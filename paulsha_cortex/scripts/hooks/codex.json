@@ -4,7 +4,7 @@
       {
         "hooks": [
           {
-            "command": "PSC_RELAY_EVENT=session_start ${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh",
+            "command": "PSC_RELAY_EVENT=session_start cortex relay-hook",
             "type": "command",
             "managedBy": "psc-coordinator-relay"
           }
@@ -16,14 +16,9 @@
       {
         "hooks": [
           {
-            "command": "PSC_RELAY_EVENT=stop ${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh",
+            "command": "PSC_RELAY_EVENT=stop cortex relay-hook",
             "type": "command",
             "managedBy": "psc-coordinator-relay"
-          },
-          {
-            "command": "PYTHONPATH=${PSC_REPO_ROOT} python3 ${PSC_REPO_ROOT}/scripts/gemma4-hooks/psc-bro-return.py --platform codex",
-            "type": "command",
-            "managedBy": "psc-bro-return"
           }
         ],
         "matcher": ".*"

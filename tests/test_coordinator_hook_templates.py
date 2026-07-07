@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import importlib.resources
 import json
 import unittest
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "paulsha_cortex" / "scripts" / "hooks"
+
+
+def _copilot_commands(doc: dict) -> list[str]:
+    return [entry.get("bash", "") for entries in doc["hooks"].values() for entry in entries]
+
+
+def _codex_commands(doc: dict) -> list[str]:
+    commands: list[str] = []
+    for groups in doc["hooks"].values():
+        for group in groups:
+            commands.extend(entry.get("command", "") for entry in group["hooks"])
+    return commands
 
 
 class HookTemplateSchemaTests(unittest.TestCase):
@@ -31,35 +44,30 @@ class HookTemplateSchemaTests(unittest.TestCase):
             self.assertIn("matcher", grp)
             self.assertIn("command", grp["hooks"][0])
 
-    def test_relay_path_resolvable_via_repo_root_env(self) -> None:
-        # 相對路徑在 cwd≠repo 時不可解；範本改用 ${PSC_REPO_ROOT}（launcher 注入）。
-        for f in ("copilot.json", "codex.json"):
-            self.assertIn("PSC_REPO_ROOT", (HOOKS / f).read_text(encoding="utf-8"))
+    def test_packaged_relay_hook_exists(self) -> None:
+        relay = importlib.resources.files("paulsha_cortex") / "scripts" / "psc-relay-hook.sh"
+        self.assertTrue(relay.is_file())
 
-
-class BroReturnEntryTests(unittest.TestCase):
-    def test_codex_stop_has_bro_return_and_preserves_relay(self) -> None:
+    def test_codex_hook_commands_use_cortex_relay_hook(self) -> None:
         d = json.loads((HOOKS / "codex.json").read_text(encoding="utf-8"))
-        hooks = d["hooks"]["Stop"][0]["hooks"]
-        cmds = [h.get("command", "") for h in hooks]
-        # existing relay preserved
-        self.assertTrue(any("psc-relay-hook.sh" in c for c in cmds), "relay entry must be preserved")
-        # new bro-return entry
-        self.assertTrue(any("psc-bro-return.py --platform codex" in c for c in cmds),
-                        "codex Stop must register psc-bro-return --platform codex")
-        bro = next(h for h in hooks if "psc-bro-return.py" in h.get("command", ""))
-        self.assertEqual(bro.get("managedBy"), "psc-bro-return")
-        self.assertIn("${PSC_REPO_ROOT}", bro["command"])
+        cmds = _codex_commands(d)
+        self.assertTrue(any("cortex relay-hook" in cmd for cmd in cmds))
+        self.assertFalse(any("psc-relay-hook.sh" in cmd for cmd in cmds))
+        self.assertFalse(any("psc-bro-return" in cmd for cmd in cmds))
 
-    def test_copilot_agentstop_has_bro_return_and_preserves_relay(self) -> None:
+    def test_copilot_hook_commands_use_cortex_relay_hook(self) -> None:
         d = json.loads((HOOKS / "copilot.json").read_text(encoding="utf-8"))
-        arr = d["hooks"]["agentStop"]
-        cmds = [h.get("bash", "") for h in arr]
-        self.assertTrue(any("psc-relay-hook.sh" in c for c in cmds), "relay entry must be preserved")
-        self.assertTrue(any("psc-bro-return.py --platform copilot" in c for c in cmds),
-                        "copilot agentStop must register psc-bro-return --platform copilot")
-        bro = next(h for h in arr if "psc-bro-return.py" in h.get("bash", ""))
-        self.assertIn("${PSC_REPO_ROOT}", bro["bash"])
+        cmds = _copilot_commands(d)
+        self.assertTrue(any("cortex relay-hook" in cmd for cmd in cmds))
+        self.assertFalse(any("psc-relay-hook.sh" in cmd for cmd in cmds))
+        self.assertFalse(any("psc-bro-return" in cmd for cmd in cmds))
+
+    def test_claude_hook_commands_use_cortex_relay_hook(self) -> None:
+        d = json.loads((HOOKS / "claude.json").read_text(encoding="utf-8"))
+        cmds = _codex_commands(d)
+        self.assertTrue(any("cortex relay-hook" in cmd for cmd in cmds))
+        self.assertFalse(any("psc-relay-hook.sh" in cmd for cmd in cmds))
+        self.assertFalse(any("psc-bro-return" in cmd for cmd in cmds))
 
 
 if __name__ == "__main__":

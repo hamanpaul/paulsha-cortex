@@ -3,22 +3,16 @@
   "hooks": {
     "sessionStart": [
       {
-        "bash": "PSC_RELAY_EVENT=session_start ${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh",
+        "bash": "PSC_RELAY_EVENT=session_start cortex relay-hook",
         "type": "command",
         "timeoutSec": 10
       }
     ],
     "agentStop": [
       {
-        "bash": "PSC_RELAY_EVENT=stop ${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh",
+        "bash": "PSC_RELAY_EVENT=stop cortex relay-hook",
         "type": "command",
         "timeoutSec": 10
-      },
-      {
-        "bash": "PYTHONPATH=${PSC_REPO_ROOT} python3 ${PSC_REPO_ROOT}/scripts/gemma4-hooks/psc-bro-return.py --platform copilot",
-        "type": "command",
-        "timeoutSec": 20,
-        "managedBy": "psc-bro-return"
       }
     ]
   }
