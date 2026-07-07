@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 from typing import Callable
 
-import yaml
-
+from .._yaml import YAMLError, safe_load
 from .contract_command import build_dispatch_prompt
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
@@ -65,8 +64,8 @@ def parse_spec_frontmatter(path) -> dict:
         return meta
 
     try:
-        data = yaml.safe_load(block)
-    except yaml.YAMLError:
+        data = safe_load(block)
+    except YAMLError:
         return meta  # 壞 frontmatter → 視為 hold（fail-safe，不 raise）
     if not isinstance(data, dict):
         return meta

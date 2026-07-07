@@ -4,8 +4,7 @@ from pathlib import Path
 from typing import Mapping
 import warnings
 
-import yaml
-
+from .._yaml import YAMLError, safe_load
 from .contract import PersonaContract, validate_persona_schema
 
 DEFAULT_PERSONAS_PATH = Path(__file__).with_name("personas.yaml")
@@ -24,8 +23,8 @@ def load_enforcement(path: str | Path | None = None) -> str:
     if not source.is_file():
         return DEFAULT_ENFORCEMENT
     try:
-        raw = yaml.safe_load(source.read_text(encoding="utf-8"))
-    except (yaml.YAMLError, OSError):
+        raw = safe_load(source.read_text(encoding="utf-8"))
+    except (YAMLError, OSError):
         # OSError：source.read_text 可能因權限/IO 失敗（is_file 與 read 間亦有 TOCTOU）；
         # 護欄旗標讀取絕不可崩潰，一律 fail-safe 退 shadow。
         return DEFAULT_ENFORCEMENT
@@ -40,8 +39,8 @@ def load_catalog(path: str | Path | None = None) -> dict[str, PersonaContract]:
     if not source.is_file():
         raise FileNotFoundError(f"persona catalog 不存在: {source}")
     try:
-        raw = yaml.safe_load(source.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+        raw = safe_load(source.read_text(encoding="utf-8"))
+    except YAMLError as exc:
         raise ValueError(f"persona catalog 解析失敗: {source}: {exc}") from exc
     if not isinstance(raw, Mapping) or not isinstance(raw.get("roles"), Mapping):
         raise ValueError(f"persona catalog 格式錯誤（缺 roles）: {source}")

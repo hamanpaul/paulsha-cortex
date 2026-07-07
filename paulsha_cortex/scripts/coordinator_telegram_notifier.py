@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import time
@@ -14,8 +15,6 @@ from typing import Dict, List
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from paulshaclaw.config import paths
 
 CHECKBOX_RE = re.compile(r"^- \[ \]", re.MULTILINE)
 TERMINAL = {"done", "failed", "stopped", "killed"}
@@ -81,20 +80,29 @@ def load_meta(path: Path) -> List[TaskMeta]:
     return rows
 
 
+def _state_path(state_root: Path) -> Path:
+    return state_root if state_root.suffix == ".json" else state_root / "jobs.json"
+
+
+def default_api_token_path() -> Path:
+    root = os.environ.get("PSC_MAX_ROOT", "").strip()
+    if root:
+        return Path(root).expanduser() / "api-token"
+    return Path.home() / ".max" / "api-token"
+
+
 def latest_job_status_by_topic(state_root: Path, limit: int = 500) -> Dict[str, str]:
-    cmd = [
-        "bash",
-        str(paths.home_root() / "prj_pri" / "custom-skills" / "coordinator" / "scripts" / "coordinator.sh"),
-        "--state-root",
-        str(state_root),
-        "jobs",
-        "--limit",
-        str(limit),
-    ]
-    data = json.loads(run_cmd(cmd))
+    payload = json.loads(_state_path(state_root).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("coordinator 狀態檔格式錯誤：頂層必須為 object")
+    jobs = payload.get("jobs", [])
+    if not isinstance(jobs, list):
+        raise ValueError("coordinator 狀態檔格式錯誤：jobs 必須為 list")
     out: Dict[str, str] = {}
-    for row in data.get("jobs", []):
-        topic = row.get("topic")
+    for row in reversed(jobs[-limit:]):
+        if not isinstance(row, dict):
+            continue
+        topic = row.get("topic") or row.get("task")
         status = row.get("status")
         if not topic or not status:
             continue
@@ -119,7 +127,7 @@ def main() -> int:
     parser.add_argument("--meta-file", required=True)
     parser.add_argument("--state-root", required=True)
     parser.add_argument("--interval-sec", type=int, default=1800)
-    parser.add_argument("--api-token-path", default=str(paths.max_root() / "api-token"))
+    parser.add_argument("--api-token-path", default=str(default_api_token_path()))
     args = parser.parse_args()
 
     meta = load_meta(Path(args.meta_file))

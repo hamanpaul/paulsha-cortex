@@ -57,7 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cortex install")
     sub = parser.add_subparsers(dest="target", required=True)
     svc = sub.add_parser("service")
-    svc.add_argument("--instance", default="paulshaclaw")
+    svc.add_argument("--instance", default="cortex")
     svc.add_argument("--interval", type=int, default=300)
     args = parser.parse_args(argv)
     return install_service(args.instance, args.interval)

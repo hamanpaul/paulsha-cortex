@@ -11,6 +11,11 @@ policy_version: 1.0.12
 - policy_profile: `flat` （見 `.paul-project.yml`）
 - policy_version: `1.0.12`
 
+## 本 repo 定位
+- `paulsha-cortex` 是治理平面拆包：persona 契約、coordinator 派工、control 檔案契約。
+- 對 `paulsha-hippo` 維持零 runtime 依賴；僅 `persona/loader.py` 保留 upstream deck schema lazy import。
+- path 契約以 `~/.agents/*` 與 `PSC_*` env 為主；service install 走 `cortex install service`。
+
 ## 動工前
 - [ ] 確認當前分支不是 `main`
   - 若在 `main`，先開 `feature/<slug>` 分支

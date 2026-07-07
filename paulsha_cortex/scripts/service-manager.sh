@@ -7,7 +7,7 @@ if [[ -z "${PY:-}" ]]; then
 fi
 
 stop_legacy_manager_timer() {
-  local instance="${PSC_INSTANCE:-paulshaclaw}"
+  local instance="${PSC_INSTANCE:-cortex}"
   if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment >/dev/null 2>&1; then
     return 0
   fi
@@ -83,7 +83,7 @@ start_manager_service() {
     echo "manager service disabled (PSC_MANAGER_DISABLED=1)"
     return 0
   fi
-  local instance="${PSC_INSTANCE:-paulshaclaw}"
+  local instance="${PSC_INSTANCE:-cortex}"
   if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment >/dev/null 2>&1; then
     echo "manager service skipped: systemctl --user unavailable (WSL no user systemd?)" >&2
     return 0
