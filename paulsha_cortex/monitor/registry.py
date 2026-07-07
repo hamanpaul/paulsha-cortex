@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
@@ -74,8 +74,10 @@ def merge_projects(
     seen: set[Path] = set()
     merged: list[ProjectEntry] = []
     for entry in [*manual, *hippo]:
-        if entry.path in seen:
+        # 於函式內強制 realpath 正規化——不假設 caller 已 resolve（symlink/./.. 亦去重）
+        key = entry.path.expanduser().resolve()
+        if key in seen:
             continue
-        seen.add(entry.path)
-        merged.append(entry)
+        seen.add(key)
+        merged.append(entry if entry.path == key else replace(entry, path=key))
     return merged

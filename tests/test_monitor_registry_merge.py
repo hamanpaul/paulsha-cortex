@@ -119,3 +119,17 @@ def test_scan_dedupes_manual_and_hippo_to_one_state(monkeypatch, tmp_path):
     matches = [s for s in states if Path(s.path).resolve() == (ws_root / "projX").resolve()]
     assert len(matches) == 1
     assert matches[0].workspace == "curated"
+
+
+def test_merge_normalizes_realpath_inside_function(tmp_path):
+    # F2：merge_projects 自身正規化——語法不同但指向同一目錄應去重、manual 勝、path 收斂為 realpath
+    from paulsha_cortex.monitor.registry import ProjectEntry, merge_projects
+    real = tmp_path / "proj"
+    real.mkdir()
+    manual = ProjectEntry(path=tmp_path / "proj", name="manual", source="manual")
+    hippo = ProjectEntry(path=tmp_path / "sub" / ".." / "proj", name="hippo", source="hippo")  # 未 resolve 的等價路徑
+    (tmp_path / "sub").mkdir()
+    out = merge_projects([manual], [hippo])
+    assert len(out) == 1                       # 去重（即使 caller 未 resolve）
+    assert out[0].name == "manual"             # manual 勝
+    assert out[0].path == real.resolve()       # path 收斂為 realpath
