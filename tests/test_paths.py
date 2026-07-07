@@ -28,3 +28,22 @@ def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_WORKTREE_ROOT", raising=False)
     monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path / "myrepo"))
     assert paths.worktree_root() == tmp_path / "myrepo-worktrees"
+
+
+def test_run_root_default_and_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    assert paths.run_root() == Path.home() / ".agents" / "run"
+    monkeypatch.setenv("PSC_RUN_ROOT", str(tmp_path / "run"))
+    assert paths.run_root() == tmp_path / "run"
+
+
+def test_config_path_default(monkeypatch):
+    monkeypatch.delenv("PSC_CONFIG_ROOT", raising=False)
+    assert paths.config_path("paulshaclaw.yaml") == Path.home() / ".config" / "paulshaclaw" / "paulshaclaw.yaml"
+
+
+def test_project_config_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("PSC_PROJECT_CONFIG_ROOT", raising=False)
+    assert paths.project_config_root() == Path.home() / ".agents" / "config" / "paulsha"
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "pc"))
+    assert paths.project_config_root() == tmp_path / "pc"

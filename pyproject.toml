@@ -7,7 +7,7 @@ name = "paulsha-cortex"
 dynamic = ["version"]
 requires-python = ">=3.10"
 description = "agent 治理平面：manager 派工 + persona 護欄 + control 檔案契約"
-dependencies = []
+dependencies = ["PyYAML>=6"]
 
 [project.scripts]
 cortex = "paulsha_cortex.cli:main"
@@ -20,6 +20,7 @@ where = ["."]
 include = ["paulsha_cortex*"]
 
 [tool.setuptools.package-data]
+"paulsha_cortex.deck" = ["data/*.yaml", "data/combos/*.yaml"]
 "paulsha_cortex.deploy" = ["templates/*.tmpl"]
 "paulsha_cortex" = [
     "persona/personas.yaml",

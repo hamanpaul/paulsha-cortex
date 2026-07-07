@@ -10,6 +10,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
+_INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
 
 def _template(name: str) -> str:
     return (resources.files("paulsha_cortex.deploy") / "templates" / name).read_text()
@@ -24,7 +26,13 @@ def render_units(instance: str, interval: int) -> dict[str, str]:
     service = service.replace("__SERVICE_SCRIPT__", str(_service_script_path()))
     timer = _template("manager.timer.tmpl").replace("__INSTANCE__", instance)
     timer = re.sub(r"^OnUnitActiveSec=.*$", f"OnUnitActiveSec={interval}", timer, flags=re.M)
-    return {f"{instance}-manager.service": service, f"{instance}-manager.timer": timer}
+    monitor = _template("monitor.service.tmpl").replace("__INSTANCE__", instance)
+    monitor = monitor.replace("__PY__", sys.executable)
+    return {
+        f"{instance}-manager.service": service,
+        f"{instance}-manager.timer": timer,
+        f"{instance}-monitor.service": monitor,
+    }
 
 
 def _systemctl_available() -> bool:
@@ -44,6 +52,20 @@ def _resolve_git_repo_root(repo_root: Path) -> Path:
     if probe.returncode != 0:
         raise ValueError(f"{candidate} 不是 git repo")
     return Path(probe.stdout.strip()).resolve()
+
+
+def _validate_instance(instance: str) -> str:
+    if not _INSTANCE_RE.fullmatch(instance):
+        raise ValueError(
+            f"instance 名稱不合法（僅允許 [a-z0-9-]，不可含路徑分隔）: {instance!r}"
+        )
+    return instance
+
+
+def _validate_interval(interval: int) -> int:
+    if interval <= 0:
+        raise ValueError(f"interval 必須為正整數，實際 {interval!r}")
+    return interval
 
 
 def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
@@ -75,13 +97,21 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
     env_file = runtime_dir / f"{instance}-manager.env"
-    _write_managed_env(env_file, {"PY": sys.executable, "PSC_REPO_ROOT": str(repo_root)})
+    _write_managed_env(
+        env_file,
+        {
+            "PY": sys.executable,
+            "PSC_REPO_ROOT": str(repo_root),
+            "PSC_RUN_ROOT": str(home / ".agents" / "run" / instance),
+        },
+    )
     if not _systemctl_available():
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
         return 0
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", f"{instance}-monitor.service"], check=True)
     subprocess.run(["systemctl", "--user", "enable", f"{instance}-manager.timer"], check=True)
-    print(f"installed: {instance}-manager.{{service,timer}}")
+    print(f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service")
     return 0
 
 
@@ -94,7 +124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     svc.add_argument("--repo-root", default=str(Path.cwd()))
     args = parser.parse_args(argv)
     try:
+        instance = _validate_instance(args.instance)
+        interval = _validate_interval(args.interval)
         repo_root = _resolve_git_repo_root(Path(args.repo_root))
     except ValueError as exc:
         parser.error(str(exc))
-    return install_service(args.instance, args.interval, repo_root)
+    return install_service(instance, interval, repo_root)

@@ -1,0 +1,15 @@
+combo:
+  id: mcu-feature
+  task_type: mcu-feature
+  cards:
+    - ref: mcu-hw-evidence
+    - ref: writing-plans
+    - ref: worktree-isolation
+    - ref: tdd-red
+    - ref: subagent-build
+    - ref: code-review
+    - ref: receiving-code-review
+    - ref: verification
+  gate_spine:
+    - after: mcu-hw-evidence
+      exists: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]

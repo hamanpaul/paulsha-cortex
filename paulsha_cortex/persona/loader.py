@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Mapping
 import warnings
 
+from paulsha_cortex.deck.schema import DeckSchemaError, DEFAULT_CARDS_PATH, load_cards
+
 from .._yaml import YAMLError, safe_load
 from .contract import PersonaContract, validate_persona_schema
 
@@ -71,11 +73,7 @@ def load_catalog(path: str | Path | None = None) -> dict[str, PersonaContract]:
 
 
 def _warn_unknown_skills(catalog: dict[str, PersonaContract]) -> None:
-    """shadow 驗證：fail-open 僅限 deck 缺席；壞目錄要警示、邏輯 bug 不吞。"""
-    try:
-        from paulshaclaw.deck.schema import DeckSchemaError, DEFAULT_CARDS_PATH, load_cards
-    except ImportError:
-        return  # deck 套件缺席（如未來拆包）→ 靜默跳過
+    """shadow 驗證：deck 已同包，僅 deck schema 錯誤維持 warning。"""
     try:
         cards = load_cards(DEFAULT_CARDS_PATH)
     except DeckSchemaError as exc:

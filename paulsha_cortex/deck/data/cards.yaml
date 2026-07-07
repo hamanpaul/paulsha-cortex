@@ -1,0 +1,129 @@
+# 轉錄真相源：custom-skills/feature-delivery-pipeline SKILL.md（11 phases）
+# produces 僅寫可機械驗證 glob；佔位符白名單：<task-slug>、<change>
+version: 0
+cards:
+  - id: brainstorming
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "superpowers:brainstorming"
+    requires: []
+    produces: ["docs/superpowers/specs/*<task-slug>*-design.md"]
+    persona_binding: planner
+
+  - id: openspec-propose
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "openspec-propose"
+    requires: ["docs/superpowers/specs/*<task-slug>*-design.md"]
+    produces:
+      - "openspec/changes/<change>/proposal.md"
+      - "openspec/changes/<change>/tasks.md"
+    persona_binding: planner
+
+  - id: writing-plans
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "superpowers:writing-plans"
+    requires: ["openspec/changes/<change>/proposal.md"]
+    produces: ["docs/superpowers/plans/*<task-slug>*.md"]
+    persona_binding: planner
+
+  - id: worktree-isolation
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:using-git-worktrees"
+    slice_group: build
+    requires: ["docs/superpowers/plans/*<task-slug>*.md"]
+    produces: []          # worktree 由 coordinator 派工時自建（feature/<slice_id>）
+    persona_binding: builder
+
+  - id: tdd-red
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:test-driven-development"
+    slice_group: build
+    requires: []
+    produces: []          # RED 證據在 build session log／commits，Phase A 不機驗
+    persona_binding: builder
+
+  - id: subagent-build
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:subagent-driven-development"
+    slice_group: build
+    requires: []
+    produces: []          # 完成偵測 = manager exit sentinel + branch commits
+    persona_binding: builder
+
+  - id: code-review
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:requesting-code-review"
+    requires: []
+    produces: ["reports/review/*<task-slug>*.md"]
+    persona_binding: reviewer
+
+  - id: verification
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:verification-before-completion"
+    requires: []
+    produces: ["reports/verify/*<task-slug>*.md"]
+    persona_binding: reviewer
+
+  - id: openspec-archive
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "openspec-archive-change"
+    slice_group: ship
+    requires: ["openspec/changes/<change>/tasks.md"]
+    produces: ["openspec/changes/archive/*<change>*"]
+    persona_binding: manager
+
+  - id: policy-commit
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "conventional-commit"
+    slice_group: ship
+    requires: []
+    produces: []          # 證據 = conventional commit 本身（不機驗檔案）
+    persona_binding: manager
+
+  - id: adversarial-review
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "codex:adversarial-review"
+    requires: ["reports/review/*<task-slug>*.md"]
+    produces: ["reports/review/*<task-slug>*-adversarial.md"]
+    persona_binding: reviewer
+
+  - id: receiving-code-review
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "superpowers:receiving-code-review"
+    requires: ["reports/review/*<task-slug>*.md"]
+    produces: []          # findings 處理證據 = fix commits + re-review，Phase A 不機驗
+    persona_binding: builder
+
+  # 註：hw-evidence.md 為 deck 投影新造的 artifact 契約（SKILL 硬體證據規則的
+  # 可機驗載體）；內容正確性由 mcu-coding-skill 執行時自律，deck 只驗存在。
+  - id: mcu-hw-evidence
+    kind: skill
+    type: interactive
+    class: niche
+    skill_ref: "mcu-coding-skill"
+    requires: []
+    produces: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]
+    persona_binding: planner

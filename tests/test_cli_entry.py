@@ -64,3 +64,27 @@ def test_relay_hook_falls_back_to_bash_when_not_executable(monkeypatch, tmp_path
     # 先試直接 exec（失敗），再 fallback 到 env bash 讀取執行
     assert calls[0][0] == str(script)
     assert calls[1] == ("/usr/bin/env", ["env", "bash", str(script), "--flag"])
+
+
+def test_routes_deck(monkeypatch):
+    seen = {}
+
+    def fake(argv=None):
+        seen["argv"] = list(argv or [])
+        return 0
+
+    monkeypatch.setattr("paulsha_cortex.deck.cli.main", fake)
+    assert main(["deck", "verify", "--change", "x"]) == 0
+    assert seen["argv"] == ["verify", "--change", "x"]
+
+
+def test_routes_monitor(monkeypatch):
+    seen = {}
+
+    def fake(argv=None):
+        seen["argv"] = list(argv or [])
+        return 0
+
+    monkeypatch.setattr("paulsha_cortex.monitor.__main__.main", fake)
+    assert main(["monitor", "--once"]) == 0
+    assert seen["argv"] == ["--once"]

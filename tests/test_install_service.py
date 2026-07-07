@@ -44,6 +44,7 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"PY={sys.executable}" in env_lines
+    assert f"PSC_RUN_ROOT={tmp_path / '.agents' / 'run' / 'beta'}" in env_lines
 
 
 def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
@@ -62,6 +63,7 @@ def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / "home" / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
+    assert f"PSC_RUN_ROOT={tmp_path / 'home' / '.agents' / 'run' / 'beta'}" in env_lines
 
 
 def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
@@ -107,3 +109,47 @@ def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):
 
     assert exc.value.code == 2
     assert f"{bad_root.resolve()} 不是 git repo" in capsys.readouterr().err
+
+
+def test_install_service_installs_monitor_unit(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    assert installer.main(["service", "--repo-root", str(repo)]) == 0
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    assert (unit_dir / "cortex-manager.service").exists()
+    assert (unit_dir / "cortex-monitor.service").exists()
+    monitor_unit = (unit_dir / "cortex-monitor.service").read_text()
+    assert "paulsha_cortex.monitor" in monitor_unit
+    assert "__INSTANCE__.env".replace("__INSTANCE__", "cortex") in monitor_unit or "cortex.env" in monitor_unit
+    assert "cortex-manager.env" in monitor_unit
+
+
+def test_install_rejects_unsafe_instance_name(tmp_path, monkeypatch, capsys):
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["service", "--instance", "../bad"])
+
+    assert exc.value.code == 2
+    assert "instance 名稱不合法" in capsys.readouterr().err
+
+
+def test_install_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["service", "--interval", "0"])
+
+    assert exc.value.code == 2
+    assert "interval 必須為正整數" in capsys.readouterr().err
