@@ -25,7 +25,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(install_main(args[1:]) or 0)
     if args[0] == "relay-hook":
         script = str(_relay_hook_script_path())
-        os.execv(script, [script, *args[1:]])
+        try:
+            os.execv(script, [script, *args[1:]])
+        except OSError:
+            # packaged 腳本非可執行（wheel 留 0644）或 noexec 掛載時，
+            # 改由 bash 讀取執行（只需讀權限）。
+            os.execv("/usr/bin/env", ["env", "bash", script, *args[1:]])
 
     from paulsha_cortex.coordinator.cli import main as coordinator_main
 
