@@ -32,6 +32,22 @@ def specs_root() -> Path:
     return _resolve_root("PSC_SPECS_ROOT", agents_root() / "specs")
 
 
+def run_root() -> Path:
+    return _resolve_root("PSC_RUN_ROOT", agents_root() / "run")
+
+
+def config_root() -> Path:
+    return _resolve_root("PSC_CONFIG_ROOT", Path.home() / ".config" / "paulshaclaw")
+
+
+def config_path(*parts: str) -> Path:
+    return config_root().joinpath(*parts)
+
+
+def project_config_root() -> Path:
+    return _resolve_root("PSC_PROJECT_CONFIG_ROOT", agents_root() / "config" / "paulsha")
+
+
 def repo_root() -> Path:
     return _resolve_root("PSC_REPO_ROOT", Path.cwd())
 
