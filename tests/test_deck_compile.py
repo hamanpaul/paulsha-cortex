@@ -264,6 +264,24 @@ def test_compile_rejects_multiline_plan_ref(tmp_path):
         )
 
 
+def test_compile_quotes_plan_ref_for_frontmatter(tmp_path):
+    from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "示例 LED 功能",
+        change="demo",
+        allow_external=True,
+        plan_ref="x: y",
+    )
+    path = tmp_path / result.slices[0].filename
+    path.write_text(result.slices[0].content, encoding="utf-8")
+    meta = parse_spec_frontmatter(path)
+    assert meta["plan"] == "x: y"
+
+
 def test_compile_frontmatter_exact_keyset(tmp_path):
     from paulsha_cortex.deck.schema import EMITTED_FRONTMATTER_FIELDS
 
@@ -463,6 +481,20 @@ def test_verify_commands_include_change_when_needed(tmp_path):
     result = compile_combo(combo, cards, "demo task", change="demo", allow_external=True)
     assert "cortex deck verify writing-plans --task-slug demo-task --change demo" in result.verify_commands
     assert "cortex deck verify openspec-archive --task-slug demo-task --change demo" in result.verify_commands
+
+
+def test_only_selection_skips_gate_verify_for_omitted_cards(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    result = compile_combo(
+        combo,
+        cards,
+        "demo task",
+        change="demo",
+        allow_external=True,
+        only=("code-review", "verification"),
+    )
+    assert not any("writing-plans" in command for command in result.verify_commands)
+    assert not any("openspec-archive" in command for command in result.verify_commands)
 
 
 

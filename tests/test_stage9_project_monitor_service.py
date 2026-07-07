@@ -400,6 +400,27 @@ class Stage9ServerTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("error", payload)
 
+    def test_server_rejects_non_object_request_payload(self) -> None:
+        sock = self._connect()
+        sock.sendall(b'[\"subscribe\"]\n')
+        payload = json.loads(_socket_recv_line(sock))
+        self.assertFalse(payload["ok"])
+        self.assertIn("JSON object", payload["error"])
+
+    def test_server_rejects_non_string_project_id(self) -> None:
+        sock = self._connect()
+        _socket_send_request(sock, {"kind": "get_project_state", "project_id": ["projA"]})
+        payload = json.loads(_socket_recv_line(sock))
+        self.assertFalse(payload["ok"])
+        self.assertIn("project_id", payload["error"])
+
+    def test_server_rejects_invalid_subscribe_projects_filter(self) -> None:
+        sock = self._connect()
+        _socket_send_request(sock, {"kind": "subscribe", "projects": "projA"})
+        payload = json.loads(_socket_recv_line(sock))
+        self.assertFalse(payload["ok"])
+        self.assertIn("projects", payload["error"])
+
     def test_server_discards_finished_connection_threads(self) -> None:
         for _ in range(3):
             sock = self._connect()

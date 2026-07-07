@@ -204,6 +204,9 @@ class MonitorServer:
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 _write_line(conn, _error(f"invalid JSON: {error}"))
                 return
+            if not isinstance(request, dict):
+                _write_line(conn, _error("request payload must be a JSON object"))
+                return
 
             kind = request.get("kind")
             if kind == "list_projects":
@@ -241,7 +244,7 @@ class MonitorServer:
 
     def _handle_get_project_state(self, conn: socket.socket, request: dict) -> None:
         project_id = request.get("project_id")
-        if not project_id:
+        if not isinstance(project_id, str) or not project_id:
             _write_line(conn, _error("project_id is required"))
             return
         state = self._store.get(project_id)
@@ -252,11 +255,15 @@ class MonitorServer:
 
     def _handle_subscribe(self, conn: socket.socket, request: dict) -> None:
         filter_projects = request.get("projects")
-        projects = (
-            tuple(str(p) for p in filter_projects)
-            if isinstance(filter_projects, list)
-            else None
-        )
+        if filter_projects is None:
+            projects = None
+        elif isinstance(filter_projects, list) and all(
+            isinstance(project_id, str) and project_id for project_id in filter_projects
+        ):
+            projects = tuple(filter_projects)
+        else:
+            _write_line(conn, _error("projects must be a list of non-empty strings"))
+            return
         sub = _Subscriber(projects=projects)
         with self._subscribers_lock:
             self._subscribers.append(sub)

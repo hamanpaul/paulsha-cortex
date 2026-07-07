@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -199,7 +200,7 @@ def _render_frontmatter(slice_id: str, plan_ref: str, deps: Sequence[str]) -> st
         "---",
         "dispatch: hold",
         f"slice_id: {slice_id}",
-        f"plan: {plan_ref}",
+        f"plan: {json.dumps(plan_ref, ensure_ascii=False)}",
         f"depends_on: {depends_on}",
     ]
     lines.append("---")
@@ -235,9 +236,12 @@ def _gate_verify_commands(
     cards: Mapping[str, Card],
     slug: str,
     change: str | None,
+    selected_refs: frozenset[str],
 ) -> list[str]:
     commands: list[str] = []
     for gate in combo.gate_spine:
+        if gate.after not in selected_refs:
+            continue
         card = cards.get(gate.after)
         if card is None:
             raise DeckCompileError(f"gate_spine.after 指向不存在卡片: {gate.after}")
@@ -281,8 +285,9 @@ def compile_combo(
     plan_ref = _validate_plan_ref(plan_ref)
 
     explicit_deps = {entry.ref: entry.depends_on for entry in entries}
+    selected_refs = frozenset(entry.ref for entry in entries)
     slices: list[SliceDoc] = []
-    verify_commands = _gate_verify_commands(combo, cards, slug, change)
+    verify_commands = _gate_verify_commands(combo, cards, slug, change, selected_refs)
     previous_slice_id: str | None = None
 
     for slice_id, members in _group_slices(entries, cards, slug):
