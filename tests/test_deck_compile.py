@@ -519,7 +519,7 @@ combo:
     slug = result.task_slug
     build = next(s for s in result.slices if s.slice_id == f"{slug}-build")
     adv = next(s for s in result.slices if s.slice_id == f"{slug}-adversarial-review")
-    assert "depends_on: []" in build.content or "depends_on:\n" not in build.content.split("---")[1] or True
+    assert "depends_on: []" in build.content   # build 為首階段，depends_on 應為空（GitHub review #1）
     assert f"depends_on: [{slug}-build]" in adv.content  # 組員 dep → group slice id
 
 

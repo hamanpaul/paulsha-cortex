@@ -313,16 +313,23 @@ def _error(message: str) -> dict:
     return {"ok": False, "error": message}
 
 
-def _read_line(conn: socket.socket, *, timeout: float = 2.0) -> bytes:
+_MAX_REQUEST_LINE = 65536  # 64 KiB：超長請求行上限，防記憶體/CPU 被拖垮（GitHub review #2）
+
+
+def _read_line(conn: socket.socket, *, timeout: float = 2.0, max_len: int = _MAX_REQUEST_LINE) -> bytes:
     conn.settimeout(timeout)
     chunks: list[bytes] = []
+    total = 0
     try:
         while True:
             ch = conn.recv(1)
             if not ch:
                 break
             chunks.append(ch)
+            total += 1
             if ch == b"\n":
+                break
+            if total >= max_len:   # 超過上限即中止讀取（不吞整行）
                 break
     except socket.timeout:
         return b""

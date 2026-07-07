@@ -16,7 +16,9 @@ ALLOWED_LEGACY_POLICIES = ("list-only", "hide")
 
 
 def default_config_path() -> Path:
-    return _legacy_manual_path()
+    # 回傳現行預設 manual 路徑（project-cortex.yaml）——與 _resolve_config_source 的
+    # 優先序一致；勿反向導回 legacy paulshaclaw.yaml（GitHub review #3）。
+    return _new_manual_path()
 
 
 def _new_manual_path() -> Path:
