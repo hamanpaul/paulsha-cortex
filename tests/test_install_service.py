@@ -140,3 +140,16 @@ def test_install_rejects_unsafe_instance_name(tmp_path, monkeypatch, capsys):
 
     assert exc.value.code == 2
     assert "instance 名稱不合法" in capsys.readouterr().err
+
+
+def test_install_rejects_non_positive_interval(tmp_path, monkeypatch, capsys):
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["service", "--interval", "0"])
+
+    assert exc.value.code == 2
+    assert "interval 必須為正整數" in capsys.readouterr().err

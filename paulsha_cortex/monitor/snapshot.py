@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import threading
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Iterable
 from .config import MonitorConfig
 from .models import ProjectState
 from .parser import extract_project_state
-from .scanner import scan_workspaces
+from .scanner import ProjectClassification, classify_project, scan_workspaces
 
 
 @dataclass(frozen=True)
@@ -22,12 +23,11 @@ class ChangeEvent:
 def _project_signature(state: ProjectState) -> tuple:
     """Stable, comparable shape used to detect "anything changed" for a project.
 
-    We exclude `last_seen_at` and `source_signals` because they tick on every
-    refresh even when nothing meaningful changed.
+    We exclude only `last_seen_at`; diagnostics like `source_signals` are part
+    of the observable monitor state and must propagate to subscribers.
     """
     payload = asdict(state)
     payload.pop("last_seen_at", None)
-    payload.pop("source_signals", None)
     return _hashable(payload)
 
 
@@ -121,8 +121,31 @@ class SnapshotStore:
                         )
                     )
                     continue
-                state = extract_project_state(project_dir, workspace_name=current.workspace)
-                state = replace(state, project_id=current.project_id)
+                classification = classify_project(project_dir)
+                if classification == ProjectClassification.LEGACY:
+                    if self._config.legacy_policy == "hide":
+                        self._states.pop(project_id, None)
+                        self._signatures.pop(project_id, None)
+                        self._sequence += 1
+                        events.append(
+                            ChangeEvent(
+                                project_id=project_id,
+                                sequence=self._sequence,
+                                project_state=current,
+                                removed=True,
+                            )
+                        )
+                        continue
+                    state = ProjectState(
+                        project_id=current.project_id,
+                        workspace=current.workspace,
+                        path=str(project_dir),
+                        legacy=True,
+                        last_seen_at=time.time(),
+                    )
+                else:
+                    state = extract_project_state(project_dir, workspace_name=current.workspace)
+                    state = replace(state, project_id=current.project_id)
                 signature = _project_signature(state)
                 self._states[project_id] = state
                 if self._signatures.get(project_id) == signature:

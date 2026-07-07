@@ -211,6 +211,41 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertTrue(events[0].removed)
         self.assertEqual(events[0].project_id, "projB")
 
+    def test_store_refresh_project_reclassifies_tracked_to_hidden_legacy(self) -> None:
+        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
+        cfg = MonitorConfig(
+            workspaces=(WorkspaceConfig(path=self.tmp / "ws", name="ws"),),
+            legacy_policy="hide",
+        )
+        store = SnapshotStore(config=cfg)
+        store.load()
+
+        import shutil
+
+        (proj / ".paul-project.yml").unlink()
+        shutil.rmtree(proj / "docs")
+
+        events = store.refresh_projects(("projA",))
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].removed)
+        self.assertIsNone(store.get("projA"))
+
+    def test_store_refresh_emits_event_when_only_source_signals_change(self) -> None:
+        (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
+        proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
+        cfg = self._build_config()
+        store = SnapshotStore(config=cfg)
+        store.load()
+
+        archive_root = proj / "openspec" / "changes" / "archive"
+        archive_root.mkdir(parents=True, exist_ok=True)
+
+        events = store.refresh_projects(("projA",))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].project_id, "projA")
+        self.assertFalse(events[0].removed)
+
     def test_store_assigns_monotonic_sequence_to_events(self) -> None:
         (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
         proj = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)

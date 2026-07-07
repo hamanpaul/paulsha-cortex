@@ -62,6 +62,12 @@ def _validate_instance(instance: str) -> str:
     return instance
 
 
+def _validate_interval(interval: int) -> int:
+    if interval <= 0:
+        raise ValueError(f"interval 必須為正整數，實際 {interval!r}")
+    return interval
+
+
 def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
     """更新 managed keys（PY / PSC_REPO_ROOT），就地保留其餘 operator 手動行與註解。
 
@@ -119,7 +125,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         instance = _validate_instance(args.instance)
+        interval = _validate_interval(args.interval)
         repo_root = _resolve_git_repo_root(Path(args.repo_root))
     except ValueError as exc:
         parser.error(str(exc))
-    return install_service(instance, args.interval, repo_root)
+    return install_service(instance, interval, repo_root)
