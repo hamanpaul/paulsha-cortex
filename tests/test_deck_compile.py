@@ -251,6 +251,19 @@ def test_compile_rejects_unsafe_change_name(tmp_path):
         compile_combo(combo, cards, "示例 LED 功能", change="../evil", allow_external=True)
 
 
+def test_compile_rejects_multiline_plan_ref(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    with pytest.raises(DeckCompileError, match="plan 參照不可含換行"):
+        compile_combo(
+            combo,
+            cards,
+            "示例 LED 功能",
+            change="demo",
+            allow_external=True,
+            plan_ref="docs/plan.md\ndispatch: auto",
+        )
+
+
 def test_compile_frontmatter_exact_keyset(tmp_path):
     from paulsha_cortex.deck.schema import EMITTED_FRONTMATTER_FIELDS
 
@@ -448,6 +461,7 @@ def test_compile_rejects_duplicate_slice_ids_from_split_group(tmp_path):
 def test_verify_commands_include_change_when_needed(tmp_path):
     cards, combo = _feature_oneshot(tmp_path)
     result = compile_combo(combo, cards, "demo task", change="demo", allow_external=True)
+    assert "cortex deck verify writing-plans --task-slug demo-task --change demo" in result.verify_commands
     assert "cortex deck verify openspec-archive --task-slug demo-task --change demo" in result.verify_commands
 
 

@@ -37,6 +37,12 @@ def _validate_change_name(change: str) -> str:
     return change
 
 
+def _validate_plan_ref(plan_ref: str) -> str:
+    if "\n" in plan_ref or "\r" in plan_ref:
+        raise DeckCompileError(f"plan 參照不可含換行: {plan_ref!r}")
+    return plan_ref
+
+
 def specs_dir() -> Path:
     """鏡射 manager_daemon.default_specs_dir 的 specs 路徑契約：
     PSC_MANAGER_SPECS_DIR → paths.specs_root()（吃 PSC_SPECS_ROOT/PSC_AGENTS_ROOT）。
@@ -217,6 +223,32 @@ def _uses_change(card: Card) -> bool:
     return any("<change>" in pattern for pattern in card.requires + card.produces)
 
 
+def _verify_command(card: Card, slug: str, change: str | None) -> str:
+    command = f"cortex deck verify {card.id} --task-slug {slug}"
+    if _uses_change(card):
+        command += f" --change {change}"
+    return command
+
+
+def _gate_verify_commands(
+    combo: Combo,
+    cards: Mapping[str, Card],
+    slug: str,
+    change: str | None,
+) -> list[str]:
+    commands: list[str] = []
+    for gate in combo.gate_spine:
+        card = cards.get(gate.after)
+        if card is None:
+            raise DeckCompileError(f"gate_spine.after 指向不存在卡片: {gate.after}")
+        if not card.produces:
+            raise DeckCompileError(f"{card.id}: gate_spine.after 卡片沒有 produces 可驗收")
+        for pattern in gate.exists:
+            _subst(pattern, slug, change)
+        commands.append(_verify_command(card, slug, change))
+    return commands
+
+
 def compile_combo(
     combo: Combo,
     cards: Mapping[str, Card],
@@ -246,10 +278,11 @@ def compile_combo(
         plan_ref = _default_plan_ref(combo.cards, cards, slug, change)
     if not plan_ref:
         raise DeckCompileError("無法決定 plan 參照：無 interactive produces，請給 --plan")
+    plan_ref = _validate_plan_ref(plan_ref)
 
     explicit_deps = {entry.ref: entry.depends_on for entry in entries}
     slices: list[SliceDoc] = []
-    verify_commands: list[str] = []
+    verify_commands = _gate_verify_commands(combo, cards, slug, change)
     previous_slice_id: str | None = None
 
     for slice_id, members in _group_slices(entries, cards, slug):
@@ -288,10 +321,7 @@ def compile_combo(
 
         for member in members:
             if member.produces:
-                command = f"cortex deck verify {member.id} --task-slug {slug}"
-                if _uses_change(member):
-                    command += f" --change {change}"
-                verify_commands.append(command)
+                verify_commands.append(_verify_command(member, slug, change))
         previous_slice_id = slice_id
 
     return CompileResult(

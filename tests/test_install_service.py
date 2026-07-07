@@ -44,6 +44,7 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"PY={sys.executable}" in env_lines
+    assert f"PSC_RUN_ROOT={tmp_path / '.agents' / 'run' / 'beta'}" in env_lines
 
 
 def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
@@ -62,6 +63,7 @@ def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / "home" / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
+    assert f"PSC_RUN_ROOT={tmp_path / 'home' / '.agents' / 'run' / 'beta'}" in env_lines
 
 
 def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):

@@ -81,7 +81,14 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
     env_file = runtime_dir / f"{instance}-manager.env"
-    _write_managed_env(env_file, {"PY": sys.executable, "PSC_REPO_ROOT": str(repo_root)})
+    _write_managed_env(
+        env_file,
+        {
+            "PY": sys.executable,
+            "PSC_REPO_ROOT": str(repo_root),
+            "PSC_RUN_ROOT": str(home / ".agents" / "run" / instance),
+        },
+    )
     if not _systemctl_available():
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
         return 0

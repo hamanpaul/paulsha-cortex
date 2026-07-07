@@ -100,6 +100,7 @@ def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):
     assert result.external == (
         "writing-plans: openspec/changes/<change>/proposal.md",
     )
+    assert f"cortex deck verify mcu-hw-evidence --task-slug {slug}" in result.verify_commands
     # hw-evidence gate 與卡 produces 一致
     assert combo.gate_spine[0].exists == cards["mcu-hw-evidence"].produces
     out = tmp_path / "specs"
