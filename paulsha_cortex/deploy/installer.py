@@ -34,7 +34,19 @@ def _systemctl_available() -> bool:
     return probe.returncode == 0
 
 
-def install_service(instance: str, interval: int) -> int:
+def _resolve_git_repo_root(repo_root: Path) -> Path:
+    candidate = repo_root.expanduser().resolve()
+    probe = subprocess.run(
+        ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise ValueError(f"{candidate} 不是 git repo")
+    return Path(probe.stdout.strip()).resolve()
+
+
+def install_service(instance: str, interval: int, repo_root: Path) -> int:
     home = Path.home()
     unit_dir = home / ".config" / "systemd" / "user"
     runtime_dir = home / ".agents" / "core" / "runtime"
@@ -43,7 +55,7 @@ def install_service(instance: str, interval: int) -> int:
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
     env_file = runtime_dir / f"{instance}-manager.env"
-    env_file.write_text(f"PY={sys.executable}\n")
+    env_file.write_text(f"PY={sys.executable}\nPSC_REPO_ROOT={repo_root}\n")
     if not _systemctl_available():
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
         return 0
@@ -59,5 +71,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     svc = sub.add_parser("service")
     svc.add_argument("--instance", default="cortex")
     svc.add_argument("--interval", type=int, default=300)
+    svc.add_argument("--repo-root", default=str(Path.cwd()))
     args = parser.parse_args(argv)
-    return install_service(args.instance, args.interval)
+    try:
+        repo_root = _resolve_git_repo_root(Path(args.repo_root))
+    except ValueError as exc:
+        parser.error(str(exc))
+    return install_service(args.instance, args.interval, repo_root)
