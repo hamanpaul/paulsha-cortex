@@ -346,6 +346,26 @@ class Stage9ClassifierTests(unittest.TestCase):
         self.assertIn("projT", ids)
         self.assertNotIn("skipme", ids)
 
+    def test_scan_workspaces_skips_unreadable_workspace_root(self) -> None:
+        ws_root = self.tmp / "ws"
+        make_workspace(
+            ws_root,
+            {"projT": {"kind": "tracked-paul-yml"}},
+        )
+        cfg = MonitorConfig(
+            workspaces=(WorkspaceConfig(path=ws_root, name="ws"),),
+            legacy_policy="list-only",
+        )
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path_self):
+            if path_self == ws_root:
+                raise PermissionError("denied")
+            return original_iterdir(path_self)
+
+        with mock.patch.object(Path, "iterdir", fake_iterdir):
+            self.assertEqual(scan_workspaces(cfg), ())
+
     def test_duplicate_project_names_are_qualified_in_snapshot(self) -> None:
         west = make_workspace(
             self.tmp / "west",
@@ -458,6 +478,22 @@ class Stage9ParserTests(unittest.TestCase):
         state = extract_project_state(proj, workspace_name="ws")
         kinds = {s.kind for s in state.source_signals}
         self.assertIn("todo", kinds)
+
+    def test_extract_project_state_marks_unreadable_archive_as_degraded(self) -> None:
+        proj = self._make_project_with_todo(DEFAULT_TODO)
+        archive_root = proj / "openspec" / "changes" / "archive"
+        archive_root.mkdir(parents=True)
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path_self):
+            if path_self == archive_root:
+                raise PermissionError("denied")
+            return original_iterdir(path_self)
+
+        with mock.patch.object(Path, "iterdir", fake_iterdir):
+            state = extract_project_state(proj, workspace_name="ws")
+        notes = " ".join(s.note or "" for s in state.source_signals if s.kind == "archive")
+        self.assertIn("degraded", notes.lower())
 
     def test_parse_todo_current_sprint_returns_only_open_items(self) -> None:
         proj = self._make_project_with_todo(DEFAULT_TODO)

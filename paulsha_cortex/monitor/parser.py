@@ -61,15 +61,21 @@ def parse_blockers(todo_md: Path) -> tuple[str, ...]:
     return tuple(items)
 
 
-def _list_workstream_dirs(project_dir: Path) -> list[Path]:
+def _list_workstream_dirs(project_dir: Path) -> tuple[list[Path], str | None]:
     workstreams_root = project_dir / "docs" / "superpowers" / "workstreams"
-    if not workstreams_root.is_dir():
-        return []
-    return sorted(
-        child
-        for child in workstreams_root.iterdir()
-        if child.is_dir() and child.name.startswith("stage")
-    )
+    try:
+        if not workstreams_root.is_dir():
+            return [], None
+        return (
+            sorted(
+                child
+                for child in workstreams_root.iterdir()
+                if child.is_dir() and child.name.startswith("stage")
+            ),
+            None,
+        )
+    except OSError as error:
+        return [], f"degraded: {type(error).__name__}: {error}"
 
 
 def _make_view(workstream_dir: Path) -> tuple[StageView | None, list[Signal]]:
@@ -127,7 +133,16 @@ def extract_project_state(project_dir: Path, *, workspace_name: str) -> ProjectS
     pending: list[StageRef] = []
     signals: list[Signal] = []
 
-    for workstream_dir in _list_workstream_dirs(project_dir):
+    workstream_dirs, workstream_error = _list_workstream_dirs(project_dir)
+    if workstream_error:
+        signals.append(
+            Signal(
+                kind="workstreams",
+                path=str(project_dir / "docs" / "superpowers" / "workstreams"),
+                note=workstream_error,
+            )
+        )
+    for workstream_dir in workstream_dirs:
         view, view_signals = _make_view(workstream_dir)
         signals.extend(view_signals)
         if view is not None:
@@ -145,13 +160,22 @@ def extract_project_state(project_dir: Path, *, workspace_name: str) -> ProjectS
     # later patch; spec §B3 + design §4 decision #5 keep it pluggable.)
     completed: list[StageRef] = []
     archive_root = project_dir / "openspec" / "changes" / "archive"
-    if archive_root.is_dir():
-        for entry in sorted(archive_root.iterdir()):
-            if entry.is_dir() and "stage" in entry.name:
-                completed.append(
-                    StageRef(stage_id=entry.name, workstream_path=str(entry))
-                )
-        signals.append(Signal(kind="archive", path=str(archive_root)))
+    try:
+        if archive_root.is_dir():
+            for entry in sorted(archive_root.iterdir()):
+                if entry.is_dir() and "stage" in entry.name:
+                    completed.append(
+                        StageRef(stage_id=entry.name, workstream_path=str(entry))
+                    )
+            signals.append(Signal(kind="archive", path=str(archive_root)))
+    except OSError as error:
+        signals.append(
+            Signal(
+                kind="archive",
+                path=str(archive_root),
+                note=f"degraded: {type(error).__name__}: {error}",
+            )
+        )
 
     return ProjectState(
         project_id=project_dir.name,
