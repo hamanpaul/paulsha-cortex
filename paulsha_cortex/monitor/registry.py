@@ -29,8 +29,8 @@ def load_hippo_projects(path: Path | None = None) -> list[ProjectEntry]:
         return []
     try:
         data = yaml.safe_load(src.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        raise ValueError(f"project-hippo.yaml 解析失敗：{src} ({exc})") from exc
+    except (yaml.YAMLError, OSError) as exc:
+        raise ValueError(f"project-hippo.yaml 讀取或解析失敗：{src} ({exc})") from exc
     if data is None:
         data = {}
     if not isinstance(data, dict):
@@ -51,7 +51,12 @@ def load_hippo_projects(path: Path | None = None) -> list[ProjectEntry]:
                 raise ValueError(
                     f"project-hippo.yaml projects[{index}].roots[{root_index}] 必須是字串：{src}"
                 )
-            resolved = Path(str(root)).expanduser().resolve()
+            raw_root = root.strip()
+            if not raw_root:
+                raise ValueError(
+                    f"project-hippo.yaml projects[{index}].roots[{root_index}] 不可為空字串：{src}"
+                )
+            resolved = Path(raw_root).expanduser().resolve()
             entries.append(
                 ProjectEntry(
                     path=resolved,

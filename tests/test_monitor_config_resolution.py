@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from paulsha_cortex.monitor.config import _resolve_config_source
+import pytest
+
+from paulsha_cortex.monitor.config import _resolve_config_source, load_config
 
 
 def _write(p: Path, text="workspaces:\n  - {name: a, path: /tmp/a}\n"):
@@ -35,3 +37,17 @@ def test_none_when_no_manual(monkeypatch, tmp_path):
     monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(tmp_path / "legacy"))
     assert _resolve_config_source(None) is None
+
+
+def test_load_config_wraps_read_os_error(monkeypatch, tmp_path):
+    config_path = _write(tmp_path / "agents" / "project-cortex.yaml")
+    original = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == config_path:
+            raise PermissionError("denied")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with pytest.raises(ValueError, match="讀取或解析失敗"):
+        load_config(config_path=config_path)

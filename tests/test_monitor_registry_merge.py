@@ -62,6 +62,28 @@ def test_load_hippo_projects_rejects_non_mapping_top_level(tmp_path):
         registry.load_hippo_projects(src)
 
 
+def test_load_hippo_projects_rejects_blank_root(tmp_path):
+    src = tmp_path / "project-hippo.yaml"
+    src.write_text("projects:\n  - slug: proj-x\n    roots: ['']\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="不可為空字串"):
+        registry.load_hippo_projects(src)
+
+
+def test_load_hippo_projects_wraps_read_os_error(tmp_path, monkeypatch):
+    src = tmp_path / "project-hippo.yaml"
+    src.write_text("projects: []\n", encoding="utf-8")
+    original = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == src:
+            raise PermissionError("denied")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with pytest.raises(ValueError, match="讀取或解析失敗"):
+        registry.load_hippo_projects(src)
+
+
 def test_load_config_missing_hippo_graceful(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
     monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)

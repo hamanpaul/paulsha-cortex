@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import socket
+import stat
 import threading
 import time
 from dataclasses import asdict
@@ -68,6 +69,14 @@ class MonitorServer:
     def _prepare_socket_path(self) -> None:
         if not self._socket_path.exists():
             return
+        try:
+            mode = self._socket_path.stat().st_mode
+        except OSError as exc:
+            raise RuntimeError(f"無法檢查 monitor socket path：{self._socket_path}") from exc
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError(
+                f"monitor socket path 已存在且不是 Unix socket：{self._socket_path}"
+            )
 
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:

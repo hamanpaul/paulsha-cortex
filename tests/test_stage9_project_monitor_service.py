@@ -487,9 +487,19 @@ class Stage9ServerTests(unittest.TestCase):
             reclaimed.stop()
             reclaimed_thread.join(timeout=2.0)
 
+    def test_server_refuses_to_delete_non_socket_path(self) -> None:
+        bad_path = self.tmp / "not-a-socket"
+        bad_path.write_text("occupied", encoding="utf-8")
+        contender = MonitorServer(store=self.store, socket_path=bad_path)
+        with self.assertRaisesRegex(RuntimeError, "不是 Unix socket"):
+            contender._prepare_socket_path()
+        self.assertTrue(bad_path.exists())
+
     def test_server_timeout_probe_treats_socket_as_live(self) -> None:
         busy_path = self.tmp / "busy-monitor.sock"
-        busy_path.write_text("", encoding="utf-8")
+        busy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        busy.bind(str(busy_path))
+        busy.close()
         contender = MonitorServer(store=self.store, socket_path=busy_path)
 
         class _TimeoutProbe:

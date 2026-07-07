@@ -18,6 +18,7 @@ class DeckCompileError(ValueError):
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SLICE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_CHANGE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 def slugify_task(task: str) -> str:
@@ -26,6 +27,14 @@ def slugify_task(task: str) -> str:
     if not slug:
         raise DeckCompileError(f"task 無法正規化為 slug: {task!r}")
     return slug
+
+
+def _validate_change_name(change: str) -> str:
+    if not _CHANGE_RE.fullmatch(change):
+        raise DeckCompileError(
+            f"change 名稱不合法（僅允許 [a-z0-9-]，且不可含路徑分隔）: {change!r}"
+        )
+    return change
 
 
 def specs_dir() -> Path:
@@ -220,6 +229,8 @@ def compile_combo(
     plan_ref: str | None = None,
 ) -> CompileResult:
     slug = slugify_task(task)
+    if change is not None:
+        change = _validate_change_name(change)
     entries = _resolve_hand(combo, cards, with_cards, only)
     external = _check_requires_coverage(entries, cards, allow_external)
 

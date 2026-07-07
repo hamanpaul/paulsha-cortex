@@ -113,8 +113,8 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
 
     try:
         payload = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as error:
-        raise ValueError(f"設定檔解析失敗：{resolved} ({error})") from error
+    except (yaml.YAMLError, OSError) as error:
+        raise ValueError(f"設定檔讀取或解析失敗：{resolved} ({error})") from error
 
     if not isinstance(payload, dict):
         raise ValueError(f"設定檔必須是 mapping：{resolved}")

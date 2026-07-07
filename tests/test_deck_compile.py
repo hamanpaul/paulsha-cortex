@@ -245,6 +245,12 @@ def test_compile_missing_change_placeholder_errors(tmp_path):
         compile_combo(combo, cards, "示例 LED 功能", allow_external=True)
 
 
+def test_compile_rejects_unsafe_change_name(tmp_path):
+    cards, combo = _feature_oneshot(tmp_path)
+    with pytest.raises(DeckCompileError, match="change 名稱不合法"):
+        compile_combo(combo, cards, "示例 LED 功能", change="../evil", allow_external=True)
+
+
 def test_compile_frontmatter_exact_keyset(tmp_path):
     from paulsha_cortex.deck.schema import EMITTED_FRONTMATTER_FIELDS
 
