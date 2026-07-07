@@ -1,0 +1,26 @@
+combo:
+  id: feature-oneshot
+  task_type: feature
+  cards:
+    - ref: brainstorming
+    - ref: openspec-propose
+    - ref: writing-plans
+    - ref: worktree-isolation
+    - ref: tdd-red
+    - ref: subagent-build
+    - ref: code-review
+    - ref: verification
+    - ref: openspec-archive
+    - ref: policy-commit
+    - ref: adversarial-review
+  gate_spine:
+    - after: writing-plans
+      exists: ["docs/superpowers/plans/*<task-slug>*.md"]
+    - after: code-review
+      exists: ["reports/review/*<task-slug>*.md"]
+    - after: verification
+      exists: ["reports/verify/*<task-slug>*.md"]
+    - after: openspec-archive
+      exists: ["openspec/changes/archive/*<change>*"]
+    - after: adversarial-review
+      exists: ["reports/review/*<task-slug>*-adversarial.md"]
