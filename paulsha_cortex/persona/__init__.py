@@ -1,6 +1,8 @@
 """Stage4 persona contract and guardrail primitives."""
 
-from . import context, contract, gate, guardrail, handoff, render, scope_ci, shadow
+from importlib import import_module
+
+from . import context, contract, gate, guardrail, handoff, render, shadow
 
 __all__ = [
     "contract",
@@ -12,3 +14,9 @@ __all__ = [
     "gate",
     "scope_ci",
 ]
+
+
+def __getattr__(name: str):
+    if name == "scope_ci":
+        return import_module(".scope_ci", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
