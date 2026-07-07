@@ -46,6 +46,26 @@ def _resolve_git_repo_root(repo_root: Path) -> Path:
     return Path(probe.stdout.strip()).resolve()
 
 
+def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
+    """更新 managed keys（PY / PSC_REPO_ROOT），就地保留其餘 operator 手動行與註解。
+
+    每次 install 只覆寫本函式管理的鍵；既有的 PSC_MANAGER_SPECS_DIR、
+    PSC_WORKTREE_ROOT、PSC_CONTROL_ROOT 等 operator 設定不得被清掉。
+    """
+    lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
+    remaining = dict(managed)
+    out: list[str] = []
+    for line in lines:
+        key = line.split("=", 1)[0] if "=" in line else None
+        if key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={value}")
+    env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
 def install_service(instance: str, interval: int, repo_root: Path) -> int:
     home = Path.home()
     unit_dir = home / ".config" / "systemd" / "user"
@@ -55,7 +75,7 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
     env_file = runtime_dir / f"{instance}-manager.env"
-    env_file.write_text(f"PY={sys.executable}\nPSC_REPO_ROOT={repo_root}\n")
+    _write_managed_env(env_file, {"PY": sys.executable, "PSC_REPO_ROOT": str(repo_root)})
     if not _systemctl_available():
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
         return 0

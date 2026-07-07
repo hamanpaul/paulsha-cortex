@@ -64,6 +64,35 @@ def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
     assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
 
 
+def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True)
+    env_file = runtime_dir / "beta-manager.env"
+    env_file.write_text(
+        "# operator tuning\nPSC_WORKTREE_ROOT=/custom/worktrees\nPY=/stale/python\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    # operator 手動行與註解保留
+    assert "# operator tuning" in env_lines
+    assert "PSC_WORKTREE_ROOT=/custom/worktrees" in env_lines
+    # managed key 就地更新、不重複
+    assert f"PY={sys.executable}" in env_lines
+    assert sum(line.startswith("PY=") for line in env_lines) == 1
+    assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
+
+
 def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):
     from paulsha_cortex.deploy import installer
 
