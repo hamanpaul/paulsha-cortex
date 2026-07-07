@@ -28,11 +28,13 @@ def load_hippo_projects(path: Path | None = None) -> list[ProjectEntry]:
     if not src.exists():
         return []
     try:
-        data = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(src.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         raise ValueError(f"project-hippo.yaml 解析失敗：{src} ({exc})") from exc
+    if data is None:
+        data = {}
     if not isinstance(data, dict):
-        return []
+        raise ValueError(f"project-hippo.yaml 頂層必須是 mapping：{src}")
     raw_projects = data.get("projects", []) or []
     if not isinstance(raw_projects, list):
         raise ValueError(f"project-hippo.yaml projects 必須是清單：{src}")

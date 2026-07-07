@@ -225,3 +225,10 @@ def test_compile_out_file_path_reports_error(tmp_path, capsys, monkeypatch):
     )
     assert rc == 1
     assert "deck:" in capsys.readouterr().err
+
+
+def test_verify_missing_change_returns_cli_error(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    rc = deck_cli.main(["verify", "openspec-archive", "--task-slug", "demo-task"])
+    assert rc == 1
+    assert "deck:" in capsys.readouterr().err

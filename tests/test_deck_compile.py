@@ -236,7 +236,7 @@ def test_compile_frontmatter_hold_and_chain(tmp_path):
     assert first.startswith("---\n")
     assert "dispatch: hold" in first
     second = result.slices[1].content
-    assert f"- {result.task_slug}-build" in second
+    assert f"depends_on: [{result.task_slug}-build]" in second
 
 
 def test_compile_missing_change_placeholder_errors(tmp_path):
@@ -442,7 +442,7 @@ def test_compile_rejects_duplicate_slice_ids_from_split_group(tmp_path):
 def test_verify_commands_include_change_when_needed(tmp_path):
     cards, combo = _feature_oneshot(tmp_path)
     result = compile_combo(combo, cards, "demo task", change="demo", allow_external=True)
-    assert "psc deck verify openspec-archive --task-slug demo-task --change demo" in result.verify_commands
+    assert "cortex deck verify openspec-archive --task-slug demo-task --change demo" in result.verify_commands
 
 
 
@@ -468,7 +468,7 @@ combo:
     build = next(s for s in result.slices if s.slice_id == f"{slug}-build")
     adv = next(s for s in result.slices if s.slice_id == f"{slug}-adversarial-review")
     assert "depends_on: []" in build.content or "depends_on:\n" not in build.content.split("---")[1] or True
-    assert f"- {slug}-build" in adv.content  # 組員 dep → group slice id
+    assert f"depends_on: [{slug}-build]" in adv.content  # 組員 dep → group slice id
 
 
 def test_with_card_already_in_hand_rejected(tmp_path):

@@ -179,17 +179,14 @@ def _group_slices(
 
 
 def _render_frontmatter(slice_id: str, plan_ref: str, deps: Sequence[str]) -> str:
+    depends_on = "[" + ", ".join(deps) + "]" if deps else "[]"
     lines = [
         "---",
         "dispatch: hold",
         f"slice_id: {slice_id}",
         f"plan: {plan_ref}",
+        f"depends_on: {depends_on}",
     ]
-    if deps:
-        lines.append("depends_on:")
-        lines.extend(f"  - {dep}" for dep in deps)
-    else:
-        lines.append("depends_on: []")
     lines.append("---")
     return "\n".join(lines)
 
@@ -280,7 +277,7 @@ def compile_combo(
 
         for member in members:
             if member.produces:
-                command = f"psc deck verify {member.id} --task-slug {slug}"
+                command = f"cortex deck verify {member.id} --task-slug {slug}"
                 if _uses_change(member):
                     command += f" --change {change}"
                 verify_commands.append(command)

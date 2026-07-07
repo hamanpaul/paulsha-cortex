@@ -132,5 +132,12 @@ def test_feature_oneshot_real_data_compiles_to_hold_specs(tmp_path):
     emit(result, out)
     metas = scan_specs(out)
     assert len(metas) == 5
+    assert {meta["slice_id"] for meta in metas} == {
+        f"{slug}-build",
+        f"{slug}-code-review",
+        f"{slug}-verification",
+        f"{slug}-ship",
+        f"{slug}-adversarial-review",
+    }
     detect_cycles(metas)
     assert ready_units(metas, lambda sid: True) == []  # 全 hold 不誤觸發

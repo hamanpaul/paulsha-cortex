@@ -12,6 +12,7 @@ from .schema import (
     load_cards,
     load_combo,
 )
+from .verify import DeckVerifyError
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -104,7 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if result.ok else 1
 
         return 2
-    except (DeckSchemaError, DeckCompileError) as exc:
+    except (DeckSchemaError, DeckCompileError, DeckVerifyError) as exc:
         print(f"deck: {exc}", file=sys.stderr)
         return 1
 
