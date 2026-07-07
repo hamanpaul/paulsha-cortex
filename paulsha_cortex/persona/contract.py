@@ -4,10 +4,16 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from typing import Mapping
 
-from paulsha_hippo.lib.lifecycle import schema as lifecycle_schema
-
-
-PHASES = lifecycle_schema.PHASES
+# Stage 3 生命週期詞彙表（語意凍結）；與上游相等性由消費端對齊測試守。
+PHASES = (
+    "research",
+    "define",
+    "plan",
+    "build",
+    "verify",
+    "review",
+    "ship",
+)
 REQUIRED_ROLES = ("manager", "builder", "reviewer")
 GATE_STATUSES = ("passed", "failed", "running", "skipped", "override")
 
