@@ -26,6 +26,8 @@ class Watcher(Protocol):
         recursive: bool = True,
     ) -> None: ...
 
+    def unwatch(self, path: Path, *, recursive: bool = True) -> None: ...
+
     def stop(self) -> None: ...
 
 
@@ -50,6 +52,14 @@ class StubWatcher:
         recursive: bool = True,
     ) -> None:
         self._subscriptions.append((Path(path), callback, recursive))
+
+    def unwatch(self, path: Path, *, recursive: bool = True) -> None:
+        target = Path(path)
+        self._subscriptions = [
+            entry
+            for entry in self._subscriptions
+            if not (entry[0] == target and entry[2] == recursive)
+        ]
 
     def trigger(self, path: Path) -> None:
         if self._stopped:
@@ -138,8 +148,6 @@ if HAS_WATCHDOG:
             return path == self._watch_path or path.parent == self._watch_path
 
         def on_any_event(self, event: FileSystemEvent) -> None:
-            if event.is_directory:
-                return
             for raw_path in (
                 event.src_path,
                 getattr(event, "dest_path", ""),
@@ -166,6 +174,7 @@ if HAS_WATCHDOG:
         def __init__(self, *, debounce_ms: int = 500) -> None:
             self._observer = Observer()
             self._handlers: list[_DebouncedHandler] = []
+            self._watches: dict[tuple[Path, bool], tuple[_DebouncedHandler, object]] = {}
             self._debounce_seconds = max(0.0, debounce_ms / 1000.0)
             self._started = False
             self._stopped = False
@@ -180,6 +189,9 @@ if HAS_WATCHDOG:
             if self._stopped:
                 raise RuntimeError("watcher is stopped")
             watch_path = Path(path)
+            watch_key = (watch_path, recursive)
+            if watch_key in self._watches:
+                return
             observer_root = watch_path.parent if watch_path.is_file() else watch_path
             handler = _DebouncedHandler(
                 watch_path=watch_path,
@@ -188,10 +200,25 @@ if HAS_WATCHDOG:
                 recursive=recursive,
             )
             self._handlers.append(handler)
-            self._observer.schedule(handler, str(observer_root), recursive=recursive)
+            watch = self._observer.schedule(handler, str(observer_root), recursive=recursive)
+            self._watches[watch_key] = (handler, watch)
             if not self._started:
                 self._observer.start()
                 self._started = True
+
+        def unwatch(self, path: Path, *, recursive: bool = True) -> None:
+            watch_key = (Path(path), recursive)
+            pair = self._watches.pop(watch_key, None)
+            if pair is None:
+                return
+            handler, watch = pair
+            handler.cancel()
+            self._handlers = [item for item in self._handlers if item is not handler]
+            if self._started:
+                try:
+                    self._observer.unschedule(watch)
+                except Exception:  # pragma: no cover
+                    pass
 
         def stop(self) -> None:
             self._stopped = True
@@ -204,6 +231,7 @@ if HAS_WATCHDOG:
                 except Exception:  # pragma: no cover
                     pass
                 self._started = False
+            self._watches.clear()
             self._handlers.clear()
 
 else:  # pragma: no cover - exercised only when watchdog missing
@@ -216,6 +244,9 @@ else:  # pragma: no cover - exercised only when watchdog missing
 
         def watch(self, path, callback) -> None:  # noqa: D401
             raise RuntimeError("watchdog not available")
+
+        def unwatch(self, path, *, recursive: bool = True) -> None:
+            return None
 
         def stop(self) -> None:
             return None

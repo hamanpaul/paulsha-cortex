@@ -16,7 +16,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="paulsha_cortex.monitor",
         description="Stage 9 Project Monitor",
     )
-    parser.add_argument("--config", help="path to paulshaclaw.yaml", default=None)
+    parser.add_argument(
+        "--config",
+        help="path to project-cortex.yaml（或 legacy paulshaclaw.yaml）",
+        default=None,
+    )
     parser.add_argument(
         "--once",
         action="store_true",

@@ -119,7 +119,10 @@ class ProjectMonitorService:
                     continue
                 seen.add(key)
                 desired_keys.append(key)
-        self._watched_paths.intersection_update(seen)
+        stale_keys = self._watched_paths - seen
+        for watch_path, recursive in stale_keys:
+            self._watcher.unwatch(watch_path, recursive=recursive)
+            self._watched_paths.remove((watch_path, recursive))
         for watch_path, recursive in desired_keys:
             watch_key = (watch_path, recursive)
             if watch_key in self._watched_paths:

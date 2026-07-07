@@ -184,6 +184,15 @@ def test_compile_dry_run_writes_nothing(tmp_path, capsys, monkeypatch):
     assert "dispatch: hold" in capsys.readouterr().out
 
 
+def test_compile_dry_run_without_change_still_loads_default_data(tmp_path, capsys, monkeypatch):
+    _seed_fixture(tmp_path / "deck", monkeypatch)
+    rc = deck_cli.main(["compile", "feature-oneshot", "--task", "demo task"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "task-slug: demo-task" in out
+    assert "dispatch: hold" in out
+
+
 def test_compile_emit_writes_hold_specs(tmp_path, monkeypatch):
     _seed_fixture(tmp_path / "deck", monkeypatch)
     specs_root = tmp_path / "specs"

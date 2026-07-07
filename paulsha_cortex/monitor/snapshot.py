@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -16,6 +16,7 @@ class ChangeEvent:
     project_id: str
     sequence: int
     project_state: ProjectState
+    removed: bool = False
 
 
 def _project_signature(state: ProjectState) -> tuple:
@@ -66,15 +67,27 @@ class SnapshotStore:
     def refresh(self) -> tuple[ChangeEvent, ...]:
         """Re-scan all workspaces; emit one event per changed project."""
         with self._lock:
+            previous_states = self._states
+            previous_signatures = self._signatures
             new_states = {s.project_id: s for s in scan_workspaces(self._config)}
             new_signatures = {
                 project_id: _project_signature(state)
                 for project_id, state in new_states.items()
             }
             events: list[ChangeEvent] = []
+            for project_id in sorted(previous_states.keys() - new_states.keys()):
+                self._sequence += 1
+                events.append(
+                    ChangeEvent(
+                        project_id=project_id,
+                        sequence=self._sequence,
+                        project_state=previous_states[project_id],
+                        removed=True,
+                    )
+                )
             for project_id, state in new_states.items():
                 signature = new_signatures[project_id]
-                if self._signatures.get(project_id) != signature:
+                if previous_signatures.get(project_id) != signature:
                     self._sequence += 1
                     events.append(
                         ChangeEvent(
@@ -98,8 +111,18 @@ class SnapshotStore:
                 if not project_dir.is_dir():
                     self._states.pop(project_id, None)
                     self._signatures.pop(project_id, None)
+                    self._sequence += 1
+                    events.append(
+                        ChangeEvent(
+                            project_id=project_id,
+                            sequence=self._sequence,
+                            project_state=current,
+                            removed=True,
+                        )
+                    )
                     continue
                 state = extract_project_state(project_dir, workspace_name=current.workspace)
+                state = replace(state, project_id=current.project_id)
                 signature = _project_signature(state)
                 self._states[project_id] = state
                 if self._signatures.get(project_id) == signature:

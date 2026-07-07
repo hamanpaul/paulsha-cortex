@@ -167,6 +167,7 @@ class MonitorServer:
                         "sequence": evt.sequence,
                         "kind": "change",
                         "project": _state_to_dict(evt.project_state),
+                        "removed": evt.removed,
                     }
                     try:
                         sub.queue.put_nowait(payload)

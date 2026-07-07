@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import time
 from enum import Enum
 from pathlib import Path
@@ -51,6 +52,30 @@ def _list_project_dirs(workspace_root: Path, ignore_dirs: frozenset[str]) -> lis
     return items
 
 
+def _qualified_duplicate_project_id(states: list[ProjectState], state: ProjectState) -> str:
+    workspace_qualified = {
+        other.workspace: f"{other.workspace}:{Path(other.path).name}"
+        for other in states
+    }
+    if len(workspace_qualified) == len(states):
+        return workspace_qualified[state.workspace]
+    return f"{state.workspace}:{Path(state.path).resolve()}"
+
+
+def _dedupe_project_ids(states: list[ProjectState]) -> tuple[ProjectState, ...]:
+    grouped: dict[str, list[ProjectState]] = {}
+    for state in states:
+        grouped.setdefault(state.project_id, []).append(state)
+    resolved: list[ProjectState] = []
+    for state in states:
+        group = grouped[state.project_id]
+        if len(group) == 1:
+            resolved.append(state)
+            continue
+        resolved.append(replace(state, project_id=_qualified_duplicate_project_id(group, state)))
+    return tuple(resolved)
+
+
 def scan_workspaces(config: MonitorConfig) -> tuple[ProjectState, ...]:
     """Walk every configured workspace and produce per-project states.
 
@@ -99,4 +124,4 @@ def scan_workspaces(config: MonitorConfig) -> tuple[ProjectState, ...]:
             )
             states.append(state)
 
-    return tuple(states)
+    return _dedupe_project_ids(states)

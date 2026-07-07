@@ -33,12 +33,22 @@ def load_hippo_projects(path: Path | None = None) -> list[ProjectEntry]:
         raise ValueError(f"project-hippo.yaml 解析失敗：{src} ({exc})") from exc
     if not isinstance(data, dict):
         return []
+    raw_projects = data.get("projects", []) or []
+    if not isinstance(raw_projects, list):
+        raise ValueError(f"project-hippo.yaml projects 必須是清單：{src}")
     entries: list[ProjectEntry] = []
-    for project in data.get("projects", []) or []:
+    for index, project in enumerate(raw_projects):
         if not isinstance(project, dict):
-            continue
+            raise ValueError(f"project-hippo.yaml projects[{index}] 必須是 mapping：{src}")
         slug = str(project.get("slug") or "")
-        for root in project.get("roots", []) or []:
+        roots = project.get("roots", []) or []
+        if not isinstance(roots, list):
+            raise ValueError(f"project-hippo.yaml projects[{index}].roots 必須是清單：{src}")
+        for root_index, root in enumerate(roots):
+            if not isinstance(root, str):
+                raise ValueError(
+                    f"project-hippo.yaml projects[{index}].roots[{root_index}] 必須是字串：{src}"
+                )
             resolved = Path(str(root)).expanduser().resolve()
             entries.append(
                 ProjectEntry(

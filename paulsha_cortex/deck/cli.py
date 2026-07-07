@@ -56,11 +56,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "compile":
             combo = load_combo(DEFAULT_COMBOS_DIR / f"{args.combo}.yaml", cards)
+            effective_change = args.change
+            if effective_change is None and not args.emit and not args.out:
+                effective_change = "dry-run"
             result = compile_combo(
                 combo,
                 cards,
                 args.task,
-                change=args.change,
+                change=effective_change,
                 with_cards=tuple(args.with_cards),
                 only=tuple(args.only),
                 allow_external=args.allow_external,

@@ -202,11 +202,14 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
 
         shutil.rmtree(doomed)
 
-        store.refresh()
+        events = store.refresh()
 
         ids = {project.project_id for project in store.current_snapshot()}
         self.assertEqual(ids, {"projA"})
         self.assertIsNone(store.get("projB"))
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0].removed)
+        self.assertEqual(events[0].project_id, "projB")
 
     def test_store_assigns_monotonic_sequence_to_events(self) -> None:
         (self.tmp / "ws").mkdir(parents=True, exist_ok=True)
@@ -226,6 +229,26 @@ class Stage9SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(len(second), 1)
         self.assertGreater(second[0].sequence, first[0].sequence)
+
+    def test_store_preserves_duplicate_project_basenames(self) -> None:
+        west_root = self.tmp / "west"
+        east_root = self.tmp / "east"
+        west_root.mkdir(parents=True, exist_ok=True)
+        east_root.mkdir(parents=True, exist_ok=True)
+        _make_workspace(west_root, "same", DEFAULT_TODO)
+        _make_workspace(east_root, "same", DEFAULT_TODO)
+        cfg = MonitorConfig(
+            workspaces=(
+                WorkspaceConfig(path=west_root, name="west"),
+                WorkspaceConfig(path=east_root, name="east"),
+            ),
+            legacy_policy="list-only",
+        )
+        store = SnapshotStore(config=cfg)
+        store.load()
+        snapshot = store.current_snapshot()
+        self.assertEqual(len(snapshot), 2)
+        self.assertEqual(len({project.project_id for project in snapshot}), 2)
 
 
 # --- Stub watcher -------------------------------------------------------
@@ -672,6 +695,7 @@ class Stage9ServiceTests(unittest.TestCase):
         change_msg = json.loads(_socket_recv_line(sock, timeout=3.0))
         self.assertEqual(change_msg["kind"], "change")
         self.assertEqual(change_msg["project"]["project_id"], "projA")
+        self.assertFalse(change_msg["removed"])
 
     def test_service_deep_file_change_is_seen_after_periodic_rescan(self) -> None:
         sock = self._connect()
@@ -684,6 +708,26 @@ class Stage9ServiceTests(unittest.TestCase):
         change_msg = json.loads(_socket_recv_line(sock, timeout=3.0))
         self.assertEqual(change_msg["kind"], "change")
         self.assertEqual(change_msg["project"]["project_id"], "projA")
+
+    def test_service_emits_removed_event_when_project_deleted(self) -> None:
+        import shutil
+
+        sock = self._connect()
+        _socket_send_request(sock, {"kind": "subscribe"})
+        json.loads(_socket_recv_line(sock))  # consume initial snapshot
+
+        shutil.rmtree(self.project_dir)
+        self.stub_watcher.trigger(self.project_dir)
+
+        change_msg = json.loads(_socket_recv_line(sock, timeout=3.0))
+        self.assertEqual(change_msg["kind"], "change")
+        self.assertEqual(change_msg["project"]["project_id"], "projA")
+        self.assertTrue(change_msg["removed"])
+
+        query = self._connect()
+        _socket_send_request(query, {"kind": "list_projects"})
+        payload = json.loads(_socket_recv_line(query))
+        self.assertEqual(payload["data"]["projects"], [])
 
 
 # --- Real watchdog integration (optional) -------------------------------
@@ -755,6 +799,19 @@ class Stage9WatchdogIntegrationTests(unittest.TestCase):
             watcher.stop()
 
         self.assertIn(head_path, received)
+
+    def test_watchdog_file_watcher_unwatch_releases_watch_state(self) -> None:
+        target = self.tmp / "project"
+        target.mkdir()
+        watcher = WatchdogFileWatcher(debounce_ms=80)
+        try:
+            watcher.watch(target, lambda _path: None, recursive=False)
+            self.assertEqual(len(watcher._watches), 1)
+            watcher.unwatch(target, recursive=False)
+            self.assertEqual(len(watcher._watches), 0)
+            self.assertEqual(len(watcher._handlers), 0)
+        finally:
+            watcher.stop()
 
 
 if __name__ == "__main__":

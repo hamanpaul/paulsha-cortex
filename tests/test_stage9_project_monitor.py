@@ -344,6 +344,26 @@ class Stage9ClassifierTests(unittest.TestCase):
         self.assertIn("projT", ids)
         self.assertNotIn("skipme", ids)
 
+    def test_duplicate_project_names_are_qualified_in_snapshot(self) -> None:
+        west = make_workspace(
+            self.tmp / "west",
+            {"same": {"kind": "tracked-paul-yml"}},
+        )
+        east = make_workspace(
+            self.tmp / "east",
+            {"same": {"kind": "tracked-paul-yml"}},
+        )
+        cfg = MonitorConfig(
+            workspaces=(
+                WorkspaceConfig(path=west, name="west"),
+                WorkspaceConfig(path=east, name="east"),
+            ),
+        )
+        states = scan_workspaces(cfg)
+        ids = [state.project_id for state in states]
+        self.assertEqual(len(states), 2)
+        self.assertEqual(len(set(ids)), 2)
+
 
 # --- B3 / Parser tests ----------------------------------------------------
 
