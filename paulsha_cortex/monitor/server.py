@@ -60,6 +60,7 @@ class MonitorServer:
         self._subscribers: list[_Subscriber] = []
         self._subscribers_lock = threading.Lock()
         self._connection_threads: list[threading.Thread] = []
+        self._connection_threads_lock = threading.Lock()
         self._serve_thread: threading.Thread | None = None
 
     # --- lifecycle ---
@@ -115,7 +116,11 @@ class MonitorServer:
                     target=self._handle_connection, args=(conn,), daemon=True
                 )
                 t.start()
-                self._connection_threads.append(t)
+                with self._connection_threads_lock:
+                    self._connection_threads = [
+                        thread for thread in self._connection_threads if thread.is_alive()
+                    ]
+                    self._connection_threads.append(t)
         finally:
             self._teardown()
 
@@ -206,6 +211,13 @@ class MonitorServer:
                 conn.close()
             except OSError:
                 pass
+            current = threading.current_thread()
+            with self._connection_threads_lock:
+                self._connection_threads = [
+                    thread
+                    for thread in self._connection_threads
+                    if thread is not current and thread.is_alive()
+                ]
 
     def _handle_list_projects(self, conn: socket.socket) -> None:
         states = self._store.current_snapshot()

@@ -377,6 +377,17 @@ class Stage9ServerTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("error", payload)
 
+    def test_server_discards_finished_connection_threads(self) -> None:
+        for _ in range(3):
+            sock = self._connect()
+            _socket_send_request(sock, {"kind": "list_projects"})
+            _socket_recv_line(sock)
+            sock.close()
+        deadline = time.time() + 1.0
+        while time.time() < deadline and self.server._connection_threads:
+            time.sleep(0.02)
+        self.assertEqual(self.server._connection_threads, [])
+
     def test_server_rejects_live_socket_instead_of_stealing_it(self) -> None:
         (self.tmp / "ws2").mkdir(parents=True, exist_ok=True)
         _make_workspace(self.tmp / "ws2", "projZ", DEFAULT_TODO)
@@ -604,11 +615,50 @@ class Stage9ServiceTests(unittest.TestCase):
             for path, _callback, recursive in self.stub_watcher.subscriptions
         }
 
+        self.assertIn((str(self.tmp / "ws"), False), subscriptions)
         self.assertIn((str(self.project_dir), False), subscriptions)
         self.assertIn((str(self.project_dir / ".git" / "HEAD"), False), subscriptions)
         self.assertIn((str(self.project_dir / ".git" / "refs"), True), subscriptions)
         self.assertNotIn((str(self.project_dir), True), subscriptions)
         self.assertFalse(any("node_modules" in path for path, _recursive in subscriptions))
+
+    def test_service_falls_back_to_stub_watcher_without_watchdog(self) -> None:
+        from paulsha_cortex.monitor import service as service_module
+
+        cfg = MonitorConfig(
+            workspaces=(WorkspaceConfig(path=self.tmp / "ws", name="ws"),),
+            legacy_policy="list-only",
+            socket_path=self.tmp / "fallback.sock",
+        )
+        with mock.patch.object(service_module, "HAS_WATCHDOG", False):
+            fallback_service = ProjectMonitorService(config=cfg)
+        self.assertIsInstance(fallback_service._watcher, StubWatcher)
+        fallback_service.stop()
+
+    def test_service_prunes_and_readds_project_watch_keys_after_recreate(self) -> None:
+        import shutil
+
+        expected = {
+            (self.project_dir, False),
+            (self.project_dir / ".git" / "HEAD", False),
+            (self.project_dir / ".git" / "refs", True),
+        }
+        shutil.rmtree(self.project_dir)
+        self.stub_watcher.trigger(self.project_dir)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and any(key in self.service._watched_paths for key in expected):
+            time.sleep(0.02)
+        self.assertFalse(any(key in self.service._watched_paths for key in expected))
+
+        self.project_dir = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
+        (self.project_dir / ".git" / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        (self.project_dir / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (self.project_dir / ".git" / "refs" / "heads" / "main").write_text("deadbeef\n")
+        self.stub_watcher.trigger(self.project_dir)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not all(key in self.service._watched_paths for key in expected):
+            time.sleep(0.02)
+        self.assertTrue(all(key in self.service._watched_paths for key in expected))
 
     def test_service_branch_switch_trigger_still_emits_change_event_immediately(self) -> None:
         sock = self._connect()

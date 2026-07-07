@@ -27,7 +27,10 @@ def load_hippo_projects(path: Path | None = None) -> list[ProjectEntry]:
     src = path or _default_hippo_path()
     if not src.exists():
         return []
-    data = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
+    try:
+        data = yaml.safe_load(src.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"project-hippo.yaml 解析失敗：{src} ({exc})") from exc
     if not isinstance(data, dict):
         return []
     entries: list[ProjectEntry] = []

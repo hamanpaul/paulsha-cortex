@@ -96,6 +96,8 @@ class SnapshotStore:
                     continue
                 project_dir = Path(current.path)
                 if not project_dir.is_dir():
+                    self._states.pop(project_id, None)
+                    self._signatures.pop(project_id, None)
                     continue
                 state = extract_project_state(project_dir, workspace_name=current.workspace)
                 signature = _project_signature(state)

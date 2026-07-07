@@ -41,6 +41,13 @@ def test_load_hippo_projects_reads_slug_roots(tmp_path):
     assert entries[0].path == tmp_path.resolve()
 
 
+def test_load_hippo_projects_invalid_yaml_raises_value_error(tmp_path):
+    src = tmp_path / "project-hippo.yaml"
+    src.write_text("projects: [", encoding="utf-8")
+    with pytest.raises(ValueError, match="project-hippo.yaml"):
+        registry.load_hippo_projects(src)
+
+
 def test_load_config_missing_hippo_graceful(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
     monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)

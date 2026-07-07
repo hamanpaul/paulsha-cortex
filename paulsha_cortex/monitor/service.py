@@ -7,7 +7,7 @@ from pathlib import Path
 from .config import MonitorConfig
 from .server import MonitorServer
 from .snapshot import ChangeEvent, SnapshotStore
-from .watcher import WatchdogFileWatcher, Watcher
+from .watcher import HAS_WATCHDOG, StubWatcher, WatchdogFileWatcher, Watcher
 
 
 class ProjectMonitorService:
@@ -27,9 +27,14 @@ class ProjectMonitorService:
     ) -> None:
         self._config = config
         self._store = store or SnapshotStore(config=config)
-        self._watcher = watcher or WatchdogFileWatcher(
-            debounce_ms=config.watch_debounce_ms
-        )
+        if watcher is not None:
+            self._watcher = watcher
+        elif HAS_WATCHDOG:
+            self._watcher = WatchdogFileWatcher(
+                debounce_ms=config.watch_debounce_ms
+            )
+        else:
+            self._watcher = StubWatcher()
         self._server = server or MonitorServer(
             store=self._store,
             socket_path=config.socket_path,
@@ -98,13 +103,29 @@ class ProjectMonitorService:
         }
 
     def _install_watches(self) -> None:
+        desired_keys: list[tuple[Path, bool]] = []
+        seen: set[tuple[Path, bool]] = set()
+        for workspace in self._config.workspaces:
+            if not workspace.path.exists():
+                continue
+            key = (workspace.path, False)
+            if key not in seen:
+                seen.add(key)
+                desired_keys.append(key)
         for project_root in self._project_roots.values():
             for watch_path, recursive in self._watch_specs(project_root):
-                watch_key = (watch_path, recursive)
-                if watch_key in self._watched_paths:
+                key = (watch_path, recursive)
+                if key in seen:
                     continue
-                self._watcher.watch(watch_path, self._handle_fs_event, recursive=recursive)
-                self._watched_paths.add(watch_key)
+                seen.add(key)
+                desired_keys.append(key)
+        self._watched_paths.intersection_update(seen)
+        for watch_path, recursive in desired_keys:
+            watch_key = (watch_path, recursive)
+            if watch_key in self._watched_paths:
+                continue
+            self._watcher.watch(watch_path, self._handle_fs_event, recursive=recursive)
+            self._watched_paths.add(watch_key)
 
     def _watch_specs(self, project_root: Path) -> tuple[tuple[Path, bool], ...]:
         specs: list[tuple[Path, bool]] = [(project_root, False)]
