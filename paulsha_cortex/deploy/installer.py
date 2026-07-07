@@ -5,6 +5,7 @@ import argparse
 import re
 import shutil
 import subprocess
+import sys
 from importlib import resources
 from pathlib import Path
 from typing import Sequence
@@ -42,8 +43,7 @@ def install_service(instance: str, interval: int) -> int:
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
     env_file = runtime_dir / f"{instance}-manager.env"
-    if not env_file.exists():
-        env_file.write_text("")
+    env_file.write_text(f"PY={sys.executable}\n")
     if not _systemctl_available():
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
         return 0
