@@ -10,7 +10,6 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 START_SH = REPO / "paulsha_cortex" / "scripts" / "service-manager.sh"
-pytestmark = pytest.mark.skip(reason="Task 8")
 
 # 抽出 start_manager_service 函式單獨跑（避免 source 整支 service-manager.sh 的副作用）
 # NB: `}}` 是 Python str.format() 對字面 `}` 的跳脫；.format() 後 sed pattern
