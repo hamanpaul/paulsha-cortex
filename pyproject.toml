@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paulsha-cortex"
+dynamic = ["version"]
+requires-python = ">=3.10"
+description = "agent 治理平面：manager 派工 + persona 護欄 + control 檔案契約"
+dependencies = []
+
+[project.scripts]
+cortex = "paulsha_cortex.cli:main"
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["paulsha_cortex*"]
+
+[tool.setuptools.package-data]
+"paulsha_cortex.deploy" = ["templates/*.tmpl"]
+"paulsha_cortex" = [
+    "persona/personas.yaml",
+    "scripts/*.sh",
+    "scripts/*.py",
+    "scripts/hooks/*.json",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,15 +1,15 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.7 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.12 -->
 <!-- 此為 canonical 真檔；AGENTS.md / GEMINI.md / .github/copilot-instructions.md 為指向本檔的 symlink，只維護本檔 -->
-policy_version: 1.0.7
+policy_version: 1.0.12
 
 # Agent Policy Checklist
 
-本 repo 受 hamanpaul project policy v1.0.7 管轄。
+本 repo 受 hamanpaul project policy v1.0.12 管轄。
 所有 agent 進入 session 時，必須依下列 checklist 行動。
 
 ## 本 repo 的 profile
 - policy_profile: `flat` （見 `.paul-project.yml`）
-- policy_version: `1.0.7`
+- policy_version: `1.0.12`
 
 ## 動工前
 - [ ] 確認當前分支不是 `main`
@@ -103,3 +103,12 @@ policy_version: 1.0.7
 - **R-24（moc-alignment，opt-in，FAIL/WARN）**：repo 於 `.paul-project.yml` 宣告 `moc`（`static` / `map` / `triggers`）後生效（未宣告 → not-applicable）。三瓣：靜態鮮度（`moc.triggers` 命中但 `moc.static` 未同步 → WARN）／動態連結懸空（`moc.map` 連到不存在的受治理產物 `openspec/changes/**`・`docs/superpowers/{specs,plans}/**`，本次新破壞 FAIL、陳年 WARN）／動態連結孤兒（active openspec change・plan・spec 未被連結 → WARN，永不 FAIL）。內容跟著專案走（留各專案 repo），引擎只出規則；platform-agnostic（純 git-level，不依賴 GitHub/GitLab）。
 - **MOC 狀態語意對齊（advisory）**：`moc.map` 上某 stage 宣稱 done 是否真 done、被 postpone 的 stage 是否還誤掛 done，屬語意層，由 Copilot reviewer 留言提醒，不入確定性規則。
 - **Exemption 白名單新增**：`policy-exempt:moc-alignment`（R-24）。
+
+## v1.0.12 新增規則（隨 paulsha-conventions 1.0.8→1.0.12 升級）
+
+- **R-14（無豁免）**：本 repo 採 symlink 模式；`AGENTS.md`、`GEMINI.md`、`.github/copilot-instructions.md` 必須持續指向 `CLAUDE.md`。
+- **R-21（tier: shareable 生效）**：全 repo 不得含個人絕對路徑、使用者名或雇主／廠商識別；一律改用 `$HOME`、env、相對路徑或測試暫存目錄。
+- **R-22（doc-reference，diff-aware）**：本次 PR 新造成的 README / docs 懸空引用為 FAIL；陳年問題屬 WARN。
+- **R-23（引擎 pin attestation）**：`policy-check.yml` 的 reusable workflow pin、`policy_engine_ref`、`.paul-project.yml` 的 `policy_version` 必須同步對齊。
+- **R-24（moc-alignment）**：僅在 `.paul-project.yml` 宣告 `moc` 時生效；未宣告則 not-applicable。
+- **升版流程**：調整 policy pin 前，先以目標引擎版本在本機實跑 policy-check 確認零 fail，再推送分支。
