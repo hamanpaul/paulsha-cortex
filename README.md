@@ -8,13 +8,15 @@
 flowchart LR
     claw[產品 / 編排主 repo] --> cortex[paulsha-cortex\npersona + coordinator + control]
     claw --> hippo[paulsha-hippo\n共用基礎能力]
-    cortex -. 僅 deck lazy import .-> claw
+    cortex --> deck[deck + monitor]
     cortex -. 不依賴 .-> hippo
 ```
 
 - **主產品 repo**：產品與 orchestration 上游，之後可 pin 本 repo commit SHA 做遷移刀。
-- **paulsha-cortex**：治理平面抽離包，提供 `cortex` CLI、persona scope guardrail、manager runtime 與檔案契約。
-- **paulsha-hippo**：既有共用基礎能力；本 repo 已剪除 lifecycle / idle / paths 依賴，只保留 `persona.loader` 的 deck lazy import fail-open 契約。
+- **paulsha-cortex**：治理平面抽離包，提供 `cortex` CLI、persona scope guardrail、manager runtime、deck / monitor 與檔案契約。
+- **paulsha-hippo**：既有共用基礎能力；本 repo 已剪除 runtime 依賴，僅保留檔案契約層級的整合。
+
+persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role profile + scope subject），不是執行中的 agent session；真正執行的是 AgentInstance，真正做安全判斷的是 guardrail / policy engine，它們只讀 persona 契約做 enforcement。
 
 ## Install
 
@@ -71,8 +73,8 @@ python -m pip install .
 | persona enforcement | `shadow`；只觀測、不阻擋，翻牌到 enforce 另案處理 |
 | manager service install | `cortex install service` 已可 render / copy / enable，systemd 不可用時會 graceful 落檔 |
 | coordinator runtime | `dispatch` / `jobs` / `stat` / `ready` / `fanout` / `complete` / `tick` 已平移 |
-| deck 驗證 | fail-open lazy import；deck 缺席時跳過 shadow 卡片比對 |
-| 依賴模型 | `dependencies = []`；runtime 不依賴 `paulsha-hippo` |
+| deck 驗證 | deck 與 persona 同包；未知 card 仍以 warning 呈現 |
+| 依賴模型 | 僅 `PyYAML`；runtime 不依賴 `paulsha-hippo` |
 
 ## 開發備註
 
