@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,10 +10,19 @@ import yaml
 from paulsha_cortex.config import paths
 
 ENV_CONFIG_VAR = "PAULSHACLAW_CONFIG"
+NEW_ENV_CONFIG_VAR = "PSC_MONITOR_CONFIG"
 ALLOWED_LEGACY_POLICIES = ("list-only", "hide")
 
 
 def default_config_path() -> Path:
+    return _legacy_manual_path()
+
+
+def _new_manual_path() -> Path:
+    return paths.project_config_root() / "project-cortex.yaml"
+
+
+def _legacy_manual_path() -> Path:
     return paths.config_path("paulshaclaw.yaml")
 
 
@@ -37,26 +47,30 @@ class MonitorConfig:
     ignore_dirs: tuple[str, ...] = ()
 
 
-def _resolve_config_source(config_path: Path | None) -> Path:
+def _resolve_config_source(config_path: Path | None) -> Path | None:
     if config_path is not None:
         return Path(config_path)
-    env_value = os.environ.get(ENV_CONFIG_VAR)
-    if env_value:
-        return Path(env_value)
-    default = default_config_path()
-    if default.exists():
-        return default
-    sample = (
-        Path(__file__).resolve().parents[2]
-        / "paulshaclaw"
-        / "config"
-        / "paulshaclaw.sample.yaml"
-    )
-    if sample.exists():
-        return sample
-    raise FileNotFoundError(
-        f"找不到設定檔：請設置 --config、{ENV_CONFIG_VAR} 或 {default_config_path()}"
-    )
+    for env in (NEW_ENV_CONFIG_VAR, ENV_CONFIG_VAR):
+        raw = os.environ.get(env, "").strip()
+        if not raw:
+            continue
+        if env == ENV_CONFIG_VAR:
+            warnings.warn(
+                "PAULSHACLAW_CONFIG 已 deprecated，改用 project-cortex.yaml",
+                stacklevel=2,
+            )
+        return Path(raw).expanduser()
+    new = _new_manual_path()
+    if new.exists():
+        return new
+    legacy = _legacy_manual_path()
+    if legacy.exists():
+        warnings.warn(
+            f"讀取 deprecated legacy monitor 設定 {legacy}，請遷移至 {new}",
+            stacklevel=2,
+        )
+        return legacy
+    return None
 
 
 def _parse_workspaces(raw: Any) -> tuple[WorkspaceConfig, ...]:
@@ -94,10 +108,15 @@ def _parse_monitor_section(raw: Any) -> dict[str, Any]:
 def load_config(*, config_path: Path | None = None) -> MonitorConfig:
     """Load the global paulshaclaw config.
 
-    Resolution order: explicit `config_path` → `PAULSHACLAW_CONFIG` env →
-    `~/.config/paulshaclaw/paulshaclaw.yaml` → bundled sample (read-only).
+    Resolution order: explicit `config_path` → `PSC_MONITOR_CONFIG` env →
+    `PAULSHACLAW_CONFIG` env → `project-cortex.yaml` → legacy `paulshaclaw.yaml`.
     """
     resolved = _resolve_config_source(config_path)
+    if resolved is None:
+        raise FileNotFoundError(
+            "找不到設定檔：請設置 --config、PSC_MONITOR_CONFIG、PAULSHACLAW_CONFIG，"
+            f"或建立 {_new_manual_path()} / {_legacy_manual_path()}"
+        )
     if not resolved.exists():
         raise FileNotFoundError(f"設定檔不存在：{resolved}")
 

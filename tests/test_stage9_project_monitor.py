@@ -179,15 +179,15 @@ class Stage9ConfigTests(unittest.TestCase):
                 name: a
             """
         )
-        previous = os.environ.get("PAULSHACLAW_CONFIG")
-        os.environ["PAULSHACLAW_CONFIG"] = str(path)
+        previous = os.environ.get("PSC_MONITOR_CONFIG")
+        os.environ["PSC_MONITOR_CONFIG"] = str(path)
         try:
             cfg = load_config()
         finally:
             if previous is None:
-                os.environ.pop("PAULSHACLAW_CONFIG", None)
+                os.environ.pop("PSC_MONITOR_CONFIG", None)
             else:
-                os.environ["PAULSHACLAW_CONFIG"] = previous
+                os.environ["PSC_MONITOR_CONFIG"] = previous
 
         self.assertEqual(cfg.workspaces[0].name, "a")
 
