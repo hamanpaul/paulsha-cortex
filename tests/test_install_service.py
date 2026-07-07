@@ -107,3 +107,21 @@ def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):
 
     assert exc.value.code == 2
     assert f"{bad_root.resolve()} 不是 git repo" in capsys.readouterr().err
+
+
+def test_install_service_installs_monitor_unit(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    assert installer.main(["service", "--repo-root", str(repo)]) == 0
+    unit_dir = tmp_path / ".config" / "systemd" / "user"
+    assert (unit_dir / "cortex-manager.service").exists()
+    assert (unit_dir / "cortex-monitor.service").exists()
+    monitor_unit = (unit_dir / "cortex-monitor.service").read_text()
+    assert "paulsha_cortex.monitor" in monitor_unit
+    assert "__INSTANCE__.env".replace("__INSTANCE__", "cortex") in monitor_unit or "cortex.env" in monitor_unit
+    assert "cortex-manager.env" in monitor_unit

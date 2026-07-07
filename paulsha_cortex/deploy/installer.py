@@ -24,7 +24,13 @@ def render_units(instance: str, interval: int) -> dict[str, str]:
     service = service.replace("__SERVICE_SCRIPT__", str(_service_script_path()))
     timer = _template("manager.timer.tmpl").replace("__INSTANCE__", instance)
     timer = re.sub(r"^OnUnitActiveSec=.*$", f"OnUnitActiveSec={interval}", timer, flags=re.M)
-    return {f"{instance}-manager.service": service, f"{instance}-manager.timer": timer}
+    monitor = _template("monitor.service.tmpl").replace("__INSTANCE__", instance)
+    monitor = monitor.replace("__PY__", sys.executable)
+    return {
+        f"{instance}-manager.service": service,
+        f"{instance}-manager.timer": timer,
+        f"{instance}-monitor.service": monitor,
+    }
 
 
 def _systemctl_available() -> bool:
@@ -80,8 +86,9 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
         return 0
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", f"{instance}-monitor.service"], check=True)
     subprocess.run(["systemctl", "--user", "enable", f"{instance}-manager.timer"], check=True)
-    print(f"installed: {instance}-manager.{{service,timer}}")
+    print(f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service")
     return 0
 
 
