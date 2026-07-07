@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,6 +9,17 @@ from .schema import Card
 
 class DeckVerifyError(ValueError):
     """verify 參數/樣式錯誤（非 artifact 缺失）：佔位符未解析、絕對路徑、路徑逃逸。"""
+
+
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def _validate_name(label: str, value: str) -> str:
+    if not _NAME_RE.fullmatch(value):
+        raise DeckVerifyError(
+            f"{label} 名稱不合法（僅允許 [a-z0-9-]，不可含 glob/path metacharacters）: {value!r}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -45,6 +57,9 @@ def verify_card(
     change: str | None = None,
 ) -> VerifyResult:
     """produces glob 存在性驗收（Phase A：只驗存在，不驗內容）。"""
+    task_slug = _validate_name("task_slug", task_slug)
+    if change is not None:
+        change = _validate_name("change", change)
     base = Path(root)
     missing: list[str] = []
     matched: list[str] = []

@@ -78,3 +78,15 @@ def test_verify_unresolved_change_placeholder_rejected(tmp_path):
         _card(["openspec/changes/<change>/proposal.md"]), "demo",
         root=tmp_path, change="demo-change")
     assert result.ok
+
+
+def test_verify_rejects_unsafe_task_slug_and_change(tmp_path):
+    with pytest.raises(DeckVerifyError, match="task_slug 名稱不合法"):
+        verify_card(_card(["reports/review/*<task-slug>*.md"]), "demo*", root=tmp_path)
+    with pytest.raises(DeckVerifyError, match="change 名稱不合法"):
+        verify_card(
+            _card(["openspec/changes/<change>/proposal.md"]),
+            "demo",
+            root=tmp_path,
+            change="*",
+        )

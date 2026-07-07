@@ -10,6 +10,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
+_INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
 
 def _template(name: str) -> str:
     return (resources.files("paulsha_cortex.deploy") / "templates" / name).read_text()
@@ -50,6 +52,14 @@ def _resolve_git_repo_root(repo_root: Path) -> Path:
     if probe.returncode != 0:
         raise ValueError(f"{candidate} 不是 git repo")
     return Path(probe.stdout.strip()).resolve()
+
+
+def _validate_instance(instance: str) -> str:
+    if not _INSTANCE_RE.fullmatch(instance):
+        raise ValueError(
+            f"instance 名稱不合法（僅允許 [a-z0-9-]，不可含路徑分隔）: {instance!r}"
+        )
+    return instance
 
 
 def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
@@ -108,7 +118,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     svc.add_argument("--repo-root", default=str(Path.cwd()))
     args = parser.parse_args(argv)
     try:
+        instance = _validate_instance(args.instance)
         repo_root = _resolve_git_repo_root(Path(args.repo_root))
     except ValueError as exc:
         parser.error(str(exc))
-    return install_service(args.instance, args.interval, repo_root)
+    return install_service(instance, args.interval, repo_root)

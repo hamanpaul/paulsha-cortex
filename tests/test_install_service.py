@@ -127,3 +127,16 @@ def test_install_service_installs_monitor_unit(tmp_path, monkeypatch):
     assert "paulsha_cortex.monitor" in monitor_unit
     assert "__INSTANCE__.env".replace("__INSTANCE__", "cortex") in monitor_unit or "cortex.env" in monitor_unit
     assert "cortex-manager.env" in monitor_unit
+
+
+def test_install_rejects_unsafe_instance_name(tmp_path, monkeypatch, capsys):
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    with pytest.raises(SystemExit) as exc:
+        installer.main(["service", "--instance", "../bad"])
+
+    assert exc.value.code == 2
+    assert "instance 名稱不合法" in capsys.readouterr().err
