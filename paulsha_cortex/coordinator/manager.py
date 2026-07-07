@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 
+from ..lib import idle
 from ..persona import gate, handoff
-from paulsha_hippo.lib import idle
 from . import autonomy
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
