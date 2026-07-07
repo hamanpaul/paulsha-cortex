@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import MonitorConfig
 from .models import ProjectState
 from .parser import extract_project_state
+from .registry import ProjectEntry, merge_projects
 
 # Always-skip directory names that should never be treated as projects.
 IMPLICIT_IGNORE = frozenset({".git", ".hg", ".svn", "node_modules", "__pycache__"})
@@ -60,29 +61,42 @@ def scan_workspaces(config: MonitorConfig) -> tuple[ProjectState, ...]:
     ignore = frozenset(config.ignore_dirs)
     legacy_visible = config.legacy_policy != "hide"
     now = time.time()
+    manual_projects: list[ProjectEntry] = []
     states: list[ProjectState] = []
 
     for workspace in config.workspaces:
         for project_dir in _list_project_dirs(workspace.path, ignore):
-            classification = classify_project(project_dir)
-            is_legacy = classification == ProjectClassification.LEGACY
-            if is_legacy and not legacy_visible:
-                continue
-            if is_legacy:
-                states.append(
-                    ProjectState(
-                        project_id=project_dir.name,
-                        workspace=workspace.name,
-                        path=str(project_dir),
-                        legacy=True,
-                        last_seen_at=now,
-                    )
+            manual_projects.append(
+                ProjectEntry(
+                    path=project_dir.resolve(),
+                    name=workspace.name,
+                    source="manual",
                 )
-            else:
-                state = extract_project_state(
-                    project_dir,
-                    workspace_name=workspace.name,
+            )
+
+    for entry in merge_projects(manual_projects, list(config.hippo_projects)):
+        project_dir = entry.path
+        if not project_dir.exists() or not project_dir.is_dir():
+            continue
+        classification = classify_project(project_dir)
+        is_legacy = classification == ProjectClassification.LEGACY
+        if is_legacy and not legacy_visible:
+            continue
+        if is_legacy:
+            states.append(
+                ProjectState(
+                    project_id=project_dir.name,
+                    workspace=entry.name,
+                    path=str(project_dir),
+                    legacy=True,
+                    last_seen_at=now,
                 )
-                states.append(state)
+            )
+        else:
+            state = extract_project_state(
+                project_dir,
+                workspace_name=entry.name,
+            )
+            states.append(state)
 
     return tuple(states)
