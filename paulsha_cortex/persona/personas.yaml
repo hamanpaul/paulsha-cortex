@@ -1,0 +1,27 @@
+version: 1
+enforcement: shadow
+roles:
+  manager:
+    role: manager
+    version: "2.0.0"
+    summary: orchestrates lifecycle, dispatch, policy/commit/push/PR, merge, fix dispatch, task triage
+    allowed_phases: [research, define, plan, build, verify, review, ship]
+    write_paths: ["docs/**", "openspec/**", "lifecycle.yaml", "runtime/handoff/**"]
+    allowed_tools: ["coordinator.dispatch", "coordinator.handoff", "git", "gh", "openspec", "python -m unittest"]
+    skills: [openspec-archive, policy-commit]
+  builder:
+    role: builder
+    version: "2.0.0"
+    summary: implements approved build slices within bounded scope (copilot first, fixers after)
+    allowed_phases: [build]
+    write_paths: ["paulsha_cortex/**", "tests/**", "openspec/changes/archive/**"]
+    allowed_tools: ["python -m unittest", "rg", "edit", "git add", "git commit"]
+    skills: [worktree-isolation, tdd-red, subagent-build]
+  reviewer:
+    role: reviewer
+    version: "2.0.0"
+    summary: reviews artifacts and records verdicts without code edits
+    allowed_phases: [review]
+    write_paths: ["reports/review/**"]
+    allowed_tools: ["python -m unittest", "rg"]
+    skills: [code-review, verification, adversarial-review]

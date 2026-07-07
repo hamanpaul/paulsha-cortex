@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "PSC_RELAY_EVENT=session_start cortex relay-hook",
+            "type": "command",
+            "managedBy": "psc-coordinator-relay"
+          }
+        ],
+        "matcher": "startup|clear|compact"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "PSC_RELAY_EVENT=stop cortex relay-hook",
+            "type": "command",
+            "managedBy": "psc-coordinator-relay"
+          }
+        ],
+        "matcher": ".*"
+      }
+    ]
+  }
+}

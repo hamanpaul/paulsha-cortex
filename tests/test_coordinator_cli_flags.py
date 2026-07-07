@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import unittest
+
+from paulsha_cortex.coordinator.cli import _refuse_unsafe_fanout, _resolve_launcher
+from paulsha_cortex.coordinator.launcher import SubprocessLauncher
+
+
+def _meta(slice_id: str) -> dict:
+    return {"slice_id": slice_id, "dispatch": "auto", "plan": "p.md", "depends_on": []}
+
+
+class ResolveLauncherTests(unittest.TestCase):
+    def test_builds_subprocess_launcher_with_flags(self) -> None:
+        lr = _resolve_launcher("copilot", None, allow_unsafe=True, model="claude-haiku-4.5")
+        self.assertIsInstance(lr, SubprocessLauncher)
+        self.assertTrue(lr._allow_unsafe)
+        self.assertEqual(lr._model, "claude-haiku-4.5")
+        self.assertEqual(lr._executor, "copilot")
+
+    def test_respects_injected_launcher(self) -> None:
+        sentinel = object()
+        self.assertIs(_resolve_launcher("copilot", sentinel, allow_unsafe=True, model="x"), sentinel)
+
+    def test_none_executor_returns_none(self) -> None:
+        self.assertIsNone(_resolve_launcher(None, None, allow_unsafe=False, model=None))
+
+
+class RefuseUnsafeFanoutTests(unittest.TestCase):
+    def test_unsafe_refuses_multiple_ready(self) -> None:
+        metas = [_meta("a"), _meta("b")]
+        with self.assertRaises(ValueError):
+            _refuse_unsafe_fanout(metas, lambda s: True, allow_unsafe=True)
+
+    def test_unsafe_allows_single_ready(self) -> None:
+        _refuse_unsafe_fanout([_meta("a")], lambda s: True, allow_unsafe=True)  # 不 raise
+
+    def test_safe_mode_unbounded(self) -> None:
+        metas = [_meta(f"s{i}") for i in range(5)]
+        _refuse_unsafe_fanout(metas, lambda s: True, allow_unsafe=False)  # 不 raise
+
+
+if __name__ == "__main__":
+    unittest.main()

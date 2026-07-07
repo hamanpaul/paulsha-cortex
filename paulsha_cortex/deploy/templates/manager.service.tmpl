@@ -1,0 +1,17 @@
+[Unit]
+Description=__INSTANCE__ persona manager service (paulsha-cortex)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+EnvironmentFile=-%h/.agents/core/runtime/__INSTANCE__.env
+EnvironmentFile=-%h/.agents/core/runtime/__INSTANCE__-manager.env
+ExecStart=/usr/bin/env bash __SERVICE_SCRIPT__
+KillMode=control-group
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

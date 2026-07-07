@@ -1,0 +1,32 @@
+name: Persona Scope (shadow)
+
+# Shadow / non-blocking persona-scope guardrail（設計 §8 / §11 Phase 3）。
+# 此 workflow 恆 exit 0（observe/annotate-only），MUST NOT 被設為 required status check。
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  persona-scope:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pip install -e .
+
+      - name: Run persona-scope (shadow, always exit 0)
+        run: python -m paulsha_cortex.persona.scope_ci

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "bash": "PSC_RELAY_EVENT=session_start cortex relay-hook",
+        "type": "command",
+        "timeoutSec": 10
+      }
+    ],
+    "agentStop": [
+      {
+        "bash": "PSC_RELAY_EVENT=stop cortex relay-hook",
+        "type": "command",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}
