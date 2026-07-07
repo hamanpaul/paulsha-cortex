@@ -44,6 +44,7 @@ class ProjectMonitorService:
         self._rescan_thread: threading.Thread | None = None
         self._debounce_lock = threading.Lock()
         self._debounce_timers: dict[str, threading.Timer] = {}
+        self._watch_state_lock = threading.RLock()
         self._project_roots: dict[str, Path] = {}
         self._watched_paths: set[tuple[Path, bool]] = set()
 
@@ -90,45 +91,48 @@ class ProjectMonitorService:
     def _rescan_loop(self) -> None:
         interval = max(0.1, float(self._config.rescan_interval_seconds))
         while not self._stop_event.wait(interval):
-            tracked_ids = tuple(self._project_roots)
+            with self._watch_state_lock:
+                tracked_ids = tuple(self._project_roots)
             if not tracked_ids:
                 continue
             self._publish_refresh(self._store.refresh_projects(tracked_ids))
 
     def _sync_project_roots(self) -> None:
-        self._project_roots = {
-            state.project_id: Path(state.path)
-            for state in self._store.current_snapshot()
-            if not state.legacy
-        }
+        with self._watch_state_lock:
+            self._project_roots = {
+                state.project_id: Path(state.path)
+                for state in self._store.current_snapshot()
+                if not state.legacy
+            }
 
     def _install_watches(self) -> None:
-        desired_keys: list[tuple[Path, bool]] = []
-        seen: set[tuple[Path, bool]] = set()
-        for workspace in self._config.workspaces:
-            if not workspace.path.exists():
-                continue
-            key = (workspace.path, False)
-            if key not in seen:
-                seen.add(key)
-                desired_keys.append(key)
-        for project_root in self._project_roots.values():
-            for watch_path, recursive in self._watch_specs(project_root):
-                key = (watch_path, recursive)
-                if key in seen:
+        with self._watch_state_lock:
+            desired_keys: list[tuple[Path, bool]] = []
+            seen: set[tuple[Path, bool]] = set()
+            for workspace in self._config.workspaces:
+                if not workspace.path.exists():
                     continue
-                seen.add(key)
-                desired_keys.append(key)
-        stale_keys = self._watched_paths - seen
-        for watch_path, recursive in stale_keys:
-            self._watcher.unwatch(watch_path, recursive=recursive)
-            self._watched_paths.remove((watch_path, recursive))
-        for watch_path, recursive in desired_keys:
-            watch_key = (watch_path, recursive)
-            if watch_key in self._watched_paths:
-                continue
-            self._watcher.watch(watch_path, self._handle_fs_event, recursive=recursive)
-            self._watched_paths.add(watch_key)
+                key = (workspace.path, False)
+                if key not in seen:
+                    seen.add(key)
+                    desired_keys.append(key)
+            for project_root in self._project_roots.values():
+                for watch_path, recursive in self._watch_specs(project_root):
+                    key = (watch_path, recursive)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    desired_keys.append(key)
+            stale_keys = self._watched_paths - seen
+            for watch_path, recursive in stale_keys:
+                self._watcher.unwatch(watch_path, recursive=recursive)
+                self._watched_paths.discard((watch_path, recursive))
+            for watch_path, recursive in desired_keys:
+                watch_key = (watch_path, recursive)
+                if watch_key in self._watched_paths:
+                    continue
+                self._watcher.watch(watch_path, self._handle_fs_event, recursive=recursive)
+                self._watched_paths.add(watch_key)
 
     def _watch_specs(self, project_root: Path) -> tuple[tuple[Path, bool], ...]:
         specs: list[tuple[Path, bool]] = [(project_root, False)]
@@ -173,7 +177,9 @@ class ProjectMonitorService:
 
     def _project_id_for_path(self, path: Path) -> str | None:
         best_match: tuple[str, int] | None = None
-        for project_id, project_root in self._project_roots.items():
+        with self._watch_state_lock:
+            project_roots = tuple(self._project_roots.items())
+        for project_id, project_root in project_roots:
             try:
                 path.relative_to(project_root)
             except ValueError:

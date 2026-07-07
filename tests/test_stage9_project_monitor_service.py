@@ -714,6 +714,27 @@ class Stage9ServiceTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertTrue(all(key in self.service._watched_paths for key in expected))
 
+    def test_service_install_watches_is_safe_under_concurrent_prune(self) -> None:
+        stale_key = (self.tmp / "ws" / "stale-project", False)
+        self.service._watched_paths.add(stale_key)
+        barrier = threading.Barrier(3)
+        errors: list[Exception] = []
+
+        def run() -> None:
+            try:
+                barrier.wait()
+                self.service._install_watches()
+            except Exception as exc:  # pragma: no cover - captured for assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, daemon=True) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        self.assertEqual(errors, [])
+
     def test_service_branch_switch_trigger_still_emits_change_event_immediately(self) -> None:
         sock = self._connect()
         _socket_send_request(sock, {"kind": "subscribe"})

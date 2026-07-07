@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -55,8 +56,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     service: ProjectMonitorService | None = None
+    previous_sigterm = None
     try:
         service = ProjectMonitorService(config=config)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda _signum, _frame: service.stop())
         service.run_forever()
     except KeyboardInterrupt:
         if service is not None:
@@ -65,6 +69,9 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError, OSError, RuntimeError) as error:
         print(f"錯誤: {error}", file=sys.stderr)
         return 1
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
     return 0
 

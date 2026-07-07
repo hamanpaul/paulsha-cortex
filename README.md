@@ -51,7 +51,7 @@ python -m pip install .
 
    ```bash
    cortex deck compile feature-oneshot --task "demo"
-   cortex deck verify --change sample-change
+   cortex deck verify openspec-archive --task-slug demo-task --change sample-change
    ```
 
 4. 監看 project 狀態：

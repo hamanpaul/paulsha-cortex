@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Imports from modules that do not yet exist — these will ImportError in Red.
 # Wrapped so the module loads and individual tests fail with a clear cause
@@ -594,6 +596,45 @@ class Stage9CliTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 1)
         self.assertNotIn("Traceback", completed.stderr)
+
+    def test_service_mode_registers_sigterm_handler(self) -> None:
+        import paulsha_cortex.monitor.__main__ as monitor_main
+
+        calls: dict[str, object] = {}
+
+        class FakeService:
+            def __init__(self, *, config) -> None:
+                calls["config"] = config
+
+            def run_forever(self) -> None:
+                calls["handler"](signal.SIGTERM, None)
+
+            def stop(self) -> None:
+                calls["stopped"] = True
+
+        def fake_signal(sig, handler):
+            if sig == signal.SIGTERM:
+                calls["handler"] = handler
+            return signal.SIG_DFL
+
+        def fake_getsignal(sig):
+            assert sig == signal.SIGTERM
+            return signal.SIG_DFL
+
+        with (
+            mock.patch.object(
+                monitor_main,
+                "load_config",
+                lambda config_path=None: MonitorConfig(
+                    workspaces=(WorkspaceConfig(path=self.tmp, name="ws"),)
+                ),
+            ),
+            mock.patch.object(monitor_main, "ProjectMonitorService", FakeService),
+            mock.patch.object(monitor_main.signal, "signal", fake_signal),
+            mock.patch.object(monitor_main.signal, "getsignal", fake_getsignal),
+        ):
+            self.assertEqual(monitor_main.main([]), 0)
+        self.assertTrue(calls.get("stopped"))
 
 
 # --- Snapshot integration test ---------------------------------------------
