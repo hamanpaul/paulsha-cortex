@@ -10,8 +10,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-# repo_root/scripts/reap-codex-brokers.sh（package 在 repo_root/paulsha_cortex/coordinator/）
-DEFAULT_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "reap-codex-brokers.sh"
+# package 內固化腳本：repo_root/paulsha_cortex/scripts/reap-codex-brokers.sh
+DEFAULT_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "reap-codex-brokers.sh"
 
 
 def reap_orphan_brokers(
