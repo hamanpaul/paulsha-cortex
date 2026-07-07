@@ -20,6 +20,7 @@ where = ["."]
 include = ["paulsha_cortex*"]
 
 [tool.setuptools.package-data]
+"paulsha_cortex.deck" = ["data/*.yaml", "data/combos/*.yaml"]
 "paulsha_cortex.deploy" = ["templates/*.tmpl"]
 "paulsha_cortex" = [
     "persona/personas.yaml",

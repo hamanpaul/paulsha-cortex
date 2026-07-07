@@ -1,6 +1,6 @@
 """monitor 監控集 = manual project-cortex.yaml ⊍ hippo project-hippo.yaml。
 
-讀共享檔為檔案契約，不 import paulsha_hippo。
+讀共享檔為檔案契約，不引入上游 runtime import。
 """
 from __future__ import annotations
 
