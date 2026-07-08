@@ -56,6 +56,39 @@ class StartManagerServiceTests(unittest.TestCase):
             self.assertIn("disabled", res.stdout)
             self.assertFalse((sd / "systemctl.log").exists())
 
+    def test_start_manager_loop_does_not_self_stop_current_service(self) -> None:
+        # F1 回歸（issue #2；Plan 3 真機實測到 cortex-manager.service 啟動 7ms 即被 SIGTERM 自停）：
+        # ExecStart 路徑（start_manager_loop）不得對 ${instance}-manager.service 下 systemctl stop。
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sd = root / "stub"
+            sd.mkdir()
+            home = root / "home"
+            home.mkdir()
+            log = sd / "systemctl.log"
+            _systemctl_ok(sd, log)
+            script = (
+                "set -euo pipefail\n"
+                "PY=/bin/true\n"
+                "fn=\"$(sed -n '/^start_manager_loop()/,/^}/p' '" + str(START_SH) + "')\"\n"
+                "eval \"$fn\"\n"
+                "start_manager_loop\n"
+            )
+            env = {
+                **os.environ,
+                "PATH": f"{sd}:{os.environ['PATH']}",
+                "HOME": str(home),
+                "PSC_INSTANCE": "cortex",
+                "PSC_MANAGER_DAEMON_DISABLED": "1",
+            }
+            res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            calls = log.read_text(encoding="utf-8") if log.exists() else ""
+            self.assertNotIn(
+                "cortex-manager.service", calls,
+                f"start_manager_loop 對自己 instance 的 service 下了 systemctl（自停）：{calls!r}",
+            )
+
     def test_no_user_systemd_graceful_skip(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             sd = Path(d)

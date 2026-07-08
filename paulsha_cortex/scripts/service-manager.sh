@@ -112,7 +112,10 @@ start_manager_service() {
 }
 
 start_manager_loop() {
-  stop_legacy_manager_timer
+  # F1（issue #2，Plan 3 真機實測到自停）：不得在此停 ${instance}-manager.*——
+  # 本函式即 cortex-manager.service 的 ExecStart，stop_legacy_manager_timer 會停掉「自己」
+  # （SIGTERM 自殺、Duration ~7ms）。cortex 為 timer+daemon 模型，舊 paulshaclaw 單元的
+  # cutover 已由 operator shell（start.sh）在 enable 前負責，此處不再自停。
   if [[ "${PSC_MANAGER_DAEMON_DISABLED:-0}" == "1" ]]; then
     echo "manager loop disabled (PSC_MANAGER_DAEMON_DISABLED=1)"
     return 0
