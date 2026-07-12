@@ -118,7 +118,7 @@ def main(
 
     if args.cmd == "dispatch":
         print(
-            "錯誤: 低階 dispatch 已停用；缺少 spec metadata。"
+            "錯誤: 低階 dispatch 已停用；缺少 spec / verification metadata。"
             "請改用 fanout/tick 或 control plane dispatch request。",
             file=sys.stderr,
         )

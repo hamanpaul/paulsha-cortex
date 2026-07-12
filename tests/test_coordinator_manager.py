@@ -45,6 +45,38 @@ def _make_job(reg: JobRegistry, slice_id: str) -> dict:
     )
 
 
+def _dispatch_meta(slice_id: str, *, plan: str = "p.md") -> dict:
+    return {
+        "slice_id": slice_id,
+        "dispatch": "auto",
+        "plan": plan,
+        "depends_on": [],
+        "target_branch": "main",
+        "verification": {
+            "docs_class": "code",
+            "review_policy": "required",
+            "required_artifacts": [],
+            "checks": [{"kind": "persona-scope"}],
+            "tests": [],
+            "full_suite": {
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 30,
+                "baseline": "no-regression",
+            },
+        },
+        "_pinned_inputs": {
+            "spec_path": f"/specs/{slice_id}.md",
+            "spec_hash": "0" * 64,
+            "plan_path": plan,
+            "plan_hash": "1" * 64,
+            "target_branch": "main",
+            "target_remote": "origin",
+            "verification_hash": "2" * 64,
+        },
+    }
+
+
 class CompleteTickDoneTests(unittest.TestCase):
     def test_exited_job_writes_passed_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -311,6 +343,169 @@ class CompleteTickShadowGateTests(unittest.TestCase):
             self.assertEqual(manifest["gate_status"], "passed")
             self.assertIsNone(manifest["gate_verdict"])
 
+    def test_pinned_spec_hash_mismatch_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            spec_path = Path(d) / "specs" / "slice-a.md"
+            plan_path = Path(d) / "docs" / "superpowers" / "plans" / "slice-a.md"
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            spec_path.write_text(
+                "---\n"
+                "dispatch: auto\n"
+                "slice_id: slice-a\n"
+                "plan: docs/superpowers/plans/slice-a.md\n"
+                "target_branch: main\n"
+                "verification:\n"
+                "  docs_class: code\n"
+                "  required_artifacts: []\n"
+                "  checks:\n"
+                "    - kind: persona-scope\n"
+                "    - kind: command\n"
+                "      name: policy\n"
+                "      argv: [python3, -m, pytest, -q]\n"
+                "      cwd: .\n"
+                "      timeout_seconds: 30\n"
+                "  tests: []\n"
+                "  full_suite:\n"
+                "    argv: [python3, -m, pytest, -q]\n"
+                "    cwd: .\n"
+                "    timeout_seconds: 60\n"
+                "    baseline: no-regression\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            plan_path.write_text("# plan\n", encoding="utf-8")
+            job = _make_job(reg, "slice-a")
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path=str(spec_path),
+                spec_hash="old-spec-hash",
+                plan_path=str(plan_path),
+                plan_hash="plan-hash",
+                target_branch="main",
+                target_remote="origin",
+                verification_hash="verification-hash",
+                dispatch_base="base-sha",
+                builder_job_id=job["job_id"],
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("slice-a", state="building", builder_job_id=job["job_id"])
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "slice-a.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "pinned-input-mismatch")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "needs_human"}])
+
+    def test_failed_job_with_pinned_spec_hash_mismatch_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            spec_path = Path(d) / "specs" / "slice-a.md"
+            plan_path = Path(d) / "docs" / "superpowers" / "plans" / "slice-a.md"
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            spec_path.write_text(
+                "---\n"
+                "dispatch: auto\n"
+                "slice_id: slice-a\n"
+                "plan: docs/superpowers/plans/slice-a.md\n"
+                "target_branch: main\n"
+                "verification:\n"
+                "  docs_class: code\n"
+                "  required_artifacts: []\n"
+                "  checks:\n"
+                "    - kind: persona-scope\n"
+                "    - kind: command\n"
+                "      name: policy\n"
+                "      argv: [python3, -m, pytest, -q]\n"
+                "      cwd: .\n"
+                "      timeout_seconds: 30\n"
+                "  tests: []\n"
+                "  full_suite:\n"
+                "    argv: [python3, -m, pytest, -q]\n"
+                "    cwd: .\n"
+                "    timeout_seconds: 60\n"
+                "    baseline: no-regression\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            plan_path.write_text("# plan\n", encoding="utf-8")
+            job = _make_job(reg, "slice-a")
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path=str(spec_path),
+                spec_hash="old-spec-hash",
+                plan_path=str(plan_path),
+                plan_hash="plan-hash",
+                target_branch="main",
+                target_remote="origin",
+                verification_hash="verification-hash",
+                dispatch_base="base-sha",
+                builder_job_id=job["job_id"],
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("slice-a", state="building", builder_job_id=job["job_id"])
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "failed"})
+            hdir = Path(d) / "handoff"
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "slice-a.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-a")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "pinned-input-mismatch")
+            self.assertEqual(manifest["completion"], "failed")
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(slice_row["gate_state"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "needs_human"}])
+
+    def test_spec_reparse_failure_still_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            spec_path = Path(d) / "specs" / "slice-a.md"
+            plan_path = Path(d) / "docs" / "superpowers" / "plans" / "slice-a.md"
+            spec_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            spec_bytes = b"\x80not-utf8"
+            spec_path.write_bytes(spec_bytes)
+            plan_bytes = b"# plan\n"
+            plan_path.write_bytes(plan_bytes)
+            job = _make_job(reg, "slice-a")
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path=str(spec_path),
+                spec_hash=manager.verification.sha256_bytes(spec_bytes),
+                plan_path=str(plan_path),
+                plan_hash=manager.verification.sha256_bytes(plan_bytes),
+                target_branch="main",
+                target_remote="origin",
+                verification_hash=manager.verification.canonical_json_hash(None),
+                dispatch_base="base-sha",
+                builder_job_id=job["job_id"],
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("slice-a", state="building", builder_job_id=job["job_id"])
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "slice-a.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-a")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "pinned-input-mismatch")
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(slice_row["gate_state"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "needs_human"}])
+            self.assertEqual(summary["errors"], [])
+
 
 class CompleteTickErrorAndReleaseTests(unittest.TestCase):
     def test_per_job_poll_error_isolated(self) -> None:
@@ -575,7 +770,7 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             reg = _reg(d)
             disp = _HeadlessDispatcher(reg)
             launcher = _RecordingLauncher()
-            metas = [{"slice_id": "slice-x", "dispatch": "auto", "plan": "p.md", "depends_on": []}]
+            metas = [_dispatch_meta("slice-x")]
             jobs = dispatch_ready(
                 metas, is_satisfied=lambda _id: True, dispatcher=disp,
                 launcher=launcher, git_runner=lambda args: "BASE_SHA",
@@ -593,7 +788,7 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             reg = _reg(d)
             disp = _HeadlessDispatcher(reg)
             launcher = _RecordingLauncher()
-            metas = [{"slice_id": "slice-y", "dispatch": "auto", "plan": "p.md", "depends_on": []}]
+            metas = [_dispatch_meta("slice-y")]
             jobs = dispatch_ready(
                 metas, is_satisfied=lambda _id: True, dispatcher=disp,
                 launcher=launcher, git_runner=boom,
@@ -625,7 +820,7 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             reg = JobRegistry(state_path=repo / "jobs.json")
             disp = _HeadlessDispatcher(reg)
             launcher = _RecordingLauncher()
-            metas = [{"slice_id": "slice-x", "dispatch": "auto", "plan": "p.md", "depends_on": []}]
+            metas = [_dispatch_meta("slice-x")]
             jobs = dispatch_ready(
                 metas, is_satisfied=lambda _id: True, dispatcher=disp,
                 launcher=launcher, git_runner=lambda args: git(*args),

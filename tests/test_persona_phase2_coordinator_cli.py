@@ -134,7 +134,7 @@ class CliTests(unittest.TestCase):
             after = state_path.read_text(encoding="utf-8") if state_path.exists() else None
 
             self.assertNotEqual(rc, 0)
-            self.assertIn("spec metadata", err.getvalue())
+            self.assertIn("spec / verification metadata", err.getvalue())
             self.assertEqual(sender.sent, [])
             self.assertEqual(creator.created, [])
             self.assertEqual(reg.list_jobs(), [])

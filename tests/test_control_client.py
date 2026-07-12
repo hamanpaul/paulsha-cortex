@@ -305,7 +305,12 @@ def test_control_plane_coordinator_submits_dispatch_request(monkeypatch, tmp_pat
     job = coordinator.create_job(
         phase="stage1",
         scope="slice-a",
-        payload={"specs_dir": "/repo/specs", "force_hold": True, "ignored": "value"},
+        payload={
+            "specs_dir": "/repo/specs",
+            "handoff_dir": "/repo/runtime/handoff",
+            "force_hold": True,
+            "ignored": "value",
+        },
     )
 
     request_path = constants.requests_dir() / f"{job['job_id']}.json"
@@ -318,6 +323,7 @@ def test_control_plane_coordinator_submits_dispatch_request(monkeypatch, tmp_pat
     assert request["args"] == {
         "slice_id": "slice-a",
         "specs_dir": "/repo/specs",
+        "handoff_dir": "/repo/runtime/handoff",
         "force_hold": True,
     }
 

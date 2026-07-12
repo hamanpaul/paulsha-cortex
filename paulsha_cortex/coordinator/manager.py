@@ -10,6 +10,7 @@ from typing import Callable, Protocol
 from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
+from . import verification
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
@@ -83,6 +84,52 @@ def _existing_manifest_job_id(path: Path) -> str | None:
     return job_id if isinstance(job_id, str) else None
 
 
+def _slice_for_job(registry, slice_id: str, job_id: str) -> dict | None:
+    if registry is None:
+        return None
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return None
+    if slice_row.get("builder_job_id") != job_id:
+        return None
+    return slice_row
+
+
+def _pinned_input_mismatches(slice_row: dict) -> list[str]:
+    repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+    mismatches: list[str] = []
+    spec_path = Path(slice_row["spec"]["path"])
+    plan_path = Path(slice_row["plan"]["path"])
+    if not plan_path.is_absolute():
+        plan_path = (repo_root / plan_path).resolve()
+    try:
+        current_spec_hash = verification.sha256_bytes(spec_path.read_bytes())
+    except OSError:
+        return ["spec-unreadable"]
+    if current_spec_hash != slice_row["spec"]["hash"]:
+        mismatches.append("spec-hash")
+    try:
+        current_plan_hash = verification.sha256_bytes(plan_path.read_bytes())
+    except OSError:
+        return mismatches + ["plan-unreadable"]
+    if current_plan_hash != slice_row["plan"]["hash"]:
+        mismatches.append("plan-hash")
+    try:
+        current_meta = autonomy.parse_spec_frontmatter(spec_path)
+    except (OSError, UnicodeDecodeError):
+        return mismatches + ["spec-frontmatter-unreadable"]
+    if current_meta.get("parse_error") is not None:
+        return mismatches + ["spec-frontmatter-invalid"]
+    if current_meta.get("target_branch") != slice_row.get("target_branch"):
+        mismatches.append("target-branch")
+    current_verification = current_meta.get("verification")
+    current_verification_hash = verification.canonical_json_hash(current_verification)
+    if current_verification_hash != slice_row["verification"]["hash"]:
+        mismatches.append("verification-hash")
+    return mismatches
+
+
 def complete_tick(
     dispatcher,
     *,
@@ -142,6 +189,27 @@ def complete_tick(
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
             gate_status = "passed" if status == "exited" else "failed"
+            gate_reason = None
+            slice_row = _slice_for_job(registry, slice_id, job_id)
+            if slice_row is not None:
+                mismatches = _pinned_input_mismatches(slice_row)
+                if mismatches:
+                    gate_status = "needs_human"
+                    gate_reason = "pinned-input-mismatch"
+                    try:
+                        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                    except Exception:
+                        pass
+                elif status == "failed":
+                    try:
+                        registry.update_slice(slice_id, state="failed", gate_state="failed")
+                    except Exception:
+                        pass
+            elif status == "failed":
+                try:
+                    registry.update_slice(slice_id, state="failed", gate_state="failed")
+                except Exception:
+                    pass
             try:
                 verdict = runner(job)
             except Exception:
@@ -157,6 +225,7 @@ def complete_tick(
                     "exit_code": job.get("exit_code"),
                     "branch": job.get("branch"),
                     "gate_verdict": verdict,
+                    "gate_reason": gate_reason,
                     "completed_at": clock(),
                 },
             )

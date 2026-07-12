@@ -64,8 +64,13 @@ def test_request_done_and_status_round_trip_include_schema_version(monkeypatch, 
 
 
 def test_build_dispatch_request():
-    req = contract.build_request(req_type="dispatch", args={"slice_id": "s1", "force_hold": True}, requested_by="telegram:42")
+    req = contract.build_request(
+        req_type="dispatch",
+        args={"slice_id": "s1", "handoff_dir": "runtime/handoff", "force_hold": True},
+        requested_by="telegram:42",
+    )
     assert req["type"] == "dispatch" and req["args"]["slice_id"] == "s1"
+    assert req["args"]["handoff_dir"] == "runtime/handoff"
 
 
 def test_build_complete_request():

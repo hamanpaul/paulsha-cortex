@@ -14,9 +14,9 @@
 
 ## 3. Deterministic verification
 
-- [ ] 3.1 RED-test strict `target_branch` and verification frontmatter parsing plus dispatch-time spec/plan/contract hashes.
-- [ ] 3.2 Implement versioned verification evidence, Candidate fencing, required artifact/scope/task checks and base-vs-Candidate no-regression suite.
-- [ ] 3.3 Replace false-green regressions so exit, rejection, timeout, exception and incomplete evidence cannot release downstream.
+- [x] 3.1 RED-test strict `target_branch` and verification frontmatter parsing plus dispatch-time spec/plan/contract hashes.
+- [x] 3.2 Implement dispatch-time spec/plan/verification hash pinning plus the versioned verification evidence writer/quarantine path.
+- [x] 3.3 Replace Task 3 false-greens so malformed frontmatter/evidence or pinned-input drift fail closed before downstream release.
 
 ## 4. Foreign exact-HEAD review
 

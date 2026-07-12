@@ -15,8 +15,10 @@ VALID_JOB_STATUSES = frozenset({"dispatched", "running", "exited", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"exited", "failed"})
 
-VALID_SLICE_STATES = frozenset({"pending", "dispatched", "running", "exited", "failed"})
-VALID_GATE_STATES = frozenset({"pending", "passed", "failed"})
+VALID_SLICE_STATES = frozenset(
+    {"pending", "building", "dispatched", "running", "exited", "verified", "completed", "needs_human", "failed"}
+)
+VALID_GATE_STATES = frozenset({"pending", "passed", "failed", "needs_human"})
 
 JOB_STATUS_TRANSITIONS = {
     "dispatched": frozenset({"dispatched", "running", "exited", "failed"}),
@@ -25,16 +27,21 @@ JOB_STATUS_TRANSITIONS = {
     "failed": frozenset({"failed"}),
 }
 SLICE_STATE_TRANSITIONS = {
-    "pending": frozenset({"pending", "dispatched", "running", "failed"}),
-    "dispatched": frozenset({"dispatched", "running", "exited", "failed"}),
+    "pending": frozenset({"pending", "building", "dispatched", "running", "needs_human", "failed"}),
+    "building": frozenset({"building", "needs_human", "failed", "verified", "completed", "exited"}),
+    "dispatched": frozenset({"dispatched", "running", "exited", "failed", "needs_human"}),
     "running": frozenset({"running", "exited", "failed"}),
     "exited": frozenset({"exited"}),
+    "verified": frozenset({"verified", "completed", "needs_human"}),
+    "completed": frozenset({"completed"}),
+    "needs_human": frozenset({"needs_human", "building", "verified", "failed", "completed"}),
     "failed": frozenset({"failed"}),
 }
 GATE_STATE_TRANSITIONS = {
-    "pending": frozenset({"pending", "passed", "failed"}),
+    "pending": frozenset({"pending", "passed", "failed", "needs_human"}),
     "passed": frozenset({"passed"}),
     "failed": frozenset({"failed"}),
+    "needs_human": frozenset({"needs_human", "pending", "passed", "failed"}),
 }
 
 
@@ -183,12 +190,14 @@ class JobRegistry:
             "spec",
             "plan",
             "target_branch",
+            "target_remote",
             "dispatch_base",
             "builder_job_id",
             "reviewer_job_id",
             "candidate",
             "state",
             "gate_state",
+            "verification",
             "current_evidence_refs",
             "current_evaluation_refs",
             "evidence_history",
@@ -215,6 +224,17 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔 slice state 非法（fail-closed）: {self._state_path}")
         if slice_row["gate_state"] not in VALID_GATE_STATES:
             raise ValueError(f"coordinator 狀態檔 gate_state 非法（fail-closed）: {self._state_path}")
+        if not isinstance(slice_row["target_branch"], str) or not slice_row["target_branch"]:
+            raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
+        if not isinstance(slice_row["target_remote"], str) or not slice_row["target_remote"]:
+            raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
+        verification_meta = slice_row["verification"]
+        if not (
+            isinstance(verification_meta, dict)
+            and isinstance(verification_meta.get("hash"), str)
+            and verification_meta["hash"]
+        ):
+            raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         _validate_slice_job_ref_in_state(
             field="builder_job_id",
             job_id=slice_row["builder_job_id"],
@@ -240,6 +260,7 @@ class JobRegistry:
             **dict(slice_row),
             "spec": dict(slice_row["spec"]),
             "plan": dict(slice_row["plan"]),
+            "verification": dict(slice_row["verification"]),
             "current_evidence_refs": list(slice_row["current_evidence_refs"]),
             "current_evaluation_refs": list(slice_row["current_evaluation_refs"]),
             "evidence_history": _copy_json_list(slice_row["evidence_history"]),
@@ -264,6 +285,7 @@ class JobRegistry:
             **dict(slice_row),
             "spec": dict(slice_row["spec"]),
             "plan": dict(slice_row["plan"]),
+            "verification": dict(slice_row["verification"]),
             "current_evidence_refs": list(slice_row["current_evidence_refs"]),
             "current_evaluation_refs": list(slice_row["current_evaluation_refs"]),
             "evidence_history": _copy_json_list(slice_row["evidence_history"]),
@@ -393,10 +415,13 @@ class JobRegistry:
         plan_path: str,
         plan_hash: str,
         target_branch: str,
-        dispatch_base: str | None,
-        builder_job_id: str | None,
-        reviewer_job_id: str | None,
-        candidate: str | None,
+        target_remote: str = "origin",
+        verification_hash: str | None = None,
+        verification: dict[str, Any] | None = None,
+        dispatch_base: str | None = None,
+        builder_job_id: str | None = None,
+        reviewer_job_id: str | None = None,
+        candidate: str | None = None,
     ) -> dict[str, Any]:
         if any(row["slice_id"] == slice_id for row in self._slices):
             raise ValueError(f"slice 已存在: {slice_id}")
@@ -408,6 +433,11 @@ class JobRegistry:
             "spec": {"path": spec_path, "hash": spec_hash},
             "plan": {"path": plan_path, "hash": plan_hash},
             "target_branch": target_branch,
+            "target_remote": target_remote,
+            "verification": {
+                "hash": verification_hash or ("0" * 64),
+                "contract": dict(verification) if isinstance(verification, dict) else None,
+            },
             "dispatch_base": dispatch_base,
             "builder_job_id": builder_job_id,
             "reviewer_job_id": reviewer_job_id,
@@ -423,6 +453,50 @@ class JobRegistry:
             "updated_at": now,
         }
         self._slices.append(slice_row)
+        self._persist()
+        return self._copy_slice(slice_row)
+
+    def repin_slice(
+        self,
+        slice_id: str,
+        *,
+        spec_path: str,
+        spec_hash: str,
+        plan_path: str,
+        plan_hash: str,
+        target_branch: str,
+        target_remote: str,
+        verification_hash: str,
+        verification: dict[str, Any] | None,
+        dispatch_base: str | None,
+    ) -> dict[str, Any]:
+        slice_row = self._find_slice(slice_id)
+        if str(slice_row["state"]) not in {"pending", "needs_human"}:
+            raise ValueError(
+                f"非法 slice state repin: {slice_row['state']!r}（只允許 pending/needs_human 重派）"
+            )
+        _validate_transition(
+            field="gate_state",
+            current=str(slice_row["gate_state"]),
+            new="pending",
+            allowed=GATE_STATE_TRANSITIONS,
+        )
+        slice_row["spec"] = {"path": spec_path, "hash": spec_hash}
+        slice_row["plan"] = {"path": plan_path, "hash": plan_hash}
+        slice_row["target_branch"] = target_branch
+        slice_row["target_remote"] = target_remote
+        slice_row["verification"] = {
+            "hash": verification_hash,
+            "contract": dict(verification) if isinstance(verification, dict) else None,
+        }
+        slice_row["dispatch_base"] = dispatch_base
+        slice_row["builder_job_id"] = None
+        slice_row["reviewer_job_id"] = None
+        slice_row["candidate"] = None
+        slice_row["gate_state"] = "pending"
+        slice_row["current_evidence_refs"] = []
+        slice_row["current_evaluation_refs"] = []
+        slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
 
@@ -444,6 +518,8 @@ class JobRegistry:
         reviewer_job_id: str | None = None,
         candidate: str | None = None,
         dispatch_base: str | None = None,
+        target_remote: str | None = None,
+        verification_hash: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         if state is not None:
@@ -484,6 +560,10 @@ class JobRegistry:
             slice_row["candidate"] = candidate
         if dispatch_base is not None:
             slice_row["dispatch_base"] = dispatch_base
+        if target_remote is not None:
+            slice_row["target_remote"] = target_remote
+        if verification_hash is not None:
+            slice_row["verification"]["hash"] = verification_hash
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)

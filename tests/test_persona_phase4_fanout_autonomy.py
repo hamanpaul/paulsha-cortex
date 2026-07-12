@@ -21,13 +21,69 @@ def _write_spec(dirpath: Path, name: str, frontmatter: str | None, body: str = "
     return p
 
 
+def _v1_verification_block(*, docs_class: str = "code") -> str:
+    return (
+        "target_branch: main\n"
+        "verification:\n"
+        f"  docs_class: {docs_class}\n"
+        "  required_artifacts: []\n"
+        "  checks:\n"
+        "    - kind: persona-scope\n"
+        "    - kind: command\n"
+        "      name: policy\n"
+        "      argv: [python3, -m, pytest, -q]\n"
+        "      cwd: .\n"
+        "      timeout_seconds: 30\n"
+        "  tests: []\n"
+        "  full_suite:\n"
+        "    argv: [python3, -m, pytest, -q]\n"
+        "    cwd: .\n"
+        "    timeout_seconds: 60\n"
+        "    baseline: no-regression"
+    )
+
+
 def _meta(slice_id, *, dispatch="auto", plan="docs/plan.md", depends_on=None, path=None):
+    spec_path = path or f"/specs/{slice_id}.md"
     return {
-        "path": path or f"/specs/{slice_id}.md",
+        "path": spec_path,
         "dispatch": dispatch,
         "slice_id": slice_id,
         "plan": plan,
         "depends_on": list(depends_on or []),
+        "target_branch": "main",
+        "verification": {
+            "docs_class": "code",
+            "review_policy": "required",
+            "required_artifacts": [],
+            "checks": [
+                {"kind": "persona-scope"},
+                {
+                    "kind": "command",
+                    "name": "policy",
+                    "argv": ["python3", "-m", "pytest", "-q"],
+                    "cwd": ".",
+                    "timeout_seconds": 300,
+                },
+            ],
+            "tests": [],
+            "full_suite": {
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 300,
+                "baseline": "no-regression",
+            },
+        },
+        "parse_error": None,
+        "_pinned_inputs": {
+            "spec_path": spec_path,
+            "spec_hash": "0" * 64,
+            "plan_path": plan or f"/plans/{slice_id}.md",
+            "plan_hash": "1" * 64,
+            "target_branch": "main",
+            "target_remote": "origin",
+            "verification_hash": "2" * 64,
+        },
     }
 
 
@@ -74,6 +130,132 @@ class _RecordingLauncher:
 # FrontmatterTests
 # --------------------------------------------------------------------------- #
 class FrontmatterTests(unittest.TestCase):
+    def test_parse_target_branch_and_verification_contract(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            p = _write_spec(
+                Path(d),
+                "verification.md",
+                "dispatch: auto\n"
+                "slice_id: verification-slice\n"
+                "plan: docs/superpowers/plans/verification.md\n"
+                "depends_on: [upstream]\n"
+                "target_branch: main\n"
+                "verification:\n"
+                "  docs_class: normative\n"
+                "  required_artifacts:\n"
+                "    - path: paulsha_cortex/example.py\n"
+                "      must_change: true\n"
+                "  checks:\n"
+                "    - kind: persona-scope\n"
+                "    - kind: command\n"
+                "      name: policy\n"
+                "      argv: [python3, -m, pytest, -q, tests/test_example.py]\n"
+                "      cwd: .\n"
+                "      timeout_seconds: 300\n"
+                "  tests:\n"
+                "    - argv: [python3, -m, pytest, -q, tests/test_example.py]\n"
+                "      cwd: .\n"
+                "      timeout_seconds: 120\n"
+                "  full_suite:\n"
+                "    argv: [python3, -m, pytest, -q]\n"
+                "    cwd: .\n"
+                "    timeout_seconds: 600\n"
+                "    baseline: no-regression",
+            )
+
+            meta = parse_spec_frontmatter(p)
+
+            self.assertEqual(meta["dispatch"], "auto")
+            self.assertEqual(meta["target_branch"], "main")
+            self.assertIsNone(meta["parse_error"])
+            self.assertEqual(meta["verification"]["docs_class"], "normative")
+            self.assertEqual(meta["verification"]["review_policy"], "required")
+            self.assertEqual(
+                meta["verification"]["required_artifacts"],
+                [{"path": "paulsha_cortex/example.py", "must_change": True}],
+            )
+            self.assertEqual(meta["verification"]["checks"][0], {"kind": "persona-scope"})
+            self.assertEqual(meta["verification"]["checks"][1]["name"], "policy")
+            self.assertEqual(
+                meta["verification"]["tests"][0]["argv"],
+                ["python3", "-m", "pytest", "-q", "tests/test_example.py"],
+            )
+            self.assertEqual(meta["verification"]["full_suite"]["baseline"], "no-regression")
+
+    def test_parse_invalid_verification_holds_with_structured_error(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "invalid.md",
+                    "dispatch: auto\n"
+                    "slice_id: invalid-slice\n"
+                    "plan: docs/superpowers/plans/invalid.md\n"
+                    "target_branch: main\n"
+                    "verification:\n"
+                    "  docs_class: code\n"
+                    "  required_artifacts: []\n"
+                    "  checks:\n"
+                    "    - kind: unknown-check\n"
+                    "  tests: []\n"
+                    "  full_suite:\n"
+                    "    argv: [python3, -m, pytest, -q]\n"
+                    "    cwd: .\n"
+                    "    timeout_seconds: 60\n"
+                    "    baseline: no-regression",
+                )
+            )
+
+            self.assertEqual(meta["dispatch"], "hold")
+            self.assertIsInstance(meta["parse_error"], dict)
+            self.assertEqual(meta["parse_error"]["code"], "invalid-frontmatter")
+            self.assertEqual(meta["parse_error"]["field"], "verification.checks[0].kind")
+            self.assertIn("unknown-check", meta["parse_error"]["message"])
+
+    def test_parse_docs_class_sets_review_policy(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        expected = {
+            "normative": "required",
+            "code": "required",
+            "informational": "not-required",
+            "trivial": "not-required",
+        }
+        with tempfile.TemporaryDirectory() as d:
+            for docs_class, review_policy in expected.items():
+                with self.subTest(docs_class=docs_class):
+                    meta = parse_spec_frontmatter(
+                        _write_spec(
+                            Path(d),
+                            f"{docs_class}.md",
+                            "dispatch: auto\n"
+                            f"slice_id: {docs_class}\n"
+                            "plan: docs/superpowers/plans/example.md\n"
+                            "target_branch: main\n"
+                            "verification:\n"
+                            f"  docs_class: {docs_class}\n"
+                            "  required_artifacts: []\n"
+                            "  checks:\n"
+                            "    - kind: persona-scope\n"
+                            "    - kind: command\n"
+                            "      name: policy\n"
+                            "      argv: [python3, -m, pytest, -q]\n"
+                            "      cwd: .\n"
+                            "      timeout_seconds: 30\n"
+                            "  tests: []\n"
+                            "  full_suite:\n"
+                            "    argv: [python3, -m, pytest, -q]\n"
+                            "    cwd: .\n"
+                            "    timeout_seconds: 60\n"
+                            "    baseline: no-regression",
+                        )
+                    )
+                    self.assertEqual(meta["verification"]["review_policy"], review_policy)
+
     def test_parse_auto_with_depends_on(self) -> None:
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 
@@ -83,7 +265,8 @@ class FrontmatterTests(unittest.TestCase):
                 "dispatch: auto\n"
                 "slice_id: persona-phase1-shadow-gate\n"
                 "plan: docs/superpowers/plans/p1.md\n"
-                "depends_on: [persona-phase0-config-loader, other]",
+                "depends_on: [persona-phase0-config-loader, other]\n"
+                + _v1_verification_block(),
             )
             meta = parse_spec_frontmatter(p)
             self.assertEqual(meta["dispatch"], "auto")
@@ -130,7 +313,12 @@ class FrontmatterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             meta = parse_spec_frontmatter(
-                _write_spec(Path(d), "scalar.md", "dispatch: auto\nslice_id: s\ndepends_on: only-one")
+                _write_spec(
+                    Path(d),
+                    "scalar.md",
+                    "dispatch: auto\nslice_id: s\nplan: docs/p.md\ndepends_on: only-one\n"
+                    + _v1_verification_block(),
+                )
             )
             self.assertEqual(meta["depends_on"], ["only-one"])  # 單一字串容錯成 list
 
@@ -143,7 +331,7 @@ class ScanTests(unittest.TestCase):
         from paulsha_cortex.coordinator.autonomy import scan_specs
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: b\nplan: p")
+            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: b\nplan: p\n" + _v1_verification_block())
             _write_spec(Path(d), "a.md", "dispatch: hold\nslice_id: a")
             _write_spec(Path(d), "c.md", None)  # 無 frontmatter
             metas = scan_specs(d)
@@ -660,7 +848,7 @@ class CliTests(unittest.TestCase):
         from paulsha_cortex.coordinator.cli import main
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "r.md", "dispatch: auto\nslice_id: r\nplan: docs/p.md")
+            _write_spec(Path(d), "r.md", "dispatch: auto\nslice_id: r\nplan: docs/p.md\n" + _v1_verification_block())
             _write_spec(Path(d), "h.md", "dispatch: hold\nslice_id: h")
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -768,7 +956,7 @@ class CliTests(unittest.TestCase):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md")
+            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md\n" + _v1_verification_block())
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
             sender = _FakeSender()
             err = io.StringIO()
@@ -794,8 +982,8 @@ class CliTests(unittest.TestCase):
         from paulsha_cortex.coordinator.cli import main
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: A\nplan: p\ndepends_on: [B]")
-            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: B\nplan: p\ndepends_on: [A]")
+            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: A\nplan: p\ndepends_on: [B]\n" + _v1_verification_block())
+            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: B\nplan: p\ndepends_on: [A]\n" + _v1_verification_block())
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 rc = main(["ready", "--specs-dir", d], is_satisfied=lambda _id: True)

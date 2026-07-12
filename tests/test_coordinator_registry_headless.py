@@ -292,6 +292,71 @@ class SliceRecordTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "gate_state"):
                 reg.update_slice("slice-a", gate_state="pending")
 
+    def test_repin_slice_preserves_needs_human_until_explicit_retry_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="feature/slice-a",
+                dispatch_base="base-sha",
+                builder_job_id=None,
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("slice-a", state="needs_human", gate_state="needs_human")
+
+            repinned = reg.repin_slice(
+                "slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha-2",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha-2",
+                target_branch="feature/slice-a",
+                target_remote="origin",
+                verification_hash="verification-sha-2",
+                verification={"docs_class": "code"},
+                dispatch_base="base-sha-2",
+            )
+
+            self.assertEqual(repinned["state"], "needs_human")
+            self.assertEqual(repinned["gate_state"], "pending")
+
+    def test_repin_slice_rejects_illegal_failed_state_rewind(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="feature/slice-a",
+                dispatch_base="base-sha",
+                builder_job_id=None,
+                reviewer_job_id=None,
+                candidate=None,
+            )
+            reg.update_slice("slice-a", state="running")
+            reg.update_slice("slice-a", state="failed", gate_state="failed")
+
+            with self.assertRaisesRegex(ValueError, "slice state"):
+                reg.repin_slice(
+                    "slice-a",
+                    spec_path="specs/slice-a.md",
+                    spec_hash="spec-sha-2",
+                    plan_path="plans/slice-a.md",
+                    plan_hash="plan-sha-2",
+                    target_branch="feature/slice-a",
+                    target_remote="origin",
+                    verification_hash="verification-sha-2",
+                    verification={"docs_class": "code"},
+                    dispatch_base="base-sha-2",
+                )
+
     def test_get_slice_returns_detached_history_refs(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")

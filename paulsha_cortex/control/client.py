@@ -17,6 +17,9 @@ class ControlPlaneCoordinator:
         specs_dir = payload.get("specs_dir")
         if isinstance(specs_dir, str) and specs_dir.strip():
             args["specs_dir"] = specs_dir
+        handoff_dir = payload.get("handoff_dir")
+        if isinstance(handoff_dir, str) and handoff_dir.strip():
+            args["handoff_dir"] = handoff_dir
         force_hold = payload.get("force_hold")
         if isinstance(force_hold, bool):
             args["force_hold"] = force_hold

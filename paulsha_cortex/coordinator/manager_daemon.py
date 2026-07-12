@@ -140,6 +140,8 @@ def _in_flight_status(registry) -> list[dict[str, Any]]:
 
 def _held_reasons(meta: dict[str, Any], is_satisfied: Callable[[str], bool]) -> list[str]:
     reasons: list[str] = []
+    if isinstance(meta.get("parse_error"), dict):
+        reasons.append(f"parse-error:{meta['parse_error'].get('field', 'frontmatter')}")
     if not (isinstance(meta.get("plan"), str) and meta["plan"]):
         reasons.append("no-plan")
     if meta.get("dispatch") != "auto":
@@ -257,6 +259,14 @@ def build_request_executor(
             target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
             if target is None:
                 raise ValueError("unknown-slice")
+            if isinstance(target.get("parse_error"), dict):
+                raise ValueError(f"invalid-spec:{target['parse_error'].get('field')}")
+            if not (
+                isinstance(target.get("target_branch"), str)
+                and target["target_branch"]
+                and isinstance(target.get("verification"), dict)
+            ):
+                raise ValueError("missing-verification-contract")
             if not (isinstance(target.get("plan"), str) and target["plan"]):
                 raise ValueError("no-plan")
             missing_deps = [dep for dep in target.get("depends_on", []) if not predicate(dep)]
@@ -287,11 +297,19 @@ def build_request_executor(
                 launcher=active_launcher,
             )
             job = dispatched[0]
+            if registry is None:
+                raise RuntimeError("dispatch requires registry for pinned slice metadata")
+            slice_row = registry.get_slice(slice_id)
             result = {
                 "job_id": job.get("job_id"),
                 "worktree": job.get("worktree"),
                 "branch": job.get("branch"),
                 "slice_id": slice_id,
+                "target_branch": slice_row.get("target_branch"),
+                "target_remote": slice_row.get("target_remote"),
+                "spec_hash": slice_row.get("spec", {}).get("hash"),
+                "plan_hash": slice_row.get("plan", {}).get("hash"),
+                "verification_hash": slice_row.get("verification", {}).get("hash"),
             }
             if force_hold and target.get("dispatch") != "auto":
                 result["override"] = "hold"
