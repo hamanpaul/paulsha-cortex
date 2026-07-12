@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from paulsha_cortex.coordinator import autonomy, completion, manager, verification
+from paulsha_cortex.coordinator import autonomy, completion, manager, review, verification
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -562,23 +562,35 @@ class DispatchDisciplineCanaryTests(unittest.TestCase):
                     "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
                     "slice_id": "slice-remote",
                     "candidate": candidate,
-                    "status": "verified",
+                    "status": "reviewing",
                     "summary": "verification-succeeded",
                     "details": {"ok": True},
                 },
                 coordinator_root=coordinator_root,
             )
-            review_payload = {
-                "schema_version": 1,
-                "builder_job_id": "slice-remote-builder-1",
-                "reviewer_job_id": "slice-remote-review-1",
-                "candidate": candidate,
-                "state": "passed",
-                "findings": [],
-            }
-            review_path = coordinator_root / "evidence" / "review" / "slice-remote.json"
-            verification.atomic_write_json(review_path, review_payload)
-            review_hash = verification.canonical_json_hash(review_payload)
+            review_payload = review.build_gate_evaluation(
+                slice_id="slice-remote",
+                state="passed",
+                reason="accepted",
+                builder_job_id="slice-remote-builder-1",
+                reviewer_job_id="slice-remote-review-1",
+                candidate=candidate,
+                launch_identity={
+                    "builder": {
+                        "executor": "copilot",
+                        "model_id": "builder-model",
+                        "independence_domain": "builder-domain",
+                    },
+                    "reviewer": {
+                        "executor": "codex",
+                        "model_id": "reviewer-model",
+                        "independence_domain": "reviewer-domain",
+                    },
+                },
+            )
+            review_ref = review.write_gate_evaluation(review_payload, coordinator_root=coordinator_root)
+            review_path = Path(review_ref["path"])
+            review_hash = review_ref["hash"]
             record = completion.write_completion_record(
                 {
                     "schema_version": completion.COMPLETION_SCHEMA_VERSION,

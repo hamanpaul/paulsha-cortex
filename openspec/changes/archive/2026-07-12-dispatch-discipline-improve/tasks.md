@@ -51,5 +51,5 @@
 
 ## 9. Completion gates
 
-- [ ] 9.1 Pass the full pytest suite, `python3 -m policy_check --repo .` and `git diff --check`.
+- [x] 9.1 Pass the full pytest suite, `python3 -m policy_check --repo .` and `git diff --check`.
 - [x] 9.2 Complete independent code review, re-review every fix and resolve all Critical/Important adversarial findings.

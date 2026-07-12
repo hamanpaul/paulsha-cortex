@@ -536,11 +536,119 @@ def build_gate_evaluation(
     }
 
 
+def validate_gate_evaluation(payload: object) -> dict[str, Any]:
+    """Validate the immutable evaluation artifact before it becomes trusted evidence."""
+    if not isinstance(payload, dict):
+        raise ValueError("gate evaluation must be an object")
+    required = {
+        "schema_version",
+        "slice_id",
+        "state",
+        "reason",
+        "builder_job_id",
+        "reviewer_job_id",
+        "candidate",
+        "launch_identity",
+        "findings",
+    }
+    missing = sorted(required - set(payload))
+    if missing:
+        raise ValueError(f"gate evaluation missing keys: {', '.join(missing)}")
+    extras = sorted(set(payload) - required)
+    if extras:
+        raise ValueError(f"gate evaluation unexpected key: {extras[0]}")
+    if payload.get("schema_version") != REVIEW_SCHEMA_VERSION:
+        raise ValueError(f"gate evaluation schema_version must be {REVIEW_SCHEMA_VERSION}")
+
+    slice_id = payload.get("slice_id")
+    if not isinstance(slice_id, str) or verification.SAFE_SLICE_ID_RE.fullmatch(slice_id) is None:
+        raise ValueError(f"invalid gate evaluation slice_id: {slice_id!r}")
+    state = payload.get("state")
+    if state not in VALID_EVALUATION_STATES:
+        raise ValueError(f"invalid gate evaluation state: {state!r}")
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("gate evaluation reason must be a non-empty string")
+    builder_job_id = payload.get("builder_job_id")
+    if not isinstance(builder_job_id, str) or not builder_job_id.strip():
+        raise ValueError("gate evaluation builder_job_id must be a non-empty string")
+    reviewer_job_id = payload.get("reviewer_job_id")
+    if reviewer_job_id is not None and (not isinstance(reviewer_job_id, str) or not reviewer_job_id.strip()):
+        raise ValueError("gate evaluation reviewer_job_id must be null or a non-empty string")
+    candidate = payload.get("candidate")
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        raise ValueError(f"invalid gate evaluation candidate: {candidate!r}")
+
+    launch_identity = payload.get("launch_identity")
+    if not isinstance(launch_identity, dict) or set(launch_identity) != {"builder", "reviewer"}:
+        raise ValueError("gate evaluation launch_identity must contain builder and reviewer")
+    normalized_identity = {
+        "builder": _normalize_identity(launch_identity["builder"], field="launch_identity.builder")
+        if launch_identity["builder"] is not None
+        else None,
+        "reviewer": _normalize_identity(launch_identity["reviewer"], field="launch_identity.reviewer")
+        if launch_identity["reviewer"] is not None
+        else None,
+    }
+
+    findings_value = payload.get("findings")
+    if not isinstance(findings_value, list):
+        raise ValueError("gate evaluation findings must be a list")
+    findings: list[dict[str, Any]] = []
+    finding_ids: set[str] = set()
+    for index, item in enumerate(findings_value):
+        field = f"findings[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{field} must be an object")
+        if set(item) != {
+            "finding_id",
+            "category",
+            "severity",
+            "summary",
+            "evidence",
+            "recommendation",
+            "blocking",
+        }:
+            raise ValueError(f"{field} has invalid keys")
+        normalized = _normalize_finding(
+            {key: item[key] for key in ("category", "severity", "summary", "evidence", "recommendation")},
+            field=field,
+        )
+        if item.get("finding_id") != normalized["finding_id"]:
+            raise ValueError(f"{field}.finding_id mismatch")
+        if item.get("blocking") is not normalized["blocking"]:
+            raise ValueError(f"{field}.blocking mismatch")
+        if normalized["finding_id"] in finding_ids:
+            raise ValueError(f"gate evaluation duplicate finding_id: {normalized['finding_id']}")
+        finding_ids.add(normalized["finding_id"])
+        findings.append(normalized)
+    has_blocking = any(item["blocking"] for item in findings)
+    if state == "passed" and has_blocking:
+        raise ValueError("passed gate evaluation must not contain blocking findings")
+    if state == "rejected" and not has_blocking:
+        raise ValueError("rejected gate evaluation must contain a blocking finding")
+    if state == "absent" and findings:
+        raise ValueError("absent gate evaluation must not contain findings")
+
+    return {
+        "schema_version": REVIEW_SCHEMA_VERSION,
+        "slice_id": slice_id,
+        "state": state,
+        "reason": reason.strip(),
+        "builder_job_id": builder_job_id.strip(),
+        "reviewer_job_id": reviewer_job_id.strip() if isinstance(reviewer_job_id, str) else None,
+        "candidate": candidate.lower(),
+        "launch_identity": normalized_identity,
+        "findings": findings,
+    }
+
+
 def write_gate_evaluation(
     payload: dict[str, Any],
     *,
     coordinator_root: str | Path | None = None,
 ) -> dict[str, Any]:
+    payload = validate_gate_evaluation(payload)
     path = gate_evaluation_path(
         slice_id=payload["slice_id"],
         builder_job_id=payload["builder_job_id"],

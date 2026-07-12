@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 
+from . import review as foreign_review
 from . import verification
 
 COMPLETION_SCHEMA_VERSION = 1
@@ -101,6 +102,9 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     docs_class = payload.get("docs_class")
     if docs_class not in verification.VALID_DOCS_CLASSES:
         raise ValueError(f"invalid completion docs_class: {docs_class!r}")
+    expected_review_policy = "required" if docs_class in {"normative", "code"} else "not-required"
+    if review_policy != expected_review_policy:
+        raise ValueError("completion review_policy does not match docs_class")
 
     normalized = {
         "schema_version": COMPLETION_SCHEMA_VERSION,
@@ -153,6 +157,9 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
         normalized["reviewer_job_id"] = None
         normalized["review_evaluation_path"] = None
         normalized["review_evaluation_hash"] = None
+    expected_target_ref = f"refs/remotes/{normalized['target_remote']}/{normalized['target_branch']}"
+    if normalized["target_ref"] != expected_target_ref:
+        raise ValueError("completion target_ref does not match target remote/branch")
     return normalized
 
 
@@ -166,7 +173,7 @@ def _validate_reference(
     expected_hash: object,
     field: str,
     validator,
-) -> None:
+) -> dict[str, Any]:
     path_str = _require_non_empty_string(path, field=field)
     if Path(path_str).is_symlink():
         raise ValueError(f"{field} must not be a symlink path")
@@ -183,6 +190,7 @@ def _validate_reference(
         normalized = validator(payload)
     if verification.canonical_json_hash(normalized) != expected:
         raise ValueError(f"{field} hash mismatch: {path_str}")
+    return normalized
 
 
 def read_completion_record(
@@ -202,19 +210,36 @@ def read_completion_record(
         expected = _normalize_digest_hash(expected_hash, field="completion_record_hash")
         if verification.canonical_json_hash(normalized) != expected:
             raise ValueError(f"completion record hash mismatch: {record_path}")
-    _validate_reference(
+    verification_evidence = _validate_reference(
         path=normalized["verification_evidence_path"],
         expected_hash=normalized["verification_evidence_hash"],
         field="verification_evidence_path",
         validator=verification.validate_verification_evidence,
     )
+    if verification_evidence["slice_id"] != normalized["slice_id"]:
+        raise ValueError("verification evidence slice_id mismatch")
+    if verification_evidence["candidate"] != normalized["candidate"]:
+        raise ValueError("verification evidence candidate mismatch")
+    expected_verification_status = "reviewing" if normalized["review_policy"] == "required" else "verified"
+    if verification_evidence["status"] != expected_verification_status:
+        raise ValueError("verification evidence status does not match review_policy")
     if normalized["review_policy"] == "required":
-        _validate_reference(
+        review_evaluation = _validate_reference(
             path=normalized["review_evaluation_path"],
             expected_hash=normalized["review_evaluation_hash"],
             field="review_evaluation_path",
-            validator=None,
+            validator=foreign_review.validate_gate_evaluation,
         )
+        if review_evaluation["slice_id"] != normalized["slice_id"]:
+            raise ValueError("review evaluation slice_id mismatch")
+        if review_evaluation["candidate"] != normalized["candidate"]:
+            raise ValueError("review evaluation candidate mismatch")
+        if review_evaluation["builder_job_id"] != normalized["builder_job_id"]:
+            raise ValueError("review evaluation builder_job_id mismatch")
+        if review_evaluation["reviewer_job_id"] != normalized["reviewer_job_id"]:
+            raise ValueError("review evaluation reviewer_job_id mismatch")
+        if review_evaluation["state"] != "passed":
+            raise ValueError("review evaluation state must be passed")
     return normalized
 
 

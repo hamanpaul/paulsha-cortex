@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from paulsha_cortex.coordinator import autonomy, completion, verification
+from paulsha_cortex.coordinator import autonomy, completion, review, verification
 
 
 def _git_ok(stdout: str = "") -> SimpleNamespace:
@@ -18,20 +18,27 @@ def _git_nonzero(returncode: int = 1) -> SimpleNamespace:
 
 
 def _write_review_eval(root: Path, *, slice_id: str, candidate: str) -> dict:
-    payload = {
-        "schema_version": 1,
-        "slice_id": slice_id,
-        "state": "passed",
-        "reason": "accepted",
-        "builder_job_id": "builder-1",
-        "reviewer_job_id": "reviewer-1",
-        "candidate": candidate,
-        "findings": [],
-        "created_at": "2026-07-12T00:00:00+00:00",
-    }
-    path = root / "evidence" / "review" / f"{slice_id}-{candidate}.json"
-    verification.atomic_write_json(path, payload)
-    return {"path": str(path), "hash": verification.canonical_json_hash(payload), "payload": payload}
+    payload = review.build_gate_evaluation(
+        slice_id=slice_id,
+        state="passed",
+        reason="accepted",
+        builder_job_id="builder-1",
+        reviewer_job_id="reviewer-1",
+        candidate=candidate,
+        launch_identity={
+            "builder": {
+                "executor": "copilot",
+                "model_id": "builder-model",
+                "independence_domain": "builder-domain",
+            },
+            "reviewer": {
+                "executor": "codex",
+                "model_id": "reviewer-model",
+                "independence_domain": "reviewer-domain",
+            },
+        },
+    )
+    return review.write_gate_evaluation(payload, coordinator_root=root)
 
 
 def _write_verification(root: Path, *, slice_id: str, candidate: str, status: str = "verified") -> dict:
@@ -158,6 +165,63 @@ class CompletionRecordValidationTests(unittest.TestCase):
 
 
 class CompletionRecordReadAndSatisfactionTests(unittest.TestCase):
+    def test_read_completion_record_rejects_cross_candidate_verification_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            candidate = "b" * 40
+            verification_ref = _write_verification(
+                root,
+                slice_id="slice-a",
+                candidate="c" * 40,
+                status="verified",
+            )
+            normalized = completion.validate_completion_record(
+                _completion_payload(
+                    slice_id="slice-a",
+                    candidate=candidate,
+                    target_sha="d" * 40,
+                    verification_ref=verification_ref,
+                    review_policy="not-required",
+                    docs_class="informational",
+                    reviewer_job_id=None,
+                    review_eval_ref=None,
+                )
+            )
+            record_path = root / "completion.json"
+            verification.atomic_write_json(record_path, normalized)
+
+            with self.assertRaisesRegex(ValueError, "verification evidence candidate mismatch"):
+                completion.read_completion_record(record_path)
+
+    def test_read_completion_record_rejects_cross_slice_review_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            candidate = "b" * 40
+            verification_ref = _write_verification(
+                root,
+                slice_id="slice-a",
+                candidate=candidate,
+                status="reviewing",
+            )
+            review_eval_ref = _write_review_eval(root, slice_id="slice-b", candidate=candidate)
+            normalized = completion.validate_completion_record(
+                _completion_payload(
+                    slice_id="slice-a",
+                    candidate=candidate,
+                    target_sha="d" * 40,
+                    verification_ref=verification_ref,
+                    review_policy="required",
+                    docs_class="code",
+                    reviewer_job_id="reviewer-1",
+                    review_eval_ref=review_eval_ref,
+                )
+            )
+            record_path = root / "completion.json"
+            verification.atomic_write_json(record_path, normalized)
+
+            with self.assertRaisesRegex(ValueError, "review evaluation slice_id mismatch"):
+                completion.read_completion_record(record_path)
+
     def test_read_completion_record_rejects_symlink_record_path(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
