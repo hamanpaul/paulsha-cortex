@@ -1134,8 +1134,8 @@ def test_complete_request_runs_complete_tick(monkeypatch, tmp_path):
     )
 
     assert done["status"] == "ok"
-    assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "passed"}]
-    assert "slice-b" in done["result"]["released"]
+    assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "needs_human"}]
+    assert done["result"]["released"] == []
 
 
 def test_complete_request_without_specs_dir_skips_spec_scan(monkeypatch, tmp_path):
@@ -1185,7 +1185,7 @@ def test_complete_request_without_specs_dir_skips_spec_scan(monkeypatch, tmp_pat
     done = contract.read_json(constants.done_dir() / f"{req_id}.json")
 
     assert done["status"] == "ok"
-    assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "passed"}]
+    assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "needs_human"}]
 
 
 def test_dispatch_no_plan(monkeypatch, tmp_path):

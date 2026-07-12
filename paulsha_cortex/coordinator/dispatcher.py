@@ -89,10 +89,12 @@ class Dispatcher:
         registry: JobRegistry,
         pane_sender: PaneSender,
         worktree_creator: WorktreeCreator,
+        git_runner: GitRunner | None = None,
     ) -> None:
         self._registry = registry
         self._pane_sender = pane_sender
         self._worktree_creator = worktree_creator
+        self._git_runner = git_runner
 
     def dispatch(
         self,
@@ -110,7 +112,7 @@ class Dispatcher:
         self._pane_sender.send(pane_id, command)
         # (3) 取 dispatch 當下的 branch head（baseline）；取不到記 None。
         #     D5：baseline 持久化於 job 上（非實例 dict），故 poll_done 可跨進程比對。
-        runner = git_runner or _default_git_runner
+        runner = git_runner or self._git_runner or _default_git_runner
         try:
             dispatch_head: str | None = runner(["rev-parse", branch])
         except Exception:
@@ -136,7 +138,7 @@ class Dispatcher:
         baseline = job.get("dispatch_head")
         if baseline is None:
             return job  # baseline 不明 → 不自動完成
-        runner = git_runner or _default_git_runner
+        runner = git_runner or self._git_runner or _default_git_runner
         try:
             current = runner(["rev-parse", job["branch"]])
         except Exception:

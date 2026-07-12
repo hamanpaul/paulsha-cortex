@@ -16,7 +16,18 @@ ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"exited", "failed"})
 
 VALID_SLICE_STATES = frozenset(
-    {"pending", "building", "dispatched", "running", "exited", "verified", "completed", "needs_human", "failed"}
+    {
+        "pending",
+        "building",
+        "dispatched",
+        "running",
+        "exited",
+        "reviewing",
+        "verified",
+        "completed",
+        "needs_human",
+        "failed",
+    }
 )
 VALID_GATE_STATES = frozenset({"pending", "passed", "failed", "needs_human"})
 
@@ -28,13 +39,14 @@ JOB_STATUS_TRANSITIONS = {
 }
 SLICE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "building", "dispatched", "running", "needs_human", "failed"}),
-    "building": frozenset({"building", "needs_human", "failed", "verified", "completed", "exited"}),
+    "building": frozenset({"building", "needs_human", "failed", "reviewing", "verified", "completed", "exited"}),
     "dispatched": frozenset({"dispatched", "running", "exited", "failed", "needs_human"}),
     "running": frozenset({"running", "exited", "failed"}),
     "exited": frozenset({"exited"}),
+    "reviewing": frozenset({"reviewing", "needs_human", "verified", "failed"}),
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
-    "needs_human": frozenset({"needs_human", "building", "verified", "failed", "completed"}),
+    "needs_human": frozenset({"needs_human", "building", "reviewing", "verified", "failed", "completed"}),
     "failed": frozenset({"failed"}),
 }
 GATE_STATE_TRANSITIONS = {
@@ -578,6 +590,7 @@ class JobRegistry:
         gate_state: str | None = None,
         evidence_refs: list[str] | None = None,
         evaluation_refs: list[str] | None = None,
+        candidate: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         if state is not None:
@@ -616,6 +629,8 @@ class JobRegistry:
             slice_row["evaluation_history"].append(
                 {"action": action, "actor": actor, "refs": refs, "at": _now_iso()}
             )
+        if candidate is not None:
+            slice_row["candidate"] = candidate
         slice_row["actions"].append(
             {
                 "action": action,

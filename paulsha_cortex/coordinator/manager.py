@@ -14,6 +14,7 @@ from . import verification
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
+VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 
 
 def _utcnow() -> str:
@@ -80,6 +81,12 @@ def _existing_manifest_job_id(path: Path) -> str | None:
     payload = _read_manifest_payload(path)
     if payload is None:
         return None
+    if payload.get("gate_status") == "passed":
+        return None
+    if payload.get("gate_status") == "needs_human" and payload.get("verification_evidence_path") is None and (
+        payload.get("gate_reason") in {"pinned-input-mismatch", "verification-runner-error", "verification-state-update-error"}
+    ):
+        return None
     job_id = payload.get("job_id")
     return job_id if isinstance(job_id, str) else None
 
@@ -130,6 +137,127 @@ def _pinned_input_mismatches(slice_row: dict) -> list[str]:
     return mismatches
 
 
+def _candidate_for_evidence(
+    *,
+    slice_row: dict | None,
+    job: dict,
+    repo_root: Path,
+    git_runner,
+) -> str:
+    fallback = None
+    if slice_row is not None:
+        dispatch_base = slice_row.get("dispatch_base")
+        if isinstance(dispatch_base, str) and verification.SAFE_SHA_RE.fullmatch(dispatch_base):
+            fallback = dispatch_base.lower()
+    branch = job.get("branch")
+    if isinstance(branch, str) and branch:
+        branch_head = verification._run_git(["-C", str(repo_root), "rev-parse", branch], git_runner)
+        stdout = branch_head["stdout"].strip()
+        if branch_head["status"] == "ok" and verification.SAFE_SHA_RE.fullmatch(stdout):
+            return stdout.lower()
+    worktree = job.get("worktree")
+    if isinstance(worktree, str) and worktree:
+        worktree_head = verification._run_git(["-C", worktree, "rev-parse", "HEAD"], git_runner)
+        stdout = worktree_head["stdout"].strip()
+        if worktree_head["status"] == "ok" and verification.SAFE_SHA_RE.fullmatch(stdout):
+            return stdout.lower()
+    return fallback or ("0" * 40)
+
+
+def _write_status_evidence(
+    *,
+    slice_row: dict | None,
+    job: dict,
+    repo_root: Path,
+    coordinator_root: Path | None,
+    git_runner,
+    status: str,
+    summary: str,
+    details: dict,
+) -> dict | None:
+    slice_id = job.get("task")
+    if not isinstance(slice_id, str) or not slice_id:
+        return None
+    payload = {
+        "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+        "slice_id": slice_id,
+        "candidate": _candidate_for_evidence(
+            slice_row=slice_row,
+            job=job,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        ),
+        "status": status,
+        "summary": summary,
+        "details": details,
+    }
+    return verification.write_verification_evidence(payload, coordinator_root=coordinator_root)
+
+
+def _discard_unpublished_evidence(evidence: dict | None) -> None:
+    if not isinstance(evidence, dict):
+        return
+    path = evidence.get("path")
+    if not isinstance(path, str) or not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _validate_result_evidence(
+    *,
+    evidence: object,
+    slice_id: str,
+    coordinator_root: Path | None,
+) -> dict:
+    if not isinstance(evidence, dict):
+        raise ValueError("verification runner must return an evidence object")
+    normalized = verification.validate_verification_evidence(evidence.get("payload"))
+    if normalized["slice_id"] != slice_id:
+        raise ValueError("verification evidence slice_id mismatch")
+    if normalized["status"] not in VERIFICATION_RESULT_STATES:
+        raise ValueError(f"unsupported verification evidence status: {normalized['status']!r}")
+    expected_path = verification.evidence_path(
+        slice_id=slice_id,
+        candidate=normalized["candidate"],
+        coordinator_root=coordinator_root,
+    )
+    if evidence.get("path") != str(expected_path):
+        raise ValueError("verification evidence path mismatch")
+    expected_hash = verification.canonical_json_hash(normalized)
+    if evidence.get("hash") != expected_hash:
+        raise ValueError("verification evidence hash mismatch")
+    stored_payload = _read_manifest_payload(expected_path)
+    if stored_payload is None:
+        raise ValueError("verification evidence file unreadable")
+    stored_normalized = verification.validate_verification_evidence(stored_payload)
+    if stored_normalized != normalized:
+        raise ValueError("verification evidence payload mismatch")
+    return {"path": str(expected_path), "hash": expected_hash, "payload": normalized}
+
+
+def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
+    payload = evidence["payload"]
+    refs = [evidence["path"]]
+    state = payload["status"]
+    gate_state = "pending" if state == "reviewing" else ("passed" if state == "verified" else "needs_human")
+    action = {
+        "reviewing": "verification-passed-await-review",
+        "verified": "verification-passed",
+    }.get(state, "verification-failed")
+    registry.record_action(
+        slice_id,
+        action=action,
+        actor="manager",
+        state=state,
+        gate_state=gate_state,
+        evidence_refs=refs,
+        candidate=payload["candidate"],
+    )
+
+
 def complete_tick(
     dispatcher,
     *,
@@ -137,12 +265,16 @@ def complete_tick(
     handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
     metas: list[dict] | None = None,
     clock: Callable[[], str] = _utcnow,
+    git_runner=None,
+    subprocess_runner=None,
+    verification_runner=None,
 ) -> dict:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         raise RuntimeError("complete_tick 需 dispatcher._registry（fail-closed）")
-    runner = gate_runner if gate_runner is not None else _default_gate_runner
     hdir = Path(handoff_dir)
+    git_runner = git_runner or getattr(dispatcher, "_git_runner", None)
+    verification_runner = verification_runner or verification.run_result_verification
 
     polled: list[str] = []
     completed: list[dict] = []
@@ -188,32 +320,119 @@ def complete_tick(
             if _existing_manifest_job_id(manifest_path) == job_id:
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
-            gate_status = "passed" if status == "exited" else "failed"
-            gate_reason = None
             slice_row = _slice_for_job(registry, slice_id, job_id)
+            repo_root = (
+                autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+                if slice_row is not None
+                else Path.cwd().resolve()
+            )
+            state_path = getattr(registry, "_state_path", None)
+            coordinator_root = Path(state_path).parent if state_path is not None else None
+            evidence = None
+            publish_evidence = False
+            gate_status = "failed" if status == "failed" else "needs_human"
+            gate_reason = None
+
             if slice_row is not None:
                 mismatches = _pinned_input_mismatches(slice_row)
-                if mismatches:
-                    gate_status = "needs_human"
-                    gate_reason = "pinned-input-mismatch"
+            else:
+                mismatches = []
+
+            if mismatches:
+                gate_status = "needs_human"
+                gate_reason = "pinned-input-mismatch"
+                try:
+                    evidence = _write_status_evidence(
+                        slice_row=slice_row,
+                        job=job,
+                        repo_root=repo_root,
+                        coordinator_root=coordinator_root,
+                        git_runner=git_runner,
+                        status="needs_human",
+                        summary="pinned-input-mismatch",
+                        details={"mismatches": mismatches},
+                    )
+                    if evidence is not None:
+                        _apply_verification_result(registry, slice_id, evidence)
+                        publish_evidence = True
+                    else:
+                        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                except Exception:
                     try:
                         registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
                     except Exception:
                         pass
-                elif status == "failed":
+            elif status == "failed":
+                gate_status = "failed"
+                gate_reason = "builder-failed"
+                if slice_row is not None:
                     try:
                         registry.update_slice(slice_id, state="failed", gate_state="failed")
                     except Exception:
                         pass
-            elif status == "failed":
+            elif slice_row is None:
+                evidence = _write_status_evidence(
+                    slice_row=None,
+                    job=job,
+                    repo_root=repo_root,
+                    coordinator_root=coordinator_root,
+                    git_runner=git_runner,
+                    status="needs_human",
+                    summary="missing-slice-proof",
+                    details={"reason": "builder exited without pinned slice verification contract"},
+                )
+                gate_status = "needs_human"
+                gate_reason = "missing-slice-proof"
+                publish_evidence = evidence is not None
+            else:
                 try:
-                    registry.update_slice(slice_id, state="failed", gate_state="failed")
-                except Exception:
-                    pass
-            try:
-                verdict = runner(job)
-            except Exception:
-                verdict = None
+                    evidence = verification_runner(
+                        slice_row=slice_row,
+                        job=job,
+                        repo_root=repo_root,
+                        coordinator_root=coordinator_root,
+                        git_runner=git_runner,
+                        subprocess_runner=subprocess_runner,
+                    )
+                    evidence = _validate_result_evidence(
+                        evidence=evidence,
+                        slice_id=slice_id,
+                        coordinator_root=coordinator_root,
+                    )
+                    gate_status = evidence["payload"]["status"]
+                    gate_reason = evidence["payload"]["summary"]
+                except Exception as exc:
+                    gate_status = "needs_human"
+                    gate_reason = "verification-runner-error"
+                    try:
+                        evidence = _write_status_evidence(
+                            slice_row=slice_row,
+                            job=job,
+                            repo_root=repo_root,
+                            coordinator_root=coordinator_root,
+                            git_runner=git_runner,
+                            status="needs_human",
+                            summary="verification-runner-error",
+                            details={"error": str(exc)},
+                        )
+                        if evidence is not None:
+                            _apply_verification_result(registry, slice_id, evidence)
+                            publish_evidence = True
+                        else:
+                            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                    except Exception:
+                        try:
+                            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        _apply_verification_result(registry, slice_id, evidence)
+                        publish_evidence = True
+                    except Exception:
+                        gate_status = "needs_human"
+                        gate_reason = "verification-state-update-error"
+                        publish_evidence = False
 
             handoff.write_manifest(
                 manifest_path,
@@ -224,11 +443,23 @@ def complete_tick(
                     "completion": status,
                     "exit_code": job.get("exit_code"),
                     "branch": job.get("branch"),
-                    "gate_verdict": verdict,
                     "gate_reason": gate_reason,
+                    "gate_verdict": evidence["payload"] if publish_evidence and evidence is not None else None,
+                    "verification_evidence_path": (
+                        evidence["path"] if publish_evidence and evidence is not None else None
+                    ),
+                    "verification_evidence_hash": (
+                        evidence["hash"] if publish_evidence and evidence is not None else None
+                    ),
                     "completed_at": clock(),
                 },
             )
+            if not publish_evidence and gate_reason in {
+                "pinned-input-mismatch",
+                "verification-runner-error",
+                "verification-state-update-error",
+            }:
+                _discard_unpublished_evidence(evidence)
             if slice_id in seen_slices:
                 # 同輪同 slice 第二個 terminal job：後者勝（manifest 已覆寫）→ 記 warning、completed 去重更新。
                 warnings.append({"slice_id": slice_id, "warning": "same-slice concurrent terminals"})

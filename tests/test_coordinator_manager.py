@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.autonomy import dispatch_ready
@@ -36,10 +37,10 @@ def _reg(tmp: str) -> JobRegistry:
     return JobRegistry(state_path=Path(tmp) / "jobs.json")
 
 
-def _make_job(reg: JobRegistry, slice_id: str) -> dict:
+def _make_job(reg: JobRegistry, slice_id: str, *, worktree: str | None = None, branch: str | None = None) -> dict:
     return reg.create_job(
-        task=slice_id, persona="builder", branch=f"feature/{slice_id}",
-        pane="", worktree=f"/wt/{slice_id}",
+        task=slice_id, persona="builder", branch=branch or f"feature/{slice_id}",
+        pane="", worktree=worktree or f"/wt/{slice_id}",
         executor="copilot", session_name=slice_id, pid=4242,
         log_path=f"/logs/{slice_id}.jsonl",
     )
@@ -77,8 +78,135 @@ def _dispatch_meta(slice_id: str, *, plan: str = "p.md") -> dict:
     }
 
 
+def _git_ok(stdout: str = "") -> SimpleNamespace:
+    return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+
+def _proc_ok() -> SimpleNamespace:
+    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def _proc_fail(returncode: int) -> SimpleNamespace:
+    return SimpleNamespace(returncode=returncode, stdout="", stderr="")
+
+
+def _persona_catalog(*, builder_paths: list[str]) -> str:
+    return (
+        "roles:\n"
+        "  manager:\n"
+        "    role: manager\n"
+        "    version: v1\n"
+        "    summary: manager\n"
+        "    allowed_phases: [define, plan, build, verify, review, ship]\n"
+        "    write_paths: [\"**\"]\n"
+        "    allowed_tools: [bash]\n"
+        "  builder:\n"
+        "    role: builder\n"
+        "    version: v1\n"
+        "    summary: builder\n"
+        f"    write_paths: [{', '.join(f'\"{path}\"' for path in builder_paths)}]\n"
+        "    allowed_phases: [build, verify]\n"
+        "    allowed_tools: [bash]\n"
+        "  reviewer:\n"
+        "    role: reviewer\n"
+        "    version: v1\n"
+        "    summary: reviewer\n"
+        "    allowed_phases: [review]\n"
+        "    write_paths: [\"**\"]\n"
+        "    allowed_tools: [bash]\n"
+    )
+
+
+def _verification_contract(*, docs_class: str = "code") -> dict:
+    return {
+        "docs_class": docs_class,
+        "review_policy": "required" if docs_class in {"code", "normative"} else "not-required",
+        "required_artifacts": [],
+        "checks": [
+            {"kind": "persona-scope"},
+            {
+                "kind": "command",
+                "name": "policy",
+                "argv": ["python3", "-m", "pytest", "-q", "tests/policy.py"],
+                "cwd": ".",
+                "timeout_seconds": 30,
+            },
+        ],
+        "tests": [],
+        "full_suite": {
+            "argv": ["python3", "-m", "pytest", "-q"],
+            "cwd": ".",
+            "timeout_seconds": 60,
+            "baseline": "no-regression",
+        },
+    }
+
+
+def _create_slice(
+    reg: JobRegistry,
+    root: Path,
+    job: dict,
+    *,
+    docs_class: str = "code",
+    dispatch_base: str = "a" * 40,
+) -> dict:
+    slice_id = job["task"]
+    contract = _verification_contract(docs_class=docs_class)
+    (root / ".git").mkdir(exist_ok=True)
+    spec_path = root / "specs" / f"{slice_id}.md"
+    plan_path = root / "docs" / "superpowers" / "plans" / f"{slice_id}.md"
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_path.write_text(
+        (
+            "---\n"
+            "dispatch: auto\n"
+            f"slice_id: {slice_id}\n"
+            f"plan: docs/superpowers/plans/{slice_id}.md\n"
+            "target_branch: main\n"
+            "verification:\n"
+            f"  docs_class: {docs_class}\n"
+            "  required_artifacts: []\n"
+            "  checks:\n"
+            "    - kind: persona-scope\n"
+            "    - kind: command\n"
+            "      name: policy\n"
+            "      argv: [python3, -m, pytest, -q, tests/policy.py]\n"
+            "      cwd: .\n"
+            "      timeout_seconds: 30\n"
+            "  tests: []\n"
+            "  full_suite:\n"
+            "    argv: [python3, -m, pytest, -q]\n"
+            "    cwd: .\n"
+            "    timeout_seconds: 60\n"
+            "    baseline: no-regression\n"
+            "---\n"
+        ),
+        encoding="utf-8",
+    )
+    plan_path.write_text("# plan\n", encoding="utf-8")
+    try:
+        return reg.create_slice(
+            slice_id=slice_id,
+            spec_path=str(spec_path),
+            spec_hash=manager.verification.sha256_bytes(spec_path.read_bytes()),
+            plan_path=str(plan_path),
+            plan_hash=manager.verification.sha256_bytes(plan_path.read_bytes()),
+            target_branch="main",
+            target_remote="origin",
+            verification_hash=manager.verification.canonical_json_hash(contract),
+            verification=contract,
+            dispatch_base=dispatch_base,
+            builder_job_id=job["job_id"],
+            reviewer_job_id=None,
+            candidate=None,
+        )
+    finally:
+        reg.update_slice(slice_id, state="building", builder_job_id=job["job_id"])
+
+
 class CompleteTickDoneTests(unittest.TestCase):
-    def test_exited_job_writes_passed_manifest(self) -> None:
+    def test_exited_job_without_slice_proof_becomes_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-a")
@@ -88,11 +216,12 @@ class CompleteTickDoneTests(unittest.TestCase):
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
 
             manifest = json.loads((hdir / "slice-a.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["gate_status"], "passed")
+            self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["completion"], "exited")
             self.assertEqual(manifest["slice_id"], "slice-a")
             self.assertEqual(manifest["completed_at"], "T0")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "needs_human"}])
+            self.assertFalse(manager.autonomy.default_is_satisfied("slice-a", handoff_dir=str(hdir)))
             self.assertEqual(summary["errors"], [])
 
 
@@ -130,7 +259,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
             hdir = Path(d) / "handoff"
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
             self.assertTrue((hdir / "slice-d.json").exists())
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-d", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-d", "gate_status": "needs_human"}])
             self.assertEqual(summary["polled"], [])
 
     def test_same_job_rescan_is_noop(self) -> None:
@@ -201,12 +330,12 @@ class CompleteTickReconcileTests(unittest.TestCase):
 
             manifest = json.loads((hdir / "slice-requeue.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["job_id"], second_job["job_id"])
-            self.assertEqual(manifest["gate_status"], "passed")
+            self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["completion"], "exited")
             self.assertEqual(manifest["completed_at"], "T1")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-requeue", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-requeue", "gate_status": "needs_human"}])
             from paulsha_cortex.coordinator import autonomy
-            self.assertTrue(autonomy.default_is_satisfied("slice-requeue", handoff_dir=str(hdir)))
+            self.assertFalse(autonomy.default_is_satisfied("slice-requeue", handoff_dir=str(hdir)))
 
     def test_legacy_manifest_without_job_id_is_upgraded(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -238,9 +367,81 @@ class CompleteTickReconcileTests(unittest.TestCase):
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["job_id"], job["job_id"])
-            self.assertEqual(manifest["gate_status"], "passed")
+            self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["completed_at"], "T0")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-legacy", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-legacy", "gate_status": "needs_human"}])
+
+    def test_retryable_needs_human_manifest_is_reprocessed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_job(reg, "slice-retryable")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+            manifest_path = hdir / "slice-retryable.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "slice_id": "slice-retryable",
+                        "job_id": job["job_id"],
+                        "gate_status": "needs_human",
+                        "completion": "exited",
+                        "exit_code": 0,
+                        "branch": job["branch"],
+                        "gate_reason": "verification-runner-error",
+                        "gate_verdict": None,
+                        "verification_evidence_path": None,
+                        "verification_evidence_hash": None,
+                        "completed_at": "OLD",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T1")
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["completed_at"], "T1")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-retryable", "gate_status": "needs_human"}])
+
+    def test_same_job_legacy_passed_manifest_is_reprocessed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_job(reg, "slice-legacy-pass")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+            manifest_path = hdir / "slice-legacy-pass.json"
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "slice_id": "slice-legacy-pass",
+                        "job_id": job["job_id"],
+                        "gate_status": "passed",
+                        "completion": "exited",
+                        "exit_code": 0,
+                        "branch": job["branch"],
+                        "gate_verdict": {"legacy": True},
+                        "gate_reason": None,
+                        "completed_at": "OLD",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T1")
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["completed_at"], "T1")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertFalse(manager.autonomy.default_is_satisfied("slice-legacy-pass", handoff_dir=str(hdir)))
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-legacy-pass", "gate_status": "needs_human"}])
 
     def test_corrupt_manifest_is_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -256,8 +457,8 @@ class CompleteTickReconcileTests(unittest.TestCase):
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["job_id"], job["job_id"])
-            self.assertEqual(manifest["gate_status"], "passed")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-corrupt", "gate_status": "passed"}])
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-corrupt", "gate_status": "needs_human"}])
             self.assertEqual(summary["errors"], [])
 
     def test_invalid_utf8_manifest_is_overwritten(self) -> None:
@@ -274,8 +475,8 @@ class CompleteTickReconcileTests(unittest.TestCase):
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["job_id"], job["job_id"])
-            self.assertEqual(manifest["gate_status"], "passed")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-invalid-utf8", "gate_status": "passed"}])
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-invalid-utf8", "gate_status": "needs_human"}])
             self.assertEqual(summary["errors"], [])
 
     def test_symlink_manifest_path_is_rejected_fail_closed(self) -> None:
@@ -311,37 +512,490 @@ class CompleteTickReconcileTests(unittest.TestCase):
             summary = manager.complete_tick(disp, handoff_dir=str(hdir / "handoff"), clock=lambda: "T0")
 
             manifest = json.loads((real_dir / "handoff" / "slice-hdir-link.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["gate_status"], "passed")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-hdir-link", "gate_status": "passed"}])
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-hdir-link", "gate_status": "needs_human"}])
             self.assertEqual(summary["errors"], [])
 
 
-class CompleteTickShadowGateTests(unittest.TestCase):
-    def test_shadow_gate_verdict_recorded_but_does_not_block(self) -> None:
+class CompleteTickVerificationTests(unittest.TestCase):
+    def test_verification_runner_exception_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
-            job = _make_job(reg, "slice-f")
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-f", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
             disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
-            hdir = Path(d) / "handoff"
-            fake_gate = lambda j: {"ok": False, "violations": [{"path": "x", "reason": "out"}],
-                                   "handoff_ok": False}
-            manager.complete_tick(disp, gate_runner=fake_gate, handoff_dir=str(hdir), clock=lambda: "T0")
-            manifest = json.loads((hdir / "slice-f.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["gate_status"], "passed")
-            self.assertEqual(manifest["gate_verdict"]["ok"], False)
+            hdir = root / "handoff"
 
-    def test_gate_runner_exception_swallowed(self) -> None:
+            def boom(**kwargs):
+                raise RuntimeError("verify 爆炸")
+
+            manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                verification_runner=boom,
+            )
+            manifest = json.loads((hdir / "slice-f.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "verification-runner-error")
+            self.assertFalse(manager.autonomy.default_is_satisfied("slice-f", handoff_dir=str(hdir)))
+
+    def test_invalid_runner_candidate_payload_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
-            job = _make_job(reg, "slice-g")
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-runner-bad-candidate", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
             disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
-            hdir = Path(d) / "handoff"
-            def boom(j):
-                raise RuntimeError("gate 爆炸")
-            manager.complete_tick(disp, gate_runner=boom, handoff_dir=str(hdir), clock=lambda: "T0")
-            manifest = json.loads((hdir / "slice-g.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["gate_status"], "passed")
+            hdir = root / "handoff"
+            candidate = "b" * 40
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                git_runner=lambda args: {
+                    ("-C", str(root), "rev-parse", "feature/slice-runner-bad-candidate"): _git_ok(candidate),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                }[tuple(args)],
+                verification_runner=lambda **kwargs: {
+                    "path": str(root / "forged.json"),
+                    "hash": "0" * 64,
+                    "payload": {
+                        "schema_version": 1,
+                        "slice_id": "slice-runner-bad-candidate",
+                        "candidate": "not-a-sha",
+                        "status": "reviewing",
+                        "summary": "verification-succeeded",
+                        "details": {"ok": True},
+                    },
+                },
+            )
+
+            manifest = json.loads((hdir / "slice-runner-bad-candidate.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-runner-bad-candidate")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "verification-runner-error")
+            self.assertEqual(manifest["gate_verdict"]["status"], "needs_human")
+            self.assertEqual(manifest["gate_verdict"]["summary"], "verification-runner-error")
+            self.assertIsNotNone(manifest["verification_evidence_path"])
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(slice_row["gate_state"], "needs_human")
+            self.assertEqual(
+                summary["completed"],
+                [{"slice_id": "slice-runner-bad-candidate", "gate_status": "needs_human"}],
+            )
+
+    def test_tampered_runner_evidence_path_and_hash_mark_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-runner-bad-evidence", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+
+            def verification_runner(**kwargs):
+                evidence = manager.verification.write_verification_evidence(
+                    {
+                        "schema_version": 1,
+                        "slice_id": "slice-runner-bad-evidence",
+                        "candidate": candidate,
+                        "status": "reviewing",
+                        "summary": "verification-succeeded",
+                        "details": {"ok": True},
+                    },
+                    coordinator_root=root,
+                )
+                return {
+                    **evidence,
+                    "path": str(root / "forged.json"),
+                    "hash": "f" * 64,
+                }
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                git_runner=lambda args: {
+                    ("-C", str(root), "rev-parse", "feature/slice-runner-bad-evidence"): _git_ok(candidate),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                }[tuple(args)],
+                verification_runner=verification_runner,
+            )
+
+            manifest = json.loads((hdir / "slice-runner-bad-evidence.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-runner-bad-evidence")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "verification-runner-error")
             self.assertIsNone(manifest["gate_verdict"])
+            self.assertIsNone(manifest["verification_evidence_path"])
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(slice_row["gate_state"], "needs_human")
+            self.assertEqual(
+                summary["completed"],
+                [{"slice_id": "slice-runner-bad-evidence", "gate_status": "needs_human"}],
+            )
+
+    def test_successful_code_verification_moves_slice_to_reviewing_without_releasing(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-g", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+            dispatch_base = "a" * 40
+            persona_catalog = _persona_catalog(builder_paths=["**"])
+
+            class _GitRunner:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def __call__(self, args: list[str]):
+                    mapping = {
+                        ("-C", str(root), "rev-parse", "feature/slice-g"): _git_ok(candidate),
+                        ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                        ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                        ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
+                        ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
+                        ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
+                        ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + "..." + candidate): _git_ok(""),
+                        ("-C", str(root), "worktree", "add", "--detach", str(root / ".psc-verification-worktrees" / "slice-g-aaaaaaaaaaaa"), dispatch_base): _git_ok(""),
+                        ("-C", str(root), "worktree", "remove", "--force", str(root / ".psc-verification-worktrees" / "slice-g-aaaaaaaaaaaa")): _git_ok(""),
+                    }
+                    return mapping[tuple(args)]
+
+            def proc_runner(argv, *, shell, cwd, timeout, env, capture_output, text):
+                self.assertFalse(shell)
+                self.assertEqual(set(env) - {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV"}, set())
+                if tuple(argv) == ("python3", "-m", "pytest", "-q", "tests/policy.py"):
+                    return _proc_ok()
+                return _proc_ok()
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                metas=[
+                    {"slice_id": "slice-g", "dispatch": "auto", "plan": "p-g.md", "depends_on": []},
+                    {"slice_id": "downstream", "dispatch": "auto", "plan": "p-down.md", "depends_on": ["slice-g"]},
+                ],
+                clock=lambda: "T0",
+                git_runner=_GitRunner(),
+                subprocess_runner=proc_runner,
+            )
+
+            manifest = json.loads((hdir / "slice-g.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-g")
+            self.assertEqual(manifest["gate_status"], "reviewing")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-g", "gate_status": "reviewing"}])
+            self.assertEqual(slice_row["state"], "reviewing")
+            self.assertEqual(slice_row["gate_state"], "pending")
+            self.assertFalse(manager.autonomy.default_is_satisfied("slice-g", handoff_dir=str(hdir)))
+            self.assertEqual(summary["released"], [])
+
+    def test_successful_informational_verification_releases_downstream(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-info", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="informational")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+            dispatch_base = "a" * 40
+            persona_catalog = _persona_catalog(builder_paths=["**"])
+            branch_heads = [_git_ok(candidate), _git_ok(candidate)]
+            worktree_heads = [_git_ok(candidate), _git_ok(candidate)]
+            worktree_statuses = [_git_ok(""), _git_ok("")]
+
+            def git_runner(args: list[str]):
+                key = tuple(args)
+                if key == ("-C", str(root), "rev-parse", "feature/slice-info"):
+                    return branch_heads.pop(0)
+                if key == ("-C", str(worktree), "rev-parse", "HEAD"):
+                    return worktree_heads.pop(0)
+                if key == ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"):
+                    return worktree_statuses.pop(0)
+                return {
+                    ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
+                    ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + "..." + candidate): _git_ok(""),
+                    ("-C", str(root), "worktree", "add", "--detach", str(root / ".psc-verification-worktrees" / "slice-info-aaaaaaaaaaaa"), dispatch_base): _git_ok(""),
+                    ("-C", str(root), "worktree", "remove", "--force", str(root / ".psc-verification-worktrees" / "slice-info-aaaaaaaaaaaa")): _git_ok(""),
+                }[key]
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                metas=[
+                    {"slice_id": "slice-info", "dispatch": "auto", "plan": "p-info.md", "depends_on": []},
+                    {"slice_id": "downstream", "dispatch": "auto", "plan": "p-down.md", "depends_on": ["slice-info"]},
+                ],
+                clock=lambda: "T0",
+                git_runner=git_runner,
+                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+            )
+
+            manifest = json.loads((hdir / "slice-info.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-info")
+            self.assertEqual(manifest["gate_status"], "verified")
+            self.assertEqual(slice_row["state"], "verified")
+            self.assertEqual(slice_row["gate_state"], "passed")
+            self.assertTrue(manager.autonomy.default_is_satisfied("slice-info", handoff_dir=str(hdir)))
+            self.assertEqual(summary["released"], ["downstream"])
+
+    def test_candidate_equal_to_dispatch_base_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            candidate = "a" * 40
+            job = _make_job(reg, "slice-h", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code", dispatch_base=candidate)
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                git_runner=lambda args: {
+                    ("-C", str(root), "rev-parse", "feature/slice-h"): _git_ok(candidate),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                    ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                }[tuple(args)],
+                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+            )
+
+            manifest = json.loads((hdir / "slice-h.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-h")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "candidate-not-advanced")
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-h", "gate_status": "needs_human"}])
+
+    def test_force_pushed_non_descendant_candidate_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            dispatch_base = "a" * 40
+            candidate = "b" * 40
+            job = _make_job(reg, "slice-i", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code", dispatch_base=dispatch_base)
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                git_runner=lambda args: {
+                    ("-C", str(root), "rev-parse", "feature/slice-i"): _git_ok(candidate),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                    ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                    ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): SimpleNamespace(returncode=1, stdout="", stderr=""),
+                }[tuple(args)],
+                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+            )
+
+            manifest = json.loads((hdir / "slice-i.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-i")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "candidate-not-descendant")
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-i", "gate_status": "needs_human"}])
+
+    def test_branch_ref_divergence_after_snapshot_marks_needs_human(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            dispatch_base = "a" * 40
+            candidate = "b" * 40
+            moved = "c" * 40
+            job = _make_job(reg, "slice-j", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="informational", dispatch_base=dispatch_base)
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            persona_catalog = _persona_catalog(builder_paths=["**"])
+            branch_responses = [_git_ok(candidate), _git_ok(moved)]
+
+            def git_runner(args: list[str]):
+                key = tuple(args)
+                if key == ("-C", str(root), "rev-parse", "feature/slice-j"):
+                    return branch_responses.pop(0)
+                return {
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                    ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                    ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
+                    ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + "..." + candidate): _git_ok(""),
+                    ("-C", str(root), "worktree", "add", "--detach", str(root / ".psc-verification-worktrees" / "slice-j-aaaaaaaaaaaa"), dispatch_base): _git_ok(""),
+                    ("-C", str(root), "worktree", "remove", "--force", str(root / ".psc-verification-worktrees" / "slice-j-aaaaaaaaaaaa")): _git_ok(""),
+                }[key]
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                git_runner=git_runner,
+                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+            )
+
+            manifest = json.loads((hdir / "slice-j.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-j")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "candidate-ref-diverged")
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-j", "gate_status": "needs_human"}])
+
+    def test_manifest_hides_evidence_when_slice_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-k", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
+            original_record_action = reg.record_action
+
+            def failing_record_action(*args, **kwargs):
+                raise RuntimeError("persist failed")
+
+            reg.record_action = failing_record_action  # type: ignore[assignment]
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+            dispatch_base = "a" * 40
+            persona_catalog = _persona_catalog(builder_paths=["**"])
+
+            def git_runner(args: list[str]):
+                return {
+                    ("-C", str(root), "rev-parse", "feature/slice-k"): _git_ok(candidate),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                    ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                    ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
+                    ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + "..." + candidate): _git_ok(""),
+                    ("-C", str(root), "worktree", "add", "--detach", str(root / ".psc-verification-worktrees" / "slice-k-aaaaaaaaaaaa"), dispatch_base): _git_ok(""),
+                    ("-C", str(root), "worktree", "remove", "--force", str(root / ".psc-verification-worktrees" / "slice-k-aaaaaaaaaaaa")): _git_ok(""),
+                }[tuple(args)]
+
+            try:
+                summary = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T0",
+                    git_runner=git_runner,
+                    subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+                )
+            finally:
+                reg.record_action = original_record_action  # type: ignore[assignment]
+
+            manifest = json.loads((hdir / "slice-k.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_reason"], "verification-state-update-error")
+            self.assertIsNone(manifest["gate_verdict"])
+            self.assertIsNone(manifest["verification_evidence_path"])
+            self.assertIsNone(manifest["verification_evidence_hash"])
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-k", "gate_status": "needs_human"}])
+            self.assertEqual(reg.get_slice("slice-k")["state"], "building")
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T1",
+                git_runner=git_runner,
+                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+            )
+
+            manifest = json.loads((hdir / "slice-k.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-k")
+            self.assertEqual(manifest["gate_status"], "reviewing")
+            self.assertIsNotNone(manifest["verification_evidence_path"])
+            self.assertEqual(slice_row["state"], "reviewing")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-k", "gate_status": "reviewing"}])
+
+    def test_retryable_runner_error_does_not_poison_later_success(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-l", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
+            original_record_action = reg.record_action
+            candidate = "b" * 40
+
+            def git_runner(args: list[str]):
+                return {
+                    ("-C", str(root), "rev-parse", "feature/slice-l"): _git_ok(candidate),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                }[tuple(args)]
+
+            def failing_record_action(*args, **kwargs):
+                raise RuntimeError("persist failed")
+
+            reg.record_action = failing_record_action  # type: ignore[assignment]
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+
+            try:
+                manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T0",
+                    git_runner=git_runner,
+                    verification_runner=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+                )
+            finally:
+                reg.record_action = original_record_action  # type: ignore[assignment]
+
+            def success_runner(**kwargs):
+                return manager.verification.write_verification_evidence(
+                    {
+                        "schema_version": 1,
+                        "slice_id": "slice-l",
+                        "candidate": candidate,
+                        "status": "reviewing",
+                        "summary": "verification-succeeded",
+                        "details": {"ok": True},
+                    },
+                    coordinator_root=root,
+                )
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T1",
+                git_runner=git_runner,
+                verification_runner=success_runner,
+            )
+
+            manifest = json.loads((hdir / "slice-l.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "reviewing")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-l", "gate_status": "reviewing"}])
 
     def test_pinned_spec_hash_mismatch_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -518,10 +1172,10 @@ class CompleteTickErrorAndReleaseTests(unittest.TestCase):
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
             self.assertTrue((hdir / "slice-i.json").exists())
             self.assertFalse((hdir / "slice-h.json").exists())
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-i", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-i", "gate_status": "needs_human"}])
             self.assertEqual([e["job_id"] for e in summary["errors"]], [a["job_id"]])
 
-    def test_downstream_released_after_manifest(self) -> None:
+    def test_downstream_not_released_by_exited_job_alone(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             up = _make_job(reg, "up")
@@ -532,11 +1186,11 @@ class CompleteTickErrorAndReleaseTests(unittest.TestCase):
                 {"slice_id": "down", "dispatch": "auto", "plan": "p-down.md", "depends_on": ["up"]},
             ]
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), metas=metas, clock=lambda: "T0")
-            self.assertIn("down", summary["released"])
+            self.assertEqual(summary["released"], [])
             from paulsha_cortex.coordinator import autonomy
-            self.assertTrue(autonomy.default_is_satisfied("up", handoff_dir=str(hdir)))
+            self.assertFalse(autonomy.default_is_satisfied("up", handoff_dir=str(hdir)))
 
-    def test_invalid_utf8_manifest_repair_still_reports_released(self) -> None:
+    def test_invalid_utf8_manifest_repair_still_keeps_downstream_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             up = _make_job(reg, "up")
@@ -551,8 +1205,8 @@ class CompleteTickErrorAndReleaseTests(unittest.TestCase):
 
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), metas=metas, clock=lambda: "T0")
 
-            self.assertEqual(summary["completed"], [{"slice_id": "up", "gate_status": "passed"}])
-            self.assertIn("down", summary["released"])
+            self.assertEqual(summary["completed"], [{"slice_id": "up", "gate_status": "needs_human"}])
+            self.assertEqual(summary["released"], [])
             self.assertEqual(summary["errors"], [])
 
 
@@ -583,7 +1237,7 @@ class CompleteTickGuardTests(unittest.TestCase):
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), metas=cyclic, clock=lambda: "T0")
             # 完成側仍寫出 manifest；released 因環被停用而省略
             self.assertTrue((hdir / "a.json").exists())
-            self.assertEqual(summary["completed"], [{"slice_id": "a", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "a", "gate_status": "needs_human"}])
             self.assertNotIn("released", summary)
 
     def test_unsafe_slice_id_rejected_no_escape_write(self) -> None:
@@ -615,7 +1269,7 @@ class RunTickTests(unittest.TestCase):
             # fanout 被 idle gate 擋，但完成側仍跑（review F-C）
             self.assertEqual(summary["dispatch_skipped"], "not-idle")
             self.assertEqual(summary["dispatched"], [])
-            self.assertEqual(summary["completed"], [{"slice_id": "x", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "x", "gate_status": "needs_human"}])
             self.assertTrue((hdir / "x.json").exists())
 
     def test_runs_fanout_and_complete_when_idle(self) -> None:
@@ -629,7 +1283,7 @@ class RunTickTests(unittest.TestCase):
                 idle_probe=lambda: (0.0, 0.0, 0.0), handoff_dir=str(hdir), clock=lambda: "T0",
             )
             self.assertFalse(summary["dispatch_skipped"])
-            self.assertEqual(summary["completed"], [{"slice_id": "y", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "y", "gate_status": "needs_human"}])
             self.assertTrue((hdir / "y.json").exists())
 
     def test_fanout_failure_does_not_block_complete(self) -> None:
@@ -645,7 +1299,7 @@ class RunTickTests(unittest.TestCase):
             )
             self.assertFalse(summary["dispatch_skipped"])
             self.assertTrue(any(e.get("stage") == "fanout" for e in summary["errors"]))
-            self.assertEqual(summary["completed"], [{"slice_id": "done-slice", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "done-slice", "gate_status": "needs_human"}])
 
     def test_invalid_utf8_dependency_manifest_does_not_create_fanout_error(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -706,7 +1360,7 @@ class RunTickTests(unittest.TestCase):
             )
             self.assertEqual(calls, [1])
             self.assertEqual(summary["reaped"], {"ran": True, "applied": True, "returncode": 0})
-            self.assertEqual(summary["completed"], [{"slice_id": "z", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "z", "gate_status": "needs_human"}])
 
     def test_reaper_exception_does_not_break_tick(self) -> None:
         # janitor 失敗一律不破壞 tick：reaped=None、errors 收 stage=reap、完成側照常
@@ -723,7 +1377,7 @@ class RunTickTests(unittest.TestCase):
             )
             self.assertIsNone(summary["reaped"])
             self.assertTrue(any(e.get("stage") == "reap" for e in summary["errors"]))
-            self.assertEqual(summary["completed"], [{"slice_id": "w", "gate_status": "passed"}])
+            self.assertEqual(summary["completed"], [{"slice_id": "w", "gate_status": "needs_human"}])
 
     def test_no_reaper_disables_janitor(self) -> None:
         # 預設不傳 reaper → reaped=None，且不產生 reap 相關 error（單測不誤觸真實回收）
@@ -761,8 +1415,7 @@ class _RecordingLauncher:
 
 
 class DispatchHeadBaselineTests(unittest.TestCase):
-    """#131：headless 派工側須持久化 dispatch_head，否則 complete_tick 的
-    預設 shadow gate 對真實 headless job 恒回 null（對要完成的 job 形同失明）。"""
+    """dispatch baseline 應持久化，且 builder exited 不能直接成為 DAG satisfaction。"""
 
     def test_dispatch_ready_persists_dispatch_head(self) -> None:
         # 注入 git_runner 回固定 baseline → 應寫進 job 與 registry（修前為 None）
@@ -796,54 +1449,23 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             self.assertEqual(len(jobs), 1)
             self.assertIsNone(jobs[0]["dispatch_head"])
 
-    def test_default_gate_verdict_non_null_after_dispatch_through_pipeline(self) -> None:
-        # 整合：dispatch_ready 記 baseline → branch 出現新 commit → complete_tick
-        # 走「預設」gate runner → 有 git diff 時 verdict 非 null（#131 核心斷言）。
+    def test_dispatch_pipeline_keeps_exited_job_out_of_completion_path(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            repo = Path(d) / "repo"
-            repo.mkdir()
-
-            def git(*args: str) -> str:
-                return subprocess.run(
-                    ["git", "-C", str(repo), *args],
-                    capture_output=True, text=True, check=True,
-                ).stdout.strip()
-
-            git("init", "-q")
-            git("config", "user.email", "t@example.com")
-            git("config", "user.name", "tester")
-            (repo / "seed.txt").write_text("0\n", encoding="utf-8")
-            git("add", "-A")
-            git("commit", "-qm", "C0")
-            git("branch", "feature/slice-x")  # baseline 落在 C0
-
-            reg = JobRegistry(state_path=repo / "jobs.json")
+            root = Path(d)
+            reg = JobRegistry(state_path=root / "jobs.json")
             disp = _HeadlessDispatcher(reg)
             launcher = _RecordingLauncher()
             metas = [_dispatch_meta("slice-x")]
             jobs = dispatch_ready(
                 metas, is_satisfied=lambda _id: True, dispatcher=disp,
-                launcher=launcher, git_runner=lambda args: git(*args),
+                launcher=launcher, git_runner=lambda args: "BASE_SHA",
             )
             self.assertTrue(jobs[0]["dispatch_head"], "baseline 應非 null")
-
-            # 模擬 agent 在 branch 上完成工作（新增 commit C1）
-            git("checkout", "-q", "feature/slice-x")
-            (repo / "seed.txt").write_text("1\n", encoding="utf-8")
-            git("add", "-A")
-            git("commit", "-qm", "C1")
-
-            hdir = repo / "handoff"
-            cwd = os.getcwd()
-            os.chdir(repo)  # 預設 gate runner 的 git diff 無 -C，需在 repo 內跑
-            try:
-                manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
-            finally:
-                os.chdir(cwd)
-
+            hdir = root / "handoff"
+            manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
             manifest = json.loads((hdir / "slice-x.json").read_text(encoding="utf-8"))
-            self.assertIsNotNone(manifest["gate_verdict"], "#131：預設 gate 不應再恒 null")
-            self.assertIn("seed.txt", manifest["gate_verdict"]["changed_paths"])
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertFalse(manager.autonomy.default_is_satisfied("slice-x", handoff_dir=str(hdir)))
 
 
 if __name__ == "__main__":

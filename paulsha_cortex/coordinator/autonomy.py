@@ -356,7 +356,7 @@ def default_is_satisfied(slice_id: str, handoff_dir: str = DEFAULT_HANDOFF_DIR) 
         payload = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return False
-    return isinstance(payload, dict) and payload.get("gate_status") == "passed"
+    return isinstance(payload, dict) and payload.get("gate_status") in {"passed", "verified"}
 
 
 # --------------------------------------------------------------------------- #
