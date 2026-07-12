@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from . import autonomy, broker_reaper, manager
@@ -74,6 +75,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="設定後據 dependency graph 觀測算出本趟釋放的下游（released）",
     )
 
+    p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
+    p_reap.add_argument("--apply", action="store_true")
+    p_reap.add_argument("--cwd-root")
+
     p_tick = sub.add_parser(
         "tick",
         help="完整 manager tick：fanout→complete（idle-gated）",
@@ -86,10 +91,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tick.add_argument("--max-load", type=float, default=1.0)
     p_tick.add_argument("--allow-unsafe", action="store_true")
     p_tick.add_argument("--model", default=None)
-    p_tick.add_argument(
-        "--no-reap", dest="reap", action="store_false", default=True,
-        help="關閉收尾孤兒 codex broker 回收（預設開；issue #161）",
-    )
 
     return parser
 
@@ -141,6 +142,17 @@ def main(
         print(json.dumps(summary, ensure_ascii=False))
         return 0
 
+    if args.cmd == "reap-brokers":
+        if args.apply and not args.cwd_root:
+            print("錯誤: --apply 需要搭配 --cwd-root", file=sys.stderr)
+            return 2
+        cwd_root = Path(args.cwd_root).resolve() if args.cwd_root else None
+        summary = broker_reaper.reap_orphan_brokers(apply=args.apply, cwd_root=cwd_root)
+        print(json.dumps(summary, ensure_ascii=False))
+        if not summary.get("ran"):
+            return 1
+        return 0 if summary.get("returncode", 0) == 0 else 1
+
     if args.cmd == "tick":
         disp = Dispatcher(reg, sender, creator)
         metas = autonomy.scan_specs(args.specs_dir)
@@ -157,18 +169,10 @@ def main(
         active_launcher = _resolve_launcher(
             args.executor, launcher, allow_unsafe=args.allow_unsafe, model=args.model
         )
-        # 收尾 janitor（issue #161）：預設開（--no-reap 關）。注入優先（測試），否則接固化腳本。
-        if args.reap:
-            active_reaper = reaper if reaper is not None else (
-                lambda: broker_reaper.reap_orphan_brokers(apply=True)
-            )
-        else:
-            active_reaper = None
         summary = manager.run_tick(
             disp, metas=metas, launcher=active_launcher, persona=args.persona,
             is_satisfied=predicate, handoff_dir=args.handoff_dir,
             require_idle=args.require_idle, max_load=args.max_load,
-            reaper=active_reaper,
         )
         print(json.dumps(summary, ensure_ascii=False))
         return 0

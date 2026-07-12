@@ -2,9 +2,9 @@
 
 ## 1. Scoped broker cleanup
 
-- [ ] 1.1 RED-test that periodic CLI/daemon ticks never call the reaper and manual cleanup defaults to dry-run.
-- [ ] 1.2 Implement `cortex reap-brokers`, require `--cwd-root` for apply, recheck live process identity and send SIGTERM only.
-- [ ] 1.3 Pass Python wiring and fake `/proc` negative fixtures, including cross-project and PID-reuse cases.
+- [x] 1.1 RED-test that periodic CLI/daemon ticks never call the reaper and manual cleanup defaults to dry-run.
+- [x] 1.2 Implement `cortex reap-brokers`, require `--cwd-root` for apply, recheck live process identity and send SIGTERM only.
+- [x] 1.3 Pass Python wiring and fake `/proc` negative fixtures, including cross-project and PID-reuse cases.
 
 ## 2. Versioned coordinator state
 

@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
-from . import autonomy, broker_reaper, manager
+from . import autonomy, manager
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
 from .registry import JobRegistry
@@ -27,7 +27,6 @@ DEFAULT_EXECUTOR = "copilot"
 DEFAULT_MAX_LOAD = 1.0
 RECENT_DONE_LIMIT = 10
 MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
-USE_DEFAULT_REAPER = object()
 
 
 @dataclass
@@ -121,10 +120,6 @@ def default_tick_interval() -> float:
         return float(override)
     except ValueError:
         return DEFAULT_TICK_INTERVAL
-
-
-def default_reaper() -> Callable[[], dict[str, Any]]:
-    return lambda: broker_reaper.reap_orphan_brokers(apply=True)
 
 
 def _in_flight_status(registry) -> list[dict[str, Any]]:
@@ -393,7 +388,7 @@ def run_loop(
     launcher=None,
     require_idle: bool = True,
     default_executor: str | None = None,
-    reaper: Callable[[], dict[str, Any]] | None | object = USE_DEFAULT_REAPER,
+    reaper: Callable[[], dict[str, Any]] | None = None,
 ) -> bool:
     runtime_pid = os.getpid() if pid is None else pid
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
@@ -406,7 +401,6 @@ def run_loop(
         disp = Dispatcher(reg, TmuxPaneSender(), ScriptWorktreeCreator())
     resolved_specs_dir = specs_dir or default_specs_dir()
     resolved_default_executor = default_executor or DEFAULT_EXECUTOR
-    resolved_reaper = default_reaper() if reaper is USE_DEFAULT_REAPER else reaper
 
     executor = request_executor or build_request_executor(
         dispatcher=disp,
@@ -414,7 +408,7 @@ def run_loop(
         handoff_dir=handoff_dir,
         launcher=launcher,
         default_executor=resolved_default_executor,
-        reaper=resolved_reaper,
+        reaper=reaper,
     )
     provider = status_provider or build_runtime_status_provider(
         registry=reg,
@@ -428,7 +422,7 @@ def run_loop(
         launcher=launcher,
         require_idle=require_idle,
         default_executor=resolved_default_executor,
-        reaper=resolved_reaper,
+        reaper=reaper,
     )
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
@@ -611,16 +605,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--handoff-dir", default=autonomy.DEFAULT_HANDOFF_DIR)
     parser.add_argument("--max-rounds", type=int)
     parser.add_argument("--no-require-idle", action="store_true")
-    parser.add_argument(
-        "--no-reap",
-        dest="reap",
-        action="store_false",
-        default=True,
-        help="關閉收尾孤兒 codex broker 回收（預設開；issue #161）",
-    )
     args = parser.parse_args(argv)
     _install_signal_handlers()
-    active_reaper = default_reaper() if args.reap else None
 
     started = run_loop(
         poll_interval=args.poll_interval,
@@ -630,7 +616,6 @@ def main(argv: list[str] | None = None) -> int:
         max_rounds=args.max_rounds,
         require_idle=not args.no_require_idle,
         default_executor=args.executor,
-        reaper=active_reaper,
     )
     return 0 if started else 1
 

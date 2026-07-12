@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from paulsha_cortex.control import constants, contract
 from paulsha_cortex.coordinator import manager_daemon
 
@@ -226,7 +228,6 @@ def test_built_executor_and_status_provider_use_injected_dispatcher_and_registry
     registry = FakeRegistry([{"job_id": "job-1", "task": "slice-b", "status": "running"}])
     dispatcher = FakeDispatcher(registry)
     launcher = object()
-    reaper = object()
     request = _write_request("20260703T090000Z-ffffffffffffffffffffffffffffffff")
     calls: list[dict] = []
 
@@ -268,7 +269,6 @@ def test_built_executor_and_status_provider_use_injected_dispatcher_and_registry
         specs_dir="docs/superpowers/specs",
         handoff_dir=str(tmp_path / "handoff"),
         launcher=launcher,
-        reaper=reaper,
         scan_specs_fn=lambda specs_dir: [{"slice_id": "slice-a", "dispatch": "auto", "plan": "p.md", "depends_on": []}],
         run_tick_fn=fake_run_tick,
     )
@@ -302,18 +302,17 @@ def test_built_executor_and_status_provider_use_injected_dispatcher_and_registry
     assert calls[0]["handoff_dir"] == str(tmp_path / "handoff")
     assert calls[0]["require_idle"] is False
     assert calls[0]["max_load"] == manager_daemon.DEFAULT_MAX_LOAD
-    assert calls[0]["reaper"] is reaper
+    assert calls[0]["reaper"] is None
     assert callable(calls[0]["predicate"])
     assert done["status"] == "ok"
     assert done["result"]["dispatched"] == ["slice-a"]
     assert status["in_flight"] == [{"job_id": "job-1", "slice_id": "slice-b", "state": "running"}]
 
 
-def test_periodic_tick_runner_uses_reaper_and_default_executor(monkeypatch, tmp_path):
+def test_periodic_tick_runner_does_not_wire_reaper_and_uses_default_executor(monkeypatch, tmp_path):
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
     dispatcher = FakeDispatcher(FakeRegistry())
     launcher = object()
-    reaper = object()
     calls: list[dict[str, object]] = []
 
     def fake_run_tick(
@@ -346,7 +345,6 @@ def test_periodic_tick_runner_uses_reaper_and_default_executor(monkeypatch, tmp_
         specs_dir=str(tmp_path / "specs"),
         handoff_dir=str(tmp_path / "handoff"),
         launcher=launcher,
-        reaper=reaper,
         run_tick_fn=fake_run_tick,
         scan_specs_fn=lambda specs_dir: [],
     )
@@ -360,7 +358,7 @@ def test_periodic_tick_runner_uses_reaper_and_default_executor(monkeypatch, tmp_
     assert calls[0]["handoff_dir"] == str(tmp_path / "handoff")
     assert calls[0]["require_idle"] is True
     assert calls[0]["max_load"] == manager_daemon.DEFAULT_MAX_LOAD
-    assert calls[0]["reaper"] is reaper
+    assert calls[0]["reaper"] is None
 
 
 def test_duplicate_req_id_is_idempotent(monkeypatch, tmp_path):
@@ -1212,14 +1210,14 @@ def test_run_loop_default_builders_receive_injected_dispatcher_and_registry(monk
     assert seen["request_dispatcher"] is dispatcher
     assert seen["request_specs_dir"] == str(home / ".agents" / "specs")
     assert seen["request_default_executor"] == manager_daemon.DEFAULT_EXECUTOR
-    assert callable(seen["request_reaper"])
+    assert seen["request_reaper"] is None
     assert seen["status_registry"] is registry
     assert seen["status_specs_dir"] == str(home / ".agents" / "specs")
     assert seen["periodic_dispatcher"] is dispatcher
     assert seen["periodic_specs_dir"] == str(home / ".agents" / "specs")
     assert seen["periodic_require_idle"] is True
     assert seen["periodic_default_executor"] == manager_daemon.DEFAULT_EXECUTOR
-    assert callable(seen["periodic_reaper"])
+    assert seen["periodic_reaper"] is None
     assert done["result"]["dispatched"] == [request["req_id"]]
 
 
@@ -1242,7 +1240,7 @@ def test_main_runs_loop_with_cli_defaults(monkeypatch):
     assert seen["max_rounds"] is None
     assert seen["require_idle"] is True
     assert seen["default_executor"] == manager_daemon.DEFAULT_EXECUTOR
-    assert callable(seen["reaper"])
+    assert "reaper" not in seen
 
 
 def test_main_honors_manager_env_defaults(monkeypatch):
@@ -1263,19 +1261,10 @@ def test_main_honors_manager_env_defaults(monkeypatch):
     assert seen["default_executor"] == "claude"
 
 
-def test_main_disables_reaper_with_no_reap(monkeypatch):
-    seen: dict[str, object] = {}
-
-    def fake_run_loop(**kwargs):
-        seen.update(kwargs)
-        return True
-
-    monkeypatch.setattr(manager_daemon, "run_loop", fake_run_loop)
-
-    exit_code = manager_daemon.main(["--no-reap"])
-
-    assert exit_code == 0
-    assert seen["reaper"] is None
+def test_main_rejects_removed_no_reap_flag():
+    with pytest.raises(SystemExit) as exc:
+        manager_daemon.main(["--no-reap"])
+    assert exc.value.code == 2
 
 
 def test_main_returns_one_when_lock_refuses_second_instance(monkeypatch):
