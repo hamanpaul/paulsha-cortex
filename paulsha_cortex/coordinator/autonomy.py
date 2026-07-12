@@ -100,7 +100,15 @@ def parse_spec_frontmatter(path) -> dict:
 
 
 def _normalize_frontmatter(path: Path, data: dict) -> dict:
-    allowed = {"dispatch", "slice_id", "plan", "depends_on", "target_branch", "verification"}
+    allowed = {
+        "dispatch",
+        "slice_id",
+        "plan",
+        "depends_on",
+        "target_branch",
+        "verification",
+        "parse_error",
+    }
     extras = set(data) - allowed
     if extras:
         extra = sorted(extras)[0]
@@ -149,6 +157,11 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
     elif dispatch == "auto":
         raise verification.ContractValidationError(
             "verification", "auto dispatch requires a verification contract"
+        )
+    if data.get("parse_error") is not None:
+        raise verification.ContractValidationError(
+            "parse_error",
+            "parse_error is runtime-owned and must be null when present",
         )
     return meta
 

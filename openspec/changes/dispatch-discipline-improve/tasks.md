@@ -46,10 +46,10 @@
 
 ## 8. Canary and documentation
 
-- [ ] 8.1 Pass a disposable end-to-end temporary repo/remote/fake-agent canary covering false completion, foreign review, stale verdict, merge ancestry, crash recovery and reaper negatives.
-- [ ] 8.2 Update README and `CHANGELOG.md [Unreleased]` with state semantics, contracts, limits, operator actions and best-effort cleanup warning.
+- [x] 8.1 Pass a disposable end-to-end temporary repo/remote/fake-agent canary covering false completion, foreign review, stale verdict, merge ancestry, crash recovery and reaper negatives.
+- [x] 8.2 Update README and `CHANGELOG.md [Unreleased]` with state semantics, contracts, limits, operator actions and best-effort cleanup warning.
 
 ## 9. Completion gates
 
 - [ ] 9.1 Pass the full pytest suite, `python3 -m policy_check --repo .` and `git diff --check`.
-- [ ] 9.2 Complete independent code review, re-review every fix and resolve all Critical/Important adversarial findings.
+- [x] 9.2 Complete independent code review, re-review every fix and resolve all Critical/Important adversarial findings.

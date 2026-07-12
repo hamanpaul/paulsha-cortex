@@ -70,6 +70,94 @@ python -m pip install .
 
 > 目前尚無獨立的 `cortex status` 服務查詢子命令；service 狀態以 `systemctl --user status` 為準。
 
+## Coordinator dispatch discipline（v1）
+
+### Job / Slice / Gate 狀態語意
+
+| 層級 | 狀態 | 語意 |
+| --- | --- | --- |
+| Job | `dispatched` / `running` / `exited` / `failed` | process 執行結果；`exited` **不等於**交付完成 |
+| Slice | `pending` / `building` / `reviewing` / `verified` / `completed` / `needs_human` / `failed` | 交付生命週期與 release gate |
+| Gate | `pending` / `passed` / `needs_human` / `failed` | verification + foreign review 的決策狀態 |
+
+依賴釋放只接受 `slice_state=completed` 且 CompletionRecord / hash / target ancestry 全部一致；單純 Job `exited` 永遠不能滿足 DAG。
+
+### Verification frontmatter 與 trust boundary（shareable-only）
+
+```yaml
+---
+dispatch: auto
+slice_id: auth-hardening
+plan: docs/superpowers/plans/auth-hardening.md
+target_branch: main
+verification:
+  docs_class: code
+  required_artifacts:
+    - path: reports/policy.json
+      must_change: true
+  checks:
+    - kind: persona-scope
+    - kind: command
+      name: policy
+      argv: [python3, -m, pytest, -q, tests/policy.py]
+      cwd: .
+      timeout_seconds: 30
+  tests: []
+  full_suite:
+    argv: [python3, -m, pytest, -q]
+    cwd: .
+    timeout_seconds: 60
+    baseline: no-regression
+---
+```
+
+- v1 只支援 `tier: shareable`；非 shareable 會 fail-closed 到 `needs_human`。
+- verification command 只接受 typed argv（`shell=False`）；採 sanitized env，但這不是 sandbox，不保證隔離 untrusted code。
+
+### Foreign reviewer identity（不同 independence domain）
+
+`PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
+
+```yaml
+schema_version: 1
+identities:
+  - executor: copilot
+    model_id: claude-haiku-4.5
+    independence_domain: anthropic
+  - executor: codex
+    model_id: gpt-5.4
+    independence_domain: openai
+```
+
+- builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析。
+- 同 domain、未知 identity、缺 model 都會得到 `foreign-review-absent`（fail-closed）。
+
+### Merge 限制與 completion/restart
+
+- v1 只支援 preserving-commit 路徑：Candidate 必須是 `refs/remotes/<remote>/<target_branch>` 的 ancestor；squash/cherry-pick 視為不支援（保持 blocked 或 needs_human）。
+- 同一 dependency chain 必須使用同一 target branch，否則 fail-closed。
+- completion ordering 固定為「先 atomic 寫 CompletionRecord，再 atomic 標 Slice `completed`」。
+- crash window（record 已寫、slice 尚未 completed）在 restart 後只會補完符合當前 target ancestry 的紀錄；不符合則維持 blocked。
+- 舊版無 `schema_version` / legacy `done` state 需先 clean-start（archive/remove 舊 `jobs.json`），不做 silent migration。
+
+### Operator actions 與 status / attention
+
+```bash
+cortex slice-action <slice-id> retry-build  --actor <text>
+cortex slice-action <slice-id> retry-verify --actor <text>
+cortex slice-action <slice-id> retry-review --actor <text>
+cortex slice-action <slice-id> abandon      --actor <text>
+```
+
+- `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
+- status snapshot 會一次列出所有 `needs_human` 事項（`attention`），包含 reason、evidence refs、ancestry 摘要與 `next_actions`，不需逐筆互動追問。
+
+### Broker cleanup（best-effort）
+
+- `cortex reap-brokers` 預設 dry-run。
+- `--apply` 必須搭配 `--cwd-root <realpath>`，只允許 scoped project 下的 broker 候選。
+- signal 前會重驗 `ppid/start-time/cmdline/cwd`；僅送 `SIGTERM`，不做 escalation。PID reuse / race 只提供 best-effort 安全保護。
+
 ## Monitor registry merge
 
 - manual config：`~/.agents/config/paulsha/project-cortex.yaml`
