@@ -83,6 +83,23 @@ def test_submit_request_supports_complete(monkeypatch, tmp_path):
     assert payload["args"]["handoff_dir"] == "runtime/handoff"
 
 
+def test_submit_request_supports_slice_action(monkeypatch, tmp_path):
+    from paulsha_cortex.control import client
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = client.submit_request(
+        "slice-action",
+        {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"},
+        "cockpit",
+    )
+
+    payload = contract.read_json(constants.requests_dir() / f"{req_id}.json")
+
+    assert payload is not None
+    assert payload["type"] == "slice-action"
+    assert payload["args"] == {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"}
+
+
 def test_read_status_degrades_on_missing_or_stale_file(monkeypatch, tmp_path):
     from paulsha_cortex.control import client
 

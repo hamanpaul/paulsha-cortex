@@ -1345,6 +1345,53 @@ def test_complete_request_forwards_review_identity(monkeypatch, tmp_path):
     assert captured["review_model"] == "gpt-5.4"
 
 
+def test_slice_action_request_runs_manager_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090012Z-99999999999999999999999999999999"
+    _write_request(
+        req_id,
+        type="slice-action",
+        args={"slice_id": "slice-a", "action": "retry-build", "actor": "operator"},
+    )
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    captured: dict[str, object] = {}
+
+    def fake_apply(dispatcher_arg, **kwargs):
+        captured["dispatcher"] = dispatcher_arg
+        captured.update(kwargs)
+        return {"slice_id": kwargs["slice_id"], "action": kwargs["action"], "result": "ok"}
+
+    monkeypatch.setattr(manager_daemon.manager, "apply_slice_action", fake_apply)
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+    )
+
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    done = contract.read_json(constants.done_dir() / f"{req_id}.json")
+    assert done["status"] == "ok"
+    assert done["result"] == {"slice_id": "slice-a", "action": "retry-build", "result": "ok"}
+    assert captured["dispatcher"] is dispatcher
+    assert captured["slice_id"] == "slice-a"
+    assert captured["action"] == "retry-build"
+    assert captured["actor"] == "operator"
+
+
 def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path):
     dispatcher = FakeDispatcher(FakeRegistry())
     launcher = object()
@@ -1900,10 +1947,11 @@ def test_run_loop_default_builders_receive_injected_dispatcher_and_registry(monk
         seen["request_reaper"] = reaper
         return lambda req: {"dispatched": [req["req_id"]], "completed": [], "errors": [], "reaped": None}
 
-    def fake_build_runtime_status_provider(*, registry, specs_dir, handoff_dir):
+    def fake_build_runtime_status_provider(*, registry, specs_dir, handoff_dir, git_runner=None):
         seen["status_registry"] = registry
         seen["status_specs_dir"] = specs_dir
         seen["status_handoff_dir"] = handoff_dir
+        seen["status_git_runner"] = git_runner
         return lambda: {"ready": [], "in_flight": [], "recent_done": []}
 
     def fake_build_periodic_tick_runner(*, dispatcher, specs_dir, handoff_dir, launcher, require_idle, default_executor, reaper):

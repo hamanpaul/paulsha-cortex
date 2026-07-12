@@ -17,6 +17,7 @@ from . import verification
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
+SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "abandon"})
 
 
 def _utcnow() -> str:
@@ -331,6 +332,166 @@ def _current_review_ref(slice_row: dict | None) -> tuple[str | None, str | None,
     if not isinstance(payload, dict):
         return path, None, None
     return path, verification.canonical_json_hash(payload), payload
+
+
+def _review_policy_for_slice(slice_row: dict) -> str:
+    contract = slice_row.get("verification", {}).get("contract")
+    if isinstance(contract, dict):
+        policy = contract.get("review_policy")
+        if policy in {"required", "not-required"}:
+            return str(policy)
+        docs_class = contract.get("docs_class")
+        if docs_class in {"informational", "trivial"}:
+            return "not-required"
+    return "required"
+
+
+def _current_verification_payload(slice_row: dict | None) -> dict | None:
+    if not isinstance(slice_row, dict):
+        return None
+    refs = slice_row.get("current_evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return None
+    path = refs[0]
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        normalized = verification.validate_verification_evidence(payload)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return {
+        "path": path,
+        "hash": verification.canonical_json_hash(normalized),
+        "payload": normalized,
+    }
+
+
+def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
+    if not isinstance(slice_row, dict):
+        return []
+    if slice_row.get("state") != "needs_human":
+        return []
+    actions = ["retry-build", "abandon"]
+    candidate = slice_row.get("candidate")
+    if not (
+        isinstance(candidate, str)
+        and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+    ):
+        return actions
+    builder_job_id = slice_row.get("builder_job_id")
+    if not isinstance(builder_job_id, str):
+        return actions
+    try:
+        builder_job = registry.get_job(builder_job_id)
+    except Exception:
+        return actions
+    if builder_job.get("status") != "exited":
+        return actions
+    evidence = _current_verification_payload(slice_row)
+    if evidence is None:
+        return actions
+    if evidence["payload"].get("candidate", "").lower() != candidate.lower():
+        return actions
+    actions.append("retry-verify")
+    if (
+        _review_policy_for_slice(slice_row) == "required"
+        and evidence["payload"].get("status") in {"reviewing", "verified"}
+    ):
+        actions.append("retry-review")
+    return actions
+
+
+def _resolve_ancestry_status(slice_row: dict, *, git_runner) -> dict[str, Any]:
+    target_remote = str(slice_row.get("target_remote") or "origin")
+    target_branch = str(slice_row.get("target_branch") or "main")
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    summary: dict[str, Any] = {
+        "target_ref": target_ref,
+        "target_head": None,
+        "status": "unknown",
+    }
+    candidate = slice_row.get("candidate")
+    if not (
+        isinstance(candidate, str)
+        and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+    ):
+        summary["status"] = "candidate-missing"
+        return summary
+    spec_path = slice_row.get("spec", {}).get("path")
+    if not isinstance(spec_path, str) or not spec_path:
+        summary["status"] = "repo-unresolved"
+        return summary
+    runner = git_runner or verification._default_git_runner
+    repo_root = autonomy._infer_repo_root(Path(spec_path))
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        summary["status"] = "target-unresolved"
+        return summary
+    summary["target_head"] = target_sha
+    ancestor = verification._run_git(
+        ["-C", str(repo_root), "merge-base", "--is-ancestor", candidate.lower(), target_sha],
+        runner,
+    )
+    if ancestor["status"] == "ok":
+        summary["status"] = "ancestor"
+    elif ancestor["status"] == "non-zero" and ancestor["returncode"] == 1:
+        summary["status"] = "not-ancestor"
+    else:
+        summary["status"] = "error"
+    return summary
+
+
+def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runner=None) -> dict[str, Any]:
+    slice_id = str(slice_row.get("slice_id") or "")
+    builder_job_id = slice_row.get("builder_job_id")
+    reviewer_job_id = slice_row.get("reviewer_job_id")
+    builder_job_state: str | None = None
+    reviewer_job_state: str | None = None
+    if hasattr(registry, "get_job"):
+        try:
+            if isinstance(builder_job_id, str):
+                builder_job_state = str(registry.get_job(builder_job_id).get("status"))
+        except Exception:
+            builder_job_state = None
+        try:
+            if isinstance(reviewer_job_id, str):
+                reviewer_job_state = str(registry.get_job(reviewer_job_id).get("status"))
+        except Exception:
+            reviewer_job_state = None
+    reason = None
+    manifest = _read_manifest_payload(Path(handoff_dir) / f"{slice_id}.json")
+    if isinstance(manifest, dict):
+        gate_reason = manifest.get("gate_reason")
+        if isinstance(gate_reason, str) and gate_reason:
+            reason = gate_reason
+    if reason is None:
+        actions = slice_row.get("actions")
+        if isinstance(actions, list) and actions:
+            latest = actions[-1]
+            if isinstance(latest, dict):
+                latest_action = latest.get("action")
+                if isinstance(latest_action, str) and latest_action:
+                    reason = latest_action
+    return {
+        "slice_id": slice_id,
+        "slice_state": slice_row.get("state"),
+        "gate_state": slice_row.get("gate_state"),
+        "job_state": reviewer_job_state or builder_job_state,
+        "builder_job_id": builder_job_id,
+        "builder_job_state": builder_job_state,
+        "reviewer_job_id": reviewer_job_id,
+        "reviewer_job_state": reviewer_job_state,
+        "reason": reason,
+        "candidate": slice_row.get("candidate"),
+        "target_remote": slice_row.get("target_remote"),
+        "target_branch": slice_row.get("target_branch"),
+        "ancestry": _resolve_ancestry_status(slice_row, git_runner=git_runner),
+        "current_evidence_refs": list(slice_row.get("current_evidence_refs") or []),
+        "current_evaluation_refs": list(slice_row.get("current_evaluation_refs") or []),
+        "next_actions": allowed_slice_actions(registry, slice_row),
+    }
 
 
 def _completion_candidate_ref(
@@ -897,6 +1058,236 @@ def _finalize_review_job(
     _apply_review_evaluation(registry, slice_id, evaluation)
     gate_status = "passed" if verdict["state"] == "passed" else "failed"
     return evaluation, gate_status, reason
+
+
+def apply_slice_action(
+    dispatcher,
+    *,
+    slice_id: str,
+    action: str,
+    actor: str,
+    specs_dir: str,
+    handoff_dir: str = autonomy.DEFAULT_HANDOFF_DIR,
+    launcher=None,
+    review_launcher=None,
+    persona: str = "builder",
+    review_executor: str | None = None,
+    review_model: str | None = None,
+    clock: Callable[[], str] = _utcnow,
+    git_runner=None,
+    subprocess_runner=None,
+    verification_runner=None,
+    scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
+    dispatch_ready_fn: Callable[..., list[dict[str, Any]]] = autonomy.dispatch_ready,
+) -> dict[str, Any]:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("slice-action requires dispatcher._registry")
+    if action not in SLICE_ACTIONS:
+        raise ValueError(f"unsupported-slice-action:{action}")
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("slice-action actor must be a non-empty string")
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError as exc:
+        raise ValueError("unknown-slice") from exc
+    if action not in allowed_slice_actions(registry, slice_row):
+        raise ValueError(f"action-not-allowed:{action}")
+
+    requested_at = clock()
+    runner = git_runner or getattr(dispatcher, "_git_runner", None)
+    verification_runner = verification_runner or verification.run_result_verification
+
+    if action == "abandon":
+        consumed_at = clock()
+        registry.record_action(
+            slice_id,
+            action="operator-abandon",
+            actor=actor,
+            state="failed",
+            gate_state="failed",
+            requested_at=requested_at,
+            consumed_at=consumed_at,
+            result="ok",
+        )
+        latest = registry.get_slice(slice_id)
+        return {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+            "result": "ok",
+            "requested_at": requested_at,
+            "consumed_at": consumed_at,
+        }
+
+    if action == "retry-build":
+        metas = scan_specs_fn(specs_dir)
+        target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
+        if target is None:
+            raise ValueError("unknown-slice")
+        if isinstance(target.get("parse_error"), dict):
+            raise ValueError(f"invalid-spec:{target['parse_error'].get('field')}")
+        if not (isinstance(target.get("plan"), str) and target["plan"]):
+            raise ValueError("no-plan")
+        dispatched = dispatch_ready_fn(
+            [{**target, "dispatch": "auto"}],
+            lambda sid: autonomy.default_is_satisfied(
+                sid,
+                handoff_dir=handoff_dir,
+                git_runner=runner,
+            ),
+            dispatcher,
+            persona=persona,
+            launcher=launcher,
+            handoff_dir=handoff_dir,
+            git_runner=runner,
+        )
+        if not dispatched:
+            raise RuntimeError("retry-build-dispatch-failed")
+        latest = registry.get_slice(slice_id)
+        outcome = {
+            "slice_id": slice_id,
+            "action": action,
+            "job_id": dispatched[0].get("job_id"),
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+        }
+    elif action == "retry-verify":
+        builder_job_id = slice_row.get("builder_job_id")
+        if not isinstance(builder_job_id, str):
+            raise ValueError("retry-verify-missing-builder")
+        builder_job = registry.get_job(builder_job_id)
+        if builder_job.get("status") != "exited":
+            raise ValueError("retry-verify-builder-not-exited")
+        repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+        state_path = getattr(registry, "_state_path", None)
+        coordinator_root = Path(state_path).parent if state_path is not None else None
+        try:
+            evidence = verification_runner(
+                slice_row=slice_row,
+                job=builder_job,
+                repo_root=repo_root,
+                coordinator_root=coordinator_root,
+                git_runner=runner,
+                subprocess_runner=subprocess_runner,
+            )
+            evidence = _validate_result_evidence(
+                evidence=evidence,
+                slice_id=slice_id,
+                coordinator_root=coordinator_root,
+            )
+            _apply_verification_result(registry, slice_id, evidence)
+            gate_status = str(evidence["payload"]["status"])
+            gate_reason = str(evidence["payload"]["summary"])
+        except Exception as exc:
+            evidence = _write_status_evidence(
+                slice_row=slice_row,
+                job=builder_job,
+                repo_root=repo_root,
+                coordinator_root=coordinator_root,
+                git_runner=runner,
+                status="needs_human",
+                summary="verification-runner-error",
+                details={"error": str(exc)},
+            )
+            if evidence is not None:
+                _apply_verification_result(registry, slice_id, evidence)
+            else:
+                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            gate_status = "needs_human"
+            gate_reason = "verification-runner-error"
+        launch_result: dict[str, Any] | None = None
+        if gate_status == "reviewing":
+            launch_result = _launch_foreign_review(
+                registry=registry,
+                slice_row=registry.get_slice(slice_id),
+                builder_job=builder_job,
+                repo_root=repo_root,
+                coordinator_root=coordinator_root,
+                candidate=str(evidence["payload"]["candidate"]),
+                subprocess_runner=subprocess_runner,
+                git_runner=runner,
+                review_launcher=review_launcher,
+                review_executor=review_executor,
+                review_model=review_model,
+            )
+            if not launch_result.get("launched"):
+                gate_status = str(launch_result.get("gate_status") or "needs_human")
+                gate_reason = str(launch_result.get("gate_reason") or "foreign-review-absent")
+        latest = registry.get_slice(slice_id)
+        refs = latest.get("current_evidence_refs") or []
+        outcome = {
+            "slice_id": slice_id,
+            "action": action,
+            "gate_status": gate_status,
+            "gate_reason": gate_reason,
+            "verification_evidence_path": refs[0] if refs else None,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+        }
+        if launch_result is not None:
+            outcome["review_launched"] = bool(launch_result.get("launched"))
+            if launch_result.get("reviewer_job_id") is not None:
+                outcome["reviewer_job_id"] = launch_result.get("reviewer_job_id")
+    else:  # retry-review
+        builder_job_id = slice_row.get("builder_job_id")
+        candidate = slice_row.get("candidate")
+        if not isinstance(builder_job_id, str):
+            raise ValueError("retry-review-missing-builder")
+        if not (
+            isinstance(candidate, str)
+            and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+        ):
+            raise ValueError("retry-review-candidate-invalid")
+        builder_job = registry.get_job(builder_job_id)
+        repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
+        state_path = getattr(registry, "_state_path", None)
+        coordinator_root = Path(state_path).parent if state_path is not None else None
+        launch_result = _launch_foreign_review(
+            registry=registry,
+            slice_row=registry.get_slice(slice_id),
+            builder_job=builder_job,
+            repo_root=repo_root,
+            coordinator_root=coordinator_root,
+            candidate=candidate.lower(),
+            subprocess_runner=subprocess_runner,
+            git_runner=runner,
+            review_launcher=review_launcher,
+            review_executor=review_executor,
+            review_model=review_model,
+        )
+        latest = registry.get_slice(slice_id)
+        outcome = {
+            "slice_id": slice_id,
+            "action": action,
+            "slice_state": latest.get("state"),
+            "gate_state": latest.get("gate_state"),
+        }
+        if launch_result.get("launched"):
+            outcome["launched"] = True
+            outcome["reviewer_job_id"] = launch_result.get("reviewer_job_id")
+        else:
+            outcome["launched"] = False
+            outcome["gate_status"] = launch_result.get("gate_status")
+            outcome["gate_reason"] = launch_result.get("gate_reason")
+            evaluation = launch_result.get("evaluation")
+            if isinstance(evaluation, dict):
+                outcome["review_evaluation_path"] = evaluation.get("path")
+
+    consumed_at = clock()
+    registry.record_action(
+        slice_id,
+        action=f"operator-{action}",
+        actor=actor,
+        requested_at=requested_at,
+        consumed_at=consumed_at,
+        result="ok",
+    )
+    outcome["result"] = "ok"
+    outcome["requested_at"] = requested_at
+    outcome["consumed_at"] = consumed_at
+    return outcome
 
 
 def complete_tick(

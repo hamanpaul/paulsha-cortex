@@ -63,5 +63,32 @@ class ReapBrokerFlagTests(unittest.TestCase):
         self.assertNotIn("--no-reap", buf.getvalue())
 
 
+class SliceActionFlagTests(unittest.TestCase):
+    def test_slice_action_help_mentions_actor_and_actions(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["slice-action", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--actor", buf.getvalue())
+        self.assertIn("retry-build", buf.getvalue())
+        self.assertIn("retry-review", buf.getvalue())
+
+    def test_slice_action_requires_actor(self) -> None:
+        parser = _build_parser()
+        with self.assertRaises(SystemExit) as exc:
+            parser.parse_args(["slice-action", "slice-a", "retry-build"])
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_slice_action_parses_required_arguments(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["slice-action", "slice-a", "retry-build", "--actor", "operator"])
+        self.assertEqual(args.cmd, "slice-action")
+        self.assertEqual(args.slice_id, "slice-a")
+        self.assertEqual(args.action, "retry-build")
+        self.assertEqual(args.actor, "operator")
+
+
 if __name__ == "__main__":
     unittest.main()

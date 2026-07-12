@@ -40,9 +40,9 @@
 
 ## 7. Local recovery and status
 
-- [ ] 7.1 RED-test persisted `retry-build`, `retry-verify`, `retry-review` and `abandon` actions with required actor.
-- [ ] 7.2 Route `slice-action` through the existing control request queue so daemon/manager remains the only state writer.
-- [ ] 7.3 Implement action consumption and a single status response listing all needs-human reasons, evidence and legal next actions.
+- [x] 7.1 RED-test persisted `retry-build`, `retry-verify`, `retry-review` and `abandon` actions with required actor.
+- [x] 7.2 Route `slice-action` through the existing control request queue so daemon/manager remains the only state writer.
+- [x] 7.3 Implement action consumption and a single status response listing all needs-human reasons, evidence and legal next actions.
 
 ## 8. Canary and documentation
 

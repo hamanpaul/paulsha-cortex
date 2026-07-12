@@ -80,6 +80,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_complete.add_argument("--review-executor", choices=sorted(_ARGV_BUILDERS), default=None)
     p_complete.add_argument("--review-model", default=None)
 
+    p_slice_action = sub.add_parser("slice-action", help="對 needs_human slice 送出本機 recovery action")
+    p_slice_action.add_argument("slice_id")
+    p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "abandon"])
+    p_slice_action.add_argument("--actor", required=True)
+
     sub.add_parser("status", help="讀取 manager daemon 狀態快照")
 
     p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
@@ -171,6 +176,15 @@ def main(
         return _submit_mutation_request(
             "complete",
             request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "slice-action":
+        return _submit_mutation_request(
+            "slice-action",
+            {"slice_id": args.slice_id, "action": args.action, "actor": args.actor},
             read_status_fn=read_status_fn,
             submit_request_fn=submit_request_fn,
             poll_done_fn=poll_done_fn,

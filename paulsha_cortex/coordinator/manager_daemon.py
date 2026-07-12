@@ -176,6 +176,7 @@ def build_runtime_status_provider(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     ready_units_fn: Callable[[list[dict[str, Any]], Callable[[str], bool]], list[dict[str, Any]]] = autonomy.ready_units,
     recent_done_limit: int = RECENT_DONE_LIMIT,
+    git_runner=None,
 ) -> Callable[[], dict[str, Any]]:
     def recent_done_provider() -> list[dict[str, Any]]:
         manifests: list[tuple[str, dict[str, Any]]] = []
@@ -201,7 +202,11 @@ def build_runtime_status_provider(
 
     def provider() -> dict[str, Any]:
         metas = scan_specs_fn(specs_dir)
-        predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
+        predicate = lambda slice_id: autonomy.default_is_satisfied(
+            slice_id,
+            handoff_dir=handoff_dir,
+            git_runner=git_runner,
+        )
         ready_units = ready_units_fn(metas, predicate)
         ready = [meta["slice_id"] for meta in ready_units]
         ready_ids = set(ready)
@@ -215,11 +220,29 @@ def build_runtime_status_provider(
             reasons = _held_reasons(meta, predicate)
             if reasons:
                 held.append({"slice_id": slice_id, "reasons": reasons})
+        slices: list[dict[str, Any]] = []
+        attention: list[dict[str, Any]] = []
+        list_slices = getattr(registry, "list_slices", None)
+        if callable(list_slices):
+            for slice_row in list_slices():
+                if not isinstance(slice_row, dict):
+                    continue
+                entry = manager.slice_status_entry(
+                    registry,
+                    slice_row,
+                    handoff_dir=handoff_dir,
+                    git_runner=git_runner,
+                )
+                slices.append(entry)
+                if entry.get("slice_state") == "needs_human":
+                    attention.append(entry)
         return {
             "ready": ready,
             "held": held,
             "in_flight": _in_flight_status(registry),
             "recent_done": recent_done_provider(),
+            "slices": slices,
+            "attention": attention,
         }
 
     return provider
@@ -279,6 +302,35 @@ def build_request_executor(
             return manager.complete_tick(
                 dispatcher,
                 **complete_kwargs,
+            )
+        if request["type"] == "slice-action":
+            slice_id = args.get("slice_id")
+            action = args.get("action")
+            actor = args.get("actor")
+            if not isinstance(slice_id, str) or not slice_id:
+                raise ValueError("slice-action requires slice_id")
+            if not isinstance(action, str) or not action:
+                raise ValueError("slice-action requires action")
+            if not isinstance(actor, str) or not actor:
+                raise ValueError("slice-action requires actor")
+            return manager.apply_slice_action(
+                dispatcher,
+                slice_id=slice_id,
+                action=action,
+                actor=actor,
+                specs_dir=request_specs_dir,
+                handoff_dir=request_handoff_dir,
+                launcher=_resolve_launcher(
+                    args.get("executor", default_executor),
+                    launcher,
+                    allow_unsafe=allow_unsafe,
+                    model=requested_model,
+                ),
+                review_launcher=active_review_launcher,
+                persona=persona,
+                review_executor=requested_review_executor,
+                review_model=requested_review_model,
+                git_runner=getattr(dispatcher, "_git_runner", None),
             )
         metas = scan_specs_fn(request_specs_dir)
         if request["type"] == "dispatch":
@@ -528,6 +580,7 @@ def run_loop(
         registry=ensure_registry(),
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
+        git_runner=getattr(ensure_dispatcher(), "_git_runner", None),
     )
     if periodic_tick_runner is not None:
         periodic_runner = periodic_tick_runner
@@ -643,6 +696,8 @@ def run_loop(
                     updated_at=now_fn(),
                 )
                 status_payload["held"] = list(snapshot.get("held", []))
+                status_payload["slices"] = list(snapshot.get("slices", []))
+                status_payload["attention"] = list(snapshot.get("attention", []))
                 contract.atomic_write_json(constants.status_path(), status_payload)
             except Exception as exc:  # noqa: BLE001
                 _log_error(exc)

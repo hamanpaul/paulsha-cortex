@@ -83,6 +83,16 @@ def test_build_complete_request():
     assert req["args"]["handoff_dir"] == "runtime/handoff"
 
 
+def test_build_slice_action_request():
+    req = contract.build_request(
+        req_type="slice-action",
+        args={"slice_id": "slice-a", "action": "retry-build", "actor": "operator"},
+        requested_by="telegram:42",
+    )
+    assert req["type"] == "slice-action"
+    assert req["args"] == {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"}
+
+
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):
         contract.build_request(req_type="nope", args={}, requested_by="x")

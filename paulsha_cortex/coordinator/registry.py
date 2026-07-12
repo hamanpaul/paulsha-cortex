@@ -639,6 +639,9 @@ class JobRegistry:
         evidence_refs: list[str] | None = None,
         evaluation_refs: list[str] | None = None,
         candidate: str | None = None,
+        requested_at: str | None = None,
+        consumed_at: str | None = None,
+        result: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
         if state is not None:
@@ -679,15 +682,20 @@ class JobRegistry:
             )
         if candidate is not None:
             slice_row["candidate"] = candidate
-        slice_row["actions"].append(
-            {
-                "action": action,
-                "actor": actor,
-                "state": slice_row["state"],
-                "gate_state": slice_row["gate_state"],
-                "at": _now_iso(),
-            }
-        )
+        action_entry: dict[str, Any] = {
+            "action": action,
+            "actor": actor,
+            "state": slice_row["state"],
+            "gate_state": slice_row["gate_state"],
+            "at": _now_iso(),
+        }
+        if requested_at is not None:
+            action_entry["requested_at"] = requested_at
+        if consumed_at is not None:
+            action_entry["consumed_at"] = consumed_at
+        if result is not None:
+            action_entry["result"] = result
+        slice_row["actions"].append(action_entry)
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
