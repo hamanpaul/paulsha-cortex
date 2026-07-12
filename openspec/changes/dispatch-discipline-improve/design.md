@@ -38,7 +38,7 @@ verification、review verdict與CompletionRecord各有schema version與hash-boun
 
 ### 3. Typed argv deterministic verification先於semantic review
 
-runner只有implicit typed-argv subprocess，接受worktree內cwd。contract明列`persona-scope`與command checks；auto-dispatch必須有policy command。env只保留`PATH/HOME/LANG/LC_ALL/TMPDIR/VIRTUAL_ENV`中既有值。required artifacts、Candidate commands與Candidate full suite必須通過；base full suite可red而Candidate必須green，任一runner error/timeout則`needs_human`。Candidate等於dispatch base一律拒絕，v1不建立no-op proof。
+runner只有implicit typed-argv subprocess，接受worktree內cwd。contract明列`persona-scope`與command checks；auto-dispatch必須有policy command。env只保留`PATH`、`HOME`、`LANG`、`LC_ALL`、`TMPDIR`、`VIRTUAL_ENV`中既有值。required artifacts、Candidate commands與Candidate full suite必須通過；base full suite可red而Candidate必須green，任一runner error/timeout則`needs_human`。Candidate等於dispatch base一律拒絕，v1不建立no-op proof。
 
 v1只允許trusted、shareable contract。清env不是sandbox，因此不接受untrusted verification，也不宣稱network isolation。
 

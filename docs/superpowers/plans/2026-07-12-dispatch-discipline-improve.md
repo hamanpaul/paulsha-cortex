@@ -289,7 +289,7 @@ Expected: FAIL，因 exit 0 現在仍走 completion shadow path。
 
 **Step 3: Implement deterministic checks**
 
-- 使用`subprocess.run(argv, shell=False, cwd=resolved_cwd, timeout=...)`；env只保留原環境中存在的`PATH/HOME/LANG/LC_ALL/TMPDIR/VIRTUAL_ENV`，contract不得自訂env，不帶token/credential env。
+- 使用`subprocess.run(argv, shell=False, cwd=resolved_cwd, timeout=...)`；env只保留原環境中存在的`PATH`、`HOME`、`LANG`、`LC_ALL`、`TMPDIR`、`VIRTUAL_ENV`，contract不得自訂env，不帶token/credential env。
 - base full-suite 使用 manager 建立、finally 必清理的 detached temporary worktree；Candidate用已 pin 的 builder worktree/HEAD。
 - 先做 hash/Candidate/artifact/scope checks，再跑 task tests，最後 full suite；第一個拒絕仍寫完整 fail evidence。
 - manager 只依 validated evidence更新 Slice，不信任 agent log 的 done claim。

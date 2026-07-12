@@ -23,7 +23,7 @@
 - **THEN** CLI以明確錯誤結束且不直接寫`jobs.json`
 
 ### Requirement: Candidate必須接受deterministic ResultVerification
-系統MUST在builder exit後固定exact Candidate SHA，確認dispatch base為其ancestor且兩者不同，並依dispatch時pin住的contract驗required artifacts、`must_change`、persona scope、明列的policy/docs/security commands、task commands與full suite。command MUST使用typed argv且不得經shell；env只保留`PATH/HOME/LANG/LC_ALL/TMPDIR/VIRTUAL_ENV`中既有值。Candidate command/full suite MUST exit 0；base full suite可non-zero但runner本身必須可信完成。缺失、timeout、signal、exception、兩邊皆non-zero、未知或不完整evidence MUST fail-closed。
+系統MUST在builder exit後固定exact Candidate SHA，確認dispatch base為其ancestor且兩者不同，並依dispatch時pin住的contract驗required artifacts、`must_change`、persona scope、明列的policy/docs/security commands、task commands與full suite。command MUST使用typed argv且不得經shell；env只保留`PATH`、`HOME`、`LANG`、`LC_ALL`、`TMPDIR`、`VIRTUAL_ENV`中既有值。Candidate command/full suite MUST exit 0；base full suite可non-zero但runner本身必須可信完成。缺失、timeout、signal、exception、兩邊皆non-zero、未知或不完整evidence MUST fail-closed。
 
 #### Scenario: Exit 0但必要產物缺失
 - **WHEN** Candidate的builder Job exited但verification找不到required artifact
