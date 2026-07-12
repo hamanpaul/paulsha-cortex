@@ -33,10 +33,10 @@
 
 ## 6. Artifact-aware dependency release
 
-- [ ] 6.1 RED-test versioned CompletionRecord validation, record-first crash ordering and orphan-record restart handling.
-- [ ] 6.2 Implement remote target fetch/ancestry completion and readiness checks that require matching Slice state and evidence hashes.
-- [ ] 6.3 Pin downstream worktree actual base SHA and recheck every upstream Candidate before creation/launch.
-- [ ] 6.4 Pass unmerged, preserving-merge, squash/cherry-pick unsupported, target mismatch and TOCTOU git fixtures.
+- [x] 6.1 RED-test versioned CompletionRecord validation, record-first crash ordering and orphan-record restart handling.
+- [x] 6.2 Implement remote target fetch/ancestry completion and readiness checks that require matching Slice state and evidence hashes.
+- [x] 6.3 Pin downstream worktree actual base SHA and recheck every upstream Candidate before creation/launch.
+- [x] 6.4 Pass unmerged, preserving-merge, squash/cherry-pick unsupported, target mismatch and TOCTOU git fixtures.
 
 ## 7. Local recovery and status
 

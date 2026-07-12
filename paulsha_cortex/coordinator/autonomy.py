@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Callable
@@ -8,6 +7,7 @@ from typing import Callable
 from paulsha_cortex.config import paths
 
 from .._yaml import YAMLError, safe_load
+from . import completion
 from .contract_command import build_dispatch_prompt
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
@@ -342,21 +342,23 @@ def ready_units(metas: list[dict], is_satisfied: IsSatisfied) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 5) default_is_satisfied（預設來源 = handoff gate_status；保持可注入覆寫）
 # --------------------------------------------------------------------------- #
-def default_is_satisfied(slice_id: str, handoff_dir: str = DEFAULT_HANDOFF_DIR) -> bool:
-    """預設判定：runtime/handoff/<slice_id>.json 存在且 gate_status=='passed'。
-
-    檔不存在/壞檔/非 passed → False（fail-closed：未證明滿足即不釋放下游）。
-    這只是預設 impl；ready_units/dispatch_ready 一律收注入 predicate，
-    未來換 merged-to-main 來源只需換注入物（同 Callable[[str], bool] 介面）。
-    """
-    p = Path(handoff_dir) / f"{slice_id}.json"
-    if not p.is_file():
-        return False
-    try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    return isinstance(payload, dict) and payload.get("gate_status") in {"passed", "verified"}
+def default_is_satisfied(
+    slice_id: str,
+    handoff_dir: str = DEFAULT_HANDOFF_DIR,
+    *,
+    repo_root: str | Path | None = None,
+    git_runner=None,
+) -> bool:
+    """預設判定：handoff 指向有效 CompletionRecord 且 candidate 仍為 target ancestor。"""
+    return (
+        completion.load_completion_from_handoff(
+            slice_id,
+            handoff_dir=handoff_dir,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        is not None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -373,6 +375,7 @@ def dispatch_ready(
     persona: str = "builder",
     git_runner=None,
     launcher: AgentLauncher | None = None,
+    handoff_dir: str = DEFAULT_HANDOFF_DIR,
 ) -> list[dict]:
     """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
 
@@ -409,18 +412,24 @@ def dispatch_ready(
         pinned_inputs: dict | None = None
         try:
             prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
-            worktree = _launcher_worktree(dispatcher, slice_id)
+            pinned_inputs = pin_dispatch_inputs(m)
+            base_sha = _resolve_target_base_sha(
+                meta=m,
+                pinned_inputs=pinned_inputs,
+                handoff_dir=handoff_dir,
+                git_runner=runner,
+            )
+            worktree = _launcher_worktree(dispatcher, slice_id, base_sha=base_sha)
             # baseline 須在 agent 動工前取（launch 前），否則含進 agent 的 commit → 空 diff。
             try:
                 dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
             except Exception:
                 dispatch_head = None
-            pinned_inputs = pin_dispatch_inputs(m)
             _record_pending_slice(
                 dispatcher=dispatcher,
                 slice_id=slice_id,
                 pinned_inputs=pinned_inputs,
-                dispatch_head=dispatch_head,
+                dispatch_base=base_sha or dispatch_head,
             )
             log_dir = str(Path("runtime/dispatch") / slice_id)
             # 在 launch 前先落地 registry row：Popen 之後、記錄完成之前若 daemon
@@ -436,7 +445,7 @@ def dispatch_ready(
                 dispatcher=dispatcher,
                 slice_id=slice_id,
                 builder_job_id=job.get("job_id"),
-                dispatch_head=dispatch_head,
+                dispatch_base=base_sha or dispatch_head,
             )
             handle = launcher.launch(
                 slice_id=slice_id,
@@ -461,11 +470,65 @@ def _branch_for_slice(slice_id: str) -> str:
     return f"feature/{slice_id}"
 
 
-def _launcher_worktree(dispatcher, slice_id: str) -> str:
+def _resolve_target_base_sha(
+    *,
+    meta: dict,
+    pinned_inputs: dict,
+    handoff_dir: str,
+    git_runner,
+) -> str:
+    repo_root = _infer_repo_root(Path(pinned_inputs["spec_path"]))
+    target_branch = str(pinned_inputs["target_branch"])
+    target_remote = str(pinned_inputs["target_remote"])
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    fetch = verification._run_git(
+        ["-C", str(repo_root), "fetch", "--no-tags", target_remote, target_branch],
+        git_runner,
+    )
+    if fetch["status"] != "ok":
+        raise ValueError(f"target fetch failed: {target_remote}/{target_branch}")
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], git_runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        raise ValueError(f"target ref unreadable: {target_ref}")
+    dependency_target: str | None = None
+    for dep in meta.get("depends_on", []):
+        dep_record = completion.load_completion_from_handoff(
+            str(dep),
+            handoff_dir=handoff_dir,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        if dep_record is None:
+            raise ValueError(f"dependency unsatisfied: {dep}")
+        dep_target = str(dep_record["target_branch"])
+        if dependency_target is None:
+            dependency_target = dep_target
+        elif dependency_target != dep_target:
+            raise ValueError("dependency target branch mismatch")
+        if dep_target != target_branch:
+            raise ValueError("dependency chain target branch mismatch")
+        dep_candidate = str(dep_record["candidate"])
+        ancestor = verification._run_git(
+            ["-C", str(repo_root), "merge-base", "--is-ancestor", dep_candidate, target_sha],
+            git_runner,
+        )
+        if ancestor["status"] != "ok":
+            raise ValueError(f"dependency candidate stale: {dep}")
+    return target_sha
+
+
+def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None) -> str:
     worktree_creator = getattr(dispatcher, "_worktree_creator", None)
     if worktree_creator is None:
         return str(Path.cwd())
-    return worktree_creator.create(_branch_for_slice(slice_id))
+    branch = _branch_for_slice(slice_id)
+    if base_sha is None:
+        return worktree_creator.create(branch)
+    try:
+        return worktree_creator.create(branch, base_sha=base_sha)
+    except TypeError:
+        return worktree_creator.create(branch)
 
 
 def _record_launching_job(
@@ -510,7 +573,7 @@ def _record_pending_slice(
     dispatcher,
     slice_id: str,
     pinned_inputs: dict,
-    dispatch_head: str | None,
+    dispatch_base: str | None,
 ) -> None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -526,7 +589,7 @@ def _record_pending_slice(
             target_remote=pinned_inputs["target_remote"],
             verification_hash=pinned_inputs["verification_hash"],
             verification=pinned_inputs.get("verification"),
-            dispatch_base=dispatch_head,
+            dispatch_base=dispatch_base,
             builder_job_id=None,
             reviewer_job_id=None,
             candidate=None,
@@ -544,7 +607,7 @@ def _record_pending_slice(
             target_remote=pinned_inputs["target_remote"],
             verification_hash=pinned_inputs["verification_hash"],
             verification=pinned_inputs.get("verification"),
-            dispatch_base=dispatch_head,
+            dispatch_base=dispatch_base,
         )
 
 
@@ -553,7 +616,7 @@ def _mark_slice_building(
     dispatcher,
     slice_id: str,
     builder_job_id: str | None,
-    dispatch_head: str | None,
+    dispatch_base: str | None,
 ) -> None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -562,7 +625,7 @@ def _mark_slice_building(
         slice_id,
         state="building",
         builder_job_id=builder_job_id,
-        dispatch_base=dispatch_head,
+        dispatch_base=dispatch_base,
     )
 
 

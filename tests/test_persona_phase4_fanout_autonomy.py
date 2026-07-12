@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +86,20 @@ def _meta(slice_id, *, dispatch="auto", plan="docs/plan.md", depends_on=None, pa
             "verification_hash": "2" * 64,
         },
     }
+
+
+def _fake_target_git_runner(args: list[str]):
+    if not args:
+        return ""
+    if args[0] == "rev-parse":
+        return "f" * 40
+    if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+        return ""
+    if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+        return "f" * 40
+    if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base" and args[3] == "--is-ancestor":
+        return ""
+    return ""
 
 
 class _FakeDispatcher:
@@ -450,17 +465,16 @@ class ReadyTests(unittest.TestCase):
         ]
         self.assertEqual(ready_units(metas, is_satisfied=lambda _id: True), [])
 
-    def test_default_is_satisfied_reads_gate_status(self) -> None:
+    def test_default_is_satisfied_delegates_to_completion_record_loader(self) -> None:
         from paulsha_cortex.coordinator.autonomy import default_is_satisfied
 
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, mock.patch(
+            "paulsha_cortex.coordinator.autonomy.completion.load_completion_from_handoff"
+        ) as load_record:
             hd = Path(d) / "handoff"
             hd.mkdir()
-            (hd / "passed-slice.json").write_text(
-                json.dumps({"gate_status": "passed"}), encoding="utf-8"
-            )
-            (hd / "failed-slice.json").write_text(
-                json.dumps({"gate_status": "failed"}), encoding="utf-8"
+            load_record.side_effect = lambda slice_id, **kwargs: (
+                {"slice_id": slice_id} if slice_id == "passed-slice" else None
             )
             self.assertTrue(default_is_satisfied("passed-slice", handoff_dir=str(hd)))
             self.assertFalse(default_is_satisfied("failed-slice", handoff_dir=str(hd)))
@@ -479,10 +493,10 @@ class FanoutTests(unittest.TestCase):
             _meta("held", dispatch="hold"),
             _meta("noplan", dispatch="auto", plan=None),
             _meta("blocked", depends_on=["down"]),     # down 未滿足 → 不就緒
-            _meta("ready-2", depends_on=["up"]),        # up 滿足 → 就緒
+            _meta("ready-2", depends_on=[]),
         ]
         launcher = _RecordingLauncher()
-        # is_satisfied 只對 "up" 回 True → ready-1（無相依）、ready-2（dep=up）就緒；
+        # ready-1 / ready-2（皆無相依）應就緒；
         # held（hold）/noplan（無 plan）/blocked（dep=down 未滿足）皆不就緒
         jobs = dispatch_ready(
             metas,
@@ -490,6 +504,7 @@ class FanoutTests(unittest.TestCase):
             dispatcher=_FakeDispatcher(),
             persona="builder",
             launcher=launcher,
+            git_runner=_fake_target_git_runner,
         )
         dispatched_tasks = [c["slice_id"] for c in launcher.calls]
         self.assertEqual(sorted(dispatched_tasks), ["ready-1", "ready-2"])
@@ -533,7 +548,7 @@ class FanoutTests(unittest.TestCase):
         metas = [_meta("slice-a", plan="docs/superpowers/plans/a.md")]
         dispatch_ready(
             metas, is_satisfied=lambda _id: True, dispatcher=_FakeDispatcher(),
-            persona="builder", launcher=launcher,
+            persona="builder", launcher=launcher, git_runner=_fake_target_git_runner,
         )
 
         self.assertEqual(len(launcher.calls), 1)
@@ -567,7 +582,7 @@ class FanoutTests(unittest.TestCase):
             with self.assertRaises(DispatchReadyError) as ctx:
                 dispatch_ready(
                     metas, is_satisfied=lambda _id: True, dispatcher=_FakeDispatcher(),
-                    persona="builder", launcher=launcher,
+                    persona="builder", launcher=launcher, git_runner=_fake_target_git_runner,
                 )
         finally:
             autonomy_mod.build_dispatch_prompt = original
@@ -591,7 +606,7 @@ class FanoutTests(unittest.TestCase):
         metas = [_meta("slice-a", plan="docs/p.md")]
         dispatch_ready(
             metas, is_satisfied=lambda _id: True, dispatcher=_FakeDispatcher(),
-            persona="builder", launcher=_FakeLauncher(),
+            persona="builder", launcher=_FakeLauncher(), git_runner=_fake_target_git_runner,
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["slice_id"], "slice-a")
@@ -639,6 +654,7 @@ class FanoutTests(unittest.TestCase):
                 dispatcher=disp,
                 persona="builder",
                 launcher=launcher,
+                git_runner=_fake_target_git_runner,
             )
 
             self.assertEqual(sender.sent, [])
@@ -683,6 +699,7 @@ class FanoutTests(unittest.TestCase):
                     dispatcher=disp,
                     persona="builder",
                     launcher=launcher,
+                    git_runner=_fake_target_git_runner,
                 )
 
             self.assertEqual(launcher.calls, ["slice-a", "slice-b"])
@@ -734,6 +751,7 @@ class FanoutTests(unittest.TestCase):
                 dispatcher=disp,
                 persona="builder",
                 launcher=launcher,
+                git_runner=_fake_target_git_runner,
             )
             # row existed when launch ran; handle (pid) attached afterwards.
             self.assertEqual(launcher.rows_at_launch, ["slice-a"])
@@ -812,9 +830,17 @@ class FanoutTests(unittest.TestCase):
             metas = [_meta("real-a", depends_on=[]), _meta("real-b", depends_on=[])]
             git_calls: list = []
 
-            def _fake_git(args):  # 注入 baseline runner，避免起真 git（#131）
+            def _fake_git(args):  # 注入 git runner，避免起真 git（target + baseline）
                 git_calls.append(list(args))
-                return "BASE_SHA"
+                if args and args[0] == "rev-parse":
+                    return "f" * 40
+                if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                    return ""
+                if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                    return "e" * 40
+                if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                    return ""
+                return ""
 
             _subprocess.run = _spy_run
             try:
@@ -833,11 +859,18 @@ class FanoutTests(unittest.TestCase):
             self.assertEqual(launcher.calls, ["real-a", "real-b"])
             self.assertEqual(sender.sent, [])   # headless：不送 tmux pane
             self.assertEqual(real_calls, [])     # 注入 git_runner → 全程不啟動真 git
-            # #131：baseline 經注入 runner 取得（launch 前讀 branch head）並持久化於 job
+            baseline_calls = [call for call in git_calls if call[:1] == ["rev-parse"]]
+            self.assertEqual(baseline_calls, [["rev-parse", "feature/real-a"], ["rev-parse", "feature/real-b"]])
+            self.assertEqual(sum(1 for call in git_calls if len(call) >= 3 and call[2] == "fetch"), 2)
             self.assertEqual(
-                git_calls, [["rev-parse", "feature/real-a"], ["rev-parse", "feature/real-b"]]
+                sum(
+                    1
+                    for call in git_calls
+                    if len(call) >= 4 and call[2] == "rev-parse" and call[3].startswith("refs/remotes/")
+                ),
+                2,
             )
-            self.assertEqual({j["dispatch_head"] for j in jobs}, {"BASE_SHA"})
+            self.assertEqual({j["dispatch_head"] for j in jobs}, {"f" * 40})
 
 
 # --------------------------------------------------------------------------- #

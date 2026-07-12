@@ -7,11 +7,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from paulsha_cortex.control import constants, contract
-from paulsha_cortex.coordinator import autonomy as coordinator_autonomy, manager_daemon
+from paulsha_cortex.coordinator import autonomy as coordinator_autonomy, completion, manager_daemon, verification
 from paulsha_cortex.coordinator.registry import JobRegistry
 
 
@@ -172,9 +173,28 @@ class FakeRegistry:
 
 
 class FakeDispatcher:
-    def __init__(self, registry: FakeRegistry, worktree_creator=None) -> None:
+    def __init__(self, registry: FakeRegistry, worktree_creator=None, git_runner=None) -> None:
         self._registry = registry
         self._worktree_creator = worktree_creator
+        self._git_runner = git_runner or _default_git_runner
+
+
+def _git_ok(stdout: str = "") -> SimpleNamespace:
+    return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+
+def _default_git_runner(args: list[str]):
+    if not args:
+        return ""
+    if args[0] == "rev-parse":
+        return "f" * 40
+    if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+        return ""
+    if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+        return "f" * 40
+    if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base" and args[3] == "--is-ancestor":
+        return ""
+    return ""
 
 
 class FakeWorktreeCreator:
@@ -225,6 +245,76 @@ def _write_request(req_id: str, **overrides) -> dict:
     return request
 
 
+def _seed_dependency_completion(
+    *,
+    root: Path,
+    handoff_dir: Path,
+    slice_id: str,
+) -> None:
+    candidate = "b" * 40
+    target_sha = "c" * 40
+    verification_ref = verification.write_verification_evidence(
+        {
+            "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+            "slice_id": slice_id,
+            "candidate": candidate,
+            "status": "verified",
+            "summary": "verification-succeeded",
+            "details": {"ok": True},
+        },
+        coordinator_root=root,
+    )
+    record = completion.write_completion_record(
+        {
+            "schema_version": completion.COMPLETION_SCHEMA_VERSION,
+            "slice_id": slice_id,
+            "spec_hash": "0" * 64,
+            "plan_hash": "1" * 64,
+            "verification_hash": "2" * 64,
+            "builder_job_id": f"{slice_id}-builder-1",
+            "reviewer_job_id": None,
+            "dispatch_base": "a" * 40,
+            "candidate": candidate,
+            "target_branch": "main",
+            "target_remote": "origin",
+            "target_ref": "refs/remotes/origin/main",
+            "target_ref_sha": target_sha,
+            "verification_evidence_path": verification_ref["path"],
+            "verification_evidence_hash": verification_ref["hash"],
+            "review_policy": "not-required",
+            "docs_class": "informational",
+            "review_evaluation_path": None,
+            "review_evaluation_hash": None,
+            "completed_at": "2026-07-12T00:00:00+00:00",
+        },
+        coordinator_root=root,
+    )
+    contract.atomic_write_json(
+        handoff_dir / f"{slice_id}.json",
+        {
+            "slice_id": slice_id,
+            "job_id": f"{slice_id}-builder-1",
+            "gate_status": "passed",
+            "completion": "exited",
+            "exit_code": 0,
+            "branch": f"feature/{slice_id}",
+            "gate_reason": "candidate-merged",
+            "gate_verdict": None,
+            "verification_evidence_path": verification_ref["path"],
+            "verification_evidence_hash": verification_ref["hash"],
+            "review_evaluation_path": None,
+            "review_evaluation_hash": None,
+            "completion_record_path": record["path"],
+            "completion_record_hash": record["hash"],
+            "slice_state": "completed",
+            "spec_hash": "0" * 64,
+            "plan_hash": "1" * 64,
+            "verification_hash": "2" * 64,
+            "completed_at": "2026-07-12T00:00:00+00:00",
+        },
+    )
+
+
 def _run_dispatch_request(
     monkeypatch,
     tmp_path,
@@ -242,7 +332,7 @@ def _run_dispatch_request(
     _materialize_dispatch_metas(tmp_path, metas)
     registry = FakeRegistry(jobs)
     worktree_creator = FakeWorktreeCreator(tmp_path / "worktrees")
-    dispatcher = FakeDispatcher(registry, worktree_creator=worktree_creator)
+    dispatcher = FakeDispatcher(registry, worktree_creator=worktree_creator, git_runner=_default_git_runner)
     launcher = RecordingLauncher()
     request_executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
@@ -279,7 +369,11 @@ def _run_complete_request(
     req_id = "20260703T090009Z-66666666666666666666666666666666"
     _write_request(req_id, type="complete", args=args)
     registry = FakeRegistry(jobs)
-    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    dispatcher = FakeDispatcher(
+        registry,
+        worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"),
+        git_runner=_default_git_runner,
+    )
     request_executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),
@@ -1325,10 +1419,7 @@ def test_dispatch_deps_unsatisfied(monkeypatch, tmp_path):
 def test_dispatch_uses_request_specific_handoff_dir_for_deps(monkeypatch, tmp_path):
     override_handoff = tmp_path / "override-handoff"
     override_handoff.mkdir()
-    contract.atomic_write_json(
-        override_handoff / "slice-dep.json",
-        {"slice_id": "slice-dep", "gate_status": "passed"},
-    )
+    _seed_dependency_completion(root=tmp_path, handoff_dir=override_handoff, slice_id="slice-dep")
 
     done, launcher, registry, worktree_creator = _run_dispatch_request(
         monkeypatch,
@@ -1611,7 +1702,14 @@ def test_dispatch_without_registry_is_fail_closed(monkeypatch, tmp_path):
     req_id = "20260703T090008Z-55555555555555555555555555555555"
     _write_request(req_id, type="dispatch", args={"slice_id": "slice-a"})
     _write_v1_spec(tmp_path / "specs", "slice-a")
-    dispatcher = type("NoRegistryDispatcher", (), {"_worktree_creator": FakeWorktreeCreator(tmp_path / "worktrees")})()
+    dispatcher = type(
+        "NoRegistryDispatcher",
+        (),
+        {
+            "_worktree_creator": FakeWorktreeCreator(tmp_path / "worktrees"),
+            "_git_runner": _default_git_runner,
+        },
+    )()
     launcher = RecordingLauncher()
     request_executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,

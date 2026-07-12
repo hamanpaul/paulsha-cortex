@@ -103,11 +103,15 @@ class Dispatcher:
         persona: str,
         pane_id: str,
         command: str,
+        base_sha: str | None = None,
         git_runner: GitRunner | None = None,
     ) -> dict[str, object]:
         branch = _branch_for_task(task)
         # (1) 先建 worktree；失敗則 raise（不送命令、不記 job — fail-closed）
-        worktree = self._worktree_creator.create(branch)
+        try:
+            worktree = self._worktree_creator.create(branch, base_sha=base_sha)
+        except TypeError:
+            worktree = self._worktree_creator.create(branch)
         # (2) 忠實轉送呼叫者給的完整 command（本 change 不組裝 copilot 指令）
         self._pane_sender.send(pane_id, command)
         # (3) 取 dispatch 當下的 branch head（baseline）；取不到記 None。

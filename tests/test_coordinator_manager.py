@@ -1012,7 +1012,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
         self.assertNotIn("registry._find_job", source)
         self.assertNotIn("registry._persist", source)
 
-    def test_successful_informational_verification_releases_downstream(self) -> None:
+    def test_successful_informational_verification_stays_verified_until_candidate_merged(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             root = Path(d)
@@ -1023,21 +1023,22 @@ class CompleteTickVerificationTests(unittest.TestCase):
             disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = root / "handoff"
             candidate = "b" * 40
+            target_head = "c" * 40
             dispatch_base = "a" * 40
             persona_catalog = _persona_catalog(builder_paths=["**"])
-            branch_heads = [_git_ok(candidate), _git_ok(candidate)]
-            worktree_heads = [_git_ok(candidate), _git_ok(candidate)]
-            worktree_statuses = [_git_ok(""), _git_ok("")]
 
             def git_runner(args: list[str]):
                 key = tuple(args)
                 if key == ("-C", str(root), "rev-parse", "feature/slice-info"):
-                    return branch_heads.pop(0)
+                    return _git_ok(candidate)
                 if key == ("-C", str(worktree), "rev-parse", "HEAD"):
-                    return worktree_heads.pop(0)
+                    return _git_ok(candidate)
                 if key == ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"):
-                    return worktree_statuses.pop(0)
+                    return _git_ok("")
                 return {
+                    ("-C", str(root), "fetch", "--no-tags", "origin", "main"): _git_ok(""),
+                    ("-C", str(root), "rev-parse", "refs/remotes/origin/main"): _git_ok(target_head),
+                    ("-C", str(root), "merge-base", "--is-ancestor", candidate, target_head): _proc_fail(1),
                     ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
                     ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
@@ -1061,9 +1062,83 @@ class CompleteTickVerificationTests(unittest.TestCase):
             manifest = json.loads((hdir / "slice-info.json").read_text(encoding="utf-8"))
             slice_row = reg.get_slice("slice-info")
             self.assertEqual(manifest["gate_status"], "verified")
+            self.assertEqual(manifest["gate_reason"], "candidate-not-merged")
+            self.assertIsNone(manifest["completion_record_path"])
             self.assertEqual(slice_row["state"], "verified")
             self.assertEqual(slice_row["gate_state"], "passed")
-            self.assertTrue(manager.autonomy.default_is_satisfied("slice-info", handoff_dir=str(hdir)))
+            self.assertFalse(
+                manager.autonomy.default_is_satisfied(
+                    "slice-info",
+                    handoff_dir=str(hdir),
+                    repo_root=root,
+                    git_runner=git_runner,
+                )
+            )
+            self.assertEqual(summary["released"], [])
+
+    def test_successful_informational_verification_records_completion_after_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-info", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="informational")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+            target_head = "c" * 40
+            dispatch_base = "a" * 40
+            persona_catalog = _persona_catalog(builder_paths=["**"])
+
+            def git_runner(args: list[str]):
+                key = tuple(args)
+                if key == ("-C", str(root), "rev-parse", "feature/slice-info"):
+                    return _git_ok(candidate)
+                if key == ("-C", str(worktree), "rev-parse", "HEAD"):
+                    return _git_ok(candidate)
+                if key == ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"):
+                    return _git_ok("")
+                return {
+                    ("-C", str(root), "fetch", "--no-tags", "origin", "main"): _git_ok(""),
+                    ("-C", str(root), "rev-parse", "refs/remotes/origin/main"): _git_ok(target_head),
+                    ("-C", str(root), "merge-base", "--is-ancestor", candidate, target_head): _git_ok(""),
+                    ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
+                    ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + "..." + candidate): _git_ok(""),
+                    ("-C", str(root), "worktree", "add", "--detach", str(root / ".psc-verification-worktrees" / "slice-info-aaaaaaaaaaaa"), dispatch_base): _git_ok(""),
+                    ("-C", str(root), "worktree", "remove", "--force", str(root / ".psc-verification-worktrees" / "slice-info-aaaaaaaaaaaa")): _git_ok(""),
+                }[key]
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                metas=[
+                    {"slice_id": "slice-info", "dispatch": "auto", "plan": "p-info.md", "depends_on": []},
+                    {"slice_id": "downstream", "dispatch": "auto", "plan": "p-down.md", "depends_on": ["slice-info"]},
+                ],
+                clock=lambda: "T0",
+                git_runner=git_runner,
+                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+            )
+
+            manifest = json.loads((hdir / "slice-info.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-info")
+            self.assertEqual(manifest["gate_status"], "passed")
+            self.assertEqual(manifest["gate_reason"], "candidate-merged")
+            self.assertEqual(slice_row["state"], "completed")
+            self.assertEqual(slice_row["gate_state"], "passed")
+            self.assertIsNotNone(manifest["completion_record_path"])
+            self.assertIsNotNone(manifest["completion_record_hash"])
+            self.assertTrue(
+                manager.autonomy.default_is_satisfied(
+                    "slice-info",
+                    handoff_dir=str(hdir),
+                    repo_root=root,
+                    git_runner=git_runner,
+                )
+            )
             self.assertEqual(summary["released"], ["downstream"])
 
     def test_candidate_equal_to_dispatch_base_marks_needs_human(self) -> None:
@@ -1761,6 +1836,17 @@ class DispatchHeadBaselineTests(unittest.TestCase):
 
     def test_dispatch_ready_persists_dispatch_head(self) -> None:
         # 注入 git_runner 回固定 baseline → 應寫進 job 與 registry（修前為 None）
+        def git_runner(args):
+            if args and args[0] == "rev-parse":
+                return "f" * 40
+            if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                return ""
+            if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                return "e" * 40
+            if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                return ""
+            return ""
+
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             disp = _HeadlessDispatcher(reg)
@@ -1768,16 +1854,24 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             metas = [_dispatch_meta("slice-x")]
             jobs = dispatch_ready(
                 metas, is_satisfied=lambda _id: True, dispatcher=disp,
-                launcher=launcher, git_runner=lambda args: "BASE_SHA",
+                launcher=launcher, git_runner=git_runner,
             )
             self.assertEqual(len(jobs), 1)
-            self.assertEqual(jobs[0]["dispatch_head"], "BASE_SHA")
-            self.assertEqual(reg.list_jobs()[0]["dispatch_head"], "BASE_SHA")
+            self.assertEqual(jobs[0]["dispatch_head"], "f" * 40)
+            self.assertEqual(reg.list_jobs()[0]["dispatch_head"], "f" * 40)
 
     def test_dispatch_ready_git_failure_records_none_not_crash(self) -> None:
         # baseline 取不到（git 例外）→ dispatch_head=None，但不破壞派工（graceful）
         def boom(args):
-            raise RuntimeError("git 爆炸")
+            if args and args[0] == "rev-parse":
+                raise RuntimeError("git 爆炸")
+            if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                return ""
+            if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                return "e" * 40
+            if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                return ""
+            return ""
 
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
@@ -1792,6 +1886,17 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             self.assertIsNone(jobs[0]["dispatch_head"])
 
     def test_dispatch_pipeline_keeps_exited_job_out_of_completion_path(self) -> None:
+        def git_runner(args):
+            if args and args[0] == "rev-parse":
+                return "f" * 40
+            if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                return ""
+            if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                return "e" * 40
+            if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                return ""
+            return ""
+
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             reg = JobRegistry(state_path=root / "jobs.json")
@@ -1800,7 +1905,7 @@ class DispatchHeadBaselineTests(unittest.TestCase):
             metas = [_dispatch_meta("slice-x")]
             jobs = dispatch_ready(
                 metas, is_satisfied=lambda _id: True, dispatcher=disp,
-                launcher=launcher, git_runner=lambda args: "BASE_SHA",
+                launcher=launcher, git_runner=git_runner,
             )
             self.assertTrue(jobs[0]["dispatch_head"], "baseline 應非 null")
             hdir = root / "handoff"

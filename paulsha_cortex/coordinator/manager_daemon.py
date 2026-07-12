@@ -246,7 +246,11 @@ def build_request_executor(
         args = request.get("args", {})
         request_specs_dir = args.get("specs_dir") or specs_dir
         request_handoff_dir = args.get("handoff_dir") or handoff_dir
-        predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=request_handoff_dir)
+        predicate = lambda slice_id: autonomy.default_is_satisfied(
+            slice_id,
+            handoff_dir=request_handoff_dir,
+            git_runner=getattr(dispatcher, "_git_runner", None),
+        )
         allow_unsafe = bool(args.get("allow_unsafe", False))
         persona = args.get("persona", default_persona)
         requested_model = args.get("model", default_model)
@@ -318,6 +322,8 @@ def build_request_executor(
                 dispatcher,
                 persona=persona,
                 launcher=active_launcher,
+                handoff_dir=request_handoff_dir,
+                git_runner=getattr(dispatcher, "_git_runner", None),
             )
             job = dispatched[0]
             if registry is None:
@@ -352,6 +358,8 @@ def build_request_executor(
                 dispatcher,
                 persona=persona,
                 launcher=active_launcher,
+                handoff_dir=request_handoff_dir,
+                git_runner=getattr(dispatcher, "_git_runner", None),
             )
             return {
                 "dispatch_skipped": False,
@@ -404,7 +412,11 @@ def build_periodic_tick_runner(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
 ) -> Callable[[], dict[str, Any]]:
-    predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
+    predicate = lambda slice_id: autonomy.default_is_satisfied(
+        slice_id,
+        handoff_dir=handoff_dir,
+        git_runner=getattr(dispatcher, "_git_runner", None),
+    )
 
     def execute() -> dict[str, Any]:
         metas = scan_specs_fn(specs_dir)

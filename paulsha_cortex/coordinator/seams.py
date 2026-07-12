@@ -18,7 +18,7 @@ class PaneSender(Protocol):
 class WorktreeCreator(Protocol):
     """為某分支建立 git worktree、回傳其路徑的 seam。"""
 
-    def create(self, branch: str) -> str: ...
+    def create(self, branch: str, *, base_sha: str | None = None) -> str: ...
 
 
 class TmuxPaneSender:
@@ -62,14 +62,14 @@ class ScriptWorktreeCreator:
         self._wt_root = Path(paths.worktree_root() if wt_root is None else wt_root)
         self._base = base
 
-    def create(self, branch: str) -> str:
+    def create(self, branch: str, *, base_sha: str | None = None) -> str:
         slug = branch.replace("/", "-")
         target = self._wt_root / slug
         self._wt_root.mkdir(parents=True, exist_ok=True)
         try:
             subprocess.run(
                 ["git", "-C", str(self._repo), "worktree", "add", "-b", branch,
-                 str(target), self._base],
+                 str(target), base_sha or self._base],
                 check=True, capture_output=True,
             )
         except subprocess.CalledProcessError as exc:

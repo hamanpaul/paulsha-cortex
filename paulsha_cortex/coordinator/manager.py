@@ -5,11 +5,12 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
+from . import completion
 from . import review as foreign_review
 from . import verification
 
@@ -82,7 +83,7 @@ def _existing_manifest_job_id(path: Path) -> str | None:
     payload = _read_manifest_payload(path)
     if payload is None:
         return None
-    if payload.get("gate_status") == "passed":
+    if payload.get("gate_status") in {"passed", "verified"}:
         return None
     if payload.get("gate_status") == "needs_human" and payload.get("verification_evidence_path") is None and (
         payload.get("gate_reason") in {"pinned-input-mismatch", "verification-runner-error", "verification-state-update-error"}
@@ -312,6 +313,176 @@ def _current_verification_ref(slice_row: dict | None) -> tuple[str | None, str |
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return path, None
     return path, verification.canonical_json_hash(normalized)
+
+
+def _current_review_ref(slice_row: dict | None) -> tuple[str | None, str | None, dict | None]:
+    if not isinstance(slice_row, dict):
+        return None, None, None
+    refs = slice_row.get("current_evaluation_refs")
+    if not isinstance(refs, list) or not refs:
+        return None, None, None
+    path = refs[0]
+    if not isinstance(path, str):
+        return None, None, None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return path, None, None
+    if not isinstance(payload, dict):
+        return path, None, None
+    return path, verification.canonical_json_hash(payload), payload
+
+
+def _completion_candidate_ref(
+    *,
+    registry,
+    slice_row: dict,
+    repo_root: Path,
+    coordinator_root: Path | None,
+    gate_status: str,
+    gate_reason: str | None,
+    clock: Callable[[], str],
+    git_runner,
+) -> tuple[str, str | None, dict | None]:
+    if gate_status not in {"verified", "passed"}:
+        return gate_status, gate_reason, None
+    slice_id = str(slice_row["slice_id"])
+    candidate = slice_row.get("candidate")
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+        registry.record_action(
+            slice_id,
+            action="completion-candidate-invalid",
+            actor="manager",
+            state="needs_human",
+            gate_state="needs_human",
+        )
+        return "needs_human", "completion-candidate-invalid", None
+    target_remote = str(slice_row.get("target_remote") or "origin")
+    target_branch = str(slice_row.get("target_branch") or "main")
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    if slice_row.get("state") == "completed" and slice_row.get("gate_state") == "passed":
+        try:
+            record_path = completion.completion_record_path(
+                slice_id=slice_id,
+                candidate=candidate.lower(),
+                coordinator_root=coordinator_root,
+            )
+            payload = completion.read_completion_record(record_path)
+            return "passed", "candidate-merged", {
+                "path": str(record_path),
+                "hash": verification.canonical_json_hash(payload),
+                "payload": payload,
+            }
+        except Exception:
+            return "needs_human", "completion-record-missing", None
+    fetch_result = verification._run_git(
+        ["-C", str(repo_root), "fetch", "--no-tags", target_remote, target_branch],
+        git_runner,
+    )
+    if fetch_result["status"] != "ok":
+        return "verified", "target-fetch-failed", None
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], git_runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        return "verified", "target-ref-unreadable", None
+    ancestor = verification._run_git(
+        ["-C", str(repo_root), "merge-base", "--is-ancestor", candidate.lower(), target_sha],
+        git_runner,
+    )
+    if ancestor["status"] != "ok":
+        if ancestor["status"] == "non-zero" and ancestor["returncode"] == 1:
+            return "verified", "candidate-not-merged", None
+        return "verified", "target-ancestry-error", None
+
+    verification_path, verification_hash = _current_verification_ref(slice_row)
+    review_path, review_hash, _ = _current_review_ref(slice_row)
+    contract = slice_row.get("verification", {}).get("contract")
+    docs_class = (
+        contract.get("docs_class")
+        if isinstance(contract, dict) and isinstance(contract.get("docs_class"), str)
+        else "code"
+    )
+    review_policy = (
+        contract.get("review_policy")
+        if isinstance(contract, dict) and contract.get("review_policy") in {"required", "not-required"}
+        else ("required" if docs_class in {"normative", "code"} else "not-required")
+    )
+    if verification_path is None or verification_hash is None:
+        return "verified", "completion-missing-verification-evidence", None
+    if review_policy == "required" and (
+        not isinstance(slice_row.get("reviewer_job_id"), str)
+        or review_path is None
+        or review_hash is None
+    ):
+        try:
+            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            registry.record_action(
+                slice_id,
+                action="completion-missing-review-evaluation",
+                actor="manager",
+                state="needs_human",
+                gate_state="needs_human",
+            )
+        except Exception:
+            pass
+        return "needs_human", "completion-missing-review-evaluation", None
+    payload = {
+        "schema_version": completion.COMPLETION_SCHEMA_VERSION,
+        "slice_id": slice_id,
+        "spec_hash": str(slice_row["spec"]["hash"]),
+        "plan_hash": str(slice_row["plan"]["hash"]),
+        "verification_hash": str(slice_row["verification"]["hash"]),
+        "builder_job_id": str(slice_row["builder_job_id"]),
+        "reviewer_job_id": slice_row.get("reviewer_job_id"),
+        "dispatch_base": str(slice_row["dispatch_base"]),
+        "candidate": candidate.lower(),
+        "target_branch": target_branch,
+        "target_remote": target_remote,
+        "target_ref": target_ref,
+        "target_ref_sha": target_sha,
+        "verification_evidence_path": verification_path,
+        "verification_evidence_hash": verification_hash,
+        "review_policy": review_policy,
+        "docs_class": docs_class,
+        "review_evaluation_path": review_path,
+        "review_evaluation_hash": review_hash,
+        "completed_at": clock(),
+    }
+    try:
+        record = completion.write_completion_record(payload, coordinator_root=coordinator_root)
+    except Exception:
+        try:
+            registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            registry.record_action(
+                slice_id,
+                action="completion-record-write-failed",
+                actor="manager",
+                state="needs_human",
+                gate_state="needs_human",
+            )
+        except Exception:
+            pass
+        return "needs_human", "completion-record-write-failed", None
+    try:
+        registry.update_slice(slice_id, state="completed", gate_state="passed")
+    except Exception:
+        return "verified", "completion-state-update-failed", record
+    record_action_kwargs: dict[str, Any] = {
+        "action": "completion-recorded",
+        "actor": "manager",
+        "state": "completed",
+        "gate_state": "passed",
+        "candidate": candidate.lower(),
+        "evidence_refs": [verification_path],
+    }
+    if review_path is not None:
+        record_action_kwargs["evaluation_refs"] = [review_path]
+    try:
+        registry.record_action(slice_id, **record_action_kwargs)
+    except Exception:
+        return "verified", "completion-action-record-failed", record
+    return "passed", "candidate-merged", record
 
 
 def _review_log_has_only_json_lines(log_path: object) -> bool:
@@ -755,8 +926,42 @@ def complete_tick(
     warnings: list[dict] = []
     seen_slices: dict[str, str] = {}  # slice_id → 本輪已寫盤的 job_id（偵測同輪同 slice 雙 terminal）
 
+    meta_by_slice: dict[str, dict] = {}
+    if isinstance(metas, list):
+        for meta in metas:
+            if not isinstance(meta, dict):
+                continue
+            sid = meta.get("slice_id")
+            if isinstance(sid, str):
+                meta_by_slice[sid] = meta
+
+    def _repo_root_for_slice(slice_id: str) -> Path | None:
+        spec_path = None
+        meta = meta_by_slice.get(slice_id)
+        if isinstance(meta, dict):
+            spec_path = meta.get("spec_path")
+        if not isinstance(spec_path, str) or not spec_path:
+            try:
+                spec_path = registry.get_slice(slice_id).get("spec", {}).get("path")
+            except Exception:
+                spec_path = None
+        if not isinstance(spec_path, str) or not spec_path:
+            return None
+        return autonomy._infer_repo_root(Path(spec_path))
+
     def _ready_ids() -> set[str]:
-        return {m["slice_id"] for m in autonomy.ready_units(metas, _satisfied_pred(handoff_dir))}
+        return {
+            m["slice_id"]
+            for m in autonomy.ready_units(
+                metas,
+                lambda sid: autonomy.default_is_satisfied(
+                    sid,
+                    handoff_dir=handoff_dir,
+                    repo_root=_repo_root_for_slice(sid),
+                    git_runner=git_runner,
+                ),
+            )
+        }
 
     released_ok = metas is not None
     before_ready: set[str] = set()
@@ -809,6 +1014,7 @@ def complete_tick(
             evidence = None
             publish_evidence = False
             evaluation = None
+            completion_record = None
             gate_status = "failed" if status == "failed" else "needs_human"
             gate_reason = None
 
@@ -820,6 +1026,12 @@ def complete_tick(
                 if slice_row is None:
                     gate_status = "needs_human"
                     gate_reason = "missing-slice-proof"
+                elif slice_row.get("state") in {"verified", "completed"} and slice_row.get("gate_state") == "passed":
+                    review_path, review_hash, review_payload = _current_review_ref(slice_row)
+                    if review_payload is not None:
+                        evaluation = {"path": review_path, "hash": review_hash, "payload": review_payload}
+                    gate_status = "passed" if slice_row.get("state") == "completed" else "verified"
+                    gate_reason = "accepted"
                 else:
                     evaluation, gate_status, gate_reason = _finalize_review_job(
                         registry=registry,
@@ -878,6 +1090,9 @@ def complete_tick(
                     gate_status = "needs_human"
                     gate_reason = "missing-slice-proof"
                     publish_evidence = evidence is not None
+                elif slice_row.get("state") in {"verified", "completed"} and slice_row.get("gate_state") == "passed":
+                    gate_status = "passed" if slice_row.get("state") == "completed" else "verified"
+                    gate_reason = "accepted"
                 else:
                     try:
                         evidence = verification_runner(
@@ -948,7 +1163,22 @@ def complete_tick(
                         gate_reason = str(launch_result["gate_reason"])
                         evaluation = launch_result.get("evaluation")
 
+            if slice_row is not None:
+                gate_status, gate_reason, completion_record = _completion_candidate_ref(
+                    registry=registry,
+                    slice_row=registry.get_slice(slice_id),
+                    repo_root=repo_root,
+                    coordinator_root=coordinator_root,
+                    gate_status=gate_status,
+                    gate_reason=gate_reason,
+                    clock=clock,
+                    git_runner=git_runner,
+                )
+                slice_row = registry.get_slice(slice_id)
             verification_path, verification_hash = _current_verification_ref(slice_row)
+            review_path, review_hash, review_payload = _current_review_ref(slice_row)
+            if evaluation is None and review_payload is not None:
+                evaluation = {"path": review_path, "hash": review_hash, "payload": review_payload}
             handoff.write_manifest(
                 manifest_path,
                 {
@@ -972,6 +1202,24 @@ def complete_tick(
                     ),
                     "review_evaluation_path": evaluation["path"] if evaluation is not None else None,
                     "review_evaluation_hash": evaluation["hash"] if evaluation is not None else None,
+                    "completion_record_path": (
+                        completion_record["path"] if completion_record is not None else None
+                    ),
+                    "completion_record_hash": (
+                        completion_record["hash"] if completion_record is not None else None
+                    ),
+                    "slice_state": slice_row.get("state") if isinstance(slice_row, dict) else None,
+                    "spec_hash": (
+                        slice_row.get("spec", {}).get("hash") if isinstance(slice_row, dict) else None
+                    ),
+                    "plan_hash": (
+                        slice_row.get("plan", {}).get("hash") if isinstance(slice_row, dict) else None
+                    ),
+                    "verification_hash": (
+                        slice_row.get("verification", {}).get("hash")
+                        if isinstance(slice_row, dict)
+                        else None
+                    ),
                     "completed_at": clock(),
                 },
             )
@@ -1053,7 +1301,13 @@ def run_tick(
         fanout_metas = [m for m in metas if m.get("slice_id") not in active]
         try:
             dispatched = autonomy.dispatch_ready(
-                fanout_metas, satisfied, dispatcher, persona=persona, launcher=launcher
+                fanout_metas,
+                satisfied,
+                dispatcher,
+                persona=persona,
+                launcher=launcher,
+                git_runner=getattr(dispatcher, "_git_runner", None),
+                handoff_dir=handoff_dir,
             )
         except (
             autonomy.DispatchReadyError,
