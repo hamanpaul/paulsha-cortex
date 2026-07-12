@@ -56,6 +56,45 @@ class CliCompleteTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertIn("manager daemon", err.getvalue())
 
+    def test_complete_subcommand_forwards_review_identity(self) -> None:
+        submitted: list[tuple[str, dict, str]] = []
+
+        def fake_submit(req_type: str, args: dict, requested_by: str) -> str:
+            submitted.append((req_type, dict(args), requested_by))
+            return "req-complete-2"
+
+        with redirect_stdout(io.StringIO()):
+            rc = cli.main(
+                [
+                    "complete",
+                    "--handoff-dir",
+                    "runtime/handoff",
+                    "--review-executor",
+                    "codex",
+                    "--review-model",
+                    "gpt-5.4",
+                ],
+                control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                control_submit_request=fake_submit,
+                control_poll_done=lambda *_args, **_kwargs: {"status": "ok", "result": {"completed": []}},
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            submitted,
+            [
+                (
+                    "complete",
+                    {
+                        "handoff_dir": "runtime/handoff",
+                        "review_executor": "codex",
+                        "review_model": "gpt-5.4",
+                    },
+                    "coordinator-cli",
+                )
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

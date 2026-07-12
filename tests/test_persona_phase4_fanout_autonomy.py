@@ -121,7 +121,7 @@ class _RecordingLauncher:
 
         self.calls.append({"slice_id": slice_id, "prompt": prompt, "worktree": worktree})
         return LaunchHandle(
-            executor="copilot", session_name=slice_id, pid=100 + len(self.calls),
+            executor="copilot", model_id=None, session_name=slice_id, pid=100 + len(self.calls),
             log_path=f"{log_dir}/{slice_id}.jsonl",
         )
 
@@ -586,7 +586,7 @@ class FanoutTests(unittest.TestCase):
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 calls.append({"slice_id": slice_id, "prompt": prompt, "worktree": worktree})
                 from paulsha_cortex.coordinator.launcher import LaunchHandle
-                return LaunchHandle(executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
+                return LaunchHandle(executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
 
         metas = [_meta("slice-a", plan="docs/p.md")]
         dispatch_ready(
@@ -625,7 +625,7 @@ class FanoutTests(unittest.TestCase):
 
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 self.calls.append({"slice_id": slice_id, "worktree": worktree, "log_dir": log_dir})
-                return LaunchHandle(executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
+                return LaunchHandle(executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
 
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
@@ -670,7 +670,7 @@ class FanoutTests(unittest.TestCase):
                 self.calls.append(slice_id)
                 if slice_id == "slice-a":
                     raise RuntimeError("executor missing")
-                return LaunchHandle(executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
+                return LaunchHandle(executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
 
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
@@ -721,7 +721,7 @@ class FanoutTests(unittest.TestCase):
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 self.rows_at_launch = [j["task"] for j in self.reg.list_jobs()]
                 return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x"
+                    executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x"
                 )
 
         with tempfile.TemporaryDirectory() as d:
@@ -791,7 +791,7 @@ class FanoutTests(unittest.TestCase):
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 self.calls.append(slice_id)
                 return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=200 + len(self.calls),
+                    executor="copilot", model_id=None, session_name=slice_id, pid=200 + len(self.calls),
                     log_path=f"{log_dir}/{slice_id}.jsonl",
                 )
 

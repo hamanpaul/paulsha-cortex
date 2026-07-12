@@ -493,6 +493,7 @@ def _record_launching_job(
     return registry.create_job(
         task=slice_id,
         persona=persona,
+        kind="build",
         branch=_branch_for_slice(slice_id),
         pane="",
         worktree=worktree,
@@ -599,6 +600,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
     return registry.attach_launch_handle(
         job["job_id"],
         executor=handle.executor,
+        model_id=handle.model_id,
         session_name=handle.session_name,
         pid=handle.pid,
         log_path=handle.log_path,

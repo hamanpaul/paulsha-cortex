@@ -41,22 +41,36 @@ class FakeRegistry:
         pid: int | None = None,
         log_path: str | None = None,
         exit_code: int | None = None,
+        kind: str = "build",
+        model_id: str | None = None,
+        independence_domain: str | None = None,
+        subject_head: str | None = None,
+        spec_hash: str | None = None,
+        plan_hash: str | None = None,
+        verification_hash: str | None = None,
     ) -> dict:
         self._seq += 1
         job = {
             "job_id": f"{task}-{self._seq}",
             "task": task,
             "persona": persona,
+            "kind": kind,
             "branch": branch,
             "pane": pane,
             "worktree": worktree,
             "status": "dispatched",
             "dispatch_head": dispatch_head,
             "executor": executor,
+            "model_id": model_id,
+            "independence_domain": independence_domain,
             "session_name": session_name,
             "pid": pid,
             "log_path": log_path,
             "exit_code": exit_code,
+            "subject_head": subject_head,
+            "spec_hash": spec_hash,
+            "plan_hash": plan_hash,
+            "verification_hash": verification_hash,
         }
         self._jobs.append(job)
         return dict(job)
@@ -66,6 +80,7 @@ class FakeRegistry:
         job_id: str,
         *,
         executor: str | None = None,
+        model_id: str | None = None,
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
@@ -73,6 +88,8 @@ class FakeRegistry:
         for job in self._jobs:
             if job["job_id"] == job_id:
                 job["executor"] = executor
+                if model_id is not None:
+                    job["model_id"] = model_id
                 job["session_name"] = session_name
                 job["pid"] = pid
                 job["log_path"] = log_path
@@ -187,6 +204,7 @@ class RecordingLauncher:
         )
         return LaunchHandle(
             executor="copilot",
+            model_id=None,
             session_name=slice_id,
             pid=1000 + len(self.calls),
             log_path=f"{log_dir}/{slice_id}.jsonl",
@@ -1183,9 +1201,98 @@ def test_complete_request_without_specs_dir_skips_spec_scan(monkeypatch, tmp_pat
     )
 
     done = contract.read_json(constants.done_dir() / f"{req_id}.json")
-
     assert done["status"] == "ok"
     assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "needs_human"}]
+
+
+def test_complete_request_forwards_review_identity(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090011Z-88888888888888888888888888888888"
+    _write_request(
+        req_id,
+        type="complete",
+        args={
+            "handoff_dir": str(tmp_path / "handoff"),
+            "review_executor": "codex",
+            "review_model": "gpt-5.4",
+        },
+    )
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    captured: dict[str, object] = {}
+
+    def fake_complete_tick(dispatcher_arg, **kwargs):
+        captured["dispatcher"] = dispatcher_arg
+        captured.update(kwargs)
+        return {"completed": [], "errors": [], "warnings": []}
+
+    monkeypatch.setattr(manager_daemon.manager, "complete_tick", fake_complete_tick)
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+    )
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    assert captured["dispatcher"] is dispatcher
+    assert captured["review_executor"] == "codex"
+    assert captured["review_model"] == "gpt-5.4"
+
+
+def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path):
+    dispatcher = FakeDispatcher(FakeRegistry())
+    launcher = object()
+    calls: list[dict[str, object]] = []
+
+    def fake_run_tick(
+        dispatcher_arg,
+        *,
+        metas,
+        launcher,
+        persona,
+        is_satisfied,
+        handoff_dir,
+        require_idle,
+        max_load,
+        reaper,
+    ) -> dict:
+        calls.append({"dispatcher": dispatcher_arg, "launcher": launcher})
+        return {"dispatch_skipped": False, "dispatched": [], "completed": [], "errors": [], "reaped": None}
+
+    captured: list[dict[str, object]] = []
+
+    def fake_resolve(executor, injected, *, allow_unsafe, model):
+        captured.append({"executor": executor, "model": model})
+        return injected
+
+    monkeypatch.setattr(manager_daemon, "_resolve_launcher", fake_resolve)
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=launcher,
+        default_executor="copilot",
+        default_model="claude-haiku-4.5",
+        run_tick_fn=fake_run_tick,
+        scan_specs_fn=lambda specs_dir: [],
+    )
+
+    runner()
+
+    assert calls and calls[0]["dispatcher"] is dispatcher
+    assert captured[0] == {"executor": "copilot", "model": "claude-haiku-4.5"}
 
 
 def test_dispatch_no_plan(monkeypatch, tmp_path):

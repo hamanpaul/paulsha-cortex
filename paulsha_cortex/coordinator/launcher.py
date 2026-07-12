@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 @dataclass(frozen=True)
 class LaunchHandle:
     executor: str
+    model_id: str | None
     session_name: str
     pid: int
     log_path: str
@@ -201,6 +202,7 @@ class SubprocessLauncher:
             )
         return LaunchHandle(
             executor=self._executor,
+            model_id=self._model,
             session_name=slice_id,
             pid=proc.pid,
             log_path=log_path,

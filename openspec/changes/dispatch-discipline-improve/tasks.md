@@ -27,9 +27,9 @@
 
 ## 5. Foreign exact-HEAD review
 
-- [ ] 5.1 RED-test explicit model identity mapping, different-domain selection, detached exact Candidate checkout and verdict provenance.
-- [ ] 5.2 Implement reviewer Jobs, immutable GateEvaluations and cortex-owned blocking-category classification.
-- [ ] 5.3 Pass same-domain, unknown identity, stale HEAD, malformed verdict, blocking and non-blocking review cases.
+- [x] 5.1 RED-test explicit model identity mapping, different-domain selection, detached exact Candidate checkout and verdict provenance.
+- [x] 5.2 Implement reviewer Jobs, immutable GateEvaluations and cortex-owned blocking-category classification.
+- [x] 5.3 Pass same-domain, unknown identity, stale HEAD, malformed verdict, blocking and non-blocking review cases.
 
 ## 6. Artifact-aware dependency release
 

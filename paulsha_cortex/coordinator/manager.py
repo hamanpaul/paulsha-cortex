@@ -10,6 +10,7 @@ from typing import Callable, Protocol
 from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
+from . import review as foreign_review
 from . import verification
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
@@ -99,6 +100,18 @@ def _slice_for_job(registry, slice_id: str, job_id: str) -> dict | None:
     except KeyError:
         return None
     if slice_row.get("builder_job_id") != job_id:
+        return None
+    return slice_row
+
+
+def _slice_for_reviewer_job(registry, slice_id: str, job_id: str) -> dict | None:
+    if registry is None:
+        return None
+    try:
+        slice_row = registry.get_slice(slice_id)
+    except KeyError:
+        return None
+    if slice_row.get("reviewer_job_id") != job_id:
         return None
     return slice_row
 
@@ -258,6 +271,463 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
     )
 
 
+def _identity_registry() -> dict[tuple[str, str], dict[str, str]]:
+    return foreign_review.load_model_identity_registry()
+
+
+def _builder_launch_identity(job: dict, identity_registry: dict[tuple[str, str], dict[str, str]] | None = None) -> dict | None:
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    domain = job.get("independence_domain")
+    if isinstance(executor, str) and isinstance(model_id, str) and isinstance(domain, str) and domain:
+        return {"executor": executor, "model_id": model_id, "independence_domain": domain}
+    if identity_registry is None:
+        return None
+    if not isinstance(executor, str) or not isinstance(model_id, str):
+        return None
+    return identity_registry.get((executor, model_id))
+
+
+def _reviewer_launch_identity(job: dict) -> dict | None:
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    domain = job.get("independence_domain")
+    if not (isinstance(executor, str) and isinstance(model_id, str) and isinstance(domain, str) and domain):
+        return None
+    return {"executor": executor, "model_id": model_id, "independence_domain": domain}
+
+
+def _current_verification_ref(slice_row: dict | None) -> tuple[str | None, str | None]:
+    if not isinstance(slice_row, dict):
+        return None, None
+    refs = slice_row.get("current_evidence_refs")
+    if not isinstance(refs, list) or not refs:
+        return None, None
+    path = refs[0]
+    if not isinstance(path, str):
+        return None, None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        normalized = verification.validate_verification_evidence(payload)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return path, None
+    return path, verification.canonical_json_hash(normalized)
+
+
+def _review_log_has_only_json_lines(log_path: object) -> bool:
+    if not isinstance(log_path, str) or not log_path:
+        return True
+    path = Path(log_path)
+    if not path.is_file():
+        return True
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            return False
+    return True
+
+
+def _apply_review_evaluation(registry, slice_id: str, evaluation: dict) -> None:
+    payload = evaluation["payload"]
+    state = payload["state"]
+    gate_state = {"passed": "passed", "rejected": "failed", "absent": "needs_human"}[state]
+    slice_state = "verified" if state == "passed" else "needs_human"
+    action = {
+        "passed": "foreign-review-passed",
+        "rejected": "foreign-review-rejected",
+        "absent": "foreign-review-absent",
+    }[state]
+    registry.record_action(
+        slice_id,
+        action=action,
+        actor="manager",
+        state=slice_state,
+        gate_state=gate_state,
+        evaluation_refs=[evaluation["path"]],
+        candidate=payload["candidate"],
+    )
+
+
+def _write_gate_evaluation(
+    *,
+    slice_id: str,
+    state: str,
+    reason: str,
+    builder_job_id: str,
+    reviewer_job_id: str | None,
+    candidate: str,
+    builder_identity: dict | None,
+    reviewer_identity: dict | None,
+    findings: list[dict] | None,
+    coordinator_root: Path | None,
+) -> dict:
+    payload = foreign_review.build_gate_evaluation(
+        slice_id=slice_id,
+        state=state,
+        reason=reason,
+        builder_job_id=builder_job_id,
+        reviewer_job_id=reviewer_job_id,
+        candidate=candidate,
+        launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
+        findings=findings,
+    )
+    return foreign_review.write_gate_evaluation(payload, coordinator_root=coordinator_root)
+
+
+def _review_inputs_drifted(slice_row: dict, review_job: dict) -> bool:
+    if slice_row.get("candidate") != review_job.get("subject_head"):
+        return True
+    return any(
+        slice_row[key]["hash"] != review_job.get(f"{key}_hash")
+        for key in ("spec", "plan")
+    ) or slice_row["verification"]["hash"] != review_job.get("verification_hash")
+
+
+def _launch_foreign_review(
+    *,
+    registry,
+    slice_row: dict,
+    builder_job: dict,
+    repo_root: Path,
+    coordinator_root: Path | None,
+    candidate: str,
+    subprocess_runner,
+    git_runner,
+    review_launcher,
+    review_executor: str | None,
+    review_model: str | None,
+) -> dict[str, Any]:
+    builder_job_id = str(builder_job["job_id"])
+    slice_id = str(slice_row["slice_id"])
+    builder_identity = None
+    try:
+        tier = foreign_review.read_repo_tier(repo_root)
+        identity_registry = _identity_registry()
+    except Exception as exc:
+        builder_identity = _builder_launch_identity(builder_job)
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="config-error",
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=None,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": f"foreign-review-config-error:{exc}",
+            "evaluation": evaluation,
+        }
+    decision = foreign_review.select_foreign_reviewer(
+        registry=identity_registry,
+        builder_executor=builder_job.get("executor"),
+        builder_model_id=builder_job.get("model_id"),
+        review_executor=review_executor,
+        review_model_id=review_model,
+        tier=tier,
+    )
+    builder_identity = decision.get("builder") or _builder_launch_identity(builder_job, identity_registry)
+    reviewer_identity = decision.get("reviewer")
+    if decision["state"] == "needs_human":
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason=str(decision["reason"]),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": str(decision["reason"]),
+            "evaluation": evaluation,
+        }
+    if decision["state"] == "absent":
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason=str(decision["reason"]),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": "foreign-review-absent",
+            "evaluation": evaluation,
+        }
+    if review_launcher is None:
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="launcher-missing",
+            builder_job_id=builder_job_id,
+            reviewer_job_id=None,
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": "foreign-review-launcher-missing",
+            "evaluation": evaluation,
+        }
+    reviewer_job = registry.create_job(
+        task=slice_id,
+        persona="reviewer",
+        kind="review",
+        branch=str(builder_job.get("branch") or f"feature/{slice_id}"),
+        pane="",
+        worktree="",
+        dispatch_head=slice_row.get("dispatch_base"),
+        executor=review_executor,
+        model_id=review_model,
+        independence_domain=reviewer_identity["independence_domain"] if reviewer_identity else None,
+        subject_head=candidate,
+        spec_hash=slice_row["spec"]["hash"],
+        plan_hash=slice_row["plan"]["hash"],
+        verification_hash=slice_row["verification"]["hash"],
+    )
+    try:
+        review_worktree = foreign_review.prepare_review_worktree(
+            repo_root=repo_root,
+            slice_id=slice_id,
+            reviewer_job_id=reviewer_job["job_id"],
+            candidate=candidate,
+            subprocess_runner=subprocess_runner,
+            git_runner=git_runner,
+        )
+        registry.update_job(reviewer_job["job_id"], worktree=str(review_worktree))
+        prompt = foreign_review.build_review_prompt(
+            slice_id=slice_id,
+            plan_path=slice_row["plan"]["path"],
+            verdict_path=str(foreign_review.review_verdict_path(review_worktree)),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=reviewer_job["job_id"],
+            candidate=candidate,
+            launch_identity=reviewer_identity,
+        )
+        handle = review_launcher.launch(
+            slice_id=reviewer_job["job_id"],
+            prompt=prompt,
+            worktree=str(review_worktree),
+            log_dir=str(Path("runtime/review") / slice_id),
+        )
+        registry.attach_launch_handle(
+            reviewer_job["job_id"],
+            executor=handle.executor,
+            model_id=handle.model_id,
+            session_name=handle.session_name,
+            pid=handle.pid,
+            log_path=handle.log_path,
+        )
+        registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
+        registry.record_action(
+            slice_id,
+            action="foreign-review-dispatched",
+            actor="manager",
+            state="reviewing",
+            gate_state="pending",
+            candidate=candidate,
+        )
+        return {"launched": True, "reviewer_job_id": reviewer_job["job_id"]}
+    except Exception as exc:
+        try:
+            registry.update_status(reviewer_job["job_id"], "failed")
+        except Exception:
+            pass
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="launch-error",
+            builder_job_id=builder_job_id,
+            reviewer_job_id=reviewer_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return {
+            "launched": False,
+            "gate_status": "needs_human",
+            "gate_reason": f"foreign-review-launch-error:{exc}",
+            "evaluation": evaluation,
+        }
+
+
+def _finalize_review_job(
+    *,
+    registry,
+    slice_row: dict,
+    review_job: dict,
+    coordinator_root: Path | None,
+    identity_registry: dict[tuple[str, str], dict[str, str]] | None,
+    git_runner,
+) -> tuple[dict | None, str, str]:
+    slice_id = str(slice_row["slice_id"])
+    builder_job = registry.get_job(slice_row["builder_job_id"])
+    candidate = str(review_job.get("subject_head") or slice_row.get("candidate") or "")
+    builder_identity = _builder_launch_identity(builder_job, identity_registry)
+    reviewer_identity = _reviewer_launch_identity(review_job)
+    if _review_inputs_drifted(slice_row, review_job):
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="stale-input",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        registry.record_action(
+            slice_id,
+            action="foreign-review-stale-input",
+            actor="manager",
+            state="needs_human",
+            gate_state="needs_human",
+            evaluation_refs=[evaluation["path"]],
+            candidate=slice_row.get("candidate"),
+        )
+        registry.update_slice(slice_id, current_evaluation_refs=[], state="needs_human", gate_state="needs_human")
+        return evaluation, "needs_human", "stale-input"
+    if review_job.get("status") == "failed":
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="reviewer-process-failed",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    worktree = Path(str(review_job["worktree"]))
+    review_head = verification._run_git(["-C", str(worktree), "rev-parse", "HEAD"], git_runner)
+    if review_head["status"] != "ok" or review_head["stdout"].strip().lower() != candidate.lower():
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="stale-head",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    if not _review_log_has_only_json_lines(review_job.get("log_path")):
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="invalid-process-output",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    verdict_path = foreign_review.review_verdict_path(worktree)
+    if not verdict_path.is_file():
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="verdict-missing",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    try:
+        verdict = foreign_review.read_review_verdict_file(
+            verdict_path,
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            launch_identity=reviewer_identity,
+        )
+    except Exception:
+        evaluation = _write_gate_evaluation(
+            slice_id=slice_id,
+            state="absent",
+            reason="invalid-verdict",
+            builder_job_id=builder_job["job_id"],
+            reviewer_job_id=review_job["job_id"],
+            candidate=candidate,
+            builder_identity=builder_identity,
+            reviewer_identity=reviewer_identity,
+            findings=[],
+            coordinator_root=coordinator_root,
+        )
+        _apply_review_evaluation(registry, slice_id, evaluation)
+        return evaluation, "needs_human", "foreign-review-absent"
+    reason = "blocking-findings" if verdict["state"] == "rejected" else "accepted"
+    evaluation = _write_gate_evaluation(
+        slice_id=slice_id,
+        state=verdict["state"],
+        reason=reason,
+        builder_job_id=builder_job["job_id"],
+        reviewer_job_id=review_job["job_id"],
+        candidate=candidate,
+        builder_identity=builder_identity,
+        reviewer_identity=reviewer_identity,
+        findings=verdict["findings"],
+        coordinator_root=coordinator_root,
+    )
+    _apply_review_evaluation(registry, slice_id, evaluation)
+    gate_status = "passed" if verdict["state"] == "passed" else "failed"
+    return evaluation, gate_status, reason
+
+
 def complete_tick(
     dispatcher,
     *,
@@ -268,6 +738,9 @@ def complete_tick(
     git_runner=None,
     subprocess_runner=None,
     verification_runner=None,
+    review_launcher=None,
+    review_executor: str | None = None,
+    review_model: str | None = None,
 ) -> dict:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -320,7 +793,12 @@ def complete_tick(
             if _existing_manifest_job_id(manifest_path) == job_id:
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
-            slice_row = _slice_for_job(registry, slice_id, job_id)
+            if job.get("kind") == "review":
+                slice_row = _slice_for_reviewer_job(registry, slice_id, job_id)
+            else:
+                slice_row = _slice_for_job(registry, slice_id, job_id)
+                if slice_row is not None and slice_row.get("reviewer_job_id"):
+                    continue
             repo_root = (
                 autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
                 if slice_row is not None
@@ -330,80 +808,33 @@ def complete_tick(
             coordinator_root = Path(state_path).parent if state_path is not None else None
             evidence = None
             publish_evidence = False
+            evaluation = None
             gate_status = "failed" if status == "failed" else "needs_human"
             gate_reason = None
 
-            if slice_row is not None:
-                mismatches = _pinned_input_mismatches(slice_row)
-            else:
-                mismatches = []
-
-            if mismatches:
-                gate_status = "needs_human"
-                gate_reason = "pinned-input-mismatch"
+            if job.get("kind") == "review":
                 try:
-                    evidence = _write_status_evidence(
-                        slice_row=slice_row,
-                        job=job,
-                        repo_root=repo_root,
-                        coordinator_root=coordinator_root,
-                        git_runner=git_runner,
-                        status="needs_human",
-                        summary="pinned-input-mismatch",
-                        details={"mismatches": mismatches},
-                    )
-                    if evidence is not None:
-                        _apply_verification_result(registry, slice_id, evidence)
-                        publish_evidence = True
-                    else:
-                        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                    identity_registry = _identity_registry()
                 except Exception:
-                    try:
-                        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
-                    except Exception:
-                        pass
-            elif status == "failed":
-                gate_status = "failed"
-                gate_reason = "builder-failed"
-                if slice_row is not None:
-                    try:
-                        registry.update_slice(slice_id, state="failed", gate_state="failed")
-                    except Exception:
-                        pass
-            elif slice_row is None:
-                evidence = _write_status_evidence(
-                    slice_row=None,
-                    job=job,
-                    repo_root=repo_root,
-                    coordinator_root=coordinator_root,
-                    git_runner=git_runner,
-                    status="needs_human",
-                    summary="missing-slice-proof",
-                    details={"reason": "builder exited without pinned slice verification contract"},
-                )
-                gate_status = "needs_human"
-                gate_reason = "missing-slice-proof"
-                publish_evidence = evidence is not None
-            else:
-                try:
-                    evidence = verification_runner(
-                        slice_row=slice_row,
-                        job=job,
-                        repo_root=repo_root,
-                        coordinator_root=coordinator_root,
-                        git_runner=git_runner,
-                        subprocess_runner=subprocess_runner,
-                    )
-                    evidence = _validate_result_evidence(
-                        evidence=evidence,
-                        slice_id=slice_id,
-                        coordinator_root=coordinator_root,
-                    )
-                    gate_status = evidence["payload"]["status"]
-                    gate_reason = evidence["payload"]["summary"]
-                except Exception as exc:
+                    identity_registry = None
+                if slice_row is None:
                     gate_status = "needs_human"
-                    gate_reason = "verification-runner-error"
+                    gate_reason = "missing-slice-proof"
+                else:
+                    evaluation, gate_status, gate_reason = _finalize_review_job(
+                        registry=registry,
+                        slice_row=slice_row,
+                        review_job=job,
+                        coordinator_root=coordinator_root,
+                        identity_registry=identity_registry,
+                        git_runner=git_runner,
+                    )
+            else:
+                mismatches = _pinned_input_mismatches(slice_row) if slice_row is not None else []
+
+                if mismatches:
+                    gate_status = "needs_human"
+                    gate_reason = "pinned-input-mismatch"
                     try:
                         evidence = _write_status_evidence(
                             slice_row=slice_row,
@@ -412,8 +843,8 @@ def complete_tick(
                             coordinator_root=coordinator_root,
                             git_runner=git_runner,
                             status="needs_human",
-                            summary="verification-runner-error",
-                            details={"error": str(exc)},
+                            summary="pinned-input-mismatch",
+                            details={"mismatches": mismatches},
                         )
                         if evidence is not None:
                             _apply_verification_result(registry, slice_id, evidence)
@@ -425,15 +856,99 @@ def complete_tick(
                             registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
                         except Exception:
                             pass
+                elif status == "failed":
+                    gate_status = "failed"
+                    gate_reason = "builder-failed"
+                    if slice_row is not None:
+                        try:
+                            registry.update_slice(slice_id, state="failed", gate_state="failed")
+                        except Exception:
+                            pass
+                elif slice_row is None:
+                    evidence = _write_status_evidence(
+                        slice_row=None,
+                        job=job,
+                        repo_root=repo_root,
+                        coordinator_root=coordinator_root,
+                        git_runner=git_runner,
+                        status="needs_human",
+                        summary="missing-slice-proof",
+                        details={"reason": "builder exited without pinned slice verification contract"},
+                    )
+                    gate_status = "needs_human"
+                    gate_reason = "missing-slice-proof"
+                    publish_evidence = evidence is not None
                 else:
                     try:
-                        _apply_verification_result(registry, slice_id, evidence)
-                        publish_evidence = True
-                    except Exception:
+                        evidence = verification_runner(
+                            slice_row=slice_row,
+                            job=job,
+                            repo_root=repo_root,
+                            coordinator_root=coordinator_root,
+                            git_runner=git_runner,
+                            subprocess_runner=subprocess_runner,
+                        )
+                        evidence = _validate_result_evidence(
+                            evidence=evidence,
+                            slice_id=slice_id,
+                            coordinator_root=coordinator_root,
+                        )
+                        gate_status = evidence["payload"]["status"]
+                        gate_reason = evidence["payload"]["summary"]
+                    except Exception as exc:
                         gate_status = "needs_human"
-                        gate_reason = "verification-state-update-error"
-                        publish_evidence = False
+                        gate_reason = "verification-runner-error"
+                        try:
+                            evidence = _write_status_evidence(
+                                slice_row=slice_row,
+                                job=job,
+                                repo_root=repo_root,
+                                coordinator_root=coordinator_root,
+                                git_runner=git_runner,
+                                status="needs_human",
+                                summary="verification-runner-error",
+                                details={"error": str(exc)},
+                            )
+                            if evidence is not None:
+                                _apply_verification_result(registry, slice_id, evidence)
+                                publish_evidence = True
+                            else:
+                                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                        except Exception:
+                            try:
+                                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            _apply_verification_result(registry, slice_id, evidence)
+                            publish_evidence = True
+                        except Exception:
+                            gate_status = "needs_human"
+                            gate_reason = "verification-state-update-error"
+                            publish_evidence = False
 
+                    if gate_status == "reviewing" and slice_row is not None:
+                        launch_result = _launch_foreign_review(
+                            registry=registry,
+                            slice_row=registry.get_slice(slice_id),
+                            builder_job=registry.get_job(job_id),
+                            repo_root=repo_root,
+                            coordinator_root=coordinator_root,
+                            candidate=evidence["payload"]["candidate"],
+                            subprocess_runner=subprocess_runner,
+                            git_runner=git_runner,
+                            review_launcher=review_launcher,
+                            review_executor=review_executor,
+                            review_model=review_model,
+                        )
+                        if launch_result.get("launched"):
+                            continue
+                        gate_status = str(launch_result["gate_status"])
+                        gate_reason = str(launch_result["gate_reason"])
+                        evaluation = launch_result.get("evaluation")
+
+            verification_path, verification_hash = _current_verification_ref(slice_row)
             handoff.write_manifest(
                 manifest_path,
                 {
@@ -444,13 +959,19 @@ def complete_tick(
                     "exit_code": job.get("exit_code"),
                     "branch": job.get("branch"),
                     "gate_reason": gate_reason,
-                    "gate_verdict": evidence["payload"] if publish_evidence and evidence is not None else None,
+                    "gate_verdict": (
+                        evaluation["payload"]
+                        if evaluation is not None
+                        else (evidence["payload"] if publish_evidence and evidence is not None else None)
+                    ),
                     "verification_evidence_path": (
-                        evidence["path"] if publish_evidence and evidence is not None else None
+                        evidence["path"] if publish_evidence and evidence is not None else verification_path
                     ),
                     "verification_evidence_hash": (
-                        evidence["hash"] if publish_evidence and evidence is not None else None
+                        evidence["hash"] if publish_evidence and evidence is not None else verification_hash
                     ),
+                    "review_evaluation_path": evaluation["path"] if evaluation is not None else None,
+                    "review_evaluation_hash": evaluation["hash"] if evaluation is not None else None,
                     "completed_at": clock(),
                 },
             )
@@ -487,6 +1008,7 @@ def run_tick(
     *,
     metas: list[dict],
     launcher=None,
+    review_launcher=None,
     persona: str = "builder",
     is_satisfied=None,
     gate_runner: GateRunner | None = None,
@@ -496,6 +1018,8 @@ def run_tick(
     idle_probe: Callable[[], tuple] = os.getloadavg,
     clock: Callable[[], str] = _utcnow,
     reaper: Callable[[], dict] | None = None,
+    review_executor: str | None = None,
+    review_model: str | None = None,
 ) -> dict:
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
@@ -538,7 +1062,14 @@ def run_tick(
         ) as exc:
             errors.append({"stage": "fanout", "error": str(exc)})
     complete = complete_tick(
-        dispatcher, gate_runner=gate_runner, handoff_dir=handoff_dir, metas=metas, clock=clock
+        dispatcher,
+        gate_runner=gate_runner,
+        handoff_dir=handoff_dir,
+        metas=metas,
+        clock=clock,
+        review_launcher=review_launcher,
+        review_executor=review_executor,
+        review_model=review_model,
     )
     # 收尾 janitor（issue #161）：回收孤兒 codex broker。失敗一律不破壞 tick——
     # 收進 errors（stage=reap），狀態放 summary["reaped"]。

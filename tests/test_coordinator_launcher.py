@@ -319,6 +319,33 @@ class ArgvTests(unittest.TestCase):
             argv = build(prompt="P", slice_id="s", log_dir="/lg")
             self.assertNotIn("--model", argv, msg=build.__name__)
 
+    def test_launch_handle_records_explicit_model_id(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 654
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                handle = SubprocessLauncher("codex", model="gpt-5.4").launch(
+                    slice_id="slice-review",
+                    prompt="PROMPT",
+                    worktree=d,
+                    log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(handle.executor, "codex")
+        self.assertEqual(handle.model_id, "gpt-5.4")
+        self.assertEqual(calls[0]["env"]["PSC_SLICE_ID"], "slice-review")
+
     def test_claude_codex_argv_model(self) -> None:
         ca = build_claude_argv(prompt="P", slice_id="s", log_dir="/lg", model="opus")
         self.assertEqual(ca[ca.index("--model") + 1], "opus")

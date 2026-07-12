@@ -478,6 +478,36 @@ class HeadlessRegistryFieldsTests(unittest.TestCase):
             self.assertEqual(job["exit_code"], 0)
             self.assertEqual(reg.get_job("slice-a-1")["executor"], "copilot")
 
+    def test_update_job_updates_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="%0",
+                worktree="/wt/slice-a",
+            )
+
+            updated = reg.update_job("slice-a-1", worktree="/wt/slice-a-review")
+
+            self.assertEqual(updated["worktree"], "/wt/slice-a-review")
+            self.assertEqual(reg.get_job("slice-a-1")["worktree"], "/wt/slice-a-review")
+
+    def test_update_job_rejects_empty_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="%0",
+                worktree="/wt/slice-a",
+            )
+
+            with self.assertRaisesRegex(ValueError, "worktree"):
+                reg.update_job("slice-a-1", worktree="")
+
     def test_update_headless_result_rejects_invalid_status_zh_tw(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")

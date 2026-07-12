@@ -233,6 +233,9 @@ def build_request_executor(
     launcher=None,
     default_persona: str = DEFAULT_PERSONA,
     default_executor: str = DEFAULT_EXECUTOR,
+    default_model: str | None = None,
+    default_review_executor: str | None = None,
+    default_review_model: str | None = None,
     default_max_load: float = DEFAULT_MAX_LOAD,
     reaper=None,
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
@@ -246,12 +249,32 @@ def build_request_executor(
         predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=request_handoff_dir)
         allow_unsafe = bool(args.get("allow_unsafe", False))
         persona = args.get("persona", default_persona)
+        requested_model = args.get("model", default_model)
+        requested_review_executor = args.get("review_executor", default_review_executor)
+        requested_review_model = args.get("review_model", default_review_model)
+        active_review_launcher = _resolve_launcher(
+            requested_review_executor,
+            launcher,
+            allow_unsafe=allow_unsafe,
+            model=requested_review_model,
+        )
         if request["type"] == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
+            complete_kwargs = {
+                "handoff_dir": request_handoff_dir,
+                "metas": complete_metas,
+            }
+            if requested_review_executor is not None or requested_review_model is not None:
+                complete_kwargs.update(
+                    {
+                        "review_launcher": active_review_launcher,
+                        "review_executor": requested_review_executor,
+                        "review_model": requested_review_model,
+                    }
+                )
             return manager.complete_tick(
                 dispatcher,
-                handoff_dir=request_handoff_dir,
-                metas=complete_metas,
+                **complete_kwargs,
             )
         metas = scan_specs_fn(request_specs_dir)
         if request["type"] == "dispatch":
@@ -287,7 +310,7 @@ def build_request_executor(
                 args.get("executor", default_executor),
                 launcher,
                 allow_unsafe=allow_unsafe,
-                model=args.get("model"),
+                model=requested_model,
             )
             dispatched = dispatch_ready_fn(
                 [{**target, "dispatch": "auto"}],
@@ -320,7 +343,7 @@ def build_request_executor(
             args.get("executor", default_executor),
             launcher,
             allow_unsafe=allow_unsafe,
-            model=args.get("model"),
+            model=requested_model,
         )
         if request["type"] == "fanout":
             jobs = dispatch_ready_fn(
@@ -337,16 +360,27 @@ def build_request_executor(
                 "errors": [],
                 "reaped": None,
             }
+        run_tick_kwargs = {
+            "metas": metas,
+            "launcher": active_launcher,
+            "persona": persona,
+            "is_satisfied": predicate,
+            "handoff_dir": request_handoff_dir,
+            "require_idle": bool(args.get("require_idle", False)),
+            "max_load": float(args.get("max_load", default_max_load)),
+            "reaper": reaper,
+        }
+        if requested_review_executor is not None or requested_review_model is not None:
+            run_tick_kwargs.update(
+                {
+                    "review_launcher": active_review_launcher,
+                    "review_executor": requested_review_executor,
+                    "review_model": requested_review_model,
+                }
+            )
         return run_tick_fn(
             dispatcher,
-            metas=metas,
-            launcher=active_launcher,
-            persona=persona,
-            is_satisfied=predicate,
-            handoff_dir=request_handoff_dir,
-            require_idle=bool(args.get("require_idle", False)),
-            max_load=float(args.get("max_load", default_max_load)),
-            reaper=reaper,
+            **run_tick_kwargs,
         )
 
     return execute
@@ -360,10 +394,13 @@ def build_periodic_tick_runner(
     launcher=None,
     default_persona: str = DEFAULT_PERSONA,
     default_executor: str = DEFAULT_EXECUTOR,
+    default_model: str | None = None,
     default_allow_unsafe: bool = False,
     default_max_load: float = DEFAULT_MAX_LOAD,
     require_idle: bool = True,
     reaper=None,
+    default_review_executor: str | None = None,
+    default_review_model: str | None = None,
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
 ) -> Callable[[], dict[str, Any]]:
@@ -376,19 +413,33 @@ def build_periodic_tick_runner(
             default_executor,
             launcher,
             allow_unsafe=default_allow_unsafe,
-            model=None,
+            model=default_model,
         )
-        return run_tick_fn(
-            dispatcher,
-            metas=metas,
-            launcher=active_launcher,
-            persona=default_persona,
-            is_satisfied=predicate,
-            handoff_dir=handoff_dir,
-            require_idle=require_idle,
-            max_load=default_max_load,
-            reaper=reaper,
+        active_review_launcher = _resolve_launcher(
+            default_review_executor,
+            launcher,
+            allow_unsafe=default_allow_unsafe,
+            model=default_review_model,
         )
+        run_tick_kwargs = {
+            "metas": metas,
+            "launcher": active_launcher,
+            "persona": default_persona,
+            "is_satisfied": predicate,
+            "handoff_dir": handoff_dir,
+            "require_idle": require_idle,
+            "max_load": default_max_load,
+            "reaper": reaper,
+        }
+        if default_review_executor is not None or default_review_model is not None:
+            run_tick_kwargs.update(
+                {
+                    "review_launcher": active_review_launcher,
+                    "review_executor": default_review_executor,
+                    "review_model": default_review_model,
+                }
+            )
+        return run_tick_fn(dispatcher, **run_tick_kwargs)
 
     return execute
 
@@ -413,6 +464,9 @@ def run_loop(
     launcher=None,
     require_idle: bool = True,
     default_executor: str | None = None,
+    default_model: str | None = None,
+    default_review_executor: str | None = None,
+    default_review_model: str | None = None,
     reaper: Callable[[], dict[str, Any]] | None = None,
 ) -> bool:
     runtime_pid = os.getpid() if pid is None else pid
@@ -437,28 +491,54 @@ def run_loop(
             disp = Dispatcher(ensure_registry(), TmuxPaneSender(), ScriptWorktreeCreator())
         return disp
 
-    executor = request_executor or build_request_executor(
-        dispatcher=ensure_dispatcher(),
-        specs_dir=resolved_specs_dir,
-        handoff_dir=handoff_dir,
-        launcher=launcher,
-        default_executor=resolved_default_executor,
-        reaper=reaper,
-    )
+    if request_executor is not None:
+        executor = request_executor
+    else:
+        executor_kwargs = {
+            "dispatcher": ensure_dispatcher(),
+            "specs_dir": resolved_specs_dir,
+            "handoff_dir": handoff_dir,
+            "launcher": launcher,
+            "default_executor": resolved_default_executor,
+            "reaper": reaper,
+        }
+        if default_model is not None:
+            executor_kwargs["default_model"] = default_model
+        if default_review_executor is not None or default_review_model is not None:
+            executor_kwargs.update(
+                {
+                    "default_review_executor": default_review_executor,
+                    "default_review_model": default_review_model,
+                }
+            )
+        executor = build_request_executor(**executor_kwargs)
     provider = status_provider or build_runtime_status_provider(
         registry=ensure_registry(),
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
     )
-    periodic_runner = periodic_tick_runner or build_periodic_tick_runner(
-        dispatcher=ensure_dispatcher(),
-        specs_dir=resolved_specs_dir,
-        handoff_dir=handoff_dir,
-        launcher=launcher,
-        require_idle=require_idle,
-        default_executor=resolved_default_executor,
-        reaper=reaper,
-    )
+    if periodic_tick_runner is not None:
+        periodic_runner = periodic_tick_runner
+    else:
+        periodic_kwargs = {
+            "dispatcher": ensure_dispatcher(),
+            "specs_dir": resolved_specs_dir,
+            "handoff_dir": handoff_dir,
+            "launcher": launcher,
+            "require_idle": require_idle,
+            "default_executor": resolved_default_executor,
+            "reaper": reaper,
+        }
+        if default_model is not None:
+            periodic_kwargs["default_model"] = default_model
+        if default_review_executor is not None or default_review_model is not None:
+            periodic_kwargs.update(
+                {
+                    "default_review_executor": default_review_executor,
+                    "default_review_model": default_review_model,
+                }
+            )
+        periodic_runner = build_periodic_tick_runner(**periodic_kwargs)
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
     constants.done_dir().mkdir(parents=True, exist_ok=True)
@@ -636,6 +716,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
     parser.add_argument("--tick-interval", type=float, default=default_tick_interval())
     parser.add_argument("--executor", default=default_executor())
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--review-executor", default=None)
+    parser.add_argument("--review-model", default=None)
     parser.add_argument("--specs-dir")
     parser.add_argument("--handoff-dir", default=autonomy.DEFAULT_HANDOFF_DIR)
     parser.add_argument("--max-rounds", type=int)
@@ -651,6 +734,9 @@ def main(argv: list[str] | None = None) -> int:
         max_rounds=args.max_rounds,
         require_idle=not args.no_require_idle,
         default_executor=args.executor,
+        default_model=args.model,
+        default_review_executor=args.review_executor,
+        default_review_model=args.review_model,
     )
     return 0 if started else 1
 

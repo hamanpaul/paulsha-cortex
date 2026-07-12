@@ -77,6 +77,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--specs-dir", default=None,
         help="設定後據 dependency graph 觀測算出本趟釋放的下游（released）",
     )
+    p_complete.add_argument("--review-executor", choices=sorted(_ARGV_BUILDERS), default=None)
+    p_complete.add_argument("--review-model", default=None)
 
     sub.add_parser("status", help="讀取 manager daemon 狀態快照")
 
@@ -96,6 +98,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tick.add_argument("--max-load", type=float, default=1.0)
     p_tick.add_argument("--allow-unsafe", action="store_true")
     p_tick.add_argument("--model", default=None)
+    p_tick.add_argument("--review-executor", choices=sorted(_ARGV_BUILDERS), default=None)
+    p_tick.add_argument("--review-model", default=None)
 
     return parser
 
@@ -160,6 +164,10 @@ def main(
         request_args = {"handoff_dir": args.handoff_dir}
         if args.specs_dir:
             request_args["specs_dir"] = args.specs_dir
+        if args.review_executor is not None:
+            request_args["review_executor"] = args.review_executor
+        if args.review_model is not None:
+            request_args["review_model"] = args.review_model
         return _submit_mutation_request(
             "complete",
             request_args,
@@ -180,6 +188,10 @@ def main(
         }
         if args.executor is not None:
             request_args["executor"] = args.executor
+        if args.review_executor is not None:
+            request_args["review_executor"] = args.review_executor
+        if args.review_model is not None:
+            request_args["review_model"] = args.review_model
         return _submit_mutation_request(
             "tick",
             request_args,

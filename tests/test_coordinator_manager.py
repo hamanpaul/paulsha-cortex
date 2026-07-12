@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.autonomy import dispatch_ready
@@ -652,21 +654,40 @@ class CompleteTickVerificationTests(unittest.TestCase):
             worktree = root / "candidate"
             worktree.mkdir()
             job = _make_job(reg, "slice-g", worktree=str(worktree))
+            reg.attach_launch_handle(job["job_id"], executor="copilot", session_name="slice-g", pid=1, log_path="/log")
+            reg._find_job(job["job_id"])["model_id"] = "claude-haiku-4.5"
             _create_slice(reg, root, job, docs_class="code")
             disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = root / "handoff"
             candidate = "b" * 40
             dispatch_base = "a" * 40
             persona_catalog = _persona_catalog(builder_paths=["**"])
+            config_root = root / "config"
+            config_root.mkdir(parents=True, exist_ok=True)
+            (config_root / "model-identities.yaml").write_text(
+                (
+                    "schema_version: 1\n"
+                    "identities:\n"
+                    "  - executor: copilot\n"
+                    "    model_id: claude-haiku-4.5\n"
+                    "    independence_domain: anthropic\n"
+                    "  - executor: codex\n"
+                    "    model_id: gpt-5.4\n"
+                    "    independence_domain: openai\n"
+                ),
+                encoding="utf-8",
+            )
 
             class _GitRunner:
                 def __init__(self) -> None:
                     self.calls = 0
 
                 def __call__(self, args: list[str]):
+                    review_worktree = str(root / ".psc-review-worktrees" / "slice-g-slice-g-2")
                     mapping = {
                         ("-C", str(root), "rev-parse", "feature/slice-g"): _git_ok(candidate),
                         ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                        ("-C", review_worktree, "rev-parse", "HEAD"): _git_ok(candidate),
                         ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
                         ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
                         ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
@@ -677,33 +698,319 @@ class CompleteTickVerificationTests(unittest.TestCase):
                     }
                     return mapping[tuple(args)]
 
-            def proc_runner(argv, *, shell, cwd, timeout, env, capture_output, text):
-                self.assertFalse(shell)
-                self.assertEqual(set(env) - {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV"}, set())
-                if tuple(argv) == ("python3", "-m", "pytest", "-q", "tests/policy.py"):
-                    return _proc_ok()
+            def proc_runner(argv, **kwargs):
+                if "shell" in kwargs:
+                    self.assertFalse(kwargs["shell"])
+                if "env" in kwargs:
+                    self.assertEqual(
+                        set(kwargs["env"]) - {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "VIRTUAL_ENV"},
+                        set(),
+                    )
                 return _proc_ok()
 
-            summary = manager.complete_tick(
-                disp,
-                handoff_dir=str(hdir),
-                metas=[
-                    {"slice_id": "slice-g", "dispatch": "auto", "plan": "p-g.md", "depends_on": []},
-                    {"slice_id": "downstream", "dispatch": "auto", "plan": "p-down.md", "depends_on": ["slice-g"]},
-                ],
-                clock=lambda: "T0",
-                git_runner=_GitRunner(),
-                subprocess_runner=proc_runner,
-            )
+            class _ReviewLauncher:
+                def launch(self, *, slice_id, prompt, worktree, log_dir):
+                    from paulsha_cortex.coordinator.launcher import LaunchHandle
 
-            manifest = json.loads((hdir / "slice-g.json").read_text(encoding="utf-8"))
+                    return LaunchHandle(
+                        executor="codex",
+                        model_id="gpt-5.4",
+                        session_name=slice_id,
+                        pid=222,
+                        log_path=f"{log_dir}/{slice_id}.jsonl",
+                    )
+
+            with mock.patch.dict("os.environ", {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}, clear=False):
+                summary = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    metas=[
+                        {"slice_id": "slice-g", "dispatch": "auto", "plan": "p-g.md", "depends_on": []},
+                        {"slice_id": "downstream", "dispatch": "auto", "plan": "p-down.md", "depends_on": ["slice-g"]},
+                    ],
+                    clock=lambda: "T0",
+                    git_runner=_GitRunner(),
+                    subprocess_runner=proc_runner,
+                    review_launcher=_ReviewLauncher(),
+                    review_executor="codex",
+                    review_model="gpt-5.4",
+                )
+
             slice_row = reg.get_slice("slice-g")
-            self.assertEqual(manifest["gate_status"], "reviewing")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-g", "gate_status": "reviewing"}])
+            self.assertFalse((hdir / "slice-g.json").exists())
+            self.assertEqual(summary["completed"], [])
             self.assertEqual(slice_row["state"], "reviewing")
             self.assertEqual(slice_row["gate_state"], "pending")
             self.assertFalse(manager.autonomy.default_is_satisfied("slice-g", handoff_dir=str(hdir)))
             self.assertEqual(summary["released"], [])
+
+    def test_review_required_slice_without_review_identity_becomes_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-review-absent", worktree=str(worktree))
+            _create_slice(reg, root, job, docs_class="code")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "PSC_PROJECT_CONFIG_ROOT": str(root / "config"),
+                },
+                clear=False,
+            ):
+                (root / "config").mkdir(parents=True, exist_ok=True)
+                (root / "config" / "model-identities.yaml").write_text(
+                    (
+                        "schema_version: 1\n"
+                        "identities:\n"
+                        "  - executor: copilot\n"
+                        "    model_id: claude-haiku-4.5\n"
+                        "    independence_domain: anthropic\n"
+                    ),
+                    encoding="utf-8",
+                )
+                reg.attach_launch_handle(
+                    job["job_id"], executor="copilot", session_name="slice-review-absent", pid=1, log_path="/log"
+                )
+                reg._find_job(job["job_id"])["model_id"] = "claude-haiku-4.5"
+                summary = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T0",
+                    git_runner=lambda args: {
+                        ("-C", str(root), "rev-parse", "feature/slice-review-absent"): _git_ok(candidate),
+                        ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                    }[tuple(args)],
+                    verification_runner=lambda **kwargs: manager.verification.write_verification_evidence(
+                        {
+                            "schema_version": 1,
+                            "slice_id": "slice-review-absent",
+                            "candidate": candidate,
+                            "status": "reviewing",
+                            "summary": "verification-succeeded",
+                            "details": {"ok": True},
+                        },
+                        coordinator_root=root,
+                    ),
+                )
+
+            manifest = json.loads((hdir / "slice-review-absent.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_verdict"]["state"], "absent")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-review-absent", "gate_status": "needs_human"}])
+
+    def test_existing_inflight_reviewer_prevents_duplicate_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-review-inflight", worktree=str(worktree))
+            reg.attach_launch_handle(job["job_id"], executor="copilot", session_name="slice-review-inflight", pid=1, log_path="/log")
+            reg._find_job(job["job_id"])["model_id"] = "claude-haiku-4.5"
+            _create_slice(reg, root, job, docs_class="code")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = root / "handoff"
+            candidate = "b" * 40
+            dispatch_base = "a" * 40
+            persona_catalog = _persona_catalog(builder_paths=["**"])
+            config_root = root / "config"
+            config_root.mkdir(parents=True, exist_ok=True)
+            (config_root / "model-identities.yaml").write_text(
+                (
+                    "schema_version: 1\n"
+                    "identities:\n"
+                    "  - executor: copilot\n"
+                    "    model_id: claude-haiku-4.5\n"
+                    "    independence_domain: anthropic\n"
+                    "  - executor: codex\n"
+                    "    model_id: gpt-5.4\n"
+                    "    independence_domain: openai\n"
+                ),
+                encoding="utf-8",
+            )
+
+            class _GitRunner:
+                def __call__(self, args: list[str]):
+                    review_worktree = str(root / ".psc-review-worktrees" / "slice-review-inflight-slice-review-inflight-2")
+                    return {
+                        ("-C", str(root), "rev-parse", "feature/slice-review-inflight"): _git_ok(candidate),
+                        ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok(candidate),
+                        ("-C", review_worktree, "rev-parse", "HEAD"): _git_ok(candidate),
+                        ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): _git_ok(""),
+                        ("-C", str(root), "merge-base", "--is-ancestor", dispatch_base, candidate): _git_ok(""),
+                        ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + ".." + candidate): _git_ok(""),
+                        ("-C", str(root), "show", dispatch_base + ":paulsha_cortex/persona/personas.yaml"): _git_ok(persona_catalog),
+                        ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", dispatch_base + "..." + candidate): _git_ok(""),
+                        ("-C", str(root), "worktree", "add", "--detach", str(root / ".psc-verification-worktrees" / "slice-review-inflight-aaaaaaaaaaaa"), dispatch_base): _git_ok(""),
+                        ("-C", str(root), "worktree", "remove", "--force", str(root / ".psc-verification-worktrees" / "slice-review-inflight-aaaaaaaaaaaa")): _git_ok(""),
+                        ("-C", str(root), "worktree", "add", "--detach", review_worktree, candidate): _git_ok(""),
+                    }[tuple(args)]
+
+            class _ReviewLauncher:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                def launch(self, *, slice_id, prompt, worktree, log_dir):
+                    from paulsha_cortex.coordinator.launcher import LaunchHandle
+
+                    self.calls += 1
+                    return LaunchHandle(
+                        executor="codex",
+                        model_id="gpt-5.4",
+                        session_name=slice_id,
+                        pid=222,
+                        log_path=f"{log_dir}/{slice_id}.jsonl",
+                    )
+
+            launcher = _ReviewLauncher()
+            with mock.patch.dict("os.environ", {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}, clear=False):
+                first = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T0",
+                    git_runner=_GitRunner(),
+                    subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+                    review_launcher=launcher,
+                    review_executor="codex",
+                    review_model="gpt-5.4",
+                )
+                second = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T1",
+                    git_runner=_GitRunner(),
+                    subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+                    review_launcher=launcher,
+                    review_executor="codex",
+                    review_model="gpt-5.4",
+                )
+
+            self.assertEqual(first["completed"], [])
+            self.assertEqual(second["completed"], [])
+            self.assertEqual(launcher.calls, 1)
+            self.assertEqual(len(reg.list_jobs()), 2)
+
+    def test_stale_review_job_preserves_history_but_clears_current_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            builder = _make_job(reg, "slice-stale-review", worktree=str(root / "candidate"))
+            reg.attach_launch_handle(builder["job_id"], executor="copilot", model_id="claude-haiku-4.5", session_name="slice-stale-review", pid=1, log_path="/log")
+            reviewer = reg.create_job(
+                task="slice-stale-review",
+                persona="reviewer",
+                kind="review",
+                branch="feature/slice-stale-review",
+                pane="",
+                worktree=str(root / "review"),
+                executor="codex",
+                model_id="gpt-5.4",
+                independence_domain="openai",
+                subject_head="b" * 40,
+                spec_hash="old-spec",
+                plan_hash="old-plan",
+                verification_hash="old-verification",
+            )
+            reg.update_status(reviewer["job_id"], "exited")
+            slice_row = reg.create_slice(
+                slice_id="slice-stale-review",
+                spec_path=str(root / "spec.md"),
+                spec_hash="new-spec",
+                plan_path=str(root / "plan.md"),
+                plan_hash="new-plan",
+                target_branch="main",
+                target_remote="origin",
+                verification_hash="new-verification",
+                verification={"docs_class": "code", "review_policy": "required"},
+                dispatch_base="a" * 40,
+                builder_job_id=builder["job_id"],
+                reviewer_job_id=reviewer["job_id"],
+                candidate="c" * 40,
+            )
+            reg.update_slice("slice-stale-review", state="building", candidate="c" * 40)
+            reg.update_slice("slice-stale-review", state="reviewing", candidate="c" * 40)
+            disp = FakeDispatcher(reg, poll_map={})
+            hdir = root / "handoff"
+
+            summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
+
+            manifest = json.loads((hdir / "slice-stale-review.json").read_text(encoding="utf-8"))
+            stored = reg.get_slice("slice-stale-review")
+            self.assertEqual(manifest["gate_reason"], "stale-input")
+            self.assertEqual(manifest["gate_verdict"]["reason"], "stale-input")
+            self.assertEqual(stored["current_evaluation_refs"], [])
+            self.assertEqual(len(stored["evaluation_history"]), 1)
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-stale-review", "gate_status": "needs_human"}])
+
+    def test_reviewer_non_json_output_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            builder = _make_job(reg, "slice-review-output", worktree=str(root / "candidate"))
+            reg.attach_launch_handle(builder["job_id"], executor="copilot", model_id="claude-haiku-4.5", session_name="slice-review-output", pid=1, log_path="/builder-log")
+            reviewer_log = root / "review.log"
+            reviewer_log.write_text("not-json\n", encoding="utf-8")
+            reviewer = reg.create_job(
+                task="slice-review-output",
+                persona="reviewer",
+                kind="review",
+                branch="feature/slice-review-output",
+                pane="",
+                worktree=str(root / "review"),
+                executor="codex",
+                model_id="gpt-5.4",
+                independence_domain="openai",
+                session_name="slice-review-output-2",
+                pid=2,
+                log_path=str(reviewer_log),
+                subject_head="b" * 40,
+                spec_hash="new-spec",
+                plan_hash="new-plan",
+                verification_hash="new-verification",
+            )
+            reg.update_status(reviewer["job_id"], "exited")
+            reg.create_slice(
+                slice_id="slice-review-output",
+                spec_path=str(root / "spec.md"),
+                spec_hash="new-spec",
+                plan_path=str(root / "plan.md"),
+                plan_hash="new-plan",
+                target_branch="main",
+                target_remote="origin",
+                verification_hash="new-verification",
+                verification={"docs_class": "code", "review_policy": "required"},
+                dispatch_base="a" * 40,
+                builder_job_id=builder["job_id"],
+                reviewer_job_id=reviewer["job_id"],
+                candidate="b" * 40,
+            )
+            reg.update_slice("slice-review-output", state="building", candidate="b" * 40)
+            reg.update_slice("slice-review-output", state="reviewing", candidate="b" * 40)
+            disp = FakeDispatcher(reg, poll_map={})
+            hdir = root / "handoff"
+
+            summary = manager.complete_tick(
+                disp,
+                handoff_dir=str(hdir),
+                clock=lambda: "T0",
+                git_runner=lambda args: _git_ok("b" * 40),
+            )
+
+            manifest = json.loads((hdir / "slice-review-output.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_verdict"]["reason"], "invalid-process-output")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-review-output", "gate_status": "needs_human"}])
+
+    def test_foreign_review_launch_avoids_registry_private_mutation(self) -> None:
+        source = inspect.getsource(manager._launch_foreign_review)
+        self.assertNotIn("registry._find_job", source)
+        self.assertNotIn("registry._persist", source)
 
     def test_successful_informational_verification_releases_downstream(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -876,8 +1183,25 @@ class CompleteTickVerificationTests(unittest.TestCase):
             worktree = root / "candidate"
             worktree.mkdir()
             job = _make_job(reg, "slice-k", worktree=str(worktree))
+            reg.attach_launch_handle(job["job_id"], executor="copilot", session_name="slice-k", pid=1, log_path="/log")
+            reg._find_job(job["job_id"])["model_id"] = "claude-haiku-4.5"
             _create_slice(reg, root, job, docs_class="code")
             original_record_action = reg.record_action
+            config_root = root / "config"
+            config_root.mkdir(parents=True, exist_ok=True)
+            (config_root / "model-identities.yaml").write_text(
+                (
+                    "schema_version: 1\n"
+                    "identities:\n"
+                    "  - executor: copilot\n"
+                    "    model_id: claude-haiku-4.5\n"
+                    "    independence_domain: anthropic\n"
+                    "  - executor: codex\n"
+                    "    model_id: gpt-5.4\n"
+                    "    independence_domain: openai\n"
+                ),
+                encoding="utf-8",
+            )
 
             def failing_record_action(*args, **kwargs):
                 raise RuntimeError("persist failed")
@@ -922,20 +1246,22 @@ class CompleteTickVerificationTests(unittest.TestCase):
             self.assertEqual(summary["completed"], [{"slice_id": "slice-k", "gate_status": "needs_human"}])
             self.assertEqual(reg.get_slice("slice-k")["state"], "building")
 
-            summary = manager.complete_tick(
-                disp,
-                handoff_dir=str(hdir),
-                clock=lambda: "T1",
-                git_runner=git_runner,
-                subprocess_runner=lambda *args, **kwargs: _proc_ok(),
-            )
+            with mock.patch.dict("os.environ", {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}, clear=False):
+                summary = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T1",
+                    git_runner=git_runner,
+                    subprocess_runner=lambda *args, **kwargs: _proc_ok(),
+                )
 
             manifest = json.loads((hdir / "slice-k.json").read_text(encoding="utf-8"))
             slice_row = reg.get_slice("slice-k")
-            self.assertEqual(manifest["gate_status"], "reviewing")
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_verdict"]["state"], "absent")
             self.assertIsNotNone(manifest["verification_evidence_path"])
-            self.assertEqual(slice_row["state"], "reviewing")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-k", "gate_status": "reviewing"}])
+            self.assertEqual(slice_row["state"], "needs_human")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-k", "gate_status": "needs_human"}])
 
     def test_retryable_runner_error_does_not_poison_later_success(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -944,9 +1270,23 @@ class CompleteTickVerificationTests(unittest.TestCase):
             worktree = root / "candidate"
             worktree.mkdir()
             job = _make_job(reg, "slice-l", worktree=str(worktree))
+            reg.attach_launch_handle(job["job_id"], executor="copilot", session_name="slice-l", pid=1, log_path="/log")
+            reg._find_job(job["job_id"])["model_id"] = "claude-haiku-4.5"
             _create_slice(reg, root, job, docs_class="code")
             original_record_action = reg.record_action
             candidate = "b" * 40
+            config_root = root / "config"
+            config_root.mkdir(parents=True, exist_ok=True)
+            (config_root / "model-identities.yaml").write_text(
+                (
+                    "schema_version: 1\n"
+                    "identities:\n"
+                    "  - executor: copilot\n"
+                    "    model_id: claude-haiku-4.5\n"
+                    "    independence_domain: anthropic\n"
+                ),
+                encoding="utf-8",
+            )
 
             def git_runner(args: list[str]):
                 return {
@@ -985,17 +1325,19 @@ class CompleteTickVerificationTests(unittest.TestCase):
                     coordinator_root=root,
                 )
 
-            summary = manager.complete_tick(
-                disp,
-                handoff_dir=str(hdir),
-                clock=lambda: "T1",
-                git_runner=git_runner,
-                verification_runner=success_runner,
-            )
+            with mock.patch.dict("os.environ", {"PSC_PROJECT_CONFIG_ROOT": str(config_root)}, clear=False):
+                summary = manager.complete_tick(
+                    disp,
+                    handoff_dir=str(hdir),
+                    clock=lambda: "T1",
+                    git_runner=git_runner,
+                    verification_runner=success_runner,
+                )
 
             manifest = json.loads((hdir / "slice-l.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["gate_status"], "reviewing")
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-l", "gate_status": "reviewing"}])
+            self.assertEqual(manifest["gate_status"], "needs_human")
+            self.assertEqual(manifest["gate_verdict"]["state"], "absent")
+            self.assertEqual(summary["completed"], [{"slice_id": "slice-l", "gate_status": "needs_human"}])
 
     def test_pinned_spec_hash_mismatch_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1409,7 +1751,7 @@ class _RecordingLauncher:
 
         self.calls.append({"slice_id": slice_id, "worktree": worktree})
         return LaunchHandle(
-            executor="copilot", session_name=slice_id, pid=100 + len(self.calls),
+            executor="copilot", model_id=None, session_name=slice_id, pid=100 + len(self.calls),
             log_path=f"{log_dir}/{slice_id}.jsonl",
         )
 

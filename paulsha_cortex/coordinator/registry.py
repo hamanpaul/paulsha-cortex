@@ -192,6 +192,20 @@ class JobRegistry:
             raise ValueError(
                 f"coordinator 狀態檔 job status 非法（fail-closed）: {self._state_path}: {status!r}"
             )
+        if "kind" in job and job.get("kind") not in {None, "build", "review"}:
+            raise ValueError(f"coordinator 狀態檔 job kind 非法（fail-closed）: {self._state_path}")
+        for field in ("executor", "session_name", "log_path", "model_id", "independence_domain"):
+            value = job.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        for field in ("pid", "exit_code"):
+            value = job.get(field)
+            if value is not None and not isinstance(value, int):
+                raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        for field in ("subject_head",):
+            value = job.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
         return dict(job)
 
     def _validate_loaded_slice(self, slice_row: object, job_ids: set[str]) -> dict[str, Any]:
@@ -327,6 +341,13 @@ class JobRegistry:
         pid: int | None = None,
         log_path: str | None = None,
         exit_code: int | None = None,
+        kind: str = "build",
+        model_id: str | None = None,
+        independence_domain: str | None = None,
+        subject_head: str | None = None,
+        spec_hash: str | None = None,
+        plan_hash: str | None = None,
+        verification_hash: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -335,21 +356,30 @@ class JobRegistry:
             for job in self._jobs
         ):
             raise ValueError(f"slice 已有 active builder，不可重複派工: {task}")
+        if kind not in {"build", "review"}:
+            raise ValueError(f"非法 kind: {kind!r}")
         self._seq += 1
         job: dict[str, Any] = {
             "job_id": f"{task}-{self._seq}",
             "task": task,
             "persona": persona,
+            "kind": kind,
             "branch": branch,
             "pane": pane,
             "worktree": worktree,
             "status": "dispatched",
             "dispatch_head": dispatch_head,
             "executor": executor,
+            "model_id": model_id,
+            "independence_domain": independence_domain,
             "session_name": session_name,
             "pid": pid,
             "log_path": log_path,
             "exit_code": exit_code,
+            "subject_head": subject_head,
+            "spec_hash": spec_hash,
+            "plan_hash": plan_hash,
+            "verification_hash": verification_hash,
             "created_at": _now_iso(),
         }
         self._jobs.append(job)
@@ -361,6 +391,21 @@ class JobRegistry:
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return dict(self._find_job(job_id))
+
+    def update_job(
+        self,
+        job_id: str,
+        *,
+        worktree: str | None = None,
+    ) -> dict[str, Any]:
+        job = self._find_job(job_id)
+        if worktree is None:
+            raise ValueError("update_job 至少需要一個欄位")
+        if not isinstance(worktree, str) or not worktree.strip():
+            raise ValueError("worktree 必須為非空字串")
+        job["worktree"] = worktree
+        self._persist()
+        return dict(job)
 
     def update_status(self, job_id: str, status: str) -> dict[str, Any]:
         if status not in VALID_JOB_STATUSES:
@@ -381,6 +426,7 @@ class JobRegistry:
         job_id: str,
         *,
         executor: str | None = None,
+        model_id: str | None = None,
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
@@ -389,6 +435,8 @@ class JobRegistry:
         if job["status"] not in ACTIVE_JOB_STATUSES:
             raise ValueError(f"僅能為 in-flight job 附加 launch handle: {job_id}")
         job["executor"] = executor
+        if model_id is not None:
+            job["model_id"] = model_id
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path
