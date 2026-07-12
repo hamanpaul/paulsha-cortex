@@ -68,6 +68,16 @@ def test_build_dispatch_request():
     assert req["type"] == "dispatch" and req["args"]["slice_id"] == "s1"
 
 
+def test_build_complete_request():
+    req = contract.build_request(
+        req_type="complete",
+        args={"handoff_dir": "runtime/handoff", "specs_dir": "specs"},
+        requested_by="telegram:42",
+    )
+    assert req["type"] == "complete"
+    assert req["args"]["handoff_dir"] == "runtime/handoff"
+
+
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):
         contract.build_request(req_type="nope", args={}, requested_by="x")

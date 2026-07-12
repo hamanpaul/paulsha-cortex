@@ -8,9 +8,9 @@
 
 ## 2. Versioned coordinator state
 
-- [ ] 2.1 RED-test versioned `jobs+slices` state, `done → exited`, legal transitions, reloadable current/history containers and clean-start rejection.
-- [ ] 2.2 Implement atomic SliceRecord CRUD/action history while retaining Job history and single-writer persistence.
-- [ ] 2.3 Pass registry, dispatcher, completion, manager and restart focused tests.
+- [x] 2.1 RED-test versioned `jobs+slices` state, `done → exited`, legal transitions, reloadable current/history containers and clean-start rejection.
+- [x] 2.2 Implement atomic SliceRecord CRUD/action history while retaining Job history and single-writer persistence.
+- [x] 2.3 Pass registry, dispatcher, completion, manager and restart focused tests.
 
 ## 3. Deterministic verification
 

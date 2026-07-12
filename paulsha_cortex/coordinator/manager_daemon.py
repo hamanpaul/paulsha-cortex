@@ -237,14 +237,21 @@ def build_request_executor(
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
     dispatch_ready_fn: Callable[..., list[dict[str, Any]]] = autonomy.dispatch_ready,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
-
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
         request_specs_dir = args.get("specs_dir") or specs_dir
-        metas = scan_specs_fn(request_specs_dir)
+        request_handoff_dir = args.get("handoff_dir") or handoff_dir
+        predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=request_handoff_dir)
         allow_unsafe = bool(args.get("allow_unsafe", False))
         persona = args.get("persona", default_persona)
+        if request["type"] == "complete":
+            complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
+            return manager.complete_tick(
+                dispatcher,
+                handoff_dir=request_handoff_dir,
+                metas=complete_metas,
+            )
+        metas = scan_specs_fn(request_specs_dir)
         if request["type"] == "dispatch":
             slice_id = args.get("slice_id")
             target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
@@ -318,7 +325,7 @@ def build_request_executor(
             launcher=active_launcher,
             persona=persona,
             is_satisfied=predicate,
-            handoff_dir=handoff_dir,
+            handoff_dir=request_handoff_dir,
             require_idle=bool(args.get("require_idle", False)),
             max_load=float(args.get("max_load", default_max_load)),
             reaper=reaper,
@@ -395,15 +402,25 @@ def run_loop(
     if held_lock is None:
         return False
 
-    reg = registry if registry is not None else JobRegistry()
-    disp = dispatcher
-    if disp is None:
-        disp = Dispatcher(reg, TmuxPaneSender(), ScriptWorktreeCreator())
     resolved_specs_dir = specs_dir or default_specs_dir()
     resolved_default_executor = default_executor or DEFAULT_EXECUTOR
+    reg = registry
+    disp = dispatcher
+
+    def ensure_registry() -> JobRegistry:
+        nonlocal reg
+        if reg is None:
+            reg = JobRegistry()
+        return reg
+
+    def ensure_dispatcher() -> Dispatcher:
+        nonlocal disp
+        if disp is None:
+            disp = Dispatcher(ensure_registry(), TmuxPaneSender(), ScriptWorktreeCreator())
+        return disp
 
     executor = request_executor or build_request_executor(
-        dispatcher=disp,
+        dispatcher=ensure_dispatcher(),
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
         launcher=launcher,
@@ -411,12 +428,12 @@ def run_loop(
         reaper=reaper,
     )
     provider = status_provider or build_runtime_status_provider(
-        registry=reg,
+        registry=ensure_registry(),
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
     )
     periodic_runner = periodic_tick_runner or build_periodic_tick_runner(
-        dispatcher=disp,
+        dispatcher=ensure_dispatcher(),
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
         launcher=launcher,

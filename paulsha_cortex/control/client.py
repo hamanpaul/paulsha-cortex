@@ -39,7 +39,11 @@ def read_status() -> dict[str, Any]:
         return _degraded_status("missing")
     updated_at = payload.get("updated_at")
     age = _status_age_seconds(updated_at)
-    if _daemon_pid_alive(payload):
+    daemon_pid_present = _daemon_pid_present(payload)
+    daemon_alive = _daemon_pid_alive(payload) if daemon_pid_present else False
+    if daemon_pid_present and not daemon_alive:
+        return _degraded_status("dead", payload)
+    if daemon_alive:
         # The daemon process is up (possibly busy on a long request). A busy
         # daemon is NOT degraded even if the status is older than the freshness
         # window; only flag it once it has stalled far beyond any real request.
@@ -66,13 +70,18 @@ def _ok_status(payload: dict[str, Any], updated_at: object) -> dict[str, Any]:
     }
 
 
-def _daemon_pid_alive(payload: dict[str, Any]) -> bool:
+def _daemon_pid_present(payload: dict[str, Any]) -> bool:
     daemon = payload.get("daemon")
     if not isinstance(daemon, dict):
         return False
     pid = daemon.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
+    return isinstance(pid, int) and pid > 0
+
+
+def _daemon_pid_alive(payload: dict[str, Any]) -> bool:
+    if not _daemon_pid_present(payload):
         return False
+    pid = payload["daemon"]["pid"]
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError, OSError):

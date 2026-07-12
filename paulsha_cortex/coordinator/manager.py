@@ -12,7 +12,7 @@ from ..persona import gate, handoff
 from . import autonomy
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
-TERMINAL_STATUSES = frozenset({"done", "failed"})
+TERMINAL_STATUSES = frozenset({"exited", "failed"})
 
 
 def _utcnow() -> str:
@@ -141,7 +141,7 @@ def complete_tick(
             if _existing_manifest_job_id(manifest_path) == job_id:
                 continue  # 真冪等：同一個 terminal job 已落盤（同 job_id → skip；異 job_id/壞檔 → overwrite）
 
-            gate_status = "passed" if status == "done" else "failed"
+            gate_status = "passed" if status == "exited" else "failed"
             try:
                 verdict = runner(job)
             except Exception:

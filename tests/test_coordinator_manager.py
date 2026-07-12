@@ -18,7 +18,7 @@ class FakeDispatcher:
     def __init__(self, registry: JobRegistry, poll_map: dict | None = None,
                  raise_on: set | None = None) -> None:
         self._registry = registry
-        self._poll_map = poll_map or {}   # job_id -> "done"/"failed"
+        self._poll_map = poll_map or {}   # job_id -> "exited"/"failed"
         self._raise_on = raise_on or set()  # job_id -> 模擬 poll 例外
 
     def poll_headless_done(self, job_id: str) -> dict:
@@ -28,7 +28,7 @@ class FakeDispatcher:
         if status is None:
             return self._registry.get_job(job_id)  # 仍在跑
         return self._registry.update_headless_result(
-            job_id, status=status, exit_code=0 if status == "done" else 1
+            job_id, status=status, exit_code=0 if status == "exited" else 1
         )
 
 
@@ -46,18 +46,18 @@ def _make_job(reg: JobRegistry, slice_id: str) -> dict:
 
 
 class CompleteTickDoneTests(unittest.TestCase):
-    def test_done_job_writes_passed_manifest(self) -> None:
+    def test_exited_job_writes_passed_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-a")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
 
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
 
             manifest = json.loads((hdir / "slice-a.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["gate_status"], "passed")
-            self.assertEqual(manifest["completion"], "done")
+            self.assertEqual(manifest["completion"], "exited")
             self.assertEqual(manifest["slice_id"], "slice-a")
             self.assertEqual(manifest["completed_at"], "T0")
             self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "passed"}])
@@ -93,7 +93,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-d")
-            reg.update_headless_result(job["job_id"], status="done", exit_code=0)
+            reg.update_headless_result(job["job_id"], status="exited", exit_code=0)
             disp = FakeDispatcher(reg, poll_map={})
             hdir = Path(d) / "handoff"
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
@@ -105,7 +105,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-e")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
             manifest_path = hdir / "slice-e.json"
@@ -123,15 +123,16 @@ class CompleteTickReconcileTests(unittest.TestCase):
             self.assertEqual(second["polled"], [])
 
     def test_concurrent_same_slice_terminals_warn_and_dedup(self) -> None:
-        # spec scenario 4：同輪同 slice 兩個 terminal job（不變量異常，正常由 G1 already-active
-        # guard 防；此處釘住 complete_tick 的降級行為）——後者勝、記 warning、completed 去重。
+        # 不變量已由 registry 擋住；此處人工污染狀態檔，釘住 complete_tick 面對既有壞狀態
+        # 仍會去重與記 warning 的降級行為。
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             first = _make_job(reg, "slice-dup")
-            second = _make_job(reg, "slice-dup")
+            second = {**first, "job_id": "slice-dup-2", "worktree": "/wt/slice-dup-2"}
+            reg._jobs.append(second)
             disp = FakeDispatcher(
                 reg,
-                poll_map={first["job_id"]: "failed", second["job_id"]: "done"},
+                poll_map={first["job_id"]: "failed", second["job_id"]: "exited"},
             )
             hdir = Path(d) / "handoff"
 
@@ -162,14 +163,14 @@ class CompleteTickReconcileTests(unittest.TestCase):
             second_job = _make_job(reg, "slice-requeue")
             disp = FakeDispatcher(
                 reg,
-                poll_map={first["job_id"]: "failed", second_job["job_id"]: "done"},
+                poll_map={first["job_id"]: "failed", second_job["job_id"]: "exited"},
             )
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T1")
 
             manifest = json.loads((hdir / "slice-requeue.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["job_id"], second_job["job_id"])
             self.assertEqual(manifest["gate_status"], "passed")
-            self.assertEqual(manifest["completion"], "done")
+            self.assertEqual(manifest["completion"], "exited")
             self.assertEqual(manifest["completed_at"], "T1")
             self.assertEqual(summary["completed"], [{"slice_id": "slice-requeue", "gate_status": "passed"}])
             from paulsha_cortex.coordinator import autonomy
@@ -179,7 +180,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-legacy")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             manifest_path = hdir / "slice-legacy.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,7 +214,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-corrupt")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             manifest_path = hdir / "slice-corrupt.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,7 +232,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-invalid-utf8")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             manifest_path = hdir / "slice-invalid-utf8.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,7 +250,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-symlink")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             manifest_path = hdir / "slice-symlink.json"
             target_path = Path(d) / "outside.json"
@@ -269,7 +270,7 @@ class CompleteTickReconcileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-hdir-link")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             real_dir = Path(d) / "real_state"
             real_dir.mkdir()
             hdir = Path(d) / "agents_link"  # symlink → real_state
@@ -288,7 +289,7 @@ class CompleteTickShadowGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-f")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             fake_gate = lambda j: {"ok": False, "violations": [{"path": "x", "reason": "out"}],
                                    "handoff_ok": False}
@@ -301,7 +302,7 @@ class CompleteTickShadowGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "slice-g")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             def boom(j):
                 raise RuntimeError("gate 爆炸")
@@ -317,7 +318,7 @@ class CompleteTickErrorAndReleaseTests(unittest.TestCase):
             reg = _reg(d)
             a = _make_job(reg, "slice-h")
             b = _make_job(reg, "slice-i")
-            disp = FakeDispatcher(reg, poll_map={b["job_id"]: "done"}, raise_on={a["job_id"]})
+            disp = FakeDispatcher(reg, poll_map={b["job_id"]: "exited"}, raise_on={a["job_id"]})
             hdir = Path(d) / "handoff"
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
             self.assertTrue((hdir / "slice-i.json").exists())
@@ -329,7 +330,7 @@ class CompleteTickErrorAndReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             up = _make_job(reg, "up")
-            disp = FakeDispatcher(reg, poll_map={up["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={up["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             metas = [
                 {"slice_id": "up", "dispatch": "auto", "plan": "p-up.md", "depends_on": []},
@@ -344,7 +345,7 @@ class CompleteTickErrorAndReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             up = _make_job(reg, "up")
-            disp = FakeDispatcher(reg, poll_map={up["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={up["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             manifest_path = hdir / "up.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -367,7 +368,7 @@ class CompleteTickGuardTests(unittest.TestCase):
             job = _make_job(reg, "slice-x")
             # 直接污染 registry 內部 job 的 task 成 None，模擬 corrupt 狀態
             reg._jobs[0]["task"] = None
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
             self.assertFalse((hdir / "None.json").exists())
@@ -378,7 +379,7 @@ class CompleteTickGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "a")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             cyclic = [
                 {"slice_id": "a", "dispatch": "auto", "plan": "pa.md", "depends_on": ["b"]},
@@ -396,7 +397,7 @@ class CompleteTickGuardTests(unittest.TestCase):
                 reg = _reg(d)
                 job = _make_job(reg, "ok")
                 reg._jobs[0]["task"] = bad   # 模擬不安全/corrupt slice_id
-                disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+                disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
                 hdir = Path(d) / "handoff"
                 summary = manager.complete_tick(disp, handoff_dir=str(hdir), clock=lambda: "T0")
                 self.assertEqual(summary["completed"], [], f"{bad!r} 應被拒")
@@ -410,7 +411,7 @@ class RunTickTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "x")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             summary = manager.run_tick(
                 disp, metas=[], require_idle=True, max_load=1.0,
@@ -426,7 +427,7 @@ class RunTickTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "y")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             summary = manager.run_tick(
                 disp, metas=[], require_idle=True, max_load=1.0,
@@ -440,7 +441,7 @@ class RunTickTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "done-slice")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             metas = [{"slice_id": "ready-one", "dispatch": "auto", "plan": "p.md", "depends_on": []}]
             summary = manager.run_tick(
@@ -502,7 +503,7 @@ class RunTickTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "z")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             summary = manager.run_tick(
                 disp, metas=[], handoff_dir=str(hdir), clock=lambda: "T0",
@@ -520,7 +521,7 @@ class RunTickTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             reg = _reg(d)
             job = _make_job(reg, "w")
-            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "done"})
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = Path(d) / "handoff"
             summary = manager.run_tick(
                 disp, metas=[], handoff_dir=str(hdir), clock=lambda: "T0", reaper=_boom,
@@ -547,7 +548,7 @@ class _HeadlessDispatcher:
         self._registry = registry
 
     def poll_headless_done(self, job_id: str) -> dict:
-        return self._registry.update_headless_result(job_id, status="done", exit_code=0)
+        return self._registry.update_headless_result(job_id, status="exited", exit_code=0)
 
 
 class _RecordingLauncher:

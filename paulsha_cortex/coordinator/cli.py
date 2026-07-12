@@ -4,13 +4,16 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
-from . import autonomy, broker_reaper, manager
-from .dispatcher import Dispatcher
+from . import autonomy, broker_reaper
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
 from .registry import JobRegistry
 from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCreator
+
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
+DEFAULT_REQUEST_POLL_INTERVAL_SECONDS = 0.1
+DEFAULT_REQUESTED_BY = "coordinator-cli"
 
 
 def _resolve_launcher(executor, injected, *, allow_unsafe, model):
@@ -75,6 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="設定後據 dependency graph 觀測算出本趟釋放的下游（released）",
     )
 
+    sub.add_parser("status", help="讀取 manager daemon 狀態快照")
+
     p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
     p_reap.add_argument("--apply", action="store_true")
     p_reap.add_argument("--cwd-root")
@@ -105,22 +110,103 @@ def main(
     git_runner=None,
     launcher: AgentLauncher | None = None,
     reaper=None,
+    control_read_status: Callable[[], dict] | None = None,
+    control_submit_request: Callable[[str, dict, str], str] | None = None,
+    control_poll_done: Callable[[str, float, float], dict | None] | None = None,
 ) -> int:
     args = _build_parser().parse_args(argv)
 
-    # 未注入 → 接線真實 seam（CLI 預設行為）；測試一律全注入 fake
-    reg = registry if registry is not None else JobRegistry()
-    sender = pane_sender if pane_sender is not None else TmuxPaneSender()
-    creator = worktree_creator if worktree_creator is not None else ScriptWorktreeCreator()
-
     if args.cmd == "dispatch":
-        disp = Dispatcher(reg, sender, creator)
-        job = disp.dispatch(
-            task=args.task, persona=args.persona,
-            pane_id=args.pane, command=args.command,
+        print(
+            "錯誤: 低階 dispatch 已停用；缺少 spec metadata。"
+            "請改用 fanout/tick 或 control plane dispatch request。",
+            file=sys.stderr,
         )
-        print(json.dumps(job, ensure_ascii=False))
+        return 1
+
+    if args.cmd == "reap-brokers":
+        if args.apply and not args.cwd_root:
+            print("錯誤: --apply 需要搭配 --cwd-root", file=sys.stderr)
+            return 2
+        cwd_root = Path(args.cwd_root).resolve() if args.cwd_root else None
+        summary = broker_reaper.reap_orphan_brokers(apply=args.apply, cwd_root=cwd_root)
+        print(json.dumps(summary, ensure_ascii=False))
+        if not summary.get("ran"):
+            return 1
+        return 0 if summary.get("returncode", 0) == 0 else 1
+
+    read_status_fn, submit_request_fn, poll_done_fn = _resolve_control_hooks(
+        control_read_status=control_read_status,
+        control_submit_request=control_submit_request,
+        control_poll_done=control_poll_done,
+    )
+
+    if args.cmd == "status":
+        print(json.dumps(read_status_fn(), ensure_ascii=False))
         return 0
+
+    if args.cmd == "ready":
+        predicate = is_satisfied if is_satisfied is not None else autonomy.default_is_satisfied
+        metas = autonomy.scan_specs(args.specs_dir)
+        try:
+            ready = autonomy.ready_units(metas, predicate)
+            print(json.dumps(ready, ensure_ascii=False))
+            return 0
+        except (ValueError, autonomy.DispatchReadyRequiresLauncherError) as exc:
+            print(f"錯誤: {exc}", file=sys.stderr)
+            return 1
+
+    if args.cmd == "complete":
+        request_args = {"handoff_dir": args.handoff_dir}
+        if args.specs_dir:
+            request_args["specs_dir"] = args.specs_dir
+        return _submit_mutation_request(
+            "complete",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "tick":
+        request_args = {
+            "specs_dir": args.specs_dir,
+            "persona": args.persona,
+            "handoff_dir": args.handoff_dir,
+            "require_idle": args.require_idle,
+            "max_load": args.max_load,
+            "allow_unsafe": args.allow_unsafe,
+            "model": args.model,
+        }
+        if args.executor is not None:
+            request_args["executor"] = args.executor
+        return _submit_mutation_request(
+            "tick",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "fanout":
+        request_args = {
+            "specs_dir": args.specs_dir,
+            "persona": args.persona,
+            "allow_unsafe": args.allow_unsafe,
+            "model": args.model,
+        }
+        if args.executor is not None:
+            request_args["executor"] = args.executor
+        return _submit_mutation_request(
+            "fanout",
+            request_args,
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    # 讀取型命令以下才需要本地 snapshot 物件。
+    reg = registry if registry is not None else JobRegistry()
 
     if args.cmd == "jobs":
         print(json.dumps(reg.list_jobs(), ensure_ascii=False))
@@ -135,79 +221,59 @@ def main(
         print(json.dumps(job, ensure_ascii=False))
         return 0
 
-    if args.cmd == "complete":
-        disp = Dispatcher(reg, sender, creator)
-        metas = autonomy.scan_specs(args.specs_dir) if args.specs_dir else None
-        summary = manager.complete_tick(disp, handoff_dir=args.handoff_dir, metas=metas)
-        print(json.dumps(summary, ensure_ascii=False))
-        return 0
-
-    if args.cmd == "reap-brokers":
-        if args.apply and not args.cwd_root:
-            print("錯誤: --apply 需要搭配 --cwd-root", file=sys.stderr)
-            return 2
-        cwd_root = Path(args.cwd_root).resolve() if args.cwd_root else None
-        summary = broker_reaper.reap_orphan_brokers(apply=args.apply, cwd_root=cwd_root)
-        print(json.dumps(summary, ensure_ascii=False))
-        if not summary.get("ran"):
-            return 1
-        return 0 if summary.get("returncode", 0) == 0 else 1
-
-    if args.cmd == "tick":
-        disp = Dispatcher(reg, sender, creator)
-        metas = autonomy.scan_specs(args.specs_dir)
-        # predicate 綁定 args.handoff_dir（避免 fanout 側對 DEFAULT_HANDOFF_DIR、complete
-        # 側對 args.handoff_dir 的不一致）；同一 predicate 餵 unsafe 守門與 run_tick。
-        predicate = is_satisfied if is_satisfied is not None else (
-            lambda s: autonomy.default_is_satisfied(s, handoff_dir=args.handoff_dir)
-        )
-        try:
-            _refuse_unsafe_fanout(metas, predicate, allow_unsafe=args.allow_unsafe)
-        except ValueError as exc:  # --allow-unsafe 就緒集 >1 → fail-closed
-            print(f"錯誤: {exc}", file=sys.stderr)
-            return 1
-        active_launcher = _resolve_launcher(
-            args.executor, launcher, allow_unsafe=args.allow_unsafe, model=args.model
-        )
-        summary = manager.run_tick(
-            disp, metas=metas, launcher=active_launcher, persona=args.persona,
-            is_satisfied=predicate, handoff_dir=args.handoff_dir,
-            require_idle=args.require_idle, max_load=args.max_load,
-        )
-        print(json.dumps(summary, ensure_ascii=False))
-        return 0
-
-    if args.cmd in ("ready", "fanout"):
-        predicate = is_satisfied if is_satisfied is not None else autonomy.default_is_satisfied
-        metas = autonomy.scan_specs(args.specs_dir)
-        try:
-            if args.cmd == "ready":
-                ready = autonomy.ready_units(metas, predicate)
-                print(json.dumps(ready, ensure_ascii=False))
-                return 0
-            # fanout：reuse Phase 2 Dispatcher（注入或預設 seam）
-            disp = Dispatcher(reg, sender, creator)
-            # --allow-unsafe 旁路沙箱/核可 → fail-closed：就緒集 >1 即拒（避免大量越權派工）。
-            _refuse_unsafe_fanout(metas, predicate, allow_unsafe=args.allow_unsafe)
-            # --executor 設定（或測試注入 launcher）→ 走 headless launcher 路徑：
-            # SubprocessLauncher 啟動 agent，dispatch_ready 記 executor/session/pid/log，
-            # 且不再經 tmux pane send（與舊路徑互斥，無 double dispatch）。
-            active_launcher = _resolve_launcher(
-                args.executor, launcher, allow_unsafe=args.allow_unsafe, model=args.model
-            )
-            # git_runner 未注入 → 不傳（沿用 Dispatcher 預設真 git）；測試一律注入 fake
-            jobs = autonomy.dispatch_ready(
-                metas, predicate, disp, persona=args.persona,
-                git_runner=git_runner, launcher=active_launcher,
-            )
-            print(json.dumps(jobs, ensure_ascii=False))
-            return 0
-        except (ValueError, autonomy.DispatchReadyRequiresLauncherError) as exc:
-            # 循環相依 → refuse；fan-out 無 headless launcher → fail-fast（提示 --executor）
-            print(f"錯誤: {exc}", file=sys.stderr)
-            return 1
-
     return 2  # pragma: no cover（argparse required=True 已擋）
+
+
+def _resolve_control_hooks(
+    *,
+    control_read_status: Callable[[], dict] | None,
+    control_submit_request: Callable[[str, dict, str], str] | None,
+    control_poll_done: Callable[[str, float, float], dict | None] | None,
+) -> tuple[
+    Callable[[], dict],
+    Callable[[str, dict, str], str],
+    Callable[[str, float, float], dict | None],
+]:
+    if control_read_status and control_submit_request and control_poll_done:
+        return control_read_status, control_submit_request, control_poll_done
+    from paulsha_cortex.control import client as control_client
+
+    return (
+        control_read_status or control_client.read_status,
+        control_submit_request or control_client.submit_request,
+        control_poll_done or control_client.poll_done,
+    )
+
+
+def _submit_mutation_request(
+    req_type: str,
+    args: dict,
+    *,
+    read_status_fn: Callable[[], dict],
+    submit_request_fn: Callable[[str, dict, str], str],
+    poll_done_fn: Callable[[str, float, float], dict | None],
+) -> int:
+    status = read_status_fn()
+    if isinstance(status, dict) and status.get("degraded"):
+        reason = status.get("degraded_reason") or "unknown"
+        print(
+            f"錯誤: manager daemon 未就緒（{reason}）；無法處理 {req_type}，請先啟動 daemon。",
+            file=sys.stderr,
+        )
+        return 1
+    req_id = submit_request_fn(req_type, dict(args), DEFAULT_REQUESTED_BY)
+    done = poll_done_fn(req_id, DEFAULT_REQUEST_TIMEOUT_SECONDS, DEFAULT_REQUEST_POLL_INTERVAL_SECONDS)
+    if not isinstance(done, dict):
+        print(
+            f"錯誤: manager daemon 未在 {DEFAULT_REQUEST_TIMEOUT_SECONDS:.1f}s 內完成 {req_type} request: {req_id}",
+            file=sys.stderr,
+        )
+        return 1
+    if done.get("status") != "ok":
+        print(f"錯誤: {done.get('error') or 'unknown request error'}", file=sys.stderr)
+        return 1
+    print(json.dumps(done.get("result"), ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

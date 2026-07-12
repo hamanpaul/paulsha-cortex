@@ -66,6 +66,23 @@ def test_concurrent_submit_request_do_not_overwrite(monkeypatch, tmp_path):
     )
 
 
+def test_submit_request_supports_complete(monkeypatch, tmp_path):
+    from paulsha_cortex.control import client
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = client.submit_request(
+        "complete",
+        {"handoff_dir": "runtime/handoff", "specs_dir": "specs"},
+        "cockpit",
+    )
+
+    payload = contract.read_json(constants.requests_dir() / f"{req_id}.json")
+
+    assert payload is not None
+    assert payload["type"] == "complete"
+    assert payload["args"]["handoff_dir"] == "runtime/handoff"
+
+
 def test_read_status_degrades_on_missing_or_stale_file(monkeypatch, tmp_path):
     from paulsha_cortex.control import client
 
@@ -82,7 +99,7 @@ def test_read_status_degrades_on_missing_or_stale_file(monkeypatch, tmp_path):
             ready=["slice-a"],
             in_flight=[{"job_id": "job-1", "slice_id": "slice-a", "state": "running"}],
             recent_done=[{"slice_id": "slice-b", "gate_status": "passed", "at": "2026-07-03T09:00:00+00:00"}],
-            daemon={"pid": 1, "last_tick_at": "2026-07-03T09:00:00+00:00", "idle": False},
+            daemon={},
             updated_at="2000-01-01T00:00:00+00:00",
         ),
     )
@@ -112,7 +129,7 @@ def test_read_status_uses_runtime_stale_threshold(monkeypatch, tmp_path):
             ready=["slice-a"],
             in_flight=[],
             recent_done=[],
-            daemon={"pid": 1, "last_tick_at": fresh_updated_at, "idle": False},
+            daemon={},
             updated_at=fresh_updated_at,
         ),
     )
@@ -124,7 +141,7 @@ def test_read_status_uses_runtime_stale_threshold(monkeypatch, tmp_path):
             ready=["slice-a"],
             in_flight=[],
             recent_done=[],
-            daemon={"pid": 1, "last_tick_at": stale_updated_at, "idle": False},
+            daemon={},
             updated_at=stale_updated_at,
         ),
     )
@@ -137,6 +154,31 @@ def test_read_status_uses_runtime_stale_threshold(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_CONTROL_STATUS_STALE_AFTER_SECONDS", raising=False)
     importlib.reload(constants)
     importlib.reload(client)
+
+
+def test_read_status_degrades_immediately_when_daemon_pid_is_dead(monkeypatch, tmp_path):
+    from paulsha_cortex.control import client
+
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    updated_at = datetime.now(timezone.utc).isoformat()
+    contract.atomic_write_json(
+        constants.status_path(),
+        contract.build_status(
+            ready=["slice-a"],
+            in_flight=[],
+            recent_done=[],
+            daemon={"pid": 424242, "last_tick_at": updated_at, "idle": False},
+            updated_at=updated_at,
+        ),
+    )
+
+    monkeypatch.setattr(client.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
+
+    dead = client.read_status()
+
+    assert dead["degraded"] is True
+    assert dead["degraded_reason"] == "dead"
+    assert dead["ready"] == []
 
 
 def test_read_status_preserves_held_items(monkeypatch, tmp_path):
@@ -353,7 +395,7 @@ def test_read_status_dead_pid_and_stale_is_degraded(monkeypatch, tmp_path):
     _write_status_file(tmp_path, pid=424242, age_seconds=60)
     status = client.read_status()
     assert status["degraded"] is True
-    assert status["degraded_reason"] == "stale"
+    assert status["degraded_reason"] == "dead"
 
 
 def test_read_status_live_but_stalled_is_degraded(monkeypatch, tmp_path):

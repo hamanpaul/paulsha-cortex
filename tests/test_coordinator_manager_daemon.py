@@ -177,6 +177,41 @@ def _run_dispatch_request(
     return done, launcher, registry, worktree_creator
 
 
+def _run_complete_request(
+    monkeypatch,
+    tmp_path,
+    *,
+    args: dict,
+    metas: list[dict] | None = None,
+    jobs: list[dict] | None = None,
+):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090009Z-66666666666666666666666666666666"
+    _write_request(req_id, type="complete", args=args)
+    registry = FakeRegistry(jobs)
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+        scan_specs_fn=lambda specs_dir: metas or [],
+    )
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+    return contract.read_json(constants.done_dir() / f"{req_id}.json")
+
+
 def test_run_loop_drains_tick_request_writes_done_and_updates_status(monkeypatch, tmp_path):
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
     registry = FakeRegistry([{"job_id": "job-1", "task": "slice-b", "status": "running"}])
@@ -883,6 +918,87 @@ def test_dispatch_unknown_slice(monkeypatch, tmp_path):
     assert launcher.calls == []
 
 
+def test_complete_request_runs_complete_tick(monkeypatch, tmp_path):
+    jobs = [
+        {
+            "job_id": "slice-a-1",
+            "task": "slice-a",
+            "persona": "builder",
+            "branch": "feature/slice-a",
+            "pane": "",
+            "worktree": "/wt/slice-a",
+            "status": "exited",
+            "dispatch_head": None,
+            "executor": "copilot",
+            "session_name": "slice-a",
+            "pid": 1001,
+            "log_path": str(tmp_path / "logs" / "slice-a.jsonl"),
+            "exit_code": 0,
+        }
+    ]
+    done = _run_complete_request(
+        monkeypatch,
+        tmp_path,
+        args={"handoff_dir": str(tmp_path / "handoff"), "specs_dir": str(tmp_path / "specs")},
+        metas=[{"slice_id": "slice-b", "dispatch": "auto", "plan": "b.md", "depends_on": ["slice-a"]}],
+        jobs=jobs,
+    )
+
+    assert done["status"] == "ok"
+    assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "passed"}]
+    assert "slice-b" in done["result"]["released"]
+
+
+def test_complete_request_without_specs_dir_skips_spec_scan(monkeypatch, tmp_path):
+    jobs = [
+        {
+            "job_id": "slice-a-1",
+            "task": "slice-a",
+            "persona": "builder",
+            "branch": "feature/slice-a",
+            "pane": "",
+            "worktree": "/wt/slice-a",
+            "status": "exited",
+            "dispatch_head": None,
+            "executor": "copilot",
+            "session_name": "slice-a",
+            "pid": 1001,
+            "log_path": str(tmp_path / "logs" / "slice-a.jsonl"),
+            "exit_code": 0,
+        }
+    ]
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = "20260703T090010Z-77777777777777777777777777777777"
+    _write_request(req_id, type="complete", args={"handoff_dir": str(tmp_path / "handoff")})
+    registry = FakeRegistry(jobs)
+    dispatcher = FakeDispatcher(registry, worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"))
+    request_executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+        scan_specs_fn=lambda specs_dir: (_ for _ in ()).throw(AssertionError("scan_specs should not run")),
+    )
+
+    manager_daemon.run_loop(
+        request_executor=request_executor,
+        status_provider=lambda: {"ready": [], "in_flight": [], "recent_done": []},
+        periodic_tick_runner=lambda: {"dispatch_skipped": False},
+        poll_interval=0.0,
+        tick_interval=300.0,
+        now_fn=lambda: "2026-07-03T09:05:00+00:00",
+        monotonic_fn=lambda: 0.0,
+        sleep_fn=lambda _: None,
+        pid=1,
+        max_rounds=1,
+    )
+
+    done = contract.read_json(constants.done_dir() / f"{req_id}.json")
+
+    assert done["status"] == "ok"
+    assert done["result"]["completed"] == [{"slice_id": "slice-a", "gate_status": "passed"}]
+
+
 def test_dispatch_no_plan(monkeypatch, tmp_path):
     done, launcher, _, _ = _run_dispatch_request(
         monkeypatch,
@@ -908,6 +1024,33 @@ def test_dispatch_deps_unsatisfied(monkeypatch, tmp_path):
     assert "deps-unsatisfied" in done["error"]
     assert "slice-dep" in done["error"]
     assert launcher.calls == []
+
+
+def test_dispatch_uses_request_specific_handoff_dir_for_deps(monkeypatch, tmp_path):
+    override_handoff = tmp_path / "override-handoff"
+    override_handoff.mkdir()
+    contract.atomic_write_json(
+        override_handoff / "slice-dep.json",
+        {"slice_id": "slice-dep", "gate_status": "passed"},
+    )
+
+    done, launcher, registry, worktree_creator = _run_dispatch_request(
+        monkeypatch,
+        tmp_path,
+        args={"slice_id": "slice-a", "handoff_dir": str(override_handoff)},
+        metas=[{"slice_id": "slice-a", "dispatch": "auto", "plan": "a.md", "depends_on": ["slice-dep"]}],
+    )
+
+    assert done["status"] == "ok"
+    assert done["result"] == {
+        "job_id": "slice-a-1",
+        "slice_id": "slice-a",
+        "branch": "feature/slice-a",
+        "worktree": str(tmp_path / "worktrees" / "feature__slice-a"),
+    }
+    assert worktree_creator.calls == ["feature/slice-a"]
+    assert [job["job_id"] for job in registry.list_jobs()] == ["slice-a-1"]
+    assert [call["slice_id"] for call in launcher.calls] == ["slice-a"]
 
 
 def test_dispatch_hold_blocked(monkeypatch, tmp_path):

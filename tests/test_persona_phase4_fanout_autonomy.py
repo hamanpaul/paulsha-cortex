@@ -670,78 +670,51 @@ class CliTests(unittest.TestCase):
             self.assertEqual([m["slice_id"] for m in payload], ["r"])
 
     def test_main_fanout_with_fakes(self) -> None:
-        # headless fan-out（reviewer #112-3）：多就緒單位經 launcher 各啟 agent，
-        # registry 記 job，全程不送 tmux pane、不碰真 git。
-        import subprocess as _subprocess
-
         from paulsha_cortex.coordinator.cli import main
-        from paulsha_cortex.coordinator.launcher import LaunchHandle
-        from paulsha_cortex.coordinator.registry import JobRegistry
-
-        class _FakeSender:
-            def __init__(self):
-                self.sent = []
-
-            def send(self, pane_id, text):
-                self.sent.append((pane_id, text))
-
-        class _FakeWt:
-            def create(self, branch):
-                return f"/fake/wt/{branch.replace('/', '-')}"
-
-        class _FakeLauncher:
-            def __init__(self):
-                self.calls = []
-
-            def launch(self, *, slice_id, prompt, worktree, log_dir):
-                self.calls.append(slice_id)
-                return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=300 + len(self.calls),
-                    log_path=f"{log_dir}/{slice_id}.jsonl",
-                )
-
-        real_calls: list = []
-        orig_run = _subprocess.run
-
-        def _spy_run(args, *a, **k):
-            if args and args[0] == "git":
-                real_calls.append(list(args))
-            return orig_run(args, *a, **k)
+        submitted: list[tuple[str, dict, str]] = []
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md")
-            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: fb\nplan: docs/p.md\ndepends_on: [up]")
-            reg = JobRegistry(state_path=Path(d) / "jobs.json")
-            sender = _FakeSender()
-            launcher = _FakeLauncher()
             out = io.StringIO()
-            _subprocess.run = _spy_run
-            try:
-                with contextlib.redirect_stdout(out):
-                    rc = main(
-                        ["fanout", "--specs-dir", d, "--executor", "copilot"],
-                        registry=reg,
-                        pane_sender=sender,
-                        worktree_creator=_FakeWt(),
-                        is_satisfied=lambda _id: True,  # up 滿足 → fa, fb 都就緒
-                        launcher=launcher,
-                        git_runner=lambda args: "BASE_SHA",  # 注入 baseline runner（#131）
+            with contextlib.redirect_stdout(out):
+                rc = main(
+                    ["fanout", "--specs-dir", d, "--executor", "copilot"],
+                    control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                    control_submit_request=lambda req_type, args, requested_by: submitted.append(
+                        (req_type, dict(args), requested_by)
                     )
-            finally:
-                _subprocess.run = orig_run
+                    or "req-fanout-1",
+                    control_poll_done=lambda req_id, timeout, poll_interval=0.5: {
+                        "status": "ok",
+                        "result": {
+                            "dispatched": [
+                                {"job_id": "fa-1", "task": "fa", "dispatch_head": "BASE_SHA"},
+                                {"job_id": "fb-2", "task": "fb", "dispatch_head": "BASE_SHA"},
+                            ]
+                        },
+                    },
+                )
             self.assertEqual(rc, 0)
-            jobs = json.loads(out.getvalue())
-            self.assertEqual(sorted(j["task"] for j in jobs), ["fa", "fb"])
-            self.assertEqual(len(reg.list_jobs()), 2)
-            self.assertEqual(sorted(launcher.calls), ["fa", "fb"])
-            self.assertEqual(sender.sent, [])   # headless：不送 tmux pane
-            self.assertEqual(real_calls, [])     # 注入 git_runner → 全程不啟動真 git
-            # #131：baseline 持久化（注入 runner 回固定 sha）
-            self.assertEqual({j["dispatch_head"] for j in reg.list_jobs()}, {"BASE_SHA"})
+            summary = json.loads(out.getvalue())
+            self.assertEqual([j["task"] for j in summary["dispatched"]], ["fa", "fb"])
+            self.assertEqual(
+                submitted,
+                [
+                    (
+                        "fanout",
+                        {
+                            "specs_dir": d,
+                            "persona": "builder",
+                            "allow_unsafe": False,
+                            "model": None,
+                            "executor": "copilot",
+                        },
+                        "coordinator-cli",
+                    )
+                ],
+            )
 
     def test_main_fanout_executor_uses_headless_launcher_no_pane_send(self) -> None:
         from paulsha_cortex.coordinator.cli import main
-        from paulsha_cortex.coordinator.launcher import LaunchHandle
         from paulsha_cortex.coordinator.registry import JobRegistry
 
         class _FakeSender:
@@ -755,24 +728,9 @@ class CliTests(unittest.TestCase):
             def create(self, branch):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
-        class _FakeLauncher:
-            def __init__(self):
-                self.calls = []
-
-            def launch(self, *, slice_id, prompt, worktree, log_dir):
-                self.calls.append(
-                    {"slice_id": slice_id, "prompt": prompt, "worktree": worktree, "log_dir": log_dir}
-                )
-                return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=4321,
-                    log_path=f"{log_dir}/{slice_id}.jsonl",
-                )
-
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md")
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
             sender = _FakeSender()
-            launcher = _FakeLauncher()
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = main(
@@ -780,30 +738,21 @@ class CliTests(unittest.TestCase):
                     registry=reg,
                     pane_sender=sender,
                     worktree_creator=_FakeWt(),
-                    is_satisfied=lambda _id: True,
-                    launcher=launcher,
+                    control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                    control_submit_request=lambda *_args: "req-fanout-2",
+                    control_poll_done=lambda req_id, timeout, poll_interval=0.5: {
+                        "status": "ok",
+                        "result": {"dispatched": [{"job_id": "fa-1", "task": "fa"}]},
+                    },
                 )
             self.assertEqual(rc, 0)
-            jobs = json.loads(out.getvalue())
-            # 走 headless 路徑：launcher.launch 被呼叫、無 pane send
-            self.assertEqual(len(launcher.calls), 1)
-            self.assertEqual(launcher.calls[0]["slice_id"], "fa")
-            self.assertEqual(sender.sent, [])  # 無 double dispatch
-            # registry/job 記錄 executor/session_name/pid/log_path
-            self.assertEqual(len(jobs), 1)
-            self.assertEqual(jobs[0]["executor"], "copilot")
-            self.assertEqual(jobs[0]["session_name"], "fa")
-            self.assertEqual(jobs[0]["pid"], 4321)
-            self.assertTrue(jobs[0]["log_path"].endswith("fa.jsonl"))
-            recorded = reg.get_job("fa-1")
-            self.assertEqual(recorded["executor"], "copilot")
-            self.assertEqual(recorded["session_name"], "fa")
-            self.assertEqual(recorded["pid"], 4321)
-            self.assertTrue(recorded["log_path"].endswith("fa.jsonl"))
+            summary = json.loads(out.getvalue())
+            self.assertEqual(summary["dispatched"], [{"job_id": "fa-1", "task": "fa"}])
+            self.assertEqual(sender.sent, [])  # mutation CLI 不得直接送 pane
+            self.assertEqual(reg.list_jobs(), [])  # 也不得成為第二個 mutable writer
 
     def test_main_fanout_without_executor_fails_fast(self) -> None:
-        # 不帶 --executor 卻有就緒單位 → fail-fast（reviewer #112-3）：
-        # 不再 silently 經 tmux pane 送多行 persona prompt；rc!=0 且提示改用 --executor。
+        # CLI 不再本地做 fanout；control plane 的錯誤應直接回傳給操作者。
         from paulsha_cortex.coordinator.cli import main
         from paulsha_cortex.coordinator.registry import JobRegistry
 
@@ -829,12 +778,17 @@ class CliTests(unittest.TestCase):
                     registry=reg,
                     pane_sender=sender,
                     worktree_creator=_FakeWt(),
-                    is_satisfied=lambda _id: True,
+                    control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                    control_submit_request=lambda *_args: "req-fanout-3",
+                    control_poll_done=lambda req_id, timeout, poll_interval=0.5: {
+                        "status": "error",
+                        "error": "請以 --executor 走 headless fanout",
+                    },
                 )
-            self.assertNotEqual(rc, 0)               # fail-fast
+            self.assertNotEqual(rc, 0)
             self.assertIn("--executor", err.getvalue())
-            self.assertEqual(sender.sent, [])        # 一行都沒送 pane
-            self.assertEqual(reg.list_jobs(), [])    # 也沒記 job
+            self.assertEqual(sender.sent, [])
+            self.assertEqual(reg.list_jobs(), [])
 
     def test_main_refuses_on_cycle(self) -> None:
         from paulsha_cortex.coordinator.cli import main

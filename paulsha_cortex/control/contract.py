@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from . import constants
 
-REQUEST_TYPES = frozenset({"tick", "fanout", "dispatch"})
+REQUEST_TYPES = frozenset({"tick", "fanout", "dispatch", "complete"})
 
 
 def utcnow() -> str:
