@@ -78,7 +78,7 @@ def _last_nonempty_line(path: str | None) -> str | None:
 
 
 class Dispatcher:
-    """派工原語：建 worktree → 送命令 → 記 job；poll_done 以 branch 新 commit 標 done。
+    """派工原語：建 worktree → 送命令 → 記 job；poll_done 以 branch 新 commit 標 exited。
 
     所有副作用經注入 seam（PaneSender / WorktreeCreator / git_runner）；
     單元測試注入 fake，不啟動真 tmux/worktree/copilot。
@@ -89,10 +89,12 @@ class Dispatcher:
         registry: JobRegistry,
         pane_sender: PaneSender,
         worktree_creator: WorktreeCreator,
+        git_runner: GitRunner | None = None,
     ) -> None:
         self._registry = registry
         self._pane_sender = pane_sender
         self._worktree_creator = worktree_creator
+        self._git_runner = git_runner
 
     def dispatch(
         self,
@@ -101,16 +103,20 @@ class Dispatcher:
         persona: str,
         pane_id: str,
         command: str,
+        base_sha: str | None = None,
         git_runner: GitRunner | None = None,
     ) -> dict[str, object]:
         branch = _branch_for_task(task)
         # (1) 先建 worktree；失敗則 raise（不送命令、不記 job — fail-closed）
-        worktree = self._worktree_creator.create(branch)
+        try:
+            worktree = self._worktree_creator.create(branch, base_sha=base_sha)
+        except TypeError:
+            worktree = self._worktree_creator.create(branch)
         # (2) 忠實轉送呼叫者給的完整 command（本 change 不組裝 copilot 指令）
         self._pane_sender.send(pane_id, command)
         # (3) 取 dispatch 當下的 branch head（baseline）；取不到記 None。
         #     D5：baseline 持久化於 job 上（非實例 dict），故 poll_done 可跨進程比對。
-        runner = git_runner or _default_git_runner
+        runner = git_runner or self._git_runner or _default_git_runner
         try:
             dispatch_head: str | None = runner(["rev-parse", branch])
         except Exception:
@@ -127,7 +133,7 @@ class Dispatcher:
         job_id: str,
         git_runner: GitRunner | None = None,
     ) -> dict[str, object]:
-        """branch 出現新 commit（head 異於 dispatch_head baseline）→ 標 done；否則維持原 status。
+        """branch 出現新 commit（head 異於 dispatch_head baseline）→ 標 exited；否則維持原 status。
 
         baseline 從 job 記錄（`dispatch_head`）讀，故跨進程（CLI 多次獨立呼叫）仍可比對。
         baseline 為 None（dispatch 時取不到 head）時不自動完成——無 baseline 即無法判定有無新 commit。
@@ -136,13 +142,13 @@ class Dispatcher:
         baseline = job.get("dispatch_head")
         if baseline is None:
             return job  # baseline 不明 → 不自動完成
-        runner = git_runner or _default_git_runner
+        runner = git_runner or self._git_runner or _default_git_runner
         try:
             current = runner(["rev-parse", job["branch"]])
         except Exception:
             return job  # 取不到 head → 無法判定，維持原狀
         if current != baseline:
-            return self._registry.update_status(job_id, "done")
+            return self._registry.update_status(job_id, "exited")
         return job
 
     def poll_headless_done(
@@ -154,18 +160,18 @@ class Dispatcher:
         """跨進程安全的 headless 完成輪詢。
 
         判定順序（不依賴 os.waitpid，故 systemd oneshot / 分離 tick 進程亦正確）：
-          1. exit sentinel 檔存在 → 讀 exit code、配末筆 JSONL → classify → done/failed。
+          1. exit sentinel 檔存在 → 讀 exit code、配末筆 JSONL → classify → exited/failed。
           2. 否則進程仍存活（os.kill(pid,0)）→ 維持 dispatched（仍在跑）。
-          3. 否則（進程已死、卻無 sentinel）→ failed（fail-closed：死了沒留 exit code）。
+          3. 否則（進程已死、卻無 sentinel，或 crash 留下無 handle pre-launch row）→ failed。
 
         pid_waiter（向後相容 seam）：注入時沿用舊路徑——直接由 waiter(pid) 取 exit code
         （None=仍在跑），不讀 sentinel。單元測試用以模擬已知 exit code。
         """
         job = self._registry.get_job(job_id)
         pid = job.get("pid")
-        if not isinstance(pid, int):
-            return job
         log_path = job.get("log_path") if isinstance(job.get("log_path"), str) else None
+        if not isinstance(pid, int) or not log_path:
+            return self._finalize_headless(job_id, exit_code=1, log_path=log_path)
 
         # 向後相容：注入 pid_waiter → 走舊「呼叫者直接給 exit code」路徑。
         if pid_waiter is not None:

@@ -202,6 +202,9 @@ def _render_frontmatter(slice_id: str, plan_ref: str, deps: Sequence[str]) -> st
         f"slice_id: {slice_id}",
         f"plan: {json.dumps(plan_ref, ensure_ascii=False)}",
         f"depends_on: {depends_on}",
+        "target_branch: null",
+        "verification: null",
+        "parse_error: null",
     ]
     lines.append("---")
     return "\n".join(lines)

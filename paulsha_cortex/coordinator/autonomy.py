@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-import json
+import os
 from pathlib import Path
 from typing import Callable
 
+from paulsha_cortex.config import paths
+
 from .._yaml import YAMLError, safe_load
+from . import completion
 from .contract_command import build_dispatch_prompt
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
+from . import verification
 
 # is_satisfied predicate 型別：收 slice_id，回該相依是否「已滿足」（可釋放下游）。
 # 判定來源由呼叫者決定（merged-to-main vs handoff gate_status）——#104 留開放。
@@ -59,36 +63,197 @@ def parse_spec_frontmatter(path) -> dict:
         "slice_id": None,
         "plan": None,
         "depends_on": [],
+        "target_branch": None,
+        "verification": None,
+        "parse_error": None,
     }
     if block is None:
         return meta
 
     try:
         data = safe_load(block)
-    except YAMLError:
-        return meta  # 壞 frontmatter → 視為 hold（fail-safe，不 raise）
+    except YAMLError as exc:
+        meta["parse_error"] = {
+            "code": "invalid-frontmatter",
+            "field": "frontmatter",
+            "message": str(exc),
+        }
+        return meta
     if not isinstance(data, dict):
+        meta["parse_error"] = {
+            "code": "invalid-frontmatter",
+            "field": "frontmatter",
+            "message": "frontmatter must be a mapping",
+        }
+        return meta
+    try:
+        return _normalize_frontmatter(p, data)
+    except verification.ContractValidationError as exc:
+        meta["slice_id"] = data.get("slice_id") if isinstance(data.get("slice_id"), str) else None
+        meta["plan"] = data.get("plan") if isinstance(data.get("plan"), str) else None
+        meta["depends_on"] = _normalize_depends_on(data.get("depends_on"))
+        meta["target_branch"] = (
+            data.get("target_branch") if isinstance(data.get("target_branch"), str) else None
+        )
+        meta["parse_error"] = exc.as_payload()
         return meta
 
-    # dispatch：只認字面 'auto'
-    if data.get("dispatch") == "auto":
-        meta["dispatch"] = "auto"
 
-    sid = data.get("slice_id")
-    meta["slice_id"] = sid if isinstance(sid, str) else None
+def _normalize_frontmatter(path: Path, data: dict) -> dict:
+    allowed = {
+        "dispatch",
+        "slice_id",
+        "plan",
+        "depends_on",
+        "target_branch",
+        "verification",
+        "parse_error",
+    }
+    extras = set(data) - allowed
+    if extras:
+        extra = sorted(extras)[0]
+        raise verification.ContractValidationError(extra, f"unknown frontmatter key: {extra}")
 
+    dispatch = "auto" if data.get("dispatch") == "auto" else "hold"
+    repo_root = _infer_repo_root(path)
+    meta: dict = {
+        "path": str(path),
+        "dispatch": dispatch,
+        "slice_id": data.get("slice_id") if isinstance(data.get("slice_id"), str) else None,
+        "plan": None,
+        "depends_on": _normalize_depends_on(data.get("depends_on")),
+        "target_branch": None,
+        "verification": None,
+        "parse_error": None,
+    }
     plan = data.get("plan")
-    meta["plan"] = plan if isinstance(plan, str) else None
+    if isinstance(plan, str) and plan.strip():
+        meta["plan"] = verification.normalize_repo_relative_path(
+            plan,
+            repo_root=repo_root,
+            field="plan",
+        )
+    elif dispatch == "auto":
+        raise verification.ContractValidationError("plan", "auto dispatch requires a plan path")
 
-    dep = data.get("depends_on")
-    if isinstance(dep, list):
-        meta["depends_on"] = [str(x) for x in dep]
-    elif isinstance(dep, str):
-        meta["depends_on"] = [dep]  # 單一字串容錯成單元素 list
-    else:
-        meta["depends_on"] = []
+    target_branch = data.get("target_branch")
+    if target_branch is not None:
+        meta["target_branch"] = verification.normalize_non_empty_string(
+            target_branch,
+            field="target_branch",
+        )
+    elif dispatch == "auto":
+        raise verification.ContractValidationError(
+            "target_branch", "auto dispatch requires a target_branch"
+        )
 
+    verification_value = data.get("verification")
+    if verification_value is not None:
+        meta["verification"] = verification.validate_verification_contract(
+            verification_value,
+            repo_root=repo_root,
+            auto_dispatch=(dispatch == "auto"),
+        )
+    elif dispatch == "auto":
+        raise verification.ContractValidationError(
+            "verification", "auto dispatch requires a verification contract"
+        )
+    if data.get("parse_error") is not None:
+        raise verification.ContractValidationError(
+            "parse_error",
+            "parse_error is runtime-owned and must be null when present",
+        )
     return meta
+
+
+def _normalize_depends_on(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _infer_repo_root(spec_path: Path) -> Path:
+    configured = paths.repo_root().resolve()
+    try:
+        spec_path.resolve().relative_to(configured)
+        return configured
+    except ValueError:
+        pass
+    for parent in [spec_path.resolve(), *spec_path.resolve().parents]:
+        if (parent / ".git").exists():
+            return parent
+    return spec_path.resolve().parent
+
+
+def _resolve_contract_path(path_value: str | None, repo_root: Path) -> Path | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    return (repo_root / path_value).resolve()
+
+
+def pin_dispatch_inputs(meta: dict, *, target_remote: str | None = None) -> dict:
+    precomputed = meta.get("_pinned_inputs")
+    if isinstance(precomputed, dict):
+        return {
+            "spec_path": precomputed["spec_path"],
+            "spec_hash": precomputed["spec_hash"],
+            "plan_path": precomputed["plan_path"],
+            "plan_hash": precomputed["plan_hash"],
+            "target_branch": precomputed.get("target_branch") or meta.get("target_branch") or "main",
+            "target_remote": verification.normalize_remote_name(
+                precomputed.get("target_remote")
+                if target_remote is None
+                else target_remote
+            ),
+            "verification_hash": precomputed["verification_hash"],
+            "verification": meta.get("verification"),
+            "review_policy": (
+                meta.get("verification", {}).get("review_policy")
+                if isinstance(meta.get("verification"), dict)
+                else None
+            ),
+        }
+    raw_spec_path = meta.get("path") or str(Path("specs") / f"{meta.get('slice_id', 'unknown')}.md")
+    repo_root = _infer_repo_root(Path(raw_spec_path))
+    spec_path = Path(raw_spec_path).resolve()
+    plan_path = _resolve_contract_path(meta.get("plan"), repo_root)
+    if plan_path is None:
+        raise ValueError(f"slice 缺 plan path，無法 pin dispatch inputs: {meta.get('slice_id')}")
+    try:
+        spec_bytes = spec_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"spec file unreadable for dispatch pinning: {spec_path}") from exc
+    try:
+        plan_bytes = plan_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"plan file unreadable for dispatch pinning: {plan_path}") from exc
+    spec_hash = verification.sha256_bytes(spec_bytes)
+    plan_hash = verification.sha256_bytes(plan_bytes)
+    verification_contract = meta.get("verification")
+    verification_hash = (
+        verification.canonical_json_hash(verification_contract)
+        if verification_contract is not None
+        else verification.canonical_json_hash(None)
+    )
+    return {
+        "spec_path": str(spec_path),
+        "spec_hash": spec_hash,
+        "plan_path": str(plan_path),
+        "plan_hash": plan_hash,
+        "target_branch": meta.get("target_branch") or "main",
+        "target_remote": verification.normalize_remote_name(
+            os.environ.get("PSC_TARGET_REMOTE") if target_remote is None else target_remote
+        ),
+        "verification_hash": verification_hash,
+        "verification": verification_contract,
+        "review_policy": (
+            verification_contract.get("review_policy")
+            if isinstance(verification_contract, dict)
+            else None
+        ),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -190,21 +355,23 @@ def ready_units(metas: list[dict], is_satisfied: IsSatisfied) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 5) default_is_satisfied（預設來源 = handoff gate_status；保持可注入覆寫）
 # --------------------------------------------------------------------------- #
-def default_is_satisfied(slice_id: str, handoff_dir: str = DEFAULT_HANDOFF_DIR) -> bool:
-    """預設判定：runtime/handoff/<slice_id>.json 存在且 gate_status=='passed'。
-
-    檔不存在/壞檔/非 passed → False（fail-closed：未證明滿足即不釋放下游）。
-    這只是預設 impl；ready_units/dispatch_ready 一律收注入 predicate，
-    未來換 merged-to-main 來源只需換注入物（同 Callable[[str], bool] 介面）。
-    """
-    p = Path(handoff_dir) / f"{slice_id}.json"
-    if not p.is_file():
-        return False
-    try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-    return isinstance(payload, dict) and payload.get("gate_status") == "passed"
+def default_is_satisfied(
+    slice_id: str,
+    handoff_dir: str = DEFAULT_HANDOFF_DIR,
+    *,
+    repo_root: str | Path | None = None,
+    git_runner=None,
+) -> bool:
+    """預設判定：handoff 指向有效 CompletionRecord 且 candidate 仍為 target ancestor。"""
+    return (
+        completion.load_completion_from_handoff(
+            slice_id,
+            handoff_dir=handoff_dir,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        is not None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +388,7 @@ def dispatch_ready(
     persona: str = "builder",
     git_runner=None,
     launcher: AgentLauncher | None = None,
+    handoff_dir: str = DEFAULT_HANDOFF_DIR,
 ) -> list[dict]:
     """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
 
@@ -254,14 +422,28 @@ def dispatch_ready(
     for m in ready:
         slice_id = m["slice_id"]
         job: dict | None = None
+        pinned_inputs: dict | None = None
         try:
             prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
-            worktree = _launcher_worktree(dispatcher, slice_id)
+            pinned_inputs = pin_dispatch_inputs(m)
+            base_sha = _resolve_target_base_sha(
+                meta=m,
+                pinned_inputs=pinned_inputs,
+                handoff_dir=handoff_dir,
+                git_runner=runner,
+            )
+            worktree = _launcher_worktree(dispatcher, slice_id, base_sha=base_sha)
             # baseline 須在 agent 動工前取（launch 前），否則含進 agent 的 commit → 空 diff。
             try:
                 dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
             except Exception:
                 dispatch_head = None
+            _record_pending_slice(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                pinned_inputs=pinned_inputs,
+                dispatch_base=base_sha or dispatch_head,
+            )
             log_dir = str(Path("runtime/dispatch") / slice_id)
             # 在 launch 前先落地 registry row：Popen 之後、記錄完成之前若 daemon
             # 崩潰，仍有可回收的 job 列（否則 agent 在跑卻無 job / in_flight / 輪詢）。
@@ -271,6 +453,12 @@ def dispatch_ready(
                 persona=persona,
                 worktree=worktree,
                 dispatch_head=dispatch_head,
+            )
+            _mark_slice_building(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                builder_job_id=job.get("job_id"),
+                dispatch_base=base_sha or dispatch_head,
             )
             handle = launcher.launch(
                 slice_id=slice_id,
@@ -283,6 +471,8 @@ def dispatch_ready(
         except Exception as exc:
             if job is not None:
                 _fail_launching_job(dispatcher, job)
+            if pinned_inputs is not None:
+                _mark_slice_needs_human(dispatcher, slice_id, reason=str(exc))
             errors.append((slice_id, exc))
     if errors:
         raise DispatchReadyError(errors, jobs)
@@ -293,11 +483,65 @@ def _branch_for_slice(slice_id: str) -> str:
     return f"feature/{slice_id}"
 
 
-def _launcher_worktree(dispatcher, slice_id: str) -> str:
+def _resolve_target_base_sha(
+    *,
+    meta: dict,
+    pinned_inputs: dict,
+    handoff_dir: str,
+    git_runner,
+) -> str:
+    repo_root = _infer_repo_root(Path(pinned_inputs["spec_path"]))
+    target_branch = str(pinned_inputs["target_branch"])
+    target_remote = str(pinned_inputs["target_remote"])
+    target_ref = f"refs/remotes/{target_remote}/{target_branch}"
+    fetch = verification._run_git(
+        ["-C", str(repo_root), "fetch", "--no-tags", target_remote, target_branch],
+        git_runner,
+    )
+    if fetch["status"] != "ok":
+        raise ValueError(f"target fetch failed: {target_remote}/{target_branch}")
+    target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], git_runner)
+    target_sha = target_head["stdout"].strip().lower()
+    if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
+        raise ValueError(f"target ref unreadable: {target_ref}")
+    dependency_target: str | None = None
+    for dep in meta.get("depends_on", []):
+        dep_record = completion.load_completion_from_handoff(
+            str(dep),
+            handoff_dir=handoff_dir,
+            repo_root=repo_root,
+            git_runner=git_runner,
+        )
+        if dep_record is None:
+            raise ValueError(f"dependency unsatisfied: {dep}")
+        dep_target = str(dep_record["target_branch"])
+        if dependency_target is None:
+            dependency_target = dep_target
+        elif dependency_target != dep_target:
+            raise ValueError("dependency target branch mismatch")
+        if dep_target != target_branch:
+            raise ValueError("dependency chain target branch mismatch")
+        dep_candidate = str(dep_record["candidate"])
+        ancestor = verification._run_git(
+            ["-C", str(repo_root), "merge-base", "--is-ancestor", dep_candidate, target_sha],
+            git_runner,
+        )
+        if ancestor["status"] != "ok":
+            raise ValueError(f"dependency candidate stale: {dep}")
+    return target_sha
+
+
+def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None) -> str:
     worktree_creator = getattr(dispatcher, "_worktree_creator", None)
     if worktree_creator is None:
         return str(Path.cwd())
-    return worktree_creator.create(_branch_for_slice(slice_id))
+    branch = _branch_for_slice(slice_id)
+    if base_sha is None:
+        return worktree_creator.create(branch)
+    try:
+        return worktree_creator.create(branch, base_sha=base_sha)
+    except TypeError:
+        return worktree_creator.create(branch)
 
 
 def _record_launching_job(
@@ -325,6 +569,7 @@ def _record_launching_job(
     return registry.create_job(
         task=slice_id,
         persona=persona,
+        kind="build",
         branch=_branch_for_slice(slice_id),
         pane="",
         worktree=worktree,
@@ -334,6 +579,87 @@ def _record_launching_job(
         pid=None,
         log_path=None,
     )
+
+
+def _record_pending_slice(
+    *,
+    dispatcher,
+    slice_id: str,
+    pinned_inputs: dict,
+    dispatch_base: str | None,
+) -> None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    try:
+        registry.create_slice(
+            slice_id=slice_id,
+            spec_path=pinned_inputs["spec_path"],
+            spec_hash=pinned_inputs["spec_hash"],
+            plan_path=pinned_inputs["plan_path"],
+            plan_hash=pinned_inputs["plan_hash"],
+            target_branch=pinned_inputs["target_branch"],
+            target_remote=pinned_inputs["target_remote"],
+            verification_hash=pinned_inputs["verification_hash"],
+            verification=pinned_inputs.get("verification"),
+            dispatch_base=dispatch_base,
+            builder_job_id=None,
+            reviewer_job_id=None,
+            candidate=None,
+        )
+    except ValueError as exc:
+        if "slice 已存在" not in str(exc):
+            raise
+        registry.repin_slice(
+            slice_id,
+            spec_path=pinned_inputs["spec_path"],
+            spec_hash=pinned_inputs["spec_hash"],
+            plan_path=pinned_inputs["plan_path"],
+            plan_hash=pinned_inputs["plan_hash"],
+            target_branch=pinned_inputs["target_branch"],
+            target_remote=pinned_inputs["target_remote"],
+            verification_hash=pinned_inputs["verification_hash"],
+            verification=pinned_inputs.get("verification"),
+            dispatch_base=dispatch_base,
+        )
+
+
+def _mark_slice_building(
+    *,
+    dispatcher,
+    slice_id: str,
+    builder_job_id: str | None,
+    dispatch_base: str | None,
+) -> None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    registry.update_slice(
+        slice_id,
+        state="building",
+        builder_job_id=builder_job_id,
+        dispatch_base=dispatch_base,
+    )
+
+
+def _mark_slice_needs_human(dispatcher, slice_id: str, *, reason: str) -> None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        return
+    try:
+        registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+    except Exception:
+        return
+    try:
+        registry.record_action(
+            slice_id,
+            action="dispatch-failed",
+            actor="manager",
+            state="needs_human",
+            gate_state="needs_human",
+        )
+    except Exception:
+        _ = reason
 
 
 def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dict:
@@ -350,6 +676,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
     return registry.attach_launch_handle(
         job["job_id"],
         executor=handle.executor,
+        model_id=handle.model_id,
         session_name=handle.session_name,
         pid=handle.pid,
         log_path=handle.log_path,

@@ -17,7 +17,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 CHECKBOX_RE = re.compile(r"^- \[ \]", re.MULTILINE)
-TERMINAL = {"done", "failed", "stopped", "killed"}
+TERMINAL = {"exited", "failed"}
 
 
 @dataclass
@@ -161,9 +161,9 @@ def main() -> int:
             sum_remaining += remaining
             lines.append(fmt_progress(item, status, remaining))
 
-            if status == "done":
+            if status == "exited":
                 success += 1
-            if status in {"failed", "stopped", "killed"}:
+            if status == "failed":
                 failed += 1
             if status not in TERMINAL:
                 all_terminal = False

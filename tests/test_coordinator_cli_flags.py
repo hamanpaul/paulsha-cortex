@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import unittest
+from contextlib import redirect_stdout
 
-from paulsha_cortex.coordinator.cli import _refuse_unsafe_fanout, _resolve_launcher
+from paulsha_cortex.coordinator.cli import _build_parser, _refuse_unsafe_fanout, _resolve_launcher
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 
 
@@ -38,6 +40,54 @@ class RefuseUnsafeFanoutTests(unittest.TestCase):
     def test_safe_mode_unbounded(self) -> None:
         metas = [_meta(f"s{i}") for i in range(5)]
         _refuse_unsafe_fanout(metas, lambda s: True, allow_unsafe=False)  # 不 raise
+
+
+class ReapBrokerFlagTests(unittest.TestCase):
+    def test_reap_brokers_help_mentions_apply_and_cwd_root(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["reap-brokers", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--apply", buf.getvalue())
+        self.assertIn("--cwd-root", buf.getvalue())
+
+    def test_tick_help_no_longer_mentions_no_reap(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["tick", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertNotIn("--no-reap", buf.getvalue())
+
+
+class SliceActionFlagTests(unittest.TestCase):
+    def test_slice_action_help_mentions_actor_and_actions(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as exc:
+            with redirect_stdout(buf):
+                parser.parse_args(["slice-action", "--help"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertIn("--actor", buf.getvalue())
+        self.assertIn("retry-build", buf.getvalue())
+        self.assertIn("retry-review", buf.getvalue())
+
+    def test_slice_action_requires_actor(self) -> None:
+        parser = _build_parser()
+        with self.assertRaises(SystemExit) as exc:
+            parser.parse_args(["slice-action", "slice-a", "retry-build"])
+        self.assertEqual(exc.exception.code, 2)
+
+    def test_slice_action_parses_required_arguments(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["slice-action", "slice-a", "retry-build", "--actor", "operator"])
+        self.assertEqual(args.cmd, "slice-action")
+        self.assertEqual(args.slice_id, "slice-a")
+        self.assertEqual(args.action, "retry-build")
+        self.assertEqual(args.actor, "operator")
 
 
 if __name__ == "__main__":

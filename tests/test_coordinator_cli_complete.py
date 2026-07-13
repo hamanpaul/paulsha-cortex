@@ -2,48 +2,98 @@ from __future__ import annotations
 
 import io
 import json
-import tempfile
 import unittest
-from contextlib import redirect_stdout
-from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
 
 from paulsha_cortex.coordinator import cli
-from paulsha_cortex.coordinator.registry import JobRegistry
-from paulsha_cortex.coordinator.seams import PaneSender, WorktreeCreator
-
-
-class _FakeSender(PaneSender):
-    def send(self, *a, **k):  # pragma: no cover - complete 不會用到
-        raise AssertionError("complete 不應送 pane")
-
-
-class _FakeCreator(WorktreeCreator):
-    def create(self, *a, **k):  # pragma: no cover
-        raise AssertionError("complete 不應建 worktree")
 
 
 class CliCompleteTests(unittest.TestCase):
-    def test_complete_subcommand_writes_manifest_and_prints_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as d:
-            reg = JobRegistry(state_path=Path(d) / "jobs.json")
-            # 終態但缺 manifest → complete 應 reconcile 補寫（dispatch_head=None 免 git）
-            reg.create_job(task="slice-cli", persona="builder", branch="feature/slice-cli",
-                           pane="", worktree="/wt/slice-cli", executor="copilot",
-                           session_name="slice-cli", pid=1, log_path="/l.jsonl")
-            reg.update_headless_result("slice-cli-1", status="done", exit_code=0)
-            hdir = Path(d) / "handoff"
+    def test_complete_subcommand_routes_through_control_plane(self) -> None:
+        submitted: list[tuple[str, dict, str]] = []
+        polled: list[tuple[str, float, float]] = []
 
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                rc = cli.main(
-                    ["complete", "--handoff-dir", str(hdir)],
-                    registry=reg, pane_sender=_FakeSender(), worktree_creator=_FakeCreator(),
+        def fake_submit(req_type: str, args: dict, requested_by: str) -> str:
+            submitted.append((req_type, dict(args), requested_by))
+            return "req-complete-1"
+
+        def fake_poll(req_id: str, timeout: float, poll_interval: float = 0.5) -> dict:
+            polled.append((req_id, timeout, poll_interval))
+            return {
+                "status": "ok",
+                "result": {"completed": [{"slice_id": "slice-cli", "gate_status": "passed"}]},
+            }
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(
+                ["complete", "--handoff-dir", "runtime/handoff", "--specs-dir", "specs"],
+                control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                control_submit_request=fake_submit,
+                control_poll_done=fake_poll,
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            submitted,
+            [("complete", {"handoff_dir": "runtime/handoff", "specs_dir": "specs"}, "coordinator-cli")],
+        )
+        self.assertEqual(polled, [("req-complete-1", 5.0, 0.1)])
+        self.assertEqual(
+            json.loads(buf.getvalue()),
+            {"completed": [{"slice_id": "slice-cli", "gate_status": "passed"}]},
+        )
+
+    def test_complete_subcommand_refuses_missing_daemon(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = cli.main(
+                ["complete", "--handoff-dir", "runtime/handoff"],
+                control_read_status=lambda: {"degraded": True, "degraded_reason": "missing"},
+                control_submit_request=lambda *_args: "req-ignored",
+            )
+
+        self.assertNotEqual(rc, 0)
+        self.assertIn("manager daemon", err.getvalue())
+
+    def test_complete_subcommand_forwards_review_identity(self) -> None:
+        submitted: list[tuple[str, dict, str]] = []
+
+        def fake_submit(req_type: str, args: dict, requested_by: str) -> str:
+            submitted.append((req_type, dict(args), requested_by))
+            return "req-complete-2"
+
+        with redirect_stdout(io.StringIO()):
+            rc = cli.main(
+                [
+                    "complete",
+                    "--handoff-dir",
+                    "runtime/handoff",
+                    "--review-executor",
+                    "codex",
+                    "--review-model",
+                    "gpt-5.4",
+                ],
+                control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                control_submit_request=fake_submit,
+                control_poll_done=lambda *_args, **_kwargs: {"status": "ok", "result": {"completed": []}},
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            submitted,
+            [
+                (
+                    "complete",
+                    {
+                        "handoff_dir": "runtime/handoff",
+                        "review_executor": "codex",
+                        "review_model": "gpt-5.4",
+                    },
+                    "coordinator-cli",
                 )
-
-            self.assertEqual(rc, 0)
-            summary = json.loads(buf.getvalue())
-            self.assertEqual(summary["completed"], [{"slice_id": "slice-cli", "gate_status": "passed"}])
-            self.assertTrue((hdir / "slice-cli.json").exists())
+            ],
+        )
 
 
 if __name__ == "__main__":

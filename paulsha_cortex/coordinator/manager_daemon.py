@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
-from . import autonomy, broker_reaper, manager
+from . import autonomy, manager
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
 from .registry import JobRegistry
@@ -27,7 +27,6 @@ DEFAULT_EXECUTOR = "copilot"
 DEFAULT_MAX_LOAD = 1.0
 RECENT_DONE_LIMIT = 10
 MANAGER_CMD_MARKER = "paulsha_cortex.coordinator.manager_daemon"
-USE_DEFAULT_REAPER = object()
 
 
 @dataclass
@@ -123,10 +122,6 @@ def default_tick_interval() -> float:
         return DEFAULT_TICK_INTERVAL
 
 
-def default_reaper() -> Callable[[], dict[str, Any]]:
-    return lambda: broker_reaper.reap_orphan_brokers(apply=True)
-
-
 def _in_flight_status(registry) -> list[dict[str, Any]]:
     in_flight = []
     for job in registry.list_jobs():
@@ -145,6 +140,8 @@ def _in_flight_status(registry) -> list[dict[str, Any]]:
 
 def _held_reasons(meta: dict[str, Any], is_satisfied: Callable[[str], bool]) -> list[str]:
     reasons: list[str] = []
+    if isinstance(meta.get("parse_error"), dict):
+        reasons.append(f"parse-error:{meta['parse_error'].get('field', 'frontmatter')}")
     if not (isinstance(meta.get("plan"), str) and meta["plan"]):
         reasons.append("no-plan")
     if meta.get("dispatch") != "auto":
@@ -179,6 +176,7 @@ def build_runtime_status_provider(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     ready_units_fn: Callable[[list[dict[str, Any]], Callable[[str], bool]], list[dict[str, Any]]] = autonomy.ready_units,
     recent_done_limit: int = RECENT_DONE_LIMIT,
+    git_runner=None,
 ) -> Callable[[], dict[str, Any]]:
     def recent_done_provider() -> list[dict[str, Any]]:
         manifests: list[tuple[str, dict[str, Any]]] = []
@@ -204,7 +202,11 @@ def build_runtime_status_provider(
 
     def provider() -> dict[str, Any]:
         metas = scan_specs_fn(specs_dir)
-        predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
+        predicate = lambda slice_id: autonomy.default_is_satisfied(
+            slice_id,
+            handoff_dir=handoff_dir,
+            git_runner=git_runner,
+        )
         ready_units = ready_units_fn(metas, predicate)
         ready = [meta["slice_id"] for meta in ready_units]
         ready_ids = set(ready)
@@ -218,11 +220,29 @@ def build_runtime_status_provider(
             reasons = _held_reasons(meta, predicate)
             if reasons:
                 held.append({"slice_id": slice_id, "reasons": reasons})
+        slices: list[dict[str, Any]] = []
+        attention: list[dict[str, Any]] = []
+        list_slices = getattr(registry, "list_slices", None)
+        if callable(list_slices):
+            for slice_row in list_slices():
+                if not isinstance(slice_row, dict):
+                    continue
+                entry = manager.slice_status_entry(
+                    registry,
+                    slice_row,
+                    handoff_dir=handoff_dir,
+                    git_runner=git_runner,
+                )
+                slices.append(entry)
+                if entry.get("slice_state") == "needs_human":
+                    attention.append(entry)
         return {
             "ready": ready,
             "held": held,
             "in_flight": _in_flight_status(registry),
             "recent_done": recent_done_provider(),
+            "slices": slices,
+            "attention": attention,
         }
 
     return provider
@@ -236,25 +256,96 @@ def build_request_executor(
     launcher=None,
     default_persona: str = DEFAULT_PERSONA,
     default_executor: str = DEFAULT_EXECUTOR,
+    default_model: str | None = None,
+    default_review_executor: str | None = None,
+    default_review_model: str | None = None,
     default_max_load: float = DEFAULT_MAX_LOAD,
     reaper=None,
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
     dispatch_ready_fn: Callable[..., list[dict[str, Any]]] = autonomy.dispatch_ready,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
-
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
         request_specs_dir = args.get("specs_dir") or specs_dir
-        metas = scan_specs_fn(request_specs_dir)
+        request_handoff_dir = args.get("handoff_dir") or handoff_dir
+        predicate = lambda slice_id: autonomy.default_is_satisfied(
+            slice_id,
+            handoff_dir=request_handoff_dir,
+            git_runner=getattr(dispatcher, "_git_runner", None),
+        )
         allow_unsafe = bool(args.get("allow_unsafe", False))
         persona = args.get("persona", default_persona)
+        requested_model = args.get("model", default_model)
+        requested_review_executor = args.get("review_executor", default_review_executor)
+        requested_review_model = args.get("review_model", default_review_model)
+        active_review_launcher = _resolve_launcher(
+            requested_review_executor,
+            launcher,
+            allow_unsafe=allow_unsafe,
+            model=requested_review_model,
+        )
+        if request["type"] == "complete":
+            complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
+            complete_kwargs = {
+                "handoff_dir": request_handoff_dir,
+                "metas": complete_metas,
+            }
+            if requested_review_executor is not None or requested_review_model is not None:
+                complete_kwargs.update(
+                    {
+                        "review_launcher": active_review_launcher,
+                        "review_executor": requested_review_executor,
+                        "review_model": requested_review_model,
+                    }
+                )
+            return manager.complete_tick(
+                dispatcher,
+                **complete_kwargs,
+            )
+        if request["type"] == "slice-action":
+            slice_id = args.get("slice_id")
+            action = args.get("action")
+            actor = args.get("actor")
+            if not isinstance(slice_id, str) or not slice_id:
+                raise ValueError("slice-action requires slice_id")
+            if not isinstance(action, str) or not action:
+                raise ValueError("slice-action requires action")
+            if not isinstance(actor, str) or not actor:
+                raise ValueError("slice-action requires actor")
+            return manager.apply_slice_action(
+                dispatcher,
+                slice_id=slice_id,
+                action=action,
+                actor=actor,
+                specs_dir=request_specs_dir,
+                handoff_dir=request_handoff_dir,
+                launcher=_resolve_launcher(
+                    args.get("executor", default_executor),
+                    launcher,
+                    allow_unsafe=allow_unsafe,
+                    model=requested_model,
+                ),
+                review_launcher=active_review_launcher,
+                persona=persona,
+                review_executor=requested_review_executor,
+                review_model=requested_review_model,
+                git_runner=getattr(dispatcher, "_git_runner", None),
+            )
+        metas = scan_specs_fn(request_specs_dir)
         if request["type"] == "dispatch":
             slice_id = args.get("slice_id")
             target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
             if target is None:
                 raise ValueError("unknown-slice")
+            if isinstance(target.get("parse_error"), dict):
+                raise ValueError(f"invalid-spec:{target['parse_error'].get('field')}")
+            if not (
+                isinstance(target.get("target_branch"), str)
+                and target["target_branch"]
+                and isinstance(target.get("verification"), dict)
+            ):
+                raise ValueError("missing-verification-contract")
             if not (isinstance(target.get("plan"), str) and target["plan"]):
                 raise ValueError("no-plan")
             missing_deps = [dep for dep in target.get("depends_on", []) if not predicate(dep)]
@@ -275,7 +366,7 @@ def build_request_executor(
                 args.get("executor", default_executor),
                 launcher,
                 allow_unsafe=allow_unsafe,
-                model=args.get("model"),
+                model=requested_model,
             )
             dispatched = dispatch_ready_fn(
                 [{**target, "dispatch": "auto"}],
@@ -283,13 +374,23 @@ def build_request_executor(
                 dispatcher,
                 persona=persona,
                 launcher=active_launcher,
+                handoff_dir=request_handoff_dir,
+                git_runner=getattr(dispatcher, "_git_runner", None),
             )
             job = dispatched[0]
+            if registry is None:
+                raise RuntimeError("dispatch requires registry for pinned slice metadata")
+            slice_row = registry.get_slice(slice_id)
             result = {
                 "job_id": job.get("job_id"),
                 "worktree": job.get("worktree"),
                 "branch": job.get("branch"),
                 "slice_id": slice_id,
+                "target_branch": slice_row.get("target_branch"),
+                "target_remote": slice_row.get("target_remote"),
+                "spec_hash": slice_row.get("spec", {}).get("hash"),
+                "plan_hash": slice_row.get("plan", {}).get("hash"),
+                "verification_hash": slice_row.get("verification", {}).get("hash"),
             }
             if force_hold and target.get("dispatch") != "auto":
                 result["override"] = "hold"
@@ -300,7 +401,7 @@ def build_request_executor(
             args.get("executor", default_executor),
             launcher,
             allow_unsafe=allow_unsafe,
-            model=args.get("model"),
+            model=requested_model,
         )
         if request["type"] == "fanout":
             jobs = dispatch_ready_fn(
@@ -309,6 +410,8 @@ def build_request_executor(
                 dispatcher,
                 persona=persona,
                 launcher=active_launcher,
+                handoff_dir=request_handoff_dir,
+                git_runner=getattr(dispatcher, "_git_runner", None),
             )
             return {
                 "dispatch_skipped": False,
@@ -317,16 +420,27 @@ def build_request_executor(
                 "errors": [],
                 "reaped": None,
             }
+        run_tick_kwargs = {
+            "metas": metas,
+            "launcher": active_launcher,
+            "persona": persona,
+            "is_satisfied": predicate,
+            "handoff_dir": request_handoff_dir,
+            "require_idle": bool(args.get("require_idle", False)),
+            "max_load": float(args.get("max_load", default_max_load)),
+            "reaper": reaper,
+        }
+        if requested_review_executor is not None or requested_review_model is not None:
+            run_tick_kwargs.update(
+                {
+                    "review_launcher": active_review_launcher,
+                    "review_executor": requested_review_executor,
+                    "review_model": requested_review_model,
+                }
+            )
         return run_tick_fn(
             dispatcher,
-            metas=metas,
-            launcher=active_launcher,
-            persona=persona,
-            is_satisfied=predicate,
-            handoff_dir=handoff_dir,
-            require_idle=bool(args.get("require_idle", False)),
-            max_load=float(args.get("max_load", default_max_load)),
-            reaper=reaper,
+            **run_tick_kwargs,
         )
 
     return execute
@@ -340,14 +454,21 @@ def build_periodic_tick_runner(
     launcher=None,
     default_persona: str = DEFAULT_PERSONA,
     default_executor: str = DEFAULT_EXECUTOR,
+    default_model: str | None = None,
     default_allow_unsafe: bool = False,
     default_max_load: float = DEFAULT_MAX_LOAD,
     require_idle: bool = True,
     reaper=None,
+    default_review_executor: str | None = None,
+    default_review_model: str | None = None,
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
 ) -> Callable[[], dict[str, Any]]:
-    predicate = lambda slice_id: autonomy.default_is_satisfied(slice_id, handoff_dir=handoff_dir)
+    predicate = lambda slice_id: autonomy.default_is_satisfied(
+        slice_id,
+        handoff_dir=handoff_dir,
+        git_runner=getattr(dispatcher, "_git_runner", None),
+    )
 
     def execute() -> dict[str, Any]:
         metas = scan_specs_fn(specs_dir)
@@ -356,19 +477,33 @@ def build_periodic_tick_runner(
             default_executor,
             launcher,
             allow_unsafe=default_allow_unsafe,
-            model=None,
+            model=default_model,
         )
-        return run_tick_fn(
-            dispatcher,
-            metas=metas,
-            launcher=active_launcher,
-            persona=default_persona,
-            is_satisfied=predicate,
-            handoff_dir=handoff_dir,
-            require_idle=require_idle,
-            max_load=default_max_load,
-            reaper=reaper,
+        active_review_launcher = _resolve_launcher(
+            default_review_executor,
+            launcher,
+            allow_unsafe=default_allow_unsafe,
+            model=default_review_model,
         )
+        run_tick_kwargs = {
+            "metas": metas,
+            "launcher": active_launcher,
+            "persona": default_persona,
+            "is_satisfied": predicate,
+            "handoff_dir": handoff_dir,
+            "require_idle": require_idle,
+            "max_load": default_max_load,
+            "reaper": reaper,
+        }
+        if default_review_executor is not None or default_review_model is not None:
+            run_tick_kwargs.update(
+                {
+                    "review_launcher": active_review_launcher,
+                    "review_executor": default_review_executor,
+                    "review_model": default_review_model,
+                }
+            )
+        return run_tick_fn(dispatcher, **run_tick_kwargs)
 
     return execute
 
@@ -393,43 +528,82 @@ def run_loop(
     launcher=None,
     require_idle: bool = True,
     default_executor: str | None = None,
-    reaper: Callable[[], dict[str, Any]] | None | object = USE_DEFAULT_REAPER,
+    default_model: str | None = None,
+    default_review_executor: str | None = None,
+    default_review_model: str | None = None,
+    reaper: Callable[[], dict[str, Any]] | None = None,
 ) -> bool:
     runtime_pid = os.getpid() if pid is None else pid
     held_lock = acquire_lock(pid=runtime_pid, pid_alive=pid_alive, now_fn=now_fn)
     if held_lock is None:
         return False
 
-    reg = registry if registry is not None else JobRegistry()
-    disp = dispatcher
-    if disp is None:
-        disp = Dispatcher(reg, TmuxPaneSender(), ScriptWorktreeCreator())
     resolved_specs_dir = specs_dir or default_specs_dir()
     resolved_default_executor = default_executor or DEFAULT_EXECUTOR
-    resolved_reaper = default_reaper() if reaper is USE_DEFAULT_REAPER else reaper
+    reg = registry
+    disp = dispatcher
 
-    executor = request_executor or build_request_executor(
-        dispatcher=disp,
-        specs_dir=resolved_specs_dir,
-        handoff_dir=handoff_dir,
-        launcher=launcher,
-        default_executor=resolved_default_executor,
-        reaper=resolved_reaper,
-    )
+    def ensure_registry() -> JobRegistry:
+        nonlocal reg
+        if reg is None:
+            reg = JobRegistry()
+        return reg
+
+    def ensure_dispatcher() -> Dispatcher:
+        nonlocal disp
+        if disp is None:
+            disp = Dispatcher(ensure_registry(), TmuxPaneSender(), ScriptWorktreeCreator())
+        return disp
+
+    if request_executor is not None:
+        executor = request_executor
+    else:
+        executor_kwargs = {
+            "dispatcher": ensure_dispatcher(),
+            "specs_dir": resolved_specs_dir,
+            "handoff_dir": handoff_dir,
+            "launcher": launcher,
+            "default_executor": resolved_default_executor,
+            "reaper": reaper,
+        }
+        if default_model is not None:
+            executor_kwargs["default_model"] = default_model
+        if default_review_executor is not None or default_review_model is not None:
+            executor_kwargs.update(
+                {
+                    "default_review_executor": default_review_executor,
+                    "default_review_model": default_review_model,
+                }
+            )
+        executor = build_request_executor(**executor_kwargs)
     provider = status_provider or build_runtime_status_provider(
-        registry=reg,
+        registry=ensure_registry(),
         specs_dir=resolved_specs_dir,
         handoff_dir=handoff_dir,
+        git_runner=getattr(ensure_dispatcher(), "_git_runner", None),
     )
-    periodic_runner = periodic_tick_runner or build_periodic_tick_runner(
-        dispatcher=disp,
-        specs_dir=resolved_specs_dir,
-        handoff_dir=handoff_dir,
-        launcher=launcher,
-        require_idle=require_idle,
-        default_executor=resolved_default_executor,
-        reaper=resolved_reaper,
-    )
+    if periodic_tick_runner is not None:
+        periodic_runner = periodic_tick_runner
+    else:
+        periodic_kwargs = {
+            "dispatcher": ensure_dispatcher(),
+            "specs_dir": resolved_specs_dir,
+            "handoff_dir": handoff_dir,
+            "launcher": launcher,
+            "require_idle": require_idle,
+            "default_executor": resolved_default_executor,
+            "reaper": reaper,
+        }
+        if default_model is not None:
+            periodic_kwargs["default_model"] = default_model
+        if default_review_executor is not None or default_review_model is not None:
+            periodic_kwargs.update(
+                {
+                    "default_review_executor": default_review_executor,
+                    "default_review_model": default_review_model,
+                }
+            )
+        periodic_runner = build_periodic_tick_runner(**periodic_kwargs)
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
     constants.done_dir().mkdir(parents=True, exist_ok=True)
@@ -522,6 +696,8 @@ def run_loop(
                     updated_at=now_fn(),
                 )
                 status_payload["held"] = list(snapshot.get("held", []))
+                status_payload["slices"] = list(snapshot.get("slices", []))
+                status_payload["attention"] = list(snapshot.get("attention", []))
                 contract.atomic_write_json(constants.status_path(), status_payload)
             except Exception as exc:  # noqa: BLE001
                 _log_error(exc)
@@ -607,20 +783,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
     parser.add_argument("--tick-interval", type=float, default=default_tick_interval())
     parser.add_argument("--executor", default=default_executor())
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--review-executor", default=None)
+    parser.add_argument("--review-model", default=None)
     parser.add_argument("--specs-dir")
     parser.add_argument("--handoff-dir", default=autonomy.DEFAULT_HANDOFF_DIR)
     parser.add_argument("--max-rounds", type=int)
     parser.add_argument("--no-require-idle", action="store_true")
-    parser.add_argument(
-        "--no-reap",
-        dest="reap",
-        action="store_false",
-        default=True,
-        help="關閉收尾孤兒 codex broker 回收（預設開；issue #161）",
-    )
     args = parser.parse_args(argv)
     _install_signal_handlers()
-    active_reaper = default_reaper() if args.reap else None
 
     started = run_loop(
         poll_interval=args.poll_interval,
@@ -630,7 +801,9 @@ def main(argv: list[str] | None = None) -> int:
         max_rounds=args.max_rounds,
         require_idle=not args.no_require_idle,
         default_executor=args.executor,
-        reaper=active_reaper,
+        default_model=args.model,
+        default_review_executor=args.review_executor,
+        default_review_model=args.review_model,
     )
     return 0 if started else 1
 

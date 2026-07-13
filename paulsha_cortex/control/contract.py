@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from . import constants
 
-REQUEST_TYPES = frozenset({"tick", "fanout", "dispatch"})
+REQUEST_TYPES = frozenset({"tick", "fanout", "dispatch", "complete", "slice-action"})
 
 
 def utcnow() -> str:
@@ -41,7 +41,7 @@ def read_json(path: Path) -> dict[str, Any] | None:
         return None
     try:
         return json.loads(target.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
 

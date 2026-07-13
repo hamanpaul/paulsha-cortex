@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 # --------------------------------------------------------------------------- #
@@ -21,14 +22,84 @@ def _write_spec(dirpath: Path, name: str, frontmatter: str | None, body: str = "
     return p
 
 
+def _v1_verification_block(*, docs_class: str = "code") -> str:
+    return (
+        "target_branch: main\n"
+        "verification:\n"
+        f"  docs_class: {docs_class}\n"
+        "  required_artifacts: []\n"
+        "  checks:\n"
+        "    - kind: persona-scope\n"
+        "    - kind: command\n"
+        "      name: policy\n"
+        "      argv: [python3, -m, pytest, -q]\n"
+        "      cwd: .\n"
+        "      timeout_seconds: 30\n"
+        "  tests: []\n"
+        "  full_suite:\n"
+        "    argv: [python3, -m, pytest, -q]\n"
+        "    cwd: .\n"
+        "    timeout_seconds: 60\n"
+        "    baseline: no-regression"
+    )
+
+
 def _meta(slice_id, *, dispatch="auto", plan="docs/plan.md", depends_on=None, path=None):
+    spec_path = path or f"/specs/{slice_id}.md"
     return {
-        "path": path or f"/specs/{slice_id}.md",
+        "path": spec_path,
         "dispatch": dispatch,
         "slice_id": slice_id,
         "plan": plan,
         "depends_on": list(depends_on or []),
+        "target_branch": "main",
+        "verification": {
+            "docs_class": "code",
+            "review_policy": "required",
+            "required_artifacts": [],
+            "checks": [
+                {"kind": "persona-scope"},
+                {
+                    "kind": "command",
+                    "name": "policy",
+                    "argv": ["python3", "-m", "pytest", "-q"],
+                    "cwd": ".",
+                    "timeout_seconds": 300,
+                },
+            ],
+            "tests": [],
+            "full_suite": {
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 300,
+                "baseline": "no-regression",
+            },
+        },
+        "parse_error": None,
+        "_pinned_inputs": {
+            "spec_path": spec_path,
+            "spec_hash": "0" * 64,
+            "plan_path": plan or f"/plans/{slice_id}.md",
+            "plan_hash": "1" * 64,
+            "target_branch": "main",
+            "target_remote": "origin",
+            "verification_hash": "2" * 64,
+        },
     }
+
+
+def _fake_target_git_runner(args: list[str]):
+    if not args:
+        return ""
+    if args[0] == "rev-parse":
+        return "f" * 40
+    if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+        return ""
+    if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+        return "f" * 40
+    if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base" and args[3] == "--is-ancestor":
+        return ""
+    return ""
 
 
 class _FakeDispatcher:
@@ -65,7 +136,7 @@ class _RecordingLauncher:
 
         self.calls.append({"slice_id": slice_id, "prompt": prompt, "worktree": worktree})
         return LaunchHandle(
-            executor="copilot", session_name=slice_id, pid=100 + len(self.calls),
+            executor="copilot", model_id=None, session_name=slice_id, pid=100 + len(self.calls),
             log_path=f"{log_dir}/{slice_id}.jsonl",
         )
 
@@ -74,6 +145,132 @@ class _RecordingLauncher:
 # FrontmatterTests
 # --------------------------------------------------------------------------- #
 class FrontmatterTests(unittest.TestCase):
+    def test_parse_target_branch_and_verification_contract(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            p = _write_spec(
+                Path(d),
+                "verification.md",
+                "dispatch: auto\n"
+                "slice_id: verification-slice\n"
+                "plan: docs/superpowers/plans/verification.md\n"
+                "depends_on: [upstream]\n"
+                "target_branch: main\n"
+                "verification:\n"
+                "  docs_class: normative\n"
+                "  required_artifacts:\n"
+                "    - path: paulsha_cortex/example.py\n"
+                "      must_change: true\n"
+                "  checks:\n"
+                "    - kind: persona-scope\n"
+                "    - kind: command\n"
+                "      name: policy\n"
+                "      argv: [python3, -m, pytest, -q, tests/test_example.py]\n"
+                "      cwd: .\n"
+                "      timeout_seconds: 300\n"
+                "  tests:\n"
+                "    - argv: [python3, -m, pytest, -q, tests/test_example.py]\n"
+                "      cwd: .\n"
+                "      timeout_seconds: 120\n"
+                "  full_suite:\n"
+                "    argv: [python3, -m, pytest, -q]\n"
+                "    cwd: .\n"
+                "    timeout_seconds: 600\n"
+                "    baseline: no-regression",
+            )
+
+            meta = parse_spec_frontmatter(p)
+
+            self.assertEqual(meta["dispatch"], "auto")
+            self.assertEqual(meta["target_branch"], "main")
+            self.assertIsNone(meta["parse_error"])
+            self.assertEqual(meta["verification"]["docs_class"], "normative")
+            self.assertEqual(meta["verification"]["review_policy"], "required")
+            self.assertEqual(
+                meta["verification"]["required_artifacts"],
+                [{"path": "paulsha_cortex/example.py", "must_change": True}],
+            )
+            self.assertEqual(meta["verification"]["checks"][0], {"kind": "persona-scope"})
+            self.assertEqual(meta["verification"]["checks"][1]["name"], "policy")
+            self.assertEqual(
+                meta["verification"]["tests"][0]["argv"],
+                ["python3", "-m", "pytest", "-q", "tests/test_example.py"],
+            )
+            self.assertEqual(meta["verification"]["full_suite"]["baseline"], "no-regression")
+
+    def test_parse_invalid_verification_holds_with_structured_error(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        with tempfile.TemporaryDirectory() as d:
+            meta = parse_spec_frontmatter(
+                _write_spec(
+                    Path(d),
+                    "invalid.md",
+                    "dispatch: auto\n"
+                    "slice_id: invalid-slice\n"
+                    "plan: docs/superpowers/plans/invalid.md\n"
+                    "target_branch: main\n"
+                    "verification:\n"
+                    "  docs_class: code\n"
+                    "  required_artifacts: []\n"
+                    "  checks:\n"
+                    "    - kind: unknown-check\n"
+                    "  tests: []\n"
+                    "  full_suite:\n"
+                    "    argv: [python3, -m, pytest, -q]\n"
+                    "    cwd: .\n"
+                    "    timeout_seconds: 60\n"
+                    "    baseline: no-regression",
+                )
+            )
+
+            self.assertEqual(meta["dispatch"], "hold")
+            self.assertIsInstance(meta["parse_error"], dict)
+            self.assertEqual(meta["parse_error"]["code"], "invalid-frontmatter")
+            self.assertEqual(meta["parse_error"]["field"], "verification.checks[0].kind")
+            self.assertIn("unknown-check", meta["parse_error"]["message"])
+
+    def test_parse_docs_class_sets_review_policy(self) -> None:
+        from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
+
+        expected = {
+            "normative": "required",
+            "code": "required",
+            "informational": "not-required",
+            "trivial": "not-required",
+        }
+        with tempfile.TemporaryDirectory() as d:
+            for docs_class, review_policy in expected.items():
+                with self.subTest(docs_class=docs_class):
+                    meta = parse_spec_frontmatter(
+                        _write_spec(
+                            Path(d),
+                            f"{docs_class}.md",
+                            "dispatch: auto\n"
+                            f"slice_id: {docs_class}\n"
+                            "plan: docs/superpowers/plans/example.md\n"
+                            "target_branch: main\n"
+                            "verification:\n"
+                            f"  docs_class: {docs_class}\n"
+                            "  required_artifacts: []\n"
+                            "  checks:\n"
+                            "    - kind: persona-scope\n"
+                            "    - kind: command\n"
+                            "      name: policy\n"
+                            "      argv: [python3, -m, pytest, -q]\n"
+                            "      cwd: .\n"
+                            "      timeout_seconds: 30\n"
+                            "  tests: []\n"
+                            "  full_suite:\n"
+                            "    argv: [python3, -m, pytest, -q]\n"
+                            "    cwd: .\n"
+                            "    timeout_seconds: 60\n"
+                            "    baseline: no-regression",
+                        )
+                    )
+                    self.assertEqual(meta["verification"]["review_policy"], review_policy)
+
     def test_parse_auto_with_depends_on(self) -> None:
         from paulsha_cortex.coordinator.autonomy import parse_spec_frontmatter
 
@@ -83,7 +280,8 @@ class FrontmatterTests(unittest.TestCase):
                 "dispatch: auto\n"
                 "slice_id: persona-phase1-shadow-gate\n"
                 "plan: docs/superpowers/plans/p1.md\n"
-                "depends_on: [persona-phase0-config-loader, other]",
+                "depends_on: [persona-phase0-config-loader, other]\n"
+                + _v1_verification_block(),
             )
             meta = parse_spec_frontmatter(p)
             self.assertEqual(meta["dispatch"], "auto")
@@ -130,7 +328,12 @@ class FrontmatterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             meta = parse_spec_frontmatter(
-                _write_spec(Path(d), "scalar.md", "dispatch: auto\nslice_id: s\ndepends_on: only-one")
+                _write_spec(
+                    Path(d),
+                    "scalar.md",
+                    "dispatch: auto\nslice_id: s\nplan: docs/p.md\ndepends_on: only-one\n"
+                    + _v1_verification_block(),
+                )
             )
             self.assertEqual(meta["depends_on"], ["only-one"])  # 單一字串容錯成 list
 
@@ -143,7 +346,7 @@ class ScanTests(unittest.TestCase):
         from paulsha_cortex.coordinator.autonomy import scan_specs
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: b\nplan: p")
+            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: b\nplan: p\n" + _v1_verification_block())
             _write_spec(Path(d), "a.md", "dispatch: hold\nslice_id: a")
             _write_spec(Path(d), "c.md", None)  # 無 frontmatter
             metas = scan_specs(d)
@@ -262,17 +465,16 @@ class ReadyTests(unittest.TestCase):
         ]
         self.assertEqual(ready_units(metas, is_satisfied=lambda _id: True), [])
 
-    def test_default_is_satisfied_reads_gate_status(self) -> None:
+    def test_default_is_satisfied_delegates_to_completion_record_loader(self) -> None:
         from paulsha_cortex.coordinator.autonomy import default_is_satisfied
 
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, mock.patch(
+            "paulsha_cortex.coordinator.autonomy.completion.load_completion_from_handoff"
+        ) as load_record:
             hd = Path(d) / "handoff"
             hd.mkdir()
-            (hd / "passed-slice.json").write_text(
-                json.dumps({"gate_status": "passed"}), encoding="utf-8"
-            )
-            (hd / "failed-slice.json").write_text(
-                json.dumps({"gate_status": "failed"}), encoding="utf-8"
+            load_record.side_effect = lambda slice_id, **kwargs: (
+                {"slice_id": slice_id} if slice_id == "passed-slice" else None
             )
             self.assertTrue(default_is_satisfied("passed-slice", handoff_dir=str(hd)))
             self.assertFalse(default_is_satisfied("failed-slice", handoff_dir=str(hd)))
@@ -291,10 +493,10 @@ class FanoutTests(unittest.TestCase):
             _meta("held", dispatch="hold"),
             _meta("noplan", dispatch="auto", plan=None),
             _meta("blocked", depends_on=["down"]),     # down 未滿足 → 不就緒
-            _meta("ready-2", depends_on=["up"]),        # up 滿足 → 就緒
+            _meta("ready-2", depends_on=[]),
         ]
         launcher = _RecordingLauncher()
-        # is_satisfied 只對 "up" 回 True → ready-1（無相依）、ready-2（dep=up）就緒；
+        # ready-1 / ready-2（皆無相依）應就緒；
         # held（hold）/noplan（無 plan）/blocked（dep=down 未滿足）皆不就緒
         jobs = dispatch_ready(
             metas,
@@ -302,6 +504,7 @@ class FanoutTests(unittest.TestCase):
             dispatcher=_FakeDispatcher(),
             persona="builder",
             launcher=launcher,
+            git_runner=_fake_target_git_runner,
         )
         dispatched_tasks = [c["slice_id"] for c in launcher.calls]
         self.assertEqual(sorted(dispatched_tasks), ["ready-1", "ready-2"])
@@ -345,7 +548,7 @@ class FanoutTests(unittest.TestCase):
         metas = [_meta("slice-a", plan="docs/superpowers/plans/a.md")]
         dispatch_ready(
             metas, is_satisfied=lambda _id: True, dispatcher=_FakeDispatcher(),
-            persona="builder", launcher=launcher,
+            persona="builder", launcher=launcher, git_runner=_fake_target_git_runner,
         )
 
         self.assertEqual(len(launcher.calls), 1)
@@ -379,7 +582,7 @@ class FanoutTests(unittest.TestCase):
             with self.assertRaises(DispatchReadyError) as ctx:
                 dispatch_ready(
                     metas, is_satisfied=lambda _id: True, dispatcher=_FakeDispatcher(),
-                    persona="builder", launcher=launcher,
+                    persona="builder", launcher=launcher, git_runner=_fake_target_git_runner,
                 )
         finally:
             autonomy_mod.build_dispatch_prompt = original
@@ -398,12 +601,12 @@ class FanoutTests(unittest.TestCase):
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 calls.append({"slice_id": slice_id, "prompt": prompt, "worktree": worktree})
                 from paulsha_cortex.coordinator.launcher import LaunchHandle
-                return LaunchHandle(executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
+                return LaunchHandle(executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
 
         metas = [_meta("slice-a", plan="docs/p.md")]
         dispatch_ready(
             metas, is_satisfied=lambda _id: True, dispatcher=_FakeDispatcher(),
-            persona="builder", launcher=_FakeLauncher(),
+            persona="builder", launcher=_FakeLauncher(), git_runner=_fake_target_git_runner,
         )
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["slice_id"], "slice-a")
@@ -437,7 +640,7 @@ class FanoutTests(unittest.TestCase):
 
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 self.calls.append({"slice_id": slice_id, "worktree": worktree, "log_dir": log_dir})
-                return LaunchHandle(executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
+                return LaunchHandle(executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
 
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
@@ -451,6 +654,7 @@ class FanoutTests(unittest.TestCase):
                 dispatcher=disp,
                 persona="builder",
                 launcher=launcher,
+                git_runner=_fake_target_git_runner,
             )
 
             self.assertEqual(sender.sent, [])
@@ -482,7 +686,7 @@ class FanoutTests(unittest.TestCase):
                 self.calls.append(slice_id)
                 if slice_id == "slice-a":
                     raise RuntimeError("executor missing")
-                return LaunchHandle(executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
+                return LaunchHandle(executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x")
 
         with tempfile.TemporaryDirectory() as d:
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
@@ -495,6 +699,7 @@ class FanoutTests(unittest.TestCase):
                     dispatcher=disp,
                     persona="builder",
                     launcher=launcher,
+                    git_runner=_fake_target_git_runner,
                 )
 
             self.assertEqual(launcher.calls, ["slice-a", "slice-b"])
@@ -533,7 +738,7 @@ class FanoutTests(unittest.TestCase):
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 self.rows_at_launch = [j["task"] for j in self.reg.list_jobs()]
                 return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=123, log_path=f"{log_dir}/x"
+                    executor="copilot", model_id=None, session_name=slice_id, pid=123, log_path=f"{log_dir}/x"
                 )
 
         with tempfile.TemporaryDirectory() as d:
@@ -546,6 +751,7 @@ class FanoutTests(unittest.TestCase):
                 dispatcher=disp,
                 persona="builder",
                 launcher=launcher,
+                git_runner=_fake_target_git_runner,
             )
             # row existed when launch ran; handle (pid) attached afterwards.
             self.assertEqual(launcher.rows_at_launch, ["slice-a"])
@@ -603,7 +809,7 @@ class FanoutTests(unittest.TestCase):
             def launch(self, *, slice_id, prompt, worktree, log_dir):
                 self.calls.append(slice_id)
                 return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=200 + len(self.calls),
+                    executor="copilot", model_id=None, session_name=slice_id, pid=200 + len(self.calls),
                     log_path=f"{log_dir}/{slice_id}.jsonl",
                 )
 
@@ -624,9 +830,17 @@ class FanoutTests(unittest.TestCase):
             metas = [_meta("real-a", depends_on=[]), _meta("real-b", depends_on=[])]
             git_calls: list = []
 
-            def _fake_git(args):  # 注入 baseline runner，避免起真 git（#131）
+            def _fake_git(args):  # 注入 git runner，避免起真 git（target + baseline）
                 git_calls.append(list(args))
-                return "BASE_SHA"
+                if args and args[0] == "rev-parse":
+                    return "f" * 40
+                if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                    return ""
+                if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                    return "e" * 40
+                if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                    return ""
+                return ""
 
             _subprocess.run = _spy_run
             try:
@@ -645,11 +859,18 @@ class FanoutTests(unittest.TestCase):
             self.assertEqual(launcher.calls, ["real-a", "real-b"])
             self.assertEqual(sender.sent, [])   # headless：不送 tmux pane
             self.assertEqual(real_calls, [])     # 注入 git_runner → 全程不啟動真 git
-            # #131：baseline 經注入 runner 取得（launch 前讀 branch head）並持久化於 job
+            baseline_calls = [call for call in git_calls if call[:1] == ["rev-parse"]]
+            self.assertEqual(baseline_calls, [["rev-parse", "feature/real-a"], ["rev-parse", "feature/real-b"]])
+            self.assertEqual(sum(1 for call in git_calls if len(call) >= 3 and call[2] == "fetch"), 2)
             self.assertEqual(
-                git_calls, [["rev-parse", "feature/real-a"], ["rev-parse", "feature/real-b"]]
+                sum(
+                    1
+                    for call in git_calls
+                    if len(call) >= 4 and call[2] == "rev-parse" and call[3].startswith("refs/remotes/")
+                ),
+                2,
             )
-            self.assertEqual({j["dispatch_head"] for j in jobs}, {"BASE_SHA"})
+            self.assertEqual({j["dispatch_head"] for j in jobs}, {"f" * 40})
 
 
 # --------------------------------------------------------------------------- #
@@ -660,7 +881,7 @@ class CliTests(unittest.TestCase):
         from paulsha_cortex.coordinator.cli import main
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "r.md", "dispatch: auto\nslice_id: r\nplan: docs/p.md")
+            _write_spec(Path(d), "r.md", "dispatch: auto\nslice_id: r\nplan: docs/p.md\n" + _v1_verification_block())
             _write_spec(Path(d), "h.md", "dispatch: hold\nslice_id: h")
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
@@ -670,78 +891,51 @@ class CliTests(unittest.TestCase):
             self.assertEqual([m["slice_id"] for m in payload], ["r"])
 
     def test_main_fanout_with_fakes(self) -> None:
-        # headless fan-out（reviewer #112-3）：多就緒單位經 launcher 各啟 agent，
-        # registry 記 job，全程不送 tmux pane、不碰真 git。
-        import subprocess as _subprocess
-
         from paulsha_cortex.coordinator.cli import main
-        from paulsha_cortex.coordinator.launcher import LaunchHandle
-        from paulsha_cortex.coordinator.registry import JobRegistry
-
-        class _FakeSender:
-            def __init__(self):
-                self.sent = []
-
-            def send(self, pane_id, text):
-                self.sent.append((pane_id, text))
-
-        class _FakeWt:
-            def create(self, branch):
-                return f"/fake/wt/{branch.replace('/', '-')}"
-
-        class _FakeLauncher:
-            def __init__(self):
-                self.calls = []
-
-            def launch(self, *, slice_id, prompt, worktree, log_dir):
-                self.calls.append(slice_id)
-                return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=300 + len(self.calls),
-                    log_path=f"{log_dir}/{slice_id}.jsonl",
-                )
-
-        real_calls: list = []
-        orig_run = _subprocess.run
-
-        def _spy_run(args, *a, **k):
-            if args and args[0] == "git":
-                real_calls.append(list(args))
-            return orig_run(args, *a, **k)
+        submitted: list[tuple[str, dict, str]] = []
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md")
-            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: fb\nplan: docs/p.md\ndepends_on: [up]")
-            reg = JobRegistry(state_path=Path(d) / "jobs.json")
-            sender = _FakeSender()
-            launcher = _FakeLauncher()
             out = io.StringIO()
-            _subprocess.run = _spy_run
-            try:
-                with contextlib.redirect_stdout(out):
-                    rc = main(
-                        ["fanout", "--specs-dir", d, "--executor", "copilot"],
-                        registry=reg,
-                        pane_sender=sender,
-                        worktree_creator=_FakeWt(),
-                        is_satisfied=lambda _id: True,  # up 滿足 → fa, fb 都就緒
-                        launcher=launcher,
-                        git_runner=lambda args: "BASE_SHA",  # 注入 baseline runner（#131）
+            with contextlib.redirect_stdout(out):
+                rc = main(
+                    ["fanout", "--specs-dir", d, "--executor", "copilot"],
+                    control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                    control_submit_request=lambda req_type, args, requested_by: submitted.append(
+                        (req_type, dict(args), requested_by)
                     )
-            finally:
-                _subprocess.run = orig_run
+                    or "req-fanout-1",
+                    control_poll_done=lambda req_id, timeout, poll_interval=0.5: {
+                        "status": "ok",
+                        "result": {
+                            "dispatched": [
+                                {"job_id": "fa-1", "task": "fa", "dispatch_head": "BASE_SHA"},
+                                {"job_id": "fb-2", "task": "fb", "dispatch_head": "BASE_SHA"},
+                            ]
+                        },
+                    },
+                )
             self.assertEqual(rc, 0)
-            jobs = json.loads(out.getvalue())
-            self.assertEqual(sorted(j["task"] for j in jobs), ["fa", "fb"])
-            self.assertEqual(len(reg.list_jobs()), 2)
-            self.assertEqual(sorted(launcher.calls), ["fa", "fb"])
-            self.assertEqual(sender.sent, [])   # headless：不送 tmux pane
-            self.assertEqual(real_calls, [])     # 注入 git_runner → 全程不啟動真 git
-            # #131：baseline 持久化（注入 runner 回固定 sha）
-            self.assertEqual({j["dispatch_head"] for j in reg.list_jobs()}, {"BASE_SHA"})
+            summary = json.loads(out.getvalue())
+            self.assertEqual([j["task"] for j in summary["dispatched"]], ["fa", "fb"])
+            self.assertEqual(
+                submitted,
+                [
+                    (
+                        "fanout",
+                        {
+                            "specs_dir": d,
+                            "persona": "builder",
+                            "allow_unsafe": False,
+                            "model": None,
+                            "executor": "copilot",
+                        },
+                        "coordinator-cli",
+                    )
+                ],
+            )
 
     def test_main_fanout_executor_uses_headless_launcher_no_pane_send(self) -> None:
         from paulsha_cortex.coordinator.cli import main
-        from paulsha_cortex.coordinator.launcher import LaunchHandle
         from paulsha_cortex.coordinator.registry import JobRegistry
 
         class _FakeSender:
@@ -755,24 +949,9 @@ class CliTests(unittest.TestCase):
             def create(self, branch):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
-        class _FakeLauncher:
-            def __init__(self):
-                self.calls = []
-
-            def launch(self, *, slice_id, prompt, worktree, log_dir):
-                self.calls.append(
-                    {"slice_id": slice_id, "prompt": prompt, "worktree": worktree, "log_dir": log_dir}
-                )
-                return LaunchHandle(
-                    executor="copilot", session_name=slice_id, pid=4321,
-                    log_path=f"{log_dir}/{slice_id}.jsonl",
-                )
-
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md")
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
             sender = _FakeSender()
-            launcher = _FakeLauncher()
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = main(
@@ -780,30 +959,21 @@ class CliTests(unittest.TestCase):
                     registry=reg,
                     pane_sender=sender,
                     worktree_creator=_FakeWt(),
-                    is_satisfied=lambda _id: True,
-                    launcher=launcher,
+                    control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                    control_submit_request=lambda *_args: "req-fanout-2",
+                    control_poll_done=lambda req_id, timeout, poll_interval=0.5: {
+                        "status": "ok",
+                        "result": {"dispatched": [{"job_id": "fa-1", "task": "fa"}]},
+                    },
                 )
             self.assertEqual(rc, 0)
-            jobs = json.loads(out.getvalue())
-            # 走 headless 路徑：launcher.launch 被呼叫、無 pane send
-            self.assertEqual(len(launcher.calls), 1)
-            self.assertEqual(launcher.calls[0]["slice_id"], "fa")
-            self.assertEqual(sender.sent, [])  # 無 double dispatch
-            # registry/job 記錄 executor/session_name/pid/log_path
-            self.assertEqual(len(jobs), 1)
-            self.assertEqual(jobs[0]["executor"], "copilot")
-            self.assertEqual(jobs[0]["session_name"], "fa")
-            self.assertEqual(jobs[0]["pid"], 4321)
-            self.assertTrue(jobs[0]["log_path"].endswith("fa.jsonl"))
-            recorded = reg.get_job("fa-1")
-            self.assertEqual(recorded["executor"], "copilot")
-            self.assertEqual(recorded["session_name"], "fa")
-            self.assertEqual(recorded["pid"], 4321)
-            self.assertTrue(recorded["log_path"].endswith("fa.jsonl"))
+            summary = json.loads(out.getvalue())
+            self.assertEqual(summary["dispatched"], [{"job_id": "fa-1", "task": "fa"}])
+            self.assertEqual(sender.sent, [])  # mutation CLI 不得直接送 pane
+            self.assertEqual(reg.list_jobs(), [])  # 也不得成為第二個 mutable writer
 
     def test_main_fanout_without_executor_fails_fast(self) -> None:
-        # 不帶 --executor 卻有就緒單位 → fail-fast（reviewer #112-3）：
-        # 不再 silently 經 tmux pane 送多行 persona prompt；rc!=0 且提示改用 --executor。
+        # CLI 不再本地做 fanout；control plane 的錯誤應直接回傳給操作者。
         from paulsha_cortex.coordinator.cli import main
         from paulsha_cortex.coordinator.registry import JobRegistry
 
@@ -819,7 +989,7 @@ class CliTests(unittest.TestCase):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md")
+            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: fa\nplan: docs/p.md\n" + _v1_verification_block())
             reg = JobRegistry(state_path=Path(d) / "jobs.json")
             sender = _FakeSender()
             err = io.StringIO()
@@ -829,19 +999,24 @@ class CliTests(unittest.TestCase):
                     registry=reg,
                     pane_sender=sender,
                     worktree_creator=_FakeWt(),
-                    is_satisfied=lambda _id: True,
+                    control_read_status=lambda: {"degraded": False, "degraded_reason": None},
+                    control_submit_request=lambda *_args: "req-fanout-3",
+                    control_poll_done=lambda req_id, timeout, poll_interval=0.5: {
+                        "status": "error",
+                        "error": "請以 --executor 走 headless fanout",
+                    },
                 )
-            self.assertNotEqual(rc, 0)               # fail-fast
+            self.assertNotEqual(rc, 0)
             self.assertIn("--executor", err.getvalue())
-            self.assertEqual(sender.sent, [])        # 一行都沒送 pane
-            self.assertEqual(reg.list_jobs(), [])    # 也沒記 job
+            self.assertEqual(sender.sent, [])
+            self.assertEqual(reg.list_jobs(), [])
 
     def test_main_refuses_on_cycle(self) -> None:
         from paulsha_cortex.coordinator.cli import main
 
         with tempfile.TemporaryDirectory() as d:
-            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: A\nplan: p\ndepends_on: [B]")
-            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: B\nplan: p\ndepends_on: [A]")
+            _write_spec(Path(d), "a.md", "dispatch: auto\nslice_id: A\nplan: p\ndepends_on: [B]\n" + _v1_verification_block())
+            _write_spec(Path(d), "b.md", "dispatch: auto\nslice_id: B\nplan: p\ndepends_on: [A]\n" + _v1_verification_block())
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 rc = main(["ready", "--specs-dir", d], is_satisfied=lambda _id: True)
