@@ -492,6 +492,7 @@ def build_periodic_tick_runner(
     default_review_model: str | None = None,
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
+    auto_claim_fn: Callable[[], list[dict[str, Any]]] = manager.run_auto_claim_scan,
 ) -> Callable[[], dict[str, Any]]:
     predicate = lambda slice_id: autonomy.default_is_satisfied(
         slice_id,
@@ -500,6 +501,7 @@ def build_periodic_tick_runner(
     )
 
     def execute() -> dict[str, Any]:
+        auto_claims = auto_claim_fn()
         metas = scan_specs_fn(specs_dir)
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=default_allow_unsafe)
         active_launcher = _resolve_launcher(
@@ -532,7 +534,8 @@ def build_periodic_tick_runner(
                     "review_model": default_review_model,
                 }
             )
-        return run_tick_fn(dispatcher, **run_tick_kwargs)
+        result = run_tick_fn(dispatcher, **run_tick_kwargs)
+        return {**result, "auto_claims": auto_claims}
 
     return execute
 

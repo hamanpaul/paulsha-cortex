@@ -7,7 +7,8 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -27,6 +28,7 @@ class WorkAuthority:
     work_id: str
     mapped_issues: tuple[int, ...]
     confirmed_todo: bool
+    auto_label: bool
     source_revisions: tuple[str, ...]
     github_provider_id: str
     github_provider_revision: str
@@ -41,8 +43,10 @@ class WorkAuthority:
         work_id: str,
         mapped_issues: tuple[int, ...],
         confirmed_todo: bool,
+        auto_label: bool,
         source_revisions: tuple[str, ...],
         provider_revision: str,
+        provider_id: str = GITHUB_PROVIDER_ID,
         last_success_epoch: float,
         snapshot_hash: str,
     ) -> "WorkAuthority":
@@ -51,8 +55,9 @@ class WorkAuthority:
         object.__setattr__(authority, "work_id", work_id)
         object.__setattr__(authority, "mapped_issues", mapped_issues)
         object.__setattr__(authority, "confirmed_todo", confirmed_todo)
+        object.__setattr__(authority, "auto_label", auto_label)
         object.__setattr__(authority, "source_revisions", source_revisions)
-        object.__setattr__(authority, "github_provider_id", GITHUB_PROVIDER_ID)
+        object.__setattr__(authority, "github_provider_id", provider_id)
         object.__setattr__(authority, "github_provider_revision", provider_revision)
         object.__setattr__(authority, "github_last_success_epoch", last_success_epoch)
         object.__setattr__(authority, "snapshot_hash", snapshot_hash)
@@ -65,12 +70,7 @@ def canonical_work_snapshot_path() -> Path:
     return state_root / "work-items.snapshot.json"
 
 
-def load_work_authority(
-    *,
-    repo: str,
-    work_id: str,
-    snapshot_path: str | Path | None = None,
-) -> WorkAuthority:
+def _load_snapshot(snapshot_path: str | Path | None = None) -> tuple[dict, str]:
     path = Path(snapshot_path) if snapshot_path is not None else canonical_work_snapshot_path()
     if path.is_symlink() or not path.is_file():
         raise ValueError("durable work snapshot unavailable")
@@ -85,6 +85,9 @@ def load_work_authority(
     if not isinstance(providers, dict) or not isinstance(items, list):
         raise ValueError("durable work snapshot malformed")
     github = providers.get(GITHUB_PROVIDER_ID)
+    if github is None:
+        # PR A canonical schema keys GitHub providers by repo.
+        return payload, verification.canonical_json_hash(payload)
     if not isinstance(github, dict) or github.get("provider_id") != GITHUB_PROVIDER_ID:
         raise ValueError("durable GitHub provider authority missing")
     revision = github.get("revision")
@@ -100,43 +103,159 @@ def load_work_authority(
         or degraded
     ):
         raise ValueError("durable GitHub provider authority invalid")
-    matches = [
-        row
-        for row in items
-        if isinstance(row, dict) and row.get("repo") == repo and row.get("work_id") == work_id
-    ]
-    if len(matches) != 1:
-        raise ValueError("confirmed work authority missing or ambiguous")
-    row = matches[0]
+    return payload, verification.canonical_json_hash(payload)
+
+
+def _authority_from_row(
+    *, row: object, providers: dict, snapshot_hash: str
+) -> WorkAuthority:
+    if not isinstance(row, dict):
+        raise ValueError("confirmed work authority row malformed")
+    repo = row.get("repo")
+    work_id = row.get("work_id")
+    if "mapped_issues" not in row:
+        return _authority_from_canonical_row(
+            row=row,
+            providers=providers,
+            snapshot_hash=snapshot_hash,
+        )
+    github = providers.get(GITHUB_PROVIDER_ID)
+    if not isinstance(github, dict):
+        raise ValueError("durable GitHub provider authority missing")
     issues = row.get("mapped_issues")
     confirmed_todo = row.get("confirmed_todo")
+    auto_label = row.get("auto_label", False)
     source_revisions = row.get("source_revisions")
     if (
         not isinstance(issues, list)
-        or not issues
         or any(not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0 for issue in issues)
         or len(set(issues)) != len(issues)
     ):
-        raise ValueError("confirmed work authority requires mapped issues")
+        raise ValueError("confirmed work authority mapped issues invalid")
+    if (
+        not isinstance(repo, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
+        or not isinstance(work_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+    ):
+        raise ValueError("confirmed work authority identity invalid")
     if not isinstance(confirmed_todo, bool):
         raise ValueError("confirmed work authority Todo flag invalid")
+    if not isinstance(auto_label, bool):
+        raise ValueError("confirmed work authority auto label invalid")
     if (
         not isinstance(source_revisions, list)
         or not source_revisions
         or any(not isinstance(value, str) or not value.strip() for value in source_revisions)
     ):
         raise ValueError("confirmed work authority revisions invalid")
-    digest = verification.canonical_json_hash(payload)
     return WorkAuthority._verified(
         repo=repo,
         work_id=work_id,
         mapped_issues=tuple(sorted(issues)),
         confirmed_todo=confirmed_todo,
+        auto_label=auto_label,
         source_revisions=tuple(sorted(source_revisions)),
-        provider_revision=revision.strip(),
-        last_success_epoch=float(last_success),
-        snapshot_hash=digest,
+        provider_revision=github["revision"].strip(),
+        last_success_epoch=float(github["last_success_epoch"]),
+        snapshot_hash=snapshot_hash,
     )
+
+
+def _authority_from_canonical_row(
+    *, row: dict, providers: dict, snapshot_hash: str
+) -> WorkAuthority:
+    repo = row.get("repo")
+    work_id = row.get("work_id")
+    sources = row.get("sources")
+    if not isinstance(repo, str) or not isinstance(work_id, str) or not isinstance(sources, list):
+        raise ValueError("canonical work authority row malformed")
+    provider_id = f"github:{repo}"
+    github = providers.get(provider_id)
+    if not isinstance(github, dict):
+        raise ValueError("durable GitHub provider authority missing")
+    revision = github.get("revision")
+    last_success_at = github.get("last_success_at")
+    if (
+        github.get("status") != "ok"
+        or not isinstance(revision, str)
+        or not revision
+        or not isinstance(last_success_at, str)
+    ):
+        raise ValueError("durable GitHub provider authority invalid")
+    try:
+        last_success = datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValueError("durable GitHub provider timestamp invalid") from exc
+    confirmed = [
+        source
+        for source in sources
+        if isinstance(source, dict) and source.get("confidence") == "confirmed"
+    ]
+    issues: list[int] = []
+    for source in confirmed:
+        if source.get("kind") != "github_issue":
+            continue
+        match = re.fullmatch(rf"{re.escape(repo)}#([1-9][0-9]*)", str(source.get("ref", "")))
+        if match is not None:
+            issues.append(int(match.group(1)))
+    todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
+    confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
+    source_revisions = tuple(
+        sorted(
+            f"{source['source_id']}@{source['revision']}"
+            for source in confirmed
+            if isinstance(source.get("source_id"), str)
+            and source["source_id"]
+            and isinstance(source.get("revision"), str)
+            and source["revision"]
+        )
+    )
+    if not source_revisions:
+        raise ValueError("confirmed work authority revisions invalid")
+    return WorkAuthority._verified(
+        repo=repo,
+        work_id=work_id,
+        mapped_issues=tuple(sorted(set(issues))),
+        confirmed_todo=confirmed_todo,
+        auto_label=False,
+        source_revisions=source_revisions,
+        provider_revision=revision,
+        provider_id=provider_id,
+        last_success_epoch=last_success,
+        snapshot_hash=snapshot_hash,
+    )
+
+
+def load_work_authorities(
+    *, snapshot_path: str | Path | None = None
+) -> tuple[WorkAuthority, ...]:
+    payload, digest = _load_snapshot(snapshot_path)
+    providers = payload["providers"]
+    authorities = tuple(
+        _authority_from_row(row=row, providers=providers, snapshot_hash=digest)
+        for row in payload["work_items"]
+    )
+    identities = [(authority.repo, authority.work_id) for authority in authorities]
+    if len(set(identities)) != len(identities):
+        raise ValueError("confirmed work authority missing or ambiguous")
+    return authorities
+
+
+def load_work_authority(
+    *,
+    repo: str,
+    work_id: str,
+    snapshot_path: str | Path | None = None,
+) -> WorkAuthority:
+    matches = [
+        authority
+        for authority in load_work_authorities(snapshot_path=snapshot_path)
+        if authority.repo == repo and authority.work_id == work_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("confirmed work authority missing or ambiguous")
+    return matches[0]
 
 
 @dataclass(frozen=True)
@@ -150,6 +269,10 @@ class ClaimCandidate:
     auto_label: bool
     active_run_id: str | None
     active_claim_key: str | None
+    active_status: str | None = None
+    active_snapshot_hash: str | None = None
+    active_source_revisions: tuple[str, ...] | None = None
+    active_provider_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +333,17 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             or any(ch not in "0123456789abcdef" for ch in candidate.active_claim_key[-64:])
         ):
             raise ValueError("active workflow requires its persisted claim key")
+        if candidate.active_status not in {"ongoing", "needs_human", "blocked", "done"}:
+            raise ValueError("active workflow status invalid")
+        if (
+            not isinstance(candidate.active_snapshot_hash, str)
+            or len(candidate.active_snapshot_hash) != 64
+            or candidate.active_source_revisions is None
+            or not candidate.active_source_revisions
+            or not isinstance(candidate.active_provider_revision, str)
+            or not candidate.active_provider_revision
+        ):
+            raise ValueError("active workflow authority metadata missing")
 
 
 def build_claim_key(candidate: ClaimCandidate) -> str:
@@ -232,6 +366,49 @@ def build_claim_key(candidate: ClaimCandidate) -> str:
 def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     if candidate.active_run_id is None:
         return None
+    authority_changed = (
+        candidate.active_snapshot_hash != candidate.authority.snapshot_hash
+        or tuple(sorted(candidate.active_source_revisions or ()))
+        != candidate.authority.source_revisions
+        or candidate.active_provider_revision
+        != candidate.authority.github_provider_revision
+    )
+    if authority_changed:
+        return None
+    expected_key = build_claim_key(
+        replace(
+            candidate,
+            active_run_id=None,
+            active_claim_key=None,
+            active_status=None,
+            active_snapshot_hash=None,
+            active_source_revisions=None,
+            active_provider_revision=None,
+        )
+    )
+    if candidate.active_claim_key != expected_key:
+        raise ValueError("persisted claim key does not match authority")
+    if candidate.active_status == "done":
+        return ClaimDecision(
+            action="done",
+            reason="already-completed",
+            claim_key=candidate.active_claim_key,
+            run_id=candidate.active_run_id,
+        )
+    if candidate.active_status == "needs_human":
+        return ClaimDecision(
+            action="needs_human",
+            reason="human-intervention-required",
+            claim_key=candidate.active_claim_key,
+            run_id=candidate.active_run_id,
+        )
+    if candidate.active_status == "blocked":
+        return ClaimDecision(
+            action="blocked",
+            reason="persisted-block",
+            claim_key=candidate.active_claim_key,
+            run_id=candidate.active_run_id,
+        )
     return ClaimDecision(
         action="resume",
         reason="active-workflow",

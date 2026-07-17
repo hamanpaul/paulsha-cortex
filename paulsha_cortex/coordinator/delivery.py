@@ -215,7 +215,7 @@ def _validate_work_authority(
 ) -> None:
     if (
         not isinstance(authority, WorkAuthority)
-        or authority.github_provider_id != GITHUB_PROVIDER_ID
+        or not authority.github_provider_id.startswith(GITHUB_PROVIDER_ID)
         or not authority.github_provider_revision
         or not authority.mapped_issues
         or not authority.confirmed_todo
@@ -367,6 +367,21 @@ class ShipOrchestrator:
             raise RuntimeError("completion record candidate does not match delivered HEAD")
         if normalized["target_ref_sha"] != facts.default_head:
             raise RuntimeError("completion record target ref does not match remote default snapshot")
+        expected_work_authority = {
+            "repo": authority.repo,
+            "work_id": authority.work_id,
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_id": authority.github_provider_id,
+            "provider_revision": authority.github_provider_revision,
+            "source_revisions": sorted(authority.source_revisions),
+            "mapped_issues": sorted(authority.mapped_issues),
+            "pr_number": pr_number,
+            "change": change,
+            "todo_paths": sorted(todo_paths),
+            "merge_commit": facts.merge_commit.lower(),
+        }
+        if normalized.get("work_authority") != expected_work_authority:
+            raise RuntimeError("completion record WorkAuthority does not match remote delivery")
         record = completion.write_completion_record(
             normalized,
             coordinator_root=coordinator_root,
@@ -377,6 +392,8 @@ class ShipOrchestrator:
         )
         if reread["candidate"] != expected_head.lower():
             raise RuntimeError("completion record reread does not match delivered HEAD")
+        if reread.get("work_authority") != expected_work_authority:
+            raise RuntimeError("completion record reread WorkAuthority mismatch")
         final_facts = replace(facts, completion_record_valid=True)
         final_gate = evaluate_remote_closure(
             facts=final_facts,

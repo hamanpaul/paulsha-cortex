@@ -183,6 +183,13 @@ class RemoteClosureFacts:
     completion_record_valid: bool
 
 
+@dataclass(frozen=True)
+class MergeStatus:
+    merged: bool
+    pr_head: str
+    merge_commit: str | None
+
+
 def evaluate_remote_closure(
     *,
     facts: RemoteClosureFacts,
@@ -695,6 +702,32 @@ class GitHubDeliveryClient:
         self._run(
             build_copilot_request_argv(repo=repo, pr_number=pr_number),
             expect_json=True,
+        )
+
+    def fetch_merge_status(self, *, repo: str, pr_number: int) -> MergeStatus:
+        self._repo_parts(repo)
+        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
+        if not isinstance(pull, dict):
+            raise RuntimeError("GitHub PR merge status malformed")
+        try:
+            head = pull["head"]["sha"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub PR merge status malformed") from exc
+        merge_commit = pull.get("merge_commit_sha")
+        merged = pull.get("merged_at") is not None
+        if (
+            not isinstance(head, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None
+            or (merged and (
+                not isinstance(merge_commit, str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", merge_commit) is None
+            ))
+        ):
+            raise RuntimeError("GitHub PR merge status malformed")
+        return MergeStatus(
+            merged=merged,
+            pr_head=head.lower(),
+            merge_commit=merge_commit.lower() if merged else None,
         )
 
     def merge(

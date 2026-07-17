@@ -119,6 +119,34 @@ class WorkActionFlagTests(unittest.TestCase):
         self.assertEqual(submitted[0][1]["action"], "ship")
         self.assertEqual(submitted[0][1]["pr_number"], 8)
 
+    def test_work_link_parses_typed_kind_and_ref(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "work",
+                "link",
+                "demo",
+                "--repo",
+                "acme/demo",
+                "--kind",
+                "openspec",
+                "--ref",
+                "unified-work-lifecycle",
+            ]
+        )
+        self.assertEqual(args.kind, "openspec")
+        self.assertEqual(args.ref, "unified-work-lifecycle")
+
+    def test_work_help_exposes_typed_link_contract(self) -> None:
+        parser = _build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with redirect_stdout(buf):
+                parser.parse_args(["work", "--help"])
+        output = buf.getvalue()
+        self.assertIn("--kind", output)
+        self.assertIn("--ref", output)
+        self.assertIn("--issue", output)
+
 
 if __name__ == "__main__":
     unittest.main()

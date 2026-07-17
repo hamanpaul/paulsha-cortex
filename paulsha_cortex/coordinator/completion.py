@@ -62,6 +62,67 @@ def _normalize_digest_hash(value: object, *, field: str) -> str:
     return digest.lower()
 
 
+def _normalize_work_authority(value: object) -> dict[str, Any]:
+    required = {
+        "repo",
+        "work_id",
+        "snapshot_hash",
+        "provider_id",
+        "provider_revision",
+        "source_revisions",
+        "mapped_issues",
+        "pr_number",
+        "change",
+        "todo_paths",
+        "merge_commit",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("completion work_authority malformed")
+    repo = _require_non_empty_string(value.get("repo"), field="work_authority.repo")
+    if repo.count("/") != 1:
+        raise ValueError("completion work_authority repo invalid")
+    sources = value.get("source_revisions")
+    issues = value.get("mapped_issues")
+    todo_paths = value.get("todo_paths")
+    pr_number = value.get("pr_number")
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or any(not isinstance(item, str) or not item for item in sources)
+        or not isinstance(issues, list)
+        or not issues
+        or any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in issues)
+        or not isinstance(todo_paths, list)
+        or not todo_paths
+        or any(not isinstance(item, str) or not item for item in todo_paths)
+        or not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number <= 0
+    ):
+        raise ValueError("completion work_authority refs invalid")
+    return {
+        "repo": repo,
+        "work_id": _require_non_empty_string(value.get("work_id"), field="work_authority.work_id"),
+        "snapshot_hash": _normalize_digest_hash(
+            value.get("snapshot_hash"), field="work_authority.snapshot_hash"
+        ),
+        "provider_id": _require_non_empty_string(
+            value.get("provider_id"), field="work_authority.provider_id"
+        ),
+        "provider_revision": _require_non_empty_string(
+            value.get("provider_revision"), field="work_authority.provider_revision"
+        ),
+        "source_revisions": sorted(sources),
+        "mapped_issues": sorted(issues),
+        "pr_number": pr_number,
+        "change": _require_non_empty_string(value.get("change"), field="work_authority.change"),
+        "todo_paths": sorted(todo_paths),
+        "merge_commit": _normalize_git_sha(
+            value.get("merge_commit"), field="work_authority.merge_commit"
+        ),
+    }
+
+
 def validate_completion_record(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("completion record must be an object")
@@ -90,7 +151,7 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"completion record missing keys: {', '.join(missing)}")
-    extras = set(payload) - required
+    extras = set(payload) - required - {"work_authority"}
     if extras:
         raise ValueError(f"completion record unexpected key: {sorted(extras)[0]}")
     if payload.get("schema_version") != COMPLETION_SCHEMA_VERSION:
@@ -134,6 +195,8 @@ def validate_completion_record(payload: object) -> dict[str, Any]:
         "review_evaluation_hash": payload.get("review_evaluation_hash"),
         "completed_at": _require_non_empty_string(payload.get("completed_at"), field="completed_at"),
     }
+    if "work_authority" in payload:
+        normalized["work_authority"] = _normalize_work_authority(payload["work_authority"])
 
     reviewer_job_id = normalized["reviewer_job_id"]
     review_path = normalized["review_evaluation_path"]

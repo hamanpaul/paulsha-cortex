@@ -108,6 +108,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("work_id")
     p_work.add_argument("--repo", required=True)
     p_work.add_argument("--issue", type=int)
+    p_work.add_argument("--kind", choices=["github_issue", "github_pr", "openspec", "path"])
+    p_work.add_argument("--ref")
     toggle = p_work.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_true")
     toggle.add_argument("--disable", action="store_true")
@@ -240,6 +242,10 @@ def main(
         }
         if args.issue is not None:
             request_args["issue"] = args.issue
+        if args.kind is not None:
+            request_args["kind"] = args.kind
+        if args.ref is not None:
+            request_args["ref"] = args.ref
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)
         if args.payload:

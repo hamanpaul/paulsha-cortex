@@ -225,7 +225,9 @@ cortex slice-action "$SLICE_ID" abandon      --actor operator
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--issue` 指定來源，並由 payload 提供 repo root；`ship` 的 evidence refs 也以 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；repo root 與 `ship` evidence refs 由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+
+Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；缺 issue 的 confirmed Todo 會持久化為 `needs_human: missing_issue`，待 operator link 且 Monitor snapshot 更新後才能 resume。Run 的 claim key、snapshot、provider/source revisions 必須一致；terminal run 不視為 active，來源 revision 改變會建立新 run。
 
 ### 5. 由 Manager 完成交付
 
@@ -311,6 +313,7 @@ identities:
 - v1 只支援 preserving-commit 路徑：Candidate 必須是 `refs/remotes/<remote>/<target_branch>` 的 ancestor；squash/cherry-pick 視為不支援（保持 blocked 或 needs_human）。
 - 同一 dependency chain 必須使用同一 target branch，否則 fail-closed。
 - completion ordering 固定為「先 atomic 寫 CompletionRecord，再 atomic 標 Slice `completed`」。
+- work delivery CompletionRecord 另綁定 repo/work ID、Monitor snapshot/provider/source revisions、mapped issues、PR/OpenSpec/Todo refs 與 merge commit；cached done 每次仍會重新讀取 fresh authority 與 remote closure。
 - crash window（record 已寫、slice 尚未 completed）在 restart 後只會補完符合當前 target ancestry 的紀錄；不符合則維持 blocked。
 - 舊版無 `schema_version` / legacy `done` state 需先 clean-start（archive/remove 舊 `jobs.json`），不做 silent migration。
 

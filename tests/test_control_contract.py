@@ -104,6 +104,22 @@ def test_work_action_contract_requires_typed_routing_fields():
     with pytest.raises(ValueError, match="action invalid"):
         contract.validate_request(req)
 
+    typed = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "link",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "kind": "path",
+            "ref": "docs/demo.md",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(typed)["args"]["kind"] == "path"
+    typed["args"]["issue"] = 12
+    with pytest.raises(ValueError, match="exactly one"):
+        contract.validate_request(typed)
+
 
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):

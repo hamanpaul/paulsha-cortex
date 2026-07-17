@@ -650,6 +650,7 @@ def test_periodic_tick_runner_does_not_wire_reaper_and_uses_default_executor(mon
     dispatcher = FakeDispatcher(FakeRegistry())
     launcher = object()
     calls: list[dict[str, object]] = []
+    auto_calls: list[str] = []
 
     def fake_run_tick(
         dispatcher_arg,
@@ -683,9 +684,10 @@ def test_periodic_tick_runner_does_not_wire_reaper_and_uses_default_executor(mon
         launcher=launcher,
         run_tick_fn=fake_run_tick,
         scan_specs_fn=lambda specs_dir: [],
+        auto_claim_fn=lambda: auto_calls.append("scan") or [{"work_id": "demo"}],
     )
 
-    runner()
+    result = runner()
 
     assert len(calls) == 1
     assert calls[0]["dispatcher"] is dispatcher
@@ -695,6 +697,8 @@ def test_periodic_tick_runner_does_not_wire_reaper_and_uses_default_executor(mon
     assert calls[0]["require_idle"] is True
     assert calls[0]["max_load"] == manager_daemon.DEFAULT_MAX_LOAD
     assert calls[0]["reaper"] is None
+    assert auto_calls == ["scan"]
+    assert result["auto_claims"] == [{"work_id": "demo"}]
 
 
 def test_duplicate_req_id_is_idempotent(monkeypatch, tmp_path):

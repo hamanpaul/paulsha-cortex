@@ -322,6 +322,7 @@ def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path
 
 
 def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, last_success=0)
     verification_ref = verification.write_verification_evidence(
         {
             "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
@@ -356,6 +357,19 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
         "review_evaluation_path": review_ref["path"],
         "review_evaluation_hash": review_ref["hash"],
         "completed_at": "2026-07-17T00:00:00+00:00",
+        "work_authority": {
+            "repo": authority.repo,
+            "work_id": authority.work_id,
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_id": authority.github_provider_id,
+            "provider_revision": authority.github_provider_revision,
+            "source_revisions": list(authority.source_revisions),
+            "mapped_issues": list(authority.mapped_issues),
+            "pr_number": 7,
+            "change": "work",
+            "todo_paths": ["docs/todo.md"],
+            "merge_commit": HEAD2,
+        },
     }
 
     class GitHub:
@@ -379,7 +393,7 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
         repo="acme/demo",
         pr_number=7,
         change="work",
-        authority=_authority(tmp_path, last_success=0),
+        authority=authority,
         todo_paths=("docs/todo.md",),
         expected_head=HEAD1,
         completion_payload=completion_payload,
@@ -390,3 +404,72 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
         result.completion_record["path"],
         expected_hash=result.completion_record["hash"],
     )["candidate"] == HEAD1
+
+
+def test_remote_closure_rejects_completion_bound_to_another_work(tmp_path: Path) -> None:
+    authority = _authority(tmp_path, last_success=0)
+
+    class GitHub:
+        def fetch_remote_closure(self, **kwargs):
+            return RemoteClosureFacts(
+                merge_commit=HEAD2,
+                pr_head=HEAD1,
+                merge_parents=(HEAD3, HEAD1),
+                default_head=HEAD2,
+                merge_is_ancestor=True,
+                merge_is_merge_commit=True,
+                issue_states={14: "closed"},
+                active_openspec_absent=True,
+                archive_present=True,
+                todo_complete=True,
+                todo_revisions={"docs/todo.md": HEAD3},
+                completion_record_valid=False,
+            )
+
+    # Validation reaches authority binding before evidence references are read.
+    payload = {
+        "schema_version": completion.COMPLETION_SCHEMA_VERSION,
+        "slice_id": "ship-review",
+        "spec_hash": "1" * 64,
+        "plan_hash": "2" * 64,
+        "verification_hash": "3" * 64,
+        "builder_job_id": "builder-1",
+        "reviewer_job_id": None,
+        "dispatch_base": HEAD3,
+        "candidate": HEAD1,
+        "target_branch": "main",
+        "target_remote": "origin",
+        "target_ref": "refs/remotes/origin/main",
+        "target_ref_sha": HEAD2,
+        "verification_evidence_path": "/missing",
+        "verification_evidence_hash": "4" * 64,
+        "review_policy": "not-required",
+        "docs_class": "informational",
+        "review_evaluation_path": None,
+        "review_evaluation_hash": None,
+        "completed_at": "2026-07-17T00:00:00+00:00",
+        "work_authority": {
+            "repo": "acme/other",
+            "work_id": authority.work_id,
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_id": authority.github_provider_id,
+            "provider_revision": authority.github_provider_revision,
+            "source_revisions": list(authority.source_revisions),
+            "mapped_issues": list(authority.mapped_issues),
+            "pr_number": 7,
+            "change": "work",
+            "todo_paths": ["docs/todo.md"],
+            "merge_commit": HEAD2,
+        },
+    }
+    with pytest.raises(RuntimeError, match="WorkAuthority"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 0).verify_remote_closure(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            authority=authority,
+            todo_paths=("docs/todo.md",),
+            expected_head=HEAD1,
+            completion_payload=payload,
+            coordinator_root=tmp_path,
+        )

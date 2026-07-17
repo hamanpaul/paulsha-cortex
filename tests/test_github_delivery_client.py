@@ -177,6 +177,15 @@ def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive() -> No
     assert not facts.completion_record_valid
 
 
+def test_fetch_merge_status_binds_merged_side_effect_to_exact_pr_head() -> None:
+    status = GitHubDeliveryClient(runner=FakeRunner()).fetch_merge_status(
+        repo="acme/demo", pr_number=7
+    )
+    assert status.merged
+    assert status.pr_head == HEAD
+    assert status.merge_commit == MERGE
+
+
 def test_fetch_fails_closed_on_non_json_or_gh_error() -> None:
     class BrokenRunner:
         def __call__(self, argv, **kwargs):

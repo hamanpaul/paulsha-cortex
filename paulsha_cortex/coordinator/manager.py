@@ -2349,3 +2349,10 @@ def apply_work_action(*, args, requested_by):
     from .work_actions import execute_work_action
 
     return execute_work_action(args=args, requested_by=requested_by)
+
+
+def run_auto_claim_scan():
+    """Periodic Manager-owned durable work claim projection."""
+    from .work_actions import run_auto_claim_scan as scan
+
+    return scan()

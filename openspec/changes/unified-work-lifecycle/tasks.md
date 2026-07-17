@@ -28,8 +28,8 @@
 ## 3. PR C — Delivery automation
 
 - [x] 3.1 RED-testmanual default、confirmed Todo+label auto claim、issue-only、missing issue、label removal與crash/restart。
-- [x] 3.2 實作`work link|unlink|start|resume|auto` control requests；Manager維持唯一writer。
-- [ ] 3.3 實作official archive、Todo/spec/docs/changelog gate、zh-TW PR metadata、policy與`PSC_PREFLIGHT_CMD` runner。
+- [x] 3.2 實作typed `work link|unlink|start|resume|auto` control requests與periodic auto-claim scan；Manager維持唯一writer。
+- [ ] 3.3 實作official archive、Todo/spec/docs/changelog gate、zh-TW PR metadata、policy與`PSC_PREFLIGHT_CMD` runner。（validation/archive/preflight已落地；PR create/update metadata orchestration尚未完成。）
 - [x] 3.4 RED-testold-HEAD/error Copilot review、unresolved thread、push未重審、failed/cancelled/pending checks與HEAD race。
 - [x] 3.5 實作每HEAD review epoch、兩輪/15分鐘bounded loop、exact-tree skip-tests與needs_human fallback。
 - [x] 3.6 實作`gh pr merge --merge`前final reread與merge後remote closure/CompletionRecord。
