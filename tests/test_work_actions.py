@@ -17,10 +17,31 @@ from paulsha_cortex.coordinator.github_delivery import (
     ReviewThread,
 )
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
+from paulsha_cortex.coordinator.registry import JobRegistry
 
 
 HEAD = "a" * 40
 TREE = "b" * 40
+
+
+def _only_journal_row(state: Path) -> dict:
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert payload["schema"] == "cortex-delivery-journal/v1"
+    assert len(payload["runs"]) == 1
+    return next(iter(payload["runs"].values()))
+
+
+def _initialize_delivery_journal(*, snapshot: Path, state: Path) -> dict:
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=state.parent / "jobs.json")
+    work_actions._load_work_run(
+        state_path=state,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    return _only_journal_row(state)
 
 
 def _init_repo(root: Path, repo: str = "acme/demo") -> Path:
@@ -220,7 +241,7 @@ def test_preflight_authorization_hash_excludes_drifting_command_output() -> None
     assert work_actions._preflight_hash(first) == work_actions._preflight_hash(second)
 
 
-def test_source_change_starts_new_run_and_terminal_run_is_not_resumed(tmp_path: Path) -> None:
+def test_source_change_starts_new_canonical_run(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
     first = work_actions.execute_work_action(
@@ -230,18 +251,6 @@ def test_source_change_starts_new_run_and_terminal_run_is_not_resumed(tmp_path: 
         state_path=state,
         now=lambda: 200,
     )
-    payload = json.loads(state.read_text(encoding="utf-8"))
-    payload["runs"]["acme/demo/demo"]["status"] = "done"
-    state.write_text(json.dumps(payload), encoding="utf-8")
-    done = work_actions.execute_work_action(
-        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
-        requested_by="operator",
-        snapshot_path=snapshot,
-        state_path=state,
-        now=lambda: 200,
-    )
-    assert done["result"]["action"] == "done"
-
     _snapshot(
         snapshot,
         source_revisions=("issue:12@open", "openspec:demo@2"),
@@ -644,8 +653,11 @@ def test_ship_needs_human_when_authority_has_multiple_delivery_targets(
         "action": "needs_human",
         "reason": "multiple-delivery-targets-unsupported",
     }
-    persisted = json.loads(state.read_text(encoding="utf-8"))["runs"]["acme/demo/demo"]
-    assert persisted["status"] == "needs_human"
+    persisted = _only_journal_row(state)
+    assert "status" not in persisted
+    assert JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0].facets == (
+        "needs_human",
+    )
 
 
 def test_ship_rejects_old_run_after_current_authority_changes(tmp_path: Path) -> None:
@@ -785,7 +797,7 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
 
         def merge_if_ready(self, **kwargs):
             calls.append("merge-if-ready")
-            durable = json.loads(state.read_text(encoding="utf-8"))["runs"]["acme/demo/demo"]
+            durable = _only_journal_row(state)
             assert durable["ship"]["phase"] == "merge-authorized"
             assert durable["ship"]["merge_authorization"]["hash"]
             authorization_path = Path(durable["ship"]["merge_authorization"]["path"])
@@ -1018,8 +1030,11 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
                 "action": "needs_human",
                 "reason": "copilot-finding-budget-exhausted",
             }
-    persisted = json.loads(state.read_text(encoding="utf-8"))["runs"]["acme/demo/demo"]
-    assert persisted["status"] == "needs_human"
+    persisted = _only_journal_row(state)
+    assert "status" not in persisted
+    assert JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()[0].facets == (
+        "needs_human",
+    )
     assert persisted["ship"]["fix_rounds"] == 2
 
 
@@ -1119,8 +1134,9 @@ def test_crash_reconcile_uses_stable_authorization_without_rerunning_preflight(
         state_path=state,
         now=lambda: 200,
     )
+    _initialize_delivery_journal(snapshot=snapshot, state=state)
     persisted = json.loads(state.read_text(encoding="utf-8"))
-    run = persisted["runs"]["acme/demo/demo"]
+    run = next(iter(persisted["runs"].values()))
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )
@@ -1217,8 +1233,9 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
         state_path=state,
         now=lambda: 200,
     )
+    _initialize_delivery_journal(snapshot=snapshot, state=state)
     persisted = json.loads(state.read_text(encoding="utf-8"))
-    run = persisted["runs"]["acme/demo/demo"]
+    run = next(iter(persisted["runs"].values()))
     authority = work_actions.load_work_authority(
         repo="acme/demo", work_id="demo", snapshot_path=snapshot
     )
@@ -1245,7 +1262,6 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
         },
         state_path=state,
     )
-    run["status"] = "done"
     run["delivery_binding"] = {
         "pr_number": 8,
         "change": "demo",

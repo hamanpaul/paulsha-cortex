@@ -1060,6 +1060,7 @@ class JobRegistry:
         run_id: str,
         *,
         current_phase: str | None = None,
+        source_revision: str | None = None,
         steps: tuple[WorkflowStep, ...] | None = None,
         issue_refs: tuple[str, ...] | None = None,
         openspec_refs: tuple[str, ...] | None = None,
@@ -1074,6 +1075,13 @@ class JobRegistry:
         facets: tuple[str, ...] | None = None,
         gate_status: str | None = None,
         planning_authority: tuple[PlanningArtifactAuthority, ...] | None = None,
+        status: str | None = None,
+        completion_record_path: str | None = None,
+        completion_record_hash: str | None = None,
+        completion_record_revision: str | None = None,
+        completion_source_revisions: dict[str, str] | None = None,
+        pr_candidate: str | None = None,
+        merge_revision: str | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1084,7 +1092,9 @@ class JobRegistry:
             work_id=current.work_id,
             repo=current.repo,
             claim_key=current.claim_key,
-            source_revision=current.source_revision,
+            source_revision=(
+                current.source_revision if source_revision is None else source_revision
+            ),
             workspace_root=current.workspace_root,
             combo=current.combo,
             current_phase=next_phase,
@@ -1110,6 +1120,29 @@ class JobRegistry:
                 if planning_authority is None
                 else tuple(planning_authority)
             ),
+            status=current.status if status is None else status,
+            completion_record_path=(
+                current.completion_record_path
+                if completion_record_path is None
+                else completion_record_path
+            ),
+            completion_record_hash=(
+                current.completion_record_hash
+                if completion_record_hash is None
+                else completion_record_hash
+            ),
+            completion_record_revision=(
+                current.completion_record_revision
+                if completion_record_revision is None
+                else completion_record_revision
+            ),
+            completion_source_revisions=(
+                dict(current.completion_source_revisions)
+                if completion_source_revisions is None
+                else dict(completion_source_revisions)
+            ),
+            pr_candidate=current.pr_candidate if pr_candidate is None else pr_candidate,
+            merge_revision=current.merge_revision if merge_revision is None else merge_revision,
         )
         self._workflows[index] = updated
         self._persist()

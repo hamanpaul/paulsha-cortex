@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -274,6 +274,13 @@ class WorkflowRun:
     created_at: str
     updated_at: str
     planning_authority: tuple[PlanningArtifactAuthority, ...] = ()
+    status: str = "ongoing"
+    completion_record_path: str | None = None
+    completion_record_hash: str | None = None
+    completion_record_revision: str | None = None
+    completion_source_revisions: dict[str, str] = field(default_factory=dict)
+    pr_candidate: str | None = None
+    merge_revision: str | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -338,6 +345,30 @@ class WorkflowRun:
             raise ValueError("workflow run facets 格式錯誤")
         if self.gate_status not in WORKFLOW_GATE_STATUSES:
             raise ValueError(f"workflow run gate_status 非法: {self.gate_status!r}")
+        if self.status not in {"ongoing", "done"}:
+            raise ValueError(f"workflow run status 非法: {self.status!r}")
+        completion_values = (
+            self.completion_record_path,
+            self.completion_record_hash,
+            self.completion_record_revision,
+            self.pr_candidate,
+            self.merge_revision,
+        )
+        if any(value is not None for value in completion_values):
+            if any(not isinstance(value, str) or not value for value in completion_values):
+                raise ValueError("workflow completion fields must be supplied together")
+            if not self.completion_source_revisions or any(
+                not isinstance(key, str)
+                or not key
+                or not isinstance(value, str)
+                or not value
+                for key, value in self.completion_source_revisions.items()
+            ):
+                raise ValueError("workflow completion source revisions invalid")
+        elif self.completion_source_revisions:
+            raise ValueError("workflow completion source revisions require completion fields")
+        if self.status == "done" and not all(completion_values):
+            raise ValueError("done workflow requires bound completion evidence")
         if self.gate_status == "passed":
             required_kinds = ["foreign-review"]
             if self.brainstorm_required:
@@ -399,6 +430,13 @@ class WorkflowRun:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "planning_authority": [item.to_dict() for item in self.planning_authority],
+            "status": self.status,
+            "completion_record_path": self.completion_record_path,
+            "completion_record_hash": self.completion_record_hash,
+            "completion_record_revision": self.completion_record_revision,
+            "completion_source_revisions": dict(self.completion_source_revisions),
+            "pr_candidate": self.pr_candidate,
+            "merge_revision": self.merge_revision,
         }
 
     @classmethod
@@ -463,6 +501,13 @@ class WorkflowRun:
             planning_authority=tuple(
                 PlanningArtifactAuthority.from_dict(item) for item in planning_authority
             ),
+            status=payload.get("status", "ongoing"),
+            completion_record_path=payload.get("completion_record_path"),
+            completion_record_hash=payload.get("completion_record_hash"),
+            completion_record_revision=payload.get("completion_record_revision"),
+            completion_source_revisions=dict(payload.get("completion_source_revisions", {})),
+            pr_candidate=payload.get("pr_candidate"),
+            merge_revision=payload.get("merge_revision"),
         )
 
 

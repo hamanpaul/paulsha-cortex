@@ -55,6 +55,10 @@ cortex work auto unified-work-lifecycle --repo owner/repo --disable
 cortex doctor --probe-live --repo owner/repo --json
 ```
 
+`link`、`unlink`、`start` 與 `resume` 不要求 caller 提供 repo root；Manager 只會從 installer 的 `PSC_REPO_ROOT` 或 Monitor workspace registry 解析與 `owner/repo` remote 完全一致的 canonical git top-level。`auto` 未指定相容用的 `--issue` 時會套用到全部 confirmed mapped issues。
+
+工作啟動後，`$PSC_COORDINATOR_ROOT/jobs.json` 內的 `workflows` 是唯一 workflow lifecycle truth。Delivery journal 只保存以同一 `run_id` 為 key 的 resumable ship phase，不另建 lifecycle state。沒有既有 PR 時，Manager 會從 reviewed builder job、confirmed issue 與 OpenSpec authority 產生 zh-TW metadata，先以 metadata context 跑 preflight，再冪等建立 PR 並把 `pr_ref` 原子寫回同一個 `WorkflowRun`；後續 merge 與 CompletionRecord 也綁定該 run 的 exact Candidate 與 canonical verification/review evidence。
+
 工作預設 manual。Auto claim 同時要求 confirmed Todo、confirmed issue 與 `cortex:auto-on-going` label；移除 label 只阻止尚未 claim 的工作，不會中止 active workflow。Todo 缺 issue 時不會自動建立 issue，而是 `needs_human: missing_issue`。
 
 ## Snapshot 與 registry migration

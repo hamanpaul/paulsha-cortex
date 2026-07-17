@@ -46,6 +46,7 @@ from .github_delivery import (
 )
 from . import verification
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
+from .work_bridge import resolve_trusted_repo_root, workflow_status
 
 
 Runner = Callable[..., object]
@@ -236,8 +237,7 @@ def _path_has_symlink(root: Path, relative: str) -> bool:
 
 
 def _override_path(args: dict[str, Any], *, repo: str) -> Path:
-    repo_root = args.get("repo_root")
-    root = _canonical_repo_root(repo_root, repo=repo)
+    root = resolve_trusted_repo_root(repo, explicit=args.get("repo_root"))
     cortex_dir = root / ".cortex"
     if cortex_dir.is_symlink():
         raise ValueError("repo_root .cortex must not be a symlink")
@@ -381,19 +381,19 @@ def _mutate_override(*, args: dict[str, Any], repo: str, work_id: str) -> dict[s
 
 
 def _run_state_path() -> Path:
-    return paths.coordinator_root() / "work-runs.json"
+    return paths.coordinator_root() / "delivery-journal.json"
 
 
 def _load_runs(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"schema": "cortex-work-runs/v1", "runs": {}}
+        return {"schema": "cortex-delivery-journal/v1", "runs": {}}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("work run state unreadable") from exc
     if (
         not isinstance(payload, dict)
-        or payload.get("schema") != "cortex-work-runs/v1"
+        or payload.get("schema") != "cortex-delivery-journal/v1"
         or not isinstance(payload.get("runs"), dict)
     ):
         raise ValueError("work run state malformed")
@@ -401,7 +401,7 @@ def _load_runs(path: Path) -> dict[str, Any]:
         if (
             not isinstance(key, str)
             or not isinstance(row, dict)
-            or row.get("status") not in {"ongoing", "needs_human", "blocked", "done"}
+            or row.get("run_id") != key
             or not isinstance(row.get("run_id"), str)
             or not isinstance(row.get("claim_key"), str)
             or not isinstance(row.get("snapshot_hash"), str)
@@ -434,12 +434,61 @@ def _save_runs(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
-def _load_work_run(*, state_path: Path, repo: str, work_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _canonical_workflow_run(*, workflow_registry, authority):
+    digest = work_authority_digest(authority)
+    matches = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.source_revision == digest
+        and run.issue_refs
+        == tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
+        and run.openspec_refs == authority.mapped_openspec
+        and run.pr_refs
+        == tuple(f"{authority.repo}#{number}" for number in authority.mapped_prs)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "delivery WorkflowRun does not match current WorkAuthority"
+        )
+    return matches[0]
+
+
+def _delivery_journal_row(run, authority) -> dict[str, Any]:
+    return {
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "source_revisions": list(authority.source_revisions),
+        "snapshot_hash": authority.snapshot_hash,
+        "provider_revision": authority.github_provider_revision,
+        "authority_digest": work_authority_digest(authority),
+        "mapped_issues": list(authority.mapped_issues),
+        "mapped_prs": list(authority.mapped_prs),
+        "mapped_openspec": list(authority.mapped_openspec),
+        "mapped_todo_paths": list(authority.mapped_todo_paths),
+        "workflow_step_ids": [
+            f"{run.run_id}:{step.phase}:{step.card}" for step in run.steps
+        ],
+    }
+
+
+def _load_work_run(
+    *, state_path: Path, workflow_registry, authority
+) -> tuple[dict[str, Any], dict[str, Any], object]:
+    run = _canonical_workflow_run(
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
     state = _load_runs(state_path)
-    active = state["runs"].get(f"{repo}/{work_id}")
-    if not isinstance(active, dict):
-        raise RuntimeError("ship requires a persisted workflow")
-    return state, active
+    active = state["runs"].get(run.run_id)
+    if active is None:
+        active = _delivery_journal_row(run, authority)
+        state["runs"][run.run_id] = active
+        _save_runs(state_path, state)
+    return state, active, run
 
 
 def _expected_claim_key(authority) -> str:
@@ -458,9 +507,9 @@ def _expected_claim_key(authority) -> str:
     )
 
 
-def _validate_current_run_authority(active: dict[str, Any], authority) -> None:
+def _validate_current_run_authority(active: dict[str, Any], authority, canonical_run) -> None:
     expected = {
-        "claim_key": _expected_claim_key(authority),
+        "claim_key": canonical_run.claim_key,
         "source_revisions": list(authority.source_revisions),
         "provider_revision": authority.github_provider_revision,
         "authority_digest": work_authority_digest(authority),
@@ -591,7 +640,7 @@ def _authorization_record(
     head = body.get("head")
     if (
         not isinstance(run_id, str)
-        or re.fullmatch(r"run-[0-9a-f]{32}", run_id) is None
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", run_id) is None
         or not isinstance(head, str)
         or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None
     ):
@@ -766,6 +815,59 @@ def _trusted_evidence_refs(authorization: dict[str, Any]) -> tuple[dict[str, str
     )
 
 
+def _fallback_workflow_starter(workflow_registry, state_path: Path):
+    """Test/embedding fallback; installed daemon supplies the production starter."""
+
+    from .work_bridge import default_workflow_manifest
+    from .workflow import WorkflowStep
+
+    def start(bound_authority, claim_key, reason):
+        manifest = default_workflow_manifest(
+            bound_authority.work_id,
+            change=(
+                bound_authority.mapped_openspec[0]
+                if bound_authority.mapped_openspec
+                else bound_authority.work_id
+            ),
+        )
+        steps = tuple(
+            WorkflowStep(
+                phase=step.phase,
+                persona=step.persona,
+                card=step.card,
+                executor="cortex-manager" if step.phase == "claim" else step.executor,
+                model="deterministic" if step.phase == "claim" else step.model,
+                domain="cortex" if step.phase == "claim" else step.domain,
+                inputs=step.inputs,
+                outputs=step.outputs,
+                gate_result="passed" if step.phase == "claim" else step.gate_result,
+            )
+            for step in manifest.steps
+        )
+        return workflow_registry._manager_create_workflow_run(
+            work_id=bound_authority.work_id,
+            repo=bound_authority.repo,
+            claim_key=claim_key,
+            source_revision=work_authority_digest(bound_authority),
+            workspace_root=str(state_path.parent.resolve()),
+            combo=manifest.combo,
+            current_phase="define",
+            steps=steps,
+            issue_refs=tuple(
+                f"{bound_authority.repo}#{number}" for number in bound_authority.mapped_issues
+            ),
+            openspec_refs=bound_authority.mapped_openspec,
+            pr_refs=tuple(
+                f"{bound_authority.repo}#{number}" for number in bound_authority.mapped_prs
+            ),
+            attempts={"claim": 1, "define": 1},
+            facets=("needs_human",) if reason is not None else (),
+            gate_status="running",
+        )
+
+    return start
+
+
 def _claim_action(
     *,
     args: dict[str, Any],
@@ -774,12 +876,22 @@ def _claim_action(
     state_path: Path,
     automatic: bool = False,
     auto_label: bool | None = None,
+    workflow_registry=None,
+    workflow_starter=None,
 ) -> dict[str, Any]:
-    state = _load_runs(state_path)
-    key = f"{authority.repo}/{authority.work_id}"
-    active = state["runs"].get(key)
-    if active is not None and not isinstance(active, dict):
-        raise ValueError("active work run malformed")
+    canonical_run = None
+    if workflow_registry is not None:
+        expected_key = _expected_claim_key(authority)
+        matching = [
+            run
+            for run in workflow_registry.list_workflow_runs()
+            if run.repo == authority.repo
+            and run.work_id == authority.work_id
+            and run.claim_key == expected_key
+        ]
+        if len(matching) > 1:
+            raise RuntimeError("canonical workflow claim is ambiguous")
+        canonical_run = matching[0] if matching else None
     issue = args.get("issue") if args.get("issue") is not None else (
         authority.mapped_issues[0] if authority.mapped_issues else None
     )
@@ -791,89 +903,68 @@ def _claim_action(
         confirmed_todo=authority.confirmed_todo,
         confirmed_issue=issue,
         auto_label=(authority.auto_label if auto_label is None else auto_label) if automatic else False,
-        active_run_id=active.get("run_id") if active else None,
-        active_claim_key=active.get("claim_key") if active else None,
-        active_status=active.get("status") if active else None,
-        active_snapshot_hash=active.get("snapshot_hash") if active else None,
+        active_run_id=canonical_run.run_id if canonical_run is not None else None,
+        active_claim_key=canonical_run.claim_key if canonical_run is not None else None,
+        active_status=workflow_status(canonical_run) if canonical_run is not None else None,
+        active_snapshot_hash=authority.snapshot_hash if canonical_run is not None else None,
         active_source_revisions=(
-            tuple(active.get("source_revisions", ())) if active else None
+            authority.source_revisions if canonical_run is not None else None
         ),
-        active_provider_revision=active.get("provider_revision") if active else None,
-        active_authority_digest=active.get("authority_digest") if active else None,
+        active_provider_revision=(
+            authority.github_provider_revision if canonical_run is not None else None
+        ),
+        active_authority_digest=(
+            work_authority_digest(authority) if canonical_run is not None else None
+        ),
     )
     decision = (
         decide_auto_claim(candidate, now_epoch=now_epoch)
         if automatic
         else decide_manual_start(candidate, now_epoch=now_epoch)
     )
-    if args["action"] == "resume" and active is None:
-        raise ValueError("resume requires an active workflow")
     if decision.action == "claim":
-        previous_run_id = active.get("run_id") if active else None
-        run_id = f"run-{uuid4().hex}"
-        active = {
-            "run_id": run_id,
-            "claim_key": decision.claim_key,
-            "repo": authority.repo,
-            "work_id": authority.work_id,
-            "status": "ongoing",
-            "source_revisions": list(authority.source_revisions),
-            "snapshot_hash": authority.snapshot_hash,
-            "provider_revision": authority.github_provider_revision,
-            "authority_digest": work_authority_digest(authority),
-            "mapped_issues": list(authority.mapped_issues),
-            "mapped_prs": list(authority.mapped_prs),
-            "mapped_openspec": list(authority.mapped_openspec),
-            "mapped_todo_paths": list(authority.mapped_todo_paths),
-            "workflow_step_ids": [
-                f"{run_id}:claim",
-                f"{run_id}:build",
-                f"{run_id}:review",
-                f"{run_id}:ship",
-            ],
-        }
-        if previous_run_id is not None:
-            active["previous_run_id"] = previous_run_id
-        state["runs"][key] = active
-        _save_runs(state_path, state)
+        if workflow_starter is None:
+            raise RuntimeError("canonical workflow starter unavailable")
+        run = workflow_starter(authority, str(decision.claim_key), None)
+        active = run.to_dict()
     elif decision.action == "needs_human":
-        run_id = active.get("run_id") if active else f"run-{uuid4().hex}"
-        active = {
-            "run_id": run_id,
-            "claim_key": build_claim_key(
-                ClaimCandidate(
-                    authority=authority,
-                    repo=authority.repo,
-                    work_id=authority.work_id,
-                    source_revisions=authority.source_revisions,
-                    confirmed_todo=authority.confirmed_todo,
-                    confirmed_issue=None,
-                    auto_label=authority.auto_label,
-                    active_run_id=None,
-                    active_claim_key=None,
-                )
-            ),
-            "repo": authority.repo,
-            "work_id": authority.work_id,
-            "status": "needs_human",
-            "reason": decision.reason,
-            "source_revisions": list(authority.source_revisions),
-            "snapshot_hash": authority.snapshot_hash,
-            "provider_revision": authority.github_provider_revision,
-            "authority_digest": work_authority_digest(authority),
-            "mapped_issues": list(authority.mapped_issues),
-            "mapped_prs": list(authority.mapped_prs),
-            "mapped_openspec": list(authority.mapped_openspec),
-            "mapped_todo_paths": list(authority.mapped_todo_paths),
-            "workflow_step_ids": [f"{run_id}:claim", f"{run_id}:ship"],
-        }
-        state["runs"][key] = active
-        _save_runs(state_path, state)
-    elif active is not None and active.get("snapshot_hash") != authority.snapshot_hash:
-        # The whole-fleet snapshot is only provenance.  Refresh it in place when
-        # the work item's semantic authority digest is unchanged.
-        active["snapshot_hash"] = authority.snapshot_hash
-        _save_runs(state_path, state)
+        claim_key = build_claim_key(
+            ClaimCandidate(
+                authority=authority,
+                repo=authority.repo,
+                work_id=authority.work_id,
+                source_revisions=authority.source_revisions,
+                confirmed_todo=authority.confirmed_todo,
+                confirmed_issue=None,
+                auto_label=authority.auto_label,
+                active_run_id=None,
+                active_claim_key=None,
+            )
+        )
+        if canonical_run is None:
+            if workflow_starter is None:
+                raise RuntimeError("canonical workflow starter unavailable")
+            canonical_run = workflow_starter(authority, claim_key, decision.reason)
+        active = canonical_run.to_dict()
+        active["reason"] = decision.reason
+    elif canonical_run is not None:
+        active = canonical_run.to_dict()
+    else:
+        active = None
+    if active is not None:
+        active.update(
+            {
+                "snapshot_hash": authority.snapshot_hash,
+                "source_revisions": list(authority.source_revisions),
+                "provider_revision": authority.github_provider_revision,
+                "authority_digest": work_authority_digest(authority),
+                "status": (
+                    workflow_status(canonical_run)
+                    if canonical_run is not None
+                    else active.get("status", "ongoing")
+                ),
+            }
+        )
     return {"action": decision.action, "reason": decision.reason, "run": active}
 
 
@@ -883,6 +974,8 @@ def run_auto_claim_scan(
     state_path: str | Path | None = None,
     now: Callable[[], float] = time.time,
     runner: Runner = subprocess.run,
+    workflow_registry=None,
+    workflow_starter=None,
 ) -> list[dict[str, Any]]:
     """Project the durable Monitor snapshot into Manager-owned auto claims."""
 
@@ -893,6 +986,12 @@ def run_auto_claim_scan(
             return []
         raise
     resolved_state = Path(state_path) if state_path is not None else _run_state_path()
+    if workflow_registry is None:
+        from .registry import JobRegistry
+
+        workflow_registry = JobRegistry(state_path=resolved_state.parent / "jobs.json")
+    if workflow_starter is None:
+        workflow_starter = _fallback_workflow_starter(workflow_registry, resolved_state)
     results: list[dict[str, Any]] = []
     for authority in authorities:
         if not authority.confirmed_todo:
@@ -948,6 +1047,8 @@ def run_auto_claim_scan(
             state_path=resolved_state,
             automatic=True,
             auto_label=live_auto_label,
+            workflow_registry=workflow_registry,
+            workflow_starter=workflow_starter,
         )
         if result["action"] not in {"ignore", "done"}:
             results.append(
@@ -967,6 +1068,7 @@ def _ship_action(
     runner: Runner,
     now: Callable[[], float],
     state_path: Path,
+    workflow_registry,
 ) -> dict[str, Any]:
     """Advance one fail-closed delivery stage for the exact durable work item.
 
@@ -979,12 +1081,12 @@ def _ship_action(
     skip_tests = args.get("skip_tests", False)
     if not isinstance(skip_tests, bool):
         raise ValueError("ship skip_tests must be a strict boolean")
-    state, active = _load_work_run(
+    state, active, canonical_run = _load_work_run(
         state_path=state_path,
-        repo=authority.repo,
-        work_id=authority.work_id,
+        workflow_registry=workflow_registry,
+        authority=authority,
     )
-    _validate_current_run_authority(active, authority)
+    _validate_current_run_authority(active, authority, canonical_run)
     if active.get("snapshot_hash") != authority.snapshot_hash:
         active["snapshot_hash"] = authority.snapshot_hash
         _save_runs(state_path, state)
@@ -993,12 +1095,16 @@ def _ship_action(
         or len(authority.mapped_openspec) != 1
         or len(authority.mapped_todo_paths) != 1
     ):
-        active["status"] = "needs_human"
         active["ship"] = {
             "phase": "needs_human",
             "reason": "multiple-delivery-targets-unsupported",
         }
         _save_runs(state_path, state)
+        workflow_registry._manager_update_workflow_run(
+            canonical_run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+        )
         return {
             "action": "needs_human",
             "reason": "multiple-delivery-targets-unsupported",
@@ -1065,8 +1171,25 @@ def _ship_action(
             "todo_paths": list(todo_paths_value),
             "completion_record": dict(closure.completion_record),
         }
-        active["status"] = "done"
         _save_runs(state_path, state)
+        source_revisions = {
+            source.rsplit("@", 1)[0]: source.rsplit("@", 1)[1]
+            for source in authority.source_revisions
+            if "@" in source
+        }
+        if canonical_run.current_phase == "ship":
+            workflow_registry._manager_update_workflow_run(
+                canonical_run.run_id,
+                status="done",
+                completion_record_path=str(closure.completion_record["path"]),
+                completion_record_hash=str(closure.completion_record["hash"]),
+                completion_record_revision=expected_head,
+                completion_source_revisions=source_revisions,
+                pr_candidate=expected_head,
+                merge_revision=closure.facts.merge_commit,
+                facets=(),
+                gate_status="passed",
+            )
         return {
             "action": "done",
             "head": expected_head,
@@ -1152,6 +1275,9 @@ def _ship_action(
                 "merge_commit": merge_status.merge_commit,
             }
             _save_runs(state_path, state)
+            workflow_registry._manager_update_workflow_run(
+                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+            )
             return {"action": "merged-awaiting-closure", "head": expected_head}
 
     active_change = repo_root / "openspec" / "changes" / change
@@ -1221,7 +1347,6 @@ def _ship_action(
             preflight=preflight,
             remote=remote,
         ):
-            active["status"] = "needs_human"
             active["ship"] = {
                 **(ship or {}),
                 "phase": "needs_human",
@@ -1230,6 +1355,9 @@ def _ship_action(
                 "tree_hash": preflight.tree_hash,
             }
             _save_runs(state_path, state)
+            workflow_registry._manager_update_workflow_run(
+                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+            )
             return {
                 "action": "needs_human",
                 "reason": "external-merge-without-authorization",
@@ -1264,7 +1392,6 @@ def _ship_action(
     if previous_head is not None and previous_head != preflight.head:
         fix_rounds += 1
         if fix_rounds > 2:
-            active["status"] = "needs_human"
             active["ship"] = {
                 **ship,
                 "phase": "needs_human",
@@ -1273,6 +1400,9 @@ def _ship_action(
                 "fix_rounds": fix_rounds,
             }
             _save_runs(state_path, state)
+            workflow_registry._manager_update_workflow_run(
+                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+            )
             return {"action": "needs_human", "reason": "copilot-finding-budget-exhausted"}
     if (
         not ship
@@ -1310,8 +1440,10 @@ def _ship_action(
     ]
     if not current_reviews:
         if float(now_epoch) - float(requested_at) > 15 * 60:
-            active["status"] = "needs_human"
             active["ship"] = {**ship, "phase": "needs_human", "reason": "copilot-review-timeout"}
+            workflow_registry._manager_update_workflow_run(
+                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+            )
             _save_runs(state_path, state)
             return {"action": "needs_human", "reason": "copilot-review-timeout"}
         return {"action": "awaiting-copilot", "head": preflight.head}
@@ -1342,9 +1474,11 @@ def _ship_action(
         _save_runs(state_path, state)
         return {"action": "fix-required", "reason": copilot.reason, "findings": finding_count}
     if copilot.action != "passed":
-        active["status"] = "needs_human"
         active["ship"] = {**ship, "phase": "needs_human", "reason": copilot.reason}
         _save_runs(state_path, state)
+        workflow_registry._manager_update_workflow_run(
+            canonical_run.run_id, facets=("needs_human",), gate_status="running"
+        )
         return {"action": "needs_human", "reason": copilot.reason}
 
     foreign_review = ForeignReviewEvidence(
@@ -1452,6 +1586,8 @@ def execute_work_action(
     ship_executor: ShipExecutor | None = None,
     snapshot_path: str | Path | None = None,
     state_path: str | Path | None = None,
+    workflow_registry=None,
+    workflow_starter=None,
 ) -> dict[str, Any]:
     action = args.get("action")
     repo = args.get("repo")
@@ -1475,12 +1611,22 @@ def execute_work_action(
     )
     now_epoch = now()
     resolved_state_path = Path(state_path) if state_path is not None else _run_state_path()
+    if workflow_registry is None:
+        from .registry import JobRegistry
+
+        workflow_registry = JobRegistry(state_path=resolved_state_path.parent / "jobs.json")
+    if workflow_starter is None:
+        workflow_starter = _fallback_workflow_starter(
+            workflow_registry, resolved_state_path
+        )
     if action in {"start", "resume"}:
         result = _claim_action(
             args=args,
             authority=authority,
             now_epoch=now_epoch,
             state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+            workflow_starter=workflow_starter,
         )
     elif action == "auto":
         enabled = args.get("enabled")
@@ -1519,6 +1665,7 @@ def execute_work_action(
                 runner=runner,
                 now=now,
                 state_path=resolved_state_path,
+                workflow_registry=workflow_registry,
             )
         )
     return {

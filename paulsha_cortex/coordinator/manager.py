@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
+from paulsha_cortex.config import paths
+
 from .._yaml import YAMLError, safe_load
 from ..lib import idle
 from ..persona import gate, handoff
@@ -3055,20 +3057,68 @@ def dispatch_workflow_card(
         creator = getattr(dispatcher, "_worktree_creator", None)
         if creator is None:
             raise ValueError("workflow builder worktree creator unavailable")
-        worktree = str(creator.create(f"feature/{run.work_id}"))
+        issue_numbers = [
+            match.group(1)
+            for ref in run.issue_refs
+            if (match := re.fullmatch(rf"{re.escape(run.repo)}#([1-9][0-9]*)", ref))
+        ]
+        if len(issue_numbers) > 1:
+            raise ValueError("workflow builder requires exactly one confirmed issue")
+        builder_branch = (
+            f"feature/{issue_numbers[0]}-{run.work_id}"
+            if issue_numbers
+            else f"feature/{run.work_id}"
+        )
+        worktree = str(creator.create(builder_branch))
     else:
         worktree = run.workspace_root
     effective_repo_root = Path(repo_root if step.persona == "planner" else worktree).resolve()
     output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
+    dispatch_base: str | None = None
+    if step.phase == "build":
+        if builder_jobs:
+            persisted_base = builder_jobs[0].get("dispatch_head")
+            if (
+                not isinstance(persisted_base, str)
+                or verification.SAFE_SHA_RE.fullmatch(persisted_base) is None
+            ):
+                raise ValueError("workflow build phase base is unavailable")
+            dispatch_base = persisted_base
+        else:
+            base_result = verification._run_git(
+                ["-C", str(effective_repo_root), "rev-parse", "HEAD"],
+                getattr(dispatcher, "_git_runner", None),
+            )
+            base_value = str(base_result.get("stdout", "")).strip().lower()
+            if (
+                base_result.get("status") != "ok"
+                or verification.SAFE_SHA_RE.fullmatch(base_value) is None
+            ):
+                raise ValueError("workflow build phase base is unavailable")
+            dispatch_base = base_value
     task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
     try:
+        branch = (
+            (
+                str(builder_jobs[-1]["branch"])
+                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                else builder_branch
+            )
+            if step.phase == "build"
+            else (
+                str(builder_jobs[-1]["branch"])
+                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+                else f"feature/{run.work_id}"
+            )
+        )
         job = registry.create_job(
             task=task,
             persona=step.persona,
             kind="review" if step.persona == "reviewer" else "build",
-            branch=f"feature/{run.work_id}",
+            branch=branch,
             pane="",
             worktree=worktree,
+            dispatch_head=dispatch_base,
             executor=identity.executor,
             model_id=identity.model_id,
             independence_domain=identity.independence_domain,
@@ -3241,6 +3291,49 @@ def apply_workflow_action(
     """
 
     action = _required_workflow_string(args, "action")
+
+    def validate_ship_result(value: object, *, candidate: str | None) -> tuple[str, dict]:
+        if not isinstance(value, dict) or value.get("trusted") is not True:
+            raise ValueError("ship validator returned no trusted result")
+        status = value.get("status")
+        if (
+            status not in {"pending", "passed", "needs_human"}
+            or not isinstance(candidate, str)
+            or value.get("head") != candidate
+            or value.get("commit_id") != candidate
+            or not isinstance(value.get("ref"), str)
+            or not value["ref"]
+            or not isinstance(value.get("hash"), str)
+            or len(value["hash"]) != 64
+        ):
+            raise ValueError("ship validator current-HEAD result invalid")
+        completion = value.get("completion")
+        if status == "passed" and completion is not None:
+            if (
+                not isinstance(completion, dict)
+                or set(completion)
+                != {
+                    "record_path",
+                    "record_hash",
+                    "record_revision",
+                    "source_revisions",
+                    "pr_candidate",
+                    "merge_revision",
+                }
+                or completion.get("record_revision") != candidate
+                or completion.get("pr_candidate") != candidate
+                or not isinstance(completion.get("record_path"), str)
+                or not isinstance(completion.get("record_hash"), str)
+                or len(completion["record_hash"]) != 64
+                or not isinstance(completion.get("source_revisions"), dict)
+                or not completion["source_revisions"]
+                or not isinstance(completion.get("merge_revision"), str)
+                or verification.SAFE_SHA_RE.fullmatch(completion["merge_revision"])
+                is None
+            ):
+                raise ValueError("ship validator completion binding invalid")
+        return str(status), value
+
     if action == "advance":
         if not trusted_terminal:
             raise ValueError("workflow advance is internal to terminal polling")
@@ -3264,17 +3357,28 @@ def apply_workflow_action(
                         "current_phase": updated.current_phase,
                         "reason": "ship-validator-unavailable",
                     }
-                trusted = ship_validator(run=current, candidate=current.candidate_head)
-                if not isinstance(trusted, dict) or trusted.get("trusted") is not True:
-                    raise ValueError("ship validator returned no trusted result")
-                if (
-                    trusted.get("status") != "passed"
-                    or trusted.get("head") != current.candidate_head
-                    or trusted.get("commit_id") != current.candidate_head
-                    or not isinstance(trusted.get("ref"), str)
-                    or not isinstance(trusted.get("hash"), str)
-                ):
-                    raise ValueError("ship validator current-HEAD result invalid")
+                status, trusted = validate_ship_result(
+                    ship_validator(run=current, candidate=current.candidate_head),
+                    candidate=current.candidate_head,
+                )
+                if status == "pending":
+                    registry._manager_update_workflow_run(
+                        run_id, facets=(), gate_status="running"
+                    )
+                    return {
+                        "run_id": current.run_id,
+                        "current_phase": "review",
+                        "reason": "delivery-in-progress",
+                    }
+                if status == "needs_human":
+                    updated = registry._manager_update_workflow_run(
+                        run_id, facets=("needs_human",), gate_status="running"
+                    )
+                    return {
+                        "run_id": updated.run_id,
+                        "current_phase": updated.current_phase,
+                        "reason": trusted.get("reason") or "delivery-needs-human",
+                    }
                 refs = {item.kind: item for item in current.gate_refs}
                 refs["copilot"] = GateEvidenceRef("copilot", trusted["ref"], trusted["hash"])
                 updated = registry._manager_update_workflow_run(
@@ -3285,6 +3389,37 @@ def apply_workflow_action(
                     ),
                     gate_status="passed",
                     facets=(),
+                    status=("done" if trusted.get("completion") is not None else None),
+                    completion_record_path=(
+                        trusted["completion"]["record_path"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    completion_record_hash=(
+                        trusted["completion"]["record_hash"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    completion_record_revision=(
+                        trusted["completion"]["record_revision"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    completion_source_revisions=(
+                        trusted["completion"]["source_revisions"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    pr_candidate=(
+                        trusted["completion"]["pr_candidate"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
+                    merge_revision=(
+                        trusted["completion"]["merge_revision"]
+                        if trusted.get("completion") is not None
+                        else None
+                    ),
                 )
                 return {"run_id": updated.run_id, "current_phase": "ship", "reason": None}
             raise ValueError("workflow card evidence replay rejected")
@@ -3392,22 +3527,24 @@ def apply_workflow_action(
                 facets = ("needs_human",)
                 gate_status = "running"
             else:
-                trusted = ship_validator(run=current, candidate=candidate)
-                if not isinstance(trusted, dict) or trusted.get("trusted") is not True:
-                    raise ValueError("ship validator returned no trusted result")
-                if (
-                    trusted.get("status") != "passed"
-                    or trusted.get("head") != candidate
-                    or trusted.get("commit_id") != candidate
-                    or not isinstance(trusted.get("ref"), str)
-                    or not isinstance(trusted.get("hash"), str)
-                ):
-                    raise ValueError("ship validator current-HEAD result invalid")
-                by_kind["copilot"] = GateEvidenceRef(
-                    "copilot", trusted["ref"], trusted["hash"]
+                status, trusted = validate_ship_result(
+                    ship_validator(run=current, candidate=candidate),
+                    candidate=candidate,
                 )
-                gate_status = "passed"
-                facets = ()
+                if status == "passed":
+                    by_kind["copilot"] = GateEvidenceRef(
+                        "copilot", trusted["ref"], trusted["hash"]
+                    )
+                    gate_status = "passed"
+                    facets = ()
+                elif status == "pending":
+                    next_phase = "review"
+                    gate_status = "running"
+                    facets = ()
+                else:
+                    next_phase = "review"
+                    gate_status = "running"
+                    facets = ("needs_human",)
         updated = registry._manager_update_workflow_run(
             run_id,
             current_phase=next_phase,
@@ -3417,11 +3554,84 @@ def apply_workflow_action(
             candidate_head=candidate,
             verified_head=verified,
             facets=facets,
+            status=(
+                "done"
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_record_path=(
+                trusted["completion"]["record_path"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_record_hash=(
+                trusted["completion"]["record_hash"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_record_revision=(
+                trusted["completion"]["record_revision"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            completion_source_revisions=(
+                trusted["completion"]["source_revisions"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            pr_candidate=(
+                trusted["completion"]["pr_candidate"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
+            merge_revision=(
+                trusted["completion"]["merge_revision"]
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else None
+            ),
         )
         reason = (
             "ship-validator-unavailable"
             if current.current_phase == "review" and phase_done and requested_phase == "ship" and ship_validator is None
-            else None
+            else (
+                "delivery-in-progress"
+                if current.current_phase == "review"
+                and phase_done
+                and requested_phase == "ship"
+                and ship_validator is not None
+                and next_phase == "review"
+                and not facets
+                else (
+                    str(trusted.get("reason") or "delivery-needs-human")
+                    if current.current_phase == "review"
+                    and phase_done
+                    and requested_phase == "ship"
+                    and ship_validator is not None
+                    and facets == ("needs_human",)
+                    else None
+                )
+            )
         )
         return {"run_id": updated.run_id, "current_phase": updated.current_phase, "reason": reason}
     if action != "start":
@@ -3637,15 +3847,57 @@ def apply_workflow_action(
     return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}
 
 
-def apply_work_action(*, args, requested_by):
+def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None):
     """唯一 production mutation seam；daemon control request 之外不直接呼叫。"""
     from .work_actions import execute_work_action
+    from .registry import JobRegistry
+    from .work_bridge import start_canonical_workflow
 
-    return execute_work_action(args=args, requested_by=requested_by)
+    active_registry = registry or JobRegistry()
+    state_path = getattr(active_registry, "_state_path", None)
+    coordinator_root = (
+        Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
+    )
+
+    def starter(authority, claim_key, reason):
+        return start_canonical_workflow(
+            registry=active_registry,
+            authority=authority,
+            claim_key=claim_key,
+            coordinator_root=coordinator_root,
+            explicit_repo_root=args.get("repo_root"),
+            runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
+            needs_human_reason=reason,
+        )
+
+    return execute_work_action(
+        args=args,
+        requested_by=requested_by,
+        workflow_registry=active_registry,
+        workflow_starter=starter,
+    )
 
 
-def run_auto_claim_scan():
+def run_auto_claim_scan(*, registry=None, runtime_factory=None):
     """Periodic Manager-owned durable work claim projection."""
     from .work_actions import run_auto_claim_scan as scan
+    from .registry import JobRegistry
+    from .work_bridge import start_canonical_workflow
 
-    return scan()
+    active_registry = registry or JobRegistry()
+    state_path = getattr(active_registry, "_state_path", None)
+    coordinator_root = (
+        Path(state_path).resolve().parent if state_path is not None else paths.coordinator_root().resolve()
+    )
+
+    def starter(authority, claim_key, reason):
+        return start_canonical_workflow(
+            registry=active_registry,
+            authority=authority,
+            claim_key=claim_key,
+            coordinator_root=coordinator_root,
+            runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
+            needs_human_reason=reason,
+        )
+
+    return scan(workflow_registry=active_registry, workflow_starter=starter)

@@ -236,6 +236,47 @@ def test_ensure_pr_metadata_rejects_remote_reread_drift() -> None:
         )
 
 
+def test_create_or_get_pull_request_creates_exact_head_then_rereads_metadata() -> None:
+    calls: list[list[str]] = []
+
+    class CreateRunner:
+        def __call__(self, argv, **kwargs):
+            calls.append(list(argv))
+            endpoint = " ".join(argv)
+            if endpoint.endswith("repos/acme/demo"):
+                return Result({"default_branch": "main"})
+            if "pulls?state=open&head=acme%3Afeature%2F14-work" in endpoint:
+                return Result([])
+            if "--method POST repos/acme/demo/pulls" in endpoint:
+                return Result(
+                    {
+                        "number": 17,
+                        "head": {"ref": "feature/14-work", "sha": HEAD},
+                        "base": {"ref": "main"},
+                    }
+                )
+            if "--method PATCH" in endpoint or "--method PUT" in endpoint:
+                return Result({})
+            if endpoint.endswith("repos/acme/demo/pulls/17"):
+                return Result({"title": "feat(workflow): 完成 work", "body": "Closes #14"})
+            if endpoint.endswith("repos/acme/demo/issues/17"):
+                return Result({"labels": [{"name": "enhancement"}]})
+            raise AssertionError(argv)
+
+    number = GitHubDeliveryClient(runner=CreateRunner()).create_or_get_pull_request(
+        repo="acme/demo",
+        branch="feature/14-work",
+        expected_head=HEAD,
+        title="feat(workflow): 完成 work",
+        body="Closes #14",
+        labels=("enhancement",),
+    )
+
+    assert number == 17
+    assert sum("--method POST repos/acme/demo/pulls" in " ".join(call) for call in calls) == 1
+    assert all(call[0] == "gh" for call in calls)
+
+
 def test_fetch_fails_closed_on_non_json_or_gh_error() -> None:
     class BrokenRunner:
         def __call__(self, argv, **kwargs):

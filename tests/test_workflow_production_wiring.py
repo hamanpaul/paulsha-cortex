@@ -357,6 +357,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         workflow_ship_validator=lambda **_: {
             "trusted": True, "status": "passed", "head": candidate, "commit_id": candidate,
             "ref": "github:copilot/current-head", "hash": "f" * 64,
+            "completion": {
+                "record_path": str(tmp_path / "evidence/completion.json"),
+                "record_hash": "e" * 64,
+                "record_revision": candidate,
+                "source_revisions": {"openspec:production-wiring": "rev-a"},
+                "pr_candidate": candidate,
+                "merge_revision": "d" * 40,
+            },
         },
     )
     trusted_ship = build_request(
@@ -367,6 +375,9 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     assert trusted_executor(trusted_ship)["current_phase"] == "ship"
 
     shipped = registry.get_workflow_run(run.run_id)
+    assert shipped.status == "done"
+    assert shipped.completion_record_revision == candidate
+    assert shipped.merge_revision == "d" * 40
     assert shipped.verified_head == shipped.candidate_head == candidate
     assert {ref.kind for ref in shipped.gate_refs} == {"brainstorm", "foreign-review", "copilot"}
     assert all(

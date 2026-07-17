@@ -704,6 +704,111 @@ class GitHubDeliveryClient:
             expect_json=True,
         )
 
+    def fetch_default_branch(self, *, repo: str) -> str:
+        self._repo_parts(repo)
+        payload = self._api(f"repos/{repo}")
+        branch = payload.get("default_branch") if isinstance(payload, dict) else None
+        if not isinstance(branch, str) or not branch:
+            raise RuntimeError("GitHub default branch unavailable")
+        return branch
+
+    def create_or_get_pull_request(
+        self,
+        *,
+        repo: str,
+        branch: str,
+        expected_head: str,
+        title: str,
+        body: str,
+        labels: tuple[str, ...],
+    ) -> int:
+        """Idempotently create the only open PR for an authenticated exact head."""
+
+        owner, _name = self._repo_parts(repo)
+        if (
+            not isinstance(branch, str)
+            or not branch
+            or branch.startswith("-")
+            or any(character.isspace() for character in branch)
+        ):
+            raise ValueError("PR branch must be a safe non-empty name")
+        if re.fullmatch(r"[0-9a-fA-F]{40}", expected_head or "") is None:
+            raise ValueError("expected_head must be a 40-character hexadecimal SHA")
+        repository = self._api(f"repos/{repo}")
+        if not isinstance(repository, dict) or not isinstance(
+            repository.get("default_branch"), str
+        ):
+            raise RuntimeError("GitHub default branch unavailable")
+        default_branch = repository["default_branch"]
+        encoded_head = quote(f"{owner}:{branch}", safe="")
+        existing = self._api(
+            f"repos/{repo}/pulls?state=open&head={encoded_head}&per_page=100"
+        )
+        if not isinstance(existing, list):
+            raise RuntimeError("GitHub open PR lookup malformed")
+        exact: list[dict] = []
+        for row in existing:
+            if not isinstance(row, dict):
+                raise RuntimeError("GitHub open PR lookup malformed")
+            head = row.get("head")
+            base = row.get("base")
+            if not isinstance(head, dict) or not isinstance(base, dict):
+                raise RuntimeError("GitHub open PR refs malformed")
+            if head.get("ref") == branch:
+                if (
+                    head.get("sha") != expected_head.lower()
+                    or base.get("ref") != default_branch
+                ):
+                    raise RuntimeError("existing PR branch is bound to a different head/base")
+                exact.append(row)
+        if len(exact) > 1:
+            raise RuntimeError("multiple open PRs match the workflow branch")
+        if exact:
+            pull = exact[0]
+        else:
+            pull = self._run(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repo}/pulls",
+                    "-f",
+                    f"title={title}",
+                    "-f",
+                    f"body={body}",
+                    "-f",
+                    f"head={branch}",
+                    "-f",
+                    f"base={default_branch}",
+                ],
+                expect_json=True,
+            )
+        if not isinstance(pull, dict):
+            raise RuntimeError("GitHub PR create payload malformed")
+        number = pull.get("number")
+        head = pull.get("head")
+        base = pull.get("base")
+        if (
+            not isinstance(number, int)
+            or isinstance(number, bool)
+            or number <= 0
+            or not isinstance(head, dict)
+            or head.get("sha") != expected_head.lower()
+            or head.get("ref") != branch
+            or not isinstance(base, dict)
+            or base.get("ref") != default_branch
+        ):
+            raise RuntimeError("GitHub PR create identity mismatch")
+        self.ensure_pr_metadata(
+            repo=repo,
+            pr_number=number,
+            title=title,
+            body=body,
+            labels=labels,
+        )
+        return number
+
     def ensure_pr_metadata(
         self,
         *,
