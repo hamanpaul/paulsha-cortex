@@ -61,6 +61,12 @@ def load_preflight_command(
         raise ValueError("PSC_PREFLIGHT_CMD is malformed") from exc
     if not command:
         raise ValueError("PSC_PREFLIGHT_CMD is required")
+    if (
+        Path(command[0]).name in {"bash", "sh"}
+        and len(command) >= 2
+        and command[1] == "-c"
+    ):
+        raise ValueError("PSC_PREFLIGHT_CMD shell wrapper is not allowed")
     executable = Path(command[0])
     if executable.is_absolute() and not (
         executable.is_file() and os.access(executable, os.X_OK)

@@ -40,6 +40,8 @@ def test_load_preflight_command_is_typed_and_requires_executable(tmp_path: Path)
     assert load_preflight_command(env=env) == (str(executable), "--strict")
     with pytest.raises(ValueError, match="executable"):
         load_preflight_command(env={"PSC_PREFLIGHT_CMD": str(tmp_path / "missing")})
+    with pytest.raises(ValueError, match="shell wrapper"):
+        load_preflight_command(env={"PSC_PREFLIGHT_CMD": "bash -c 'echo unsafe'"})
 
 
 def test_skip_tests_requires_recent_exact_tree_evidence() -> None:
