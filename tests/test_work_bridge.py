@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import manager_daemon, review, verification, work_bridge
 from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
@@ -412,6 +414,81 @@ def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(
     assert len(archive_jobs) == 1
     assert archive_jobs[0]["subject_head"] == reset.candidate_head
     assert archive_jobs[0]["workflow_evidence"]["hash"]
+
+    def bind_verify(subject: str, marker: str) -> None:
+        job = registry.create_job(
+            task=f"verify-{marker}",
+            persona="reviewer",
+            kind="review",
+            branch="feature/14-work",
+            pane="",
+            worktree=str(repo),
+            executor="claude",
+            model_id="sonnet",
+            independence_domain="anthropic",
+            subject_head=subject,
+            workflow_run_id=run.run_id,
+            workflow_claim_key=run.claim_key,
+            workflow_repo=run.repo,
+            workflow_card="verify-card",
+            workflow_phase="verify",
+            workflow_repo_root=str(repo),
+            source_revision=run.source_revision,
+        )
+        registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+        job = registry.get_job(job["job_id"])
+        envelope = {
+            "schema_version": 1,
+            "kind": "verify",
+            "job": {
+                "job_id": job["job_id"],
+                "run_id": job["workflow_run_id"],
+                "claim_key": job["workflow_claim_key"],
+                "repo": job["workflow_repo"],
+                "source_revision": job["source_revision"],
+                "card_id": job["workflow_card"],
+                "phase": job["workflow_phase"],
+                "inputs": job["workflow_inputs"],
+                "outputs": job["workflow_outputs"],
+                "output_baseline": job["workflow_output_baseline"],
+            },
+            "payload": {"candidate": subject, "marker": marker},
+            "artifacts": [],
+        }
+        content = (
+            json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        relative = Path("evidence") / "workflow" / f"verify-{marker}.json"
+        path = state_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        registry.bind_workflow_evidence(
+            job["job_id"],
+            locator={
+                "kind": "verify",
+                "path": relative.as_posix(),
+                "hash": hashlib.sha256(content).hexdigest(),
+            },
+            subject_head=subject,
+        )
+
+    bind_verify(candidate, "old")
+    with pytest.raises(RuntimeError, match="one canonical verify"):
+        work_bridge._workflow_evidence_payload(
+            registry=registry,
+            state_root=state_root,
+            run=reset,
+            phase="verify",
+        )
+    bind_verify(reset.candidate_head, "current")
+    payload, selected = work_bridge._workflow_evidence_payload(
+        registry=registry,
+        state_root=state_root,
+        run=reset,
+        phase="verify",
+    )
+    assert payload["marker"] == "current"
+    assert selected["subject_head"] == reset.candidate_head
 
 
 def test_installed_defaults_start_to_ship_handoff_remains_monitor_ongoing(

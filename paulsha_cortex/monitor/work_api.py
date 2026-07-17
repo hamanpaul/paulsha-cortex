@@ -764,6 +764,7 @@ def _parse_closure_evidence(
                 ref=source.ref,
                 source_id=source.source_id,
                 revision=source.revision,
+                status=source.status,
             )
             if semantic is None:
                 continue
@@ -788,6 +789,7 @@ def _parse_closure_evidence(
                     ref=source.ref,
                     source_id=source.source_id,
                     revision=source.revision,
+                    status=source.status,
                 )
                 if semantic is None:
                     continue

@@ -401,15 +401,41 @@ def build_request_executor(
                         allow_unsafe=False,
                         model=identity.model_id,
                     )
-                    job = manager.dispatch_workflow_card(
-                        dispatcher,
-                        run=run,
-                        identities=identities,
-                        launcher_factory=launcher_factory,
-                        coordinator_root=coordinator_root,
-                    )
-                    if job is not None:
-                        result["result"]["job_id"] = job["job_id"]
+                    if args.get("action") == "resume":
+                        active_ship_validator = workflow_ship_validator
+                        if (
+                            active_ship_validator is None
+                            and run.claim_key.startswith("claim:v1:")
+                            and len(run.source_revision) == 64
+                        ):
+                            from .work_bridge import build_production_ship_validator
+
+                            active_ship_validator = build_production_ship_validator(
+                                registry=registry,
+                                coordinator_root=coordinator_root,
+                            )
+                        resumed = manager.resume_workflow_run(
+                            dispatcher,
+                            run_id=run.run_id,
+                            identities=identities,
+                            launcher_factory=launcher_factory,
+                            coordinator_root=coordinator_root,
+                            ship_validator=active_ship_validator,
+                        )
+                        result["result"].update(resumed)
+                        result["result"]["run"] = registry.get_workflow_run(
+                            run.run_id
+                        ).to_dict()
+                    else:
+                        job = manager.dispatch_workflow_card(
+                            dispatcher,
+                            run=run,
+                            identities=identities,
+                            launcher_factory=launcher_factory,
+                            coordinator_root=coordinator_root,
+                        )
+                        if job is not None:
+                            result["result"]["job_id"] = job["job_id"]
             return result
         if request["type"] == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None

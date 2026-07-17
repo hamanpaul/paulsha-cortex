@@ -3299,6 +3299,10 @@ def resume_workflow_run(
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
+        and (
+            step.phase not in {"verify", "review"}
+            or job.get("subject_head") == run.candidate_head
+        )
     ]
     job = jobs[-1] if jobs else dispatch_workflow_card(
         dispatcher,

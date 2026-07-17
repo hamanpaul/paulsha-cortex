@@ -277,7 +277,14 @@ def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
 ) -> None:
     snapshot = tmp_path / "canonical.json"
 
-    def write(*, provider_revision: str, issue_revision: str, pr_revision: str) -> None:
+    def write(
+        *,
+        provider_revision: str,
+        issue_revision: str,
+        pr_revision: str,
+        issue_status: str = "open",
+        openspec_status: str = "active",
+    ) -> None:
         snapshot.write_text(
             json.dumps(
                 {
@@ -304,7 +311,7 @@ def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
                                     "kind": "github_issue",
                                     "ref": "acme/demo#12",
                                     "revision": issue_revision,
-                                    "status": "open",
+                                    "status": issue_status,
                                     "confidence": "confirmed",
                                     "provider": "github:acme/demo",
                                 },
@@ -322,7 +329,7 @@ def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
                                     "kind": "openspec",
                                     "ref": "demo",
                                     "revision": "spec-content",
-                                    "status": "active",
+                                    "status": openspec_status,
                                     "confidence": "confirmed",
                                     "provider": "repo:acme/demo",
                                 },
@@ -365,6 +372,78 @@ def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
     )
     assert refreshed.source_revisions == first.source_revisions
     assert work_actions.work_authority_digest(refreshed) == first_digest
+
+    write(
+        provider_revision="gh-3",
+        issue_revision="updated:3",
+        pr_revision="updated:3",
+        issue_status="closed",
+        openspec_status="archived",
+    )
+    completed = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    completed_candidate = work_actions.ClaimCandidate(
+        authority=completed,
+        repo=completed.repo,
+        work_id=completed.work_id,
+        source_revisions=completed.source_revisions,
+        confirmed_todo=completed.confirmed_todo,
+        confirmed_issue=12,
+        auto_label=False,
+        active_run_id=None,
+        active_claim_key=None,
+    )
+    completed_key = work_actions.build_claim_key(completed_candidate)
+
+    write(
+        provider_revision="gh-4",
+        issue_revision="updated:4",
+        pr_revision="updated:4",
+        issue_status="open",
+        openspec_status="archived",
+    )
+    reopened = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    assert work_actions.work_authority_digest(reopened) != work_actions.work_authority_digest(
+        completed
+    )
+
+    write(
+        provider_revision="gh-5",
+        issue_revision="updated:5",
+        pr_revision="updated:5",
+        issue_status="closed",
+        openspec_status="active",
+    )
+    reactivated = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    assert work_actions.work_authority_digest(reactivated) != work_actions.work_authority_digest(
+        completed
+    )
+    decision = work_actions.decide_manual_start(
+        work_actions.ClaimCandidate(
+            authority=reactivated,
+            repo=reactivated.repo,
+            work_id=reactivated.work_id,
+            source_revisions=reactivated.source_revisions,
+            confirmed_todo=reactivated.confirmed_todo,
+            confirmed_issue=12,
+            auto_label=False,
+            active_run_id="done-run",
+            active_claim_key=completed_key,
+            active_status="done",
+            active_snapshot_hash=completed.snapshot_hash,
+            active_source_revisions=completed.source_revisions,
+            active_provider_revision=completed.github_provider_revision,
+            active_authority_digest=work_actions.work_authority_digest(completed),
+        ),
+        now_epoch=reactivated.github_last_success_epoch + 1,
+    )
+    assert decision.action == "claim"
+    assert decision.reason is None
 
 
 def test_snapshot_refresh_noise_keeps_same_semantic_run(tmp_path: Path) -> None:

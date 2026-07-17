@@ -24,7 +24,13 @@ DERIVED_AUTHORITY_KINDS = frozenset({"workflow_run", "completion_record"})
 
 
 def semantic_source_revision(
-    *, repo: str, kind: str, ref: str, source_id: str, revision: str
+    *,
+    repo: str,
+    kind: str,
+    ref: str,
+    source_id: str,
+    revision: str,
+    status: str | None = None,
 ) -> tuple[str, str] | None:
     """Return the stable security authority represented by one Monitor source.
 
@@ -41,16 +47,23 @@ def semantic_source_revision(
 
     if kind in DERIVED_AUTHORITY_KINDS:
         return None
-    if kind in {
-        "github_issue",
-        "github_pr",
-        "todo",
-        "superpowers_spec",
-        "superpowers_plan",
-    }:
+    if kind in {"github_issue", "github_pr"}:
+        state = str(status or "").lower()
+        allowed = (
+            {"open", "closed"}
+            if kind == "github_issue"
+            else {"open", "closed", "merged"}
+        )
+        if state not in allowed:
+            raise ValueError(f"canonical {kind} lifecycle status invalid")
+        return source_id, f"identity:{ref};state:{state}"
+    if kind in {"todo", "superpowers_spec", "superpowers_plan"}:
         return source_id, f"identity:{ref}"
     if kind == "openspec":
-        return f"openspec:{repo}:{ref}", f"identity:{ref}"
+        state = str(status or "").lower()
+        if state not in {"active", "archived"}:
+            raise ValueError("canonical openspec lifecycle status invalid")
+        return f"openspec:{repo}:{ref}", f"identity:{ref};state:{state}"
     return source_id, revision
 
 
@@ -289,6 +302,7 @@ def _authority_from_canonical_row(
             ref=ref,
             source_id=source_id,
             revision=source_revision,
+            status=source.get("status") if isinstance(source.get("status"), str) else None,
         )
         if semantic is None:
             continue

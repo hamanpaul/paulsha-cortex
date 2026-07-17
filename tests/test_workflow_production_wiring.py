@@ -105,6 +105,69 @@ def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path:
     assert not hasattr(registry, "update_workflow_run")
 
 
+def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"plan": 1},
+        gate_status="running",
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    calls: list[str] = []
+
+    def phase_aware_resume(*args, **kwargs):
+        calls.append(kwargs["run_id"])
+        return {
+            "run_id": kwargs["run_id"],
+            "current_phase": "build",
+            "job_id": "new-build-job",
+            "reason": "advanced",
+        }
+
+    monkeypatch.setattr(manager, "resume_workflow_run", phase_aware_resume)
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("public resume must not dispatch without polling terminal state")
+        ),
+    )
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        work_action_fn=lambda **_: {
+            "work_id": run.work_id,
+            "repo": run.repo,
+            "result": {"action": "resume", "run": run.to_dict()},
+        },
+    )
+
+    result = executor(
+        build_request(
+            req_type="work-action",
+            args={"action": "resume", "repo": run.repo, "work_id": run.work_id},
+            requested_by="operator",
+        )
+    )
+
+    assert calls == [run.run_id]
+    assert result["result"]["current_phase"] == "build"
+    assert result["result"]["job_id"] == "new-build-job"
+
+
 def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     candidate = "a" * 40

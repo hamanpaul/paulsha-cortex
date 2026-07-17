@@ -693,7 +693,7 @@ def _commit_archive_and_require_reverification(
 def _authority_with_manager_pr(authority: WorkAuthority, pr_number: int) -> WorkAuthority:
     pr_ref = f"{authority.repo}#{pr_number}"
     source_revisions = set(authority.source_revisions)
-    source_revisions.add(f"github_pr:{pr_ref}@identity:{pr_ref}")
+    source_revisions.add(f"github_pr:{pr_ref}@identity:{pr_ref};state:open")
     return WorkAuthority._verified(
         repo=authority.repo,
         work_id=authority.work_id,
@@ -728,6 +728,10 @@ def _workflow_evidence_payload(
         and row.get("status") == "exited"
         and row.get("exit_code") == 0
         and isinstance(row.get("workflow_evidence"), dict)
+        and (
+            phase not in {"verify", "review"}
+            or row.get("subject_head") == run.candidate_head
+        )
     ]
     if expected_ref is not None:
         rows = [

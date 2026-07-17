@@ -314,8 +314,8 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
     assert authority.mapped_openspec == ("lifecycle",)
     assert authority.mapped_todo_paths == ("docs/todo.md",)
     assert authority.source_revisions == (
-        "github_issue:acme/demo#14@identity:acme/demo#14",
-        "github_pr:acme/demo#8@identity:acme/demo#8",
-        "openspec:acme/demo:lifecycle@identity:lifecycle",
+        "github_issue:acme/demo#14@identity:acme/demo#14;state:open",
+        "github_pr:acme/demo#8@identity:acme/demo#8;state:open",
+        "openspec:acme/demo:lifecycle@identity:lifecycle;state:active",
         "todo:docs/todo.md@identity:docs/todo.md",
     )
