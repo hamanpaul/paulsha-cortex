@@ -295,17 +295,25 @@ verification:
 `PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
 
 ```yaml
-schema_version: 1
+schema_version: 2
 identities:
+  - executor: agy
+    model_id: Gemini 3.1 Pro (High)
+    independence_domain: google
+    capabilities: [planning]
+    live_probe: agy-plan-sandbox
   - executor: codex
     model_id: "<builder-model-id>"
     independence_domain: "<builder-domain>"
+    capabilities: [planning, build]
   - executor: claude
     model_id: "<reviewer-model-id>"
     independence_domain: "<different-reviewer-domain>"
+    capabilities: [planning, review]
 ```
 
-- builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析。
+- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity，自訂檔不得以不同內容 shadow 它。
+- planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - 同 domain、未知 identity、缺 model 都會得到 `foreign-review-absent`（fail-closed）。
 
 ### Merge 限制與 completion/restart
@@ -349,12 +357,13 @@ cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 | coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
 | specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
 | run root | `~/.agents/run` | `PSC_RUN_ROOT` |
+| monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
 | project config root | `~/.agents/config/paulsha` | `PSC_PROJECT_CONFIG_ROOT` |
 | repo root | 目前工作目錄 | `PSC_REPO_ROOT` |
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
-共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 `~/.agents`；installer 也會建立 `~/.agents/core/runtime` 與 `~/.config/systemd/user` 需要的單元檔。
+共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 的 bootstrap EnvironmentFile 固定放在 `~/.agents/core/runtime/<instance>-manager.env`；該檔會持久化 `PSC_AGENTS_ROOT`，再將 runtime 導向 override。installer 重跑會更新自身管理的 Python/repo 值，但保留既有 operator `PSC_AGENTS_ROOT`、`PSC_RUN_ROOT`、`PSC_MONITOR_STATE_ROOT` 與 `PSC_PROJECT_CONFIG_ROOT`。
 
 ## 誠實狀態表
 

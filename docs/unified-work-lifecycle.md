@@ -45,11 +45,13 @@ work_items:
 
 ```bash
 cortex list --repo owner/repo --state todo --explain
-cortex work show unified-work-lifecycle --json
-cortex work link unified-work-lifecycle --kind github_issue --ref owner/repo#14
-cortex work start unified-work-lifecycle
-cortex work resume unified-work-lifecycle
-cortex work auto unified-work-lifecycle --enable
+cortex work show unified-work-lifecycle --repo owner/repo --json
+cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
+cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
+cortex work start unified-work-lifecycle --repo owner/repo
+cortex work resume unified-work-lifecycle --repo owner/repo
+cortex work auto unified-work-lifecycle --repo owner/repo --enable
+cortex work auto unified-work-lifecycle --repo owner/repo --disable
 cortex doctor --probe-live --repo owner/repo --json
 ```
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from paulsha_cortex import cli as umbrella_cli
@@ -48,6 +50,18 @@ def test_fanout_help_uses_daemon_default_not_legacy_tmux(capsys) -> None:
 def test_subcommand_help_uses_installed_cortex_invocations() -> None:
     assert build_deck_parser().prog == "cortex deck"
     assert build_monitor_parser().prog == "cortex monitor"
+
+
+def test_unified_lifecycle_docs_use_typed_repo_scoped_work_mutations() -> None:
+    docs = (Path(__file__).parents[1] / "docs" / "unified-work-lifecycle.md").read_text(
+        encoding="utf-8"
+    )
+    assert "cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14" in docs
+    assert "cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14" in docs
+    assert "cortex work start unified-work-lifecycle --repo owner/repo" in docs
+    assert "cortex work resume unified-work-lifecycle --repo owner/repo" in docs
+    assert "cortex work auto unified-work-lifecycle --repo owner/repo --enable" in docs
+    assert "cortex work auto unified-work-lifecycle --repo owner/repo --disable" in docs
 
 
 def test_install_help_explains_enable_start_and_interval_semantics(capsys) -> None:

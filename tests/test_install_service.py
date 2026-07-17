@@ -77,7 +77,12 @@ def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
     runtime_dir.mkdir(parents=True)
     env_file = runtime_dir / "beta-manager.env"
     env_file.write_text(
-        "# operator tuning\nPSC_WORKTREE_ROOT=/custom/worktrees\nPY=/stale/python\n",
+        "# operator tuning\n"
+        "PSC_WORKTREE_ROOT=/custom/worktrees\n"
+        "PSC_RUN_ROOT=/custom/run\n"
+        "PSC_MONITOR_STATE_ROOT=/custom/monitor\n"
+        "PSC_PROJECT_CONFIG_ROOT=/custom/config\n"
+        "PY=/stale/python\n",
         encoding="utf-8",
     )
 
@@ -91,10 +96,58 @@ def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
     # operator 手動行與註解保留
     assert "# operator tuning" in env_lines
     assert "PSC_WORKTREE_ROOT=/custom/worktrees" in env_lines
+    assert "PSC_RUN_ROOT=/custom/run" in env_lines
+    assert "PSC_MONITOR_STATE_ROOT=/custom/monitor" in env_lines
+    assert "PSC_PROJECT_CONFIG_ROOT=/custom/config" in env_lines
     # managed key 就地更新、不重複
     assert f"PY={sys.executable}" in env_lines
     assert sum(line.startswith("PY=") for line in env_lines) == 1
     assert f"PSC_REPO_ROOT={repo_root.resolve()}" in env_lines
+
+
+def test_install_derives_runtime_defaults_from_agents_root_but_keeps_bootstrap_env_location(
+    tmp_path, monkeypatch
+):
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    custom_agents = tmp_path / "custom-agents"
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(custom_agents))
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert f"PSC_AGENTS_ROOT={custom_agents}" in env_lines
+    assert f"PSC_RUN_ROOT={custom_agents / 'run' / 'beta'}" in env_lines
+    assert f"PSC_MONITOR_STATE_ROOT={custom_agents / 'monitor'}" in env_lines
+    assert f"PSC_PROJECT_CONFIG_ROOT={custom_agents / 'config' / 'paulsha'}" in env_lines
+
+
+def test_install_existing_agents_root_drives_new_specific_defaults(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    custom_agents = tmp_path / "operator-agents"
+    env_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(f"PSC_AGENTS_ROOT={custom_agents}\n", encoding="utf-8")
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert f"PSC_AGENTS_ROOT={custom_agents}" in env_lines
+    assert f"PSC_RUN_ROOT={custom_agents / 'run' / 'beta'}" in env_lines
+    assert f"PSC_MONITOR_STATE_ROOT={custom_agents / 'monitor'}" in env_lines
 
 
 def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):
