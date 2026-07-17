@@ -143,3 +143,21 @@ def test_cortex_work_show_reports_socket_error_to_stderr(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "unknown work item" in captured.err
+
+
+def test_cortex_work_help_lists_read_and_manager_actions(capsys):
+    assert cli.main(["work", "--help"]) == 0
+    output = capsys.readouterr().out
+    for command in ("show", "link", "unlink", "start", "resume", "auto", "ship"):
+        assert command in output
+
+
+def test_cortex_work_mutation_routes_to_coordinator(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.cli.main",
+        lambda argv: calls.append(argv) or 0,
+    )
+
+    assert cli.main(["work", "start", "work", "--repo", "example/acme"]) == 0
+    assert calls == [["work", "start", "work", "--repo", "example/acme"]]

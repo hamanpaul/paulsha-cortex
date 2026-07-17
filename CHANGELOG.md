@@ -27,6 +27,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **統一 `cortex work` umbrella routing**：`show` 仍由 Monitor read API 回應，`link`／`unlink`／`start`／`resume`／`auto`／`ship` 則正確進入 Manager control queue；共同 help 同步列出完整 command family。
 - **Project Monitor 不再把暫時掃描失敗發布成假移除**：workspace／project subtree 無法可靠讀取時保留 last-good `ProjectState` 並附加 `degraded` scan signal；只有成功掃描父層後才允許 removal。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 也改為拒絕非正值，避免錯誤設定被 clamp 成緊迴圈。
 - **CompletionRecord 會重新驗證並綁定全部 evidence**：readiness 現在會嚴格驗證 GateEvaluation schema，並要求 verification/review evidence 的 Slice、Candidate、builder/reviewer job、狀態與 CompletionRecord 一致；target ref 也必須對應宣告的 remote/branch，避免以跨 Slice 或跨 Candidate 的合法 hash 證據繞過 dependency gate。
 - **manager 會重新驗證 verification evidence 後才套用結果**：`complete_tick()` 現在會自行驗 schema、candidate、證據檔 path/hash 與落盤內容一致性；`verification_runner` 回傳 forged payload/path/hash 時一律 fail-closed 到 `needs_human`，不再把 Slice 或 handoff manifest 誤推進 `reviewing` / `verified`。

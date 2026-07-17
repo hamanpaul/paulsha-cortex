@@ -39,6 +39,21 @@ coordinator commands:
 run 'cortex <command> --help' for command-specific help.
 """
 
+_WORK_HELP = """\
+usage: cortex work <show|link|unlink|start|resume|auto|ship> ...
+
+work item commands:
+  show      從 Monitor 讀取 Work Item 與關聯解釋
+  link      由 Manager 寫入 confirmed association
+  unlink    由 Manager 寫入 exclusion
+  start     手動 claim 並建立 WorkflowRun
+  resume    恢復 needs_human／blocked workflow
+  auto      管理 cortex:auto-on-going issue label
+  ship      執行 fail-closed delivery state machine
+
+run 'cortex work show --help' or coordinator mutation help for arguments.
+"""
+
 
 def _relay_hook_script_path() -> Path:
     return Path(str(resources.files("paulsha_cortex") / "scripts" / "psc-relay-hook.sh"))
@@ -72,8 +87,14 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         from paulsha_cortex.monitor.__main__ import main as monitor_main
 
         return int(monitor_main(args[1:]) or 0)
-    if args[0] in {"list", "work"}:
+    if args[0] == "list":
         return _work_read_main(args, work_client=work_client)
+    if args[0] == "work":
+        if len(args) == 1 or args[1] in {"-h", "--help"}:
+            sys.stdout.write(_WORK_HELP)
+            return 0
+        if args[1] == "show":
+            return _work_read_main(args, work_client=work_client)
     if args[0] == "doctor":
         from paulsha_cortex.doctor import main as doctor_main
 
