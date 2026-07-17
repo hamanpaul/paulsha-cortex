@@ -14,18 +14,18 @@ from .service import ProjectMonitorService
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="paulsha_cortex.monitor",
-        description="Stage 9 Project Monitor",
+        prog="cortex monitor",
+        description="依 workspace 文件訊號推導專案狀態；不取代 coordinator delivery status。",
     )
     parser.add_argument(
         "--config",
-        help="path to project-cortex.yaml（或 legacy paulshaclaw.yaml）",
+        help="project-cortex.yaml 路徑（預設依環境變數與標準位置解析）",
         default=None,
     )
     parser.add_argument(
         "--once",
         action="store_true",
-        help="run a single scan, dump JSON snapshot to stdout, exit 0",
+        help="單次掃描後輸出 JSON 並結束；未指定則啟動長駐服務",
     )
     return parser
 

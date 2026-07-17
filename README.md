@@ -20,8 +20,11 @@ persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role p
 
 ## Install
 
+需求：Python 3.10+、Git，以及至少一個已安裝並登入的 headless executor CLI（`copilot`、`claude` 或 `codex`）。套件只安裝 Python runtime，不會代裝或登入 executor。
+
 ```bash
 pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
+cortex --help
 ```
 
 也可在專案內直接安裝：
@@ -32,43 +35,78 @@ python -m pip install .
 
 ## Usage
 
-1. 安裝 systemd `--user` 單元（冪等；一次佈署 manager timer + monitor service）：
+1. 在被治理的目標 git repo 安裝 systemd `--user` 單元：
 
    ```bash
-   cortex install service --instance demo --interval 300
+   cd /path/to/target-repo
+   cortex install service \
+     --instance cortex \
+     --repo-root "$(git rev-parse --show-toplevel)"
    ```
 
-2. 啟動 / 查狀態：
+   Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。
+
+2. 啟動 manager 並分別檢查 service/runtime 狀態：
 
    ```bash
-   systemctl --user start demo-manager.timer
-   systemctl --user start demo-monitor.service
-   systemctl --user status demo-manager.timer
-   systemctl --user status demo-monitor.service
+   systemctl --user start cortex-manager.service cortex-manager.timer
+   systemctl --user status cortex-manager.service
+   cortex status | jq
    ```
 
-3. 使用 deck：
+   可在 `$HOME/.agents/core/runtime/cortex-manager.env` 加入 operator 設定；installer 重跑時會保留非 managed keys：
 
-   ```bash
-   cortex deck compile feature-oneshot --task "demo"
-   cortex deck verify openspec-archive --task-slug demo-task --change sample-change
+   ```dotenv
+   PSC_MANAGER_EXECUTOR=codex
+   PSC_MANAGER_INTERVAL_SECONDS=300
    ```
 
-4. 監看 project 狀態：
+3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash
-   cortex monitor --once
-   cortex monitor
+   cortex deck compile feature-oneshot --task "example feature" --change example-feature
+   cortex deck compile feature-oneshot --task "example feature" --change example-feature --emit
    ```
 
-5. 使用 coordinator CLI：
+4. 完成 interactive checklist，將 spec 的 glob plan 改為確切路徑，補齊 `target_branch` / `verification` 後才翻成 `dispatch: auto`，再執行一次完整 tick：
 
    ```bash
+   cortex ready --specs-dir "$HOME/.agents/specs" | jq
+   cortex tick \
+     --specs-dir "$HOME/.agents/specs" \
+     --executor codex \
+     --model "<builder-model-id>" \
+     --review-executor claude \
+     --review-model "<reviewer-model-id>"
+   ```
+
+5. Project Monitor 是選配功能。啟動前先建立 `$HOME/.agents/config/paulsha/project-cortex.yaml`；workspace path 應指向「包含各 repo 的父目錄」：
+
+   ```yaml
+   workspaces:
+     - name: projects
+       path: /path/to/workspace
+   monitor:
+     poll_interval_seconds: 60
+     rescan_interval_seconds: 300
+     legacy_policy: hide
+   ```
+
+   ```bash
+   cortex monitor --once | jq
+   systemctl --user start cortex-monitor.service
+   systemctl --user status cortex-monitor.service
+   ```
+
+6. 日常查詢：
+
+   ```bash
+   cortex status | jq
    cortex jobs
-   cortex ready --specs-dir ~/.agents/specs
+   cortex stat "$JOB_ID"
    ```
 
-> `cortex status` 查的是 manager 任務狀態；`systemctl --user status` 查的是 service 是否存活，兩者用途不同。
+> `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 
 ## 從使用者角度操作
 
@@ -113,7 +151,24 @@ Deck 產生的 spec 預設為 `dispatch: hold`，不會立即派工。翻成 `di
 
 Manager 只會派送「已翻 auto、有 plan、相依全部 completed」的 slice。不要使用低階 `cortex dispatch`；它因缺少 spec / verification metadata 已停用。
 
-### 2. 觀察任務狀態
+### 2. 派工與執行 gate
+
+先確認 ready set，再明確指定 builder 與 foreign reviewer：
+
+```bash
+cortex ready --specs-dir "$HOME/.agents/specs" | jq
+
+cortex tick \
+  --specs-dir "$HOME/.agents/specs" \
+  --executor codex \
+  --model "<builder-model-id>" \
+  --review-executor claude \
+  --review-model "<reviewer-model-id>"
+```
+
+`tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--model` / `--review-model` 原樣傳給 executor，能否使用仍取決於該 CLI 與帳號權限。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。
+
+### 3. 觀察任務狀態
 
 ```bash
 # Manager 綜合狀態：ready / held / in-flight / slices / attention
@@ -121,7 +176,7 @@ cortex status | jq
 
 # Job 執行歷史與單筆詳情
 cortex jobs | jq
-cortex stat <job-id> | jq
+cortex stat "$JOB_ID" | jq
 
 # 只列出目前可派送的 specs
 cortex ready --specs-dir ~/.agents/specs | jq
@@ -144,18 +199,31 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 
 Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務交付完成**。只有 Slice 通過 deterministic verification、必要的 foreign review，且 Candidate 已進入 target branch 後，才會變成 `completed` 並釋放下游 dependency。
 
-### 3. 處理 `needs_human`
+### 4. 處理 `needs_human`
 
 先從 `cortex status` 的 `attention[].next_actions` 選擇當下允許的動作，不要手動改 `jobs.json`：
 
 ```bash
-cortex slice-action <slice-id> retry-build  --actor operator
-cortex slice-action <slice-id> retry-verify --actor operator
-cortex slice-action <slice-id> retry-review --actor operator
-cortex slice-action <slice-id> abandon      --actor operator
+cortex slice-action "$SLICE_ID" retry-build  --actor operator
+cortex slice-action "$SLICE_ID" retry-verify --actor operator
+cortex slice-action "$SLICE_ID" retry-review --actor operator
+cortex slice-action "$SLICE_ID" abandon      --actor operator
 ```
 
 `fanout`、`tick`、`complete` 與 `slice-action` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
+
+### 5. Merge Candidate 並完成交付
+
+Cortex 不會替使用者 merge。verification / review 通過後，Slice 會停在 `verified` / `candidate-not-merged`；這個狀態不一定列入 `attention`，也要檢查 `status.slices`。將 `feature/<slice-id>` 透過保留原 Candidate commit 的 merge commit 合入並推送 target branch 後，再執行：
+
+```bash
+cortex complete \
+  --specs-dir "$HOME/.agents/specs" \
+  --review-executor claude \
+  --review-model "<reviewer-model-id>"
+```
+
+只有 Candidate 成為 `refs/remotes/<remote>/<target_branch>` 的 ancestor，Cortex 才會寫 CompletionRecord、標記 Slice `completed` 並釋放下游。squash / rebase merge / cherry-pick 會改變 Candidate identity，目前不受支援。
 
 ### 目前邊界
 
@@ -164,6 +232,9 @@ cortex slice-action <slice-id> abandon      --actor operator
 - verification 的 sanitized env 不等於 network / filesystem sandbox。
 - v1 自動 foreign review 限 `tier: shareable`。
 - preserving-commit merge 是目前受支援路徑；squash / cherry-pick 改變 Candidate identity 時會 fail-closed。
+- installer/service 尚無 periodic builder/reviewer model pin；需要固定 model 時，使用帶 `--model` / `--review-model` 的手動 `cortex tick`。
+
+尚未實作的 operator bootstrap、model pin、monitor init、instance/path isolation、state migration 與 async request UX 統一追蹤於 [issue #12](https://github.com/hamanpaul/paulsha-cortex/issues/12)，供後續 OpenSpec / implementation plan 使用。
 
 ## Coordinator dispatch discipline（v1）
 
@@ -216,12 +287,12 @@ verification:
 ```yaml
 schema_version: 1
 identities:
-  - executor: copilot
-    model_id: claude-haiku-4.5
-    independence_domain: anthropic
   - executor: codex
-    model_id: gpt-5.4
-    independence_domain: openai
+    model_id: "<builder-model-id>"
+    independence_domain: "<builder-domain>"
+  - executor: claude
+    model_id: "<reviewer-model-id>"
+    independence_domain: "<different-reviewer-domain>"
 ```
 
 - builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析。
@@ -238,10 +309,10 @@ identities:
 ### Operator actions 與 status / attention
 
 ```bash
-cortex slice-action <slice-id> retry-build  --actor <text>
-cortex slice-action <slice-id> retry-verify --actor <text>
-cortex slice-action <slice-id> retry-review --actor <text>
-cortex slice-action <slice-id> abandon      --actor <text>
+cortex slice-action "$SLICE_ID" retry-build  --actor "$ACTOR"
+cortex slice-action "$SLICE_ID" retry-verify --actor "$ACTOR"
+cortex slice-action "$SLICE_ID" retry-review --actor "$ACTOR"
+cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 ```
 
 - `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
@@ -278,10 +349,10 @@ cortex slice-action <slice-id> abandon      --actor <text>
 
 | 面向 | 現況 |
 | --- | --- |
-| persona enforcement | `shadow`；只觀測、不阻擋，翻牌到 enforce 另案處理 |
-| manager service install | `cortex install service` 已可一次 render / copy / enable manager timer + monitor service；systemd 不可用時會 graceful 落檔 |
-| coordinator runtime | `dispatch` / `jobs` / `stat` / `ready` / `fanout` / `complete` / `tick` 已平移 |
-| deck 驗證 | deck 與 persona 同包；未知 card 仍以 warning 呈現 |
+| persona enforcement | standalone PR workflow 為 `shadow`；coordinator verification 的 `persona-scope` 為 fail-closed gate |
+| manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
+| coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` 走 control queue；舊低階 `dispatch` 已停用 |
+| deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
 | monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 |
 | 依賴模型 | 僅 `PyYAML`；runtime 不依賴 `paulsha-hippo` |
 

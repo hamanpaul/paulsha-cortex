@@ -16,30 +16,33 @@ from .verify import DeckVerifyError
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="psc deck")
+    parser = argparse.ArgumentParser(
+        prog="cortex deck",
+        description="將 Deck combo 編譯成預設 dispatch:hold 的 slice specs。",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list", help="列出卡片與 combos")
 
     compile_parser = sub.add_parser("compile", help="combo+task → slice specs（預設 dry-run）")
-    compile_parser.add_argument("combo")
-    compile_parser.add_argument("--task", required=True)
-    compile_parser.add_argument("--change")
+    compile_parser.add_argument("combo", help="combo ID（例如 feature-oneshot）")
+    compile_parser.add_argument("--task", required=True, help="人類可讀的任務描述")
+    compile_parser.add_argument("--change", help="OpenSpec change ID；正式 emit 時依 combo 需求提供")
     compile_parser.add_argument("--with", dest="with_cards", action="append", default=[],
                                 metavar="CARD[:after=ID|:before=ID]")
     compile_parser.add_argument("--only", nargs="+", default=[])
-    compile_parser.add_argument("--allow-external", action="store_true")
-    compile_parser.add_argument("--plan", dest="plan_ref")
+    compile_parser.add_argument("--allow-external", action="store_true", help="允許 combo 宣告的外部前置輸入")
+    compile_parser.add_argument("--plan", dest="plan_ref", help="覆寫產生 spec 的 plan reference")
     out_group = compile_parser.add_mutually_exclusive_group()
-    out_group.add_argument("--out")
-    out_group.add_argument("--emit", action="store_true")
-    compile_parser.add_argument("--force", action="store_true")
+    out_group.add_argument("--out", help="寫入指定 spec 目錄；未設定時只 dry-run")
+    out_group.add_argument("--emit", action="store_true", help="寫入預設 specs 目錄；未設定時只 dry-run")
+    compile_parser.add_argument("--force", action="store_true", help="允許覆寫既有輸出檔")
 
     verify_parser = sub.add_parser("verify", help="卡片 produces 存在性驗收")
-    verify_parser.add_argument("card_id")
-    verify_parser.add_argument("--task-slug", required=True)
-    verify_parser.add_argument("--change")
-    verify_parser.add_argument("--root", default=".")
+    verify_parser.add_argument("card_id", help="要驗收 produces glob 的 card ID")
+    verify_parser.add_argument("--task-slug", required=True, help="compile 輸出的 task slug")
+    verify_parser.add_argument("--change", help="OpenSpec change ID")
+    verify_parser.add_argument("--root", default=".", help="glob 驗收根目錄（預設：目前目錄）")
     return parser
 
 
