@@ -116,12 +116,21 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="cortex install")
+    parser = argparse.ArgumentParser(
+        prog="cortex install",
+        description="安裝 paulsha-cortex systemd --user units；只落檔/enable，不會 start service。",
+    )
     sub = parser.add_subparsers(dest="target", required=True)
-    svc = sub.add_parser("service")
-    svc.add_argument("--instance", default="cortex")
-    svc.add_argument("--interval", type=int, default=300)
-    svc.add_argument("--repo-root", default=str(Path.cwd()))
+    svc = sub.add_parser("service", help="安裝 manager service/timer 與 monitor service")
+    svc.add_argument("--instance", default="cortex", help="systemd unit 前綴（預設：cortex）")
+    svc.add_argument(
+        "--interval", type=int, default=300,
+        help="deprecated manager timer 的 OnUnitActiveSec 秒數；daemon tick 請用 PSC_MANAGER_INTERVAL_SECONDS",
+    )
+    svc.add_argument(
+        "--repo-root", default=str(Path.cwd()),
+        help="被治理的目標 git repo（預設：目前目錄）",
+    )
     args = parser.parse_args(argv)
     try:
         instance = _validate_instance(args.instance)

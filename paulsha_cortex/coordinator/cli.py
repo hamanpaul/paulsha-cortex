@@ -39,53 +39,71 @@ def _refuse_unsafe_fanout(metas, predicate, *, allow_unsafe, max_ready=1):
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m paulsha_cortex.coordinator")
+    parser = argparse.ArgumentParser(
+        prog="cortex",
+        description="讀取 manager 狀態，或透過 control queue 執行派工與交付 gate。",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_dispatch = sub.add_parser("dispatch", help="派一個 job 進 pane+worktree")
+    p_dispatch = sub.add_parser(
+        "dispatch",
+        help="已停用的舊低階入口（請改用 fanout/tick）",
+        description="此入口缺少 spec/verification metadata，固定拒絕執行；請改用 fanout 或 tick。",
+    )
     p_dispatch.add_argument("--task", required=True)
     p_dispatch.add_argument("--persona", required=True)
     p_dispatch.add_argument("--pane", required=True)
     p_dispatch.add_argument("--command", required=True)
 
-    sub.add_parser("jobs", help="列出所有 job")
+    sub.add_parser("jobs", help="列出所有 Job 執行紀錄")
 
-    p_stat = sub.add_parser("stat", help="查單一 job")
+    p_stat = sub.add_parser("stat", help="查單一 Job 執行紀錄")
     p_stat.add_argument("job_id")
 
-    p_ready = sub.add_parser("ready", help="列出就緒（dispatch:auto∧有plan∧depends_on全滿足）的單位")
-    p_ready.add_argument("--specs-dir", required=True)
+    p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
+    p_ready.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
 
-    p_fanout = sub.add_parser("fanout", help="對就緒集經 Dispatcher 並行派工")
-    p_fanout.add_argument("--specs-dir", required=True)
-    p_fanout.add_argument("--persona", default="builder")
+    p_fanout = sub.add_parser("fanout", help="透過 manager daemon 派送目前 ready 的 slices")
+    p_fanout.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
+    p_fanout.add_argument("--persona", default="builder", help="builder persona role（預設：builder）")
     p_fanout.add_argument(
         "--executor",
         choices=sorted(_ARGV_BUILDERS),
         default=None,
-        help="設定後走 headless launcher 路徑（copilot/claude/codex）；未設則沿用舊 tmux pane 路徑",
+        help="headless executor；未指定時使用 daemon 預設值",
     )
-    p_fanout.add_argument("--allow-unsafe", action="store_true")
-    p_fanout.add_argument("--model", default=None)
+    p_fanout.add_argument(
+        "--allow-unsafe",
+        action="store_true",
+        help="高風險：旁路 executor approval/sandbox；只允許單一 ready slice canary",
+    )
+    p_fanout.add_argument("--model", default=None, help="原樣傳給 builder executor 的 model ID")
 
     p_complete = sub.add_parser(
         "complete",
-        help="完成側 tick：輪詢 in-flight job → 寫 handoff manifest → 釋放下游",
+        help="輪詢既有 jobs，執行 verification/review/completion gate",
     )
-    p_complete.add_argument("--handoff-dir", default=autonomy.DEFAULT_HANDOFF_DIR)
+    p_complete.add_argument(
+        "--handoff-dir",
+        default=autonomy.DEFAULT_HANDOFF_DIR,
+        help=f"handoff 目錄（預設為相對路徑：{autonomy.DEFAULT_HANDOFF_DIR}）",
+    )
     p_complete.add_argument(
         "--specs-dir", default=None,
         help="設定後據 dependency graph 觀測算出本趟釋放的下游（released）",
     )
-    p_complete.add_argument("--review-executor", choices=sorted(_ARGV_BUILDERS), default=None)
-    p_complete.add_argument("--review-model", default=None)
+    p_complete.add_argument(
+        "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="foreign reviewer executor",
+    )
+    p_complete.add_argument("--review-model", default=None, help="foreign reviewer model ID")
 
     p_slice_action = sub.add_parser("slice-action", help="對 needs_human slice 送出本機 recovery action")
     p_slice_action.add_argument("slice_id")
     p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "abandon"])
     p_slice_action.add_argument("--actor", required=True)
 
-    sub.add_parser("status", help="讀取 manager daemon 狀態快照")
+    sub.add_parser("status", help="讀取 manager daemon 的 ready/held/slices/attention 快照")
 
     p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
     p_reap.add_argument("--apply", action="store_true")
@@ -93,18 +111,32 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_tick = sub.add_parser(
         "tick",
-        help="完整 manager tick：fanout→complete（idle-gated）",
+        help="執行完整 manager tick：fanout → verification/review/completion",
     )
-    p_tick.add_argument("--specs-dir", required=True)
-    p_tick.add_argument("--persona", default="builder")
-    p_tick.add_argument("--executor", choices=sorted(_ARGV_BUILDERS), default=None)
-    p_tick.add_argument("--handoff-dir", default=autonomy.DEFAULT_HANDOFF_DIR)
-    p_tick.add_argument("--require-idle", action="store_true")
-    p_tick.add_argument("--max-load", type=float, default=1.0)
-    p_tick.add_argument("--allow-unsafe", action="store_true")
-    p_tick.add_argument("--model", default=None)
-    p_tick.add_argument("--review-executor", choices=sorted(_ARGV_BUILDERS), default=None)
-    p_tick.add_argument("--review-model", default=None)
+    p_tick.add_argument("--specs-dir", required=True, help="要掃描的 spec 目錄")
+    p_tick.add_argument("--persona", default="builder", help="builder persona role（預設：builder）")
+    p_tick.add_argument(
+        "--executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="headless builder executor；未指定時使用 daemon 預設值",
+    )
+    p_tick.add_argument(
+        "--handoff-dir",
+        default=autonomy.DEFAULT_HANDOFF_DIR,
+        help=f"handoff 目錄（預設為相對路徑：{autonomy.DEFAULT_HANDOFF_DIR}）",
+    )
+    p_tick.add_argument("--require-idle", action="store_true", help="系統負載高於 --max-load 時不派新工作")
+    p_tick.add_argument("--max-load", type=float, default=1.0, help="--require-idle 的 1-minute load threshold")
+    p_tick.add_argument(
+        "--allow-unsafe",
+        action="store_true",
+        help="高風險：旁路 executor approval/sandbox；只允許單一 ready slice canary",
+    )
+    p_tick.add_argument("--model", default=None, help="原樣傳給 builder executor 的 model ID")
+    p_tick.add_argument(
+        "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
+        help="foreign reviewer executor",
+    )
+    p_tick.add_argument("--review-model", default=None, help="foreign reviewer model ID")
 
     return parser
 

@@ -7,7 +7,31 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
-_USAGE = "usage: cortex {install service|relay-hook|deck|monitor|<coordinator subcommand>} <args...>\n"
+_USAGE = "usage: cortex [-h] <command> [<args>...]\n"
+_HELP = """\
+usage: cortex [-h] <command> [<args>...]
+
+paulsha-cortex 檔案驅動的 Agent 派工與交付治理 CLI
+
+setup and workflow commands:
+  install service  安裝 manager service/timer 與 monitor 的 systemd --user units
+  deck             預覽或產生 dispatch:hold 的 slice specs
+  monitor          掃描專案文件並輸出 Project Monitor 狀態
+  relay-hook       執行封裝內 relay hook（整合用途）
+
+coordinator commands:
+  status           讀取 manager daemon 綜合狀態
+  ready            列出符合派工條件的 specs
+  jobs, stat       查詢 Job 執行紀錄
+  fanout           派送目前 ready 的 slices
+  tick             執行 fanout + completion/review 流程
+  complete         輪詢既有 jobs 並執行 verification/review/completion
+  slice-action     對 needs_human slice 執行允許的 recovery action
+  reap-brokers     dry-run 或受限清理孤兒 Codex broker
+  dispatch         已停用的舊低階入口
+
+run 'cortex <command> --help' for command-specific help.
+"""
 
 
 def _relay_hook_script_path() -> Path:
@@ -19,6 +43,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args:
         sys.stderr.write(_USAGE)
         return 2
+    if args[0] in {"-h", "--help"}:
+        sys.stdout.write(_HELP)
+        return 0
     if args[0] == "install":
         from paulsha_cortex.deploy.installer import main as install_main
 
