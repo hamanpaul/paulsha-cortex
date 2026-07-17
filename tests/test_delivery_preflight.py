@@ -6,16 +6,20 @@ from pathlib import Path
 
 import pytest
 
+from paulsha_cortex.coordinator import verification
 from paulsha_cortex.coordinator.preflight import (
+    FULL_SUITE_EVIDENCE_SCHEMA,
     FullSuiteEvidence,
     PreflightRequest,
     build_preflight_argv,
     load_preflight_command,
+    load_full_suite_evidence,
     run_preflight,
 )
 
 
 HEAD = "a" * 40
+TREE = "b" * 40
 
 
 def test_initial_and_existing_pr_preflight_argv() -> None:
@@ -42,41 +46,67 @@ def test_load_preflight_command_is_typed_and_requires_executable(tmp_path: Path)
         load_preflight_command(env={"PSC_PREFLIGHT_CMD": str(tmp_path / "missing")})
     with pytest.raises(ValueError, match="shell wrapper"):
         load_preflight_command(env={"PSC_PREFLIGHT_CMD": "bash -c 'echo unsafe'"})
+    with pytest.raises(ValueError, match="shell wrapper"):
+        build_preflight_argv(
+            command=("/usr/bin/env", "bash", "-c", "echo unsafe"),
+            request=PreflightRequest(pr_number=15),
+        )
 
 
 def test_skip_tests_requires_recent_exact_tree_evidence() -> None:
+    evidence = FullSuiteEvidence(
+        schema=FULL_SUITE_EVIDENCE_SCHEMA,
+        tree_hash=TREE,
+        passed=True,
+        completed_at_epoch=950,
+    )
     request = PreflightRequest(
         pr_number=15,
         skip_tests=True,
-        tree_hash=HEAD,
+        tree_hash=TREE,
         now_epoch=1_000,
-        full_suite=FullSuiteEvidence(tree_hash=HEAD, passed=True, completed_at_epoch=950),
     )
-    assert build_preflight_argv(command=("preflight",), request=request)[-1] == "--skip-tests"
+    assert build_preflight_argv(
+        command=("preflight",),
+        request=request,
+        current_tree_hash=TREE,
+        full_suite_evidence=evidence,
+    )[-1] == "--skip-tests"
     with pytest.raises(ValueError, match="exact current tree"):
         build_preflight_argv(
             command=("preflight",),
-            request=replace(
-                request,
-                full_suite=FullSuiteEvidence(
-                    tree_hash="b" * 40,
-                    passed=True,
-                    completed_at_epoch=950,
-                ),
-            ),
+            request=request,
+            current_tree_hash="c" * 40,
+            full_suite_evidence=evidence,
         )
     with pytest.raises(ValueError, match="stale"):
         build_preflight_argv(
             command=("preflight",),
-            request=replace(
-                request,
-                full_suite=FullSuiteEvidence(
-                    tree_hash=HEAD,
-                    passed=True,
-                    completed_at_epoch=1,
-                ),
+            request=request,
+            current_tree_hash=TREE,
+            full_suite_evidence=replace(
+                evidence,
+                completed_at_epoch=1,
             ),
         )
+
+
+def test_full_suite_evidence_is_durable_strict_and_hash_bound(tmp_path: Path) -> None:
+    payload = {
+        "schema": FULL_SUITE_EVIDENCE_SCHEMA,
+        "tree_hash": TREE,
+        "passed": True,
+        "completed_at_epoch": 950,
+    }
+    path = tmp_path / "full-suite.json"
+    path.write_text(__import__("json").dumps(payload), encoding="utf-8")
+    evidence = load_full_suite_evidence(
+        path,
+        expected_hash=verification.canonical_json_hash(payload),
+    )
+    assert evidence.tree_hash == TREE
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_full_suite_evidence(path, expected_hash="0" * 64)
 
 
 def test_run_preflight_runs_quick_policy_then_ci_parity_without_shell(tmp_path: Path) -> None:
@@ -86,12 +116,19 @@ def test_run_preflight_runs_quick_policy_then_ci_parity_without_shell(tmp_path: 
     calls: list[dict[str, object]] = []
 
     class Result:
-        returncode = 0
-        stdout = "ok"
-        stderr = ""
+        def __init__(self, stdout="ok", returncode=0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
 
     def runner(argv, **kwargs):
         calls.append({"argv": list(argv), **kwargs})
+        if "status" in argv:
+            return Result("")
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return Result(HEAD)
+        if argv[-2:] == ["rev-parse", "HEAD^{tree}"]:
+            return Result(TREE)
         return Result()
 
     result = run_preflight(
@@ -101,22 +138,30 @@ def test_run_preflight_runs_quick_policy_then_ci_parity_without_shell(tmp_path: 
         runner=runner,
     )
     assert result.passed
-    assert calls[0]["argv"] == ["python3", "-m", "policy_check", "--repo", "."]
-    assert calls[1]["argv"] == [str(executable), "--pr", "15"]
-    assert calls[0]["shell"] is False
-    assert calls[1]["shell"] is False
+    assert calls[3]["argv"] == ["python3", "-m", "policy_check", "--repo", "."]
+    assert calls[4]["argv"] == [str(executable), "--pr", "15"]
+    assert result.head == HEAD
+    assert result.tree_hash == TREE
+    assert all(call["shell"] is False for call in calls)
 
 
 def test_run_preflight_stops_after_failed_quick_policy(tmp_path: Path) -> None:
     calls = []
 
     class Result:
-        returncode = 1
-        stdout = ""
-        stderr = "failed"
+        def __init__(self, returncode=1, stdout=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = "failed" if returncode else ""
 
     def runner(argv, **kwargs):
         calls.append(list(argv))
+        if "status" in argv:
+            return Result(0, "")
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return Result(0, HEAD)
+        if argv[-2:] == ["rev-parse", "HEAD^{tree}"]:
+            return Result(0, TREE)
         return Result()
 
     result = run_preflight(
@@ -127,4 +172,115 @@ def test_run_preflight_stops_after_failed_quick_policy(tmp_path: Path) -> None:
     )
     assert not result.passed
     assert result.failed_stage == "policy"
-    assert len(calls) == 1
+    assert len(calls) == 4
+
+
+def test_run_preflight_rejects_forged_or_empty_tree_request(tmp_path: Path) -> None:
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def runner(argv, **kwargs):
+        if "status" in argv:
+            return Result("")
+        return Result(TREE if argv[-1] == "HEAD^{tree}" else HEAD)
+
+    with pytest.raises(ValueError, match="current tree"):
+        run_preflight(
+            repo_root=tmp_path,
+            command=("preflight",),
+            request=PreflightRequest(pr_number=15, tree_hash=""),
+            runner=runner,
+        )
+
+
+def test_run_preflight_invalidates_result_when_tree_changes_during_gate(tmp_path: Path) -> None:
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    tree_reads = 0
+
+    def runner(argv, **kwargs):
+        nonlocal tree_reads
+        if argv[-1] == "HEAD":
+            return Result(HEAD)
+        if argv[-1] == "HEAD^{tree}":
+            tree_reads += 1
+            return Result(TREE if tree_reads == 1 else "c" * 40)
+        if "status" in argv:
+            return Result("")
+        return Result("ok")
+
+    result = run_preflight(
+        repo_root=tmp_path,
+        command=("preflight",),
+        request=PreflightRequest(pr_number=15),
+        runner=runner,
+    )
+    assert not result.passed
+    assert result.failed_stage == "tree-race"
+
+
+def test_run_preflight_rejects_dirty_worktree(tmp_path: Path) -> None:
+    class Result:
+        returncode = 0
+        stdout = " M tracked.py\n"
+        stderr = ""
+
+    with pytest.raises(RuntimeError, match="clean committed worktree"):
+        run_preflight(
+            repo_root=tmp_path,
+            command=("preflight",),
+            request=PreflightRequest(pr_number=15),
+            runner=lambda argv, **kwargs: Result(),
+        )
+
+
+def test_run_preflight_uses_trusted_clock_for_skip_evidence(tmp_path: Path) -> None:
+    payload = {
+        "schema": FULL_SUITE_EVIDENCE_SCHEMA,
+        "tree_hash": TREE,
+        "passed": True,
+        "completed_at_epoch": 100,
+    }
+    path = tmp_path / "full-suite.json"
+    path.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def runner(argv, **kwargs):
+        if "status" in argv:
+            return Result("")
+        if argv[-1] == "HEAD":
+            return Result(HEAD)
+        if argv[-1] == "HEAD^{tree}":
+            return Result(TREE)
+        return Result("ok")
+
+    with pytest.raises(ValueError, match="stale"):
+        run_preflight(
+            repo_root=tmp_path,
+            command=("preflight",),
+            request=PreflightRequest(
+                pr_number=15,
+                skip_tests=True,
+                tree_hash=TREE,
+                now_epoch=101,
+                full_suite_evidence_path=str(path),
+                full_suite_evidence_hash=verification.canonical_json_hash(payload),
+            ),
+            runner=runner,
+            now=lambda: 2_000,
+        )

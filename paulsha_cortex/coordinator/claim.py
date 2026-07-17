@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -21,6 +22,7 @@ class ClaimCandidate:
     auto_label: bool
     provider_fresh: bool
     active_run_id: str | None
+    active_claim_key: str | None
 
 
 @dataclass(frozen=True)
@@ -32,7 +34,9 @@ class ClaimDecision:
 
 
 def _validate_candidate(candidate: ClaimCandidate) -> None:
-    if "/" not in candidate.repo or not candidate.work_id.strip():
+    repo_valid = re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", candidate.repo)
+    work_id_valid = re.fullmatch(r"[a-z0-9][a-z0-9-]*", candidate.work_id)
+    if repo_valid is None or work_id_valid is None:
         raise ValueError("claim candidate repo/work_id invalid")
     if any(not isinstance(revision, str) or not revision.strip() for revision in candidate.source_revisions):
         raise ValueError("source revisions must be non-empty strings")
@@ -42,10 +46,24 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
         or candidate.confirmed_issue <= 0
     ):
         raise ValueError("confirmed_issue must be a positive integer or null")
+    if candidate.active_run_id is None and candidate.active_claim_key is not None:
+        raise ValueError("active_claim_key requires active_run_id")
+    if candidate.active_run_id is not None:
+        if not isinstance(candidate.active_run_id, str) or not candidate.active_run_id.strip():
+            raise ValueError("active_run_id must be a non-empty string")
+        if (
+            not isinstance(candidate.active_claim_key, str)
+            or not candidate.active_claim_key.startswith("claim:v1:")
+            or len(candidate.active_claim_key) != len("claim:v1:") + 64
+            or any(ch not in "0123456789abcdef" for ch in candidate.active_claim_key[-64:])
+        ):
+            raise ValueError("active workflow requires its persisted claim key")
 
 
 def build_claim_key(candidate: ClaimCandidate) -> str:
     _validate_candidate(candidate)
+    if not candidate.source_revisions:
+        raise ValueError("new claim requires authoritative source revisions")
     payload = {
         "repo": candidate.repo,
         "work_id": candidate.work_id,
@@ -63,7 +81,7 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     return ClaimDecision(
         action="resume",
         reason="active-workflow",
-        claim_key=build_claim_key(candidate),
+        claim_key=candidate.active_claim_key,
         run_id=candidate.active_run_id,
     )
 
@@ -99,7 +117,7 @@ def decide_auto_claim(candidate: ClaimCandidate) -> ClaimDecision:
 
 
 def build_label_argv(*, repo: str, issue: int, enabled: bool) -> list[str]:
-    if "/" not in repo or repo.startswith("/") or repo.endswith("/"):
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
         raise ValueError("repo must be owner/name")
     if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
         raise ValueError("issue must be a positive integer")

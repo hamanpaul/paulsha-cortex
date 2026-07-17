@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from paulsha_cortex.coordinator.claim import (
     AUTO_LABEL,
     ClaimCandidate,
@@ -22,6 +24,7 @@ def _candidate() -> ClaimCandidate:
         auto_label=True,
         provider_fresh=True,
         active_run_id=None,
+        active_claim_key=None,
     )
 
 
@@ -67,10 +70,25 @@ def test_auto_claim_requires_todo_issue_label_and_fresh_provider() -> None:
 
 
 def test_active_run_is_idempotent_and_label_removal_does_not_cancel() -> None:
-    active = replace(_candidate(), active_run_id="run-1", auto_label=False)
+    original_key = build_claim_key(_candidate())
+    active = replace(
+        _candidate(),
+        active_run_id="run-1",
+        active_claim_key=original_key,
+        source_revisions=("issue:14@updated",),
+        auto_label=False,
+    )
     assert decide_manual_start(active).action == "resume"
     assert decide_auto_claim(active).action == "resume"
     assert decide_auto_claim(active).run_id == "run-1"
+    assert decide_auto_claim(active).claim_key == original_key
+
+
+def test_new_claim_requires_revisions_and_active_run_requires_persisted_key() -> None:
+    with pytest.raises(ValueError, match="source revisions"):
+        decide_manual_start(replace(_candidate(), source_revisions=()))
+    with pytest.raises(ValueError, match="persisted claim key"):
+        decide_auto_claim(replace(_candidate(), active_run_id="run-1"))
 
 
 def test_label_rest_argv_is_typed() -> None:

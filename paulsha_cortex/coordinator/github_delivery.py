@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Callable, Mapping
+from urllib.parse import quote
 
 
 GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+COPILOT_REVIEWER_LOGIN = "copilot-pull-request-reviewer[bot]"
+_SHIP_CAPABILITY = object()
 COPILOT_ERROR_MARKERS = (
     "encountered an error",
     "failed to review",
@@ -34,6 +41,8 @@ class CopilotReview:
     commit_id: str
     state: str
     body: str
+    author: str
+    submitted_at_epoch: float
 
     @property
     def is_error(self) -> bool:
@@ -69,6 +78,8 @@ class DeliveryFacts:
 class DeliveryPolicy:
     expected_head: str
     required_closing_issues: tuple[int, ...]
+    copilot_review_id: int
+    copilot_requested_at_epoch: float
 
 
 @dataclass(frozen=True)
@@ -93,7 +104,12 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
         reasons.append("checks-not-terminal-green")
 
     current_reviews = tuple(
-        review for review in facts.copilot_reviews if review.commit_id == policy.expected_head
+        review
+        for review in facts.copilot_reviews
+        if review.commit_id == policy.expected_head
+        and review.review_id == policy.copilot_review_id
+        and review.author == COPILOT_REVIEWER_LOGIN
+        and review.submitted_at_epoch >= policy.copilot_requested_at_epoch
     )
     if not current_reviews:
         reasons.append("copilot-current-head-review-missing")
@@ -130,7 +146,8 @@ def build_copilot_request_argv(*, repo: str, pr_number: int) -> list[str]:
     ]
 
 
-def build_merge_argv(*, pr_number: int, expected_head: str) -> list[str]:
+def build_merge_argv(*, repo: str, pr_number: int, expected_head: str) -> list[str]:
+    GitHubDeliveryClient._repo_parts(repo)
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise ValueError("pr_number must be a positive integer")
     if len(expected_head) != 40 or any(
@@ -142,6 +159,8 @@ def build_merge_argv(*, pr_number: int, expected_head: str) -> list[str]:
         "pr",
         "merge",
         str(pr_number),
+        "--repo",
+        repo,
         "--merge",
         "--match-head-commit",
         expected_head,
@@ -151,12 +170,14 @@ def build_merge_argv(*, pr_number: int, expected_head: str) -> list[str]:
 @dataclass(frozen=True)
 class RemoteClosureFacts:
     merge_commit: str
+    default_head: str
     merge_is_ancestor: bool
     merge_is_merge_commit: bool
     issue_states: Mapping[int, str]
     active_openspec_absent: bool
     archive_present: bool
     todo_complete: bool
+    todo_revisions: Mapping[str, str]
     completion_record_valid: bool
 
 
@@ -166,6 +187,8 @@ def evaluate_remote_closure(
     required_issues: tuple[int, ...],
 ) -> GateResult:
     reasons: list[str] = []
+    if re.fullmatch(r"[0-9a-fA-F]{40}", facts.default_head) is None:
+        reasons.append("remote-default-unverified")
     if len(facts.merge_commit) != 40 or not facts.merge_is_ancestor:
         reasons.append("merge-ancestry-unverified")
     if not facts.merge_is_merge_commit:
@@ -186,11 +209,17 @@ def evaluate_remote_closure(
 
 Runner = Callable[..., object]
 _WORK_QUERY = """
-query($owner:String!,$name:String!,$number:Int!) {
+query($owner:String!,$name:String!,$number:Int!,$issueCursor:String,$threadCursor:String) {
   repository(owner:$owner,name:$name) {
     pullRequest(number:$number) {
-      closingIssuesReferences(first:100) { nodes { number } }
-      reviewThreads(first:100) { nodes { id isResolved isOutdated } }
+      closingIssuesReferences(first:100,after:$issueCursor) {
+        nodes { number repository { nameWithOwner } }
+        pageInfo { hasNextPage endCursor }
+      }
+      reviewThreads(first:100,after:$threadCursor) {
+        nodes { id isResolved isOutdated }
+        pageInfo { hasNextPage endCursor }
+      }
     }
   }
 }
@@ -227,17 +256,36 @@ class GitHubDeliveryClient:
     def _api(self, endpoint: str) -> object:
         return self._run(["gh", "api", endpoint], expect_json=True)
 
+    def _api_pages(self, endpoint: str) -> list[object]:
+        payload = self._run(
+            ["gh", "api", "--paginate", "--slurp", endpoint],
+            expect_json=True,
+        )
+        if not isinstance(payload, list) or not payload:
+            raise RuntimeError("GitHub paginated payload malformed")
+        return payload
+
     @staticmethod
     def _repo_parts(repo: str) -> tuple[str, str]:
         parts = repo.split("/")
-        if len(parts) != 2 or not all(parts):
+        if (
+            len(parts) != 2
+            or not all(parts)
+            or any(re.fullmatch(r"[A-Za-z0-9_.-]+", part) is None for part in parts)
+        ):
             raise ValueError("repo must be owner/name")
         return parts[0], parts[1]
 
     def _work_graph(self, *, repo: str, pr_number: int) -> dict[str, object]:
         owner, name = self._repo_parts(repo)
-        payload = self._run(
-            [
+        issue_nodes: list[object] = []
+        thread_nodes: list[object] = []
+        issue_cursor: str | None = None
+        thread_cursor: str | None = None
+        issues_done = False
+        threads_done = False
+        while True:
+            argv = [
                 "gh",
                 "api",
                 "graphql",
@@ -249,16 +297,63 @@ class GitHubDeliveryClient:
                 f"name={name}",
                 "-F",
                 f"number={pr_number}",
-            ],
-            expect_json=True,
-        )
-        try:
-            work = payload["data"]["repository"]["pullRequest"]  # type: ignore[index]
-        except (KeyError, TypeError) as exc:
-            raise RuntimeError("GitHub GraphQL work facts malformed") from exc
-        if not isinstance(work, dict):
-            raise RuntimeError("GitHub GraphQL pullRequest missing")
-        return work
+            ]
+            if issue_cursor is not None:
+                argv.extend(["-F", f"issueCursor={issue_cursor}"])
+            if thread_cursor is not None:
+                argv.extend(["-F", f"threadCursor={thread_cursor}"])
+            payload = self._run(argv, expect_json=True)
+            if not isinstance(payload, dict) or payload.get("errors"):
+                raise RuntimeError("GitHub GraphQL work facts unavailable")
+            try:
+                work = payload["data"]["repository"]["pullRequest"]  # type: ignore[index]
+                issue_connection = work["closingIssuesReferences"]
+                thread_connection = work["reviewThreads"]
+            except (KeyError, TypeError) as exc:
+                raise RuntimeError("GitHub GraphQL work facts malformed") from exc
+            if not isinstance(issue_connection, dict) or not isinstance(thread_connection, dict):
+                raise RuntimeError("GitHub GraphQL work facts malformed")
+            issue_page = issue_connection.get("nodes")
+            thread_page = thread_connection.get("nodes")
+            issue_info = issue_connection.get("pageInfo")
+            thread_info = thread_connection.get("pageInfo")
+            if not isinstance(issue_page, list) or not isinstance(thread_page, list):
+                raise RuntimeError("GitHub GraphQL nodes malformed")
+            if not isinstance(issue_info, dict) or not isinstance(thread_info, dict):
+                raise RuntimeError("GitHub GraphQL pageInfo malformed")
+            issue_next = issue_info.get("hasNextPage")
+            thread_next = thread_info.get("hasNextPage")
+            if not isinstance(issue_next, bool) or not isinstance(thread_next, bool):
+                raise RuntimeError("GitHub GraphQL pageInfo malformed")
+            if not issues_done:
+                issue_nodes.extend(issue_page)
+            if not threads_done:
+                thread_nodes.extend(thread_page)
+            issues_done = issues_done or not issue_next
+            threads_done = threads_done or not thread_next
+            if issues_done and threads_done:
+                return {
+                    "closingIssuesReferences": {"nodes": issue_nodes},
+                    "reviewThreads": {"nodes": thread_nodes},
+                }
+            if not issues_done:
+                next_issue_cursor = issue_info.get("endCursor")
+                if (
+                    not isinstance(next_issue_cursor, str)
+                    or not next_issue_cursor
+                    or next_issue_cursor == issue_cursor
+                ):
+                    raise RuntimeError("GitHub GraphQL issue cursor malformed")
+                issue_cursor = next_issue_cursor
+            if not threads_done:
+                next_thread_cursor = thread_info.get("endCursor")
+                if (
+                    not isinstance(next_thread_cursor, str)
+                    or not next_thread_cursor
+                    or next_thread_cursor == thread_cursor
+                ):
+                    raise RuntimeError("GitHub GraphQL thread cursor malformed")
+                thread_cursor = next_thread_cursor
 
     def _tree_paths(self, *, repo: str, ref: str) -> tuple[str, ...]:
         payload = self._api(f"repos/{repo}/git/trees/{ref}?recursive=1")
@@ -314,22 +409,32 @@ class GitHubDeliveryClient:
         if not isinstance(head, str):
             raise RuntimeError("GitHub pull request refs malformed")
 
-        check_payload = self._api(f"repos/{repo}/commits/{head}/check-runs")
-        status_payload = self._api(f"repos/{repo}/commits/{head}/status")
-        review_payload = self._api(f"repos/{repo}/pulls/{pr_number}/reviews")
-        if not isinstance(check_payload, dict) or not isinstance(
-            check_payload.get("check_runs"), list
-        ):
-            raise RuntimeError("GitHub check runs malformed")
-        if not isinstance(status_payload, dict) or not isinstance(
-            status_payload.get("statuses"), list
-        ):
-            raise RuntimeError("GitHub commit statuses malformed")
-        if not isinstance(review_payload, list):
-            raise RuntimeError("GitHub reviews malformed")
+        check_pages = self._api_pages(
+            f"repos/{repo}/commits/{head}/check-runs?per_page=100"
+        )
+        status_pages = self._api_pages(
+            f"repos/{repo}/commits/{head}/statuses?per_page=100"
+        )
+        review_pages = self._api_pages(
+            f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100"
+        )
 
         checks: list[GitHubCheck] = []
-        for row in check_payload["check_runs"]:
+        check_rows: list[object] = []
+        expected_total: int | None = None
+        for page in check_pages:
+            if not isinstance(page, dict) or not isinstance(page.get("check_runs"), list):
+                raise RuntimeError("GitHub check runs malformed")
+            total = page.get("total_count")
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise RuntimeError("GitHub check runs total_count malformed")
+            expected_total = total if expected_total is None else expected_total
+            if total != expected_total:
+                raise RuntimeError("GitHub check runs total_count changed during read")
+            check_rows.extend(page["check_runs"])
+        if expected_total != len(check_rows):
+            raise RuntimeError("GitHub check runs pagination incomplete")
+        for row in check_rows:
             if not isinstance(row, dict):
                 raise RuntimeError("GitHub check run malformed")
             checks.append(
@@ -341,7 +446,12 @@ class GitHubDeliveryClient:
                     else None,
                 )
             )
-        for row in status_payload["statuses"]:
+        status_rows: list[object] = []
+        for page in status_pages:
+            if not isinstance(page, list):
+                raise RuntimeError("GitHub commit statuses malformed")
+            status_rows.extend(page)
+        for row in status_rows:
             if not isinstance(row, dict):
                 raise RuntimeError("GitHub commit status malformed")
             state = row.get("state")
@@ -356,19 +466,48 @@ class GitHubDeliveryClient:
                 )
             )
         reviews: list[CopilotReview] = []
-        for row in review_payload:
+        review_rows: list[object] = []
+        for page in review_pages:
+            if not isinstance(page, list):
+                raise RuntimeError("GitHub reviews malformed")
+            review_rows.extend(page)
+        for row in review_rows:
             if not isinstance(row, dict):
                 raise RuntimeError("GitHub review malformed")
             login = row.get("user", {}).get("login") if isinstance(row.get("user"), dict) else None
-            if not isinstance(login, str) or "copilot" not in login.casefold():
+            if login != COPILOT_REVIEWER_LOGIN:
                 continue
             try:
+                review_id = row["id"]
+                commit_id = row["commit_id"]
+                state = row["state"]
+                body_value = row.get("body")
+                submitted_at = row["submitted_at"]
+                if (
+                    not isinstance(review_id, int)
+                    or isinstance(review_id, bool)
+                    or review_id <= 0
+                    or not isinstance(commit_id, str)
+                    or re.fullmatch(r"[0-9a-fA-F]{40}", commit_id) is None
+                    or not isinstance(state, str)
+                    or (body_value is not None and not isinstance(body_value, str))
+                    or not isinstance(submitted_at, str)
+                ):
+                    raise ValueError("review fields malformed")
+                submitted_datetime = datetime.fromisoformat(
+                    submitted_at.replace("Z", "+00:00")
+                )
+                if submitted_datetime.tzinfo is None:
+                    raise ValueError("submitted_at timezone missing")
+                submitted_epoch = submitted_datetime.timestamp()
                 reviews.append(
                     CopilotReview(
-                        review_id=int(row["id"]),
-                        commit_id=str(row["commit_id"]),
-                        state=str(row["state"]),
-                        body=str(row.get("body") or ""),
+                        review_id=review_id,
+                        commit_id=commit_id.lower(),
+                        state=state,
+                        body=body_value or "",
+                        author=login,
+                        submitted_at_epoch=submitted_epoch,
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
@@ -376,20 +515,37 @@ class GitHubDeliveryClient:
 
         graph = self._work_graph(repo=repo, pr_number=pr_number)
         try:
-            issues = tuple(
-                sorted(
-                    int(node["number"])
-                    for node in graph["closingIssuesReferences"]["nodes"]  # type: ignore[index]
+            issue_numbers: list[int] = []
+            for node in graph["closingIssuesReferences"]["nodes"]:  # type: ignore[index]
+                if (
+                    not isinstance(node, dict)
+                    or not isinstance(node.get("number"), int)
+                    or isinstance(node.get("number"), bool)
+                    or not isinstance(node.get("repository"), dict)
+                    or not isinstance(node["repository"].get("nameWithOwner"), str)
+                ):
+                    raise TypeError("closing issue node malformed")
+                if node["repository"]["nameWithOwner"] == repo:
+                    issue_numbers.append(node["number"])
+            issues = tuple(sorted(issue_numbers))
+            parsed_threads: list[ReviewThread] = []
+            for node in graph["reviewThreads"]["nodes"]:  # type: ignore[index]
+                if (
+                    not isinstance(node, dict)
+                    or not isinstance(node.get("id"), str)
+                    or not node["id"]
+                    or not isinstance(node.get("isResolved"), bool)
+                    or not isinstance(node.get("isOutdated"), bool)
+                ):
+                    raise TypeError("review thread node malformed")
+                parsed_threads.append(
+                    ReviewThread(
+                        thread_id=node["id"],
+                        resolved=node["isResolved"],
+                        outdated=node["isOutdated"],
+                    )
                 )
-            )
-            threads = tuple(
-                ReviewThread(
-                    thread_id=str(node["id"]),
-                    resolved=bool(node["isResolved"]),
-                    outdated=bool(node["isOutdated"]),
-                )
-                for node in graph["reviewThreads"]["nodes"]  # type: ignore[index]
-            )
+            threads = tuple(parsed_threads)
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("GitHub PR association facts malformed") from exc
         # Ship validates the exact candidate tree.  The default branch still
@@ -415,8 +571,7 @@ class GitHubDeliveryClient:
         pr_number: int,
         change: str,
         required_issues: tuple[int, ...],
-        todo_complete: bool,
-        completion_record_valid: bool,
+        todo_paths: tuple[str, ...],
     ) -> RemoteClosureFacts:
         self._repo_parts(repo)
         pull = self._api(f"repos/{repo}/pulls/{pr_number}")
@@ -431,8 +586,20 @@ class GitHubDeliveryClient:
             or not isinstance(default_branch, str)
         ):
             raise RuntimeError("GitHub merge evidence incomplete")
+        encoded_branch = quote(default_branch, safe="")
+        default_ref = self._api(f"repos/{repo}/git/ref/heads/{encoded_branch}")
+        try:
+            default_head = default_ref["object"]["sha"]  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub default branch ref malformed") from exc
+        if (
+            not isinstance(default_head, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", default_head) is None
+        ):
+            raise RuntimeError("GitHub default branch ref malformed")
+        default_head = default_head.lower()
         comparison = self._api(
-            f"repos/{repo}/compare/{merge_commit}...{default_branch}"
+            f"repos/{repo}/compare/{merge_commit}...{default_head}"
         )
         if not isinstance(comparison, dict):
             raise RuntimeError("GitHub ancestry comparison malformed")
@@ -447,17 +614,58 @@ class GitHubDeliveryClient:
             if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
                 raise RuntimeError("GitHub issue state malformed")
             issue_states[issue] = payload["state"]
-        paths = self._commit_tree_paths(repo=repo, commit=default_branch)
+        paths = self._commit_tree_paths(repo=repo, commit=default_head)
         active_absent, archive_present = self._openspec_facts(paths, change)
+        if not todo_paths:
+            raise ValueError("remote Todo paths are required for closure")
+        todo_revisions: dict[str, str] = {}
+        todo_complete = True
+        task_pattern = re.compile(r"(?m)^\s*[-*]\s+\[([ xX])\]\s+")
+        for todo_path in todo_paths:
+            pure = PurePosixPath(todo_path)
+            if (
+                not todo_path
+                or pure.is_absolute()
+                or ".." in pure.parts
+                or pure.suffix.lower() != ".md"
+            ):
+                raise ValueError("Todo path must be a safe repo-relative markdown path")
+            encoded_path = quote(todo_path, safe="/")
+            encoded_ref = quote(default_head, safe="")
+            payload = self._api(
+                f"repos/{repo}/contents/{encoded_path}?ref={encoded_ref}"
+            )
+            if (
+                not isinstance(payload, dict)
+                or payload.get("type") != "file"
+                or payload.get("encoding") != "base64"
+                or not isinstance(payload.get("content"), str)
+                or not isinstance(payload.get("sha"), str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", payload["sha"]) is None
+            ):
+                raise RuntimeError("GitHub remote Todo payload malformed")
+            try:
+                encoded_content = "".join(payload["content"].split())
+                content = base64.b64decode(
+                    encoded_content, validate=True
+                ).decode("utf-8")
+            except (ValueError, binascii.Error, UnicodeDecodeError) as exc:
+                raise RuntimeError("GitHub remote Todo content malformed") from exc
+            task_states = task_pattern.findall(content)
+            if not task_states or any(state == " " for state in task_states):
+                todo_complete = False
+            todo_revisions[todo_path] = payload["sha"].lower()
         return RemoteClosureFacts(
             merge_commit=merge_commit,
+            default_head=default_head,
             merge_is_ancestor=comparison.get("status") in {"ahead", "identical"},
             merge_is_merge_commit=len(merge_payload["parents"]) >= 2,
             issue_states=issue_states,
             active_openspec_absent=active_absent,
             archive_present=archive_present,
             todo_complete=todo_complete,
-            completion_record_valid=completion_record_valid,
+            todo_revisions=todo_revisions,
+            completion_record_valid=False,
         )
 
     def request_copilot(self, *, repo: str, pr_number: int) -> None:
@@ -466,9 +674,18 @@ class GitHubDeliveryClient:
             expect_json=True,
         )
 
-    def merge(self, *, pr_number: int, expected_head: str) -> None:
+    def merge(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        expected_head: str,
+        _capability: object | None = None,
+    ) -> None:
+        if _capability is not _SHIP_CAPABILITY:
+            raise PermissionError("merge is restricted to ShipOrchestrator")
         self._run(
-            build_merge_argv(pr_number=pr_number, expected_head=expected_head),
+            build_merge_argv(repo=repo, pr_number=pr_number, expected_head=expected_head),
             expect_json=False,
         )
 
@@ -479,7 +696,10 @@ class GitHubDeliveryClient:
         pr_number: int,
         change: str,
         policy: DeliveryPolicy,
+        _capability: object | None = None,
     ) -> DeliveryFacts:
+        if _capability is not _SHIP_CAPABILITY:
+            raise PermissionError("merge admission is restricted to ShipOrchestrator")
         facts = self.fetch_delivery_facts(
             repo=repo,
             pr_number=pr_number,
@@ -488,5 +708,10 @@ class GitHubDeliveryClient:
         result = evaluate_delivery_gate(facts=facts, policy=policy)
         if not result.allowed:
             raise RuntimeError(f"delivery gate blocked: {', '.join(result.reasons)}")
-        self.merge(pr_number=pr_number, expected_head=policy.expected_head)
+        self.merge(
+            repo=repo,
+            pr_number=pr_number,
+            expected_head=policy.expected_head,
+            _capability=_capability,
+        )
         return facts

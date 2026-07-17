@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Mapping
 
-from .github_delivery import GateResult
+from . import completion, review as foreign_review, verification
+from .github_delivery import (
+    DeliveryFacts,
+    DeliveryPolicy,
+    GateResult,
+    GitHubDeliveryClient,
+    RemoteClosureFacts,
+    evaluate_remote_closure,
+    _SHIP_CAPABILITY,
+)
+from .preflight import PreflightResult
 
 
 CONVENTIONAL_ZH_TW_TITLE_RE = re.compile(
@@ -14,6 +27,7 @@ CONVENTIONAL_ZH_TW_TITLE_RE = re.compile(
 CLOSING_RE_TEMPLATE = r"(?im)^\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{issue}\b"
 REVIEW_TIMEOUT_SECONDS = 15 * 60
 MAX_FIX_ROUNDS = 2
+PROVIDER_MAX_AGE_SECONDS = 900
 
 
 @dataclass(frozen=True)
@@ -123,12 +137,19 @@ class ReviewLoop:
         head: str,
         now_epoch: int | float,
         finding_count: int,
+        review_id: int,
+        submitted_at_epoch: int | float,
         error: bool = False,
     ) -> "ReviewDecision":
         if self.requested_at is None:
             raise ValueError("Copilot review was not requested for current HEAD")
         if head != self.head:
             return ReviewDecision(self, "needs_human", "copilot-old-head-review")
+        if not isinstance(review_id, int) or isinstance(review_id, bool) or review_id <= 0:
+            raise ValueError("review_id must be a positive integer")
+        submitted_at = float(submitted_at_epoch)
+        if submitted_at < self.requested_at or submitted_at > float(now_epoch):
+            return ReviewDecision(self, "needs_human", "copilot-review-outside-request-epoch")
         elapsed = float(now_epoch) - self.requested_at
         if elapsed < 0 or elapsed > REVIEW_TIMEOUT_SECONDS:
             return ReviewDecision(self, "needs_human", "copilot-review-timeout")
@@ -137,7 +158,13 @@ class ReviewLoop:
         if not isinstance(finding_count, int) or isinstance(finding_count, bool) or finding_count < 0:
             raise ValueError("finding_count must be a non-negative integer")
         if finding_count == 0:
-            return ReviewDecision(self, "passed", None)
+            return ReviewDecision(
+                self,
+                "passed",
+                None,
+                head=self.head,
+                review_id=review_id,
+            )
         if self.fix_rounds >= MAX_FIX_ROUNDS:
             return ReviewDecision(
                 self,
@@ -152,6 +179,202 @@ class ReviewDecision:
     loop: ReviewLoop
     action: str
     reason: str | None
+    head: str | None = None
+    review_id: int | None = None
+
+
+@dataclass(frozen=True)
+class ProviderFreshnessEvidence:
+    provider: str
+    revision: str
+    last_success_epoch: int | float
+    degraded: bool
+
+
+@dataclass(frozen=True)
+class ForeignReviewEvidence:
+    path: str
+    expected_hash: str
+
+
+@dataclass(frozen=True)
+class ShipResult:
+    delivery_facts: DeliveryFacts
+    expected_head: str
+    expected_tree_hash: str
+
+
+@dataclass(frozen=True)
+class ClosureResult:
+    facts: RemoteClosureFacts
+    completion_record: Mapping[str, object]
+
+
+def _validate_provider_freshness(
+    evidence: ProviderFreshnessEvidence,
+    *,
+    now_epoch: int | float,
+) -> None:
+    if (
+        not isinstance(evidence.provider, str)
+        or not evidence.provider.strip()
+        or not isinstance(evidence.revision, str)
+        or not evidence.revision.strip()
+        or not isinstance(evidence.last_success_epoch, (int, float))
+        or isinstance(evidence.last_success_epoch, bool)
+        or not isinstance(evidence.degraded, bool)
+    ):
+        raise ValueError("provider freshness evidence incomplete")
+    age = float(now_epoch) - float(evidence.last_success_epoch)
+    if evidence.degraded or age < 0 or age > PROVIDER_MAX_AGE_SECONDS:
+        raise RuntimeError("provider degraded or stale")
+
+
+def _validate_foreign_review(
+    evidence: ForeignReviewEvidence,
+    *,
+    expected_head: str,
+) -> dict[str, object]:
+    path = Path(evidence.path)
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError("foreign review evidence path must be absolute and not a symlink")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("foreign review evidence unreadable") from exc
+    normalized = foreign_review.validate_gate_evaluation(payload)
+    if (
+        not isinstance(evidence.expected_hash, str)
+        or len(evidence.expected_hash) != 64
+        or verification.canonical_json_hash(normalized) != evidence.expected_hash.lower()
+    ):
+        raise ValueError("foreign review evidence hash mismatch")
+    identities = normalized["launch_identity"]
+    builder = identities["builder"]
+    reviewer = identities["reviewer"]
+    if (
+        normalized["state"] != "passed"
+        or normalized["candidate"] != expected_head.lower()
+        or builder is None
+        or reviewer is None
+        or builder["independence_domain"] == reviewer["independence_domain"]
+    ):
+        raise RuntimeError("foreign review does not authorize exact HEAD")
+    return normalized
+
+
+class ShipOrchestrator:
+    """Single admission point for immutable-HEAD delivery and terminal closure."""
+
+    def __init__(
+        self,
+        *,
+        github: GitHubDeliveryClient,
+        now: Callable[[], float],
+    ) -> None:
+        self._github = github
+        self._now = now
+
+    def merge_if_ready(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        change: str,
+        expected_head: str,
+        expected_tree_hash: str,
+        required_issues: tuple[int, ...],
+        provider: ProviderFreshnessEvidence,
+        preflight: PreflightResult,
+        copilot: ReviewDecision,
+        foreign_review: ForeignReviewEvidence,
+    ) -> ShipResult:
+        _require_sha(expected_head)
+        _require_sha(expected_tree_hash)
+        now_epoch = self._now()
+        _validate_provider_freshness(provider, now_epoch=now_epoch)
+        if (
+            not preflight.passed
+            or preflight.head.lower() != expected_head.lower()
+            or preflight.tree_hash.lower() != expected_tree_hash.lower()
+        ):
+            raise RuntimeError("preflight does not authorize exact HEAD/tree")
+        if (
+            copilot.action != "passed"
+            or copilot.head != expected_head
+            or copilot.review_id is None
+            or copilot.loop.head != expected_head
+            or copilot.loop.requested_at is None
+            or copilot.loop.fix_rounds > MAX_FIX_ROUNDS
+            or float(now_epoch) - copilot.loop.requested_at < 0
+            or float(now_epoch) - copilot.loop.requested_at > REVIEW_TIMEOUT_SECONDS
+        ):
+            raise RuntimeError("Copilot review epoch has not passed")
+        _validate_foreign_review(foreign_review, expected_head=expected_head)
+        facts = self._github.merge_if_ready(
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+            policy=DeliveryPolicy(
+                expected_head=expected_head,
+                required_closing_issues=required_issues,
+                copilot_review_id=copilot.review_id,
+                copilot_requested_at_epoch=copilot.loop.requested_at,
+            ),
+            _capability=_SHIP_CAPABILITY,
+        )
+        return ShipResult(
+            delivery_facts=facts,
+            expected_head=expected_head,
+            expected_tree_hash=expected_tree_hash,
+        )
+
+    def verify_remote_closure(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        change: str,
+        required_issues: tuple[int, ...],
+        todo_paths: tuple[str, ...],
+        expected_head: str,
+        completion_payload: object,
+        coordinator_root: str | Path | None = None,
+    ) -> ClosureResult:
+        facts = self._github.fetch_remote_closure(
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+            required_issues=required_issues,
+            todo_paths=todo_paths,
+        )
+        pre_record = replace(facts, completion_record_valid=True)
+        gate = evaluate_remote_closure(facts=pre_record, required_issues=required_issues)
+        if not gate.allowed:
+            raise RuntimeError(f"remote closure blocked: {', '.join(gate.reasons)}")
+        normalized = completion.validate_completion_record(completion_payload)
+        if normalized["candidate"] != expected_head.lower():
+            raise RuntimeError("completion record candidate does not match delivered HEAD")
+        if normalized["target_ref_sha"] != facts.default_head:
+            raise RuntimeError("completion record target ref does not match remote default snapshot")
+        record = completion.write_completion_record(
+            normalized,
+            coordinator_root=coordinator_root,
+        )
+        reread = completion.read_completion_record(
+            record["path"],
+            expected_hash=record["hash"],
+        )
+        if reread["candidate"] != expected_head.lower():
+            raise RuntimeError("completion record reread does not match delivered HEAD")
+        final_facts = replace(facts, completion_record_valid=True)
+        final_gate = evaluate_remote_closure(
+            facts=final_facts,
+            required_issues=required_issues,
+        )
+        if not final_gate.allowed:
+            raise RuntimeError(f"remote closure blocked: {', '.join(final_gate.reasons)}")
+        return ClosureResult(facts=final_facts, completion_record=record)
 
 
 def _require_sha(value: str) -> None:

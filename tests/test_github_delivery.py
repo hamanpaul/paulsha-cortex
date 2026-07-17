@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from paulsha_cortex.coordinator.github_delivery import (
+    COPILOT_REVIEWER_LOGIN,
     CopilotReview,
     DeliveryFacts,
     DeliveryPolicy,
@@ -33,6 +34,8 @@ def _facts() -> DeliveryFacts:
                 commit_id=HEAD,
                 state="COMMENTED",
                 body="review complete",
+                author=COPILOT_REVIEWER_LOGIN,
+                submitted_at_epoch=100,
             ),
         ),
         review_threads=(ReviewThread(thread_id="t1", resolved=True, outdated=False),),
@@ -45,7 +48,7 @@ def _facts() -> DeliveryFacts:
 def test_delivery_gate_accepts_exact_current_head_terminal_green() -> None:
     result = evaluate_delivery_gate(
         facts=_facts(),
-        policy=DeliveryPolicy(expected_head=HEAD, required_closing_issues=(14,)),
+        policy=_policy(),
     )
     assert result.allowed
     assert result.reasons == ()
@@ -78,6 +81,8 @@ def test_delivery_gate_accepts_exact_current_head_terminal_green() -> None:
                         commit_id="b" * 40,
                         state="COMMENTED",
                         body="old head",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=100,
                     ),
                 ),
             ),
@@ -88,10 +93,12 @@ def test_delivery_gate_accepts_exact_current_head_terminal_green() -> None:
                 _facts(),
                 copilot_reviews=(
                     CopilotReview(
-                        review_id=9,
+                        review_id=7,
                         commit_id=HEAD,
                         state="COMMENTED",
                         body="Copilot encountered an error while reviewing this pull request",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=100,
                     ),
                 ),
             ),
@@ -113,7 +120,7 @@ def test_delivery_gate_accepts_exact_current_head_terminal_green() -> None:
 def test_delivery_gate_fails_closed(facts: DeliveryFacts, reason: str) -> None:
     result = evaluate_delivery_gate(
         facts=facts,
-        policy=DeliveryPolicy(expected_head=HEAD, required_closing_issues=(14,)),
+        policy=_policy(),
     )
     assert not result.allowed
     assert reason in result.reasons
@@ -126,7 +133,7 @@ def test_outdated_unresolved_thread_is_non_blocking() -> None:
     )
     assert evaluate_delivery_gate(
         facts=facts,
-        policy=DeliveryPolicy(expected_head=HEAD, required_closing_issues=(14,)),
+        policy=_policy(),
     ).allowed
 
 
@@ -140,12 +147,18 @@ def test_typed_github_commands_request_copilot_and_merge_commit_only() -> None:
         "-f",
         "reviewers[]=copilot-pull-request-reviewer[bot]",
     ]
-    merge = build_merge_argv(pr_number=15, expected_head=HEAD)
+    merge = build_merge_argv(
+        repo="hamanpaul/paulsha-cortex",
+        pr_number=15,
+        expected_head=HEAD,
+    )
     assert merge == [
         "gh",
         "pr",
         "merge",
         "15",
+        "--repo",
+        "hamanpaul/paulsha-cortex",
         "--merge",
         "--match-head-commit",
         HEAD,
@@ -153,15 +166,41 @@ def test_typed_github_commands_request_copilot_and_merge_commit_only() -> None:
     assert "--auto" not in merge
 
 
+def _policy() -> DeliveryPolicy:
+    return DeliveryPolicy(
+        expected_head=HEAD,
+        required_closing_issues=(14,),
+        copilot_review_id=7,
+        copilot_requested_at_epoch=90,
+    )
+
+
+def test_delivery_gate_requires_exact_bot_review_from_request_epoch() -> None:
+    review = _facts().copilot_reviews[0]
+    for invalid in (
+        replace(review, author="copilot-helper"),
+        replace(review, submitted_at_epoch=89),
+        replace(review, review_id=99),
+    ):
+        result = evaluate_delivery_gate(
+            facts=replace(_facts(), copilot_reviews=(invalid,)),
+            policy=_policy(),
+        )
+        assert not result.allowed
+        assert "copilot-current-head-review-missing" in result.reasons
+
+
 def test_remote_closure_is_strict_conjunction() -> None:
     facts = RemoteClosureFacts(
         merge_commit="c" * 40,
+        default_head="d" * 40,
         merge_is_ancestor=True,
         merge_is_merge_commit=True,
         issue_states={14: "closed"},
         active_openspec_absent=True,
         archive_present=True,
         todo_complete=True,
+        todo_revisions={"todo.md": "d" * 40},
         completion_record_valid=True,
     )
     assert evaluate_remote_closure(facts=facts, required_issues=(14,)).allowed
