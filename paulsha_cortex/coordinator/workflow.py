@@ -201,6 +201,7 @@ class WorkflowRun:
     work_id: str
     repo: str
     claim_key: str
+    source_revision: str
     combo: str
     current_phase: str
     steps: tuple[WorkflowStep, ...]
@@ -225,6 +226,7 @@ class WorkflowRun:
             ("work_id", self.work_id),
             ("repo", self.repo),
             ("claim_key", self.claim_key),
+            ("source_revision", self.source_revision),
             ("combo", self.combo),
         ):
             if not isinstance(value, str) or not value:
@@ -312,6 +314,7 @@ class WorkflowRun:
             "work_id": self.work_id,
             "repo": self.repo,
             "claim_key": self.claim_key,
+            "source_revision": self.source_revision,
             "combo": self.combo,
             "current_phase": self.current_phase,
             "steps": [step.to_dict() for step in self.steps],
@@ -340,6 +343,7 @@ class WorkflowRun:
             "work_id",
             "repo",
             "claim_key",
+            "source_revision",
             "combo",
             "current_phase",
             "steps",
@@ -366,6 +370,7 @@ class WorkflowRun:
             work_id=payload["work_id"],
             repo=payload["repo"],
             claim_key=payload["claim_key"],
+            source_revision=payload["source_revision"],
             combo=payload["combo"],
             current_phase=payload["current_phase"],
             steps=tuple(WorkflowStep.from_dict(step) for step in payload["steps"]),

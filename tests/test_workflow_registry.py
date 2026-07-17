@@ -62,6 +62,7 @@ def _create_run(registry: JobRegistry) -> WorkflowRun:
         work_id="unified-work-lifecycle",
         repo="hamanpaul/paulsha-cortex",
         claim_key="hamanpaul/paulsha-cortex/unified-work-lifecycle/rev-a",
+        source_revision="rev-a",
         combo="feature-oneshot",
         current_phase="plan",
         steps=(_step(),),

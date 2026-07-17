@@ -399,6 +399,7 @@ def _validate_primary_integration(
         "question_pack_id",
         "secondary_evidence_hash",
         "resolutions",
+        "artifacts",
     }
     if extras:
         raise ValueError(f"primary integration unexpected key: {sorted(extras)[0]}")
@@ -447,11 +448,30 @@ def _validate_primary_integration(
         )
     if seen != expected:
         raise ValueError("primary integration does not resolve every question")
+    artifacts_raw = payload.get("artifacts", [])
+    if not isinstance(artifacts_raw, list):
+        raise ValueError("primary integration artifacts must be a list")
+    artifacts: list[dict[str, str]] = []
+    for index, row in enumerate(artifacts_raw):
+        if not isinstance(row, dict) or set(row) != {"kind", "path", "content"}:
+            raise ValueError(f"artifacts[{index}] invalid keys")
+        kind = row.get("kind")
+        path = row.get("path")
+        content = row.get("content")
+        if kind not in PLANNING_KINDS or not isinstance(path, str) or not path or not isinstance(content, str):
+            raise ValueError(f"artifacts[{index}] invalid")
+        artifacts.append({"kind": str(kind), "path": path, "content": content})
+    referenced = {
+        ref for resolution in normalized for ref in resolution["artifact_refs"]
+    }
+    if artifacts and {item["path"] for item in artifacts} != referenced:
+        raise ValueError("primary integration artifact content/ref mismatch")
     return {
         "schema_version": 1,
         "question_pack_id": question_pack.pack_id,
         "secondary_evidence_hash": secondary_evidence_hash,
         "resolutions": normalized,
+        "artifacts": artifacts,
     }
 
 
@@ -628,6 +648,7 @@ def run_heterogeneous_brainstorm(
     primary_questioner: Callable[[Mapping[str, object]], object],
     secondary_planner: Callable[[Mapping[str, object], ModelIdentity], object],
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object],
+    artifact_writer: Callable[[object], None] | None = None,
 ) -> BrainstormResult:
     empty_refs = PlanningGateRefs()
     if report.complete:
@@ -673,6 +694,19 @@ def run_heterogeneous_brainstorm(
             empty_refs,
             None,
         )
+    if artifact_writer is not None:
+        try:
+            if not integration.get("artifacts"):
+                raise ValueError("structured artifact content missing")
+            artifact_writer(integration.get("artifacts", []))
+        except Exception:
+            return BrainstormResult(
+                "needs_human",
+                "primary-artifact-write-rejected",
+                selection.identity.independence_domain,
+                empty_refs,
+                None,
+            )
     artifact_evidence = _post_integration_artifact_evidence(integration, artifact_root, report)
     if artifact_evidence is None:
         return BrainstormResult(

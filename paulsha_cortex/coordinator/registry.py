@@ -349,7 +349,11 @@ class JobRegistry:
             )
         if "kind" in job and job.get("kind") not in {None, "build", "review"}:
             raise ValueError(f"coordinator 狀態檔 job kind 非法（fail-closed）: {self._state_path}")
-        for field in ("executor", "session_name", "log_path", "model_id", "independence_domain"):
+        for field in (
+            "executor", "session_name", "log_path", "model_id", "independence_domain",
+            "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
+            "source_revision",
+        ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
@@ -503,6 +507,11 @@ class JobRegistry:
         spec_hash: str | None = None,
         plan_hash: str | None = None,
         verification_hash: str | None = None,
+        workflow_run_id: str | None = None,
+        workflow_claim_key: str | None = None,
+        workflow_repo: str | None = None,
+        workflow_card: str | None = None,
+        source_revision: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -535,6 +544,11 @@ class JobRegistry:
             "spec_hash": spec_hash,
             "plan_hash": plan_hash,
             "verification_hash": verification_hash,
+            "workflow_run_id": workflow_run_id,
+            "workflow_claim_key": workflow_claim_key,
+            "workflow_repo": workflow_repo,
+            "workflow_card": workflow_card,
+            "source_revision": source_revision,
             "created_at": _now_iso(),
         }
         self._jobs.append(job)
@@ -879,6 +893,7 @@ class JobRegistry:
         work_id: str,
         repo: str,
         claim_key: str,
+        source_revision: str,
         combo: str,
         current_phase: str,
         steps: tuple[WorkflowStep, ...],
@@ -911,6 +926,7 @@ class JobRegistry:
             work_id=work_id,
             repo=repo,
             claim_key=claim_key,
+            source_revision=source_revision,
             combo=combo,
             current_phase=current_phase,
             steps=tuple(steps),
@@ -961,6 +977,7 @@ class JobRegistry:
             work_id=current.work_id,
             repo=current.repo,
             claim_key=current.claim_key,
+            source_revision=current.source_revision,
             combo=current.combo,
             current_phase=next_phase,
             steps=current.steps if steps is None else tuple(steps),

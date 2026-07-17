@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
-from .launcher import build_agy_argv, build_claude_argv, build_codex_argv, build_copilot_argv
+from .launcher import build_agy_argv
 from .model_identities import (
     AGY_MODEL_ID,
     CapabilityProbe,
@@ -27,12 +27,42 @@ class ProductionPlanningRuntime:
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object]
 
 
-_BUILDERS = {
-    "agy": build_agy_argv,
-    "claude": build_claude_argv,
-    "codex": build_codex_argv,
-    "copilot": build_copilot_argv,
-}
+def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree: Path) -> list[str]:
+    if identity.executor == "agy":
+        return build_agy_argv(
+            prompt=prompt,
+            slice_id="cortex-planning-runtime",
+            log_dir=temp_dir,
+            worktree=str(worktree),
+            allow_unsafe=False,
+            model=identity.model_id,
+        )
+    if identity.executor == "codex":
+        return [
+            "codex", "exec", prompt, "--json", "--sandbox", "read-only",
+            "--model", identity.model_id, "-o", str(Path(temp_dir) / "last.json"),
+            "-C", str(worktree),
+        ]
+    if identity.executor == "claude":
+        return [
+            "claude", "-p", prompt, "--output-format", "json",
+            "--permission-mode", "plan", "--tools", "", "--model", identity.model_id,
+            "--add-dir", str(worktree),
+        ]
+    raise ValueError(f"unsupported read-only planning executor: {identity.executor}")
+
+
+def _git_snapshot(worktree: Path, runner: Callable[..., object]) -> str:
+    raw = runner(
+        ["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=all"],
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if getattr(raw, "returncode", None) != 0 or not isinstance(getattr(raw, "stdout", None), str):
+        raise ValueError("planning git diff guard unavailable")
+    return raw.stdout
 
 
 def _extract_json(stdout: str, output_path: Path) -> object:
@@ -65,19 +95,10 @@ def _invoke_json(
     runner: Callable[..., object],
     timeout_seconds: int,
 ) -> object:
-    builder = _BUILDERS.get(identity.executor)
-    if builder is None:
-        raise ValueError(f"unsupported safe planning executor: {identity.executor}")
     with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
         output_path = Path(temp_dir) / "last.json"
-        argv = builder(
-            prompt=prompt,
-            slice_id="cortex-planning-runtime",
-            log_dir=temp_dir,
-            worktree=str(worktree),
-            allow_unsafe=False,
-            model=identity.model_id,
-        )
+        before = _git_snapshot(worktree, runner)
+        argv = _planning_argv(identity, prompt, temp_dir, worktree)
         raw = runner(
             argv,
             cwd=str(worktree),
@@ -90,6 +111,9 @@ def _invoke_json(
         stdout = getattr(raw, "stdout", None)
         if returncode != 0 or not isinstance(stdout, str):
             raise ValueError(f"planning launcher failed: {identity.executor}/{identity.model_id}")
+        after = _git_snapshot(worktree, runner)
+        if after != before:
+            raise ValueError("planning launcher modified worktree despite read-only contract")
         return _extract_json(stdout, output_path)
 
 
@@ -196,7 +220,8 @@ def build_production_planning_runtime(
 
     def integrator(pack: Mapping[str, object], evidence: Mapping[str, object]) -> object:
         return invoke_primary(
-            "Integrate evidence, update accepted planning artifacts in the sandboxed worktree, and return only integration JSON. "
+            "Integrate evidence without editing files. Return integration JSON with an artifacts list; "
+            "each artifact must contain kind, path, and complete UTF-8 content. "
             + json.dumps({"question_pack": pack, "secondary_evidence": evidence}, ensure_ascii=False, sort_keys=True)
         )
 
