@@ -248,3 +248,85 @@ work_items:
     assert loaded.work_items["work"].links == ()
     assert loaded.work_items["work"].excludes == (source,)
     assert os.stat(tmp_path / ".cortex/work-items.yaml").st_mode & 0o777 == 0o600
+
+
+def test_exclusion_suppresses_frontmatter_confirmed_edge(tmp_path):
+    ref = "docs/superpowers/specs/work.md"
+    _write(tmp_path / ref, "---\nwork_item: work\n---\n# Work\n")
+    _write(
+        tmp_path / ".cortex/work-items.yaml",
+        """version: 1
+work_items:
+  work:
+    title: Work
+    links: []
+    excludes: []
+""",
+    )
+    source = _source("superpowers_spec", ref)
+    unlink_work_source(tmp_path, "work", SourceLink("path", ref))
+
+    result = correlate_work_sources(tmp_path, "example/acme", (source,))
+
+    assert not result.degraded
+    assert result.source_owners == {}
+    assert all(group.work_id != "work" for group in result.groups)
+
+
+def test_exclusion_suppresses_workflow_and_closing_confirmed_edges(tmp_path):
+    _write(
+        tmp_path / ".cortex/work-items.yaml",
+        """version: 1
+work_items:
+  work:
+    title: Work
+    links:
+      - {kind: github_issue, ref: example/acme#7}
+      - {kind: github_pr, ref: example/acme#9}
+    excludes: []
+""",
+    )
+    issue = _source("github_issue", "example/acme#7")
+    pull = _source("github_pr", "example/acme#9")
+    unlink_work_source(
+        tmp_path, "work", SourceLink("github_pr", "example/acme#9")
+    )
+
+    result = correlate_work_sources(
+        tmp_path,
+        "example/acme",
+        (issue, pull),
+        workflow_links={pull.source_id: "work"},
+        closing_links={pull.source_id: issue.source_id},
+    )
+
+    assert not result.degraded
+    assert result.source_owners == {issue.source_id: "work"}
+    work = next(group for group in result.groups if group.work_id == "work")
+    assert {source.source_id for source in work.sources} == {issue.source_id}
+
+
+def test_exclusion_removes_one_authority_without_hiding_real_collision(tmp_path):
+    ref = "docs/superpowers/specs/work.md"
+    _write(tmp_path / ref, "---\nwork_item: frontmatter-owner\n---\n# Work\n")
+    _write(
+        tmp_path / ".cortex/work-items.yaml",
+        """version: 1
+work_items:
+  workflow-owner:
+    title: Workflow
+    links: []
+    excludes: [{kind: path, ref: docs/superpowers/specs/work.md}]
+""",
+    )
+    source = _source("superpowers_spec", ref)
+
+    result = correlate_work_sources(
+        tmp_path,
+        "example/acme",
+        (source,),
+        workflow_links={source.source_id: "workflow-owner"},
+    )
+
+    assert not result.degraded
+    assert result.source_owners == {source.source_id: "frontmatter-owner"}

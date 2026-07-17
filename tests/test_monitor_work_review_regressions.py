@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -683,6 +684,92 @@ def test_unowned_remote_archive_is_terminal_evidence_not_a_work_item(tmp_path):
 
     assert store.list_work_items()["items"] == []
     assert store.list_work_items(include_done=True)["items"] == []
+
+
+def test_unowned_closed_github_history_is_closure_evidence_not_work_items(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    github = _provider(
+        "github:example/acme",
+        (
+            _github_entity("github_issue", 7, "closed"),
+            _github_entity("github_pr", 9, "closed"),
+        ),
+    )
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(github),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github-terminal:example/acme")
+        ),
+        workflow_provider_factory=lambda _repo: _StaticProvider(
+            _provider("workflow:example/acme")
+        ),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+
+    refresher.refresh((project,), include_github=True)
+
+    assert store.list_work_items()["items"] == []
+    assert store.list_work_items(include_done=True)["items"] == []
+
+
+def test_completed_workflow_refs_aggregate_remote_archived_openspec(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = tmp_path / "coordinator/workflows.json"
+    state.parent.mkdir()
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 3,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-3",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "completed",
+                        "issue_refs": [],
+                        "pr_refs": [],
+                        "openspec_refs": ["canary"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    terminal = _provider(
+        "github-terminal:example/acme",
+        (_remote_openspec_source("canary"),),
+        observations={
+            "remote_openspec": {"active": [], "archived": ["canary"]},
+            "remote_openspec_observed": True,
+        },
+    )
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github:example/acme")
+        ),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(terminal),
+        workflow_provider_factory=lambda repo_name: WorkflowRegistryProvider(
+            repo_name, state_path=state
+        ),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+
+    refresher.refresh((project,), include_github=True)
+
+    item = store.get_work_item("work", repo="example/acme")["item"]
+    assert {source["status"] for source in item["sources"]} == {"completed", "archived"}
 
 
 def test_openspec_closure_uses_all_mapped_refs_not_work_id_slug(tmp_path):

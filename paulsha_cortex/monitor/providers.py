@@ -289,7 +289,18 @@ class WorkflowRegistryProvider:
                         provider=self.provider_id,
                     )
                 )
-                links[source_id] = work_id
+                _add_workflow_link(links, source_id, work_id)
+                for ref in row.get("issue_refs", []):
+                    _add_workflow_link(links, f"github_issue:{ref}", work_id)
+                for ref in row.get("pr_refs", []):
+                    _add_workflow_link(links, f"github_pr:{ref}", work_id)
+                for ref in row.get("openspec_refs", []):
+                    for canonical_id in (
+                        f"openspec:{self.repo}:{ref}",
+                        f"github_openspec:{self.repo}:{ref}:active",
+                        f"github_openspec:{self.repo}:{ref}:archived",
+                    ):
+                        _add_workflow_link(links, canonical_id, work_id)
                 completion = _validated_workflow_completion(
                     row, state_path=self.state_path
                 )
@@ -385,6 +396,44 @@ def _validate_workflow_v2_row(row: object) -> None:
         raise ValueError("workflow run contains unsupported keys")
     if "status" not in row and "current_phase" not in row:
         raise ValueError("workflow run requires status or current_phase")
+    repo = _nonempty(row.get("repo"), "repo")
+    if re.fullmatch(r"[^/#\s]+/[^/#\s]+", repo) is None:
+        raise ValueError("workflow repo must be owner/name")
+    work_id = _nonempty(row.get("work_id"), "work_id")
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
+        raise ValueError("workflow work_id must be a slug")
+    _nonempty(row.get("run_id"), "run_id")
+    _nonempty(row.get("status", row.get("current_phase")), "status")
+    for field in ("issue_refs", "pr_refs"):
+        refs = _typed_workflow_refs(row.get(field, []), field=field)
+        if any(
+            re.fullmatch(rf"{re.escape(repo)}#[1-9][0-9]*", ref) is None
+            for ref in refs
+        ):
+            raise ValueError(f"workflow {field} must contain repo-scoped refs")
+    openspec_refs = _typed_workflow_refs(
+        row.get("openspec_refs", []), field="openspec_refs"
+    )
+    if any(re.fullmatch(r"[a-z0-9][a-z0-9-]*", ref) is None for ref in openspec_refs):
+        raise ValueError("workflow openspec_refs must contain slugs")
+
+
+def _typed_workflow_refs(value: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(
+        not isinstance(ref, str) or not ref for ref in value
+    ):
+        raise ValueError(f"workflow {field} must be an array of strings")
+    if len(value) != len(set(value)):
+        raise ValueError(f"workflow {field} contains duplicate refs")
+    return tuple(value)
+
+
+def _add_workflow_link(links: dict[str, str], source_id: str, work_id: str) -> None:
+    previous = links.setdefault(source_id, work_id)
+    if previous != work_id:
+        raise ValueError(
+            f"workflow authority collision: {source_id} -> {previous}, {work_id}"
+        )
 
 
 def _validated_workflow_completion(

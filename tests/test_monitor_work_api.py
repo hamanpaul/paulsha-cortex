@@ -15,7 +15,7 @@ from paulsha_cortex.monitor.work_api import (
     WorkModelRefresher,
     WorkReadModelStore,
 )
-from paulsha_cortex.monitor.work_models import WorkItem
+from paulsha_cortex.monitor.work_models import ProviderSnapshot, WorkItem
 from paulsha_cortex.monitor.work_snapshot import WorkSnapshot
 from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
@@ -23,14 +23,14 @@ from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 NOW = "2026-07-17T10:00:00Z"
 
 
-def _item(work_id: str, state: str, *, repo="example/acme"):
+def _item(work_id: str, state: str, *, repo="example/acme", facets=()):
     return WorkItem(
         work_id=work_id,
         repo=repo,
         title=work_id.replace("-", " "),
         state=state,
         phase="plan" if state == "ongoing" else None,
-        facets=(),
+        facets=facets,
         sources=(),
         next_actions=("start",) if state == "todo" else (),
         workflow_run_id="run-1" if state == "ongoing" else None,
@@ -38,11 +38,11 @@ def _item(work_id: str, state: str, *, repo="example/acme"):
     )
 
 
-def _snapshot(*items, sequence=7):
+def _snapshot(*items, sequence=7, providers=None):
     return WorkSnapshot(
         sequence=sequence,
         written_at=NOW,
-        providers={},
+        providers=providers or {},
         work_items=tuple(items),
         source_owners={},
         exclusions=(),
@@ -72,6 +72,55 @@ def test_read_model_filters_repo_and_normalizes_on_going():
     envelope = store.list_work_items(repo="example/acme", states=("on-going",))
     assert [item["work_id"] for item in envelope["items"]] == ["active"]
     assert envelope["items"][0]["state"] == "on-going"
+
+
+def test_hard_gates_are_repo_scoped_while_fleet_health_remains_visible():
+    healthy = ProviderSnapshot(
+        provider_id="github:example/acme",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="github:healthy",
+        diagnostics=(),
+        sources=(),
+    )
+    degraded = ProviderSnapshot(
+        provider_id="github:example/other",
+        status="degraded",
+        last_attempt_at=NOW,
+        last_success_at=None,
+        revision=None,
+        diagnostics=("github:example/other stale",),
+        sources=(),
+    )
+    store = WorkReadModelStore(
+        _snapshot(
+            _item("healthy", "todo", repo="example/acme"),
+            _item(
+                "same-repo-degraded",
+                "todo",
+                repo="example/acme",
+                facets=("degraded",),
+            ),
+            _item("blocked", "todo", repo="example/other"),
+            providers={healthy.provider_id: healthy, degraded.provider_id: degraded},
+        )
+    )
+
+    healthy_envelope = store.get_work_item("healthy", repo="example/acme")
+    blocked_envelope = store.list_work_items(repo="example/other")
+
+    assert healthy_envelope["hard_gates"] == {
+        "auto_claim": True,
+        "merge": True,
+        "reasons": [],
+    }
+    assert healthy_envelope["fleet_health"]["degraded"] is True
+    assert store.list_work_items(repo="example/acme")["hard_gates"]["merge"] is False
+    assert blocked_envelope["hard_gates"]["auto_claim"] is False
+    assert blocked_envelope["hard_gates"]["reasons"] == [
+        "github:example/other stale"
+    ]
 
 
 def test_read_model_show_and_explain_contract():

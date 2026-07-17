@@ -235,6 +235,8 @@ def correlate_work_sources(
     for source in sources:
         explicit = _source_frontmatter_work_ids(root, source)
         for work_id in explicit:
+            if _source_excluded(exclusions_by_work, work_id, source):
+                continue
             candidates[source.source_id].add(work_id)
             authoritative.setdefault(work_id, []).append(
                 {"authority": "frontmatter", "source_id": source.source_id}
@@ -254,11 +256,23 @@ def correlate_work_sources(
                     )
                     linked.add(_fallback_work_id(target))
                 for linked_work_id in linked:
+                    source = next(
+                        source for source in sources if source.source_id == source_id
+                    )
+                    if _source_excluded(
+                        exclusions_by_work, linked_work_id, source
+                    ):
+                        continue
                     candidates[source_id].add(linked_work_id)
                     authoritative.setdefault(linked_work_id, []).append(
                         {"authority": authority, "source_id": source_id}
                     )
             elif _WORK_ID.fullmatch(work_id):
+                source = next(
+                    source for source in sources if source.source_id == source_id
+                )
+                if _source_excluded(exclusions_by_work, work_id, source):
+                    continue
                 candidates[source_id].add(work_id)
                 authoritative.setdefault(work_id, []).append(
                     {"authority": authority, "source_id": source_id}
@@ -363,6 +377,8 @@ def correlate_work_sources(
             continue
         if source.kind == "openspec" and source.status == "archived":
             continue
+        if source.kind in {"github_issue", "github_pr"} and source.status == "closed":
+            continue
         work_id = _fallback_work_id(source)
         correlated.append(
             CorrelatedWork(
@@ -415,6 +431,17 @@ def _link_matches_source(link: SourceLink, source: WorkSource) -> bool:
             "todo", "superpowers_spec", "superpowers_plan"
         }
     return source.kind == link.kind and source.ref == link.ref
+
+
+def _source_excluded(
+    exclusions_by_work: Mapping[str, set[SourceLink]],
+    work_id: str,
+    source: WorkSource,
+) -> bool:
+    return any(
+        _link_matches_source(link, source)
+        for link in exclusions_by_work.get(work_id, set())
+    )
 
 
 def _fallback_work_id(source: WorkSource) -> str:

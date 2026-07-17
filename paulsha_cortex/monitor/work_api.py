@@ -167,7 +167,7 @@ class WorkReadModelStore:
                     explanations[work_key(item.repo, item.work_id)] = self._explanation(
                         item.work_id, repo=item.repo
                     )
-            envelope = self._envelope()
+            envelope = self._envelope(repo=repo)
             envelope["items"] = items
             if explain:
                 envelope["explanations"] = explanations
@@ -185,7 +185,7 @@ class WorkReadModelStore:
             if len(matches) > 1:
                 raise AmbiguousWorkItemError(work_id)
             item = matches[0]
-            envelope = self._envelope()
+            envelope = self._envelope(repo=item.repo, work_id=item.work_id)
             envelope["item"] = item.to_dict()
             return envelope
 
@@ -211,22 +211,50 @@ class WorkReadModelStore:
             ),
         )
 
-    def _envelope(self) -> dict:
+    def _envelope(
+        self, *, repo: str | None = None, work_id: str | None = None
+    ) -> dict:
         providers = []
         for provider_id in sorted(self._snapshot.providers):
             provider = self._snapshot.providers[provider_id]
             row = {"provider_id": provider_id, **provider.to_dict()}
             providers.append(row)
-        degraded = any(row["status"] == "degraded" for row in providers) or any(
-            "degraded" in item.facets for item in self._items.values()
-        )
+        scoped_providers = [
+            row
+            for row in providers
+            if repo is None or _provider_repo(row["provider_id"]) in {None, repo}
+        ]
+        scoped_item_reasons = [
+            f"work_item:{item.repo}:{item.work_id} degraded"
+            for item in self._items.values()
+            if repo is None or item.repo == repo
+            if work_id is None or item.work_id == work_id
+            if "degraded" in item.facets
+        ]
+        scoped_gates = self._hard_gates(scoped_providers)
+        if not scoped_gates["reasons"]:
+            scoped_gates["reasons"] = scoped_item_reasons
+        scoped_gates["auto_claim"] = not scoped_gates["reasons"]
+        scoped_gates["merge"] = not scoped_gates["reasons"]
+        fleet_reasons = list(self._hard_gates(providers)["reasons"])
+        if not fleet_reasons:
+            fleet_reasons.extend(
+                f"work_item:{item.repo}:{item.work_id} degraded"
+                for item in self._items.values()
+                if "degraded" in item.facets
+            )
+        fleet_reasons = list(dict.fromkeys(fleet_reasons))
         return {
             "schema": WORK_API_SCHEMA,
             "generated_at": self._snapshot.written_at,
             "sequence": self._snapshot.sequence,
-            "degraded": degraded,
+            "degraded": bool(scoped_gates["reasons"]),
             "providers": providers,
-            "hard_gates": self._hard_gates(providers),
+            "hard_gates": scoped_gates,
+            "fleet_health": {
+                "degraded": bool(fleet_reasons),
+                "reasons": fleet_reasons,
+            },
         }
 
     @staticmethod
@@ -542,8 +570,15 @@ def _generate_inferred_signals(
     signals: list[InferredSignal] = []
     artifacts: list[tuple[object, str]] = []
     issues: list[tuple[object, str, str]] = []
+    closed_github_ids = {
+        source.source_id
+        for source in sources
+        if source.kind in {"github_issue", "github_pr"} and source.status == "closed"
+    }
     for source in sources:
         if source.kind == "openspec" and source.status == "archived":
+            continue
+        if source.source_id in closed_github_ids:
             continue
         if source.kind == "github_issue" and source.title:
             slug = _slug(source.title)
@@ -578,6 +613,8 @@ def _generate_inferred_signals(
         source_id = branch.get("source_id")
         ref = branch.get("ref")
         if not isinstance(source_id, str) or not isinstance(ref, str):
+            continue
+        if source_id in closed_github_ids:
             continue
         candidate = _slug(ref.rsplit("/", 1)[-1])
         if candidate:
@@ -741,6 +778,13 @@ def _retain_last_good(
         revision=previous.revision,
         sources=previous.sources,
     )
+
+
+def _provider_repo(provider_id: str) -> str | None:
+    for prefix in ("github-terminal:", "github:", "workflow:", "repo:"):
+        if provider_id.startswith(prefix):
+            return provider_id[len(prefix) :]
+    return None
 
 
 _GITHUB_SSH = re.compile(r"^(?:ssh://)?git@github\.com[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?$")

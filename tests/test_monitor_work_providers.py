@@ -5,6 +5,8 @@ import base64
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from paulsha_cortex.monitor.providers import (
     GitHubTerminalProvider,
     GitHubWorkProvider,
@@ -368,6 +370,112 @@ def test_workflow_registry_rejects_cross_work_completion_replay(monkeypatch, tmp
 
     assert result.status == "ok"
     assert result.observations["validated_completions"] == {}
+
+
+def test_workflow_registry_validates_refs_and_emits_canonical_authority_edges(tmp_path):
+    state = tmp_path / "workflows.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 9,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-9",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "completed",
+                        "issue_refs": ["example/acme#7"],
+                        "pr_refs": ["example/acme#9"],
+                        "openspec_refs": ["canary"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert result.observations["workflow_links"] == {
+        "workflow_run:example/acme:run-9": "work",
+        "github_issue:example/acme#7": "work",
+        "github_pr:example/acme#9": "work",
+        "openspec:example/acme:canary": "work",
+        "github_openspec:example/acme:canary:active": "work",
+        "github_openspec:example/acme:canary:archived": "work",
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("issue_refs", "example/acme#7"),
+        ("issue_refs", ["example/other#7"]),
+        ("issue_refs", ["example/acme#0"]),
+        ("pr_refs", ["example/acme#x"]),
+        ("openspec_refs", ["../escape"]),
+        ("openspec_refs", ["canary", "canary"]),
+    ),
+)
+def test_workflow_registry_rejects_invalid_typed_refs(tmp_path, field, value):
+    state = tmp_path / "workflows.json"
+    row = {
+        "run_id": "run-9",
+        "repo": "example/acme",
+        "work_id": "work",
+        "status": "completed",
+        "issue_refs": [],
+        "pr_refs": [],
+        "openspec_refs": [],
+    }
+    row[field] = value
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 9,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [row],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "degraded"
+
+
+def test_workflow_registry_rejects_cross_work_authority_collision(tmp_path):
+    state = tmp_path / "workflows.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 9,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": f"run-{work_id}",
+                        "repo": "example/acme",
+                        "work_id": work_id,
+                        "status": "completed",
+                        "issue_refs": ["example/acme#7"],
+                    }
+                    for work_id in ("one", "two")
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "degraded"
+    assert any("authority collision" in note for note in result.diagnostics)
 
 
 def test_workflow_registry_unknown_schema_and_root_keys_are_degraded(tmp_path):
