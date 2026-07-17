@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -12,9 +13,11 @@ from paulsha_cortex.coordinator.preflight import (
     FullSuiteEvidence,
     PreflightRequest,
     build_preflight_argv,
+    canonical_full_suite_evidence_path,
     load_preflight_command,
     load_full_suite_evidence,
     run_preflight,
+    write_full_suite_evidence_after_run,
 )
 
 
@@ -57,20 +60,21 @@ def test_skip_tests_requires_recent_exact_tree_evidence() -> None:
     evidence = FullSuiteEvidence(
         schema=FULL_SUITE_EVIDENCE_SCHEMA,
         tree_hash=TREE,
-        passed=True,
         completed_at_epoch=950,
+        command=("python3", "-m", "pytest"),
+        evidence_hash="1" * 64,
     )
     request = PreflightRequest(
         pr_number=15,
         skip_tests=True,
         tree_hash=TREE,
-        now_epoch=1_000,
     )
     assert build_preflight_argv(
         command=("preflight",),
         request=request,
         current_tree_hash=TREE,
         full_suite_evidence=evidence,
+        now_epoch=1_000,
     )[-1] == "--skip-tests"
     with pytest.raises(ValueError, match="exact current tree"):
         build_preflight_argv(
@@ -78,6 +82,7 @@ def test_skip_tests_requires_recent_exact_tree_evidence() -> None:
             request=request,
             current_tree_hash="c" * 40,
             full_suite_evidence=evidence,
+            now_epoch=1_000,
         )
     with pytest.raises(ValueError, match="stale"):
         build_preflight_argv(
@@ -88,25 +93,65 @@ def test_skip_tests_requires_recent_exact_tree_evidence() -> None:
                 evidence,
                 completed_at_epoch=1,
             ),
+            now_epoch=1_000,
         )
 
 
-def test_full_suite_evidence_is_durable_strict_and_hash_bound(tmp_path: Path) -> None:
-    payload = {
-        "schema": FULL_SUITE_EVIDENCE_SCHEMA,
-        "tree_hash": TREE,
-        "passed": True,
-        "completed_at_epoch": 950,
-    }
-    path = tmp_path / "full-suite.json"
-    path.write_text(__import__("json").dumps(payload), encoding="utf-8")
-    evidence = load_full_suite_evidence(
-        path,
-        expected_hash=verification.canonical_json_hash(payload),
+def test_full_suite_evidence_is_created_only_by_actual_successful_run(tmp_path: Path) -> None:
+    class Result:
+        stderr = ""
+
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    def runner(argv, **kwargs):
+        if "status" in argv:
+            return Result("")
+        if argv[-1] == "HEAD":
+            return Result(HEAD)
+        if argv[-1] == "HEAD^{tree}":
+            return Result(TREE)
+        return Result("tests passed", 0)
+
+    evidence = write_full_suite_evidence_after_run(
+        repo_root=tmp_path,
+        command=("python3", "-m", "pytest"),
+        runner=runner,
+        now=lambda: 950,
+        state_root=tmp_path / "state",
     )
     assert evidence.tree_hash == TREE
+    path = canonical_full_suite_evidence_path(TREE, state_root=tmp_path / "state")
+    assert path.stat().st_mode & 0o222 == 0
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    path.chmod(0o600)
+    payload["payload"]["command"] = ["true"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o400)
     with pytest.raises(ValueError, match="hash mismatch"):
-        load_full_suite_evidence(path, expected_hash="0" * 64)
+        load_full_suite_evidence(tree_hash=TREE, state_root=tmp_path / "state")
+
+    def failing_runner(argv, **kwargs):
+        if "status" in argv:
+            return Result("")
+        if argv[-1] == "HEAD":
+            return Result(HEAD)
+        if argv[-1] == "HEAD^{tree}":
+            return Result(TREE)
+        return Result("failed", 1)
+
+    with pytest.raises(RuntimeError, match="command failed"):
+        write_full_suite_evidence_after_run(
+            repo_root=tmp_path,
+            command=("python3", "-m", "pytest"),
+            runner=failing_runner,
+            now=lambda: 951,
+            state_root=tmp_path / "failed-state",
+        )
+    assert not canonical_full_suite_evidence_path(
+        TREE, state_root=tmp_path / "failed-state"
+    ).exists()
 
 
 def test_run_preflight_runs_quick_policy_then_ci_parity_without_shell(tmp_path: Path) -> None:
@@ -244,15 +289,6 @@ def test_run_preflight_rejects_dirty_worktree(tmp_path: Path) -> None:
 
 
 def test_run_preflight_uses_trusted_clock_for_skip_evidence(tmp_path: Path) -> None:
-    payload = {
-        "schema": FULL_SUITE_EVIDENCE_SCHEMA,
-        "tree_hash": TREE,
-        "passed": True,
-        "completed_at_epoch": 100,
-    }
-    path = tmp_path / "full-suite.json"
-    path.write_text(__import__("json").dumps(payload), encoding="utf-8")
-
     class Result:
         returncode = 0
         stderr = ""
@@ -269,6 +305,14 @@ def test_run_preflight_uses_trusted_clock_for_skip_evidence(tmp_path: Path) -> N
             return Result(TREE)
         return Result("ok")
 
+    write_full_suite_evidence_after_run(
+        repo_root=tmp_path,
+        command=("python3", "-m", "pytest"),
+        runner=runner,
+        now=lambda: 100,
+        state_root=tmp_path / "state",
+    )
+
     with pytest.raises(ValueError, match="stale"):
         run_preflight(
             repo_root=tmp_path,
@@ -277,10 +321,26 @@ def test_run_preflight_uses_trusted_clock_for_skip_evidence(tmp_path: Path) -> N
                 pr_number=15,
                 skip_tests=True,
                 tree_hash=TREE,
-                now_epoch=101,
-                full_suite_evidence_path=str(path),
-                full_suite_evidence_hash=verification.canonical_json_hash(payload),
             ),
             runner=runner,
             now=lambda: 2_000,
+            evidence_state_root=tmp_path / "state",
+        )
+
+
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_evidence_and_preflight_reject_non_finite_timestamps(tmp_path: Path, timestamp: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        build_preflight_argv(
+            command=("preflight",),
+            request=PreflightRequest(pr_number=15, skip_tests=True),
+            current_tree_hash=TREE,
+            full_suite_evidence=FullSuiteEvidence(
+                schema=FULL_SUITE_EVIDENCE_SCHEMA,
+                tree_hash=TREE,
+                completed_at_epoch=1,
+                command=("pytest",),
+                evidence_hash="1" * 64,
+            ),
+            now_epoch=timestamp,
         )

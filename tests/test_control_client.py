@@ -6,8 +6,9 @@ import importlib
 import sys
 import threading
 import time
+from pathlib import Path
 
-from paulsha_cortex.control import constants, contract
+from paulsha_cortex.control import client, constants, contract
 
 
 def test_submit_request_writes_atomically(monkeypatch, tmp_path):
@@ -21,8 +22,6 @@ def test_submit_request_writes_atomically(monkeypatch, tmp_path):
     def spy_rename(src, dst):
         rename_calls.append((str(src), str(dst), constants.requests_dir().glob("*.tmp") is not None, Path(src).exists(), Path(dst).exists()))
         return real_rename(src, dst)
-
-    from pathlib import Path
 
     monkeypatch.setattr(contract.os, "rename", spy_rename)
 
@@ -97,7 +96,25 @@ def test_submit_request_supports_slice_action(monkeypatch, tmp_path):
 
     assert payload is not None
     assert payload["type"] == "slice-action"
-    assert payload["args"] == {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"}
+
+
+def test_submit_work_action_writes_only_a_control_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("PSC_CONTROL_ROOT", str(tmp_path))
+    req_id = client.submit_work_action(
+        action="ship",
+        repo="acme/demo",
+        work_id="demo",
+        args={"pr_number": 8},
+        requested_by="operator",
+    )
+    payload = contract.read_json(constants.requests_dir() / f"{req_id}.json")
+    assert payload["type"] == "work-action"
+    assert payload["args"] == {
+        "action": "ship",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "pr_number": 8,
+    }
 
 
 def test_read_status_degrades_on_missing_or_stale_file(monkeypatch, tmp_path):

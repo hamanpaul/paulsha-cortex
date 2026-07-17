@@ -1392,6 +1392,38 @@ def test_slice_action_request_runs_manager_action(monkeypatch, tmp_path):
     assert captured["actor"] == "operator"
 
 
+def test_work_action_request_has_one_manager_owned_execution_path(tmp_path):
+    registry = FakeRegistry()
+    dispatcher = FakeDispatcher(
+        registry,
+        worktree_creator=FakeWorktreeCreator(tmp_path / "worktrees"),
+    )
+    calls = []
+
+    def work_action(*, args, requested_by):
+        calls.append((args, requested_by))
+        return {"action": args["action"], "work_id": args["work_id"]}
+
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=RecordingLauncher(),
+        work_action_fn=work_action,
+    )
+    result = executor(
+        {
+            "type": "work-action",
+            "args": {"action": "start", "repo": "acme/demo", "work_id": "demo"},
+            "requested_by": "operator",
+        }
+    )
+    assert result == {"action": "start", "work_id": "demo"}
+    assert calls == [
+        ({"action": "start", "repo": "acme/demo", "work_id": "demo"}, "operator")
+    ]
+
+
 def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path):
     dispatcher = FakeDispatcher(FakeRegistry())
     launcher = object()

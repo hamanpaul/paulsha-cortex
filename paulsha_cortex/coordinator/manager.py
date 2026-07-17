@@ -2342,3 +2342,10 @@ def apply_workflow_action(
         facets=(),
     )
     return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}
+
+
+def apply_work_action(*, args, requested_by):
+    """唯一 production mutation seam；daemon control request 之外不直接呼叫。"""
+    from .work_actions import execute_work_action
+
+    return execute_work_action(args=args, requested_by=requested_by)

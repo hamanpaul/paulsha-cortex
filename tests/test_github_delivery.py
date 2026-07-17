@@ -193,6 +193,8 @@ def test_delivery_gate_requires_exact_bot_review_from_request_epoch() -> None:
 def test_remote_closure_is_strict_conjunction() -> None:
     facts = RemoteClosureFacts(
         merge_commit="c" * 40,
+        pr_head=HEAD,
+        merge_parents=("1" * 40, HEAD),
         default_head="d" * 40,
         merge_is_ancestor=True,
         merge_is_merge_commit=True,
@@ -203,7 +205,9 @@ def test_remote_closure_is_strict_conjunction() -> None:
         todo_revisions={"todo.md": "d" * 40},
         completion_record_valid=True,
     )
-    assert evaluate_remote_closure(facts=facts, required_issues=(14,)).allowed
+    assert evaluate_remote_closure(
+        facts=facts, required_issues=(14,), expected_head=HEAD
+    ).allowed
     for field in (
         "merge_is_ancestor",
         "merge_is_merge_commit",
@@ -215,8 +219,16 @@ def test_remote_closure_is_strict_conjunction() -> None:
         assert not evaluate_remote_closure(
             facts=replace(facts, **{field: False}),
             required_issues=(14,),
+            expected_head=HEAD,
         ).allowed
     assert not evaluate_remote_closure(
         facts=replace(facts, issue_states={14: "open"}),
         required_issues=(14,),
+        expected_head=HEAD,
+    ).allowed
+
+    assert not evaluate_remote_closure(
+        facts=replace(facts, merge_parents=("1" * 40, "2" * 40)),
+        required_issues=(14,),
+        expected_head=HEAD,
     ).allowed

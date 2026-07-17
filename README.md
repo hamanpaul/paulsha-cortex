@@ -219,7 +219,9 @@ cortex slice-action "$SLICE_ID" retry-review --actor operator
 cortex slice-action "$SLICE_ID" abandon      --actor operator
 ```
 
-`fanout`、`tick`、`complete` 與 `slice-action` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
+`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
+
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--issue` 指定來源，並由 payload 提供 repo root；`ship` 的 evidence refs 也以 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
 ### 5. Merge Candidate 並完成交付
 
@@ -360,7 +362,7 @@ cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 | --- | --- |
 | persona enforcement | standalone PR workflow 為 `shadow`；coordinator verification 的 `persona-scope` 為 fail-closed gate |
 | manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
-| coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` 走 control queue；舊低階 `dispatch` 已停用 |
+| coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
 | monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 |
 | 依賴模型 | 僅 `PyYAML`；runtime 不依賴 `paulsha-hippo` |

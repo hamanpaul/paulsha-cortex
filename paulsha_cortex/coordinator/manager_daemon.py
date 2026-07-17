@@ -271,6 +271,7 @@ def build_request_executor(
     workflow_primary_integrator=None,
     workflow_runtime_factory=None,
     workflow_ship_validator=None,
+    work_action_fn: Callable[..., dict[str, Any]] = manager.apply_work_action,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -307,6 +308,11 @@ def build_request_executor(
                 runtime_factory=workflow_runtime_factory,
                 ship_validator=workflow_ship_validator,
                 git_runner=getattr(dispatcher, "_git_runner", None),
+            )
+        if request["type"] == "work-action":
+            return work_action_fn(
+                args=dict(args),
+                requested_by=request["requested_by"],
             )
         if request["type"] == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None

@@ -93,6 +93,18 @@ def test_build_slice_action_request():
     assert req["args"] == {"slice_id": "slice-a", "action": "retry-build", "actor": "operator"}
 
 
+def test_work_action_contract_requires_typed_routing_fields():
+    req = contract.build_request(
+        req_type="work-action",
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+    )
+    assert contract.validate_request(req)["args"]["action"] == "start"
+    req["args"]["action"] = "delete"
+    with pytest.raises(ValueError, match="action invalid"):
+        contract.validate_request(req)
+
+
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):
         contract.build_request(req_type="nope", args={}, requested_by="x")

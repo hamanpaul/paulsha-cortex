@@ -170,6 +170,8 @@ def build_merge_argv(*, repo: str, pr_number: int, expected_head: str) -> list[s
 @dataclass(frozen=True)
 class RemoteClosureFacts:
     merge_commit: str
+    pr_head: str
+    merge_parents: tuple[str, ...]
     default_head: str
     merge_is_ancestor: bool
     merge_is_merge_commit: bool
@@ -185,12 +187,15 @@ def evaluate_remote_closure(
     *,
     facts: RemoteClosureFacts,
     required_issues: tuple[int, ...],
+    expected_head: str,
 ) -> GateResult:
     reasons: list[str] = []
     if re.fullmatch(r"[0-9a-fA-F]{40}", facts.default_head) is None:
         reasons.append("remote-default-unverified")
     if len(facts.merge_commit) != 40 or not facts.merge_is_ancestor:
         reasons.append("merge-ancestry-unverified")
+    if facts.pr_head != expected_head or expected_head not in facts.merge_parents:
+        reasons.append("merged-pr-head-unverified")
     if not facts.merge_is_merge_commit:
         reasons.append("merge-commit-required")
     if any(facts.issue_states.get(issue) != "closed" for issue in required_issues):
@@ -357,7 +362,7 @@ class GitHubDeliveryClient:
 
     def _tree_paths(self, *, repo: str, ref: str) -> tuple[str, ...]:
         payload = self._api(f"repos/{repo}/git/trees/{ref}?recursive=1")
-        if not isinstance(payload, dict) or payload.get("truncated") is True:
+        if not isinstance(payload, dict) or payload.get("truncated") is not False:
             raise RuntimeError("GitHub tree unavailable or truncated")
         rows = payload.get("tree")
         if not isinstance(rows, list):
@@ -579,11 +584,17 @@ class GitHubDeliveryClient:
         if not isinstance(pull, dict) or not isinstance(repository, dict):
             raise RuntimeError("GitHub closure payload malformed")
         merge_commit = pull.get("merge_commit_sha")
+        try:
+            pr_head = pull["head"]["sha"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub merged PR head malformed") from exc
         default_branch = repository.get("default_branch")
         if (
             pull.get("merged_at") is None
             or not isinstance(merge_commit, str)
             or not isinstance(default_branch, str)
+            or not isinstance(pr_head, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", pr_head) is None
         ):
             raise RuntimeError("GitHub merge evidence incomplete")
         encoded_branch = quote(default_branch, safe="")
@@ -608,6 +619,16 @@ class GitHubDeliveryClient:
             merge_payload.get("parents"), list
         ):
             raise RuntimeError("GitHub merge commit payload malformed")
+        parent_rows = merge_payload["parents"]
+        merge_parents: list[str] = []
+        for parent in parent_rows:
+            if (
+                not isinstance(parent, dict)
+                or not isinstance(parent.get("sha"), str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", parent["sha"]) is None
+            ):
+                raise RuntimeError("GitHub merge commit parent malformed")
+            merge_parents.append(parent["sha"].lower())
         issue_states: dict[int, str] = {}
         for issue in required_issues:
             payload = self._api(f"repos/{repo}/issues/{issue}")
@@ -657,9 +678,11 @@ class GitHubDeliveryClient:
             todo_revisions[todo_path] = payload["sha"].lower()
         return RemoteClosureFacts(
             merge_commit=merge_commit,
+            pr_head=pr_head.lower(),
+            merge_parents=tuple(merge_parents),
             default_head=default_head,
             merge_is_ancestor=comparison.get("status") in {"ahead", "identical"},
-            merge_is_merge_commit=len(merge_payload["parents"]) >= 2,
+            merge_is_merge_commit=len(merge_parents) >= 2,
             issue_states=issue_states,
             active_openspec_absent=active_absent,
             archive_present=archive_present,

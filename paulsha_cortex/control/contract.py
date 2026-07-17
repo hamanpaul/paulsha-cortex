@@ -10,8 +10,9 @@ from uuid import uuid4
 from . import constants
 
 REQUEST_TYPES = frozenset(
-    {"tick", "fanout", "dispatch", "complete", "slice-action", "workflow-action"}
+    {"tick", "fanout", "dispatch", "complete", "slice-action", "workflow-action", "work-action"}
 )
+WORK_ACTIONS = frozenset({"link", "unlink", "start", "resume", "auto", "ship"})
 
 
 def utcnow() -> str:
@@ -74,6 +75,16 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
     args = payload.get("args")
     if not isinstance(args, dict):
         raise ValueError("request args must be an object")
+    if req_type == "work-action":
+        action = args.get("action")
+        repo = args.get("repo")
+        work_id = args.get("work_id")
+        if action not in WORK_ACTIONS:
+            raise ValueError("work-action action invalid")
+        if not isinstance(repo, str) or not repo.strip():
+            raise ValueError("work-action repo required")
+        if not isinstance(work_id, str) or not work_id.strip():
+            raise ValueError("work-action work_id required")
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")

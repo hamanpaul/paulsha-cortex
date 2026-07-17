@@ -109,6 +109,7 @@ class FakeRunner:
         if f"git/trees/{HEAD_TREE}?recursive=1" in endpoint or f"git/trees/{MAIN_TREE}?recursive=1" in endpoint:
             return Result(
                 {
+                    "truncated": False,
                     "tree": [
                         {
                             "path": "openspec/changes/archive/2026-07-17-unified-work-lifecycle/tasks.md"
@@ -121,7 +122,7 @@ class FakeRunner:
         if f"compare/{MERGE}...{DEFAULT_HEAD}" in endpoint:
             return Result({"status": "ahead"})
         if f"git/commits/{MERGE}" in endpoint:
-            return Result({"parents": [{"sha": "1" * 40}, {"sha": "2" * 40}]})
+            return Result({"parents": [{"sha": "1" * 40}, {"sha": HEAD}]})
         if "repos/acme/demo/issues/14" in endpoint:
             return Result({"state": "closed"})
         if f"repos/acme/demo/contents/docs/todo.md?ref={DEFAULT_HEAD}" in endpoint:
@@ -285,6 +286,25 @@ def test_check_run_pagination_must_match_total_count() -> None:
 
     with pytest.raises(RuntimeError, match="pagination incomplete"):
         GitHubDeliveryClient(runner=Incomplete()).fetch_delivery_facts(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+        )
+
+
+@pytest.mark.parametrize("truncated", [None, "false", 0, 1, True])
+def test_tree_requires_explicit_boolean_false(truncated) -> None:
+    class BadTree(FakeRunner):
+        def __call__(self, argv, **kwargs):
+            if f"git/trees/{HEAD_TREE}?recursive=1" in " ".join(argv):
+                payload = {"tree": []}
+                if truncated is not None:
+                    payload["truncated"] = truncated
+                return Result(payload)
+            return super().__call__(argv, **kwargs)
+
+    with pytest.raises(RuntimeError, match="unavailable or truncated"):
+        GitHubDeliveryClient(runner=BadTree()).fetch_delivery_facts(
             repo="acme/demo",
             pr_number=7,
             change="unified-work-lifecycle",

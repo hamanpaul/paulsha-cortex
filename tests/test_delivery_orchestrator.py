@@ -7,12 +7,12 @@ from pathlib import Path
 import pytest
 
 from paulsha_cortex.coordinator import completion, review, verification
+from paulsha_cortex.coordinator.claim import load_work_authority
 from paulsha_cortex.coordinator.delivery import (
     ArchiveGateFacts,
     PullRequestMetadata,
     ReviewLoop,
     ForeignReviewEvidence,
-    ProviderFreshnessEvidence,
     ShipOrchestrator,
     build_openspec_archive_argv,
     validate_archive_gate,
@@ -25,6 +25,32 @@ from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 HEAD1 = "a" * 40
 HEAD2 = "b" * 40
 HEAD3 = "c" * 40
+
+
+def _authority(root: Path, *, last_success: float = 150, issues=(14,)):
+    payload = {
+        "schema": "work-items-snapshot/v1",
+        "providers": {
+            "github": {
+                "provider_id": "github",
+                "revision": "github-rev-1",
+                "last_success_epoch": last_success,
+                "degraded": False,
+            }
+        },
+        "work_items": [
+            {
+                "repo": "acme/demo",
+                "work_id": "work",
+                "mapped_issues": list(issues),
+                "confirmed_todo": True,
+                "source_revisions": ["issue:14@open", "openspec:work@abc"],
+            }
+        ],
+    }
+    path = root / f"authority-{last_success}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return load_work_authority(repo="acme/demo", work_id="work", snapshot_path=path)
 
 
 def test_archive_gate_requires_tasks_specs_docs_and_changelog() -> None:
@@ -183,6 +209,12 @@ def test_review_id_must_belong_to_current_request_epoch() -> None:
     assert decision.reason == "copilot-review-outside-request-epoch"
 
 
+@pytest.mark.parametrize("timestamp", [float("nan"), float("inf"), float("-inf")])
+def test_review_epochs_require_finite_timestamps(timestamp: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        ReviewLoop.start(head=HEAD1, now_epoch=timestamp)
+
+
 def _foreign_review(root: Path, *, head: str = HEAD1) -> ForeignReviewEvidence:
     payload = review.build_gate_evaluation(
         slice_id="ship-review",
@@ -254,13 +286,7 @@ def test_ship_orchestrator_is_single_exact_evidence_merge_admission(tmp_path: Pa
         change="work",
         expected_head=HEAD1,
         expected_tree_hash=HEAD2,
-        required_issues=(14,),
-        provider=ProviderFreshnessEvidence(
-            provider="github",
-            revision="snapshot-1",
-            last_success_epoch=150,
-            degraded=False,
-        ),
+        authority=_authority(tmp_path),
         preflight=_preflight(),
         copilot=_copilot_decision(),
         foreign_review=_foreign_review(tmp_path),
@@ -282,15 +308,14 @@ def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path
         change="work",
         expected_head=HEAD1,
         expected_tree_hash=HEAD2,
-        required_issues=(14,),
-        provider=ProviderFreshnessEvidence("github", "snapshot-1", 100, False),
+        authority=_authority(tmp_path, last_success=100),
         preflight=_preflight(),
         copilot=_copilot_decision(),
         foreign_review=_foreign_review(tmp_path),
     )
     with pytest.raises(RuntimeError, match="stale"):
         orchestrator.merge_if_ready(**base)
-    base["provider"] = ProviderFreshnessEvidence("github", "snapshot-1", 1_500, False)
+    base["authority"] = _authority(tmp_path, last_success=1_500)
     base["preflight"] = _preflight(head=HEAD3)
     with pytest.raises(RuntimeError, match="exact HEAD/tree"):
         orchestrator.merge_if_ready(**base)
@@ -337,6 +362,8 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
         def fetch_remote_closure(self, **kwargs):
             return RemoteClosureFacts(
                 merge_commit=HEAD2,
+                pr_head=HEAD1,
+                merge_parents=(HEAD3, HEAD1),
                 default_head=HEAD2,
                 merge_is_ancestor=True,
                 merge_is_merge_commit=True,
@@ -352,7 +379,7 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
         repo="acme/demo",
         pr_number=7,
         change="work",
-        required_issues=(14,),
+        authority=_authority(tmp_path, last_success=0),
         todo_paths=("docs/todo.md",),
         expected_head=HEAD1,
         completion_payload=completion_payload,

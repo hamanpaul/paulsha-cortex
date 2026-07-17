@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import io
+import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
+from paulsha_cortex.coordinator import cli
 from paulsha_cortex.coordinator.cli import _build_parser, _refuse_unsafe_fanout, _resolve_launcher
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 
@@ -88,6 +91,33 @@ class SliceActionFlagTests(unittest.TestCase):
         self.assertEqual(args.slice_id, "slice-a")
         self.assertEqual(args.action, "retry-build")
         self.assertEqual(args.actor, "operator")
+
+
+class WorkActionFlagTests(unittest.TestCase):
+    def test_work_ship_enqueues_payload_without_executing_delivery(self) -> None:
+        submitted = []
+        with tempfile.TemporaryDirectory() as root:
+            payload = f"{root}/ship.json"
+            with open(payload, "w", encoding="utf-8") as handle:
+                json.dump({"pr_number": 8, "change": "demo"}, handle)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                rc = cli.main(
+                    ["work", "ship", "demo", "--repo", "acme/demo", "--payload", payload],
+                    control_read_status=lambda: {"degraded": False},
+                    control_submit_request=lambda kind, args, actor: submitted.append(
+                        (kind, args, actor)
+                    )
+                    or "req-1",
+                    control_poll_done=lambda *_args, **_kwargs: {
+                        "status": "ok",
+                        "result": {"action": "awaiting-copilot"},
+                    },
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "ship")
+        self.assertEqual(submitted[0][1]["pr_number"], 8)
 
 
 if __name__ == "__main__":
