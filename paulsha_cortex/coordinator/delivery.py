@@ -89,6 +89,8 @@ class ReviewLoop:
     ) -> "ReviewLoop":
         if head != self.head:
             raise ValueError("cannot request review for a non-current HEAD")
+        if self.requested_at is not None:
+            return self
         return replace(self, requested_at=float(now_epoch))
 
     def advance_after_fix(

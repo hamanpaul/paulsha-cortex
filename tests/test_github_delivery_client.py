@@ -4,7 +4,10 @@ import json
 
 import pytest
 
-from paulsha_cortex.coordinator.github_delivery import GitHubDeliveryClient
+from paulsha_cortex.coordinator.github_delivery import (
+    DeliveryPolicy,
+    GitHubDeliveryClient,
+)
 
 
 HEAD = "a" * 40
@@ -101,6 +104,8 @@ class FakeRunner:
             return Result({"parents": [{"sha": "1" * 40}, {"sha": "2" * 40}]})
         if "repos/acme/demo/issues/14" in endpoint:
             return Result({"state": "closed"})
+        if argv[:4] == ["gh", "pr", "merge", "7"]:
+            return Result({})
         raise AssertionError(f"unexpected argv: {argv}")
 
 
@@ -164,7 +169,45 @@ def test_merge_and_request_commands_remain_shell_free() -> None:
 
     client = GitHubDeliveryClient(runner=RawRunner())
     client.request_copilot(repo="acme/demo", pr_number=7)
-    client.merge(pr_number=7)
+    client.merge(pr_number=7, expected_head=HEAD)
     assert calls[0][0][-1] == "reviewers[]=copilot-pull-request-reviewer[bot]"
-    assert calls[1][0] == ["gh", "pr", "merge", "7", "--merge"]
+    assert calls[1][0] == [
+        "gh",
+        "pr",
+        "merge",
+        "7",
+        "--merge",
+        "--match-head-commit",
+        HEAD,
+    ]
     assert all(call[1]["shell"] is False for call in calls)
+
+
+def test_merge_if_ready_rereads_and_matches_exact_head() -> None:
+    runner = FakeRunner()
+    client = GitHubDeliveryClient(runner=runner)
+    client.merge_if_ready(
+        repo="acme/demo",
+        pr_number=7,
+        change="unified-work-lifecycle",
+        policy=DeliveryPolicy(expected_head=HEAD, required_closing_issues=(14,)),
+    )
+    merge_calls = [call for call in runner.calls if call[0][:4] == ["gh", "pr", "merge", "7"]]
+    assert len(merge_calls) == 1
+    assert merge_calls[0][0][-1] == HEAD
+
+
+def test_merge_if_ready_does_not_merge_when_final_reread_blocks() -> None:
+    runner = FakeRunner()
+    client = GitHubDeliveryClient(runner=runner)
+    with pytest.raises(RuntimeError, match="head-race"):
+        client.merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+            policy=DeliveryPolicy(
+                expected_head="f" * 40,
+                required_closing_issues=(14,),
+            ),
+        )
+    assert not any(call[0][:4] == ["gh", "pr", "merge", "7"] for call in runner.calls)

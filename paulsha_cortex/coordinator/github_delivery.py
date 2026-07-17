@@ -130,10 +130,22 @@ def build_copilot_request_argv(*, repo: str, pr_number: int) -> list[str]:
     ]
 
 
-def build_merge_argv(*, pr_number: int) -> list[str]:
+def build_merge_argv(*, pr_number: int, expected_head: str) -> list[str]:
     if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
         raise ValueError("pr_number must be a positive integer")
-    return ["gh", "pr", "merge", str(pr_number), "--merge"]
+    if len(expected_head) != 40 or any(
+        character not in "0123456789abcdefABCDEF" for character in expected_head
+    ):
+        raise ValueError("expected_head must be a 40-character hexadecimal SHA")
+    return [
+        "gh",
+        "pr",
+        "merge",
+        str(pr_number),
+        "--merge",
+        "--match-head-commit",
+        expected_head,
+    ]
 
 
 @dataclass(frozen=True)
@@ -454,5 +466,27 @@ class GitHubDeliveryClient:
             expect_json=True,
         )
 
-    def merge(self, *, pr_number: int) -> None:
-        self._run(build_merge_argv(pr_number=pr_number), expect_json=False)
+    def merge(self, *, pr_number: int, expected_head: str) -> None:
+        self._run(
+            build_merge_argv(pr_number=pr_number, expected_head=expected_head),
+            expect_json=False,
+        )
+
+    def merge_if_ready(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        change: str,
+        policy: DeliveryPolicy,
+    ) -> DeliveryFacts:
+        facts = self.fetch_delivery_facts(
+            repo=repo,
+            pr_number=pr_number,
+            change=change,
+        )
+        result = evaluate_delivery_gate(facts=facts, policy=policy)
+        if not result.allowed:
+            raise RuntimeError(f"delivery gate blocked: {', '.join(result.reasons)}")
+        self.merge(pr_number=pr_number, expected_head=policy.expected_head)
+        return facts

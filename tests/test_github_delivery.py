@@ -140,8 +140,16 @@ def test_typed_github_commands_request_copilot_and_merge_commit_only() -> None:
         "-f",
         "reviewers[]=copilot-pull-request-reviewer[bot]",
     ]
-    merge = build_merge_argv(pr_number=15)
-    assert merge == ["gh", "pr", "merge", "15", "--merge"]
+    merge = build_merge_argv(pr_number=15, expected_head=HEAD)
+    assert merge == [
+        "gh",
+        "pr",
+        "merge",
+        "15",
+        "--merge",
+        "--match-head-commit",
+        HEAD,
+    ]
     assert "--auto" not in merge
 
 

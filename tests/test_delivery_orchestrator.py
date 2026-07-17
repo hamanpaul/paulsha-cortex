@@ -121,3 +121,11 @@ def test_review_loop_requires_request_before_review() -> None:
             now_epoch=101,
             finding_count=0,
         )
+
+
+def test_repeated_request_does_not_extend_current_head_deadline() -> None:
+    loop = ReviewLoop.start(head=HEAD1, now_epoch=100).mark_requested(
+        head=HEAD1,
+        now_epoch=100,
+    )
+    assert loop.mark_requested(head=HEAD1, now_epoch=800).requested_at == 100
