@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
+import subprocess
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 
 
 GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
@@ -164,3 +167,264 @@ def evaluate_remote_closure(
         reasons.append("completion-record-invalid")
     normalized = _unique_reasons(reasons)
     return GateResult(allowed=not normalized, reasons=normalized)
+
+
+Runner = Callable[..., object]
+_WORK_QUERY = """
+query($owner:String!,$name:String!,$number:Int!) {
+  repository(owner:$owner,name:$name) {
+    pullRequest(number:$number) {
+      closingIssuesReferences(first:100) { nodes { number } }
+      reviewThreads(first:100) { nodes { id isResolved isOutdated } }
+    }
+  }
+}
+""".strip()
+
+
+class GitHubDeliveryClient:
+    """Authenticated ``gh api`` seam; any malformed remote fact fails closed."""
+
+    def __init__(self, *, runner: Runner = subprocess.run) -> None:
+        self._runner = runner
+
+    def _run(self, argv: list[str], *, expect_json: bool) -> object:
+        raw = self._runner(
+            argv,
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        returncode = getattr(raw, "returncode", None)
+        if returncode != 0:
+            stderr = getattr(raw, "stderr", "")
+            raise RuntimeError(f"gh command failed: {stderr}".rstrip())
+        if not expect_json:
+            return getattr(raw, "stdout", "")
+        stdout = getattr(raw, "stdout", "")
+        if not isinstance(stdout, str):
+            raise RuntimeError("gh command returned non-text output")
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("gh command returned malformed JSON") from exc
+
+    def _api(self, endpoint: str) -> object:
+        return self._run(["gh", "api", endpoint], expect_json=True)
+
+    @staticmethod
+    def _repo_parts(repo: str) -> tuple[str, str]:
+        parts = repo.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError("repo must be owner/name")
+        return parts[0], parts[1]
+
+    def _work_graph(self, *, repo: str, pr_number: int) -> dict[str, object]:
+        owner, name = self._repo_parts(repo)
+        payload = self._run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={_WORK_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+            ],
+            expect_json=True,
+        )
+        try:
+            work = payload["data"]["repository"]["pullRequest"]  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub GraphQL work facts malformed") from exc
+        if not isinstance(work, dict):
+            raise RuntimeError("GitHub GraphQL pullRequest missing")
+        return work
+
+    def _tree_paths(self, *, repo: str, ref: str) -> tuple[str, ...]:
+        payload = self._api(f"repos/{repo}/git/trees/{ref}?recursive=1")
+        if not isinstance(payload, dict) or payload.get("truncated") is True:
+            raise RuntimeError("GitHub tree unavailable or truncated")
+        rows = payload.get("tree")
+        if not isinstance(rows, list):
+            raise RuntimeError("GitHub tree payload malformed")
+        paths: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+                raise RuntimeError("GitHub tree entry malformed")
+            paths.append(row["path"])
+        return tuple(paths)
+
+    def _commit_tree_paths(self, *, repo: str, commit: str) -> tuple[str, ...]:
+        payload = self._api(f"repos/{repo}/git/commits/{commit}")
+        try:
+            tree_sha = payload["tree"]["sha"]  # type: ignore[index]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub commit tree malformed") from exc
+        if not isinstance(tree_sha, str):
+            raise RuntimeError("GitHub commit tree malformed")
+        return self._tree_paths(repo=repo, ref=tree_sha)
+
+    @staticmethod
+    def _openspec_facts(paths: tuple[str, ...], change: str) -> tuple[bool, bool]:
+        if not change or "/" in change or change in {".", ".."}:
+            raise ValueError("change must be a safe OpenSpec slug")
+        active_prefix = f"openspec/changes/{change}/"
+        archive_pattern = re.compile(
+            rf"^openspec/changes/archive/\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(change)}/"
+        )
+        active_absent = not any(path.startswith(active_prefix) for path in paths)
+        archive_present = any(archive_pattern.match(path) for path in paths)
+        return active_absent, archive_present
+
+    def fetch_delivery_facts(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        change: str,
+    ) -> DeliveryFacts:
+        self._repo_parts(repo)
+        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
+        if not isinstance(pull, dict):
+            raise RuntimeError("GitHub pull request payload malformed")
+        try:
+            head = pull["head"]["sha"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("GitHub pull request refs malformed") from exc
+        if not isinstance(head, str):
+            raise RuntimeError("GitHub pull request refs malformed")
+
+        check_payload = self._api(f"repos/{repo}/commits/{head}/check-runs")
+        review_payload = self._api(f"repos/{repo}/pulls/{pr_number}/reviews")
+        if not isinstance(check_payload, dict) or not isinstance(
+            check_payload.get("check_runs"), list
+        ):
+            raise RuntimeError("GitHub check runs malformed")
+        if not isinstance(review_payload, list):
+            raise RuntimeError("GitHub reviews malformed")
+
+        checks: list[GitHubCheck] = []
+        for row in check_payload["check_runs"]:
+            if not isinstance(row, dict):
+                raise RuntimeError("GitHub check run malformed")
+            checks.append(
+                GitHubCheck(
+                    name=str(row.get("name", "")),
+                    status=str(row.get("status", "")),
+                    conclusion=row.get("conclusion")
+                    if isinstance(row.get("conclusion"), str)
+                    else None,
+                )
+            )
+        reviews: list[CopilotReview] = []
+        for row in review_payload:
+            if not isinstance(row, dict):
+                raise RuntimeError("GitHub review malformed")
+            login = row.get("user", {}).get("login") if isinstance(row.get("user"), dict) else None
+            if not isinstance(login, str) or "copilot" not in login.casefold():
+                continue
+            try:
+                reviews.append(
+                    CopilotReview(
+                        review_id=int(row["id"]),
+                        commit_id=str(row["commit_id"]),
+                        state=str(row["state"]),
+                        body=str(row.get("body") or ""),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("GitHub Copilot review malformed") from exc
+
+        graph = self._work_graph(repo=repo, pr_number=pr_number)
+        try:
+            issues = tuple(
+                sorted(
+                    int(node["number"])
+                    for node in graph["closingIssuesReferences"]["nodes"]  # type: ignore[index]
+                )
+            )
+            threads = tuple(
+                ReviewThread(
+                    thread_id=str(node["id"]),
+                    resolved=bool(node["isResolved"]),
+                    outdated=bool(node["isOutdated"]),
+                )
+                for node in graph["reviewThreads"]["nodes"]  # type: ignore[index]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("GitHub PR association facts malformed") from exc
+        # Ship validates the exact candidate tree.  The default branch still
+        # contains the active change until this PR is merged.
+        paths = self._commit_tree_paths(repo=repo, commit=head)
+        active_absent, archive_present = self._openspec_facts(paths, change)
+        return DeliveryFacts(
+            head=head,
+            mergeable=pull.get("mergeable") is True,
+            mergeable_state=str(pull.get("mergeable_state", "")),
+            checks=tuple(checks),
+            copilot_reviews=tuple(reviews),
+            review_threads=threads,
+            closing_issues=issues,
+            active_openspec_absent=active_absent,
+            archive_present=archive_present,
+        )
+
+    def fetch_remote_closure(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        change: str,
+        required_issues: tuple[int, ...],
+        todo_complete: bool,
+        completion_record_valid: bool,
+    ) -> RemoteClosureFacts:
+        self._repo_parts(repo)
+        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
+        repository = self._api(f"repos/{repo}")
+        if not isinstance(pull, dict) or not isinstance(repository, dict):
+            raise RuntimeError("GitHub closure payload malformed")
+        merge_commit = pull.get("merge_commit_sha")
+        default_branch = repository.get("default_branch")
+        if (
+            pull.get("merged_at") is None
+            or not isinstance(merge_commit, str)
+            or not isinstance(default_branch, str)
+        ):
+            raise RuntimeError("GitHub merge evidence incomplete")
+        comparison = self._api(
+            f"repos/{repo}/compare/{merge_commit}...{default_branch}"
+        )
+        if not isinstance(comparison, dict):
+            raise RuntimeError("GitHub ancestry comparison malformed")
+        issue_states: dict[int, str] = {}
+        for issue in required_issues:
+            payload = self._api(f"repos/{repo}/issues/{issue}")
+            if not isinstance(payload, dict) or not isinstance(payload.get("state"), str):
+                raise RuntimeError("GitHub issue state malformed")
+            issue_states[issue] = payload["state"]
+        paths = self._commit_tree_paths(repo=repo, commit=default_branch)
+        active_absent, archive_present = self._openspec_facts(paths, change)
+        return RemoteClosureFacts(
+            merge_commit=merge_commit,
+            merge_is_ancestor=comparison.get("status") in {"ahead", "identical"},
+            issue_states=issue_states,
+            active_openspec_absent=active_absent,
+            archive_present=archive_present,
+            todo_complete=todo_complete,
+            completion_record_valid=completion_record_valid,
+        )
+
+    def request_copilot(self, *, repo: str, pr_number: int) -> None:
+        self._run(
+            build_copilot_request_argv(repo=repo, pr_number=pr_number),
+            expect_json=True,
+        )
+
+    def merge(self, *, pr_number: int) -> None:
+        self._run(build_merge_argv(pr_number=pr_number), expect_json=False)
