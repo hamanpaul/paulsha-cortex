@@ -45,6 +45,8 @@ class MonitorConfig:
     poll_interval_seconds: int = 60
     rescan_interval_seconds: int = 300
     watch_debounce_ms: int = 500
+    github_refresh_interval_seconds: int = 300
+    provider_stale_after_seconds: int = 900
     legacy_policy: str = "list-only"
     socket_path: Path = field(default_factory=default_socket_path)
     ignore_dirs: tuple[str, ...] = ()
@@ -135,6 +137,8 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         ("poll_interval_seconds", 60),
         ("rescan_interval_seconds", 300),
         ("watch_debounce_ms", 500),
+        ("github_refresh_interval_seconds", 300),
+        ("provider_stale_after_seconds", 900),
     ):
         value = monitor.get(field_name, default)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -161,6 +165,8 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         poll_interval_seconds=poll_interval,
         rescan_interval_seconds=rescan_interval,
         watch_debounce_ms=debounce,
+        github_refresh_interval_seconds=intervals["github_refresh_interval_seconds"],
+        provider_stale_after_seconds=intervals["provider_stale_after_seconds"],
         legacy_policy=legacy_policy,
         socket_path=socket_path,
         ignore_dirs=ignore_dirs,
