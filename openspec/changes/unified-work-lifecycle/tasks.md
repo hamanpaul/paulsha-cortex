@@ -9,7 +9,7 @@
 
 ## 1. PR A — Monitor truth model
 
-- [ ] 1.1 RED-test GitHub/repo/workflow providers、archive exclusion、scan race、auth/rate-limit/timeout與restart cache。
+- [x] 1.1 RED-test GitHub/repo/workflow providers、archive exclusion、scan race、auth/rate-limit/timeout與restart cache。
 - [x] 1.2 實作`WorkSource`/`WorkItem`、provider snapshots與`work-items-snapshot/v1` atomic durable store。
 - [x] 1.3 RED-test並實作lifecycle reducer、reopen、strict closure與degraded freeze。
 - [x] 1.4 RED-test並實作`.cortex/work-items.yaml`、`work_item` frontmatter、confirmed/inferred correlation、collision/exclusion與explain trace。

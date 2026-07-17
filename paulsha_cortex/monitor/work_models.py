@@ -1,7 +1,8 @@
 """Versioned work read-model primitives shared by Monitor providers and stores."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -107,6 +108,7 @@ class ProviderSnapshot:
     revision: str | None
     diagnostics: tuple[str, ...]
     sources: tuple[WorkSource, ...]
+    observations: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.provider_id:
@@ -127,6 +129,14 @@ class ProviderSnapshot:
             raise ValueError("provider snapshot contains duplicate source_id")
         if any(source.provider != self.provider_id for source in self.sources):
             raise ValueError("provider snapshot contains foreign provider source")
+        observations = self.observations
+        if not isinstance(observations, Mapping):
+            raise ValueError("provider observations must be an object")
+        try:
+            normalized_observations = json.loads(json.dumps(observations))
+        except (TypeError, ValueError) as error:
+            raise ValueError("provider observations must be JSON-safe") from error
+        object.__setattr__(self, "observations", normalized_observations)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +146,7 @@ class ProviderSnapshot:
             "revision": self.revision,
             "diagnostics": list(self.diagnostics),
             "sources": [source.to_dict() for source in self.sources],
+            "observations": dict(self.observations),
         }
 
     @classmethod
@@ -153,7 +164,16 @@ class ProviderSnapshot:
             revision=_optional_string(payload, "revision"),
             diagnostics=_strings(payload.get("diagnostics"), "diagnostics"),
             sources=tuple(WorkSource.from_dict(source) for source in sources),
+            observations=(
+                payload.get("observations", {})
+                if isinstance(payload.get("observations", {}), Mapping)
+                else _invalid_observations()
+            ),
         )
+
+
+def _invalid_observations():
+    raise ValueError("provider observations must be an object")
 
 
 @dataclass(frozen=True)

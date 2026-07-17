@@ -12,13 +12,18 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from .config import default_socket_path
-from .correlation import correlate_work_sources
-from .lifecycle import project_work_items
+from .correlation import InferredSignal, correlate_work_sources
+from .lifecycle import ClosureEvidence, project_work_items
 from .models import ProjectState
-from .providers import GitHubWorkProvider, RepoWorkProvider
+from .providers import (
+    GitHubTerminalProvider,
+    GitHubWorkProvider,
+    RepoWorkProvider,
+    WorkflowRegistryProvider,
+)
 from .work_models import ProviderSnapshot
 from .work_models import WorkItem
-from .work_snapshot import WorkSnapshot, WorkSnapshotStore
+from .work_snapshot import WorkSnapshot, WorkSnapshotStore, work_key
 
 
 WORK_API_SCHEMA = "cortex-work/v1"
@@ -42,6 +47,10 @@ class WorkChangeEvent:
     removed: bool = False
 
 
+class AmbiguousWorkItemError(LookupError):
+    """A bare work ID matches more than one repository."""
+
+
 class WorkReadModelStore:
     def __init__(
         self,
@@ -51,10 +60,10 @@ class WorkReadModelStore:
     ) -> None:
         self._lock = threading.RLock()
         self._snapshot = snapshot
-        self._items = {item.work_id: item for item in snapshot.work_items}
+        self._items = {(item.repo, item.work_id): item for item in snapshot.work_items}
         self._explanations = {
-            work_id: dict(explanation)
-            for work_id, explanation in (explanations or {}).items()
+            identity: dict(explanation)
+            for identity, explanation in (explanations or {}).items()
         }
 
     @classmethod
@@ -91,16 +100,26 @@ class WorkReadModelStore:
         *,
         explanations: Mapping[str, Mapping] | None = None,
     ) -> tuple[WorkChangeEvent, ...]:
+        return self.replace_durably(snapshot, None, explanations=explanations)
+
+    def replace_durably(
+        self,
+        snapshot: WorkSnapshot,
+        persist: Callable[[WorkSnapshot], None] | None,
+        *,
+        explanations: Mapping[str, Mapping] | None = None,
+    ) -> tuple[WorkChangeEvent, ...]:
+        """Resolve the final sequence, durably write it, then publish in memory."""
         with self._lock:
             previous = self._items
-            current = {item.work_id: item for item in snapshot.work_items}
+            current = {(item.repo, item.work_id): item for item in snapshot.work_items}
             events: list[WorkChangeEvent] = []
             sequence = self._snapshot.sequence
-            for work_id in sorted(previous.keys() - current.keys()):
+            for identity in sorted(previous.keys() - current.keys()):
                 sequence += 1
-                events.append(WorkChangeEvent(sequence, previous[work_id], removed=True))
-            for work_id, item in sorted(current.items()):
-                if previous.get(work_id) != item:
+                events.append(WorkChangeEvent(sequence, previous[identity], removed=True))
+            for identity, item in sorted(current.items()):
+                if previous.get(identity) != item:
                     sequence += 1
                     events.append(WorkChangeEvent(sequence, item))
             sequence = max(sequence, snapshot.sequence)
@@ -113,12 +132,14 @@ class WorkReadModelStore:
                     source_owners=snapshot.source_owners,
                     exclusions=snapshot.exclusions,
                 )
+            if persist is not None:
+                persist(snapshot)
             self._snapshot = snapshot
             self._items = current
             if explanations is not None:
                 self._explanations = {
-                    work_id: dict(explanation)
-                    for work_id, explanation in explanations.items()
+                    identity: dict(explanation)
+                    for identity, explanation in explanations.items()
                 }
             return tuple(events)
 
@@ -143,30 +164,42 @@ class WorkReadModelStore:
                     continue
                 items.append(item.to_dict())
                 if explain:
-                    explanations[item.work_id] = self._explanation(item.work_id)
+                    explanations[work_key(item.repo, item.work_id)] = self._explanation(
+                        item.work_id, repo=item.repo
+                    )
             envelope = self._envelope()
             envelope["items"] = items
             if explain:
                 envelope["explanations"] = explanations
             return envelope
 
-    def get_work_item(self, work_id: str) -> dict:
+    def get_work_item(self, work_id: str, *, repo: str | None = None) -> dict:
         with self._lock:
-            item = self._items.get(work_id)
-            if item is None:
+            matches = [
+                item
+                for (item_repo, item_id), item in self._items.items()
+                if item_id == work_id and (repo is None or item_repo == repo)
+            ]
+            if not matches:
                 raise KeyError(work_id)
+            if len(matches) > 1:
+                raise AmbiguousWorkItemError(work_id)
+            item = matches[0]
             envelope = self._envelope()
             envelope["item"] = item.to_dict()
             return envelope
 
-    def explain_work_item(self, work_id: str) -> dict:
-        envelope = self.get_work_item(work_id)
-        envelope["explanation"] = self._explanation(work_id)
+    def explain_work_item(self, work_id: str, *, repo: str | None = None) -> dict:
+        envelope = self.get_work_item(work_id, repo=repo)
+        envelope["explanation"] = self._explanation(work_id, repo=envelope["item"]["repo"])
         return envelope
 
-    def _explanation(self, work_id: str) -> Mapping:
+    def _explanation(self, work_id: str, *, repo: str | None = None) -> Mapping:
+        identity = work_key(repo, work_id) if repo is not None else work_id
         return self._explanations.get(
-            work_id,
+            identity,
+            self._explanations.get(
+                work_id,
             {
                 "work_id": work_id,
                 "authoritative_links": [],
@@ -175,6 +208,7 @@ class WorkReadModelStore:
                 "exclusions": [],
                 "reducer_trace": [],
             },
+            ),
         )
 
     def _envelope(self) -> dict:
@@ -192,6 +226,24 @@ class WorkReadModelStore:
             "sequence": self._snapshot.sequence,
             "degraded": degraded,
             "providers": providers,
+            "hard_gates": self._hard_gates(providers),
+        }
+
+    @staticmethod
+    def _hard_gates(providers: Sequence[Mapping]) -> dict:
+        reasons: list[str] = []
+        for row in providers:
+            if row["status"] != "degraded":
+                continue
+            stale = next(
+                (note for note in row.get("diagnostics", []) if note.endswith(" stale")),
+                None,
+            )
+            reasons.append(stale or f"{row['provider_id']} degraded")
+        return {
+            "auto_claim": not reasons,
+            "merge": not reasons,
+            "reasons": reasons,
         }
 
 
@@ -234,10 +286,20 @@ class WorkModelRefresher:
         durable_store: WorkSnapshotStore,
         read_store: WorkReadModelStore,
         github_provider_factory: Callable[[str], GitHubWorkProvider] | None = None,
+        github_terminal_provider_factory: Callable[[str], GitHubTerminalProvider] | None = None,
+        workflow_provider_factory: Callable[[str], WorkflowRegistryProvider] | None = None,
+        stale_after_seconds: int = 900,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self.durable_store = durable_store
         self.read_store = read_store
         self.github_provider_factory = github_provider_factory or GitHubWorkProvider
+        self.github_terminal_provider_factory = (
+            github_terminal_provider_factory or GitHubTerminalProvider
+        )
+        self.workflow_provider_factory = workflow_provider_factory or WorkflowRegistryProvider
+        self.stale_after_seconds = stale_after_seconds
+        self.now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
 
     def refresh(
@@ -253,7 +315,10 @@ class WorkModelRefresher:
             source_owners: dict[str, str] = {}
             exclusions: list[Mapping[str, str]] = []
             explanations: dict[str, Mapping] = {}
-            attempted_at = _utcnow()
+            current_time = self.now()
+            if current_time.tzinfo is None:
+                raise ValueError("now must include timezone")
+            attempted_at = current_time.isoformat().replace("+00:00", "Z")
             for project in sorted(projects, key=lambda item: item.path):
                 if project.legacy:
                     continue
@@ -264,18 +329,67 @@ class WorkModelRefresher:
                 local = _retain_last_good(previous_local, local_result)
                 providers[local.provider_id] = local
                 relevant = [local]
+                workflow_result = self.workflow_provider_factory(repo).scan()
+                workflow = _retain_last_good(
+                    providers.get(workflow_result.provider_id), workflow_result
+                )
+                providers[workflow.provider_id] = workflow
+                relevant.append(workflow)
                 github_id = f"github:{repo}"
                 if include_github and is_github:
                     github_result = self.github_provider_factory(repo).scan()
                     github = _retain_last_good(providers.get(github_id), github_result)
                     providers[github_id] = github
                     relevant.append(github)
+                    terminal_result = self.github_terminal_provider_factory(repo).scan()
+                    terminal = _retain_last_good(
+                        providers.get(terminal_result.provider_id), terminal_result
+                    )
+                    providers[terminal.provider_id] = terminal
+                    relevant.append(terminal)
                 elif github_id in providers:
                     relevant.append(providers[github_id])
+                    terminal_id = f"github-terminal:{repo}"
+                    if terminal_id in providers:
+                        relevant.append(providers[terminal_id])
+                if github_id in providers and not WorkSnapshot(
+                    sequence=previous.sequence,
+                    written_at=attempted_at,
+                    providers=providers,
+                    work_items=(),
+                    source_owners={},
+                    exclusions=(),
+                ).provider_is_fresh(
+                    github_id,
+                    now=current_time,
+                    max_age=self.stale_after_seconds,
+                ):
+                    stale = providers[github_id]
+                    stale = replace(
+                        stale,
+                        status="degraded",
+                        last_attempt_at=attempted_at,
+                        diagnostics=tuple(
+                            dict.fromkeys((*stale.diagnostics, f"{github_id} stale"))
+                        ),
+                    )
+                    providers[github_id] = stale
+                    relevant = [
+                        stale if provider.provider_id == github_id else provider
+                        for provider in relevant
+                    ]
                 sources = tuple(
                     source for provider in relevant for source in provider.sources
                 )
-                correlation = correlate_work_sources(root, repo, sources)
+                observations = _merge_observations(relevant)
+                correlation = correlate_work_sources(
+                    root,
+                    repo,
+                    sources,
+                    inferred_signals=_parse_inferred_signals(observations),
+                    closing_links=observations.get("closing_links", {}),
+                    workflow_links=observations.get("workflow_links", {}),
+                )
                 if correlation.degraded and local_result.status == "ok":
                     collision_result = replace(
                         local_result,
@@ -306,11 +420,19 @@ class WorkModelRefresher:
                     repo=repo,
                     updated_at=attempted_at,
                     previous_items=prior,
+                    closure_by_work=_parse_closure_evidence(
+                        observations, correlation=correlation
+                    ),
                 )
                 projected_items.extend(projection.items)
-                explanations.update(projection.explanations)
+                explanations.update(
+                    (work_key(repo, work_id), explanation)
+                    for work_id, explanation in projection.explanations.items()
+                )
                 if correlation.degraded:
-                    projected_ids = {item.work_id for item in projection.items}
+                    projected_ids = {
+                        work_key(item.repo, item.work_id) for item in projection.items
+                    }
                     source_owners.update(
                         (source_id, owner)
                         for source_id, owner in previous.source_owners.items()
@@ -318,7 +440,10 @@ class WorkModelRefresher:
                     )
                     exclusions.extend(previous.exclusions)
                 else:
-                    source_owners.update(correlation.source_owners)
+                    source_owners.update(
+                        (source_id, work_key(repo, owner))
+                        for source_id, owner in correlation.source_owners.items()
+                    )
                     exclusions.extend(correlation.exclusions)
             snapshot = WorkSnapshot(
                 sequence=previous.sequence + 1,
@@ -328,8 +453,102 @@ class WorkModelRefresher:
                 source_owners=source_owners,
                 exclusions=tuple(_dedupe_mappings(exclusions)),
             )
-            self.durable_store.write(snapshot)
-            return self.read_store.replace(snapshot, explanations=explanations)
+            return self.read_store.replace_durably(
+                snapshot, self.durable_store.write, explanations=explanations
+            )
+
+
+def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
+    merged: dict[str, object] = {
+        "closing_links": {},
+        "workflow_links": {},
+        "closure_by_work": {},
+        "inferred_signals": [],
+        "remote_openspec": {"active": [], "archived": []},
+    }
+    for provider in providers:
+        observations = provider.observations
+        for key in ("closing_links", "workflow_links"):
+            value = observations.get(key, {})
+            if isinstance(value, Mapping):
+                merged[key].update(value)
+        closure = observations.get("closure_by_work", {})
+        if isinstance(closure, Mapping):
+            for work_id, facts in closure.items():
+                if isinstance(work_id, str) and isinstance(facts, Mapping):
+                    merged["closure_by_work"].setdefault(work_id, {}).update(facts)
+        signals = observations.get("inferred_signals", [])
+        if isinstance(signals, list):
+            merged["inferred_signals"].extend(signals)
+        remote = observations.get("remote_openspec", {})
+        if isinstance(remote, Mapping):
+            for state in ("active", "archived"):
+                values = remote.get(state, [])
+                if isinstance(values, list):
+                    merged["remote_openspec"][state].extend(
+                        value for value in values if isinstance(value, str)
+                    )
+    return merged
+
+
+def _parse_inferred_signals(observations: Mapping) -> tuple[InferredSignal, ...]:
+    parsed: list[InferredSignal] = []
+    for row in observations.get("inferred_signals", []):
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            parsed.append(
+                InferredSignal(
+                    work_id=row["work_id"],
+                    kind=row["kind"],
+                    value=row["value"],
+                    source_ids=tuple(row["source_ids"]),
+                    weight=float(row.get("weight", 1.0)),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return tuple(parsed)
+
+
+def _parse_closure_evidence(
+    observations: Mapping, *, correlation=None
+) -> dict[str, ClosureEvidence]:
+    fields = ClosureEvidence.__dataclass_fields__
+    combined: dict[str, dict[str, bool]] = {}
+    for work_id, row in observations.get("closure_by_work", {}).items():
+        if not isinstance(work_id, str) or not isinstance(row, Mapping):
+            continue
+        resolved = work_id
+        if work_id.startswith("@source:") and correlation is not None:
+            source_id = work_id[len("@source:") :]
+            resolved = next(
+                (
+                    group.work_id
+                    for group in correlation.groups
+                    if any(source.source_id == source_id for source in group.sources)
+                ),
+                "",
+            )
+        if not resolved:
+            continue
+        facts = combined.setdefault(resolved, {})
+        for name in fields:
+            if name in row:
+                facts[name] = row.get(name) is True
+    remote = observations.get("remote_openspec", {})
+    active = set(remote.get("active", [])) if isinstance(remote, Mapping) else set()
+    archived = set(remote.get("archived", [])) if isinstance(remote, Mapping) else set()
+    for work_id, facts in combined.items():
+        if active or archived:
+            facts["remote_active_openspec_absent"] = work_id not in active
+            facts["remote_archive_present"] = work_id in archived
+    return {
+        work_id: ClosureEvidence(
+            **{name: facts.get(name, False) for name in fields}
+        )
+        for work_id, facts in combined.items()
+    }
 
 
 def _retain_last_good(

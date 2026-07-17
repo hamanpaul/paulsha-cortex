@@ -4,7 +4,12 @@ import json
 import subprocess
 from pathlib import Path
 
-from paulsha_cortex.monitor.providers import GitHubWorkProvider, RepoWorkProvider
+from paulsha_cortex.monitor.providers import (
+    GitHubTerminalProvider,
+    GitHubWorkProvider,
+    RepoWorkProvider,
+    WorkflowRegistryProvider,
+)
 
 
 def _write(path: Path, text: str) -> Path:
@@ -95,6 +100,16 @@ class FakeRunner:
         if self.error is not None:
             raise self.error
         return self.result
+
+
+class SequenceRunner:
+    def __init__(self, results):
+        self.results = iter(results)
+        self.calls = []
+
+    def run(self, argv, *, timeout):
+        self.calls.append(tuple(argv))
+        return next(self.results)
 
 
 def _completed(payload, *, returncode=0, stderr=""):
@@ -191,3 +206,86 @@ def test_github_provider_malformed_json_is_degraded():
 
     assert result.status == "degraded"
     assert any("JSON" in item for item in result.diagnostics)
+
+
+def test_workflow_registry_provider_emits_authoritative_link_and_completion(tmp_path):
+    state = tmp_path / "workflows.json"
+    state.write_text(
+        json.dumps(
+            {
+                "sequence": 8,
+                "workflow_runs": [
+                    {
+                        "run_id": "run-7",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "review",
+                        "completion_record_valid": True,
+                    },
+                    {
+                        "run_id": "foreign",
+                        "repo": "example/other",
+                        "work_id": "work",
+                        "status": "build",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert [source.ref for source in result.sources] == ["run-7"]
+    source_id = result.sources[0].source_id
+    assert result.observations["workflow_links"] == {source_id: "work"}
+    assert result.observations["closure_by_work"]["work"]["completion_record_valid"]
+
+
+def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main"},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "number": 9,
+                            "body": "work_item: work\n",
+                            "state": "MERGED",
+                            "mergedAt": "2026-07-17T10:00:00Z",
+                            "mergeCommit": {"oid": "a" * 40},
+                            "closingIssuesReferences": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"number": 7, "state": "CLOSED"}]
+                            },
+                        }
+                    ]
+                },
+            }
+        }
+    }
+    tree = {
+        "tree": [
+            {"path": "openspec/changes/archive/2026-07-17-work/proposal.md"}
+        ]
+    }
+    runner = SequenceRunner([_completed(graph), _completed(tree)])
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "ok"
+    assert result.observations["closing_links"] == {
+        "github_pr:example/acme#9": "work",
+        "github_issue:example/acme#7": "work",
+    }
+    assert result.observations["closure_by_work"]["work"] == {
+        "pr_merged_with_merge_commit": True,
+        "issues_all_closed": True,
+    }
+    assert result.observations["remote_openspec"] == {
+        "active": [],
+        "archived": ["work"],
+    }

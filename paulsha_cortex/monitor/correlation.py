@@ -244,7 +244,21 @@ def correlate_work_sources(
         ("workflow_metadata", workflow_links or {}),
     ):
         for source_id, work_id in mapping.items():
-            if source_id in candidates and isinstance(work_id, str) and _WORK_ID.fullmatch(work_id):
+            if source_id not in candidates or not isinstance(work_id, str):
+                continue
+            if authority == "github_closing" and work_id in candidates:
+                linked = candidates[work_id]
+                if not linked:
+                    target = next(
+                        source for source in sources if source.source_id == work_id
+                    )
+                    linked.add(_fallback_work_id(target))
+                for linked_work_id in linked:
+                    candidates[source_id].add(linked_work_id)
+                    authoritative.setdefault(linked_work_id, []).append(
+                        {"authority": authority, "source_id": source_id}
+                    )
+            elif _WORK_ID.fullmatch(work_id):
                 candidates[source_id].add(work_id)
                 authoritative.setdefault(work_id, []).append(
                     {"authority": authority, "source_id": source_id}

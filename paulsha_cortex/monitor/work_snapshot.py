@@ -17,6 +17,11 @@ from .work_models import ProviderSnapshot, WorkItem, parse_timestamp
 SNAPSHOT_SCHEMA = "work-items-snapshot/v1"
 
 
+def work_key(repo: str, work_id: str) -> str:
+    """Stable external identity for a repo-scoped Work Item."""
+    return f"{repo}::{work_id}"
+
+
 class SnapshotValidationError(ValueError):
     """The candidate cannot safely replace a last-good snapshot."""
 
@@ -39,7 +44,17 @@ class WorkSnapshot:
             raise ValueError("snapshot sequence must be a non-negative integer")
         parse_timestamp(self.written_at)
         object.__setattr__(self, "providers", dict(self.providers))
-        object.__setattr__(self, "source_owners", dict(self.source_owners))
+        owners = dict(self.source_owners)
+        by_slug: dict[str, list[str]] = {}
+        for item in self.work_items:
+            by_slug.setdefault(item.work_id, []).append(work_key(item.repo, item.work_id))
+        for source_id, owner in tuple(owners.items()):
+            if not isinstance(owner, str):
+                continue
+            matches = by_slug.get(owner, [])
+            if len(matches) == 1:
+                owners[source_id] = matches[0]
+        object.__setattr__(self, "source_owners", owners)
         object.__setattr__(self, "exclusions", tuple(dict(item) for item in self.exclusions))
         self.validate_ownership()
 
@@ -49,7 +64,7 @@ class WorkSnapshot:
         for provider_id, provider in self.providers.items():
             if provider.provider_id != provider_id:
                 raise ValueError("provider map key does not match provider snapshot")
-        work_ids = {item.work_id for item in self.work_items}
+        work_ids = {work_key(item.repo, item.work_id) for item in self.work_items}
         if len(work_ids) != len(self.work_items):
             raise ValueError("duplicate work item ID")
         for source_id, owner in self.source_owners.items():
@@ -60,13 +75,14 @@ class WorkSnapshot:
         observed_owners: dict[str, str] = {}
         for item in self.work_items:
             for source in item.sources:
-                previous = observed_owners.setdefault(source.source_id, item.work_id)
-                if previous != item.work_id:
+                owner = work_key(item.repo, item.work_id)
+                previous = observed_owners.setdefault(source.source_id, owner)
+                if previous != owner:
                     raise ValueError(
-                        f"ownership collision for {source.source_id}: {previous}, {item.work_id}"
+                        f"ownership collision for {source.source_id}: {previous}, {owner}"
                     )
                 declared = self.source_owners.get(source.source_id)
-                if declared is not None and declared != item.work_id:
+                if declared is not None and declared != owner:
                     raise ValueError(f"ownership collision for {source.source_id}")
         for exclusion in self.exclusions:
             if not isinstance(exclusion, Mapping):

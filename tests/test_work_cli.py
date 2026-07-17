@@ -99,6 +99,27 @@ def test_cortex_work_show_json_and_explain(capsys):
     ]
 
 
+def test_cortex_work_show_passes_repo_for_composite_identity(capsys):
+    payload = _envelope([])
+    payload.pop("items")
+    payload["item"] = _item("shared", "todo")
+    client = FakeClient([{"ok": True, "data": payload}])
+
+    assert cli.main(
+        ["work", "show", "shared", "--repo", "example/acme", "--json"],
+        work_client=client,
+    ) == 0
+
+    assert json.loads(capsys.readouterr().out)["item"]["work_id"] == "shared"
+    assert client.requests == [
+        {
+            "kind": "get_work_item",
+            "work_id": "shared",
+            "repo": "example/acme",
+        }
+    ]
+
+
 def test_cortex_work_show_reports_socket_error_to_stderr(capsys):
     client = FakeClient([{"ok": False, "error": "unknown work item"}])
     assert cli.main(["work", "show", "missing"], work_client=client) == 1

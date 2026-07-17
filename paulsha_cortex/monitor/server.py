@@ -35,7 +35,12 @@ from pathlib import Path
 from typing import Iterable
 
 from .snapshot import ChangeEvent, SnapshotStore
-from .work_api import WORK_API_SCHEMA, WorkChangeEvent, WorkReadModelStore
+from .work_api import (
+    WORK_API_SCHEMA,
+    AmbiguousWorkItemError,
+    WorkChangeEvent,
+    WorkReadModelStore,
+)
 
 ACCEPT_TIMEOUT_SECONDS = 0.25
 SUBSCRIBE_QUEUE_GET_TIMEOUT = 0.25
@@ -400,15 +405,25 @@ class MonitorServer:
         if store is None:
             return
         work_id = request.get("work_id")
+        repo = request.get("repo")
         if not isinstance(work_id, str) or not work_id:
             _write_line(conn, _error("work_id is required"))
             return
+        if repo is not None and (not isinstance(repo, str) or not repo):
+            _write_line(conn, _error("repo must be a non-empty string"))
+            return
         try:
             data = (
-                store.explain_work_item(work_id)
+                store.explain_work_item(work_id, repo=repo)
                 if explain
-                else store.get_work_item(work_id)
+                else store.get_work_item(work_id, repo=repo)
             )
+        except AmbiguousWorkItemError:
+            _write_line(
+                conn,
+                _error(f"ambiguous work item: {work_id}; specify repo"),
+            )
+            return
         except KeyError:
             _write_line(conn, _error(f"unknown work item: {work_id}"))
             return

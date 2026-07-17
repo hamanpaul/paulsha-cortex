@@ -98,6 +98,7 @@ def _build_work_parser() -> argparse.ArgumentParser:
     work_sub = work.add_subparsers(dest="work_command", required=True)
     show = work_sub.add_parser("show", help="顯示單一 Work Item")
     show.add_argument("work_id")
+    show.add_argument("--repo", default=None, help="指定 owner/repo 以消除同名歧義")
     show.add_argument("--json", action="store_true", help="輸出 cortex-work/v1 JSON")
     show.add_argument("--explain", action="store_true", help="附 correlation/reducer 解釋")
     return parser
@@ -121,6 +122,8 @@ def _work_read_main(args: list[str], *, work_client=None) -> int:
             "kind": "explain_work_item" if parsed.explain else "get_work_item",
             "work_id": parsed.work_id,
         }
+        if parsed.repo is not None:
+            request["repo"] = parsed.repo
     try:
         response = client.request(request)
     except (OSError, RuntimeError) as error:
@@ -144,7 +147,11 @@ def _work_read_main(args: list[str], *, work_client=None) -> int:
                 f"{item.get('state', '-')}\t{item.get('phase') or '-'}\t{facets}"
             )
             if parsed.explain:
-                explanation = data.get("explanations", {}).get(item.get("work_id"), {})
+                identity = f"{item.get('repo')}::{item.get('work_id')}"
+                explanation = data.get("explanations", {}).get(
+                    identity,
+                    data.get("explanations", {}).get(item.get("work_id"), {}),
+                )
                 print(json.dumps(explanation, ensure_ascii=False, sort_keys=True))
     else:
         item = data.get("item", {})

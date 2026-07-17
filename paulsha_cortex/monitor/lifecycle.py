@@ -181,7 +181,9 @@ def project_work_items(
                 phase=prior.phase if prior is not None and workflows else None,
                 facets=decision.facets,
                 sources=group.sources,
-                next_actions=("start",) if decision.state == "todo" else (),
+                next_actions=("start",)
+                if decision.state == "todo" and group.confidence == "confirmed"
+                else (),
                 workflow_run_id=workflow.ref if workflow is not None else None,
                 updated_at=updated_at,
             )

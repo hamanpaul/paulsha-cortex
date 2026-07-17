@@ -47,6 +47,7 @@ class ProjectMonitorService:
         self._work_refresher = work_refresher or WorkModelRefresher(
             durable_store=self._durable_work_store,
             read_store=self._work_store,
+            stale_after_seconds=config.provider_stale_after_seconds,
         )
         self._server = server or MonitorServer(
             store=self._store,

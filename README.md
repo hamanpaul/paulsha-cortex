@@ -119,9 +119,16 @@ Cortex 不是 Jira / Notion 式的任務資料庫，而是以檔案為主的 Age
 | Spec | 任務意圖、plan、相依、驗證契約 | `~/.agents/specs/*.md` / `cortex ready` |
 | Job | 一次 Agent process 執行嘗試 | `cortex jobs` / `cortex stat` |
 | Slice | 從 build、verification、review 到交付的生命週期 | `cortex status` 的 `slices` / `attention` |
-| Project Monitor | 從專案 workstream / todo / archive 推導的專案進度 | `cortex monitor --once` |
+| Project Monitor | 從 GitHub、Todo／spec／plan、active OpenSpec 與 workflow registry 投影跨 repo Work Item | `cortex list` / `cortex work show` |
 
-Project Monitor 不會代替 coordinator 狀態：前者觀察專案文件，後者追蹤 Agent 執行與交付 gate。
+Project Monitor 不會代替 coordinator 狀態：前者提供 `topic`／`todo`／`on-going`／`done` read model，後者仍是 workflow 的唯一 writer。可用下列 read-only CLI 查詢；同一 `work-id` 若跨 repo 重複，`show` 必須加 `--repo`：
+
+```bash
+cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
+cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
+```
+
+Monitor 只允許 confirmed association 提供 `start` authority；inferred 分組只顯示。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state、加上 degraded facet，並在 `cortex-work/v1.hard_gates` 關閉 auto claim 與 merge。
 
 Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
 
