@@ -149,6 +149,7 @@ def test_remote_closure_is_strict_conjunction() -> None:
     facts = RemoteClosureFacts(
         merge_commit="c" * 40,
         merge_is_ancestor=True,
+        merge_is_merge_commit=True,
         issue_states={14: "closed"},
         active_openspec_absent=True,
         archive_present=True,
@@ -158,6 +159,7 @@ def test_remote_closure_is_strict_conjunction() -> None:
     assert evaluate_remote_closure(facts=facts, required_issues=(14,)).allowed
     for field in (
         "merge_is_ancestor",
+        "merge_is_merge_commit",
         "active_openspec_absent",
         "archive_present",
         "todo_complete",

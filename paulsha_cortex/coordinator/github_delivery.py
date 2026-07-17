@@ -140,6 +140,7 @@ def build_merge_argv(*, pr_number: int) -> list[str]:
 class RemoteClosureFacts:
     merge_commit: str
     merge_is_ancestor: bool
+    merge_is_merge_commit: bool
     issue_states: Mapping[int, str]
     active_openspec_absent: bool
     archive_present: bool
@@ -155,6 +156,8 @@ def evaluate_remote_closure(
     reasons: list[str] = []
     if len(facts.merge_commit) != 40 or not facts.merge_is_ancestor:
         reasons.append("merge-ancestry-unverified")
+    if not facts.merge_is_merge_commit:
+        reasons.append("merge-commit-required")
     if any(facts.issue_states.get(issue) != "closed" for issue in required_issues):
         reasons.append("issue-not-closed")
     if not facts.active_openspec_absent:
@@ -421,6 +424,11 @@ class GitHubDeliveryClient:
         )
         if not isinstance(comparison, dict):
             raise RuntimeError("GitHub ancestry comparison malformed")
+        merge_payload = self._api(f"repos/{repo}/git/commits/{merge_commit}")
+        if not isinstance(merge_payload, dict) or not isinstance(
+            merge_payload.get("parents"), list
+        ):
+            raise RuntimeError("GitHub merge commit payload malformed")
         issue_states: dict[int, str] = {}
         for issue in required_issues:
             payload = self._api(f"repos/{repo}/issues/{issue}")
@@ -432,6 +440,7 @@ class GitHubDeliveryClient:
         return RemoteClosureFacts(
             merge_commit=merge_commit,
             merge_is_ancestor=comparison.get("status") in {"ahead", "identical"},
+            merge_is_merge_commit=len(merge_payload["parents"]) >= 2,
             issue_states=issue_states,
             active_openspec_absent=active_absent,
             archive_present=archive_present,

@@ -97,6 +97,8 @@ class FakeRunner:
             return Result({"default_branch": "main"})
         if f"compare/{MERGE}...main" in endpoint:
             return Result({"status": "ahead"})
+        if f"git/commits/{MERGE}" in endpoint:
+            return Result({"parents": [{"sha": "1" * 40}, {"sha": "2" * 40}]})
         if "repos/acme/demo/issues/14" in endpoint:
             return Result({"state": "closed"})
         raise AssertionError(f"unexpected argv: {argv}")
@@ -132,6 +134,7 @@ def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive() -> No
     )
     assert facts.merge_commit == MERGE
     assert facts.merge_is_ancestor
+    assert facts.merge_is_merge_commit
     assert facts.issue_states == {14: "closed"}
     assert facts.archive_present
 
