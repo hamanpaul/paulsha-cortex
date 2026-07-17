@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
 import json
 import re
 import subprocess
@@ -103,7 +105,6 @@ class RepoWorkProvider:
         )
 
     def _scan_observations(self, sources: Sequence[WorkSource]) -> dict:
-        closure: dict[str, dict[str, bool]] = {}
         signals: list[dict[str, object]] = []
         for source in sources:
             if source.kind not in {
@@ -139,14 +140,7 @@ class RepoWorkProvider:
                     "weight": 1.0,
                 }
             )
-            task_files = [path for path in paths_to_check if path.name in {"todo.md", "tasks.md"}]
-            if task_files:
-                complete = all(_markdown_tasks_complete(path) for path in task_files)
-                facts = closure.setdefault(work_id, {})
-                facts["todo_tasks_complete"] = (
-                    facts.get("todo_tasks_complete", True) and complete
-                )
-        return {"closure_by_work": closure, "inferred_signals": signals}
+        return {"inferred_signals": signals}
 
     def _scan_sources(self) -> tuple[WorkSource, ...]:
         definitions = (
@@ -258,14 +252,27 @@ class WorkflowRegistryProvider:
             payload = json.loads(raw)
             if not isinstance(payload, Mapping):
                 raise ValueError("registry root must be an object")
-            rows = payload.get("workflow_runs", payload.get("workflows", []))
-            if not isinstance(rows, list):
-                raise ValueError("workflow_runs must be an array")
+            version = payload.get("schema_version")
+            if version == 1:
+                _validate_workflow_v1_root(payload)
+                return ProviderSnapshot(
+                    provider_id=self.provider_id,
+                    status="ok",
+                    last_attempt_at=attempted_at,
+                    last_success_at=attempted_at,
+                    revision=f"registry-sha256:{_digest((raw,))}",
+                    diagnostics=(),
+                    sources=(),
+                    observations={},
+                )
+            _validate_workflow_v2_root(payload)
+            rows = payload["workflow_runs"]
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
             closure: dict[str, dict[str, bool]] = {}
             for row in rows:
-                if not isinstance(row, Mapping) or row.get("repo") != self.repo:
+                _validate_workflow_v2_row(row)
+                if row.get("repo") != self.repo:
                     continue
                 run_id = _nonempty(row.get("run_id"), "run_id")
                 work_id = _nonempty(row.get("work_id"), "work_id")
@@ -283,7 +290,7 @@ class WorkflowRegistryProvider:
                     )
                 )
                 links[source_id] = work_id
-                if _workflow_completion_record_valid(row):
+                if _workflow_completion_record_valid(row, state_path=self.state_path):
                     closure.setdefault(work_id, {})["completion_record_valid"] = True
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             return ProviderSnapshot(
@@ -314,40 +321,125 @@ def _nonempty(value: object, field: str) -> str:
     return value
 
 
-def _workflow_completion_record_valid(row: Mapping) -> bool:
-    record_path = row.get("completion_record_path")
-    if record_path is None:
-        # Registry v2 may persist the Manager's validated result directly.
-        return row.get("completion_record_valid") is True
+_WORKFLOW_V1_KEYS = frozenset({"schema_version", "seq", "jobs", "slices"})
+_WORKFLOW_V2_KEYS = frozenset(
+    {"schema_version", "sequence", "workflow_runs", "legacy_records"}
+)
+_WORKFLOW_V2_REQUIRED_ROW_KEYS = frozenset({"run_id", "repo", "work_id"})
+_WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
+    {
+        "status", "current_phase", "claim_key", "combo", "steps", "issue_refs",
+        "openspec_refs", "pr_refs", "attempts", "evidence", "facets",
+        "created_at", "updated_at", "completion_record_path",
+        "completion_record_hash", "completion_record_revision",
+    }
+)
+
+
+def _validate_workflow_v1_root(payload: Mapping) -> None:
+    if set(payload) != _WORKFLOW_V1_KEYS:
+        raise ValueError("workflow registry v1 root keys are invalid")
+    if (
+        isinstance(payload.get("seq"), bool)
+        or not isinstance(payload.get("seq"), int)
+        or not isinstance(payload.get("jobs"), list)
+        or not isinstance(payload.get("slices"), list)
+    ):
+        raise ValueError("workflow registry v1 root values are invalid")
+
+
+def _validate_workflow_v2_root(payload: Mapping) -> None:
+    if payload.get("schema_version") != 2:
+        raise ValueError("unsupported workflow registry schema_version")
+    if set(payload) != _WORKFLOW_V2_KEYS:
+        raise ValueError("workflow registry v2 root keys are invalid")
+    sequence = payload.get("sequence")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("workflow registry sequence must be a non-negative integer")
+    if not isinstance(payload.get("workflow_runs"), list):
+        raise ValueError("workflow_runs must be an array")
+    legacy = payload.get("legacy_records")
+    if (
+        not isinstance(legacy, Mapping)
+        or set(legacy) != {"jobs", "slices"}
+        or not isinstance(legacy.get("jobs"), list)
+        or not isinstance(legacy.get("slices"), list)
+    ):
+        raise ValueError("workflow registry legacy_records are invalid")
+
+
+def _validate_workflow_v2_row(row: object) -> None:
+    if not isinstance(row, Mapping):
+        raise ValueError("workflow run must be an object")
+    keys = set(row)
+    if not _WORKFLOW_V2_REQUIRED_ROW_KEYS.issubset(keys):
+        raise ValueError("workflow run misses required keys")
+    if keys - _WORKFLOW_V2_REQUIRED_ROW_KEYS - _WORKFLOW_V2_OPTIONAL_ROW_KEYS:
+        raise ValueError("workflow run contains unsupported keys")
+    if "status" not in row and "current_phase" not in row:
+        raise ValueError("workflow run requires status or current_phase")
+
+
+def _workflow_completion_record_valid(
+    row: Mapping, *, state_path: Path
+) -> bool:
+    fields = (
+        row.get("completion_record_path"),
+        row.get("completion_record_hash"),
+        row.get("completion_record_revision"),
+    )
+    if all(value is None for value in fields):
+        return False
+    if any(value is None for value in fields):
+        raise ValueError("completion record path/hash/revision must be supplied together")
+    record_path, expected_hash, expected_revision = fields
     if not isinstance(record_path, str) or not record_path:
         raise ValueError("completion_record_path must be a non-empty string")
-    expected_hash = row.get("completion_record_hash")
-    if expected_hash is not None and (not isinstance(expected_hash, str) or not expected_hash):
-        raise ValueError("completion_record_hash must be null or a non-empty string")
+    if not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash) is None:
+        raise ValueError("completion_record_hash must be a 64-char hex digest")
+    if not isinstance(expected_revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", expected_revision) is None:
+        raise ValueError("completion_record_revision must be a 40-char commit SHA")
+    path = Path(record_path)
+    if path.is_symlink():
+        raise ValueError("completion_record_path must not be a symlink")
+    resolved = path.resolve(strict=True)
+    allowed_root = (state_path.parent / "evidence" / "completion").resolve()
+    try:
+        resolved.relative_to(allowed_root)
+    except ValueError as error:
+        raise ValueError("completion_record_path escapes coordinator completion root") from error
     from paulsha_cortex.coordinator.completion import read_completion_record
 
-    read_completion_record(record_path, expected_hash=expected_hash)
+    record = read_completion_record(resolved, expected_hash=expected_hash.lower())
+    if record.get("candidate") != expected_revision.lower():
+        raise ValueError("completion record revision mismatch")
     return True
 
 
 def _frontmatter_work_item(path: Path) -> str | None:
-    text = path.read_text(encoding="utf-8")
+    return _frontmatter_work_item_text(path.read_text(encoding="utf-8"), source=str(path))
+
+
+def _frontmatter_work_item_text(text: str, *, source: str) -> str | None:
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return None
     try:
         end = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
     except StopIteration:
-        raise ValueError(f"unterminated frontmatter: {path}")
+        raise ValueError(f"unterminated frontmatter: {source}")
     payload = yaml.safe_load("\n".join(lines[1:end])) or {}
     if not isinstance(payload, Mapping):
-        raise ValueError(f"frontmatter must be an object: {path}")
+        raise ValueError(f"frontmatter must be an object: {source}")
     value = payload.get("work_item")
     return value if isinstance(value, str) and value else None
 
 
 def _markdown_tasks_complete(path: Path) -> bool:
-    text = path.read_text(encoding="utf-8")
+    return _markdown_tasks_complete_text(path.read_text(encoding="utf-8"))
+
+
+def _markdown_tasks_complete_text(text: str) -> bool:
     tasks = re.findall(r"^\s*[-*]\s+\[([ xX])\]", text, flags=re.MULTILINE)
     return bool(tasks) and all(marker.lower() == "x" for marker in tasks)
 
@@ -487,13 +579,14 @@ class GitHubWorkProvider:
             status=state,
             confidence="confirmed",
             provider=self.provider_id,
+            title=title,
         )
 
 
 class GitHubTerminalProvider:
     """Read closing references and remote default-branch archive evidence."""
 
-    _QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name} pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage} nodes{number body state mergedAt mergeCommit{oid} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
+    _QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage} nodes{number body headRefName state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
 
     def __init__(
         self,
@@ -524,12 +617,20 @@ class GitHubTerminalProvider:
             if pulls["pageInfo"]["hasNextPage"]:
                 raise ValueError("pull request pagination incomplete")
             default_branch = repository["defaultBranchRef"]["name"]
+            default_revision = repository["defaultBranchRef"]["target"]["oid"]
+            if re.fullmatch(r"[0-9a-fA-F]{40}", default_revision) is None:
+                raise ValueError("default branch revision is invalid")
             tree = self._json(
                 (
                     "gh", "api", "--method", "GET",
-                    f"repos/{self.repo}/git/trees/{default_branch}?recursive=1",
+                    f"repos/{self.repo}/git/trees/{default_revision}?recursive=1",
                 )
             )
+            if tree.get("truncated") is not False:
+                raise ValueError("default branch tree is truncated")
+            if not isinstance(tree.get("tree"), list):
+                raise ValueError("default branch tree entries are invalid")
+            remote_todos = self._remote_todos(tree)
             paths = {
                 row["path"]
                 for row in tree["tree"]
@@ -551,8 +652,13 @@ class GitHubTerminalProvider:
             }
             links: dict[str, str] = {}
             closure: dict[str, dict[str, bool]] = {}
+            branches: list[dict[str, str]] = []
             for pull in pulls["nodes"]:
                 number = pull["number"]
+                pr_source_id = f"github_pr:{self.repo}#{number}"
+                head_ref = pull.get("headRefName")
+                if isinstance(head_ref, str) and head_ref:
+                    branches.append({"source_id": pr_source_id, "ref": head_ref})
                 closing = pull["closingIssuesReferences"]
                 if closing["pageInfo"]["hasNextPage"]:
                     raise ValueError("closing issue pagination incomplete")
@@ -562,7 +668,7 @@ class GitHubTerminalProvider:
                 explicit_work_id = _pr_work_id(pull.get("body"))
                 primary_issue_source = f"github_issue:{self.repo}#{issues[0]['number']}"
                 work_id = explicit_work_id or f"@source:{primary_issue_source}"
-                links[f"github_pr:{self.repo}#{number}"] = (
+                links[pr_source_id] = (
                     explicit_work_id or primary_issue_source
                 )
                 for issue in issues:
@@ -571,11 +677,28 @@ class GitHubTerminalProvider:
                         links[issue_source] = explicit_work_id
                     elif issue_source != primary_issue_source:
                         links[issue_source] = primary_issue_source
+                merge = pull.get("mergeCommit") or {}
+                merge_revision = merge.get("oid")
+                parent_count = (merge.get("parents") or {}).get("totalCount")
+                merge_commit = bool(
+                    pull.get("state") == "MERGED"
+                    and pull.get("mergedAt")
+                    and isinstance(merge_revision, str)
+                    and re.fullmatch(r"[0-9a-fA-F]{40}", merge_revision)
+                    and isinstance(parent_count, int)
+                    and not isinstance(parent_count, bool)
+                    and parent_count >= 2
+                )
+                if merge_commit:
+                    comparison = self._json(
+                        (
+                            "gh", "api", "--method", "GET",
+                            f"repos/{self.repo}/compare/{merge_revision}...{default_revision}",
+                        )
+                    )
+                    merge_commit = comparison.get("status") in {"ahead", "identical"}
                 closure[work_id] = {
-                    "pr_merged_with_merge_commit": bool(
-                        pull.get("mergedAt") and (pull.get("mergeCommit") or {}).get("oid")
-                    ),
-                    "issues_all_closed": all(issue.get("state") == "CLOSED" for issue in issues),
+                    "pr_merged_with_merge_commit": merge_commit,
                 }
         except subprocess.TimeoutExpired:
             return self._failure(attempted_at, "github terminal timeout")
@@ -590,6 +713,11 @@ class GitHubTerminalProvider:
                 "active": sorted(active_changes),
                 "archived": sorted(archived_changes),
             },
+            "remote_openspec_observed": True,
+            "default_branch": default_branch,
+            "default_revision": default_revision.lower(),
+            "remote_todos": remote_todos,
+            "branches": branches,
         }
         return ProviderSnapshot(
             provider_id=self.provider_id,
@@ -622,6 +750,52 @@ class GitHubTerminalProvider:
             sources=(),
             observations={},
         )
+
+    def _remote_todos(self, tree: Mapping) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for entry in tree.get("tree", []):
+            if not isinstance(entry, Mapping):
+                continue
+            path = entry.get("path")
+            revision = entry.get("sha")
+            if (
+                not isinstance(path, str)
+                or re.fullmatch(r"docs/superpowers/workstreams/.+/todo\.md", path) is None
+            ):
+                continue
+            if entry.get("type") != "blob" or not isinstance(revision, str) or re.fullmatch(
+                r"[0-9a-fA-F]{40}", revision
+            ) is None:
+                raise ValueError("remote Todo tree entry is invalid")
+            blob = self._json(
+                (
+                    "gh", "api", "--method", "GET",
+                    f"repos/{self.repo}/git/blobs/{revision}",
+                )
+            )
+            if blob.get("encoding") != "base64" or blob.get("sha") != revision:
+                raise ValueError("remote Todo blob revision mismatch")
+            content = blob.get("content")
+            if not isinstance(content, str):
+                raise ValueError("remote Todo blob content is invalid")
+            try:
+                text = base64.b64decode(
+                    re.sub(r"\s+", "", content), validate=True
+                ).decode("utf-8")
+            except (binascii.Error, UnicodeDecodeError) as error:
+                raise ValueError("remote Todo blob content is invalid") from error
+            work_id = _frontmatter_work_item_text(text, source=f"github:{path}@{revision}")
+            if work_id is None:
+                continue
+            rows.append(
+                {
+                    "work_id": work_id,
+                    "path": path,
+                    "revision": revision.lower(),
+                    "complete": _markdown_tasks_complete_text(text),
+                }
+            )
+        return sorted(rows, key=lambda row: (str(row["work_id"]), str(row["path"])))
 
 
 def _pr_work_id(body: object) -> str | None:

@@ -12,6 +12,7 @@ from paulsha_cortex.monitor.work_api import (
     WorkReadModelStore,
 )
 from paulsha_cortex.monitor.models import ProjectState
+from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
 from paulsha_cortex.monitor.work_models import ProviderSnapshot, WorkItem, WorkSource
 from paulsha_cortex.monitor.work_snapshot import WorkSnapshot, WorkSnapshotStore
 
@@ -169,17 +170,28 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
     gh = _provider(
         "github:example/acme",
         (issue,),
+    )
+    terminal = _provider(
+        "github-terminal:example/acme",
         observations={
             "closing_links": {issue.source_id: "work"},
             "closure_by_work": {
                 "work": {
                     "pr_merged_with_merge_commit": True,
-                    "issues_all_closed": True,
                     "remote_active_openspec_absent": True,
                     "remote_archive_present": True,
-                    "todo_tasks_complete": True,
                 }
             },
+            "remote_openspec": {"active": [], "archived": ["work"]},
+            "remote_openspec_observed": True,
+            "remote_todos": [
+                {
+                    "work_id": "work",
+                    "path": "docs/superpowers/workstreams/work/todo.md",
+                    "revision": "c" * 40,
+                    "complete": True,
+                }
+            ],
         },
     )
     registry = _provider(
@@ -196,9 +208,7 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
         durable_store=durable,
         read_store=store,
         github_provider_factory=lambda _repo: _StaticProvider(gh),
-        github_terminal_provider_factory=lambda _repo: _StaticProvider(
-            _provider("github-terminal:example/acme")
-        ),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(terminal),
         workflow_provider_factory=lambda _repo: _StaticProvider(registry),
         now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
     )
@@ -217,6 +227,125 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
     refresher.workflow_provider_factory = lambda _repo: _StaticProvider(completed)
     refresher.refresh((project,), include_github=True)
     assert store.get_work_item("work", repo="example/acme")["item"]["state"] == "done"
+
+
+def test_strict_closure_conjoins_all_confirmed_group_issues(tmp_path):
+    repo = tmp_path / "repo"
+    override = repo / ".cortex/work-items.yaml"
+    override.parent.mkdir(parents=True)
+    override.write_text(
+        """version: 1
+work_items:
+  work:
+    title: Work
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_issue
+        ref: example/acme#8
+      - kind: github_pr
+        ref: example/acme#9
+    excludes: []
+""",
+        encoding="utf-8",
+    )
+    sources = tuple(
+        WorkSource(
+            source_id=f"{kind}:example/acme#{number}",
+            kind=kind,
+            ref=f"example/acme#{number}",
+            revision=f"github:{number}",
+            status=status,
+            confidence="confirmed",
+            provider="github:example/acme",
+        )
+        for kind, number, status in (
+            ("github_issue", 7, "closed"),
+            ("github_issue", 8, "open"),
+            ("github_pr", 9, "closed"),
+        )
+    )
+    gh = _provider("github:example/acme", sources)
+    terminal = _provider(
+        "github-terminal:example/acme",
+        observations={
+            "closure_by_work": {
+                "work": {
+                    "pr_merged_with_merge_commit": True,
+                }
+            },
+            "remote_openspec": {"active": [], "archived": ["work"]},
+            "remote_openspec_observed": True,
+            "remote_todos": [
+                {
+                    "work_id": "work",
+                    "path": "docs/superpowers/workstreams/work/todo.md",
+                    "revision": "c" * 40,
+                    "complete": True,
+                }
+            ],
+        },
+    )
+    registry = _provider(
+        "workflow:example/acme",
+        observations={
+            "closure_by_work": {"work": {"completion_record_valid": True}}
+        },
+    )
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(gh),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(terminal),
+        workflow_provider_factory=lambda _repo: _StaticProvider(registry),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+
+    refresher.refresh((project,), include_github=True)
+
+    assert store.get_work_item("work", repo="example/acme")["item"]["state"] != "done"
+
+
+def test_production_fuzzy_title_and_artifact_slug_group_for_display_only(tmp_path):
+    repo = tmp_path / "repo"
+    proposal = repo / "openspec/changes/display-work/proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Proposal\n", encoding="utf-8")
+    issue = WorkSource(
+        source_id="github_issue:example/acme#7",
+        kind="github_issue",
+        ref="example/acme#7",
+        revision="github:i7",
+        status="open",
+        confidence="confirmed",
+        provider="github:example/acme",
+        title="Display Work",
+    )
+    gh = _provider("github:example/acme", (issue,))
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(gh),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github-terminal:example/acme")
+        ),
+        workflow_provider_factory=lambda _repo: _StaticProvider(
+            _provider("workflow:example/acme")
+        ),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+
+    refresher.refresh((project,), include_github=True)
+
+    items = store.list_work_items(include_done=True)["items"]
+    assert [(item["work_id"], len(item["sources"])) for item in items] == [
+        ("display-work", 2)
+    ]
+    assert items[0]["next_actions"] == []
 
 
 def test_stale_github_snapshot_freezes_state_and_closes_automation_gates(tmp_path):
@@ -251,6 +380,46 @@ def test_stale_github_snapshot_freezes_state_and_closes_automation_gates(tmp_pat
         "merge": False,
         "reasons": ["github:example/acme stale"],
     }
+
+
+def test_malformed_workflow_registry_retains_last_good_and_freezes(tmp_path):
+    repo = tmp_path / "repo"
+    spec = repo / "docs/superpowers/specs/work.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("---\nwork_item: work\n---\n# Work\n", encoding="utf-8")
+    state = tmp_path / "coordinator/workflows.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        '{"schema_version":2,"sequence":1,"legacy_records":{"jobs":[],"slices":[]},"workflow_runs":['
+        '{"run_id":"run-1","repo":"example/acme","work_id":"work","status":"build"}]}'
+        ,
+        encoding="utf-8",
+    )
+    durable = WorkSnapshotStore(tmp_path / "snapshot.json")
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=durable,
+        read_store=store,
+        workflow_provider_factory=lambda name: WorkflowRegistryProvider(
+            name, state_path=state
+        ),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+    refresher.refresh((project,), include_github=False)
+    assert store.get_work_item("work", repo="example/acme")["item"]["state"] == "on-going"
+
+    state.write_text(
+        '{"schema_version":99,"sequence":2,"legacy_records":{"jobs":[],"slices":[]},"workflow_runs":[]}', encoding="utf-8"
+    )
+    refresher.refresh((project,), include_github=False)
+
+    item = store.get_work_item("work", repo="example/acme")["item"]
+    assert item["state"] == "on-going"
+    assert "degraded" in item["facets"]
+    provider = durable.load().providers["workflow:example/acme"]
+    assert provider.status == "degraded"
+    assert [source.ref for source in provider.sources] == ["run-1"]
 
 
 def test_multi_item_sequence_is_durable_before_read_model_commit(tmp_path):

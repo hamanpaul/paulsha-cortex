@@ -63,6 +63,7 @@ class WorkSource:
     status: str
     confidence: str
     provider: str
+    title: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("source_id", "ref", "revision", "status", "provider"):
@@ -72,9 +73,11 @@ class WorkSource:
             raise ValueError(f"unsupported WorkSource kind: {self.kind!r}")
         if self.confidence not in SOURCE_CONFIDENCES:
             raise ValueError(f"unsupported source confidence: {self.confidence!r}")
+        if self.title is not None and (not isinstance(self.title, str) or not self.title):
+            raise ValueError("WorkSource.title must be null or a non-empty string")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "source_id": self.source_id,
             "kind": self.kind,
             "ref": self.ref,
@@ -83,6 +86,9 @@ class WorkSource:
             "confidence": self.confidence,
             "provider": self.provider,
         }
+        if self.title is not None:
+            payload["title"] = self.title
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "WorkSource":
@@ -96,6 +102,7 @@ class WorkSource:
             status=_required_string(payload, "status"),
             confidence=_required_string(payload, "confidence"),
             provider=_required_string(payload, "provider"),
+            title=_optional_string(payload, "title"),
         )
 
 

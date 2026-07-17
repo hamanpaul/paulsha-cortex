@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import subprocess
 from pathlib import Path
 
@@ -152,6 +153,7 @@ def test_github_provider_uses_typed_argv_and_json():
         ("github_issue", "example/acme#14", "open"),
         ("github_pr", "example/acme#15", "closed"),
     ]
+    assert result.sources[0].title == "umbrella"
     argv, timeout = runner.calls[0]
     assert argv == (
         "gh",
@@ -208,19 +210,35 @@ def test_github_provider_malformed_json_is_degraded():
     assert any("JSON" in item for item in result.diagnostics)
 
 
-def test_workflow_registry_provider_emits_authoritative_link_and_completion(tmp_path):
+def test_workflow_registry_provider_emits_authoritative_link_and_completion(monkeypatch, tmp_path):
     state = tmp_path / "workflows.json"
+    record = tmp_path / "evidence/completion/record.json"
+    record.parent.mkdir(parents=True)
+    record.write_text("{}", encoding="utf-8")
+    calls = []
+
+    def read_record(path, *, expected_hash=None):
+        calls.append((str(path), expected_hash))
+        return {"candidate": "a" * 40}
+
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.completion.read_completion_record", read_record
+    )
     state.write_text(
         json.dumps(
             {
+                "schema_version": 2,
                 "sequence": 8,
+                "legacy_records": {"jobs": [], "slices": []},
                 "workflow_runs": [
                     {
                         "run_id": "run-7",
                         "repo": "example/acme",
                         "work_id": "work",
                         "status": "review",
-                        "completion_record_valid": True,
+                        "completion_record_path": str(record),
+                        "completion_record_hash": "b" * 64,
+                        "completion_record_revision": "a" * 40,
                     },
                     {
                         "run_id": "foreign",
@@ -241,13 +259,110 @@ def test_workflow_registry_provider_emits_authoritative_link_and_completion(tmp_
     source_id = result.sources[0].source_id
     assert result.observations["workflow_links"] == {source_id: "work"}
     assert result.observations["closure_by_work"]["work"]["completion_record_valid"]
+    assert calls == [(str(record), "b" * 64)]
+
+
+def test_workflow_registry_unknown_schema_and_root_keys_are_degraded(tmp_path):
+    state = tmp_path / "workflows.json"
+    for payload in (
+        {
+            "schema_version": 99,
+            "sequence": 1,
+            "workflow_runs": [],
+            "legacy_records": {"jobs": [], "slices": []},
+        },
+        {
+            "schema_version": 2,
+            "sequence": 1,
+            "workflow_runs": [],
+            "legacy_records": {"jobs": [], "slices": []},
+            "unknown": True,
+        },
+        {"sequence": 1, "workflow_runs": []},
+    ):
+        state.write_text(json.dumps(payload), encoding="utf-8")
+        result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+        assert result.status == "degraded"
+
+
+def test_workflow_registry_explicit_v1_is_compatible_but_never_associated(tmp_path):
+    state = tmp_path / "jobs.json"
+    state.write_text(
+        json.dumps({"schema_version": 1, "seq": 3, "jobs": [], "slices": []}),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert result.sources == ()
+    assert result.observations == {}
+
+
+def test_workflow_registry_rejects_boolean_completion_without_record(tmp_path):
+    state = tmp_path / "workflows.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 1,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-1",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "review",
+                        "completion_record_valid": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "degraded"
+
+
+def test_workflow_registry_rejects_completion_record_outside_safe_root(tmp_path):
+    record = tmp_path / "outside.json"
+    record.write_text("{}", encoding="utf-8")
+    state = tmp_path / "coordinator/workflows.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 1,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-1",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "review",
+                        "completion_record_path": str(record),
+                        "completion_record_hash": "b" * 64,
+                        "completion_record_revision": "a" * 40,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "degraded"
 
 
 def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main"},
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
@@ -256,7 +371,10 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
                             "body": "work_item: work\n",
                             "state": "MERGED",
                             "mergedAt": "2026-07-17T10:00:00Z",
-                            "mergeCommit": {"oid": "a" * 40},
+                            "mergeCommit": {
+                                "oid": "a" * 40,
+                                "parents": {"totalCount": 2},
+                            },
                             "closingIssuesReferences": {
                                 "pageInfo": {"hasNextPage": False},
                                 "nodes": [{"number": 7, "state": "CLOSED"}]
@@ -268,11 +386,14 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
         }
     }
     tree = {
+        "truncated": False,
         "tree": [
             {"path": "openspec/changes/archive/2026-07-17-work/proposal.md"}
         ]
     }
-    runner = SequenceRunner([_completed(graph), _completed(tree)])
+    runner = SequenceRunner(
+        [_completed(graph), _completed(tree), _completed({"status": "ahead"})]
+    )
 
     result = GitHubTerminalProvider("example/acme", runner=runner).scan()
 
@@ -283,9 +404,148 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
     }
     assert result.observations["closure_by_work"]["work"] == {
         "pr_merged_with_merge_commit": True,
-        "issues_all_closed": True,
     }
     assert result.observations["remote_openspec"] == {
         "active": [],
         "archived": ["work"],
     }
+
+
+def test_github_terminal_squash_merge_is_not_a_merge_commit():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "number": 9,
+                            "body": "work_item: work\n",
+                            "state": "MERGED",
+                            "mergedAt": "2026-07-17T10:00:00Z",
+                            "mergeCommit": {
+                                "oid": "a" * 40,
+                                "parents": {"totalCount": 1},
+                            },
+                            "closingIssuesReferences": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"number": 7, "state": "CLOSED"}],
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    runner = SequenceRunner([_completed(graph), _completed({"truncated": False, "tree": []})])
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "ok"
+    assert not result.observations["closure_by_work"]["work"][
+        "pr_merged_with_merge_commit"
+    ]
+
+
+def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "number": 9,
+                            "body": "work_item: work\n",
+                            "state": "MERGED",
+                            "mergedAt": "2026-07-17T10:00:00Z",
+                            "mergeCommit": {"oid": "a" * 40, "parents": {"totalCount": 2}},
+                            "closingIssuesReferences": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"number": 7, "state": "CLOSED"}],
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    runner = SequenceRunner(
+        [
+            _completed(graph),
+            _completed({"truncated": False, "tree": []}),
+            _completed({"status": "diverged"}),
+        ]
+    )
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert not result.observations["closure_by_work"]["work"][
+        "pr_merged_with_merge_commit"
+    ]
+
+
+def test_github_terminal_truncated_tree_is_degraded():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            }
+        }
+    }
+    runner = SequenceRunner(
+        [_completed(graph), _completed({"truncated": True, "tree": []})]
+    )
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "degraded"
+
+
+def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
+    todo = tmp_path / "docs/superpowers/workstreams/work/todo.md"
+    todo.parent.mkdir(parents=True)
+    todo.write_text("---\nwork_item: work\n---\n- [x] local only\n", encoding="utf-8")
+    local = RepoWorkProvider(tmp_path, repo="example/acme").scan()
+    assert local.observations.get("closure_by_work", {}) == {}
+
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            }
+        }
+    }
+    tree = {
+        "truncated": False,
+        "tree": [
+            {
+                "path": "docs/superpowers/workstreams/work/todo.md",
+                "type": "blob",
+                "sha": "c" * 40,
+            }
+        ],
+    }
+    remote_body = "---\nwork_item: work\n---\n- [x] remote task\n"
+    blob = {
+        "encoding": "base64",
+        "content": base64.b64encode(remote_body.encode()).decode(),
+        "sha": "c" * 40,
+    }
+    runner = SequenceRunner([_completed(graph), _completed(tree), _completed(blob)])
+
+    remote = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert remote.status == "ok"
+    assert remote.observations["remote_todos"] == [
+        {
+            "work_id": "work",
+            "path": "docs/superpowers/workstreams/work/todo.md",
+            "revision": "c" * 40,
+            "complete": True,
+        }
+    ]

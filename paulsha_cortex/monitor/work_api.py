@@ -382,11 +382,15 @@ class WorkModelRefresher:
                     source for provider in relevant for source in provider.sources
                 )
                 observations = _merge_observations(relevant)
+                inferred_signals = (
+                    *_parse_inferred_signals(observations),
+                    *_generate_inferred_signals(sources, observations),
+                )
                 correlation = correlate_work_sources(
                     root,
                     repo,
                     sources,
-                    inferred_signals=_parse_inferred_signals(observations),
+                    inferred_signals=inferred_signals,
                     closing_links=observations.get("closing_links", {}),
                     workflow_links=observations.get("workflow_links", {}),
                 )
@@ -465,28 +469,55 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
         "closure_by_work": {},
         "inferred_signals": [],
         "remote_openspec": {"active": [], "archived": []},
+        "remote_openspec_observed": False,
+        "remote_todos": [],
+        "branches": [],
     }
     for provider in providers:
         observations = provider.observations
-        for key in ("closing_links", "workflow_links"):
-            value = observations.get(key, {})
+        if provider.provider_id.startswith("github-terminal:"):
+            value = observations.get("closing_links", {})
             if isinstance(value, Mapping):
-                merged[key].update(value)
+                merged["closing_links"].update(value)
+        if provider.provider_id.startswith("workflow:"):
+            value = observations.get("workflow_links", {})
+            if isinstance(value, Mapping):
+                merged["workflow_links"].update(value)
         closure = observations.get("closure_by_work", {})
         if isinstance(closure, Mapping):
             for work_id, facts in closure.items():
                 if isinstance(work_id, str) and isinstance(facts, Mapping):
-                    merged["closure_by_work"].setdefault(work_id, {}).update(facts)
+                    accepted: dict[str, object] = {}
+                    if provider.provider_id.startswith("github-terminal:"):
+                        if "pr_merged_with_merge_commit" in facts:
+                            accepted["pr_merged_with_merge_commit"] = facts[
+                                "pr_merged_with_merge_commit"
+                            ]
+                    if provider.provider_id.startswith("workflow:"):
+                        if "completion_record_valid" in facts:
+                            accepted["completion_record_valid"] = facts[
+                                "completion_record_valid"
+                            ]
+                    merged["closure_by_work"].setdefault(work_id, {}).update(accepted)
         signals = observations.get("inferred_signals", [])
         if isinstance(signals, list):
             merged["inferred_signals"].extend(signals)
-        remote = observations.get("remote_openspec", {})
-        if isinstance(remote, Mapping):
-            for state in ("active", "archived"):
-                values = remote.get(state, [])
+        if provider.provider_id.startswith("github-terminal:"):
+            remote = observations.get("remote_openspec", {})
+            if isinstance(remote, Mapping):
+                for state in ("active", "archived"):
+                    values = remote.get(state, [])
+                    if isinstance(values, list):
+                        merged["remote_openspec"][state].extend(
+                            value for value in values if isinstance(value, str)
+                        )
+            if observations.get("remote_openspec_observed") is True:
+                merged["remote_openspec_observed"] = True
+            for key in ("remote_todos", "branches"):
+                values = observations.get(key, [])
                 if isinstance(values, list):
-                    merged["remote_openspec"][state].extend(
-                        value for value in values if isinstance(value, str)
+                    merged[key].extend(
+                        value for value in values if isinstance(value, Mapping)
                     )
     return merged
 
@@ -509,6 +540,75 @@ def _parse_inferred_signals(observations: Mapping) -> tuple[InferredSignal, ...]
         except (KeyError, TypeError, ValueError):
             continue
     return tuple(parsed)
+
+
+def _generate_inferred_signals(
+    sources: Sequence, observations: Mapping
+) -> tuple[InferredSignal, ...]:
+    """Generate display-only fuzzy evidence; correlation still owns competition checks."""
+    signals: list[InferredSignal] = []
+    artifacts: list[tuple[object, str]] = []
+    issues: list[tuple[object, str, str]] = []
+    for source in sources:
+        if source.kind == "github_issue" and source.title:
+            slug = _slug(source.title)
+            if slug:
+                issues.append((source, slug, source.ref.rsplit("#", 1)[-1]))
+                signals.append(
+                    InferredSignal(slug, "issue_title", source.title, (source.source_id,), 1.0)
+                )
+        artifact = _artifact_slug(source)
+        if artifact:
+            artifacts.append((source, artifact))
+            signals.append(
+                InferredSignal(
+                    artifact, "artifact_slug", source.ref, (source.source_id,), 1.0
+                )
+            )
+    for issue, _, number in issues:
+        for artifact_source, artifact in artifacts:
+            if re.search(rf"(?<!\d){re.escape(number)}(?!\d)", artifact_source.ref):
+                signals.append(
+                    InferredSignal(
+                        artifact,
+                        "issue_token",
+                        number,
+                        (issue.source_id, artifact_source.source_id),
+                        0.8,
+                    )
+                )
+    for branch in observations.get("branches", []):
+        if not isinstance(branch, Mapping):
+            continue
+        source_id = branch.get("source_id")
+        ref = branch.get("ref")
+        if not isinstance(source_id, str) or not isinstance(ref, str):
+            continue
+        candidate = _slug(ref.rsplit("/", 1)[-1])
+        if candidate:
+            candidate = re.sub(r"^\d+-", "", candidate)
+        if candidate:
+            signals.append(InferredSignal(candidate, "branch_slug", ref, (source_id,), 0.7))
+    unique: dict[tuple[str, str, tuple[str, ...]], InferredSignal] = {}
+    for signal in signals:
+        unique[(signal.work_id, signal.kind, signal.source_ids)] = signal
+    return tuple(unique.values())
+
+
+def _slug(value: str) -> str | None:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug if slug and re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug) else None
+
+
+def _artifact_slug(source) -> str | None:
+    if source.kind == "openspec":
+        return _slug(source.ref)
+    if source.kind not in {"todo", "superpowers_spec", "superpowers_plan"}:
+        return None
+    path = Path(source.ref)
+    value = path.parent.name if path.name == "todo.md" else path.stem
+    value = re.sub(r"^\d{4}-\d{2}-\d{2}-", "", value)
+    return _slug(value)
 
 
 def _parse_closure_evidence(
@@ -534,13 +634,41 @@ def _parse_closure_evidence(
             continue
         facts = combined.setdefault(resolved, {})
         for name in fields:
+            if name in {"issues_all_closed", "todo_tasks_complete"}:
+                continue
             if name in row:
                 facts[name] = row.get(name) is True
     remote = observations.get("remote_openspec", {})
     active = set(remote.get("active", [])) if isinstance(remote, Mapping) else set()
     archived = set(remote.get("archived", [])) if isinstance(remote, Mapping) else set()
+    for todo in observations.get("remote_todos", []):
+        if not isinstance(todo, Mapping):
+            continue
+        work_id = todo.get("work_id")
+        revision = todo.get("revision")
+        if (
+            not isinstance(work_id, str)
+            or not isinstance(revision, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
+            or not isinstance(todo.get("path"), str)
+            or not isinstance(todo.get("complete"), bool)
+        ):
+            continue
+        facts = combined.setdefault(work_id, {})
+        facts["todo_tasks_complete"] = facts.get("todo_tasks_complete", True) and todo["complete"]
+    for group in getattr(correlation, "groups", ()):
+        if group.work_id not in combined:
+            continue
+        issues = [
+            source
+            for source in group.sources
+            if source.kind == "github_issue" and source.confidence == "confirmed"
+        ]
+        combined[group.work_id]["issues_all_closed"] = bool(issues) and all(
+            source.status == "closed" for source in issues
+        )
     for work_id, facts in combined.items():
-        if active or archived:
+        if observations.get("remote_openspec_observed") is True or active or archived:
             facts["remote_active_openspec_absent"] = work_id not in active
             facts["remote_archive_present"] = work_id in archived
     return {

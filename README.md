@@ -128,7 +128,7 @@ cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
 cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
 ```
 
-Monitor 只允許 confirmed association 提供 `start` authority；inferred 分組只顯示。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state、加上 degraded facet，並在 `cortex-work/v1.hard_gates` 關閉 auto claim 與 merge。
+Monitor 只允許 confirmed association 提供 `start` authority；issue title、artifact／branch slug 等 inferred 分組只顯示。`done` 的 Todo completion 只採遠端 default branch blob revision，不採本機 overlay；PR 也必須是至少雙 parent 且可證明已進 default branch 的 merge commit。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state、加上 degraded facet，並在 `cortex-work/v1.hard_gates` 關閉 auto claim 與 merge。
 
 Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
 
