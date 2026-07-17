@@ -73,10 +73,15 @@ class VersionedRegistryTests(unittest.TestCase):
             )
             self.assertEqual(payload["seq"], 1)
             self.assertEqual(payload["slices"], [])
+            self.assertEqual(payload["workflows"], [])
+            self.assertEqual(
+                payload["legacy_records"],
+                {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []},
+            )
             self.assertEqual(len(payload["jobs"]), 1)
             self.assertEqual(
                 set(payload.keys()),
-                {"schema_version", "seq", "jobs", "slices"},
+                {"schema_version", "seq", "jobs", "slices", "workflows", "legacy_records"},
             )
 
     def test_missing_schema_version_is_rejected_without_rewrite(self) -> None:

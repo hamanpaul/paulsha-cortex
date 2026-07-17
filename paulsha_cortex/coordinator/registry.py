@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -8,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from paulsha_cortex.config import paths
+from .workflow import WorkflowRun, WorkflowStep, validate_workflow_phase_transition
 
-COORDINATOR_STATE_SCHEMA_VERSION = 1
+COORDINATOR_STATE_SCHEMA_VERSION = 2
 
 VALID_JOB_STATUSES = frozenset({"dispatched", "running", "exited", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
@@ -85,6 +87,22 @@ def _copy_json_list(value: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_copy_json_object(item) for item in value]
 
 
+def _deepcopy_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _empty_legacy_records() -> dict[str, Any]:
+    return {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []}
+
+
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _migration_error(path: Path, reason: str) -> ValueError:
     return ValueError(
         f"coordinator 狀態檔需要人工 clean start: {path} ({reason}); "
@@ -128,6 +146,8 @@ class JobRegistry:
         self._state_path = Path(state_path) if state_path is not None else _default_state_path()
         self._jobs: list[dict[str, Any]] = []
         self._slices: list[dict[str, Any]] = []
+        self._workflows: list[WorkflowRun] = []
+        self._legacy_records: dict[str, Any] = _empty_legacy_records()
         self._seq = seq_start
         self._load()
 
@@ -135,14 +155,36 @@ class JobRegistry:
         if not self._state_path.is_file():
             return
         try:
-            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+            original = self._state_path.read_bytes()
+            payload = json.loads(original.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(
                 f"coordinator 狀態檔解析失敗（fail-closed）: {self._state_path}: {exc}"
             ) from exc
         if not isinstance(payload, dict):
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         schema_version = payload.get("schema_version")
+        if schema_version == 1:
+            jobs, slices, seq = self._validate_state_records(payload)
+            legacy_records = {
+                "source_schema_version": 1,
+                "seq": seq,
+                "jobs": jobs,
+                "slices": slices,
+            }
+            migrated = {
+                "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
+                "seq": seq,
+                "jobs": [],
+                "slices": [],
+                "workflows": [],
+                "legacy_records": legacy_records,
+            }
+            self._write_v1_backup(original)
+            self._write_payload_atomically(migrated)
+            self._legacy_records = _deepcopy_json(legacy_records)
+            self._seq = max(seq, self._seq)
+            return
         if schema_version != COORDINATOR_STATE_SCHEMA_VERSION:
             if schema_version is None:
                 raise _migration_error(self._state_path, "缺少 schema_version（legacy jobs-only state）")
@@ -150,6 +192,37 @@ class JobRegistry:
                 self._state_path,
                 f"不支援的 schema_version={schema_version!r}",
             )
+        jobs, slices, seq = self._validate_state_records(payload)
+        missing_v2_roots = [key for key in ("workflows", "legacy_records") if key not in payload]
+        if missing_v2_roots:
+            raise ValueError(
+                "coordinator 狀態檔v2缺必要根欄位（fail-closed）: "
+                + ", ".join(missing_v2_roots)
+            )
+        workflows = payload["workflows"]
+        legacy_records = payload["legacy_records"]
+        if not isinstance(workflows, list):
+            raise ValueError(f"coordinator 狀態檔 workflow 格式錯誤（fail-closed）: {self._state_path}")
+        try:
+            validated_workflows = [WorkflowRun.from_dict(run) for run in workflows]
+        except ValueError as exc:
+            raise ValueError(
+                f"coordinator 狀態檔 workflow 格式錯誤（fail-closed）: {self._state_path}: {exc}"
+            ) from exc
+        claim_keys = [run.claim_key for run in validated_workflows]
+        run_ids = [run.run_id for run in validated_workflows]
+        if len(set(claim_keys)) != len(claim_keys) or len(set(run_ids)) != len(run_ids):
+            raise ValueError(f"coordinator 狀態檔 workflow 重複識別（fail-closed）: {self._state_path}")
+        self._validate_legacy_records(legacy_records)
+        self._jobs = jobs
+        self._slices = slices
+        self._workflows = validated_workflows
+        self._legacy_records = _deepcopy_json(legacy_records)
+        self._seq = max(seq, self._seq)
+
+    def _validate_state_records(
+        self, payload: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
         jobs = payload.get("jobs")
         slices = payload.get("slices")
         seq = payload.get("seq", 0)
@@ -158,29 +231,69 @@ class JobRegistry:
         validated_jobs = [self._validate_loaded_job(job) for job in jobs]
         job_ids = {str(job["job_id"]) for job in validated_jobs}
         validated_slices = [self._validate_loaded_slice(slice_row, job_ids) for slice_row in slices]
-        self._jobs = validated_jobs
-        self._slices = validated_slices
-        self._seq = max(seq, self._seq)
+        return validated_jobs, validated_slices, seq
+
+    def _validate_legacy_records(self, value: object) -> None:
+        if not isinstance(value, dict):
+            raise ValueError(f"coordinator 狀態檔 legacy_records 格式錯誤: {self._state_path}")
+        if value.get("source_schema_version") != 1 or not isinstance(value.get("seq"), int):
+            raise ValueError(f"coordinator 狀態檔 legacy_records 格式錯誤: {self._state_path}")
+        jobs = value.get("jobs")
+        slices = value.get("slices")
+        if not isinstance(jobs, list) or not isinstance(slices, list):
+            raise ValueError(f"coordinator 狀態檔 legacy_records 格式錯誤: {self._state_path}")
+        validated_jobs = [self._validate_loaded_job(job) for job in jobs]
+        job_ids = {str(job["job_id"]) for job in validated_jobs}
+        for slice_row in slices:
+            self._validate_loaded_slice(slice_row, job_ids)
+
+    def _write_v1_backup(self, original: bytes) -> Path:
+        directory = self._state_path.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(original).hexdigest()
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = directory / f"{self._state_path.name}.v1.{timestamp}.{digest}.bak"
+        fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".backup.tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o400)
+            os.link(tmp, backup)
+            _fsync_directory(directory)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        tmp.unlink(missing_ok=True)
+        return backup
+
+    def _write_payload_atomically(self, payload: dict[str, Any]) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(self._state_path.parent), suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self._state_path)
+            _fsync_directory(self._state_path.parent)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _persist(self) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
             "seq": self._seq,
             "jobs": self._jobs,
             "slices": self._slices,
+            "workflows": [run.to_dict() for run in self._workflows],
+            "legacy_records": self._legacy_records,
         }
-        fd, tmp = tempfile.mkstemp(dir=str(self._state_path.parent), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, self._state_path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
+        self._write_payload_atomically(payload)
 
     def _validate_loaded_job(self, job: object) -> dict[str, Any]:
         if not isinstance(job, dict) or "job_id" not in job or "status" not in job:
@@ -699,3 +812,119 @@ class JobRegistry:
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
+
+    def _find_workflow_run_index(self, run_id: str) -> int:
+        for index, run in enumerate(self._workflows):
+            if run.run_id == run_id:
+                return index
+        raise KeyError(f"workflow run 不存在: {run_id}")
+
+    def _copy_workflow_run(self, run: WorkflowRun) -> WorkflowRun:
+        return WorkflowRun.from_dict(run.to_dict())
+
+    def list_legacy_records(self) -> dict[str, Any]:
+        return _deepcopy_json(self._legacy_records)
+
+    def list_workflow_runs(self) -> list[WorkflowRun]:
+        return [self._copy_workflow_run(run) for run in self._workflows]
+
+    def get_workflow_run(self, run_id: str) -> WorkflowRun:
+        return self._copy_workflow_run(self._workflows[self._find_workflow_run_index(run_id)])
+
+    def create_workflow_run(
+        self,
+        *,
+        work_id: str,
+        repo: str,
+        claim_key: str,
+        combo: str,
+        current_phase: str,
+        steps: tuple[WorkflowStep, ...],
+        issue_refs: tuple[str, ...] = (),
+        openspec_refs: tuple[str, ...] = (),
+        pr_refs: tuple[str, ...] = (),
+        attempts: dict[str, int] | None = None,
+        evidence_refs: tuple[str, ...] = (),
+        facets: tuple[str, ...] = (),
+        gate_status: str = "pending",
+    ) -> WorkflowRun:
+        for existing in self._workflows:
+            if existing.claim_key != claim_key:
+                continue
+            if existing.work_id != work_id or existing.repo != repo:
+                raise ValueError(f"claim_key 已屬於其他 work item: {claim_key}")
+            return self._copy_workflow_run(existing)
+
+        run_id = f"workflow-{hashlib.sha256(claim_key.encode('utf-8')).hexdigest()[:20]}"
+        if any(run.run_id == run_id for run in self._workflows):
+            raise ValueError(f"workflow run id collision: {run_id}")
+        now = _now_iso()
+        run = WorkflowRun(
+            run_id=run_id,
+            work_id=work_id,
+            repo=repo,
+            claim_key=claim_key,
+            combo=combo,
+            current_phase=current_phase,
+            steps=tuple(steps),
+            issue_refs=tuple(issue_refs),
+            openspec_refs=tuple(openspec_refs),
+            pr_refs=tuple(pr_refs),
+            attempts=dict(attempts or {}),
+            evidence_refs=tuple(evidence_refs),
+            facets=tuple(facets),
+            gate_status=gate_status,
+            created_at=now,
+            updated_at=now,
+        )
+        self._workflows.append(run)
+        try:
+            self._persist()
+        except BaseException:
+            self._workflows.pop()
+            raise
+        return self._copy_workflow_run(run)
+
+    def update_workflow_run(
+        self,
+        run_id: str,
+        *,
+        current_phase: str | None = None,
+        steps: tuple[WorkflowStep, ...] | None = None,
+        issue_refs: tuple[str, ...] | None = None,
+        openspec_refs: tuple[str, ...] | None = None,
+        pr_refs: tuple[str, ...] | None = None,
+        attempts: dict[str, int] | None = None,
+        evidence_refs: tuple[str, ...] | None = None,
+        facets: tuple[str, ...] | None = None,
+        gate_status: str | None = None,
+    ) -> WorkflowRun:
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        next_phase = current.current_phase if current_phase is None else current_phase
+        validate_workflow_phase_transition(current.current_phase, next_phase)
+        updated = WorkflowRun(
+            run_id=current.run_id,
+            work_id=current.work_id,
+            repo=current.repo,
+            claim_key=current.claim_key,
+            combo=current.combo,
+            current_phase=next_phase,
+            steps=current.steps if steps is None else tuple(steps),
+            issue_refs=current.issue_refs if issue_refs is None else tuple(issue_refs),
+            openspec_refs=current.openspec_refs if openspec_refs is None else tuple(openspec_refs),
+            pr_refs=current.pr_refs if pr_refs is None else tuple(pr_refs),
+            attempts=dict(current.attempts if attempts is None else attempts),
+            evidence_refs=current.evidence_refs if evidence_refs is None else tuple(evidence_refs),
+            facets=current.facets if facets is None else tuple(facets),
+            gate_status=current.gate_status if gate_status is None else gate_status,
+            created_at=current.created_at,
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        try:
+            self._persist()
+        except BaseException:
+            self._workflows[index] = current
+            raise
+        return self._copy_workflow_run(updated)
