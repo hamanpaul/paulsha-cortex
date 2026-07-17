@@ -113,8 +113,8 @@ python3 -m pytest -q tests/test_workflow_registry.py tests/test_deck_schema.py t
 3. RED-testagy argv含print/plan/sandbox且沒有unsafe bypass；capability probe failure不視為available。
 4. Implement planner gate與immutable evidence；brainstorm evidence不能填ForeignReview ref。
 5. RED-test並實作manifest per-card durable Job、periodic terminal resume與canonical coordinator-root evidence；control caller不得提供path/hash。
-6. RED-test所有planner（含manifest plan card）的disposable strict-read-only checkout/finally rollback，snapshot涵蓋empty dirs、directory symlinks與metadata；實作current work/change/manifest-bound staging、新檔no-clobber、既有TBD baseline-hash CAS replacement，以及artifact/evidence/registry phase的intent-journal transaction/restart reconcile。
-7. RED-testverify/review必須產生符合manifest glob的真實report；canonical evidence locator不得替代report output。
+6. RED-test所有planner（含manifest plan card）的disposable strict-read-only checkout/finally rollback，snapshot涵蓋empty dirs、directory symlinks、mode與xattrs，PermissionError仍無條件還原且restore fault fail-closed；scan時持久化canonical ref/kind/work item/hash authority，新檔no-clobber、既有TBD只依persisted authority CAS replacement。Intent journal須記immutable/idempotent evidence operation與expected gate ref；registry未commit才rollback，已commit逐operation驗證，drift保留journal並設`needs_human`。
+7. RED-testdispatch保存output目錄baseline；verify/review必須產生符合manifest glob、該job新建或baseline CAS更新且frontmatter綁run/card/Candidate的真實report；canonical evidence保存current/baseline hash，locator不得替代report output。
 8. Run PR B full gates與independent review，更新OpenSpec Task 2。
 
 ---

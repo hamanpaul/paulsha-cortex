@@ -118,7 +118,33 @@ def _copy_planning_sandbox(worktree: Path, destination: Path) -> None:
     )
 
 
+def _make_tree_traversable(root: Path) -> None:
+    """Restore enough owner access to inspect and replace a hostile tree.
+
+    The launcher can chmod directories through an absolute path.  Never follow
+    symlinks while recovering access; the immutable baseline restores the
+    original metadata after the polluted entries have been removed.
+    """
+
+    if root.is_symlink():
+        raise RuntimeError("planning recovery root cannot be a symlink")
+    os.chmod(root, 0o700, follow_symlinks=False)
+
+    def visit(directory: Path) -> None:
+        os.chmod(directory, 0o700, follow_symlinks=False)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name == ".git" or entry.is_symlink():
+                    continue
+                path = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    visit(path)
+
+    visit(root)
+
+
 def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
+    _make_tree_traversable(worktree)
     for child in worktree.iterdir():
         if child.name == ".git":
             continue
@@ -135,6 +161,8 @@ def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
         else:
             shutil.copy2(source, target)
     shutil.copystat(baseline, worktree, follow_symlinks=False)
+    if _tree_snapshot(worktree) != _tree_snapshot(baseline):
+        raise RuntimeError("planning operator restore verification failed")
 
 
 def _extract_json(stdout: str, output_path: Path) -> object:
@@ -197,11 +225,32 @@ def _invoke_json(
         except BaseException as exc:
             failure = exc
         finally:
-            if _tree_snapshot(sandbox) != sandbox_before:
+            try:
+                sandbox_dirty = _tree_snapshot(sandbox) != sandbox_before
+            except BaseException:
+                sandbox_dirty = True
+                try:
+                    _make_tree_traversable(sandbox)
+                except BaseException:
+                    pass
+            if sandbox_dirty:
                 failure = ValueError("planning launcher modified disposable read-only sandbox")
-            if _tree_snapshot(worktree) != operator_before:
-                _restore_operator_tree(worktree, baseline)
-                failure = ValueError("planning launcher modified operator worktree; changes rolled back")
+
+            operator_dirty = False
+            try:
+                operator_dirty = _tree_snapshot(worktree) != operator_before
+            except BaseException:
+                operator_dirty = True
+            if operator_dirty:
+                try:
+                    _restore_operator_tree(worktree, baseline)
+                except BaseException as exc:
+                    failure = RuntimeError("planning operator restore failed")
+                    failure.__cause__ = exc
+                else:
+                    failure = ValueError(
+                        "planning launcher modified operator worktree; changes rolled back"
+                    )
         if failure is not None:
             raise failure
         return result

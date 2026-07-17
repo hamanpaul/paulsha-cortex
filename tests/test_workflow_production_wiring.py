@@ -17,6 +17,7 @@ from paulsha_cortex.coordinator.model_identities import CapabilityProbe, Identit
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import (
     GateEvidenceRef,
+    PlanningArtifactAuthority,
     WorkflowManifest,
     WorkflowRun,
     WorkflowStep,
@@ -171,7 +172,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             elif phase == "verify":
                 report = tmp_path / "reports/verify/production-wiring.md"
                 report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text("# Verification\n\nPassed.\n", encoding="utf-8")
+                report.write_text(
+                    "---\n"
+                    f"workflow_run_id: {contract_payload['run_id']}\n"
+                    f"workflow_card_id: {card}\n"
+                    f"candidate: {candidate}\n"
+                    "---\n# Verification\n\nPassed.\n",
+                    encoding="utf-8",
+                )
                 evidence = {
                     "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
                     "slice_id": f"{contract_payload['run_id']}-{card}",
@@ -184,7 +192,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                 report_ref = f"reports/review/production-wiring{suffix}.md"
                 report = tmp_path / report_ref
                 report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text("# Review\n\nPassed.\n", encoding="utf-8")
+                report.write_text(
+                    "---\n"
+                    f"workflow_run_id: {contract_payload['run_id']}\n"
+                    f"workflow_card_id: {card}\n"
+                    f"candidate: {candidate}\n"
+                    "---\n# Review\n\nPassed.\n",
+                    encoding="utf-8",
+                )
                 evidence = review.build_gate_evaluation(
                     slice_id=f"{contract_payload['run_id']}-{card}",
                     state="passed", reason="accepted",
@@ -365,6 +380,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     assert all(job.get("workflow_claim_key") == run.claim_key for job in workflow_jobs)
     assert all(isinstance(job.get("workflow_inputs"), list) for job in workflow_jobs)
     assert all(isinstance(job.get("workflow_outputs"), list) for job in workflow_jobs)
+    assert all(isinstance(job.get("workflow_output_baseline"), list) for job in workflow_jobs)
+    adversarial_job = next(
+        job for job in workflow_jobs if job.get("workflow_card") == "adversarial-review"
+    )
+    assert any(
+        row["path"] == "reports/review/production-wiring.md"
+        for row in adversarial_job["workflow_output_baseline"]
+    )
     assert all(not Path(job["workflow_evidence"]["path"]).is_absolute() for job in workflow_jobs)
     assert all(
         (tmp_path / job["workflow_evidence"]["path"]).is_file()
@@ -422,7 +445,6 @@ def test_manager_rejects_planner_artifacts_outside_governed_roots(tmp_path: Path
             str(tmp_path),
             [{"kind": "plan", "path": "README.md", "content": "not allowed"}],
             work_id="production-wiring",
-            task_slug="production-wiring",
             allowed_refs=("docs/superpowers/plans/*production-wiring*.md",),
         )
 
@@ -439,12 +461,11 @@ def test_planning_artifact_publish_is_scoped_cas_and_transactional(tmp_path: Pat
         "content": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
     }
     rollback = manager._publish_planning_artifacts(
-        str(tmp_path), [plan, spec], work_id="production-wiring", task_slug="production-wiring",
+        str(tmp_path), [plan, spec], work_id="production-wiring",
         allowed_refs=(
             "docs/superpowers/plans/*production-wiring*.md",
             "docs/superpowers/specs/*production-wiring*-spec.md",
         ),
-        baseline_hashes={},
     )
     assert (tmp_path / plan["path"]).is_file()
     assert (tmp_path / spec["path"]).is_file()
@@ -455,14 +476,13 @@ def test_planning_artifact_publish_is_scoped_cas_and_transactional(tmp_path: Pat
     conflict = tmp_path / spec["path"]
     conflict.parent.mkdir(parents=True, exist_ok=True)
     conflict.write_text("owned by another transaction\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="no-clobber"):
+    with pytest.raises(ValueError, match="current planning authority"):
         manager._publish_planning_artifacts(
-            str(tmp_path), [plan, spec], work_id="production-wiring", task_slug="production-wiring",
+            str(tmp_path), [plan, spec], work_id="production-wiring",
             allowed_refs=(
                 "docs/superpowers/plans/*production-wiring*.md",
                 "docs/superpowers/specs/*production-wiring*-spec.md",
             ),
-            baseline_hashes={},
         )
     assert not (tmp_path / plan["path"]).exists()
     assert conflict.read_text(encoding="utf-8") == "owned by another transaction\n"
@@ -470,9 +490,8 @@ def test_planning_artifact_publish_is_scoped_cas_and_transactional(tmp_path: Pat
     other_work = dict(plan, path="docs/superpowers/plans/other-work-plan.md")
     with pytest.raises(ValueError, match="outside governed roots"):
         manager._publish_planning_artifacts(
-            str(tmp_path), [other_work], work_id="production-wiring", task_slug="production-wiring",
+            str(tmp_path), [other_work], work_id="production-wiring",
             allowed_refs=("docs/superpowers/plans/*production-wiring*.md",),
-            baseline_hashes={},
         )
 
 
@@ -497,12 +516,15 @@ def test_planning_artifact_publish_replaces_only_exact_baseline_and_rolls_back_g
         },
     ]
     rollback = manager._publish_planning_artifacts(
-        str(tmp_path), rows, work_id="production-wiring", task_slug="production-wiring",
+        str(tmp_path), rows, work_id="production-wiring",
         allowed_refs=(
             "docs/superpowers/specs/*production-wiring*-spec.md",
             "docs/superpowers/plans/*production-wiring*.md",
         ),
-        baseline_hashes={spec_ref: baseline},
+        authorities=(PlanningArtifactAuthority(
+            ref=spec_ref, kind="spec", work_id="production-wiring",
+            baseline_sha256=baseline,
+        ),),
     )
     assert "Bound." in spec_path.read_text(encoding="utf-8")
     assert (tmp_path / plan_ref).is_file()
@@ -511,14 +533,17 @@ def test_planning_artifact_publish_replaces_only_exact_baseline_and_rolls_back_g
     assert not (tmp_path / plan_ref).exists()
 
     spec_path.write_text("operator changed after scan\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="baseline CAS"):
+    with pytest.raises(ValueError, match="authority drift"):
         manager._publish_planning_artifacts(
-            str(tmp_path), rows, work_id="production-wiring", task_slug="production-wiring",
+            str(tmp_path), rows, work_id="production-wiring",
             allowed_refs=(
                 "docs/superpowers/specs/*production-wiring*-spec.md",
                 "docs/superpowers/plans/*production-wiring*.md",
             ),
-            baseline_hashes={spec_ref: baseline},
+            authorities=(PlanningArtifactAuthority(
+                ref=spec_ref, kind="spec", work_id="production-wiring",
+                baseline_sha256=baseline,
+            ),),
         )
     assert spec_path.read_text(encoding="utf-8") == "operator changed after scan\n"
     assert not (tmp_path / plan_ref).exists()
@@ -682,7 +707,9 @@ def test_restart_reconcile_keeps_publication_when_registry_gate_is_committed(
         artifact, b"# Plan\n", baseline_hash=None, kind="artifact"
     )
     evidence = tmp_path / "evidence/brainstorm.json"
-    transaction.write_evidence(evidence, {"kind": "brainstorm-peer"})
+    transaction.write_evidence(
+        evidence, {"schema_version": 1, "kind": "brainstorm-peer"}
+    )
     digest = manager._sha256_path(evidence)
     run = _run(
         phase="plan",
@@ -697,6 +724,176 @@ def test_restart_reconcile_keeps_publication_when_registry_gate_is_committed(
     assert artifact.is_file()
     assert evidence.is_file()
     assert not (tmp_path / "planning-transactions/workflow-1.json").exists()
+
+
+def test_idempotent_existing_evidence_records_expected_gate_before_registry_commit(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence/brainstorm.json"
+    evidence.parent.mkdir()
+    evidence_payload = {"schema_version": 1, "kind": "brainstorm-peer"}
+    evidence.write_text(
+        json.dumps(evidence_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence.chmod(0o600)
+    transaction = manager._PlanningPublicationTransaction(
+        root=tmp_path, run_id="workflow-1", journal_root=tmp_path
+    )
+    artifact = tmp_path / "docs/superpowers/plans/work-1.md"
+    transaction.publish(artifact, b"# Plan\n", baseline_hash=None, kind="artifact")
+    transaction.write_evidence(evidence, evidence_payload)
+    journal = json.loads(
+        (tmp_path / "planning-transactions/workflow-1.json").read_text(encoding="utf-8")
+    )
+    expected = {
+        "kind": "brainstorm",
+        "ref": str(evidence),
+        "sha256": manager._sha256_path(evidence),
+    }
+    assert journal["expected_gate_ref"] == expected
+    assert [row["kind"] for row in journal["operations"]] == ["artifact", "evidence"]
+
+    run = _run(
+        phase="plan", status="running",
+        refs=(GateEvidenceRef("brainstorm", expected["ref"], expected["sha256"]),),
+    )
+    manager._PlanningPublicationTransaction.reconcile(
+        root=tmp_path, journal_root=tmp_path, run=run
+    )
+    assert artifact.is_file()
+    assert evidence.is_file()
+    assert not (tmp_path / "planning-transactions/workflow-1.json").exists()
+
+
+def test_idempotent_existing_evidence_rejects_noncanonical_mode(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence/brainstorm.json"
+    evidence.parent.mkdir()
+    payload = {"schema_version": 1, "kind": "brainstorm-peer"}
+    evidence.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence.chmod(0o644)
+    transaction = manager._PlanningPublicationTransaction(
+        root=tmp_path, run_id="workflow-1", journal_root=tmp_path
+    )
+
+    with pytest.raises(ValueError, match="immutable evidence mode conflict"):
+        transaction.write_evidence(evidence, payload)
+
+    assert not (tmp_path / "planning-transactions/workflow-1.json").exists()
+
+
+def test_committed_reconcile_detects_artifact_drift_and_preserves_intent(
+    tmp_path: Path,
+) -> None:
+    transaction = manager._PlanningPublicationTransaction(
+        root=tmp_path, run_id="workflow-1", journal_root=tmp_path
+    )
+    artifact = tmp_path / "docs/superpowers/plans/work-1.md"
+    transaction.publish(artifact, b"# Plan\n", baseline_hash=None, kind="artifact")
+    evidence = tmp_path / "evidence/brainstorm.json"
+    transaction.write_evidence(
+        evidence, {"schema_version": 1, "kind": "brainstorm-peer"}
+    )
+    run = _run(
+        phase="plan", status="running",
+        refs=(GateEvidenceRef("brainstorm", str(evidence), manager._sha256_path(evidence)),),
+    )
+    artifact.write_text("operator drift\n", encoding="utf-8")
+
+    with pytest.raises(manager.PlanningPublicationDrift, match="drift"):
+        manager._PlanningPublicationTransaction.reconcile(
+            root=tmp_path, journal_root=tmp_path, run=run
+        )
+
+    assert artifact.read_text(encoding="utf-8") == "operator drift\n"
+    assert (tmp_path / "planning-transactions/workflow-1.json").is_file()
+
+
+def test_existing_report_requires_baseline_change_and_embedded_workflow_binding(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    report_ref = "reports/verify/work.md"
+    report = tmp_path / report_ref
+    report.parent.mkdir(parents=True)
+    stale = (
+        "---\nworkflow_run_id: run\nworkflow_card_id: card\n"
+        f"candidate: {'a' * 40}\n---\n# Verification\n\nPassed.\n"
+    )
+    report.write_text(stale, encoding="utf-8")
+    baseline = manager._sha256_path(report)
+    log = tmp_path / "verify.jsonl"
+    payload = {
+        "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+        "slice_id": "run-card", "candidate": "a" * 40,
+        "status": "verified", "summary": "ok", "details": {},
+        "outputs": [report_ref],
+    }
+    log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="verify", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(tmp_path), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head="a" * 40,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="card", workflow_phase="verify", workflow_repo_root=str(tmp_path),
+        workflow_outputs=(report_ref,), source_revision="rev",
+        workflow_output_baseline=({"path": report_ref, "sha256": baseline},),
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(ValueError, match="stale preexisting report"):
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=tmp_path
+        )
+
+    report.write_text(stale.replace("Passed.", "Passed after this job."), encoding="utf-8")
+    terminal = manager.terminalize_workflow_job(
+        registry, job_id=job["job_id"], coordinator_root=tmp_path
+    )
+    assert terminal["workflow_evidence"] is not None
+
+
+def test_planning_replacement_requires_persisted_authority_not_caller_hash(
+    tmp_path: Path,
+) -> None:
+    ref = "docs/superpowers/specs/production-wiring-spec.md"
+    path = tmp_path / ref
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "---\nstatus: draft\n---\n# Spec\n## Requirements\nTBD\n",
+        encoding="utf-8",
+    )
+    authority = PlanningArtifactAuthority(
+        ref=ref, kind="spec", work_id="production-wiring",
+        baseline_sha256=manager._sha256_path(path),
+    )
+    replacement = {
+        "kind": "spec", "path": ref,
+        "content": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
+    }
+    rollback = manager._publish_planning_artifacts(
+        str(tmp_path), [replacement], work_id="production-wiring",
+        allowed_refs=("docs/superpowers/specs/*production-wiring*-spec.md",),
+        authorities=(authority,),
+    )
+    rollback()
+
+    forged = PlanningArtifactAuthority(
+        ref=ref, kind="design", work_id="production-wiring",
+        baseline_sha256=authority.baseline_sha256,
+    )
+    with pytest.raises(ValueError, match="current planning authority"):
+        manager._publish_planning_artifacts(
+            str(tmp_path), [replacement], work_id="production-wiring",
+            allowed_refs=("docs/superpowers/specs/*production-wiring*-spec.md",),
+            authorities=(forged,),
+        )
 
 
 def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> None:
@@ -731,10 +928,20 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     assert result["reason"] == "planning-complete"
     assert run.brainstorm_required is False
     assert run.gate_refs == ()
+    assert {
+        (authority.ref, authority.kind, authority.work_id, authority.baseline_sha256)
+        for authority in run.planning_authority
+    } == {
+        (row["ref"], row["kind"], "production-wiring", manager._sha256_path(tmp_path / row["ref"]))
+        for row in rows
+    }
 
 
-def test_brainstorm_publication_rolls_back_registry_fault_and_restart_retries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("commit_before_error", [False, True])
+def test_brainstorm_publication_reconciles_registry_commit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_before_error: bool,
 ) -> None:
     state_path = tmp_path / "registry.json"
     registry = JobRegistry(state_path=state_path)
@@ -808,6 +1015,8 @@ def test_brainstorm_publication_rolls_back_registry_fault_and_restart_retries(
             for row in payload.get("workflows", [])
         ):
             failed = True
+            if commit_before_error:
+                real_write(payload)
             raise OSError("registry save fault")
         real_write(payload)
 
@@ -824,9 +1033,15 @@ def test_brainstorm_publication_rolls_back_registry_fault_and_restart_retries(
             primary_integrator=integrator, coordinator_root=tmp_path,
         )
 
-    assert registry.list_workflow_runs()[0].current_phase == "define"
-    assert not (tmp_path / "docs/superpowers").exists()
-    assert not list((tmp_path / "evidence").glob("brainstorm-*.json"))
+    if commit_before_error:
+        assert registry.list_workflow_runs()[0].current_phase == "plan"
+        assert (tmp_path / "docs/superpowers").is_dir()
+        assert list((tmp_path / "evidence").glob("brainstorm-*.json"))
+        assert not list((tmp_path / "planning-transactions").glob("*.json"))
+    else:
+        assert registry.list_workflow_runs()[0].current_phase == "define"
+        assert not (tmp_path / "docs/superpowers").exists()
+        assert not list((tmp_path / "evidence").glob("brainstorm-*.json"))
 
     restarted = JobRegistry(state_path=state_path)
     result = manager.apply_workflow_action(
@@ -839,7 +1054,9 @@ def test_brainstorm_publication_rolls_back_registry_fault_and_restart_retries(
         primary_questioner=questioner, secondary_planner=secondary,
         primary_integrator=integrator, coordinator_root=tmp_path,
     )
-    assert result["reason"] == "brainstorm-complete"
+    assert result["reason"] == (
+        "already-claimed" if commit_before_error else "brainstorm-complete"
+    )
     assert restarted.get_workflow_run(result["run_id"]).current_phase == "plan"
     assert not list((tmp_path / "planning-transactions").glob("*.json"))
 

@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from paulsha_cortex.config import paths
-from .workflow import GateEvidenceRef, WorkflowRun, WorkflowStep, validate_workflow_phase_transition
+from .workflow import (
+    GateEvidenceRef,
+    PlanningArtifactAuthority,
+    WorkflowRun,
+    WorkflowStep,
+    validate_workflow_phase_transition,
+)
 
 COORDINATOR_STATE_SCHEMA_VERSION = 2
 
@@ -394,6 +400,30 @@ class JobRegistry:
                 raise ValueError(
                     f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}"
                 )
+        output_baseline = job.get("workflow_output_baseline", [])
+        if not isinstance(output_baseline, list):
+            raise ValueError(
+                f"coordinator 狀態檔 workflow_output_baseline 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        baseline_paths: set[str] = set()
+        for row in output_baseline:
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"path", "sha256"}
+                or not isinstance(row.get("path"), str)
+                or not row["path"]
+                or Path(row["path"]).is_absolute()
+                or ".." in Path(row["path"]).parts
+                or Path(row["path"]).as_posix() != row["path"]
+                or not isinstance(row.get("sha256"), str)
+                or len(row["sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in row["sha256"])
+                or row["path"] in baseline_paths
+            ):
+                raise ValueError(
+                    f"coordinator 狀態檔 workflow_output_baseline 格式錯誤（fail-closed）: {self._state_path}"
+                )
+            baseline_paths.add(row["path"])
         return dict(job)
 
     def _validate_loaded_slice(self, slice_row: object, job_ids: set[str]) -> dict[str, Any]:
@@ -546,6 +576,7 @@ class JobRegistry:
         workflow_outputs: tuple[str, ...] = (),
         source_revision: str | None = None,
         workflow_sandbox_hash: str | None = None,
+        workflow_output_baseline: tuple[dict[str, str], ...] = (),
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -588,18 +619,20 @@ class JobRegistry:
             "workflow_outputs": list(workflow_outputs),
             "source_revision": source_revision,
             "workflow_sandbox_hash": workflow_sandbox_hash,
+            "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
             "workflow_evidence": None,
             "created_at": _now_iso(),
         }
+        job = self._validate_loaded_job(job)
         self._jobs.append(job)
         self._persist()
-        return dict(job)
+        return _deepcopy_json(job)
 
     def list_jobs(self) -> list[dict[str, Any]]:
-        return [dict(job) for job in self._jobs]
+        return [_deepcopy_json(job) for job in self._jobs]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
-        return dict(self._find_job(job_id))
+        return _deepcopy_json(self._find_job(job_id))
 
     def update_job(
         self,
@@ -614,7 +647,7 @@ class JobRegistry:
             raise ValueError("worktree 必須為非空字串")
         job["worktree"] = worktree
         self._persist()
-        return dict(job)
+        return _deepcopy_json(job)
 
     def bind_workflow_evidence(
         self,
@@ -638,12 +671,12 @@ class JobRegistry:
         if existing is not None:
             if existing != locator or (subject_head is not None and job.get("subject_head") != subject_head):
                 raise ValueError("workflow evidence已綁定且內容衝突")
-            return dict(job)
+            return _deepcopy_json(job)
         job["workflow_evidence"] = dict(locator)
         if subject_head is not None:
             job["subject_head"] = subject_head
         self._persist()
-        return dict(job)
+        return _deepcopy_json(job)
 
     def update_status(self, job_id: str, status: str) -> dict[str, Any]:
         if status not in VALID_JOB_STATUSES:
@@ -657,7 +690,7 @@ class JobRegistry:
         )
         job["status"] = status
         self._persist()
-        return dict(job)
+        return _deepcopy_json(job)
 
     def attach_launch_handle(
         self,
@@ -679,7 +712,7 @@ class JobRegistry:
         job["pid"] = pid
         job["log_path"] = log_path
         self._persist()
-        return dict(job)
+        return _deepcopy_json(job)
 
     def update_headless_result(
         self,
@@ -702,7 +735,7 @@ class JobRegistry:
         job["status"] = status
         job["exit_code"] = exit_code
         self._persist()
-        return dict(job)
+        return _deepcopy_json(job)
 
     def create_slice(
         self,
@@ -979,6 +1012,7 @@ class JobRegistry:
         verified_head: str | None = None,
         facets: tuple[str, ...] = (),
         gate_status: str = "pending",
+        planning_authority: tuple[PlanningArtifactAuthority, ...] = (),
     ) -> WorkflowRun:
         for existing in self._workflows:
             if existing.claim_key != claim_key:
@@ -1015,6 +1049,7 @@ class JobRegistry:
             gate_status=gate_status,
             created_at=now,
             updated_at=now,
+            planning_authority=tuple(planning_authority),
         )
         self._workflows.append(run)
         self._persist()
@@ -1038,6 +1073,7 @@ class JobRegistry:
         verified_head: str | None = None,
         facets: tuple[str, ...] | None = None,
         gate_status: str | None = None,
+        planning_authority: tuple[PlanningArtifactAuthority, ...] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1069,6 +1105,11 @@ class JobRegistry:
             gate_status=current.gate_status if gate_status is None else gate_status,
             created_at=current.created_at,
             updated_at=_now_iso(),
+            planning_authority=(
+                current.planning_authority
+                if planning_authority is None
+                else tuple(planning_authority)
+            ),
         )
         self._workflows[index] = updated
         self._persist()

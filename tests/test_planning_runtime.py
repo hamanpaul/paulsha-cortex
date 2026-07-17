@@ -180,3 +180,60 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     link.unlink()
     link.symlink_to("empty", target_is_directory=True)
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
+
+
+def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) -> None:
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    tracked = protected / "tracked.md"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    xattr_supported = True
+    try:
+        os.setxattr(tracked, "user.cortex-test", b"baseline")
+    except (AttributeError, OSError):
+        xattr_supported = False
+    protected.chmod(0o750)
+
+    def runner(argv, **kwargs):
+        tracked.write_text("polluted\n", encoding="utf-8")
+        if xattr_supported:
+            os.setxattr(tracked, "user.cortex-test", b"polluted")
+        protected.chmod(0)
+        return _completed(json.dumps({"ok": True}))
+
+    with pytest.raises(ValueError, match="operator worktree.*rolled back"):
+        planning_runtime._invoke_json(
+            identity, "return JSON", worktree=tmp_path, runner=runner,
+            timeout_seconds=30,
+        )
+
+    assert protected.stat().st_mode & 0o777 == 0o750
+    assert tracked.read_text(encoding="utf-8") == "baseline\n"
+    if xattr_supported:
+        assert os.getxattr(tracked, "user.cortex-test") == b"baseline"
+
+
+def test_operator_restore_fault_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    tracked = tmp_path / "tracked.md"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    real_restore = planning_runtime._restore_operator_tree
+
+    def runner(argv, **kwargs):
+        tracked.write_text("polluted\n", encoding="utf-8")
+        return _completed(json.dumps({"ok": True}))
+
+    def restore_then_fail(worktree, baseline):
+        real_restore(worktree, baseline)
+        raise OSError("restore fsync fault")
+
+    monkeypatch.setattr(planning_runtime, "_restore_operator_tree", restore_then_fail)
+    with pytest.raises(RuntimeError, match="restore failed"):
+        planning_runtime._invoke_json(
+            identity, "return JSON", worktree=tmp_path, runner=runner,
+            timeout_seconds=30,
+        )
+    assert tracked.read_text(encoding="utf-8") == "baseline\n"

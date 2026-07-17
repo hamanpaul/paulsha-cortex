@@ -9,7 +9,11 @@ import pytest
 
 from paulsha_cortex.coordinator import registry as registry_module
 from paulsha_cortex.coordinator.registry import JobRegistry
-from paulsha_cortex.coordinator.workflow import WorkflowRun, WorkflowStep
+from paulsha_cortex.coordinator.workflow import (
+    PlanningArtifactAuthority,
+    WorkflowRun,
+    WorkflowStep,
+)
 
 
 def _legacy_v1_payload() -> dict[str, object]:
@@ -74,6 +78,14 @@ def _create_run(registry: JobRegistry) -> WorkflowRun:
         evidence_refs=("evidence/question-pack.json",),
         facets=("needs_human",),
         gate_status="pending",
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref="docs/superpowers/plans/unified-work-lifecycle.md",
+                kind="plan",
+                work_id="unified-work-lifecycle",
+                baseline_sha256="a" * 64,
+            ),
+        ),
     )
 
 
@@ -151,6 +163,14 @@ def test_workflow_run_persists_all_fields_and_claim_is_restart_idempotent(tmp_pa
     assert created.evidence_refs == ("evidence/question-pack.json",)
     assert created.facets == ("needs_human",)
     assert created.gate_status == "pending"
+    assert created.planning_authority == (
+        PlanningArtifactAuthority(
+            ref="docs/superpowers/plans/unified-work-lifecycle.md",
+            kind="plan",
+            work_id="unified-work-lifecycle",
+            baseline_sha256="a" * 64,
+        ),
+    )
 
     restarted = JobRegistry(state_path=state)
     duplicate = _create_run(restarted)
@@ -249,6 +269,9 @@ def test_terminal_workflow_evidence_locator_is_single_assignment_and_durable(tmp
         workflow_claim_key="repo/work/rev", workflow_repo="owner/repo",
         workflow_card="build", workflow_phase="build", workflow_repo_root=str(tmp_path),
         source_revision="rev",
+        workflow_output_baseline=(
+            {"path": "reports/build.md", "sha256": "d" * 64},
+        ),
     )
     registry.update_status(str(job["job_id"]), "exited")
     locator = {"kind": "build", "path": "evidence/workflow/card.json", "hash": "a" * 64}
@@ -257,6 +280,12 @@ def test_terminal_workflow_evidence_locator_is_single_assignment_and_durable(tmp
     restored = JobRegistry(state_path=state).get_job(str(job["job_id"]))
     assert restored["workflow_evidence"] == locator
     assert restored["subject_head"] == "b" * 40
+    assert restored["workflow_output_baseline"] == [
+        {"path": "reports/build.md", "sha256": "d" * 64}
+    ]
+
+    restored["workflow_output_baseline"][0]["sha256"] = "e" * 64
+    assert registry.get_job(str(job["job_id"]))["workflow_output_baseline"][0]["sha256"] == "d" * 64
 
     with pytest.raises(ValueError, match="衝突"):
         registry.bind_workflow_evidence(

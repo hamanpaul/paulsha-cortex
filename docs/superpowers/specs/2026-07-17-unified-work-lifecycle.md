@@ -91,13 +91,13 @@ Registry以atomic backup從v1升v2；v1 jobs/slices保留legacy records，不猜
 
 新增planner persona；Deck compiler保存每card `persona_binding`，default combo `feature-oneshot`。Artifact只有在frontmatter `status: accepted`、必要章節存在且沒有blocking decision marker時才算accepted。Blocking marker只接受獨立行`TBD`、`[TBD]`、`Decision: TBD`、`決策：未定`或Open Questions章節中的實際項目；inline說明文字與fenced code不觸發。缺accepted spec/design/plan或存在blocking marker時，primary planner先出question pack，secondary異質planner只回evidence，primary整合落檔。
 
-所有Define/Plan invocation與manifest plan card只在temporary disposable checkout以plan/read-only/sandbox執行；Claude不得使用`acceptEdits`且停用tools，Codex固定`--sandbox read-only`。成功、nonzero與exception都驗sandbox/operator tree的檔案內容、empty dirs、directory symlinks與stable metadata，operator污染必須回滾且不留檔。Primary回傳structured content後，Manager先依current work/change與manifest output refs驗整組；新檔no-clobber，已掃描TBD檔只可在current hash等於baseline且仍屬同work/manifest refs時CAS replacement。Artifacts、brainstorm evidence與registry phase update共用durable intent journal，save fault整組rollback，restart/resume依persisted gate reconcile。
+所有Define/Plan invocation與manifest plan card只在temporary disposable checkout以plan/read-only/sandbox執行；Claude不得使用`acceptEdits`且停用tools，Codex固定`--sandbox read-only`。成功、nonzero與exception都驗sandbox/operator tree；snapshot權限錯誤也先恢復安全traversal，再依baseline還原entries、mode與xattrs，restore fault fail-closed。Scan時持久化canonical ref/kind/work item/content hash authority；Primary structured replacement必須逐欄符合該authority與manifest refs，不接受caller hash或filename推測。新檔no-clobber。Artifacts、immutable/idempotent brainstorm evidence、expected gate ref與registry phase update共用durable intent journal；registry未commit才rollback，已commit則restart逐operation驗type/hash/mode/evidence，drift成`needs_human`並保留journal。
 
 Secondary selection: `agy/google -> claude/anthropic -> codex/openai`，排除primary domain。`agy`只使用headless print + plan + sandbox，不允許unsafe bypass；`agy + Gemini 3.1 Pro (High)`映射google並由live doctor驗證。沒有異質model或output malformed時停needs_human。
 
 ### 5.3 Build/verify/review
 
-Verify/review card除canonical coordinator evidence外，必須實際產生符合manifest `produces` glob的report並綁content hash；canonical evidence path只屬gate ref，不得拿來滿足report output。
+每張card dispatch時保存output目錄baseline。Verify/review card除canonical coordinator evidence外，必須實際產生符合manifest `produces` glob、為該job新建或相對baseline更新的report；report frontmatter精確綁run/card/Candidate，canonical evidence保存current/baseline hash且path只屬gate ref，不得拿來滿足report output。
 
 Builder在`feature/<issue>-<slug>` worktree；沿用exact Candidate、base comparison、artifact/evidence verification。Foreign Reviewer使用不同domain、detached exact HEAD。Brainstorm peer、ForeignReview、Copilot是三個不同evidence gate，不可互換。
 

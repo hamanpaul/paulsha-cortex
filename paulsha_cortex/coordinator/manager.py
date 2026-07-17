@@ -7,12 +7,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
+from .._yaml import YAMLError, safe_load
 from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
@@ -31,6 +33,7 @@ from .planning import (
 from .workflow import (
     WORKFLOW_PHASES,
     GateEvidenceRef,
+    PlanningArtifactAuthority,
     WorkflowManifest,
     validate_workflow_phase_transition,
 )
@@ -1771,12 +1774,17 @@ def _load_workflow_manifest(path_value: str) -> WorkflowManifest:
     return WorkflowManifest.from_dict(payload)
 
 
-def _load_planning_artifacts(args: Mapping[str, object]) -> tuple[PlanningArtifact, ...]:
+def _load_planning_artifacts(
+    args: Mapping[str, object],
+    *,
+    work_id: str,
+    persisted: tuple[PlanningArtifactAuthority, ...] = (),
+) -> tuple[tuple[PlanningArtifact, ...], tuple[PlanningArtifactAuthority, ...]]:
     root = Path(_required_workflow_string(args, "artifact_root")).resolve()
     rows = args.get("planning_artifacts")
     if not isinstance(rows, list):
         raise ValueError("workflow-action planning_artifacts must be a list")
-    artifacts: list[PlanningArtifact] = []
+    requested: list[tuple[str, str]] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict) or set(row) != {"kind", "ref"}:
             raise ValueError(f"workflow-action planning_artifacts[{index}] invalid")
@@ -1784,20 +1792,45 @@ def _load_planning_artifacts(args: Mapping[str, object]) -> tuple[PlanningArtifa
         ref = row.get("ref")
         if not isinstance(kind, str) or not isinstance(ref, str) or not ref:
             raise ValueError(f"workflow-action planning_artifacts[{index}] invalid")
+        requested.append((kind, ref))
+    if persisted:
+        expected = [(item.kind, item.ref) for item in persisted]
+        if requested != expected:
+            raise ValueError("workflow planning artifact scan differs from persisted authority")
+        authority = persisted
+    else:
+        authority = ()
+    artifacts: list[PlanningArtifact] = []
+    scanned: list[PlanningArtifactAuthority] = []
+    for index, (kind, ref) in enumerate(requested):
         relative = Path(ref)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(f"workflow-action planning_artifacts[{index}] escapes artifact_root")
         try:
             unresolved = root / relative
-            if unresolved.is_symlink():
-                raise ValueError("symlink planning artifact")
+            cursor = root
+            for part in relative.parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError("symlink planning artifact")
             resolved = unresolved.resolve()
             resolved.relative_to(root)
-            text = resolved.read_text(encoding="utf-8")
+            content = resolved.read_bytes()
+            text = content.decode("utf-8")
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(f"workflow planning artifact unreadable: {ref}") from exc
         artifacts.append(PlanningArtifact(kind=kind, ref=ref, text=text))
-    return tuple(artifacts)
+        scanned.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id=work_id,
+                baseline_sha256=hashlib.sha256(content).hexdigest(),
+            )
+        )
+    if authority and tuple(scanned) != authority:
+        raise ValueError("workflow planning artifact current authority drift")
+    return tuple(artifacts), tuple(scanned)
 
 
 def _audit_phase_steps(
@@ -1979,7 +2012,8 @@ def _canonical_workflow_artifacts(
     rows: object,
     *,
     repo_root: Path,
-) -> list[dict[str, str]]:
+    baseline_by_ref: Mapping[str, str],
+) -> list[dict[str, str | None]]:
     if not isinstance(rows, list):
         raise ValueError("workflow terminal outputs must be a list")
     artifacts: list[dict[str, str]] = []
@@ -1990,14 +2024,111 @@ def _canonical_workflow_artifacts(
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("workflow terminal output escapes repo")
         unresolved = repo_root / relative
-        if unresolved.is_symlink():
-            raise ValueError("workflow terminal output symlink rejected")
+        cursor = repo_root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow terminal output symlink rejected")
         resolved = unresolved.resolve()
         resolved.relative_to(repo_root)
         if not resolved.is_file():
             raise ValueError("workflow terminal output missing")
-        artifacts.append({"path": ref, "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest()})
+        artifacts.append(
+            {
+                "path": ref,
+                "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+                "baseline_sha256": baseline_by_ref.get(ref),
+            }
+        )
     return artifacts
+
+
+def _workflow_output_baseline(repo_root: Path, patterns: tuple[str, ...]) -> tuple[dict[str, str], ...]:
+    rows: dict[str, str] = {}
+    for pattern in patterns:
+        relative_pattern = Path(pattern)
+        if relative_pattern.is_absolute() or ".." in relative_pattern.parts:
+            raise ValueError("workflow manifest output pattern escapes repo")
+        static_parts: list[str] = []
+        for part in relative_pattern.parts:
+            if any(marker in part for marker in ("*", "?", "[")):
+                break
+            static_parts.append(part)
+        static_root = repo_root.joinpath(*static_parts)
+        cursor = repo_root
+        for part in static_parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow output baseline symlink rejected")
+        if len(static_parts) == len(relative_pattern.parts):
+            candidates = (static_root,)
+        elif static_root.is_dir():
+            candidates = tuple(static_root.rglob("*"))
+        else:
+            candidates = ()
+        for unresolved in candidates:
+            relative = unresolved.relative_to(repo_root).as_posix()
+            cursor = repo_root
+            for part in Path(relative).parts:
+                cursor = cursor / part
+                if cursor.is_symlink():
+                    raise ValueError("workflow output baseline symlink rejected")
+            resolved = unresolved.resolve()
+            resolved.relative_to(repo_root)
+            if resolved.is_file():
+                rows[relative] = _sha256_path(resolved)
+    return tuple({"path": path, "sha256": rows[path]} for path in sorted(rows))
+
+
+def _report_binding(content: bytes) -> Mapping[str, object]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("workflow report must be UTF-8") from exc
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("workflow report binding frontmatter missing")
+    try:
+        closing = next(index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---")
+    except StopIteration as exc:
+        raise ValueError("workflow report binding frontmatter missing") from exc
+    try:
+        payload = safe_load("\n".join(lines[1:closing]))
+    except YAMLError as exc:
+        raise ValueError("workflow report binding frontmatter invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("workflow report binding frontmatter invalid")
+    return payload
+
+
+def _validate_terminal_reports(
+    refs: list[str],
+    *,
+    repo_root: Path,
+    job: Mapping[str, object],
+    candidate: str | None,
+) -> None:
+    if job.get("workflow_phase") not in {"verify", "review"}:
+        return
+    baseline = {
+        row["path"]: row["sha256"]
+        for row in job.get("workflow_output_baseline", [])
+        if isinstance(row, dict)
+    }
+    for ref in refs:
+        path = (repo_root / ref).resolve()
+        content = path.read_bytes()
+        current_hash = hashlib.sha256(content).hexdigest()
+        if baseline.get(ref) == current_hash:
+            raise ValueError(f"workflow stale preexisting report rejected: {ref}")
+        binding = _report_binding(content)
+        expected = {
+            "workflow_run_id": job.get("workflow_run_id"),
+            "workflow_card_id": job.get("workflow_card"),
+            "candidate": candidate,
+        }
+        if any(binding.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"workflow report binding mismatch: {ref}")
 
 
 def _planner_sandbox_path(job: Mapping[str, object], coordinator_root: str | Path) -> Path:
@@ -2100,9 +2231,30 @@ def terminalize_workflow_job(
     repo_root_value = job.get("workflow_repo_root")
     if not isinstance(repo_root_value, str) or not repo_root_value:
         raise ValueError("workflow job repo root missing")
+    repo_root = Path(repo_root_value).resolve()
+    baseline_rows = job.get("workflow_output_baseline")
+    if not isinstance(baseline_rows, list):
+        raise ValueError("workflow job output baseline missing")
+    baseline_by_ref = {
+        str(row["path"]): str(row["sha256"])
+        for row in baseline_rows
+        if isinstance(row, dict)
+        and set(row) == {"path", "sha256"}
+        and isinstance(row.get("path"), str)
+        and isinstance(row.get("sha256"), str)
+    }
+    if len(baseline_by_ref) != len(baseline_rows):
+        raise ValueError("workflow job output baseline invalid")
+    _validate_terminal_reports(
+        output_refs,
+        repo_root=repo_root,
+        job=job,
+        candidate=candidate,
+    )
     artifacts = _canonical_workflow_artifacts(
         normalized_payload.get("outputs", []),
-        repo_root=Path(repo_root_value).resolve(),
+        repo_root=repo_root,
+        baseline_by_ref=baseline_by_ref,
     )
     envelope = {
         "schema_version": 1,
@@ -2117,6 +2269,7 @@ def terminalize_workflow_job(
             "phase": phase,
             "inputs": job.get("workflow_inputs", []),
             "outputs": declared_outputs,
+            "output_baseline": baseline_rows,
         },
         "payload": normalized_payload,
         "artifacts": artifacts,
@@ -2201,6 +2354,7 @@ def _read_job_workflow_evidence(
         "phase": job["workflow_phase"],
         "inputs": job.get("workflow_inputs", []),
         "outputs": job.get("workflow_outputs", []),
+        "output_baseline": job.get("workflow_output_baseline", []),
     }
     if (
         not isinstance(payload, dict)
@@ -2217,18 +2371,35 @@ def _read_job_workflow_evidence(
     repo_root = Path(repo_root_value).resolve()
     refs: list[str] = []
     for row in payload["artifacts"]:
-        if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256", "baseline_sha256"}:
             raise ValueError("workflow canonical artifact locator invalid")
         ref = row.get("path")
         expected_hash = row.get("sha256")
-        if not isinstance(ref, str) or not isinstance(expected_hash, str):
+        baseline_hash = row.get("baseline_sha256")
+        if (
+            not isinstance(ref, str)
+            or not isinstance(expected_hash, str)
+            or baseline_hash is not None and not isinstance(baseline_hash, str)
+        ):
             raise ValueError("workflow canonical artifact locator invalid")
+        expected_baseline = {
+            str(item["path"]): str(item["sha256"])
+            for item in job.get("workflow_output_baseline", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and isinstance(item.get("sha256"), str)
+        }.get(ref)
+        if baseline_hash != expected_baseline:
+            raise ValueError("workflow canonical artifact baseline mismatch")
         relative_artifact = Path(ref)
         if relative_artifact.is_absolute() or ".." in relative_artifact.parts:
             raise ValueError("workflow canonical artifact escapes repo")
         unresolved_artifact = repo_root / relative_artifact
-        if unresolved_artifact.is_symlink():
-            raise ValueError("workflow canonical artifact symlink rejected")
+        cursor = repo_root
+        for part in relative_artifact.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow canonical artifact symlink rejected")
         artifact_path = unresolved_artifact.resolve()
         artifact_path.relative_to(repo_root)
         if (
@@ -2242,6 +2413,10 @@ def _read_job_workflow_evidence(
 
 def _sha256_path(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class PlanningPublicationDrift(RuntimeError):
+    """A durable planning intent cannot be safely committed or rolled back."""
 
 
 class _PlanningPublicationTransaction:
@@ -2262,6 +2437,7 @@ class _PlanningPublicationTransaction:
         self.root = root.resolve()
         self.run_id = run_id
         self.operations: list[dict[str, object]] = []
+        self.expected_gate_ref: dict[str, str] | None = None
         self.journal_root = journal_root.resolve() if journal_root is not None else None
         self.journal_path = (
             self.journal_root / "planning-transactions" / f"{run_id}.json"
@@ -2271,11 +2447,12 @@ class _PlanningPublicationTransaction:
 
     def _payload(self) -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "planning-publication-intent",
             "run_id": self.run_id,
             "root": str(self.root),
             "operations": self.operations,
+            "expected_gate_ref": self.expected_gate_ref,
         }
 
     def _persist(self) -> None:
@@ -2365,10 +2542,12 @@ class _PlanningPublicationTransaction:
         existed = path.is_file()
         before = path.read_bytes() if existed else None
         before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
+        idempotent_evidence = existed and before == content and kind == "evidence"
+        if idempotent_evidence and path.stat().st_mode & 0o7777 != mode:
+            raise ValueError(f"planning immutable evidence mode conflict: {relative}")
         if existed and baseline_hash is None:
-            if before == content and kind == "evidence":
-                return
-            raise ValueError(f"planning artifact no-clobber conflict: {relative}")
+            if not idempotent_evidence:
+                raise ValueError(f"planning artifact no-clobber conflict: {relative}")
         if baseline_hash is not None and (not existed or before_hash != baseline_hash):
             raise ValueError(f"planning artifact baseline CAS conflict: {relative}")
         missing_dirs: list[str] = []
@@ -2389,9 +2568,12 @@ class _PlanningPublicationTransaction:
             "after_hash": hashlib.sha256(content).hexdigest(),
             "after_mode": after_mode,
             "created_dirs": list(reversed(missing_dirs)),
+            "mutation": not idempotent_evidence,
         }
         self.operations.append(operation)
         self._persist()
+        if idempotent_evidence:
+            return
         self._write_atomic(
             path,
             content,
@@ -2401,7 +2583,18 @@ class _PlanningPublicationTransaction:
         )
 
     def write_evidence(self, path: Path, payload: object) -> None:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("kind") != "brainstorm-peer"
+        ):
+            raise ValueError("brainstorm evidence payload is invalid")
         content = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        self.expected_gate_ref = {
+            "kind": "brainstorm",
+            "ref": str(Path(os.path.abspath(path))),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
         self.publish(path, content, baseline_hash=None, mode=0o600, kind="evidence")
 
     def rollback(self) -> None:
@@ -2471,7 +2664,7 @@ class _PlanningPublicationTransaction:
             raise RuntimeError("planning transaction operation is invalid")
         required = {
             "kind", "path", "before_exists", "before_hash", "before_content",
-            "before_mode", "after_hash", "after_mode", "created_dirs",
+            "before_mode", "after_hash", "after_mode", "created_dirs", "mutation",
         }
         if set(value) != required or value.get("kind") not in {"artifact", "evidence"}:
             raise RuntimeError("planning transaction operation is invalid")
@@ -2504,6 +2697,13 @@ class _PlanningPublicationTransaction:
                 raise RuntimeError("planning transaction hash is invalid")
         if not isinstance(value.get("before_exists"), bool):
             raise RuntimeError("planning transaction baseline is invalid")
+        if not isinstance(value.get("mutation"), bool):
+            raise RuntimeError("planning transaction mutation flag is invalid")
+        if not value["mutation"] and (
+            value.get("kind") != "evidence"
+            or value.get("before_hash") != value.get("after_hash")
+        ):
+            raise RuntimeError("planning transaction immutable operation is invalid")
         if not isinstance(value.get("after_hash"), str) or not isinstance(value.get("after_mode"), int):
             raise RuntimeError("planning transaction target is invalid")
         if value["before_exists"]:
@@ -2533,36 +2733,113 @@ class _PlanningPublicationTransaction:
                 raise RuntimeError("planning transaction created_dir escapes boundary") from exc
         return dict(value)
 
+    def _validate_committed_operation(self, operation: Mapping[str, object]) -> None:
+        path = Path(str(operation["path"]))
+        boundary = self.root
+        try:
+            path.relative_to(boundary)
+        except ValueError:
+            if operation.get("kind") != "evidence" or self.journal_root is None:
+                raise PlanningPublicationDrift("planning committed artifact escaped boundary")
+            boundary = self.journal_root
+            try:
+                path.relative_to(boundary)
+            except ValueError as exc:
+                raise PlanningPublicationDrift(
+                    "planning committed artifact escaped boundary"
+                ) from exc
+        cursor = path.parent
+        while cursor != boundary:
+            if cursor.is_symlink():
+                raise PlanningPublicationDrift(
+                    f"planning committed artifact parent type drift: {cursor}"
+                )
+            parent = cursor.parent
+            if parent == cursor:
+                raise PlanningPublicationDrift("planning committed artifact boundary drift")
+            cursor = parent
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise PlanningPublicationDrift(f"planning committed artifact drift: {path}") from exc
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise PlanningPublicationDrift(f"planning committed artifact type drift: {path}")
+        if _sha256_path(path) != operation["after_hash"]:
+            raise PlanningPublicationDrift(f"planning committed artifact hash drift: {path}")
+        if metadata.st_mode & 0o7777 != operation["after_mode"]:
+            raise PlanningPublicationDrift(f"planning committed artifact mode drift: {path}")
+        if operation.get("kind") == "evidence":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise PlanningPublicationDrift("planning committed evidence drift") from exc
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema_version") != 1
+                or payload.get("kind") != "brainstorm-peer"
+                or self.expected_gate_ref is None
+                or self.expected_gate_ref.get("ref") != str(path)
+                or self.expected_gate_ref.get("sha256") != operation["after_hash"]
+            ):
+                raise PlanningPublicationDrift("planning committed evidence binding drift")
+
     @classmethod
     def reconcile(cls, *, root: Path, journal_root: Path, run) -> None:
         path = journal_root.resolve() / "planning-transactions" / f"{run.run_id}.json"
+        if path.is_symlink():
+            raise PlanningPublicationDrift("planning transaction journal symlink rejected")
         if not path.is_file():
             return
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PlanningPublicationDrift("planning transaction journal is unreadable") from exc
         if (
             not isinstance(payload, dict)
-            or payload.get("schema_version") != 1
+            or payload.get("schema_version") != 2
             or payload.get("kind") != "planning-publication-intent"
             or payload.get("run_id") != run.run_id
             or payload.get("root") != str(root.resolve())
             or not isinstance(payload.get("operations"), list)
+            or payload.get("expected_gate_ref") is not None
+            and not isinstance(payload.get("expected_gate_ref"), dict)
         ):
-            raise RuntimeError("planning transaction journal is invalid")
+            raise PlanningPublicationDrift("planning transaction journal is invalid")
         transaction = cls(root=root, run_id=run.run_id, journal_root=journal_root)
-        transaction.operations = [
-            transaction._validate_loaded_operation(operation)
-            for operation in payload["operations"]
+        expected_gate_ref = payload["expected_gate_ref"]
+        expected: GateEvidenceRef | None = None
+        if expected_gate_ref is not None:
+            try:
+                expected = GateEvidenceRef.from_dict(expected_gate_ref)
+            except ValueError as exc:
+                raise PlanningPublicationDrift("planning expected gate ref is invalid") from exc
+            if expected.kind != "brainstorm" or expected.sha256 is None:
+                raise PlanningPublicationDrift("planning expected gate ref is invalid")
+            transaction.expected_gate_ref = expected.to_dict()
+        try:
+            transaction.operations = [
+                transaction._validate_loaded_operation(operation)
+                for operation in payload["operations"]
+            ]
+        except RuntimeError as exc:
+            raise PlanningPublicationDrift("planning transaction operation drift") from exc
+        evidence_operations = [
+            operation
+            for operation in transaction.operations
+            if operation.get("kind") == "evidence"
         ]
-        evidence_ops = [op for op in transaction.operations if op.get("kind") == "evidence"]
-        committed = any(
-            ref.kind == "brainstorm"
-            and any(ref.ref == op.get("path") and ref.sha256 == op.get("after_hash") for op in evidence_ops)
-            for ref in run.gate_refs
-        )
-        if committed and run.current_phase not in {"claim", "define"}:
+        if expected is not None and len(evidence_operations) != 1:
+            raise PlanningPublicationDrift("planning committed evidence operation is invalid")
+        committed = expected is not None and any(ref == expected for ref in run.gate_refs)
+        if committed:
+            for operation in transaction.operations:
+                transaction._validate_committed_operation(operation)
             transaction.commit()
         else:
-            transaction.rollback()
+            try:
+                transaction.rollback()
+            except RuntimeError as exc:
+                raise PlanningPublicationDrift("planning uncommitted rollback drift") from exc
 
 
 def _publish_planning_artifacts(
@@ -2570,15 +2847,16 @@ def _publish_planning_artifacts(
     rows: object,
     *,
     work_id: str,
-    task_slug: str,
     allowed_refs: tuple[str, ...],
-    baseline_hashes: Mapping[str, str] | None = None,
+    authorities: tuple[PlanningArtifactAuthority, ...] = (),
     transaction: _PlanningPublicationTransaction | None = None,
 ) -> Callable[[], None]:
     if not isinstance(rows, list):
         raise ValueError("planning artifacts must be a list")
-    baseline_hashes = baseline_hashes or {}
     root = Path(root_value).resolve()
+    authority_by_ref = {item.ref: item for item in authorities}
+    if len(authority_by_ref) != len(authorities):
+        raise ValueError("duplicate planning authority ref")
     prepared: list[tuple[Path, bytes, str | None]] = []
     for row in rows:
         if not isinstance(row, dict) or set(row) != {"kind", "path", "content"}:
@@ -2593,7 +2871,6 @@ def _publish_planning_artifacts(
                 ("docs", "superpowers", "specs"),
                 ("docs", "superpowers", "plans"),
             }
-            and task_slug in relative.name
         )
         openspec_bound = (
             len(relative.parts) >= 4
@@ -2621,13 +2898,21 @@ def _publish_planning_artifacts(
         artifact = PlanningArtifact(kind=str(row["kind"]), ref=path_value, text=content)
         if not assess_planning_artifact(artifact).accepted:
             raise ValueError(f"planning artifact is not accepted: {path_value}")
-        baseline_hash = baseline_hashes.get(path_value)
-        if path.exists() and baseline_hash is None:
-            raise ValueError(f"planning artifact no-clobber conflict: {path_value}")
-        if not path.exists() and baseline_hash is not None:
-            raise ValueError(f"planning artifact baseline CAS conflict: {path_value}")
-        if path.is_file() and baseline_hash is not None and _sha256_path(path) != baseline_hash:
-            raise ValueError(f"planning artifact baseline CAS conflict: {path_value}")
+        owner = authority_by_ref.get(path_value)
+        baseline_hash: str | None = None
+        if path.exists():
+            if (
+                owner is None
+                or owner.ref != path_value
+                or owner.kind != row["kind"]
+                or owner.work_id != work_id
+            ):
+                raise ValueError(f"planning artifact lacks current planning authority: {path_value}")
+            baseline_hash = owner.baseline_sha256
+            if not path.is_file() or _sha256_path(path) != baseline_hash:
+                raise ValueError(f"planning artifact current authority drift: {path_value}")
+        elif owner is not None:
+            raise ValueError(f"planning artifact current authority drift: {path_value}")
         prepared.append((path, content.encode("utf-8"), baseline_hash))
 
     publication = transaction or _PlanningPublicationTransaction(
@@ -2773,6 +3058,8 @@ def dispatch_workflow_card(
         worktree = str(creator.create(f"feature/{run.work_id}"))
     else:
         worktree = run.workspace_root
+    effective_repo_root = Path(repo_root if step.persona == "planner" else worktree).resolve()
+    output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
     task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
     try:
         job = registry.create_job(
@@ -2796,6 +3083,7 @@ def dispatch_workflow_card(
             workflow_outputs=step.outputs,
             source_revision=run.source_revision,
             workflow_sandbox_hash=sandbox_hash,
+            workflow_output_baseline=output_baseline,
         )
     except BaseException:
         if planner_sandbox is not None:
@@ -2836,11 +3124,21 @@ def resume_workflow_run(
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
-    _PlanningPublicationTransaction.reconcile(
-        root=Path(run.workspace_root),
-        journal_root=Path(coordinator_root),
-        run=run,
-    )
+    try:
+        _PlanningPublicationTransaction.reconcile(
+            root=Path(run.workspace_root),
+            journal_root=Path(coordinator_root),
+            run=run,
+        )
+    except PlanningPublicationDrift:
+        updated = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "planning-publication-drift",
+        }
     step = _current_workflow_step(run)
     if step is None:
         if run.current_phase == "review" and ship_validator is not None:
@@ -3159,11 +3457,21 @@ def apply_workflow_action(
         if coordinator_root is not None
         else Path(_required_workflow_string(args, "evidence_dir")).resolve().parent
     )
-    _PlanningPublicationTransaction.reconcile(
-        root=artifact_root,
-        journal_root=transaction_root,
-        run=run,
-    )
+    try:
+        _PlanningPublicationTransaction.reconcile(
+            root=artifact_root,
+            journal_root=transaction_root,
+            run=run,
+        )
+    except PlanningPublicationDrift:
+        run = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "planning-publication-drift",
+        }
     if run.current_phase not in {"claim", "define"}:
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "already-claimed"}
     if run.current_phase == "claim":
@@ -3172,7 +3480,16 @@ def apply_workflow_action(
             current_phase="define",
             attempts={**run.attempts, "define": 1},
         )
-    artifacts = _load_planning_artifacts(args)
+    artifacts, authority = _load_planning_artifacts(
+        args,
+        work_id=run.work_id,
+        persisted=run.planning_authority,
+    )
+    if not run.planning_authority and authority:
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            planning_authority=authority,
+        )
     report = assess_planning_completeness(artifacts)
     if report.complete:
         primary_executor = str(args.get("primary_executor") or "cortex-manager")
@@ -3233,10 +3550,6 @@ def apply_workflow_action(
         }
 
     identities = identity_registry or load_model_identities()
-    baseline_hashes = {
-        artifact.ref: _sha256_path(artifact_root / artifact.ref)
-        for artifact in artifacts
-    }
     publication = _PlanningPublicationTransaction(
         root=artifact_root,
         run_id=run.run_id,
@@ -3261,11 +3574,10 @@ def apply_workflow_action(
             _required_workflow_string(args, "artifact_root"),
             rows,
             work_id=run.work_id,
-            task_slug=manifest.task_slug,
             allowed_refs=tuple(
                 ref for step in manifest.steps for ref in step.outputs
             ),
-            baseline_hashes=baseline_hashes,
+            authorities=run.planning_authority,
             transaction=publication,
         ),
         evidence_writer=publication.write_evidence,
@@ -3301,7 +3613,25 @@ def apply_workflow_action(
             facets=(),
         )
     except BaseException:
-        publication.rollback()
+        persisted = registry.get_workflow_run(run.run_id)
+        expected = publication.expected_gate_ref
+        committed = False
+        if expected is not None:
+            try:
+                expected_ref = GateEvidenceRef.from_dict(expected)
+            except ValueError:
+                expected_ref = None
+            committed = expected_ref is not None and any(
+                ref == expected_ref for ref in persisted.gate_refs
+            )
+        if committed:
+            _PlanningPublicationTransaction.reconcile(
+                root=artifact_root,
+                journal_root=transaction_root,
+                run=persisted,
+            )
+        else:
+            publication.rollback()
         raise
     publication.commit()
     return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
@@ -11,6 +12,58 @@ WORKFLOW_PHASES = ("claim", "define", "plan", "build", "verify", "review", "ship
 WORKFLOW_GATE_STATUSES = frozenset({"pending", "running", "passed", "failed"})
 WORKFLOW_FACETS = frozenset({"needs_human", "blocked", "degraded"})
 STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_human", "blocked", "skipped"})
+
+
+@dataclass(frozen=True)
+class PlanningArtifactAuthority:
+    """Scan-time ownership and CAS baseline for one canonical planning artifact."""
+
+    ref: str
+    kind: str
+    work_id: str
+    baseline_sha256: str
+
+    def __post_init__(self) -> None:
+        path = Path(self.ref)
+        if (
+            not isinstance(self.ref, str)
+            or not self.ref
+            or path.is_absolute()
+            or ".." in path.parts
+            or path.as_posix() != self.ref
+        ):
+            raise ValueError("planning authority ref 必須為canonical repo-relative path")
+        if self.kind not in {"spec", "design", "plan"}:
+            raise ValueError("planning authority kind 非法")
+        if not isinstance(self.work_id, str) or not self.work_id:
+            raise ValueError("planning authority work_id 必須為非空字串")
+        if (
+            not isinstance(self.baseline_sha256, str)
+            or len(self.baseline_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.baseline_sha256)
+        ):
+            raise ValueError("planning authority baseline_sha256 格式錯誤")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "ref": self.ref,
+            "kind": self.kind,
+            "work_id": self.work_id,
+            "baseline_sha256": self.baseline_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "PlanningArtifactAuthority":
+        if not isinstance(payload, dict) or set(payload) != {
+            "ref", "kind", "work_id", "baseline_sha256"
+        }:
+            raise ValueError("planning authority 格式錯誤")
+        return cls(
+            ref=payload["ref"],
+            kind=payload["kind"],
+            work_id=payload["work_id"],
+            baseline_sha256=payload["baseline_sha256"],
+        )
 
 
 @dataclass(frozen=True)
@@ -220,6 +273,7 @@ class WorkflowRun:
     gate_status: str
     created_at: str
     updated_at: str
+    planning_authority: tuple[PlanningArtifactAuthority, ...] = ()
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -249,6 +303,15 @@ class WorkflowRun:
             not isinstance(item, GateEvidenceRef) for item in self.gate_refs
         ):
             raise ValueError("workflow run gate_refs 格式錯誤")
+        if not isinstance(self.planning_authority, tuple) or any(
+            not isinstance(item, PlanningArtifactAuthority) for item in self.planning_authority
+        ):
+            raise ValueError("workflow run planning_authority 格式錯誤")
+        authority_refs = [item.ref for item in self.planning_authority]
+        if len(authority_refs) != len(set(authority_refs)) or any(
+            item.work_id != self.work_id for item in self.planning_authority
+        ):
+            raise ValueError("workflow run planning_authority ownership衝突")
         gate_kinds = [item.kind for item in self.gate_refs]
         gate_locators = [item.ref for item in self.gate_refs]
         if len(set(gate_kinds)) != len(gate_kinds) or len(set(gate_locators)) != len(gate_locators):
@@ -335,6 +398,7 @@ class WorkflowRun:
             "gate_status": self.gate_status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "planning_authority": [item.to_dict() for item in self.planning_authority],
         }
 
     @classmethod
@@ -369,6 +433,9 @@ class WorkflowRun:
         gate_refs = payload.get("gate_refs", [])
         if not isinstance(gate_refs, list):
             raise ValueError("workflow run gate_refs 格式錯誤")
+        planning_authority = payload.get("planning_authority", [])
+        if not isinstance(planning_authority, list):
+            raise ValueError("workflow run planning_authority 格式錯誤")
         return cls(
             run_id=payload["run_id"],
             work_id=payload["work_id"],
@@ -393,6 +460,9 @@ class WorkflowRun:
             gate_status=payload["gate_status"],
             created_at=payload["created_at"],
             updated_at=payload["updated_at"],
+            planning_authority=tuple(
+                PlanningArtifactAuthority.from_dict(item) for item in planning_authority
+            ),
         )
 
 
