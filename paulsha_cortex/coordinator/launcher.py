@@ -114,6 +114,31 @@ def build_codex_argv(
     return argv
 
 
+def build_agy_argv(
+    *,
+    prompt: str,
+    slice_id: str,
+    log_dir: str,
+    worktree: str | None = None,
+    remote: str | None = None,
+    allow_unsafe: bool = False,
+    model: str | None = None,
+) -> list[str]:
+    """Build the only supported Antigravity invocation: headless plan+sandbox.
+
+    Antigravity exposes ``--dangerously-skip-permissions`` but cortex never
+    emits it.  The planner peer is evidence-only, so it has no reason to run
+    with write permissions even when another executor was explicitly granted
+    unsafe mode.
+    """
+    if allow_unsafe:
+        raise ValueError("agy executor does not support unsafe mode")
+    argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
+    if model is not None:
+        argv.extend(["--model", model])
+    return argv
+
+
 @runtime_checkable
 class AgentLauncher(Protocol):
     def launch(
@@ -130,6 +155,7 @@ _ARGV_BUILDERS = {
     "copilot": build_copilot_argv,
     "claude": build_claude_argv,
     "codex": build_codex_argv,
+    "agy": build_agy_argv,
 }
 
 
@@ -147,6 +173,8 @@ class SubprocessLauncher:
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
+        if executor == "agy" and allow_unsafe:
+            raise ValueError("agy executor refuses unsafe mode")
         self._executor = executor
         self._relay_target = relay_target
         self._codex_remote = codex_remote

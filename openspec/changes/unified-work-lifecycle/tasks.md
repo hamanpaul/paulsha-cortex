@@ -20,8 +20,8 @@
 
 - [ ] 2.1 RED-testregistry v1 backup→v2 migration、legacy records、WorkflowRun/Step與claim-key restart idempotency。
 - [ ] 2.2 實作planner persona、`feature-oneshot` combo與Deck persona binding workflow manifest。
-- [ ] 2.3 RED-testaccepted artifact completeness、question pack、TBD/undecided marker與primary/secondary evidence integration。
-- [ ] 2.4 實作model identities與`agy` safe plan/sandbox launcher；unknown/same-domain/unavailable/malformed全部fail-closed。
+- [x] 2.3 RED-testaccepted artifact completeness、question pack、TBD/undecided marker與primary/secondary evidence integration。
+- [x] 2.4 實作model identities與`agy` safe plan/sandbox launcher；unknown/same-domain/unavailable/malformed全部fail-closed。
 - [ ] 2.5 驗planner/builder/reviewer domain separation及brainstorm/ForeignReview gate分離。
 - [ ] 2.6 通過migration/focused/full tests、help、OpenSpec、policy與preflight。
 
