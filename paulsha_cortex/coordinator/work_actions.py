@@ -196,6 +196,20 @@ def _canonical_repo_root(value: object, *, repo: str) -> Path:
         raise ValueError("repo_root unavailable") from exc
     if raw.is_symlink() or raw.absolute() != root or not root.is_dir():
         raise ValueError("repo_root must be a real non-symlink directory")
+    top_level = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if top_level.returncode != 0 or not isinstance(top_level.stdout, str):
+        raise ValueError("repo_root canonical git top-level unavailable")
+    try:
+        canonical_top_level = Path(top_level.stdout.strip()).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("repo_root canonical git top-level unavailable") from exc
+    if canonical_top_level != root:
+        raise ValueError("repo_root must equal canonical git top-level")
     completed = subprocess.run(
         ["git", "-C", str(root), "remote", "get-url", "origin"],
         shell=False,
@@ -447,7 +461,6 @@ def _expected_claim_key(authority) -> str:
 def _validate_current_run_authority(active: dict[str, Any], authority) -> None:
     expected = {
         "claim_key": _expected_claim_key(authority),
-        "snapshot_hash": authority.snapshot_hash,
         "source_revisions": list(authority.source_revisions),
         "provider_revision": authority.github_provider_revision,
         "authority_digest": work_authority_digest(authority),
@@ -497,8 +510,6 @@ def _command_result_payload(result: object) -> dict[str, Any] | None:
     return {
         "argv": list(getattr(result, "argv")),
         "returncode": getattr(result, "returncode"),
-        "stdout": getattr(result, "stdout"),
-        "stderr": getattr(result, "stderr"),
     }
 
 
@@ -788,6 +799,7 @@ def _claim_action(
             tuple(active.get("source_revisions", ())) if active else None
         ),
         active_provider_revision=active.get("provider_revision") if active else None,
+        active_authority_digest=active.get("authority_digest") if active else None,
     )
     decision = (
         decide_auto_claim(candidate, now_epoch=now_epoch)
@@ -856,6 +868,11 @@ def _claim_action(
             "workflow_step_ids": [f"{run_id}:claim", f"{run_id}:ship"],
         }
         state["runs"][key] = active
+        _save_runs(state_path, state)
+    elif active is not None and active.get("snapshot_hash") != authority.snapshot_hash:
+        # The whole-fleet snapshot is only provenance.  Refresh it in place when
+        # the work item's semantic authority digest is unchanged.
+        active["snapshot_hash"] = authority.snapshot_hash
         _save_runs(state_path, state)
     return {"action": decision.action, "reason": decision.reason, "run": active}
 
@@ -968,6 +985,24 @@ def _ship_action(
         work_id=authority.work_id,
     )
     _validate_current_run_authority(active, authority)
+    if active.get("snapshot_hash") != authority.snapshot_hash:
+        active["snapshot_hash"] = authority.snapshot_hash
+        _save_runs(state_path, state)
+    if (
+        len(authority.mapped_prs) != 1
+        or len(authority.mapped_openspec) != 1
+        or len(authority.mapped_todo_paths) != 1
+    ):
+        active["status"] = "needs_human"
+        active["ship"] = {
+            "phase": "needs_human",
+            "reason": "multiple-delivery-targets-unsupported",
+        }
+        _save_runs(state_path, state)
+        return {
+            "action": "needs_human",
+            "reason": "multiple-delivery-targets-unsupported",
+        }
     binding = _ship_binding(args, authority)
     pr_number = binding["pr_number"]
     change = binding["change"]
@@ -1086,6 +1121,38 @@ def _ship_action(
             "merge_commit": closure.facts.merge_commit,
             "completion_record": dict(closure.completion_record),
         }
+
+    if ship and ship.get("phase") == "merge-authorized":
+        expected_head = ship.get("head")
+        tree_hash = ship.get("tree_hash")
+        authorization = ship.get("merge_authorization")
+        if (
+            not isinstance(expected_head, str)
+            or not isinstance(tree_hash, str)
+            or not _authorization_identity_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                head=expected_head,
+                tree_hash=tree_hash,
+            )
+        ):
+            raise ValueError("ship merge-authorized state malformed")
+        merge_status = github.fetch_merge_status(
+            repo=authority.repo,
+            pr_number=pr_number,
+        )
+        if merge_status.merged:
+            if merge_status.pr_head != expected_head:
+                raise RuntimeError("merged PR HEAD does not match authorized HEAD")
+            active["ship"] = {
+                **ship,
+                "phase": "merged",
+                "merge_commit": merge_status.merge_commit,
+            }
+            _save_runs(state_path, state)
+            return {"action": "merged-awaiting-closure", "head": expected_head}
 
     active_change = repo_root / "openspec" / "changes" / change
     if active_change.is_dir():
@@ -1420,13 +1487,28 @@ def execute_work_action(
         issue = args.get("issue")
         if not isinstance(enabled, bool):
             raise ValueError("auto requires strict boolean enabled")
-        if issue not in authority.mapped_issues:
-            raise ValueError("auto issue is not authorized")
-        argv = build_label_argv(repo=authority.repo, issue=issue, enabled=enabled)
-        completed = runner(argv, shell=False, capture_output=True, text=True)
-        if getattr(completed, "returncode", None) != 0:
-            raise RuntimeError("GitHub auto-label mutation failed")
-        result = {"action": "auto", "enabled": enabled, "issue": issue}
+        if issue is None:
+            if not authority.mapped_issues:
+                raise ValueError("auto requires at least one authorized issue")
+            issues = authority.mapped_issues
+        else:
+            if issue not in authority.mapped_issues:
+                raise ValueError("auto issue is not authorized")
+            issues = (issue,)
+        for target_issue in issues:
+            argv = build_label_argv(
+                repo=authority.repo,
+                issue=target_issue,
+                enabled=enabled,
+            )
+            completed = runner(argv, shell=False, capture_output=True, text=True)
+            if getattr(completed, "returncode", None) != 0:
+                raise RuntimeError("GitHub auto-label mutation failed")
+        result = (
+            {"action": "auto", "enabled": enabled, "issues": list(issues)}
+            if issue is None
+            else {"action": "auto", "enabled": enabled, "issue": issue}
+        )
     else:
         result = (
             ship_executor(dict(args), authority)

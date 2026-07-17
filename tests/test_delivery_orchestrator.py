@@ -27,7 +27,15 @@ HEAD2 = "b" * 40
 HEAD3 = "c" * 40
 
 
-def _authority(root: Path, *, last_success: float = 150, issues=(14,)):
+def _authority(
+    root: Path,
+    *,
+    last_success: float = 150,
+    issues=(14,),
+    prs=(7,),
+    changes=("work",),
+    todo_paths=("docs/todo.md",),
+):
     payload = {
         "schema": "work-items-snapshot/v1",
         "providers": {
@@ -43,9 +51,9 @@ def _authority(root: Path, *, last_success: float = 150, issues=(14,)):
                 "repo": "acme/demo",
                 "work_id": "work",
                 "mapped_issues": list(issues),
-                "mapped_prs": [7],
-                "mapped_openspec": ["work"],
-                "mapped_todo_paths": ["docs/todo.md"],
+                "mapped_prs": list(prs),
+                "mapped_openspec": list(changes),
+                "mapped_todo_paths": list(todo_paths),
                 "confirmed_todo": True,
                 "source_revisions": ["issue:14@open", "openspec:work@abc"],
             }
@@ -322,6 +330,27 @@ def test_ship_orchestrator_blocks_stale_provider_or_non_exact_preflight(tmp_path
     base["preflight"] = _preflight(head=HEAD3)
     with pytest.raises(RuntimeError, match="exact HEAD/tree"):
         orchestrator.merge_if_ready(**base)
+
+
+def test_delivery_orchestrator_rejects_multi_target_authority_before_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    class GitHub:
+        def merge_if_ready(self, **kwargs):
+            raise AssertionError("multi-target authority must not reach GitHub")
+
+    with pytest.raises(ValueError, match="single delivery target"):
+        ShipOrchestrator(github=GitHub(), now=lambda: 200).merge_if_ready(
+            repo="acme/demo",
+            pr_number=7,
+            change="work",
+            expected_head=HEAD1,
+            expected_tree_hash=HEAD2,
+            authority=_authority(tmp_path, prs=(7, 8)),
+            preflight=_preflight(),
+            copilot=_copilot_decision(),
+            foreign_review=_foreign_review(tmp_path),
+        )
 
 
 def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) -> None:

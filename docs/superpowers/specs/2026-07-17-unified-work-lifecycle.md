@@ -52,7 +52,7 @@ Override schema、negative exclusion與path safety以`CONTEXT.md`為canonical。
 
 - `cortex list [--repo ...] [--state ...] [--all] [--json] [--explain]`，default隱藏done。
 - `cortex work show|link|unlink|start|resume <work-id>`。
-- `cortex work auto <work-id> --enable|--disable`管理`cortex:auto-on-going`。
+- `cortex work auto <work-id> --enable|--disable`管理`cortex:auto-on-going`；未指定 legacy issue selector 時，對全部 confirmed mapped issues 套用同一 mutation，任一 API 失敗整體 fail-closed。
 - JSON schema為`cortex-work/v1`；canonical envelope/object/explanation在`CONTEXT.md`。
 - Input filter接受`ongoing|on-going`，human/JSON output只顯示`on-going`。
 - Socket新增list/get/explain/subscription；ProjectState API相容一個release cycle。
@@ -64,6 +64,8 @@ Override schema、negative exclusion與path safety以`CONTEXT.md`為canonical。
 `WorkflowRun`保存work item、claim key、combo、current phase、steps、issue/OpenSpec/PR refs、attempts、evidence。`WorkflowStep`保存phase、persona、card、executor/model/domain、inputs、outputs與gate result。
 
 每個非Manager card由production dispatcher建立durable Job，綁定run/claim/repo/source revision/phase/card/persona/model identity。Terminal poll只從job log建立canonical coordinator-root evidence並原子綁回job；control caller不得提供evidence path/hash。同phase全部card passed後才前進，restart後從registry resume。
+
+Claim key 只綁該 work item 的 canonical semantic authority 與 provider/source revisions，不綁 snapshot sequence、written-at 或其他 repo 資料。V1 terminal delivery 每個 run 只支援唯一 PR、OpenSpec 與 Todo target；任一類有多個 confirmed refs 時必須 `needs_human`，不得以單一 target 產生 CompletionRecord。Repo mutation 的 `repo_root` 必須等於 canonical git top-level realpath 且 origin identity 相符。
 
 Stable ID優先explicit work item，其次`issue:<owner>/<repo>#N`，最後source locator。內部state enum用`ongoing`。
 

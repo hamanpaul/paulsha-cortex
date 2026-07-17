@@ -15,6 +15,7 @@ from paulsha_cortex.coordinator.claim import (
     decide_auto_claim,
     decide_manual_start,
     load_work_authority,
+    work_authority_digest,
 )
 
 
@@ -131,6 +132,7 @@ def test_active_run_is_idempotent_and_label_removal_does_not_cancel(tmp_path: Pa
         active_snapshot_hash=candidate.authority.snapshot_hash,
         active_source_revisions=candidate.authority.source_revisions,
         active_provider_revision=candidate.authority.github_provider_revision,
+        active_authority_digest=work_authority_digest(candidate.authority),
     )
     assert decide_manual_start(active, now_epoch=1_000).action == "resume"
     assert decide_auto_claim(active, now_epoch=1_000).action == "resume"
@@ -188,6 +190,7 @@ def test_resume_requires_exact_persisted_authority_and_terminal_is_not_active(tm
         active_snapshot_hash=candidate.authority.snapshot_hash,
         active_source_revisions=candidate.authority.source_revisions,
         active_provider_revision=candidate.authority.github_provider_revision,
+        active_authority_digest=work_authority_digest(candidate.authority),
     )
     assert decide_manual_start(active, now_epoch=1_000).action == "resume"
     with pytest.raises(ValueError, match="claim key"):

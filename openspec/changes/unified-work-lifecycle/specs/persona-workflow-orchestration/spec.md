@@ -5,10 +5,16 @@ Manager MUST以registry schema v2保存`WorkflowRun`與`WorkflowStep`，並以`r
 
 每張非Manager card MUST由production dispatcher建立綁定run、claim、repo、source revision、phase、card、persona與model identity的durable Job。Manager MUST只在該Job successful terminal後建立canonical coordinator-root evidence並原子綁回Job；caller-supplied evidence path/hash MUST被拒絕。Periodic terminal poll MUST可在restart後由registry重建目前card並繼續推進；同phase所有card通過前 MUST NOT前進。
 
+Claim key MUST雜湊該work item的canonical semantic authority與provider/source revisions，MUST NOT納入snapshot sequence、written-at、whole-fleet hash或其他repo noise。
+
 #### Scenario: Claim後crash/restart
 - **WHEN**相同claim key在restart後再次送達
 - **THEN** Manager回傳既有WorkflowRun
 - **THEN**不重複建立job、branch、worktree或PR
+
+#### Scenario: Snapshot只有fleet metadata更新
+- **WHEN**同一work item的provider/source revisions與confirmed refs未變，但snapshot sequence、written-at或其他repo資料改變
+- **THEN**Manager重用既有WorkflowRun與claim key，只更新snapshot provenance
 
 #### Scenario: Malformed v1 registry
 - **WHEN**migration輸入schema malformed或backup無法durably寫入

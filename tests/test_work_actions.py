@@ -148,6 +148,78 @@ def test_start_is_restart_idempotent_and_auto_uses_typed_label_command(tmp_path:
         )
 
 
+def test_auto_without_issue_mutates_every_mapped_issue(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "auto",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "enabled": True,
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        now=lambda: 200,
+        runner=runner,
+    )
+    assert result["result"] == {"action": "auto", "enabled": True, "issues": [12, 13]}
+    assert [call[4] for call in calls] == [
+        "repos/acme/demo/issues/12/labels",
+        "repos/acme/demo/issues/13/labels",
+    ]
+
+
+def test_auto_without_issue_fails_closed_if_any_label_mutation_fails(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        failed = "issues/13/" in " ".join(argv)
+        return SimpleNamespace(returncode=1 if failed else 0, stdout="{}", stderr="boom" if failed else "")
+
+    with pytest.raises(RuntimeError, match="auto-label mutation failed"):
+        work_actions.execute_work_action(
+            args={
+                "action": "auto",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "enabled": False,
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            now=lambda: 200,
+            runner=runner,
+        )
+    assert len(calls) == 2
+
+
+def test_preflight_authorization_hash_excludes_drifting_command_output() -> None:
+    first = PreflightResult(
+        True,
+        None,
+        CommandResult(("policy",), 0, "first stdout", "first stderr"),
+        CommandResult(("preflight",), 0, "duration=1", ""),
+        HEAD,
+        TREE,
+    )
+    second = PreflightResult(
+        True,
+        None,
+        CommandResult(("policy",), 0, "different stdout", "different stderr"),
+        CommandResult(("preflight",), 0, "duration=999", "warning text"),
+        HEAD,
+        TREE,
+    )
+    assert work_actions._preflight_hash(first) == work_actions._preflight_hash(second)
+
+
 def test_source_change_starts_new_run_and_terminal_run_is_not_resumed(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
@@ -184,6 +256,38 @@ def test_source_change_starts_new_run_and_terminal_run_is_not_resumed(tmp_path: 
     )
     assert changed["result"]["action"] == "claim"
     assert changed["result"]["run"]["run_id"] != first["result"]["run"]["run_id"]
+
+
+def test_snapshot_refresh_noise_keeps_same_semantic_run(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    first = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    first_snapshot_hash = first["result"]["run"]["snapshot_hash"]
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    payload.update(
+        {
+            "sequence": 99,
+            "written_at": "2026-07-17T12:00:00Z",
+            "fleet_noise": {"other/repo": "changed"},
+        }
+    )
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    refreshed = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    assert refreshed["result"]["action"] == "resume"
+    assert refreshed["result"]["run"]["run_id"] == first["result"]["run"]["run_id"]
+    assert refreshed["result"]["run"]["snapshot_hash"] != first_snapshot_hash
 
 
 def test_periodic_auto_scan_claims_labeled_work_and_persists_missing_issue(tmp_path: Path) -> None:
@@ -407,6 +511,24 @@ def test_all_actions_reject_malformed_repo_and_repo_root_remote_mismatch(tmp_pat
             requested_by="operator",
             snapshot_path=tmp_path / "missing",
         )
+
+
+def test_repo_root_must_be_exact_git_toplevel(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path / "repo")
+    nested = root / "nested"
+    nested.mkdir()
+    with pytest.raises(ValueError, match="top-level"):
+        work_actions.execute_work_action(
+            args={
+                "action": "link",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(nested),
+                "kind": "openspec",
+                "ref": "demo",
+            },
+            requested_by="operator",
+        )
     root = _init_repo(tmp_path / "other", repo="acme/other")
     with pytest.raises(ValueError, match="remote.*match"):
         work_actions.execute_work_action(
@@ -480,6 +602,50 @@ def test_ship_payload_refs_must_exactly_match_work_authority(
             state_path=state,
             now=lambda: 200,
         )
+
+
+@pytest.mark.parametrize(
+    "snapshot_overrides",
+    [
+        {"prs": (8, 9)},
+        {"changes": ("demo", "other")},
+        {"todo_paths": ("docs/todo.md", "docs/other.md")},
+    ],
+)
+def test_ship_needs_human_when_authority_has_multiple_delivery_targets(
+    tmp_path: Path, snapshot_overrides: dict
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", **snapshot_overrides)
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    result = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    assert result["result"] == {
+        "action": "needs_human",
+        "reason": "multiple-delivery-targets-unsupported",
+    }
+    persisted = json.loads(state.read_text(encoding="utf-8"))["runs"]["acme/demo/demo"]
+    assert persisted["status"] == "needs_human"
 
 
 def test_ship_rejects_old_run_after_current_authority_changes(tmp_path: Path) -> None:
@@ -939,6 +1105,104 @@ def test_external_merge_without_durable_authorization_needs_human(monkeypatch, t
         "reason": "external-merge-without-authorization",
     }
     assert merge_calls == []
+
+
+def test_crash_reconcile_uses_stable_authorization_without_rerunning_preflight(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    run = persisted["runs"]["acme/demo/demo"]
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    authorization = work_actions._authorization_record(
+        {
+            "schema": "cortex-merge-authorization/v1",
+            "run_id": run["run_id"],
+            "workflow_step_ids": run["workflow_step_ids"],
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "authority_digest": work_actions.work_authority_digest(authority),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "head": HEAD,
+            "tree_hash": TREE,
+            "copilot_requested_at_epoch": 200.0,
+            "copilot_review_id": 9,
+            "copilot_hash": "1" * 64,
+            "foreign_review_path": "/evidence/review.json",
+            "foreign_review_hash": "2" * 64,
+            "preflight_hash": "3" * 64,
+            "checks_hash": "4" * 64,
+        },
+        state_path=state,
+    )
+    run["delivery_binding"] = {
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+    }
+    run["ship"] = {
+        "phase": "merge-authorized",
+        "head": HEAD,
+        "tree_hash": TREE,
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "merge_authorization": authorization,
+    }
+    state.write_text(json.dumps(persisted), encoding="utf-8")
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(True, HEAD, "c" * 40)
+
+        def ensure_pr_metadata(self, **kwargs):
+            raise AssertionError("crash reconciliation must not rewrite PR metadata")
+
+    class Orchestrator:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("crash reconciliation must not rerun preflight")
+        ),
+    )
+    result = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 220,
+    )
+    assert result["result"]["action"] == "merged-awaiting-closure"
 
 
 def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(

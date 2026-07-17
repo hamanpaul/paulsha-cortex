@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -291,7 +290,6 @@ def work_authority_digest(authority: WorkAuthority) -> str:
     payload = {
         "repo": authority.repo,
         "work_id": authority.work_id,
-        "snapshot_hash": authority.snapshot_hash,
         "provider_id": authority.github_provider_id,
         "provider_revision": authority.github_provider_revision,
         "source_revisions": list(authority.source_revisions),
@@ -299,6 +297,7 @@ def work_authority_digest(authority: WorkAuthority) -> str:
         "mapped_prs": list(authority.mapped_prs),
         "mapped_openspec": list(authority.mapped_openspec),
         "mapped_todo_paths": list(authority.mapped_todo_paths),
+        "confirmed_todo": authority.confirmed_todo,
     }
     return verification.canonical_json_hash(payload)
 
@@ -349,6 +348,7 @@ class ClaimCandidate:
     active_snapshot_hash: str | None = None
     active_source_revisions: tuple[str, ...] | None = None
     active_provider_revision: str | None = None
+    active_authority_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -418,6 +418,8 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             or not candidate.active_source_revisions
             or not isinstance(candidate.active_provider_revision, str)
             or not candidate.active_provider_revision
+            or not isinstance(candidate.active_authority_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", candidate.active_authority_digest) is None
         ):
             raise ValueError("active workflow authority metadata missing")
 
@@ -429,13 +431,9 @@ def build_claim_key(candidate: ClaimCandidate) -> str:
     payload = {
         "repo": candidate.repo,
         "work_id": candidate.work_id,
-        "github_provider_revision": candidate.authority.github_provider_revision,
-        "work_snapshot_hash": candidate.authority.snapshot_hash,
-        "source_revisions": sorted(candidate.source_revisions),
+        "authority_digest": work_authority_digest(candidate.authority),
     }
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    digest = verification.canonical_json_hash(payload)
     return f"claim:v1:{digest}"
 
 
@@ -443,7 +441,7 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     if candidate.active_run_id is None:
         return None
     authority_changed = (
-        candidate.active_snapshot_hash != candidate.authority.snapshot_hash
+        candidate.active_authority_digest != work_authority_digest(candidate.authority)
         or tuple(sorted(candidate.active_source_revisions or ()))
         != candidate.authority.source_revisions
         or candidate.active_provider_revision
@@ -460,6 +458,7 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
             active_snapshot_hash=None,
             active_source_revisions=None,
             active_provider_revision=None,
+            active_authority_digest=None,
         )
     )
     if candidate.active_claim_key != expected_key:

@@ -231,6 +231,12 @@ def _validate_work_authority(
         or not math.isfinite(authority.github_last_success_epoch)
     ):
         raise ValueError("confirmed WorkAuthority is incomplete")
+    if (
+        len(authority.mapped_prs) != 1
+        or len(authority.mapped_openspec) != 1
+        or len(authority.mapped_todo_paths) != 1
+    ):
+        raise ValueError("confirmed WorkAuthority must have a single delivery target")
     age = float(now_epoch) - authority.github_last_success_epoch
     if age < 0 or age > PROVIDER_MAX_AGE_SECONDS:
         raise RuntimeError("provider degraded or stale")

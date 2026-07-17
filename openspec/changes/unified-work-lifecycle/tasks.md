@@ -29,11 +29,11 @@
 ## 3. PR C — Delivery automation
 
 - [x] 3.1 RED-testmanual default、confirmed Todo+label auto claim、issue-only、missing issue、label removal與crash/restart。
-- [x] 3.2 實作typed `work link|unlink|start|resume|auto` control requests與periodic auto-claim scan；Manager維持唯一writer。
+- [x] 3.2 實作typed `work link|unlink|start|resume|auto` control requests與periodic auto-claim scan；Manager維持唯一writer；auto無issue selector時mutation全部mapped issues且API failure fail-closed。
 - [ ] 3.3 實作official archive、Todo/spec/docs/changelog gate、zh-TW PR metadata、policy與`PSC_PREFLIGHT_CMD` runner。（change-specific validation/archive/preflight與mapped PR authenticated update+reread已落地；新 PR create orchestration尚未完成。）
 - [x] 3.4 RED-testold-HEAD/error Copilot review、unresolved thread、push未重審、failed/cancelled/pending checks與HEAD race。
 - [x] 3.5 實作每HEAD review epoch、兩輪/15分鐘bounded loop、exact-tree skip-tests與needs_human fallback。
-- [x] 3.6 實作`gh pr merge --merge`前final reread、atomic durable `merge-authorized` record、crash reconciliation與merge後remote closure/authority-bound CompletionRecord。
+- [x] 3.6 實作`gh pr merge --merge`前final reread、stable-hash atomic durable `merge-authorized` record、免重跑preflight的crash reconciliation與merge後remote closure/authority-bound CompletionRecord；V1多delivery target轉needs_human。
 - [ ] 3.7 通過GitHub seam/focused/full/integration tests、help、OpenSpec、policy與preflight；對應完成issue #5/#8與ship-gate issue。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
