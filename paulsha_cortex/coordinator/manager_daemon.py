@@ -17,6 +17,7 @@ from ..control import constants, contract
 from . import autonomy, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
+from .model_identities import load_model_identities
 from .registry import JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 
@@ -297,10 +298,37 @@ def build_request_executor(
             registry = getattr(dispatcher, "_registry", None)
             if registry is None:
                 raise RuntimeError("workflow-action requires dispatcher._registry")
-            return manager.apply_workflow_action(
+            identities = workflow_identity_registry or load_model_identities()
+            state_path = getattr(registry, "_state_path", None)
+            coordinator_root = (
+                Path(state_path).resolve().parent
+                if state_path is not None
+                else paths.coordinator_root().resolve()
+            )
+            launcher_factory = lambda identity: _resolve_launcher(
+                identity.executor,
+                launcher,
+                allow_unsafe=False,
+                model=identity.model_id,
+            )
+            if args.get("action") == "resume":
+                extras = set(args) - {"action", "run_id"}
+                if extras:
+                    raise ValueError(
+                        f"workflow resume rejects caller evidence/input: {sorted(extras)[0]}"
+                    )
+                return manager.resume_workflow_run(
+                    dispatcher,
+                    run_id=str(args.get("run_id") or ""),
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    ship_validator=workflow_ship_validator,
+                )
+            result = manager.apply_workflow_action(
                 registry,
                 args=args,
-                identity_registry=workflow_identity_registry,
+                identity_registry=identities,
                 probes=workflow_probes,
                 primary_questioner=workflow_primary_questioner,
                 secondary_planner=workflow_secondary_planner,
@@ -308,7 +336,20 @@ def build_request_executor(
                 runtime_factory=workflow_runtime_factory,
                 ship_validator=workflow_ship_validator,
                 git_runner=getattr(dispatcher, "_git_runner", None),
+                coordinator_root=coordinator_root,
             )
+            if args.get("action") == "start":
+                run = registry.get_workflow_run(str(result["run_id"]))
+                job = manager.dispatch_workflow_card(
+                    dispatcher,
+                    run=run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                )
+                if job is not None:
+                    result["job_id"] = job["job_id"]
+            return result
         if request["type"] == "work-action":
             return work_action_fn(
                 args=dict(args),
@@ -493,6 +534,8 @@ def build_periodic_tick_runner(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
     auto_claim_fn: Callable[[], list[dict[str, Any]]] = manager.run_auto_claim_scan,
+    workflow_identity_registry=None,
+    workflow_ship_validator=None,
 ) -> Callable[[], dict[str, Any]]:
     predicate = lambda slice_id: autonomy.default_is_satisfied(
         slice_id,
@@ -502,6 +545,40 @@ def build_periodic_tick_runner(
 
     def execute() -> dict[str, Any]:
         auto_claims = auto_claim_fn()
+        registry = getattr(dispatcher, "_registry", None)
+        if registry is not None and hasattr(registry, "list_workflow_runs"):
+            state_path = getattr(registry, "_state_path", None)
+            coordinator_root = (
+                Path(state_path).resolve().parent
+                if state_path is not None
+                else paths.coordinator_root().resolve()
+            )
+            identities = workflow_identity_registry or load_model_identities()
+            launcher_factory = lambda identity: _resolve_launcher(
+                identity.executor,
+                launcher,
+                allow_unsafe=False,
+                model=identity.model_id,
+            )
+            for workflow in registry.list_workflow_runs():
+                if workflow.current_phase not in {"plan", "build", "verify", "review"}:
+                    continue
+                try:
+                    manager.resume_workflow_run(
+                        dispatcher,
+                        run_id=workflow.run_id,
+                        identities=identities,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                        ship_validator=workflow_ship_validator,
+                    )
+                except Exception as exc:
+                    _log_error(exc)
+                    registry._manager_update_workflow_run(
+                        workflow.run_id,
+                        facets=("needs_human",),
+                        gate_status="running",
+                    )
         metas = scan_specs_fn(specs_dir)
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=default_allow_unsafe)
         active_launcher = _resolve_launcher(

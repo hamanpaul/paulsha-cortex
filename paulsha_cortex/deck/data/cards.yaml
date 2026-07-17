@@ -19,7 +19,9 @@ cards:
     skill_ref: "superpowers:brainstorming"
     phase: define
     requires: []
-    produces: ["docs/superpowers/specs/*<task-slug>*-design.md"]
+    produces:
+      - "docs/superpowers/specs/*<task-slug>*-spec.md"
+      - "docs/superpowers/specs/*<task-slug>*-design.md"
     persona_binding: planner
 
   - id: openspec-propose

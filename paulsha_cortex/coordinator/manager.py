@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -20,10 +21,16 @@ from .model_identities import CapabilityProbe, IdentityRegistry, load_model_iden
 from .planning import (
     PlanningArtifact,
     PlanningScope,
+    assess_planning_artifact,
     assess_planning_completeness,
     run_heterogeneous_brainstorm,
 )
-from .workflow import GateEvidenceRef, WorkflowManifest, validate_workflow_phase_transition
+from .workflow import (
+    WORKFLOW_PHASES,
+    GateEvidenceRef,
+    WorkflowManifest,
+    validate_workflow_phase_transition,
+)
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
@@ -1836,6 +1843,7 @@ def _job_for_workflow_card(
         "workflow_claim_key": run.claim_key,
         "workflow_repo": run.repo,
         "workflow_card": card_id,
+        "workflow_phase": run.current_phase,
         "source_revision": run.source_revision,
         "persona": expected_persona,
     }
@@ -1863,13 +1871,30 @@ def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> st
         or not isinstance(worktree, str)
     ):
         raise ValueError("workflow job candidate/worktree missing")
-    runner = git_runner or subprocess.run
-    common = {"capture_output": True, "text": True, "check": False}
-    exists = runner(["git", "-C", worktree, "cat-file", "-e", f"{candidate}^{{commit}}"], **common)
-    if getattr(exists, "returncode", 1) != 0:
+
+    def run_git(argv: list[str]):
+        if git_runner is None:
+            return subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            return git_runner(argv, capture_output=True, text=True, check=False)
+        except TypeError:
+            return git_runner(argv[1:] if argv and argv[0] == "git" else argv)
+
+    exists = run_git(["git", "-C", worktree, "cat-file", "-e", f"{candidate}^{{commit}}"])
+    if isinstance(exists, str):
+        exists_ok = True
+    else:
+        exists_ok = getattr(exists, "returncode", 1) == 0
+    if not exists_ok:
         raise ValueError("workflow candidate does not exist")
-    head = runner(["git", "-C", worktree, "rev-parse", "HEAD"], **common)
-    if getattr(head, "returncode", 1) != 0 or getattr(head, "stdout", "").strip().lower() != candidate:
+    head = run_git(["git", "-C", worktree, "rev-parse", "HEAD"])
+    if isinstance(head, str):
+        head_ok = True
+        head_text = head
+    else:
+        head_ok = getattr(head, "returncode", 1) == 0
+        head_text = getattr(head, "stdout", "")
+    if not head_ok or not isinstance(head_text, str) or head_text.strip().lower() != candidate:
         raise ValueError("workflow candidate is not exact worktree HEAD")
     return candidate
 
@@ -1889,6 +1914,7 @@ def _review_builder_job(
         "workflow_run_id": run.run_id,
         "workflow_claim_key": run.claim_key,
         "workflow_repo": run.repo,
+        "workflow_phase": "build",
         "source_revision": run.source_revision,
         "persona": "builder",
         "subject_head": candidate,
@@ -1914,51 +1940,269 @@ def _review_builder_job(
     return builder, identity
 
 
-def _read_trusted_artifact_ref(locator: object, validator) -> tuple[dict[str, object], str, str]:
-    if not isinstance(locator, dict):
-        raise ValueError("trusted evidence ref must be an object")
-    ref = locator.get("path")
-    expected_hash = locator.get("hash")
-    if not isinstance(ref, str) or not isinstance(expected_hash, str):
-        raise ValueError("trusted evidence ref requires path/hash")
+def _extract_terminal_json(log_path: object) -> dict[str, object]:
+    if not isinstance(log_path, str) or not log_path:
+        raise ValueError("workflow terminal log missing")
     try:
-        payload = json.loads(Path(ref).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("trusted evidence unreadable") from exc
-    normalized = validator(payload)
-    actual_hash = verification.canonical_json_hash(normalized)
-    if actual_hash != expected_hash:
-        raise ValueError("trusted evidence hash mismatch")
-    return normalized, ref, actual_hash
+        lines = Path(log_path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("workflow terminal log unreadable") from exc
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        nested = value.get("workflow_evidence")
+        if isinstance(nested, dict):
+            return nested
+        for key in ("result", "content", "message", "text"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                try:
+                    parsed = json.loads(nested)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    return parsed
+        return value
+    raise ValueError("workflow terminal log has no JSON evidence")
 
 
-def _verified_output_refs(args: Mapping[str, object], *, repo_root: Path) -> tuple[str, ...]:
-    rows = args.get("artifacts", [])
+def _canonical_workflow_artifacts(
+    rows: object,
+    *,
+    repo_root: Path,
+) -> list[dict[str, str]]:
     if not isinstance(rows, list):
-        raise ValueError("workflow card artifacts must be a list")
-    refs: list[str] = []
-    for row in rows:
-        if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
-            raise ValueError("workflow card artifact locator invalid")
-        ref = row.get("path")
-        digest = row.get("sha256")
-        if not isinstance(ref, str) or not isinstance(digest, str):
-            raise ValueError("workflow card artifact locator invalid")
+        raise ValueError("workflow terminal outputs must be a list")
+    artifacts: list[dict[str, str]] = []
+    for ref in rows:
+        if not isinstance(ref, str) or not ref:
+            raise ValueError("workflow terminal output path invalid")
         relative = Path(ref)
         if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError("workflow card artifact escapes repo")
+            raise ValueError("workflow terminal output escapes repo")
         unresolved = repo_root / relative
         if unresolved.is_symlink():
-            raise ValueError("workflow card artifact symlink rejected")
-        path = unresolved.resolve()
-        path.relative_to(repo_root)
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-            raise ValueError("workflow card artifact hash mismatch")
+            raise ValueError("workflow terminal output symlink rejected")
+        resolved = unresolved.resolve()
+        resolved.relative_to(repo_root)
+        if not resolved.is_file():
+            raise ValueError("workflow terminal output missing")
+        artifacts.append({"path": ref, "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest()})
+    return artifacts
+
+
+def terminalize_workflow_job(
+    registry,
+    *,
+    job_id: str,
+    coordinator_root: str | Path,
+) -> dict[str, object]:
+    """Create and atomically bind canonical evidence for one terminal workflow job."""
+
+    job = registry.get_job(job_id)
+    if job.get("workflow_evidence") is not None:
+        return job
+    if job.get("status") != "exited" or job.get("exit_code") != 0:
+        raise ValueError("workflow job is not successful terminal")
+    phase = job.get("workflow_phase")
+    if phase not in {"plan", "build", "verify", "review"}:
+        raise ValueError("workflow job phase is not terminalizable")
+    raw = _extract_terminal_json(job.get("log_path"))
+    candidate: str | None = None
+    if phase in {"plan", "build"}:
+        required = {"schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"}
+        if set(raw) != required or raw.get("schema_version") != 1 or raw.get("kind") != "workflow-card":
+            raise ValueError("workflow card terminal evidence schema invalid")
+        if raw.get("status") != "passed":
+            raise ValueError("workflow card terminal evidence did not pass")
+        candidate_value = raw.get("candidate")
+        if phase == "build":
+            if not isinstance(candidate_value, str) or verification.SAFE_SHA_RE.fullmatch(candidate_value) is None:
+                raise ValueError("workflow build candidate invalid")
+            candidate = candidate_value.lower()
+        elif candidate_value is not None:
+            raise ValueError("workflow plan candidate must be null")
+        normalized_payload: dict[str, object] = dict(raw)
+    elif phase == "verify":
+        normalized_payload = verification.validate_verification_evidence(raw)
+        candidate = str(normalized_payload["candidate"])
+    else:
+        normalized_payload = foreign_review.validate_gate_evaluation(raw)
+        candidate = str(normalized_payload["candidate"])
+    if (
+        normalized_payload.get("run_id", job.get("workflow_run_id")) != job.get("workflow_run_id")
+        or normalized_payload.get("card_id", job.get("workflow_card")) != job.get("workflow_card")
+    ):
+        raise ValueError("workflow terminal evidence run/card mismatch")
+    declared_outputs = job.get("workflow_outputs")
+    if not isinstance(declared_outputs, list):
+        raise ValueError("workflow job declared outputs missing")
+    output_refs = normalized_payload.get("outputs", [])
+    if phase in {"plan", "build"}:
+        if not isinstance(output_refs, list):
+            raise ValueError("workflow terminal outputs invalid")
+        if any(
+            not isinstance(ref, str)
+            or not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_outputs)
+            for ref in output_refs
+        ):
+            raise ValueError("workflow terminal output is outside manifest refs")
+        if any(not any(fnmatch.fnmatch(str(ref), pattern) for ref in output_refs) for pattern in declared_outputs):
+            raise ValueError("workflow terminal output is incomplete for manifest refs")
+    repo_root_value = job.get("workflow_repo_root")
+    if not isinstance(repo_root_value, str) or not repo_root_value:
+        raise ValueError("workflow job repo root missing")
+    artifacts = _canonical_workflow_artifacts(
+        normalized_payload.get("outputs", []),
+        repo_root=Path(repo_root_value).resolve(),
+    )
+    envelope = {
+        "schema_version": 1,
+        "kind": str(phase),
+        "job": {
+            "job_id": job["job_id"],
+            "run_id": job["workflow_run_id"],
+            "claim_key": job["workflow_claim_key"],
+            "repo": job["workflow_repo"],
+            "source_revision": job["source_revision"],
+            "card_id": job["workflow_card"],
+            "phase": phase,
+            "inputs": job.get("workflow_inputs", []),
+            "outputs": declared_outputs,
+        },
+        "payload": normalized_payload,
+        "artifacts": artifacts,
+    }
+    content = (json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    root = Path(coordinator_root).resolve()
+    relative = Path("evidence") / "workflow" / f"{hashlib.sha256(job_id.encode()).hexdigest()}.json"
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created_evidence = False
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if path.is_symlink() or path.read_bytes() != content:
+            raise ValueError("workflow canonical evidence conflict")
+    else:
+        created_evidence = True
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    locator = {
+        "kind": str(phase),
+        "path": relative.as_posix(),
+        "hash": hashlib.sha256(content).hexdigest(),
+    }
+    try:
+        return registry.bind_workflow_evidence(job_id, locator=locator, subject_head=candidate)
+    except BaseException:
+        if created_evidence:
+            path.unlink(missing_ok=True)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        raise
+
+
+def _read_job_workflow_evidence(
+    job: Mapping[str, object],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> tuple[dict[str, object], tuple[str, ...], str, str]:
+    locator = job.get("workflow_evidence")
+    if not isinstance(locator, dict) or set(locator) != {"kind", "path", "hash"}:
+        raise ValueError("workflow job has no canonical evidence locator")
+    relative = Path(str(locator["path"]))
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("evidence", "workflow"):
+        raise ValueError("workflow canonical evidence path invalid")
+    root = Path(coordinator_root).resolve()
+    unresolved = root / relative
+    if unresolved.is_symlink():
+        raise ValueError("workflow canonical evidence symlink rejected")
+    path = unresolved.resolve()
+    path.relative_to(root)
+    content = path.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != locator["hash"]:
+        raise ValueError("workflow canonical evidence hash mismatch")
+    payload = json.loads(content.decode("utf-8"))
+    expected_job = {
+        "job_id": job["job_id"],
+        "run_id": run.run_id,
+        "claim_key": run.claim_key,
+        "repo": run.repo,
+        "source_revision": run.source_revision,
+        "card_id": job["workflow_card"],
+        "phase": job["workflow_phase"],
+        "inputs": job.get("workflow_inputs", []),
+        "outputs": job.get("workflow_outputs", []),
+    }
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != locator["kind"]
+        or payload.get("job") != expected_job
+        or not isinstance(payload.get("payload"), dict)
+        or not isinstance(payload.get("artifacts"), list)
+    ):
+        raise ValueError("workflow canonical evidence binding invalid")
+    repo_root_value = job.get("workflow_repo_root")
+    if not isinstance(repo_root_value, str) or not repo_root_value:
+        raise ValueError("workflow evidence repo root missing")
+    repo_root = Path(repo_root_value).resolve()
+    refs: list[str] = []
+    for row in payload["artifacts"]:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+            raise ValueError("workflow canonical artifact locator invalid")
+        ref = row.get("path")
+        expected_hash = row.get("sha256")
+        if not isinstance(ref, str) or not isinstance(expected_hash, str):
+            raise ValueError("workflow canonical artifact locator invalid")
+        relative_artifact = Path(ref)
+        if relative_artifact.is_absolute() or ".." in relative_artifact.parts:
+            raise ValueError("workflow canonical artifact escapes repo")
+        unresolved_artifact = repo_root / relative_artifact
+        if unresolved_artifact.is_symlink():
+            raise ValueError("workflow canonical artifact symlink rejected")
+        artifact_path = unresolved_artifact.resolve()
+        artifact_path.relative_to(repo_root)
+        if (
+            not artifact_path.is_file()
+            or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != expected_hash
+        ):
+            raise ValueError("workflow canonical artifact drift")
         refs.append(ref)
-    return tuple(refs)
+    return payload["payload"], tuple(refs), str(path), digest
 
 
-def _write_planning_artifacts(root_value: str, rows: object) -> None:
+def _publish_planning_artifacts(
+    root_value: str,
+    rows: object,
+    *,
+    work_id: str,
+    task_slug: str,
+    allowed_refs: tuple[str, ...],
+) -> Callable[[], None]:
     if not isinstance(rows, list):
         raise ValueError("planning artifacts must be a list")
     root = Path(root_value).resolve()
@@ -1971,35 +2215,317 @@ def _write_planning_artifacts(root_value: str, rows: object) -> None:
         if not isinstance(path_value, str) or not isinstance(content, str):
             raise ValueError("planning artifact path/content invalid")
         relative = Path(path_value)
-        allowed = (
-            relative.parts[:2] == ("docs", "superpowers")
-            or relative.parts[:2] == ("openspec", "changes")
+        docs_bound = (
+            relative.parts[:3] in {
+                ("docs", "superpowers", "specs"),
+                ("docs", "superpowers", "plans"),
+            }
+            and task_slug in relative.name
         )
-        if relative.is_absolute() or ".." in relative.parts or not allowed or relative.suffix != ".md":
+        openspec_bound = (
+            len(relative.parts) >= 4
+            and relative.parts[:2] == ("openspec", "changes")
+            and relative.parts[2] == work_id
+            and relative.parts[2] != "archive"
+        )
+        manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not (docs_bound or openspec_bound)
+            or not manifest_bound
+            or relative.suffix != ".md"
+        ):
             raise ValueError("planning artifact path outside governed roots")
         unresolved = root / relative
         if unresolved.is_symlink():
             raise ValueError("planning artifact symlink rejected")
         path = unresolved.resolve()
         path.relative_to(root)
+        artifact = PlanningArtifact(kind=str(row["kind"]), ref=path_value, text=content)
+        if not assess_planning_artifact(artifact).accepted:
+            raise ValueError(f"planning artifact is not accepted: {path_value}")
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"planning artifact no-clobber conflict: {path_value}")
         prepared.append((path, content.encode("utf-8")))
-    for path, content in prepared:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".planning.tmp")
-        temp = Path(temp_name)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, path)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
+
+    created: list[Path] = []
+    created_dirs: list[Path] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix=".cortex-planning-stage-", dir=root) as stage_dir:
+            staged: list[tuple[Path, Path]] = []
+            for index, (target, content) in enumerate(prepared):
+                stage = Path(stage_dir) / f"{index}.md"
+                with stage.open("xb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                staged.append((stage, target))
+            for stage, target in staged:
+                missing: list[Path] = []
+                parent = target.parent
+                while parent != root and not parent.exists():
+                    missing.append(parent)
+                    parent = parent.parent
+                target.parent.mkdir(parents=True, exist_ok=True)
+                created_dirs.extend(reversed(missing))
+                os.link(stage, target)
+                created.append(target)
+                directory_fd = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+    except BaseException:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        for path in reversed(created_dirs):
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            temp.unlink(missing_ok=True)
+                path.rmdir()
+            except OSError:
+                pass
+        raise
+
+    def rollback() -> None:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        for path in reversed(created_dirs):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+    return rollback
+
+
+def _current_workflow_step(run):
+    pending = [
+        step
+        for step in run.steps
+        if step.phase == run.current_phase and step.gate_result != "passed"
+    ]
+    return pending[0] if pending else None
+
+
+def _select_workflow_identity(run, step, identities: IdentityRegistry):
+    builder_domains = {
+        item.domain
+        for item in run.steps
+        if item.phase == "build" and item.gate_result == "passed" and item.domain is not None
+    }
+    candidates = list(identities.identities)
+    if step.persona == "planner":
+        candidates = [item for item in candidates if "planning" in item.capabilities]
+    if step.persona == "reviewer":
+        candidates = [item for item in candidates if item.independence_domain not in builder_domains]
+    elif run.primary_domain is not None:
+        preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
+        if preferred:
+            candidates = preferred
+    if not candidates:
+        raise ValueError(f"no configured identity for workflow persona: {step.persona}")
+    return candidates[0]
+
+
+def _workflow_job_prompt(run, step, *, builder_job_id: str | None) -> str:
+    contract: dict[str, object] = {
+        "run_id": run.run_id,
+        "work_id": run.work_id,
+        "repo": run.repo,
+        "source_revision": run.source_revision,
+        "phase": step.phase,
+        "card_id": step.card,
+        "persona": step.persona,
+        "inputs": list(step.inputs),
+        "declared_outputs": list(step.outputs),
+        "candidate": run.candidate_head,
+    }
+    if builder_job_id is not None:
+        contract["builder_job_id"] = builder_job_id
+    return (
+        "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
+        "path or hash because Manager will canonicalize it. Contract: "
+        + json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def dispatch_workflow_card(
+    dispatcher,
+    *,
+    run,
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+) -> dict[str, object] | None:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("workflow dispatch requires dispatcher registry")
+    step = _current_workflow_step(run)
+    if step is None or run.current_phase not in {"plan", "build", "verify", "review"}:
+        return None
+    matching = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_card") == step.card
+        and job.get("workflow_phase") == step.phase
+    ]
+    if matching:
+        return matching[-1]
+    identity = _select_workflow_identity(run, step, identities)
+    launcher = launcher_factory(identity)
+    if launcher is None:
+        raise ValueError("workflow launcher unavailable")
+    builder_jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("persona") == "builder"
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+    ]
+    builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+    if builder_jobs:
+        worktree = str(builder_jobs[-1]["worktree"])
+    elif step.phase == "build":
+        creator = getattr(dispatcher, "_worktree_creator", None)
+        if creator is None:
+            raise ValueError("workflow builder worktree creator unavailable")
+        worktree = str(creator.create(f"feature/{run.work_id}"))
+    else:
+        worktree = run.workspace_root
+    task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
+    job = registry.create_job(
+        task=task,
+        persona=step.persona,
+        kind="review" if step.persona == "reviewer" else "build",
+        branch=f"feature/{run.work_id}",
+        pane="",
+        worktree=worktree,
+        executor=identity.executor,
+        model_id=identity.model_id,
+        independence_domain=identity.independence_domain,
+        subject_head=run.candidate_head if step.phase in {"verify", "review"} else None,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=step.card,
+        workflow_phase=step.phase,
+        workflow_repo_root=worktree,
+        workflow_inputs=step.inputs,
+        workflow_outputs=step.outputs,
+        source_revision=run.source_revision,
+    )
+    try:
+        handle = launcher.launch(
+            slice_id=str(job["job_id"]),
+            prompt=_workflow_job_prompt(run, step, builder_job_id=builder_job_id),
+            worktree=worktree,
+            log_dir=str(Path(coordinator_root).resolve() / "logs" / "workflow"),
+        )
+        return registry.attach_launch_handle(
+            str(job["job_id"]),
+            executor=identity.executor,
+            model_id=identity.model_id,
+            session_name=handle.session_name,
+            pid=handle.pid,
+            log_path=handle.log_path,
+        )
+    except BaseException:
+        registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)
+        raise
+
+
+def resume_workflow_run(
+    dispatcher,
+    *,
+    run_id: str,
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+    ship_validator: Callable[..., object] | None = None,
+) -> dict[str, object]:
+    registry = getattr(dispatcher, "_registry", None)
+    if registry is None:
+        raise RuntimeError("workflow resume requires dispatcher registry")
+    run = registry.get_workflow_run(run_id)
+    step = _current_workflow_step(run)
+    if step is None:
+        if run.current_phase == "review" and ship_validator is not None:
+            last = [item for item in run.steps if item.phase == "review"][-1]
+            return apply_workflow_action(
+                registry,
+                args={"action": "advance", "run_id": run.run_id, "card_id": last.card, "current_phase": "ship"},
+                identity_registry=identities,
+                ship_validator=ship_validator,
+                git_runner=getattr(dispatcher, "_git_runner", None),
+                coordinator_root=coordinator_root,
+                trusted_terminal=True,
+            )
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
+    jobs = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_card") == step.card
+        and job.get("workflow_phase") == step.phase
+    ]
+    job = jobs[-1] if jobs else dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+    if job is None:
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+    if job.get("status") in IN_FLIGHT_STATUSES:
+        job = dispatcher.poll_headless_done(str(job["job_id"]))
+    if job.get("status") in IN_FLIGHT_STATUSES:
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
+    if job.get("status") != "exited" or job.get("exit_code") != 0:
+        updated = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), gate_status="running"
+        )
+        return {"run_id": run.run_id, "current_phase": updated.current_phase, "job_id": job["job_id"], "reason": "job-failed"}
+    job = terminalize_workflow_job(
+        registry,
+        job_id=str(job["job_id"]),
+        coordinator_root=coordinator_root,
+    )
+    phase_steps = [item for item in run.steps if item.phase == run.current_phase]
+    is_last = step.card == phase_steps[-1].card
+    next_phase = (
+        WORKFLOW_PHASES[WORKFLOW_PHASES.index(run.current_phase) + 1]
+        if is_last
+        else run.current_phase
+    )
+    result = apply_workflow_action(
+        registry,
+        args={
+            "action": "advance",
+            "run_id": run.run_id,
+            "card_id": step.card,
+            "job_id": job["job_id"],
+            "current_phase": next_phase,
+        },
+        identity_registry=identities,
+        ship_validator=ship_validator,
+        git_runner=getattr(dispatcher, "_git_runner", None),
+        coordinator_root=coordinator_root,
+        trusted_terminal=True,
+    )
+    updated = registry.get_workflow_run(run.run_id)
+    next_job = dispatch_workflow_card(
+        dispatcher,
+        run=updated,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        coordinator_root=coordinator_root,
+    )
+    if next_job is not None:
+        result["job_id"] = next_job["job_id"]
+    return result
 
 
 def apply_workflow_action(
@@ -2014,6 +2540,8 @@ def apply_workflow_action(
     runtime_factory: Callable[..., object] | None = None,
     ship_validator: Callable[..., object] | None = None,
     git_runner=None,
+    coordinator_root: str | Path | None = None,
+    trusted_terminal: bool = False,
 ) -> dict[str, object]:
     """Apply the sole production mutation API for Manager-owned workflows.
 
@@ -2024,6 +2552,8 @@ def apply_workflow_action(
 
     action = _required_workflow_string(args, "action")
     if action == "advance":
+        if not trusted_terminal:
+            raise ValueError("workflow advance is internal to terminal polling")
         run_id = _required_workflow_string(args, "run_id")
         current = registry.get_workflow_run(run_id)
         card_id = _required_workflow_string(args, "card_id")
@@ -2077,6 +2607,13 @@ def apply_workflow_action(
             expected_persona=step.persona,
             identities=identities,
         )
+        if coordinator_root is None:
+            raise ValueError("workflow canonical coordinator root unavailable")
+        evidence, outputs, evidence_path, evidence_hash = _read_job_workflow_evidence(
+            job,
+            run=current,
+            coordinator_root=coordinator_root,
+        )
         candidate = current.candidate_head
         if current.current_phase in {"build", "verify", "review"}:
             job_candidate = _verify_exact_candidate(job, git_runner=git_runner)
@@ -2090,15 +2627,10 @@ def apply_workflow_action(
         }
         if current.current_phase in {"verify", "review"} and identity.independence_domain in builder_domains:
             raise ValueError("workflow reviewer must use a foreign independence domain")
-        outputs = _verified_output_refs(
-            args, repo_root=Path(_required_workflow_string(args, "repo_root")).resolve()
-        )
         by_kind = {item.kind: item for item in current.gate_refs}
         verified = current.verified_head
         if current.current_phase == "verify":
-            evidence, evidence_path, evidence_hash = _read_trusted_artifact_ref(
-                args.get("verification_ref"), verification.validate_verification_evidence
-            )
+            evidence = verification.validate_verification_evidence(evidence)
             if (
                 evidence.get("slice_id") != f"{current.run_id}-{card_id}"
                 or evidence.get("candidate") != candidate
@@ -2108,9 +2640,7 @@ def apply_workflow_action(
             outputs = outputs + (evidence_path,)
             verified = candidate
         if current.current_phase == "review":
-            evaluation, evidence_path, evidence_hash = _read_trusted_artifact_ref(
-                args.get("review_ref"), foreign_review.validate_gate_evaluation
-            )
+            evaluation = foreign_review.validate_gate_evaluation(evidence)
             if (
                 evaluation.get("slice_id") != f"{current.run_id}-{card_id}"
                 or evaluation.get("candidate") != candidate
@@ -2210,6 +2740,7 @@ def apply_workflow_action(
         repo=_required_workflow_string(args, "repo"),
         claim_key=_required_workflow_string(args, "claim_key"),
         source_revision=_required_workflow_string(args, "source_revision"),
+        workspace_root=str(Path(_required_workflow_string(args, "artifact_root")).resolve()),
         combo=manifest.combo,
         current_phase="claim",
         issue_refs=tuple(args.get("issue_refs", ())),
@@ -2309,8 +2840,14 @@ def apply_workflow_action(
         primary_questioner=primary_questioner,
         secondary_planner=secondary_planner,
         primary_integrator=primary_integrator,
-        artifact_writer=lambda rows: _write_planning_artifacts(
-            _required_workflow_string(args, "artifact_root"), rows
+        artifact_writer=lambda rows: _publish_planning_artifacts(
+            _required_workflow_string(args, "artifact_root"),
+            rows,
+            work_id=run.work_id,
+            task_slug=manifest.task_slug,
+            allowed_refs=tuple(
+                ref for step in manifest.steps for ref in step.outputs
+            ),
         ),
     )
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:

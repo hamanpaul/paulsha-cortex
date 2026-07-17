@@ -63,6 +63,7 @@ def _create_run(registry: JobRegistry) -> WorkflowRun:
         repo="hamanpaul/paulsha-cortex",
         claim_key="hamanpaul/paulsha-cortex/unified-work-lifecycle/rev-a",
         source_revision="rev-a",
+        workspace_root="/tmp/paulsha-cortex",
         combo="feature-oneshot",
         current_phase="plan",
         steps=(_step(),),
@@ -237,3 +238,29 @@ def test_v2_atomic_write_failure_rolls_back_memory_and_file(
     assert state.read_bytes() == original
     assert registry.list_workflow_runs() == []
     assert not any(path.suffix == ".tmp" for path in tmp_path.iterdir())
+
+
+def test_terminal_workflow_evidence_locator_is_single_assignment_and_durable(tmp_path: Path) -> None:
+    state = tmp_path / "jobs.json"
+    registry = JobRegistry(state_path=state)
+    job = registry.create_job(
+        task="workflow-card", persona="builder", branch="feature/work", pane="",
+        worktree=str(tmp_path), exit_code=0, workflow_run_id="workflow-1",
+        workflow_claim_key="repo/work/rev", workflow_repo="owner/repo",
+        workflow_card="build", workflow_phase="build", workflow_repo_root=str(tmp_path),
+        source_revision="rev",
+    )
+    registry.update_status(str(job["job_id"]), "exited")
+    locator = {"kind": "build", "path": "evidence/workflow/card.json", "hash": "a" * 64}
+
+    registry.bind_workflow_evidence(str(job["job_id"]), locator=locator, subject_head="b" * 40)
+    restored = JobRegistry(state_path=state).get_job(str(job["job_id"]))
+    assert restored["workflow_evidence"] == locator
+    assert restored["subject_head"] == "b" * 40
+
+    with pytest.raises(ValueError, match="衝突"):
+        registry.bind_workflow_evidence(
+            str(job["job_id"]),
+            locator={**locator, "hash": "c" * 64},
+            subject_head="b" * 40,
+        )

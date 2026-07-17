@@ -648,7 +648,7 @@ def run_heterogeneous_brainstorm(
     primary_questioner: Callable[[Mapping[str, object]], object],
     secondary_planner: Callable[[Mapping[str, object], ModelIdentity], object],
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object],
-    artifact_writer: Callable[[object], None] | None = None,
+    artifact_writer: Callable[[object], Callable[[], None] | None] | None = None,
 ) -> BrainstormResult:
     empty_refs = PlanningGateRefs()
     if report.complete:
@@ -694,11 +694,12 @@ def run_heterogeneous_brainstorm(
             empty_refs,
             None,
         )
+    rollback_publication: Callable[[], None] | None = None
     if artifact_writer is not None:
         try:
             if not integration.get("artifacts"):
                 raise ValueError("structured artifact content missing")
-            artifact_writer(integration.get("artifacts", []))
+            rollback_publication = artifact_writer(integration.get("artifacts", []))
         except Exception:
             return BrainstormResult(
                 "needs_human",
@@ -709,6 +710,8 @@ def run_heterogeneous_brainstorm(
             )
     artifact_evidence = _post_integration_artifact_evidence(integration, artifact_root, report)
     if artifact_evidence is None:
+        if rollback_publication is not None:
+            rollback_publication()
         return BrainstormResult(
             "needs_human",
             "primary-artifact-invalid",
@@ -737,6 +740,8 @@ def run_heterogeneous_brainstorm(
     try:
         _write_immutable_json(evidence_path, evidence_payload)
     except FileExistsError:
+        if rollback_publication is not None:
+            rollback_publication()
         return BrainstormResult(
             "needs_human",
             "brainstorm-evidence-conflict",
@@ -745,6 +750,8 @@ def run_heterogeneous_brainstorm(
             None,
         )
     except OSError:
+        if rollback_publication is not None:
+            rollback_publication()
         return BrainstormResult(
             "needs_human",
             "brainstorm-evidence-write-failed",

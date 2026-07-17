@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +11,8 @@ from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     manager, manager_daemon, planning_runtime, registry as registry_module, review, verification,
 )
+from paulsha_cortex.coordinator.dispatcher import Dispatcher
+from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import CapabilityProbe, IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import (
@@ -80,21 +81,6 @@ def _workflow_args(manifest_path: Path, artifact_root: Path) -> dict[str, object
     }
 
 
-def _card_job(
-    registry: JobRegistry, run: WorkflowRun, *, card: str, persona: str,
-    executor: str, model: str, domain: str, worktree: Path,
-    candidate: str | None = None,
-) -> dict[str, object]:
-    job = registry.create_job(
-        task=f"{run.run_id}-{card}", persona=persona, kind="review" if persona == "reviewer" else "build",
-        branch=f"feature/{card}", pane="%0", worktree=str(worktree), executor=executor,
-        model_id=model, independence_domain=domain, subject_head=candidate, exit_code=0,
-        workflow_run_id=run.run_id, workflow_claim_key=run.claim_key, workflow_repo=run.repo,
-        workflow_card=card, source_revision=run.source_revision,
-    )
-    return registry.update_status(str(job["job_id"]), "exited")
-
-
 def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
@@ -128,7 +114,16 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             return SimpleNamespace(returncode=0, stdout=candidate + "\n", stderr="")
         raise AssertionError(argv)
 
-    dispatcher = SimpleNamespace(_registry=registry, _git_runner=git_runner)
+    created_branches: list[str] = []
+
+    class WorktreeCreator:
+        def create(self, branch, base_sha=None):
+            created_branches.append(branch)
+            return str(tmp_path)
+
+    dispatcher = Dispatcher(
+        registry, pane_sender=None, worktree_creator=WorktreeCreator(), git_runner=git_runner
+    )
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(_manifest().to_dict()), encoding="utf-8")
     identities = IdentityRegistry.from_rows(
@@ -148,6 +143,54 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         ]
     )
     calls: list[str] = []
+
+    class WorkflowLauncher:
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            contract_payload = json.loads(prompt.split("Contract: ", 1)[1])
+            job = registry.get_job(slice_id)
+            phase = contract_payload["phase"]
+            card = contract_payload["card_id"]
+            if phase == "plan":
+                evidence = {
+                    "schema_version": 1, "kind": "workflow-card", "status": "passed",
+                    "run_id": contract_payload["run_id"], "card_id": card,
+                    "candidate": None,
+                    "outputs": ["docs/superpowers/plans/production-wiring-plan.md"],
+                }
+            elif phase == "build":
+                evidence = {
+                    "schema_version": 1, "kind": "workflow-card", "status": "passed",
+                    "run_id": contract_payload["run_id"], "card_id": card,
+                    "candidate": candidate, "outputs": [],
+                }
+            elif phase == "verify":
+                evidence = {
+                    "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+                    "slice_id": f"{contract_payload['run_id']}-{card}",
+                    "candidate": candidate, "status": "verified", "summary": "ok",
+                    "details": {"card": card},
+                }
+            else:
+                evidence = review.build_gate_evaluation(
+                    slice_id=f"{contract_payload['run_id']}-{card}",
+                    state="passed", reason="accepted",
+                    builder_job_id=contract_payload["builder_job_id"],
+                    reviewer_job_id=slice_id, candidate=candidate,
+                    launch_identity={
+                        "builder": identities.require("codex", "gpt-primary").legacy_dict(),
+                        "reviewer": identities.require("claude", "claude-secondary").legacy_dict(),
+                    },
+                )
+            log_path = Path(log_dir) / f"{slice_id}.jsonl"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+            log_path.with_suffix(".exit").write_text("0", encoding="utf-8")
+            return LaunchHandle(
+                executor=str(job["executor"]), model_id=str(job["model_id"]),
+                session_name=slice_id, pid=100, log_path=str(log_path),
+            )
+
+    workflow_launcher = WorkflowLauncher()
 
     def questioner(report):
         calls.append("questioner")
@@ -207,6 +250,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         workflow_primary_questioner=questioner,
         workflow_secondary_planner=secondary,
         workflow_primary_integrator=integrator,
+        launcher=workflow_launcher,
     )
 
     result = executor(build_request(req_type="workflow-action", args=_workflow_args(manifest_path, tmp_path), requested_by="operator"))
@@ -217,129 +261,68 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     assert [ref.kind for ref in run.gate_refs] == ["brainstorm"]
     assert Path(run.gate_refs[0].ref).is_file()
 
-    plan_job = _card_job(
-        registry, run, card="writing-plans", persona="planner", executor="codex",
-        model="gpt-primary", domain="openai", worktree=tmp_path,
-    )
-    plan_path = tmp_path / "docs/superpowers/plans/production-wiring-plan.md"
-    plan_request = build_request(
-        req_type="workflow-action",
-        args={
-            "action": "advance", "run_id": run.run_id, "card_id": "writing-plans",
-            "job_id": plan_job["job_id"], "current_phase": "build", "repo_root": str(tmp_path),
-            "artifacts": [{
-                "path": str(plan_path.relative_to(tmp_path)),
-                "sha256": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
-            }],
-        },
-        requested_by="operator",
-    )
-    assert executor(plan_request)["current_phase"] == "build"
-
-    builder_jobs = []
-    build_cards = [step.card for step in run.steps if step.phase == "build"]
-    for index, card in enumerate(build_cards):
-        job = _card_job(
-            registry, run, card=card, persona="builder", executor="codex",
-            model="gpt-primary", domain="openai", worktree=tmp_path, candidate=candidate,
-        )
-        builder_jobs.append(job)
-        request = build_request(
+    with pytest.raises(ValueError, match="rejects caller evidence"):
+        executor(build_request(
             req_type="workflow-action",
             args={
-                "action": "advance", "run_id": run.run_id, "card_id": card,
-                "job_id": job["job_id"],
-                "current_phase": "verify" if index == len(build_cards) - 1 else "build",
-                "repo_root": str(tmp_path), "artifacts": [],
+                "action": "resume", "run_id": run.run_id,
+                "verification_ref": {"path": "/tmp/forged", "hash": "0" * 64},
             },
             requested_by="operator",
-        )
-        assert executor(request)["current_phase"] == (
-            "verify" if index == len(build_cards) - 1 else "build"
-        )
-        if index == 0:
-            with pytest.raises(ValueError, match="replay"):
-                executor(request)
-            persisted = registry.get_workflow_run(run.run_id)
-            passed = [
-                step.card for step in persisted.steps
-                if step.phase == "build" and step.gate_result == "passed"
-            ]
-            assert passed == [card]
+        ))
 
-    verify_card = next(step.card for step in run.steps if step.phase == "verify")
-    verify_job = _card_job(
-        registry, run, card=verify_card, persona="reviewer", executor="claude",
-        model="claude-secondary", domain="anthropic", worktree=tmp_path, candidate=candidate,
+    # Simulate daemon restart: only durable registry + job log/sentinel survive.
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    dispatcher = Dispatcher(
+        registry, pane_sender=None, worktree_creator=WorktreeCreator(), git_runner=git_runner
     )
-    verification_ref = verification.write_verification_evidence(
-        {
-            "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
-            "slice_id": f"{run.run_id}-{verify_card}", "candidate": candidate,
-            "status": "verified", "summary": "ok", "details": {"card": verify_card},
-        },
-        coordinator_root=tmp_path / "coordinator",
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        workflow_identity_registry=identities,
+        launcher=workflow_launcher,
     )
-    verify_request = build_request(
-        req_type="workflow-action",
-        args={
-            "action": "advance", "run_id": run.run_id, "card_id": verify_card,
-            "job_id": verify_job["job_id"], "current_phase": "review",
-            "repo_root": str(tmp_path), "artifacts": [], "verification_ref": verification_ref,
-        },
-        requested_by="operator",
-    )
-    assert executor(verify_request)["current_phase"] == "review"
 
-    review_cards = [step.card for step in run.steps if step.phase == "review"]
-    for index, card in enumerate(review_cards):
-        reviewer_job = _card_job(
-            registry, run, card=card, persona="reviewer", executor="claude",
-            model="claude-secondary", domain="anthropic", worktree=tmp_path, candidate=candidate,
-        )
-        evaluation = review.build_gate_evaluation(
-            slice_id=f"{run.run_id}-{card}", state="passed", reason="accepted",
-            builder_job_id=builder_jobs[0]["job_id"], reviewer_job_id=reviewer_job["job_id"],
-            candidate=candidate,
-            launch_identity={
-                "builder": identities.require("codex", "gpt-primary").legacy_dict(),
-                "reviewer": identities.require("claude", "claude-secondary").legacy_dict(),
-            },
-        )
-        review_ref = review.write_gate_evaluation(
-            evaluation, coordinator_root=tmp_path / "coordinator"
-        )
-        request = build_request(
+    periodic = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=workflow_launcher,
+        workflow_identity_registry=identities,
+        scan_specs_fn=lambda _: [],
+        run_tick_fn=lambda *args, **kwargs: {"dispatch_skipped": False},
+    )
+    periodic()
+    assert registry.get_workflow_run(run.run_id).current_phase == "build"
+
+    seen_phases = ["build"]
+    for _ in range(6):
+        result = executor(build_request(
             req_type="workflow-action",
-            args={
-                "action": "advance", "run_id": run.run_id, "card_id": card,
-                "job_id": reviewer_job["job_id"],
-                "current_phase": "ship" if index == len(review_cards) - 1 else "review",
-                "repo_root": str(tmp_path), "artifacts": [], "review_ref": review_ref,
-            },
+            args={"action": "resume", "run_id": run.run_id},
             requested_by="operator",
-        )
-        result = executor(request)
-        assert result["current_phase"] == "review"
-        if index == len(review_cards) - 1:
-            assert result["reason"] == "ship-validator-unavailable"
+        ))
+        seen_phases.append(result["current_phase"])
+    assert seen_phases == ["build", "build", "build", "verify", "review", "review", "review"]
+    assert result["reason"] == "ship-validator-unavailable"
 
-    last_card = review_cards[-1]
     fake_ship = build_request(
         req_type="workflow-action",
         args={
-            "action": "advance", "run_id": run.run_id, "card_id": last_card,
+            "action": "advance", "run_id": run.run_id, "card_id": "adversarial-review",
             "current_phase": "ship", "gate_refs": [{"kind": "copilot", "ref": "fake"}],
         },
         requested_by="operator",
     )
-    with pytest.raises(ValueError, match="never trusted"):
+    with pytest.raises(ValueError, match="internal"):
         executor(fake_ship)
     trusted_executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),
         handoff_dir=str(tmp_path / "handoff"),
         workflow_identity_registry=identities,
+        launcher=workflow_launcher,
         workflow_ship_validator=lambda **_: {
             "trusted": True, "status": "passed", "head": candidate, "commit_id": candidate,
             "ref": "github:copilot/current-head", "hash": "f" * 64,
@@ -347,10 +330,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     )
     trusted_ship = build_request(
         req_type="workflow-action",
-        args={
-            "action": "advance", "run_id": run.run_id, "card_id": last_card,
-            "current_phase": "ship",
-        },
+        args={"action": "resume", "run_id": run.run_id},
         requested_by="operator",
     )
     assert trusted_executor(trusted_ship)["current_phase"] == "ship"
@@ -361,6 +341,18 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     assert all(
         step.executor is not None and step.domain is not None and step.gate_result == "passed"
         for step in shipped.steps if step.phase in {"claim", "define", "plan", "build", "verify", "review"}
+    )
+    workflow_jobs = [job for job in registry.list_jobs() if job.get("workflow_run_id") == run.run_id]
+    assert len(workflow_jobs) == 7
+    assert created_branches == ["feature/production-wiring"]
+    assert all(job.get("workflow_evidence") for job in workflow_jobs)
+    assert all(job.get("workflow_claim_key") == run.claim_key for job in workflow_jobs)
+    assert all(isinstance(job.get("workflow_inputs"), list) for job in workflow_jobs)
+    assert all(isinstance(job.get("workflow_outputs"), list) for job in workflow_jobs)
+    assert all(not Path(job["workflow_evidence"]["path"]).is_absolute() for job in workflow_jobs)
+    assert all(
+        (tmp_path / job["workflow_evidence"]["path"]).is_file()
+        for job in workflow_jobs
     )
 
 
@@ -375,7 +367,7 @@ def test_workflow_candidate_must_exist_at_exact_worktree_head(tmp_path: Path) ->
         manager._verify_exact_candidate(job, git_runner=missing_runner)
 
 
-def test_manager_rejects_same_domain_review_job_even_with_valid_evaluation(tmp_path: Path) -> None:
+def test_manager_rejects_same_domain_reviewer_before_dispatch(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     candidate = "b" * 40
     steps = tuple(
@@ -394,7 +386,7 @@ def test_manager_rejects_same_domain_review_job_even_with_valid_evaluation(tmp_p
     )
     run = registry._manager_create_workflow_run(
         work_id="same-domain", repo="owner/repo", claim_key="owner/repo/same-domain/rev-a",
-        source_revision="rev-a", combo="feature-oneshot", current_phase="review",
+        source_revision="rev-a", workspace_root=str(tmp_path), combo="feature-oneshot", current_phase="review",
         steps=steps, candidate_head=candidate, verified_head=candidate, gate_status="running",
     )
     identities = IdentityRegistry.from_rows(
@@ -403,50 +395,65 @@ def test_manager_rejects_same_domain_review_job_even_with_valid_evaluation(tmp_p
             {"executor": "claude", "model_id": "reviewer", "independence_domain": "openai", "capabilities": []},
         ]
     )
-    builder_card = next(step.card for step in run.steps if step.phase == "build")
-    builder_job = _card_job(
-        registry, run, card=builder_card, persona="builder", executor="codex",
-        model="builder", domain="openai", worktree=tmp_path, candidate=candidate,
-    )
-    review_card = next(step.card for step in run.steps if step.phase == "review")
-    reviewer_job = _card_job(
-        registry, run, card=review_card, persona="reviewer", executor="claude",
-        model="reviewer", domain="openai", worktree=tmp_path, candidate=candidate,
-    )
-    evaluation = review.build_gate_evaluation(
-        slice_id=f"{run.run_id}-{review_card}", state="passed", reason="accepted",
-        builder_job_id=builder_job["job_id"], reviewer_job_id=reviewer_job["job_id"],
-        candidate=candidate,
-        launch_identity={
-            "builder": identities.require("codex", "builder").legacy_dict(),
-            "reviewer": identities.require("claude", "reviewer").legacy_dict(),
-        },
-    )
-    review_ref = review.write_gate_evaluation(evaluation, coordinator_root=tmp_path / "coordinator")
-
-    def git_runner(argv, **kwargs):
-        if "cat-file" in argv:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        return SimpleNamespace(returncode=0, stdout=candidate + "\n", stderr="")
-
-    with pytest.raises(ValueError, match="foreign independence domain"):
-        manager.apply_workflow_action(
-            registry,
-            args={
-                "action": "advance", "run_id": run.run_id, "card_id": review_card,
-                "job_id": reviewer_job["job_id"], "current_phase": "review",
-                "repo_root": str(tmp_path), "artifacts": [], "review_ref": review_ref,
-            },
-            identity_registry=identities,
-            git_runner=git_runner,
-        )
+    review_step = next(step for step in run.steps if step.phase == "review")
+    with pytest.raises(ValueError, match="no configured identity"):
+        manager._select_workflow_identity(run, review_step, identities)
 
 
 def test_manager_rejects_planner_artifacts_outside_governed_roots(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="outside governed roots"):
-        manager._write_planning_artifacts(
+        manager._publish_planning_artifacts(
             str(tmp_path),
             [{"kind": "plan", "path": "README.md", "content": "not allowed"}],
+            work_id="production-wiring",
+            task_slug="production-wiring",
+            allowed_refs=("docs/superpowers/plans/*production-wiring*.md",),
+        )
+
+
+def test_planning_artifact_publish_is_scoped_no_clobber_and_transactional(tmp_path: Path) -> None:
+    plan = {
+        "kind": "plan",
+        "path": "docs/superpowers/plans/production-wiring-plan.md",
+        "content": "---\nstatus: accepted\n---\n# Plan\n## Task 1\nBuild.\n",
+    }
+    spec = {
+        "kind": "spec",
+        "path": "docs/superpowers/specs/production-wiring-spec.md",
+        "content": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
+    }
+    rollback = manager._publish_planning_artifacts(
+        str(tmp_path), [plan, spec], work_id="production-wiring", task_slug="production-wiring",
+        allowed_refs=(
+            "docs/superpowers/plans/*production-wiring*.md",
+            "docs/superpowers/specs/*production-wiring*-spec.md",
+        ),
+    )
+    assert (tmp_path / plan["path"]).is_file()
+    assert (tmp_path / spec["path"]).is_file()
+    rollback()
+    assert not (tmp_path / plan["path"]).exists()
+    assert not (tmp_path / spec["path"]).exists()
+
+    conflict = tmp_path / spec["path"]
+    conflict.parent.mkdir(parents=True, exist_ok=True)
+    conflict.write_text("owned by another transaction\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no-clobber"):
+        manager._publish_planning_artifacts(
+            str(tmp_path), [plan, spec], work_id="production-wiring", task_slug="production-wiring",
+            allowed_refs=(
+                "docs/superpowers/plans/*production-wiring*.md",
+                "docs/superpowers/specs/*production-wiring*-spec.md",
+            ),
+        )
+    assert not (tmp_path / plan["path"]).exists()
+    assert conflict.read_text(encoding="utf-8") == "owned by another transaction\n"
+
+    other_work = dict(plan, path="docs/superpowers/plans/other-work-plan.md")
+    with pytest.raises(ValueError, match="outside governed roots"):
+        manager._publish_planning_artifacts(
+            str(tmp_path), [other_work], work_id="production-wiring", task_slug="production-wiring",
+            allowed_refs=("docs/superpowers/plans/*production-wiring*.md",),
         )
 
 
@@ -481,6 +488,7 @@ def _run(
         repo="owner/repo",
         claim_key="owner/repo/work-1/rev-a",
         source_revision="rev-a",
+        workspace_root="/tmp/work-1",
         combo="feature-oneshot",
         current_phase=phase,
         steps=steps,

@@ -112,7 +112,9 @@ python3 -m pytest -q tests/test_workflow_registry.py tests/test_deck_schema.py t
 2. RED-testselection order、primary-domain exclusion、same/unknown domain與malformed output。
 3. RED-testagy argv含print/plan/sandbox且沒有unsafe bypass；capability probe failure不視為available。
 4. Implement planner gate與immutable evidence；brainstorm evidence不能填ForeignReview ref。
-5. Run PR B full gates與independent review，更新OpenSpec Task 2。
+5. RED-test並實作manifest per-card durable Job、periodic terminal resume與canonical coordinator-root evidence；control caller不得提供path/hash。
+6. RED-testplanner disposable checkout/finally rollback，以及current work/change/manifest-bound staging、transactional no-clobber publish。
+7. Run PR B full gates與independent review，更新OpenSpec Task 2。
 
 ---
 

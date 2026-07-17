@@ -63,6 +63,8 @@ Override schema、negative exclusion與path safety以`CONTEXT.md`為canonical。
 
 `WorkflowRun`保存work item、claim key、combo、current phase、steps、issue/OpenSpec/PR refs、attempts、evidence。`WorkflowStep`保存phase、persona、card、executor/model/domain、inputs、outputs與gate result。
 
+每個非Manager card由production dispatcher建立durable Job，綁定run/claim/repo/source revision/phase/card/persona/model identity。Terminal poll只從job log建立canonical coordinator-root evidence並原子綁回job；control caller不得提供evidence path/hash。同phase全部card passed後才前進，restart後從registry resume。
+
 Stable ID優先explicit work item，其次`issue:<owner>/<repo>#N`，最後source locator。內部state enum用`ongoing`。
 
 ## 4. State reducer
@@ -86,6 +88,8 @@ Registry以atomic backup從v1升v2；v1 jobs/slices保留legacy records，不猜
 ### 5.2 Define/plan
 
 新增planner persona；Deck compiler保存每card `persona_binding`，default combo `feature-oneshot`。Artifact只有在frontmatter `status: accepted`、必要章節存在且沒有blocking decision marker時才算accepted。Blocking marker只接受獨立行`TBD`、`[TBD]`、`Decision: TBD`、`決策：未定`或Open Questions章節中的實際項目；inline說明文字與fenced code不觸發。缺accepted spec/design/plan或存在blocking marker時，primary planner先出question pack，secondary異質planner只回evidence，primary整合落檔。
+
+Planner只在temporary disposable checkout以plan/read-only/sandbox執行；成功、nonzero與exception都在`finally`驗sandbox/operator tree，operator污染必須回滾且不留檔。Primary回傳structured content後，Manager先依current work/change與manifest output refs驗整組，再以transactional no-clobber publish；衝突或任一失敗整組rollback。
 
 Secondary selection: `agy/google -> claude/anthropic -> codex/openai`，排除primary domain。`agy`只使用headless print + plan + sandbox，不允許unsafe bypass；`agy + Gemini 3.1 Pro (High)`映射google並由live doctor驗證。沒有異質model或output malformed時停needs_human。
 

@@ -3,6 +3,8 @@
 ### Requirement: Manager必須是WorkflowRun與mutation的單一writer
 Manager MUST以registry schema v2保存`WorkflowRun`與`WorkflowStep`，並以`repo/work-id/authoritative source revisions` claim key確保restart idempotency。V1 registry MUST先建立不可覆寫atomic backup才升v2；舊jobs/slices MUST保存為legacy records且 MUST NOT推測work item。CLI mutation MUST經control request queue。
 
+每張非Manager card MUST由production dispatcher建立綁定run、claim、repo、source revision、phase、card、persona與model identity的durable Job。Manager MUST只在該Job successful terminal後建立canonical coordinator-root evidence並原子綁回Job；caller-supplied evidence path/hash MUST被拒絕。Periodic terminal poll MUST可在restart後由registry重建目前card並繼續推進；同phase所有card通過前 MUST NOT前進。
+
 #### Scenario: Claim後crash/restart
 - **WHEN**相同claim key在restart後再次送達
 - **THEN** Manager回傳既有WorkflowRun
@@ -34,6 +36,8 @@ Deck compiler MUST把每張card的`persona_binding`寫入workflow manifest；Man
 
 ### Requirement: 不完整規格必須經異質雙模型brainstorm
 Artifact只有在frontmatter `status: accepted`、必要章節存在且沒有blocking decision marker時才算accepted。Marker parser MUST只把獨立行`TBD`、`[TBD]`、`Decision: TBD`、`決策：未定`或Open Questions中的實際項目視為blocking，MUST忽略inline說明與fenced code。Accepted spec/design/plan缺失或有blocking marker時，primary planner MUST先產question pack；secondary planner MUST來自不同independence domain且只回evidence；primary MUST整合並落檔。Secondary選擇 MUST依可用的`agy/google → claude/anthropic → codex/openai`順序排除primary domain；無異質model、unknown identity或malformed output MUST fail-closed。
+
+Planner subprocess MUST只在temporary disposable checkout執行，並以read-only executor模式啟動。Manager MUST在成功、nonzero或exception路徑的`finally`驗sandbox與operator worktree完整內容；任何修改 MUST fail-closed，operator checkout MUST回復且不得殘留。Primary只回傳structured artifact content；Manager MUST先驗所有path均綁定目前work/change與manifest outputs、在staging驗整組，再以transactional no-clobber方式publish；任一衝突或失敗 MUST rollback整組且不得覆蓋其他work item。
 
 #### Scenario: Agy可用且primary非Google
 - **WHEN** completeness gate觸發且agy live capability/identity probe通過

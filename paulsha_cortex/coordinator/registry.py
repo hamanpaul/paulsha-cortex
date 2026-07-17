@@ -352,7 +352,7 @@ class JobRegistry:
         for field in (
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
-            "source_revision",
+            "workflow_phase", "workflow_repo_root", "source_revision",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -365,6 +365,26 @@ class JobRegistry:
             value = job.get(field)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        evidence = job.get("workflow_evidence")
+        if evidence is not None and (
+            not isinstance(evidence, dict)
+            or set(evidence) != {"kind", "path", "hash"}
+            or any(not isinstance(evidence.get(key), str) or not evidence[key] for key in evidence)
+            or len(str(evidence.get("hash", ""))) != 64
+            or any(char not in "0123456789abcdef" for char in str(evidence.get("hash", "")))
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 workflow_evidence 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        for field in ("workflow_inputs", "workflow_outputs"):
+            value = job.get(field)
+            if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(item, str) or not item for item in value)
+            ):
+                raise ValueError(
+                    f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}"
+                )
         return dict(job)
 
     def _validate_loaded_slice(self, slice_row: object, job_ids: set[str]) -> dict[str, Any]:
@@ -511,6 +531,10 @@ class JobRegistry:
         workflow_claim_key: str | None = None,
         workflow_repo: str | None = None,
         workflow_card: str | None = None,
+        workflow_phase: str | None = None,
+        workflow_repo_root: str | None = None,
+        workflow_inputs: tuple[str, ...] = (),
+        workflow_outputs: tuple[str, ...] = (),
         source_revision: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
@@ -548,7 +572,12 @@ class JobRegistry:
             "workflow_claim_key": workflow_claim_key,
             "workflow_repo": workflow_repo,
             "workflow_card": workflow_card,
+            "workflow_phase": workflow_phase,
+            "workflow_repo_root": workflow_repo_root,
+            "workflow_inputs": list(workflow_inputs),
+            "workflow_outputs": list(workflow_outputs),
             "source_revision": source_revision,
+            "workflow_evidence": None,
             "created_at": _now_iso(),
         }
         self._jobs.append(job)
@@ -573,6 +602,35 @@ class JobRegistry:
         if not isinstance(worktree, str) or not worktree.strip():
             raise ValueError("worktree 必須為非空字串")
         job["worktree"] = worktree
+        self._persist()
+        return dict(job)
+
+    def bind_workflow_evidence(
+        self,
+        job_id: str,
+        *,
+        locator: dict[str, str],
+        subject_head: str | None = None,
+    ) -> dict[str, Any]:
+        job = self._find_job(job_id)
+        if job.get("status") != "exited" or job.get("exit_code") != 0:
+            raise ValueError("workflow evidence只能綁定successful terminal job")
+        if (
+            not isinstance(locator, dict)
+            or set(locator) != {"kind", "path", "hash"}
+            or any(not isinstance(locator.get(key), str) or not locator[key] for key in locator)
+            or len(locator.get("hash", "")) != 64
+            or any(char not in "0123456789abcdef" for char in locator.get("hash", ""))
+        ):
+            raise ValueError("workflow evidence locator格式錯誤")
+        existing = job.get("workflow_evidence")
+        if existing is not None:
+            if existing != locator or (subject_head is not None and job.get("subject_head") != subject_head):
+                raise ValueError("workflow evidence已綁定且內容衝突")
+            return dict(job)
+        job["workflow_evidence"] = dict(locator)
+        if subject_head is not None:
+            job["subject_head"] = subject_head
         self._persist()
         return dict(job)
 
@@ -894,6 +952,7 @@ class JobRegistry:
         repo: str,
         claim_key: str,
         source_revision: str,
+        workspace_root: str,
         combo: str,
         current_phase: str,
         steps: tuple[WorkflowStep, ...],
@@ -927,6 +986,7 @@ class JobRegistry:
             repo=repo,
             claim_key=claim_key,
             source_revision=source_revision,
+            workspace_root=workspace_root,
             combo=combo,
             current_phase=current_phase,
             steps=tuple(steps),
@@ -978,6 +1038,7 @@ class JobRegistry:
             repo=current.repo,
             claim_key=current.claim_key,
             source_revision=current.source_revision,
+            workspace_root=current.workspace_root,
             combo=current.combo,
             current_phase=next_phase,
             steps=current.steps if steps is None else tuple(steps),

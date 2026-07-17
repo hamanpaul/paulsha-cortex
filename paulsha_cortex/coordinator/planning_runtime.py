@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -52,17 +55,57 @@ def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree
     raise ValueError(f"unsupported read-only planning executor: {identity.executor}")
 
 
-def _git_snapshot(worktree: Path, runner: Callable[..., object]) -> str:
-    raw = runner(
-        ["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=all"],
-        shell=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+def _tree_snapshot(root: Path) -> str:
+    """Hash every tracked/untracked file without following symlinks.
+
+    The planner runs in a disposable copy, but the operator checkout is also
+    hashed before and after launch.  This catches direct writes through an
+    absolute path even when the planner exits non-zero.
+    """
+
+    digest = hashlib.sha256()
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        dirs[:] = sorted(name for name in dirs if name != ".git")
+        for name in sorted(files):
+            path = Path(current) / name
+            relative = path.relative_to(root).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            if path.is_symlink():
+                digest.update(b"link\0")
+                digest.update(os.readlink(path).encode("utf-8"))
+            else:
+                digest.update(b"file\0")
+                digest.update(path.read_bytes())
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _copy_planning_sandbox(worktree: Path, destination: Path) -> None:
+    shutil.copytree(
+        worktree,
+        destination,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".git"),
     )
-    if getattr(raw, "returncode", None) != 0 or not isinstance(getattr(raw, "stdout", None), str):
-        raise ValueError("planning git diff guard unavailable")
-    return raw.stdout
+
+
+def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
+    for child in worktree.iterdir():
+        if child.name == ".git":
+            continue
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+    for source in baseline.iterdir():
+        target = worktree / source.name
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
+        elif source.is_dir():
+            shutil.copytree(source, target, symlinks=True)
+        else:
+            shutil.copy2(source, target)
 
 
 def _extract_json(stdout: str, output_path: Path) -> object:
@@ -95,26 +138,44 @@ def _invoke_json(
     runner: Callable[..., object],
     timeout_seconds: int,
 ) -> object:
+    operator_before = _tree_snapshot(worktree)
     with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
+        baseline = Path(temp_dir) / "baseline"
+        sandbox = Path(temp_dir) / "checkout"
+        _copy_planning_sandbox(worktree, baseline)
+        shutil.copytree(baseline, sandbox, symlinks=True)
+        sandbox_before = _tree_snapshot(sandbox)
         output_path = Path(temp_dir) / "last.json"
-        before = _git_snapshot(worktree, runner)
-        argv = _planning_argv(identity, prompt, temp_dir, worktree)
-        raw = runner(
-            argv,
-            cwd=str(worktree),
-            shell=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        returncode = getattr(raw, "returncode", None)
-        stdout = getattr(raw, "stdout", None)
-        if returncode != 0 or not isinstance(stdout, str):
-            raise ValueError(f"planning launcher failed: {identity.executor}/{identity.model_id}")
-        after = _git_snapshot(worktree, runner)
-        if after != before:
-            raise ValueError("planning launcher modified worktree despite read-only contract")
-        return _extract_json(stdout, output_path)
+        argv = _planning_argv(identity, prompt, temp_dir, sandbox)
+        failure: BaseException | None = None
+        result: object | None = None
+        try:
+            raw = runner(
+                argv,
+                cwd=str(sandbox),
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            returncode = getattr(raw, "returncode", None)
+            stdout = getattr(raw, "stdout", None)
+            if returncode != 0 or not isinstance(stdout, str):
+                raise ValueError(
+                    f"planning launcher failed: {identity.executor}/{identity.model_id}"
+                )
+            result = _extract_json(stdout, output_path)
+        except BaseException as exc:
+            failure = exc
+        finally:
+            if _tree_snapshot(sandbox) != sandbox_before:
+                failure = ValueError("planning launcher modified disposable read-only sandbox")
+            if _tree_snapshot(worktree) != operator_before:
+                _restore_operator_tree(worktree, baseline)
+                failure = ValueError("planning launcher modified operator worktree; changes rolled back")
+        if failure is not None:
+            raise failure
+        return result
 
 
 def _probe_identity(
