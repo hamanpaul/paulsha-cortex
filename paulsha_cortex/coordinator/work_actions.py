@@ -25,6 +25,7 @@ from .claim import (
     decide_manual_start,
     load_work_authorities,
     load_work_authority,
+    work_authority_digest,
 )
 from .delivery import (
     ArchiveGateFacts,
@@ -35,8 +36,15 @@ from .delivery import (
     build_openspec_archive_argv,
     validate_archive_gate,
     validate_pr_metadata,
+    _validate_foreign_review,
 )
-from .github_delivery import COPILOT_REVIEWER_LOGIN, GitHubDeliveryClient
+from .github_delivery import (
+    COPILOT_REVIEWER_LOGIN,
+    DeliveryPolicy,
+    GitHubDeliveryClient,
+    evaluate_delivery_gate,
+)
+from . import verification
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 
 
@@ -121,24 +129,101 @@ def _validate_local_archive_inputs(
         changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         changelog = ""
+    unreleased_match = re.search(
+        r"(?ms)^## \[Unreleased\]\s*(.*?)(?=^## |\Z)", changelog
+    )
+    unreleased = unreleased_match.group(1) if unreleased_match else ""
+    fragments = tuple(
+        repo_root / directory / f"{change}.md"
+        for directory in ("changelog.d", "changes")
+    )
+    fragment_present = any(
+        path.is_file() and not path.is_symlink() and path.read_text(encoding="utf-8").strip()
+        for path in fragments
+    )
+    policy_text = "\n".join(
+        str(getattr(policy, field, "")) for field in ("stdout", "stderr")
+    )
+    doc_reference_warning = bool(
+        re.search(r"(?i)(?:R-22.*WARN|WARN.*R-22|doc-reference.*WARN|WARN.*doc-reference)", policy_text)
+    )
     facts = ArchiveGateFacts(
         tasks_complete=bool(task_states) and all(state.lower() == "x" for state in task_states),
         canonical_specs_valid=getattr(canonical, "returncode", None) == 0,
-        doc_references_valid=getattr(policy, "returncode", None) == 0,
-        changelog_present="## [Unreleased]" in changelog and "- **" in changelog,
+        doc_references_valid=(
+            getattr(policy, "returncode", None) == 0 and not doc_reference_warning
+        ),
+        changelog_present=(
+            re.search(
+                rf"(?im)^\s*[-*]\s+.*(?<![a-z0-9-]){re.escape(change)}(?![a-z0-9-]).*$",
+                unreleased,
+            )
+            is not None
+            or fragment_present
+        ),
     )
     gate = validate_archive_gate(facts)
     if not gate.allowed:
         raise RuntimeError(f"archive gate blocked: {', '.join(gate.reasons)}")
 
 
-def _override_path(args: dict[str, Any]) -> Path:
+def _repo_identity(repo: object) -> str:
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
+        raise ValueError("repo must be canonical owner/name")
+    return repo
+
+
+def _remote_repo(value: str) -> str | None:
+    patterns = (
+        r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+        r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+        r"ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, value.strip())
+        if match is not None:
+            return match.group(1)
+    return None
+
+
+def _canonical_repo_root(value: object, *, repo: str) -> Path:
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError("repo_root must be absolute")
+    raw = Path(value)
+    try:
+        root = raw.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("repo_root unavailable") from exc
+    if raw.is_symlink() or raw.absolute() != root or not root.is_dir():
+        raise ValueError("repo_root must be a real non-symlink directory")
+    completed = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+        raise ValueError("repo_root canonical origin remote unavailable")
+    remote_repo = _remote_repo(completed.stdout)
+    if remote_repo != repo:
+        raise ValueError("repo_root origin remote must match requested repo")
+    return root
+
+
+def _path_has_symlink(root: Path, relative: str) -> bool:
+    current = root
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+        if not current.exists():
+            break
+    return False
+
+
+def _override_path(args: dict[str, Any], *, repo: str) -> Path:
     repo_root = args.get("repo_root")
-    if not isinstance(repo_root, str) or not Path(repo_root).is_absolute():
-        raise ValueError("link/unlink require absolute repo_root")
-    root = Path(repo_root).resolve(strict=True)
-    if not root.is_dir():
-        raise ValueError("repo_root must be a directory")
+    root = _canonical_repo_root(repo_root, repo=repo)
     cortex_dir = root / ".cortex"
     if cortex_dir.is_symlink():
         raise ValueError("repo_root .cortex must not be a symlink")
@@ -250,7 +335,9 @@ def _mutate_override(*, args: dict[str, Any], repo: str, work_id: str) -> dict[s
     if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
         raise ValueError("work_id invalid")
     source = _canonical_source(args=args, repo=repo)
-    path = _override_path(args)
+    path = _override_path(args, repo=repo)
+    if source["kind"] == "path" and _path_has_symlink(path.parent.parent, source["ref"]):
+        raise ValueError("path ref must not traverse a symlink")
     if path.exists():
         payload = safe_load(path.read_text(encoding="utf-8"))
     else:
@@ -306,6 +393,8 @@ def _load_runs(path: Path) -> dict[str, Any]:
             or not isinstance(row.get("snapshot_hash"), str)
             or not isinstance(row.get("source_revisions"), list)
             or not isinstance(row.get("provider_revision"), str)
+            or not isinstance(row.get("authority_digest"), str)
+            or not isinstance(row.get("workflow_step_ids"), list)
         ):
             raise ValueError("work run record malformed")
     return payload
@@ -321,6 +410,11 @@ def _save_runs(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -332,6 +426,333 @@ def _load_work_run(*, state_path: Path, repo: str, work_id: str) -> tuple[dict[s
     if not isinstance(active, dict):
         raise RuntimeError("ship requires a persisted workflow")
     return state, active
+
+
+def _expected_claim_key(authority) -> str:
+    return build_claim_key(
+        ClaimCandidate(
+            authority=authority,
+            repo=authority.repo,
+            work_id=authority.work_id,
+            source_revisions=authority.source_revisions,
+            confirmed_todo=authority.confirmed_todo,
+            confirmed_issue=authority.mapped_issues[0] if authority.mapped_issues else None,
+            auto_label=False,
+            active_run_id=None,
+            active_claim_key=None,
+        )
+    )
+
+
+def _validate_current_run_authority(active: dict[str, Any], authority) -> None:
+    expected = {
+        "claim_key": _expected_claim_key(authority),
+        "snapshot_hash": authority.snapshot_hash,
+        "source_revisions": list(authority.source_revisions),
+        "provider_revision": authority.github_provider_revision,
+        "authority_digest": work_authority_digest(authority),
+        "mapped_issues": list(authority.mapped_issues),
+        "mapped_prs": list(authority.mapped_prs),
+        "mapped_openspec": list(authority.mapped_openspec),
+        "mapped_todo_paths": list(authority.mapped_todo_paths),
+    }
+    if any(active.get(field) != value for field, value in expected.items()):
+        raise RuntimeError("persisted workflow does not match current WorkAuthority")
+    step_ids = active.get("workflow_step_ids")
+    if (
+        not isinstance(active.get("run_id"), str)
+        or not isinstance(step_ids, list)
+        or not step_ids
+        or any(not isinstance(step_id, str) or not step_id for step_id in step_ids)
+        or len(set(step_ids)) != len(step_ids)
+    ):
+        raise ValueError("persisted workflow step identity malformed")
+
+
+def _ship_binding(args: dict[str, Any], authority) -> dict[str, Any]:
+    pr_number = _positive_int(args.get("pr_number"), field="pr_number")
+    change = args.get("change")
+    todo_paths = args.get("todo_paths")
+    if pr_number not in authority.mapped_prs:
+        raise RuntimeError("ship PR is not authorized by WorkAuthority")
+    if not isinstance(change, str) or change not in authority.mapped_openspec:
+        raise RuntimeError("ship OpenSpec change is not authorized by WorkAuthority")
+    if (
+        not isinstance(todo_paths, list)
+        or any(not isinstance(path, str) or not path for path in todo_paths)
+        or tuple(sorted(todo_paths)) != authority.mapped_todo_paths
+        or len(set(todo_paths)) != len(todo_paths)
+    ):
+        raise RuntimeError("ship Todo refs are not exactly authorized by WorkAuthority")
+    return {
+        "pr_number": pr_number,
+        "change": change,
+        "todo_paths": list(authority.mapped_todo_paths),
+    }
+
+
+def _command_result_payload(result: object) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {
+        "argv": list(getattr(result, "argv")),
+        "returncode": getattr(result, "returncode"),
+        "stdout": getattr(result, "stdout"),
+        "stderr": getattr(result, "stderr"),
+    }
+
+
+def _preflight_hash(preflight: object) -> str:
+    return verification.canonical_json_hash(
+        {
+            "passed": getattr(preflight, "passed"),
+            "failed_stage": getattr(preflight, "failed_stage"),
+            "head": getattr(preflight, "head"),
+            "tree_hash": getattr(preflight, "tree_hash"),
+            "policy": _command_result_payload(getattr(preflight, "policy")),
+            "ci_parity": _command_result_payload(getattr(preflight, "ci_parity")),
+        }
+    )
+
+
+def _checks_hash(remote: object) -> str:
+    return verification.canonical_json_hash(
+        [
+            {
+                "name": check.name,
+                "status": check.status,
+                "conclusion": check.conclusion,
+            }
+            for check in remote.checks
+        ]
+    )
+
+
+def _merge_authorization_body(
+    *,
+    active: dict[str, Any],
+    authority,
+    binding: dict[str, Any],
+    preflight: object,
+    remote: object,
+    copilot: object,
+    foreign_review: ForeignReviewEvidence,
+) -> dict[str, Any]:
+    normalized_foreign = _validate_foreign_review(
+        foreign_review,
+        expected_head=preflight.head,
+    )
+    if verification.canonical_json_hash(normalized_foreign) != foreign_review.expected_hash.lower():
+        raise RuntimeError("foreign review evidence hash changed during authorization")
+    return {
+        "schema": "cortex-merge-authorization/v1",
+        "run_id": active["run_id"],
+        "workflow_step_ids": list(active["workflow_step_ids"]),
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "authority_digest": work_authority_digest(authority),
+        "pr_number": binding["pr_number"],
+        "change": binding["change"],
+        "todo_paths": list(binding["todo_paths"]),
+        "head": preflight.head,
+        "tree_hash": preflight.tree_hash,
+        "copilot_requested_at_epoch": copilot.loop.requested_at,
+        "copilot_review_id": copilot.review_id,
+        "copilot_hash": verification.canonical_json_hash(
+            {
+                "head": copilot.head,
+                "review_id": copilot.review_id,
+                "requested_at_epoch": copilot.loop.requested_at,
+            }
+        ),
+        "foreign_review_path": foreign_review.path,
+        "foreign_review_hash": foreign_review.expected_hash.lower(),
+        "preflight_hash": _preflight_hash(preflight),
+        "checks_hash": _checks_hash(remote),
+    }
+
+
+def _authorization_record(
+    body: dict[str, Any], *, state_path: Path
+) -> dict[str, Any]:
+    digest = verification.canonical_json_hash(body)
+    run_id = body.get("run_id")
+    head = body.get("head")
+    if (
+        not isinstance(run_id, str)
+        or re.fullmatch(r"run-[0-9a-f]{32}", run_id) is None
+        or not isinstance(head, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", head) is None
+    ):
+        raise ValueError("merge authorization identity malformed")
+    root = state_path.resolve().parent / "evidence" / "merge-authorization"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{run_id}-{head.lower()}.json"
+    wrapper = {"payload": body, "hash": digest}
+    if target.exists():
+        if (
+            target.is_symlink()
+            or target.stat().st_mode & 0o222
+            or json.loads(target.read_text(encoding="utf-8")) != wrapper
+        ):
+            raise RuntimeError("merge authorization evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                json.dump(wrapper, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                if target.is_symlink() or json.loads(target.read_text(encoding="utf-8")) != wrapper:
+                    raise RuntimeError("merge authorization evidence conflict")
+            os.chmod(target, 0o444)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"payload": body, "hash": digest, "path": str(target)}
+
+
+def _authorization_matches(
+    value: object,
+    *,
+    active: dict[str, Any],
+    authority,
+    binding: dict[str, Any],
+    preflight: object,
+    remote: object | None = None,
+) -> bool:
+    if not _authorization_identity_matches(
+        value,
+        active=active,
+        authority=authority,
+        binding=binding,
+        head=preflight.head,
+        tree_hash=preflight.tree_hash,
+    ):
+        return False
+    body = value["payload"]
+    return (
+        body.get("preflight_hash") == _preflight_hash(preflight)
+        and (remote is None or body.get("checks_hash") == _checks_hash(remote))
+    )
+
+
+def _authorization_identity_matches(
+    value: object,
+    *,
+    active: dict[str, Any],
+    authority,
+    binding: dict[str, Any],
+    head: str,
+    tree_hash: str,
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {"payload", "hash", "path"}:
+        return False
+    body = value.get("payload")
+    digest = value.get("hash")
+    evidence_path = value.get("path")
+    required = {
+        "schema",
+        "run_id",
+        "workflow_step_ids",
+        "repo",
+        "work_id",
+        "authority_digest",
+        "pr_number",
+        "change",
+        "todo_paths",
+        "head",
+        "tree_hash",
+        "copilot_requested_at_epoch",
+        "copilot_review_id",
+        "copilot_hash",
+        "foreign_review_path",
+        "foreign_review_hash",
+        "preflight_hash",
+        "checks_hash",
+    }
+    if (
+        not isinstance(body, dict)
+        or set(body) != required
+        or verification.canonical_json_hash(body) != digest
+        or not isinstance(evidence_path, str)
+        or not Path(evidence_path).is_absolute()
+        or Path(evidence_path).is_symlink()
+        or not Path(evidence_path).is_file()
+        or Path(evidence_path).stat().st_mode & 0o222
+    ):
+        return False
+    try:
+        evidence_wrapper = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if evidence_wrapper != {"payload": body, "hash": digest}:
+        return False
+    return (
+        body.get("schema") == "cortex-merge-authorization/v1"
+        and body.get("run_id") == active.get("run_id")
+        and body.get("workflow_step_ids") == active.get("workflow_step_ids")
+        and body.get("repo") == authority.repo
+        and body.get("work_id") == authority.work_id
+        and body.get("authority_digest") == work_authority_digest(authority)
+        and body.get("pr_number") == binding["pr_number"]
+        and body.get("change") == binding["change"]
+        and body.get("todo_paths") == binding["todo_paths"]
+        and body.get("head") == head
+        and body.get("tree_hash") == tree_hash
+        and isinstance(body.get("copilot_review_id"), int)
+        and not isinstance(body.get("copilot_review_id"), bool)
+        and body["copilot_review_id"] > 0
+        and isinstance(body.get("copilot_requested_at_epoch"), (int, float))
+        and not isinstance(body.get("copilot_requested_at_epoch"), bool)
+        and math.isfinite(float(body["copilot_requested_at_epoch"]))
+        and isinstance(body.get("foreign_review_path"), str)
+        and Path(body["foreign_review_path"]).is_absolute()
+        and all(
+            isinstance(body.get(field), str)
+            and re.fullmatch(r"[0-9a-f]{64}", body[field]) is not None
+            for field in (
+                "copilot_hash",
+                "foreign_review_hash",
+                "preflight_hash",
+                "checks_hash",
+            )
+        )
+    )
+
+
+def _trusted_evidence_refs(authorization: dict[str, Any]) -> tuple[dict[str, str], ...]:
+    body = authorization["payload"]
+    return (
+        {
+            "kind": "preflight",
+            "ref": f"head:{body['head']}:tree:{body['tree_hash']}",
+            "hash": body["preflight_hash"],
+        },
+        {
+            "kind": "foreign_review",
+            "ref": body["foreign_review_path"],
+            "hash": body["foreign_review_hash"],
+        },
+        {
+            "kind": "copilot",
+            "ref": f"github-review:{body['copilot_review_id']}",
+            "hash": body["copilot_hash"],
+        },
+        {
+            "kind": "merge_authorization",
+            "ref": authorization["path"],
+            "hash": authorization["hash"],
+        },
+    )
 
 
 def _claim_action(
@@ -377,8 +798,9 @@ def _claim_action(
         raise ValueError("resume requires an active workflow")
     if decision.action == "claim":
         previous_run_id = active.get("run_id") if active else None
+        run_id = f"run-{uuid4().hex}"
         active = {
-            "run_id": f"run-{uuid4().hex}",
+            "run_id": run_id,
             "claim_key": decision.claim_key,
             "repo": authority.repo,
             "work_id": authority.work_id,
@@ -386,14 +808,26 @@ def _claim_action(
             "source_revisions": list(authority.source_revisions),
             "snapshot_hash": authority.snapshot_hash,
             "provider_revision": authority.github_provider_revision,
+            "authority_digest": work_authority_digest(authority),
+            "mapped_issues": list(authority.mapped_issues),
+            "mapped_prs": list(authority.mapped_prs),
+            "mapped_openspec": list(authority.mapped_openspec),
+            "mapped_todo_paths": list(authority.mapped_todo_paths),
+            "workflow_step_ids": [
+                f"{run_id}:claim",
+                f"{run_id}:build",
+                f"{run_id}:review",
+                f"{run_id}:ship",
+            ],
         }
         if previous_run_id is not None:
             active["previous_run_id"] = previous_run_id
         state["runs"][key] = active
         _save_runs(state_path, state)
     elif decision.action == "needs_human":
+        run_id = active.get("run_id") if active else f"run-{uuid4().hex}"
         active = {
-            "run_id": active.get("run_id") if active else f"run-{uuid4().hex}",
+            "run_id": run_id,
             "claim_key": build_claim_key(
                 ClaimCandidate(
                     authority=authority,
@@ -414,6 +848,12 @@ def _claim_action(
             "source_revisions": list(authority.source_revisions),
             "snapshot_hash": authority.snapshot_hash,
             "provider_revision": authority.github_provider_revision,
+            "authority_digest": work_authority_digest(authority),
+            "mapped_issues": list(authority.mapped_issues),
+            "mapped_prs": list(authority.mapped_prs),
+            "mapped_openspec": list(authority.mapped_openspec),
+            "mapped_todo_paths": list(authority.mapped_todo_paths),
+            "workflow_step_ids": [f"{run_id}:claim", f"{run_id}:ship"],
         }
         state["runs"][key] = active
         _save_runs(state_path, state)
@@ -442,44 +882,48 @@ def run_auto_claim_scan(
             continue
         live_auto_label = False
         if authority.mapped_issues:
-            issue = authority.mapped_issues[0]
-            completed = runner(
-                ["gh", "api", f"repos/{authority.repo}/issues/{issue}"],
-                shell=False,
-                capture_output=True,
-                text=True,
-            )
-            if getattr(completed, "returncode", None) != 0:
-                results.append(
-                    {
-                        "repo": authority.repo,
-                        "work_id": authority.work_id,
-                        "action": "blocked",
-                        "reason": "github-label-read-failed",
-                    }
+            issue_reads_failed = False
+            for issue in authority.mapped_issues:
+                completed = runner(
+                    ["gh", "api", f"repos/{authority.repo}/issues/{issue}"],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
                 )
+                if getattr(completed, "returncode", None) != 0:
+                    results.append(
+                        {
+                            "repo": authority.repo,
+                            "work_id": authority.work_id,
+                            "action": "blocked",
+                            "reason": "github-label-read-failed",
+                        }
+                    )
+                    issue_reads_failed = True
+                    break
+                try:
+                    issue_payload = json.loads(getattr(completed, "stdout", ""))
+                    labels = issue_payload["labels"]
+                    if not isinstance(labels, list) or any(
+                        not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                        for label in labels
+                    ):
+                        raise TypeError
+                    names = {label["name"] for label in labels}
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    results.append(
+                        {
+                            "repo": authority.repo,
+                            "work_id": authority.work_id,
+                            "action": "blocked",
+                            "reason": "github-label-payload-malformed",
+                        }
+                    )
+                    issue_reads_failed = True
+                    break
+                live_auto_label = live_auto_label or "cortex:auto-on-going" in names
+            if issue_reads_failed:
                 continue
-            try:
-                issue_payload = json.loads(getattr(completed, "stdout", ""))
-                labels = issue_payload["labels"]
-                if not isinstance(labels, list):
-                    raise TypeError
-                names = {
-                    label["name"]
-                    for label in labels
-                    if isinstance(label, dict) and isinstance(label.get("name"), str)
-                }
-            except (json.JSONDecodeError, KeyError, TypeError):
-                results.append(
-                    {
-                        "repo": authority.repo,
-                        "work_id": authority.work_id,
-                        "action": "blocked",
-                        "reason": "github-label-payload-malformed",
-                    }
-                )
-                continue
-            live_auto_label = "cortex:auto-on-going" in names
         result = _claim_action(
             args={"action": "auto-scan"},
             authority=authority,
@@ -514,24 +958,30 @@ def _ship_action(
     therefore cannot silently repeat a merge or manufacture terminal evidence.
     """
 
-    repo_root_value = args.get("repo_root")
-    if not isinstance(repo_root_value, str) or not Path(repo_root_value).is_absolute():
-        raise ValueError("ship requires absolute repo_root")
-    repo_root = Path(repo_root_value).resolve()
-    pr_number = _positive_int(args.get("pr_number"), field="pr_number")
-    change = args.get("change")
-    if not isinstance(change, str) or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", change) is None:
-        raise ValueError("ship change must be a safe slug")
+    repo_root = _canonical_repo_root(args.get("repo_root"), repo=authority.repo)
     skip_tests = args.get("skip_tests", False)
     if not isinstance(skip_tests, bool):
         raise ValueError("ship skip_tests must be a strict boolean")
-    _pr_metadata(args, required_issues=authority.mapped_issues)
-
     state, active = _load_work_run(
         state_path=state_path,
         repo=authority.repo,
         work_id=authority.work_id,
     )
+    _validate_current_run_authority(active, authority)
+    binding = _ship_binding(args, authority)
+    pr_number = binding["pr_number"]
+    change = binding["change"]
+    todo_paths_value = binding["todo_paths"]
+    protected_refs = [f"openspec/changes/{change}", *todo_paths_value]
+    if any(_path_has_symlink(repo_root, ref) for ref in protected_refs):
+        raise ValueError("ship authorized repo path must not traverse a symlink")
+    metadata = _pr_metadata(args, required_issues=authority.mapped_issues)
+    persisted_binding = active.get("delivery_binding")
+    if persisted_binding is None:
+        active["delivery_binding"] = binding
+        _save_runs(state_path, state)
+    elif persisted_binding != binding:
+        raise RuntimeError("ship delivery binding differs from persisted PR/OpenSpec/Todo refs")
     ship = active.get("ship")
     if ship is not None and not isinstance(ship, dict):
         raise ValueError("ship state malformed")
@@ -543,13 +993,21 @@ def _ship_action(
 
     if ship and ship.get("phase") == "merged":
         expected_head = ship.get("head")
-        if not isinstance(expected_head, str):
-            raise ValueError("ship merged state malformed")
-        todo_paths_value = args.get("todo_paths")
-        if not isinstance(todo_paths_value, list) or any(
-            not isinstance(path, str) or not path for path in todo_paths_value
+        tree_hash = ship.get("tree_hash")
+        authorization = ship.get("merge_authorization")
+        if (
+            not isinstance(expected_head, str)
+            or not isinstance(tree_hash, str)
+            or not _authorization_identity_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                head=expected_head,
+                tree_hash=tree_hash,
+            )
         ):
-            raise ValueError("ship closure requires todo_paths")
+            raise ValueError("ship merged state malformed")
         completion_payload = _json_file(
             args.get("completion_record_path"),
             field="completion_record_path",
@@ -562,6 +1020,9 @@ def _ship_action(
             todo_paths=tuple(todo_paths_value),
             expected_head=expected_head,
             completion_payload=completion_payload,
+            run_id=active["run_id"],
+            workflow_step_ids=tuple(active["workflow_step_ids"]),
+            trusted_evidence_refs=_trusted_evidence_refs(authorization),
         )
         active["ship"] = {
             **ship,
@@ -583,12 +1044,23 @@ def _ship_action(
         expected_head = ship.get("head")
         record = ship.get("completion_record")
         todo_paths = ship.get("todo_paths")
+        tree_hash = ship.get("tree_hash")
+        authorization = ship.get("merge_authorization")
         if (
             not isinstance(expected_head, str)
             or not isinstance(record, dict)
             or not isinstance(record.get("path"), str)
             or not isinstance(record.get("hash"), str)
             or not isinstance(todo_paths, list)
+            or not isinstance(tree_hash, str)
+            or not _authorization_identity_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                head=expected_head,
+                tree_hash=tree_hash,
+            )
         ):
             raise ValueError("cached done state malformed")
         from . import completion
@@ -604,6 +1076,9 @@ def _ship_action(
             todo_paths=tuple(todo_paths),
             expected_head=expected_head,
             completion_payload=completion_payload,
+            run_id=active["run_id"],
+            workflow_step_ids=tuple(active["workflow_step_ids"]),
+            trusted_evidence_refs=_trusted_evidence_refs(authorization),
         )
         return {
             "action": "done",
@@ -634,6 +1109,13 @@ def _ship_action(
             "next_action": "commit and push the archive diff, then enqueue ship again",
         }
 
+    github.ensure_pr_metadata(
+        repo=authority.repo,
+        pr_number=pr_number,
+        title=metadata.title,
+        body=metadata.body,
+        labels=metadata.labels,
+    )
     command = load_preflight_command()
     preflight = run_preflight(
         repo_root=repo_root,
@@ -663,6 +1145,28 @@ def _ship_action(
     if merge_status.merged:
         if merge_status.pr_head != preflight.head:
             raise RuntimeError("merged PR HEAD does not match exact preflight HEAD")
+        authorization = ship.get("merge_authorization") if ship else None
+        if not _authorization_matches(
+            authorization,
+            active=active,
+            authority=authority,
+            binding=binding,
+            preflight=preflight,
+            remote=remote,
+        ):
+            active["status"] = "needs_human"
+            active["ship"] = {
+                **(ship or {}),
+                "phase": "needs_human",
+                "reason": "external-merge-without-authorization",
+                "head": preflight.head,
+                "tree_hash": preflight.tree_hash,
+            }
+            _save_runs(state_path, state)
+            return {
+                "action": "needs_human",
+                "reason": "external-merge-without-authorization",
+            }
         active["ship"] = {
             **(ship or {}),
             "phase": "merged",
@@ -671,6 +1175,8 @@ def _ship_action(
             "merge_commit": merge_status.merge_commit,
             "pr_number": pr_number,
             "change": change,
+            "todo_paths": list(todo_paths_value),
+            "merge_authorization": authorization,
         }
         _save_runs(state_path, state)
         return {"action": "merged-awaiting-closure", "head": preflight.head}
@@ -701,7 +1207,11 @@ def _ship_action(
             }
             _save_runs(state_path, state)
             return {"action": "needs_human", "reason": "copilot-finding-budget-exhausted"}
-    if not ship or previous_head != preflight.head or ship.get("phase") != "review-requested":
+    if (
+        not ship
+        or previous_head != preflight.head
+        or ship.get("phase") not in {"review-requested", "merge-authorized"}
+    ):
         github.request_copilot(repo=authority.repo, pr_number=pr_number)
         active["ship"] = {
             "phase": "review-requested",
@@ -712,6 +1222,7 @@ def _ship_action(
             "fix_rounds": fix_rounds,
             "pr_number": pr_number,
             "change": change,
+            "todo_paths": list(todo_paths_value),
         }
         _save_runs(state_path, state)
         return {"action": "awaiting-copilot", "head": preflight.head}
@@ -773,6 +1284,47 @@ def _ship_action(
         path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
         expected_hash=args.get("foreign_review_hash"),
     )
+    remote_gate = evaluate_delivery_gate(
+        facts=remote,
+        policy=DeliveryPolicy(
+            expected_head=preflight.head,
+            required_closing_issues=authority.mapped_issues,
+            copilot_review_id=copilot.review_id,
+            copilot_requested_at_epoch=copilot.loop.requested_at,
+        ),
+    )
+    if not remote_gate.allowed:
+        raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
+    authorization = _authorization_record(
+        _merge_authorization_body(
+            active=active,
+            authority=authority,
+            binding=binding,
+            preflight=preflight,
+            remote=remote,
+            copilot=copilot,
+            foreign_review=foreign_review,
+        ),
+        state_path=state_path,
+    )
+    existing_authorization = ship.get("merge_authorization") if ship else None
+    if existing_authorization is not None and existing_authorization != authorization:
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    active["ship"] = {
+        **ship,
+        "phase": "merge-authorized",
+        "head": preflight.head,
+        "tree_hash": preflight.tree_hash,
+        "review_id": copilot.review_id,
+        "requested_at_epoch": copilot.loop.requested_at,
+        "fix_rounds": fix_rounds,
+        "pr_number": pr_number,
+        "change": change,
+        "todo_paths": list(todo_paths_value),
+        "merge_authorization": authorization,
+    }
+    _save_runs(state_path, state)
+    ship = active["ship"]
     try:
         merged = orchestrator.merge_if_ready(
             repo=authority.repo,
@@ -787,7 +1339,18 @@ def _ship_action(
         )
     except RuntimeError:
         post_merge = github.fetch_merge_status(repo=authority.repo, pr_number=pr_number)
-        if not post_merge.merged or post_merge.pr_head != preflight.head:
+        if (
+            not post_merge.merged
+            or post_merge.pr_head != preflight.head
+            or not _authorization_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                preflight=preflight,
+                remote=remote,
+            )
+        ):
             raise
         merged = SimpleNamespace(
             expected_head=preflight.head,
@@ -804,6 +1367,10 @@ def _ship_action(
         "tree_hash": merged.expected_tree_hash,
         "fix_rounds": fix_rounds,
         "merge_commit": post_merge.merge_commit,
+        "pr_number": pr_number,
+        "change": change,
+        "todo_paths": list(todo_paths_value),
+        "merge_authorization": authorization,
     }
     _save_runs(state_path, state)
     return {"action": "merged-awaiting-closure", "head": merged.expected_head}
@@ -824,7 +1391,8 @@ def execute_work_action(
     work_id = args.get("work_id")
     if action not in {"link", "unlink", "start", "resume", "auto", "ship"}:
         raise ValueError("unsupported work action")
-    if not isinstance(repo, str) or not isinstance(work_id, str):
+    repo = _repo_identity(repo)
+    if not isinstance(work_id, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
         raise ValueError("work action repo/work_id invalid")
     if action in {"link", "unlink"}:
         return {

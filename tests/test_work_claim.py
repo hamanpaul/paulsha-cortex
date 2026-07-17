@@ -40,6 +40,9 @@ def _authority(
                 "repo": "acme/demo",
                 "work_id": "lifecycle",
                 "mapped_issues": list(issues),
+                "mapped_prs": [8],
+                "mapped_openspec": ["lifecycle"],
+                "mapped_todo_paths": ["docs/todo.md"],
                 "confirmed_todo": True,
                 "auto_label": True,
                 "source_revisions": ["issue:14@open", "openspec:lifecycle@abc"],
@@ -76,6 +79,13 @@ def test_claim_key_is_stable_for_repo_work_and_sorted_revisions(tmp_path: Path) 
     )
     assert first == second
     assert first.startswith("claim:v1:")
+
+
+def test_work_authority_preserves_exact_confirmed_delivery_refs(tmp_path: Path) -> None:
+    authority = _authority(tmp_path)
+    assert authority.mapped_prs == (8,)
+    assert authority.mapped_openspec == ("lifecycle",)
+    assert authority.mapped_todo_paths == ("docs/todo.md",)
 
 
 def test_manual_start_requires_confirmed_todo_issue_and_fresh_provider(tmp_path: Path) -> None:
@@ -256,6 +266,24 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
                                 "confidence": "confirmed",
                                 "provider": "local:acme/demo",
                             },
+                            {
+                                "source_id": "github_pr:acme/demo#8",
+                                "kind": "github_pr",
+                                "ref": "acme/demo#8",
+                                "revision": "pr-r1",
+                                "status": "open",
+                                "confidence": "confirmed",
+                                "provider": "github:acme/demo",
+                            },
+                            {
+                                "source_id": "todo:docs/todo.md",
+                                "kind": "todo",
+                                "ref": "docs/todo.md",
+                                "revision": "todo-r1",
+                                "status": "active",
+                                "confidence": "confirmed",
+                                "provider": "local:acme/demo",
+                            },
                         ],
                         "next_actions": ["start"],
                         "workflow_run_id": None,
@@ -264,7 +292,9 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
                 ],
                 "source_owners": {
                     "github_issue:acme/demo#14": "acme/demo::lifecycle",
+                    "github_pr:acme/demo#8": "acme/demo::lifecycle",
                     "openspec:lifecycle": "acme/demo::lifecycle",
+                    "todo:docs/todo.md": "acme/demo::lifecycle",
                 },
                 "exclusions": [],
             }
@@ -277,7 +307,12 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
     assert authority.github_provider_id == "github:acme/demo"
     assert authority.mapped_issues == (14,)
     assert authority.confirmed_todo
+    assert authority.mapped_prs == (8,)
+    assert authority.mapped_openspec == ("lifecycle",)
+    assert authority.mapped_todo_paths == ("docs/todo.md",)
     assert authority.source_revisions == (
         "github_issue:acme/demo#14@issue-r1",
+        "github_pr:acme/demo#8@pr-r1",
         "openspec:lifecycle@spec-r1",
+        "todo:docs/todo.md@todo-r1",
     )

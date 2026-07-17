@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from paulsha_cortex.coordinator.github_delivery import (
     COPILOT_REVIEWER_LOGIN,
     CopilotReview,
     DeliveryFacts,
+    GitHubCheck,
     MergeStatus,
     ReviewThread,
 )
@@ -19,6 +21,22 @@ from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 
 HEAD = "a" * 40
 TREE = "b" * 40
+
+
+def _init_repo(root: Path, repo: str = "acme/demo") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    remote = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if remote.returncode != 0:
+        subprocess.run(
+            ["git", "-C", str(root), "remote", "add", "origin", f"git@github.com:{repo}.git"],
+            check=True,
+        )
+    return root
 
 
 def _pr_metadata(path: Path, *, title="fix(work): 修正工作流程", body="Closes #12") -> Path:
@@ -36,7 +54,11 @@ def _snapshot(
     source_revisions=("issue:12@open", "openspec:demo@1"),
     provider_revision="gh-1",
     auto_label=True,
+    prs=(8,),
+    changes=("demo",),
+    todo_paths=("docs/todo.md",),
 ) -> Path:
+    _init_repo(path.parent)
     path.write_text(
         json.dumps(
             {
@@ -54,6 +76,9 @@ def _snapshot(
                         "repo": "acme/demo",
                         "work_id": "demo",
                         "mapped_issues": list(issues),
+                        "mapped_prs": list(prs),
+                        "mapped_openspec": list(changes),
+                        "mapped_todo_paths": list(todo_paths),
                         "confirmed_todo": True,
                         "auto_label": auto_label,
                         "source_revisions": list(source_revisions),
@@ -208,9 +233,54 @@ def test_periodic_auto_scan_claims_labeled_work_and_persists_missing_issue(tmp_p
     assert resumed["result"]["run"]["status"] == "ongoing"
 
 
+def test_periodic_auto_scan_reads_every_issue_and_any_label_claims(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
+    calls: list[str] = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv[-1])
+        labels = [{"name": "cortex:auto-on-going"}] if argv[-1].endswith("/13") else []
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"labels": labels}), stderr="")
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        runner=runner,
+    )
+    assert calls == ["repos/acme/demo/issues/12", "repos/acme/demo/issues/13"]
+    assert result[0]["action"] == "claim"
+
+
+def test_periodic_auto_scan_fails_closed_if_any_mapped_issue_read_fails(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
+
+    def runner(argv, **kwargs):
+        if argv[-1].endswith("/13"):
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        )
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        runner=runner,
+    )
+    assert result == [{
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "action": "blocked",
+        "reason": "github-label-read-failed",
+    }]
+    assert not (tmp_path / "runs.json").exists()
+
+
 def test_unlink_persists_exclusion_and_link_removes_it(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
+    repo_root = _init_repo(tmp_path / "repo")
     common = {
         "repo": "acme/demo",
         "work_id": "demo",
@@ -235,8 +305,7 @@ def test_unlink_persists_exclusion_and_link_removes_it(tmp_path: Path) -> None:
 
 
 def test_typed_path_and_openspec_links_and_exclusions_are_canonical(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
+    repo_root = _init_repo(tmp_path / "repo")
     base = {"repo": "acme/demo", "work_id": "demo", "repo_root": str(repo_root)}
     for kind, ref in (
         ("path", "docs/superpowers/specs/demo.md"),
@@ -275,8 +344,7 @@ def test_typed_path_and_openspec_links_and_exclusions_are_canonical(tmp_path: Pa
     ],
 )
 def test_link_rejects_malformed_or_conflicting_source(tmp_path: Path, extra: dict) -> None:
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
+    repo_root = _init_repo(tmp_path / "repo")
     with pytest.raises(ValueError):
         work_actions.execute_work_action(
             args={
@@ -293,7 +361,7 @@ def test_link_rejects_malformed_or_conflicting_source(tmp_path: Path, extra: dic
 def test_override_writer_rejects_symlink_escape(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     outside = tmp_path / "outside"
-    repo_root.mkdir()
+    _init_repo(repo_root)
     outside.mkdir()
     (repo_root / ".cortex").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
@@ -311,7 +379,7 @@ def test_override_writer_rejects_symlink_escape(tmp_path: Path) -> None:
 
 
 def test_override_writer_rejects_malformed_existing_schema(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
+    repo_root = _init_repo(tmp_path / "repo")
     override = repo_root / ".cortex" / "work-items.yaml"
     override.parent.mkdir(parents=True)
     override.write_text(
@@ -329,6 +397,156 @@ def test_override_writer_rejects_malformed_existing_schema(tmp_path: Path) -> No
                 "ref": "demo",
             },
             requested_by="operator",
+        )
+
+
+def test_all_actions_reject_malformed_repo_and_repo_root_remote_mismatch(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="owner/name"):
+        work_actions.execute_work_action(
+            args={"action": "start", "repo": "bad/repo/extra", "work_id": "demo"},
+            requested_by="operator",
+            snapshot_path=tmp_path / "missing",
+        )
+    root = _init_repo(tmp_path / "other", repo="acme/other")
+    with pytest.raises(ValueError, match="remote.*match"):
+        work_actions.execute_work_action(
+            args={
+                "action": "link",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(root),
+                "kind": "openspec",
+                "ref": "demo",
+            },
+            requested_by="operator",
+        )
+
+
+def test_path_link_rejects_repo_internal_symlink(tmp_path: Path) -> None:
+    root = _init_repo(tmp_path / "repo")
+    outside = tmp_path / "outside.md"
+    outside.write_text("x", encoding="utf-8")
+    (root / "linked.md").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        work_actions.execute_work_action(
+            args={
+                "action": "link",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(root),
+                "kind": "path",
+                "ref": "linked.md",
+            },
+            requested_by="operator",
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "reason"),
+    [
+        ({"pr_number": 9}, "PR.*authorized"),
+        ({"change": "other"}, "OpenSpec.*authorized"),
+        ({"todo_paths": ["docs/other.md"]}, "Todo.*authorized"),
+    ],
+)
+def test_ship_payload_refs_must_exactly_match_work_authority(
+    tmp_path: Path, override: dict, reason: str
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    args = {
+        "action": "ship",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "repo_root": str(tmp_path),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        **override,
+    }
+    with pytest.raises(RuntimeError, match=reason):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 200,
+        )
+
+
+def test_ship_rejects_old_run_after_current_authority_changes(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    _snapshot(
+        snapshot,
+        source_revisions=("issue:12@open", "openspec:demo@2"),
+        provider_revision="gh-2",
+    )
+    with pytest.raises(RuntimeError, match="current WorkAuthority"):
+        work_actions.execute_work_action(
+            args={
+                "action": "ship",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(tmp_path),
+                "pr_number": 8,
+                "change": "demo",
+                "todo_paths": ["docs/todo.md"],
+                "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 200,
+        )
+
+
+def test_ship_rejects_authorized_repo_path_symlink(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    outside = tmp_path / "outside-change"
+    outside.mkdir()
+    active_root = tmp_path / "openspec" / "changes"
+    active_root.mkdir(parents=True)
+    (active_root / "demo").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        work_actions.execute_work_action(
+            args={
+                "action": "ship",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(tmp_path),
+                "pr_number": 8,
+                "change": "demo",
+                "todo_paths": ["docs/todo.md"],
+                "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 200,
         )
 
 
@@ -356,6 +574,9 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
         def __init__(self, *, runner):
             calls.append("github-init")
 
+        def ensure_pr_metadata(self, **kwargs):
+            calls.append("ensure-pr-metadata")
+
         def fetch_delivery_facts(self, **kwargs):
             calls.append("remote-archive-gate")
             reviews = ()
@@ -374,7 +595,7 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
                 head=HEAD,
                 mergeable=True,
                 mergeable_state="clean",
-                checks=(),
+                checks=(GitHubCheck("pytest", "completed", "success"),),
                 copilot_reviews=reviews,
                 review_threads=(),
                 closing_issues=(12,),
@@ -398,6 +619,12 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
 
         def merge_if_ready(self, **kwargs):
             calls.append("merge-if-ready")
+            durable = json.loads(state.read_text(encoding="utf-8"))["runs"]["acme/demo/demo"]
+            assert durable["ship"]["phase"] == "merge-authorized"
+            assert durable["ship"]["merge_authorization"]["hash"]
+            authorization_path = Path(durable["ship"]["merge_authorization"]["path"])
+            assert authorization_path.is_file()
+            assert authorization_path.stat().st_mode & 0o222 == 0
             assert kwargs["authority"].mapped_issues == (12,)
             assert kwargs["preflight"].head == HEAD
             assert kwargs["copilot"].review_id == 9
@@ -414,6 +641,12 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
 
     monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
     monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    foreign_normalized = {"state": "passed", "candidate": HEAD}
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *args, **kwargs: foreign_normalized,
+    )
     monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
     monkeypatch.setattr(
         work_actions,
@@ -434,8 +667,9 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
         "repo_root": str(tmp_path),
         "pr_number": 8,
         "change": "demo",
+        "todo_paths": ["docs/todo.md"],
         "foreign_review_path": str(foreign),
-        "foreign_review_hash": "e" * 64,
+        "foreign_review_hash": work_actions.verification.canonical_json_hash(foreign_normalized),
         "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
     }
     first = work_actions.execute_work_action(
@@ -460,7 +694,7 @@ def test_default_ship_runtime_is_resumable_and_connects_all_delivery_gates(
     assert "merge-if-ready" in calls
 
     third = work_actions.execute_work_action(
-        args={**base, "todo_paths": ["todo.md"], "completion_record_path": str(completion)},
+        args={**base, "completion_record_path": str(completion)},
         requested_by="operator",
         snapshot_path=snapshot,
         state_path=state,
@@ -501,6 +735,7 @@ def test_ship_runs_official_archive_before_preflight(tmp_path: Path) -> None:
             "repo_root": str(tmp_path),
             "pr_number": 8,
             "change": "demo",
+            "todo_paths": ["docs/todo.md"],
             "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
         },
         requested_by="operator",
@@ -531,6 +766,9 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
 
     class GitHub:
         def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
             pass
 
         def fetch_delivery_facts(self, **kwargs):
@@ -585,6 +823,7 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
         "repo_root": str(tmp_path),
         "pr_number": 8,
         "change": "demo",
+        "todo_paths": ["docs/todo.md"],
         "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
     }
     for index, head in enumerate(heads):
@@ -618,7 +857,7 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
     assert persisted["ship"]["fix_rounds"] == 2
 
 
-def test_external_merge_is_reconciled_without_second_merge(monkeypatch, tmp_path: Path) -> None:
+def test_external_merge_without_durable_authorization_needs_human(monkeypatch, tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
     work_actions.execute_work_action(
@@ -632,6 +871,9 @@ def test_external_merge_is_reconciled_without_second_merge(monkeypatch, tmp_path
 
     class GitHub:
         def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
             pass
 
         def fetch_delivery_facts(self, **kwargs):
@@ -682,16 +924,20 @@ def test_external_merge_is_reconciled_without_second_merge(monkeypatch, tmp_path
             "repo": "acme/demo",
             "work_id": "demo",
             "repo_root": str(tmp_path),
-            "pr_number": 8,
-            "change": "demo",
-            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+                "pr_number": 8,
+                "change": "demo",
+                "todo_paths": ["docs/todo.md"],
+                "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
         },
         requested_by="operator",
         snapshot_path=snapshot,
         state_path=state,
         now=lambda: 200,
     )
-    assert result["result"]["action"] == "merged-awaiting-closure"
+    assert result["result"] == {
+        "action": "needs_human",
+        "reason": "external-merge-without-authorization",
+    }
     assert merge_calls == []
 
 
@@ -709,11 +955,44 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
     )
     persisted = json.loads(state.read_text(encoding="utf-8"))
     run = persisted["runs"]["acme/demo/demo"]
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    authorization = work_actions._authorization_record(
+        {
+            "schema": "cortex-merge-authorization/v1",
+            "run_id": run["run_id"],
+            "workflow_step_ids": run["workflow_step_ids"],
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "authority_digest": work_actions.work_authority_digest(authority),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "head": HEAD,
+            "tree_hash": TREE,
+            "copilot_requested_at_epoch": 200.0,
+            "copilot_review_id": 9,
+            "copilot_hash": "1" * 64,
+            "foreign_review_path": "/evidence/review.json",
+            "foreign_review_hash": "2" * 64,
+            "preflight_hash": "3" * 64,
+            "checks_hash": "4" * 64,
+        },
+        state_path=state,
+    )
     run["status"] = "done"
+    run["delivery_binding"] = {
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+    }
     run["ship"] = {
         "phase": "done",
         "head": HEAD,
+        "tree_hash": TREE,
         "todo_paths": ["docs/todo.md"],
+        "merge_authorization": authorization,
         "completion_record": {"path": "/evidence/record.json", "hash": "d" * 64},
     }
     state.write_text(json.dumps(persisted), encoding="utf-8")
@@ -747,6 +1026,7 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
             "repo_root": str(tmp_path),
             "pr_number": 8,
             "change": "demo",
+            "todo_paths": ["docs/todo.md"],
             "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
         },
         requested_by="operator",
@@ -801,6 +1081,7 @@ def test_archive_and_pr_metadata_fail_closed_before_mutation(
                 "repo_root": str(tmp_path),
                 "pr_number": 8,
                 "change": "demo",
+                "todo_paths": ["docs/todo.md"],
                 "pr_metadata_path": str(metadata),
             },
             requested_by="operator",
@@ -810,3 +1091,55 @@ def test_archive_and_pr_metadata_fail_closed_before_mutation(
             runner=runner,
         )
     assert ["openspec", "archive", "-y", "demo"] not in calls
+
+
+@pytest.mark.parametrize(
+    ("changelog", "policy_stdout", "reason"),
+    [
+        ("## [Unreleased]\n- **other**: done\n", "", "changelog-missing"),
+        (
+            "## [Unreleased]\n- **demo**: done\n",
+            "WARN R-22 doc-reference stale link",
+            "doc-reference-invalid",
+        ),
+    ],
+)
+def test_archive_requires_change_specific_changelog_and_no_doc_reference_warning(
+    tmp_path: Path, changelog: str, policy_stdout: str, reason: str
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    change_dir = tmp_path / "openspec" / "changes" / "demo"
+    change_dir.mkdir(parents=True)
+    (change_dir / "tasks.md").write_text("- [x] complete\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+
+    def runner(argv, **kwargs):
+        stdout = policy_stdout if argv[:3] == ["python3", "-m", "policy_check"] else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    with pytest.raises(RuntimeError, match=reason):
+        work_actions.execute_work_action(
+            args={
+                "action": "ship",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(tmp_path),
+                "pr_number": 8,
+                "change": "demo",
+                "todo_paths": ["docs/todo.md"],
+                "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 200,
+            runner=runner,
+        )

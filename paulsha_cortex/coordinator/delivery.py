@@ -76,7 +76,9 @@ def validate_pr_metadata(
     for issue in required_issues:
         if re.search(CLOSING_RE_TEMPLATE.format(issue=issue), metadata.body) is None:
             reasons.append(f"closing-keyword-missing:{issue}")
-    if any(not isinstance(label, str) or not label.strip() for label in metadata.labels):
+    if not metadata.labels or any(
+        not isinstance(label, str) or not label.strip() for label in metadata.labels
+    ) or len(set(metadata.labels)) != len(metadata.labels):
         reasons.append("pr-label-invalid")
     return GateResult(allowed=not reasons, reasons=tuple(reasons))
 
@@ -218,6 +220,9 @@ def _validate_work_authority(
         or not authority.github_provider_id.startswith(GITHUB_PROVIDER_ID)
         or not authority.github_provider_revision
         or not authority.mapped_issues
+        or not authority.mapped_prs
+        or not authority.mapped_openspec
+        or not authority.mapped_todo_paths
         or not authority.confirmed_todo
         or not authority.source_revisions
         or not isinstance(now_epoch, (int, float))
@@ -341,6 +346,9 @@ class ShipOrchestrator:
         todo_paths: tuple[str, ...],
         expected_head: str,
         completion_payload: object,
+        run_id: str,
+        workflow_step_ids: tuple[str, ...],
+        trusted_evidence_refs: tuple[Mapping[str, str], ...],
         coordinator_root: str | Path | None = None,
     ) -> ClosureResult:
         now_epoch = self._now()
@@ -375,10 +383,19 @@ class ShipOrchestrator:
             "provider_revision": authority.github_provider_revision,
             "source_revisions": sorted(authority.source_revisions),
             "mapped_issues": sorted(authority.mapped_issues),
+            "mapped_prs": sorted(authority.mapped_prs),
+            "mapped_openspec": sorted(authority.mapped_openspec),
+            "mapped_todo_paths": sorted(authority.mapped_todo_paths),
             "pr_number": pr_number,
             "change": change,
             "todo_paths": sorted(todo_paths),
             "merge_commit": facts.merge_commit.lower(),
+            "run_id": run_id,
+            "workflow_step_ids": sorted(workflow_step_ids),
+            "trusted_evidence_refs": sorted(
+                (dict(item) for item in trusted_evidence_refs),
+                key=lambda item: item["kind"],
+            ),
         }
         if normalized.get("work_authority") != expected_work_authority:
             raise RuntimeError("completion record WorkAuthority does not match remote delivery")

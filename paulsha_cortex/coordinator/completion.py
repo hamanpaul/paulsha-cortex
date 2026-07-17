@@ -71,10 +71,16 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         "provider_revision",
         "source_revisions",
         "mapped_issues",
+        "mapped_prs",
+        "mapped_openspec",
+        "mapped_todo_paths",
         "pr_number",
         "change",
         "todo_paths",
         "merge_commit",
+        "run_id",
+        "workflow_step_ids",
+        "trusted_evidence_refs",
     }
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("completion work_authority malformed")
@@ -83,8 +89,13 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         raise ValueError("completion work_authority repo invalid")
     sources = value.get("source_revisions")
     issues = value.get("mapped_issues")
+    mapped_prs = value.get("mapped_prs")
+    mapped_openspec = value.get("mapped_openspec")
+    mapped_todo_paths = value.get("mapped_todo_paths")
     todo_paths = value.get("todo_paths")
     pr_number = value.get("pr_number")
+    step_ids = value.get("workflow_step_ids")
+    evidence_refs = value.get("trusted_evidence_refs")
     if (
         not isinstance(sources, list)
         or not sources
@@ -92,14 +103,53 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         or not isinstance(issues, list)
         or not issues
         or any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in issues)
+        or not isinstance(mapped_prs, list)
+        or not mapped_prs
+        or any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in mapped_prs)
+        or not isinstance(mapped_openspec, list)
+        or not mapped_openspec
+        or any(not isinstance(item, str) or not item for item in mapped_openspec)
+        or not isinstance(mapped_todo_paths, list)
+        or not mapped_todo_paths
+        or any(not isinstance(item, str) or not item for item in mapped_todo_paths)
         or not isinstance(todo_paths, list)
         or not todo_paths
         or any(not isinstance(item, str) or not item for item in todo_paths)
         or not isinstance(pr_number, int)
         or isinstance(pr_number, bool)
         or pr_number <= 0
+        or not isinstance(step_ids, list)
+        or not step_ids
+        or any(not isinstance(item, str) or not item for item in step_ids)
+        or len(set(step_ids)) != len(step_ids)
+        or not isinstance(evidence_refs, list)
     ):
         raise ValueError("completion work_authority refs invalid")
+    normalized_evidence: list[dict[str, str]] = []
+    for item in evidence_refs:
+        if not isinstance(item, dict) or set(item) != {"kind", "ref", "hash"}:
+            raise ValueError("completion trusted evidence ref malformed")
+        kind = item.get("kind")
+        if kind not in {"preflight", "foreign_review", "copilot", "merge_authorization"}:
+            raise ValueError("completion trusted evidence kind invalid")
+        normalized_evidence.append(
+            {
+                "kind": kind,
+                "ref": _require_non_empty_string(
+                    item.get("ref"), field="work_authority.trusted_evidence.ref"
+                ),
+                "hash": _normalize_digest_hash(
+                    item.get("hash"), field="work_authority.trusted_evidence.hash"
+                ),
+            }
+        )
+    if {item["kind"] for item in normalized_evidence} != {
+        "preflight",
+        "foreign_review",
+        "copilot",
+        "merge_authorization",
+    } or len(normalized_evidence) != 4:
+        raise ValueError("completion trusted evidence refs incomplete")
     return {
         "repo": repo,
         "work_id": _require_non_empty_string(value.get("work_id"), field="work_authority.work_id"),
@@ -114,12 +164,18 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         ),
         "source_revisions": sorted(sources),
         "mapped_issues": sorted(issues),
+        "mapped_prs": sorted(mapped_prs),
+        "mapped_openspec": sorted(mapped_openspec),
+        "mapped_todo_paths": sorted(mapped_todo_paths),
         "pr_number": pr_number,
         "change": _require_non_empty_string(value.get("change"), field="work_authority.change"),
         "todo_paths": sorted(todo_paths),
         "merge_commit": _normalize_git_sha(
             value.get("merge_commit"), field="work_authority.merge_commit"
         ),
+        "run_id": _require_non_empty_string(value.get("run_id"), field="work_authority.run_id"),
+        "workflow_step_ids": sorted(step_ids),
+        "trusted_evidence_refs": sorted(normalized_evidence, key=lambda item: item["kind"]),
     }
 
 

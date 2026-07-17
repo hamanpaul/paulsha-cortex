@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from pathlib import PurePosixPath
 from urllib.parse import quote
 
 from paulsha_cortex.config import paths
@@ -27,6 +28,9 @@ class WorkAuthority:
     repo: str
     work_id: str
     mapped_issues: tuple[int, ...]
+    mapped_prs: tuple[int, ...]
+    mapped_openspec: tuple[str, ...]
+    mapped_todo_paths: tuple[str, ...]
     confirmed_todo: bool
     auto_label: bool
     source_revisions: tuple[str, ...]
@@ -42,6 +46,9 @@ class WorkAuthority:
         repo: str,
         work_id: str,
         mapped_issues: tuple[int, ...],
+        mapped_prs: tuple[int, ...] = (),
+        mapped_openspec: tuple[str, ...] = (),
+        mapped_todo_paths: tuple[str, ...] = (),
         confirmed_todo: bool,
         auto_label: bool,
         source_revisions: tuple[str, ...],
@@ -54,6 +61,9 @@ class WorkAuthority:
         object.__setattr__(authority, "repo", repo)
         object.__setattr__(authority, "work_id", work_id)
         object.__setattr__(authority, "mapped_issues", mapped_issues)
+        object.__setattr__(authority, "mapped_prs", mapped_prs)
+        object.__setattr__(authority, "mapped_openspec", mapped_openspec)
+        object.__setattr__(authority, "mapped_todo_paths", mapped_todo_paths)
         object.__setattr__(authority, "confirmed_todo", confirmed_todo)
         object.__setattr__(authority, "auto_label", auto_label)
         object.__setattr__(authority, "source_revisions", source_revisions)
@@ -123,6 +133,9 @@ def _authority_from_row(
     if not isinstance(github, dict):
         raise ValueError("durable GitHub provider authority missing")
     issues = row.get("mapped_issues")
+    prs = row.get("mapped_prs", [])
+    changes = row.get("mapped_openspec", [])
+    todo_paths = row.get("mapped_todo_paths", [])
     confirmed_todo = row.get("confirmed_todo")
     auto_label = row.get("auto_label", False)
     source_revisions = row.get("source_revisions")
@@ -130,6 +143,19 @@ def _authority_from_row(
         not isinstance(issues, list)
         or any(not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0 for issue in issues)
         or len(set(issues)) != len(issues)
+        or not isinstance(prs, list)
+        or any(not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0 for pr in prs)
+        or len(set(prs)) != len(prs)
+        or not isinstance(changes, list)
+        or any(
+            not isinstance(change, str)
+            or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", change) is None
+            for change in changes
+        )
+        or len(set(changes)) != len(changes)
+        or not isinstance(todo_paths, list)
+        or any(not _safe_todo_path(path) for path in todo_paths)
+        or len(set(todo_paths)) != len(todo_paths)
     ):
         raise ValueError("confirmed work authority mapped issues invalid")
     if (
@@ -153,6 +179,9 @@ def _authority_from_row(
         repo=repo,
         work_id=work_id,
         mapped_issues=tuple(sorted(issues)),
+        mapped_prs=tuple(sorted(prs)),
+        mapped_openspec=tuple(sorted(changes)),
+        mapped_todo_paths=tuple(sorted(todo_paths)),
         confirmed_todo=confirmed_todo,
         auto_label=auto_label,
         source_revisions=tuple(sorted(source_revisions)),
@@ -193,12 +222,26 @@ def _authority_from_canonical_row(
         if isinstance(source, dict) and source.get("confidence") == "confirmed"
     ]
     issues: list[int] = []
+    prs: list[int] = []
+    changes: list[str] = []
+    todo_paths: list[str] = []
     for source in confirmed:
-        if source.get("kind") != "github_issue":
-            continue
-        match = re.fullmatch(rf"{re.escape(repo)}#([1-9][0-9]*)", str(source.get("ref", "")))
-        if match is not None:
-            issues.append(int(match.group(1)))
+        kind = source.get("kind")
+        ref = source.get("ref")
+        if kind in {"github_issue", "github_pr"}:
+            match = re.fullmatch(rf"{re.escape(repo)}#([1-9][0-9]*)", str(ref or ""))
+            if match is None:
+                raise ValueError("canonical GitHub work source ref invalid")
+            target = issues if kind == "github_issue" else prs
+            target.append(int(match.group(1)))
+        elif kind == "openspec":
+            if not isinstance(ref, str) or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", ref) is None:
+                raise ValueError("canonical OpenSpec work source ref invalid")
+            changes.append(ref)
+        elif kind == "todo":
+            if not _safe_todo_path(ref):
+                raise ValueError("canonical Todo work source ref invalid")
+            todo_paths.append(ref)
     todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
     source_revisions = tuple(
@@ -217,6 +260,9 @@ def _authority_from_canonical_row(
         repo=repo,
         work_id=work_id,
         mapped_issues=tuple(sorted(set(issues))),
+        mapped_prs=tuple(sorted(set(prs))),
+        mapped_openspec=tuple(sorted(set(changes))),
+        mapped_todo_paths=tuple(sorted(set(todo_paths))),
         confirmed_todo=confirmed_todo,
         auto_label=False,
         source_revisions=source_revisions,
@@ -225,6 +271,36 @@ def _authority_from_canonical_row(
         last_success_epoch=last_success,
         snapshot_hash=snapshot_hash,
     )
+
+
+def _safe_todo_path(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    pure = PurePosixPath(value)
+    return (
+        not pure.is_absolute()
+        and ".." not in pure.parts
+        and pure.as_posix() == value
+        and pure.suffix.lower() == ".md"
+    )
+
+
+def work_authority_digest(authority: WorkAuthority) -> str:
+    if not isinstance(authority, WorkAuthority):
+        raise ValueError("confirmed WorkAuthority is required")
+    payload = {
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "snapshot_hash": authority.snapshot_hash,
+        "provider_id": authority.github_provider_id,
+        "provider_revision": authority.github_provider_revision,
+        "source_revisions": list(authority.source_revisions),
+        "mapped_issues": list(authority.mapped_issues),
+        "mapped_prs": list(authority.mapped_prs),
+        "mapped_openspec": list(authority.mapped_openspec),
+        "mapped_todo_paths": list(authority.mapped_todo_paths),
+    }
+    return verification.canonical_json_hash(payload)
 
 
 def load_work_authorities(

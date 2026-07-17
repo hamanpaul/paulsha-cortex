@@ -186,6 +186,56 @@ def test_fetch_merge_status_binds_merged_side_effect_to_exact_pr_head() -> None:
     assert status.merge_commit == MERGE
 
 
+def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
+    calls: list[list[str]] = []
+
+    class MetadataRunner:
+        def __call__(self, argv, **kwargs):
+            calls.append(list(argv))
+            endpoint = " ".join(argv)
+            if "--method PATCH" in endpoint:
+                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+            if "--method PUT" in endpoint:
+                return Result({"labels": [{"name": "enhancement"}]})
+            if endpoint.endswith("repos/acme/demo/pulls/7"):
+                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+            if endpoint.endswith("repos/acme/demo/issues/7"):
+                return Result({"labels": [{"name": "enhancement"}]})
+            raise AssertionError(argv)
+
+    GitHubDeliveryClient(runner=MetadataRunner()).ensure_pr_metadata(
+        repo="acme/demo",
+        pr_number=7,
+        title="fix(work): 修正工作流程",
+        body="Closes #14",
+        labels=("enhancement",),
+    )
+    assert any("--method" in call and "PATCH" in call for call in calls)
+    assert any("--method" in call and "PUT" in call for call in calls)
+
+
+def test_ensure_pr_metadata_rejects_remote_reread_drift() -> None:
+    class DriftRunner:
+        def __call__(self, argv, **kwargs):
+            endpoint = " ".join(argv)
+            if "--method" in argv:
+                return Result({})
+            if endpoint.endswith("repos/acme/demo/pulls/7"):
+                return Result({"title": "wrong", "body": "Closes #14"})
+            if endpoint.endswith("repos/acme/demo/issues/7"):
+                return Result({"labels": [{"name": "enhancement"}]})
+            raise AssertionError(argv)
+
+    with pytest.raises(RuntimeError, match="metadata reread mismatch"):
+        GitHubDeliveryClient(runner=DriftRunner()).ensure_pr_metadata(
+            repo="acme/demo",
+            pr_number=7,
+            title="fix(work): 修正工作流程",
+            body="Closes #14",
+            labels=("enhancement",),
+        )
+
+
 def test_fetch_fails_closed_on_non_json_or_gh_error() -> None:
     class BrokenRunner:
         def __call__(self, argv, **kwargs):

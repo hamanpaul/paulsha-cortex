@@ -704,6 +704,70 @@ class GitHubDeliveryClient:
             expect_json=True,
         )
 
+    def ensure_pr_metadata(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+        title: str,
+        body: str,
+        labels: tuple[str, ...],
+    ) -> None:
+        """Update an existing authorized PR and prove every field by reread."""
+
+        self._repo_parts(repo)
+        if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+            raise ValueError("pr_number must be a positive integer")
+        if not isinstance(title, str) or not title or not isinstance(body, str) or not body:
+            raise ValueError("PR title/body must be non-empty strings")
+        if (
+            not labels
+            or any(not isinstance(label, str) or not label.strip() for label in labels)
+            or len(set(labels)) != len(labels)
+        ):
+            raise ValueError("PR labels must be unique non-empty strings")
+        self._run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{repo}/pulls/{pr_number}",
+                "-f",
+                f"title={title}",
+                "-f",
+                f"body={body}",
+            ],
+            expect_json=True,
+        )
+        label_argv = [
+            "gh",
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{repo}/issues/{pr_number}/labels",
+        ]
+        for label in labels:
+            label_argv.extend(["-f", f"labels[]={label}"])
+        self._run(label_argv, expect_json=True)
+        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
+        issue = self._api(f"repos/{repo}/issues/{pr_number}")
+        if not isinstance(pull, dict) or not isinstance(issue, dict):
+            raise RuntimeError("GitHub PR metadata reread malformed")
+        rows = issue.get("labels")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str)
+            for row in rows
+        ):
+            raise RuntimeError("GitHub PR metadata reread malformed")
+        remote_labels = tuple(sorted(row["name"] for row in rows))
+        if (
+            pull.get("title") != title
+            or pull.get("body") != body
+            or remote_labels != tuple(sorted(labels))
+        ):
+            raise RuntimeError("GitHub PR metadata reread mismatch")
+
     def fetch_merge_status(self, *, repo: str, pr_number: int) -> MergeStatus:
         self._repo_parts(repo)
         pull = self._api(f"repos/{repo}/pulls/{pr_number}")

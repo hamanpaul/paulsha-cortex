@@ -43,6 +43,9 @@ def _authority(root: Path, *, last_success: float = 150, issues=(14,)):
                 "repo": "acme/demo",
                 "work_id": "work",
                 "mapped_issues": list(issues),
+                "mapped_prs": [7],
+                "mapped_openspec": ["work"],
+                "mapped_todo_paths": ["docs/todo.md"],
                 "confirmed_todo": True,
                 "source_revisions": ["issue:14@open", "openspec:work@abc"],
             }
@@ -336,6 +339,12 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
     )
     foreign_payload = json.loads(Path(_foreign_review(tmp_path).path).read_text())
     review_ref = review.write_gate_evaluation(foreign_payload, coordinator_root=tmp_path)
+    trusted_evidence_refs = [
+        {"kind": "preflight", "ref": "tree:" + HEAD2, "hash": "5" * 64},
+        {"kind": "foreign_review", "ref": review_ref["path"], "hash": review_ref["hash"]},
+        {"kind": "copilot", "ref": "github-review:9", "hash": "6" * 64},
+        {"kind": "merge_authorization", "ref": "run:run-1", "hash": "7" * 64},
+    ]
     completion_payload = {
         "schema_version": completion.COMPLETION_SCHEMA_VERSION,
         "slice_id": "ship-review",
@@ -365,10 +374,16 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
             "provider_revision": authority.github_provider_revision,
             "source_revisions": list(authority.source_revisions),
             "mapped_issues": list(authority.mapped_issues),
+            "mapped_prs": list(authority.mapped_prs),
+            "mapped_openspec": list(authority.mapped_openspec),
+            "mapped_todo_paths": list(authority.mapped_todo_paths),
             "pr_number": 7,
             "change": "work",
             "todo_paths": ["docs/todo.md"],
             "merge_commit": HEAD2,
+            "run_id": "run-1",
+            "workflow_step_ids": ["step-build", "step-review", "step-ship"],
+            "trusted_evidence_refs": trusted_evidence_refs,
         },
     }
 
@@ -397,6 +412,9 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
         todo_paths=("docs/todo.md",),
         expected_head=HEAD1,
         completion_payload=completion_payload,
+        run_id="run-1",
+        workflow_step_ids=("step-build", "step-review", "step-ship"),
+        trusted_evidence_refs=tuple(trusted_evidence_refs),
         coordinator_root=tmp_path,
     )
     assert result.facts.completion_record_valid
@@ -456,10 +474,21 @@ def test_remote_closure_rejects_completion_bound_to_another_work(tmp_path: Path)
             "provider_revision": authority.github_provider_revision,
             "source_revisions": list(authority.source_revisions),
             "mapped_issues": list(authority.mapped_issues),
+            "mapped_prs": list(authority.mapped_prs),
+            "mapped_openspec": list(authority.mapped_openspec),
+            "mapped_todo_paths": list(authority.mapped_todo_paths),
             "pr_number": 7,
             "change": "work",
             "todo_paths": ["docs/todo.md"],
             "merge_commit": HEAD2,
+            "run_id": "run-1",
+            "workflow_step_ids": ["step-build", "step-review", "step-ship"],
+            "trusted_evidence_refs": [
+                {"kind": "preflight", "ref": "tree:" + HEAD2, "hash": "5" * 64},
+                {"kind": "foreign_review", "ref": "/missing-review", "hash": "6" * 64},
+                {"kind": "copilot", "ref": "github-review:9", "hash": "7" * 64},
+                {"kind": "merge_authorization", "ref": "run:run-1", "hash": "8" * 64},
+            ],
         },
     }
     with pytest.raises(RuntimeError, match="WorkAuthority"):
@@ -471,5 +500,8 @@ def test_remote_closure_rejects_completion_bound_to_another_work(tmp_path: Path)
             todo_paths=("docs/todo.md",),
             expected_head=HEAD1,
             completion_payload=payload,
+            run_id="run-1",
+            workflow_step_ids=("step-build", "step-review", "step-ship"),
+            trusted_evidence_refs=tuple(payload["work_authority"]["trusted_evidence_refs"]),
             coordinator_root=tmp_path,
         )
