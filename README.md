@@ -356,14 +356,14 @@ cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 | control root | `~/.agents/control` | `PSC_CONTROL_ROOT` |
 | coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
 | specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
-| run root | `~/.agents/run` | `PSC_RUN_ROOT` |
+| run root | CLI 預設 `~/.agents/run`；installed instance 為 `~/.agents/run/<instance>` | `PSC_RUN_ROOT` |
 | monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
 | project config root | `~/.agents/config/paulsha` | `PSC_PROJECT_CONFIG_ROOT` |
 | repo root | 目前工作目錄 | `PSC_REPO_ROOT` |
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
-共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 的 bootstrap EnvironmentFile 固定放在 `~/.agents/core/runtime/<instance>-manager.env`；該檔會持久化 `PSC_AGENTS_ROOT`，再將 runtime 導向 override。installer 重跑會更新自身管理的 Python/repo 值，但保留既有 operator `PSC_AGENTS_ROOT`、`PSC_RUN_ROOT`、`PSC_MONITOR_STATE_ROOT` 與 `PSC_PROJECT_CONFIG_ROOT`。
+共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；後者會持久化 `PSC_AGENTS_ROOT`，再將 runtime 導向 override。installer 重跑會更新自身管理的 Python/repo 值，但保留既有 operator `PSC_AGENTS_ROOT`、`PSC_RUN_ROOT`、`PSC_MONITOR_STATE_ROOT` 與 `PSC_PROJECT_CONFIG_ROOT`。Monitor socket 預設為 `$PSC_RUN_ROOT/project-monitor.sock`，也可由 `project-cortex.yaml` 的 `monitor.socket_path` 覆寫；live doctor 會透過 production `MonitorSocketClient` 執行 `list_work_items` 並驗證 `cortex-work/v1`，單純 Unix socket 可連線不算 ready。
 
 ## 誠實狀態表
 

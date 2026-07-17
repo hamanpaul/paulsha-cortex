@@ -60,6 +60,8 @@ cortex doctor --probe-live --repo owner/repo --json
 ## Snapshot 與 registry migration
 
 - Work snapshot：`$PSC_MONITOR_STATE_ROOT/work-items.snapshot.json`；未設定時為 `$PSC_AGENTS_ROOT/monitor/work-items.snapshot.json`。
+- Installed service 先依 unit 宣告順序合併 `<instance>.env` 與 `<instance>-manager.env`；預設 socket 為 `$PSC_AGENTS_ROOT/run/<instance>/project-monitor.sock`，`monitor.socket_path` override 優先。
+- `doctor --probe-live` 必須以 production Monitor config 解出 socket，再用 read-only `list_work_items` 驗證 `ok` 與 `cortex-work/v1` envelope；裸 listener 或只完成 connect 都視為失敗。
 - Snapshot schema：`work-items-snapshot/v1`，mode `0600`，atomic replace + file/directory fsync。
 - Coordinator registry：首次載入合法 v1 時先建立 read-only、content-hash 命名的 backup，再升級為 v2。
 - 舊 jobs/slices 只進 `legacy_records`，不會猜測 work item association。

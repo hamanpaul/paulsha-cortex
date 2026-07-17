@@ -6,18 +6,18 @@ import argparse
 import json
 import os
 import re
-import socket
-import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from urllib.parse import quote
+from unittest.mock import patch
 
 DOCTOR_SCHEMA = "cortex-doctor/v1"
 AUTO_LABEL = "cortex:auto-on-going"
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 Runner = Callable[..., object]
 AgyProbe = Callable[[], tuple[bool, str]]
 
@@ -157,44 +157,161 @@ def _default_agy_probe() -> tuple[bool, str]:
     return ready, "ready" if ready else "unavailable"
 
 
-def _service_paths_probe(*, home: Path, instance: str, live: bool) -> ProbeResult:
-    if INSTANCE_RE.fullmatch(instance) is None:
-        return ProbeResult("service-paths", "fail", "instance name is invalid", True)
-    required_paths = (
-        home / ".config" / "systemd" / "user" / f"{instance}-manager.service",
-        home / ".config" / "systemd" / "user" / f"{instance}-manager.timer",
-        home / ".config" / "systemd" / "user" / f"{instance}-monitor.service",
-        # systemd templates intentionally bootstrap from this fixed location;
-        # PSC_AGENTS_ROOT inside the env file controls all runtime data roots.
-        home / ".agents" / "core" / "runtime" / f"{instance}-manager.env",
-    )
-    missing = sum(path.is_symlink() or not path.is_file() for path in required_paths)
-    if missing:
-        return ProbeResult(
-            "service-paths",
-            "fail" if live else "warn",
-            f"{missing} managed service path(s) missing",
-            live,
-        )
-    expected_env = f"EnvironmentFile=-%h/.agents/core/runtime/{instance}-manager.env"
+def _unit_environment_files(path: Path, *, home: Path) -> tuple[tuple[Path, bool], ...]:
     try:
-        manager_text = required_paths[0].read_text(encoding="utf-8")
-        monitor_text = required_paths[2].read_text(encoding="utf-8")
-        env_values: dict[str, str] = {}
-        for line in required_paths[3].read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.partition("=")
-            if separator:
-                env_values[key] = value
-    except (OSError, UnicodeError):
-        return ProbeResult("service-paths", "fail", "managed unit/env paths unreadable", True)
-    roots = ("PSC_REPO_ROOT", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT", "PSC_PROJECT_CONFIG_ROOT")
-    if (
-        expected_env not in manager_text
-        or expected_env not in monitor_text
-        or any(not Path(env_values.get(name, "")).expanduser().is_absolute() for name in roots)
-    ):
-        return ProbeResult("service-paths", "fail", "managed unit/env path contract is inconsistent", True)
-    return ProbeResult("service-paths", "pass", "managed unit/env path contract is consistent", live)
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("unit unreadable") from exc
+    files: list[tuple[Path, bool]] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line.startswith("EnvironmentFile="):
+            continue
+        value = line.split("=", 1)[1]
+        optional = value.startswith("-")
+        if optional:
+            value = value[1:]
+        value = value.replace("%h", str(home))
+        candidate = Path(value).expanduser()
+        if not value or "%" in value or not candidate.is_absolute():
+            raise ValueError("EnvironmentFile path invalid")
+        files.append((candidate, optional))
+    if not files:
+        raise ValueError("EnvironmentFile missing")
+    return tuple(files)
+
+
+def _parse_environment_file(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("EnvironmentFile unreadable") from exc
+    values: dict[str, str] = {}
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or ENV_KEY_RE.fullmatch(key) is None or key in values:
+            raise ValueError("EnvironmentFile entry invalid or duplicate")
+        if value[:1] in {"'", '"'}:
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ValueError("EnvironmentFile quote invalid")
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _runtime_defaults(
+    environment: Mapping[str, str],
+    *,
+    home: Path,
+    instance: str,
+) -> dict[str, str]:
+    effective = dict(environment)
+    effective["HOME"] = str(home)
+    agents_root = Path(effective.get("PSC_AGENTS_ROOT", str(home / ".agents"))).expanduser()
+    effective.setdefault("PSC_AGENTS_ROOT", str(agents_root))
+    effective.setdefault("PSC_RUN_ROOT", str(agents_root / "run" / instance))
+    effective.setdefault("PSC_MONITOR_STATE_ROOT", str(agents_root / "monitor"))
+    effective.setdefault("PSC_PROJECT_CONFIG_ROOT", str(agents_root / "config" / "paulsha"))
+    return effective
+
+
+def _load_bootstrap_environment(
+    *,
+    home: Path,
+    instance: str,
+    base_env: Mapping[str, str],
+) -> dict[str, str]:
+    if INSTANCE_RE.fullmatch(instance) is None or not home.is_absolute():
+        raise ValueError("service instance/home invalid")
+    unit_root = home / ".config" / "systemd" / "user"
+    manager_unit = unit_root / f"{instance}-manager.service"
+    monitor_unit = unit_root / f"{instance}-monitor.service"
+    if manager_unit.is_symlink() or monitor_unit.is_symlink():
+        raise ValueError("managed units must not be symlinks")
+    manager_files = _unit_environment_files(
+        manager_unit,
+        home=home,
+    )
+    monitor_files = _unit_environment_files(
+        monitor_unit,
+        home=home,
+    )
+    if manager_files != monitor_files:
+        raise ValueError("manager/monitor EnvironmentFile order differs")
+    bootstrap_env = home / ".agents" / "core" / "runtime" / f"{instance}-manager.env"
+    if bootstrap_env not in {path for path, _optional in manager_files} or not bootstrap_env.is_file():
+        raise ValueError("managed bootstrap EnvironmentFile missing")
+    effective = dict(base_env)
+    for env_path, optional in manager_files:
+        if not env_path.exists():
+            if optional:
+                continue
+            raise ValueError("required EnvironmentFile missing")
+        if env_path.is_symlink() or not env_path.is_file():
+            raise ValueError("EnvironmentFile must be a regular non-symlink file")
+        effective.update(_parse_environment_file(env_path))
+    effective = _runtime_defaults(effective, home=home, instance=instance)
+    roots = ("PSC_AGENTS_ROOT", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT", "PSC_PROJECT_CONFIG_ROOT")
+    if any(not Path(effective[name]).expanduser().is_absolute() for name in roots):
+        raise ValueError("effective runtime root is not absolute")
+    return effective
+
+
+def _service_environment_probe(
+    *,
+    home: Path,
+    instance: str,
+    live: bool,
+    base_env: Mapping[str, str],
+) -> tuple[ProbeResult, dict[str, str]]:
+    if INSTANCE_RE.fullmatch(instance) is None:
+        return (
+            ProbeResult("service-paths", "fail", "instance name is invalid", True),
+            _runtime_defaults(base_env, home=home, instance="cortex"),
+        )
+    timer = home / ".config" / "systemd" / "user" / f"{instance}-manager.timer"
+    try:
+        effective = _load_bootstrap_environment(
+            home=home,
+            instance=instance,
+            base_env=base_env,
+        )
+        if timer.is_symlink() or not timer.is_file():
+            raise FileNotFoundError("manager timer missing")
+    except FileNotFoundError:
+        return (
+            ProbeResult(
+                "service-paths",
+                "fail" if live else "warn",
+                "managed service bootstrap path(s) missing",
+                live,
+            ),
+            _runtime_defaults(base_env, home=home, instance=instance),
+        )
+    except (OSError, ValueError):
+        return (
+            ProbeResult("service-paths", "fail", "managed bootstrap environment is invalid", True),
+            _runtime_defaults(base_env, home=home, instance=instance),
+        )
+    return (
+        ProbeResult("service-paths", "pass", "effective service environment is valid", live),
+        effective,
+    )
+
+
+def _service_paths_probe(*, home: Path, instance: str, live: bool) -> ProbeResult:
+    result, _effective = _service_environment_probe(
+        home=home,
+        instance=instance,
+        live=live,
+        base_env=os.environ,
+    )
+    return result
 
 
 def _root_is_creatable(path: Path) -> bool:
@@ -208,13 +325,28 @@ def _root_is_creatable(path: Path) -> bool:
     return candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK)
 
 
+def _load_runtime_monitor_socket_path(env: Mapping[str, str]) -> Path:
+    """Resolve custom/default socket through the production Monitor config loader."""
+    from .monitor.config import load_config
+
+    with patch.dict(os.environ, dict(env), clear=True):
+        return Path(load_config().socket_path).expanduser()
+
+
+def _request_runtime_monitor(socket_path: Path, payload: Mapping[str, object]) -> dict:
+    """Use the production work API client; missing PR A fails closed."""
+    from .monitor.work_api import MonitorSocketClient
+
+    return MonitorSocketClient(socket_path=socket_path, timeout=2.0).request(payload)
+
+
 def _monitor_path_probes(
-    env: Mapping[str, str],
-    agents_root: Path,
     *,
+    state_root: Path,
+    socket_path: Path,
     live: bool,
 ) -> tuple[ProbeResult, ProbeResult]:
-    state_root = Path(env.get("PSC_MONITOR_STATE_ROOT", str(agents_root / "monitor"))).expanduser()
+    state_root = Path(state_root).expanduser()
     if not state_root.is_absolute():
         state = ProbeResult("monitor-state", "fail", "monitor state root must be absolute", True)
     elif not _root_is_creatable(state_root):
@@ -222,28 +354,36 @@ def _monitor_path_probes(
     else:
         state = ProbeResult("monitor-state", "pass", "durable state root is writable/creatable", True)
 
-    run_root = Path(env.get("PSC_RUN_ROOT", str(agents_root / "run"))).expanduser()
-    if not run_root.is_absolute():
+    socket_path = Path(socket_path).expanduser()
+    run_root = socket_path.parent
+    if not socket_path.is_absolute():
         monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket root must be absolute", True)
     elif not _root_is_creatable(run_root):
         monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket root is not writable/creatable", True)
     elif not live:
         monitor_socket = ProbeResult("monitor-socket", "warn", "socket connectivity not probed", False)
     else:
-        socket_path = run_root / "project-monitor.sock"
         try:
-            if not stat.S_ISSOCK(socket_path.stat().st_mode):
-                raise OSError("not a socket")
-            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                client.settimeout(1.0)
-                client.connect(str(socket_path))
-            finally:
-                client.close()
+            response = _request_runtime_monitor(
+                socket_path,
+                {"kind": "list_work_items", "states": [], "include_done": False, "explain": False},
+            )
         except OSError:
             monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket is not listening", True)
+        except (ImportError, RuntimeError, ValueError):
+            monitor_socket = ProbeResult("monitor-socket", "fail", "monitor work API probe failed", True)
         else:
-            monitor_socket = ProbeResult("monitor-socket", "pass", "monitor socket accepted a live connection", True)
+            data = response.get("data") if isinstance(response, dict) else None
+            if (
+                not isinstance(response, dict)
+                or response.get("ok") is not True
+                or not isinstance(data, dict)
+                or data.get("schema") != "cortex-work/v1"
+                or not isinstance(data.get("items"), list)
+            ):
+                monitor_socket = ProbeResult("monitor-socket", "fail", "monitor work API protocol invalid", True)
+            else:
+                monitor_socket = ProbeResult("monitor-socket", "pass", "cortex-work/v1 read API ready", True)
     return state, monitor_socket
 
 
@@ -296,16 +436,38 @@ def run_doctor(
 ) -> DoctorReport:
     environment = dict(os.environ if env is None else env)
     home_path = Path(home) if home is not None else Path(environment.get("HOME", str(Path.home())))
-    agents_root = Path(environment.get("PSC_AGENTS_ROOT", str(home_path / ".agents"))).expanduser()
-    state_probe, socket_probe = _monitor_path_probes(
-        environment,
-        agents_root,
+    service_probe, effective = _service_environment_probe(
+        home=home_path,
+        instance=instance,
         live=probe_live,
+        base_env=environment,
     )
+    agents_root = Path(effective["PSC_AGENTS_ROOT"]).expanduser()
+    state_root = Path(effective["PSC_MONITOR_STATE_ROOT"]).expanduser()
+    try:
+        socket_path = _load_runtime_monitor_socket_path(effective)
+    except (ImportError, OSError, ValueError):
+        state_probe, _ignored_socket = _monitor_path_probes(
+            state_root=state_root,
+            socket_path=Path(effective["PSC_RUN_ROOT"]) / "project-monitor.sock",
+            live=False,
+        )
+        socket_probe = ProbeResult(
+            "monitor-socket",
+            "fail",
+            "production Monitor config did not resolve a socket path",
+            True,
+        )
+    else:
+        state_probe, socket_probe = _monitor_path_probes(
+            state_root=state_root,
+            socket_path=socket_path,
+            live=probe_live,
+        )
     probes: list[ProbeResult] = [
-        _preflight_probe(environment),
-        _identity_probe(environment, agents_root),
-        _service_paths_probe(home=home_path, instance=instance, live=probe_live),
+        _preflight_probe(effective),
+        _identity_probe(effective, agents_root),
+        service_probe,
         state_probe,
         socket_probe,
     ]
