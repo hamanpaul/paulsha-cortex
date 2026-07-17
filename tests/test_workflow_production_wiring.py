@@ -143,14 +143,19 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         ]
     )
     calls: list[str] = []
+    plan_launch_roots: list[Path] = []
 
     class WorkflowLauncher:
+        def as_read_only(self):
+            return self
+
         def launch(self, *, slice_id, prompt, worktree, log_dir):
             contract_payload = json.loads(prompt.split("Contract: ", 1)[1])
             job = registry.get_job(slice_id)
             phase = contract_payload["phase"]
             card = contract_payload["card_id"]
             if phase == "plan":
+                plan_launch_roots.append(Path(worktree))
                 evidence = {
                     "schema_version": 1, "kind": "workflow-card", "status": "passed",
                     "run_id": contract_payload["run_id"], "card_id": card,
@@ -164,13 +169,22 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                     "candidate": candidate, "outputs": [],
                 }
             elif phase == "verify":
+                report = tmp_path / "reports/verify/production-wiring.md"
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text("# Verification\n\nPassed.\n", encoding="utf-8")
                 evidence = {
                     "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
                     "slice_id": f"{contract_payload['run_id']}-{card}",
                     "candidate": candidate, "status": "verified", "summary": "ok",
                     "details": {"card": card},
+                    "outputs": ["reports/verify/production-wiring.md"],
                 }
             else:
+                suffix = "-adversarial" if card == "adversarial-review" else ""
+                report_ref = f"reports/review/production-wiring{suffix}.md"
+                report = tmp_path / report_ref
+                report.parent.mkdir(parents=True, exist_ok=True)
+                report.write_text("# Review\n\nPassed.\n", encoding="utf-8")
                 evidence = review.build_gate_evaluation(
                     slice_id=f"{contract_payload['run_id']}-{card}",
                     state="passed", reason="accepted",
@@ -181,6 +195,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                         "reviewer": identities.require("claude", "claude-secondary").legacy_dict(),
                     },
                 )
+                evidence["outputs"] = [report_ref]
             log_path = Path(log_dir) / f"{slice_id}.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
@@ -257,6 +272,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     run = registry.get_workflow_run(result["run_id"])
 
     assert calls == ["questioner", "secondary:anthropic", "integrator"]
+    assert plan_launch_roots and all(path != tmp_path for path in plan_launch_roots)
     assert run.current_phase == "plan"
     assert [ref.kind for ref in run.gate_refs] == ["brainstorm"]
     assert Path(run.gate_refs[0].ref).is_file()
@@ -411,7 +427,7 @@ def test_manager_rejects_planner_artifacts_outside_governed_roots(tmp_path: Path
         )
 
 
-def test_planning_artifact_publish_is_scoped_no_clobber_and_transactional(tmp_path: Path) -> None:
+def test_planning_artifact_publish_is_scoped_cas_and_transactional(tmp_path: Path) -> None:
     plan = {
         "kind": "plan",
         "path": "docs/superpowers/plans/production-wiring-plan.md",
@@ -428,6 +444,7 @@ def test_planning_artifact_publish_is_scoped_no_clobber_and_transactional(tmp_pa
             "docs/superpowers/plans/*production-wiring*.md",
             "docs/superpowers/specs/*production-wiring*-spec.md",
         ),
+        baseline_hashes={},
     )
     assert (tmp_path / plan["path"]).is_file()
     assert (tmp_path / spec["path"]).is_file()
@@ -445,6 +462,7 @@ def test_planning_artifact_publish_is_scoped_no_clobber_and_transactional(tmp_pa
                 "docs/superpowers/plans/*production-wiring*.md",
                 "docs/superpowers/specs/*production-wiring*-spec.md",
             ),
+            baseline_hashes={},
         )
     assert not (tmp_path / plan["path"]).exists()
     assert conflict.read_text(encoding="utf-8") == "owned by another transaction\n"
@@ -454,7 +472,126 @@ def test_planning_artifact_publish_is_scoped_no_clobber_and_transactional(tmp_pa
         manager._publish_planning_artifacts(
             str(tmp_path), [other_work], work_id="production-wiring", task_slug="production-wiring",
             allowed_refs=("docs/superpowers/plans/*production-wiring*.md",),
+            baseline_hashes={},
         )
+
+
+def test_planning_artifact_publish_replaces_only_exact_baseline_and_rolls_back_group(
+    tmp_path: Path,
+) -> None:
+    spec_ref = "docs/superpowers/specs/production-wiring-spec.md"
+    plan_ref = "docs/superpowers/plans/production-wiring-plan.md"
+    old_spec = "---\nstatus: draft\n---\n# Spec\n## Requirements\nTBD\n"
+    spec_path = tmp_path / spec_ref
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_path.write_text(old_spec, encoding="utf-8")
+    baseline = manager._sha256_path(spec_path)
+    rows = [
+        {
+            "kind": "spec", "path": spec_ref,
+            "content": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
+        },
+        {
+            "kind": "plan", "path": plan_ref,
+            "content": "---\nstatus: accepted\n---\n# Plan\n## Task 1\nBuild.\n",
+        },
+    ]
+    rollback = manager._publish_planning_artifacts(
+        str(tmp_path), rows, work_id="production-wiring", task_slug="production-wiring",
+        allowed_refs=(
+            "docs/superpowers/specs/*production-wiring*-spec.md",
+            "docs/superpowers/plans/*production-wiring*.md",
+        ),
+        baseline_hashes={spec_ref: baseline},
+    )
+    assert "Bound." in spec_path.read_text(encoding="utf-8")
+    assert (tmp_path / plan_ref).is_file()
+    rollback()
+    assert spec_path.read_text(encoding="utf-8") == old_spec
+    assert not (tmp_path / plan_ref).exists()
+
+    spec_path.write_text("operator changed after scan\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="baseline CAS"):
+        manager._publish_planning_artifacts(
+            str(tmp_path), rows, work_id="production-wiring", task_slug="production-wiring",
+            allowed_refs=(
+                "docs/superpowers/specs/*production-wiring*-spec.md",
+                "docs/superpowers/plans/*production-wiring*.md",
+            ),
+            baseline_hashes={spec_ref: baseline},
+        )
+    assert spec_path.read_text(encoding="utf-8") == "operator changed after scan\n"
+    assert not (tmp_path / plan_ref).exists()
+
+
+def test_verify_terminal_evidence_cannot_substitute_for_declared_report(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    log = tmp_path / "verify.jsonl"
+    payload = {
+        "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+        "slice_id": "run-card",
+        "candidate": "a" * 40,
+        "status": "verified",
+        "summary": "ok",
+        "details": {},
+        "outputs": [],
+    }
+    log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="verify", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(tmp_path), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head="a" * 40,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="card", workflow_phase="verify", workflow_repo_root=str(tmp_path),
+        workflow_outputs=("reports/verify/work.md",), source_revision="rev",
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(ValueError, match="incomplete for manifest refs"):
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=tmp_path
+        )
+    assert not (tmp_path / "evidence/workflow").exists()
+
+
+def test_planner_terminalization_rejects_disposable_sandbox_pollution(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plan_ref = "docs/superpowers/plans/work-plan.md"
+    plan = repo / plan_ref
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Plan\n", encoding="utf-8")
+    sandbox = tmp_path / "planning-sandboxes" / ("a" * 32)
+    sandbox.parent.mkdir()
+    planning_runtime._copy_planning_sandbox(repo, sandbox)
+    sandbox_hash = planning_runtime._tree_snapshot(sandbox)
+    log = tmp_path / "plan.jsonl"
+    payload = {
+        "schema_version": 1, "kind": "workflow-card", "status": "passed",
+        "run_id": "run", "card_id": "card", "candidate": None,
+        "outputs": [plan_ref],
+    }
+    log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="plan", persona="planner", branch="feature/work", pane="",
+        worktree=str(sandbox), executor="codex", model_id="planner",
+        independence_domain="openai", workflow_run_id="run",
+        workflow_claim_key="claim", workflow_repo="owner/repo", workflow_card="card",
+        workflow_phase="plan", workflow_repo_root=str(repo), workflow_outputs=(plan_ref,),
+        source_revision="rev", workflow_sandbox_hash=sandbox_hash,
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    (sandbox / "empty-pollution").mkdir()
+
+    with pytest.raises(ValueError, match="modified disposable read-only sandbox"):
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=tmp_path
+        )
+    assert not sandbox.exists()
+    assert registry.get_job(job["job_id"])["workflow_evidence"] is None
 
 
 def _run(
@@ -534,6 +671,34 @@ def test_workflow_gate_refs_are_typed_distinct_and_ship_requires_all_three() -> 
     assert no_brainstorm.gate_status == "passed"
 
 
+def test_restart_reconcile_keeps_publication_when_registry_gate_is_committed(
+    tmp_path: Path,
+) -> None:
+    transaction = manager._PlanningPublicationTransaction(
+        root=tmp_path, run_id="workflow-1", journal_root=tmp_path
+    )
+    artifact = tmp_path / "docs/superpowers/plans/work-1.md"
+    transaction.publish(
+        artifact, b"# Plan\n", baseline_hash=None, kind="artifact"
+    )
+    evidence = tmp_path / "evidence/brainstorm.json"
+    transaction.write_evidence(evidence, {"kind": "brainstorm-peer"})
+    digest = manager._sha256_path(evidence)
+    run = _run(
+        phase="plan",
+        status="running",
+        refs=(GateEvidenceRef("brainstorm", str(evidence), digest),),
+    )
+
+    manager._PlanningPublicationTransaction.reconcile(
+        root=tmp_path, journal_root=tmp_path, run=run
+    )
+
+    assert artifact.is_file()
+    assert evidence.is_file()
+    assert not (tmp_path / "planning-transactions/workflow-1.json").exists()
+
+
 def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
@@ -566,6 +731,117 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     assert result["reason"] == "planning-complete"
     assert run.brainstorm_required is False
     assert run.gate_refs == ()
+
+
+def test_brainstorm_publication_rolls_back_registry_fault_and_restart_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_path = tmp_path / "registry.json"
+    registry = JobRegistry(state_path=state_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(_manifest().to_dict()), encoding="utf-8")
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            },
+            {
+                "executor": "claude", "model_id": "secondary",
+                "independence_domain": "anthropic", "capabilities": ["planning"],
+            },
+        ]
+    )
+
+    def questioner(report):
+        from paulsha_cortex.coordinator.planning import assess_planning_completeness
+
+        return assess_planning_completeness([]).default_question_pack.to_dict()
+
+    def secondary(pack, identity):
+        return {
+            "schema_version": 1,
+            "question_pack_id": pack["pack_id"],
+            "evidence": [
+                {"question_id": row["question_id"], "claims": ["missing"], "source_refs": ["scan:1"]}
+                for row in pack["questions"]
+            ],
+        }
+
+    def integrator(pack, evidence):
+        bodies = {
+            "spec": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
+            "design": "---\nstatus: accepted\n---\n# Design\n## Decisions\nBound.\n",
+            "plan": "---\nstatus: accepted\n---\n# Plan\n## Task 1\nBuild.\n",
+        }
+        refs = {
+            "spec": "docs/superpowers/specs/production-wiring-spec.md",
+            "design": "docs/superpowers/specs/production-wiring-design.md",
+            "plan": "docs/superpowers/plans/production-wiring-plan.md",
+        }
+        resolutions = []
+        artifacts = []
+        for row in pack["questions"]:
+            kind = row["kind"].removeprefix("missing-")
+            resolutions.append(
+                {
+                    "question_id": row["question_id"], "decision": "accepted",
+                    "artifact_kind": kind, "artifact_refs": [refs[kind]],
+                }
+            )
+            artifacts.append({"kind": kind, "path": refs[kind], "content": bodies[kind]})
+        return {
+            "schema_version": 1, "question_pack_id": pack["pack_id"],
+            "secondary_evidence_hash": evidence["evidence_hash"],
+            "resolutions": resolutions, "artifacts": artifacts,
+        }
+
+    args = _workflow_args(manifest_path, tmp_path)
+    args.update({"primary_model": "primary"})
+    real_write = registry._write_payload_atomically
+    failed = False
+
+    def fail_plan_transition(payload):
+        nonlocal failed
+        if not failed and any(
+            row.get("current_phase") == "plan" and row.get("gate_refs")
+            for row in payload.get("workflows", [])
+        ):
+            failed = True
+            raise OSError("registry save fault")
+        real_write(payload)
+
+    monkeypatch.setattr(registry, "_write_payload_atomically", fail_plan_transition)
+    with pytest.raises(OSError, match="registry save fault"):
+        manager.apply_workflow_action(
+            registry, args=args, identity_registry=identities,
+            probes={
+                ("claude", "secondary"): CapabilityProbe.ready_for(
+                    "claude", "secondary", "anthropic"
+                )
+            },
+            primary_questioner=questioner, secondary_planner=secondary,
+            primary_integrator=integrator, coordinator_root=tmp_path,
+        )
+
+    assert registry.list_workflow_runs()[0].current_phase == "define"
+    assert not (tmp_path / "docs/superpowers").exists()
+    assert not list((tmp_path / "evidence").glob("brainstorm-*.json"))
+
+    restarted = JobRegistry(state_path=state_path)
+    result = manager.apply_workflow_action(
+        restarted, args=args, identity_registry=identities,
+        probes={
+            ("claude", "secondary"): CapabilityProbe.ready_for(
+                "claude", "secondary", "anthropic"
+            )
+        },
+        primary_questioner=questioner, secondary_planner=secondary,
+        primary_integrator=integrator, coordinator_root=tmp_path,
+    )
+    assert result["reason"] == "brainstorm-complete"
+    assert restarted.get_workflow_run(result["run_id"]).current_phase == "plan"
+    assert not list((tmp_path / "planning-transactions").glob("*.json"))
 
 
 def test_manager_rejects_forged_persona_spine(tmp_path: Path) -> None:

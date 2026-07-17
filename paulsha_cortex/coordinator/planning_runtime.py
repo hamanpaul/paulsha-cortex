@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -56,7 +57,7 @@ def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree
 
 
 def _tree_snapshot(root: Path) -> str:
-    """Hash every tracked/untracked file without following symlinks.
+    """Hash the complete tree shape, content, links, and stable metadata.
 
     The planner runs in a disposable copy, but the operator checkout is also
     hashed before and after launch.  This catches direct writes through an
@@ -64,20 +65,47 @@ def _tree_snapshot(root: Path) -> str:
     """
 
     digest = hashlib.sha256()
-    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
-        dirs[:] = sorted(name for name in dirs if name != ".git")
-        for name in sorted(files):
-            path = Path(current) / name
-            relative = path.relative_to(root).as_posix()
-            digest.update(relative.encode("utf-8"))
+
+    def add_metadata(path: Path) -> os.stat_result:
+        metadata = path.lstat()
+        digest.update(f"{metadata.st_mode}:{metadata.st_uid}:{metadata.st_gid}".encode())
+        digest.update(b"\0")
+        try:
+            names = sorted(os.listxattr(path, follow_symlinks=False))
+        except (AttributeError, OSError):
+            names = []
+        for name in names:
+            digest.update(name.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"=")
+            try:
+                digest.update(os.getxattr(path, name, follow_symlinks=False))
+            except OSError:
+                digest.update(b"<unreadable>")
             digest.update(b"\0")
-            if path.is_symlink():
-                digest.update(b"link\0")
-                digest.update(os.readlink(path).encode("utf-8"))
-            else:
-                digest.update(b"file\0")
-                digest.update(path.read_bytes())
-            digest.update(b"\0")
+        return metadata
+
+    def visit(path: Path, relative: Path) -> None:
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        metadata = add_metadata(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"link\0")
+            digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+        elif stat.S_ISDIR(metadata.st_mode):
+            digest.update(b"dir\0")
+            for child in sorted(path.iterdir(), key=lambda item: item.name):
+                if child.name == ".git":
+                    continue
+                visit(child, relative / child.name)
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"file\0")
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"special\0")
+            digest.update(str(metadata.st_rdev).encode())
+        digest.update(b"\0")
+
+    visit(root, Path("."))
     return digest.hexdigest()
 
 
@@ -106,6 +134,7 @@ def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
             shutil.copytree(source, target, symlinks=True)
         else:
             shutil.copy2(source, target)
+    shutil.copystat(baseline, worktree, follow_symlinks=False)
 
 
 def _extract_json(stdout: str, output_path: Path) -> object:

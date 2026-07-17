@@ -353,10 +353,19 @@ class JobRegistry:
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "source_revision",
+            "workflow_sandbox_hash",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        sandbox_hash = job.get("workflow_sandbox_hash")
+        if sandbox_hash is not None and (
+            len(sandbox_hash) != 64
+            or any(char not in "0123456789abcdef" for char in sandbox_hash)
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 workflow_sandbox_hash 格式錯誤（fail-closed）: {self._state_path}"
+            )
         for field in ("pid", "exit_code"):
             value = job.get(field)
             if value is not None and not isinstance(value, int):
@@ -536,6 +545,7 @@ class JobRegistry:
         workflow_inputs: tuple[str, ...] = (),
         workflow_outputs: tuple[str, ...] = (),
         source_revision: str | None = None,
+        workflow_sandbox_hash: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -577,6 +587,7 @@ class JobRegistry:
             "workflow_inputs": list(workflow_inputs),
             "workflow_outputs": list(workflow_outputs),
             "source_revision": source_revision,
+            "workflow_sandbox_hash": workflow_sandbox_hash,
             "workflow_evidence": None,
             "created_at": _now_iso(),
         }

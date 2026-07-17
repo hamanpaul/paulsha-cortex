@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from paulsha_cortex.coordinator import planning_runtime
@@ -117,3 +118,65 @@ def test_planning_runtime_checks_disposable_sandbox_even_on_nonzero(tmp_path: Pa
         )
     assert baseline.read_text(encoding="utf-8") == "operator\n"
     assert not (tmp_path / "leak.md").exists()
+
+
+def test_planning_runtime_detects_and_rolls_back_directory_and_metadata_pollution(
+    tmp_path: Path,
+) -> None:
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    tracked = tmp_path / "tracked.md"
+    tracked.write_text("operator\n", encoding="utf-8")
+    tracked.chmod(0o640)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    directory_link = tmp_path / "dir-link"
+    directory_link.symlink_to("target", target_is_directory=True)
+
+    def runner(argv, **kwargs):
+        tracked.chmod(0o600)
+        empty.rmdir()
+        (tmp_path / "pollution-empty").mkdir()
+        directory_link.unlink()
+        directory_link.symlink_to("empty", target_is_directory=True)
+        return _completed(json.dumps({"ok": True}))
+
+    with pytest.raises(ValueError, match="operator worktree.*rolled back"):
+        planning_runtime._invoke_json(
+            identity,
+            "return JSON",
+            worktree=tmp_path,
+            runner=runner,
+            timeout_seconds=30,
+        )
+
+    assert tracked.stat().st_mode & 0o777 == 0o640
+    assert empty.is_dir()
+    assert not (tmp_path / "pollution-empty").exists()
+    assert directory_link.is_symlink()
+    assert os.readlink(directory_link) == "target"
+
+
+def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "dir-link"
+    link.symlink_to("target", target_is_directory=True)
+    baseline = planning_runtime._tree_snapshot(tmp_path)
+
+    empty.rmdir()
+    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+    empty.mkdir()
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    empty.chmod(0o700)
+    assert planning_runtime._tree_snapshot(tmp_path) != baseline
+    empty.chmod(0o755)
+    assert planning_runtime._tree_snapshot(tmp_path) == baseline
+
+    link.unlink()
+    link.symlink_to("empty", target_is_directory=True)
+    assert planning_runtime._tree_snapshot(tmp_path) != baseline

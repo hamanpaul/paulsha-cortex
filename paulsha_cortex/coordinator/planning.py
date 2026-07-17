@@ -649,6 +649,7 @@ def run_heterogeneous_brainstorm(
     secondary_planner: Callable[[Mapping[str, object], ModelIdentity], object],
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object],
     artifact_writer: Callable[[object], Callable[[], None] | None] | None = None,
+    evidence_writer: Callable[[Path, object], None] | None = None,
 ) -> BrainstormResult:
     empty_refs = PlanningGateRefs()
     if report.complete:
@@ -738,7 +739,10 @@ def run_heterogeneous_brainstorm(
     )[:32]
     evidence_path = Path(evidence_dir) / f"brainstorm-{evidence_key}.json"
     try:
-        _write_immutable_json(evidence_path, evidence_payload)
+        if evidence_writer is None:
+            _write_immutable_json(evidence_path, evidence_payload)
+        else:
+            evidence_writer(evidence_path, evidence_payload)
     except FileExistsError:
         if rollback_publication is not None:
             rollback_publication()

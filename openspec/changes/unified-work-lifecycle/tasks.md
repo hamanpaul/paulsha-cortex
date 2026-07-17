@@ -23,7 +23,7 @@
 - [x] 2.3 RED-testaccepted artifact completeness、question pack、TBD/undecided marker與primary/secondary evidence integration。
 - [x] 2.4 實作model identities與`agy` safe plan/sandbox launcher；unknown/same-domain/unavailable/malformed全部fail-closed。
 - [x] 2.5 驗planner/builder/reviewer domain separation及brainstorm/ForeignReview gate分離。
-- [x] 2.6 實作manifest per-card durable dispatch/resume、terminal canonical evidence、scoped transaction/no-clobber planning publish與disposable read-only planner sandbox。
+- [x] 2.6 實作manifest per-card durable dispatch/resume、terminal canonical evidence、verify/review manifest report gate、artifact/evidence/registry recoverable intent transaction、TBD baseline-hash CAS replacement，以及所有planner的disposable strict-read-only sandbox與完整tree pollution rollback。
 - [ ] 2.7 通過migration/focused/full tests、help、OpenSpec、policy與preflight。
 
 ## 3. PR C — Delivery automation

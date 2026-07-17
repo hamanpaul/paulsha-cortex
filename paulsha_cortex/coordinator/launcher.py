@@ -26,7 +26,10 @@ def build_copilot_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
+    read_only: bool = False,
 ) -> list[str]:
+    if read_only:
+        raise ValueError("copilot executor has no enforced read-only planning mode")
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
     argv = [
@@ -57,7 +60,10 @@ def build_claude_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
+    read_only: bool = False,
 ) -> list[str]:
+    if read_only and allow_unsafe:
+        raise ValueError("read-only Claude planning cannot bypass permissions")
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
     argv = [
@@ -71,8 +77,10 @@ def build_claude_argv(
         "--name",
         slice_id,
         "--permission-mode",
-        "bypassPermissions" if allow_unsafe else "acceptEdits",
+        "plan" if read_only else ("bypassPermissions" if allow_unsafe else "acceptEdits"),
     ]
+    if read_only:
+        argv += ["--tools", ""]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None:
@@ -89,7 +97,10 @@ def build_codex_argv(
     remote: str | None = "psc",
     allow_unsafe: bool = False,
     model: str | None = None,
+    read_only: bool = False,
 ) -> list[str]:
+    if read_only and allow_unsafe:
+        raise ValueError("read-only Codex planning cannot bypass sandbox")
     # smoke 實證：`codex exec` 不接受 `--remote`（unexpected argument）。codex 的 remote
     # 是獨立的 `remote-control` 子命令/app-server，非 exec 旗標；故 headless exec 不帶 remote。
     argv = [
@@ -106,6 +117,8 @@ def build_codex_argv(
         # smoke 實證：headless codex exec 帶（未持久信任的）relay hook 時，會卡在 hook
         # 信任閘等待輸入 → timeout。autonomous 派工須一併 bypass hook trust 才不會掛住。
         argv.append("--dangerously-bypass-hook-trust")
+    elif read_only:
+        argv += ["--sandbox", "read-only"]
     if model is not None:
         argv += ["--model", model]
     argv.extend(["-o", str(Path(log_dir) / "last.json")])
@@ -123,6 +136,7 @@ def build_agy_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
+    read_only: bool = False,
 ) -> list[str]:
     """Build the only supported Antigravity invocation: headless plan+sandbox.
 
@@ -170,11 +184,16 @@ class SubprocessLauncher:
         codex_remote: str = "psc",
         allow_unsafe: bool = False,
         model: str | None = None,
+        read_only: bool = False,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
         if executor == "agy" and allow_unsafe:
             raise ValueError("agy executor refuses unsafe mode")
+        if read_only and executor == "copilot":
+            raise ValueError("copilot executor has no enforced read-only planning mode")
+        if read_only and allow_unsafe:
+            raise ValueError("read-only launcher cannot enable unsafe mode")
         self._executor = executor
         self._relay_target = relay_target
         self._codex_remote = codex_remote
@@ -183,6 +202,19 @@ class SubprocessLauncher:
         # claude bypassPermissions）。預設 False，採最小放權，避免無意間關掉沙箱。
         self._allow_unsafe = allow_unsafe
         self._model = model
+        self._read_only = read_only
+
+    def as_read_only(self) -> "SubprocessLauncher":
+        """Return an equivalent launcher with the executor's strict planning contract."""
+
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=False,
+            model=self._model,
+            read_only=True,
+        )
 
     def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
         # log_dir resolve 成絕對：sentinel 由子進程的 bash wrapper 以 cwd=worktree 寫入，
@@ -198,6 +230,7 @@ class SubprocessLauncher:
             remote=self._codex_remote,
             allow_unsafe=self._allow_unsafe,
             model=self._model,
+            read_only=self._read_only,
         )
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
