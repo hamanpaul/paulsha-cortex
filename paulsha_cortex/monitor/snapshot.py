@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import MonitorConfig
-from .fs import checked_stat_mode
+from .fs import checked_stat_mode, stable_path
 from .models import ProjectState, Signal
 from .parser import extract_project_state
 from .scanner import (
@@ -77,13 +77,13 @@ class SnapshotStore:
             previous_signatures = self._signatures
             result = scan_workspaces_detailed(self._config)
             previous_ids_by_path = {
-                str(Path(state.path).resolve()): project_id
+                str(stable_path(Path(state.path))): project_id
                 for project_id, state in previous_states.items()
             }
             new_states: dict[str, ProjectState] = {}
             for scanned in result.states:
                 stable_id = previous_ids_by_path.get(
-                    str(Path(scanned.path).resolve()),
+                    str(stable_path(Path(scanned.path))),
                     scanned.project_id,
                 )
                 state = replace(scanned, project_id=stable_id)
@@ -93,16 +93,29 @@ class SnapshotStore:
             for project_id, previous in previous_states.items():
                 if project_id in new_states:
                     continue
-                if not _is_under_degraded_root(Path(previous.path), result.degraded_roots):
+                path_degraded = _is_under_degraded_root(
+                    Path(previous.path),
+                    result.degraded_roots,
+                )
+                workspace_degraded = previous.workspace in result.degraded_workspaces
+                if not path_degraded and not workspace_degraded:
                     continue
                 degraded_root = next(
-                    root
-                    for root in result.degraded_roots
-                    if _is_under_degraded_root(Path(previous.path), (root,))
+                    (
+                        root
+                        for root in result.degraded_roots
+                        if _is_under_degraded_root(Path(previous.path), (root,))
+                    ),
+                    None,
+                )
+                note = (
+                    f"degraded: scan unavailable under {degraded_root}"
+                    if degraded_root is not None
+                    else f"degraded: workspace unavailable: {previous.workspace}"
                 )
                 new_states[project_id] = _with_scan_degraded_signal(
                     previous,
-                    (f"degraded: scan unavailable under {degraded_root}",),
+                    (note,),
                 )
             new_signatures = {
                 project_id: _project_signature(state)
@@ -255,10 +268,10 @@ class SnapshotStore:
 
 
 def _is_under_degraded_root(path: Path, roots: tuple[Path, ...]) -> bool:
-    resolved = path.resolve()
+    resolved = stable_path(path)
     for root in roots:
         try:
-            resolved.relative_to(root.resolve())
+            resolved.relative_to(stable_path(root))
         except ValueError:
             continue
         return True

@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 
 from .config import MonitorConfig
-from .fs import checked_stat_mode
+from .fs import checked_resolve, checked_stat_mode
 from .server import MonitorServer
 from .snapshot import ChangeEvent, SnapshotStore
 from .watcher import HAS_WATCHDOG, StubWatcher, WatchdogFileWatcher, Watcher
@@ -224,7 +224,9 @@ class ProjectMonitorService:
             return None, None
         resolved = Path(raw_path)
         if not resolved.is_absolute():
-            resolved = (git_entry.parent / resolved).resolve()
+            resolved, resolve_error = checked_resolve(git_entry.parent / resolved)
+            if resolve_error is not None:
+                return None, resolve_error
         return resolved, None
 
     def _handle_fs_event(self, path: Path) -> None:

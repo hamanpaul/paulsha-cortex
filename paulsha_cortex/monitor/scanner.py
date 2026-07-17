@@ -7,7 +7,7 @@ from pathlib import Path
 import stat
 
 from .config import MonitorConfig
-from .fs import checked_lstat_mode, checked_stat_mode
+from .fs import checked_lstat_mode, checked_resolve, checked_stat_mode, stable_path
 from .models import ProjectState
 from .parser import extract_project_state
 from .registry import ProjectEntry, merge_projects
@@ -27,6 +27,7 @@ class ScanResult:
 
     states: tuple[ProjectState, ...]
     degraded_roots: tuple[Path, ...] = ()
+    degraded_workspaces: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
 
 
@@ -132,7 +133,7 @@ def _qualified_duplicate_project_id(states: list[ProjectState], state: ProjectSt
     }
     if len(workspace_qualified) == len(states):
         return workspace_qualified[state.workspace]
-    return f"{state.workspace}:{Path(state.path).resolve()}"
+    return f"{state.workspace}:{stable_path(Path(state.path))}"
 
 
 def _dedupe_project_ids(states: list[ProjectState]) -> tuple[ProjectState, ...]:
@@ -162,18 +163,26 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
     manual_projects: list[ProjectEntry] = []
     states: list[ProjectState] = []
     degraded_roots: list[Path] = []
+    degraded_workspaces: list[str] = []
     diagnostics: list[str] = []
 
     for workspace in config.workspaces:
         project_dirs, error = _list_project_dirs_checked(workspace.path, ignore)
         if error is not None:
             degraded_roots.append(workspace.path)
+            degraded_workspaces.append(workspace.name)
             diagnostics.append(error)
             continue
         for project_dir in project_dirs:
+            resolved_project, resolve_error = checked_resolve(project_dir)
+            if resolve_error is not None:
+                degraded_roots.append(workspace.path)
+                degraded_workspaces.append(workspace.name)
+                diagnostics.append(resolve_error)
+                continue
             manual_projects.append(
                 ProjectEntry(
-                    path=project_dir.resolve(),
+                    path=resolved_project,
                     name=workspace.name,
                     source="manual",
                 )
@@ -226,6 +235,7 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
     return ScanResult(
         states=_dedupe_project_ids(states),
         degraded_roots=tuple(dict.fromkeys(Path(root) for root in degraded_roots)),
+        degraded_workspaces=tuple(dict.fromkeys(degraded_workspaces)),
         diagnostics=tuple(dict.fromkeys(diagnostics)),
     )
 

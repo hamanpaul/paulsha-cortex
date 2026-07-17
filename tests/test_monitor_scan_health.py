@@ -8,7 +8,11 @@ import pytest
 
 from paulsha_cortex.monitor.config import MonitorConfig, WorkspaceConfig, load_config
 from paulsha_cortex.monitor.models import ProjectState
-from paulsha_cortex.monitor.scanner import ProjectClassification, ScanResult
+from paulsha_cortex.monitor.scanner import (
+    ProjectClassification,
+    ScanResult,
+    scan_workspaces_detailed,
+)
 from paulsha_cortex.monitor.service import ProjectMonitorService
 from paulsha_cortex.monitor.snapshot import SnapshotStore
 from paulsha_cortex.monitor.watcher import StubWatcher
@@ -393,3 +397,88 @@ def test_watch_schedule_race_is_retried_without_claiming_key(tmp_path: Path) -> 
     watcher.fail_path = None
     service._install_watches()
     assert (head, False) in service._watched_paths
+
+
+def test_project_resolve_error_marks_workspace_degraded(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "demo"
+    project.mkdir(parents=True)
+    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
+    original_resolve = Path.resolve
+
+    def fail_project_resolve(path: Path, *args, **kwargs):
+        if path == project:
+            raise OSError("resolve transient")
+        return original_resolve(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "resolve", fail_project_resolve):
+        result = scan_workspaces_detailed(config)
+
+    assert result.states == ()
+    assert workspace in result.degraded_roots
+    assert result.diagnostics and "resolve transient" in result.diagnostics[0]
+
+
+def test_snapshot_resolve_error_preserves_last_good(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    project = workspace / "demo"
+    project.mkdir(parents=True)
+    (project / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
+    store = SnapshotStore(config=config)
+    store.load()
+    degraded = ScanResult(
+        states=(),
+        degraded_roots=(workspace,),
+        diagnostics=("degraded: resolve unavailable",),
+    )
+    original_resolve = Path.resolve
+
+    def fail_resolve(path: Path, *args, **kwargs):
+        if path in {workspace, project}:
+            raise OSError("resolve transient")
+        return original_resolve(path, *args, **kwargs)
+
+    with mock.patch(
+        "paulsha_cortex.monitor.snapshot.scan_workspaces_detailed",
+        return_value=degraded,
+    ), mock.patch.object(Path, "resolve", fail_resolve):
+        events = store.refresh()
+
+    assert store.get("demo") is not None
+    assert events and not events[0].removed
+
+
+def test_external_symlink_resolve_error_freezes_workspace_identity(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "outside-target"
+    target.mkdir()
+    (target / ".paul-project.yml").write_text("policy_profile: flat\n", encoding="utf-8")
+    project_link = workspace / "linked-project"
+    project_link.symlink_to(target, target_is_directory=True)
+    config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
+    store = SnapshotStore(config=config)
+    store.load()
+    before = store.current_snapshot()[0]
+    original_resolve = Path.resolve
+
+    def fail_link_resolve(path: Path, *args, **kwargs):
+        if path == project_link:
+            raise OSError("link resolve transient")
+        return original_resolve(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "resolve", fail_link_resolve):
+        outage_events = store.refresh()
+
+    retained = store.get(before.project_id)
+    assert retained is not None
+    assert retained.path == before.path
+    assert outage_events and not outage_events[0].removed
+
+    recovery_events = store.refresh()
+    recovered = store.get(before.project_id)
+    assert recovered is not None
+    assert recovered.path == before.path
+    assert all(not event.removed for event in recovery_events)
