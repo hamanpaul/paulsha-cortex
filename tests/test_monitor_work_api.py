@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import json
+import socket
+import threading
+import time
+
+from paulsha_cortex.monitor.config import MonitorConfig
+from paulsha_cortex.monitor.server import MonitorServer
+from paulsha_cortex.monitor.server import _Subscriber
+from paulsha_cortex.monitor.models import ProjectState
+from paulsha_cortex.monitor.snapshot import ChangeEvent, SnapshotStore
+from paulsha_cortex.monitor.work_api import (
+    WorkChangeEvent,
+    WorkModelRefresher,
+    WorkReadModelStore,
+)
+from paulsha_cortex.monitor.work_models import WorkItem
+from paulsha_cortex.monitor.work_snapshot import WorkSnapshot
+from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
+
+
+NOW = "2026-07-17T10:00:00Z"
+
+
+def _item(work_id: str, state: str, *, repo="example/acme"):
+    return WorkItem(
+        work_id=work_id,
+        repo=repo,
+        title=work_id.replace("-", " "),
+        state=state,
+        phase="plan" if state == "ongoing" else None,
+        facets=(),
+        sources=(),
+        next_actions=("start",) if state == "todo" else (),
+        workflow_run_id="run-1" if state == "ongoing" else None,
+        updated_at=NOW,
+    )
+
+
+def _snapshot(*items, sequence=7):
+    return WorkSnapshot(
+        sequence=sequence,
+        written_at=NOW,
+        providers={},
+        work_items=tuple(items),
+        source_owners={},
+        exclusions=(),
+    )
+
+
+def test_read_model_list_defaults_hide_done_and_sorts():
+    store = WorkReadModelStore(
+        _snapshot(_item("z-done", "done"), _item("b-todo", "todo"), _item("a-topic", "topic"))
+    )
+
+    envelope = store.list_work_items()
+
+    assert envelope["schema"] == "cortex-work/v1"
+    assert envelope["sequence"] == 7
+    assert [item["work_id"] for item in envelope["items"]] == ["a-topic", "b-todo"]
+    assert envelope["degraded"] is False
+
+
+def test_read_model_filters_repo_and_normalizes_on_going():
+    store = WorkReadModelStore(
+        _snapshot(
+            _item("active", "ongoing"),
+            _item("other", "todo", repo="example/other"),
+        )
+    )
+    envelope = store.list_work_items(repo="example/acme", states=("on-going",))
+    assert [item["work_id"] for item in envelope["items"]] == ["active"]
+    assert envelope["items"][0]["state"] == "on-going"
+
+
+def test_read_model_show_and_explain_contract():
+    explanation = {
+        "work_id": "active",
+        "authoritative_links": [],
+        "inferred_signals": [],
+        "competing_candidates": [],
+        "exclusions": [],
+        "reducer_trace": [{"rule": "active_workflow", "accepted": True}],
+    }
+    store = WorkReadModelStore(
+        _snapshot(_item("active", "ongoing")), explanations={"active": explanation}
+    )
+    assert store.get_work_item("active")["item"]["state"] == "on-going"
+    assert store.explain_work_item("active")["explanation"] == explanation
+
+
+def test_read_model_replace_uses_next_monotonic_sequence_without_double_increment():
+    store = WorkReadModelStore(_snapshot(_item("active", "todo"), sequence=7))
+    replacement = _snapshot(_item("active", "ongoing"), sequence=8)
+
+    events = store.replace(replacement)
+
+    assert [event.sequence for event in events] == [8]
+    assert store.sequence == 8
+
+
+def _send(sock, payload):
+    sock.sendall((json.dumps(payload) + "\n").encode())
+
+
+def _recv(sock, timeout=2.0):
+    sock.settimeout(timeout)
+    data = b""
+    while not data.endswith(b"\n"):
+        data += sock.recv(4096)
+    return json.loads(data)
+
+
+def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
+    project_store = SnapshotStore(config=MonitorConfig(workspaces=()))
+    work_store = WorkReadModelStore(_snapshot(_item("active", "ongoing")))
+    socket_path = tmp_path / "monitor.sock"
+    server = MonitorServer(
+        store=project_store, work_store=work_store, socket_path=socket_path
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if socket_path.exists():
+            break
+        time.sleep(0.01)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            _send(client, {"kind": "list_projects"})
+            assert _recv(client)["data"]["projects"] == []
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            _send(client, {"kind": "list_work_items"})
+            payload = _recv(client)
+            assert payload["ok"]
+            assert payload["data"]["items"][0]["work_id"] == "active"
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            _send(client, {"kind": "get_work_item", "work_id": "active"})
+            assert _recv(client)["data"]["item"]["state"] == "on-going"
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            _send(client, {"kind": "explain_work_item", "work_id": "active"})
+            assert _recv(client)["data"]["explanation"]["work_id"] == "active"
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            _send(client, {"kind": "subscribe_work_items", "work_ids": ["active"]})
+            initial = _recv(client)
+            assert initial["kind"] == "work_snapshot"
+            assert initial["schema"] == "cortex-work/v1"
+            assert initial["sequence"] == 7
+            event = WorkChangeEvent(
+                sequence=8,
+                work_item=_item("active", "ongoing"),
+                removed=False,
+            )
+            server.publish_work_events((event,))
+            changed = _recv(client)
+            assert changed["kind"] == "work_change"
+            assert changed["schema"] == "cortex-work/v1"
+            assert changed["item"]["work_id"] == "active"
+    finally:
+        server.stop()
+        thread.join(timeout=2)
+
+
+def test_work_subscription_extension_preserves_legacy_queue_full_replacement(tmp_path):
+    server = MonitorServer(
+        store=SnapshotStore(config=MonitorConfig(workspaces=())),
+        work_store=WorkReadModelStore.empty(),
+        socket_path=tmp_path / "unused.sock",
+    )
+    subscriber = _Subscriber(projects=None)
+    for index in range(subscriber.queue.maxsize):
+        subscriber.queue.put_nowait({"sequence": index})
+    server._subscribers.append(subscriber)
+    state = ProjectState(project_id="project", workspace="ws", path="/tmp/project")
+
+    server.publish_events((ChangeEvent("project", 9999, state),))
+
+    newest = None
+    while not subscriber.queue.empty():
+        newest = subscriber.queue.get_nowait()
+    assert newest["sequence"] == 9999
+
+
+def test_refresher_projects_local_provider_and_freezes_on_collision(tmp_path):
+    repo = tmp_path / "repo"
+    spec = repo / "docs/superpowers/specs/work.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("---\nwork_item: work\n---\n# work\n", encoding="utf-8")
+    durable = WorkSnapshotStore(tmp_path / "state/work-items.snapshot.json")
+    read_store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(durable_store=durable, read_store=read_store)
+    project = ProjectState(
+        project_id="example/acme", workspace="ws", path=str(repo)
+    )
+
+    first_events = refresher.refresh((project,), include_github=False)
+
+    assert first_events
+    assert read_store.get_work_item("work")["item"]["state"] == "todo"
+    assert durable.load().work_items[0].work_id == "work"
+
+    active = repo / "openspec/changes/duplicate/proposal.md"
+    archived = repo / "openspec/changes/archive/2026-07-17-duplicate/proposal.md"
+    active.parent.mkdir(parents=True)
+    archived.parent.mkdir(parents=True)
+    active.write_text("# active\n", encoding="utf-8")
+    archived.write_text("# archive\n", encoding="utf-8")
+
+    refresher.refresh((project,), include_github=False)
+
+    frozen = read_store.get_work_item("work")["item"]
+    assert frozen["state"] == "todo"
+    assert frozen["facets"] == ["degraded"]
+    provider = durable.load().providers["repo:example/acme"]
+    assert provider.status == "degraded"
+    assert any(source.ref == "docs/superpowers/specs/work.md" for source in provider.sources)

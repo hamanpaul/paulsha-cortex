@@ -54,6 +54,7 @@ try:
     )
     from paulsha_cortex.monitor.server import MonitorServer
     from paulsha_cortex.monitor.service import ProjectMonitorService
+    from paulsha_cortex.monitor.work_snapshot import WorkSnapshotStore
 
     PHASE3_AVAILABLE = True
     PHASE3_IMPORT_ERROR: ImportError | None = None
@@ -605,7 +606,11 @@ class Stage9ServiceTests(unittest.TestCase):
         )
         self.stub_watcher = StubWatcher()
         self.service = ProjectMonitorService(
-            config=self.cfg, watcher=self.stub_watcher
+            config=self.cfg,
+            watcher=self.stub_watcher,
+            durable_work_store=WorkSnapshotStore(
+                self.tmp / "state/work-items.snapshot.json"
+            ),
         )
         self.service_thread = threading.Thread(
             target=self.service.run_forever, daemon=True
@@ -647,6 +652,15 @@ class Stage9ServiceTests(unittest.TestCase):
         self.assertTrue(self.run_dir.exists())
         mode = stat.S_IMODE(self.run_dir.stat().st_mode)
         self.assertEqual(mode, 0o700)
+
+    def test_service_projects_local_work_items_into_new_socket_api(self) -> None:
+        sock = self._connect()
+        _socket_send_request(sock, {"kind": "list_work_items"})
+        payload = json.loads(_socket_recv_line(sock))
+        self.assertTrue(payload["ok"])
+        items = payload["data"]["items"]
+        self.assertTrue(items)
+        self.assertEqual({item["state"] for item in items}, {"todo"})
 
     def test_service_emits_event_when_underlying_todo_changes(self) -> None:
         sock = self._connect()

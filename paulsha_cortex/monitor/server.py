@@ -7,6 +7,10 @@ Wire contract (per design §3.6 + spec §B6):
     {"kind": "get_project_state", "project_id": "<id>"}
     {"kind": "subscribe"}                              # all projects
     {"kind": "subscribe", "projects": ["<id>", ...]}   # filter
+    {"kind": "list_work_items"}
+    {"kind": "get_work_item", "work_id": "<id>"}
+    {"kind": "explain_work_item", "work_id": "<id>"}
+    {"kind": "subscribe_work_items", "work_ids": ["<id>", ...]}
 
   Unary response (one JSON object on one line, then close):
     {"ok": true,  "data": <payload>}
@@ -31,6 +35,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .snapshot import ChangeEvent, SnapshotStore
+from .work_api import WORK_API_SCHEMA, WorkChangeEvent, WorkReadModelStore
 
 ACCEPT_TIMEOUT_SECONDS = 0.25
 SUBSCRIBE_QUEUE_GET_TIMEOUT = 0.25
@@ -50,15 +55,33 @@ class _Subscriber:
         return project_id in self.projects
 
 
+class _WorkSubscriber:
+    def __init__(self, *, work_ids: tuple[str, ...] | None) -> None:
+        self.work_ids = work_ids
+        self.queue: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAXSIZE)
+        self.alive = True
+
+    def matches(self, work_id: str) -> bool:
+        return self.work_ids is None or work_id in self.work_ids
+
+
 class MonitorServer:
     """Long-lived Unix-socket server. Single instance per service."""
 
-    def __init__(self, *, store: SnapshotStore, socket_path: Path) -> None:
+    def __init__(
+        self,
+        *,
+        store: SnapshotStore,
+        socket_path: Path,
+        work_store: WorkReadModelStore | None = None,
+    ) -> None:
         self._store = store
+        self._work_store = work_store
         self._socket_path = Path(socket_path)
         self._listener: socket.socket | None = None
         self._stop_event = threading.Event()
         self._subscribers: list[_Subscriber] = []
+        self._work_subscribers: list[_WorkSubscriber] = []
         self._subscribers_lock = threading.Lock()
         self._connection_threads: list[threading.Thread] = []
         self._connection_threads_lock = threading.Lock()
@@ -139,6 +162,8 @@ class MonitorServer:
         with self._subscribers_lock:
             for sub in self._subscribers:
                 sub.alive = False
+            for sub in self._work_subscribers:
+                sub.alive = False
         # Best-effort: close the listener so any in-flight accept errors out.
         if self._listener is not None:
             try:
@@ -192,6 +217,36 @@ class MonitorServer:
                         except queue.Full:
                             pass
 
+    def publish_work_events(self, events: Iterable[WorkChangeEvent]) -> None:
+        events = tuple(events)
+        if not events:
+            return
+        with self._subscribers_lock:
+            for sub in list(self._work_subscribers):
+                if not sub.alive:
+                    continue
+                for event in events:
+                    if not sub.matches(event.work_item.work_id):
+                        continue
+                    payload = {
+                        "schema": WORK_API_SCHEMA,
+                        "sequence": event.sequence,
+                        "kind": "work_change",
+                        "item": event.work_item.to_dict(),
+                        "removed": event.removed,
+                    }
+                    try:
+                        sub.queue.put_nowait(payload)
+                    except queue.Full:
+                        try:
+                            sub.queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            sub.queue.put_nowait(payload)
+                        except queue.Full:
+                            pass
+
     # --- request handling ---
 
     def _handle_connection(self, conn: socket.socket) -> None:
@@ -215,6 +270,14 @@ class MonitorServer:
                 self._handle_get_project_state(conn, request)
             elif kind == "subscribe":
                 self._handle_subscribe(conn, request)
+            elif kind == "list_work_items":
+                self._handle_list_work_items(conn, request)
+            elif kind == "get_work_item":
+                self._handle_get_work_item(conn, request, explain=False)
+            elif kind == "explain_work_item":
+                self._handle_get_work_item(conn, request, explain=True)
+            elif kind == "subscribe_work_items":
+                self._handle_subscribe_work_items(conn, request)
             else:
                 _write_line(conn, _error(f"unknown request kind: {kind!r}"))
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -297,6 +360,97 @@ class MonitorServer:
             with self._subscribers_lock:
                 if sub in self._subscribers:
                     self._subscribers.remove(sub)
+
+    def _require_work_store(self, conn: socket.socket) -> WorkReadModelStore | None:
+        if self._work_store is None:
+            _write_line(conn, _error("work read model unavailable"))
+            return None
+        return self._work_store
+
+    def _handle_list_work_items(self, conn: socket.socket, request: dict) -> None:
+        store = self._require_work_store(conn)
+        if store is None:
+            return
+        repo = request.get("repo")
+        states = request.get("states", [])
+        include_done = request.get("include_done", False)
+        explain = request.get("explain", False)
+        if repo is not None and (not isinstance(repo, str) or not repo):
+            _write_line(conn, _error("repo must be a non-empty string"))
+            return
+        if not isinstance(states, list) or any(not isinstance(state, str) for state in states):
+            _write_line(conn, _error("states must be a list of strings"))
+            return
+        if not isinstance(include_done, bool) or not isinstance(explain, bool):
+            _write_line(conn, _error("include_done/explain must be booleans"))
+            return
+        try:
+            data = store.list_work_items(
+                repo=repo, states=states, include_done=include_done, explain=explain
+            )
+        except ValueError as error:
+            _write_line(conn, _error(str(error)))
+            return
+        _write_line(conn, {"ok": True, "data": data})
+
+    def _handle_get_work_item(
+        self, conn: socket.socket, request: dict, *, explain: bool
+    ) -> None:
+        store = self._require_work_store(conn)
+        if store is None:
+            return
+        work_id = request.get("work_id")
+        if not isinstance(work_id, str) or not work_id:
+            _write_line(conn, _error("work_id is required"))
+            return
+        try:
+            data = (
+                store.explain_work_item(work_id)
+                if explain
+                else store.get_work_item(work_id)
+            )
+        except KeyError:
+            _write_line(conn, _error(f"unknown work item: {work_id}"))
+            return
+        _write_line(conn, {"ok": True, "data": data})
+
+    def _handle_subscribe_work_items(self, conn: socket.socket, request: dict) -> None:
+        store = self._require_work_store(conn)
+        if store is None:
+            return
+        raw_ids = request.get("work_ids")
+        if raw_ids is None:
+            work_ids = None
+        elif isinstance(raw_ids, list) and all(
+            isinstance(work_id, str) and work_id for work_id in raw_ids
+        ):
+            work_ids = tuple(raw_ids)
+        else:
+            _write_line(conn, _error("work_ids must be a list of non-empty strings"))
+            return
+        sub = _WorkSubscriber(work_ids=work_ids)
+        with self._subscribers_lock:
+            self._work_subscribers.append(sub)
+        try:
+            initial = store.list_work_items(include_done=True)
+            initial["kind"] = "work_snapshot"
+            initial["items"] = [
+                item for item in initial["items"] if sub.matches(item["work_id"])
+            ]
+            _write_line(conn, initial)
+            while sub.alive and not self._stop_event.is_set():
+                try:
+                    event = sub.queue.get(timeout=SUBSCRIBE_QUEUE_GET_TIMEOUT)
+                except queue.Empty:
+                    if _peer_closed(conn):
+                        return
+                    continue
+                _write_line(conn, event)
+        finally:
+            sub.alive = False
+            with self._subscribers_lock:
+                if sub in self._work_subscribers:
+                    self._work_subscribers.remove(sub)
 
 
 # --- helpers ---
