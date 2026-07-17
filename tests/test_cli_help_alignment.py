@@ -15,6 +15,7 @@ def test_umbrella_help_lists_public_command_families(capsys) -> None:
     assert captured.err == ""
     assert "usage: cortex" in captured.out
     assert "install service" in captured.out
+    assert "doctor" in captured.out
     assert "deck" in captured.out
     assert "monitor" in captured.out
     assert "tick" in captured.out

@@ -37,8 +37,8 @@
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 
-- [ ] 4.1 實作`cortex doctor --probe-live`的gh auth/permissions、label、preflight executable、model identities、agy smoke與service path probes。
-- [ ] 4.2 更新README、usage/help snapshots、service install與registry/snapshot migration docs。
+- [x] 4.1 實作`cortex doctor --probe-live`的gh auth/permissions、label、preflight executable、model identities、agy smoke與service path probes。
+- [x] 4.2 更新README、usage/help snapshots、service install與registry/snapshot migration docs。
 - [ ] 4.3 在`paulsha-cortex`以低風險docs-only issue跑auto-label canary，刻意缺accepted plan以觸發異質brainstorm。
 - [ ] 4.4 驗canary完整經brainstorm→build→ForeignReview→archive→preflight→Copilot→merge commit→done；通過前不擴散auto label。
 - [ ] 4.5 使用official CLI archive `unified-work-lifecycle`；issue #12只勾實際涵蓋項目。

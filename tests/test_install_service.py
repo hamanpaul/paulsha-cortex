@@ -45,6 +45,8 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"PY={sys.executable}" in env_lines
     assert f"PSC_RUN_ROOT={tmp_path / '.agents' / 'run' / 'beta'}" in env_lines
+    assert f"PSC_MONITOR_STATE_ROOT={tmp_path / '.agents' / 'monitor'}" in env_lines
+    assert f"PSC_PROJECT_CONFIG_ROOT={tmp_path / '.agents' / 'config' / 'paulsha'}" in env_lines
 
 
 def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):

@@ -90,9 +90,16 @@ def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
 
 def install_service(instance: str, interval: int, repo_root: Path) -> int:
     home = Path.home()
+    agents_root = home / ".agents"
     unit_dir = home / ".config" / "systemd" / "user"
-    runtime_dir = home / ".agents" / "core" / "runtime"
-    for directory in (unit_dir, runtime_dir, home / ".agents" / "specs"):
+    runtime_dir = agents_root / "core" / "runtime"
+    for directory in (
+        unit_dir,
+        runtime_dir,
+        agents_root / "specs",
+        agents_root / "monitor",
+        agents_root / "config" / "paulsha",
+    ):
         directory.mkdir(parents=True, exist_ok=True)
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
@@ -102,7 +109,9 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
         {
             "PY": sys.executable,
             "PSC_REPO_ROOT": str(repo_root),
-            "PSC_RUN_ROOT": str(home / ".agents" / "run" / instance),
+            "PSC_RUN_ROOT": str(agents_root / "run" / instance),
+            "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
+            "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
         },
     )
     if not _systemctl_available():

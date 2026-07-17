@@ -104,7 +104,11 @@ python -m pip install .
    cortex status | jq
    cortex jobs
    cortex stat "$JOB_ID"
+   cortex list --state todo --explain
+   cortex doctor --probe-live --repo owner/repo --json
    ```
+
+   新的 Work Item read model 使用 `topic → todo → on-going → done` 四態；日常操作、override、snapshot/registry migration 與 delivery gate 詳見 [Unified Work Lifecycle 操作與遷移](docs/unified-work-lifecycle.md)。所有工作預設 manual，只有 confirmed Todo 對應到帶 `cortex:auto-on-going` label 的 confirmed issue 才能 auto claim。
 
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 
@@ -223,26 +227,19 @@ cortex slice-action "$SLICE_ID" abandon      --actor operator
 
 Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--issue` 指定來源，並由 payload 提供 repo root；`ship` 的 evidence refs 也以 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
-### 5. Merge Candidate 並完成交付
+### 5. 由 Manager 完成交付
 
-Cortex 不會替使用者 merge。verification / review 通過後，Slice 會停在 `verified` / `candidate-not-merged`；這個狀態不一定列入 `attention`，也要檢查 `status.slices`。將 `feature/<slice-id>` 透過保留原 Candidate commit 的 merge commit 合入並推送 target branch 後，再執行：
+Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec、跑 policy/pinned preflight、建立或更新 PR、要求 current-HEAD Copilot review，再重讀 checks、threads、closing refs 與 mergeability。只有全部 gate 對同一 HEAD 成立時才執行 merge commit；任何 stale provider、HEAD race、舊 review、partial closure 或第三輪 finding 都停在 `needs_human`。
 
-```bash
-cortex complete \
-  --specs-dir "$HOME/.agents/specs" \
-  --review-executor claude \
-  --review-model "<reviewer-model-id>"
-```
-
-只有 Candidate 成為 `refs/remotes/<remote>/<target_branch>` 的 ancestor，Cortex 才會寫 CompletionRecord、標記 Slice `completed` 並釋放下游。squash / rebase merge / cherry-pick 會改變 Candidate identity，目前不受支援。
+Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、active OpenSpec 消失、archive/Todo/CompletionRecord 成立。部分完成不會提早標 `done`。
 
 ### 目前邊界
 
 - 沒有 Web UI；任務意圖仍以 Markdown spec 維護。
-- v1 不做自動 fix-loop / retry；需由使用者選擇 recovery action。
+- Copilot finding 只允許兩輪 bounded fix/re-review；超過預算需由 operator recovery。
 - verification 的 sanitized env 不等於 network / filesystem sandbox。
 - v1 自動 foreign review 限 `tier: shareable`。
-- preserving-commit merge 是目前受支援路徑；squash / cherry-pick 改變 Candidate identity 時會 fail-closed。
+- merge commit 是目前受支援路徑；auto/squash/rebase/cherry-pick 會 fail-closed。
 - installer/service 尚無 periodic builder/reviewer model pin；需要固定 model 時，使用帶 `--model` / `--review-model` 的手動 `cortex tick`。
 
 尚未實作的 operator bootstrap、model pin、monitor init、instance/path isolation、state migration 與 async request UX 統一追蹤於 [issue #12](https://github.com/hamanpaul/paulsha-cortex/issues/12)，供後續 OpenSpec / implementation plan 使用。
