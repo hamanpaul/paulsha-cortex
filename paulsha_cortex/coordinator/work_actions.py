@@ -488,6 +488,15 @@ def _load_work_run(
         active = _delivery_journal_row(run, authority)
         state["runs"][run.run_id] = active
         _save_runs(state_path, state)
+    else:
+        provenance = {
+            "source_revisions": list(authority.source_revisions),
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_revision": authority.github_provider_revision,
+        }
+        if any(active.get(field) != value for field, value in provenance.items()):
+            active.update(provenance)
+            _save_runs(state_path, state)
     return state, active, run
 
 
@@ -511,7 +520,6 @@ def _validate_current_run_authority(active: dict[str, Any], authority, canonical
     expected = {
         "claim_key": canonical_run.claim_key,
         "source_revisions": list(authority.source_revisions),
-        "provider_revision": authority.github_provider_revision,
         "authority_digest": work_authority_digest(authority),
         "mapped_issues": list(authority.mapped_issues),
         "mapped_prs": list(authority.mapped_prs),
@@ -948,6 +956,16 @@ def _claim_action(
         active = canonical_run.to_dict()
         active["reason"] = decision.reason
     elif canonical_run is not None:
+        if args.get("action") == "resume" and decision.action in {
+            "resume",
+            "needs_human",
+            "blocked",
+        }:
+            if workflow_starter is None:
+                raise RuntimeError("canonical workflow starter unavailable")
+            canonical_run = workflow_starter(
+                authority, canonical_run.claim_key, None
+            )
         active = canonical_run.to_dict()
     else:
         active = None

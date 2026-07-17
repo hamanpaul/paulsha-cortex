@@ -10,6 +10,7 @@ from paulsha_cortex.control import constants, contract
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     manager, manager_daemon, planning_runtime, registry as registry_module, review, verification,
+    work_bridge,
 )
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -348,6 +349,18 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     )
     with pytest.raises(ValueError, match="internal"):
         executor(fake_ship)
+    current = registry.get_workflow_run(run.run_id)
+    for card in ("openspec-archive", "policy-commit"):
+        work_bridge._record_manager_ship_job(
+            registry=registry,
+            state_root=tmp_path,
+            run=current,
+            worktree=tmp_path,
+            branch="feature/production-wiring",
+            card=card,
+            old_head=candidate,
+            new_head=candidate,
+        )
     trusted_executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),
@@ -385,7 +398,12 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         for step in shipped.steps if step.phase in {"claim", "define", "plan", "build", "verify", "review"}
     )
     workflow_jobs = [job for job in registry.list_jobs() if job.get("workflow_run_id") == run.run_id]
-    assert len(workflow_jobs) == 7
+    assert len(workflow_jobs) == 9
+    assert {
+        job.get("workflow_card")
+        for job in workflow_jobs
+        if job.get("workflow_phase") == "ship"
+    } == {"openspec-archive", "policy-commit"}
     assert created_branches == ["feature/production-wiring"]
     assert all(job.get("workflow_evidence") for job in workflow_jobs)
     assert all(job.get("workflow_claim_key") == run.claim_key for job in workflow_jobs)
@@ -651,7 +669,10 @@ def _run(
                 ),
                 inputs=step.inputs,
                 outputs=step.outputs,
-                gate_result="passed" if step.phase in {"verify", "review"} else step.gate_result,
+                gate_result=(
+                    "passed" if step.phase in {"verify", "review", "ship"}
+                    else step.gate_result
+                ),
             )
             for step in steps
         )

@@ -20,6 +20,38 @@ AUTO_LABEL = "cortex:auto-on-going"
 WORK_SNAPSHOT_SCHEMA = "work-items-snapshot/v1"
 GITHUB_PROVIDER_ID = "github"
 PROVIDER_MAX_AGE_SECONDS = 900
+DERIVED_AUTHORITY_KINDS = frozenset({"workflow_run", "completion_record"})
+
+
+def semantic_source_revision(
+    *, repo: str, kind: str, ref: str, source_id: str, revision: str
+) -> tuple[str, str] | None:
+    """Return the stable security authority represented by one Monitor source.
+
+    Workflow/completion rows are projections of Manager state and must never
+    feed back into a new claim. GitHub timestamps and active/archive OpenSpec
+    provider locators are provenance; their closure facts are checked by
+    dedicated gates, so identity—not updated_at—is the stable authority here.
+    Source membership and locator identity are the claim authority. Provider
+    timestamps and content hashes remain provenance: changing either must not
+    make a Manager-authored archive/PR refresh look like a second claim. A
+    changed target is still security relevant because it changes the stable
+    source key/ref set and therefore the authority digest.
+    """
+
+    if kind in DERIVED_AUTHORITY_KINDS:
+        return None
+    if kind in {
+        "github_issue",
+        "github_pr",
+        "todo",
+        "superpowers_spec",
+        "superpowers_plan",
+    }:
+        return source_id, f"identity:{ref}"
+    if kind == "openspec":
+        return f"openspec:{repo}:{ref}", f"identity:{ref}"
+    return source_id, revision
 
 
 @dataclass(frozen=True, init=False)
@@ -243,15 +275,29 @@ def _authority_from_canonical_row(
             todo_paths.append(ref)
     todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
-    source_revisions = tuple(
-        sorted(
-            f"{source['source_id']}@{source['revision']}"
-            for source in confirmed
-            if isinstance(source.get("source_id"), str)
-            and source["source_id"]
-            and isinstance(source.get("revision"), str)
-            and source["revision"]
+    semantic_sources: dict[str, str] = {}
+    for source in confirmed:
+        source_id = source.get("source_id")
+        source_revision = source.get("revision")
+        kind = source.get("kind")
+        ref = source.get("ref")
+        if not all(isinstance(value, str) and value for value in (source_id, source_revision, kind, ref)):
+            continue
+        semantic = semantic_source_revision(
+            repo=repo,
+            kind=kind,
+            ref=ref,
+            source_id=source_id,
+            revision=source_revision,
         )
+        if semantic is None:
+            continue
+        key, value = semantic
+        previous = semantic_sources.setdefault(key, value)
+        if previous != value:
+            raise ValueError("confirmed semantic work authority revisions conflict")
+    source_revisions = tuple(
+        f"{source_id}@{semantic_sources[source_id]}" for source_id in sorted(semantic_sources)
     )
     if not source_revisions:
         raise ValueError("confirmed work authority revisions invalid")
@@ -291,7 +337,6 @@ def work_authority_digest(authority: WorkAuthority) -> str:
         "repo": authority.repo,
         "work_id": authority.work_id,
         "provider_id": authority.github_provider_id,
-        "provider_revision": authority.github_provider_revision,
         "source_revisions": list(authority.source_revisions),
         "mapped_issues": list(authority.mapped_issues),
         "mapped_prs": list(authority.mapped_prs),
@@ -444,8 +489,6 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
         candidate.active_authority_digest != work_authority_digest(candidate.authority)
         or tuple(sorted(candidate.active_source_revisions or ()))
         != candidate.authority.source_revisions
-        or candidate.active_provider_revision
-        != candidate.authority.github_provider_revision
     )
     if authority_changed:
         return None

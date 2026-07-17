@@ -624,6 +624,8 @@ def build_periodic_tick_runner(
                 model=identity.model_id,
             )
             for workflow in registry.list_workflow_runs():
+                if workflow.status != "ongoing" or "blocked" in workflow.facets:
+                    continue
                 if workflow.current_phase not in {"plan", "build", "verify", "review"}:
                     continue
                 try:

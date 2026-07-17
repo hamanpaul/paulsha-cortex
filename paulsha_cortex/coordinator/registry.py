@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1051,7 +1052,21 @@ class JobRegistry:
             updated_at=now,
             planning_authority=tuple(planning_authority),
         )
-        self._workflows.append(run)
+        superseded_at = _now_iso()
+        next_workflows = [
+            replace(
+                existing,
+                status="superseded",
+                facets=tuple(sorted(set(existing.facets) | {"blocked"})),
+                updated_at=superseded_at,
+            )
+            if existing.repo == repo
+            and existing.work_id == work_id
+            and existing.status == "ongoing"
+            else existing
+            for existing in self._workflows
+        ]
+        self._workflows = [*next_workflows, run]
         self._persist()
         return self._copy_workflow_run(run)
 
@@ -1143,6 +1158,50 @@ class JobRegistry:
             ),
             pr_candidate=current.pr_candidate if pr_candidate is None else pr_candidate,
             merge_revision=current.merge_revision if merge_revision is None else merge_revision,
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_reset_workflow_after_archive(
+        self,
+        run_id: str,
+        *,
+        candidate_head: str,
+    ) -> WorkflowRun:
+        """Atomically invalidate old Candidate gates after Manager archive commit."""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.current_phase != "review" or current.status != "ongoing":
+            raise ValueError("archive candidate reset requires active review workflow")
+        steps = []
+        for step in current.steps:
+            if step.phase in {"verify", "review"}:
+                steps.append(replace(step, gate_result="pending"))
+            elif step.phase == "ship" and step.card == "openspec-archive":
+                steps.append(
+                    replace(
+                        step,
+                        executor="cortex-manager",
+                        model="deterministic",
+                        domain="cortex",
+                        gate_result="passed",
+                    )
+                )
+            else:
+                steps.append(step)
+        updated = replace(
+            current,
+            current_phase="verify",
+            steps=tuple(steps),
+            attempts={**current.attempts, "verify": current.attempts.get("verify", 0) + 1},
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            candidate_head=candidate_head,
+            verified_head=None,
+            facets=(),
+            gate_status="running",
+            updated_at=_now_iso(),
         )
         self._workflows[index] = updated
         self._persist()

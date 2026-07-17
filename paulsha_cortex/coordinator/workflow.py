@@ -345,7 +345,7 @@ class WorkflowRun:
             raise ValueError("workflow run facets 格式錯誤")
         if self.gate_status not in WORKFLOW_GATE_STATUSES:
             raise ValueError(f"workflow run gate_status 非法: {self.gate_status!r}")
-        if self.status not in {"ongoing", "done"}:
+        if self.status not in {"ongoing", "done", "superseded"}:
             raise ValueError(f"workflow run status 非法: {self.status!r}")
         completion_values = (
             self.completion_record_path,
@@ -384,7 +384,7 @@ class WorkflowRun:
                     raise ValueError(f"workflow ship 缺少 {required_kind} gate evidence")
             if self.candidate_head is None or self.verified_head != self.candidate_head:
                 raise ValueError("workflow ship 必須綁定已驗證的exact candidate HEAD")
-            for required_phase in ("verify", "review"):
+            for required_phase in ("verify", "review", "ship"):
                 phase_steps = [step for step in self.steps if step.phase == required_phase]
                 if not phase_steps or any(step.gate_result != "passed" for step in phase_steps):
                     raise ValueError(f"workflow ship 前 {required_phase} steps 必須全部passed")

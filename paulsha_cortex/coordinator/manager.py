@@ -24,7 +24,12 @@ from . import completion
 from . import planning_runtime
 from . import review as foreign_review
 from . import verification
-from .model_identities import CapabilityProbe, IdentityRegistry, load_model_identities
+from .model_identities import (
+    CapabilityProbe,
+    IdentityRegistry,
+    ModelIdentity,
+    load_model_identities,
+)
 from .planning import (
     PlanningArtifact,
     PlanningScope,
@@ -1948,23 +1953,37 @@ def _review_builder_job(
     if not isinstance(builder_job_id, str) or not builder_job_id:
         raise ValueError("review evaluation builder job missing")
     builder = registry.get_job(builder_job_id)
+    archive_author = (
+        builder.get("workflow_phase") == "ship"
+        and builder.get("workflow_card") == "openspec-archive"
+        and builder.get("persona") == "manager"
+    )
     expected = {
         "workflow_run_id": run.run_id,
         "workflow_claim_key": run.claim_key,
         "workflow_repo": run.repo,
-        "workflow_phase": "build",
         "source_revision": run.source_revision,
-        "persona": "builder",
         "subject_head": candidate,
         "status": "exited",
         "exit_code": 0,
     }
+    expected.update(
+        {
+            "workflow_phase": "ship" if archive_author else "build",
+            "persona": "manager" if archive_author else "builder",
+        }
+    )
     for field, value in expected.items():
         if builder.get(field) != value:
             raise ValueError(f"review evaluation builder binding mismatch: {field}")
     card = builder.get("workflow_card")
     if not isinstance(card, str) or not any(
-        step.phase == "build" and step.card == card and step.gate_result == "passed"
+        step.card == card
+        and step.gate_result == "passed"
+        and (
+            (step.phase == "build" and not archive_author)
+            or (step.phase == "ship" and archive_author)
+        )
         for step in run.steps
     ):
         raise ValueError("review evaluation builder card is not passed")
@@ -1972,7 +1991,15 @@ def _review_builder_job(
     model = builder.get("model_id")
     if not isinstance(executor, str) or not isinstance(model, str):
         raise ValueError("review evaluation builder identity missing")
-    identity = identities.require(executor, model)
+    identity = (
+        ModelIdentity(
+            executor=executor,
+            model_id=model,
+            independence_domain=str(builder.get("independence_domain")),
+        )
+        if archive_author
+        else identities.require(executor, model)
+    )
     if builder.get("independence_domain") != identity.independence_domain:
         raise ValueError("review evaluation builder identity/domain mismatch")
     return builder, identity
@@ -2411,6 +2438,45 @@ def _read_job_workflow_evidence(
             raise ValueError("workflow canonical artifact drift")
         refs.append(ref)
     return payload["payload"], tuple(refs), str(path), digest
+
+
+def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
+    steps = run.steps
+    for card in ("openspec-archive", "policy-commit"):
+        jobs = [
+            job
+            for job in registry.list_jobs()
+            if job.get("workflow_run_id") == run.run_id
+            and job.get("workflow_phase") == "ship"
+            and job.get("workflow_card") == card
+            and job.get("persona") == "manager"
+            and job.get("subject_head") == candidate
+            and job.get("status") == "exited"
+            and job.get("exit_code") == 0
+        ]
+        if len(jobs) != 1:
+            raise ValueError(f"workflow ship card audit missing or ambiguous: {card}")
+        payload, _outputs, _path, _digest = _read_job_workflow_evidence(
+            jobs[0], run=run, coordinator_root=coordinator_root
+        )
+        if (
+            payload.get("kind") != "workflow-card"
+            or payload.get("status") != "passed"
+            or payload.get("run_id") != run.run_id
+            or payload.get("card_id") != card
+            or payload.get("candidate") != candidate
+        ):
+            raise ValueError(f"workflow ship card evidence invalid: {card}")
+        steps = _audit_phase_steps(
+            steps,
+            phase="ship",
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            outputs=(),
+            card_id=card,
+        )
+    return steps
 
 
 def _sha256_path(path: Path) -> str:
@@ -2995,6 +3061,7 @@ def dispatch_workflow_card(
     identities: IdentityRegistry,
     launcher_factory: Callable[[object], object],
     coordinator_root: str | Path,
+    retry_failed: bool = False,
 ) -> dict[str, object] | None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -3008,8 +3075,12 @@ def dispatch_workflow_card(
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
+        and (
+            step.phase not in {"verify", "review"}
+            or job.get("subject_head") == run.candidate_head
+        )
     ]
-    if matching:
+    if matching and not (retry_failed and matching[-1].get("status") == "failed"):
         return matching[-1]
     identity = _select_workflow_identity(run, step, identities)
     launcher = launcher_factory(identity)
@@ -3024,9 +3095,20 @@ def dispatch_workflow_card(
         job
         for job in registry.list_jobs()
         if job.get("workflow_run_id") == run.run_id
-        and job.get("persona") == "builder"
+        and (
+            job.get("persona") == "builder"
+            or (
+                job.get("persona") == "manager"
+                and job.get("workflow_phase") == "ship"
+                and job.get("workflow_card") == "openspec-archive"
+            )
+        )
         and job.get("status") == "exited"
         and job.get("exit_code") == 0
+        and (
+            run.candidate_head is None
+            or job.get("subject_head") == run.candidate_head
+        )
     ]
     builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
     planner_sandbox: Path | None = None
@@ -3174,6 +3256,14 @@ def resume_workflow_run(
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    retry_failed = False
+    if "needs_human" in run.facets and run.status == "ongoing":
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(facet for facet in run.facets if facet != "needs_human"),
+            gate_status="running",
+        )
+        retry_failed = True
     try:
         _PlanningPublicationTransaction.reconcile(
             root=Path(run.workspace_root),
@@ -3216,7 +3306,17 @@ def resume_workflow_run(
         identities=identities,
         launcher_factory=launcher_factory,
         coordinator_root=coordinator_root,
+        retry_failed=retry_failed,
     )
+    if retry_failed and job is not None and job.get("status") == "failed":
+        job = dispatch_workflow_card(
+            dispatcher,
+            run=run,
+            identities=identities,
+            launcher_factory=launcher_factory,
+            coordinator_root=coordinator_root,
+            retry_failed=True,
+        )
     if job is None:
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
     if job.get("status") in IN_FLIGHT_STATUSES:
@@ -3362,6 +3462,16 @@ def apply_workflow_action(
                     candidate=current.candidate_head,
                 )
                 if status == "pending":
+                    persisted = registry.get_workflow_run(run_id)
+                    if (
+                        persisted.current_phase != current.current_phase
+                        or persisted.candidate_head != current.candidate_head
+                    ):
+                        return {
+                            "run_id": persisted.run_id,
+                            "current_phase": persisted.current_phase,
+                            "reason": trusted.get("reason") or "delivery-in-progress",
+                        }
                     registry._manager_update_workflow_run(
                         run_id, facets=(), gate_status="running"
                     )
@@ -3381,9 +3491,20 @@ def apply_workflow_action(
                     }
                 refs = {item.kind: item for item in current.gate_refs}
                 refs["copilot"] = GateEvidenceRef("copilot", trusted["ref"], trusted["hash"])
+                ship_steps = current.steps
+                if trusted.get("completion") is not None:
+                    if coordinator_root is None:
+                        raise ValueError("workflow ship audit root unavailable")
+                    ship_steps = _validated_ship_steps(
+                        registry,
+                        run=current,
+                        candidate=str(current.candidate_head),
+                        coordinator_root=coordinator_root,
+                    )
                 updated = registry._manager_update_workflow_run(
                     run_id,
                     current_phase="ship",
+                    steps=ship_steps,
                     gate_refs=tuple(
                         refs[kind] for kind in ("brainstorm", "foreign-review", "copilot") if kind in refs
                     ),
@@ -3548,7 +3669,19 @@ def apply_workflow_action(
         updated = registry._manager_update_workflow_run(
             run_id,
             current_phase=next_phase,
-            steps=updated_steps,
+            steps=(
+                _validated_ship_steps(
+                    registry,
+                    run=current,
+                    candidate=str(candidate),
+                    coordinator_root=coordinator_root,
+                )
+                if current.current_phase == "review"
+                and phase_done
+                and next_phase == "ship"
+                and trusted.get("completion") is not None
+                else updated_steps
+            ),
             gate_refs=tuple(by_kind[kind] for kind in ("brainstorm", "foreign-review", "copilot") if kind in by_kind),
             gate_status=gate_status,
             candidate_head=candidate,
@@ -3719,6 +3852,7 @@ def apply_workflow_action(
             ),
             brainstorm_required=False,
             primary_domain=primary_domain,
+            facets=(),
         )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "planning-complete"}
 

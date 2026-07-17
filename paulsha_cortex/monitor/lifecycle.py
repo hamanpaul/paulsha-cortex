@@ -151,7 +151,8 @@ def project_work_items(
         workflows = [
             source
             for source in group.sources
-            if source.kind == "workflow_run" and source.status not in {"done", "completed", "failed"}
+            if source.kind == "workflow_run"
+            and source.status not in {"done", "completed", "failed", "superseded"}
         ]
         facts = LifecycleFacts(
             previous_state=prior.state if prior is not None else None,

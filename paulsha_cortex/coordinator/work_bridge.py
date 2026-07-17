@@ -11,6 +11,7 @@ import os
 import subprocess
 import time
 import hashlib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -180,14 +181,21 @@ def start_canonical_workflow(
     """Create/resume the real WorkflowRun for a WorkAuthority claim."""
 
     existing = [run for run in registry.list_workflow_runs() if run.claim_key == claim_key]
+    existing_run = None
     if existing:
         if len(existing) != 1 or existing[0].repo != authority.repo or existing[0].work_id != authority.work_id:
             raise RuntimeError("canonical workflow claim collision")
-        return existing[0]
+        existing_run = existing[0]
+        if existing_run.status != "ongoing":
+            return existing_run
+        if existing_run.current_phase != "define":
+            return existing_run
     root = resolve_trusted_repo_root(authority.repo, explicit=explicit_repo_root)
     change = authority.mapped_openspec[0] if authority.mapped_openspec else authority.work_id
     manifest = default_workflow_manifest(authority.work_id, change=change)
     if needs_human_reason is not None:
+        if existing_run is not None:
+            return existing_run
         run = registry._manager_create_workflow_run(
             work_id=authority.work_id,
             repo=authority.repo,
@@ -245,6 +253,8 @@ def start_canonical_workflow(
 def workflow_status(run) -> str:
     if getattr(run, "status", "ongoing") == "done":
         return "done"
+    if getattr(run, "status", "ongoing") == "superseded":
+        return "blocked"
     if "needs_human" in run.facets:
         return "needs_human"
     if "blocked" in run.facets:
@@ -360,9 +370,22 @@ def _builder_binding(
     ):
         raise RuntimeError("delivery foreign-review builder binding malformed")
     row = registry.get_job(builder_job_id)
+    normal_builder = (
+        row.get("workflow_phase") == "build"
+        and row.get("persona") == "builder"
+    )
+    manager_archive = (
+        row.get("workflow_phase") == "ship"
+        and row.get("workflow_card") == "openspec-archive"
+        and row.get("persona") == "manager"
+        and row.get("executor") == "cortex-manager"
+        and row.get("model_id") == "deterministic"
+        and row.get("independence_domain") == "cortex"
+        and isinstance(row.get("workflow_evidence"), dict)
+    )
     if (
         row.get("workflow_run_id") != run.run_id
-        or row.get("workflow_phase") != "build"
+        or not (normal_builder or manager_archive)
         or row.get("status") != "exited"
         or row.get("exit_code") != 0
         or row.get("subject_head") != candidate
@@ -376,7 +399,301 @@ def _builder_binding(
     return root, branch
 
 
+def _push_exact_candidate(
+    *,
+    registry,
+    run,
+    authority: WorkAuthority,
+    state_root: Path,
+    worktree: Path,
+    branch: str,
+    candidate: str,
+    runner,
+) -> None:
+    if re.fullmatch(r"feature/[a-z0-9][a-z0-9._/-]*", branch) is None:
+        raise ValueError("workflow delivery branch is not an authorized feature ref")
+    head = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if head.returncode != 0 or head.stdout.strip().lower() != candidate:
+        raise RuntimeError("delivery push requires exact local Candidate HEAD")
+    from . import work_actions
+
+    state_path = state_root / "delivery-journal.json"
+    state, row, _canonical = work_actions._load_work_run(
+        state_path=state_path,
+        workflow_registry=registry,
+        authority=authority,
+    )
+    ref = f"refs/heads/{branch}"
+
+    def read_remote() -> str | None:
+        completed = runner(
+            ["git", "-C", str(worktree), "ls-remote", "--exit-code", "origin", ref],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if getattr(completed, "returncode", 1) == 2:
+            return None
+        if getattr(completed, "returncode", 1) != 0:
+            raise RuntimeError("delivery remote branch readback failed")
+        fields = str(getattr(completed, "stdout", "")).strip().split()
+        if len(fields) != 2 or fields[1] != ref or verification.SAFE_SHA_RE.fullmatch(fields[0]) is None:
+            raise RuntimeError("delivery remote branch readback malformed")
+        return fields[0].lower()
+
+    remote_head = read_remote()
+    pushes = row.setdefault("pushes", {})
+    persisted = pushes.get(candidate)
+    expected = {"branch": branch, "ref": ref, "head": candidate}
+    if persisted is not None and persisted != expected:
+        raise RuntimeError("delivery push journal conflicts with Candidate")
+    if remote_head != candidate:
+        pushed = runner(
+            ["git", "-C", str(worktree), "push", "origin", f"HEAD:{ref}"],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if getattr(pushed, "returncode", 1) != 0:
+            raise RuntimeError("delivery exact Candidate push failed")
+        remote_head = read_remote()
+    if remote_head != candidate:
+        raise RuntimeError("delivery remote branch does not match exact Candidate")
+    if persisted is None:
+        pushes[candidate] = expected
+        work_actions._save_runs(state_path, state)
+
+
+def _rebase_delivery_journal_authority(
+    *, state_root: Path, run, authority: WorkAuthority
+) -> None:
+    from . import work_actions
+
+    state_path = state_root / "delivery-journal.json"
+    state = work_actions._load_runs(state_path)
+    row = state["runs"].get(run.run_id)
+    if not isinstance(row, dict):
+        raise RuntimeError("delivery push journal missing canonical run")
+    row.update(
+        {
+            "source_revisions": list(authority.source_revisions),
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_revision": authority.github_provider_revision,
+            "authority_digest": work_authority_digest(authority),
+            "mapped_issues": list(authority.mapped_issues),
+            "mapped_prs": list(authority.mapped_prs),
+            "mapped_openspec": list(authority.mapped_openspec),
+            "mapped_todo_paths": list(authority.mapped_todo_paths),
+        }
+    )
+    work_actions._save_runs(state_path, state)
+
+
+def _archive_path_allowed(path: str, *, change: str) -> bool:
+    return (
+        path == "CHANGELOG.md"
+        or path == "README.md"
+        or path.startswith("changelog.d/")
+        or path.startswith("docs/")
+        or path.startswith("openspec/specs/")
+        or path.startswith("openspec/changes/archive/")
+        or path.startswith(f"openspec/changes/{change}/")
+    )
+
+
+def _record_manager_ship_job(
+    *,
+    registry,
+    state_root: Path,
+    run,
+    worktree: Path,
+    branch: str,
+    card: str,
+    old_head: str,
+    new_head: str,
+):
+    existing = [
+        job
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_phase") == "ship"
+        and job.get("workflow_card") == card
+        and job.get("subject_head") == new_head
+        and job.get("status") == "exited"
+        and job.get("exit_code") == 0
+        and isinstance(job.get("workflow_evidence"), dict)
+    ]
+    if len(existing) == 1:
+        return existing[0]
+    if existing:
+        raise RuntimeError("manager ship card audit is ambiguous")
+    job = registry.create_job(
+        task=f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{card}",
+        persona="manager",
+        kind="build",
+        branch=branch,
+        pane="",
+        worktree=str(worktree),
+        dispatch_head=old_head,
+        executor="cortex-manager",
+        model_id="deterministic",
+        independence_domain="cortex",
+        subject_head=new_head,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=card,
+        workflow_phase="ship",
+        workflow_repo_root=str(worktree),
+        source_revision=run.source_revision,
+    )
+    job = registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    envelope = {
+        "schema_version": 1,
+        "kind": "ship",
+        "job": {
+            "job_id": job["job_id"],
+            "run_id": run.run_id,
+            "claim_key": run.claim_key,
+            "repo": run.repo,
+            "source_revision": run.source_revision,
+            "card_id": card,
+            "phase": "ship",
+            "inputs": [],
+            "outputs": [],
+            "output_baseline": [],
+        },
+        "payload": {
+            "schema_version": 1,
+            "kind": "workflow-card",
+            "status": "passed",
+            "run_id": run.run_id,
+            "card_id": card,
+            "candidate": new_head,
+            "outputs": [],
+        },
+        "artifacts": [],
+    }
+    content = (
+        json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode()
+    relative = Path("evidence") / "workflow" / f"{hashlib.sha256(str(job['job_id']).encode()).hexdigest()}.json"
+    target = state_root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise RuntimeError("manager archive evidence conflict")
+    else:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    return registry.bind_workflow_evidence(
+        str(job["job_id"]),
+        locator={
+            "kind": "ship",
+            "path": relative.as_posix(),
+            "hash": hashlib.sha256(content).hexdigest(),
+        },
+        subject_head=new_head,
+    )
+
+
+def _commit_archive_and_require_reverification(
+    *, registry, state_root: Path, run, authority: WorkAuthority, worktree: Path, branch: str, candidate: str, runner
+):
+    if len(authority.mapped_openspec) != 1:
+        raise RuntimeError("archive commit requires one OpenSpec change")
+    change = authority.mapped_openspec[0]
+    tracked = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--name-only", "--no-renames", "-z", "HEAD"],
+        shell=False,
+        capture_output=True,
+    )
+    untracked = subprocess.run(
+        ["git", "-C", str(worktree), "ls-files", "--others", "--exclude-standard", "-z"],
+        shell=False,
+        capture_output=True,
+    )
+    if tracked.returncode != 0 or untracked.returncode != 0:
+        raise RuntimeError("archive diff inspection failed")
+    changed = {
+        value.decode("utf-8")
+        for value in tracked.stdout.split(b"\0") + untracked.stdout.split(b"\0")
+        if value
+    }
+    if not changed or any(not _archive_path_allowed(path, change=change) for path in changed):
+        raise RuntimeError("archive diff escaped strict OpenSpec/docs/changelog allowlist")
+    added = subprocess.run(
+        ["git", "-C", str(worktree), "add", "-A", "--", *sorted(changed)],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if added.returncode != 0:
+        raise RuntimeError("archive allowlist staging failed")
+    staged = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--name-only", "--no-renames", "-z"],
+        shell=False,
+        capture_output=True,
+    )
+    staged_paths = {value.decode("utf-8") for value in staged.stdout.split(b"\0") if value}
+    if staged.returncode != 0 or staged_paths != changed:
+        raise RuntimeError("archive staged diff differs from inspected allowlist")
+    committed = subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-m", f"chore(openspec): archive {change}"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if committed.returncode != 0:
+        raise RuntimeError("archive allowlist commit failed")
+    head = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    new_head = head.stdout.strip().lower()
+    if head.returncode != 0 or verification.SAFE_SHA_RE.fullmatch(new_head) is None or new_head == candidate:
+        raise RuntimeError("archive commit did not produce a new exact Candidate")
+    _push_exact_candidate(
+        registry=registry,
+        run=run,
+        authority=authority,
+        state_root=state_root,
+        worktree=worktree,
+        branch=branch,
+        candidate=new_head,
+        runner=runner,
+    )
+    _record_manager_ship_job(
+        registry=registry,
+        state_root=state_root,
+        run=run,
+        worktree=worktree,
+        branch=branch,
+        card="openspec-archive",
+        old_head=candidate,
+        new_head=new_head,
+    )
+    return registry._manager_reset_workflow_after_archive(
+        run.run_id,
+        candidate_head=new_head,
+    )
+
+
 def _authority_with_manager_pr(authority: WorkAuthority, pr_number: int) -> WorkAuthority:
+    pr_ref = f"{authority.repo}#{pr_number}"
+    source_revisions = set(authority.source_revisions)
+    source_revisions.add(f"github_pr:{pr_ref}@identity:{pr_ref}")
     return WorkAuthority._verified(
         repo=authority.repo,
         work_id=authority.work_id,
@@ -386,7 +703,7 @@ def _authority_with_manager_pr(authority: WorkAuthority, pr_number: int) -> Work
         mapped_todo_paths=authority.mapped_todo_paths,
         confirmed_todo=authority.confirmed_todo,
         auto_label=authority.auto_label,
-        source_revisions=authority.source_revisions,
+        source_revisions=tuple(sorted(source_revisions)),
         provider_revision=authority.github_provider_revision,
         provider_id=authority.github_provider_id,
         last_success_epoch=authority.github_last_success_epoch,
@@ -653,6 +970,16 @@ def build_production_ship_validator(
             )
             if not initial.passed or initial.head != candidate:
                 raise RuntimeError("initial PR-metadata preflight failed")
+            _push_exact_candidate(
+                registry=registry,
+                run=run,
+                authority=authority,
+                state_root=state_root,
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                runner=runner,
+            )
             github = GitHubDeliveryClient(runner=runner)
             number = github.create_or_get_pull_request(
                 repo=run.repo,
@@ -667,6 +994,11 @@ def build_production_ship_validator(
                 run.run_id,
                 source_revision=work_authority_digest(authority),
                 pr_refs=(f"{run.repo}#{number}",),
+            )
+            _rebase_delivery_journal_authority(
+                state_root=state_root,
+                run=updated,
+                authority=authority,
             )
             evidence = _write_json_evidence(
                 state_root,
@@ -697,6 +1029,20 @@ def build_production_ship_validator(
                 source_revision=work_authority_digest(authority),
             )
         from . import work_actions
+        from . import review as review_evidence
+
+        foreign_payload, _foreign_job = _workflow_evidence_payload(
+            registry=registry,
+            state_root=state_root,
+            run=run,
+            phase="review",
+            expected_ref=foreign[0].ref,
+            expected_hash=foreign[0].sha256,
+        )
+        foreign_record = review_evidence.write_gate_evaluation(
+            foreign_payload,
+            coordinator_root=state_root,
+        )
 
         completion_draft = _completion_draft(
             registry=registry,
@@ -714,8 +1060,8 @@ def build_production_ship_validator(
             "pr_number": number,
             "change": authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None,
             "todo_paths": list(authority.mapped_todo_paths),
-            "foreign_review_path": foreign[0].ref,
-            "foreign_review_hash": foreign[0].sha256,
+            "foreign_review_path": foreign_record["path"],
+            "foreign_review_hash": foreign_record["hash"],
             "pr_metadata_path": str(metadata_path),
             "skip_tests": False,
         }
@@ -729,6 +1075,33 @@ def build_production_ship_validator(
             state_path=state_root / "delivery-journal.json",
             workflow_registry=registry,
         )
+        if action.get("action") == "archive-applied-needs-commit":
+            reset = _commit_archive_and_require_reverification(
+                registry=registry,
+                state_root=state_root,
+                run=run,
+                authority=authority,
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                runner=runner,
+            )
+            action = {
+                "action": "candidate-reverification-required",
+                "head": reset.candidate_head,
+                "reason": "archive-commit-invalidated-candidate-evidence",
+            }
+        if action.get("action") == "done":
+            _record_manager_ship_job(
+                registry=registry,
+                state_root=state_root,
+                run=run,
+                worktree=worktree,
+                branch=branch,
+                card="policy-commit",
+                old_head=candidate,
+                new_head=candidate,
+            )
         status = "passed" if action.get("action") == "done" else "pending"
         if action.get("action") == "needs_human":
             status = "needs_human"

@@ -265,6 +265,106 @@ def test_source_change_starts_new_canonical_run(tmp_path: Path) -> None:
     )
     assert changed["result"]["action"] == "claim"
     assert changed["result"]["run"]["run_id"] != first["result"]["run"]["run_id"]
+    runs = JobRegistry(state_path=state.parent / "jobs.json").list_workflow_runs()
+    assert len([run for run in runs if run.status == "ongoing"]) == 1
+    old = next(run for run in runs if run.run_id == first["result"]["run"]["run_id"])
+    assert old.status == "superseded"
+    assert "blocked" in old.facets
+
+
+def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "canonical.json"
+
+    def write(*, provider_revision: str, issue_revision: str, pr_revision: str) -> None:
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "schema": "work-items-snapshot/v1",
+                    "providers": {
+                        "github:acme/demo": {
+                            "provider_id": "github:acme/demo",
+                            "status": "ok",
+                            "last_attempt_at": "2026-07-17T00:00:00Z",
+                            "last_success_at": "2026-07-17T00:00:00Z",
+                            "revision": provider_revision,
+                            "diagnostics": [],
+                            "sources": [],
+                            "observations": {},
+                        }
+                    },
+                    "work_items": [
+                        {
+                            "repo": "acme/demo",
+                            "work_id": "demo",
+                            "sources": [
+                                {
+                                    "source_id": "github_issue:acme/demo#12",
+                                    "kind": "github_issue",
+                                    "ref": "acme/demo#12",
+                                    "revision": issue_revision,
+                                    "status": "open",
+                                    "confidence": "confirmed",
+                                    "provider": "github:acme/demo",
+                                },
+                                {
+                                    "source_id": "github_pr:acme/demo#8",
+                                    "kind": "github_pr",
+                                    "ref": "acme/demo#8",
+                                    "revision": pr_revision,
+                                    "status": "open",
+                                    "confidence": "confirmed",
+                                    "provider": "github:acme/demo",
+                                },
+                                {
+                                    "source_id": "openspec:acme/demo:demo",
+                                    "kind": "openspec",
+                                    "ref": "demo",
+                                    "revision": "spec-content",
+                                    "status": "active",
+                                    "confidence": "confirmed",
+                                    "provider": "repo:acme/demo",
+                                },
+                                {
+                                    "source_id": "workflow_run:acme/demo:run-1",
+                                    "kind": "workflow_run",
+                                    "ref": "run-1",
+                                    "revision": "registry:9",
+                                    "status": "ongoing",
+                                    "confidence": "confirmed",
+                                    "provider": "workflow:acme/demo",
+                                },
+                                {
+                                    "source_id": "completion_record:acme/demo:run-1",
+                                    "kind": "completion_record",
+                                    "ref": "run-1",
+                                    "revision": "completion:9",
+                                    "status": "valid",
+                                    "confidence": "confirmed",
+                                    "provider": "workflow:acme/demo",
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write(provider_revision="gh-1", issue_revision="updated:1", pr_revision="updated:1")
+    first = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    first_digest = work_actions.work_authority_digest(first)
+    assert all("workflow_run" not in row and "completion_record" not in row for row in first.source_revisions)
+
+    write(provider_revision="gh-2", issue_revision="updated:2", pr_revision="updated:2")
+    refreshed = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    assert refreshed.source_revisions == first.source_revisions
+    assert work_actions.work_authority_digest(refreshed) == first_digest
 
 
 def test_snapshot_refresh_noise_keeps_same_semantic_run(tmp_path: Path) -> None:

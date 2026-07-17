@@ -268,10 +268,27 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             return "main"
 
     monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", GitHub)
+    pushed = False
+
+    def delivery_runner(argv, **kwargs):
+        nonlocal pushed
+        if "ls-remote" in argv:
+            return SimpleNamespace(
+                returncode=0 if pushed else 2,
+                stdout=(f"{candidate}\trefs/heads/feature/14-work\n" if pushed else ""),
+                stderr="",
+            )
+        if "push" in argv:
+            assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
+            pushed = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(argv)
+
     validator = work_bridge.build_production_ship_validator(
         registry=registry,
         coordinator_root=tmp_path / "state",
         snapshot_path=snapshot,
+        runner=delivery_runner,
     )
 
     result = validator(run=run, candidate=candidate)
@@ -284,7 +301,117 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert updated.run_id == run.run_id
     assert updated.pr_refs == ("acme/demo#17",)
     assert updated.source_revision != run.source_revision
-    assert not (tmp_path / "state" / "delivery-journal.json").exists()
+    journal = json.loads(
+        (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
+    )
+    assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
+
+
+def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(
+    tmp_path: Path,
+) -> None:
+    repo, _initial = _repo(tmp_path / "repo")
+    active = repo / "openspec" / "changes" / "work"
+    active.mkdir(parents=True)
+    (active / "proposal.md").write_text("# Proposal\n", encoding="utf-8")
+    (repo / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add change"], check=True)
+    candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot)
+    state_root = tmp_path / "state"
+    registry = JobRegistry(state_path=state_root / "jobs.json")
+    ship_steps = (
+        WorkflowStep(
+            "ship", "manager", "openspec-archive", None, None, None, (), ()
+        ),
+        WorkflowStep("ship", "manager", "policy-commit", None, None, None, (), ()),
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="work",
+        repo="acme/demo",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision=work_authority_digest(authority),
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=tuple(step for step in _steps() if step.phase != "ship") + ship_steps,
+        issue_refs=("acme/demo#14",),
+        openspec_refs=("work",),
+        pr_refs=(),
+        attempts={"verify": 1, "review": 1},
+        gate_refs=(GateEvidenceRef("foreign-review", "old-review", "1" * 64),),
+        candidate_head=candidate,
+        verified_head=candidate,
+        gate_status="running",
+    )
+
+    archive = repo / "openspec" / "changes" / "archive"
+    archive.mkdir(parents=True)
+    active.rename(archive / "work")
+    with (repo / "CHANGELOG.md").open("a", encoding="utf-8") as handle:
+        handle.write("- Archive work.\n")
+
+    remote_head: str | None = None
+
+    def delivery_runner(argv, **kwargs):
+        nonlocal remote_head
+        if "ls-remote" in argv:
+            if remote_head is None:
+                return SimpleNamespace(returncode=2, stdout="", stderr="")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{remote_head}\trefs/heads/feature/14-work\n",
+                stderr="",
+            )
+        if "push" in argv:
+            remote_head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    reset = work_bridge._commit_archive_and_require_reverification(
+        registry=registry,
+        state_root=state_root,
+        run=run,
+        authority=authority,
+        worktree=repo,
+        branch="feature/14-work",
+        candidate=candidate,
+        runner=delivery_runner,
+    )
+
+    assert reset.current_phase == "verify"
+    assert reset.candidate_head == remote_head
+    assert reset.candidate_head != candidate
+    assert reset.verified_head is None
+    assert reset.gate_refs == ()
+    assert reset.attempts["verify"] == 2
+    assert all(
+        step.gate_result == "pending"
+        for step in reset.steps
+        if step.phase in {"verify", "review"}
+    )
+    assert next(
+        step for step in reset.steps if step.card == "openspec-archive"
+    ).gate_result == "passed"
+    archive_jobs = [
+        job for job in registry.list_jobs()
+        if job.get("workflow_card") == "openspec-archive"
+    ]
+    assert len(archive_jobs) == 1
+    assert archive_jobs[0]["subject_head"] == reset.candidate_head
+    assert archive_jobs[0]["workflow_evidence"]["hash"]
 
 
 def test_installed_defaults_start_to_ship_handoff_remains_monitor_ongoing(
@@ -540,11 +667,33 @@ identities:
             return "main"
 
     monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", GitHub)
+    pushed = False
+
+    def delivery_runner(argv, **kwargs):
+        nonlocal pushed
+        if "ls-remote" in argv:
+            return SimpleNamespace(
+                returncode=0 if pushed else 2,
+                stdout=(f"{candidate}\trefs/heads/feature/14-work\n" if pushed else ""),
+                stderr="",
+            )
+        if "push" in argv:
+            assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
+            pushed = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    ship_validator = work_bridge.build_production_ship_validator(
+        registry=registry,
+        coordinator_root=coordinator_root,
+        runner=delivery_runner,
+    )
     executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),
         handoff_dir=str(tmp_path / "handoff"),
         launcher=Launcher(),
+        workflow_ship_validator=ship_validator,
     )
     started = executor(
         build_request(

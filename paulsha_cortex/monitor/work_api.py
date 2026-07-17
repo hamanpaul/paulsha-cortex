@@ -466,7 +466,7 @@ class WorkModelRefresher:
                     updated_at=attempted_at,
                     previous_items=prior,
                     closure_by_work=_parse_closure_evidence(
-                        observations, correlation=correlation
+                        observations, correlation=correlation, repo=repo
                     ),
                 )
                 projected_items.extend(projection.items)
@@ -680,7 +680,7 @@ def _artifact_slug(source) -> str | None:
 
 
 def _parse_closure_evidence(
-    observations: Mapping, *, correlation=None
+    observations: Mapping, *, correlation=None, repo: str
 ) -> dict[str, ClosureEvidence]:
     fields = ClosureEvidence.__dataclass_fields__
     combined: dict[str, dict[str, bool]] = {}
@@ -752,25 +752,64 @@ def _parse_closure_evidence(
             and remote_prs[source.source_id]["merged_with_merge_commit"] is True
             for source in prs
         )
-        authoritative_revisions = {
-            source.source_id: source.revision
-            for source in group.sources
-            if source.confidence == "confirmed"
-            and source.kind not in {"workflow_run", "completion_record"}
-        }
-        combined[group.work_id]["completion_record_valid"] = bool(
-            authoritative_revisions
-        ) and isinstance(completion_rows, list) and any(
-            isinstance(completion, Mapping)
-            and completion.get("source_revisions") == authoritative_revisions
-            and all(
+        from paulsha_cortex.coordinator.claim import semantic_source_revision
+
+        authoritative_revisions: dict[str, str] = {}
+        for source in group.sources:
+            if source.confidence != "confirmed":
+                continue
+            semantic = semantic_source_revision(
+                repo=repo,
+                kind=source.kind,
+                ref=source.ref,
+                source_id=source.source_id,
+                revision=source.revision,
+            )
+            if semantic is None:
+                continue
+            source_id, revision = semantic
+            previous = authoritative_revisions.setdefault(source_id, revision)
+            if previous != revision:
+                authoritative_revisions = {}
+                break
+        def completion_matches(completion: object) -> bool:
+            if not isinstance(completion, Mapping):
+                return False
+            supplied = completion.get("source_revisions")
+            if not isinstance(supplied, Mapping):
+                return False
+            normalized: dict[str, str] = {}
+            for source in group.sources:
+                if source.confidence != "confirmed":
+                    continue
+                semantic = semantic_source_revision(
+                    repo=repo,
+                    kind=source.kind,
+                    ref=source.ref,
+                    source_id=source.source_id,
+                    revision=source.revision,
+                )
+                if semantic is None:
+                    continue
+                source_id, revision = semantic
+                supplied_revision = supplied.get(source_id, supplied.get(source.source_id))
+                if supplied_revision == source.revision:
+                    supplied_revision = revision
+                if supplied_revision != revision:
+                    return False
+                normalized[source_id] = revision
+            return normalized == authoritative_revisions and all(
                 remote_prs.get(source.source_id, {}).get("candidate")
                 == completion.get("pr_candidate")
                 and remote_prs.get(source.source_id, {}).get("merge_revision")
                 == completion.get("merge_revision")
                 for source in prs
             )
-            for completion in completion_rows
+
+        combined[group.work_id]["completion_record_valid"] = bool(
+            authoritative_revisions
+        ) and isinstance(completion_rows, list) and any(
+            completion_matches(completion) for completion in completion_rows
         )
         openspec_refs = {
             source.ref
