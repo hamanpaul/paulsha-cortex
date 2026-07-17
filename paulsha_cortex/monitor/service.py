@@ -139,7 +139,10 @@ class ProjectMonitorService:
                 try:
                     self._watcher.unwatch(watch_path, recursive=recursive)
                 except OSError:
-                    continue
+                    # The watcher may have removed its underlying watch before
+                    # reporting a backend error.  Forget the local claim so a
+                    # later desired pass can install it again.
+                    pass
                 self._watched_paths.discard((watch_path, recursive))
             for watch_path, recursive in desired_keys:
                 watch_key = (watch_path, recursive)

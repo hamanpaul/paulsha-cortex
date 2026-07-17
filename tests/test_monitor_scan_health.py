@@ -399,6 +399,42 @@ def test_watch_schedule_race_is_retried_without_claiming_key(tmp_path: Path) -> 
     assert (head, False) in service._watched_paths
 
 
+def test_unwatch_error_drops_stale_claim_so_watch_can_be_reinstalled(
+    tmp_path: Path,
+) -> None:
+    class UnwatchRaceWatcher(StubWatcher):
+        fail_once = True
+
+        def unwatch(self, path, *, recursive=True):
+            super().unwatch(path, recursive=recursive)
+            if self.fail_once:
+                self.fail_once = False
+                raise OSError("backend removed watch before reporting failure")
+
+    workspace = tmp_path / "workspace"
+    project = workspace / "demo"
+    project.mkdir(parents=True)
+    config = MonitorConfig(workspaces=(WorkspaceConfig(path=workspace, name="test"),))
+    store = SnapshotStore(config=config)
+    store.load()
+    watcher = UnwatchRaceWatcher()
+    service = ProjectMonitorService(config=config, watcher=watcher, store=store)
+    stale_key = (project, False)
+    watcher.watch(project, service._handle_fs_event, recursive=False)
+    service._watched_paths.add(stale_key)
+
+    service._install_watches()
+
+    assert stale_key not in service._watched_paths
+    assert not any(entry[0] == project for entry in watcher.subscriptions)
+
+    service._project_roots = {"demo": project}
+    service._install_watches()
+
+    assert stale_key in service._watched_paths
+    assert any(entry[0] == project for entry in watcher.subscriptions)
+
+
 def test_project_resolve_error_marks_workspace_degraded(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     project = workspace / "demo"
