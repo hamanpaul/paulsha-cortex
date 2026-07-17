@@ -300,11 +300,16 @@ class GitHubDeliveryClient:
             raise RuntimeError("GitHub pull request refs malformed")
 
         check_payload = self._api(f"repos/{repo}/commits/{head}/check-runs")
+        status_payload = self._api(f"repos/{repo}/commits/{head}/status")
         review_payload = self._api(f"repos/{repo}/pulls/{pr_number}/reviews")
         if not isinstance(check_payload, dict) or not isinstance(
             check_payload.get("check_runs"), list
         ):
             raise RuntimeError("GitHub check runs malformed")
+        if not isinstance(status_payload, dict) or not isinstance(
+            status_payload.get("statuses"), list
+        ):
+            raise RuntimeError("GitHub commit statuses malformed")
         if not isinstance(review_payload, list):
             raise RuntimeError("GitHub reviews malformed")
 
@@ -319,6 +324,20 @@ class GitHubDeliveryClient:
                     conclusion=row.get("conclusion")
                     if isinstance(row.get("conclusion"), str)
                     else None,
+                )
+            )
+        for row in status_payload["statuses"]:
+            if not isinstance(row, dict):
+                raise RuntimeError("GitHub commit status malformed")
+            state = row.get("state")
+            context = row.get("context")
+            if not isinstance(state, str) or not isinstance(context, str):
+                raise RuntimeError("GitHub commit status malformed")
+            checks.append(
+                GitHubCheck(
+                    name=context,
+                    status="in_progress" if state == "pending" else "completed",
+                    conclusion="success" if state == "success" else state,
                 )
             )
         reviews: list[CopilotReview] = []

@@ -46,6 +46,10 @@ class FakeRunner:
                     ]
                 }
             )
+        if f"commits/{HEAD}/status" in endpoint:
+            return Result(
+                {"statuses": [{"context": "legacy/lint", "state": "success"}]}
+            )
         if "pulls/7/reviews" in endpoint:
             return Result(
                 [
@@ -110,6 +114,9 @@ def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     assert facts.active_openspec_absent
     assert facts.archive_present
     assert facts.review_threads[0].outdated
+    assert any(
+        f"commits/{HEAD}/status" in " ".join(call[0]) for call in runner.calls
+    )
     assert all(call[1]["shell"] is False for call in runner.calls)
 
 
