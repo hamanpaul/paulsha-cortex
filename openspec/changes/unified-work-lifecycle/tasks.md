@@ -22,7 +22,7 @@
 - [x] 2.2 實作planner persona、`feature-oneshot` combo與Deck persona binding workflow manifest。
 - [x] 2.3 RED-testaccepted artifact completeness、question pack、TBD/undecided marker與primary/secondary evidence integration。
 - [x] 2.4 實作model identities與`agy` safe plan/sandbox launcher；unknown/same-domain/unavailable/malformed全部fail-closed。
-- [ ] 2.5 驗planner/builder/reviewer domain separation及brainstorm/ForeignReview gate分離。
+- [x] 2.5 驗planner/builder/reviewer domain separation及brainstorm/ForeignReview gate分離。
 - [ ] 2.6 通過migration/focused/full tests、help、OpenSpec、policy與preflight。
 
 ## 3. PR C — Delivery automation

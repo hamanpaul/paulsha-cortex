@@ -75,6 +75,7 @@ class CompileResult:
 
 
 _LEGACY_CARD_PHASES = {
+    "workflow-claim": "claim",
     "brainstorming": "define",
     "openspec-propose": "define",
     "writing-plans": "plan",
@@ -199,7 +200,7 @@ def _group_slices(
     seen_ids: set[str] = set()
     for entry in entries:
         card = cards[entry.ref]
-        if card.type != "headless":
+        if card.type != "headless" or card.phase == "claim":
             continue
         if card.slice_group:
             slice_id = f"{slug}-{card.slice_group}"
@@ -423,9 +424,24 @@ def compile_combo(
 
 
 def emit(result: CompileResult, target_dir: str | Path, *, force: bool = False) -> list[Path]:
-    """將 compiled slices 寫成平鋪 specs 檔。"""
+    """將 compiled slices 與Manager可重啟載入的manifest一起持久化。"""
     directory = Path(target_dir)
-    filenames = [slice_doc.filename for slice_doc in result.slices]
+    documents = list(result.slices)
+    if result.workflow_manifest is not None:
+        documents.append(
+            SliceDoc(
+                slice_id=f"{result.task_slug}-workflow-manifest",
+                filename=f"{result.task_slug}.workflow.json",
+                content=json.dumps(
+                    result.workflow_manifest.to_dict(),
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+            )
+        )
+    filenames = [document.filename for document in documents]
     duplicates = sorted({name for name in filenames if filenames.count(name) > 1})
     if duplicates:
         raise DeckCompileError("emit 結果含重複檔名: " + ", ".join(duplicates))
@@ -442,7 +458,7 @@ def emit(result: CompileResult, target_dir: str | Path, *, force: bool = False) 
     temp_paths: list[Path] = []
     backups: list[tuple[Path, Path | None]] = []
     try:
-        for slice_doc in result.slices:
+        for slice_doc in documents:
             final_path = directory / slice_doc.filename
             if force:
                 fd, temp_name = tempfile.mkstemp(
@@ -455,6 +471,8 @@ def emit(result: CompileResult, target_dir: str | Path, *, force: bool = False) 
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as handle:
                         handle.write(slice_doc.content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
                     os.chmod(temp_path, 0o644)  # mkstemp 預設 0o600，與非 force 路徑一致
                     backup_path: Path | None = None
                     if final_path.exists():
@@ -481,10 +499,17 @@ def emit(result: CompileResult, target_dir: str | Path, *, force: bool = False) 
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as handle:
                         handle.write(slice_doc.content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
                 except Exception:
                     final_path.unlink(missing_ok=True)
                     raise
             written.append(final_path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception as exc:  # 任何寫入期例外（含編碼錯誤）都必須走同一套回滾，否則 finally 會刪掉備份
         if force:
             for final_path, backup_path in reversed(backups):

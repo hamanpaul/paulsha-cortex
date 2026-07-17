@@ -29,6 +29,10 @@ class ControlPlaneCoordinator:
     def wait_done(self, req_id: str, timeout: float, poll_interval: float = 0.5) -> dict[str, Any] | None:
         return poll_done(req_id, timeout=timeout, poll_interval=poll_interval)
 
+    def workflow_action(self, args: dict[str, Any]) -> str:
+        """Queue a Manager-owned workflow mutation; never write registry state directly."""
+        return submit_request("workflow-action", args, self.requested_by)
+
 
 def submit_request(req_type: str, args: dict[str, Any], requested_by: str) -> str:
     request = contract.build_request(req_type=req_type, args=args, requested_by=requested_by)

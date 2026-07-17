@@ -58,7 +58,7 @@ def _step() -> WorkflowStep:
 
 
 def _create_run(registry: JobRegistry) -> WorkflowRun:
-    return registry.create_workflow_run(
+    return registry._manager_create_workflow_run(
         work_id="unified-work-lifecycle",
         repo="hamanpaul/paulsha-cortex",
         claim_key="hamanpaul/paulsha-cortex/unified-work-lifecycle/rev-a",
@@ -162,7 +162,7 @@ def test_workflow_run_update_is_typed_persisted_and_rejects_phase_regression(tmp
     registry = JobRegistry(state_path=state)
     created = _create_run(registry)
 
-    updated = registry.update_workflow_run(
+    updated = registry._manager_update_workflow_run(
         created.run_id,
         current_phase="build",
         attempts={"plan": 1, "build": 2},
@@ -176,7 +176,7 @@ def test_workflow_run_update_is_typed_persisted_and_rejects_phase_regression(tmp
     assert JobRegistry(state_path=state).get_workflow_run(created.run_id) == updated
 
     with pytest.raises(ValueError, match="phase transition"):
-        registry.update_workflow_run(created.run_id, current_phase="plan")
+        registry._manager_update_workflow_run(created.run_id, current_phase="plan")
 
 
 def test_malformed_v2_workflow_rejected_without_rewrite(tmp_path: Path) -> None:

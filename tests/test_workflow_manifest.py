@@ -55,17 +55,18 @@ def test_feature_oneshot_emits_card_bound_personas_not_global_builder() -> None:
     steps = result.workflow_manifest.steps
     assert [step.card for step in steps] == [entry.ref for entry in combo.cards]
     assert [(step.card, step.phase, step.persona) for step in steps] == [
+        ("workflow-claim", "claim", "manager"),
         ("brainstorming", "define", "planner"),
         ("openspec-propose", "define", "planner"),
         ("writing-plans", "plan", "planner"),
         ("worktree-isolation", "build", "builder"),
         ("tdd-red", "build", "builder"),
         ("subagent-build", "build", "builder"),
-        ("code-review", "review", "reviewer"),
         ("verification", "verify", "reviewer"),
+        ("code-review", "review", "reviewer"),
+        ("adversarial-review", "review", "reviewer"),
         ("openspec-archive", "ship", "manager"),
         ("policy-commit", "ship", "manager"),
-        ("adversarial-review", "review", "reviewer"),
     ]
     assert {step.persona for step in steps} == {"planner", "builder", "reviewer", "manager"}
     assert all(step.gate_result == "pending" for step in steps)

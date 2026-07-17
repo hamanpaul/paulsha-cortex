@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from ..lib import idle
 from ..persona import gate, handoff
@@ -13,6 +13,14 @@ from . import autonomy
 from . import completion
 from . import review as foreign_review
 from . import verification
+from .model_identities import CapabilityProbe, IdentityRegistry, load_model_identities
+from .planning import (
+    PlanningArtifact,
+    PlanningScope,
+    assess_planning_completeness,
+    run_heterogeneous_brainstorm,
+)
+from .workflow import GateEvidenceRef, WorkflowManifest
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
@@ -1732,3 +1740,164 @@ def run_tick(
         "errors": errors + complete["errors"] + reap_errors,
         "reaped": reaped,
     }
+
+
+def _required_workflow_string(args: Mapping[str, object], field: str) -> str:
+    value = args.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"workflow-action requires {field}")
+    return value.strip()
+
+
+def _load_workflow_manifest(path_value: str) -> WorkflowManifest:
+    path = Path(path_value)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"workflow manifest unreadable: {path}") from exc
+    return WorkflowManifest.from_dict(payload)
+
+
+def _load_planning_artifacts(args: Mapping[str, object]) -> tuple[PlanningArtifact, ...]:
+    root = Path(_required_workflow_string(args, "artifact_root")).resolve()
+    rows = args.get("planning_artifacts")
+    if not isinstance(rows, list):
+        raise ValueError("workflow-action planning_artifacts must be a list")
+    artifacts: list[PlanningArtifact] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"kind", "ref"}:
+            raise ValueError(f"workflow-action planning_artifacts[{index}] invalid")
+        kind = row.get("kind")
+        ref = row.get("ref")
+        if not isinstance(kind, str) or not isinstance(ref, str) or not ref:
+            raise ValueError(f"workflow-action planning_artifacts[{index}] invalid")
+        relative = Path(ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"workflow-action planning_artifacts[{index}] escapes artifact_root")
+        try:
+            unresolved = root / relative
+            if unresolved.is_symlink():
+                raise ValueError("symlink planning artifact")
+            resolved = unresolved.resolve()
+            resolved.relative_to(root)
+            text = resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"workflow planning artifact unreadable: {ref}") from exc
+        artifacts.append(PlanningArtifact(kind=kind, ref=ref, text=text))
+    return tuple(artifacts)
+
+
+def apply_workflow_action(
+    registry,
+    *,
+    args: Mapping[str, object],
+    identity_registry: IdentityRegistry | None = None,
+    probes: Mapping[tuple[str, str], CapabilityProbe] | None = None,
+    primary_questioner: Callable[[Mapping[str, object]], object] | None = None,
+    secondary_planner: Callable[[Mapping[str, object], object], object] | None = None,
+    primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object] | None = None,
+) -> dict[str, object]:
+    """Apply the sole production mutation API for Manager-owned workflows.
+
+    Callers reach this function through the durable control queue. Registry
+    mutation methods are intentionally private so CLI/socket clients cannot
+    bypass Manager orchestration.
+    """
+
+    action = _required_workflow_string(args, "action")
+    if action == "advance":
+        run_id = _required_workflow_string(args, "run_id")
+        phase = _required_workflow_string(args, "current_phase")
+        raw_refs = args.get("gate_refs", [])
+        if not isinstance(raw_refs, list):
+            raise ValueError("workflow-action gate_refs must be a list")
+        additions = tuple(GateEvidenceRef.from_dict(item) for item in raw_refs)
+        current = registry.get_workflow_run(run_id)
+        by_kind = {item.kind: item for item in current.gate_refs}
+        for item in additions:
+            existing = by_kind.get(item.kind)
+            if existing is not None and existing != item:
+                raise ValueError(f"workflow gate evidence already fixed: {item.kind}")
+            by_kind[item.kind] = item
+        updated = registry._manager_update_workflow_run(
+            run_id,
+            current_phase=phase,
+            gate_refs=tuple(by_kind[kind] for kind in ("brainstorm", "foreign-review", "copilot") if kind in by_kind),
+            gate_status=args.get("gate_status") if isinstance(args.get("gate_status"), str) else None,
+        )
+        return {"run_id": updated.run_id, "current_phase": updated.current_phase}
+    if action != "start":
+        raise ValueError(f"unsupported workflow action: {action}")
+
+    manifest = _load_workflow_manifest(_required_workflow_string(args, "manifest_path"))
+    manifest.validate_manager_spine()
+    run = registry._manager_create_workflow_run(
+        work_id=_required_workflow_string(args, "work_id"),
+        repo=_required_workflow_string(args, "repo"),
+        claim_key=_required_workflow_string(args, "claim_key"),
+        combo=manifest.combo,
+        current_phase="claim",
+        steps=manifest.steps,
+        issue_refs=tuple(args.get("issue_refs", ())),
+        openspec_refs=tuple(args.get("openspec_refs", ())),
+        pr_refs=tuple(args.get("pr_refs", ())),
+        attempts={"claim": 1},
+        gate_status="running",
+    )
+    if run.current_phase != "claim":
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "already-claimed"}
+    run = registry._manager_update_workflow_run(
+        run.run_id,
+        current_phase="define",
+        attempts={**run.attempts, "define": 1},
+    )
+    artifacts = _load_planning_artifacts(args)
+    report = assess_planning_completeness(artifacts)
+    if report.complete:
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            current_phase="plan",
+            attempts={**run.attempts, "plan": 1},
+        )
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "planning-complete"}
+
+    if primary_questioner is None or secondary_planner is None or primary_integrator is None:
+        run = registry._manager_update_workflow_run(run.run_id, facets=("needs_human",))
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "reason": "planning-runtime-unavailable",
+        }
+
+    identities = identity_registry or load_model_identities()
+    primary = (
+        _required_workflow_string(args, "primary_executor"),
+        _required_workflow_string(args, "primary_model"),
+    )
+    result = run_heterogeneous_brainstorm(
+        report=report,
+        primary=primary,
+        registry=identities,
+        probes=probes or {},
+        evidence_dir=_required_workflow_string(args, "evidence_dir"),
+        artifact_root=_required_workflow_string(args, "artifact_root"),
+        scope=PlanningScope(
+            repo=run.repo,
+            work_id=run.work_id,
+            source_revision=_required_workflow_string(args, "source_revision"),
+        ),
+        primary_questioner=primary_questioner,
+        secondary_planner=secondary_planner,
+        primary_integrator=primary_integrator,
+    )
+    if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
+        run = registry._manager_update_workflow_run(run.run_id, facets=("needs_human",))
+        return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
+    run = registry._manager_update_workflow_run(
+        run.run_id,
+        current_phase="plan",
+        attempts={**run.attempts, "plan": 1},
+        gate_refs=result.gate_refs.as_tuple(),
+        facets=(),
+    )
+    return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from paulsha_cortex.config import paths
-from .workflow import WorkflowRun, WorkflowStep, validate_workflow_phase_transition
+from .workflow import GateEvidenceRef, WorkflowRun, WorkflowStep, validate_workflow_phase_transition
 
 COORDINATOR_STATE_SCHEMA_VERSION = 2
 
@@ -270,19 +270,49 @@ class JobRegistry:
         return backup
 
     def _write_payload_atomically(self, payload: dict[str, Any]) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(self._state_path.parent), suffix=".tmp")
+        directory = self._state_path.parent
+        directory.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(directory), suffix=".tmp")
         tmp = Path(tmp_name)
+        backup: Path | None = None
+        had_original = self._state_path.is_file()
+        replaced = False
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if had_original:
+                backup_fd, backup_name = tempfile.mkstemp(
+                    dir=str(directory), suffix=".rollback.bak"
+                )
+                backup = Path(backup_name)
+                with os.fdopen(backup_fd, "wb") as handle:
+                    handle.write(self._state_path.read_bytes())
+                    handle.flush()
+                    os.fsync(handle.fileno())
             os.replace(tmp, self._state_path)
-            _fsync_directory(self._state_path.parent)
-        except BaseException:
+            replaced = True
+            _fsync_directory(directory)
+        except BaseException as original_error:
             tmp.unlink(missing_ok=True)
-            raise
+            if replaced:
+                try:
+                    if had_original and backup is not None:
+                        os.replace(backup, self._state_path)
+                        backup = None
+                    else:
+                        self._state_path.unlink(missing_ok=True)
+                    _fsync_directory(directory)
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        "coordinator state rollback failed after durability fault"
+                    ) from rollback_error
+            raise original_error
+        finally:
+            tmp.unlink(missing_ok=True)
+            if backup is not None:
+                backup.unlink(missing_ok=True)
 
     def _persist(self) -> None:
         payload = {
@@ -293,7 +323,19 @@ class JobRegistry:
             "workflows": [run.to_dict() for run in self._workflows],
             "legacy_records": self._legacy_records,
         }
-        self._write_payload_atomically(payload)
+        try:
+            self._write_payload_atomically(payload)
+        except BaseException:
+            # _write_payload_atomically restores the previous durable file.
+            # Reload that exact snapshot so every mutation site, including
+            # legacy job/slice methods, rolls memory back consistently too.
+            self._jobs = []
+            self._slices = []
+            self._workflows = []
+            self._legacy_records = _empty_legacy_records()
+            self._seq = 0
+            self._load()
+            raise
 
     def _validate_loaded_job(self, job: object) -> dict[str, Any]:
         if not isinstance(job, dict) or "job_id" not in job or "status" not in job:
@@ -831,7 +873,7 @@ class JobRegistry:
     def get_workflow_run(self, run_id: str) -> WorkflowRun:
         return self._copy_workflow_run(self._workflows[self._find_workflow_run_index(run_id)])
 
-    def create_workflow_run(
+    def _manager_create_workflow_run(
         self,
         *,
         work_id: str,
@@ -845,6 +887,7 @@ class JobRegistry:
         pr_refs: tuple[str, ...] = (),
         attempts: dict[str, int] | None = None,
         evidence_refs: tuple[str, ...] = (),
+        gate_refs: tuple[GateEvidenceRef, ...] = (),
         facets: tuple[str, ...] = (),
         gate_status: str = "pending",
     ) -> WorkflowRun:
@@ -872,20 +915,17 @@ class JobRegistry:
             pr_refs=tuple(pr_refs),
             attempts=dict(attempts or {}),
             evidence_refs=tuple(evidence_refs),
+            gate_refs=tuple(gate_refs),
             facets=tuple(facets),
             gate_status=gate_status,
             created_at=now,
             updated_at=now,
         )
         self._workflows.append(run)
-        try:
-            self._persist()
-        except BaseException:
-            self._workflows.pop()
-            raise
+        self._persist()
         return self._copy_workflow_run(run)
 
-    def update_workflow_run(
+    def _manager_update_workflow_run(
         self,
         run_id: str,
         *,
@@ -896,6 +936,7 @@ class JobRegistry:
         pr_refs: tuple[str, ...] | None = None,
         attempts: dict[str, int] | None = None,
         evidence_refs: tuple[str, ...] | None = None,
+        gate_refs: tuple[GateEvidenceRef, ...] | None = None,
         facets: tuple[str, ...] | None = None,
         gate_status: str | None = None,
     ) -> WorkflowRun:
@@ -916,15 +957,12 @@ class JobRegistry:
             pr_refs=current.pr_refs if pr_refs is None else tuple(pr_refs),
             attempts=dict(current.attempts if attempts is None else attempts),
             evidence_refs=current.evidence_refs if evidence_refs is None else tuple(evidence_refs),
+            gate_refs=current.gate_refs if gate_refs is None else tuple(gate_refs),
             facets=current.facets if facets is None else tuple(facets),
             gate_status=current.gate_status if gate_status is None else gate_status,
             created_at=current.created_at,
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated
-        try:
-            self._persist()
-        except BaseException:
-            self._workflows[index] = current
-            raise
+        self._persist()
         return self._copy_workflow_run(updated)

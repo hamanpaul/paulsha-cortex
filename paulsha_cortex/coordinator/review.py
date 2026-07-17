@@ -73,7 +73,9 @@ def _normalize_identity(
 
 
 def load_model_identity_registry(config_root: str | Path | None = None) -> dict[tuple[str, str], dict[str, str]]:
-    return model_identities.load_model_identities(config_root).legacy_mapping()
+    return model_identities.load_model_identities(
+        config_root, use_packaged_default=False
+    ).legacy_mapping()
 
 
 def read_repo_tier(repo_root: str | Path | None = None) -> str:

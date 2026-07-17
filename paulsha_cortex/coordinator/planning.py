@@ -15,6 +15,7 @@ from .model_identities import (
     ModelIdentity,
     select_secondary_planner,
 )
+from .workflow import GateEvidenceRef
 
 PLANNING_KINDS = ("spec", "design", "plan")
 QUESTION_PACK_SCHEMA_VERSION = 1
@@ -22,10 +23,6 @@ BRAINSTORM_EVIDENCE_SCHEMA_VERSION = 1
 _STANDALONE_MARKERS = frozenset({"tbd", "[tbd]", "decision: tbd", "決策：未定"})
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _LIST_ITEM_RE = re.compile(r"^(?:[-+*]|\d+[.)])\s+(\S.*)$")
-_DECISION_PREFIX_RE = re.compile(
-    r"^(?:tbd(?:\s|:|：)|\[tbd\](?:\s|:|：)|decision\s*:\s*tbd\b|決策\s*[：:]\s*未定\b)",
-    re.IGNORECASE,
-)
 _REQUIRED_HEADINGS = {
     "spec": frozenset({"requirements", "requirement", "problem", "problem and outcome", "goals"}),
     "design": frozenset({"decisions", "decision", "design", "architecture"}),
@@ -146,11 +143,6 @@ def _headings_and_markers(body: str, *, line_offset: int) -> tuple[set[str], tup
             markers.append(BlockingMarker("standalone", line_number, stripped))
             continue
         item = _LIST_ITEM_RE.match(stripped)
-        if item:
-            item_text = re.sub(r"^\[[ xX]\]\s*", "", item.group(1).strip())
-            if item_text.casefold() in _STANDALONE_MARKERS or _DECISION_PREFIX_RE.match(item_text):
-                markers.append(BlockingMarker("list-decision", line_number, item.group(1).strip()))
-                continue
         if open_questions_level is not None:
             if item and item.group(1).strip().casefold() not in {"none", "n/a", "無", "無。"}:
                 markers.append(BlockingMarker("open-question", line_number, item.group(1).strip()))
@@ -563,9 +555,29 @@ def _post_integration_artifact_evidence(
 
 @dataclass(frozen=True)
 class PlanningGateRefs:
-    brainstorm_peer: str | None = None
-    foreign_review: str | None = None
-    copilot: str | None = None
+    brainstorm_peer: GateEvidenceRef | None = None
+    foreign_review: GateEvidenceRef | None = None
+    copilot: GateEvidenceRef | None = None
+
+    def __post_init__(self) -> None:
+        expected = (
+            ("brainstorm_peer", self.brainstorm_peer, "brainstorm"),
+            ("foreign_review", self.foreign_review, "foreign-review"),
+            ("copilot", self.copilot, "copilot"),
+        )
+        refs: list[str] = []
+        for field, value, kind in expected:
+            if value is not None and (not isinstance(value, GateEvidenceRef) or value.kind != kind):
+                raise ValueError(f"planning gate {field} 必須使用 {kind} kind")
+            if value is not None:
+                refs.append(value.ref)
+        if len(refs) != len(set(refs)):
+            raise ValueError("planning gate refs must be distinct")
+
+    def as_tuple(self) -> tuple[GateEvidenceRef, ...]:
+        return tuple(
+            item for item in (self.brainstorm_peer, self.foreign_review, self.copilot) if item is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -702,7 +714,9 @@ def run_heterogeneous_brainstorm(
             empty_refs,
             None,
         )
-    refs = PlanningGateRefs(brainstorm_peer=str(evidence_path))
+    refs = PlanningGateRefs(
+        brainstorm_peer=GateEvidenceRef(kind="brainstorm", ref=str(evidence_path))
+    )
     return BrainstormResult(
         "ready",
         None,

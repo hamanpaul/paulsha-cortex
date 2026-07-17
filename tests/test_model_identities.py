@@ -23,7 +23,7 @@ def _completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
 
 
 def test_packaged_v2_registry_has_google_agy_default() -> None:
-    registry = load_model_identities(use_packaged_default=True)
+    registry = load_model_identities()
 
     agy = registry.require("agy", AGY_MODEL_ID)
     assert registry.schema_version == 2
@@ -277,3 +277,34 @@ def test_secondary_selection_fails_closed_for_unknown_or_same_domain_only() -> N
         probes=probes,
     )
     assert (same.state, same.reason) == ("needs_human", "no-heterogeneous-planner")
+
+
+def test_v1_identity_is_a_probe_bound_planning_fallback(tmp_path: Path) -> None:
+    (tmp_path / "model-identities.yaml").write_text(
+        """\
+schema_version: 1
+identities:
+  - executor: codex
+    model_id: primary
+    independence_domain: openai
+  - executor: claude
+    model_id: legacy-secondary
+    independence_domain: anthropic
+""",
+        encoding="utf-8",
+    )
+    registry = load_model_identities(tmp_path)
+
+    unavailable = select_secondary_planner(registry=registry, primary=("codex", "primary"), probes={})
+    assert unavailable.reason == "no-heterogeneous-planner"
+
+    selected = select_secondary_planner(
+        registry=registry,
+        primary=("codex", "primary"),
+        probes={
+            ("claude", "legacy-secondary"): CapabilityProbe.ready_for(
+                "claude", "legacy-secondary", "anthropic"
+            )
+        },
+    )
+    assert selected.identity and selected.identity.executor == "claude"

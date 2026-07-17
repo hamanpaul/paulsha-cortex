@@ -6,7 +6,7 @@ from typing import Mapping
 
 # Stage 3 生命週期詞彙表（語意凍結）；與上游相等性由消費端對齊測試守。
 PHASES = (
-    "research",
+    "claim",
     "define",
     "plan",
     "build",

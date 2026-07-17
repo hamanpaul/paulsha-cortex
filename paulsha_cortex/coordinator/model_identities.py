@@ -207,7 +207,17 @@ def _load_model_identity_file(path: Path) -> IdentityRegistry:
             extras = set(row) - {"executor", "model_id", "independence_domain"}
             if extras:
                 raise ValueError(f"model-identities[{index}].{sorted(extras)[0]} unexpected")
-            normalized_rows.append(dict(row))
+            normalized = dict(row)
+            executor = normalized.get("executor")
+            model_id = normalized.get("model_id")
+            # v1 had no capability field. Preserve its identities as planning
+            # fallback candidates; selection still requires a matching live
+            # probe and a foreign independence domain.
+            if executor != "agy" or model_id == AGY_MODEL_ID:
+                normalized["capabilities"] = ["planning"]
+            if executor == "agy" and model_id == AGY_MODEL_ID:
+                normalized["live_probe"] = AGY_LIVE_PROBE
+            normalized_rows.append(normalized)
         rows = normalized_rows
     return IdentityRegistry.from_rows(rows, schema_version=int(schema_version))
 
@@ -215,7 +225,7 @@ def _load_model_identity_file(path: Path) -> IdentityRegistry:
 def load_model_identities(
     config_root: str | Path | None = None,
     *,
-    use_packaged_default: bool = False,
+    use_packaged_default: bool = True,
 ) -> IdentityRegistry:
     root = Path(config_root) if config_root is not None else paths.project_config_root()
     custom_path = root / "model-identities.yaml"
@@ -226,16 +236,23 @@ def load_model_identities(
     if not custom_path.is_file():
         return packaged
     custom = _load_model_identity_file(custom_path)
-    packaged_keys = {(item.executor, item.model_id) for item in packaged.identities}
+    packaged_by_key = {
+        (item.executor, item.model_id): item for item in packaged.identities
+    }
+    additions: list[ModelIdentity] = []
     for identity in custom.identities:
         key = (identity.executor, identity.model_id)
-        if key in packaged_keys:
+        packaged_identity = packaged_by_key.get(key)
+        if packaged_identity is not None and packaged_identity == identity:
+            continue
+        if packaged_identity is not None:
             raise ValueError(
                 f"model-identities custom identity shadows packaged default: {key[0]}/{key[1]}"
             )
+        additions.append(identity)
     return IdentityRegistry(
         schema_version=MODEL_IDENTITY_SCHEMA_VERSION,
-        identities=packaged.identities + custom.identities,
+        identities=packaged.identities + tuple(additions),
     )
 
 

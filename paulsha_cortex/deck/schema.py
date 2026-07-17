@@ -170,7 +170,7 @@ def load_cards(path: str | Path) -> dict[str, Card]:
         if not isinstance(skill_ref, str) or not skill_ref:
             rec_errors.append(f"{cid}: skill_ref 必須為非空字串")
         if phase is not None and phase not in (
-            "research",
+            "claim",
             "define",
             "plan",
             "build",

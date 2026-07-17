@@ -2,6 +2,16 @@
 # produces 僅寫可機械驗證 glob；佔位符白名單：<task-slug>、<change>
 version: 0
 cards:
+  - id: workflow-claim
+    kind: skill
+    type: headless
+    class: core
+    skill_ref: "coordinator:workflow-claim"
+    phase: claim
+    requires: []
+    produces: []
+    persona_binding: manager
+
   - id: brainstorming
     kind: skill
     type: interactive

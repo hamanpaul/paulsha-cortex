@@ -264,6 +264,11 @@ def build_request_executor(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
     dispatch_ready_fn: Callable[..., list[dict[str, Any]]] = autonomy.dispatch_ready,
+    workflow_identity_registry=None,
+    workflow_probes=None,
+    workflow_primary_questioner=None,
+    workflow_secondary_planner=None,
+    workflow_primary_integrator=None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -285,6 +290,19 @@ def build_request_executor(
             allow_unsafe=allow_unsafe,
             model=requested_review_model,
         )
+        if request["type"] == "workflow-action":
+            registry = getattr(dispatcher, "_registry", None)
+            if registry is None:
+                raise RuntimeError("workflow-action requires dispatcher._registry")
+            return manager.apply_workflow_action(
+                registry,
+                args=args,
+                identity_registry=workflow_identity_registry,
+                probes=workflow_probes,
+                primary_questioner=workflow_primary_questioner,
+                secondary_planner=workflow_secondary_planner,
+                primary_integrator=workflow_primary_integrator,
+            )
         if request["type"] == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
             complete_kwargs = {

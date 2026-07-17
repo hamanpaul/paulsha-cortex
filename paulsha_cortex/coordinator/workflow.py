@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 
 DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
 WORKFLOW_MANIFEST_VERSION = 1
-WORKFLOW_PHASES = ("queued", "research", "define", "plan", "build", "verify", "review", "ship")
+WORKFLOW_PHASES = ("claim", "define", "plan", "build", "verify", "review", "ship")
 WORKFLOW_GATE_STATUSES = frozenset({"pending", "running", "passed", "failed"})
 WORKFLOW_FACETS = frozenset({"needs_human", "blocked", "degraded"})
 STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_human", "blocked", "skipped"})
@@ -90,6 +90,29 @@ class WorkflowStep:
 
 
 @dataclass(frozen=True)
+class GateEvidenceRef:
+    """A typed, immutable locator for one independent workflow gate."""
+
+    kind: str
+    ref: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"brainstorm", "foreign-review", "copilot"}:
+            raise ValueError(f"workflow gate evidence kind 非法: {self.kind!r}")
+        if not isinstance(self.ref, str) or not self.ref.strip():
+            raise ValueError("workflow gate evidence ref 必須為非空字串")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"kind": self.kind, "ref": self.ref}
+
+    @classmethod
+    def from_dict(cls, payload: object) -> GateEvidenceRef:
+        if not isinstance(payload, dict) or set(payload) != {"kind", "ref"}:
+            raise ValueError("workflow gate evidence 格式錯誤")
+        return cls(kind=payload["kind"], ref=payload["ref"])
+
+
+@dataclass(frozen=True)
 class WorkflowManifest:
     """一次Deck compile的persona-preserving workflow manifest。"""
 
@@ -98,8 +121,52 @@ class WorkflowManifest:
     steps: tuple[WorkflowStep, ...]
     version: int = WORKFLOW_MANIFEST_VERSION
 
+    def __post_init__(self) -> None:
+        if self.version != WORKFLOW_MANIFEST_VERSION:
+            raise ValueError(f"workflow manifest version 非法: {self.version!r}")
+        for field, value in (("combo", self.combo), ("task_slug", self.task_slug)):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"workflow manifest {field} 必須為非空字串")
+        if not self.steps:
+            raise ValueError("workflow manifest steps 不可為空")
+
+    def validate_manager_spine(self) -> None:
+        """Validate the stricter ordering required before Manager can claim it."""
+        phase_indexes = [WORKFLOW_PHASES.index(step.phase) for step in self.steps]
+        if phase_indexes != sorted(phase_indexes):
+            raise ValueError("workflow manifest phases 必須依生命週期單調排列")
+        if self.steps[0].phase != "claim":
+            raise ValueError("workflow manifest 必須由 claim phase 開始")
+        if set(step.phase for step in self.steps) != set(WORKFLOW_PHASES):
+            raise ValueError("workflow manifest 必須涵蓋完整 phase spine")
+        first_ship = next((index for index, step in enumerate(self.steps) if step.phase == "ship"), None)
+        if first_ship is not None and not any(
+            step.phase == "review" and step.persona == "reviewer"
+            for step in self.steps[:first_ship]
+        ):
+            raise ValueError("workflow manifest ship 前缺少 reviewer step")
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "version": self.version,
+            "combo": self.combo,
+            "task_slug": self.task_slug,
+            "steps": [step.to_dict() for step in self.steps],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> WorkflowManifest:
+        if not isinstance(payload, dict) or set(payload) != {"version", "combo", "task_slug", "steps"}:
+            raise ValueError("workflow manifest 格式錯誤")
+        steps = payload["steps"]
+        if not isinstance(steps, list):
+            raise ValueError("workflow manifest steps 格式錯誤")
+        return cls(
+            version=payload["version"],
+            combo=payload["combo"],
+            task_slug=payload["task_slug"],
+            steps=tuple(WorkflowStep.from_dict(step) for step in steps),
+        )
 
 
 @dataclass(frozen=True)
@@ -118,6 +185,7 @@ class WorkflowRun:
     pr_refs: tuple[str, ...]
     attempts: dict[str, int]
     evidence_refs: tuple[str, ...]
+    gate_refs: tuple[GateEvidenceRef, ...]
     facets: tuple[str, ...]
     gate_status: str
     created_at: str
@@ -145,6 +213,14 @@ class WorkflowRun:
         ):
             if not isinstance(value, tuple) or any(not isinstance(item, str) for item in value):
                 raise ValueError(f"workflow run {field} 必須為字串tuple")
+        if not isinstance(self.gate_refs, tuple) or any(
+            not isinstance(item, GateEvidenceRef) for item in self.gate_refs
+        ):
+            raise ValueError("workflow run gate_refs 格式錯誤")
+        gate_kinds = [item.kind for item in self.gate_refs]
+        gate_locators = [item.ref for item in self.gate_refs]
+        if len(set(gate_kinds)) != len(gate_kinds) or len(set(gate_locators)) != len(gate_locators):
+            raise ValueError("workflow gate evidence kinds and refs must be distinct")
         if not isinstance(self.attempts, dict) or any(
             not isinstance(key, str) or not key or not isinstance(value, int) or value < 0
             for key, value in self.attempts.items()
@@ -158,6 +234,12 @@ class WorkflowRun:
             raise ValueError("workflow run facets 格式錯誤")
         if self.gate_status not in WORKFLOW_GATE_STATUSES:
             raise ValueError(f"workflow run gate_status 非法: {self.gate_status!r}")
+        if self.gate_status == "passed":
+            for required_kind in ("brainstorm", "foreign-review"):
+                if required_kind not in gate_kinds:
+                    raise ValueError(f"workflow passed 缺少 {required_kind} gate evidence")
+        if self.current_phase == "ship" and "copilot" not in gate_kinds:
+            raise ValueError("workflow ship 缺少 copilot gate evidence")
         for field, value in (("created_at", self.created_at), ("updated_at", self.updated_at)):
             try:
                 datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -178,6 +260,7 @@ class WorkflowRun:
             "pr_refs": list(self.pr_refs),
             "attempts": dict(self.attempts),
             "evidence_refs": list(self.evidence_refs),
+            "gate_refs": [item.to_dict() for item in self.gate_refs],
             "facets": list(self.facets),
             "gate_status": self.gate_status,
             "created_at": self.created_at,
@@ -211,6 +294,9 @@ class WorkflowRun:
         list_fields = ("steps", "issue_refs", "openspec_refs", "pr_refs", "evidence_refs", "facets")
         if any(not isinstance(payload[field], list) for field in list_fields):
             raise ValueError("workflow run list欄位格式錯誤")
+        gate_refs = payload.get("gate_refs", [])
+        if not isinstance(gate_refs, list):
+            raise ValueError("workflow run gate_refs 格式錯誤")
         return cls(
             run_id=payload["run_id"],
             work_id=payload["work_id"],
@@ -224,6 +310,7 @@ class WorkflowRun:
             pr_refs=tuple(payload["pr_refs"]),
             attempts=payload["attempts"],
             evidence_refs=tuple(payload["evidence_refs"]),
+            gate_refs=tuple(GateEvidenceRef.from_dict(item) for item in gate_refs),
             facets=tuple(payload["facets"]),
             gate_status=payload["gate_status"],
             created_at=payload["created_at"],
@@ -238,5 +325,5 @@ def validate_workflow_phase_transition(current: str, new: str) -> None:
         return
     current_index = WORKFLOW_PHASES.index(current)
     new_index = WORKFLOW_PHASES.index(new)
-    if current != "queued" and new_index <= current_index:
+    if new_index != current_index + 1:
         raise ValueError(f"非法 workflow phase transition: {current!r} -> {new!r}")

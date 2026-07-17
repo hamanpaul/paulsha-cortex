@@ -132,8 +132,13 @@ No blocking open question.
         "1. 決策：未定：選擇 retry owner",
     ):
         result = assess_planning_artifact(_artifact("design", ACCEPTED_DESIGN + f"\n{marker}\n"))
-        assert result.accepted is False
-        assert result.blocking_markers
+        assert result.accepted is True
+        assert not result.blocking_markers
+
+    literal = assess_planning_artifact(
+        _artifact("design", ACCEPTED_DESIGN + "\n- TBD is literal documentation, not a decision.\n")
+    )
+    assert literal.accepted is True
 
     open_item = ACCEPTED_DESIGN + "\n## Open Questions\n\n- Which provider owns retry?\n"
     result = assess_planning_artifact(_artifact("design", open_item))
@@ -298,7 +303,7 @@ def test_brainstorm_is_heterogeneous_persists_immutable_peer_evidence_and_keeps_
     assert result.gate_refs.brainstorm_peer
     assert result.gate_refs.foreign_review is None
     assert result.gate_refs.copilot is None
-    evidence_path = Path(result.gate_refs.brainstorm_peer)
+    evidence_path = Path(result.gate_refs.brainstorm_peer.ref)
     assert evidence_path.is_file()
     assert evidence_path.stat().st_mode & 0o777 == 0o600
     persisted = json.loads(evidence_path.read_text(encoding="utf-8"))

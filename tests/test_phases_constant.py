@@ -1,7 +1,7 @@
 def test_phases_is_frozen_stage3_vocabulary():
     from paulsha_cortex.persona.contract import PHASES
 
-    assert PHASES == ("research", "define", "plan", "build", "verify", "review", "ship")
+    assert PHASES == ("claim", "define", "plan", "build", "verify", "review", "ship")
 
 
 def test_no_hippo_import():
