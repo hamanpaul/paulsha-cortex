@@ -361,6 +361,8 @@ def correlate_work_sources(
     for source in sources:
         if source.source_id in grouped_source_ids:
             continue
+        if source.kind == "openspec" and source.status == "archived":
+            continue
         work_id = _fallback_work_id(source)
         correlated.append(
             CorrelatedWork(

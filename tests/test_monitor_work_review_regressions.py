@@ -214,7 +214,20 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
                 pull.source_id: "work",
                 openspec.source_id: "work",
             },
-            "closure_by_work": {"work": {"completion_record_valid": True}},
+            "validated_completions": {
+                "work": [
+                    {
+                        "run_id": "run-7",
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "b" * 40,
+                        "source_revisions": {
+                            issue.source_id: issue.revision,
+                            pull.source_id: pull.revision,
+                            openspec.source_id: openspec.revision,
+                        },
+                    }
+                ]
+            },
         },
     )
     durable = WorkSnapshotStore(tmp_path / "snapshot.json")
@@ -241,7 +254,20 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
                 pull.source_id: "work",
                 openspec.source_id: "work",
             },
-            "closure_by_work": {"work": {"completion_record_valid": True}},
+            "validated_completions": {
+                "work": [
+                    {
+                        "run_id": "run-7",
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "b" * 40,
+                        "source_revisions": {
+                            issue.source_id: issue.revision,
+                            pull.source_id: pull.revision,
+                            openspec.source_id: openspec.revision,
+                        },
+                    }
+                ]
+            },
         },
     )
     refresher.workflow_provider_factory = lambda _repo: _StaticProvider(completed)
@@ -435,6 +461,21 @@ def _run_closure_projection(tmp_path, *, override_text, github_sources, terminal
     override.parent.mkdir(parents=True, exist_ok=True)
     override.write_text(override_text, encoding="utf-8")
     store = WorkReadModelStore.empty()
+    mapped_sources = tuple(github_sources) + tuple(terminal.sources)
+    remote_prs = terminal.observations.get("remote_prs", [])
+    first_pr = remote_prs[0] if remote_prs else {}
+    validated_completions = {
+        "umbrella": [
+            {
+                "run_id": "run-complete",
+                "pr_candidate": first_pr.get("candidate"),
+                "merge_revision": first_pr.get("merge_revision"),
+                "source_revisions": {
+                    source.source_id: source.revision for source in mapped_sources
+                },
+            }
+        ]
+    }
     refresher = WorkModelRefresher(
         durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
         read_store=store,
@@ -446,7 +487,7 @@ def _run_closure_projection(tmp_path, *, override_text, github_sources, terminal
             _provider(
                 "workflow:example/acme",
                 observations={
-                    "closure_by_work": {"umbrella": {"completion_record_valid": True}}
+                    "validated_completions": validated_completions
                 },
             )
         ),
@@ -511,6 +552,137 @@ work_items:
     )
 
     assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] != "done"
+
+
+def test_completion_identity_must_match_every_mapped_merged_pr(tmp_path):
+    override = """version: 1
+work_items:
+  umbrella:
+    title: Multi PR Identity
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_pr
+        ref: example/acme#9
+      - kind: github_pr
+        ref: example/acme#10
+      - kind: openspec
+        ref: canary
+    excludes: []
+"""
+    github = (
+        _github_entity("github_issue", 7, "closed"),
+        _github_entity("github_pr", 9, "closed"),
+        _github_entity("github_pr", 10, "closed"),
+    )
+    terminal = _closure_terminal(
+        openspec_refs=("canary",), prs=((9, True), (10, True))
+    )
+
+    store, _, _ = _run_closure_projection(
+        tmp_path, override_text=override, github_sources=github, terminal=terminal
+    )
+
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] != "done"
+
+
+@pytest.mark.parametrize("stale_field", ("candidate", "merge_revision", "source_revision"))
+def test_same_work_completion_replay_must_match_current_terminal_identity(
+    tmp_path, stale_field
+):
+    override = """version: 1
+work_items:
+  umbrella:
+    title: Replay Guard
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_pr
+        ref: example/acme#9
+      - kind: openspec
+        ref: canary
+    excludes: []
+"""
+    github = (
+        _github_entity("github_issue", 7, "closed"),
+        _github_entity("github_pr", 9, "closed"),
+    )
+    terminal = _closure_terminal(openspec_refs=("canary",), prs=((9, True),))
+    store, refresher, project = _run_closure_projection(
+        tmp_path, override_text=override, github_sources=github, terminal=terminal
+    )
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] == "done"
+
+    stale_github = github
+    stale_terminal = terminal
+    if stale_field == "source_revision":
+        stale_github = (
+            WorkSource(
+                **{
+                    **github[0].__dict__,
+                    "revision": "github:issue-updated-after-completion",
+                }
+            ),
+            github[1],
+        )
+    else:
+        remote_prs = [dict(row) for row in terminal.observations["remote_prs"]]
+        remote_prs[0][stale_field] = "f" * 40
+        stale_terminal = _provider(
+            terminal.provider_id,
+            terminal.sources,
+            observations={**terminal.observations, "remote_prs": remote_prs},
+        )
+    refresher.github_provider_factory = lambda _repo: _StaticProvider(
+        _provider("github:example/acme", stale_github)
+    )
+    refresher.github_terminal_provider_factory = lambda _repo: _StaticProvider(
+        stale_terminal
+    )
+
+    refresher.refresh((project,), include_github=True)
+
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] != "done"
+
+
+def test_unowned_remote_archive_is_terminal_evidence_not_a_work_item(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    terminal = _provider(
+        "github-terminal:example/acme",
+        (_remote_openspec_source("historical"),),
+        observations={
+            "remote_openspec": {"active": [], "archived": ["historical"]},
+            "remote_openspec_observed": True,
+            "remote_todos": [
+                {
+                    "openspec_ref": "historical",
+                    "path": "openspec/changes/archive/2026-07-17-historical/tasks.md",
+                    "revision": "c" * 40,
+                    "complete": True,
+                }
+            ],
+        },
+    )
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github:example/acme")
+        ),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(terminal),
+        workflow_provider_factory=lambda _repo: _StaticProvider(
+            _provider("workflow:example/acme")
+        ),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+
+    refresher.refresh((project,), include_github=True)
+
+    assert store.list_work_items()["items"] == []
+    assert store.list_work_items(include_done=True)["items"] == []
 
 
 def test_openspec_closure_uses_all_mapped_refs_not_work_id_slug(tmp_path):

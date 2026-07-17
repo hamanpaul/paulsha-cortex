@@ -269,7 +269,7 @@ class WorkflowRegistryProvider:
             rows = payload["workflow_runs"]
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
-            closure: dict[str, dict[str, bool]] = {}
+            validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
                 _validate_workflow_v2_row(row)
                 if row.get("repo") != self.repo:
@@ -290,8 +290,11 @@ class WorkflowRegistryProvider:
                     )
                 )
                 links[source_id] = work_id
-                if _workflow_completion_record_valid(row, state_path=self.state_path):
-                    closure.setdefault(work_id, {})["completion_record_valid"] = True
+                completion = _validated_workflow_completion(
+                    row, state_path=self.state_path
+                )
+                if completion is not None:
+                    validated_completions.setdefault(work_id, []).append(completion)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
             return ProviderSnapshot(
                 provider_id=self.provider_id,
@@ -311,7 +314,10 @@ class WorkflowRegistryProvider:
             revision=f"registry-sha256:{_digest((raw,))}",
             diagnostics=(),
             sources=tuple(sources),
-            observations={"workflow_links": links, "closure_by_work": closure},
+            observations={
+                "workflow_links": links,
+                "validated_completions": validated_completions,
+            },
         )
 
 
@@ -381,16 +387,16 @@ def _validate_workflow_v2_row(row: object) -> None:
         raise ValueError("workflow run requires status or current_phase")
 
 
-def _workflow_completion_record_valid(
+def _validated_workflow_completion(
     row: Mapping, *, state_path: Path
-) -> bool:
+) -> dict[str, object] | None:
     fields = (
         row.get("completion_record_path"),
         row.get("completion_record_hash"),
         row.get("completion_record_revision"),
     )
     if all(value is None for value in fields):
-        return False
+        return None
     if any(value is None for value in fields):
         raise ValueError("completion record path/hash/revision must be supplied together")
     record_path, expected_hash, expected_revision = fields
@@ -434,7 +440,7 @@ def _workflow_completion_record_valid(
 
     record = read_completion_record(resolved, expected_hash=expected_hash.lower())
     normalized_sources = dict(source_revisions)
-    return all(
+    valid = all(
         (
             record.get("candidate") == expected_revision.lower() == pr_candidate.lower(),
             record.get("work_id") == row.get("work_id"),
@@ -443,6 +449,14 @@ def _workflow_completion_record_valid(
             record.get("merge_revision") == merge_revision.lower(),
         )
     )
+    if not valid:
+        return None
+    return {
+        "run_id": row["run_id"],
+        "pr_candidate": pr_candidate.lower(),
+        "merge_revision": merge_revision.lower(),
+        "source_revisions": normalized_sources,
+    }
 
 
 def _frontmatter_work_item(path: Path) -> str | None:

@@ -467,6 +467,7 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
         "closing_links": {},
         "workflow_links": {},
         "closure_by_work": {},
+        "validated_completions": {},
         "inferred_signals": [],
         "remote_openspec": {"active": [], "archived": []},
         "remote_openspec_observed": False,
@@ -484,17 +485,13 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
             value = observations.get("workflow_links", {})
             if isinstance(value, Mapping):
                 merged["workflow_links"].update(value)
-        closure = observations.get("closure_by_work", {})
-        if isinstance(closure, Mapping):
-            for work_id, facts in closure.items():
-                if isinstance(work_id, str) and isinstance(facts, Mapping):
-                    accepted: dict[str, object] = {}
-                    if provider.provider_id.startswith("workflow:"):
-                        if "completion_record_valid" in facts:
-                            accepted["completion_record_valid"] = facts[
-                                "completion_record_valid"
-                            ]
-                    merged["closure_by_work"].setdefault(work_id, {}).update(accepted)
+            completions = observations.get("validated_completions", {})
+            if isinstance(completions, Mapping):
+                for work_id, rows in completions.items():
+                    if isinstance(work_id, str) and isinstance(rows, list):
+                        merged["validated_completions"].setdefault(work_id, []).extend(
+                            row for row in rows if isinstance(row, Mapping)
+                        )
         signals = observations.get("inferred_signals", [])
         if isinstance(signals, list):
             merged["inferred_signals"].extend(signals)
@@ -546,6 +543,8 @@ def _generate_inferred_signals(
     artifacts: list[tuple[object, str]] = []
     issues: list[tuple[object, str, str]] = []
     for source in sources:
+        if source.kind == "openspec" and source.status == "archived":
+            continue
         if source.kind == "github_issue" and source.title:
             slug = _slug(source.title)
             if slug:
@@ -634,6 +633,9 @@ def _parse_closure_evidence(
                 continue
             if name in row:
                 facts[name] = row.get(name) is True
+    validated_completions = observations.get("validated_completions", {})
+    if not isinstance(validated_completions, Mapping):
+        validated_completions = {}
     remote = observations.get("remote_openspec", {})
     active = set(remote.get("active", [])) if isinstance(remote, Mapping) else set()
     archived = set(remote.get("archived", [])) if isinstance(remote, Mapping) else set()
@@ -654,8 +656,10 @@ def _parse_closure_evidence(
         and isinstance(row.get("merged_with_merge_commit"), bool)
     }
     for group in getattr(correlation, "groups", ()):
-        if group.work_id not in combined:
+        completion_rows = validated_completions.get(group.work_id, [])
+        if group.work_id not in combined and not completion_rows:
             continue
+        combined.setdefault(group.work_id, {})
         issues = [
             source
             for source in group.sources
@@ -674,6 +678,26 @@ def _parse_closure_evidence(
             and source.source_id in remote_prs
             and remote_prs[source.source_id]["merged_with_merge_commit"] is True
             for source in prs
+        )
+        authoritative_revisions = {
+            source.source_id: source.revision
+            for source in group.sources
+            if source.confidence == "confirmed"
+            and source.kind not in {"workflow_run", "completion_record"}
+        }
+        combined[group.work_id]["completion_record_valid"] = bool(
+            authoritative_revisions
+        ) and isinstance(completion_rows, list) and any(
+            isinstance(completion, Mapping)
+            and completion.get("source_revisions") == authoritative_revisions
+            and all(
+                remote_prs.get(source.source_id, {}).get("candidate")
+                == completion.get("pr_candidate")
+                and remote_prs.get(source.source_id, {}).get("merge_revision")
+                == completion.get("merge_revision")
+                for source in prs
+            )
+            for completion in completion_rows
         )
         openspec_refs = {
             source.ref

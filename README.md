@@ -128,7 +128,7 @@ cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
 cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
 ```
 
-Monitor 只允許 override、frontmatter、GitHub closing reference 與 workflow metadata 提供 confirmed association；PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。`done` 的 Todo completion 只採遠端 default branch 的 Todo blob與 archived OpenSpec task checklist revision，不採本機 overlay；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state、加上 degraded facet，並在 `cortex-work/v1.hard_gates` 關閉 auto claim 與 merge。
+Monitor 只允許 override、frontmatter、GitHub closing reference 與 workflow metadata 提供 confirmed association；PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 只提供終態證據，不會單獨建立 work item。`done` 的 Todo completion 只採遠端 default branch 的 Todo blob與 archived OpenSpec task checklist revision，不採本機 overlay；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state、加上 degraded facet，並在 `cortex-work/v1.hard_gates` 關閉 auto claim 與 merge。
 
 Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
 

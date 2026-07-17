@@ -261,8 +261,67 @@ def test_workflow_registry_existing_completion_schema_remains_not_valid(monkeypa
     assert [source.ref for source in result.sources] == ["run-7"]
     source_id = result.sources[0].source_id
     assert result.observations["workflow_links"] == {source_id: "work"}
-    assert result.observations["closure_by_work"] == {}
+    assert result.observations["validated_completions"] == {}
     assert calls == [(str(record), "b" * 64)]
+
+
+def test_workflow_registry_preserves_validated_completion_identity(monkeypatch, tmp_path):
+    state = tmp_path / "workflows.json"
+    record = tmp_path / "evidence/completion/record.json"
+    record.parent.mkdir(parents=True)
+    record.write_text("{}", encoding="utf-8")
+    source_revisions = {
+        "github_issue:example/acme#7": "github:i7",
+        "github_pr:example/acme#9": "github:p9",
+    }
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.completion.read_completion_record",
+        lambda *_args, **_kwargs: {
+            "candidate": "a" * 40,
+            "work_id": "work",
+            "run_id": "run-7",
+            "source_revisions": source_revisions,
+            "merge_revision": "d" * 40,
+        },
+    )
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 8,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-7",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "completed",
+                        "completion_record_path": str(record),
+                        "completion_record_hash": "b" * 64,
+                        "completion_record_revision": "a" * 40,
+                        "source_revisions": source_revisions,
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "d" * 40,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert result.observations["validated_completions"] == {
+        "work": [
+            {
+                "run_id": "run-7",
+                "pr_candidate": "a" * 40,
+                "merge_revision": "d" * 40,
+                "source_revisions": source_revisions,
+            }
+        ]
+    }
 
 
 def test_workflow_registry_rejects_cross_work_completion_replay(monkeypatch, tmp_path):
@@ -308,7 +367,7 @@ def test_workflow_registry_rejects_cross_work_completion_replay(monkeypatch, tmp
     result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
 
     assert result.status == "ok"
-    assert result.observations["closure_by_work"] == {}
+    assert result.observations["validated_completions"] == {}
 
 
 def test_workflow_registry_unknown_schema_and_root_keys_are_degraded(tmp_path):
