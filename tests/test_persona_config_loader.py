@@ -9,10 +9,38 @@ from paulsha_cortex.persona.loader import load_catalog
 
 
 class LoadCatalogTests(unittest.TestCase):
-    def test_default_catalog_loads_three_roles(self) -> None:
+    def test_default_catalog_loads_required_roles_including_planner(self) -> None:
         catalog = load_catalog()
-        self.assertEqual(set(catalog), {"manager", "builder", "reviewer"})
+        self.assertEqual(set(catalog), {"manager", "planner", "builder", "reviewer"})
         self.assertTrue(contract.validate_persona_schema(catalog).ok)
+
+    def test_planner_is_limited_to_define_and_plan(self) -> None:
+        planner = load_catalog()["planner"]
+        self.assertEqual(planner.allowed_phases, ("define", "plan"))
+
+    def test_modern_catalog_without_required_planner_is_rejected(self) -> None:
+        catalog = load_catalog()
+        catalog.pop("planner")
+        result = contract.validate_persona_schema(catalog)
+        self.assertFalse(result.ok)
+        self.assertIn("missing required role: planner", result.errors)
+
+    def test_legacy_v1_catalog_without_planner_remains_compatible(self) -> None:
+        catalog = load_catalog()
+        catalog.pop("planner")
+        legacy = {
+            role: contract.PersonaContract(
+                role=persona.role,
+                version="v1",
+                summary=persona.summary,
+                allowed_phases=persona.allowed_phases,
+                write_paths=persona.write_paths,
+                allowed_tools=persona.allowed_tools,
+                skills=persona.skills,
+            )
+            for role, persona in catalog.items()
+        }
+        self.assertTrue(contract.validate_persona_schema(legacy).ok)
 
     def test_missing_file_fails_closed(self) -> None:
         with self.assertRaises(FileNotFoundError):

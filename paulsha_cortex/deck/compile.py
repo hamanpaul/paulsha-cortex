@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.coordinator.workflow import WorkflowManifest, WorkflowStep
 
 from .schema import Card, Combo, ComboEntry
 
@@ -68,6 +69,26 @@ class CompileResult:
     checklist: tuple[str, ...]
     verify_commands: tuple[str, ...]
     external: tuple[str, ...]
+    # Optional only for source compatibility with callers that construct a
+    # CompileResult solely to exercise emit(); compile_combo always populates it.
+    workflow_manifest: WorkflowManifest | None = None
+
+
+_LEGACY_CARD_PHASES = {
+    "brainstorming": "define",
+    "openspec-propose": "define",
+    "writing-plans": "plan",
+    "mcu-hw-evidence": "define",
+    "worktree-isolation": "build",
+    "tdd-red": "build",
+    "subagent-build": "build",
+    "receiving-code-review": "build",
+    "verification": "verify",
+    "code-review": "review",
+    "adversarial-review": "review",
+    "openspec-archive": "ship",
+    "policy-commit": "ship",
+}
 
 
 def _subst(glob: str, slug: str, change: str | None) -> str:
@@ -227,6 +248,64 @@ def _uses_change(card: Card) -> bool:
     return any("<change>" in pattern for pattern in card.requires + card.produces)
 
 
+def _workflow_phase(card: Card, persona) -> str:
+    phase = card.phase or _LEGACY_CARD_PHASES.get(card.id)
+    if phase is None:
+        if len(persona.allowed_phases) == 1:
+            phase = persona.allowed_phases[0]
+        else:
+            raise DeckCompileError(f"{card.id}: 缺 phase，無法由 persona {persona.role} 唯一推導")
+    if phase not in persona.allowed_phases:
+        raise DeckCompileError(f"{card.id}: persona {persona.role} 不允許 phase {phase}")
+    return phase
+
+
+def _manifest_subst(pattern: str, slug: str, change: str | None) -> str:
+    """Resolve known locators while retaining an intentionally external change token."""
+    out = pattern.replace("<task-slug>", slug)
+    if change is not None:
+        out = out.replace("<change>", change)
+    return out
+
+
+def _compile_workflow_manifest(
+    combo: Combo,
+    entries: Sequence[ComboEntry],
+    cards: Mapping[str, Card],
+    slug: str,
+    change: str | None,
+) -> WorkflowManifest:
+    # 延遲import避免persona loader載入deck catalog時形成module-level循環。
+    from paulsha_cortex.persona.loader import load_catalog
+
+    try:
+        catalog = load_catalog()
+    except (FileNotFoundError, ValueError) as exc:
+        raise DeckCompileError(f"persona catalog 無法載入: {exc}") from exc
+
+    steps: list[WorkflowStep] = []
+    for entry in entries:
+        card = cards[entry.ref]
+        binding = card.persona_binding
+        if not binding or binding not in catalog:
+            raise DeckCompileError(f"{card.id}: persona_binding {binding!r} 無法解析到catalog")
+        persona = catalog[binding]
+        phase = _workflow_phase(card, persona)
+        steps.append(
+            WorkflowStep(
+                phase=phase,
+                persona=binding,
+                card=card.id,
+                executor=None,
+                model=None,
+                domain=None,
+                inputs=tuple(_manifest_subst(item, slug, change) for item in card.requires),
+                outputs=tuple(_manifest_subst(item, slug, change) for item in card.produces),
+            )
+        )
+    return WorkflowManifest(combo=combo.id, task_slug=slug, steps=tuple(steps))
+
+
 def _verify_command(card: Card, slug: str, change: str | None) -> str:
     command = f"cortex deck verify {card.id} --task-slug {slug}"
     if _uses_change(card):
@@ -272,6 +351,7 @@ def compile_combo(
         change = _validate_change_name(change)
     entries = _resolve_hand(combo, cards, with_cards, only)
     external = _check_requires_coverage(entries, cards, allow_external)
+    workflow_manifest = _compile_workflow_manifest(combo, entries, cards, slug, change)
 
     interactive_cards = [cards[entry.ref] for entry in entries if cards[entry.ref].type == "interactive"]
     checklist = tuple(
@@ -338,6 +418,7 @@ def compile_combo(
         checklist=checklist,
         verify_commands=tuple(dict.fromkeys(verify_commands)),
         external=external,
+        workflow_manifest=workflow_manifest,
     )
 
 

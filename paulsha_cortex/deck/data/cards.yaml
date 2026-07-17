@@ -7,6 +7,7 @@ cards:
     type: interactive
     class: core
     skill_ref: "superpowers:brainstorming"
+    phase: define
     requires: []
     produces: ["docs/superpowers/specs/*<task-slug>*-design.md"]
     persona_binding: planner
@@ -16,6 +17,7 @@ cards:
     type: interactive
     class: core
     skill_ref: "openspec-propose"
+    phase: define
     requires: ["docs/superpowers/specs/*<task-slug>*-design.md"]
     produces:
       - "openspec/changes/<change>/proposal.md"
@@ -27,6 +29,7 @@ cards:
     type: interactive
     class: core
     skill_ref: "superpowers:writing-plans"
+    phase: plan
     requires: ["openspec/changes/<change>/proposal.md"]
     produces: ["docs/superpowers/plans/*<task-slug>*.md"]
     persona_binding: planner
@@ -36,6 +39,7 @@ cards:
     type: headless
     class: core
     skill_ref: "superpowers:using-git-worktrees"
+    phase: build
     slice_group: build
     requires: ["docs/superpowers/plans/*<task-slug>*.md"]
     produces: []          # worktree 由 coordinator 派工時自建（feature/<slice_id>）
@@ -46,6 +50,7 @@ cards:
     type: headless
     class: core
     skill_ref: "superpowers:test-driven-development"
+    phase: build
     slice_group: build
     requires: []
     produces: []          # RED 證據在 build session log／commits，Phase A 不機驗
@@ -56,6 +61,7 @@ cards:
     type: headless
     class: core
     skill_ref: "superpowers:subagent-driven-development"
+    phase: build
     slice_group: build
     requires: []
     produces: []          # 完成偵測 = manager exit sentinel + branch commits
@@ -66,6 +72,7 @@ cards:
     type: headless
     class: core
     skill_ref: "superpowers:requesting-code-review"
+    phase: review
     requires: []
     produces: ["reports/review/*<task-slug>*.md"]
     persona_binding: reviewer
@@ -75,6 +82,7 @@ cards:
     type: headless
     class: core
     skill_ref: "superpowers:verification-before-completion"
+    phase: verify
     requires: []
     produces: ["reports/verify/*<task-slug>*.md"]
     persona_binding: reviewer
@@ -84,6 +92,7 @@ cards:
     type: headless
     class: core
     skill_ref: "openspec-archive-change"
+    phase: ship
     slice_group: ship
     requires: ["openspec/changes/<change>/tasks.md"]
     produces: ["openspec/changes/archive/*<change>*"]
@@ -94,6 +103,7 @@ cards:
     type: headless
     class: core
     skill_ref: "conventional-commit"
+    phase: ship
     slice_group: ship
     requires: []
     produces: []          # 證據 = conventional commit 本身（不機驗檔案）
@@ -104,6 +114,7 @@ cards:
     type: headless
     class: core
     skill_ref: "codex:adversarial-review"
+    phase: review
     requires: ["reports/review/*<task-slug>*.md"]
     produces: ["reports/review/*<task-slug>*-adversarial.md"]
     persona_binding: reviewer
@@ -113,6 +124,7 @@ cards:
     type: headless
     class: core
     skill_ref: "superpowers:receiving-code-review"
+    phase: build
     requires: ["reports/review/*<task-slug>*.md"]
     produces: []          # findings 處理證據 = fix commits + re-review，Phase A 不機驗
     persona_binding: builder
@@ -124,6 +136,7 @@ cards:
     type: interactive
     class: niche
     skill_ref: "mcu-coding-skill"
+    phase: define
     requires: []
     produces: ["docs/superpowers/specs/*<task-slug>*-hw-evidence.md"]
     persona_binding: planner

@@ -30,6 +30,7 @@ _CARD_KEYS = frozenset(
         "type",
         "class",
         "skill_ref",
+        "phase",
         "requires",
         "produces",
         "persona_binding",
@@ -59,6 +60,7 @@ class Card:
     type: str
     card_class: str  # YAML key: class
     skill_ref: str
+    phase: str | None = None
     requires: tuple[str, ...] = ()
     produces: tuple[str, ...] = ()
     persona_binding: str | None = None
@@ -158,6 +160,7 @@ def load_cards(path: str | Path) -> dict[str, Card]:
         ctype = rec.get("type")
         cclass = rec.get("class")
         skill_ref = rec.get("skill_ref")
+        phase = _optional_str(rec.get("phase"), cid, "phase", rec_errors)
         if kind not in CARD_KINDS:
             rec_errors.append(f"{cid}: kind 非法值 {kind!r}")
         if ctype not in CARD_TYPES:
@@ -166,6 +169,16 @@ def load_cards(path: str | Path) -> dict[str, Card]:
             rec_errors.append(f"{cid}: class 非法值 {cclass!r}")
         if not isinstance(skill_ref, str) or not skill_ref:
             rec_errors.append(f"{cid}: skill_ref 必須為非空字串")
+        if phase is not None and phase not in (
+            "research",
+            "define",
+            "plan",
+            "build",
+            "verify",
+            "review",
+            "ship",
+        ):
+            rec_errors.append(f"{cid}: phase 非法值 {phase!r}")
         requires = _str_tuple(rec.get("requires"), cid, "requires", rec_errors)
         produces = _str_tuple(rec.get("produces"), cid, "produces", rec_errors)
         _check_placeholders(cid, requires + produces, rec_errors)
@@ -183,6 +196,7 @@ def load_cards(path: str | Path) -> dict[str, Card]:
             type=ctype,
             card_class=cclass,
             skill_ref=skill_ref,
+            phase=phase,
             requires=requires,
             produces=produces,
             persona_binding=persona_binding,

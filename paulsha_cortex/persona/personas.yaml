@@ -9,6 +9,14 @@ roles:
     write_paths: ["docs/**", "openspec/**", "lifecycle.yaml", "runtime/handoff/**"]
     allowed_tools: ["coordinator.dispatch", "coordinator.handoff", "git", "gh", "openspec", "python -m unittest"]
     skills: [openspec-archive, policy-commit]
+  planner:
+    role: planner
+    version: "1.0.0"
+    summary: defines accepted requirements and produces implementation plans without building or shipping
+    allowed_phases: [define, plan]
+    write_paths: ["docs/superpowers/specs/**", "docs/superpowers/plans/**", "openspec/changes/**"]
+    allowed_tools: ["rg", "edit", "openspec"]
+    skills: [brainstorming, openspec-propose, writing-plans, mcu-hw-evidence]
   builder:
     role: builder
     version: "2.0.0"
@@ -21,7 +29,7 @@ roles:
     role: reviewer
     version: "2.0.0"
     summary: reviews artifacts and records verdicts without code edits
-    allowed_phases: [review]
+    allowed_phases: [verify, review]
     write_paths: ["reports/review/**"]
     allowed_tools: ["python -m unittest", "rg"]
     skills: [code-review, verification, adversarial-review]
