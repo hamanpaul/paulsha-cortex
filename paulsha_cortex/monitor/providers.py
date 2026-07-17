@@ -331,7 +331,8 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "status", "current_phase", "claim_key", "combo", "steps", "issue_refs",
         "openspec_refs", "pr_refs", "attempts", "evidence", "facets",
         "created_at", "updated_at", "completion_record_path",
-        "completion_record_hash", "completion_record_revision",
+        "completion_record_hash", "completion_record_revision", "source_revisions",
+        "pr_candidate", "merge_revision",
     }
 )
 
@@ -399,6 +400,27 @@ def _workflow_completion_record_valid(
         raise ValueError("completion_record_hash must be a 64-char hex digest")
     if not isinstance(expected_revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", expected_revision) is None:
         raise ValueError("completion_record_revision must be a 40-char commit SHA")
+    source_revisions = row.get("source_revisions")
+    if (
+        not isinstance(source_revisions, Mapping)
+        or not source_revisions
+        or any(
+            not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(revision, str)
+            or not revision
+            for source_id, revision in source_revisions.items()
+        )
+    ):
+        raise ValueError("completion source_revisions must be a non-empty string map")
+    pr_candidate = row.get("pr_candidate")
+    merge_revision = row.get("merge_revision")
+    for field, value in (
+        ("pr_candidate", pr_candidate),
+        ("merge_revision", merge_revision),
+    ):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+            raise ValueError(f"{field} must be a 40-char commit SHA")
     path = Path(record_path)
     if path.is_symlink():
         raise ValueError("completion_record_path must not be a symlink")
@@ -411,9 +433,16 @@ def _workflow_completion_record_valid(
     from paulsha_cortex.coordinator.completion import read_completion_record
 
     record = read_completion_record(resolved, expected_hash=expected_hash.lower())
-    if record.get("candidate") != expected_revision.lower():
-        raise ValueError("completion record revision mismatch")
-    return True
+    normalized_sources = dict(source_revisions)
+    return all(
+        (
+            record.get("candidate") == expected_revision.lower() == pr_candidate.lower(),
+            record.get("work_id") == row.get("work_id"),
+            record.get("run_id") == row.get("run_id"),
+            record.get("source_revisions") == normalized_sources,
+            record.get("merge_revision") == merge_revision.lower(),
+        )
+    )
 
 
 def _frontmatter_work_item(path: Path) -> str | None:
@@ -586,7 +615,7 @@ class GitHubWorkProvider:
 class GitHubTerminalProvider:
     """Read closing references and remote default-branch archive evidence."""
 
-    _QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage} nodes{number body headRefName state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
+    _QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage} nodes{number body headRefName headRefOid state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
 
     def __init__(
         self,
@@ -650,8 +679,27 @@ class GitHubTerminalProvider:
                 if len(path.split("/")) >= 5
                 if (match := _ARCHIVE_DATE_PREFIX.match(path.split("/")[3]))
             }
+            if active_changes & archived_changes:
+                raise ValueError("remote active/archive OpenSpec collision")
+            sources = tuple(
+                WorkSource(
+                    source_id=f"github_openspec:{self.repo}:{ref}:{status}",
+                    kind="openspec",
+                    ref=ref,
+                    revision=f"github-tree:{default_revision.lower()}",
+                    status=status,
+                    confidence="confirmed",
+                    provider=self.provider_id,
+                    title=ref,
+                )
+                for status, refs in (
+                    ("active", sorted(active_changes)),
+                    ("archived", sorted(archived_changes)),
+                )
+                for ref in refs
+            )
             links: dict[str, str] = {}
-            closure: dict[str, dict[str, bool]] = {}
+            remote_prs: list[dict[str, object]] = []
             branches: list[dict[str, str]] = []
             for pull in pulls["nodes"]:
                 number = pull["number"]
@@ -663,19 +711,11 @@ class GitHubTerminalProvider:
                 if closing["pageInfo"]["hasNextPage"]:
                     raise ValueError("closing issue pagination incomplete")
                 issues = closing["nodes"]
-                if not issues:
-                    continue
-                explicit_work_id = _pr_work_id(pull.get("body"))
-                primary_issue_source = f"github_issue:{self.repo}#{issues[0]['number']}"
-                work_id = explicit_work_id or f"@source:{primary_issue_source}"
-                links[pr_source_id] = (
-                    explicit_work_id or primary_issue_source
-                )
-                for issue in issues:
-                    issue_source = f"github_issue:{self.repo}#{issue['number']}"
-                    if explicit_work_id is not None:
-                        links[issue_source] = explicit_work_id
-                    elif issue_source != primary_issue_source:
+                if issues:
+                    primary_issue_source = f"github_issue:{self.repo}#{issues[0]['number']}"
+                    links[pr_source_id] = primary_issue_source
+                    for issue in issues[1:]:
+                        issue_source = f"github_issue:{self.repo}#{issue['number']}"
                         links[issue_source] = primary_issue_source
                 merge = pull.get("mergeCommit") or {}
                 merge_revision = merge.get("oid")
@@ -697,9 +737,25 @@ class GitHubTerminalProvider:
                         )
                     )
                     merge_commit = comparison.get("status") in {"ahead", "identical"}
-                closure[work_id] = {
-                    "pr_merged_with_merge_commit": merge_commit,
-                }
+                candidate = pull.get("headRefOid")
+                remote_prs.append(
+                    {
+                        "source_id": pr_source_id,
+                        "candidate": (
+                            candidate.lower()
+                            if isinstance(candidate, str)
+                            and re.fullmatch(r"[0-9a-fA-F]{40}", candidate)
+                            else None
+                        ),
+                        "merge_revision": (
+                            merge_revision.lower()
+                            if isinstance(merge_revision, str)
+                            and re.fullmatch(r"[0-9a-fA-F]{40}", merge_revision)
+                            else None
+                        ),
+                        "merged_with_merge_commit": merge_commit,
+                    }
+                )
         except subprocess.TimeoutExpired:
             return self._failure(attempted_at, "github terminal timeout")
         except FileNotFoundError:
@@ -708,7 +764,7 @@ class GitHubTerminalProvider:
             return self._failure(attempted_at, "github terminal evidence unavailable")
         observations = {
             "closing_links": links,
-            "closure_by_work": closure,
+            "remote_prs": sorted(remote_prs, key=lambda row: str(row["source_id"])),
             "remote_openspec": {
                 "active": sorted(active_changes),
                 "archived": sorted(archived_changes),
@@ -726,7 +782,7 @@ class GitHubTerminalProvider:
             last_success_at=attempted_at,
             revision="github-terminal:" + _digest((json.dumps(observations, sort_keys=True).encode(),)),
             diagnostics=(),
-            sources=(),
+            sources=sources,
             observations=observations,
         )
 
@@ -758,10 +814,16 @@ class GitHubTerminalProvider:
                 continue
             path = entry.get("path")
             revision = entry.get("sha")
-            if (
-                not isinstance(path, str)
-                or re.fullmatch(r"docs/superpowers/workstreams/.+/todo\.md", path) is None
-            ):
+            if not isinstance(path, str):
+                continue
+            is_todo = re.fullmatch(
+                r"docs/superpowers/workstreams/.+/todo\.md", path
+            ) is not None
+            archive_match = re.fullmatch(
+                r"openspec/changes/archive/(\d{4}-\d{2}-\d{2}-.+)/tasks\.md",
+                path,
+            )
+            if not is_todo and archive_match is None:
                 continue
             if entry.get("type") != "blob" or not isinstance(revision, str) or re.fullmatch(
                 r"[0-9a-fA-F]{40}", revision
@@ -784,22 +846,29 @@ class GitHubTerminalProvider:
                 ).decode("utf-8")
             except (binascii.Error, UnicodeDecodeError) as error:
                 raise ValueError("remote Todo blob content is invalid") from error
-            work_id = _frontmatter_work_item_text(text, source=f"github:{path}@{revision}")
-            if work_id is None:
-                continue
-            rows.append(
-                {
-                    "work_id": work_id,
-                    "path": path,
-                    "revision": revision.lower(),
-                    "complete": _markdown_tasks_complete_text(text),
-                }
-            )
-        return sorted(rows, key=lambda row: (str(row["work_id"]), str(row["path"])))
-
-
-def _pr_work_id(body: object) -> str | None:
-    if not isinstance(body, str):
-        return None
-    match = re.search(r"(?m)^work_item:\s*([a-z0-9][a-z0-9-]*)\s*$", body)
-    return match.group(1) if match else None
+            row: dict[str, object] = {
+                "path": path,
+                "revision": revision.lower(),
+                "complete": _markdown_tasks_complete_text(text),
+            }
+            if archive_match is not None:
+                archived_name = archive_match.group(1)
+                match = _ARCHIVE_DATE_PREFIX.match(archived_name)
+                if match is None:
+                    raise ValueError("remote archived OpenSpec tasks path is invalid")
+                row["openspec_ref"] = match.group("name")
+            else:
+                work_id = _frontmatter_work_item_text(
+                    text, source=f"github:{path}@{revision}"
+                )
+                if work_id is None:
+                    continue
+                row["work_id"] = work_id
+            rows.append(row)
+        return sorted(
+            rows,
+            key=lambda row: (
+                str(row.get("work_id", row.get("openspec_ref", ""))),
+                str(row["path"]),
+            ),
+        )

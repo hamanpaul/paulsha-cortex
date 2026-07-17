@@ -471,6 +471,7 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
         "remote_openspec": {"active": [], "archived": []},
         "remote_openspec_observed": False,
         "remote_todos": [],
+        "remote_prs": [],
         "branches": [],
     }
     for provider in providers:
@@ -488,11 +489,6 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
             for work_id, facts in closure.items():
                 if isinstance(work_id, str) and isinstance(facts, Mapping):
                     accepted: dict[str, object] = {}
-                    if provider.provider_id.startswith("github-terminal:"):
-                        if "pr_merged_with_merge_commit" in facts:
-                            accepted["pr_merged_with_merge_commit"] = facts[
-                                "pr_merged_with_merge_commit"
-                            ]
                     if provider.provider_id.startswith("workflow:"):
                         if "completion_record_valid" in facts:
                             accepted["completion_record_valid"] = facts[
@@ -513,7 +509,7 @@ def _merge_observations(providers: Sequence[ProviderSnapshot]) -> dict:
                         )
             if observations.get("remote_openspec_observed") is True:
                 merged["remote_openspec_observed"] = True
-            for key in ("remote_todos", "branches"):
+            for key in ("remote_todos", "remote_prs", "branches"):
                 values = observations.get(key, [])
                 if isinstance(values, list):
                     merged[key].extend(
@@ -641,21 +637,22 @@ def _parse_closure_evidence(
     remote = observations.get("remote_openspec", {})
     active = set(remote.get("active", [])) if isinstance(remote, Mapping) else set()
     archived = set(remote.get("archived", [])) if isinstance(remote, Mapping) else set()
-    for todo in observations.get("remote_todos", []):
-        if not isinstance(todo, Mapping):
-            continue
-        work_id = todo.get("work_id")
-        revision = todo.get("revision")
-        if (
-            not isinstance(work_id, str)
-            or not isinstance(revision, str)
-            or re.fullmatch(r"[0-9a-fA-F]{40}", revision) is None
-            or not isinstance(todo.get("path"), str)
-            or not isinstance(todo.get("complete"), bool)
-        ):
-            continue
-        facts = combined.setdefault(work_id, {})
-        facts["todo_tasks_complete"] = facts.get("todo_tasks_complete", True) and todo["complete"]
+    remote_todos = [
+        todo
+        for todo in observations.get("remote_todos", [])
+        if isinstance(todo, Mapping)
+        and isinstance(todo.get("revision"), str)
+        and re.fullmatch(r"[0-9a-fA-F]{40}", todo["revision"])
+        and isinstance(todo.get("path"), str)
+        and isinstance(todo.get("complete"), bool)
+    ]
+    remote_prs = {
+        row["source_id"]: row
+        for row in observations.get("remote_prs", [])
+        if isinstance(row, Mapping)
+        and isinstance(row.get("source_id"), str)
+        and isinstance(row.get("merged_with_merge_commit"), bool)
+    }
     for group in getattr(correlation, "groups", ()):
         if group.work_id not in combined:
             continue
@@ -667,10 +664,40 @@ def _parse_closure_evidence(
         combined[group.work_id]["issues_all_closed"] = bool(issues) and all(
             source.status == "closed" for source in issues
         )
-    for work_id, facts in combined.items():
-        if observations.get("remote_openspec_observed") is True or active or archived:
-            facts["remote_active_openspec_absent"] = work_id not in active
-            facts["remote_archive_present"] = work_id in archived
+        prs = [
+            source
+            for source in group.sources
+            if source.kind == "github_pr" and source.confidence == "confirmed"
+        ]
+        combined[group.work_id]["pr_merged_with_merge_commit"] = bool(prs) and all(
+            source.status == "closed"
+            and source.source_id in remote_prs
+            and remote_prs[source.source_id]["merged_with_merge_commit"] is True
+            for source in prs
+        )
+        openspec_refs = {
+            source.ref
+            for source in group.sources
+            if source.kind == "openspec" and source.confidence == "confirmed"
+        }
+        if observations.get("remote_openspec_observed") is True:
+            combined[group.work_id]["remote_active_openspec_absent"] = bool(
+                openspec_refs
+            ) and all(ref not in active for ref in openspec_refs)
+            combined[group.work_id]["remote_archive_present"] = bool(
+                openspec_refs
+            ) and all(ref in archived for ref in openspec_refs)
+        doc_todos = [todo for todo in remote_todos if todo.get("work_id") == group.work_id]
+        openspec_todos = [
+            todo for todo in remote_todos if todo.get("openspec_ref") in openspec_refs
+        ]
+        todo_evidence = [*doc_todos, *openspec_todos]
+        openspec_tasks_complete = not openspec_refs or openspec_refs.issubset(
+            {str(todo.get("openspec_ref")) for todo in openspec_todos}
+        )
+        combined[group.work_id]["todo_tasks_complete"] = bool(todo_evidence) and all(
+            todo["complete"] is True for todo in todo_evidence
+        ) and openspec_tasks_complete
     return {
         work_id: ClosureEvidence(
             **{name: facts.get(name, False) for name in fields}

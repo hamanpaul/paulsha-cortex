@@ -158,6 +158,8 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
         confidence="confirmed",
         provider="github:example/acme",
     )
+    pull = _github_entity("github_pr", 9, "closed")
+    openspec = _remote_openspec_source("work")
     workflow = WorkSource(
         source_id="workflow_run:run-7",
         kind="workflow_run",
@@ -169,19 +171,21 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
     )
     gh = _provider(
         "github:example/acme",
-        (issue,),
+        (issue, pull),
     )
     terminal = _provider(
         "github-terminal:example/acme",
+        (openspec,),
         observations={
-            "closing_links": {issue.source_id: "work"},
-            "closure_by_work": {
-                "work": {
-                    "pr_merged_with_merge_commit": True,
-                    "remote_active_openspec_absent": True,
-                    "remote_archive_present": True,
+            "closing_links": {pull.source_id: issue.source_id},
+            "remote_prs": [
+                {
+                    "source_id": pull.source_id,
+                    "candidate": "a" * 40,
+                    "merge_revision": "b" * 40,
+                    "merged_with_merge_commit": True,
                 }
-            },
+            ],
             "remote_openspec": {"active": [], "archived": ["work"]},
             "remote_openspec_observed": True,
             "remote_todos": [
@@ -189,6 +193,12 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
                     "work_id": "work",
                     "path": "docs/superpowers/workstreams/work/todo.md",
                     "revision": "c" * 40,
+                    "complete": True,
+                },
+                {
+                    "openspec_ref": "work",
+                    "path": "openspec/changes/archive/2026-07-17-work/tasks.md",
+                    "revision": "d" * 40,
                     "complete": True,
                 }
             ],
@@ -198,7 +208,12 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
         "workflow:example/acme",
         (workflow,),
         observations={
-            "workflow_links": {workflow.source_id: "work"},
+            "workflow_links": {
+                workflow.source_id: "work",
+                issue.source_id: "work",
+                pull.source_id: "work",
+                openspec.source_id: "work",
+            },
             "closure_by_work": {"work": {"completion_record_valid": True}},
         },
     )
@@ -221,6 +236,11 @@ def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
         "workflow:example/acme",
         (),
         observations={
+            "workflow_links": {
+                issue.source_id: "work",
+                pull.source_id: "work",
+                openspec.source_id: "work",
+            },
             "closure_by_work": {"work": {"completion_record_valid": True}},
         },
     )
@@ -346,6 +366,187 @@ def test_production_fuzzy_title_and_artifact_slug_group_for_display_only(tmp_pat
         ("display-work", 2)
     ]
     assert items[0]["next_actions"] == []
+
+
+def _remote_openspec_source(ref: str, *, status: str = "archived") -> WorkSource:
+    return WorkSource(
+        source_id=f"github_openspec:example/acme:{ref}:{status}",
+        kind="openspec",
+        ref=ref,
+        revision="github-tree:" + "d" * 40,
+        status=status,
+        confidence="confirmed",
+        provider="github-terminal:example/acme",
+    )
+
+
+def _github_entity(kind: str, number: int, status: str) -> WorkSource:
+    return WorkSource(
+        source_id=f"{kind}:example/acme#{number}",
+        kind=kind,
+        ref=f"example/acme#{number}",
+        revision=f"github:{number}",
+        status=status,
+        confidence="confirmed",
+        provider="github:example/acme",
+    )
+
+
+def _closure_terminal(*, openspec_refs, prs, active=()):
+    sources = tuple(_remote_openspec_source(ref) for ref in openspec_refs)
+    return _provider(
+        "github-terminal:example/acme",
+        sources,
+        observations={
+            "closing_links": {
+                f"github_pr:example/acme#{number}": "github_issue:example/acme#7"
+                for number, _ in prs
+            },
+            "remote_prs": [
+                {
+                    "source_id": f"github_pr:example/acme#{number}",
+                    "candidate": chr(96 + index) * 40,
+                    "merge_revision": chr(96 + index) * 40,
+                    "merged_with_merge_commit": merged,
+                }
+                for index, (number, merged) in enumerate(prs, 1)
+            ],
+            "remote_openspec": {
+                "active": list(active),
+                "archived": list(openspec_refs),
+            },
+            "remote_openspec_observed": True,
+            "remote_todos": [
+                {
+                    "openspec_ref": ref,
+                    "path": f"openspec/changes/archive/2026-07-17-{ref}/tasks.md",
+                    "revision": "c" * 40,
+                    "complete": True,
+                }
+                for ref in openspec_refs
+            ],
+        },
+    )
+
+
+def _run_closure_projection(tmp_path, *, override_text, github_sources, terminal):
+    repo = tmp_path / "repo"
+    override = repo / ".cortex/work-items.yaml"
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(override_text, encoding="utf-8")
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github:example/acme", github_sources)
+        ),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(terminal),
+        workflow_provider_factory=lambda _repo: _StaticProvider(
+            _provider(
+                "workflow:example/acme",
+                observations={
+                    "closure_by_work": {"umbrella": {"completion_record_valid": True}}
+                },
+            )
+        ),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+    refresher.refresh((project,), include_github=True)
+    return store, refresher, project
+
+
+def test_openspec_only_archived_tasks_can_complete_without_todo_md(tmp_path):
+    override = """version: 1
+work_items:
+  umbrella:
+    title: Canary
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_pr
+        ref: example/acme#9
+      - kind: openspec
+        ref: canary
+    excludes: []
+"""
+    github = (_github_entity("github_issue", 7, "closed"), _github_entity("github_pr", 9, "closed"))
+    terminal = _closure_terminal(openspec_refs=("canary",), prs=((9, True),))
+
+    store, _, _ = _run_closure_projection(
+        tmp_path, override_text=override, github_sources=github, terminal=terminal
+    )
+
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] == "done"
+
+
+def test_all_confirmed_mapped_prs_must_be_terminal_merge_commits(tmp_path):
+    override = """version: 1
+work_items:
+  umbrella:
+    title: Multi PR
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_pr
+        ref: example/acme#9
+      - kind: github_pr
+        ref: example/acme#10
+      - kind: openspec
+        ref: canary
+    excludes: []
+"""
+    github = (
+        _github_entity("github_issue", 7, "closed"),
+        _github_entity("github_pr", 9, "closed"),
+        _github_entity("github_pr", 10, "open"),
+    )
+    terminal = _closure_terminal(
+        openspec_refs=("canary",), prs=((9, True), (10, False))
+    )
+
+    store, _, _ = _run_closure_projection(
+        tmp_path, override_text=override, github_sources=github, terminal=terminal
+    )
+
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] != "done"
+
+
+def test_openspec_closure_uses_all_mapped_refs_not_work_id_slug(tmp_path):
+    override = """version: 1
+work_items:
+  umbrella:
+    title: Different Slugs
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: github_pr
+        ref: example/acme#9
+      - kind: openspec
+        ref: change-a
+      - kind: openspec
+        ref: change-b
+    excludes: []
+"""
+    github = (_github_entity("github_issue", 7, "closed"), _github_entity("github_pr", 9, "closed"))
+    terminal = _closure_terminal(
+        openspec_refs=("change-a", "change-b"), prs=((9, True),)
+    )
+    store, refresher, project = _run_closure_projection(
+        tmp_path, override_text=override, github_sources=github, terminal=terminal
+    )
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] == "done"
+
+    refresher.github_terminal_provider_factory = lambda _repo: _StaticProvider(
+        _closure_terminal(
+            openspec_refs=("change-a", "change-b"),
+            prs=((9, True),),
+            active=("change-b",),
+        )
+    )
+    refresher.refresh((project,), include_github=True)
+    assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] != "done"
 
 
 def test_stale_github_snapshot_freezes_state_and_closes_automation_gates(tmp_path):

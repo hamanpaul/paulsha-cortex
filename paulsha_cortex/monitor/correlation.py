@@ -240,8 +240,8 @@ def correlate_work_sources(
                 {"authority": "frontmatter", "source_id": source.source_id}
             )
     for authority, mapping in (
-        ("github_closing", closing_links or {}),
         ("workflow_metadata", workflow_links or {}),
+        ("github_closing", closing_links or {}),
     ):
         for source_id, work_id in mapping.items():
             if source_id not in candidates or not isinstance(work_id, str):

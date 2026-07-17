@@ -210,7 +210,7 @@ def test_github_provider_malformed_json_is_degraded():
     assert any("JSON" in item for item in result.diagnostics)
 
 
-def test_workflow_registry_provider_emits_authoritative_link_and_completion(monkeypatch, tmp_path):
+def test_workflow_registry_existing_completion_schema_remains_not_valid(monkeypatch, tmp_path):
     state = tmp_path / "workflows.json"
     record = tmp_path / "evidence/completion/record.json"
     record.parent.mkdir(parents=True)
@@ -239,6 +239,9 @@ def test_workflow_registry_provider_emits_authoritative_link_and_completion(monk
                         "completion_record_path": str(record),
                         "completion_record_hash": "b" * 64,
                         "completion_record_revision": "a" * 40,
+                        "source_revisions": {"github_pr:example/acme#9": "p" * 40},
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "d" * 40,
                     },
                     {
                         "run_id": "foreign",
@@ -258,8 +261,54 @@ def test_workflow_registry_provider_emits_authoritative_link_and_completion(monk
     assert [source.ref for source in result.sources] == ["run-7"]
     source_id = result.sources[0].source_id
     assert result.observations["workflow_links"] == {source_id: "work"}
-    assert result.observations["closure_by_work"]["work"]["completion_record_valid"]
+    assert result.observations["closure_by_work"] == {}
     assert calls == [(str(record), "b" * 64)]
+
+
+def test_workflow_registry_rejects_cross_work_completion_replay(monkeypatch, tmp_path):
+    state = tmp_path / "workflows.json"
+    record = tmp_path / "evidence/completion/record.json"
+    record.parent.mkdir(parents=True)
+    record.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.completion.read_completion_record",
+        lambda *_args, **_kwargs: {
+            "candidate": "a" * 40,
+            "work_id": "other-work",
+            "run_id": "run-7",
+            "source_revisions": {"github_pr:example/acme#9": "p" * 40},
+            "merge_revision": "d" * 40,
+        },
+    )
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 8,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-7",
+                        "repo": "example/acme",
+                        "work_id": "work",
+                        "status": "review",
+                        "completion_record_path": str(record),
+                        "completion_record_hash": "b" * 64,
+                        "completion_record_revision": "a" * 40,
+                        "source_revisions": {"github_pr:example/acme#9": "p" * 40},
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "d" * 40,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert result.observations["closure_by_work"] == {}
 
 
 def test_workflow_registry_unknown_schema_and_root_keys_are_degraded(tmp_path):
@@ -346,6 +395,9 @@ def test_workflow_registry_rejects_completion_record_outside_safe_root(tmp_path)
                         "completion_record_path": str(record),
                         "completion_record_hash": "b" * 64,
                         "completion_record_revision": "a" * 40,
+                        "source_revisions": {"github_pr:example/acme#9": "p" * 40},
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "d" * 40,
                     }
                 ],
             }
@@ -369,6 +421,7 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
                         {
                             "number": 9,
                             "body": "work_item: work\n",
+                            "headRefOid": "e" * 40,
                             "state": "MERGED",
                             "mergedAt": "2026-07-17T10:00:00Z",
                             "mergeCommit": {
@@ -399,12 +452,19 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
 
     assert result.status == "ok"
     assert result.observations["closing_links"] == {
-        "github_pr:example/acme#9": "work",
-        "github_issue:example/acme#7": "work",
+        "github_pr:example/acme#9": "github_issue:example/acme#7",
     }
-    assert result.observations["closure_by_work"]["work"] == {
-        "pr_merged_with_merge_commit": True,
-    }
+    assert result.observations["remote_prs"] == [
+        {
+            "source_id": "github_pr:example/acme#9",
+            "candidate": "e" * 40,
+            "merge_revision": "a" * 40,
+            "merged_with_merge_commit": True,
+        }
+    ]
+    assert [(source.ref, source.status) for source in result.sources] == [
+        ("work", "archived")
+    ]
     assert result.observations["remote_openspec"] == {
         "active": [],
         "archived": ["work"],
@@ -443,9 +503,7 @@ def test_github_terminal_squash_merge_is_not_a_merge_commit():
     result = GitHubTerminalProvider("example/acme", runner=runner).scan()
 
     assert result.status == "ok"
-    assert not result.observations["closure_by_work"]["work"][
-        "pr_merged_with_merge_commit"
-    ]
+    assert not result.observations["remote_prs"][0]["merged_with_merge_commit"]
 
 
 def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
@@ -482,9 +540,7 @@ def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
 
     result = GitHubTerminalProvider("example/acme", runner=runner).scan()
 
-    assert not result.observations["closure_by_work"]["work"][
-        "pr_merged_with_merge_commit"
-    ]
+    assert not result.observations["remote_prs"][0]["merged_with_merge_commit"]
 
 
 def test_github_terminal_truncated_tree_is_degraded():
@@ -549,3 +605,77 @@ def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
             "complete": True,
         }
     ]
+
+
+def test_remote_archived_openspec_tasks_are_todo_completion_evidence():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            }
+        }
+    }
+    task_path = "openspec/changes/archive/2026-07-17-canary/tasks.md"
+    tree = {
+        "truncated": False,
+        "tree": [{"path": task_path, "type": "blob", "sha": "c" * 40}],
+    }
+    blob = {
+        "encoding": "base64",
+        "content": base64.b64encode(b"- [x] task one\n- [x] task two\n").decode(),
+        "sha": "c" * 40,
+    }
+    runner = SequenceRunner([_completed(graph), _completed(tree), _completed(blob)])
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "ok"
+    assert result.observations["remote_todos"] == [
+        {
+            "openspec_ref": "canary",
+            "path": task_path,
+            "revision": "c" * 40,
+            "complete": True,
+        }
+    ]
+    assert [(source.ref, source.status) for source in result.sources] == [
+        ("canary", "archived")
+    ]
+
+
+def test_pr_body_work_item_is_not_confirmed_authority():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "number": 9,
+                            "body": "work_item: evil\n",
+                            "headRefName": "feature/7-work",
+                            "state": "OPEN",
+                            "mergedAt": None,
+                            "mergeCommit": None,
+                            "closingIssuesReferences": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"number": 7, "state": "OPEN"}],
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    runner = SequenceRunner(
+        [_completed(graph), _completed({"truncated": False, "tree": []})]
+    )
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.observations["closing_links"] == {
+        "github_pr:example/acme#9": "github_issue:example/acme#7"
+    }
+    assert "evil" not in json.dumps(result.observations["closing_links"])
