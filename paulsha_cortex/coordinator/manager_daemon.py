@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
-from . import autonomy, manager
+from . import autonomy, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
 from .registry import JobRegistry
@@ -269,6 +269,7 @@ def build_request_executor(
     workflow_primary_questioner=None,
     workflow_secondary_planner=None,
     workflow_primary_integrator=None,
+    workflow_runtime_factory=None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -302,6 +303,7 @@ def build_request_executor(
                 primary_questioner=workflow_primary_questioner,
                 secondary_planner=workflow_secondary_planner,
                 primary_integrator=workflow_primary_integrator,
+                runtime_factory=workflow_runtime_factory,
             )
         if request["type"] == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
@@ -583,6 +585,7 @@ def run_loop(
             "launcher": launcher,
             "default_executor": resolved_default_executor,
             "reaper": reaper,
+            "workflow_runtime_factory": planning_runtime.build_production_planning_runtime,
         }
         if default_model is not None:
             executor_kwargs["default_model"] = default_model

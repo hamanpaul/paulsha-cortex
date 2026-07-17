@@ -636,7 +636,11 @@ def run_heterogeneous_brainstorm(
     if selection.state != "ready" or selection.identity is None:
         return BrainstormResult("needs_human", selection.reason, None, empty_refs, None)
     try:
-        pack = validate_question_pack(primary_questioner(report.to_dict()), report=report)
+        questioner_input = {
+            **report.to_dict(),
+            "default_question_pack": report.default_question_pack.to_dict(),
+        }
+        pack = validate_question_pack(primary_questioner(questioner_input), report=report)
     except Exception:
         return BrainstormResult("needs_human", "question-pack-malformed", None, empty_refs, None)
     try:
@@ -715,7 +719,11 @@ def run_heterogeneous_brainstorm(
             None,
         )
     refs = PlanningGateRefs(
-        brainstorm_peer=GateEvidenceRef(kind="brainstorm", ref=str(evidence_path))
+        brainstorm_peer=GateEvidenceRef(
+            kind="brainstorm",
+            ref=str(evidence_path),
+            sha256=hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+        )
     )
     return BrainstormResult(
         "ready",

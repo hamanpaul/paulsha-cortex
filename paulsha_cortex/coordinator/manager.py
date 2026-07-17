@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from .planning import (
     assess_planning_completeness,
     run_heterogeneous_brainstorm,
 )
-from .workflow import GateEvidenceRef, WorkflowManifest
+from .workflow import GateEvidenceRef, WorkflowManifest, validate_workflow_phase_transition
 
 IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
@@ -1787,6 +1788,153 @@ def _load_planning_artifacts(args: Mapping[str, object]) -> tuple[PlanningArtifa
     return tuple(artifacts)
 
 
+def _audit_phase_steps(
+    steps,
+    *,
+    phase: str,
+    executor: str,
+    model: str,
+    domain: str,
+    outputs: tuple[str, ...],
+    gate_result: str = "passed",
+):
+    from .workflow import WorkflowStep
+
+    return tuple(
+        WorkflowStep(
+            phase=step.phase,
+            persona=step.persona,
+            card=step.card,
+            executor=executor if step.phase == phase else step.executor,
+            model=model if step.phase == phase else step.model,
+            domain=domain if step.phase == phase else step.domain,
+            inputs=step.inputs,
+            outputs=outputs if step.phase == phase else step.outputs,
+            gate_result=gate_result if step.phase == phase else step.gate_result,
+        )
+        for step in steps
+    )
+
+
+def _evidence_path(root: Path, ref: str) -> Path:
+    unresolved = Path(ref)
+    if not unresolved.is_absolute():
+        unresolved = root / unresolved
+    if unresolved.is_symlink():
+        raise ValueError("workflow evidence symlink rejected")
+    resolved = unresolved.resolve()
+    resolved.relative_to(root)
+    if not resolved.is_file():
+        raise ValueError("workflow evidence missing")
+    return resolved
+
+
+def _read_hashed_json(root: Path, locator: Mapping[str, object]) -> tuple[dict[str, object], str, str]:
+    ref = locator.get("ref")
+    expected_hash = locator.get("sha256")
+    if not isinstance(ref, str) or not ref or not isinstance(expected_hash, str):
+        raise ValueError("workflow evidence locator requires ref/sha256")
+    try:
+        path = _evidence_path(root, ref)
+        content = path.read_bytes()
+    except (OSError, ValueError) as exc:
+        raise ValueError("workflow evidence locator invalid") from exc
+    actual_hash = hashlib.sha256(content).hexdigest()
+    if actual_hash != expected_hash:
+        raise ValueError("workflow evidence sha256 mismatch")
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow evidence JSON invalid") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("workflow evidence schema invalid")
+    return payload, str(path), actual_hash
+
+
+def _validate_phase_evidence(
+    *,
+    args: Mapping[str, object],
+    run,
+) -> tuple[dict[str, object], str, str]:
+    root = Path(_required_workflow_string(args, "evidence_root")).resolve()
+    locator = args.get("phase_evidence")
+    if not isinstance(locator, dict):
+        raise ValueError("workflow advance requires phase_evidence")
+    payload, path, digest = _read_hashed_json(root, locator)
+    required = {
+        "schema_version", "kind", "status", "work_id", "phase", "persona",
+        "executor", "model", "independence_domain", "candidate_head", "outputs",
+    }
+    if not required.issubset(payload) or payload.get("schema_version") != 1:
+        raise ValueError("workflow phase evidence schema invalid")
+    if payload.get("status") != "passed" or payload.get("work_id") != run.work_id:
+        raise ValueError("workflow phase evidence identity/status invalid")
+    if payload.get("phase") != run.current_phase:
+        raise ValueError("workflow phase evidence phase mismatch")
+    expected_persona = next(step.persona for step in run.steps if step.phase == run.current_phase)
+    if payload.get("persona") != expected_persona:
+        raise ValueError("workflow phase evidence persona mismatch")
+    for field in ("executor", "model", "independence_domain"):
+        if not isinstance(payload.get(field), str) or not payload[field]:
+            raise ValueError(f"workflow phase evidence {field} invalid")
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list) or any(not isinstance(item, str) or not item for item in outputs):
+        raise ValueError("workflow phase evidence outputs invalid")
+    expected_kind = {
+        "plan": "phase-gate",
+        "build": "phase-gate",
+        "verify": "verification",
+        "review": "foreign-review",
+    }.get(run.current_phase)
+    if payload.get("kind") != expected_kind:
+        raise ValueError("workflow phase evidence kind mismatch")
+    candidate = payload.get("candidate_head")
+    if run.current_phase in {"build", "verify", "review"}:
+        if not isinstance(candidate, str) or len(candidate) != 40 or any(
+            char not in "0123456789abcdef" for char in candidate
+        ):
+            raise ValueError("workflow phase evidence candidate invalid")
+    if run.current_phase in {"verify", "review"} and candidate != run.candidate_head:
+        raise ValueError("workflow phase evidence candidate mismatch")
+    builder_domains = {
+        step.domain for step in run.steps if step.phase == "build" and step.domain is not None
+    }
+    if run.current_phase in {"verify", "review"} and payload["independence_domain"] in builder_domains:
+        raise ValueError("workflow reviewer must use a foreign independence domain")
+    return payload, path, digest
+
+
+def _validate_copilot_evidence(
+    *, args: Mapping[str, object], run
+) -> GateEvidenceRef:
+    root = Path(_required_workflow_string(args, "evidence_root")).resolve()
+    locators = args.get("gate_refs")
+    if not isinstance(locators, list):
+        raise ValueError("workflow ship requires gate_refs")
+    copilot_locator = next(
+        (item for item in locators if isinstance(item, dict) and item.get("kind") == "copilot"),
+        None,
+    )
+    if not isinstance(copilot_locator, dict):
+        raise ValueError("workflow ship requires copilot evidence")
+    payload, path, digest = _read_hashed_json(root, copilot_locator)
+    if set(payload) != {
+        "schema_version", "kind", "status", "work_id", "phase", "head", "commit_id"
+    }:
+        raise ValueError("copilot evidence schema invalid")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("kind") != "copilot"
+        or payload.get("status") != "passed"
+        or payload.get("work_id") != run.work_id
+        or payload.get("phase") != "ship"
+        or payload.get("head") != run.candidate_head
+        or payload.get("commit_id") != run.candidate_head
+    ):
+        raise ValueError("copilot evidence is not current exact-HEAD passed review")
+    return GateEvidenceRef("copilot", path, digest)
+
+
 def apply_workflow_action(
     registry,
     *,
@@ -1796,6 +1944,7 @@ def apply_workflow_action(
     primary_questioner: Callable[[Mapping[str, object]], object] | None = None,
     secondary_planner: Callable[[Mapping[str, object], object], object] | None = None,
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object] | None = None,
+    runtime_factory: Callable[..., object] | None = None,
 ) -> dict[str, object]:
     """Apply the sole production mutation API for Manager-owned workflows.
 
@@ -1808,22 +1957,41 @@ def apply_workflow_action(
     if action == "advance":
         run_id = _required_workflow_string(args, "run_id")
         phase = _required_workflow_string(args, "current_phase")
-        raw_refs = args.get("gate_refs", [])
-        if not isinstance(raw_refs, list):
-            raise ValueError("workflow-action gate_refs must be a list")
-        additions = tuple(GateEvidenceRef.from_dict(item) for item in raw_refs)
         current = registry.get_workflow_run(run_id)
+        validate_workflow_phase_transition(current.current_phase, phase)
+        evidence, evidence_path, evidence_hash = _validate_phase_evidence(args=args, run=current)
         by_kind = {item.kind: item for item in current.gate_refs}
-        for item in additions:
-            existing = by_kind.get(item.kind)
-            if existing is not None and existing != item:
-                raise ValueError(f"workflow gate evidence already fixed: {item.kind}")
-            by_kind[item.kind] = item
+        if current.current_phase == "review":
+            foreign = GateEvidenceRef("foreign-review", evidence_path, evidence_hash)
+            by_kind[foreign.kind] = foreign
+            copilot = _validate_copilot_evidence(args=args, run=current)
+            by_kind[copilot.kind] = copilot
+            if args.get("gate_status") != "passed":
+                raise ValueError("workflow ship requires passed gate_status")
+        elif args.get("gate_refs"):
+            raise ValueError("gate_refs may only be supplied by review-to-ship transition")
+        updated_steps = _audit_phase_steps(
+            current.steps,
+            phase=current.current_phase,
+            executor=str(evidence["executor"]),
+            model=str(evidence["model"]),
+            domain=str(evidence["independence_domain"]),
+            outputs=tuple(evidence["outputs"]),
+        )
+        candidate = current.candidate_head
+        verified = current.verified_head
+        if current.current_phase == "build":
+            candidate = str(evidence["candidate_head"])
+        if current.current_phase == "verify":
+            verified = str(evidence["candidate_head"])
         updated = registry._manager_update_workflow_run(
             run_id,
             current_phase=phase,
+            steps=updated_steps,
             gate_refs=tuple(by_kind[kind] for kind in ("brainstorm", "foreign-review", "copilot") if kind in by_kind),
             gate_status=args.get("gate_status") if isinstance(args.get("gate_status"), str) else None,
+            candidate_head=candidate,
+            verified_head=verified,
         )
         return {"run_id": updated.run_id, "current_phase": updated.current_phase}
     if action != "start":
@@ -1837,11 +2005,18 @@ def apply_workflow_action(
         claim_key=_required_workflow_string(args, "claim_key"),
         combo=manifest.combo,
         current_phase="claim",
-        steps=manifest.steps,
         issue_refs=tuple(args.get("issue_refs", ())),
         openspec_refs=tuple(args.get("openspec_refs", ())),
         pr_refs=tuple(args.get("pr_refs", ())),
         attempts={"claim": 1},
+        steps=_audit_phase_steps(
+            manifest.steps,
+            phase="claim",
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            outputs=(),
+        ),
         gate_status="running",
     )
     if run.current_phase != "claim":
@@ -1854,15 +2029,57 @@ def apply_workflow_action(
     artifacts = _load_planning_artifacts(args)
     report = assess_planning_completeness(artifacts)
     if report.complete:
+        primary_executor = str(args.get("primary_executor") or "cortex-manager")
+        primary_model = str(args.get("primary_model") or "deterministic")
+        primary_domain = str(args.get("primary_domain") or "cortex")
         run = registry._manager_update_workflow_run(
             run.run_id,
             current_phase="plan",
             attempts={**run.attempts, "plan": 1},
+            steps=_audit_phase_steps(
+                run.steps,
+                phase="define",
+                executor=primary_executor,
+                model=primary_model,
+                domain=primary_domain,
+                outputs=tuple(artifact.ref for artifact in artifacts),
+            ),
+            brainstorm_required=False,
+            primary_domain=primary_domain,
         )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "planning-complete"}
 
+    primary = (
+        _required_workflow_string(args, "primary_executor"),
+        _required_workflow_string(args, "primary_model"),
+    )
+    if (
+        runtime_factory is not None
+        and (primary_questioner is None or secondary_planner is None or primary_integrator is None)
+    ):
+        try:
+            runtime = runtime_factory(
+                primary=primary,
+                worktree=_required_workflow_string(args, "artifact_root"),
+            )
+        except Exception:
+            run = registry._manager_update_workflow_run(
+                run.run_id, facets=("needs_human",), brainstorm_required=True
+            )
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "planning-runtime-initialization-failed",
+            }
+        identity_registry = runtime.identity_registry
+        probes = runtime.probes
+        primary_questioner = runtime.primary_questioner
+        secondary_planner = runtime.secondary_planner
+        primary_integrator = runtime.primary_integrator
     if primary_questioner is None or secondary_planner is None or primary_integrator is None:
-        run = registry._manager_update_workflow_run(run.run_id, facets=("needs_human",))
+        run = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), brainstorm_required=True
+        )
         return {
             "run_id": run.run_id,
             "current_phase": run.current_phase,
@@ -1870,10 +2087,6 @@ def apply_workflow_action(
         }
 
     identities = identity_registry or load_model_identities()
-    primary = (
-        _required_workflow_string(args, "primary_executor"),
-        _required_workflow_string(args, "primary_model"),
-    )
     result = run_heterogeneous_brainstorm(
         report=report,
         primary=primary,
@@ -1891,13 +2104,31 @@ def apply_workflow_action(
         primary_integrator=primary_integrator,
     )
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
-        run = registry._manager_update_workflow_run(run.run_id, facets=("needs_human",))
+        run = registry._manager_update_workflow_run(
+            run.run_id, facets=("needs_human",), brainstorm_required=True
+        )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
     run = registry._manager_update_workflow_run(
         run.run_id,
         current_phase="plan",
         attempts={**run.attempts, "plan": 1},
         gate_refs=result.gate_refs.as_tuple(),
+        brainstorm_required=True,
+        primary_domain=identities.require(*primary).independence_domain,
+        steps=_audit_phase_steps(
+            run.steps,
+            phase="define",
+            executor=primary[0],
+            model=primary[1],
+            domain=identities.require(*primary).independence_domain,
+            outputs=tuple(
+                ref
+                for resolution in (result.integration or {}).get("resolutions", [])
+                if isinstance(resolution, dict)
+                for ref in resolution.get("artifact_refs", [])
+                if isinstance(ref, str)
+            ),
+        ),
         facets=(),
     )
     return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "brainstorm-complete"}

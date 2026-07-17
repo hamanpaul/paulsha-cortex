@@ -1938,13 +1938,17 @@ def test_run_loop_default_builders_receive_injected_dispatcher_and_registry(monk
     request = _write_request("20260703T090005Z-99999999999999999999999999999999")
     seen: dict[str, object] = {}
 
-    def fake_build_request_executor(*, dispatcher, specs_dir, handoff_dir, launcher, default_executor, reaper):
+    def fake_build_request_executor(
+        *, dispatcher, specs_dir, handoff_dir, launcher, default_executor, reaper,
+        workflow_runtime_factory,
+    ):
         seen["request_dispatcher"] = dispatcher
         seen["request_specs_dir"] = specs_dir
         seen["request_handoff_dir"] = handoff_dir
         seen["request_launcher"] = launcher
         seen["request_default_executor"] = default_executor
         seen["request_reaper"] = reaper
+        seen["workflow_runtime_factory"] = workflow_runtime_factory
         return lambda req: {"dispatched": [req["req_id"]], "completed": [], "errors": [], "reaped": None}
 
     def fake_build_runtime_status_provider(*, registry, specs_dir, handoff_dir, git_runner=None):
@@ -1987,6 +1991,7 @@ def test_run_loop_default_builders_receive_injected_dispatcher_and_registry(monk
     assert seen["request_specs_dir"] == str(home / ".agents" / "specs")
     assert seen["request_default_executor"] == manager_daemon.DEFAULT_EXECUTOR
     assert seen["request_reaper"] is None
+    assert seen["workflow_runtime_factory"] is manager_daemon.planning_runtime.build_production_planning_runtime
     assert seen["status_registry"] is registry
     assert seen["status_specs_dir"] == str(home / ".agents" / "specs")
     assert seen["periodic_dispatcher"] is dispatcher

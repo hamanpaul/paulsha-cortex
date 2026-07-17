@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Mapping
+
+from .launcher import build_agy_argv, build_claude_argv, build_codex_argv, build_copilot_argv
+from .model_identities import (
+    AGY_MODEL_ID,
+    CapabilityProbe,
+    IdentityRegistry,
+    ModelIdentity,
+    load_model_identities,
+    probe_agy_capability,
+)
+
+
+@dataclass(frozen=True)
+class ProductionPlanningRuntime:
+    identity_registry: IdentityRegistry
+    probes: Mapping[tuple[str, str], CapabilityProbe]
+    primary_questioner: Callable[[Mapping[str, object]], object]
+    secondary_planner: Callable[[Mapping[str, object], ModelIdentity], object]
+    primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object]
+
+
+_BUILDERS = {
+    "agy": build_agy_argv,
+    "claude": build_claude_argv,
+    "codex": build_codex_argv,
+    "copilot": build_copilot_argv,
+}
+
+
+def _extract_json(stdout: str, output_path: Path) -> object:
+    candidates = [stdout.strip()]
+    if output_path.is_file():
+        candidates.insert(0, output_path.read_text(encoding="utf-8").strip())
+    candidates.extend(reversed([line.strip() for line in stdout.splitlines() if line.strip()]))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            for key in ("result", "content", "message", "text"):
+                nested = value.get(key)
+                if isinstance(nested, str):
+                    try:
+                        return json.loads(nested)
+                    except json.JSONDecodeError:
+                        pass
+            return value
+    raise ValueError("planning launcher returned no JSON object")
+
+
+def _invoke_json(
+    identity: ModelIdentity,
+    prompt: str,
+    *,
+    worktree: Path,
+    runner: Callable[..., object],
+    timeout_seconds: int,
+) -> object:
+    builder = _BUILDERS.get(identity.executor)
+    if builder is None:
+        raise ValueError(f"unsupported safe planning executor: {identity.executor}")
+    with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
+        output_path = Path(temp_dir) / "last.json"
+        argv = builder(
+            prompt=prompt,
+            slice_id="cortex-planning-runtime",
+            log_dir=temp_dir,
+            worktree=str(worktree),
+            allow_unsafe=False,
+            model=identity.model_id,
+        )
+        raw = runner(
+            argv,
+            cwd=str(worktree),
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        returncode = getattr(raw, "returncode", None)
+        stdout = getattr(raw, "stdout", None)
+        if returncode != 0 or not isinstance(stdout, str):
+            raise ValueError(f"planning launcher failed: {identity.executor}/{identity.model_id}")
+        return _extract_json(stdout, output_path)
+
+
+def _probe_identity(
+    identity: ModelIdentity,
+    *,
+    worktree: Path,
+    runner: Callable[..., object],
+    timeout_seconds: int,
+) -> CapabilityProbe:
+    expected = {
+        "capability": "cortex-planning-json",
+        "executor": identity.executor,
+        "model": identity.model_id,
+    }
+    prompt = "Return only this JSON object and do not call tools: " + json.dumps(
+        expected, ensure_ascii=False, separators=(",", ":")
+    )
+    try:
+        value = _invoke_json(
+            identity,
+            prompt,
+            worktree=worktree,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        return CapabilityProbe(
+            False,
+            identity.executor,
+            identity.model_id,
+            identity.independence_domain,
+            "safe-probe-failed",
+            type(exc).__name__,
+        )
+    if value != expected:
+        return CapabilityProbe(
+            False,
+            identity.executor,
+            identity.model_id,
+            identity.independence_domain,
+            "identity-mismatch",
+        )
+    return CapabilityProbe.ready_for(
+        identity.executor, identity.model_id, identity.independence_domain
+    )
+
+
+def build_production_planning_runtime(
+    *,
+    primary: tuple[str, str],
+    worktree: str | Path,
+    runner: Callable[..., object] = subprocess.run,
+    timeout_seconds: int = 120,
+) -> ProductionPlanningRuntime:
+    """Build the daemon's real, safe, heterogeneous planning adapters."""
+
+    root = Path(worktree).resolve()
+    registry = load_model_identities()
+    probes: dict[tuple[str, str], CapabilityProbe] = {}
+    for identity in registry.identities:
+        if "planning" not in identity.capabilities:
+            continue
+        if identity.executor == "agy" and identity.model_id == AGY_MODEL_ID:
+            probes[(identity.executor, identity.model_id)] = probe_agy_capability(
+                runner=runner, timeout_seconds=min(timeout_seconds, 45)
+            )
+        else:
+            probes[(identity.executor, identity.model_id)] = _probe_identity(
+                identity,
+                worktree=root,
+                runner=runner,
+                timeout_seconds=timeout_seconds,
+            )
+
+    primary_identity = registry.get(*primary)
+
+    def invoke_primary(prompt: str) -> object:
+        if primary_identity is None:
+            raise ValueError("primary planning identity is not configured")
+        return _invoke_json(
+            primary_identity,
+            prompt,
+            worktree=root,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def questioner(report: Mapping[str, object]) -> object:
+        return invoke_primary(
+            "Return only the exact question-pack JSON required to resolve this completeness report: "
+            + json.dumps(report, ensure_ascii=False, sort_keys=True)
+        )
+
+    def secondary(pack: Mapping[str, object], identity: ModelIdentity) -> object:
+        return _invoke_json(
+            identity,
+            "Return only evidence JSON; do not make decisions or edit files. Question pack: "
+            + json.dumps(pack, ensure_ascii=False, sort_keys=True),
+            worktree=root,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def integrator(pack: Mapping[str, object], evidence: Mapping[str, object]) -> object:
+        return invoke_primary(
+            "Integrate evidence, update accepted planning artifacts in the sandboxed worktree, and return only integration JSON. "
+            + json.dumps({"question_pack": pack, "secondary_evidence": evidence}, ensure_ascii=False, sort_keys=True)
+        )
+
+    return ProductionPlanningRuntime(registry, probes, questioner, secondary, integrator)

@@ -95,21 +95,31 @@ class GateEvidenceRef:
 
     kind: str
     ref: str
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"brainstorm", "foreign-review", "copilot"}:
             raise ValueError(f"workflow gate evidence kind 非法: {self.kind!r}")
         if not isinstance(self.ref, str) or not self.ref.strip():
             raise ValueError("workflow gate evidence ref 必須為非空字串")
+        if self.sha256 is not None and (
+            not isinstance(self.sha256, str)
+            or len(self.sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.sha256)
+        ):
+            raise ValueError("workflow gate evidence sha256 格式錯誤")
 
     def to_dict(self) -> dict[str, str]:
-        return {"kind": self.kind, "ref": self.ref}
+        payload = {"kind": self.kind, "ref": self.ref}
+        if self.sha256 is not None:
+            payload["sha256"] = self.sha256
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> GateEvidenceRef:
-        if not isinstance(payload, dict) or set(payload) != {"kind", "ref"}:
+        if not isinstance(payload, dict) or not {"kind", "ref"}.issubset(payload) or set(payload) - {"kind", "ref", "sha256"}:
             raise ValueError("workflow gate evidence 格式錯誤")
-        return cls(kind=payload["kind"], ref=payload["ref"])
+        return cls(kind=payload["kind"], ref=payload["ref"], sha256=payload.get("sha256"))
 
 
 @dataclass(frozen=True)
@@ -139,6 +149,20 @@ class WorkflowManifest:
             raise ValueError("workflow manifest 必須由 claim phase 開始")
         if set(step.phase for step in self.steps) != set(WORKFLOW_PHASES):
             raise ValueError("workflow manifest 必須涵蓋完整 phase spine")
+        expected_persona = {
+            "claim": "manager",
+            "define": "planner",
+            "plan": "planner",
+            "build": "builder",
+            "verify": "reviewer",
+            "review": "reviewer",
+            "ship": "manager",
+        }
+        for step in self.steps:
+            if step.persona != expected_persona[step.phase]:
+                raise ValueError(
+                    f"workflow manifest {step.phase} phase 必須綁定 {expected_persona[step.phase]} persona"
+                )
         first_ship = next((index for index, step in enumerate(self.steps) if step.phase == "ship"), None)
         if first_ship is not None and not any(
             step.phase == "review" and step.persona == "reviewer"
@@ -186,6 +210,10 @@ class WorkflowRun:
     attempts: dict[str, int]
     evidence_refs: tuple[str, ...]
     gate_refs: tuple[GateEvidenceRef, ...]
+    brainstorm_required: bool
+    primary_domain: str | None
+    candidate_head: str | None
+    verified_head: str | None
     facets: tuple[str, ...]
     gate_status: str
     created_at: str
@@ -221,6 +249,15 @@ class WorkflowRun:
         gate_locators = [item.ref for item in self.gate_refs]
         if len(set(gate_kinds)) != len(gate_kinds) or len(set(gate_locators)) != len(gate_locators):
             raise ValueError("workflow gate evidence kinds and refs must be distinct")
+        if not isinstance(self.brainstorm_required, bool):
+            raise ValueError("workflow run brainstorm_required 必須為bool")
+        for field, value in (
+            ("primary_domain", self.primary_domain),
+            ("candidate_head", self.candidate_head),
+            ("verified_head", self.verified_head),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"workflow run {field} 必須為null或非空字串")
         if not isinstance(self.attempts, dict) or any(
             not isinstance(key, str) or not key or not isinstance(value, int) or value < 0
             for key, value in self.attempts.items()
@@ -235,11 +272,34 @@ class WorkflowRun:
         if self.gate_status not in WORKFLOW_GATE_STATUSES:
             raise ValueError(f"workflow run gate_status 非法: {self.gate_status!r}")
         if self.gate_status == "passed":
-            for required_kind in ("brainstorm", "foreign-review"):
+            required_kinds = ["foreign-review"]
+            if self.brainstorm_required:
+                required_kinds.insert(0, "brainstorm")
+            for required_kind in required_kinds:
                 if required_kind not in gate_kinds:
                     raise ValueError(f"workflow passed 缺少 {required_kind} gate evidence")
-        if self.current_phase == "ship" and "copilot" not in gate_kinds:
-            raise ValueError("workflow ship 缺少 copilot gate evidence")
+        if self.current_phase == "ship":
+            if self.gate_status != "passed":
+                raise ValueError("workflow ship gate_status 必須為passed")
+            for required_kind in ("foreign-review", "copilot"):
+                if required_kind not in gate_kinds:
+                    raise ValueError(f"workflow ship 缺少 {required_kind} gate evidence")
+            if self.candidate_head is None or self.verified_head != self.candidate_head:
+                raise ValueError("workflow ship 必須綁定已驗證的exact candidate HEAD")
+            for required_phase in ("verify", "review"):
+                phase_steps = [step for step in self.steps if step.phase == required_phase]
+                if not phase_steps or any(step.gate_result != "passed" for step in phase_steps):
+                    raise ValueError(f"workflow ship 前 {required_phase} steps 必須全部passed")
+            builder_domains = {
+                step.domain for step in self.steps if step.phase == "build" and step.domain is not None
+            }
+            reviewer_domains = {
+                step.domain
+                for step in self.steps
+                if step.phase in {"verify", "review"} and step.domain is not None
+            }
+            if not builder_domains or not reviewer_domains or builder_domains & reviewer_domains:
+                raise ValueError("workflow ship 前 reviewer 必須與builder independence domain分離")
         for field, value in (("created_at", self.created_at), ("updated_at", self.updated_at)):
             try:
                 datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -261,6 +321,10 @@ class WorkflowRun:
             "attempts": dict(self.attempts),
             "evidence_refs": list(self.evidence_refs),
             "gate_refs": [item.to_dict() for item in self.gate_refs],
+            "brainstorm_required": self.brainstorm_required,
+            "primary_domain": self.primary_domain,
+            "candidate_head": self.candidate_head,
+            "verified_head": self.verified_head,
             "facets": list(self.facets),
             "gate_status": self.gate_status,
             "created_at": self.created_at,
@@ -311,6 +375,10 @@ class WorkflowRun:
             attempts=payload["attempts"],
             evidence_refs=tuple(payload["evidence_refs"]),
             gate_refs=tuple(GateEvidenceRef.from_dict(item) for item in gate_refs),
+            brainstorm_required=payload.get("brainstorm_required", False),
+            primary_domain=payload.get("primary_domain"),
+            candidate_head=payload.get("candidate_head"),
+            verified_head=payload.get("verified_head"),
             facets=tuple(payload["facets"]),
             gate_status=payload["gate_status"],
             created_at=payload["created_at"],
