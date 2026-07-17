@@ -216,7 +216,7 @@ def test_monitor_live_probe_requires_connectable_unix_socket(tmp_path: Path) -> 
     )
     assert state.status == "pass"
     assert monitor_socket.status == "fail"
-    assert "API probe failed" in monitor_socket.detail
+    assert "monitor socket" in monitor_socket.detail
 
 
 def test_monitor_protocol_probe_rejects_transport_only_listener(tmp_path: Path, monkeypatch) -> None:
