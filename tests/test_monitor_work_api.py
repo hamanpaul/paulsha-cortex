@@ -237,6 +237,48 @@ def test_server_stopped_before_start_never_signals_ready(tmp_path):
     assert not server.wait_until_ready(timeout=0)
 
 
+def test_old_server_teardown_does_not_unlink_replacement_socket(tmp_path):
+    socket_path = tmp_path / "monitor.sock"
+    store = SnapshotStore(config=MonitorConfig(workspaces=()))
+    old_server = MonitorServer(store=store, socket_path=socket_path)
+    old_thread = threading.Thread(target=old_server.serve_forever, daemon=True)
+    old_thread.start()
+    assert old_server.wait_until_ready(timeout=2.0)
+
+    teardown_entered = threading.Event()
+    release_teardown = threading.Event()
+    original_teardown = old_server._teardown
+
+    def delayed_teardown(listener, *, unlink_socket, **kwargs):
+        teardown_entered.set()
+        assert release_teardown.wait(timeout=2.0)
+        original_teardown(listener, unlink_socket=unlink_socket, **kwargs)
+
+    replacement_server = MonitorServer(store=store, socket_path=socket_path)
+    replacement_thread = threading.Thread(
+        target=replacement_server.serve_forever,
+        daemon=True,
+    )
+    try:
+        with mock.patch.object(old_server, "_teardown", side_effect=delayed_teardown):
+            old_server.stop()
+            assert teardown_entered.wait(timeout=2.0)
+            replacement_thread.start()
+            assert replacement_server.wait_until_ready(timeout=2.0)
+            release_teardown.set()
+            old_thread.join(timeout=2.0)
+
+        assert socket_path.exists()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+    finally:
+        release_teardown.set()
+        replacement_server.stop()
+        replacement_thread.join(timeout=2.0)
+        old_server.stop()
+        old_thread.join(timeout=2.0)
+
+
 def test_work_subscription_extension_preserves_legacy_queue_full_replacement(tmp_path):
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),

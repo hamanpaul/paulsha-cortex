@@ -46,6 +46,8 @@ ACCEPT_TIMEOUT_SECONDS = 0.25
 SUBSCRIBE_QUEUE_GET_TIMEOUT = 0.25
 EVENT_QUEUE_MAXSIZE = 1024
 SOCKET_PROBE_TIMEOUT_SECONDS = 0.2
+_SOCKET_PATH_LOCK = threading.Lock()
+_SOCKET_OWNERS: dict[str, object] = {}
 
 
 class _Subscriber:
@@ -132,19 +134,30 @@ class MonitorServer:
         if self._stop_event.is_set():
             return
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
-        self._prepare_socket_path()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound = False
+        socket_identity: tuple[int, int, int] | None = None
+        owner_token: object | None = None
         try:
-            previous_umask = os.umask(0o177)
-            try:
-                listener.bind(str(self._socket_path))
-                bound = True
-            finally:
-                os.umask(previous_umask)
-            os.chmod(str(self._socket_path), 0o600)
-            listener.listen(16)
-            listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
+            with _SOCKET_PATH_LOCK:
+                self._prepare_socket_path()
+                previous_umask = os.umask(0o177)
+                try:
+                    listener.bind(str(self._socket_path))
+                    bound = True
+                finally:
+                    os.umask(previous_umask)
+                os.chmod(str(self._socket_path), 0o600)
+                listener.listen(16)
+                listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
+                path_stat = self._socket_path.lstat()
+                socket_identity = (
+                    path_stat.st_dev,
+                    path_stat.st_ino,
+                    path_stat.st_ctime_ns,
+                )
+                owner_token = object()
+                _SOCKET_OWNERS[str(self._socket_path)] = owner_token
             with self._lifecycle_lock:
                 self._listener = listener
                 if self._stop_event.is_set():
@@ -169,7 +182,12 @@ class MonitorServer:
                     ]
                     self._connection_threads.append(t)
         finally:
-            self._teardown(listener, unlink_socket=bound)
+            self._teardown(
+                listener,
+                unlink_socket=bound,
+                socket_identity=socket_identity,
+                owner_token=owner_token,
+            )
 
     def stop(self) -> None:
         with self._lifecycle_lock:
@@ -193,7 +211,14 @@ class MonitorServer:
         """Wait until the Unix socket is listening, not merely bound."""
         return self._ready_event.wait(timeout)
 
-    def _teardown(self, listener: socket.socket, *, unlink_socket: bool) -> None:
+    def _teardown(
+        self,
+        listener: socket.socket,
+        *,
+        unlink_socket: bool,
+        socket_identity: tuple[int, int, int] | None,
+        owner_token: object | None,
+    ) -> None:
         with self._lifecycle_lock:
             self._ready_event.clear()
             if self._listener is listener:
@@ -202,12 +227,25 @@ class MonitorServer:
             listener.close()
         except OSError:
             pass
-        if unlink_socket:
-            try:
-                if self._socket_path.exists():
-                    self._socket_path.unlink()
-            except OSError:
-                pass
+        if unlink_socket and socket_identity is not None and owner_token is not None:
+            with _SOCKET_PATH_LOCK:
+                owner_key = str(self._socket_path)
+                if _SOCKET_OWNERS.get(owner_key) is not owner_token:
+                    return
+                _SOCKET_OWNERS.pop(owner_key, None)
+                try:
+                    path_stat = self._socket_path.lstat()
+                    current_identity = (
+                        path_stat.st_dev,
+                        path_stat.st_ino,
+                        path_stat.st_ctime_ns,
+                    )
+                    if current_identity == socket_identity:
+                        self._socket_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
 
     # --- public publish surface ---
 
