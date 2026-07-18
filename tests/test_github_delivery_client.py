@@ -157,6 +157,29 @@ def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     assert all(call[1]["shell"] is False for call in runner.calls)
 
 
+def test_fetch_delivery_facts_uses_latest_legacy_status_per_context() -> None:
+    class StatusHistory(FakeRunner):
+        def __call__(self, argv, **kwargs):
+            if f"commits/{HEAD}/statuses" in " ".join(argv):
+                return Result(
+                    [[
+                        {"context": "legacy/lint", "state": "success"},
+                        {"context": "legacy/lint", "state": "failure"},
+                    ]]
+                )
+            return super().__call__(argv, **kwargs)
+
+    facts = GitHubDeliveryClient(runner=StatusHistory()).fetch_delivery_facts(
+        repo="acme/demo",
+        pr_number=7,
+        change="unified-work-lifecycle",
+    )
+
+    legacy_checks = tuple(check for check in facts.checks if check.name == "legacy/lint")
+    assert len(legacy_checks) == 1
+    assert legacy_checks[0].terminal_green
+
+
 def test_fetch_remote_closure_verifies_merge_ancestor_issues_and_archive() -> None:
     runner = FakeRunner()
     facts = GitHubDeliveryClient(runner=runner).fetch_remote_closure(

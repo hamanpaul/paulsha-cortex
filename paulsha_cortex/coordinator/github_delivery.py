@@ -463,6 +463,7 @@ class GitHubDeliveryClient:
             if not isinstance(page, list):
                 raise RuntimeError("GitHub commit statuses malformed")
             status_rows.extend(page)
+        seen_status_contexts: set[str] = set()
         for row in status_rows:
             if not isinstance(row, dict):
                 raise RuntimeError("GitHub commit status malformed")
@@ -470,6 +471,9 @@ class GitHubDeliveryClient:
             context = row.get("context")
             if not isinstance(state, str) or not isinstance(context, str):
                 raise RuntimeError("GitHub commit status malformed")
+            if context in seen_status_contexts:
+                continue
+            seen_status_contexts.add(context)
             checks.append(
                 GitHubCheck(
                     name=context,
