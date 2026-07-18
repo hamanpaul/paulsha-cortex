@@ -2165,7 +2165,11 @@ def _planner_sandbox_path(job: Mapping[str, object], coordinator_root: str | Pat
     if not isinstance(raw, str) or not raw:
         raise ValueError("planner sandbox path missing")
     path = Path(raw)
-    if not path.is_absolute() or path.is_symlink():
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or path != path.resolve(strict=False)
+    ):
         raise ValueError("planner sandbox path invalid")
     root = Path(coordinator_root).resolve()
     allowed_parents = {
@@ -2175,6 +2179,27 @@ def _planner_sandbox_path(job: Mapping[str, object], coordinator_root: str | Pat
     if path.parent not in allowed_parents or re.fullmatch(r"[0-9a-f]{32}", path.name) is None:
         raise ValueError("planner sandbox path outside coordinator boundary")
     return path
+
+
+def _discard_failed_planner_sandbox(
+    job: Mapping[str, object],
+    *,
+    run_id: str,
+    card: str,
+    coordinator_root: str | Path,
+) -> None:
+    if job.get("persona") != "planner" or job.get("status") != "failed":
+        raise ValueError("planner sandbox retry requires failed planner job")
+    path = _planner_sandbox_path(job, coordinator_root)
+    expected_name = hashlib.sha256(f"{run_id}:{card}".encode()).hexdigest()[:32]
+    if path.name != expected_name:
+        raise ValueError("planner sandbox retry identity mismatch")
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError("planner sandbox retry target is not a directory")
+        shutil.rmtree(path)
+    if path.exists() or path.is_symlink():
+        raise ValueError("planner sandbox retry cleanup incomplete")
 
 
 def terminalize_workflow_job(
@@ -3082,6 +3107,13 @@ def dispatch_workflow_card(
     ]
     if matching and not (retry_failed and matching[-1].get("status") == "failed"):
         return matching[-1]
+    if matching and step.persona == "planner":
+        _discard_failed_planner_sandbox(
+            matching[-1],
+            run_id=run.run_id,
+            card=step.card,
+            coordinator_root=coordinator_root,
+        )
     identity = _select_workflow_identity(run, step, identities)
     launcher = launcher_factory(identity)
     if launcher is None:

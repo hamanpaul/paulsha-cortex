@@ -769,6 +769,76 @@ def test_planner_terminalization_rejects_disposable_sandbox_pollution(tmp_path: 
     assert registry.get_job(job["job_id"])["workflow_evidence"] is None
 
 
+def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "source.md").write_text("source\n", encoding="utf-8")
+    coordinator_root = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator_root / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"plan": 1},
+        gate_status="running",
+    )
+    identities = IdentityRegistry.from_rows(
+        [{
+            "executor": "codex",
+            "model_id": "gpt-primary",
+            "independence_domain": "openai",
+            "capabilities": ["planning"],
+        }]
+    )
+
+    class Launcher:
+        def as_read_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            return LaunchHandle(
+                executor="codex",
+                model_id="gpt-primary",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    first = manager.dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=coordinator_root,
+    )
+    first_sandbox = Path(first["worktree"])
+    (first_sandbox / "failed-attempt-marker").write_text("stale\n", encoding="utf-8")
+    registry.update_headless_result(first["job_id"], status="failed", exit_code=1)
+
+    retried = manager.dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=coordinator_root,
+        retry_failed=True,
+    )
+
+    assert retried["job_id"] != first["job_id"]
+    assert Path(retried["worktree"]) == first_sandbox
+    assert not (first_sandbox / "failed-attempt-marker").exists()
+    assert (first_sandbox / "source.md").read_text(encoding="utf-8") == "source\n"
+
+
 def _run(
     *, phase: str, status: str, refs: tuple[GateEvidenceRef, ...],
     brainstorm_required: bool = True,
