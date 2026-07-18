@@ -85,6 +85,8 @@ class MonitorServer:
         self._socket_path = Path(socket_path)
         self._listener: socket.socket | None = None
         self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._subscribers: list[_Subscriber] = []
         self._work_subscribers: list[_WorkSubscriber] = []
         self._subscribers_lock = threading.Lock()
@@ -127,20 +129,28 @@ class MonitorServer:
 
     def serve_forever(self) -> None:
         # Atomic bind + permission tightening.
+        if self._stop_event.is_set():
+            return
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
         self._prepare_socket_path()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        previous_umask = os.umask(0o177)
+        bound = False
         try:
-            listener.bind(str(self._socket_path))
-        finally:
-            os.umask(previous_umask)
-        os.chmod(str(self._socket_path), 0o600)
-        listener.listen(16)
-        listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
-        self._listener = listener
+            previous_umask = os.umask(0o177)
+            try:
+                listener.bind(str(self._socket_path))
+                bound = True
+            finally:
+                os.umask(previous_umask)
+            os.chmod(str(self._socket_path), 0o600)
+            listener.listen(16)
+            listener.settimeout(ACCEPT_TIMEOUT_SECONDS)
+            with self._lifecycle_lock:
+                self._listener = listener
+                if self._stop_event.is_set():
+                    return
+                self._ready_event.set()
 
-        try:
             while not self._stop_event.is_set():
                 try:
                     conn, _addr = listener.accept()
@@ -159,10 +169,13 @@ class MonitorServer:
                     ]
                     self._connection_threads.append(t)
         finally:
-            self._teardown()
+            self._teardown(listener, unlink_socket=bound)
 
     def stop(self) -> None:
-        self._stop_event.set()
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            self._ready_event.clear()
+            listener = self._listener
         # Mark all subscribers dead so their threads can exit.
         with self._subscribers_lock:
             for sub in self._subscribers:
@@ -170,24 +183,31 @@ class MonitorServer:
             for sub in self._work_subscribers:
                 sub.alive = False
         # Best-effort: close the listener so any in-flight accept errors out.
-        if self._listener is not None:
+        if listener is not None:
             try:
-                self._listener.close()
+                listener.close()
             except OSError:
                 pass
 
-    def _teardown(self) -> None:
-        if self._listener is not None:
-            try:
-                self._listener.close()
-            except OSError:
-                pass
-            self._listener = None
+    def wait_until_ready(self, timeout: float | None = None) -> bool:
+        """Wait until the Unix socket is listening, not merely bound."""
+        return self._ready_event.wait(timeout)
+
+    def _teardown(self, listener: socket.socket, *, unlink_socket: bool) -> None:
+        with self._lifecycle_lock:
+            self._ready_event.clear()
+            if self._listener is listener:
+                self._listener = None
         try:
-            if self._socket_path.exists():
-                self._socket_path.unlink()
+            listener.close()
         except OSError:
             pass
+        if unlink_socket:
+            try:
+                if self._socket_path.exists():
+                    self._socket_path.unlink()
+            except OSError:
+                pass
 
     # --- public publish surface ---
 

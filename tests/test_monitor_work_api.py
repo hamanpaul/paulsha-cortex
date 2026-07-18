@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
-import time
+from unittest import mock
 
 from paulsha_cortex.monitor.config import MonitorConfig
 from paulsha_cortex.monitor.server import MonitorServer
@@ -170,10 +170,7 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    for _ in range(100):
-        if socket_path.exists():
-            break
-        time.sleep(0.01)
+    assert server.wait_until_ready(timeout=2.0)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.connect(str(socket_path))
@@ -217,6 +214,27 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
     finally:
         server.stop()
         thread.join(timeout=2)
+
+
+def test_server_stopped_before_start_never_signals_ready(tmp_path):
+    server = MonitorServer(
+        store=SnapshotStore(config=MonitorConfig(workspaces=())),
+        socket_path=tmp_path / "monitor.sock",
+    )
+    server.stop()
+
+    with mock.patch.object(
+        server._ready_event,
+        "set",
+        wraps=server._ready_event.set,
+    ) as ready_set:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    ready_set.assert_not_called()
+    assert not server.wait_until_ready(timeout=0)
 
 
 def test_work_subscription_extension_preserves_legacy_queue_full_replacement(tmp_path):
