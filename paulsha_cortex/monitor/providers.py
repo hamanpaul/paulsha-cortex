@@ -632,7 +632,8 @@ class GitHubWorkProvider:
             "--method",
             "GET",
             "--paginate",
-            "--slurp",
+            "--jq",
+            ".[]",
             f"repos/{self.repo}/issues?state=all&per_page=100",
         )
         try:
@@ -655,8 +656,13 @@ class GitHubWorkProvider:
             return self._failure(attempted_at, diagnostic)
         stdout = completed.stdout.decode() if isinstance(completed.stdout, bytes) else completed.stdout
         try:
-            payload = json.loads(stdout)
-            entities = self._flatten_pages(payload)
+            entities = [
+                json.loads(line)
+                for line in stdout.splitlines()
+                if line.strip()
+            ]
+            if any(not isinstance(entity, dict) for entity in entities):
+                raise ValueError("GitHub entity is not an object")
             sources = tuple(self._entity_source(entity) for entity in entities)
         except (json.JSONDecodeError, TypeError, ValueError, KeyError):
             return self._failure(attempted_at, "github API returned malformed JSON")
@@ -687,21 +693,6 @@ class GitHubWorkProvider:
             diagnostics=(diagnostic,),
             sources=(),
         )
-
-    @staticmethod
-    def _flatten_pages(payload: object) -> list[dict]:
-        if not isinstance(payload, list):
-            raise ValueError("GitHub response is not an array")
-        pages = payload if not payload or isinstance(payload[0], list) else [payload]
-        entities: list[dict] = []
-        for page in pages:
-            if not isinstance(page, list):
-                raise ValueError("GitHub page is not an array")
-            for entity in page:
-                if not isinstance(entity, dict):
-                    raise ValueError("GitHub entity is not an object")
-                entities.append(entity)
-        return entities
 
     def _entity_source(self, entity: dict) -> WorkSource:
         number = entity["number"]
