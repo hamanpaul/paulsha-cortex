@@ -9,6 +9,7 @@ import pytest
 from paulsha_cortex.monitor.config import MonitorConfig, WorkspaceConfig, load_config
 from paulsha_cortex.monitor.models import ProjectState
 from paulsha_cortex.monitor.scanner import (
+    DegradedDiagnostic,
     ProjectClassification,
     ScanResult,
     scan_workspaces_detailed,
@@ -66,6 +67,13 @@ def test_refresh_preserves_last_good_state_when_scan_is_degraded(tmp_path: Path)
         states=(),
         degraded_roots=(workspace,),
         diagnostics=(f"degraded: OSError: cannot read {workspace}",),
+        degraded_diagnostics=(
+            DegradedDiagnostic(
+                workspace,
+                "test",
+                f"degraded: OSError: cannot read {workspace}",
+            ),
+        ),
     )
     with mock.patch(
         "paulsha_cortex.monitor.snapshot.scan_workspaces_detailed",
@@ -76,10 +84,211 @@ def test_refresh_preserves_last_good_state_when_scan_is_degraded(tmp_path: Path)
     state = store.get("demo")
     assert state is not None
     assert events and not events[0].removed
-    assert any(
-        signal.kind == "scan" and signal.note and "degraded" in signal.note
-        for signal in state.source_signals
+    scan_signal = next(signal for signal in state.source_signals if signal.kind == "scan")
+    assert scan_signal.note == degraded.diagnostics[0]
+
+
+def test_refresh_does_not_assign_unrelated_global_diagnostic(tmp_path: Path) -> None:
+    west_root = tmp_path / "west"
+    east_root = tmp_path / "east"
+    for root, project_name in (
+        (west_root, "west-project"),
+        (east_root, "east-project"),
+    ):
+        project = root / project_name
+        project.mkdir(parents=True)
+        (project / ".paul-project.yml").write_text(
+            "policy_profile: flat\n",
+            encoding="utf-8",
+        )
+    config = MonitorConfig(
+        workspaces=(
+            WorkspaceConfig(path=west_root, name="west"),
+            WorkspaceConfig(path=east_root, name="east"),
+        ),
     )
+    store = SnapshotStore(config=config)
+    store.load()
+
+    with mock.patch(
+        "paulsha_cortex.monitor.snapshot.scan_workspaces_detailed",
+        return_value=ScanResult(
+            states=(),
+            degraded_roots=(west_root, east_root),
+            degraded_workspaces=("west", "east"),
+            diagnostics=(
+                "degraded: PermissionError: west offline",
+                "degraded: PermissionError: east offline",
+            ),
+        ),
+    ):
+        store.refresh()
+
+    notes = {
+        state.project_id: next(
+            signal.note for signal in state.source_signals if signal.kind == "scan"
+        )
+        for state in store.current_snapshot()
+    }
+    assert notes["west-project"] == f"degraded: scan unavailable under {west_root}"
+    assert notes["east-project"] == f"degraded: scan unavailable under {east_root}"
+
+
+def test_refresh_uses_structured_root_diagnostic_without_prefix_collision(
+    tmp_path: Path,
+) -> None:
+    short_root = tmp_path / "root"
+    long_root = tmp_path / "root-old"
+    for root, project_name in (
+        (short_root, "short-project"),
+        (long_root, "long-project"),
+    ):
+        project = root / project_name
+        project.mkdir(parents=True)
+        (project / ".paul-project.yml").write_text(
+            "policy_profile: flat\n",
+            encoding="utf-8",
+        )
+    store = SnapshotStore(
+        config=MonitorConfig(
+            workspaces=(
+                WorkspaceConfig(path=short_root, name="short"),
+                WorkspaceConfig(path=long_root, name="long"),
+            ),
+        )
+    )
+    store.load()
+    short_diagnostic = f"degraded: PermissionError: {short_root} offline"
+    long_diagnostic = f"degraded: PermissionError: {long_root} offline"
+
+    with mock.patch(
+        "paulsha_cortex.monitor.snapshot.scan_workspaces_detailed",
+        return_value=ScanResult(
+            states=(),
+            degraded_roots=(short_root, long_root),
+            degraded_workspaces=("short", "long"),
+            diagnostics=(long_diagnostic, short_diagnostic),
+            degraded_diagnostics=(
+                DegradedDiagnostic(long_root, "long", long_diagnostic),
+                DegradedDiagnostic(short_root, "short", short_diagnostic),
+            ),
+        ),
+    ):
+        store.refresh()
+
+    notes = {
+        state.project_id: next(
+            signal.note for signal in state.source_signals if signal.kind == "scan"
+        )
+        for state in store.current_snapshot()
+    }
+    assert notes == {
+        "long-project": long_diagnostic,
+        "short-project": short_diagnostic,
+    }
+
+
+def test_refresh_diagnostic_does_not_cross_nested_workspace_identity(
+    tmp_path: Path,
+) -> None:
+    parent_root = tmp_path / "root"
+    nested_root = parent_root / "nested"
+    parent_project = parent_root / "parent-project"
+    child_project = nested_root / "child-project"
+    for project in (parent_project, child_project):
+        project.mkdir(parents=True)
+        (project / ".paul-project.yml").write_text(
+            "policy_profile: flat\n",
+            encoding="utf-8",
+        )
+    store = SnapshotStore(
+        config=MonitorConfig(
+            workspaces=(
+                WorkspaceConfig(path=parent_root, name="parent"),
+                WorkspaceConfig(path=nested_root, name="child"),
+            ),
+            ignore_dirs=("nested",),
+        )
+    )
+    store.load()
+    parent_diagnostic = f"degraded: parent unavailable: {parent_root}"
+    child_diagnostic = f"degraded: child unavailable: {nested_root}"
+
+    with mock.patch(
+        "paulsha_cortex.monitor.snapshot.scan_workspaces_detailed",
+        return_value=ScanResult(
+            states=(),
+            degraded_roots=(parent_root, nested_root),
+            degraded_workspaces=("parent", "child"),
+            diagnostics=(parent_diagnostic, child_diagnostic),
+            degraded_diagnostics=(
+                DegradedDiagnostic(parent_root, "parent", parent_diagnostic),
+                DegradedDiagnostic(nested_root, "child", child_diagnostic),
+            ),
+        ),
+    ):
+        store.refresh()
+
+    notes = {
+        state.project_id: next(
+            signal.note for signal in state.source_signals if signal.kind == "scan"
+        )
+        for state in store.current_snapshot()
+    }
+    assert notes == {
+        "child-project": child_diagnostic,
+        "parent-project": parent_diagnostic,
+    }
+
+
+@pytest.mark.parametrize(
+    ("parent_name", "child_name"),
+    (("parent", "child"), ("same", "same")),
+)
+def test_outer_workspace_degradation_does_not_freeze_healthy_nested_removal(
+    tmp_path: Path,
+    parent_name: str,
+    child_name: str,
+) -> None:
+    parent_root = tmp_path / "root"
+    nested_root = parent_root / "nested"
+    parent_project = parent_root / "parent-project"
+    child_project = nested_root / "child-project"
+    for project in (parent_project, child_project):
+        project.mkdir(parents=True)
+        (project / ".paul-project.yml").write_text(
+            "policy_profile: flat\n",
+            encoding="utf-8",
+        )
+    store = SnapshotStore(
+        config=MonitorConfig(
+            workspaces=(
+                WorkspaceConfig(path=parent_root, name=parent_name),
+                WorkspaceConfig(path=nested_root, name=child_name),
+            ),
+            ignore_dirs=("nested",),
+        )
+    )
+    store.load()
+    parent_diagnostic = f"degraded: parent unavailable: {parent_root}"
+
+    with mock.patch(
+        "paulsha_cortex.monitor.snapshot.scan_workspaces_detailed",
+        return_value=ScanResult(
+            states=(),
+            degraded_roots=(parent_root,),
+            degraded_workspaces=(parent_name,),
+            diagnostics=(parent_diagnostic,),
+            degraded_diagnostics=(
+                DegradedDiagnostic(parent_root, parent_name, parent_diagnostic),
+            ),
+        ),
+    ):
+        events = store.refresh()
+
+    assert store.get("parent-project") is not None
+    assert store.get("child-project") is None
+    assert any(event.project_id == "child-project" and event.removed for event in events)
 
 
 def test_targeted_refresh_defers_missing_project_until_parent_scan(tmp_path: Path) -> None:

@@ -22,6 +22,13 @@ class ProjectClassification(str, Enum):
 
 
 @dataclass(frozen=True)
+class DegradedDiagnostic:
+    root: Path
+    workspace: str
+    note: str
+
+
+@dataclass(frozen=True)
 class ScanResult:
     """One monitor scan plus the roots that could not be read authoritatively."""
 
@@ -29,6 +36,7 @@ class ScanResult:
     degraded_roots: tuple[Path, ...] = ()
     degraded_workspaces: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    degraded_diagnostics: tuple[DegradedDiagnostic, ...] = ()
 
 
 def classify_project_detailed(
@@ -154,8 +162,9 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
     """Walk workspaces without treating unavailable roots as authoritative emptiness.
 
     Honours `legacy_policy` and `ignore_dirs` per design §3.2 / §3.5.
-    Missing workspace paths are silently skipped — the service must not
-    crash when a workspace is unmounted (spec §B7).
+    Unavailable workspace paths emit degraded diagnostics so the service can
+    retain last-good state without crashing when a workspace is unmounted
+    (spec §B7).
     """
     ignore = frozenset(config.ignore_dirs)
     legacy_visible = config.legacy_policy != "hide"
@@ -165,6 +174,7 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
     degraded_roots: list[Path] = []
     degraded_workspaces: list[str] = []
     diagnostics: list[str] = []
+    degraded_diagnostics: list[DegradedDiagnostic] = []
 
     for workspace in config.workspaces:
         project_dirs, error = _list_project_dirs_checked(workspace.path, ignore)
@@ -172,6 +182,9 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
             degraded_roots.append(workspace.path)
             degraded_workspaces.append(workspace.name)
             diagnostics.append(error)
+            degraded_diagnostics.append(
+                DegradedDiagnostic(workspace.path, workspace.name, error)
+            )
             continue
         for project_dir in project_dirs:
             resolved_project, resolve_error = checked_resolve(project_dir)
@@ -179,6 +192,9 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
                 degraded_roots.append(workspace.path)
                 degraded_workspaces.append(workspace.name)
                 diagnostics.append(resolve_error)
+                degraded_diagnostics.append(
+                    DegradedDiagnostic(workspace.path, workspace.name, resolve_error)
+                )
                 continue
             manual_projects.append(
                 ProjectEntry(
@@ -193,15 +209,25 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
         project_mode, availability_error = checked_stat_mode(project_dir)
         if availability_error is not None:
             diagnostics.append(availability_error)
+            degraded_diagnostics.append(
+                DegradedDiagnostic(project_dir, entry.name, availability_error)
+            )
         if project_mode is None or not stat.S_ISDIR(project_mode):
             degraded_roots.append(project_dir)
             if not any(str(project_dir) in item for item in diagnostics):
-                diagnostics.append(f"degraded: project unavailable: {project_dir}")
+                diagnostic = f"degraded: project unavailable: {project_dir}"
+                diagnostics.append(diagnostic)
+                degraded_diagnostics.append(
+                    DegradedDiagnostic(project_dir, entry.name, diagnostic)
+                )
             continue
         classification, classification_error = classify_project_detailed(project_dir)
         if classification_error is not None:
             degraded_roots.append(project_dir)
             diagnostics.append(classification_error)
+            degraded_diagnostics.append(
+                DegradedDiagnostic(project_dir, entry.name, classification_error)
+            )
             continue
         is_legacy = classification == ProjectClassification.LEGACY
         if is_legacy and not legacy_visible:
@@ -229,6 +255,10 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
             if degraded:
                 degraded_roots.append(project_dir)
                 diagnostics.extend(degraded)
+                degraded_diagnostics.extend(
+                    DegradedDiagnostic(project_dir, entry.name, diagnostic)
+                    for diagnostic in degraded
+                )
                 continue
             states.append(state)
 
@@ -237,6 +267,7 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
         degraded_roots=tuple(dict.fromkeys(Path(root) for root in degraded_roots)),
         degraded_workspaces=tuple(dict.fromkeys(degraded_workspaces)),
         diagnostics=tuple(dict.fromkeys(diagnostics)),
+        degraded_diagnostics=tuple(dict.fromkeys(degraded_diagnostics)),
     )
 
 

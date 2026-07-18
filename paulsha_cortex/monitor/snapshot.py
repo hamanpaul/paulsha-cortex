@@ -93,21 +93,84 @@ class SnapshotStore:
             for project_id, previous in previous_states.items():
                 if project_id in new_states:
                     continue
-                path_degraded = _is_under_degraded_root(
-                    Path(previous.path),
-                    result.degraded_roots,
+                workspace_name_roots = tuple(
+                    workspace.path
+                    for workspace in self._config.workspaces
+                    if workspace.name == previous.workspace
                 )
-                workspace_degraded = previous.workspace in result.degraded_workspaces
-                if not path_degraded and not workspace_degraded:
-                    continue
-                degraded_root = next(
+                owning_workspace_root = max(
                     (
                         root
-                        for root in result.degraded_roots
+                        for root in workspace_name_roots
                         if _is_under_degraded_root(Path(previous.path), (root,))
                     ),
-                    None,
+                    key=lambda root: len(stable_path(root).parts),
+                    default=None,
                 )
+                workspace_degraded = (
+                    previous.workspace in result.degraded_workspaces
+                    and len(workspace_name_roots) == 1
+                )
+                matching_diagnostics = tuple(
+                    diagnostic
+                    for diagnostic in result.degraded_diagnostics
+                    if diagnostic.workspace == previous.workspace
+                    and _is_under_degraded_root(
+                        Path(previous.path),
+                        (diagnostic.root,),
+                    )
+                    and (
+                        owning_workspace_root is None
+                        or _is_under_degraded_root(
+                            diagnostic.root,
+                            (owning_workspace_root,),
+                        )
+                    )
+                )
+                legacy_matching_roots = tuple(
+                    root
+                    for root in result.degraded_roots
+                    if _is_under_degraded_root(Path(previous.path), (root,))
+                    and (
+                        owning_workspace_root is not None
+                        and _is_under_degraded_root(
+                            root,
+                            (owning_workspace_root,),
+                        )
+                    )
+                )
+                if (
+                    not matching_diagnostics
+                    and not legacy_matching_roots
+                    and not workspace_degraded
+                ):
+                    continue
+                if matching_diagnostics:
+                    most_specific_depth = max(
+                        len(stable_path(diagnostic.root).parts)
+                        for diagnostic in matching_diagnostics
+                    )
+                    degraded_root = next(
+                        diagnostic.root
+                        for diagnostic in matching_diagnostics
+                        if len(stable_path(diagnostic.root).parts)
+                        == most_specific_depth
+                    )
+                    diagnostics = tuple(
+                        dict.fromkeys(
+                            diagnostic.note
+                            for diagnostic in matching_diagnostics
+                            if len(stable_path(diagnostic.root).parts)
+                            == most_specific_depth
+                        )
+                    )
+                else:
+                    degraded_root = max(
+                        legacy_matching_roots,
+                        key=lambda root: len(stable_path(root).parts),
+                        default=None,
+                    )
+                    diagnostics = ()
                 note = (
                     f"degraded: scan unavailable under {degraded_root}"
                     if degraded_root is not None
@@ -115,7 +178,7 @@ class SnapshotStore:
                 )
                 new_states[project_id] = _with_scan_degraded_signal(
                     previous,
-                    (note,),
+                    diagnostics or (note,),
                 )
             new_signatures = {
                 project_id: _project_signature(state)
