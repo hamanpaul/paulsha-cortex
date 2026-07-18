@@ -2022,19 +2022,45 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
         if not isinstance(value, dict):
             continue
         nested = value.get("workflow_evidence")
-        if isinstance(nested, dict):
+        if _is_workflow_terminal_payload(nested):
             return nested
+        item = value.get("item")
+        if (
+            value.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+        ):
+            parsed = _parse_terminal_json_text(item.get("text"))
+            if parsed is not None:
+                return parsed
         for key in ("result", "content", "message", "text"):
-            nested = value.get(key)
-            if isinstance(nested, str):
-                try:
-                    parsed = json.loads(nested)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, dict):
-                    return parsed
-        return value
+            parsed = _parse_terminal_json_text(value.get(key))
+            if parsed is not None:
+                return parsed
+        if _is_workflow_terminal_payload(value):
+            return value
     raise ValueError("workflow terminal log has no JSON evidence")
+
+
+def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if _is_workflow_terminal_payload(parsed) else None
+
+
+def _is_workflow_terminal_payload(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("schema_version"), int)
+        and ("status" in value or "state" in value)
+        and "candidate" in value
+        and "outputs" in value
+        and (value.get("kind") == "workflow-card" or "slice_id" in value)
+    )
 
 
 def _canonical_workflow_artifacts(

@@ -769,6 +769,41 @@ def test_planner_terminalization_rejects_disposable_sandbox_pollution(tmp_path: 
     assert registry.get_job(job["job_id"])["workflow_evidence"] is None
 
 
+def test_terminal_json_uses_codex_final_agent_message_not_turn_envelope(tmp_path: Path) -> None:
+    evidence = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": None,
+        "outputs": ["docs/superpowers/plans/work.md"],
+    }
+    log = tmp_path / "codex.jsonl"
+    log.write_text(
+        "\n".join(
+            (
+                json.dumps({
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "aggregated_output": json.dumps({"status": "fake"}),
+                    },
+                }),
+                json.dumps({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": json.dumps(evidence)},
+                }),
+                json.dumps({"type": "turn.completed", "usage": {"output_tokens": 10}}),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
 def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
