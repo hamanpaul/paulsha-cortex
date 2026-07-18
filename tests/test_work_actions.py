@@ -476,6 +476,15 @@ def test_canonical_authority_loader_ignores_issue_only_topic_rows(tmp_path: Path
         "confidence": "confirmed",
         "provider": "repo:acme/demo",
     }
+    workflow = {
+        "source_id": "workflow_run:acme/demo:run-1",
+        "kind": "workflow_run",
+        "ref": "run-1",
+        "revision": "registry:1",
+        "status": "ongoing",
+        "confidence": "confirmed",
+        "provider": "workflow:acme/demo",
+    }
     snapshot.write_text(
         json.dumps(
             {
@@ -485,12 +494,14 @@ def test_canonical_authority_loader_ignores_issue_only_topic_rows(tmp_path: Path
                     {
                         "repo": "acme/demo",
                         "work_id": "issue:acme/demo#99",
+                        "next_actions": [],
                         "sources": [{**issue, "ref": "acme/demo#99", "source_id": "github_issue:acme/demo#99"}],
                     },
                     {
                         "repo": "acme/demo",
                         "work_id": "demo",
-                        "sources": [issue, openspec],
+                        "next_actions": [],
+                        "sources": [issue, openspec, workflow],
                     },
                 ],
             }

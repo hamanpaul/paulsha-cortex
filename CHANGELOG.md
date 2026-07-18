@@ -28,6 +28,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **Active workflow authority 可在 `start` action 消失後繼續 resume/closure**：canonical loader 現在把 confirmed `workflow_run` 視為持續 authority；display-only topic/orphan仍忽略，避免 `on-going` WorkItem 因 next actions 為空而變成 authority missing。
 - **Work authority loader 不再讓 display-only topic/orphan 阻塞 confirmed 工作**：canonical loader 會忽略沒有 `start` authority 或沒有 confirmed Todo 的 read-model rows；repo/work/source/action malformed 仍 fail-closed。Repo override 同步補上 unified lifecycle issue/OpenSpec/superpowers confirmed links，消除重複 display groups與錯誤 missing-issue workflow。
 - **Live GitHub provider 不再因 scan 前固定 clock 而被立即標 stale**：freshness reference 改為 provider scans 完成後再讀取，避免成功 snapshot 的 `last_success_at` 晚於 pre-scan clock 形成負 age、永久關閉 auto claim/merge；新增 deterministic clock regression 與 live projection probe。
 - **GitHub Work provider 相容不支援 `gh api --slurp` 的 gh 版本**：pagination 改用 typed `--paginate --jq '.[]'` JSONL entity stream，保留 shell-free argv 與 malformed response fail-closed；避免 live Monitor 永久 degraded 並阻止 auto claim/merge。
