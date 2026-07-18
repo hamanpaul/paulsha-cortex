@@ -444,6 +444,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         workflow_identity_registry=identities,
         scan_specs_fn=lambda _: [],
         run_tick_fn=lambda *args, **kwargs: {"dispatch_skipped": False},
+        auto_claim_fn=lambda: [],
     )
     periodic()
     assert registry.get_workflow_run(run.run_id).current_phase == "build"
