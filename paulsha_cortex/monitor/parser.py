@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+import stat
 import time
 from pathlib import Path
 
+from .fs import checked_stat_mode
 from .models import ProjectState, Signal, StageRef, StageView, TaskRef
 
 UNCHECKED_BULLET = re.compile(r"^\s*-\s*\[\s\]\s+(.+?)\s*$")
@@ -63,19 +65,25 @@ def parse_blockers(todo_md: Path) -> tuple[str, ...]:
 
 def _list_workstream_dirs(project_dir: Path) -> tuple[list[Path], str | None]:
     workstreams_root = project_dir / "docs" / "superpowers" / "workstreams"
+    root_mode, error = checked_stat_mode(workstreams_root)
+    if error is not None:
+        return [], error
+    if root_mode is None or not stat.S_ISDIR(root_mode):
+        return [], None
     try:
-        if not workstreams_root.is_dir():
-            return [], None
-        return (
-            sorted(
-                child
-                for child in workstreams_root.iterdir()
-                if child.is_dir() and child.name.startswith("stage")
-            ),
-            None,
-        )
+        children = sorted(workstreams_root.iterdir())
     except OSError as error:
         return [], f"degraded: {type(error).__name__}: {error}"
+    workstreams: list[Path] = []
+    for child in children:
+        child_mode, error = checked_stat_mode(child)
+        if error is not None:
+            return [], error
+        if child_mode is None:
+            return [], f"degraded: workstream vanished during scan: {child}"
+        if stat.S_ISDIR(child_mode) and child.name.startswith("stage"):
+            workstreams.append(child)
+    return workstreams, None
 
 
 def _make_view(workstream_dir: Path) -> tuple[StageView | None, list[Signal]]:
@@ -83,7 +91,21 @@ def _make_view(workstream_dir: Path) -> tuple[StageView | None, list[Signal]]:
     todo_md = workstream_dir / "todo.md"
     signals: list[Signal] = []
 
-    if not todo_md.is_file():
+    todo_mode, error = checked_stat_mode(todo_md)
+    if error is not None:
+        signals.append(Signal(kind="todo", path=str(todo_md), note=error))
+        return (
+            StageView(
+                stage_id=workstream_dir.name,
+                workstream_path=str(workstream_dir),
+                processing_task=None,
+                next_task=None,
+                blockers=(),
+                degraded=True,
+            ),
+            signals,
+        )
+    if todo_mode is None or not stat.S_ISREG(todo_mode):
         return None, signals
 
     text, error = _read_text_safe(todo_md)
@@ -160,22 +182,38 @@ def extract_project_state(project_dir: Path, *, workspace_name: str) -> ProjectS
     # later patch; spec §B3 + design §4 decision #5 keep it pluggable.)
     completed: list[StageRef] = []
     archive_root = project_dir / "openspec" / "changes" / "archive"
-    try:
-        if archive_root.is_dir():
+    archive_mode, archive_error = checked_stat_mode(archive_root)
+    if archive_error is not None:
+        signals.append(Signal(kind="archive", path=str(archive_root), note=archive_error))
+    elif archive_mode is not None and stat.S_ISDIR(archive_mode):
+        try:
             for entry in sorted(archive_root.iterdir()):
-                if entry.is_dir() and "stage" in entry.name:
+                entry_mode, error = checked_stat_mode(entry)
+                if error is not None:
+                    signals.append(Signal(kind="archive", path=str(entry), note=error))
+                    break
+                if entry_mode is None:
+                    signals.append(
+                        Signal(
+                            kind="archive",
+                            path=str(entry),
+                            note=f"degraded: archive entry vanished during scan: {entry}",
+                        )
+                    )
+                    break
+                if stat.S_ISDIR(entry_mode) and "stage" in entry.name:
                     completed.append(
                         StageRef(stage_id=entry.name, workstream_path=str(entry))
                     )
             signals.append(Signal(kind="archive", path=str(archive_root)))
-    except OSError as error:
-        signals.append(
-            Signal(
-                kind="archive",
-                path=str(archive_root),
-                note=f"degraded: {type(error).__name__}: {error}",
+        except OSError as error:
+            signals.append(
+                Signal(
+                    kind="archive",
+                    path=str(archive_root),
+                    note=f"degraded: {type(error).__name__}: {error}",
+                )
             )
-        )
 
     return ProjectState(
         project_id=project_dir.name,

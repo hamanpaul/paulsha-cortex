@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import time
 import threading
+import stat
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
 from .config import MonitorConfig
-from .models import ProjectState
+from .fs import checked_stat_mode, stable_path
+from .models import ProjectState, Signal
 from .parser import extract_project_state
-from .scanner import ProjectClassification, classify_project, scan_workspaces
+from .scanner import (
+    ProjectClassification,
+    classify_project_detailed,
+    scan_workspaces_detailed,
+)
 
 
 @dataclass(frozen=True)
@@ -59,7 +65,7 @@ class SnapshotStore:
         with self._lock:
             self._states.clear()
             self._signatures.clear()
-            for state in scan_workspaces(self._config):
+            for state in scan_workspaces_detailed(self._config).states:
                 self._states[state.project_id] = state
                 self._signatures[state.project_id] = _project_signature(state)
         return ()
@@ -69,7 +75,111 @@ class SnapshotStore:
         with self._lock:
             previous_states = self._states
             previous_signatures = self._signatures
-            new_states = {s.project_id: s for s in scan_workspaces(self._config)}
+            result = scan_workspaces_detailed(self._config)
+            previous_ids_by_path = {
+                str(stable_path(Path(state.path))): project_id
+                for project_id, state in previous_states.items()
+            }
+            new_states: dict[str, ProjectState] = {}
+            for scanned in result.states:
+                stable_id = previous_ids_by_path.get(
+                    str(stable_path(Path(scanned.path))),
+                    scanned.project_id,
+                )
+                state = replace(scanned, project_id=stable_id)
+                if stable_id in new_states and new_states[stable_id].path != state.path:
+                    raise ValueError(f"duplicate project_id after scan: {stable_id}")
+                new_states[stable_id] = state
+            for project_id, previous in previous_states.items():
+                if project_id in new_states:
+                    continue
+                workspace_name_roots = tuple(
+                    workspace.path
+                    for workspace in self._config.workspaces
+                    if workspace.name == previous.workspace
+                )
+                owning_workspace_root = max(
+                    (
+                        root
+                        for root in workspace_name_roots
+                        if _is_under_degraded_root(Path(previous.path), (root,))
+                    ),
+                    key=lambda root: len(stable_path(root).parts),
+                    default=None,
+                )
+                workspace_degraded = (
+                    previous.workspace in result.degraded_workspaces
+                    and len(workspace_name_roots) == 1
+                )
+                matching_diagnostics = tuple(
+                    diagnostic
+                    for diagnostic in result.degraded_diagnostics
+                    if diagnostic.workspace == previous.workspace
+                    and _is_under_degraded_root(
+                        Path(previous.path),
+                        (diagnostic.root,),
+                    )
+                    and (
+                        owning_workspace_root is None
+                        or _is_under_degraded_root(
+                            diagnostic.root,
+                            (owning_workspace_root,),
+                        )
+                    )
+                )
+                legacy_matching_roots = tuple(
+                    root
+                    for root in result.degraded_roots
+                    if _is_under_degraded_root(Path(previous.path), (root,))
+                    and (
+                        owning_workspace_root is not None
+                        and _is_under_degraded_root(
+                            root,
+                            (owning_workspace_root,),
+                        )
+                    )
+                )
+                if (
+                    not matching_diagnostics
+                    and not legacy_matching_roots
+                    and not workspace_degraded
+                ):
+                    continue
+                if matching_diagnostics:
+                    most_specific_depth = max(
+                        len(stable_path(diagnostic.root).parts)
+                        for diagnostic in matching_diagnostics
+                    )
+                    degraded_root = next(
+                        diagnostic.root
+                        for diagnostic in matching_diagnostics
+                        if len(stable_path(diagnostic.root).parts)
+                        == most_specific_depth
+                    )
+                    diagnostics = tuple(
+                        dict.fromkeys(
+                            diagnostic.note
+                            for diagnostic in matching_diagnostics
+                            if len(stable_path(diagnostic.root).parts)
+                            == most_specific_depth
+                        )
+                    )
+                else:
+                    degraded_root = max(
+                        legacy_matching_roots,
+                        key=lambda root: len(stable_path(root).parts),
+                        default=None,
+                    )
+                    diagnostics = ()
+                note = (
+                    f"degraded: scan unavailable under {degraded_root}"
+                    if degraded_root is not None
+                    else f"degraded: workspace unavailable: {previous.workspace}"
+                )
+                new_states[project_id] = _with_scan_degraded_signal(
+                    previous,
+                    diagnostics or (note,),
+                )
             new_signatures = {
                 project_id: _project_signature(state)
                 for project_id, state in new_states.items()
@@ -108,20 +218,50 @@ class SnapshotStore:
                 if current is None or current.legacy:
                     continue
                 project_dir = Path(current.path)
-                if not project_dir.is_dir():
-                    self._states.pop(project_id, None)
-                    self._signatures.pop(project_id, None)
+                project_mode, project_error = checked_stat_mode(project_dir)
+                if (
+                    project_error is not None
+                    or project_mode is None
+                    or not stat.S_ISDIR(project_mode)
+                ):
+                    state = _with_scan_degraded_signal(
+                        current,
+                        (
+                            project_error
+                            or f"degraded: project unavailable: {project_dir}",
+                        ),
+                    )
+                    signature = _project_signature(state)
+                    self._states[project_id] = state
+                    if self._signatures.get(project_id) == signature:
+                        continue
+                    self._signatures[project_id] = signature
                     self._sequence += 1
                     events.append(
                         ChangeEvent(
                             project_id=project_id,
                             sequence=self._sequence,
-                            project_state=current,
-                            removed=True,
+                            project_state=state,
                         )
                     )
                     continue
-                classification = classify_project(project_dir)
+                classification, classification_error = classify_project_detailed(project_dir)
+                if classification_error is not None:
+                    state = _with_scan_degraded_signal(current, (classification_error,))
+                    signature = _project_signature(state)
+                    self._states[project_id] = state
+                    if self._signatures.get(project_id) == signature:
+                        continue
+                    self._signatures[project_id] = signature
+                    self._sequence += 1
+                    events.append(
+                        ChangeEvent(
+                            project_id=project_id,
+                            sequence=self._sequence,
+                            project_state=state,
+                        )
+                    )
+                    continue
                 if classification == ProjectClassification.LEGACY:
                     if self._config.legacy_policy == "hide":
                         self._states.pop(project_id, None)
@@ -146,6 +286,13 @@ class SnapshotStore:
                 else:
                     state = extract_project_state(project_dir, workspace_name=current.workspace)
                     state = replace(state, project_id=current.project_id)
+                    degraded_notes = tuple(
+                        signal.note
+                        for signal in state.source_signals
+                        if signal.note and signal.note.startswith("degraded:")
+                    )
+                    if degraded_notes:
+                        state = _with_scan_degraded_signal(current, degraded_notes)
                 signature = _project_signature(state)
                 self._states[project_id] = state
                 if self._signatures.get(project_id) == signature:
@@ -181,3 +328,26 @@ class SnapshotStore:
     def sequence(self) -> int:
         with self._lock:
             return self._sequence
+
+
+def _is_under_degraded_root(path: Path, roots: tuple[Path, ...]) -> bool:
+    resolved = stable_path(path)
+    for root in roots:
+        try:
+            resolved.relative_to(stable_path(root))
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _with_scan_degraded_signal(
+    state: ProjectState,
+    diagnostics: tuple[str, ...],
+) -> ProjectState:
+    retained = tuple(signal for signal in state.source_signals if signal.kind != "scan")
+    note = diagnostics[0] if diagnostics else "degraded: scan unavailable"
+    return replace(
+        state,
+        source_signals=retained + (Signal(kind="scan", path=state.path, note=note),),
+    )

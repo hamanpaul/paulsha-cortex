@@ -123,6 +123,8 @@ Cortex 不是 Jira / Notion 式的任務資料庫，而是以檔案為主的 Age
 
 Project Monitor 不會代替 coordinator 狀態：前者觀察專案文件，後者追蹤 Agent 執行與交付 gate。
 
+Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
+
 ### 1. 建立任務
 
 先用 Deck 把一個工作流編譯成 slice specs：

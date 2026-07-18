@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from pathlib import Path
 
 from .config import MonitorConfig
+from .fs import checked_resolve, checked_stat_mode
 from .server import MonitorServer
 from .snapshot import ChangeEvent, SnapshotStore
 from .watcher import HAS_WATCHDOG, StubWatcher, WatchdogFileWatcher, Watcher
@@ -110,7 +112,16 @@ class ProjectMonitorService:
             desired_keys: list[tuple[Path, bool]] = []
             seen: set[tuple[Path, bool]] = set()
             for workspace in self._config.workspaces:
-                if not workspace.path.exists():
+                workspace_mode, workspace_error = checked_stat_mode(workspace.path)
+                if (
+                    workspace_error is not None
+                    or workspace_mode is None
+                    or not stat.S_ISDIR(workspace_mode)
+                ):
+                    for key in self._existing_watch_keys_under(workspace.path):
+                        if key not in seen:
+                            seen.add(key)
+                            desired_keys.append(key)
                     continue
                 key = (workspace.path, False)
                 if key not in seen:
@@ -125,52 +136,121 @@ class ProjectMonitorService:
                     desired_keys.append(key)
             stale_keys = self._watched_paths - seen
             for watch_path, recursive in stale_keys:
-                self._watcher.unwatch(watch_path, recursive=recursive)
+                try:
+                    self._watcher.unwatch(watch_path, recursive=recursive)
+                except OSError:
+                    # The watcher may have removed its underlying watch before
+                    # reporting a backend error.  Forget the local claim so a
+                    # later desired pass can install it again.
+                    pass
                 self._watched_paths.discard((watch_path, recursive))
             for watch_path, recursive in desired_keys:
                 watch_key = (watch_path, recursive)
                 if watch_key in self._watched_paths:
                     continue
-                self._watcher.watch(watch_path, self._handle_fs_event, recursive=recursive)
+                try:
+                    self._watcher.watch(
+                        watch_path,
+                        self._handle_fs_event,
+                        recursive=recursive,
+                    )
+                except OSError:
+                    # A check-to-schedule race is transient. Do not claim the
+                    # key; the next synchronization will retry it.
+                    continue
                 self._watched_paths.add(watch_key)
+
+    def _existing_watch_keys_under(self, root: Path) -> tuple[tuple[Path, bool], ...]:
+        retained: list[tuple[Path, bool]] = []
+        for key in self._watched_paths:
+            watch_path, _recursive = key
+            if watch_path == root:
+                retained.append(key)
+                continue
+            try:
+                watch_path.relative_to(root)
+            except ValueError:
+                continue
+            retained.append(key)
+        return tuple(retained)
 
     def _watch_specs(self, project_root: Path) -> tuple[tuple[Path, bool], ...]:
         specs: list[tuple[Path, bool]] = [(project_root, False)]
-        git_dir = self._resolve_git_dir(project_root)
+        git_dir, git_error = self._resolve_git_dir_checked(project_root)
+        if git_error is not None:
+            return tuple(dict.fromkeys([*specs, *self._existing_watch_keys_under(project_root)]))
         if git_dir is None:
             return tuple(specs)
         head_path = git_dir / "HEAD"
         refs_path = git_dir / "refs"
-        if head_path.exists():
+        head_mode, head_error = checked_stat_mode(head_path)
+        if head_error is not None and (head_path, False) in self._watched_paths:
             specs.append((head_path, False))
-        if refs_path.exists():
+        elif head_mode is not None:
+            specs.append((head_path, False))
+        refs_mode, refs_error = checked_stat_mode(refs_path)
+        if refs_error is not None and (refs_path, True) in self._watched_paths:
+            specs.append((refs_path, True))
+        elif refs_mode is not None:
             specs.append((refs_path, True))
         return tuple(specs)
 
     def _resolve_git_dir(self, project_root: Path) -> Path | None:
+        git_dir, _error = self._resolve_git_dir_checked(project_root)
+        return git_dir
+
+    def _resolve_git_dir_checked(
+        self,
+        project_root: Path,
+    ) -> tuple[Path | None, str | None]:
         git_entry = project_root / ".git"
-        if git_entry.is_dir():
-            return git_entry
-        if not git_entry.is_file():
-            return None
+        git_mode, git_error = checked_stat_mode(git_entry)
+        if git_error is not None:
+            return None, git_error
+        if git_mode is None:
+            return None, None
+        if stat.S_ISDIR(git_mode):
+            return git_entry, None
+        if not stat.S_ISREG(git_mode):
+            return None, None
         try:
             first_line = git_entry.read_text(encoding="utf-8").splitlines()[0].strip()
-        except (OSError, IndexError):
-            return None
+        except OSError as error:
+            return None, f"degraded: {type(error).__name__}: {error}"
+        except IndexError:
+            return None, None
         prefix = "gitdir:"
         if not first_line.lower().startswith(prefix):
-            return None
+            return None, None
         raw_path = first_line[len(prefix):].strip()
         if not raw_path:
-            return None
+            return None, None
         resolved = Path(raw_path)
         if not resolved.is_absolute():
-            resolved = (git_entry.parent / resolved).resolve()
-        return resolved
+            resolved, resolve_error = checked_resolve(git_entry.parent / resolved)
+            if resolve_error is not None:
+                return None, resolve_error
+        return resolved, None
 
     def _handle_fs_event(self, path: Path) -> None:
         project_id = self._project_id_for_path(Path(path))
         if project_id is None:
+            self._publish_refresh(self._store.refresh())
+            return
+        with self._watch_state_lock:
+            project_root = self._project_roots.get(project_id)
+        project_mode, project_error = (
+            checked_stat_mode(project_root)
+            if project_root is not None
+            else (None, None)
+        )
+        if project_root is not None and (
+            project_error is not None
+            or project_mode is None
+            or not stat.S_ISDIR(project_mode)
+        ):
+            # The workspace parent is still readable, so a full scan can
+            # authoritatively distinguish deletion from an unavailable root.
             self._publish_refresh(self._store.refresh())
             return
         self._schedule_project_refresh(project_id)

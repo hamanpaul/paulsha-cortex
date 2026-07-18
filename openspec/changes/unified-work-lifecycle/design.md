@@ -1,0 +1,124 @@
+## Context
+
+現有Monitor已有workspace scan、ProjectState、in-memory SnapshotStore、Unix socket與systemd service；Coordinator已有single-writer control queue、versioned jobs/slices、deterministic verification、foreign review與CompletionRecord。這些是本change的anchor，不建立第二套daemon或平行delivery engine。
+
+規範性公共型別、override/frontmatter、snapshot與CLI JSON schema完整列於`CONTEXT.md`；accepted end-to-end行為列於superpowers source spec；逐檔TDD與commit boundaries列於implementation plan。
+
+## Goals / Non-Goals
+
+**Goals:**
+
+- 將GitHub issue、repo Todo artifacts、OpenSpec、workflow與delivery evidence投影為四態Work Item。
+- Provider部分失敗時沿用last-good並阻止destructive transition。
+- 以confirmed authority授權claim/merge/done；inferred只供顯示/explain。
+- 讓Manager以claim key冪等地協調planner/builder/reviewer/ship steps。
+- 保存Deck persona binding並強制planner peer、builder與reviewer的domain separation。
+- 以current-HEAD GitHub evidence與remote default branch狀態閉合done。
+- 對現有ProjectState、Slice與CompletionRecord提供明確migration/compatibility。
+
+**Non-Goals:**
+
+- v1不自動建立缺少的GitHub issue。
+- v1不支援GitHub以外forge的terminal delivery。
+- 不把heuristic association升級為authority。
+- 不使用GitHub auto-merge，不新增batch merge queue或替代branch protection平台。
+- 不導入event-sourcing/database；先使用atomic JSON與immutable evidence。
+- 不讓Copilot review取代ForeignReview，也不讓同一secondary同時滿足兩個gate。
+
+## Decisions
+
+### 1. Provider snapshot先正規化source，再做correlation/reduction
+
+每個provider輸出`ProviderSnapshot(provider_id, status, attempt/success timestamps, revision, sources, diagnostics)`。GitHub provider以authenticated `gh api`取得issues、PRs、closing refs、reviews、threads、checks與default branch trees；repo provider掃描固定artifact globs並排除`openspec/changes/archive/**`；workflow provider只讀Manager registry/evidence。
+
+Monitor將provider snapshot寫入`$PSC_MONITOR_STATE_ROOT/work-items.snapshot.json`，default root為`$PSC_AGENTS_ROOT/monitor`，schema固定`work-items-snapshot/v1`。成功才替換該provider sources；failure保留last-good sources並標degraded。Reducer使用「所有provider的last-good source集合 + current health」重建WorkItems，因此failure不能看成empty/removal。
+
+對受degraded provider影響的work item，保留prior lifecycle state、加入`degraded` facet，禁止new dispatch/done/merge。900秒無GitHub success是Manager hard gate；300秒是default refresh，不是freshness guarantee。
+
+### 2. Correlation分authority graph與display clusters
+
+Source以`kind + canonical ref`形成stable `source_id`。Confirmed edges只來自`.cortex/work-items.yaml`、`work_item` frontmatter、GitHub closing reference與Manager metadata。Stable work ID依序為explicit work item、`issue:<owner>/<repo>#N`、source locator。
+
+Title/slug/branch/issue token heuristic必須至少兩個independent signals、沒有competing candidate，才可產生inferred cluster。Inferred source保留`confidence=inferred`，不能成為claim/merge/done input。`--explain`回傳accepted/rejected signals、competitors、exclusions與reducer trace。
+
+Override parser只讀repo root `.cortex/work-items.yaml` version 1；unknown key、path escape、duplicate或ownership collision fail-closed。Link/unlink由Manager原子更新；unlink一定建立negative exclusion。
+
+### 3. Lifecycle不是Workflow phase
+
+WorkItem lifecycle固定`topic|todo|ongoing|done`，public顯示`on-going`。Workflow phase固定`claim|define|plan|build|verify|review|ship`。`queued/blocked/needs_human`不創建新lifecycle state。
+
+Strict closure是合取：mapped PR以merge commit進default branch、所有mapped issues closed、OpenSpec在遠端default branch archive且active path消失、Todo tasks完成、CompletionRecord schema/hash/revisions有效。Local uncommitted overlay可使topic顯示todo，但永遠不能證明done。
+
+若issue reopen或active OpenSpec同名再出現，reducer依source truth退回topic/todo；CompletionRecord保留audit但不覆蓋current contradiction。
+
+### 4. CLI與socket共用versioned serializer
+
+CLI `--json`與socket work-item payload共用`cortex-work/v1` serializer與canonical ordering。`list`預設只列topic/todo/on-going；`--all`含done。`--state`接受`ongoing`或`on-going`，輸出只用`on-going`。
+
+Socket unary envelope沿用`{ok,data|error}`，新增request kind `list_work_items`、`get_work_item`、`explain_work_item`；subscription新增`subscribe_work_items`，event為`work_snapshot|work_change`並帶sequence。舊ProjectState requests保留一個release cycle，help與response diagnostic標deprecated。
+
+### 5. Workflow registry v2做原子備份migration
+
+Manager首次讀v1 registry時，在同目錄以content hash與timestamp建立不可覆寫backup，fsync後才以atomic replace寫v2。V1 jobs/slices映射為`legacy_records`，不得推測work_id、不得自動附掛WorkflowRun。Unknown/malformed schema拒絕migration且原檔不變。
+
+`WorkflowRun`保存work ID、claim key、combo、phase、steps、issue/OpenSpec/PR refs、attempts與evidence refs。每個`WorkflowStep`保存phase、persona、card、executor/model/domain、inputs/outputs、gate result。Active claim key唯一；restart/duplicate control request回既有run。
+
+### 6. Claim manual-first、label opt-in
+
+`cortex work start`可啟動confirmed Todo。Auto claim要求同一work item同時具有confirmed Todo與confirmed GitHub issue，且issue帶`cortex:auto-on-going`。Issue-only即使帶label仍是topic，不派工；Todo缺issue設`needs_human:missing_issue`，不自動建issue。Operator link後`resume`重用run/claim key。
+
+`work auto --enable|--disable`使用GitHub REST管理label。移除label只阻止尚未claim工作，不中止active run。Provider stale/degraded、association conflict或non-GitHub forge皆fail-closed。
+
+### 7. Persona completeness與independence是manifest gate
+
+Deck compiler把card `persona_binding`原樣寫入workflow manifest。新增planner persona；default combo `feature-oneshot`依序執行planner、builder、reviewer、manager。Artifact必須有frontmatter `status: accepted`、必要章節且沒有blocking decision marker才算accepted。Marker只接受獨立行`TBD`、`[TBD]`、`Decision: TBD`、`決策：未定`或Open Questions中的實際項目；inline說明與fenced code忽略。缺accepted spec/design/plan或存在marker時，primary planner先產question pack，secondary planner只回evidence，primary整合。
+
+Model identity registry顯式映射executor/model/domain；secondary選擇`agy/google → claude/anthropic → codex/openai`，排除primary domain。`agy` argv固定`agy --print --mode plan --sandbox ...`等價結構，不允許unsafe bypass。Malformed output、unknown identity、same-domain或live probe failure皆停止在needs_human。
+
+Builder與Foreign Reviewer沿用Candidate verification/review，但reviewer必須不同domain且在detached exact HEAD。Brainstorm peer evidence與ForeignReview evaluation保存不同step/gate refs，不可互換；Copilot也只屬ship gate。
+
+### 8. Ship以每個HEAD為review epoch
+
+Manager先以官方`openspec archive -y <change>`產生archive diff，確認tasks全勾、canonical specs與doc refs，再加入changelog fragment。PR metadata使用zh-TW conventional title/body/labels，issue引用用`Closes #N`。
+
+快速`python3 -m policy_check --repo .`後執行`PSC_PREFLIGHT_CMD`；初次帶draft metadata，既有PR修正帶`--pr N`。Preflight須涵蓋pytest、`openspec validate --all`與PR-context policy。`--skip-tests`只接受同tree hash、fresh、full-suite evidence。
+
+Push/PR後等待checks terminal-green，request `@copilot`並驗review `commit_id == HEAD`、非error、threads resolved/outdated。每次push建立新review epoch並重新request。Finding由Builder修正或Reviewer以證據判誤報；最多兩輪、每HEAD 15分鐘。超時或第三輪finding轉needs_human。
+
+Merge前重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，若任一revision改變就重跑相應gate。只用`gh pr merge --merge`，不使用`--auto`。
+
+### 9. Done在merge後以remote snapshot重證
+
+Merge後fetch default branch，驗merge commit ancestry、mapped issue closed、active OpenSpec消失、archive存在、Todo complete，再寫versioned CompletionRecord。Record綁定work ID、workflow/run/step IDs、source revisions、PR/head/merge SHA、issue states、archive tree、Todo revisions與gate evidence hashes。
+
+Monitor只在GitHub/provider fresh且Record驗證通過時投影done；record缺失、stale、source contradiction或provider degraded皆不升done。
+
+## Failure handling
+
+- GitHub auth/rate-limit/timeout：沿用GitHub last-good、degraded facet、禁claim/merge/done。
+- Repo scan race/mount error：沿用該repo last-good；成功完整scan前不remove。
+- Override/frontmatter collision：repo provider degraded；explain列出每個claim edge。
+- Registry migration crash：backup保留，atomic destination不是完整v2就拒啟動，不猜測修復。
+- Agent/model/agy unavailable：needs_human，不降級到same-domain。
+- Copilot timeout/error/old HEAD：needs_human或重請current epoch，不把COMMENTED當approval gate shortcut。
+- HEAD/check/thread race：停止merge，重建epoch並重跑gate。
+
+## Migration Plan
+
+1. Baseline：修issue #4 scan stability；刪除已archive change的stale active copy；核對issue #10。
+2. PR A：provider/snapshot/reducer/correlation/override/read CLI/socket；不啟用mutation。
+3. PR B：planner/persona manifest/registry v2/agy/brainstorm；auto仍off。
+4. PR C：manual/label claim、preflight/Copilot/merge/remote closure與work actions。
+5. PR D：doctor/help/README/service/migration docs、archive此change、live docs-only canary。
+
+## Risks / Trade-offs
+
+- GitHub provider成本與rate-limit：批次GraphQL/REST、ETag/revision cache、300s default refresh；stale時安全停機。
+- JSON snapshot/registry成長：保留schema/hash/atomic write；有實測scale證據再導入journal。
+- 四PR跨期相容：PR A只read、PR B只建workflow能力、PR C才mutation；feature flags/auto-off避免半套ship。
+- Copilot bounded wait拖慢delivery：這是current-HEAD assurance成本；超時交operator，不偷換reviewer。
+- Remote archive與local overlay矛盾：done只相信remote default branch，local只作todo overlay。
+
+## Open Questions
+
+無blocking open question。Override path、frontmatter key、snapshot path/schema、CLI JSON schema、refresh/freshness、review rounds/timeouts、merge strategy與forge scope均已在本change鎖定。

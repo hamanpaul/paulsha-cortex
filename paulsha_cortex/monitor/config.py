@@ -130,9 +130,19 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
             f"config.monitor.legacy_policy 必須是 {ALLOWED_LEGACY_POLICIES} 之一，得到 {legacy_policy!r}"
         )
 
-    poll_interval = int(monitor.get("poll_interval_seconds", 60))
-    rescan_interval = int(monitor.get("rescan_interval_seconds", 300))
-    debounce = int(monitor.get("watch_debounce_ms", 500))
+    intervals: dict[str, int] = {}
+    for field_name, default in (
+        ("poll_interval_seconds", 60),
+        ("rescan_interval_seconds", 300),
+        ("watch_debounce_ms", 500),
+    ):
+        value = monitor.get(field_name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"config.monitor.{field_name} 必須是正整數，得到 {value!r}")
+        intervals[field_name] = value
+    poll_interval = intervals["poll_interval_seconds"]
+    rescan_interval = intervals["rescan_interval_seconds"]
+    debounce = intervals["watch_debounce_ms"]
 
     socket_raw = monitor.get("socket_path")
     socket_path = (

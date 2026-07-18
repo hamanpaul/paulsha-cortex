@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.monitor.fs import stable_path
 
 
 def _default_hippo_path() -> Path:
@@ -56,7 +57,7 @@ def load_hippo_projects(path: Path | None = None) -> list[ProjectEntry]:
                 raise ValueError(
                     f"project-hippo.yaml projects[{index}].roots[{root_index}] 不可為空字串：{src}"
                 )
-            resolved = Path(raw_root).expanduser().resolve()
+            resolved = stable_path(Path(raw_root).expanduser())
             entries.append(
                 ProjectEntry(
                     path=resolved,
@@ -75,7 +76,7 @@ def merge_projects(
     merged: list[ProjectEntry] = []
     for entry in [*manual, *hippo]:
         # 於函式內強制 realpath 正規化——不假設 caller 已 resolve（symlink/./.. 亦去重）
-        key = entry.path.expanduser().resolve()
+        key = stable_path(entry.path.expanduser())
         if key in seen:
             continue
         seen.add(key)
