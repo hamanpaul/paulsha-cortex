@@ -339,6 +339,7 @@ class WorkModelRefresher:
         with self._lock:
             previous = self.read_store.current_snapshot()
             providers = dict(previous.providers)
+            active_provider_ids: set[str] = set()
             projected_items: list[WorkItem] = []
             source_owners: dict[str, str] = {}
             exclusions: list[Mapping[str, str]] = []
@@ -364,6 +365,7 @@ class WorkModelRefresher:
                 providers[workflow.provider_id] = workflow
                 relevant.append(workflow)
                 github_id = f"github:{repo}"
+                terminal_id = f"github-terminal:{repo}"
                 if include_github and is_github:
                     github_result = self.github_provider_factory(repo).scan()
                     github = _retain_last_good(providers.get(github_id), github_result)
@@ -377,35 +379,46 @@ class WorkModelRefresher:
                     relevant.append(terminal)
                 elif github_id in providers:
                     relevant.append(providers[github_id])
-                    terminal_id = f"github-terminal:{repo}"
                     if terminal_id in providers:
                         relevant.append(providers[terminal_id])
-                if github_id in providers and not WorkSnapshot(
+                freshness_snapshot = WorkSnapshot(
                     sequence=previous.sequence,
                     written_at=attempted_at,
                     providers=providers,
                     work_items=(),
                     source_owners={},
                     exclusions=(),
-                ).provider_is_fresh(
-                    github_id,
-                    now=current_time,
-                    max_age=self.stale_after_seconds,
-                ):
-                    stale = providers[github_id]
+                )
+                relevant_ids = {provider.provider_id for provider in relevant}
+                for authority_id in (github_id, terminal_id):
+                    fresh = freshness_snapshot.provider_is_fresh(
+                        authority_id,
+                        now=current_time,
+                        max_age=self.stale_after_seconds,
+                    )
+                    if authority_id not in relevant_ids or fresh:
+                        continue
                     stale = replace(
-                        stale,
+                        providers[authority_id],
                         status="degraded",
                         last_attempt_at=attempted_at,
                         diagnostics=tuple(
-                            dict.fromkeys((*stale.diagnostics, f"{github_id} stale"))
+                            dict.fromkeys(
+                                (
+                                    *providers[authority_id].diagnostics,
+                                    f"{authority_id} stale",
+                                )
+                            )
                         ),
                     )
-                    providers[github_id] = stale
+                    providers[authority_id] = stale
                     relevant = [
-                        stale if provider.provider_id == github_id else provider
+                        stale if provider.provider_id == authority_id else provider
                         for provider in relevant
                     ]
+                active_provider_ids.update(
+                    provider.provider_id for provider in relevant
+                )
                 sources = tuple(
                     source for provider in relevant for source in provider.sources
                 )
@@ -477,6 +490,11 @@ class WorkModelRefresher:
                         for source_id, owner in correlation.source_owners.items()
                     )
                     exclusions.extend(correlation.exclusions)
+            providers = {
+                provider_id: provider
+                for provider_id, provider in providers.items()
+                if provider_id in active_provider_ids
+            }
             snapshot = WorkSnapshot(
                 sequence=previous.sequence + 1,
                 written_at=attempted_at,
@@ -548,13 +566,31 @@ def _parse_inferred_signals(observations: Mapping) -> tuple[InferredSignal, ...]
     for row in observations.get("inferred_signals", []):
         if not isinstance(row, Mapping):
             continue
+        work_id = row.get("work_id")
+        kind = row.get("kind")
+        value = row.get("value")
+        if any(
+            not isinstance(field, str) or not field
+            for field in (work_id, kind, value)
+        ):
+            continue
+        source_ids = row.get("source_ids")
+        if (
+            not isinstance(source_ids, (list, tuple))
+            or not source_ids
+            or any(
+                not isinstance(source_id, str) or not source_id
+                for source_id in source_ids
+            )
+        ):
+            continue
         try:
             parsed.append(
                 InferredSignal(
-                    work_id=row["work_id"],
-                    kind=row["kind"],
-                    value=row["value"],
-                    source_ids=tuple(row["source_ids"]),
+                    work_id=work_id,
+                    kind=kind,
+                    value=value,
+                    source_ids=tuple(source_ids),
                     weight=float(row.get("weight", 1.0)),
                 )
             )

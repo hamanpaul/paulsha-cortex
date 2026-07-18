@@ -11,6 +11,7 @@ from paulsha_cortex.monitor.work_api import (
     AmbiguousWorkItemError,
     WorkModelRefresher,
     WorkReadModelStore,
+    _parse_inferred_signals,
 )
 from paulsha_cortex.monitor.models import ProjectState
 from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
@@ -19,6 +20,31 @@ from paulsha_cortex.monitor.work_snapshot import WorkSnapshot, WorkSnapshotStore
 
 
 NOW = "2026-07-17T10:00:00Z"
+
+
+def test_inferred_signal_parser_rejects_malformed_fields() -> None:
+    base = {
+        "work_id": "candidate",
+        "kind": "slug",
+        "value": "candidate",
+    }
+    observations = {
+        "inferred_signals": [
+            {**base, "source_ids": ["github:issue:1", "path:plan.md"]},
+            {**base, "source_ids": "github:issue:1"},
+            {**base, "source_ids": []},
+            {**base, "source_ids": ["github:issue:1", ""]},
+            {**base, "source_ids": ["github:issue:1", 7]},
+            {**base, "kind": ["slug"], "source_ids": ["github:issue:1"]},
+            {**base, "value": {"slug": "candidate"}, "source_ids": ["github:issue:1"]},
+        ]
+    }
+
+    parsed = _parse_inferred_signals(observations)
+
+    assert [signal.source_ids for signal in parsed] == [
+        ("github:issue:1", "path:plan.md")
+    ]
 
 
 def _item(repo: str, work_id: str, *, state: str = "todo") -> WorkItem:
@@ -808,13 +834,28 @@ work_items:
     assert store.get_work_item("umbrella", repo="example/acme")["item"]["state"] != "done"
 
 
-def test_stale_github_snapshot_freezes_state_and_closes_automation_gates(tmp_path):
+@pytest.mark.parametrize(
+    "stale_provider_id",
+    ("github:example/acme", "github-terminal:example/acme"),
+)
+def test_stale_github_snapshot_freezes_state_and_closes_automation_gates(
+    tmp_path, stale_provider_id
+):
     stale = "2026-07-17T09:44:59Z"
-    provider = _provider("github:example/acme", at=stale)
+    providers = {
+        provider_id: _provider(
+            provider_id,
+            at=stale if provider_id == stale_provider_id else NOW,
+        )
+        for provider_id in (
+            "github:example/acme",
+            "github-terminal:example/acme",
+        )
+    }
     previous = WorkSnapshot(
         sequence=1,
         written_at=stale,
-        providers={provider.provider_id: provider},
+        providers=providers,
         work_items=(_item("example/acme", "work", state="todo"),),
         source_owners={},
         exclusions=(),
@@ -838,7 +879,7 @@ def test_stale_github_snapshot_freezes_state_and_closes_automation_gates(tmp_pat
     assert store.list_work_items()["hard_gates"] == {
         "auto_claim": False,
         "merge": False,
-        "reasons": ["github:example/acme stale"],
+        "reasons": [f"{stale_provider_id} stale"],
     }
 
 

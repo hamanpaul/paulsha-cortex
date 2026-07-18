@@ -421,3 +421,21 @@ def test_refresher_projects_local_provider_and_freezes_on_collision(tmp_path):
     provider = durable.load().providers["repo:example/acme"]
     assert provider.status == "degraded"
     assert any(source.ref == "docs/superpowers/specs/work.md" for source in provider.sources)
+
+
+def test_refresher_prunes_provider_state_after_authoritative_project_removal(tmp_path):
+    repo = tmp_path / "repo"
+    spec = repo / "docs/superpowers/specs/work.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("---\nwork_item: work\n---\n# work\n", encoding="utf-8")
+    durable = WorkSnapshotStore(tmp_path / "state/work-items.snapshot.json")
+    read_store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(durable_store=durable, read_store=read_store)
+    project = ProjectState(project_id="example/acme", workspace="ws", path=str(repo))
+    refresher.refresh((project,), include_github=False)
+
+    events = refresher.refresh((), include_github=False)
+
+    assert any(event.removed and event.work_item.work_id == "work" for event in events)
+    assert durable.load().providers == {}
+    assert read_store.list_work_items(include_done=True)["items"] == []
