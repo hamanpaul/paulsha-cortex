@@ -47,7 +47,7 @@ def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree
         return [
             "codex", "exec", prompt, "--json", "--sandbox", "read-only",
             "--model", identity.model_id, "-o", str(Path(temp_dir) / "last.json"),
-            "-C", str(worktree),
+            "-C", str(worktree), "--skip-git-repo-check",
         ]
     if identity.executor == "claude":
         return [

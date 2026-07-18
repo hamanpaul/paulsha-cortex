@@ -889,10 +889,11 @@ def _claim_action(
 ) -> dict[str, Any]:
     canonical_run = None
     if workflow_registry is not None:
+        all_runs = workflow_registry.list_workflow_runs()
         expected_key = _expected_claim_key(authority)
         matching = [
             run
-            for run in workflow_registry.list_workflow_runs()
+            for run in all_runs
             if run.repo == authority.repo
             and run.work_id == authority.work_id
             and run.claim_key == expected_key
@@ -900,6 +901,23 @@ def _claim_action(
         if len(matching) > 1:
             raise RuntimeError("canonical workflow claim is ambiguous")
         canonical_run = matching[0] if matching else None
+        if canonical_run is None and (automatic or args.get("action") == "resume"):
+            active = [
+                run
+                for run in all_runs
+                if run.repo == authority.repo
+                and run.work_id == authority.work_id
+                and run.status == "ongoing"
+                and run.issue_refs
+                == tuple(
+                    f"{authority.repo}#{number}"
+                    for number in authority.mapped_issues
+                )
+                and run.openspec_refs == authority.mapped_openspec
+            ]
+            if len(active) > 1:
+                raise RuntimeError("active workflow identity is ambiguous")
+            canonical_run = active[0] if active else None
     issue = args.get("issue") if args.get("issue") is not None else (
         authority.mapped_issues[0] if authority.mapped_issues else None
     )
@@ -925,6 +943,26 @@ def _claim_action(
             work_authority_digest(authority) if canonical_run is not None else None
         ),
     )
+    if (
+        canonical_run is not None
+        and canonical_run.claim_key != _expected_claim_key(authority)
+        and (automatic or args.get("action") == "resume")
+    ):
+        active = canonical_run.to_dict()
+        active.update(
+            {
+                "snapshot_hash": authority.snapshot_hash,
+                "source_revisions": list(authority.source_revisions),
+                "provider_revision": authority.github_provider_revision,
+                "authority_digest": work_authority_digest(authority),
+                "status": workflow_status(canonical_run),
+            }
+        )
+        return {
+            "action": "resume",
+            "reason": "active-workflow",
+            "run": active,
+        }
     decision = (
         decide_auto_claim(candidate, now_epoch=now_epoch)
         if automatic

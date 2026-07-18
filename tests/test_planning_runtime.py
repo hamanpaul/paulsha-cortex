@@ -60,6 +60,7 @@ def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
     assert codex_calls and all(
         argv[argv.index("--sandbox") + 1] == "read-only" for argv in codex_calls
     )
+    assert all("--skip-git-repo-check" in argv for argv in codex_calls)
     agy_calls = [
         argv for argv in calls if argv and argv[0] == "agy" and argv != ["agy", "models"]
     ]
