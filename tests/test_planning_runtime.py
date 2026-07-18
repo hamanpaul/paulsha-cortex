@@ -77,6 +77,108 @@ def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
     assert claude_argv[claude_argv.index("--tools") + 1] == ""
 
 
+def test_secondary_prompt_embeds_bounded_repo_sources_without_tool_access(
+    monkeypatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "openspec" / "changes" / "demo" / "proposal.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nstatus: draft\n---\n## Why\nEvidence.\n", encoding="utf-8")
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary", "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy", "model_id": AGY_MODEL_ID, "independence_domain": "google",
+                "capabilities": ["planning"], "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    prompts: list[str] = []
+
+    def runner(argv, **kwargs):
+        if argv == ["agy", "models"]:
+            return _completed(f"{AGY_MODEL_ID}\n")
+        prompt = argv[argv.index("--print") + 1] if "--print" in argv else argv[2]
+        prompts.append(prompt)
+        for marker in (
+            "Return only this compact JSON object and perform no tool calls: ",
+            "Return only this JSON object and do not call tools: ",
+        ):
+            if marker in prompt:
+                return _completed(prompt.split(marker, 1)[1] + "\n")
+        return _completed(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "question_pack_id": "qp-demo",
+                    "evidence": [
+                        {
+                            "question_id": "q-demo",
+                            "claims": ["The proposal records the intended evidence."],
+                            "source_refs": ["openspec/changes/demo/proposal.md"],
+                        }
+                    ],
+                }
+            )
+        )
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"), worktree=tmp_path, runner=runner
+    )
+    result = runtime.secondary_planner(
+        {
+            "schema_version": 1,
+            "pack_id": "qp-demo",
+            "questions": [
+                {
+                    "question_id": "q-demo",
+                    "kind": "missing-spec",
+                    "prompt": "What is required?",
+                    "source_refs": ["openspec/changes/demo/proposal.md"],
+                }
+            ],
+        },
+        registry.require("agy", AGY_MODEL_ID),
+    )
+
+    assert result["question_pack_id"] == "qp-demo"
+    assert "Do not call tools" in prompts[-1]
+    assert "Evidence." in prompts[-1]
+    assert planning_runtime._planning_destinations(
+        {
+            "questions": [
+                {"source_refs": ["openspec/changes/demo/proposal.md"]}
+            ]
+        }
+    )["plan"] == "docs/superpowers/plans/demo.md"
+
+
+def test_planning_json_parser_accepts_only_whole_fenced_object(tmp_path: Path) -> None:
+    output = tmp_path / "missing.json"
+    assert planning_runtime._extract_json(
+        '```json\n{"schema_version": 1}\n```\n', output
+    ) == {"schema_version": 1}
+    with pytest.raises(ValueError, match="no JSON object"):
+        planning_runtime._extract_json(
+            'Commentary.\n```json\n{"schema_version": 1}\n```\n', output
+        )
+
+
+def test_planning_source_material_rejects_symlink_traversal(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n", encoding="utf-8")
+    link = tmp_path / "linked.md"
+    link.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="symlink"):
+        planning_runtime._planning_source_material(
+            {"questions": [{"source_refs": ["linked.md"]}]}, root=tmp_path
+        )
+
+
 def test_planning_runtime_rejects_any_worktree_mutation(tmp_path: Path) -> None:
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
     baseline = tmp_path / "tracked.md"

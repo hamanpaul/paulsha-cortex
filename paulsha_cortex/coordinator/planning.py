@@ -241,11 +241,16 @@ def _build_default_question_pack(
 ) -> QuestionPack:
     questions: list[PlanningQuestion] = []
     for kind in missing_kinds:
+        source_refs = tuple(
+            assessment.artifact.ref
+            for assessment in assessments
+            if assessment.artifact.kind == kind
+        )
         questions.append(
             _make_question(
                 f"missing-{kind}",
                 f"What authoritative content is required to create an accepted {kind}?",
-                (),
+                source_refs,
             )
         )
     for assessment in assessments:

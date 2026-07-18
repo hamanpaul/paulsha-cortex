@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Callable, Mapping
 
 from .launcher import build_agy_argv
@@ -169,8 +171,14 @@ def _extract_json(stdout: str, output_path: Path) -> object:
     candidates = [stdout.strip()]
     if output_path.is_file():
         candidates.insert(0, output_path.read_text(encoding="utf-8").strip())
-    candidates.extend(reversed([line.strip() for line in stdout.splitlines() if line.strip()]))
     for candidate in candidates:
+        fenced = re.fullmatch(
+            r"```(?:json)?\s*\n(?P<body>\{.*\})\s*\n```",
+            candidate,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if fenced is not None:
+            candidate = fenced.group("body")
         try:
             value = json.loads(candidate)
         except (json.JSONDecodeError, TypeError):
@@ -301,6 +309,72 @@ def _probe_identity(
     )
 
 
+def _planning_source_material(
+    pack: Mapping[str, object], *, root: Path, max_bytes: int = 262_144
+) -> dict[str, str]:
+    questions = pack.get("questions")
+    if not isinstance(questions, list):
+        raise ValueError("planning question pack has no questions")
+    refs = sorted(
+        {
+            ref
+            for question in questions
+            if isinstance(question, dict)
+            for ref in question.get("source_refs", [])
+            if isinstance(ref, str)
+        }
+    )
+    material: dict[str, str] = {}
+    total = 0
+    for ref in refs:
+        pure = PurePosixPath(ref)
+        if pure.is_absolute() or ".." in pure.parts or pure.as_posix() != ref:
+            raise ValueError("planning source ref is not canonical repo-relative")
+        current = root
+        for part in pure.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("planning source ref traverses symlink")
+        try:
+            target = current.resolve(strict=True)
+            target.relative_to(root)
+        except (OSError, ValueError) as exc:
+            raise ValueError("planning source ref is unavailable") from exc
+        if not target.is_file():
+            raise ValueError("planning source ref is not a file")
+        try:
+            body = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError("planning source ref is unreadable") from exc
+        total += len(body.encode("utf-8"))
+        if total > max_bytes:
+            raise ValueError("planning source material exceeds bounded context")
+        material[ref] = body
+    return material
+
+
+def _planning_destinations(pack: Mapping[str, object]) -> dict[str, str]:
+    questions = pack.get("questions")
+    if not isinstance(questions, list):
+        return {}
+    slugs = {
+        parts[2]
+        for question in questions if isinstance(question, dict)
+        for ref in question.get("source_refs", [])
+        if isinstance(ref, str)
+        and (parts := PurePosixPath(ref).parts)[:2] == ("openspec", "changes")
+        and len(parts) >= 4
+    }
+    if len(slugs) != 1:
+        return {}
+    slug = next(iter(slugs))
+    return {
+        "spec": f"docs/superpowers/specs/{slug}-spec.md",
+        "design": f"docs/superpowers/specs/{slug}-design.md",
+        "plan": f"docs/superpowers/plans/{slug}.md",
+    }
+
+
 def build_production_planning_runtime(
     *,
     primary: tuple[str, str],
@@ -348,10 +422,19 @@ def build_production_planning_runtime(
         )
 
     def secondary(pack: Mapping[str, object], identity: ModelIdentity) -> object:
+        source_material = _planning_source_material(pack, root=root)
         return _invoke_json(
             identity,
-            "Return only evidence JSON; do not make decisions or edit files. Question pack: "
-            + json.dumps(pack, ensure_ascii=False, sort_keys=True),
+            "Do not call tools, run commands, make decisions, or edit files. Use only the supplied "
+            "source material. Return exactly one JSON object with keys schema_version=1, "
+            "question_pack_id, and evidence. Evidence must contain every question exactly once; "
+            "each row has only question_id, non-empty claims string list, and non-empty source_refs "
+            "string list naming supplied sources. Input: "
+            + json.dumps(
+                {"question_pack": pack, "source_material": source_material},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
             worktree=root,
             runner=runner,
             timeout_seconds=timeout_seconds,
@@ -359,9 +442,21 @@ def build_production_planning_runtime(
 
     def integrator(pack: Mapping[str, object], evidence: Mapping[str, object]) -> object:
         return invoke_primary(
-            "Integrate evidence without editing files. Return integration JSON with an artifacts list; "
-            "each artifact must contain kind, path, and complete UTF-8 content. "
-            + json.dumps({"question_pack": pack, "secondary_evidence": evidence}, ensure_ascii=False, sort_keys=True)
+            "Do not call tools or edit files. Integrate only the supplied evidence. Return exactly one "
+            "JSON object with schema_version=1, question_pack_id, secondary_evidence_hash, resolutions, "
+            "and artifacts. Each resolution has only question_id, decision, artifact_kind, artifact_refs. "
+            "Each artifact has only kind, path, content; content must be complete UTF-8 Markdown with "
+            "frontmatter status: accepted, the matching work_item, and required headings: Requirements "
+            "for spec, Decisions for design, Tasks for plan. Use the supplied destination paths. Input: "
+            + json.dumps(
+                {
+                    "question_pack": pack,
+                    "secondary_evidence": evidence,
+                    "destinations": _planning_destinations(pack),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         )
 
     return ProductionPlanningRuntime(registry, probes, questioner, secondary, integrator)

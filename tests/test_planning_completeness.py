@@ -159,6 +159,22 @@ def test_completeness_requires_accepted_spec_design_and_plan() -> None:
     assert [question.kind for question in report.default_question_pack.questions] == ["missing-plan"]
 
 
+def test_rejected_artifacts_remain_authoritative_sources_for_missing_kind_questions() -> None:
+    report = assess_planning_completeness(
+        [
+            _artifact("spec", "---\nstatus: draft\n---\n## Requirements\nDraft.\n", "openspec/changes/demo/proposal.md"),
+            _artifact("design", "---\nstatus: draft\n---\n## Decisions\nDraft.\n", "openspec/changes/demo/design.md"),
+            _artifact("plan", "---\nstatus: draft\n---\n## Tasks\n- [ ] Draft.\n", "openspec/changes/demo/tasks.md"),
+        ]
+    )
+
+    assert [question.source_refs for question in report.default_question_pack.questions] == [
+        ("openspec/changes/demo/proposal.md",),
+        ("openspec/changes/demo/design.md",),
+        ("openspec/changes/demo/tasks.md",),
+    ]
+
+
 def test_any_blocking_marker_triggers_brainstorm_even_when_an_alternate_artifact_is_accepted() -> None:
     report = assess_planning_completeness(
         [
