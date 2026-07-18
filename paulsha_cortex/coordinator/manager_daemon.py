@@ -401,7 +401,12 @@ def build_request_executor(
                         allow_unsafe=False,
                         model=identity.model_id,
                     )
-                    if args.get("action") == "resume":
+                    if args.get("action") == "resume" and run.current_phase in {
+                        "plan",
+                        "build",
+                        "verify",
+                        "review",
+                    }:
                         active_ship_validator = workflow_ship_validator
                         if (
                             active_ship_validator is None
