@@ -168,6 +168,63 @@ def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
     assert result["result"]["job_id"] == "new-build-job"
 
 
+def test_public_work_resume_preserves_define_retry_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="define",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"define": 1},
+        facets=("needs_human",),
+        brainstorm_required=True,
+        gate_status="running",
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    monkeypatch.setattr(
+        manager,
+        "resume_workflow_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("define retry is completed by the canonical work starter")
+        ),
+    )
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        work_action_fn=lambda **_: {
+            "work_id": run.work_id,
+            "repo": run.repo,
+            "result": {
+                "action": "needs_human",
+                "reason": "planning-runtime-initialization-failed",
+                "run": run.to_dict(),
+            },
+        },
+    )
+
+    result = executor(
+        build_request(
+            req_type="work-action",
+            args={"action": "resume", "repo": run.repo, "work_id": run.work_id},
+            requested_by="operator",
+        )
+    )
+
+    assert result["result"]["reason"] == "planning-runtime-initialization-failed"
+    assert result["result"]["run"]["current_phase"] == "define"
+    assert result["result"]["run"]["facets"] == ["needs_human"]
+
+
 def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     candidate = "a" * 40
