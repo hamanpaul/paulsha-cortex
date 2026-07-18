@@ -309,6 +309,48 @@ def test_source_change_starts_new_canonical_run(tmp_path: Path) -> None:
     assert "blocked" in old.facets
 
 
+def test_auto_scan_does_not_supersede_active_run_when_planning_adds_sources(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    first = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    _snapshot(
+        snapshot,
+        source_revisions=(
+            "issue:12@open",
+            "openspec:demo@1",
+            "superpowers_plan:docs/demo.md@active",
+        ),
+        provider_revision="gh-2",
+    )
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        runner=lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"labels": [{"name": "cortex:auto-on-going"}]}),
+            stderr="",
+        ),
+        workflow_registry=registry,
+    )
+
+    assert result[0]["action"] == "resume"
+    assert result[0]["run"]["run_id"] == first["result"]["run"]["run_id"]
+    assert len(registry.list_workflow_runs()) == 1
+    assert registry.list_workflow_runs()[0].status == "ongoing"
+
+
 def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
     tmp_path: Path,
 ) -> None:
