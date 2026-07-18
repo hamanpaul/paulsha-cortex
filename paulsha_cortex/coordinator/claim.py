@@ -243,11 +243,14 @@ def _authority_from_canonical_row(
     sources = row.get("sources")
     if not isinstance(repo, str) or not isinstance(work_id, str) or not isinstance(sources, list):
         raise ValueError("canonical work authority row malformed")
-    if (
-        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
-        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
-    ):
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None:
         raise ValueError("canonical work authority identity invalid")
+    next_actions = row.get("next_actions")
+    if next_actions is not None and (
+        not isinstance(next_actions, list)
+        or any(not isinstance(action, str) or not action for action in next_actions)
+    ):
+        raise ValueError("canonical work authority actions malformed")
     if any(
         not isinstance(source, dict)
         or source.get("confidence") not in {"confirmed", "inferred"}
@@ -256,6 +259,18 @@ def _authority_from_canonical_row(
         raise ValueError("canonical work authority sources malformed")
     if sources and all(source["confidence"] == "inferred" for source in sources):
         return None
+    if next_actions is not None and "start" not in next_actions:
+        return None
+    confirmed = [
+        source
+        for source in sources
+        if isinstance(source, dict) and source.get("confidence") == "confirmed"
+    ]
+    todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
+    if not any(source.get("kind") in todo_kinds for source in confirmed):
+        return None
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
+        raise ValueError("canonical work authority identity invalid")
     provider_id = f"github:{repo}"
     github = providers.get(provider_id)
     if not isinstance(github, dict):
@@ -273,11 +288,6 @@ def _authority_from_canonical_row(
         last_success = datetime.fromisoformat(last_success_at.replace("Z", "+00:00")).timestamp()
     except ValueError as exc:
         raise ValueError("durable GitHub provider timestamp invalid") from exc
-    confirmed = [
-        source
-        for source in sources
-        if isinstance(source, dict) and source.get("confidence") == "confirmed"
-    ]
     issues: list[int] = []
     prs: list[int] = []
     changes: list[str] = []
@@ -299,7 +309,6 @@ def _authority_from_canonical_row(
             if not _safe_todo_path(ref):
                 raise ValueError("canonical Todo work source ref invalid")
             todo_paths.append(ref)
-    todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     confirmed_todo = any(source.get("kind") in todo_kinds for source in confirmed)
     semantic_sources: dict[str, str] = {}
     for source in confirmed:

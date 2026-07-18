@@ -1,5 +1,16 @@
 version: 1
 work_items:
+  unified-work-lifecycle:
+    title: Unified work lifecycle
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#14
+      - kind: openspec
+        ref: unified-work-lifecycle
+      - kind: path
+        ref: docs/superpowers/specs/2026-07-17-unified-work-lifecycle.md
+      - kind: path
+        ref: docs/superpowers/plans/2026-07-17-unified-work-lifecycle.md
   docs-only-lifecycle-canary:
     title: Unified lifecycle live canary
     links:

@@ -1464,6 +1464,7 @@ def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path
         default_model="claude-haiku-4.5",
         run_tick_fn=fake_run_tick,
         scan_specs_fn=lambda specs_dir: [],
+        auto_claim_fn=lambda: [],
     )
 
     runner()
