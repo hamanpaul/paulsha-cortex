@@ -10,7 +10,8 @@ Wire contract (per design §3.6 + spec §B6):
     {"kind": "list_work_items"}
     {"kind": "get_work_item", "work_id": "<id>"}
     {"kind": "explain_work_item", "work_id": "<id>"}
-    {"kind": "subscribe_work_items", "work_ids": ["<id>", ...]}
+    {"kind": "subscribe_work_items", "repo": "owner/repo",
+     "work_ids": ["<id>", ...]}                    # filters optional
 
   Unary response (one JSON object on one line, then close):
     {"ok": true,  "data": <payload>}
@@ -19,6 +20,13 @@ Wire contract (per design §3.6 + spec §B6):
   Subscribe response (newline-delimited JSON event stream):
     {"sequence": <int>, "kind": "snapshot", "projects": [<state>, ...]}
     {"sequence": <int>, "kind": "change",   "project":  <state>}
+    {"schema": "cortex-work/v1", "sequence": <int>,
+     "kind": "work_snapshot", "items": [<work-item>, ...]}
+    {"schema": "cortex-work/v1", "sequence": <int>,
+     "kind": "work_change", "item": <work-item>, "removed": <bool>}
+
+  Subscription events are streamed directly and do not use the unary ok/data
+  wrapper.
 """
 
 from __future__ import annotations
@@ -63,13 +71,21 @@ class _Subscriber:
 
 
 class _WorkSubscriber:
-    def __init__(self, *, work_ids: tuple[str, ...] | None) -> None:
+    def __init__(
+        self,
+        *,
+        repo: str | None,
+        work_ids: tuple[str, ...] | None,
+    ) -> None:
+        self.repo = repo
         self.work_ids = work_ids
         self.queue: queue.Queue = queue.Queue(maxsize=EVENT_QUEUE_MAXSIZE)
         self.alive = True
 
-    def matches(self, work_id: str) -> bool:
-        return self.work_ids is None or work_id in self.work_ids
+    def matches(self, repo: str, work_id: str) -> bool:
+        return (self.repo is None or repo == self.repo) and (
+            self.work_ids is None or work_id in self.work_ids
+        )
 
 
 class MonitorServer:
@@ -289,7 +305,7 @@ class MonitorServer:
                 if not sub.alive:
                     continue
                 for event in events:
-                    if not sub.matches(event.work_item.work_id):
+                    if not sub.matches(event.work_item.repo, event.work_item.work_id):
                         continue
                     payload = {
                         "schema": WORK_API_SCHEMA,
@@ -491,6 +507,10 @@ class MonitorServer:
         store = self._require_work_store(conn)
         if store is None:
             return
+        repo = request.get("repo")
+        if repo is not None and (not isinstance(repo, str) or not repo):
+            _write_line(conn, _error("repo must be a non-empty string"))
+            return
         raw_ids = request.get("work_ids")
         if raw_ids is None:
             work_ids = None
@@ -501,14 +521,16 @@ class MonitorServer:
         else:
             _write_line(conn, _error("work_ids must be a list of non-empty strings"))
             return
-        sub = _WorkSubscriber(work_ids=work_ids)
+        sub = _WorkSubscriber(repo=repo, work_ids=work_ids)
         with self._subscribers_lock:
             self._work_subscribers.append(sub)
         try:
             initial = store.list_work_items(include_done=True)
             initial["kind"] = "work_snapshot"
             initial["items"] = [
-                item for item in initial["items"] if sub.matches(item["work_id"])
+                item
+                for item in initial["items"]
+                if sub.matches(item["repo"], item["work_id"])
             ]
             _write_line(conn, initial)
             while sub.alive and not self._stop_event.is_set():

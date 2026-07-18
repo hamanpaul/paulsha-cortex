@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from paulsha_cortex import cli
 
 
@@ -67,6 +69,21 @@ def test_cortex_list_human_defaults_hide_done(capsys):
     assert "example/acme" in output
     assert "todo" in output
     assert client.requests[0]["include_done"] is False
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["list", "--help"], "--state"),
+        (["work", "show", "--help"], "--repo"),
+    ],
+)
+def test_work_read_commands_expose_standard_help(argv, expected, capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(argv)
+
+    assert error.value.code == 0
+    assert expected in capsys.readouterr().out
 
 
 def test_cortex_list_human_explain_displays_explanation(capsys):

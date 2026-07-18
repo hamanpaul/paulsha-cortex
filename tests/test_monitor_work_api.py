@@ -216,6 +216,58 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
         thread.join(timeout=2)
 
 
+def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
+    work_store = WorkReadModelStore(
+        _snapshot(
+            _item("shared", "todo", repo="example/acme"),
+            _item("shared", "todo", repo="example/other"),
+        )
+    )
+    socket_path = tmp_path / "monitor.sock"
+    server = MonitorServer(
+        store=SnapshotStore(config=MonitorConfig(workspaces=())),
+        work_store=work_store,
+        socket_path=socket_path,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    assert server.wait_until_ready(timeout=2.0)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(socket_path))
+            _send(
+                client,
+                {
+                    "kind": "subscribe_work_items",
+                    "repo": "example/acme",
+                    "work_ids": ["shared"],
+                },
+            )
+            initial = _recv(client)
+            assert [item["repo"] for item in initial["items"]] == ["example/acme"]
+
+            server.publish_work_events(
+                (
+                    WorkChangeEvent(
+                        sequence=8,
+                        work_item=_item("shared", "ongoing", repo="example/other"),
+                        removed=False,
+                    ),
+                    WorkChangeEvent(
+                        sequence=9,
+                        work_item=_item("shared", "ongoing", repo="example/acme"),
+                        removed=False,
+                    ),
+                )
+            )
+            changed = _recv(client)
+            assert changed["sequence"] == 9
+            assert changed["item"]["repo"] == "example/acme"
+    finally:
+        server.stop()
+        thread.join(timeout=2)
+
+
 def test_server_stopped_before_start_never_signals_ready(tmp_path):
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),
