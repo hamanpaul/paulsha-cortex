@@ -18,3 +18,10 @@ work_items:
         ref: hamanpaul/paulsha-cortex#20
       - kind: openspec
         ref: docs-only-lifecycle-canary
+  docs-only-lifecycle-canary-v2:
+    title: Unified lifecycle clean live canary
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#27
+      - kind: openspec
+        ref: docs-only-lifecycle-canary-v2
