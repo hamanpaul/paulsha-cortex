@@ -107,6 +107,25 @@ def test_delivery_gate_accepts_exact_current_head_terminal_green() -> None:
         (
             replace(
                 _facts(),
+                copilot_reviews=(
+                    CopilotReview(
+                        review_id=7,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body=(
+                            "Copilot wasn't able to review this pull request because "
+                            "it exceeds the maximum number of lines."
+                        ),
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=100,
+                    ),
+                ),
+            ),
+            "copilot-error-review",
+        ),
+        (
+            replace(
+                _facts(),
                 review_threads=(ReviewThread(thread_id="t2", resolved=False, outdated=False),),
             ),
             "review-thread-open",

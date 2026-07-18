@@ -162,7 +162,7 @@ def _load_snapshot(snapshot_path: str | Path | None = None) -> tuple[dict, str]:
 
 def _authority_from_row(
     *, row: object, providers: dict, snapshot_hash: str
-) -> WorkAuthority:
+) -> WorkAuthority | None:
     if not isinstance(row, dict):
         raise ValueError("confirmed work authority row malformed")
     repo = row.get("repo")
@@ -237,12 +237,25 @@ def _authority_from_row(
 
 def _authority_from_canonical_row(
     *, row: dict, providers: dict, snapshot_hash: str
-) -> WorkAuthority:
+) -> WorkAuthority | None:
     repo = row.get("repo")
     work_id = row.get("work_id")
     sources = row.get("sources")
     if not isinstance(repo, str) or not isinstance(work_id, str) or not isinstance(sources, list):
         raise ValueError("canonical work authority row malformed")
+    if (
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) is None
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+    ):
+        raise ValueError("canonical work authority identity invalid")
+    if any(
+        not isinstance(source, dict)
+        or source.get("confidence") not in {"confirmed", "inferred"}
+        for source in sources
+    ):
+        raise ValueError("canonical work authority sources malformed")
+    if sources and all(source["confidence"] == "inferred" for source in sources):
+        return None
     provider_id = f"github:{repo}"
     github = providers.get(provider_id)
     if not isinstance(github, dict):
@@ -366,10 +379,11 @@ def load_work_authorities(
 ) -> tuple[WorkAuthority, ...]:
     payload, digest = _load_snapshot(snapshot_path)
     providers = payload["providers"]
-    authorities = tuple(
+    parsed = (
         _authority_from_row(row=row, providers=providers, snapshot_hash=digest)
         for row in payload["work_items"]
     )
+    authorities = tuple(authority for authority in parsed if authority is not None)
     identities = [(authority.repo, authority.work_id) for authority in authorities]
     if len(set(identities)) != len(identities):
         raise ValueError("confirmed work authority missing or ambiguous")

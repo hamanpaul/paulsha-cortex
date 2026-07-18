@@ -21,6 +21,10 @@ COPILOT_ERROR_MARKERS = (
     "encountered an error",
     "failed to review",
     "unable to review",
+    "wasn't able to review",
+    "was not able to review",
+    "couldn't review",
+    "could not review",
 )
 
 

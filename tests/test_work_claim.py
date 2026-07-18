@@ -291,7 +291,29 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
                         "next_actions": ["start"],
                         "workflow_run_id": None,
                         "updated_at": "2026-07-17T10:00:00Z",
-                    }
+                    },
+                    {
+                        "work_id": "display-only",
+                        "repo": "acme/demo",
+                        "title": "Display only",
+                        "state": "topic",
+                        "phase": None,
+                        "facets": [],
+                        "sources": [
+                            {
+                                "source_id": "github_issue:acme/demo#99",
+                                "kind": "github_issue",
+                                "ref": "acme/demo#99",
+                                "revision": "issue-r99",
+                                "status": "open",
+                                "confidence": "inferred",
+                                "provider": "github:acme/demo",
+                            }
+                        ],
+                        "next_actions": [],
+                        "workflow_run_id": None,
+                        "updated_at": "2026-07-17T10:00:00Z",
+                    },
                 ],
                 "source_owners": {
                     "github_issue:acme/demo#14": "acme/demo::lifecycle",
@@ -319,3 +341,7 @@ def test_loader_accepts_pr_a_canonical_durable_snapshot(tmp_path: Path) -> None:
         "openspec:acme/demo:lifecycle@identity:lifecycle;state:active",
         "todo:docs/todo.md@identity:docs/todo.md",
     )
+    with pytest.raises(ValueError, match="missing or ambiguous"):
+        load_work_authority(
+            repo="acme/demo", work_id="display-only", snapshot_path=path
+        )
