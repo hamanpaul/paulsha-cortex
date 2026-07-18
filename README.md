@@ -119,9 +119,16 @@ Cortex 不是 Jira / Notion 式的任務資料庫，而是以檔案為主的 Age
 | Spec | 任務意圖、plan、相依、驗證契約 | `~/.agents/specs/*.md` / `cortex ready` |
 | Job | 一次 Agent process 執行嘗試 | `cortex jobs` / `cortex stat` |
 | Slice | 從 build、verification、review 到交付的生命週期 | `cortex status` 的 `slices` / `attention` |
-| Project Monitor | 從專案 workstream / todo / archive 推導的專案進度 | `cortex monitor --once` |
+| Project Monitor | 從 GitHub、Todo／spec／plan、active OpenSpec 與 workflow registry 投影跨 repo Work Item | `cortex list` / `cortex work show` |
 
-Project Monitor 不會代替 coordinator 狀態：前者觀察專案文件，後者追蹤 Agent 執行與交付 gate。
+Project Monitor 不會代替 coordinator 狀態：前者提供 `topic`／`todo`／`on-going`／`done` read model，後者仍是 workflow 的唯一 writer。可用下列 read-only CLI 查詢；同一 `work-id` 若跨 repo 重複，`show` 必須加 `--repo`：
+
+```bash
+cortex list --repo hamanpaul/paulsha-cortex --state on-going --explain
+cortex work show unified-work-lifecycle --repo hamanpaul/paulsha-cortex --json
+```
+
+Monitor 只允許 override、frontmatter、GitHub closing reference 與通過typed refs驗證的workflow metadata提供 confirmed association；override exclusion 優先抑制所有同work的 confirmed edge。PR body、issue title、artifact／branch slug 等 fuzzy 訊號只顯示。未被 confirmed mapping 擁有的 archived OpenSpec 與 closed GitHub issue／PR 只提供終態證據，不會單獨建立 work item。`done` 的 Todo completion 只採遠端 default branch 的 Todo blob與 archived OpenSpec task checklist revision，不採本機 overlay；所有 mapped PR 都必須是至少雙 parent且可證明已進 default branch 的 merge commit，且 CompletionRecord 保存的 source revisions、PR candidate與merge revision必須逐一符合目前remote truth；所有 mapped OpenSpec refs 也必須完成 archive。GitHub 或其他 authority provider degraded／超過 `provider_stale_after_seconds` 未成功更新時，會保留 last-good state並加上 degraded facet；`cortex-work/v1.hard_gates`只依查詢中的repo/work item authority關閉auto claim與merge，跨repo整體狀態另由`fleet_health`回報。
 
 Monitor 採 last-good 語意：workspace 或 project subtree 暫時無法讀取時，既有項目會保留並帶 `degraded` scan signal，不會發布 removal；只有後續成功掃描父層、確認項目真的消失時才移除。`poll_interval_seconds`、`rescan_interval_seconds` 與 `watch_debounce_ms` 必須全部大於零，錯誤設定會在 service 啟動前直接失敗。
 

@@ -10,6 +10,8 @@ from .fs import checked_resolve, checked_stat_mode
 from .server import MonitorServer
 from .snapshot import ChangeEvent, SnapshotStore
 from .watcher import HAS_WATCHDOG, StubWatcher, WatchdogFileWatcher, Watcher
+from .work_api import WorkModelRefresher, WorkReadModelStore
+from .work_snapshot import SnapshotValidationError, WorkSnapshotStore
 
 
 class ProjectMonitorService:
@@ -26,6 +28,9 @@ class ProjectMonitorService:
         watcher: Watcher | None = None,
         store: SnapshotStore | None = None,
         server: MonitorServer | None = None,
+        work_store: WorkReadModelStore | None = None,
+        durable_work_store: WorkSnapshotStore | None = None,
+        work_refresher: WorkModelRefresher | None = None,
     ) -> None:
         self._config = config
         self._store = store or SnapshotStore(config=config)
@@ -37,26 +42,45 @@ class ProjectMonitorService:
             )
         else:
             self._watcher = StubWatcher()
+        self._durable_work_store = durable_work_store or WorkSnapshotStore()
+        self._work_store = work_store or self._bootstrap_work_store()
+        self._work_refresher = work_refresher or WorkModelRefresher(
+            durable_store=self._durable_work_store,
+            read_store=self._work_store,
+            stale_after_seconds=config.provider_stale_after_seconds,
+        )
         self._server = server or MonitorServer(
             store=self._store,
+            work_store=self._work_store,
             socket_path=config.socket_path,
         )
         self._stop_event = threading.Event()
         self._poll_thread: threading.Thread | None = None
         self._rescan_thread: threading.Thread | None = None
+        self._github_thread: threading.Thread | None = None
         self._debounce_lock = threading.Lock()
         self._debounce_timers: dict[str, threading.Timer] = {}
         self._watch_state_lock = threading.RLock()
         self._project_roots: dict[str, Path] = {}
         self._watched_paths: set[tuple[Path, bool]] = set()
 
+    def _bootstrap_work_store(self) -> WorkReadModelStore:
+        """Serve last-good immediately; invalid snapshots stay fail-closed/empty."""
+        try:
+            snapshot = self._durable_work_store.load_for_bootstrap()
+        except SnapshotValidationError:
+            snapshot = None
+        return WorkReadModelStore(snapshot) if snapshot is not None else WorkReadModelStore.empty()
+
     def run_forever(self) -> None:
         self._prepare_run_dir()
         self._store.load()
+        self._refresh_work_model(include_github=False)
         self._sync_project_roots()
         self._install_watches()
         self._start_poll_thread()
         self._start_rescan_thread()
+        self._start_github_thread()
         try:
             self._server.serve_forever()
         finally:
@@ -85,6 +109,14 @@ class ProjectMonitorService:
         self._rescan_thread = threading.Thread(target=self._rescan_loop, daemon=True)
         self._rescan_thread.start()
 
+    def _start_github_thread(self) -> None:
+        if self._github_thread is not None:
+            return
+        self._github_thread = threading.Thread(
+            target=self._github_refresh_loop, daemon=True
+        )
+        self._github_thread.start()
+
     def _poll_loop(self) -> None:
         interval = max(0.1, float(self._config.poll_interval_seconds))
         while not self._stop_event.wait(interval):
@@ -98,6 +130,13 @@ class ProjectMonitorService:
             if not tracked_ids:
                 continue
             self._publish_refresh(self._store.refresh_projects(tracked_ids))
+
+    def _github_refresh_loop(self) -> None:
+        interval = max(0.1, float(self._config.github_refresh_interval_seconds))
+        while not self._stop_event.is_set():
+            self._refresh_work_model(include_github=True)
+            if self._stop_event.wait(interval):
+                return
 
     def _sync_project_roots(self) -> None:
         with self._watch_state_lock:
@@ -294,12 +333,25 @@ class ProjectMonitorService:
         self._install_watches()
         if event is not None:
             self._server.publish_events((event,))
+        self._refresh_work_model(include_github=False)
 
     def _publish_refresh(self, events: tuple[ChangeEvent, ...]) -> None:
         self._sync_project_roots()
         self._install_watches()
         if events:
             self._server.publish_events(events)
+        self._refresh_work_model(include_github=False)
+
+    def _refresh_work_model(self, *, include_github: bool) -> None:
+        try:
+            events = self._work_refresher.refresh(
+                self._store.current_snapshot(), include_github=include_github
+            )
+        except (OSError, ValueError):
+            # Durable last-good remains available; the next scheduled refresh retries.
+            return
+        if events:
+            self._server.publish_work_events(events)
 
     def _cancel_debounce_timers(self) -> None:
         with self._debounce_lock:
@@ -325,3 +377,9 @@ class ProjectMonitorService:
             and threading.current_thread() is not self._rescan_thread
         ):
             self._rescan_thread.join(timeout=2.0)
+        if (
+            self._github_thread is not None
+            and self._github_thread.is_alive()
+            and threading.current_thread() is not self._github_thread
+        ):
+            self._github_thread.join(timeout=2.0)

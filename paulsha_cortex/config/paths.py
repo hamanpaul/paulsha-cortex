@@ -36,6 +36,15 @@ def run_root() -> Path:
     return _resolve_root("PSC_RUN_ROOT", agents_root() / "run")
 
 
+def monitor_state_root() -> Path:
+    """Durable Monitor state; distinct from the runtime socket directory."""
+    return _resolve_root("PSC_MONITOR_STATE_ROOT", agents_root() / "monitor")
+
+
+def work_items_snapshot_path() -> Path:
+    return monitor_state_root() / "work-items.snapshot.json"
+
+
 def config_root() -> Path:
     return _resolve_root("PSC_CONFIG_ROOT", Path.home() / ".config" / "paulshaclaw")
 
