@@ -259,13 +259,14 @@ def _authority_from_canonical_row(
         raise ValueError("canonical work authority sources malformed")
     if sources and all(source["confidence"] == "inferred" for source in sources):
         return None
-    if next_actions is not None and "start" not in next_actions:
-        return None
     confirmed = [
         source
         for source in sources
         if isinstance(source, dict) and source.get("confidence") == "confirmed"
     ]
+    has_workflow = any(source.get("kind") == "workflow_run" for source in confirmed)
+    if next_actions is not None and "start" not in next_actions and not has_workflow:
+        return None
     todo_kinds = {"todo", "superpowers_spec", "superpowers_plan", "openspec"}
     if not any(source.get("kind") in todo_kinds for source in confirmed):
         return None
