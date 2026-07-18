@@ -28,6 +28,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **唯讀 workflow planner 可在 disposable checkout 啟動 Codex**：Coordinator launcher 僅對 `read_only` card 加上 `--skip-git-repo-check`，保留 `--sandbox read-only`；builder 路徑仍維持原本的 git trust gate，避免放寬可寫入執行階段。
 - **Active workflow 不再被自己新增的 planning sources supersede**：auto claim 與 explicit resume 會先以穩定 repo/work/issue/OpenSpec identity 找出唯一 ongoing run；accepted superpowers spec/plan 加入 authority 時維持同一 run，由 active workflow 優先，不再建立新 claim。Codex planner 同時在無 `.git` 的 disposable read-only checkout 使用官方 `--skip-git-repo-check`，避免安全 sandbox 被 CLI trust check 誤擋。
 - **`work resume` 現在會真正重入既有 `needs_human` workflow**：claim router 不再把既有 `needs_human` 誤當成只讀結果直接回傳；operator resume 會以同一 claim key 呼叫 canonical starter，讓 define／brainstorm retry 可以在不新建 run 的前提下繼續。
 - **Headless 異質 brainstorm 不再因讀取 evidence 觸發互動 permission**：缺 accepted artifact 時，question pack 現在保留同 kind 的既有 repo refs；Manager 以 bounded、UTF-8、無 symlink 的 read-only方式把來源內容直接嵌入 secondary prompt，明確禁止 tool/command call，並提供 manifest-compatible planning destinations 與 exact JSON contract。`agy --mode plan --sandbox` 因此不需 unsafe bypass 或全域 command allow rule。

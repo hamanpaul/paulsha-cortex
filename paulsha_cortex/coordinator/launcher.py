@@ -118,7 +118,7 @@ def build_codex_argv(
         # 信任閘等待輸入 → timeout。autonomous 派工須一併 bypass hook trust 才不會掛住。
         argv.append("--dangerously-bypass-hook-trust")
     elif read_only:
-        argv += ["--sandbox", "read-only"]
+        argv += ["--sandbox", "read-only", "--skip-git-repo-check"]
     if model is not None:
         argv += ["--model", model]
     argv.extend(["-o", str(Path(log_dir) / "last.json")])
