@@ -48,8 +48,9 @@ class TmuxPaneSender:
 class ScriptWorktreeCreator:
     """真實作：鏡射 scripts/using-git-worktrees.sh 的新分支路徑。
 
-    `git -C <repo> worktree add -b <branch> <wt_root>/<slug> <base>`，
-    回傳 target 路徑。單元測試 MUST 注入 fake，不實體化此類。
+    新 branch 使用 `git worktree add -b`；既有 branch 僅在它完全位於 base
+    ancestry 時 fast-forward 後重掛。回傳 target 路徑。單元測試 MUST 注入
+    fake，不實體化此類。
     """
 
     def __init__(
@@ -66,12 +67,63 @@ class ScriptWorktreeCreator:
         slug = branch.replace("/", "-")
         target = self._wt_root / slug
         self._wt_root.mkdir(parents=True, exist_ok=True)
+        base = base_sha or self._base
         try:
-            subprocess.run(
-                ["git", "-C", str(self._repo), "worktree", "add", "-b", branch,
-                 str(target), base_sha or self._base],
-                check=True, capture_output=True,
+            if target.exists() or target.is_symlink():
+                raise ValueError("worktree target already exists")
+            base_probe = subprocess.run(
+                ["git", "-C", str(self._repo), "rev-parse", "--verify", f"{base}^{{commit}}"],
+                check=False,
+                capture_output=True,
             )
+            if base_probe.returncode != 0:
+                raise ValueError(
+                    f"git worktree base invalid: {base_probe.stderr.decode().strip()}"
+                )
+            exact_base = base_probe.stdout.decode().strip()
+            branch_probe = subprocess.run(
+                [
+                    "git", "-C", str(self._repo), "show-ref", "--verify", "--quiet",
+                    f"refs/heads/{branch}",
+                ],
+                check=False,
+                capture_output=True,
+            )
+            if branch_probe.returncode not in {0, 1}:
+                raise ValueError(
+                    f"git branch probe failed: {branch_probe.stderr.decode().strip()}"
+                )
+            if branch_probe.returncode == 0:
+                ancestor = subprocess.run(
+                    [
+                        "git", "-C", str(self._repo), "merge-base", "--is-ancestor",
+                        branch, exact_base,
+                    ],
+                    check=False,
+                    capture_output=True,
+                )
+                if ancestor.returncode == 1:
+                    raise ValueError("existing worktree branch has commits outside requested base")
+                if ancestor.returncode != 0:
+                    raise ValueError(
+                        f"git branch ancestry check failed: {ancestor.stderr.decode().strip()}"
+                    )
+                subprocess.run(
+                    ["git", "-C", str(self._repo), "branch", "-f", branch, exact_base],
+                    check=True,
+                    capture_output=True,
+                )
+                argv = [
+                    "git", "-C", str(self._repo), "worktree", "add", str(target), branch,
+                ]
+            else:
+                argv = [
+                    "git", "-C", str(self._repo), "worktree", "add", "-b", branch,
+                    str(target), exact_base,
+                ]
+            subprocess.run(argv, check=True, capture_output=True)
+        except ValueError:
+            raise
         except subprocess.CalledProcessError as exc:
             raise ValueError(f"git worktree add failed: {exc.stderr.decode().strip()}") from exc
         except FileNotFoundError as exc:
