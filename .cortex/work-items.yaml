@@ -25,3 +25,10 @@ work_items:
         ref: hamanpaul/paulsha-cortex#27
       - kind: openspec
         ref: docs-only-lifecycle-canary-v2
+  terminal-lifecycle-canary:
+    title: Unified lifecycle terminal live canary
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#31
+      - kind: openspec
+        ref: terminal-lifecycle-canary
