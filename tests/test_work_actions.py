@@ -169,6 +169,43 @@ def test_start_is_restart_idempotent_and_auto_uses_typed_label_command(tmp_path:
         )
 
 
+def test_resume_existing_needs_human_reenters_canonical_starter(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, claim_key, "planning-failed")
+    calls: list[tuple[str, str | None]] = []
+
+    def starter(bound_authority, bound_claim_key, reason):
+        assert bound_authority == authority
+        calls.append((bound_claim_key, reason))
+        return registry._manager_update_workflow_run(
+            initial.run_id,
+            current_phase="plan",
+            facets=(),
+            attempts={"claim": 1, "define": 2, "plan": 1},
+        )
+
+    result = work_actions.execute_work_action(
+        args={"action": "resume", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=starter,
+    )
+
+    assert calls == [(claim_key, None)]
+    assert result["result"]["run"]["current_phase"] == "plan"
+    assert result["result"]["run"]["facets"] == []
+
+
 def test_auto_without_issue_mutates_every_mapped_issue(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
     calls: list[list[str]] = []

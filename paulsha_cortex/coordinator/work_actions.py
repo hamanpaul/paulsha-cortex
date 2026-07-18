@@ -953,6 +953,12 @@ def _claim_action(
             if workflow_starter is None:
                 raise RuntimeError("canonical workflow starter unavailable")
             canonical_run = workflow_starter(authority, claim_key, decision.reason)
+        elif args.get("action") == "resume":
+            if workflow_starter is None:
+                raise RuntimeError("canonical workflow starter unavailable")
+            canonical_run = workflow_starter(
+                authority, canonical_run.claim_key, None
+            )
         active = canonical_run.to_dict()
         active["reason"] = decision.reason
     elif canonical_run is not None:
