@@ -82,6 +82,14 @@ class ArgvTests(unittest.TestCase):
         self.assertNotIn("acceptEdits", claude)
         self.assertEqual(claude[claude.index("--tools") + 1], "")
         self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+        self.assertIn("--skip-git-repo-check", codex)
+
+    def test_codex_builder_keeps_git_trust_check(self) -> None:
+        argv = build_codex_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=False
+        )
+
+        self.assertNotIn("--skip-git-repo-check", argv)
 
     def test_codex_argv_allow_unsafe_adds_sandbox_bypass(self) -> None:
         # 明確 opt-in allow_unsafe=True 才加入 sandbox bypass flag
