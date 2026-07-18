@@ -5,6 +5,8 @@ import socket
 import threading
 from unittest import mock
 
+import pytest
+
 from paulsha_cortex.monitor.config import MonitorConfig
 from paulsha_cortex.monitor.server import MonitorServer
 from paulsha_cortex.monitor.server import _Subscriber
@@ -157,8 +159,21 @@ def _recv(sock, timeout=2.0):
     sock.settimeout(timeout)
     data = b""
     while not data.endswith(b"\n"):
-        data += sock.recv(4096)
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise EOFError("socket closed before newline-delimited response")
+        data += chunk
     return json.loads(data)
+
+
+def test_recv_fails_fast_when_socket_closes_before_newline():
+    client, server = socket.socketpair()
+    server.close()
+    try:
+        with pytest.raises(EOFError, match="before newline"):
+            _recv(client)
+    finally:
+        client.close()
 
 
 def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
@@ -217,10 +232,29 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
 
 
 def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
+    healthy = ProviderSnapshot(
+        provider_id="github:example/acme",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="github:healthy",
+        diagnostics=(),
+        sources=(),
+    )
+    degraded = ProviderSnapshot(
+        provider_id="github:example/other",
+        status="degraded",
+        last_attempt_at=NOW,
+        last_success_at=None,
+        revision=None,
+        diagnostics=("github:example/other stale",),
+        sources=(),
+    )
     work_store = WorkReadModelStore(
         _snapshot(
             _item("shared", "todo", repo="example/acme"),
             _item("shared", "todo", repo="example/other"),
+            providers={healthy.provider_id: healthy, degraded.provider_id: degraded},
         )
     )
     socket_path = tmp_path / "monitor.sock"
@@ -245,6 +279,9 @@ def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
             )
             initial = _recv(client)
             assert [item["repo"] for item in initial["items"]] == ["example/acme"]
+            assert initial["degraded"] is False
+            assert initial["hard_gates"]["auto_claim"] is True
+            assert initial["fleet_health"]["degraded"] is True
 
             server.publish_work_events(
                 (

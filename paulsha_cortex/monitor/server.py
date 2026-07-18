@@ -525,7 +525,7 @@ class MonitorServer:
         with self._subscribers_lock:
             self._work_subscribers.append(sub)
         try:
-            initial = store.list_work_items(include_done=True)
+            initial = store.list_work_items(repo=repo, include_done=True)
             initial["kind"] = "work_snapshot"
             initial["items"] = [
                 item
