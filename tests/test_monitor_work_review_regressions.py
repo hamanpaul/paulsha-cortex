@@ -173,6 +173,71 @@ def _provider(provider_id: str, sources=(), *, observations=None, at=NOW):
     )
 
 
+def test_live_provider_freshness_uses_post_scan_clock(tmp_path):
+    repo = tmp_path / "repo"
+    proposal = repo / "openspec/changes/canary/proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Canary\n", encoding="utf-8")
+    override = repo / ".cortex/work-items.yaml"
+    override.parent.mkdir(parents=True)
+    override.write_text(
+        """version: 1
+work_items:
+  canary:
+    title: Canary
+    links:
+      - kind: github_issue
+        ref: example/acme#7
+      - kind: openspec
+        ref: canary
+""",
+        encoding="utf-8",
+    )
+    issue = WorkSource(
+        source_id="github_issue:example/acme#7",
+        kind="github_issue",
+        ref="example/acme#7",
+        revision="github:i7",
+        status="open",
+        confidence="confirmed",
+        provider="github:example/acme",
+    )
+    provider_time = "2026-07-17T10:00:01Z"
+    times = iter(
+        (
+            datetime(2026, 7, 17, 10, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 17, 10, 0, 2, tzinfo=timezone.utc),
+        )
+    )
+    store = WorkReadModelStore.empty()
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=store,
+        github_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github:example/acme", (issue,), at=provider_time)
+        ),
+        github_terminal_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github-terminal:example/acme", at=provider_time)
+        ),
+        workflow_provider_factory=lambda _repo: _StaticProvider(
+            _provider("workflow:example/acme")
+        ),
+        now=lambda: next(times),
+    )
+
+    refresher.refresh(
+        (ProjectState(project_id="example/acme", workspace="ws", path=str(repo)),),
+        include_github=True,
+    )
+
+    assert store.get_work_item("canary", repo="example/acme")["item"]["state"] == "todo"
+    assert store.list_work_items()["hard_gates"] == {
+        "auto_claim": True,
+        "merge": True,
+        "reasons": [],
+    }
+
+
 def test_production_wiring_passes_workflow_links_and_strict_closure(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

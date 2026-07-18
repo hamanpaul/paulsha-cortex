@@ -381,6 +381,9 @@ class WorkModelRefresher:
                     relevant.append(providers[github_id])
                     if terminal_id in providers:
                         relevant.append(providers[terminal_id])
+                freshness_time = self.now()
+                if freshness_time.tzinfo is None:
+                    raise ValueError("now must include timezone")
                 freshness_snapshot = WorkSnapshot(
                     sequence=previous.sequence,
                     written_at=attempted_at,
@@ -393,7 +396,7 @@ class WorkModelRefresher:
                 for authority_id in (github_id, terminal_id):
                     fresh = freshness_snapshot.provider_is_fresh(
                         authority_id,
-                        now=current_time,
+                        now=freshness_time,
                         max_age=self.stale_after_seconds,
                     )
                     if authority_id not in relevant_ids or fresh:
