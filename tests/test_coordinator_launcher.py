@@ -70,6 +70,19 @@ class ArgvTests(unittest.TestCase):
         argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg")
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
 
+    def test_planner_read_only_argv_never_uses_edit_permissions(self) -> None:
+        claude = build_claude_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True
+        )
+        codex = build_codex_argv(
+            prompt="P", slice_id="s", log_dir="/lg", read_only=True
+        )
+
+        self.assertEqual(claude[claude.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", claude)
+        self.assertEqual(claude[claude.index("--tools") + 1], "")
+        self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+
     def test_codex_argv_allow_unsafe_adds_sandbox_bypass(self) -> None:
         # 明確 opt-in allow_unsafe=True 才加入 sandbox bypass flag
         argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg", allow_unsafe=True)

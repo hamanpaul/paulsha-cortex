@@ -3,10 +3,18 @@
 ### Requirement: Manager必須是WorkflowRun與mutation的單一writer
 Manager MUST以registry schema v2保存`WorkflowRun`與`WorkflowStep`，並以`repo/work-id/authoritative source revisions` claim key確保restart idempotency。V1 registry MUST先建立不可覆寫atomic backup才升v2；舊jobs/slices MUST保存為legacy records且 MUST NOT推測work item。CLI mutation MUST經control request queue。
 
+每張非Manager card MUST由production dispatcher建立綁定run、claim、repo、source revision、phase、card、persona與model identity的durable Job。Manager MUST只在該Job successful terminal後建立canonical coordinator-root evidence並原子綁回Job；caller-supplied evidence path/hash MUST被拒絕。Periodic terminal poll MUST可在restart後由registry重建目前card並繼續推進；同phase所有card通過前 MUST NOT前進。
+
+Claim key MUST雜湊該work item的canonical semantic authority與provider/source revisions，MUST NOT納入snapshot sequence、written-at、whole-fleet hash或其他repo noise。
+
 #### Scenario: Claim後crash/restart
 - **WHEN**相同claim key在restart後再次送達
 - **THEN** Manager回傳既有WorkflowRun
 - **THEN**不重複建立job、branch、worktree或PR
+
+#### Scenario: Snapshot只有fleet metadata更新
+- **WHEN**同一work item的provider/source revisions與confirmed refs未變，但snapshot sequence、written-at或其他repo資料改變
+- **THEN**Manager重用既有WorkflowRun與claim key，只更新snapshot provenance
 
 #### Scenario: Malformed v1 registry
 - **WHEN**migration輸入schema malformed或backup無法durably寫入
@@ -35,6 +43,8 @@ Deck compiler MUST把每張card的`persona_binding`寫入workflow manifest；Man
 ### Requirement: 不完整規格必須經異質雙模型brainstorm
 Artifact只有在frontmatter `status: accepted`、必要章節存在且沒有blocking decision marker時才算accepted。Marker parser MUST只把獨立行`TBD`、`[TBD]`、`Decision: TBD`、`決策：未定`或Open Questions中的實際項目視為blocking，MUST忽略inline說明與fenced code。Accepted spec/design/plan缺失或有blocking marker時，primary planner MUST先產question pack；secondary planner MUST來自不同independence domain且只回evidence；primary MUST整合並落檔。Secondary選擇 MUST依可用的`agy/google → claude/anthropic → codex/openai`順序排除primary domain；無異質model、unknown identity或malformed output MUST fail-closed。
 
+Planner subprocess與manifest plan card MUST只在temporary disposable checkout執行，並以read-only executor模式啟動；Claude MUST使用`plan`且停用tools、Codex MUST使用`--sandbox read-only`。Manager MUST在成功、nonzero或exception路徑驗sandbox與operator worktree的檔案、empty dirs、directory symlinks與stable metadata；snapshot遇權限錯誤也 MUST先恢復安全traversal再依baseline還原entries、mode與xattrs，restore fault MUST fail-closed。Primary只回傳structured artifact content；Manager MUST在scan時持久化canonical ref、kind、work item與content hash authority，replacement MUST逐欄符合該authority及manifest outputs，不得信任caller hash或filename推測。新檔 MUST no-clobber。Artifact、immutable或既存同內容brainstorm evidence、expected gate ref與registry phase update MUST由durable intent journal形成recoverable transaction；registry未commit的save fault MUST rollback，已commit的restart/resume MUST逐operation重驗type/hash/mode/evidence後保留產物，drift MUST設`needs_human`並保留journal，且不得覆蓋其他work item。
+
 #### Scenario: Agy可用且primary非Google
 - **WHEN** completeness gate觸發且agy live capability/identity probe通過
 - **THEN** secondary使用Google domain回傳evidence
@@ -43,6 +53,14 @@ Artifact只有在frontmatter `status: accepted`、必要章節存在且沒有blo
 #### Scenario: 只剩same-domain model
 - **WHEN**所有可用secondary都與primary同domain
 - **THEN** WorkflowRun設needs_human且不進build
+
+### Requirement: Verify與Review必須產生manifest-declared report
+Manager MUST在每張card dispatch時持久化output目錄baseline。Verify與review terminal payload MUST列出實際report outputs；每個output MUST匹配該card的manifest glob、存在於綁定repo root、為該job後新建或相對baseline已更新，且report frontmatter MUST精確綁定WorkflowRun、card與Candidate。Canonical coordinator evidence MUST保存current與baseline hash；其locator MUST只作gate evidence，MUST NOT被計為report output。
+
+#### Scenario: Reviewer只有canonical evidence而沒有report
+- **WHEN**review job成功結束但沒有產生manifest宣告的report
+- **THEN**Manager拒絕terminalize或phase advance
+- **AND**canonical evidence path不得補足缺少的report
 
 ### Requirement: Agy launcher必須使用safe plan sandbox
 `agy` launcher MUST使用headless print、plan mode與sandbox，MUST NOT加入unsafe permission bypass。Model identity registry MUST登錄`agy + Gemini 3.1 Pro (High)`為`google`並由`doctor --probe-live`驗capability；版本字串 alone MUST NOT視為可用。

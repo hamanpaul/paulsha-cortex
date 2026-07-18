@@ -4,17 +4,18 @@ from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, l
 
 # feature-delivery-pipeline SKILL.md 的 11 個 phase → card id（1:1）
 PHASE_CARDS = [
+    "workflow-claim",      # 0 Manager durable claim
     "brainstorming",        # 1 scope/brainstorm
     "openspec-propose",     # 2 propose
     "writing-plans",        # 3 plan
     "worktree-isolation",   # 4 worktree（slice_group: build）
     "tdd-red",              # 5 TDD（slice_group: build）
     "subagent-build",       # 6 subagent execution（slice_group: build）
-    "code-review",          # 7 review
-    "verification",         # 8 verify
+    "verification",         # 7 deterministic verify
+    "code-review",          # 8 foreign review
+    "adversarial-review",   # 9 adversarial review
     "openspec-archive",     # 9 archive（slice_group: ship）
     "policy-commit",        # 10 policy gate + commit（slice_group: ship）
-    "adversarial-review",   # 11 codex adversarial
 ]
 
 MCU_FEATURE_CARDS = [
@@ -60,10 +61,10 @@ def test_feature_oneshot_combo_loads():
     assert [c.ref for c in combo.cards] == PHASE_CARDS
     assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
         ("writing-plans", ("docs/superpowers/plans/*<task-slug>*.md",)),
-        ("code-review", ("reports/review/*<task-slug>*.md",)),
         ("verification", ("reports/verify/*<task-slug>*.md",)),
-        ("openspec-archive", ("openspec/changes/archive/*<change>*",)),
+        ("code-review", ("reports/review/*<task-slug>*.md",)),
         ("adversarial-review", ("reports/review/*<task-slug>*-adversarial.md",)),
+        ("openspec-archive", ("openspec/changes/archive/*<change>*",)),
     ]
 
 
@@ -123,10 +124,10 @@ def test_feature_oneshot_real_data_compiles_to_hold_specs(tmp_path):
     assert result.external == ()  # 全鏈 requires 覆蓋，無需 --allow-external
     assert [s.slice_id for s in result.slices] == [
         f"{slug}-build",
-        f"{slug}-code-review",
         f"{slug}-verification",
-        f"{slug}-ship",
+        f"{slug}-code-review",
         f"{slug}-adversarial-review",
+        f"{slug}-ship",
     ]
     assert len(result.checklist) == 3  # 三張 interactive 前置卡
     out = tmp_path / "specs"
@@ -135,10 +136,10 @@ def test_feature_oneshot_real_data_compiles_to_hold_specs(tmp_path):
     assert len(metas) == 5
     assert {meta["slice_id"] for meta in metas} == {
         f"{slug}-build",
-        f"{slug}-code-review",
         f"{slug}-verification",
-        f"{slug}-ship",
+        f"{slug}-code-review",
         f"{slug}-adversarial-review",
+        f"{slug}-ship",
     }
     detect_cycles(metas)
     assert ready_units(metas, lambda sid: True) == []  # 全 hold 不誤觸發

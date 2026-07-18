@@ -29,11 +29,29 @@ class ControlPlaneCoordinator:
     def wait_done(self, req_id: str, timeout: float, poll_interval: float = 0.5) -> dict[str, Any] | None:
         return poll_done(req_id, timeout=timeout, poll_interval=poll_interval)
 
+    def workflow_action(self, args: dict[str, Any]) -> str:
+        """Queue a Manager-owned workflow mutation; never write registry state directly."""
+        return submit_request("workflow-action", args, self.requested_by)
+
 
 def submit_request(req_type: str, args: dict[str, Any], requested_by: str) -> str:
     request = contract.build_request(req_type=req_type, args=args, requested_by=requested_by)
+    request = contract.validate_request(request)
     contract.atomic_write_json(constants.requests_dir() / f"{request['req_id']}.json", request)
     return request["req_id"]
+
+
+def submit_work_action(
+    *,
+    action: str,
+    repo: str,
+    work_id: str,
+    args: dict[str, Any] | None = None,
+    requested_by: str = "coordinator-cli",
+) -> str:
+    payload = dict(args or {})
+    payload.update({"action": action, "repo": repo, "work_id": work_id})
+    return submit_request("work-action", payload, requested_by)
 
 
 def read_status() -> dict[str, Any]:

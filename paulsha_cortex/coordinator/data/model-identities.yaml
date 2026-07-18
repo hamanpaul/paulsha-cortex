@@ -1,0 +1,7 @@
+schema_version: 2
+identities:
+  - executor: agy
+    model_id: Gemini 3.1 Pro (High)
+    independence_domain: google
+    capabilities: [planning]
+    live_probe: agy-plan-sandbox

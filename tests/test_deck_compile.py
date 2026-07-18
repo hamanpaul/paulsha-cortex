@@ -426,7 +426,10 @@ def test_emit_writes_flat_and_refuses_overwrite(tmp_path):
     result = compile_combo(combo, cards, "demo task", change="demo", allow_external=True)
     written = emit(result, tmp_path)
     assert all(path.parent == tmp_path for path in written)
-    assert {path.name for path in written} == {slice_doc.filename for slice_doc in result.slices}
+    assert {path.name for path in written} == {
+        *(slice_doc.filename for slice_doc in result.slices),
+        f"{result.task_slug}.workflow.json",
+    }
     with pytest.raises(DeckCompileError, match="已存在"):
         emit(result, tmp_path)
 
@@ -437,7 +440,10 @@ def test_emit_force_overwrites_atomically(tmp_path):
     emit(result, tmp_path)
     written = emit(result, tmp_path, force=True)
     assert written
-    assert all(path.read_text(encoding="utf-8").startswith("---") for path in written)
+    assert all(
+        path.suffix == ".json" or path.read_text(encoding="utf-8").startswith("---")
+        for path in written
+    )
 
 
 def test_emit_force_rolls_back_on_replace_failure(tmp_path, monkeypatch):

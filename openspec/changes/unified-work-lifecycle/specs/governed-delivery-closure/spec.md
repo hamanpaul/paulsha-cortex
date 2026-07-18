@@ -37,6 +37,13 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 ### Requirement: Merge前後必須重讀remote terminal facts
 Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，revision race MUST中止merge。Merge MUST使用`gh pr merge --merge`且 MUST NOT使用GitHub `--auto`。Merge後 MUST fetch default branch並驗merge ancestry、all mapped issues closed、active OpenSpec消失、remote archive存在、Todo tasks完成，才可寫versioned CompletionRecord並投影done。
 
+V1 WorkflowRun只支援唯一mapped PR、唯一OpenSpec change與唯一Todo path。任一類有多個confirmed refs時 Manager MUST設`needs_human:multiple-delivery-targets-unsupported`，MUST NOT只選其中一個完成、merge或寫CompletionRecord。Merge authorization MUST只雜湊stable semantic preflight result與immutable evidence hashes，MUST NOT納入stdout、stderr或duration；`merge-authorized` crash recovery MUST先依durable authorization與authenticated merge status reconcile，已merge時 MUST NOT重跑preflight。
+
+#### Scenario: Work item有多個delivery targets
+- **WHEN**current WorkAuthority含多張PR、多個active OpenSpec或多個Todo path任一情形
+- **THEN**V1 Manager轉needs_human且不得對單一target投影done
+- **THEN**CompletionRecord不得把未驗證refs標示完成
+
 #### Scenario: Merge後issue仍open
 - **WHEN**PR已merge但任一mapped issue仍open
 - **THEN**CompletionRecord不得通過strict closure

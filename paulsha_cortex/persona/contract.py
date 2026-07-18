@@ -6,7 +6,7 @@ from typing import Mapping
 
 # Stage 3 生命週期詞彙表（語意凍結）；與上游相等性由消費端對齊測試守。
 PHASES = (
-    "research",
+    "claim",
     "define",
     "plan",
     "build",
@@ -14,7 +14,7 @@ PHASES = (
     "review",
     "ship",
 )
-REQUIRED_ROLES = ("manager", "builder", "reviewer")
+REQUIRED_ROLES = ("manager", "planner", "builder", "reviewer")
 GATE_STATUSES = ("passed", "failed", "running", "skipped", "override")
 
 
@@ -77,7 +77,17 @@ def validate_persona_schema(
 ) -> ValidationResult:
     errors: list[str] = []
 
-    for required_role in REQUIRED_ROLES:
+    # Dispatch-base verification must remain able to replay the pre-planner v1
+    # catalog. All modern catalogs require planner; only a complete legacy base
+    # catalog whose records are explicitly versioned ``v1`` receives the
+    # compatibility exemption.
+    legacy_v1 = (
+        "planner" not in catalog
+        and all(role in catalog for role in ("manager", "builder", "reviewer"))
+        and all(_persona_record(catalog[role]).get("version") == "v1" for role in catalog)
+    )
+    required_roles = tuple(role for role in REQUIRED_ROLES if not (legacy_v1 and role == "planner"))
+    for required_role in required_roles:
         if required_role not in catalog:
             errors.append(f"missing required role: {required_role}")
 

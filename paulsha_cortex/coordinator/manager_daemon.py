@@ -14,9 +14,10 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
-from . import autonomy, manager
+from . import autonomy, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .dispatcher import Dispatcher
+from .model_identities import load_model_identities
 from .registry import JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 
@@ -264,6 +265,14 @@ def build_request_executor(
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
     dispatch_ready_fn: Callable[..., list[dict[str, Any]]] = autonomy.dispatch_ready,
+    workflow_identity_registry=None,
+    workflow_probes=None,
+    workflow_primary_questioner=None,
+    workflow_secondary_planner=None,
+    workflow_primary_integrator=None,
+    workflow_runtime_factory=None,
+    workflow_ship_validator=None,
+    work_action_fn: Callable[..., dict[str, Any]] | None = None,
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
     def execute(request: dict[str, Any]) -> dict[str, Any]:
         args = request.get("args", {})
@@ -285,6 +294,149 @@ def build_request_executor(
             allow_unsafe=allow_unsafe,
             model=requested_review_model,
         )
+        if request["type"] == "workflow-action":
+            registry = getattr(dispatcher, "_registry", None)
+            if registry is None:
+                raise RuntimeError("workflow-action requires dispatcher._registry")
+            identities = workflow_identity_registry or load_model_identities()
+            state_path = getattr(registry, "_state_path", None)
+            coordinator_root = (
+                Path(state_path).resolve().parent
+                if state_path is not None
+                else paths.coordinator_root().resolve()
+            )
+            launcher_factory = lambda identity: _resolve_launcher(
+                identity.executor,
+                launcher,
+                allow_unsafe=False,
+                model=identity.model_id,
+            )
+            if args.get("action") == "resume":
+                extras = set(args) - {"action", "run_id"}
+                if extras:
+                    raise ValueError(
+                        f"workflow resume rejects caller evidence/input: {sorted(extras)[0]}"
+                    )
+                resume_run = registry.get_workflow_run(str(args.get("run_id") or ""))
+                active_ship_validator = workflow_ship_validator
+                if (
+                    active_ship_validator is None
+                    and resume_run.claim_key.startswith("claim:v1:")
+                    and len(resume_run.source_revision) == 64
+                ):
+                    from .work_bridge import build_production_ship_validator
+
+                    active_ship_validator = build_production_ship_validator(
+                        registry=registry,
+                        coordinator_root=coordinator_root,
+                    )
+                return manager.resume_workflow_run(
+                    dispatcher,
+                    run_id=str(args.get("run_id") or ""),
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    ship_validator=active_ship_validator,
+                )
+            result = manager.apply_workflow_action(
+                registry,
+                args=args,
+                identity_registry=identities,
+                probes=workflow_probes,
+                primary_questioner=workflow_primary_questioner,
+                secondary_planner=workflow_secondary_planner,
+                primary_integrator=workflow_primary_integrator,
+                runtime_factory=workflow_runtime_factory,
+                ship_validator=workflow_ship_validator,
+                git_runner=getattr(dispatcher, "_git_runner", None),
+                coordinator_root=coordinator_root,
+            )
+            if args.get("action") == "start":
+                run = registry.get_workflow_run(str(result["run_id"]))
+                job = manager.dispatch_workflow_card(
+                    dispatcher,
+                    run=run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                )
+                if job is not None:
+                    result["job_id"] = job["job_id"]
+            return result
+        if request["type"] == "work-action":
+            registry = getattr(dispatcher, "_registry", None)
+            if registry is None:
+                raise RuntimeError("work-action requires dispatcher._registry")
+            if work_action_fn is None:
+                result = manager.apply_work_action(
+                    args=dict(args),
+                    requested_by=request["requested_by"],
+                    registry=registry,
+                    runtime_factory=(
+                        workflow_runtime_factory
+                        or planning_runtime.build_production_planning_runtime
+                    ),
+                )
+            else:
+                result = work_action_fn(
+                    args=dict(args),
+                    requested_by=request["requested_by"],
+                )
+            if args.get("action") in {"start", "resume"}:
+                registry = getattr(dispatcher, "_registry", None)
+                run_payload = result.get("result", {}).get("run") if isinstance(result, dict) else None
+                run_id = run_payload.get("run_id") if isinstance(run_payload, dict) else None
+                if registry is not None and isinstance(run_id, str):
+                    run = registry.get_workflow_run(run_id)
+                    identities = workflow_identity_registry or load_model_identities()
+                    state_path = getattr(registry, "_state_path", None)
+                    coordinator_root = (
+                        Path(state_path).resolve().parent
+                        if state_path is not None
+                        else paths.coordinator_root().resolve()
+                    )
+                    launcher_factory = lambda identity: _resolve_launcher(
+                        identity.executor,
+                        launcher,
+                        allow_unsafe=False,
+                        model=identity.model_id,
+                    )
+                    if args.get("action") == "resume":
+                        active_ship_validator = workflow_ship_validator
+                        if (
+                            active_ship_validator is None
+                            and run.claim_key.startswith("claim:v1:")
+                            and len(run.source_revision) == 64
+                        ):
+                            from .work_bridge import build_production_ship_validator
+
+                            active_ship_validator = build_production_ship_validator(
+                                registry=registry,
+                                coordinator_root=coordinator_root,
+                            )
+                        resumed = manager.resume_workflow_run(
+                            dispatcher,
+                            run_id=run.run_id,
+                            identities=identities,
+                            launcher_factory=launcher_factory,
+                            coordinator_root=coordinator_root,
+                            ship_validator=active_ship_validator,
+                        )
+                        result["result"].update(resumed)
+                        result["result"]["run"] = registry.get_workflow_run(
+                            run.run_id
+                        ).to_dict()
+                    else:
+                        job = manager.dispatch_workflow_card(
+                            dispatcher,
+                            run=run,
+                            identities=identities,
+                            launcher_factory=launcher_factory,
+                            coordinator_root=coordinator_root,
+                        )
+                        if job is not None:
+                            result["result"]["job_id"] = job["job_id"]
+            return result
         if request["type"] == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
             complete_kwargs = {
@@ -463,6 +615,9 @@ def build_periodic_tick_runner(
     default_review_model: str | None = None,
     scan_specs_fn: Callable[[str], list[dict[str, Any]]] = autonomy.scan_specs,
     run_tick_fn: Callable[..., dict[str, Any]] = manager.run_tick,
+    auto_claim_fn: Callable[[], list[dict[str, Any]]] | None = None,
+    workflow_identity_registry=None,
+    workflow_ship_validator=None,
 ) -> Callable[[], dict[str, Any]]:
     predicate = lambda slice_id: autonomy.default_is_satisfied(
         slice_id,
@@ -471,6 +626,62 @@ def build_periodic_tick_runner(
     )
 
     def execute() -> dict[str, Any]:
+        registry = getattr(dispatcher, "_registry", None)
+        auto_claims = (
+            auto_claim_fn()
+            if auto_claim_fn is not None
+            else manager.run_auto_claim_scan(
+                registry=registry,
+                runtime_factory=planning_runtime.build_production_planning_runtime,
+            )
+        )
+        if registry is not None and hasattr(registry, "list_workflow_runs"):
+            state_path = getattr(registry, "_state_path", None)
+            coordinator_root = (
+                Path(state_path).resolve().parent
+                if state_path is not None
+                else paths.coordinator_root().resolve()
+            )
+            identities = workflow_identity_registry or load_model_identities()
+            launcher_factory = lambda identity: _resolve_launcher(
+                identity.executor,
+                launcher,
+                allow_unsafe=False,
+                model=identity.model_id,
+            )
+            for workflow in registry.list_workflow_runs():
+                if workflow.status != "ongoing" or "blocked" in workflow.facets:
+                    continue
+                if workflow.current_phase not in {"plan", "build", "verify", "review"}:
+                    continue
+                try:
+                    active_ship_validator = workflow_ship_validator
+                    if (
+                        active_ship_validator is None
+                        and workflow.claim_key.startswith("claim:v1:")
+                        and len(workflow.source_revision) == 64
+                    ):
+                        from .work_bridge import build_production_ship_validator
+
+                        active_ship_validator = build_production_ship_validator(
+                            registry=registry,
+                            coordinator_root=coordinator_root,
+                        )
+                    manager.resume_workflow_run(
+                        dispatcher,
+                        run_id=workflow.run_id,
+                        identities=identities,
+                        launcher_factory=launcher_factory,
+                        coordinator_root=coordinator_root,
+                        ship_validator=active_ship_validator,
+                    )
+                except Exception as exc:
+                    _log_error(exc)
+                    registry._manager_update_workflow_run(
+                        workflow.run_id,
+                        facets=("needs_human",),
+                        gate_status="running",
+                    )
         metas = scan_specs_fn(specs_dir)
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=default_allow_unsafe)
         active_launcher = _resolve_launcher(
@@ -503,7 +714,8 @@ def build_periodic_tick_runner(
                     "review_model": default_review_model,
                 }
             )
-        return run_tick_fn(dispatcher, **run_tick_kwargs)
+        result = run_tick_fn(dispatcher, **run_tick_kwargs)
+        return {**result, "auto_claims": auto_claims}
 
     return execute
 
@@ -565,6 +777,7 @@ def run_loop(
             "launcher": launcher,
             "default_executor": resolved_default_executor,
             "reaper": reaper,
+            "workflow_runtime_factory": planning_runtime.build_production_planning_runtime,
         }
         if default_model is not None:
             executor_kwargs["default_model"] = default_model

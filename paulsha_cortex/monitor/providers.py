@@ -231,7 +231,7 @@ class WorkflowRegistryProvider:
         self.state_path = (
             Path(state_path)
             if state_path is not None
-            else paths.coordinator_root() / "workflows.json"
+            else paths.coordinator_root() / "jobs.json"
         )
 
     def scan(self) -> ProviderSnapshot:
@@ -265,8 +265,11 @@ class WorkflowRegistryProvider:
                     sources=(),
                     observations={},
                 )
-            _validate_workflow_v2_root(payload)
-            rows = payload["workflow_runs"]
+            if "workflows" in payload:
+                rows = _validate_canonical_coordinator_v2_root(payload)
+            else:
+                _validate_workflow_v2_root(payload)
+                rows = payload["workflow_runs"]
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
             validated_completions: dict[str, list[dict[str, object]]] = {}
@@ -350,6 +353,11 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "created_at", "updated_at", "completion_record_path",
         "completion_record_hash", "completion_record_revision", "source_revisions",
         "pr_candidate", "merge_revision",
+        # Exact coordinator.workflow.WorkflowRun fields.
+        "source_revision", "workspace_root", "evidence_refs", "gate_refs",
+        "brainstorm_required", "primary_domain", "candidate_head",
+        "verified_head", "gate_status", "completion_source_revisions",
+        "planning_authority",
     }
 )
 
@@ -384,6 +392,31 @@ def _validate_workflow_v2_root(payload: Mapping) -> None:
         or not isinstance(legacy.get("slices"), list)
     ):
         raise ValueError("workflow registry legacy_records are invalid")
+
+
+def _validate_canonical_coordinator_v2_root(payload: Mapping) -> list[dict[str, object]]:
+    """Read the exact JobRegistry v2 schema without instantiating its writer.
+
+    Monitor is strictly read-only here: importing ``JobRegistry`` would run its
+    migration path and violate the single-writer boundary.
+    """
+
+    expected = {"schema_version", "seq", "jobs", "slices", "workflows", "legacy_records"}
+    if set(payload) != expected or payload.get("schema_version") != 2:
+        raise ValueError("canonical coordinator registry root keys are invalid")
+    if (
+        isinstance(payload.get("seq"), bool)
+        or not isinstance(payload.get("seq"), int)
+        or payload["seq"] < 0
+        or not isinstance(payload.get("jobs"), list)
+        or not isinstance(payload.get("slices"), list)
+        or not isinstance(payload.get("workflows"), list)
+        or not isinstance(payload.get("legacy_records"), Mapping)
+    ):
+        raise ValueError("canonical coordinator registry root values are invalid")
+    from paulsha_cortex.coordinator.workflow import WorkflowRun
+
+    return [WorkflowRun.from_dict(row).to_dict() for row in payload["workflows"]]
 
 
 def _validate_workflow_v2_row(row: object) -> None:
@@ -455,7 +488,7 @@ def _validated_workflow_completion(
         raise ValueError("completion_record_hash must be a 64-char hex digest")
     if not isinstance(expected_revision, str) or re.fullmatch(r"[0-9a-fA-F]{40}", expected_revision) is None:
         raise ValueError("completion_record_revision must be a 40-char commit SHA")
-    source_revisions = row.get("source_revisions")
+    source_revisions = row.get("source_revisions", row.get("completion_source_revisions"))
     if (
         not isinstance(source_revisions, Mapping)
         or not source_revisions
@@ -489,13 +522,32 @@ def _validated_workflow_completion(
 
     record = read_completion_record(resolved, expected_hash=expected_hash.lower())
     normalized_sources = dict(source_revisions)
+    authority_record = record.get("work_authority")
+    if isinstance(authority_record, Mapping):
+        raw_sources = authority_record.get("source_revisions")
+        if not isinstance(raw_sources, list) or any(
+            not isinstance(value, str) or "@" not in value for value in raw_sources
+        ):
+            return None
+        record_sources = {
+            value.rsplit("@", 1)[0]: value.rsplit("@", 1)[1]
+            for value in raw_sources
+        }
+        record_work_id = authority_record.get("work_id")
+        record_run_id = authority_record.get("run_id")
+        record_merge_revision = authority_record.get("merge_commit")
+    else:
+        record_sources = record.get("source_revisions")
+        record_work_id = record.get("work_id")
+        record_run_id = record.get("run_id")
+        record_merge_revision = record.get("merge_revision")
     valid = all(
         (
             record.get("candidate") == expected_revision.lower() == pr_candidate.lower(),
-            record.get("work_id") == row.get("work_id"),
-            record.get("run_id") == row.get("run_id"),
-            record.get("source_revisions") == normalized_sources,
-            record.get("merge_revision") == merge_revision.lower(),
+            record_work_id == row.get("work_id"),
+            record_run_id == row.get("run_id"),
+            record_sources == normalized_sources,
+            record_merge_revision == merge_revision.lower(),
         )
     )
     if not valid:

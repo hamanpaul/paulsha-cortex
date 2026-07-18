@@ -104,7 +104,11 @@ python -m pip install .
    cortex status | jq
    cortex jobs
    cortex stat "$JOB_ID"
+   cortex list --state todo --explain
+   cortex doctor --probe-live --repo owner/repo --json
    ```
+
+   新的 Work Item read model 使用 `topic → todo → on-going → done` 四態；日常操作、override、snapshot/registry migration 與 delivery gate 詳見 [Unified Work Lifecycle 操作與遷移](docs/unified-work-lifecycle.md)。所有工作預設 manual，只有 confirmed Todo 對應到帶 `cortex:auto-on-going` label 的 confirmed issue 才能 auto claim。
 
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 
@@ -219,28 +223,29 @@ cortex slice-action "$SLICE_ID" retry-review --actor operator
 cortex slice-action "$SLICE_ID" abandon      --actor operator
 ```
 
-`fanout`、`tick`、`complete` 與 `slice-action` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
+`fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
 
-### 5. Merge Candidate 並完成交付
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root，只有 `ship` 的 exact evidence refs 等進階欄位由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
-Cortex 不會替使用者 merge。verification / review 通過後，Slice 會停在 `verified` / `candidate-not-merged`；這個狀態不一定列入 `attention`，也要檢查 `status.slices`。將 `feature/<slice-id>` 透過保留原 Candidate commit 的 merge commit 合入並推送 target branch 後，再執行：
+Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；它會讀取 work item 的全部 mapped issues，任一張帶 `cortex:auto-on-going` 即符合 label 條件，但任一 GitHub API read 失敗會讓整個 claim fail-closed。`cortex work auto ... --enable|--disable` 未指定 legacy `--issue` 時會對全部 mapped issues 套用相同 label mutation；任一 mutation 失敗時整個 action 報錯。缺 issue 的 confirmed Todo 會持久化為 `needs_human: missing_issue`，待 operator link 且 Monitor snapshot 更新後才能 resume。Run 的 claim key 綁定該 work item 的 canonical semantic authority（provider/source revisions 與 confirmed refs），不綁 whole-fleet snapshot hash；只有 sequence、written-at 或其他 repo 噪音的 snapshot refresh 會原 run resume 並更新 provenance，語意來源變更才建立新 run。
 
-```bash
-cortex complete \
-  --specs-dir "$HOME/.agents/specs" \
-  --review-executor claude \
-  --review-model "<reviewer-model-id>"
-```
+`ship` 的 `pr_number`、`change`、`todo_paths` 必須與 current WorkAuthority 的 confirmed refs 完全相同，第一次 ship 後即成為 immutable delivery binding。V1 每個 run 只支援唯一一張 PR、唯一一個 OpenSpec change 與唯一一個 Todo path；任一類有多個 confirmed target 時轉為 `needs_human: multiple-delivery-targets-unsupported`，不會以其中一個 target 寫 CompletionRecord 或投影 done。Manager 會用 authenticated `gh api` 更新既有 mapped PR 的 zh-TW conventional title、body 與 labels，再逐欄 reread；body 必須用 closing keyword涵蓋全部 mapped issues。`repo_root` 必須恰好等於 canonical `git rev-parse --show-toplevel` realpath，且 `origin` 對應同一 `owner/name`。
 
-只有 Candidate 成為 `refs/remotes/<remote>/<target_branch>` 的 ancestor，Cortex 才會寫 CompletionRecord、標記 Slice `completed` 並釋放下游。squash / rebase merge / cherry-pick 會改變 Candidate identity，目前不受支援。
+Merge authorization 只雜湊 stable preflight 結果（argv、return code、HEAD、tree 與 gate outcome）及 immutable evidence hashes，不納入 stdout、stderr 或 duration。若 Manager 在 `merge-authorized` 後 crash，restart 會先以唯讀 authorization record 與 authenticated merge status reconcile；已合併時不重寫 PR metadata，也不重跑可能漂移的 preflight output。
+
+### 5. 由 Manager 完成交付
+
+Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec、跑 policy/pinned preflight、建立或更新 PR、要求 current-HEAD Copilot review，再重讀 checks、threads、closing refs 與 mergeability。只有全部 gate 對同一 HEAD 成立時才執行 merge commit；任何 stale provider、HEAD race、舊 review、partial closure 或第三輪 finding 都停在 `needs_human`。
+
+Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、active OpenSpec 消失、archive/Todo/CompletionRecord 成立。部分完成不會提早標 `done`。
 
 ### 目前邊界
 
 - 沒有 Web UI；任務意圖仍以 Markdown spec 維護。
-- v1 不做自動 fix-loop / retry；需由使用者選擇 recovery action。
+- Copilot finding 只允許兩輪 bounded fix/re-review；超過預算需由 operator recovery。
 - verification 的 sanitized env 不等於 network / filesystem sandbox。
 - v1 自動 foreign review 限 `tier: shareable`。
-- preserving-commit merge 是目前受支援路徑；squash / cherry-pick 改變 Candidate identity 時會 fail-closed。
+- merge commit 是目前受支援路徑；auto/squash/rebase/cherry-pick 會 fail-closed。
 - installer/service 尚無 periodic builder/reviewer model pin；需要固定 model 時，使用帶 `--model` / `--review-model` 的手動 `cortex tick`。
 
 尚未實作的 operator bootstrap、model pin、monitor init、instance/path isolation、state migration 與 async request UX 統一追蹤於 [issue #12](https://github.com/hamanpaul/paulsha-cortex/issues/12)，供後續 OpenSpec / implementation plan 使用。
@@ -294,17 +299,25 @@ verification:
 `PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`：
 
 ```yaml
-schema_version: 1
+schema_version: 2
 identities:
+  - executor: agy
+    model_id: Gemini 3.1 Pro (High)
+    independence_domain: google
+    capabilities: [planning]
+    live_probe: agy-plan-sandbox
   - executor: codex
     model_id: "<builder-model-id>"
     independence_domain: "<builder-domain>"
+    capabilities: [planning, build]
   - executor: claude
     model_id: "<reviewer-model-id>"
     independence_domain: "<different-reviewer-domain>"
+    capabilities: [planning, review]
 ```
 
-- builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析。
+- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity，自訂檔不得以不同內容 shadow 它。
+- planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - 同 domain、未知 identity、缺 model 都會得到 `foreign-review-absent`（fail-closed）。
 
 ### Merge 限制與 completion/restart
@@ -312,6 +325,8 @@ identities:
 - v1 只支援 preserving-commit 路徑：Candidate 必須是 `refs/remotes/<remote>/<target_branch>` 的 ancestor；squash/cherry-pick 視為不支援（保持 blocked 或 needs_human）。
 - 同一 dependency chain 必須使用同一 target branch，否則 fail-closed。
 - completion ordering 固定為「先 atomic 寫 CompletionRecord，再 atomic 標 Slice `completed`」。
+- work delivery CompletionRecord 另綁定 repo/work/run ID、workflow step IDs、Monitor snapshot/provider/source revisions、mapped issues、PR/OpenSpec/Todo refs、merge commit，以及 trusted preflight/Copilot/ForeignReview/merge-authorization refs；cached done 每次仍會重新讀取 fresh authority 與 remote closure。
+- merge 前 Manager 會先以 atomic no-clobber+fsync 寫入唯讀 `merge-authorized` evidence file（authority digest、HEAD/tree、Copilot epoch/review ID、ForeignReview/preflight/checks hashes），再把 path/hash 綁回 run state。Crash replay 只接受 exact record；未經 Manager authorization 的 external merge 會進入 `needs_human`，不會直接閉合。
 - crash window（record 已寫、slice 尚未 completed）在 restart 後只會補完符合當前 target ancestry 的紀錄；不符合則維持 blocked。
 - 舊版無 `schema_version` / legacy `done` state 需先 clean-start（archive/remove 舊 `jobs.json`），不做 silent migration。
 
@@ -346,13 +361,14 @@ cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 | control root | `~/.agents/control` | `PSC_CONTROL_ROOT` |
 | coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
 | specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
-| run root | `~/.agents/run` | `PSC_RUN_ROOT` |
+| run root | CLI 預設 `~/.agents/run`；installed instance 為 `~/.agents/run/<instance>` | `PSC_RUN_ROOT` |
+| monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
 | project config root | `~/.agents/config/paulsha` | `PSC_PROJECT_CONFIG_ROOT` |
 | repo root | 目前工作目錄 | `PSC_REPO_ROOT` |
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
-共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 `~/.agents`；installer 也會建立 `~/.agents/core/runtime` 與 `~/.config/systemd/user` 需要的單元檔。
+共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；後者會持久化 `PSC_AGENTS_ROOT`，再將 runtime 導向 override。installer 重跑會更新自身管理的 Python/repo 值，但保留既有 operator `PSC_AGENTS_ROOT`、`PSC_RUN_ROOT`、`PSC_MONITOR_STATE_ROOT` 與 `PSC_PROJECT_CONFIG_ROOT`。Monitor socket 預設為 `$PSC_RUN_ROOT/project-monitor.sock`，也可由 `project-cortex.yaml` 的 `monitor.socket_path` 覆寫；live doctor 會透過 production `MonitorSocketClient` 執行 `list_work_items` 並驗證 `cortex-work/v1`，單純 Unix socket 可連線不算 ready。
 
 ## 誠實狀態表
 
@@ -360,7 +376,7 @@ cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 | --- | --- |
 | persona enforcement | standalone PR workflow 為 `shadow`；coordinator verification 的 `persona-scope` 為 fail-closed gate |
 | manager service install | `cortex install service` 會 render / copy / enable，但不會 start；systemd 不可用時只落檔 |
-| coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` 走 control queue；舊低階 `dispatch` 已停用 |
+| coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
 | monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 |
 | 依賴模型 | 僅 `PyYAML`；runtime 不依賴 `paulsha-hippo` |

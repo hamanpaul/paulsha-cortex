@@ -135,6 +135,29 @@ def _write_manifest(
 
 
 class CompletionRecordValidationTests(unittest.TestCase):
+    def test_work_authority_rejects_unclosed_multi_target_refs(self) -> None:
+        authority = {
+            "repo": "acme/demo",
+            "work_id": "work",
+            "snapshot_hash": "0" * 64,
+            "provider_id": "github",
+            "provider_revision": "github-rev-1",
+            "source_revisions": ["issue:14@closed"],
+            "mapped_issues": [14],
+            "mapped_prs": [7, 8],
+            "mapped_openspec": ["work"],
+            "mapped_todo_paths": ["docs/todo.md"],
+            "pr_number": 7,
+            "change": "work",
+            "todo_paths": ["docs/todo.md"],
+            "merge_commit": "a" * 40,
+            "run_id": "run-1",
+            "workflow_step_ids": ["step-ship"],
+            "trusted_evidence_refs": [],
+        }
+        with self.assertRaisesRegex(ValueError, "refs invalid"):
+            completion._normalize_work_authority(authority)
+
     def test_required_policy_requires_reviewer_identity_and_eval_refs(self) -> None:
         payload = _completion_payload(
             slice_id="slice-required",

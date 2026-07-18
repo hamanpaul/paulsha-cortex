@@ -12,9 +12,9 @@ from paulsha_cortex.config import paths
 
 from .._yaml import YAMLError, safe_load
 from ..persona import render
-from . import verification
+from . import model_identities, verification
 
-MODEL_IDENTITY_SCHEMA_VERSION = 1
+MODEL_IDENTITY_SCHEMA_VERSION = model_identities.MODEL_IDENTITY_SCHEMA_VERSION
 REVIEW_SCHEMA_VERSION = 1
 REVIEW_VERDICT_FILENAME = ".psc-review-verdict.json"
 REVIEW_WORKTREE_DIRNAME = ".psc-review-worktrees"
@@ -52,40 +52,6 @@ def _canonical_json(payload: object) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _assert_no_duplicate_yaml_keys(text: str) -> None:
-    contexts: list[tuple[int, set[str]]] = []
-    for lineno, raw_line in enumerate(text.splitlines(), start=1):
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-        stripped = raw_line.strip()
-        if stripped.startswith("- "):
-            item_text = stripped[2:].strip()
-            if ":" not in item_text:
-                while contexts and contexts[-1][0] > indent:
-                    contexts.pop()
-                continue
-            key = item_text.split(":", 1)[0].strip()
-            context_indent = indent + 2
-            while contexts and contexts[-1][0] >= context_indent:
-                contexts.pop()
-            contexts.append((context_indent, set()))
-            if key in contexts[-1][1]:
-                raise ValueError(f"duplicate key '{key}' at line {lineno}")
-            contexts[-1][1].add(key)
-            continue
-        if ":" not in stripped:
-            continue
-        key = stripped.split(":", 1)[0].strip()
-        while contexts and contexts[-1][0] > indent:
-            contexts.pop()
-        if not contexts or contexts[-1][0] < indent:
-            contexts.append((indent, set()))
-        if key in contexts[-1][1]:
-            raise ValueError(f"duplicate key '{key}' at line {lineno}")
-        contexts[-1][1].add(key)
-
-
 def _normalize_identity(
     identity: object,
     *,
@@ -107,56 +73,9 @@ def _normalize_identity(
 
 
 def load_model_identity_registry(config_root: str | Path | None = None) -> dict[tuple[str, str], dict[str, str]]:
-    root = Path(config_root) if config_root is not None else paths.project_config_root()
-    path = root / "model-identities.yaml"
-    if not path.is_file():
-        raise ValueError(f"model-identities missing: {path}")
-    try:
-        text = path.read_text(encoding="utf-8")
-        _assert_no_duplicate_yaml_keys(text)
-        payload = safe_load(text)
-    except (OSError, UnicodeDecodeError, YAMLError, ValueError) as exc:
-        raise ValueError(f"model-identities unreadable: {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"model-identities invalid root: {path}")
-    extras = set(payload) - {"schema_version", "identities"}
-    if extras:
-        extra = sorted(extras)[0]
-        raise ValueError(f"model-identities unexpected top-level key: {extra}")
-    if payload.get("schema_version") != MODEL_IDENTITY_SCHEMA_VERSION:
-        raise ValueError(
-            f"model-identities schema_version must be {MODEL_IDENTITY_SCHEMA_VERSION}, "
-            f"got {payload.get('schema_version')!r}"
-        )
-    rows = payload.get("identities")
-    if not isinstance(rows, list):
-        raise ValueError("model-identities identities must be a list")
-    registry: dict[tuple[str, str], dict[str, str]] = {}
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            raise ValueError(f"model-identities[{index}] must be an object")
-        extras = set(row) - {"executor", "model_id", "independence_domain"}
-        if extras:
-            extra = sorted(extras)[0]
-            raise ValueError(f"model-identities[{index}].{extra} unexpected")
-        executor = row.get("executor")
-        model_id = row.get("model_id")
-        domain = row.get("independence_domain")
-        if not isinstance(executor, str) or not executor.strip():
-            raise ValueError(f"model-identities[{index}].executor invalid")
-        if not isinstance(model_id, str) or not model_id.strip():
-            raise ValueError(f"model-identities[{index}].model_id invalid")
-        if not isinstance(domain, str) or not domain.strip():
-            raise ValueError(f"model-identities[{index}].independence_domain invalid")
-        key = (executor.strip(), model_id.strip())
-        if key in registry:
-            raise ValueError(f"model-identities duplicate identity: {key[0]}/{key[1]}")
-        registry[key] = {
-            "executor": key[0],
-            "model_id": key[1],
-            "independence_domain": domain.strip(),
-        }
-    return registry
+    return model_identities.load_model_identities(
+        config_root, use_packaged_default=False
+    ).legacy_mapping()
 
 
 def read_repo_tier(repo_root: str | Path | None = None) -> str:

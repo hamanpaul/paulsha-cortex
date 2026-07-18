@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -68,7 +69,12 @@ def _validate_interval(interval: int) -> int:
     return interval
 
 
-def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
+def _write_managed_env(
+    env_file: Path,
+    managed: dict[str, str],
+    *,
+    preserve_existing: frozenset[str] = frozenset(),
+) -> None:
     """更新 managed keys（PY / PSC_REPO_ROOT），就地保留其餘 operator 手動行與註解。
 
     每次 install 只覆寫本函式管理的鍵；既有的 PSC_MANAGER_SPECS_DIR、
@@ -80,7 +86,11 @@ def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
     for line in lines:
         key = line.split("=", 1)[0] if "=" in line else None
         if key in remaining:
-            out.append(f"{key}={remaining.pop(key)}")
+            if key in preserve_existing:
+                out.append(line)
+                remaining.pop(key)
+            else:
+                out.append(f"{key}={remaining.pop(key)}")
         else:
             out.append(line)
     for key, value in remaining.items():
@@ -88,22 +98,63 @@ def _write_managed_env(env_file: Path, managed: dict[str, str]) -> None:
     env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
+def _read_plain_env(env_file: Path) -> dict[str, str]:
+    if not env_file.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key and key.strip() == key:
+            values[key] = value
+    return values
+
+
 def install_service(instance: str, interval: int, repo_root: Path) -> int:
     home = Path.home()
+    bootstrap_root = home / ".agents"
+    runtime_dir = bootstrap_root / "core" / "runtime"
+    env_file = runtime_dir / f"{instance}-manager.env"
+    existing = _read_plain_env(env_file)
+    agents_root = Path(
+        existing.get(
+            "PSC_AGENTS_ROOT",
+            os.environ.get("PSC_AGENTS_ROOT", str(bootstrap_root)),
+        )
+    ).expanduser()
+    if not agents_root.is_absolute():
+        raise ValueError("PSC_AGENTS_ROOT 必須為絕對路徑")
     unit_dir = home / ".config" / "systemd" / "user"
-    runtime_dir = home / ".agents" / "core" / "runtime"
-    for directory in (unit_dir, runtime_dir, home / ".agents" / "specs"):
+    # Units always bootstrap their EnvironmentFile from %h/.agents. The env
+    # file then redirects all mutable/runtime data through PSC_AGENTS_ROOT and
+    # the more-specific PSC_* roots.
+    for directory in (
+        unit_dir,
+        runtime_dir,
+        agents_root / "specs",
+        agents_root / "monitor",
+        agents_root / "config" / "paulsha",
+    ):
         directory.mkdir(parents=True, exist_ok=True)
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
-    env_file = runtime_dir / f"{instance}-manager.env"
     _write_managed_env(
         env_file,
         {
             "PY": sys.executable,
             "PSC_REPO_ROOT": str(repo_root),
-            "PSC_RUN_ROOT": str(home / ".agents" / "run" / instance),
+            "PSC_AGENTS_ROOT": str(agents_root),
+            "PSC_RUN_ROOT": str(agents_root / "run" / instance),
+            "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
+            "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
         },
+        preserve_existing=frozenset(
+            {
+                "PSC_AGENTS_ROOT",
+                "PSC_RUN_ROOT",
+                "PSC_MONITOR_STATE_ROOT",
+                "PSC_PROJECT_CONFIG_ROOT",
+            }
+        ),
     )
     if not _systemctl_available():
         print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
@@ -136,6 +187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         instance = _validate_instance(args.instance)
         interval = _validate_interval(args.interval)
         repo_root = _resolve_git_repo_root(Path(args.repo_root))
+        return install_service(instance, interval, repo_root)
     except ValueError as exc:
         parser.error(str(exc))
-    return install_service(instance, interval, repo_root)
+    raise AssertionError("argparse.error must exit")

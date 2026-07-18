@@ -103,6 +103,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_slice_action.add_argument("action", choices=["retry-build", "retry-verify", "retry-review", "abandon"])
     p_slice_action.add_argument("--actor", required=True)
 
+    p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
+    p_work.add_argument("action", choices=["link", "unlink", "start", "resume", "auto", "ship"])
+    p_work.add_argument("work_id")
+    p_work.add_argument("--repo", required=True)
+    p_work.add_argument("--issue", type=int)
+    p_work.add_argument("--kind", choices=["github_issue", "github_pr", "openspec", "path"])
+    p_work.add_argument("--ref")
+    toggle = p_work.add_mutually_exclusive_group()
+    toggle.add_argument("--enable", action="store_true")
+    toggle.add_argument("--disable", action="store_true")
+    p_work.add_argument("--payload", help="額外 manager-side evidence refs JSON object")
+
     sub.add_parser("status", help="讀取 manager daemon 的 ready/held/slices/attention 快照")
 
     p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
@@ -217,6 +229,42 @@ def main(
         return _submit_mutation_request(
             "slice-action",
             {"slice_id": args.slice_id, "action": args.action, "actor": args.actor},
+            read_status_fn=read_status_fn,
+            submit_request_fn=submit_request_fn,
+            poll_done_fn=poll_done_fn,
+        )
+
+    if args.cmd == "work":
+        request_args = {
+            "action": args.action,
+            "repo": args.repo,
+            "work_id": args.work_id,
+        }
+        if args.issue is not None:
+            request_args["issue"] = args.issue
+        if args.kind is not None:
+            request_args["kind"] = args.kind
+        if args.ref is not None:
+            request_args["ref"] = args.ref
+        if args.enable or args.disable:
+            request_args["enabled"] = bool(args.enable)
+        if args.payload:
+            try:
+                extra = json.loads(Path(args.payload).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                print(f"錯誤: work payload unreadable: {exc}", file=sys.stderr)
+                return 2
+            if not isinstance(extra, dict):
+                print("錯誤: work payload must be a JSON object", file=sys.stderr)
+                return 2
+            protected = {"action", "repo", "work_id"}
+            if protected & set(extra):
+                print("錯誤: work payload cannot override action/repo/work_id", file=sys.stderr)
+                return 2
+            request_args.update(extra)
+        return _submit_mutation_request(
+            "work-action",
+            request_args,
             read_status_fn=read_status_fn,
             submit_request_fn=submit_request_fn,
             poll_done_fn=poll_done_fn,
