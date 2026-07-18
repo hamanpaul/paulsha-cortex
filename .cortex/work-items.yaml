@@ -1,0 +1,9 @@
+version: 1
+work_items:
+  docs-only-lifecycle-canary:
+    title: Unified lifecycle live canary
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#20
+      - kind: openspec
+        ref: docs-only-lifecycle-canary
