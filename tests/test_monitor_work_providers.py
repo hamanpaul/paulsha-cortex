@@ -125,26 +125,30 @@ def _completed(payload, *, returncode=0, stderr=""):
 
 
 def test_github_provider_uses_typed_argv_and_json():
+    rows = [
+        {
+            "number": 14,
+            "title": "umbrella",
+            "state": "open",
+            "node_id": "ISSUE_node",
+            "updated_at": "2026-07-17T10:00:00Z",
+            "labels": [{"name": "cortex:auto-on-going"}],
+        },
+        {
+            "number": 15,
+            "title": "delivery",
+            "state": "closed",
+            "node_id": "PR_node",
+            "updated_at": "2026-07-17T10:01:00Z",
+            "pull_request": {"url": "https://api.github.test/pr/15"},
+        },
+    ]
     runner = FakeRunner(
-        _completed(
-            [[
-                {
-                    "number": 14,
-                    "title": "umbrella",
-                    "state": "open",
-                    "node_id": "ISSUE_node",
-                    "updated_at": "2026-07-17T10:00:00Z",
-                    "labels": [{"name": "cortex:auto-on-going"}],
-                },
-                {
-                    "number": 15,
-                    "title": "delivery",
-                    "state": "closed",
-                    "node_id": "PR_node",
-                    "updated_at": "2026-07-17T10:01:00Z",
-                    "pull_request": {"url": "https://api.github.test/pr/15"},
-                },
-            ]]
+        subprocess.CompletedProcess(
+            args=("gh",),
+            returncode=0,
+            stdout="\n".join(json.dumps(row) for row in rows) + "\n",
+            stderr="",
         )
     )
 
@@ -163,7 +167,8 @@ def test_github_provider_uses_typed_argv_and_json():
         "--method",
         "GET",
         "--paginate",
-        "--slurp",
+        "--jq",
+        ".[]",
         "repos/example/acme/issues?state=all&per_page=100",
     )
     assert timeout == 12
