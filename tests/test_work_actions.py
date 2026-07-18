@@ -446,6 +446,66 @@ def test_canonical_claim_excludes_derived_sources_and_volatile_github_revisions(
     assert decision.reason is None
 
 
+def test_canonical_authority_loader_ignores_issue_only_topic_rows(tmp_path: Path) -> None:
+    snapshot = tmp_path / "canonical.json"
+    provider = {
+        "provider_id": "github:acme/demo",
+        "status": "ok",
+        "last_attempt_at": "2026-07-17T00:00:00Z",
+        "last_success_at": "2026-07-17T00:00:00Z",
+        "revision": "gh-1",
+        "diagnostics": [],
+        "sources": [],
+        "observations": {},
+    }
+    issue = {
+        "source_id": "github_issue:acme/demo#12",
+        "kind": "github_issue",
+        "ref": "acme/demo#12",
+        "revision": "issue-open",
+        "status": "open",
+        "confidence": "confirmed",
+        "provider": "github:acme/demo",
+    }
+    openspec = {
+        "source_id": "openspec:acme/demo:demo",
+        "kind": "openspec",
+        "ref": "demo",
+        "revision": "spec-content",
+        "status": "active",
+        "confidence": "confirmed",
+        "provider": "repo:acme/demo",
+    }
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema": "work-items-snapshot/v1",
+                "providers": {"github:acme/demo": provider},
+                "work_items": [
+                    {
+                        "repo": "acme/demo",
+                        "work_id": "issue:acme/demo#99",
+                        "sources": [{**issue, "ref": "acme/demo#99", "source_id": "github_issue:acme/demo#99"}],
+                    },
+                    {
+                        "repo": "acme/demo",
+                        "work_id": "demo",
+                        "sources": [issue, openspec],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+
+    assert authority.mapped_issues == (12,)
+    assert authority.mapped_openspec == ("demo",)
+
+
 def test_snapshot_refresh_noise_keeps_same_semantic_run(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
