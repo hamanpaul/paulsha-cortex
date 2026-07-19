@@ -1144,6 +1144,95 @@ def test_ship_needs_human_when_authority_has_multiple_delivery_targets(
     )
 
 
+def test_ship_resume_rearms_prebinding_target_cardinality_stop(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import work_bridge
+    from paulsha_cortex.coordinator.claim import work_authority_digest
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", todo_paths=())
+    state = tmp_path / "delivery-journal.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    stopped = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": [],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    assert stopped["result"]["reason"] == "multiple-delivery-targets-unsupported"
+
+    _snapshot(
+        snapshot,
+        todo_paths=("docs/todo.md",),
+        source_revisions=("issue:12@open", "openspec:demo@1", "todo:docs/todo.md@1"),
+    )
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=state.parent / "jobs.json")
+    run = registry.list_workflow_runs()[0]
+    run = registry._manager_update_workflow_run(
+        run.run_id,
+        source_revision=work_authority_digest(authority),
+        facets=("needs_human", "degraded"),
+    )
+    work_bridge._rebase_delivery_journal_authority(
+        state_root=state.parent,
+        run=run,
+        authority=authority,
+    )
+
+    active = tmp_path / "openspec" / "changes" / "demo"
+    active.mkdir(parents=True)
+    (active / "tasks.md").write_text("- [x] ready\n", encoding="utf-8")
+    (tmp_path / "changelog.d").mkdir()
+    (tmp_path / "changelog.d" / "demo.md").write_text("fixed\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n\n### Fixed\n- ready\n", encoding="utf-8"
+    )
+
+    def runner(argv, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    resumed = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "pr_metadata_path": str(tmp_path / "pr.json"),
+        },
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+
+    assert resumed["result"]["action"] == "archive-applied-needs-commit"
+    assert "ship" not in _only_journal_row(state)
+    assert JobRegistry(state_path=state.parent / "jobs.json").get_workflow_run(
+        run.run_id
+    ).facets == ("degraded",)
+
+
 def test_ship_rejects_old_run_after_current_authority_changes(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"

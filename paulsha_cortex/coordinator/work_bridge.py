@@ -1285,6 +1285,11 @@ def build_production_ship_validator(
                 run.run_id,
                 source_revision=work_authority_digest(authority),
             )
+        _rebase_delivery_journal_authority(
+            state_root=state_root,
+            run=run,
+            authority=authority,
+        )
         from . import work_actions
         from . import review as review_evidence
 

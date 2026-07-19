@@ -38,6 +38,7 @@
 - [x] 3.6 實作`gh pr merge --merge`前final reread、stable-hash atomic durable `merge-authorized` record、免重跑preflight的crash reconciliation與merge後remote closure/authority-bound CompletionRecord；V1多delivery target轉needs_human。
 - [x] 3.7 通過GitHub seam/focused/full/integration tests、help、OpenSpec、policy與preflight；完成planner issue #5與ship-gate issue #16。Issue #8其餘task-type選牌、計分/成本與skill治理範圍保留，不由本change虛假關閉。
 - [x] 3.8 RED-test並實作immutable exact-HEAD `maintainer-review` attestation、Copilot/maintainer二選一gate與保留實際review kind/ref/hash的merge authorization v2。
+- [x] 3.9 RED-test並實作pre-binding target-cardinality stop恢復：operator補齊唯一PR/OpenSpec/Todo authority後explicit resume可重綁同一run journal；既有binding與其他needs_human仍fail-closed。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

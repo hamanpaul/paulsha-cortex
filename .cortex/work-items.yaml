@@ -32,3 +32,5 @@ work_items:
         ref: hamanpaul/paulsha-cortex#31
       - kind: openspec
         ref: terminal-lifecycle-canary
+      - kind: path
+        ref: docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md
