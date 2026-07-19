@@ -198,6 +198,10 @@ def test_run_preflight_strips_inherited_cortex_runtime_from_gate_processes(
     monkeypatch.setenv("PSC_AGENTS_ROOT", "/live/agents")
     monkeypatch.setenv("PSC_REPO_ROOT", "/live/repo")
     monkeypatch.setenv("PREFLIGHT_AUTH_MARKER", "preserved")
+    monkeypatch.setenv("HOME", "/operator/home")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/operator/cache")
+    monkeypatch.setenv("PYTHONUSERBASE", "/operator/python-user-base")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/operator/gh-config")
     calls: list[dict[str, object]] = []
 
     class Result:
@@ -224,11 +228,21 @@ def test_run_preflight_strips_inherited_cortex_runtime_from_gate_processes(
     )
 
     assert result.passed
+    disposable_homes: set[Path] = set()
     for call in calls[3:5]:
         environment = call["env"]
         assert isinstance(environment, dict)
         assert environment["PREFLIGHT_AUTH_MARKER"] == "preserved"
         assert not any(name.startswith("PSC_") for name in environment)
+        assert environment["HOME"] != "/operator/home"
+        assert environment["XDG_CACHE_HOME"] == str(
+            Path(environment["HOME"]) / ".cache"
+        )
+        assert environment["PYTHONUSERBASE"] == "/operator/python-user-base"
+        assert environment["GH_CONFIG_DIR"] == "/operator/gh-config"
+        disposable_homes.add(Path(environment["HOME"]))
+    assert len(disposable_homes) == 1
+    assert not next(iter(disposable_homes)).exists()
 
 
 def test_run_preflight_stops_after_failed_quick_policy(tmp_path: Path) -> None:

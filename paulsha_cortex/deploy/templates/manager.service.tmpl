@@ -10,6 +10,7 @@ EnvironmentFile=-%h/.agents/core/runtime/__INSTANCE__.env
 EnvironmentFile=-%h/.agents/core/runtime/__INSTANCE__-manager.env
 ExecStart=/usr/bin/env bash __SERVICE_SCRIPT__
 KillMode=control-group
+UMask=0022
 Restart=on-failure
 RestartSec=10
 
