@@ -2368,6 +2368,8 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
 def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     tmp_path: Path,
 ) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
@@ -2407,7 +2409,7 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
         repo="hamanpaul/paulsha-cortex",
         claim_key="claim:v1:" + "1" * 64,
         source_revision="2" * 64,
-        workspace_root=str(repo),
+        workspace_root=str(workspace),
         combo="feature-oneshot",
         current_phase="verify",
         steps=steps,
@@ -2539,6 +2541,14 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     assert not manager._is_exact_reviewer_terminal_recovery(
         registry,
         {**bound, "workflow_input_root": str(repo)},
+        run=run,
+        step=verify_step,
+        identities=identities,
+        coordinator_root=coordinator,
+    )
+    assert not manager._is_exact_reviewer_terminal_recovery(
+        registry,
+        {**bound, "workflow_repo_root": str(workspace)},
         run=run,
         step=verify_step,
         identities=identities,
