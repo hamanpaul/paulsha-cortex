@@ -2257,6 +2257,7 @@ def test_committed_reconcile_detects_artifact_drift_and_preserves_intent(
 
 def test_existing_report_requires_baseline_change_and_embedded_workflow_binding(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     report_ref = "reports/verify/work.md"
@@ -2306,6 +2307,100 @@ def test_existing_report_requires_baseline_change_and_embedded_workflow_binding(
         "candidate": "a" * 40,
     }
     assert "Passed after this job." in report.read_text(encoding="utf-8")
+
+    run = SimpleNamespace(
+        run_id="run",
+        claim_key="claim",
+        repo="owner/repo",
+        source_revision="rev",
+        candidate_head="a" * 40,
+    )
+    report_bytes = report.read_bytes()
+    report_hash = manager._sha256_path(report)
+    report.unlink()
+    with pytest.raises(ValueError, match="artifact drift"):
+        manager._read_job_workflow_evidence(
+            terminal,
+            run=run,
+            coordinator_root=tmp_path,
+        )
+
+    work_bridge._write_json_evidence(
+        tmp_path,
+        "report-cleanup",
+        {
+            "schema": "cortex-workflow-report-cleanup/v1",
+            "run_id": run.run_id,
+            "candidate": run.candidate_head,
+            "reports": [{"path": report_ref, "sha256": report_hash}],
+        },
+    )
+    payload, outputs, _path, _digest = manager._read_job_workflow_evidence(
+        terminal,
+        run=run,
+        coordinator_root=tmp_path,
+    )
+    assert payload["status"] == "verified"
+    assert outputs == (report_ref,)
+
+    report.write_bytes(report_bytes)
+    original_read_bytes = Path.read_bytes
+    raced = False
+
+    def disappear_before_read(path: Path) -> bytes:
+        nonlocal raced
+        if path == report and not raced:
+            raced = True
+            report.unlink()
+            raise FileNotFoundError(report)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", disappear_before_read)
+    payload, outputs, _path, _digest = manager._read_job_workflow_evidence(
+        terminal,
+        run=run,
+        coordinator_root=tmp_path,
+    )
+    assert payload["status"] == "verified"
+    assert outputs == (report_ref,)
+
+
+def test_report_cleanup_evidence_enumeration_is_bounded_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "evidence" / "report-cleanup"
+    directory.mkdir(parents=True)
+    run = SimpleNamespace(run_id="run", candidate_head="a" * 40)
+    original_iterdir = Path.iterdir
+
+    def too_many_markers(path: Path):
+        if path == directory:
+            for index in range(2049):
+                yield directory / f"{index:064x}.json"
+            return
+        yield from original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", too_many_markers)
+    assert manager._workflow_report_cleanup_allows_missing(
+        coordinator_root=tmp_path,
+        run=run,
+        ref="reports/verify/work.md",
+        expected_hash="b" * 64,
+    ) is False
+
+    def failed_enumeration(path: Path):
+        if path == directory:
+            raise OSError("directory enumeration failed")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", failed_enumeration)
+    assert manager._workflow_report_cleanup_allows_missing(
+        coordinator_root=tmp_path,
+        run=run,
+        ref="reports/verify/work.md",
+        expected_hash="b" * 64,
+    ) is False
 
 
 def test_terminal_report_manifest_cannot_authorize_arbitrary_markdown_overwrite(
