@@ -357,7 +357,7 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "source_revision", "workspace_root", "evidence_refs", "gate_refs",
         "brainstorm_required", "primary_domain", "candidate_head",
         "verified_head", "gate_status", "completion_source_revisions",
-        "planning_authority",
+        "planning_authority", "planning_source_revision",
     }
 )
 

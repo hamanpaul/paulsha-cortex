@@ -163,6 +163,7 @@ def test_workflow_run_persists_all_fields_and_claim_is_restart_idempotent(tmp_pa
     assert created.evidence_refs == ("evidence/question-pack.json",)
     assert created.facets == ("needs_human",)
     assert created.gate_status == "pending"
+    assert created.planning_source_revision == "rev-a"
     assert created.planning_authority == (
         PlanningArtifactAuthority(
             ref="docs/superpowers/plans/unified-work-lifecycle.md",
@@ -178,6 +179,10 @@ def test_workflow_run_persists_all_fields_and_claim_is_restart_idempotent(tmp_pa
     assert restarted.list_workflow_runs() == [created]
     assert len(json.loads(state.read_text(encoding="utf-8"))["workflows"]) == 1
 
+    legacy_payload = created.to_dict()
+    legacy_payload.pop("planning_source_revision")
+    assert WorkflowRun.from_dict(legacy_payload).planning_source_revision is None
+
 
 def test_workflow_run_update_is_typed_persisted_and_rejects_phase_regression(tmp_path: Path) -> None:
     state = tmp_path / "jobs.json"
@@ -187,12 +192,15 @@ def test_workflow_run_update_is_typed_persisted_and_rejects_phase_regression(tmp
     updated = registry._manager_update_workflow_run(
         created.run_id,
         current_phase="build",
+        source_revision="rev-b",
         attempts={"plan": 1, "build": 2},
         evidence_refs=("evidence/question-pack.json", "evidence/build.json"),
         facets=(),
         gate_status="running",
     )
     assert updated.current_phase == "build"
+    assert updated.source_revision == "rev-b"
+    assert updated.planning_source_revision == "rev-a"
     assert updated.attempts["build"] == 2
     assert updated.gate_status == "running"
     assert JobRegistry(state_path=state).get_workflow_run(created.run_id) == updated

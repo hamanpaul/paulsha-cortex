@@ -298,6 +298,7 @@ class WorkflowRun:
     created_at: str
     updated_at: str
     planning_authority: tuple[PlanningArtifactAuthority, ...] = ()
+    planning_source_revision: str | None = None
     status: str = "ongoing"
     completion_record_path: str | None = None
     completion_record_hash: str | None = None
@@ -338,6 +339,11 @@ class WorkflowRun:
             not isinstance(item, PlanningArtifactAuthority) for item in self.planning_authority
         ):
             raise ValueError("workflow run planning_authority 格式錯誤")
+        if self.planning_source_revision is not None and (
+            not isinstance(self.planning_source_revision, str)
+            or not self.planning_source_revision
+        ):
+            raise ValueError("workflow run planning_source_revision 必須為null或非空字串")
         authority_refs = [item.ref for item in self.planning_authority]
         if len(authority_refs) != len(set(authority_refs)) or any(
             item.work_id != self.work_id for item in self.planning_authority
@@ -456,6 +462,7 @@ class WorkflowRun:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "planning_authority": [item.to_dict() for item in self.planning_authority],
+            "planning_source_revision": self.planning_source_revision,
             "status": self.status,
             "completion_record_path": self.completion_record_path,
             "completion_record_hash": self.completion_record_hash,
@@ -527,6 +534,7 @@ class WorkflowRun:
             planning_authority=tuple(
                 PlanningArtifactAuthority.from_dict(item) for item in planning_authority
             ),
+            planning_source_revision=payload.get("planning_source_revision"),
             status=payload.get("status", "ongoing"),
             completion_record_path=payload.get("completion_record_path"),
             completion_record_hash=payload.get("completion_record_hash"),

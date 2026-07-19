@@ -237,7 +237,7 @@ Merge authorization 只雜湊 stable preflight 結果（argv、return code、HEA
 
 Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec、跑 policy/pinned preflight、建立或更新 PR，再要求恰好一種current-HEAD delivery review：authenticated Copilot review，或透過`review-attest`建立的immutable maintainer evidence。Manager接著重讀checks、threads、closing refs與mergeability；只有全部gate對同一HEAD成立時才執行merge commit。Maintainer evidence保留`maintainer-review` kind，絕不偽裝成Copilot。
 
-Headless build card會在dispatch前解析declared inputs。Accepted planning artifact只接受WorkflowRun planning authority的ref/hash；獨立builder worktree缺檔時由Manager原子seed。Job、versioned bounded prompt與canonical evidence保存同一份input snapshot，terminalize再驗hash。Dead job轉`needs_human`後periodic runner不會自動重派，必須由operator明確執行`work resume`。
+Headless build card會在dispatch前解析declared inputs。異質brainstorm發布的新artifact會先由canonical brainstorm evidence的ref/kind/hash與不可變發證source revision原子併入WorkflowRun planning authority；legacy active run也只透過相同evidence reconcile，不從mutable檔案猜測。後續PR refresh即使更新run目前source revision，也不會改寫planning發證revision；brainstorm-required run缺evidence一律停止。Accepted planning artifact只接受該authority的ref/hash；獨立builder worktree缺檔時由Manager原子seed。Job、versioned bounded prompt與canonical evidence保存同一份input snapshot，terminalize再驗hash。Dead job轉`needs_human`後periodic runner不會自動重派；explicit resume若dispatch失敗也會保留stop facet，必須修正authority後再由operator重試。
 
 Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、active OpenSpec 消失、archive/Todo/CompletionRecord 成立。部分完成不會提早標 `done`。
 
