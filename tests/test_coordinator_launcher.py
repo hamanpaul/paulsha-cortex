@@ -158,6 +158,11 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(
             review_schema["properties"]["kind"]["enum"], ["workflow-review-result"]
         )
+        self.assertIn(
+            "report-only",
+            review_schema["properties"]["findings"]["items"]["properties"]
+            ["category"]["description"],
+        )
         self.assertIn("--safe-mode", claude)
         self.assertIn("--no-session-persistence", claude)
         self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")

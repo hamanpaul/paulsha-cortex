@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import hashlib
 from pathlib import Path
@@ -1274,6 +1275,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     plan_launch_roots: list[Path] = []
     commit_capability_requests: list[str] = []
     review_capability_requests: list[str] = []
+    adversarial_launches: list[str] = []
 
     class WorkflowLauncher:
         def as_read_only(self):
@@ -1319,11 +1321,26 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             else:
                 suffix = "-adversarial" if card == "adversarial-review" else ""
                 report_ref = f"reports/review/production-wiring{suffix}.md"
+                findings = []
+                if card == "adversarial-review":
+                    adversarial_launches.append(slice_id)
+                    if len(adversarial_launches) == 1:
+                        findings = [{
+                            "category": "correctness",
+                            "severity": "minor",
+                            "summary": "prior report omitted one sandbox-only failure file",
+                            "evidence": [{
+                                "path": "reports/review/production-wiring.md",
+                                "line": None,
+                                "detail": "the Candidate verdict is unchanged",
+                            }],
+                            "recommendation": "correct the enumeration in a fresh report",
+                        }]
                 evidence = {
                     "schema_version": 1,
                     "kind": "workflow-review-result",
-                    "reason": "accepted",
-                    "findings": [],
+                    "reason": "blocking findings" if findings else "accepted",
+                    "findings": findings,
                     "reports": [{"path": report_ref, "body": "# Review\n\nPassed."}],
                 }
             log_path = Path(log_dir) / f"{slice_id}.jsonl"
@@ -1464,7 +1481,109 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         "workflow-review-result",
         "workflow-review-result",
     ]
+    assert result["reason"] == "blocking-findings"
+    blocked = registry.get_workflow_run(run.run_id)
+    assert blocked.facets == ("needs_human",)
+    assert blocked.gate_status == "failed"
+    assert next(
+        step for step in blocked.steps if step.card == "adversarial-review"
+    ).gate_result == "needs_human"
+    rejected_job = next(
+        job
+        for job in reversed(registry.list_jobs())
+        if job.get("workflow_card") == "adversarial-review"
+    )
+    forged_job = dict(rejected_job)
+    forged_job["workflow_evidence"] = {
+        **rejected_job["workflow_evidence"],
+        "hash": "0" * 64,
+    }
+    assert not manager._is_rejected_workflow_review_evidence(
+        forged_job, run=blocked, coordinator_root=coordinator_dir
+    )
+    stale_job = {**rejected_job, "subject_head": "f" * 40}
+    assert not manager._is_rejected_workflow_review_evidence(
+        stale_job, run=blocked, coordinator_root=coordinator_dir
+    )
+    rejected_index = next(
+        index
+        for index, job in enumerate(registry._jobs)
+        if job.get("job_id") == rejected_job["job_id"]
+    )
+    jobs_before_mismatch = len(registry.list_jobs())
+    rejected_subject = registry._jobs[rejected_index]["subject_head"]
+    registry._jobs[rejected_index]["subject_head"] = "f" * 40
+    registry._persist()
+    mismatch = executor(build_request(
+        req_type="workflow-action",
+        args={"action": "resume", "run_id": run.run_id},
+        requested_by="operator",
+    ))
+    assert mismatch["reason"] == "rejected-review-recovery-mismatch"
+    assert len(registry.list_jobs()) == jobs_before_mismatch
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+    assert registry.get_workflow_run(run.run_id).gate_status == "failed"
+    registry._jobs[rejected_index]["subject_head"] = rejected_subject
+    registry._persist()
+    rejected_hash = registry._jobs[rejected_index]["workflow_evidence"]["hash"]
+    registry._jobs[rejected_index]["workflow_evidence"]["hash"] = "0" * 64
+    registry._persist()
+    mismatch = executor(build_request(
+        req_type="workflow-action",
+        args={"action": "resume", "run_id": run.run_id},
+        requested_by="operator",
+    ))
+    assert mismatch["reason"] == "rejected-review-recovery-mismatch"
+    assert len(registry.list_jobs()) == jobs_before_mismatch
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+    assert registry.get_workflow_run(run.run_id).gate_status == "failed"
+    registry._jobs[rejected_index]["workflow_evidence"]["hash"] = rejected_hash
+    registry._persist()
+    jobs_before_periodic = len(registry.list_jobs())
+    periodic()
+    assert len(registry.list_jobs()) == jobs_before_periodic
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+
+    result = executor(build_request(
+        req_type="workflow-action",
+        args={"action": "resume", "run_id": run.run_id},
+        requested_by="operator",
+    ))
     assert result["reason"] == "ship-validator-unavailable"
+    assert len(adversarial_launches) == 2
+    assert review_capability_requests == [
+        "workflow-verification-result",
+        "workflow-review-result",
+        "workflow-review-result",
+        "workflow-review-result",
+    ]
+
+    passed = registry.get_workflow_run(run.run_id)
+    replay_steps = tuple(
+        replace(step, gate_result="pending")
+        if step.card == "adversarial-review"
+        else step
+        for step in passed.steps
+    )
+    registry._manager_update_workflow_run(
+        run.run_id,
+        steps=replay_steps,
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    jobs_before_replay = len(registry.list_jobs())
+    replayed = executor(build_request(
+        req_type="workflow-action",
+        args={"action": "resume", "run_id": run.run_id},
+        requested_by="operator",
+    ))
+    assert replayed["reason"] == "ship-validator-unavailable"
+    assert len(registry.list_jobs()) == jobs_before_replay
+    assert next(
+        step
+        for step in registry.get_workflow_run(run.run_id).steps
+        if step.card == "adversarial-review"
+    ).gate_result == "passed"
 
     fake_ship = build_request(
         req_type="workflow-action",
@@ -1525,7 +1644,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         for step in shipped.steps if step.phase in {"claim", "define", "plan", "build", "verify", "review"}
     )
     workflow_jobs = [job for job in registry.list_jobs() if job.get("workflow_run_id") == run.run_id]
-    assert len(workflow_jobs) == 9
+    assert len(workflow_jobs) == 10
     assert {
         job.get("workflow_card")
         for job in workflow_jobs
@@ -1537,12 +1656,17 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     assert all(isinstance(job.get("workflow_inputs"), list) for job in workflow_jobs)
     assert all(isinstance(job.get("workflow_outputs"), list) for job in workflow_jobs)
     assert all(isinstance(job.get("workflow_output_baseline"), list) for job in workflow_jobs)
-    adversarial_job = next(
+    adversarial_jobs = [
         job for job in workflow_jobs if job.get("workflow_card") == "adversarial-review"
-    )
+    ]
+    assert len(adversarial_jobs) == 2
     assert any(
         row["path"] == "reports/review/production-wiring.md"
-        for row in adversarial_job["workflow_output_baseline"]
+        for row in adversarial_jobs[0]["workflow_output_baseline"]
+    )
+    assert any(
+        row["path"] == "reports/review/production-wiring-adversarial.md"
+        for row in adversarial_jobs[1]["workflow_output_baseline"]
     )
     assert all(not Path(job["workflow_evidence"]["path"]).is_absolute() for job in workflow_jobs)
     assert all(
