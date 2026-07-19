@@ -4794,7 +4794,12 @@ def _dispatch_workflow_card(
         review_only_factory = getattr(launcher, "as_review_only", None)
         if not callable(review_only_factory):
             raise ValueError("reviewer launcher lacks enforced read-only contract")
-        launcher = review_only_factory()
+        terminal_kind = (
+            "workflow-verification-result"
+            if step.phase == "verify"
+            else "workflow-review-result"
+        )
+        launcher = review_only_factory(terminal_kind=terminal_kind)
     effective_commit_policy = step.commit_policy or _LEGACY_CARD_EXECUTION.get(
         step.card, (None, None, None, None)
     )[2]

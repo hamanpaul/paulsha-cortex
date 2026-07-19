@@ -619,7 +619,10 @@ identities:
         def as_commit_required(self):
             return self
 
-        def as_review_only(self):
+        def as_review_only(self, *, terminal_kind):
+            assert terminal_kind in {
+                "workflow-verification-result", "workflow-review-result",
+            }
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):

@@ -587,7 +587,8 @@ def test_operator_resume_recovers_only_exact_legacy_agy_reviewer_terminal(
     launched: list[str] = []
 
     class Launcher:
-        def as_review_only(self):
+        def as_review_only(self, *, terminal_kind):
+            assert terminal_kind == "workflow-verification-result"
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):
@@ -1282,8 +1283,8 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             commit_capability_requests.append("required")
             return self
 
-        def as_review_only(self):
-            review_capability_requests.append("required")
+        def as_review_only(self, *, terminal_kind):
+            review_capability_requests.append(terminal_kind)
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):
@@ -1458,7 +1459,11 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         seen_phases.append(result["current_phase"])
     assert seen_phases == ["build", "build", "build", "verify", "review", "review", "review"]
     assert commit_capability_requests == ["required", "required"]
-    assert review_capability_requests == ["required", "required", "required"]
+    assert review_capability_requests == [
+        "workflow-verification-result",
+        "workflow-review-result",
+        "workflow-review-result",
+    ]
     assert result["reason"] == "ship-validator-unavailable"
 
     fake_ship = build_request(
@@ -2558,7 +2563,8 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     launched: list[tuple[str, str, str]] = []
 
     class Launcher:
-        def as_review_only(self):
+        def as_review_only(self, *, terminal_kind):
+            assert terminal_kind == "workflow-verification-result"
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):

@@ -96,6 +96,7 @@ class ArgvTests(unittest.TestCase):
             claude = build_claude_argv(
                 prompt="P", slice_id="s", log_dir="/lg",
                 worktree="/wt/reviewer", review_only=True,
+                review_terminal_kind="workflow-verification-result",
             )
         codex = build_codex_argv(
             prompt="P", slice_id="s", log_dir="/lg", review_only=True
@@ -135,8 +136,27 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("/run/docker.sock", protected_files)
         self.assertNotIn("/var/run/docker.sock", protected_files)
         self.assertIn("--strict-mcp-config", claude)
+        schema = json.loads(claude[claude.index("--json-schema") + 1])
         self.assertEqual(
-            claude[claude.index("--json-schema") + 1], '{"type":"object"}'
+            schema["required"],
+            ["schema_version", "kind", "status", "summary", "details", "reports"],
+        )
+        self.assertEqual(
+            schema["properties"]["kind"]["enum"], ["workflow-verification-result"]
+        )
+        self.assertEqual(schema["properties"]["status"]["enum"], ["verified"])
+        review = build_claude_argv(
+            prompt="P",
+            slice_id="review", log_dir="/lg", worktree="/wt/reviewer", review_only=True,
+            review_terminal_kind="workflow-review-result",
+        )
+        review_schema = json.loads(review[review.index("--json-schema") + 1])
+        self.assertEqual(
+            review_schema["required"],
+            ["schema_version", "kind", "reason", "findings", "reports"],
+        )
+        self.assertEqual(
+            review_schema["properties"]["kind"]["enum"], ["workflow-review-result"]
         )
         self.assertIn("--safe-mode", claude)
         self.assertIn("--no-session-persistence", claude)
@@ -145,6 +165,11 @@ class ArgvTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Candidate checkout"):
             build_claude_argv(
                 prompt="P", slice_id="s", log_dir="/lg", review_only=True
+            )
+        with self.assertRaisesRegex(ValueError, "terminal contract kind"):
+            build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg",
+                worktree="/wt/reviewer", review_only=True,
             )
         with self.assertRaisesRegex(ValueError, "read-only"):
             build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", review_only=True)
@@ -449,7 +474,9 @@ class ArgvTests(unittest.TestCase):
                 inherited_secrets,
                 clear=False,
             ):
-                SubprocessLauncher("claude").as_review_only().launch(
+                SubprocessLauncher("claude").as_review_only(
+                    terminal_kind="workflow-verification-result"
+                ).launch(
                     slice_id="review",
                     prompt="P",
                     worktree=d,
