@@ -281,13 +281,19 @@ class GitHubDeliveryClient:
         return self._run(["gh", "api", endpoint], expect_json=True)
 
     def _api_pages(self, endpoint: str) -> list[object]:
-        payload = self._run(
-            ["gh", "api", "--paginate", "--slurp", endpoint],
-            expect_json=True,
+        stdout = self._run(
+            ["gh", "api", "--paginate", "--jq", ".", endpoint],
+            expect_json=False,
         )
-        if not isinstance(payload, list) or not payload:
+        if not isinstance(stdout, str):
             raise RuntimeError("GitHub paginated payload malformed")
-        return payload
+        try:
+            pages = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GitHub paginated payload malformed") from exc
+        if not pages:
+            raise RuntimeError("GitHub paginated payload malformed")
+        return pages
 
     @staticmethod
     def _repo_parts(repo: str) -> tuple[str, str]:

@@ -16,7 +16,7 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 - **THEN**Manager拒絕`--skip-tests`並重跑full suite
 
 ### Requirement: Delivery review與GitHub gates必須綁定current HEAD
-開PR後 Manager MUST等待所有required checks terminal-green，並要求恰好一種current-HEAD delivery review authority：request `@copilot`所得的authenticated review，或經control queue建立的typed `maintainer-review` evidence。有效Copilot review MUST非error且`commit_id`等於current HEAD；maintainer evidence MUST immutable且精確綁定repo/work/run/authority digest/PR/current HEAD/actor/verdict。所有current findings threads MUST resolved或outdated。每次push MUST使舊review evidence失效。兩種authority MUST保留實際kind/ref/hash，MUST NOT把maintainer evidence偽裝成Copilot。Delivery review MUST NOT取代ForeignReview。
+開PR後 Manager MUST等待所有required checks terminal-green，並要求恰好一種current-HEAD delivery review authority：request `@copilot`所得的authenticated review，或經control queue建立的typed `maintainer-review` evidence。有效Copilot review MUST非error且`commit_id`等於current HEAD；maintainer evidence MUST immutable且精確綁定repo/work/run/authority digest/PR/current HEAD/actor/verdict。所有current findings threads MUST resolved或outdated。每次push MUST使舊review evidence失效。兩種authority MUST保留實際kind/ref/hash，MUST NOT把maintainer evidence偽裝成Copilot。Delivery review MUST NOT取代ForeignReview。Manager讀取checks、statuses與reviews的REST pagination MUST使用目前支援的typed shell-free gh argv，MUST NOT要求本機gh未提供的`--slurp`；空輸出或任一malformed page MUST fail-closed。
 
 #### Scenario: Push後只有舊HEAD review
 - **WHEN**PR HEAD改變且最新Copilot review仍綁前一commit
@@ -25,6 +25,10 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 #### Scenario: Check cancelled或thread unresolved
 - **WHEN**任一required check failed/cancelled/pending，或current thread unresolved
 - **THEN**Manager不得merge
+
+#### Scenario: Paginated delivery facts含malformed page
+- **WHEN**authenticated gh pagination回傳空stream或任一頁不是合法JSON
+- **THEN**Manager停止current-HEAD gate並不得merge
 
 #### Scenario: Maintainer attest綁定舊HEAD
 - **WHEN**PR HEAD已從A推進到B，但maintainer evidence綁定A
