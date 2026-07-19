@@ -149,8 +149,9 @@ def build_copilot_argv(
     allow_unsafe: bool = False,
     model: str | None = None,
     read_only: bool = False,
+    review_only: bool = False,
 ) -> list[str]:
-    if read_only:
+    if read_only or review_only:
         raise ValueError("copilot executor has no enforced read-only planning mode")
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
@@ -183,8 +184,9 @@ def build_claude_argv(
     allow_unsafe: bool = False,
     model: str | None = None,
     read_only: bool = False,
+    review_only: bool = False,
 ) -> list[str]:
-    if read_only and allow_unsafe:
+    if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude planning cannot bypass permissions")
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
@@ -199,10 +201,14 @@ def build_claude_argv(
         "--name",
         slice_id,
         "--permission-mode",
-        "plan" if read_only else ("bypassPermissions" if allow_unsafe else "acceptEdits"),
+        "plan"
+        if read_only or review_only
+        else ("bypassPermissions" if allow_unsafe else "acceptEdits"),
     ]
     if read_only:
         argv += ["--tools", ""]
+    elif review_only:
+        argv += ["--tools", "Read,Grep,Glob,Bash"]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None:
@@ -220,11 +226,12 @@ def build_codex_argv(
     allow_unsafe: bool = False,
     model: str | None = None,
     read_only: bool = False,
+    review_only: bool = False,
     commit_required: bool = False,
 ) -> list[str]:
-    if read_only and allow_unsafe:
+    if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Codex planning cannot bypass sandbox")
-    if commit_required and (read_only or allow_unsafe):
+    if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required Codex builder requires enforced workspace-write")
     if worktree is not None:
         worktree = str(Path(worktree).resolve())
@@ -244,7 +251,7 @@ def build_codex_argv(
         # smoke 實證：headless codex exec 帶（未持久信任的）relay hook 時，會卡在 hook
         # 信任閘等待輸入 → timeout。autonomous 派工須一併 bypass hook trust 才不會掛住。
         argv.append("--dangerously-bypass-hook-trust")
-    elif read_only:
+    elif read_only or review_only:
         argv += ["--sandbox", "read-only", "--skip-git-repo-check"]
     else:
         argv += ["--sandbox", "workspace-write"]
@@ -269,6 +276,7 @@ def build_agy_argv(
     allow_unsafe: bool = False,
     model: str | None = None,
     read_only: bool = False,
+    review_only: bool = False,
 ) -> list[str]:
     """Build the only supported Antigravity invocation: headless plan+sandbox.
 
@@ -317,17 +325,20 @@ class SubprocessLauncher:
         allow_unsafe: bool = False,
         model: str | None = None,
         read_only: bool = False,
+        review_only: bool = False,
         commit_required: bool = False,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
         if executor == "agy" and allow_unsafe:
             raise ValueError("agy executor refuses unsafe mode")
-        if read_only and executor == "copilot":
+        if (read_only or review_only) and executor == "copilot":
             raise ValueError("copilot executor has no enforced read-only planning mode")
-        if read_only and allow_unsafe:
+        if read_only and review_only:
+            raise ValueError("launcher cannot be both planner-read-only and reviewer-read-only")
+        if (read_only or review_only) and allow_unsafe:
             raise ValueError("read-only launcher cannot enable unsafe mode")
-        if commit_required and (read_only or allow_unsafe):
+        if commit_required and (read_only or review_only or allow_unsafe):
             raise ValueError("commit-required launcher requires enforced workspace-write")
         self._executor = executor
         self._relay_target = relay_target
@@ -338,6 +349,7 @@ class SubprocessLauncher:
         self._allow_unsafe = allow_unsafe
         self._model = model
         self._read_only = read_only
+        self._review_only = review_only
         self._commit_required = commit_required
 
     def as_read_only(self) -> "SubprocessLauncher":
@@ -350,13 +362,28 @@ class SubprocessLauncher:
             allow_unsafe=False,
             model=self._model,
             read_only=True,
+            review_only=False,
+            commit_required=False,
+        )
+
+    def as_review_only(self) -> "SubprocessLauncher":
+        """Return a launcher that can inspect, but cannot mutate, a Candidate checkout."""
+
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=False,
+            model=self._model,
+            read_only=False,
+            review_only=True,
             commit_required=False,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
         """Return a builder launcher explicitly allowed to update linked Git metadata."""
 
-        if self._read_only:
+        if self._read_only or self._review_only:
             raise ValueError("commit-required launcher requires enforced workspace-write")
         if self._allow_unsafe or self._commit_required:
             return self
@@ -367,6 +394,7 @@ class SubprocessLauncher:
             allow_unsafe=False,
             model=self._model,
             read_only=False,
+            review_only=False,
             commit_required=True,
         )
 
@@ -389,6 +417,7 @@ class SubprocessLauncher:
             "allow_unsafe": self._allow_unsafe,
             "model": self._model,
             "read_only": self._read_only,
+            "review_only": self._review_only,
         }
         if self._executor == "codex":
             builder_kwargs["commit_required"] = self._commit_required

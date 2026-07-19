@@ -103,7 +103,11 @@ WorkflowStep額外保存`skill_ref`與structured action/commit/test policy。Bra
 
 Prompt固定為`workflow-card-prompt/v1`，包含resolved source content與terminal schema。Active v1 run可繼承同phase input contract以恢復pending cards，但既有passed card不回填新證據、不偽稱通過新gate。Terminalize再次驗snapshot hash，canonical job evidence保存相同snapshot。
 
+Verify/review identity除了foreign domain，也必須在schema v2明示`review` capability；legacy v1 identity只保留planning能力，不推測review權。Reviewer launcher使用executor read-only mode，且工作目錄為Manager建立的exact Candidate disposable clone；checkout後移除所有Git remotes，原Candidate完整tree snapshot在所有terminal與launch failure路徑重驗後才清除clone。Agent terminal只提供substantive verification summary/details、review findings/reason與inline report body；Manager從durable Job注入slice/Candidate、builder/reviewer job IDs與launch identities，正規化finding ID/blocking/state。Report只允許phase專屬Markdown root，並以durable intent journal將multi-report CAS、canonical evidence與registry bind包成可rollback/roll-forward transaction；report frontmatter另綁job ID，讓同run/card retry不會誤用舊report。Agent不得直接修改Candidate或report。
+
 Plan/build workflow card的headless process exit 0但terminal明示`failed`或`needs_human`時，Manager保留原job/log且不建立passed evidence；periodic維持`needs_human` stop。只有explicit operator resume可在schema與run/card binding一致時重派同一run/card，malformed或錯誤binding不可藉此旁路。
+
+升級前誤派planning-only canonical Agy的verify/review Job若以generic v1 `passed` terminal結束，該payload永不視為evidence。只有explicit operator resume可在latest Job精確綁定run/claim/repo/source/card/phase/persona/current Candidate、canonical Agy identity與manifest outputs雙向完整時授權單次fresh dispatch；periodic與一般retry flag均不可取得此migration authority。Terminal parser只額外接受整份內容恰為單一JSON fenced object，不從任意prose擷取JSON。
 
 Build phase由多張會commit的card逐步形成Candidate。Manager接受每張card的terminal前，必須重讀worktree exact HEAD，並驗新Candidate等於或為目前Candidate的descendant後才原子推進；首張build card以持久化dispatch base為baseline。Verify/review繼續要求job Candidate完全等於凍結的run Candidate。
 

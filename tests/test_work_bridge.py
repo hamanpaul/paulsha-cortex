@@ -587,7 +587,7 @@ identities:
   - executor: claude
     model_id: claude-reviewer
     independence_domain: anthropic
-    capabilities: []
+    capabilities: [review]
 """,
         encoding="utf-8",
     )
@@ -619,6 +619,9 @@ identities:
         def as_commit_required(self):
             return self
 
+        def as_review_only(self):
+            return self
+
         def launch(self, *, slice_id, prompt, worktree, log_dir):
             contract = json.loads(prompt.split("Contract: ", 1)[1])
             job = registry.get_job(slice_id)
@@ -646,24 +649,13 @@ identities:
                 }
             elif phase == "verify":
                 report_ref = "reports/verify/work.md"
-                report = repo / report_ref
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    "---\n"
-                    f"workflow_run_id: {contract['run_id']}\n"
-                    f"workflow_card_id: {card}\n"
-                    f"candidate: {candidate}\n"
-                    "---\n# Verification\n\nPassed.\n",
-                    encoding="utf-8",
-                )
                 evidence = {
-                    "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
-                    "slice_id": f"{contract['run_id']}-{card}",
-                    "candidate": candidate,
+                    "schema_version": 1,
+                    "kind": "workflow-verification-result",
                     "status": "verified",
                     "summary": "ok",
                     "details": {"card": card},
-                    "outputs": [report_ref],
+                    "reports": [{"path": report_ref, "body": "# Verification\n\nPassed."}],
                 }
             else:
                 report_ref = (
@@ -671,38 +663,13 @@ identities:
                     if card == "adversarial-review"
                     else "reports/review/work.md"
                 )
-                report = repo / report_ref
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    "---\n"
-                    f"workflow_run_id: {contract['run_id']}\n"
-                    f"workflow_card_id: {card}\n"
-                    f"candidate: {candidate}\n"
-                    "---\n# Review\n\nPassed.\n",
-                    encoding="utf-8",
-                )
-                builder = registry.get_job(contract["builder_job_id"])
-                evidence = review.build_gate_evaluation(
-                    slice_id=f"{contract['run_id']}-{card}",
-                    state="passed",
-                    reason="accepted",
-                    builder_job_id=builder["job_id"],
-                    reviewer_job_id=slice_id,
-                    candidate=candidate,
-                    launch_identity={
-                        "builder": {
-                            "executor": builder["executor"],
-                            "model_id": builder["model_id"],
-                            "independence_domain": builder["independence_domain"],
-                        },
-                        "reviewer": {
-                            "executor": job["executor"],
-                            "model_id": job["model_id"],
-                            "independence_domain": job["independence_domain"],
-                        },
-                    },
-                )
-                evidence["outputs"] = [report_ref]
+                evidence = {
+                    "schema_version": 1,
+                    "kind": "workflow-review-result",
+                    "reason": "accepted",
+                    "findings": [],
+                    "reports": [{"path": report_ref, "body": "# Review\n\nPassed."}],
+                }
             log_path = Path(log_dir) / f"{slice_id}.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")

@@ -59,6 +59,10 @@ cortex doctor --probe-live --repo owner/repo --json
 
 工作啟動後，`$PSC_COORDINATOR_ROOT/jobs.json` 內的 `workflows` 是唯一 workflow lifecycle truth。Delivery journal 只保存以同一 `run_id` 為 key 的 resumable ship phase，不另建 lifecycle state。沒有既有 PR 時，Manager 會從 reviewed builder job、confirmed issue 與 OpenSpec authority 產生 zh-TW metadata，先以 metadata context 跑 preflight，再冪等建立 PR 並把 `pr_ref` 原子寫回同一個 `WorkflowRun`；後續 merge 與 CompletionRecord 也綁定該 run 的 exact Candidate 與 canonical verification/review evidence。
 
+Verify/Review dispatch只接受schema v2明示`review` capability、且independence domain不同於Builder的identity。Reviewer以enforced read-only mode在exact Candidate的disposable clone執行；Manager於terminal與launch failure路徑重驗原Candidate完整tree snapshot後清除clone。terminal只回substantive verification/findings與inline Markdown body；Manager依durable Job自行建立report frontmatter、Candidate/job/identity binding與GateEvaluation。Report路徑限於phase專屬的`reports/verify/*.md`／`reports/review/*.md`，durable publication journal可在多檔partial write、canonical evidence或registry save fault後rollback，亦可在已bind的crash replay中roll-forward。整份log恰為單一JSON fenced object時可解析，但含prose、第二個fence或錯誤schema仍fail-closed。
+
+舊版曾把 planning-only canonical Agy 誤派成 reviewer。這類既存 `exited-0` generic terminal 不會成為 evidence；只有 operator 明確執行 `cortex work resume`，且最新 Job 的 run/claim/repo/source/card/phase/Candidate/identity/output contract 全部精確吻合時，Manager 才保留舊 Job/log 並重派一次。Periodic runner 不取得此 recovery authority。
+
 工作預設 manual。Auto claim 同時要求 confirmed Todo、confirmed issue 與 `cortex:auto-on-going` label；移除 label 只阻止尚未 claim 的工作，不會中止 active workflow。Todo 缺 issue 時不會自動建立 issue，而是 `needs_human: missing_issue`。
 
 ## Snapshot 與 registry migration

@@ -16,7 +16,12 @@ from paulsha_cortex.coordinator import (
 )
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
-from paulsha_cortex.coordinator.model_identities import CapabilityProbe, IdentityRegistry
+from paulsha_cortex.coordinator.model_identities import (
+    AGY_LIVE_PROBE,
+    AGY_MODEL_ID,
+    CapabilityProbe,
+    IdentityRegistry,
+)
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import (
     GateEvidenceRef,
@@ -448,6 +453,205 @@ def test_nonpassing_terminal_retry_authority_requires_exact_schema_and_binding(
     assert manager._retryable_nonpassing_workflow_terminal({**job, "exit_code": False}) is False
 
 
+def test_operator_resume_recovers_only_exact_legacy_agy_reviewer_terminal(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "canary@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Canary"], check=True)
+    (tmp_path / "README.md").write_text("legacy recovery\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    candidate = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    steps = tuple(
+        WorkflowStep.from_dict({
+            **step.to_dict(),
+            "gate_result": "passed" if step.phase in {"claim", "define", "plan", "build"} else "pending",
+        })
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=steps,
+        candidate_head=candidate,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"verify": 1},
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    builder = registry.create_job(
+        task="wf-builder",
+        persona="builder",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(tmp_path),
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="subagent-build",
+        workflow_phase="build",
+        workflow_repo_root=str(tmp_path),
+        workflow_input_root=str(tmp_path),
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
+    legacy_log = tmp_path / "legacy-agy.jsonl"
+    legacy_log.write_text(
+        "```json\n"
+        + json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-card",
+                "status": "passed",
+                "run_id": run.run_id,
+                "card_id": "verification",
+                "candidate": candidate,
+                "outputs": ["reports/verify/production-wiring.md"],
+            },
+            indent=2,
+        )
+        + "\n```\n",
+        encoding="utf-8",
+    )
+    legacy = registry.create_job(
+        task="wf-verification",
+        persona="reviewer",
+        kind="review",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(tmp_path),
+        executor="agy",
+        model_id=AGY_MODEL_ID,
+        independence_domain="google",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="verification",
+        workflow_phase="verify",
+        workflow_repo_root=str(tmp_path),
+        workflow_input_root=str(tmp_path),
+        workflow_outputs=("reports/verify/*production-wiring*.md",),
+        source_revision=run.source_revision,
+        workflow_output_baseline=(),
+    )
+    registry.attach_launch_handle(
+        legacy["job_id"],
+        executor="agy",
+        model_id=AGY_MODEL_ID,
+        session_name=legacy["job_id"],
+        log_path=str(legacy_log),
+    )
+    registry.update_headless_result(legacy["job_id"], status="exited", exit_code=0)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "sonnet",
+                "independence_domain": "anthropic",
+                "capabilities": ["review"],
+            },
+        ]
+    )
+    launched: list[str] = []
+
+    class Launcher:
+        def as_review_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append(slice_id)
+            return LaunchHandle(
+                executor="claude",
+                model_id="sonnet",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    class ResumeDispatcher:
+        _registry = registry
+        _git_runner = None
+
+        def poll_headless_done(self, job_id):
+            return registry.get_job(job_id)
+
+    verify_step = next(step for step in run.steps if step.card == "verification")
+    assert manager._is_exact_legacy_agy_recovery(
+        registry.get_job(legacy["job_id"]),
+        run=run,
+        step=verify_step,
+        identities=identities,
+    ), (registry.get_job(legacy["job_id"]), run.to_dict(), verify_step.to_dict())
+    assert not manager._is_exact_legacy_agy_recovery(
+        {
+            **registry.get_job(legacy["job_id"]),
+            "workflow_outputs": ["reports/verify/other.md"],
+        },
+        run=run,
+        step=verify_step,
+        identities=identities,
+    )
+
+    stopped = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _identity: Launcher(),
+        coordinator_root=tmp_path / "coordinator",
+    )
+    assert stopped["reason"] == "operator-resume-required"
+    assert launched == []
+
+    resumed = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _identity: Launcher(),
+        coordinator_root=tmp_path / "coordinator",
+        operator_resume=True,
+    )
+
+    assert resumed["reason"] == "in-flight"
+    assert resumed["job_id"] != legacy["job_id"]
+    assert registry.get_job(legacy["job_id"])["workflow_evidence"] is None
+    replacement = registry.get_job(resumed["job_id"])
+    assert replacement["executor"] == "claude"
+    assert replacement["workflow_builder_job_id"] == builder["job_id"]
+    assert launched == [replacement["job_id"]]
+
+
 def test_build_card_advances_candidate_only_to_exact_descendant_head(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -767,7 +971,7 @@ def test_operator_resume_dispatch_error_restores_needs_human(
     )
     monkeypatch.setattr(
         manager,
-        "dispatch_workflow_card",
+        "_dispatch_workflow_card",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("input gate failed")),
     )
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
@@ -1012,11 +1216,23 @@ def test_same_input_content_isolated_across_workflow_runs(tmp_path: Path) -> Non
 
 
 def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp_path: Path) -> None:
-    registry = JobRegistry(state_path=tmp_path / "registry.json")
-    candidate = "a" * 40
+    coordinator_dir = tmp_path.parent / f".{tmp_path.name}-coordinator"
+    state_path = coordinator_dir / "registry.json"
+    registry = JobRegistry(state_path=state_path)
     proposal = tmp_path / "openspec/changes/production-wiring/proposal.md"
     proposal.parent.mkdir(parents=True)
     proposal.write_text("# Proposal\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "canary@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Canary"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "openspec"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    candidate = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
     def git_runner(argv, **kwargs):
         if "cat-file" in argv:
@@ -1049,13 +1265,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                 "executor": "claude",
                 "model_id": "claude-secondary",
                 "independence_domain": "anthropic",
-                "capabilities": ["planning"],
+                "capabilities": ["planning", "review"],
             },
         ]
     )
     calls: list[str] = []
     plan_launch_roots: list[Path] = []
     commit_capability_requests: list[str] = []
+    review_capability_requests: list[str] = []
 
     class WorkflowLauncher:
         def as_read_only(self):
@@ -1063,6 +1280,10 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
 
         def as_commit_required(self):
             commit_capability_requests.append("required")
+            return self
+
+        def as_review_only(self):
+            review_capability_requests.append("required")
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):
@@ -1085,47 +1306,25 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                     "candidate": candidate, "outputs": [],
                 }
             elif phase == "verify":
-                report = tmp_path / "reports/verify/production-wiring.md"
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    "---\n"
-                    f"workflow_run_id: {contract_payload['run_id']}\n"
-                    f"workflow_card_id: {card}\n"
-                    f"candidate: {candidate}\n"
-                    "---\n# Verification\n\nPassed.\n",
-                    encoding="utf-8",
-                )
                 evidence = {
-                    "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
-                    "slice_id": f"{contract_payload['run_id']}-{card}",
-                    "candidate": candidate, "status": "verified", "summary": "ok",
+                    "schema_version": 1, "kind": "workflow-verification-result",
+                    "status": "verified", "summary": "ok",
                     "details": {"card": card},
-                    "outputs": ["reports/verify/production-wiring.md"],
+                    "reports": [{
+                        "path": "reports/verify/production-wiring.md",
+                        "body": "# Verification\n\nPassed.",
+                    }],
                 }
             else:
                 suffix = "-adversarial" if card == "adversarial-review" else ""
                 report_ref = f"reports/review/production-wiring{suffix}.md"
-                report = tmp_path / report_ref
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    "---\n"
-                    f"workflow_run_id: {contract_payload['run_id']}\n"
-                    f"workflow_card_id: {card}\n"
-                    f"candidate: {candidate}\n"
-                    "---\n# Review\n\nPassed.\n",
-                    encoding="utf-8",
-                )
-                evidence = review.build_gate_evaluation(
-                    slice_id=f"{contract_payload['run_id']}-{card}",
-                    state="passed", reason="accepted",
-                    builder_job_id=contract_payload["builder_job_id"],
-                    reviewer_job_id=slice_id, candidate=candidate,
-                    launch_identity={
-                        "builder": identities.require("codex", "gpt-primary").legacy_dict(),
-                        "reviewer": identities.require("claude", "claude-secondary").legacy_dict(),
-                    },
-                )
-                evidence["outputs"] = [report_ref]
+                evidence = {
+                    "schema_version": 1,
+                    "kind": "workflow-review-result",
+                    "reason": "accepted",
+                    "findings": [],
+                    "reports": [{"path": report_ref, "body": "# Review\n\nPassed."}],
+                }
             log_path = Path(log_dir) / f"{slice_id}.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
@@ -1198,11 +1397,16 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         launcher=workflow_launcher,
     )
 
-    result = executor(build_request(req_type="workflow-action", args=_workflow_args(manifest_path, tmp_path), requested_by="operator"))
+    workflow_args = _workflow_args(manifest_path, tmp_path)
+    workflow_args["evidence_dir"] = str(coordinator_dir / "evidence")
+    result = executor(build_request(
+        req_type="workflow-action", args=workflow_args, requested_by="operator"
+    ))
     run = registry.get_workflow_run(result["run_id"])
 
     assert calls == ["questioner", "secondary:anthropic", "integrator"]
     assert commit_capability_requests == []
+    assert review_capability_requests == []
     assert plan_launch_roots and all(path != tmp_path for path in plan_launch_roots)
     assert run.current_phase == "plan"
     assert [ref.kind for ref in run.gate_refs] == ["brainstorm"]
@@ -1219,7 +1423,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         ))
 
     # Simulate daemon restart: only durable registry + job log/sentinel survive.
-    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    registry = JobRegistry(state_path=state_path)
     dispatcher = Dispatcher(
         registry, pane_sender=None, worktree_creator=WorktreeCreator(), git_runner=git_runner
     )
@@ -1254,6 +1458,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         seen_phases.append(result["current_phase"])
     assert seen_phases == ["build", "build", "build", "verify", "review", "review", "review"]
     assert commit_capability_requests == ["required", "required"]
+    assert review_capability_requests == ["required", "required", "required"]
     assert result["reason"] == "ship-validator-unavailable"
 
     fake_ship = build_request(
@@ -1270,7 +1475,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     for card in ("openspec-archive", "policy-commit"):
         work_bridge._record_manager_ship_job(
             registry=registry,
-            state_root=tmp_path,
+            state_root=coordinator_dir,
             run=current,
             worktree=tmp_path,
             branch="feature/production-wiring",
@@ -1336,7 +1541,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     )
     assert all(not Path(job["workflow_evidence"]["path"]).is_absolute() for job in workflow_jobs)
     assert all(
-        (tmp_path / job["workflow_evidence"]["path"]).is_file()
+        (coordinator_dir / job["workflow_evidence"]["path"]).is_file()
         for job in workflow_jobs
     )
 
@@ -1377,7 +1582,7 @@ def test_manager_rejects_same_domain_reviewer_before_dispatch(tmp_path: Path) ->
     identities = IdentityRegistry.from_rows(
         [
             {"executor": "codex", "model_id": "builder", "independence_domain": "openai", "capabilities": []},
-            {"executor": "claude", "model_id": "reviewer", "independence_domain": "openai", "capabilities": []},
+            {"executor": "claude", "model_id": "reviewer", "independence_domain": "openai", "capabilities": ["review"]},
         ]
     )
     review_step = next(step for step in run.steps if step.phase == "review")
@@ -1499,13 +1704,12 @@ def test_verify_terminal_evidence_cannot_substitute_for_declared_report(tmp_path
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     log = tmp_path / "verify.jsonl"
     payload = {
-        "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
-        "slice_id": "run-card",
-        "candidate": "a" * 40,
+        "schema_version": 1,
+        "kind": "workflow-verification-result",
         "status": "verified",
         "summary": "ok",
         "details": {},
-        "outputs": [],
+        "reports": [],
     }
     log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     job = registry.create_job(
@@ -1519,7 +1723,7 @@ def test_verify_terminal_evidence_cannot_substitute_for_declared_report(tmp_path
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
 
-    with pytest.raises(ValueError, match="incomplete for manifest refs"):
+    with pytest.raises(ValueError, match="non-empty list"):
         manager.terminalize_workflow_job(
             registry, job_id=job["job_id"], coordinator_root=tmp_path
         )
@@ -1889,10 +2093,9 @@ def test_existing_report_requires_baseline_change_and_embedded_workflow_binding(
     baseline = manager._sha256_path(report)
     log = tmp_path / "verify.jsonl"
     payload = {
-        "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
-        "slice_id": "run-card", "candidate": "a" * 40,
+        "schema_version": 1, "kind": "workflow-verification-result",
         "status": "verified", "summary": "ok", "details": {},
-        "outputs": [report_ref],
+        "reports": [{"path": report_ref, "body": "# Verification\n\nPassed after this job."}],
     }
     log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     job = registry.create_job(
@@ -1907,16 +2110,307 @@ def test_existing_report_requires_baseline_change_and_embedded_workflow_binding(
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
 
-    with pytest.raises(ValueError, match="stale preexisting report"):
+    report.write_text(stale.replace("Passed.", "Operator drift."), encoding="utf-8")
+    with pytest.raises(ValueError, match="baseline CAS conflict"):
         manager.terminalize_workflow_job(
             registry, job_id=job["job_id"], coordinator_root=tmp_path
         )
 
-    report.write_text(stale.replace("Passed.", "Passed after this job."), encoding="utf-8")
+    report.write_text(stale, encoding="utf-8")
     terminal = manager.terminalize_workflow_job(
         registry, job_id=job["job_id"], coordinator_root=tmp_path
     )
     assert terminal["workflow_evidence"] is not None
+    binding = manager._report_binding(report.read_bytes())
+    assert binding == {
+        "workflow_run_id": "run",
+        "workflow_card_id": "card",
+        "workflow_job_id": job["job_id"],
+        "candidate": "a" * 40,
+    }
+    assert "Passed after this job." in report.read_text(encoding="utf-8")
+
+
+def test_terminal_report_manifest_cannot_authorize_arbitrary_markdown_overwrite(
+    tmp_path: Path,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "state.json")
+    readme = tmp_path / "README.md"
+    readme.write_text("operator content\n", encoding="utf-8")
+    log = tmp_path / "verify.jsonl"
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-verification-result",
+        "status": "verified",
+        "summary": "ok",
+        "details": {},
+        "reports": [{"path": "README.md", "body": "replaced"}],
+    }) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="verify-wide", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(tmp_path), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head="a" * 40,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="verification", workflow_phase="verify",
+        workflow_repo_root=str(tmp_path), workflow_outputs=("**/*.md",),
+        source_revision="rev",
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(ValueError, match="manifest root invalid"):
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=tmp_path / "coordinator"
+        )
+    assert readme.read_text(encoding="utf-8") == "operator content\n"
+
+
+def test_report_publication_rolls_back_when_registry_bind_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    report_ref = "reports/verify/work.md"
+    log = tmp_path / "verify.jsonl"
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-verification-result",
+        "status": "verified",
+        "summary": "ok",
+        "details": {},
+        "reports": [{"path": report_ref, "body": "# Verification\n\nPassed."}],
+    }) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="verify-bind-fault", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(tmp_path), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head="a" * 40,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="verification", workflow_phase="verify",
+        workflow_repo_root=str(tmp_path), workflow_outputs=(report_ref,), source_revision="rev",
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    monkeypatch.setattr(
+        registry,
+        "bind_workflow_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("save fault")),
+    )
+
+    with pytest.raises(OSError, match="save fault"):
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=coordinator
+        )
+    assert not (tmp_path / report_ref).exists()
+    assert not list((coordinator / "workflow-report-transactions").glob("*.json"))
+    assert registry.get_job(job["job_id"])["workflow_evidence"] is None
+
+
+def test_multi_report_partial_write_is_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    refs = ("reports/verify/work-a.md", "reports/verify/work-b.md")
+    log = tmp_path / "verify.jsonl"
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-verification-result",
+        "status": "verified",
+        "summary": "ok",
+        "details": {},
+        "reports": [
+            {"path": refs[0], "body": "# A"},
+            {"path": refs[1], "body": "# B"},
+        ],
+    }) + "\n", encoding="utf-8")
+    job = registry.create_job(
+        task="verify-partial", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(tmp_path), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head="a" * 40,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="verification", workflow_phase="verify",
+        workflow_repo_root=str(tmp_path), workflow_outputs=("reports/verify/*.md",),
+        source_revision="rev",
+    )
+    registry.attach_launch_handle(job["job_id"], log_path=str(log))
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    original = manager._PlanningPublicationTransaction._write_atomic
+    failed = False
+
+    def flaky(path, content, mode, **kwargs):
+        nonlocal failed
+        if path.name == "work-b.md" and not failed:
+            failed = True
+            raise OSError("second write fault")
+        return original(path, content, mode, **kwargs)
+
+    monkeypatch.setattr(
+        manager._PlanningPublicationTransaction,
+        "_write_atomic",
+        staticmethod(flaky),
+    )
+    with pytest.raises(OSError, match="second write fault"):
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=coordinator
+        )
+    assert all(not (tmp_path / ref).exists() for ref in refs)
+    assert not list((coordinator / "workflow-report-transactions").glob("*.json"))
+
+
+def test_forged_report_journal_traversal_is_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    job = registry.create_job(
+        task="verify-journal", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(repo), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head="a" * 40,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="verification", workflow_phase="verify",
+        workflow_repo_root=str(repo), workflow_outputs=("reports/verify/*.md",),
+        source_revision="rev",
+    )
+    transaction = manager._WorkflowReportPublicationTransaction(
+        repo_root=repo,
+        coordinator_root=coordinator,
+        job_id=job["job_id"],
+    )
+    transaction.publish(
+        (("reports/verify/work.md", "# Verification"),),
+        job=job,
+        candidate="a" * 40,
+    )
+    payload = json.loads(transaction.journal_path.read_text(encoding="utf-8"))
+    payload["operations"][0]["path"] = str(
+        repo / "reports" / "verify" / ".." / ".." / ".." / "outside.md"
+    )
+    transaction.journal_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(manager.WorkflowReportPublicationDrift, match="operation invalid"):
+        manager._WorkflowReportPublicationTransaction.reconcile(
+            registry=registry,
+            job=job,
+            coordinator_root=coordinator,
+        )
+    assert not (tmp_path / "outside.md").exists()
+    assert transaction.journal_path.is_file()
+
+
+def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "canary@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Canary"], check=True)
+    readme = repo / "README.md"
+    readme.write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    run = SimpleNamespace(run_id="workflow-review", candidate_head=candidate)
+    step = SimpleNamespace(card="verification")
+    coordinator = tmp_path / "coordinator"
+    sandbox = manager._create_reviewer_sandbox(
+        run=run,
+        step=step,
+        candidate_root=repo,
+        coordinator_root=coordinator,
+        input_snapshot=(),
+    )
+    assert sandbox != repo
+    assert subprocess.run(
+        ["git", "-C", str(sandbox), "rev-parse", "HEAD"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == candidate
+    assert subprocess.run(
+        ["git", "-C", str(sandbox), "remote"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == ""
+    assert subprocess.run(
+        ["git", "-C", str(sandbox), "push", "origin", "HEAD:refs/heads/forbidden"],
+        capture_output=True, text=True, check=False,
+    ).returncode != 0
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    job = registry.create_job(
+        task="review-mutation", persona="reviewer", kind="review", branch="feature/work",
+        pane="", worktree=str(sandbox), executor="claude", model_id="reviewer",
+        independence_domain="anthropic", subject_head=candidate,
+        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_card="verification", workflow_phase="verify",
+        workflow_repo_root=str(repo), workflow_input_root=str(sandbox),
+        workflow_sandbox_hash=manager.planning_runtime._tree_snapshot(repo),
+        source_revision="rev",
+    )
+    readme.write_text("reviewer mutation\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="modified Candidate"):
+        manager._discard_reviewer_sandbox(
+            job,
+            coordinator_root=coordinator,
+            require_candidate_unchanged=True,
+        )
+    assert not sandbox.exists()
+
+
+def test_review_terminal_rejects_non_builder_job_binding_before_publication(
+    tmp_path: Path,
+) -> None:
+    candidate = "a" * 40
+    steps = tuple(
+        WorkflowStep.from_dict({
+            **step.to_dict(),
+            "gate_result": "passed" if step.phase in {"claim", "define", "plan", "build", "verify"} else "pending",
+        })
+        for step in _manifest().steps
+    )
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring", repo="owner/repo",
+        claim_key="claim:v1:" + "1" * 64, source_revision="2" * 64,
+        workspace_root=str(tmp_path), combo="feature-oneshot", current_phase="review",
+        steps=steps, issue_refs=(), openspec_refs=(), pr_refs=(),
+        attempts={"review": 1}, candidate_head=candidate, verified_head=candidate,
+        gate_status="running",
+    )
+    invalid_builder = registry.create_job(
+        task="invalid-builder", persona="manager", kind="build", branch="feature/work",
+        pane="", worktree=str(tmp_path), executor="codex", model_id="builder",
+        independence_domain="openai", subject_head=candidate,
+        workflow_run_id=run.run_id, workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo, workflow_card="subagent-build", workflow_phase="build",
+        workflow_repo_root=str(tmp_path), source_revision=run.source_revision,
+    )
+    registry.update_headless_result(invalid_builder["job_id"], status="exited", exit_code=0)
+    report_ref = "reports/review/production-wiring.md"
+    log = tmp_path / "review.jsonl"
+    log.write_text(json.dumps({
+        "schema_version": 1, "kind": "workflow-review-result", "reason": "accepted",
+        "findings": [], "reports": [{"path": report_ref, "body": "# Review"}],
+    }) + "\n", encoding="utf-8")
+    review_job = registry.create_job(
+        task="review-invalid-builder", persona="reviewer", kind="review",
+        branch="feature/work", pane="", worktree=str(tmp_path), executor="claude",
+        model_id="reviewer", independence_domain="anthropic", subject_head=candidate,
+        workflow_run_id=run.run_id, workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo, workflow_card="code-review", workflow_phase="review",
+        workflow_repo_root=str(tmp_path), workflow_outputs=(report_ref,),
+        workflow_builder_job_id=invalid_builder["job_id"], source_revision=run.source_revision,
+    )
+    registry.attach_launch_handle(review_job["job_id"], log_path=str(log))
+    registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
+
+    with pytest.raises(ValueError, match="builder binding mismatch: persona"):
+        manager.terminalize_workflow_job(
+            registry, job_id=review_job["job_id"], coordinator_root=coordinator
+        )
+    assert not (tmp_path / report_ref).exists()
 
 
 def test_planning_replacement_requires_persisted_authority_not_caller_hash(
