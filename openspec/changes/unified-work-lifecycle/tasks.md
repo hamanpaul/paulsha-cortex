@@ -40,6 +40,7 @@
 - [x] 3.8 RED-test並實作immutable exact-HEAD `maintainer-review` attestation、Copilot/maintainer二選一gate與保留實際review kind/ref/hash的merge authorization v2。
 - [x] 3.9 RED-test並實作pre-binding target-cardinality stop恢復：operator補齊唯一PR/OpenSpec/Todo authority後explicit resume可重綁同一run journal；既有binding與其他needs_human仍fail-closed。
 - [x] 3.10 RED-test並實作post-archive retry-build：只保留Manager-owned official archive authority，重開最後builder並讓新Candidate單調延伸；其他已通過ship card拒絕retry。
+- [x] 3.11 RED-test並修正delivery GitHub pagination：不依賴本機gh不支援的`--slurp`，以typed JSONL page stream完整重讀checks/statuses/reviews，malformed page維持fail-closed。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

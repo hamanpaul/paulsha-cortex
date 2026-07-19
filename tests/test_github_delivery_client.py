@@ -26,6 +26,12 @@ class Result:
         self.stderr = "" if returncode == 0 else "failed"
 
 
+class PaginatedResult(Result):
+    def __init__(self, pages):
+        super().__init__({})
+        self.stdout = "\n".join(json.dumps(page) for page in pages)
+
+
 class FakeRunner:
     def __init__(self):
         self.calls = []
@@ -45,7 +51,7 @@ class FakeRunner:
                 }
             )
         if f"commits/{HEAD}/check-runs" in endpoint:
-            return Result(
+            return PaginatedResult(
                 [{
                     "total_count": 1,
                     "check_runs": [
@@ -54,9 +60,9 @@ class FakeRunner:
                 }]
             )
         if f"commits/{HEAD}/statuses" in endpoint:
-            return Result([[{"context": "legacy/lint", "state": "success"}]])
+            return PaginatedResult([[{"context": "legacy/lint", "state": "success"}]])
         if "pulls/7/reviews" in endpoint:
-            return Result(
+            return PaginatedResult(
                 [[
                     {
                         "id": 9,
@@ -154,6 +160,10 @@ def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     assert any(
         f"commits/{HEAD}/statuses" in " ".join(call[0]) for call in runner.calls
     )
+    paginated_calls = [call[0] for call in runner.calls if "--paginate" in call[0]]
+    assert paginated_calls
+    assert all("--slurp" not in argv for argv in paginated_calls)
+    assert all(argv[argv.index("--jq") + 1] == "." for argv in paginated_calls)
     assert all(call[1]["shell"] is False for call in runner.calls)
 
 
@@ -161,7 +171,7 @@ def test_fetch_delivery_facts_uses_latest_legacy_status_per_context() -> None:
     class StatusHistory(FakeRunner):
         def __call__(self, argv, **kwargs):
             if f"commits/{HEAD}/statuses" in " ".join(argv):
-                return Result(
+                return PaginatedResult(
                     [[
                         {"context": "legacy/lint", "state": "success"},
                         {"context": "legacy/lint", "state": "failure"},
@@ -391,7 +401,7 @@ def test_check_run_pagination_must_match_total_count() -> None:
     class Incomplete(FakeRunner):
         def __call__(self, argv, **kwargs):
             if f"commits/{HEAD}/check-runs" in " ".join(argv):
-                return Result(
+                return PaginatedResult(
                     [
                         {
                             "total_count": 2,
@@ -409,6 +419,23 @@ def test_check_run_pagination_must_match_total_count() -> None:
 
     with pytest.raises(RuntimeError, match="pagination incomplete"):
         GitHubDeliveryClient(runner=Incomplete()).fetch_delivery_facts(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+        )
+
+
+def test_paginated_delivery_api_rejects_malformed_jsonl_page() -> None:
+    class Malformed(FakeRunner):
+        def __call__(self, argv, **kwargs):
+            if f"commits/{HEAD}/statuses" in " ".join(argv):
+                result = PaginatedResult([[{"context": "legacy/lint", "state": "success"}]])
+                result.stdout += "\nnot-json"
+                return result
+            return super().__call__(argv, **kwargs)
+
+    with pytest.raises(RuntimeError, match="paginated payload malformed"):
+        GitHubDeliveryClient(runner=Malformed()).fetch_delivery_facts(
             repo="acme/demo",
             pr_number=7,
             change="unified-work-lifecycle",
