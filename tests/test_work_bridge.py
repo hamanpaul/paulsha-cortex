@@ -110,6 +110,9 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo, candidate = _repo(tmp_path / "repo")
+    plan = repo / "docs" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Accepted plan\n", encoding="utf-8")
     snapshot = _snapshot(tmp_path / "snapshot.json")
     authority = load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot)
     registry = JobRegistry(state_path=tmp_path / "state" / "jobs.json")
@@ -156,6 +159,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         source_revision=run.source_revision,
     )
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    report_ref = "reports/review/work-review.md"
     review_job = registry.create_job(
         task="wf-review",
         persona="reviewer",
@@ -173,6 +177,8 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         workflow_card="review-card",
         workflow_phase="review",
         workflow_repo_root=str(repo),
+        workflow_outputs=(report_ref,),
+        workflow_output_baseline=(),
         source_revision=run.source_revision,
     )
     registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
@@ -196,7 +202,11 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             },
         },
     )
-    evaluation["outputs"] = []
+    report = repo / report_ref
+    report.parent.mkdir(parents=True)
+    report.write_text("# Canonical review\n", encoding="utf-8")
+    report_hash = hashlib.sha256(report.read_bytes()).hexdigest()
+    evaluation["outputs"] = [{"path": report_ref, "sha256": report_hash}]
     review_job = registry.get_job(review_job["job_id"])
     envelope = {
         "schema_version": 1,
@@ -210,11 +220,13 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             "card_id": "review-card",
             "phase": "review",
             "inputs": [],
-            "outputs": [],
+            "outputs": [report_ref],
             "output_baseline": [],
         },
         "payload": evaluation,
-        "artifacts": [],
+        "artifacts": [
+            {"path": report_ref, "sha256": report_hash, "baseline_sha256": None}
+        ],
     }
     content = (
         json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -243,6 +255,26 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
 
     def fake_preflight(**kwargs):
         preflight_requests.append(kwargs["request"])
+        preflight_root = Path(kwargs["repo_root"])
+        assert preflight_root != repo
+        assert subprocess.run(
+            ["git", "-C", str(preflight_root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout == ""
+        assert subprocess.run(
+            ["git", "-C", str(preflight_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == candidate
+        assert subprocess.run(
+            ["git", "-C", str(preflight_root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().startswith("feature/preflight-")
         return PreflightResult(
             True,
             None,
@@ -303,10 +335,94 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert updated.run_id == run.run_id
     assert updated.pr_refs == ("acme/demo#17",)
     assert updated.source_revision != run.source_revision
+    assert not report.exists()
+    assert plan.is_file()
+    assert subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "feature/preflight-*"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
     journal = json.loads(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
     assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
+
+
+def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = _repo(tmp_path / "repo")
+    state_root = tmp_path / "state"
+    report_ref = "reports/review/work-review.md"
+    report = repo / report_ref
+    report.parent.mkdir(parents=True)
+    canonical = b"# Canonical review\n"
+    report.write_bytes(b"# Drifted review\n")
+    run = SimpleNamespace(run_id="workflow-run", candidate_head=candidate)
+    job = {
+        "job_id": "review-job",
+        "workflow_run_id": run.run_id,
+        "workflow_claim_key": "claim:v1:" + "1" * 64,
+        "workflow_repo": "acme/demo",
+        "workflow_card": "review-card",
+        "workflow_phase": "review",
+        "workflow_inputs": [],
+        "workflow_outputs": [report_ref],
+        "workflow_output_baseline": [],
+        "source_revision": "source-revision",
+        "subject_head": candidate,
+        "status": "exited",
+        "exit_code": 0,
+    }
+    envelope = {
+        "schema_version": 1,
+        "kind": "review",
+        "job": {
+            "job_id": job["job_id"],
+            "run_id": run.run_id,
+            "claim_key": job["workflow_claim_key"],
+            "repo": job["workflow_repo"],
+            "source_revision": job["source_revision"],
+            "card_id": job["workflow_card"],
+            "phase": "review",
+            "inputs": [],
+            "outputs": [report_ref],
+            "output_baseline": [],
+        },
+        "payload": {},
+        "artifacts": [
+            {
+                "path": report_ref,
+                "sha256": hashlib.sha256(canonical).hexdigest(),
+                "baseline_sha256": None,
+            }
+        ],
+    }
+    content = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    evidence = state_root / "evidence" / "workflow" / "review.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(content)
+    job["workflow_evidence"] = {
+        "kind": "review",
+        "path": "evidence/workflow/review.json",
+        "hash": hashlib.sha256(content).hexdigest(),
+    }
+
+    class Registry:
+        @staticmethod
+        def list_jobs():
+            return [job]
+
+    with pytest.raises(RuntimeError, match="report hash drift"):
+        work_bridge._remove_canonical_untracked_reports(
+            registry=Registry(),
+            state_root=state_root,
+            run=run,
+            worktree=repo,
+        )
+
+    assert report.read_bytes() == b"# Drifted review\n"
 
 
 def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(
