@@ -251,6 +251,7 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
         lambda name, path=None: f"/tools/{name}",
     )
     calls: list[list[str]] = []
+    configured_sandbox = {}
 
     def runner(argv, **_kwargs):
         calls.append(list(argv))
@@ -270,6 +271,10 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
                     )
                 )
             )
+        if argv[:2] == ["/tools/srt", "--settings"]:
+            configured_sandbox.update(
+                json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            )
         return Result()
 
     result = _review_sandbox_probe(
@@ -284,7 +289,12 @@ def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
     assert ["/tools/socat", "-V"] in calls
     assert ["/tools/srt", "--version"] in calls
     assert any(argv[:2] == ["/tools/bwrap", "--ro-bind"] for argv in calls)
-    assert any(argv[:3] == ["/tools/srt", "--", "/tools/python3"] for argv in calls)
+    assert any(
+        argv[0] == "/tools/srt" and argv[3:5] == ["--", "/tools/python3"]
+        for argv in calls
+    )
+    assert configured_sandbox["filesystem"]["denyRead"][-1] == "/run/docker.sock"
+    assert "/var/run/docker.sock" not in configured_sandbox["filesystem"]["denyRead"]
 
 
 def test_review_sandbox_probe_rejects_unsupported_claude_version(
@@ -352,7 +362,7 @@ def test_review_sandbox_probe_rejects_degraded_unix_socket_filter(
                     )
                 )
             )
-        if argv[:3] == ["/tools/srt", "--", "/tools/python3"]:
+        if argv[0] == "/tools/srt" and "--settings" in argv:
             return Result(returncode=1)
         return Result()
 
@@ -364,7 +374,7 @@ def test_review_sandbox_probe_rejects_degraded_unix_socket_filter(
     )
 
     assert result.status == "fail"
-    assert "Unix socket seccomp" in result.detail
+    assert "configured reviewer sandbox" in result.detail
 
 
 def test_monitor_path_probe_rejects_relative_socket_root(tmp_path: Path) -> None:

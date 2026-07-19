@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,11 +41,41 @@ _CREDENTIAL_ENV_RE = re.compile(
 )
 
 
+def _srt_runtime_root() -> Path | None:
+    """Resolve only the installed official sandbox-runtime package root."""
+
+    executable = shutil.which("srt")
+    if executable is None:
+        return None
+    resolved = Path(executable).resolve()
+    for parent in resolved.parents:
+        metadata = parent / "package.json"
+        if not metadata.is_file() or metadata.is_symlink():
+            continue
+        try:
+            payload = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if payload.get("name") == "@anthropic-ai/sandbox-runtime":
+            return parent
+    return None
+
+
 def _claude_review_settings(worktree: str) -> str:
     """Build a CLI-only sandbox policy for a headless Claude reviewer."""
 
     candidate = (Path(worktree).resolve() / "candidate").resolve()
     home = Path.home().resolve()
+    runtime_paths = tuple(
+        dict.fromkeys(
+            path.resolve()
+            for path in (
+                Path("/run/user"),
+                Path("/run/docker.sock"),
+                Path("/var/run/docker.sock"),
+            )
+        )
+    )
     credential_paths = (
         home / ".aws",
         home / ".claude",
@@ -53,9 +84,7 @@ def _claude_review_settings(worktree: str) -> str:
         home / ".config" / "gcloud",
         home / ".kube",
         home / ".ssh",
-        Path("/run/user"),
-        Path("/run/docker.sock"),
-        Path("/var/run/docker.sock"),
+        *runtime_paths,
     )
     credential_env = sorted(
         name for name in os.environ if _CREDENTIAL_ENV_RE.search(name) is not None
@@ -66,6 +95,9 @@ def _claude_review_settings(worktree: str) -> str:
         for path in sorted(home.glob(".local/lib/python*/site-packages"))
         if path.is_dir() and not path.is_symlink()
     )
+    srt_root = _srt_runtime_root()
+    if srt_root is not None:
+        tool_read_paths.append(srt_root)
     read_denials = [
         f"Read(/{path.as_posix()}{'/**' if path.suffix == '' else ''})"
         for path in credential_paths
@@ -79,12 +111,7 @@ def _claude_review_settings(worktree: str) -> str:
             "allowUnsandboxedCommands": False,
             "filesystem": {
                 "denyWrite": [str(candidate)],
-                "denyRead": [
-                    str(home),
-                    "/run/user",
-                    "/run/docker.sock",
-                    "/var/run/docker.sock",
-                ],
+                "denyRead": [str(home), *(str(path) for path in runtime_paths)],
                 "allowRead": [str(path) for path in tool_read_paths],
             },
             "credentials": {

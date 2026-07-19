@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -238,24 +239,46 @@ def _review_sandbox_probe(
             return ProbeResult(
                 "review-sandbox", "fail", "native read-only sandbox smoke failed", True
             )
-        unix_socket_code, _ = _process(
-            runner,
-            [
-                srt,
-                "--",
-                python,
-                "-c",
-                (
-                    "import errno,socket,sys;"
-                    "\ntry: socket.socket(socket.AF_UNIX)"
-                    "\nexcept PermissionError as exc: sys.exit(0 if exc.errno == errno.EPERM else 2)"
-                    "\nelse: sys.exit(1)"
-                ),
-            ],
-        )
+        try:
+            from .coordinator.launcher import _claude_review_settings
+
+            with tempfile.TemporaryDirectory(prefix="cortex-review-sandbox-") as root:
+                candidate = Path(root) / "candidate"
+                candidate.mkdir()
+                policy = json.loads(_claude_review_settings(root))["sandbox"]["filesystem"]
+                settings = Path(root) / "srt-settings.json"
+                settings.write_text(
+                    json.dumps(
+                        {
+                            "filesystem": {**policy, "allowWrite": []},
+                            "network": {"allowedDomains": [], "deniedDomains": []},
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                unix_socket_code, _ = _process(
+                    runner,
+                    [
+                        srt,
+                        "--settings",
+                        str(settings),
+                        "--",
+                        python,
+                        "-c",
+                        (
+                            "import errno,socket,sys;"
+                            "\ntry: socket.socket(socket.AF_UNIX)"
+                            "\nexcept PermissionError as exc: sys.exit(0 if exc.errno == errno.EPERM else 2)"
+                            "\nelse: sys.exit(1)"
+                        ),
+                    ],
+                )
+        except (KeyError, OSError, TypeError, ValueError):
+            unix_socket_code = 2
         if unix_socket_code != 0:
             return ProbeResult(
-                "review-sandbox", "fail", "Unix socket seccomp smoke failed", True
+                "review-sandbox", "fail", "configured reviewer sandbox smoke failed", True
             )
     return ProbeResult(
         "review-sandbox", "pass", "Claude native Bash sandbox runtime ready", True
