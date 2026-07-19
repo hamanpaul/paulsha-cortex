@@ -17,6 +17,7 @@ def test_render_substitutes_instance_and_script(tmp_path):
     service = units["alpha-manager.service"]
     assert "__INSTANCE__" not in service and "__SERVICE_SCRIPT__" not in service
     assert "alpha persona manager service" in service
+    assert "UMask=0022" in service
     timer = units["alpha-manager.timer"]
     assert "OnUnitActiveSec=120" in timer
 
