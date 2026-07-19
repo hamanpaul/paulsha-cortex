@@ -132,6 +132,13 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 - **THEN**Manager從evidence採用並固化brainstorm發證source revision；後續PR refresh改變run目前source revision仍可重驗同一evidence
 - **THEN**evidence缺失、漂移或artifact不在planner outputs時保留`needs_human`且不得launch
 
+#### Scenario: Review完成後default branch推進WorkAuthority
+- **GIVEN**exact Candidate與verify/review evidence皆已凍結，但default branch或provider refresh使current WorkAuthority digest前進
+- **WHEN**Manager執行initial delivery push
+- **THEN**Manager只可把同一WorkflowRun的current source revision與同run delivery journal冪等重綁到fresh authority
+- **AND**planning source revision、claim、Candidate、planning authority與verify/review evidence不得被改寫
+- **AND**若registry更新後於journal更新前中斷，explicit resume必須可重播相同rebase，不得另建run或拒絕exact Candidate
+
 #### Scenario: Builder worktree缺accepted plan
 - **WHEN**pending build card宣告accepted plan但獨立builder worktree尚無該檔
 - **THEN**Manager只從相同run的planning authority驗hash後原子seed

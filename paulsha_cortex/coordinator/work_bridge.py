@@ -425,6 +425,19 @@ def _push_exact_candidate(
     from . import work_actions
 
     state_path = state_root / "delivery-journal.json"
+    current_digest = work_authority_digest(authority)
+    if run.source_revision != current_digest:
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            source_revision=current_digest,
+        )
+    journal = work_actions._load_runs(state_path)
+    if run.run_id in journal["runs"]:
+        _rebase_delivery_journal_authority(
+            state_root=state_root,
+            run=run,
+            authority=authority,
+        )
     state, row, _canonical = work_actions._load_work_run(
         state_path=state_path,
         workflow_registry=registry,
