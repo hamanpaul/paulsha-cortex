@@ -30,6 +30,7 @@ from .claim import (
 from .delivery import (
     ArchiveGateFacts,
     ForeignReviewEvidence,
+    MaintainerReviewEvidence,
     PullRequestMetadata,
     ReviewLoop,
     ShipOrchestrator,
@@ -47,6 +48,7 @@ from .github_delivery import (
 from . import verification
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .work_bridge import resolve_trusted_repo_root, workflow_status
+from .workflow import GateEvidenceRef
 
 
 Runner = Callable[..., object]
@@ -603,8 +605,9 @@ def _merge_authorization_body(
     binding: dict[str, Any],
     preflight: object,
     remote: object,
-    copilot: object,
+    copilot: object | None,
     foreign_review: ForeignReviewEvidence,
+    maintainer_review: MaintainerReviewEvidence | None = None,
 ) -> dict[str, Any]:
     normalized_foreign = _validate_foreign_review(
         foreign_review,
@@ -612,8 +615,7 @@ def _merge_authorization_body(
     )
     if verification.canonical_json_hash(normalized_foreign) != foreign_review.expected_hash.lower():
         raise RuntimeError("foreign review evidence hash changed during authorization")
-    return {
-        "schema": "cortex-merge-authorization/v1",
+    common = {
         "run_id": active["run_id"],
         "workflow_step_ids": list(active["workflow_step_ids"]),
         "repo": authority.repo,
@@ -624,6 +626,26 @@ def _merge_authorization_body(
         "todo_paths": list(binding["todo_paths"]),
         "head": preflight.head,
         "tree_hash": preflight.tree_hash,
+        "foreign_review_path": foreign_review.path,
+        "foreign_review_hash": foreign_review.expected_hash.lower(),
+        "preflight_hash": _preflight_hash(preflight),
+        "checks_hash": _checks_hash(remote),
+    }
+    if maintainer_review is not None:
+        if copilot is not None:
+            raise ValueError("merge authorization review authority is ambiguous")
+        return {
+            "schema": "cortex-merge-authorization/v2",
+            **common,
+            "review_kind": "maintainer-review",
+            "review_ref": maintainer_review.path,
+            "review_hash": maintainer_review.expected_hash.lower(),
+        }
+    if copilot is None:
+        raise ValueError("merge authorization review authority missing")
+    return {
+        "schema": "cortex-merge-authorization/v1",
+        **common,
         "copilot_requested_at_epoch": copilot.loop.requested_at,
         "copilot_review_id": copilot.review_id,
         "copilot_hash": verification.canonical_json_hash(
@@ -633,10 +655,6 @@ def _merge_authorization_body(
                 "requested_at_epoch": copilot.loop.requested_at,
             }
         ),
-        "foreign_review_path": foreign_review.path,
-        "foreign_review_hash": foreign_review.expected_hash.lower(),
-        "preflight_hash": _preflight_hash(preflight),
-        "checks_hash": _checks_hash(remote),
     }
 
 
@@ -727,7 +745,7 @@ def _authorization_identity_matches(
     body = value.get("payload")
     digest = value.get("hash")
     evidence_path = value.get("path")
-    required = {
+    common_required = {
         "schema",
         "run_id",
         "workflow_step_ids",
@@ -739,17 +757,23 @@ def _authorization_identity_matches(
         "todo_paths",
         "head",
         "tree_hash",
-        "copilot_requested_at_epoch",
-        "copilot_review_id",
-        "copilot_hash",
         "foreign_review_path",
         "foreign_review_hash",
         "preflight_hash",
         "checks_hash",
     }
+    schema = body.get("schema") if isinstance(body, dict) else None
+    review_required = (
+        {"copilot_requested_at_epoch", "copilot_review_id", "copilot_hash"}
+        if schema == "cortex-merge-authorization/v1"
+        else {"review_kind", "review_ref", "review_hash"}
+        if schema == "cortex-merge-authorization/v2"
+        else set()
+    )
     if (
         not isinstance(body, dict)
-        or set(body) != required
+        or not review_required
+        or set(body) != common_required | review_required
         or verification.canonical_json_hash(body) != digest
         or not isinstance(evidence_path, str)
         or not Path(evidence_path).is_absolute()
@@ -764,8 +788,8 @@ def _authorization_identity_matches(
         return False
     if evidence_wrapper != {"payload": body, "hash": digest}:
         return False
-    return (
-        body.get("schema") == "cortex-merge-authorization/v1"
+    common_valid = (
+        schema in {"cortex-merge-authorization/v1", "cortex-merge-authorization/v2"}
         and body.get("run_id") == active.get("run_id")
         and body.get("workflow_step_ids") == active.get("workflow_step_ids")
         and body.get("repo") == authority.repo
@@ -776,29 +800,59 @@ def _authorization_identity_matches(
         and body.get("todo_paths") == binding["todo_paths"]
         and body.get("head") == head
         and body.get("tree_hash") == tree_hash
-        and isinstance(body.get("copilot_review_id"), int)
-        and not isinstance(body.get("copilot_review_id"), bool)
-        and body["copilot_review_id"] > 0
-        and isinstance(body.get("copilot_requested_at_epoch"), (int, float))
-        and not isinstance(body.get("copilot_requested_at_epoch"), bool)
-        and math.isfinite(float(body["copilot_requested_at_epoch"]))
         and isinstance(body.get("foreign_review_path"), str)
         and Path(body["foreign_review_path"]).is_absolute()
         and all(
             isinstance(body.get(field), str)
             and re.fullmatch(r"[0-9a-f]{64}", body[field]) is not None
             for field in (
-                "copilot_hash",
                 "foreign_review_hash",
                 "preflight_hash",
                 "checks_hash",
             )
         )
     )
+    if not common_valid:
+        return False
+    if schema == "cortex-merge-authorization/v1":
+        return (
+            isinstance(body.get("copilot_review_id"), int)
+            and not isinstance(body.get("copilot_review_id"), bool)
+            and body["copilot_review_id"] > 0
+            and isinstance(body.get("copilot_requested_at_epoch"), (int, float))
+            and not isinstance(body.get("copilot_requested_at_epoch"), bool)
+            and math.isfinite(float(body["copilot_requested_at_epoch"]))
+            and isinstance(body.get("copilot_hash"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is not None
+        )
+    review_ref = body.get("review_ref")
+    return (
+        body.get("review_kind") == "maintainer-review"
+        and isinstance(review_ref, str)
+        and Path(review_ref).is_absolute()
+        and not Path(review_ref).is_symlink()
+        and Path(review_ref).is_file()
+        and Path(review_ref).stat().st_mode & 0o222 == 0
+        and isinstance(body.get("review_hash"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", body["review_hash"]) is not None
+    )
 
 
 def _trusted_evidence_refs(authorization: dict[str, Any]) -> tuple[dict[str, str], ...]:
     body = authorization["payload"]
+    current_review = (
+        {
+            "kind": "maintainer-review",
+            "ref": body["review_ref"],
+            "hash": body["review_hash"],
+        }
+        if body.get("schema") == "cortex-merge-authorization/v2"
+        else {
+            "kind": "copilot",
+            "ref": f"github-review:{body['copilot_review_id']}",
+            "hash": body["copilot_hash"],
+        }
+    )
     return (
         {
             "kind": "preflight",
@@ -810,17 +864,299 @@ def _trusted_evidence_refs(authorization: dict[str, Any]) -> tuple[dict[str, str
             "ref": body["foreign_review_path"],
             "hash": body["foreign_review_hash"],
         },
-        {
-            "kind": "copilot",
-            "ref": f"github-review:{body['copilot_review_id']}",
-            "hash": body["copilot_hash"],
-        },
+        current_review,
         {
             "kind": "merge_authorization",
             "ref": authorization["path"],
             "hash": authorization["hash"],
         },
     )
+
+
+def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / "maintainer-review"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{body['run_id']}-{body['candidate']}.json"
+    content = (json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content or target.stat().st_mode & 0o222:
+            raise RuntimeError("maintainer review evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, target)
+            os.chmod(target, 0o444)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except FileExistsError:
+            if target.is_symlink() or target.read_bytes() != content:
+                raise RuntimeError("maintainer review evidence conflict")
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"ref": str(target), "hash": digest}
+
+
+def _validate_maintainer_review(
+    *,
+    path: object,
+    expected_hash: object,
+    run,
+    authority,
+    pr_number: int,
+    candidate: str,
+) -> dict[str, Any]:
+    evidence_path = _absolute_file(path, field="maintainer_review_path")
+    if evidence_path.stat().st_mode & 0o222:
+        raise ValueError("maintainer review evidence must be immutable")
+    try:
+        body = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("maintainer review evidence unreadable") from exc
+    bound_refs = [ref for ref in run.gate_refs if ref.kind == "maintainer-review"]
+    if (
+        run.current_phase != "review"
+        or run.candidate_head != candidate
+        or run.verified_head != candidate
+        or len(bound_refs) != 1
+        or bound_refs[0].ref != str(evidence_path)
+        or bound_refs[0].sha256 != expected_hash
+        or not isinstance(body, dict)
+        or body.get("schema") != "cortex-maintainer-review/v1"
+        or body.get("repo") != authority.repo
+        or body.get("work_id") != authority.work_id
+        or body.get("run_id") != run.run_id
+        or body.get("authority_digest") != work_authority_digest(authority)
+        or body.get("pr_number") != pr_number
+        or body.get("candidate") != candidate
+        or body.get("verdict") != "approved"
+        or body.get("findings") != []
+        or not isinstance(expected_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+        or verification.canonical_json_hash(body) != expected_hash
+    ):
+        raise RuntimeError("maintainer review does not authorize exact HEAD")
+    return body
+
+
+def _review_attest_action(
+    *,
+    args: dict[str, Any],
+    requested_by: str,
+    authority,
+    runner: Runner,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    allowed = {"action", "repo", "work_id", "actor", "verdict", "summary", "findings"}
+    extras = set(args) - allowed
+    if extras:
+        raise ValueError(f"review-attest rejects caller evidence/input: {sorted(extras)[0]}")
+    actor = args.get("actor")
+    summary = args.get("summary")
+    findings = args.get("findings")
+    if (
+        not isinstance(actor, str) or not actor.strip() or len(actor) > 128 or "\n" in actor
+        or args.get("verdict") != "approved"
+        or not isinstance(summary, str) or not summary.strip() or len(summary) > 4000
+        or findings != []
+        or not isinstance(now_epoch, (int, float))
+        or isinstance(now_epoch, bool)
+        or not math.isfinite(float(now_epoch))
+    ):
+        raise ValueError("review-attest payload invalid")
+    _state, active, run = _load_work_run(
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        authority=authority,
+    )
+    _validate_current_run_authority(active, authority, run)
+    foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
+    if (
+        run.current_phase != "review"
+        or run.status != "ongoing"
+        or not isinstance(run.candidate_head, str)
+        or run.verified_head != run.candidate_head
+        or len(foreign) != 1
+        or len(authority.mapped_prs) != 1
+        or run.pr_refs != (f"{run.repo}#{authority.mapped_prs[0]}",)
+    ):
+        raise RuntimeError("review-attest requires current exact-HEAD review run")
+    pr_number = authority.mapped_prs[0]
+    remote = GitHubDeliveryClient(runner=runner).fetch_delivery_facts(
+        repo=authority.repo,
+        pr_number=pr_number,
+        change=authority.mapped_openspec[0],
+    )
+    if remote.head != run.candidate_head:
+        raise RuntimeError("review-attest PR HEAD mismatch")
+    body = {
+        "schema": "cortex-maintainer-review/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "pr_number": pr_number,
+        "candidate": run.candidate_head,
+        "actor": actor.strip(),
+        "requested_by": requested_by,
+        "verdict": "approved",
+        "summary": summary.strip(),
+        "findings": [],
+        "reviewed_at_epoch": float(now_epoch),
+    }
+    record = _maintainer_review_record(body, state_path=state_path)
+    refs = {ref.kind: ref for ref in run.gate_refs if ref.kind != "copilot"}
+    refs["maintainer-review"] = GateEvidenceRef(
+        "maintainer-review", record["ref"], record["hash"]
+    )
+    workflow_registry._manager_update_workflow_run(
+        run.run_id,
+        gate_refs=tuple(
+            refs[kind]
+            for kind in ("brainstorm", "foreign-review", "maintainer-review")
+            if kind in refs
+        ),
+        facets=(),
+    )
+    return {"action": "review-attested", "head": run.candidate_head, **record}
+
+
+def _ship_with_maintainer_review(
+    *,
+    args: dict[str, Any],
+    active: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    authority,
+    canonical_run,
+    binding: dict[str, Any],
+    preflight: object,
+    remote: object,
+    orchestrator: ShipOrchestrator,
+    github: GitHubDeliveryClient,
+    ship: dict[str, Any] | None,
+    fix_rounds: int,
+) -> dict[str, Any]:
+    path = args.get("maintainer_review_path")
+    expected_hash = args.get("maintainer_review_hash")
+    _validate_maintainer_review(
+        path=path,
+        expected_hash=expected_hash,
+        run=canonical_run,
+        authority=authority,
+        pr_number=binding["pr_number"],
+        candidate=preflight.head,
+    )
+    maintainer = MaintainerReviewEvidence(path=str(path), expected_hash=str(expected_hash))
+    foreign_review = ForeignReviewEvidence(
+        path=str(_absolute_file(args.get("foreign_review_path"), field="foreign_review_path")),
+        expected_hash=args.get("foreign_review_hash"),
+    )
+    remote_gate = evaluate_delivery_gate(
+        facts=remote,
+        policy=DeliveryPolicy(
+            expected_head=preflight.head,
+            required_closing_issues=authority.mapped_issues,
+            review_kind="maintainer-review",
+        ),
+    )
+    if not remote_gate.allowed:
+        raise RuntimeError(f"merge authorization blocked: {', '.join(remote_gate.reasons)}")
+    authorization = _authorization_record(
+        _merge_authorization_body(
+            active=active,
+            authority=authority,
+            binding=binding,
+            preflight=preflight,
+            remote=remote,
+            copilot=None,
+            foreign_review=foreign_review,
+            maintainer_review=maintainer,
+        ),
+        state_path=state_path,
+    )
+    existing_authorization = ship.get("merge_authorization") if ship else None
+    if existing_authorization is not None and existing_authorization != authorization:
+        raise RuntimeError("persisted merge authorization differs from current gate evidence")
+    active["ship"] = {
+        **(ship or {}),
+        "phase": "merge-authorized",
+        "head": preflight.head,
+        "tree_hash": preflight.tree_hash,
+        "review_kind": "maintainer-review",
+        "review_ref": maintainer.path,
+        "fix_rounds": fix_rounds,
+        "pr_number": binding["pr_number"],
+        "change": binding["change"],
+        "todo_paths": list(binding["todo_paths"]),
+        "merge_authorization": authorization,
+    }
+    _save_runs(state_path, state)
+    try:
+        merged = orchestrator.merge_if_ready(
+            repo=authority.repo,
+            pr_number=binding["pr_number"],
+            change=binding["change"],
+            expected_head=preflight.head,
+            expected_tree_hash=preflight.tree_hash,
+            authority=authority,
+            preflight=preflight,
+            copilot=None,
+            foreign_review=foreign_review,
+            maintainer_review=maintainer,
+        )
+    except RuntimeError:
+        post_merge = github.fetch_merge_status(
+            repo=authority.repo, pr_number=binding["pr_number"]
+        )
+        if (
+            not post_merge.merged
+            or post_merge.pr_head != preflight.head
+            or not _authorization_matches(
+                authorization,
+                active=active,
+                authority=authority,
+                binding=binding,
+                preflight=preflight,
+                remote=remote,
+            )
+        ):
+            raise
+        merged = SimpleNamespace(
+            expected_head=preflight.head,
+            expected_tree_hash=preflight.tree_hash,
+        )
+    else:
+        post_merge = github.fetch_merge_status(
+            repo=authority.repo, pr_number=binding["pr_number"]
+        )
+        if not post_merge.merged or post_merge.pr_head != preflight.head:
+            raise RuntimeError("merge side effect is not visible on exact PR HEAD")
+    active["ship"] = {
+        **active["ship"],
+        "phase": "merged",
+        "head": merged.expected_head,
+        "tree_hash": merged.expected_tree_hash,
+        "merge_commit": post_merge.merge_commit,
+    }
+    _save_runs(state_path, state)
+    return {
+        "action": "merged-awaiting-closure",
+        "head": preflight.head,
+        "review_kind": "maintainer-review",
+        "review_ref": maintainer.path,
+        "review_hash": maintainer.expected_hash,
+    }
 
 
 def _fallback_workflow_starter(workflow_registry, state_path: Path):
@@ -1449,6 +1785,26 @@ def _ship_action(
     fix_rounds = ship.get("fix_rounds", 0) if ship else 0
     if not isinstance(fix_rounds, int) or isinstance(fix_rounds, bool) or fix_rounds < 0:
         raise ValueError("ship fix round state malformed")
+    has_maintainer_path = args.get("maintainer_review_path") is not None
+    has_maintainer_hash = args.get("maintainer_review_hash") is not None
+    if has_maintainer_path != has_maintainer_hash:
+        raise ValueError("maintainer review path/hash must be supplied together")
+    if has_maintainer_path:
+        return _ship_with_maintainer_review(
+            args=args,
+            active=active,
+            state=state,
+            state_path=state_path,
+            authority=authority,
+            canonical_run=canonical_run,
+            binding=binding,
+            preflight=preflight,
+            remote=remote,
+            orchestrator=orchestrator,
+            github=github,
+            ship=ship,
+            fix_rounds=fix_rounds,
+        )
     if ship and ship.get("phase") == "needs-fix" and previous_head == preflight.head:
         return {"action": "fix-required", "head": preflight.head, "fix_rounds": fix_rounds}
     if previous_head is not None and previous_head != preflight.head:
@@ -1654,7 +2010,7 @@ def execute_work_action(
     action = args.get("action")
     repo = args.get("repo")
     work_id = args.get("work_id")
-    if action not in {"link", "unlink", "start", "resume", "auto", "ship"}:
+    if action not in {"link", "unlink", "start", "resume", "auto", "ship", "review-attest"}:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
     if not isinstance(work_id, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
@@ -1689,6 +2045,16 @@ def execute_work_action(
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
+        )
+    elif action == "review-attest":
+        result = _review_attest_action(
+            args=args,
+            requested_by=requested_by,
+            authority=authority,
+            runner=runner,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
         )
     elif action == "auto":
         enabled = args.get("enabled")

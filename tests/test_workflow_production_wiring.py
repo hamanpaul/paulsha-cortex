@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -125,10 +126,10 @@ def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
         gate_status="running",
     )
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
-    calls: list[str] = []
+    calls: list[tuple[str, bool]] = []
 
     def phase_aware_resume(*args, **kwargs):
-        calls.append(kwargs["run_id"])
+        calls.append((kwargs["run_id"], kwargs["operator_resume"]))
         return {
             "run_id": kwargs["run_id"],
             "current_phase": "build",
@@ -163,7 +164,7 @@ def test_public_work_resume_routes_through_phase_aware_poll_terminalize_advance(
         )
     )
 
-    assert calls == [run.run_id]
+    assert calls == [(run.run_id, True)]
     assert result["result"]["current_phase"] == "build"
     assert result["result"]["job_id"] == "new-build-job"
 
@@ -225,9 +226,146 @@ def test_public_work_resume_preserves_define_retry_result(
     assert result["result"]["run"]["facets"] == ["needs_human"]
 
 
+def test_periodic_resume_does_not_clear_needs_human_or_retry(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 1},
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path,
+    )
+
+    assert result["reason"] == "operator-resume-required"
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+    assert registry.list_jobs() == []
+
+
+def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path: Path) -> None:
+    operator_root = tmp_path / "operator"
+    builder_root = tmp_path / "builder"
+    plan_ref = "docs/superpowers/plans/production-wiring-plan.md"
+    plan = operator_root / plan_ref
+    plan.parent.mkdir(parents=True)
+    plan_bytes = b"# Accepted plan\n\nBuild the contract.\n"
+    plan.write_bytes(plan_bytes)
+    builder_root.mkdir()
+    digest = hashlib.sha256(plan_bytes).hexdigest()
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(operator_root),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 1},
+        gate_status="running",
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=plan_ref,
+                kind="plan",
+                work_id="production-wiring",
+                baseline_sha256=digest,
+            ),
+        ),
+    )
+    red = next(step for step in run.steps if step.card == "tdd-red")
+
+    patterns = manager._effective_workflow_inputs(run, red)
+    snapshot = manager._workflow_input_snapshot(
+        run=run,
+        repo_root=builder_root,
+        patterns=patterns,
+        coordinator_root=tmp_path / "coordinator",
+    )
+    payload = json.loads(
+        manager._workflow_job_prompt(
+            run,
+            red,
+            builder_job_id=None,
+            input_snapshot=snapshot,
+        ).split("Contract: ", 1)[1]
+    )
+
+    assert patterns == ("docs/superpowers/plans/*production-wiring*.md",)
+    assert (builder_root / plan_ref).read_bytes() == plan_bytes
+    assert snapshot == (
+        {
+            "pattern": patterns[0],
+            "path": plan_ref,
+            "sha256": digest,
+            "authority": "planning-authority",
+            "content_ref": snapshot[0]["content_ref"],
+        },
+    )
+    assert payload["kind"] == "workflow-card-prompt"
+    assert payload["schema_version"] == 1
+    assert payload["skill_ref"] == "superpowers:test-driven-development"
+    assert payload["source_material"][0]["content"] == plan_bytes.decode()
+    assert payload["terminal_schema"]["required"]
+
+
+def test_build_input_snapshot_rejects_mutable_operator_drift(tmp_path: Path) -> None:
+    operator_root = tmp_path / "operator"
+    builder_root = tmp_path / "builder"
+    plan_ref = "docs/superpowers/plans/production-wiring-plan.md"
+    plan = operator_root / plan_ref
+    plan.parent.mkdir(parents=True)
+    plan.write_text("changed after acceptance\n", encoding="utf-8")
+    builder_root.mkdir()
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring", repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64, source_revision="2" * 64,
+        workspace_root=str(operator_root), combo="feature-oneshot", current_phase="build",
+        steps=_manifest().steps, issue_refs=(), openspec_refs=("production-wiring",), pr_refs=(),
+        attempts={"build": 1}, gate_status="running",
+        planning_authority=(PlanningArtifactAuthority(
+            ref=plan_ref, kind="plan", work_id="production-wiring", baseline_sha256="0" * 64,
+        ),),
+    )
+    red = next(step for step in run.steps if step.card == "tdd-red")
+
+    with pytest.raises(ValueError, match="planning input drift"):
+        manager._workflow_input_snapshot(
+            run=run,
+            repo_root=builder_root,
+            patterns=manager._effective_workflow_inputs(run, red),
+            coordinator_root=tmp_path / "coordinator",
+        )
+    assert list(builder_root.rglob("*")) == []
+
+
 def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     candidate = "a" * 40
+    proposal = tmp_path / "openspec/changes/production-wiring/proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Proposal\n", encoding="utf-8")
 
     def git_runner(argv, **kwargs):
         if "cat-file" in argv:
@@ -808,6 +946,9 @@ def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Pat
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / "source.md").write_text("source\n", encoding="utf-8")
+    proposal = repo / "openspec/changes/production-wiring/proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Proposal\n", encoding="utf-8")
     coordinator_root = tmp_path / "coordinator"
     registry = JobRegistry(state_path=coordinator_root / "registry.json")
     run = registry._manager_create_workflow_run(
@@ -933,12 +1074,14 @@ def test_workflow_gate_refs_are_typed_distinct_and_ship_requires_all_three() -> 
     brainstorm = GateEvidenceRef("brainstorm", "evidence/brainstorm.json")
     foreign = GateEvidenceRef("foreign-review", "evidence/foreign.json")
     copilot = GateEvidenceRef("copilot", "evidence/copilot.json")
+    maintainer = GateEvidenceRef("maintainer-review", "evidence/maintainer.json")
 
     assert _run(phase="review", status="passed", refs=(brainstorm, foreign)).gate_status == "passed"
     assert _run(phase="ship", status="passed", refs=(brainstorm, foreign, copilot)).current_phase == "ship"
+    assert _run(phase="ship", status="passed", refs=(brainstorm, foreign, maintainer)).current_phase == "ship"
     with pytest.raises(ValueError, match="foreign-review"):
         _run(phase="review", status="passed", refs=(brainstorm,))
-    with pytest.raises(ValueError, match="copilot"):
+    with pytest.raises(ValueError, match="delivery review"):
         _run(phase="ship", status="passed", refs=(brainstorm, foreign))
     with pytest.raises(ValueError, match="gate_status.*passed"):
         _run(phase="ship", status="running", refs=(brainstorm, foreign, copilot))
@@ -1159,6 +1302,9 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(_manifest().to_dict()), encoding="utf-8")
+    proposal = tmp_path / "openspec/changes/production-wiring/proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Proposal\n", encoding="utf-8")
     bodies = {
         "spec": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nFixed.\n",
         "design": "---\nstatus: accepted\n---\n# Design\n## Decisions\nFixed.\n",

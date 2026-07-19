@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from .config import default_socket_path
+from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
 from .lifecycle import ClosureEvidence, project_work_items
 from .models import ProjectState
@@ -277,7 +277,7 @@ class WorkReadModelStore:
 
 class MonitorSocketClient:
     def __init__(self, socket_path: str | Path | None = None, *, timeout: float = 5.0) -> None:
-        self.socket_path = Path(socket_path) if socket_path is not None else default_socket_path()
+        self.socket_path = Path(socket_path) if socket_path is not None else load_config().socket_path
         self.timeout = timeout
 
     def request(self, payload: Mapping) -> dict:

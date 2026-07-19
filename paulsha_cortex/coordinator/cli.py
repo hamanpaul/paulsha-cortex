@@ -104,12 +104,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_slice_action.add_argument("--actor", required=True)
 
     p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
-    p_work.add_argument("action", choices=["link", "unlink", "start", "resume", "auto", "ship"])
+    p_work.add_argument(
+        "action", choices=["link", "unlink", "start", "resume", "auto", "ship", "review-attest"]
+    )
     p_work.add_argument("work_id")
     p_work.add_argument("--repo", required=True)
     p_work.add_argument("--issue", type=int)
     p_work.add_argument("--kind", choices=["github_issue", "github_pr", "openspec", "path"])
     p_work.add_argument("--ref")
+    p_work.add_argument("--actor")
     toggle = p_work.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_true")
     toggle.add_argument("--disable", action="store_true")
@@ -246,6 +249,8 @@ def main(
             request_args["kind"] = args.kind
         if args.ref is not None:
             request_args["ref"] = args.ref
+        if args.actor is not None:
+            request_args["actor"] = args.actor
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)
         if args.payload:

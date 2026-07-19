@@ -141,6 +141,7 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
         env_file,
         {
             "PY": sys.executable,
+            "PSC_INSTANCE": instance,
             "PSC_REPO_ROOT": str(repo_root),
             "PSC_AGENTS_ROOT": str(agents_root),
             "PSC_RUN_ROOT": str(agents_root / "run" / instance),
@@ -149,6 +150,7 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
         },
         preserve_existing=frozenset(
             {
+                "PSC_INSTANCE",
                 "PSC_AGENTS_ROOT",
                 "PSC_RUN_ROOT",
                 "PSC_MONITOR_STATE_ROOT",

@@ -18,6 +18,7 @@ from paulsha_cortex.coordinator.github_delivery import (
 )
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.workflow import GateEvidenceRef
 
 
 HEAD = "a" * 40
@@ -204,6 +205,70 @@ def test_resume_existing_needs_human_reenters_canonical_starter(tmp_path: Path) 
     assert calls == [(claim_key, None)]
     assert result["result"]["run"]["current_phase"] == "plan"
     assert result["result"]["run"]["facets"] == []
+
+
+def test_review_attest_writes_immutable_exact_head_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=("acme/demo#8",),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
+        gate_status="passed",
+        facets=(),
+    )
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            return DeliveryFacts(
+                head=HEAD, mergeable=True, mergeable_state="clean",
+                checks=(GitHubCheck("pytest", "completed", "success"),),
+                copilot_reviews=(), review_threads=(), closing_issues=(12,),
+                active_openspec_absent=True, archive_present=True,
+            )
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    args = {
+        "action": "review-attest", "repo": "acme/demo", "work_id": "demo",
+        "actor": "maintainer@example", "verdict": "approved",
+        "summary": "Exact-HEAD adversarial review passed.", "findings": [],
+    }
+    first = work_actions.execute_work_action(
+        args=args, requested_by="operator", snapshot_path=snapshot, state_path=state,
+        now=lambda: 210, workflow_registry=registry,
+    )
+    second = work_actions.execute_work_action(
+        args=args, requested_by="operator", snapshot_path=snapshot, state_path=state,
+        now=lambda: 210, workflow_registry=registry,
+    )
+
+    assert first == second
+    evidence = Path(first["result"]["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
+    persisted = registry.get_workflow_run(run_id)
+    review = next(ref for ref in persisted.gate_refs if ref.kind == "maintainer-review")
+    assert review.ref == str(evidence)
+    assert review.sha256 == first["result"]["hash"]
 
 
 def test_auto_without_issue_mutates_every_mapped_issue(tmp_path: Path) -> None:

@@ -772,6 +772,11 @@ def _workflow_evidence_payload(
         "outputs": job.get("workflow_outputs", []),
         "output_baseline": job.get("workflow_output_baseline", []),
     }
+    envelope_job = envelope.get("job") if isinstance(envelope, dict) else None
+    if job.get("workflow_input_snapshot") or (
+        isinstance(envelope_job, dict) and "input_snapshot" in envelope_job
+    ):
+        expected_job["input_snapshot"] = job.get("workflow_input_snapshot", [])
     payload = envelope.get("payload") if isinstance(envelope, dict) else None
     if (
         not isinstance(envelope, dict)
@@ -939,6 +944,9 @@ def build_production_ship_validator(
         foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
         if len(foreign) != 1 or foreign[0].sha256 is None:
             raise ValueError("ship adapter requires canonical foreign-review evidence")
+        maintainer = [ref for ref in run.gate_refs if ref.kind == "maintainer-review"]
+        if len(maintainer) > 1 or (maintainer and maintainer[0].sha256 is None):
+            raise ValueError("ship adapter maintainer-review evidence is ambiguous")
         authority = load_work_authority(
             repo=run.repo,
             work_id=run.work_id,
@@ -1069,6 +1077,9 @@ def build_production_ship_validator(
             "pr_metadata_path": str(metadata_path),
             "skip_tests": False,
         }
+        if maintainer:
+            ship_args["maintainer_review_path"] = maintainer[0].ref
+            ship_args["maintainer_review_hash"] = maintainer[0].sha256
         if completion_draft is not None:
             ship_args["completion_record_path"] = str(completion_draft)
         action = work_actions._ship_action(
@@ -1128,6 +1139,14 @@ def build_production_ship_validator(
             "reason": action.get("reason"),
             **evidence,
         }
+        if maintainer:
+            result.update(
+                {
+                    "review_kind": "maintainer-review",
+                    "review_ref": maintainer[0].ref,
+                    "review_hash": maintainer[0].sha256,
+                }
+            )
         if status == "passed":
             record = action.get("completion_record")
             merge_revision = action.get("merge_commit")

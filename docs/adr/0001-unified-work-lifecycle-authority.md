@@ -43,15 +43,27 @@ Completeness gate 在 accepted spec/design/plan 缺失、出現 TBD 或未決策
 
 ### 5. Delivery 是 bounded、current-HEAD、remote-verified closure
 
-Builder 使用 `feature/<issue>-<slug>` worktree；deterministic verification 與 foreign exact-HEAD review 沿用既有 Candidate/evidence gate。Brainstorm peer 與 foreign reviewer 是不同 gate，Copilot review也不能替代 foreign reviewer。
+Builder 使用 `feature/<issue>-<slug>` worktree；deterministic verification 與 foreign exact-HEAD review 沿用既有 Candidate/evidence gate。Brainstorm peer 與 foreign reviewer 是不同 gate；後續typed current-HEAD delivery review（Copilot或maintainer）也不能替代 foreign reviewer。
 
-Ship 由 Manager 執行：官方 `openspec archive -y`、tasks/spec/docs/changelog 檢查、zh-TW PR metadata、快速 policy、`PSC_PREFLIGHT_CMD` CI-parity preflight、GitHub checks、current-HEAD Copilot review、resolved/outdated threads、final HEAD race check、`gh pr merge --merge`。每次 push 重請 Copilot；最多兩輪 fix/re-review，每 HEAD 等 15 分鐘；逾限轉 needs_human。
+Ship 由 Manager 執行：官方 `openspec archive -y`、tasks/spec/docs/changelog 檢查、zh-TW PR metadata、快速 policy、`PSC_PREFLIGHT_CMD` CI-parity preflight、GitHub checks、typed current-HEAD delivery review、resolved/outdated threads、final HEAD race check、`gh pr merge --merge`。Copilot路徑每次push重請review且最多兩輪fix/re-review、每HEAD等15分鐘；maintainer路徑由Manager寫exact-HEAD immutable attestation。逾限或任一authority drift轉needs_human。
 
 Merge 後 fetch default branch，確認 merge ancestry、issues closed、active OpenSpec 消失、remote archive 存在、Todo tasks 完成，再寫 CompletionRecord。只有全部成立才投影 done。
 
 ### 6. 公開 contract versioned，舊 ProjectState 暫時相容
 
 CLI JSON schema URI 固定為 `cortex-work/v1`；WorkItem/WorkSource 欄位、排序、`on-going` spelling 與 explain trace 依 `CONTEXT.md` 定義。Monitor socket新增 `list_work_items`、`get_work_item`、`explain_work_item` 與 work subscription；既有 ProjectState request/response 保留一個 release cycle並標 deprecated。
+
+### 7. Planning artifact以hash-bound input snapshot交給builder
+
+Manager在launch前解析declared inputs，accepted planning artifact只接受WorkflowRun authority中的ref/hash。獨立builder worktree缺檔時由Manager原子seed；Job、prompt、terminal evidence保存相同input snapshot，terminalize再次驗hash。Prompt同時保存card skill/action/commit/test policy與exact terminal schema。Legacy pending card可繼承同phase inputs，但passed card不回填新gate。
+
+### 8. Human stop與delivery review都使用typed Manager authority
+
+Dead job被reconcile成`needs_human`後，periodic runner不得自動重派；只有queued explicit resume可重試。ForeignReview之後的delivery review是`copilot | maintainer-review` typed union；maintainer attestation由Manager重讀PR HEAD後寫immutable exact-HEAD evidence，merge authorization v2保留實際kind/ref/hash，禁止偽裝Copilot。
+
+### 9. Runtime root依instance明確選擇
+
+Process `PSC_RUN_ROOT`最高優先；否則interactive CLI按`PSC_INSTANCE`讀installer bootstrap env，缺檔才使用`$PSC_AGENTS_ROOT/run/<instance>`。不掃描猜測多instance，malformed/symlink/relative env fail-closed；Monitor client使用production config socket path。
 
 ## Alternatives considered
 

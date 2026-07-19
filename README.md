@@ -225,7 +225,7 @@ cortex slice-action "$SLICE_ID" abandon      --actor operator
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root，只有 `ship` 的 exact evidence refs 等進階欄位由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root，只有 `review-attest` 的review摘要與 `ship` 的 exact evidence refs 等進階欄位由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
 Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；它會讀取 work item 的全部 mapped issues，任一張帶 `cortex:auto-on-going` 即符合 label 條件，但任一 GitHub API read 失敗會讓整個 claim fail-closed。`cortex work auto ... --enable|--disable` 未指定 legacy `--issue` 時會對全部 mapped issues 套用相同 label mutation；任一 mutation 失敗時整個 action 報錯。缺 issue 的 confirmed Todo 會持久化為 `needs_human: missing_issue`，待 operator link 且 Monitor snapshot 更新後才能 resume。Run 的 claim key 綁定該 work item 的 canonical semantic authority（provider/source revisions 與 confirmed refs），不綁 whole-fleet snapshot hash；只有 sequence、written-at 或其他 repo 噪音的 snapshot refresh 會原 run resume 並更新 provenance，語意來源變更才建立新 run。
 
@@ -235,14 +235,16 @@ Merge authorization 只雜湊 stable preflight 結果（argv、return code、HEA
 
 ### 5. 由 Manager 完成交付
 
-Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec、跑 policy/pinned preflight、建立或更新 PR、要求 current-HEAD Copilot review，再重讀 checks、threads、closing refs 與 mergeability。只有全部 gate 對同一 HEAD 成立時才執行 merge commit；任何 stale provider、HEAD race、舊 review、partial closure 或第三輪 finding 都停在 `needs_human`。
+Work Item workflow 通過 build、deterministic verification 與 foreign review 後，由 Manager 依序 archive OpenSpec、跑 policy/pinned preflight、建立或更新 PR，再要求恰好一種current-HEAD delivery review：authenticated Copilot review，或透過`review-attest`建立的immutable maintainer evidence。Manager接著重讀checks、threads、closing refs與mergeability；只有全部gate對同一HEAD成立時才執行merge commit。Maintainer evidence保留`maintainer-review` kind，絕不偽裝成Copilot。
+
+Headless build card會在dispatch前解析declared inputs。Accepted planning artifact只接受WorkflowRun planning authority的ref/hash；獨立builder worktree缺檔時由Manager原子seed。Job、versioned bounded prompt與canonical evidence保存同一份input snapshot，terminalize再驗hash。Dead job轉`needs_human`後periodic runner不會自動重派，必須由operator明確執行`work resume`。
 
 Merge 後 Manager 會重新 fetch default branch，驗證雙親 merge commit ancestry、issue closed、active OpenSpec 消失、archive/Todo/CompletionRecord 成立。部分完成不會提早標 `done`。
 
 ### 目前邊界
 
 - 沒有 Web UI；任務意圖仍以 Markdown spec 維護。
-- Copilot finding 只允許兩輪 bounded fix/re-review；超過預算需由 operator recovery。
+- Copilot finding 只允許兩輪 bounded fix/re-review；超過預算需由 operator recovery。Maintainer路徑仍要求ForeignReview、terminal-green checks與resolved/outdated threads。
 - verification 的 sanitized env 不等於 network / filesystem sandbox。
 - v1 自動 foreign review 限 `tier: shareable`。
 - merge commit 是目前受支援路徑；auto/squash/rebase/cherry-pick 會 fail-closed。
@@ -325,8 +327,8 @@ identities:
 - v1 只支援 preserving-commit 路徑：Candidate 必須是 `refs/remotes/<remote>/<target_branch>` 的 ancestor；squash/cherry-pick 視為不支援（保持 blocked 或 needs_human）。
 - 同一 dependency chain 必須使用同一 target branch，否則 fail-closed。
 - completion ordering 固定為「先 atomic 寫 CompletionRecord，再 atomic 標 Slice `completed`」。
-- work delivery CompletionRecord 另綁定 repo/work/run ID、workflow step IDs、Monitor snapshot/provider/source revisions、mapped issues、PR/OpenSpec/Todo refs、merge commit，以及 trusted preflight/Copilot/ForeignReview/merge-authorization refs；cached done 每次仍會重新讀取 fresh authority 與 remote closure。
-- merge 前 Manager 會先以 atomic no-clobber+fsync 寫入唯讀 `merge-authorized` evidence file（authority digest、HEAD/tree、Copilot epoch/review ID、ForeignReview/preflight/checks hashes），再把 path/hash 綁回 run state。Crash replay 只接受 exact record；未經 Manager authorization 的 external merge 會進入 `needs_human`，不會直接閉合。
+- work delivery CompletionRecord 另綁定 repo/work/run ID、workflow step IDs、Monitor snapshot/provider/source revisions、mapped issues、PR/OpenSpec/Todo refs、merge commit，以及 trusted preflight/current-HEAD delivery review/ForeignReview/merge-authorization refs；cached done 每次仍會重新讀取 fresh authority 與 remote closure。
+- merge 前 Manager 會先以 atomic no-clobber+fsync 寫入唯讀 `merge-authorized` evidence file（authority digest、HEAD/tree、實際review kind/ref/hash、ForeignReview/preflight/checks hashes），再把 path/hash 綁回 run state。Crash replay 只接受 exact record；未經 Manager authorization 的 external merge 會進入 `needs_human`，不會直接閉合。
 - crash window（record 已寫、slice 尚未 completed）在 restart 後只會補完符合當前 target ancestry 的紀錄；不符合則維持 blocked。
 - 舊版無 `schema_version` / legacy `done` state 需先 clean-start（archive/remove 舊 `jobs.json`），不做 silent migration。
 
@@ -337,7 +339,13 @@ cortex slice-action "$SLICE_ID" retry-build  --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-verify --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-review --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
+
+# PR已建立且foreign review綁定current HEAD後，建立typed maintainer evidence：
+cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
+  --payload review-attest.json
 ```
+
+`review-attest.json`只接受`{"verdict":"approved","summary":"...","findings":[]}`；path/hash由Manager生成，caller不得注入。Manager會重讀authenticated PR HEAD並將evidence綁定repo/work/run/authority/PR/candidate/actor。
 
 - `slice-action` 一律透過 control request queue，由 daemon/manager 單一 writer 消費。
 - status snapshot 會一次列出所有 `needs_human` 事項（`attention`），包含 reason、evidence refs、ancestry 摘要與 `next_actions`，不需逐筆互動追問。
@@ -361,14 +369,14 @@ cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
 | control root | `~/.agents/control` | `PSC_CONTROL_ROOT` |
 | coordinator root | `~/.agents/coordinator` | `PSC_COORDINATOR_ROOT` |
 | specs root | `~/.agents/specs` | `PSC_SPECS_ROOT` |
-| run root | CLI 預設 `~/.agents/run`；installed instance 為 `~/.agents/run/<instance>` | `PSC_RUN_ROOT` |
+| run root | 依 `PSC_INSTANCE`（預設`cortex`）讀installer env；未安裝時為`~/.agents/run/<instance>` | `PSC_RUN_ROOT`（最高優先） |
 | monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
 | project config root | `~/.agents/config/paulsha` | `PSC_PROJECT_CONFIG_ROOT` |
 | repo root | 目前工作目錄 | `PSC_REPO_ROOT` |
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
-共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；後者會持久化 `PSC_AGENTS_ROOT`，再將 runtime 導向 override。installer 重跑會更新自身管理的 Python/repo 值，但保留既有 operator `PSC_AGENTS_ROOT`、`PSC_RUN_ROOT`、`PSC_MONITOR_STATE_ROOT` 與 `PSC_PROJECT_CONFIG_ROOT`。Monitor socket 預設為 `$PSC_RUN_ROOT/project-monitor.sock`，也可由 `project-cortex.yaml` 的 `monitor.socket_path` 覆寫；live doctor 會透過 production `MonitorSocketClient` 執行 `list_work_items` 並驗證 `cortex-work/v1`，單純 Unix socket 可連線不算 ready。
+共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑會更新自身管理的Python/repo值，但保留既有operator roots。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。
 
 ## 誠實狀態表
 

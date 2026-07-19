@@ -337,6 +337,7 @@ def build_request_executor(
                     launcher_factory=launcher_factory,
                     coordinator_root=coordinator_root,
                     ship_validator=active_ship_validator,
+                    operator_resume=True,
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -426,6 +427,7 @@ def build_request_executor(
                             launcher_factory=launcher_factory,
                             coordinator_root=coordinator_root,
                             ship_validator=active_ship_validator,
+                            operator_resume=True,
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(

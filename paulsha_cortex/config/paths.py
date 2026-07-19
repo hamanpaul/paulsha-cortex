@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .runtime import resolve_run_root
+
 
 def _env_path(name: str) -> Path | None:
     value = os.environ.get(name, "").strip()
@@ -33,7 +35,7 @@ def specs_root() -> Path:
 
 
 def run_root() -> Path:
-    return _resolve_root("PSC_RUN_ROOT", agents_root() / "run")
+    return resolve_run_root()
 
 
 def monitor_state_root() -> Path:
