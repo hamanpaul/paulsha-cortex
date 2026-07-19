@@ -90,6 +90,11 @@ def _claude_review_json_schema(kind: str) -> str:
             "properties": {
                 "category": {
                     "type": "string",
+                    "description": (
+                        "Use blocking categories only for defects in the Candidate or its "
+                        "acceptance. A report-only wording or enumeration inaccuracy that does "
+                        "not change the Candidate verdict is style; correct it in this report."
+                    ),
                     "enum": [
                         "acceptance", "correctness", "data-loss", "pre-existing-out-of-scope",
                         "race", "scope-bypass", "security", "style", "verification-bypass",

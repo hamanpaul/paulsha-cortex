@@ -65,6 +65,10 @@ Verify/Review dispatch只接受schema v2明示`review` capability、且independe
 
 工作預設 manual。Auto claim 同時要求 confirmed Todo、confirmed issue 與 `cortex:auto-on-going` label；移除 label 只阻止尚未 claim 的工作，不會中止 active workflow。Todo 缺 issue 時不會自動建立 issue，而是 `needs_human: missing_issue`。
 
+合法且exact-bound的review `state=rejected`會保存immutable GateEvaluation、把當前card標成`needs_human`並停在原phase；periodic runner不得重派。只有operator explicit `cortex work resume`可在Candidate、report與evaluation hash重驗後建立fresh reviewer Job。Blocking category只描述Candidate或acceptance缺陷；若只是前份review report的措辭／列舉精度且不改變Candidate verdict，fresh reviewer應以non-blocking `style`留下更正，不得冒充Candidate correctness。
+
+若合法`state=passed` review evidence已canonical bind，但step audit或registry save在完成前中斷，operator resume會重驗同一份exact evidence並冪等重播，不建立fresh reviewer Job；forged、stale或unknown state仍停在`needs_human`。
+
 ## Snapshot 與 registry migration
 
 - Work snapshot：`$PSC_MONITOR_STATE_ROOT/work-items.snapshot.json`；未設定時為 `$PSC_AGENTS_ROOT/monitor/work-items.snapshot.json`。

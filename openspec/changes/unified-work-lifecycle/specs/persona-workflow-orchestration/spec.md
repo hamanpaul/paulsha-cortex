@@ -77,6 +77,17 @@ Verify/review identity MUST以schema v2明示`review` capability且其independen
 - **THEN**Manager拒絕terminalize或phase advance
 - **AND**canonical evidence path不得補足缺少的report
 
+#### Scenario: Review回傳blocking finding
+- **WHEN**exact-bound review GateEvaluation為`state=rejected`
+- **THEN**Manager MUST保存immutable rejected evidence、將當前card與WorkflowRun標成`needs_human`並停在原phase，MUST NOT誤報binding mismatch
+- **AND**periodic runner MUST NOT重派；只有operator explicit resume在Candidate、report與evaluation hash重驗後 MAY建立fresh reviewer Job
+- **AND**blocking category MUST只描述Candidate或acceptance缺陷；不改變Candidate verdict的prior-report措辭或列舉精度 MUST以non-blocking `style`留下更正，MUST NOT放寬既有category-based blocking判定
+
+#### Scenario: Passed review在step audit前中斷
+- **WHEN**合法`state=passed` canonical review evidence已bind，但step audit或registry save尚未完成
+- **THEN**operator explicit resume MUST重驗同一run/claim/repo/source/card/phase/Candidate/job/evaluation與report hash並冪等重播，MUST NOT建立fresh reviewer Job
+- **AND**forged、stale或unknown evidence state MUST保留`needs_human`且不得dispatch
+
 ### Requirement: Agy launcher必須使用safe plan sandbox
 `agy` launcher MUST使用headless print、plan mode與sandbox，MUST NOT加入unsafe permission bypass。Model identity registry MUST登錄`agy + Gemini 3.1 Pro (High)`為`google`並由`doctor --probe-live`驗capability；版本字串 alone MUST NOT視為可用。
 

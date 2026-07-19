@@ -2313,6 +2313,73 @@ def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
     )
 
 
+def _workflow_review_evidence_state(
+    job: Mapping[str, object],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> str | None:
+    """Return the exact immutable review state eligible for operator recovery."""
+
+    card = job.get("workflow_card")
+    if (
+        job.get("workflow_run_id") != run.run_id
+        or job.get("workflow_claim_key") != run.claim_key
+        or job.get("workflow_repo") != run.repo
+        or job.get("source_revision") != run.source_revision
+        or not isinstance(card, str)
+        or not any(
+            step.phase == "review"
+            and step.card == card
+            and step.gate_result != "passed"
+            for step in run.steps
+        )
+        or job.get("workflow_phase") != "review"
+        or job.get("persona") != "reviewer"
+        or job.get("kind") != "review"
+        or job.get("subject_head") != run.candidate_head
+        or job.get("workflow_evidence") is None
+        or job.get("status") != "exited"
+        or job.get("exit_code") != 0
+    ):
+        return None
+    try:
+        evidence, _outputs, _path, _digest = _read_job_workflow_evidence(
+            job,
+            run=run,
+            coordinator_root=coordinator_root,
+        )
+        payload = dict(evidence)
+        payload.pop("outputs", None)
+        evaluation = foreign_review.validate_gate_evaluation(payload)
+    except (OSError, ValueError):
+        return None
+    state = evaluation.get("state")
+    if (
+        state not in {"passed", "rejected"}
+        or evaluation.get("slice_id") != f"{run.run_id}-{card}"
+        or evaluation.get("candidate") != run.candidate_head
+        or evaluation.get("reviewer_job_id") != job.get("job_id")
+    ):
+        return None
+    return str(state)
+
+
+def _is_rejected_workflow_review_evidence(
+    job: Mapping[str, object],
+    *,
+    run,
+    coordinator_root: str | Path,
+) -> bool:
+    """Recognize an exact immutable rejected review for explicit fresh review only."""
+
+    return _workflow_review_evidence_state(
+        job,
+        run=run,
+        coordinator_root=coordinator_root,
+    ) == "rejected"
+
+
 def _is_exact_legacy_agy_recovery(
     job: Mapping[str, object],
     *,
@@ -4659,6 +4726,16 @@ def _workflow_job_prompt(
             "finding_evidence_keys": ["path", "line", "detail"],
             "finding_categories": sorted(foreign_review.VALID_FINDING_CATEGORIES),
             "finding_severities": sorted(foreign_review.VALID_SEVERITIES),
+            "finding_category_policy": {
+                "blocking": (
+                    "Use correctness/acceptance/security/data-loss/race/scope-bypass/"
+                    "verification-bypass only for Candidate or acceptance defects."
+                ),
+                "report_only": (
+                    "Use style for prior-report wording or enumeration inaccuracies that do not "
+                    "change the Candidate verdict, and correct the record in this report."
+                ),
+            },
             "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
         }
     else:
@@ -4752,6 +4829,11 @@ def _dispatch_workflow_card(
                 and (
                     matching[-1].get("status") == "failed"
                     or _retryable_nonpassing_workflow_terminal(matching[-1])
+                    or _is_rejected_workflow_review_evidence(
+                        matching[-1],
+                        run=run,
+                        coordinator_root=coordinator_root,
+                    )
                 )
             )
             or (
@@ -5066,6 +5148,7 @@ def resume_workflow_run(
     if registry is None:
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
+    pre_resume_gate_status = run.gate_status
     retry_failed = False
     recovery_job_id: str | None = None
     if "needs_human" in run.facets and run.status == "ongoing":
@@ -5083,29 +5166,42 @@ def resume_workflow_run(
                 if job.get("workflow_run_id") == run.run_id
                 and job.get("workflow_card") == recovery_step.card
                 and job.get("workflow_phase") == recovery_step.phase
-                and (
-                    recovery_step.phase not in {"verify", "review"}
-                    or job.get("subject_head") == run.candidate_head
-                )
             ]
-            if recovery_jobs and (
+            latest_recovery = recovery_jobs[-1] if recovery_jobs else None
+            if (
+                latest_recovery is not None
+                and recovery_step.phase == "review"
+                and latest_recovery.get("workflow_evidence") is not None
+                and _workflow_review_evidence_state(
+                    latest_recovery,
+                    run=run,
+                    coordinator_root=coordinator_root,
+                ) is None
+            ):
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "job_id": latest_recovery.get("job_id"),
+                    "reason": "rejected-review-recovery-mismatch",
+                }
+            if latest_recovery is not None and (
                 _is_exact_legacy_agy_recovery(
-                    recovery_jobs[-1], run=run, step=recovery_step, identities=identities
+                    latest_recovery, run=run, step=recovery_step, identities=identities
                 )
                 or _is_exact_reviewer_terminal_recovery(
                     registry,
-                    recovery_jobs[-1],
+                    latest_recovery,
                     run=run,
                     step=recovery_step,
                     identities=identities,
                     coordinator_root=coordinator_root,
                 )
             ):
-                recovery_job_id = str(recovery_jobs[-1]["job_id"])
+                recovery_job_id = str(latest_recovery["job_id"])
             if recovery_job_id is not None:
                 try:
                     _discard_reviewer_sandbox(
-                        recovery_jobs[-1],
+                        latest_recovery,
                         coordinator_root=coordinator_root,
                         require_candidate_unchanged=True,
                     )
@@ -5147,7 +5243,7 @@ def resume_workflow_run(
         updated = registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
-            gate_status="running",
+            gate_status=pre_resume_gate_status,
         )
         return {
             "run_id": updated.run_id,
@@ -5229,6 +5325,11 @@ def resume_workflow_run(
     elif retry_failed and job is not None and (
         job.get("status") == "failed"
         or _retryable_nonpassing_workflow_terminal(job)
+        or _is_rejected_workflow_review_evidence(
+            job,
+            run=run,
+            coordinator_root=coordinator_root,
+        )
     ):
         job = dispatch_or_stop(run, retry=True)
     if job is None:
@@ -5282,22 +5383,33 @@ def resume_workflow_run(
         if is_last
         else run.current_phase
     )
-    result = apply_workflow_action(
-        registry,
-        args={
-            "action": "advance",
-            "run_id": run.run_id,
-            "card_id": step.card,
-            "job_id": job["job_id"],
-            "current_phase": next_phase,
-        },
-        identity_registry=identities,
-        ship_validator=ship_validator,
-        git_runner=getattr(dispatcher, "_git_runner", None),
-        coordinator_root=coordinator_root,
-        trusted_terminal=True,
-    )
+    try:
+        result = apply_workflow_action(
+            registry,
+            args={
+                "action": "advance",
+                "run_id": run.run_id,
+                "card_id": step.card,
+                "job_id": job["job_id"],
+                "current_phase": next_phase,
+            },
+            identity_registry=identities,
+            ship_validator=ship_validator,
+            git_runner=getattr(dispatcher, "_git_runner", None),
+            coordinator_root=coordinator_root,
+            trusted_terminal=True,
+        )
+    except Exception:
+        current = registry.get_workflow_run(run.run_id)
+        registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+        )
+        raise
     updated = registry.get_workflow_run(run.run_id)
+    if "needs_human" in updated.facets:
+        return result
     next_job = dispatch_or_stop(updated)
     if next_job is not None:
         result["job_id"] = next_job["job_id"]
@@ -5535,6 +5647,7 @@ def apply_workflow_action(
             raise ValueError("workflow reviewer must use a foreign independence domain")
         by_kind = {item.kind: item for item in current.gate_refs}
         verified = current.verified_head
+        review_state: str | None = None
         if current.current_phase == "verify":
             report_outputs = evidence.get("outputs")
             evidence_payload = dict(evidence)
@@ -5555,10 +5668,11 @@ def apply_workflow_action(
             if (
                 evaluation.get("slice_id") != f"{current.run_id}-{card_id}"
                 or evaluation.get("candidate") != candidate
-                or evaluation.get("state") != "passed"
+                or evaluation.get("state") not in {"passed", "rejected"}
                 or evaluation.get("reviewer_job_id") != job.get("job_id")
             ):
                 raise ValueError("review evaluation workflow/card/candidate mismatch")
+            review_state = str(evaluation["state"])
             builder_job_id = evaluation.get("builder_job_id")
             _builder_job, builder_identity = _review_builder_job(
                 registry,
@@ -5585,8 +5699,31 @@ def apply_workflow_action(
             model=identity.model_id,
             domain=identity.independence_domain,
             outputs=outputs,
+            gate_result=("needs_human" if review_state == "rejected" else "passed"),
             card_id=card_id,
         )
+        if review_state == "rejected":
+            updated = registry._manager_update_workflow_run(
+                run_id,
+                current_phase=current.current_phase,
+                steps=updated_steps,
+                gate_refs=tuple(
+                    by_kind[kind]
+                    for kind in (
+                        "brainstorm", "foreign-review", "copilot", "maintainer-review",
+                    )
+                    if kind in by_kind
+                ),
+                gate_status="failed",
+                candidate_head=candidate,
+                verified_head=verified,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            )
+            return {
+                "run_id": updated.run_id,
+                "current_phase": updated.current_phase,
+                "reason": "blocking-findings",
+            }
         phase_done = all(
             item.gate_result == "passed"
             for item in updated_steps
