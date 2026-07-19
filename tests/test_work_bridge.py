@@ -357,8 +357,9 @@ def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
     report_ref = "reports/review/work-review.md"
     report = repo / report_ref
     report.parent.mkdir(parents=True)
-    canonical = b"# Canonical review\n"
-    report.write_bytes(b"# Drifted review\n")
+    canonical = b"# Historical canonical review\n"
+    latest = b"# Latest canonical review\n"
+    report.write_bytes(canonical)
     run = SimpleNamespace(run_id="workflow-run", candidate_head=candidate)
     job = {
         "job_id": "review-job",
@@ -408,11 +409,46 @@ def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
         "path": "evidence/workflow/review.json",
         "hash": hashlib.sha256(content).hexdigest(),
     }
+    latest_job = {
+        **job,
+        "job_id": "review-job-2",
+        "workflow_card": "adversarial-review-card",
+        "workflow_output_baseline": [
+            {"path": report_ref, "sha256": hashlib.sha256(canonical).hexdigest()}
+        ],
+    }
+    latest_envelope = {
+        **envelope,
+        "job": {
+            **envelope["job"],
+            "job_id": latest_job["job_id"],
+            "card_id": latest_job["workflow_card"],
+            "output_baseline": latest_job["workflow_output_baseline"],
+        },
+        "artifacts": [
+            {
+                "path": report_ref,
+                "sha256": hashlib.sha256(latest).hexdigest(),
+                "baseline_sha256": hashlib.sha256(canonical).hexdigest(),
+            }
+        ],
+    }
+    latest_content = (
+        json.dumps(latest_envelope, sort_keys=True, separators=(",", ":")).encode()
+        + b"\n"
+    )
+    latest_evidence = state_root / "evidence" / "workflow" / "review-2.json"
+    latest_evidence.write_bytes(latest_content)
+    latest_job["workflow_evidence"] = {
+        "kind": "review",
+        "path": "evidence/workflow/review-2.json",
+        "hash": hashlib.sha256(latest_content).hexdigest(),
+    }
 
     class Registry:
         @staticmethod
         def list_jobs():
-            return [job]
+            return [job, latest_job]
 
     with pytest.raises(RuntimeError, match="report hash drift"):
         work_bridge._remove_canonical_untracked_reports(
@@ -422,7 +458,7 @@ def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
             worktree=repo,
         )
 
-    assert report.read_bytes() == b"# Drifted review\n"
+    assert report.read_bytes() == canonical
 
 
 def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(

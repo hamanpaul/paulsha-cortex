@@ -830,7 +830,7 @@ def _remove_canonical_untracked_reports(
     Unknown, tracked, symlinked, stale, or hash-drifted paths remain a hard stop.
     """
 
-    trusted: dict[str, set[str]] = {}
+    trusted: dict[str, str] = {}
     for job in registry.list_jobs():
         phase = job.get("workflow_phase")
         locator = job.get("workflow_evidence")
@@ -875,10 +875,12 @@ def _remove_canonical_untracked_reports(
             relative = Path(str(artifact["path"]))
             if relative.is_absolute() or ".." in relative.parts:
                 raise RuntimeError("canonical workflow report path escapes repo")
-            trusted.setdefault(relative.as_posix(), set()).add(str(artifact["sha256"]))
+            # JobRegistry is append-ordered; a retry publication supersedes the
+            # prior canonical body at the same report path.
+            trusted[relative.as_posix()] = str(artifact["sha256"])
 
     removals: list[Path] = []
-    for relative, hashes in sorted(trusted.items()):
+    for relative, expected_hash in sorted(trusted.items()):
         path = worktree / relative
         if not path.exists() and not path.is_symlink():
             continue
@@ -890,7 +892,7 @@ def _remove_canonical_untracked_reports(
         except ValueError as exc:
             raise RuntimeError("canonical workflow report path escapes worktree") from exc
         actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
-        if actual not in hashes:
+        if actual != expected_hash:
             raise RuntimeError("canonical workflow report hash drift")
         tracked = subprocess.run(
             ["git", "-C", str(worktree), "ls-files", "--error-unmatch", "--", relative],
