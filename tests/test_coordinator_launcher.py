@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -88,17 +89,54 @@ class ArgvTests(unittest.TestCase):
 
     def test_reviewer_read_only_argv_allows_inspection_but_never_edit_permissions(self) -> None:
         claude = build_claude_argv(
-            prompt="P", slice_id="s", log_dir="/lg", review_only=True
+            prompt="P", slice_id="s", log_dir="/lg",
+            worktree="/wt/reviewer", review_only=True,
         )
         codex = build_codex_argv(
             prompt="P", slice_id="s", log_dir="/lg", review_only=True
         )
 
-        self.assertEqual(claude[claude.index("--permission-mode") + 1], "plan")
+        self.assertEqual(claude[claude.index("--permission-mode") + 1], "dontAsk")
         self.assertNotIn("acceptEdits", claude)
-        self.assertEqual(claude[claude.index("--tools") + 1], "Read,Grep,Glob,Bash")
+        self.assertNotIn("--remote-control", claude)
+        self.assertNotIn("--add-dir", claude)
+        self.assertEqual(claude[claude.index("--tools") + 1], "Bash")
+        self.assertNotIn("--allowedTools", claude)
+        self.assertEqual(claude[claude.index("--setting-sources") + 1], "")
+        settings = json.loads(claude[claude.index("--settings") + 1])
+        self.assertTrue(settings["sandbox"]["enabled"])
+        self.assertTrue(settings["sandbox"]["failIfUnavailable"])
+        self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["denyWrite"],
+            ["/wt/reviewer/candidate"],
+        )
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["allowRead"][0],
+            "/wt/reviewer/candidate",
+        )
+        self.assertEqual(
+            settings["sandbox"]["filesystem"]["denyRead"],
+            [str(Path.home().resolve()), "/run/user", "/run/docker.sock", "/var/run/docker.sock"],
+        )
+        protected_files = {
+            row["path"] for row in settings["sandbox"]["credentials"]["files"]
+        }
+        self.assertIn("/run/user", protected_files)
+        self.assertIn("/run/docker.sock", protected_files)
+        self.assertIn("/var/run/docker.sock", protected_files)
+        self.assertIn("--strict-mcp-config", claude)
+        self.assertEqual(
+            claude[claude.index("--json-schema") + 1], '{"type":"object"}'
+        )
+        self.assertIn("--safe-mode", claude)
+        self.assertIn("--no-session-persistence", claude)
         self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
         self.assertIn("--skip-git-repo-check", codex)
+        with self.assertRaisesRegex(ValueError, "Candidate checkout"):
+            build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg", review_only=True
+            )
         with self.assertRaisesRegex(ValueError, "read-only"):
             build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", review_only=True)
 
@@ -375,6 +413,56 @@ class ArgvTests(unittest.TestCase):
             "GIT_CONFIG_VALUE_0",
         ):
             self.assertNotIn(key, env)
+
+    def test_reviewer_launch_uses_minimal_env_and_non_login_shell(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 225
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "env": env})
+            return _FakeProc()
+
+        inherited_secrets = {
+            "PGPASSWORD": "postgres-secret",
+            "MYSQL_PWD": "mysql-secret",
+            "DATABASE_URL": "postgres://secret@example.invalid/db",
+            "GITHUB_PAT": "github-secret",
+            "BASH_ENV": "/tmp/credential-exporter",
+            "LC_SECRET": "locale-shaped-secret",
+        }
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ,
+                inherited_secrets,
+                clear=False,
+            ):
+                SubprocessLauncher("claude").as_review_only().launch(
+                    slice_id="review",
+                    prompt="P",
+                    worktree=d,
+                    log_dir=str(Path(d) / "logs"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(calls[0]["argv"][:2], ["bash", "-c"])
+        for key in inherited_secrets:
+            self.assertNotIn(key, calls[0]["env"])
+        self.assertNotIn("PSC_REPO_ROOT", calls[0]["env"])
+        self.assertNotIn("PSC_RELAY_TARGET", calls[0]["env"])
+        self.assertLessEqual(
+            set(calls[0]["env"]),
+            {
+                "HOME", "LANG", "LC_ADDRESS", "LC_ALL", "LC_COLLATE", "LC_CTYPE",
+                "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_MESSAGES", "LC_MONETARY",
+                "LC_NAME", "LC_NUMERIC", "LC_PAPER", "LC_TELEPHONE", "LC_TIME",
+                "LOGNAME", "PATH", "SHELL", "TMPDIR", "USER", "VIRTUAL_ENV",
+            },
+        )
 
     def test_launch_resolves_worktree_before_argv_and_popen(self) -> None:
         calls = []

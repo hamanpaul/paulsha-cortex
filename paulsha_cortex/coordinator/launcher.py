@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -32,6 +34,73 @@ _GIT_REPOSITORY_ENV_KEYS = frozenset(
     }
 )
 
+_CREDENTIAL_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_?KEY|AUTH|COOKIE|CREDENTIALS?|PASSWORD|PRIVATE_?KEY|SECRET|TOKEN)(?:$|_)",
+    re.IGNORECASE,
+)
+
+
+def _claude_review_settings(worktree: str) -> str:
+    """Build a CLI-only sandbox policy for a headless Claude reviewer."""
+
+    candidate = (Path(worktree).resolve() / "candidate").resolve()
+    home = Path.home().resolve()
+    credential_paths = (
+        home / ".aws",
+        home / ".claude",
+        home / ".claude.json",
+        home / ".config" / "gh",
+        home / ".config" / "gcloud",
+        home / ".kube",
+        home / ".ssh",
+        Path("/run/user"),
+        Path("/run/docker.sock"),
+        Path("/var/run/docker.sock"),
+    )
+    credential_env = sorted(
+        name for name in os.environ if _CREDENTIAL_ENV_RE.search(name) is not None
+    )
+    tool_read_paths = [candidate]
+    tool_read_paths.extend(
+        path.resolve()
+        for path in sorted(home.glob(".local/lib/python*/site-packages"))
+        if path.is_dir() and not path.is_symlink()
+    )
+    read_denials = [
+        f"Read(/{path.as_posix()}{'/**' if path.suffix == '' else ''})"
+        for path in credential_paths
+    ]
+    settings = {
+        "permissions": {"deny": read_denials},
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "autoAllowBashIfSandboxed": True,
+            "allowUnsandboxedCommands": False,
+            "filesystem": {
+                "denyWrite": [str(candidate)],
+                "denyRead": [
+                    str(home),
+                    "/run/user",
+                    "/run/docker.sock",
+                    "/var/run/docker.sock",
+                ],
+                "allowRead": [str(path) for path in tool_read_paths],
+            },
+            "credentials": {
+                "files": [
+                    {"path": str(path), "mode": "deny"}
+                    for path in credential_paths
+                ],
+                "envVars": [
+                    {"name": name, "mode": "deny"}
+                    for name in credential_env
+                ],
+            },
+        },
+    }
+    return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
 
 def _git_scope_env() -> dict[str, str]:
     """Drop inherited Git repository/config selectors before scope binding."""
@@ -40,6 +109,39 @@ def _git_scope_env() -> dict[str, str]:
         key: value
         for key, value in os.environ.items()
         if key not in _GIT_REPOSITORY_ENV_KEYS and not key.startswith("GIT_CONFIG_")
+    }
+
+
+def _review_scope_env() -> dict[str, str]:
+    """Keep only non-secret process basics for an untrusted read-only reviewer."""
+
+    allowed = {
+        "HOME",
+        "LANG",
+        "LC_ADDRESS",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_IDENTIFICATION",
+        "LC_MEASUREMENT",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NAME",
+        "LC_NUMERIC",
+        "LC_PAPER",
+        "LC_TELEPHONE",
+        "LC_TIME",
+        "LOGNAME",
+        "PATH",
+        "SHELL",
+        "TMPDIR",
+        "USER",
+        "VIRTUAL_ENV",
+    }
+    return {
+        key: value
+        for key, value in _git_scope_env().items()
+        if key in allowed
     }
 
 
@@ -187,31 +289,56 @@ def build_claude_argv(
     review_only: bool = False,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
-        raise ValueError("read-only Claude planning cannot bypass permissions")
+        raise ValueError("read-only Claude launcher cannot bypass permissions")
+    if review_only and worktree is None:
+        raise ValueError("read-only Claude reviewer requires a Candidate checkout")
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
     argv = [
         "claude",
         "-p",
         prompt,
-        "--remote-control",
         "--output-format",
         "stream-json",
         "--verbose",  # smoke 實證：claude -p + --output-format stream-json 必須帶 --verbose
         "--name",
         slice_id,
         "--permission-mode",
-        "plan"
-        if read_only or review_only
-        else ("bypassPermissions" if allow_unsafe else "acceptEdits"),
+        (
+            "plan"
+            if read_only
+            else (
+                "dontAsk"
+                if review_only
+                else ("bypassPermissions" if allow_unsafe else "acceptEdits")
+            )
+        ),
     ]
+    if not review_only:
+        argv.append("--remote-control")
     if read_only:
         argv += ["--tools", ""]
     elif review_only:
-        argv += ["--tools", "Read,Grep,Glob,Bash"]
+        argv += [
+            "--tools",
+            "Bash",
+            "--setting-sources",
+            "",
+            "--settings",
+            _claude_review_settings(worktree),
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--strict-mcp-config",
+            "--json-schema",
+            '{"type":"object"}',
+            "--safe-mode",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--no-session-persistence",
+        ]
     if model is not None:
         argv += ["--model", model]
-    if worktree is not None:
+    if worktree is not None and not review_only:
         argv.extend(["--add-dir", worktree])
     return argv
 
@@ -427,13 +554,16 @@ class SubprocessLauncher:
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。
-        env = {
-            **_git_scope_env(),
-            "PSC_SLICE_ID": slice_id,
-            "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
-        }
-        if self._relay_target is not None:
-            env["PSC_RELAY_TARGET"] = self._relay_target
+        if self._review_only:
+            env = _review_scope_env()
+        else:
+            env = {
+                **_git_scope_env(),
+                "PSC_SLICE_ID": slice_id,
+                "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
+            }
+            if self._relay_target is not None:
+                env["PSC_RELAY_TARGET"] = self._relay_target
         log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
@@ -444,7 +574,8 @@ class SubprocessLauncher:
         # 誤判「還沒開始就已完成」（fail-closed：每輪從乾淨狀態起跑）。
         Path(sentinel).unlink(missing_ok=True)
         script = f'{shlex.join(inner_argv)}; printf %s "$?" > {shlex.quote(sentinel)}'
-        argv = ["bash", "-lc", script]
+        # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
+        argv = ["bash", "-c" if self._review_only else "-lc", script]
         with open(log_path, "wb") as logf:
             proc = subprocess.Popen(
                 argv,
