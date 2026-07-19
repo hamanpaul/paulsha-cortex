@@ -9,7 +9,7 @@ work_item: terminal-lifecycle-canary
 
 ### Repo-local authority
 
-Use a repo-local override that maps issue #31, the dedicated Todo, and a new active, confirmed OpenSpec work item named `terminal-lifecycle-canary`. Do not modify the Manager registry directly or extend automatic labeling to other repositories.
+Use a repo-local override that maps issue #31 to a new active, confirmed OpenSpec work item named `terminal-lifecycle-canary`. Do not modify the Manager registry directly or extend automatic labeling to other repositories.
 
 ### Isolated canary identity
 
@@ -31,4 +31,4 @@ Every required output and gate is authoritative. If any typed output is absent o
 
 ### Change boundary
 
-The canary artifact change is documentation-only and is confined to the repo-local authority mapping, the dedicated Todo, `docs/unified-work-lifecycle.md`, the current OpenSpec change, and issue #31. Runtime delivery recovery may only re-arm a pre-binding target-cardinality stop after the authority becomes the exact single PR/OpenSpec/Todo tuple; all other strict gates remain unchanged.
+Implementation is documentation-only and is confined to `docs/unified-work-lifecycle.md`, the current OpenSpec change, and issue #31. Runtime code is outside the change boundary.
