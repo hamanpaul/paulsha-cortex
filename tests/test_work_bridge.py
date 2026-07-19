@@ -343,6 +343,12 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         capture_output=True,
         text=True,
     ).stdout == ""
+    work_bridge._remove_canonical_untracked_reports(
+        registry=registry,
+        state_root=tmp_path / "state",
+        run=run,
+        worktree=repo,
+    )
     journal = json.loads(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
@@ -459,6 +465,14 @@ def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
         )
 
     assert report.read_bytes() == canonical
+    report.unlink()
+    with pytest.raises(RuntimeError, match="missing before cleanup"):
+        work_bridge._remove_canonical_untracked_reports(
+            registry=Registry(),
+            state_root=state_root,
+            run=run,
+            worktree=repo,
+        )
 
 
 def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(

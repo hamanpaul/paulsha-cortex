@@ -828,6 +828,7 @@ def _remove_canonical_untracked_reports(
     tree content.  They are needed while subsequent review cards snapshot their
     inputs, but must not make the exact committed Candidate dirty at delivery.
     Unknown, tracked, symlinked, stale, or hash-drifted paths remain a hard stop.
+    A hash-addressed cleanup intent makes a Manager-completed deletion replayable.
     """
 
     trusted: dict[str, str] = {}
@@ -879,11 +880,34 @@ def _remove_canonical_untracked_reports(
             # prior canonical body at the same report path.
             trusted[relative.as_posix()] = str(artifact["sha256"])
 
+    cleanup_payload = {
+        "schema": "cortex-workflow-report-cleanup/v1",
+        "run_id": run.run_id,
+        "candidate": run.candidate_head,
+        "reports": [
+            {"path": path, "sha256": sha256}
+            for path, sha256 in sorted(trusted.items())
+        ],
+    }
+    cleanup_digest = verification.canonical_json_hash(cleanup_payload)
+    cleanup_path = (
+        state_root.resolve() / "evidence" / "report-cleanup" / f"{cleanup_digest}.json"
+    )
+    cleanup_started = cleanup_path.exists() or cleanup_path.is_symlink()
+    if cleanup_started and (
+        cleanup_path.is_symlink()
+        or not cleanup_path.is_file()
+        or cleanup_path.stat().st_mode & 0o222
+    ):
+        raise RuntimeError("workflow report cleanup evidence is not immutable")
+
     removals: list[Path] = []
     for relative, expected_hash in sorted(trusted.items()):
         path = worktree / relative
         if not path.exists() and not path.is_symlink():
-            continue
+            if cleanup_started:
+                continue
+            raise RuntimeError("canonical workflow report is missing before cleanup")
         if path.is_symlink() or not path.is_file():
             raise RuntimeError("canonical workflow report path is not a regular file")
         resolved = path.resolve(strict=True)
@@ -906,6 +930,8 @@ def _remove_canonical_untracked_reports(
             raise RuntimeError("canonical workflow report tracking state unavailable")
         removals.append(resolved)
 
+    if trusted:
+        _write_json_evidence(state_root, "report-cleanup", cleanup_payload)
     for path in removals:
         path.unlink()
         directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
