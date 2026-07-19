@@ -105,6 +105,8 @@ Prompt固定為`workflow-card-prompt/v1`，包含resolved source content與termi
 
 Plan/build workflow card的headless process exit 0但terminal明示`failed`或`needs_human`時，Manager保留原job/log且不建立passed evidence；periodic維持`needs_human` stop。只有explicit operator resume可在schema與run/card binding一致時重派同一run/card，malformed或錯誤binding不可藉此旁路。
 
+Build phase由多張會commit的card逐步形成Candidate。Manager接受每張card的terminal前，必須重讀worktree exact HEAD，並驗新Candidate等於或為目前Candidate的descendant後才原子推進；首張build card以持久化dispatch base為baseline。Verify/review繼續要求job Candidate完全等於凍結的run Candidate。
+
 ### 11. `needs_human`是operator resume boundary
 
 Dispatcher仍負責把dead PID/no sentinel fail-closed成failed job；Manager將run設`needs_human`後，periodic runner只回`operator-resume-required`，不得清facet或重派。只有control queue收到explicit work/workflow resume才清facet、保留舊failed job並重試相同run/card。

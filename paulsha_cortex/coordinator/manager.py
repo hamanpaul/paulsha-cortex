@@ -2074,6 +2074,44 @@ def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> st
     return candidate
 
 
+def _verify_build_candidate_transition(
+    job: Mapping[str, object],
+    *,
+    previous_candidate: object,
+    git_runner=None,
+) -> str:
+    """Accept an exact build HEAD only when it monotonically extends its trusted baseline."""
+
+    candidate = _verify_exact_candidate(job, git_runner=git_runner)
+    baseline = previous_candidate if previous_candidate is not None else job.get("dispatch_head")
+    worktree = job.get("worktree")
+    if (
+        not isinstance(baseline, str)
+        or verification.SAFE_SHA_RE.fullmatch(baseline) is None
+        or not isinstance(worktree, str)
+    ):
+        raise ValueError("workflow build candidate baseline missing")
+    if baseline == candidate:
+        return candidate
+
+    argv = ["git", "-C", worktree, "merge-base", "--is-ancestor", baseline, candidate]
+    if git_runner is None:
+        ancestry = subprocess.run(argv, capture_output=True, text=True, check=False)
+    else:
+        try:
+            ancestry = git_runner(argv, capture_output=True, text=True, check=False)
+        except TypeError:
+            ancestry = git_runner(argv[1:])
+    if isinstance(ancestry, str):
+        return candidate
+    returncode = getattr(ancestry, "returncode", 1)
+    if returncode == 1:
+        raise ValueError("workflow build candidate is not a descendant")
+    if returncode != 0:
+        raise ValueError("workflow build candidate ancestry unavailable")
+    return candidate
+
+
 def _review_builder_job(
     registry,
     *,
@@ -4218,9 +4256,15 @@ def apply_workflow_action(
             coordinator_root=coordinator_root,
         )
         candidate = current.candidate_head
-        if current.current_phase in {"build", "verify", "review"}:
+        if current.current_phase == "build":
+            candidate = _verify_build_candidate_transition(
+                job,
+                previous_candidate=candidate,
+                git_runner=git_runner,
+            )
+        elif current.current_phase in {"verify", "review"}:
             job_candidate = _verify_exact_candidate(job, git_runner=git_runner)
-            if candidate is not None and candidate != job_candidate:
+            if candidate != job_candidate:
                 raise ValueError("workflow card candidate mismatch")
             candidate = job_candidate
         builder_domains = {

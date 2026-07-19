@@ -108,6 +108,12 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 - **WHEN**operator透過control queue明確resume同一run
 - **THEN**Manager MAY重派同一card；malformed或錯誤binding terminal MUST NOT取得此retry authority
 
+#### Scenario: Sequential build card推進Candidate
+- **WHEN**build card提交的新exact worktree HEAD等於或為目前Candidate的descendant
+- **THEN**Manager MUST接受該card並將WorkflowRun Candidate原子推進至新HEAD
+- **WHEN**build terminal Candidate不是目前Candidate的descendant，或verify/review Candidate不完全等於凍結Candidate
+- **THEN**Manager MUST拒絕該evidence且MUST NOT推進workflow
+
 ### Requirement: Headless card prompt必須是bounded execution envelope
 每張headless card prompt MUST為versioned structured envelope，至少包含run/work/source revision、phase/card/persona、skill ref、task action、commit/test policy、resolved source material、declared outputs、candidate semantics與exact terminal JSON schema。Source material總量 MUST有上限；超限 MUST fail-closed。Manager已provision worktree時，`worktree-isolation` MUST明示不得建立第二個worktree。
 
