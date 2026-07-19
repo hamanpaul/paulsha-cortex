@@ -298,15 +298,31 @@ def _run(
     argv: Sequence[str],
     cwd: Path,
     runner: Runner,
+    environment: Mapping[str, str] | None = None,
 ) -> CommandResult:
+    kwargs: dict[str, object] = {
+        "cwd": str(cwd),
+        "shell": False,
+        "capture_output": True,
+        "text": True,
+    }
+    if environment is not None:
+        kwargs["env"] = dict(environment)
     raw = runner(
         list(argv),
-        cwd=str(cwd),
-        shell=False,
-        capture_output=True,
-        text=True,
+        **kwargs,
     )
     return _coerce_result(argv, raw)
+
+
+def _preflight_environment() -> dict[str, str]:
+    """Preserve host/tool auth while withholding Manager runtime authority."""
+
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("PSC_")
+    }
 
 
 def _read_clean_identity(*, root: Path, runner: Runner) -> tuple[str, str]:
@@ -364,8 +380,14 @@ def run_preflight(
             tree_hash=tree_hash,
             state_root=evidence_state_root,
         )
+    gate_environment = _preflight_environment()
     policy_argv = ["python3", "-m", "policy_check", "--repo", "."]
-    policy = _run(argv=policy_argv, cwd=root, runner=runner)
+    policy = _run(
+        argv=policy_argv,
+        cwd=root,
+        runner=runner,
+        environment=gate_environment,
+    )
     if policy.returncode != 0:
         return PreflightResult(
             passed=False,
@@ -382,7 +404,12 @@ def run_preflight(
         full_suite_evidence=evidence,
         now_epoch=now_epoch,
     )
-    ci_parity = _run(argv=ci_argv, cwd=root, runner=runner)
+    ci_parity = _run(
+        argv=ci_argv,
+        cwd=root,
+        runner=runner,
+        environment=gate_environment,
+    )
     final_head_result = _run(
         argv=["git", "-C", str(root), "rev-parse", "HEAD"],
         cwd=root,

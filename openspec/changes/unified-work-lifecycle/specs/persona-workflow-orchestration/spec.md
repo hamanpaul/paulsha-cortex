@@ -59,12 +59,20 @@ Manager MUST在每張card dispatch時持久化output目錄baseline。Verify與re
 
 進入delivery時，Manager MAY在後續review card已不再需要repo內report input後清除Manager-owned report publication，但 MUST逐一重驗同一run、exact Candidate、successful verify/review Job、canonical evidence locator/hash與最新artifact content hash，且只可清除未被Candidate追蹤的phase-scoped regular file。刪除前 MUST先建立綁定完整report path/hash集合的hash-addressed immutable cleanup intent；只有同一intent存在且通過schema、filename/content hash、immutable mode、run/Candidate與path/hash全量重驗時，crash/retry evidence reader MAY把missing report視為已完成操作。Tracked、symlink、path escape、writable或malformed intent、未授權missing或任何hash drift MUST fail-closed。初次metadata preflight MUST先驗delivery branch符合`feature/<slug>`，再於由exact Candidate建立的乾淨、policy-compliant暫存`feature/preflight-*` checkout執行；MUST NOT把builder worktree的uncommitted planning overlay或其他檔案帶入exact-tree gate，且結束後 MUST移除worktree與暫存branch。
 
+Manager執行quick policy及configured CI-parity preflight子行程時 MUST保留一般工具與認證所需環境，但 MUST移除所有繼承的`PSC_*` runtime authority；preflight內的測試 MUST NOT因此取得production coordinator root、executor、repo或service identity。
+
 Review phase所有card已通過後，ship validator的任一exception MUST先把同一WorkflowRun標為`needs_human`並將gate設為failed，再向operator回報；MUST NOT只回CLI error而留下無attention facet的ongoing run。
 
 #### Scenario: Manager report與planning overlay存在於builder worktree
 - **WHEN** exact Candidate已完成ForeignReview，但builder worktree另有canonical report publication與accepted planning overlay
 - **THEN** Manager只可在report evidence完整重驗後清除未追蹤report，並在乾淨的暫存`feature/preflight-*` exact-Candidate checkout執行初次metadata preflight
 - **AND** 任一unknown、tracked、symlink或hash-drift report不得被靜默忽略或刪除
+
+#### Scenario: Manager service環境執行full preflight
+- **GIVEN**Manager service環境含production `PSC_*` root、executor與repo設定
+- **WHEN**Manager在exact-Candidate checkout執行quick policy與CI-parity preflight
+- **THEN**兩個gate子行程均看不到繼承的`PSC_*` runtime authority
+- **AND**非Cortex的工具與認證環境仍可供preflight使用
 
 Verify/review identity MUST以schema v2明示`review` capability且其independence domain MUST不同於Builder。Reviewer launcher MUST採executor enforced read-only mode並只在exact Candidate的disposable clone執行；Claude reviewer MUST使用非互動`dontAsk`與safe-mode而非Plan Mode、不得載入Candidate customization、remote session或MCP，且工具面 MUST只暴露OS-sandboxed Bash；StructuredOutput schema MUST由Manager-generated phase contract決定並強制verification或review全部必要欄位、fixed kind/status、inline reports及typed findings，不得接受generic或empty object。Filesystem MUST拒讀home、runtime user sockets與Docker sockets；symlink aliases MUST先解析、去重成canonical targets，仍只重開Candidate、必要Python user-site工具鏈與解析後的官方SRT package root。Bash MUST在fail-if-unavailable、禁止unsandboxed fallback、Candidate deny-write且隔離credential paths/env的OS原生sandbox內執行。Reviewer subprocess MUST採非密鑰環境正向allowlist且 MUST NOT啟動login shell。缺Claude Code 2.1.187+、必要CLI surface、sandbox runtime dependency、live native smoke、以實際review filesystem policy執行的smoke或Unix-socket seccomp smoke MUST fail-closed。Checkout後 MUST移除所有Git remotes；Claude protected-path bind targets MUST只建立在deterministic disposable session root，exact Candidate MUST固定在其`candidate/` checkout，且兩者 MUST分離以維持material tree與Git status乾淨。Manager MUST在terminal、launch failure及operator retry清理路徑重驗原Candidate完整tree snapshot，任何drift MUST fail-closed。Agent MUST只回substantive verification/findings與inline report body。Manager MUST從durable Job建構slice/Candidate、builder/reviewer job IDs、launch identity、finding ID/blocking/state與frontmatter。Report MUST限於phase專屬`reports/verify/*.md`或`reports/review/*.md`，並以durable intent journal將multi-report CAS、canonical evidence與registry bind包成可rollback/roll-forward transaction；partial write、save fault或crash replay MUST不得留下未綁定publication。Journal recovery path MUST為canonical repo內phase專屬Markdown path，任何`..`、symlink、duplicate或repo escape MUST fail-closed。Agent提供的immutable binding欄位或直接Candidate/report寫入 MUST NOT被採信。
 
