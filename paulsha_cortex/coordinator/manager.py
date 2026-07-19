@@ -5298,15 +5298,29 @@ def resume_workflow_run(
     if step is None:
         if run.current_phase == "review" and ship_validator is not None:
             last = [item for item in run.steps if item.phase == "review"][-1]
-            return apply_workflow_action(
-                registry,
-                args={"action": "advance", "run_id": run.run_id, "card_id": last.card, "current_phase": "ship"},
-                identity_registry=identities,
-                ship_validator=ship_validator,
-                git_runner=getattr(dispatcher, "_git_runner", None),
-                coordinator_root=coordinator_root,
-                trusted_terminal=True,
-            )
+            try:
+                return apply_workflow_action(
+                    registry,
+                    args={
+                        "action": "advance",
+                        "run_id": run.run_id,
+                        "card_id": last.card,
+                        "current_phase": "ship",
+                    },
+                    identity_registry=identities,
+                    ship_validator=ship_validator,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    coordinator_root=coordinator_root,
+                    trusted_terminal=True,
+                )
+            except Exception:
+                current = registry.get_workflow_run(run.run_id)
+                registry._manager_update_workflow_run(
+                    run.run_id,
+                    facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                    gate_status="failed",
+                )
+                raise
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
     jobs = [
         job

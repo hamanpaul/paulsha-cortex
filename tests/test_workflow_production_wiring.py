@@ -266,6 +266,54 @@ def test_periodic_resume_does_not_clear_needs_human_or_retry(tmp_path: Path) -> 
     assert registry.list_jobs() == []
 
 
+def test_ship_validator_failure_persists_needs_human_on_review_complete_run(
+    tmp_path: Path,
+) -> None:
+    steps = tuple(
+        WorkflowStep.from_dict({**step.to_dict(), "gate_result": "passed"})
+        if step.phase != "ship"
+        else step
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"review": 1},
+        candidate_head="a" * 40,
+        verified_head="a" * 40,
+        gate_status="running",
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    with pytest.raises(RuntimeError, match="preflight failed"):
+        manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=lambda _: None,
+            coordinator_root=tmp_path,
+            operator_resume=True,
+            ship_validator=lambda **_: (_ for _ in ()).throw(
+                RuntimeError("preflight failed")
+            ),
+        )
+
+    stopped = registry.get_workflow_run(run.run_id)
+    assert stopped.current_phase == "review"
+    assert stopped.facets == ("needs_human",)
+    assert stopped.gate_status == "failed"
+
+
 def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_old_job(
     tmp_path: Path,
 ) -> None:
