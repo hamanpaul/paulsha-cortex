@@ -1844,6 +1844,65 @@ def _load_planning_artifacts(
     return tuple(artifacts), tuple(scanned)
 
 
+def _manager_archive_applied(run) -> bool:
+    archives = [
+        step
+        for step in run.steps
+        if step.phase == "ship"
+        and step.card == "openspec-archive"
+        and step.gate_result == "passed"
+    ]
+    return len(archives) == 1 and (
+        archives[0].executor,
+        archives[0].model,
+        archives[0].domain,
+    ) == ("cortex-manager", "deterministic", "cortex")
+
+
+def _planning_artifact_relative_path_after_archive(
+    run,
+    *,
+    workspace: Path,
+    ref: str,
+    digest: str,
+) -> Path:
+    relative = Path(ref)
+    cursor = workspace
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("workflow brainstorm artifact symlink rejected")
+    direct = workspace / relative
+    if direct.is_file() or not _manager_archive_applied(run):
+        return relative
+    parts = relative.parts
+    if (
+        len(parts) < 4
+        or parts[:2] != ("openspec", "changes")
+        or parts[2] not in run.openspec_refs
+    ):
+        return relative
+    archive_root = workspace / "openspec" / "changes" / "archive"
+    if archive_root.is_symlink() or not archive_root.is_dir():
+        return relative
+    suffix = f"-{parts[2]}"
+    matches: list[Path] = []
+    for archived_change in archive_root.iterdir():
+        if archived_change.is_symlink() or not archived_change.name.endswith(suffix):
+            continue
+        candidate = archived_change.joinpath(*parts[3:])
+        cursor = workspace
+        for part in candidate.relative_to(workspace).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow brainstorm archived artifact symlink rejected")
+        if candidate.is_file() and hashlib.sha256(candidate.read_bytes()).hexdigest() == digest:
+            matches.append(candidate)
+    if len(matches) > 1:
+        raise ValueError("workflow brainstorm archived artifact authority ambiguous")
+    return matches[0].relative_to(workspace) if matches else relative
+
+
 def _validated_brainstorm_planning_authority(
     run,
     *,
@@ -1931,12 +1990,18 @@ def _validated_brainstorm_planning_authority(
         relative = Path(ref)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("workflow brainstorm artifact escapes workspace")
+        target_relative = _planning_artifact_relative_path_after_archive(
+            run,
+            workspace=workspace,
+            ref=ref,
+            digest=digest,
+        )
         cursor = workspace
-        for part in relative.parts:
+        for part in target_relative.parts:
             cursor = cursor / part
             if cursor.is_symlink():
                 raise ValueError("workflow brainstorm artifact symlink rejected")
-        target = (workspace / relative).resolve()
+        target = (workspace / target_relative).resolve()
         try:
             target.relative_to(workspace)
         except ValueError as exc:

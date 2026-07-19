@@ -1414,12 +1414,27 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         raise RuntimeError("retry-build requires verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
-    repair_action = (
-        "Repair the exact Candidate after a delivery preflight failure. Run the authoritative "
-        "preflight, fix only real Candidate failures, and make active OpenSpec tasks describe and "
-        "complete only pre-archive work. Do not claim archive, merge, issue closure, or done before "
-        "Manager performs those actions. Commit a tested descendant Candidate."
+    archive_applied = any(
+        step.phase == "ship"
+        and step.card == "openspec-archive"
+        and step.gate_result == "passed"
+        for step in run.steps
     )
+    if archive_applied:
+        repair_action = (
+            "Repair the exact Candidate after a post-archive verification or review failure. "
+            "Preserve the Manager-owned official OpenSpec archive and fix only real Candidate "
+            "failures identified by the current verification/review evidence. Do not recreate the "
+            "active change or claim merge, issue closure, or done. Commit a tested descendant "
+            "Candidate."
+        )
+    else:
+        repair_action = (
+            "Repair the exact Candidate after a delivery preflight failure. Run the authoritative "
+            "preflight, fix only real Candidate failures, and make active OpenSpec tasks describe and "
+            "complete only pre-archive work. Do not claim archive, merge, issue closure, or done before "
+            "Manager performs those actions. Commit a tested descendant Candidate."
+        )
     updated = workflow_registry._manager_reset_workflow_for_retry_build(
         run.run_id,
         expected_candidate=expected_candidate.lower(),

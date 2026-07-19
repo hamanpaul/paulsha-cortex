@@ -1207,6 +1207,94 @@ def test_brainstorm_required_without_evidence_stays_stopped_before_dispatch(
     assert dispatched == []
 
 
+def test_brainstorm_authority_resolves_exact_manager_archive_after_active_path_moves(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    coordinator_root = tmp_path / "coordinator"
+    ref = "openspec/changes/production-wiring/proposal.md"
+    body = "---\nstatus: accepted\n---\n# Proposal\n## Requirements\nBound.\n"
+    active = workspace / ref
+    active.parent.mkdir(parents=True)
+    active.write_text(body, encoding="utf-8")
+    digest = manager._sha256_path(active)
+    evidence = coordinator_root / "evidence" / "planning" / "brainstorm.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "brainstorm-peer",
+                "scope": {
+                    "repo": "hamanpaul/paulsha-cortex",
+                    "work_id": "production-wiring",
+                    "source_revision": "2" * 64,
+                },
+                "artifacts": [{"kind": "spec", "ref": ref, "sha256": digest}],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    archive = (
+        workspace
+        / "openspec"
+        / "changes"
+        / "archive"
+        / "2026-07-19-production-wiring"
+        / "proposal.md"
+    )
+    archive.parent.mkdir(parents=True)
+    active.replace(archive)
+    archive_step = replace(
+        next(step for step in _manifest().steps if step.card == "openspec-archive"),
+        executor="cortex-manager",
+        model="deterministic",
+        domain="cortex",
+        gate_result="passed",
+    )
+    run = SimpleNamespace(
+        repo="hamanpaul/paulsha-cortex",
+        work_id="production-wiring",
+        workspace_root=str(workspace),
+        steps=(archive_step,),
+        openspec_refs=("production-wiring",),
+        brainstorm_required=True,
+        planning_source_revision="2" * 64,
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind="spec",
+                work_id="production-wiring",
+                baseline_sha256=digest,
+            ),
+        ),
+        gate_refs=(
+            GateEvidenceRef("brainstorm", str(evidence), manager._sha256_path(evidence)),
+        ),
+    )
+
+    authority, source_revision = manager._validated_brainstorm_planning_authority(
+        run,
+        coordinator_root=coordinator_root,
+    )
+
+    assert authority == run.planning_authority
+    assert source_revision == "2" * 64
+
+    untrusted = SimpleNamespace(
+        **{
+            **run.__dict__,
+            "steps": (replace(archive_step, executor="operator"),),
+        }
+    )
+    with pytest.raises(ValueError, match="artifact hash drift"):
+        manager._validated_brainstorm_planning_authority(
+            untrusted,
+            coordinator_root=coordinator_root,
+        )
+
+
 def test_operator_resume_dispatch_error_restores_needs_human(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

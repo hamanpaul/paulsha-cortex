@@ -1284,11 +1284,21 @@ class JobRegistry:
         build_steps = [step for step in current.steps if step.phase == "build"]
         if not build_steps or any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-build reset requires completed build phase")
-        if any(
-            step.phase == "ship" and step.gate_result == "passed"
+        passed_ship_steps = [
+            step
             for step in current.steps
+            if step.phase == "ship" and step.gate_result == "passed"
+        ]
+        if len(passed_ship_steps) > 1 or any(
+            step.card != "openspec-archive"
+            or step.executor != "cortex-manager"
+            or step.model != "deterministic"
+            or step.domain != "cortex"
+            for step in passed_ship_steps
         ):
-            raise ValueError("retry-build reset requires pre-archive workflow")
+            raise ValueError(
+                "retry-build reset only permits Manager-owned archive authority"
+            )
         repair_card = build_steps[-1].card
         steps = tuple(
             replace(
@@ -1304,7 +1314,8 @@ class JobRegistry:
                 ),
             )
             if (step.phase == "build" and step.card == repair_card)
-            or step.phase in {"verify", "review", "ship"}
+            or step.phase in {"verify", "review"}
+            or (step.phase == "ship" and step.gate_result != "passed")
             else step
             for step in current.steps
         )
@@ -1318,7 +1329,9 @@ class JobRegistry:
             },
             gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
             verified_head=None,
-            facets=(),
+            facets=tuple(
+                facet for facet in current.facets if facet != "needs_human"
+            ),
             gate_status="running",
             updated_at=_now_iso(),
         )
