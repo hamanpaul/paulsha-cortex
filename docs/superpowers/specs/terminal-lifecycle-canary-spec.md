@@ -27,9 +27,6 @@ A missing typed output or failed gate SHALL prevent completion and preserve a `n
 
 ### Scope
 
-The change SHALL be limited to the repo-local authority mapping, the dedicated
-`docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md`,
-`docs/unified-work-lifecycle.md`, the `terminal-lifecycle-canary` OpenSpec
-change, and issue #31.
+The change SHALL be limited to `docs/unified-work-lifecycle.md`, the `terminal-lifecycle-canary` OpenSpec change, and issue #31.
 
 The change SHALL NOT modify runtime code, directly alter the Manager registry, or enable automatic labels for other repositories.

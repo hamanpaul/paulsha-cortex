@@ -9,7 +9,6 @@ work_item: terminal-lifecycle-canary
 
 ### 1. Document the terminal lifecycle canary
 
-- [x] Establish one confirmed Todo path for issue #31 and the active OpenSpec change.
 - [ ] Update `docs/unified-work-lifecycle.md` with issue #31 and the confirmed `terminal-lifecycle-canary` mapping.
 - [ ] Record persona-domain separation and the heterogeneous brainstorm requirement.
 - [ ] Record the docs-only build path, verification gates, and fail-closed `needs_human` behavior.
