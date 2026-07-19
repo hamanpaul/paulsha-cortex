@@ -1253,3 +1253,75 @@ class JobRegistry:
         self._workflows[index] = updated
         self._persist()
         return self._copy_workflow_run(updated)
+
+    def _manager_reset_workflow_for_retry_build(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        repair_action: str,
+    ) -> WorkflowRun:
+        """Atomically reopen only the final builder card after an explicit human stop."""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase not in {"verify", "review"}
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError("retry-build reset requires active needs_human verify/review workflow")
+        if current.candidate_head != expected_candidate:
+            raise ValueError("retry-build reset Candidate CAS mismatch")
+        if not isinstance(repair_action, str) or not repair_action:
+            raise ValueError("retry-build reset action missing")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("retry-build reset refuses active workflow job")
+        build_steps = [step for step in current.steps if step.phase == "build"]
+        if not build_steps or any(step.gate_result != "passed" for step in build_steps):
+            raise ValueError("retry-build reset requires completed build phase")
+        if any(
+            step.phase == "ship" and step.gate_result == "passed"
+            for step in current.steps
+        ):
+            raise ValueError("retry-build reset requires pre-archive workflow")
+        repair_card = build_steps[-1].card
+        steps = tuple(
+            replace(
+                step,
+                executor=None,
+                model=None,
+                domain=None,
+                gate_result="pending",
+                action=(
+                    repair_action
+                    if step.phase == "build" and step.card == repair_card
+                    else step.action
+                ),
+            )
+            if (step.phase == "build" and step.card == repair_card)
+            or step.phase in {"verify", "review", "ship"}
+            else step
+            for step in current.steps
+        )
+        updated = replace(
+            current,
+            current_phase="build",
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "build": current.attempts.get("build", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            verified_head=None,
+            facets=(),
+            gate_status="running",
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)

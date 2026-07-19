@@ -120,6 +120,23 @@ def test_work_action_contract_requires_typed_routing_fields():
     with pytest.raises(ValueError, match="exactly one"):
         contract.validate_request(typed)
 
+    retry = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "expected_candidate": "a" * 40,
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(retry)["args"]["action"] == "retry-build"
+    retry["args"]["expected_candidate"] = "A" * 40
+    assert contract.validate_request(retry)["args"]["expected_candidate"] == "A" * 40
+    retry["args"]["expected_candidate"] = "short"
+    with pytest.raises(ValueError, match="exact expected_candidate"):
+        contract.validate_request(retry)
+
 
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):

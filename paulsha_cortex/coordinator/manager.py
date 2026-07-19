@@ -4885,6 +4885,7 @@ def _dispatch_workflow_card(
     coordinator_root: str | Path,
     retry_failed: bool = False,
     operator_recovery_job_id: str | None = None,
+    force_new_build: bool = False,
 ) -> dict[str, object] | None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -4892,6 +4893,8 @@ def _dispatch_workflow_card(
     step = _current_workflow_step(run)
     if step is None or run.current_phase not in {"plan", "build", "verify", "review"}:
         return None
+    if force_new_build and (step.phase != "build" or step.persona != "builder"):
+        raise ValueError("forced workflow retry requires builder card")
     matching = [
         job
         for job in registry.list_jobs()
@@ -4934,6 +4937,7 @@ def _dispatch_workflow_card(
                     )
                 )
             )
+            or (force_new_build and matching[-1].get("status") in TERMINAL_STATUSES)
         )
     )
     if matching and not retryable_latest:
@@ -5203,6 +5207,7 @@ def dispatch_workflow_card(
     launcher_factory: Callable[[object], object],
     coordinator_root: str | Path,
     retry_failed: bool = False,
+    force_new_build: bool = False,
 ) -> dict[str, object] | None:
     """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
 
@@ -5213,6 +5218,7 @@ def dispatch_workflow_card(
         launcher_factory=launcher_factory,
         coordinator_root=coordinator_root,
         retry_failed=retry_failed,
+        force_new_build=force_new_build,
     )
 
 

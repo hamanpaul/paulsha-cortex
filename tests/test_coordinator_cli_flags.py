@@ -98,6 +98,17 @@ class SliceActionFlagTests(unittest.TestCase):
 
 
 class WorkActionFlagTests(unittest.TestCase):
+    def test_work_retry_build_accepts_exact_candidate_payload(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "work", "retry-build", "demo", "--repo", "acme/demo",
+                "--issue", "12", "--actor", "operator", "--payload", "repair.json",
+            ]
+        )
+        self.assertEqual(args.action, "retry-build")
+        self.assertEqual(args.payload, "repair.json")
+
     def test_work_ship_enqueues_payload_without_executing_delivery(self) -> None:
         submitted = []
         with tempfile.TemporaryDirectory() as root:

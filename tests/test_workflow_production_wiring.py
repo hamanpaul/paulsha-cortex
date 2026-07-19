@@ -233,6 +233,215 @@ def test_public_work_resume_preserves_define_retry_result(
     assert result["result"]["run"]["facets"] == ["needs_human"]
 
 
+def test_public_work_retry_build_forces_one_new_manager_dispatched_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 2},
+        candidate_head="a" * 40,
+        gate_status="running",
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    calls: list[bool] = []
+
+    def forced_dispatch(*args, **kwargs):
+        calls.append(kwargs.get("force_new_build"))
+        return {"job_id": "repair-builder"}
+
+    monkeypatch.setattr(manager, "dispatch_workflow_card", forced_dispatch)
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        workflow_identity_registry=IdentityRegistry.from_rows([]),
+        work_action_fn=lambda **_: {
+            "work_id": run.work_id,
+            "repo": run.repo,
+            "result": {"action": "retry-build", "run": run.to_dict()},
+        },
+    )
+
+    result = executor(
+        build_request(
+            req_type="work-action",
+            args={
+                "action": "retry-build",
+                "repo": run.repo,
+                "work_id": run.work_id,
+                "expected_candidate": "a" * 40,
+            },
+            requested_by="operator",
+        )
+    )
+
+    assert calls == [True]
+    assert result["result"]["job_id"] == "repair-builder"
+
+
+def test_forced_retry_build_dispatches_new_job_after_prior_success(
+    tmp_path: Path,
+) -> None:
+    plan = tmp_path / "docs/superpowers/plans/production-wiring.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Repair plan\n", encoding="utf-8")
+    steps = tuple(
+        replace(
+            step,
+            gate_result=(
+                "pending"
+                if step.phase == "build" and step.card == "subagent-build"
+                else "passed" if step.phase == "build" else step.gate_result
+            ),
+            action=(
+                "Repair exact Candidate and commit a tested descendant."
+                if step.phase == "build" and step.card == "subagent-build"
+                else step.action
+            ),
+        )
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 2},
+        candidate_head="a" * 40,
+        gate_status="running",
+    )
+    old = registry.create_job(
+        task="wf-old-subagent-build",
+        persona="builder",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(tmp_path),
+        dispatch_head="b" * 40,
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        subject_head="a" * 40,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="subagent-build",
+        workflow_phase="build",
+        workflow_repo_root=str(tmp_path),
+        workflow_input_root=str(tmp_path),
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(old["job_id"], status="exited", exit_code=0)
+    launched: list[str] = []
+
+    class Launcher:
+        def as_commit_required(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append(prompt)
+            return LaunchHandle(
+                executor="codex",
+                model_id="gpt-primary",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    replacement = manager.dispatch_workflow_card(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run=run,
+        identities=IdentityRegistry.from_rows(
+            [{
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            }]
+        ),
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=tmp_path / "coordinator",
+        force_new_build=True,
+    )
+
+    assert replacement["job_id"] != old["job_id"]
+    assert replacement["dispatch_head"] == old["dispatch_head"]
+    assert "Repair exact Candidate" in launched[0]
+
+
+def test_public_work_retry_build_restores_needs_human_when_dispatch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 2},
+        candidate_head="a" * 40,
+        gate_status="running",
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("launch failed")),
+    )
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        workflow_identity_registry=IdentityRegistry.from_rows([]),
+        work_action_fn=lambda **_: {
+            "work_id": run.work_id,
+            "repo": run.repo,
+            "result": {"action": "retry-build", "run": run.to_dict()},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        executor(
+            build_request(
+                req_type="work-action",
+                args={
+                    "action": "retry-build",
+                    "repo": run.repo,
+                    "work_id": run.work_id,
+                    "expected_candidate": "a" * 40,
+                },
+                requested_by="operator",
+            )
+        )
+
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+
+
 def test_periodic_resume_does_not_clear_needs_human_or_retry(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     run = registry._manager_create_workflow_run(

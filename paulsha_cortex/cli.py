@@ -40,7 +40,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|link|unlink|start|resume|auto|ship> ...
+usage: cortex work <show|link|unlink|start|resume|retry-build|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -48,7 +48,9 @@ work item commands:
   unlink    由 Manager 寫入 exclusion
   start     手動 claim 並建立 WorkflowRun
   resume    恢復 needs_human／blocked workflow
+  retry-build  以 exact Candidate CAS 重開最後一個 builder card
   auto      管理 cortex:auto-on-going issue label
+  review-attest  建立 exact-HEAD maintainer review evidence
   ship      執行 fail-closed delivery state machine
 
 run 'cortex work show --help' or coordinator mutation help for arguments.

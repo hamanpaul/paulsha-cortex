@@ -157,6 +157,13 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 - **WHEN**build terminal Candidate不是目前Candidate的descendant，或verify/review Candidate不完全等於凍結Candidate
 - **THEN**Manager MUST拒絕該evidence且MUST NOT推進workflow
 
+#### Scenario: Delivery preflight揭露Candidate缺陷後重開build
+- **GIVEN**ongoing WorkflowRun停在`needs_human` verify/review、無active Job、全部既有build card已passed、尚無ship card通過，且operator提供的`expected_candidate`完全等於目前Candidate
+- **WHEN**operator透過control queue明確執行`work retry-build`
+- **THEN**只有窄化的Manager registry recovery MAY把phase退回build、重開最後一張builder card、清除舊verified head與verify/review/delivery gate authority並增加build attempt
+- **AND**Manager MUST立刻建立fresh builder Job；新Candidate MUST等於或為舊Candidate的descendant，舊Job與evidence MUST保留供audit
+- **AND**caller-supplied path/hash/report或未知payload、stale Candidate、非`needs_human`、active Job或未完成build MUST fail-closed，periodic runner MUST NOT自行取得此recovery authority
+
 ### Requirement: Headless card prompt必須是bounded execution envelope
 每張headless card prompt MUST為versioned structured envelope，至少包含run/work/source revision、phase/card/persona、skill ref、task action、commit/test policy、resolved source material、declared outputs、candidate semantics與exact terminal JSON schema。Source material總量 MUST有上限；超限 MUST fail-closed。Manager已provision worktree時，`worktree-isolation` MUST明示不得建立第二個worktree。
 
