@@ -416,6 +416,10 @@ def dispatch_ready(
             "persona 契約為多行 prompt，經 tmux pane send-keys -l 會被換行打散。"
             "請以 --executor（copilot/claude/codex）走 headless 路徑派工。"
         )
+    if ready and persona == "builder":
+        commit_required_factory = getattr(launcher, "as_commit_required", None)
+        if callable(commit_required_factory):
+            launcher = commit_required_factory()
     runner = git_runner or _default_git_runner
     jobs: list[dict] = []
     errors: list[tuple[str, Exception]] = []

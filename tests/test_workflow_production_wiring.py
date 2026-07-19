@@ -729,9 +729,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     )
     calls: list[str] = []
     plan_launch_roots: list[Path] = []
+    commit_capability_requests: list[str] = []
 
     class WorkflowLauncher:
         def as_read_only(self):
+            return self
+
+        def as_commit_required(self):
+            commit_capability_requests.append("required")
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):
@@ -871,6 +876,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     run = registry.get_workflow_run(result["run_id"])
 
     assert calls == ["questioner", "secondary:anthropic", "integrator"]
+    assert commit_capability_requests == []
     assert plan_launch_roots and all(path != tmp_path for path in plan_launch_roots)
     assert run.current_phase == "plan"
     assert [ref.kind for ref in run.gate_refs] == ["brainstorm"]
@@ -921,6 +927,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         ))
         seen_phases.append(result["current_phase"])
     assert seen_phases == ["build", "build", "build", "verify", "review", "review", "review"]
+    assert commit_capability_requests == ["required", "required"]
     assert result["reason"] == "ship-validator-unavailable"
 
     fake_ship = build_request(

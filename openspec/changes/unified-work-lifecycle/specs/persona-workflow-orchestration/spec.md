@@ -79,7 +79,7 @@ Builder MUST在`feature/<issue>-<slug>` worktree執行deterministic Candidate ve
 - **THEN**Manager仍需按review gate選擇不同於Builder domain的reviewer step
 
 ### Requirement: Declared inputs必須形成hash-bound handoff
-Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kind/hash，把brainstorm新發布artifact原子併入WorkflowRun planning authority，並保存不可變發證source revision；PR refresh MAY更新run目前source revision但MUST NOT改寫發證revision。Legacy active run也MUST只由相同evidence reconcile，MUST NOT從mutable workspace猜測authority；`brainstorm_required=true`卻缺evidence MUST fail-closed。Manager接著MUST在launch前解析目前card與同phase既有card的declared input globs；每個glob MUST至少命中一個regular non-symlink UTF-8檔案。Planning artifact命中 MUST與WorkflowRun的planning authority ref/hash一致；builder worktree缺檔時 Manager MAY從該authority原子seed，但evidence/operator artifact drift、destination conflict或未授權的同glob替代檔 MUST fail-closed。Manager MUST把pattern/path/hash/authority/content locator保存為Job input snapshot，terminalize時 MUST重驗檔案hash；dispatch exception MUST恢復`needs_human` stop facet。
+Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kind/hash，把brainstorm新發布artifact原子併入WorkflowRun planning authority，並保存不可變發證source revision；PR refresh MAY更新run目前source revision但MUST NOT改寫發證revision。Legacy active run也MUST只由相同evidence reconcile，MUST NOT從mutable workspace猜測authority；`brainstorm_required=true`卻缺evidence MUST fail-closed。Manager接著MUST在launch前解析目前card與同phase既有card的declared input globs；每個glob MUST至少命中一個regular non-symlink UTF-8檔案。Planning artifact命中 MUST與WorkflowRun的planning authority ref/hash一致；builder worktree缺檔時 Manager MAY從該authority原子seed，但evidence/operator artifact drift、destination conflict或未授權的同glob替代檔 MUST fail-closed。Codex MUST使用`workspace-write`；workflow的`commit_policy=required`及legacy fanout／dispatch／retry-build的builder persona MUST取得明確commit capability，並只將Git解析且驗證的current-worktree gitdir、shared objects、current-branch ref/reflog parent directories以`--add-dir`開放。Launcher MUST清除inherited Git repository selectors，MUST NOT使用sandbox bypass或把Git write directories交給planner、verify或review。Symlink、detached HEAD、invalid或escape metadata MUST拒絕required-commit launch。Manager MUST把pattern/path/hash/authority/content locator保存為Job input snapshot，terminalize時 MUST重驗檔案hash；dispatch exception MUST恢復`needs_human` stop facet。
 
 #### Scenario: Legacy run缺brainstorm發布artifact authority
 - **WHEN**同一active run已保存canonical brainstorm evidence，但planning authority只含brainstorm前artifact
@@ -91,6 +91,11 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 - **WHEN**pending build card宣告accepted plan但獨立builder worktree尚無該檔
 - **THEN**Manager只從相同run的planning authority驗hash後原子seed
 - **THEN**Job、prompt與canonical evidence保存相同input snapshot
+
+#### Scenario: Linked worktree builder需要建立required commit
+- **WHEN**Codex builder的`.git`指向primary workspace外的linked-worktree metadata
+- **THEN**Manager只對`commit_policy=required` builder要求明確commit capability；launcher清除inherited Git repository selectors，只額外開放Git驗證出的current-worktree gitdir、shared objects、current-branch ref/reflog parent directories，並保留`workspace-write` sandbox
+- **THEN**planner、verify與review不取得這些Git directories；metadata不可信或required-commit worktree為detached HEAD時不得launch
 
 #### Scenario: Operator artifact在accept後漂移
 - **WHEN**operator checkout中的planning artifact hash不再等於run authority

@@ -3603,6 +3603,16 @@ def dispatch_workflow_card(
         if not callable(read_only_factory):
             raise ValueError("planner launcher lacks enforced read-only contract")
         launcher = read_only_factory()
+    effective_commit_policy = step.commit_policy or _LEGACY_CARD_EXECUTION.get(
+        step.card, (None, None, None, None)
+    )[2]
+    if effective_commit_policy == "required":
+        if step.persona != "builder":
+            raise ValueError("commit-required workflow card must use builder persona")
+        commit_required_factory = getattr(launcher, "as_commit_required", None)
+        if not callable(commit_required_factory):
+            raise ValueError("builder launcher lacks explicit commit-required capability")
+        launcher = commit_required_factory()
     builder_jobs = [
         job
         for job in registry.list_jobs()

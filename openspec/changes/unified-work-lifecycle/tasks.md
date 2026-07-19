@@ -45,6 +45,7 @@
 - [x] 4.2 更新README、usage/help snapshots、service install與registry/snapshot migration docs。
 - [x] 4.2a 統一interactive/service instance runtime discovery；installer保存`PSC_INSTANCE`，CLI control queue與Monitor client解析相同runtime roots/socket。
 - [x] 4.2b 將brainstorm發布artifact從canonical evidence原子併入planning authority並固化發證revision；legacy resume只允許同evidence reconcile，缺evidence或dispatch exception恢復`needs_human`。
+- [x] 4.2c 讓workflow的`commit_policy=required`及legacy fanout／dispatch／retry-build Codex builder在保留`workspace-write`下，透過明確commit capability只開放Git驗證出的current-worktree gitdir、shared objects、current-branch ref/reflog parent directories；清除inherited Git repository selectors，planner／verify／review不取得Git write directories，invalid metadata維持fail-closed。
 - [ ] 4.3 在`paulsha-cortex`以低風險docs-only issue跑auto-label canary，刻意缺accepted plan以觸發異質brainstorm。
 - [ ] 4.4 驗canary完整經brainstorm→build→ForeignReview→archive→preflight→typed maintainer current-HEAD review→merge commit→done；通過前不擴散auto label。
 - [ ] 4.5 使用official CLI archive `unified-work-lifecycle`；issue #12只勾實際涵蓋項目。

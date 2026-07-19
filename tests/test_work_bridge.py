@@ -616,6 +616,9 @@ identities:
         def as_read_only(self):
             return self
 
+        def as_commit_required(self):
+            return self
+
         def launch(self, *, slice_id, prompt, worktree, log_dir):
             contract = json.loads(prompt.split("Contract: ", 1)[1])
             job = registry.get_job(slice_id)

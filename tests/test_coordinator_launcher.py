@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator.launcher import (
@@ -91,6 +93,191 @@ class ArgvTests(unittest.TestCase):
 
         self.assertNotIn("--skip-git-repo-check", argv)
 
+    def test_codex_builder_grants_only_linked_worktree_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/launcher-test", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            builder = build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                commit_required=True,
+            )
+            planner = build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                read_only=True,
+            )
+
+            self.assertEqual(builder[builder.index("--sandbox") + 1], "workspace-write")
+            add_dirs = [
+                builder[index + 1]
+                for index, value in enumerate(builder)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(
+                add_dirs,
+                [
+                    str((repo / ".git" / "worktrees" / "linked").resolve()),
+                    str((repo / ".git" / "objects").resolve()),
+                    str((repo / ".git" / "refs" / "heads" / "feature").resolve()),
+                    str((repo / ".git" / "logs" / "refs" / "heads" / "feature").resolve()),
+                ],
+            )
+            self.assertNotIn("--add-dir", planner)
+
+    def test_codex_builder_rejects_detached_linked_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(linked)],
+                check=True,
+            )
+
+            reviewer = build_codex_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+            )
+            self.assertNotIn("--add-dir", reviewer)
+
+            with self.assertRaisesRegex(ValueError, "gitdir escapes"):
+                build_codex_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir=str(root / "logs"),
+                    worktree=str(linked),
+                    commit_required=True,
+                )
+
+    def test_codex_builder_ignores_inherited_git_repository_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            decoy = root / "decoy"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "fixture"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "Launcher Test",
+                    "GIT_AUTHOR_EMAIL": "launcher@example.invalid",
+                    "GIT_COMMITTER_NAME": "Launcher Test",
+                    "GIT_COMMITTER_EMAIL": "launcher@example.invalid",
+                },
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/scope-test", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+            subprocess.run(["git", "init", "-q", str(decoy)], check=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(decoy / ".git"),
+                    "GIT_WORK_TREE": str(linked),
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.worktree",
+                    "GIT_CONFIG_VALUE_0": str(linked),
+                },
+                clear=False,
+            ):
+                argv = build_codex_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir=str(root / "logs"),
+                    worktree=str(linked),
+                    commit_required=True,
+                )
+
+            add_dirs = [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(add_dirs[0], str(repo / ".git" / "worktrees" / "linked"))
+            self.assertNotIn(str(decoy / ".git"), add_dirs)
+
+    def test_codex_builder_rejects_symlink_git_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            metadata = root / "metadata"
+            metadata.mkdir()
+            (root / ".git").symlink_to(metadata, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                build_codex_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir=str(root / "logs"),
+                    worktree=str(root),
+                    commit_required=True,
+                )
+
+    def test_codex_commit_required_rejects_sandbox_bypass(self) -> None:
+        with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+            build_codex_argv(
+                prompt="P", slice_id="s", log_dir="/lg",
+                allow_unsafe=True, commit_required=True,
+            )
+
+    def test_subprocess_launcher_commit_capability_is_explicit(self) -> None:
+        base = SubprocessLauncher("codex")
+        builder = base.as_commit_required()
+
+        self.assertFalse(base._commit_required)
+        self.assertTrue(builder._commit_required)
+        self.assertFalse(builder._allow_unsafe)
+
     def test_codex_argv_allow_unsafe_adds_sandbox_bypass(self) -> None:
         # 明確 opt-in allow_unsafe=True 才加入 sandbox bypass flag
         argv = build_codex_argv(prompt="P", slice_id="s", log_dir="/lg", allow_unsafe=True)
@@ -130,6 +317,80 @@ class ArgvTests(unittest.TestCase):
         env = calls[0]["env"]
         self.assertIn("PSC_REPO_ROOT", env)
         self.assertTrue(env["PSC_REPO_ROOT"])
+
+    def test_launch_removes_inherited_git_repository_selection_env(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 223
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"env": env})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": "/tmp/decoy.git",
+                    "GIT_COMMON_DIR": "/tmp/decoy-common",
+                    "GIT_WORK_TREE": "/tmp/decoy-worktree",
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.worktree",
+                    "GIT_CONFIG_VALUE_0": "/tmp/decoy-worktree",
+                },
+                clear=False,
+            ):
+                SubprocessLauncher("copilot").launch(
+                    slice_id="s", prompt="P", worktree=d, log_dir=str(Path(d) / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        env = calls[0]["env"]
+        for key in (
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+        ):
+            self.assertNotIn(key, env)
+
+    def test_launch_resolves_worktree_before_argv_and_popen(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 224
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv, "cwd": cwd})
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                actual = root / "actual"
+                alias = root / "alias"
+                actual.mkdir()
+                alias.symlink_to(actual, target_is_directory=True)
+                SubprocessLauncher("codex").launch(
+                    slice_id="s",
+                    prompt="P",
+                    worktree=str(alias),
+                    log_dir=str(root / "lg"),
+                )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        self.assertEqual(calls[0]["cwd"], str(actual.resolve()))
+        self.assertIn(f"-C {actual.resolve()}", calls[0]["argv"][2])
+        self.assertNotIn(str(alias), calls[0]["argv"][2])
 
     def test_subprocess_launcher_codex_default_no_sandbox_bypass(self) -> None:
         import shlex
