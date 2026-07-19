@@ -91,6 +91,8 @@ Push/PR後等待checks terminal-green，並要求恰好一種typed current-HEAD 
 
 Merge前重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，若任一revision改變就重跑相應gate。只用`gh pr merge --merge`，不使用`--auto`。
 
+V1 target cardinality 要求current authority恰為一張PR、一個active OpenSpec與一個Todo。若在任何delivery binding建立前因缺少或多出target而停在`needs_human`，operator可先修正repo-local confirmed correlation再explicit resume；Manager重綁同一run的journal後只清除這個特定stop。已建立binding或其他stop reason不取得此恢復權限。
+
 ### 9. Done在merge後以remote snapshot重證
 
 Merge後fetch default branch，驗merge commit ancestry、mapped issue closed、active OpenSpec消失、archive存在、Todo complete，再寫versioned CompletionRecord。Record綁定work ID、workflow/run/step IDs、source revisions、PR/head/merge SHA、issue states、archive tree、Todo revisions與gate evidence hashes。

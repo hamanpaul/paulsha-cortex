@@ -25,4 +25,5 @@ work_item: terminal-lifecycle-canary
 
 ## Impact
 
-只影響 `docs/unified-work-lifecycle.md`、本 OpenSpec change 與 issue #31。
+只影響 `.cortex/work-items.yaml`、`docs/unified-work-lifecycle.md`、
+`docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md`、本 OpenSpec change 與 issue #31。

@@ -1574,6 +1574,29 @@ def _ship_action(
             "action": "needs_human",
             "reason": "multiple-delivery-targets-unsupported",
         }
+    ship = active.get("ship")
+    if ship is not None and not isinstance(ship, dict):
+        raise ValueError("ship state malformed")
+    if (
+        isinstance(ship, dict)
+        and ship.get("phase") == "needs_human"
+        and ship.get("reason") == "multiple-delivery-targets-unsupported"
+        and active.get("delivery_binding") is None
+    ):
+        # This stop is established before any delivery binding or external
+        # mutation.  Once operator-owned correlation resolves to the one
+        # PR/OpenSpec/Todo tuple required by v1, an explicit resume may safely
+        # re-arm the same WorkflowRun instead of requiring registry surgery.
+        active.pop("ship")
+        _save_runs(state_path, state)
+        canonical_run = workflow_registry._manager_update_workflow_run(
+            canonical_run.run_id,
+            facets=tuple(
+                facet for facet in canonical_run.facets if facet != "needs_human"
+            ),
+            gate_status="running",
+        )
+        ship = None
     binding = _ship_binding(args, authority)
     pr_number = binding["pr_number"]
     change = binding["change"]
@@ -1588,9 +1611,6 @@ def _ship_action(
         _save_runs(state_path, state)
     elif persisted_binding != binding:
         raise RuntimeError("ship delivery binding differs from persisted PR/OpenSpec/Todo refs")
-    ship = active.get("ship")
-    if ship is not None and not isinstance(ship, dict):
-        raise ValueError("ship state malformed")
     github = GitHubDeliveryClient(runner=runner)
     orchestrator = ShipOrchestrator(github=github, now=now)
 
