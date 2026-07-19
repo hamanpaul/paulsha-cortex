@@ -88,10 +88,15 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("--skip-git-repo-check", codex)
 
     def test_reviewer_read_only_argv_allows_inspection_but_never_edit_permissions(self) -> None:
-        claude = build_claude_argv(
-            prompt="P", slice_id="s", log_dir="/lg",
-            worktree="/wt/reviewer", review_only=True,
-        )
+        with mock.patch.object(
+            launcher_module,
+            "_srt_runtime_root",
+            return_value=Path("/tools/sandbox-runtime"),
+        ):
+            claude = build_claude_argv(
+                prompt="P", slice_id="s", log_dir="/lg",
+                worktree="/wt/reviewer", review_only=True,
+            )
         codex = build_codex_argv(
             prompt="P", slice_id="s", log_dir="/lg", review_only=True
         )
@@ -115,16 +120,20 @@ class ArgvTests(unittest.TestCase):
             settings["sandbox"]["filesystem"]["allowRead"][0],
             "/wt/reviewer/candidate",
         )
+        self.assertIn(
+            "/tools/sandbox-runtime",
+            settings["sandbox"]["filesystem"]["allowRead"],
+        )
         self.assertEqual(
             settings["sandbox"]["filesystem"]["denyRead"],
-            [str(Path.home().resolve()), "/run/user", "/run/docker.sock", "/var/run/docker.sock"],
+            [str(Path.home().resolve()), "/run/user", "/run/docker.sock"],
         )
         protected_files = {
             row["path"] for row in settings["sandbox"]["credentials"]["files"]
         }
         self.assertIn("/run/user", protected_files)
         self.assertIn("/run/docker.sock", protected_files)
-        self.assertIn("/var/run/docker.sock", protected_files)
+        self.assertNotIn("/var/run/docker.sock", protected_files)
         self.assertIn("--strict-mcp-config", claude)
         self.assertEqual(
             claude[claude.index("--json-schema") + 1], '{"type":"object"}'
