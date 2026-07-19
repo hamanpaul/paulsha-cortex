@@ -82,8 +82,9 @@ class DeliveryFacts:
 class DeliveryPolicy:
     expected_head: str
     required_closing_issues: tuple[int, ...]
-    copilot_review_id: int
-    copilot_requested_at_epoch: float
+    copilot_review_id: int | None = None
+    copilot_requested_at_epoch: float | None = None
+    review_kind: str = "copilot"
 
 
 @dataclass(frozen=True)
@@ -107,20 +108,27 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
     if not facts.checks or any(not check.terminal_green for check in facts.checks):
         reasons.append("checks-not-terminal-green")
 
-    current_reviews = tuple(
-        review
-        for review in facts.copilot_reviews
-        if review.commit_id == policy.expected_head
-        and review.review_id == policy.copilot_review_id
-        and review.author == COPILOT_REVIEWER_LOGIN
-        and review.submitted_at_epoch >= policy.copilot_requested_at_epoch
-    )
-    if not current_reviews:
-        reasons.append("copilot-current-head-review-missing")
-    elif any(review.is_error for review in current_reviews):
-        reasons.append("copilot-error-review")
-    elif any(review.state.upper() not in {"COMMENTED", "APPROVED"} for review in current_reviews):
-        reasons.append("copilot-review-state-invalid")
+    if policy.review_kind == "copilot":
+        if policy.copilot_review_id is None or policy.copilot_requested_at_epoch is None:
+            reasons.append("copilot-review-policy-invalid")
+            current_reviews = ()
+        else:
+            current_reviews = tuple(
+                review
+                for review in facts.copilot_reviews
+                if review.commit_id == policy.expected_head
+                and review.review_id == policy.copilot_review_id
+                and review.author == COPILOT_REVIEWER_LOGIN
+                and review.submitted_at_epoch >= policy.copilot_requested_at_epoch
+            )
+        if not current_reviews:
+            reasons.append("copilot-current-head-review-missing")
+        elif any(review.is_error for review in current_reviews):
+            reasons.append("copilot-error-review")
+        elif any(review.state.upper() not in {"COMMENTED", "APPROVED"} for review in current_reviews):
+            reasons.append("copilot-review-state-invalid")
+    elif policy.review_kind != "maintainer-review":
+        reasons.append("delivery-review-policy-invalid")
 
     if any(thread.blocks_merge for thread in facts.review_threads):
         reasons.append("review-thread-open")

@@ -79,6 +79,10 @@ class WorkflowStep:
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     gate_result: str = "pending"
+    skill_ref: str | None = None
+    action: str | None = None
+    commit_policy: str | None = None
+    test_policy: str | None = None
 
     def __post_init__(self) -> None:
         if self.phase not in WORKFLOW_PHASES:
@@ -94,6 +98,18 @@ class WorkflowStep:
                 raise ValueError(f"workflow step {field} 必須為字串tuple")
         if self.gate_result not in STEP_GATE_RESULTS:
             raise ValueError(f"workflow step gate_result 非法: {self.gate_result!r}")
+        for field, value in (
+            ("skill_ref", self.skill_ref),
+            ("action", self.action),
+            ("commit_policy", self.commit_policy),
+            ("test_policy", self.test_policy),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"workflow step {field} 必須為null或非空字串")
+        if self.commit_policy not in {None, "forbidden", "optional", "required"}:
+            raise ValueError("workflow step commit_policy 非法")
+        if self.test_policy not in {None, "none", "red-required", "focused", "full"}:
+            raise ValueError("workflow step test_policy 非法")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +122,10 @@ class WorkflowStep:
             "inputs": list(self.inputs),
             "outputs": list(self.outputs),
             "gate_result": self.gate_result,
+            "skill_ref": self.skill_ref,
+            "action": self.action,
+            "commit_policy": self.commit_policy,
+            "test_policy": self.test_policy,
         }
 
     @classmethod
@@ -139,6 +159,10 @@ class WorkflowStep:
             inputs=tuple(inputs),
             outputs=tuple(outputs),
             gate_result=payload["gate_result"],
+            skill_ref=payload.get("skill_ref"),
+            action=payload.get("action"),
+            commit_policy=payload.get("commit_policy"),
+            test_policy=payload.get("test_policy"),
         )
 
 
@@ -151,7 +175,7 @@ class GateEvidenceRef:
     sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in {"brainstorm", "foreign-review", "copilot"}:
+        if self.kind not in {"brainstorm", "foreign-review", "copilot", "maintainer-review"}:
             raise ValueError(f"workflow gate evidence kind 非法: {self.kind!r}")
         if not isinstance(self.ref, str) or not self.ref.strip():
             raise ValueError("workflow gate evidence ref 必須為非空字串")
@@ -379,9 +403,11 @@ class WorkflowRun:
         if self.current_phase == "ship":
             if self.gate_status != "passed":
                 raise ValueError("workflow ship gate_status 必須為passed")
-            for required_kind in ("foreign-review", "copilot"):
-                if required_kind not in gate_kinds:
-                    raise ValueError(f"workflow ship 缺少 {required_kind} gate evidence")
+            if "foreign-review" not in gate_kinds:
+                raise ValueError("workflow ship 缺少 foreign-review gate evidence")
+            delivery_reviews = {"copilot", "maintainer-review"} & set(gate_kinds)
+            if len(delivery_reviews) != 1:
+                raise ValueError("workflow ship 必須恰有一種 current-HEAD delivery review gate evidence")
             if self.candidate_head is None or self.verified_head != self.candidate_head:
                 raise ValueError("workflow ship 必須綁定已驗證的exact candidate HEAD")
             for required_phase in ("verify", "review", "ship"):

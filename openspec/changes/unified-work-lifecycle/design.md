@@ -87,7 +87,7 @@ Manager先以官方`openspec archive -y <change>`產生archive diff，確認task
 
 快速`python3 -m policy_check --repo .`後執行`PSC_PREFLIGHT_CMD`；初次帶draft metadata，既有PR修正帶`--pr N`。Preflight須涵蓋pytest、`openspec validate --all`與PR-context policy。`--skip-tests`只接受同tree hash、fresh、full-suite evidence。
 
-Push/PR後等待checks terminal-green，request `@copilot`並驗review `commit_id == HEAD`、非error、threads resolved/outdated。每次push建立新review epoch並重新request。Finding由Builder修正或Reviewer以證據判誤報；最多兩輪、每HEAD 15分鐘。超時或第三輪finding轉needs_human。
+Push/PR後等待checks terminal-green，並要求恰好一種typed current-HEAD delivery review。Copilot路徑request `@copilot`並驗review `commit_id == HEAD`、非error；maintainer路徑由Manager重讀PR HEAD後寫immutable attestation。兩者都要求threads resolved/outdated且不能替代ForeignReview。每次push使舊review authority失效；Copilot finding最多兩輪、每HEAD 15分鐘，超時或第三輪轉needs_human。
 
 Merge前重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，若任一revision改變就重跑相應gate。只用`gh pr merge --merge`，不使用`--auto`。
 
@@ -96,6 +96,22 @@ Merge前重新讀HEAD、mergeability、checks、threads、closing issues與archi
 Merge後fetch default branch，驗merge commit ancestry、mapped issue closed、active OpenSpec消失、archive存在、Todo complete，再寫versioned CompletionRecord。Record綁定work ID、workflow/run/step IDs、source revisions、PR/head/merge SHA、issue states、archive tree、Todo revisions與gate evidence hashes。
 
 Monitor只在GitHub/provider fresh且Record驗證通過時投影done；record缺失、stale、source contradiction或provider degraded皆不升done。
+
+### 10. Planning handoff以input snapshot跨worktree
+
+WorkflowStep額外保存`skill_ref`與structured action/commit/test policy。Manager在dispatch前把目前card與同phase較早card的inputs合併，逐glob解析regular non-symlink檔案並保存pattern/path/hash/authority/content locator。若builder worktree缺accepted planning artifact，只能從WorkflowRun planning authority驗hash後原子seed；operator source drift、destination conflict、同glob未授權替代檔或128 KiB prompt bound超限皆停止在job建立前。
+
+Prompt固定為`workflow-card-prompt/v1`，包含resolved source content與terminal schema。Active v1 run可繼承同phase input contract以恢復pending cards，但既有passed card不回填新證據、不偽稱通過新gate。Terminalize再次驗snapshot hash，canonical job evidence保存相同snapshot。
+
+### 11. `needs_human`是operator resume boundary
+
+Dispatcher仍負責把dead PID/no sentinel fail-closed成failed job；Manager將run設`needs_human`後，periodic runner只回`operator-resume-required`，不得清facet或重派。只有control queue收到explicit work/workflow resume才清facet、保留舊failed job並重試相同run/card。
+
+### 12. Current-HEAD delivery review是typed union
+
+ForeignReview仍是獨立必備gate。其後delivery review authority恰為`copilot`或`maintainer-review`之一。`review-attest`只經Manager queue建立：先重讀authenticated PR HEAD，再寫repo/work/run/authority digest/PR/candidate/actor/verdict綁定的immutable evidence。Ship重驗run gate ref/hash與current HEAD，GitHub checks/threads/mergeability/archive/closing refs完全沿用。
+
+既有Copilot authorization維持v1 replay；maintainer路徑使用merge authorization v2，保存實際review kind/ref/hash。Manager不得把maintainer evidence寫成Copilot kind。Interactive runtime另以`PSC_INSTANCE`選取installer bootstrap env，讓CLI與service共享instance-scoped run root；invalid env fail-closed。
 
 ## Failure handling
 

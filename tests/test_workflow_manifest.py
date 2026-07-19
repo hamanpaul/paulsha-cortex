@@ -44,6 +44,10 @@ def test_workflow_step_serializes_all_persisted_fields() -> None:
         "inputs": ("openspec/changes/demo/proposal.md",),
         "outputs": ("docs/superpowers/plans/demo.md",),
         "gate_result": "pending",
+        "skill_ref": None,
+        "action": None,
+        "commit_policy": None,
+        "test_policy": None,
     }
 
 
@@ -70,6 +74,21 @@ def test_feature_oneshot_emits_card_bound_personas_not_global_builder() -> None:
     ]
     assert {step.persona for step in steps} == {"planner", "builder", "reviewer", "manager"}
     assert all(step.gate_result == "pending" for step in steps)
+
+
+def test_manifest_roundtrips_card_execution_contract() -> None:
+    cards, combo = _feature_oneshot()
+    result = compile_combo(combo, cards, "manifest demo", change="demo")
+    manifest = WorkflowManifest.from_dict(result.workflow_manifest.to_dict())
+    red = next(step for step in manifest.steps if step.card == "tdd-red")
+    build = next(step for step in manifest.steps if step.card == "subagent-build")
+
+    assert red.skill_ref == "superpowers:test-driven-development"
+    assert red.commit_policy == "required"
+    assert red.test_policy == "red-required"
+    assert red.inputs == ("docs/superpowers/plans/*manifest-demo*.md",)
+    assert build.action and "accepted plan" in build.action
+    assert build.inputs == red.inputs
 
 
 def test_manifest_resolves_inputs_outputs_and_preserves_slice_frontmatter() -> None:

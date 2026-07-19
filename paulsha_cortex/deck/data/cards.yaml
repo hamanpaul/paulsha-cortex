@@ -56,6 +56,10 @@ cards:
     requires: ["docs/superpowers/plans/*<task-slug>*.md"]
     produces: []          # worktree 由 coordinator 派工時自建（feature/<slice_id>）
     persona_binding: builder
+    execution:
+      action: "確認 Manager provision 的 builder worktree，並依 accepted plan 回報隔離狀態；不得另建第二個 worktree"
+      commit_policy: forbidden
+      test_policy: none
 
   - id: tdd-red
     kind: skill
@@ -64,9 +68,13 @@ cards:
     skill_ref: "superpowers:test-driven-development"
     phase: build
     slice_group: build
-    requires: []
+    requires: ["docs/superpowers/plans/*<task-slug>*.md"]
     produces: []          # RED 證據在 build session log／commits，Phase A 不機驗
     persona_binding: builder
+    execution:
+      action: "以 accepted plan 為唯一需求來源，新增可重現缺口的 RED regression test"
+      commit_policy: required
+      test_policy: red-required
 
   - id: subagent-build
     kind: skill
@@ -75,9 +83,13 @@ cards:
     skill_ref: "superpowers:subagent-driven-development"
     phase: build
     slice_group: build
-    requires: []
+    requires: ["docs/superpowers/plans/*<task-slug>*.md"]
     produces: []          # 完成偵測 = manager exit sentinel + branch commits
     persona_binding: builder
+    execution:
+      action: "依 accepted plan 以最小 diff 實作，讓 RED test 轉綠並提交候選 HEAD"
+      commit_policy: required
+      test_policy: focused
 
   - id: code-review
     kind: skill

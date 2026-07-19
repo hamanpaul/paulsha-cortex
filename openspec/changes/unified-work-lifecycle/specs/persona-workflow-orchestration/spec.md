@@ -32,8 +32,8 @@ Claim key MUST雜湊該work item的canonical semantic authority與provider/sourc
 - **THEN** Manager重用既有run/claim metadata並繼續
 - **THEN**不自動建立第二張issue
 
-### Requirement: Workflow manifest必須保留每步persona binding
-Deck compiler MUST把每張card的`persona_binding`寫入workflow manifest；Manager MUST依step使用planner、builder、reviewer或manager persona，不得以global builder覆蓋。Default combo MUST為`feature-oneshot`。每個WorkflowStep MUST保存phase、persona、card、executor/model/domain、inputs、outputs與gate result。
+### Requirement: Workflow manifest必須保留每步persona binding與execution contract
+Deck compiler MUST把每張card的`persona_binding`、`skill_ref`、task-specific action、commit policy與test policy寫入workflow manifest；Manager MUST依step使用planner、builder、reviewer或manager persona，不得以global builder覆蓋。Default combo MUST為`feature-oneshot`。每個WorkflowStep MUST保存phase、persona、card、executor/model/domain、inputs、outputs、execution contract與gate result。
 
 #### Scenario: Combo含不同persona cards
 - **WHEN** Deck compile feature-oneshot
@@ -71,9 +71,38 @@ Manager MUST在每張card dispatch時持久化output目錄baseline。Verify與re
 - **THEN**Manager不得選agy執行brainstorm
 
 ### Requirement: Brainstorm peer與Foreign Reviewer必須是獨立gate
-Builder MUST在`feature/<issue>-<slug>` worktree執行deterministic Candidate verification。Foreign Reviewer MUST使用不同於Builder的independence domain並在detached exact Candidate HEAD審查。Brainstorm peer、ForeignReview與Copilot review MUST保存不同gate/evidence refs，任一 MUST NOT取代另一個。
+Builder MUST在`feature/<issue>-<slug>` worktree執行deterministic Candidate verification。Foreign Reviewer MUST使用不同於Builder的independence domain並在detached exact Candidate HEAD審查。Brainstorm peer、ForeignReview與current-HEAD delivery review MUST保存不同gate/evidence refs，任一 MUST NOT取代另一個；delivery review MUST明確標為`copilot`或`maintainer-review`，不得互相偽裝。
 
 #### Scenario: Brainstorm peer也是可用reviewer
 - **WHEN**同一model曾產生planning evidence
 - **THEN**該evidence不能滿足ForeignReview
 - **THEN**Manager仍需按review gate選擇不同於Builder domain的reviewer step
+
+### Requirement: Declared inputs必須形成hash-bound handoff
+Manager MUST在launch前解析目前card與同phase既有card的declared input globs；每個glob MUST至少命中一個regular non-symlink UTF-8檔案。Planning artifact命中 MUST與WorkflowRun的planning authority ref/hash一致；builder worktree缺檔時 Manager MAY從該authority原子seed，但mutable operator artifact drift、destination conflict或未授權的同glob替代檔 MUST fail-closed。Manager MUST把pattern/path/hash/authority/content locator保存為Job input snapshot，terminalize時 MUST重驗檔案hash。
+
+#### Scenario: Builder worktree缺accepted plan
+- **WHEN**pending build card宣告accepted plan但獨立builder worktree尚無該檔
+- **THEN**Manager只從相同run的planning authority驗hash後原子seed
+- **THEN**Job、prompt與canonical evidence保存相同input snapshot
+
+#### Scenario: Operator artifact在accept後漂移
+- **WHEN**operator checkout中的planning artifact hash不再等於run authority
+- **THEN**Manager在建立Job或launch前拒絕dispatch
+- **THEN**不得以其他同glob檔案補位
+
+### Requirement: Headless card prompt必須是bounded execution envelope
+每張headless card prompt MUST為versioned structured envelope，至少包含run/work/source revision、phase/card/persona、skill ref、task action、commit/test policy、resolved source material、declared outputs、candidate semantics與exact terminal JSON schema。Source material總量 MUST有上限；超限 MUST fail-closed。Manager已provision worktree時，`worktree-isolation` MUST明示不得建立第二個worktree。
+
+#### Scenario: Legacy pending build card沒有直接inputs
+- **WHEN**active v1 manifest的`tdd-red`或`subagent-build`沒有直接inputs，但同phase較早card宣告accepted plan
+- **THEN**Manager繼承同phase input contract並建立snapshot
+- **THEN**不得把舊passed card靜默改寫成新gate已通過
+
+### Requirement: Interrupted headless job只能由operator恢復
+Dead PID且沒有exit sentinel的dispatched job MUST先由Dispatcher保存為failed並將WorkflowRun設為`needs_human`。Periodic runner MUST只reconcile，MUST NOT清除`needs_human`或自動重派；只有經control queue的explicit `work resume`或`workflow resume` MAY清除facet並重試同run/card，舊failed job MUST保留。
+
+#### Scenario: Periodic runner連跑兩輪
+- **WHEN**第一輪發現dead PID/no sentinel並將run設為needs_human
+- **THEN**第二輪回`operator-resume-required`
+- **THEN**不得建立新job

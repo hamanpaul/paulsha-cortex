@@ -359,7 +359,7 @@ class JobRegistry:
         for field in (
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
-            "workflow_phase", "workflow_repo_root", "source_revision",
+            "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash",
         ):
             value = job.get(field)
@@ -401,6 +401,30 @@ class JobRegistry:
                 raise ValueError(
                     f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}"
                 )
+        input_snapshot = job.get("workflow_input_snapshot", [])
+        if not isinstance(input_snapshot, list):
+            raise ValueError(
+                f"coordinator 狀態檔 workflow_input_snapshot 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        snapshot_keys: set[tuple[str, str]] = set()
+        for row in input_snapshot:
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"pattern", "path", "sha256", "authority", "content_ref"}
+                or any(not isinstance(row.get(key), str) or not row[key] for key in row)
+                or Path(row["path"]).is_absolute()
+                or ".." in Path(row["path"]).parts
+                or Path(row["path"]).as_posix() != row["path"]
+                or len(row["sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in row["sha256"])
+                or row["authority"] not in {"planning-authority", "worktree"}
+                or not Path(row["content_ref"]).is_absolute()
+                or (row["pattern"], row["path"]) in snapshot_keys
+            ):
+                raise ValueError(
+                    f"coordinator 狀態檔 workflow_input_snapshot 格式錯誤（fail-closed）: {self._state_path}"
+                )
+            snapshot_keys.add((row["pattern"], row["path"]))
         output_baseline = job.get("workflow_output_baseline", [])
         if not isinstance(output_baseline, list):
             raise ValueError(
@@ -573,7 +597,9 @@ class JobRegistry:
         workflow_card: str | None = None,
         workflow_phase: str | None = None,
         workflow_repo_root: str | None = None,
+        workflow_input_root: str | None = None,
         workflow_inputs: tuple[str, ...] = (),
+        workflow_input_snapshot: tuple[dict[str, str], ...] = (),
         workflow_outputs: tuple[str, ...] = (),
         source_revision: str | None = None,
         workflow_sandbox_hash: str | None = None,
@@ -616,7 +642,9 @@ class JobRegistry:
             "workflow_card": workflow_card,
             "workflow_phase": workflow_phase,
             "workflow_repo_root": workflow_repo_root,
+            "workflow_input_root": workflow_input_root,
             "workflow_inputs": list(workflow_inputs),
+            "workflow_input_snapshot": [dict(row) for row in workflow_input_snapshot],
             "workflow_outputs": list(workflow_outputs),
             "source_revision": source_revision,
             "workflow_sandbox_hash": workflow_sandbox_hash,

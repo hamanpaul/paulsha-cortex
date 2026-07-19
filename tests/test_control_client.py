@@ -117,6 +117,33 @@ def test_submit_work_action_writes_only_a_control_request(monkeypatch, tmp_path)
     }
 
 
+def test_submit_work_action_accepts_review_attest_through_control_contract(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    agents = tmp_path / "selected-agents"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "beta-manager.env").write_text(
+        f"PSC_AGENTS_ROOT={agents}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PSC_INSTANCE", "beta")
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+    monkeypatch.delenv("PSC_CONTROL_ROOT", raising=False)
+
+    req_id = client.submit_work_action(
+        action="review-attest",
+        repo="acme/demo",
+        work_id="demo",
+        args={"actor": "maintainer", "verdict": "approved", "summary": "reviewed"},
+        requested_by="operator",
+    )
+
+    payload = contract.read_json(agents / "control" / "requests" / f"{req_id}.json")
+    assert payload is not None
+    assert payload["args"]["action"] == "review-attest"
+
+
 def test_read_status_degrades_on_missing_or_stale_file(monkeypatch, tmp_path):
     from paulsha_cortex.control import client
 

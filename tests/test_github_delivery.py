@@ -54,6 +54,23 @@ def test_delivery_gate_accepts_exact_current_head_terminal_green() -> None:
     assert result.reasons == ()
 
 
+def test_delivery_gate_accepts_typed_maintainer_review_without_copilot() -> None:
+    facts = replace(_facts(), copilot_reviews=())
+    policy = DeliveryPolicy(
+        expected_head=HEAD,
+        required_closing_issues=(14,),
+        review_kind="maintainer-review",
+    )
+
+    assert evaluate_delivery_gate(facts=facts, policy=policy).allowed
+    blocked = evaluate_delivery_gate(
+        facts=replace(facts, review_threads=(ReviewThread("open", False, False),)),
+        policy=policy,
+    )
+    assert not blocked.allowed
+    assert blocked.reasons == ("review-thread-open",)
+
+
 @pytest.mark.parametrize(
     ("facts", "reason"),
     (

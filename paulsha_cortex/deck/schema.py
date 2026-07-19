@@ -36,8 +36,10 @@ _CARD_KEYS = frozenset(
         "persona_binding",
         "provider_binding",
         "slice_group",
+        "execution",
     }
 )
+_EXECUTION_KEYS = frozenset({"action", "commit_policy", "test_policy"})
 _COMBO_FILE_KEYS = frozenset({"combo"})
 _COMBO_KEYS = frozenset({"id", "task_type", "cards", "gate_spine"})
 _COMBO_ENTRY_KEYS = frozenset({"ref", "depends_on"})
@@ -66,6 +68,9 @@ class Card:
     persona_binding: str | None = None
     provider_binding: str | None = None
     slice_group: str | None = None
+    action: str | None = None
+    commit_policy: str | None = None
+    test_policy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +189,24 @@ def load_cards(path: str | Path) -> dict[str, Card]:
         _check_placeholders(cid, requires + produces, rec_errors)
         persona_binding = _optional_str(rec.get("persona_binding"), cid, "persona_binding", rec_errors)
         provider_binding = _optional_str(rec.get("provider_binding"), cid, "provider_binding", rec_errors)
+        execution = rec.get("execution")
+        action = commit_policy = test_policy = None
+        if execution is not None:
+            if not isinstance(execution, Mapping):
+                rec_errors.append(f"{cid}: execution 必須為mapping")
+            else:
+                _check_unknown_keys(f"{cid}.execution", execution, _EXECUTION_KEYS, rec_errors)
+                action = _optional_str(execution.get("action"), cid, "execution.action", rec_errors)
+                commit_policy = _optional_str(
+                    execution.get("commit_policy"), cid, "execution.commit_policy", rec_errors
+                )
+                test_policy = _optional_str(
+                    execution.get("test_policy"), cid, "execution.test_policy", rec_errors
+                )
+                if commit_policy not in {None, "forbidden", "optional", "required"}:
+                    rec_errors.append(f"{cid}: execution.commit_policy 非法值 {commit_policy!r}")
+                if test_policy not in {None, "none", "red-required", "focused", "full"}:
+                    rec_errors.append(f"{cid}: execution.test_policy 非法值 {test_policy!r}")
         slice_group = rec.get("slice_group")
         if slice_group is not None and (not isinstance(slice_group, str) or not slice_group):
             rec_errors.append(f"{cid}: slice_group 必須為非空字串")
@@ -202,6 +225,9 @@ def load_cards(path: str | Path) -> dict[str, Card]:
             persona_binding=persona_binding,
             provider_binding=provider_binding,
             slice_group=slice_group,
+            action=action,
+            commit_policy=commit_policy,
+            test_policy=test_policy,
         )
     if errors:
         raise DeckSchemaError(f"cards 驗證失敗: {source}: " + "; ".join(errors))
