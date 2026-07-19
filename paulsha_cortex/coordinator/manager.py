@@ -2189,18 +2189,25 @@ def _write_workflow_input_content(
     encoded = (
         json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
-    path = coordinator_root.resolve() / "evidence" / "workflow-inputs" / f"{digest}.json"
+    locator_digest = hashlib.sha256(encoded).hexdigest()
+    path = coordinator_root.resolve() / "evidence" / "workflow-inputs" / f"{locator_digest}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        if path.is_symlink() or path.read_bytes() != encoded:
+        if path.is_symlink() or path.read_bytes() != encoded or path.stat().st_mode & 0o222:
             raise ValueError("workflow input content-address conflict")
     else:
         with os.fdopen(fd, "wb") as stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(path, 0o444)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     return str(path)
 
 
@@ -2223,9 +2230,10 @@ def _workflow_input_snapshot(
         if not authority_refs:
             raise ValueError(f"workflow declared input missing: {pattern}")
         for ref in authority_refs:
-            source = operator_root / ref
-            if source.is_symlink() or not source.is_file():
+            source_matches = _safe_input_matches(operator_root, ref)
+            if len(source_matches) != 1:
                 raise ValueError("workflow planning input missing")
+            source = source_matches[0]
             data = source.read_bytes()
             if hashlib.sha256(data).hexdigest() != authority[ref].baseline_sha256:
                 raise ValueError("workflow planning input drift")
@@ -2233,14 +2241,23 @@ def _workflow_input_snapshot(
 
     for ref, data in seeds.items():
         destination = root / ref
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        parent = root
+        for part in Path(ref).parent.parts:
+            child = parent / part
+            if child.is_symlink():
+                raise ValueError("workflow input seed parent symlink rejected")
+            child.mkdir(exist_ok=True)
+            if child.is_symlink() or not child.is_dir():
+                raise ValueError("workflow input seed parent invalid")
+            child.resolve().relative_to(root)
+            parent = child
         if destination.is_symlink():
             raise ValueError("workflow input seed symlink rejected")
         if destination.exists():
             if not destination.is_file() or destination.read_bytes() != data:
                 raise ValueError("workflow input seed conflict")
             continue
-        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=parent)
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(data)
@@ -2296,7 +2313,63 @@ def _workflow_input_snapshot(
     return tuple(rows)
 
 
-def _validate_workflow_input_snapshot(repo_root: Path, rows: object) -> None:
+def _read_workflow_input_content(
+    row: Mapping[str, object],
+    *,
+    run=None,
+    coordinator_root: str | Path | None = None,
+) -> dict[str, object]:
+    raw_ref = row.get("content_ref")
+    if not isinstance(raw_ref, str):
+        raise ValueError("workflow input content reference invalid")
+    content_path = Path(raw_ref)
+    if not content_path.is_absolute() or content_path.is_symlink() or not content_path.is_file():
+        raise ValueError("workflow input content reference missing")
+    if content_path.stat().st_mode & 0o222:
+        raise ValueError("workflow input content reference mutable")
+    resolved = content_path.resolve()
+    if coordinator_root is not None:
+        expected_root = Path(coordinator_root).resolve() / "evidence" / "workflow-inputs"
+        if resolved.parent != expected_root:
+            raise ValueError("workflow input content reference outside evidence root")
+    encoded = resolved.read_bytes()
+    if resolved.suffix != ".json" or hashlib.sha256(encoded).hexdigest() != resolved.stem:
+        raise ValueError("workflow input content locator drift")
+    try:
+        envelope = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow input content reference invalid") from exc
+    required = {
+        "schema_version", "kind", "run_id", "work_id", "repo", "source_revision",
+        "path", "sha256", "content",
+    }
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != required
+        or envelope.get("schema_version") != 1
+        or envelope.get("kind") != "workflow-input-content"
+        or envelope.get("path") != row.get("path")
+        or envelope.get("sha256") != row.get("sha256")
+        or not isinstance(envelope.get("content"), str)
+        or hashlib.sha256(envelope["content"].encode("utf-8")).hexdigest() != row.get("sha256")
+    ):
+        raise ValueError("workflow input content reference drift")
+    if run is not None and (
+        envelope.get("run_id") != run.run_id
+        or envelope.get("work_id") != run.work_id
+        or envelope.get("repo") != run.repo
+        or envelope.get("source_revision") != run.source_revision
+    ):
+        raise ValueError("workflow input content authority drift")
+    return envelope
+
+
+def _validate_workflow_input_snapshot(
+    repo_root: Path,
+    rows: object,
+    *,
+    coordinator_root: str | Path | None = None,
+) -> None:
     if not isinstance(rows, list):
         raise ValueError("workflow input snapshot missing")
     for row in rows:
@@ -2312,6 +2385,7 @@ def _validate_workflow_input_snapshot(repo_root: Path, rows: object) -> None:
             raise ValueError("workflow input snapshot file missing")
         if hashlib.sha256(target.read_bytes()).hexdigest() != row["sha256"]:
             raise ValueError("workflow input snapshot hash drift")
+        _read_workflow_input_content(row, coordinator_root=coordinator_root)
 
 
 def _report_binding(content: bytes) -> Mapping[str, object]:
@@ -2491,8 +2565,16 @@ def terminalize_workflow_job(
     if not isinstance(repo_root_value, str) or not repo_root_value:
         raise ValueError("workflow job repo root missing")
     repo_root = Path(repo_root_value).resolve()
+    input_root_value = job.get("workflow_input_root") or repo_root_value
+    if not isinstance(input_root_value, str) or not input_root_value:
+        raise ValueError("workflow job input root missing")
+    input_root = Path(input_root_value).resolve()
     input_snapshot = job.get("workflow_input_snapshot", [])
-    _validate_workflow_input_snapshot(repo_root, input_snapshot)
+    _validate_workflow_input_snapshot(
+        input_root,
+        input_snapshot,
+        coordinator_root=coordinator_root,
+    )
     baseline_rows = job.get("workflow_output_baseline")
     if not isinstance(baseline_rows, list):
         raise ValueError("workflow job output baseline missing")
@@ -3291,24 +3373,17 @@ def _workflow_job_prompt(
     step,
     *,
     builder_job_id: str | None,
+    coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...] = (),
 ) -> str:
     fallback = _LEGACY_CARD_EXECUTION.get(step.card, (None, None, None, None))
     source_material: list[dict[str, object]] = []
     for row in input_snapshot:
-        content_path = Path(row["content_ref"])
-        if content_path.is_symlink() or not content_path.is_file():
-            raise ValueError("workflow input content reference missing")
-        envelope = json.loads(content_path.read_text(encoding="utf-8"))
-        if (
-            not isinstance(envelope, dict)
-            or envelope.get("kind") != "workflow-input-content"
-            or envelope.get("run_id") != run.run_id
-            or envelope.get("path") != row["path"]
-            or envelope.get("sha256") != row["sha256"]
-            or not isinstance(envelope.get("content"), str)
-        ):
-            raise ValueError("workflow input content reference drift")
+        envelope = _read_workflow_input_content(
+            row,
+            run=run,
+            coordinator_root=coordinator_root,
+        )
         source_material.append({**row, "content": envelope["content"]})
     contract: dict[str, object] = {
         "schema_version": 1,
@@ -3523,6 +3598,7 @@ def dispatch_workflow_card(
             workflow_card=step.card,
             workflow_phase=step.phase,
             workflow_repo_root=repo_root if step.persona == "planner" else worktree,
+            workflow_input_root=worktree,
             workflow_inputs=effective_inputs,
             workflow_input_snapshot=input_snapshot,
             workflow_outputs=step.outputs,
@@ -3541,6 +3617,7 @@ def dispatch_workflow_card(
                 run,
                 step,
                 builder_job_id=builder_job_id,
+                coordinator_root=coordinator_root,
                 input_snapshot=input_snapshot,
             ),
             worktree=worktree,

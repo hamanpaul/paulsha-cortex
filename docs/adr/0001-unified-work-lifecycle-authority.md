@@ -61,9 +61,9 @@ Manager在launch前解析declared inputs，accepted planning artifact只接受Wo
 
 Dead job被reconcile成`needs_human`後，periodic runner不得自動重派；只有queued explicit resume可重試。ForeignReview之後的delivery review是`copilot | maintainer-review` typed union；maintainer attestation由Manager重讀PR HEAD後寫immutable exact-HEAD evidence，merge authorization v2保留實際kind/ref/hash，禁止偽裝Copilot。
 
-### 9. Runtime root依instance明確選擇
+### 9. Runtime roots依instance明確選擇
 
-Process `PSC_RUN_ROOT`最高優先；否則interactive CLI按`PSC_INSTANCE`讀installer bootstrap env，缺檔才使用`$PSC_AGENTS_ROOT/run/<instance>`。不掃描猜測多instance，malformed/symlink/relative env fail-closed；Monitor client使用production config socket path。
+Process specific `PSC_*_ROOT`最高優先，其次是可一次覆寫derived roots的process `PSC_AGENTS_ROOT`；兩者皆無時interactive CLI才按`PSC_INSTANCE`讀installer bootstrap env，讓control/coordinator/specs/run/monitor/project-config roots與service一致，缺檔則從`$HOME/.agents`推導。不掃描猜測多instance，malformed/symlink/relative env fail-closed，installer也拒絕覆寫symlink bootstrap；Monitor client使用production config socket path。
 
 ## Alternatives considered
 

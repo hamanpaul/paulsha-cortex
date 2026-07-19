@@ -359,7 +359,7 @@ class JobRegistry:
         for field in (
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
-            "workflow_phase", "workflow_repo_root", "source_revision",
+            "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash",
         ):
             value = job.get(field)
@@ -597,6 +597,7 @@ class JobRegistry:
         workflow_card: str | None = None,
         workflow_phase: str | None = None,
         workflow_repo_root: str | None = None,
+        workflow_input_root: str | None = None,
         workflow_inputs: tuple[str, ...] = (),
         workflow_input_snapshot: tuple[dict[str, str], ...] = (),
         workflow_outputs: tuple[str, ...] = (),
@@ -641,6 +642,7 @@ class JobRegistry:
             "workflow_card": workflow_card,
             "workflow_phase": workflow_phase,
             "workflow_repo_root": workflow_repo_root,
+            "workflow_input_root": workflow_input_root,
             "workflow_inputs": list(workflow_inputs),
             "workflow_input_snapshot": [dict(row) for row in workflow_input_snapshot],
             "workflow_outputs": list(workflow_outputs),

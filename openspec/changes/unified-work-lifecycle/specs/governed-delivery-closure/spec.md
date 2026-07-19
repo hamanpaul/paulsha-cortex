@@ -66,10 +66,10 @@ V1 WorkflowRun只支援唯一mapped PR、唯一OpenSpec change與唯一Todo path
 - **THEN**fleet auto rollout保持disabled
 - **THEN**Monitor read-only rollout仍可繼續並顯示diagnostics
 
-### Requirement: Interactive CLI與service必須解析相同instance run root
-`PSC_RUN_ROOT` process override MUST最高優先。未設定時interactive command MUST依`PSC_INSTANCE`（default `cortex`）讀取installer管理的`$HOME/.agents/core/runtime/<instance>-manager.env`；不存在安裝檔時預設為`$PSC_AGENTS_ROOT/run/<instance>`。Bootstrap env若為symlink、malformed或root非絕對路徑 MUST fail-closed。Installer MUST保存`PSC_INSTANCE`，Monitor socket client MUST使用production monitor config的socket path。
+### Requirement: Interactive CLI與service必須解析相同instance runtime roots
+各specific `PSC_*_ROOT` process override MUST最高優先；其次是可一次覆寫所有derived roots的process `PSC_AGENTS_ROOT`。兩者未設定時interactive command MUST依`PSC_INSTANCE`（default `cortex`）讀取installer管理的`$HOME/.agents/core/runtime/<instance>-manager.env`，並使用相同的agents/control/coordinator/specs/run/monitor/project-config roots；不存在安裝檔時才從`$HOME/.agents`推導。Bootstrap env若為symlink、malformed或root非絕對路徑 MUST fail-closed，installer也MUST拒絕覆寫symlink bootstrap。Installer MUST保存`PSC_INSTANCE`，Monitor socket client MUST使用production monitor config的socket path。
 
 #### Scenario: 安裝beta instance後由interactive CLI操作
-- **WHEN**operator設定`PSC_INSTANCE=beta`且未覆寫`PSC_RUN_ROOT`
-- **THEN**CLI與beta manager/monitor service使用相同run root與socket
-- **THEN**不得掃描猜測其他instance或fallback到generic run root
+- **WHEN**operator設定`PSC_INSTANCE=beta`且未覆寫specific runtime root
+- **THEN**CLI control queue與beta manager service使用相同control root，CLI與monitor service使用相同project config、run root與socket
+- **THEN**不得掃描猜測其他instance或fallback到generic runtime root

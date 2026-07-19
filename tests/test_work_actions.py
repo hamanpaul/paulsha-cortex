@@ -231,7 +231,7 @@ def test_review_attest_writes_immutable_exact_head_evidence(
         pr_refs=("acme/demo#8",),
         gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
         gate_status="passed",
-        facets=(),
+        facets=("needs_human", "degraded"),
     )
 
     class GitHub:
@@ -269,6 +269,7 @@ def test_review_attest_writes_immutable_exact_head_evidence(
     review = next(ref for ref in persisted.gate_refs if ref.kind == "maintainer-review")
     assert review.ref == str(evidence)
     assert review.sha256 == first["result"]["hash"]
+    assert persisted.facets == ("degraded",)
 
 
 def test_auto_without_issue_mutates_every_mapped_issue(tmp_path: Path) -> None:
@@ -1613,6 +1614,60 @@ def test_crash_reconcile_uses_stable_authorization_without_rerunning_preflight(
         now=lambda: 220,
     )
     assert result["result"]["action"] == "merged-awaiting-closure"
+
+
+def test_v2_authorization_rejects_tampered_maintainer_review_on_replay(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    active = {"run_id": "workflow-" + "a" * 20, "workflow_step_ids": ["review", "ship"]}
+    binding = {"pr_number": 8, "change": "demo", "todo_paths": ["docs/todo.md"]}
+    review = tmp_path / "maintainer-review.json"
+    review_payload = {"schema": "maintainer-review/v1", "candidate": HEAD, "verdict": "approved"}
+    review.write_text(json.dumps(review_payload), encoding="utf-8")
+    review.chmod(0o444)
+    body = {
+        "schema": "cortex-merge-authorization/v2",
+        "run_id": active["run_id"],
+        "workflow_step_ids": active["workflow_step_ids"],
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "authority_digest": work_actions.work_authority_digest(authority),
+        **binding,
+        "head": HEAD,
+        "tree_hash": TREE,
+        "review_kind": "maintainer-review",
+        "review_ref": str(review),
+        "review_hash": work_actions.verification.canonical_json_hash(review_payload),
+        "foreign_review_path": str(tmp_path / "foreign.json"),
+        "foreign_review_hash": "2" * 64,
+        "preflight_hash": "3" * 64,
+        "checks_hash": "4" * 64,
+    }
+    authorization = work_actions._authorization_record(body, state_path=state)
+    assert work_actions._authorization_identity_matches(
+        authorization,
+        active=active,
+        authority=authority,
+        binding=binding,
+        head=HEAD,
+        tree_hash=TREE,
+    )
+
+    review.chmod(0o600)
+    review.write_text(json.dumps({**review_payload, "verdict": "rejected"}), encoding="utf-8")
+    review.chmod(0o444)
+
+    assert not work_actions._authorization_identity_matches(
+        authorization,
+        active=active,
+        authority=authority,
+        binding=binding,
+        head=HEAD,
+        tree_hash=TREE,
+    )
 
 
 def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(

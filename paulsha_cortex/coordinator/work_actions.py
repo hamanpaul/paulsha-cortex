@@ -826,7 +826,7 @@ def _authorization_identity_matches(
             and re.fullmatch(r"[0-9a-f]{64}", body["copilot_hash"]) is not None
         )
     review_ref = body.get("review_ref")
-    return (
+    if not (
         body.get("review_kind") == "maintainer-review"
         and isinstance(review_ref, str)
         and Path(review_ref).is_absolute()
@@ -835,7 +835,13 @@ def _authorization_identity_matches(
         and Path(review_ref).stat().st_mode & 0o222 == 0
         and isinstance(body.get("review_hash"), str)
         and re.fullmatch(r"[0-9a-f]{64}", body["review_hash"]) is not None
-    )
+    ):
+        return False
+    try:
+        review_payload = json.loads(Path(review_ref).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return verification.canonical_json_hash(review_payload) == body["review_hash"]
 
 
 def _trusted_evidence_refs(authorization: dict[str, Any]) -> tuple[dict[str, str], ...]:
@@ -898,7 +904,11 @@ def _maintainer_review_record(body: dict[str, Any], *, state_path: Path) -> dict
             finally:
                 os.close(directory_fd)
         except FileExistsError:
-            if target.is_symlink() or target.read_bytes() != content:
+            if (
+                target.is_symlink()
+                or target.read_bytes() != content
+                or target.stat().st_mode & 0o222
+            ):
                 raise RuntimeError("maintainer review evidence conflict")
         finally:
             temporary.unlink(missing_ok=True)
@@ -1026,7 +1036,7 @@ def _review_attest_action(
             for kind in ("brainstorm", "foreign-review", "maintainer-review")
             if kind in refs
         ),
-        facets=(),
+        facets=tuple(facet for facet in run.facets if facet != "needs_human"),
     )
     return {"action": "review-attested", "head": run.candidate_head, **record}
 

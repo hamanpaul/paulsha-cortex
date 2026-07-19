@@ -307,6 +307,7 @@ def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path
             run,
             red,
             builder_job_id=None,
+            coordinator_root=tmp_path / "coordinator",
             input_snapshot=snapshot,
         ).split("Contract: ", 1)[1]
     )
@@ -327,6 +328,58 @@ def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path
     assert payload["skill_ref"] == "superpowers:test-driven-development"
     assert payload["source_material"][0]["content"] == plan_bytes.decode()
     assert payload["terminal_schema"]["required"]
+    assert Path(snapshot[0]["content_ref"]).stat().st_mode & 0o222 == 0
+
+
+def test_input_content_tamper_is_rejected_by_prompt_and_terminal_validation(tmp_path: Path) -> None:
+    operator_root = tmp_path / "operator"
+    builder_root = tmp_path / "builder"
+    plan_ref = "docs/superpowers/plans/production-wiring-plan.md"
+    plan = operator_root / plan_ref
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Accepted\n", encoding="utf-8")
+    builder_root.mkdir()
+    digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring", repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64, source_revision="2" * 64,
+        workspace_root=str(operator_root), combo="feature-oneshot", current_phase="build",
+        steps=_manifest().steps, issue_refs=(), openspec_refs=("production-wiring",), pr_refs=(),
+        attempts={"build": 1}, gate_status="running",
+        planning_authority=(PlanningArtifactAuthority(
+            ref=plan_ref, kind="plan", work_id="production-wiring", baseline_sha256=digest,
+        ),),
+    )
+    red = next(step for step in run.steps if step.card == "tdd-red")
+    coordinator_root = tmp_path / "coordinator"
+    snapshot = manager._workflow_input_snapshot(
+        run=run,
+        repo_root=builder_root,
+        patterns=manager._effective_workflow_inputs(run, red),
+        coordinator_root=coordinator_root,
+    )
+    content_ref = Path(snapshot[0]["content_ref"])
+    envelope = json.loads(content_ref.read_text(encoding="utf-8"))
+    envelope["content"] = "# Tampered\n"
+    content_ref.chmod(0o600)
+    content_ref.write_text(json.dumps(envelope), encoding="utf-8")
+    content_ref.chmod(0o444)
+
+    with pytest.raises(ValueError, match="locator drift"):
+        manager._workflow_job_prompt(
+            run,
+            red,
+            builder_job_id=None,
+            coordinator_root=coordinator_root,
+            input_snapshot=snapshot,
+        )
+    with pytest.raises(ValueError, match="locator drift"):
+        manager._validate_workflow_input_snapshot(
+            builder_root,
+            list(snapshot),
+            coordinator_root=coordinator_root,
+        )
 
 
 def test_build_input_snapshot_rejects_mutable_operator_drift(tmp_path: Path) -> None:
@@ -358,6 +411,78 @@ def test_build_input_snapshot_rejects_mutable_operator_drift(tmp_path: Path) -> 
             coordinator_root=tmp_path / "coordinator",
         )
     assert list(builder_root.rglob("*")) == []
+
+
+def test_build_input_seed_rejects_symlinked_parent_without_outside_write(tmp_path: Path) -> None:
+    operator_root = tmp_path / "operator"
+    builder_root = tmp_path / "builder"
+    outside = tmp_path / "outside"
+    plan_ref = "docs/superpowers/plans/production-wiring-plan.md"
+    plan = operator_root / plan_ref
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Accepted\n", encoding="utf-8")
+    digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+    builder_root.mkdir()
+    outside.mkdir()
+    (builder_root / "docs").symlink_to(outside, target_is_directory=True)
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring", repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64, source_revision="2" * 64,
+        workspace_root=str(operator_root), combo="feature-oneshot", current_phase="build",
+        steps=_manifest().steps, issue_refs=(), openspec_refs=("production-wiring",), pr_refs=(),
+        attempts={"build": 1}, gate_status="running",
+        planning_authority=(PlanningArtifactAuthority(
+            ref=plan_ref, kind="plan", work_id="production-wiring", baseline_sha256=digest,
+        ),),
+    )
+    red = next(step for step in run.steps if step.card == "tdd-red")
+
+    with pytest.raises(ValueError, match="symlink"):
+        manager._workflow_input_snapshot(
+            run=run, repo_root=builder_root,
+            patterns=manager._effective_workflow_inputs(run, red),
+            coordinator_root=tmp_path / "coordinator",
+        )
+    assert not (outside / "superpowers/plans/production-wiring-plan.md").exists()
+
+
+def test_same_input_content_isolated_across_workflow_runs(tmp_path: Path) -> None:
+    refs: list[str] = []
+    for index in (1, 2):
+        operator_root = tmp_path / f"operator-{index}"
+        builder_root = tmp_path / f"builder-{index}"
+        plan_ref = f"docs/superpowers/plans/work-{index}-plan.md"
+        plan = operator_root / plan_ref
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# Identical accepted content\n", encoding="utf-8")
+        builder_root.mkdir()
+        digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+        registry = JobRegistry(state_path=tmp_path / f"registry-{index}.json")
+        manifest = compile_combo(
+            load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", load_cards(DEFAULT_CARDS_PATH)),
+            load_cards(DEFAULT_CARDS_PATH), f"work {index}", change=f"work-{index}",
+        ).workflow_manifest
+        run = registry._manager_create_workflow_run(
+            work_id=f"work-{index}", repo="hamanpaul/paulsha-cortex",
+            claim_key=f"claim:v1:{index}" + "1" * 63, source_revision=str(index) * 64,
+            workspace_root=str(operator_root), combo="feature-oneshot", current_phase="build",
+            steps=manifest.steps, issue_refs=(), openspec_refs=(f"work-{index}",), pr_refs=(),
+            attempts={"build": 1}, gate_status="running",
+            planning_authority=(PlanningArtifactAuthority(
+                ref=plan_ref, kind="plan", work_id=f"work-{index}", baseline_sha256=digest,
+            ),),
+        )
+        red = next(step for step in run.steps if step.card == "tdd-red")
+        snapshot = manager._workflow_input_snapshot(
+            run=run, repo_root=builder_root,
+            patterns=manager._effective_workflow_inputs(run, red),
+            coordinator_root=tmp_path / "coordinator",
+        )
+        refs.append(snapshot[0]["content_ref"])
+
+    assert refs[0] != refs[1]
+    assert all(Path(ref).is_file() for ref in refs)
 
 
 def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp_path: Path) -> None:
@@ -996,6 +1121,7 @@ def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Pat
         launcher_factory=lambda _: Launcher(),
         coordinator_root=coordinator_root,
     )
+    assert first["workflow_input_root"] == first["worktree"]
     first_sandbox = Path(first["worktree"])
     (first_sandbox / "failed-attempt-marker").write_text("stale\n", encoding="utf-8")
     registry.update_headless_result(first["job_id"], status="failed", exit_code=1)

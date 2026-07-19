@@ -12,7 +12,7 @@ from . import constants
 REQUEST_TYPES = frozenset(
     {"tick", "fanout", "dispatch", "complete", "slice-action", "workflow-action", "work-action"}
 )
-WORK_ACTIONS = frozenset({"link", "unlink", "start", "resume", "auto", "ship"})
+WORK_ACTIONS = frozenset({"link", "unlink", "start", "resume", "auto", "ship", "review-attest"})
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
 
 

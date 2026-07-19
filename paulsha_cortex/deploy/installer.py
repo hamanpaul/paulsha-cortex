@@ -80,6 +80,8 @@ def _write_managed_env(
     每次 install 只覆寫本函式管理的鍵；既有的 PSC_MANAGER_SPECS_DIR、
     PSC_WORKTREE_ROOT、PSC_CONTROL_ROOT 等 operator 設定不得被清掉。
     """
+    if env_file.is_symlink():
+        raise ValueError("runtime bootstrap env 不可為 symlink")
     lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.exists() else []
     remaining = dict(managed)
     out: list[str] = []
@@ -99,6 +101,8 @@ def _write_managed_env(
 
 
 def _read_plain_env(env_file: Path) -> dict[str, str]:
+    if env_file.is_symlink():
+        raise ValueError("runtime bootstrap env 不可為 symlink")
     if not env_file.is_file():
         return {}
     values: dict[str, str] = {}

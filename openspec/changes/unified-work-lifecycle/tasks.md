@@ -43,7 +43,7 @@
 
 - [x] 4.1 實作`cortex doctor --probe-live`的gh auth/permissions、label、preflight executable、model identities、agy smoke與service path probes。
 - [x] 4.2 更新README、usage/help snapshots、service install與registry/snapshot migration docs。
-- [x] 4.2a 統一interactive/service instance runtime discovery；installer保存`PSC_INSTANCE`，CLI與Monitor client解析相同run root/socket。
+- [x] 4.2a 統一interactive/service instance runtime discovery；installer保存`PSC_INSTANCE`，CLI control queue與Monitor client解析相同runtime roots/socket。
 - [ ] 4.3 在`paulsha-cortex`以低風險docs-only issue跑auto-label canary，刻意缺accepted plan以觸發異質brainstorm。
 - [ ] 4.4 驗canary完整經brainstorm→build→ForeignReview→archive→preflight→typed maintainer current-HEAD review→merge commit→done；通過前不擴散auto label。
 - [ ] 4.5 使用official CLI archive `unified-work-lifecycle`；issue #12只勾實際涵蓋項目。

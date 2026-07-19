@@ -151,6 +151,23 @@ def test_install_existing_agents_root_drives_new_specific_defaults(tmp_path, mon
     assert f"PSC_MONITOR_STATE_ROOT={custom_agents / 'monitor'}" in env_lines
 
 
+def test_install_rejects_symlinked_bootstrap_without_overwriting_target(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    home = tmp_path / "home"
+    env_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    env_file.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.env"
+    outside.write_text("DO_NOT_OVERWRITE=1\n", encoding="utf-8")
+    env_file.symlink_to(outside)
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="symlink"):
+        installer.install_service("beta", 300, tmp_path / "repo")
+
+    assert outside.read_text(encoding="utf-8") == "DO_NOT_OVERWRITE=1\n"
+
+
 def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):
     from paulsha_cortex.deploy import installer
 

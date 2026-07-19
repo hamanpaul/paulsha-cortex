@@ -73,11 +73,11 @@ cortex doctor --probe-live --repo owner/repo --json
 
 ## Delivery gate
 
-Manager 是唯一 writer。每次 push 都會使上一個 Copilot epoch 失效，並重新要求 current-HEAD review。Merge 前必須同時具備：
+Manager 是唯一 writer。每次 push 都會使上一個 delivery review epoch 失效，並重新要求 current-HEAD review。Merge 前必須同時具備：
 
 - exact tree 的 policy + pinned preflight；
 - deterministic verification 與不同 independence domain 的 ForeignReview；
-- current-HEAD、非 error 的 Copilot review，且 threads resolved/outdated；
+- 恰好一種 current-HEAD typed delivery review：非 error 且 threads resolved/outdated 的 Copilot review，或 immutable exact-HEAD maintainer attestation；
 - terminal-green checks/statuses、closing refs、archive diff 與 mergeability；
 - fresh GitHub provider snapshot。
 
