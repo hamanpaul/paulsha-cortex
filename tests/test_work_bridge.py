@@ -10,7 +10,13 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.control.contract import build_request
-from paulsha_cortex.coordinator import manager_daemon, review, verification, work_bridge
+from paulsha_cortex.coordinator import (
+    manager_daemon,
+    review,
+    verification,
+    work_actions,
+    work_bridge,
+)
 from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -44,7 +50,14 @@ def _repo(root: Path) -> tuple[Path, str]:
     return root, head
 
 
-def _snapshot(path: Path) -> Path:
+def _snapshot(
+    path: Path,
+    *,
+    source_revisions: tuple[str, ...] = (
+        "github_issue:acme/demo#14@issue-open",
+        "openspec:acme/demo:work@spec-1",
+    ),
+) -> Path:
     path.write_text(
         json.dumps(
             {
@@ -67,10 +80,7 @@ def _snapshot(path: Path) -> Path:
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
                         "auto_label": False,
-                        "source_revisions": [
-                            "github_issue:acme/demo#14@issue-open",
-                            "openspec:acme/demo:work@spec-1",
-                        ],
+                        "source_revisions": list(source_revisions),
                     }
                 ],
             }
@@ -324,6 +334,19 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         snapshot_path=snapshot,
         runner=delivery_runner,
     )
+    initial_source_revision = run.source_revision
+    work_actions._load_work_run(
+        state_path=tmp_path / "state" / "delivery-journal.json",
+        workflow_registry=registry,
+        authority=authority,
+    )
+    _snapshot(
+        snapshot,
+        source_revisions=(
+            "github_issue:acme/demo#14@issue-open",
+            "openspec:acme/demo:work@spec-2",
+        ),
+    )
 
     result = validator(run=run, candidate=candidate)
 
@@ -335,6 +358,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert updated.run_id == run.run_id
     assert updated.pr_refs == ("acme/demo#17",)
     assert updated.source_revision != run.source_revision
+    assert updated.planning_source_revision == initial_source_revision
     assert not report.exists()
     assert plan.is_file()
     assert subprocess.run(
@@ -353,6 +377,9 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
     assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
+    assert "openspec:acme/demo:work@spec-2" in journal["runs"][run.run_id][
+        "source_revisions"
+    ]
 
 
 def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
