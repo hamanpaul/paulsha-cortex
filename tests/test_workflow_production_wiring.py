@@ -259,6 +259,194 @@ def test_periodic_resume_does_not_clear_needs_human_or_retry(tmp_path: Path) -> 
     assert registry.list_jobs() == []
 
 
+def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_old_job(
+    tmp_path: Path,
+) -> None:
+    plan = tmp_path / "docs/superpowers/plans/production-wiring-plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Plan\n", encoding="utf-8")
+    steps = tuple(
+        WorkflowStep.from_dict({
+            **step.to_dict(),
+            "gate_result": "passed" if step.card == "worktree-isolation" else step.gate_result,
+        })
+        for step in _manifest().steps
+    )
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 1},
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    log = tmp_path / "needs-human.jsonl"
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "needs_human",
+        "run_id": run.run_id,
+        "card_id": "tdd-red",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }) + "\n", encoding="utf-8")
+    old_job = registry.create_job(
+        task="wf-tdd-red",
+        persona="builder",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(tmp_path),
+        dispatch_head="b" * 40,
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="tdd-red",
+        workflow_phase="build",
+        workflow_repo_root=str(tmp_path),
+        workflow_input_root=str(tmp_path),
+        source_revision=run.source_revision,
+    )
+    registry.attach_launch_handle(old_job["job_id"], log_path=str(log))
+    registry.update_headless_result(old_job["job_id"], status="exited", exit_code=0)
+
+    class Launcher:
+        def as_commit_required(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            return LaunchHandle(
+                executor="codex",
+                model_id="gpt-primary",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    class ResumeDispatcher:
+        _registry = registry
+        _git_runner = None
+
+        def poll_headless_done(self, job_id):
+            return registry.get_job(job_id)
+
+    identities = IdentityRegistry.from_rows([{
+        "executor": "codex",
+        "model_id": "gpt-primary",
+        "independence_domain": "openai",
+        "capabilities": [],
+    }])
+    stopped = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path / "coordinator",
+    )
+    assert stopped["reason"] == "operator-resume-required"
+    assert len(registry.list_jobs()) == 1
+
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "needs_human",
+        "run_id": "wrong-run",
+        "card_id": "tdd-red",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="did not pass"):
+        manager.resume_workflow_run(
+            ResumeDispatcher(),
+            run_id=run.run_id,
+            identities=identities,
+            launcher_factory=lambda _: Launcher(),
+            coordinator_root=tmp_path / "coordinator",
+            operator_resume=True,
+        )
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+    assert len(registry.list_jobs()) == 1
+    log.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "needs_human",
+        "run_id": run.run_id,
+        "card_id": "tdd-red",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }) + "\n", encoding="utf-8")
+
+    result = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=tmp_path / "coordinator",
+        operator_resume=True,
+    )
+
+    assert result["reason"] == "in-flight"
+    assert result["job_id"] != old_job["job_id"]
+    assert registry.get_job(old_job["job_id"])["status"] == "exited"
+    assert registry.get_job(old_job["job_id"])["workflow_evidence"] is None
+    assert registry.get_workflow_run(run.run_id).facets == ()
+
+
+def test_nonpassing_terminal_retry_authority_requires_exact_schema_and_binding(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "terminal.jsonl"
+    payload = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "needs_human",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    job = {
+        "workflow_evidence": None,
+        "status": "exited",
+        "exit_code": 0,
+        "workflow_phase": "build",
+        "workflow_run_id": "run",
+        "workflow_card": "card",
+        "log_path": str(log),
+    }
+    log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    assert manager._retryable_nonpassing_workflow_terminal(job) is True
+
+    for key, value in (
+        ("schema_version", True),
+        ("status", "passed"),
+        ("run_id", "other-run"),
+        ("card_id", "other-card"),
+        ("candidate", "not-a-sha"),
+        ("outputs", "not-a-list"),
+    ):
+        invalid = {**payload, key: value}
+        log.write_text(json.dumps(invalid) + "\n", encoding="utf-8")
+        assert manager._retryable_nonpassing_workflow_terminal(job) is False
+
+    log.write_text("not-json\n", encoding="utf-8")
+    assert manager._retryable_nonpassing_workflow_terminal(job) is False
+
+    log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    assert manager._retryable_nonpassing_workflow_terminal({**job, "exit_code": False}) is False
+
+
 def test_operator_resume_reconciles_brainstorm_artifact_authority_before_dispatch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

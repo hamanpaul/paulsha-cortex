@@ -102,6 +102,12 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 - **THEN**Manager在建立Job或launch前拒絕dispatch
 - **THEN**不得以其他同glob檔案補位
 
+#### Scenario: Plan/build workflow card明示needs human後由operator重試
+- **WHEN**plan/build workflow card的headless process exit 0但terminal schema與run/card binding正確且status為`failed`或`needs_human`
+- **THEN**Manager MUST保留舊Job/log且MUST NOT建立passed evidence，periodic MUST維持`needs_human` stop
+- **WHEN**operator透過control queue明確resume同一run
+- **THEN**Manager MAY重派同一card；malformed或錯誤binding terminal MUST NOT取得此retry authority
+
 ### Requirement: Headless card prompt必須是bounded execution envelope
 每張headless card prompt MUST為versioned structured envelope，至少包含run/work/source revision、phase/card/persona、skill ref、task action、commit/test policy、resolved source material、declared outputs、candidate semantics與exact terminal JSON schema。Source material總量 MUST有上限；超限 MUST fail-closed。Manager已provision worktree時，`worktree-isolation` MUST明示不得建立第二個worktree。
 

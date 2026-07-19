@@ -103,6 +103,8 @@ WorkflowStep額外保存`skill_ref`與structured action/commit/test policy。Bra
 
 Prompt固定為`workflow-card-prompt/v1`，包含resolved source content與terminal schema。Active v1 run可繼承同phase input contract以恢復pending cards，但既有passed card不回填新證據、不偽稱通過新gate。Terminalize再次驗snapshot hash，canonical job evidence保存相同snapshot。
 
+Plan/build workflow card的headless process exit 0但terminal明示`failed`或`needs_human`時，Manager保留原job/log且不建立passed evidence；periodic維持`needs_human` stop。只有explicit operator resume可在schema與run/card binding一致時重派同一run/card，malformed或錯誤binding不可藉此旁路。
+
 ### 11. `needs_human`是operator resume boundary
 
 Dispatcher仍負責把dead PID/no sentinel fail-closed成failed job；Manager將run設`needs_human`後，periodic runner只回`operator-resume-required`，不得清facet或重派。只有control queue收到explicit work/workflow resume才清facet、保留舊failed job並重試相同run/card。
