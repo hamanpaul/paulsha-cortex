@@ -49,6 +49,7 @@
 - [x] 4.2d 讓schema/binding正確且明示`failed|needs_human`的plan/build workflow terminal只在explicit operator resume時重派同一run/card；舊job/log保留且periodic不自動重試。
 - [x] 4.2e 讓sequential build card只把Candidate單調推進到目前Candidate的exact descendant worktree HEAD；verify/review仍維持exact equality。
 - [x] 4.2f 讓verify/review只選明示review capability的foreign identity並在exact Candidate disposable clone以read-only launcher執行；原Candidate用tree snapshot防寫，Manager以phase專屬report root與durable publication journal擁有report/GateEvaluation binding，且舊planning-only Agy terminal只可由exact explicit operator recovery重派。
+- [x] 4.2g 讓Claude reviewer以dontAsk、safe-mode及僅Bash工具面搭配fail-closed原生sandbox執行non-mutating tests；home/runtime sockets拒讀、Candidate deny-write、credential/MCP/remote隔離、缺bubblewrap/socat/srt或Unix-socket seccomp失效時拒絕啟動，且exact-bound無payload terminal僅能explicit operator recovery重派。
 - [ ] 4.3 在`paulsha-cortex`以低風險docs-only issue跑auto-label canary，刻意缺accepted plan以觸發異質brainstorm。
 - [ ] 4.4 驗canary完整經brainstorm→build→ForeignReview→archive→preflight→typed maintainer current-HEAD review→merge commit→done；通過前不擴散auto label。
 - [ ] 4.5 使用official CLI archive `unified-work-lifecycle`；issue #12只勾實際涵蓋項目。

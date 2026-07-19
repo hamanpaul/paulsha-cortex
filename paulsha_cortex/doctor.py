@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,6 +137,129 @@ def _load_runtime_model_identities(config_root: Path) -> int:
     ):
         raise ValueError("canonical agy planning identity missing")
     return int(registry.schema_version)
+
+
+def _review_sandbox_probe(
+    env: Mapping[str, str],
+    agents_root: Path,
+    *,
+    runner: Runner = subprocess.run,
+    live: bool = False,
+) -> ProbeResult:
+    """Validate the executable Claude sandbox surface when it can review."""
+
+    config_root = Path(
+        env.get("PSC_PROJECT_CONFIG_ROOT", str(agents_root / "config" / "paulsha"))
+    ).expanduser()
+    try:
+        from .coordinator.model_identities import load_model_identities
+
+        registry = load_model_identities(config_root)
+    except (ImportError, OSError, ValueError):
+        return ProbeResult(
+            "review-sandbox", "fail", "review identity registry unavailable", True
+        )
+    required = any(
+        identity.executor == "claude" and "review" in identity.capabilities
+        for identity in registry.identities
+    )
+    if not required:
+        return ProbeResult(
+            "review-sandbox", "warn", "no Claude review identity configured", False
+        )
+    search_path = env.get("PATH")
+    executables = {
+        name: shutil.which(name, path=search_path)
+        for name in ("claude", "bwrap", "socat", "srt", "python3")
+    }
+    missing = [name for name, path in executables.items() if path is None]
+    if missing:
+        return ProbeResult(
+            "review-sandbox",
+            "fail",
+            f"missing required executable(s): {','.join(missing)}",
+            True,
+        )
+    claude = str(executables["claude"])
+    bwrap = str(executables["bwrap"])
+    socat = str(executables["socat"])
+    srt = str(executables["srt"])
+    python = str(executables["python3"])
+    claude_code, claude_version = _process(runner, [claude, "--version"])
+    version_match = re.search(r"\b([0-9]+)\.([0-9]+)\.([0-9]+)\b", claude_version)
+    if (
+        claude_code != 0
+        or version_match is None
+        or tuple(int(part) for part in version_match.groups()) < (2, 1, 187)
+    ):
+        return ProbeResult(
+            "review-sandbox",
+            "fail",
+            "Claude Code 2.1.187 or newer is required",
+            True,
+        )
+    help_code, help_text = _process(runner, [claude, "--help"])
+    required_flags = {
+        "--disable-slash-commands",
+        "--json-schema",
+        "--permission-mode",
+        "--safe-mode",
+        "--setting-sources",
+        "--settings",
+        "--tools",
+    }
+    if help_code != 0 or any(flag not in help_text for flag in required_flags):
+        return ProbeResult(
+            "review-sandbox", "fail", "Claude review sandbox CLI surface unavailable", True
+        )
+    dependency_commands = ([bwrap, "--version"], [socat, "-V"], [srt, "--version"])
+    if any(_process(runner, list(argv))[0] != 0 for argv in dependency_commands):
+        return ProbeResult(
+            "review-sandbox", "fail", "Claude sandbox dependency execution failed", True
+        )
+    if live:
+        smoke_code, _ = _process(
+            runner,
+            [
+                bwrap,
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--unshare-net",
+                "--die-with-parent",
+                "/bin/true",
+            ],
+        )
+        if smoke_code != 0:
+            return ProbeResult(
+                "review-sandbox", "fail", "native read-only sandbox smoke failed", True
+            )
+        unix_socket_code, _ = _process(
+            runner,
+            [
+                srt,
+                "--",
+                python,
+                "-c",
+                (
+                    "import errno,socket,sys;"
+                    "\ntry: socket.socket(socket.AF_UNIX)"
+                    "\nexcept PermissionError as exc: sys.exit(0 if exc.errno == errno.EPERM else 2)"
+                    "\nelse: sys.exit(1)"
+                ),
+            ],
+        )
+        if unix_socket_code != 0:
+            return ProbeResult(
+                "review-sandbox", "fail", "Unix socket seccomp smoke failed", True
+            )
+    return ProbeResult(
+        "review-sandbox", "pass", "Claude native Bash sandbox runtime ready", True
+    )
 
 
 def _default_agy_probe() -> tuple[bool, str]:
@@ -467,6 +591,12 @@ def run_doctor(
     probes: list[ProbeResult] = [
         _preflight_probe(effective),
         _identity_probe(effective, agents_root),
+        _review_sandbox_probe(
+            effective,
+            agents_root,
+            runner=runner,
+            live=probe_live,
+        ),
         service_probe,
         state_probe,
         socket_probe,

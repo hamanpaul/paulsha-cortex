@@ -2316,24 +2316,31 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
     run = SimpleNamespace(run_id="workflow-review", candidate_head=candidate)
     step = SimpleNamespace(card="verification")
     coordinator = tmp_path / "coordinator"
-    sandbox = manager._create_reviewer_sandbox(
+    sandbox, checkout = manager._create_reviewer_sandbox(
         run=run,
         step=step,
+        executor="claude",
         candidate_root=repo,
         coordinator_root=coordinator,
         input_snapshot=(),
     )
     assert sandbox != repo
     assert subprocess.run(
-        ["git", "-C", str(sandbox), "rev-parse", "HEAD"], check=True,
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"], check=True,
         capture_output=True, text=True,
     ).stdout.strip() == candidate
     assert subprocess.run(
-        ["git", "-C", str(sandbox), "remote"], check=True,
+        ["git", "-C", str(checkout), "remote"], check=True,
         capture_output=True, text=True,
     ).stdout.strip() == ""
+    assert all((sandbox / ref).is_file() for ref in manager._CLAUDE_REVIEW_PROTECTED_FILES)
+    assert all((sandbox / ref).is_dir() for ref in manager._CLAUDE_REVIEW_PROTECTED_DIRS)
     assert subprocess.run(
-        ["git", "-C", str(sandbox), "push", "origin", "HEAD:refs/heads/forbidden"],
+        ["git", "-C", str(checkout), "status", "--porcelain"], check=True,
+        capture_output=True, text=True,
+    ).stdout == ""
+    assert subprocess.run(
+        ["git", "-C", str(checkout), "push", "origin", "HEAD:refs/heads/forbidden"],
         capture_output=True, text=True, check=False,
     ).returncode != 0
     registry = JobRegistry(state_path=coordinator / "jobs.json")
@@ -2341,9 +2348,9 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
         task="review-mutation", persona="reviewer", kind="review", branch="feature/work",
         pane="", worktree=str(sandbox), executor="claude", model_id="reviewer",
         independence_domain="anthropic", subject_head=candidate,
-        workflow_run_id="run", workflow_claim_key="claim", workflow_repo="owner/repo",
+        workflow_run_id="workflow-review", workflow_claim_key="claim", workflow_repo="owner/repo",
         workflow_card="verification", workflow_phase="verify",
-        workflow_repo_root=str(repo), workflow_input_root=str(sandbox),
+        workflow_repo_root=str(repo), workflow_input_root=str(checkout),
         workflow_sandbox_hash=manager.planning_runtime._tree_snapshot(repo),
         source_revision="rev",
     )
@@ -2356,6 +2363,239 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
             require_candidate_unchanged=True,
         )
     assert not sandbox.exists()
+
+
+def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "canary@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Canary"], check=True
+    )
+    (repo / "README.md").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    steps = tuple(
+        WorkflowStep.from_dict(
+            {
+                **step.to_dict(),
+                "gate_result": (
+                    "passed"
+                    if step.phase in {"claim", "define", "plan", "build"}
+                    else "pending"
+                ),
+            }
+        )
+        for step in _manifest().steps
+    )
+    coordinator = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="verify",
+        steps=steps,
+        candidate_head=candidate,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"verify": 1},
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    builder = registry.create_job(
+        task="wf-builder",
+        persona="builder",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(repo),
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="subagent-build",
+        workflow_phase="build",
+        workflow_repo_root=str(repo),
+        workflow_input_root=str(repo),
+        source_revision=run.source_revision,
+    )
+    registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
+    verify_step = next(step for step in run.steps if step.card == "verification")
+    sandbox, checkout = manager._create_reviewer_sandbox(
+        run=run,
+        step=verify_step,
+        executor="codex",
+        candidate_root=repo,
+        coordinator_root=coordinator,
+        input_snapshot=(),
+    )
+    log_root = coordinator / "logs" / "workflow"
+    log_root.mkdir(parents=True)
+    legacy = registry.create_job(
+        task="wf-verification",
+        persona="reviewer",
+        kind="review",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(sandbox),
+        executor="claude",
+        model_id="sonnet",
+        independence_domain="anthropic",
+        subject_head=candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=verify_step.card,
+        workflow_phase=verify_step.phase,
+        workflow_repo_root=str(repo),
+        workflow_input_root=str(checkout),
+        workflow_outputs=verify_step.outputs,
+        workflow_output_baseline=(),
+        workflow_sandbox_hash=manager.planning_runtime._tree_snapshot(repo),
+        workflow_builder_job_id=builder["job_id"],
+        source_revision=run.source_revision,
+    )
+    log = log_root / f"{legacy['job_id']}.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "Plan Mode prevented tests; no terminal JSON was produced.",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    registry.attach_launch_handle(
+        legacy["job_id"],
+        executor="claude",
+        model_id="sonnet",
+        session_name=legacy["job_id"],
+        log_path=str(log),
+    )
+    registry.update_headless_result(legacy["job_id"], status="exited", exit_code=0)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "sonnet",
+                "independence_domain": "anthropic",
+                "capabilities": ["review"],
+            },
+        ]
+    )
+    bound = registry.get_job(legacy["job_id"])
+    assert manager._is_exact_reviewer_terminal_recovery(
+        registry,
+        bound,
+        run=run,
+        step=verify_step,
+        identities=identities,
+        coordinator_root=coordinator,
+    )
+    assert not manager._is_exact_reviewer_terminal_recovery(
+        registry,
+        {**bound, "subject_head": "f" * 40},
+        run=run,
+        step=verify_step,
+        identities=identities,
+        coordinator_root=coordinator,
+    )
+    assert not manager._is_exact_reviewer_terminal_recovery(
+        registry,
+        {**bound, "worktree": str(sandbox.with_name("0" * 32))},
+        run=run,
+        step=verify_step,
+        identities=identities,
+        coordinator_root=coordinator,
+    )
+    assert not manager._is_exact_reviewer_terminal_recovery(
+        registry,
+        {**bound, "workflow_input_root": str(repo)},
+        run=run,
+        step=verify_step,
+        identities=identities,
+        coordinator_root=coordinator,
+    )
+
+    launched: list[tuple[str, str, str]] = []
+
+    class Launcher:
+        def as_review_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append((slice_id, prompt, worktree))
+            return LaunchHandle(
+                executor="claude",
+                model_id="sonnet",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    class ResumeDispatcher:
+        _registry = registry
+        _git_runner = None
+
+        def poll_headless_done(self, job_id):
+            return registry.get_job(job_id)
+
+    stopped = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _identity: Launcher(),
+        coordinator_root=coordinator,
+    )
+    assert stopped["reason"] == "operator-resume-required"
+    assert launched == []
+
+    resumed = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _identity: Launcher(),
+        coordinator_root=coordinator,
+        operator_resume=True,
+    )
+    assert resumed["reason"] == "in-flight"
+    assert resumed["job_id"] != legacy["job_id"]
+    assert [row[0] for row in launched] == [resumed["job_id"]]
+    assert '"candidate_checkout": "candidate"' in launched[0][1]
+    assert launched[0][2] == str(sandbox)
+    replacement = registry.get_job(resumed["job_id"])
+    assert Path(replacement["worktree"]) == sandbox
+    assert Path(replacement["workflow_input_root"]) == sandbox / "candidate"
+    assert (sandbox / "candidate").is_dir()
+    assert registry.get_job(legacy["job_id"])["workflow_evidence"] is None
 
 
 def test_review_terminal_rejects_non_builder_job_binding_before_publication(

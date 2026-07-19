@@ -2403,6 +2403,109 @@ def _is_exact_legacy_agy_recovery(
     )
 
 
+def _is_exact_reviewer_terminal_recovery(
+    registry,
+    job: Mapping[str, object],
+    *,
+    run,
+    step,
+    identities: IdentityRegistry,
+    coordinator_root: str | Path,
+) -> bool:
+    """Classify an exact reviewer with no payload for explicit operator retry only."""
+
+    repo_root_value = job.get("workflow_repo_root")
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or step.persona != "reviewer"
+        or step.phase not in {"verify", "review"}
+        or job.get("persona") != "reviewer"
+        or job.get("kind") != "review"
+        or job.get("workflow_run_id") != run.run_id
+        or job.get("workflow_claim_key") != run.claim_key
+        or job.get("workflow_repo") != run.repo
+        or job.get("source_revision") != run.source_revision
+        or job.get("workflow_card") != step.card
+        or job.get("workflow_phase") != step.phase
+        or job.get("subject_head") != run.candidate_head
+        or job.get("workflow_outputs") != list(step.outputs)
+        or not isinstance(repo_root_value, str)
+        or Path(repo_root_value).resolve() != Path(run.workspace_root).resolve()
+    ):
+        return False
+    executor = job.get("executor")
+    model_id = job.get("model_id")
+    if not isinstance(executor, str) or not isinstance(model_id, str):
+        return False
+    identity = identities.get(executor, model_id)
+    if (
+        identity is None
+        or "review" not in identity.capabilities
+        or identity.independence_domain != job.get("independence_domain")
+    ):
+        return False
+    try:
+        builder, _ = _review_builder_job(
+            registry,
+            run=run,
+            builder_job_id=job.get("workflow_builder_job_id"),
+            candidate=str(run.candidate_head),
+            identities=identities,
+        )
+        sandbox = _reviewer_sandbox_path(job, coordinator_root)
+        checkout = _reviewer_checkout_path(
+            job,
+            coordinator_root,
+            allow_legacy_claude_layout=True,
+        )
+    except ValueError:
+        return False
+    expected = job.get("workflow_sandbox_hash")
+    candidate_root = Path(repo_root_value)
+    try:
+        candidate_unchanged = (
+            isinstance(expected, str)
+            and len(expected) == 64
+            and not candidate_root.is_symlink()
+            and candidate_root.is_dir()
+            and planning_runtime._tree_snapshot(candidate_root) == expected
+        )
+    except (OSError, PermissionError):
+        return False
+    if (
+        not candidate_unchanged
+        or sandbox == candidate_root
+        or checkout == candidate_root
+        or builder.get("independence_domain") == identity.independence_domain
+    ):
+        return False
+    log_value = job.get("log_path")
+    job_id = job.get("job_id")
+    if not isinstance(log_value, str) or not isinstance(job_id, str):
+        return False
+    log = Path(log_value)
+    expected_log_root = Path(coordinator_root).resolve() / "logs" / "workflow"
+    if (
+        log.is_symlink()
+        or not log.is_file()
+        or log.name != f"{job_id}.jsonl"
+        or log.resolve().parent != expected_log_root
+    ):
+        return False
+    try:
+        log.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    try:
+        _extract_terminal_json(str(log))
+    except ValueError:
+        return True
+    return False
+
+
 def _canonical_workflow_artifacts(
     rows: object,
     *,
@@ -3275,14 +3378,59 @@ def _reviewer_sandbox_parent(
     return Path(coordinator_root).resolve().parent / f".{Path(coordinator_root).name}-review-sandboxes"
 
 
+_CLAUDE_REVIEW_PROTECTED_FILES = (
+    ".bash_profile",
+    ".bashrc",
+    ".claude.json",
+    ".gitconfig",
+    ".gitmodules",
+    ".mcp.json",
+    ".profile",
+    ".ripgreprc",
+    ".zprofile",
+    ".zshrc",
+)
+_CLAUDE_REVIEW_PROTECTED_DIRS = (
+    ".claude",
+    ".claude/agents",
+    ".claude/commands",
+    ".claude/skills",
+    ".claude/worktrees",
+    ".husky",
+    ".idea",
+    ".vscode",
+)
+
+
+def _prepare_claude_review_sandbox(sandbox: Path) -> None:
+    """Create only the bind targets required by Claude's strict Bash sandbox."""
+
+    for ref in _CLAUDE_REVIEW_PROTECTED_DIRS:
+        target = sandbox / ref
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise ValueError("workflow reviewer protected directory invalid")
+        if not target.exists():
+            target.mkdir(parents=True)
+    for ref in _CLAUDE_REVIEW_PROTECTED_FILES:
+        target = sandbox / ref
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise ValueError("workflow reviewer protected file invalid")
+        if not target.exists():
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+
+
 def _create_reviewer_sandbox(
     *,
     run,
     step,
+    executor: str,
     candidate_root: Path,
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...],
-) -> Path:
+) -> tuple[Path, Path]:
     candidate = run.candidate_head
     if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
         raise ValueError("workflow reviewer candidate invalid")
@@ -3295,10 +3443,14 @@ def _create_reviewer_sandbox(
     sandbox = parent / name
     if sandbox.exists() or sandbox.is_symlink():
         raise ValueError("stale reviewer sandbox requires reconciliation")
+    checkout_root = sandbox / "candidate" if executor == "claude" else sandbox
+    if executor == "claude":
+        sandbox.mkdir()
+        _prepare_claude_review_sandbox(sandbox)
     clone = subprocess.run(
         [
             "git", "clone", "--quiet", "--no-hardlinks", "--no-local", "--no-checkout",
-            str(candidate_root.resolve()), str(sandbox),
+            str(candidate_root.resolve()), str(checkout_root),
         ],
         capture_output=True,
         text=True,
@@ -3308,7 +3460,7 @@ def _create_reviewer_sandbox(
         shutil.rmtree(sandbox, ignore_errors=True)
         raise ValueError("workflow reviewer sandbox clone failed")
     checkout = subprocess.run(
-        ["git", "-C", str(sandbox), "checkout", "--quiet", "--detach", candidate],
+        ["git", "-C", str(checkout_root), "checkout", "--quiet", "--detach", candidate],
         capture_output=True,
         text=True,
         check=False,
@@ -3317,13 +3469,13 @@ def _create_reviewer_sandbox(
         shutil.rmtree(sandbox, ignore_errors=True)
         raise ValueError("workflow reviewer sandbox checkout failed")
     remove_origin = subprocess.run(
-        ["git", "-C", str(sandbox), "remote", "remove", "origin"],
+        ["git", "-C", str(checkout_root), "remote", "remove", "origin"],
         capture_output=True,
         text=True,
         check=False,
     )
     remotes = subprocess.run(
-        ["git", "-C", str(sandbox), "remote"],
+        ["git", "-C", str(checkout_root), "remote"],
         capture_output=True,
         text=True,
         check=False,
@@ -3332,7 +3484,7 @@ def _create_reviewer_sandbox(
         shutil.rmtree(sandbox, ignore_errors=True)
         raise ValueError("workflow reviewer sandbox remote isolation failed")
     head = subprocess.run(
-        ["git", "-C", str(sandbox), "rev-parse", "HEAD"],
+        ["git", "-C", str(checkout_root), "rev-parse", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
@@ -3340,11 +3492,11 @@ def _create_reviewer_sandbox(
     if head.returncode != 0 or head.stdout.strip().lower() != candidate.lower():
         shutil.rmtree(sandbox, ignore_errors=True)
         raise ValueError("workflow reviewer sandbox head mismatch")
-    for link in sandbox.rglob("*"):
+    for link in checkout_root.rglob("*"):
         if not link.is_symlink():
             continue
         try:
-            link.resolve(strict=False).relative_to(sandbox.resolve())
+            link.resolve(strict=False).relative_to(checkout_root.resolve())
         except ValueError as exc:
             shutil.rmtree(sandbox, ignore_errors=True)
             raise ValueError("workflow reviewer sandbox external symlink rejected") from exc
@@ -3356,7 +3508,7 @@ def _create_reviewer_sandbox(
                 coordinator_root=coordinator_root,
             )
             ref = str(envelope["path"])
-            target = sandbox / ref
+            target = checkout_root / ref
             target.parent.mkdir(parents=True, exist_ok=True)
             content = str(envelope["content"]).encode("utf-8")
             if target.is_symlink():
@@ -3373,7 +3525,7 @@ def _create_reviewer_sandbox(
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
         raise
-    return sandbox
+    return sandbox, checkout_root
 
 
 def _reviewer_sandbox_path(job: Mapping[str, object], coordinator_root: str | Path) -> Path:
@@ -3386,14 +3538,50 @@ def _reviewer_sandbox_path(job: Mapping[str, object], coordinator_root: str | Pa
         coordinator_root=coordinator_root,
         candidate_root=Path(repo_root),
     )
+    run_id = job.get("workflow_run_id")
+    card = job.get("workflow_card")
+    candidate = job.get("subject_head")
+    if (
+        not isinstance(run_id, str)
+        or not isinstance(card, str)
+        or not isinstance(candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+    ):
+        raise ValueError("reviewer sandbox identity missing")
+    expected_name = hashlib.sha256(f"{run_id}:{card}:{candidate}".encode()).hexdigest()[:32]
     if (
         not path.is_absolute()
         or path.is_symlink()
         or path.parent != allowed
-        or re.fullmatch(r"[0-9a-f]{32}", path.name) is None
+        or path.name != expected_name
     ):
         raise ValueError("reviewer sandbox path invalid")
     return path
+
+
+def _reviewer_checkout_path(
+    job: Mapping[str, object],
+    coordinator_root: str | Path,
+    *,
+    allow_legacy_claude_layout: bool = False,
+) -> Path:
+    """Resolve the exact disposable checkout nested under a reviewer session root."""
+
+    sandbox = _reviewer_sandbox_path(job, coordinator_root)
+    input_root = job.get("workflow_input_root")
+    executor = job.get("executor")
+    if not isinstance(input_root, str) or not isinstance(executor, str):
+        raise ValueError("reviewer checkout path missing")
+    checkout = Path(input_root)
+    expected = sandbox / "candidate" if executor == "claude" else sandbox
+    legacy = executor == "claude" and allow_legacy_claude_layout and checkout == sandbox
+    if (
+        not checkout.is_absolute()
+        or checkout.is_symlink()
+        or (checkout != expected and not legacy)
+    ):
+        raise ValueError("reviewer checkout path invalid")
+    return checkout
 
 
 def _discard_reviewer_sandbox(
@@ -4437,6 +4625,7 @@ def _workflow_job_prompt(
     builder_job_id: str | None,
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...] = (),
+    candidate_checkout: str | None = None,
 ) -> str:
     fallback = _LEGACY_CARD_EXECUTION.get(step.card, (None, None, None, None))
     source_material: list[dict[str, object]] = []
@@ -4496,6 +4685,8 @@ def _workflow_job_prompt(
     }
     if builder_job_id is not None:
         contract["builder_job_id"] = builder_job_id
+    if candidate_checkout is not None:
+        contract["candidate_checkout"] = candidate_checkout
     planner_contract = (
         " This planner card is read-only: use the disposable checkout only, do not edit files, and "
         "return only existing manifest-declared artifacts."
@@ -4504,8 +4695,10 @@ def _workflow_job_prompt(
     )
     reviewer_contract = (
         " This reviewer card is read-only: inspect and run only non-mutating commands in the "
-        "Candidate checkout. Return report bodies inline; Manager alone writes report files, "
-        "binding frontmatter, job IDs, Candidate and launch identities."
+        "Candidate checkout. If candidate_checkout is present, change into that relative directory "
+        "before every repository command. Execute the verification or review now; do not create a plan or ask "
+        "for approval. Return report bodies inline; Manager alone writes report files, binding "
+        "frontmatter, job IDs, Candidate and launch identities."
         if step.persona == "reviewer"
         else ""
     )
@@ -4527,7 +4720,7 @@ def _dispatch_workflow_card(
     launcher_factory: Callable[[object], object],
     coordinator_root: str | Path,
     retry_failed: bool = False,
-    operator_legacy_job_id: str | None = None,
+    operator_recovery_job_id: str | None = None,
 ) -> dict[str, object] | None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -4557,9 +4750,19 @@ def _dispatch_workflow_card(
                 )
             )
             or (
-                operator_legacy_job_id == matching[-1].get("job_id")
-                and _is_exact_legacy_agy_recovery(
-                    matching[-1], run=run, step=step, identities=identities
+                operator_recovery_job_id == matching[-1].get("job_id")
+                and (
+                    _is_exact_legacy_agy_recovery(
+                        matching[-1], run=run, step=step, identities=identities
+                    )
+                    or _is_exact_reviewer_terminal_recovery(
+                        registry,
+                        matching[-1],
+                        run=run,
+                        step=step,
+                        identities=identities,
+                        coordinator_root=coordinator_root,
+                    )
                 )
             )
         )
@@ -4675,9 +4878,10 @@ def _dispatch_workflow_card(
         )
         output_baseline = _workflow_output_baseline(reviewer_target, step.outputs)
         try:
-            reviewer_sandbox = _create_reviewer_sandbox(
+            reviewer_sandbox, reviewer_checkout = _create_reviewer_sandbox(
                 run=run,
                 step=step,
+                executor=identity.executor,
                 candidate_root=reviewer_target,
                 coordinator_root=coordinator_root,
                 input_snapshot=input_snapshot,
@@ -4685,7 +4889,7 @@ def _dispatch_workflow_card(
             sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
             repo_root = str(reviewer_target)
             worktree = str(reviewer_sandbox)
-            effective_repo_root = reviewer_sandbox
+            effective_repo_root = reviewer_checkout
             _validate_workflow_input_snapshot(
                 effective_repo_root,
                 list(input_snapshot),
@@ -4760,7 +4964,7 @@ def _dispatch_workflow_card(
             workflow_repo_root=(
                 repo_root if step.persona in {"planner", "reviewer"} else worktree
             ),
-            workflow_input_root=worktree,
+            workflow_input_root=str(effective_repo_root),
             workflow_inputs=effective_inputs,
             workflow_input_snapshot=input_snapshot,
             workflow_outputs=step.outputs,
@@ -4784,6 +4988,11 @@ def _dispatch_workflow_card(
                 builder_job_id=builder_job_id,
                 coordinator_root=coordinator_root,
                 input_snapshot=input_snapshot,
+                candidate_checkout=(
+                    "candidate"
+                    if step.persona == "reviewer" and identity.executor == "claude"
+                    else None
+                ),
             ),
             worktree=worktree,
             log_dir=str(Path(coordinator_root).resolve() / "logs" / "workflow"),
@@ -4848,7 +5057,7 @@ def resume_workflow_run(
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
     retry_failed = False
-    legacy_recovery_job_id: str | None = None
+    recovery_job_id: str | None = None
     if "needs_human" in run.facets and run.status == "ongoing":
         if not operator_resume:
             return {
@@ -4869,10 +5078,20 @@ def resume_workflow_run(
                     or job.get("subject_head") == run.candidate_head
                 )
             ]
-            if recovery_jobs and _is_exact_legacy_agy_recovery(
-                recovery_jobs[-1], run=run, step=recovery_step, identities=identities
+            if recovery_jobs and (
+                _is_exact_legacy_agy_recovery(
+                    recovery_jobs[-1], run=run, step=recovery_step, identities=identities
+                )
+                or _is_exact_reviewer_terminal_recovery(
+                    registry,
+                    recovery_jobs[-1],
+                    run=run,
+                    step=recovery_step,
+                    identities=identities,
+                    coordinator_root=coordinator_root,
+                )
             ):
-                legacy_recovery_job_id = str(recovery_jobs[-1]["job_id"])
+                recovery_job_id = str(recovery_jobs[-1]["job_id"])
             if recovery_jobs:
                 try:
                     _discard_reviewer_sandbox(
@@ -4939,10 +5158,10 @@ def resume_workflow_run(
         bound_run,
         *,
         retry: bool = False,
-        retry_legacy_job_id: str | None = None,
+        retry_recovery_job_id: str | None = None,
     ):
         try:
-            if retry_legacy_job_id is not None:
+            if retry_recovery_job_id is not None:
                 return _dispatch_workflow_card(
                     dispatcher,
                     run=bound_run,
@@ -4950,7 +5169,7 @@ def resume_workflow_run(
                     launcher_factory=launcher_factory,
                     coordinator_root=coordinator_root,
                     retry_failed=retry,
-                    operator_legacy_job_id=retry_legacy_job_id,
+                    operator_recovery_job_id=retry_recovery_job_id,
                 )
             return dispatch_workflow_card(
                 dispatcher,
@@ -4995,8 +5214,8 @@ def resume_workflow_run(
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if job is not None and legacy_recovery_job_id == job.get("job_id"):
-        job = dispatch_or_stop(run, retry_legacy_job_id=legacy_recovery_job_id)
+    if job is not None and recovery_job_id == job.get("job_id"):
+        job = dispatch_or_stop(run, retry_recovery_job_id=recovery_job_id)
     elif retry_failed and job is not None and (
         job.get("status") == "failed"
         or _retryable_nonpassing_workflow_terminal(job)
