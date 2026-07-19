@@ -1,1 +1,1 @@
-- Delivery現在會在canonical evidence完整重驗後，以immutable cleanup intent清除未追蹤的Manager-owned reviewer reports，並在驗證delivery branch後於乾淨的暫存`feature/preflight-*` exact-Candidate checkout執行初次metadata preflight；未授權缺檔或漂移仍fail-closed，ship validator exception也會持久化`needs_human`。
+- Delivery現在會在canonical evidence完整重驗後，以immutable cleanup intent清除未追蹤的Manager-owned reviewer reports；crash replay evidence reader只接受同一intent授權的missing path。驗證delivery branch後，初次metadata preflight於乾淨的暫存`feature/preflight-*` exact-Candidate checkout執行；未授權缺檔或漂移仍fail-closed，ship validator exception也會持久化`needs_human`。

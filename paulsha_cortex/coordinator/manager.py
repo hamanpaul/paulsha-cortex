@@ -4070,13 +4070,95 @@ def _read_job_workflow_evidence(
                 raise ValueError("workflow canonical artifact symlink rejected")
         artifact_path = unresolved_artifact.resolve()
         artifact_path.relative_to(repo_root)
-        if (
-            not artifact_path.is_file()
-            or hashlib.sha256(artifact_path.read_bytes()).hexdigest() != expected_hash
-        ):
+        artifact_present = artifact_path.is_file()
+        artifact_bytes = None
+        if artifact_present:
+            try:
+                artifact_bytes = artifact_path.read_bytes()
+            except FileNotFoundError:
+                artifact_present = False
+        if not artifact_present:
+            if not _workflow_report_cleanup_allows_missing(
+                coordinator_root=root,
+                run=run,
+                ref=ref,
+                expected_hash=expected_hash,
+            ):
+                raise ValueError("workflow canonical artifact drift")
+        elif hashlib.sha256(artifact_bytes).hexdigest() != expected_hash:
             raise ValueError("workflow canonical artifact drift")
         refs.append(ref)
     return payload["payload"], tuple(refs), str(path), digest
+
+
+def _workflow_report_cleanup_allows_missing(
+    *,
+    coordinator_root: Path,
+    run,
+    ref: str,
+    expected_hash: str,
+) -> bool:
+    directory = coordinator_root / "evidence" / "report-cleanup"
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    matched = False
+    try:
+        markers = directory.iterdir()
+        for count, marker in enumerate(markers, start=1):
+            if count > 2048:
+                return False
+            try:
+                invalid_marker = (
+                    marker.is_symlink()
+                    or not marker.is_file()
+                    or marker.stat().st_mode & 0o222
+                    or re.fullmatch(r"[0-9a-f]{64}\.json", marker.name) is None
+                )
+            except OSError:
+                continue
+            if invalid_marker:
+                continue
+            envelope = json.loads(marker.read_text(encoding="utf-8"))
+            payload = envelope.get("payload") if isinstance(envelope, dict) else None
+            reports = payload.get("reports") if isinstance(payload, dict) else None
+            digest = marker.stem
+            if (
+                not isinstance(envelope, dict)
+                or set(envelope) != {"payload", "hash"}
+                or not isinstance(payload, dict)
+                or envelope.get("hash") != digest
+                or verification.canonical_json_hash(payload) != digest
+                or set(payload) != {"schema", "run_id", "candidate", "reports"}
+                or payload.get("schema") != "cortex-workflow-report-cleanup/v1"
+                or payload.get("run_id") != run.run_id
+                or payload.get("candidate") != run.candidate_head
+                or not isinstance(reports, list)
+                or not reports
+            ):
+                continue
+            normalized: dict[str, str] = {}
+            valid = True
+            for row in reports:
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {"path", "sha256"}
+                    or not isinstance(row.get("path"), str)
+                    or Path(str(row["path"])).is_absolute()
+                    or ".." in Path(str(row["path"])).parts
+                    or Path(str(row["path"])).as_posix() != str(row["path"])
+                    or not str(row["path"]).startswith(("reports/verify/", "reports/review/"))
+                    or not isinstance(row.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", str(row["sha256"])) is None
+                    or str(row["path"]) in normalized
+                ):
+                    valid = False
+                    break
+                normalized[str(row["path"])] = str(row["sha256"])
+            if valid and normalized.get(ref) == expected_hash:
+                matched = True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return matched
 
 
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
