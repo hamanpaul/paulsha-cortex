@@ -1840,6 +1840,138 @@ def _load_planning_artifacts(
     return tuple(artifacts), tuple(scanned)
 
 
+def _validated_brainstorm_planning_authority(
+    run,
+    *,
+    coordinator_root: str | Path,
+    brainstorm_ref: GateEvidenceRef | None = None,
+) -> tuple[tuple[PlanningArtifactAuthority, ...], str | None]:
+    """Bind published planning artifacts from canonical brainstorm evidence."""
+    refs = (
+        [brainstorm_ref]
+        if brainstorm_ref is not None
+        else [ref for ref in run.gate_refs if ref.kind == "brainstorm"]
+    )
+    if not refs:
+        if run.brainstorm_required:
+            raise ValueError("workflow brainstorm evidence missing")
+        return run.planning_authority, run.planning_source_revision
+    if len(refs) != 1 or refs[0] is None:
+        raise ValueError("workflow brainstorm authority must be unique")
+    gate_ref = refs[0]
+    evidence_path = Path(gate_ref.ref)
+    evidence_root = Path(coordinator_root).resolve() / "evidence"
+    if (
+        not evidence_path.is_absolute()
+        or evidence_path.is_symlink()
+        or not evidence_path.is_file()
+    ):
+        raise ValueError("workflow brainstorm evidence missing")
+    resolved_evidence = evidence_path.resolve()
+    try:
+        resolved_evidence.relative_to(evidence_root)
+    except ValueError as exc:
+        raise ValueError("workflow brainstorm evidence outside coordinator root") from exc
+    encoded = resolved_evidence.read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != gate_ref.sha256:
+        raise ValueError("workflow brainstorm evidence hash drift")
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("workflow brainstorm evidence invalid") from exc
+    scope = payload.get("scope") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "brainstorm-peer"
+        or not isinstance(scope, dict)
+        or set(scope) != {"repo", "work_id", "source_revision"}
+        or scope.get("repo") != run.repo
+        or scope.get("work_id") != run.work_id
+        or not isinstance(scope.get("source_revision"), str)
+        or not scope["source_revision"]
+        or not isinstance(payload.get("artifacts"), list)
+    ):
+        raise ValueError("workflow brainstorm evidence binding invalid")
+    evidence_source_revision = scope["source_revision"]
+    if (
+        run.planning_source_revision is not None
+        and run.planning_source_revision != evidence_source_revision
+    ):
+        raise ValueError("workflow brainstorm evidence source revision drift")
+    rows = payload["artifacts"]
+
+    declared_patterns = tuple(
+        pattern
+        for step in run.steps
+        if step.persona == "planner" and step.phase in {"define", "plan"}
+        for pattern in step.outputs
+    )
+    persisted = {item.ref: item for item in run.planning_authority}
+    scanned: dict[str, PlanningArtifactAuthority] = {}
+    workspace = Path(run.workspace_root).resolve()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {"kind", "ref", "sha256"}:
+            raise ValueError(f"workflow brainstorm artifact[{index}] invalid")
+        kind = row.get("kind")
+        ref = row.get("ref")
+        digest = row.get("sha256")
+        if (
+            kind not in {"spec", "design", "plan"}
+            or not isinstance(ref, str)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or ref in scanned
+        ):
+            raise ValueError(f"workflow brainstorm artifact[{index}] invalid")
+        relative = Path(ref)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("workflow brainstorm artifact escapes workspace")
+        cursor = workspace
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ValueError("workflow brainstorm artifact symlink rejected")
+        target = (workspace / relative).resolve()
+        try:
+            target.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError("workflow brainstorm artifact escapes workspace") from exc
+        if not target.is_file():
+            raise ValueError("workflow brainstorm artifact hash drift")
+        data = target.read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("workflow brainstorm artifact hash drift")
+        existing = persisted.get(ref)
+        if existing is None:
+            if not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns):
+                raise ValueError("workflow brainstorm artifact outside planner outputs")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("workflow brainstorm artifact unreadable") from exc
+            if not assess_planning_artifact(PlanningArtifact(kind=kind, ref=ref, text=text)).accepted:
+                raise ValueError("workflow brainstorm artifact is not accepted")
+        elif (
+            existing.kind != kind
+            or existing.work_id != run.work_id
+            or existing.baseline_sha256 != digest
+        ):
+            raise ValueError("workflow brainstorm artifact differs from persisted authority")
+        scanned[ref] = PlanningArtifactAuthority(
+            ref=ref,
+            kind=kind,
+            work_id=run.work_id,
+            baseline_sha256=digest,
+        )
+
+    if set(persisted) - set(scanned):
+        raise ValueError("workflow brainstorm evidence omits persisted authority")
+    ordered = list(run.planning_authority)
+    ordered.extend(scanned[ref] for ref in scanned if ref not in persisted)
+    return tuple(ordered), evidence_source_revision
+
+
 def _audit_phase_steps(
     steps,
     *,
@@ -3681,6 +3813,52 @@ def resume_workflow_run(
             "current_phase": updated.current_phase,
             "reason": "planning-publication-drift",
         }
+    try:
+        planning_authority, planning_source_revision = _validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=coordinator_root,
+        )
+    except ValueError:
+        current = registry.get_workflow_run(run.run_id)
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "planning-authority-reconciliation-failed",
+        }
+    if (
+        planning_authority != run.planning_authority
+        or planning_source_revision != run.planning_source_revision
+    ):
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            planning_authority=planning_authority,
+            planning_source_revision=planning_source_revision,
+        )
+
+    def dispatch_or_stop(bound_run, *, retry: bool = False):
+        try:
+            return dispatch_workflow_card(
+                dispatcher,
+                run=bound_run,
+                identities=identities,
+                launcher_factory=launcher_factory,
+                coordinator_root=coordinator_root,
+                retry_failed=retry,
+            )
+        except Exception:
+            current = registry.get_workflow_run(bound_run.run_id)
+            registry._manager_update_workflow_run(
+                bound_run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status="running",
+            )
+            raise
+
     step = _current_workflow_step(run)
     if step is None:
         if run.current_phase == "review" and ship_validator is not None:
@@ -3706,23 +3884,9 @@ def resume_workflow_run(
             or job.get("subject_head") == run.candidate_head
         )
     ]
-    job = jobs[-1] if jobs else dispatch_workflow_card(
-        dispatcher,
-        run=run,
-        identities=identities,
-        launcher_factory=launcher_factory,
-        coordinator_root=coordinator_root,
-        retry_failed=retry_failed,
-    )
+    job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
     if retry_failed and job is not None and job.get("status") == "failed":
-        job = dispatch_workflow_card(
-            dispatcher,
-            run=run,
-            identities=identities,
-            launcher_factory=launcher_factory,
-            coordinator_root=coordinator_root,
-            retry_failed=True,
-        )
+        job = dispatch_or_stop(run, retry=True)
     if job is None:
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
     if job.get("status") in IN_FLIGHT_STATUSES:
@@ -3762,13 +3926,7 @@ def resume_workflow_run(
         trusted_terminal=True,
     )
     updated = registry.get_workflow_run(run.run_id)
-    next_job = dispatch_workflow_card(
-        dispatcher,
-        run=updated,
-        identities=identities,
-        launcher_factory=launcher_factory,
-        coordinator_root=coordinator_root,
-    )
+    next_job = dispatch_or_stop(updated)
     if next_job is not None:
         result["job_id"] = next_job["job_id"]
     return result
@@ -4363,11 +4521,18 @@ def apply_workflow_action(
         )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
     try:
+        planning_authority, planning_source_revision = _validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=transaction_root,
+            brainstorm_ref=result.gate_refs.brainstorm_peer,
+        )
         run = registry._manager_update_workflow_run(
             run.run_id,
             current_phase="plan",
             attempts={**run.attempts, "plan": 1},
             gate_refs=result.gate_refs.as_tuple(),
+            planning_authority=planning_authority,
+            planning_source_revision=planning_source_revision,
             brainstorm_required=True,
             primary_domain=identities.require(*primary).independence_domain,
             steps=_audit_phase_steps(

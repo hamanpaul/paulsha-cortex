@@ -1,4 +1,4 @@
-- 修正 unified lifecycle handoff trust chain：declared workflow inputs 會在 dispatch 前解析、hash 綁定、必要時由 planning authority seed 到 builder worktree，並以版本化 bounded prompt 傳遞 card action、commit/test policy 與 terminal schema。
+- 修正 unified lifecycle handoff trust chain：brainstorm canonical evidence會把新發布artifact與不可變發證revision原子併入planning authority（含legacy run reconciliation），缺evidence或後續current revision rebase皆fail-closed／不誤判；declared workflow inputs在dispatch前解析、hash綁定、必要時seed到builder worktree，並以版本化bounded prompt傳遞card action、commit/test policy與terminal schema。
 - Dead headless job 進入 `needs_human` 後，periodic runner 不再自動清除 facet 或重派；只有 control queue 的明確 resume 可重試同一 run/card。
 - 新增 immutable exact-HEAD `cortex work review-attest` authority；delivery 保留實際 `maintainer-review` kind/ref/hash，與 Copilot 二選一且不弱化 ForeignReview、checks、threads、archive 或 closure gates。
 - Interactive runtime 依 `PSC_INSTANCE` 讀取 installer bootstrap env，與 systemd service 共用 control/coordinator/specs/run/monitor/project-config roots；Monitor client尊重production socket config，且symlink bootstrap fail-closed。

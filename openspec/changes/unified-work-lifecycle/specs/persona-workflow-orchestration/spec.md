@@ -79,7 +79,13 @@ Builder MUST在`feature/<issue>-<slug>` worktree執行deterministic Candidate ve
 - **THEN**Manager仍需按review gate選擇不同於Builder domain的reviewer step
 
 ### Requirement: Declared inputs必須形成hash-bound handoff
-Manager MUST在launch前解析目前card與同phase既有card的declared input globs；每個glob MUST至少命中一個regular non-symlink UTF-8檔案。Planning artifact命中 MUST與WorkflowRun的planning authority ref/hash一致；builder worktree缺檔時 Manager MAY從該authority原子seed，但mutable operator artifact drift、destination conflict或未授權的同glob替代檔 MUST fail-closed。Manager MUST把pattern/path/hash/authority/content locator保存為Job input snapshot，terminalize時 MUST重驗檔案hash。
+Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kind/hash，把brainstorm新發布artifact原子併入WorkflowRun planning authority，並保存不可變發證source revision；PR refresh MAY更新run目前source revision但MUST NOT改寫發證revision。Legacy active run也MUST只由相同evidence reconcile，MUST NOT從mutable workspace猜測authority；`brainstorm_required=true`卻缺evidence MUST fail-closed。Manager接著MUST在launch前解析目前card與同phase既有card的declared input globs；每個glob MUST至少命中一個regular non-symlink UTF-8檔案。Planning artifact命中 MUST與WorkflowRun的planning authority ref/hash一致；builder worktree缺檔時 Manager MAY從該authority原子seed，但evidence/operator artifact drift、destination conflict或未授權的同glob替代檔 MUST fail-closed。Manager MUST把pattern/path/hash/authority/content locator保存為Job input snapshot，terminalize時 MUST重驗檔案hash；dispatch exception MUST恢復`needs_human` stop facet。
+
+#### Scenario: Legacy run缺brainstorm發布artifact authority
+- **WHEN**同一active run已保存canonical brainstorm evidence，但planning authority只含brainstorm前artifact
+- **THEN**explicit resume先驗evidence scope/hash與workspace exact artifact hashes，再原子補齊同一run authority
+- **THEN**Manager從evidence採用並固化brainstorm發證source revision；後續PR refresh改變run目前source revision仍可重驗同一evidence
+- **THEN**evidence缺失、漂移或artifact不在planner outputs時保留`needs_human`且不得launch
 
 #### Scenario: Builder worktree缺accepted plan
 - **WHEN**pending build card宣告accepted plan但獨立builder worktree尚無該檔

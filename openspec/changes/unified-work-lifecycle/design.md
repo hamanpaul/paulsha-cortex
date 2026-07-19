@@ -99,7 +99,7 @@ Monitor只在GitHub/provider fresh且Record驗證通過時投影done；record缺
 
 ### 10. Planning handoff以input snapshot跨worktree
 
-WorkflowStep額外保存`skill_ref`與structured action/commit/test policy。Manager在dispatch前把目前card與同phase較早card的inputs合併，逐glob解析regular non-symlink檔案並保存pattern/path/hash/authority/content locator。若builder worktree缺accepted planning artifact，只能從WorkflowRun planning authority驗hash後原子seed；operator source drift、destination conflict、同glob未授權替代檔或128 KiB prompt bound超限皆停止在job建立前。
+WorkflowStep額外保存`skill_ref`與structured action/commit/test policy。Brainstorm publication先以canonical evidence的scope與artifact ref/kind/hash原子擴充WorkflowRun planning authority，並保存不可變發證source revision；PR refresh只能更新run目前source revision。Legacy active run只能由相同evidence reconcile，不能掃mutable檔案猜測；brainstorm-required卻缺evidence時fail-closed。Manager再於dispatch前把目前card與同phase較早card的inputs合併，逐glob解析regular non-symlink檔案並保存pattern/path/hash/authority/content locator。若builder worktree缺accepted planning artifact，只能從WorkflowRun planning authority驗hash後原子seed；operator source drift、destination conflict、同glob未授權替代檔、dispatch exception或128 KiB prompt bound超限皆保留`needs_human`並停止在job建立前。
 
 Prompt固定為`workflow-card-prompt/v1`，包含resolved source content與terminal schema。Active v1 run可繼承同phase input contract以恢復pending cards，但既有passed card不回填新證據、不偽稱通過新gate。Terminalize再次驗snapshot hash，canonical job evidence保存相同snapshot。
 

@@ -1079,6 +1079,7 @@ class JobRegistry:
             created_at=now,
             updated_at=now,
             planning_authority=tuple(planning_authority),
+            planning_source_revision=source_revision,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1118,6 +1119,7 @@ class JobRegistry:
         facets: tuple[str, ...] | None = None,
         gate_status: str | None = None,
         planning_authority: tuple[PlanningArtifactAuthority, ...] | None = None,
+        planning_source_revision: str | None = None,
         status: str | None = None,
         completion_record_path: str | None = None,
         completion_record_hash: str | None = None,
@@ -1162,6 +1164,11 @@ class JobRegistry:
                 current.planning_authority
                 if planning_authority is None
                 else tuple(planning_authority)
+            ),
+            planning_source_revision=(
+                current.planning_source_revision
+                if planning_source_revision is None
+                else planning_source_revision
             ),
             status=current.status if status is None else status,
             completion_record_path=(

@@ -259,6 +259,206 @@ def test_periodic_resume_does_not_clear_needs_human_or_retry(tmp_path: Path) -> 
     assert registry.list_jobs() == []
 
 
+def test_operator_resume_reconciles_brainstorm_artifact_authority_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    coordinator_root = tmp_path / "coordinator"
+    rows = {
+        "spec": "docs/superpowers/specs/production-wiring-spec.md",
+        "design": "docs/superpowers/specs/production-wiring-design.md",
+        "plan": "docs/superpowers/plans/production-wiring-plan.md",
+    }
+    bodies = {
+        "spec": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
+        "design": "---\nstatus: accepted\n---\n# Design\n## Decisions\nBound.\n",
+        "plan": "---\nstatus: accepted\n---\n# Plan\n## Tasks\n- Build.\n",
+    }
+    artifact_rows = []
+    for kind, ref in rows.items():
+        path = workspace / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(bodies[kind], encoding="utf-8")
+        artifact_rows.append(
+            {"kind": kind, "ref": ref, "sha256": manager._sha256_path(path)}
+        )
+    evidence = coordinator_root / "evidence" / "planning" / "brainstorm.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "brainstorm-peer",
+                "scope": {
+                    "repo": "hamanpaul/paulsha-cortex",
+                    "work_id": "production-wiring",
+                    "source_revision": "2" * 64,
+                },
+                "artifacts": artifact_rows,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    state_path = coordinator_root / "jobs.json"
+    registry = JobRegistry(state_path=state_path)
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(workspace),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 1},
+        facets=("needs_human",),
+        gate_refs=(
+            GateEvidenceRef("brainstorm", str(evidence), manager._sha256_path(evidence)),
+        ),
+        gate_status="running",
+    )
+    legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy_state["workflows"][0].pop("planning_source_revision")
+    state_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+    registry = JobRegistry(state_path=state_path)
+    run = registry.get_workflow_run(run.run_id)
+    assert run.planning_source_revision is None
+    seen: list[tuple[PlanningArtifactAuthority, ...]] = []
+
+    def no_dispatch(_dispatcher, *, run, **_kwargs):
+        seen.append(run.planning_authority)
+        return None
+
+    monkeypatch.setattr(manager, "dispatch_workflow_card", no_dispatch)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=coordinator_root,
+        operator_resume=True,
+    )
+
+    assert result["reason"] == "not-dispatchable"
+    assert {item.ref for item in seen[0]} == set(rows.values())
+    reconciled = registry.get_workflow_run(run.run_id)
+    assert reconciled.planning_authority == seen[0]
+    assert reconciled.planning_source_revision == "2" * 64
+
+    rebased = registry._manager_update_workflow_run(
+        run.run_id,
+        source_revision="3" * 64,
+    )
+    assert rebased.planning_source_revision == "2" * 64
+    periodic = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=coordinator_root,
+    )
+    assert periodic["reason"] == "not-dispatchable"
+    assert registry.get_workflow_run(run.run_id).facets == ()
+
+    evidence.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="evidence hash drift"):
+        manager._validated_brainstorm_planning_authority(
+            registry.get_workflow_run(run.run_id),
+            coordinator_root=coordinator_root,
+        )
+
+
+def test_brainstorm_required_without_evidence_stays_stopped_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=(),
+        openspec_refs=(),
+        pr_refs=(),
+        attempts={"build": 1},
+        facets=("needs_human",),
+        gate_status="running",
+        brainstorm_required=True,
+    )
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *_args, **_kwargs: dispatched.append("called"),
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=tmp_path,
+        operator_resume=True,
+    )
+
+    assert result["reason"] == "planning-authority-reconciliation-failed"
+    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
+    assert dispatched == []
+
+
+def test_operator_resume_dispatch_error_restores_needs_human(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=(),
+        openspec_refs=(),
+        pr_refs=(),
+        attempts={"build": 1},
+        facets=("needs_human", "degraded"),
+        gate_status="running",
+    )
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("input gate failed")),
+    )
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    with pytest.raises(ValueError, match="input gate failed"):
+        manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=lambda _: None,
+            coordinator_root=tmp_path,
+            operator_resume=True,
+        )
+
+    assert registry.get_workflow_run(run.run_id).facets == ("degraded", "needs_human")
+
+
 def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path: Path) -> None:
     operator_root = tmp_path / "operator"
     builder_root = tmp_path / "builder"
@@ -1588,6 +1788,14 @@ def test_brainstorm_publication_reconciles_registry_commit_boundary(
         "already-claimed" if commit_before_error else "brainstorm-complete"
     )
     assert restarted.get_workflow_run(result["run_id"]).current_phase == "plan"
+    assert {
+        authority.ref
+        for authority in restarted.get_workflow_run(result["run_id"]).planning_authority
+    } == {
+        "docs/superpowers/specs/production-wiring-spec.md",
+        "docs/superpowers/specs/production-wiring-design.md",
+        "docs/superpowers/plans/production-wiring-plan.md",
+    }
     assert not list((tmp_path / "planning-transactions").glob("*.json"))
 
 
