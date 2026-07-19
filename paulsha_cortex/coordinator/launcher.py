@@ -41,6 +41,82 @@ _CREDENTIAL_ENV_RE = re.compile(
 )
 
 
+def _claude_review_json_schema(kind: str) -> str:
+    """Bind Claude StructuredOutput to the Manager terminal contract."""
+
+    report = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["path", "body"],
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "body": {"type": "string", "minLength": 1},
+        },
+    }
+    common = {
+        "type": "object",
+        "additionalProperties": False,
+    }
+    if kind == "workflow-verification-result":
+        schema = {
+            **common,
+            "required": [
+                "schema_version", "kind", "status", "summary", "details", "reports",
+            ],
+            "properties": {
+                "schema_version": {"type": "integer", "enum": [1]},
+                "kind": {"type": "string", "enum": [kind]},
+                "status": {"type": "string", "enum": ["verified"]},
+                "summary": {"type": "string", "minLength": 1},
+                "details": {"type": "object"},
+                "reports": {"type": "array", "minItems": 1, "items": report},
+            },
+        }
+    elif kind == "workflow-review-result":
+        evidence = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["path", "line", "detail"],
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "line": {"type": ["integer", "null"], "minimum": 1},
+                "detail": {"type": "string", "minLength": 1},
+            },
+        }
+        finding = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["category", "severity", "summary", "evidence", "recommendation"],
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": [
+                        "acceptance", "correctness", "data-loss", "pre-existing-out-of-scope",
+                        "race", "scope-bypass", "security", "style", "verification-bypass",
+                    ],
+                },
+                "severity": {"type": "string", "enum": ["critical", "important", "minor"]},
+                "summary": {"type": "string", "minLength": 1},
+                "evidence": {"type": "array", "items": evidence},
+                "recommendation": {"type": "string", "minLength": 1},
+            },
+        }
+        schema = {
+            **common,
+            "required": ["schema_version", "kind", "reason", "findings", "reports"],
+            "properties": {
+                "schema_version": {"type": "integer", "enum": [1]},
+                "kind": {"type": "string", "enum": [kind]},
+                "reason": {"type": "string", "minLength": 1},
+                "findings": {"type": "array", "items": finding},
+                "reports": {"type": "array", "minItems": 1, "items": report},
+            },
+        }
+    else:
+        raise ValueError("Claude reviewer terminal contract kind invalid")
+    return json.dumps(schema, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
 def _srt_runtime_root() -> Path | None:
     """Resolve only the installed official sandbox-runtime package root."""
 
@@ -314,11 +390,20 @@ def build_claude_argv(
     model: str | None = None,
     read_only: bool = False,
     review_only: bool = False,
+    review_terminal_kind: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
     if review_only and worktree is None:
         raise ValueError("read-only Claude reviewer requires a Candidate checkout")
+    if review_only:
+        if review_terminal_kind is None:
+            raise ValueError("Claude reviewer terminal contract kind missing")
+        review_schema = _claude_review_json_schema(review_terminal_kind)
+    else:
+        if review_terminal_kind is not None:
+            raise ValueError("Claude terminal contract requires reviewer mode")
+        review_schema = None
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
     argv = [
@@ -357,7 +442,7 @@ def build_claude_argv(
             '{"mcpServers":{}}',
             "--strict-mcp-config",
             "--json-schema",
-            '{"type":"object"}',
+            str(review_schema),
             "--safe-mode",
             "--disable-slash-commands",
             "--no-chrome",
@@ -481,6 +566,7 @@ class SubprocessLauncher:
         read_only: bool = False,
         review_only: bool = False,
         commit_required: bool = False,
+        review_terminal_kind: str | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
@@ -494,6 +580,12 @@ class SubprocessLauncher:
             raise ValueError("read-only launcher cannot enable unsafe mode")
         if commit_required and (read_only or review_only or allow_unsafe):
             raise ValueError("commit-required launcher requires enforced workspace-write")
+        if review_only and review_terminal_kind not in {
+            "workflow-verification-result", "workflow-review-result",
+        }:
+            raise ValueError("reviewer launcher terminal contract kind invalid")
+        if not review_only and review_terminal_kind is not None:
+            raise ValueError("reviewer terminal contract requires reviewer mode")
         self._executor = executor
         self._relay_target = relay_target
         self._codex_remote = codex_remote
@@ -505,6 +597,7 @@ class SubprocessLauncher:
         self._read_only = read_only
         self._review_only = review_only
         self._commit_required = commit_required
+        self._review_terminal_kind = review_terminal_kind
 
     def as_read_only(self) -> "SubprocessLauncher":
         """Return an equivalent launcher with the executor's strict planning contract."""
@@ -520,7 +613,7 @@ class SubprocessLauncher:
             commit_required=False,
         )
 
-    def as_review_only(self) -> "SubprocessLauncher":
+    def as_review_only(self, *, terminal_kind: str) -> "SubprocessLauncher":
         """Return a launcher that can inspect, but cannot mutate, a Candidate checkout."""
 
         return SubprocessLauncher(
@@ -532,6 +625,7 @@ class SubprocessLauncher:
             read_only=False,
             review_only=True,
             commit_required=False,
+            review_terminal_kind=terminal_kind,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -575,6 +669,8 @@ class SubprocessLauncher:
         }
         if self._executor == "codex":
             builder_kwargs["commit_required"] = self._commit_required
+        if self._executor == "claude":
+            builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )
