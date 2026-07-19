@@ -38,11 +38,19 @@ def test_terminal_lifecycle_canary_docs_record_the_full_closure_contract() -> No
     assert not missing, f"terminal lifecycle canary section is missing: {missing}"
 
 
-def test_terminal_lifecycle_canary_active_tasks_stop_at_pre_archive_gates() -> None:
+def test_terminal_lifecycle_canary_archived_tasks_preserve_pre_archive_gates() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    tasks = (
-        repo_root / "openspec" / "changes" / "terminal-lifecycle-canary" / "tasks.md"
-    ).read_text(encoding="utf-8")
+    active_change = repo_root / "openspec" / "changes" / "terminal-lifecycle-canary"
+    archived_tasks = list(
+        (repo_root / "openspec" / "changes" / "archive").glob(
+            "*-terminal-lifecycle-canary/tasks.md"
+        )
+    )
+
+    assert not active_change.exists()
+    assert len(archived_tasks) == 1
+
+    tasks = archived_tasks[0].read_text(encoding="utf-8")
 
     assert "- [ ]" not in tasks
     assert "change-specific changelog fragment" in tasks
