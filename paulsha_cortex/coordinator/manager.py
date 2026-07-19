@@ -2433,7 +2433,6 @@ def _is_exact_reviewer_terminal_recovery(
         or job.get("subject_head") != run.candidate_head
         or job.get("workflow_outputs") != list(step.outputs)
         or not isinstance(repo_root_value, str)
-        or Path(repo_root_value).resolve() != Path(run.workspace_root).resolve()
     ):
         return False
     executor = job.get("executor")
@@ -2462,6 +2461,12 @@ def _is_exact_reviewer_terminal_recovery(
             allow_legacy_claude_layout=True,
         )
     except ValueError:
+        return False
+    builder_worktree = builder.get("worktree")
+    if (
+        not isinstance(builder_worktree, str)
+        or Path(repo_root_value).resolve() != Path(builder_worktree).resolve()
+    ):
         return False
     expected = job.get("workflow_sandbox_hash")
     candidate_root = Path(repo_root_value)
@@ -5092,7 +5097,7 @@ def resume_workflow_run(
                 )
             ):
                 recovery_job_id = str(recovery_jobs[-1]["job_id"])
-            if recovery_jobs:
+            if recovery_job_id is not None:
                 try:
                     _discard_reviewer_sandbox(
                         recovery_jobs[-1],

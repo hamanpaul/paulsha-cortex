@@ -62,7 +62,7 @@ Verify/review identity MUST以schema v2明示`review` capability且其independen
 #### Scenario: Claude reviewer受Plan Mode或sandbox dependency阻擋
 - **WHEN**Claude reviewer無法執行non-mutating test、sandbox dependency缺失、要求unsandboxed fallback，或`exited-0`卻沒有terminal payload
 - **THEN**Manager不得建立evidence或自動重派
-- **AND**只有run/claim/repo/source/card/phase/Candidate/builder/reviewer identity/output/sandbox snapshot全部精確綁定且Candidate未漂移時，explicit operator resume才可保留舊Job/log後重派
+- **AND**只有run/claim/repo/source/card/phase/Candidate/builder/reviewer identity/output/sandbox snapshot全部精確綁定、原始Candidate root精確等於已驗證Builder Job worktree且Candidate未漂移時，explicit operator resume才可保留舊Job/log後重派
 
 #### Scenario: Reviewer嘗試改寫Candidate或manifest授權過寬
 - **WHEN**reviewer在disposable clone外改寫原Candidate，或terminal report path離開該phase專屬Markdown root
