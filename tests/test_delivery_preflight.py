@@ -190,6 +190,47 @@ def test_run_preflight_runs_quick_policy_then_ci_parity_without_shell(tmp_path: 
     assert all(call["shell"] is False for call in calls)
 
 
+def test_run_preflight_strips_inherited_cortex_runtime_from_gate_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PSC_MANAGER_EXECUTOR", "codex")
+    monkeypatch.setenv("PSC_AGENTS_ROOT", "/live/agents")
+    monkeypatch.setenv("PSC_REPO_ROOT", "/live/repo")
+    monkeypatch.setenv("PREFLIGHT_AUTH_MARKER", "preserved")
+    calls: list[dict[str, object]] = []
+
+    class Result:
+        def __init__(self, stdout="ok", returncode=0):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = ""
+
+    def runner(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        if "status" in argv:
+            return Result("")
+        if argv[-2:] == ["rev-parse", "HEAD"]:
+            return Result(HEAD)
+        if argv[-2:] == ["rev-parse", "HEAD^{tree}"]:
+            return Result(TREE)
+        return Result()
+
+    result = run_preflight(
+        repo_root=tmp_path,
+        command=("preflight",),
+        request=PreflightRequest(pr_number=15),
+        runner=runner,
+    )
+
+    assert result.passed
+    for call in calls[3:5]:
+        environment = call["env"]
+        assert isinstance(environment, dict)
+        assert environment["PREFLIGHT_AUTH_MARKER"] == "preserved"
+        assert not any(name.startswith("PSC_") for name in environment)
+
+
 def test_run_preflight_stops_after_failed_quick_policy(tmp_path: Path) -> None:
     calls = []
 
