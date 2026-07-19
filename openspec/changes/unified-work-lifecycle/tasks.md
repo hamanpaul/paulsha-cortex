@@ -48,6 +48,7 @@
 - [x] 4.2c 讓workflow的`commit_policy=required`及legacy fanout／dispatch／retry-build Codex builder在保留`workspace-write`下，透過明確commit capability只開放Git驗證出的current-worktree gitdir、shared objects、current-branch ref/reflog parent directories；清除inherited Git repository selectors，planner／verify／review不取得Git write directories，invalid metadata維持fail-closed。
 - [x] 4.2d 讓schema/binding正確且明示`failed|needs_human`的plan/build workflow terminal只在explicit operator resume時重派同一run/card；舊job/log保留且periodic不自動重試。
 - [x] 4.2e 讓sequential build card只把Candidate單調推進到目前Candidate的exact descendant worktree HEAD；verify/review仍維持exact equality。
+- [x] 4.2f 讓verify/review只選明示review capability的foreign identity並在exact Candidate disposable clone以read-only launcher執行；原Candidate用tree snapshot防寫，Manager以phase專屬report root與durable publication journal擁有report/GateEvaluation binding，且舊planning-only Agy terminal只可由exact explicit operator recovery重派。
 - [ ] 4.3 在`paulsha-cortex`以低風險docs-only issue跑auto-label canary，刻意缺accepted plan以觸發異質brainstorm。
 - [ ] 4.4 驗canary完整經brainstorm→build→ForeignReview→archive→preflight→typed maintainer current-HEAD review→merge commit→done；通過前不擴散auto label。
 - [ ] 4.5 使用official CLI archive `unified-work-lifecycle`；issue #12只勾實際涵蓋項目。

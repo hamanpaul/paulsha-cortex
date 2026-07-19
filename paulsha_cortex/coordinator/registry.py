@@ -237,6 +237,15 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         validated_jobs = [self._validate_loaded_job(job) for job in jobs]
         job_ids = {str(job["job_id"]) for job in validated_jobs}
+        for job in validated_jobs:
+            builder_job_id = job.get("workflow_builder_job_id")
+            if builder_job_id is not None and (
+                builder_job_id not in job_ids or builder_job_id == job.get("job_id")
+            ):
+                raise ValueError(
+                    "coordinator 狀態檔 workflow_builder_job_id 格式錯誤（fail-closed）: "
+                    f"{self._state_path}"
+                )
         validated_slices = [self._validate_loaded_slice(slice_row, job_ids) for slice_row in slices]
         return validated_jobs, validated_slices, seq
 
@@ -360,7 +369,7 @@ class JobRegistry:
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
-            "workflow_sandbox_hash",
+            "workflow_sandbox_hash", "workflow_builder_job_id",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -604,6 +613,7 @@ class JobRegistry:
         source_revision: str | None = None,
         workflow_sandbox_hash: str | None = None,
         workflow_output_baseline: tuple[dict[str, str], ...] = (),
+        workflow_builder_job_id: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -614,6 +624,7 @@ class JobRegistry:
             raise ValueError(f"slice 已有 active builder，不可重複派工: {task}")
         if kind not in {"build", "review"}:
             raise ValueError(f"非法 kind: {kind!r}")
+        self._validate_existing_job_ref("workflow_builder_job_id", workflow_builder_job_id)
         self._seq += 1
         job: dict[str, Any] = {
             "job_id": f"{task}-{self._seq}",
@@ -649,6 +660,7 @@ class JobRegistry:
             "source_revision": source_revision,
             "workflow_sandbox_hash": workflow_sandbox_hash,
             "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
+            "workflow_builder_job_id": workflow_builder_job_id,
             "workflow_evidence": None,
             "created_at": _now_iso(),
         }

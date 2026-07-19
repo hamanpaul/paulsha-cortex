@@ -25,6 +25,9 @@ from . import planning_runtime
 from . import review as foreign_review
 from . import verification
 from .model_identities import (
+    AGY_DOMAIN,
+    AGY_LIVE_PROBE,
+    AGY_MODEL_ID,
     CapabilityProbe,
     IdentityRegistry,
     ModelIdentity,
@@ -49,6 +52,7 @@ IN_FLIGHT_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_STATUSES = frozenset({"exited", "failed"})
 VERIFICATION_RESULT_STATES = frozenset({"needs_human", "reviewing", "verified"})
 SLICE_ACTIONS = frozenset({"retry-build", "retry-verify", "retry-review", "abandon"})
+WORKFLOW_REPORT_MAX_BYTES = 128 * 1024
 
 
 def _utcnow() -> str:
@@ -2039,7 +2043,11 @@ def _job_for_workflow_card(
 
 def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> str:
     candidate = job.get("subject_head")
-    worktree = job.get("worktree")
+    worktree = (
+        job.get("workflow_repo_root")
+        if job.get("persona") == "reviewer"
+        else job.get("worktree")
+    )
     if (
         not isinstance(candidate, str)
         or verification.SAFE_SHA_RE.fullmatch(candidate) is None
@@ -2112,14 +2120,13 @@ def _verify_build_candidate_transition(
     return candidate
 
 
-def _review_builder_job(
+def _review_builder_job_binding(
     registry,
     *,
     run,
     builder_job_id: object,
     candidate: str,
-    identities: IdentityRegistry,
-) -> tuple[dict[str, object], object]:
+) -> tuple[dict[str, object], bool]:
     if not isinstance(builder_job_id, str) or not builder_job_id:
         raise ValueError("review evaluation builder job missing")
     builder = registry.get_job(builder_job_id)
@@ -2157,6 +2164,23 @@ def _review_builder_job(
         for step in run.steps
     ):
         raise ValueError("review evaluation builder card is not passed")
+    return builder, archive_author
+
+
+def _review_builder_job(
+    registry,
+    *,
+    run,
+    builder_job_id: object,
+    candidate: str,
+    identities: IdentityRegistry,
+) -> tuple[dict[str, object], object]:
+    builder, archive_author = _review_builder_job_binding(
+        registry,
+        run=run,
+        builder_job_id=builder_job_id,
+        candidate=candidate,
+    )
     executor = builder.get("executor")
     model = builder.get("model_id")
     if not isinstance(executor, str) or not isinstance(model, str):
@@ -2179,9 +2203,10 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
     if not isinstance(log_path, str) or not log_path:
         raise ValueError("workflow terminal log missing")
     try:
-        lines = Path(log_path).read_text(encoding="utf-8").splitlines()
+        content = Path(log_path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("workflow terminal log unreadable") from exc
+    lines = content.splitlines()
     for line in reversed(lines):
         if not line.strip():
             continue
@@ -2209,12 +2234,20 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
                 return parsed
         if _is_workflow_terminal_payload(value):
             return value
+    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```\r?\n?", content)
+    if fenced is not None:
+        parsed = _parse_terminal_json_text(fenced.group("body"))
+        if parsed is not None:
+            return parsed
     raise ValueError("workflow terminal log has no JSON evidence")
 
 
 def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
     if not isinstance(value, str):
         return None
+    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```", value)
+    if fenced is not None:
+        value = fenced.group("body")
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
@@ -2223,6 +2256,11 @@ def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
 
 
 def _is_workflow_terminal_payload(value: object) -> bool:
+    if isinstance(value, dict) and value.get("kind") in {
+        "workflow-verification-result",
+        "workflow-review-result",
+    }:
+        return type(value.get("schema_version")) is int and isinstance(value.get("reports"), list)
     return (
         isinstance(value, dict)
         and type(value.get("schema_version")) is int
@@ -2272,6 +2310,96 @@ def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
         )
         and isinstance(outputs, list)
         and all(isinstance(ref, str) for ref in outputs)
+    )
+
+
+def _is_exact_legacy_agy_recovery(
+    job: Mapping[str, object],
+    *,
+    run,
+    step,
+    identities: IdentityRegistry,
+) -> bool:
+    """Classify the one legacy planning-only Agy reviewer terminal eligible for operator recovery."""
+
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or step.persona != "reviewer"
+        or step.phase not in {"verify", "review"}
+        or job.get("persona") != "reviewer"
+        or job.get("kind") != "review"
+        or job.get("workflow_run_id") != run.run_id
+        or job.get("workflow_claim_key") != run.claim_key
+        or job.get("workflow_repo") != run.repo
+        or job.get("source_revision") != run.source_revision
+        or job.get("workflow_card") != step.card
+        or job.get("workflow_phase") != step.phase
+        or job.get("subject_head") != run.candidate_head
+        or job.get("executor") != "agy"
+        or job.get("model_id") != AGY_MODEL_ID
+        or job.get("independence_domain") != AGY_DOMAIN
+    ):
+        return False
+    worktree = job.get("worktree")
+    repo_root = job.get("workflow_repo_root")
+    input_root = job.get("workflow_input_root")
+    if (
+        not isinstance(worktree, str)
+        or not Path(worktree).is_absolute()
+        or Path(worktree).resolve(strict=False) != Path(worktree)
+        or repo_root != worktree
+        or input_root != worktree
+    ):
+        return False
+    identity = identities.get("agy", AGY_MODEL_ID)
+    if (
+        identity is None
+        or identity.independence_domain != AGY_DOMAIN
+        or identity.capabilities != ("planning",)
+        or identity.live_probe != AGY_LIVE_PROBE
+    ):
+        return False
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return False
+    required = {
+        "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
+    }
+    outputs = raw.get("outputs")
+    declared_outputs = job.get("workflow_outputs")
+    return (
+        set(raw) == required
+        and raw.get("schema_version") == 1
+        and raw.get("kind") == "workflow-card"
+        and raw.get("status") == "passed"
+        and raw.get("run_id") == run.run_id
+        and raw.get("card_id") == step.card
+        and raw.get("candidate") == run.candidate_head
+        and isinstance(run.candidate_head, str)
+        and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
+        and isinstance(outputs, list)
+        and all(
+            isinstance(ref, str)
+            and ref
+            and not Path(ref).is_absolute()
+            and ".." not in Path(ref).parts
+            and Path(ref).as_posix() == ref
+            for ref in outputs
+        )
+        and isinstance(declared_outputs, list)
+        and declared_outputs == list(step.outputs)
+        and all(
+            any(fnmatch.fnmatch(ref, pattern) for pattern in declared_outputs)
+            for ref in outputs
+        )
+        and all(
+            any(fnmatch.fnmatch(ref, pattern) for ref in outputs)
+            for pattern in declared_outputs
+        )
     )
 
 
@@ -2621,6 +2749,443 @@ def _report_binding(content: bytes) -> Mapping[str, object]:
     return payload
 
 
+def _inline_terminal_reports(
+    value: object,
+    *,
+    phase: str,
+    declared_outputs: list[str],
+) -> tuple[tuple[str, str], ...]:
+    governed_root = {
+        "verify": ("reports", "verify"),
+        "review": ("reports", "review"),
+    }.get(phase)
+    if governed_root is None:
+        raise ValueError("workflow terminal report phase invalid")
+    for pattern in declared_outputs:
+        relative_pattern = Path(pattern)
+        if (
+            relative_pattern.is_absolute()
+            or ".." in relative_pattern.parts
+            or relative_pattern.parts[:2] != governed_root
+            or relative_pattern.suffix != ".md"
+        ):
+            raise ValueError("workflow terminal report manifest root invalid")
+    if not isinstance(value, list) or not value:
+        raise ValueError("workflow terminal reports must be a non-empty list")
+    reports: list[tuple[str, str]] = []
+    refs: set[str] = set()
+    total = 0
+    for index, row in enumerate(value):
+        if not isinstance(row, dict) or set(row) != {"path", "body"}:
+            raise ValueError(f"workflow terminal reports[{index}] schema invalid")
+        ref = row.get("path")
+        body = row.get("body")
+        relative = Path(ref) if isinstance(ref, str) else Path()
+        if (
+            not isinstance(ref, str)
+            or not ref
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() != ref
+            or relative.parts[:2] != governed_root
+            or relative.suffix != ".md"
+            or ref in refs
+            or not isinstance(body, str)
+            or not body.strip()
+        ):
+            raise ValueError(f"workflow terminal reports[{index}] invalid")
+        encoded = body.encode("utf-8")
+        total += len(encoded)
+        if total > WORKFLOW_REPORT_MAX_BYTES:
+            raise ValueError("workflow terminal report content exceeds bound")
+        refs.add(ref)
+        reports.append((ref, body))
+    if any(
+        not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_outputs)
+        for ref, _body in reports
+    ):
+        raise ValueError("workflow terminal report is outside manifest refs")
+    if any(
+        not any(fnmatch.fnmatch(ref, pattern) for ref, _body in reports)
+        for pattern in declared_outputs
+    ):
+        raise ValueError("workflow terminal report is incomplete for manifest refs")
+    return tuple(reports)
+
+
+def _manager_report_content(
+    *,
+    job: Mapping[str, object],
+    candidate: str,
+    body: str,
+) -> bytes:
+    binding = {
+        "workflow_run_id": job.get("workflow_run_id"),
+        "workflow_card_id": job.get("workflow_card"),
+        "workflow_job_id": job.get("job_id"),
+        "candidate": candidate,
+    }
+    frontmatter = "\n".join(
+        f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in binding.items()
+    )
+    normalized_body = body.rstrip() + "\n"
+    return f"---\n{frontmatter}\n---\n{normalized_body}".encode("utf-8")
+
+
+class WorkflowReportPublicationDrift(RuntimeError):
+    """A report publication journal cannot be safely committed or rolled back."""
+
+
+class _WorkflowReportPublicationTransaction:
+    """Crash-consistent report publication around canonical evidence binding."""
+
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        coordinator_root: Path,
+        job_id: str,
+    ) -> None:
+        self.repo_root = repo_root.resolve()
+        self.coordinator_root = coordinator_root.resolve()
+        self.job_id = job_id
+        name = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+        self.journal_path = self.coordinator_root / "workflow-report-transactions" / f"{name}.json"
+        self.operations: list[dict[str, object]] = []
+        self.expected_evidence: dict[str, str] | None = None
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "workflow-report-publication-intent",
+            "job_id": self.job_id,
+            "repo_root": str(self.repo_root),
+            "operations": self.operations,
+            "expected_evidence": self.expected_evidence,
+        }
+
+    def _persist(self) -> None:
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        content = (json.dumps(self._payload(), ensure_ascii=False, sort_keys=True) + "\n").encode()
+        fd, tmp_name = tempfile.mkstemp(dir=self.journal_path.parent, suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.journal_path)
+            directory_fd = os.open(self.journal_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _content(operation: Mapping[str, object], field: str) -> bytes:
+        encoded = operation.get(field)
+        if not isinstance(encoded, str):
+            raise WorkflowReportPublicationDrift("workflow report transaction content invalid")
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (TypeError, ValueError) as exc:
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction content invalid"
+            ) from exc
+
+    @staticmethod
+    def _guard_path(path: Path, root: Path) -> None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction path escapes repo"
+            ) from exc
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction symlink rejected"
+                )
+
+    def publish(
+        self,
+        reports: tuple[tuple[str, str], ...],
+        *,
+        job: Mapping[str, object],
+        candidate: str,
+    ) -> None:
+        baseline_rows = job.get("workflow_output_baseline")
+        if not isinstance(baseline_rows, list):
+            raise ValueError("workflow job output baseline missing")
+        baseline_by_ref = {
+            str(row["path"]): str(row["sha256"])
+            for row in baseline_rows
+            if isinstance(row, dict)
+            and set(row) == {"path", "sha256"}
+            and isinstance(row.get("path"), str)
+            and isinstance(row.get("sha256"), str)
+        }
+        if len(baseline_by_ref) != len(baseline_rows):
+            raise ValueError("workflow job output baseline invalid")
+        operations: list[dict[str, object]] = []
+        for ref, body in reports:
+            path = self.repo_root / ref
+            self._guard_path(path, self.repo_root)
+            existed = path.is_file()
+            before = path.read_bytes() if existed else None
+            if before is not None and len(before) > WORKFLOW_REPORT_MAX_BYTES:
+                raise ValueError(f"workflow report baseline exceeds bound: {ref}")
+            before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
+            baseline_hash = baseline_by_ref.get(ref)
+            if (baseline_hash is None and existed) or (
+                baseline_hash is not None and before_hash != baseline_hash
+            ):
+                raise ValueError(f"workflow report baseline CAS conflict: {ref}")
+            after = _manager_report_content(job=job, candidate=candidate, body=body)
+            operations.append(
+                {
+                    "path": str(path),
+                    "before_exists": existed,
+                    "before_hash": before_hash,
+                    "before_content": base64.b64encode(before).decode("ascii") if before is not None else None,
+                    "before_mode": path.stat().st_mode & 0o7777 if existed else None,
+                    "after_hash": hashlib.sha256(after).hexdigest(),
+                    "after_content": base64.b64encode(after).decode("ascii"),
+                    "after_mode": 0o644,
+                }
+            )
+        self.operations = operations
+        self._persist()
+        try:
+            self._apply(forward=True)
+        except BaseException:
+            self.rollback()
+            raise
+
+    def bind_expected_evidence(self, locator: Mapping[str, object]) -> None:
+        if (
+            set(locator) != {"kind", "path", "hash"}
+            or not all(isinstance(locator.get(key), str) for key in ("kind", "path", "hash"))
+        ):
+            raise ValueError("workflow report expected evidence invalid")
+        self.expected_evidence = {key: str(locator[key]) for key in ("kind", "path", "hash")}
+        self._persist()
+
+    def _apply(self, *, forward: bool) -> None:
+        rows = self.operations if forward else list(reversed(self.operations))
+        for operation in rows:
+            path = Path(str(operation["path"]))
+            self._guard_path(path, self.repo_root)
+            current_hash = _sha256_path(path) if path.is_file() else None
+            before_hash = operation.get("before_hash")
+            after_hash = operation.get("after_hash")
+            wanted_hash = after_hash if forward else before_hash
+            tolerated_hash = before_hash if forward else after_hash
+            if current_hash == wanted_hash:
+                continue
+            if current_hash != tolerated_hash:
+                raise WorkflowReportPublicationDrift(
+                    f"workflow report publication drift: {path}"
+                )
+            if not forward and not bool(operation["before_exists"]):
+                path.unlink(missing_ok=True)
+                if path.parent.exists():
+                    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                continue
+            content_field = "after_content" if forward else "before_content"
+            mode_field = "after_mode" if forward else "before_mode"
+            content = self._content(operation, content_field)
+            mode = operation.get(mode_field)
+            if not isinstance(mode, int):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction mode invalid"
+                )
+            _PlanningPublicationTransaction._write_atomic(
+                path,
+                content,
+                mode,
+                expect_absent=current_hash is None,
+                expected_hash=current_hash,
+            )
+
+    def rollback(self) -> None:
+        if not self.journal_path.exists():
+            return
+        self._apply(forward=False)
+        self.commit()
+
+    def commit(self) -> None:
+        self.journal_path.unlink(missing_ok=True)
+        if self.journal_path.parent.exists():
+            directory_fd = os.open(self.journal_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+    @classmethod
+    def reconcile(
+        cls,
+        *,
+        registry,
+        job: Mapping[str, object],
+        coordinator_root: Path,
+    ) -> None:
+        repo_root_value = job.get("workflow_repo_root")
+        job_id = job.get("job_id")
+        if not isinstance(repo_root_value, str) or not isinstance(job_id, str):
+            return
+        transaction = cls(
+            repo_root=Path(repo_root_value),
+            coordinator_root=coordinator_root,
+            job_id=job_id,
+        )
+        path = transaction.journal_path
+        if path.is_symlink():
+            raise WorkflowReportPublicationDrift("workflow report transaction symlink rejected")
+        if not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction unreadable"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {
+                "schema_version", "kind", "job_id", "repo_root", "operations", "expected_evidence",
+            }
+            or payload.get("schema_version") != 1
+            or payload.get("kind") != "workflow-report-publication-intent"
+            or payload.get("job_id") != job_id
+            or payload.get("repo_root") != str(Path(repo_root_value).resolve())
+            or not isinstance(payload.get("operations"), list)
+        ):
+            raise WorkflowReportPublicationDrift("workflow report transaction invalid")
+        phase_root = {
+            "verify": ("reports", "verify"),
+            "review": ("reports", "review"),
+        }.get(job.get("workflow_phase"))
+        required_operation = {
+            "path", "before_exists", "before_hash", "before_content", "before_mode",
+            "after_hash", "after_content", "after_mode",
+        }
+        operations: list[dict[str, object]] = []
+        operation_paths: set[Path] = set()
+        for row in payload["operations"]:
+            if not isinstance(row, dict) or set(row) != required_operation or phase_root is None:
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            operation = dict(row)
+            operation_path = Path(str(operation["path"]))
+            if (
+                not operation_path.is_absolute()
+                or operation_path != operation_path.resolve(strict=False)
+            ):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            try:
+                relative = operation_path.relative_to(transaction.repo_root)
+            except ValueError as exc:
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                ) from exc
+            if (
+                ".." in relative.parts
+                or relative.parts[:2] != phase_root
+                or relative.suffix != ".md"
+                or operation_path in operation_paths
+            ):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            operation_paths.add(operation_path)
+            if not isinstance(operation.get("before_exists"), bool):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction operation invalid"
+                )
+            before = operation.get("before_content")
+            before_hash = operation.get("before_hash")
+            before_mode = operation.get("before_mode")
+            if operation["before_exists"]:
+                before_bytes = transaction._content(operation, "before_content")
+                if (
+                    not isinstance(before_hash, str)
+                    or hashlib.sha256(before_bytes).hexdigest() != before_hash
+                    or not isinstance(before_mode, int)
+                ):
+                    raise WorkflowReportPublicationDrift(
+                        "workflow report transaction baseline invalid"
+                    )
+            elif any(value is not None for value in (before, before_hash, before_mode)):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction baseline invalid"
+                )
+            after_bytes = transaction._content(operation, "after_content")
+            if (
+                not isinstance(operation.get("after_hash"), str)
+                or hashlib.sha256(after_bytes).hexdigest() != operation["after_hash"]
+                or not isinstance(operation.get("after_mode"), int)
+            ):
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction target invalid"
+                )
+            operations.append(operation)
+        transaction.operations = operations
+        expected = payload.get("expected_evidence")
+        expected_path = Path(str(expected.get("path"))) if isinstance(expected, dict) else None
+        if expected is not None and (
+            not isinstance(expected, dict)
+            or set(expected) != {"kind", "path", "hash"}
+            or expected.get("kind") != job.get("workflow_phase")
+            or not isinstance(expected.get("path"), str)
+            or expected_path is None
+            or expected_path.is_absolute()
+            or ".." in expected_path.parts
+            or expected_path.as_posix() != expected.get("path")
+            or expected_path.parts[:2] != ("evidence", "workflow")
+            or not isinstance(expected.get("hash"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(expected["hash"])) is None
+        ):
+            raise WorkflowReportPublicationDrift(
+                "workflow report transaction expected evidence invalid"
+            )
+        transaction.expected_evidence = dict(expected) if isinstance(expected, dict) else None
+        persisted = registry.get_job(job_id).get("workflow_evidence")
+        if persisted is not None:
+            if persisted != transaction.expected_evidence:
+                raise WorkflowReportPublicationDrift(
+                    "workflow report transaction evidence binding drift"
+                )
+            transaction._apply(forward=True)
+            transaction.commit()
+        else:
+            transaction.rollback()
+
+
+def _persisted_job_identity(job: Mapping[str, object], *, field: str) -> dict[str, str]:
+    identity = {
+        "executor": job.get("executor"),
+        "model_id": job.get("model_id"),
+        "independence_domain": job.get("independence_domain"),
+    }
+    if any(not isinstance(value, str) or not value for value in identity.values()):
+        raise ValueError(f"workflow {field} identity missing")
+    return {key: str(value) for key, value in identity.items()}
+
+
 def _validate_terminal_reports(
     refs: list[str],
     *,
@@ -2645,6 +3210,7 @@ def _validate_terminal_reports(
         expected = {
             "workflow_run_id": job.get("workflow_run_id"),
             "workflow_card_id": job.get("workflow_card"),
+            "workflow_job_id": job.get("job_id"),
             "candidate": candidate,
         }
         if any(binding.get(key) != value for key, value in expected.items()):
@@ -2696,6 +3262,164 @@ def _discard_failed_planner_sandbox(
         raise ValueError("planner sandbox retry cleanup incomplete")
 
 
+def _reviewer_sandbox_parent(
+    *,
+    coordinator_root: str | Path,
+    candidate_root: Path,
+) -> Path:
+    parent = Path(coordinator_root).resolve() / "review-sandboxes"
+    try:
+        parent.relative_to(candidate_root.resolve())
+    except ValueError:
+        return parent
+    return Path(coordinator_root).resolve().parent / f".{Path(coordinator_root).name}-review-sandboxes"
+
+
+def _create_reviewer_sandbox(
+    *,
+    run,
+    step,
+    candidate_root: Path,
+    coordinator_root: str | Path,
+    input_snapshot: tuple[dict[str, str], ...],
+) -> Path:
+    candidate = run.candidate_head
+    if not isinstance(candidate, str) or verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        raise ValueError("workflow reviewer candidate invalid")
+    parent = _reviewer_sandbox_parent(
+        coordinator_root=coordinator_root,
+        candidate_root=candidate_root,
+    )
+    parent.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(f"{run.run_id}:{step.card}:{candidate}".encode()).hexdigest()[:32]
+    sandbox = parent / name
+    if sandbox.exists() or sandbox.is_symlink():
+        raise ValueError("stale reviewer sandbox requires reconciliation")
+    clone = subprocess.run(
+        [
+            "git", "clone", "--quiet", "--no-hardlinks", "--no-local", "--no-checkout",
+            str(candidate_root.resolve()), str(sandbox),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if clone.returncode != 0:
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise ValueError("workflow reviewer sandbox clone failed")
+    checkout = subprocess.run(
+        ["git", "-C", str(sandbox), "checkout", "--quiet", "--detach", candidate],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if checkout.returncode != 0:
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise ValueError("workflow reviewer sandbox checkout failed")
+    remove_origin = subprocess.run(
+        ["git", "-C", str(sandbox), "remote", "remove", "origin"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    remotes = subprocess.run(
+        ["git", "-C", str(sandbox), "remote"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if remove_origin.returncode != 0 or remotes.returncode != 0 or remotes.stdout.strip():
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise ValueError("workflow reviewer sandbox remote isolation failed")
+    head = subprocess.run(
+        ["git", "-C", str(sandbox), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if head.returncode != 0 or head.stdout.strip().lower() != candidate.lower():
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise ValueError("workflow reviewer sandbox head mismatch")
+    for link in sandbox.rglob("*"):
+        if not link.is_symlink():
+            continue
+        try:
+            link.resolve(strict=False).relative_to(sandbox.resolve())
+        except ValueError as exc:
+            shutil.rmtree(sandbox, ignore_errors=True)
+            raise ValueError("workflow reviewer sandbox external symlink rejected") from exc
+    try:
+        for row in input_snapshot:
+            envelope = _read_workflow_input_content(
+                row,
+                run=run,
+                coordinator_root=coordinator_root,
+            )
+            ref = str(envelope["path"])
+            target = sandbox / ref
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = str(envelope["content"]).encode("utf-8")
+            if target.is_symlink():
+                raise ValueError("workflow reviewer input symlink rejected")
+            if target.exists() and (not target.is_file() or target.read_bytes() != content):
+                raise ValueError("workflow reviewer input seed conflict")
+            if not target.exists():
+                _PlanningPublicationTransaction._write_atomic(
+                    target,
+                    content,
+                    0o600,
+                    expect_absent=True,
+                )
+    except BaseException:
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise
+    return sandbox
+
+
+def _reviewer_sandbox_path(job: Mapping[str, object], coordinator_root: str | Path) -> Path:
+    raw = job.get("worktree")
+    repo_root = job.get("workflow_repo_root")
+    if not isinstance(raw, str) or not isinstance(repo_root, str):
+        raise ValueError("reviewer sandbox path missing")
+    path = Path(raw)
+    allowed = _reviewer_sandbox_parent(
+        coordinator_root=coordinator_root,
+        candidate_root=Path(repo_root),
+    )
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or path.parent != allowed
+        or re.fullmatch(r"[0-9a-f]{32}", path.name) is None
+    ):
+        raise ValueError("reviewer sandbox path invalid")
+    return path
+
+
+def _discard_reviewer_sandbox(
+    job: Mapping[str, object],
+    *,
+    coordinator_root: str | Path,
+    require_candidate_unchanged: bool,
+) -> None:
+    if job.get("persona") != "reviewer" or not isinstance(job.get("workflow_sandbox_hash"), str):
+        return
+    repo_root = job.get("workflow_repo_root")
+    if not isinstance(repo_root, str):
+        raise ValueError("reviewer candidate root missing")
+    candidate_root = Path(repo_root).resolve()
+    expected = str(job["workflow_sandbox_hash"])
+    sandbox = _reviewer_sandbox_path(job, coordinator_root)
+    if not sandbox.exists() and not sandbox.is_symlink():
+        return
+    unchanged = candidate_root.is_dir() and planning_runtime._tree_snapshot(candidate_root) == expected
+    shutil.rmtree(sandbox, ignore_errors=True)
+    if sandbox.exists() or sandbox.is_symlink():
+        raise ValueError("reviewer sandbox cleanup incomplete")
+    if require_candidate_unchanged and not unchanged:
+        raise ValueError("workflow reviewer modified Candidate checkout")
+
+
 def terminalize_workflow_job(
     registry,
     *,
@@ -2705,11 +3429,23 @@ def terminalize_workflow_job(
     """Create and atomically bind canonical evidence for one terminal workflow job."""
 
     job = registry.get_job(job_id)
+    _WorkflowReportPublicationTransaction.reconcile(
+        registry=registry,
+        job=job,
+        coordinator_root=Path(coordinator_root),
+    )
+    job = registry.get_job(job_id)
     sandbox_path: Path | None = None
     if job.get("workflow_evidence") is not None:
         if job.get("persona") == "planner":
             sandbox_path = _planner_sandbox_path(job, coordinator_root)
             shutil.rmtree(sandbox_path, ignore_errors=True)
+        elif job.get("persona") == "reviewer":
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=True,
+            )
         return job
     if job.get("persona") == "planner":
         expected_sandbox_hash = job.get("workflow_sandbox_hash")
@@ -2725,7 +3461,11 @@ def terminalize_workflow_job(
     if phase not in {"plan", "build", "verify", "review"}:
         raise ValueError("workflow job phase is not terminalizable")
     raw = _extract_terminal_json(job.get("log_path"))
+    declared_outputs = job.get("workflow_outputs")
+    if not isinstance(declared_outputs, list):
+        raise ValueError("workflow job declared outputs missing")
     candidate: str | None = None
+    inline_reports: tuple[tuple[str, str], ...] = ()
     if phase in {"plan", "build"}:
         required = {"schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"}
         if set(raw) != required or raw.get("schema_version") != 1 or raw.get("kind") != "workflow-card":
@@ -2741,27 +3481,96 @@ def terminalize_workflow_job(
             raise ValueError("workflow plan candidate must be null")
         normalized_payload: dict[str, object] = dict(raw)
     elif phase == "verify":
-        report_outputs = raw.get("outputs")
-        evidence_payload = dict(raw)
-        evidence_payload.pop("outputs", None)
-        normalized_payload = verification.validate_verification_evidence(evidence_payload)
-        normalized_payload["outputs"] = report_outputs
-        candidate = str(normalized_payload["candidate"])
+        required = {"schema_version", "kind", "status", "summary", "details", "reports"}
+        if (
+            set(raw) != required
+            or raw.get("schema_version") != 1
+            or raw.get("kind") != "workflow-verification-result"
+            or raw.get("status") != "verified"
+            or not isinstance(raw.get("summary"), str)
+            or not str(raw["summary"]).strip()
+            or not isinstance(raw.get("details"), dict)
+        ):
+            raise ValueError("workflow verification terminal schema invalid")
+        if not isinstance(job.get("subject_head"), str):
+            raise ValueError("workflow verification candidate missing")
+        candidate = str(job["subject_head"])
+        inline_reports = _inline_terminal_reports(
+            raw.get("reports"), phase="verify", declared_outputs=declared_outputs
+        )
+        normalized_payload = verification.validate_verification_evidence(
+            {
+                "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+                "slice_id": f"{job['workflow_run_id']}-{job['workflow_card']}",
+                "candidate": candidate,
+                "status": "verified",
+                "summary": str(raw["summary"]).strip(),
+                "details": raw["details"],
+            }
+        )
+        normalized_payload["outputs"] = [ref for ref, _body in inline_reports]
     else:
-        report_outputs = raw.get("outputs")
-        evidence_payload = dict(raw)
-        evidence_payload.pop("outputs", None)
-        normalized_payload = foreign_review.validate_gate_evaluation(evidence_payload)
-        normalized_payload["outputs"] = report_outputs
-        candidate = str(normalized_payload["candidate"])
+        required = {"schema_version", "kind", "reason", "findings", "reports"}
+        if (
+            set(raw) != required
+            or raw.get("schema_version") != 1
+            or raw.get("kind") != "workflow-review-result"
+            or not isinstance(raw.get("reason"), str)
+            or not str(raw["reason"]).strip()
+            or not isinstance(raw.get("findings"), list)
+            or not isinstance(job.get("subject_head"), str)
+        ):
+            raise ValueError("workflow review terminal schema invalid")
+        candidate = str(job["subject_head"])
+        builder_job_id = job.get("workflow_builder_job_id")
+        if not isinstance(builder_job_id, str) or not builder_job_id:
+            raise ValueError("workflow review builder job binding missing")
+        run_id = job.get("workflow_run_id")
+        if not isinstance(run_id, str):
+            raise ValueError("workflow review run binding missing")
+        run = registry.get_workflow_run(run_id)
+        builder_job, _archive_author = _review_builder_job_binding(
+            registry,
+            run=run,
+            builder_job_id=builder_job_id,
+            candidate=candidate,
+        )
+        reviewer_identity = _persisted_job_identity(job, field="reviewer")
+        builder_identity = _persisted_job_identity(builder_job, field="builder")
+        verdict = foreign_review.validate_review_verdict(
+            {
+                "schema_version": foreign_review.REVIEW_SCHEMA_VERSION,
+                "builder_job_id": builder_job_id,
+                "reviewer_job_id": str(job["job_id"]),
+                "candidate": candidate,
+                "launch_identity": reviewer_identity,
+                "findings": raw["findings"],
+            },
+            builder_job_id=builder_job_id,
+            reviewer_job_id=str(job["job_id"]),
+            candidate=candidate,
+            launch_identity=reviewer_identity,
+        )
+        inline_reports = _inline_terminal_reports(
+            raw.get("reports"), phase="review", declared_outputs=declared_outputs
+        )
+        normalized_payload = foreign_review.build_gate_evaluation(
+            slice_id=f"{job['workflow_run_id']}-{job['workflow_card']}",
+            state=str(verdict["state"]),
+            reason=str(raw["reason"]).strip(),
+            builder_job_id=builder_job_id,
+            reviewer_job_id=str(job["job_id"]),
+            candidate=candidate,
+            launch_identity={"builder": builder_identity, "reviewer": reviewer_identity},
+            findings=verdict["findings"],
+        )
+        normalized_payload = foreign_review.validate_gate_evaluation(normalized_payload)
+        normalized_payload["outputs"] = [ref for ref, _body in inline_reports]
     if (
         normalized_payload.get("run_id", job.get("workflow_run_id")) != job.get("workflow_run_id")
         or normalized_payload.get("card_id", job.get("workflow_card")) != job.get("workflow_card")
     ):
         raise ValueError("workflow terminal evidence run/card mismatch")
-    declared_outputs = job.get("workflow_outputs")
-    if not isinstance(declared_outputs, list):
-        raise ValueError("workflow job declared outputs missing")
     output_refs = normalized_payload.get("outputs", [])
     if not isinstance(output_refs, list):
         raise ValueError("workflow terminal outputs invalid")
@@ -2790,6 +3599,12 @@ def terminalize_workflow_job(
         input_snapshot,
         coordinator_root=coordinator_root,
     )
+    if job.get("persona") == "reviewer":
+        _discard_reviewer_sandbox(
+            job,
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=True,
+        )
     baseline_rows = job.get("workflow_output_baseline")
     if not isinstance(baseline_rows, list):
         raise ValueError("workflow job output baseline missing")
@@ -2803,79 +3618,106 @@ def terminalize_workflow_job(
     }
     if len(baseline_by_ref) != len(baseline_rows):
         raise ValueError("workflow job output baseline invalid")
-    _validate_terminal_reports(
-        output_refs,
-        repo_root=repo_root,
-        job=job,
-        candidate=candidate,
-    )
-    artifacts = _canonical_workflow_artifacts(
-        normalized_payload.get("outputs", []),
-        repo_root=repo_root,
-        baseline_by_ref=baseline_by_ref,
-    )
-    job_binding = {
-        "job_id": job["job_id"],
-        "run_id": job["workflow_run_id"],
-        "claim_key": job["workflow_claim_key"],
-        "repo": job["workflow_repo"],
-        "source_revision": job["source_revision"],
-        "card_id": job["workflow_card"],
-        "phase": phase,
-        "inputs": job.get("workflow_inputs", []),
-        "outputs": declared_outputs,
-        "output_baseline": baseline_rows,
-    }
-    if "workflow_input_snapshot" in job:
-        job_binding["input_snapshot"] = input_snapshot
-    envelope = {
-        "schema_version": 1,
-        "kind": str(phase),
-        "job": job_binding,
-        "payload": normalized_payload,
-        "artifacts": artifacts,
-    }
-    content = (json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    root = Path(coordinator_root).resolve()
-    relative = Path("evidence") / "workflow" / f"{hashlib.sha256(job_id.encode()).hexdigest()}.json"
-    path = root / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
+    report_transaction: _WorkflowReportPublicationTransaction | None = None
     created_evidence = False
+    path: Path | None = None
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if path.is_symlink() or path.read_bytes() != content:
-            raise ValueError("workflow canonical evidence conflict")
-    else:
-        created_evidence = True
+        if inline_reports:
+            if candidate is None:
+                raise ValueError("workflow report candidate missing")
+            report_transaction = _WorkflowReportPublicationTransaction(
+                repo_root=repo_root,
+                coordinator_root=Path(coordinator_root),
+                job_id=job_id,
+            )
+            report_transaction.publish(inline_reports, job=job, candidate=candidate)
+        _validate_terminal_reports(
+            output_refs,
+            repo_root=repo_root,
+            job=job,
+            candidate=candidate,
+        )
+        artifacts = _canonical_workflow_artifacts(
+            normalized_payload.get("outputs", []),
+            repo_root=repo_root,
+            baseline_by_ref=baseline_by_ref,
+        )
+        job_binding = {
+            "job_id": job["job_id"],
+            "run_id": job["workflow_run_id"],
+            "claim_key": job["workflow_claim_key"],
+            "repo": job["workflow_repo"],
+            "source_revision": job["source_revision"],
+            "card_id": job["workflow_card"],
+            "phase": phase,
+            "inputs": job.get("workflow_inputs", []),
+            "outputs": declared_outputs,
+            "output_baseline": baseline_rows,
+        }
+        if "workflow_input_snapshot" in job:
+            job_binding["input_snapshot"] = input_snapshot
+        envelope = {
+            "schema_version": 1,
+            "kind": str(phase),
+            "job": job_binding,
+            "payload": normalized_payload,
+            "artifacts": artifacts,
+        }
+        content = (
+            json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        root = Path(coordinator_root).resolve()
+        relative = Path("evidence") / "workflow" / f"{hashlib.sha256(job_id.encode()).hexdigest()}.json"
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        locator = {
+            "kind": str(phase),
+            "path": relative.as_posix(),
+            "hash": hashlib.sha256(content).hexdigest(),
+        }
+        if report_transaction is not None:
+            report_transaction.bind_expected_evidence(locator)
         try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except BaseException:
-            path.unlink(missing_ok=True)
-            raise
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    locator = {
-        "kind": str(phase),
-        "path": relative.as_posix(),
-        "hash": hashlib.sha256(content).hexdigest(),
-    }
-    try:
-        bound = registry.bind_workflow_evidence(job_id, locator=locator, subject_head=candidate)
-    except BaseException:
-        if created_evidence:
-            path.unlink(missing_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if path.is_symlink() or path.read_bytes() != content:
+                raise ValueError("workflow canonical evidence conflict")
+        else:
+            created_evidence = True
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
             directory_fd = os.open(path.parent, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+        bound = registry.bind_workflow_evidence(job_id, locator=locator, subject_head=candidate)
+        if report_transaction is not None:
+            report_transaction.commit()
+    except BaseException:
+        persisted = registry.get_job(job_id).get("workflow_evidence")
+        if persisted is None:
+            if created_evidence and path is not None:
+                path.unlink(missing_ok=True)
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            if report_transaction is not None:
+                report_transaction.rollback()
+        elif report_transaction is not None:
+            _WorkflowReportPublicationTransaction.reconcile(
+                registry=registry,
+                job=registry.get_job(job_id),
+                coordinator_root=Path(coordinator_root),
+            )
         raise
     if sandbox_path is not None:
         shutil.rmtree(sandbox_path, ignore_errors=True)
@@ -3551,7 +4393,12 @@ def _select_workflow_identity(run, step, identities: IdentityRegistry):
     if step.persona == "planner":
         candidates = [item for item in candidates if "planning" in item.capabilities]
     if step.persona == "reviewer":
-        candidates = [item for item in candidates if item.independence_domain not in builder_domains]
+        candidates = [
+            item
+            for item in candidates
+            if "review" in item.capabilities
+            and item.independence_domain not in builder_domains
+        ]
     elif run.primary_domain is not None:
         preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
         if preferred:
@@ -3600,6 +4447,33 @@ def _workflow_job_prompt(
             coordinator_root=coordinator_root,
         )
         source_material.append({**row, "content": envelope["content"]})
+    if step.phase == "verify":
+        terminal_schema: dict[str, object] = {
+            "kind": "workflow-verification-result",
+            "schema_version": 1,
+            "required": ["schema_version", "kind", "status", "summary", "details", "reports"],
+            "fixed": {"schema_version": 1, "kind": "workflow-verification-result", "status": "verified"},
+            "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
+        }
+    elif step.phase == "review":
+        terminal_schema = {
+            "kind": "workflow-review-result",
+            "schema_version": 1,
+            "required": ["schema_version", "kind", "reason", "findings", "reports"],
+            "fixed": {"schema_version": 1, "kind": "workflow-review-result"},
+            "finding_keys": ["category", "severity", "summary", "evidence", "recommendation"],
+            "finding_evidence_keys": ["path", "line", "detail"],
+            "finding_categories": sorted(foreign_review.VALID_FINDING_CATEGORIES),
+            "finding_severities": sorted(foreign_review.VALID_SEVERITIES),
+            "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
+        }
+    else:
+        terminal_schema = {
+            "kind": "workflow-card",
+            "schema_version": 1,
+            "required": ["schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"],
+            "status": ["passed", "failed", "needs_human"],
+        }
     contract: dict[str, object] = {
         "schema_version": 1,
         "kind": "workflow-card-prompt",
@@ -3618,12 +4492,7 @@ def _workflow_job_prompt(
         "action": step.action or fallback[1],
         "commit_policy": step.commit_policy or fallback[2],
         "test_policy": step.test_policy or fallback[3],
-        "terminal_schema": {
-            "kind": "workflow-card",
-            "schema_version": 1,
-            "required": ["schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"],
-            "status": ["passed", "failed", "needs_human"],
-        },
+        "terminal_schema": terminal_schema,
     }
     if builder_job_id is not None:
         contract["builder_job_id"] = builder_job_id
@@ -3633,16 +4502,24 @@ def _workflow_job_prompt(
         if step.persona == "planner"
         else ""
     )
+    reviewer_contract = (
+        " This reviewer card is read-only: inspect and run only non-mutating commands in the "
+        "Candidate checkout. Return report bodies inline; Manager alone writes report files, "
+        "binding frontmatter, job IDs, Candidate and launch identities."
+        if step.persona == "reviewer"
+        else ""
+    )
     return (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
         "path or hash because Manager will canonicalize it."
         + planner_contract
+        + reviewer_contract
         + " Contract: "
         + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )
 
 
-def dispatch_workflow_card(
+def _dispatch_workflow_card(
     dispatcher,
     *,
     run,
@@ -3650,6 +4527,7 @@ def dispatch_workflow_card(
     launcher_factory: Callable[[object], object],
     coordinator_root: str | Path,
     retry_failed: bool = False,
+    operator_legacy_job_id: str | None = None,
 ) -> dict[str, object] | None:
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
@@ -3670,10 +4548,20 @@ def dispatch_workflow_card(
     ]
     retryable_latest = bool(
         matching
-        and retry_failed
         and (
-            matching[-1].get("status") == "failed"
-            or _retryable_nonpassing_workflow_terminal(matching[-1])
+            (
+                retry_failed
+                and (
+                    matching[-1].get("status") == "failed"
+                    or _retryable_nonpassing_workflow_terminal(matching[-1])
+                )
+            )
+            or (
+                operator_legacy_job_id == matching[-1].get("job_id")
+                and _is_exact_legacy_agy_recovery(
+                    matching[-1], run=run, step=step, identities=identities
+                )
+            )
         )
     )
     if matching and not retryable_latest:
@@ -3694,6 +4582,11 @@ def dispatch_workflow_card(
         if not callable(read_only_factory):
             raise ValueError("planner launcher lacks enforced read-only contract")
         launcher = read_only_factory()
+    elif step.persona == "reviewer":
+        review_only_factory = getattr(launcher, "as_review_only", None)
+        if not callable(review_only_factory):
+            raise ValueError("reviewer launcher lacks enforced read-only contract")
+        launcher = review_only_factory()
     effective_commit_policy = step.commit_policy or _LEGACY_CARD_EXECUTION.get(
         step.card, (None, None, None, None)
     )[2]
@@ -3724,7 +4617,10 @@ def dispatch_workflow_card(
         )
     ]
     builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
+    if step.persona == "reviewer" and builder_job_id is None:
+        raise ValueError("workflow reviewer builder job unavailable")
     planner_sandbox: Path | None = None
+    reviewer_sandbox: Path | None = None
     sandbox_hash: str | None = None
     repo_root = run.workspace_root
     if step.persona == "planner":
@@ -3769,13 +4665,44 @@ def dispatch_workflow_card(
         worktree = run.workspace_root
     effective_repo_root = Path(worktree).resolve()
     effective_inputs = _effective_workflow_inputs(run, step)
-    input_snapshot = _workflow_input_snapshot(
-        run=run,
-        repo_root=effective_repo_root,
-        patterns=effective_inputs,
-        coordinator_root=coordinator_root,
-    )
-    output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
+    if step.persona == "reviewer":
+        reviewer_target = effective_repo_root
+        input_snapshot = _workflow_input_snapshot(
+            run=run,
+            repo_root=reviewer_target,
+            patterns=effective_inputs,
+            coordinator_root=coordinator_root,
+        )
+        output_baseline = _workflow_output_baseline(reviewer_target, step.outputs)
+        try:
+            reviewer_sandbox = _create_reviewer_sandbox(
+                run=run,
+                step=step,
+                candidate_root=reviewer_target,
+                coordinator_root=coordinator_root,
+                input_snapshot=input_snapshot,
+            )
+            sandbox_hash = planning_runtime._tree_snapshot(reviewer_target)
+            repo_root = str(reviewer_target)
+            worktree = str(reviewer_sandbox)
+            effective_repo_root = reviewer_sandbox
+            _validate_workflow_input_snapshot(
+                effective_repo_root,
+                list(input_snapshot),
+                coordinator_root=coordinator_root,
+            )
+        except BaseException:
+            if reviewer_sandbox is not None:
+                shutil.rmtree(reviewer_sandbox, ignore_errors=True)
+            raise
+    else:
+        input_snapshot = _workflow_input_snapshot(
+            run=run,
+            repo_root=effective_repo_root,
+            patterns=effective_inputs,
+            coordinator_root=coordinator_root,
+        )
+        output_baseline = _workflow_output_baseline(effective_repo_root, step.outputs)
     dispatch_base: str | None = None
     if step.phase == "build":
         if builder_jobs:
@@ -3830,7 +4757,9 @@ def dispatch_workflow_card(
             workflow_repo=run.repo,
             workflow_card=step.card,
             workflow_phase=step.phase,
-            workflow_repo_root=repo_root if step.persona == "planner" else worktree,
+            workflow_repo_root=(
+                repo_root if step.persona in {"planner", "reviewer"} else worktree
+            ),
             workflow_input_root=worktree,
             workflow_inputs=effective_inputs,
             workflow_input_snapshot=input_snapshot,
@@ -3838,10 +4767,13 @@ def dispatch_workflow_card(
             source_revision=run.source_revision,
             workflow_sandbox_hash=sandbox_hash,
             workflow_output_baseline=output_baseline,
+            workflow_builder_job_id=builder_job_id if step.persona == "reviewer" else None,
         )
     except BaseException:
         if planner_sandbox is not None:
             shutil.rmtree(planner_sandbox, ignore_errors=True)
+        if reviewer_sandbox is not None:
+            shutil.rmtree(reviewer_sandbox, ignore_errors=True)
         raise
     try:
         handle = launcher.launch(
@@ -3864,11 +4796,41 @@ def dispatch_workflow_card(
             pid=handle.pid,
             log_path=handle.log_path,
         )
-    except BaseException:
+    except BaseException as launch_exc:
         registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)
         if planner_sandbox is not None:
             shutil.rmtree(planner_sandbox, ignore_errors=True)
+        if reviewer_sandbox is not None:
+            try:
+                _discard_reviewer_sandbox(
+                    registry.get_job(str(job["job_id"])),
+                    coordinator_root=coordinator_root,
+                    require_candidate_unchanged=True,
+                )
+            except Exception as cleanup_exc:
+                raise cleanup_exc from launch_exc
         raise
+
+
+def dispatch_workflow_card(
+    dispatcher,
+    *,
+    run,
+    identities: IdentityRegistry,
+    launcher_factory: Callable[[object], object],
+    coordinator_root: str | Path,
+    retry_failed: bool = False,
+) -> dict[str, object] | None:
+    """Dispatch a normal workflow card; legacy recovery is operator-resume internal only."""
+
+    return _dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=launcher_factory,
+        coordinator_root=coordinator_root,
+        retry_failed=retry_failed,
+    )
 
 
 def resume_workflow_run(
@@ -3886,6 +4848,7 @@ def resume_workflow_run(
         raise RuntimeError("workflow resume requires dispatcher registry")
     run = registry.get_workflow_run(run_id)
     retry_failed = False
+    legacy_recovery_job_id: str | None = None
     if "needs_human" in run.facets and run.status == "ongoing":
         if not operator_resume:
             return {
@@ -3893,6 +4856,37 @@ def resume_workflow_run(
                 "current_phase": run.current_phase,
                 "reason": "operator-resume-required",
             }
+        recovery_step = _current_workflow_step(run)
+        if recovery_step is not None:
+            recovery_jobs = [
+                job
+                for job in registry.list_jobs()
+                if job.get("workflow_run_id") == run.run_id
+                and job.get("workflow_card") == recovery_step.card
+                and job.get("workflow_phase") == recovery_step.phase
+                and (
+                    recovery_step.phase not in {"verify", "review"}
+                    or job.get("subject_head") == run.candidate_head
+                )
+            ]
+            if recovery_jobs and _is_exact_legacy_agy_recovery(
+                recovery_jobs[-1], run=run, step=recovery_step, identities=identities
+            ):
+                legacy_recovery_job_id = str(recovery_jobs[-1]["job_id"])
+            if recovery_jobs:
+                try:
+                    _discard_reviewer_sandbox(
+                        recovery_jobs[-1],
+                        coordinator_root=coordinator_root,
+                        require_candidate_unchanged=True,
+                    )
+                except ValueError:
+                    return {
+                        "run_id": run.run_id,
+                        "current_phase": run.current_phase,
+                        "job_id": recovery_jobs[-1].get("job_id"),
+                        "reason": "reviewer-candidate-drift",
+                    }
         run = registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(facet for facet in run.facets if facet != "needs_human"),
@@ -3941,8 +4935,23 @@ def resume_workflow_run(
             planning_source_revision=planning_source_revision,
         )
 
-    def dispatch_or_stop(bound_run, *, retry: bool = False):
+    def dispatch_or_stop(
+        bound_run,
+        *,
+        retry: bool = False,
+        retry_legacy_job_id: str | None = None,
+    ):
         try:
+            if retry_legacy_job_id is not None:
+                return _dispatch_workflow_card(
+                    dispatcher,
+                    run=bound_run,
+                    identities=identities,
+                    launcher_factory=launcher_factory,
+                    coordinator_root=coordinator_root,
+                    retry_failed=retry,
+                    operator_legacy_job_id=retry_legacy_job_id,
+                )
             return dispatch_workflow_card(
                 dispatcher,
                 run=bound_run,
@@ -3986,7 +4995,9 @@ def resume_workflow_run(
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if retry_failed and job is not None and (
+    if job is not None and legacy_recovery_job_id == job.get("job_id"):
+        job = dispatch_or_stop(run, retry_legacy_job_id=legacy_recovery_job_id)
+    elif retry_failed and job is not None and (
         job.get("status") == "failed"
         or _retryable_nonpassing_workflow_terminal(job)
     ):
@@ -3998,10 +5009,24 @@ def resume_workflow_run(
     if job.get("status") in IN_FLIGHT_STATUSES:
         return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
     if job.get("status") != "exited" or job.get("exit_code") != 0:
+        failure_reason = "job-failed"
+        try:
+            _discard_reviewer_sandbox(
+                job,
+                coordinator_root=coordinator_root,
+                require_candidate_unchanged=True,
+            )
+        except ValueError:
+            failure_reason = "reviewer-candidate-drift"
         updated = registry._manager_update_workflow_run(
             run.run_id, facets=("needs_human",), gate_status="running"
         )
-        return {"run_id": run.run_id, "current_phase": updated.current_phase, "job_id": job["job_id"], "reason": "job-failed"}
+        return {
+            "run_id": run.run_id,
+            "current_phase": updated.current_phase,
+            "job_id": job["job_id"],
+            "reason": failure_reason,
+        }
     try:
         job = terminalize_workflow_job(
             registry,
@@ -4009,6 +5034,11 @@ def resume_workflow_run(
             coordinator_root=coordinator_root,
         )
     except Exception:
+        _discard_reviewer_sandbox(
+            registry.get_job(str(job["job_id"])),
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=True,
+        )
         current = registry.get_workflow_run(run.run_id)
         registry._manager_update_workflow_run(
             run.run_id,

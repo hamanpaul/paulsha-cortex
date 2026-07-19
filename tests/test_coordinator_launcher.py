@@ -86,6 +86,22 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
         self.assertIn("--skip-git-repo-check", codex)
 
+    def test_reviewer_read_only_argv_allows_inspection_but_never_edit_permissions(self) -> None:
+        claude = build_claude_argv(
+            prompt="P", slice_id="s", log_dir="/lg", review_only=True
+        )
+        codex = build_codex_argv(
+            prompt="P", slice_id="s", log_dir="/lg", review_only=True
+        )
+
+        self.assertEqual(claude[claude.index("--permission-mode") + 1], "plan")
+        self.assertNotIn("acceptEdits", claude)
+        self.assertEqual(claude[claude.index("--tools") + 1], "Read,Grep,Glob,Bash")
+        self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+        self.assertIn("--skip-git-repo-check", codex)
+        with self.assertRaisesRegex(ValueError, "read-only"):
+            build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", review_only=True)
+
     def test_codex_builder_keeps_git_trust_check(self) -> None:
         argv = build_codex_argv(
             prompt="P", slice_id="s", log_dir="/lg", read_only=False

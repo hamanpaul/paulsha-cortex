@@ -1,0 +1,1 @@
+fix(workflow): Verify/Review只選具review capability的foreign identity並在exact Candidate disposable clone執行；Manager以tree snapshot、phase專屬report root及durable publication journal建構report/GateEvaluation binding，舊planning-only Agy reviewer terminal僅能由exact explicit operator resume重派。
