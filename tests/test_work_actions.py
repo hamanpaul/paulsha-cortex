@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -205,6 +206,94 @@ def test_resume_existing_needs_human_reenters_canonical_starter(tmp_path: Path) 
     assert calls == [(claim_key, None)]
     assert result["result"]["run"]["current_phase"] == "plan"
     assert result["result"]["run"]["facets"] == []
+
+
+def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    passed = tuple(
+        replace(step, gate_result="passed")
+        if step.phase in {"build", "verify", "review"}
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build", "verify"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        initial.run_id,
+        current_phase="review",
+        steps=passed,
+        attempts={"build": 1, "verify": 1, "review": 1},
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        facets=("needs_human",),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/review.json", "f" * 64),),
+        gate_status="running",
+    )
+    args = {
+        "action": "retry-build",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+    }
+    with pytest.raises(RuntimeError, match="Candidate CAS mismatch"):
+        work_actions.execute_work_action(
+            args={**args, "expected_candidate": "c" * 40},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
+
+    archive_started = tuple(
+        replace(step, gate_result="passed") if step.phase == "ship" else step
+        for step in passed
+    )
+    registry._manager_update_workflow_run(initial.run_id, steps=archive_started)
+    with pytest.raises(ValueError, match="pre-archive"):
+        work_actions.execute_work_action(
+            args={**args, "expected_candidate": HEAD},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(initial.run_id, steps=passed)
+
+    result = work_actions.execute_work_action(
+        args={**args, "expected_candidate": HEAD},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    assert result["result"]["action"] == "retry-build"
+    assert reset.current_phase == "build"
+    assert reset.candidate_head == HEAD
+    assert reset.verified_head is None
+    assert reset.facets == ()
+    assert reset.gate_refs == ()
+    assert reset.attempts["build"] == 2
+    build_steps = [step for step in reset.steps if step.phase == "build"]
+    assert all(step.gate_result == "passed" for step in build_steps[:-1])
+    assert build_steps[-1].gate_result == "pending"
+    assert "Do not claim archive" in str(build_steps[-1].action)
+    assert all(
+        step.gate_result == "pending"
+        for step in reset.steps
+        if step.phase in {"verify", "review", "ship"}
+    )
 
 
 def test_review_attest_writes_immutable_exact_head_evidence(

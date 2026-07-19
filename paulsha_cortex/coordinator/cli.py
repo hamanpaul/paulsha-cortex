@@ -105,7 +105,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_work = sub.add_parser("work", help="透過 manager daemon 執行 work lifecycle mutation")
     p_work.add_argument(
-        "action", choices=["link", "unlink", "start", "resume", "auto", "ship", "review-attest"]
+        "action",
+        choices=[
+            "link", "unlink", "start", "resume", "retry-build", "auto", "ship",
+            "review-attest",
+        ],
     )
     p_work.add_argument("work_id")
     p_work.add_argument("--repo", required=True)

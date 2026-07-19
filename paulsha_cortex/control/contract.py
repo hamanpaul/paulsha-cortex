@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,9 @@ from . import constants
 REQUEST_TYPES = frozenset(
     {"tick", "fanout", "dispatch", "complete", "slice-action", "workflow-action", "work-action"}
 )
-WORK_ACTIONS = frozenset({"link", "unlink", "start", "resume", "auto", "ship", "review-attest"})
+WORK_ACTIONS = frozenset(
+    {"link", "unlink", "start", "resume", "retry-build", "auto", "ship", "review-attest"}
+)
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
 
 
@@ -94,6 +97,11 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             typed = kind in WORK_SOURCE_KINDS and isinstance(ref, str) and bool(ref.strip())
             if legacy == typed:
                 raise ValueError("work-action link requires exactly one of --issue or --kind/--ref")
+        if action == "retry-build" and (
+            not isinstance(args.get("expected_candidate"), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
+        ):
+            raise ValueError("work-action retry-build requires exact expected_candidate")
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")

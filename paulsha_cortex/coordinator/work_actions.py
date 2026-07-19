@@ -1376,6 +1376,63 @@ def _claim_action(
     return {"action": decision.action, "reason": decision.reason, "run": active}
 
 
+def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+    """Reopen the final builder card with exact-Candidate CAS after a human stop."""
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+    }
+    if extras:
+        raise ValueError(f"retry-build rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_candidate = args.get("expected_candidate")
+    if (
+        not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+    ):
+        raise ValueError("retry-build requires exact expected_candidate")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("retry-build issue is not authorized by WorkAuthority")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    active = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.status == "ongoing"
+        and run.issue_refs == expected_issues
+        and run.openspec_refs == authority.mapped_openspec
+    ]
+    if len(active) != 1:
+        raise RuntimeError("retry-build requires one active canonical WorkflowRun")
+    run = active[0]
+    if "needs_human" not in run.facets:
+        raise RuntimeError("retry-build requires needs_human workflow")
+    if run.current_phase not in {"verify", "review"}:
+        raise RuntimeError("retry-build requires verify/review workflow")
+    if run.candidate_head != expected_candidate.lower():
+        raise RuntimeError("retry-build expected Candidate CAS mismatch")
+    repair_action = (
+        "Repair the exact Candidate after a delivery preflight failure. Run the authoritative "
+        "preflight, fix only real Candidate failures, and make active OpenSpec tasks describe and "
+        "complete only pre-archive work. Do not claim archive, merge, issue closure, or done before "
+        "Manager performs those actions. Commit a tested descendant Candidate."
+    )
+    updated = workflow_registry._manager_reset_workflow_for_retry_build(
+        run.run_id,
+        expected_candidate=expected_candidate.lower(),
+        repair_action=repair_action,
+    )
+    return {
+        "action": "retry-build",
+        "reason": "candidate-repair-dispatched",
+        "expected_candidate": expected_candidate.lower(),
+        "run": updated.to_dict(),
+    }
+
+
 def run_auto_claim_scan(
     *,
     snapshot_path: str | Path | None = None,
@@ -2020,7 +2077,9 @@ def execute_work_action(
     action = args.get("action")
     repo = args.get("repo")
     work_id = args.get("work_id")
-    if action not in {"link", "unlink", "start", "resume", "auto", "ship", "review-attest"}:
+    if action not in {
+        "link", "unlink", "start", "resume", "retry-build", "auto", "ship", "review-attest",
+    }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
     if not isinstance(work_id, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None:
@@ -2055,6 +2114,12 @@ def execute_work_action(
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
+        )
+    elif action == "retry-build":
+        result = _retry_build_action(
+            args=args,
+            authority=authority,
+            workflow_registry=workflow_registry,
         )
     elif action == "review-attest":
         result = _review_attest_action(

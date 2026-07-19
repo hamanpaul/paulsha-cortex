@@ -50,12 +50,14 @@ cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --
 cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
 cortex work start unified-work-lifecycle --repo owner/repo
 cortex work resume unified-work-lifecycle --repo owner/repo
+cortex work retry-build unified-work-lifecycle --repo owner/repo --issue 14 --actor operator \
+  --payload <(printf '%s\n' '{"expected_candidate":"<40-char SHA>"}')
 cortex work auto unified-work-lifecycle --repo owner/repo --enable
 cortex work auto unified-work-lifecycle --repo owner/repo --disable
 cortex doctor --probe-live --repo owner/repo --json
 ```
 
-`link`、`unlink`、`start` 與 `resume` 不要求 caller 提供 repo root；Manager 只會從 installer 的 `PSC_REPO_ROOT` 或 Monitor workspace registry 解析與 `owner/repo` remote 完全一致的 canonical git top-level。`auto` 未指定相容用的 `--issue` 時會套用到全部 confirmed mapped issues。
+`retry-build` payload只接受`{"expected_candidate":"<40-char SHA>"}`。Manager會把它當CAS，不把caller內容當evidence；只有ongoing `needs_human` verify/review run、無active job、舊build全passed、尚無ship card通過且Candidate完全相同時，才原子重開最後一張builder card，清除舊verify/review/delivery authority並立刻派出新builder。新Candidate仍必須是舊Candidate的exact descendant。`link`、`unlink`、`start` 與 `resume` 不要求 caller 提供 repo root；Manager 只會從 installer 的 `PSC_REPO_ROOT` 或 Monitor workspace registry 解析與 `owner/repo` remote 完全一致的 canonical git top-level。`auto` 未指定相容用的 `--issue` 時會套用到全部 confirmed mapped issues。
 
 工作啟動後，`$PSC_COORDINATOR_ROOT/jobs.json` 內的 `workflows` 是唯一 workflow lifecycle truth。Delivery journal 只保存以同一 `run_id` 為 key 的 resumable ship phase，不另建 lifecycle state。沒有既有 PR 時，Manager 會從 reviewed builder job、confirmed issue 與 OpenSpec authority 產生 zh-TW metadata，先驗delivery branch符合`feature/<slug>`，再於乾淨、policy-compliant且完成後刪除的暫存`feature/preflight-*` exact-Candidate checkout以metadata context跑preflight，之後冪等建立PR並把`pr_ref`原子寫回同一個`WorkflowRun`；builder worktree內的accepted planning overlay不會混入此exact-tree gate。Verify/review report是Manager-owned evidence material：最後一張review已取得immutable canonical evidence後，delivery只會清除hash完全吻合且未被Candidate追蹤的report，並在刪除前寫入hash-addressed immutable cleanup intent；只有同一intent的crash/retry evidence reader可接受report已不存在，unknown、tracked、symlink、可寫或malformed intent、未授權缺檔或drift一律阻擋。若review-complete run的ship validator失敗，Manager會先持久化`needs_human`與failed gate再回報錯誤。後續 merge 與 CompletionRecord 也綁定該 run 的 exact Candidate 與 canonical verification/review evidence。
 
