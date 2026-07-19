@@ -2187,11 +2187,53 @@ def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
 def _is_workflow_terminal_payload(value: object) -> bool:
     return (
         isinstance(value, dict)
-        and isinstance(value.get("schema_version"), int)
+        and type(value.get("schema_version")) is int
         and ("status" in value or "state" in value)
         and "candidate" in value
         and "outputs" in value
         and (value.get("kind") == "workflow-card" or "slice_id" in value)
+    )
+
+
+def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
+    """Recognize an immutable, bound card terminal that explicitly requested a stop."""
+
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or job.get("workflow_phase") not in {"plan", "build"}
+    ):
+        return False
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return False
+    required = {
+        "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
+    }
+    phase = job.get("workflow_phase")
+    candidate = raw.get("candidate")
+    outputs = raw.get("outputs")
+    return (
+        set(raw) == required
+        and type(raw.get("schema_version")) is int
+        and raw.get("schema_version") == 1
+        and raw.get("kind") == "workflow-card"
+        and raw.get("status") in {"failed", "needs_human"}
+        and raw.get("run_id") == job.get("workflow_run_id")
+        and raw.get("card_id") == job.get("workflow_card")
+        and (
+            (phase == "plan" and candidate is None)
+            or (
+                phase == "build"
+                and isinstance(candidate, str)
+                and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
+            )
+        )
+        and isinstance(outputs, list)
+        and all(isinstance(ref, str) for ref in outputs)
     )
 
 
@@ -2599,7 +2641,10 @@ def _discard_failed_planner_sandbox(
     card: str,
     coordinator_root: str | Path,
 ) -> None:
-    if job.get("persona") != "planner" or job.get("status") != "failed":
+    if job.get("persona") != "planner" or (
+        job.get("status") != "failed"
+        and not _retryable_nonpassing_workflow_terminal(job)
+    ):
         raise ValueError("planner sandbox retry requires failed planner job")
     path = _planner_sandbox_path(job, coordinator_root)
     expected_name = hashlib.sha256(f"{run_id}:{card}".encode()).hexdigest()[:32]
@@ -3585,7 +3630,15 @@ def dispatch_workflow_card(
             or job.get("subject_head") == run.candidate_head
         )
     ]
-    if matching and not (retry_failed and matching[-1].get("status") == "failed"):
+    retryable_latest = bool(
+        matching
+        and retry_failed
+        and (
+            matching[-1].get("status") == "failed"
+            or _retryable_nonpassing_workflow_terminal(matching[-1])
+        )
+    )
+    if matching and not retryable_latest:
         return matching[-1]
     if matching and step.persona == "planner":
         _discard_failed_planner_sandbox(
@@ -3895,7 +3948,10 @@ def resume_workflow_run(
         )
     ]
     job = jobs[-1] if jobs else dispatch_or_stop(run, retry=retry_failed)
-    if retry_failed and job is not None and job.get("status") == "failed":
+    if retry_failed and job is not None and (
+        job.get("status") == "failed"
+        or _retryable_nonpassing_workflow_terminal(job)
+    ):
         job = dispatch_or_stop(run, retry=True)
     if job is None:
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
@@ -3908,11 +3964,20 @@ def resume_workflow_run(
             run.run_id, facets=("needs_human",), gate_status="running"
         )
         return {"run_id": run.run_id, "current_phase": updated.current_phase, "job_id": job["job_id"], "reason": "job-failed"}
-    job = terminalize_workflow_job(
-        registry,
-        job_id=str(job["job_id"]),
-        coordinator_root=coordinator_root,
-    )
+    try:
+        job = terminalize_workflow_job(
+            registry,
+            job_id=str(job["job_id"]),
+            coordinator_root=coordinator_root,
+        )
+    except Exception:
+        current = registry.get_workflow_run(run.run_id)
+        registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+        )
+        raise
     phase_steps = [item for item in run.steps if item.phase == run.current_phase]
     is_last = step.card == phase_steps[-1].card
     next_phase = (
