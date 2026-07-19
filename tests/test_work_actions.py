@@ -254,12 +254,12 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
             workflow_registry=registry,
         )
 
-    archive_started = tuple(
+    delivery_side_effect_started = tuple(
         replace(step, gate_result="passed") if step.phase == "ship" else step
         for step in passed
     )
-    registry._manager_update_workflow_run(initial.run_id, steps=archive_started)
-    with pytest.raises(ValueError, match="pre-archive"):
+    registry._manager_update_workflow_run(initial.run_id, steps=delivery_side_effect_started)
+    with pytest.raises(ValueError, match="Manager-owned archive authority"):
         work_actions.execute_work_action(
             args={**args, "expected_candidate": HEAD},
             requested_by="operator",
@@ -293,6 +293,84 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
         step.gate_result == "pending"
         for step in reset.steps
         if step.phase in {"verify", "review", "ship"}
+    )
+
+
+def test_retry_build_preserves_only_manager_owned_archive_authority(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    archived = tuple(
+        replace(
+            step,
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            gate_result="passed",
+        )
+        if step.phase == "ship" and step.card == "openspec-archive"
+        else replace(step, gate_result="passed")
+        if step.phase in {"build", "verify", "review"}
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build", "verify"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        initial.run_id,
+        current_phase="review",
+        steps=archived,
+        attempts={"build": 1, "verify": 2, "review": 2},
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        facets=("needs_human", "degraded"),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/review.json", "f" * 64),),
+        gate_status="failed",
+    )
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "actor": "operator",
+            "expected_candidate": HEAD,
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    assert result["result"]["action"] == "retry-build"
+    assert reset.current_phase == "build"
+    assert reset.facets == ("degraded",)
+    assert reset.gate_refs == ()
+    archive = next(step for step in reset.steps if step.card == "openspec-archive")
+    assert (
+        archive.executor,
+        archive.model,
+        archive.domain,
+        archive.gate_result,
+    ) == ("cortex-manager", "deterministic", "cortex", "passed")
+    policy = next(step for step in reset.steps if step.card == "policy-commit")
+    assert policy.gate_result == "pending"
+    assert all(
+        step.gate_result == "pending"
+        for step in reset.steps
+        if step.phase in {"verify", "review"}
+    )
+    assert "Preserve the Manager-owned official OpenSpec archive" in str(
+        next(step for step in reset.steps if step.card == "subagent-build").action
     )
 
 

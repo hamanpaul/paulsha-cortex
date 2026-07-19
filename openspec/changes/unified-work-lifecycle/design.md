@@ -93,6 +93,8 @@ Merge前重新讀HEAD、mergeability、checks、threads、closing issues與archi
 
 V1 target cardinality 要求current authority恰為一張PR、一個active OpenSpec與一個Todo。若在任何delivery binding建立前因缺少或多出target而停在`needs_human`，operator可先修正repo-local confirmed correlation再explicit resume；Manager重綁同一run的journal後只清除這個特定stop。已建立binding或其他stop reason不取得此恢復權限。
 
+Official archive產生的新Candidate會失效舊verify/review evidence；若fresh reviewer發現archive後才出現的Candidate缺陷，operator可用exact CAS執行`retry-build`。Registry只允許保留identity精確為Manager deterministic archive的已通過ship step，重開最後builder與後續gate；planning reconciliation只把已移走的active artifact對應到同hash且唯一的official archive path，維持immutable brainstorm authority。Policy-commit或其他ship side effect一旦通過便拒絕rewind。修正commit仍須是archived Candidate的descendant，且不得重建active change或冒稱terminal closure。
+
 ### 9. Done在merge後以remote snapshot重證
 
 Merge後fetch default branch，驗merge commit ancestry、mapped issue closed、active OpenSpec消失、archive存在、Todo complete，再寫versioned CompletionRecord。Record綁定work ID、workflow/run/step IDs、source revisions、PR/head/merge SHA、issue states、archive tree、Todo revisions與gate evidence hashes。

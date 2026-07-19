@@ -54,6 +54,11 @@ V1 WorkflowRun只支援唯一mapped PR、唯一OpenSpec change與唯一Todo path
 - **THEN**Manager只在current authority恰為一張PR、一個active OpenSpec與一個Todo path時重綁journal並清除此target-cardinality stop
 - **THEN**既有binding或其他needs_human原因仍維持fail-closed
 
+#### Scenario: Official archive後review finding需要Candidate修正
+- **WHEN**Manager-owned official archive step已通過，但fresh verification或review對archived Candidate留下blocking finding
+- **THEN**operator可用exact Candidate CAS執行retry-build，Manager保留archive step authority並重開最後builder與後續verify/review gate
+- **THEN**新Candidate必須單調延伸archived Candidate；若任何其他ship step已通過則拒絕retry
+
 #### Scenario: Merge後issue仍open
 - **WHEN**PR已merge但任一mapped issue仍open
 - **THEN**CompletionRecord不得通過strict closure
