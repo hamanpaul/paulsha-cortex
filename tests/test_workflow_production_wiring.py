@@ -2278,6 +2278,58 @@ def test_terminal_json_uses_codex_final_agent_message_not_turn_envelope(tmp_path
     assert manager._extract_terminal_json(str(log)) == evidence
 
 
+def test_terminal_json_reads_copilot_assistant_message_data_content(tmp_path: Path) -> None:
+    evidence = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    log = tmp_path / "copilot.jsonl"
+    log.write_text(
+        "\n".join(
+            (
+                json.dumps({
+                    "type": "assistant.message",
+                    "data": {"content": json.dumps(evidence)},
+                }),
+                json.dumps({"type": "result", "exitCode": 0}),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
+def test_terminal_json_rejects_copilot_non_message_data_content(tmp_path: Path) -> None:
+    fake = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    log = tmp_path / "copilot-tool.jsonl"
+    log.write_text(
+        json.dumps({
+            "type": "tool.execution_complete",
+            "data": {"content": json.dumps(fake)},
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="no JSON evidence"):
+        manager._extract_terminal_json(str(log))
+
+
 def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
