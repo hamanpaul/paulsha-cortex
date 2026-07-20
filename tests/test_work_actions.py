@@ -590,6 +590,36 @@ def test_abandon_evidence_rejects_non_regular_existing_target(tmp_path: Path) ->
         work_actions._abandon_record(body, state_path=state)
 
 
+def test_abandon_evidence_rejects_oversized_target_without_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    digest = work_actions.verification.canonical_json_hash(body)
+    root = tmp_path / "evidence" / "work-abandon"
+    root.mkdir(parents=True)
+    target = root / f"{body['run_id']}-{digest}.json"
+    target.write_bytes(b"x" * 5000)
+    target.chmod(0o444)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _self: (_ for _ in ()).throw(AssertionError("must not read")),
+    )
+
+    with pytest.raises(RuntimeError, match="workflow abandon evidence conflict"):
+        work_actions._abandon_record(body, state_path=state)
+
+
 def test_review_attest_writes_immutable_exact_head_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

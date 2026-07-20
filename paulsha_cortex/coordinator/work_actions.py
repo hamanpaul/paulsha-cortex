@@ -1450,11 +1450,14 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
 
 def _validate_abandon_evidence_target(target: Path, content: bytes) -> None:
     try:
+        metadata = target.stat()
         conflict = (
             target.is_symlink()
             or not target.is_file()
+            or metadata.st_size != len(content)
+            or metadata.st_size > 4096
+            or metadata.st_mode & 0o222
             or target.read_bytes() != content
-            or target.stat().st_mode & 0o222
         )
     except OSError as error:
         raise RuntimeError("workflow abandon evidence conflict") from error
