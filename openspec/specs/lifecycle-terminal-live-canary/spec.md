@@ -1,7 +1,7 @@
 # lifecycle-terminal-live-canary Specification
 
 ## Purpose
-TBD - created by archiving change terminal-lifecycle-canary. Update Purpose after archive.
+定義 issue #31 docs-only terminal lifecycle canary 的可審查 closure 契約，確保所有 strict gates 與 remote closure 成立後才投影為 `done`，任一 gate 缺失時維持未完成。
 ## Requirements
 ### Requirement: Terminal live canary 必須留下可審查 evidence
 
@@ -16,5 +16,4 @@ Terminal docs-only canary MUST記錄 mapped issue、planner/builder/reviewer ind
 #### Scenario: 任一 gate 未完成
 
 - **WHEN** brainstorm、ForeignReview、archive、preflight、review或remote closure任一缺失
-- **THEN** workflow維持 `on-going`並帶 attention facet
-
+- **THEN** workflow維持 `on-going`並帶 `needs_human`或`blocked` attention facet
