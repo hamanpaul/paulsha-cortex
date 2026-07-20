@@ -1161,6 +1161,16 @@ def _completion_draft(
     return target
 
 
+def _delivery_adapter_status(action: object) -> str:
+    if not isinstance(action, str):
+        return "pending"
+    if action == "done":
+        return "passed"
+    if action in {"fix-required", "needs_human"}:
+        return "needs_human"
+    return "pending"
+
+
 def build_production_ship_validator(
     *,
     registry,
@@ -1394,9 +1404,7 @@ def build_production_ship_validator(
                 old_head=candidate,
                 new_head=candidate,
             )
-        status = "passed" if action.get("action") == "done" else "pending"
-        if action.get("action") == "needs_human":
-            status = "needs_human"
+        status = _delivery_adapter_status(action.get("action"))
         evidence = _write_json_evidence(
             state_root,
             "delivery-adapter",
