@@ -21,7 +21,7 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 - **THEN**remote HEAD未精確等於Candidate時不得進入current-HEAD delivery gate
 
 ### Requirement: Delivery review與GitHub gates必須綁定current HEAD
-開PR後 Manager MUST等待所有required checks terminal-green，並要求恰好一種current-HEAD delivery review authority：request `@copilot`所得的authenticated review，或經control queue建立的typed `maintainer-review` evidence。有效Copilot review MUST非error且`commit_id`等於current HEAD；maintainer evidence MUST immutable且精確綁定repo/work/run/authority digest/PR/current HEAD/actor/verdict。所有current findings threads MUST resolved或outdated。每次push MUST使舊review evidence失效。兩種authority MUST保留實際kind/ref/hash，MUST NOT把maintainer evidence偽裝成Copilot。Delivery review MUST NOT取代ForeignReview。Manager讀取checks、statuses與reviews的REST pagination MUST使用目前支援的typed shell-free gh argv，MUST NOT要求本機gh未提供的`--slurp`；空輸出或任一malformed page MUST fail-closed。
+開PR後 Manager MUST等待所有required checks terminal-green，並要求恰好一種current-HEAD delivery review authority：request `@copilot`所得的authenticated review，或經control queue建立的typed `maintainer-review` evidence。有效Copilot review MUST非error且`commit_id`等於current HEAD；maintainer evidence MUST immutable且精確綁定repo/work/run/authority digest/PR/current HEAD/actor/verdict。所有current findings threads MUST resolved或outdated。每次push MUST使舊review evidence失效。兩種authority MUST保留實際kind/ref/hash，MUST NOT把maintainer evidence偽裝成Copilot；merge authorization與CompletionRecord MUST保存同一種實際delivery review kind，並持續要求恰好一種。Delivery review MUST NOT取代ForeignReview。Manager讀取checks、statuses與reviews的REST pagination MUST使用目前支援的typed shell-free gh argv，MUST NOT要求本機gh未提供的`--slurp`；空輸出或任一malformed page MUST fail-closed。
 
 #### Scenario: Push後只有舊HEAD review
 - **WHEN**PR HEAD改變且最新Copilot review仍綁前一commit
@@ -45,6 +45,11 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 - **WHEN**ship validator提供該evidence完整的path/hash pair
 - **THEN**Manager MAY重入同一delivery transaction，並在merge authorization前重驗immutable evidence
 - **AND**external merge、target cardinality、未知stop reason、不完整path/hash、stale Candidate或binding mismatch MUST維持fail-closed
+
+#### Scenario: Maintainer-authorized merge建立CompletionRecord
+- **GIVEN**merge authorization保存的current-HEAD delivery review kind為`maintainer-review`
+- **WHEN**Manager驗證remote closure並建立CompletionRecord
+- **THEN**trusted evidence MUST保留`maintainer-review`的實際ref/hash，並拒絕缺少delivery review或同時宣告Copilot與maintainer authority
 
 ### Requirement: Finding處理必須bounded且不得偷換reviewer
 真finding MUST由Builder修正並加regression test；誤報 MUST由Reviewer留下evidence後resolve。每個HEAD最長等待15分鐘，最多兩輪fix/re-review。Timeout或第三輪仍有finding MUST設`needs_human`，不得替換reviewer或繞過gate。

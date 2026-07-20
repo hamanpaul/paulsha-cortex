@@ -353,7 +353,10 @@ def test_delivery_orchestrator_rejects_multi_target_authority_before_remote_muta
         )
 
 
-def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize("review_kind", ["copilot", "maintainer-review"])
+def test_remote_closure_reads_and_validates_completion_record(
+    tmp_path: Path, review_kind: str
+) -> None:
     authority = _authority(tmp_path, last_success=0)
     verification_ref = verification.write_verification_evidence(
         {
@@ -371,7 +374,11 @@ def test_remote_closure_reads_and_validates_completion_record(tmp_path: Path) ->
     trusted_evidence_refs = [
         {"kind": "preflight", "ref": "tree:" + HEAD2, "hash": "5" * 64},
         {"kind": "foreign_review", "ref": review_ref["path"], "hash": review_ref["hash"]},
-        {"kind": "copilot", "ref": "github-review:9", "hash": "6" * 64},
+        {
+            "kind": review_kind,
+            "ref": "github-review:9" if review_kind == "copilot" else str(tmp_path / "maintainer.json"),
+            "hash": "6" * 64,
+        },
         {"kind": "merge_authorization", "ref": "run:run-1", "hash": "7" * 64},
     ]
     completion_payload = {
