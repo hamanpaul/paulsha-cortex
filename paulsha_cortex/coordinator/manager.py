@@ -5310,6 +5310,49 @@ def dispatch_workflow_card(
     )
 
 
+def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
+    """Detect the narrow post-merge closure path without granting ship authority."""
+    if run.current_phase != "review" or not isinstance(run.candidate_head, str):
+        return False
+    journal_path = Path(coordinator_root) / "delivery-journal.json"
+    if journal_path.is_symlink() or not journal_path.is_file():
+        return False
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    rows = journal.get("runs") if isinstance(journal, dict) else None
+    row = rows.get(run.run_id) if isinstance(rows, dict) else None
+    ship = row.get("ship") if isinstance(row, dict) else None
+    authorization = ship.get("merge_authorization") if isinstance(ship, dict) else None
+    authorization_body = (
+        authorization.get("payload") if isinstance(authorization, dict) else None
+    )
+    return bool(
+        isinstance(journal, dict)
+        and journal.get("schema") == "cortex-delivery-journal/v1"
+        and isinstance(row, dict)
+        and row.get("run_id") == run.run_id
+        and row.get("repo") == run.repo
+        and row.get("work_id") == run.work_id
+        and isinstance(ship, dict)
+        and ship.get("phase") == "merged"
+        and ship.get("head") == run.candidate_head
+        and isinstance(ship.get("merge_commit"), str)
+        and verification.SAFE_SHA_RE.fullmatch(ship["merge_commit"]) is not None
+        and isinstance(authorization, dict)
+        and isinstance(authorization.get("path"), str)
+        and Path(authorization["path"]).is_absolute()
+        and isinstance(authorization.get("hash"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", authorization["hash"]) is not None
+        and isinstance(authorization_body, dict)
+        and authorization_body.get("run_id") == run.run_id
+        and authorization_body.get("repo") == run.repo
+        and authorization_body.get("work_id") == run.work_id
+        and authorization_body.get("head") == run.candidate_head
+    )
+
+
 def resume_workflow_run(
     dispatcher,
     *,
@@ -5409,32 +5452,38 @@ def resume_workflow_run(
             "current_phase": updated.current_phase,
             "reason": "planning-publication-drift",
         }
-    try:
-        planning_authority, planning_source_revision = _validated_brainstorm_planning_authority(
-            run,
-            coordinator_root=coordinator_root,
-        )
-    except ValueError:
-        current = registry.get_workflow_run(run.run_id)
-        updated = registry._manager_update_workflow_run(
-            run.run_id,
-            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
-            gate_status=pre_resume_gate_status,
-        )
-        return {
-            "run_id": updated.run_id,
-            "current_phase": updated.current_phase,
-            "reason": "planning-authority-reconciliation-failed",
-        }
-    if (
-        planning_authority != run.planning_authority
-        or planning_source_revision != run.planning_source_revision
-    ):
-        run = registry._manager_update_workflow_run(
-            run.run_id,
-            planning_authority=planning_authority,
-            planning_source_revision=planning_source_revision,
-        )
+    post_merge_closure = ship_validator is not None and _merged_delivery_reconciliation_pending(
+        run, coordinator_root=coordinator_root
+    )
+    if not post_merge_closure:
+        try:
+            planning_authority, planning_source_revision = (
+                _validated_brainstorm_planning_authority(
+                    run,
+                    coordinator_root=coordinator_root,
+                )
+            )
+        except ValueError:
+            current = registry.get_workflow_run(run.run_id)
+            updated = registry._manager_update_workflow_run(
+                run.run_id,
+                facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                gate_status=pre_resume_gate_status,
+            )
+            return {
+                "run_id": updated.run_id,
+                "current_phase": updated.current_phase,
+                "reason": "planning-authority-reconciliation-failed",
+            }
+        if (
+            planning_authority != run.planning_authority
+            or planning_source_revision != run.planning_source_revision
+        ):
+            run = registry._manager_update_workflow_run(
+                run.run_id,
+                planning_authority=planning_authority,
+                planning_source_revision=planning_source_revision,
+            )
 
     def dispatch_or_stop(
         bound_run,
