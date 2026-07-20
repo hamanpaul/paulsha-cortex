@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- **舊 lifecycle canary 以 abandoned 語意封存**：兩個未進入delivery的canary在Manager exact-run abandon後搬入日期archive，保留未勾選tasks並綁定immutable abandon evidence；不建立CompletionRecord，也不宣稱completed或done。
 - **Canonical ship audit保留Job發證時source revision**：evidence reader改以Job自身persisted dispatch revision驗envelope，不再因WorkflowRun current source於PR/provider refresh後前進而誤報binding invalid；run/claim/repo/card/phase與locator/hash仍完整fail-closed重驗。
 - **Cached done可用current semantic draft刷新CompletionRecord**：default snapshot前進時，Manager為`done` journal產生新draft，terminal validator優先完整驗證replacement並於成功後更新cached record ref/hash；沒有replacement仍重驗既有record，conflict或remote mismatch維持fail-closed。
 - **Cached done closure可在Manager finalization前安全重入**：delivery journal已完整記錄`done`但WorkflowRun尚未綁定CompletionRecord時，explicit resume與`merged`相同略過已消失的active planning path；journal只作routing hint，terminal validator仍完整fail-closed重驗所有closure authority。
