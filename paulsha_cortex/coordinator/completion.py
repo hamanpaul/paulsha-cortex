@@ -139,7 +139,13 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
         if not isinstance(item, dict) or set(item) != {"kind", "ref", "hash"}:
             raise ValueError("completion trusted evidence ref malformed")
         kind = item.get("kind")
-        if kind not in {"preflight", "foreign_review", "copilot", "merge_authorization"}:
+        if kind not in {
+            "preflight",
+            "foreign_review",
+            "copilot",
+            "maintainer-review",
+            "merge_authorization",
+        }:
             raise ValueError("completion trusted evidence kind invalid")
         normalized_evidence.append(
             {
@@ -152,12 +158,12 @@ def _normalize_work_authority(value: object) -> dict[str, Any]:
                 ),
             }
         )
-    if {item["kind"] for item in normalized_evidence} != {
-        "preflight",
-        "foreign_review",
-        "copilot",
-        "merge_authorization",
-    } or len(normalized_evidence) != 4:
+    evidence_kinds = {item["kind"] for item in normalized_evidence}
+    if (
+        not {"preflight", "foreign_review", "merge_authorization"}.issubset(evidence_kinds)
+        or len(evidence_kinds & {"copilot", "maintainer-review"}) != 1
+        or len(normalized_evidence) != 4
+    ):
         raise ValueError("completion trusted evidence refs incomplete")
     return {
         "repo": repo,

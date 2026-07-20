@@ -192,6 +192,11 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 ### Requirement: Headless card prompt必須是bounded execution envelope
 每張headless card prompt MUST為versioned structured envelope，至少包含run/work/source revision、phase/card/persona、skill ref、task action、commit/test policy、resolved source material、declared outputs、candidate semantics與exact terminal JSON schema。Source material總量 MUST有上限；超限 MUST fail-closed。Manager已provision worktree時，`worktree-isolation` MUST明示不得建立第二個worktree。
 
+#### Scenario: Plan/build card沒有宣告artifact output
+- **WHEN**plan/build manifest card的declared outputs為空
+- **THEN**terminal schema MUST把`outputs`明示固定為空陣列
+- **AND**有declared outputs時只允許符合每個manifest pattern的repo-relative artifact path字串；action、summary或其他描述性物件 MUST NOT被當成output ref
+
 #### Scenario: Legacy pending build card沒有直接inputs
 - **WHEN**active v1 manifest的`tdd-red`或`subagent-build`沒有直接inputs，但同phase較早card宣告accepted plan
 - **THEN**Manager繼承同phase input contract並建立snapshot

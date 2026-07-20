@@ -44,7 +44,13 @@
 - [x] 3.12 RED-test並修正既有PR的Candidate推送：fresh verify/review後先以PR context重跑乾淨exact-Candidate preflight，再由Manager冪等push並重讀授權feature ref，remote HEAD不符時不得進入delivery gate。
 - [x] 3.13 RED-test並修正terminal closure provider：Todo以default revision精確綁定的Contents identity讀取，僅bounded retry HTTP 502/503/504，production ancestry compare只查canonical workflow-linked PR。
 - [x] 3.14 RED-test並修正existing-PR metadata transaction：title/body PATCH、labels PUT及identity reread僅對HTTP 502/503/504 bounded retry；create/push/merge side effect維持單次fail-closed。
-- [x] 3.15 RED-test並新增`work abandon`：exact run ID CAS、current authority、actor/reason、active Job與pre-delivery side-effect gate全部fail-closed；成功只寫immutable evidence並將run設為superseded，不建立CompletionRecord。
+- [x] 3.15 RED-test並修正exact metadata冪等性：先authenticated reread title/body/labels，全部一致時不發PATCH/PUT；只有drift才write並再次完整reread。
+- [x] 3.16 RED-test並修正delivery finding閉環：`fix-required`由trusted adapter fail-closed映射為`needs_human`，使operator可用exact-Candidate `retry-build`重開builder。
+- [x] 3.17 RED-test並修正builder terminalization recovery：final builder job已成功退出（`exited/0`）但immutable evidence未綁定時，允許exact-Candidate `retry-build`在窄化build phase重派；真正failed job、前置build、job狀態與input snapshot維持fail-closed。
+- [x] 3.18 RED-test並收緊plan/build terminal output prompt：`outputs`只允許符合manifest的repo-relative artifact path字串；manifest無outputs時明示固定為空陣列，禁止描述性物件造成合法repair Candidate無法綁定。
+- [x] 3.19 RED-test並修正typed maintainer review recovery：只有完整path/hash且已由WorkflowRun綁定的exact-HEAD maintainer evidence可重入`copilot-*` needs-human stop；其他stop與錯誤binding維持fail-closed。
+- [x] 3.20 RED-test並修正CompletionRecord typed delivery evidence：保留merge authorization實際使用的`copilot`或`maintainer-review` kind/ref/hash，要求兩者恰好一種，避免maintainer-authorized merge卡在remote closure。
+- [x] 3.21 RED-test並新增`work abandon`：exact run ID CAS、current authority、actor/reason、active Job與pre-delivery side-effect gate全部fail-closed；成功只寫immutable evidence並將run設為superseded，不建立CompletionRecord。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

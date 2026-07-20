@@ -135,6 +135,52 @@ def _write_manifest(
 
 
 class CompletionRecordValidationTests(unittest.TestCase):
+    @staticmethod
+    def _work_authority(*, review_kind: str = "copilot") -> dict:
+        return {
+            "repo": "acme/demo",
+            "work_id": "work",
+            "snapshot_hash": "0" * 64,
+            "provider_id": "github",
+            "provider_revision": "github-rev-1",
+            "source_revisions": ["issue:14@closed"],
+            "mapped_issues": [14],
+            "mapped_prs": [7],
+            "mapped_openspec": ["work"],
+            "mapped_todo_paths": ["docs/todo.md"],
+            "pr_number": 7,
+            "change": "work",
+            "todo_paths": ["docs/todo.md"],
+            "merge_commit": "a" * 40,
+            "run_id": "run-1",
+            "workflow_step_ids": ["step-ship"],
+            "trusted_evidence_refs": [
+                {"kind": "preflight", "ref": "tree:" + "b" * 40, "hash": "1" * 64},
+                {"kind": "foreign_review", "ref": "/review.json", "hash": "2" * 64},
+                {"kind": review_kind, "ref": "/delivery-review.json", "hash": "3" * 64},
+                {"kind": "merge_authorization", "ref": "/authorization.json", "hash": "4" * 64},
+            ],
+        }
+
+    def test_work_authority_accepts_maintainer_review_as_delivery_authority(self) -> None:
+        normalized = completion._normalize_work_authority(
+            self._work_authority(review_kind="maintainer-review")
+        )
+
+        self.assertEqual(
+            {item["kind"] for item in normalized["trusted_evidence_refs"]},
+            {"preflight", "foreign_review", "maintainer-review", "merge_authorization"},
+        )
+
+    def test_work_authority_rejects_both_delivery_review_authorities(self) -> None:
+        authority = self._work_authority(review_kind="maintainer-review")
+        authority["trusted_evidence_refs"].append(
+            {"kind": "copilot", "ref": "github-review:9", "hash": "5" * 64}
+        )
+
+        with self.assertRaisesRegex(ValueError, "refs incomplete"):
+            completion._normalize_work_authority(authority)
+
     def test_work_authority_rejects_unclosed_multi_target_refs(self) -> None:
         authority = {
             "repo": "acme/demo",

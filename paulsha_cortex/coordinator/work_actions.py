@@ -1169,6 +1169,26 @@ def _ship_with_maintainer_review(
     }
 
 
+def _recoverable_maintainer_ship_stop(
+    *,
+    ship: dict[str, Any] | None,
+    args: dict[str, Any],
+) -> bool:
+    """Detect a complete maintainer locator on a recoverable Copilot stop."""
+
+    has_path = args.get("maintainer_review_path") is not None
+    has_hash = args.get("maintainer_review_hash") is not None
+    if has_path != has_hash:
+        raise ValueError("maintainer review path/hash must be supplied together")
+    return bool(
+        has_path
+        and ship is not None
+        and ship.get("phase") == "needs_human"
+        and isinstance(ship.get("reason"), str)
+        and str(ship["reason"]).startswith("copilot-")
+    )
+
+
 def _fallback_workflow_starter(workflow_registry, state_path: Path):
     """Test/embedding fallback; installed daemon supplies the production starter."""
 
@@ -1410,8 +1430,8 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
     run = active[0]
     if "needs_human" not in run.facets:
         raise RuntimeError("retry-build requires needs_human workflow")
-    if run.current_phase not in {"verify", "review"}:
-        raise RuntimeError("retry-build requires verify/review workflow")
+    if run.current_phase not in {"build", "verify", "review"}:
+        raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
     archive_applied = any(
@@ -1420,20 +1440,29 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         and step.gate_result == "passed"
         for step in run.steps
     )
-    if archive_applied:
+    if run.current_phase == "build":
+        repair_action = (
+            "Recover the exact Candidate after a builder terminalization failure. Preserve all "
+            "declared input snapshots and inspect any existing unbound worktree commits before "
+            "changing files. Fix only real Candidate failures, preserve any Manager-owned official "
+            "OpenSpec archive, and do not recreate the active change or claim merge, issue closure, "
+            "or done. Commit or adopt a tested descendant Candidate."
+        )
+    elif archive_applied:
         repair_action = (
             "Repair the exact Candidate after a post-archive verification or review failure. "
-            "Preserve the Manager-owned official OpenSpec archive and fix only real Candidate "
-            "failures identified by the current verification/review evidence. Do not recreate the "
-            "active change or claim merge, issue closure, or done. Commit a tested descendant "
-            "Candidate."
+            "Inspect any existing worktree repair commits. Preserve the Manager-owned official "
+            "OpenSpec archive and fix only real Candidate failures identified by the current "
+            "verification/review evidence. Do not recreate the active change or claim merge, issue "
+            "closure, or done. Commit or adopt a tested descendant Candidate."
         )
     else:
         repair_action = (
-            "Repair the exact Candidate after a delivery preflight failure. Run the authoritative "
-            "preflight, fix only real Candidate failures, and make active OpenSpec tasks describe and "
-            "complete only pre-archive work. Do not claim archive, merge, issue closure, or done before "
-            "Manager performs those actions. Commit a tested descendant Candidate."
+            "Repair the exact Candidate after a delivery preflight failure. Inspect any existing "
+            "worktree repair commits, run the authoritative preflight, fix only real Candidate "
+            "failures, and make active OpenSpec tasks describe and complete only pre-archive work. "
+            "Do not claim archive, merge, issue closure, or done before Manager performs those "
+            "actions. Commit or adopt a tested descendant Candidate."
         )
     updated = workflow_registry._manager_reset_workflow_for_retry_build(
         run.run_id,
@@ -1865,7 +1894,8 @@ def _ship_action(
     github = GitHubDeliveryClient(runner=runner)
     orchestrator = ShipOrchestrator(github=github, now=now)
 
-    if ship and ship.get("phase") == "needs_human":
+    maintainer_recovery = _recoverable_maintainer_ship_stop(ship=ship, args=args)
+    if ship and ship.get("phase") == "needs_human" and not maintainer_recovery:
         return {"action": "needs_human", "reason": ship.get("reason")}
 
     if ship and ship.get("phase") == "merged":
@@ -2123,11 +2153,7 @@ def _ship_action(
     fix_rounds = ship.get("fix_rounds", 0) if ship else 0
     if not isinstance(fix_rounds, int) or isinstance(fix_rounds, bool) or fix_rounds < 0:
         raise ValueError("ship fix round state malformed")
-    has_maintainer_path = args.get("maintainer_review_path") is not None
-    has_maintainer_hash = args.get("maintainer_review_hash") is not None
-    if has_maintainer_path != has_maintainer_hash:
-        raise ValueError("maintainer review path/hash must be supplied together")
-    if has_maintainer_path:
+    if maintainer_recovery or args.get("maintainer_review_path") is not None:
         return _ship_with_maintainer_review(
             args=args,
             active=active,

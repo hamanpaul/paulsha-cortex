@@ -1405,6 +1405,10 @@ def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path
     assert payload["skill_ref"] == "superpowers:test-driven-development"
     assert payload["source_material"][0]["content"] == plan_bytes.decode()
     assert payload["terminal_schema"]["required"]
+    assert payload["terminal_schema"]["fixed"]["run_id"] == run.run_id
+    assert payload["terminal_schema"]["fixed"]["card_id"] == red.card
+    assert payload["terminal_schema"]["fixed"]["outputs"] == []
+    assert payload["terminal_schema"]["outputs"]["descriptive_objects_forbidden"] is True
     assert Path(snapshot[0]["content_ref"]).stat().st_mode & 0o222 == 0
 
 
@@ -2276,6 +2280,58 @@ def test_terminal_json_uses_codex_final_agent_message_not_turn_envelope(tmp_path
     )
 
     assert manager._extract_terminal_json(str(log)) == evidence
+
+
+def test_terminal_json_reads_copilot_assistant_message_data_content(tmp_path: Path) -> None:
+    evidence = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    log = tmp_path / "copilot.jsonl"
+    log.write_text(
+        "\n".join(
+            (
+                json.dumps({
+                    "type": "assistant.message",
+                    "data": {"content": json.dumps(evidence)},
+                }),
+                json.dumps({"type": "result", "exitCode": 0}),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
+def test_terminal_json_rejects_copilot_non_message_data_content(tmp_path: Path) -> None:
+    fake = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    log = tmp_path / "copilot-tool.jsonl"
+    log.write_text(
+        json.dumps({
+            "type": "tool.execution_complete",
+            "data": {"content": json.dumps(fake)},
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="no JSON evidence"):
+        manager._extract_terminal_json(str(log))
 
 
 def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Path) -> None:
@@ -3293,16 +3349,34 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     args = _workflow_args(manifest_path, tmp_path)
     args["planning_artifacts"] = rows
     args["primary_domain"] = "openai"
+    launched: list[str] = []
+
+    class Launcher:
+        def as_read_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append(slice_id)
+            return LaunchHandle(
+                executor="test",
+                model_id="test",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
     executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),
         handoff_dir=str(tmp_path / "handoff"),
+        launcher=Launcher(),
         workflow_runtime_factory=lambda **_: (_ for _ in ()).throw(AssertionError("must not launch")),
     )
 
     result = executor(build_request(req_type="workflow-action", args=args, requested_by="operator"))
     run = registry.get_workflow_run(result["run_id"])
     assert result["reason"] == "planning-complete"
+    assert launched == [result["job_id"]]
     assert run.brainstorm_required is False
     assert run.gate_refs == ()
     assert {
