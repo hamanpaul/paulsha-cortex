@@ -25,7 +25,7 @@ work_item: terminal-lifecycle-canary
 
 ### 3. Deliver and close
 
-- [x] Archive the `terminal-lifecycle-canary` OpenSpec change through the Manager-owned official archive flow.
+- [ ] Archive the `terminal-lifecycle-canary` OpenSpec change through the official archive flow.
 - [ ] Deliver the accepted change using a merge commit.
 - [ ] Close issue #31 through the delivered merge.
 - [ ] Verify that the completed work is projected as done.
