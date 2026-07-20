@@ -247,6 +247,92 @@ def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
     assert any("--method" in call and "PUT" in call for call in calls)
 
 
+def test_ensure_pr_metadata_retries_only_transient_idempotent_calls() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    class TransientMetadataRunner:
+        def __call__(self, argv, **kwargs):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                result = Result({}, returncode=1)
+                result.stderr = "gh: temporarily unavailable (HTTP 503)"
+                return result
+            endpoint = " ".join(argv)
+            if "--method PATCH" in endpoint:
+                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+            if "--method PUT" in endpoint:
+                return Result({"labels": [{"name": "enhancement"}]})
+            if endpoint.endswith("repos/acme/demo/pulls/7"):
+                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+            if endpoint.endswith("repos/acme/demo/issues/7"):
+                return Result({"labels": [{"name": "enhancement"}]})
+            raise AssertionError(argv)
+
+    GitHubDeliveryClient(
+        runner=TransientMetadataRunner(),
+        metadata_retry_delays=(0.25,),
+        sleeper=sleeps.append,
+    ).ensure_pr_metadata(
+        repo="acme/demo",
+        pr_number=7,
+        title="fix(work): 修正工作流程",
+        body="Closes #14",
+        labels=("enhancement",),
+    )
+
+    assert calls[0] == calls[1]
+    assert sleeps == [0.25]
+
+
+def test_delivery_reads_outside_metadata_do_not_retry_gateway_failures() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def unavailable(argv, **kwargs):
+        calls.append(list(argv))
+        result = Result({}, returncode=1)
+        result.stderr = "gh: temporarily unavailable (HTTP 503)"
+        return result
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        GitHubDeliveryClient(
+            runner=unavailable,
+            metadata_retry_delays=(0.25,),
+            sleeper=sleeps.append,
+        ).fetch_merge_status(repo="acme/demo", pr_number=7)
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_ensure_pr_metadata_does_not_retry_non_transient_failure() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def unauthorized(argv, **kwargs):
+        calls.append(list(argv))
+        result = Result({}, returncode=1)
+        result.stderr = "gh: authentication failed (HTTP 401)"
+        return result
+
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        GitHubDeliveryClient(
+            runner=unauthorized,
+            metadata_retry_delays=(0.25, 0.5),
+            sleeper=sleeps.append,
+        ).ensure_pr_metadata(
+            repo="acme/demo",
+            pr_number=7,
+            title="fix(work): 修正工作流程",
+            body="Closes #14",
+            labels=("enhancement",),
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
 def test_ensure_pr_metadata_rejects_remote_reread_drift() -> None:
     class DriftRunner:
         def __call__(self, argv, **kwargs):

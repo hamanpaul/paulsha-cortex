@@ -29,6 +29,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **Delivery PR metadata可承受暫時gateway故障**：既有PR的title/body PATCH、labels PUT與兩筆identity reread只在HTTP 502/503/504時做finite bounded retry；這些操作皆為冪等metadata transaction。PR create、push、merge與其他delivery side effect不共用此retry路徑，auth、rate-limit及malformed response仍立即fail-closed。
 - **Terminal closure provider不再被GitHub暫時gateway故障或無關PR拖垮**：remote Todo改以default revision精確綁定的Contents API讀取，並逐筆重驗path/blob SHA/encoding；只有HTTP 502/503/504會依有限backoff重試，auth、rate-limit與malformed response仍立即fail-closed。Production ancestry compare只對canonical WorkflowRegistry已連結的PR執行，保留完整PR remote truth但不再為整個repo的歷史merged PR逐筆查詢。
 - **既有PR可由Manager推進至fresh exact Candidate**：post-archive修復等流程若WorkflowRun已綁PR但remote branch仍停在舊HEAD，ship adapter現在會先以PR context在乾淨checkout重跑preflight，再冪等push並重讀授權的`feature/*` ref；remote HEAD未精確對齊時維持fail-closed，不再必然卡在`ship HEAD differs from authenticated GitHub PR`。
 - **Official archive 後可安全修復 Candidate finding**：`cortex work retry-build` 現在可在唯一已通過的 ship authority 是 identity 精確的 Manager official archive 時，保留 archive step並重開最後builder與fresh verify/review；brainstorm authority會以同hash的唯一official archive artifact重證，任何其他已通過ship card仍拒絕rewind。新Candidate繼續要求單調延伸，讓archive後才暴露的stale path/test defect可經正式workflow修正。
