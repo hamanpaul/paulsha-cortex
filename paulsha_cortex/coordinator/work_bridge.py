@@ -411,6 +411,7 @@ def _push_exact_candidate(
     branch: str,
     candidate: str,
     runner,
+    pre_push: Callable[[], None] | None = None,
 ) -> None:
     if re.fullmatch(r"feature/[a-z0-9][a-z0-9._/-]*", branch) is None:
         raise ValueError("workflow delivery branch is not an authorized feature ref")
@@ -468,6 +469,8 @@ def _push_exact_candidate(
     if persisted is not None and persisted != expected:
         raise RuntimeError("delivery push journal conflicts with Candidate")
     if remote_head != candidate:
+        if pre_push is not None:
+            pre_push()
         pushed = runner(
             ["git", "-C", str(worktree), "push", "origin", f"HEAD:{ref}"],
             shell=False,
@@ -1289,6 +1292,30 @@ def build_production_ship_validator(
             state_root=state_root,
             run=run,
             authority=authority,
+        )
+        def authorize_existing_pr_push() -> None:
+            existing = _run_exact_candidate_preflight(
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                command=load_preflight_command(),
+                request=PreflightRequest(pr_number=number),
+                runner=runner,
+                now=now,
+            )
+            if not existing.passed or existing.head != candidate:
+                raise RuntimeError("existing PR exact-Candidate preflight failed")
+
+        _push_exact_candidate(
+            registry=registry,
+            run=run,
+            authority=authority,
+            state_root=state_root,
+            worktree=worktree,
+            branch=branch,
+            candidate=candidate,
+            runner=runner,
+            pre_push=authorize_existing_pr_push,
         )
         from . import work_actions
         from . import review as review_evidence
