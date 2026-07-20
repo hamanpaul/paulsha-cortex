@@ -1050,7 +1050,7 @@ def _completion_draft(
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
     row = journal.get("runs", {}).get(run.run_id) if isinstance(journal, dict) else None
     ship = row.get("ship") if isinstance(row, dict) else None
-    if not isinstance(ship, dict) or ship.get("phase") != "merged":
+    if not isinstance(ship, dict) or ship.get("phase") not in {"merged", "done"}:
         return None
     authorization = ship.get("merge_authorization")
     if not isinstance(authorization, dict):

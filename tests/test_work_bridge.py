@@ -1123,6 +1123,25 @@ identities:
     assert revised_payload["target_ref_sha"] == "f" * 40
     assert json.loads(draft.read_text(encoding="utf-8")) == completion_payload
 
+    journal_path = coordinator_root / "delivery-journal.json"
+    terminal_journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    terminal_journal["runs"][run_id]["ship"]["phase"] = "done"
+    journal_path.write_text(json.dumps(terminal_journal), encoding="utf-8")
+    default_head["value"] = "b" * 40
+    done_revised = work_bridge._completion_draft(
+        registry=registry,
+        state_root=coordinator_root,
+        run=run,
+        authority=authority,
+        candidate=candidate,
+        pr_number=17,
+        foreign_ref=foreign_ref,
+        runner=subprocess.run,
+        now=lambda: 350.0,
+    )
+    assert done_revised is not None and done_revised.is_file()
+    assert json.loads(done_revised.read_text(encoding="utf-8"))["target_ref_sha"] == "b" * 40
+
     default_head["value"] = "a" * 40
     malformed = work_bridge._completion_draft(
         registry=registry,

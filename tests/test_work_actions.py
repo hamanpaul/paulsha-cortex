@@ -2502,8 +2502,9 @@ def test_v2_authorization_rejects_tampered_maintainer_review_on_replay(tmp_path:
     )
 
 
+@pytest.mark.parametrize("use_replacement", [False, True])
 def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, use_replacement: bool
 ) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
@@ -2558,6 +2559,8 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
     }
     state.write_text(json.dumps(persisted), encoding="utf-8")
     closure_calls = []
+    replacement = tmp_path / "replacement-completion.json"
+    replacement.write_text(json.dumps({"record": "replacement"}), encoding="utf-8")
 
     class GitHub:
         def __init__(self, *, runner):
@@ -2571,25 +2574,41 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
             closure_calls.append(kwargs)
             return SimpleNamespace(
                 facts=SimpleNamespace(merge_commit="c" * 40),
-                completion_record={"path": "/evidence/record.json", "hash": "d" * 64},
+                completion_record={
+                    "path": (
+                        "/evidence/replacement-record.json"
+                        if use_replacement
+                        else "/evidence/record.json"
+                    ),
+                    "hash": ("e" if use_replacement else "d") * 64,
+                },
             )
 
     from paulsha_cortex.coordinator import completion
 
     monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
     monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
-    monkeypatch.setattr(completion, "read_completion_record", lambda *args, **kwargs: {"record": True})
+    cached_reads = []
+
+    def read_cached(*args, **kwargs):
+        cached_reads.append((args, kwargs))
+        return {"record": True}
+
+    monkeypatch.setattr(completion, "read_completion_record", read_cached)
+    ship_args = {
+        "action": "ship",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "repo_root": str(tmp_path),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+    }
+    if use_replacement:
+        ship_args["completion_record_path"] = str(replacement)
     result = work_actions.execute_work_action(
-        args={
-            "action": "ship",
-            "repo": "acme/demo",
-            "work_id": "demo",
-            "repo_root": str(tmp_path),
-            "pr_number": 8,
-            "change": "demo",
-            "todo_paths": ["docs/todo.md"],
-            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
-        },
+        args=ship_args,
         requested_by="operator",
         snapshot_path=snapshot,
         state_path=state,
@@ -2598,6 +2617,13 @@ def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(
     assert result["result"]["action"] == "done"
     assert len(closure_calls) == 1
     assert closure_calls[0]["authority"].snapshot_hash == run["snapshot_hash"]
+    assert closure_calls[0]["completion_payload"] == (
+        {"record": "replacement"} if use_replacement else {"record": True}
+    )
+    assert len(cached_reads) == (0 if use_replacement else 1)
+    refreshed = json.loads(state.read_text(encoding="utf-8"))
+    refreshed_run = next(iter(refreshed["runs"].values()))
+    assert refreshed_run["ship"]["completion_record"] == result["result"]["completion_record"]
 
 
 @pytest.mark.parametrize(
