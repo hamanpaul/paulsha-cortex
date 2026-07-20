@@ -49,6 +49,7 @@
 - [x] 3.17 RED-test並修正builder terminalization recovery：final builder job已成功退出（`exited/0`）但immutable evidence未綁定時，允許exact-Candidate `retry-build`在窄化build phase重派；真正failed job、前置build、job狀態與input snapshot維持fail-closed。
 - [x] 3.18 RED-test並收緊plan/build terminal output prompt：`outputs`只允許符合manifest的repo-relative artifact path字串；manifest無outputs時明示固定為空陣列，禁止描述性物件造成合法repair Candidate無法綁定。
 - [x] 3.19 RED-test並修正typed maintainer review recovery：只有完整path/hash且已由WorkflowRun綁定的exact-HEAD maintainer evidence可重入`copilot-*` needs-human stop；其他stop與錯誤binding維持fail-closed。
+- [x] 3.20 RED-test並修正CompletionRecord typed delivery evidence：保留merge authorization實際使用的`copilot`或`maintainer-review` kind/ref/hash，要求兩者恰好一種，避免maintainer-authorized merge卡在remote closure。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

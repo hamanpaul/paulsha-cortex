@@ -99,6 +99,6 @@ Manager 是唯一 writer。每次 push 都會使上一個 delivery review epoch 
 - terminal-green checks/statuses、closing refs、archive diff 與 mergeability；
 - fresh GitHub provider snapshot。
 
-最多兩輪 builder fix/re-review，每個 HEAD 等待 15 分鐘；current-HEAD review 出現 finding 時，delivery adapter 會把 `fix-required` fail-closed 投影為 `needs_human`，只有 operator 的 exact-Candidate `retry-build` 才能重開 builder；第三次仍有 finding 或逾時也維持 `needs_human`。若後續已由Manager綁定exact-HEAD maintainer evidence，只有完整path/hash可重入這類`copilot-*` stop，其他stop reason仍fail-closed。合併只使用 `gh pr merge --merge --match-head-commit <HEAD>`，不使用 auto/squash/rebase。Merge 後會重新 fetch default branch，驗證雙親 merge commit ancestry、issue、archive、Todo 與 CompletionRecord，全部成立才投影 `done`。
+最多兩輪 builder fix/re-review，每個 HEAD 等待 15 分鐘；current-HEAD review 出現 finding 時，delivery adapter 會把 `fix-required` fail-closed 投影為 `needs_human`，只有 operator 的 exact-Candidate `retry-build` 才能重開 builder；第三次仍有 finding 或逾時也維持 `needs_human`。若後續已由Manager綁定exact-HEAD maintainer evidence，只有完整path/hash可重入這類`copilot-*` stop，其他stop reason仍fail-closed。合併只使用 `gh pr merge --merge --match-head-commit <HEAD>`，不使用 auto/squash/rebase。Merge 後會重新 fetch default branch，驗證雙親 merge commit ancestry、issue、archive、Todo 與 CompletionRecord；CompletionRecord會保留實際使用的`copilot`或`maintainer-review` kind/ref/hash，並要求恰好一種delivery review authority，全部成立才投影 `done`。
 
 V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，但 ship 會停在 `needs_human`。

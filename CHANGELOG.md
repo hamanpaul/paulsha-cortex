@@ -29,6 +29,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **CompletionRecord接受typed maintainer review authority**：remote closure現在保留merge authorization實際使用的`copilot`或`maintainer-review` evidence kind/ref/hash，並要求兩者恰好一種；maintainer-authorized merge不再因舊的Copilot-only白名單卡住，缺失或雙重authority仍fail-closed。
 - **Typed maintainer review可安全接手Copilot stop**：delivery journal停在`copilot-finding-budget-exhausted`、timeout或其他`copilot-*` needs-human reason時，只有WorkflowRun已綁定且path/hash完整的exact-HEAD maintainer evidence可重入；後續仍重驗immutable evidence，external merge與其他stop不會被旁路。
 - **Plan/build terminal output prompt對齊manifest ref契約**：structured prompt現在明示`outputs`只能是符合declared outputs的repo-relative artifact path字串；manifest未宣告outputs時固定要求`[]`，避免builder把adoption摘要放入outputs後被Manager正確拒絕而無法綁定tested descendant Candidate。
 - **Retry-build可採用已提交且已測試的descendant Candidate**：delivery preflight與post-archive review recovery prompt現在明示先檢查worktree既有repair commit，允許builder提交或採用tested descendant；Manager仍以exact舊Candidate CAS與單調ancestry獨立驗證，不接受caller evidence或倒退HEAD。
