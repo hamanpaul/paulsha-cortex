@@ -1152,12 +1152,31 @@ def _completion_draft(
     normalized = completion.validate_completion_record(payload)
     directory = state_root / "evidence" / "completion-drafts"
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"{run.run_id}-{candidate}.json"
-    if target.exists():
-        if json.loads(target.read_text(encoding="utf-8")) != normalized:
-            raise RuntimeError("completion draft conflict")
-    else:
+    semantic_payload = dict(normalized)
+    semantic_payload.pop("completed_at")
+    semantic_hash = verification.canonical_json_hash(semantic_payload)
+    target = directory / f"{run.run_id}-{candidate}-{semantic_hash}.json"
+
+    def reuse_existing() -> Path:
+        if target.is_symlink() or not target.is_file():
+            raise RuntimeError("completion draft conflict: target is not a regular file")
+        try:
+            existing = json.loads(target.read_text(encoding="utf-8"))
+            existing_normalized = completion.validate_completion_record(existing)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError("completion draft conflict: existing draft is invalid") from exc
+        existing_semantic = dict(existing_normalized)
+        existing_semantic.pop("completed_at")
+        if existing_semantic != semantic_payload:
+            raise RuntimeError("completion draft conflict: semantic content mismatch")
+        return target
+
+    if target.exists() or target.is_symlink():
+        return reuse_existing()
+    try:
         verification.atomic_write_json(target, normalized)
+    except verification.AtomicWriteConflictError:
+        return reuse_existing()
     return target
 
 

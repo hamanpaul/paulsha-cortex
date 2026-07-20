@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- **Completion Draft依closure語意建立immutable revision**：檔名改以排除`completed_at`的normalized payload hash版控；相同語意retry沿用首份draft，default branch或authority前進則保留舊檔並建立新revision，malformed或symlink collision維持fail-closed且不覆寫audit evidence。
 - **舊pre-delivery WorkflowRun可由Manager明確abandon**：新增queued `cortex work abandon`，要求exact run ID CAS、current WorkAuthority、actor與bounded reason；active Job、PR ref、passed ship step或CompletionRecord一律拒絕。成功只寫immutable audit evidence並將run設為`superseded`，不勾未完成tasks、不建立CompletionRecord或投影done。
 - **Delivery GitHub pagination 相容未提供 `--slurp` 的 gh**：checks、statuses 與 reviews 改用 shell-free `gh api --paginate --jq '.'` JSONL page stream；空輸出或任一 malformed page 仍 fail-closed，避免 current-HEAD ship validator 永久停在 `needs_human`。
 - **Monitor 完成統一 Work Item correlation、lifecycle 與 read API**：`.cortex/work-items.yaml`／scalar `work_item` frontmatter 提供 confirmed authority，雙訊號 heuristic 僅供 inferred display，collision、path escape、provider degraded 與 partial closure 全部 fail-closed；四態 reducer 支援 strict done/reopen 與 `on-going` 公開拼法。Unix socket 新增 list/get/explain/work subscription、支援 repo-scoped 同名隔離，且保留既有 ProjectState API；CLI 新增 read-only `cortex list` 與 `cortex work show`。

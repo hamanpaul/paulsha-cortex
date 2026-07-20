@@ -76,6 +76,12 @@ Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing i
 - **THEN**authorization MUST以其immutable pre-merge digest重驗，不得要求它等於terminal WorkAuthority digest
 - **AND**此例外只適用post-merge terminal reconciliation；merge-authorized與merge前所有gate仍 MUST精確等於current WorkAuthority digest，且evidence wrapper/ref/hash/review binding任一drift仍 MUST fail-closed
 
+#### Scenario: Completion Draft在terminal authority前進後重試
+- **GIVEN**Manager已為同一run與Candidate保存一份合法Completion Draft
+- **WHEN**重試只改變`completed_at`，或default branch、provider、WorkAuthority與其他closure語意已前進
+- **THEN**Manager MUST以排除`completed_at`的normalized closure語意hash選取immutable draft revision；相同語意 MUST沿用首份draft及其時間戳，語意前進 MUST建立新revision且保留舊draft
+- **AND**既有target為symlink、malformed或同一語意key內容不符時 MUST fail-closed，不得覆寫或刪除audit evidence
+
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
 Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。
