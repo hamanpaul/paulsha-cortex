@@ -289,6 +289,9 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
     assert all(step.gate_result == "passed" for step in build_steps[:-1])
     assert build_steps[-1].gate_result == "pending"
     assert "Do not claim archive" in str(build_steps[-1].action)
+    assert "Commit or adopt a tested descendant Candidate" in str(
+        build_steps[-1].action
+    )
     assert all(
         step.gate_result == "pending"
         for step in reset.steps
@@ -370,6 +373,9 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
         if step.phase in {"verify", "review"}
     )
     assert "Preserve the Manager-owned official OpenSpec archive" in str(
+        next(step for step in reset.steps if step.card == "subagent-build").action
+    )
+    assert "Commit or adopt a tested descendant Candidate" in str(
         next(step for step in reset.steps if step.card == "subagent-build").action
     )
 
