@@ -4082,7 +4082,7 @@ def _read_job_workflow_evidence(
         "run_id": run.run_id,
         "claim_key": run.claim_key,
         "repo": run.repo,
-        "source_revision": run.source_revision,
+        "source_revision": job["source_revision"],
         "card_id": job["workflow_card"],
         "phase": job["workflow_phase"],
         "inputs": job.get("workflow_inputs", []),
