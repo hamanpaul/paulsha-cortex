@@ -11,6 +11,7 @@ import pytest
 
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
+    completion,
     manager_daemon,
     review,
     verification,
@@ -1086,6 +1087,7 @@ identities:
     assert completion_payload["work_authority"]["run_id"] == run_id
     assert completion_payload["work_authority"]["merge_commit"] == "e" * 40
     assert completion_payload["target_ref_sha"] == "d" * 40
+    assert completion.read_completion_record(draft) == completion_payload
 
     # Retry reuses the first immutable draft when only completed_at changes.
     replay = work_bridge._completion_draft(

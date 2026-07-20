@@ -1064,6 +1064,7 @@ def _completion_draft(
         run=run,
         phase="verify",
     )
+    verification_payload["slice_id"] = run.run_id
     verification_payload["status"] = "reviewing"
     verification_record = verification.write_verification_evidence(
         verification_payload,
@@ -1076,6 +1077,7 @@ def _completion_draft(
         phase="review",
         expected_ref=foreign_ref.ref,
     )
+    review_payload["slice_id"] = run.run_id
     review_record = review.write_gate_evaluation(
         review_payload,
         coordinator_root=state_root,

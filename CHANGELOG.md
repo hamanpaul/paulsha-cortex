@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- **CompletionRecord統一綁定WorkflowRun closure evidence**：Manager先重驗各自per-card slice的verify/review canonical envelope，再以共同run ID派生closure evidence；strict reader現在可同時驗證slice、Candidate與builder/reviewer jobs，不再因合法的不同card identity誤報slice mismatch。
 - **Completion Draft依closure語意建立immutable revision**：檔名改以排除`completed_at`的normalized payload hash版控；相同語意retry沿用首份draft，default branch或authority前進則保留舊檔並建立新revision，malformed或symlink collision維持fail-closed且不覆寫audit evidence。
 - **舊pre-delivery WorkflowRun可由Manager明確abandon**：新增queued `cortex work abandon`，要求exact run ID CAS、current WorkAuthority、actor與bounded reason；active Job、PR ref、passed ship step或CompletionRecord一律拒絕。成功只寫immutable audit evidence並將run設為`superseded`，不勾未完成tasks、不建立CompletionRecord或投影done。
 - **Delivery GitHub pagination 相容未提供 `--slurp` 的 gh**：checks、statuses 與 reviews 改用 shell-free `gh api --paginate --jq '.'` JSONL page stream；空輸出或任一 malformed page 仍 fail-closed，避免 current-HEAD ship validator 永久停在 `needs_human`。
