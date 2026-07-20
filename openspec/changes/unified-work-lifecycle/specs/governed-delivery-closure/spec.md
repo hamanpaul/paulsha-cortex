@@ -53,6 +53,8 @@ Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing i
 
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
+Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。
+
 V1 WorkflowRun只支援唯一mapped PR、唯一OpenSpec change與唯一Todo path。任一類不是恰好一個confirmed ref時 Manager MUST設`needs_human:multiple-delivery-targets-unsupported`，MUST NOT只選其中一個完成、merge或寫CompletionRecord。若該stop發生於immutable delivery binding建立前，operator修正repo-local correlation並explicit resume後，Manager MAY在current authority已收斂為恰好一組PR/OpenSpec/Todo時重綁同一run的delivery journal並清除此特定stop；已建立binding或其他`needs_human`原因 MUST NOT由此路徑清除。Merge authorization MUST只雜湊stable semantic preflight result與immutable evidence hashes，MUST NOT納入stdout、stderr或duration；v2 authorization MUST保存實際current-HEAD review kind/ref/hash。`merge-authorized` crash recovery MUST先依durable authorization與authenticated merge status reconcile，已merge時 MUST NOT重跑preflight；既有v1 Copilot authorization只可按原schema重播，不得重新解釋成maintainer authority。
 
 #### Scenario: Work item有多個delivery targets
