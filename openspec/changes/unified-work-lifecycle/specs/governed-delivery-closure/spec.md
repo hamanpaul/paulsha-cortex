@@ -62,6 +62,13 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 ### Requirement: Merge前後必須重讀remote terminal facts
 Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，revision race MUST中止merge。Merge MUST使用`gh pr merge --merge`且 MUST NOT使用GitHub `--auto`。Merge後 MUST fetch default branch並驗merge ancestry、all mapped issues closed、active OpenSpec消失、remote archive存在、Todo tasks完成，才可寫versioned CompletionRecord並投影done。
 
+#### Scenario: Merge後active planning path已移入official archive
+- **GIVEN**Manager delivery journal已以exact Candidate與merge authorization記錄`merged`
+- **AND**accepted OpenSpec planning paths已由同一workflow的official archive移出active change目錄
+- **WHEN**operator resume觸發remote closure reconciliation
+- **THEN**Manager MUST直接重驗merged journal與remote closure，不得因active planning path已不存在而回退到planning-authority reconciliation
+- **AND**journal identity、Candidate、merge commit或authorization不完整時 MUST維持原本的fail-closed planning reconciliation與ship validator檢查
+
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
 Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。
