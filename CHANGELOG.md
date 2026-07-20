@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- **舊pre-delivery WorkflowRun可由Manager明確abandon**：新增queued `cortex work abandon`，要求exact run ID CAS、current WorkAuthority、actor與bounded reason；active Job、PR ref、passed ship step或CompletionRecord一律拒絕。成功只寫immutable audit evidence並將run設為`superseded`，不勾未完成tasks、不建立CompletionRecord或投影done。
 - **Delivery GitHub pagination 相容未提供 `--slurp` 的 gh**：checks、statuses 與 reviews 改用 shell-free `gh api --paginate --jq '.'` JSONL page stream；空輸出或任一 malformed page 仍 fail-closed，避免 current-HEAD ship validator 永久停在 `needs_human`。
 - **Monitor 完成統一 Work Item correlation、lifecycle 與 read API**：`.cortex/work-items.yaml`／scalar `work_item` frontmatter 提供 confirmed authority，雙訊號 heuristic 僅供 inferred display，collision、path escape、provider degraded 與 partial closure 全部 fail-closed；四態 reducer 支援 strict done/reopen 與 `on-going` 公開拼法。Unix socket 新增 list/get/explain/work subscription、支援 repo-scoped 同名隔離，且保留既有 ProjectState API；CLI 新增 read-only `cortex list` 與 `cortex work show`。
 - **Monitor 新增統一工作來源與 durable last-good foundation**：repo provider 以固定 artifact globs 掃描 Todo／superpowers／active OpenSpec，排除 archive 並對 active/archive 同名 fail-closed；GitHub provider 只用 typed `gh api` argv/JSON，auth、rate-limit、timeout 或 malformed response 一律 degraded。`work-items-snapshot/v1` 以 0600、file/directory fsync 與 atomic replace 保存 per-provider last-good，失敗 scan 不移除既有 sources，權威 project removal 會清除對應 provider，restart 可先提供 degraded read model，且 GitHub entity／terminal closure providers 均受 900 秒 freshness gate 約束。

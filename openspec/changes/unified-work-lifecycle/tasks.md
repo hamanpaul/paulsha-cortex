@@ -50,6 +50,7 @@
 - [x] 3.18 RED-test並收緊plan/build terminal output prompt：`outputs`只允許符合manifest的repo-relative artifact path字串；manifest無outputs時明示固定為空陣列，禁止描述性物件造成合法repair Candidate無法綁定。
 - [x] 3.19 RED-test並修正typed maintainer review recovery：只有完整path/hash且已由WorkflowRun綁定的exact-HEAD maintainer evidence可重入`copilot-*` needs-human stop；其他stop與錯誤binding維持fail-closed。
 - [x] 3.20 RED-test並修正CompletionRecord typed delivery evidence：保留merge authorization實際使用的`copilot`或`maintainer-review` kind/ref/hash，要求兩者恰好一種，避免maintainer-authorized merge卡在remote closure。
+- [x] 3.21 RED-test並新增`work abandon`：exact run ID CAS、current authority、actor/reason、active Job與pre-delivery side-effect gate全部fail-closed；成功只寫immutable evidence並將run設為superseded，不建立CompletionRecord。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

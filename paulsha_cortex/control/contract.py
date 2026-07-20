@@ -14,7 +14,10 @@ REQUEST_TYPES = frozenset(
     {"tick", "fanout", "dispatch", "complete", "slice-action", "workflow-action", "work-action"}
 )
 WORK_ACTIONS = frozenset(
-    {"link", "unlink", "start", "resume", "retry-build", "auto", "ship", "review-attest"}
+    {
+        "link", "unlink", "start", "resume", "retry-build", "abandon",
+        "auto", "ship", "review-attest",
+    }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
 
@@ -102,6 +105,29 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
             raise ValueError("work-action retry-build requires exact expected_candidate")
+        if action == "abandon":
+            expected_run_id = args.get("expected_run_id")
+            actor = args.get("actor")
+            reason = args.get("reason")
+            if (
+                not isinstance(expected_run_id, str)
+                or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+            ):
+                raise ValueError("work-action abandon requires exact expected_run_id")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError("work-action abandon requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError("work-action abandon requires bounded reason")
     requested_by = payload.get("requested_by")
     if not isinstance(requested_by, str) or not requested_by:
         raise ValueError("request requested_by must be a non-empty string")

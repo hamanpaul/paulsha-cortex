@@ -16,6 +16,15 @@ Claim key MUST雜湊該work item的canonical semantic authority與provider/sourc
 - **WHEN**同一work item的provider/source revisions與confirmed refs未變，但snapshot sequence、written-at或其他repo資料改變
 - **THEN**Manager重用既有WorkflowRun與claim key，只更新snapshot provenance
 
+#### Scenario: Operator淘汰被新canary取代的pre-delivery run
+- **WHEN**operator經control queue提交exact WorkflowRun ID CAS、actor與bounded reason，且該run仍為唯一ongoing authority、沒有active Job、PR ref、passed ship step或CompletionRecord
+- **THEN**Manager寫入immutable reason evidence並把該run標為`superseded`
+- **THEN**不得建立CompletionRecord、勾未完成tasks或投影done；相同CAS/reason重播必須冪等
+
+#### Scenario: Abandon碰到delivery side effect或不同active run
+- **WHEN**target run已有PR/ship side effect，或同work item另有ongoing run
+- **THEN**Manager拒絕abandon且不得修改任一WorkflowRun
+
 #### Scenario: Malformed v1 registry
 - **WHEN**migration輸入schema malformed或backup無法durably寫入
 - **THEN** Manager拒絕migration且原檔不變

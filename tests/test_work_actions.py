@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 import subprocess
@@ -488,6 +489,251 @@ def test_retry_build_recovers_unbound_builder_terminalization(
     assert "declared input snapshots" in str(
         next(step for step in reset.steps if step.card == repair_card).action
     )
+
+
+def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    job = registry.create_job(
+        task="wf-abandon-guard",
+        persona="planner",
+        kind="build",
+        branch="feature/demo",
+        pane="",
+        worktree=run.workspace_root,
+        executor="codex",
+        model_id="gpt",
+        independence_domain="openai",
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="define-card",
+        workflow_phase="define",
+        workflow_repo_root=run.workspace_root,
+        source_revision=run.source_revision,
+    )
+    args = {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "Superseded by the clean terminal canary.",
+    }
+    with pytest.raises(ValueError, match="refuses active workflow job"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=1)
+    with pytest.raises(RuntimeError, match="CAS mismatch"):
+        work_actions.execute_work_action(
+            args={**args, "expected_run_id": "workflow-" + "b" * 20},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#8",))
+    with pytest.raises(ValueError, match="only permits pre-delivery"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(run_id, pr_refs=())
+    assert not (state.parent / "evidence" / "work-abandon").exists()
+
+    first = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    abandoned = registry.get_workflow_run(run_id)
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    item = payload["work_items"][0]
+    item["mapped_issues"] = [12, 13]
+    item["source_revisions"].append("issue:13@open")
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    registry._manager_create_workflow_run(
+        work_id="demo",
+        repo="acme/demo",
+        claim_key="claim:v1:" + "c" * 64,
+        source_revision="authority-drifted",
+        workspace_root=abandoned.workspace_root,
+        combo=abandoned.combo,
+        current_phase="define",
+        steps=abandoned.steps,
+        issue_refs=("acme/demo#12", "acme/demo#13"),
+        openspec_refs=("demo",),
+    )
+    second = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+
+    assert first == second
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert "blocked" in abandoned.facets
+    assert abandoned.completion_record_path is None
+    evidence = Path(first["result"]["evidence"]["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
+    payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert payload["run_id"] == run_id
+    assert payload["actor"] == "operator"
+    assert payload["reason"] == args["reason"]
+    assert str(evidence) in abandoned.evidence_refs
+
+    with pytest.raises(RuntimeError, match="different authority"):
+        work_actions.execute_work_action(
+            args={**args, "reason": "A different reason."},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
+def test_abandon_evidence_is_immutable_at_link_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    real_link = os.link
+
+    def crash_after_link(source, target):
+        real_link(source, target)
+        assert Path(target).stat().st_mode & 0o222 == 0
+        raise RuntimeError("simulated crash after link")
+
+    monkeypatch.setattr(os, "link", crash_after_link)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        work_actions._abandon_record(body, state_path=state)
+
+    monkeypatch.setattr(os, "link", real_link)
+    replay = work_actions._abandon_record(body, state_path=state)
+    evidence = Path(replay["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
+
+
+def test_abandon_evidence_temp_collision_preserves_foreign_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    digest = work_actions.verification.canonical_json_hash(body)
+    root = tmp_path / "evidence" / "work-abandon"
+    root.mkdir(parents=True)
+    target = root / f"{body['run_id']}-{digest}.json"
+    temporary = root / f".{target.name}.collision.tmp"
+    temporary.write_text("foreign temporary\n", encoding="utf-8")
+    monkeypatch.setattr(
+        work_actions,
+        "uuid4",
+        lambda: SimpleNamespace(hex="collision"),
+    )
+
+    with pytest.raises(RuntimeError, match="temporary collision"):
+        work_actions._abandon_record(body, state_path=state)
+
+    assert temporary.read_text(encoding="utf-8") == "foreign temporary\n"
+    assert not target.exists()
+
+
+def test_abandon_evidence_rejects_non_regular_existing_target(tmp_path: Path) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    digest = work_actions.verification.canonical_json_hash(body)
+    root = tmp_path / "evidence" / "work-abandon"
+    root.mkdir(parents=True)
+    target = root / f"{body['run_id']}-{digest}.json"
+    target.mkdir()
+
+    with pytest.raises(RuntimeError, match="workflow abandon evidence conflict"):
+        work_actions._abandon_record(body, state_path=state)
+
+
+def test_abandon_evidence_rejects_oversized_target_without_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    digest = work_actions.verification.canonical_json_hash(body)
+    root = tmp_path / "evidence" / "work-abandon"
+    root.mkdir(parents=True)
+    target = root / f"{body['run_id']}-{digest}.json"
+    target.write_bytes(b"x" * 5000)
+    target.chmod(0o444)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda _self: (_ for _ in ()).throw(AssertionError("must not read")),
+    )
+
+    with pytest.raises(RuntimeError, match="workflow abandon evidence conflict"):
+        work_actions._abandon_record(body, state_path=state)
 
 
 def test_review_attest_writes_immutable_exact_head_evidence(

@@ -137,6 +137,23 @@ def test_work_action_contract_requires_typed_routing_fields():
     with pytest.raises(ValueError, match="exact expected_candidate"):
         contract.validate_request(retry)
 
+    abandon = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "abandon",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "expected_run_id": "workflow-" + "a" * 20,
+            "actor": "operator",
+            "reason": "Superseded by a clean terminal canary.",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(abandon)["args"]["action"] == "abandon"
+    abandon["args"]["reason"] = "bad\nreason"
+    with pytest.raises(ValueError, match="bounded reason"):
+        contract.validate_request(abandon)
+
 
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):

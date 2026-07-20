@@ -175,6 +175,38 @@ class WorkActionFlagTests(unittest.TestCase):
             self.assertEqual(request["args"]["verdict"], "approved")
             self.assertEqual(request["args"]["findings"], [])
 
+    def test_work_abandon_parser_writes_exact_run_cas_and_reason(self) -> None:
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "abandon", "demo", "--repo", "acme/demo",
+                "--actor", "operator",
+                "--expected-run-id", "workflow-" + "a" * 20,
+                "--reason", "Superseded by the terminal canary.",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "abandoned"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "abandon")
+        self.assertEqual(
+            submitted[0][1]["expected_run_id"], "workflow-" + "a" * 20
+        )
+        self.assertEqual(
+            submitted[0][1]["reason"], "Superseded by the terminal canary."
+        )
+
     def test_work_link_parses_typed_kind_and_ref(self) -> None:
         args = _build_parser().parse_args(
             [
