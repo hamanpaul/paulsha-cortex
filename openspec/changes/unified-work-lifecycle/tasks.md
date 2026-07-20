@@ -43,7 +43,8 @@
 - [x] 3.11 RED-test並修正delivery GitHub pagination：不依賴本機gh不支援的`--slurp`，以typed JSONL page stream完整重讀checks/statuses/reviews，malformed page維持fail-closed。
 - [x] 3.12 RED-test並修正既有PR的Candidate推送：fresh verify/review後先以PR context重跑乾淨exact-Candidate preflight，再由Manager冪等push並重讀授權feature ref，remote HEAD不符時不得進入delivery gate。
 - [x] 3.13 RED-test並修正terminal closure provider：Todo以default revision精確綁定的Contents identity讀取，僅bounded retry HTTP 502/503/504，production ancestry compare只查canonical workflow-linked PR。
-- [x] 3.14 RED-test並新增`work abandon`：exact run ID CAS、current authority、actor/reason、active Job與pre-delivery side-effect gate全部fail-closed；成功只寫immutable evidence並將run設為superseded，不建立CompletionRecord。
+- [x] 3.14 RED-test並修正existing-PR metadata transaction：title/body PATCH、labels PUT及identity reread僅對HTTP 502/503/504 bounded retry；create/push/merge side effect維持單次fail-closed。
+- [x] 3.15 RED-test並新增`work abandon`：exact run ID CAS、current authority、actor/reason、active Job與pre-delivery side-effect gate全部fail-closed；成功只寫immutable evidence並將run設為superseded，不建立CompletionRecord。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

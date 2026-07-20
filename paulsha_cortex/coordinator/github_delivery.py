@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -253,8 +255,28 @@ query($owner:String!,$name:String!,$number:Int!,$issueCursor:String,$threadCurso
 class GitHubDeliveryClient:
     """Authenticated ``gh api`` seam; any malformed remote fact fails closed."""
 
-    def __init__(self, *, runner: Runner = subprocess.run) -> None:
+    def __init__(
+        self,
+        *,
+        runner: Runner = subprocess.run,
+        metadata_retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._runner = runner
+        if any(
+            not isinstance(delay, (int, float))
+            or isinstance(delay, bool)
+            or not math.isfinite(float(delay))
+            or delay < 0
+            for delay in metadata_retry_delays
+        ):
+            raise ValueError(
+                "GitHub metadata retry delays must be finite non-negative numbers"
+            )
+        self._metadata_retry_delays = tuple(
+            float(delay) for delay in metadata_retry_delays
+        )
+        self._sleeper = sleeper
 
     def _run(self, argv: list[str], *, expect_json: bool) -> object:
         raw = self._runner(
@@ -279,6 +301,21 @@ class GitHubDeliveryClient:
 
     def _api(self, endpoint: str) -> object:
         return self._run(["gh", "api", endpoint], expect_json=True)
+
+    def _metadata_json(self, argv: list[str]) -> object:
+        """Retry only the idempotent PR-metadata transaction surface."""
+
+        for attempt in range(len(self._metadata_retry_delays) + 1):
+            try:
+                return self._run(argv, expect_json=True)
+            except RuntimeError as error:
+                if (
+                    attempt >= len(self._metadata_retry_delays)
+                    or re.search(r"\bHTTP (?:502|503|504)\b", str(error)) is None
+                ):
+                    raise
+                self._sleeper(self._metadata_retry_delays[attempt])
+        raise AssertionError("unreachable metadata retry state")
 
     def _api_pages(self, endpoint: str) -> list[object]:
         stdout = self._run(
@@ -853,7 +890,7 @@ class GitHubDeliveryClient:
             or len(set(labels)) != len(labels)
         ):
             raise ValueError("PR labels must be unique non-empty strings")
-        self._run(
+        self._metadata_json(
             [
                 "gh",
                 "api",
@@ -864,8 +901,7 @@ class GitHubDeliveryClient:
                 f"title={title}",
                 "-f",
                 f"body={body}",
-            ],
-            expect_json=True,
+            ]
         )
         label_argv = [
             "gh",
@@ -876,9 +912,13 @@ class GitHubDeliveryClient:
         ]
         for label in labels:
             label_argv.extend(["-f", f"labels[]={label}"])
-        self._run(label_argv, expect_json=True)
-        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
-        issue = self._api(f"repos/{repo}/issues/{pr_number}")
+        self._metadata_json(label_argv)
+        pull = self._metadata_json(
+            ["gh", "api", f"repos/{repo}/pulls/{pr_number}"]
+        )
+        issue = self._metadata_json(
+            ["gh", "api", f"repos/{repo}/issues/{pr_number}"]
+        )
         if not isinstance(pull, dict) or not isinstance(issue, dict):
             raise RuntimeError("GitHub PR metadata reread malformed")
         rows = issue.get("labels")
