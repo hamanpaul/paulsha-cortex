@@ -51,6 +51,8 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 ### Requirement: Merge前後必須重讀remote terminal facts
 Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，revision race MUST中止merge。Merge MUST使用`gh pr merge --merge`且 MUST NOT使用GitHub `--auto`。Merge後 MUST fetch default branch並驗merge ancestry、all mapped issues closed、active OpenSpec消失、remote archive存在、Todo tasks完成，才可寫versioned CompletionRecord並投影done。
 
+Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
+
 V1 WorkflowRun只支援唯一mapped PR、唯一OpenSpec change與唯一Todo path。任一類不是恰好一個confirmed ref時 Manager MUST設`needs_human:multiple-delivery-targets-unsupported`，MUST NOT只選其中一個完成、merge或寫CompletionRecord。若該stop發生於immutable delivery binding建立前，operator修正repo-local correlation並explicit resume後，Manager MAY在current authority已收斂為恰好一組PR/OpenSpec/Todo時重綁同一run的delivery journal並清除此特定stop；已建立binding或其他`needs_human`原因 MUST NOT由此路徑清除。Merge authorization MUST只雜湊stable semantic preflight result與immutable evidence hashes，MUST NOT納入stdout、stderr或duration；v2 authorization MUST保存實際current-HEAD review kind/ref/hash。`merge-authorized` crash recovery MUST先依durable authorization與authenticated merge status reconcile，已merge時 MUST NOT重跑preflight；既有v1 Copilot authorization只可按原schema重播，不得重新解釋成maintainer authority。
 
 #### Scenario: Work item有多個delivery targets

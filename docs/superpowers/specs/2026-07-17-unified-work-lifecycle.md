@@ -110,6 +110,7 @@ Manager依序：
 2. 擬定zh-TW conventional PR title/body/labels，body用`Closes #N`。
 3. 跑快速policy，再跑`PSC_PREFLIGHT_CMD`；preflight含pytest/OpenSpec/PR-context policy。
 4. 開/更新PR；若既有PR仍停在修復前HEAD，先以PR context對乾淨exact Candidate重跑preflight，再由Manager冪等push並重讀授權feature ref。等待checks terminal-green，每次push重請current-HEAD Copilot。
+   既有PR的title/body PATCH、labels PUT與identity reread只對HTTP 502/503/504做finite bounded retry；create、push、review request與merge不共用此metadata retry authority。
 5. 驗Copilot非error、`commit_id == HEAD`、threads resolved/outdated。
 6. Finding最多兩輪builder fix/re-review，每HEAD 15分鐘；逾限needs_human。
 7. Merge前重讀HEAD/mergeability/checks/threads/issues/archive；只用`gh pr merge --merge`。
