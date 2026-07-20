@@ -1402,6 +1402,52 @@ def test_snapshot_refresh_noise_keeps_same_semantic_run(tmp_path: Path) -> None:
     assert refreshed["result"]["run"]["snapshot_hash"] != first_snapshot_hash
 
 
+def test_explicit_resume_selects_unique_done_ship_run_after_authority_changes(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        source_revisions=("issue:12@closed", "openspec:demo@archived"),
+    )
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    terminal = SimpleNamespace(
+        run_id="workflow-" + "a" * 20,
+        repo="acme/demo",
+        work_id="demo",
+        claim_key="claim:v1:" + "b" * 64,
+        status="done",
+        current_phase="ship",
+        facets=(),
+        issue_refs=("acme/demo#12",),
+        openspec_refs=("demo",),
+        to_dict=lambda: {
+            "run_id": "workflow-" + "a" * 20,
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "current_phase": "ship",
+            "status": "done",
+        },
+    )
+    registry = SimpleNamespace(list_workflow_runs=lambda: [terminal])
+
+    result = work_actions._claim_action(
+        args={"action": "resume"},
+        authority=authority,
+        now_epoch=200,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+        workflow_starter=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("terminal refresh must not create a new run")
+        ),
+    )
+
+    assert result["action"] == "resume"
+    assert result["reason"] == "active-workflow"
+    assert result["run"]["run_id"] == terminal.run_id
+
+
 def test_periodic_auto_scan_claims_labeled_work_and_persists_missing_issue(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"

@@ -148,6 +148,12 @@ Manager MUST先以canonical brainstorm evidence綁定的scope與artifact ref/kin
 - **AND**planning source revision、claim、Candidate、planning authority與verify/review evidence不得被改寫
 - **AND**若registry更新後於journal更新前中斷，explicit resume必須可重播相同rebase，不得另建run或拒絕exact Candidate
 
+#### Scenario: Terminal WorkflowRun只刷新closure evidence
+- **GIVEN**唯一WorkflowRun已在`ship` phase完成，全部ship steps與immutable journal binding仍通過audit
+- **WHEN**operator以work resume要求重驗fresh terminal authority
+- **THEN**Manager只可呼叫既有ship validator並更新CompletionRecord fields，不得呼叫normal card dispatcher、改變Candidate或把run重開為ongoing
+- **AND**缺validator、非passed result、completion binding不完整或terminal run identity ambiguous時不得改寫既有completion
+
 #### Scenario: Builder worktree缺accepted plan
 - **WHEN**pending build card宣告accepted plan但獨立builder worktree尚無該檔
 - **THEN**Manager只從相同run的planning authority驗hash後原子seed

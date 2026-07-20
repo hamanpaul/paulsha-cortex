@@ -711,7 +711,9 @@ def _commit_archive_and_require_reverification(
 def _authority_with_manager_pr(authority: WorkAuthority, pr_number: int) -> WorkAuthority:
     pr_ref = f"{authority.repo}#{pr_number}"
     source_revisions = set(authority.source_revisions)
-    source_revisions.add(f"github_pr:{pr_ref}@identity:{pr_ref};state:open")
+    source_prefix = f"github_pr:{pr_ref}@"
+    if not any(value.startswith(source_prefix) for value in source_revisions):
+        source_revisions.add(f"{source_prefix}identity:{pr_ref};state:open")
     return WorkAuthority._verified(
         repo=authority.repo,
         work_id=authority.work_id,
@@ -1205,11 +1207,14 @@ def build_production_ship_validator(
     state_root = Path(coordinator_root).resolve()
 
     def validate(*, run, candidate: str | None) -> dict[str, object]:
+        terminal_refresh = (
+            run.current_phase == "ship" and getattr(run, "status", None) == "done"
+        )
         if (
             not isinstance(candidate, str)
             or run.candidate_head != candidate
             or run.verified_head != candidate
-            or run.current_phase != "review"
+            or (run.current_phase != "review" and not terminal_refresh)
         ):
             raise ValueError("ship adapter requires review-complete exact candidate")
         foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]

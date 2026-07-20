@@ -54,6 +54,7 @@ def _repo(root: Path) -> tuple[Path, str]:
 def _snapshot(
     path: Path,
     *,
+    mapped_prs: tuple[int, ...] = (),
     source_revisions: tuple[str, ...] = (
         "github_issue:acme/demo#14@issue-open",
         "openspec:acme/demo:work@spec-1",
@@ -76,7 +77,7 @@ def _snapshot(
                         "repo": "acme/demo",
                         "work_id": "work",
                         "mapped_issues": [14],
-                        "mapped_prs": [],
+                        "mapped_prs": list(mapped_prs),
                         "mapped_openspec": ["work"],
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
@@ -89,6 +90,73 @@ def _snapshot(
         encoding="utf-8",
     )
     return path
+
+
+def test_manager_pr_authority_preserves_current_terminal_source_revision(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(
+        tmp_path / "snapshot.json",
+        mapped_prs=(17,),
+        source_revisions=(
+            "github_issue:acme/demo#14@issue-closed",
+            "github_pr:acme/demo#17@identity:acme/demo#17;state:closed",
+            "openspec:acme/demo:work@archived",
+        ),
+    )
+    authority = load_work_authority(
+        repo="acme/demo", work_id="work", snapshot_path=snapshot
+    )
+
+    bound = work_bridge._authority_with_manager_pr(authority, 17)
+
+    pr_sources = [
+        value
+        for value in bound.source_revisions
+        if value.startswith("github_pr:acme/demo#17@")
+    ]
+    assert pr_sources == [
+        "github_pr:acme/demo#17@identity:acme/demo#17;state:closed"
+    ]
+
+
+def test_manager_pr_authority_adds_open_source_only_when_provider_has_none(
+    tmp_path: Path,
+) -> None:
+    authority = load_work_authority(
+        repo="acme/demo",
+        work_id="work",
+        snapshot_path=_snapshot(tmp_path / "snapshot.json"),
+    )
+
+    bound = work_bridge._authority_with_manager_pr(authority, 17)
+
+    assert "github_pr:acme/demo#17@identity:acme/demo#17;state:open" in (
+        bound.source_revisions
+    )
+
+
+def test_ship_adapter_accepts_only_done_ship_run_for_terminal_refresh(tmp_path: Path) -> None:
+    validator = work_bridge.build_production_ship_validator(
+        registry=SimpleNamespace(), coordinator_root=tmp_path
+    )
+    candidate = "a" * 40
+    terminal = SimpleNamespace(
+        candidate_head=candidate,
+        verified_head=candidate,
+        current_phase="ship",
+        status="done",
+        gate_refs=(),
+    )
+
+    with pytest.raises(ValueError, match="canonical foreign-review"):
+        validator(run=terminal, candidate=candidate)
+
+    with pytest.raises(ValueError, match="review-complete exact candidate"):
+        validator(
+            run=SimpleNamespace(**{**vars(terminal), "status": "ongoing"}),
+            candidate=candidate,
+        )
 
 
 def _steps() -> tuple[WorkflowStep, ...]:
