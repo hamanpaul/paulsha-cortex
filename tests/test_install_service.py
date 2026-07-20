@@ -17,6 +17,7 @@ def test_render_substitutes_instance_and_script(tmp_path):
     service = units["alpha-manager.service"]
     assert "__INSTANCE__" not in service and "__SERVICE_SCRIPT__" not in service
     assert "alpha persona manager service" in service
+    assert "UMask=0022" in service
     timer = units["alpha-manager.timer"]
     assert "OnUnitActiveSec=120" in timer
 
@@ -44,6 +45,7 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
     env_file = tmp_path / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"PY={sys.executable}" in env_lines
+    assert "PSC_INSTANCE=beta" in env_lines
     assert f"PSC_RUN_ROOT={tmp_path / '.agents' / 'run' / 'beta'}" in env_lines
     assert f"PSC_MONITOR_STATE_ROOT={tmp_path / '.agents' / 'monitor'}" in env_lines
     assert f"PSC_PROJECT_CONFIG_ROOT={tmp_path / '.agents' / 'config' / 'paulsha'}" in env_lines
@@ -148,6 +150,23 @@ def test_install_existing_agents_root_drives_new_specific_defaults(tmp_path, mon
     assert f"PSC_AGENTS_ROOT={custom_agents}" in env_lines
     assert f"PSC_RUN_ROOT={custom_agents / 'run' / 'beta'}" in env_lines
     assert f"PSC_MONITOR_STATE_ROOT={custom_agents / 'monitor'}" in env_lines
+
+
+def test_install_rejects_symlinked_bootstrap_without_overwriting_target(tmp_path, monkeypatch):
+    from paulsha_cortex.deploy import installer
+
+    home = tmp_path / "home"
+    env_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    env_file.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.env"
+    outside.write_text("DO_NOT_OVERWRITE=1\n", encoding="utf-8")
+    env_file.symlink_to(outside)
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError, match="symlink"):
+        installer.install_service("beta", 300, tmp_path / "repo")
+
+    assert outside.read_text(encoding="utf-8") == "DO_NOT_OVERWRITE=1\n"
 
 
 def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):

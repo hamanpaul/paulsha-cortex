@@ -130,6 +130,11 @@ class _RecordingLauncher:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.commit_capability_requests = 0
+
+    def as_commit_required(self):
+        self.commit_capability_requests += 1
+        return self
 
     def launch(self, *, slice_id, prompt, worktree, log_dir):
         from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -510,6 +515,7 @@ class FanoutTests(unittest.TestCase):
         self.assertEqual(sorted(dispatched_tasks), ["ready-1", "ready-2"])
         self.assertEqual(len(jobs), 2)
         self.assertTrue(all(j["persona"] == "builder" for j in jobs))
+        self.assertEqual(launcher.commit_capability_requests, 1)
         # 非就緒一個都沒派
         self.assertNotIn("held", dispatched_tasks)
         self.assertNotIn("noplan", dispatched_tasks)

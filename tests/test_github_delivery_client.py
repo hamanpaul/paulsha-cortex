@@ -26,6 +26,12 @@ class Result:
         self.stderr = "" if returncode == 0 else "failed"
 
 
+class PaginatedResult(Result):
+    def __init__(self, pages):
+        super().__init__({})
+        self.stdout = "\n".join(json.dumps(page) for page in pages)
+
+
 class FakeRunner:
     def __init__(self):
         self.calls = []
@@ -45,7 +51,7 @@ class FakeRunner:
                 }
             )
         if f"commits/{HEAD}/check-runs" in endpoint:
-            return Result(
+            return PaginatedResult(
                 [{
                     "total_count": 1,
                     "check_runs": [
@@ -54,9 +60,9 @@ class FakeRunner:
                 }]
             )
         if f"commits/{HEAD}/statuses" in endpoint:
-            return Result([[{"context": "legacy/lint", "state": "success"}]])
+            return PaginatedResult([[{"context": "legacy/lint", "state": "success"}]])
         if "pulls/7/reviews" in endpoint:
-            return Result(
+            return PaginatedResult(
                 [[
                     {
                         "id": 9,
@@ -154,6 +160,10 @@ def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     assert any(
         f"commits/{HEAD}/statuses" in " ".join(call[0]) for call in runner.calls
     )
+    paginated_calls = [call[0] for call in runner.calls if "--paginate" in call[0]]
+    assert paginated_calls
+    assert all("--slurp" not in argv for argv in paginated_calls)
+    assert all(argv[argv.index("--jq") + 1] == "." for argv in paginated_calls)
     assert all(call[1]["shell"] is False for call in runner.calls)
 
 
@@ -161,7 +171,7 @@ def test_fetch_delivery_facts_uses_latest_legacy_status_per_context() -> None:
     class StatusHistory(FakeRunner):
         def __call__(self, argv, **kwargs):
             if f"commits/{HEAD}/statuses" in " ".join(argv):
-                return Result(
+                return PaginatedResult(
                     [[
                         {"context": "legacy/lint", "state": "success"},
                         {"context": "legacy/lint", "state": "failure"},
@@ -213,17 +223,35 @@ def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
     calls: list[list[str]] = []
 
     class MetadataRunner:
+        patched = False
+        labeled = False
+
         def __call__(self, argv, **kwargs):
             calls.append(list(argv))
             endpoint = " ".join(argv)
             if "--method PATCH" in endpoint:
+                self.patched = True
                 return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
             if "--method PUT" in endpoint:
+                self.labeled = True
                 return Result({"labels": [{"name": "enhancement"}]})
             if endpoint.endswith("repos/acme/demo/pulls/7"):
-                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+                return Result(
+                    {
+                        "title": (
+                            "fix(work): 修正工作流程" if self.patched else "wrong"
+                        ),
+                        "body": "Closes #14",
+                    }
+                )
             if endpoint.endswith("repos/acme/demo/issues/7"):
-                return Result({"labels": [{"name": "enhancement"}]})
+                return Result(
+                    {
+                        "labels": (
+                            [{"name": "enhancement"}] if self.labeled else []
+                        )
+                    }
+                )
             raise AssertionError(argv)
 
     GitHubDeliveryClient(runner=MetadataRunner()).ensure_pr_metadata(
@@ -235,6 +263,139 @@ def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
     )
     assert any("--method" in call and "PATCH" in call for call in calls)
     assert any("--method" in call and "PUT" in call for call in calls)
+    assert len(calls) == 6
+
+
+def test_ensure_pr_metadata_skips_writes_when_remote_is_already_exact() -> None:
+    calls: list[list[str]] = []
+
+    def exact(argv, **kwargs):
+        calls.append(list(argv))
+        endpoint = " ".join(argv)
+        assert "--method" not in argv
+        if endpoint.endswith("repos/acme/demo/pulls/7"):
+            return Result(
+                {"title": "fix(work): 修正工作流程", "body": "Closes #14"}
+            )
+        if endpoint.endswith("repos/acme/demo/issues/7"):
+            return Result({"labels": [{"name": "enhancement"}]})
+        raise AssertionError(argv)
+
+    GitHubDeliveryClient(runner=exact).ensure_pr_metadata(
+        repo="acme/demo",
+        pr_number=7,
+        title="fix(work): 修正工作流程",
+        body="Closes #14",
+        labels=("enhancement",),
+    )
+
+    assert len(calls) == 2
+
+
+def test_ensure_pr_metadata_retries_only_transient_idempotent_calls() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    class TransientMetadataRunner:
+        patched = False
+        labeled = False
+        patch_attempts = 0
+
+        def __call__(self, argv, **kwargs):
+            calls.append(list(argv))
+            endpoint = " ".join(argv)
+            if "--method PATCH" in endpoint:
+                self.patch_attempts += 1
+                if self.patch_attempts == 1:
+                    result = Result({}, returncode=1)
+                    result.stderr = "gh: temporarily unavailable (HTTP 503)"
+                    return result
+                self.patched = True
+                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+            if "--method PUT" in endpoint:
+                self.labeled = True
+                return Result({"labels": [{"name": "enhancement"}]})
+            if endpoint.endswith("repos/acme/demo/pulls/7"):
+                return Result(
+                    {
+                        "title": (
+                            "fix(work): 修正工作流程" if self.patched else "wrong"
+                        ),
+                        "body": "Closes #14",
+                    }
+                )
+            if endpoint.endswith("repos/acme/demo/issues/7"):
+                return Result(
+                    {
+                        "labels": (
+                            [{"name": "enhancement"}] if self.labeled else []
+                        )
+                    }
+                )
+            raise AssertionError(argv)
+
+    GitHubDeliveryClient(
+        runner=TransientMetadataRunner(),
+        metadata_retry_delays=(0.25,),
+        sleeper=sleeps.append,
+    ).ensure_pr_metadata(
+        repo="acme/demo",
+        pr_number=7,
+        title="fix(work): 修正工作流程",
+        body="Closes #14",
+        labels=("enhancement",),
+    )
+
+    assert calls[2] == calls[3]
+    assert sleeps == [0.25]
+
+
+def test_delivery_reads_outside_metadata_do_not_retry_gateway_failures() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def unavailable(argv, **kwargs):
+        calls.append(list(argv))
+        result = Result({}, returncode=1)
+        result.stderr = "gh: temporarily unavailable (HTTP 503)"
+        return result
+
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        GitHubDeliveryClient(
+            runner=unavailable,
+            metadata_retry_delays=(0.25,),
+            sleeper=sleeps.append,
+        ).fetch_merge_status(repo="acme/demo", pr_number=7)
+
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_ensure_pr_metadata_does_not_retry_non_transient_failure() -> None:
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def unauthorized(argv, **kwargs):
+        calls.append(list(argv))
+        result = Result({}, returncode=1)
+        result.stderr = "gh: authentication failed (HTTP 401)"
+        return result
+
+    with pytest.raises(RuntimeError, match="HTTP 401"):
+        GitHubDeliveryClient(
+            runner=unauthorized,
+            metadata_retry_delays=(0.25, 0.5),
+            sleeper=sleeps.append,
+        ).ensure_pr_metadata(
+            repo="acme/demo",
+            pr_number=7,
+            title="fix(work): 修正工作流程",
+            body="Closes #14",
+            labels=("enhancement",),
+        )
+
+    assert len(calls) == 1
+    assert sleeps == []
 
 
 def test_ensure_pr_metadata_rejects_remote_reread_drift() -> None:
@@ -391,7 +552,7 @@ def test_check_run_pagination_must_match_total_count() -> None:
     class Incomplete(FakeRunner):
         def __call__(self, argv, **kwargs):
             if f"commits/{HEAD}/check-runs" in " ".join(argv):
-                return Result(
+                return PaginatedResult(
                     [
                         {
                             "total_count": 2,
@@ -409,6 +570,23 @@ def test_check_run_pagination_must_match_total_count() -> None:
 
     with pytest.raises(RuntimeError, match="pagination incomplete"):
         GitHubDeliveryClient(runner=Incomplete()).fetch_delivery_facts(
+            repo="acme/demo",
+            pr_number=7,
+            change="unified-work-lifecycle",
+        )
+
+
+def test_paginated_delivery_api_rejects_malformed_jsonl_page() -> None:
+    class Malformed(FakeRunner):
+        def __call__(self, argv, **kwargs):
+            if f"commits/{HEAD}/statuses" in " ".join(argv):
+                result = PaginatedResult([[{"context": "legacy/lint", "state": "success"}]])
+                result.stdout += "\nnot-json"
+                return result
+            return super().__call__(argv, **kwargs)
+
+    with pytest.raises(RuntimeError, match="paginated payload malformed"):
+        GitHubDeliveryClient(runner=Malformed()).fetch_delivery_facts(
             repo="acme/demo",
             pr_number=7,
             change="unified-work-lifecycle",

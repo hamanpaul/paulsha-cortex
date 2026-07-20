@@ -323,6 +323,9 @@ def validate_verification_evidence(payload: object) -> dict[str, Any]:
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError(f"verification evidence missing keys: {', '.join(missing)}")
+    extras = sorted(set(payload) - required)
+    if extras:
+        raise ValueError(f"verification evidence unexpected key: {extras[0]}")
     if payload.get("schema_version") != VERIFICATION_SCHEMA_VERSION:
         raise ValueError(
             f"verification evidence schema_version must be {VERIFICATION_SCHEMA_VERSION}, "

@@ -7,7 +7,9 @@ import math
 import os
 import shlex
 import shutil
+import site
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -298,15 +300,39 @@ def _run(
     argv: Sequence[str],
     cwd: Path,
     runner: Runner,
+    environment: Mapping[str, str] | None = None,
 ) -> CommandResult:
+    kwargs: dict[str, object] = {
+        "cwd": str(cwd),
+        "shell": False,
+        "capture_output": True,
+        "text": True,
+    }
+    if environment is not None:
+        kwargs["env"] = dict(environment)
     raw = runner(
         list(argv),
-        cwd=str(cwd),
-        shell=False,
-        capture_output=True,
-        text=True,
+        **kwargs,
     )
     return _coerce_result(argv, raw)
+
+
+def _preflight_environment(*, disposable_home: Path) -> dict[str, str]:
+    """Isolate Cortex state while retaining the operator's tool/auth roots."""
+
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("PSC_")
+    }
+    original_home = Path(environment.get("HOME") or Path.home()).expanduser()
+    python_user_base = environment.get("PYTHONUSERBASE") or site.getuserbase()
+    environment["HOME"] = str(disposable_home)
+    environment["XDG_CACHE_HOME"] = str(disposable_home / ".cache")
+    if python_user_base:
+        environment["PYTHONUSERBASE"] = str(python_user_base)
+    environment.setdefault("GH_CONFIG_DIR", str(original_home / ".config" / "gh"))
+    return environment
 
 
 def _read_clean_identity(*, root: Path, runner: Runner) -> tuple[str, str]:
@@ -364,25 +390,37 @@ def run_preflight(
             tree_hash=tree_hash,
             state_root=evidence_state_root,
         )
-    policy_argv = ["python3", "-m", "policy_check", "--repo", "."]
-    policy = _run(argv=policy_argv, cwd=root, runner=runner)
-    if policy.returncode != 0:
-        return PreflightResult(
-            passed=False,
-            failed_stage="policy",
-            policy=policy,
-            ci_parity=None,
-            head=head,
-            tree_hash=tree_hash,
+    with tempfile.TemporaryDirectory(prefix="psc-preflight-home-") as temp_home:
+        gate_environment = _preflight_environment(disposable_home=Path(temp_home))
+        policy_argv = ["python3", "-m", "policy_check", "--repo", "."]
+        policy = _run(
+            argv=policy_argv,
+            cwd=root,
+            runner=runner,
+            environment=gate_environment,
         )
-    ci_argv = build_preflight_argv(
-        command=command,
-        request=request,
-        current_tree_hash=tree_hash,
-        full_suite_evidence=evidence,
-        now_epoch=now_epoch,
-    )
-    ci_parity = _run(argv=ci_argv, cwd=root, runner=runner)
+        if policy.returncode != 0:
+            return PreflightResult(
+                passed=False,
+                failed_stage="policy",
+                policy=policy,
+                ci_parity=None,
+                head=head,
+                tree_hash=tree_hash,
+            )
+        ci_argv = build_preflight_argv(
+            command=command,
+            request=request,
+            current_tree_hash=tree_hash,
+            full_suite_evidence=evidence,
+            now_epoch=now_epoch,
+        )
+        ci_parity = _run(
+            argv=ci_argv,
+            cwd=root,
+            runner=runner,
+            environment=gate_environment,
+        )
     final_head_result = _run(
         argv=["git", "-C", str(root), "rev-parse", "HEAD"],
         cwd=root,

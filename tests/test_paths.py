@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from paulsha_cortex.config import paths
 
 
@@ -32,9 +34,39 @@ def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):
 
 def test_run_root_default_and_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
-    assert paths.run_root() == Path.home() / ".agents" / "run"
+    monkeypatch.delenv("PSC_INSTANCE", raising=False)
+    assert paths.run_root() == Path.home() / ".agents" / "run" / "cortex"
     monkeypatch.setenv("PSC_RUN_ROOT", str(tmp_path / "run"))
     assert paths.run_root() == tmp_path / "run"
+
+
+def test_run_root_discovers_selected_installed_instance(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "beta-manager.env").write_text(
+        f"PSC_AGENTS_ROOT={tmp_path / 'agents'}\n"
+        f"PSC_RUN_ROOT={tmp_path / 'custom-run'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.setenv("PSC_INSTANCE", "beta")
+
+    assert paths.run_root() == tmp_path / "custom-run"
+
+
+def test_run_root_rejects_malformed_installed_environment(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "cortex-manager.env").write_text("PSC_RUN_ROOT=relative/run\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_INSTANCE", raising=False)
+
+    with pytest.raises(ValueError, match="絕對路徑"):
+        paths.run_root()
 
 
 def test_config_path_default(monkeypatch):

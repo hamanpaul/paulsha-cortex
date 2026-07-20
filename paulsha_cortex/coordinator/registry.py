@@ -237,6 +237,15 @@ class JobRegistry:
             raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
         validated_jobs = [self._validate_loaded_job(job) for job in jobs]
         job_ids = {str(job["job_id"]) for job in validated_jobs}
+        for job in validated_jobs:
+            builder_job_id = job.get("workflow_builder_job_id")
+            if builder_job_id is not None and (
+                builder_job_id not in job_ids or builder_job_id == job.get("job_id")
+            ):
+                raise ValueError(
+                    "coordinator 狀態檔 workflow_builder_job_id 格式錯誤（fail-closed）: "
+                    f"{self._state_path}"
+                )
         validated_slices = [self._validate_loaded_slice(slice_row, job_ids) for slice_row in slices]
         return validated_jobs, validated_slices, seq
 
@@ -359,8 +368,8 @@ class JobRegistry:
         for field in (
             "executor", "session_name", "log_path", "model_id", "independence_domain",
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
-            "workflow_phase", "workflow_repo_root", "source_revision",
-            "workflow_sandbox_hash",
+            "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
+            "workflow_sandbox_hash", "workflow_builder_job_id",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -401,6 +410,30 @@ class JobRegistry:
                 raise ValueError(
                     f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}"
                 )
+        input_snapshot = job.get("workflow_input_snapshot", [])
+        if not isinstance(input_snapshot, list):
+            raise ValueError(
+                f"coordinator 狀態檔 workflow_input_snapshot 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        snapshot_keys: set[tuple[str, str]] = set()
+        for row in input_snapshot:
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"pattern", "path", "sha256", "authority", "content_ref"}
+                or any(not isinstance(row.get(key), str) or not row[key] for key in row)
+                or Path(row["path"]).is_absolute()
+                or ".." in Path(row["path"]).parts
+                or Path(row["path"]).as_posix() != row["path"]
+                or len(row["sha256"]) != 64
+                or any(char not in "0123456789abcdef" for char in row["sha256"])
+                or row["authority"] not in {"planning-authority", "worktree"}
+                or not Path(row["content_ref"]).is_absolute()
+                or (row["pattern"], row["path"]) in snapshot_keys
+            ):
+                raise ValueError(
+                    f"coordinator 狀態檔 workflow_input_snapshot 格式錯誤（fail-closed）: {self._state_path}"
+                )
+            snapshot_keys.add((row["pattern"], row["path"]))
         output_baseline = job.get("workflow_output_baseline", [])
         if not isinstance(output_baseline, list):
             raise ValueError(
@@ -573,11 +606,14 @@ class JobRegistry:
         workflow_card: str | None = None,
         workflow_phase: str | None = None,
         workflow_repo_root: str | None = None,
+        workflow_input_root: str | None = None,
         workflow_inputs: tuple[str, ...] = (),
+        workflow_input_snapshot: tuple[dict[str, str], ...] = (),
         workflow_outputs: tuple[str, ...] = (),
         source_revision: str | None = None,
         workflow_sandbox_hash: str | None = None,
         workflow_output_baseline: tuple[dict[str, str], ...] = (),
+        workflow_builder_job_id: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -588,6 +624,7 @@ class JobRegistry:
             raise ValueError(f"slice 已有 active builder，不可重複派工: {task}")
         if kind not in {"build", "review"}:
             raise ValueError(f"非法 kind: {kind!r}")
+        self._validate_existing_job_ref("workflow_builder_job_id", workflow_builder_job_id)
         self._seq += 1
         job: dict[str, Any] = {
             "job_id": f"{task}-{self._seq}",
@@ -616,11 +653,14 @@ class JobRegistry:
             "workflow_card": workflow_card,
             "workflow_phase": workflow_phase,
             "workflow_repo_root": workflow_repo_root,
+            "workflow_input_root": workflow_input_root,
             "workflow_inputs": list(workflow_inputs),
+            "workflow_input_snapshot": [dict(row) for row in workflow_input_snapshot],
             "workflow_outputs": list(workflow_outputs),
             "source_revision": source_revision,
             "workflow_sandbox_hash": workflow_sandbox_hash,
             "workflow_output_baseline": [dict(row) for row in workflow_output_baseline],
+            "workflow_builder_job_id": workflow_builder_job_id,
             "workflow_evidence": None,
             "created_at": _now_iso(),
         }
@@ -1051,6 +1091,7 @@ class JobRegistry:
             created_at=now,
             updated_at=now,
             planning_authority=tuple(planning_authority),
+            planning_source_revision=source_revision,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1090,6 +1131,7 @@ class JobRegistry:
         facets: tuple[str, ...] | None = None,
         gate_status: str | None = None,
         planning_authority: tuple[PlanningArtifactAuthority, ...] | None = None,
+        planning_source_revision: str | None = None,
         status: str | None = None,
         completion_record_path: str | None = None,
         completion_record_hash: str | None = None,
@@ -1134,6 +1176,11 @@ class JobRegistry:
                 current.planning_authority
                 if planning_authority is None
                 else tuple(planning_authority)
+            ),
+            planning_source_revision=(
+                current.planning_source_revision
+                if planning_source_revision is None
+                else planning_source_revision
             ),
             status=current.status if status is None else status,
             completion_record_path=(
@@ -1200,6 +1247,119 @@ class JobRegistry:
             candidate_head=candidate_head,
             verified_head=None,
             facets=(),
+            gate_status="running",
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
+    def _manager_reset_workflow_for_retry_build(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        repair_action: str,
+    ) -> WorkflowRun:
+        """Atomically reopen only the final builder card after an explicit human stop."""
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase not in {"build", "verify", "review"}
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError(
+                "retry-build reset requires active needs_human build/verify/review workflow"
+            )
+        if current.candidate_head != expected_candidate:
+            raise ValueError("retry-build reset Candidate CAS mismatch")
+        if not isinstance(repair_action, str) or not repair_action:
+            raise ValueError("retry-build reset action missing")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("retry-build reset refuses active workflow job")
+        build_steps = [step for step in current.steps if step.phase == "build"]
+        if not build_steps:
+            raise ValueError("retry-build reset requires build phase")
+        repair_card = build_steps[-1].card
+        if current.current_phase == "build":
+            if (
+                any(step.gate_result != "passed" for step in build_steps[:-1])
+                or build_steps[-1].gate_result != "pending"
+            ):
+                raise ValueError(
+                    "retry-build reset requires only the final builder card pending"
+                )
+            terminal_repairs = [
+                job
+                for job in self._jobs
+                if job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_phase") == "build"
+                and job.get("workflow_card") == repair_card
+                and job.get("status") == "exited"
+                and job.get("exit_code") == 0
+            ]
+            if (
+                not terminal_repairs
+                or terminal_repairs[-1].get("workflow_evidence") is not None
+            ):
+                raise ValueError(
+                    "retry-build reset requires unbound terminal builder evidence"
+                )
+        elif any(step.gate_result != "passed" for step in build_steps):
+            raise ValueError("retry-build reset requires completed build phase")
+        passed_ship_steps = [
+            step
+            for step in current.steps
+            if step.phase == "ship" and step.gate_result == "passed"
+        ]
+        if len(passed_ship_steps) > 1 or any(
+            step.card != "openspec-archive"
+            or step.executor != "cortex-manager"
+            or step.model != "deterministic"
+            or step.domain != "cortex"
+            for step in passed_ship_steps
+        ):
+            raise ValueError(
+                "retry-build reset only permits Manager-owned archive authority"
+            )
+        steps = tuple(
+            replace(
+                step,
+                executor=None,
+                model=None,
+                domain=None,
+                gate_result="pending",
+                action=(
+                    repair_action
+                    if step.phase == "build" and step.card == repair_card
+                    else step.action
+                ),
+            )
+            if (step.phase == "build" and step.card == repair_card)
+            or step.phase in {"verify", "review"}
+            or (step.phase == "ship" and step.gate_result != "passed")
+            else step
+            for step in current.steps
+        )
+        updated = replace(
+            current,
+            current_phase="build",
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "build": current.attempts.get("build", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            verified_head=None,
+            facets=tuple(
+                facet for facet in current.facets if facet != "needs_human"
+            ),
             gate_status="running",
             updated_at=_now_iso(),
         )

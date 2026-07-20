@@ -5,11 +5,14 @@ import hashlib
 import base64
 import binascii
 import json
+import math
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
+from urllib.parse import quote
 
 import yaml
 
@@ -357,7 +360,7 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "source_revision", "workspace_root", "evidence_refs", "gate_refs",
         "brainstorm_required", "primary_domain", "candidate_head",
         "verified_head", "gate_status", "completion_source_revisions",
-        "planning_authority",
+        "planning_authority", "planning_source_revision",
     }
 )
 
@@ -729,11 +732,37 @@ class GitHubTerminalProvider:
         *,
         runner: CommandRunner | None = None,
         timeout_seconds: float = 30,
+        retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
+        sleeper: Callable[[float], None] = time.sleep,
+        relevant_pr_numbers: tuple[int, ...] | None = None,
     ) -> None:
         self.repo = repo
         self.provider_id = f"github-terminal:{repo}"
         self.runner = runner or SubprocessCommandRunner()
         self.timeout_seconds = timeout_seconds
+        if any(
+            not isinstance(delay, (int, float))
+            or isinstance(delay, bool)
+            or not math.isfinite(float(delay))
+            or delay < 0
+            for delay in retry_delays
+        ):
+            raise ValueError("GitHub terminal retry delays must be finite non-negative numbers")
+        self.retry_delays = tuple(float(delay) for delay in retry_delays)
+        self.sleeper = sleeper
+        if relevant_pr_numbers is not None and (
+            len(relevant_pr_numbers) != len(set(relevant_pr_numbers))
+            or any(
+                not isinstance(number, int)
+                or isinstance(number, bool)
+                or number <= 0
+                for number in relevant_pr_numbers
+            )
+        ):
+            raise ValueError("relevant PR numbers must be unique positive integers")
+        self.relevant_pr_numbers = (
+            None if relevant_pr_numbers is None else frozenset(relevant_pr_numbers)
+        )
 
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()
@@ -765,7 +794,10 @@ class GitHubTerminalProvider:
                 raise ValueError("default branch tree is truncated")
             if not isinstance(tree.get("tree"), list):
                 raise ValueError("default branch tree entries are invalid")
-            remote_todos = self._remote_todos(tree)
+            remote_todos = self._remote_todos(
+                tree,
+                default_revision=default_revision.lower(),
+            )
             paths = {
                 row["path"]
                 for row in tree["tree"]
@@ -834,6 +866,10 @@ class GitHubTerminalProvider:
                     and isinstance(parent_count, int)
                     and not isinstance(parent_count, bool)
                     and parent_count >= 2
+                    and (
+                        self.relevant_pr_numbers is None
+                        or number in self.relevant_pr_numbers
+                    )
                 )
                 if merge_commit:
                     comparison = self._json(
@@ -893,8 +929,19 @@ class GitHubTerminalProvider:
         )
 
     def _json(self, argv: Sequence[str]) -> Mapping:
-        completed = self.runner.run(argv, timeout=self.timeout_seconds)
-        if completed.returncode != 0:
+        completed = None
+        for attempt in range(len(self.retry_delays) + 1):
+            completed = self.runner.run(argv, timeout=self.timeout_seconds)
+            if completed.returncode == 0:
+                break
+            error = f"{completed.stderr}\n{completed.stdout}"
+            if (
+                attempt >= len(self.retry_delays)
+                or re.search(r"\bHTTP (?:502|503|504)\b", error) is None
+            ):
+                raise OSError("gh api failed")
+            self.sleeper(self.retry_delays[attempt])
+        if completed is None or completed.returncode != 0:
             raise OSError("gh api failed")
         payload = json.loads(completed.stdout)
         if not isinstance(payload, Mapping):
@@ -913,7 +960,12 @@ class GitHubTerminalProvider:
             observations={},
         )
 
-    def _remote_todos(self, tree: Mapping) -> list[dict[str, object]]:
+    def _remote_todos(
+        self,
+        tree: Mapping,
+        *,
+        default_revision: str,
+    ) -> list[dict[str, object]]:
         rows: list[dict[str, object]] = []
         for entry in tree.get("tree", []):
             if not isinstance(entry, Mapping):
@@ -935,23 +987,32 @@ class GitHubTerminalProvider:
                 r"[0-9a-fA-F]{40}", revision
             ) is None:
                 raise ValueError("remote Todo tree entry is invalid")
-            blob = self._json(
+            content_file = self._json(
                 (
                     "gh", "api", "--method", "GET",
-                    f"repos/{self.repo}/git/blobs/{revision}",
+                    (
+                        f"repos/{self.repo}/contents/{quote(path, safe='/')}"
+                        f"?ref={default_revision}"
+                    ),
                 )
             )
-            if blob.get("encoding") != "base64" or blob.get("sha") != revision:
-                raise ValueError("remote Todo blob revision mismatch")
-            content = blob.get("content")
+            if (
+                content_file.get("type") != "file"
+                or content_file.get("path") != path
+                or not isinstance(content_file.get("sha"), str)
+                or content_file["sha"].lower() != revision.lower()
+                or content_file.get("encoding") != "base64"
+            ):
+                raise ValueError("remote Todo content identity mismatch")
+            content = content_file.get("content")
             if not isinstance(content, str):
-                raise ValueError("remote Todo blob content is invalid")
+                raise ValueError("remote Todo content is invalid")
             try:
                 text = base64.b64decode(
                     re.sub(r"\s+", "", content), validate=True
                 ).decode("utf-8")
             except (binascii.Error, UnicodeDecodeError) as error:
-                raise ValueError("remote Todo blob content is invalid") from error
+                raise ValueError("remote Todo content is invalid") from error
             row: dict[str, object] = {
                 "path": path,
                 "revision": revision.lower(),

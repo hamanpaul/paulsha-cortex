@@ -5,8 +5,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -82,8 +84,9 @@ class DeliveryFacts:
 class DeliveryPolicy:
     expected_head: str
     required_closing_issues: tuple[int, ...]
-    copilot_review_id: int
-    copilot_requested_at_epoch: float
+    copilot_review_id: int | None = None
+    copilot_requested_at_epoch: float | None = None
+    review_kind: str = "copilot"
 
 
 @dataclass(frozen=True)
@@ -107,20 +110,27 @@ def evaluate_delivery_gate(*, facts: DeliveryFacts, policy: DeliveryPolicy) -> G
     if not facts.checks or any(not check.terminal_green for check in facts.checks):
         reasons.append("checks-not-terminal-green")
 
-    current_reviews = tuple(
-        review
-        for review in facts.copilot_reviews
-        if review.commit_id == policy.expected_head
-        and review.review_id == policy.copilot_review_id
-        and review.author == COPILOT_REVIEWER_LOGIN
-        and review.submitted_at_epoch >= policy.copilot_requested_at_epoch
-    )
-    if not current_reviews:
-        reasons.append("copilot-current-head-review-missing")
-    elif any(review.is_error for review in current_reviews):
-        reasons.append("copilot-error-review")
-    elif any(review.state.upper() not in {"COMMENTED", "APPROVED"} for review in current_reviews):
-        reasons.append("copilot-review-state-invalid")
+    if policy.review_kind == "copilot":
+        if policy.copilot_review_id is None or policy.copilot_requested_at_epoch is None:
+            reasons.append("copilot-review-policy-invalid")
+            current_reviews = ()
+        else:
+            current_reviews = tuple(
+                review
+                for review in facts.copilot_reviews
+                if review.commit_id == policy.expected_head
+                and review.review_id == policy.copilot_review_id
+                and review.author == COPILOT_REVIEWER_LOGIN
+                and review.submitted_at_epoch >= policy.copilot_requested_at_epoch
+            )
+        if not current_reviews:
+            reasons.append("copilot-current-head-review-missing")
+        elif any(review.is_error for review in current_reviews):
+            reasons.append("copilot-error-review")
+        elif any(review.state.upper() not in {"COMMENTED", "APPROVED"} for review in current_reviews):
+            reasons.append("copilot-review-state-invalid")
+    elif policy.review_kind != "maintainer-review":
+        reasons.append("delivery-review-policy-invalid")
 
     if any(thread.blocks_merge for thread in facts.review_threads):
         reasons.append("review-thread-open")
@@ -245,8 +255,28 @@ query($owner:String!,$name:String!,$number:Int!,$issueCursor:String,$threadCurso
 class GitHubDeliveryClient:
     """Authenticated ``gh api`` seam; any malformed remote fact fails closed."""
 
-    def __init__(self, *, runner: Runner = subprocess.run) -> None:
+    def __init__(
+        self,
+        *,
+        runner: Runner = subprocess.run,
+        metadata_retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._runner = runner
+        if any(
+            not isinstance(delay, (int, float))
+            or isinstance(delay, bool)
+            or not math.isfinite(float(delay))
+            or delay < 0
+            for delay in metadata_retry_delays
+        ):
+            raise ValueError(
+                "GitHub metadata retry delays must be finite non-negative numbers"
+            )
+        self._metadata_retry_delays = tuple(
+            float(delay) for delay in metadata_retry_delays
+        )
+        self._sleeper = sleeper
 
     def _run(self, argv: list[str], *, expect_json: bool) -> object:
         raw = self._runner(
@@ -272,14 +302,57 @@ class GitHubDeliveryClient:
     def _api(self, endpoint: str) -> object:
         return self._run(["gh", "api", endpoint], expect_json=True)
 
-    def _api_pages(self, endpoint: str) -> list[object]:
-        payload = self._run(
-            ["gh", "api", "--paginate", "--slurp", endpoint],
-            expect_json=True,
+    def _metadata_json(self, argv: list[str]) -> object:
+        """Retry only the idempotent PR-metadata transaction surface."""
+
+        for attempt in range(len(self._metadata_retry_delays) + 1):
+            try:
+                return self._run(argv, expect_json=True)
+            except RuntimeError as error:
+                if (
+                    attempt >= len(self._metadata_retry_delays)
+                    or re.search(r"\bHTTP (?:502|503|504)\b", str(error)) is None
+                ):
+                    raise
+                self._sleeper(self._metadata_retry_delays[attempt])
+        raise AssertionError("unreachable metadata retry state")
+
+    def _read_pr_metadata(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+    ) -> tuple[dict, tuple[str, ...]]:
+        pull = self._metadata_json(
+            ["gh", "api", f"repos/{repo}/pulls/{pr_number}"]
         )
-        if not isinstance(payload, list) or not payload:
+        issue = self._metadata_json(
+            ["gh", "api", f"repos/{repo}/issues/{pr_number}"]
+        )
+        if not isinstance(pull, dict) or not isinstance(issue, dict):
+            raise RuntimeError("GitHub PR metadata reread malformed")
+        rows = issue.get("labels")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str)
+            for row in rows
+        ):
+            raise RuntimeError("GitHub PR metadata reread malformed")
+        return pull, tuple(sorted(row["name"] for row in rows))
+
+    def _api_pages(self, endpoint: str) -> list[object]:
+        stdout = self._run(
+            ["gh", "api", "--paginate", "--jq", ".", endpoint],
+            expect_json=False,
+        )
+        if not isinstance(stdout, str):
             raise RuntimeError("GitHub paginated payload malformed")
-        return payload
+        try:
+            pages = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GitHub paginated payload malformed") from exc
+        if not pages:
+            raise RuntimeError("GitHub paginated payload malformed")
+        return pages
 
     @staticmethod
     def _repo_parts(repo: str) -> tuple[str, str]:
@@ -826,7 +899,7 @@ class GitHubDeliveryClient:
         body: str,
         labels: tuple[str, ...],
     ) -> None:
-        """Update an existing authorized PR and prove every field by reread."""
+        """Ensure exact remote metadata, writing only after authenticated drift."""
 
         self._repo_parts(repo)
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
@@ -839,7 +912,18 @@ class GitHubDeliveryClient:
             or len(set(labels)) != len(labels)
         ):
             raise ValueError("PR labels must be unique non-empty strings")
-        self._run(
+        expected_labels = tuple(sorted(labels))
+        pull, remote_labels = self._read_pr_metadata(
+            repo=repo,
+            pr_number=pr_number,
+        )
+        if (
+            pull.get("title") == title
+            and pull.get("body") == body
+            and remote_labels == expected_labels
+        ):
+            return
+        self._metadata_json(
             [
                 "gh",
                 "api",
@@ -850,8 +934,7 @@ class GitHubDeliveryClient:
                 f"title={title}",
                 "-f",
                 f"body={body}",
-            ],
-            expect_json=True,
+            ]
         )
         label_argv = [
             "gh",
@@ -862,22 +945,15 @@ class GitHubDeliveryClient:
         ]
         for label in labels:
             label_argv.extend(["-f", f"labels[]={label}"])
-        self._run(label_argv, expect_json=True)
-        pull = self._api(f"repos/{repo}/pulls/{pr_number}")
-        issue = self._api(f"repos/{repo}/issues/{pr_number}")
-        if not isinstance(pull, dict) or not isinstance(issue, dict):
-            raise RuntimeError("GitHub PR metadata reread malformed")
-        rows = issue.get("labels")
-        if not isinstance(rows, list) or any(
-            not isinstance(row, dict) or not isinstance(row.get("name"), str)
-            for row in rows
-        ):
-            raise RuntimeError("GitHub PR metadata reread malformed")
-        remote_labels = tuple(sorted(row["name"] for row in rows))
+        self._metadata_json(label_argv)
+        pull, remote_labels = self._read_pr_metadata(
+            repo=repo,
+            pr_number=pr_number,
+        )
         if (
             pull.get("title") != title
             or pull.get("body") != body
-            or remote_labels != tuple(sorted(labels))
+            or remote_labels != expected_labels
         ):
             raise RuntimeError("GitHub PR metadata reread mismatch")
 

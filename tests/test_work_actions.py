@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from paulsha_cortex.coordinator.github_delivery import (
 )
 from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.workflow import GateEvidenceRef
 
 
 HEAD = "a" * 40
@@ -204,6 +206,341 @@ def test_resume_existing_needs_human_reenters_canonical_starter(tmp_path: Path) 
     assert calls == [(claim_key, None)]
     assert result["result"]["run"]["current_phase"] == "plan"
     assert result["result"]["run"]["facets"] == []
+
+
+def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    passed = tuple(
+        replace(step, gate_result="passed")
+        if step.phase in {"build", "verify", "review"}
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build", "verify"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        initial.run_id,
+        current_phase="review",
+        steps=passed,
+        attempts={"build": 1, "verify": 1, "review": 1},
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        facets=("needs_human",),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/review.json", "f" * 64),),
+        gate_status="running",
+    )
+    args = {
+        "action": "retry-build",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+    }
+    with pytest.raises(RuntimeError, match="Candidate CAS mismatch"):
+        work_actions.execute_work_action(
+            args={**args, "expected_candidate": "c" * 40},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
+
+    delivery_side_effect_started = tuple(
+        replace(step, gate_result="passed") if step.phase == "ship" else step
+        for step in passed
+    )
+    registry._manager_update_workflow_run(initial.run_id, steps=delivery_side_effect_started)
+    with pytest.raises(ValueError, match="Manager-owned archive authority"):
+        work_actions.execute_work_action(
+            args={**args, "expected_candidate": HEAD},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(initial.run_id, steps=passed)
+
+    result = work_actions.execute_work_action(
+        args={**args, "expected_candidate": HEAD},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    assert result["result"]["action"] == "retry-build"
+    assert reset.current_phase == "build"
+    assert reset.candidate_head == HEAD
+    assert reset.verified_head is None
+    assert reset.facets == ()
+    assert reset.gate_refs == ()
+    assert reset.attempts["build"] == 2
+    build_steps = [step for step in reset.steps if step.phase == "build"]
+    assert all(step.gate_result == "passed" for step in build_steps[:-1])
+    assert build_steps[-1].gate_result == "pending"
+    assert "Do not claim archive" in str(build_steps[-1].action)
+    assert all(
+        step.gate_result == "pending"
+        for step in reset.steps
+        if step.phase in {"verify", "review", "ship"}
+    )
+
+
+def test_retry_build_preserves_only_manager_owned_archive_authority(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    archived = tuple(
+        replace(
+            step,
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            gate_result="passed",
+        )
+        if step.phase == "ship" and step.card == "openspec-archive"
+        else replace(step, gate_result="passed")
+        if step.phase in {"build", "verify", "review"}
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build", "verify"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        initial.run_id,
+        current_phase="review",
+        steps=archived,
+        attempts={"build": 1, "verify": 2, "review": 2},
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        facets=("needs_human", "degraded"),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/review.json", "f" * 64),),
+        gate_status="failed",
+    )
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "actor": "operator",
+            "expected_candidate": HEAD,
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    assert result["result"]["action"] == "retry-build"
+    assert reset.current_phase == "build"
+    assert reset.facets == ("degraded",)
+    assert reset.gate_refs == ()
+    archive = next(step for step in reset.steps if step.card == "openspec-archive")
+    assert (
+        archive.executor,
+        archive.model,
+        archive.domain,
+        archive.gate_result,
+    ) == ("cortex-manager", "deterministic", "cortex", "passed")
+    policy = next(step for step in reset.steps if step.card == "policy-commit")
+    assert policy.gate_result == "pending"
+    assert all(
+        step.gate_result == "pending"
+        for step in reset.steps
+        if step.phase in {"verify", "review"}
+    )
+    assert "Preserve the Manager-owned official OpenSpec archive" in str(
+        next(step for step in reset.steps if step.card == "subagent-build").action
+    )
+
+
+def test_retry_build_recovers_unbound_builder_terminalization(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    repair_card = next(
+        step.card for step in reversed(initial.steps) if step.phase == "build"
+    )
+    terminalization_failed = tuple(
+        replace(step, gate_result="passed")
+        if step.phase == "build" and step.card != repair_card
+        else replace(step, gate_result="pending")
+        if step.phase == "build"
+        else replace(
+            step,
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            gate_result="passed",
+        )
+        if step.phase == "ship" and step.card == "openspec-archive"
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        initial.run_id,
+        steps=terminalization_failed,
+        attempts={"build": 2},
+        candidate_head=HEAD,
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    job_args = {
+        "task": "wf-demo-subagent-build",
+        "persona": "builder",
+        "branch": "feature/demo",
+        "pane": "",
+        "worktree": str(tmp_path),
+        "dispatch_head": HEAD,
+        "executor": "codex",
+        "model_id": "gpt-primary",
+        "independence_domain": "openai",
+        "workflow_run_id": initial.run_id,
+        "workflow_claim_key": initial.claim_key,
+        "workflow_repo": initial.repo,
+        "workflow_card": repair_card,
+        "workflow_phase": "build",
+        "workflow_repo_root": str(tmp_path),
+        "workflow_input_root": str(tmp_path),
+        "source_revision": initial.source_revision,
+    }
+    failed_job = registry.create_job(**job_args)
+    registry.update_headless_result(
+        failed_job["job_id"], status="failed", exit_code=1
+    )
+    action_args = {
+        "action": "retry-build",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_candidate": HEAD,
+    }
+    with pytest.raises(ValueError, match="unbound terminal builder evidence"):
+        work_actions.execute_work_action(
+            args=action_args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
+
+    successful_job = registry.create_job(**job_args)
+    registry.update_headless_result(
+        successful_job["job_id"], status="exited", exit_code=0
+    )
+    result = work_actions.execute_work_action(
+        args=action_args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    assert result["result"]["action"] == "retry-build"
+    assert reset.current_phase == "build"
+    assert reset.candidate_head == HEAD
+    assert reset.facets == ()
+    assert reset.attempts["build"] == 3
+    assert registry.get_job(successful_job["job_id"])["workflow_evidence"] is None
+    assert "declared input snapshots" in str(
+        next(step for step in reset.steps if step.card == repair_card).action
+    )
+
+
+def test_review_attest_writes_immutable_exact_head_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=("acme/demo#8",),
+        gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
+        gate_status="passed",
+        facets=("needs_human", "degraded"),
+    )
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            return DeliveryFacts(
+                head=HEAD, mergeable=True, mergeable_state="clean",
+                checks=(GitHubCheck("pytest", "completed", "success"),),
+                copilot_reviews=(), review_threads=(), closing_issues=(12,),
+                active_openspec_absent=True, archive_present=True,
+            )
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    args = {
+        "action": "review-attest", "repo": "acme/demo", "work_id": "demo",
+        "actor": "maintainer@example", "verdict": "approved",
+        "summary": "Exact-HEAD adversarial review passed.", "findings": [],
+    }
+    first = work_actions.execute_work_action(
+        args=args, requested_by="operator", snapshot_path=snapshot, state_path=state,
+        now=lambda: 210, workflow_registry=registry,
+    )
+    second = work_actions.execute_work_action(
+        args=args, requested_by="operator", snapshot_path=snapshot, state_path=state,
+        now=lambda: 210, workflow_registry=registry,
+    )
+
+    assert first == second
+    evidence = Path(first["result"]["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
+    persisted = registry.get_workflow_run(run_id)
+    review = next(ref for ref in persisted.gate_refs if ref.kind == "maintainer-review")
+    assert review.ref == str(evidence)
+    assert review.sha256 == first["result"]["hash"]
+    assert persisted.facets == ("degraded",)
 
 
 def test_auto_without_issue_mutates_every_mapped_issue(tmp_path: Path) -> None:
@@ -989,6 +1326,95 @@ def test_ship_needs_human_when_authority_has_multiple_delivery_targets(
     )
 
 
+def test_ship_resume_rearms_prebinding_target_cardinality_stop(tmp_path: Path) -> None:
+    from paulsha_cortex.coordinator import work_bridge
+    from paulsha_cortex.coordinator.claim import work_authority_digest
+
+    snapshot = _snapshot(tmp_path / "snapshot.json", todo_paths=())
+    state = tmp_path / "delivery-journal.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    stopped = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": [],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    assert stopped["result"]["reason"] == "multiple-delivery-targets-unsupported"
+
+    _snapshot(
+        snapshot,
+        todo_paths=("docs/todo.md",),
+        source_revisions=("issue:12@open", "openspec:demo@1", "todo:docs/todo.md@1"),
+    )
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=state.parent / "jobs.json")
+    run = registry.list_workflow_runs()[0]
+    run = registry._manager_update_workflow_run(
+        run.run_id,
+        source_revision=work_authority_digest(authority),
+        facets=("needs_human", "degraded"),
+    )
+    work_bridge._rebase_delivery_journal_authority(
+        state_root=state.parent,
+        run=run,
+        authority=authority,
+    )
+
+    active = tmp_path / "openspec" / "changes" / "demo"
+    active.mkdir(parents=True)
+    (active / "tasks.md").write_text("- [x] ready\n", encoding="utf-8")
+    (tmp_path / "changelog.d").mkdir()
+    (tmp_path / "changelog.d" / "demo.md").write_text("fixed\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n\n### Fixed\n- ready\n", encoding="utf-8"
+    )
+
+    def runner(argv, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    resumed = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "pr_metadata_path": str(tmp_path / "pr.json"),
+        },
+        requested_by="operator",
+        runner=runner,
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+
+    assert resumed["result"]["action"] == "archive-applied-needs-commit"
+    assert "ship" not in _only_journal_row(state)
+    assert JobRegistry(state_path=state.parent / "jobs.json").get_workflow_run(
+        run.run_id
+    ).facets == ("degraded",)
+
+
 def test_ship_rejects_old_run_after_current_authority_changes(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
@@ -1548,6 +1974,60 @@ def test_crash_reconcile_uses_stable_authorization_without_rerunning_preflight(
         now=lambda: 220,
     )
     assert result["result"]["action"] == "merged-awaiting-closure"
+
+
+def test_v2_authorization_rejects_tampered_maintainer_review_on_replay(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    active = {"run_id": "workflow-" + "a" * 20, "workflow_step_ids": ["review", "ship"]}
+    binding = {"pr_number": 8, "change": "demo", "todo_paths": ["docs/todo.md"]}
+    review = tmp_path / "maintainer-review.json"
+    review_payload = {"schema": "maintainer-review/v1", "candidate": HEAD, "verdict": "approved"}
+    review.write_text(json.dumps(review_payload), encoding="utf-8")
+    review.chmod(0o444)
+    body = {
+        "schema": "cortex-merge-authorization/v2",
+        "run_id": active["run_id"],
+        "workflow_step_ids": active["workflow_step_ids"],
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "authority_digest": work_actions.work_authority_digest(authority),
+        **binding,
+        "head": HEAD,
+        "tree_hash": TREE,
+        "review_kind": "maintainer-review",
+        "review_ref": str(review),
+        "review_hash": work_actions.verification.canonical_json_hash(review_payload),
+        "foreign_review_path": str(tmp_path / "foreign.json"),
+        "foreign_review_hash": "2" * 64,
+        "preflight_hash": "3" * 64,
+        "checks_hash": "4" * 64,
+    }
+    authorization = work_actions._authorization_record(body, state_path=state)
+    assert work_actions._authorization_identity_matches(
+        authorization,
+        active=active,
+        authority=authority,
+        binding=binding,
+        head=HEAD,
+        tree_hash=TREE,
+    )
+
+    review.chmod(0o600)
+    review.write_text(json.dumps({**review_payload, "verdict": "rejected"}), encoding="utf-8")
+    review.chmod(0o444)
+
+    assert not work_actions._authorization_identity_matches(
+        authorization,
+        active=active,
+        authority=authority,
+        binding=binding,
+        head=HEAD,
+        tree_hash=TREE,
+    )
 
 
 def test_cached_done_replays_remote_closure_instead_of_trusting_local_state(

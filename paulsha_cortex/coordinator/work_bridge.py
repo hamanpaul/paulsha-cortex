@@ -6,12 +6,14 @@ run-keyed journal, but never invents a second run identity or lifecycle state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import subprocess
-import time
-import hashlib
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping
@@ -409,6 +411,7 @@ def _push_exact_candidate(
     branch: str,
     candidate: str,
     runner,
+    pre_push: Callable[[], None] | None = None,
 ) -> None:
     if re.fullmatch(r"feature/[a-z0-9][a-z0-9._/-]*", branch) is None:
         raise ValueError("workflow delivery branch is not an authorized feature ref")
@@ -423,6 +426,19 @@ def _push_exact_candidate(
     from . import work_actions
 
     state_path = state_root / "delivery-journal.json"
+    current_digest = work_authority_digest(authority)
+    if run.source_revision != current_digest:
+        run = registry._manager_update_workflow_run(
+            run.run_id,
+            source_revision=current_digest,
+        )
+    journal = work_actions._load_runs(state_path)
+    if run.run_id in journal["runs"]:
+        _rebase_delivery_journal_authority(
+            state_root=state_root,
+            run=run,
+            authority=authority,
+        )
     state, row, _canonical = work_actions._load_work_run(
         state_path=state_path,
         workflow_registry=registry,
@@ -453,6 +469,8 @@ def _push_exact_candidate(
     if persisted is not None and persisted != expected:
         raise RuntimeError("delivery push journal conflicts with Candidate")
     if remote_head != candidate:
+        if pre_push is not None:
+            pre_push()
         pushed = runner(
             ["git", "-C", str(worktree), "push", "origin", f"HEAD:{ref}"],
             shell=False,
@@ -711,7 +729,7 @@ def _authority_with_manager_pr(authority: WorkAuthority, pr_number: int) -> Work
     )
 
 
-def _workflow_evidence_payload(
+def _workflow_evidence_envelope(
     *,
     registry,
     state_root: Path,
@@ -772,6 +790,11 @@ def _workflow_evidence_payload(
         "outputs": job.get("workflow_outputs", []),
         "output_baseline": job.get("workflow_output_baseline", []),
     }
+    envelope_job = envelope.get("job") if isinstance(envelope, dict) else None
+    if job.get("workflow_input_snapshot") or (
+        isinstance(envelope_job, dict) and "input_snapshot" in envelope_job
+    ):
+        expected_job["input_snapshot"] = job.get("workflow_input_snapshot", [])
     payload = envelope.get("payload") if isinstance(envelope, dict) else None
     if (
         not isinstance(envelope, dict)
@@ -782,9 +805,231 @@ def _workflow_evidence_payload(
         or not isinstance(payload, dict)
     ):
         raise RuntimeError("workflow evidence envelope malformed")
+    return envelope, job
+
+
+def _workflow_evidence_payload(
+    *,
+    registry,
+    state_root: Path,
+    run,
+    phase: str,
+    expected_ref: str | None = None,
+    expected_hash: str | None = None,
+) -> tuple[dict, dict]:
+    envelope, job = _workflow_evidence_envelope(
+        registry=registry,
+        state_root=state_root,
+        run=run,
+        phase=phase,
+        expected_ref=expected_ref,
+        expected_hash=expected_hash,
+    )
+    payload = envelope["payload"]
     payload = dict(payload)
     payload.pop("outputs", None)
     return payload, job
+
+
+def _remove_canonical_untracked_reports(
+    *,
+    registry,
+    state_root: Path,
+    run,
+    worktree: Path,
+) -> None:
+    """Remove only exact, canonical report publications before delivery.
+
+    Reviewer reports are Manager-owned evidence material rather than Candidate
+    tree content.  They are needed while subsequent review cards snapshot their
+    inputs, but must not make the exact committed Candidate dirty at delivery.
+    Unknown, tracked, symlinked, stale, or hash-drifted paths remain a hard stop.
+    A hash-addressed cleanup intent makes a Manager-completed deletion replayable.
+    """
+
+    trusted: dict[str, str] = {}
+    for job in registry.list_jobs():
+        phase = job.get("workflow_phase")
+        locator = job.get("workflow_evidence")
+        if (
+            job.get("workflow_run_id") != run.run_id
+            or phase not in {"verify", "review"}
+            or job.get("subject_head") != run.candidate_head
+            or job.get("status") != "exited"
+            or job.get("exit_code") != 0
+            or not isinstance(locator, dict)
+            or not isinstance(locator.get("path"), str)
+            or not isinstance(locator.get("hash"), str)
+        ):
+            continue
+        evidence_ref = state_root / str(locator["path"])
+        envelope, _validated_job = _workflow_evidence_envelope(
+            registry=registry,
+            state_root=state_root,
+            run=run,
+            phase=str(phase),
+            expected_ref=str(evidence_ref),
+            expected_hash=str(locator["hash"]),
+        )
+        phase_root = f"reports/{'verify' if phase == 'verify' else 'review'}/"
+        for artifact in envelope["artifacts"]:
+            if (
+                not isinstance(artifact, dict)
+                or set(artifact) != {"path", "sha256", "baseline_sha256"}
+                or not isinstance(artifact.get("path"), str)
+                or not artifact["path"].startswith(phase_root)
+                or not isinstance(artifact.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", str(artifact["sha256"])) is None
+                or artifact.get("baseline_sha256") is not None
+                and (
+                    not isinstance(artifact.get("baseline_sha256"), str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}", str(artifact["baseline_sha256"])
+                    ) is None
+                )
+            ):
+                raise RuntimeError("canonical workflow report artifact malformed")
+            relative = Path(str(artifact["path"]))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError("canonical workflow report path escapes repo")
+            # JobRegistry is append-ordered; a retry publication supersedes the
+            # prior canonical body at the same report path.
+            trusted[relative.as_posix()] = str(artifact["sha256"])
+
+    cleanup_payload = {
+        "schema": "cortex-workflow-report-cleanup/v1",
+        "run_id": run.run_id,
+        "candidate": run.candidate_head,
+        "reports": [
+            {"path": path, "sha256": sha256}
+            for path, sha256 in sorted(trusted.items())
+        ],
+    }
+    cleanup_digest = verification.canonical_json_hash(cleanup_payload)
+    cleanup_path = (
+        state_root.resolve() / "evidence" / "report-cleanup" / f"{cleanup_digest}.json"
+    )
+    cleanup_started = cleanup_path.exists() or cleanup_path.is_symlink()
+    if cleanup_started and (
+        cleanup_path.is_symlink()
+        or not cleanup_path.is_file()
+        or cleanup_path.stat().st_mode & 0o222
+    ):
+        raise RuntimeError("workflow report cleanup evidence is not immutable")
+
+    removals: list[Path] = []
+    for relative, expected_hash in sorted(trusted.items()):
+        path = worktree / relative
+        if not path.exists() and not path.is_symlink():
+            if cleanup_started:
+                continue
+            raise RuntimeError("canonical workflow report is missing before cleanup")
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("canonical workflow report path is not a regular file")
+        resolved = path.resolve(strict=True)
+        try:
+            resolved.relative_to(worktree)
+        except ValueError as exc:
+            raise RuntimeError("canonical workflow report path escapes worktree") from exc
+        actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
+        if actual != expected_hash:
+            raise RuntimeError("canonical workflow report hash drift")
+        tracked = subprocess.run(
+            ["git", "-C", str(worktree), "ls-files", "--error-unmatch", "--", relative],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if tracked.returncode == 0:
+            raise RuntimeError("canonical workflow report unexpectedly tracked")
+        if tracked.returncode != 1:
+            raise RuntimeError("canonical workflow report tracking state unavailable")
+        removals.append(resolved)
+
+    if trusted:
+        _write_json_evidence(state_root, "report-cleanup", cleanup_payload)
+    for path in removals:
+        path.unlink()
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+def _run_exact_candidate_preflight(
+    *,
+    worktree: Path,
+    branch: str,
+    candidate: str,
+    command: tuple[str, ...],
+    request: PreflightRequest,
+    runner,
+    now,
+):
+    """Run initial metadata preflight in a clean detached exact-Candidate checkout."""
+
+    if verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        raise ValueError("initial preflight Candidate is invalid")
+    branch_match = re.fullmatch(r"feature/([a-z0-9][a-z0-9-]*)", branch)
+    if branch_match is None:
+        raise ValueError("initial preflight delivery branch violates feature policy")
+    head = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if head.returncode != 0 or head.stdout.strip().lower() != candidate:
+        raise RuntimeError("initial preflight requires exact local Candidate HEAD")
+    parent = Path(tempfile.mkdtemp(prefix="cortex-preflight-"))
+    checkout = parent / "candidate"
+    checkout_branch = f"feature/preflight-{candidate[:12]}-{uuid4().hex[:8]}"
+    added = False
+    try:
+        created = subprocess.run(
+            [
+                "git", "-C", str(worktree), "worktree", "add", "-b",
+                checkout_branch, str(checkout), candidate,
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            raise RuntimeError("exact Candidate preflight checkout failed")
+        added = True
+        return run_preflight(
+            repo_root=checkout,
+            command=command,
+            request=request,
+            runner=runner,
+            now=now,
+        )
+    finally:
+        cleanup_error = False
+        if added:
+            removed = subprocess.run(
+                ["git", "-C", str(worktree), "worktree", "remove", "--force", str(checkout)],
+                shell=False,
+                capture_output=True,
+                text=True,
+            )
+            cleanup_error = removed.returncode != 0
+            if not cleanup_error:
+                deleted = subprocess.run(
+                    [
+                        "git", "-C", str(worktree), "update-ref", "-d",
+                        f"refs/heads/{checkout_branch}", candidate,
+                    ],
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                )
+                cleanup_error = deleted.returncode != 0
+        shutil.rmtree(parent, ignore_errors=True)
+        if cleanup_error:
+            raise RuntimeError("exact Candidate preflight checkout cleanup failed")
 
 
 def _completion_draft(
@@ -916,6 +1161,16 @@ def _completion_draft(
     return target
 
 
+def _delivery_adapter_status(action: object) -> str:
+    if not isinstance(action, str):
+        return "pending"
+    if action == "done":
+        return "passed"
+    if action in {"fix-required", "needs_human"}:
+        return "needs_human"
+    return "pending"
+
+
 def build_production_ship_validator(
     *,
     registry,
@@ -939,6 +1194,9 @@ def build_production_ship_validator(
         foreign = [ref for ref in run.gate_refs if ref.kind == "foreign-review"]
         if len(foreign) != 1 or foreign[0].sha256 is None:
             raise ValueError("ship adapter requires canonical foreign-review evidence")
+        maintainer = [ref for ref in run.gate_refs if ref.kind == "maintainer-review"]
+        if len(maintainer) > 1 or (maintainer and maintainer[0].sha256 is None):
+            raise ValueError("ship adapter maintainer-review evidence is ambiguous")
         authority = load_work_authority(
             repo=run.repo,
             work_id=run.work_id,
@@ -954,6 +1212,12 @@ def build_production_ship_validator(
             state_root=state_root,
             foreign_ref=foreign[0],
         )
+        _remove_canonical_untracked_reports(
+            registry=registry,
+            state_root=state_root,
+            run=run,
+            worktree=worktree,
+        )
         metadata = _pr_metadata(run)
         metadata_path = _metadata_file(state_root, run, metadata)
         pr_numbers = []
@@ -965,8 +1229,10 @@ def build_production_ship_validator(
         if len(pr_numbers) > 1:
             raise RuntimeError("workflow delivery supports one PR")
         if not pr_numbers:
-            initial = run_preflight(
-                repo_root=worktree,
+            initial = _run_exact_candidate_preflight(
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
                 command=load_preflight_command(),
                 request=PreflightRequest(metadata_path=str(metadata_path)),
                 runner=runner,
@@ -1032,6 +1298,35 @@ def build_production_ship_validator(
                 run.run_id,
                 source_revision=work_authority_digest(authority),
             )
+        _rebase_delivery_journal_authority(
+            state_root=state_root,
+            run=run,
+            authority=authority,
+        )
+        def authorize_existing_pr_push() -> None:
+            existing = _run_exact_candidate_preflight(
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                command=load_preflight_command(),
+                request=PreflightRequest(pr_number=number),
+                runner=runner,
+                now=now,
+            )
+            if not existing.passed or existing.head != candidate:
+                raise RuntimeError("existing PR exact-Candidate preflight failed")
+
+        _push_exact_candidate(
+            registry=registry,
+            run=run,
+            authority=authority,
+            state_root=state_root,
+            worktree=worktree,
+            branch=branch,
+            candidate=candidate,
+            runner=runner,
+            pre_push=authorize_existing_pr_push,
+        )
         from . import work_actions
         from . import review as review_evidence
 
@@ -1069,6 +1364,9 @@ def build_production_ship_validator(
             "pr_metadata_path": str(metadata_path),
             "skip_tests": False,
         }
+        if maintainer:
+            ship_args["maintainer_review_path"] = maintainer[0].ref
+            ship_args["maintainer_review_hash"] = maintainer[0].sha256
         if completion_draft is not None:
             ship_args["completion_record_path"] = str(completion_draft)
         action = work_actions._ship_action(
@@ -1106,9 +1404,7 @@ def build_production_ship_validator(
                 old_head=candidate,
                 new_head=candidate,
             )
-        status = "passed" if action.get("action") == "done" else "pending"
-        if action.get("action") == "needs_human":
-            status = "needs_human"
+        status = _delivery_adapter_status(action.get("action"))
         evidence = _write_json_evidence(
             state_root,
             "delivery-adapter",
@@ -1128,6 +1424,14 @@ def build_production_ship_validator(
             "reason": action.get("reason"),
             **evidence,
         }
+        if maintainer:
+            result.update(
+                {
+                    "review_kind": "maintainer-review",
+                    "review_ref": maintainer[0].ref,
+                    "review_hash": maintainer[0].sha256,
+                }
+            )
         if status == "passed":
             record = action.get("completion_record")
             merge_revision = action.get("merge_commit")

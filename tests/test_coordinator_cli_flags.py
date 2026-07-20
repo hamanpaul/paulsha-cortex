@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
 
+from paulsha_cortex.control import client as control_client, contract as control_contract
 from paulsha_cortex.coordinator import cli
 from paulsha_cortex.coordinator.cli import _build_parser, _refuse_unsafe_fanout, _resolve_launcher
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
@@ -94,6 +98,17 @@ class SliceActionFlagTests(unittest.TestCase):
 
 
 class WorkActionFlagTests(unittest.TestCase):
+    def test_work_retry_build_accepts_exact_candidate_payload(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(
+            [
+                "work", "retry-build", "demo", "--repo", "acme/demo",
+                "--issue", "12", "--actor", "operator", "--payload", "repair.json",
+            ]
+        )
+        self.assertEqual(args.action, "retry-build")
+        self.assertEqual(args.payload, "repair.json")
+
     def test_work_ship_enqueues_payload_without_executing_delivery(self) -> None:
         submitted = []
         with tempfile.TemporaryDirectory() as root:
@@ -118,6 +133,47 @@ class WorkActionFlagTests(unittest.TestCase):
         self.assertEqual(submitted[0][0], "work-action")
         self.assertEqual(submitted[0][1]["action"], "ship")
         self.assertEqual(submitted[0][1]["pr_number"], 8)
+
+    def test_review_attest_parser_writes_valid_durable_control_request(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            payload_path = Path(root) / "review.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": "approved",
+                        "summary": "Exact-HEAD review passed.",
+                        "findings": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            req_ids: list[str] = []
+
+            def done(req_id, *_args, **_kwargs):
+                req_ids.append(req_id)
+                return {"status": "ok", "result": {"action": "review-attested"}}
+
+            with mock.patch.dict(os.environ, {"PSC_CONTROL_ROOT": root}, clear=False):
+                with redirect_stdout(io.StringIO()):
+                    rc = cli.main(
+                        [
+                            "work", "review-attest", "demo", "--repo", "acme/demo",
+                            "--actor", "maintainer", "--payload", str(payload_path),
+                        ],
+                        control_read_status=lambda: {"degraded": False},
+                        control_submit_request=control_client.submit_request,
+                        control_poll_done=done,
+                    )
+
+            self.assertEqual(rc, 0)
+            request = control_contract.read_json(
+                Path(root) / "requests" / f"{req_ids[0]}.json"
+            )
+            self.assertIsNotNone(request)
+            self.assertEqual(request["args"]["action"], "review-attest")
+            self.assertEqual(request["args"]["actor"], "maintainer")
+            self.assertEqual(request["args"]["verdict"], "approved")
+            self.assertEqual(request["args"]["findings"], [])
 
     def test_work_link_parses_typed_kind_and_ref(self) -> None:
         args = _build_parser().parse_args(

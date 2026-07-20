@@ -10,7 +10,13 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.control.contract import build_request
-from paulsha_cortex.coordinator import manager_daemon, review, verification, work_bridge
+from paulsha_cortex.coordinator import (
+    manager_daemon,
+    review,
+    verification,
+    work_actions,
+    work_bridge,
+)
 from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -44,7 +50,14 @@ def _repo(root: Path) -> tuple[Path, str]:
     return root, head
 
 
-def _snapshot(path: Path) -> Path:
+def _snapshot(
+    path: Path,
+    *,
+    source_revisions: tuple[str, ...] = (
+        "github_issue:acme/demo#14@issue-open",
+        "openspec:acme/demo:work@spec-1",
+    ),
+) -> Path:
     path.write_text(
         json.dumps(
             {
@@ -67,10 +80,7 @@ def _snapshot(path: Path) -> Path:
                         "mapped_todo_paths": ["docs/todo.md"],
                         "confirmed_todo": True,
                         "auto_label": False,
-                        "source_revisions": [
-                            "github_issue:acme/demo#14@issue-open",
-                            "openspec:acme/demo:work@spec-1",
-                        ],
+                        "source_revisions": list(source_revisions),
                     }
                 ],
             }
@@ -106,10 +116,28 @@ def _steps() -> tuple[WorkflowStep, ...]:
     )
 
 
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        (None, "pending"),
+        ({}, "pending"),
+        ("done", "passed"),
+        ("fix-required", "needs_human"),
+        ("needs_human", "needs_human"),
+        ("awaiting-copilot", "pending"),
+    ],
+)
+def test_delivery_adapter_status(action: object, expected: str) -> None:
+    assert work_bridge._delivery_adapter_status(action) == expected
+
+
 def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo, candidate = _repo(tmp_path / "repo")
+    plan = repo / "docs" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Accepted plan\n", encoding="utf-8")
     snapshot = _snapshot(tmp_path / "snapshot.json")
     authority = load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot)
     registry = JobRegistry(state_path=tmp_path / "state" / "jobs.json")
@@ -156,6 +184,7 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         source_revision=run.source_revision,
     )
     registry.update_headless_result(job["job_id"], status="exited", exit_code=0)
+    report_ref = "reports/review/work-review.md"
     review_job = registry.create_job(
         task="wf-review",
         persona="reviewer",
@@ -173,6 +202,8 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         workflow_card="review-card",
         workflow_phase="review",
         workflow_repo_root=str(repo),
+        workflow_outputs=(report_ref,),
+        workflow_output_baseline=(),
         source_revision=run.source_revision,
     )
     registry.update_headless_result(review_job["job_id"], status="exited", exit_code=0)
@@ -196,7 +227,11 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             },
         },
     )
-    evaluation["outputs"] = []
+    report = repo / report_ref
+    report.parent.mkdir(parents=True)
+    report.write_text("# Canonical review\n", encoding="utf-8")
+    report_hash = hashlib.sha256(report.read_bytes()).hexdigest()
+    evaluation["outputs"] = [{"path": report_ref, "sha256": report_hash}]
     review_job = registry.get_job(review_job["job_id"])
     envelope = {
         "schema_version": 1,
@@ -210,11 +245,13 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             "card_id": "review-card",
             "phase": "review",
             "inputs": [],
-            "outputs": [],
+            "outputs": [report_ref],
             "output_baseline": [],
         },
         "payload": evaluation,
-        "artifacts": [],
+        "artifacts": [
+            {"path": report_ref, "sha256": report_hash, "baseline_sha256": None}
+        ],
     }
     content = (
         json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -243,6 +280,26 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
 
     def fake_preflight(**kwargs):
         preflight_requests.append(kwargs["request"])
+        preflight_root = Path(kwargs["repo_root"])
+        assert preflight_root != repo
+        assert subprocess.run(
+            ["git", "-C", str(preflight_root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout == ""
+        assert subprocess.run(
+            ["git", "-C", str(preflight_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip() == candidate
+        assert subprocess.run(
+            ["git", "-C", str(preflight_root), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().startswith("feature/preflight-")
         return PreflightResult(
             True,
             None,
@@ -270,19 +327,27 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             return "main"
 
     monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", GitHub)
-    pushed = False
+    remote_head = None
+    push_count = 0
 
     def delivery_runner(argv, **kwargs):
-        nonlocal pushed
+        nonlocal push_count, remote_head
         if "ls-remote" in argv:
             return SimpleNamespace(
-                returncode=0 if pushed else 2,
-                stdout=(f"{candidate}\trefs/heads/feature/14-work\n" if pushed else ""),
+                returncode=0 if remote_head is not None else 2,
+                stdout=(
+                    f"{remote_head}\trefs/heads/feature/14-work\n"
+                    if remote_head is not None
+                    else ""
+                ),
                 stderr="",
             )
         if "push" in argv:
             assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
-            pushed = True
+            if push_count == 1:
+                assert preflight_requests[-1].pr_number == 17
+            push_count += 1
+            remote_head = candidate
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(argv)
 
@@ -291,6 +356,19 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
         coordinator_root=tmp_path / "state",
         snapshot_path=snapshot,
         runner=delivery_runner,
+    )
+    initial_source_revision = run.source_revision
+    work_actions._load_work_run(
+        state_path=tmp_path / "state" / "delivery-journal.json",
+        workflow_registry=registry,
+        authority=authority,
+    )
+    _snapshot(
+        snapshot,
+        source_revisions=(
+            "github_issue:acme/demo#14@issue-open",
+            "openspec:acme/demo:work@spec-2",
+        ),
     )
 
     result = validator(run=run, candidate=candidate)
@@ -303,10 +381,167 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert updated.run_id == run.run_id
     assert updated.pr_refs == ("acme/demo#17",)
     assert updated.source_revision != run.source_revision
+    assert updated.planning_source_revision == initial_source_revision
+    assert not report.exists()
+    assert plan.is_file()
+    assert subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "feature/preflight-*"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+    work_bridge._remove_canonical_untracked_reports(
+        registry=registry,
+        state_root=tmp_path / "state",
+        run=run,
+        worktree=repo,
+    )
     journal = json.loads(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
     assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
+    assert "openspec:acme/demo:work@spec-2" in journal["runs"][run.run_id][
+        "source_revisions"
+    ]
+
+    # A repaired exact Candidate on an already-bound PR must be preflighted,
+    # pushed, and read back before the ordinary ship state machine compares
+    # authenticated remote facts with the local tree.
+    remote_head = "a" * 40
+    monkeypatch.setattr(
+        work_actions,
+        "_ship_action",
+        lambda **kwargs: {"action": "awaiting-copilot"},
+    )
+    resumed = validator(
+        run=registry.get_workflow_run(run.run_id),
+        candidate=candidate,
+    )
+
+    assert resumed["status"] == "pending"
+    assert remote_head == candidate
+    assert push_count == 2
+    assert preflight_requests[-1].pr_number == 17
+
+
+def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
+    tmp_path: Path,
+) -> None:
+    repo, candidate = _repo(tmp_path / "repo")
+    state_root = tmp_path / "state"
+    report_ref = "reports/review/work-review.md"
+    report = repo / report_ref
+    report.parent.mkdir(parents=True)
+    canonical = b"# Historical canonical review\n"
+    latest = b"# Latest canonical review\n"
+    report.write_bytes(canonical)
+    run = SimpleNamespace(run_id="workflow-run", candidate_head=candidate)
+    job = {
+        "job_id": "review-job",
+        "workflow_run_id": run.run_id,
+        "workflow_claim_key": "claim:v1:" + "1" * 64,
+        "workflow_repo": "acme/demo",
+        "workflow_card": "review-card",
+        "workflow_phase": "review",
+        "workflow_inputs": [],
+        "workflow_outputs": [report_ref],
+        "workflow_output_baseline": [],
+        "source_revision": "source-revision",
+        "subject_head": candidate,
+        "status": "exited",
+        "exit_code": 0,
+    }
+    envelope = {
+        "schema_version": 1,
+        "kind": "review",
+        "job": {
+            "job_id": job["job_id"],
+            "run_id": run.run_id,
+            "claim_key": job["workflow_claim_key"],
+            "repo": job["workflow_repo"],
+            "source_revision": job["source_revision"],
+            "card_id": job["workflow_card"],
+            "phase": "review",
+            "inputs": [],
+            "outputs": [report_ref],
+            "output_baseline": [],
+        },
+        "payload": {},
+        "artifacts": [
+            {
+                "path": report_ref,
+                "sha256": hashlib.sha256(canonical).hexdigest(),
+                "baseline_sha256": None,
+            }
+        ],
+    }
+    content = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    evidence = state_root / "evidence" / "workflow" / "review.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(content)
+    job["workflow_evidence"] = {
+        "kind": "review",
+        "path": "evidence/workflow/review.json",
+        "hash": hashlib.sha256(content).hexdigest(),
+    }
+    latest_job = {
+        **job,
+        "job_id": "review-job-2",
+        "workflow_card": "adversarial-review-card",
+        "workflow_output_baseline": [
+            {"path": report_ref, "sha256": hashlib.sha256(canonical).hexdigest()}
+        ],
+    }
+    latest_envelope = {
+        **envelope,
+        "job": {
+            **envelope["job"],
+            "job_id": latest_job["job_id"],
+            "card_id": latest_job["workflow_card"],
+            "output_baseline": latest_job["workflow_output_baseline"],
+        },
+        "artifacts": [
+            {
+                "path": report_ref,
+                "sha256": hashlib.sha256(latest).hexdigest(),
+                "baseline_sha256": hashlib.sha256(canonical).hexdigest(),
+            }
+        ],
+    }
+    latest_content = (
+        json.dumps(latest_envelope, sort_keys=True, separators=(",", ":")).encode()
+        + b"\n"
+    )
+    latest_evidence = state_root / "evidence" / "workflow" / "review-2.json"
+    latest_evidence.write_bytes(latest_content)
+    latest_job["workflow_evidence"] = {
+        "kind": "review",
+        "path": "evidence/workflow/review-2.json",
+        "hash": hashlib.sha256(latest_content).hexdigest(),
+    }
+
+    class Registry:
+        @staticmethod
+        def list_jobs():
+            return [job, latest_job]
+
+    with pytest.raises(RuntimeError, match="report hash drift"):
+        work_bridge._remove_canonical_untracked_reports(
+            registry=Registry(),
+            state_root=state_root,
+            run=run,
+            worktree=repo,
+        )
+
+    assert report.read_bytes() == canonical
+    report.unlink()
+    with pytest.raises(RuntimeError, match="missing before cleanup"):
+        work_bridge._remove_canonical_untracked_reports(
+            registry=Registry(),
+            state_root=state_root,
+            run=run,
+            worktree=repo,
+        )
 
 
 def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(
@@ -587,7 +822,7 @@ identities:
   - executor: claude
     model_id: claude-reviewer
     independence_domain: anthropic
-    capabilities: []
+    capabilities: [review]
 """,
         encoding="utf-8",
     )
@@ -614,6 +849,15 @@ identities:
 
     class Launcher:
         def as_read_only(self):
+            return self
+
+        def as_commit_required(self):
+            return self
+
+        def as_review_only(self, *, terminal_kind):
+            assert terminal_kind in {
+                "workflow-verification-result", "workflow-review-result",
+            }
             return self
 
         def launch(self, *, slice_id, prompt, worktree, log_dir):
@@ -643,24 +887,13 @@ identities:
                 }
             elif phase == "verify":
                 report_ref = "reports/verify/work.md"
-                report = repo / report_ref
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    "---\n"
-                    f"workflow_run_id: {contract['run_id']}\n"
-                    f"workflow_card_id: {card}\n"
-                    f"candidate: {candidate}\n"
-                    "---\n# Verification\n\nPassed.\n",
-                    encoding="utf-8",
-                )
                 evidence = {
-                    "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
-                    "slice_id": f"{contract['run_id']}-{card}",
-                    "candidate": candidate,
+                    "schema_version": 1,
+                    "kind": "workflow-verification-result",
                     "status": "verified",
                     "summary": "ok",
                     "details": {"card": card},
-                    "outputs": [report_ref],
+                    "reports": [{"path": report_ref, "body": "# Verification\n\nPassed."}],
                 }
             else:
                 report_ref = (
@@ -668,38 +901,13 @@ identities:
                     if card == "adversarial-review"
                     else "reports/review/work.md"
                 )
-                report = repo / report_ref
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text(
-                    "---\n"
-                    f"workflow_run_id: {contract['run_id']}\n"
-                    f"workflow_card_id: {card}\n"
-                    f"candidate: {candidate}\n"
-                    "---\n# Review\n\nPassed.\n",
-                    encoding="utf-8",
-                )
-                builder = registry.get_job(contract["builder_job_id"])
-                evidence = review.build_gate_evaluation(
-                    slice_id=f"{contract['run_id']}-{card}",
-                    state="passed",
-                    reason="accepted",
-                    builder_job_id=builder["job_id"],
-                    reviewer_job_id=slice_id,
-                    candidate=candidate,
-                    launch_identity={
-                        "builder": {
-                            "executor": builder["executor"],
-                            "model_id": builder["model_id"],
-                            "independence_domain": builder["independence_domain"],
-                        },
-                        "reviewer": {
-                            "executor": job["executor"],
-                            "model_id": job["model_id"],
-                            "independence_domain": job["independence_domain"],
-                        },
-                    },
-                )
-                evidence["outputs"] = [report_ref]
+                evidence = {
+                    "schema_version": 1,
+                    "kind": "workflow-review-result",
+                    "reason": "accepted",
+                    "findings": [],
+                    "reports": [{"path": report_ref, "body": "# Review\n\nPassed."}],
+                }
             log_path = Path(log_dir) / f"{slice_id}.jsonl"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")

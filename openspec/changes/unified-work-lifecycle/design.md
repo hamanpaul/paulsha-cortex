@@ -79,7 +79,7 @@ Deck compiler把card `persona_binding`原樣寫入workflow manifest。新增plan
 
 Model identity registry顯式映射executor/model/domain；secondary選擇`agy/google → claude/anthropic → codex/openai`，排除primary domain。`agy` argv固定`agy --print --mode plan --sandbox ...`等價結構，不允許unsafe bypass。Malformed output、unknown identity、same-domain或live probe failure皆停止在needs_human。
 
-Builder與Foreign Reviewer沿用Candidate verification/review，但reviewer必須不同domain且在detached exact HEAD。每張card dispatch時保存output目錄baseline；Verify/review terminal payload必須列出符合manifest output glob且可由repo root重讀/hash的真實report，report必須是該job後新建或相對baseline更新，frontmatter精確綁WorkflowRun、card與Candidate。Canonical coordinator evidence保存current/baseline hash且locator只屬gate ref，不算report output。Brainstorm peer evidence與ForeignReview evaluation保存不同step/gate refs，不可互換；Copilot也只屬ship gate。
+Builder與Foreign Reviewer沿用Candidate verification/review，但reviewer必須不同domain且在detached exact HEAD。Claude reviewer以`dontAsk`、safe-mode、僅Bash工具面與structured JSON output執行non-mutating tests，不使用Plan Mode或Candidate customization；CLI-only settings停用remote/MCP、拒讀home/runtime sockets且只重開Candidate/Python user-site、隔離credentials並deny-write Candidate，review subprocess採最小正向環境allowlist與非login shell。缺Claude Code 2.1.187+、必要CLI surface、bubblewrap/socat/srt、live native或Unix-socket seccomp smoke，或要求unsandboxed fallback皆停止。Protected-path bind targets只存在deterministic disposable session root，exact Candidate固定在其`candidate/` checkout，兩者分離以維持material tree與Git status乾淨。每張card dispatch時保存output目錄baseline；Verify/review terminal payload必須列出符合manifest output glob且可由repo root重讀/hash的真實report，report必須是該job後新建或相對baseline更新，frontmatter精確綁WorkflowRun、card與Candidate。Canonical coordinator evidence保存current/baseline hash且locator只屬gate ref，不算report output。Brainstorm peer evidence與ForeignReview evaluation保存不同step/gate refs，不可互換；Copilot也只屬ship gate。Exact-bound reviewer若`exited-0`但缺payload，只能由explicit operator resume在重驗Candidate snapshot後保留舊Job並重派，periodic無此權限。
 
 ### 8. Ship以每個HEAD為review epoch
 
@@ -87,15 +87,43 @@ Manager先以官方`openspec archive -y <change>`產生archive diff，確認task
 
 快速`python3 -m policy_check --repo .`後執行`PSC_PREFLIGHT_CMD`；初次帶draft metadata，既有PR修正帶`--pr N`。Preflight須涵蓋pytest、`openspec validate --all`與PR-context policy。`--skip-tests`只接受同tree hash、fresh、full-suite evidence。
 
-Push/PR後等待checks terminal-green，request `@copilot`並驗review `commit_id == HEAD`、非error、threads resolved/outdated。每次push建立新review epoch並重新request。Finding由Builder修正或Reviewer以證據判誤報；最多兩輪、每HEAD 15分鐘。超時或第三輪finding轉needs_human。
+Push/PR後等待checks terminal-green，並要求恰好一種typed current-HEAD delivery review。Copilot路徑request `@copilot`並驗review `commit_id == HEAD`、非error；maintainer路徑由Manager重讀PR HEAD後寫immutable attestation。兩者都要求threads resolved/outdated且不能替代ForeignReview。每次push使舊review authority失效；Copilot finding最多兩輪、每HEAD 15分鐘，超時或第三輪轉needs_human。
 
 Merge前重新讀HEAD、mergeability、checks、threads、closing issues與archive diff，若任一revision改變就重跑相應gate。只用`gh pr merge --merge`，不使用`--auto`。
+
+V1 target cardinality 要求current authority恰為一張PR、一個active OpenSpec與一個Todo。若在任何delivery binding建立前因缺少或多出target而停在`needs_human`，operator可先修正repo-local confirmed correlation再explicit resume；Manager重綁同一run的journal後只清除這個特定stop。已建立binding或其他stop reason不取得此恢復權限。
+
+Official archive產生的新Candidate會失效舊verify/review evidence；若fresh reviewer發現archive後才出現的Candidate缺陷，operator可用exact CAS執行`retry-build`。Registry只允許保留identity精確為Manager deterministic archive的已通過ship step，重開最後builder與後續gate；planning reconciliation只把已移走的active artifact對應到同hash且唯一的official archive path，維持immutable brainstorm authority。Policy-commit或其他ship side effect一旦通過便拒絕rewind。修正commit仍須是archived Candidate的descendant，且不得重建active change或冒稱terminal closure。
 
 ### 9. Done在merge後以remote snapshot重證
 
 Merge後fetch default branch，驗merge commit ancestry、mapped issue closed、active OpenSpec消失、archive存在、Todo complete，再寫versioned CompletionRecord。Record綁定work ID、workflow/run/step IDs、source revisions、PR/head/merge SHA、issue states、archive tree、Todo revisions與gate evidence hashes。
 
 Monitor只在GitHub/provider fresh且Record驗證通過時投影done；record缺失、stale、source contradiction或provider degraded皆不升done。
+
+### 10. Planning handoff以input snapshot跨worktree
+
+WorkflowStep額外保存`skill_ref`與structured action/commit/test policy。Brainstorm publication先以canonical evidence的scope與artifact ref/kind/hash原子擴充WorkflowRun planning authority，並保存不可變發證source revision；PR refresh只能更新run目前source revision。Legacy active run只能由相同evidence reconcile，不能掃mutable檔案猜測；brainstorm-required卻缺evidence時fail-closed。Manager再於dispatch前把目前card與同phase較早card的inputs合併，逐glob解析regular non-symlink檔案並保存pattern/path/hash/authority/content locator。若builder worktree缺accepted planning artifact，只能從WorkflowRun planning authority驗hash後原子seed。Codex固定`workspace-write`；workflow的`commit_policy=required`及legacy fanout／dispatch／retry-build的builder persona取得明確commit capability。Linked worktree的`.git`為external marker時，launcher先清除inherited Git repository selectors，再以Git解析並驗證current worktree gitdir與common metadata關係，只將該gitdir、shared objects、current branch ref/reflog parent directories以`--add-dir`開放。Planner、verify與review不取得這些Git directories；symlink、detached HEAD、invalid或escape metadata皆拒絕required-commit launch。Operator source drift、destination conflict、同glob未授權替代檔、dispatch exception或128 KiB prompt bound超限皆保留`needs_human`並停止在job建立前。
+
+Prompt固定為`workflow-card-prompt/v1`，包含resolved source content與terminal schema。Active v1 run可繼承同phase input contract以恢復pending cards，但既有passed card不回填新證據、不偽稱通過新gate。Terminalize再次驗snapshot hash，canonical job evidence保存相同snapshot。
+
+Verify/review identity除了foreign domain，也必須在schema v2明示`review` capability；legacy v1 identity只保留planning能力，不推測review權。Reviewer launcher使用executor read-only mode，且工作目錄為Manager建立的exact Candidate disposable clone；checkout後移除所有Git remotes，原Candidate完整tree snapshot在所有terminal與launch failure路徑重驗後才清除clone。Agent terminal只提供substantive verification summary/details、review findings/reason與inline report body；Manager從durable Job注入slice/Candidate、builder/reviewer job IDs與launch identities，正規化finding ID/blocking/state。Report只允許phase專屬Markdown root，並以durable intent journal將multi-report CAS、canonical evidence與registry bind包成可rollback/roll-forward transaction；report frontmatter另綁job ID，讓同run/card retry不會誤用舊report。Agent不得直接修改Candidate或report。
+
+Plan/build workflow card的headless process exit 0但terminal明示`failed`或`needs_human`時，Manager保留原job/log且不建立passed evidence；periodic維持`needs_human` stop。只有explicit operator resume可在schema與run/card binding一致時重派同一run/card，malformed或錯誤binding不可藉此旁路。
+
+升級前誤派planning-only canonical Agy的verify/review Job若以generic v1 `passed` terminal結束，該payload永不視為evidence。只有explicit operator resume可在latest Job精確綁定run/claim/repo/source/card/phase/persona/current Candidate、canonical Agy identity與manifest outputs雙向完整時授權單次fresh dispatch；periodic與一般retry flag均不可取得此migration authority。Terminal parser只額外接受整份內容恰為單一JSON fenced object，不從任意prose擷取JSON。
+
+Build phase由多張會commit的card逐步形成Candidate。Manager接受每張card的terminal前，必須重讀worktree exact HEAD，並驗新Candidate等於或為目前Candidate的descendant後才原子推進；首張build card以持久化dispatch base為baseline。Verify/review繼續要求job Candidate完全等於凍結的run Candidate。
+
+### 11. `needs_human`是operator resume boundary
+
+Dispatcher仍負責把dead PID/no sentinel fail-closed成failed job；Manager將run設`needs_human`後，periodic runner只回`operator-resume-required`，不得清facet或重派。只有control queue收到explicit work/workflow resume才清facet、保留舊failed job並重試相同run/card。
+
+### 12. Current-HEAD delivery review是typed union
+
+ForeignReview仍是獨立必備gate。其後delivery review authority恰為`copilot`或`maintainer-review`之一。`review-attest`只經Manager queue建立：先重讀authenticated PR HEAD，再寫repo/work/run/authority digest/PR/candidate/actor/verdict綁定的immutable evidence。Ship重驗run gate ref/hash與current HEAD，GitHub checks/threads/mergeability/archive/closing refs完全沿用。
+
+既有Copilot authorization維持v1 replay；maintainer路徑使用merge authorization v2，保存實際review kind/ref/hash。Manager不得把maintainer evidence寫成Copilot kind。Interactive runtime另以`PSC_INSTANCE`選取installer bootstrap env，讓CLI與service共享instance-scoped run root；invalid env fail-closed。
 
 ## Failure handling
 

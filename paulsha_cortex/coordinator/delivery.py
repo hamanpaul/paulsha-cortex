@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from . import completion, review as foreign_review, verification
-from .claim import GITHUB_PROVIDER_ID, PROVIDER_MAX_AGE_SECONDS, WorkAuthority
+from .claim import (
+    GITHUB_PROVIDER_ID,
+    PROVIDER_MAX_AGE_SECONDS,
+    WorkAuthority,
+    work_authority_digest,
+)
 from .github_delivery import (
     DeliveryFacts,
     DeliveryPolicy,
@@ -198,6 +203,42 @@ class ForeignReviewEvidence:
 
 
 @dataclass(frozen=True)
+class MaintainerReviewEvidence:
+    path: str
+    expected_hash: str
+
+
+def _validate_maintainer_review_evidence(
+    evidence: MaintainerReviewEvidence,
+    *,
+    authority: WorkAuthority,
+    pr_number: int,
+    expected_head: str,
+) -> dict[str, object]:
+    path = Path(evidence.path)
+    if not path.is_absolute() or path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o222:
+        raise ValueError("maintainer review evidence must be immutable absolute file")
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("maintainer review evidence unreadable") from exc
+    if (
+        not isinstance(body, dict)
+        or body.get("schema") != "cortex-maintainer-review/v1"
+        or body.get("repo") != authority.repo
+        or body.get("work_id") != authority.work_id
+        or body.get("authority_digest") != work_authority_digest(authority)
+        or body.get("pr_number") != pr_number
+        or body.get("candidate") != expected_head
+        or body.get("verdict") != "approved"
+        or body.get("findings") != []
+        or verification.canonical_json_hash(body) != evidence.expected_hash
+    ):
+        raise RuntimeError("maintainer review does not authorize exact HEAD")
+    return body
+
+
+@dataclass(frozen=True)
 class ShipResult:
     delivery_facts: DeliveryFacts
     expected_head: str
@@ -297,8 +338,9 @@ class ShipOrchestrator:
         expected_tree_hash: str,
         authority: WorkAuthority,
         preflight: PreflightResult,
-        copilot: ReviewDecision,
+        copilot: ReviewDecision | None,
         foreign_review: ForeignReviewEvidence,
+        maintainer_review: MaintainerReviewEvidence | None = None,
     ) -> ShipResult:
         _require_sha(expected_head)
         _require_sha(expected_tree_hash)
@@ -312,17 +354,29 @@ class ShipOrchestrator:
             or preflight.tree_hash.lower() != expected_tree_hash.lower()
         ):
             raise RuntimeError("preflight does not authorize exact HEAD/tree")
-        if (
-            copilot.action != "passed"
-            or copilot.head != expected_head
-            or copilot.review_id is None
-            or copilot.loop.head != expected_head
-            or copilot.loop.requested_at is None
-            or copilot.loop.fix_rounds > MAX_FIX_ROUNDS
-            or float(now_epoch) - copilot.loop.requested_at < 0
-            or float(now_epoch) - copilot.loop.requested_at > REVIEW_TIMEOUT_SECONDS
-        ):
-            raise RuntimeError("Copilot review epoch has not passed")
+        if (copilot is None) == (maintainer_review is None):
+            raise RuntimeError("exactly one current-HEAD delivery review is required")
+        if copilot is not None:
+            if (
+                copilot.action != "passed"
+                or copilot.head != expected_head
+                or copilot.review_id is None
+                or copilot.loop.head != expected_head
+                or copilot.loop.requested_at is None
+                or copilot.loop.fix_rounds > MAX_FIX_ROUNDS
+                or float(now_epoch) - copilot.loop.requested_at < 0
+                or float(now_epoch) - copilot.loop.requested_at > REVIEW_TIMEOUT_SECONDS
+            ):
+                raise RuntimeError("Copilot review epoch has not passed")
+            review_kind = "copilot"
+        else:
+            _validate_maintainer_review_evidence(
+                maintainer_review,
+                authority=authority,
+                pr_number=pr_number,
+                expected_head=expected_head,
+            )
+            review_kind = "maintainer-review"
         _validate_foreign_review(foreign_review, expected_head=expected_head)
         facts = self._github.merge_if_ready(
             repo=repo,
@@ -331,8 +385,9 @@ class ShipOrchestrator:
             policy=DeliveryPolicy(
                 expected_head=expected_head,
                 required_closing_issues=authority.mapped_issues,
-                copilot_review_id=copilot.review_id,
-                copilot_requested_at_epoch=copilot.loop.requested_at,
+                copilot_review_id=copilot.review_id if copilot is not None else None,
+                copilot_requested_at_epoch=(copilot.loop.requested_at if copilot is not None else None),
+                review_kind=review_kind,
             ),
             _capability=_SHIP_CAPABILITY,
         )

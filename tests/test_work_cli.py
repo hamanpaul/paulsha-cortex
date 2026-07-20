@@ -148,7 +148,10 @@ def test_cortex_work_show_reports_socket_error_to_stderr(capsys):
 def test_cortex_work_help_lists_read_and_manager_actions(capsys):
     assert cli.main(["work", "--help"]) == 0
     output = capsys.readouterr().out
-    for command in ("show", "link", "unlink", "start", "resume", "auto", "ship"):
+    for command in (
+        "show", "link", "unlink", "start", "resume", "retry-build", "auto",
+        "review-attest", "ship",
+    ):
         assert command in output
 
 

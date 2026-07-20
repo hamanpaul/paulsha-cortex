@@ -337,6 +337,7 @@ def build_request_executor(
                     launcher_factory=launcher_factory,
                     coordinator_root=coordinator_root,
                     ship_validator=active_ship_validator,
+                    operator_resume=True,
                 )
             result = manager.apply_workflow_action(
                 registry,
@@ -382,7 +383,7 @@ def build_request_executor(
                     args=dict(args),
                     requested_by=request["requested_by"],
                 )
-            if args.get("action") in {"start", "resume"}:
+            if args.get("action") in {"start", "resume", "retry-build"}:
                 registry = getattr(dispatcher, "_registry", None)
                 run_payload = result.get("result", {}).get("run") if isinstance(result, dict) else None
                 run_id = run_payload.get("run_id") if isinstance(run_payload, dict) else None
@@ -426,19 +427,35 @@ def build_request_executor(
                             launcher_factory=launcher_factory,
                             coordinator_root=coordinator_root,
                             ship_validator=active_ship_validator,
+                            operator_resume=True,
                         )
                         result["result"].update(resumed)
                         result["result"]["run"] = registry.get_workflow_run(
                             run.run_id
                         ).to_dict()
                     else:
-                        job = manager.dispatch_workflow_card(
-                            dispatcher,
-                            run=run,
-                            identities=identities,
-                            launcher_factory=launcher_factory,
-                            coordinator_root=coordinator_root,
-                        )
+                        try:
+                            job = manager.dispatch_workflow_card(
+                                dispatcher,
+                                run=run,
+                                identities=identities,
+                                launcher_factory=launcher_factory,
+                                coordinator_root=coordinator_root,
+                                force_new_build=args.get("action") == "retry-build",
+                            )
+                            if args.get("action") == "retry-build" and job is None:
+                                raise RuntimeError("retry-build produced no builder Job")
+                        except Exception:
+                            if args.get("action") == "retry-build":
+                                current = registry.get_workflow_run(run.run_id)
+                                registry._manager_update_workflow_run(
+                                    run.run_id,
+                                    facets=tuple(
+                                        dict.fromkeys((*current.facets, "needs_human"))
+                                    ),
+                                    gate_status="running",
+                                )
+                            raise
                         if job is not None:
                             result["result"]["job_id"] = job["job_id"]
             return result

@@ -302,6 +302,10 @@ def _compile_workflow_manifest(
                 domain=None,
                 inputs=tuple(_manifest_subst(item, slug, change) for item in card.requires),
                 outputs=tuple(_manifest_subst(item, slug, change) for item in card.produces),
+                skill_ref=card.skill_ref,
+                action=card.action,
+                commit_policy=card.commit_policy,
+                test_policy=card.test_policy,
             )
         )
     return WorkflowManifest(combo=combo.id, task_slug=slug, steps=tuple(steps))

@@ -18,6 +18,7 @@ from paulsha_cortex.doctor import (
     _load_runtime_monitor_socket_path,
     _monitor_path_probes,
     _preflight_probe,
+    _review_sandbox_probe,
     _valid_repo,
     run_doctor,
 )
@@ -195,6 +196,185 @@ def test_identity_probe_uses_runtime_schema_validator(monkeypatch, tmp_path: Pat
     result = _identity_probe({"PSC_PROJECT_CONFIG_ROOT": str(config)}, tmp_path)
     assert result.status == "fail"
     assert "runtime validator" in result.detail
+
+
+def test_review_sandbox_probe_requires_dependencies_only_for_claude_reviewer(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    identity = config / "model-identities.yaml"
+    identity.write_text(
+        "schema_version: 2\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: sonnet\n"
+        "    independence_domain: anthropic\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: "/usr/bin/bwrap" if name == "bwrap" else None,
+    )
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/usr/bin"}, tmp_path
+    )
+    assert result.status == "fail"
+    assert result.required is True
+    assert "socat" in result.detail
+
+    identity.write_text("schema_version: 2\nidentities: []\n", encoding="utf-8")
+    optional = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/usr/bin"}, tmp_path
+    )
+    assert optional.status == "warn"
+    assert optional.required is False
+
+
+def test_review_sandbox_probe_executes_supported_cli_and_native_smoke(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 2\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: sonnet\n"
+        "    independence_domain: anthropic\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: f"/tools/{name}",
+    )
+    calls: list[list[str]] = []
+    configured_sandbox = {}
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv == ["/tools/claude", "--version"]:
+            return Result(raw="2.1.214 (Claude Code)\n")
+        if argv == ["/tools/claude", "--help"]:
+            return Result(
+                raw=" ".join(
+                    (
+                        "--disable-slash-commands",
+                        "--json-schema",
+                        "--permission-mode",
+                        "--safe-mode",
+                        "--setting-sources",
+                        "--settings",
+                        "--tools",
+                    )
+                )
+            )
+        if argv[:2] == ["/tools/srt", "--settings"]:
+            configured_sandbox.update(
+                json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+            )
+        return Result()
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=runner,
+        live=True,
+    )
+
+    assert result.status == "pass"
+    assert ["/tools/bwrap", "--version"] in calls
+    assert ["/tools/socat", "-V"] in calls
+    assert ["/tools/srt", "--version"] in calls
+    assert any(argv[:2] == ["/tools/bwrap", "--ro-bind"] for argv in calls)
+    assert any(
+        argv[0] == "/tools/srt" and argv[3:5] == ["--", "/tools/python3"]
+        for argv in calls
+    )
+    assert configured_sandbox["filesystem"]["denyRead"][-1] == "/run/docker.sock"
+    assert "/var/run/docker.sock" not in configured_sandbox["filesystem"]["denyRead"]
+
+
+def test_review_sandbox_probe_rejects_unsupported_claude_version(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 2\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: sonnet\n"
+        "    independence_domain: anthropic\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: f"/tools/{name}",
+    )
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=lambda argv, **kwargs: Result(raw="2.1.186 (Claude Code)\n"),
+    )
+
+    assert result.status == "fail"
+    assert "2.1.187" in result.detail
+
+
+def test_review_sandbox_probe_rejects_degraded_unix_socket_filter(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "model-identities.yaml").write_text(
+        "schema_version: 2\n"
+        "identities:\n"
+        "  - executor: claude\n"
+        "    model_id: sonnet\n"
+        "    independence_domain: anthropic\n"
+        "    capabilities: [review]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor.shutil.which",
+        lambda name, path=None: f"/tools/{name}",
+    )
+
+    def runner(argv, **_kwargs):
+        if argv == ["/tools/claude", "--version"]:
+            return Result(raw="2.1.214 (Claude Code)\n")
+        if argv == ["/tools/claude", "--help"]:
+            return Result(
+                raw=" ".join(
+                    (
+                        "--disable-slash-commands",
+                        "--json-schema",
+                        "--permission-mode",
+                        "--safe-mode",
+                        "--setting-sources",
+                        "--settings",
+                        "--tools",
+                    )
+                )
+            )
+        if argv[0] == "/tools/srt" and "--settings" in argv:
+            return Result(returncode=1)
+        return Result()
+
+    result = _review_sandbox_probe(
+        {"PSC_PROJECT_CONFIG_ROOT": str(config), "PATH": "/tools"},
+        tmp_path,
+        runner=runner,
+        live=True,
+    )
+
+    assert result.status == "fail"
+    assert "configured reviewer sandbox" in result.detail
 
 
 def test_monitor_path_probe_rejects_relative_socket_root(tmp_path: Path) -> None:

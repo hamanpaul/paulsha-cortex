@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .runtime import resolve_project_config_root, resolve_run_root, resolve_runtime_root
+
 
 def _env_path(name: str) -> Path | None:
     value = os.environ.get(name, "").strip()
@@ -17,28 +19,28 @@ def _resolve_root(name: str, default: Path) -> Path:
 
 
 def agents_root() -> Path:
-    return _resolve_root("PSC_AGENTS_ROOT", Path.home() / ".agents")
+    return resolve_runtime_root("PSC_AGENTS_ROOT")
 
 
 def control_root() -> Path:
-    return _resolve_root("PSC_CONTROL_ROOT", agents_root() / "control")
+    return resolve_runtime_root("PSC_CONTROL_ROOT")
 
 
 def coordinator_root() -> Path:
-    return _resolve_root("PSC_COORDINATOR_ROOT", agents_root() / "coordinator")
+    return resolve_runtime_root("PSC_COORDINATOR_ROOT")
 
 
 def specs_root() -> Path:
-    return _resolve_root("PSC_SPECS_ROOT", agents_root() / "specs")
+    return resolve_runtime_root("PSC_SPECS_ROOT")
 
 
 def run_root() -> Path:
-    return _resolve_root("PSC_RUN_ROOT", agents_root() / "run")
+    return resolve_run_root()
 
 
 def monitor_state_root() -> Path:
     """Durable Monitor state; distinct from the runtime socket directory."""
-    return _resolve_root("PSC_MONITOR_STATE_ROOT", agents_root() / "monitor")
+    return resolve_runtime_root("PSC_MONITOR_STATE_ROOT")
 
 
 def work_items_snapshot_path() -> Path:
@@ -54,7 +56,7 @@ def config_path(*parts: str) -> Path:
 
 
 def project_config_root() -> Path:
-    return _resolve_root("PSC_PROJECT_CONFIG_ROOT", agents_root() / "config" / "paulsha")
+    return resolve_project_config_root()
 
 
 def repo_root() -> Path:
