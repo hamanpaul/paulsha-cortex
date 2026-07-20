@@ -523,9 +523,11 @@ def test_ship_validator_failure_persists_needs_human_on_review_complete_run(
     assert stopped.gate_status == "failed"
 
 
+@pytest.mark.parametrize("terminal_phase", ["merged", "done"])
 def test_post_merge_closure_skips_active_planning_path_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    terminal_phase: str,
 ) -> None:
     steps = tuple(
         WorkflowStep.from_dict({**step.to_dict(), "gate_result": "passed"})
@@ -564,7 +566,7 @@ def test_post_merge_closure_skips_active_planning_path_reconciliation(
                         "repo": run.repo,
                         "work_id": run.work_id,
                         "ship": {
-                            "phase": "merged",
+                            "phase": terminal_phase,
                             "head": candidate,
                             "merge_commit": "b" * 40,
                             "merge_authorization": {

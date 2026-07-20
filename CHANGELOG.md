@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- **Cached done closure可在Manager finalization前安全重入**：delivery journal已完整記錄`done`但WorkflowRun尚未綁定CompletionRecord時，explicit resume與`merged`相同略過已消失的active planning path；journal只作routing hint，terminal validator仍完整fail-closed重驗所有closure authority。
 - **Post-archive repair保留可驗證的Manager ship audit**：`openspec-archive` job可在registry仍保存passed authority且Git ancestry成立時綁定final Candidate的ancestor；`policy-commit`仍要求exact final Candidate，unrelated commit、ambiguous evidence或ancestry error維持fail-closed。
 - **CompletionRecord統一綁定WorkflowRun closure evidence**：Manager先重驗各自per-card slice的verify/review canonical envelope，再以共同run ID派生closure evidence；strict reader現在可同時驗證slice、Candidate與builder/reviewer jobs，不再因合法的不同card identity誤報slice mismatch。
 - **Completion Draft依closure語意建立immutable revision**：檔名改以排除`completed_at`的normalized payload hash版控；相同語意retry沿用首份draft，default branch或authority前進則保留舊檔並建立新revision，malformed或symlink collision維持fail-closed且不覆寫audit evidence。
