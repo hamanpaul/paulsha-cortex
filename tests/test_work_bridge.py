@@ -119,13 +119,15 @@ def _steps() -> tuple[WorkflowStep, ...]:
 @pytest.mark.parametrize(
     ("action", "expected"),
     [
+        (None, "pending"),
+        ({}, "pending"),
         ("done", "passed"),
         ("fix-required", "needs_human"),
         ("needs_human", "needs_human"),
         ("awaiting-copilot", "pending"),
     ],
 )
-def test_delivery_adapter_status(action: str, expected: str) -> None:
+def test_delivery_adapter_status(action: object, expected: str) -> None:
     assert work_bridge._delivery_adapter_status(action) == expected
 
 

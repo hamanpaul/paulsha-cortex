@@ -1162,6 +1162,8 @@ def _completion_draft(
 
 
 def _delivery_adapter_status(action: object) -> str:
+    if not isinstance(action, str):
+        return "pending"
     if action == "done":
         return "passed"
     if action in {"fix-required", "needs_human"}:
