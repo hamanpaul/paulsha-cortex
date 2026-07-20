@@ -223,17 +223,35 @@ def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
     calls: list[list[str]] = []
 
     class MetadataRunner:
+        patched = False
+        labeled = False
+
         def __call__(self, argv, **kwargs):
             calls.append(list(argv))
             endpoint = " ".join(argv)
             if "--method PATCH" in endpoint:
+                self.patched = True
                 return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
             if "--method PUT" in endpoint:
+                self.labeled = True
                 return Result({"labels": [{"name": "enhancement"}]})
             if endpoint.endswith("repos/acme/demo/pulls/7"):
-                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+                return Result(
+                    {
+                        "title": (
+                            "fix(work): 修正工作流程" if self.patched else "wrong"
+                        ),
+                        "body": "Closes #14",
+                    }
+                )
             if endpoint.endswith("repos/acme/demo/issues/7"):
-                return Result({"labels": [{"name": "enhancement"}]})
+                return Result(
+                    {
+                        "labels": (
+                            [{"name": "enhancement"}] if self.labeled else []
+                        )
+                    }
+                )
             raise AssertionError(argv)
 
     GitHubDeliveryClient(runner=MetadataRunner()).ensure_pr_metadata(
@@ -245,6 +263,33 @@ def test_ensure_pr_metadata_updates_and_rereads_exact_remote_fields() -> None:
     )
     assert any("--method" in call and "PATCH" in call for call in calls)
     assert any("--method" in call and "PUT" in call for call in calls)
+    assert len(calls) == 6
+
+
+def test_ensure_pr_metadata_skips_writes_when_remote_is_already_exact() -> None:
+    calls: list[list[str]] = []
+
+    def exact(argv, **kwargs):
+        calls.append(list(argv))
+        endpoint = " ".join(argv)
+        assert "--method" not in argv
+        if endpoint.endswith("repos/acme/demo/pulls/7"):
+            return Result(
+                {"title": "fix(work): 修正工作流程", "body": "Closes #14"}
+            )
+        if endpoint.endswith("repos/acme/demo/issues/7"):
+            return Result({"labels": [{"name": "enhancement"}]})
+        raise AssertionError(argv)
+
+    GitHubDeliveryClient(runner=exact).ensure_pr_metadata(
+        repo="acme/demo",
+        pr_number=7,
+        title="fix(work): 修正工作流程",
+        body="Closes #14",
+        labels=("enhancement",),
+    )
+
+    assert len(calls) == 2
 
 
 def test_ensure_pr_metadata_retries_only_transient_idempotent_calls() -> None:
@@ -252,21 +297,41 @@ def test_ensure_pr_metadata_retries_only_transient_idempotent_calls() -> None:
     sleeps: list[float] = []
 
     class TransientMetadataRunner:
+        patched = False
+        labeled = False
+        patch_attempts = 0
+
         def __call__(self, argv, **kwargs):
             calls.append(list(argv))
-            if len(calls) == 1:
-                result = Result({}, returncode=1)
-                result.stderr = "gh: temporarily unavailable (HTTP 503)"
-                return result
             endpoint = " ".join(argv)
             if "--method PATCH" in endpoint:
+                self.patch_attempts += 1
+                if self.patch_attempts == 1:
+                    result = Result({}, returncode=1)
+                    result.stderr = "gh: temporarily unavailable (HTTP 503)"
+                    return result
+                self.patched = True
                 return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
             if "--method PUT" in endpoint:
+                self.labeled = True
                 return Result({"labels": [{"name": "enhancement"}]})
             if endpoint.endswith("repos/acme/demo/pulls/7"):
-                return Result({"title": "fix(work): 修正工作流程", "body": "Closes #14"})
+                return Result(
+                    {
+                        "title": (
+                            "fix(work): 修正工作流程" if self.patched else "wrong"
+                        ),
+                        "body": "Closes #14",
+                    }
+                )
             if endpoint.endswith("repos/acme/demo/issues/7"):
-                return Result({"labels": [{"name": "enhancement"}]})
+                return Result(
+                    {
+                        "labels": (
+                            [{"name": "enhancement"}] if self.labeled else []
+                        )
+                    }
+                )
             raise AssertionError(argv)
 
     GitHubDeliveryClient(
@@ -281,7 +346,7 @@ def test_ensure_pr_metadata_retries_only_transient_idempotent_calls() -> None:
         labels=("enhancement",),
     )
 
-    assert calls[0] == calls[1]
+    assert calls[2] == calls[3]
     assert sleeps == [0.25]
 
 

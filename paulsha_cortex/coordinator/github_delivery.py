@@ -317,6 +317,28 @@ class GitHubDeliveryClient:
                 self._sleeper(self._metadata_retry_delays[attempt])
         raise AssertionError("unreachable metadata retry state")
 
+    def _read_pr_metadata(
+        self,
+        *,
+        repo: str,
+        pr_number: int,
+    ) -> tuple[dict, tuple[str, ...]]:
+        pull = self._metadata_json(
+            ["gh", "api", f"repos/{repo}/pulls/{pr_number}"]
+        )
+        issue = self._metadata_json(
+            ["gh", "api", f"repos/{repo}/issues/{pr_number}"]
+        )
+        if not isinstance(pull, dict) or not isinstance(issue, dict):
+            raise RuntimeError("GitHub PR metadata reread malformed")
+        rows = issue.get("labels")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("name"), str)
+            for row in rows
+        ):
+            raise RuntimeError("GitHub PR metadata reread malformed")
+        return pull, tuple(sorted(row["name"] for row in rows))
+
     def _api_pages(self, endpoint: str) -> list[object]:
         stdout = self._run(
             ["gh", "api", "--paginate", "--jq", ".", endpoint],
@@ -877,7 +899,7 @@ class GitHubDeliveryClient:
         body: str,
         labels: tuple[str, ...],
     ) -> None:
-        """Update an existing authorized PR and prove every field by reread."""
+        """Ensure exact remote metadata, writing only after authenticated drift."""
 
         self._repo_parts(repo)
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
@@ -890,6 +912,17 @@ class GitHubDeliveryClient:
             or len(set(labels)) != len(labels)
         ):
             raise ValueError("PR labels must be unique non-empty strings")
+        expected_labels = tuple(sorted(labels))
+        pull, remote_labels = self._read_pr_metadata(
+            repo=repo,
+            pr_number=pr_number,
+        )
+        if (
+            pull.get("title") == title
+            and pull.get("body") == body
+            and remote_labels == expected_labels
+        ):
+            return
         self._metadata_json(
             [
                 "gh",
@@ -913,25 +946,14 @@ class GitHubDeliveryClient:
         for label in labels:
             label_argv.extend(["-f", f"labels[]={label}"])
         self._metadata_json(label_argv)
-        pull = self._metadata_json(
-            ["gh", "api", f"repos/{repo}/pulls/{pr_number}"]
+        pull, remote_labels = self._read_pr_metadata(
+            repo=repo,
+            pr_number=pr_number,
         )
-        issue = self._metadata_json(
-            ["gh", "api", f"repos/{repo}/issues/{pr_number}"]
-        )
-        if not isinstance(pull, dict) or not isinstance(issue, dict):
-            raise RuntimeError("GitHub PR metadata reread malformed")
-        rows = issue.get("labels")
-        if not isinstance(rows, list) or any(
-            not isinstance(row, dict) or not isinstance(row.get("name"), str)
-            for row in rows
-        ):
-            raise RuntimeError("GitHub PR metadata reread malformed")
-        remote_labels = tuple(sorted(row["name"] for row in rows))
         if (
             pull.get("title") != title
             or pull.get("body") != body
-            or remote_labels != tuple(sorted(labels))
+            or remote_labels != expected_labels
         ):
             raise RuntimeError("GitHub PR metadata reread mismatch")
 

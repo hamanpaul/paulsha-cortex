@@ -44,6 +44,7 @@
 - [x] 3.12 RED-test並修正既有PR的Candidate推送：fresh verify/review後先以PR context重跑乾淨exact-Candidate preflight，再由Manager冪等push並重讀授權feature ref，remote HEAD不符時不得進入delivery gate。
 - [x] 3.13 RED-test並修正terminal closure provider：Todo以default revision精確綁定的Contents identity讀取，僅bounded retry HTTP 502/503/504，production ancestry compare只查canonical workflow-linked PR。
 - [x] 3.14 RED-test並修正existing-PR metadata transaction：title/body PATCH、labels PUT及identity reread僅對HTTP 502/503/504 bounded retry；create/push/merge side effect維持單次fail-closed。
+- [x] 3.15 RED-test並修正exact metadata冪等性：先authenticated reread title/body/labels，全部一致時不發PATCH/PUT；只有drift才write並再次完整reread。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 
