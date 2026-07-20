@@ -444,6 +444,7 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
             workflow_registry=registry,
         )
     registry._manager_update_workflow_run(run_id, pr_refs=())
+    assert not (state.parent / "evidence" / "work-abandon").exists()
 
     first = work_actions.execute_work_action(
         args=args,

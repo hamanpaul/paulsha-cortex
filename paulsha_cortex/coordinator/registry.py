@@ -1339,13 +1339,13 @@ class JobRegistry:
         self._persist()
         return self._copy_workflow_run(updated)
 
-    def _manager_abandon_workflow_run(
+    def _manager_validate_workflow_abandon(
         self,
         run_id: str,
         *,
         evidence_ref: str,
     ) -> WorkflowRun:
-        """Supersede one exact pre-delivery run after an explicit operator action."""
+        """Read-only admission check for one exact pre-delivery abandon action."""
 
         if not isinstance(evidence_ref, str) or not evidence_ref:
             raise ValueError("workflow abandon evidence ref missing")
@@ -1373,6 +1373,24 @@ class JobRegistry:
             or current.completion_record_path is not None
         ):
             raise ValueError("workflow abandon only permits pre-delivery run")
+        return self._copy_workflow_run(current)
+
+    def _manager_abandon_workflow_run(
+        self,
+        run_id: str,
+        *,
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """Supersede one exact pre-delivery run after an explicit operator action."""
+
+        self._manager_validate_workflow_abandon(
+            run_id,
+            evidence_ref=evidence_ref,
+        )
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.status == "superseded":
+            return self._copy_workflow_run(current)
         updated = replace(
             current,
             status="superseded",

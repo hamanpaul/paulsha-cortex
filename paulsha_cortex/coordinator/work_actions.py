@@ -1559,6 +1559,10 @@ def _abandon_action(
     )
     if run.status == "superseded" and str(target) not in run.evidence_refs:
         raise RuntimeError("WorkflowRun was superseded by different authority")
+    workflow_registry._manager_validate_workflow_abandon(
+        run.run_id,
+        evidence_ref=str(target),
+    )
     record = _abandon_record(body, state_path=state_path)
     updated = workflow_registry._manager_abandon_workflow_run(
         run.run_id,
