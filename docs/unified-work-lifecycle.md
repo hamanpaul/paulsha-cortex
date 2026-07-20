@@ -102,3 +102,11 @@ Manager 是唯一 writer。每次 push 都會使上一個 delivery review epoch 
 最多兩輪 builder fix/re-review，每個 HEAD 等待 15 分鐘；current-HEAD review 出現 finding 時，delivery adapter 會把 `fix-required` fail-closed 投影為 `needs_human`，只有 operator 的 exact-Candidate `retry-build` 才能重開 builder；第三次仍有 finding 或逾時也維持 `needs_human`。若後續已由Manager綁定exact-HEAD maintainer evidence，只有完整path/hash可重入這類`copilot-*` stop，其他stop reason仍fail-closed。合併只使用 `gh pr merge --merge --match-head-commit <HEAD>`，不使用 auto/squash/rebase。Merge 後會重新 fetch default branch，驗證雙親 merge commit ancestry、issue、archive、Todo 與 CompletionRecord，全部成立才投影 `done`。
 
 V1 terminal delivery 僅支援 GitHub。其他 forge 仍可顯示 read model，但 ship 會停在 `needs_human`。
+
+## Terminal lifecycle canary
+
+`terminal-lifecycle-canary` confirmed mapping 對應 issue #31。這條 docs-only canary 保持 persona-domain separation：primary `planner` 必須整合 `agy/google` evidence 完成 heterogeneous brainstorm，`planner`、`builder` 與 `reviewer` 則分別在不同 independence domain 產出規劃、最小文件 diff 與獨立審查 evidence。
+
+候選變更必須通過 OpenSpec validation、policy、full preflight、ForeignReview，以及 exact current-HEAD 的 adversarial maintainer review。任一 typed output 或 gate 缺失、失敗或無法對準同一 HEAD 時，workflow 必須 fail-closed 保持 `needs_human`，不得宣稱 terminal completion。
+
+PR #54 僅識別目前仍為 open 的 delivery target；此編號本身不是 merge、issue closure 或 `done` evidence。Manager 先以 official archive 流程封存 OpenSpec change，後續只有在其餘 strict gates 通過後，才可透過該 PR 以帶 closing reference 的 merge commit 交付並關閉 issue #31。重新讀取 default branch 與 remote authority 後，只有 PR、archive、merge ancestry、issue closure、Todo 與 CompletionRecord 全部成立，Monitor 才能投影為 `done`。
