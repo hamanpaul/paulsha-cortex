@@ -5338,7 +5338,7 @@ def dispatch_workflow_card(
 
 
 def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
-    """Detect the narrow post-merge closure path without granting ship authority."""
+    """Detect the narrow terminal closure path without granting ship authority."""
     if run.current_phase != "review" or not isinstance(run.candidate_head, str):
         return False
     journal_path = Path(coordinator_root) / "delivery-journal.json"
@@ -5363,7 +5363,7 @@ def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path
         and row.get("repo") == run.repo
         and row.get("work_id") == run.work_id
         and isinstance(ship, dict)
-        and ship.get("phase") == "merged"
+        and ship.get("phase") in {"merged", "done"}
         and ship.get("head") == run.candidate_head
         and isinstance(ship.get("merge_commit"), str)
         and verification.SAFE_SHA_RE.fullmatch(ship["merge_commit"]) is not None

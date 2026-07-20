@@ -94,6 +94,12 @@ Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing i
 - **THEN**Manager MAY接受archive job綁定final Candidate的Git ancestor，但 MUST要求registry中的archive step仍為Manager-owned passed authority、job/evidence完整且ancestry查詢成功
 - **AND**`policy-commit` MUST仍精確綁定final Candidate；unrelated archive commit、ambiguous job、evidence mismatch或ancestry error MUST fail-closed
 
+#### Scenario: Ship done與WorkflowRun finalization之間發生crash
+- **GIVEN**delivery journal已以完整binding記錄`done`，但Manager尚未把CompletionRecord與ship audit finalization寫回WorkflowRun
+- **WHEN**operator explicit resume同一run
+- **THEN**Manager MUST與`merged` routing相同略過已由official archive移走的active planning path，不得回退成planning-authority failure
+- **AND**`done`只可作routing hint；ship validator仍 MUST重新驗證CompletionRecord、remote closure、authorization與全部evidence，malformed binding MUST fail-closed
+
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
 Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。
