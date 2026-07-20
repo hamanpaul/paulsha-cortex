@@ -15,6 +15,11 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 - **WHEN**current tree hash與evidence tree hash不同
 - **THEN**Manager拒絕`--skip-tests`並重跑full suite
 
+#### Scenario: 既有PR仍停在修復前HEAD
+- **WHEN**WorkflowRun已綁定既有PR，但fresh verify/review通過的exact Candidate尚未出現在該PR branch
+- **THEN**Manager先以`--pr N`對乾淨exact-Candidate checkout完成preflight，再冪等push授權的`feature/*` ref並重讀remote HEAD
+- **THEN**remote HEAD未精確等於Candidate時不得進入current-HEAD delivery gate
+
 ### Requirement: Delivery review與GitHub gates必須綁定current HEAD
 開PR後 Manager MUST等待所有required checks terminal-green，並要求恰好一種current-HEAD delivery review authority：request `@copilot`所得的authenticated review，或經control queue建立的typed `maintainer-review` evidence。有效Copilot review MUST非error且`commit_id`等於current HEAD；maintainer evidence MUST immutable且精確綁定repo/work/run/authority digest/PR/current HEAD/actor/verdict。所有current findings threads MUST resolved或outdated。每次push MUST使舊review evidence失效。兩種authority MUST保留實際kind/ref/hash，MUST NOT把maintainer evidence偽裝成Copilot。Delivery review MUST NOT取代ForeignReview。Manager讀取checks、statuses與reviews的REST pagination MUST使用目前支援的typed shell-free gh argv，MUST NOT要求本機gh未提供的`--slurp`；空輸出或任一malformed page MUST fail-closed。
 

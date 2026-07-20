@@ -41,6 +41,7 @@
 - [x] 3.9 RED-test並實作pre-binding target-cardinality stop恢復：operator補齊唯一PR/OpenSpec/Todo authority後explicit resume可重綁同一run journal；既有binding與其他needs_human仍fail-closed。
 - [x] 3.10 RED-test並實作post-archive retry-build：只保留Manager-owned official archive authority，重開最後builder並讓新Candidate單調延伸；其他已通過ship card拒絕retry。
 - [x] 3.11 RED-test並修正delivery GitHub pagination：不依賴本機gh不支援的`--slurp`，以typed JSONL page stream完整重讀checks/statuses/reviews，malformed page維持fail-closed。
+- [x] 3.12 RED-test並修正既有PR的Candidate推送：fresh verify/review後先以PR context重跑乾淨exact-Candidate preflight，再由Manager冪等push並重讀授權feature ref，remote HEAD不符時不得進入delivery gate。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

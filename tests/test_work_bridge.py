@@ -312,19 +312,27 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
             return "main"
 
     monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", GitHub)
-    pushed = False
+    remote_head = None
+    push_count = 0
 
     def delivery_runner(argv, **kwargs):
-        nonlocal pushed
+        nonlocal push_count, remote_head
         if "ls-remote" in argv:
             return SimpleNamespace(
-                returncode=0 if pushed else 2,
-                stdout=(f"{candidate}\trefs/heads/feature/14-work\n" if pushed else ""),
+                returncode=0 if remote_head is not None else 2,
+                stdout=(
+                    f"{remote_head}\trefs/heads/feature/14-work\n"
+                    if remote_head is not None
+                    else ""
+                ),
                 stderr="",
             )
         if "push" in argv:
             assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
-            pushed = True
+            if push_count == 1:
+                assert preflight_requests[-1].pr_number == 17
+            push_count += 1
+            remote_head = candidate
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(argv)
 
@@ -380,6 +388,25 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert "openspec:acme/demo:work@spec-2" in journal["runs"][run.run_id][
         "source_revisions"
     ]
+
+    # A repaired exact Candidate on an already-bound PR must be preflighted,
+    # pushed, and read back before the ordinary ship state machine compares
+    # authenticated remote facts with the local tree.
+    remote_head = "a" * 40
+    monkeypatch.setattr(
+        work_actions,
+        "_ship_action",
+        lambda **kwargs: {"action": "awaiting-copilot"},
+    )
+    resumed = validator(
+        run=registry.get_workflow_run(run.run_id),
+        candidate=candidate,
+    )
+
+    assert resumed["status"] == "pending"
+    assert remote_head == candidate
+    assert push_count == 2
+    assert preflight_requests[-1].pr_number == 17
 
 
 def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
