@@ -204,4 +204,4 @@ Merge 固定使用 merge commit；不使用 GitHub auto-merge。Copilot finding 
 - Architecture decision：`docs/adr/0001-unified-work-lifecycle-authority.md`
 - Accepted design spec：`docs/superpowers/specs/2026-07-17-unified-work-lifecycle.md`
 - Implementation plan：`docs/superpowers/plans/2026-07-17-unified-work-lifecycle.md`
-- OpenSpec change：`openspec/changes/unified-work-lifecycle/`
+- OpenSpec archive：`openspec/changes/archive/2026-07-20-unified-work-lifecycle/`

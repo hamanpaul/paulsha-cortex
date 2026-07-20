@@ -1,5 +1,7 @@
 # Unified Work Lifecycle 操作與遷移
 
+對應 OpenSpec 已於 2026-07-20 由 official CLI 封存至 `openspec/changes/archive/2026-07-20-unified-work-lifecycle/`；governed delivery closure、persona workflow orchestration 與 unified work read model 已發佈至 `openspec/specs/` 作為 canonical 規格。
+
 ## 四態 read model
 
 Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done`。`blocked`、`needs_human`、`degraded` 是 facet，不是第五種狀態。
