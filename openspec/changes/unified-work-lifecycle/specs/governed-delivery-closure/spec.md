@@ -82,6 +82,12 @@ Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing i
 - **THEN**Manager MUST以排除`completed_at`的normalized closure語意hash選取immutable draft revision；相同語意 MUST沿用首份draft及其時間戳，語意前進 MUST建立新revision且保留舊draft
 - **AND**既有target為symlink、malformed或同一語意key內容不符時 MUST fail-closed，不得覆寫或刪除audit evidence
 
+#### Scenario: Per-card evidence派生run-level CompletionRecord binding
+- **GIVEN**verify與ForeignReview由同一WorkflowRun的不同card dispatch，因而各自保存不同per-card slice identity
+- **WHEN**Manager建立Completion Draft
+- **THEN**Manager MUST先重驗每份原始canonical envelope的run、job、phase、Candidate、path與hash，再以共同WorkflowRun ID寫入closure verification與review evidence
+- **AND**CompletionRecord strict reader MUST同時重驗run-level slice、Candidate、builder/reviewer job與evidence hash；原始per-card evidence不得被改寫或以未驗證payload取代
+
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
 Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。
