@@ -5339,7 +5339,12 @@ def dispatch_workflow_card(
 
 def _merged_delivery_reconciliation_pending(run, *, coordinator_root: str | Path) -> bool:
     """Detect the narrow terminal closure path without granting ship authority."""
-    if run.current_phase != "review" or not isinstance(run.candidate_head, str):
+    terminal_refresh = (
+        run.current_phase == "ship" and getattr(run, "status", None) == "done"
+    )
+    if (
+        run.current_phase != "review" and not terminal_refresh
+    ) or not isinstance(run.candidate_head, str):
         return False
     journal_path = Path(coordinator_root) / "delivery-journal.json"
     if journal_path.is_symlink() or not journal_path.is_file():
@@ -5479,7 +5484,7 @@ def resume_workflow_run(
             "current_phase": updated.current_phase,
             "reason": "planning-publication-drift",
         }
-    post_merge_closure = ship_validator is not None and _merged_delivery_reconciliation_pending(
+    post_merge_closure = _merged_delivery_reconciliation_pending(
         run, coordinator_root=coordinator_root
     )
     if not post_merge_closure:
@@ -5548,6 +5553,12 @@ def resume_workflow_run(
 
     step = _current_workflow_step(run)
     if step is None:
+        if run.current_phase == "review" and post_merge_closure and ship_validator is None:
+            return {
+                "run_id": run.run_id,
+                "current_phase": run.current_phase,
+                "reason": "ship-validator-unavailable",
+            }
         if run.current_phase == "review" and ship_validator is not None:
             last = [item for item in run.steps if item.phase == "review"][-1]
             try:
@@ -5573,6 +5584,22 @@ def resume_workflow_run(
                     gate_status="failed",
                 )
                 raise
+        if run.current_phase == "ship" and run.status == "done" and post_merge_closure:
+            if ship_validator is None:
+                return {
+                    "run_id": run.run_id,
+                    "current_phase": run.current_phase,
+                    "reason": "ship-validator-unavailable",
+                }
+            return apply_workflow_action(
+                registry,
+                args={"action": "refresh-completion", "run_id": run.run_id},
+                identity_registry=identities,
+                ship_validator=ship_validator,
+                git_runner=getattr(dispatcher, "_git_runner", None),
+                coordinator_root=coordinator_root,
+                trusted_terminal=True,
+            )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "no-pending-card"}
     jobs = [
         job
@@ -5759,6 +5786,70 @@ def apply_workflow_action(
             ):
                 raise ValueError("ship validator completion binding invalid")
         return str(status), normalized
+
+    if action == "refresh-completion":
+        if not trusted_terminal:
+            raise ValueError("workflow completion refresh is internal to terminal polling")
+        run_id = _required_workflow_string(args, "run_id")
+        current = registry.get_workflow_run(run_id)
+        if current.current_phase != "ship" or current.status != "done":
+            raise ValueError("workflow completion refresh requires a done ship run")
+        if ship_validator is None:
+            return {
+                "run_id": current.run_id,
+                "current_phase": current.current_phase,
+                "reason": "ship-validator-unavailable",
+            }
+        status, trusted = validate_ship_result(
+            ship_validator(run=current, candidate=current.candidate_head),
+            candidate=current.candidate_head,
+        )
+        if status != "passed":
+            return {
+                "run_id": current.run_id,
+                "current_phase": current.current_phase,
+                "reason": trusted.get("reason")
+                or ("delivery-in-progress" if status == "pending" else "delivery-needs-human"),
+            }
+        completion_binding = trusted.get("completion")
+        if completion_binding is None:
+            raise ValueError("workflow completion refresh requires completion binding")
+        if coordinator_root is None:
+            raise ValueError("workflow ship audit root unavailable")
+        refs = {item.kind: item for item in current.gate_refs}
+        review_kind = trusted["review_kind"]
+        refs.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)
+        refs[review_kind] = GateEvidenceRef(
+            review_kind, trusted["review_ref"], trusted["review_hash"]
+        )
+        updated = registry._manager_update_workflow_run(
+            run_id,
+            steps=_validated_ship_steps(
+                registry,
+                run=current,
+                candidate=str(current.candidate_head),
+                coordinator_root=coordinator_root,
+            ),
+            gate_refs=tuple(
+                refs[kind]
+                for kind in ("brainstorm", "foreign-review", "copilot", "maintainer-review")
+                if kind in refs
+            ),
+            gate_status="passed",
+            facets=(),
+            status="done",
+            completion_record_path=completion_binding["record_path"],
+            completion_record_hash=completion_binding["record_hash"],
+            completion_record_revision=completion_binding["record_revision"],
+            completion_source_revisions=completion_binding["source_revisions"],
+            pr_candidate=completion_binding["pr_candidate"],
+            merge_revision=completion_binding["merge_revision"],
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "completion-refreshed",
+        }
 
     if action == "advance":
         if not trusted_terminal:

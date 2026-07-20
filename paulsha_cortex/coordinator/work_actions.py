@@ -1293,6 +1293,18 @@ def _claim_action(
             if len(active) > 1:
                 raise RuntimeError("active workflow identity is ambiguous")
             canonical_run = active[0] if active else None
+        if canonical_run is None and args.get("action") == "resume":
+            completed = [
+                run
+                for run in all_runs
+                if run.repo == authority.repo
+                and run.work_id == authority.work_id
+                and run.status == "done"
+                and run.current_phase == "ship"
+            ]
+            if len(completed) > 1:
+                raise RuntimeError("completed workflow identity is ambiguous")
+            canonical_run = completed[0] if completed else None
     issue = args.get("issue") if args.get("issue") is not None else (
         authority.mapped_issues[0] if authority.mapped_issues else None
     )

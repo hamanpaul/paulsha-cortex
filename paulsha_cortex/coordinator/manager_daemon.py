@@ -407,6 +407,7 @@ def build_request_executor(
                         "build",
                         "verify",
                         "review",
+                        "ship",
                     }:
                         active_ship_validator = workflow_ship_validator
                         if (

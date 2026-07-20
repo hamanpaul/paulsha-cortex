@@ -112,6 +112,12 @@ Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing i
 - **THEN**reader MUST以Job自身持久化的immutable source revision驗證envelope，不得要求它等於current run revision或改寫原證據
 - **AND**job的run、claim、repo、card、phase、locator、content hash與其他binding仍 MUST完整匹配，任一drift MUST fail-closed
 
+#### Scenario: 已完成run的CompletionRecord authority過期
+- **GIVEN**同repo/work恰有一個`done/ship` WorkflowRun，terminal journal仍完整綁定其Candidate、merge commit與authorization，但CompletionRecord保存PR open等舊source revision
+- **WHEN**operator explicit resume該work
+- **THEN**Manager MUST以current WorkAuthority重跑production ship validator，且不得建立新run、重開builder或dispatch任何workflow card
+- **AND**current provider已含PR closed revision時不得另加synthetic open revision；只有完整`passed` completion binding可更新同一run，pending、needs-human、malformed或多個terminal candidate MUST保留舊record並fail-closed
+
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
 Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。

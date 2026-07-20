@@ -36,6 +36,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **Done WorkflowRun可重驗並刷新terminal CompletionRecord**：explicit `cortex work resume`會唯一選取同work的`done/ship` run，使用current WorkAuthority重跑既有ship validator並只在完整closure通過後更新CompletionRecord；PR provider已有`closed` revision時不再額外注入`state:open`，pending、needs-human或malformed結果皆保留舊completion且不重派workflow card。
 - **Terminal closure接受合法的WorkAuthority revision前進**：`merged`／cached `done`重播會保留immutable merge authorization的pre-terminal digest，並以current closed/archived authority重驗remote closure；merge-authorized與merge前gate仍要求current digest精確相等，tampered wrapper、review或其他binding不會被放寬。
 - **Post-merge closure不再要求已archive的active planning path**：delivery journal完整綁定merged run/Candidate/merge commit/authorization時，operator resume會直接重驗CompletionRecord與remote closure；official archive移走active OpenSpec後不再誤報planning-authority reconciliation failure，malformed journal仍走原本fail-closed路徑。
 - **CompletionRecord接受typed maintainer review authority**：remote closure現在保留merge authorization實際使用的`copilot`或`maintainer-review` evidence kind/ref/hash，並要求兩者恰好一種；maintainer-authorized merge不再因舊的Copilot-only白名單卡住，缺失或雙重authority仍fail-closed。

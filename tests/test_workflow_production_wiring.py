@@ -43,6 +43,99 @@ def _manifest() -> WorkflowManifest:
     return result.workflow_manifest
 
 
+def _done_ship_run(registry: JobRegistry, root: Path) -> WorkflowRun:
+    candidate = "a" * 40
+    bindings = {
+        "manager": ("cortex-manager", "deterministic", "cortex"),
+        "planner": ("agy", "planner", "google"),
+        "builder": ("codex", "builder", "openai"),
+        "reviewer": ("claude", "reviewer", "anthropic"),
+    }
+    steps = tuple(
+        replace(
+            step,
+            executor=bindings[step.persona][0],
+            model=bindings[step.persona][1],
+            domain=bindings[step.persona][2],
+            gate_result="passed",
+        )
+        for step in _manifest().steps
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="terminal-refresh",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(root),
+        combo="feature-oneshot",
+        current_phase="ship",
+        steps=steps,
+        issue_refs=("hamanpaul/paulsha-cortex#31",),
+        openspec_refs=("terminal-refresh",),
+        pr_refs=("hamanpaul/paulsha-cortex#54",),
+        attempts={"ship": 1},
+        gate_refs=(
+            GateEvidenceRef("foreign-review", "evidence/foreign.json", "3" * 64),
+            GateEvidenceRef("copilot", "github:copilot/54", "4" * 64),
+        ),
+        candidate_head=candidate,
+        verified_head=candidate,
+        gate_status="passed",
+    )
+    for card in ("openspec-archive", "policy-commit"):
+        work_bridge._record_manager_ship_job(
+            registry=registry,
+            state_root=root,
+            run=run,
+            worktree=root,
+            branch="feature/terminal-refresh",
+            card=card,
+            old_head=candidate,
+            new_head=candidate,
+        )
+    run = registry._manager_update_workflow_run(
+        run.run_id,
+        status="done",
+        completion_record_path=str(root / "evidence/completion-old.json"),
+        completion_record_hash="5" * 64,
+        completion_record_revision=candidate,
+        completion_source_revisions={"github_pr:repo#54": "state:open"},
+        pr_candidate=candidate,
+        merge_revision="6" * 40,
+    )
+    (root / "delivery-journal.json").write_text(
+        json.dumps(
+            {
+                "schema": "cortex-delivery-journal/v1",
+                "runs": {
+                    run.run_id: {
+                        "run_id": run.run_id,
+                        "repo": run.repo,
+                        "work_id": run.work_id,
+                        "ship": {
+                            "phase": "done",
+                            "head": candidate,
+                            "merge_commit": "6" * 40,
+                            "merge_authorization": {
+                                "path": "/evidence/authorization.json",
+                                "hash": "7" * 64,
+                                "payload": {
+                                    "run_id": run.run_id,
+                                    "repo": run.repo,
+                                    "work_id": run.work_id,
+                                    "head": candidate,
+                                },
+                            },
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return registry.get_workflow_run(run.run_id)
+
+
 def test_feature_oneshot_manifest_has_monotonic_complete_spine_and_foreign_review_before_ship() -> None:
     manifest = _manifest()
     phases = [step.phase for step in manifest.steps]
@@ -660,6 +753,180 @@ def test_post_merge_closure_routing_rejects_incomplete_authorization(tmp_path: P
     assert not manager._merged_delivery_reconciliation_pending(
         run, coordinator_root=tmp_path
     )
+
+
+def test_done_ship_resume_refreshes_completion_without_dispatch(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = _done_ship_run(registry, tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    jobs_before = registry.list_jobs()
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(
+            AssertionError("terminal completion refresh must not launch a workflow card")
+        ),
+        coordinator_root=tmp_path,
+        operator_resume=True,
+        ship_validator=lambda **_: {
+            "trusted": True,
+            "status": "passed",
+            "head": run.candidate_head,
+            "commit_id": run.candidate_head,
+            "ref": "evidence/maintainer-review.json",
+            "hash": "8" * 64,
+            "review_kind": "maintainer-review",
+            "review_ref": "evidence/maintainer-review.json",
+            "review_hash": "8" * 64,
+            "completion": {
+                "record_path": str(tmp_path / "evidence/completion-current.json"),
+                "record_hash": "9" * 64,
+                "record_revision": run.candidate_head,
+                "source_revisions": {"github_pr:repo#54": "state:closed"},
+                "pr_candidate": run.candidate_head,
+                "merge_revision": "6" * 40,
+            },
+        },
+    )
+
+    refreshed = registry.get_workflow_run(run.run_id)
+    assert result["reason"] == "completion-refreshed"
+    assert refreshed.current_phase == "ship"
+    assert refreshed.status == "done"
+    assert refreshed.completion_record_path.endswith("completion-current.json")
+    assert refreshed.completion_source_revisions == {
+        "github_pr:repo#54": "state:closed"
+    }
+    assert {ref.kind for ref in refreshed.gate_refs} == {
+        "foreign-review",
+        "maintainer-review",
+    }
+    assert registry.list_jobs() == jobs_before
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_reason"),
+    [("pending", "delivery-in-progress"), ("needs_human", "closure-mismatch")],
+)
+def test_done_ship_resume_keeps_existing_completion_until_refresh_passes(
+    tmp_path: Path,
+    status: str,
+    expected_reason: str,
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = _done_ship_run(registry, tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    result = manager.resume_workflow_run(
+        dispatcher,
+        run_id=run.run_id,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: None,
+        coordinator_root=tmp_path,
+        operator_resume=True,
+        ship_validator=lambda **_: {
+            "trusted": True,
+            "status": status,
+            "head": run.candidate_head,
+            "commit_id": run.candidate_head,
+            "ref": "github:copilot/54",
+            "hash": "4" * 64,
+            "reason": "closure-mismatch" if status == "needs_human" else None,
+        },
+    )
+
+    unchanged = registry.get_workflow_run(run.run_id)
+    assert result["reason"] == expected_reason
+    assert unchanged.status == "done"
+    assert unchanged.completion_record_path == run.completion_record_path
+    assert unchanged.completion_record_hash == run.completion_record_hash
+
+
+def test_done_ship_resume_rejects_malformed_completion_refresh(tmp_path: Path) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = _done_ship_run(registry, tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+
+    with pytest.raises(ValueError, match="completion binding invalid"):
+        manager.resume_workflow_run(
+            dispatcher,
+            run_id=run.run_id,
+            identities=IdentityRegistry.from_rows([]),
+            launcher_factory=lambda _: None,
+            coordinator_root=tmp_path,
+            operator_resume=True,
+            ship_validator=lambda **_: {
+                "trusted": True,
+                "status": "passed",
+                "head": run.candidate_head,
+                "commit_id": run.candidate_head,
+                "ref": "github:copilot/54",
+                "hash": "4" * 64,
+                "completion": {
+                    "record_path": str(tmp_path / "completion-invalid.json"),
+                    "record_hash": "too-short",
+                    "record_revision": run.candidate_head,
+                    "source_revisions": {"github_pr:repo#54": "state:closed"},
+                    "pr_candidate": run.candidate_head,
+                    "merge_revision": "6" * 40,
+                },
+            },
+        )
+
+    unchanged = registry.get_workflow_run(run.run_id)
+    assert unchanged.status == "done"
+    assert unchanged.completion_record_path == run.completion_record_path
+    assert unchanged.completion_record_hash == run.completion_record_hash
+
+
+def test_public_work_resume_routes_done_ship_run_through_terminal_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run = _done_ship_run(registry, tmp_path)
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        manager,
+        "resume_workflow_run",
+        lambda *_args, **kwargs: calls.append(kwargs["run_id"])
+        or {
+            "run_id": kwargs["run_id"],
+            "current_phase": "ship",
+            "reason": "completion-refreshed",
+        },
+    )
+    monkeypatch.setattr(
+        manager,
+        "dispatch_workflow_card",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("done ship resume must not use normal dispatch")
+        ),
+    )
+    executor = manager_daemon.build_request_executor(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        workflow_ship_validator=lambda **_: None,
+        work_action_fn=lambda **_: {
+            "work_id": run.work_id,
+            "repo": run.repo,
+            "result": {"action": "resume", "run": run.to_dict()},
+        },
+    )
+
+    result = executor(
+        build_request(
+            req_type="work-action",
+            args={"action": "resume", "repo": run.repo, "work_id": run.work_id},
+            requested_by="operator",
+        )
+    )
+
+    assert calls == [run.run_id]
+    assert result["result"]["reason"] == "completion-refreshed"
 
 
 def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_old_job(
