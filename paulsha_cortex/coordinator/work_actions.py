@@ -739,6 +739,7 @@ def _authorization_identity_matches(
     binding: dict[str, Any],
     head: str,
     tree_hash: str,
+    terminal_reconciliation: bool = False,
 ) -> bool:
     if not isinstance(value, dict) or set(value) != {"payload", "hash", "path"}:
         return False
@@ -794,7 +795,15 @@ def _authorization_identity_matches(
         and body.get("workflow_step_ids") == active.get("workflow_step_ids")
         and body.get("repo") == authority.repo
         and body.get("work_id") == authority.work_id
-        and body.get("authority_digest") == work_authority_digest(authority)
+        and (
+            body.get("authority_digest") == work_authority_digest(authority)
+            or (
+                terminal_reconciliation
+                and isinstance(body.get("authority_digest"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", body["authority_digest"])
+                is not None
+            )
+        )
         and body.get("pr_number") == binding["pr_number"]
         and body.get("change") == binding["change"]
         and body.get("todo_paths") == binding["todo_paths"]
@@ -1912,6 +1921,7 @@ def _ship_action(
                 binding=binding,
                 head=expected_head,
                 tree_hash=tree_hash,
+                terminal_reconciliation=True,
             )
         ):
             raise ValueError("ship merged state malformed")
@@ -1984,6 +1994,7 @@ def _ship_action(
                 binding=binding,
                 head=expected_head,
                 tree_hash=tree_hash,
+                terminal_reconciliation=True,
             )
         ):
             raise ValueError("cached done state malformed")

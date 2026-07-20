@@ -52,6 +52,7 @@
 - [x] 3.20 RED-test並修正CompletionRecord typed delivery evidence：保留merge authorization實際使用的`copilot`或`maintainer-review` kind/ref/hash，要求兩者恰好一種，避免maintainer-authorized merge卡在remote closure。
 - [x] 3.21 RED-test並新增`work abandon`：exact run ID CAS、current authority、actor/reason、active Job與pre-delivery side-effect gate全部fail-closed；成功只寫immutable evidence並將run設為superseded，不建立CompletionRecord。
 - [x] 3.22 RED-test並修正post-merge closure routing：delivery journal完整綁定merged Candidate/merge commit/authorization時，resume略過已被official archive移走的active planning path重驗，仍由ship validator完整驗證CompletionRecord與remote closure。
+- [x] 3.23 RED-test並修正terminal authority transition：merged/done closure接受immutable merge authorization保留pre-terminal WorkAuthority digest；merge-authorized與merge前gate仍要求current digest精確相等，tampered evidence維持fail-closed。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 
