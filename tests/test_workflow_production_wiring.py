@@ -3293,16 +3293,34 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     args = _workflow_args(manifest_path, tmp_path)
     args["planning_artifacts"] = rows
     args["primary_domain"] = "openai"
+    launched: list[str] = []
+
+    class Launcher:
+        def as_read_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append(slice_id)
+            return LaunchHandle(
+                executor="test",
+                model_id="test",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
     executor = manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),
         handoff_dir=str(tmp_path / "handoff"),
+        launcher=Launcher(),
         workflow_runtime_factory=lambda **_: (_ for _ in ()).throw(AssertionError("must not launch")),
     )
 
     result = executor(build_request(req_type="workflow-action", args=args, requested_by="operator"))
     run = registry.get_workflow_run(result["run_id"])
     assert result["reason"] == "planning-complete"
+    assert launched == [result["job_id"]]
     assert run.brainstorm_required is False
     assert run.gate_refs == ()
     assert {
