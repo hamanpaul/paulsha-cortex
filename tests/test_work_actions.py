@@ -555,6 +555,185 @@ def test_review_attest_writes_immutable_exact_head_evidence(
     assert persisted.facets == ("degraded",)
 
 
+def test_typed_maintainer_review_can_reenter_only_copilot_needs_human_stop() -> None:
+    evidence = {
+        "maintainer_review_path": "/evidence/maintainer.json",
+        "maintainer_review_hash": "a" * 64,
+    }
+
+    assert work_actions._recoverable_maintainer_ship_stop(
+        ship={"phase": "needs_human", "reason": "copilot-finding-budget-exhausted"},
+        args=evidence,
+    )
+    assert work_actions._recoverable_maintainer_ship_stop(
+        ship={"phase": "needs_human", "reason": "copilot-review-timeout"},
+        args=evidence,
+    )
+    assert not work_actions._recoverable_maintainer_ship_stop(
+        ship={"phase": "needs_human", "reason": "external-merge-without-authorization"},
+        args=evidence,
+    )
+    with pytest.raises(ValueError, match="path/hash must be supplied together"):
+        work_actions._recoverable_maintainer_ship_stop(
+            ship={"phase": "needs_human", "reason": "copilot-review-timeout"},
+            args={"maintainer_review_path": "/evidence/maintainer.json"},
+        )
+
+
+def test_ship_reenters_copilot_stop_through_bound_maintainer_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    run_id = started["result"]["run"]["run_id"]
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    maintainer_body = {
+        "schema": "cortex-maintainer-review/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": run_id,
+        "authority_digest": work_actions.work_authority_digest(authority),
+        "pr_number": 8,
+        "candidate": HEAD,
+        "actor": "maintainer",
+        "requested_by": "operator",
+        "verdict": "approved",
+        "summary": "Exact-HEAD review passed.",
+        "findings": [],
+        "reviewed_at_epoch": 205.0,
+    }
+    maintainer = work_actions._maintainer_review_record(
+        maintainer_body, state_path=state
+    )
+    foreign_payload = {"state": "passed", "candidate": HEAD}
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text(json.dumps(foreign_payload), encoding="utf-8")
+    foreign_hash = work_actions.verification.canonical_json_hash(foreign_payload)
+    for phase in ("plan", "build", "verify", "review"):
+        registry._manager_update_workflow_run(run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        run_id,
+        candidate_head=HEAD,
+        verified_head=HEAD,
+        pr_refs=("acme/demo#8",),
+        gate_refs=(
+            GateEvidenceRef("foreign-review", str(foreign), foreign_hash),
+            GateEvidenceRef("maintainer-review", maintainer["ref"], maintainer["hash"]),
+        ),
+        gate_status="passed",
+        facets=("needs_human",),
+    )
+    _initialize_delivery_journal(snapshot=snapshot, state=state)
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    row = persisted["runs"][run_id]
+    row["ship"] = {
+        "phase": "needs_human",
+        "reason": "copilot-finding-budget-exhausted",
+        "head": HEAD,
+        "tree_hash": TREE,
+        "fix_rounds": 3,
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+    }
+    state.write_text(json.dumps(persisted), encoding="utf-8")
+    merged = {"value": False}
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            return DeliveryFacts(
+                head=HEAD,
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(GitHubCheck("pytest", "completed", "success"),),
+                copilot_reviews=(),
+                review_threads=(),
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(
+                merged=merged["value"],
+                pr_head=HEAD,
+                merge_commit="c" * 40 if merged["value"] else None,
+            )
+
+    class Orchestrator:
+        def __init__(self, *, github, now):
+            pass
+
+        def merge_if_ready(self, **kwargs):
+            assert kwargs["copilot"] is None
+            assert kwargs["maintainer_review"].path == maintainer["ref"]
+            merged["value"] = True
+            return SimpleNamespace(expected_head=HEAD, expected_tree_hash=TREE)
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "ShipOrchestrator", Orchestrator)
+    monkeypatch.setattr(
+        work_actions,
+        "_validate_foreign_review",
+        lambda *args, **kwargs: foreign_payload,
+    )
+    monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            passed=True,
+            failed_stage=None,
+            policy=CommandResult(("policy",), 0, "", ""),
+            ci_parity=CommandResult(("preflight",), 0, "", ""),
+            head=HEAD,
+            tree_hash=TREE,
+        ),
+    )
+    result = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "foreign_review_path": str(foreign),
+            "foreign_review_hash": foreign_hash,
+            "maintainer_review_path": maintainer["ref"],
+            "maintainer_review_hash": maintainer["hash"],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 210,
+        workflow_registry=registry,
+    )
+
+    assert result["result"]["action"] == "merged-awaiting-closure"
+    assert result["result"]["review_kind"] == "maintainer-review"
+    assert _only_journal_row(state)["ship"]["phase"] == "merged"
+
+
 def test_auto_without_issue_mutates_every_mapped_issue(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
     calls: list[list[str]] = []

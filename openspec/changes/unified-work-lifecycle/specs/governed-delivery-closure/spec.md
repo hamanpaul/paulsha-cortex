@@ -40,6 +40,12 @@ Manager MUST先跑`python3 -m policy_check --repo .`，再執行configured `PSC_
 - **THEN**Manager拒絕merge authorization並要求B的新attestation
 - **THEN**不得改寫evidence或把它記成Copilot review
 
+#### Scenario: Copilot stop切換為typed maintainer authority
+- **GIVEN**delivery journal停在`copilot-*` needs-human reason，且WorkflowRun綁定一份exact-HEAD maintainer-review evidence
+- **WHEN**ship validator提供該evidence完整的path/hash pair
+- **THEN**Manager MAY重入同一delivery transaction，並在merge authorization前重驗immutable evidence
+- **AND**external merge、target cardinality、未知stop reason、不完整path/hash、stale Candidate或binding mismatch MUST維持fail-closed
+
 ### Requirement: Finding處理必須bounded且不得偷換reviewer
 真finding MUST由Builder修正並加regression test；誤報 MUST由Reviewer留下evidence後resolve。每個HEAD最長等待15分鐘，最多兩輪fix/re-review。Timeout或第三輪仍有finding MUST設`needs_human`，不得替換reviewer或繞過gate。
 

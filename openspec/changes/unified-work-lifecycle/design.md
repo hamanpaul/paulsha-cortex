@@ -123,7 +123,7 @@ Dispatcher仍負責把dead PID/no sentinel fail-closed成failed job；Manager將
 
 ForeignReview仍是獨立必備gate。其後delivery review authority恰為`copilot`或`maintainer-review`之一。`review-attest`只經Manager queue建立：先重讀authenticated PR HEAD，再寫repo/work/run/authority digest/PR/candidate/actor/verdict綁定的immutable evidence。Ship重驗run gate ref/hash與current HEAD，GitHub checks/threads/mergeability/archive/closing refs完全沿用。
 
-既有Copilot authorization維持v1 replay；maintainer路徑使用merge authorization v2，保存實際review kind/ref/hash。Manager不得把maintainer evidence寫成Copilot kind。Interactive runtime另以`PSC_INSTANCE`選取installer bootstrap env，讓CLI與service共享instance-scoped run root；invalid env fail-closed。
+既有Copilot authorization維持v1 replay；maintainer路徑使用merge authorization v2，保存實際review kind/ref/hash。WorkflowRun已綁定且path/hash完整的exact-HEAD maintainer evidence只可重入既有`copilot-*` needs-human stop；external merge、target cardinality或其他stop仍fail-closed。Manager不得把maintainer evidence寫成Copilot kind。Interactive runtime另以`PSC_INSTANCE`選取installer bootstrap env，讓CLI與service共享instance-scoped run root；invalid env fail-closed。
 
 ## Failure handling
 
