@@ -95,6 +95,8 @@ V1 target cardinality 要求current authority恰為一張PR、一個active OpenS
 
 Official archive產生的新Candidate會失效舊verify/review evidence；若fresh reviewer發現archive後才出現的Candidate缺陷，operator可用exact CAS執行`retry-build`。Registry只允許保留identity精確為Manager deterministic archive的已通過ship step，重開最後builder與後續gate；planning reconciliation只把已移走的active artifact對應到同hash且唯一的official archive path，維持immutable brainstorm authority。Policy-commit或其他ship side effect一旦通過便拒絕rewind。修正commit仍須是archived Candidate的descendant，且不得重建active change或冒稱terminal closure。
 
+被後續terminal canary取代的舊run以queued `work abandon`明確淘汰，不直接改registry。Action要求exact run ID CAS、current WorkAuthority refs、actor與bounded reason；只接受沒有active Job、PR ref、passed ship step或CompletionRecord的pre-delivery run。Manager將reason寫入immutable evidence後把run設為`superseded`；此狀態不等於done，不產生CompletionRecord，也不授權把未完成OpenSpec tasks勾成完成。
+
 ### 9. Done在merge後以remote snapshot重證
 
 Merge後fetch default branch，驗merge commit ancestry、mapped issue closed、active OpenSpec消失、archive存在、Todo complete，再寫versioned CompletionRecord。Record綁定work ID、workflow/run/step IDs、source revisions、PR/head/merge SHA、issue states、archive tree、Todo revisions與gate evidence hashes。

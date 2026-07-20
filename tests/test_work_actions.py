@@ -374,6 +374,116 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
     )
 
 
+def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json", prs=())
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    started = work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        workflow_registry=registry,
+    )
+    run_id = started["result"]["run"]["run_id"]
+    run = registry.get_workflow_run(run_id)
+    job = registry.create_job(
+        task="wf-abandon-guard",
+        persona="planner",
+        kind="build",
+        branch="feature/demo",
+        pane="",
+        worktree=run.workspace_root,
+        executor="codex",
+        model_id="gpt",
+        independence_domain="openai",
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card="define-card",
+        workflow_phase="define",
+        workflow_repo_root=run.workspace_root,
+        source_revision=run.source_revision,
+    )
+    args = {
+        "action": "abandon",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_run_id": run_id,
+        "reason": "Superseded by the clean terminal canary.",
+    }
+    with pytest.raises(ValueError, match="refuses active workflow job"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry.update_headless_result(job["job_id"], status="exited", exit_code=1)
+    with pytest.raises(RuntimeError, match="CAS mismatch"):
+        work_actions.execute_work_action(
+            args={**args, "expected_run_id": "workflow-" + "b" * 20},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(run_id, pr_refs=("acme/demo#8",))
+    with pytest.raises(ValueError, match="only permits pre-delivery"):
+        work_actions.execute_work_action(
+            args=args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+    registry._manager_update_workflow_run(run_id, pr_refs=())
+
+    first = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+    second = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        workflow_registry=registry,
+    )
+
+    assert first == second
+    abandoned = registry.get_workflow_run(run_id)
+    assert abandoned.status == "superseded"
+    assert "blocked" in abandoned.facets
+    assert abandoned.completion_record_path is None
+    evidence = Path(first["result"]["evidence"]["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
+    payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert payload["run_id"] == run_id
+    assert payload["actor"] == "operator"
+    assert payload["reason"] == args["reason"]
+    assert str(evidence) in abandoned.evidence_refs
+
+    with pytest.raises(RuntimeError, match="different authority"):
+        work_actions.execute_work_action(
+            args={**args, "reason": "A different reason."},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            workflow_registry=registry,
+        )
+
+
 def test_review_attest_writes_immutable_exact_head_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

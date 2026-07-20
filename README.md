@@ -225,7 +225,7 @@ cortex slice-action "$SLICE_ID" abandon      --actor operator
 
 `fanout`、`tick`、`complete`、`slice-action` 與 `work` 都會寫入 control request queue，再由 daemon / manager 這個單一 writer 改變狀態；daemon 未啟動時會明確拒絕，不會由 CLI 直接競寫 registry。
 
-Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS，`review-attest` 的review摘要與 `ship` 的 exact evidence refs 也由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
+Work lifecycle mutation 使用 `cortex work <link|unlink|start|resume|retry-build|abandon|auto|review-attest|ship> <work-id> --repo <owner/repo>`。`link` / `unlink` 以 `--kind <github_issue|github_pr|openspec|path> --ref <canonical-ref>` 指定來源，`--issue N` 僅保留一個 release 的相容入口，兩者不得混用；一般 link/start/resume 由 installer/Monitor registry 解析 trusted repo root。`retry-build` 的 payload 只接受 `expected_candidate` CAS；`abandon` 必須帶 exact `--expected-run-id`、bounded `--actor` 與單行 `--reason`，只會把無active Job、無PR/ship side effect的pre-delivery run設成`superseded`並留下immutable evidence，不會建立CompletionRecord。`review-attest` 的review摘要與 `ship` 的 exact evidence refs 也由 `--payload <json>` 傳入。CLI 只排隊，confirmed Todo/issue authority、GitHub label、official OpenSpec archive、preflight、current-HEAD review、merge 與 remote closure 都由 Manager 驗證及執行。
 
 Manager periodic tick 會從 durable Monitor snapshot 執行 auto-claim scan；它會讀取 work item 的全部 mapped issues，任一張帶 `cortex:auto-on-going` 即符合 label 條件，但任一 GitHub API read 失敗會讓整個 claim fail-closed。`cortex work auto ... --enable|--disable` 未指定 legacy `--issue` 時會對全部 mapped issues 套用相同 label mutation；任一 mutation 失敗時整個 action 報錯。缺 issue 的 confirmed Todo 會持久化為 `needs_human: missing_issue`，待 operator link 且 Monitor snapshot 更新後才能 resume。Run 的 claim key 綁定該 work item 的 canonical semantic authority（provider/source revisions 與 confirmed refs），不綁 whole-fleet snapshot hash；只有 sequence、written-at 或其他 repo 噪音的 snapshot refresh 會原 run resume 並更新 provenance，語意來源變更才建立新 run。
 
@@ -342,6 +342,10 @@ cortex slice-action "$SLICE_ID" retry-build  --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-verify --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" retry-review --actor "$ACTOR"
 cortex slice-action "$SLICE_ID" abandon      --actor "$ACTOR"
+
+# 明確淘汰沒有delivery side effect的舊WorkflowRun：
+cortex work abandon "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
+  --expected-run-id "$RUN_ID" --reason "$REASON"
 
 # PR已建立且foreign review綁定current HEAD後，建立typed maintainer evidence：
 cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \

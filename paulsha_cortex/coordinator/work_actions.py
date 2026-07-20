@@ -1448,6 +1448,132 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
     }
 
 
+def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / "work-abandon"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{body['run_id']}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content or target.stat().st_mode & 0o222:
+            raise RuntimeError("workflow abandon evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, target)
+            os.chmod(target, 0o444)
+            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except FileExistsError:
+            if (
+                target.is_symlink()
+                or target.read_bytes() != content
+                or target.stat().st_mode & 0o222
+            ):
+                raise RuntimeError("workflow abandon evidence conflict")
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"ref": str(target), "hash": digest}
+
+
+def _abandon_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """Supersede one exact pre-delivery WorkflowRun without completion evidence."""
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_run_id", "reason",
+    }
+    if extras:
+        raise ValueError(f"abandon rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_run_id = args.get("expected_run_id")
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("abandon requires exact expected_run_id")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("abandon requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("abandon requires bounded reason")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("abandon issue is not authorized by WorkAuthority")
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    exact = [run for run in related if run.run_id == expected_run_id]
+    if len(exact) != 1:
+        raise RuntimeError("abandon expected WorkflowRun CAS mismatch")
+    run = exact[0]
+    if any(item.status == "ongoing" and item.run_id != run.run_id for item in related):
+        raise RuntimeError("abandon refuses a different active WorkflowRun")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
+        raise RuntimeError("abandon WorkflowRun refs differ from current WorkAuthority")
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "actor": actor,
+        "reason": reason,
+    }
+    digest = verification.canonical_json_hash(body)
+    target = (
+        state_path.resolve().parent
+        / "evidence"
+        / "work-abandon"
+        / f"{run.run_id}-{digest}.json"
+    )
+    if run.status == "superseded" and str(target) not in run.evidence_refs:
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    record = _abandon_record(body, state_path=state_path)
+    updated = workflow_registry._manager_abandon_workflow_run(
+        run.run_id,
+        evidence_ref=record["ref"],
+    )
+    return {
+        "action": "abandoned",
+        "reason": reason,
+        "actor": actor,
+        "expected_run_id": expected_run_id,
+        "evidence": record,
+        "run": updated.to_dict(),
+    }
+
+
 def run_auto_claim_scan(
     *,
     snapshot_path: str | Path | None = None,
@@ -2113,7 +2239,8 @@ def execute_work_action(
     repo = args.get("repo")
     work_id = args.get("work_id")
     if action not in {
-        "link", "unlink", "start", "resume", "retry-build", "auto", "ship", "review-attest",
+        "link", "unlink", "start", "resume", "retry-build", "abandon", "auto", "ship",
+        "review-attest",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -2154,6 +2281,13 @@ def execute_work_action(
         result = _retry_build_action(
             args=args,
             authority=authority,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "abandon":
+        result = _abandon_action(
+            args=args,
+            authority=authority,
+            state_path=resolved_state_path,
             workflow_registry=workflow_registry,
         )
     elif action == "review-attest":
