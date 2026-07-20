@@ -2293,6 +2293,11 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
             parsed = _parse_terminal_json_text(item.get("text"))
             if parsed is not None:
                 return parsed
+        data = value.get("data")
+        if value.get("type") == "assistant.message" and isinstance(data, dict):
+            parsed = _parse_terminal_json_text(data.get("content"))
+            if parsed is not None:
+                return parsed
         for key in ("result", "content", "message", "text"):
             parsed = _parse_terminal_json_text(value.get(key))
             if parsed is not None:
