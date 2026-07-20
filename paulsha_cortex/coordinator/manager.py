@@ -4891,11 +4891,26 @@ def _workflow_job_prompt(
             "reports": [{"path": "concrete repo-relative path matching declared_outputs", "body": "Markdown body without frontmatter"}],
         }
     else:
+        fixed_terminal_fields: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "workflow-card",
+            "run_id": run.run_id,
+            "card_id": step.card,
+        }
+        if not step.outputs:
+            fixed_terminal_fields["outputs"] = []
         terminal_schema = {
             "kind": "workflow-card",
             "schema_version": 1,
             "required": ["schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs"],
+            "fixed": fixed_terminal_fields,
             "status": ["passed", "failed", "needs_human"],
+            "outputs": {
+                "type": "array",
+                "items": "repo-relative artifact path string matching declared_outputs",
+                "must_match_every_declared_output": True,
+                "descriptive_objects_forbidden": True,
+            },
         }
     contract: dict[str, object] = {
         "schema_version": 1,
@@ -4938,7 +4953,10 @@ def _workflow_job_prompt(
     )
     return (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
-        "path or hash because Manager will canonicalize it."
+        "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
+        "repo-relative artifact path strings matching declared_outputs; when declared_outputs is "
+        "empty, outputs must be exactly []. Never put action, summary, or other descriptive objects "
+        "in outputs."
         + planner_contract
         + reviewer_contract
         + " Contract: "
