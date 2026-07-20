@@ -715,6 +715,58 @@ def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
     assert not result.observations["remote_prs"][0]["merged_with_merge_commit"]
 
 
+def test_github_terminal_compares_only_workflow_linked_prs():
+    def merged(number: int, merge: str) -> dict:
+        return {
+            "number": number,
+            "body": "",
+            "headRefName": f"feature/{number}-work",
+            "headRefOid": str(number % 10) * 40,
+            "state": "MERGED",
+            "mergedAt": "2026-07-17T10:00:00Z",
+            "mergeCommit": {"oid": merge, "parents": {"totalCount": 2}},
+            "closingIssuesReferences": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [{"number": number, "state": "CLOSED"}],
+            },
+        }
+
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [merged(8, "a" * 40), merged(9, "b" * 40)],
+                },
+            }
+        }
+    }
+    runner = SequenceRunner(
+        [
+            _completed(graph),
+            _completed({"truncated": False, "tree": []}),
+            _completed({"status": "ahead"}),
+        ]
+    )
+
+    result = GitHubTerminalProvider(
+        "example/acme",
+        runner=runner,
+        relevant_pr_numbers=(9,),
+    ).scan()
+
+    assert result.status == "ok"
+    assert len(runner.calls) == 3
+    assert "compare/" + "b" * 40 in runner.calls[2][-1]
+    by_number = {
+        int(row["source_id"].rsplit("#", 1)[1]): row
+        for row in result.observations["remote_prs"]
+    }
+    assert by_number[8]["merged_with_merge_commit"] is False
+    assert by_number[9]["merged_with_merge_commit"] is True
+
+
 def test_github_terminal_truncated_tree_is_degraded():
     graph = {
         "data": {
@@ -731,6 +783,61 @@ def test_github_terminal_truncated_tree_is_degraded():
     result = GitHubTerminalProvider("example/acme", runner=runner).scan()
 
     assert result.status == "degraded"
+
+
+def test_github_terminal_retries_only_transient_gateway_failures():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            }
+        }
+    }
+    transient = _completed(
+        {"message": "temporarily unavailable"},
+        returncode=1,
+        stderr="gh: temporarily unavailable (HTTP 503)",
+    )
+    runner = SequenceRunner(
+        [transient, _completed(graph), _completed({"truncated": False, "tree": []})]
+    )
+    sleeps = []
+
+    result = GitHubTerminalProvider(
+        "example/acme",
+        runner=runner,
+        retry_delays=(0.25,),
+        sleeper=sleeps.append,
+    ).scan()
+
+    assert result.status == "ok"
+    assert sleeps == [0.25]
+    assert runner.calls[0] == runner.calls[1]
+
+
+def test_github_terminal_does_not_retry_non_transient_api_failure():
+    runner = SequenceRunner(
+        [
+            _completed(
+                {"message": "bad credentials"},
+                returncode=1,
+                stderr="gh: bad credentials (HTTP 401)",
+            )
+        ]
+    )
+    sleeps = []
+
+    result = GitHubTerminalProvider(
+        "example/acme",
+        runner=runner,
+        retry_delays=(0.25, 0.5),
+        sleeper=sleeps.append,
+    ).scan()
+
+    assert result.status == "degraded"
+    assert sleeps == []
+    assert len(runner.calls) == 1
 
 
 def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
@@ -760,6 +867,8 @@ def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
     }
     remote_body = "---\nwork_item: work\n---\n- [x] remote task\n"
     blob = {
+        "type": "file",
+        "path": "docs/superpowers/workstreams/work/todo.md",
         "encoding": "base64",
         "content": base64.b64encode(remote_body.encode()).decode(),
         "sha": "c" * 40,
@@ -777,6 +886,14 @@ def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
             "complete": True,
         }
     ]
+    assert runner.calls[2] == (
+        "gh",
+        "api",
+        "--method",
+        "GET",
+        "repos/example/acme/contents/docs/superpowers/workstreams/work/todo.md?ref="
+        + "d" * 40,
+    )
 
 
 def test_remote_archived_openspec_tasks_are_todo_completion_evidence():
@@ -794,6 +911,8 @@ def test_remote_archived_openspec_tasks_are_todo_completion_evidence():
         "tree": [{"path": task_path, "type": "blob", "sha": "c" * 40}],
     }
     blob = {
+        "type": "file",
+        "path": task_path,
         "encoding": "base64",
         "content": base64.b64encode(b"- [x] task one\n- [x] task two\n").decode(),
         "sha": "c" * 40,
@@ -814,6 +933,35 @@ def test_remote_archived_openspec_tasks_are_todo_completion_evidence():
     assert [(source.ref, source.status) for source in result.sources] == [
         ("canary", "archived")
     ]
+
+
+def test_remote_todo_contents_identity_mismatch_is_degraded():
+    graph = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            }
+        }
+    }
+    path = "docs/superpowers/workstreams/work/todo.md"
+    tree = {
+        "truncated": False,
+        "tree": [{"path": path, "type": "blob", "sha": "c" * 40}],
+    }
+    contents = {
+        "type": "file",
+        "path": path,
+        "encoding": "base64",
+        "content": base64.b64encode(b"- [x] task\n").decode(),
+        "sha": "e" * 40,
+    }
+    runner = SequenceRunner([_completed(graph), _completed(tree), _completed(contents)])
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "degraded"
+    assert result.observations == {}
 
 
 def test_pr_body_work_item_is_not_confirmed_authority():
