@@ -2000,9 +2000,16 @@ def _ship_action(
             raise ValueError("cached done state malformed")
         from . import completion
 
-        completion_payload = completion.read_completion_record(
-            record["path"], expected_hash=record["hash"]
-        )
+        replacement_path = args.get("completion_record_path")
+        if replacement_path is None:
+            completion_payload = completion.read_completion_record(
+                record["path"], expected_hash=record["hash"]
+            )
+        else:
+            completion_payload = _json_file(
+                replacement_path,
+                field="completion_record_path",
+            )
         closure = orchestrator.verify_remote_closure(
             repo=authority.repo,
             pr_number=pr_number,
@@ -2015,6 +2022,11 @@ def _ship_action(
             workflow_step_ids=tuple(active["workflow_step_ids"]),
             trusted_evidence_refs=_trusted_evidence_refs(authorization),
         )
+        active["ship"] = {
+            **ship,
+            "completion_record": dict(closure.completion_record),
+        }
+        _save_runs(state_path, state)
         return {
             "action": "done",
             "head": expected_head,

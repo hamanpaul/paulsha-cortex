@@ -57,6 +57,7 @@
 - [x] 3.25 RED-test並修正CompletionRecord run-level evidence binding：驗證原始per-card verify/review canonical envelope後，以同一WorkflowRun ID派生closure evidence，讓CompletionRecord重新讀取時可同時精確綁定verification與ForeignReview。
 - [x] 3.26 RED-test並修正post-archive repair的ship audit：Manager-owned archive job可綁定final Candidate的exact ancestor，前提是registry仍保存passed archive authority且Git ancestry成立；policy-commit仍要求exact final Candidate，unrelated commit維持fail-closed。
 - [x] 3.27 RED-test並修正cached done closure routing：ship validator已寫`done`但Manager finalization尚未完成的crash window，explicit resume與`merged`相同略過已消失的active planning path，仍由terminal validator完整重驗。
+- [x] 3.28 RED-test並修正cached done CompletionRecord refresh：Manager可為current remote snapshot產生新draft，terminal validator以它取代stale cached payload完整重驗，成功後原子更新journal record；未提供replacement時仍重驗既有record。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 
