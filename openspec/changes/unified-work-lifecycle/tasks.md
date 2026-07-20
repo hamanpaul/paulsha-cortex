@@ -47,6 +47,7 @@
 - [x] 3.15 RED-test並修正exact metadata冪等性：先authenticated reread title/body/labels，全部一致時不發PATCH/PUT；只有drift才write並再次完整reread。
 - [x] 3.16 RED-test並修正delivery finding閉環：`fix-required`由trusted adapter fail-closed映射為`needs_human`，使operator可用exact-Candidate `retry-build`重開builder。
 - [x] 3.17 RED-test並修正builder terminalization recovery：final builder job已成功退出（`exited/0`）但immutable evidence未綁定時，允許exact-Candidate `retry-build`在窄化build phase重派；真正failed job、前置build、job狀態與input snapshot維持fail-closed。
+- [x] 3.18 RED-test並收緊plan/build terminal output prompt：`outputs`只允許符合manifest的repo-relative artifact path字串；manifest無outputs時明示固定為空陣列，禁止描述性物件造成合法repair Candidate無法綁定。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

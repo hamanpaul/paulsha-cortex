@@ -1405,6 +1405,10 @@ def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path
     assert payload["skill_ref"] == "superpowers:test-driven-development"
     assert payload["source_material"][0]["content"] == plan_bytes.decode()
     assert payload["terminal_schema"]["required"]
+    assert payload["terminal_schema"]["fixed"]["run_id"] == run.run_id
+    assert payload["terminal_schema"]["fixed"]["card_id"] == red.card
+    assert payload["terminal_schema"]["fixed"]["outputs"] == []
+    assert payload["terminal_schema"]["outputs"]["descriptive_objects_forbidden"] is True
     assert Path(snapshot[0]["content_ref"]).stat().st_mode & 0o222 == 0
 
 
