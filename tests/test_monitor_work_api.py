@@ -16,6 +16,7 @@ from paulsha_cortex.monitor.work_api import (
     WorkChangeEvent,
     WorkModelRefresher,
     WorkReadModelStore,
+    _workflow_linked_pr_numbers,
 )
 from paulsha_cortex.monitor.work_models import ProviderSnapshot, WorkItem
 from paulsha_cortex.monitor.work_snapshot import WorkSnapshot
@@ -62,6 +63,28 @@ def test_read_model_list_defaults_hide_done_and_sorts():
     assert envelope["sequence"] == 7
     assert [item["work_id"] for item in envelope["items"]] == ["a-topic", "b-todo"]
     assert envelope["degraded"] is False
+
+
+def test_terminal_pr_filter_comes_only_from_canonical_workflow_links():
+    provider = ProviderSnapshot(
+        provider_id="workflow:example/acme",
+        status="ok",
+        last_attempt_at=NOW,
+        last_success_at=NOW,
+        revision="workflow-1",
+        diagnostics=(),
+        sources=(),
+        observations={
+            "workflow_links": {
+                "github_pr:example/acme#54": "terminal-canary",
+                "github_pr:example/acme#7": "older-work",
+                "github_pr:example/other#99": "other-repo",
+                "github_issue:example/acme#31": "terminal-canary",
+            }
+        },
+    )
+
+    assert _workflow_linked_pr_numbers(provider, repo="example/acme") == (7, 54)
 
 
 def test_read_model_filters_repo_and_normalizes_on_going():

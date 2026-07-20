@@ -47,6 +47,7 @@ Override schema、negative exclusion與path safety以`CONTEXT.md`為canonical。
 - Provider成功才替換sources；failure保留last-good並更新degraded health。
 - Startup可先讀snapshot提供degraded state；invalid/unknown schema不覆寫合法檔。
 - GitHub default refresh 300秒；900秒沒有success時禁止auto claim與merge。
+- Terminal closure provider以default revision精確呼叫Contents API讀Todo，並驗response path、blob SHA與encoding；production只對WorkflowRegistry canonical linked PR做merge ancestry compare。HTTP 502/503/504可有限backoff重試，auth、rate-limit、其他HTTP錯誤與malformed/identity mismatch仍立即fail-closed並保留last-good。
 
 ### 2.4 CLI/API
 
