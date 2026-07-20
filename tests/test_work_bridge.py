@@ -116,6 +116,19 @@ def _steps() -> tuple[WorkflowStep, ...]:
     )
 
 
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ("done", "passed"),
+        ("fix-required", "needs_human"),
+        ("needs_human", "needs_human"),
+        ("awaiting-copilot", "pending"),
+    ],
+)
+def test_delivery_adapter_status(action: str, expected: str) -> None:
+    assert work_bridge._delivery_adapter_status(action) == expected
+
+
 def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     monkeypatch, tmp_path: Path
 ) -> None:
