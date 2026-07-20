@@ -1448,6 +1448,20 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
     }
 
 
+def _validate_abandon_evidence_target(target: Path, content: bytes) -> None:
+    try:
+        conflict = (
+            target.is_symlink()
+            or not target.is_file()
+            or target.read_bytes() != content
+            or target.stat().st_mode & 0o222
+        )
+    except OSError as error:
+        raise RuntimeError("workflow abandon evidence conflict") from error
+    if conflict:
+        raise RuntimeError("workflow abandon evidence conflict")
+
+
 def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
     digest = verification.canonical_json_hash(body)
     root = state_path.resolve().parent / "evidence" / "work-abandon"
@@ -1457,8 +1471,7 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
         json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     if target.exists():
-        if target.is_symlink() or target.read_bytes() != content or target.stat().st_mode & 0o222:
-            raise RuntimeError("workflow abandon evidence conflict")
+        _validate_abandon_evidence_target(target, content)
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
         try:
@@ -1476,12 +1489,7 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
             try:
                 os.link(temporary, target)
             except FileExistsError:
-                if (
-                    target.is_symlink()
-                    or target.read_bytes() != content
-                    or target.stat().st_mode & 0o222
-                ):
-                    raise RuntimeError("workflow abandon evidence conflict")
+                _validate_abandon_evidence_target(target, content)
             else:
                 directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
                 try:
