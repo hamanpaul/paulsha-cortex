@@ -4232,6 +4232,33 @@ def _workflow_report_cleanup_allows_missing(
 
 
 def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: str | Path):
+    def matches_candidate(card: str, job: Mapping[str, object]) -> bool:
+        subject = job.get("subject_head")
+        if subject == candidate:
+            return True
+        if (
+            card != "openspec-archive"
+            or not _manager_archive_applied(run)
+            or not isinstance(subject, str)
+            or verification.SAFE_SHA_RE.fullmatch(subject) is None
+            or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        ):
+            return False
+        try:
+            ancestry = subprocess.run(
+                [
+                    "git", "-C", str(run.workspace_root), "merge-base", "--is-ancestor",
+                    subject, candidate,
+                ],
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return False
+        return ancestry.returncode == 0
+
     steps = run.steps
     for card in ("openspec-archive", "policy-commit"):
         jobs = [
@@ -4241,7 +4268,7 @@ def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: st
             and job.get("workflow_phase") == "ship"
             and job.get("workflow_card") == card
             and job.get("persona") == "manager"
-            and job.get("subject_head") == candidate
+            and matches_candidate(card, job)
             and job.get("status") == "exited"
             and job.get("exit_code") == 0
         ]
@@ -4255,7 +4282,7 @@ def _validated_ship_steps(registry, *, run, candidate: str, coordinator_root: st
             or payload.get("status") != "passed"
             or payload.get("run_id") != run.run_id
             or payload.get("card_id") != card
-            or payload.get("candidate") != candidate
+            or payload.get("candidate") != jobs[0].get("subject_head")
         ):
             raise ValueError(f"workflow ship card evidence invalid: {card}")
         steps = _audit_phase_steps(

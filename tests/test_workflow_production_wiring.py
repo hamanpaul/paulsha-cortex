@@ -2172,6 +2172,148 @@ def test_workflow_candidate_must_exist_at_exact_worktree_head(tmp_path: Path) ->
         manager._verify_exact_candidate(job, git_runner=missing_runner)
 
 
+def test_ship_audit_accepts_manager_archive_ancestor_after_retry_build(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    coordinator = tmp_path / "coordinator"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "archive.txt").write_text("archived\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "archive.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "archive"], check=True)
+    archive_candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "repair.txt").write_text("repair\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "repair.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "repair"], check=True)
+    final_candidate = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    registry = JobRegistry(state_path=coordinator / "jobs.json")
+    steps = tuple(
+        replace(
+            step,
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            gate_result="passed",
+        )
+        if step.phase == "ship" and step.card == "openspec-archive"
+        else step
+        for step in _manifest().steps
+    )
+    run = registry._manager_create_workflow_run(
+        work_id="archive-repair",
+        repo="owner/repo",
+        claim_key="claim:v1:" + "a" * 64,
+        source_revision="b" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        candidate_head=final_candidate,
+        verified_head=final_candidate,
+        gate_status="running",
+    )
+    work_bridge._record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        worktree=repo,
+        branch="feature/archive-repair",
+        card="openspec-archive",
+        old_head=archive_candidate,
+        new_head=archive_candidate,
+    )
+    work_bridge._record_manager_ship_job(
+        registry=registry,
+        state_root=coordinator,
+        run=run,
+        worktree=repo,
+        branch="feature/archive-repair",
+        card="policy-commit",
+        old_head=final_candidate,
+        new_head=final_candidate,
+    )
+
+    audited = manager._validated_ship_steps(
+        registry,
+        run=run,
+        candidate=final_candidate,
+        coordinator_root=coordinator,
+    )
+    assert all(
+        step.gate_result == "passed"
+        for step in audited
+        if step.phase == "ship"
+    )
+
+    archive_tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", f"{archive_candidate}^{{tree}}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    sibling_candidate = subprocess.run(
+        ["git", "-C", str(repo), "commit-tree", archive_tree, "-p", archive_candidate],
+        check=True,
+        capture_output=True,
+        text=True,
+        input="unrelated sibling\n",
+    ).stdout.strip()
+    unrelated_root = tmp_path / "unrelated-coordinator"
+    unrelated_registry = JobRegistry(state_path=unrelated_root / "jobs.json")
+    unrelated_run = unrelated_registry._manager_create_workflow_run(
+        work_id="unrelated-archive",
+        repo="owner/repo",
+        claim_key="claim:v1:" + "c" * 64,
+        source_revision="d" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="review",
+        steps=steps,
+        candidate_head=final_candidate,
+        verified_head=final_candidate,
+        gate_status="running",
+    )
+    work_bridge._record_manager_ship_job(
+        registry=unrelated_registry,
+        state_root=unrelated_root,
+        run=unrelated_run,
+        worktree=repo,
+        branch="feature/unrelated-archive",
+        card="openspec-archive",
+        old_head=archive_candidate,
+        new_head=sibling_candidate,
+    )
+    work_bridge._record_manager_ship_job(
+        registry=unrelated_registry,
+        state_root=unrelated_root,
+        run=unrelated_run,
+        worktree=repo,
+        branch="feature/unrelated-archive",
+        card="policy-commit",
+        old_head=final_candidate,
+        new_head=final_candidate,
+    )
+    with pytest.raises(ValueError, match="openspec-archive"):
+        manager._validated_ship_steps(
+            unrelated_registry,
+            run=unrelated_run,
+            candidate=final_candidate,
+            coordinator_root=unrelated_root,
+        )
+
+
 def test_manager_rejects_same_domain_reviewer_before_dispatch(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     candidate = "b" * 40

@@ -55,6 +55,7 @@
 - [x] 3.23 RED-test並修正terminal authority transition：merged/done closure接受immutable merge authorization保留pre-terminal WorkAuthority digest；merge-authorized與merge前gate仍要求current digest精確相等，tampered evidence維持fail-closed。
 - [x] 3.24 RED-test並修正Completion Draft重試版控：以排除`completed_at`的closure語意hash建立immutable revision；相同語意重播沿用首份draft，default branch或authority前進則保留舊draft並建立新revision，malformed collision維持fail-closed。
 - [x] 3.25 RED-test並修正CompletionRecord run-level evidence binding：驗證原始per-card verify/review canonical envelope後，以同一WorkflowRun ID派生closure evidence，讓CompletionRecord重新讀取時可同時精確綁定verification與ForeignReview。
+- [x] 3.26 RED-test並修正post-archive repair的ship audit：Manager-owned archive job可綁定final Candidate的exact ancestor，前提是registry仍保存passed archive authority且Git ancestry成立；policy-commit仍要求exact final Candidate，unrelated commit維持fail-closed。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 
