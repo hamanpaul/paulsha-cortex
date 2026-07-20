@@ -937,6 +937,8 @@ identities:
     monkeypatch.setattr(work_bridge, "run_preflight", fake_preflight)
     created = []
 
+    default_head = {"value": "d" * 40}
+
     class GitHub:
         def __init__(self, *, runner):
             pass
@@ -946,7 +948,7 @@ identities:
             return 17
 
         def fetch_remote_closure(self, **kwargs):
-            return SimpleNamespace(default_head="d" * 40, merge_commit="e" * 40)
+            return SimpleNamespace(default_head=default_head["value"], merge_commit="e" * 40)
 
         def fetch_default_branch(self, **kwargs):
             return "main"
@@ -1077,9 +1079,71 @@ identities:
         pr_number=17,
         foreign_ref=foreign_ref,
         runner=subprocess.run,
-        now=time.time,
+        now=lambda: 100.0,
     )
     assert draft is not None and draft.is_file()
     completion_payload = json.loads(draft.read_text(encoding="utf-8"))
     assert completion_payload["work_authority"]["run_id"] == run_id
     assert completion_payload["work_authority"]["merge_commit"] == "e" * 40
+    assert completion_payload["target_ref_sha"] == "d" * 40
+
+    # Retry reuses the first immutable draft when only completed_at changes.
+    replay = work_bridge._completion_draft(
+        registry=registry,
+        state_root=coordinator_root,
+        run=run,
+        authority=authority,
+        candidate=candidate,
+        pr_number=17,
+        foreign_ref=foreign_ref,
+        runner=subprocess.run,
+        now=lambda: 200.0,
+    )
+    assert replay == draft
+    assert json.loads(replay.read_text(encoding="utf-8")) == completion_payload
+
+    # A default-branch advance is new closure semantics, so it gets a new
+    # immutable revision instead of conflicting with or replacing the prior draft.
+    default_head["value"] = "f" * 40
+    revised = work_bridge._completion_draft(
+        registry=registry,
+        state_root=coordinator_root,
+        run=run,
+        authority=authority,
+        candidate=candidate,
+        pr_number=17,
+        foreign_ref=foreign_ref,
+        runner=subprocess.run,
+        now=lambda: 300.0,
+    )
+    assert revised is not None and revised != draft and revised.is_file()
+    revised_payload = json.loads(revised.read_text(encoding="utf-8"))
+    assert revised_payload["target_ref_sha"] == "f" * 40
+    assert json.loads(draft.read_text(encoding="utf-8")) == completion_payload
+
+    default_head["value"] = "a" * 40
+    malformed = work_bridge._completion_draft(
+        registry=registry,
+        state_root=coordinator_root,
+        run=run,
+        authority=authority,
+        candidate=candidate,
+        pr_number=17,
+        foreign_ref=foreign_ref,
+        runner=subprocess.run,
+        now=lambda: 400.0,
+    )
+    assert malformed is not None
+    malformed.write_text("{\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="existing draft is invalid"):
+        work_bridge._completion_draft(
+            registry=registry,
+            state_root=coordinator_root,
+            run=run,
+            authority=authority,
+            candidate=candidate,
+            pr_number=17,
+            foreign_ref=foreign_ref,
+            runner=subprocess.run,
+            now=lambda: 500.0,
+        )
