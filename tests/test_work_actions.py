@@ -454,6 +454,24 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
         state_path=state,
         workflow_registry=registry,
     )
+    abandoned = registry.get_workflow_run(run_id)
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    item = payload["work_items"][0]
+    item["mapped_issues"] = [12, 13]
+    item["source_revisions"].append("issue:13@open")
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    registry._manager_create_workflow_run(
+        work_id="demo",
+        repo="acme/demo",
+        claim_key="claim:v1:" + "c" * 64,
+        source_revision="authority-drifted",
+        workspace_root=abandoned.workspace_root,
+        combo=abandoned.combo,
+        current_phase="define",
+        steps=abandoned.steps,
+        issue_refs=("acme/demo#12", "acme/demo#13"),
+        openspec_refs=("demo",),
+    )
     second = work_actions.execute_work_action(
         args=args,
         requested_by="operator",

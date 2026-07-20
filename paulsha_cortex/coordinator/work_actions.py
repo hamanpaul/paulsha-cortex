@@ -1501,6 +1501,72 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
     return {"ref": str(target), "hash": digest}
 
 
+def _superseded_abandon_body(
+    run,
+    *,
+    state_path: Path,
+    actor: str,
+    reason: str,
+) -> dict[str, Any]:
+    root = state_path.resolve().parent / "evidence" / "work-abandon"
+    candidates: list[Path] = []
+    pattern = re.compile(rf"{re.escape(run.run_id)}-([0-9a-f]{{64}})\.json")
+    for value in run.evidence_refs:
+        path = Path(value)
+        if (
+            not path.is_absolute()
+            or path.parent != root
+            or pattern.fullmatch(path.name) is None
+        ):
+            continue
+        candidates.append(path)
+    if len(candidates) != 1:
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    target = candidates[0]
+    try:
+        if (
+            target.is_symlink()
+            or not target.is_file()
+            or target.stat().st_mode & 0o222
+            or target.stat().st_size > 4096
+        ):
+            raise RuntimeError("WorkflowRun was superseded by different authority")
+        raw = target.read_bytes()
+        body = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            "WorkflowRun was superseded by different authority"
+        ) from error
+    required = {
+        "schema",
+        "repo",
+        "work_id",
+        "run_id",
+        "authority_digest",
+        "actor",
+        "reason",
+    }
+    if (
+        not isinstance(body, dict)
+        or set(body) != required
+        or body.get("schema") != "cortex-work-abandon/v1"
+        or body.get("repo") != run.repo
+        or body.get("work_id") != run.work_id
+        or body.get("run_id") != run.run_id
+        or re.fullmatch(r"[0-9a-f]{64}", str(body.get("authority_digest"))) is None
+        or body.get("actor") != actor
+        or body.get("reason") != reason
+    ):
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    digest = verification.canonical_json_hash(body)
+    if raw != content or target.name != f"{run.run_id}-{digest}.json":
+        raise RuntimeError("WorkflowRun was superseded by different authority")
+    return body
+
+
 def _abandon_action(
     *,
     args: dict[str, Any],
@@ -1537,9 +1603,6 @@ def _abandon_action(
         or not reason.isprintable()
     ):
         raise ValueError("abandon requires bounded reason")
-    issue = args.get("issue")
-    if issue is not None and issue not in authority.mapped_issues:
-        raise RuntimeError("abandon issue is not authorized by WorkAuthority")
     related = [
         run
         for run in workflow_registry.list_workflow_runs()
@@ -1549,6 +1612,33 @@ def _abandon_action(
     if len(exact) != 1:
         raise RuntimeError("abandon expected WorkflowRun CAS mismatch")
     run = exact[0]
+    if run.status == "superseded":
+        body = _superseded_abandon_body(
+            run,
+            state_path=state_path,
+            actor=actor,
+            reason=reason,
+        )
+        record = _abandon_record(body, state_path=state_path)
+        workflow_registry._manager_validate_workflow_abandon(
+            run.run_id,
+            evidence_ref=record["ref"],
+        )
+        updated = workflow_registry._manager_abandon_workflow_run(
+            run.run_id,
+            evidence_ref=record["ref"],
+        )
+        return {
+            "action": "abandoned",
+            "reason": reason,
+            "actor": actor,
+            "expected_run_id": expected_run_id,
+            "evidence": record,
+            "run": updated.to_dict(),
+        }
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("abandon issue is not authorized by WorkAuthority")
     if any(item.status == "ongoing" and item.run_id != run.run_id for item in related):
         raise RuntimeError("abandon refuses a different active WorkflowRun")
     expected_issues = tuple(
@@ -1572,8 +1662,6 @@ def _abandon_action(
         / "work-abandon"
         / f"{run.run_id}-{digest}.json"
     )
-    if run.status == "superseded" and str(target) not in run.evidence_refs:
-        raise RuntimeError("WorkflowRun was superseded by different authority")
     workflow_registry._manager_validate_workflow_abandon(
         run.run_id,
         evidence_ref=str(target),
