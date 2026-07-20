@@ -29,6 +29,7 @@
 - **deck frontmatter emit 契約與 runtime parser keyset 對齊**：`EMITTED_FRONTMATTER_FIELDS`、deck compile frontmatter 與 `parse_spec_frontmatter()` 現在一致包含 `target_branch` / `verification` / `parse_error`；compile 產生 hold spec 時固定輸出 `null` 欄位，runtime 僅接受 `parse_error: null`（non-null fail-closed），避免 deck contract alignment 漂移。
 
 ### Fixed
+- **Retry-build可採用已提交且已測試的descendant Candidate**：delivery preflight與post-archive review recovery prompt現在明示先檢查worktree既有repair commit，允許builder提交或採用tested descendant；Manager仍以exact舊Candidate CAS與單調ancestry獨立驗證，不接受caller evidence或倒退HEAD。
 - **Copilot workflow terminal evidence 可由 Manager 正式綁定**：terminal parser 現在只在 typed `assistant.message` event 讀取 `data.content` 的完整 workflow payload，保留既有 discriminator 驗證；不再把 Copilot 已成功產生的 exact-Candidate terminal 誤判為缺少 JSON evidence。
 - **Exact PR metadata不再無條件重寫**：`ensure_pr_metadata`先以authenticated PR/issue reread驗title、body與完整labels；全部精確一致時直接保留remote state，不發PATCH/PUT。任一欄drift才執行冪等metadata writes並再次完整reread，降低GitHub write degradation期間的無效side effect且不放寬identity gate。
 - **Delivery PR metadata可承受暫時gateway故障**：既有PR的title/body PATCH、labels PUT與兩筆identity reread只在HTTP 502/503/504時做finite bounded retry；這些操作皆為冪等metadata transaction。PR create、push、merge與其他delivery side effect不共用此retry路徑，auth、rate-limit及malformed response仍立即fail-closed。
