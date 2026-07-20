@@ -1,0 +1,1 @@
+Fixed GitHub terminal closure scans by reading remote Todo files through exact-ref Contents identity checks, bounding retries to transient gateway failures, and limiting production merge ancestry comparisons to canonical workflow-linked PRs.

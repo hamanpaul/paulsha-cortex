@@ -21,6 +21,8 @@ Monitor MUST從authenticated GitHub、repo artifacts與Manager registry讀取ver
 ### Requirement: Provider失敗必須保留durable last-good
 Monitor MUST將provider snapshots與WorkItems原子保存於`$PSC_MONITOR_STATE_ROOT/work-items.snapshot.json`；未設定時root MUST為`$PSC_AGENTS_ROOT/monitor`，schema MUST為`work-items-snapshot/v1`且file mode MUST為`0600`。Provider只有成功完整scan後 MAY替換其sources/revision/last-success；auth、rate-limit、timeout、I/O、parse或ownership collision MUST保留last-good sources並標`degraded`。Unknown/invalid snapshot MUST NOT覆寫既有合法snapshot。
 
+GitHub terminal closure provider讀取remote Todo時 MUST以authenticated default revision呼叫Contents API，且 MUST逐筆驗證response為file、path與tree entry相同、blob SHA與tree revision相同、encoding為base64。Production ancestry compare MUST只對canonical WorkflowRegistry `workflow_links`已連結至該repo的PR執行；其他PR仍可提供remote state但 MUST NOT取得`merged_with_merge_commit=true`的closure authority。只有明確HTTP 502/503/504 MAY以finite bounded delay重試；auth、rate-limit、其他HTTP error、malformed JSON或identity mismatch MUST立即fail-closed並保留last-good。
+
 #### Scenario: GitHub暫時timeout
 - **WHEN** GitHub provider上次成功後本輪timeout
 - **THEN** snapshot保留上次GitHub sources與revision並更新degraded health
@@ -35,6 +37,11 @@ Monitor MUST將provider snapshots與WorkItems原子保存於`$PSC_MONITOR_STATE_
 - **WHEN** 距最後成功GitHub snapshot超過900秒
 - **THEN** read API仍可顯示last-good state與diagnostic
 - **THEN** Manager拒絕auto claim與merge
+
+#### Scenario: 無關merged PR不觸發terminal ancestry查詢
+- **WHEN** repo含多張歷史merged PR但WorkflowRegistry只把其中一張連結到active work item
+- **THEN** terminal provider只對該workflow-linked PR查詢merge revision是否已進default branch
+- **THEN** 無關PR不得取得closure authority，也不得因其compare API暫時失敗拖垮本輪scan
 
 ### Requirement: Correlation必須區分confirmed與inferred authority
 Confirmed association MUST只來自repo root `.cortex/work-items.yaml` version 1、markdown scalar frontmatter key `work_item`、GitHub closing reference或Manager workflow metadata。Override work ID MUST符合`[a-z0-9][a-z0-9-]*`；path MUST為repo-relative且不可escape。Title、slug、branch與issue token等heuristic MUST至少有兩個獨立訊號、無competing candidate，且只能建立`inferred` display group。單一source MUST NOT屬於兩個confirmed work item；collision MUST令provider degraded。`unlink` MUST保存exclusion。

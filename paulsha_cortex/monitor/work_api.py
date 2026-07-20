@@ -29,6 +29,26 @@ from .work_snapshot import WorkSnapshot, WorkSnapshotStore, work_key
 WORK_API_SCHEMA = "cortex-work/v1"
 
 
+def _workflow_linked_pr_numbers(
+    provider: ProviderSnapshot,
+    *,
+    repo: str,
+) -> tuple[int, ...]:
+    links = provider.observations.get("workflow_links", {})
+    if not isinstance(links, Mapping):
+        return ()
+    prefix = f"github_pr:{repo}#"
+    numbers = {
+        int(source_id[len(prefix) :])
+        for source_id in links
+        if isinstance(source_id, str)
+        and source_id.startswith(prefix)
+        and source_id[len(prefix) :].isdigit()
+        and int(source_id[len(prefix) :]) > 0
+    }
+    return tuple(sorted(numbers))
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -325,6 +345,9 @@ class WorkModelRefresher:
         self.github_terminal_provider_factory = (
             github_terminal_provider_factory or GitHubTerminalProvider
         )
+        self._uses_default_github_terminal_provider = (
+            github_terminal_provider_factory is None
+        )
         self.workflow_provider_factory = workflow_provider_factory or WorkflowRegistryProvider
         self.stale_after_seconds = stale_after_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -371,7 +394,18 @@ class WorkModelRefresher:
                     github = _retain_last_good(providers.get(github_id), github_result)
                     providers[github_id] = github
                     relevant.append(github)
-                    terminal_result = self.github_terminal_provider_factory(repo).scan()
+                    terminal_provider = (
+                        GitHubTerminalProvider(
+                            repo,
+                            relevant_pr_numbers=_workflow_linked_pr_numbers(
+                                workflow,
+                                repo=repo,
+                            ),
+                        )
+                        if self._uses_default_github_terminal_provider
+                        else self.github_terminal_provider_factory(repo)
+                    )
+                    terminal_result = terminal_provider.scan()
                     terminal = _retain_last_good(
                         providers.get(terminal_result.provider_id), terminal_result
                     )

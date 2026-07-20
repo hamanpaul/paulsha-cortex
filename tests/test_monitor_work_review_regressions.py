@@ -173,6 +173,57 @@ def _provider(provider_id: str, sources=(), *, observations=None, at=NOW):
     )
 
 
+def test_default_terminal_provider_receives_only_registry_linked_prs(
+    tmp_path, monkeypatch
+):
+    captured: list[tuple[str, tuple[int, ...] | None]] = []
+
+    class CapturingTerminalProvider:
+        def __init__(self, repo: str, *, relevant_pr_numbers=None):
+            captured.append((repo, relevant_pr_numbers))
+            self.repo = repo
+
+        def scan(self) -> ProviderSnapshot:
+            return _provider(f"github-terminal:{self.repo}")
+
+    monkeypatch.setattr(
+        "paulsha_cortex.monitor.work_api.GitHubTerminalProvider",
+        CapturingTerminalProvider,
+    )
+    workflow = _provider(
+        "workflow:example/acme",
+        observations={
+            "workflow_links": {
+                "github_pr:example/acme#9": "work",
+                "github_issue:example/acme#7": "work",
+                "github_pr:example/other#11": "other",
+            }
+        },
+    )
+    refresher = WorkModelRefresher(
+        durable_store=WorkSnapshotStore(tmp_path / "snapshot.json"),
+        read_store=WorkReadModelStore.empty(),
+        github_provider_factory=lambda _repo: _StaticProvider(
+            _provider("github:example/acme")
+        ),
+        workflow_provider_factory=lambda _repo: _StaticProvider(workflow),
+        now=lambda: datetime(2026, 7, 17, 10, 0, tzinfo=timezone.utc),
+    )
+
+    refresher.refresh(
+        (
+            ProjectState(
+                project_id="example/acme",
+                workspace="ws",
+                path=str(tmp_path),
+            ),
+        ),
+        include_github=True,
+    )
+
+    assert captured == [("example/acme", (9,))]
+
+
 def test_live_provider_freshness_uses_post_scan_clock(tmp_path):
     repo = tmp_path / "repo"
     proposal = repo / "openspec/changes/canary/proposal.md"
