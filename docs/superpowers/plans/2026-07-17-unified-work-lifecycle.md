@@ -27,7 +27,7 @@ issue: hamanpaul/paulsha-cortex#14
 
 ## Task 0: Baseline與planning artifacts
 
-**Files:** `CONTEXT.md`、`docs/adr/0001-unified-work-lifecycle-authority.md`、本spec/plan、`openspec/changes/unified-work-lifecycle/**`、issue #4相關既有Monitor files/tests、stale active change paths。
+**Files:** `CONTEXT.md`、`docs/adr/0001-unified-work-lifecycle-authority.md`、本spec/plan、`openspec/changes/archive/2026-07-20-unified-work-lifecycle/**`、issue #4相關既有Monitor files/tests、stale active change paths。
 
 1. 核對issue #14與related issue，不建立重複umbrella。
 2. 完成並validate本change。

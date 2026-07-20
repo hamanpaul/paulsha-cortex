@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Changed
+- **Unified work lifecycle OpenSpec完成正式封存**：所有33項實作與canary工作已有可驗證證據，official CLI將change搬入日期archive，並把governed delivery、persona workflow與unified read model三份規格發佈為canonical specs。
 - **舊 lifecycle canary 以 abandoned 語意封存**：兩個未進入delivery的canary在Manager exact-run abandon後搬入日期archive，保留未勾選tasks並綁定immutable abandon evidence；不建立CompletionRecord，也不宣稱completed或done。
 - **Canonical ship audit保留Job發證時source revision**：evidence reader改以Job自身persisted dispatch revision驗envelope，不再因WorkflowRun current source於PR/provider refresh後前進而誤報binding invalid；run/claim/repo/card/phase與locator/hash仍完整fail-closed重驗。
 - **Cached done可用current semantic draft刷新CompletionRecord**：default snapshot前進時，Manager為`done` journal產生新draft，terminal validator優先完整驗證replacement並於成功後更新cached record ref/hash；沒有replacement仍重驗既有record，conflict或remote mismatch維持fail-closed。
