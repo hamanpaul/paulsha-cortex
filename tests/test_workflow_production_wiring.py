@@ -2236,6 +2236,10 @@ def test_ship_audit_accepts_manager_archive_ancestor_after_retry_build(tmp_path:
         old_head=archive_candidate,
         new_head=archive_candidate,
     )
+    run = registry._manager_update_workflow_run(
+        run.run_id,
+        source_revision="e" * 64,
+    )
     work_bridge._record_manager_ship_job(
         registry=registry,
         state_root=coordinator,
