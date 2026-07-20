@@ -1301,7 +1301,8 @@ class JobRegistry:
                 if job.get("workflow_run_id") == current.run_id
                 and job.get("workflow_phase") == "build"
                 and job.get("workflow_card") == repair_card
-                and job.get("status") in TERMINAL_JOB_STATUSES
+                and job.get("status") == "exited"
+                and job.get("exit_code") == 0
             ]
             if (
                 not terminal_repairs

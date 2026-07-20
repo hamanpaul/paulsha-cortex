@@ -414,38 +414,52 @@ def test_retry_build_recovers_unbound_builder_terminalization(
         facets=("needs_human",),
         gate_status="running",
     )
-    failed_job = registry.create_job(
-        task="wf-demo-subagent-build",
-        persona="builder",
-        branch="feature/demo",
-        pane="",
-        worktree=str(tmp_path),
-        dispatch_head=HEAD,
-        executor="codex",
-        model_id="gpt-primary",
-        independence_domain="openai",
-        workflow_run_id=initial.run_id,
-        workflow_claim_key=initial.claim_key,
-        workflow_repo=initial.repo,
-        workflow_card=repair_card,
-        workflow_phase="build",
-        workflow_repo_root=str(tmp_path),
-        workflow_input_root=str(tmp_path),
-        source_revision=initial.source_revision,
-    )
+    job_args = {
+        "task": "wf-demo-subagent-build",
+        "persona": "builder",
+        "branch": "feature/demo",
+        "pane": "",
+        "worktree": str(tmp_path),
+        "dispatch_head": HEAD,
+        "executor": "codex",
+        "model_id": "gpt-primary",
+        "independence_domain": "openai",
+        "workflow_run_id": initial.run_id,
+        "workflow_claim_key": initial.claim_key,
+        "workflow_repo": initial.repo,
+        "workflow_card": repair_card,
+        "workflow_phase": "build",
+        "workflow_repo_root": str(tmp_path),
+        "workflow_input_root": str(tmp_path),
+        "source_revision": initial.source_revision,
+    }
+    failed_job = registry.create_job(**job_args)
     registry.update_headless_result(
-        failed_job["job_id"], status="exited", exit_code=0
+        failed_job["job_id"], status="failed", exit_code=1
     )
+    action_args = {
+        "action": "retry-build",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "issue": 12,
+        "actor": "operator",
+        "expected_candidate": HEAD,
+    }
+    with pytest.raises(ValueError, match="unbound terminal builder evidence"):
+        work_actions.execute_work_action(
+            args=action_args,
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            workflow_registry=registry,
+        )
 
+    successful_job = registry.create_job(**job_args)
+    registry.update_headless_result(
+        successful_job["job_id"], status="exited", exit_code=0
+    )
     result = work_actions.execute_work_action(
-        args={
-            "action": "retry-build",
-            "repo": "acme/demo",
-            "work_id": "demo",
-            "issue": 12,
-            "actor": "operator",
-            "expected_candidate": HEAD,
-        },
+        args=action_args,
         requested_by="operator",
         snapshot_path=snapshot,
         state_path=tmp_path / "runs.json",
@@ -458,7 +472,7 @@ def test_retry_build_recovers_unbound_builder_terminalization(
     assert reset.candidate_head == HEAD
     assert reset.facets == ()
     assert reset.attempts["build"] == 3
-    assert registry.get_job(failed_job["job_id"])["workflow_evidence"] is None
+    assert registry.get_job(successful_job["job_id"])["workflow_evidence"] is None
     assert "declared input snapshots" in str(
         next(step for step in reset.steps if step.card == repair_card).action
     )
