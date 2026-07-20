@@ -1463,24 +1463,31 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise RuntimeError(
+                "workflow abandon evidence temporary collision"
+            ) from error
+        try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fchmod(handle.fileno(), 0o444)
                 os.fsync(handle.fileno())
-            os.link(temporary, target)
-            directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except FileExistsError:
-            if (
-                target.is_symlink()
-                or target.read_bytes() != content
-                or target.stat().st_mode & 0o222
-            ):
-                raise RuntimeError("workflow abandon evidence conflict")
+                os.link(temporary, target)
+            except FileExistsError:
+                if (
+                    target.is_symlink()
+                    or target.read_bytes() != content
+                    or target.stat().st_mode & 0o222
+                ):
+                    raise RuntimeError("workflow abandon evidence conflict")
+            else:
+                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
     return {"ref": str(target), "hash": digest}

@@ -518,6 +518,39 @@ def test_abandon_evidence_is_immutable_at_link_creation(
     assert evidence.stat().st_mode & 0o222 == 0
 
 
+def test_abandon_evidence_temp_collision_preserves_foreign_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    digest = work_actions.verification.canonical_json_hash(body)
+    root = tmp_path / "evidence" / "work-abandon"
+    root.mkdir(parents=True)
+    target = root / f"{body['run_id']}-{digest}.json"
+    temporary = root / f".{target.name}.collision.tmp"
+    temporary.write_text("foreign temporary\n", encoding="utf-8")
+    monkeypatch.setattr(
+        work_actions,
+        "uuid4",
+        lambda: SimpleNamespace(hex="collision"),
+    )
+
+    with pytest.raises(RuntimeError, match="temporary collision"):
+        work_actions._abandon_record(body, state_path=state)
+
+    assert temporary.read_text(encoding="utf-8") == "foreign temporary\n"
+    assert not target.exists()
+
+
 def test_review_attest_writes_immutable_exact_head_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
