@@ -1431,17 +1431,18 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
     elif archive_applied:
         repair_action = (
             "Repair the exact Candidate after a post-archive verification or review failure. "
-            "Preserve the Manager-owned official OpenSpec archive and fix only real Candidate "
-            "failures identified by the current verification/review evidence. Do not recreate the "
-            "active change or claim merge, issue closure, or done. Commit or adopt a tested "
-            "descendant Candidate."
+            "Inspect any existing worktree repair commits. Preserve the Manager-owned official "
+            "OpenSpec archive and fix only real Candidate failures identified by the current "
+            "verification/review evidence. Do not recreate the active change or claim merge, issue "
+            "closure, or done. Commit or adopt a tested descendant Candidate."
         )
     else:
         repair_action = (
-            "Repair the exact Candidate after a delivery preflight failure. Run the authoritative "
-            "preflight, fix only real Candidate failures, and make active OpenSpec tasks describe and "
-            "complete only pre-archive work. Do not claim archive, merge, issue closure, or done before "
-            "Manager performs those actions. Commit or adopt a tested descendant Candidate."
+            "Repair the exact Candidate after a delivery preflight failure. Inspect any existing "
+            "worktree repair commits, run the authoritative preflight, fix only real Candidate "
+            "failures, and make active OpenSpec tasks describe and complete only pre-archive work. "
+            "Do not claim archive, merge, issue closure, or done before Manager performs those "
+            "actions. Commit or adopt a tested descendant Candidate."
         )
     updated = workflow_registry._manager_reset_workflow_for_retry_build(
         run.run_id,

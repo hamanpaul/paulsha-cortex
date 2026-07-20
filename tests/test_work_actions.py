@@ -292,6 +292,9 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
     assert "Commit or adopt a tested descendant Candidate" in str(
         build_steps[-1].action
     )
+    assert "Inspect any existing worktree repair commits" in str(
+        build_steps[-1].action
+    )
     assert all(
         step.gate_result == "pending"
         for step in reset.steps
@@ -376,6 +379,9 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
         next(step for step in reset.steps if step.card == "subagent-build").action
     )
     assert "Commit or adopt a tested descendant Candidate" in str(
+        next(step for step in reset.steps if step.card == "subagent-build").action
+    )
+    assert "Inspect any existing worktree repair commits" in str(
         next(step for step in reset.steps if step.card == "subagent-build").action
     )
 
