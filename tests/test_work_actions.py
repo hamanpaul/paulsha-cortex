@@ -2453,6 +2453,40 @@ def test_v2_authorization_rejects_tampered_maintainer_review_on_replay(tmp_path:
         tree_hash=TREE,
     )
 
+    terminal_authority = authority.__class__._verified(
+        repo=authority.repo,
+        work_id=authority.work_id,
+        mapped_issues=authority.mapped_issues,
+        mapped_prs=authority.mapped_prs,
+        mapped_openspec=authority.mapped_openspec,
+        mapped_todo_paths=authority.mapped_todo_paths,
+        confirmed_todo=authority.confirmed_todo,
+        auto_label=authority.auto_label,
+        snapshot_hash="9" * 64,
+        source_revisions=(*authority.source_revisions, "github-pr:8@state:closed"),
+        provider_id=authority.github_provider_id,
+        provider_revision=authority.github_provider_revision,
+        last_success_epoch=authority.github_last_success_epoch,
+    )
+    assert work_actions.work_authority_digest(terminal_authority) != body["authority_digest"]
+    assert not work_actions._authorization_identity_matches(
+        authorization,
+        active=active,
+        authority=terminal_authority,
+        binding=binding,
+        head=HEAD,
+        tree_hash=TREE,
+    )
+    assert work_actions._authorization_identity_matches(
+        authorization,
+        active=active,
+        authority=terminal_authority,
+        binding=binding,
+        head=HEAD,
+        tree_hash=TREE,
+        terminal_reconciliation=True,
+    )
+
     review.chmod(0o600)
     review.write_text(json.dumps({**review_payload, "verdict": "rejected"}), encoding="utf-8")
     review.chmod(0o444)
@@ -2460,10 +2494,11 @@ def test_v2_authorization_rejects_tampered_maintainer_review_on_replay(tmp_path:
     assert not work_actions._authorization_identity_matches(
         authorization,
         active=active,
-        authority=authority,
+        authority=terminal_authority,
         binding=binding,
         head=HEAD,
         tree_hash=TREE,
+        terminal_reconciliation=True,
     )
 
 

@@ -69,6 +69,13 @@ Merge前 Manager MUST重新讀HEAD、mergeability、checks、threads、closing i
 - **THEN**Manager MUST直接重驗merged journal與remote closure，不得因active planning path已不存在而回退到planning-authority reconciliation
 - **AND**journal identity、Candidate、merge commit或authorization不完整時 MUST維持原本的fail-closed planning reconciliation與ship validator檢查
 
+#### Scenario: Terminal facts使WorkAuthority revision前進
+- **GIVEN**immutable merge authorization精確綁定merge當下的WorkAuthority digest、run、delivery targets、Candidate與tree
+- **AND**PR merge後issue closed、PR closed與OpenSpec archived使current WorkAuthority digest自然前進
+- **WHEN**Manager重播`merged`或cached `done` remote closure
+- **THEN**authorization MUST以其immutable pre-merge digest重驗，不得要求它等於terminal WorkAuthority digest
+- **AND**此例外只適用post-merge terminal reconciliation；merge-authorized與merge前所有gate仍 MUST精確等於current WorkAuthority digest，且evidence wrapper/ref/hash/review binding任一drift仍 MUST fail-closed
+
 Existing PR metadata transaction的title/body PATCH、labels PUT與後續PR/issue identity reread MAY只在明確HTTP 502/503/504時以finite bounded delay重試；這些操作 MUST保持冪等且每次成功後仍完整reread。PR create、Candidate push、review request、merge與其他delivery side effect MUST NOT取得此retry authority。Auth、rate-limit、其他HTTP error或malformed response MUST立即fail-closed。
 
 Manager MUST在existing PR metadata write前先authenticated reread PR title/body與issue labels；三者與canonical metadata全部精確一致時 MUST NOT發出PATCH或PUT。任一欄drift時才 MAY執行冪等PATCH/PUT，且成功後 MUST再次完整reread並驗exact identity。Initial reread、post-write reread或shape validation任一失敗 MUST fail-closed，MUST NOT把write omission解釋為未驗證的skip。
