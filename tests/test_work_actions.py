@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 import subprocess
@@ -483,6 +484,38 @@ def test_abandon_supersedes_exact_pre_delivery_run_with_immutable_reason(
             state_path=state,
             workflow_registry=registry,
         )
+
+
+def test_abandon_evidence_is_immutable_at_link_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "runs.json"
+    body = {
+        "schema": "cortex-work-abandon/v1",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "run_id": "workflow-" + "a" * 20,
+        "authority_digest": "b" * 64,
+        "actor": "operator",
+        "reason": "Superseded by the terminal canary.",
+    }
+    real_link = os.link
+
+    def crash_after_link(source, target):
+        real_link(source, target)
+        assert Path(target).stat().st_mode & 0o222 == 0
+        raise RuntimeError("simulated crash after link")
+
+    monkeypatch.setattr(os, "link", crash_after_link)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        work_actions._abandon_record(body, state_path=state)
+
+    monkeypatch.setattr(os, "link", real_link)
+    replay = work_actions._abandon_record(body, state_path=state)
+    evidence = Path(replay["ref"])
+    assert evidence.is_file()
+    assert evidence.stat().st_mode & 0o222 == 0
 
 
 def test_review_attest_writes_immutable_exact_head_evidence(

@@ -1466,9 +1466,9 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
+                os.fchmod(handle.fileno(), 0o444)
                 os.fsync(handle.fileno())
             os.link(temporary, target)
-            os.chmod(target, 0o444)
             directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_fd)
