@@ -1267,10 +1267,12 @@ class JobRegistry:
         current = self._workflows[index]
         if (
             current.status != "ongoing"
-            or current.current_phase not in {"verify", "review"}
+            or current.current_phase not in {"build", "verify", "review"}
             or "needs_human" not in current.facets
         ):
-            raise ValueError("retry-build reset requires active needs_human verify/review workflow")
+            raise ValueError(
+                "retry-build reset requires active needs_human build/verify/review workflow"
+            )
         if current.candidate_head != expected_candidate:
             raise ValueError("retry-build reset Candidate CAS mismatch")
         if not isinstance(repair_action, str) or not repair_action:
@@ -1282,7 +1284,33 @@ class JobRegistry:
         ):
             raise ValueError("retry-build reset refuses active workflow job")
         build_steps = [step for step in current.steps if step.phase == "build"]
-        if not build_steps or any(step.gate_result != "passed" for step in build_steps):
+        if not build_steps:
+            raise ValueError("retry-build reset requires build phase")
+        repair_card = build_steps[-1].card
+        if current.current_phase == "build":
+            if (
+                any(step.gate_result != "passed" for step in build_steps[:-1])
+                or build_steps[-1].gate_result != "pending"
+            ):
+                raise ValueError(
+                    "retry-build reset requires only the final builder card pending"
+                )
+            terminal_repairs = [
+                job
+                for job in self._jobs
+                if job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_phase") == "build"
+                and job.get("workflow_card") == repair_card
+                and job.get("status") in TERMINAL_JOB_STATUSES
+            ]
+            if (
+                not terminal_repairs
+                or terminal_repairs[-1].get("workflow_evidence") is not None
+            ):
+                raise ValueError(
+                    "retry-build reset requires unbound terminal builder evidence"
+                )
+        elif any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-build reset requires completed build phase")
         passed_ship_steps = [
             step
@@ -1299,7 +1327,6 @@ class JobRegistry:
             raise ValueError(
                 "retry-build reset only permits Manager-owned archive authority"
             )
-        repair_card = build_steps[-1].card
         steps = tuple(
             replace(
                 step,

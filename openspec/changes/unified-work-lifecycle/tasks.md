@@ -46,6 +46,7 @@
 - [x] 3.14 RED-test並修正existing-PR metadata transaction：title/body PATCH、labels PUT及identity reread僅對HTTP 502/503/504 bounded retry；create/push/merge side effect維持單次fail-closed。
 - [x] 3.15 RED-test並修正exact metadata冪等性：先authenticated reread title/body/labels，全部一致時不發PATCH/PUT；只有drift才write並再次完整reread。
 - [x] 3.16 RED-test並修正delivery finding閉環：`fix-required`由trusted adapter fail-closed映射為`needs_human`，使operator可用exact-Candidate `retry-build`重開builder。
+- [x] 3.17 RED-test並修正builder terminalization recovery：final builder job已terminal但immutable evidence未綁定時，允許exact-Candidate `retry-build`在窄化build phase重派；前置build、job狀態與input snapshot維持fail-closed。
 
 ## 4. PR D — Bootstrap, docs, deployment, canary
 

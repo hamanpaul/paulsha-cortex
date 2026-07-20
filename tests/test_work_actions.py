@@ -374,6 +374,96 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
     )
 
 
+def test_retry_build_recovers_unbound_builder_terminalization(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    initial = work_actions._fallback_workflow_starter(
+        registry, tmp_path / "runs.json"
+    )(authority, work_actions._expected_claim_key(authority), None)
+    repair_card = next(
+        step.card for step in reversed(initial.steps) if step.phase == "build"
+    )
+    terminalization_failed = tuple(
+        replace(step, gate_result="passed")
+        if step.phase == "build" and step.card != repair_card
+        else replace(step, gate_result="pending")
+        if step.phase == "build"
+        else replace(
+            step,
+            executor="cortex-manager",
+            model="deterministic",
+            domain="cortex",
+            gate_result="passed",
+        )
+        if step.phase == "ship" and step.card == "openspec-archive"
+        else step
+        for step in initial.steps
+    )
+    for phase in ("plan", "build"):
+        registry._manager_update_workflow_run(initial.run_id, current_phase=phase)
+    registry._manager_update_workflow_run(
+        initial.run_id,
+        steps=terminalization_failed,
+        attempts={"build": 2},
+        candidate_head=HEAD,
+        facets=("needs_human",),
+        gate_status="running",
+    )
+    failed_job = registry.create_job(
+        task="wf-demo-subagent-build",
+        persona="builder",
+        branch="feature/demo",
+        pane="",
+        worktree=str(tmp_path),
+        dispatch_head=HEAD,
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        workflow_run_id=initial.run_id,
+        workflow_claim_key=initial.claim_key,
+        workflow_repo=initial.repo,
+        workflow_card=repair_card,
+        workflow_phase="build",
+        workflow_repo_root=str(tmp_path),
+        workflow_input_root=str(tmp_path),
+        source_revision=initial.source_revision,
+    )
+    registry.update_headless_result(
+        failed_job["job_id"], status="exited", exit_code=0
+    )
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "actor": "operator",
+            "expected_candidate": HEAD,
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        workflow_registry=registry,
+    )
+
+    reset = registry.get_workflow_run(initial.run_id)
+    assert result["result"]["action"] == "retry-build"
+    assert reset.current_phase == "build"
+    assert reset.candidate_head == HEAD
+    assert reset.facets == ()
+    assert reset.attempts["build"] == 3
+    assert registry.get_job(failed_job["job_id"])["workflow_evidence"] is None
+    assert "declared input snapshots" in str(
+        next(step for step in reset.steps if step.card == repair_card).action
+    )
+
+
 def test_review_attest_writes_immutable_exact_head_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

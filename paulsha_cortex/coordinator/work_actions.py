@@ -1410,8 +1410,8 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
     run = active[0]
     if "needs_human" not in run.facets:
         raise RuntimeError("retry-build requires needs_human workflow")
-    if run.current_phase not in {"verify", "review"}:
-        raise RuntimeError("retry-build requires verify/review workflow")
+    if run.current_phase not in {"build", "verify", "review"}:
+        raise RuntimeError("retry-build requires build/verify/review workflow")
     if run.candidate_head != expected_candidate.lower():
         raise RuntimeError("retry-build expected Candidate CAS mismatch")
     archive_applied = any(
@@ -1420,7 +1420,15 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         and step.gate_result == "passed"
         for step in run.steps
     )
-    if archive_applied:
+    if run.current_phase == "build":
+        repair_action = (
+            "Recover the exact Candidate after a builder terminalization failure. Preserve all "
+            "declared input snapshots and inspect any existing unbound worktree commits before "
+            "changing files. Fix only real Candidate failures, preserve any Manager-owned official "
+            "OpenSpec archive, and do not recreate the active change or claim merge, issue closure, "
+            "or done. Commit or adopt a tested descendant Candidate."
+        )
+    elif archive_applied:
         repair_action = (
             "Repair the exact Candidate after a post-archive verification or review failure. "
             "Preserve the Manager-owned official OpenSpec archive and fix only real Candidate "
