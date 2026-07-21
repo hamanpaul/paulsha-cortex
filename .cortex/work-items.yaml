@@ -25,6 +25,15 @@ work_items:
         ref: hamanpaul/paulsha-cortex#27
       - kind: openspec
         ref: docs-only-lifecycle-canary-v2
+  porcelain-skeleton:
+    title: porcelain routing skeleton (B1)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#87
+      - kind: openspec
+        ref: porcelain-skeleton
+      - kind: path
+        ref: docs/superpowers/workstreams/porcelain-skeleton/todo.md
   add-cortex-version-flag:
     title: cortex --version flag (porcelain dogfood canary)
     links:
