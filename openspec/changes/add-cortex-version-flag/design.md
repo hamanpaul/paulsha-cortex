@@ -1,3 +1,8 @@
+---
+status: accepted
+work_item: add-cortex-version-flag
+---
+
 # Design
 
 ## Decisions

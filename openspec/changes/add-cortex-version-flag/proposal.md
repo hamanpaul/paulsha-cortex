@@ -1,6 +1,11 @@
 ---
+status: accepted
 work_item: add-cortex-version-flag
 ---
+
+## Goals
+
+驗證 coordinator 全自動交付鏈（dogfood canary），並補上 release 工程需要的版本可見性。
 
 ## Why
 

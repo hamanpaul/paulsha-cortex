@@ -5,6 +5,10 @@ work_item: add-cortex-version-flag
 
 # add-cortex-version-flag Design
 
+## Goals
+
+以最小、可驗證的變更補上 cortex 版本可見性，同時作為 dogfood 管線的 canary 標的；設計上優先「不動既有行為」與「零新增依賴」。
+
 ## Decisions
 
 ### 實作位置

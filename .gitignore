@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 build/
 *.egg-info/
+
+# dogfood runtime 殘留（daemon cwd=repo root 時產生）
+/runtime/
+/.dogfood-specs/
