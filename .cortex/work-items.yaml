@@ -34,6 +34,10 @@ work_items:
         ref: add-cortex-version-flag
       - kind: path
         ref: docs/superpowers/workstreams/add-cortex-version-flag/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/add-cortex-version-flag-spec.md
+      - kind: path
+        ref: docs/superpowers/plans/add-cortex-version-flag.md
   terminal-lifecycle-canary:
     title: Unified lifecycle terminal live canary
     links:
