@@ -4998,10 +4998,18 @@ def _workflow_job_prompt(
         "test_policy": step.test_policy or fallback[3],
         "terminal_schema": terminal_schema,
     }
+    if run.openspec_refs:
+        contract["openspec_ref"] = run.openspec_refs[0]
     if builder_job_id is not None:
         contract["builder_job_id"] = builder_job_id
     if candidate_checkout is not None:
         contract["candidate_checkout"] = candidate_checkout
+    effective_commit_policy = step.commit_policy or fallback[2]
+    tasks_path = (
+        f"openspec/changes/{contract['openspec_ref']}/tasks.md"
+        if isinstance(contract.get("openspec_ref"), str)
+        else "openspec/changes/<change>/tasks.md"
+    )
     planner_contract = (
         " This planner card is read-only: use the disposable checkout only, do not edit files, and "
         "return only existing manifest-declared artifacts."
@@ -5017,6 +5025,12 @@ def _workflow_job_prompt(
         if step.persona == "reviewer"
         else ""
     )
+    commit_required_contract = (
+        f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
+        "and never modify pinned input files such as the plan document."
+        if effective_commit_policy == "required"
+        else ""
+    )
     return (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
         "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
@@ -5028,6 +5042,7 @@ def _workflow_job_prompt(
         "null."
         + planner_contract
         + reviewer_contract
+        + commit_required_contract
         + " Contract: "
         + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )

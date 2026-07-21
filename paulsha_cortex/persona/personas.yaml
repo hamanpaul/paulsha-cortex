@@ -22,7 +22,7 @@ roles:
     version: "2.0.0"
     summary: implements approved build slices within bounded scope (copilot first, fixers after)
     allowed_phases: [build]
-    write_paths: ["paulsha_cortex/**", "tests/**", "openspec/changes/archive/**"]
+    write_paths: ["paulsha_cortex/**", "tests/**", "openspec/changes/archive/**", "openspec/changes/**", "changelog.d/**", "CHANGELOG.md", "docs/superpowers/plans/**"]
     allowed_tools: ["python -m unittest", "rg", "edit", "git add", "git commit"]
     skills: [worktree-isolation, tdd-red, subagent-build]
   reviewer:
