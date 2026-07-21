@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import sys
@@ -67,6 +68,13 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
     if not args:
         sys.stderr.write(_USAGE)
         return 2
+    if args[0] == "--version":
+        try:
+            current_version = importlib.metadata.version("paulsha-cortex")
+        except importlib.metadata.PackageNotFoundError:
+            current_version = "0.0.0+unknown"
+        sys.stdout.write(f"cortex {current_version}\n")
+        return 0
     if args[0] in {"-h", "--help"}:
         sys.stdout.write(_HELP)
         return 0
