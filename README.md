@@ -25,6 +25,7 @@ persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role p
 ```bash
 pipx install git+https://github.com/hamanpaul/paulsha-cortex.git
 cortex --help
+cortex --version
 ```
 
 也可在專案內直接安裝：
