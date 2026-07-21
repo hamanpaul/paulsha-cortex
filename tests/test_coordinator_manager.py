@@ -13,6 +13,7 @@ from unittest import mock
 from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.autonomy import dispatch_ready
 from paulsha_cortex.coordinator.registry import JobRegistry
+from paulsha_cortex.coordinator.workflow import WorkflowStep
 
 
 class FakeDispatcher:
@@ -225,6 +226,103 @@ class CompleteTickDoneTests(unittest.TestCase):
             self.assertEqual(summary["completed"], [{"slice_id": "slice-a", "gate_status": "needs_human"}])
             self.assertFalse(manager.autonomy.default_is_satisfied("slice-a", handoff_dir=str(hdir)))
             self.assertEqual(summary["errors"], [])
+
+
+class WorkflowJobPromptTests(unittest.TestCase):
+    def _run(self, *, openspec_refs: tuple[str, ...] = ("issue-116",)) -> SimpleNamespace:
+        return SimpleNamespace(
+            run_id="run-1",
+            work_id="work-1",
+            repo="owner/repo",
+            source_revision="a" * 40,
+            candidate_head=None,
+            openspec_refs=openspec_refs,
+        )
+
+    def test_commit_required_build_card_prompt_includes_tasks_guidance(self) -> None:
+        step = WorkflowStep(
+            phase="build",
+            persona="builder",
+            card="subagent-build",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=(),
+        )
+
+        prompt = manager._workflow_job_prompt(
+            self._run(),
+            step,
+            builder_job_id="job-1",
+            coordinator_root="/tmp/coordinator",
+        )
+
+        self.assertIn("openspec/changes/issue-116/tasks.md checkboxes", prompt)
+        self.assertIn("never modify pinned input files such as the plan document", prompt)
+
+    def test_commit_required_build_card_without_openspec_ref_uses_generic_tasks_path(self) -> None:
+        step = WorkflowStep(
+            phase="build",
+            persona="builder",
+            card="tdd-red",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=(),
+        )
+
+        prompt = manager._workflow_job_prompt(
+            self._run(openspec_refs=()),
+            step,
+            builder_job_id="job-1",
+            coordinator_root="/tmp/coordinator",
+        )
+
+        self.assertIn("openspec/changes/<change>/tasks.md checkboxes", prompt)
+        self.assertIn("never modify pinned input files such as the plan document", prompt)
+
+    def test_non_commit_required_cards_do_not_include_tasks_guidance(self) -> None:
+        worktree_step = WorkflowStep(
+            phase="build",
+            persona="builder",
+            card="worktree-isolation",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=(),
+        )
+        verification_step = WorkflowStep(
+            phase="verify",
+            persona="reviewer",
+            card="verification",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=("reports/verify/work-1.md",),
+        )
+
+        worktree_prompt = manager._workflow_job_prompt(
+            self._run(),
+            worktree_step,
+            builder_job_id=None,
+            coordinator_root="/tmp/coordinator",
+        )
+        verification_prompt = manager._workflow_job_prompt(
+            self._run(),
+            verification_step,
+            builder_job_id="job-1",
+            coordinator_root="/tmp/coordinator",
+            candidate_checkout="candidate",
+        )
+
+        self.assertNotIn("tasks.md checkboxes", worktree_prompt)
+        self.assertNotIn("never modify pinned input files", worktree_prompt)
+        self.assertNotIn("tasks.md checkboxes", verification_prompt)
+        self.assertNotIn("never modify pinned input files", verification_prompt)
 
 
 class CompleteTickFailedAndInFlightTests(unittest.TestCase):

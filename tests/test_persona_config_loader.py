@@ -55,8 +55,16 @@ class LoadCatalogTests(unittest.TestCase):
 
     def test_contract_catalog_sourced_from_yaml(self) -> None:
         self.assertEqual(
-            set(contract.PERSONA_CATALOG["builder"].write_paths),
-            {"paulsha_cortex/**", "tests/**", "openspec/changes/archive/**"},
+            list(contract.PERSONA_CATALOG["builder"].write_paths),
+            [
+                "paulsha_cortex/**",
+                "tests/**",
+                "openspec/changes/archive/**",
+                "openspec/changes/**",
+                "changelog.d/**",
+                "CHANGELOG.md",
+                "docs/superpowers/plans/**",
+            ],
         )
 
     def test_malformed_yaml_fails_closed(self) -> None:
@@ -86,6 +94,12 @@ class RoleV2ScopeTests(unittest.TestCase):
     def test_builder_archive_yes_push_no_commit_yes(self) -> None:
         self.assertTrue(
             self.rail.evaluate_filesystem(role="builder", path="openspec/changes/archive/x/spec.md").allowed
+        )
+        self.assertTrue(
+            self.rail.evaluate_filesystem(role="builder", path="openspec/changes/x/tasks.md").allowed
+        )
+        self.assertTrue(
+            self.rail.evaluate_filesystem(role="builder", path="changelog.d/116-builder-deliverables.md").allowed
         )
         self.assertFalse(self.rail.evaluate_tool(role="builder", tool="git push").allowed)
         self.assertTrue(self.rail.evaluate_tool(role="builder", tool="git commit").allowed)
