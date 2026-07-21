@@ -1036,18 +1036,23 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         "candidate": "a" * 40,
         "outputs": [],
     }) + "\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="did not pass"):
-        manager.resume_workflow_run(
-            ResumeDispatcher(),
-            run_id=run.run_id,
-            identities=identities,
-            launcher_factory=lambda _: Launcher(),
-            coordinator_root=tmp_path / "coordinator",
-            operator_resume=True,
-        )
-    assert registry.get_workflow_run(run.run_id).facets == ("needs_human",)
-    assert len(registry.list_jobs()) == 1
-    log.write_text(json.dumps({
+    malformed = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=tmp_path / "coordinator",
+        operator_resume=True,
+    )
+    assert malformed["reason"] == "card-terminal-malformed-retry"
+    assert malformed["job_id"] != old_job["job_id"]
+    assert registry.get_workflow_run(run.run_id).facets == ()
+    assert len(registry.list_jobs()) == 2
+    assert registry.get_job(old_job["job_id"])["workflow_evidence"] is None
+    retry_job = registry.get_job(malformed["job_id"])
+    retry_log = Path(retry_job["log_path"])
+    retry_log.parent.mkdir(parents=True, exist_ok=True)
+    retry_log.write_text(json.dumps({
         "schema_version": 1,
         "kind": "workflow-card",
         "status": "needs_human",
@@ -1056,6 +1061,12 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         "candidate": "a" * 40,
         "outputs": [],
     }) + "\n", encoding="utf-8")
+    registry.update_headless_result(retry_job["job_id"], status="exited", exit_code=0)
+    registry._manager_update_workflow_run(
+        run.run_id,
+        facets=("needs_human",),
+        gate_status="running",
+    )
 
     result = manager.resume_workflow_run(
         ResumeDispatcher(),
@@ -1115,6 +1126,180 @@ def test_nonpassing_terminal_retry_authority_requires_exact_schema_and_binding(
 
     log.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     assert manager._retryable_nonpassing_workflow_terminal({**job, "exit_code": False}) is False
+
+
+def test_malformed_workflow_card_terminal_detects_unterminalizable_card_results(
+    tmp_path: Path,
+) -> None:
+    log = tmp_path / "terminal.jsonl"
+    job = {
+        "workflow_evidence": None,
+        "status": "exited",
+        "exit_code": 0,
+        "workflow_phase": "build",
+        "workflow_run_id": "run",
+        "workflow_card": "card",
+        "log_path": str(log),
+    }
+    good = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+
+    log.write_text(json.dumps({**good, "candidate": None}) + "\n", encoding="utf-8")
+    assert manager._malformed_workflow_card_terminal(job) is True
+
+    for status in ("failed", "needs_human"):
+        log.write_text(json.dumps({**good, "status": status}) + "\n", encoding="utf-8")
+        assert manager._malformed_workflow_card_terminal(job) is False
+
+    for status in ("failed", "needs_human"):
+        log.write_text(
+            json.dumps({**good, "status": status, "candidate": None}) + "\n",
+            encoding="utf-8",
+        )
+        assert manager._malformed_workflow_card_terminal(job) is True
+
+    log.write_text(json.dumps({**good, "status": "done"}) + "\n", encoding="utf-8")
+    assert manager._malformed_workflow_card_terminal(job) is True
+
+    log.write_text(json.dumps(good) + "\n", encoding="utf-8")
+    assert manager._malformed_workflow_card_terminal(job) is False
+
+
+def test_operator_resume_retries_malformed_build_terminal_without_advancing(
+    tmp_path: Path,
+) -> None:
+    operator_root = tmp_path / "operator"
+    builder_root = tmp_path / "builder"
+    coordinator_root = tmp_path / "coordinator"
+    operator_root.mkdir()
+    builder_root.mkdir()
+    plan_ref = "docs/superpowers/plans/production-wiring-plan.md"
+    plan = operator_root / plan_ref
+    plan.parent.mkdir(parents=True)
+    plan.write_text("---\nstatus: accepted\n---\n# Plan\n## Steps\n- Reproduce\n", encoding="utf-8")
+    registry = JobRegistry(state_path=coordinator_root / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(operator_root),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"build": 1},
+        gate_status="running",
+        planning_authority=(
+            PlanningArtifactAuthority(
+                ref=plan_ref,
+                kind="plan",
+                work_id="production-wiring",
+                baseline_sha256=hashlib.sha256(plan.read_bytes()).hexdigest(),
+            ),
+        ),
+    )
+    step = manager._current_workflow_step(run)
+    assert step is not None
+    assert step.phase == "build"
+    log = tmp_path / "malformed-build.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-card",
+                "status": "passed",
+                "run_id": run.run_id,
+                "card_id": step.card,
+                "candidate": None,
+                "outputs": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    legacy = registry.create_job(
+        task="wf-malformed-build",
+        persona="builder",
+        kind="build",
+        branch="feature/14-production-wiring",
+        pane="",
+        worktree=str(builder_root),
+        dispatch_head="a" * 40,
+        executor="codex",
+        model_id="gpt-primary",
+        independence_domain="openai",
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=step.card,
+        workflow_phase=step.phase,
+        workflow_repo_root=str(builder_root),
+        workflow_input_root=str(builder_root),
+        workflow_inputs=manager._effective_workflow_inputs(run, step),
+        workflow_outputs=step.outputs,
+        source_revision=run.source_revision,
+    )
+    registry.attach_launch_handle(
+        legacy["job_id"],
+        executor="codex",
+        model_id="gpt-primary",
+        session_name="wf-malformed-build",
+        log_path=str(log),
+    )
+    registry.update_headless_result(legacy["job_id"], status="exited", exit_code=0)
+    identities = IdentityRegistry.from_rows(
+        [{
+            "executor": "codex",
+            "model_id": "gpt-primary",
+            "independence_domain": "openai",
+            "capabilities": [],
+        }]
+    )
+
+    class Launcher:
+        def as_commit_required(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            return LaunchHandle(
+                executor="codex",
+                model_id="gpt-primary",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    class ResumeDispatcher:
+        _registry = registry
+        _git_runner = None
+
+        def poll_headless_done(self, job_id):
+            return registry.get_job(job_id)
+
+    result = manager.resume_workflow_run(
+        ResumeDispatcher(),
+        run_id=run.run_id,
+        identities=identities,
+        launcher_factory=lambda _identity: Launcher(),
+        coordinator_root=coordinator_root,
+        operator_resume=True,
+    )
+
+    assert result["reason"] == "card-terminal-malformed-retry"
+    assert result["current_phase"] == "build"
+    assert result["job_id"] != legacy["job_id"]
+    assert registry.get_job(legacy["job_id"])["workflow_evidence"] is None
+    assert registry.get_workflow_run(run.run_id).current_phase == "build"
 
 
 def test_operator_resume_recovers_only_exact_legacy_agy_reviewer_terminal(
@@ -1816,6 +2001,17 @@ def test_build_input_snapshot_seeds_hash_bound_plan_and_versions_prompt(tmp_path
     assert payload["terminal_schema"]["fixed"]["outputs"] == []
     assert payload["terminal_schema"]["outputs"]["descriptive_objects_forbidden"] is True
     assert Path(snapshot[0]["content_ref"]).stat().st_mode & 0o222 == 0
+    prompt = manager._workflow_job_prompt(
+        run,
+        red,
+        builder_job_id=None,
+        coordinator_root=tmp_path / "coordinator",
+        input_snapshot=snapshot,
+    )
+    assert "40-hex" in prompt
+    assert "rev-parse HEAD" in prompt
+    assert "must never be null" in prompt
+    assert "must be null" in prompt
 
 
 def test_input_content_tamper_is_rejected_by_prompt_and_terminal_validation(tmp_path: Path) -> None:
@@ -2944,6 +3140,98 @@ def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Pat
     first_sandbox = Path(first["worktree"])
     (first_sandbox / "failed-attempt-marker").write_text("stale\n", encoding="utf-8")
     registry.update_headless_result(first["job_id"], status="failed", exit_code=1)
+
+    retried = manager.dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=coordinator_root,
+        retry_failed=True,
+    )
+
+    assert retried["job_id"] != first["job_id"]
+    assert Path(retried["worktree"]) == first_sandbox
+    assert not (first_sandbox / "failed-attempt-marker").exists()
+    assert (first_sandbox / "source.md").read_text(encoding="utf-8") == "source\n"
+
+
+def test_malformed_planner_terminal_retry_reuses_cleaned_disposable_sandbox(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "source.md").write_text("source\n", encoding="utf-8")
+    proposal = repo / "openspec/changes/production-wiring/proposal.md"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("# Proposal\n", encoding="utf-8")
+    coordinator_root = tmp_path / "coordinator"
+    registry = JobRegistry(state_path=coordinator_root / "registry.json")
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"plan": 1},
+        gate_status="running",
+    )
+    identities = IdentityRegistry.from_rows(
+        [{
+            "executor": "codex",
+            "model_id": "gpt-primary",
+            "independence_domain": "openai",
+            "capabilities": ["planning"],
+        }]
+    )
+
+    class Launcher:
+        def as_read_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            return LaunchHandle(
+                executor="codex",
+                model_id="gpt-primary",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    first = manager.dispatch_workflow_card(
+        dispatcher,
+        run=run,
+        identities=identities,
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=coordinator_root,
+    )
+    first_sandbox = Path(first["worktree"])
+    (first_sandbox / "failed-attempt-marker").write_text("stale\n", encoding="utf-8")
+    first_log = Path(first["log_path"])
+    first_log.parent.mkdir(parents=True, exist_ok=True)
+    first_log.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-card",
+                "status": "done",
+                "run_id": run.run_id,
+                "card_id": first["workflow_card"],
+                "candidate": None,
+                "outputs": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    registry.update_headless_result(first["job_id"], status="exited", exit_code=0)
 
     retried = manager.dispatch_workflow_card(
         dispatcher,
