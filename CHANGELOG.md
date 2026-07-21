@@ -8,7 +8,6 @@
 ## [Unreleased]
 
 ### Added
-- **`cortex --version` 頂層旗標（add-cortex-version-flag）**：輸出安裝套件版本（importlib.metadata + fallback），exit 0；dogfood canary 首個實機交付批次。
 - **canary follow-ups workstream todo**：記錄 dogfood canary 實跑發現的後續事項，並作為 work authority 的新增 confirmed 來源。
 - **dogfood canary 規劃產物（add-cortex-version-flag）**：為 `cortex --version` canary 批次建立 confirmed Work Item 綁定、accepted 規劃四件套與 active OpenSpec change（`cli-version-reporting`），供 coordinator dogfood 派工消費。
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
