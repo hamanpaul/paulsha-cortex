@@ -9,3 +9,4 @@ work_item: add-cortex-version-flag
 - [x] 1.2 `paulsha_cortex/cli.py` 頂層 `--version` 實作（importlib.metadata + fallback），測試轉 GREEN。
 - [x] 1.3 README CLI 段落補 `--version`；`changelog.d/86-cortex-version-flag.md` 與 `CHANGELOG.md [Unreleased]` 同步。
 - [x] 1.4 builder card 已重跑 `pytest`、`policy_check` 與 `git diff --check` focused preflight。
+- [x] 1.5 post-archive repair：補 `PackageNotFoundError` fallback 測試，並移除 canonical spec EOF 空白行後重跑 focused preflight。

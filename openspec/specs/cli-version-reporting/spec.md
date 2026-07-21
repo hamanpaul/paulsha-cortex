@@ -18,4 +18,3 @@ TBD - created by archiving change add-cortex-version-flag. Update Purpose after 
 - **WHEN** 於未安裝套件 metadata 的開發環境執行 `cortex --version`
 - **THEN** stdout 輸出 fallback 版本字串 `cortex 0.0.0+unknown`
 - **THEN** exit code 為 0
-
