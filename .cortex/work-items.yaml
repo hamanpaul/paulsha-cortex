@@ -25,6 +25,15 @@ work_items:
         ref: hamanpaul/paulsha-cortex#27
       - kind: openspec
         ref: docs-only-lifecycle-canary-v2
+  add-cortex-version-flag:
+    title: cortex --version flag (porcelain dogfood canary)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#86
+      - kind: openspec
+        ref: add-cortex-version-flag
+      - kind: path
+        ref: docs/superpowers/workstreams/add-cortex-version-flag/todo.md
   terminal-lifecycle-canary:
     title: Unified lifecycle terminal live canary
     links:
