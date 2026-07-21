@@ -16,6 +16,7 @@
 - **canary 規劃產物補齊 completeness gate 要求**：openspec change 三件與 workstream Todo 補 `status: accepted` frontmatter 與各 kind 必要章節，`assess_planning_completeness` 全數通過。
 
 ### Changed
+- **canary follow-ups 移至獨立 workstream todo**：符合 Monitor repo provider 固定 todo glob，確實成為 confirmed todo 來源。
 - **canary Work Item 補齊 spec/plan path links**：`.cortex/work-items.yaml` 的 canary 條目補 superpowers spec/plan path links，work authority 完整涵蓋規劃產物。
 - **Unified work lifecycle OpenSpec完成正式封存**：所有33項實作與canary工作已有可驗證證據，official CLI將change搬入日期archive，並把governed delivery、persona workflow與unified read model三份規格發佈為canonical specs。
 - **舊 lifecycle canary 以 abandoned 語意封存**：兩個未進入delivery的canary在Manager exact-run abandon後搬入日期archive，保留未勾選tasks並綁定immutable abandon evidence；不建立CompletionRecord，也不宣稱completed或done。
