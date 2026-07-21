@@ -2726,19 +2726,98 @@ def test_archive_and_pr_metadata_fail_closed_before_mutation(
     assert ["openspec", "archive", "-y", "demo"] not in calls
 
 
-@pytest.mark.parametrize(
-    ("changelog", "policy_stdout", "reason"),
-    [
-        ("## [Unreleased]\n- **other**: done\n", "", "changelog-missing"),
-        (
-            "## [Unreleased]\n- **demo**: done\n",
-            "WARN R-22 doc-reference stale link",
-            "doc-reference-invalid",
-        ),
-    ],
-)
-def test_archive_requires_change_specific_changelog_and_no_doc_reference_warning(
-    tmp_path: Path, changelog: str, policy_stdout: str, reason: str
+def test_archive_requires_change_specific_changelog(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    change_dir = tmp_path / "openspec" / "changes" / "demo"
+    change_dir.mkdir(parents=True)
+    (change_dir / "tasks.md").write_text("- [x] complete\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n- **other**: done\n", encoding="utf-8"
+    )
+
+    def runner(argv, **kwargs):
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="changelog-missing"):
+        work_actions.execute_work_action(
+            args={
+                "action": "ship",
+                "repo": "acme/demo",
+                "work_id": "demo",
+                "repo_root": str(tmp_path),
+                "pr_number": 8,
+                "change": "demo",
+                "todo_paths": ["docs/todo.md"],
+                "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+            },
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=state,
+            now=lambda: 200,
+            runner=runner,
+        )
+
+
+def test_archive_allows_advisory_r22_doc_reference_warning(tmp_path: Path) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    change_dir = tmp_path / "openspec" / "changes" / "demo"
+    change_dir.mkdir(parents=True)
+    (change_dir / "tasks.md").write_text("- [x] complete\n", encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n- **demo**: done\n", encoding="utf-8"
+    )
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["python3", "-m", "policy_check"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="WARN R-22 doc-reference stale link",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    result = work_actions.execute_work_action(
+        args={
+            "action": "ship",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "repo_root": str(tmp_path),
+            "pr_number": 8,
+            "change": "demo",
+            "todo_paths": ["docs/todo.md"],
+            "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        runner=runner,
+    )
+
+    assert result["result"]["action"] == "archive-applied-needs-commit"
+    assert calls[-1] == ["openspec", "archive", "-y", "demo"]
+
+
+def test_archive_blocks_nonzero_policy_check_with_doc_reference_invalid(
+    tmp_path: Path,
 ) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
@@ -2752,13 +2831,20 @@ def test_archive_requires_change_specific_changelog_and_no_doc_reference_warning
     change_dir = tmp_path / "openspec" / "changes" / "demo"
     change_dir.mkdir(parents=True)
     (change_dir / "tasks.md").write_text("- [x] complete\n", encoding="utf-8")
-    (tmp_path / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n- **demo**: done\n", encoding="utf-8"
+    )
 
     def runner(argv, **kwargs):
-        stdout = policy_stdout if argv[:3] == ["python3", "-m", "policy_check"] else ""
-        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        if argv[:3] == ["python3", "-m", "policy_check"]:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="WARN R-22 doc-reference stale link",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    with pytest.raises(RuntimeError, match=reason):
+    with pytest.raises(RuntimeError, match="doc-reference-invalid"):
         work_actions.execute_work_action(
             args={
                 "action": "ship",
