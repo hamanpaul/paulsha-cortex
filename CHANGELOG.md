@@ -13,6 +13,7 @@
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
 
 ### Fixed
+- **archive gate 不再把 R-22 advisory WARN 視為阻斷**：`policy_check` 的 doc reference gate 現在只以 return code 判定，避免既有 diff-aware R-22 advisory WARN 讓所有 archive change 永遠卡在 `doc-reference-invalid`。
 - **Copilot commit-required 卡補 scoped 檔案/工具權限**：workflow builder 派工現在會在 commit-required 模式只開 `--allow-all-tools` 與必要的 linked worktree Git 寫入目錄，避免 headless Copilot 因無法互動授權而卡在 commit。
 - **malformed workflow build 卡改走可重試 recovery**：Manager 現在會把 malformed 的 passed terminal（含 build candidate 缺失）辨識為可重派卡片，避免 operator resume 永久卡死，並在 prompt 明示 build/plan candidate 的回報契約。
 - **canary 規劃產物補齊 completeness gate 要求**：openspec change 三件與 workstream Todo 補 `status: accepted` frontmatter 與各 kind 必要章節，`assess_planning_completeness` 全數通過。

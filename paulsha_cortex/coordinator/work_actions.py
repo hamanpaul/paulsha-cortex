@@ -144,18 +144,10 @@ def _validate_local_archive_inputs(
         path.is_file() and not path.is_symlink() and path.read_text(encoding="utf-8").strip()
         for path in fragments
     )
-    policy_text = "\n".join(
-        str(getattr(policy, field, "")) for field in ("stdout", "stderr")
-    )
-    doc_reference_warning = bool(
-        re.search(r"(?i)(?:R-22.*WARN|WARN.*R-22|doc-reference.*WARN|WARN.*doc-reference)", policy_text)
-    )
     facts = ArchiveGateFacts(
         tasks_complete=bool(task_states) and all(state.lower() == "x" for state in task_states),
         canonical_specs_valid=getattr(canonical, "returncode", None) == 0,
-        doc_references_valid=(
-            getattr(policy, "returncode", None) == 0 and not doc_reference_warning
-        ),
+        doc_references_valid=getattr(policy, "returncode", None) == 0,
         changelog_present=(
             re.search(
                 rf"(?im)^\s*[-*]\s+.*(?<![a-z0-9-]){re.escape(change)}(?![a-z0-9-]).*$",
