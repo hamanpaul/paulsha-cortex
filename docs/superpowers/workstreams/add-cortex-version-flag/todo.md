@@ -1,8 +1,11 @@
 ---
+status: accepted
 work_item: add-cortex-version-flag
 ---
 
 # add-cortex-version-flag Todo
+
+## Tasks
 
 - [ ] 將 issue #86、active OpenSpec change 與本 Todo 綁定為同一 confirmed Work Item。
 - [ ] 由 coordinator 派工 copilot（gpt-5.4）在 worktree 完成 `cortex --version` build（TDD）。

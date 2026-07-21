@@ -1,3 +1,8 @@
+---
+status: accepted
+work_item: add-cortex-version-flag
+---
+
 # Tasks
 
 - [ ] 1.1 新增 `tests/test_cli_version.py`，確認現況 RED。
