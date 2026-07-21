@@ -360,9 +360,16 @@ def build_copilot_argv(
     model: str | None = None,
     read_only: bool = False,
     review_only: bool = False,
+    commit_required: bool = False,
 ) -> list[str]:
+    if commit_required and (read_only or review_only or allow_unsafe):
+        raise ValueError("commit-required Copilot builder requires enforced workspace-write")
     if read_only or review_only:
         raise ValueError("copilot executor has no enforced read-only planning mode")
+    if commit_required:
+        if worktree is None:
+            raise ValueError("commit-required Copilot builder requires a worktree")
+        worktree = str(Path(worktree).resolve())
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
     argv = [
@@ -379,7 +386,12 @@ def build_copilot_argv(
     ]
     if model is not None:
         argv += ["--model", model]
-    if allow_unsafe:
+    if commit_required:
+        argv.append("--allow-all-tools")
+        argv += ["--add-dir", worktree]
+        for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+            argv += ["--add-dir", git_write_dir]
+    elif allow_unsafe:
         argv.append("--allow-all")
     return argv
 
@@ -672,7 +684,7 @@ class SubprocessLauncher:
             "read_only": self._read_only,
             "review_only": self._review_only,
         }
-        if self._executor == "codex":
+        if self._executor in {"codex", "copilot"}:
             builder_kwargs["commit_required"] = self._commit_required
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
