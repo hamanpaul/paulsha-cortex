@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -28,6 +29,104 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("slice-a", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("json", argv)
+
+    def test_copilot_builder_commit_required_scopes_tool_and_git_write_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/copilot-scope", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            argv = build_copilot_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir=str(root / "logs"),
+                worktree=str(linked),
+                commit_required=True,
+            )
+
+            self.assertIn("--allow-all-tools", argv)
+            self.assertNotIn("--allow-all", argv)
+            add_dirs = [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--add-dir"
+            ]
+            self.assertEqual(
+                add_dirs,
+                [
+                    str(linked.resolve()),
+                    str((repo / ".git" / "worktrees" / "linked").resolve()),
+                    str((repo / ".git" / "objects").resolve()),
+                    str((repo / ".git" / "refs" / "heads" / "feature").resolve()),
+                    str((repo / ".git" / "logs" / "refs" / "heads" / "feature").resolve()),
+                ],
+            )
+
+    def test_copilot_builder_commit_required_rejects_incompatible_modes(self) -> None:
+        for kwargs in (
+            {"read_only": True},
+            {"review_only": True},
+            {"allow_unsafe": True},
+        ):
+            with self.assertRaisesRegex(ValueError, "enforced workspace-write"):
+                build_copilot_argv(
+                    prompt="P",
+                    slice_id="s",
+                    log_dir="/lg",
+                    worktree="/wt/slice-a",
+                    commit_required=True,
+                    **kwargs,
+                )
+        with self.assertRaisesRegex(ValueError, "requires a worktree"):
+            build_copilot_argv(
+                prompt="P",
+                slice_id="s",
+                log_dir="/lg",
+                commit_required=True,
+            )
+
+    def test_copilot_builder_commit_required_false_preserves_existing_argv(self) -> None:
+        baseline = build_copilot_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            model="claude-haiku-4.5",
+            allow_unsafe=True,
+        )
+        argv = build_copilot_argv(
+            prompt="P",
+            slice_id="s",
+            log_dir="/lg",
+            worktree="/wt/slice-a",
+            model="claude-haiku-4.5",
+            allow_unsafe=True,
+            commit_required=False,
+        )
+
+        self.assertEqual(argv, baseline)
 
     def test_claude_argv(self) -> None:
         argv = build_claude_argv(
@@ -582,6 +681,71 @@ class ArgvTests(unittest.TestCase):
             launcher_module.subprocess.Popen = original
         script = calls[0]["argv"][2]
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", script)
+
+    def test_subprocess_launcher_copilot_commit_required_adds_scoped_permissions(self) -> None:
+        calls = []
+
+        class _FakeProc:
+            pid = 226
+
+        def _fake_popen(argv, *, cwd, env, stdout, stderr):
+            calls.append({"argv": argv})
+            return _FakeProc()
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo = root / "repo"
+            linked = root / "linked"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Launcher Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "launcher@example.invalid"],
+                check=True,
+            )
+            (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", str(repo), "worktree", "add", "-q",
+                    "-b", "feature/copilot-launch", str(linked), "HEAD",
+                ],
+                check=True,
+            )
+
+            git_write_dirs = launcher_module._linked_worktree_git_write_dirs(str(linked))
+            original = launcher_module.subprocess.Popen
+            launcher_module.subprocess.Popen = _fake_popen
+            try:
+                with mock.patch.object(
+                    launcher_module,
+                    "_linked_worktree_git_write_dirs",
+                    return_value=git_write_dirs,
+                ):
+                    SubprocessLauncher("copilot").as_commit_required().launch(
+                        slice_id="s",
+                        prompt="P",
+                        worktree=str(linked),
+                        log_dir=str(root / "lg"),
+                    )
+            finally:
+                launcher_module.subprocess.Popen = original
+
+            script = calls[0]["argv"][2]
+            inner_argv = shlex.split(script.split(";", 1)[0])
+            self.assertIn("--allow-all-tools", script)
+            self.assertIn(f"--add-dir {shlex.quote(str(linked.resolve()))}", script)
+            self.assertIn(
+                f"--add-dir {shlex.quote(git_write_dirs[0])}",
+                script,
+            )
+            self.assertNotIn("--allow-all", inner_argv)
 
     def test_prompt_is_single_element(self) -> None:
         # prompt 含換行也是單一 argv 元素（headless 的核心保證）

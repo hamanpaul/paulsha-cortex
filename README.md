@@ -102,6 +102,7 @@ python -m pip install .
 6. 日常查詢：
 
    ```bash
+   cortex --version
    cortex status | jq
    cortex jobs
    cortex stat "$JOB_ID"

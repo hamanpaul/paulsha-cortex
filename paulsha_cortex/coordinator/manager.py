@@ -2383,6 +2383,44 @@ def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
     )
 
 
+def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
+    """Recognize plan/build terminals that cannot be bound as a passed workflow-card."""
+
+    if _retryable_nonpassing_workflow_terminal(job):
+        return False
+    if (
+        job.get("workflow_evidence") is not None
+        or job.get("status") != "exited"
+        or type(job.get("exit_code")) is not int
+        or job.get("exit_code") != 0
+        or job.get("workflow_phase") not in {"plan", "build"}
+    ):
+        return False
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError:
+        return True
+    required = {
+        "schema_version", "kind", "status", "run_id", "card_id", "candidate", "outputs",
+    }
+    if (
+        set(raw) != required
+        or type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != 1
+        or raw.get("kind") != "workflow-card"
+    ):
+        return True
+    if raw.get("status") != "passed":
+        return True
+    candidate = raw.get("candidate")
+    if job.get("workflow_phase") == "build":
+        return (
+            not isinstance(candidate, str)
+            or verification.SAFE_SHA_RE.fullmatch(candidate) is None
+        )
+    return candidate is not None
+
+
 def _workflow_review_evidence_state(
     job: Mapping[str, object],
     *,
@@ -3493,6 +3531,7 @@ def _discard_failed_planner_sandbox(
     if job.get("persona") != "planner" or (
         job.get("status") != "failed"
         and not _retryable_nonpassing_workflow_terminal(job)
+        and not _malformed_workflow_card_terminal(job)
     ):
         raise ValueError("planner sandbox retry requires failed planner job")
     path = _planner_sandbox_path(job, coordinator_root)
@@ -4959,10 +4998,18 @@ def _workflow_job_prompt(
         "test_policy": step.test_policy or fallback[3],
         "terminal_schema": terminal_schema,
     }
+    if run.openspec_refs:
+        contract["openspec_ref"] = run.openspec_refs[0]
     if builder_job_id is not None:
         contract["builder_job_id"] = builder_job_id
     if candidate_checkout is not None:
         contract["candidate_checkout"] = candidate_checkout
+    effective_commit_policy = step.commit_policy or fallback[2]
+    tasks_path = (
+        f"openspec/changes/{contract['openspec_ref']}/tasks.md"
+        if isinstance(contract.get("openspec_ref"), str)
+        else "openspec/changes/<change>/tasks.md"
+    )
     planner_contract = (
         " This planner card is read-only: use the disposable checkout only, do not edit files, and "
         "return only existing manifest-declared artifacts."
@@ -4978,14 +5025,24 @@ def _workflow_job_prompt(
         if step.persona == "reviewer"
         else ""
     )
+    commit_required_contract = (
+        f" Before the final commit, update {tasks_path} checkboxes for work completed by this card, "
+        "and never modify pinned input files such as the plan document."
+        if effective_commit_policy == "required"
+        else ""
+    )
     return (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
         "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
         "repo-relative artifact path strings matching declared_outputs; when declared_outputs is "
         "empty, outputs must be exactly []. Never put action, summary, or other descriptive objects "
-        "in outputs."
+        "in outputs. For build cards, candidate must be the full 40-hex commit SHA of the worktree "
+        "HEAD after the card completes (use `git rev-parse HEAD`); commit-forbidden cards must "
+        "report the current HEAD, build candidates must never be null, and plan candidates must be "
+        "null."
         + planner_contract
         + reviewer_contract
+        + commit_required_contract
         + " Contract: "
         + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )
@@ -5029,6 +5086,7 @@ def _dispatch_workflow_card(
                 and (
                     matching[-1].get("status") == "failed"
                     or _retryable_nonpassing_workflow_terminal(matching[-1])
+                    or _malformed_workflow_card_terminal(matching[-1])
                     or _is_rejected_workflow_review_evidence(
                         matching[-1],
                         run=run,
@@ -5649,6 +5707,23 @@ def resume_workflow_run(
             "current_phase": updated.current_phase,
             "job_id": job["job_id"],
             "reason": failure_reason,
+        }
+    if _malformed_workflow_card_terminal(job):
+        replacement = dispatch_workflow_card(
+            dispatcher,
+            run=run,
+            identities=identities,
+            launcher_factory=launcher_factory,
+            coordinator_root=coordinator_root,
+            retry_failed=True,
+        )
+        if replacement is None:
+            return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": "not-dispatchable"}
+        return {
+            "run_id": run.run_id,
+            "current_phase": run.current_phase,
+            "job_id": replacement["job_id"],
+            "reason": "card-terminal-malformed-retry",
         }
     try:
         job = terminalize_workflow_job(
