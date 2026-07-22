@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- **porcelain-request request 追蹤 CLI**：新增唯讀 `cortex request list/show/wait/logs` 家族、versioned `cortex-porcelain/request/v1` JSON 輸出，以及 request timeout 後的顯性追蹤面。
 - **B2 porcelain-request 規劃產物**：request 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-skeleton registry 與頂層路由骨架**：新增 stdlib-only porcelain 命令註冊表、`cortex --help` 動態 porcelain commands 區段，以及 coordinator 透傳前的外掛分派點，供 B2+ 家族各自登記子命令。
 - **porcelain-skeleton rollout 補充規格**：B1 驗收要求與 B2+ 接軌契約。
