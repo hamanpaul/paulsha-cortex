@@ -606,7 +606,7 @@ def test_forced_retry_build_dispatches_new_job_after_prior_success(
                 "executor": "codex",
                 "model_id": "gpt-primary",
                 "independence_domain": "openai",
-                "capabilities": ["planning"],
+                "capabilities": ["build"],
             }]
         ),
         launcher_factory=lambda _: Launcher(),
@@ -1154,7 +1154,7 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         "executor": "codex",
         "model_id": "gpt-primary",
         "independence_domain": "openai",
-        "capabilities": [],
+        "capabilities": ["build"],
     }])
     stopped = manager.resume_workflow_run(
         ResumeDispatcher(),
@@ -1401,7 +1401,7 @@ def test_operator_resume_retries_malformed_build_terminal_without_advancing(
             "executor": "codex",
             "model_id": "gpt-primary",
             "independence_domain": "openai",
-            "capabilities": [],
+            "capabilities": ["build"],
         }]
     )
 
@@ -2351,7 +2351,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                 "executor": "codex",
                 "model_id": "gpt-primary",
                 "independence_domain": "openai",
-                "capabilities": ["planning"],
+                "capabilities": ["planning", "build"],
             },
             {
                 "executor": "claude",
@@ -2968,6 +2968,12 @@ def test_planner_identity_selection_ignores_primary_domain_preference() -> None:
     identities = IdentityRegistry.from_rows(
         [
             {
+                "executor": "copilot",
+                "model_id": "builder-openai",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
                 "executor": "claude",
                 "model_id": "planner-claude",
                 "independence_domain": "anthropic",
@@ -2992,20 +2998,67 @@ def test_planner_identity_selection_ignores_primary_domain_preference() -> None:
     assert (selected.executor, selected.model_id) == ("claude", "planner-claude")
 
 
-def test_builder_identity_selection_still_prefers_primary_domain() -> None:
+def test_builder_identity_selection_requires_build_capability_before_domain_preference() -> None:
     identities = IdentityRegistry.from_rows(
         [
             {
-                "executor": "codex",
+                "executor": "copilot",
                 "model_id": "builder-openai",
                 "independence_domain": "openai",
-                "capabilities": [],
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "planner-claude",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning", "review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google"),
+        SimpleNamespace(persona="builder"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("copilot", "builder-openai")
+
+
+def test_builder_identity_selection_still_prefers_primary_domain_after_build_filter() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "builder-openai",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "planner-claude",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning", "review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
             },
             {
                 "executor": "gemini",
                 "model_id": "builder-google",
                 "independence_domain": "google",
-                "capabilities": [],
+                "capabilities": ["build"],
             },
         ]
     )

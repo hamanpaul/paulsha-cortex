@@ -887,7 +887,7 @@ identities:
   - executor: codex
     model_id: gpt-primary
     independence_domain: openai
-    capabilities: [planning]
+    capabilities: [planning, build]
   - executor: claude
     model_id: claude-reviewer
     independence_domain: anthropic
