@@ -10,14 +10,15 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
+from paulsha_cortex.coordinator import manager_daemon
+from paulsha_cortex.deploy import installer
+
 from . import COMMANDS, PorcelainCommand, register
 from . import inspect as inspect_family
 from . import service as service_family
 
 BOOTSTRAP_SCHEMA = "cortex-porcelain/bootstrap/v1"
-_EXECUTOR_CANDIDATES: tuple[str, ...] = ("copilot", "claude", "codex")
-
-
+_EXECUTOR_CANDIDATES: tuple[str, ...] = ("claude", "codex", "copilot")
 def register_commands() -> None:
     if "bootstrap" in COMMANDS:
         return
@@ -76,7 +77,153 @@ def _git_repo_root(repo_root: Path) -> tuple[bool, str]:
     return True, (result.stdout.strip() or str(repo_root))
 
 
-def run_preflight(*, repo_root: str) -> dict[str, Any]:
+def _executor_status(name: str) -> tuple[bool, str, str | None]:
+    if name == "copilot":
+        argv = [
+            "copilot",
+            "-p",
+            "Respond with OK only.",
+            "--silent",
+            "--allow-all-tools",
+            "--disable-builtin-mcps",
+            "--no-custom-instructions",
+            "--output-format",
+            "json",
+        ]
+        success_detail = "copilot prompt auth ok"
+        login_fix = "請先執行 `copilot login`，或設定 COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN。"
+    elif name == "claude":
+        argv = ["claude", "auth", "status"]
+        success_detail = "claude auth status ok"
+        failure_detail = "claude 已安裝，但尚未登入。"
+        failure_fix = "請先執行 `claude auth login`。"
+    elif name == "codex":
+        try:
+            result = _run(["codex", "doctor", "--json"], timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"codex 認證檢查失敗：{exc}", "請先執行 `codex login`。"
+        if result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                payload = None
+            auth_status = None
+            if isinstance(payload, dict):
+                checks = payload.get("checks")
+                if isinstance(checks, dict):
+                    credentials = checks.get("auth.credentials")
+                    if isinstance(credentials, dict):
+                        auth_status = credentials.get("status")
+            if auth_status == "ok":
+                return True, "codex auth credentials ok", None
+        return False, "codex 已安裝，但尚未登入。", "請先執行 `codex login`。"
+    else:
+        raise ValueError(f"unsupported executor: {name}")
+
+    try:
+        result = _run(argv, timeout=20 if name == "copilot" else 10)
+    except OSError as exc:
+        if name == "copilot":
+            return False, f"copilot 認證檢查失敗：{exc}", "請確認 `copilot` 可執行；若尚未登入，請先執行 `copilot login`。"
+        return False, f"{name} 認證檢查失敗：{exc}", failure_fix
+    except subprocess.TimeoutExpired:
+        if name == "copilot":
+            return (
+                False,
+                "copilot 認證檢查逾時，無法確認登入態。",
+                "請確認 `copilot -p` 可在此機器正常執行；若尚未登入，請先執行 `copilot login`。",
+            )
+        return False, f"{name} 認證檢查逾時。", failure_fix
+    if result.returncode == 0:
+        return True, success_detail, None
+    if name == "copilot":
+        combined = (result.stdout + result.stderr).lower()
+        if any(token in combined for token in ("login", "authenticate", "authorization", "device code")):
+            return False, "copilot 已安裝，但尚未登入。", login_fix
+        return (
+            False,
+            "copilot 啟動失敗，無法確認登入態。",
+            "請先確認 `copilot -p 'Respond with OK only.' --silent --allow-all-tools --disable-builtin-mcps --no-custom-instructions --output-format json` 可正常執行；若尚未登入，請先執行 `copilot login`。",
+        )
+    return False, failure_detail, failure_fix
+
+
+def _instance_runtime_env_path(instance: str) -> Path:
+    home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+    return home / ".agents" / "core" / "runtime" / f"{instance}.env"
+
+
+def _read_runtime_env_strict(path: Path) -> dict[str, str]:
+    return installer._read_plain_env(path)
+
+
+def _validate_persisted_executor(name: str, *, source: str) -> None:
+    if name and name not in _EXECUTOR_CANDIDATES:
+        raise ValueError(f"{source} PSC_MANAGER_EXECUTOR 不支援：{name}")
+
+
+def _effective_executor(instance: str) -> tuple[str, str]:
+    managed = _read_runtime_env_strict(service_family._runtime_env_path(instance))
+    runtime = _read_runtime_env_strict(_instance_runtime_env_path(instance))
+    _validate_persisted_executor(
+        managed.get("PSC_MANAGER_EXECUTOR", "").strip(),
+        source="manager env",
+    )
+    _validate_persisted_executor(
+        runtime.get("PSC_MANAGER_EXECUTOR", "").strip(),
+        source="instance env",
+    )
+    override = os.environ.get("PSC_MANAGER_EXECUTOR", "").strip()
+    if override:
+        return override, "process-env"
+    persisted = managed.get("PSC_MANAGER_EXECUTOR", "").strip()
+    if persisted:
+        return persisted, "installed-manager-env"
+    runtime_executor = runtime.get("PSC_MANAGER_EXECUTOR", "").strip()
+    if runtime_executor:
+        return runtime_executor, "installed-instance-env"
+    return manager_daemon.DEFAULT_EXECUTOR, "default"
+
+
+def _executor_preflight(*, instance: str) -> dict[str, Any]:
+    try:
+        effective_executor, source = _effective_executor(instance)
+    except ValueError as exc:
+        return _preflight_check(
+            "executor",
+            False,
+            f"runtime executor 設定無效：{exc}",
+            fix="請先移除或修正 `$HOME/.agents/core/runtime/*.env` 的 symlink/格式錯誤，再重新執行 `cortex bootstrap`。",
+        )
+    if effective_executor not in _EXECUTOR_CANDIDATES:
+        return _preflight_check(
+            "executor",
+            False,
+            f"bootstrap 目前會使用不支援的 executor：{effective_executor}",
+            fix="請執行 `export PSC_MANAGER_EXECUTOR=claude`（或 `codex` / `copilot`）後再重跑 `cortex bootstrap`。",
+        )
+    if shutil.which(effective_executor) is None:
+        fix = f"請安裝並登入 `{effective_executor}`。"
+        if source == "default":
+            fix += " 或先執行 `export PSC_MANAGER_EXECUTOR=claude`（或 `codex`）後再重跑 `cortex bootstrap`。"
+        else:
+            fix += " 修正後請重新執行 `cortex bootstrap`。"
+        return _preflight_check(
+            "executor",
+            False,
+            f"bootstrap 目前會使用 {effective_executor}（來源：{source}），但 PATH 找不到該 CLI。",
+            fix=fix,
+        )
+    ok, detail, fix = _executor_status(effective_executor)
+    return _preflight_check(
+        "executor",
+        ok,
+        f"{effective_executor} ({source}): {detail}",
+        fix=fix,
+    )
+
+
+def run_preflight(*, instance: str, repo_root: str) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
     python_ok = sys.version_info >= (3, 10)
@@ -125,31 +272,7 @@ def run_preflight(*, repo_root: str) -> dict[str, Any]:
             )
         )
 
-    gh_path = shutil.which("gh")
-    gh_ok = gh_path is not None
-    if gh_ok:
-        gh_status = _run(["gh", "auth", "status"])
-        gh_ok = gh_status.returncode == 0
-        gh_detail = "gh auth status ok" if gh_ok else "gh 已安裝，但尚未登入。"
-        gh_fix = None if gh_ok else "請先執行 `gh auth login`。"
-    else:
-        gh_detail = "gh 不在 PATH"
-        gh_fix = "請先安裝 GitHub CLI（gh），再執行 `gh auth login`。"
-    checks.append(_preflight_check("gh-auth", gh_ok, gh_detail, fix=gh_fix))
-
-    found_executors = [name for name in _EXECUTOR_CANDIDATES if shutil.which(name)]
-    checks.append(
-        _preflight_check(
-            "executor",
-            bool(found_executors),
-            ", ".join(found_executors) if found_executors else "找不到 executor CLI",
-            fix=(
-                "請安裝並登入至少一個 executor CLI：copilot、claude 或 codex。"
-                if not found_executors
-                else None
-            ),
-        )
-    )
+    checks.append(_executor_preflight(instance=instance))
 
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "repo_root": effective_repo_root}
 
@@ -276,7 +399,7 @@ def main(argv: Sequence[str]) -> int:
     args = parser.parse_args(list(argv))
     effective_sample_task = args.task or "sample workflow"
 
-    preflight = run_preflight(repo_root=args.repo_root)
+    preflight = run_preflight(instance=args.instance, repo_root=args.repo_root)
     payload: dict[str, Any] = _bootstrap_envelope(
         command="bootstrap",
         instance=args.instance,

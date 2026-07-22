@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import importlib
 import json
-import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from paulsha_cortex.deploy import installer
 
 BOOTSTRAP_SCHEMA = "cortex-porcelain/bootstrap/v1"
 
@@ -44,23 +46,68 @@ def _write_stub(path: Path, name: str, body: str) -> Path:
     return script
 
 
-def _write_gh_stub(bin_dir: Path, *, auth_status_rc: int) -> Path:
-    return _write_stub(
-        bin_dir,
-        "gh",
-        "\n".join(
-            (
-                'if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then',
-                f"  exit {auth_status_rc}",
-                "fi",
-                'if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then',
-                "  exit 0",
-                "fi",
-                "exit 0",
-                "",
-            )
+def _write_symlink_tool(bin_dir: Path, name: str, target_name: str) -> Path:
+    target = shutil.which(target_name)
+    assert target is not None
+    link = bin_dir / name
+    link.symlink_to(target)
+    return link
+
+
+def _write_executor_stub(bin_dir: Path, *, name: str, auth_status_rc: int) -> Path:
+    commands = {
+        "copilot": (
+            'if [[ "${1:-}" == "-p" ]]; then',
+            f'  [[ {auth_status_rc} -eq 0 ]] || echo "please run copilot login" >&2',
+            f"  exit {auth_status_rc}",
+            "fi",
+            'if [[ "${1:-}" == "login" ]]; then',
+            "  exit 0",
+            "fi",
         ),
-    )
+        "claude": (
+            'if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then',
+            f"  exit {auth_status_rc}",
+            "fi",
+            'if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then',
+            "  exit 0",
+            "fi",
+        ),
+        "codex": (
+            'if [[ "${1:-}" == "doctor" && "${2:-}" == "--json" ]]; then',
+            (
+                "  printf '%s\\n' '{\"checks\":{\"auth.credentials\":{\"status\":\"ok\"}}}'"
+                if auth_status_rc == 0
+                else "  printf '%s\\n' '{\"checks\":{\"auth.credentials\":{\"status\":\"fail\"}}}'"
+            ),
+            f"  exit {auth_status_rc}",
+            "fi",
+            'if [[ "${1:-}" == "login" ]]; then',
+            "  exit 0",
+            "fi",
+        ),
+    }
+    return _write_stub(bin_dir, name, "\n".join((*commands[name], "exit 0", "")))
+
+
+def _configure_preflight_tools(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    executor: str = "claude",
+    executor_auth_status_rc: int = 0,
+    include_git: bool = True,
+    runtime_executor: str | None = None,
+) -> None:
+    _write_symlink_tool(bootstrap_runtime["bin_dir"], "bash", "bash")
+    if include_git:
+        _write_symlink_tool(bootstrap_runtime["bin_dir"], "git", "git")
+    _write_executor_stub(bootstrap_runtime["bin_dir"], name=executor, auth_status_rc=executor_auth_status_rc)
+    monkeypatch.setenv("PATH", str(bootstrap_runtime["bin_dir"]))
+    if runtime_executor is None:
+        monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
+    else:
+        monkeypatch.setenv("PSC_MANAGER_EXECUTOR", runtime_executor)
 
 
 @pytest.fixture
@@ -154,36 +201,239 @@ def _patch_sample_failure(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("cwd_key", "path_entries", "auth_status_rc", "needles"),
+    ("executor", "login_hint"),
     [
-        ("repo_root", "with-gh", 1, ("gh auth login", "exit code 4")),
-        ("outside_root", "with-gh", 0, ("git", "repo")),
-        ("repo_root", "missing-git", 0, ("git", "install")),
+        ("copilot", "copilot login"),
+        ("claude", "claude auth login"),
+        ("codex", "codex login"),
     ],
 )
-def test_bootstrap_preflight_reports_actionable_fixes(
+def test_bootstrap_preflight_reports_executor_login_fix(
     bootstrap_runtime: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    cwd_key: str,
-    path_entries: str,
-    auth_status_rc: int,
-    needles: tuple[str, str],
+    executor: str,
+    login_hint: str,
 ) -> None:
     _reset_porcelain_modules()
-    _write_gh_stub(bootstrap_runtime["bin_dir"], auth_status_rc=auth_status_rc)
-    if path_entries == "missing-git":
-        monkeypatch.setenv("PATH", str(bootstrap_runtime["bin_dir"]))
-    else:
-        monkeypatch.setenv("PATH", f"{bootstrap_runtime['bin_dir']}:{os.environ['PATH']}")
-    monkeypatch.chdir(bootstrap_runtime[cwd_key])
+    _configure_preflight_tools(
+        bootstrap_runtime,
+        monkeypatch,
+        executor=executor,
+        executor_auth_status_rc=1,
+        runtime_executor=executor,
+    )
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
 
     assert _run_cli(["bootstrap"]) == 4
 
     captured = capsys.readouterr()
     combined = (captured.out + captured.err).lower()
-    for needle in needles:
-        assert needle.lower() in combined
+    assert login_hint in combined
+    assert "executor" in combined
+
+
+def test_bootstrap_preflight_reports_actionable_repo_fix(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, runtime_executor="claude")
+    monkeypatch.chdir(bootstrap_runtime["outside_root"])
+
+    assert _run_cli(["bootstrap"]) == 4
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "git" in combined
+    assert "repo" in combined
+
+
+def test_bootstrap_preflight_reports_missing_git_fix(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    _configure_preflight_tools(
+        bootstrap_runtime,
+        monkeypatch,
+        include_git=False,
+        runtime_executor="claude",
+    )
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap"]) == 4
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "git" in combined
+    assert "install" in combined
+
+
+def test_bootstrap_preflight_requires_effective_runtime_executor(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, executor="claude")
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap"]) == 4
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "psc_manager_executor" in combined
+    assert "copilot" in combined
+
+
+def test_bootstrap_preflight_uses_installed_instance_executor_config(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    runtime_dir = bootstrap_runtime["home"] / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta.env").write_text("PSC_MANAGER_EXECUTOR=claude\n", encoding="utf-8")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch)
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap", "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "service install" in captured.out
+
+
+def test_service_install_rejects_unsupported_executor_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PSC_MANAGER_EXECUTOR", "badexec")
+
+    with pytest.raises(ValueError, match="PSC_MANAGER_EXECUTOR"):
+        installer.install_service_result("beta", 300, repo_root)
+
+
+def test_service_install_rejects_invalid_persisted_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta-manager.env").write_text("PSC_MANAGER_EXECUTOR=badexec\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
+
+    with pytest.raises(ValueError, match="既有 PSC_MANAGER_EXECUTOR"):
+        installer.install_service_result("beta", 300, repo_root)
+
+
+def test_service_install_rejects_invalid_instance_env_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta.env").write_text("PSC_MANAGER_EXECUTOR=badexec\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
+
+    with pytest.raises(ValueError, match="instance PSC_MANAGER_EXECUTOR"):
+        installer.install_service_result("beta", 300, repo_root)
+
+
+def test_service_install_rejects_invalid_instance_env_even_with_valid_manager_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    home = tmp_path / "home"
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta.env").write_text("PSC_MANAGER_EXECUTOR=badexec\n", encoding="utf-8")
+    (runtime_dir / "beta-manager.env").write_text("PSC_MANAGER_EXECUTOR=claude\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
+
+    with pytest.raises(ValueError, match="instance PSC_MANAGER_EXECUTOR"):
+        installer.install_service_result("beta", 300, repo_root)
+
+
+def test_bootstrap_preflight_rejects_symlinked_runtime_env(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    runtime_dir = bootstrap_runtime["home"] / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "real.env").write_text("PSC_MANAGER_EXECUTOR=claude\n", encoding="utf-8")
+    (runtime_dir / "beta.env").symlink_to(runtime_dir / "real.env")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, runtime_executor="claude")
+    monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap"]) == 4
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "runtime executor" in combined
+    assert "symlink" in combined
+
+
+def test_bootstrap_preflight_rejects_invalid_runtime_env_even_with_process_override(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    runtime_dir = bootstrap_runtime["home"] / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta.env").write_text("PSC_MANAGER_EXECUTOR=badexec\n", encoding="utf-8")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, runtime_executor="claude")
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap"]) == 4
+
+    captured = capsys.readouterr()
+    combined = (captured.out + captured.err).lower()
+    assert "runtime executor" in combined
+    assert "badexec" in combined
+
+
+def test_bootstrap_preflight_accepts_quoted_runtime_executor(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_porcelain_modules()
+    runtime_dir = bootstrap_runtime["home"] / ".agents" / "core" / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "beta-manager.env").write_text('PSC_MANAGER_EXECUTOR="claude"\n', encoding="utf-8")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch)
+    monkeypatch.chdir(bootstrap_runtime["repo_root"])
+
+    assert _run_cli(["bootstrap", "--dry-run"]) == 0
+
+    captured = capsys.readouterr()
+    assert "service install" in captured.out
 
 
 def test_bootstrap_dry_run_only_previews_service_calls(
@@ -192,8 +442,7 @@ def test_bootstrap_dry_run_only_previews_service_calls(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _reset_porcelain_modules()
-    _write_gh_stub(bootstrap_runtime["bin_dir"], auth_status_rc=0)
-    monkeypatch.setenv("PATH", f"{bootstrap_runtime['bin_dir']}:{os.environ['PATH']}")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, runtime_executor="claude")
     service_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     inspect_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     _patch_bootstrap_backends(monkeypatch, service_calls=service_calls, inspect_calls=inspect_calls)
@@ -213,8 +462,7 @@ def test_bootstrap_json_runs_service_then_inspect_summaries(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _reset_porcelain_modules()
-    _write_gh_stub(bootstrap_runtime["bin_dir"], auth_status_rc=0)
-    monkeypatch.setenv("PATH", f"{bootstrap_runtime['bin_dir']}:{os.environ['PATH']}")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, runtime_executor="claude")
     service_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     inspect_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     _patch_bootstrap_backends(monkeypatch, service_calls=service_calls, inspect_calls=inspect_calls)
@@ -235,8 +483,7 @@ def test_bootstrap_sample_failure_is_degraded_but_not_fatal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _reset_porcelain_modules()
-    _write_gh_stub(bootstrap_runtime["bin_dir"], auth_status_rc=0)
-    monkeypatch.setenv("PATH", f"{bootstrap_runtime['bin_dir']}:{os.environ['PATH']}")
+    _configure_preflight_tools(bootstrap_runtime, monkeypatch, runtime_executor="claude")
     service_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     inspect_calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
     _patch_bootstrap_backends(monkeypatch, service_calls=service_calls, inspect_calls=inspect_calls)
