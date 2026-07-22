@@ -324,6 +324,115 @@ class WorkflowJobPromptTests(unittest.TestCase):
         self.assertNotIn("tasks.md checkboxes", verification_prompt)
         self.assertNotIn("never modify pinned input files", verification_prompt)
 
+    def test_commit_required_prompt_includes_needs_fix_reviewer_findings(self) -> None:
+        step = WorkflowStep(
+            phase="build",
+            persona="builder",
+            card="subagent-build",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=(),
+        )
+        with tempfile.TemporaryDirectory() as coordinator_root:
+            (Path(coordinator_root) / "delivery-journal.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "cortex-delivery-journal/v1",
+                        "runs": {
+                            "run-1": {
+                                "run_id": "run-1",
+                                "repo": "owner/repo",
+                                "work_id": "work-1",
+                                "ship": {
+                                    "phase": "needs-fix",
+                                    "findings": [
+                                        {
+                                            "path": "paulsha_cortex/porcelain/request.py",
+                                            "line": 193,
+                                            "body": "Repair the missing request binding.",
+                                        }
+                                    ],
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            prompt = manager._workflow_job_prompt(
+                self._run(),
+                step,
+                builder_job_id="job-1",
+                coordinator_root=coordinator_root,
+            )
+
+        self.assertIn("Reviewer findings to fix in this repair", prompt)
+        self.assertIn(
+            "[paulsha_cortex/porcelain/request.py:193] Repair the missing request binding.",
+            prompt,
+        )
+
+    def test_missing_delivery_journal_keeps_commit_required_prompt_unchanged(self) -> None:
+        step = WorkflowStep(
+            phase="build",
+            persona="builder",
+            card="subagent-build",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=(),
+        )
+        with tempfile.TemporaryDirectory() as coordinator_root:
+            prompt = manager._workflow_job_prompt(
+                self._run(),
+                step,
+                builder_job_id="job-1",
+                coordinator_root=coordinator_root,
+            )
+
+        self.assertNotIn("Reviewer findings to fix in this repair", prompt)
+
+    def test_needs_fix_prompt_without_findings_remains_unchanged(self) -> None:
+        step = WorkflowStep(
+            phase="build",
+            persona="builder",
+            card="subagent-build",
+            executor=None,
+            model=None,
+            domain=None,
+            inputs=(),
+            outputs=(),
+        )
+        with tempfile.TemporaryDirectory() as coordinator_root:
+            (Path(coordinator_root) / "delivery-journal.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "cortex-delivery-journal/v1",
+                        "runs": {
+                            "run-1": {
+                                "run_id": "run-1",
+                                "repo": "owner/repo",
+                                "work_id": "work-1",
+                                "ship": {"phase": "needs-fix"},
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prompt = manager._workflow_job_prompt(
+                self._run(),
+                step,
+                builder_job_id="job-1",
+                coordinator_root=coordinator_root,
+            )
+
+        self.assertNotIn("Reviewer findings to fix in this repair", prompt)
+
 
 class CompleteTickFailedAndInFlightTests(unittest.TestCase):
     def test_failed_job_writes_failed_manifest(self) -> None:

@@ -2264,6 +2264,11 @@ def _ship_action(
         requested_at=float(requested_at),
     )
     finding_count = sum(1 for thread in remote.review_threads if thread.blocks_merge)
+    findings = [
+        {"path": thread.path, "line": thread.line, "body": thread.body_excerpt}
+        for thread in remote.review_threads
+        if thread.blocks_merge
+    ][:10]
     copilot = loop.record_review(
         head=review.commit_id,
         now_epoch=now_epoch,
@@ -2278,6 +2283,7 @@ def _ship_action(
             "phase": "needs-fix",
             "review_id": review.review_id,
             "finding_count": finding_count,
+            "findings": findings,
             "fix_rounds": fix_rounds,
         }
         _save_runs(state_path, state)

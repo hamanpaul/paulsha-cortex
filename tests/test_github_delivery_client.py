@@ -94,7 +94,20 @@ class FakeRunner:
                                 },
                                 "reviewThreads": {
                                     "nodes": [
-                                        {"id": "T1", "isResolved": False, "isOutdated": True}
+                                        {
+                                            "id": "T1",
+                                            "isResolved": False,
+                                            "isOutdated": True,
+                                            "comments": {
+                                                "nodes": [
+                                                    {
+                                                        "path": "paulsha_cortex/porcelain/request.py",
+                                                        "line": 193,
+                                                        "body": "A" * 300,
+                                                    }
+                                                ]
+                                            },
+                                        }
                                     ],
                                     "pageInfo": {
                                         "hasNextPage": False,
@@ -157,6 +170,9 @@ def test_fetch_delivery_facts_uses_authenticated_typed_gh_api() -> None:
     assert facts.active_openspec_absent
     assert facts.archive_present
     assert facts.review_threads[0].outdated
+    assert facts.review_threads[0].path == "paulsha_cortex/porcelain/request.py"
+    assert facts.review_threads[0].line == 193
+    assert facts.review_threads[0].body_excerpt == "A" * 240
     assert any(
         f"commits/{HEAD}/statuses" in " ".join(call[0]) for call in runner.calls
     )
@@ -649,6 +665,15 @@ def test_graphql_connections_are_fully_paginated_and_booleans_are_strict() -> No
                                             "id": thread,
                                             "isResolved": resolved,
                                             "isOutdated": False,
+                                            "comments": {
+                                                "nodes": [
+                                                    {
+                                                        "path": f"src/{thread.lower()}.py",
+                                                        "line": issue,
+                                                        "body": f"finding-{thread}",
+                                                    }
+                                                ]
+                                            },
                                         }
                                     ],
                                     "pageInfo": {
@@ -669,6 +694,12 @@ def test_graphql_connections_are_fully_paginated_and_booleans_are_strict() -> No
     )
     assert facts.closing_issues == (14, 15)
     assert tuple(thread.thread_id for thread in facts.review_threads) == ("T1", "T2")
+    assert tuple(thread.path for thread in facts.review_threads) == ("src/t1.py", "src/t2.py")
+    assert tuple(thread.line for thread in facts.review_threads) == (14, 15)
+    assert tuple(thread.body_excerpt for thread in facts.review_threads) == (
+        "finding-T1",
+        "finding-T2",
+    )
     with pytest.raises(RuntimeError, match="association facts malformed"):
         GitHubDeliveryClient(runner=Paged(malformed=True)).fetch_delivery_facts(
             repo="acme/demo",
