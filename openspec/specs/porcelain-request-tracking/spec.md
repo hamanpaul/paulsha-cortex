@@ -1,7 +1,7 @@
 # porcelain-request-tracking Specification
 
 ## Purpose
-TBD - created by archiving change porcelain-request. Update Purpose after archive.
+定義 `cortex request` 唯讀追蹤介面，讓會先回傳 request ID 的 mutation/automation 流程可在 daemon 正常或 degraded 時一致查詢 pending/done 狀態、等待 terminal 結果，並追溯關聯 job 與 log。
 ## Requirements
 ### Requirement: request 必須可唯讀追蹤
 
