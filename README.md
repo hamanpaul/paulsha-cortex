@@ -142,7 +142,7 @@ python -m pip install .
    cortex service uninstall --instance cortex --purge --json
    ```
 
-   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。
+   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
 
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 

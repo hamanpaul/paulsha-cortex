@@ -174,7 +174,10 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
         return InstallServiceResult(
             exit_code=0,
             mode="fallback",
-            message=f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式",
+            message=(
+                f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式；"
+                "fallback 缺少 `cortex service logs --follow` 即時串流。"
+            ),
         )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", f"{instance}-monitor.service"], check=True)

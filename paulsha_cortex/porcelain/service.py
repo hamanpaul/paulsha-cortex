@@ -86,6 +86,32 @@ def _service_envelope(command: str, instance: str, *, mode: str, **payload: Any)
     }
 
 
+def _emit_command_error(
+    command: str,
+    instance: str,
+    *,
+    json_output: bool,
+    mode: str,
+    exit_code: int,
+    message: str,
+    **payload: Any,
+) -> int:
+    if json_output:
+        _json_dump(
+            _service_envelope(
+                command,
+                instance,
+                mode=mode,
+                error=message,
+                result={"exit_code": exit_code},
+                **payload,
+            )
+        )
+        return exit_code
+    sys.stderr.write(message if message.endswith("\n") else message + "\n")
+    return exit_code
+
+
 def _unit_names(instance: str) -> tuple[str, str, str]:
     return (
         f"{instance}-manager.service",
@@ -212,21 +238,17 @@ def _control_service_state(instance: str) -> dict[str, Any]:
 
 def _mode_error(command: str, instance: str, *, json_output: bool, message: str) -> int:
     service = _control_service_state(instance)
-    if json_output:
-        _json_dump(
-            _service_envelope(
-                command,
-                instance,
-                mode=str(service.get("mode")),
-                error=message,
-                result={"exit_code": 1},
-                service=service,
-            )
-        )
-        return 1
-    _print_status(service)
-    sys.stderr.write(message + "\n")
-    return 1
+    if not json_output:
+        _print_status(service)
+    return _emit_command_error(
+        command,
+        instance,
+        json_output=json_output,
+        mode=str(service.get("mode")),
+        exit_code=1,
+        message=message,
+        service=service,
+    )
 
 
 def _print_status(service: dict[str, Any]) -> None:
@@ -287,6 +309,10 @@ def _run_systemctl(verb: str, *units: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _completed_process_error(result: subprocess.CompletedProcess[str], *, fallback: str) -> str:
+    return (result.stderr or result.stdout or fallback).strip() or fallback
+
+
 def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
     if not _systemd_control_available():
         return _mode_error(
@@ -298,9 +324,17 @@ def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
     service, timer = _manager_pair(instance)
     result = _run_systemctl(command, service, timer)
     if result.returncode != 0:
-        if result.stderr:
-            sys.stderr.write(result.stderr)
-        return result.returncode
+        return _emit_command_error(
+            command,
+            instance,
+            json_output=json_output,
+            mode="systemd",
+            exit_code=result.returncode,
+            message=_completed_process_error(
+                result,
+                fallback=f"systemctl {command} failed for {service} {timer}",
+            ),
+        )
     if json_output:
         _json_dump(_service_envelope(command, instance, mode="systemd", result={"exit_code": result.returncode}))
         return 0
@@ -329,25 +363,74 @@ def _tail_lines(path: Path, lines: int) -> str:
     return "\n".join(data[-max(lines, 0) :]) + ("\n" if data and lines != 0 else "")
 
 
+def _stream_process_output(argv: list[str]) -> int:
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        sys.stdout.write(line)
+    stderr_output = ""
+    if process.stderr is not None:
+        stderr_output = process.stderr.read()
+    return_code = process.wait()
+    if return_code != 0 and stderr_output:
+        sys.stderr.write(stderr_output)
+    return return_code
+
+
 def _run_logs(*, instance: str, lines: int, follow: bool, json_output: bool) -> int:
     service = _status_payload(instance)
     output: str
     source: str
-    if service.get("mode") == "systemd":
-        raw = subprocess.run(
-            _journalctl_args(instance, lines=lines, follow=follow),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
+    mode = str(service.get("mode"))
+    if follow and json_output:
+        return _emit_command_error(
+            "logs",
+            instance,
+            json_output=True,
+            mode=mode,
+            exit_code=1,
+            message="`cortex service logs --json` 不支援 `--follow` 串流輸出。",
+            service=service,
+            source="journalctl" if mode == "systemd" else "file",
+            lines=max(lines, 0),
         )
+    if service.get("mode") == "systemd":
+        argv = _journalctl_args(instance, lines=lines, follow=follow)
+        if follow:
+            return _stream_process_output(argv)
+        raw = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=10)
         if raw.returncode != 0:
-            if raw.stderr:
-                sys.stderr.write(raw.stderr)
-            return raw.returncode
+            return _emit_command_error(
+                "logs",
+                instance,
+                json_output=json_output,
+                mode=mode,
+                exit_code=raw.returncode,
+                message=_completed_process_error(raw, fallback=f"journalctl failed for {instance}"),
+                service=service,
+                source="journalctl",
+                lines=max(lines, 0),
+            )
         output = raw.stdout
         source = "journalctl"
     else:
+        if follow:
+            return _emit_command_error(
+                "logs",
+                instance,
+                json_output=json_output,
+                mode=mode,
+                exit_code=1,
+                message="fallback mode 不支援 `cortex service logs --follow`；請直接 tail log 檔案。",
+                service=service,
+                source="file",
+                lines=max(lines, 0),
+            )
         log_path = Path(str(service.get("log_path") or _fallback_log_path()))
         if not log_path.is_file():
             raise ValueError(f"log not found: {log_path}")
@@ -387,13 +470,25 @@ def _run_uninstall(*, instance: str, purge: bool, json_output: bool) -> int:
     stop_result = _run_systemctl("stop", *units)
     disable_result = _run_systemctl("disable", *units)
     if stop_result.returncode != 0:
-        if stop_result.stderr:
-            sys.stderr.write(stop_result.stderr)
-        return stop_result.returncode
+        return _emit_command_error(
+            "uninstall",
+            instance,
+            json_output=json_output,
+            mode="systemd",
+            exit_code=stop_result.returncode,
+            message=_completed_process_error(stop_result, fallback=f"systemctl stop failed for {instance}"),
+            purge=purge,
+        )
     if disable_result.returncode != 0:
-        if disable_result.stderr:
-            sys.stderr.write(disable_result.stderr)
-        return disable_result.returncode
+        return _emit_command_error(
+            "uninstall",
+            instance,
+            json_output=json_output,
+            mode="systemd",
+            exit_code=disable_result.returncode,
+            message=_completed_process_error(disable_result, fallback=f"systemctl disable failed for {instance}"),
+            purge=purge,
+        )
     for unit_name in units:
         _remove_if_exists(unit_root / unit_name)
     env_path = _runtime_env_path(instance)
@@ -401,9 +496,15 @@ def _run_uninstall(*, instance: str, purge: bool, json_output: bool) -> int:
         _remove_if_exists(env_path)
     daemon_reload = _run_systemctl("daemon-reload")
     if daemon_reload.returncode != 0:
-        if daemon_reload.stderr:
-            sys.stderr.write(daemon_reload.stderr)
-        return daemon_reload.returncode
+        return _emit_command_error(
+            "uninstall",
+            instance,
+            json_output=json_output,
+            mode="systemd",
+            exit_code=daemon_reload.returncode,
+            message=_completed_process_error(daemon_reload, fallback="systemctl daemon-reload failed"),
+            purge=purge,
+        )
     if json_output:
         _json_dump(
             _service_envelope(
@@ -423,26 +524,27 @@ def main(argv: Sequence[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(_normalize_argv(argv))
     try:
+        instance = installer._validate_instance(getattr(args, "instance", "cortex"))
         if args.command == "install":
             return _run_install(
-                instance=args.instance,
+                instance=instance,
                 interval=args.interval,
                 repo_root=args.repo_root,
                 json_output=args.json,
             )
         if args.command in {"start", "stop", "restart"}:
-            return _run_lifecycle(args.command, instance=args.instance, json_output=args.json)
+            return _run_lifecycle(args.command, instance=instance, json_output=args.json)
         if args.command == "status":
-            return _run_status(instance=args.instance, json_output=args.json)
+            return _run_status(instance=instance, json_output=args.json)
         if args.command == "logs":
             return _run_logs(
-                instance=args.instance,
+                instance=instance,
                 lines=args.n,
                 follow=args.follow,
                 json_output=args.json,
             )
         if args.command == "uninstall":
-            return _run_uninstall(instance=args.instance, purge=args.purge, json_output=args.json)
+            return _run_uninstall(instance=instance, purge=args.purge, json_output=args.json)
     except ValueError as exc:
         print(f"錯誤: {exc}", file=sys.stderr)
         return 1

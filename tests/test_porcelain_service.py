@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import io
 import json
 import os
 import subprocess
@@ -216,6 +217,7 @@ def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(
     assert payload["result"]["exit_code"] == 0
     assert "systemd 不可用" in payload["message"]
     assert "service-manager.sh" in payload["message"]
+    assert "--follow" in payload["message"]
 
 
 @pytest.mark.parametrize(("command", "verb"), [("start", "start"), ("stop", "stop"), ("restart", "restart")])
@@ -373,6 +375,42 @@ def test_service_logs_uses_journalctl_when_systemd_units_exist(
     assert "beta-manager.service" in calls
 
 
+def test_service_logs_follow_streams_without_subprocess_run(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _load_cli()
+    service = importlib.import_module("paulsha_cortex.porcelain.service")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(argv, *args, **kwargs):
+        raise AssertionError("follow mode must not use subprocess.run")
+
+    class FakePopen:
+        def __init__(self, argv, *, stdout, stderr, text):
+            assert stdout == subprocess.PIPE
+            assert stderr == subprocess.PIPE
+            assert text is True
+            seen["argv"] = list(argv)
+            self.stdout = io.StringIO("follow line 1\nfollow line 2\n")
+            self.stderr = io.StringIO("")
+            self.returncode = 0
+
+        def wait(self) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(service, "_status_payload", lambda instance: {"instance": instance, "mode": "systemd"})
+    monkeypatch.setattr(service.subprocess, "run", fake_run)
+    monkeypatch.setattr(service.subprocess, "Popen", FakePopen)
+
+    assert service.main(["logs", "--instance", "beta", "--follow", "-n", "5"]) == 0
+
+    captured = capsys.readouterr()
+    assert "follow line 1" in captured.out
+    assert seen["argv"][-1] == "-f"
+
+
 def test_service_logs_reads_fallback_log_when_systemd_is_unavailable(
     service_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],
@@ -387,6 +425,78 @@ def test_service_logs_reads_fallback_log_when_systemd_is_unavailable(
     assert "recent line" in captured.out
     assert "newest line" in captured.out
     assert "old line" not in captured.out
+
+
+def test_service_logs_follow_rejects_fallback_mode(
+    service_runtime: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log_path = service_runtime["log_root"] / "manager.log"
+    log_path.write_text("line 1\n", encoding="utf-8")
+    (service_runtime["control_root"] / "manager.lock").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+    assert _run_cli(["service", "logs", "--instance", "beta", "--follow", "--json"]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command"] == "logs"
+    assert payload["mode"] == "fallback"
+    assert payload["source"] == "file"
+    assert "不支援" in payload["error"]
+
+
+def test_service_logs_json_failure_reports_envelope(
+    service_runtime: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    show_payload = service_runtime["tmp_path"] / "systemctl-logs-fail.txt"
+    systemctl_calls = service_runtime["tmp_path"] / "systemctl-logs-fail.calls"
+    journalctl_calls = service_runtime["tmp_path"] / "journalctl-fail.calls"
+    manager_exec = service_runtime["tmp_path"] / "venv" / "bin" / "python"
+    manager_exec.parent.mkdir(parents=True, exist_ok=True)
+    manager_exec.write_text("", encoding="utf-8")
+    _write_units(service_runtime["unit_root"], "beta", exec_path=manager_exec, monitor_exec_path=manager_exec)
+    show_payload.write_text(_systemctl_show("beta", manager_pid=4321, monitor_pid=8765), encoding="utf-8")
+    _write_systemctl_stub(service_runtime["bin_dir"], systemctl_calls, show_payload)
+    _write_stub(
+        service_runtime["bin_dir"],
+        "journalctl",
+        f'printf "%s\\n" "$*" >> "{journalctl_calls}"\nprintf "journal failed\\n" >&2\nexit 7\n',
+    )
+
+    assert _run_cli(["service", "logs", "--instance", "beta", "--json"]) == 7
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["command"] == "logs"
+    assert payload["mode"] == "systemd"
+    assert payload["result"]["exit_code"] == 7
+    assert payload["source"] == "journalctl"
+    assert "journal failed" in payload["error"]
+
+
+@pytest.mark.parametrize(("command", "expected_rc"), [("start", 5), ("uninstall", 6)])
+def test_service_json_failures_preserve_envelope_for_systemctl_errors(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    expected_rc: int,
+) -> None:
+    systemctl_calls = service_runtime["tmp_path"] / f"systemctl-{command}-fail.calls"
+    manager_exec = service_runtime["tmp_path"] / "venv" / "bin" / "python"
+    manager_exec.parent.mkdir(parents=True, exist_ok=True)
+    manager_exec.write_text("", encoding="utf-8")
+    _write_units(service_runtime["unit_root"], "beta", exec_path=manager_exec, monitor_exec_path=manager_exec)
+    _write_systemctl_stub(service_runtime["bin_dir"], systemctl_calls)
+    monkeypatch.setenv("SYSTEMCTL_RC", str(expected_rc))
+
+    assert _run_cli(["service", command, "--instance", "beta", "--json"]) == expected_rc
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == SERVICE_SCHEMA
+    assert payload["command"] == command
+    assert payload["mode"] == "systemd"
+    assert payload["result"]["exit_code"] == expected_rc
+    assert "failed" in payload["error"]
 
 
 @pytest.mark.parametrize(("purge", "env_exists"), [(False, True), (True, False)])
@@ -442,3 +552,22 @@ def test_service_uninstall_fails_gracefully_without_systemd_when_not_installed(
     assert payload["service"]["mode"] == "none"
     assert payload["result"]["exit_code"] == 1
     assert "systemd 不可用" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["service", "status", "--instance", "../evil"],
+        ["service", "start", "--instance", "../evil", "--json"],
+        ["service", "logs", "--instance", "../evil", "-n", "1"],
+        ["service", "uninstall", "--instance", "../evil", "--purge", "--json"],
+    ],
+)
+def test_service_rejects_invalid_instance_names(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _run_cli(argv) == 1
+
+    captured = capsys.readouterr()
+    assert "instance 名稱不合法" in captured.err
