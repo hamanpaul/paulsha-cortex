@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata
 import json
 import os
@@ -10,11 +11,15 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
-_USAGE = "usage: cortex [-h] <command> [<args>...]\n"
+_USAGE = "usage: cortex [-h] [--version] <command> [<args>...]\n"
 _HELP = """\
-usage: cortex [-h] <command> [<args>...]
+usage: cortex [-h] [--version] <command> [<args>...]
 
 paulsha-cortex 檔案驅動的 Agent 派工與交付治理 CLI
+
+options:
+  -h, --help      show this help message and exit
+  --version       show installed version and exit
 
 setup and workflow commands:
   install service  安裝 manager service/timer 與 monitor 的 systemd --user units
@@ -63,6 +68,24 @@ def _relay_hook_script_path() -> Path:
     return Path(str(resources.files("paulsha_cortex") / "scripts" / "psc-relay-hook.sh"))
 
 
+def _load_porcelain_commands():
+    porcelain = importlib.import_module("paulsha_cortex.porcelain")
+
+    porcelain.load_commands()
+    return porcelain.COMMANDS
+
+
+def _help_text() -> str:
+    commands = _load_porcelain_commands()
+    if not commands:
+        return _HELP
+    lines = [_HELP.rstrip(), "", "porcelain commands:"]
+    for command in sorted(commands.values(), key=lambda item: item.name):
+        lines.append(f"  {command.name:<16}{command.help}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
@@ -76,7 +99,7 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         sys.stdout.write(f"cortex {current_version}\n")
         return 0
     if args[0] in {"-h", "--help"}:
-        sys.stdout.write(_HELP)
+        sys.stdout.write(_help_text())
         return 0
     if args[0] == "install":
         from paulsha_cortex.deploy.installer import main as install_main
@@ -110,6 +133,10 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         from paulsha_cortex.doctor import main as doctor_main
 
         return int(doctor_main(args[1:]) or 0)
+    porcelain_commands = _load_porcelain_commands()
+    porcelain_command = porcelain_commands.get(args[0])
+    if porcelain_command is not None:
+        return int(porcelain_command.run(args[1:]) or 0)
 
     from paulsha_cortex.coordinator.cli import main as coordinator_main
 
