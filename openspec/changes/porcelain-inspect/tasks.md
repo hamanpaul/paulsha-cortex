@@ -9,4 +9,5 @@ work_item: porcelain-inspect
 - [x] 1.2 `paulsha_cortex/porcelain/_runtime_probe.py` 共用探測函式實作。
 - [x] 1.3 `paulsha_cortex/porcelain/inspect.py` 六子命令實作 + `_FAMILY_MODULES` 登記。
 - [x] 1.4 README CLI 段落補 `inspect` 家族（R-16）；`changelog.d/porcelain-inspect.md` 與 `CHANGELOG.md [Unreleased]` 同步（條目含 porcelain-inspect 字樣）。
-- [x] 1.5 pytest 全綠、policy_check 0 fail、`git diff --check` 乾淨。
+- [x] 1.5 修補後 candidate 已重跑 `python3 -m pytest tests/ -q`、`python3 -m policy_check --repo .`、`git diff --check`。
+- [x] 1.6 以 conventional commit 提交 tested descendant candidate（僅涵蓋 pre-archive builder repair）。
