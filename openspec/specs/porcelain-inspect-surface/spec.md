@@ -26,4 +26,3 @@ TBD - created by archiving change porcelain-inspect. Update Purpose after archiv
 
 - **WHEN** systemd unit 的 `ExecStart` 指向一個已被刪除的 venv 路徑
 - **THEN** `cortex inspect service` 的輸出標示該行程為 stale/殭屍，並附下一步建議（重新 `service install` 或 `service restart`）
-
