@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -134,7 +135,7 @@ def test_inspect_status_human_and_json_report_same_snapshot(
     inspect_runtime: dict[str, Path],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    updated_at = "2026-07-22T08:00:00+00:00"
+    updated_at = datetime.now(timezone.utc).isoformat()
     payload = contract.build_status(
         ready=["slice-a"],
         in_flight=[{"job_id": "slice-a-1", "slice_id": "slice-a", "state": "running"}],
@@ -158,6 +159,32 @@ def test_inspect_status_human_and_json_report_same_snapshot(
     assert "slice-a" in human
     assert "slice-held" in human
     assert "degraded" in human
+
+
+def test_inspect_status_uses_runtime_degraded_evaluation(
+    inspect_runtime: dict[str, Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    updated_at = datetime.now(timezone.utc).isoformat()
+    payload = contract.build_status(
+        ready=["slice-a"],
+        in_flight=[],
+        recent_done=[],
+        daemon={"pid": 999_999, "last_tick_at": updated_at, "idle": False},
+        updated_at=updated_at,
+    )
+    contract.atomic_write_json(constants.status_path(), payload)
+
+    assert _run_cli(["inspect", "status", "--json"]) == 0
+    rendered = json.loads(capsys.readouterr().out)
+    assert rendered["status"]["degraded"] is True
+    assert rendered["status"]["degraded_reason"] == "dead"
+    assert rendered["status"]["updated_at"] is None
+
+    assert _run_cli(["inspect", "status"]) == 0
+    human = capsys.readouterr().out
+    assert "degraded: True" in human
+    assert "updated_at: None" in human
 
 
 def test_inspect_job_human_and_json_report_same_job_record(

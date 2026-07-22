@@ -7,7 +7,6 @@ import sys
 from typing import Any, Sequence
 
 from paulsha_cortex.config import paths
-from paulsha_cortex.control import constants, contract
 from paulsha_cortex.control.client import read_status
 from paulsha_cortex.coordinator import autonomy
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -131,18 +130,7 @@ def _print_service(service: dict[str, Any]) -> None:
 
 
 def _run_status(*, json_output: bool) -> int:
-    raw_status = contract.read_json(constants.status_path())
-    if isinstance(raw_status, dict):
-        status = {
-            **raw_status,
-            "held": list(raw_status.get("held", [])),
-            "slices": list(raw_status.get("slices", [])),
-            "attention": list(raw_status.get("attention", [])),
-            "degraded": bool(raw_status.get("degraded", False)),
-            "degraded_reason": raw_status.get("degraded_reason"),
-        }
-    else:
-        status = read_status()
+    status = read_status()
     if json_output:
         _json_dump(_inspect_envelope("status", status=status))
         return 0
