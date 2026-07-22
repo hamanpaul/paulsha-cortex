@@ -173,6 +173,31 @@ def test_outdated_unresolved_thread_is_non_blocking() -> None:
     ).allowed
 
 
+def test_review_thread_carries_finding_context_without_changing_blocking_logic() -> None:
+    blocked = ReviewThread(
+        thread_id="t-find",
+        resolved=False,
+        outdated=False,
+        path="paulsha_cortex/porcelain/request.py",
+        line=193,
+        body_excerpt="Please guard the missing request mapping.",
+    )
+    outdated = ReviewThread(
+        thread_id="t-old",
+        resolved=False,
+        outdated=True,
+        path="paulsha_cortex/porcelain/request.py",
+        line=193,
+        body_excerpt="Old finding.",
+    )
+
+    assert blocked.blocks_merge is True
+    assert blocked.path == "paulsha_cortex/porcelain/request.py"
+    assert blocked.line == 193
+    assert blocked.body_excerpt == "Please guard the missing request mapping."
+    assert outdated.blocks_merge is False
+
+
 def test_typed_github_commands_request_copilot_and_merge_commit_only() -> None:
     assert build_copilot_request_argv(repo="hamanpaul/paulsha-cortex", pr_number=15) == [
         "gh",

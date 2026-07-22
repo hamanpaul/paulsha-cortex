@@ -61,6 +61,9 @@ class ReviewThread:
     thread_id: str
     resolved: bool
     outdated: bool
+    path: str | None = None
+    line: int | None = None
+    body_excerpt: str = ""
 
     @property
     def blocks_merge(self) -> bool:
@@ -243,7 +246,14 @@ query($owner:String!,$name:String!,$number:Int!,$issueCursor:String,$threadCurso
         pageInfo { hasNextPage endCursor }
       }
       reviewThreads(first:100,after:$threadCursor) {
-        nodes { id isResolved isOutdated }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          comments(first:1) {
+            nodes { path line body }
+          }
+        }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -631,11 +641,42 @@ class GitHubDeliveryClient:
                     or not isinstance(node.get("isOutdated"), bool)
                 ):
                     raise TypeError("review thread node malformed")
+                path: str | None = None
+                line: int | None = None
+                body_excerpt = ""
+                comments = node.get("comments")
+                if comments is not None:
+                    if not isinstance(comments, dict):
+                        raise TypeError("review thread comments malformed")
+                    comment_nodes = comments.get("nodes")
+                    if not isinstance(comment_nodes, list):
+                        raise TypeError("review thread comments malformed")
+                    if comment_nodes:
+                        first_comment = comment_nodes[0]
+                        if not isinstance(first_comment, dict):
+                            raise TypeError("review thread comment malformed")
+                        path_value = first_comment.get("path")
+                        line_value = first_comment.get("line")
+                        body_value = first_comment.get("body")
+                        if path_value is not None and not isinstance(path_value, str):
+                            raise TypeError("review thread comment path malformed")
+                        if line_value is not None and (
+                            not isinstance(line_value, int) or isinstance(line_value, bool)
+                        ):
+                            raise TypeError("review thread comment line malformed")
+                        if body_value is not None and not isinstance(body_value, str):
+                            raise TypeError("review thread comment body malformed")
+                        path = path_value
+                        line = line_value
+                        body_excerpt = (body_value or "")[:240]
                 parsed_threads.append(
                     ReviewThread(
                         thread_id=node["id"],
                         resolved=node["isResolved"],
                         outdated=node["isOutdated"],
+                        path=path,
+                        line=line,
+                        body_excerpt=body_excerpt,
                     )
                 )
             threads = tuple(parsed_threads)
