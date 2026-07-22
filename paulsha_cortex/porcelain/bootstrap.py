@@ -84,7 +84,6 @@ def _executor_status(name: str) -> tuple[bool, str, str | None]:
             "-p",
             "Respond with OK only.",
             "--silent",
-            "--allow-all-tools",
             "--disable-builtin-mcps",
             "--no-custom-instructions",
             "--output-format",
@@ -131,7 +130,7 @@ def _executor_status(name: str) -> tuple[bool, str, str | None]:
             return (
                 False,
                 "copilot 認證檢查逾時，無法確認登入態。",
-                "請確認 `copilot -p` 可在此機器正常執行；若尚未登入，請先執行 `copilot login`。",
+                "請確認 `copilot -p 'Respond with OK only.' --silent --disable-builtin-mcps --no-custom-instructions --output-format json` 可在此機器正常執行；若尚未登入，請先執行 `copilot login`。",
             )
         return False, f"{name} 認證檢查逾時。", failure_fix
     if result.returncode == 0:
@@ -143,7 +142,7 @@ def _executor_status(name: str) -> tuple[bool, str, str | None]:
         return (
             False,
             "copilot 啟動失敗，無法確認登入態。",
-            "請先確認 `copilot -p 'Respond with OK only.' --silent --allow-all-tools --disable-builtin-mcps --no-custom-instructions --output-format json` 可正常執行；若尚未登入，請先執行 `copilot login`。",
+            "請先確認 `copilot -p 'Respond with OK only.' --silent --disable-builtin-mcps --no-custom-instructions --output-format json` 可正常執行；若尚未登入，請先執行 `copilot login`。",
         )
     return False, failure_detail, failure_fix
 

@@ -54,10 +54,20 @@ def _write_symlink_tool(bin_dir: Path, name: str, target_name: str) -> Path:
     return link
 
 
-def _write_executor_stub(bin_dir: Path, *, name: str, auth_status_rc: int) -> Path:
+def _write_executor_stub(
+    bin_dir: Path,
+    *,
+    name: str,
+    auth_status_rc: int,
+    argv_log: Path | None = None,
+) -> Path:
+    log_line = ""
+    if argv_log is not None:
+        log_line = f'printf "%s\\n" "$*" >> "{argv_log}"'
     commands = {
         "copilot": (
             'if [[ "${1:-}" == "-p" ]]; then',
+            log_line,
             f'  [[ {auth_status_rc} -eq 0 ]] || echo "please run copilot login" >&2',
             f"  exit {auth_status_rc}",
             "fi",
@@ -98,11 +108,17 @@ def _configure_preflight_tools(
     executor_auth_status_rc: int = 0,
     include_git: bool = True,
     runtime_executor: str | None = None,
+    argv_log: Path | None = None,
 ) -> None:
     _write_symlink_tool(bootstrap_runtime["bin_dir"], "bash", "bash")
     if include_git:
         _write_symlink_tool(bootstrap_runtime["bin_dir"], "git", "git")
-    _write_executor_stub(bootstrap_runtime["bin_dir"], name=executor, auth_status_rc=executor_auth_status_rc)
+    _write_executor_stub(
+        bootstrap_runtime["bin_dir"],
+        name=executor,
+        auth_status_rc=executor_auth_status_rc,
+        argv_log=argv_log,
+    )
     monkeypatch.setenv("PATH", str(bootstrap_runtime["bin_dir"]))
     if runtime_executor is None:
         monkeypatch.delenv("PSC_MANAGER_EXECUTOR", raising=False)
@@ -454,6 +470,28 @@ def test_bootstrap_dry_run_only_previews_service_calls(
     assert "service start" in captured.out
     assert service_calls == []
     assert inspect_calls == []
+
+
+def test_bootstrap_copilot_preflight_avoids_allow_all_tools(
+    bootstrap_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_porcelain_modules()
+    argv_log = bootstrap_runtime["tmp_path"] / "copilot-argv.log"
+    _configure_preflight_tools(
+        bootstrap_runtime,
+        monkeypatch,
+        executor="copilot",
+        runtime_executor="copilot",
+        argv_log=argv_log,
+    )
+
+    assert _run_cli(["bootstrap", "--dry-run"]) == 0
+
+    logged_argv = argv_log.read_text(encoding="utf-8").strip()
+    assert "--allow-all-tools" not in logged_argv
+    assert "--disable-builtin-mcps" in logged_argv
+    assert "--no-custom-instructions" in logged_argv
 
 
 def test_bootstrap_json_runs_service_then_inspect_summaries(

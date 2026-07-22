@@ -4,4 +4,4 @@
 
 ### Fixed
 
-- **porcelain-bootstrap executor preflight**：`bootstrap` preflight 改為檢查實際 executor 登入態（`copilot` / `claude` / `codex`），並移除未列入凍結設計的額外 `gh-auth` gate。
+- **porcelain-bootstrap executor preflight**：`bootstrap` preflight 改為檢查實際 executor 登入態（`copilot` / `claude` / `codex`），移除未列入凍結設計的額外 `gh-auth` gate，且 `copilot` 探測不再要求 `--allow-all-tools`。
