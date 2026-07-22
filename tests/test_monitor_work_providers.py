@@ -643,6 +643,154 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
     }
 
 
+def test_github_terminal_provider_aggregates_pull_requests_across_pages():
+    first_page = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                    "nodes": [
+                        {
+                            "number": 9,
+                            "body": "",
+                            "headRefName": "feature/9-work",
+                            "headRefOid": "e" * 40,
+                            "state": "OPEN",
+                            "mergedAt": None,
+                            "mergeCommit": None,
+                            "closingIssuesReferences": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"number": 7, "state": "OPEN"}],
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    second_page = {
+        "data": {
+            "repository": {
+                "defaultBranchRef": {"name": "ignored", "target": {"oid": "f" * 40}},
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {
+                            "number": 10,
+                            "body": "",
+                            "headRefName": "feature/10-work",
+                            "headRefOid": "a" * 40,
+                            "state": "CLOSED",
+                            "mergedAt": None,
+                            "mergeCommit": None,
+                            "closingIssuesReferences": {
+                                "pageInfo": {"hasNextPage": False},
+                                "nodes": [{"number": 8, "state": "CLOSED"}],
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+    }
+    runner = SequenceRunner(
+        [
+            _completed(first_page),
+            _completed(second_page),
+            _completed({"truncated": False, "tree": []}),
+        ]
+    )
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "ok"
+    assert result.observations["closing_links"] == {
+        "github_pr:example/acme#9": "github_issue:example/acme#7",
+        "github_pr:example/acme#10": "github_issue:example/acme#8",
+    }
+    assert result.observations["branches"] == [
+        {"source_id": "github_pr:example/acme#9", "ref": "feature/9-work"},
+        {"source_id": "github_pr:example/acme#10", "ref": "feature/10-work"},
+    ]
+    assert result.observations["remote_prs"] == [
+        {
+            "source_id": "github_pr:example/acme#10",
+            "candidate": "a" * 40,
+            "merge_revision": None,
+            "merged_with_merge_commit": False,
+        },
+        {
+            "source_id": "github_pr:example/acme#9",
+            "candidate": "e" * 40,
+            "merge_revision": None,
+            "merged_with_merge_commit": False,
+        },
+    ]
+    assert result.observations["default_branch"] == "main"
+    assert result.observations["default_revision"] == "d" * 40
+    assert runner.calls[0] == (
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={GitHubTerminalProvider._QUERY}",
+        "-F",
+        "owner=example",
+        "-F",
+        "name=acme",
+    )
+    assert runner.calls[1] == (
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        f"query={GitHubTerminalProvider._QUERY}",
+        "-F",
+        "owner=example",
+        "-F",
+        "name=acme",
+        "-F",
+        "cursor=cursor-1",
+    )
+
+
+def test_github_terminal_provider_pull_request_page_limit_is_explicit_failure():
+    runner = SequenceRunner(
+        [
+            _completed(
+                {
+                    "data": {
+                        "repository": {
+                            "defaultBranchRef": {
+                                "name": "main",
+                                "target": {"oid": "d" * 40},
+                            },
+                            "pullRequests": {
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": f"cursor-{index}",
+                                },
+                                "nodes": [],
+                            },
+                        }
+                    }
+                }
+            )
+            for index in range(20)
+        ]
+    )
+
+    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "degraded"
+    assert result.sources == ()
+    assert result.observations == {}
+    assert result.diagnostics == ("github terminal evidence unavailable",)
+    assert len(runner.calls) == 20
+    assert all(call[:3] == ("gh", "api", "graphql") for call in runner.calls)
+
+
 def test_github_terminal_squash_merge_is_not_a_merge_commit():
     graph = {
         "data": {

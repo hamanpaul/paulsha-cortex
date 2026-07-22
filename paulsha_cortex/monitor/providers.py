@@ -724,7 +724,8 @@ class GitHubWorkProvider:
 class GitHubTerminalProvider:
     """Read closing references and remote default-branch archive evidence."""
 
-    _QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage} nodes{number body headRefName headRefOid state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
+    _QUERY = """query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,after:$cursor,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage endCursor} nodes{number body headRefName headRefOid state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
+    _PULL_REQUEST_PAGE_LIMIT = 20
 
     def __init__(
         self,
@@ -768,20 +769,27 @@ class GitHubTerminalProvider:
         attempted_at = _utcnow()
         owner, name = self.repo.split("/", 1)
         try:
-            graph = self._json(
-                (
-                    "gh", "api", "graphql",
-                    "-f", f"query={self._QUERY}",
-                    "-F", f"owner={owner}",
-                    "-F", f"name={name}",
-                )
-            )
+            graph = self._json(self._pull_request_argv(owner=owner, name=name))
             repository = graph["data"]["repository"]
+            default_branch_ref = repository["defaultBranchRef"]
             pulls = repository["pullRequests"]
-            if pulls["pageInfo"]["hasNextPage"]:
-                raise ValueError("pull request pagination incomplete")
-            default_branch = repository["defaultBranchRef"]["name"]
-            default_revision = repository["defaultBranchRef"]["target"]["oid"]
+            pull_nodes = list(pulls["nodes"])
+            page_count = 1
+            while pulls["pageInfo"]["hasNextPage"]:
+                if page_count >= self._PULL_REQUEST_PAGE_LIMIT:
+                    raise ValueError("pull request pagination incomplete")
+                cursor = pulls["pageInfo"]["endCursor"]
+                if not isinstance(cursor, str) or not cursor:
+                    raise ValueError("pull request pagination incomplete")
+                graph = self._json(
+                    self._pull_request_argv(owner=owner, name=name, cursor=cursor)
+                )
+                repository = graph["data"]["repository"]
+                pulls = repository["pullRequests"]
+                pull_nodes.extend(pulls["nodes"])
+                page_count += 1
+            default_branch = default_branch_ref["name"]
+            default_revision = default_branch_ref["target"]["oid"]
             if re.fullmatch(r"[0-9a-fA-F]{40}", default_revision) is None:
                 raise ValueError("default branch revision is invalid")
             tree = self._json(
@@ -839,7 +847,7 @@ class GitHubTerminalProvider:
             links: dict[str, str] = {}
             remote_prs: list[dict[str, object]] = []
             branches: list[dict[str, str]] = []
-            for pull in pulls["nodes"]:
+            for pull in pull_nodes:
                 number = pull["number"]
                 pr_source_id = f"github_pr:{self.repo}#{number}"
                 head_ref = pull.get("headRefName")
@@ -927,6 +935,23 @@ class GitHubTerminalProvider:
             sources=sources,
             observations=observations,
         )
+
+    def _pull_request_argv(
+        self,
+        *,
+        owner: str,
+        name: str,
+        cursor: str | None = None,
+    ) -> tuple[str, ...]:
+        argv = [
+            "gh", "api", "graphql",
+            "-f", f"query={self._QUERY}",
+            "-F", f"owner={owner}",
+            "-F", f"name={name}",
+        ]
+        if cursor is not None:
+            argv.extend(("-F", f"cursor={cursor}"))
+        return tuple(argv)
 
     def _json(self, argv: Sequence[str]) -> Mapping:
         completed = None
