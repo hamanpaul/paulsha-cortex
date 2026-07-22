@@ -264,6 +264,7 @@ def test_planning_runtime_detects_and_rolls_back_directory_and_metadata_pollutio
 def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
+    baseline_mode = empty.lstat().st_mode & 0o7777
     target = tmp_path / "target"
     target.mkdir()
     link = tmp_path / "dir-link"
@@ -277,7 +278,7 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
 
     empty.chmod(0o700)
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
-    empty.chmod(0o755)
+    empty.chmod(baseline_mode)
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
 
     link.unlink()
