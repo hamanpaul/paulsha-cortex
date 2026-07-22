@@ -80,6 +80,18 @@ def _exec_path_stale(exec_path: str | None) -> bool:
     return candidate.is_absolute() and not candidate.exists()
 
 
+def _stale_suggested_commands(instance: str, unit_name: str) -> list[str]:
+    return [
+        f"cortex install service --instance {instance}",
+        f"systemctl --user restart {unit_name}",
+    ]
+
+
+def _stale_suggestion(instance: str, unit_name: str) -> str:
+    install, restart = _stale_suggested_commands(instance, unit_name)
+    return f"stale ExecStart detected; rerun `{install}` or `{restart}` after restoring the venv"
+
+
 def _unit_status(unit_name: str, unit_path: Path, live_rows: Mapping[str, Mapping[str, Any]]) -> str:
     row = live_rows.get(unit_name)
     if row is not None:
@@ -115,13 +127,16 @@ def probe_service_runtime(instance: str) -> dict[str, Any]:
     for unit_name in unit_names:
         unit_path = unit_root / unit_name
         exec_path = _unit_exec_path(unit_path) if unit_name.endswith(".service") else None
+        stale = _exec_path_stale(exec_path)
         units[unit_name] = {
             "path": str(unit_path),
             "present": unit_path.exists(),
             "status": _unit_status(unit_name, unit_path, live_rows),
             "pid": _unit_pid(unit_name, live_rows),
             "exec_path": exec_path,
-            "stale": _exec_path_stale(exec_path),
+            "stale": stale,
+            "suggested_commands": _stale_suggested_commands(instance, unit_name) if stale else [],
+            "suggestion": _stale_suggestion(instance, unit_name) if stale else None,
         }
     mode = "systemd" if any(unit["present"] for unit in units.values()) else "unmanaged"
     return {

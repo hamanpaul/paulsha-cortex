@@ -123,10 +123,14 @@ def _print_service(service: dict[str, Any]) -> None:
     sys.stdout.write(f"mode: {service.get('mode')}\n")
     sys.stdout.write(f"version: {service.get('version')}\n")
     for unit_name, row in sorted(service.get("units", {}).items()):
-        sys.stdout.write(
+        line = (
             f"{unit_name}\tstatus={row.get('status')}\tpid={row.get('pid') or '-'}"
-            f"\texec_path={row.get('exec_path') or '-'}\tstale={row.get('stale')}\n"
+            f"\texec_path={row.get('exec_path') or '-'}\tstale={row.get('stale')}"
         )
+        suggestion = row.get("suggestion")
+        if suggestion:
+            line += f"\tsuggestion={suggestion}"
+        sys.stdout.write(line + "\n")
 
 
 def _run_status(*, json_output: bool) -> int:

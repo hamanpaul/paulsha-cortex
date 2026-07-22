@@ -345,12 +345,20 @@ def test_inspect_service_flags_unit_pointing_to_missing_venv(
     assert rendered["service"]["mode"] == "systemd"
     assert rendered["service"]["units"]["cortex-monitor.service"]["exec_path"] == str(missing_python)
     assert rendered["service"]["units"]["cortex-monitor.service"]["stale"] is True
+    assert rendered["service"]["units"]["cortex-monitor.service"]["suggested_commands"] == [
+        "cortex install service --instance cortex",
+        "systemctl --user restart cortex-monitor.service",
+    ]
+    assert "cortex install service --instance cortex" in rendered["service"]["units"]["cortex-monitor.service"]["suggestion"]
+    assert "systemctl --user restart cortex-monitor.service" in rendered["service"]["units"]["cortex-monitor.service"]["suggestion"]
 
     assert _run_cli(["inspect", "service"]) == 0
     human = capsys.readouterr().out
     assert "cortex-monitor.service" in human
     assert str(missing_python) in human
     assert "stale" in human.lower()
+    assert "cortex install service --instance cortex" in human
+    assert "systemctl --user restart cortex-monitor.service" in human
 
 
 @pytest.mark.parametrize(
