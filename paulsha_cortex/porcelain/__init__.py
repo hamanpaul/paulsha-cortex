@@ -14,7 +14,7 @@ class PorcelainCommand:
 
 
 COMMANDS: dict[str, PorcelainCommand] = {}
-_FAMILY_MODULES: tuple[str, ...] = ("paulsha_cortex.porcelain.request", "paulsha_cortex.porcelain.inspect")
+_FAMILY_MODULES: tuple[str, ...] = ("paulsha_cortex.porcelain.request", "paulsha_cortex.porcelain.inspect", "paulsha_cortex.porcelain.service")
 _LOADED_MODULES: set[str] = set()
 
 
