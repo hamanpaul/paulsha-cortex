@@ -4870,7 +4870,7 @@ def _select_workflow_identity(run, step, identities: IdentityRegistry):
     candidates = list(identities.identities)
     if step.persona == "planner":
         candidates = [item for item in candidates if "planning" in item.capabilities]
-    if step.persona == "reviewer":
+    elif step.persona == "reviewer":
         candidates = [
             item
             for item in candidates

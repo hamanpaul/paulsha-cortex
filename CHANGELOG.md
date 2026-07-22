@@ -16,6 +16,7 @@
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
 
 ### Fixed
+- **planner workflow identity 不再被 `primary_domain` 釘死**：`_select_workflow_identity()` 現在只對非 planner、非 reviewer persona 套用 domain 偏好，避免 primary domain 是 google 時規劃階段被 agy 單點綁死。
 - **model identities custom 優先 packaged 預設**：`load_model_identities()` 合併 packaged 與 custom registry 時改為先放 custom 條目，避免本機不可用的 agy 永遠搶先 operator 在 custom 設定的 planner 而卡在重派迴圈。
 - **builder archive gate 交付路徑與 tasks 勾選指示補齊**：builder persona 現在可寫 active OpenSpec、changelog、CHANGELOG 與 superpowers plan 路徑，commit-required workflow prompt 也會明示更新對應 `tasks.md` 勾選且不得改動 pinned input。
 - **archive gate 不再把 R-22 advisory WARN 視為阻斷**：`policy_check` 的 doc reference gate 現在只以 return code 判定，避免既有 diff-aware R-22 advisory WARN 讓所有 archive change 永遠卡在 `doc-reference-invalid`。
