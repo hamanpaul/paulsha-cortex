@@ -96,23 +96,6 @@ def test_load_config_missing_hippo_graceful(monkeypatch, tmp_path):
     assert cfg.hippo_projects == ()
 
 
-def test_load_config_explicit_path_ignores_ambient_hippo(monkeypatch, tmp_path):
-    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path))
-    config_path = tmp_path / "project-cortex.yaml"
-    config_path.write_text(
-        f"workspaces:\n  - {{name: a, path: {tmp_path / 'workspace'}}}\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "project-hippo.yaml").write_text(
-        f"projects:\n  - slug: ambient\n    roots: [{tmp_path / 'ambient'}]\n",
-        encoding="utf-8",
-    )
-
-    cfg = load_config(config_path=config_path)
-
-    assert cfg.hippo_projects == ()
-
-
 def test_load_config_both_missing_fails(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_MONITOR_CONFIG", raising=False)
     monkeypatch.delenv("PAULSHACLAW_CONFIG", raising=False)
