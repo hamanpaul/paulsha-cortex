@@ -112,6 +112,15 @@ python -m pip install .
 
    新的 Work Item read model 使用 `topic → todo → on-going → done` 四態；日常操作、override、snapshot/registry migration 與 delivery gate 詳見 [Unified Work Lifecycle 操作與遷移](docs/unified-work-lifecycle.md)。所有工作預設 manual，只有 confirmed Todo 對應到帶 `cortex:auto-on-going` label 的 confirmed issue 才能 auto claim。
 
+7. 追蹤已送出的 control request（唯讀、不經 control queue）：
+
+   ```bash
+   cortex request list --json
+   cortex request show "$REQUEST_ID"
+   cortex request wait "$REQUEST_ID" --timeout 30
+   cortex request logs "$REQUEST_ID" --json
+   ```
+
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 
 ## 從使用者角度操作
