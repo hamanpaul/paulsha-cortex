@@ -26,4 +26,3 @@ TBD - created by archiving change porcelain-request. Update Purpose after archiv
 
 - **WHEN** 腳本執行 `cortex request list --json`
 - **THEN** stdout 為單一 JSON 文件、含 schema 欄位與 requests 陣列（每項含 request_id/type/state/建立時間）
-
