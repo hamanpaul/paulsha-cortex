@@ -184,6 +184,37 @@ def _workflow_args(manifest_path: Path, artifact_root: Path) -> dict[str, object
     }
 
 
+def _write_planning_artifacts(root: Path, *, missing: set[str] | None = None) -> tuple[PlanningArtifactAuthority, ...]:
+    missing = missing or set()
+    proposal = root / "openspec/changes/production-wiring/proposal.md"
+    proposal.parent.mkdir(parents=True, exist_ok=True)
+    proposal.write_text("# Proposal\n", encoding="utf-8")
+    bodies = {
+        "spec": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nFixed.\n",
+        "design": "---\nstatus: accepted\n---\n# Design\n## Decisions\nFixed.\n",
+        "plan": "---\nstatus: accepted\n---\n# Plan\n## Task 1\nBuild.\n",
+    }
+    authority: list[PlanningArtifactAuthority] = []
+    for kind, body in bodies.items():
+        ref = f"docs/{kind}.md"
+        path = root / ref
+        if kind not in missing:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        else:
+            digest = "0" * 64
+        authority.append(
+            PlanningArtifactAuthority(
+                ref=ref,
+                kind=kind,
+                work_id="production-wiring",
+                baseline_sha256=digest,
+            )
+        )
+    return tuple(authority)
+
+
 def test_control_queue_workflow_action_is_the_production_mutation_path(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
@@ -383,6 +414,114 @@ def test_public_work_retry_build_forces_one_new_manager_dispatched_builder(
     assert result["result"]["job_id"] == "repair-builder"
 
 
+def test_plan_dispatch_passes_complete_planner_card_without_launch(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    authority = _write_planning_artifacts(repo)
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"plan": 1},
+        gate_status="running",
+        planning_authority=authority,
+    )
+
+    result = manager.dispatch_workflow_card(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run=run,
+        identities=IdentityRegistry.from_rows([]),
+        launcher_factory=lambda _: (_ for _ in ()).throw(AssertionError("must not launch")),
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    planner = next(step for step in persisted.steps if step.card == "writing-plans")
+
+    assert result is None
+    assert persisted.current_phase == "build"
+    assert persisted.attempts == {"plan": 1, "build": 1}
+    assert planner.gate_result == "passed"
+    assert (planner.executor, planner.model, planner.domain) == (
+        "cortex-manager",
+        "deterministic",
+        "cortex",
+    )
+    assert planner.outputs == tuple(item.ref for item in authority)
+    assert registry.list_jobs() == []
+
+
+def test_plan_dispatch_launches_planner_when_artifacts_are_incomplete(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    authority = _write_planning_artifacts(repo, missing={"plan"})
+    run = registry._manager_create_workflow_run(
+        work_id="production-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "1" * 64,
+        source_revision="2" * 64,
+        workspace_root=str(repo),
+        combo="feature-oneshot",
+        current_phase="plan",
+        steps=_manifest().steps,
+        issue_refs=("hamanpaul/paulsha-cortex#14",),
+        openspec_refs=("production-wiring",),
+        pr_refs=(),
+        attempts={"plan": 1},
+        gate_status="running",
+        planning_authority=authority,
+    )
+    launched: list[str] = []
+
+    class Launcher:
+        def as_read_only(self):
+            return self
+
+        def launch(self, *, slice_id, prompt, worktree, log_dir):
+            launched.append(slice_id)
+            return LaunchHandle(
+                executor="codex",
+                model_id="gpt-primary",
+                session_name=slice_id,
+                pid=100,
+                log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
+            )
+
+    job = manager.dispatch_workflow_card(
+        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        run=run,
+        identities=IdentityRegistry.from_rows(
+            [{
+                "executor": "codex",
+                "model_id": "gpt-primary",
+                "independence_domain": "openai",
+                "capabilities": ["planning"],
+            }]
+        ),
+        launcher_factory=lambda _: Launcher(),
+        coordinator_root=tmp_path / "coordinator",
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+
+    assert job is not None
+    assert job["workflow_card"] == "writing-plans"
+    assert launched == [job["job_id"]]
+    assert persisted.current_phase == "plan"
+    assert next(step for step in persisted.steps if step.card == "writing-plans").gate_result == "pending"
+    assert len(registry.list_jobs()) == 1
+
+
 def test_forced_retry_build_dispatches_new_job_after_prior_success(
     tmp_path: Path,
 ) -> None:
@@ -467,7 +606,7 @@ def test_forced_retry_build_dispatches_new_job_after_prior_success(
                 "executor": "codex",
                 "model_id": "gpt-primary",
                 "independence_domain": "openai",
-                "capabilities": ["planning"],
+                "capabilities": ["build"],
             }]
         ),
         launcher_factory=lambda _: Launcher(),
@@ -1015,7 +1154,7 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         "executor": "codex",
         "model_id": "gpt-primary",
         "independence_domain": "openai",
-        "capabilities": [],
+        "capabilities": ["build"],
     }])
     stopped = manager.resume_workflow_run(
         ResumeDispatcher(),
@@ -1262,7 +1401,7 @@ def test_operator_resume_retries_malformed_build_terminal_without_advancing(
             "executor": "codex",
             "model_id": "gpt-primary",
             "independence_domain": "openai",
-            "capabilities": [],
+            "capabilities": ["build"],
         }]
     )
 
@@ -2212,7 +2351,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
                 "executor": "codex",
                 "model_id": "gpt-primary",
                 "independence_domain": "openai",
-                "capabilities": ["planning"],
+                "capabilities": ["planning", "build"],
             },
             {
                 "executor": "claude",
@@ -2376,8 +2515,8 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     assert calls == ["questioner", "secondary:anthropic", "integrator"]
     assert commit_capability_requests == []
     assert review_capability_requests == []
-    assert plan_launch_roots and all(path != tmp_path for path in plan_launch_roots)
-    assert run.current_phase == "plan"
+    assert plan_launch_roots == []
+    assert run.current_phase == "build"
     assert [ref.kind for ref in run.gate_refs] == ["brainstorm"]
     assert Path(run.gate_refs[0].ref).is_file()
 
@@ -2425,7 +2564,9 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
             requested_by="operator",
         ))
         seen_phases.append(result["current_phase"])
-    assert seen_phases == ["build", "build", "build", "verify", "review", "review", "review"]
+        if result["reason"] == "blocking-findings":
+            break
+    assert seen_phases == ["build", "build", "verify", "review", "review", "review"]
     assert commit_capability_requests == ["required", "required"]
     assert review_capability_requests == [
         "workflow-verification-result",
@@ -2595,7 +2736,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         for step in shipped.steps if step.phase in {"claim", "define", "plan", "build", "verify", "review"}
     )
     workflow_jobs = [job for job in registry.list_jobs() if job.get("workflow_run_id") == run.run_id]
-    assert len(workflow_jobs) == 10
+    assert len(workflow_jobs) == 9
     assert {
         job.get("workflow_card")
         for job in workflow_jobs
@@ -2814,6 +2955,148 @@ def test_manager_rejects_same_domain_reviewer_before_dispatch(tmp_path: Path) ->
     review_step = next(step for step in run.steps if step.phase == "review")
     with pytest.raises(ValueError, match="no configured identity"):
         manager._select_workflow_identity(run, review_step, identities)
+
+
+def _workflow_identity_run(*, primary_domain: str | None, build_domain: str | None = None) -> SimpleNamespace:
+    steps = []
+    if build_domain is not None:
+        steps.append(SimpleNamespace(phase="build", gate_result="passed", domain=build_domain))
+    return SimpleNamespace(primary_domain=primary_domain, steps=steps)
+
+
+def test_planner_identity_selection_ignores_primary_domain_preference() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "builder-openai",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "planner-claude",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning", "review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google"),
+        SimpleNamespace(persona="planner"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("claude", "planner-claude")
+
+
+def test_builder_identity_selection_requires_build_capability_before_domain_preference() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "builder-openai",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "planner-claude",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning", "review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google"),
+        SimpleNamespace(persona="builder"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("copilot", "builder-openai")
+
+
+def test_builder_identity_selection_still_prefers_primary_domain_after_build_filter() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "builder-openai",
+                "independence_domain": "openai",
+                "capabilities": ["build"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "planner-claude",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning", "review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+            {
+                "executor": "gemini",
+                "model_id": "builder-google",
+                "independence_domain": "google",
+                "capabilities": ["build"],
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google"),
+        SimpleNamespace(persona="builder"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("gemini", "builder-google")
+
+
+def test_reviewer_identity_selection_excludes_builder_domains() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "review-google",
+                "independence_domain": "google",
+                "capabilities": ["review"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "review-anthropic",
+                "independence_domain": "anthropic",
+                "capabilities": ["review"],
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google", build_domain="google"),
+        SimpleNamespace(persona="reviewer"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("claude", "review-anthropic")
 
 
 def test_manager_rejects_planner_artifacts_outside_governed_roots(tmp_path: Path) -> None:
@@ -4216,8 +4499,9 @@ def test_complete_plan_does_not_require_or_launch_brainstorm(tmp_path: Path) -> 
     result = executor(build_request(req_type="workflow-action", args=args, requested_by="operator"))
     run = registry.get_workflow_run(result["run_id"])
     assert result["reason"] == "planning-complete"
-    assert launched == [result["job_id"]]
+    assert launched == []
     assert run.brainstorm_required is False
+    assert run.current_phase == "build"
     assert run.gate_refs == ()
     assert {
         (authority.ref, authority.kind, authority.work_id, authority.baseline_sha256)

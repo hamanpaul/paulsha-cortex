@@ -887,7 +887,7 @@ identities:
   - executor: codex
     model_id: gpt-primary
     independence_domain: openai
-    capabilities: [planning]
+    capabilities: [planning, build]
   - executor: claude
     model_id: claude-reviewer
     independence_domain: anthropic
@@ -1059,8 +1059,11 @@ identities:
         )
     )
     run_id = started["result"]["run"]["run_id"]
-    first_job = registry.get_job(started["result"]["job_id"])
-    assert first_job["persona"] == "planner"
+    if "job_id" in started["result"]:
+        first_job = registry.get_job(started["result"]["job_id"])
+        assert first_job["persona"] == "planner"
+    else:
+        assert registry.get_workflow_run(run_id).current_phase == "build"
 
     result = None
     for _ in range(10):

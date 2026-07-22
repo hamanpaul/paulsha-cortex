@@ -9,6 +9,7 @@
 
 ### Added
 - **B2 porcelain-request 規劃產物**：request 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **porcelain-skeleton rollout 補充規格**：B1 驗收要求與 B2+ 接軌契約。
 - **B1 porcelain-skeleton 規劃產物**：路由骨架批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **cortex CLI 版本輸出**：新增頂層 `cortex --version`，輸出已安裝套件版本；若無 package metadata 則回退為 `0.0.0+unknown`。
 - **canary follow-ups workstream todo**：記錄 dogfood canary 實跑發現的後續事項，並作為 work authority 的新增 confirmed 來源。
@@ -16,6 +17,10 @@
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
 
 ### Fixed
+- **builder workflow identity 先過濾 build capability**：`_select_workflow_identity()` 現在會先排除不具 `build` 能力的 builder 候選，再套用 `primary_domain` 偏好，避免 google primary domain 把 build 卡誤派給僅支援 planning 的身分而陷入 malformed 重派。
+- **plan-phase planner 卡可在產物完備時由 Manager 決定性通過**：`writing-plans` 等規劃卡若其 persisted planning authority 對應的 accepted spec/design/plan 已完整存在，manager 會直接把當前 planner step 標記為 `passed` 並推進到下一 phase，不再多派 planner executor。
+- **planner workflow identity 不再被 `primary_domain` 釘死**：`_select_workflow_identity()` 現在只對非 planner、非 reviewer persona 套用 domain 偏好，避免 primary domain 是 google 時規劃階段被 agy 單點綁死。
+- **model identities custom 優先 packaged 預設**：`load_model_identities()` 合併 packaged 與 custom registry 時改為先放 custom 條目，避免本機不可用的 agy 永遠搶先 operator 在 custom 設定的 planner 而卡在重派迴圈。
 - **builder archive gate 交付路徑與 tasks 勾選指示補齊**：builder persona 現在可寫 active OpenSpec、changelog、CHANGELOG 與 superpowers plan 路徑，commit-required workflow prompt 也會明示更新對應 `tasks.md` 勾選且不得改動 pinned input。
 - **archive gate 不再把 R-22 advisory WARN 視為阻斷**：`policy_check` 的 doc reference gate 現在只以 return code 判定，避免既有 diff-aware R-22 advisory WARN 讓所有 archive change 永遠卡在 `doc-reference-invalid`。
 - **Copilot commit-required 卡補 scoped 檔案/工具權限**：workflow builder 派工現在會在 commit-required 模式只開 `--allow-all-tools` 與必要的 linked worktree Git 寫入目錄，避免 headless Copilot 因無法互動授權而卡在 commit。
