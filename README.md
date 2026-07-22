@@ -121,6 +121,17 @@ python -m pip install .
    cortex request logs "$REQUEST_ID" --json
    ```
 
+8. 用 `inspect` 家族直接檢查既有 runtime / registry / monitor 快照（唯讀、不經 control queue）：
+
+   ```bash
+   cortex inspect status --json
+   cortex inspect job "$JOB_ID"
+   cortex inspect ready --json
+   cortex inspect work porcelain-inspect --repo hamanpaul/paulsha-cortex
+   cortex inspect doctor --json
+   cortex inspect service --json
+   ```
+
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 
 ## 從使用者角度操作
