@@ -91,3 +91,19 @@ def test_load_config_wraps_read_os_error(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "read_text", fake_read_text)
     with pytest.raises(ValueError, match="讀取或解析失敗"):
         load_config(config_path=config_path)
+
+
+def test_explicit_config_path_scopes_hippo_sidecar_to_same_directory(monkeypatch, tmp_path):
+    external = tmp_path / "external"
+    local = tmp_path / "local"
+    monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(external))
+    (external / "project-hippo.yaml").parent.mkdir(parents=True, exist_ok=True)
+    (external / "project-hippo.yaml").write_text(
+        f"projects:\n  - slug: external\n    roots: [{tmp_path / 'external-repo'}]\n",
+        encoding="utf-8",
+    )
+    config_path = _write(local / "project-cortex.yaml")
+
+    cfg = load_config(config_path=config_path)
+
+    assert cfg.hippo_projects == ()

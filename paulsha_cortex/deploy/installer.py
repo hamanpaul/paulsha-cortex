@@ -7,11 +7,19 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
 _INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+@dataclass(frozen=True)
+class InstallServiceResult:
+    exit_code: int
+    mode: str
+    message: str
 
 
 def _template(name: str) -> str:
@@ -113,7 +121,7 @@ def _read_plain_env(env_file: Path) -> dict[str, str]:
     return values
 
 
-def install_service(instance: str, interval: int, repo_root: Path) -> int:
+def install_service_result(instance: str, interval: int, repo_root: Path) -> InstallServiceResult:
     home = Path.home()
     bootstrap_root = home / ".agents"
     runtime_dir = bootstrap_root / "core" / "runtime"
@@ -163,13 +171,28 @@ def install_service(instance: str, interval: int, repo_root: Path) -> int:
         ),
     )
     if not _systemctl_available():
-        print(f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式")
-        return 0
+        return InstallServiceResult(
+            exit_code=0,
+            mode="fallback",
+            message=(
+                f"systemd 不可用：單元已落檔 {unit_dir}，請改用 service-manager.sh 前景模式；"
+                "fallback 缺少 `cortex service logs --follow` 即時串流。"
+            ),
+        )
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     subprocess.run(["systemctl", "--user", "enable", f"{instance}-monitor.service"], check=True)
     subprocess.run(["systemctl", "--user", "enable", f"{instance}-manager.timer"], check=True)
-    print(f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service")
-    return 0
+    return InstallServiceResult(
+        exit_code=0,
+        mode="systemd",
+        message=f"installed: {instance}-manager.{{service,timer}} + {instance}-monitor.service",
+    )
+
+
+def install_service(instance: str, interval: int, repo_root: Path) -> int:
+    result = install_service_result(instance, interval, repo_root)
+    print(result.message)
+    return result.exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
