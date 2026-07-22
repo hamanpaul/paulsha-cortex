@@ -34,6 +34,15 @@ work_items:
         ref: porcelain-inspect
       - kind: path
         ref: docs/superpowers/workstreams/porcelain-inspect/todo.md
+  release-pipeline:
+    title: release-pipeline (B9)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#95
+      - kind: openspec
+        ref: release-pipeline
+      - kind: path
+        ref: docs/superpowers/workstreams/release-pipeline/todo.md
   porcelain-request:
     title: porcelain request family (B2)
     links:
