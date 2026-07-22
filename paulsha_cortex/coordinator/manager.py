@@ -1785,6 +1785,22 @@ def _load_workflow_manifest(path_value: str) -> WorkflowManifest:
     return WorkflowManifest.from_dict(payload)
 
 
+def _read_planning_artifact_content(root: Path, ref: str) -> tuple[bytes, str]:
+    relative = Path(ref)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("planning artifact escapes artifact root")
+    unresolved = root / relative
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValueError("symlink planning artifact")
+    resolved = unresolved.resolve()
+    resolved.relative_to(root)
+    content = resolved.read_bytes()
+    return content, content.decode("utf-8")
+
+
 def _load_planning_artifacts(
     args: Mapping[str, object],
     *,
@@ -1814,20 +1830,8 @@ def _load_planning_artifacts(
     artifacts: list[PlanningArtifact] = []
     scanned: list[PlanningArtifactAuthority] = []
     for index, (kind, ref) in enumerate(requested):
-        relative = Path(ref)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"workflow-action planning_artifacts[{index}] escapes artifact_root")
         try:
-            unresolved = root / relative
-            cursor = root
-            for part in relative.parts:
-                cursor = cursor / part
-                if cursor.is_symlink():
-                    raise ValueError("symlink planning artifact")
-            resolved = unresolved.resolve()
-            resolved.relative_to(root)
-            content = resolved.read_bytes()
-            text = content.decode("utf-8")
+            content, text = _read_planning_artifact_content(root, ref)
         except (OSError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(f"workflow planning artifact unreadable: {ref}") from exc
         artifacts.append(PlanningArtifact(kind=kind, ref=ref, text=text))
@@ -1842,6 +1846,18 @@ def _load_planning_artifacts(
     if authority and tuple(scanned) != authority:
         raise ValueError("workflow planning artifact current authority drift")
     return tuple(artifacts), tuple(scanned)
+
+
+def _load_run_planning_artifacts(run) -> tuple[PlanningArtifact, ...] | None:
+    root = Path(run.workspace_root).resolve()
+    artifacts: list[PlanningArtifact] = []
+    for authority in run.planning_authority:
+        try:
+            _content, text = _read_planning_artifact_content(root, authority.ref)
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        artifacts.append(PlanningArtifact(kind=authority.kind, ref=authority.ref, text=text))
+    return tuple(artifacts)
 
 
 def _manager_archive_applied(run) -> bool:
@@ -5122,6 +5138,42 @@ def _dispatch_workflow_card(
             card=step.card,
             coordinator_root=coordinator_root,
         )
+    if step.persona == "planner" and step.phase == "plan":
+        artifacts = _load_run_planning_artifacts(run)
+        try:
+            planning_complete = artifacts is not None and assess_planning_completeness(artifacts).complete
+        except ValueError:
+            planning_complete = False
+        if planning_complete:
+            pending_phase_steps = [
+                item
+                for item in run.steps
+                if item.phase == run.current_phase and item.gate_result != "passed"
+            ]
+            is_last_pending = bool(pending_phase_steps) and step.card == pending_phase_steps[-1].card
+            next_phase = run.current_phase
+            attempts = run.attempts
+            if is_last_pending:
+                next_phase = WORKFLOW_PHASES[WORKFLOW_PHASES.index(run.current_phase) + 1]
+                attempts = {
+                    **run.attempts,
+                    next_phase: run.attempts.get(next_phase, 0) + 1,
+                }
+            registry._manager_update_workflow_run(
+                run.run_id,
+                current_phase=next_phase,
+                steps=_audit_phase_steps(
+                    run.steps,
+                    phase=run.current_phase,
+                    executor="cortex-manager",
+                    model="deterministic",
+                    domain="cortex",
+                    outputs=tuple(artifact.ref for artifact in artifacts),
+                    card_id=step.card,
+                ),
+                attempts=attempts,
+            )
+            return None
     identity = _select_workflow_identity(run, step, identities)
     launcher = launcher_factory(identity)
     if launcher is None:
