@@ -252,7 +252,7 @@ def load_model_identities(
         additions.append(identity)
     return IdentityRegistry(
         schema_version=MODEL_IDENTITY_SCHEMA_VERSION,
-        identities=packaged.identities + tuple(additions),
+        identities=tuple(additions) + packaged.identities,
     )
 
 

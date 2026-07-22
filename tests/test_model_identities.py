@@ -51,6 +51,44 @@ identities:
     assert registry.require("codex", "gpt-primary").independence_domain == "openai"
 
 
+def test_packaged_default_puts_custom_identities_before_packaged_defaults(tmp_path: Path) -> None:
+    (tmp_path / "model-identities.yaml").write_text(
+        """\
+schema_version: 2
+identities:
+  - executor: claude
+    model_id: planner
+    independence_domain: anthropic
+    capabilities: [planning, review]
+  - executor: copilot
+    model_id: build
+    independence_domain: github
+    capabilities: [build]
+""",
+        encoding="utf-8",
+    )
+
+    registry = load_model_identities(tmp_path, use_packaged_default=True)
+
+    assert [
+        (identity.executor, identity.model_id)
+        for identity in registry.identities
+    ] == [
+        ("claude", "planner"),
+        ("copilot", "build"),
+        ("agy", AGY_MODEL_ID),
+    ]
+
+
+def test_packaged_default_without_custom_file_returns_packaged_only(tmp_path: Path) -> None:
+    registry = load_model_identities(tmp_path, use_packaged_default=True)
+
+    assert [
+        (identity.executor, identity.model_id)
+        for identity in registry.identities
+    ] == [("agy", AGY_MODEL_ID)]
+
+
 def test_v2_registry_is_strict_and_rejects_unknown_or_duplicate_rows(tmp_path: Path) -> None:
     path = tmp_path / "model-identities.yaml"
     path.write_text(
