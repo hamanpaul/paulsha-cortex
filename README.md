@@ -36,6 +36,17 @@ python -m pip install .
 
 ## Usage
 
+### 10 分鐘上手：`cortex bootstrap`
+
+乾淨機器或新 workspace 建議先跑一次 bootstrap，把 preflight、service install/start 與基本健檢串成單一入口：
+
+```bash
+cortex bootstrap --dry-run
+cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
+```
+
+`--dry-run` 只會檢查 Python/Git/repo/登入態並預覽後續命令，不會修改任何檔案或啟動服務；正式執行時預設會 install + start，最後附上 `inspect status` / `inspect doctor` 的下一步指引。若想順手產生第一個 sample workflow，可加 `--sample feature-oneshot --task "demo feature"`；sample 失敗只會降級回報，不影響 bootstrap 核心步驟成功與否。
+
 1. 在被治理的目標 git repo 安裝 systemd `--user` 單元：
 
    ```bash
