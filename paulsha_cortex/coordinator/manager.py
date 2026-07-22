@@ -4893,10 +4893,12 @@ def _select_workflow_identity(run, step, identities: IdentityRegistry):
             if "review" in item.capabilities
             and item.independence_domain not in builder_domains
         ]
-    elif run.primary_domain is not None:
-        preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
-        if preferred:
-            candidates = preferred
+    else:
+        candidates = [item for item in candidates if "build" in item.capabilities]
+        if run.primary_domain is not None:
+            preferred = [item for item in candidates if item.independence_domain == run.primary_domain]
+            if preferred:
+                candidates = preferred
     if not candidates:
         raise ValueError(f"no configured identity for workflow persona: {step.persona}")
     return candidates[0]
