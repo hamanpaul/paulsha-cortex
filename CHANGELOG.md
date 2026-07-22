@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- **B4 porcelain-service 規劃產物**：service 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-inspect 唯讀檢查 CLI**：新增 `cortex inspect status/job/ready/work/doctor/service` 家族、versioned `cortex-porcelain/inspect/v1` JSON 輸出，以及 systemd unit exec path stale 偵測。
 - **B3 porcelain-inspect 規劃產物**：inspect 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-request request 追蹤 CLI**：新增唯讀 `cortex request list/show/wait/logs` 家族、versioned `cortex-porcelain/request/v1` JSON 輸出，以及 request timeout 後的顯性追蹤面。
