@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- **porcelain-skeleton rollout 補充規格**：B1 驗收要求與 B2+ 接軌契約。
 - **B1 porcelain-skeleton 規劃產物**：路由骨架批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **cortex CLI 版本輸出**：新增頂層 `cortex --version`，輸出已安裝套件版本；若無 package metadata 則回退為 `0.0.0+unknown`。
 - **canary follow-ups workstream todo**：記錄 dogfood canary 實跑發現的後續事項，並作為 work authority 的新增 confirmed 來源。
