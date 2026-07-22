@@ -12,6 +12,7 @@ from paulsha_cortex.control.client import read_status
 from paulsha_cortex.coordinator import autonomy
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.doctor import run_doctor
+from paulsha_cortex.monitor.config import default_socket_path, load_config
 from paulsha_cortex.monitor.work_api import MonitorSocketClient
 
 from . import COMMANDS, PorcelainCommand, register
@@ -173,11 +174,18 @@ def _run_ready(*, json_output: bool) -> int:
     return 0
 
 
+def _monitor_socket_path() -> str:
+    try:
+        return str(load_config().socket_path)
+    except FileNotFoundError:
+        return str(default_socket_path())
+
+
 def _load_work_item(work_id: str, *, repo: str | None) -> dict[str, Any]:
     request = {"kind": "get_work_item", "work_id": work_id}
     if repo is not None:
         request["repo"] = repo
-    response = MonitorSocketClient().request(request)
+    response = MonitorSocketClient(socket_path=_monitor_socket_path()).request(request)
     if not response.get("ok"):
         raise ValueError(str(response.get("error", f"work item not found: {work_id}")))
     data = response.get("data")
