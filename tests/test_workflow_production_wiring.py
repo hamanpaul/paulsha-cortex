@@ -2816,6 +2816,95 @@ def test_manager_rejects_same_domain_reviewer_before_dispatch(tmp_path: Path) ->
         manager._select_workflow_identity(run, review_step, identities)
 
 
+def _workflow_identity_run(*, primary_domain: str | None, build_domain: str | None = None) -> SimpleNamespace:
+    steps = []
+    if build_domain is not None:
+        steps.append(SimpleNamespace(phase="build", gate_result="passed", domain=build_domain))
+    return SimpleNamespace(primary_domain=primary_domain, steps=steps)
+
+
+def test_planner_identity_selection_ignores_primary_domain_preference() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "planner-claude",
+                "independence_domain": "anthropic",
+                "capabilities": ["planning", "review"],
+            },
+            {
+                "executor": "agy",
+                "model_id": AGY_MODEL_ID,
+                "independence_domain": "google",
+                "capabilities": ["planning"],
+                "live_probe": AGY_LIVE_PROBE,
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google"),
+        SimpleNamespace(persona="planner"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("claude", "planner-claude")
+
+
+def test_builder_identity_selection_still_prefers_primary_domain() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex",
+                "model_id": "builder-openai",
+                "independence_domain": "openai",
+                "capabilities": [],
+            },
+            {
+                "executor": "gemini",
+                "model_id": "builder-google",
+                "independence_domain": "google",
+                "capabilities": [],
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google"),
+        SimpleNamespace(persona="builder"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("gemini", "builder-google")
+
+
+def test_reviewer_identity_selection_excludes_builder_domains() -> None:
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "claude",
+                "model_id": "review-google",
+                "independence_domain": "google",
+                "capabilities": ["review"],
+            },
+            {
+                "executor": "claude",
+                "model_id": "review-anthropic",
+                "independence_domain": "anthropic",
+                "capabilities": ["review"],
+            },
+        ]
+    )
+
+    selected = manager._select_workflow_identity(
+        _workflow_identity_run(primary_domain="google", build_domain="google"),
+        SimpleNamespace(persona="reviewer"),
+        identities,
+    )
+
+    assert (selected.executor, selected.model_id) == ("claude", "review-anthropic")
+
+
 def test_manager_rejects_planner_artifacts_outside_governed_roots(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="outside governed roots"):
         manager._publish_planning_artifacts(
