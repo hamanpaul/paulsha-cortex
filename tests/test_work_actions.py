@@ -2276,6 +2276,126 @@ def test_review_findings_persist_across_heads_and_third_round_needs_human(
     assert persisted["ship"]["fix_rounds"] == 2
 
 
+def test_ship_fix_required_persists_capped_reviewer_findings(
+    monkeypatch, tmp_path: Path
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    state = tmp_path / "runs.json"
+    work_actions.execute_work_action(
+        args={"action": "start", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+
+    threads = tuple(
+        ReviewThread(
+            thread_id=f"thread-{index}",
+            resolved=False,
+            outdated=False,
+            path=f"src/file_{index}.py",
+            line=100 + index,
+            body_excerpt=f"finding {index}",
+        )
+        for index in range(12)
+    )
+    current = {"review_ready": False}
+
+    class GitHub:
+        def __init__(self, *, runner):
+            pass
+
+        def ensure_pr_metadata(self, **kwargs):
+            pass
+
+        def fetch_delivery_facts(self, **kwargs):
+            reviews = ()
+            if current["review_ready"]:
+                reviews = (
+                    CopilotReview(
+                        review_id=9,
+                        commit_id=HEAD,
+                        state="COMMENTED",
+                        body="findings",
+                        author=COPILOT_REVIEWER_LOGIN,
+                        submitted_at_epoch=205.0,
+                    ),
+                )
+            return DeliveryFacts(
+                head=HEAD,
+                mergeable=True,
+                mergeable_state="clean",
+                checks=(),
+                copilot_reviews=reviews,
+                review_threads=threads,
+                closing_issues=(12,),
+                active_openspec_absent=True,
+                archive_present=True,
+            )
+
+        def fetch_merge_status(self, **kwargs):
+            return MergeStatus(False, HEAD, None)
+
+        def request_copilot(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(work_actions, "GitHubDeliveryClient", GitHub)
+    monkeypatch.setattr(work_actions, "load_preflight_command", lambda: ("preflight",))
+    monkeypatch.setattr(
+        work_actions,
+        "run_preflight",
+        lambda **kwargs: PreflightResult(
+            True,
+            None,
+            CommandResult(("policy",), 0, "", ""),
+            CommandResult(("preflight",), 0, "", ""),
+            HEAD,
+            TREE,
+        ),
+    )
+    args = {
+        "action": "ship",
+        "repo": "acme/demo",
+        "work_id": "demo",
+        "repo_root": str(tmp_path),
+        "pr_number": 8,
+        "change": "demo",
+        "todo_paths": ["docs/todo.md"],
+        "pr_metadata_path": str(_pr_metadata(tmp_path / "pr.json")),
+    }
+
+    requested = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+    )
+    assert requested["result"]["action"] == "awaiting-copilot"
+
+    current["review_ready"] = True
+    reviewed = work_actions.execute_work_action(
+        args=args,
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 207,
+    )
+
+    assert reviewed["result"] == {
+        "action": "fix-required",
+        "reason": "copilot-findings",
+        "findings": 12,
+    }
+    persisted = _only_journal_row(state)
+    assert persisted["ship"]["phase"] == "needs-fix"
+    assert persisted["ship"]["findings"] == [
+        {"path": f"src/file_{index}.py", "line": 100 + index, "body": f"finding {index}"}
+        for index in range(10)
+    ]
+
+
 def test_external_merge_without_durable_authorization_needs_human(monkeypatch, tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"

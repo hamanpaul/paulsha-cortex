@@ -4926,6 +4926,47 @@ _LEGACY_CARD_EXECUTION = {
 }
 
 
+def _repair_findings_prompt_suffix(run, *, coordinator_root: str | Path) -> str:
+    journal_path = Path(coordinator_root) / "delivery-journal.json"
+    if journal_path.is_symlink() or not journal_path.is_file():
+        return ""
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    runs = journal.get("runs") if isinstance(journal, dict) else None
+    row = runs.get(run.run_id) if isinstance(runs, dict) else None
+    ship = row.get("ship") if isinstance(row, dict) else None
+    findings = ship.get("findings") if isinstance(ship, dict) else None
+    if not (
+        isinstance(ship, dict)
+        and ship.get("phase") == "needs-fix"
+        and isinstance(findings, list)
+        and findings
+    ):
+        return ""
+    compact: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        path = finding.get("path")
+        line = finding.get("line")
+        body = finding.get("body")
+        if path is not None and not isinstance(path, str):
+            continue
+        if line is not None and (not isinstance(line, int) or isinstance(line, bool)):
+            continue
+        if not isinstance(body, str) or not body:
+            continue
+        compact.append(f"[{path or '?'}:{line if line is not None else '?'}] {body}")
+    if not compact:
+        return ""
+    suffix = " Reviewer findings to fix in this repair (address each, then commit): " + "; ".join(
+        compact
+    )
+    return suffix[:2000]
+
+
 def _workflow_job_prompt(
     run,
     step,
@@ -5049,6 +5090,11 @@ def _workflow_job_prompt(
         if effective_commit_policy == "required"
         else ""
     )
+    repair_findings_contract = (
+        _repair_findings_prompt_suffix(run, coordinator_root=coordinator_root)
+        if effective_commit_policy == "required"
+        else ""
+    )
     return (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
         "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
@@ -5061,6 +5107,7 @@ def _workflow_job_prompt(
         + planner_contract
         + reviewer_contract
         + commit_required_contract
+        + repair_findings_contract
         + " Contract: "
         + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )

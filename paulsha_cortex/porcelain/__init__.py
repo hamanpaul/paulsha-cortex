@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import sys
 from typing import Callable, Sequence
 
 
@@ -13,7 +14,7 @@ class PorcelainCommand:
 
 
 COMMANDS: dict[str, PorcelainCommand] = {}
-_FAMILY_MODULES: tuple[str, ...] = ()
+_FAMILY_MODULES: tuple[str, ...] = ("paulsha_cortex.porcelain.request", "paulsha_cortex.porcelain.inspect")
 _LOADED_MODULES: set[str] = set()
 
 
@@ -27,7 +28,28 @@ def load_commands() -> None:
     for module_name in _FAMILY_MODULES:
         if module_name in _LOADED_MODULES:
             continue
-        module = importlib.import_module(module_name)
-        register_commands = getattr(module, "register_commands")
-        register_commands()
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            sys.stderr.write(
+                f"warning: porcelain family {module_name} skipped: import failed ({type(exc).__name__}: {exc})\n"
+            )
+            continue
+        register_commands = getattr(module, "register_commands", None)
+        if not callable(register_commands):
+            sys.stderr.write(
+                f"warning: porcelain family {module_name} skipped: register_commands missing or not callable\n"
+            )
+            continue
+        snapshot = dict(COMMANDS)
+        try:
+            register_commands()
+        except Exception as exc:
+            COMMANDS.clear()
+            COMMANDS.update(snapshot)
+            sys.stderr.write(
+                f"warning: porcelain family {module_name} skipped: register_commands failed "
+                f"({type(exc).__name__}: {exc})\n"
+            )
+            continue
         _LOADED_MODULES.add(module_name)

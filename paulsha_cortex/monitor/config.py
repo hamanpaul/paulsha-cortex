@@ -180,7 +180,8 @@ def load_config(*, config_path: Path | None = None) -> MonitorConfig:
     `PAULSHACLAW_CONFIG` env → `project-cortex.yaml` → legacy `paulshaclaw.yaml`.
     """
     resolved = _resolve_config_source(config_path)
-    hippo = tuple(load_hippo_projects())
+    hippo_path = resolved.parent / "project-hippo.yaml" if resolved is not None else None
+    hippo = tuple(load_hippo_projects(hippo_path))
     if resolved is None:
         if not hippo:
             raise FileNotFoundError(

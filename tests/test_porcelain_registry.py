@@ -45,3 +45,47 @@ def test_load_commands_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert seen == ["register"]
     assert list(porcelain.COMMANDS) == ["demo"]
+
+
+def test_load_commands_fail_open_skips_broken_family_and_keeps_good_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    porcelain = _import_porcelain()
+    porcelain.COMMANDS.clear()
+
+    good_family = types.ModuleType("good_porcelain_family")
+
+    def register_commands() -> None:
+        porcelain.register(
+            porcelain.PorcelainCommand(name="demo", help="demo command", run=lambda argv: 0)
+        )
+
+    good_family.register_commands = register_commands
+    monkeypatch.setitem(sys.modules, "good_porcelain_family", good_family)
+    monkeypatch.setattr(
+        porcelain,
+        "_FAMILY_MODULES",
+        ("missing_porcelain_family", "good_porcelain_family"),
+    )
+
+    porcelain.load_commands()
+
+    assert list(porcelain.COMMANDS) == ["demo"]
+    assert "missing_porcelain_family" in capsys.readouterr().err
+
+
+def test_load_commands_fail_open_reports_missing_register_commands(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    porcelain = _import_porcelain()
+    porcelain.COMMANDS.clear()
+
+    broken_family = types.ModuleType("broken_porcelain_family")
+    broken_family.register_commands = "not-callable"
+    monkeypatch.setitem(sys.modules, "broken_porcelain_family", broken_family)
+    monkeypatch.setattr(porcelain, "_FAMILY_MODULES", ("broken_porcelain_family",))
+
+    porcelain.load_commands()
+
+    assert porcelain.COMMANDS == {}
+    assert "broken_porcelain_family" in capsys.readouterr().err
