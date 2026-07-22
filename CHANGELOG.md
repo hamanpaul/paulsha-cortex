@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- **B6 porcelain-run-recover 規劃產物**：run/recover 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **B3 porcelain-inspect 規劃產物**：inspect 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-request request 追蹤 CLI**：新增唯讀 `cortex request list/show/wait/logs` 家族、versioned `cortex-porcelain/request/v1` JSON 輸出，以及 request timeout 後的顯性追蹤面。
 - **B2 porcelain-request 規劃產物**：request 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
