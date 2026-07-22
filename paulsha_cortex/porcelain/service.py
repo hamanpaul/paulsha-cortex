@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import os
 import subprocess
@@ -199,6 +197,38 @@ def _status_payload(instance: str) -> dict[str, Any]:
     }
 
 
+def _systemd_control_available() -> bool:
+    return installer._systemctl_available()
+
+
+def _control_service_state(instance: str) -> dict[str, Any]:
+    service = _status_payload(instance)
+    if _systemd_control_available() or service.get("mode") == "fallback":
+        return service
+    normalized = dict(service)
+    normalized["mode"] = "none"
+    return normalized
+
+
+def _mode_error(command: str, instance: str, *, json_output: bool, message: str) -> int:
+    service = _control_service_state(instance)
+    if json_output:
+        _json_dump(
+            _service_envelope(
+                command,
+                instance,
+                mode=str(service.get("mode")),
+                error=message,
+                result={"exit_code": 1},
+                service=service,
+            )
+        )
+        return 1
+    _print_status(service)
+    sys.stderr.write(message + "\n")
+    return 1
+
+
 def _print_status(service: dict[str, Any]) -> None:
     sys.stdout.write(f"instance: {service.get('instance')}\n")
     sys.stdout.write(f"mode: {service.get('mode')}\n")
@@ -230,18 +260,20 @@ def _print_status(service: dict[str, Any]) -> None:
 def _run_install(*, instance: str, interval: int, repo_root: str, json_output: bool) -> int:
     argv = ["service", "--instance", instance, "--repo-root", repo_root, "--interval", str(interval)]
     if json_output:
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            exit_code = int(installer.main(argv) or 0)
+        validated_instance = installer._validate_instance(instance)
+        validated_interval = installer._validate_interval(interval)
+        validated_repo_root = installer._resolve_git_repo_root(Path(repo_root))
+        result = installer.install_service_result(validated_instance, validated_interval, validated_repo_root)
         _json_dump(
             _service_envelope(
                 "install",
                 instance,
-                mode="systemd",
-                result={"exit_code": exit_code},
+                mode=result.mode,
+                message=result.message,
+                result={"exit_code": result.exit_code},
             )
         )
-        return exit_code
+        return result.exit_code
     return int(installer.main(argv) or 0)
 
 
@@ -256,6 +288,13 @@ def _run_systemctl(verb: str, *units: str) -> subprocess.CompletedProcess[str]:
 
 
 def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
+    if not _systemd_control_available():
+        return _mode_error(
+            command,
+            instance,
+            json_output=json_output,
+            message="systemd 不可用；start/stop/restart 僅支援 systemd mode，請改用前景 service-manager.sh 管理 fallback runtime。",
+        )
     service, timer = _manager_pair(instance)
     result = _run_systemctl(command, service, timer)
     if result.returncode != 0:
@@ -336,6 +375,13 @@ def _remove_if_exists(path: Path) -> None:
 
 
 def _run_uninstall(*, instance: str, purge: bool, json_output: bool) -> int:
+    if not _systemd_control_available():
+        return _mode_error(
+            "uninstall",
+            instance,
+            json_output=json_output,
+            message="systemd 不可用；uninstall 無法停用 user units，請先移除 fallback runtime 再清理 unit 檔案。",
+        )
     unit_root = Path(os.environ.get("HOME", str(Path.home()))).expanduser() / ".config" / "systemd" / "user"
     units = _unit_names(instance)
     stop_result = _run_systemctl("stop", *units)

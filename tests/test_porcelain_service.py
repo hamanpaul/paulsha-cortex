@@ -4,6 +4,7 @@ import importlib
 import importlib.metadata
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -138,13 +139,20 @@ def test_service_install_json_wraps_existing_installer(
 ) -> None:
     from paulsha_cortex.deploy import installer
 
-    seen: dict[str, list[str]] = {}
+    seen: dict[str, object] = {}
 
-    def fake_install(argv):
-        seen["argv"] = list(argv)
-        return 0
+    def fake_install_result(instance: str, interval: int, repo_root: Path):
+        seen["instance"] = instance
+        seen["interval"] = interval
+        seen["repo_root"] = repo_root
+        return installer.InstallServiceResult(
+            exit_code=0,
+            mode="systemd",
+            message="installed: beta-manager.{service,timer} + beta-monitor.service",
+        )
 
-    monkeypatch.setattr(installer, "main", fake_install)
+    monkeypatch.setattr(installer, "install_service_result", fake_install_result)
+    monkeypatch.setattr(installer, "_resolve_git_repo_root", lambda path: path.resolve())
 
     argv = [
         "service",
@@ -160,12 +168,54 @@ def test_service_install_json_wraps_existing_installer(
     assert _run_cli(argv) == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert seen["argv"] == ["service", "--instance", "beta", "--repo-root", str(service_runtime["repo_root"]), "--interval", "60"]
+    assert seen == {
+        "instance": "beta",
+        "interval": 60,
+        "repo_root": service_runtime["repo_root"].resolve(),
+    }
     assert payload["schema"] == SERVICE_SCHEMA
     assert payload["command"] == "install"
     assert payload["instance"] == "beta"
     assert payload["mode"] == "systemd"
     assert payload["result"]["exit_code"] == 0
+    assert "installed:" in payload["message"]
+
+
+def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    subprocess.run(["git", "init", "-q", str(service_runtime["repo_root"])], check=True)
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+
+    assert (
+        _run_cli(
+            [
+                "service",
+                "install",
+                "--instance",
+                "beta",
+                "--repo-root",
+                str(service_runtime["repo_root"]),
+                "--interval",
+                "60",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == SERVICE_SCHEMA
+    assert payload["command"] == "install"
+    assert payload["instance"] == "beta"
+    assert payload["mode"] == "fallback"
+    assert payload["result"]["exit_code"] == 0
+    assert "systemd 不可用" in payload["message"]
+    assert "service-manager.sh" in payload["message"]
 
 
 @pytest.mark.parametrize(("command", "verb"), [("start", "start"), ("stop", "stop"), ("restart", "restart")])
@@ -197,6 +247,29 @@ def test_service_lifecycle_commands_operate_manager_service_and_timer_together(
     assert f"--user {verb}" in calls
     assert "beta-manager.service" in calls
     assert "beta-manager.timer" in calls
+
+
+@pytest.mark.parametrize("command", ["start", "stop", "restart"])
+def test_service_lifecycle_commands_fail_gracefully_without_systemd(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    (service_runtime["control_root"] / "manager.lock").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+    assert _run_cli(["service", command, "--instance", "beta", "--json"]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == SERVICE_SCHEMA
+    assert payload["command"] == command
+    assert payload["mode"] == "fallback"
+    assert payload["service"]["mode"] == "fallback"
+    assert payload["result"]["exit_code"] == 1
+    assert "systemd 不可用" in payload["error"]
 
 
 def test_service_status_reports_systemd_runtime_and_env_summary(
@@ -350,3 +423,22 @@ def test_service_uninstall_only_purges_runtime_env_with_flag(
     assert env_file.exists() is env_exists
     assert "--user stop" in calls
     assert "--user disable" in calls
+
+
+def test_service_uninstall_fails_gracefully_without_systemd_when_not_installed(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    assert _run_cli(["service", "uninstall", "--instance", "beta", "--json"]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == SERVICE_SCHEMA
+    assert payload["command"] == "uninstall"
+    assert payload["mode"] == "none"
+    assert payload["service"]["mode"] == "none"
+    assert payload["result"]["exit_code"] == 1
+    assert "systemd 不可用" in payload["error"]
