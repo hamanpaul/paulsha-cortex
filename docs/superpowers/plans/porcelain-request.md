@@ -14,7 +14,8 @@ work_item: porcelain-request
 ### 2. 實作
 
 - [ ] `paulsha_cortex/porcelain/request.py`：`request list/show/wait/logs` 四子命令，路徑取自 `control.constants`，唯讀、不經 control queue。
-- [ ] `paulsha_cortex/porcelain/__init__.py`：`_FAMILY_MODULES` 加入 request 模組（僅此一行）。
+- [ ] `paulsha_cortex/porcelain/__init__.py`：`_FAMILY_MODULES` 加入 request 模組；並承接 B1 review findings——`load_commands()` 改為 fail-open（家族模組 import/註冊失敗時記錄並跳過，不影響既有命令）且對 `register_commands` 缺失/非 callable 給出含模組名的明確錯誤。
+- [ ] 補上 `openspec/specs/porcelain-command-registry/spec.md` 的 Purpose 敘述（B1 archive 鷹架殘留 TBD）。
 
 ### 3. 同步與驗證
 
