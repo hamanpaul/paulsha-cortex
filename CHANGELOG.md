@@ -18,6 +18,7 @@
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
 
 ### Fixed
+- **repair 派工注入 bot review findings**：delivery journal 現在會保留 blocking review threads 的檔案/行號/摘錄，repair builder 的 commit-required prompt 會直接附上 needs-fix findings，避免 fix-round 在缺少 reviewer 上下文時盲修。
 - **builder workflow identity 先過濾 build capability**：`_select_workflow_identity()` 現在會先排除不具 `build` 能力的 builder 候選，再套用 `primary_domain` 偏好，避免 google primary domain 把 build 卡誤派給僅支援 planning 的身分而陷入 malformed 重派。
 - **plan-phase planner 卡可在產物完備時由 Manager 決定性通過**：`writing-plans` 等規劃卡若其 persisted planning authority 對應的 accepted spec/design/plan 已完整存在，manager 會直接把當前 planner step 標記為 `passed` 並推進到下一 phase，不再多派 planner executor。
 - **planner workflow identity 不再被 `primary_domain` 釘死**：`_select_workflow_identity()` 現在只對非 planner、非 reviewer persona 套用 domain 偏好，避免 primary domain 是 google 時規劃階段被 agy 單點綁死。
