@@ -80,6 +80,12 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    cortex deck compile feature-oneshot --task "example feature" --change example-feature --emit
    ```
 
+   若只是想先建立第一個 sample workflow，可直接走導引式包裝：
+
+   ```bash
+   cortex init-sample --task "example feature" --change example-feature
+   ```
+
 4. 完成 interactive checklist，將 spec 的 glob plan 改為確切路徑，補齊 `target_branch` / `verification` 後才翻成 `dispatch: auto`，再執行一次完整 tick：
 
    ```bash
@@ -228,6 +234,14 @@ Deck 產生的 spec 預設為 `dispatch: hold`，不會立即派工。翻成 `di
 2. 確認 `plan`、`depends_on`、`target_branch` 與 `verification` 契約。
 3. 執行 Deck 列出的 verify commands。
 4. 只將允許 manager 派工的 spec 改為 `dispatch: auto`。
+
+不想直接操作 `deck compile --emit` 時，可改用：
+
+```bash
+cortex init-sample --task "example feature 實作" --change example-feature
+```
+
+`init-sample` 會維持 `dispatch: hold`，並直接列出 spec 檔名、`plan` / `target_branch` / `verification` 必補欄位，以及 `deck verify` 下一步指引。
 
 Manager 只會派送「已翻 auto、有 plan、相依全部 completed」的 slice。不要使用低階 `cortex dispatch`；它因缺少 spec / verification metadata 已停用。
 

@@ -9,6 +9,7 @@
 
 ### Added
 - **B7 porcelain-init-sample 規劃產物**：init-sample 批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **porcelain-init-sample 導引式 sample CLI**：新增 `cortex init-sample`，包裝 `deck compile --emit`，固定維持 `dispatch: hold`，並輸出必補欄位、`deck verify` 指令與手動翻 auto 指引。
 - **porcelain-run-recover 高階執行與復原 CLI**：新增 `cortex run tick/fanout/complete/work` 與 `cortex recover slice/work/brokers/service` 家族、顯性 request ID、`--wait`，以及 versioned JSON 輸出。
 - **B6 porcelain-run-recover 規劃產物**：run/recover 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-bootstrap 單步上手 CLI**：新增 `cortex bootstrap`，把 preflight、`service install/start`、`inspect status/doctor` 摘要、`--dry-run` 與非阻斷 `--sample` 串成單一 `cortex-porcelain/bootstrap/v1` 入口。
