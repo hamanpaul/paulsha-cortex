@@ -7,17 +7,21 @@ from pathlib import Path
 
 import pytest
 
+from paulsha_cortex.deck.schema import DeckSchemaError
+
 
 INIT_SAMPLE_SCHEMA = "cortex-porcelain/init-sample/v1"
 
 
 def _load_cli():
-    for module_name in (
-        "paulsha_cortex.cli",
-        "paulsha_cortex.porcelain",
-        "paulsha_cortex.porcelain.init_sample",
-    ):
-        sys.modules.pop(module_name, None)
+    for module_name in list(sys.modules):
+        if module_name == "paulsha_cortex.cli":
+            sys.modules.pop(module_name, None)
+            continue
+        if module_name == "paulsha_cortex.porcelain" or module_name.startswith(
+            "paulsha_cortex.porcelain."
+        ):
+            sys.modules.pop(module_name, None)
     return importlib.import_module("paulsha_cortex.cli")
 
 
@@ -43,6 +47,21 @@ def _seed_emitted_spec(specs_root: Path, *, change: str) -> Path:
     path.write_text(
         "---\n"
         "dispatch: hold\n"
+        "plan: docs/superpowers/plans/*demo*.md\n"
+        "target_branch: null\n"
+        "verification: null\n"
+        "---\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _seed_non_hold_spec(specs_root: Path, *, change: str) -> Path:
+    path = specs_root / f"{change}-build.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\n"
+        "dispatch: auto\n"
         "plan: docs/superpowers/plans/*demo*.md\n"
         "target_branch: null\n"
         "verification: null\n"
@@ -88,6 +107,7 @@ def test_init_sample_routes_before_coordinator_and_prints_hold_checklist(
     assert "dispatch: hold" in emitted.read_text(encoding="utf-8")
     assert emitted.name in captured.out
     assert "plan" in captured.out
+    assert "目前 deck emit 產生的 glob 路徑" in captured.out
     assert "target_branch" in captured.out
     assert "main" in captured.out
     assert "verification" in captured.out
@@ -143,3 +163,43 @@ def test_init_sample_json_emits_versioned_schema(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["schema"] == INIT_SAMPLE_SCHEMA
+
+
+def test_init_sample_compile_contract_errors_use_prefixed_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    specs_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_load_combo(*args, **kwargs):
+        raise DeckSchemaError("combo 驗證失敗: 缺少 cards")
+
+    def fake_deck_main(argv=None):
+        raise AssertionError(f"deck compile 不應被呼叫: {argv}")
+
+    monkeypatch.setattr("paulsha_cortex.deck.schema.load_combo", fake_load_combo)
+    monkeypatch.setattr("paulsha_cortex.deck.cli.main", fake_deck_main)
+
+    assert _run_cli(["init-sample", "--task", "Demo feature", "--change", "demo-change"]) == 1
+
+    captured = capsys.readouterr()
+    assert list(specs_root.rglob("*.md")) == []
+    assert "init-sample: combo 驗證失敗" in captured.err
+
+
+def test_init_sample_non_hold_emit_reports_zh_tw_error(
+    monkeypatch: pytest.MonkeyPatch,
+    specs_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    emitted = _seed_non_hold_spec(specs_root, change="demo-change")
+
+    def fake_deck_main(argv=None):
+        return 0
+
+    monkeypatch.setattr("paulsha_cortex.deck.cli.main", fake_deck_main)
+
+    assert _run_cli(["init-sample", "--task", "Demo feature", "--change", "demo-change"]) == 1
+
+    captured = capsys.readouterr()
+    assert emitted.name in captured.err
+    assert "dispatch 必須維持 hold" in captured.err

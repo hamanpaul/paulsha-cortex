@@ -46,7 +46,9 @@ def _slugify(value: str) -> str:
 
 
 def _combo_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "deck" / "data" / "combos"
+    from paulsha_cortex.deck.schema import DEFAULT_COMBOS_DIR
+
+    return DEFAULT_COMBOS_DIR
 
 
 def _available_combos() -> tuple[str, ...]:
@@ -116,15 +118,15 @@ def _ensure_hold(paths: Sequence[Path]) -> None:
     for path in paths:
         frontmatter = _read_frontmatter(path)
         if frontmatter.get("dispatch") != "hold":
-            raise ValueError(f"{path.name}: dispatch must remain hold")
+            raise ValueError(f"{path.name}: dispatch 必須維持 hold")
 
 
 def _required_fields() -> list[dict[str, str]]:
     return [
         {
             "name": "plan",
-            "current": "glob path from deck emit",
-            "required": "replace with the exact accepted plan path",
+            "current": "deck emit 產生的 glob 路徑",
+            "required": "改成確切的 accepted plan 路徑",
         },
         {
             "name": "target_branch",
@@ -134,37 +136,38 @@ def _required_fields() -> list[dict[str, str]]:
         {
             "name": "verification",
             "current": "null",
-            "required": "object with persona-scope, name=policy check, and full_suite baseline=no-regression",
+            "required": "改成完整 object，包含 persona-scope、name=policy check、full_suite baseline=no-regression",
         },
     ]
 
 
 def _next_steps() -> list[str]:
     return [
-        "Edit the emitted spec and keep dispatch: hold until the checklist is complete.",
-        "Replace plan with an exact accepted plan path.",
-        "Set target_branch to main.",
-        "Replace verification with the full contract, including persona-scope, policy, and full_suite.",
-        "Run the listed deck verify commands.",
-        "When everything is ready, manually change dispatch: hold to dispatch: auto.",
+        "編輯 emitted spec，完成 checklist 前都維持 dispatch: hold。",
+        "將 plan 改成確切的 accepted plan 路徑。",
+        "將 target_branch 設為 main。",
+        "將 verification 改成完整契約，包含 persona-scope、policy 與 full_suite。",
+        "執行列出的 deck verify 指令。",
+        "全部確認完成後，再手動把 dispatch: hold 改成 dispatch: auto。",
     ]
 
 
 def _print_human_summary(payload: dict[str, Any]) -> None:
     sys.stdout.write(f"sample: {payload['combo']} -> {payload['task_slug']}\n")
-    sys.stdout.write("specs:\n")
+    sys.stdout.write("spec 檔案:\n")
     for path in payload["specs"]:
         sys.stdout.write(f"  - {path}\n")
-    sys.stdout.write("required before dispatch can become auto:\n")
-    sys.stdout.write("  - plan: replace the glob with the exact accepted plan path\n")
-    sys.stdout.write("  - target_branch: main\n")
-    sys.stdout.write("  - verification: include persona-scope, policy, and full_suite (baseline=no-regression)\n")
+    sys.stdout.write("dispatch 變成 auto 前必補欄位:\n")
+    for field in payload["required_fields"]:
+        sys.stdout.write(
+            f"  - {field['name']}: 目前 {field['current']}；需改成 {field['required']}\n"
+        )
     sys.stdout.write("deck verify:\n")
     for command in payload["verify_commands"]:
         sys.stdout.write(f"  - {command}\n")
-    sys.stdout.write("next:\n")
-    sys.stdout.write("  - keep dispatch: hold until the checklist is complete\n")
-    sys.stdout.write("  - manually flip dispatch to auto only after the verify commands pass\n")
+    sys.stdout.write("下一步:\n")
+    for step in payload["next_steps"]:
+        sys.stdout.write(f"  - {step}\n")
 
 
 def main(argv: Sequence[str]) -> int:
@@ -173,7 +176,11 @@ def main(argv: Sequence[str]) -> int:
     _validate_combo(parser, args.combo)
 
     effective_change = args.change or _slugify(args.task)
-    result = _load_compile_result(combo=args.combo, task=args.task, change=effective_change)
+    try:
+        result = _load_compile_result(combo=args.combo, task=args.task, change=effective_change)
+    except (OSError, ValueError) as exc:
+        print(f"init-sample: {exc}", file=sys.stderr)
+        return 1
 
     from paulsha_cortex.deck.cli import main as deck_main
 

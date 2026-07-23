@@ -1,7 +1,7 @@
 # porcelain-init-sample Specification
 
 ## Purpose
-TBD - created by archiving change porcelain-init-sample. Update Purpose after archive.
+提供 `cortex init-sample` 的穩定契約：以既有 deck combo 產生 `dispatch: hold` 的 sample workflow spec，並同步提示使用者補齊派工前必填欄位與驗證步驟。
 ## Requirements
 ### Requirement: init-sample 產出的 spec 必須一律為 dispatch hold
 
@@ -22,4 +22,3 @@ TBD - created by archiving change porcelain-init-sample. Update Purpose after ar
 - **WHEN** 使用者執行 `cortex init-sample --task "..." --combo not-a-real-combo`
 - **THEN** exit code 為 2
 - **THEN** 不呼叫 `deck compile`、不產生任何檔案
-
