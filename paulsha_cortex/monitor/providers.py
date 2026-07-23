@@ -275,6 +275,7 @@ class WorkflowRegistryProvider:
                 rows = payload["workflow_runs"]
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
+            diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
                 _validate_workflow_v2_row(row)
@@ -282,6 +283,15 @@ class WorkflowRegistryProvider:
                     continue
                 run_id = _nonempty(row.get("run_id"), "run_id")
                 work_id = _nonempty(row.get("work_id"), "work_id")
+                try:
+                    completion = _validated_workflow_completion(
+                        row, state_path=self.state_path
+                    )
+                except _WorkflowCompletionValidationError as error:
+                    diagnostics.append(
+                        f"workflow completion skipped: {run_id}: {error}"
+                    )
+                    continue
                 status = _nonempty(row.get("status", row.get("current_phase")), "status")
                 source_id = f"workflow_run:{self.repo}:{run_id}"
                 sources.append(
@@ -307,9 +317,6 @@ class WorkflowRegistryProvider:
                         f"github_openspec:{self.repo}:{ref}:archived",
                     ):
                         _add_workflow_link(links, canonical_id, work_id)
-                completion = _validated_workflow_completion(
-                    row, state_path=self.state_path
-                )
                 if completion is not None:
                     validated_completions.setdefault(work_id, []).append(completion)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
@@ -329,7 +336,7 @@ class WorkflowRegistryProvider:
             last_attempt_at=attempted_at,
             last_success_at=attempted_at,
             revision=f"registry-sha256:{_digest((raw,))}",
-            diagnostics=(),
+            diagnostics=tuple(diagnostics),
             sources=tuple(sources),
             observations={
                 "workflow_links": links,
@@ -363,6 +370,10 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "planning_authority", "planning_source_revision",
     }
 )
+
+
+class _WorkflowCompletionValidationError(ValueError):
+    """Bad completion contents for one row; provider may skip that row only."""
 
 
 def _validate_workflow_v1_root(payload: Mapping) -> None:
@@ -523,7 +534,10 @@ def _validated_workflow_completion(
         raise ValueError("completion_record_path escapes coordinator completion root") from error
     from paulsha_cortex.coordinator.completion import read_completion_record
 
-    record = read_completion_record(resolved, expected_hash=expected_hash.lower())
+    try:
+        record = read_completion_record(resolved, expected_hash=expected_hash.lower())
+    except ValueError as error:
+        raise _WorkflowCompletionValidationError(str(error)) from error
     normalized_sources = dict(source_revisions)
     authority_record = record.get("work_authority")
     if isinstance(authority_record, Mapping):
@@ -724,7 +738,8 @@ class GitHubWorkProvider:
 class GitHubTerminalProvider:
     """Read closing references and remote default-branch archive evidence."""
 
-    _QUERY = """query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage} nodes{number body headRefName headRefOid state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
+    _QUERY = """query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){defaultBranchRef{name target{... on Commit{oid}}} pullRequests(first:100,after:$cursor,states:[OPEN,CLOSED,MERGED]){pageInfo{hasNextPage endCursor} nodes{number body headRefName headRefOid state mergedAt mergeCommit{oid parents(first:3){totalCount}} closingIssuesReferences(first:100){pageInfo{hasNextPage} nodes{number state}}}}}}"""
+    _PULL_REQUEST_PAGE_LIMIT = 20
 
     def __init__(
         self,
@@ -768,20 +783,27 @@ class GitHubTerminalProvider:
         attempted_at = _utcnow()
         owner, name = self.repo.split("/", 1)
         try:
-            graph = self._json(
-                (
-                    "gh", "api", "graphql",
-                    "-f", f"query={self._QUERY}",
-                    "-F", f"owner={owner}",
-                    "-F", f"name={name}",
-                )
-            )
+            graph = self._json(self._pull_request_argv(owner=owner, name=name))
             repository = graph["data"]["repository"]
+            default_branch_ref = repository["defaultBranchRef"]
             pulls = repository["pullRequests"]
-            if pulls["pageInfo"]["hasNextPage"]:
-                raise ValueError("pull request pagination incomplete")
-            default_branch = repository["defaultBranchRef"]["name"]
-            default_revision = repository["defaultBranchRef"]["target"]["oid"]
+            pull_nodes = list(pulls["nodes"])
+            page_count = 1
+            while pulls["pageInfo"]["hasNextPage"]:
+                if page_count >= self._PULL_REQUEST_PAGE_LIMIT:
+                    raise ValueError("pull request pagination incomplete")
+                cursor = pulls["pageInfo"]["endCursor"]
+                if not isinstance(cursor, str) or not cursor:
+                    raise ValueError("pull request pagination incomplete")
+                graph = self._json(
+                    self._pull_request_argv(owner=owner, name=name, cursor=cursor)
+                )
+                repository = graph["data"]["repository"]
+                pulls = repository["pullRequests"]
+                pull_nodes.extend(pulls["nodes"])
+                page_count += 1
+            default_branch = default_branch_ref["name"]
+            default_revision = default_branch_ref["target"]["oid"]
             if re.fullmatch(r"[0-9a-fA-F]{40}", default_revision) is None:
                 raise ValueError("default branch revision is invalid")
             tree = self._json(
@@ -839,7 +861,7 @@ class GitHubTerminalProvider:
             links: dict[str, str] = {}
             remote_prs: list[dict[str, object]] = []
             branches: list[dict[str, str]] = []
-            for pull in pulls["nodes"]:
+            for pull in pull_nodes:
                 number = pull["number"]
                 pr_source_id = f"github_pr:{self.repo}#{number}"
                 head_ref = pull.get("headRefName")
@@ -927,6 +949,23 @@ class GitHubTerminalProvider:
             sources=sources,
             observations=observations,
         )
+
+    def _pull_request_argv(
+        self,
+        *,
+        owner: str,
+        name: str,
+        cursor: str | None = None,
+    ) -> tuple[str, ...]:
+        argv = [
+            "gh", "api", "graphql",
+            "-f", f"query={self._QUERY}",
+            "-F", f"owner={owner}",
+            "-F", f"name={name}",
+        ]
+        if cursor is not None:
+            argv.extend(("-F", f"cursor={cursor}"))
+        return tuple(argv)
 
     def _json(self, argv: Sequence[str]) -> Mapping:
         completed = None

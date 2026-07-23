@@ -36,6 +36,17 @@ python -m pip install .
 
 ## Usage
 
+### 10 分鐘上手：`cortex bootstrap`
+
+乾淨機器或新 workspace 建議先跑一次 bootstrap，把 preflight、service install/start 與基本健檢串成單一入口：
+
+```bash
+cortex bootstrap --dry-run
+cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
+```
+
+`--dry-run` 只會檢查 Python/Git/repo/登入態並預覽後續命令，不會修改任何檔案或啟動服務；正式執行時預設會 install + start，最後附上 `inspect status` / `inspect doctor` 的下一步指引。若想順手產生第一個 sample workflow，可加 `--sample feature-oneshot --task "demo feature"`；sample 失敗只會降級回報，不影響 bootstrap 核心步驟成功與否。
+
 1. 在被治理的目標 git repo 安裝 systemd `--user` 單元：
 
    ```bash
@@ -120,6 +131,51 @@ python -m pip install .
    cortex request wait "$REQUEST_ID" --timeout 30
    cortex request logs "$REQUEST_ID" --json
    ```
+
+8. 用 `inspect` 家族直接檢查既有 runtime / registry / monitor 快照（唯讀、不經 control queue）：
+
+   ```bash
+   cortex inspect status --json
+   cortex inspect job "$JOB_ID"
+   cortex inspect ready --json
+   cortex inspect work porcelain-inspect --repo hamanpaul/paulsha-cortex
+   cortex inspect doctor --json
+   cortex inspect service --json
+   ```
+
+9. 用 `service` 家族管理 installer、systemd runtime 與 fallback logs：
+
+   ```bash
+   cortex service install --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
+   cortex service start --instance cortex --json
+   cortex service status --instance cortex --json
+   cortex service logs --instance cortex -n 50
+   cortex service uninstall --instance cortex --purge --json
+   ```
+
+   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
+
+10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：
+
+   ```bash
+   cortex run tick --specs-dir "$HOME/.agents/specs" --wait
+   cortex run fanout --executor codex --model "<builder-model-id>"
+   cortex run complete --review-executor claude --review-model "<reviewer-model-id>" --wait
+   cortex run work resume porcelain-run-recover --repo hamanpaul/paulsha-cortex --actor operator
+   ```
+
+   `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
+
+11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
+
+   ```bash
+   cortex recover slice "$SLICE_ID" retry-build --actor operator --wait
+   cortex recover work porcelain-run-recover resume --repo hamanpaul/paulsha-cortex --actor operator
+   cortex recover brokers reap --apply --cwd-root "$(git rev-parse --show-toplevel)"
+   cortex recover service restart --instance cortex
+   ```
+
+   `recover` 不提供 `--allow-unsafe` 等旁路旗標；需要專家級低階參數時仍使用既有 coordinator 命令。
 
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 

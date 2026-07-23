@@ -158,6 +158,92 @@ def _print_timeout_hint(request_id: str) -> None:
     sys.stderr.write(f"hint: cortex request show {request_id}\n")
 
 
+def emit_request_accepted(
+    request_id: str,
+    action: str,
+    *,
+    schema: str,
+    json_output: bool,
+) -> None:
+    payload = {
+        "schema": schema,
+        "request_id": request_id,
+        "action": action,
+        "accepted": True,
+        "status": "pending",
+        "hint": f"cortex request wait {request_id}",
+    }
+    if json_output:
+        _json_dump(payload)
+        return
+    for key in ("request_id", "action", "accepted", "status", "hint"):
+        value = payload[key]
+        if isinstance(value, bool):
+            value = str(value).lower()
+        sys.stdout.write(f"{key}: {value}\n")
+
+
+def wait_for_request(request_id: str, *, timeout: float) -> tuple[int, dict[str, Any]]:
+    _require_request_record(request_id)
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        record = _require_request_record(request_id)
+        if record["state"] == "done":
+            failed = record.get("error") is not None or record.get("status") != "ok"
+            return (1 if failed else 0), record
+        if time.monotonic() >= deadline:
+            return 3, record
+        time.sleep(min(WAIT_POLL_INTERVAL_SECONDS, max(deadline - time.monotonic(), 0.0)))
+
+
+def track_submitted_request(
+    request_id: str,
+    action: str,
+    *,
+    schema: str,
+    wait: bool,
+    timeout: float,
+    json_output: bool,
+) -> int:
+    if not wait:
+        emit_request_accepted(
+            request_id,
+            action,
+            schema=schema,
+            json_output=json_output,
+        )
+        return 3
+
+    if not json_output:
+        emit_request_accepted(
+            request_id,
+            action,
+            schema=schema,
+            json_output=False,
+        )
+    exit_code, record = wait_for_request(request_id, timeout=timeout)
+    if json_output:
+        payload: dict[str, Any] = {
+            "schema": schema,
+            "request_id": request_id,
+            "action": action,
+            "accepted": True,
+            "status": record.get("status") if exit_code != 3 else "pending",
+        }
+        if exit_code == 3:
+            payload["timeout_seconds"] = max(timeout, 0.0)
+            payload["hint"] = f"cortex request show {request_id}"
+        else:
+            payload["result"] = record.get("result")
+            payload["error"] = record.get("error")
+        _json_dump(payload)
+    elif exit_code == 3:
+        _print_timeout_hint(request_id)
+    else:
+        _print_request_summary(record)
+    return exit_code
+
+
 def _related_jobs(done: dict[str, Any] | None) -> list[dict[str, Any]]:
     if done is None:
         return []
@@ -226,33 +312,18 @@ def _run_show(request_id: str, *, json_output: bool) -> int:
 
 
 def _run_wait(request_id: str, *, timeout: float, json_output: bool) -> int:
-    _require_request_record(request_id)
-    deadline = time.monotonic() + max(timeout, 0.0)
-    while True:
-        record = _require_request_record(request_id)
-        if record["state"] == "done":
-            if json_output:
-                _json_dump({"schema": REQUEST_SCHEMA, "request": record})
-            else:
-                _print_request_summary(record)
-            if record.get("error") is not None or record.get("status") != "ok":
-                return 1
-            return 0
-        if time.monotonic() >= deadline:
-            hint = f"cortex request show {request_id}"
-            if json_output:
-                _json_dump(
-                    {
-                        "schema": REQUEST_SCHEMA,
-                        "request": record,
-                        "timeout_seconds": max(timeout, 0.0),
-                        "hint": hint,
-                    }
-                )
-            else:
-                _print_timeout_hint(request_id)
-            return 3
-        time.sleep(min(WAIT_POLL_INTERVAL_SECONDS, max(deadline - time.monotonic(), 0.0)))
+    exit_code, record = wait_for_request(request_id, timeout=timeout)
+    if json_output:
+        payload: dict[str, Any] = {"schema": REQUEST_SCHEMA, "request": record}
+        if exit_code == 3:
+            payload["timeout_seconds"] = max(timeout, 0.0)
+            payload["hint"] = f"cortex request show {request_id}"
+        _json_dump(payload)
+    elif exit_code == 3:
+        _print_timeout_hint(request_id)
+    else:
+        _print_request_summary(record)
+    return exit_code
 
 
 def _run_logs(request_id: str, *, json_output: bool) -> int:
