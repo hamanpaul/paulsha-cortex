@@ -65,8 +65,9 @@ def _completion_payload(
     docs_class: str,
     reviewer_job_id: str | None,
     review_eval_ref: dict | None,
+    work_authority: dict | None = None,
 ) -> dict:
-    return {
+    payload = {
         "schema_version": completion.COMPLETION_SCHEMA_VERSION,
         "slice_id": slice_id,
         "spec_hash": "1" * 64,
@@ -88,6 +89,9 @@ def _completion_payload(
         "review_evaluation_hash": None if review_eval_ref is None else review_eval_ref["hash"],
         "completed_at": "2026-07-12T00:00:00+00:00",
     }
+    if work_authority is not None:
+        payload["work_authority"] = work_authority
+    return payload
 
 
 def _write_manifest(
@@ -338,6 +342,148 @@ class CompletionRecordReadAndSatisfactionTests(unittest.TestCase):
             verification.atomic_write_json(record_path, normalized)
             with self.assertRaisesRegex(ValueError, "verification_evidence_path"):
                 completion.read_completion_record(record_path, expected_hash=record_hash)
+
+    def test_write_completion_record_reuses_existing_valid_record_despite_authority_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            candidate = "b" * 40
+            verification_ref = _write_verification(
+                root, slice_id="slice-a", candidate=candidate, status="reviewing"
+            )
+            review_eval_ref = _write_review_eval(root, slice_id="slice-a", candidate=candidate)
+            first = completion.write_completion_record(
+                _completion_payload(
+                    slice_id="slice-a",
+                    candidate=candidate,
+                    target_sha="c" * 40,
+                    verification_ref=verification_ref,
+                    review_policy="required",
+                    docs_class="code",
+                    reviewer_job_id="reviewer-1",
+                    review_eval_ref=review_eval_ref,
+                    work_authority={
+                        "repo": "acme/demo",
+                        "work_id": "work",
+                        "snapshot_hash": "0" * 64,
+                        "provider_id": "github",
+                        "provider_revision": "github-rev-1",
+                        "source_revisions": ["issue:14@tree-main-1"],
+                        "mapped_issues": [14],
+                        "mapped_prs": [7],
+                        "mapped_openspec": ["work"],
+                        "mapped_todo_paths": ["docs/todo.md"],
+                        "pr_number": 7,
+                        "change": "work",
+                        "todo_paths": ["docs/todo.md"],
+                        "merge_commit": "a" * 40,
+                        "run_id": "run-1",
+                        "workflow_step_ids": ["step-ship"],
+                        "trusted_evidence_refs": [
+                            {"kind": "preflight", "ref": "tree:" + "b" * 40, "hash": "1" * 64},
+                            {"kind": "foreign_review", "ref": "/review.json", "hash": "2" * 64},
+                            {"kind": "copilot", "ref": "/delivery-review.json", "hash": "3" * 64},
+                            {"kind": "merge_authorization", "ref": "/authorization.json", "hash": "4" * 64},
+                        ],
+                    },
+                ),
+                coordinator_root=root,
+            )
+
+            second = completion.write_completion_record(
+                _completion_payload(
+                    slice_id="slice-a",
+                    candidate=candidate,
+                    target_sha="c" * 40,
+                    verification_ref=verification_ref,
+                    review_policy="required",
+                    docs_class="code",
+                    reviewer_job_id="reviewer-1",
+                    review_eval_ref=review_eval_ref,
+                    work_authority={
+                        "repo": "acme/demo",
+                        "work_id": "work",
+                        "snapshot_hash": "f" * 64,
+                        "provider_id": "github",
+                        "provider_revision": "github-rev-2",
+                        "source_revisions": ["issue:14@tree-main-2"],
+                        "mapped_issues": [14],
+                        "mapped_prs": [7],
+                        "mapped_openspec": ["work"],
+                        "mapped_todo_paths": ["docs/todo.md"],
+                        "pr_number": 7,
+                        "change": "work",
+                        "todo_paths": ["docs/todo.md"],
+                        "merge_commit": "a" * 40,
+                        "run_id": "run-1",
+                        "workflow_step_ids": ["step-ship"],
+                        "trusted_evidence_refs": [
+                            {"kind": "preflight", "ref": "tree:" + "b" * 40, "hash": "1" * 64},
+                            {"kind": "foreign_review", "ref": "/review.json", "hash": "2" * 64},
+                            {"kind": "copilot", "ref": "/delivery-review.json", "hash": "3" * 64},
+                            {"kind": "merge_authorization", "ref": "/authorization.json", "hash": "4" * 64},
+                        ],
+                    },
+                ),
+                coordinator_root=root,
+            )
+
+            self.assertEqual(second["path"], first["path"])
+            self.assertEqual(second["hash"], first["hash"])
+            self.assertEqual(second["payload"], first["payload"])
+            quarantine_dir = root / "evidence" / "completion" / "quarantine"
+            self.assertFalse(quarantine_dir.exists())
+
+    def test_semantic_match_tolerates_source_revisions_drift(self) -> None:
+        # ship 對長期 in-flight run 的 work_authority 比對必須容忍 source_revisions
+        # 隨 main 前進的合法漂移（只有它不同時仍視為語意相同），其餘語意欄位仍須一致。
+        def _payload(source_revisions: list[str]) -> dict:
+            return _completion_payload(
+                slice_id="slice-a",
+                candidate="b" * 40,
+                target_sha="c" * 40,
+                verification_ref={"path": "/verification.json", "hash": "3" * 64},
+                review_policy="required",
+                docs_class="code",
+                reviewer_job_id="reviewer-1",
+                review_eval_ref={"path": "/review-eval.json", "hash": "9" * 64},
+                work_authority={
+                    "repo": "acme/demo",
+                    "work_id": "work",
+                    "snapshot_hash": "0" * 64,
+                    "provider_id": "github",
+                    "provider_revision": "github-rev-1",
+                    "source_revisions": source_revisions,
+                    "mapped_issues": [14],
+                    "mapped_prs": [7],
+                    "mapped_openspec": ["work"],
+                    "mapped_todo_paths": ["docs/todo.md"],
+                    "pr_number": 7,
+                    "change": "work",
+                    "todo_paths": ["docs/todo.md"],
+                    "merge_commit": "a" * 40,
+                    "run_id": "run-1",
+                    "workflow_step_ids": ["step-ship"],
+                    "trusted_evidence_refs": [
+                        {"kind": "preflight", "ref": "tree:" + "b" * 40, "hash": "1" * 64},
+                        {"kind": "foreign_review", "ref": "/review.json", "hash": "2" * 64},
+                        {"kind": "copilot", "ref": "/delivery-review.json", "hash": "3" * 64},
+                        {"kind": "merge_authorization", "ref": "/authorization.json", "hash": "4" * 64},
+                    ],
+                },
+            )
+
+        existing = _payload(["openspec:work@tree-main-1"])
+        incoming = _payload(["openspec:work@tree-main-2"])
+        self.assertTrue(
+            completion.completion_records_semantically_match(existing, incoming)
+        )
+
+        # 真正的語意差異（mapped_prs）仍必須被判為不相符。
+        divergent = _payload(["openspec:work@tree-main-1"])
+        divergent["work_authority"]["mapped_prs"] = [8]
+        self.assertFalse(
+            completion.completion_records_semantically_match(existing, divergent)
+        )
 
     def test_load_completion_requires_completed_slice_state_and_matching_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
