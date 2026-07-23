@@ -367,7 +367,8 @@ def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
             if isinstance(error, str):
                 sys.stderr.write(error if error.endswith("\n") else error + "\n")
             return exit_code
-        _print_status(_status_payload(instance))
+        service_payload = payload.get("service")
+        _print_status(service_payload if isinstance(service_payload, dict) else _status_payload(instance))
         return 0
     if not _systemd_control_available():
         return _mode_error(

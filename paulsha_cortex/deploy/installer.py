@@ -121,10 +121,10 @@ def _read_plain_env(env_file: Path) -> dict[str, str]:
             continue
         key, separator, value = line.partition("=")
         if not separator or not key or key.strip() != key or key in values:
-            raise ValueError("runtime bootstrap env 格式錯誤")
+            raise ValueError(f"runtime bootstrap env 格式錯誤: {env_file}: {raw!r}")
         if value[:1] in {"'", '"'}:
             if len(value) < 2 or value[-1] != value[0]:
-                raise ValueError("runtime bootstrap env quote invalid")
+                raise ValueError(f"runtime bootstrap env quote invalid: {env_file}: {raw!r}")
             value = value[1:-1]
         values[key] = value
     return values

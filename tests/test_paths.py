@@ -69,6 +69,22 @@ def test_run_root_rejects_malformed_installed_environment(monkeypatch, tmp_path)
         paths.run_root()
 
 
+def test_run_root_accepts_quoted_values_in_selected_installed_instance(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    runtime = home / ".agents" / "core" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "beta-manager.env").write_text(
+        'PSC_MANAGER_EXECUTOR="claude"\n'
+        f'PSC_RUN_ROOT="{tmp_path / "custom-run"}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.setenv("PSC_INSTANCE", "beta")
+
+    assert paths.run_root() == tmp_path / "custom-run"
+
+
 def test_config_path_default(monkeypatch):
     monkeypatch.delenv("PSC_CONFIG_ROOT", raising=False)
     assert paths.config_path("paulshaclaw.yaml") == Path.home() / ".config" / "paulshaclaw" / "paulshaclaw.yaml"

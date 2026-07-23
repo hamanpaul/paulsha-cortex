@@ -472,6 +472,27 @@ def test_bootstrap_dry_run_only_previews_service_calls(
     assert inspect_calls == []
 
 
+def test_bootstrap_planned_commands_quote_copy_paste_values() -> None:
+    _reset_porcelain_modules()
+    bootstrap = importlib.import_module("paulsha_cortex.porcelain.bootstrap")
+
+    commands = bootstrap._planned_commands(
+        instance="beta team",
+        repo_root="/tmp/demo repo",
+        interval=300,
+        start=True,
+        sample="feature oneshot",
+        task="demo feature",
+        change="demo change",
+    )
+
+    assert commands == [
+        "cortex service install --instance 'beta team' --repo-root '/tmp/demo repo' --interval 300",
+        "cortex service start --instance 'beta team'",
+        "cortex init-sample --combo 'feature oneshot' --task 'demo feature' --change 'demo change'",
+    ]
+
+
 def test_bootstrap_copilot_preflight_avoids_allow_all_tools(
     bootstrap_runtime: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,

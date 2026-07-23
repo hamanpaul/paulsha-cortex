@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -287,13 +288,29 @@ def _planned_commands(
     change: str | None,
 ) -> list[str]:
     commands = [
-        f"cortex service install --instance {instance} --repo-root {repo_root} --interval {interval}",
+        shlex.join(
+            [
+                "cortex",
+                "service",
+                "install",
+                "--instance",
+                instance,
+                "--repo-root",
+                repo_root,
+                "--interval",
+                str(interval),
+            ]
+        ),
     ]
     if start:
-        commands.append(f"cortex service start --instance {instance}")
+        commands.append(shlex.join(["cortex", "service", "start", "--instance", instance]))
     if sample is not None:
         sample_change = change or _slugify(task or sample)
-        commands.append(f"cortex init-sample --combo {sample} --task {task or ''} --change {sample_change}".strip())
+        sample_command = ["cortex", "init-sample", "--combo", sample]
+        if task is not None:
+            sample_command.extend(("--task", task))
+        sample_command.extend(("--change", sample_change))
+        commands.append(shlex.join(sample_command))
     return commands
 
 
