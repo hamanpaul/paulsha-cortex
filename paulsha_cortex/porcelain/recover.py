@@ -66,7 +66,6 @@ def _build_parser() -> argparse.ArgumentParser:
     service_sub = service.add_subparsers(dest="service_command", required=True)
     restart = service_sub.add_parser("restart", help="重啟 manager service/timer")
     restart.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
-    restart.add_argument("--json", action="store_true")
     return parser
 
 
@@ -129,8 +128,6 @@ def _run_service(args: argparse.Namespace) -> int:
     from . import service
 
     service_argv = ["restart", "--instance", args.instance]
-    if args.json:
-        service_argv.append("--json")
     return service.main(service_argv)
 
 

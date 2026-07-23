@@ -55,7 +55,7 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     toggle.add_argument("--enable", action="store_const", dest="enabled", const=True)
     toggle.add_argument("--disable", action="store_const", dest="enabled", const=False)
     parser.set_defaults(enabled=None)
-    parser.add_argument("--payload", help="額外 manager-side evidence refs JSON object")
+    parser.add_argument("--payload", help="額外 manager-side evidence refs JSON 檔案路徑")
 
 
 def _build_parser() -> argparse.ArgumentParser:

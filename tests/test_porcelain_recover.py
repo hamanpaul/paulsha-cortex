@@ -192,6 +192,28 @@ def test_recover_service_restart_delegates_to_porcelain_service(
     assert capsys.readouterr().err == ""
 
 
+def test_recover_service_restart_does_not_expose_json_flag(
+    control_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    service = importlib.import_module("paulsha_cortex.porcelain.service")
+    called = False
+
+    def fake_service_main(argv):
+        nonlocal called
+        called = True
+        return 0
+
+    monkeypatch.setattr(service, "main", fake_service_main)
+
+    assert _run_cli(["recover", "service", "restart", "--instance", "beta", "--json"]) == 2
+
+    captured = capsys.readouterr()
+    assert called is False
+    assert "unrecognized arguments: --json" in captured.err
+
+
 def test_recover_json_emits_one_versioned_pending_document(
     control_runtime: Path,
     capsys: pytest.CaptureFixture[str],

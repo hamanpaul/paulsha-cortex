@@ -199,6 +199,17 @@ def test_run_json_emits_one_versioned_pending_document(
     }
 
 
+def test_run_work_payload_help_describes_json_file_path(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _run_cli(["run", "work", "-h"]) == 0
+
+    captured = capsys.readouterr()
+    assert "JSON 檔案路徑" in captured.out
+    assert captured.err == ""
+
+
 @pytest.mark.parametrize(
     ("done_status", "done_error", "expected_exit"),
     [
