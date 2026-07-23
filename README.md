@@ -34,6 +34,18 @@ cortex --version
 python -m pip install .
 ```
 
+## 新手上手
+
+第一次接觸 `cortex`，建議照這個順序走：
+
+- [Quickstart](docs/onboarding/quickstart.md)：從 `pipx install`、`cortex bootstrap` 到第一個 workflow。
+- [Upgrade](docs/onboarding/upgrade.md)：升級與 F1 pipx 快照過期處理。
+- [Rollback](docs/onboarding/rollback.md)：回退到上一個已知可用版本。
+- [Troubleshooting](docs/onboarding/troubleshooting.md)：manager degraded、request timeout、systemd、executor、stale venv 快速對照。
+- [Concepts](docs/onboarding/concepts.md)：`spec`、`job`、`slice`、`work` 名詞速查。
+- [Admin](docs/onboarding/admin.md)：`cortex service`、`cortex inspect`、`cortex request` 的日常維運操作。
+- [Runbook](docs/onboarding/runbook.md)：把常見事故整理成可執行 SOP。
+
 ## Usage
 
 ### 10 分鐘上手：`cortex bootstrap`
