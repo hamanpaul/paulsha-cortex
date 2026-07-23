@@ -52,6 +52,15 @@ work_items:
         ref: porcelain-inspect
       - kind: path
         ref: docs/superpowers/workstreams/porcelain-inspect/todo.md
+  onboarding-docs:
+    title: onboarding-docs (B8)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#94
+      - kind: openspec
+        ref: onboarding-docs
+      - kind: path
+        ref: docs/superpowers/workstreams/onboarding-docs/todo.md
   porcelain-init-sample:
     title: porcelain init-sample (B7)
     links:
