@@ -53,6 +53,7 @@ def test_onboarding_docs_contract_is_documented() -> None:
     assert "pipx install" in quickstart
     assert "cortex bootstrap" in quickstart
     assert "workflow" in quickstart
+    assert 'cortex ready --specs-dir "$HOME/.agents/specs"' in quickstart
     assert any(
         command in quickstart for command in ("cortex init-sample", "cortex deck compile", "cortex tick")
     ), "quickstart must show how to reach the first workflow"

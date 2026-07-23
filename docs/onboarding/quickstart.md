@@ -12,6 +12,7 @@
 - `python3 -m paulsha_cortex.cli --help`
 - `python3 -m paulsha_cortex.cli bootstrap --help`
 - `python3 -m paulsha_cortex.cli init-sample --help`
+- `python3 -m paulsha_cortex.cli ready --help`
 - `python3 -m paulsha_cortex.cli run tick --help`
 
 ## 0. 先備條件
@@ -87,11 +88,11 @@ cortex init-sample --task "demo feature" --change demo-feature
 如果你只是想看 manager 能否接住第一個 workflow，最小可行流程是：
 
 ```bash
-cortex ready
+cortex ready --specs-dir "$HOME/.agents/specs"
 cortex run tick --wait
 ```
 
-`cortex ready` 會告訴你 sample spec 是否已經符合派工條件；`cortex run tick --wait` 會把 ready 的 workflow 送進 manager，並等待 request 進入 terminal 或 timeout。
+`cortex ready --specs-dir "$HOME/.agents/specs"` 會告訴你 sample spec 是否已經符合派工條件；`cortex run tick --wait` 會把 ready 的 workflow 送進 manager，並等待 request 進入 terminal 或 timeout。
 
 ## 4. 觀察第一個 workflow 的結果
 
