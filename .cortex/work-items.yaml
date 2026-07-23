@@ -52,6 +52,15 @@ work_items:
         ref: porcelain-inspect
       - kind: path
         ref: docs/superpowers/workstreams/porcelain-inspect/todo.md
+  porcelain-run-recover:
+    title: porcelain run/recover families (B6)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#92
+      - kind: openspec
+        ref: porcelain-run-recover
+      - kind: path
+        ref: docs/superpowers/workstreams/porcelain-run-recover/todo.md
   porcelain-request:
     title: porcelain request family (B2)
     links:
