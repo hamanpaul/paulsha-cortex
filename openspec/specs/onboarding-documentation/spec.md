@@ -1,7 +1,7 @@
 # onboarding-documentation Specification
 
 ## Purpose
-TBD - created by archiving change onboarding-docs. Update Purpose after archive.
+定義 `paulsha-cortex` onboarding 文件集的最低契約，讓新手可依 Quickstart 與配套文件完成安裝、bootstrap、第一個 workflow，且所有範例維持 shareable-safe 路徑衛生。
 ## Requirements
 ### Requirement: 新手必須能依 Quickstart 文件獨立完成第一個 workflow
 

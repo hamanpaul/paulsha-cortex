@@ -15,13 +15,9 @@ ONBOARDING_DOCS = (
 )
 README_GUIDE_HEADING = "## 新手上手"
 README_GUIDE_LINKS = tuple(ONBOARDING_DOCS)
-FORBIDDEN_MARKERS = (
-    "/home/paul_chen",
-    "paul_chen",
-    "Arcadyan",
-    "arcadyan",
-)
+BASH_FENCE_RE = re.compile(r"```bash\n(.*?)```", flags=re.DOTALL)
 PERSONAL_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/(?:home|Users)/[A-Za-z0-9._-]+")
+ABSOLUTE_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9.+:/_~-])/(?!/)[^\s`\"')]+")
 
 
 def _read_required(relpath: str) -> str:
@@ -41,6 +37,13 @@ def _extract_markdown_section(text: str, heading: str) -> str:
     remainder = text[start:]
     next_heading = re.search(r"^##\s+", remainder, flags=re.MULTILINE)
     return remainder[: next_heading.start()] if next_heading else remainder
+
+
+def _assert_repo_safe_bash_paths(text: str, *, relpath: str) -> None:
+    for block in BASH_FENCE_RE.findall(text):
+        assert not PERSONAL_ABSOLUTE_PATH_RE.search(block), f"{relpath} must not contain personal absolute paths"
+        match = ABSOLUTE_PATH_TOKEN_RE.search(block)
+        assert match is None, f"{relpath} bash examples must use ~/$HOME/env/relative paths, found `{match.group(0)}`"
 
 
 def test_onboarding_docs_contract_is_documented() -> None:
@@ -86,12 +89,9 @@ def test_onboarding_docs_contract_is_documented() -> None:
 def test_onboarding_docs_use_repo_safe_paths_only() -> None:
     readme = _read_required("README.md")
     guide = _extract_markdown_section(readme, README_GUIDE_HEADING)
-    for relpath in (*ONBOARDING_DOCS,):
+    for relpath in ONBOARDING_DOCS:
         text = _read_required(relpath)
         assert not PERSONAL_ABSOLUTE_PATH_RE.search(text), f"{relpath} must not contain personal absolute paths"
-        for marker in FORBIDDEN_MARKERS:
-            assert marker not in text, f"{relpath} must not contain `{marker}`"
+        _assert_repo_safe_bash_paths(text, relpath=relpath)
 
     assert not PERSONAL_ABSOLUTE_PATH_RE.search(guide), "README onboarding guide must avoid personal absolute paths"
-    for marker in FORBIDDEN_MARKERS:
-        assert marker not in guide, f"README onboarding guide must not contain `{marker}`"

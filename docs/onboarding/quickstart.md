@@ -44,7 +44,7 @@ python3 -m paulsha_cortex.cli --version
 先進到你要治理的 repo：
 
 ```bash
-cd /path/to/target-repo
+cd ~/path/to/target-repo
 ```
 
 先做 dry-run，確認 Python、Git、repo root 與 executor 登入態：
