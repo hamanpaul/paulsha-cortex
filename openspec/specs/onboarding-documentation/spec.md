@@ -21,4 +21,3 @@ TBD - created by archiving change onboarding-docs. Update Purpose after archive.
 
 - **WHEN** 對七份文件執行機敏標記掃描（R-21 secret-scan 範疇）
 - **THEN** 掃描結果不含任何個人絕對路徑或使用者名
-

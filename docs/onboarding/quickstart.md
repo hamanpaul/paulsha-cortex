@@ -6,7 +6,7 @@
 
 - `docs/superpowers/specs/2026-07-21-porcelain-cli-ux-design.md` §6、§9
 - `docs/superpowers/specs/onboarding-docs-spec.md`
-- `openspec/changes/onboarding-docs/specs/onboarding-documentation/spec.md`
+- `openspec/specs/onboarding-documentation/spec.md`
 - issue #94
 - dogfood findings: F1、F8
 - `python3 -m paulsha_cortex.cli --help`
