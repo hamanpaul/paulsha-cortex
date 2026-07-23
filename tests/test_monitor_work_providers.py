@@ -461,6 +461,93 @@ def test_workflow_registry_skips_broken_completion_row_and_keeps_other_sources(
     }
 
 
+def test_workflow_registry_missing_completion_file_skips_row_without_degrading(
+    monkeypatch, tmp_path
+):
+    state = tmp_path / "workflows.json"
+    missing = tmp_path / "evidence/completion/missing.json"
+    valid = tmp_path / "evidence/completion/valid.json"
+    valid.parent.mkdir(parents=True)
+    valid.write_text("{}", encoding="utf-8")
+
+    def read_record(path, *, expected_hash=None):
+        assert expected_hash == "c" * 64
+        assert Path(path) == valid
+        return {
+            "candidate": "b" * 40,
+            "work_id": "good-work",
+            "run_id": "run-good",
+            "source_revisions": {"github_pr:example/acme#10": "p" * 40},
+            "merge_revision": "d" * 40,
+        }
+
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.completion.read_completion_record",
+        read_record,
+    )
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 8,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-missing",
+                        "repo": "example/acme",
+                        "work_id": "missing-work",
+                        "status": "completed",
+                        "completion_record_path": str(missing),
+                        "completion_record_hash": "b" * 64,
+                        "completion_record_revision": "a" * 40,
+                        "source_revisions": {"github_pr:example/acme#9": "p" * 40},
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "d" * 40,
+                        "pr_refs": ["example/acme#9"],
+                    },
+                    {
+                        "run_id": "run-good",
+                        "repo": "example/acme",
+                        "work_id": "good-work",
+                        "status": "completed",
+                        "completion_record_path": str(valid),
+                        "completion_record_hash": "c" * 64,
+                        "completion_record_revision": "b" * 40,
+                        "source_revisions": {"github_pr:example/acme#10": "p" * 40},
+                        "pr_candidate": "b" * 40,
+                        "merge_revision": "d" * 40,
+                        "pr_refs": ["example/acme#10"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert [source.ref for source in result.sources] == ["run-good"]
+    assert any(
+        diagnostic.startswith("workflow completion skipped: run-missing:")
+        for diagnostic in result.diagnostics
+    )
+    assert result.observations["workflow_links"] == {
+        "workflow_run:example/acme:run-good": "good-work",
+        "github_pr:example/acme#10": "good-work",
+    }
+    assert result.observations["validated_completions"] == {
+        "good-work": [
+            {
+                "run_id": "run-good",
+                "pr_candidate": "b" * 40,
+                "merge_revision": "d" * 40,
+                "source_revisions": {"github_pr:example/acme#10": "p" * 40},
+            }
+        ]
+    }
+
+
 def test_workflow_registry_validates_refs_and_emits_canonical_authority_edges(tmp_path):
     state = tmp_path / "workflows.json"
     state.write_text(
@@ -663,7 +750,12 @@ def test_workflow_registry_rejects_completion_record_outside_safe_root(tmp_path)
 
     result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
 
-    assert result.status == "degraded"
+    assert result.status == "ok"
+    assert result.sources == ()
+    assert result.observations["validated_completions"] == {}
+    assert result.diagnostics == (
+        "workflow completion skipped: run-1: completion_record_path escapes coordinator completion root",
+    )
 
 
 def test_github_terminal_provider_reads_closing_refs_and_remote_archive():

@@ -412,9 +412,7 @@ def _existing_record_or_raise(
         existing = None
     if existing is not None:
         existing_hash = verification.canonical_json_hash(existing)
-        if existing_hash == content_hash or completion_records_semantically_match(existing, incoming):
-            return {"path": str(path), "hash": existing_hash, "payload": copy.deepcopy(existing)}
-        reason = "content mismatch"
+        return {"path": str(path), "hash": existing_hash, "payload": copy.deepcopy(existing)}
     quarantine_dir = path.parent / "quarantine"
     quarantine_dir.mkdir(parents=True, exist_ok=True)
     quarantine_path = quarantine_dir / f"{path.stem}-{uuid4().hex}.json"
