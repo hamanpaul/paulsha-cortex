@@ -155,6 +155,28 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
 
+10. 用 `run` 家族提交高階 mutation；不加 `--wait` 時會回傳 request ID 並以 exit 3 表示 accepted-pending：
+
+   ```bash
+   cortex run tick --specs-dir "$HOME/.agents/specs" --wait
+   cortex run fanout --executor codex --model "<builder-model-id>"
+   cortex run complete --review-executor claude --review-model "<reviewer-model-id>" --wait
+   cortex run work resume porcelain-run-recover --repo hamanpaul/paulsha-cortex --actor operator
+   ```
+
+   `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
+
+11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
+
+   ```bash
+   cortex recover slice "$SLICE_ID" retry-build --actor operator --wait
+   cortex recover work porcelain-run-recover resume --repo hamanpaul/paulsha-cortex --actor operator
+   cortex recover brokers reap --apply --cwd-root "$(git rev-parse --show-toplevel)"
+   cortex recover service restart --instance cortex
+   ```
+
+   `recover` 不提供 `--allow-unsafe` 等旁路旗標；需要專家級低階參數時仍使用既有 coordinator 命令。
+
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 
 ## 從使用者角度操作
