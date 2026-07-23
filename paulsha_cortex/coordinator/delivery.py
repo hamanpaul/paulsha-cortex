@@ -458,7 +458,12 @@ class ShipOrchestrator:
                 key=lambda item: item["kind"],
             ),
         }
-        if normalized.get("work_authority") != expected_work_authority:
+        expected_record = dict(normalized)
+        expected_record["work_authority"] = expected_work_authority
+        if not completion.completion_records_semantically_match(
+            normalized,
+            expected_record,
+        ):
             raise RuntimeError("completion record WorkAuthority does not match remote delivery")
         record = completion.write_completion_record(
             normalized,
@@ -470,7 +475,10 @@ class ShipOrchestrator:
         )
         if reread["candidate"] != expected_head.lower():
             raise RuntimeError("completion record reread does not match delivered HEAD")
-        if reread.get("work_authority") != expected_work_authority:
+        if not completion.completion_records_semantically_match(
+            reread,
+            expected_record,
+        ):
             raise RuntimeError("completion record reread WorkAuthority mismatch")
         final_facts = replace(facts, completion_record_valid=True)
         final_gate = evaluate_remote_closure(

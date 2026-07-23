@@ -377,6 +377,90 @@ def test_workflow_registry_rejects_cross_work_completion_replay(monkeypatch, tmp
     assert result.observations["validated_completions"] == {}
 
 
+def test_workflow_registry_skips_broken_completion_row_and_keeps_other_sources(
+    monkeypatch, tmp_path
+):
+    state = tmp_path / "workflows.json"
+    broken = tmp_path / "evidence/completion/broken.json"
+    valid = tmp_path / "evidence/completion/valid.json"
+    broken.parent.mkdir(parents=True)
+    broken.write_text("{}", encoding="utf-8")
+    valid.write_text("{}", encoding="utf-8")
+
+    def read_record(path, *, expected_hash=None):
+        if Path(path) == broken:
+            raise ValueError("completion record unreadable")
+        return {
+            "candidate": "b" * 40,
+            "work_id": "good-work",
+            "run_id": "run-good",
+            "source_revisions": {"github_pr:example/acme#10": "p" * 40},
+            "merge_revision": "d" * 40,
+        }
+
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.completion.read_completion_record",
+        read_record,
+    )
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 8,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-bad",
+                        "repo": "example/acme",
+                        "work_id": "bad-work",
+                        "status": "completed",
+                        "completion_record_path": str(broken),
+                        "completion_record_hash": "b" * 64,
+                        "completion_record_revision": "a" * 40,
+                        "source_revisions": {"github_pr:example/acme#9": "p" * 40},
+                        "pr_candidate": "a" * 40,
+                        "merge_revision": "d" * 40,
+                        "pr_refs": ["example/acme#9"],
+                    },
+                    {
+                        "run_id": "run-good",
+                        "repo": "example/acme",
+                        "work_id": "good-work",
+                        "status": "completed",
+                        "completion_record_path": str(valid),
+                        "completion_record_hash": "c" * 64,
+                        "completion_record_revision": "b" * 40,
+                        "source_revisions": {"github_pr:example/acme#10": "p" * 40},
+                        "pr_candidate": "b" * 40,
+                        "merge_revision": "d" * 40,
+                        "pr_refs": ["example/acme#10"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    assert [source.ref for source in result.sources] == ["run-good"]
+    assert result.observations["workflow_links"] == {
+        "workflow_run:example/acme:run-good": "good-work",
+        "github_pr:example/acme#10": "good-work",
+    }
+    assert result.observations["validated_completions"] == {
+        "good-work": [
+            {
+                "run_id": "run-good",
+                "pr_candidate": "b" * 40,
+                "merge_revision": "d" * 40,
+                "source_revisions": {"github_pr:example/acme#10": "p" * 40},
+            }
+        ]
+    }
+
+
 def test_workflow_registry_validates_refs_and_emits_canonical_authority_edges(tmp_path):
     state = tmp_path / "workflows.json"
     state.write_text(
