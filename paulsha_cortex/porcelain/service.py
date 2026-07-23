@@ -86,6 +86,56 @@ def _service_envelope(command: str, instance: str, *, mode: str, **payload: Any)
     }
 
 
+def install(*, instance: str, interval: int, repo_root: str) -> dict[str, Any]:
+    validated_instance = installer._validate_instance(instance)
+    validated_interval = installer._validate_interval(interval)
+    validated_repo_root = installer._resolve_git_repo_root(Path(repo_root))
+    result = installer.install_service_result(validated_instance, validated_interval, validated_repo_root)
+    return _service_envelope(
+        "install",
+        instance,
+        mode=result.mode,
+        message=result.message,
+        result={"exit_code": result.exit_code},
+    )
+
+
+def start(*, instance: str) -> dict[str, Any]:
+    if not _systemd_control_available():
+        service = _control_service_state(instance)
+        return _service_envelope(
+            "start",
+            instance,
+            mode=str(service.get("mode")),
+            error=(
+                "systemd 不可用；start/stop/restart 僅支援 systemd mode，"
+                "請改用前景 service-manager.sh 管理 fallback runtime。"
+            ),
+            result={"exit_code": 1},
+            service=service,
+        )
+    service_unit, timer_unit = _manager_pair(instance)
+    result = _run_systemctl("start", service_unit, timer_unit)
+    if result.returncode != 0:
+        return _service_envelope(
+            "start",
+            instance,
+            mode="systemd",
+            error=_completed_process_error(
+                result,
+                fallback=f"systemctl start failed for {service_unit} {timer_unit}",
+            ),
+            result={"exit_code": result.returncode},
+        )
+    return _service_envelope(
+        "start",
+        instance,
+        mode="systemd",
+        result={"exit_code": 0},
+        service=_status_payload(instance),
+    )
+
+
 def _emit_command_error(
     command: str,
     instance: str,
@@ -282,20 +332,9 @@ def _print_status(service: dict[str, Any]) -> None:
 def _run_install(*, instance: str, interval: int, repo_root: str, json_output: bool) -> int:
     argv = ["service", "--instance", instance, "--repo-root", repo_root, "--interval", str(interval)]
     if json_output:
-        validated_instance = installer._validate_instance(instance)
-        validated_interval = installer._validate_interval(interval)
-        validated_repo_root = installer._resolve_git_repo_root(Path(repo_root))
-        result = installer.install_service_result(validated_instance, validated_interval, validated_repo_root)
-        _json_dump(
-            _service_envelope(
-                "install",
-                instance,
-                mode=result.mode,
-                message=result.message,
-                result={"exit_code": result.exit_code},
-            )
-        )
-        return result.exit_code
+        payload = install(instance=instance, interval=interval, repo_root=repo_root)
+        _json_dump(payload)
+        return int(payload.get("result", {}).get("exit_code", 1))
     return int(installer.main(argv) or 0)
 
 
@@ -314,6 +353,23 @@ def _completed_process_error(result: subprocess.CompletedProcess[str], *, fallba
 
 
 def _run_lifecycle(command: str, *, instance: str, json_output: bool) -> int:
+    if command == "start":
+        payload = start(instance=instance)
+        exit_code = int(payload.get("result", {}).get("exit_code", 1))
+        if json_output:
+            _json_dump(payload)
+            return exit_code
+        if exit_code != 0:
+            service_payload = payload.get("service")
+            if isinstance(service_payload, dict):
+                _print_status(service_payload)
+            error = payload.get("error")
+            if isinstance(error, str):
+                sys.stderr.write(error if error.endswith("\n") else error + "\n")
+            return exit_code
+        service_payload = payload.get("service")
+        _print_status(service_payload if isinstance(service_payload, dict) else _status_payload(instance))
+        return 0
     if not _systemd_control_available():
         return _mode_error(
             command,

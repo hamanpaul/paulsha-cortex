@@ -65,6 +65,20 @@ def _inspect_envelope(command: str, **payload: Any) -> dict[str, Any]:
     return {"schema": INSPECT_SCHEMA, "command": command, **payload}
 
 
+def status_summary() -> dict[str, Any]:
+    return read_status()
+
+
+def doctor_summary(
+    *,
+    probe_live: bool = False,
+    repo: str | None = None,
+    instance: str | None = None,
+) -> dict[str, Any]:
+    effective_instance = instance if instance is not None else os.environ.get("PSC_INSTANCE", "cortex")
+    return run_doctor(probe_live=probe_live, repo=repo, instance=effective_instance).to_dict()
+
+
 def _print_status(status: dict[str, Any]) -> None:
     sys.stdout.write(f"updated_at: {status.get('updated_at')}\n")
     sys.stdout.write(f"degraded: {status.get('degraded')}\n")
@@ -134,7 +148,7 @@ def _print_service(service: dict[str, Any]) -> None:
 
 
 def _run_status(*, json_output: bool) -> int:
-    status = read_status()
+    status = status_summary()
     if json_output:
         _json_dump(_inspect_envelope("status", status=status))
         return 0
@@ -205,7 +219,7 @@ def _run_doctor(
     instance: str,
     json_output: bool,
 ) -> int:
-    doctor = run_doctor(probe_live=probe_live, repo=repo, instance=instance).to_dict()
+    doctor = doctor_summary(probe_live=probe_live, repo=repo, instance=instance)
     if json_output:
         _json_dump(_inspect_envelope("doctor", doctor=doctor))
         return 0

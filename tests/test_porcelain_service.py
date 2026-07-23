@@ -473,6 +473,32 @@ def test_service_logs_json_failure_reports_envelope(
     assert "journal failed" in payload["error"]
 
 
+def test_service_start_human_output_reuses_service_payload_without_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _load_cli()
+    service = importlib.import_module("paulsha_cortex.porcelain.service")
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        service,
+        "start",
+        lambda *, instance: {
+            "result": {"exit_code": 0},
+            "service": {"instance": instance, "mode": "systemd", "status": "active/running"},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_status_payload",
+        lambda instance: (_ for _ in ()).throw(AssertionError(f"unexpected refresh for {instance}")),
+    )
+    monkeypatch.setattr(service, "_print_status", lambda payload: seen.setdefault("payload", payload))
+
+    assert service.main(["start", "--instance", "beta"]) == 0
+    assert seen["payload"] == {"instance": "beta", "mode": "systemd", "status": "active/running"}
+
+
 @pytest.mark.parametrize(("command", "expected_rc"), [("start", 5), ("uninstall", 6)])
 def test_service_json_failures_preserve_envelope_for_systemctl_errors(
     service_runtime: dict[str, Path],

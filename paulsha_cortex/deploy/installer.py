@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Sequence
 
 _INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SUPPORTED_EXECUTORS = frozenset({"copilot", "claude", "codex"})
 
 
 @dataclass(frozen=True)
@@ -114,11 +115,23 @@ def _read_plain_env(env_file: Path) -> dict[str, str]:
     if not env_file.is_file():
         return {}
     values: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
+    for raw in env_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
         key, separator, value = line.partition("=")
-        if separator and key and key.strip() == key:
-            values[key] = value
+        if not separator or not key or key.strip() != key or key in values:
+            raise ValueError(f"runtime bootstrap env 格式錯誤: {env_file}: {raw!r}")
+        if value[:1] in {"'", '"'}:
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ValueError(f"runtime bootstrap env quote invalid: {env_file}: {raw!r}")
+            value = value[1:-1]
+        values[key] = value
     return values
+
+
+def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
+    return runtime_dir / f"{instance}.env"
 
 
 def install_service_result(instance: str, interval: int, repo_root: Path) -> InstallServiceResult:
@@ -127,6 +140,13 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
     runtime_dir = bootstrap_root / "core" / "runtime"
     env_file = runtime_dir / f"{instance}-manager.env"
     existing = _read_plain_env(env_file)
+    instance_env = _read_plain_env(_instance_env_file(runtime_dir, instance))
+    persisted_executor = existing.get("PSC_MANAGER_EXECUTOR", "").strip()
+    if persisted_executor and persisted_executor not in _SUPPORTED_EXECUTORS:
+        raise ValueError("既有 PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
+    instance_executor = instance_env.get("PSC_MANAGER_EXECUTOR", "").strip()
+    if instance_executor and instance_executor not in _SUPPORTED_EXECUTORS:
+        raise ValueError("既有 instance PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
     agents_root = Path(
         existing.get(
             "PSC_AGENTS_ROOT",
@@ -149,17 +169,23 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
         directory.mkdir(parents=True, exist_ok=True)
     for name, content in render_units(instance, interval).items():
         (unit_dir / name).write_text(content)
+    managed_env = {
+        "PY": sys.executable,
+        "PSC_INSTANCE": instance,
+        "PSC_REPO_ROOT": str(repo_root),
+        "PSC_AGENTS_ROOT": str(agents_root),
+        "PSC_RUN_ROOT": str(agents_root / "run" / instance),
+        "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
+        "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
+    }
+    executor_override = os.environ.get("PSC_MANAGER_EXECUTOR", "").strip()
+    if executor_override:
+        if executor_override not in _SUPPORTED_EXECUTORS:
+            raise ValueError("PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
+        managed_env["PSC_MANAGER_EXECUTOR"] = executor_override
     _write_managed_env(
         env_file,
-        {
-            "PY": sys.executable,
-            "PSC_INSTANCE": instance,
-            "PSC_REPO_ROOT": str(repo_root),
-            "PSC_AGENTS_ROOT": str(agents_root),
-            "PSC_RUN_ROOT": str(agents_root / "run" / instance),
-            "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
-            "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
-        },
+        managed_env,
         preserve_existing=frozenset(
             {
                 "PSC_INSTANCE",
