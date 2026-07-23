@@ -36,6 +36,17 @@ python -m pip install .
 
 ## Usage
 
+### 10 分鐘上手：`cortex bootstrap`
+
+乾淨機器或新 workspace 建議先跑一次 bootstrap，把 preflight、service install/start 與基本健檢串成單一入口：
+
+```bash
+cortex bootstrap --dry-run
+cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
+```
+
+`--dry-run` 只會檢查 Python/Git/repo/登入態並預覽後續命令，不會修改任何檔案或啟動服務；正式執行時預設會 install + start，最後附上 `inspect status` / `inspect doctor` 的下一步指引。若想順手產生第一個 sample workflow，可加 `--sample feature-oneshot --task "demo feature"`；sample 失敗只會降級回報，不影響 bootstrap 核心步驟成功與否。
+
 1. 在被治理的目標 git repo 安裝 systemd `--user` 單元：
 
    ```bash
@@ -120,6 +131,29 @@ python -m pip install .
    cortex request wait "$REQUEST_ID" --timeout 30
    cortex request logs "$REQUEST_ID" --json
    ```
+
+8. 用 `inspect` 家族直接檢查既有 runtime / registry / monitor 快照（唯讀、不經 control queue）：
+
+   ```bash
+   cortex inspect status --json
+   cortex inspect job "$JOB_ID"
+   cortex inspect ready --json
+   cortex inspect work porcelain-inspect --repo hamanpaul/paulsha-cortex
+   cortex inspect doctor --json
+   cortex inspect service --json
+   ```
+
+9. 用 `service` 家族管理 installer、systemd runtime 與 fallback logs：
+
+   ```bash
+   cortex service install --instance cortex --repo-root "$(git rev-parse --show-toplevel)"
+   cortex service start --instance cortex --json
+   cortex service status --instance cortex --json
+   cortex service logs --instance cortex -n 50
+   cortex service uninstall --instance cortex --purge --json
+   ```
+
+   `cortex service status` 會先讀 systemd units 與 bootstrap env，若尚未安裝但偵測到前景 `service-manager.sh` lock，則回報 fallback mode 與 log path；`cortex service logs` 會優先走 `journalctl --user`，否則回退讀 `$HOME/.agents/log/manager.log`。只有 systemd mode 支援 `--follow` 即時串流；fallback mode 會顯性拒絕並要求直接 tail log 檔。
 
 > `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
 

@@ -169,6 +169,27 @@ def test_install_rejects_symlinked_bootstrap_without_overwriting_target(tmp_path
     assert outside.read_text(encoding="utf-8") == "DO_NOT_OVERWRITE=1\n"
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("NOT AN ENV LINE\n", "格式錯誤"),
+        ('PSC_MANAGER_EXECUTOR="claude\n', "quote invalid"),
+    ],
+)
+def test_install_reports_bootstrap_env_path_and_line_on_parse_failure(tmp_path, content, expected):
+    from paulsha_cortex.deploy import installer
+
+    env_file = tmp_path / "beta-manager.env"
+    env_file.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected) as exc:
+        installer._read_plain_env(env_file)
+
+    message = str(exc.value)
+    assert str(env_file) in message
+    assert content.strip() in message
+
+
 def test_install_rejects_non_git_repo_root(tmp_path, monkeypatch, capsys):
     from paulsha_cortex.deploy import installer
 

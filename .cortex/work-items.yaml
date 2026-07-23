@@ -25,6 +25,24 @@ work_items:
         ref: hamanpaul/paulsha-cortex#27
       - kind: openspec
         ref: docs-only-lifecycle-canary-v2
+  porcelain-bootstrap:
+    title: porcelain bootstrap (B5)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#91
+      - kind: openspec
+        ref: porcelain-bootstrap
+      - kind: path
+        ref: docs/superpowers/workstreams/porcelain-bootstrap/todo.md
+  porcelain-service:
+    title: porcelain service family (B4)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#90
+      - kind: openspec
+        ref: porcelain-service
+      - kind: path
+        ref: docs/superpowers/workstreams/porcelain-service/todo.md
   porcelain-inspect:
     title: porcelain inspect family (B3)
     links:

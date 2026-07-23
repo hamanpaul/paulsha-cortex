@@ -40,9 +40,12 @@ def _parse_bootstrap_env(path: Path) -> dict[str, str]:
             or ENV_KEY_RE.fullmatch(key) is None
             or not value
             or value != value.strip()
-            or value.startswith(("'", '"'))
         ):
-            raise ValueError("runtime bootstrap env 格式錯誤")
+            raise ValueError(f"runtime bootstrap env 格式錯誤: {path}: {raw_line!r}")
+        if value[:1] in {"'", '"'}:
+            if len(value) < 2 or value[-1] != value[0]:
+                raise ValueError(f"runtime bootstrap env quote invalid: {path}: {raw_line!r}")
+            value = value[1:-1]
         values[key] = value
     return values
 
