@@ -28,6 +28,7 @@
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
 
 ### Fixed
+- **CompletionRecord immutable 重用與 provider 缺檔韌性**：已完成/已合併 run 的 CompletionRecord 一旦已有可驗證舊檔，後續 reconciliation 會直接重用既有 record，不再因 `work_authority.source_revisions` 等合法漂移欄位重推導後隔離舊檔；`WorkflowRegistryProvider` 遇到缺失、symlink、越界或內容損毀的 completion 檔時，也只跳過該列並留下 diagnostic，不再讓整個 provider degraded。
 - **WorkflowRun completion record 冪等與 provider 韌性**：已完成 run 若因 snapshot/provider revision 漂移而重播 closure，現在會重用既有 CompletionRecord 的揮發 `work_authority` metadata，不再隔離合法舊檔；`WorkflowRegistryProvider` 遇到單筆 completion record 驗證失敗時也只跳過該列，其他 run 的 sources/links 與 validated completions 仍可正常輸出。
 - **porcelain-run-recover CLI JSON 邊界修正**：`cortex recover service restart` 不再暴露會誤導 schema 的 `--json` 旗標，`cortex run work --payload` help 也明確改成要求 JSON 檔案路徑。
 - **porcelain-bootstrap executor preflight**：`bootstrap` preflight 改為檢查實際 executor 登入態（`copilot` / `claude` / `codex`），移除未列入凍結設計的額外 `gh-auth` gate，且 `copilot` 探測不再要求 `--allow-all-tools`。

@@ -523,20 +523,20 @@ def _validated_workflow_completion(
     ):
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
             raise ValueError(f"{field} must be a 40-char commit SHA")
-    path = Path(record_path)
-    if path.is_symlink():
-        raise ValueError("completion_record_path must not be a symlink")
-    resolved = path.resolve(strict=True)
-    allowed_root = (state_path.parent / "evidence" / "completion").resolve()
     try:
-        resolved.relative_to(allowed_root)
-    except ValueError as error:
-        raise ValueError("completion_record_path escapes coordinator completion root") from error
-    from paulsha_cortex.coordinator.completion import read_completion_record
+        path = Path(record_path)
+        if path.is_symlink():
+            raise ValueError("completion_record_path must not be a symlink")
+        resolved = path.resolve(strict=True)
+        allowed_root = (state_path.parent / "evidence" / "completion").resolve()
+        try:
+            resolved.relative_to(allowed_root)
+        except ValueError as error:
+            raise ValueError("completion_record_path escapes coordinator completion root") from error
+        from paulsha_cortex.coordinator.completion import read_completion_record
 
-    try:
         record = read_completion_record(resolved, expected_hash=expected_hash.lower())
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         raise _WorkflowCompletionValidationError(str(error)) from error
     normalized_sources = dict(source_revisions)
     authority_record = record.get("work_authority")
