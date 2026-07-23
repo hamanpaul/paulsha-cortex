@@ -460,6 +460,139 @@ def test_remote_closure_reads_and_validates_completion_record(
     )["candidate"] == HEAD1
 
 
+def test_remote_closure_reuses_existing_completion_record_when_authority_metadata_drifts(
+    tmp_path: Path,
+) -> None:
+    authority = _authority(tmp_path, last_success=0)
+    verification_ref = verification.write_verification_evidence(
+        {
+            "schema_version": verification.VERIFICATION_SCHEMA_VERSION,
+            "slice_id": "ship-review",
+            "candidate": HEAD1,
+            "status": "reviewing",
+            "summary": "ok",
+            "details": {"ok": True},
+        },
+        coordinator_root=tmp_path,
+    )
+    foreign_payload = json.loads(Path(_foreign_review(tmp_path).path).read_text())
+    review_ref = review.write_gate_evaluation(foreign_payload, coordinator_root=tmp_path)
+    trusted_evidence_refs = [
+        {"kind": "preflight", "ref": "tree:" + HEAD2, "hash": "5" * 64},
+        {"kind": "foreign_review", "ref": review_ref["path"], "hash": review_ref["hash"]},
+        {"kind": "copilot", "ref": "github-review:9", "hash": "6" * 64},
+        {"kind": "merge_authorization", "ref": "run:run-1", "hash": "7" * 64},
+    ]
+    completion_payload = {
+        "schema_version": completion.COMPLETION_SCHEMA_VERSION,
+        "slice_id": "ship-review",
+        "spec_hash": "1" * 64,
+        "plan_hash": "2" * 64,
+        "verification_hash": "3" * 64,
+        "builder_job_id": "builder-1",
+        "reviewer_job_id": "reviewer-1",
+        "dispatch_base": HEAD3,
+        "candidate": HEAD1,
+        "target_branch": "main",
+        "target_remote": "origin",
+        "target_ref": "refs/remotes/origin/main",
+        "target_ref_sha": HEAD2,
+        "verification_evidence_path": verification_ref["path"],
+        "verification_evidence_hash": verification_ref["hash"],
+        "review_policy": "required",
+        "docs_class": "code",
+        "review_evaluation_path": review_ref["path"],
+        "review_evaluation_hash": review_ref["hash"],
+        "completed_at": "2026-07-17T00:00:00+00:00",
+        "work_authority": {
+            "repo": authority.repo,
+            "work_id": authority.work_id,
+            "snapshot_hash": authority.snapshot_hash,
+            "provider_id": authority.github_provider_id,
+            "provider_revision": authority.github_provider_revision,
+            "source_revisions": list(authority.source_revisions),
+            "mapped_issues": list(authority.mapped_issues),
+            "mapped_prs": list(authority.mapped_prs),
+            "mapped_openspec": list(authority.mapped_openspec),
+            "mapped_todo_paths": list(authority.mapped_todo_paths),
+            "pr_number": 7,
+            "change": "work",
+            "todo_paths": ["docs/todo.md"],
+            "merge_commit": HEAD2,
+            "run_id": "run-1",
+            "workflow_step_ids": ["step-build", "step-review", "step-ship"],
+            "trusted_evidence_refs": trusted_evidence_refs,
+        },
+    }
+
+    class GitHub:
+        def fetch_remote_closure(self, **kwargs):
+            return RemoteClosureFacts(
+                merge_commit=HEAD2,
+                pr_head=HEAD1,
+                merge_parents=(HEAD3, HEAD1),
+                default_head=HEAD2,
+                merge_is_ancestor=True,
+                merge_is_merge_commit=True,
+                issue_states={14: "closed"},
+                active_openspec_absent=True,
+                archive_present=True,
+                todo_complete=True,
+                todo_revisions={"docs/todo.md": HEAD3},
+                completion_record_valid=False,
+            )
+
+    orchestrator = ShipOrchestrator(github=GitHub(), now=lambda: 0)
+    first = orchestrator.verify_remote_closure(
+        repo="acme/demo",
+        pr_number=7,
+        change="work",
+        authority=authority,
+        todo_paths=("docs/todo.md",),
+        expected_head=HEAD1,
+        completion_payload=completion_payload,
+        run_id="run-1",
+        workflow_step_ids=("step-build", "step-review", "step-ship"),
+        trusted_evidence_refs=tuple(trusted_evidence_refs),
+        coordinator_root=tmp_path,
+    )
+    replay_authority = authority.__class__._verified(
+        repo=authority.repo,
+        work_id=authority.work_id,
+        mapped_issues=authority.mapped_issues,
+        mapped_prs=authority.mapped_prs,
+        mapped_openspec=authority.mapped_openspec,
+        mapped_todo_paths=authority.mapped_todo_paths,
+        confirmed_todo=authority.confirmed_todo,
+        auto_label=authority.auto_label,
+        source_revisions=authority.source_revisions,
+        provider_id=authority.github_provider_id,
+        provider_revision="github-rev-2",
+        last_success_epoch=authority.github_last_success_epoch,
+        snapshot_hash="9" * 64,
+    )
+
+    second = orchestrator.verify_remote_closure(
+        repo="acme/demo",
+        pr_number=7,
+        change="work",
+        authority=replay_authority,
+        todo_paths=("docs/todo.md",),
+        expected_head=HEAD1,
+        completion_payload=completion.read_completion_record(
+            first.completion_record["path"],
+            expected_hash=first.completion_record["hash"],
+        ),
+        run_id="run-1",
+        workflow_step_ids=("step-build", "step-review", "step-ship"),
+        trusted_evidence_refs=tuple(trusted_evidence_refs),
+        coordinator_root=tmp_path,
+    )
+
+    assert second.completion_record == first.completion_record
+    assert not list((tmp_path / "evidence" / "completion" / "quarantine").glob("*.json"))
+
+
 def test_remote_closure_rejects_completion_bound_to_another_work(tmp_path: Path) -> None:
     authority = _authority(tmp_path, last_success=0)
 

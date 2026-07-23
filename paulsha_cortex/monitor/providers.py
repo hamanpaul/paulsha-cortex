@@ -275,6 +275,7 @@ class WorkflowRegistryProvider:
                 rows = payload["workflow_runs"]
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
+            diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
                 _validate_workflow_v2_row(row)
@@ -282,6 +283,15 @@ class WorkflowRegistryProvider:
                     continue
                 run_id = _nonempty(row.get("run_id"), "run_id")
                 work_id = _nonempty(row.get("work_id"), "work_id")
+                try:
+                    completion = _validated_workflow_completion(
+                        row, state_path=self.state_path
+                    )
+                except _WorkflowCompletionValidationError as error:
+                    diagnostics.append(
+                        f"workflow completion skipped: {run_id}: {error}"
+                    )
+                    continue
                 status = _nonempty(row.get("status", row.get("current_phase")), "status")
                 source_id = f"workflow_run:{self.repo}:{run_id}"
                 sources.append(
@@ -307,9 +317,6 @@ class WorkflowRegistryProvider:
                         f"github_openspec:{self.repo}:{ref}:archived",
                     ):
                         _add_workflow_link(links, canonical_id, work_id)
-                completion = _validated_workflow_completion(
-                    row, state_path=self.state_path
-                )
                 if completion is not None:
                     validated_completions.setdefault(work_id, []).append(completion)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
@@ -329,7 +336,7 @@ class WorkflowRegistryProvider:
             last_attempt_at=attempted_at,
             last_success_at=attempted_at,
             revision=f"registry-sha256:{_digest((raw,))}",
-            diagnostics=(),
+            diagnostics=tuple(diagnostics),
             sources=tuple(sources),
             observations={
                 "workflow_links": links,
@@ -363,6 +370,10 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "planning_authority", "planning_source_revision",
     }
 )
+
+
+class _WorkflowCompletionValidationError(ValueError):
+    """Bad completion contents for one row; provider may skip that row only."""
 
 
 def _validate_workflow_v1_root(payload: Mapping) -> None:
@@ -523,7 +534,10 @@ def _validated_workflow_completion(
         raise ValueError("completion_record_path escapes coordinator completion root") from error
     from paulsha_cortex.coordinator.completion import read_completion_record
 
-    record = read_completion_record(resolved, expected_hash=expected_hash.lower())
+    try:
+        record = read_completion_record(resolved, expected_hash=expected_hash.lower())
+    except ValueError as error:
+        raise _WorkflowCompletionValidationError(str(error)) from error
     normalized_sources = dict(source_revisions)
     authority_record = record.get("work_authority")
     if isinstance(authority_record, Mapping):

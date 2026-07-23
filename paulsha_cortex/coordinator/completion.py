@@ -14,6 +14,7 @@ from . import verification
 
 COMPLETION_SCHEMA_VERSION = 1
 VALID_REVIEW_POLICIES = frozenset({"required", "not-required"})
+VOLATILE_WORK_AUTHORITY_FIELDS = frozenset({"snapshot_hash", "provider_revision"})
 
 
 def classify_completion(*, exit_code: int, last_jsonl_line: str | None) -> str:
@@ -301,6 +302,28 @@ def _load_json_file(path: str | Path) -> object:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _semantic_work_authority(authority: object) -> dict[str, Any] | None:
+    if authority is None:
+        return None
+    normalized = _normalize_work_authority(authority)
+    return {
+        key: copy.deepcopy(value)
+        for key, value in normalized.items()
+        if key not in VOLATILE_WORK_AUTHORITY_FIELDS
+    }
+
+
+def completion_records_semantically_match(existing: object, incoming: object) -> bool:
+    try:
+        existing_normalized = validate_completion_record(existing)
+        incoming_normalized = validate_completion_record(incoming)
+    except ValueError:
+        return False
+    existing_authority = _semantic_work_authority(existing_normalized.pop("work_authority", None))
+    incoming_authority = _semantic_work_authority(incoming_normalized.pop("work_authority", None))
+    return existing_normalized == incoming_normalized and existing_authority == incoming_authority
+
+
 def _validate_reference(
     *,
     path: object,
@@ -377,15 +400,20 @@ def read_completion_record(
     return normalized
 
 
-def _existing_record_or_raise(path: Path, content_hash: str) -> dict[str, Any]:
+def _existing_record_or_raise(
+    path: Path,
+    content_hash: str,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
     reason = "existing completion record unreadable"
     try:
         existing = read_completion_record(path)
     except ValueError:
         existing = None
     if existing is not None:
-        if verification.canonical_json_hash(existing) == content_hash:
-            return {"path": str(path), "hash": content_hash, "payload": copy.deepcopy(existing)}
+        existing_hash = verification.canonical_json_hash(existing)
+        if existing_hash == content_hash or completion_records_semantically_match(existing, incoming):
+            return {"path": str(path), "hash": existing_hash, "payload": copy.deepcopy(existing)}
         reason = "content mismatch"
     quarantine_dir = path.parent / "quarantine"
     quarantine_dir.mkdir(parents=True, exist_ok=True)
@@ -407,11 +435,11 @@ def write_completion_record(
     )
     content_hash = verification.canonical_json_hash(normalized)
     if path.exists():
-        return _existing_record_or_raise(path, content_hash)
+        return _existing_record_or_raise(path, content_hash, normalized)
     try:
         verification.atomic_write_json(path, normalized)
     except verification.AtomicWriteConflictError:
-        return _existing_record_or_raise(path, content_hash)
+        return _existing_record_or_raise(path, content_hash, normalized)
     return {"path": str(path), "hash": content_hash, "payload": copy.deepcopy(normalized)}
 
 
