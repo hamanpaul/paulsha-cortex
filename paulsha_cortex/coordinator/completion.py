@@ -14,7 +14,12 @@ from . import verification
 
 COMPLETION_SCHEMA_VERSION = 1
 VALID_REVIEW_POLICIES = frozenset({"required", "not-required"})
-VOLATILE_WORK_AUTHORITY_FIELDS = frozenset({"snapshot_hash", "provider_revision"})
+# source_revisions（openspec/todo/spec 綁 default-branch tree SHA）隨 main 前進合法漂移，
+# 對 completion 語意（run/candidate/verdict/mapped refs/merge_commit）無影響，故納入揮發集，
+# 讓長期 in-flight run 的 ship work_authority 比對不因此漂移誤判 mismatch。
+VOLATILE_WORK_AUTHORITY_FIELDS = frozenset(
+    {"snapshot_hash", "provider_revision", "source_revisions"}
+)
 
 
 def classify_completion(*, exit_code: int, last_jsonl_line: str | None) -> str:

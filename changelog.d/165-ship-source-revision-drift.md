@@ -1,0 +1,1 @@
+- **ship source_revisions 漂移容忍**：`completion_records_semantically_match` 現在把 `work_authority.source_revisions` 視為揮發欄位，讓跨多次 main 前進的長期 in-flight run 在 ship 時不再因 source_revisions 合法漂移誤判 `completion record reread WorkAuthority mismatch`；candidate/merge_commit/mapped refs 等仍精確比對。
