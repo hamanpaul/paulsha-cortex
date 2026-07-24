@@ -1,1 +1,0 @@
-- fix(delivery): 隔離preflight子行程與Manager的`PSC_*` runtime authority，避免測試誤啟production workflow executor。

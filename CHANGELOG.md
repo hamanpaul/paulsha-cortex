@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-24
+
 ### Added
 - **release-pipeline 發版工作流**：新增 Python 3.10–3.13 測試矩陣、build/smoke-install CI，以及 tag `v*` 觸發的 GitHub Release 資產發佈流程。
 - **B9 release-pipeline 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。

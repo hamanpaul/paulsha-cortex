@@ -1,1 +1,0 @@
-- fix(delivery): initial push前冪等重綁fresh current WorkAuthority，保留planning issuance與exact Candidate evidence。
