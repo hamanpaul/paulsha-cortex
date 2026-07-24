@@ -1,0 +1,1 @@
+- **pyproject 補 readme**：`[project]` 宣告 `readme = "README.md"`，使 `python -m build` 產物帶 long_description、通過 `twine check --strict`（B9 release pipeline build gate 依賴此）。
