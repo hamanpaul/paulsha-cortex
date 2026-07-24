@@ -1,1 +1,0 @@
-- fix(delivery): 以disposable HOME與固定service umask完整隔離preflight，避免installed runtime fallback與mode drift。
