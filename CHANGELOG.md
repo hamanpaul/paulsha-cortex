@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Added
+- **release-pipeline GitHub Release automation**：新增 Python 3.10–3.13 CI matrix、build/smoke-install artifact 驗證，以及 tag `v*` 觸發的 GitHub Release workflow（附 wheel/sdist，不含 PyPI 發布）。
 - **B9 release-pipeline 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **onboarding-docs 新手文件集**：新增 Quickstart、Upgrade、Rollback、Troubleshooting、Concepts、Admin、Runbook 七份 onboarding 文件與 README 導覽段。
 - **B8 onboarding-docs 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
