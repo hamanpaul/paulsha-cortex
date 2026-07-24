@@ -13,6 +13,7 @@
 - **release-pipeline 發版工作流**：新增 Python 3.10–3.13 測試矩陣、build/smoke-install CI，以及 tag `v*` 觸發的 GitHub Release 資產發佈流程。
 - **B9 release-pipeline 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **onboarding-docs 新手文件集**：新增 Quickstart、Upgrade、Rollback、Troubleshooting、Concepts、Admin、Runbook 七份 onboarding 文件與 README 導覽段。
+- **release 版本安裝指引**：Quickstart／Upgrade 補上從 release tag（`@v0.1.0`）或 GitHub Release wheel 安裝特定版本的說明，避免只裝到 `main` HEAD。
 - **B8 onboarding-docs 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **B7 porcelain-init-sample 規劃產物**：init-sample 批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-init-sample 導引式 sample CLI**：新增 `cortex init-sample`，包裝 `deck compile --emit`，固定維持 `dispatch: hold`，並輸出必補欄位、`deck verify` 指令與手動翻 auto 指引。

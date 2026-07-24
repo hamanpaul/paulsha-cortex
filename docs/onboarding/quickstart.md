@@ -32,6 +32,19 @@ cortex --version
 cortex --help
 ```
 
+上面裝的是 `main` 最新碼。若要部署**特定 release**（例如 `v0.1.0`），從 tag 或
+GitHub Release 附帶的 wheel 安裝，避免裝到未發佈的變更：
+
+```bash
+# 從 release tag
+pipx install "git+https://github.com/hamanpaul/paulsha-cortex.git@v0.1.0"
+
+# 或從 GitHub Release 下載的 wheel（release.yml 會把 wheel/sdist 附在該 tag 的 Release）
+pipx install ./paulsha_cortex-0.1.0-py3-none-any.whl
+
+cortex --version   # 應印出 0.1.0
+```
+
 若你是在 repo checkout 內直接試跑，也可以用：
 
 ```bash

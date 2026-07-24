@@ -31,11 +31,18 @@ cortex service status --instance cortex --json
 cortex inspect service --instance cortex --json
 ```
 
-2. 重新安裝最新版本。
+2. 重新安裝目標版本。
 
 ```bash
+# 升級到 main 最新碼
 pipx install --force git+https://github.com/hamanpaul/paulsha-cortex.git
+
+# 或釘住特定 release（建議正式部署用；tag 或 GitHub Release 的 wheel 二選一）
+pipx install --force "git+https://github.com/hamanpaul/paulsha-cortex.git@v0.1.0"
+pipx install --force ./paulsha_cortex-0.1.0-py3-none-any.whl
 ```
+
+裝完先 `cortex --version` 確認版本，再進行下一步的 service restart。
 
 3. 重啟 manager service/timer，讓 systemd 重新載入目前安裝位置。
 
