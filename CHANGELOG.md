@@ -9,6 +9,17 @@
 
 ### Added
 - **B9 release-pipeline 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **onboarding-docs 新手文件集**：新增 Quickstart、Upgrade、Rollback、Troubleshooting、Concepts、Admin、Runbook 七份 onboarding 文件與 README 導覽段。
+- **B8 onboarding-docs 規劃產物**：批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **B7 porcelain-init-sample 規劃產物**：init-sample 批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **porcelain-init-sample 導引式 sample CLI**：新增 `cortex init-sample`，包裝 `deck compile --emit`，固定維持 `dispatch: hold`，並輸出必補欄位、`deck verify` 指令與手動翻 auto 指引。
+- **porcelain-run-recover 高階執行與復原 CLI**：新增 `cortex run tick/fanout/complete/work` 與 `cortex recover slice/work/brokers/service` 家族、顯性 request ID、`--wait`，以及 versioned JSON 輸出。
+- **B6 porcelain-run-recover 規劃產物**：run/recover 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **porcelain-bootstrap 單步上手 CLI**：新增 `cortex bootstrap`，把 preflight、`service install/start`、`inspect status/doctor` 摘要、`--dry-run` 與非阻斷 `--sample` 串成單一 `cortex-porcelain/bootstrap/v1` 入口。
+- **B5 porcelain-bootstrap 規劃產物**：bootstrap 批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **porcelain-service service 管理 CLI**：新增 `cortex service install/start/stop/restart/status/logs/uninstall` 家族、versioned `cortex-porcelain/service/v1` JSON 輸出，以及 systemd/fallback runtime 與 log source 切換。
+- **B4 porcelain-service 規劃產物**：service 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
+- **porcelain-inspect 唯讀檢查 CLI**：新增 `cortex inspect status/job/ready/work/doctor/service` 家族、versioned `cortex-porcelain/inspect/v1` JSON 輸出，以及 systemd unit exec path stale 偵測。
 - **B3 porcelain-inspect 規劃產物**：inspect 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
 - **porcelain-request request 追蹤 CLI**：新增唯讀 `cortex request list/show/wait/logs` 家族、versioned `cortex-porcelain/request/v1` JSON 輸出，以及 request timeout 後的顯性追蹤面。
 - **B2 porcelain-request 規劃產物**：request 家族批次的 Work Item 綁定、規劃四件套與 OpenSpec change。
@@ -21,6 +32,13 @@
 - **Porcelain CLI UX 規格與 v0.1.0 release plan**：凍結七家族（bootstrap/request/run/inspect/recover/service/init-sample）命令詞彙、exit code 契約、`--json` schema 穩定策略、request_id 顯性化 UX 與 TUI 邊界契約；並定義 v0.1.0 批次順序、release 程序（GitHub Release）、升級回滾與 KPI。
 
 ### Fixed
+- **ship source_revisions 漂移容忍**：`completion_records_semantically_match` 現在把 `work_authority.source_revisions` 視為揮發欄位，讓跨多次 main 前進的長期 in-flight run 在 ship 時不再因 source_revisions 合法漂移誤判 `completion record reread WorkAuthority mismatch`。
+- **CompletionRecord immutable 重用與 provider 缺檔韌性**：已完成/已合併 run 的 CompletionRecord 一旦已有可驗證舊檔，後續 reconciliation 會直接重用既有 record，不再因 `work_authority.source_revisions` 等合法漂移欄位重推導後隔離舊檔；`WorkflowRegistryProvider` 遇到缺失、symlink、越界或內容損毀的 completion 檔時，也只跳過該列並留下 diagnostic，不再讓整個 provider degraded。
+- **WorkflowRun completion record 冪等與 provider 韌性**：已完成 run 若因 snapshot/provider revision 漂移而重播 closure，現在會重用既有 CompletionRecord 的揮發 `work_authority` metadata，不再隔離合法舊檔；`WorkflowRegistryProvider` 遇到單筆 completion record 驗證失敗時也只跳過該列，其他 run 的 sources/links 與 validated completions 仍可正常輸出。
+- **porcelain-run-recover CLI JSON 邊界修正**：`cortex recover service restart` 不再暴露會誤導 schema 的 `--json` 旗標，`cortex run work --payload` help 也明確改成要求 JSON 檔案路徑。
+- **porcelain-bootstrap executor preflight**：`bootstrap` preflight 改為檢查實際 executor 登入態（`copilot` / `claude` / `codex`），移除未列入凍結設計的額外 `gh-auth` gate，且 `copilot` 探測不再要求 `--allow-all-tools`。
+- **GitHub terminal PR 分頁**：`GitHubTerminalProvider` 現在會以 cursor 逐頁讀取最多 20 頁 pull requests，完整聚合超過 100 筆的 repo；若頁數仍未收斂則顯式失敗，避免第 101 個 PR 讓 terminal provider 永久 degraded。
+- **porcelain-service lifecycle guardrails**：所有 `service` 子命令現在共用 instance 驗證，`logs --follow` 改為 systemd-only 串流且 fallback 明確拒絕，systemctl/journalctl 失敗時 `--json` 也會回傳一致的 `cortex-porcelain/service/v1` 錯誤 envelope。
 - **repair 派工注入 bot review findings**：delivery journal 現在會保留 blocking review threads 的檔案/行號/摘錄，repair builder 的 commit-required prompt 會直接附上 needs-fix findings，避免 fix-round 在缺少 reviewer 上下文時盲修。
 - **builder workflow identity 先過濾 build capability**：`_select_workflow_identity()` 現在會先排除不具 `build` 能力的 builder 候選，再套用 `primary_domain` 偏好，避免 google primary domain 把 build 卡誤派給僅支援 planning 的身分而陷入 malformed 重派。
 - **plan-phase planner 卡可在產物完備時由 Manager 決定性通過**：`writing-plans` 等規劃卡若其 persisted planning authority 對應的 accepted spec/design/plan 已完整存在，manager 會直接把當前 planner step 標記為 `passed` 並推進到下一 phase，不再多派 planner executor。
