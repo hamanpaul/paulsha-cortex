@@ -10,4 +10,4 @@ work_item: release-pipeline
 - [x] 1.2 擴充 `tests.yml` Python 3.10–3.13 matrix；新增 build job。
 - [x] 1.3 新增 clean-venv smoke-install job；新增 `release.yml`（tag `v*` 觸發）。
 - [x] 1.4 全新增／修改 `uses:` SHA pin；`changelog.d/release-pipeline.md` 與 `CHANGELOG.md [Unreleased]` 同步（條目含 release-pipeline 字樣）。
-- [ ] 1.5 pytest 全綠、policy_check 0 fail、`git diff --check` 乾淨、新 workflow CI 實跑全綠。
+- [x] 1.5 authoritative policy gate、`openspec validate --all`、`python3 -m pytest -q tests` 與 `git diff --check` 皆通過；live CI / merge / archive 由 Manager 接手。

@@ -8,6 +8,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 SHA_PIN_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+USES_WITH_VERSION_COMMENT_RE = re.compile(
+    r"^\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s+#\s+v\d+\.\d+\.\d+(?:[-.A-Za-z0-9]+)?\s*$"
+)
 
 
 def _load_workflow(name: str) -> dict:
@@ -44,6 +47,20 @@ def _assert_all_uses_are_sha_pinned(payload: dict, *, relpath: str) -> None:
             assert SHA_PIN_RE.match(uses), f"{relpath}:{job_name} step `{uses}` must use a 40-hex SHA pin"
 
 
+def _assert_all_uses_have_version_comments(name: str) -> None:
+    path = WORKFLOWS / name
+    uses_lines = [
+        (line_no, line)
+        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        if re.match(r"^\s*uses:\s+", line)
+    ]
+    assert uses_lines, f"{path.relative_to(REPO_ROOT)} must contain at least one uses step"
+    for line_no, line in uses_lines:
+        assert USES_WITH_VERSION_COMMENT_RE.match(line), (
+            f"{path.relative_to(REPO_ROOT)}:{line_no} uses line must keep a 40-hex SHA pin and `# vX.Y.Z` comment"
+        )
+
+
 def test_tests_workflow_matches_release_pipeline_contract() -> None:
     payload = _load_workflow("tests.yml")
     jobs = payload.get("jobs", {})
@@ -73,6 +90,7 @@ def test_tests_workflow_matches_release_pipeline_contract() -> None:
     assert "cortex --help" in smoke_runs
 
     _assert_all_uses_are_sha_pinned(payload, relpath=".github/workflows/tests.yml")
+    _assert_all_uses_have_version_comments("tests.yml")
 
 
 def test_release_workflow_is_tag_only_no_pypi_and_sha_pinned() -> None:
@@ -92,3 +110,4 @@ def test_release_workflow_is_tag_only_no_pypi_and_sha_pinned() -> None:
     jobs = payload.get("jobs", {})
     assert isinstance(jobs, dict) and jobs, "release.yml must define jobs"
     _assert_all_uses_are_sha_pinned(payload, relpath=".github/workflows/release.yml")
+    _assert_all_uses_have_version_comments("release.yml")
