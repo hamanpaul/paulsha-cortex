@@ -128,3 +128,22 @@ work_items:
         ref: terminal-lifecycle-canary
       - kind: path
         ref: docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md
+  dispatch-reliability-batch:
+    title: dispatch reliability batch (#177 前置批 1)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#152
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#100
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#99
+      - kind: openspec
+        ref: 2026-07-25-dispatch-reliability
+      - kind: path
+        ref: docs/superpowers/workstreams/dispatch-reliability-batch/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/dispatch-reliability-batch-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/dispatch-reliability-batch-design.md
+      - kind: path
+        ref: docs/superpowers/plans/dispatch-reliability-batch.md
