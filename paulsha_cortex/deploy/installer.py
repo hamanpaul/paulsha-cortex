@@ -12,6 +12,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Sequence
 
+from paulsha_cortex.config import paths
+
 _INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SUPPORTED_EXECUTORS = frozenset({"copilot", "claude", "codex"})
 
@@ -31,13 +33,16 @@ def _service_script_path() -> Path:
     return Path(str(resources.files("paulsha_cortex") / "scripts" / "service-manager.sh"))
 
 
-def render_units(instance: str, interval: int) -> dict[str, str]:
+def render_units(instance: str, interval: int, repo_root: Path | str | None = None) -> dict[str, str]:
     service = _template("manager.service.tmpl").replace("__INSTANCE__", instance)
     service = service.replace("__SERVICE_SCRIPT__", str(_service_script_path()))
     timer = _template("manager.timer.tmpl").replace("__INSTANCE__", instance)
     timer = re.sub(r"^OnUnitActiveSec=.*$", f"OnUnitActiveSec={interval}", timer, flags=re.M)
     monitor = _template("monitor.service.tmpl").replace("__INSTANCE__", instance)
     monitor = monitor.replace("__PY__", sys.executable)
+    service_root = Path(repo_root).resolve() if repo_root is not None else paths.repo_root().resolve()
+    service = service.replace("__REPO_ROOT__", str(service_root))
+    monitor = monitor.replace("__REPO_ROOT__", str(service_root))
     return {
         f"{instance}-manager.service": service,
         f"{instance}-manager.timer": timer,
@@ -167,7 +172,7 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
         agents_root / "config" / "paulsha",
     ):
         directory.mkdir(parents=True, exist_ok=True)
-    for name, content in render_units(instance, interval).items():
+    for name, content in render_units(instance, interval, repo_root=repo_root).items():
         (unit_dir / name).write_text(content)
     managed_env = {
         "PY": sys.executable,

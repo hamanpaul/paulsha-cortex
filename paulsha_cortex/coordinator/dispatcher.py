@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from paulsha_cortex.config import paths
+
 from .completion import classify_completion
 from .registry import JobRegistry
 from .seams import PaneSender, WorktreeCreator
@@ -20,9 +22,16 @@ PidAlive = Callable[[int], bool]
 
 
 def _default_git_runner(args: list[str]) -> str:
-    proc = subprocess.run(["git", *args], capture_output=True, text=True)
+    repo_root = paths.repo_root()
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        capture_output=True,
+        text=True,
+    )
     if proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} 失敗: {proc.stderr.strip()}")
+        raise RuntimeError(
+            f"git -C {repo_root} {' '.join(args)} 失敗: {proc.stderr.strip()}"
+        )
     return proc.stdout.strip()
 
 

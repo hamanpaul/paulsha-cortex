@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #99：git runner 與 systemd 單元以 repo root 為基準**：`dispatcher._default_git_runner` 現在以 `git -C <repo_root>` 執行 git 呼叫；`cortex-manager.service` 與 `cortex-monitor.service` 渲染時皆加入 `WorkingDirectory=<repo_root>`，避免 daemon 於非預期目錄執行 git 或長駐服務命令。
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

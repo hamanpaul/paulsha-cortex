@@ -68,7 +68,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
      --repo-root "$(git rev-parse --show-toplevel)"
    ```
 
-   Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。
+   Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。兩個 service 都會設定 `WorkingDirectory=<PSC_REPO_ROOT>`，因此服務執行時不受 `cwd` 影響。
 
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
 
@@ -473,7 +473,7 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 | monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
 | project config root | `~/.agents/config/paulsha` | `PSC_PROJECT_CONFIG_ROOT` |
-| repo root | 目前工作目錄 | `PSC_REPO_ROOT` |
+| repo root | 指定 install 時的 git repo top-level（`--repo-root`） | `PSC_REPO_ROOT` |
 | worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
 
 共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑會更新自身管理的Python/repo值，但保留既有operator roots。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。

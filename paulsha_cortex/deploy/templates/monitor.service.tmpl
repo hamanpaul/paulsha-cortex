@@ -9,6 +9,7 @@ StartLimitBurst=5
 EnvironmentFile=-%h/.agents/core/runtime/__INSTANCE__.env
 EnvironmentFile=-%h/.agents/core/runtime/__INSTANCE__-manager.env
 ExecStart=__PY__ -m paulsha_cortex.monitor
+WorkingDirectory=__REPO_ROOT__
 KillMode=control-group
 Restart=on-failure
 RestartSec=10
