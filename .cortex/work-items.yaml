@@ -143,6 +143,36 @@ work_items:
         ref: docs/superpowers/specs/fix-git-runner-cwd-design.md
       - kind: path
         ref: docs/superpowers/plans/fix-git-runner-cwd.md
+  fix-dispatch-exception-detail:
+    title: fix DispatchReadyError detail + manager.log timestamp (#100)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#100
+      - kind: openspec
+        ref: 2026-07-25-fix-dispatch-exception-detail
+      - kind: path
+        ref: docs/superpowers/workstreams/fix-dispatch-exception-detail/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-dispatch-exception-detail-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-dispatch-exception-detail-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-dispatch-exception-detail.md
+  fix-mutation-request-timeout:
+    title: fix mutation request 5s timeout (#152)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#152
+      - kind: openspec
+        ref: 2026-07-25-fix-mutation-request-timeout
+      - kind: path
+        ref: docs/superpowers/workstreams/fix-mutation-request-timeout/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-mutation-request-timeout-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-mutation-request-timeout-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-mutation-request-timeout.md
   dispatch-reliability-batch:
     title: dispatch reliability batch (abandoned, #134)
     links: []
