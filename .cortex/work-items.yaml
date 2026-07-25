@@ -128,22 +128,18 @@ work_items:
         ref: terminal-lifecycle-canary
       - kind: path
         ref: docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md
-  dispatch-reliability-batch:
-    title: dispatch reliability batch (#177 前置批 1)
+  fix-git-runner-cwd:
+    title: fix git runner cwd coupling (#99)
     links:
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#152
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#100
       - kind: github_issue
         ref: hamanpaul/paulsha-cortex#99
       - kind: openspec
-        ref: 2026-07-25-dispatch-reliability
+        ref: 2026-07-25-fix-git-runner-cwd
       - kind: path
-        ref: docs/superpowers/workstreams/dispatch-reliability-batch/todo.md
+        ref: docs/superpowers/workstreams/fix-git-runner-cwd/todo.md
       - kind: path
-        ref: docs/superpowers/specs/dispatch-reliability-batch-spec.md
+        ref: docs/superpowers/specs/fix-git-runner-cwd-spec.md
       - kind: path
-        ref: docs/superpowers/specs/dispatch-reliability-batch-design.md
+        ref: docs/superpowers/specs/fix-git-runner-cwd-design.md
       - kind: path
-        ref: docs/superpowers/plans/dispatch-reliability-batch.md
+        ref: docs/superpowers/plans/fix-git-runner-cwd.md
