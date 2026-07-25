@@ -143,3 +143,13 @@ work_items:
         ref: docs/superpowers/specs/fix-git-runner-cwd-design.md
       - kind: path
         ref: docs/superpowers/plans/fix-git-runner-cwd.md
+  dispatch-reliability-batch:
+    title: dispatch reliability batch (abandoned, #134)
+    links: []
+    excludes:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#99
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#100
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#152
