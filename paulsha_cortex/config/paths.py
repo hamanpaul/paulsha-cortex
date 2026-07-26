@@ -69,10 +69,15 @@ def _canonical_repo_root(repo: Path) -> Path:
     return repo
 
 
-def worktree_root() -> Path:
-    """coordinator 派工 worktree 池預設為 sibling `<repo>-worktrees`。"""
+def worktree_root_for(repo: Path) -> Path:
+    """依給定 repo 計算 worktree pool，預設為 sibling `<repo>-worktrees`。"""
     override = _env_path("PSC_WORKTREE_ROOT")
     if override is not None:
         return override
-    repo = _canonical_repo_root(repo_root())
+    repo = _canonical_repo_root(repo)
     return repo.parent / f"{repo.name}-worktrees"
+
+
+def worktree_root() -> Path:
+    """coordinator 派工 worktree pool 的預設路徑。"""
+    return worktree_root_for(repo_root())

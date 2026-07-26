@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #134：multi-issue build 支援最小 issue 為主 branch 且以 run repository 建立 worktree**：builder 會在 run 含多個 issue 時，使用編號最小的 `feature/<主issue>-<work_id>`，並由 run repo 作為 `ScriptWorktreeCreator` 的 git 工作目錄。
 - **Issue #152：mutation request 逾時改採分級 timeout + pending 回報**：`coordinator/cli.py` `_submit_mutation_request` 依 `req_type` 套用分級 timeout（`fanout`/`tick` 60 秒、`complete`/`work`/`work-action`/`run` 30 秒、其餘 5 秒），`poll` timeout 時保留 `req_id` 與追蹤指引並回傳 `EXIT_SUBMITTED_PENDING`（exit 3）避免成功派工被誤報為失敗。
 - **Issue #99：git runner 與 systemd 單元以 repo root 為基準**：`dispatcher._default_git_runner` 現在以 `git -C <repo_root>` 執行 git 呼叫；`cortex-manager.service` 與 `cortex-monitor.service` 渲染時皆加入 `WorkingDirectory=<repo_root>`，避免 daemon 於非預期目錄執行 git 或長駐服務命令。
 - **Issue #182：monitor workflow provider 跳過 superseded run 的 issue authority**：`WorkflowRegistryProvider` 建立 workflow_links 時不再對 `superseded` run 主張 issue/pr/openspec authority，避免廢棄 run 的 issue_refs 與其他 work item 衝突使 provider degraded；degraded 會凍結 `project_work_items` 於舊 snapshot，讓新以 work-items.yaml `github_issue` link 綁定的 source 永遠不進入 monitor read model。

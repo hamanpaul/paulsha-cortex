@@ -22,8 +22,10 @@ from ..persona import gate, handoff
 from . import autonomy
 from . import completion
 from . import planning_runtime
+from . import seams
 from . import review as foreign_review
 from . import verification
+from ..config.paths import worktree_root_for
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -5308,18 +5310,34 @@ def _dispatch_workflow_card(
         worktree = str(builder_jobs[-1]["worktree"])
     elif step.phase == "build":
         creator = getattr(dispatcher, "_worktree_creator", None)
+        workspace_root = Path(run.workspace_root)
         if creator is None:
-            raise ValueError("workflow builder worktree creator unavailable")
+            try:
+                creator = seams.ScriptWorktreeCreator(
+                    repo=workspace_root,
+                    wt_root=worktree_root_for(workspace_root),
+                    base="main",
+                )
+            except BaseException as exc:
+                raise ValueError("workflow builder worktree creator unavailable") from exc
+        elif str(Path(getattr(creator, "repo_root", "")).resolve()) != str(workspace_root.resolve()):
+            try:
+                creator = seams.ScriptWorktreeCreator(
+                    repo=workspace_root,
+                    wt_root=worktree_root_for(workspace_root),
+                    base="main",
+                )
+            except BaseException as exc:
+                raise ValueError("workflow builder worktree creator unavailable") from exc
         issue_numbers = [
-            match.group(1)
+            int(match.group(1))
             for ref in run.issue_refs
             if (match := re.fullmatch(rf"{re.escape(run.repo)}#([1-9][0-9]*)", ref))
         ]
-        if len(issue_numbers) > 1:
-            raise ValueError("workflow builder requires exactly one confirmed issue")
+        primary_issue = min(issue_numbers) if issue_numbers else None
         builder_branch = (
-            f"feature/{issue_numbers[0]}-{run.work_id}"
-            if issue_numbers
+            f"feature/{primary_issue}-{run.work_id}"
+            if primary_issue is not None
             else f"feature/{run.work_id}"
         )
         worktree = str(creator.create(builder_branch))
