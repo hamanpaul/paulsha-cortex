@@ -203,6 +203,21 @@ work_items:
         ref: docs/superpowers/specs/reclaim-pr-inheritance-design.md
       - kind: path
         ref: docs/superpowers/plans/reclaim-pr-inheritance.md
+  driving-cortex-skill:
+    title: driving-cortex skill (#177)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#177
+      - kind: openspec
+        ref: 2026-07-26-driving-cortex-skill
+      - kind: path
+        ref: docs/superpowers/workstreams/driving-cortex-skill/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/driving-cortex-skill-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/driving-cortex-skill-design.md
+      - kind: path
+        ref: docs/superpowers/plans/driving-cortex-skill.md
   dispatch-reliability-batch:
     title: dispatch reliability batch (abandoned, #134)
     links: []
