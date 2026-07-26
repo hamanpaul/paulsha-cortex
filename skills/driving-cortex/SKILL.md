@@ -61,7 +61,7 @@ description: "driving cortex、派工 cortex、cortex work 導向的協作 skill
 ## 已知坑
 
 - [ ] `#152`：`5s` 這類短超時是預期回報節奏，不代表實際失敗，先確認 `--wait` 與 retry 方案。
-- [ ] `#175`：`re-claim` 後會繼承舊上下文，避免在已開 PR 後直接 re-claim。
+- [ ] `#175`：re-claim 繼承舊 PR 綁定已於 #190 修復；仍建議避免在已開 PR 後直接 re-claim，以防邊界情境殘留。
 - [ ] `#158`：archive/sources 的 Purpose 若仍留 `TBD`，會阻礙 close gate，需補齊。
 - [ ] `#83`：缺少 worktree/branch GC 的情境下，偶有殘留資源；交接前回收可疑 workspace。
 - [ ] `#99`：daemon 若假設目前 cwd 作為 repo root，可能讀錯目錄，務必驗證 manager/monitor 是否以 `PSC_REPO_ROOT` 類正確根路徑執行。
