@@ -56,12 +56,12 @@ SLICE_STATE_TRANSITIONS = {
     "verified": frozenset({"verified", "completed", "needs_human"}),
     "completed": frozenset({"completed"}),
     "needs_human": frozenset({"needs_human", "building", "reviewing", "verified", "failed", "completed"}),
-    "failed": frozenset({"failed"}),
+    "failed": frozenset({"failed", "needs_human"}),
 }
 GATE_STATE_TRANSITIONS = {
     "pending": frozenset({"pending", "passed", "failed", "needs_human"}),
     "passed": frozenset({"passed"}),
-    "failed": frozenset({"failed"}),
+    "failed": frozenset({"failed", "needs_human"}),
     "needs_human": frozenset({"needs_human", "pending", "passed", "failed"}),
 }
 
@@ -156,10 +156,33 @@ class JobRegistry:
         self._workflows: list[WorkflowRun] = []
         self._legacy_records: dict[str, Any] = _empty_legacy_records()
         self._seq = seq_start
+        self._state_mtime_ns: int | None = None
+        self._state_size: int | None = None
+        self._load()
+
+    def _record_state_file_metadata(self) -> None:
+        try:
+            stat = self._state_path.stat()
+        except OSError:
+            self._state_mtime_ns = None
+            self._state_size = None
+            return
+        self._state_mtime_ns = stat.st_mtime_ns
+        self._state_size = stat.st_size
+
+    def _reload_if_changed(self) -> None:
+        try:
+            stat = self._state_path.stat()
+        except OSError:
+            return
+        if self._state_mtime_ns == stat.st_mtime_ns and self._state_size == stat.st_size:
+            return
         self._load()
 
     def _load(self) -> None:
         if not self._state_path.is_file():
+            self._state_mtime_ns = None
+            self._state_size = None
             return
         try:
             original = self._state_path.read_bytes()
@@ -191,6 +214,7 @@ class JobRegistry:
             self._write_payload_atomically(migrated)
             self._legacy_records = _deepcopy_json(legacy_records)
             self._seq = max(seq, self._seq)
+            self._record_state_file_metadata()
             return
         if schema_version != COORDINATOR_STATE_SCHEMA_VERSION:
             if schema_version is None:
@@ -226,6 +250,7 @@ class JobRegistry:
         self._workflows = validated_workflows
         self._legacy_records = _deepcopy_json(legacy_records)
         self._seq = max(seq, self._seq)
+        self._record_state_file_metadata()
 
     def _validate_state_records(
         self, payload: dict[str, Any]
@@ -341,6 +366,7 @@ class JobRegistry:
         }
         try:
             self._write_payload_atomically(payload)
+            self._record_state_file_metadata()
         except BaseException:
             # _write_payload_atomically restores the previous durable file.
             # Reload that exact snapshot so every mutation site, including
@@ -547,12 +573,14 @@ class JobRegistry:
         }
 
     def _find_job(self, job_id: str) -> dict[str, Any]:
+        self._reload_if_changed()
         for job in self._jobs:
             if job["job_id"] == job_id:
                 return job
         raise KeyError(f"job 不存在: {job_id}")
 
     def _find_slice(self, slice_id: str) -> dict[str, Any]:
+        self._reload_if_changed()
         for slice_row in self._slices:
             if slice_row["slice_id"] == slice_id:
                 return slice_row
@@ -670,6 +698,7 @@ class JobRegistry:
         return _deepcopy_json(job)
 
     def list_jobs(self) -> list[dict[str, Any]]:
+        self._reload_if_changed()
         return [_deepcopy_json(job) for job in self._jobs]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
@@ -873,9 +902,11 @@ class JobRegistry:
         return self._copy_slice(slice_row)
 
     def list_slices(self) -> list[dict[str, Any]]:
+        self._reload_if_changed()
         return [self._copy_slice(slice_row) for slice_row in self._slices]
 
     def get_slice(self, slice_id: str) -> dict[str, Any]:
+        self._reload_if_changed()
         return self._copy_slice(self._find_slice(slice_id))
 
     def update_slice(

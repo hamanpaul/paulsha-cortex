@@ -407,6 +407,8 @@ def _current_verification_payload(slice_row: dict | None) -> dict | None:
 def allowed_slice_actions(registry, slice_row: dict | None) -> list[str]:
     if not isinstance(slice_row, dict):
         return []
+    if slice_row.get("state") == "failed":
+        return ["retry-build", "abandon"]
     if slice_row.get("state") != "needs_human":
         return []
     actions = ["retry-build", "abandon"]
