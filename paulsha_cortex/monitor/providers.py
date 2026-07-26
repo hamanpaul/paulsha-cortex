@@ -871,13 +871,14 @@ class GitHubTerminalProvider:
                 closing = pull["closingIssuesReferences"]
                 if closing["pageInfo"]["hasNextPage"]:
                     raise ValueError("closing issue pagination incomplete")
-                issues = closing["nodes"]
-                if issues:
-                    primary_issue_source = f"github_issue:{self.repo}#{issues[0]['number']}"
-                    links[pr_source_id] = primary_issue_source
-                    for issue in issues[1:]:
-                        issue_source = f"github_issue:{self.repo}#{issue['number']}"
-                        links[issue_source] = primary_issue_source
+                if pull.get("state") != "CLOSED":
+                    issues = closing["nodes"]
+                    if issues:
+                        primary_issue_source = f"github_issue:{self.repo}#{issues[0]['number']}"
+                        links[pr_source_id] = primary_issue_source
+                        for issue in issues[1:]:
+                            issue_source = f"github_issue:{self.repo}#{issue['number']}"
+                            links[issue_source] = primary_issue_source
                 merge = pull.get("mergeCommit") or {}
                 merge_revision = merge.get("oid")
                 parent_count = (merge.get("parents") or {}).get("totalCount")

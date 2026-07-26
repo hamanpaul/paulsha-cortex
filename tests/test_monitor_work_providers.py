@@ -930,7 +930,6 @@ def test_github_terminal_provider_aggregates_pull_requests_across_pages():
     assert result.status == "ok"
     assert result.observations["closing_links"] == {
         "github_pr:example/acme#9": "github_issue:example/acme#7",
-        "github_pr:example/acme#10": "github_issue:example/acme#8",
     }
     assert result.observations["branches"] == [
         {"source_id": "github_pr:example/acme#9", "ref": "feature/9-work"},

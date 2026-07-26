@@ -56,7 +56,7 @@ def resolve_trusted_repo_root(repo: str, *, explicit: object = None) -> Path:
     """Resolve owner/name only through installed repo/Monitor configuration."""
 
     candidates: list[Path] = []
-    if isinstance(explicit, str) and explicit:
+    if isinstance(explicit, (str, Path)) and explicit:
         raw = Path(explicit).expanduser()
         try:
             root = raw.resolve(strict=True)
@@ -209,7 +209,7 @@ def start_canonical_workflow(
             steps=manifest.steps,
             issue_refs=tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues),
             openspec_refs=authority.mapped_openspec,
-            pr_refs=tuple(f"{authority.repo}#{number}" for number in authority.mapped_prs),
+            pr_refs=(),
             attempts={"claim": 1},
             facets=("needs_human",),
             gate_status="running",
@@ -243,7 +243,7 @@ def start_canonical_workflow(
             "primary_domain": primary.independence_domain,
             "issue_refs": [f"{authority.repo}#{number}" for number in authority.mapped_issues],
             "openspec_refs": list(authority.mapped_openspec),
-            "pr_refs": [f"{authority.repo}#{number}" for number in authority.mapped_prs],
+            "pr_refs": [],
         },
         identity_registry=identities,
         runtime_factory=runtime_factory,
