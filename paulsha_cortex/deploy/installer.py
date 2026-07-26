@@ -135,6 +135,28 @@ def _read_plain_env(env_file: Path) -> dict[str, str]:
     return values
 
 
+def _resolve_python_executable(value: str | None) -> str | None:
+    if not value:
+        return None
+    candidate = Path(value.strip()).expanduser()
+    if not candidate.is_absolute():
+        return None
+    if candidate.parent.name != "bin":
+        return None
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", candidate.name):
+        return None
+    return str(candidate.resolve())
+
+
+def _resolve_agents_root(raw_agents_root: str | None) -> Path | None:
+    if not raw_agents_root:
+        return None
+    candidate = Path(raw_agents_root).expanduser()
+    if not candidate.is_absolute():
+        return None
+    return candidate
+
+
 def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
     return runtime_dir / f"{instance}.env"
 
@@ -146,20 +168,24 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
     env_file = runtime_dir / f"{instance}-manager.env"
     existing = _read_plain_env(env_file)
     instance_env = _read_plain_env(_instance_env_file(runtime_dir, instance))
+    existing_python = _resolve_python_executable(existing.get("PY", ""))
+    caller_python = _resolve_python_executable(sys.executable)
+    if existing_python and caller_python and existing_python != caller_python:
+        raise ValueError(
+            f"既有 runtime env 中的 PY 指向 {existing_python}，與目前呼叫者 {caller_python} 不一致，"
+            "請先手動清理該 instance env 後再執行 install。"
+        )
     persisted_executor = existing.get("PSC_MANAGER_EXECUTOR", "").strip()
     if persisted_executor and persisted_executor not in _SUPPORTED_EXECUTORS:
         raise ValueError("既有 PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
     instance_executor = instance_env.get("PSC_MANAGER_EXECUTOR", "").strip()
     if instance_executor and instance_executor not in _SUPPORTED_EXECUTORS:
         raise ValueError("既有 instance PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
-    agents_root = Path(
-        existing.get(
-            "PSC_AGENTS_ROOT",
-            os.environ.get("PSC_AGENTS_ROOT", str(bootstrap_root)),
-        )
-    ).expanduser()
-    if not agents_root.is_absolute():
-        raise ValueError("PSC_AGENTS_ROOT 必須為絕對路徑")
+    agents_root = _resolve_agents_root(existing.get("PSC_AGENTS_ROOT"))
+    if agents_root is None:
+        agents_root = _resolve_agents_root(os.environ.get("PSC_AGENTS_ROOT", ""))
+    if agents_root is None:
+        agents_root = bootstrap_root
     unit_dir = home / ".config" / "systemd" / "user"
     # Units always bootstrap their EnvironmentFile from %h/.agents. The env
     # file then redirects all mutable/runtime data through PSC_AGENTS_ROOT and
@@ -194,7 +220,6 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
         preserve_existing=frozenset(
             {
                 "PSC_INSTANCE",
-                "PSC_AGENTS_ROOT",
                 "PSC_RUN_ROOT",
                 "PSC_MONITOR_STATE_ROOT",
                 "PSC_PROJECT_CONFIG_ROOT",

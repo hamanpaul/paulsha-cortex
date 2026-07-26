@@ -13,6 +13,7 @@
 ### Fixed
 - **Issue #98：修正 dispatch spec root 推斷**：`_infer_repo_root()` 在 `PSC_REPO_ROOT` 設定且 spec 位於 repo 外部時，改回傳 `paths.repo_root()`，避免沿 spec 路徑 `.git` 向上尋找導致誤判。
 - **Issue #118：跨 repo 派工 builder scope 修正**：`builder` persona 的 `write_paths` 已改為 `**`，不再綁定 `paulsha_cortex/**`，避免跨 repo 派工時對目標 repo 路徑誤拒，保留 worktree 邊界與其他 persona 安全限制原則。
+- **Issue #148：service install 不可覆寫既有 manager env 的 Python 指向**：`cortex install service` 當既有 `PY` 指向不同有效 venv 時會拒絕安裝，並修正既有相對/無效 `PSC_AGENTS_ROOT` 的覆寫邏輯，避免既有 runtime 設定被破壞。
 - **Issue #175：reclaim PR inheritance**：`start_canonical_workflow` needs_human 與 start 兩條路徑都不再帶入 `pr_refs`，`GitHubTerminalProvider` 不會將 `state=CLOSED`（未合併）PR 加入 `closing_links`，避免 closed PR 異常延續到 delivery authority。
 - **Issue #101：deck emit frontmatter 補齊 auto dispatch 合約**：`paulsha_cortex/deck/compile.py` 讓 `--emit` 預設輸出非空 `target_branch`（`feature/<change>`，缺 `change` 時 fallback `feature/<slug>`）並補齊 `verification` skeleton（含 `persona-scope`、`name=policy` command、`tests` 與 `full_suite.baseline=no-regression`）。
 - **Issue #134：multi-issue build 支援最小 issue 為主 branch 且以 run repository 建立 worktree**：builder 會在 run 含多個 issue 時，使用編號最小的 `feature/<主issue>-<work_id>`，並由 run repo 作為 `ScriptWorktreeCreator` 的 git 工作目錄。
