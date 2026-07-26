@@ -654,6 +654,53 @@ def test_workflow_registry_rejects_cross_work_authority_collision(tmp_path):
     assert any("authority collision" in note for note in result.diagnostics)
 
 
+def test_workflow_registry_superseded_run_does_not_claim_issue_authority(tmp_path):
+    # A superseded (abandoned) run must not claim issue/pr/openspec authority,
+    # so it cannot collide with another work item's run on a shared issue ref
+    # (regression for #182: workflow provider degraded froze projection and
+    # hid newly override-bound sources like #100).
+    state = tmp_path / "workflows.json"
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "sequence": 9,
+                "legacy_records": {"jobs": [], "slices": []},
+                "workflow_runs": [
+                    {
+                        "run_id": "run-abandoned",
+                        "repo": "example/acme",
+                        "work_id": "abandoned-batch",
+                        "status": "superseded",
+                        "issue_refs": ["example/acme#7"],
+                        "pr_refs": ["example/acme#9"],
+                        "openspec_refs": ["canary"],
+                    },
+                    {
+                        "run_id": "run-active",
+                        "repo": "example/acme",
+                        "work_id": "real-work",
+                        "status": "completed",
+                        "issue_refs": ["example/acme#7"],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = WorkflowRegistryProvider("example/acme", state_path=state).scan()
+
+    assert result.status == "ok"
+    links = result.observations["workflow_links"]
+    # superseded run still maps its own workflow_run source (unique, no collision)
+    assert links["workflow_run:example/acme:run-abandoned"] == "abandoned-batch"
+    # but it does NOT claim issue/pr/openspec authority (only the active run does)
+    assert links["github_issue:example/acme#7"] == "real-work"
+    assert "github_pr:example/acme#9" not in links
+    assert "openspec:example/acme:canary" not in links
+
+
 def test_workflow_registry_unknown_schema_and_root_keys_are_degraded(tmp_path):
     state = tmp_path / "workflows.json"
     for payload in (

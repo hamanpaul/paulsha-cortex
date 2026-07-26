@@ -306,17 +306,18 @@ class WorkflowRegistryProvider:
                     )
                 )
                 _add_workflow_link(links, source_id, work_id)
-                for ref in row.get("issue_refs", []):
-                    _add_workflow_link(links, f"github_issue:{ref}", work_id)
-                for ref in row.get("pr_refs", []):
-                    _add_workflow_link(links, f"github_pr:{ref}", work_id)
-                for ref in row.get("openspec_refs", []):
-                    for canonical_id in (
-                        f"openspec:{self.repo}:{ref}",
-                        f"github_openspec:{self.repo}:{ref}:active",
-                        f"github_openspec:{self.repo}:{ref}:archived",
-                    ):
-                        _add_workflow_link(links, canonical_id, work_id)
+                if status != "superseded":
+                    for ref in row.get("issue_refs", []):
+                        _add_workflow_link(links, f"github_issue:{ref}", work_id)
+                    for ref in row.get("pr_refs", []):
+                        _add_workflow_link(links, f"github_pr:{ref}", work_id)
+                    for ref in row.get("openspec_refs", []):
+                        for canonical_id in (
+                            f"openspec:{self.repo}:{ref}",
+                            f"github_openspec:{self.repo}:{ref}:active",
+                            f"github_openspec:{self.repo}:{ref}:archived",
+                        ):
+                            _add_workflow_link(links, canonical_id, work_id)
                 if completion is not None:
                     validated_completions.setdefault(work_id, []).append(completion)
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:

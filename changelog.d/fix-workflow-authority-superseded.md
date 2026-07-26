@@ -1,0 +1,3 @@
+### Fixed
+
+- **Issue #182：monitor workflow provider 不再對 superseded run 主張 issue authority**：`WorkflowRegistryProvider` 建立 workflow_links（issue/pr/openspec authority）時跳過 `superseded` run，避免廢棄 run 的 issue_refs 與其他 work item 的 run 衝突導致 provider degraded；degraded 會使 `project_work_items` 凍結於舊 snapshot，讓新以 work-items.yaml `github_issue` link 綁定的 source（如 #100）永遠不進入 monitor read model。superseded run 仍作為來源顯示，只是不再主張 issue authority。
