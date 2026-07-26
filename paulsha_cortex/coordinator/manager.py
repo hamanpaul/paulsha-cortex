@@ -1735,11 +1735,18 @@ def run_tick(
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 handoff_dir=handoff_dir,
             )
-        except (
-            autonomy.DispatchReadyError,
-            autonomy.DispatchReadyRequiresLauncherError,
-            ValueError,
-        ) as exc:
+        except autonomy.DispatchReadyError as exc:
+            dispatched = list(exc.jobs)
+            errors.extend(
+                {
+                    "slice_id": slice_id,
+                    "type": exc_value.__class__.__name__,
+                    "message": str(exc_value),
+                    "stage": "fanout",
+                }
+                for slice_id, exc_value in exc.errors
+            )
+        except (autonomy.DispatchReadyRequiresLauncherError, ValueError) as exc:
             errors.append({"stage": "fanout", "error": str(exc)})
     complete = complete_tick(
         dispatcher,

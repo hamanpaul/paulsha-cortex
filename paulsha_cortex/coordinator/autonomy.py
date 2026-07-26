@@ -22,10 +22,22 @@ DEFAULT_HANDOFF_DIR = "runtime/handoff"
 
 
 class DispatchReadyError(RuntimeError):
+    _MAX_MESSAGE_LENGTH = 160
+
+    @staticmethod
+    def _compact_message(exc: Exception) -> str:
+        raw = str(exc)
+        if len(raw) > DispatchReadyError._MAX_MESSAGE_LENGTH:
+            return f"{raw[: DispatchReadyError._MAX_MESSAGE_LENGTH - 3]}..."
+        return raw
+
     def __init__(self, errors: list[tuple[str, Exception]], jobs: list[dict]) -> None:
         self.errors = tuple(errors)
         self.jobs = list(jobs)
-        failed = ", ".join(slice_id for slice_id, _ in errors)
+        failed = ", ".join(
+            f"{slice_id}({exc.__class__.__name__}: {self._compact_message(exc)} filename={getattr(exc, 'filename', None)!s})"
+            for slice_id, exc in errors
+        )
         super().__init__(f"dispatch_ready failed for slice(s): {failed}")
 
 

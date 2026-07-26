@@ -10,6 +10,7 @@
 ### Fixed
 - **Issue #99：git runner 與 systemd 單元以 repo root 為基準**：`dispatcher._default_git_runner` 現在以 `git -C <repo_root>` 執行 git 呼叫；`cortex-manager.service` 與 `cortex-monitor.service` 渲染時皆加入 `WorkingDirectory=<repo_root>`，避免 daemon 於非預期目錄執行 git 或長駐服務命令。
 - **Issue #182：monitor workflow provider 跳過 superseded run 的 issue authority**：`WorkflowRegistryProvider` 建立 workflow_links 時不再對 `superseded` run 主張 issue/pr/openspec authority，避免廢棄 run 的 issue_refs 與其他 work item 衝突使 provider degraded；degraded 會凍結 `project_work_items` 於舊 snapshot，讓新以 work-items.yaml `github_issue` link 綁定的 source 永遠不進入 monitor read model。
+- **Issue #100：tick 的 dispatch 失敗回報與 manager daemon log 時間戳**：`DispatchReadyError` 現在輸出每 slice 的 `slice_id`、例外型別與訊息摘要；`tick` 在 fanout 失敗時保留已成功 dispatch 的 jobs 並回傳 per-slice 錯誤欄位；`manager_daemon` 的錯誤 log 改以可解析 ISO-8601 時間戳為行首。
 
 ## [0.1.0] - 2026-07-24
 

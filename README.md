@@ -274,6 +274,10 @@ cortex tick \
 
 `tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--model` / `--review-model` 原樣傳給 executor，能否使用仍取決於該 CLI 與帳號權限。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。
 
+若 fanout 發生 `dispatch` 例外，`tick` 回傳仍包含 `completed` 與 `dispatched`，並在 `errors` 按 slice 回報 `slice_id`、`type`、`message`，讓上層在部分派送成功時仍可見完整狀態。
+
+Daemon log 的每筆輸出則會以 ISO-8601 時間戳作為欄位首位，便於 `journalctl` / `manager.log` 直接過濾。
+
 ### 3. 觀察任務狀態
 
 ```bash

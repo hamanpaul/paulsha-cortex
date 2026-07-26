@@ -1011,7 +1011,7 @@ def _install_signal_handlers() -> None:
 
 
 def _log_error(exc: Exception) -> None:
-    print(f"manager_daemon error: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print(f"{contract.utcnow()} manager_daemon error: {type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
