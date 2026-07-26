@@ -35,7 +35,7 @@ class DispatchReadyError(RuntimeError):
         self.errors = tuple(errors)
         self.jobs = list(jobs)
         failed = ", ".join(
-            f"{slice_id}({exc.__class__.__name__}: {self._compact_message(exc)} filename={getattr(exc, 'filename', None)!s})"
+            f"{slice_id}({exc.__class__.__name__}: {self._compact_message(exc)})"
             for slice_id, exc in errors
         )
         super().__init__(f"dispatch_ready failed for slice(s): {failed}")

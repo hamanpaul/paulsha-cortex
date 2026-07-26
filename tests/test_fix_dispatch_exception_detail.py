@@ -16,7 +16,7 @@ def test_dispatch_ready_error_str_includes_slice_id_and_exception_details() -> N
 
     assert "slice-100" in rendered
     assert "FileNotFoundError" in rendered
-    assert str(exc.filename) in rendered
+    assert "/tmp/no_such_dispatch_input.yml" in rendered
 
 
 class _Registry:
