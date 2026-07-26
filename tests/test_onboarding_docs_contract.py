@@ -15,8 +15,10 @@ ONBOARDING_DOCS = (
 )
 README_GUIDE_HEADING = "## 新手上手"
 README_GUIDE_LINKS = tuple(ONBOARDING_DOCS)
-BASH_FENCE_RE = re.compile(r"```bash\n(.*?)```", flags=re.DOTALL)
-PERSONAL_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])/(?:home|Users)/[A-Za-z0-9._-]+")
+BASH_FENCE_RE = re.compile(r"```bash[ \t]*\r?\n(.*?)```", flags=re.DOTALL)
+PERSONAL_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9._-])(?:/(?:home|Users)|[A-Za-z]:\\Users)(?:\\[A-Za-z0-9._-]+)+"
+)
 ABSOLUTE_PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9.+:/_~-])/(?!/)[^\s`\"')]+")
 
 
