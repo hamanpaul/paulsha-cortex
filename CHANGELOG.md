@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Added
+- **Issue #177：driving-cortex skill**：新增 `skills/driving-cortex/SKILL.md`，提供 agent 編排 coordinator 視角下的 cortex dogfood 批次驅動與交付操作指南（含 seven-section 實務骨架）。
+
 ### Fixed
 - **Issue #175：reclaim PR inheritance**：`start_canonical_workflow` needs_human 與 start 兩條路徑都不再帶入 `pr_refs`，`GitHubTerminalProvider` 不會將 `state=CLOSED`（未合併）PR 加入 `closing_links`，避免 closed PR 異常延續到 delivery authority。
 - **Issue #134：multi-issue build 支援最小 issue 為主 branch 且以 run repository 建立 worktree**：builder 會在 run 含多個 issue 時，使用編號最小的 `feature/<主issue>-<work_id>`，並由 run repo 作為 `ScriptWorktreeCreator` 的 git 工作目錄。

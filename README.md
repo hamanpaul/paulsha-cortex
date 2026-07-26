@@ -45,6 +45,7 @@ python -m pip install .
 - [Concepts](docs/onboarding/concepts.md)：`spec`、`job`、`slice`、`work` 名詞速查。
 - [Admin](docs/onboarding/admin.md)：`cortex service`、`cortex inspect`、`cortex request` 的日常維運操作。
 - [Runbook](docs/onboarding/runbook.md)：把常見事故整理成可執行 SOP。
+- [driving-cortex skill](skills/driving-cortex/SKILL.md)：agent 編排 coordinator 視角，對應 issue #177 的 dogfood 派工實務。
 
 ## Usage
 
