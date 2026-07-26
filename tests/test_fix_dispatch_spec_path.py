@@ -19,6 +19,7 @@ def test_infer_repo_root_prefers_configured_repo_root_for_external_spec(monkeypa
 
 def test_infer_repo_root_keeps_in_repo_path_for_repo_relative_spec(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
+    repo_root.mkdir()
     (repo_root / ".git").mkdir()
     spec_path = repo_root / "specs" / "foo-spec.md"
     spec_path.parent.mkdir(parents=True)
@@ -31,6 +32,7 @@ def test_infer_repo_root_keeps_in_repo_path_for_repo_relative_spec(monkeypatch, 
 
 def test_infer_repo_root_fallback_unchanged_without_configured_repo_root(monkeypatch, tmp_path):
     repo_root = tmp_path / "repo"
+    repo_root.mkdir()
     spec_path = tmp_path / "outside" / "specs" / "foo-spec.md"
     spec_path.parent.mkdir(parents=True)
     spec_path.write_text("# foo\n", encoding="utf-8")
