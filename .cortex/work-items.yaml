@@ -218,6 +218,110 @@ work_items:
         ref: docs/superpowers/specs/driving-cortex-skill-design.md
       - kind: path
         ref: docs/superpowers/plans/driving-cortex-skill.md
+  fix-dispatch-spec-path:
+    title: fix dispatch spec path resolution (#98)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#98
+      - kind: openspec
+        ref: 2026-07-26-fix-dispatch-spec-path
+      - kind: path
+        ref: docs/superpowers/specs/fix-dispatch-spec-path-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-dispatch-spec-path-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-dispatch-spec-path.md
+  fix-deck-emit-frontmatter:
+    title: fix deck emit frontmatter for dispatch contract (#101)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#101
+      - kind: openspec
+        ref: 2026-07-26-fix-deck-emit-frontmatter
+      - kind: path
+        ref: docs/superpowers/specs/fix-deck-emit-frontmatter-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-deck-emit-frontmatter-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-deck-emit-frontmatter.md
+  fix-builder-write-paths:
+    title: fix builder write_paths cross-repo (#118)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#118
+      - kind: openspec
+        ref: 2026-07-26-fix-builder-write-paths
+      - kind: path
+        ref: docs/superpowers/specs/fix-builder-write-paths-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-builder-write-paths-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-builder-write-paths.md
+  docs-monitor-load-config:
+    title: docs monitor load_config explicit/ambient (#143)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#143
+      - kind: openspec
+        ref: 2026-07-26-docs-monitor-load-config
+      - kind: path
+        ref: docs/superpowers/specs/docs-monitor-load-config-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/docs-monitor-load-config-design.md
+      - kind: path
+        ref: docs/superpowers/plans/docs-monitor-load-config.md
+  fix-service-install-overwrite:
+    title: fix service install overwrite guard (#148)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#148
+      - kind: openspec
+        ref: 2026-07-26-fix-service-install-overwrite
+      - kind: path
+        ref: docs/superpowers/specs/fix-service-install-overwrite-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-service-install-overwrite-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-service-install-overwrite.md
+  fix-slice-failed-deadend:
+    title: fix slice failed state dead-end (#153)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#153
+      - kind: openspec
+        ref: 2026-07-26-fix-slice-failed-deadend
+      - kind: path
+        ref: docs/superpowers/specs/fix-slice-failed-deadend-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-slice-failed-deadend-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-slice-failed-deadend.md
+  docs-archived-spec-purpose:
+    title: docs archived spec Purpose TBD (#158)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#158
+      - kind: openspec
+        ref: 2026-07-26-docs-archived-spec-purpose
+      - kind: path
+        ref: docs/superpowers/specs/docs-archived-spec-purpose-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/docs-archived-spec-purpose-design.md
+      - kind: path
+        ref: docs/superpowers/plans/docs-archived-spec-purpose.md
+  test-r21-regex-resilience:
+    title: test R-21 regex resilience CRLF + Windows (#169)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#169
+      - kind: openspec
+        ref: 2026-07-26-test-r21-regex-resilience
+      - kind: path
+        ref: docs/superpowers/specs/test-r21-regex-resilience-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/test-r21-regex-resilience-design.md
+      - kind: path
+        ref: docs/superpowers/plans/test-r21-regex-resilience.md
   dispatch-reliability-batch:
     title: dispatch reliability batch (abandoned, #134)
     links: []
