@@ -5320,7 +5320,9 @@ def _dispatch_workflow_card(
                 )
             except BaseException as exc:
                 raise ValueError("workflow builder worktree creator unavailable") from exc
-        elif str(Path(getattr(creator, "repo_root", "")).resolve()) != str(workspace_root.resolve()):
+        elif isinstance(creator, seams.ScriptWorktreeCreator) and (
+            str(Path(creator.repo_root).resolve()) != str(workspace_root.resolve())
+        ):
             try:
                 creator = seams.ScriptWorktreeCreator(
                     repo=workspace_root,

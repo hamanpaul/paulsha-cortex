@@ -63,6 +63,10 @@ class ScriptWorktreeCreator:
         self._wt_root = Path(paths.worktree_root() if wt_root is None else wt_root)
         self._base = base
 
+    @property
+    def repo_root(self) -> Path:
+        return self._repo
+
     def create(self, branch: str, *, base_sha: str | None = None) -> str:
         slug = branch.replace("/", "-")
         target = self._wt_root / slug

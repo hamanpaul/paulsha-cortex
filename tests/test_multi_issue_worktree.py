@@ -51,7 +51,7 @@ class _RecordingCreator:
 
 def _init_repo(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
     subprocess.run(["git", "-C", str(root), "config", "user.name", "Test User"], check=True)
     (root / "README.md").write_text("test\n", encoding="utf-8")
@@ -161,6 +161,8 @@ def test_single_issue_build_branch_unchanged(tmp_path: Path) -> None:
 def test_build_worktree_uses_run_workspace_root_not_manager_repo(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
+    from paulsha_cortex.config.paths import worktree_root_for
+
     manager_repo = tmp_path / "manager-repo"
     run_workspace = tmp_path / "run-repo"
     _init_repo(manager_repo)
@@ -171,22 +173,13 @@ def test_build_worktree_uses_run_workspace_root_not_manager_repo(
         workspace_root=run_workspace,
         issue_refs=(f"{_REPO}#34",),
     )
-    manager_creator = _RecordingCreator(manager_repo)
+    # Production daemon injects a real ScriptWorktreeCreator anchored at the
+    # Manager repo; build phase must re-anchor it to the run's workspace_root.
+    manager_pool = manager_repo.parent / f"{manager_repo.name}-worktrees"
+    manager_creator = manager.seams.ScriptWorktreeCreator(
+        repo=manager_repo, wt_root=manager_pool, base="main"
+    )
     launcher = _CommitLauncher()
-    script_calls: dict[str, object] = {}
-
-    class FakeScriptWorktreeCreator:
-        def __init__(self, repo: str | Path, wt_root: str | Path, base: str = "main") -> None:
-            script_calls["repo"] = str(repo)
-            script_calls["wt_root"] = str(wt_root)
-            script_calls["base"] = base
-            script_calls["branch"] = []
-
-        def create(self, branch: str, *, base_sha: str | None = None) -> str:
-            script_calls.setdefault("branch", []).append((branch, base_sha))
-            return str(run_workspace)
-
-    monkeypatch.setattr(manager.seams, "ScriptWorktreeCreator", FakeScriptWorktreeCreator)
     dispatcher = type(
         "D",
         (),
@@ -213,10 +206,12 @@ def test_build_worktree_uses_run_workspace_root_not_manager_repo(
     assert job is not None
     persisted = registry.get_job(job["job_id"])
 
-    assert script_calls["repo"] == str(run_workspace.resolve())
-    assert script_calls["branch"] == [("feature/34-multi-issue-worktree", None)]
-    assert persisted["worktree"] == str(run_workspace)
-    assert manager_creator.calls == []
+    expected_pool = worktree_root_for(run_workspace)
+    expected_worktree = expected_pool / "feature-34-multi-issue-worktree"
+    assert persisted["worktree"] == str(expected_worktree)
+    assert expected_worktree.is_dir()
+    # Manager-anchored pool must NOT receive the build worktree.
+    assert not (manager_pool / "feature-34-multi-issue-worktree").exists()
 
 
 def test_pr_metadata_closes_all_mapped_issues(tmp_path: Path) -> None:
