@@ -1,7 +1,7 @@
 # governed-delivery-closure Specification
 
 ## Purpose
-TBD - created by archiving change unified-work-lifecycle. Update Purpose after archive.
+Ship 階段必須經官方 archive、tasks 完成、changelog 與 docs alignment 檢核後才允許閉合交付。
 ## Requirements
 ### Requirement: Ship前必須官方archive並建立完整PR metadata
 Manager MUST使用官方`openspec archive -y <change>`，並確認tasks全勾、canonical specs合法、doc references同步與changelog fragment存在。PR title/body/labels MUST先完整擬定為zh-TW；body引用mapped issue MUST使用closing keyword。Local手工搬移change MUST NOT視為archive gate通過。
@@ -166,4 +166,3 @@ V1 WorkflowRun只支援唯一mapped PR、唯一OpenSpec change與唯一Todo path
 - **WHEN**operator設定`PSC_INSTANCE=beta`且未覆寫specific runtime root
 - **THEN**CLI control queue與beta manager service使用相同control root，CLI與monitor service使用相同project config、run root與socket
 - **THEN**不得掃描猜測其他instance或fallback到generic runtime root
-

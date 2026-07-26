@@ -1,7 +1,7 @@
 # porcelain-inspect-surface Specification
 
 ## Purpose
-TBD - created by archiving change porcelain-inspect. Update Purpose after archive.
+把分散查詢收斂為 `cortex inspect`，提供統一的唯讀系統真相並觀測服務執行時狀態。
 ## Requirements
 ### Requirement: inspect 家族必須提供統一唯讀檢視且不得 mutation
 

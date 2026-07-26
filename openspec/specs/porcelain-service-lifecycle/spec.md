@@ -1,7 +1,7 @@
 # porcelain-service-lifecycle Specification
 
 ## Purpose
-TBD - created by archiving change porcelain-service. Update Purpose after archive.
+讓一般使用者管理 cortex 背景服務時不必記 systemctl/journalctl 細節，並修正 service/timer 操作不同步與版本不可見的缺口。
 ## Requirements
 ### Requirement: service 生命週期命令必須明確區分三種運行模式
 
@@ -27,4 +27,3 @@ TBD - created by archiving change porcelain-service. Update Purpose after archiv
 
 - **WHEN** 使用者執行 `cortex service status`
 - **THEN** 輸出包含目前運行中程式的版本字串與 exec path
-

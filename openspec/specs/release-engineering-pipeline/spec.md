@@ -1,7 +1,7 @@
 # release-engineering-pipeline Specification
 
 ## Purpose
-TBD - created by archiving change release-pipeline. Update Purpose after archive.
+建立 v0.1.0 可信賴發佈所需的 CI/release pipeline：多版本測試、封裝驗證、乾淨環境 smoke-install 與 tag 觸發 release。
 ## Requirements
 ### Requirement: release pipeline 必須驗證封裝產物可在乾淨環境安裝執行
 
@@ -22,4 +22,3 @@ CI MUST 新增 build job 產出 wheel/sdist 並以 `twine check --strict` 驗證
 - **WHEN** 審查 `.github/workflows/release.yml` 新增的每一個 `uses:` 步驟
 - **THEN** 每一個 `uses:` 皆為 `owner/action@<40-hex-sha>` 形式並附版本註解
 - **THEN** `.github/workflows/policy-check.yml` 的引擎 pin 內容與變更前完全一致
-

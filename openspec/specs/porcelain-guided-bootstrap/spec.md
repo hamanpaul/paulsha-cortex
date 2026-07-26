@@ -1,7 +1,7 @@
 # porcelain-guided-bootstrap Specification
 
 ## Purpose
-TBD - created by archiving change porcelain-bootstrap. Update Purpose after archive.
+讓使用者從乾淨機器開始，以單一命令完成環境檢查、服務安裝、啟動、健檢與下一步引導。
 ## Requirements
 ### Requirement: bootstrap 必須在環境不滿足時明確指引而非單純報錯
 
@@ -22,4 +22,3 @@ TBD - created by archiving change porcelain-bootstrap. Update Purpose after arch
 - **WHEN** 使用者於滿足 preflight 的環境執行 `cortex bootstrap --dry-run`
 - **THEN** 輸出列出將執行的 `service install`/`service start` 參數預覽
 - **THEN** 系統上不存在任何新安裝的 unit 檔或啟動的行程
-

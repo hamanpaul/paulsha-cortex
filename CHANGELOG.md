@@ -15,6 +15,7 @@
 - **Issue #118：跨 repo 派工 builder scope 修正**：`builder` persona 的 `write_paths` 已改為 `**`，不再綁定 `paulsha_cortex/**`，避免跨 repo 派工時對目標 repo 路徑誤拒，保留 worktree 邊界與其他 persona 安全限制原則。
 - **Issue #175：reclaim PR inheritance**：`start_canonical_workflow` needs_human 與 start 兩條路徑都不再帶入 `pr_refs`，`GitHubTerminalProvider` 不會將 `state=CLOSED`（未合併）PR 加入 `closing_links`，避免 closed PR 異常延續到 delivery authority。
 - **Issue #101：deck emit frontmatter 補齊 auto dispatch 合約**：`paulsha_cortex/deck/compile.py` 讓 `--emit` 預設輸出非空 `target_branch`（`feature/<change>`，缺 `change` 時 fallback `feature/<slug>`）並補齊 `verification` skeleton（含 `persona-scope`、`name=policy` command、`tests` 與 `full_suite.baseline=no-regression`）。
+- **Issue #158：openspec archive 產出規格 Purpose 改進**：`openspec archive` 會以 change proposal 的 `## Goals`（無法取得時備援其他段落）填補 archived spec 的 `## Purpose`，同時補齊本次變更關聯九份既有 specs 的 `Purpose` 內容。
 - **Issue #134：multi-issue build 支援最小 issue 為主 branch 且以 run repository 建立 worktree**：builder 會在 run 含多個 issue 時，使用編號最小的 `feature/<主issue>-<work_id>`，並由 run repo 作為 `ScriptWorktreeCreator` 的 git 工作目錄。
 - **Issue #152：mutation request 逾時改採分級 timeout + pending 回報**：`coordinator/cli.py` `_submit_mutation_request` 依 `req_type` 套用分級 timeout（`fanout`/`tick` 60 秒、`complete`/`work`/`work-action`/`run` 30 秒、其餘 5 秒），`poll` timeout 時保留 `req_id` 與追蹤指引並回傳 `EXIT_SUBMITTED_PENDING`（exit 3）避免成功派工被誤報為失敗。
 - **Issue #153：failed slice 可恢復與外部 jobs.json 重載**：`manager.apply_slice_action` 現在可對 `failed` slice 進行 `retry-build`，`JobRegistry` 也會偵測 `jobs.json` 外部修改並重載持久化狀態。

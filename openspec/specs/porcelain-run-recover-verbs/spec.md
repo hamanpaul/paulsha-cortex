@@ -1,7 +1,7 @@
 # porcelain-run-recover-verbs Specification
 
 ## Purpose
-TBD - created by archiving change porcelain-run-recover. Update Purpose after archive.
+用任務導向命令收斂 mutation 操作，映射既有 request/action，並以 request_id 追蹤 run/recover 流程。
 ## Requirements
 ### Requirement: run 家族必須映射既有 request types 並提供 --wait
 
@@ -27,4 +27,3 @@ TBD - created by archiving change porcelain-run-recover. Update Purpose after ar
 - **WHEN** 使用者執行 `cortex recover slice <slice_id> retry-build` 但未帶 `--actor`
 - **THEN** exit code 為 2（用法錯誤）
 - **THEN** 不產生任何 control queue 寫入
-

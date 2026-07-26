@@ -1,7 +1,7 @@
 # unified-work-read-model Specification
 
 ## Purpose
-TBD - created by archiving change unified-work-lifecycle. Update Purpose after archive.
+跨 GitHub、repo artifact 與 workflow 聚合可解釋的 WorkItem 讀取模型，提供統一 lifecycle 觀測與治理回饋。
 ## Requirements
 ### Requirement: Monitor必須聚合versioned Work Sources
 Monitor MUST從authenticated GitHub、repo artifacts與Manager registry讀取versioned `WorkSource`，並投影`WorkItem`。Repo provider MUST掃描`docs/superpowers/workstreams/**/todo.md`、`docs/superpowers/specs/**/*.md`、`docs/superpowers/plans/**/*.md`與`openspec/changes/*`的proposal/design/tasks/spec，且 MUST明確排除`openspec/changes/archive/**`。Local uncommitted artifact MAY使item成為`todo`，但 MUST NOT作為`done` evidence。
@@ -92,4 +92,3 @@ Confirmed association MUST只來自repo root `.cortex/work-items.yaml` version 1
 - **WHEN** operator以`--explain --json`查詢inferred或conflicted item
 - **THEN** response包含authoritative links、inferred signals、competing candidates、exclusions與reducer trace
 - **THEN** explain本身不修改association
-

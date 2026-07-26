@@ -1,7 +1,7 @@
 # cli-version-reporting Specification
 
 ## Purpose
-TBD - created by archiving change add-cortex-version-flag. Update Purpose after archive.
+補齊 CLI 版本可見性，讓 `cortex --version` 可用於人機與腳本辨識安裝版本。
 ## Requirements
 ### Requirement: cortex CLI 必須提供頂層 --version
 

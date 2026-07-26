@@ -1,7 +1,7 @@
 # persona-workflow-orchestration Specification
 
 ## Purpose
-TBD - created by archiving change unified-work-lifecycle. Update Purpose after archive.
+建立可解釋、可回退、可追溯的 Work Item 讀取模型與治理流程。
 ## Requirements
 ### Requirement: Manager必須是WorkflowRun與mutation的單一writer
 Manager MUST以registry schema v2保存`WorkflowRun`與`WorkflowStep`，並以`repo/work-id/authoritative source revisions` claim key確保restart idempotency。V1 registry MUST先建立不可覆寫atomic backup才升v2；舊jobs/slices MUST保存為legacy records且 MUST NOT推測work item。CLI mutation MUST經control request queue。
@@ -218,4 +218,3 @@ Dead PID且沒有exit sentinel的dispatched job MUST先由Dispatcher保存為fai
 - **WHEN**第一輪發現dead PID/no sentinel並將run設為needs_human
 - **THEN**第二輪回`operator-resume-required`
 - **THEN**不得建立新job
-
