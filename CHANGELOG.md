@@ -18,6 +18,10 @@
 - **Issue #182：monitor workflow provider 跳過 superseded run 的 issue authority**：`WorkflowRegistryProvider` 建立 workflow_links 時不再對 `superseded` run 主張 issue/pr/openspec authority，避免廢棄 run 的 issue_refs 與其他 work item 衝突使 provider degraded；degraded 會凍結 `project_work_items` 於舊 snapshot，讓新以 work-items.yaml `github_issue` link 綁定的 source 永遠不進入 monitor read model。
 - **Issue #100：tick 的 dispatch 失敗回報與 manager daemon log 時間戳**：`DispatchReadyError` 現在輸出每 slice 的 `slice_id`、例外型別與訊息摘要；`tick` 在 fanout 失敗時保留已成功 dispatch 的 jobs 並回傳 per-slice 錯誤欄位；`manager_daemon` 的錯誤 log 改以可解析 ISO-8601 時間戳為行首。
 
+### Documentation
+
+- **Issue #143：`load_config` explicit/ambient 邊界明確化**：新增 `docs/monitor-config.md` 記錄 `load_config` explicit mode 與 ambient mode 的差異，說明 `load_config(config_path=<explicit>)` 僅載入指定設定檔，不合併 ambient `project-hippo.yaml`，未帶 `config_path` 則仍合併可見的 ambient hippo projects。
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

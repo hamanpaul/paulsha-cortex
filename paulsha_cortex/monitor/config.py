@@ -180,13 +180,17 @@ def load_config(*, config_path: Path | None = None) -> MonitorConfig:
     `PAULSHACLAW_CONFIG` env → `project-cortex.yaml` → legacy `paulshaclaw.yaml`.
     """
     resolved = _resolve_config_source(config_path)
-    hippo_path = resolved.parent / "project-hippo.yaml" if resolved is not None else None
-    hippo = tuple(load_hippo_projects(hippo_path))
     if resolved is None:
+        hippo = tuple(load_hippo_projects())
         if not hippo:
             raise FileNotFoundError(
                 "無 project 設定：manual（project-cortex.yaml / legacy）與 "
                 "project-hippo.yaml 皆不存在"
             )
         return MonitorConfig(workspaces=(), hippo_projects=hippo)
-    return replace(_load_manual_config(resolved), hippo_projects=hippo)
+    if config_path is not None:
+        return replace(_load_manual_config(resolved), hippo_projects=())
+    return replace(
+        _load_manual_config(resolved),
+        hippo_projects=tuple(load_hippo_projects(resolved.parent / "project-hippo.yaml")),
+    )
