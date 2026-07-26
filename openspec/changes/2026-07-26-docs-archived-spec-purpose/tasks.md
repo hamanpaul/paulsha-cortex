@@ -5,7 +5,7 @@ work_item: docs-archived-spec-purpose
 
 # Tasks
 
-- [ ] [RED] `tests/test_openspec_archive_purpose.py`：`openspec archive` 產生的 spec.md 不含 `Purpose: TBD`（含從 change proposal 推導或 prompt 的 Purpose 文字）。
+- [x] [RED] `tests/test_openspec_archive_purpose.py`：`openspec archive` 產生的 spec.md 不含 `Purpose: TBD`（含從 change proposal 推導或 prompt 的 Purpose 文字）。
 - [ ] [實作] `paulsha_cortex/cli/openspec*.py`：archive 時從 change proposal 推導 Purpose（如取 `## Goals` 段首段），或 prompt 使用者輸入。
 - [ ] [實作] 批次更新既有 specs 的 `Purpose: TBD`：
   - persona-workflow-orchestration
