@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -45,6 +46,67 @@ def _validate_plan_ref(plan_ref: str) -> str:
     return plan_ref
 
 
+def _infer_target_branch(task_slug: str, change: str | None) -> str:
+    if change and change != "dry-run":
+        return f"feature/{change}"
+    return f"feature/{task_slug}"
+
+
+def _warning_default_target_branch(task_slug: str, change: str | None) -> None:
+    if change:
+        return
+    print(
+        f"deck compile: 目錄 context 缺 change，target_branch fallback 為 feature/{task_slug}",
+        file=sys.stderr,
+    )
+
+
+def _verification_skeleton() -> dict[str, object]:
+    return {
+        "docs_class": "code",
+        "required_artifacts": [],
+        "checks": [
+            {"kind": "persona-scope"},
+            {
+                "kind": "command",
+                "name": "policy",
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 30,
+            },
+        ],
+        "tests": [
+            {
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 60,
+            },
+        ],
+        "full_suite": {
+            "argv": ["python3", "-m", "pytest", "-q"],
+            "cwd": ".",
+            "timeout_seconds": 60,
+            "baseline": "no-regression",
+        },
+    }
+
+
+def _format_scalar(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _format_inline_list(values: Sequence[object]) -> str:
+    return "[" + ", ".join(_format_scalar(value) for value in values) + "]"
+
+
 def specs_dir() -> Path:
     """鏡射 manager_daemon.default_specs_dir 的 specs 路徑契約：
     PSC_MANAGER_SPECS_DIR → paths.specs_root()（吃 PSC_SPECS_ROOT/PSC_AGENTS_ROOT）。
@@ -84,6 +146,7 @@ _LEGACY_CARD_PHASES = {
     "tdd-red": "build",
     "subagent-build": "build",
     "receiving-code-review": "build",
+    "write-spec": "plan",
     "verification": "verify",
     "code-review": "review",
     "adversarial-review": "review",
@@ -216,7 +279,13 @@ def _group_slices(
     return groups
 
 
-def _render_frontmatter(slice_id: str, plan_ref: str, deps: Sequence[str]) -> str:
+def _render_frontmatter(
+    slice_id: str,
+    plan_ref: str,
+    deps: Sequence[str],
+    target_branch: str,
+    verification: dict[str, object],
+) -> str:
     depends_on = "[" + ", ".join(deps) + "]" if deps else "[]"
     lines = [
         "---",
@@ -224,10 +293,54 @@ def _render_frontmatter(slice_id: str, plan_ref: str, deps: Sequence[str]) -> st
         f"slice_id: {slice_id}",
         f"plan: {json.dumps(plan_ref, ensure_ascii=False)}",
         f"depends_on: {depends_on}",
-        "target_branch: null",
-        "verification: null",
-        "parse_error: null",
+        f"target_branch: {json.dumps(target_branch, ensure_ascii=False)}",
     ]
+    lines.append("verification:")
+    lines.append(f"  docs_class: {_format_scalar(verification.get('docs_class'))}")
+    required_artifacts = verification.get("required_artifacts")
+    if not required_artifacts:
+        lines.append("  required_artifacts: []")
+    else:
+        lines.append("  required_artifacts:")
+        for artifact in required_artifacts if isinstance(required_artifacts, list) else ():
+            if isinstance(artifact, dict):
+                lines.append("    - path: " + _format_scalar(artifact.get("path")))
+                lines.append(
+                    "      must_change: "
+                    + _format_scalar(
+                        artifact.get("must_change", False),
+                    )
+                )
+            else:
+                lines.append("    - " + _format_scalar(artifact))
+    checks = verification.get("checks")
+    lines.append("  checks:")
+    if isinstance(checks, list):
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            lines.append("    - kind: " + _format_scalar(check.get("kind")))
+            for key, value in check.items():
+                if key == "kind":
+                    continue
+                lines.append(f"      {key}: {_format_scalar(value)}")
+    tests = verification.get("tests")
+    lines.append("  tests:")
+    if isinstance(tests, list):
+        for test in tests:
+            if not isinstance(test, dict):
+                continue
+            lines.append("    - argv: " + _format_inline_list(test.get("argv", ())))
+            for key, value in test.items():
+                if key == "argv":
+                    continue
+                lines.append(f"      {key}: {_format_scalar(value)}")
+    full_suite = verification.get("full_suite")
+    lines.append("  full_suite:")
+    if isinstance(full_suite, dict):
+        for key, value in full_suite.items():
+            lines.append(f"    {key}: {_format_scalar(value)}")
+    lines.append("parse_error: null")
     lines.append("---")
     return "\n".join(lines)
 
@@ -397,8 +510,17 @@ def compile_combo(
         produces = [_subst(glob, slug, change) for member in members for glob in member.produces]
         requires_block = "".join(f"\n- {item}" for item in requires) or "\n-（無）"
         produces_block = "".join(f"\n- {item}" for item in produces) or "\n-（無，完成偵測=exit sentinel）"
+        target_branch = _infer_target_branch(slug, change)
+        if not change:
+            _warning_default_target_branch(slug, change)
         content = (
-            _render_frontmatter(slice_id, plan_ref, deps)
+            _render_frontmatter(
+                slice_id,
+                plan_ref,
+                deps,
+                target_branch,
+                _verification_skeleton(),
+            )
             + "\n"
             + f"# {slice_id}\n\n"
             + f"任務：{task}\n"

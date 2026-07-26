@@ -244,7 +244,7 @@ cortex deck compile feature-oneshot \
 Deck 產生的 spec 預設為 `dispatch: hold`，不會立即派工。翻成 `dispatch: auto` 前，使用者應：
 
 1. 完成 Deck 列出的 interactive checklist。
-2. 確認 `plan`、`depends_on`、`target_branch` 與 `verification` 契約。
+2. 確認 `plan`、`depends_on`、`target_branch` 與 `verification` 契約，並依 [auto dispatch 契約文件](docs/superpowers/specs/fix-deck-emit-frontmatter-dispatch-contract.md) 補齊欄位。
 3. 執行 Deck 列出的 verify commands。
 4. 只將允許 manager 派工的 spec 改為 `dispatch: auto`。
 
