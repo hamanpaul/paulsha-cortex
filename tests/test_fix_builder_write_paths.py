@@ -7,14 +7,14 @@ def _builder_guardrail() -> guardrail.PersonaGuardrail:
     return guardrail.PersonaGuardrail(contract.PERSONA_CATALOG)
 
 
-def test_cross_repo_dispatch_path_is_out_of_builder_scope_before_fix() -> None:
+def test_cross_repo_dispatch_path_is_within_builder_scope_after_fix() -> None:
     decision = _builder_guardrail().evaluate_filesystem(
         role="builder",
         path="external-repo/src/feature/agent/main.py",
     )
 
-    assert not decision.allowed
-    assert decision.rule_id == "filesystem-scope"
+    assert decision.allowed
+    assert decision.rule_id == "filesystem-allow"
 
 
 def test_cortex_repo_dispatch_keeps_in_scope() -> None:

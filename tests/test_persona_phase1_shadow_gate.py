@@ -130,13 +130,13 @@ class GateVerdictTests(unittest.TestCase):
         catalog = load_catalog()
         verdict = gate.build_verdict(
             role="builder",
-            changed_paths=["paulsha_cortex/persona/gate.py", "docs/secret.md"],
+            changed_paths=["paulsha_cortex/persona/gate.py", "../docs/secret.md"],
             manifest_ok=True,
             catalog=catalog,
         )
         self.assertFalse(verdict["ok"])
         offending = [v["path"] for v in verdict["violations"]]
-        self.assertIn("docs/secret.md", offending)
+        self.assertIn("../docs/secret.md", offending)
         for v in verdict["violations"]:
             self.assertTrue(v["reason"])  # 帶可審計原因
 
@@ -222,7 +222,7 @@ class GateExitCodeTests(unittest.TestCase):
     def test_shadow_always_zero_enforce_one_on_violation(self) -> None:
         from paulsha_cortex.persona import gate
 
-        self._patch_diff(gate, ["docs/secret.md"])  # builder 越界
+        self._patch_diff(gate, ["../docs/secret.md"])  # builder 越界
         with tempfile.TemporaryDirectory() as d:
             manifest = _write_manifest(Path(d))
             argv = ["--role", "builder", "--base", "main",

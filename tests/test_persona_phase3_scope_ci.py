@@ -101,8 +101,8 @@ class OutOfScopeShadowTests(unittest.TestCase):
         self.addCleanup(setattr, gate, "compute_changed_paths", original)
 
     def test_out_of_scope_diff_violations_but_still_exit_zero(self) -> None:
-        # builder 不可寫 docs/** → 越界
-        self._patch_diff(["paulsha_cortex/persona/scope_ci.py", "docs/secret.md"])
+        # builder 不可寫出 worktree 邊界 → 越界
+        self._patch_diff(["paulsha_cortex/persona/scope_ci.py", "../docs/secret.md"])
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
             _write_manifest(repo)  # from_role=builder
@@ -110,7 +110,7 @@ class OutOfScopeShadowTests(unittest.TestCase):
             self.assertEqual(code, 0)  # shadow 恆 0，即使越界
             self.assertFalse(payload["ok"])
             offending = [v["path"] for v in payload["violations"]]
-            self.assertIn("docs/secret.md", offending)
+            self.assertIn("../docs/secret.md", offending)
             for v in payload["violations"]:
                 self.assertTrue(v["reason"])  # 帶可審計原因
 

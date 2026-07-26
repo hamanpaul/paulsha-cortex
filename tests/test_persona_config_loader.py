@@ -57,13 +57,7 @@ class LoadCatalogTests(unittest.TestCase):
         self.assertEqual(
             list(contract.PERSONA_CATALOG["builder"].write_paths),
             [
-                "paulsha_cortex/**",
-                "tests/**",
-                "openspec/changes/archive/**",
-                "openspec/changes/**",
-                "changelog.d/**",
-                "CHANGELOG.md",
-                "docs/superpowers/plans/**",
+                "**",
             ],
         )
 

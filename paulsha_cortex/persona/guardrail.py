@@ -29,6 +29,18 @@ class PersonaGuardrail:
             )
 
         normalized_path = _normalize_path(path)
+        if (
+            normalized_path.startswith("/")
+            or normalized_path == ".."
+            or normalized_path.startswith("../")
+            or "/../" in normalized_path
+        ):
+            return GuardrailDecision(
+                allowed=False,
+                rule_id="filesystem-scope",
+                reason=f"path {normalized_path} is outside persona worktree scope",
+            )
+
         for pattern in persona.write_paths:
             if fnmatch.fnmatch(normalized_path, pattern):
                 return GuardrailDecision(
@@ -71,7 +83,9 @@ class PersonaGuardrail:
 
 def _normalize_path(path: str) -> str:
     normalized = path.replace("\\", "/")
-    return PurePosixPath(normalized).as_posix().lstrip("./")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return PurePosixPath(normalized).as_posix()
 
 
 def _normalize_tool(tool: str) -> str:
