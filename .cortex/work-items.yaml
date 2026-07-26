@@ -173,6 +173,21 @@ work_items:
         ref: docs/superpowers/specs/fix-mutation-request-timeout-design.md
       - kind: path
         ref: docs/superpowers/plans/fix-mutation-request-timeout.md
+  multi-issue-worktree:
+    title: multi-issue Work Item + repo-scoped builder worktree (#134)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#134
+      - kind: openspec
+        ref: 2026-07-26-multi-issue-worktree
+      - kind: path
+        ref: docs/superpowers/workstreams/multi-issue-worktree/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/multi-issue-worktree-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/multi-issue-worktree-design.md
+      - kind: path
+        ref: docs/superpowers/plans/multi-issue-worktree.md
   dispatch-reliability-batch:
     title: dispatch reliability batch (abandoned, #134)
     links: []
