@@ -24,7 +24,6 @@ class MutationRequestTimeoutTests(unittest.TestCase):
             ("tick", 60.0),
             ("complete", 30.0),
             ("work-action", 30.0),
-            ("run", 30.0),
             ("dispatch", 5.0),
         ]
 

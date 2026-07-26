@@ -21,9 +21,7 @@ _REQUEST_TIMEOUTS: dict[str, float] = {
     "fanout": 60.0,
     "tick": 60.0,
     "complete": 30.0,
-    "work": 30.0,
     "work-action": 30.0,
-    "run": 30.0,
 }
 
 

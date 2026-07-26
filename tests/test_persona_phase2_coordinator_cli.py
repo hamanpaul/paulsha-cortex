@@ -211,7 +211,7 @@ class CliTests(unittest.TestCase):
                 submitted,
                 [("complete", {"handoff_dir": str(Path(d) / "handoff")}, "coordinator-cli")],
             )
-            self.assertEqual(polled, [("req-1", 5.0, 0.1)])
+            self.assertEqual(polled, [("req-1", 30.0, 0.1)])
             self.assertEqual(json.loads(buf.getvalue()), {"completed": [{"slice_id": "slice-a", "gate_status": "passed"}]})
             self.assertEqual(reg.list_jobs(), [])
 

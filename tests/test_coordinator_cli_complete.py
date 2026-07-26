@@ -38,7 +38,7 @@ class CliCompleteTests(unittest.TestCase):
             submitted,
             [("complete", {"handoff_dir": "runtime/handoff", "specs_dir": "specs"}, "coordinator-cli")],
         )
-        self.assertEqual(polled, [("req-complete-1", 5.0, 0.1)])
+        self.assertEqual(polled, [("req-complete-1", 30.0, 0.1)])
         self.assertEqual(
             json.loads(buf.getvalue()),
             {"completed": [{"slice_id": "slice-cli", "gate_status": "passed"}]},
