@@ -14,6 +14,17 @@ from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCr
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
 DEFAULT_REQUEST_POLL_INTERVAL_SECONDS = 0.1
 DEFAULT_REQUESTED_BY = "coordinator-cli"
+EXIT_SUBMITTED_PENDING = 3
+
+
+_REQUEST_TIMEOUTS: dict[str, float] = {
+    "fanout": 60.0,
+    "tick": 60.0,
+    "complete": 30.0,
+    "work": 30.0,
+    "work-action": 30.0,
+    "run": 30.0,
+}
 
 
 def _resolve_launcher(executor, injected, *, allow_unsafe, model):
@@ -382,14 +393,20 @@ def _submit_mutation_request(
             file=sys.stderr,
         )
         return 1
+
+    timeout_seconds = _REQUEST_TIMEOUTS.get(req_type, DEFAULT_REQUEST_TIMEOUT_SECONDS)
     req_id = submit_request_fn(req_type, dict(args), DEFAULT_REQUESTED_BY)
-    done = poll_done_fn(req_id, DEFAULT_REQUEST_TIMEOUT_SECONDS, DEFAULT_REQUEST_POLL_INTERVAL_SECONDS)
+    done = poll_done_fn(req_id, timeout_seconds, DEFAULT_REQUEST_POLL_INTERVAL_SECONDS)
     if not isinstance(done, dict):
         print(
-            f"錯誤: manager daemon 未在 {DEFAULT_REQUEST_TIMEOUT_SECONDS:.1f}s 內完成 {req_type} request: {req_id}",
+            f"錯誤: manager daemon 未在 {timeout_seconds:.1f}s 內完成 {req_type} request: {req_id}。",
             file=sys.stderr,
         )
-        return 1
+        print(
+            f"請使用 `cortex request show {req_id}` 或 `cortex request wait {req_id} --timeout {int(timeout_seconds)}` 追蹤狀態。",
+            file=sys.stderr,
+        )
+        return EXIT_SUBMITTED_PENDING
     if done.get("status") != "ok":
         print(f"錯誤: {done.get('error') or 'unknown request error'}", file=sys.stderr)
         return 1

@@ -195,7 +195,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    `recover` 不提供 `--allow-unsafe` 等旁路旗標；需要專家級低階參數時仍使用既有 coordinator 命令。
 
-> `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。`fanout` / `tick` / `complete` / `slice-action` 的 CLI 最多等 control response 5 秒；timeout 後 daemon 可能仍在工作，應回到 `cortex status` 查證。
+> `cortex status` 查 manager 的工作與 gate 狀態；`systemctl --user status` 只查 service 是否存活，兩者不可互相替代。mutation request 目前採分級 timeout：`fanout` / `tick` 為 60 秒，`complete` / `work-action` 為 30 秒，其餘為 5 秒；timeout 後 daemon 可能仍在工作，請回到 `cortex status` 或 `cortex request show <request-id>` 查證。
 
 ## 從使用者角度操作
 
