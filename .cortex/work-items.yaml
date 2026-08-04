@@ -433,3 +433,36 @@ work_items:
         ref: docs/superpowers/workstreams/design-task-type-taxonomy/todo.md
       - kind: path
         ref: docs/superpowers/specs/design-task-type-taxonomy-spec.md
+  feat-slice-executor-model:
+    title: per-slice executor/model 宣告與 depends_on 顯式診斷 (#294)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#294
+      - kind: openspec
+        ref: 2026-08-04-feat-slice-executor-model
+      - kind: path
+        ref: docs/superpowers/workstreams/feat-slice-executor-model/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/feat-slice-executor-model-spec.md
+  fix-preflight-closeout-order:
+    title: 本地 closeout 先於 PR metadata preflight 與 frozen artifacts materialize (#263)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#263
+      - kind: openspec
+        ref: 2026-08-04-fix-preflight-closeout-order
+      - kind: path
+        ref: docs/superpowers/workstreams/fix-preflight-closeout-order/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-preflight-closeout-order-spec.md
+  feat-task-type-combo-selector:
+    title: task_type 自動選 combo 與 fix-standard combo (#202)
+    links:
+      - kind: github_issue
+        ref: hamanpaul/paulsha-cortex#202
+      - kind: openspec
+        ref: 2026-08-04-feat-task-type-combo-selector
+      - kind: path
+        ref: docs/superpowers/workstreams/feat-task-type-combo-selector/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/feat-task-type-combo-selector-spec.md

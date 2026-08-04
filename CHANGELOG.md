@@ -30,6 +30,11 @@
   靜音）。`persona-scope` 設為 main required status check 屬 GitHub repo 設定，
   設定步驟見 `docs/persona-scope-enforcement.md`。
 ### Added
+- **批次 W2 planning artifacts（#294、#263、#202）**：為三個 work item
+  （`feat-slice-executor-model`、`fix-preflight-closeout-order`、`feat-task-type-combo-selector`）
+  新增 spec／design／plan／todo 與 `openspec/changes/2026-08-04-<wi>/` planning artifacts，
+  並登錄 `.cortex/work-items.yaml` 作為 confirmed authority；只提供 planning authority，
+  不含實作。
 - **批次 W1 planning artifacts（#295／#291、#260、#178、#139）**：為四個 work item
   （`fix-persona-catalog-portability`〔#295 primary＋#291 duplicate 一修多關的 multi-issue
   Work Item〕、`fix-repair-commit-recovery`、`feat-work-gc`、`design-task-type-taxonomy`）
