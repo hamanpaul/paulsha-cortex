@@ -5,7 +5,7 @@ work_item: feat-task-type-combo-selector
 
 # Tasks
 
-- [ ] 1.1 RED：依 `docs/superpowers/plans/feat-task-type-combo-selector.md` 的 TDD RED 章節新增 `tests/test_combo_selector.py` 與 `tests/test_combo_selector_wiring.py`，確認全部失敗（前置：#139 的 `paulsha_cortex/deck/task_types.py` 已落地）。
+- [x] 1.1 RED：依 `docs/superpowers/plans/feat-task-type-combo-selector.md` 的 TDD RED 章節新增 `tests/test_combo_selector.py` 與 `tests/test_combo_selector_wiring.py`，確認全部失敗（前置：#139 的 `paulsha_cortex/deck/task_types.py` 已落地）。
 - [ ] 1.2 實作至 GREEN，範圍限於 `docs/superpowers/specs/feat-task-type-combo-selector-spec.md` 的 Requirements（R1-R6）；不繞過 deck compile policy gate 與 `validate_manager_spine`，不自建 taxonomy 值域。
 - [ ] 1.3 `changelog.d/feat-task-type-combo-selector.md` fragment 與 `CHANGELOG.md [Unreleased]` entry（#202）；`docs/unified-work-lifecycle.md` 與 CLI help（`--combo`／`--combo-selections`）同步。
 - [ ] 1.4 `python3 -m pytest tests/ -q` 全綠；帶 PR 上下文的 `policy_check` 0 fail；`git diff --check` 乾淨。
