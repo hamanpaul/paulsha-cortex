@@ -21,6 +21,7 @@ STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_
 # 與 WorkflowStep.persona 的合法值對齊（見 deck.schema 對 persona 的定義）。
 MODEL_CHAIN_PERSONAS = frozenset({"planner", "builder", "reviewer"})
 MODEL_CHAIN_RESOLUTION_SOURCES = frozenset({"override", "registry"})
+COMBO_SELECTION_SOURCES = frozenset({"task-type-auto", "explicit-override", "bypass-default"})
 
 
 def _validate_model_chain_override(value: object, *, field_name: str) -> None:
@@ -61,6 +62,30 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
                 raise ValueError(f"workflow run {field_name}[{persona!r}].{key} 必須為非空字串")
         if row.get("source") not in MODEL_CHAIN_RESOLUTION_SOURCES:
             raise ValueError(f"workflow run {field_name}[{persona!r}].source 非法: {row.get('source')!r}")
+
+
+def _validate_combo_selection(value: object) -> None:
+    if value is None:
+        return
+    required_keys = {"source", "task_type", "combo", "reason"}
+    if not isinstance(value, dict) or set(value) != required_keys:
+        raise ValueError("workflow run combo_selection 格式錯誤")
+    source = value.get("source")
+    if source not in COMBO_SELECTION_SOURCES:
+        raise ValueError(f"workflow run combo_selection.source 非法: {source!r}")
+    task_type = value.get("task_type")
+    if task_type is not None and (not isinstance(task_type, str) or not task_type):
+        raise ValueError("workflow run combo_selection.task_type 必須為null或非空字串")
+    combo = value.get("combo")
+    if not isinstance(combo, str) or not combo:
+        raise ValueError("workflow run combo_selection.combo 必須為非空字串")
+    reason = value.get("reason")
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or len(reason) > 500
+    ):
+        raise ValueError("workflow run combo_selection.reason 必須為 1–500 字字串")
 
 
 @dataclass(frozen=True)
@@ -391,6 +416,7 @@ class WorkflowRun:
     # 用了什麼模型、為什麼」。每次 dispatch 選定 identity 時逐段覆寫更新，純
     # provenance，不影響既有 workflow 語意。
     resolved_model_chain: dict[str, dict[str, str]] | None = None
+    combo_selection: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -562,6 +588,7 @@ class WorkflowRun:
                 raise ValueError(f"workflow run {field} 必須為ISO8601") from exc
         _validate_model_chain_override(self.model_chain_override, field_name="model_chain_override")
         _validate_model_chain_resolution(self.resolved_model_chain, field_name="resolved_model_chain")
+        _validate_combo_selection(self.combo_selection)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -614,6 +641,9 @@ class WorkflowRun:
                 {persona: dict(row) for persona, row in self.resolved_model_chain.items()}
                 if self.resolved_model_chain is not None
                 else None
+            ),
+            "combo_selection": (
+                dict(self.combo_selection) if self.combo_selection is not None else None
             ),
         }
 
@@ -695,6 +725,7 @@ class WorkflowRun:
             frozen_readiness=payload.get("frozen_readiness"),
             model_chain_override=payload.get("model_chain_override"),
             resolved_model_chain=payload.get("resolved_model_chain"),
+            combo_selection=payload.get("combo_selection"),
         )
 
 

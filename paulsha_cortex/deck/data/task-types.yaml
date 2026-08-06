@@ -1,0 +1,28 @@
+version: 0
+task_types:
+  feat:
+    description: 新增功能
+    combo: feature-oneshot
+  fix:
+    description: 缺陷修復
+    combo: fix-standard
+  docs:
+    description: 文件更新
+    combo: null
+  test:
+    description: 測試增補
+    combo: null
+  ci:
+    description: CI 與自動化維護
+    combo: null
+  refactor:
+    description: 重構整理
+    combo: null
+scopes:
+  - coordinator
+  - porcelain
+  - workflow
+  - cli
+  - deck
+  - monitor
+  - onboarding

@@ -53,6 +53,10 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-candidate")
     parser.add_argument("--expected-run-id")
     parser.add_argument("--reason")
+    parser.add_argument(
+        "--combo",
+        help="start 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
+    )
     toggle = parser.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_const", dest="enabled", const=True)
     toggle.add_argument("--disable", action="store_const", dest="enabled", const=False)
@@ -135,6 +139,7 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
                 "expected_candidate",
                 "expected_run_id",
                 "reason",
+                "combo",
                 "enabled",
                 "planner_executor",
                 "planner_model",

@@ -7270,6 +7270,7 @@ def apply_workflow_action(
     # 只負責原樣轉交給 _manager_create_workflow_run；不在 manager.py 重算。
     start_sizing_score = args.get("sizing_score")
     start_sizing_band = args.get("sizing_band")
+    start_combo_selection = args.get("combo_selection")
     # #205 R1/R2：run-scoped 模型鏈覆寫在 claim 當下（本次 `_manager_create_
     # workflow_run` 呼叫，若同 claim_key 已存在 ongoing run 則此呼叫是
     # no-op，覆寫沿用既有 run，見 registry.py 的 idempotent 短路）一併凍結。
@@ -7298,6 +7299,7 @@ def apply_workflow_action(
         sizing_score=start_sizing_score,
         sizing_band=start_sizing_band,
         model_chain_override=start_model_chain_override,
+        combo_selection=start_combo_selection,
     )
     artifact_root = Path(_required_workflow_string(args, "artifact_root")).resolve()
     transaction_root = (
@@ -7507,6 +7509,7 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
     # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
     work_action_model_chain_override = extract_model_chain_override(args)
+    work_action_combo_override = args.get("combo")
 
     def starter(authority, claim_key, reason):
         return start_canonical_workflow(
@@ -7518,6 +7521,7 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
             runtime_factory=runtime_factory or planning_runtime.build_production_planning_runtime,
             needs_human_reason=reason,
             model_chain_override=work_action_model_chain_override,
+            combo_override=work_action_combo_override,
         )
 
     return execute_work_action(

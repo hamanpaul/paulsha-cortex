@@ -33,7 +33,7 @@ setup and workflow commands:
 coordinator commands:
   status           讀取 manager daemon 綜合狀態
   ready            列出符合派工條件的 specs
-  jobs, stat       查詢 Job 執行紀錄
+  jobs, stat       查詢 Job 執行紀錄與 combo/retry 彙總
   fanout           派送目前 ready 的 slices
   tick             執行 fanout + completion/review 流程
   complete         輪詢既有 jobs 並執行 verification/review/completion
@@ -52,7 +52,7 @@ work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
   link      由 Manager 寫入 confirmed association
   unlink    由 Manager 寫入 exclusion
-  start     手動 claim 並建立 WorkflowRun
+  start     手動 claim 並建立 WorkflowRun（可用 --combo 明示 override）
   resume    恢復 needs_human／blocked workflow
   retry-build  以 exact Candidate CAS 重開最後一個 builder card
   retry-verify  以 exact Candidate CAS 只重跑 verification，不重建 candidate
@@ -63,6 +63,8 @@ work item commands:
   auto      管理 cortex:auto-on-going issue label
   review-attest  建立 exact-HEAD maintainer review evidence
   ship      執行 fail-closed delivery state machine
+
+`cortex stat --combo-selections` 可彙總自動選牌／override／bypass 的來源與 task_type。
 
 run 'cortex work show --help' or coordinator mutation help for arguments.
 """

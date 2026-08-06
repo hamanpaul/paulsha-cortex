@@ -106,6 +106,13 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
             raise ValueError(f"work-action {action} requires exact expected_candidate")
+        if action == "start" and "combo" in args:
+            combo = args.get("combo")
+            if (
+                not isinstance(combo, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]*", combo) is None
+            ):
+                raise ValueError("work-action start combo invalid")
         if action == "recover-planning":
             expected_run_id = args.get("expected_run_id")
             failure_classification = args.get("failure_classification")

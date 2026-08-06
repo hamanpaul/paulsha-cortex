@@ -410,6 +410,8 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         # 與其解析結果稽核紀錄（executor/model/domain/來源），provenance-only，
         # 比照 retry_classification／sizing_score 的可選欄位模式。
         "model_chain_override", "resolved_model_chain",
+        # #202：combo 選牌來源／task_type／bypass reason 的 provenance-only 欄位。
+        "combo_selection",
     }
 )
 

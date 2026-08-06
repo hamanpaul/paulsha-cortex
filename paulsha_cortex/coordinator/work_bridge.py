@@ -21,15 +21,23 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.compile import compile_combo
+from paulsha_cortex.deck.selector import ComboSelection, select_combo
 from paulsha_cortex.deck.schema import (
     DEFAULT_CARDS_PATH,
     DEFAULT_COMBOS_DIR,
     load_cards,
     load_combo,
 )
+from paulsha_cortex.deck.task_types import load_task_types
 
 from . import verification
-from .claim import WorkAuthority, load_work_authority, sizing_band, work_authority_digest
+from .claim import (
+    WorkAuthority,
+    load_work_authority,
+    mapped_issue_titles,
+    sizing_band,
+    work_authority_digest,
+)
 from .github_delivery import GitHubDeliveryClient
 from .model_identities import IdentityRegistry, load_model_identities
 from .planning import (
@@ -141,9 +149,26 @@ def resolve_trusted_repo_root(repo: str, *, explicit: object = None) -> Path:
     return matches[0]
 
 
-def default_workflow_manifest(work_id: str, *, change: str | None):
+def _combo_catalog(cards) -> dict[str, object]:
+    catalog: dict[str, object] = {}
+    for combo_file in sorted(DEFAULT_COMBOS_DIR.glob("*.yaml")):
+        combo = load_combo(combo_file, cards)
+        catalog[combo.id] = combo
+    return catalog
+
+
+def _combo_selection_payload(selection: ComboSelection) -> dict[str, str | None]:
+    return {
+        "source": selection.source,
+        "task_type": selection.task_type,
+        "combo": selection.combo_id,
+        "reason": selection.reason,
+    }
+
+
+def default_workflow_manifest(work_id: str, *, change: str | None, combo_name: str = "feature-oneshot"):
     cards = load_cards(DEFAULT_CARDS_PATH)
-    combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
+    combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo_name}.yaml", cards)
     result = compile_combo(
         combo,
         cards,
@@ -152,7 +177,7 @@ def default_workflow_manifest(work_id: str, *, change: str | None):
         allow_external=True,
     )
     if result.workflow_manifest is None:  # pragma: no cover - compile contract
-        raise RuntimeError("feature-oneshot did not produce a workflow manifest")
+        raise RuntimeError(f"{combo_name} did not produce a workflow manifest")
     result.workflow_manifest.validate_manager_spine()
     return result.workflow_manifest
 
@@ -318,6 +343,7 @@ def start_canonical_workflow(
     runtime_factory=None,
     needs_human_reason: str | None = None,
     model_chain_override: dict[str, dict[str, str]] | None = None,
+    combo_override: str | None = None,
 ):
     """Create/resume the real WorkflowRun for a WorkAuthority claim."""
 
@@ -348,7 +374,38 @@ def start_canonical_workflow(
         )
     root = resolve_trusted_repo_root(authority.repo, explicit=explicit_repo_root)
     change = authority.mapped_openspec[0] if authority.mapped_openspec else authority.work_id
-    manifest = default_workflow_manifest(authority.work_id, change=change)
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo_catalog = _combo_catalog(cards)
+    taxonomy = load_task_types(combos=combo_catalog)
+    if combo_override is not None:
+        validated_override = combo_catalog.get(combo_override)
+        if validated_override is None:
+            load_combo(DEFAULT_COMBOS_DIR / f"{combo_override}.yaml", cards)
+            raise RuntimeError(f"combo override unavailable: {combo_override}")
+        override_task_type = next(
+            (
+                task_type
+                for task_type, spec in taxonomy.task_types.items()
+                if spec.combo == combo_override
+            ),
+            None,
+        )
+        combo_selection = ComboSelection(
+            combo_id=combo_override,
+            source="explicit-override",
+            task_type=override_task_type,
+            reason=f"explicit override selected {combo_override}",
+        )
+    else:
+        combo_selection = select_combo(
+            mapped_issue_titles(authority),
+            taxonomy=taxonomy,
+        )
+    manifest = default_workflow_manifest(
+        authority.work_id,
+        change=change,
+        combo_name=combo_selection.combo_id,
+    )
     # #208 收口 wiring 1：claim 時嘗試算 sizing（若能取得既有 plan artifact 與
     # combo 資訊——多半是 openspec-propose 已先在 disk 上落地 tasks.md 的情境）。
     # fail-soft：拿不到就維持 None，run 不掛 band，行為與現行完全相同。
@@ -377,6 +434,7 @@ def start_canonical_workflow(
             sizing_score=claim_sizing_score,
             sizing_band=claim_sizing_band,
             model_chain_override=effective_model_chain_override,
+            combo_selection=_combo_selection_payload(combo_selection),
         )
         return run
     manifest_path = _write_manifest(Path(coordinator_root), claim_key, manifest)
@@ -411,6 +469,7 @@ def start_canonical_workflow(
             "openspec_refs": list(authority.mapped_openspec),
             "pr_refs": [],
             "model_chain_override": effective_model_chain_override,
+            "combo_selection": _combo_selection_payload(combo_selection),
         },
         identity_registry=identities,
         runtime_factory=runtime_factory,

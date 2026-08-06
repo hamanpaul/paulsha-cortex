@@ -1231,6 +1231,7 @@ class JobRegistry:
         plan_review_passed: bool = False,
         frozen_readiness: dict[str, Any] | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
+        combo_selection: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         matches = [
             existing
@@ -1292,6 +1293,7 @@ class JobRegistry:
             plan_review_passed=plan_review_passed,
             frozen_readiness=frozen_readiness,
             model_chain_override=model_chain_override,
+            combo_selection=combo_selection,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1347,6 +1349,7 @@ class JobRegistry:
         frozen_readiness: dict[str, Any] | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
         resolved_model_chain: dict[str, dict[str, str]] | None = None,
+        combo_selection: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -1439,6 +1442,9 @@ class JobRegistry:
                 current.resolved_model_chain
                 if resolved_model_chain is None
                 else resolved_model_chain
+            ),
+            combo_selection=(
+                current.combo_selection if combo_selection is None else combo_selection
             ),
             frozen_readiness=(
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness

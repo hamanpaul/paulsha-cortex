@@ -1,0 +1,18 @@
+combo:
+  id: fix-standard
+  task_type: fix
+  cards:
+    - ref: workflow-claim
+    - ref: openspec-propose
+    - ref: writing-plans
+    - ref: worktree-isolation
+    - ref: tdd-red
+    - ref: subagent-build
+    - ref: verification
+    - ref: code-review
+    - ref: policy-commit
+  gate_spine:
+    - after: verification
+      exists: ["reports/verify/*<task-slug>*.md"]
+    - after: code-review
+      exists: ["reports/review/*<task-slug>*.md"]

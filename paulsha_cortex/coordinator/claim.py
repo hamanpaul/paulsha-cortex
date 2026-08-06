@@ -259,6 +259,40 @@ def _load_snapshot(snapshot_path: str | Path | None = None) -> tuple[dict, str]:
     return payload, verification.canonical_json_hash(payload)
 
 
+def mapped_issue_titles(
+    authority: WorkAuthority,
+    *,
+    snapshot_path: str | Path | None = None,
+) -> dict[int, str | None] | None:
+    payload, canonical_hash = _load_snapshot(snapshot_path)
+    if canonical_hash != authority.snapshot_hash:
+        return None
+    for row in payload.get("work_items", []):
+        if (
+            isinstance(row, dict)
+            and row.get("repo") == authority.repo
+            and row.get("work_id") == authority.work_id
+        ):
+            sources = row.get("sources")
+            if not isinstance(sources, list):
+                return {}
+            titles: dict[int, str | None] = {}
+            for source in sources:
+                if not isinstance(source, dict) or source.get("kind") != "github_issue":
+                    continue
+                match = re.fullmatch(
+                    rf"{re.escape(authority.repo)}#([1-9][0-9]*)",
+                    str(source.get("ref") or ""),
+                )
+                if match is None:
+                    continue
+                number = int(match.group(1))
+                title = source.get("title")
+                titles[number] = title if isinstance(title, str) else None
+            return titles
+    return {}
+
+
 def _authority_from_row(
     *, row: object, providers: dict, snapshot_hash: str
 ) -> WorkAuthority | None:

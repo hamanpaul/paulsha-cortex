@@ -70,7 +70,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "stat",
         help=(
             "查單一 Job 執行紀錄；--retry-classifications 依 retry 分類彙總 workflow runs；"
-            "--decomposition-depths 依拆分深度彙總"
+            "--decomposition-depths 依拆分深度彙總；"
+            "--combo-selections 依 combo provenance 彙總"
         ),
     )
     p_stat.add_argument("job_id", nargs="?", default=None)
@@ -83,6 +84,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--decomposition-depths",
         action="store_true",
         help="依 decomposition_depth 彙總 workflow runs（#223：拆分深度可觀測面）",
+    )
+    p_stat.add_argument(
+        "--combo-selections",
+        action="store_true",
+        help="依 combo_selection 的 source × task_type 彙總 workflow runs（#202）",
     )
 
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
@@ -147,6 +153,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--failure-reason")
     p_work.add_argument("--expected-run-id", help="abandon 使用的 exact WorkflowRun CAS")
     p_work.add_argument("--reason", help="abandon 的單行審計理由（最多 500 字）")
+    p_work.add_argument(
+        "--combo",
+        help="start 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
+    )
     toggle = p_work.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_true")
     toggle.add_argument("--disable", action="store_true")
@@ -293,6 +303,8 @@ def main(
             request_args["expected_run_id"] = args.expected_run_id
         if args.reason is not None:
             request_args["reason"] = args.reason
+        if args.combo is not None:
+            request_args["combo"] = args.combo
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)
         if args.payload:
@@ -382,9 +394,26 @@ def main(
                 depth_counts[key] = depth_counts.get(key, 0) + 1
             print(json.dumps({"decomposition_depths": depth_counts}, ensure_ascii=False))
             return 0
+        if args.combo_selections:
+            counts: dict[str, dict[str, int]] = {}
+            for run in reg.list_workflow_runs():
+                selection = run.combo_selection
+                source = "unrecorded"
+                task_type = "unrecorded"
+                if isinstance(selection, dict):
+                    raw_source = selection.get("source")
+                    raw_task_type = selection.get("task_type")
+                    if isinstance(raw_source, str) and raw_source:
+                        source = raw_source
+                    if isinstance(raw_task_type, str) and raw_task_type:
+                        task_type = raw_task_type
+                counts.setdefault(source, {})
+                counts[source][task_type] = counts[source].get(task_type, 0) + 1
+            print(json.dumps({"combo_selections": counts}, ensure_ascii=False))
+            return 0
         if args.job_id is None:
             print(
-                "錯誤: stat 需要 job_id（或 --retry-classifications／--decomposition-depths）",
+                "錯誤: stat 需要 job_id（或 --retry-classifications／--decomposition-depths／--combo-selections）",
                 file=sys.stderr,
             )
             return 1

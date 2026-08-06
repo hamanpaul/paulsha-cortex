@@ -53,6 +53,7 @@ cortex work show unified-work-lifecycle --repo owner/repo --json
 cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
 cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
 cortex work start unified-work-lifecycle --repo owner/repo
+cortex work start unified-work-lifecycle --repo owner/repo --combo fix-standard
 cortex work resume unified-work-lifecycle --repo owner/repo
 cortex work retry-build unified-work-lifecycle --repo owner/repo --issue 14 --actor operator \
   --payload <(printf '%s\n' '{"expected_candidate":"<40-char SHA>"}')
@@ -61,8 +62,17 @@ cortex work abandon stale-canary --repo owner/repo --actor operator \
   --reason 'Superseded by the terminal canary.'
 cortex work auto unified-work-lifecycle --repo owner/repo --enable
 cortex work auto unified-work-lifecycle --repo owner/repo --disable
+cortex stat --combo-selections
 cortex doctor --probe-live --repo owner/repo --json
 ```
+
+### Combo 自動選擇
+
+`cortex work start` 與 auto claim 建立 workflow 時，Manager 會先讀 durable snapshot 內已確認的 GitHub issue title，交給 `paulsha_cortex/deck/task_types.py` 的 taxonomy 做機械分類，再映射到 combo。現況 `feat` 會選 `feature-oneshot`、`fix` 會選 `fix-standard`；`docs`／`test`／`ci`／`refactor` 目前仍是明示缺口，會帶 `bypass-default` provenance 沿用既有 `feature-oneshot`。
+
+若標題是 `unknown_type`、scope 不在受控詞典、或多個 mapped issue 得到互斥 type，claim 會 fail-closed，且不建立 WorkflowRun。修法只有兩種：修正 issue title，或用 `cortex work start <work_id> --repo <owner/repo> --combo <id>` 做 authoritative override。override 永遠優先於自動選牌，並會在 run 的 `combo_selection` 留下 `explicit-override` 來源。
+
+`cortex stat --combo-selections` 會彙總 `source × task_type`，直接看出多少 run 是自動選牌、多少走 override、多少因 title 缺席／unparseable／combo 缺口而 bypass。`fix-standard` 雖然比 comment 草稿多了 `openspec-propose` 與 `writing-plans` 兩張 planner 卡，但這是為了滿足 `validate_manager_spine` 的完整 phase spine；verification 與 code-review 兩條核心 gate 維持不變。
 
 `retry-build` payload只接受`{"expected_candidate":"<40-char SHA>"}`。Manager會把它當CAS，不把caller內容當evidence；通常只有ongoing `needs_human` verify/review run、無active job、舊build全passed且Candidate完全相同時，才原子重開最後一張builder card，清除舊verify/review authority並立刻派出新builder。另一個窄化入口只處理final builder terminalization失敗：run必須停在build phase、前置build card全passed、final card pending，而且最新同card job已成功退出（`exited/0`）卻沒有workflow evidence；真正的failed job不符合此入口。所有recovery prompt都要求先檢查worktree是否已有repair commit，並允許builder提交或採用已測試的descendant Candidate；Manager仍獨立驗證exact舊Candidate CAS與單調ancestry。terminalization recovery另要求保留declared input snapshot並先檢查未綁定commit。Plan/build terminal的`outputs`只可列出符合manifest的repo-relative artifact paths；manifest沒有outputs時必須精確回`[]`，不得塞入action/summary物件。Ship authority 原則上必須仍為pending；唯一例外是已通過且 identity 精確為 `cortex-manager/deterministic/cortex` 的 `openspec-archive`，此時保留official archive step並只重設後續gate，讓post-archive finding可由tested descendant Candidate修正。Manager會把已移走的active brainstorm artifact對應到同hash且唯一的official archive path重證，不接受caller改寫authority、模糊archive或symlink；任何其他已通過ship card仍拒絕retry。新Candidate仍必須是舊Candidate的exact descendant。`link`、`unlink`、`start` 與 `resume` 不要求 caller 提供 repo root；Manager 只會從 installer 的 `PSC_REPO_ROOT` 或 Monitor workspace registry 解析與 `owner/repo` remote 完全一致的 canonical git top-level。當同work只有一個`done/ship` run且terminal journal binding完整時，explicit `resume`會重跑current authority的ship validator來刷新stale CompletionRecord；不會建立新run、重開builder或dispatch card，pending／needs-human／malformed結果也不會覆寫既有completion。`auto` 未指定相容用的 `--issue` 時會套用到全部 confirmed mapped issues。
 
