@@ -12,6 +12,7 @@ from .claim import sizing_band as compute_sizing_band
 DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
 WORKFLOW_MANIFEST_VERSION = 1
 WORKFLOW_PHASES = ("claim", "define", "plan", "build", "verify", "review", "ship")
+SHIP_TRANSITION_STAGES = ("local-closeout", "pr-preflight", "external-ship")
 WORKFLOW_GATE_STATUSES = frozenset({"pending", "running", "passed", "failed"})
 WORKFLOW_FACETS = frozenset(
     {"needs_human", "blocked", "degraded", "needs_decomposition", "planning_released"}
@@ -707,3 +708,14 @@ def validate_workflow_phase_transition(current: str, new: str) -> None:
     new_index = WORKFLOW_PHASES.index(new)
     if new_index != current_index + 1:
         raise ValueError(f"非法 workflow phase transition: {current!r} -> {new!r}")
+
+
+def validate_ship_stage_transition(current: str, new: str) -> None:
+    if current not in SHIP_TRANSITION_STAGES or new not in SHIP_TRANSITION_STAGES:
+        raise ValueError(f"非法 ship transition stage: {current!r} -> {new!r}")
+    if current == new:
+        return
+    current_index = SHIP_TRANSITION_STAGES.index(current)
+    new_index = SHIP_TRANSITION_STAGES.index(new)
+    if new_index != current_index + 1:
+        raise ValueError(f"非法 ship transition stage: {current!r} -> {new!r}")

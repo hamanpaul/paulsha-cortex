@@ -39,7 +39,7 @@ from .planning import (
     compute_sizing_score,
 )
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
-from .workflow import MODEL_CHAIN_PERSONAS
+from .workflow import MODEL_CHAIN_PERSONAS, validate_ship_stage_transition
 
 
 def extract_model_chain_override(args: Mapping[str, object]) -> dict[str, dict[str, str]] | None:
@@ -510,6 +510,53 @@ def _metadata_file(root: Path, run, metadata: dict[str, object]) -> Path:
     return target
 
 
+def _preflight_result_evidence(
+    *,
+    state_root: Path,
+    run,
+    candidate: str,
+    stage: str,
+    preflight,
+    status: str,
+    reason: str,
+    next_action: str | None = None,
+) -> dict[str, object]:
+    payload = {
+        "schema": "cortex-pr-preflight/v1",
+        "run_id": run.run_id,
+        "candidate": candidate,
+        "stage": stage,
+        "status": status,
+        "reason": reason,
+        "head": preflight.head,
+        "tree_hash": preflight.tree_hash,
+        "failed_stage": preflight.failed_stage,
+        "policy": {
+            "argv": list(preflight.policy.argv),
+            "returncode": preflight.policy.returncode,
+        },
+        "ci_parity": (
+            None
+            if preflight.ci_parity is None
+            else {
+                "argv": list(preflight.ci_parity.argv),
+                "returncode": preflight.ci_parity.returncode,
+            }
+        ),
+    }
+    if next_action is not None:
+        payload["next_action"] = next_action
+    evidence = _write_json_evidence(state_root, "pr-preflight", payload)
+    return {
+        "trusted": True,
+        "status": status,
+        "head": candidate,
+        "commit_id": candidate,
+        "reason": reason,
+        **evidence,
+    }
+
+
 def _builder_binding(
     registry,
     run,
@@ -572,6 +619,16 @@ def _builder_binding(
         raise RuntimeError("builder delivery binding malformed")
     root = Path(worktree).resolve(strict=True)
     return root, branch
+
+
+def _manager_archive_applied(run) -> bool:
+    return any(
+        step.phase == "ship"
+        and step.card == "openspec-archive"
+        and step.gate_result == "passed"
+        and (step.executor, step.model, step.domain) == ("cortex-manager", "deterministic", "cortex")
+        for step in run.steps
+    )
 
 
 def _push_exact_candidate(
@@ -855,16 +912,6 @@ def _commit_archive_and_require_reverification(
     new_head = head.stdout.strip().lower()
     if head.returncode != 0 or verification.SAFE_SHA_RE.fullmatch(new_head) is None or new_head == candidate:
         raise RuntimeError("archive commit did not produce a new exact Candidate")
-    _push_exact_candidate(
-        registry=registry,
-        run=run,
-        authority=authority,
-        state_root=state_root,
-        worktree=worktree,
-        branch=branch,
-        candidate=new_head,
-        runner=runner,
-    )
     _record_manager_ship_job(
         registry=registry,
         state_root=state_root,
@@ -1430,6 +1477,56 @@ def build_production_ship_validator(
             run=run,
             worktree=worktree,
         )
+        change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
+        active_change = worktree / "openspec" / "changes" / str(change) if change else None
+        if active_change is not None and active_change.is_dir() and not _manager_archive_applied(run):
+            from . import work_actions
+
+            validate_ship_stage_transition("local-closeout", "pr-preflight")
+            work_actions._validate_local_archive_inputs(
+                repo_root=worktree,
+                change=str(change),
+                runner=runner,
+            )
+            archived = runner(
+                work_actions.build_openspec_archive_argv(str(change)),
+                cwd=str(worktree),
+                shell=False,
+                capture_output=True,
+                text=True,
+            )
+            if getattr(archived, "returncode", None) != 0:
+                raise RuntimeError("official OpenSpec archive failed")
+            reset = _commit_archive_and_require_reverification(
+                registry=registry,
+                state_root=state_root,
+                run=run,
+                authority=authority,
+                worktree=worktree,
+                branch=branch,
+                candidate=candidate,
+                runner=runner,
+            )
+            evidence = _write_json_evidence(
+                state_root,
+                "delivery-adapter",
+                {
+                    "schema": "cortex-delivery-adapter/v1",
+                    "run_id": run.run_id,
+                    "candidate": candidate,
+                    "action": "candidate-reverification-required",
+                    "next_candidate": reset.candidate_head,
+                    "stage": "local-closeout",
+                },
+            )
+            return {
+                "trusted": True,
+                "status": "pending",
+                "head": candidate,
+                "commit_id": candidate,
+                "reason": "archive-commit-invalidated-candidate-evidence",
+                **evidence,
+            }
         metadata = _pr_metadata(run)
         metadata_path = _metadata_file(state_root, run, metadata)
         pr_numbers = []
@@ -1451,56 +1548,26 @@ def build_production_ship_validator(
                 now=now,
             )
             if not initial.passed or initial.head != candidate:
-                raise RuntimeError("initial PR-metadata preflight failed")
-            _push_exact_candidate(
-                registry=registry,
+                return _preflight_result_evidence(
+                    state_root=state_root,
+                    run=run,
+                    candidate=candidate,
+                    stage="metadata",
+                    preflight=initial,
+                    status="needs_human",
+                    reason="pr-preflight-blocked",
+                    next_action="resume-after-preflight-fix",
+                )
+            return _preflight_result_evidence(
+                state_root=state_root,
                 run=run,
-                authority=authority,
-                state_root=state_root,
-                worktree=worktree,
-                branch=branch,
                 candidate=candidate,
-                runner=runner,
+                stage="metadata",
+                preflight=initial,
+                status="needs_human",
+                reason="awaiting-pr-authorization",
+                next_action="awaiting-pr-authorization",
             )
-            github = GitHubDeliveryClient(runner=runner)
-            number = github.create_or_get_pull_request(
-                repo=run.repo,
-                branch=branch,
-                expected_head=candidate,
-                title=str(metadata["title"]),
-                body=str(metadata["body"]),
-                labels=tuple(metadata["labels"]),
-            )
-            authority = _authority_with_manager_pr(authority, number)
-            updated = registry._manager_update_workflow_run(
-                run.run_id,
-                source_revision=work_authority_digest(authority),
-                pr_refs=(f"{run.repo}#{number}",),
-            )
-            _rebase_delivery_journal_authority(
-                state_root=state_root,
-                run=updated,
-                authority=authority,
-            )
-            evidence = _write_json_evidence(
-                state_root,
-                "delivery-adapter",
-                {
-                    "schema": "cortex-delivery-adapter/v1",
-                    "run_id": updated.run_id,
-                    "candidate": candidate,
-                    "action": "pr-created",
-                    "pr_number": number,
-                    "authority_digest": updated.source_revision,
-                },
-            )
-            return {
-                "trusted": True,
-                "status": "pending",
-                "head": candidate,
-                "commit_id": candidate,
-                **evidence,
-            }
         number = pr_numbers[0]
         if authority.mapped_prs not in {(), (number,)}:
             raise RuntimeError("workflow PR differs from current WorkAuthority")
@@ -1515,18 +1582,26 @@ def build_production_ship_validator(
             run=run,
             authority=authority,
         )
-        def authorize_existing_pr_push() -> None:
-            existing = _run_exact_candidate_preflight(
-                worktree=worktree,
-                branch=branch,
+        existing = _run_exact_candidate_preflight(
+            worktree=worktree,
+            branch=branch,
+            candidate=candidate,
+            command=load_preflight_command(),
+            request=PreflightRequest(pr_number=number),
+            runner=runner,
+            now=now,
+        )
+        if not existing.passed or existing.head != candidate:
+            return _preflight_result_evidence(
+                state_root=state_root,
+                run=run,
                 candidate=candidate,
-                command=load_preflight_command(),
-                request=PreflightRequest(pr_number=number),
-                runner=runner,
-                now=now,
+                stage="existing-pr",
+                preflight=existing,
+                status="needs_human",
+                reason="pr-preflight-blocked",
+                next_action="resume-after-preflight-fix",
             )
-            if not existing.passed or existing.head != candidate:
-                raise RuntimeError("existing PR exact-Candidate preflight failed")
 
         _push_exact_candidate(
             registry=registry,
@@ -1537,7 +1612,6 @@ def build_production_ship_validator(
             branch=branch,
             candidate=candidate,
             runner=runner,
-            pre_push=authorize_existing_pr_push,
         )
         from . import work_actions
         from . import review as review_evidence

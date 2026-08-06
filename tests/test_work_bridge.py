@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -201,7 +202,7 @@ def test_delivery_adapter_status(action: object, expected: str) -> None:
     assert work_bridge._delivery_adapter_status(action) == expected
 
 
-def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
+def test_ship_adapter_stops_at_pr_authorization_after_metadata_preflight(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo, candidate = _repo(tmp_path / "repo")
@@ -443,14 +444,14 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
 
     result = validator(run=run, candidate=candidate)
 
-    assert result["status"] == "pending"
+    assert result["status"] == "needs_human"
+    assert result["reason"] == "awaiting-pr-authorization"
     assert preflight_requests[0].metadata_path is not None
     assert preflight_requests[0].pr_number is None
-    assert created[0]["branch"] == "feature/14-work"
     updated = registry.get_workflow_run(run.run_id)
     assert updated.run_id == run.run_id
-    assert updated.pr_refs == ("acme/demo#17",)
-    assert updated.source_revision != run.source_revision
+    assert updated.pr_refs == ()
+    assert updated.source_revision == run.source_revision
     assert updated.planning_source_revision == initial_source_revision
     assert not report.exists()
     assert plan.is_file()
@@ -469,28 +470,40 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     journal = json.loads(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
-    assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
-    assert "openspec:acme/demo:work@spec-2" in journal["runs"][run.run_id][
-        "source_revisions"
-    ]
+    assert journal["runs"][run.run_id].get("pushes", {}) == {}
+    assert created == []
 
     # A repaired exact Candidate on an already-bound PR must be preflighted,
     # pushed, and read back before the ordinary ship state machine compares
     # authenticated remote facts with the local tree.
-    remote_head = "a" * 40
+    authority_with_pr = work_bridge._authority_with_manager_pr(
+        load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot),
+        17,
+    )
+    updated = registry._manager_update_workflow_run(
+        run.run_id,
+        pr_refs=("acme/demo#17",),
+        source_revision=work_authority_digest(authority_with_pr),
+    )
+    work_bridge._rebase_delivery_journal_authority(
+        state_root=tmp_path / "state",
+        run=updated,
+        authority=authority_with_pr,
+    )
+    remote_head = None
     monkeypatch.setattr(
         work_actions,
         "_ship_action",
         lambda **kwargs: {"action": "awaiting-copilot"},
     )
     resumed = validator(
-        run=registry.get_workflow_run(run.run_id),
+        run=registry.get_workflow_run(updated.run_id),
         candidate=candidate,
     )
 
     assert resumed["status"] == "pending"
     assert remote_head == candidate
-    assert push_count == 2
+    assert push_count == 1
     assert preflight_requests[-1].pr_number == 17
 
 
@@ -614,7 +627,7 @@ def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
         )
 
 
-def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(
+def test_archive_commit_invalidates_old_gates_without_pushing(
     tmp_path: Path,
 ) -> None:
     repo, _initial = _repo(tmp_path / "repo")
@@ -699,7 +712,8 @@ def test_archive_commit_pushes_new_candidate_and_invalidates_old_gates(
     )
 
     assert reset.current_phase == "verify"
-    assert reset.candidate_head == remote_head
+    assert remote_head is None
+    assert reset.candidate_head is not None
     assert reset.candidate_head != candidate
     assert reset.verified_head is None
     assert reset.gate_refs == ()
@@ -819,9 +833,11 @@ def test_installed_defaults_start_to_ship_handoff_remains_monitor_ongoing(
             "---\nstatus: accepted\n---\n# Design\n## Decisions\nReady.\n"
         ),
         "openspec/changes/work/tasks.md": (
-            "---\nstatus: accepted\n---\n# Tasks\n- [ ] Ship.\n"
+            "---\nstatus: accepted\n---\n# Tasks\n- [x] Ship.\n"
         ),
-        "docs/todo.md": "---\nstatus: accepted\n---\n# Todo\n- [ ] Ship.\n",
+        "docs/todo.md": "---\nstatus: accepted\n---\n# Todo\n- [x] Ship.\n",
+        "CHANGELOG.md": "## [Unreleased]\n\n- work\n",
+        "changelog.d/work.md": "work\n",
     }
     for ref, body in planning_files.items():
         target = repo / ref
@@ -1012,12 +1028,18 @@ identities:
 
     def fake_preflight(**kwargs):
         preflight_requests.append(kwargs["request"])
+        head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         return PreflightResult(
             True,
             None,
             CommandResult(("policy",), 0, "", ""),
             CommandResult(("preflight",), 0, "", ""),
-            candidate,
+            head,
             "5" * 40,
         )
 
@@ -1045,6 +1067,17 @@ identities:
 
     def delivery_runner(argv, **kwargs):
         nonlocal pushed
+        if argv[:2] == ["openspec", "validate"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[:3] == ["python3", "-m", "policy_check"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[:2] == ["openspec", "archive"]:
+            active = repo / "openspec" / "changes" / "work"
+            archived = repo / "openspec" / "changes" / "archive" / "2026-08-06-work"
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            if active.exists():
+                shutil.move(str(active), str(archived))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "ls-remote" in argv:
             return SimpleNamespace(
                 returncode=0 if pushed else 2,
@@ -1084,7 +1117,7 @@ identities:
         assert registry.get_workflow_run(run_id).current_phase == "build"
 
     result = None
-    for _ in range(10):
+    for _ in range(20):
         result = executor(
             build_request(
                 req_type="workflow-action",
@@ -1092,16 +1125,18 @@ identities:
                 requested_by="operator",
             )
         )
-        if registry.get_workflow_run(run_id).pr_refs:
+        current = registry.get_workflow_run(run_id)
+        if "needs_human" in current.facets:
             break
-    assert result is not None and result["reason"] == "delivery-in-progress"
+    assert result is not None and result["reason"] == "awaiting-pr-authorization"
     run = registry.get_workflow_run(run_id)
     assert run.current_phase == "review"
-    assert run.pr_refs == ("acme/demo#17",)
+    assert run.pr_refs == ()
+    assert "needs_human" in run.facets
     assert branches == ["feature/14-work"]
     assert preflight_requests[0].metadata_path is not None
     assert preflight_requests[0].pr_number is None
-    assert created[0]["branch"] == "feature/14-work"
+    assert created == []
 
     from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
 
@@ -1127,7 +1162,7 @@ identities:
     authorization_path.write_text("{}\n", encoding="utf-8")
     authorization = {
         "payload": {
-            "head": candidate,
+            "head": str(run.candidate_head),
             "tree_hash": "5" * 40,
             "foreign_review_path": foreign_ref.ref,
             "foreign_review_hash": foreign_ref.sha256,
@@ -1160,6 +1195,11 @@ identities:
     authority = work_bridge._authority_with_manager_pr(
         load_work_authority(repo="acme/demo", work_id="work"), 17
     )
+    run = registry._manager_update_workflow_run(
+        run_id,
+        pr_refs=("acme/demo#17",),
+        source_revision=work_authority_digest(authority),
+    )
     # #208 收口 wiring 4：sizing 是 work item 屬性，_completion_draft 必須把
     # run 上已算好的 sizing_score/sizing_band 帶進 CompletionRecord（比照既有
     # retry_classification 的 provenance-only 可選欄位模式）。
@@ -1169,7 +1209,7 @@ identities:
         state_root=coordinator_root,
         run=run,
         authority=authority,
-        candidate=candidate,
+        candidate=str(run.candidate_head),
         pr_number=17,
         foreign_ref=foreign_ref,
         runner=subprocess.run,
@@ -1190,7 +1230,7 @@ identities:
         state_root=coordinator_root,
         run=run,
         authority=authority,
-        candidate=candidate,
+        candidate=str(run.candidate_head),
         pr_number=17,
         foreign_ref=foreign_ref,
         runner=subprocess.run,
