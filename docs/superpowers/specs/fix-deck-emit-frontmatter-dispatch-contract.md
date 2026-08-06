@@ -11,6 +11,7 @@
   - `checks`
   - `tests`
   - `full_suite`
+- `executor` / `model_id`：optional，但必須成對宣告且皆為非空字串；宣告時 manager 會先用 `model-identities.yaml` 驗證該 `(executor, model_id)` 是否已註冊，未宣告時沿用 fanout/tick 的 builder 預設值。Deck compile 本身不會自動輸出這兩欄，需要 operator 在確定要逐 slice 覆寫時手動補上。
 
 ### `checks` 要求
 

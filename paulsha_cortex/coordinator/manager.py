@@ -1855,6 +1855,8 @@ def run_tick(
     reaper: Callable[[], dict] | None = None,
     review_executor: str | None = None,
     review_model: str | None = None,
+    identity_registry=None,
+    launcher_factory=None,
 ) -> dict:
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
@@ -1895,6 +1897,8 @@ def run_tick(
                 launcher=launcher,
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 handoff_dir=handoff_dir,
+                identity_registry=identity_registry,
+                launcher_factory=launcher_factory,
             )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)

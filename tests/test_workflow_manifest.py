@@ -111,6 +111,7 @@ def test_manifest_roundtrips_card_execution_contract() -> None:
 def test_manifest_resolves_inputs_outputs_and_preserves_slice_frontmatter() -> None:
     cards, combo = _feature_oneshot()
     result = compile_combo(combo, cards, "manifest demo", change="demo")
+    runtime_only = {"executor", "model_id"}
 
     plan = next(step for step in result.workflow_manifest.steps if step.card == "writing-plans")
     assert plan.inputs == ("openspec/changes/demo/proposal.md",)
@@ -120,7 +121,7 @@ def test_manifest_resolves_inputs_outputs_and_preserves_slice_frontmatter() -> N
         frontmatter = slice_doc.content.split("---\n", 2)[1]
         import yaml
 
-        assert set(yaml.safe_load(frontmatter)) == set(EMITTED_FRONTMATTER_FIELDS)
+        assert set(yaml.safe_load(frontmatter)) == set(EMITTED_FRONTMATTER_FIELDS) - runtime_only
 
 
 def test_manifest_rejects_unknown_persona_binding(tmp_path) -> None:

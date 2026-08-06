@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
 import argparse
 import fcntl
+import inspect
+import json
 import os
 import re
 import signal
@@ -229,7 +230,53 @@ def _in_flight_status(registry) -> list[dict[str, Any]]:
     return in_flight
 
 
-def _held_reasons(meta: dict[str, Any], is_satisfied: Callable[[str], bool]) -> list[str]:
+def _available_identity_candidates(identity_registry) -> str:
+    identities = getattr(identity_registry, "identities", ())
+    return ", ".join(
+        f"{identity.executor}/{identity.model_id}"
+        for identity in identities
+        if isinstance(getattr(identity, "executor", None), str)
+        and isinstance(getattr(identity, "model_id", None), str)
+    ) or "(none)"
+
+
+def _require_registered_identity(*, identity_registry, executor: str, model_id: str, context: str):
+    identity = identity_registry.get(executor, model_id)
+    if identity is None:
+        available = _available_identity_candidates(identity_registry)
+        raise ValueError(f"{context}: {executor}/{model_id}（可用 candidates: {available}）")
+    return identity
+
+
+def _call_with_supported_kwargs(func, *args, **kwargs):
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return func(*args, **kwargs)
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return func(*args, **kwargs)
+    supported = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    filtered_kwargs = {name: value for name, value in kwargs.items() if name in supported}
+    return func(*args, **filtered_kwargs)
+
+
+def _held_reasons(
+    meta: dict[str, Any],
+    is_satisfied: Callable[[str], bool],
+    *,
+    batch_ids: set[str],
+    handoff_dir: str,
+) -> list[str]:
     reasons: list[str] = []
     if isinstance(meta.get("parse_error"), dict):
         reasons.append(f"parse-error:{meta['parse_error'].get('field', 'frontmatter')}")
@@ -239,7 +286,12 @@ def _held_reasons(meta: dict[str, Any], is_satisfied: Callable[[str], bool]) -> 
         reasons.append("dispatch-hold")
     for dep in meta.get("depends_on", []):
         if not is_satisfied(dep):
-            reasons.append(f"deps-unsatisfied:{dep}")
+            reason = autonomy.classify_batch_dependency(
+                dep,
+                batch_ids=batch_ids,
+                handoff_dir=handoff_dir,
+            )
+            reasons.append(reason or f"deps-unsatisfied:{dep}")
     return reasons
 
 
@@ -316,6 +368,11 @@ def build_runtime_status_provider(
             handoff_dir=handoff_dir,
             git_runner=git_runner,
         )
+        batch_ids = {
+            slice_id
+            for meta in metas
+            if isinstance((slice_id := meta.get("slice_id")), str) and slice_id
+        }
         ready_units = ready_units_fn(metas, predicate)
         ready = [meta["slice_id"] for meta in ready_units]
         ready_ids = set(ready)
@@ -326,7 +383,12 @@ def build_runtime_status_provider(
                 continue
             if slice_id in ready_ids:
                 continue
-            reasons = _held_reasons(meta, predicate)
+            reasons = _held_reasons(
+                meta,
+                predicate,
+                batch_ids=batch_ids,
+                handoff_dir=handoff_dir,
+            )
             if reasons:
                 held.append({"slice_id": slice_id, "reasons": reasons})
         slices: list[dict[str, Any]] = []
@@ -397,13 +459,32 @@ def build_request_executor(
         requested_model = args.get("model", default_model)
         requested_review_executor = args.get("review_executor", default_review_executor)
         requested_review_model = args.get("review_model", default_review_model)
+        request_type = request["type"]
         active_review_launcher = _resolve_launcher(
             requested_review_executor,
             launcher,
             allow_unsafe=allow_unsafe,
             model=requested_review_model,
         )
-        if request["type"] == "workflow-action":
+        builder_identity_registry = None
+        builder_launcher_factory = None
+        if request_type in {"dispatch", "fanout", "tick"}:
+            builder_identity_registry = workflow_identity_registry or load_model_identities()
+            builder_launcher_factory = lambda identity: _resolve_launcher(
+                identity.executor,
+                launcher,
+                allow_unsafe=allow_unsafe,
+                model=identity.model_id,
+            )
+            requested_executor = args.get("executor", default_executor)
+            if isinstance(requested_executor, str) and requested_executor and isinstance(requested_model, str) and requested_model:
+                _require_registered_identity(
+                    identity_registry=builder_identity_registry,
+                    executor=requested_executor,
+                    model_id=requested_model,
+                    context=f"{request_type} request 指定的 identity 不存在於 registry",
+                )
+        if request_type == "workflow-action":
             registry = getattr(dispatcher, "_registry", None)
             if registry is None:
                 raise RuntimeError("workflow-action requires dispatcher._registry")
@@ -489,7 +570,7 @@ def build_request_executor(
                     if job is not None:
                         result["job_id"] = job["job_id"]
             return result
-        if request["type"] == "work-action":
+        if request_type == "work-action":
             registry = getattr(dispatcher, "_registry", None)
             if registry is None:
                 raise RuntimeError("work-action requires dispatcher._registry")
@@ -585,7 +666,7 @@ def build_request_executor(
                         if job is not None:
                             result["result"]["job_id"] = job["job_id"]
             return result
-        if request["type"] == "complete":
+        if request_type == "complete":
             complete_metas = scan_specs_fn(request_specs_dir) if args.get("specs_dir") else None
             complete_kwargs = {
                 "handoff_dir": request_handoff_dir,
@@ -603,7 +684,7 @@ def build_request_executor(
                 dispatcher,
                 **complete_kwargs,
             )
-        if request["type"] == "slice-action":
+        if request_type == "slice-action":
             slice_id = args.get("slice_id")
             action = args.get("action")
             actor = args.get("actor")
@@ -633,7 +714,7 @@ def build_request_executor(
                 git_runner=getattr(dispatcher, "_git_runner", None),
             )
         metas = scan_specs_fn(request_specs_dir)
-        if request["type"] == "dispatch":
+        if request_type == "dispatch":
             slice_id = args.get("slice_id")
             target = next((meta for meta in metas if meta.get("slice_id") == slice_id), None)
             if target is None:
@@ -668,7 +749,8 @@ def build_request_executor(
                 allow_unsafe=allow_unsafe,
                 model=requested_model,
             )
-            dispatched = dispatch_ready_fn(
+            dispatched = _call_with_supported_kwargs(
+                dispatch_ready_fn,
                 [{**target, "dispatch": "auto"}],
                 lambda _slice_id: True,
                 dispatcher,
@@ -676,6 +758,8 @@ def build_request_executor(
                 launcher=active_launcher,
                 handoff_dir=request_handoff_dir,
                 git_runner=getattr(dispatcher, "_git_runner", None),
+                identity_registry=builder_identity_registry,
+                launcher_factory=builder_launcher_factory,
             )
             job = dispatched[0]
             if registry is None:
@@ -703,8 +787,9 @@ def build_request_executor(
             allow_unsafe=allow_unsafe,
             model=requested_model,
         )
-        if request["type"] == "fanout":
-            jobs = dispatch_ready_fn(
+        if request_type == "fanout":
+            jobs = _call_with_supported_kwargs(
+                dispatch_ready_fn,
                 metas,
                 predicate,
                 dispatcher,
@@ -712,6 +797,8 @@ def build_request_executor(
                 launcher=active_launcher,
                 handoff_dir=request_handoff_dir,
                 git_runner=getattr(dispatcher, "_git_runner", None),
+                identity_registry=builder_identity_registry,
+                launcher_factory=builder_launcher_factory,
             )
             return {
                 "dispatch_skipped": False,
@@ -729,6 +816,8 @@ def build_request_executor(
             "require_idle": bool(args.get("require_idle", False)),
             "max_load": float(args.get("max_load", default_max_load)),
             "reaper": reaper,
+            "identity_registry": builder_identity_registry,
+            "launcher_factory": builder_launcher_factory,
         }
         if requested_review_executor is not None or requested_review_model is not None:
             run_tick_kwargs.update(
@@ -738,7 +827,8 @@ def build_request_executor(
                     "review_model": requested_review_model,
                 }
             )
-        return run_tick_fn(
+        return _call_with_supported_kwargs(
+            run_tick_fn,
             dispatcher,
             **run_tick_kwargs,
         )
@@ -774,6 +864,13 @@ def build_periodic_tick_runner(
     )
 
     def execute() -> dict[str, Any]:
+        identities = workflow_identity_registry or load_model_identities()
+        workflow_launcher_factory = lambda identity: _resolve_launcher(
+            identity.executor,
+            launcher,
+            allow_unsafe=False,
+            model=identity.model_id,
+        )
         registry = getattr(dispatcher, "_registry", None)
         auto_claim_error: str | None = None
         try:
@@ -800,13 +897,6 @@ def build_periodic_tick_runner(
                 if state_path is not None
                 else paths.coordinator_root().resolve()
             )
-            identities = workflow_identity_registry or load_model_identities()
-            launcher_factory = lambda identity: _resolve_launcher(
-                identity.executor,
-                launcher,
-                allow_unsafe=False,
-                model=identity.model_id,
-            )
             for workflow in registry.list_workflow_runs():
                 if workflow.status != "ongoing" or "blocked" in workflow.facets:
                     continue
@@ -829,7 +919,7 @@ def build_periodic_tick_runner(
                         dispatcher,
                         run_id=workflow.run_id,
                         identities=identities,
-                        launcher_factory=launcher_factory,
+                        launcher_factory=workflow_launcher_factory,
                         coordinator_root=coordinator_root,
                         ship_validator=active_ship_validator,
                     )
@@ -850,6 +940,18 @@ def build_periodic_tick_runner(
                     )
         metas = scan_specs_fn(specs_dir)
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=default_allow_unsafe)
+        if (
+            isinstance(default_executor, str)
+            and default_executor
+            and isinstance(default_model, str)
+            and default_model
+        ):
+            _require_registered_identity(
+                identity_registry=identities,
+                executor=default_executor,
+                model_id=default_model,
+                context="periodic tick 預設 identity 不存在於 registry",
+            )
         active_launcher = _resolve_launcher(
             default_executor,
             launcher,
@@ -871,6 +973,13 @@ def build_periodic_tick_runner(
             "require_idle": require_idle,
             "max_load": default_max_load,
             "reaper": reaper,
+            "identity_registry": identities,
+            "launcher_factory": lambda identity: _resolve_launcher(
+                identity.executor,
+                launcher,
+                allow_unsafe=default_allow_unsafe,
+                model=identity.model_id,
+            ),
         }
         if default_review_executor is not None or default_review_model is not None:
             run_tick_kwargs.update(
@@ -880,7 +989,7 @@ def build_periodic_tick_runner(
                     "review_model": default_review_model,
                 }
             )
-        result = run_tick_fn(dispatcher, **run_tick_kwargs)
+        result = _call_with_supported_kwargs(run_tick_fn, dispatcher, **run_tick_kwargs)
         summary = {**result, "auto_claims": auto_claims}
         if auto_claim_error is not None:
             # 讓 operator 能從 status/summary 看出 auto-claim 這輪降級了，

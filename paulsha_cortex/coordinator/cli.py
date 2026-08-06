@@ -102,7 +102,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="高風險：旁路 executor approval/sandbox；只允許單一 ready slice canary",
     )
-    p_fanout.add_argument("--model", default=None, help="原樣傳給 builder executor 的 model ID")
+    p_fanout.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "builder model ID 預設值；spec frontmatter 宣告 executor/model_id 時逐 slice 覆寫；"
+            "明確指定的 (executor, model) 須為 model-identities 已註冊身分"
+        ),
+    )
 
     p_complete = sub.add_parser(
         "complete",
@@ -180,7 +187,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="高風險：旁路 executor approval/sandbox；只允許單一 ready slice canary",
     )
-    p_tick.add_argument("--model", default=None, help="原樣傳給 builder executor 的 model ID")
+    p_tick.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "builder model ID 預設值；spec frontmatter 宣告 executor/model_id 時逐 slice 覆寫；"
+            "明確指定的 (executor, model) 須為 model-identities 已註冊身分"
+        ),
+    )
     p_tick.add_argument(
         "--review-executor", choices=sorted(_ARGV_BUILDERS), default=None,
         help="foreign reviewer executor",
@@ -238,8 +252,27 @@ def main(
     if args.cmd == "ready":
         predicate = is_satisfied if is_satisfied is not None else autonomy.default_is_satisfied
         metas = autonomy.scan_specs(args.specs_dir)
+        batch_ids = {
+            slice_id
+            for meta in metas
+            if isinstance((slice_id := meta.get("slice_id")), str) and slice_id
+        }
         try:
             ready = autonomy.ready_units(metas, predicate)
+            for meta in metas:
+                slice_id = meta.get("slice_id")
+                if not isinstance(slice_id, str) or not slice_id:
+                    continue
+                for dep in meta.get("depends_on", []):
+                    if predicate(dep):
+                        continue
+                    reason = autonomy.classify_batch_dependency(
+                        dep,
+                        batch_ids=batch_ids,
+                        handoff_dir=autonomy.DEFAULT_HANDOFF_DIR,
+                    )
+                    if reason and reason.startswith("deps-unknown:"):
+                        print(f"診斷: {slice_id} {reason}", file=sys.stderr)
             print(json.dumps(ready, ensure_ascii=False))
             return 0
         except (ValueError, autonomy.DispatchReadyRequiresLauncherError) as exc:

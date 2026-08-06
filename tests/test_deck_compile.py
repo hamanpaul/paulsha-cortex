@@ -285,11 +285,12 @@ def test_compile_quotes_plan_ref_for_frontmatter(tmp_path):
 def test_compile_frontmatter_exact_keyset(tmp_path):
     from paulsha_cortex.deck.schema import EMITTED_FRONTMATTER_FIELDS
 
+    runtime_only = {"executor", "model_id"}
     cards, combo = _feature_oneshot(tmp_path)
     result = compile_combo(combo, cards, "示例 LED 功能", change="demo", allow_external=True)
     for slice_doc in result.slices:
         block = slice_doc.content.split("---\n")[1]
-        assert set(yaml.safe_load(block)) == set(EMITTED_FRONTMATTER_FIELDS)
+        assert set(yaml.safe_load(block)) == set(EMITTED_FRONTMATTER_FIELDS) - runtime_only
 
 
 def test_requires_uncovered_blocks_without_allow_external(tmp_path):

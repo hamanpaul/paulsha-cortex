@@ -1354,7 +1354,7 @@ def test_runtime_status_provider_classifies_held_units(monkeypatch, tmp_path):
     assert status["held"] == [
         {"slice_id": "slice-no-plan", "reasons": ["no-plan"]},
         {"slice_id": "slice-held", "reasons": ["dispatch-hold"]},
-        {"slice_id": "slice-blocked", "reasons": ["deps-unsatisfied:slice-dep"]},
+        {"slice_id": "slice-blocked", "reasons": ["deps-unknown:slice-dep"]},
     ]
     assert {item["slice_id"] for item in status["held"]} == {"slice-no-plan", "slice-held", "slice-blocked"}
 
@@ -1672,7 +1672,7 @@ def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path
         handoff_dir=str(tmp_path / "handoff"),
         launcher=launcher,
         default_executor="copilot",
-        default_model="claude-haiku-4.5",
+        default_model="gpt-5.4",
         run_tick_fn=fake_run_tick,
         scan_specs_fn=lambda specs_dir: [],
         auto_claim_fn=lambda: [],
@@ -1681,7 +1681,7 @@ def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path
     runner()
 
     assert calls and calls[0]["dispatcher"] is dispatcher
-    assert captured[0] == {"executor": "copilot", "model": "claude-haiku-4.5"}
+    assert captured[0] == {"executor": "copilot", "model": "gpt-5.4"}
 
 
 def test_dispatch_no_plan(monkeypatch, tmp_path):
