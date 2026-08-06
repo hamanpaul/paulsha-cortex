@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: fix-persona-catalog-portability
+work_item: fix-persona-catalog-portability-v2
 ---
 
 ## Goals
@@ -24,4 +24,4 @@ work_item: fix-persona-catalog-portability
 
 ### Modified Capabilities
 
-- `trusted-dispatch-completion`：deterministic ResultVerification 的 persona catalog 來源解析。詳見 `docs/superpowers/specs/fix-persona-catalog-portability-spec.md` 的 Requirements 與 `docs/superpowers/specs/fix-persona-catalog-portability-design.md` 的 Decisions。
+- `trusted-dispatch-completion`：deterministic ResultVerification 的 persona catalog 來源解析。詳見 `docs/superpowers/specs/fix-persona-catalog-portability-v2-spec.md` 的 Requirements 與 `docs/superpowers/specs/fix-persona-catalog-portability-v2-design.md` 的 Decisions。

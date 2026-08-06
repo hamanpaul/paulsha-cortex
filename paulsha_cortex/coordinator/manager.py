@@ -2527,7 +2527,11 @@ def _terminal_parse_diagnostics(
 
 # #261 R2：會實際跑確定性 gate 的 phase。這些 phase 的 `passed` 必須有 manager 獨立
 # 產生的 gate ledger 背書；plan card 不改動 candidate、不跑 gate，故不在此列。
-GATE_LEDGER_REQUIRED_PHASES = frozenset({"build", "verify"})
+# #313：verify 亦不在此列——verification 卡以 review-only 沙箱啟動，
+# `launcher._should_run_gates` 依設計不讓唯讀 reviewer 跑 gate（也不寫 ledger），
+# 要求 ledger 等於讓 verification 卡結構性永不可過；verify 的獨立證據層是
+# deterministic verification report 管線（schema／binding／report 重驗）。
+GATE_LEDGER_REQUIRED_PHASES = frozenset({"build"})
 
 
 def _assert_terminal_gate_consistency(
@@ -3160,6 +3164,53 @@ def _write_workflow_input_content(
     return str(path)
 
 
+_CHECKBOX_VOLATILE_PLAN_BASENAMES = frozenset({"tasks.md", "todo.md"})
+_CHECKBOX_RE = re.compile(r"^(\s*(?:[-+*]|\d+[.)])\s+)\[[xX]\]", re.M)
+
+
+def _checkbox_insensitive_equal(baseline: bytes, current: bytes) -> bool:
+    """#310：卡片契約要求 builder 勾選 tasks/todo 的 checkbox；只有 checkbox
+    狀態差異（``- [x]``→``- [ ]`` 正規化後相等）視為未漂移。任何其他 byte 差異
+    仍屬 drift。"""
+    try:
+        base_text = baseline.decode("utf-8")
+        cur_text = current.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    normalize = lambda text: _CHECKBOX_RE.sub(lambda m: m.group(1) + "[ ]", text)
+    return normalize(base_text) == normalize(cur_text)
+
+
+def _authority_map_with_checkbox_tolerance(run, *, candidate_root: Path) -> dict[str, str]:
+    """#310 補遺：reviewer 的 frozen authority 驗證沿用 checkbox-insensitive 容忍。
+
+    tasks/todo（kind=plan）在候選 worktree 的 checkbox 勾選不視為 drift；容忍
+    成立時以候選內容的實際 hash 作為 pinned 期望值——reviewer 收到的 input
+    snapshot 就是這份內容，hash 必須對得上實檔。其他差異維持 baseline，使
+    `verify_authority_in_input_snapshot` 照舊 fail-closed。baseline bytes 取自
+    operator_root 的同 ref 檔案，且必須先驗證其 hash 等於 authority baseline。
+    """
+    operator_root = Path(run.workspace_root).resolve()
+    mapping: dict[str, str] = {}
+    for item in run.planning_authority:
+        expected = item.baseline_sha256
+        if item.kind == "plan" and Path(item.ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES:
+            candidate_matches = _safe_input_matches(candidate_root, item.ref)
+            baseline_matches = _safe_input_matches(operator_root, item.ref)
+            if len(candidate_matches) == 1 and len(baseline_matches) == 1:
+                candidate_data = candidate_matches[0].read_bytes()
+                baseline_data = baseline_matches[0].read_bytes()
+                digest = hashlib.sha256(candidate_data).hexdigest()
+                if (
+                    digest != expected
+                    and hashlib.sha256(baseline_data).hexdigest() == expected
+                    and _checkbox_insensitive_equal(baseline_data, candidate_data)
+                ):
+                    expected = digest
+        mapping[item.ref] = expected
+    return mapping
+
+
 def _workflow_input_snapshot(
     *,
     run,
@@ -3230,7 +3281,26 @@ def _workflow_input_snapshot(
             digest = hashlib.sha256(data).hexdigest()
             bound = authority.get(ref)
             if bound is not None and digest != bound.baseline_sha256:
-                raise ValueError("workflow planning input drift")
+                # #310：tasks/todo（kind=plan）的 checkbox 勾選是卡片契約的既定
+                # 行為，不得視為 drift。baseline bytes 取自 operator_root 的同
+                # ref 檔案，且必須先驗證其 hash 等於 authority baseline，才可
+                # 作為 checkbox-insensitive 比對的基準；其餘任何差異 fail-closed。
+                tolerated = False
+                if (
+                    bound.kind == "plan"
+                    and Path(ref).name in _CHECKBOX_VOLATILE_PLAN_BASENAMES
+                ):
+                    baseline_matches = _safe_input_matches(operator_root, ref)
+                    if len(baseline_matches) == 1:
+                        baseline_data = baseline_matches[0].read_bytes()
+                        if (
+                            hashlib.sha256(baseline_data).hexdigest()
+                            == bound.baseline_sha256
+                            and _checkbox_insensitive_equal(baseline_data, data)
+                        ):
+                            tolerated = True
+                if not tolerated:
+                    raise ValueError("workflow planning input drift")
             pattern_has_authority = any(
                 fnmatch.fnmatch(candidate_ref, pattern) for candidate_ref in authority
             )
@@ -5418,13 +5488,19 @@ _LEGACY_CARD_EXECUTION = {
     ),
     "tdd-red": (
         "superpowers:test-driven-development",
-        "Use the accepted plan to add and commit a reproducible RED regression test.",
+        "Use the accepted plan to add and commit a reproducible RED regression test. "
+        "In pinned planning files (tasks.md / todo.md) you may ONLY toggle checkbox "
+        "state; never edit, rephrase, or annotate their text — any wording change "
+        "is planning-input drift and fails the run.",
         "required",
         "red-required",
     ),
     "subagent-build": (
         "superpowers:subagent-driven-development",
-        "Implement the accepted plan with the minimum diff and commit a tested candidate HEAD.",
+        "Implement the accepted plan with the minimum diff and commit a tested candidate HEAD. "
+        "In pinned planning files (tasks.md / todo.md) you may ONLY toggle checkbox "
+        "state; never edit, rephrase, or annotate their text — any wording change "
+        "is planning-input drift and fails the run.",
         "required",
         "focused",
     ),
@@ -5519,7 +5595,20 @@ def _workflow_job_prompt(
                 "schema_version", "kind", "reason", "findings", "reports",
                 *(["authority_hashes"] if authority_hashes_expected else []),
             ],
-            "fixed": {"schema_version": 1, "kind": "workflow-review-result"},
+            "fixed": {
+                "schema_version": 1,
+                "kind": "workflow-review-result",
+                # #315 補遺 2：sonnet reviewer 對「actually opened」措辭的條件性
+                # 解讀會整組省略 authority_hashes（實測 2/2）。expected 值由
+                # manager 原樣提供，列入 fixed 要求逐字照抄——照抄本身即攻證
+                # 「收到的 frozen authority 與 pinned hash 一致」；harvest 端
+                # 的精確比對不變。
+                **(
+                    {"authority_hashes": dict(authority_hashes_expected)}
+                    if authority_hashes_expected
+                    else {}
+                ),
+            },
             # #261 R1：選填欄位；review verdict 仍由 findings 決定，status 只用來
             # 誠實表達「這張 review card 自己沒能完成」。
             "optional": ["status"],
@@ -5543,9 +5632,10 @@ def _workflow_job_prompt(
         if authority_hashes_expected:
             terminal_schema["authority_hashes"] = {
                 "description": (
-                    "Echo back the pinned sha256 for every frozen planning authority ref you "
-                    "actually opened in source_material; the verdict is rejected unless it "
-                    "matches exactly."
+                    "MANDATORY: copy the expected mapping below verbatim into the "
+                    "authority_hashes field of your terminal JSON. It attests the frozen "
+                    "planning authority you received; the verdict is rejected if the field "
+                    "is missing or differs in any way."
                 ),
                 "expected": dict(authority_hashes_expected),
             }
@@ -6045,7 +6135,10 @@ def _dispatch_workflow_card(
     effective_inputs = _effective_workflow_inputs(run, step)
     if step.persona == "reviewer":
         reviewer_target = effective_repo_root
-        authority_map = {item.ref: item.baseline_sha256 for item in run.planning_authority}
+        # #310 補遺：checkbox 容忍成立的 tasks/todo 以候選實際 hash 為 pinned 期望值。
+        authority_map = _authority_map_with_checkbox_tolerance(
+            run, candidate_root=reviewer_target
+        )
         effective_inputs = _reviewer_input_patterns(run, effective_inputs)
         input_snapshot = _workflow_input_snapshot(
             run=run,

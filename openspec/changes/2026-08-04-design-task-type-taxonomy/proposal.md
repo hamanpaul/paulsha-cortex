@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: design-task-type-taxonomy
+work_item: design-task-type-taxonomy-v2
 ---
 
 ## Goals
@@ -22,4 +22,4 @@ repo 內存在至少四種互不相干的 task 分類軸，且無 issue 明確�
 ## Capabilities
 
 ### Modified Capabilities
-- `persona-workflow-orchestration`：詳見 `docs/superpowers/specs/design-task-type-taxonomy-spec.md` 的 Requirements 與 `docs/superpowers/specs/design-task-type-taxonomy-design.md` 的 Decisions。
+- `persona-workflow-orchestration`：詳見 `docs/superpowers/specs/design-task-type-taxonomy-v2-spec.md` 的 Requirements 與 `docs/superpowers/specs/design-task-type-taxonomy-v2-design.md` 的 Decisions。

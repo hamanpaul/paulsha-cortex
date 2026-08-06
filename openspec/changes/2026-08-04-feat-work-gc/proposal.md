@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: feat-work-gc
+work_item: feat-work-gc-v2
 ---
 
 ## Goals
@@ -23,4 +23,4 @@ cortex 每批次派工產生的 build 產物沒有生命週期回收，v0.1.0 �
 ## Capabilities
 
 ### Modified Capabilities
-- `governed-delivery-closure`：新增交付後產物回收（proposal-first、內容層 merged 驗證、fail-safe 保留、registry 唯讀）要求；詳見 `docs/superpowers/specs/feat-work-gc-spec.md` 的 Requirements 與 `docs/superpowers/specs/feat-work-gc-design.md` 的 Decisions。
+- `governed-delivery-closure`：新增交付後產物回收（proposal-first、內容層 merged 驗證、fail-safe 保留、registry 唯讀）要求；詳見 `docs/superpowers/specs/feat-work-gc-v2-spec.md` 的 Requirements 與 `docs/superpowers/specs/feat-work-gc-v2-design.md` 的 Decisions。

@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: feat-work-gc
+work_item: feat-work-gc-v2
 ---
 
 # feat-work-gc Specification

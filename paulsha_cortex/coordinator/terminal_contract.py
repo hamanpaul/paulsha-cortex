@@ -568,6 +568,20 @@ def authorize_terminal(
     # 模型自述的 gate 宣告必須與 ledger 一致：宣稱跑了 ledger 沒有的 gate，或宣稱
     # 的結果與 ledger 不符，都是 R2 定義的矛盾（前者代表自述不可信，後者已被上面
     # 的迴圈攔下，這裡補上「宣稱 failed 卻整體 passed」這類不一致）。
+    #
+    # #308：operator 顯式零 gate（ledger 存在但 gates 為空）時跳過此對照——此設定
+    # 依 #261 文件本就沒有 R2 保護，空 ledger 下沒有可對照的獨立證據層；模型自述
+    # 不構成授權，對照它只會讓授權結果隨模型是否填寫 gate_evidence 而隨機化
+    # （gpt-5.4 會把 shell 指令如 `pwd` 填進 gate_evidence）。ledger 非空時維持
+    # fail-closed。
+    if not outcomes:
+        return TerminalAuthorization(
+            status="passed",
+            authorized=True,
+            verified_gates=(),
+            ledger_digest=digest,
+            legacy=envelope.legacy,
+        )
     for item in envelope.gate_evidence:
         name = item["name"]
         if name not in outcomes:

@@ -7,6 +7,31 @@
 
 ## [Unreleased]
 ### Fixed
+- **abandon 尋址窗口放寬至全額認領**：abandon 校驗 run refs 與 authority 全等；窗口期舊識別全額認領（撤 openspec exclude）、-v2 暫撤 openspec link。
+- **舊識別墓碑 todo（abandon 尋址窗口）**：authority 需檔案級來源，-v2 遷移後舊識別無檔化致 abandon 不可尋址；暫置墓碑 todo，abandon 後移除。
+- **-v2 issue links 暫撤（abandon 尋址窗口）**：解 issue contested → authority ambiguous → abandon 無從尋址的死鎖；隨後還原並補 excludes（abandon 先於 exclude 的正確時序）。
+- **-v2 excludes 收窄至 openspec ref**：保留舊識別可尋址性（abandon 需 authority），僅排除實際碰撞的 openspec 認領。
+- **-v2 重識別補 excludes 斷開舊識別的 source 認領**：消除 confirmed source collision 造成的 repo provider degraded（比照 dispatch-reliability-batch 先例）。
+### Changed
+- **feat-work-gc 與 design-task-type-taxonomy 重識別為 -v2（#178／#139）**：三代 run 因基礎設施缺陷鏈 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別於修復齊備的 main 重跑。
+### Fixed
+- **封存 14 個 7/25–26 遺留 active OpenSpec changes**：功能已 merge 但缺 specs delta，validate --all 14 fail 擋所有 ship preflight；官方 archive 後 0 failed。
+- **build 卡指引明令 pinned tasks/todo 僅可切換 checkbox**：修正 builder 註記 plan 文字超出 checkbox 容忍造成 drift 卡死。
+- **Issue #315 補遺 3：review StructuredOutput 工具 schema 開放 authority_hashes**：additionalProperties:false 下模型無法交出驗證器要求的攻證欄位（#219 佈線缺口）；工具 schema 開放屬性，必填與比對仍由 manager 驗證。
+- **Issue #315 補遺 2：review 派工 schema 把 authority_hashes 列入 fixed 逐字照抄**：修正 sonnet reviewer 條件性解讀導致整組省略、review terminal 恆 schema invalid；harvest 精確比對不變。
+- **Issue #315 補遺：retry-review 重置時同步失效舊 exited review job**：比照 retry-verify，reset 時標記 failed 讓 resume 走 replacement dispatch。
+- **Issue #315：retry-verify 重置時失效舊 exited verification job**：沙箱已清的舊 job 維持 exited 會讓 dispatch 先 terminalize 而永遠 `input snapshot file missing`；reset 時標記 failed，resume 走 replacement dispatch。
+- **Issue #313：verify phase 移出 gate ledger 必要集**：verification 卡的 review-only 沙箱依設計不寫 ledger，要求 ledger＝verification 卡結構性永不可過。`GATE_LEDGER_REQUIRED_PHASES` 收斂為 `{build}`；verify 的獨立證據層是 deterministic verification report 管線。
+- **Issue #310 補遺：reviewer frozen authority 驗證沿用 checkbox 容忍**：`verify_authority_in_input_snapshot` 的 pinned 期望值改由 `_authority_map_with_checkbox_tolerance` 提供，checkbox 容忍成立的 tasks/todo 以候選實際 hash 比對；其他差異維持 fail-closed。
+- **Issue #310：pinned planning input 對 task checkbox 更新的 drift 容忍**：kind=plan 的 `tasks.md`／`todo.md` 於 raw-hash 不符時做 checkbox-insensitive 比對（baseline 取自 operator_root 並先驗 hash）；其他差異維持 fail-closed。修正卡片契約要求勾選 checkbox 與 verify 派工 drift 檢查的互斥。
+- **Issue #308：零 gate 設定下模型自述 gate_evidence 不再觸發 fail-closed**：ledger `gates: []` 時 `authorize_terminal` 跳過 unknown-gate 對照（#261 文件：零 gate＝無 R2 保護）；ledger 非空維持 fail-closed。
+### Changed
+- **W1 canary v2 檔名對齊（#295／#291）**：build 卡 declared inputs 以 `*<work_id>*` glob 檔名，v2 僅改 frontmatter 導致 declared input missing；檔名與 workstream 目錄補 `-v2` 並同步引用。
+- **W1 canary 重識別為 fix-persona-catalog-portability-v2（#295／#291）**：三代 run 因 #299／#302／#303 基礎設施缺陷 superseded 觸發 #218 世代熔斷，依「-v2 識別」慣例重識別續作（檔案路徑不動）。
+### Fixed
+- **Issue #302：registry 載入層 claim_key 唯一性改為只約束 ongoing runs**：與 abandon→reclaim（#256 D4／#299）語意對齊；重 claim persist 後 manager 重啟不再無法載回狀態檔。run_id 唯一性維持全域。
+- **批次 W1 openspec design.md 補件（#295／#291、#260、#178、#139）**：design kind 的 authority 來源是 `openspec/changes/<change>/design.md`，缺檔時 planning completeness 永遠 incomplete、claim 後 define 繞進 brainstorm 並靜默 needs_human（7/30 批次全卡 define 的根因）。為四個 work item 補上 design.md，使 define 走 planning-complete deterministic 路徑。
+- **Issue #299：planning_released 釋放後同 claim_key 可重新 claim**：`work_bridge.start_canonical_workflow` 的 existing-run reuse guard 原對 `superseded` run 無條件短路，未 honor #256 D4 釋放語意，abandon→reclaim 永久死路。新增 `_claimable_existing_runs` 過濾已釋放 run，未釋放 superseded／done／ongoing 行為不變。
 - **Issue #277：pre-candidate 失敗恢復與 stale candidate 重評**：新增 `recover-pre-candidate` work/slice action 以處置 candidate 為 null 時的 builder 失敗並回收殘留 worktree；修復 completion 對 `candidate-worktree-dirty` 的快照競態，改為在 tick 時以當前 branch HEAD 動態重評。
 - **Issue #286：fanout plan pinning 以 spec 檔自身所在 repo 解析**：修復 `coordinator/autonomy.py` 中 `_infer_repo_root(spec_path)` 於 `PSC_REPO_ROOT` 環境變數存在時盲目回傳 manager host repo 的問題。調整為優先以 `spec_path` 所在目錄向上推導專案 Git repository root；當 spec 位於 manager host 外部的其他 repository（如 `serialwrap` 或 worktree）時，能正確將 relative plan glob 解析至該專案目錄，解決跨 repo ad-hoc 派工觸發 `DispatchReadyError: plan file unreadable` 的問題，並使 `ready` 與 `fanout` 階段對專案 repo_root 的判定維持一致。
 - **Issue #273：修復 Monitor refresh 靜默失敗、同 Repo 多 Checkout 衝突與 Source Collision 歸零缺陷**：

@@ -3,12 +3,8 @@ status: accepted
 work_item: feat-work-gc
 ---
 
-# feat-work-gc Todo
+# feat-work-gc Todo（墓碑——識別已遷移）
 
 ## Tasks
 
-- [ ] 將 issue #178、active OpenSpec change `2026-08-04-feat-work-gc` 與本 Todo 綁定為同一 confirmed Work Item。
-- [ ] coordinator 派工 copilot（gpt-5.4）以 TDD 完成 #178：先寫 RED 測試（squash-merge 判 merged、unmerged 絕不進 apply 清單、dirty worktree 保留、closed-unmerged PR 分支保留），再實作到 GREEN。
-- [ ] ForeignReview（claude／sonnet）review 通過；operator 驗收核可。
-- [ ] `changelog.d/feat-work-gc.md` fragment 已新增且已 commit（R-09 硬性 gate）；`CHANGELOG.md [Unreleased]` 有對應 entry。
-- [ ] 帶 PR 上下文執行 `policy_check`（`--pr-title`／`--pr-body`／`--pr-labels`／`--pr-base-ref`／`--pr-head-ref`）確認 fail: 0；全套 pytest 通過。
+- [x] 識別已由 `feat-work-gc-v2` 接手（世代熔斷）；本 Todo 僅為 abandon 尋址窗口的暫時墓碑，abandon 完成後由終態 PR 移除。

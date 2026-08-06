@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: fix-persona-catalog-portability
+work_item: fix-persona-catalog-portability-v2
 ---
 
 # fix-persona-catalog-portability Plan

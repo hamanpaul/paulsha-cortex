@@ -290,6 +290,23 @@ def _other_owner_ongoing_runs(registry, authority: WorkAuthority) -> list:
     ]
 
 
+def _claimable_existing_runs(registry, claim_key: str) -> list:
+    """#299：同 claim_key 既有 run 中，過濾掉 abandon 已釋放（``superseded`` 且帶
+    ``planning_released`` facet）的歷史紀錄。
+
+    #256 D4 的釋放語意允許同識別重新 claim；released run 若仍參與 reuse guard
+    短路，abandon→reclaim 即永久死路（registry 層的
+    ``_manager_create_workflow_run`` 本已支援以 attempt 鹽化 run_id 建新 run）。
+    其餘狀態（ongoing／done／未釋放的 superseded）維持原短路行為。
+    """
+    return [
+        run
+        for run in registry.list_workflow_runs()
+        if run.claim_key == claim_key
+        and not (run.status == "superseded" and "planning_released" in run.facets)
+    ]
+
+
 def start_canonical_workflow(
     *,
     registry,
@@ -304,7 +321,7 @@ def start_canonical_workflow(
 ):
     """Create/resume the real WorkflowRun for a WorkAuthority claim."""
 
-    existing = [run for run in registry.list_workflow_runs() if run.claim_key == claim_key]
+    existing = _claimable_existing_runs(registry, claim_key)
     existing_run = None
     if existing:
         if len(existing) != 1 or existing[0].repo != authority.repo or existing[0].work_id != authority.work_id:

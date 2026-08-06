@@ -130,6 +130,19 @@ def _claude_review_json_schema(kind: str) -> str:
                 "reason": {"type": "string", "minLength": 1},
                 "findings": {"type": "array", "items": finding},
                 "reports": {"type": "array", "minItems": 1, "items": report},
+                # #315 補遺 3（#219 attestation 缺口）：manager 驗證器在 input
+                # snapshot 含 planning-authority 列時「要求」authority_hashes，
+                # 但本工具 schema additionalProperties:false 之前沒有此屬性——
+                # 模型再遵循 prompt 也交不出來（工具層拒收），review terminal
+                # 恆 schema invalid。是否必填由 manager 依 context 驗證，工具
+                # schema 僅開放屬性。
+                "authority_hashes": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                    },
+                },
             },
         }
     else:

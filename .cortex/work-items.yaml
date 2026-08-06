@@ -387,8 +387,8 @@ work_items:
         ref: docs/superpowers/workstreams/persona-enforce-required-check/todo.md
       - kind: path
         ref: docs/superpowers/specs/persona-enforce-required-check-spec.md
-  fix-persona-catalog-portability:
-    title: persona catalog 可攜性——非 cortex repo verification 不再卡 persona-catalog-unreadable (#295/#291)
+  fix-persona-catalog-portability-v2:
+    title: persona catalog 可攜性 v2 重識別——#218 世代熔斷後續作 (#295/#291)
     links:
       - kind: github_issue
         ref: hamanpaul/paulsha-cortex#295
@@ -397,9 +397,13 @@ work_items:
       - kind: openspec
         ref: 2026-08-04-fix-persona-catalog-portability
       - kind: path
-        ref: docs/superpowers/workstreams/fix-persona-catalog-portability/todo.md
+        ref: docs/superpowers/workstreams/fix-persona-catalog-portability-v2/todo.md
       - kind: path
-        ref: docs/superpowers/specs/fix-persona-catalog-portability-spec.md
+        ref: docs/superpowers/specs/fix-persona-catalog-portability-v2-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-persona-catalog-portability-v2-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-persona-catalog-portability-v2.md
   fix-repair-commit-recovery:
     title: repair commit 缺 terminal evidence 的窄化恢復與 stale job 選擇修正 (#260)
     links:
@@ -412,27 +416,29 @@ work_items:
       - kind: path
         ref: docs/superpowers/specs/fix-repair-commit-recovery-spec.md
   feat-work-gc:
-    title: cortex work gc——proposal-first 產物生命週期回收 (#178)
+    title: feat-work-gc（已由 -v2 重識別接手；舊 runs 為 superseded 審計）
     links:
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#178
-      - kind: openspec
-        ref: 2026-08-04-feat-work-gc
       - kind: path
         ref: docs/superpowers/workstreams/feat-work-gc/todo.md
-      - kind: path
-        ref: docs/superpowers/specs/feat-work-gc-spec.md
   design-task-type-taxonomy:
-    title: task_type taxonomy 契約定案與骨架——#8 叢集基礎 (#139)
+    title: design-task-type-taxonomy（已由 -v2 重識別接手；舊 runs 為 superseded 審計）
     links:
-      - kind: github_issue
-        ref: hamanpaul/paulsha-cortex#139
-      - kind: openspec
-        ref: 2026-08-04-design-task-type-taxonomy
       - kind: path
         ref: docs/superpowers/workstreams/design-task-type-taxonomy/todo.md
+  feat-work-gc-v2:
+    title: cortex work gc v2 重識別——世代熔斷後續作 (#178)
+    links:
       - kind: path
-        ref: docs/superpowers/specs/design-task-type-taxonomy-spec.md
+        ref: docs/superpowers/workstreams/feat-work-gc-v2/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/feat-work-gc-v2-spec.md
+  design-task-type-taxonomy-v2:
+    title: task_type taxonomy v2 重識別——世代熔斷後續作 (#139)
+    links:
+      - kind: path
+        ref: docs/superpowers/workstreams/design-task-type-taxonomy-v2/todo.md
+      - kind: path
+        ref: docs/superpowers/specs/design-task-type-taxonomy-v2-spec.md
   feat-slice-executor-model:
     title: per-slice executor/model 宣告與 depends_on 顯式診斷 (#294)
     links:

@@ -1,6 +1,6 @@
 ---
 status: accepted
-work_item: design-task-type-taxonomy
+work_item: design-task-type-taxonomy-v2
 ---
 
 ## ADDED Requirements

@@ -304,9 +304,19 @@ class JobRegistry:
             raise ValueError(
                 f"coordinator 狀態檔 workflow 格式錯誤（fail-closed）: {self._state_path}: {exc}"
             ) from exc
-        claim_keys = [run.claim_key for run in validated_workflows]
+        # claim_key 唯一性只約束 ongoing runs：abandon→reclaim（#256 D4／#299）會讓
+        # released（superseded＋planning_released）歷史 row 與新 ongoing run 合法共用同
+        # 一 claim_key（_manager_create_workflow_run 以 attempt 鹽化 run_id）。全域唯一
+        # 性會讓重 claim persist 後的狀態檔無法重新載入（manager 重啟即 brick）。
+        # run_id 唯一性維持全域 fail-closed。
+        ongoing_claim_keys = [
+            run.claim_key for run in validated_workflows if run.status == "ongoing"
+        ]
         run_ids = [run.run_id for run in validated_workflows]
-        if len(set(claim_keys)) != len(claim_keys) or len(set(run_ids)) != len(run_ids):
+        if (
+            len(set(ongoing_claim_keys)) != len(ongoing_claim_keys)
+            or len(set(run_ids)) != len(run_ids)
+        ):
             raise ValueError(f"coordinator 狀態檔 workflow 重複識別（fail-closed）: {self._state_path}")
         self._validate_legacy_records(legacy_records)
         self._jobs = jobs
@@ -1636,6 +1646,18 @@ class JobRegistry:
         build_steps = [step for step in current.steps if step.phase == "build"]
         if not build_steps or any(step.gate_result != "passed" for step in build_steps):
             raise ValueError("retry-verify reset requires completed build phase")
+        # #315：operator 已以 CAS 顯式授權重跑 verification；舊 exited verify job
+        # 的 reviewer sandbox 依設計已清除、terminal 證據不可重驗，維持 "exited"
+        # 會讓 dispatch 先 terminalize 舊 job 而永遠卡在 input-snapshot-missing。
+        # 標記 failed 讓 explicit resume 走 replacement dispatch；build phase job
+        # 與 active job（前面 admission 已擋）不受影響。
+        for job in self._jobs:
+            if (
+                job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_phase") == "verify"
+                and job.get("status") == "exited"
+            ):
+                job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "verify" else step
             for step in current.steps
@@ -1700,6 +1722,17 @@ class JobRegistry:
         verify_steps = [step for step in current.steps if step.phase == "verify"]
         if not verify_steps or any(step.gate_result != "passed" for step in verify_steps):
             raise ValueError("retry-review reset requires completed verify phase")
+        # #315（review 版）：operator 已以 CAS 顯式授權重跑 review；舊 exited
+        # review job 的 reviewer sandbox 已清、terminal 不可重驗，維持 "exited"
+        # 會讓 resume 先 terminalize 舊 job 而卡死。標記 failed 讓 explicit
+        # resume 走 replacement dispatch；verify／build job 不受影響。
+        for job in self._jobs:
+            if (
+                job.get("workflow_run_id") == current.run_id
+                and job.get("workflow_phase") == "review"
+                and job.get("status") == "exited"
+            ):
+                job["status"] = "failed"
         steps = tuple(
             replace(step, gate_result="pending") if step.phase == "review" else step
             for step in current.steps
