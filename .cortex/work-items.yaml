@@ -450,6 +450,10 @@ work_items:
         ref: docs/superpowers/workstreams/feat-slice-executor-model/todo.md
       - kind: path
         ref: docs/superpowers/specs/feat-slice-executor-model-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/feat-slice-executor-model-design.md
+      - kind: path
+        ref: docs/superpowers/plans/feat-slice-executor-model.md
   fix-preflight-closeout-order:
     title: 本地 closeout 先於 PR metadata preflight 與 frozen artifacts materialize (#263)
     links:
@@ -461,6 +465,10 @@ work_items:
         ref: docs/superpowers/workstreams/fix-preflight-closeout-order/todo.md
       - kind: path
         ref: docs/superpowers/specs/fix-preflight-closeout-order-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/fix-preflight-closeout-order-design.md
+      - kind: path
+        ref: docs/superpowers/plans/fix-preflight-closeout-order.md
   feat-task-type-combo-selector:
     title: task_type 自動選 combo 與 fix-standard combo (#202)
     links:
@@ -472,3 +480,7 @@ work_items:
         ref: docs/superpowers/workstreams/feat-task-type-combo-selector/todo.md
       - kind: path
         ref: docs/superpowers/specs/feat-task-type-combo-selector-spec.md
+      - kind: path
+        ref: docs/superpowers/specs/feat-task-type-combo-selector-design.md
+      - kind: path
+        ref: docs/superpowers/plans/feat-task-type-combo-selector.md
