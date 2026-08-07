@@ -62,7 +62,7 @@ def _add_work_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reason")
     parser.add_argument(
         "--combo",
-        help="start 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
+        help="start／intake 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
     )
     toggle = parser.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_const", dest="enabled", const=True)
@@ -148,10 +148,11 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         "reviewer_executor",
         "reviewer_model",
     )
-    # combo 只在 start action 有意義（--combo 為 start 專用 override）；其餘
-    # action 一律不送出，避免未經驗證的 combo 被夾帶進 manager（見 code review
-    # finding，contract.validate_request 的 fail-closed 是最終防線）。
-    if args.action == "start":
+    # combo 只在 start／intake action 有意義（--combo 為 start／intake 專用
+    # override，intake 內部等價於 start）；其餘 action 一律不送出，避免未經
+    # 驗證的 combo 被夾帶進 manager（見 code review finding，
+    # contract.validate_request 的 fail-closed 是最終防線）。
+    if args.action in {"start", "intake"}:
         provided_names = provided_names + ("combo",)
     payload = {
         "action": args.action,

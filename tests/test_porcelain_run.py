@@ -208,6 +208,29 @@ def test_run_work_resume_drops_combo(
     assert capsys.readouterr().err == ""
 
 
+def test_run_work_intake_forwards_combo(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """issue #203：intake 內部等價於 start，porcelain 也要轉送 --combo。"""
+
+    assert (
+        _run_cli(
+            [
+                "run", "work", "intake", "porcelain-run-combo",
+                "--repo", "hamanpaul/paulsha-cortex",
+                "--combo", "fix-standard",
+            ]
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert request["args"]["action"] == "intake"
+    assert request["args"]["combo"] == "fix-standard"
+    assert capsys.readouterr().err == ""
+
+
 def test_run_without_wait_prints_accepted_request_tracking_block(
     control_runtime: Path,
     capsys: pytest.CaptureFixture[str],

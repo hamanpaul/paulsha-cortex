@@ -47,6 +47,33 @@ def work_items_snapshot_path() -> Path:
     return monitor_state_root() / "work-items.snapshot.json"
 
 
+def skill_registry_root() -> Path:
+    """Skill governance 治理平面根目錄（issue #204）：ledger／park state／proposal 共用。
+
+    未宣告獨立 `PSC_*` override——沿用 `agents_root()`（已支援 `PSC_AGENTS_ROOT`
+    覆寫）底下的 `registry` 子目錄，理由：這是 `~/.agents` 樹的 mutable runtime
+    狀態，跟 coordinator/control/specs/monitor 屬同一族，沒必要另開一個環境變數
+    造成 path 契約碎片化。
+    """
+    return agents_root() / "registry"
+
+
+def skill_usage_ledger_path() -> Path:
+    """Append-only skill usage event ledger（`schema_version`/`event_id`/... 見
+    `paulsha_cortex.coordinator.skill_ledger`）。"""
+    return skill_registry_root() / "skill_usage.jsonl"
+
+
+def skill_park_state_path() -> Path:
+    """目前已 park 的 skill 清單（可逆狀態，不含歷史紀錄／ledger 本身）。"""
+    return skill_registry_root() / "skill_park.json"
+
+
+def skill_park_proposals_root() -> Path:
+    """Janitor 產生、尚待 operator 核准/已核准的 park proposal 檔案目錄。"""
+    return skill_registry_root() / "skill_park_proposals"
+
+
 def config_root() -> Path:
     return _resolve_root("PSC_CONFIG_ROOT", Path.home() / ".config" / "paulshaclaw")
 

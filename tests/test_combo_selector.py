@@ -73,6 +73,37 @@ def test_fix_standard_manifest_passes_manager_spine() -> None:
     manifest.validate_manager_spine()
 
 
+def test_small_fix_combo_loads_and_passes_schema() -> None:
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", _cards())
+
+    assert combo.id == "small-fix"
+    assert combo.task_type == "small-fix"
+    assert [gate.after for gate in combo.gate_spine] == ["verification", "code-review"]
+
+
+def test_small_fix_manifest_passes_manager_spine() -> None:
+    manifest = default_workflow_manifest("demo-work", change=None, combo_name="small-fix")
+
+    assert manifest.combo == "small-fix"
+    manifest.validate_manager_spine()
+
+
+def test_small_fix_manifest_never_touches_openspec_requires() -> None:
+    """#324 缺口 B：small-fix 全鏈不依賴 openspec proposal，打斷 requires DAG
+    斷鏈——對照組 fix-standard 反而含 openspec，用以區分新舊 combo 行為。"""
+    small_fix = default_workflow_manifest("demo-work", change=None, combo_name="small-fix")
+    fix_standard = default_workflow_manifest("demo-work", change=None, combo_name="fix-standard")
+
+    for step in small_fix.steps:
+        assert "openspec" not in " ".join(step.inputs)
+        assert "openspec" not in " ".join(step.outputs)
+
+    assert any(
+        "openspec" in " ".join(step.inputs) or "openspec" in " ".join(step.outputs)
+        for step in fix_standard.steps
+    )
+
+
 def test_task_types_yaml_maps_fix_to_fix_standard() -> None:
     taxonomy = _taxonomy()
 
@@ -221,6 +252,40 @@ def test_select_combo_override_unknown_combo_fail_closed() -> None:
             {202: "fix(deck): tighten selector wiring"},
             override="no-such-combo",
         )
+
+
+def test_small_fix_sizing_band_not_higher_than_feature_oneshot(tmp_path) -> None:
+    """sizing 自洽（#324 附帶驗證）：small-fix 的 combo 結構（7 卡／2 gate）不
+    大於 feature-oneshot（11 卡／4 gate），``current_sizing_snapshot()`` 算出
+    的 band 因此不應高於 feature-oneshot；同一組人工構造 plan artifact 餵給
+    兩個 combo，避免與 compute_sizing_score 內部權重耦合太緊。"""
+    from paulsha_cortex.coordinator.work_bridge import current_sizing_snapshot
+
+    (tmp_path / "tasks.md").write_text(
+        "---\ndomain_breadth: 1\nstate_consistency: 1\n---\n# Tasks\n## Task 1\nBuild.\n",
+        encoding="utf-8",
+    )
+    rows = [{"kind": "plan", "ref": "tasks.md"}]
+
+    small_fix_total, small_fix_band = current_sizing_snapshot(
+        workspace_root=tmp_path, combo_name="small-fix", artifact_rows=rows
+    )
+    feature_total, feature_band = current_sizing_snapshot(
+        workspace_root=tmp_path, combo_name="feature-oneshot", artifact_rows=rows
+    )
+
+    assert small_fix_total is not None and feature_total is not None
+    band_rank = {"green": 0, "yellow": 1, "red": 2}
+    assert band_rank[small_fix_band] <= band_rank[feature_band]
+    assert small_fix_total <= feature_total
+
+    # 結構性事實才是本測試非空性的落點：small-fix 的 card/gate 規模嚴格小於
+    # feature-oneshot，即便五維 sizing 因門檻飽和而打平，這條斷言仍會在
+    # small-fix.yaml 被改成跟 feature-oneshot 一樣大時失敗。
+    small_fix = _combo_catalog()["small-fix"]
+    feature_oneshot = _combo_catalog()["feature-oneshot"]
+    assert len(small_fix.cards) < len(feature_oneshot.cards)
+    assert len(small_fix.gate_spine) < len(feature_oneshot.gate_spine)
 
 
 def test_select_combo_deterministic() -> None:

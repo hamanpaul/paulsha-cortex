@@ -24,9 +24,10 @@ from paulsha_cortex.deck.compile import compile_combo
 from paulsha_cortex.deck.selector import ComboSelection, ComboSelectionError, select_combo
 from paulsha_cortex.deck.schema import (
     DEFAULT_CARDS_PATH,
-    DEFAULT_COMBOS_DIR,
+    iter_combo_files,
     load_cards,
     load_combo,
+    resolve_combo_path,
 )
 from paulsha_cortex.deck.task_types import load_task_types
 
@@ -151,7 +152,7 @@ def resolve_trusted_repo_root(repo: str, *, explicit: object = None) -> Path:
 
 def _combo_catalog(cards) -> dict[str, object]:
     catalog: dict[str, object] = {}
-    for combo_file in sorted(DEFAULT_COMBOS_DIR.glob("*.yaml")):
+    for combo_id, combo_file in iter_combo_files():
         combo = load_combo(combo_file, cards)
         catalog[combo.id] = combo
     return catalog
@@ -168,7 +169,7 @@ def _combo_selection_payload(selection: ComboSelection) -> dict[str, str | None]
 
 def default_workflow_manifest(work_id: str, *, change: str | None, combo_name: str = "feature-oneshot"):
     cards = load_cards(DEFAULT_CARDS_PATH)
-    combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo_name}.yaml", cards)
+    combo = load_combo(resolve_combo_path(combo_name), cards)
     result = compile_combo(
         combo,
         cards,
@@ -245,7 +246,7 @@ def current_sizing_snapshot(
         if plan_artifact is None:
             return None, None
         cards = load_cards(DEFAULT_CARDS_PATH)
-        combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo_name}.yaml", cards)
+        combo = load_combo(resolve_combo_path(combo_name), cards)
         # combo.cards 只存 ComboEntry(ref, depends_on)——persona_binding 是card
         # 本身（load_cards 的字典）的欄位，須用 ref 查表，見 deck/schema.py。
         persona_binding_count = sum(

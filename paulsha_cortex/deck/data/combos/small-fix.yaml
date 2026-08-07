@@ -1,0 +1,16 @@
+combo:
+  id: small-fix
+  task_type: small-fix
+  cards:
+    - ref: workflow-claim
+    - ref: brainstorming
+    - ref: writing-plans-light
+    - ref: subagent-build
+    - ref: verification
+    - ref: code-review
+    - ref: policy-commit
+  gate_spine:
+    - after: verification
+      exists: ["reports/verify/*<task-slug>*.md"]
+    - after: code-review
+      exists: ["reports/review/*<task-slug>*.md"]

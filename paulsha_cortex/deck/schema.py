@@ -66,6 +66,47 @@ class DeckSchemaError(ValueError):
     """deck 資料載入／驗證錯誤（fail-closed：任一錯即整批拒載）。"""
 
 
+def instance_combos_dir() -> Path:
+    """`$PSC_AGENTS_ROOT/config/combos/`——instance-local combo override 目錄。
+
+    函式內 import 避免頂層循環依賴風險（比照 `porcelain/init_sample.py` 既有慣例）。
+    """
+    from paulsha_cortex.config import paths as _paths
+
+    return _paths.agents_root() / "config" / "combos"
+
+
+def combo_search_dirs(*, package_dir: Path = DEFAULT_COMBOS_DIR) -> tuple[Path, ...]:
+    """依優先序回傳實際存在的 combo 搜尋目錄：instance-local 先於套件內建。
+
+    `package_dir` 可由呼叫端注入，讓 `deck/cli.py` 這類模組保留自己的
+    `DEFAULT_COMBOS_DIR` module-level 繫結供既有測試 monkeypatch。
+    """
+    candidates = (instance_combos_dir(), package_dir)
+    return tuple(d for d in candidates if d.is_dir())
+
+
+def resolve_combo_path(combo_id: str, *, package_dir: Path = DEFAULT_COMBOS_DIR) -> Path:
+    """依 `combo_search_dirs()` 順序尋找 `<combo_id>.yaml`；找不到則 fail-closed。"""
+    dirs = combo_search_dirs(package_dir=package_dir)
+    for directory in dirs:
+        candidate = directory / f"{combo_id}.yaml"
+        if candidate.is_file():
+            return candidate
+    searched = ", ".join(str(d) for d in dirs) if dirs else "(無搜尋目錄存在)"
+    raise DeckSchemaError(f"combo 未找到: {combo_id}（搜尋過: {searched}）")
+
+
+def iter_combo_files(*, package_dir: Path = DEFAULT_COMBOS_DIR) -> list[tuple[str, Path]]:
+    """列舉可用 combo（依 id 排序、去重）：instance-local 同 id 覆蓋套件內建。"""
+    found: dict[str, Path] = {}
+    for directory in combo_search_dirs(package_dir=package_dir):
+        for path in sorted(directory.glob("*.yaml")):
+            if path.stem not in found:
+                found[path.stem] = path
+    return sorted(found.items())
+
+
 @dataclass(frozen=True)
 class Card:
     id: str
