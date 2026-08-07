@@ -19,12 +19,14 @@ roles:
     skills: [brainstorming, openspec-propose, writing-plans, mcu-hw-evidence]
   builder:
     role: builder
-    version: "2.0.0"
+    version: "2.1.0"
     summary: implements approved build slices within bounded scope (copilot first, fixers after)
     allowed_phases: [build]
     write_paths: ["**"]
     allowed_tools: ["python -m unittest", "rg", "edit", "git add", "git commit"]
     skills: [worktree-isolation, tdd-red, subagent-build]
+    completion_obligations:
+      - "完成前 MUST 執行 git add 加入本次全部變更並 git commit；worktree 不乾淨（git status --porcelain 非空）即視為未完成，不得回報 passed／完成"
   reviewer:
     role: reviewer
     version: "2.0.0"
