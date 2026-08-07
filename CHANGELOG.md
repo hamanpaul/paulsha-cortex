@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Added
+- **Issue #340：builder persona 契約新增 `completion_obligations`（結束前必須 commit）**：`PersonaContract` 新增 `completion_obligations` 欄位（fail-closed schema 檢查），`personas.yaml` 的 `builder` 角色新增義務宣告「完成前必須 git add＋git commit，worktree 不乾淨不得回報完成」，由 `render_contract_prompt` 注入實際派工的 dispatch prompt，補上既有 `commit_policy: required`（只管寫入權限）與 manager 端事後 dirty-worktree 安全網之間「事前宣告義務」的缺口；空清單角色不受影響。
 ### Fixed
 - **paulshaclaw#264：status 條目補上明確 project 歸屬**：`recent_done`／`attention`／`slices` 現在投影明確的 `repo`；缺少來源時保留 `null`，不從 worktree 或 branch 猜測 project。
 - **Issue #295（primary）／#291（duplicate）：persona catalog 改以套件內建為 canonical 來源，非 cortex repo 的 slice 不再確定性卡 `persona-catalog-unreadable`**：`run_result_verification` 原本無條件從**目標 repo**讀 `paulsha_cortex/persona/personas.yaml`，該檔只存在於 paulsha-cortex 自身，跨 repo 治理必然卡 `needs_human`，且 `dispatch: auto` 又強制要求該 check 無法拿掉。改為先以 `git cat-file -e` 探測 `dispatch_base` tree 是否宣告 repo-local override：存在即維持既有 pin/fail-closed 行為；不存在則回退讀取 `paulsha_cortex.persona.loader.DEFAULT_PERSONAS_PATH` 套件內建 catalog 完成 scope 判定。override 壞損（不可讀／不合法）仍 fail-closed 不靜默回退；cortex repo 自身行為不退化。evidence 新增 `source`（`repo-local`／`packaged`）欄位可稽核判定依據。

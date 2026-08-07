@@ -59,6 +59,15 @@ def load_catalog(path: str | Path | None = None) -> dict[str, PersonaContract]:
             raw_skills = []
         if not isinstance(raw_skills, list) or any(not isinstance(s, str) for s in raw_skills):
             raise ValueError(f"persona catalog schema 不合法: {role}: skills 必須是字串清單")
+        raw_completion_obligations = rec.get("completion_obligations", [])
+        if raw_completion_obligations is None:
+            raw_completion_obligations = []
+        if not isinstance(raw_completion_obligations, list) or any(
+            not isinstance(o, str) for o in raw_completion_obligations
+        ):
+            raise ValueError(
+                f"persona catalog schema 不合法: {role}: completion_obligations 必須是字串清單"
+            )
         catalog[role] = PersonaContract(
             role=rec["role"],
             version=rec["version"],
@@ -67,6 +76,7 @@ def load_catalog(path: str | Path | None = None) -> dict[str, PersonaContract]:
             write_paths=tuple(rec["write_paths"]),
             allowed_tools=tuple(rec["allowed_tools"]),
             skills=tuple(raw_skills),
+            completion_obligations=tuple(raw_completion_obligations),
         )
     _warn_unknown_skills(catalog)
     return catalog

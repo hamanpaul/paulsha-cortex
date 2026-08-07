@@ -43,6 +43,7 @@ def build_persona_context(
         "version": persona.version,
         "allowed_phases": list(persona.allowed_phases),
         "write_paths": list(persona.write_paths),
+        "completion_obligations": list(persona.completion_obligations),
         "effective_tools": effective_tools,
         "overlay": normalized_overlay,
     }

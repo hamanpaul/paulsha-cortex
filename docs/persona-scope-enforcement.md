@@ -29,6 +29,15 @@ work_item: persona-enforce-required-check
 是 fail-safe 的：缺檔、壞 YAML、缺 key、非法值一律退回 `shadow`——最保守，永不
 因設定損毀而誤翻 `enforce`。
 
+`personas.yaml` 每個角色除 `write_paths`／`allowed_tools` 等 scope 欄位外，
+可另宣告 `completion_obligations`（字串清單，預設空，非破壞性擴充）：這是
+「派工前把完成義務講清楚」的事前宣告，會被 `render.render_contract_prompt`
+注入 dispatch prompt（見 `paulsha_cortex/persona/render.py`），與
+`PersonaGuardrail` 的 scope 判定各司其職——後者管「能不能做」，前者管「結束
+前必須做完什麼」。目前僅 `builder` 宣告一條：完成前必須 `git add`＋
+`git commit`，worktree 不乾淨不得回報完成；空清單角色（`manager`／
+`planner`／`reviewer`）不受影響，render 出的 prompt 不新增此段。
+
 ## 切換前的零誤殺回放（R1 / D1）
 
 `enforce` 上線前，先以近期已合併 PR 的實際檔案清單回放 persona scope 判定，
