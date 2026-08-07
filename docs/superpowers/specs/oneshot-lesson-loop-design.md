@@ -16,7 +16,7 @@ work_item: oneshot-lesson-loop
 |---|---|---|
 | `gate_ledger.py` | 由 manager 掌控 wrapper 執行、模型結束**之後**才產生的**確定性 gate 通過/失敗**紀錄（R2 重驗，模型不可自述、不可控） | fail-closed 契約很緊；混入「one-shot 整體品質」這種較軟的分類語意，會污染既有 gate pass/fail 的精確性 |
 | `completion.py` 的 `CompletionRecord.sizing_score`／`sizing_band` | work item **複雜度屬性**的快照（`#222`／design `#208` H.2），每次 repair／re-claim 重算 | 衡量的是「這件事有多難」，不是「這次做得好不好」；band 是輸入特徵，不是 track_record 要的結果標籤 |
-| `engineering_outcome.py` | `#275` 落地的「一個 work item 終局落在哪」outbox，`outcome ∈ {shipped, abandoned, rejected, failed, rolled_back}`（`engineering_outcome.py:37`） | 語意層級是「work item 級終局」而非「one-shot 嘗試品質」——一個 `shipped` outcome 底下可能已經吃了 2 輪 repair，`shipped` 本身無法回答「這次是 clean 還是 fixup」 |
+| `engineering_outcome.py` | `#275` 落地的「一個 work item 終局落在哪」outbox，`outcome ∈ {shipped, abandoned, rejected, failed, rolled_back}`（`engineering_outcome.py:51`-`:56`） | 語意層級是「work item 級終局」而非「one-shot 嘗試品質」——一個 `shipped` outcome 底下可能已經吃了 2 輪 repair，`shipped` 本身無法回答「這次是 clean 還是 fixup」 |
 
 理由：`gate_ledger.py` 與 `CompletionRecord` 的語意早已被既有測試與呼叫端鎖死，混用
 會製造「一個欄位身兼兩種不相干語意」的技術債（正是 issue 偵察階段要避免誤認的兩個
@@ -48,7 +48,7 @@ issue 原文 §6「lesson 進 memory(`knowledge/`) → wakeup 召回」把 lesso
 
 先例：`engineering_outcome.py` 模組 docstring 已明文「本模組也不 import 任何 hippo
 套件——這是外部 learning systems（含 Hippo）消費的唯讀 outbox，Hippo 未安裝時本模組
-的一切行為必須維持不變」（`engineering_outcome.py:22`-`:25`）。lesson payload 的出口
+的一切行為必須維持不變」（`engineering_outcome.py:25`-`:27`）。lesson payload 的出口
 SHALL 沿用同一原則，但 MUST 是獨立檔案／schema（見 R3 的「不可複用同一份
 `engineering-outcomes/<repo-slug>.jsonl`」），因為 outcome 詞彙與粒度不同，混用會讓
 既有 `#275` 消費端（含 Hippo）收到語意混雜的 `outcome` 值。
@@ -104,7 +104,7 @@ R2 已把 `session_health` 定義為不透明 pass-through 欄位，即使某些
 
 ### D5 track_record 是既有終局訊號的下游 reducer，非重複捕捉——但需要一個小型 additive 缺口
 
-查證 `_ship_action`（`work_actions.py:3259`）呼叫 `emit_outcome()` 時傳入的
+查證 `_ship_action`（`work_actions.py:3262`）呼叫 `emit_outcome()` 時傳入的
 `review={"merge_authorization_hash": ...}`（`work_actions.py:3277`-`:3280`），**未包含**
 `fix_rounds`／`finding_count`——即使同一個作用域內 `active.get("repair_rounds", 0)`
 （`work_actions.py:3506`）已經算出這個值可用。`_abandon_action`

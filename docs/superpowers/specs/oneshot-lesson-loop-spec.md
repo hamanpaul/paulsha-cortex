@@ -33,18 +33,18 @@ issue 原文（2026-06-24 起，多則 comment 補充）主張「站在 RL 光�
 - `#325`（token usage 收進 job record）**已落地**：`paulsha_cortex/coordinator/
   registry.py` 的 job record 新增 `usage`／`usage_raw`／`usage_reason`／`started_at`／
   `exited_at` 五欄位（fail-closed schema 檢查於 `registry.py:474` 與 `:479`，寫入於
-  `registry.py:935`／`:959`-`:971`），`paulsha_cortex/coordinator/usage_aggregate.py:15`
+  `registry.py:939`／`:959`-`:971`），`paulsha_cortex/coordinator/usage_aggregate.py:15`
   `aggregate_usage_by_run()` 依 `workflow_run_id` 彙總 `input_tokens`／`output_tokens`／
   `cached_input_tokens`／`reasoning_output_tokens` 四欄位，`cortex stat --usage-by-run`
   暴露唯讀查詢（`paulsha_cortex/coordinator/cli.py:135`）。**這改變了本票 cost 維度的
   設計自由度**——見下方 R1 與 deviations。
 - `#275`（engineering outcome contract）**已落地**：`paulsha_cortex/coordinator/
   engineering_outcome.py` 是「外部 learning systems（含 Hippo）消費的唯讀 append-only
-  outbox」，`_ship_action`／`_abandon_action`（`work_actions.py:3259`／`:2305`）在既有
+  outbox」，`_ship_action`／`_abandon_action`（`work_actions.py:3262`／`:2308`）在既有
   終局轉換（`status="done"`／`status="superseded"`）之前 durable 寫入一筆
   `shipped`／`abandoned` record。**這是本票 D2「cortex 只產出、不管 hippo 召回」邊界
   的既有先例**，但其 outcome 詞彙（`shipped`／`abandoned`／`rejected`／`failed`／
-  `rolled_back`，`engineering_outcome.py:37`）與粒度（一個 work item 的終局轉換，可能
+  `rolled_back`，`engineering_outcome.py:51`-`:56`）與粒度（一個 work item 的終局轉換，可能
   已含多輪 repair）都與本票的 `clean`／`fixup`／`fail`（一次 one-shot 嘗試的品質）不同
   ——不可直接借用同一份 record 當 track_record 的 outcome 值，需要額外欄位（見 D1/D5）。
 - `#209`（model capability envelope）**已落地**：`capable()` 第六項判準已**凍結函式
@@ -96,7 +96,7 @@ task_types.classify_title()` 對 work item 的 mapped issue 標題分類取得
 |---|---|
 | `clean` | ship 終局轉換時，`delivery.ReviewLoop.fix_rounds`（`delivery.py:131`，於 `work_actions.py:3506` 讀作 `active.get("repair_rounds", 0)`）＝`0` |
 | `fixup` | ship 終局轉換達成，但 `fix_rounds ≥ 1`（`delivery.py:39` `MAX_FIX_ROUNDS`／`#218` `repair_budget_for_band()` 之內完成） |
-| `fail` | run 走 `_abandon_action`（`status="superseded"`）終局，或 repair budget 耗盡進入 `needs_human`（`delivery.py:222` `"copilot-finding-budget-exhausted"`）且未再恢復 |
+| `fail` | run 走 `_abandon_action`（`status="superseded"`）終局，或 repair budget 耗盡進入 `needs_human`（`delivery.py:234` `"copilot-finding-budget-exhausted"`）且未再恢復 |
 
 `cost` SHALL 為 reserved、nullable 欄位。**`#325` 已於本批落地**（job record 的
 `usage`／`usage_raw` 欄位、`usage_aggregate.aggregate_usage_by_run()`），本票因此
