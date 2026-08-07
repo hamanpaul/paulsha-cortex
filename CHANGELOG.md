@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Changed
+- **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
 - **Refs #294：slice spec 可宣告 executor/model_id 並於派工前強制 registry 驗證**：`dispatch_ready` 支援逐 slice 的 builder identity 覆寫，unknown identity fail-closed 並列出可用 candidates；同時 `cortex fanout`／`tick` 的明確 `(executor, model)` 與 periodic tick 預設 model 也改為先查 `model-identities.yaml`，避免 typo 直到 session 內才失敗。
 - **Issue #202：task_type 自動選牌與 fix-standard combo**：新增 deck taxonomy loader／selector、`fix-standard` workflow combo、`WorkflowRun.combo_selection` provenance、`cortex work start --combo` authoritative override，以及 `cortex stat --combo-selections` 彙總。Refs #202。
