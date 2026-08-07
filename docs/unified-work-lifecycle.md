@@ -91,6 +91,17 @@ cortex work intake unified-work-lifecycle --repo owner/repo --issue 14 --combo f
 ```
 
 Telegram 等 bot 宿主若要提供「貼一段文字/issue 就進件」的入口，應呼叫 `submit_work_action(action="intake", ...)`（`paulsha_cortex/control/client.py`）；既有的 `/dispatch <slice_id>` 走既存 slice_id 派工，維持原樣不變，不在本次範圍內改動。
+### Work identity migration（設計中，見 ADR-0002）
+
+`link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別
+（例如 `-v2` 世代熔斷）要把一批來源整批從舊 work_id 搬到新 work_id 時，只能
+靠多次分開的 `link`／`unlink` 呼叫加上「等 Monitor 下一次 rescan 確認生效」
+的手動判斷——`hamanpaul/paulsha-cortex#326`–`#330` 是本專案自己實際跑過一次
+的完整記錄，橫跨 5 個 PR、近 9 小時。`docs/adr/0002-work-identity-migration.md`
+定了收斂成單一 `cortex work migrate` 動詞的設計（單一 atomic override
+transaction、凍結 authority 做 abandon CAS、不放寬 `claim.py` 既有的碰撞
+不變量），供後續 code 票直接實作；本文件的 `## CLI` 範例區塊會在該動詞落地
+後同步補上。
 
 `retry-build` payload只接受`{"expected_candidate":"<40-char SHA>"}`。Manager會把它當CAS，不把caller內容當evidence；通常只有ongoing `needs_human` verify/review run、無active job、舊build全passed且Candidate完全相同時，才原子重開最後一張builder card，清除舊verify/review authority並立刻派出新builder。另一個窄化入口只處理final builder terminalization失敗：run必須停在build phase、前置build card全passed、final card pending，而且最新同card job已成功退出（`exited/0`）卻沒有workflow evidence；真正的failed job不符合此入口。所有recovery prompt都要求先檢查worktree是否已有repair commit，並允許builder提交或採用已測試的descendant Candidate；Manager仍獨立驗證exact舊Candidate CAS與單調ancestry。terminalization recovery另要求保留declared input snapshot並先檢查未綁定commit。Plan/build terminal的`outputs`只可列出符合manifest的repo-relative artifact paths；manifest沒有outputs時必須精確回`[]`，不得塞入action/summary物件。Ship authority 原則上必須仍為pending；唯一例外是已通過且 identity 精確為 `cortex-manager/deterministic/cortex` 的 `openspec-archive`，此時保留official archive step並只重設後續gate，讓post-archive finding可由tested descendant Candidate修正。Manager會把已移走的active brainstorm artifact對應到同hash且唯一的official archive path重證，不接受caller改寫authority、模糊archive或symlink；任何其他已通過ship card仍拒絕retry。新Candidate仍必須是舊Candidate的exact descendant。`link`、`unlink`、`start` 與 `resume` 不要求 caller 提供 repo root；Manager 只會從 installer 的 `PSC_REPO_ROOT` 或 Monitor workspace registry 解析與 `owner/repo` remote 完全一致的 canonical git top-level。當同work只有一個`done/ship` run且terminal journal binding完整時，explicit `resume`會重跑current authority的ship validator來刷新stale CompletionRecord；不會建立新run、重開builder或dispatch card，pending／needs-human／malformed結果也不會覆寫既有completion。`auto` 未指定相容用的 `--issue` 時會套用到全部 confirmed mapped issues。
 

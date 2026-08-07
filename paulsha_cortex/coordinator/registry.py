@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from . import verification
+from .usage_extractors import extract_usage
 from .workflow import (
     GateEvidenceRef,
     PlanningArtifactAuthority,
@@ -470,9 +471,14 @@ class JobRegistry:
             "workflow_run_id", "workflow_claim_key", "workflow_repo", "workflow_card",
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
+            "usage_reason", "started_at", "exited_at",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
+                raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        for field in ("usage", "usage_raw"):
+            value = job.get(field)
+            if value is not None and not isinstance(value, dict):
                 raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
         sandbox_hash = job.get("workflow_sandbox_hash")
         if sandbox_hash is not None and (
@@ -774,6 +780,11 @@ class JobRegistry:
             "workflow_builder_job_id": workflow_builder_job_id,
             "workflow_stage_execution_key": workflow_stage_execution_key,
             "workflow_evidence": None,
+            "usage": None,
+            "usage_raw": None,
+            "usage_reason": None,
+            "started_at": None,
+            "exited_at": None,
             "created_at": _now_iso(),
         }
         job = self._validate_loaded_job(job)
@@ -921,6 +932,7 @@ class JobRegistry:
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path
+        job["started_at"] = _now_iso()
         self._persist()
         return _deepcopy_json(job)
 
@@ -944,6 +956,19 @@ class JobRegistry:
         )
         job["status"] = status
         job["exit_code"] = exit_code
+        job["exited_at"] = _now_iso()
+        # #325：usage 抽取是盡力而為的附加資訊，任何失敗都不得影響上面已判定
+        # 好的 status/exit_code/exited_at——extract_usage 本身已 fail-soft，
+        # 這裡再包一層防禦性雙保險。
+        try:
+            extraction = extract_usage(job.get("executor"), job.get("log_path"))
+            job["usage"] = extraction.get("usage")
+            job["usage_raw"] = extraction.get("usage_raw")
+            job["usage_reason"] = extraction.get("usage_reason")
+        except BaseException as exc:  # noqa: BLE001 - 防禦性雙保險，絕不上拋
+            job["usage"] = None
+            job["usage_raw"] = None
+            job["usage_reason"] = f"extractor crashed: {exc}"
         self._persist()
         return _deepcopy_json(job)
 

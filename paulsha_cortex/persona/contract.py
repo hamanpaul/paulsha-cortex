@@ -27,6 +27,7 @@ class PersonaContract:
     write_paths: tuple[str, ...]
     allowed_tools: tuple[str, ...]
     skills: tuple[str, ...] = ()
+    completion_obligations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,16 @@ def validate_persona_schema(
             not isinstance(skills, (list, tuple)) or any(not isinstance(skill, str) for skill in skills)
         ):
             errors.append(f"{role}: skills 必須是字串清單")
+
+        completion_obligations = record.get("completion_obligations")
+        if completion_obligations is not None and (
+            not isinstance(completion_obligations, (list, tuple))
+            or any(
+                not isinstance(obligation, str) or not obligation.strip()
+                for obligation in completion_obligations
+            )
+        ):
+            errors.append(f"{role}: completion_obligations 必須是字串清單")
 
     return ValidationResult(ok=not errors, errors=tuple(errors))
 
