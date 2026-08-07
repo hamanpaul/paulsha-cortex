@@ -441,6 +441,37 @@ def test_default_branch_and_current_branch_are_protected(tmp_path: Path) -> None
     assert main_artifact.reason == gc.REASON_PROTECTED
 
 
+def test_current_checked_out_branch_protected_even_when_content_mergeable(tmp_path: Path) -> None:
+    """current-checked-out-branch 保護與 default-branch 保護是兩條獨立規則：
+    repo_root 目前 checked out 在一個「內容上已可判 merged」的非 default 分支時，
+    仍必須因為它是目前 checkout 而 protected，不得被 apply 誤刪。
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+
+    _git(repo, "checkout", "-qb", "feature/checked-out-elsewhere")
+    (repo / "here.txt").write_text("here\n", encoding="utf-8")
+    _git(repo, "add", "here.txt")
+    _git(repo, "commit", "-qm", "commit on checked-out branch")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "merge", "-q", "--ff-only", "feature/checked-out-elsewhere")
+    # main 現在與 feature/checked-out-elsewhere 同 tip（merged-ancestor 可判）；
+    # 接著把 repo_root 本身切到該分支，驗證它因為是「目前 checkout」而受保護。
+    _git(repo, "checkout", "-q", "feature/checked-out-elsewhere")
+
+    report = gc.run_gc(repo, apply=True, worktree_root=tmp_path / "no-pool")
+
+    checked_out_artifact = _artifact(report.artifacts, "branch", "feature/checked-out-elsewhere")
+    assert checked_out_artifact.action == gc.ACTION_KEEP
+    assert checked_out_artifact.reason == gc.REASON_PROTECTED
+    assert _branch_exists(repo, "feature/checked-out-elsewhere")
+
+    # default branch 本身依然獨立受保護（fallback "main"）。
+    main_artifact = _artifact(report.artifacts, "branch", "main")
+    assert main_artifact.action == gc.ACTION_KEEP
+    assert main_artifact.reason == gc.REASON_PROTECTED
+
+
 def test_scan_does_not_import_registry_writers() -> None:
     import inspect
 
