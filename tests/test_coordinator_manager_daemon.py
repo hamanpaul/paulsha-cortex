@@ -14,6 +14,7 @@ import pytest
 
 from paulsha_cortex.control import constants, contract
 from paulsha_cortex.coordinator import autonomy as coordinator_autonomy, completion, manager_daemon, verification
+from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 
 
@@ -1640,6 +1641,20 @@ def test_work_action_request_has_one_manager_owned_execution_path(tmp_path):
 
 
 def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path):
+    # #294 R5：build_periodic_tick_runner 對 default_executor/default_model 做
+    # fail-closed identity registry 驗證，因此測試需自帶一份包含
+    # copilot/gpt-5.4 的假 registry，不可依賴套件內建或使用者機器上的
+    # model-identities.yaml（兩者都不保證含這個 identity，會讓測試在乾淨環境
+    # 假失敗）。
+    identity_registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "copilot",
+                "model_id": "gpt-5.4",
+                "independence_domain": "github",
+            }
+        ]
+    )
     dispatcher = FakeDispatcher(FakeRegistry())
     launcher = object()
     calls: list[dict[str, object]] = []
@@ -1673,6 +1688,7 @@ def test_periodic_tick_runner_passes_default_builder_model(monkeypatch, tmp_path
         launcher=launcher,
         default_executor="copilot",
         default_model="gpt-5.4",
+        workflow_identity_registry=identity_registry,
         run_tick_fn=fake_run_tick,
         scan_specs_fn=lambda specs_dir: [],
         auto_claim_fn=lambda: [],
