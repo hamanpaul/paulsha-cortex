@@ -336,7 +336,15 @@ def test_parse_failure_keeps_diagnostics_without_authority() -> None:
 # --------------------------------------------------------------------------
 
 
-def _build_card_job(registry, tmp_path: Path, *, log: Path, run_id="run", card_id="card"):
+def _build_card_job(
+    registry,
+    tmp_path: Path,
+    *,
+    log: Path,
+    run_id="run",
+    card_id="card",
+    outputs: tuple[str, ...] = ("reports/build/work.md",),
+):
     job = registry.create_job(
         task="build",
         persona="builder",
@@ -353,7 +361,7 @@ def _build_card_job(registry, tmp_path: Path, *, log: Path, run_id="run", card_i
         workflow_card=card_id,
         workflow_phase="build",
         workflow_repo_root=str(tmp_path),
-        workflow_outputs=("reports/build/work.md",),
+        workflow_outputs=outputs,
         source_revision="rev",
     )
     registry.attach_launch_handle(job["job_id"], log_path=str(log))
@@ -794,3 +802,330 @@ def test_prompt_contract_matches_what_manager_enforces(tmp_path: Path) -> None:
             raw=terminal, job=registry.get_job(job["job_id"])
         )
     assert excinfo.value.gate == "pytest"
+
+
+# --------------------------------------------------------------------------
+# #307：test_policy=red-required 卡與 R2 gate 一致性檢查的語意反轉
+# --------------------------------------------------------------------------
+#
+# tdd-red 卡（execution.test_policy=red-required）的正確產出是「新增並 commit
+# 會失敗的 RED regression test」。宣告 PSC_GATE_CMD_PYTEST 時，這張卡的 pytest
+# gate *理應* failed——R2 的一般 fail-closed 規則會把這個預期中的 failed 誤判為
+# 與 terminal 自稱 passed 矛盾，結構性地讓 red-required 卡永遠不可能通過。
+#
+# 語意反轉只精準命中 `RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這一項 ledger 結
+# 果，且只在 exit_code 精確等於 1（pytest 的 TESTS_FAILED：測試被收集、確實執
+# 行，且至少一個失敗）時才視為合格 RED；其餘 exit_code（0＝全綠、2/3/4/5＝
+# collection error／interrupted／internal error／usage error／no tests
+# collected）一律維持 failed，避免「builder 根本沒寫測試」或「測試檔壞掉」被誤
+# 判為合格 RED。一般卡（test_policy 非 red-required）完全不受影響。
+
+
+def test_red_required_gate_failed_as_expected_is_authorized(tmp_path: Path) -> None:
+    """(a) red-required 卡＋pytest gate 如預期 failed（exit_code=1）→ 應該通過。"""
+
+    log = tmp_path / "job.jsonl"
+    _write_ledger(
+        log,
+        gates=[
+            {"name": "openspec", "status": "passed", "exit_code": 0},
+            {"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"},
+        ],
+    )
+    envelope = tc.validate_envelope(
+        _card(
+            status="passed",
+            gate_evidence=[
+                {"name": "openspec", "status": "passed"},
+                # 模型誠實自述觀察到的原始事實（RED test 確實 failed）——不要求
+                # 模型自己做語意反轉；manager 端的反轉只作用在矛盾偵測那一步。
+                {"name": "pytest", "status": "failed"},
+            ],
+        )
+    )
+    granted = tc.authorize_terminal(
+        envelope,
+        ledger_path=tc.gate_ledger_path(log),
+        require_ledger=True,
+        test_policy="red-required",
+    )
+    assert granted.authorized is True
+    assert granted.status == "passed"
+
+
+def test_red_required_gate_passed_green_is_rejected(tmp_path: Path) -> None:
+    """(b) red-required 卡＋pytest gate passed（全綠、未產生 RED）→ 仍須 fail closed。
+
+    red-required 的必要條件是「測試確實失敗」；全綠代表沒有交付要求的 RED
+    regression test，terminal 自稱的 passed 與這個事實矛盾。
+    """
+
+    log = tmp_path / "job.jsonl"
+    _write_ledger(log, gates=[{"name": "pytest", "status": "passed", "exit_code": 0}])
+    envelope = tc.validate_envelope(
+        _card(status="passed", gate_evidence=[{"name": "pytest", "status": "passed"}])
+    )
+    with pytest.raises(tc.GateContradictionError) as excinfo:
+        tc.authorize_terminal(
+            envelope,
+            ledger_path=tc.gate_ledger_path(log),
+            require_ledger=True,
+            test_policy="red-required",
+        )
+    assert excinfo.value.gate == "pytest"
+    assert excinfo.value.actual == "failed"
+
+
+@pytest.mark.parametrize(
+    "exit_code,label",
+    [
+        (2, "collection-error-or-interrupted"),
+        (3, "internal-error"),
+        (4, "usage-error"),
+        (5, "no-tests-collected"),
+    ],
+)
+def test_red_required_broken_test_is_never_authorized(
+    tmp_path: Path, exit_code: int, label: str
+) -> None:
+    """red-required 卡＋pytest 非 0/1 的 exit_code（測試檔壞掉／根本沒寫測試）
+    → 不得被當成合格 RED，一律維持 fail closed。"""
+
+    log = tmp_path / f"job-{label}.jsonl"
+    _write_ledger(
+        log,
+        gates=[{"name": "pytest", "status": "failed", "exit_code": exit_code}],
+    )
+    envelope = tc.validate_envelope(_card(status="passed", gate_evidence=[]))
+    with pytest.raises(tc.GateContradictionError) as excinfo:
+        tc.authorize_terminal(
+            envelope,
+            ledger_path=tc.gate_ledger_path(log),
+            require_ledger=True,
+            test_policy="red-required",
+        )
+    assert excinfo.value.gate == "pytest"
+    assert excinfo.value.actual == "failed"
+
+
+def test_red_required_semantics_do_not_leak_into_general_cards(tmp_path: Path) -> None:
+    """(c) 一般卡（test_policy 非 red-required）＋pytest gate failed＋terminal 自稱
+    passed → 必須仍 fail closed；語意反轉不得外溢到一般卡。"""
+
+    log = tmp_path / "job.jsonl"
+    _write_ledger(log, gates=[{"name": "pytest", "status": "failed", "exit_code": 1}])
+    envelope = tc.validate_envelope(_card(status="passed", gate_evidence=[]))
+
+    for test_policy in (None, "none", "focused", "full"):
+        with pytest.raises(tc.GateContradictionError) as excinfo:
+            tc.authorize_terminal(
+                envelope,
+                ledger_path=tc.gate_ledger_path(log),
+                require_ledger=True,
+                test_policy=test_policy,
+            )
+        assert excinfo.value.gate == "pytest"
+        assert excinfo.value.actual == "failed"
+
+
+def test_red_required_semantics_only_touch_pytest_gate(tmp_path: Path) -> None:
+    """red-required 反轉只精準命中 pytest 這一項；其他 gate（例如 openspec）
+    failed 時，red-required 卡仍須 fail closed，不得整張卡放行。"""
+
+    log = tmp_path / "job.jsonl"
+    _write_ledger(
+        log,
+        gates=[
+            {"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"},
+            {"name": "openspec", "status": "failed", "exit_code": 1, "detail": "invalid"},
+        ],
+    )
+    envelope = tc.validate_envelope(_card(status="passed", gate_evidence=[]))
+    with pytest.raises(tc.GateContradictionError) as excinfo:
+        tc.authorize_terminal(
+            envelope,
+            ledger_path=tc.gate_ledger_path(log),
+            require_ledger=True,
+            test_policy="red-required",
+        )
+    assert excinfo.value.gate == "openspec"
+
+
+def _tdd_red_step_run(registry, tmp_path: Path):
+    """建一個掛完整 manifest（含真實 tdd-red 卡）的 WorkflowRun，回傳 (run, step)。"""
+
+    from dataclasses import replace as _replace
+
+    from paulsha_cortex.deck.compile import compile_combo
+    from paulsha_cortex.deck.schema import (
+        DEFAULT_CARDS_PATH,
+        DEFAULT_COMBOS_DIR,
+        load_cards,
+        load_combo,
+    )
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "feature-oneshot.yaml", cards)
+    manifest = compile_combo(
+        combo, cards, "red required wiring", change="red-required-wiring"
+    ).workflow_manifest
+    assert manifest is not None
+    run = registry._manager_create_workflow_run(
+        work_id="red-required-wiring",
+        repo="hamanpaul/paulsha-cortex",
+        claim_key="claim:v1:" + "3" * 64,
+        source_revision="4" * 64,
+        workspace_root=str(tmp_path),
+        combo="feature-oneshot",
+        current_phase="build",
+        steps=tuple(
+            _replace(step, executor="codex", model="gpt-primary", domain="openai")
+            for step in manifest.steps
+        ),
+        issue_refs=(),
+        openspec_refs=(),
+        pr_refs=(),
+        attempts={},
+        facets=(),
+        gate_status="running",
+    )
+    step = next(item for item in run.steps if item.card == "tdd-red")
+    assert step.test_policy == "red-required"
+    return run, step
+
+
+def test_manager_harvest_authorizes_tdd_red_card_with_expected_red_pytest(
+    tmp_path: Path,
+) -> None:
+    """端到端：真正的 tdd-red 卡 + PSC_GATE_CMD_PYTEST 宣告 + pytest 如預期
+    failed（exit_code=1）→ terminalize_workflow_job 必須成功（issue #307 的
+    原始回歸情境：W1 batch run workflow-b512cbfc7609c4b13c01 / tdd-red-416）。
+    """
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.registry import JobRegistry
+
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run, step = _tdd_red_step_run(registry, tmp_path)
+
+    log = tmp_path / "build.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-card",
+                "status": "passed",
+                "run_id": run.run_id,
+                "card_id": step.card,
+                "candidate": "a" * 40,
+                "outputs": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_ledger(
+        log, gates=[{"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}]
+    )
+    job = _build_card_job(
+        registry, tmp_path, log=log, run_id=run.run_id, card_id=step.card, outputs=step.outputs
+    )
+
+    terminal = manager.terminalize_workflow_job(
+        registry, job_id=job["job_id"], coordinator_root=tmp_path
+    )
+    assert terminal["workflow_evidence"] is not None
+
+
+def test_manager_harvest_still_rejects_tdd_red_card_with_green_pytest(
+    tmp_path: Path,
+) -> None:
+    """端到端對照：真正的 tdd-red 卡若 pytest 全綠（沒有產生 RED），
+    terminalize_workflow_job 仍必須 fail closed，不得被語意反轉放行。"""
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.registry import JobRegistry
+
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run, step = _tdd_red_step_run(registry, tmp_path)
+
+    log = tmp_path / "build.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-card",
+                "status": "passed",
+                "run_id": run.run_id,
+                "card_id": step.card,
+                "candidate": "a" * 40,
+                "outputs": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_ledger(log, gates=[{"name": "pytest", "status": "passed", "exit_code": 0}])
+    job = _build_card_job(
+        registry, tmp_path, log=log, run_id=run.run_id, card_id=step.card, outputs=step.outputs
+    )
+
+    with pytest.raises(tc.GateContradictionError) as excinfo:
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=tmp_path
+        )
+    assert excinfo.value.gate == "pytest"
+    assert registry.get_job(job["job_id"])["workflow_evidence"] is None
+
+
+def test_manager_harvest_general_build_card_unaffected_by_red_required_wiring(
+    tmp_path: Path,
+) -> None:
+    """端到端對照：同一個 run 內的一般 build 卡（test_policy 非 red-required）
+    ＋pytest failed＋terminal 自稱 passed → registry 有 test_policy 可查也仍須
+    fail closed；registry 佈線本身不得弱化一般卡。"""
+
+    from paulsha_cortex.coordinator import manager
+    from paulsha_cortex.coordinator.registry import JobRegistry
+
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    run, _tdd_red = _tdd_red_step_run(registry, tmp_path)
+    general_step = next(
+        item for item in run.steps if item.phase == "build" and item.card != "tdd-red"
+    )
+    assert general_step.test_policy != "red-required"
+
+    log = tmp_path / "build.jsonl"
+    log.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "workflow-card",
+                "status": "passed",
+                "run_id": run.run_id,
+                "card_id": general_step.card,
+                "candidate": "a" * 40,
+                "outputs": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_ledger(
+        log, gates=[{"name": "pytest", "status": "failed", "exit_code": 1, "detail": "1 failed"}]
+    )
+    job = _build_card_job(
+        registry,
+        tmp_path,
+        log=log,
+        run_id=run.run_id,
+        card_id=general_step.card,
+        outputs=general_step.outputs,
+    )
+
+    with pytest.raises(tc.GateContradictionError) as excinfo:
+        manager.terminalize_workflow_job(
+            registry, job_id=job["job_id"], coordinator_root=tmp_path
+        )
+    assert excinfo.value.gate == "pytest"
+    assert registry.get_job(job["job_id"])["workflow_evidence"] is None

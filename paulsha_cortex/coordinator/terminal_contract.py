@@ -56,6 +56,23 @@ MAX_SCHEMA_RETRIES = 2
 GATE_LEDGER_SCHEMA_VERSION = 1
 GATE_LEDGER_KIND = "workflow-gate-ledger"
 
+# #307：red-required（tdd-red）卡語意反轉的唯一對象——manager 認可的「測試 gate」
+# 名稱，對應 operator 慣例宣告的 ``PSC_GATE_CMD_PYTEST``
+# （gate_ledger.GATE_ENV_PREFIX + "PYTEST" → 小寫 gate 名 "pytest"）。deck/data
+# /cards.yaml 的 tdd-red 卡以 ``runtime_capabilities: ["module:pytest"]`` 明確
+# 宣告依賴 pytest；其餘宣告的 gate（openspec／policy…）不受影響，仍走一般
+# fail-closed 規則——語意反轉刻意只精準命中這一個 gate 名稱，不是放寬整張卡。
+RED_REQUIRED_TEST_GATE_NAME = "pytest"
+
+# pytest 的標準 exit code（見 ``_pytest.config.ExitCode``）。只有
+# ``TESTS_FAILED``（1，代表「測試被收集、確實執行，且至少一個失敗」）是
+# red-required 要求的合格 RED 證據。其餘：``OK``（0，全綠＝沒有產生 RED）、
+# ``INTERRUPTED``（2，也是 collection/import error 的退出碼）、
+# ``INTERNAL_ERROR``（3）、``USAGE_ERROR``（4）、``NO_TESTS_COLLECTED``（5）
+# 都代表「builder 根本沒寫測試」或「測試檔壞掉」，一律維持 fail closed，不視為
+# 合格 RED。
+PYTEST_EXIT_TESTS_FAILED = 1
+
 class TerminalContractError(ValueError):
     """確定性的 terminal contract 違規；一律 fail closed，且錯誤可被機器讀取。"""
 
@@ -500,11 +517,59 @@ def _ledger_outcomes(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return outcomes
 
 
+def _apply_red_required_semantics(
+    outcomes: Mapping[str, dict[str, Any]], *, test_policy: str | None
+) -> dict[str, dict[str, Any]]:
+    """#307：red-required 卡對「測試 gate」語意反轉——RED（測試失敗）才是達成。
+
+    只精準命中 :data:`RED_REQUIRED_TEST_GATE_NAME` 這一個 ledger 項；其餘 gate
+    （openspec／policy…）原樣返回，一般卡（``test_policy`` 非 ``red-required``）
+    整份 outcomes 原樣返回，不改動既有 fail-closed 行為。
+
+    只有 pytest exit code 精確等於 :data:`PYTEST_EXIT_TESTS_FAILED`（1）才視為
+    合格 RED 證據並反轉為 ``passed``；exit code 0（全綠，未產生 RED）反轉為
+    ``failed``——red-required 的必要條件是測試確實失敗，全綠代表沒有交付要求的
+    RED regression test。其餘 exit code（2/3/4/5…，collection error／
+    interrupted／internal error／usage error／no tests collected）或缺少
+    ``exit_code`` 一律維持既有的 ``failed`` 判定，不做任何轉換——這些狀況代表
+    「builder 根本沒寫測試」或「測試檔壞掉」，不是合格的 RED，必須繼續 fail
+    closed。
+    """
+
+    if test_policy != "red-required":
+        return dict(outcomes)
+    entry = outcomes.get(RED_REQUIRED_TEST_GATE_NAME)
+    if entry is None:
+        return dict(outcomes)
+    exit_code = entry.get("exit_code")
+    transformed = dict(outcomes)
+    if type(exit_code) is int and exit_code == PYTEST_EXIT_TESTS_FAILED:
+        transformed[RED_REQUIRED_TEST_GATE_NAME] = {
+            **entry,
+            "status": "passed",
+            "detail": (
+                f"red-required：pytest exit_code={exit_code}（測試如預期失敗，"
+                f"視為達成 RED 要求）；原始 detail={entry.get('detail') or ''!r}"
+            ),
+        }
+    elif entry.get("status") == "passed":
+        transformed[RED_REQUIRED_TEST_GATE_NAME] = {
+            **entry,
+            "status": "failed",
+            "detail": (
+                "red-required：pytest exit_code=0（全數通過，未產生 RED 失敗）；"
+                "不符合 red-required 要求"
+            ),
+        }
+    return transformed
+
+
 def authorize_terminal(
     envelope: TerminalEnvelope,
     *,
     ledger_path: str | Path,
     require_ledger: bool = False,
+    test_policy: str | None = None,
 ) -> TerminalAuthorization:
     """採信 terminal 狀態；``passed`` 必須由 manager 獨立產生的 gate ledger 授權（R2）。
 
@@ -514,6 +579,12 @@ def authorize_terminal(
 
     D3：矛盾偵測優先於狀態採信——先做確定性 cross-check，矛盾即 fail closed，
     才進入正常的狀態處理，避免「先按 passed 走一段流程」造成部分副作用。
+
+    #307：``test_policy="red-required"`` 時，:func:`_apply_red_required_semantics`
+    只對 :data:`RED_REQUIRED_TEST_GATE_NAME` 這一項 ledger 結果做語意反轉，且只
+    影響「terminal 自稱 passed 是否與 ledger 矛盾」這條判斷；模型自述的
+    ``gate_evidence`` 仍對照未反轉的原始 ledger 事實，維持誠實性檢查不被稀釋。
+    其他 ``test_policy``（含 ``None``）不受影響，一般卡的 fail-closed 行為不變。
     """
 
     if envelope.status != "passed":
@@ -553,10 +624,13 @@ def authorize_terminal(
         )
 
     outcomes = _ledger_outcomes(ledger)
+    # #307：red-required 卡的語意反轉只作用在這裡（矛盾偵測），不影響下面的
+    # gate_evidence 誠實性 cross-check——那裡刻意繼續用未反轉的 `outcomes`。
+    effective_outcomes = _apply_red_required_semantics(outcomes, test_policy=test_policy)
     # D3：先做矛盾偵測。即使 terminal 沒有引用該 gate，manager 讀到的失敗結果
     # 也直接否決 passed——「沒提到」不能當作「沒失敗」。
-    for name in sorted(outcomes):
-        actual = outcomes[name]
+    for name in sorted(effective_outcomes):
+        actual = effective_outcomes[name]
         if actual["status"] != "passed":
             raise GateContradictionError(
                 gate=name,

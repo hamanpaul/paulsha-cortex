@@ -2605,10 +2605,36 @@ def _terminal_parse_diagnostics(
 GATE_LEDGER_REQUIRED_PHASES = frozenset({"build"})
 
 
+def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | None:
+    """#307：從 job 綁定的 :class:`WorkflowRun` 撈出目前 card 的 ``execution.test_policy``。
+
+    只用來餵給 :func:`terminal_contract.authorize_terminal` 做 red-required 語意
+    反轉；找不到（``registry`` 未提供、run/card 不存在、欄位缺失等）一律回
+    ``None``——維持既有 fail-closed 行為，不因為查找失敗而放寬任何一般卡的檢查。
+    """
+
+    if registry is None:
+        return None
+    run_id = job.get("workflow_run_id")
+    card_id = job.get("workflow_card")
+    if not isinstance(run_id, str) or not isinstance(card_id, str):
+        return None
+    phase = job.get("workflow_phase")
+    try:
+        run = registry.get_workflow_run(run_id)
+    except Exception:
+        return None
+    for step in getattr(run, "steps", ()):
+        if step.card == card_id and (phase is None or step.phase == phase):
+            return step.test_policy
+    return None
+
+
 def _assert_terminal_gate_consistency(
     raw: Mapping[str, object],
     *,
     job: Mapping[str, object],
+    registry=None,
 ) -> None:
     """#261 R2／D3：矛盾偵測優先於狀態採信。
 
@@ -2620,6 +2646,11 @@ def _assert_terminal_gate_consistency(
     會跑 gate 的 phase（build／verify）若連 ledger 都不存在，代表 wrapper 的 gate
     階段沒跑完，同樣 fail closed：模型文字、exit code 為 0、無明確錯誤三者皆不構成
     成功授權。
+
+    #307：``registry`` 為選填——提供時會用來解析目前 card 的 ``test_policy``，讓
+    ``test_policy=red-required``（tdd-red）卡對測試 gate 的語意反轉在
+    :func:`terminal_contract.authorize_terminal` 生效；未提供或解析不到時
+    ``test_policy`` 視為 ``None``，行為與反轉前完全相同。
     """
 
     try:
@@ -2635,6 +2666,7 @@ def _assert_terminal_gate_consistency(
         envelope,
         ledger_path=terminal_contract.gate_ledger_path(log_path),
         require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
+        test_policy=_workflow_step_test_policy(registry, job),
     )
 
 
@@ -4308,7 +4340,8 @@ def terminalize_workflow_job(
     raw = _extract_terminal_json(job.get("log_path"))
     # #261 R2／D3：矛盾偵測排在任何狀態採信之前。放在 per-phase schema 驗證之前，
     # 是為了避免「先按 passed 走一段流程、後面才發現不對」造成的部分副作用。
-    _assert_terminal_gate_consistency(raw, job=job)
+    # #307：帶入 registry 讓 red-required 卡的測試 gate 語意反轉生效。
+    _assert_terminal_gate_consistency(raw, job=job, registry=registry)
     declared_outputs = job.get("workflow_outputs")
     if not isinstance(declared_outputs, list):
         raise ValueError("workflow job declared outputs missing")
