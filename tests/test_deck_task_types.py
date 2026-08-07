@@ -62,6 +62,50 @@ def test_loader_rejects_invalid_scopes(tmp_path: Path, replace_with: str) -> Non
         load_task_types(_write(tmp_path, "task-types.yaml", bad), combos=_combo_catalog())
 
 
+@pytest.mark.parametrize(
+    "mutation, expected_marker",
+    [
+        (
+            lambda text: text.replace(
+                "scopes:\n",
+                "  perf:\n    description: 效能調校\n    combo: null\nscopes:\n",
+                1,
+            ),
+            "perf",
+        ),
+        (
+            lambda text: text.replace(
+                "  refactor:\n    description: 重構整理\n    combo: null\n", ""
+            ),
+            "refactor",
+        ),
+    ],
+)
+def test_loader_rejects_value_domain_drift(tmp_path: Path, mutation, expected_marker: str) -> None:
+    original = DEFAULT_TASK_TYPES_PATH.read_text(encoding="utf-8")
+    bad = mutation(original)
+    assert bad != original
+
+    with pytest.raises(DeckSchemaError, match=expected_marker):
+        load_task_types(_write(tmp_path, "task-types.yaml", bad), combos=_combo_catalog())
+
+
+def test_loader_rejects_empty_description(tmp_path: Path) -> None:
+    original = DEFAULT_TASK_TYPES_PATH.read_text(encoding="utf-8")
+    bad = original.replace("description: 新增功能", 'description: ""', 1)
+    assert bad != original
+
+    with pytest.raises(DeckSchemaError, match="description"):
+        load_task_types(_write(tmp_path, "task-types.yaml", bad), combos=_combo_catalog())
+
+
+def test_loader_rejects_unknown_combo_reference(tmp_path: Path) -> None:
+    incomplete_combos = {"feature-oneshot": object()}
+
+    with pytest.raises(DeckSchemaError, match="fix-standard"):
+        load_task_types(DEFAULT_TASK_TYPES_PATH, combos=incomplete_combos)
+
+
 def test_classify_matched_with_scope() -> None:
     taxonomy = load_task_types(combos=_combo_catalog())
 
@@ -117,3 +161,28 @@ def test_classify_absent_and_unparseable() -> None:
     assert absent.disposition == "bypass"
     assert unparseable.kind == "unparseable"
     assert unparseable.disposition == "bypass"
+
+
+def test_disposition_mapping_is_total() -> None:
+    taxonomy = load_task_types(combos=_combo_catalog())
+    representative_titles = {
+        "matched": "feat: 新增選牌",
+        "unknown_type": "perf(cli): accelerate combo lookup",
+        "ambiguous": "fix(claimx): 修正",
+        "absent": "repair selector fallback",
+        "unparseable": "fix(: broken",
+    }
+
+    classifications = {kind: classify_title(title, taxonomy) for kind, title in representative_titles.items()}
+    dispositions = {kind: classification.disposition for kind, classification in classifications.items()}
+
+    assert dispositions == {
+        "matched": "proceed",
+        "unknown_type": "fail_closed",
+        "ambiguous": "fail_closed",
+        "absent": "bypass",
+        "unparseable": "bypass",
+    }
+    # 五類皆有定義、無未定義分支：kind 本身也須與 representative title 對得上。
+    for kind, classification in classifications.items():
+        assert classification.kind == kind

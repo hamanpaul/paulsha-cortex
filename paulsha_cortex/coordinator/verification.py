@@ -777,31 +777,69 @@ def run_result_verification(
             return _finish("needs_human", "required-artifact-unchanged")
         artifact_result["status"] = "passed"
 
-    catalog_blob = _run_git(
-        ["-C", str(resolved_repo_root), "show", f"{dispatch_base}:{PERSONA_CATALOG_PATH}"],
+    catalog_probe = _run_git(
+        ["-C", str(resolved_repo_root), "cat-file", "-e", f"{dispatch_base}:{PERSONA_CATALOG_PATH}"],
         git_runner,
     )
-    if catalog_blob["status"] != "ok":
+    if catalog_probe["status"] == "ok":
+        # repo-local override 宣告存在（#295/#291 R2）：pin 在 dispatch_base commit 讀取，
+        # 壞損時 fail-closed，不靜默回退 packaged catalog（R3/D3）。
+        catalog_blob = _run_git(
+            ["-C", str(resolved_repo_root), "show", f"{dispatch_base}:{PERSONA_CATALOG_PATH}"],
+            git_runner,
+        )
+        if catalog_blob["status"] != "ok":
+            details["persona_catalog"] = {
+                "path": PERSONA_CATALOG_PATH,
+                "commit": dispatch_base,
+                "error": catalog_blob,
+            }
+            return _finish("needs_human", "persona-catalog-unreadable")
+        try:
+            catalog = _load_catalog_from_text(catalog_blob["stdout"])
+        except ValueError as exc:
+            details["persona_catalog"] = {
+                "path": PERSONA_CATALOG_PATH,
+                "commit": dispatch_base,
+                "error": str(exc),
+            }
+            return _finish("needs_human", "persona-catalog-invalid")
         details["persona_catalog"] = {
             "path": PERSONA_CATALOG_PATH,
             "commit": dispatch_base,
-            "error": catalog_blob,
+            "hash": sha256_bytes(catalog_blob["stdout"].encode("utf-8")),
+            "source": "repo-local",
         }
-        return _finish("needs_human", "persona-catalog-unreadable")
-    try:
-        catalog = _load_catalog_from_text(catalog_blob["stdout"])
-    except ValueError as exc:
+    else:
+        # 未宣告 override：canonical 來源改為 cortex 套件內建 catalog（#295 R1/D1），
+        # persona 定義是 cortex 的產品資產，不要求被治理 repo 的 git tree 長出該檔。
+        from ..persona.loader import DEFAULT_PERSONAS_PATH
+
+        packaged_path = DEFAULT_PERSONAS_PATH
+        try:
+            packaged_text = packaged_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            details["persona_catalog"] = {
+                "path": str(packaged_path),
+                "commit": None,
+                "error": str(exc),
+            }
+            return _finish("needs_human", "persona-catalog-unreadable")
+        try:
+            catalog = _load_catalog_from_text(packaged_text)
+        except ValueError as exc:
+            details["persona_catalog"] = {
+                "path": str(packaged_path),
+                "commit": None,
+                "error": str(exc),
+            }
+            return _finish("needs_human", "persona-catalog-invalid")
         details["persona_catalog"] = {
-            "path": PERSONA_CATALOG_PATH,
-            "commit": dispatch_base,
-            "error": str(exc),
+            "path": str(packaged_path),
+            "commit": None,
+            "hash": sha256_bytes(packaged_text.encode("utf-8")),
+            "source": "packaged",
         }
-        return _finish("needs_human", "persona-catalog-invalid")
-    details["persona_catalog"] = {
-        "path": PERSONA_CATALOG_PATH,
-        "commit": dispatch_base,
-        "hash": sha256_bytes(catalog_blob["stdout"].encode("utf-8")),
-    }
     scope_diff = _run_git(
         [
             "-C",

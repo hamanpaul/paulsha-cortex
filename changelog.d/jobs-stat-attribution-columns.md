@@ -1,0 +1,2 @@
+### Added
+- **Issue #323：`cortex jobs`／`stat` 對 workflow lane job 補 work_id／primary issue 歸屬欄**：`wf-xxxxxxxx-<card>-<n>` job 輸出新增 `workflow_work_id`／`workflow_primary_issue` 兩欄，於輸出端以既有 `workflow_run_id` join registry 的 workflow run（`work_id`／`issue_refs[0]`），零額外持久化狀態；card 已由既有 `workflow_card` 欄位提供。非 workflow lane job（無 `workflow_run_id`）與其餘既有欄位皆不受影響，兩新欄位一律出現、值為 `null`，operator 不再需要手動 join job row 與 run row 才能判讀某個 job 屬於哪個 work item、對應哪張 issue。
