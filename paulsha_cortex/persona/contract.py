@@ -5,8 +5,20 @@ from datetime import datetime
 from typing import Mapping
 
 # Stage 3 生命週期詞彙表（語意凍結）；與上游相等性由消費端對齊測試守。
+#
+# 本表是治理平面與記憶平面**共用的詞彙聯集**，不是本平面的執行序列——
+# cortex 實際跑的管線是 `coordinator/workflow.WORKFLOW_PHASES`（7 個，自 claim 起）。
+# 這裡只做成員資格檢查（`phase not in PHASES`、`allowed_phases` 子集驗證），
+# 不決定順序，因此收錄兩平面各自的首階段：
+#   - `claim`    ：cortex 的 work item 認領（manager 決定性執行）
+#   - `research` ：hippo 的記憶 slice 調查階段
+# 兩者語意不同、不可互相改名。共用是靠「各自持有相同常數 + 消費端對齊測試」
+# 達成，三套套件之間不得建立 import 依賴（見 paulshaclaw
+# tests/test_cortex_alignment.py）。異動此表必須同步 paulsha-hippo 的
+# `lib/lifecycle/schema.PHASES`，否則對齊測試會 FAIL。
 PHASES = (
     "claim",
+    "research",
     "define",
     "plan",
     "build",

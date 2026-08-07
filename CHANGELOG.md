@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Changed
+- **lifecycle 詞彙表改為治理平面與記憶平面的聯集，修復 `claim`／`research` 分歧造成的跨平面對齊 FAIL**：`persona/contract.PHASES` 由 7 個擴充為 8 個，新增 hippo 的首階段 `research`。`claim`（cortex 的 work item 認領，manager 決定性執行）與 `research`（hippo 的記憶 slice 調查階段）語意不同、不可互相改名，故採聯集而非改名，兩平面詞彙得以逐字相等且無需資料遷移。`PHASES` 在兩平面都只做成員資格檢查、不決定順序，聯集不影響既有行為；實際執行序列 `coordinator/workflow.WORKFLOW_PHASES` 維持 7 個、自 `claim` 起不變，並新增測試釘住這條界線。三套套件之間維持零 import 依賴，相等性續由 paulshaclaw 的消費端對齊測試守。
+
 ## [0.1.3] - 2026-08-07
 
 ### Fixed
