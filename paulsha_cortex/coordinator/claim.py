@@ -264,7 +264,20 @@ def mapped_issue_titles(
     *,
     snapshot_path: str | Path | None = None,
 ) -> dict[int, str | None] | None:
-    payload, canonical_hash = _load_snapshot(snapshot_path)
+    try:
+        payload, canonical_hash = _load_snapshot(snapshot_path)
+    except ValueError:
+        # 呼叫端（work_bridge.start_canonical_workflow → select_combo）已把
+        # None 當成「拿不到權威 issue 標題」的既定 bypass 訊號（見下方 hash
+        # mismatch 分支）。_load_snapshot 在 durable snapshot 不存在／不可
+        # 讀／schema 損壞，或（legacy schema）provider 區塊本身無效時皆會
+        # raise ValueError（AuthorityValidationError 亦是其子類別）——這些
+        # 都是「這次就是拿不到權威資料」的同一類情境，理應與 hash mismatch
+        # 走同一條 fail-soft 路徑，而不是讓例外一路炸穿到 claim 呼叫端。
+        # 其餘呼叫者（load_work_authorities／load_work_authority）需要的是
+        # 一個可信的 WorkAuthority 本體，沒有安全的預設值可以退，所以維持
+        # 現行的 fail-hard 行為不變，只有這裡改。
+        return None
     if canonical_hash != authority.snapshot_hash:
         return None
     for row in payload.get("work_items", []):

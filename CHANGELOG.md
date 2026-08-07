@@ -10,6 +10,7 @@
 - **Issue #202：task_type 自動選牌與 fix-standard combo**：新增 deck taxonomy loader／selector、`fix-standard` workflow combo、`WorkflowRun.combo_selection` provenance、`cortex work start --combo` authoritative override，以及 `cortex stat --combo-selections` 彙總。Refs #202。
 
 ### Fixed
+- **Issue #202 補遺：durable snapshot 不可用時 combo 選擇改走 fail-soft**：`claim.mapped_issue_titles` 先前只在 snapshot hash mismatch 時 bypass；`_load_snapshot` 因 snapshot 不存在／不可讀／schema 損壞 raise 的 `ValueError`（含 `AuthorityValidationError`）未被攔截，會炸穿 `work_bridge.start_canonical_workflow`。現在一併回傳 `None` 落回 bypass-default combo，`load_work_authorities`／`load_work_authority` 維持 fail-hard 不變。
 - **abandon 尋址窗口放寬至全額認領**：abandon 校驗 run refs 與 authority 全等；窗口期舊識別全額認領（撤 openspec exclude）、-v2 暫撤 openspec link。
 - **舊識別墓碑 todo（abandon 尋址窗口）**：authority 需檔案級來源，-v2 遷移後舊識別無檔化致 abandon 不可尋址；暫置墓碑 todo，abandon 後移除。
 - **-v2 issue links 暫撤（abandon 尋址窗口）**：解 issue contested → authority ambiguous → abandon 無從尋址的死鎖；隨後還原並補 excludes（abandon 先於 exclude 的正確時序）。
