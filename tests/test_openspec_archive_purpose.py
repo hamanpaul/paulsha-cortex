@@ -5,6 +5,17 @@ import re
 import shutil
 import subprocess
 
+import pytest
+
+
+# 本檔是外部 CLI 的整合測試：`openspec` 是 npm 套件（@fission-ai/openspec），
+# 不在 Python 專案的依賴樹裡。缺 CLI 時明確 skip 並附原因（測試輸出可見），
+# 而不是硬 assert 讓整個 CI 紅燈。
+requires_openspec_cli = pytest.mark.skipif(
+    shutil.which("openspec") is None,
+    reason="需要 openspec CLI（npm 套件 @fission-ai/openspec），此環境未安裝",
+)
+
 
 def _seed_demo_openspec_change(root: Path, change_id: str = "docs-archived-spec-purpose-red") -> Path:
     change_root = root / "openspec" / "changes" / change_id
@@ -51,8 +62,6 @@ The archive command MUST preserve a capability spec.
 
 
 def _archive_change(repo_root: Path, change_id: str) -> Path:
-    assert shutil.which("openspec"), "openspec CLI must be installed"
-
     result = subprocess.run(
         ["openspec", "archive", "-y", change_id],
         check=False,
@@ -65,6 +74,7 @@ def _archive_change(repo_root: Path, change_id: str) -> Path:
     return repo_root / "openspec" / "specs" / "demo-capability" / "spec.md"
 
 
+@requires_openspec_cli
 def test_archive_spec_does_not_keep_tbd_purpose(tmp_path: Path) -> None:
     change_id = "docs-archived-spec-purpose-red"
     repo_root = tmp_path / "repo"

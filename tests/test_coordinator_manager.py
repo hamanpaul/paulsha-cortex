@@ -94,6 +94,9 @@ def _proc_fail(returncode: int) -> SimpleNamespace:
 
 
 def _persona_catalog(*, builder_paths: list[str]) -> str:
+    # 先組好再內插：Python 3.11 以前不允許 f-string 表達式含反斜線（PEP 701
+    # 才放寬），內嵌 f'\"{path}\"' 會讓本檔在 3.10／3.11 連 parse 都失敗。
+    quoted_builder_paths = ", ".join('"{}"'.format(path) for path in builder_paths)
     return (
         "roles:\n"
         "  manager:\n"
@@ -107,7 +110,7 @@ def _persona_catalog(*, builder_paths: list[str]) -> str:
         "    role: builder\n"
         "    version: v1\n"
         "    summary: builder\n"
-        f"    write_paths: [{', '.join(f'\"{path}\"' for path in builder_paths)}]\n"
+        f"    write_paths: [{quoted_builder_paths}]\n"
         "    allowed_phases: [build, verify]\n"
         "    allowed_tools: [bash]\n"
         "  reviewer:\n"
