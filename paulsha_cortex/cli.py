@@ -39,6 +39,7 @@ coordinator commands:
   complete         輪詢既有 jobs 並執行 verification/review/completion
   slice-action     對 needs_human slice 執行允許的 recovery action
   work             透過 Manager 單一 writer 執行 work lifecycle action
+  outcome          讀取 canonical engineering outcome outbox（唯讀）
   reap-brokers     dry-run 或受限清理孤兒 Codex broker
   dispatch         已停用的舊低階入口
 

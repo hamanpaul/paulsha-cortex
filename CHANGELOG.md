@@ -13,6 +13,18 @@
 ### Changed
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
+- **Issue #275：發布 canonical engineering outcome contract 供外部 learning systems 消費**：新增
+  `paulsha_cortex/coordinator/engineering_outcome.py`——append-only、一 repo 一檔的
+  `engineering-outcomes/<repo-slug>.jsonl` outbox，`work_actions._ship_action`／
+  `_abandon_action` 在既有的 `status="done"`／`status="superseded"` terminal transition
+  之前 durable 寫入一筆 `shipped`／`abandoned` record（`outcome_id` 由 run_id／outcome／
+  該次轉換的內容位址 digest 決定性推導，daemon restart 或 request retry 重複 tick 不會
+  產生第二筆）。record 含 per-job `card`／`persona`／`workflow_phase` 展開欄位，
+  `execution_provenance` 誠實標示 `correlation_confidence: "weak"`（job record 目前沒有
+  存 executor 自身 session UUID，只有 worktree-path＋時間窗可用）。`rejected`／`failed`／
+  `rolled_back` 是 schema 保留值，v1 沒有對應的 run-level 終局轉換點可掛，尚無 emitter。
+  新增 `cortex outcome list/show/replay` 唯讀 CLI surface。設計決策見
+  `docs/superpowers/specs/engineering-outcome-contract-{spec,design}.md`。
 - **Issue #323：`cortex jobs`／`stat` 對 workflow lane job 補 work_id／primary issue 歸屬欄**：`wf-xxxxxxxx-<card>-<n>` job 輸出新增 `workflow_work_id`／`workflow_primary_issue` 兩欄，於輸出端以既有 `workflow_run_id` join registry 的 workflow run，零額外持久化狀態；card 已由既有 `workflow_card` 欄位提供。非 workflow lane job 與其餘既有欄位皆不受影響。
 - **Issue #178：新增 `cortex work gc` 交付後產物回收命令**：proposal-first 回收殘留 build worktree 與已 merge 的 repo local branch；預設 dry-run 只輸出候選清單與逐項 `reclaim`／`keep`＋reason code，`--apply` 才執行且逐項重驗（TOCTOU-safe）。merged 判定改走內容層驗證鏈（`git merge-base --is-ancestor` → `git cherry` 內容等價），修正 squash-merge 後 ref-ancestry 失真、`git branch -d`／`--merged` 誤拒已合併分支的既有陷阱；任何疑義一律 `keep` 並附 reason code，closed-unmerged PR 分支保留。新模組 `paulsha_cortex/coordinator/gc.py` 由 umbrella CLI 攔截路由，不經 manager daemon、對 registry 唯讀、不動 remote。
 - **Refs #294：slice spec 可宣告 executor/model_id 並於派工前強制 registry 驗證**：`dispatch_ready` 支援逐 slice 的 builder identity 覆寫，unknown identity fail-closed 並列出可用 candidates；同時 `cortex fanout`／`tick` 的明確 `(executor, model)` 與 periodic tick 預設 model 也改為先查 `model-identities.yaml`，避免 typo 直到 session 內才失敗。

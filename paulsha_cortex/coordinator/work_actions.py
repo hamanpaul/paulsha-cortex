@@ -48,6 +48,7 @@ from .github_delivery import (
     GitHubDeliveryClient,
     evaluate_delivery_gate,
 )
+from . import engineering_outcome
 from . import verification
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .work_bridge import current_sizing_snapshot, resolve_trusted_repo_root, workflow_status
@@ -2201,6 +2202,22 @@ def _abandon_action(
             run.run_id,
             evidence_ref=record["ref"],
         )
+        # #275：重入分支（run 已是 superseded）也要 emit，才能覆蓋「第一次
+        # emit 之後、terminal transition 之前 daemon crash」這個窗口；
+        # attempt_digest 用 evidence digest——同一份 evidence 內容重讀回來
+        # 算出同一個 digest，OutcomeStore.append 據此去重，不產生第二筆。
+        outcome_store = engineering_outcome.OutcomeStore(
+            engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+        )
+        engineering_outcome.emit_outcome(
+            outcome_store,
+            run=run,
+            authority=authority,
+            jobs=workflow_registry.list_jobs(),
+            outcome="abandoned",
+            attempt_digest=record["hash"],
+            reason_code=reason,
+        )
         updated = workflow_registry._manager_abandon_workflow_run(
             run.run_id,
             evidence_ref=record["ref"],
@@ -2244,6 +2261,20 @@ def _abandon_action(
         evidence_ref=str(target),
     )
     record = _abandon_record(body, state_path=state_path)
+    # #275：先 durable 寫 canonical outcome，再改 run status（見
+    # docs/superpowers/specs/engineering-outcome-contract-design.md）。
+    outcome_store = engineering_outcome.OutcomeStore(
+        engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+    )
+    engineering_outcome.emit_outcome(
+        outcome_store,
+        run=run,
+        authority=authority,
+        jobs=workflow_registry.list_jobs(),
+        outcome="abandoned",
+        attempt_digest=record["hash"],
+        reason_code=reason,
+    )
     updated = workflow_registry._manager_abandon_workflow_run(
         run.run_id,
         evidence_ref=record["ref"],
@@ -3123,6 +3154,35 @@ def _ship_action(
             if "@" in source
         }
         if canonical_run.current_phase == "ship":
+            # #275：canonical engineering outcome 必須在 terminal transition
+            # （status="done"）之前 durable 寫入，讓外部 learning systems 有一個
+            # 不受 WorkflowRun in-place 覆寫影響的 append-only 記錄可讀。
+            # attempt_digest 用 completion record hash——同一次 merge 重跑
+            # ship（daemon restart／request retry）會算出同一個 hash，因此
+            # OutcomeStore.append 據此去重，不產生第二筆 outcome。
+            outcome_store = engineering_outcome.OutcomeStore(
+                engineering_outcome.outcome_store_path(state_path, repo=authority.repo)
+            )
+            engineering_outcome.emit_outcome(
+                outcome_store,
+                run=canonical_run,
+                authority=authority,
+                jobs=workflow_registry.list_jobs(),
+                outcome="shipped",
+                attempt_digest=str(closure.completion_record["hash"]),
+                candidate={
+                    "pr_number": pr_number,
+                    "openspec_change": change,
+                    "sha": expected_head,
+                    "merge_commit": closure.facts.merge_commit,
+                },
+                verification={"todo_paths": list(todo_paths_value)},
+                review={
+                    "merge_authorization_hash": (
+                        authorization.get("hash") if isinstance(authorization, dict) else None
+                    ),
+                },
+            )
             workflow_registry._manager_update_workflow_run(
                 canonical_run.run_id,
                 status="done",

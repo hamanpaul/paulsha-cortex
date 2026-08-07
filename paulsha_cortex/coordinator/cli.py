@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import autonomy, broker_reaper
+from . import autonomy, broker_reaper, engineering_outcome
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
 from .registry import JobRegistry
 from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCreator
@@ -250,6 +250,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_tick.add_argument("--review-model", default=None, help="foreign reviewer model ID")
 
+    p_outcome = sub.add_parser(
+        "outcome",
+        help="讀取 canonical engineering outcome outbox（唯讀，#275）",
+    )
+    p_outcome.add_argument("mode", choices=["list", "show", "replay"])
+    p_outcome.add_argument(
+        "outcome_id", nargs="?", default=None, help="show 專用：目標 outcome_id"
+    )
+    p_outcome.add_argument(
+        "--repo", default=None, help="限定 repo；省略時掃描全部 repo 的 outbox 檔案"
+    )
+    p_outcome.add_argument("--work-id", default=None, help="list 專用：限定 work_id")
+    p_outcome.add_argument(
+        "--since", default=None, help="replay 專用：ISO8601 起點（含），依 emitted_at 過濾"
+    )
+
     return parser
 
 
@@ -441,6 +457,30 @@ def main(
             submit_request_fn=submit_request_fn,
             poll_done_fn=poll_done_fn,
         )
+
+    if args.cmd == "outcome":
+        root = engineering_outcome.default_outcomes_root()
+        if args.mode == "show":
+            if not args.outcome_id:
+                print("錯誤: outcome show 需要 outcome_id", file=sys.stderr)
+                return 1
+            record = engineering_outcome.show_outcome(root, args.outcome_id, repo=args.repo)
+            if record is None:
+                print(f"錯誤: 查無 outcome_id={args.outcome_id}", file=sys.stderr)
+                return 1
+            print(json.dumps(record, ensure_ascii=False))
+            return 0
+        if args.mode == "list":
+            records = list(
+                engineering_outcome.list_outcomes(root, repo=args.repo, work_id=args.work_id)
+            )
+            print(json.dumps(records, ensure_ascii=False))
+            return 0
+        records = list(
+            engineering_outcome.replay_outcomes(root, repo=args.repo, since=args.since)
+        )
+        print(json.dumps(records, ensure_ascii=False))
+        return 0
 
     # 讀取型命令以下才需要本地 snapshot 物件。
     reg = registry if registry is not None else JobRegistry()
