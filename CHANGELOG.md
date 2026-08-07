@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 ### Added
+- **Issue #137：交付 one-shot 成效閉環（lesson-loop + 棘輪計分）設計文件**：新增
+  `docs/superpowers/specs/oneshot-lesson-loop-{spec,design}.md`。凍結 `task_type ×
+  outcome` 計分 schema（計分鍵沿用 `#139` taxonomy 的 `(type, scope)` tuple、`outcome`
+  三態 `clean`／`fixup`／`fail`、`cost` reserved 並定義由 `#325` 已落地的 usage 聚合投
+  影）；定案 session-health 為診斷特徵、不進 reward；定案 cortex 端只產出 lesson
+  payload、不觸碰 `paulsha-hippo` `knowledge/` 目錄的跨 repo 邊界；定案棘輪介面契約與
+  `#209 capable()` 既有簽章相容，建議掛點為 `capable()` 判準之一而非另開
+  `autonomy.py` 內部路徑。詳見 `changelog.d/oneshot-lesson-loop-design.md`。
 - **Issue #340：builder persona 契約新增 `completion_obligations`（結束前必須 commit）**：`PersonaContract` 新增 `completion_obligations` 欄位（fail-closed schema 檢查），`personas.yaml` 的 `builder` 角色新增義務宣告「完成前必須 git add＋git commit，worktree 不乾淨不得回報完成」，由 `render_contract_prompt` 注入實際派工的 dispatch prompt，補上既有 `commit_policy: required`（只管寫入權限）與 manager 端事後 dirty-worktree 安全網之間「事前宣告義務」的缺口；空清單角色不受影響。
 ### Fixed
 - **Issue #339：run tick 對已有 needs_human 終局紀錄的 slice 不再重複 fanout**：`run_tick` 原本的冪等防護只排除 registry 中仍在 `dispatched`/`running` 的 job，job 一旦 poll 到 exited 就離開這個集合，不論其 `gate_status` 是 `needs_human`／`failed`／`passed`；`ready_units`/`default_is_satisfied` 只檢查「別人 depends_on 我」是否滿足，從未檢查「我自己是否已經跑過」，導致下一趟 tick 對已完成待人工的 slice 重新 fanout，撞 `ScriptWorktreeCreator.create` 的 `"worktree target already exists"`。現在派工前會掃描每個 slice 是否已有 handoff 終局紀錄，併入排除集合；此掃描不受 idle gate 影響，`require_idle` 擋下新工作時 `needs_human` 清單仍會回報。summary 新增 `needs_human: [{slice_id, gate_reason, handoff_path}, ...]` 欄位。
