@@ -24,8 +24,11 @@ jobs:
 
       - name: Detect test suite
         id: detect
+        # 用 find 而非 `ls A B`：`ls` 只要任一 glob 沒配到就回傳非零，
+        # 於是「有 test_*.py 但沒有 *_test.py」的 repo 會被誤判為無測試，
+        # 整個 pytest 段落被跳過卻仍回報 success（假綠燈）。
         run: |
-          if [ -d tests ] && ls tests/test_*.py tests/*_test.py >/dev/null 2>&1; then
+          if [ -d tests ] && [ -n "$(find tests -maxdepth 1 \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)" ]; then
             echo "has_tests=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_tests=false" >> "$GITHUB_OUTPUT"
