@@ -612,7 +612,7 @@ def build_request_executor(
                     args=dict(args),
                     requested_by=request["requested_by"],
                 )
-            if args.get("action") in {"start", "resume", "retry-build"}:
+            if args.get("action") in {"start", "resume", "retry-build", "intake"}:
                 registry = getattr(dispatcher, "_registry", None)
                 run_payload = result.get("result", {}).get("run") if isinstance(result, dict) else None
                 run_id = run_payload.get("run_id") if isinstance(run_payload, dict) else None

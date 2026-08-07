@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from paulsha_cortex.coordinator.completion import classify_completion
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
@@ -617,6 +618,211 @@ class HeadlessCompletionPollingTests(unittest.TestCase):
 
             self.assertEqual(updated["status"], "failed")
             self.assertNotEqual(updated["status"], "running")
+
+
+class UsageTrackingTests(unittest.TestCase):
+    """Issue #325：job record 收斂 token usage。"""
+
+    def test_update_headless_result_populates_usage_from_log(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "codex.jsonl"
+            log_path.write_text(
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 40,
+                            "cached_input_tokens": 5,
+                            "reasoning_output_tokens": 2,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="",
+                worktree="/wt/slice-a",
+            )
+            reg.attach_launch_handle(
+                "slice-a-1",
+                executor="codex",
+                session_name="slice-a",
+                pid=123,
+                log_path=str(log_path),
+            )
+
+            updated = reg.update_headless_result("slice-a-1", status="exited", exit_code=0)
+
+            self.assertIsNotNone(updated["usage"])
+            self.assertEqual(updated["usage"]["input_tokens"], 100)
+            self.assertEqual(updated["usage"]["output_tokens"], 40)
+            self.assertIsNone(updated["usage_reason"])
+            self.assertEqual(reg.get_job("slice-a-1")["usage"]["output_tokens"], 40)
+
+    def test_update_headless_result_usage_reason_for_unsupported_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "agy.jsonl"
+            log_path.write_text('{"type":"permission_denied"}\n', encoding="utf-8")
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="",
+                worktree="/wt/slice-a",
+            )
+            reg.attach_launch_handle(
+                "slice-a-1",
+                executor="agy",
+                session_name="slice-a",
+                pid=123,
+                log_path=str(log_path),
+            )
+
+            updated = reg.update_headless_result("slice-a-1", status="exited", exit_code=0)
+
+            self.assertIsNone(updated["usage"])
+            self.assertIn("unsupported", updated["usage_reason"])
+
+    def test_usage_extractor_crash_does_not_break_status_or_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "codex.jsonl"
+            log_path.write_text('{"type":"turn.completed","usage":{}}\n', encoding="utf-8")
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="",
+                worktree="/wt/slice-a",
+            )
+            reg.attach_launch_handle(
+                "slice-a-1",
+                executor="codex",
+                session_name="slice-a",
+                pid=123,
+                log_path=str(log_path),
+            )
+
+            with mock.patch(
+                "paulsha_cortex.coordinator.registry.extract_usage",
+                side_effect=RuntimeError("boom"),
+            ):
+                updated = reg.update_headless_result("slice-a-1", status="exited", exit_code=0)
+
+            self.assertEqual(updated["status"], "exited")
+            self.assertEqual(updated["exit_code"], 0)
+            self.assertIsNone(updated["usage"])
+            self.assertIn("extractor crashed", updated["usage_reason"])
+            # 落盤後重讀也要維持一致，不是只有 in-memory 回傳值正確。
+            self.assertEqual(reg.get_job("slice-a-1")["status"], "exited")
+            self.assertEqual(reg.get_job("slice-a-1")["exit_code"], 0)
+
+    def test_legacy_job_without_usage_fields_loads_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            legacy_job = {
+                "job_id": "slice-a-1",
+                "task": "slice-a",
+                "persona": "builder",
+                "kind": "build",
+                "branch": "feature/slice-a",
+                "pane": "",
+                "worktree": "/wt/slice-a",
+                "status": "exited",
+                "dispatch_head": None,
+                "executor": "codex",
+                "model_id": None,
+                "independence_domain": None,
+                "session_name": "slice-a",
+                "pid": 123,
+                "log_path": "/logs/slice-a.jsonl",
+                "exit_code": 0,
+                "subject_head": None,
+                "spec_hash": None,
+                "plan_hash": None,
+                "verification_hash": None,
+                "workflow_run_id": None,
+                "workflow_claim_key": None,
+                "workflow_repo": None,
+                "workflow_card": None,
+                "workflow_phase": None,
+                "workflow_repo_root": None,
+                "workflow_input_root": None,
+                "workflow_inputs": [],
+                "workflow_input_snapshot": [],
+                "workflow_outputs": [],
+                "source_revision": None,
+                "workflow_sandbox_hash": None,
+                "workflow_output_baseline": [],
+                "workflow_builder_job_id": None,
+                "workflow_stage_execution_key": None,
+                "workflow_evidence": None,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                # 刻意不含 usage/usage_raw/usage_reason/started_at/exited_at，
+                # 模擬本票落地前既存的歷史 job dict。
+            }
+            state.write_text(
+                json.dumps(
+                    {
+                        "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
+                        "seq": 1,
+                        "jobs": [legacy_job],
+                        "slices": [],
+                        "workflows": [],
+                        "legacy_records": {
+                            "source_schema_version": 1,
+                            "seq": 0,
+                            "jobs": [],
+                            "slices": [],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            reg = JobRegistry(state_path=state)
+            jobs = reg.list_jobs()
+
+            self.assertEqual(len(jobs), 1)
+            self.assertIsNone(jobs[0].get("usage"))
+            self.assertIsNone(jobs[0].get("started_at"))
+            self.assertIsNone(jobs[0].get("exited_at"))
+
+    def test_started_at_and_exited_at_are_recorded_and_ordered(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log_path = Path(d) / "missing.jsonl"
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            created = reg.create_job(
+                task="slice-a",
+                persona="builder",
+                branch="feature/slice-a",
+                pane="",
+                worktree="/wt/slice-a",
+            )
+            self.assertIsNone(created["started_at"])
+            self.assertIsNone(created["exited_at"])
+
+            attached = reg.attach_launch_handle(
+                "slice-a-1",
+                executor="codex",
+                session_name="slice-a",
+                pid=123,
+                log_path=str(log_path),
+            )
+            self.assertIsNotNone(attached["started_at"])
+            self.assertIsNone(attached["exited_at"])
+
+            updated = reg.update_headless_result("slice-a-1", status="failed", exit_code=1)
+
+            self.assertIsNotNone(updated["exited_at"])
+            self.assertGreaterEqual(updated["exited_at"], updated["started_at"])
 
 
 if __name__ == "__main__":

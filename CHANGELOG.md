@@ -6,7 +6,10 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Added
+- **Issue #340：builder persona 契約新增 `completion_obligations`（結束前必須 commit）**：`PersonaContract` 新增 `completion_obligations` 欄位（fail-closed schema 檢查），`personas.yaml` 的 `builder` 角色新增義務宣告「完成前必須 git add＋git commit，worktree 不乾淨不得回報完成」，由 `render_contract_prompt` 注入實際派工的 dispatch prompt，補上既有 `commit_policy: required`（只管寫入權限）與 manager 端事後 dirty-worktree 安全網之間「事前宣告義務」的缺口；空清單角色不受影響。
 ### Fixed
+- **Issue #339：run tick 對已有 needs_human 終局紀錄的 slice 不再重複 fanout**：`run_tick` 原本的冪等防護只排除 registry 中仍在 `dispatched`/`running` 的 job，job 一旦 poll 到 exited 就離開這個集合，不論其 `gate_status` 是 `needs_human`／`failed`／`passed`；`ready_units`/`default_is_satisfied` 只檢查「別人 depends_on 我」是否滿足，從未檢查「我自己是否已經跑過」，導致下一趟 tick 對已完成待人工的 slice 重新 fanout，撞 `ScriptWorktreeCreator.create` 的 `"worktree target already exists"`。現在派工前會掃描每個 slice 是否已有 handoff 終局紀錄，併入排除集合；此掃描不受 idle gate 影響，`require_idle` 擋下新工作時 `needs_human` 清單仍會回報。summary 新增 `needs_human: [{slice_id, gate_reason, handoff_path}, ...]` 欄位。
 - **paulshaclaw#264：status 條目補上明確 project 歸屬**：`recent_done`／`attention`／`slices` 現在投影明確的 `repo`；缺少來源時保留 `null`，不從 worktree 或 branch 猜測 project。
 - **Issue #295（primary）／#291（duplicate）：persona catalog 改以套件內建為 canonical 來源，非 cortex repo 的 slice 不再確定性卡 `persona-catalog-unreadable`**：`run_result_verification` 原本無條件從**目標 repo**讀 `paulsha_cortex/persona/personas.yaml`，該檔只存在於 paulsha-cortex 自身，跨 repo 治理必然卡 `needs_human`，且 `dispatch: auto` 又強制要求該 check 無法拿掉。改為先以 `git cat-file -e` 探測 `dispatch_base` tree 是否宣告 repo-local override：存在即維持既有 pin/fail-closed 行為；不存在則回退讀取 `paulsha_cortex.persona.loader.DEFAULT_PERSONAS_PATH` 套件內建 catalog 完成 scope 判定。override 壞損（不可讀／不合法）仍 fail-closed 不靜默回退；cortex repo 自身行為不退化。evidence 新增 `source`（`repo-local`／`packaged`）欄位可稽核判定依據。
 - **Issue #303：三個測試直讀 production coordinator 狀態檔，環境洩漏使本地 pytest gate 被宿主狀態污染**：`test_porcelain_inspect.py::test_inspect_missing_targets_exit_one[argv0-missing-job]`／`test_work_actions.py::test_auto_without_issue_mutates_every_mapped_issue`／`test_auto_without_issue_fails_closed_if_any_label_mutation_fails` 未隔離 coordinator root，未顯式覆寫 `PSC_*` 時經 `resolve_runtime_root()` 落回 `$HOME/.agents`，直讀宿主真實 `~/.agents/coordinator/jobs.json`；production 狀態異常時三測試連帶 fail-closed。同根因擴大排查後，`tests/conftest.py` 的 autouse `_clear_runtime_env` 改為同時把 `PSC_AGENTS_ROOT`／`PSC_CONFIG_ROOT` 指向每測試獨立的空 tmp 目錄（作為 fail-safe 安全網，覆蓋 coordinator／control／specs／monitor／project-config／run root 整個家族），並補上 5 支既有測試（`test_paths.py`／`test_install_service.py`／`test_coordinator_manager_daemon.py`）刻意驗證「未覆寫時落回 `$HOME`」語意所需的顯式 `PSC_AGENTS_ROOT` delenv。以 audit-hook 稽核與偽造 corrupted `jobs.json` 重現 W1 batch 情境驗證修復前後行為差異。詳見 `changelog.d/fix-test-production-state-leak.md`。
@@ -14,6 +17,33 @@
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
 - **Issue #324：combo 搜尋改支援 instance-local override，新增 small-fix 輕量 combo**：`deck/schema.py` 新增 `resolve_combo_path()`／`iter_combo_files()`／`combo_search_dirs()`，一律先查 `$PSC_AGENTS_ROOT/config/combos/<id>.yaml`，找不到才 fallback 到套件內建目錄（同 id 時 instance-local 優先、reinstall 不覆寫自訂檔）；`deck/selector.py`／`deck/cli.py`／`coordinator/work_bridge.py`／`porcelain/init_sample.py` 全數改走這兩個入口。另新增卡片 `writing-plans-light`（只吃 spec/design doc、不依賴 openspec proposal）與參考 combo `small-fix`（7 張卡、2 條核心 gate_spine，覆蓋全 7 個 phase 各恰一張），打斷小任務不需要的 openspec requires 全鏈；`small-fix` 只能經 `--combo small-fix` explicit override 使用，不進自動選牌映射。
+- **Issue #204：新增 skill usage ledger、proposal-first park janitor 與 core/emergency 永久豁免**：新模組 `paulsha_cortex/coordinator/skill_ledger.py`（append-only、去重的 `~/.agents/registry/skill_usage.jsonl` terminal 執行事件記錄，欄位固定白名單不含任何自由格式 payload）與 `skill_janitor.py`（cold-skill 判定＋proposal-first park／restore，比照既有 `gc.py` 只分類不執行的精神）；`manager.run_tick` 新增 `ledger_recorder`／`skill_janitor` 兩個注入點（與既有 `reaper` 同款預設不啟用、例外不破壞 tick）；新 CLI `cortex skill inspect|list-proposals|propose|approve-proposal|park|restore`。`class: core`／`class: emergency`（`deck/schema.py` 既有 `CARD_CLASSES` schema 欄位的首個治理消費點）於 cold 判定與所有 park 入口皆二次防呆強制豁免。
+- **Issue #203：`cortex work intake` 把 link+start 合成單一「拿到一個 issue/task 就進件」入口，不復活低階直派**：新增 `work-action` 動作 `intake`——帶 `--issue`／`--kind`+`--ref` 且尚未反映在受監控快照時先建立 override link（等價 `cortex work link`），再原樣轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`）；省略時直接沿用 work_id 現有的 confirmed authority。Intake 不會憑空建立新 authority——work_id 必須已在受監控權威快照中存在，且最終仍要求 confirmed Todo 或已授權的 issue/openspec/path 來源，否則 fail-closed，不建立 WorkflowRun。`contract.py`／`work_actions.py`／`manager.py`／`manager_daemon.py`／`cli.py`／`porcelain/run.py` 六處同步放行 `intake`；已停用的低階 `dispatch` 與既有 Telegram `/dispatch <slice_id>` 維持原樣，不在本次範圍內改動。詳見 `changelog.d/task-intake-work-authority.md`。
+- **Issue #325：job record 收斂 token usage——per-lane 成本歸屬的最小底座**：新增
+  `usage_extractors.py` 依 executor（codex／claude／copilot／agy）從 headless
+  session log 抽取 token 用量，各自處理累計值 vs 逐行累加、欄位語意易混淆
+  （如 claude 的 `cache_read_input_tokens` vs `cache_creation_input_tokens`）與
+  copilot `result.usage` 不含 token 數的誤讀陷阱；全程 fail-soft 不影響 job 的
+  status/exit_code 判定。job record 新增 `usage`／`usage_raw`／`usage_reason`／
+  `started_at`／`exited_at` 欄位，並新增 `cortex stat --usage-by-run` 依
+  workflow run 彙總用量。
+- **Issue #136：新增 `cortex capacity-gate check` porcelain 命令與 `claude.json` PreToolUse 模板**：補上「agent 手動呼叫 `Task`/`Agent` 或以 `Bash` 啟動 `codex exec`/`claude -p`/`copilot -p` headless session」這條完全繞過 manager daemon 既有 fanout idle gate 的 ad-hoc 破口。純函式 `classify_tool`/`evaluate_gate` 讀既有 `control.client.read_status()` 的 `daemon.idle` 布林，忙碌或 `degraded`（保守視為忙碌，避免讀不到狀態時靜默放行）時回傳 Claude Code PreToolUse hook 協定的 `ask` 決策；`claude.json` 新增 `PreToolUse` 區塊（`Task`／`Bash` matcher）僅為模板，寫入使用者 live `~/.claude/settings.json` 的切點屬 paulshaclaw thin install，本 repo 不自動生效。
+- **Issue #331：`cortex work migrate` 原子動詞設計（ADR-0002）**：新增
+  `docs/adr/0002-work-identity-migration.md`，定義用單一 atomic override
+  transaction＋寫入前凍結 authority 的 abandon CAS，把識別遷移（如 `-v2`
+  世代熔斷）收斂成 1-2 次 CLI 呼叫，取代現況要靠 5 個 PR、跨近 9 小時手動
+  拉鋸 `.cortex/work-items.yaml` 的流程（`#326`–`#330` 實測記錄）；刻意維持
+  `claim.py` 既有碰撞不變量與 source-owner-transfer 守門不變。純設計文件，
+  不含程式碼變動。詳見 `changelog.d/work-identity-migration-design.md`。
+- **Issue #276：builder 派工依 plan Task 邊界分段——設計文件（design-doc）**：新增
+  `openspec/changes/2026-08-07-builder-task-boundary-segmentation/` 與
+  `docs/superpowers/specs/builder-task-boundary-segmentation-{design,spec}.md`，
+  定案 per-Task fan-out（同 worktree 續派原語）、Task 邊界解析
+  （`planning.list_plan_tasks()`）、`build_dispatch_prompt()` 反漫遊／
+  commit 斷點語句、`classify_completion()` 新增 `context-exhausted` 分類、
+  commit log 續跑進度帳，以及與 #277 的介面邊界；本票不動任何
+  `paulsha_cortex/` 程式檔，code 落地拆為三張後續票。
+- **Issue #209：模型能力封套設計文件——定案 `capable()` 六項判準與 `resource-inventory` 四欄位契約**：新增 `openspec/changes/2026-08-07-design-model-capability-envelope/` 與 `docs/superpowers/specs/design-model-capability-envelope-{spec,design}.md`，定案 `#138` judge「能力配得上」謂詞的六項合取式與供給側四個靜態欄位契約；定案短期落地位置為既有 `model-identities.yaml`；定案三閘序（eligibility／admission／routing）並記錄與既有 `claim_readiness.CHECK_ORDER` 的落差；更正 issue §4 roster 現況——registry 全文只有一個身分，連 issue 自身修正 comment 的三身分表都對不上 main。純設計文件，未實作、未改任何 `.py`。詳見 `changelog.d/model-capability-envelope-design.md`。
 - **Issue #323：`cortex jobs`／`stat` 對 workflow lane job 補 work_id／primary issue 歸屬欄**：`wf-xxxxxxxx-<card>-<n>` job 輸出新增 `workflow_work_id`／`workflow_primary_issue` 兩欄，於輸出端以既有 `workflow_run_id` join registry 的 workflow run，零額外持久化狀態；card 已由既有 `workflow_card` 欄位提供。非 workflow lane job 與其餘既有欄位皆不受影響。
 - **Issue #178：新增 `cortex work gc` 交付後產物回收命令**：proposal-first 回收殘留 build worktree 與已 merge 的 repo local branch；預設 dry-run 只輸出候選清單與逐項 `reclaim`／`keep`＋reason code，`--apply` 才執行且逐項重驗（TOCTOU-safe）。merged 判定改走內容層驗證鏈（`git merge-base --is-ancestor` → `git cherry` 內容等價），修正 squash-merge 後 ref-ancestry 失真、`git branch -d`／`--merged` 誤拒已合併分支的既有陷阱；任何疑義一律 `keep` 並附 reason code，closed-unmerged PR 分支保留。新模組 `paulsha_cortex/coordinator/gc.py` 由 umbrella CLI 攔截路由，不經 manager daemon、對 registry 唯讀、不動 remote。
 - **Refs #294：slice spec 可宣告 executor/model_id 並於派工前強制 registry 驗證**：`dispatch_ready` 支援逐 slice 的 builder identity 覆寫，unknown identity fail-closed 並列出可用 candidates；同時 `cortex fanout`／`tick` 的明確 `(executor, model)` 與 periodic tick 預設 model 也改為先查 `model-identities.yaml`，避免 typo 直到 session 內才失敗。

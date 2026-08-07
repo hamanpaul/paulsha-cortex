@@ -158,3 +158,87 @@ def test_work_action_contract_requires_typed_routing_fields():
 def test_unknown_type_still_raises():
     with pytest.raises(ValueError):
         contract.build_request(req_type="nope", args={}, requested_by="x")
+
+
+def test_work_action_intake_accepts_bare_or_typed_link_syntax_and_allows_omission():
+    """issue #203：intake 的 issue/kind+ref 是可省略的（work_id 已有 confirmed
+    authority 時不需再帶），但一旦帶了就必須符合與 link 相同的恰好擇一語法。
+    """
+    bare = contract.build_request(
+        req_type="work-action",
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+    )
+    assert contract.validate_request(bare)["args"]["action"] == "intake"
+
+    legacy = contract.build_request(
+        req_type="work-action",
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo", "issue": 12},
+        requested_by="operator",
+    )
+    assert contract.validate_request(legacy)["args"]["issue"] == 12
+
+    typed = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "kind": "path",
+            "ref": "docs/todo.md",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(typed)["args"]["kind"] == "path"
+
+
+def test_work_action_intake_rejects_conflicting_or_partial_link_args():
+    both = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "issue": 12,
+            "kind": "path",
+            "ref": "docs/todo.md",
+        },
+        requested_by="operator",
+    )
+    with pytest.raises(ValueError, match="恰好擇一"):
+        contract.validate_request(both)
+
+    partial = contract.build_request(
+        req_type="work-action",
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo", "kind": "path"},
+        requested_by="operator",
+    )
+    with pytest.raises(ValueError, match="恰好擇一"):
+        contract.validate_request(partial)
+
+
+def test_work_action_intake_accepts_combo_like_start():
+    request = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+    )
+    assert contract.validate_request(request)["args"]["combo"] == "fix-standard"
+
+    invalid_combo = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "combo": "Bad Combo",
+        },
+        requested_by="operator",
+    )
+    with pytest.raises(ValueError, match="intake combo invalid"):
+        contract.validate_request(invalid_combo)

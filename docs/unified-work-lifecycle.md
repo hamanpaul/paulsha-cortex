@@ -52,6 +52,7 @@ cortex list --repo owner/repo --state todo --explain
 cortex work show unified-work-lifecycle --repo owner/repo --json
 cortex work link unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
 cortex work unlink unified-work-lifecycle --repo owner/repo --kind github_issue --ref owner/repo#14
+cortex work intake unified-work-lifecycle --repo owner/repo --issue 14
 cortex work start unified-work-lifecycle --repo owner/repo
 cortex work start unified-work-lifecycle --repo owner/repo --combo fix-standard
 cortex work resume unified-work-lifecycle --repo owner/repo
@@ -79,6 +80,33 @@ cortex doctor --probe-live --repo owner/repo --json
 `paulsha_cortex/deck/schema.py` 的 `resolve_combo_path()`／`iter_combo_files()`（`deck/cli.py`、`work_bridge.py`、`porcelain/init_sample.py` 皆已改走這兩個入口）會先查 `$PSC_AGENTS_ROOT/config/combos/<id>.yaml`，找不到才 fallback 到套件內建 `paulsha_cortex/deck/data/combos/`。同 id 時 instance-local 優先於套件內建，且 reinstall／升級套件不會蓋掉這份自訂檔——把自訂 combo YAML 放進 `$PSC_AGENTS_ROOT/config/combos/` 即可長期覆寫或新增 combo，不需要 fork 套件內建資料。兩個目錄都找不到指定 id 時 fail-closed，錯誤訊息會列出實際搜尋過的目錄清單。
 
 `small-fix` 是套件內建的輕量 combo 參考實作（`workflow-claim → brainstorming → writing-plans-light → subagent-build → verification → code-review → policy-commit`，7 張卡、2 條核心 gate_spine），刻意用 `writing-plans-light`（只吃 `docs/superpowers/specs/*<task-slug>*-design.md`，不依賴 `openspec/changes/<change>/proposal.md`）取代 `writing-plans`，打斷小任務不需要的 openspec 全鏈。`small-fix` 只能經 `--combo small-fix` explicit override 使用，不在 `task-types.yaml` 的自動選牌映射中（`combo.task_type` 填 `small-fix`，不是 `fix`——避免和 `fix-standard` 的自動選牌搶同一個 `fix` task type）。
+### Intake（`link` + `start` 合成，#203）
+
+`cortex work intake <work_id> --repo <owner/repo>` 是「拿到一個 issue/task 就進件」的單一入口，取代已停用的低階 `dispatch`。它等價於「（必要時）`link` 後接 `start`」，但收斂成一次呼叫：
+
+- 帶 `--issue N`（或 `--kind/--ref`）時，若該來源尚未反映在受監控快照的 `mapped_issues`／`mapped_openspec`／`mapped_todo_paths`，會先寫一筆 override link（與 `cortex work link` 相同語法、相同 fail-closed 驗證），再重新載入 authority。
+- 省略 `--issue`／`--kind`／`--ref` 時，直接沿用 work_id 現有的 confirmed authority（等價於單獨呼叫 `start`）——這是「work_id 已有 confirmed Todo 或已 link issue」時的常見用法。
+- 兩種路徑最終都轉交既有 `start` 語意（`claim_key` 去重、`--combo` override 皆比照 `start`），不繞過 `default_workflow_manifest`／`validate_manager_spine`。
+- **Intake 不會憑空建立新 authority**：`.cortex/work-items.yaml` 這份 override 檔與受監控的 `work-items.snapshot.json` 是兩份分開維護的狀態，override 寫入後仍要等下一輪 Monitor correlation 才會併入快照。因此若 work_id 既無 confirmed Todo、也未曾 link 過 issue，且本次呼叫也沒有帶 `--issue`／`--kind`/`--ref`，intake 會 fail-closed 拒絕，不建立 WorkflowRun；純文字任務仍需要先有明文授權來源（confirmed Todo 或 linked issue）才能進件。
+
+```bash
+cortex work intake unified-work-lifecycle --repo owner/repo --issue 14
+cortex work intake unified-work-lifecycle --repo owner/repo
+cortex work intake unified-work-lifecycle --repo owner/repo --issue 14 --combo fix-standard
+```
+
+Telegram 等 bot 宿主若要提供「貼一段文字/issue 就進件」的入口，應呼叫 `submit_work_action(action="intake", ...)`（`paulsha_cortex/control/client.py`）；既有的 `/dispatch <slice_id>` 走既存 slice_id 派工，維持原樣不變，不在本次範圍內改動。
+### Work identity migration（設計中，見 ADR-0002）
+
+`link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別
+（例如 `-v2` 世代熔斷）要把一批來源整批從舊 work_id 搬到新 work_id 時，只能
+靠多次分開的 `link`／`unlink` 呼叫加上「等 Monitor 下一次 rescan 確認生效」
+的手動判斷——`hamanpaul/paulsha-cortex#326`–`#330` 是本專案自己實際跑過一次
+的完整記錄，橫跨 5 個 PR、近 9 小時。`docs/adr/0002-work-identity-migration.md`
+定了收斂成單一 `cortex work migrate` 動詞的設計（單一 atomic override
+transaction、凍結 authority 做 abandon CAS、不放寬 `claim.py` 既有的碰撞
+不變量），供後續 code 票直接實作；本文件的 `## CLI` 範例區塊會在該動詞落地
+後同步補上。
 
 `retry-build` payload只接受`{"expected_candidate":"<40-char SHA>"}`。Manager會把它當CAS，不把caller內容當evidence；通常只有ongoing `needs_human` verify/review run、無active job、舊build全passed且Candidate完全相同時，才原子重開最後一張builder card，清除舊verify/review authority並立刻派出新builder。另一個窄化入口只處理final builder terminalization失敗：run必須停在build phase、前置build card全passed、final card pending，而且最新同card job已成功退出（`exited/0`）卻沒有workflow evidence；真正的failed job不符合此入口。所有recovery prompt都要求先檢查worktree是否已有repair commit，並允許builder提交或採用已測試的descendant Candidate；Manager仍獨立驗證exact舊Candidate CAS與單調ancestry。terminalization recovery另要求保留declared input snapshot並先檢查未綁定commit。Plan/build terminal的`outputs`只可列出符合manifest的repo-relative artifact paths；manifest沒有outputs時必須精確回`[]`，不得塞入action/summary物件。Ship authority 原則上必須仍為pending；唯一例外是已通過且 identity 精確為 `cortex-manager/deterministic/cortex` 的 `openspec-archive`，此時保留official archive step並只重設後續gate，讓post-archive finding可由tested descendant Candidate修正。Manager會把已移走的active brainstorm artifact對應到同hash且唯一的official archive path重證，不接受caller改寫authority、模糊archive或symlink；任何其他已通過ship card仍拒絕retry。新Candidate仍必須是舊Candidate的exact descendant。`link`、`unlink`、`start` 與 `resume` 不要求 caller 提供 repo root；Manager 只會從 installer 的 `PSC_REPO_ROOT` 或 Monitor workspace registry 解析與 `owner/repo` remote 完全一致的 canonical git top-level。當同work只有一個`done/ship` run且terminal journal binding完整時，explicit `resume`會重跑current authority的ship validator來刷新stale CompletionRecord；不會建立新run、重開builder或dispatch card，pending／needs-human／malformed結果也不會覆寫既有completion。`auto` 未指定相容用的 `--issue` 時會套用到全部 confirmed mapped issues。
 

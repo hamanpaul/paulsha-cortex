@@ -82,6 +82,19 @@ class RenderContractPromptTests(unittest.TestCase):
         self.assertIn("build", prompt)
         self.assertIn("git commit", prompt)
 
+    def test_builder_prompt_includes_completion_obligations(self) -> None:
+        from paulsha_cortex.persona import render
+
+        prompt = render.render_contract_prompt("builder")
+        self.assertIn("completion_obligations", prompt)
+        self.assertIn("不得回報", prompt)
+
+    def test_reviewer_prompt_omits_completion_obligations(self) -> None:
+        from paulsha_cortex.persona import render
+
+        prompt = render.render_contract_prompt("reviewer")
+        self.assertNotIn("completion_obligations", prompt)
+
     def test_deterministic(self) -> None:
         from paulsha_cortex.persona import render
 

@@ -522,6 +522,47 @@ cortex work review-attest "$WORK_ID" --repo "$REPO" --actor "$ACTOR" \
 - `--apply` 必須搭配 `--cwd-root <realpath>`，只允許 scoped project 下的 broker 候選。
 - signal 前會重驗 `ppid/start-time/cmdline/cwd`；僅送 `SIGTERM`，不做 escalation。PID reuse / race 只提供 best-effort 安全保護。
 
+## Skill usage ledger 與 park janitor（#204）
+
+append-only skill 執行事件記錄、cold-skill 偵測與 proposal-first park／restore，落於
+`~/.agents/registry/`（`skill_usage.jsonl` / `skill_park.json` / `skill_park_proposals/`，
+`PSC_AGENTS_ROOT` 可整族覆寫）。treated 為 `paulsha_cortex.coordinator.skill_ledger` /
+`skill_janitor` 兩個模組；`manager.run_tick` 提供 `ledger_recorder` / `skill_janitor`
+注入點（與既有 `reaper` 同款「預設不啟用、例外不破壞 tick」模式），production 排程是否
+啟用由呼叫端決定。
+
+Operator 流程：
+
+```bash
+# 唯讀：每個 skill 的樣本數／最後使用時間／目前 cold／park 判定
+cortex skill inspect
+
+# 唯讀：列出 janitor 已開的 park proposal（pending／approved）
+cortex skill list-proposals
+
+# 手動跑一次 janitor tick：偵測 cold skill、只開 proposal，不動 park 狀態
+cortex skill propose
+
+# 核准既有 pending proposal，套用 park（需 operator 明確帶 --approved-by）
+cortex skill approve-proposal <proposal_id> --approved-by "$ACTOR"
+
+# 不經 proposal，直接手動 park 一個 skill（同樣需 --approved-by）
+cortex skill park <skill_id> --reason "..." --approved-by "$ACTOR"
+
+# 撤銷 park（可逆：只改 park 狀態，不動 skill 檔案或 ledger）
+cortex skill restore <skill_id> --approved-by "$ACTOR"
+```
+
+- `class: core` / `class: emergency`（`deck/schema.py` 的 `Card.card_class`）在
+  cold 判定與所有 park 入口（janitor proposal、`approve-proposal`、手動 `park`）
+  都強制豁免，不可被 park。
+- cold 判定閾值（最低樣本數 / 觀測窗天數）為初始預設值，未經人類最終核可；
+  細節與調整方式見
+  `docs/superpowers/plans/2026-08-07-skill-cold-threshold-defaults.md`。
+- `park` 目前只記錄狀態（`cortex skill inspect` 可讀出），尚未接上任何 skill
+  選牌／router 路徑——deck combo 選牌目前沒有消費 park 狀態的機制，這條「park →
+  排除於自動選牌之外」預期由後續 shared read model（issue #139）承接。
+
 ## Monitor registry merge
 
 - manual config：`~/.agents/config/paulsha/project-cortex.yaml`
@@ -564,6 +605,7 @@ export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
 | coordinator runtime | `jobs` / `stat` / `ready` / `status` 為讀取路徑；`fanout` / `complete` / `tick` / `slice-action` / `work` 走 control queue；舊低階 `dispatch` 已停用 |
 | deck 驗證 | compile 只產生 `dispatch: hold` 骨架；verify 只檢查 `produces` glob 存在性，不驗內容 |
 | monitor registry | `project-cortex.yaml` ⊍ `project-hippo.yaml`，realpath 去重且 manual 優先 |
+| skill 治理（#204） | ledger／park state／janitor proposal 已落地，`cortex skill` 可操作；`manager.run_tick` 的 `ledger_recorder`／`skill_janitor` 是可注入 hook，預設不啟用（比照既有 `reaper` 慣例）；park 狀態尚未接上任何選牌/router 消費點 |
 | 依賴模型 | 僅 `PyYAML`；runtime 不依賴 `paulsha-hippo` |
 
 ## 開發備註

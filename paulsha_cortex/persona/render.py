@@ -22,6 +22,15 @@ def render_contract_prompt(
     write_paths = "\n".join(f"  - {p}" for p in ctx["write_paths"])
     effective_tools = "\n".join(f"  - {t}" for t in ctx["effective_tools"])
 
+    completion_obligations_block = ""
+    completion_obligations = ctx["completion_obligations"]
+    if completion_obligations:
+        obligations = "\n".join(f"  - {o}" for o in completion_obligations)
+        completion_obligations_block = (
+            "- completion_obligations（結束前必須全部滿足，否則不得回報完成）：\n"
+            f"{obligations}\n"
+        )
+
     return (
         f"[PERSONA CONTRACT — role: {ctx['role']} (v{ctx['version']})]\n"
         "你在本次派工中扮演上述角色，且 MUST 嚴守以下契約邊界：\n"
@@ -30,5 +39,6 @@ def render_contract_prompt(
         f"{write_paths}\n"
         "- effective_tools（僅可使用下列工具）:\n"
         f"{effective_tools}\n"
+        f"{completion_obligations_block}"
         "[END PERSONA CONTRACT]"
     )

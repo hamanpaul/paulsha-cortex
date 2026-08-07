@@ -437,3 +437,42 @@ def test_apply_work_action_forwards_combo_override_for_start(
     )
 
     assert captured["combo_override"] == "fix-standard"
+
+
+def test_apply_work_action_forwards_combo_override_for_intake(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """issue #203：intake 內部等價於 start，manager 層縱深防禦也要放行
+    combo（見 test_apply_work_action_forwards_combo_override_for_start 的
+    對稱案例、test_apply_work_action_drops_combo_override_for_resume 的反例）。
+    """
+
+    captured: dict[str, object] = {}
+
+    def fake_start_canonical_workflow(**kwargs):
+        captured["combo_override"] = kwargs.get("combo_override")
+        raise RuntimeError("stop-after-capture")
+
+    monkeypatch.setattr(work_bridge, "start_canonical_workflow", fake_start_canonical_workflow)
+
+    def fake_execute_work_action(*, args, requested_by, workflow_registry, workflow_starter):
+        with pytest.raises(RuntimeError, match="stop-after-capture"):
+            workflow_starter(None, "claim:v1:" + "1" * 64, None)
+        return {"action": "captured"}
+
+    monkeypatch.setattr(coordinator_work_actions, "execute_work_action", fake_execute_work_action)
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    coordinator_manager.apply_work_action(
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "work",
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+        registry=registry,
+    )
+
+    assert captured["combo_override"] == "fix-standard"
