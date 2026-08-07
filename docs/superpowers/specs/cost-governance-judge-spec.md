@@ -27,13 +27,19 @@ budget／limit／alert／throttle／enforce／policy，看得到額度、不做�
   （已落地設計）D3／R3 已明文裁定 **不新建**此檔，四個能力封套靜態欄位 additive 掛在
   `model-identities.yaml`（schema v2→v3）。本票 D1 沿用此裁定，MVP 不新增第二批靜態
   欄位。
-- `capable()`（`#209`，已落地設計，尚未 code-landed）：`claim_readiness.py:18` 與
-  `:421-437` 明文標註 `#209 not yet landed`，`capability_probe()` 目前恆
+- `capable()`（`#209`，已落地設計——`design-model-capability-envelope-{spec,design}.md`
+  於 main 存在，尚未 code-landed）：`claim_readiness.py:18` 與 `:421-437` 明文標註
+  `#209 not yet landed`，`capability_probe()` 目前恆
   `_passed("capability", bypass="envelope_unavailable")`——即這格闖關永遠通過。
-- `track_record()`（`#137`，已落地設計，尚未 code-landed）：全 repo `grep -rn
-  "track_record"` 於 `paulsha_cortex/` 零命中，`oneshot-lesson-loop-spec.md` R4 已
-  凍結函式簽章 `track_record(resource, task_type: str, scope: str | None = None) ->
-  float`，與 `#209` R1 第六項判準相容。
+- `track_record()`（`#137`，**設計初稿、尚未合併 main、尚未 code-landed**）：`git branch
+  -a` 顯示 `oneshot-lesson-loop-{spec,design}.md` 只存在於未合併的 sibling 分支
+  `feature/137-oneshot-lesson-loop-design`（`git merge-base --is-ancestor` 對 `main`
+  回傳 false；`git ls-remote --heads origin` 亦無此分支），main 上 `git ls-tree -r main
+  --name-only | grep oneshot` 零命中——**不可與 `#209`／`#139` 的「已落地設計」等同視之**。
+  函式簽章 `track_record(resource, task_type: str, scope: str | None = None) -> float`
+  引自該分支草稿 R4（與 `#209` R1 第六項判準相容），本票只引用其簽章作為介面對齊依據，
+  不代表該設計已定案落地；下文所有「`#137` 已落地設計」字樣統一訂正為此處的準確狀態，
+  詳見「與 #137 狀態的訂正說明」段落。
 - `#136`（已落地，code + design）：`paulsha_cortex/porcelain/capacity_gate.py`
   `evaluate_gate()` 是 **PreToolUse hook 用的 daemon-idle 布林閘**，管的是互動 session
   中手動 spawn subagent/headless 的破口，與本票要的「resource 級 quota/rate 是否有
@@ -47,8 +53,43 @@ budget／limit／alert／throttle／enforce／policy，看得到額度、不做�
 - `autonomy.py:394` `ready_units()` 與 `autonomy.py:447` `dispatch_ready()` 之間目前
   **沒有任何** admission/routing 過濾層——`ready_units()` 判斷結構完整性後直接交給
   `dispatch_ready()` fan-out，這正是本票 D4 要插入「控速分流層」的空隙，且此掛點選擇
-  與同批 `#137` design D4 的建議完全對齊（`#137` 已明文「棘輪不是 `autonomy.py` 內部
-  新函式，而是 `#209 capable()` 的一個因子，被 `#138` judge 呼叫」）。
+  與同批 `#137` design 草稿（未合併分支）D4 的建議掛點一致（該草稿主張「棘輪不是
+  `autonomy.py` 內部新函式，而是 `#209 capable()` 的一個因子，被 `#138` judge
+  呼叫」）——僅作為介面對齊參考，不代表該草稿已定案或已合併。
+- `#324`（已落地，main，「combo 可擴充與可選」）與本票**無資料或函式介面耦合**：
+  `#324` 落地的是 `deck/schema.py` 的 combo 搜尋路徑（instance-local override）與
+  `small-fix` 輕量 combo，屬 workflow/card 派工骨架層；`#324` issue 原文「非目標」
+  段落自行畫出邊界——「勝率／outcome scoring → `#137`；cost-aware routing →
+  `#138`」，即 `#324` 明文把本票的範圍排除在外。本票在此記錄查證結果：兩者是
+  **不相交**的責任邊界（combo 選牌 vs. resource 級 cost-aware routing），非「有
+  介面待對齊」關係，不需要本票額外定義接線點。
+
+## 與 `#137` 狀態的訂正說明
+
+本文件初版曾多處把 `#137`（one-shot 成效閉環／track-record）標注為「已落地設計」，
+與 `#209`（`design-model-capability-envelope-{spec,design}.md`）、`#139`
+（`design-task-type-taxonomy-v2-{spec,design}.md`）並列——**此標注不成立，已訂正**。
+複驗查證（`main @ a2e8d0c`）：
+
+- `git ls-tree -r main --name-only | grep -i oneshot`：零命中，main 上不存在任何
+  `#137` 的設計文件。
+- `#137` 的 `oneshot-lesson-loop-{spec,design}.md` 只存在於本 repo 本機的 sibling
+  分支 `feature/137-oneshot-lesson-loop-design`（`git merge-base --is-ancestor
+  feature/137-oneshot-lesson-loop-design main` 回傳 false）；`git ls-remote --heads
+  origin` 亦無此分支，未推送到遠端，更未合併。
+- `docs/superpowers/workstreams/cost-governance-cluster/todo.md` 自身的叢集 A 表格
+  （本檔緊鄰列）把 `#137` 標為 **`open`**，與「已落地設計」矛盾。
+- `#209` 自己的 `design-model-capability-envelope-spec.md:98` 在 R1 第 6 項判準把
+  `#137` 標注為「`#137`（**尚未落地**；`grep -rn "track_record" paulsha_cortex`
+  零命中，本票只引用函式簽章，不假設其內部實作）」——`#209` 才是對 `#137` 狀態的
+  準確表述，本文件應與其一致而非自相矛盾。
+
+**修正後的準確表述**：`#137` 的設計是**未合併的本機分支草稿**，非「已落地設計」。
+本文件下游所有引用 `#137` 函式簽章／掛點建議之處，語意皆改為「引用該草稿內容作為
+介面對齊參考，不代表其已定案、已合併或已落地」；`#137` 本體（設計與程式碼）皆待該
+分支正式開 PR 並合併 main 後才算落地。這不影響本票（`#138`）的任何 D/R 決策內容
+本身——interim stub 契約（R4）本就已把 `track_record` 列為恆真 stub，訂正只是狀態
+描述用語精確化，不變更設計。
 
 ## Goals
 
@@ -91,6 +132,18 @@ durable JSON persistence 設計）。
 `rate_tracker` MUST NOT 擴充 `model_identities.py`（靜態 registry）、
 `claim_readiness.py`（一次性交易）、或 `manager_daemon.py`（daemon-level 迴圈狀態）
 三者任一——三者的既有語意邊界理由見 design D3。
+
+**與 `#325`（已落地，main @ PR `#356`）的介面關係**：`#325`
+（「job record 收斂 token usage」）已在 `registry.py` 落地 job 級的 `usage`／
+`usage_raw` 欄位（`input_tokens`／`output_tokens`／`cached_input_tokens`／
+`reasoning_output_tokens`，per-executor adapter 抽取），是**歷史、per-job、事後**
+的用量歸屬記錄，供 `cortex jobs`/`stat` 輸出消費。`rate_tracker`（本節）是
+**即時、per-resource、事前**的請求速率閘門（token bucket 的 `available` 布林），
+兩者資料形狀與更新時機都不同，不是同一份資料的兩種投影——`rate_tracker` MUST NOT
+直接消費 `usage`/`usage_raw` 作為即時判斷依據（`#325` 的 issue 本文「非目標」段落
+自身也明文排除「不做預算、擋工、控速、告警 → #138」，確認兩者是互補而非重疊的
+分工）。若未來要用 `#325` 累積的歷史 usage 校準 `rate_tracker` 的 `capacity`
+初始值或做離線分析，屬後續實作票範圍，本票只記錄此依賴方向、不預先設計。
 
 ### R2 控速分流層介面契約凍結，掛點為 `autonomy.py` 兩函式之間
 
@@ -204,8 +257,9 @@ JOIN 呼叫端讀取。`rate_tracker` MUST NOT 自建獨立 CLI 或另一條查�
 - 不實作 `rate_tracker.py`、`filter_ready()`、`should_terminate()` 任一本體。
 - 不接線 cost meter（`paulshaclaw/cost/`）進 status view `quota` 鍵——那是待未來票對齊
   `paulshaclaw` owner 的跨 repo工作，本票只記錄依賴方向。
-- 不實作 `#209` `capable()`、不實作 `#137` `track_record()`——本票只引用兩者已凍結的
-  函式簽章。
+- 不實作 `#209` `capable()`、不實作 `#137` `track_record()`——本票只引用 `#209`
+  已凍結（main 落地）的函式簽章，以及 `#137` 未合併草稿分支提出、尚未定案的函式簽章
+  （見「與 `#137` 狀態的訂正說明」）。
 - 不修改 `autonomy.py`／`claim_readiness.py`／`manager_daemon.py`／
   `capacity_gate.py` 既有程式碼一行。
 - 不修改 `#136`／`#137`／`#209` 既有設計文件文字。
@@ -222,16 +276,20 @@ JOIN 呼叫端讀取。`rate_tracker` MUST NOT 自建獨立 CLI 或另一條查�
 
 - `cost-governance-judge-spec.md`／`cost-governance-judge-design.md` 皆含非空
   frontmatter（`status`／`work_item`）與非空 Requirements／Decisions 段落，行數量級
-  比照 `oneshot-lesson-loop-{spec,design}.md`（195／158 行）與
-  `design-model-capability-envelope-{spec,design}.md`（256／227 行）。
+  比照 `design-model-capability-envelope-{spec,design}.md`（256／227 行，main 已落地
+  可直接核對）；`oneshot-lesson-loop-{spec,design}.md`（195／158 行）僅存在於 `#137`
+  未合併的 `feature/137-oneshot-lesson-loop-design` 分支，**於 main checkout 上核對
+  此條會找不到檔案**——複驗者須先 `git fetch`／切到該分支才能核對，或視為暫不可驗證。
 - R1 `RateSnapshot` 欄位與 `#209` R2 的 `(executor, model_id)` 複合鍵一致（可用
   `grep -n "(executor, model_id)"` 於 `design-model-capability-envelope-spec.md`
-  與本文件互相核對）。
-- R4 的四因子判斷式逐項可追溯到對應已落地設計票的函式簽章（`capable()` 見
-  `design-model-capability-envelope-spec.md:98`；`track_record()` 見
-  `oneshot-lesson-loop-spec.md:150`）。
+  與本文件互相核對，兩者皆在 main，可直接驗證）。
+- R4 的四因子判斷式：`capable()` 簽章可在 main 核對，見
+  `design-model-capability-envelope-spec.md:98`；`track_record()` 簽章僅能在
+  `#137` 未合併分支的 `oneshot-lesson-loop-spec.md:150` 核對，main 上暫不可驗證
+  （見「與 `#137` 狀態的訂正說明」）。
 - R2 的 `filter_ready` 掛點（`autonomy.py:394` 與 `:447` 之間）與 `#137`
-  `oneshot-lesson-loop-design.md` D4 的建議掛點描述一致（互相印證，非本票孤立主張）。
+  未合併草稿 `oneshot-lesson-loop-design.md` D4 的建議掛點描述一致（互相印證，非本票
+  孤立主張；但該草稿本身尚未合併 main，此條驗證同樣需先取得該分支）。
 - `docs/superpowers/workstreams/cost-governance-cluster/todo.md` 的 `#138` 列狀態
   更新為「設計文件已交付」。
 - 全套 `pytest` 維持綠燈不倒退（本票不改 `.py`，屬留證性質而非風險緩解）。

@@ -52,7 +52,7 @@ additive 擴充 `model-identities.yaml`，MUST NOT 新開第二個 inventory 檔
 | `quota` | cost meter（`paulshaclaw/cost/`，非本 repo） | 已有實作（跨 vendor quota 取數），未暴露成本票能消費的 view 介面——本票不落地此介接，留給後續實作票 |
 | `rate` | **`#138` 本票自己負責** | 全 repo zero 命中（`grep -rn "token_bucket\|rate_limit"` 於 `paulsha_cortex/` 無治理相關命中），本票 D3 定義其資料結構 |
 | `health` | `#139` 六項落地任務之一（跨 agent 存活） | 未落地，本票只消費其欄位契約，不重複定義 |
-| `track_record` | `#137`（已落地設計） | `track_record(resource, task_type, scope=None) -> float`（`oneshot-lesson-loop-spec.md` R4），型別已與 `#209 capable()` 第六項對齊 |
+| `track_record` | `#137`（**設計初稿，`feature/137-oneshot-lesson-loop-design` 分支，尚未合併 main**——訂正見文末「與 `#137` 狀態的訂正說明」） | `track_record(resource, task_type, scope=None) -> float`（草稿 `oneshot-lesson-loop-spec.md` R4），型別已與 `#209 capable()` 第六項對齊，但簽章本身尚未定案 |
 
 `rate` 欄位型別本票 SHALL 凍結為：`dict[str, RateSnapshot]`，鍵為
 `f"{executor}:{model_id}"`（與 `#209` R2 的 `(executor, model_id)` 複合鍵一致，字串化
@@ -76,7 +76,7 @@ additive 擴充 `model-identities.yaml`，MUST NOT 新開第二個 inventory 檔
 ### D3 rate 自追：新模組 `rate_tracker.py`，token bucket 資料結構
 
 新增獨立模組 `paulsha_cortex/coordinator/rate_tracker.py`（實作票落點，本票不寫程式
-碼），不擴充下列既有模組（避免撞責任邊界，比照 `#137` D1 的排除表寫法）：
+碼），不擴充下列既有模組（避免撞責任邊界，比照 `#137` 未合併草稿 D1 的排除表寫法）：
 
 | 既有模組 | 為何不適合承載 rate tracking |
 |---|---|
@@ -105,7 +105,7 @@ additive 擴充 `model-identities.yaml`，MUST NOT 新開第二個 inventory 檔
 明確裁量依據。
 
 ### D4 控速分流層：不是 `#136`，是夾在 `autonomy.py` `ready_units()` 與
-`dispatch_ready()` 之間的一層新過濾——與 `#137` D4 的建議掛點完全對齊
+`dispatch_ready()` 之間的一層新過濾——與 `#137` 未合併草稿 D4 的建議掛點一致
 
 issue §5 原文用詞「控速分流層」容易讓後續實作票誤認為與 `#136`（已落地）是同一層或
 要擴充 `#136`。查證 main 現況：`#136` 落地的 `paulsha_cortex/porcelain/capacity_gate.py`
@@ -120,7 +120,8 @@ admission 閘（不擋，只排隊/詢問），是同一閘序位置上的兩把
 `capacity_gate.evaluate_gate()`，也 MUST NOT 讓 `#138` 重新發明一個 daemon-idle 判斷
 （那是 `#136` 已解決的問題）。
 
-真正的掛點（沿用 `#137` design D4 已建議、本票確認採納的方案 3）：
+真正的掛點（沿用 `#137` design 草稿——未合併分支——D4 建議、本票確認採納的方案 3；
+該草稿本身尚未定案或合併，本票僅引其掛點分析作為對齊參考）：
 
 ```
 manager.ready_units()          -- autonomy.py:394，結構完整性判定（#136/#138 之前）
@@ -205,7 +206,7 @@ judge(work, resource) =
       rate_available(resource)                          -- D3，本票自己的 rate_tracker
     ∧ quota_remaining(resource) > 0                      -- cost meter（外部，非本 repo）
     ∧ capable(resource, work)                            -- #209 R1 六項合取（已落地設計）
-    ∧ track_record(resource, work.task_type) ≥ threshold -- #137 R4（已落地設計）
+    ∧ track_record(resource, work.task_type) ≥ threshold -- #137 R4（設計初稿，未合併）
 ```
 
 `judge` 選第一個滿足全部四項的 resource（deterministic 順序，比照 registry 既有迭代
@@ -216,12 +217,12 @@ judge(work, resource) =
 四個因子目前的實際落地狀態各自獨立，`filter_ready`（D4）落地時 **不需要等四者全部
 code-landed**，可先用以下 stub 逐步替換，且每個 stub 都已有明確的「真值」替換點：
 
-| 因子 | interim stub | 真值替換點（設計已定案，等實作票） |
+| 因子 | interim stub | 真值替換點 |
 |---|---|---|
-| `rate_available` | 恆真（D3 `rate_tracker.py` 尚未落地） | `rate_tracker.consume()` |
-| `quota_remaining` | 恆真（cost meter 尚未暴露 view 介面給本 repo） | 待未來票把 `paulshaclaw/cost/` 接進 D2 status view |
-| `capable` | 恆真（`claim_readiness.py:421-437` 現況正是這個 bypass：`capability_lookup is None` 時 `_passed(..., bypass="envelope_unavailable")`） | `#209` R1 的實作票落地 `capable()` 本體後 |
-| `track_record` | 恆真（`#137` `track_record.py` 尚未落地） | `#137` R4 的實作票落地 `track_record()` 本體後 |
+| `rate_available` | 恆真（D3 `rate_tracker.py` 尚未落地） | `rate_tracker.consume()`（設計已定案，本票 D3，等實作票） |
+| `quota_remaining` | 恆真（cost meter 尚未暴露 view 介面給本 repo） | 待未來票把 `paulshaclaw/cost/` 接進 D2 status view（設計已定案，本票 D2，等實作票） |
+| `capable` | 恆真（`claim_readiness.py:421-437` 現況正是這個 bypass：`capability_lookup is None` 時 `_passed(..., bypass="envelope_unavailable")`） | `#209` R1 的實作票落地 `capable()` 本體後（`#209` 設計已落地 main，等 code） |
+| `track_record` | 恆真（`#137` `track_record.py` 尚未落地） | `#137` R4 的實作票落地 `track_record()` 本體後（`#137` **設計本身也尚未落地 main**——未合併分支草稿，需先合併設計、再落地 code） |
 
 四項全恆真時，`judge` 恆選第一個 eligibility 通過的 resource——這與**現況**
 （`ready_units()` 之後無任何 admission/routing 過濾，直接 `dispatch_ready()`）行為
@@ -236,7 +237,8 @@ release——緩解：本節明文「stub 全恆真＝現況等價的安全 no-o
 
 ### D7 session 終止槓桿：只定觸發契約，串接 `#137` `session_health`
 
-沿用 `#137`（已落地設計）R2 的既有邊界：`session_health` 是**不透明 pass-through**
+沿用 `#137`（**設計初稿，未合併 main**——見文末訂正說明）R2 的既有邊界：`session_health`
+是**不透明 pass-through**
 欄位（`dict | None`），MUST NOT 併入 outcome/reward 計分，但**可以**用於歸因與早期
 預警——本票的 session 終止觸發正是「早期預警」的消費端之一。
 
@@ -288,3 +290,36 @@ def should_terminate(signals: SessionSignals) -> TerminationDecision | None:
   照抄 issue 字面去找一個不存在的 config，會卡住——緩解：D4 已明文查證結果（本 repo
   不存在），並保留「池總吞吐＝各桶速率之和」的概念供未來若帳號池真的落地時直接套用
   D3 的 token bucket 模型，不需要另外設計聚合邏輯。
+
+## 與相鄰票的介面關係
+
+- **`#325`（已落地，main，PR `#356`）**：`registry.py` 落地的 job 級 `usage`／
+  `usage_raw` 欄位是歷史、per-job、事後的用量記錄，與本票 D3 `rate_tracker` 要的
+  即時、per-resource、事前速率閘門是不同資料形狀與更新時機，兩者互補不重疊——`#325`
+  issue 本文「非目標」段落自行排除「控速、告警 → #138」，確認邊界不衝突。完整查證見
+  `cost-governance-judge-spec.md` R1 段落。
+- **`#324`（已落地，main，「combo 可擴充與可選」）**：與本票**無資料或函式介面耦合**，
+  屬 workflow/card 派工骨架層（combo 搜尋路徑、`small-fix` 輕量 combo），`#324` issue
+  本文「非目標」段落自行畫出邊界（「cost-aware routing → #138」）。記錄查證結果供
+  複驗核對，非本票需要接線的相鄰模組。
+
+## 與 `#137` 狀態的訂正說明
+
+本文件初版多處把 `#137`（one-shot 成效閉環／track-record）標注為「已落地設計」，與
+`#209`（`design-model-capability-envelope-{spec,design}.md`，main 已落地）並列——
+**此標注不成立，已訂正為「設計初稿，`feature/137-oneshot-lesson-loop-design` 分支，
+尚未合併 main」**。查證依據：
+
+1. `git ls-tree -r main --name-only | grep -i oneshot` 於本 repo 零命中——main 上不
+   存在任何 `#137` 的設計文件。
+2. `git merge-base --is-ancestor feature/137-oneshot-lesson-loop-design main` 回傳
+   false（未合併）；`git ls-remote --heads origin` 亦無此分支（未推送）。
+3. `docs/superpowers/workstreams/cost-governance-cluster/todo.md` 的叢集 A 表格本身
+   把 `#137` 列為 `open`，與「已落地設計」矛盾。
+4. `#209` 自己的 `design-model-capability-envelope-spec.md:98` 在 R1 第 6 項判準把
+   `#137` 標注為「尚未落地」——`#209` 對 `#137` 狀態的表述才是準確的，本文件應與其
+   一致。
+
+本節訂正不改變本票任何 D/R 決策內容：interim stub 契約（D6／spec R4）本就已把
+`track_record` 列為恆真 stub，訂正只是把狀態描述從「已落地設計」精確化為「設計初稿、
+未合併」，前述 D2／D3／D4／D6／D7 各處提及 `#137` 之處已同步訂正引用文字。

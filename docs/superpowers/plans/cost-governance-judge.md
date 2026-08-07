@@ -13,12 +13,21 @@ work_item: cost-governance-judge
 
 ## 依賴前提（派工前必讀）
 
-- `#209 capable()` 本體與 `#137 track_record()` 本體目前皆為**已落地設計、尚未
-  code-landed**——下列子票中標「可獨立先做」的不需要等它們，標「依賴」的需要等對應
-  票的程式碼落地。
+- `#209 capable()` 本體目前為**已落地設計（`design-model-capability-envelope-
+  {spec,design}.md` 在 main）、尚未 code-landed**。`#137 track_record()` 本體現況
+  更早一階——**設計本身也尚未落地 main**（`oneshot-lesson-loop-{spec,design}.md`
+  只存在於未合併的 `feature/137-oneshot-lesson-loop-design` 分支，詳見
+  `cost-governance-judge-design.md`「與 `#137` 狀態的訂正說明」），須先合併設計、
+  再落地程式碼。下列子票中標「可獨立先做」的不需要等它們，標「依賴」的需要等對應
+  票的程式碼落地（`#137` 一項還額外多一道「先合併設計」的前置）。
 - 四個 interim stub（design D6／spec R4）保證骨架先行不會讓現有派工行為退化，因此
   子票 2（`filter_ready` 骨架）可以在子票 1（`rate_tracker`）之前或並行動工，不構成
   阻擋。
+- 已落地票 `#325`（job usage schema）與本票子票 1（`rate_tracker.py`）**無直接依賴**：
+  `#325` 的 `registry.py` `usage`／`usage_raw` 是歷史 per-job 記錄，子票 1 是即時
+  per-resource 速率閘門，兩者資料源不同（詳見 design.md／spec.md「與相鄰票的介面
+  關係」）；`#324`（combo 可擴充與可選）與本票任何子票皆無介面耦合，僅記錄查證結果
+  供派工參考，不影響本表拆分。
 
 ## 後續實作票拆分
 
