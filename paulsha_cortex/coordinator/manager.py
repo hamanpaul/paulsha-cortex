@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Protocol
 
 from paulsha_cortex.config import paths
@@ -793,6 +794,63 @@ def _review_inputs_drifted(slice_row: dict, review_job: dict) -> bool:
     ) or slice_row["verification"]["hash"] != review_job.get("verification_hash")
 
 
+def _slice_review_authority_inputs(
+    *,
+    slice_row: Mapping[str, object],
+    repo_root: Path,
+    coordinator_root: Path | None,
+    candidate: str,
+) -> tuple[dict[str, str] | None, tuple[dict[str, str], ...] | None]:
+    if coordinator_root is None:
+        return None, None
+    identity = SimpleNamespace(
+        run_id=str(slice_row["slice_id"]),
+        work_id=str(slice_row["slice_id"]),
+        repo=str(repo_root),
+        source_revision=candidate,
+    )
+    authority: dict[str, str] = {}
+    rows: list[dict[str, str]] = []
+    for key in ("spec", "plan"):
+        payload = slice_row.get(key)
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"slice review {key} payload invalid")
+        raw_path = payload.get("path")
+        digest = payload.get("hash")
+        if not isinstance(raw_path, str) or not isinstance(digest, str):
+            raise ValueError(f"slice review {key} payload invalid")
+        path = Path(raw_path)
+        # 對齊 _pinned_input_mismatches：legacy/回復情境可能留下相對 path（例如
+        # 舊版 pin_dispatch_inputs 寫入的 plan path），一律以 repo_root 為 base
+        # resolve，避免這裡誤用當前 cwd 解析而讀錯檔或拋例外。
+        if not path.is_absolute():
+            path = repo_root / path
+        path = path.resolve()
+        relative = path.relative_to(repo_root.resolve()).as_posix()
+        data = path.read_bytes()
+        actual = verification.sha256_bytes(data)
+        if actual != digest:
+            raise ValueError(f"slice review {key} input drift")
+        authority[relative] = actual
+        content_ref = _write_workflow_input_content(
+            coordinator_root=coordinator_root,
+            run=identity,
+            ref=relative,
+            digest=actual,
+            content=data.decode("utf-8"),
+        )
+        rows.append(
+            {
+                "pattern": relative,
+                "path": relative,
+                "sha256": actual,
+                "authority": "planning-authority",
+                "content_ref": content_ref,
+            }
+        )
+    return authority, tuple(rows)
+
+
 def _launch_foreign_review(
     *,
     registry,
@@ -921,11 +979,20 @@ def _launch_foreign_review(
         verification_hash=slice_row["verification"]["hash"],
     )
     try:
+        authority_inputs = _slice_review_authority_inputs(
+            slice_row=slice_row,
+            repo_root=repo_root,
+            coordinator_root=coordinator_root,
+            candidate=candidate,
+        )
         review_worktree = foreign_review.prepare_review_worktree(
             repo_root=repo_root,
             slice_id=slice_id,
             reviewer_job_id=reviewer_job["job_id"],
             candidate=candidate,
+            authority=authority_inputs[0],
+            input_snapshot=authority_inputs[1],
+            source_revision=candidate if authority_inputs[0] else None,
             subprocess_runner=subprocess_runner,
             git_runner=git_runner,
         )
@@ -1855,6 +1922,8 @@ def run_tick(
     reaper: Callable[[], dict] | None = None,
     review_executor: str | None = None,
     review_model: str | None = None,
+    identity_registry=None,
+    launcher_factory=None,
 ) -> dict:
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
@@ -1895,6 +1964,8 @@ def run_tick(
                 launcher=launcher,
                 git_runner=getattr(dispatcher, "_git_runner", None),
                 handoff_dir=handoff_dir,
+                identity_registry=identity_registry,
+                launcher_factory=launcher_factory,
             )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)
@@ -3231,6 +3302,15 @@ def _workflow_input_snapshot(
             raise ValueError(f"workflow declared input missing: {pattern}")
         for ref in authority_refs:
             source_matches = _safe_input_matches(operator_root, ref)
+            if len(source_matches) != 1:
+                archived_ref = _planning_artifact_relative_path_after_archive(
+                    run,
+                    workspace=operator_root,
+                    ref=ref,
+                    digest=authority[ref].baseline_sha256,
+                ).as_posix()
+                if archived_ref != ref:
+                    source_matches = _safe_input_matches(operator_root, archived_ref)
             if len(source_matches) != 1:
                 raise ValueError("workflow planning input missing")
             source = source_matches[0]
@@ -7139,6 +7219,18 @@ def apply_workflow_action(
                     ship_validator(run=current, candidate=candidate),
                     candidate=candidate,
                 )
+                if status in {"pending", "needs_human"}:
+                    persisted = registry.get_workflow_run(run_id)
+                    if (
+                        persisted.current_phase != current.current_phase
+                        or persisted.candidate_head != current.candidate_head
+                    ):
+                        return {
+                            "run_id": persisted.run_id,
+                            "current_phase": persisted.current_phase,
+                            "reason": trusted.get("reason")
+                            or ("delivery-in-progress" if status == "pending" else "delivery-needs-human"),
+                        }
                 if status == "passed":
                     review_kind = trusted["review_kind"]
                     by_kind.pop("maintainer-review" if review_kind == "copilot" else "copilot", None)

@@ -191,6 +191,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    ```
 
    `--executor`／`--model` 省略時由 daemon 採用部署設定；帶 `--wait [--timeout N]` 時成功為 exit 0、terminal failure 為 exit 1、逾時仍為 exit 3。所有 queue mutation 都可加 `--json` 取得 `cortex-porcelain/run/v1` 輸出。
+   若 spec frontmatter 成對宣告 optional `executor`／`model_id`，fanout/tick 會逐 slice 覆寫這裡的 builder 預設值；命令列明確指定與 spec frontmatter 宣告的 `(executor, model_id)` 都會先查 `model-identities.yaml`，unknown identity 直接 fail-closed 並列出可用 candidates。
    `cortex run work start/resume/...` 額外支援 `--planner-executor`／`--planner-model`／`--builder-executor`／`--builder-model`／`--reviewer-executor`／`--reviewer-model`：run-scoped 覆寫該 work item 這次 claim 的 planner/builder/reviewer 模型鏈，三段各自獨立、未指定的段落回退共享 `model-identities.yaml`。覆寫只影響這個 run，不改共享設定檔、不影響其他 active run 尚未派出的 card；於 claim（或首次 dispatch）時凍結，之後 resume／retry 沿用凍結值。指定的 identity 仍須通過既有 capability 與 builder/reviewer independence domain 檢查，違反時 CLI 直接回報錯誤原因並列出可用 identity，不會靜默退回共享預設。
 
 11. 用 `recover` 家族執行受限復原；slice/work mutation 的 `--actor` 為必要審計欄位：
@@ -281,7 +282,7 @@ cortex tick \
   --review-model "<reviewer-model-id>"
 ```
 
-`tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--model` / `--review-model` 原樣傳給 executor，能否使用仍取決於該 CLI 與帳號權限。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。
+`tick` 會依序處理 ready fanout、既有 Job 輪詢、deterministic verification、必要的 foreign review 與 completion 判斷。`--executor`／`--model` 是整批 builder 預設值；spec frontmatter 若成對宣告 `executor`／`model_id`，會逐 slice 覆寫且沿用同一套 commit-required／approval-safety 語意。命令列明確指定與 per-slice 覆寫的 `(executor, model_id)` 都必須存在於 `model-identities.yaml`，才會真正進 executor argv。不要在一般操作加入 `--allow-unsafe`；它會旁路 executor approval/sandbox，且只允許單一 ready slice canary。
 
 若 fanout 發生 `dispatch` 例外，`tick` 回傳仍包含 `completed` 與 `dispatched`，並在 `errors` 按 slice 回報 `slice_id`、`type`、`message`，讓上層在部分派送成功時仍可見完整狀態。
 
@@ -477,6 +478,7 @@ identities:
 
 - schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity，自訂檔不得以不同內容 shadow 它。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
+- fanout/tick 明確指定的 builder `(executor, model_id)`，以及 spec frontmatter 成對宣告的 `executor`／`model_id`，都會先查這份 registry；unknown identity 會在派工前 fail-closed 並列出可用 candidates。
 - workflow reviewer 只會選擇明示 `capabilities: [review]` 且與 Builder 不同 independence domain 的 schema v2 identity；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
 - Verify/Review 以 executor 的 enforced read-only mode在exact Candidate的remote-free disposable clone檢查；Claude reviewer固定使用`dontAsk`與`safe-mode`，只暴露OS-sandboxed Bash並要求structured JSON object，不載入Candidate `CLAUDE.md`/skills/plugins/MCP/remote session，也不進Plan Mode。Filesystem預設拒讀整個home、`/run/user`與Docker sockets，只重開Candidate與Python user-site工具鏈，並對Candidate clone設deny-write；review subprocess只保留`PATH`、`HOME`、locale、`TMPDIR`、`VIRTUAL_ENV`等非密鑰基礎環境，且不啟動login shell。Linux/WSL host必須安裝`bubblewrap`、`socat`與官方sandbox runtime（Ubuntu可用`sudo apt-get install bubblewrap socat`，再用`npm install -g @anthropic-ai/sandbox-runtime`）；任一依賴缺失、Unix-socket seccomp失效或命令要求unsandboxed fallback都拒絕啟動。Manager在所有terminal/launch failure/operator retry路徑重驗原Candidate完整tree snapshot後清除clone。agent只回傳substantive result、findings與inline report body；report僅能發布至phase專屬的`reports/verify/*.md`或`reports/review/*.md`，並由durable publication journal把多檔CAS、canonical evidence與registry bind組成可rollback/roll-forward的transaction。Manager會從durable Job注入Candidate、builder/reviewer job ID與launch identity，agent不取得report或Candidate寫入權。
 - `cortex doctor`會在identity registry配置Claude `review` capability時把Claude Code 2.1.187+、必要CLI flags、`bubblewrap`、`socat`與`srt`執行能力列為required probe；`--probe-live`另跑native read-only與Unix-socket seccomp smoke。沒有Claude reviewer的部署只顯示非必要warn。Claude的protected bind targets位於deterministic disposable session root，exact Candidate則固定在其無污染的`candidate/` checkout。

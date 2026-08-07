@@ -16,6 +16,8 @@ EMITTED_FRONTMATTER_FIELDS = (
     "depends_on",
     "target_branch",
     "verification",
+    "executor",
+    "model_id",
     "parse_error",
 )
 CARD_KINDS = ("skill",)

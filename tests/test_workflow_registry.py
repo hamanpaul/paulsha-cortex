@@ -11,8 +11,10 @@ from paulsha_cortex.coordinator import registry as registry_module
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import (
     PlanningArtifactAuthority,
+    SHIP_TRANSITION_STAGES,
     WorkflowRun,
     WorkflowStep,
+    validate_ship_stage_transition,
 )
 
 
@@ -207,6 +209,33 @@ def test_workflow_run_update_is_typed_persisted_and_rejects_phase_regression(tmp
 
     with pytest.raises(ValueError, match="phase transition"):
         registry._manager_update_workflow_run(created.run_id, current_phase="plan")
+
+
+@pytest.mark.parametrize(
+    ("current", "new"),
+    [
+        ("local-closeout", "local-closeout"),
+        ("local-closeout", "pr-preflight"),
+        ("pr-preflight", "external-ship"),
+    ],
+)
+def test_ship_stage_transition_accepts_monotonic_progress(current: str, new: str) -> None:
+    assert SHIP_TRANSITION_STAGES == ("local-closeout", "pr-preflight", "external-ship")
+    validate_ship_stage_transition(current, new)
+
+
+@pytest.mark.parametrize(
+    ("current", "new"),
+    [
+        ("pr-preflight", "local-closeout"),
+        ("external-ship", "pr-preflight"),
+        ("local-closeout", "external-ship"),
+        ("bogus", "local-closeout"),
+    ],
+)
+def test_ship_stage_transition_rejects_regression_and_invalid_values(current: str, new: str) -> None:
+    with pytest.raises(ValueError, match="ship transition stage"):
+        validate_ship_stage_transition(current, new)
 
 
 def test_malformed_v2_workflow_rejected_without_rewrite(tmp_path: Path) -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 from hashlib import sha256
@@ -229,6 +231,9 @@ def prepare_review_worktree(
     slice_id: str,
     reviewer_job_id: str,
     candidate: str,
+    authority: Mapping[str, str] | None = None,
+    input_snapshot: Sequence[Mapping[str, object]] | None = None,
+    source_revision: str | None = None,
     subprocess_runner: SubprocessRunner | None = None,
     git_runner: Callable[[list[str]], object] | None = None,
 ) -> Path:
@@ -255,6 +260,73 @@ def prepare_review_worktree(
     head_stdout = head["stdout"].strip().lower()
     if head["status"] != "ok" or head_stdout != candidate.lower():
         raise RuntimeError("review worktree head mismatch")
+    if worktree.is_symlink() or (worktree.exists() and not worktree.is_dir()):
+        raise RuntimeError("review worktree path invalid")
+    worktree.mkdir(parents=True, exist_ok=True)
+    extended_inputs = bool(authority) or bool(input_snapshot)
+    if extended_inputs:
+        if authority is None or input_snapshot is None or source_revision is None:
+            raise ValueError("review worktree authority materialization requires authority, input_snapshot, and source_revision")
+        from . import manager as workflow_manager
+
+        records: list[dict[str, str]] = []
+        for row in input_snapshot:
+            envelope = workflow_manager._read_workflow_input_content(row)
+            ref = str(envelope["path"])
+            ref_path = Path(ref)
+            if ref_path.is_absolute() or ".." in ref_path.parts:
+                raise ValueError("review worktree authority seed ref path invalid")
+            target = worktree / ref
+            parent = worktree
+            for part in Path(ref).parent.parts:
+                parent = parent / part
+                if parent.is_symlink():
+                    raise ValueError("review worktree authority seed parent symlink rejected")
+                parent.mkdir(exist_ok=True)
+                if parent.is_symlink() or not parent.is_dir():
+                    raise ValueError("review worktree authority seed parent invalid")
+                parent.resolve().relative_to(worktree)
+            content = str(envelope["content"]).encode("utf-8")
+            if target.is_symlink():
+                raise ValueError("review worktree authority seed symlink rejected")
+            try:
+                target.parent.resolve(strict=True).relative_to(worktree)
+            except ValueError as exc:
+                raise ValueError("review worktree authority seed escapes workspace") from exc
+            if target.exists():
+                if not target.is_file() or target.read_bytes() != content:
+                    raise ValueError("review worktree authority seed conflict")
+            else:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            records.append(
+                {
+                    "path": ref,
+                    "sha256": str(envelope["sha256"]),
+                    "source_revision": source_revision,
+                    "candidate": candidate.lower(),
+                }
+            )
+        materialization_path = worktree / ".psc-review-materialization.json"
+        materialization_payload = {"authority": records}
+        body = json.dumps(materialization_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        if materialization_path.exists():
+            if materialization_path.is_symlink() or materialization_path.read_text(encoding="utf-8") != body:
+                raise ValueError("review worktree materialization record conflict")
+        else:
+            fd = os.open(materialization_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+        verify_authority_in_input_snapshot(
+            authority=authority,
+            input_snapshot=input_snapshot,
+            workspace_root=worktree,
+        )
     return worktree
 
 
@@ -262,6 +334,7 @@ def verify_authority_in_input_snapshot(
     *,
     authority: Mapping[str, str],
     input_snapshot: Sequence[Mapping[str, object]],
+    workspace_root: str | Path | None = None,
 ) -> None:
     """Prove every frozen planning authority ref carries its pinned hash in the
     review job's input snapshot before a reviewer may be dispatched.
@@ -290,6 +363,31 @@ def verify_authority_in_input_snapshot(
     drifted = sorted(ref for ref in authority if rows_by_path[ref].get("sha256") != authority[ref])
     if drifted:
         raise ValueError(f"review input snapshot authority hash drift: {', '.join(drifted)}")
+    if workspace_root is None:
+        return
+    root = Path(workspace_root).resolve()
+    missing_workspace = []
+    drifted_workspace = []
+    for ref, digest in authority.items():
+        target = root / ref
+        if target.is_symlink() or not target.is_file():
+            missing_workspace.append(ref)
+            continue
+        try:
+            target.resolve(strict=True).relative_to(root)
+        except ValueError:
+            missing_workspace.append(ref)
+            continue
+        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            drifted_workspace.append(ref)
+    if missing_workspace:
+        raise ValueError(
+            f"review input snapshot missing frozen authority: {', '.join(sorted(missing_workspace))}"
+        )
+    if drifted_workspace:
+        raise ValueError(
+            f"review input snapshot authority hash drift: {', '.join(sorted(drifted_workspace))}"
+        )
 
 
 def _normalize_evidence_item(item: object, *, field: str) -> dict[str, Any]:

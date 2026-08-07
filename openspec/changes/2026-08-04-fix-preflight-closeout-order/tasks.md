@@ -5,10 +5,10 @@ work_item: fix-preflight-closeout-order
 
 # Tasks
 
-- [ ] 1.1 RED：依 `docs/superpowers/plans/fix-preflight-closeout-order.md` 的 TDD RED 章節新增 `tests/test_preflight_closeout_order.py`，確認全部失敗。
-- [ ] 1.2 實作至 GREEN，範圍限於 `docs/superpowers/specs/fix-preflight-closeout-order-spec.md` 的 Requirements（R1–R6）；不動 `WORKFLOW_PHASES` spine、不改 external mutation 授權模型、不新增 job row 欄位。
-- [ ] 1.3 `changelog.d/fix-preflight-closeout-order.md` fragment 與 `CHANGELOG.md [Unreleased]` entry（#263）；`docs/unified-work-lifecycle.md` 同步三段語意與停止點。
-- [ ] 1.4 `python3 -m pytest tests/ -q` 全綠；帶 PR 上下文的 `policy_check` 0 fail；`git diff --check` 乾淨。
+- [x] 1.1 RED：依 `docs/superpowers/plans/fix-preflight-closeout-order.md` 的 TDD RED 章節新增 `tests/test_preflight_closeout_order.py`，確認全部失敗。
+- [x] 1.2 實作至 GREEN，範圍限於 `docs/superpowers/specs/fix-preflight-closeout-order-spec.md` 的 Requirements（R1–R6）；不動 `WORKFLOW_PHASES` spine、不改 external mutation 授權模型、不新增 job row 欄位。
+- [x] 1.3 `changelog.d/fix-preflight-closeout-order.md` fragment 與 `CHANGELOG.md [Unreleased]` entry（#263）；`docs/unified-work-lifecycle.md` 同步三段語意與停止點。
+- [x] 1.4 `python3 -m pytest tests/ -q` 全綠；帶 PR 上下文的 `policy_check` 0 fail；`git diff --check` 乾淨。
 
 ## 驗收
 

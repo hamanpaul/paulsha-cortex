@@ -36,7 +36,14 @@ def _add_tracking_options(parser: argparse.ArgumentParser) -> None:
 def _add_executor_options(parser: argparse.ArgumentParser, *, review: bool) -> None:
     parser.add_argument("--specs-dir", default=None, help="覆寫 daemon specs 目錄")
     parser.add_argument("--executor", default=None, help="覆寫 builder executor")
-    parser.add_argument("--model", default=None, help="覆寫 builder model ID")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "覆寫 builder model ID 預設值；spec frontmatter 宣告 executor/model_id 時逐 slice 覆寫；"
+            "明確指定的 (executor, model_id) 須為 model-identities 已註冊身分"
+        ),
+    )
     if review:
         parser.add_argument("--review-executor", default=None, help="覆寫 reviewer executor")
         parser.add_argument("--review-model", default=None, help="覆寫 reviewer model ID")

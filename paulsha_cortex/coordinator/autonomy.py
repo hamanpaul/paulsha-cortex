@@ -11,6 +11,7 @@ from . import completion
 from .contract_command import build_dispatch_prompt
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
+from .model_identities import load_model_identities
 from . import verification
 
 # is_satisfied predicate 型別：收 slice_id，回該相依是否「已滿足」（可釋放下游）。
@@ -61,7 +62,8 @@ def _split_frontmatter(text: str) -> str | None:
 def parse_spec_frontmatter(path) -> dict:
     """解析 superpowers spec 開頭 --- frontmatter。
 
-    回 {path, dispatch, slice_id, plan, depends_on}。
+    回 {path, dispatch, slice_id, plan, depends_on, target_branch, verification,
+    executor, model_id, parse_error}。
     硬約束：dispatch 僅在字面值為 'auto' 時為 'auto'，其餘一律 'hold'（fail-safe）。
     容忍無 frontmatter（視為 hold），不 raise。
     """
@@ -77,6 +79,8 @@ def parse_spec_frontmatter(path) -> dict:
         "depends_on": [],
         "target_branch": None,
         "verification": None,
+        "executor": None,
+        "model_id": None,
         "parse_error": None,
     }
     if block is None:
@@ -107,6 +111,8 @@ def parse_spec_frontmatter(path) -> dict:
         meta["target_branch"] = (
             data.get("target_branch") if isinstance(data.get("target_branch"), str) else None
         )
+        meta["executor"] = data.get("executor") if isinstance(data.get("executor"), str) else None
+        meta["model_id"] = data.get("model_id") if isinstance(data.get("model_id"), str) else None
         meta["parse_error"] = exc.as_payload()
         return meta
 
@@ -119,6 +125,8 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
         "depends_on",
         "target_branch",
         "verification",
+        "executor",
+        "model_id",
         "parse_error",
     }
     extras = set(data) - allowed
@@ -136,6 +144,8 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
         "depends_on": _normalize_depends_on(data.get("depends_on")),
         "target_branch": None,
         "verification": None,
+        "executor": None,
+        "model_id": None,
         "parse_error": None,
     }
     plan = data.get("plan")
@@ -169,6 +179,24 @@ def _normalize_frontmatter(path: Path, data: dict) -> dict:
     elif dispatch == "auto":
         raise verification.ContractValidationError(
             "verification", "auto dispatch requires a verification contract"
+        )
+    has_executor = data.get("executor") is not None
+    has_model_id = data.get("model_id") is not None
+    if has_executor != has_model_id:
+        missing = "model_id" if has_executor else "executor"
+        counterpart = "executor" if missing == "model_id" else "model_id"
+        raise verification.ContractValidationError(
+            missing,
+            f"{missing} must be declared together with {counterpart}",
+        )
+    if has_executor:
+        meta["executor"] = verification.normalize_non_empty_string(
+            data.get("executor"),
+            field="executor",
+        )
+        meta["model_id"] = verification.normalize_non_empty_string(
+            data.get("model_id"),
+            field="model_id",
         )
     if data.get("parse_error") is not None:
         raise verification.ContractValidationError(
@@ -313,12 +341,27 @@ def _build_graph(metas: list[dict]) -> dict[str, list[str]]:
     return graph
 
 
+def classify_batch_dependency(
+    dep: str,
+    *,
+    batch_ids: set[str],
+    handoff_dir: str,
+) -> str | None:
+    if dep in batch_ids:
+        return None
+    manifest_path = Path(handoff_dir) / f"{dep}.json"
+    if manifest_path.is_file():
+        return f"deps-external:{dep}"
+    return f"deps-unknown:{dep}"
+
+
 def detect_cycles(metas: list[dict]) -> None:
     """以 slice_id 為節點、depends_on 為有向邊偵測循環相依。
 
     成環 → raise ValueError（帶 cycle path）。
     重複 slice_id → raise ValueError（先於 DFS，見 _build_graph）。
-    指向不在 metas 的 slice_id 的邊不算環（外部/未掃到，交給 is_satisfied）。
+    指向不在 metas 的 slice_id 的邊不算環（外部/未掃到；診斷責任在
+    classify_batch_dependency）。
     """
     graph = _build_graph(metas)
 
@@ -409,6 +452,8 @@ def dispatch_ready(
     git_runner=None,
     launcher: AgentLauncher | None = None,
     handoff_dir: str = DEFAULT_HANDOFF_DIR,
+    identity_registry=None,
+    launcher_factory=None,
 ) -> list[dict]:
     """算就緒集，對每單位經注入的 headless AgentLauncher 各啟一個 agent（一單位一 job）。
 
@@ -441,6 +486,7 @@ def dispatch_ready(
         if callable(commit_required_factory):
             launcher = commit_required_factory()
     runner = git_runner or _default_git_runner
+    resolved_identity_registry = identity_registry
     jobs: list[dict] = []
     errors: list[tuple[str, Exception]] = []
     for m in ready:
@@ -450,6 +496,44 @@ def dispatch_ready(
         try:
             prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             pinned_inputs = pin_dispatch_inputs(m)
+            # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
+            # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
+            # 再被更新（見下方 _mark_slice_needs_human），故先嘗試取現有 branch head
+            # 存底；branch 尚未建立（首次派工常態）時取不到，None 為預期落點。
+            try:
+                early_dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
+            except Exception:
+                early_dispatch_head = None
+            _record_pending_slice(
+                dispatcher=dispatcher,
+                slice_id=slice_id,
+                pinned_inputs=pinned_inputs,
+                dispatch_base=early_dispatch_head,
+            )
+            active_launcher = launcher
+            executor = m.get("executor")
+            model_id = m.get("model_id")
+            if isinstance(executor, str) and executor and isinstance(model_id, str) and model_id:
+                if resolved_identity_registry is None:
+                    resolved_identity_registry = load_model_identities()
+                identity = resolved_identity_registry.get(executor, model_id)
+                if identity is None:
+                    available = ", ".join(
+                        f"{item.executor}/{item.model_id}"
+                        for item in resolved_identity_registry.identities
+                    ) or "(none)"
+                    raise ValueError(
+                        f"spec identity unknown: {executor}/{model_id}（可用 candidates: {available}）"
+                    )
+                if launcher_factory is None:
+                    raise ValueError(
+                        f"slice {slice_id} declares executor/model_id but launcher_factory is unavailable"
+                    )
+                active_launcher = launcher_factory(identity)
+                if persona == "builder":
+                    commit_required_factory = getattr(active_launcher, "as_commit_required", None)
+                    if callable(commit_required_factory):
+                        active_launcher = commit_required_factory()
             base_sha = _resolve_target_base_sha(
                 meta=m,
                 pinned_inputs=pinned_inputs,
@@ -462,12 +546,6 @@ def dispatch_ready(
                 dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
             except Exception:
                 dispatch_head = None
-            _record_pending_slice(
-                dispatcher=dispatcher,
-                slice_id=slice_id,
-                pinned_inputs=pinned_inputs,
-                dispatch_base=base_sha or dispatch_head,
-            )
             log_dir = str(Path("runtime/dispatch") / slice_id)
             # 在 launch 前先落地 registry row：Popen 之後、記錄完成之前若 daemon
             # 崩潰，仍有可回收的 job 列（否則 agent 在跑卻無 job / in_flight / 輪詢）。
@@ -484,7 +562,7 @@ def dispatch_ready(
                 builder_job_id=job.get("job_id"),
                 dispatch_base=base_sha or dispatch_head,
             )
-            handle = launcher.launch(
+            handle = active_launcher.launch(
                 slice_id=slice_id,
                 prompt=prompt,
                 worktree=worktree,
