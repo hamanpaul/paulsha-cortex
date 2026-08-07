@@ -41,7 +41,7 @@ def _add_executor_options(parser: argparse.ArgumentParser, *, review: bool) -> N
         default=None,
         help=(
             "覆寫 builder model ID 預設值；spec frontmatter 宣告 executor/model_id 時逐 slice 覆寫；"
-            "明確指定的 (executor, model) 須為 model-identities 已註冊身分"
+            "明確指定的 (executor, model_id) 須為 model-identities 已註冊身分"
         ),
     )
     if review:

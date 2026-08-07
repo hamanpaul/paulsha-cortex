@@ -62,7 +62,8 @@ def _split_frontmatter(text: str) -> str | None:
 def parse_spec_frontmatter(path) -> dict:
     """解析 superpowers spec 開頭 --- frontmatter。
 
-    回 {path, dispatch, slice_id, plan, depends_on, executor, model_id}。
+    回 {path, dispatch, slice_id, plan, depends_on, target_branch, verification,
+    executor, model_id, parse_error}。
     硬約束：dispatch 僅在字面值為 'auto' 時為 'auto'，其餘一律 'hold'（fail-safe）。
     容忍無 frontmatter（視為 hold），不 raise。
     """
@@ -495,11 +496,19 @@ def dispatch_ready(
         try:
             prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             pinned_inputs = pin_dispatch_inputs(m)
+            # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查
+            # 或 base_sha 解析若晚點失敗，slice 落 needs_human 後 dispatch_base 不會
+            # 再被更新（見下方 _mark_slice_needs_human），故先嘗試取現有 branch head
+            # 存底；branch 尚未建立（首次派工常態）時取不到，None 為預期落點。
+            try:
+                early_dispatch_head: str | None = runner(["rev-parse", _branch_for_slice(slice_id)])
+            except Exception:
+                early_dispatch_head = None
             _record_pending_slice(
                 dispatcher=dispatcher,
                 slice_id=slice_id,
                 pinned_inputs=pinned_inputs,
-                dispatch_base=None,
+                dispatch_base=early_dispatch_head,
             )
             active_launcher = launcher
             executor = m.get("executor")

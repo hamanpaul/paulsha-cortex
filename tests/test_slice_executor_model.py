@@ -463,6 +463,10 @@ def test_dispatch_ready_unknown_identity_fail_closed_lists_available(tmp_path: P
     assert "codex/gpt-5.4-codex" in str(excinfo.value)
     assert default_launcher.calls[0]["slice_id"] == "slice-good"
     assert registry.get_slice("slice-bad")["state"] == "needs_human"
+    # reviewer #333-1：identity 檢查失敗於 base_sha 解析前，needs_human 之後
+    # dispatch_base 不會再被更新，故 pending slice 建立時須先嘗試填入既有
+    # branch head（非硬編碼 None），保留可診斷基準。
+    assert registry.get_slice("slice-bad")["dispatch_base"] == "f" * 40
 
 
 def test_dispatch_ready_no_declaration_behavior_unchanged(tmp_path: Path) -> None:

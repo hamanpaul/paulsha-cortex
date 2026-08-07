@@ -865,8 +865,19 @@ class FanoutTests(unittest.TestCase):
             self.assertEqual(launcher.calls, ["real-a", "real-b"])
             self.assertEqual(sender.sent, [])   # headless：不送 tmux pane
             self.assertEqual(real_calls, [])     # 注入 git_runner → 全程不啟動真 git
+            # 每 slice 兩次 rev-parse baseline：_record_pending_slice 前的 best-effort
+            # early fetch（identity/base_sha 若晚點失敗仍留診斷基準）＋ launch 前的
+            # 權威 dispatch_head（見 autonomy.py 內 reviewer #333-1 註解）。
             baseline_calls = [call for call in git_calls if call[:1] == ["rev-parse"]]
-            self.assertEqual(baseline_calls, [["rev-parse", "feature/real-a"], ["rev-parse", "feature/real-b"]])
+            self.assertEqual(
+                baseline_calls,
+                [
+                    ["rev-parse", "feature/real-a"],
+                    ["rev-parse", "feature/real-a"],
+                    ["rev-parse", "feature/real-b"],
+                    ["rev-parse", "feature/real-b"],
+                ],
+            )
             self.assertEqual(sum(1 for call in git_calls if len(call) >= 3 and call[2] == "fetch"), 2)
             self.assertEqual(
                 sum(
