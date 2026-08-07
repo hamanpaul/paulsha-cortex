@@ -2720,6 +2720,24 @@ def _is_workflow_terminal_payload(value: object) -> bool:
     )
 
 
+def _is_stale_terminalized_failed_job(job: Mapping[str, object]) -> bool:
+    """#260 D6：把「exited 且 exit code 非 0」併入既有 ``status == 'failed'`` 的
+    stale-terminal 判定。
+
+    `resume_workflow_run` 的 replacement 選擇與 `_dispatch_workflow_card` 的
+    `retryable_latest` 過去只認 ``status == "failed"``；repair job 以非 0 exit
+    code 正常終止（``status == "exited"``）時不落在這條件內，導致第一次
+    operator resume 只重新回報 stale job 的 `job-failed`，要再執行一次才
+    dispatch replacement。收斂點刻意選在既有條件式旁新增一個並列分支，不動
+    exited/0 的既有三條路徑（unbound terminal recovery、malformed schema
+    retry、正常 terminalize）。
+    """
+
+    if job.get("status") == "failed":
+        return True
+    return job.get("status") == "exited" and type(job.get("exit_code")) is int and job.get("exit_code") != 0
+
+
 def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
     """Recognize an immutable, bound card terminal that explicitly requested a stop."""
 
@@ -5952,7 +5970,7 @@ def _dispatch_workflow_card(
             (
                 retry_failed
                 and (
-                    matching[-1].get("status") == "failed"
+                    _is_stale_terminalized_failed_job(matching[-1])
                     or _retryable_nonpassing_workflow_terminal(matching[-1])
                     or _malformed_workflow_card_terminal(matching[-1])
                     or _is_rejected_workflow_review_evidence(
@@ -6677,7 +6695,7 @@ def resume_workflow_run(
     if job is not None and recovery_job_id == job.get("job_id"):
         job = dispatch_or_stop(run, retry_recovery_job_id=recovery_job_id)
     elif retry_failed and job is not None and (
-        job.get("status") == "failed"
+        _is_stale_terminalized_failed_job(job)
         or _retryable_nonpassing_workflow_terminal(job)
         or _is_rejected_workflow_review_evidence(
             job,
@@ -6705,11 +6723,16 @@ def resume_workflow_run(
         updated = registry._manager_update_workflow_run(
             run.run_id, facets=("needs_human",), gate_status="running"
         )
+        # #260 R6：失敗回報附帶唯讀 terminal 診斷（observed HEAD／job id／失敗
+        # 原因），沿用 #261 的 `_terminal_parse_diagnostics`；診斷與授權分離，
+        # 不得因此授予任何 candidate authority。
+        diagnostics = _terminal_parse_diagnostics(job)
         return {
             "run_id": run.run_id,
             "current_phase": updated.current_phase,
             "job_id": job["job_id"],
             "reason": failure_reason,
+            "terminal_diagnostics": diagnostics.as_dict(),
         }
     if _malformed_workflow_card_terminal(job):
         # #261 R3／D5：同一個確定性 schema mismatch 不得無限回派模型。計數持久化在

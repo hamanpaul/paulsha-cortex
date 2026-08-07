@@ -52,6 +52,11 @@ def test_subcommand_help_uses_installed_cortex_invocations() -> None:
     assert build_monitor_parser().prog == "cortex monitor"
 
 
+def test_work_help_lists_gc_subcommand() -> None:
+    assert "gc" in umbrella_cli._WORK_HELP
+    assert "回收" in umbrella_cli._WORK_HELP
+
+
 def test_unified_lifecycle_docs_use_typed_repo_scoped_work_mutations() -> None:
     docs = (Path(__file__).parents[1] / "docs" / "unified-work-lifecycle.md").read_text(
         encoding="utf-8"
