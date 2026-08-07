@@ -43,6 +43,24 @@ class PersonaSchemaTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("version", "\n".join(result.errors))
 
+    def test_persona_schema_rejects_non_list_completion_obligations(self) -> None:
+        broken_catalog = {
+            "manager": {
+                "role": "manager",
+                "version": "1.0.0",
+                "summary": "manager",
+                "allowed_phases": ["claim"],
+                "write_paths": ["docs/**"],
+                "allowed_tools": ["git"],
+                "completion_obligations": 123,
+            }
+        }
+
+        result = contract.validate_persona_schema(broken_catalog)
+
+        self.assertFalse(result.ok)
+        self.assertIn("completion_obligations", "\n".join(result.errors))
+
 
 class RoleBaselineTests(unittest.TestCase):
     def test_required_roles_present(self) -> None:
