@@ -558,6 +558,15 @@ def test_specs_dir_env_matrix_matches_manager(monkeypatch, tmp_path):
     from paulsha_cortex.coordinator.manager_daemon import default_specs_dir
     from paulsha_cortex.deck.compile import specs_dir
 
+    # #303：最後一組 case 刻意清空所有 PSC_* 以驗證 fallback 路徑，因而繞過
+    # conftest 的 autouse 隔離網（它靠設定 PSC_AGENTS_ROOT 生效）。fallback 會走
+    # Path.home() 讀 ~/.agents/core/runtime/cortex-manager.env，若不另外隔離就會
+    # 讀到 operator 的真實 bootstrap 檔，使本測試結果取決於宿主狀態。改指向假
+    # HOME：兩個被比對的函式仍走同一條 fallback，契約一致性的驗證意圖不變。
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
     cases = (
         {"PSC_MANAGER_SPECS_DIR": str(tmp_path / "m")},
         {"PSC_SPECS_ROOT": str(tmp_path / "s")},
