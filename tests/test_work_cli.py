@@ -149,7 +149,7 @@ def test_cortex_work_help_lists_read_and_manager_actions(capsys):
     assert cli.main(["work", "--help"]) == 0
     output = capsys.readouterr().out
     for command in (
-        "show", "link", "unlink", "start", "resume", "retry-build", "auto",
+        "show", "gc", "link", "unlink", "start", "resume", "retry-build", "auto",
         "abandon", "review-attest", "ship",
     ):
         assert command in output
@@ -164,3 +164,30 @@ def test_cortex_work_mutation_routes_to_coordinator(monkeypatch):
 
     assert cli.main(["work", "start", "work", "--repo", "example/acme"]) == 0
     assert calls == [["work", "start", "work", "--repo", "example/acme"]]
+
+
+def test_cortex_work_gc_routes_to_gc_module_not_coordinator(monkeypatch, tmp_path):
+    coordinator_calls = []
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.cli.main",
+        lambda argv: coordinator_calls.append(argv) or 0,
+    )
+    gc_calls = []
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.gc.main",
+        lambda argv: gc_calls.append(argv) or 0,
+    )
+
+    assert cli.main(["work", "gc", "--repo-root", str(tmp_path), "--json"]) == 0
+
+    assert gc_calls == [["--repo-root", str(tmp_path), "--json"]]
+    assert coordinator_calls == []
+
+
+def test_cortex_work_gc_help_is_executable(capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["work", "gc", "--help"])
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    assert "--apply" in output
+    assert "--repo-root" in output
