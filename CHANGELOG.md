@@ -11,6 +11,10 @@
 ### Added
 - **Refs #294：slice spec 可宣告 executor/model_id 並於派工前強制 registry 驗證**：`dispatch_ready` 支援逐 slice 的 builder identity 覆寫，unknown identity fail-closed 並列出可用 candidates；同時 `cortex fanout`／`tick` 的明確 `(executor, model)` 與 periodic tick 預設 model 也改為先查 `model-identities.yaml`，避免 typo 直到 session 內才失敗。
 - **Issue #202：task_type 自動選牌與 fix-standard combo**：新增 deck taxonomy loader／selector、`fix-standard` workflow combo、`WorkflowRun.combo_selection` provenance、`cortex work start --combo` authoritative override，以及 `cortex stat --combo-selections` 彙總。Refs #202。
+- **Issue #260：新增 `recover-repair-commit` work action**：repair job 失敗終止但已在 builder worktree 留下合法 descendant commit 時，以雙 CAS（`expected_run_id`＋`expected_candidate`）確定性 bind 為新 candidate；判準全部取自系統事實，不啟動任何 model session，冪等回報 `already-recovered`；`retry-build` 既有 CAS 與窄化入口原封不動。
+
+### Fixed
+- **Issue #260：resume／dispatch 不再重選 stale failed job**：`resume_workflow_run`／`_dispatch_workflow_card` 的 stale-terminal 判定補上「`exited` 且 exit code 非 0」，第一次 operator resume 即 dispatch replacement，不再空轉一輪；失敗回報附掛唯讀 `terminal_diagnostics`，不授予 candidate authority。
 
 ### Fixed
 - **CI 測試閘門形同虛設（tests.yml 偵測誤判）**：`ls tests/test_*.py tests/*_test.py` 只要任一 glob 沒配到就回傳非零，本 repo 因此恆判為「無測試套件」而跳過整段 pytest 卻回報 success；改用 `find -print -quit`。

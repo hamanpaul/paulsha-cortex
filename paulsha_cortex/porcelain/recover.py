@@ -47,7 +47,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     work = sub.add_parser("work", help="復原 work lifecycle")
     work.add_argument("work_id")
-    work.add_argument("action", choices=("retry-build", "resume", "recover-pre-candidate", "abandon"))
+    work.add_argument(
+        "action",
+        choices=(
+            "retry-build", "resume", "recover-pre-candidate",
+            "recover-repair-commit", "abandon",
+        ),
+    )
     work.add_argument("--repo", required=True)
     work.add_argument("--actor", required=True)
     work.add_argument("--expected-candidate")
