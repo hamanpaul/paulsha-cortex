@@ -323,3 +323,8 @@ def should_terminate(signals: SessionSignals) -> TerminationDecision | None:
 本節訂正不改變本票任何 D/R 決策內容：interim stub 契約（D6／spec R4）本就已把
 `track_record` 列為恆真 stub，訂正只是把狀態描述從「已落地設計」精確化為「設計初稿、
 未合併」，前述 D2／D3／D4／D6／D7 各處提及 `#137` 之處已同步訂正引用文字。
+
+> **後記（merge 時點更新）**：本節查證反映的是撰寫當下的狀態。`#137` 設計文件其後已隨
+> PR #361 合併進 main（`docs/superpowers/specs/oneshot-lesson-loop-{spec,design}.md`），
+> 上述「尚未合併」的描述自 PR #361 起不再成立；查證鏈保留作為撰寫過程的如實記錄。
+

@@ -91,6 +91,10 @@ budget／limit／alert／throttle／enforce／policy，看得到額度、不做�
 本身——interim stub 契約（R4）本就已把 `track_record` 列為恆真 stub，訂正只是狀態
 描述用語精確化，不變更設計。
 
+> **後記（merge 時點更新）**：本節查證反映的是撰寫當下的狀態。`#137` 設計文件其後已隨
+> PR #361 合併進 main（`docs/superpowers/specs/oneshot-lesson-loop-{spec,design}.md`），
+> 上述「尚未合併」的描述自 PR #361 起不再成立；查證鏈保留作為撰寫過程的如實記錄。
+
 ## Goals
 
 - 凍結 `rate` 自追（token bucket）資料契約，作為 `#139` R7 status view `rate` 鍵的
