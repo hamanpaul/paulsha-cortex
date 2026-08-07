@@ -2503,6 +2503,343 @@ def _recover_pre_candidate_action(
     }
 
 
+def _find_repair_adoption_record(
+    run,
+    *,
+    run_id: str,
+    adopted_candidate: str,
+) -> str | None:
+    """掃描 run 既有 evidence_refs 是否已有本次 adoption 的 durable record（#260 D4）。
+
+    只讀 canonical `evidence/work-repair-adoption/` 目錄下的檔案，用於
+    `recover-repair-commit` 的冪等判定；不做任何寫入或狀態變更。
+    """
+
+    for path_value in run.evidence_refs:
+        if not isinstance(path_value, str):
+            continue
+        path = Path(path_value)
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or path.parent.name != "work-repair-adoption"
+        ):
+            continue
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(body, dict):
+            continue
+        if (
+            body.get("schema") == "cortex-work-repair-adoption/v1"
+            and body.get("run_id") == run_id
+            and body.get("adopted_candidate") == adopted_candidate
+        ):
+            return path_value
+    return None
+
+
+def _repair_adoption_record(
+    *,
+    run,
+    state_path: Path,
+    actor: str,
+    failed_job_id: str,
+    observed_head: str,
+    adopted_candidate: str,
+    previous_candidate: str,
+) -> dict[str, str]:
+    """寫入 `cortex-work-repair-adoption/v1` immutable evidence（#260 R3）。
+
+    比照 `_abandon_record`／`_recover_planning_record` 的 create-with-O_EXCL +
+    hardlink-publish 慣例；同內容重寫視為冪等，內容衝突 fail closed。
+    """
+
+    body = {
+        "schema": "cortex-work-repair-adoption/v1",
+        "run_id": run.run_id,
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "actor": actor,
+        "failed_job_id": failed_job_id,
+        "observed_head": observed_head,
+        "adopted_candidate": adopted_candidate,
+        "previous_candidate": previous_candidate,
+    }
+    digest = verification.canonical_json_hash(body)
+    root = state_path.resolve().parent / "evidence" / "work-repair-adoption"
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / f"{run.run_id}-{digest}.json"
+    content = (
+        json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != content:
+            raise RuntimeError("workflow repair-commit adoption evidence conflict")
+    else:
+        temporary = root / f".{target.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError as error:
+            raise RuntimeError(
+                "workflow repair-commit adoption evidence collision"
+            ) from error
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fchmod(handle.fileno(), 0o444)
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                if target.is_symlink() or target.read_bytes() != content:
+                    raise RuntimeError(
+                        "workflow repair-commit adoption evidence conflict"
+                    )
+            else:
+                directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {"ref": str(target), "hash": digest}
+
+
+def _recover_repair_commit_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    requested_by: str,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """對 build phase 失敗終止、但已在 worktree 留下合法 descendant commit 的
+    repair job，做具雙 CAS 的窄化 adoption（#260 R1-R5）。
+
+    判準全部取自系統既有紀錄與 git 事實：worktree 路徑取自 failed builder job
+    row，HEAD／乾淨度／descendant lineage 全部由這裡的 git 呼叫重新確認；
+    operator 帶的 ``expected_run_id``／``expected_candidate`` 只做交叉比對，
+    不被當作 evidence 採信。此 action 不啟動任何 model session——adoption 完全
+    由 manager 側確定性驗證完成。
+    """
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor",
+        "expected_run_id", "expected_candidate",
+    }
+    if extras:
+        raise ValueError(
+            f"recover-repair-commit rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    expected_run_id = args.get("expected_run_id")
+    expected_candidate = args.get("expected_candidate")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("recover-repair-commit requires exact expected_run_id")
+    if (
+        not isinstance(expected_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(expected_candidate) is None
+    ):
+        raise ValueError("recover-repair-commit requires exact expected_candidate")
+    expected_candidate = expected_candidate.lower()
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("recover-repair-commit issue is not authorized by WorkAuthority")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    exact = [run for run in related if run.run_id == expected_run_id]
+    if len(exact) != 1:
+        raise RuntimeError("recover-repair-commit expected WorkflowRun CAS mismatch")
+    run = exact[0]
+    if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
+        raise RuntimeError(
+            "recover-repair-commit WorkflowRun refs differ from current WorkAuthority"
+        )
+    actor = args.get("actor")
+    actor_value = actor if isinstance(actor, str) and actor.strip() else requested_by
+    if not isinstance(actor_value, str) or not actor_value.strip():
+        actor_value = "operator"
+
+    # #260 D4：冪等判定先於其餘 admission——adoption 成功後 run 已離開 build
+    # phase，若不先檢查會被後面的 phase 檢查誤判為錯誤而非 replay。
+    existing_record = _find_repair_adoption_record(
+        run, run_id=expected_run_id, adopted_candidate=expected_candidate,
+    )
+    if run.candidate_head == expected_candidate and existing_record is not None:
+        return {
+            "action": "recover-repair-commit",
+            "reason": "already-recovered",
+            "expected_run_id": expected_run_id,
+            "expected_candidate": expected_candidate,
+            "run": run.to_dict(),
+            "evidence": {"ref": existing_record},
+        }
+
+    if run.status != "ongoing":
+        raise RuntimeError("recover-repair-commit requires ongoing workflow")
+    if "needs_human" not in run.facets:
+        raise RuntimeError("recover-repair-commit requires needs_human workflow")
+    if run.current_phase != "build":
+        raise RuntimeError("recover-repair-commit requires build phase workflow")
+    original_candidate = run.candidate_head
+    if (
+        not isinstance(original_candidate, str)
+        or verification.SAFE_SHA_RE.fullmatch(original_candidate) is None
+    ):
+        raise RuntimeError("recover-repair-commit requires an existing build candidate")
+    original_candidate = original_candidate.lower()
+    if expected_candidate == original_candidate:
+        raise RuntimeError(
+            "recover-repair-commit requires a new descendant commit; the Candidate "
+            "is unchanged, use retry-verify instead"
+        )
+    build_steps = [step for step in run.steps if step.phase == "build"]
+    if not build_steps:
+        raise RuntimeError("recover-repair-commit requires build phase steps")
+    if (
+        any(step.gate_result != "passed" for step in build_steps[:-1])
+        or build_steps[-1].gate_result != "pending"
+    ):
+        raise RuntimeError(
+            "recover-repair-commit requires only the final builder card pending"
+        )
+    repair_card = build_steps[-1].card
+    all_jobs = workflow_registry.list_jobs()
+    if any(
+        job.get("workflow_run_id") == run.run_id
+        and job.get("status") in {"dispatched", "running"}
+        for job in all_jobs
+    ):
+        raise RuntimeError("recover-repair-commit refuses active workflow job")
+    same_card_jobs = [
+        job
+        for job in all_jobs
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_phase") == "build"
+        and job.get("workflow_card") == repair_card
+    ]
+    if not same_card_jobs:
+        raise RuntimeError("recover-repair-commit requires an existing failed builder job")
+    failed_job = same_card_jobs[-1]
+    if failed_job.get("status") not in {"exited", "failed"}:
+        raise RuntimeError("recover-repair-commit requires a terminalized builder job")
+    if failed_job.get("workflow_evidence") is not None:
+        raise RuntimeError(
+            "recover-repair-commit refuses a job with bound workflow evidence"
+        )
+
+    worktree = failed_job.get("worktree")
+    if not isinstance(worktree, str) or not worktree.strip():
+        raise RuntimeError("recover-repair-commit requires a known builder worktree")
+    head_result = verification._run_git(["-C", worktree, "rev-parse", "HEAD"], None)
+    head_value = str(head_result.get("stdout", "")).strip().lower()
+    if (
+        head_result.get("status") != "ok"
+        or verification.SAFE_SHA_RE.fullmatch(head_value) is None
+    ):
+        raise RuntimeError("recover-repair-commit could not read worktree HEAD")
+    if head_value != expected_candidate:
+        raise RuntimeError(
+            "recover-repair-commit expected_candidate CAS mismatch against worktree HEAD"
+        )
+    status_result = verification._run_git(
+        ["-C", worktree, "status", "--porcelain", "--untracked-files=all"], None
+    )
+    if status_result.get("status") != "ok":
+        raise RuntimeError("recover-repair-commit could not read worktree status")
+    if str(status_result.get("stdout", "")).strip():
+        raise RuntimeError("recover-repair-commit requires a clean worktree")
+    ancestry_result = verification._run_git(
+        ["-C", worktree, "merge-base", "--is-ancestor", original_candidate, expected_candidate],
+        None,
+    )
+    if ancestry_result.get("status") == "non-zero" and ancestry_result.get("returncode") == 1:
+        raise RuntimeError("recover-repair-commit requires a descendant candidate")
+    if ancestry_result.get("status") != "ok":
+        raise RuntimeError("recover-repair-commit candidate ancestry unavailable")
+
+    record = _repair_adoption_record(
+        run=run,
+        state_path=state_path,
+        actor=actor_value,
+        failed_job_id=str(failed_job.get("job_id")),
+        observed_head=expected_candidate,
+        adopted_candidate=expected_candidate,
+        previous_candidate=original_candidate,
+    )
+    adoption_job = workflow_registry.create_job(
+        task=str(failed_job.get("task")),
+        persona="builder",
+        kind="build",
+        branch=str(failed_job.get("branch")),
+        pane="",
+        worktree=worktree,
+        dispatch_head=failed_job.get("dispatch_head"),
+        executor=failed_job.get("executor"),
+        model_id=failed_job.get("model_id"),
+        independence_domain=failed_job.get("independence_domain"),
+        subject_head=expected_candidate,
+        workflow_run_id=run.run_id,
+        workflow_claim_key=run.claim_key,
+        workflow_repo=run.repo,
+        workflow_card=repair_card,
+        workflow_phase="build",
+        workflow_repo_root=failed_job.get("workflow_repo_root"),
+        workflow_input_root=failed_job.get("workflow_input_root"),
+        workflow_inputs=tuple(failed_job.get("workflow_inputs") or ()),
+        workflow_input_snapshot=tuple(
+            dict(item) for item in (failed_job.get("workflow_input_snapshot") or ())
+        ),
+        workflow_outputs=tuple(failed_job.get("workflow_outputs") or ()),
+        source_revision=run.source_revision,
+        workflow_sandbox_hash=failed_job.get("workflow_sandbox_hash"),
+        workflow_output_baseline=tuple(
+            dict(item) for item in (failed_job.get("workflow_output_baseline") or ())
+        ),
+    )
+    workflow_registry.update_headless_result(
+        adoption_job["job_id"], status="exited", exit_code=0
+    )
+    locator = {
+        "kind": "work-repair-adoption",
+        "path": record["ref"],
+        "hash": record["hash"],
+    }
+    workflow_registry.bind_workflow_evidence(
+        adoption_job["job_id"], locator=locator, subject_head=expected_candidate,
+    )
+    updated = workflow_registry._manager_adopt_repair_candidate(
+        run.run_id,
+        expected_candidate=original_candidate,
+        adopted_candidate=expected_candidate,
+        adoption_job_id=adoption_job["job_id"],
+        evidence_ref=record["ref"],
+    )
+    return {
+        "action": "recover-repair-commit",
+        "reason": "repair-commit-adopted",
+        "expected_run_id": expected_run_id,
+        "expected_candidate": expected_candidate,
+        "previous_candidate": original_candidate,
+        "evidence": record,
+        "adoption_job_id": adoption_job["job_id"],
+        "run": updated.to_dict(),
+    }
+
+
 def run_auto_claim_scan(
     *,
     snapshot_path: str | Path | None = None,
@@ -3262,8 +3599,8 @@ def execute_work_action(
     work_id = args.get("work_id")
     if action not in {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "recover-planning", "recover-pre-candidate", "abandon",
-        "auto", "ship", "review-attest",
+        "retry-review", "recover-planning", "recover-pre-candidate",
+        "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -3329,6 +3666,14 @@ def execute_work_action(
         )
     elif action == "recover-pre-candidate":
         result = _recover_pre_candidate_action(
+            args=args,
+            authority=authority,
+            requested_by=requested_by,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "recover-repair-commit":
+        result = _recover_repair_commit_action(
             args=args,
             authority=authority,
             requested_by=requested_by,

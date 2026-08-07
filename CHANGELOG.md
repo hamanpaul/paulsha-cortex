@@ -12,11 +12,24 @@
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
 - **Issue #323：`cortex jobs`／`stat` 對 workflow lane job 補 work_id／primary issue 歸屬欄**：`wf-xxxxxxxx-<card>-<n>` job 輸出新增 `workflow_work_id`／`workflow_primary_issue` 兩欄，於輸出端以既有 `workflow_run_id` join registry 的 workflow run，零額外持久化狀態；card 已由既有 `workflow_card` 欄位提供。非 workflow lane job 與其餘既有欄位皆不受影響。
+- **Issue #178：新增 `cortex work gc` 交付後產物回收命令**：proposal-first 回收殘留 build worktree 與已 merge 的 repo local branch；預設 dry-run 只輸出候選清單與逐項 `reclaim`／`keep`＋reason code，`--apply` 才執行且逐項重驗（TOCTOU-safe）。merged 判定改走內容層驗證鏈（`git merge-base --is-ancestor` → `git cherry` 內容等價），修正 squash-merge 後 ref-ancestry 失真、`git branch -d`／`--merged` 誤拒已合併分支的既有陷阱；任何疑義一律 `keep` 並附 reason code，closed-unmerged PR 分支保留。新模組 `paulsha_cortex/coordinator/gc.py` 由 umbrella CLI 攔截路由，不經 manager daemon、對 registry 唯讀、不動 remote。
 - **Refs #294：slice spec 可宣告 executor/model_id 並於派工前強制 registry 驗證**：`dispatch_ready` 支援逐 slice 的 builder identity 覆寫，unknown identity fail-closed 並列出可用 candidates；同時 `cortex fanout`／`tick` 的明確 `(executor, model)` 與 periodic tick 預設 model 也改為先查 `model-identities.yaml`，避免 typo 直到 session 內才失敗。
 - **Issue #202：task_type 自動選牌與 fix-standard combo**：新增 deck taxonomy loader／selector、`fix-standard` workflow combo、`WorkflowRun.combo_selection` provenance、`cortex work start --combo` authoritative override，以及 `cortex stat --combo-selections` 彙總。Refs #202。
+- **Issue #260：新增 `recover-repair-commit` work action**：repair job 失敗終止但已在 builder worktree 留下合法 descendant commit 時，以雙 CAS（`expected_run_id`＋`expected_candidate`）確定性 bind 為新 candidate；判準全部取自系統事實，不啟動任何 model session，冪等回報 `already-recovered`；`retry-build` 既有 CAS 與窄化入口原封不動。
+
+### Fixed
+- **Issue #260：resume／dispatch 不再重選 stale failed job**：`resume_workflow_run`／`_dispatch_workflow_card` 的 stale-terminal 判定補上「`exited` 且 exit code 非 0」，第一次 operator resume 即 dispatch replacement，不再空轉一輪；失敗回報附掛唯讀 `terminal_diagnostics`，不授予 candidate authority。
 
 ### Fixed
 - **Issue #139：`task_type` taxonomy 契約補齊測試覆蓋並確認驗收面**：`paulsha_cortex/deck/data/task-types.yaml`（雙鎖值域＋scope 受控詞典）與 `paulsha_cortex/deck/task_types.py`（fail-closed loader、`classify_title` 五類判定）已隨 #202 提前落地，本票確認其符合 spec 的 R1–R6，並補齊 `tests/test_deck_task_types.py` 缺口測試（值域漂移拒載、空描述拒載、未知 combo 引用拒載、五類處置映射全稱驗證）；R7（統一 log reader／status view 介面契約）維持只定契約不實作。
+- **Issue #296：builder tick tasks.md 與 reviewer authority-proving 凍結
+  baseline 矛盾——確認已由 #310 修復，補 production-fidelity 迴歸測試**：
+  #296 與 #310 為同一起 2026-08-04 hippo 事故的獨立提報；#310 的修法（PR
+  #311／#312）已在 #296 提報後數小時落地，但 #296 未被關閉核實。新增
+  `tests/test_builder_tasks_tick_verify_dispatch.py` 以真實 git repo 重現
+  `_dispatch_workflow_card` reviewer 分支（verify／review 共用），涵蓋
+  checkbox-only 通過、tasks.md 文字改動仍擋、proposal.md 等 spec 檔改動仍擋
+  三種情境；無需再改動 production code。
 - **Issue #307：gate ledger 一致性檢查消費 `test_policy=red-required`，解除與 tdd-red 卡的結構性互斥**：`_assert_terminal_gate_consistency` 從 job 綁定的 `WorkflowRun.steps` 查出目前 card 的 `test_policy`，交給 `terminal_contract.authorize_terminal` 對 red-required 卡的 pytest gate 做精準語意反轉——只有 exit code 精確等於 `1`（測試如預期失敗）才視為合格 RED；exit code `0`（全綠）或 `2`／`3`／`4`／`5`（collection error／internal error／usage error／no tests collected）一律維持 fail closed。其他 gate 與一般卡不受影響。
 - **CI 測試閘門形同虛設（tests.yml 偵測誤判）**：`ls tests/test_*.py tests/*_test.py` 只要任一 glob 沒配到就回傳非零，本 repo 因此恆判為「無測試套件」而跳過整段 pytest 卻回報 success；改用 `find -print -quit`。
 - **Issue #263：ship validator 重排為本地 closeout 先於 PR metadata preflight**：archive commit 不再內嵌 push；pre-PR metadata preflight 失敗改回可 resume 的 `pr-preflight-blocked` typed stop、通過後照舊自動建立 PR；slice-based review worktree 補上 frozen authority materialize 與 hash 驗證。

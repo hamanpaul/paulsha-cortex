@@ -1617,6 +1617,123 @@ class JobRegistry:
         self._persist()
         return self._copy_workflow_run(updated)
 
+    def _manager_adopt_repair_candidate(
+        self,
+        run_id: str,
+        *,
+        expected_candidate: str,
+        adopted_candidate: str,
+        adoption_job_id: str,
+        evidence_ref: str,
+    ) -> WorkflowRun:
+        """Atomically bind an adopted repair commit as the new build Candidate (#260).
+
+        比照 `_manager_reset_workflow_for_retry_build` 的 CAS／admission 風格：驗
+        run 狀態、final build card pending、無 active job 後，在單一 persist 內完成
+        candidate 換綁、final build step 標 passed（identity 取自 adoption job）、
+        phase 前進 verify。``expected_candidate`` 是原（舊）candidate 的 CAS，
+        ``adopted_candidate`` 才是要換綁的新 SHA——呼叫端（work_actions）已完成
+        git 事實驗證，這裡只再次原子重驗 run 狀態未在期間漂移。
+        """
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "build"
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError(
+                "repair-commit adoption requires active needs_human build workflow"
+            )
+        if current.candidate_head != expected_candidate:
+            raise ValueError("repair-commit adoption expected Candidate CAS mismatch")
+        if (
+            not isinstance(adopted_candidate, str)
+            or verification.SAFE_SHA_RE.fullmatch(adopted_candidate) is None
+        ):
+            raise ValueError("repair-commit adoption requires exact adopted candidate")
+        if not isinstance(evidence_ref, str) or not evidence_ref:
+            raise ValueError("repair-commit adoption evidence ref missing")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("repair-commit adoption refuses active workflow job")
+        build_steps = [step for step in current.steps if step.phase == "build"]
+        if not build_steps:
+            raise ValueError("repair-commit adoption requires build phase")
+        if (
+            any(step.gate_result != "passed" for step in build_steps[:-1])
+            or build_steps[-1].gate_result != "pending"
+        ):
+            raise ValueError(
+                "repair-commit adoption requires only the final builder card pending"
+            )
+        repair_card = build_steps[-1].card
+        adoption_job = self._find_job(adoption_job_id)
+        expected_job_fields = {
+            "workflow_run_id": current.run_id,
+            "workflow_claim_key": current.claim_key,
+            "workflow_repo": current.repo,
+            "workflow_card": repair_card,
+            "workflow_phase": "build",
+            "persona": "builder",
+            "source_revision": current.source_revision,
+            "subject_head": adopted_candidate,
+            "status": "exited",
+            "exit_code": 0,
+        }
+        for field, value in expected_job_fields.items():
+            if adoption_job.get(field) != value:
+                raise ValueError(f"repair-commit adoption job binding mismatch: {field}")
+        if adoption_job.get("workflow_evidence") is None:
+            raise ValueError("repair-commit adoption job requires bound evidence")
+        identity_executor = adoption_job.get("executor")
+        identity_model = adoption_job.get("model_id")
+        identity_domain = adoption_job.get("independence_domain")
+        if (
+            not isinstance(identity_executor, str)
+            or not isinstance(identity_model, str)
+            or not isinstance(identity_domain, str)
+        ):
+            raise ValueError("repair-commit adoption job identity missing")
+        steps = tuple(
+            replace(
+                step,
+                executor=identity_executor,
+                model=identity_model,
+                domain=identity_domain,
+                gate_result="passed",
+            )
+            if step.phase == "build" and step.card == repair_card
+            else step
+            for step in current.steps
+        )
+        evidence_refs = current.evidence_refs
+        if evidence_ref not in evidence_refs:
+            evidence_refs = (*evidence_refs, evidence_ref)
+        updated = replace(
+            current,
+            current_phase="verify",
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "verify": current.attempts.get("verify", 0) + 1,
+            },
+            gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
+            candidate_head=adopted_candidate,
+            verified_head=None,
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            evidence_refs=evidence_refs,
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
     def _manager_reset_workflow_for_retry_verify(
         self,
         run_id: str,

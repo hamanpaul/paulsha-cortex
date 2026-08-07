@@ -5,10 +5,10 @@ work_item: fix-repair-commit-recovery
 
 # Tasks
 
-- [ ] 1.1 RED：依 `docs/superpowers/plans/fix-repair-commit-recovery.md` 的 TDD RED 章節新增 `tests/test_repair_commit_recovery.py`，確認全部失敗。
-- [ ] 1.2 實作至 GREEN，範圍限於 `docs/superpowers/specs/fix-repair-commit-recovery-spec.md` 的 Requirements（R1–R6）；不放寬 retry-build CAS 與既有窄化入口。
-- [ ] 1.3 `changelog.d/fix-repair-commit-recovery.md` fragment 與 `CHANGELOG.md [Unreleased]` entry（#260）；`docs/unified-work-lifecycle.md` 與 CLI help 同步。
-- [ ] 1.4 `python3 -m pytest tests/ -q` 全綠；帶 PR 上下文的 `policy_check` 0 fail；`git diff --check` 乾淨。
+- [x] 1.1 RED：依 `docs/superpowers/plans/fix-repair-commit-recovery.md` 的 TDD RED 章節新增 `tests/test_repair_commit_recovery.py`，確認全部失敗。
+- [x] 1.2 實作至 GREEN，範圍限於 `docs/superpowers/specs/fix-repair-commit-recovery-spec.md` 的 Requirements（R1–R6）；不放寬 retry-build CAS 與既有窄化入口。
+- [x] 1.3 `changelog.d/fix-repair-commit-recovery.md` fragment 與 `CHANGELOG.md [Unreleased]` entry（#260）；`docs/unified-work-lifecycle.md` 與 CLI help 同步。
+- [x] 1.4 `python3 -m pytest tests/ -q` 全綠；帶 PR 上下文的 `policy_check` 0 fail；`git diff --check` 乾淨。
 
 ## 驗收
 

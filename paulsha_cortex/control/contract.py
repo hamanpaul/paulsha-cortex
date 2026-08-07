@@ -16,8 +16,8 @@ REQUEST_TYPES = frozenset(
 WORK_ACTIONS = frozenset(
     {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "recover-planning", "recover-pre-candidate", "abandon",
-        "auto", "ship", "review-attest",
+        "retry-review", "recover-planning", "recover-pre-candidate",
+        "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -101,7 +101,9 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             typed = kind in WORK_SOURCE_KINDS and isinstance(ref, str) and bool(ref.strip())
             if legacy == typed:
                 raise ValueError("work-action link requires exactly one of --issue or --kind/--ref")
-        if action in {"retry-build", "retry-verify", "retry-review"} and (
+        if action in {
+            "retry-build", "retry-verify", "retry-review", "recover-repair-commit",
+        } and (
             not isinstance(args.get("expected_candidate"), str)
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
@@ -140,6 +142,15 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or "\n" in failure_reason
             ):
                 raise ValueError("work-action recover-planning requires failure_reason")
+        if action == "recover-repair-commit":
+            expected_run_id = args.get("expected_run_id")
+            if (
+                not isinstance(expected_run_id, str)
+                or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+            ):
+                raise ValueError(
+                    "work-action recover-repair-commit requires exact expected_run_id"
+                )
         if action == "abandon":
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")

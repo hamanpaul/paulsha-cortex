@@ -46,10 +46,11 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|link|unlink|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|abandon|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|abandon|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
+  gc        proposal-first 回收殘留 build worktree 與已 merge local branch（唯讀 registry）
   link      由 Manager 寫入 confirmed association
   unlink    由 Manager 寫入 exclusion
   start     手動 claim 並建立 WorkflowRun（可用 --combo 明示 override）
@@ -60,6 +61,7 @@ work item commands:
   abandon   以 exact WorkflowRun CAS 將 pre-delivery run 標成 superseded
   recover-planning  對 define/needs_human 的 planning 失敗作可恢復重跑
   recover-pre-candidate  對 candidate 產生前的 builder 失敗作可恢復重跑並回收 worktree
+  recover-repair-commit  對 repair commit 已存在但缺 terminal evidence 的 build 失敗做具 CAS 的採納恢復
   auto      管理 cortex:auto-on-going issue label
   review-attest  建立 exact-HEAD maintainer review evidence
   ship      執行 fail-closed delivery state machine
@@ -135,6 +137,10 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
             return 0
         if args[1] == "show":
             return _work_read_main(args, work_client=work_client)
+        if args[1] == "gc":
+            from paulsha_cortex.coordinator import gc as gc_module
+
+            return int(gc_module.main(args[2:]) or 0)
     if args[0] == "doctor":
         from paulsha_cortex.doctor import main as doctor_main
 
