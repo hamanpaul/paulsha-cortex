@@ -6,10 +6,10 @@ from typing import Mapping
 
 from .schema import (
     DEFAULT_CARDS_PATH,
-    DEFAULT_COMBOS_DIR,
     DeckSchemaError,
     load_cards,
     load_combo,
+    resolve_combo_path,
 )
 from .task_types import TaskTypeTaxonomy, TitleClassification, classify_title
 
@@ -88,7 +88,7 @@ def select_combo(
         # task_type，找不到對應 type（例如 legacy combo mcu-feature 未列在
         # task-types.yaml 映射）時保留 None，不得因此判定 override 未知。
         try:
-            load_combo(DEFAULT_COMBOS_DIR / f"{override}.yaml", load_cards(DEFAULT_CARDS_PATH))
+            load_combo(resolve_combo_path(override), load_cards(DEFAULT_CARDS_PATH))
         except DeckSchemaError as exc:
             raise ComboSelectionError(f"combo override unknown: {override}: {exc}") from exc
         task_type = _reverse_combo_task_type(override, taxonomy)

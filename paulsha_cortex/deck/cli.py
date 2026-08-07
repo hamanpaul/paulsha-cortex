@@ -9,8 +9,10 @@ from .schema import (
     DEFAULT_CARDS_PATH,
     DEFAULT_COMBOS_DIR,
     DeckSchemaError,
+    iter_combo_files,
     load_cards,
     load_combo,
+    resolve_combo_path,
 )
 from .verify import DeckVerifyError
 
@@ -51,7 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         cards = load_cards(DEFAULT_CARDS_PATH)
         if args.command == "list":
-            for combo_file in sorted(DEFAULT_COMBOS_DIR.glob("*.yaml")):
+            for combo_id, combo_file in iter_combo_files(package_dir=DEFAULT_COMBOS_DIR):
                 combo = load_combo(combo_file, cards)
                 print(f"{combo.id}\t(task_type={combo.task_type}, cards={len(combo.cards)})")
             for card in cards.values():
@@ -59,7 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         if args.command == "compile":
-            combo = load_combo(DEFAULT_COMBOS_DIR / f"{args.combo}.yaml", cards)
+            combo = load_combo(resolve_combo_path(args.combo, package_dir=DEFAULT_COMBOS_DIR), cards)
             effective_change = args.change
             if effective_change is None and not args.emit and not args.out:
                 effective_change = "dry-run"

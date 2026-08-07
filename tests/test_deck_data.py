@@ -43,6 +43,7 @@ def test_interactive_headless_typing():
         "brainstorming",
         "openspec-propose",
         "writing-plans",
+        "writing-plans-light",
         "mcu-hw-evidence",
     }
     assert {c.id for c in cards.values() if c.type == "headless"} == (set(PHASE_CARDS) - interactive) | {"receiving-code-review"}
@@ -122,6 +123,69 @@ def test_mcu_feature_real_data_compiles_to_hold_specs(tmp_path):
     assert len(metas) == len(result.slices)
     detect_cycles(metas)
     assert ready_units(metas, lambda sid: True) == []
+
+
+# #324 缺口 C：small-fix 是輕量 combo 參考實作，7 張卡覆蓋 WORKFLOW_PHASES
+# 各恰一張（claim/define/plan/build/verify/review/ship）。
+SMALL_FIX_CARDS = [
+    "workflow-claim",
+    "brainstorming",
+    "writing-plans-light",
+    "subagent-build",
+    "verification",
+    "code-review",
+    "policy-commit",
+]
+
+
+def test_writing_plans_light_card_does_not_require_openspec():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    card = cards["writing-plans-light"]
+
+    assert card.phase == "plan"
+    assert card.persona_binding == "planner"
+    assert card.skill_ref == "superpowers:writing-plans"
+    assert card.requires == ("docs/superpowers/specs/*<task-slug>*-design.md",)
+    assert not any("openspec" in require for require in card.requires)
+    assert card.produces == ("docs/superpowers/plans/*<task-slug>*.md",)
+
+
+def test_small_fix_combo_loads_with_7_cards_and_2_gates():
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", cards)
+
+    assert combo.id == "small-fix"
+    assert [entry.ref for entry in combo.cards] == SMALL_FIX_CARDS
+    assert len(combo.cards) == 7
+    assert len(combo.gate_spine) == 2
+    assert [(gate.after, gate.exists) for gate in combo.gate_spine] == [
+        ("verification", ("reports/verify/*<task-slug>*.md",)),
+        ("code-review", ("reports/review/*<task-slug>*.md",)),
+    ]
+
+
+def test_small_fix_combo_covers_each_workflow_phase_exactly_once():
+    from paulsha_cortex.coordinator.workflow import WORKFLOW_PHASES
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", cards)
+    phases = [cards[entry.ref].phase for entry in combo.cards]
+
+    assert phases == list(WORKFLOW_PHASES)
+
+
+def test_small_fix_combo_manifest_passes_manager_spine():
+    from paulsha_cortex.deck.compile import compile_combo
+
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "small-fix.yaml", cards)
+    result = compile_combo(combo, cards, "small fix demo", change="small-fix-demo")
+
+    assert result.workflow_manifest is not None
+    # 非空性自證：拿掉任一 phase 的卡（例如刪 brainstorming）會讓
+    # validate_manager_spine() 拋例外，見 tests/test_combo_search_path.py 姊妹
+    # 案例；此處鎖定「現況必須通過」。
+    result.workflow_manifest.validate_manager_spine()
 
 
 def test_feature_oneshot_real_data_compiles_to_hold_specs(tmp_path):

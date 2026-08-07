@@ -45,14 +45,10 @@ def _slugify(value: str) -> str:
     return slug or "sample"
 
 
-def _combo_dir() -> Path:
-    from paulsha_cortex.deck.schema import DEFAULT_COMBOS_DIR
-
-    return DEFAULT_COMBOS_DIR
-
-
 def _available_combos() -> tuple[str, ...]:
-    return tuple(sorted(path.stem for path in _combo_dir().glob("*.yaml")))
+    from paulsha_cortex.deck.schema import iter_combo_files
+
+    return tuple(combo_id for combo_id, _ in iter_combo_files())
 
 
 def _validate_combo(parser: argparse.ArgumentParser, combo: str) -> None:
@@ -64,10 +60,10 @@ def _validate_combo(parser: argparse.ArgumentParser, combo: str) -> None:
 
 def _load_compile_result(*, combo: str, task: str, change: str):
     from paulsha_cortex.deck.compile import compile_combo
-    from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
+    from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, load_cards, load_combo, resolve_combo_path
 
     cards = load_cards(DEFAULT_CARDS_PATH)
-    loaded_combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo}.yaml", cards)
+    loaded_combo = load_combo(resolve_combo_path(combo), cards)
     return compile_combo(
         loaded_combo,
         cards,

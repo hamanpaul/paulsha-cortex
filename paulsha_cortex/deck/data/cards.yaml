@@ -46,6 +46,19 @@ cards:
     produces: ["docs/superpowers/plans/*<task-slug>*.md"]
     persona_binding: planner
 
+  # #324：與 writing-plans 同一 skill_ref，只差 requires——只吃 spec/design
+  # doc，不依賴 openspec proposal，供不需要 openspec 全鏈的輕量 combo（如
+  # small-fix）使用，打斷 issue #324 描述的 requires DAG 斷鏈。
+  - id: writing-plans-light
+    kind: skill
+    type: interactive
+    class: core
+    skill_ref: "superpowers:writing-plans"
+    phase: plan
+    requires: ["docs/superpowers/specs/*<task-slug>*-design.md"]
+    produces: ["docs/superpowers/plans/*<task-slug>*.md"]
+    persona_binding: planner
+
   - id: worktree-isolation
     kind: skill
     type: headless
