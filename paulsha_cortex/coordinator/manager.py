@@ -1550,6 +1550,11 @@ def complete_tick(
 
     polled: list[str] = []
     completed: list[dict] = []
+    # completed 對應的 terminal job 全量快照（issue #204 skill_ledger 用）：
+    # 與 completed 1:1 同步更新（含同輪同 slice 雙 terminal 的「後者勝」語意），
+    # 讓 run_tick 的 ledger_recorder 注入點能拿到 workflow_card/job_id 等記帳
+    # 所需欄位，不必重新 parse 精簡過的 completed 條目。
+    completed_jobs: list[dict] = []
     errors: list[dict] = []
     warnings: list[dict] = []
     seen_slices: dict[str, str] = {}  # slice_id → 本輪已寫盤的 job_id（偵測同輪同 slice 雙 terminal）
@@ -1916,13 +1921,25 @@ def complete_tick(
                     if entry["slice_id"] == slice_id:
                         entry["gate_status"] = gate_status
                         break
+                for job_entry in completed_jobs:
+                    if job_entry.get("task") == slice_id:
+                        job_entry.clear()
+                        job_entry.update(job)
+                        break
             else:
                 completed.append({"slice_id": slice_id, "gate_status": gate_status})
+                completed_jobs.append(dict(job))
             seen_slices[slice_id] = job_id
         except Exception as exc:
             errors.append({"job_id": job_id, "error": str(exc)})
 
-    summary: dict = {"polled": polled, "completed": completed, "errors": errors, "warnings": warnings}
+    summary: dict = {
+        "polled": polled,
+        "completed": completed,
+        "completed_jobs": completed_jobs,
+        "errors": errors,
+        "warnings": warnings,
+    }
     if released_ok:
         try:
             summary["released"] = sorted(_ready_ids() - before_ready)
@@ -1946,6 +1963,8 @@ def run_tick(
     idle_probe: Callable[[], tuple] = os.getloadavg,
     clock: Callable[[], str] = _utcnow,
     reaper: Callable[[], dict] | None = None,
+    ledger_recorder: Callable[[list[dict]], list[dict]] | None = None,
+    skill_janitor: Callable[[], dict] | None = None,
     review_executor: str | None = None,
     review_model: str | None = None,
     identity_registry=None,
@@ -1961,7 +1980,19 @@ def run_tick(
     reaper 為收尾 janitor（issue #161）：傳入時於 complete 後呼叫一次以回收孤兒 codex
     broker（多 worktree 派工殘留），其回傳放 summary["reaped"]；任何例外收進 errors（stage=reap），
     不破壞 tick。預設 None（不啟用）——避免單測誤觸真實行程回收；production 由 CLI 接上。
-    回 {dispatch_skipped, dispatched, completed, errors, reaped}。
+
+    ledger_recorder／skill_janitor 為 skill 治理收尾 hook（issue #204），與 reaper 同款
+    「預設 None 不啟用、例外一律吸收不破壞 tick」注入模式：
+    - ledger_recorder：若提供，於 complete_tick 之後以本輪 `complete["completed_jobs"]`
+      （terminal job 全量快照清單）呼叫一次，預期回傳實際記錄的 usage event 清單，放進
+      summary["skill_usage_events"]；典型注入值為
+      `functools.partial(skill_ledger.record_usage_events, cards=cards)`。
+    - skill_janitor：若提供，於 complete 後呼叫一次（zero-arg），只做 cold-skill 偵測與
+      proposal 產生（不動 park state），回傳放 summary["skill_janitor"]；典型注入值為
+      `functools.partial(skill_janitor.run_janitor_tick, cards=cards, ledger_path=..., proposals_dir=...)`。
+    兩者任一丟例外都收進 errors（stage 分別為 skill_ledger／skill_janitor），不影響
+    dispatch/complete/reap 任何一段的結果。
+    回 {dispatch_skipped, dispatched, completed, errors, reaped, skill_usage_events, skill_janitor}。
     """
     satisfied = is_satisfied if is_satisfied is not None else _satisfied_pred(handoff_dir)
     dispatched: list = []
@@ -2016,6 +2047,28 @@ def run_tick(
         review_executor=review_executor,
         review_model=review_model,
     )
+    # skill usage ledger 記錄（issue #204）：complete_tick 本輪產出的 terminal job
+    # 全量快照過 ledger_recorder（若有注入）。跟 reaper 同款 try/except 隔離——記錄
+    # 失敗不得讓 tick 中斷；結果放 summary["skill_usage_events"]，例外收進 errors
+    # （stage=skill_ledger）。預設 None（不啟用）：避免單測誤寫真實 ledger 檔。
+    skill_usage_events = None
+    ledger_errors: list = []
+    if ledger_recorder is not None:
+        try:
+            skill_usage_events = ledger_recorder(complete["completed_jobs"])
+        except Exception as exc:
+            ledger_errors.append({"stage": "skill_ledger", "error": str(exc)})
+
+    # skill park janitor（issue #204）：proposal-first，只讀 ledger、只寫 proposal，
+    # 絕不動 park state。例外一律吸收；結果放 summary["skill_janitor"]。
+    skill_janitor_result = None
+    janitor_errors: list = []
+    if skill_janitor is not None:
+        try:
+            skill_janitor_result = skill_janitor()
+        except Exception as exc:
+            janitor_errors.append({"stage": "skill_janitor", "error": str(exc)})
+
     # 收尾 janitor（issue #161）：回收孤兒 codex broker。失敗一律不破壞 tick——
     # 收進 errors（stage=reap），狀態放 summary["reaped"]。
     reaped = None
@@ -2029,8 +2082,10 @@ def run_tick(
         "dispatch_skipped": dispatch_skipped,
         "dispatched": dispatched,
         "completed": complete["completed"],
-        "errors": errors + complete["errors"] + reap_errors,
+        "errors": errors + complete["errors"] + ledger_errors + janitor_errors + reap_errors,
         "reaped": reaped,
+        "skill_usage_events": skill_usage_events,
+        "skill_janitor": skill_janitor_result,
     }
 
 

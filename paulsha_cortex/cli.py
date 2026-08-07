@@ -24,6 +24,7 @@ options:
 setup and workflow commands:
   install service  安裝 manager service/timer 與 monitor 的 systemd --user units
   deck             預覽或產生 dispatch:hold 的 slice specs
+  skill            skill usage ledger 檢視與 park/janitor 操作（inspect/park/restore/...）
   monitor          掃描專案文件並輸出 Project Monitor 狀態
   list             列出統一 Work Item read model
   work show        顯示單一 Work Item 與可解釋關聯
@@ -125,6 +126,10 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         from paulsha_cortex.deck.cli import main as deck_main
 
         return int(deck_main(args[1:]) or 0)
+    if args[0] == "skill":
+        from paulsha_cortex.coordinator.skill_cli import main as skill_main
+
+        return int(skill_main(args[1:]) or 0)
     if args[0] == "monitor":
         from paulsha_cortex.monitor.__main__ import main as monitor_main
 
