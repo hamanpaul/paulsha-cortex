@@ -594,7 +594,7 @@ export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
 
 實際值請替換為 repo 實際提供的 module / executable，且禁止用 `sh -c` 形式包裝。
 
-共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑會更新自身管理的Python/repo值，但保留既有operator roots。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。
+共同前綴 `PSC_AGENTS_ROOT` 可一次覆寫 mutable/runtime roots。systemd unit 依宣告順序讀取 `~/.agents/core/runtime/<instance>.env` 與固定 bootstrap `~/.agents/core/runtime/<instance>-manager.env`；installer在後者持久化`PSC_INSTANCE`與`PSC_AGENTS_ROOT`。Interactive CLI以同一`PSC_INSTANCE`選取bootstrap env，不掃描猜測其他instance；symlink、malformed或relative root會fail-closed。installer重跑時，PY／PSC_REPO_ROOT會與env中`PSC_REPO_IDENTITY`身分戳記（由git remote origin正規化而來，SSH/HTTPS視為同一身分；非git/無origin則退回路徑指紋）比對；同身分、或戳記缺席（首次安裝／既有舊env遷移）才會更新並保留既有operator roots，跨身分變更須帶`--rebind`明確放行，否則fail-closed並於錯誤訊息附上env檔實際路徑（`cortex doctor`可在潛伏期內偵測此類漂移）。Monitor socket預設為`$PSC_RUN_ROOT/project-monitor.sock`，也可由`project-cortex.yaml`的`monitor.socket_path`覆寫；production `MonitorSocketClient`與service使用相同config解析。
 
 ## 誠實狀態表
 

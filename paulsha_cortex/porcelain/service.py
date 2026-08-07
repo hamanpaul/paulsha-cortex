@@ -31,6 +31,10 @@ def _build_parser() -> argparse.ArgumentParser:
     install_cmd.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
     install_cmd.add_argument("--interval", type=int, default=300)
     install_cmd.add_argument("--repo-root", default=str(Path.cwd()))
+    install_cmd.add_argument(
+        "--rebind", action="store_true",
+        help="既有 instance 記錄的 repo 身分與 --repo-root 不符時，明確放行本次搬遷",
+    )
     install_cmd.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/service/v1 JSON")
 
     for command_name, help_text in (
@@ -86,11 +90,13 @@ def _service_envelope(command: str, instance: str, *, mode: str, **payload: Any)
     }
 
 
-def install(*, instance: str, interval: int, repo_root: str) -> dict[str, Any]:
+def install(*, instance: str, interval: int, repo_root: str, rebind: bool = False) -> dict[str, Any]:
     validated_instance = installer._validate_instance(instance)
     validated_interval = installer._validate_interval(interval)
     validated_repo_root = installer._resolve_git_repo_root(Path(repo_root))
-    result = installer.install_service_result(validated_instance, validated_interval, validated_repo_root)
+    result = installer.install_service_result(
+        validated_instance, validated_interval, validated_repo_root, rebind=rebind
+    )
     return _service_envelope(
         "install",
         instance,
@@ -329,10 +335,14 @@ def _print_status(service: dict[str, Any]) -> None:
         sys.stdout.write(f"suggested: {command}\n")
 
 
-def _run_install(*, instance: str, interval: int, repo_root: str, json_output: bool) -> int:
+def _run_install(
+    *, instance: str, interval: int, repo_root: str, json_output: bool, rebind: bool = False
+) -> int:
     argv = ["service", "--instance", instance, "--repo-root", repo_root, "--interval", str(interval)]
+    if rebind:
+        argv.append("--rebind")
     if json_output:
-        payload = install(instance=instance, interval=interval, repo_root=repo_root)
+        payload = install(instance=instance, interval=interval, repo_root=repo_root, rebind=rebind)
         _json_dump(payload)
         return int(payload.get("result", {}).get("exit_code", 1))
     return int(installer.main(argv) or 0)
@@ -587,6 +597,7 @@ def main(argv: Sequence[str]) -> int:
                 interval=args.interval,
                 repo_root=args.repo_root,
                 json_output=args.json,
+                rebind=args.rebind,
             )
         if args.command in {"start", "stop", "restart"}:
             return _run_lifecycle(args.command, instance=instance, json_output=args.json)

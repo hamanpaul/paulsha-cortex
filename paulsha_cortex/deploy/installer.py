@@ -175,17 +175,57 @@ def _read_plain_env(env_file: Path) -> dict[str, str]:
     return values
 
 
-def _resolve_python_executable(value: str | None) -> str | None:
-    if not value:
+_GIT_ORIGIN_SSH_RE = re.compile(r"^[\w.-]+@(?P<host>[^:/]+):(?P<path>.+?)/?$")
+_GIT_ORIGIN_URL_RE = re.compile(
+    r"^(?:https?|git|ssh)://(?:[^@/]+@)?(?P<host>[^/]+)/(?P<path>.+?)/?$"
+)
+
+
+def _normalize_git_origin(url: str) -> str | None:
+    """把 SSH（`git@host:owner/name.git`）與 HTTPS（`https://host/owner/name`）
+    正規化成同一個身分字串 `host/path`（小寫、去掉尾綴 `.git`）。
+
+    解不出 host/path 回 None；此函式不 raise。
+    """
+    candidate = url.strip()
+    if not candidate:
         return None
-    candidate = Path(value.strip()).expanduser()
-    if not candidate.is_absolute():
+    match = _GIT_ORIGIN_SSH_RE.match(candidate) or _GIT_ORIGIN_URL_RE.match(candidate)
+    if not match:
         return None
-    if candidate.parent.name != "bin":
+    host = match.group("host").strip().strip("/")
+    path = match.group("path").strip().strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not host or not path:
         return None
-    if not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", candidate.name):
-        return None
-    return str(candidate.resolve())
+    return f"{host}/{path}".lower()
+
+
+def _resolve_repo_identity(repo_root: Path) -> str:
+    """身分真值：git remote origin 正規化成功則回 `git:<host/path>`；
+    非 git repo／無 origin／git 指令失敗一律靜默退回 `path:<resolved repo_root>`。
+
+    此函式保證不 raise，讓呼叫端（installer 主流程、doctor probe）
+    不必額外包一層 try/except 就能安全呼叫。
+    """
+    try:
+        resolved = repo_root.expanduser().resolve()
+    except OSError:
+        return f"path:{repo_root}"
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(resolved), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return f"path:{resolved}"
+    if probe.returncode == 0:
+        normalized = _normalize_git_origin(probe.stdout.strip())
+        if normalized:
+            return f"git:{normalized}"
+    return f"path:{resolved}"
 
 
 def _resolve_agents_root(raw_agents_root: str | None) -> Path | None:
@@ -201,19 +241,27 @@ def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
     return runtime_dir / f"{instance}.env"
 
 
-def install_service_result(instance: str, interval: int, repo_root: Path) -> InstallServiceResult:
+def install_service_result(
+    instance: str, interval: int, repo_root: Path, *, rebind: bool = False
+) -> InstallServiceResult:
     home = Path.home()
     bootstrap_root = home / ".agents"
     runtime_dir = bootstrap_root / "core" / "runtime"
     env_file = runtime_dir / f"{instance}-manager.env"
     existing = _read_plain_env(env_file)
     instance_env = _read_plain_env(_instance_env_file(runtime_dir, instance))
-    existing_python = _resolve_python_executable(existing.get("PY", ""))
-    caller_python = _resolve_python_executable(sys.executable)
-    if existing_python and caller_python and existing_python != caller_python:
+    new_identity = _resolve_repo_identity(repo_root)
+    existing_identity = existing.get("PSC_REPO_IDENTITY", "").strip()
+    if existing_identity and existing_identity != new_identity and not rebind:
+        # 比對基準是身分真值（git remote origin 正規化，或非 git repo 時的路徑指紋），
+        # 不是呼叫者——這是 #366 對 #198 的修正：舊守衛比對「既有值 vs 呼叫者」，
+        # 一旦既有值腐化過一次，同一呼叫者之後即可永久繞過。
+        # 缺戳記（existing_identity 為空字串，涵蓋 env 不存在／#366 前的舊安裝）
+        # 一律短路放行並補寫戳記，屬遷移路徑，不得 fail-closed。
         raise ValueError(
-            f"既有 runtime env 中的 PY 指向 {existing_python}，與目前呼叫者 {caller_python} 不一致，"
-            "請先手動清理該 instance env 後再執行 install。"
+            f"既有 runtime env（{env_file}）記錄的 repo 身分為 {existing_identity}，"
+            f"與目前 --repo-root 解析出的身分 {new_identity} 不一致，"
+            "如為合法搬遷請加上 --rebind 明確放行；否則請確認 --repo-root 是否誤指向其他 repo。"
         )
     persisted_executor = existing.get("PSC_MANAGER_EXECUTOR", "").strip()
     if persisted_executor and persisted_executor not in _SUPPORTED_EXECUTORS:
@@ -244,6 +292,7 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
         "PY": sys.executable,
         "PSC_INSTANCE": instance,
         "PSC_REPO_ROOT": str(repo_root),
+        "PSC_REPO_IDENTITY": new_identity,
         "PSC_AGENTS_ROOT": str(agents_root),
         "PSC_RUN_ROOT": str(agents_root / "run" / instance),
         "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
@@ -304,8 +353,8 @@ def install_service_result(instance: str, interval: int, repo_root: Path) -> Ins
     )
 
 
-def install_service(instance: str, interval: int, repo_root: Path) -> int:
-    result = install_service_result(instance, interval, repo_root)
+def install_service(instance: str, interval: int, repo_root: Path, *, rebind: bool = False) -> int:
+    result = install_service_result(instance, interval, repo_root, rebind=rebind)
     print(result.message)
     return result.exit_code
 
@@ -326,12 +375,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--repo-root", default=str(Path.cwd()),
         help="被治理的目標 git repo（預設：目前目錄）",
     )
+    svc.add_argument(
+        "--rebind", action="store_true",
+        help="既有 instance 記錄的 repo 身分與 --repo-root 不符時，明確放行本次搬遷",
+    )
     args = parser.parse_args(argv)
     try:
         instance = _validate_instance(args.instance)
         interval = _validate_interval(args.interval)
         repo_root = _resolve_git_repo_root(Path(args.repo_root))
-        return install_service(instance, interval, repo_root)
+        return install_service(instance, interval, repo_root, rebind=args.rebind)
     except ValueError as exc:
         parser.error(str(exc))
     raise AssertionError("argparse.error must exit")

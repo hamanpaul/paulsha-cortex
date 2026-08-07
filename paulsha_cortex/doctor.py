@@ -521,6 +521,42 @@ def _service_environment_probe(
     )
 
 
+def _repo_identity_probe(effective: Mapping[str, str]) -> ProbeResult:
+    """#366：比對 env 內 PSC_REPO_IDENTITY 身分戳記與 PSC_REPO_ROOT 目前實際解析出的
+    身分是否一致，讓 PSC_REPO_ROOT 被靜默改寫的漂移能在潛伏期內被偵測到。"""
+    from .deploy.installer import _resolve_repo_identity
+
+    repo_root_raw = effective.get("PSC_REPO_ROOT", "").strip()
+    stamp = effective.get("PSC_REPO_IDENTITY", "").strip()
+    if not repo_root_raw:
+        return ProbeResult(
+            "repo-identity", "warn", "PSC_REPO_ROOT not set; identity drift not checked", False
+        )
+    if not stamp:
+        return ProbeResult(
+            "repo-identity",
+            "warn",
+            "PSC_REPO_IDENTITY stamp missing (env predates #366 identity guard); "
+            "rerun `cortex install service` to backfill",
+            False,
+        )
+    try:
+        actual = _resolve_repo_identity(Path(repo_root_raw))
+    except Exception:
+        return ProbeResult(
+            "repo-identity", "warn", "unable to resolve current repo identity for PSC_REPO_ROOT", False
+        )
+    if actual != stamp:
+        return ProbeResult(
+            "repo-identity",
+            "fail",
+            f"PSC_REPO_ROOT identity drift: recorded PSC_REPO_IDENTITY={stamp!r} but "
+            f"PSC_REPO_ROOT={repo_root_raw!r} currently resolves to {actual!r}",
+            True,
+        )
+    return ProbeResult("repo-identity", "pass", "PSC_REPO_ROOT matches recorded PSC_REPO_IDENTITY stamp", False)
+
+
 def _service_paths_probe(*, home: Path, instance: str, live: bool) -> ProbeResult:
     result, _effective = _service_environment_probe(
         home=home,
@@ -691,6 +727,7 @@ def run_doctor(
             live=probe_live,
         ),
         service_probe,
+        _repo_identity_probe(effective),
         state_probe,
         socket_probe,
     ]

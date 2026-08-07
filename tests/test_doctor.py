@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import sys
 import threading
 import types
@@ -73,6 +74,13 @@ def _layout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "PSC_PROJECT_CONFIG_ROOT": str(identity.parent),
     }
     return home, env
+
+
+def _init_git_repo_with_origin(path: Path, url: str) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", url], check=True)
+    return path
 
 
 def test_live_doctor_checks_gh_label_preflight_identity_agy_and_service_paths(
@@ -601,6 +609,95 @@ def test_service_probe_rejects_unit_that_does_not_load_bootstrap_env(tmp_path: P
     result = _service_paths_probe(home=home, instance="cortex", live=True)
     assert result.status == "fail"
     assert "bootstrap environment is invalid" in result.detail
+
+
+# --- #366：repo-identity probe（PSC_REPO_ROOT 與 PSC_REPO_IDENTITY 漂移偵測） --
+
+
+def test_repo_identity_probe_passes_when_stamp_matches_actual_origin(tmp_path: Path) -> None:
+    from paulsha_cortex.doctor import _repo_identity_probe
+
+    repo = tmp_path / "repo"
+    _init_git_repo_with_origin(repo, "https://github.com/hamanpaul/paulsha-cortex")
+    effective = {
+        "PSC_REPO_ROOT": str(repo),
+        "PSC_REPO_IDENTITY": "git:github.com/hamanpaul/paulsha-cortex",
+    }
+
+    result = _repo_identity_probe(effective)
+
+    assert result.status == "pass"
+
+
+def test_repo_identity_probe_fails_when_stamp_diverges_from_actual_origin(tmp_path: Path) -> None:
+    from paulsha_cortex.doctor import _repo_identity_probe
+
+    repo = tmp_path / "repo"
+    _init_git_repo_with_origin(repo, "https://github.com/hamanpaul/paulsha-cortex")
+    effective = {
+        "PSC_REPO_ROOT": str(repo),
+        "PSC_REPO_IDENTITY": "git:github.com/other-owner/other-repo",
+    }
+
+    result = _repo_identity_probe(effective)
+
+    assert result.status == "fail"
+    assert result.required is True
+    assert "other-owner/other-repo" in result.detail
+    assert "hamanpaul/paulsha-cortex" in result.detail
+
+
+def test_repo_identity_probe_warns_when_stamp_missing_on_legacy_env(tmp_path: Path) -> None:
+    """#366 修復前的舊安裝，env 只有 PSC_REPO_ROOT、沒有 PSC_REPO_IDENTITY，
+    屬於預期過渡態，不得把 doctor 拖成 fail。"""
+    from paulsha_cortex.doctor import _repo_identity_probe
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    effective = {"PSC_REPO_ROOT": str(repo)}
+
+    result = _repo_identity_probe(effective)
+
+    assert result.status == "warn"
+    assert result.required is False
+
+
+def test_run_doctor_reports_repo_identity_drift_as_overall_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+    repo = tmp_path / "governed-repo"
+    _init_git_repo_with_origin(repo, "https://github.com/hamanpaul/paulsha-cortex")
+    env_file = home / ".agents" / "core" / "runtime" / "cortex-manager.env"
+    content = env_file.read_text(encoding="utf-8").replace(
+        "PSC_REPO_ROOT=/repo\n",
+        f"PSC_REPO_ROOT={repo}\nPSC_REPO_IDENTITY=git:github.com/other-owner/other-repo\n",
+    )
+    env_file.write_text(content, encoding="utf-8")
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+
+    assert report.ok is False
+    assert {probe.name for probe in report.probes} >= {
+        "repo-identity",
+        "service-paths",
+        "monitor-state",
+        "monitor-socket",
+        "preflight",
+        "model-identities",
+        "agy",
+    }
+    repo_identity = next(p for p in report.probes if p.name == "repo-identity")
+    assert repo_identity.status == "fail"
+    assert repo_identity.required is True
 
 
 def test_doctor_cli_json_and_help(monkeypatch, capsys) -> None:

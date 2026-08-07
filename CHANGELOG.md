@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #366：install service 身分守衛改比對身分真值，PSC_REPO_ROOT 補上守衛——F44 復發修復（#148 未完成的一半）**：新增 `PSC_REPO_IDENTITY` 身分戳記（由 `git remote origin` 正規化而來，SSH/HTTPS 視為同一身分；非 git/無 origin 退回路徑指紋），取代 `#198` 遺留的「既有 PY 比對呼叫者」守衛，改為「既有身分比對新解析出的身分」，解掉腐化一次後守衛永久失效的根因；新增 `--rebind` 顯式繞過旗標（installer 與 `porcelain/service.py` 對稱透傳），既有 env 缺戳記時放行並補寫（遷移路徑，不 fail-closed）；`cortex doctor` 新增 `repo-identity` probe，能在潛伏期內偵測 `PSC_REPO_ROOT` 與實際身分不符；同步修正 `README.md:597` 舊敘述。詳見 `changelog.d/install-service-identity-guard.md`。
+
 ## [0.1.2] - 2026-08-07
 
 ### Added

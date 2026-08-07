@@ -142,10 +142,11 @@ def test_service_install_json_wraps_existing_installer(
 
     seen: dict[str, object] = {}
 
-    def fake_install_result(instance: str, interval: int, repo_root: Path):
+    def fake_install_result(instance: str, interval: int, repo_root: Path, *, rebind: bool = False):
         seen["instance"] = instance
         seen["interval"] = interval
         seen["repo_root"] = repo_root
+        seen["rebind"] = rebind
         return installer.InstallServiceResult(
             exit_code=0,
             mode="systemd",
@@ -173,6 +174,7 @@ def test_service_install_json_wraps_existing_installer(
         "instance": "beta",
         "interval": 60,
         "repo_root": service_runtime["repo_root"].resolve(),
+        "rebind": False,
     }
     assert payload["schema"] == SERVICE_SCHEMA
     assert payload["command"] == "install"
@@ -180,6 +182,44 @@ def test_service_install_json_wraps_existing_installer(
     assert payload["mode"] == "systemd"
     assert payload["result"]["exit_code"] == 0
     assert "installed:" in payload["message"]
+
+
+def test_service_install_json_passes_through_rebind_flag(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#366：porcelain install 對稱透傳 --rebind 給裸 installer，避免呼叫端
+    （如 paulshaclaw 的 start.sh）被迫繞去裸 `cortex install service` 才能用。"""
+    from paulsha_cortex.deploy import installer
+
+    seen: dict[str, object] = {}
+
+    def fake_install_result(instance: str, interval: int, repo_root: Path, *, rebind: bool = False):
+        seen["rebind"] = rebind
+        return installer.InstallServiceResult(
+            exit_code=0,
+            mode="systemd",
+            message="installed: beta-manager.{service,timer} + beta-monitor.service",
+        )
+
+    monkeypatch.setattr(installer, "install_service_result", fake_install_result)
+    monkeypatch.setattr(installer, "_resolve_git_repo_root", lambda path: path.resolve())
+
+    argv = [
+        "service",
+        "install",
+        "--instance",
+        "beta",
+        "--repo-root",
+        str(service_runtime["repo_root"]),
+        "--rebind",
+        "--json",
+    ]
+    assert _run_cli(argv) == 0
+    capsys.readouterr()
+
+    assert seen == {"rebind": True}
 
 
 def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(

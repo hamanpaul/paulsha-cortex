@@ -13,6 +13,12 @@ def _init_git_repo(path):
     return path
 
 
+def _init_git_repo_with_origin(path, url):
+    _init_git_repo(path)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", url], check=True)
+    return path
+
+
 def test_render_substitutes_instance_and_script(tmp_path):
     units = render_units(instance="alpha", interval=120)
     service = units["alpha-manager.service"]
@@ -342,7 +348,13 @@ def test_install_service_and_install_reports_systemctl_step_error(
 
     calls: list[list[str]] = []
     unit_dir = tmp_path / ".config" / "systemd" / "user"
+    repo_root = tmp_path / "repo"
+    # install_service_result 最先呼叫 _resolve_repo_identity()（#366），
+    # 該函式也走 subprocess.run（git remote get-url origin），故排在
+    # systemctl 步驟之前一併出現在 calls 記錄裡。
+    identity_probe_command = ["git", "-C", str(repo_root), "remote", "get-url", "origin"]
     expected_commands = [
+        identity_probe_command,
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "beta-monitor.service"],
         ["systemctl", "--user", "enable", "beta-manager.timer"],
@@ -358,7 +370,7 @@ def test_install_service_and_install_reports_systemctl_step_error(
     monkeypatch.setattr(installer.subprocess, "run", fake_run)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(installer, "_systemctl_available", lambda: True)
-    fake_result = installer.install_service_result("beta", 120, tmp_path / "repo")
+    fake_result = installer.install_service_result("beta", 120, repo_root)
 
     assert fake_result.mode == "systemd"
     assert fake_result.exit_code == 7
@@ -430,3 +442,212 @@ def test_systemctl_failure_still_reports_hook_migration_that_already_happened(
     managed = doc["hooks"]["Stop"][0]["hooks"][0]
     assert managed["command"] == "PSC_RELAY_EVENT=stop cortex relay-hook"
     assert list(codex_hooks.parent.glob("hooks.json.bak-*"))
+
+
+# --- #366：install service 身分守衛（PSC_REPO_IDENTITY） ---------------------
+
+
+def test_normalize_git_origin_ssh_and_https_are_equal():
+    from paulsha_cortex.deploy import installer
+
+    ssh = installer._normalize_git_origin("git@github.com:hamanpaul/paulsha-cortex.git")
+    https = installer._normalize_git_origin("https://github.com/hamanpaul/paulsha-cortex")
+
+    assert ssh == https == "github.com/hamanpaul/paulsha-cortex"
+
+
+def test_install_service_first_install_backfills_identity_stamp(tmp_path, monkeypatch):
+    """首次安裝（env 不存在）不得被身分守衛擋住，且要補寫 PSC_REPO_IDENTITY。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_root = _init_git_repo(tmp_path / "repo")
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(repo_root)
+
+    assert installer.main(["service", "--instance", "beta"]) == 0
+
+    env_file = tmp_path / "home" / ".agents" / "core" / "runtime" / "beta-manager.env"
+    assert "PSC_REPO_IDENTITY=" in env_file.read_text(encoding="utf-8")
+
+
+def test_install_service_non_git_or_no_origin_repo_root_falls_back_to_path_identity(
+    tmp_path, monkeypatch
+):
+    """非 git repo／無 origin 時，身分解析必須 fail-safe 退回路徑指紋，不得炸掉。"""
+    from paulsha_cortex.deploy import installer
+
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    bad_root = tmp_path / "not-a-repo"
+    bad_root.mkdir()
+
+    result = installer.install_service_result("beta", 300, bad_root)
+
+    assert result.exit_code == 0
+    env_file = tmp_path / "home" / ".agents" / "core" / "runtime" / "beta-manager.env"
+    content = env_file.read_text(encoding="utf-8")
+    assert f"PSC_REPO_IDENTITY=path:{bad_root.resolve()}" in content
+
+
+def test_install_service_blocks_repo_root_change_when_identity_stamp_mismatches(
+    tmp_path, monkeypatch
+):
+    """既有 instance 已記錄 repo 身分後，換一個不同身分的 --repo-root 必須 fail-closed。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_a = _init_git_repo_with_origin(
+        tmp_path / "repo-a", "https://github.com/hamanpaul/paulsha-cortex"
+    )
+    repo_b = _init_git_repo_with_origin(
+        tmp_path / "repo-b", "https://github.com/otherorg/other-repo"
+    )
+    home = tmp_path / "home"
+    runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text(
+        "PY=/tmp/venv-a/bin/python\n"
+        f"PSC_REPO_ROOT={repo_a}\n"
+        "PSC_REPO_IDENTITY=git:github.com/hamanpaul/paulsha-cortex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    # 呼叫者 python 刻意與既有值相同：若守衛仍只比對「呼叫者」（舊 #198 邏輯），
+    # 這裡會被誤判放行；必須靠身分真值比對才能擋下。
+    monkeypatch.setattr(installer.sys, "executable", "/tmp/venv-a/bin/python")
+
+    before = runtime_file.read_text(encoding="utf-8")
+    with pytest.raises(ValueError):
+        installer.install_service_result("beta", 300, repo_b)
+    assert runtime_file.read_text(encoding="utf-8") == before
+
+
+def test_install_service_identity_guard_survives_corrupted_existing_value(tmp_path, monkeypatch):
+    """重現 F44：既有值已被腐化成錯的 repo，且呼叫者剛好與腐化值同源——
+    比對基準是身分真值而非呼叫者，這次呼叫仍必須被擋下。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_a = _init_git_repo_with_origin(
+        tmp_path / "repo-a", "https://github.com/hamanpaul/paulsha-cortex"
+    )
+    repo_b_corrupted = _init_git_repo_with_origin(
+        tmp_path / "repo-b", "https://github.com/otherorg/other-repo"
+    )
+    corrupted_python = "/tmp/venv-b/bin/python"
+    home = tmp_path / "home"
+    runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text(
+        f"PY={corrupted_python}\n"
+        f"PSC_REPO_ROOT={repo_b_corrupted}\n"
+        "PSC_REPO_IDENTITY=git:github.com/otherorg/other-repo\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    # 呼叫者剛好跟腐化值同一個 python——舊守衛（比對呼叫者）在此情境下會誤判放行。
+    monkeypatch.setattr(installer.sys, "executable", corrupted_python)
+
+    before = runtime_file.read_text(encoding="utf-8")
+    with pytest.raises(ValueError):
+        installer.install_service_result("beta", 300, repo_a)
+    assert runtime_file.read_text(encoding="utf-8") == before
+
+
+def test_install_service_rebind_flag_allows_repo_identity_change(tmp_path, monkeypatch):
+    """--rebind 是明確搬遷放行旗標：帶上後身分/PY/repo_root 三者一併改寫成新值。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_a = _init_git_repo_with_origin(
+        tmp_path / "repo-a", "https://github.com/hamanpaul/paulsha-cortex"
+    )
+    repo_b = _init_git_repo_with_origin(
+        tmp_path / "repo-b", "https://github.com/otherorg/other-repo"
+    )
+    home = tmp_path / "home"
+    runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text(
+        "PY=/tmp/venv-b/bin/python\n"
+        f"PSC_REPO_ROOT={repo_b}\n"
+        "PSC_REPO_IDENTITY=git:github.com/otherorg/other-repo\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(installer.sys, "executable", "/tmp/venv-a/bin/python")
+
+    result = installer.install_service_result("beta", 300, repo_a, rebind=True)
+
+    assert result.exit_code == 0
+    content = runtime_file.read_text(encoding="utf-8")
+    assert "PY=/tmp/venv-a/bin/python" in content
+    assert f"PSC_REPO_ROOT={repo_a}" in content
+    assert "PSC_REPO_IDENTITY=git:github.com/hamanpaul/paulsha-cortex" in content
+
+
+def test_install_service_same_origin_different_remote_style_or_path_does_not_block(
+    tmp_path, monkeypatch
+):
+    """同 repo 換 remote 寫法（SSH↔HTTPS）或換 checkout 路徑不得被誤擋，且 PY 應
+    自由跟著呼叫者更新（不再受舊的「PY 比對呼叫者」守衛牽制）。
+
+    刻意讓既有 PY 與呼叫者 PY 不同：若身分守衛沒接手、舊 PY-vs-caller 邏輯還在，
+    這裡會被誤擋。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_old_path = _init_git_repo_with_origin(
+        tmp_path / "repo-old-path", "git@github.com:hamanpaul/paulsha-cortex.git"
+    )
+    repo_new_path = _init_git_repo_with_origin(
+        tmp_path / "repo-new-path", "https://github.com/hamanpaul/paulsha-cortex"
+    )
+    home = tmp_path / "home"
+    runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text(
+        "PY=/tmp/venv-old/bin/python\n"
+        f"PSC_REPO_ROOT={repo_old_path}\n"
+        "PSC_REPO_IDENTITY=git:github.com/hamanpaul/paulsha-cortex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(installer.sys, "executable", "/tmp/venv-new/bin/python")
+
+    result = installer.install_service_result("beta", 300, repo_new_path)
+
+    assert result.exit_code == 0
+    content = runtime_file.read_text(encoding="utf-8")
+    assert "PY=/tmp/venv-new/bin/python" in content
+    assert f"PSC_REPO_ROOT={repo_new_path}" in content
+    assert "PSC_REPO_IDENTITY=git:github.com/hamanpaul/paulsha-cortex" in content
+
+
+def test_install_service_identity_mismatch_error_includes_env_file_path(tmp_path, monkeypatch):
+    """錯誤訊息必須帶上 env 檔實際路徑，讓 operator 不必自己推算。"""
+    from paulsha_cortex.deploy import installer
+
+    repo_a = _init_git_repo_with_origin(
+        tmp_path / "repo-a", "https://github.com/hamanpaul/paulsha-cortex"
+    )
+    repo_b = _init_git_repo_with_origin(
+        tmp_path / "repo-b", "https://github.com/otherorg/other-repo"
+    )
+    home = tmp_path / "home"
+    runtime_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_text(
+        "PY=/tmp/venv-a/bin/python\n"
+        f"PSC_REPO_ROOT={repo_a}\n"
+        "PSC_REPO_IDENTITY=git:github.com/hamanpaul/paulsha-cortex\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ValueError) as exc:
+        installer.install_service_result("beta", 300, repo_b)
+
+    assert str(runtime_file) in str(exc.value)
