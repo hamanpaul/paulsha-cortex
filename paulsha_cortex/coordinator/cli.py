@@ -303,7 +303,7 @@ def main(
             request_args["expected_run_id"] = args.expected_run_id
         if args.reason is not None:
             request_args["reason"] = args.reason
-        if args.combo is not None:
+        if args.combo is not None and args.action == "start":
             request_args["combo"] = args.combo
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)

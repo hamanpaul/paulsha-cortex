@@ -195,6 +195,24 @@ def test_select_combo_override_wins_over_auto() -> None:
     assert selection.task_type == "fix"
 
 
+def test_select_combo_override_accepts_combo_absent_from_taxonomy_mapping() -> None:
+    """R3：override 只要 combo 存在／可載入就應可用，不受 task-types.yaml 的
+    type→combo 映射限制。``mcu-feature`` 是 repo 內實際存在、可 load_combo
+    的 legacy combo（``paulsha_cortex/deck/data/combos/mcu-feature.yaml``），
+    但沒有任何 task_type 映射到它——純靠 taxonomy 反查會誤判 unknown
+    （code review finding A）。
+    """
+
+    selection = _select_combo(
+        {202: "feat: add selector orchestration"},
+        override="mcu-feature",
+    )
+
+    assert selection.combo_id == "mcu-feature"
+    assert selection.source == "explicit-override"
+    assert selection.task_type is None
+
+
 def test_select_combo_override_unknown_combo_fail_closed() -> None:
     selector = _selector_module()
 

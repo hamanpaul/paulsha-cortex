@@ -123,32 +123,34 @@ def _complete_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _work_args(args: argparse.Namespace) -> dict[str, Any]:
+    provided_names = (
+        "issue",
+        "kind",
+        "ref",
+        "actor",
+        "failure_classification",
+        "failure_reason",
+        "expected_candidate",
+        "expected_run_id",
+        "reason",
+        "enabled",
+        "planner_executor",
+        "planner_model",
+        "builder_executor",
+        "builder_model",
+        "reviewer_executor",
+        "reviewer_model",
+    )
+    # combo 只在 start action 有意義（--combo 為 start 專用 override）；其餘
+    # action 一律不送出，避免未經驗證的 combo 被夾帶進 manager（見 code review
+    # finding，contract.validate_request 的 fail-closed 是最終防線）。
+    if args.action == "start":
+        provided_names = provided_names + ("combo",)
     payload = {
         "action": args.action,
         "work_id": args.work_id,
         "repo": args.repo,
-        **_provided(
-            args,
-            (
-                "issue",
-                "kind",
-                "ref",
-                "actor",
-                "failure_classification",
-                "failure_reason",
-                "expected_candidate",
-                "expected_run_id",
-                "reason",
-                "combo",
-                "enabled",
-                "planner_executor",
-                "planner_model",
-                "builder_executor",
-                "builder_model",
-                "reviewer_executor",
-                "reviewer_model",
-            ),
-        ),
+        **_provided(args, provided_names),
     }
     if args.payload:
         extra = json.loads(Path(args.payload).read_text(encoding="utf-8"))

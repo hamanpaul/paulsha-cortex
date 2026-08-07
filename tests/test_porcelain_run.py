@@ -162,6 +162,52 @@ def test_run_subcommands_map_to_existing_request_types_and_arguments(
     assert capsys.readouterr().err == ""
 
 
+def test_run_work_start_forwards_combo(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        _run_cli(
+            [
+                "run", "work", "start", "porcelain-run-combo",
+                "--repo", "hamanpaul/paulsha-cortex",
+                "--combo", "fix-standard",
+            ]
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert request["args"]["combo"] == "fix-standard"
+    assert capsys.readouterr().err == ""
+
+
+def test_run_work_resume_drops_combo(
+    control_runtime: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--combo 標註為 start 專用；resume 帶 --combo 時 porcelain 不得轉送，
+
+    否則未經驗證的 combo 可能經 manager 一路滲透到
+    ``start_canonical_workflow``（code review finding）。
+    """
+
+    assert (
+        _run_cli(
+            [
+                "run", "work", "resume", "porcelain-run-combo",
+                "--repo", "hamanpaul/paulsha-cortex",
+                "--combo", "fix-standard",
+            ]
+        )
+        == 3
+    )
+
+    request = _submitted_request()
+    assert "combo" not in request["args"]
+    assert capsys.readouterr().err == ""
+
+
 def test_run_without_wait_prints_accepted_request_tracking_block(
     control_runtime: Path,
     capsys: pytest.CaptureFixture[str],

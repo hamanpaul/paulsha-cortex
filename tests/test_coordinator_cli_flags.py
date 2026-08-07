@@ -207,6 +207,58 @@ class WorkActionFlagTests(unittest.TestCase):
             submitted[0][1]["reason"], "Superseded by the terminal canary."
         )
 
+    def test_work_start_forwards_combo(self) -> None:
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "start", "demo", "--repo", "acme/demo",
+                "--combo", "fix-standard",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "started"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][1]["combo"], "fix-standard")
+
+    def test_work_resume_drops_combo(self) -> None:
+        """--combo 標註為 start 專用；resume 帶 --combo 時 CLI 不得轉送，
+
+        否則未經驗證的 combo 可能經 manager 一路滲透到
+        ``start_canonical_workflow``（code review finding）。
+        """
+
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "resume", "demo", "--repo", "acme/demo",
+                "--combo", "fix-standard",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "resumed"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("combo", submitted[0][1])
+
     def test_work_link_parses_typed_kind_and_ref(self) -> None:
         args = _build_parser().parse_args(
             [

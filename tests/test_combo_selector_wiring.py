@@ -10,6 +10,8 @@ import pytest
 
 from paulsha_cortex.control import contract
 from paulsha_cortex.coordinator import cli as coordinator_cli
+from paulsha_cortex.coordinator import manager as coordinator_manager
+from paulsha_cortex.coordinator import work_actions as coordinator_work_actions
 from paulsha_cortex.coordinator import work_bridge
 from paulsha_cortex.coordinator.claim import canonical_work_snapshot_path, load_work_authority
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -316,3 +318,122 @@ def test_contract_validates_start_combo_arg(combo: str) -> None:
         requested_by="operator",
     )
     assert contract.validate_request(valid)["args"]["combo"] == "fix-standard"
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["resume", "auto", "ship", "abandon", "recover-planning", "review-attest"],
+)
+def test_contract_fail_closed_rejects_combo_on_non_start_action(action: str) -> None:
+    """R3／code review finding：combo override 只在 start 有意義。
+
+    resume 等 action 若夾帶 combo（不論來自 CLI／porcelain 疏漏或 --payload
+    繞過），contract 這個所有入口的收斂點必須 fail-closed 拒絕，不得讓未經
+    驗證的 combo 有機會流到 ``apply_work_action``／
+    ``start_canonical_workflow``。
+    """
+
+    request = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": action,
+            "repo": "acme/demo",
+            "work_id": "work",
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+    )
+
+    with pytest.raises(ValueError, match=f"work-action {action} must not include combo"):
+        contract.validate_request(request)
+
+
+def test_contract_fail_closed_rejects_combo_on_retry_build_even_with_valid_candidate() -> None:
+    request = contract.build_request(
+        req_type="work-action",
+        args={
+            "action": "retry-build",
+            "repo": "acme/demo",
+            "work_id": "work",
+            "expected_candidate": "a" * 40,
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+    )
+
+    with pytest.raises(ValueError, match="work-action retry-build must not include combo"):
+        contract.validate_request(request)
+
+
+def test_apply_work_action_drops_combo_override_for_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """manager 層縱深防禦：即使 args 帶了 combo（不論是誰的疏漏），resume 也
+    絕不能把它轉交 ``start_canonical_workflow``——只有 ``action == "start"``
+    才允許（見 code review finding）。
+    """
+
+    captured: dict[str, object] = {}
+
+    def fake_start_canonical_workflow(**kwargs):
+        captured["combo_override"] = kwargs.get("combo_override")
+        raise RuntimeError("stop-after-capture")
+
+    monkeypatch.setattr(work_bridge, "start_canonical_workflow", fake_start_canonical_workflow)
+
+    def fake_execute_work_action(*, args, requested_by, workflow_registry, workflow_starter):
+        with pytest.raises(RuntimeError, match="stop-after-capture"):
+            workflow_starter(None, "claim:v1:" + "1" * 64, None)
+        return {"action": "captured"}
+
+    monkeypatch.setattr(coordinator_work_actions, "execute_work_action", fake_execute_work_action)
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    result = coordinator_manager.apply_work_action(
+        args={
+            "action": "resume",
+            "repo": "acme/demo",
+            "work_id": "work",
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+        registry=registry,
+    )
+
+    assert result == {"action": "captured"}
+    assert captured["combo_override"] is None
+
+
+def test_apply_work_action_forwards_combo_override_for_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_start_canonical_workflow(**kwargs):
+        captured["combo_override"] = kwargs.get("combo_override")
+        raise RuntimeError("stop-after-capture")
+
+    monkeypatch.setattr(work_bridge, "start_canonical_workflow", fake_start_canonical_workflow)
+
+    def fake_execute_work_action(*, args, requested_by, workflow_registry, workflow_starter):
+        with pytest.raises(RuntimeError, match="stop-after-capture"):
+            workflow_starter(None, "claim:v1:" + "1" * 64, None)
+        return {"action": "captured"}
+
+    monkeypatch.setattr(coordinator_work_actions, "execute_work_action", fake_execute_work_action)
+
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    coordinator_manager.apply_work_action(
+        args={
+            "action": "start",
+            "repo": "acme/demo",
+            "work_id": "work",
+            "combo": "fix-standard",
+        },
+        requested_by="operator",
+        registry=registry,
+    )
+
+    assert captured["combo_override"] == "fix-standard"

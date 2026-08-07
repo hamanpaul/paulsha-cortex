@@ -4,7 +4,13 @@ import re
 from dataclasses import dataclass
 from typing import Mapping
 
-from .schema import DeckSchemaError
+from .schema import (
+    DEFAULT_CARDS_PATH,
+    DEFAULT_COMBOS_DIR,
+    DeckSchemaError,
+    load_cards,
+    load_combo,
+)
 from .task_types import TaskTypeTaxonomy, TitleClassification, classify_title
 
 _COMBO_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -77,9 +83,15 @@ def select_combo(
     if override is not None:
         if _COMBO_ID_RE.fullmatch(override) is None:
             raise ComboSelectionError(f"combo override invalid: {override!r}")
+        # R3：override 只要 combo 檔存在且可經 load_combo 驗證即可用——taxonomy
+        # 反查（下方 _reverse_combo_task_type）只用來標記 provenance 的
+        # task_type，找不到對應 type（例如 legacy combo mcu-feature 未列在
+        # task-types.yaml 映射）時保留 None，不得因此判定 override 未知。
+        try:
+            load_combo(DEFAULT_COMBOS_DIR / f"{override}.yaml", load_cards(DEFAULT_CARDS_PATH))
+        except DeckSchemaError as exc:
+            raise ComboSelectionError(f"combo override unknown: {override}: {exc}") from exc
         task_type = _reverse_combo_task_type(override, taxonomy)
-        if task_type is None and override != default_combo:
-            raise ComboSelectionError(f"combo override unknown: {override}")
         return ComboSelection(
             combo_id=override,
             source="explicit-override",

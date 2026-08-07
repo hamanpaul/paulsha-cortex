@@ -12,6 +12,7 @@
 ### Fixed
 - **CI 測試閘門形同虛設（tests.yml 偵測誤判）**：`ls tests/test_*.py tests/*_test.py` 只要任一 glob 沒配到就回傳非零，本 repo 因此恆判為「無測試套件」而跳過整段 pytest 卻回報 success；改用 `find -print -quit`。
 - **Issue #202 補遺：durable snapshot 不可用時 combo 選擇改走 fail-soft**：`claim.mapped_issue_titles` 先前只在 snapshot hash mismatch 時 bypass；`_load_snapshot` 因 snapshot 不存在／不可讀／schema 損壞 raise 的 `ValueError`（含 `AuthorityValidationError`）未被攔截，會炸穿 `work_bridge.start_canonical_workflow`。現在一併回傳 `None` 落回 bypass-default combo，`load_work_authorities`／`load_work_authority` 維持 fail-hard 不變。
+- **Issue #202 code review 修復：override 驗證改用 `load_combo`、`combo` 收斂只在 start 可用**：`deck.selector.select_combo` 的 override 先前只靠 taxonomy 反查判定未知，會誤判 repo 內實際存在但無 task_type 映射的 legacy combo（如 `mcu-feature`）；改為直接以 `load_combo` 驗證。另外 `--combo` 雖標「start 專用」，CLI／porcelain／manager 先前對所有 work action 都會轉交 `combo`，`resume` 在特定時序下可能被未經驗證的 combo override 影響；四層（`control/contract.py` fail-closed 為收斂防線）同步收斂為只在 `action == "start"` 才夾帶／轉交 `combo`，並清除 `work_bridge.start_canonical_workflow` 內與 selector 重覆的驗證死碼。
 - **abandon 尋址窗口放寬至全額認領**：abandon 校驗 run refs 與 authority 全等；窗口期舊識別全額認領（撤 openspec exclude）、-v2 暫撤 openspec link。
 - **舊識別墓碑 todo（abandon 尋址窗口）**：authority 需檔案級來源，-v2 遷移後舊識別無檔化致 abandon 不可尋址；暫置墓碑 todo，abandon 後移除。
 - **-v2 issue links 暫撤（abandon 尋址窗口）**：解 issue contested → authority ambiguous → abandon 無從尋址的死鎖；隨後還原並補 excludes（abandon 先於 exclude 的正確時序）。

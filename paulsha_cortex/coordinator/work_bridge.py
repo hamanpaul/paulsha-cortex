@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.compile import compile_combo
-from paulsha_cortex.deck.selector import ComboSelection, select_combo
+from paulsha_cortex.deck.selector import ComboSelection, ComboSelectionError, select_combo
 from paulsha_cortex.deck.schema import (
     DEFAULT_CARDS_PATH,
     DEFAULT_COMBOS_DIR,
@@ -377,30 +377,19 @@ def start_canonical_workflow(
     cards = load_cards(DEFAULT_CARDS_PATH)
     combo_catalog = _combo_catalog(cards)
     taxonomy = load_task_types(combos=combo_catalog)
-    if combo_override is not None:
-        validated_override = combo_catalog.get(combo_override)
-        if validated_override is None:
-            load_combo(DEFAULT_COMBOS_DIR / f"{combo_override}.yaml", cards)
-            raise RuntimeError(f"combo override unavailable: {combo_override}")
-        override_task_type = next(
-            (
-                task_type
-                for task_type, spec in taxonomy.task_types.items()
-                if spec.combo == combo_override
-            ),
-            None,
-        )
-        combo_selection = ComboSelection(
-            combo_id=combo_override,
-            source="explicit-override",
-            task_type=override_task_type,
-            reason=f"explicit override selected {combo_override}",
-        )
-    else:
+    # combo_override 的存在性／合法性驗證單一交給 select_combo（deck/selector.py
+    # R3：經 load_combo 驗證，taxonomy 反查找不到 task_type 時保留 None，legacy
+    # combo 如 mcu-feature 不會被誤判 unknown）；此處不再重覆一份驗證邏輯。
+    try:
         combo_selection = select_combo(
             mapped_issue_titles(authority),
             taxonomy=taxonomy,
+            override=combo_override,
         )
+    except ComboSelectionError as exc:
+        if combo_override is not None:
+            raise RuntimeError(f"combo override unavailable: {combo_override}") from exc
+        raise
     manifest = default_workflow_manifest(
         authority.work_id,
         change=change,
