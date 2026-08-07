@@ -38,7 +38,7 @@ TOCTOU 縫、StageExecutionKey 派工端消費、reviewer attestation 強度升�
 | Issue | 標題要旨 | 狀態 |
 |---|---|---|
 | `#139` | 共用基礎設施：task_type / log reader / 歸屬 / status view / ledger / session-health | **硬 blocker**；已定案為 taxonomy 所有者 |
-| `#138` | 成本治理：meter → governance，cost-aware dispatch + 控速分流（judge 公式） | open |
+| `#138` | 成本治理：meter → governance，cost-aware dispatch + 控速分流（judge 公式） | 設計文件已交付（`docs/superpowers/specs/cost-governance-judge-{spec,design}.md`），拆分後續實作票清單見 `docs/superpowers/plans/cost-governance-judge.md`；待 `#137`/`#209` 本體 code-landed 後可依序替換 interim stub |
 | `#137` | one-shot 成效閉環：lesson-loop + 棘輪計分（track-record） | open |
 | `#136` | PreToolUse 容量閘門 hook（admission control） | open；「擋 vs 不擋」裁決已貼 |
 | `#202` | feat(deck)：以 task_type 自動選擇 combo | open；已改為 additive with fallback，不再被 combo 缺口阻擋 |
