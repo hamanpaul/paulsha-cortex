@@ -69,6 +69,17 @@ class HookTemplateSchemaTests(unittest.TestCase):
         self.assertFalse(any("psc-relay-hook.sh" in cmd for cmd in cmds))
         self.assertFalse(any("psc-bro-return" in cmd for cmd in cmds))
 
+    def test_claude_hook_declares_pretooluse_capacity_gate(self) -> None:
+        # Issue #136：spawn subagent/headless 前查 status.json 的容量閘門，
+        # 模板須宣告 PreToolUse，且至少一個 command 呼叫 `cortex capacity-gate`。
+        d = json.loads((HOOKS / "claude.json").read_text(encoding="utf-8"))
+        self.assertIn("PreToolUse", d["hooks"])
+        cmds = _codex_commands(d)
+        self.assertTrue(any("cortex capacity-gate" in cmd for cmd in cmds))
+        matchers = [group.get("matcher") for group in d["hooks"]["PreToolUse"]]
+        self.assertIn("Task", matchers)
+        self.assertIn("Bash", matchers)
+
 
 if __name__ == "__main__":
     unittest.main()
