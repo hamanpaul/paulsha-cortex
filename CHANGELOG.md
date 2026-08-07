@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Fixed
+- **Issue #295（primary）／#291（duplicate）：persona catalog 改以套件內建為 canonical 來源，非 cortex repo 的 slice 不再確定性卡 `persona-catalog-unreadable`**：`run_result_verification` 原本無條件從**目標 repo**讀 `paulsha_cortex/persona/personas.yaml`，該檔只存在於 paulsha-cortex 自身，跨 repo 治理必然卡 `needs_human`，且 `dispatch: auto` 又強制要求該 check 無法拿掉。改為先以 `git cat-file -e` 探測 `dispatch_base` tree 是否宣告 repo-local override：存在即維持既有 pin/fail-closed 行為；不存在則回退讀取 `paulsha_cortex.persona.loader.DEFAULT_PERSONAS_PATH` 套件內建 catalog 完成 scope 判定。override 壞損（不可讀／不合法）仍 fail-closed 不靜默回退；cortex repo 自身行為不退化。evidence 新增 `source`（`repo-local`／`packaged`）欄位可稽核判定依據。
 ### Changed
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added
