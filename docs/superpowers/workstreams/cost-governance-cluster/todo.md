@@ -10,7 +10,13 @@ work_item: cost-governance-cluster
 ## Tasks
 
 - [x] 派第一波 `#211`、`#214`、`#221`（互不碰檔，可並行）。（2026-07-27 完成）
-- [ ] `#210` 的難度後驗 estimator（零外部前置）。
+- [x] `#210` 設計文件已落地（2026-08-07）：`docs/superpowers/plans/sizing-envelope-calibration.md`
+      ＋`docs/superpowers/specs/sizing-envelope-calibration-{spec,design}.md`。**「零外部
+      前置，可立即開始」的舊註記需更正**——設計層查證發現 `invariant_ceiling` estimator
+      實際依賴一個尚未持久化的欄位（`invariant_count` 從未寫入 `CompletionRecord`，只在
+      plan-review 當下一次性比對），需先補一張前置票才能開工；難度後驗 estimator 則需改用
+      `merge_commit` 本地 diff 而非粒度不符的 `sizing_declaration_drift`。後續 estimator
+      實作票的切分與依賴序見上述 design doc「建議後續實作票切分」。
 - [ ] 決定是否採納 `fix-standard` combo（草稿見 `#202`）。
 - [x] band 觸發加掛層的閾值：**預設 Yellow 起掛**（#221/PR #228 落地為具名常數可調）；repair 上限依 band 參數化 green=1/yellow=2（#218/PR #243），兩者已對齊。
 - [ ] 確認次軸 `scope`、排除 agent-usage-stats 5 類、combo 為輸出而非輸入三項順推事項。
@@ -44,7 +50,7 @@ TOCTOU 縫、StageExecutionKey 派工端消費、reviewer attestation 強度升�
 | `#202` | feat(deck)：以 task_type 自動選擇 combo | open；已改為 additive with fallback，不再被 combo 缺口阻擋 |
 | `#208` | sizing gate + lifecycle retry 成本治理 | open；已拆分 |
 | `#209` | 模型能力封套、`capable()` 謂詞、topic×band 路由矩陣 | open |
-| `#210` | 以自身 run 歷史校準 sizing 難度與能力封套 | open；**零外部前置，可立即開始** |
+| `#210` | 以自身 run 歷史校準 sizing 難度與能力封套 | open；**設計已落地**（`docs/superpowers/specs/sizing-envelope-calibration-{spec,design}.md`）；依賴 `#209` 欄位落地＋一張新前置票（`invariant_count` 持久化） |
 | `#224` | subagent 交付失敗類型實測 | open（記錄性質） |
 | `#8` | deck 自主派工閉環 umbrella | open；**已對帳確認不關**——六張子票全 open，另有整合層條件 |
 
