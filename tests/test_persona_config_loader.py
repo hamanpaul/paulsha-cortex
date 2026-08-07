@@ -75,6 +75,53 @@ class LoadCatalogTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_catalog(bad)
 
+    def test_builder_completion_obligations_require_commit(self) -> None:
+        obligations = " ".join(contract.PERSONA_CATALOG["builder"].completion_obligations)
+        self.assertTrue(obligations)
+        self.assertIn("commit", obligations)
+        self.assertTrue("worktree" in obligations or "乾淨" in obligations)
+
+    def test_completion_obligations_non_list_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "personas.yaml"
+            bad.write_text(
+                "version: 1\n"
+                "enforcement: shadow\n"
+                "roles:\n"
+                "  manager:\n"
+                "    role: manager\n"
+                "    version: \"1.0.0\"\n"
+                "    summary: manager\n"
+                "    allowed_phases: [claim]\n"
+                "    write_paths: [\"docs/**\"]\n"
+                "    allowed_tools: [\"git\"]\n"
+                "  planner:\n"
+                "    role: planner\n"
+                "    version: \"1.0.0\"\n"
+                "    summary: planner\n"
+                "    allowed_phases: [plan]\n"
+                "    write_paths: [\"docs/**\"]\n"
+                "    allowed_tools: [\"rg\"]\n"
+                "  builder:\n"
+                "    role: builder\n"
+                "    version: \"1.0.0\"\n"
+                "    summary: builder\n"
+                "    allowed_phases: [build]\n"
+                "    write_paths: [\"**\"]\n"
+                "    allowed_tools: [\"git\"]\n"
+                "    completion_obligations: \"not a list\"\n"
+                "  reviewer:\n"
+                "    role: reviewer\n"
+                "    version: \"1.0.0\"\n"
+                "    summary: reviewer\n"
+                "    allowed_phases: [review]\n"
+                "    write_paths: [\"reports/**\"]\n"
+                "    allowed_tools: [\"rg\"]\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                load_catalog(bad)
+
 
 class RoleV2ScopeTests(unittest.TestCase):
     def setUp(self) -> None:
