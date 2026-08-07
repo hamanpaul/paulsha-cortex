@@ -1558,16 +1558,55 @@ def build_production_ship_validator(
                     reason="pr-preflight-blocked",
                     next_action="resume-after-preflight-fix",
                 )
-            return _preflight_result_evidence(
-                state_root=state_root,
+            _push_exact_candidate(
+                registry=registry,
                 run=run,
+                authority=authority,
+                state_root=state_root,
+                worktree=worktree,
+                branch=branch,
                 candidate=candidate,
-                stage="metadata",
-                preflight=initial,
-                status="needs_human",
-                reason="awaiting-pr-authorization",
-                next_action="awaiting-pr-authorization",
+                runner=runner,
             )
+            github = GitHubDeliveryClient(runner=runner)
+            number = github.create_or_get_pull_request(
+                repo=run.repo,
+                branch=branch,
+                expected_head=candidate,
+                title=str(metadata["title"]),
+                body=str(metadata["body"]),
+                labels=tuple(metadata["labels"]),
+            )
+            authority = _authority_with_manager_pr(authority, number)
+            updated = registry._manager_update_workflow_run(
+                run.run_id,
+                source_revision=work_authority_digest(authority),
+                pr_refs=(f"{run.repo}#{number}",),
+            )
+            _rebase_delivery_journal_authority(
+                state_root=state_root,
+                run=updated,
+                authority=authority,
+            )
+            evidence = _write_json_evidence(
+                state_root,
+                "delivery-adapter",
+                {
+                    "schema": "cortex-delivery-adapter/v1",
+                    "run_id": updated.run_id,
+                    "candidate": candidate,
+                    "action": "pr-created",
+                    "pr_number": number,
+                    "authority_digest": updated.source_revision,
+                },
+            )
+            return {
+                "trusted": True,
+                "status": "pending",
+                "head": candidate,
+                "commit_id": candidate,
+                **evidence,
+            }
         number = pr_numbers[0]
         if authority.mapped_prs not in {(), (number,)}:
             raise RuntimeError("workflow PR differs from current WorkAuthority")

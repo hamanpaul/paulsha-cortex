@@ -601,10 +601,18 @@ def test_stage_order_closeout_then_preflight_then_ship(
         assert preflight_index < mutation_index
 
 
-def test_no_external_mutation_without_authorization(
+def test_pr_created_automatically_after_closeout_and_preflight_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Once local closeout has already completed (active change archived)
+    and metadata preflight passes, ship validate MUST proceed to push and
+    create the PR in the same call -- spec R3's 驗收面: "本地 archive 完成
+    後建立 PR，仍銜接 current-head CI、foreign review、final attestation與
+    ship". Plan task 3 explicitly keeps `_pr_metadata`/preflight/push/PR
+    creation "保持在 local closeout 段之後執行" (kept, just reordered), not
+    removed behind a manual "awaiting-pr-authorization" stop.
+    """
     harness = _ship_harness(
         tmp_path,
         monkeypatch,
@@ -616,11 +624,12 @@ def test_no_external_mutation_without_authorization(
 
     assert outcome.exception is None
     assert isinstance(outcome.result, dict)
-    assert outcome.result["status"] == "needs_human"
-    assert "awaiting-pr-authorization" in str(outcome.result.get("reason"))
-    assert not harness.runner.saw_push()
-    assert not harness.runner.saw_gh()
-    assert not (harness.state_root / "delivery-journal.json").exists()
+    assert outcome.result["status"] == "pending"
+    assert harness.runner.saw_push()
+    assert harness.runner.saw_gh()
+    updated = harness.registry.get_workflow_run(harness.run_id)
+    assert updated.pr_refs == ("acme/demo#17",)
+    assert (harness.state_root / "delivery-journal.json").exists()
 
 
 def test_archive_commit_does_not_push(tmp_path: Path) -> None:

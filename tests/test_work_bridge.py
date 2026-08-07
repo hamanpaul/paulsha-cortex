@@ -202,7 +202,7 @@ def test_delivery_adapter_status(action: object, expected: str) -> None:
     assert work_bridge._delivery_adapter_status(action) == expected
 
 
-def test_ship_adapter_stops_at_pr_authorization_after_metadata_preflight(
+def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     monkeypatch, tmp_path: Path
 ) -> None:
     repo, candidate = _repo(tmp_path / "repo")
@@ -444,14 +444,14 @@ def test_ship_adapter_stops_at_pr_authorization_after_metadata_preflight(
 
     result = validator(run=run, candidate=candidate)
 
-    assert result["status"] == "needs_human"
-    assert result["reason"] == "awaiting-pr-authorization"
+    assert result["status"] == "pending"
     assert preflight_requests[0].metadata_path is not None
     assert preflight_requests[0].pr_number is None
+    assert created[0]["branch"] == "feature/14-work"
     updated = registry.get_workflow_run(run.run_id)
     assert updated.run_id == run.run_id
-    assert updated.pr_refs == ()
-    assert updated.source_revision == run.source_revision
+    assert updated.pr_refs == ("acme/demo#17",)
+    assert updated.source_revision != run.source_revision
     assert updated.planning_source_revision == initial_source_revision
     assert not report.exists()
     assert plan.is_file()
@@ -470,40 +470,28 @@ def test_ship_adapter_stops_at_pr_authorization_after_metadata_preflight(
     journal = json.loads(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
-    assert journal["runs"][run.run_id].get("pushes", {}) == {}
-    assert created == []
+    assert journal["runs"][run.run_id]["pushes"][candidate]["head"] == candidate
+    assert "openspec:acme/demo:work@spec-2" in journal["runs"][run.run_id][
+        "source_revisions"
+    ]
 
     # A repaired exact Candidate on an already-bound PR must be preflighted,
     # pushed, and read back before the ordinary ship state machine compares
     # authenticated remote facts with the local tree.
-    authority_with_pr = work_bridge._authority_with_manager_pr(
-        load_work_authority(repo="acme/demo", work_id="work", snapshot_path=snapshot),
-        17,
-    )
-    updated = registry._manager_update_workflow_run(
-        run.run_id,
-        pr_refs=("acme/demo#17",),
-        source_revision=work_authority_digest(authority_with_pr),
-    )
-    work_bridge._rebase_delivery_journal_authority(
-        state_root=tmp_path / "state",
-        run=updated,
-        authority=authority_with_pr,
-    )
-    remote_head = None
+    remote_head = "a" * 40
     monkeypatch.setattr(
         work_actions,
         "_ship_action",
         lambda **kwargs: {"action": "awaiting-copilot"},
     )
     resumed = validator(
-        run=registry.get_workflow_run(updated.run_id),
+        run=registry.get_workflow_run(run.run_id),
         candidate=candidate,
     )
 
     assert resumed["status"] == "pending"
     assert remote_head == candidate
-    assert push_count == 1
+    assert push_count == 2
     assert preflight_requests[-1].pr_number == 17
 
 
@@ -1063,10 +1051,10 @@ identities:
             return "main"
 
     monkeypatch.setattr(work_bridge, "GitHubDeliveryClient", GitHub)
-    pushed = False
+    pushed_head: str | None = None
 
     def delivery_runner(argv, **kwargs):
-        nonlocal pushed
+        nonlocal pushed_head
         if argv[:2] == ["openspec", "validate"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if argv[:3] == ["python3", "-m", "policy_check"]:
@@ -1080,13 +1068,22 @@ identities:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "ls-remote" in argv:
             return SimpleNamespace(
-                returncode=0 if pushed else 2,
-                stdout=(f"{candidate}\trefs/heads/feature/14-work\n" if pushed else ""),
+                returncode=0 if pushed_head is not None else 2,
+                stdout=(
+                    f"{pushed_head}\trefs/heads/feature/14-work\n"
+                    if pushed_head is not None
+                    else ""
+                ),
                 stderr="",
             )
         if "push" in argv:
             assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
-            pushed = True
+            pushed_head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(argv)
 
@@ -1125,18 +1122,16 @@ identities:
                 requested_by="operator",
             )
         )
-        current = registry.get_workflow_run(run_id)
-        if "needs_human" in current.facets:
+        if registry.get_workflow_run(run_id).pr_refs:
             break
-    assert result is not None and result["reason"] == "awaiting-pr-authorization"
+    assert result is not None and result["reason"] == "delivery-in-progress"
     run = registry.get_workflow_run(run_id)
     assert run.current_phase == "review"
-    assert run.pr_refs == ()
-    assert "needs_human" in run.facets
+    assert run.pr_refs == ("acme/demo#17",)
     assert branches == ["feature/14-work"]
     assert preflight_requests[0].metadata_path is not None
     assert preflight_requests[0].pr_number is None
-    assert created == []
+    assert created[0]["branch"] == "feature/14-work"
 
     from paulsha_cortex.monitor.providers import WorkflowRegistryProvider
 
@@ -1194,11 +1189,6 @@ identities:
     )
     authority = work_bridge._authority_with_manager_pr(
         load_work_authority(repo="acme/demo", work_id="work"), 17
-    )
-    run = registry._manager_update_workflow_run(
-        run_id,
-        pr_refs=("acme/demo#17",),
-        source_revision=work_authority_digest(authority),
     )
     # #208 收口 wiring 4：sizing 是 work item 屬性，_completion_draft 必須把
     # run 上已算好的 sizing_score/sizing_band 帶進 CompletionRecord（比照既有
