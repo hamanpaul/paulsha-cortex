@@ -4,12 +4,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from . import autonomy, broker_reaper
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
 from .registry import JobRegistry
 from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCreator
+from .workflow import WorkflowRun
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
 DEFAULT_REQUEST_POLL_INTERVAL_SECONDS = 0.1
@@ -45,6 +46,44 @@ def _refuse_unsafe_fanout(metas, predicate, *, allow_unsafe, max_ready=1):
         raise ValueError(
             f"--allow-unsafe 僅允許 ≤{max_ready} 個就緒 slice（canary 一次一個），實得 {len(ready)}"
         )
+
+
+def _workflow_run_attribution(run: WorkflowRun | None) -> dict[str, str | None]:
+    """把 WorkflowRun 投影成 job 輸出要補的歸屬欄位（#323）：
+    ``workflow_work_id``／``workflow_primary_issue``。``run`` 為 ``None``
+    （非 workflow lane job，或 workflow_run_id 已查無對應 run）時兩欄位皆為
+    ``None``，與既有 ``workflow_*`` 欄位「一律出現、N/A 時為 null」的慣例一致，
+    讓既有消費者可安全假設欄位存在而不必分支處理缺欄位。card 已由既有
+    ``workflow_card`` 欄位提供，不重複新增。"""
+    return {
+        "workflow_work_id": run.work_id if run is not None else None,
+        "workflow_primary_issue": (
+            run.issue_refs[0] if run is not None and run.issue_refs else None
+        ),
+    }
+
+
+def _attribute_job(job: dict[str, Any], reg: JobRegistry) -> dict[str, Any]:
+    """單一 job dict（``stat``）的輸出端補欄：依 ``workflow_run_id`` join
+    registry 現有的 workflow run，零額外持久化狀態。"""
+    workflow_run_id = job.get("workflow_run_id")
+    run: WorkflowRun | None = None
+    if isinstance(workflow_run_id, str) and workflow_run_id:
+        try:
+            run = reg.get_workflow_run(workflow_run_id)
+        except KeyError:
+            run = None
+    job.update(_workflow_run_attribution(run))
+    return job
+
+
+def _attribute_jobs(jobs: list[dict[str, Any]], reg: JobRegistry) -> list[dict[str, Any]]:
+    """``jobs`` 列表輸出端補欄：一次性把 workflow runs 建成 ``run_id`` 索引，
+    避免對每個 job 各自線性掃描 registry 的 workflow run 列表。"""
+    runs_by_id = {run.run_id: run for run in reg.list_workflow_runs()}
+    for job in jobs:
+        job.update(_workflow_run_attribution(runs_by_id.get(job.get("workflow_run_id"))))
+    return jobs
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -407,7 +446,7 @@ def main(
     reg = registry if registry is not None else JobRegistry()
 
     if args.cmd == "jobs":
-        print(json.dumps(reg.list_jobs(), ensure_ascii=False))
+        print(json.dumps(_attribute_jobs(reg.list_jobs(), reg), ensure_ascii=False))
         return 0
 
     if args.cmd == "stat":
@@ -455,7 +494,7 @@ def main(
         except KeyError as exc:
             print(f"錯誤: {exc}", file=sys.stderr)
             return 1
-        print(json.dumps(job, ensure_ascii=False))
+        print(json.dumps(_attribute_job(job, reg), ensure_ascii=False))
         return 0
 
     return 2  # pragma: no cover（argparse required=True 已擋）
