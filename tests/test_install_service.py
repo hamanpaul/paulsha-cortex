@@ -40,6 +40,7 @@ def test_install_writes_current_python_to_env_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
 
     assert installer.main(["service", "--instance", "beta"]) == 0
 
@@ -61,6 +62,7 @@ def test_install_writes_git_repo_root_to_env_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.chdir(work_dir)
 
     assert installer.main(["service", "--instance", "beta"]) == 0

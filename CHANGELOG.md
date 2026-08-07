@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.15。
 
 ## [Unreleased]
+### Fixed
+- **Issue #303：三個測試直讀 production coordinator 狀態檔，環境洩漏使本地 pytest gate 被宿主狀態污染**：`test_porcelain_inspect.py::test_inspect_missing_targets_exit_one[argv0-missing-job]`／`test_work_actions.py::test_auto_without_issue_mutates_every_mapped_issue`／`test_auto_without_issue_fails_closed_if_any_label_mutation_fails` 未隔離 coordinator root，未顯式覆寫 `PSC_*` 時經 `resolve_runtime_root()` 落回 `$HOME/.agents`，直讀宿主真實 `~/.agents/coordinator/jobs.json`；production 狀態異常時三測試連帶 fail-closed。同根因擴大排查後，`tests/conftest.py` 的 autouse `_clear_runtime_env` 改為同時把 `PSC_AGENTS_ROOT`／`PSC_CONFIG_ROOT` 指向每測試獨立的空 tmp 目錄（作為 fail-safe 安全網，覆蓋 coordinator／control／specs／monitor／project-config／run root 整個家族），並補上 5 支既有測試（`test_paths.py`／`test_install_service.py`／`test_coordinator_manager_daemon.py`）刻意驗證「未覆寫時落回 `$HOME`」語意所需的顯式 `PSC_AGENTS_ROOT` delenv。以 audit-hook 稽核與偽造 corrupted `jobs.json` 重現 W1 batch 情境驗證修復前後行為差異。詳見 `changelog.d/fix-test-production-state-leak.md`。
 ### Changed
 - **封存批次 W2 三個已交付的 OpenSpec changes**：#294／#263／#202 的 change 已隨 PR 合併，但本批改由人工管線收尾未經 cortex ship，故 change 目錄仍 active；以官方 archive 折入 canonical specs。
 ### Added

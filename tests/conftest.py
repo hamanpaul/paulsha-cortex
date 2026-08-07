@@ -8,11 +8,27 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep tests hermetic against operator shell/runtime bootstrap variables."""
+def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep tests hermetic against operator shell/runtime bootstrap variables.
+
+    Clearing PSC_* alone is not enough: paulsha_cortex.config.runtime falls
+    back to the *installed* instance under the real ``$HOME`` (bootstrap env
+    file, then ``Path.home() / ".agents"``) whenever a root is unset. Without
+    an explicit redirect, any test that forgets to isolate its own coordinator
+    root (JobRegistry(), IdentityRegistry(), paths.coordinator_root(), ...)
+    silently reads (and, on schema migration, could even write) the operator's
+    real production state — see #303. Point the whole PSC_AGENTS_ROOT family
+    (coordinator/control/specs/monitor/project-config/run root all derive
+    from it, see config/runtime.py RUNTIME_ROOT_DEFAULTS) plus PSC_CONFIG_ROOT
+    at an empty per-test directory by default; tests that need specific fixture
+    data still monkeypatch these explicitly afterwards, which overrides this.
+    """
     for name in tuple(os.environ):
         if name.startswith("PSC_") or name == "PAULSHACLAW_CONFIG":
             monkeypatch.delenv(name, raising=False)
+    unset_root = tmp_path / "unset-psc-root-guard"
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
+    monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
 
 
 @pytest.fixture(autouse=True)

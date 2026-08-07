@@ -2197,6 +2197,7 @@ def test_run_loop_default_builders_receive_injected_dispatcher_and_registry(monk
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     registry = FakeRegistry()
     dispatcher = FakeDispatcher(registry)
     request = _write_request("20260703T090005Z-99999999999999999999999999999999")

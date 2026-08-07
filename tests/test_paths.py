@@ -35,6 +35,7 @@ def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):
 def test_run_root_default_and_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
     monkeypatch.delenv("PSC_INSTANCE", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     assert paths.run_root() == Path.home() / ".agents" / "run" / "cortex"
     monkeypatch.setenv("PSC_RUN_ROOT", str(tmp_path / "run"))
     assert paths.run_root() == tmp_path / "run"
@@ -51,6 +52,7 @@ def test_run_root_discovers_selected_installed_instance(monkeypatch, tmp_path):
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PSC_INSTANCE", "beta")
 
     assert paths.run_root() == tmp_path / "custom-run"
@@ -63,6 +65,7 @@ def test_run_root_rejects_malformed_installed_environment(monkeypatch, tmp_path)
     (runtime / "cortex-manager.env").write_text("PSC_RUN_ROOT=relative/run\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.delenv("PSC_INSTANCE", raising=False)
 
     with pytest.raises(ValueError, match="絕對路徑"):
@@ -80,6 +83,7 @@ def test_run_root_accepts_quoted_values_in_selected_installed_instance(monkeypat
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("PSC_RUN_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PSC_INSTANCE", "beta")
 
     assert paths.run_root() == tmp_path / "custom-run"
@@ -92,6 +96,7 @@ def test_config_path_default(monkeypatch):
 
 def test_project_config_root(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_PROJECT_CONFIG_ROOT", raising=False)
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     assert paths.project_config_root() == Path.home() / ".agents" / "config" / "paulsha"
     monkeypatch.setenv("PSC_PROJECT_CONFIG_ROOT", str(tmp_path / "pc"))
     assert paths.project_config_root() == tmp_path / "pc"
