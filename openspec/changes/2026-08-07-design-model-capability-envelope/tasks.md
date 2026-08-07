@@ -15,6 +15,13 @@ work_item: design-model-capability-envelope
       `CHANGELOG.md [Unreleased]` entry。
 - [x] 1.5 `python3 -m pytest tests/ -q` 全綠（docs-only，基線不變）；
       `openspec validate 2026-08-07-design-model-capability-envelope --strict` 通過。
+      補充（複驗實測，取代任何印象式宣稱）：`openspec validate --changes --strict` 為
+      **13 passed, 0 failed**（13 個 change 總數已含本票，非另計 14）；
+      `openspec validate --specs --strict` 為 **12 passed, 4 failed**（`cli-version-reporting`
+      ／`persona-workflow-orchestration`／`porcelain-guided-bootstrap`／
+      `porcelain-inspect-surface` 四個 spec 失敗，非 16/16 全過）——但此 4 項失敗在 main
+      基線（`9bda3c0`，未套用本票任何變更）跑同一指令結果逐項相同，證實為既有回歸，非本票
+      造成，不阻塞本票落地。
 
 ## 本票不做（範圍切分給後續實作票）
 

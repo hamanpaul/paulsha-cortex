@@ -110,31 +110,54 @@ issue §5 矩陣原樣保留（本票不重新推導 topic 分佈或門檻），
 roster 擴充（新增至少一個具 `build` capability 的第二身分）才會發生，且擴充時程不在本票掌握
 範圍內（見「現況更正」）。
 
-### D6 registry 現況更正：連 issue 自身的修正都對不上 main
+### D6 registry 現況更正：packaged registry 只有 1 身分，但與同一 repo 內一份受版控筆記矛盾
 
 `model-identities.yaml` 全文只有一個身分（`agy`/`gemini-3.1-pro-high`/`capabilities:
 [planning]`），這點本票以檔案原文為準（見 spec 背景節的完整 YAML 引用）。issue #209 的
 2026-07-27 comment（`§4 更正`）宣稱 registry「實際三個身分」，列出
 `agy`/`claude-sonnet-4-6`（build）、`agy`/`gemini-3.6-flash-high`（review）、
-`agy`/`Gemini 3.1 Pro (High)`（planning）——本票對 main 全 repo（含 tests fixtures）執行
-`grep -rn "claude-sonnet-4-6\|gemini-3.6-flash-high"`，**零命中**。
+`agy`/`Gemini 3.1 Pro (High)`（planning）。
 
-這代表 issue 自己的第二輪修正描述的是某個 host-local
-`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml` overlay 的內容（該路徑允許自訂疊加，見
-`model_identities.py` 對 packaged vs custom 兩份檔案的合併邏輯），而不是 main 分支
-tracked 的狀態。issue thread 內的兩輪自我修正本身仍然可能對某個執行環境為真，但作為「main
-現況」的陳述不成立——本設計文件的權威來源是 `git show main:...` 可查證的檔案內容，不是
-issue comment 文字。
+本文件初版曾誤述「本票對 main 全 repo（含 tests fixtures）執行 grep，零命中」——複驗更正：
+`grep -rn "claude-sonnet-4-6\|gemini-3.6-flash-high" .`（排除 `.git`）在 main 上**確有
+命中**，且不只 issue comment 文字：
 
-理由記錄這一層而非止步於 issue 已知的修正：往後任何要引用「registry 現況」的實作票，若只讀
-issue comment 而不去 `git show` 實際檔案，會把一個 host-local overlay 誤當成 repo 的
-canonical 狀態，進而誤判「roster 已經有 build/review 身分」而略過 D5／R6 提醒的
-「`capable()` 落地後可能把現行全部 build 派工擋下」風險。
+- `docs/superpowers/workstreams/cost-governance-cluster/todo.md:129` 是本 repo 既有、
+  受版控的「關鍵事實（避免重犯）」筆記，白紙黑字寫「registry 實際只有三個身分…
+  `claude-sonnet-4-6`（build/anthropic）、`gemini-3.6-flash-high`（review/google）、
+  `Gemini 3.1 Pro (High)`（planning/google）」，與 issue comment 的修正表幾乎逐字一致。
+- `docs/superpowers/workstreams/driving-cortex-skill/todo.md:12` 另有 1 處提及
+  `gemini-3.6-flash-high` 作為 ForeignReview 執行身分。
+- `tests/test_model_identities.py:368,376` 是測試 fixture 裡字面湊巧出現的字串（mock CLI
+  輸出／診斷訊息斷言用途），與 registry 身分宣告無關，不構成同語意命中。
 
-風險與緩解：若之後有人在某台機器的 `$PSC_PROJECT_CONFIG_ROOT` 疊加了 build/review 身分，
-本文件的「只有 1 個身分」陳述會對該機器失真——緩解：本文件所有現況陳述明確標註查證來源
-（`git show`／`grep`，皆可重跑核對），且明文只claim「main tracked 狀態」，不 claim
-「所有可能的執行環境」。
+這代表本文件 R4／spec R4 引用的同一份 `cost-governance-cluster/todo.md`（三閘序「已定案」
+第 5 條）與本節（registry 只有 1 身分）之間存在一個未收斂的矛盾：**同一份 todo.md** 在第 5
+條被本票奉為三閘序的權威來源，卻在第 129 行斷言一個與 packaged registry 不符的三身分表。
+本票不假裝這個矛盾不存在，也不擅自替 todo.md 的 owner 收斂它，本文件的立場是：
+
+1. `model-identities.yaml`／`model_identities.py` 是 repo 內**唯一有 loader、有
+   fail-closed 驗證、被程式實際讀取**的 packaged registry 路徑，本票 R1–R8 的資料依據以它
+   的現況（1 身分）為準；
+2. `todo.md:129` 的三身分表*可能*反映某個 host-local
+   `$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml` overlay（該路徑允許自訂疊加，見
+   `model_identities.py` 對 packaged vs custom 兩份檔案的合併邏輯）在記錄當下被筆記者當成
+   「registry 現況」寫下——但這是本票的推測，不是查證結論：`todo.md:129` 本身沒有標注資料
+   來源是 packaged 檔案還是某台機器的 overlay；
+3. 這個矛盾 MUST 在後續實作票（欄位 schema PR）上線前與 `cost-governance-cluster` todo
+   owner 對齊：若 overlay 確實已在某環境生效提供三身分，「僅 1 身分」這個風險評估前提就需要
+   重新核實；若 `todo.md:129` 是過時或誤記，該筆記應更新以避免持續誤導。本票不擅自編輯
+   `cost-governance-cluster/todo.md`（超出本票 owner 權限與範圍）。
+
+理由記錄這一層而非止步於「查了 grep」：往後任何要引用「registry 現況」的實作票，若只讀
+issue comment 或只讀 todo.md 其中一份文件，可能各自得到不同答案——本文件把兩份文件的矛盾
+攤開，並明確標注查證結論的信心邊界（packaged 檔案內容可重跑核對；host-local overlay 只是
+假設），避免任一方被誤當成唯一權威、也避免「零命中」這種可證偽陳述誤導後續讀者。
+
+風險與緩解：若之後證實 `todo.md:129` 反映的是某個已在用的環境現況（而非過時筆記），本文件
+「僅 1 身分」的假設會低估現行實際可用的 build/review 身分數，`capable()` 上線影響評估
+（見「風險與緩解」章節）需要跟著重估——緩解：本節已明文列出這是待收斂項，且要求後續實作票
+上線前重新確認 registry 現況，不是本文件片面決定終局。
 
 ### D7 沿用既有 `envelope_lookup` 介面形狀，不另起爐灶
 

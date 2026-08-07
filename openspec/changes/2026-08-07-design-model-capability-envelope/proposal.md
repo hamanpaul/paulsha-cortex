@@ -15,9 +15,12 @@ work_item: design-model-capability-envelope
 `#208` 已落地需求側五維 sizing 量表（`claim.py:1098` `sizing_band()` 等，main 生產可用），
 但供給側「能力配得上」完全未定義：`claim_readiness.py:18,421-437` 明文標註
 `capability` 檢查是 `#209 not yet landed` 的 observability bypass（恆真、無過濾）；
-packaged registry（`model-identities.yaml`）現況只有一個身分且無 `build`/`review`
-capability；issue #209 §4.1 的三身分表（含其自身 2026-07-27 修正 comment）與 main tracked
-現況皆不符（`grep` 全 repo 零命中該表列的 model_id）。issue 本文自稱「設計討論記錄，非實作
+packaged registry（`model-identities.yaml`，repo 內唯一有 loader／fail-closed 驗證的身分
+清單）現況只有一個身分且無 `build`/`review` capability；issue #209 §4.1 的三身分表（含其
+自身 2026-07-27 修正 comment）與 packaged registry 現況不符。但這兩個 model_id 並非只存在
+issue comment 文字——`docs/superpowers/workstreams/cost-governance-cluster/todo.md:129`
+這份受版控的「關鍵事實」筆記重申幾乎逐字相同的三身分表，與 packaged registry 矛盾，此矛盾
+尚未收斂（詳見「現況更正」段與 `design.md` D6）。issue 本文自稱「設計討論記錄，非實作
 PR；落地依 OpenSpec 開 change」，本票即為該 change。
 
 ## What Changes
@@ -30,8 +33,10 @@ PR；落地依 OpenSpec 開 change」，本票即為該 change。
 - 定案三閘序（eligibility／admission／routing）並記錄與既有 `claim_readiness.CHECK_ORDER`
   的落差；定案 topic×band 矩陣在現行 roster（僅 1 個 `build` 身分）下只有 eligibility 語意、
   無 routing 語意。
-- **§4 現況更正**：registry 全文只有一個身分（`agy`/`gemini-3.1-pro-high`/
-  `capabilities: [planning]`），連 issue #209 自身修正 comment 的三身分表都對不上 main。
+- **§4 現況更正**：packaged registry 全文只有一個身分（`agy`/`gemini-3.1-pro-high`/
+  `capabilities: [planning]`），issue #209 自身修正 comment 的三身分表與此不符；但同一份
+  三身分表也出現在 repo 內受版控的 `cost-governance-cluster/todo.md:129`，本票記錄這個
+  矛盾並標明尚待與其 owner 對齊，不擅自判定孰是孰非（見 `design.md` D6）。
 - 明載既有消費端契約點（`planning.py:456-509` 的 `envelope_lookup` 介面形狀）必須被後續
   實作票沿用，不得另起爐灶。
 - 不實作、不改 `.py`、不新增資料源。

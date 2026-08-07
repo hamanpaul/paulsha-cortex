@@ -35,8 +35,9 @@ work_item: design-model-capability-envelope
 - `paulsha_cortex/coordinator/planning.py:456-509` 的 `_plan_review_envelope()` 同樣有
   `envelope_lookup` 掛勾，但 `manager.py:5988` 目前固定傳入 `envelope_lookup=None`，恆走
   bypass 分支（見 D7）。
-- `paulsha_cortex/coordinator/data/model-identities.yaml`（packaged registry，唯一在 repo 內
-  受版控的身分清單）**全文只有一個身分**：
+- `paulsha_cortex/coordinator/data/model-identities.yaml`（packaged registry，repo 內
+  唯一有 loader／fail-closed 驗證、被 `model_identities.py` 實際讀取的身分清單）
+  **全文只有一個身分**：
 
   ```yaml
   schema_version: 2
@@ -48,14 +49,19 @@ work_item: design-model-capability-envelope
       live_probe: agy-plan-sandbox
   ```
 
-  即 `capabilities` 唯一值是 `planning`；repo 內**沒有任何身分**帶 `build` 或 `review`
-  capability。issue 原文 §4.1 初版的三身分表（`codex/gpt-5.3-codex-spark`、
+  即 `capabilities` 唯一值是 `planning`；packaged registry 內**沒有任何身分**帶 `build`
+  或 `review` capability。issue 原文 §4.1 初版的三身分表（`codex/gpt-5.3-codex-spark`、
   `copilot/gpt-5.4`、`claude/sonnet`、`Luna(Opus max)`）與其 2026-07-27 comment 的
   **修正表**（`agy`/`claude-sonnet-4-6`〔build〕、`agy`/`gemini-3.6-flash-high`〔review〕、
-  `agy`/`Gemini 3.1 Pro (High)`〔planning〕）皆與 main 現況不符：全 repo
-  `grep -rn "claude-sonnet-4-6\|gemini-3.6-flash-high"` **零命中**——這兩個 model_id
-  只存在於 issue comment 文字裡，從未寫進任何受版控設定檔。本文件的 §4 更正以「連 issue
-  自己的修正 comment 都對不上 main」為準（見「現況更正」節），非重複 issue 已知的第一輪更正。
+  `agy`/`Gemini 3.1 Pro (High)`〔planning〕）皆與 packaged registry 現況不符。但這兩個
+  model_id 在全 repo grep **並非只存在於 issue comment**——
+  `docs/superpowers/workstreams/cost-governance-cluster/todo.md:129` 是本 repo 既有、
+  受版控的「關鍵事實（避免重犯）」筆記，重申幾乎逐字相同的三身分表；
+  `driving-cortex-skill/todo.md:12` 另有 1 處提及 `gemini-3.6-flash-high`。本文件的 §4
+  更正以「packaged registry（唯一有 loader 的檔案）現況只有 1 身分」為準，但明確記錄
+  `todo.md:129` 與此矛盾、尚未收斂（見「現況更正」節 R6 與
+  `docs/superpowers/specs/design-model-capability-envelope-design.md` D6）——這牽涉另一份
+  獨立的受版控文件，需要與其 owner 對齊，非本票單方面可判定孰是孰非。
 - `resource-inventory.yaml`（issue §8.2 指名的落地檔案）**在 repo 中不存在**；issue 原文
   §139 引用該檔名owner 為 `#139`，但 `#139`（issue body 已核對）本身的落地清單是「session log
   reader／`project_resolver` 歸屬／resource status view（動態 JOIN）／outcome ledger／
@@ -134,7 +140,10 @@ quota／health 也一起收），欄位遷移 MUST 為 additive-only 搬遷（�
 ### R4 三閘序（eligibility／admission／routing）契約凍結
 
 `#136`／`#138`／`#209` 的邊界依 2026-07-27 議定（issue #209 §9.5，並與
-`docs/superpowers/workstreams/cost-governance-cluster/todo.md` 的「已定案」第 5 條一致）
+`docs/superpowers/workstreams/cost-governance-cluster/todo.md` 的「已定案」第 5 條一致
+——**注意**：本票引用的是該 todo.md 的三閘序裁決（第 5 條），與同一份 todo.md 第 129 行
+「registry 實際三個身分」的筆記是不同段落、不同性質的陳述；後者與 packaged registry 現況
+矛盾，見 R6，本票不因為第 5 條可信就連帶背書第 129 行）
 凍結為：
 
 | 閘 | 回答的問題 | 擋不擋 | 判準 | 落在 |
@@ -167,22 +176,31 @@ eligibility 判準的參考輸入，但 MUST 明確標註：**在 registry 只�
 eligibility 判斷（該不該直接派）而非 routing 判斷。roster 擴充後（新增第二個 `build`
 capability 身分）矩陣才會產生實際的 routing 分流效果；本票不假設擴充時程。
 
-### R6 registry 現況更正（含 issue 自身修正未同步 main 的落差）
+### R6 registry 現況更正（packaged registry 僅 1 身分；與 todo.md:129 的矛盾待收斂）
 
 本票文件 MUST 明載以下事實，取代 issue §4.1 的任何版本（含其 2026-07-27 comment 的修正表）：
 
-- packaged registry（`paulsha_cortex/coordinator/data/model-identities.yaml`）現況
-  **只有一個身分**：`agy` / `gemini-3.1-pro-high` / `independence_domain: google` /
-  `capabilities: [planning]` / `live_probe: agy-plan-sandbox`。
-- 全 repo（含 tests fixture）grep `claude-sonnet-4-6`、`gemini-3.6-flash-high` **零命中**：
-  issue 自身 2026-07-27 comment 宣稱的「registry 實際三個身分」表本身也未反映 main 現況——
-  那張表可能是對照某個未受版控的 `$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`
-  overlay（host-local，不在本 repo diff 範圍內），但作為「main 現況」的陳述並不成立。
-- 因此**目前唯一登錄的身分完全不具備 `build` 或 `review` capability**；R1 項 5
-  （`required_capabilities ⊆ resource.capabilities`）在絕大多數 build/review 型工作上會對
-  這個唯一身分判否——`capable()` 落地後，若沒有同時擴充 registry 補上至少一個 `build` 身分，
-  現行 build 派工會從「無過濾（bypass）」變成「全部被 `capable()` 擋下」，這是後續實作票
-  上線前 MUST 先確認的環境前提，不是本票要解決的範圍。
+- packaged registry（`paulsha_cortex/coordinator/data/model-identities.yaml`，repo 內
+  唯一有 loader／fail-closed 驗證的身分清單）現況**只有一個身分**：`agy` /
+  `gemini-3.1-pro-high` / `independence_domain: google` / `capabilities: [planning]` /
+  `live_probe: agy-plan-sandbox`。
+- 全 repo grep `claude-sonnet-4-6`、`gemini-3.6-flash-high` **並非零命中**：issue 自身
+  2026-07-27 comment 宣稱的「registry 實際三個身分」表與 packaged registry 不符，但
+  `docs/superpowers/workstreams/cost-governance-cluster/todo.md:129`（受版控、屬本 repo
+  「關鍵事實」筆記）重申幾乎逐字相同的三身分表；`driving-cortex-skill/todo.md:12` 另有 1
+  處提及 `gemini-3.6-flash-high`；`tests/test_model_identities.py:368,376` 為測試 fixture
+  字面巧合，與 registry 宣告無關。本票以 packaged registry（唯一有 loader 的檔案）現況為
+  R1–R8 的資料依據，但 `todo.md:129` 與此矛盾**尚未收斂**——本票不擅自判定 `todo.md:129`
+  是過時筆記還是反映某個 host-local overlay（`model_identities.py` 允許
+  `$PSC_PROJECT_CONFIG_ROOT` 疊加，理論上可能），這需要與 `cost-governance-cluster` todo
+  owner 對齊，超出本票（design-model-capability-envelope）的範圍。詳細記錄見
+  `docs/superpowers/specs/design-model-capability-envelope-design.md` D6。
+- 因此**packaged registry 目前唯一登錄的身分完全不具備 `build` 或 `review` capability**；
+  R1 項 5（`required_capabilities ⊆ resource.capabilities`）在絕大多數 build/review 型工作
+  上會對這個唯一身分判否——`capable()` 落地後，若沒有同時擴充 registry 補上至少一個 `build`
+  身分，現行 build 派工會從「無過濾（bypass）」變成「全部被 `capable()` 擋下」；若
+  `todo.md:129` 的三身分表確實反映某個已生效的 overlay，這個風險評估的前提本身需要重新
+  核實。這是後續實作票上線前 MUST 先確認的環境前提，不是本票要解決的範圍。
 
 ### R7 既有消費端契約點必須被沿用
 

@@ -20,9 +20,15 @@ work_item: design-model-capability-envelope
   terminal/retryable 二分類交易裡，尚未區分「擋」與「排隊」兩種結局，留給後續實作票處理。
 - topic×band 矩陣在 registry 僅 1 個 `build` capability 身分的現況下，只有 eligibility
   語意（該不該派），沒有 routing 語意（派給誰）——分母是 1。
-- **現況更正**：`model-identities.yaml` 全文只有一個身分，`capabilities: [planning]`；
-  issue #209 自身 2026-07-27 修正 comment 宣稱的三身分表（含 `claude-sonnet-4-6`／
-  `gemini-3.6-flash-high`）在全 repo grep 零命中，本文件以 `git show` 可查證的檔案內容為準。
+- **現況更正**：`model-identities.yaml`（packaged registry，唯一有 loader 的身分清單）
+  全文只有一個身分，`capabilities: [planning]`；issue #209 自身 2026-07-27 修正 comment
+  宣稱的三身分表（含 `claude-sonnet-4-6`／`gemini-3.6-flash-high`）與此不符。但這兩個
+  model_id 在全 repo grep **並非零命中**：`docs/superpowers/workstreams/
+  cost-governance-cluster/todo.md:129` 這份受版控的「關鍵事實」筆記重申幾乎逐字相同的
+  三身分表，`driving-cortex-skill/todo.md:12` 另有 1 處提及；`tests/test_model_identities.py`
+  1 處為 fixture 字面巧合，與 registry 宣告無關。本文件以 packaged registry（唯一有 loader、
+  被程式實際讀取）現況為準，但 todo.md:129 的矛盾尚未收斂，待與其 owner 對齊——詳見
+  `docs/superpowers/specs/design-model-capability-envelope-design.md` D6。
 - 既有 `planning.py:456-509` 的 `envelope_lookup` provider 介面（`Mapping` 含
   `invariant_count`／`artifact_classes` 兩鍵）必須被後續實作沿用，MUST NOT 另開一條查表
   路徑；`acceptance_mode`（本票新欄位）與既有 `acceptance_surfaces`（`#208`/`#221` 已落地，
