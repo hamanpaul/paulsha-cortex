@@ -309,6 +309,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok("artifact.txt\n"),
                 }
@@ -381,6 +382,13 @@ class ResultVerificationTests(unittest.TestCase):
                     (
                         "-C",
                         str(root),
+                        "cat-file",
+                        "-e",
+                        "a" * 40 + ":paulsha_cortex/persona/personas.yaml",
+                    ): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
                         "show",
                         "a" * 40 + ":paulsha_cortex/persona/personas.yaml",
                     ): _git_ok(base_catalog),
@@ -434,6 +442,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): [_git_ok(""), _git_ok("")],
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok("src/code.py\n"),
                 }
@@ -484,6 +493,7 @@ class ResultVerificationTests(unittest.TestCase):
                             ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
                             ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                             ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                            ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                             ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                             ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                         }
@@ -554,6 +564,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                     (
@@ -616,6 +627,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                     (
@@ -674,6 +686,7 @@ class ResultVerificationTests(unittest.TestCase):
                             ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
                             ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                             ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                            ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                             ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                             ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                             (
@@ -762,6 +775,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ],
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                     (
@@ -818,6 +832,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): [_git_ok(""), _git_ok("")],
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                     (
@@ -874,6 +889,7 @@ class ResultVerificationTests(unittest.TestCase):
                     ("-C", str(worktree), "status", "--porcelain", "--untracked-files=all"): [_git_ok(""), _git_ok("")],
                     ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
                     ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
                     ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
                     (
@@ -914,6 +930,262 @@ class ResultVerificationTests(unittest.TestCase):
 
             self.assertEqual(evidence["payload"]["status"], "needs_human")
             self.assertEqual(evidence["payload"]["summary"], "base-full-suite-timeout")
+
+
+class PersonaCatalogPortabilityTests(unittest.TestCase):
+    """#295／#291：非 cortex repo 的 dispatch_base tree 沒有
+    paulsha_cortex/persona/personas.yaml 時，persona gate 必須回退套件內建 catalog，
+    而不是確定性卡在 persona-catalog-unreadable。"""
+
+    def test_non_cortex_repo_without_local_catalog_passes_persona_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            contract = _contract(docs_class="code")
+            slice_row = _slice_row(root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): [_git_ok("b" * 40), _git_ok("b" * 40)],
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_fail(),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(root / ".psc-verification-worktrees" / "slice-a-aaaaaaaaaaaa"),
+                        "a" * 40,
+                    ): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(root / ".psc-verification-worktrees" / "slice-a-aaaaaaaaaaaa"),
+                    ): _git_ok(""),
+                }
+            )
+            proc_runner = FakeSubprocessRunner(
+                {
+                    ("python3", "-m", "pytest", "-q", "tests/policy.py"): _proc_ok(),
+                    ("python3", "-m", "pytest", "-q"): [_proc_ok(), _proc_ok()],
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=proc_runner,
+            )
+
+            self.assertNotEqual(evidence["payload"]["summary"], "persona-catalog-unreadable")
+            self.assertEqual(evidence["payload"]["status"], "reviewing")
+            persona_catalog = evidence["payload"]["details"]["persona_catalog"]
+            self.assertEqual(persona_catalog["source"], "packaged")
+            self.assertIsNone(persona_catalog["commit"])
+            self.assertNotIn(
+                ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"),
+                [tuple(call) for call in git_runner.calls],
+            )
+
+    def test_repo_local_catalog_overrides_packaged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            override_catalog = _persona_catalog(builder_paths=["docs/**"])
+            contract = _contract(docs_class="code")
+            slice_row = _slice_row(root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): [_git_ok("b" * 40), _git_ok("b" * 40)],
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
+                    ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(override_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(root / ".psc-verification-worktrees" / "slice-a-aaaaaaaaaaaa"),
+                        "a" * 40,
+                    ): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(root / ".psc-verification-worktrees" / "slice-a-aaaaaaaaaaaa"),
+                    ): _git_ok(""),
+                }
+            )
+            proc_runner = FakeSubprocessRunner(
+                {
+                    ("python3", "-m", "pytest", "-q", "tests/policy.py"): _proc_ok(),
+                    ("python3", "-m", "pytest", "-q"): [_proc_ok(), _proc_ok()],
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=proc_runner,
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "reviewing")
+            persona_catalog = evidence["payload"]["details"]["persona_catalog"]
+            self.assertEqual(persona_catalog["source"], "repo-local")
+            self.assertEqual(persona_catalog["commit"], "a" * 40)
+            self.assertEqual(persona_catalog["hash"], sha256(override_catalog.encode("utf-8")).hexdigest())
+
+    def test_declared_override_unreadable_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            contract = _contract(docs_class="code")
+            slice_row = _slice_row(root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): _git_ok("b" * 40),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
+                    ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_fail("blob missing"),
+                }
+            )
+            proc_runner = FakeSubprocessRunner({})
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=proc_runner,
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "needs_human")
+            self.assertEqual(evidence["payload"]["summary"], "persona-catalog-unreadable")
+            persona_catalog = evidence["payload"]["details"]["persona_catalog"]
+            self.assertEqual(persona_catalog["path"], "paulsha_cortex/persona/personas.yaml")
+            self.assertEqual(persona_catalog["commit"], "a" * 40)
+
+    def test_declared_override_invalid_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            contract = _contract(docs_class="code")
+            slice_row = _slice_row(root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): _git_ok("b" * 40),
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
+                    ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok("roles: [broken"),
+                }
+            )
+            proc_runner = FakeSubprocessRunner({})
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=proc_runner,
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "needs_human")
+            self.assertEqual(evidence["payload"]["summary"], "persona-catalog-invalid")
+            persona_catalog = evidence["payload"]["details"]["persona_catalog"]
+            self.assertEqual(persona_catalog["path"], "paulsha_cortex/persona/personas.yaml")
+            self.assertEqual(persona_catalog["commit"], "a" * 40)
+
+    def test_cortex_repo_behavior_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            base_catalog = _persona_catalog(builder_paths=["**"])
+            contract = _contract(docs_class="code")
+            slice_row = _slice_row(root, "slice-a", contract, dispatch_base="a" * 40, worktree=worktree)
+            job = _job("slice-a", worktree)
+            git_runner = FakeGitRunner(
+                {
+                    ("-C", str(root), "rev-parse", job["branch"]): [_git_ok("b" * 40), _git_ok("b" * 40)],
+                    ("-C", str(worktree), "rev-parse", "HEAD"): _git_ok("b" * 40),
+                    ("-C", str(root), "merge-base", "--is-ancestor", "a" * 40, "b" * 40): _git_ok(""),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + ".." + "b" * 40): _git_ok(""),
+                    ("-C", str(root), "cat-file", "-e", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(""),
+                    ("-C", str(root), "show", "a" * 40 + ":paulsha_cortex/persona/personas.yaml"): _git_ok(base_catalog),
+                    ("-C", str(root), "-c", "core.quotepath=false", "diff", "--name-only", "a" * 40 + "..." + "b" * 40): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(root / ".psc-verification-worktrees" / "slice-a-aaaaaaaaaaaa"),
+                        "a" * 40,
+                    ): _git_ok(""),
+                    (
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(root / ".psc-verification-worktrees" / "slice-a-aaaaaaaaaaaa"),
+                    ): _git_ok(""),
+                }
+            )
+            proc_runner = FakeSubprocessRunner(
+                {
+                    ("python3", "-m", "pytest", "-q", "tests/policy.py"): _proc_ok(),
+                    ("python3", "-m", "pytest", "-q"): [_proc_ok(), _proc_ok()],
+                }
+            )
+
+            evidence = verification.run_result_verification(
+                slice_row=slice_row,
+                job=job,
+                repo_root=root,
+                coordinator_root=root / "coordinator",
+                git_runner=git_runner,
+                subprocess_runner=proc_runner,
+            )
+
+            self.assertEqual(evidence["payload"]["status"], "reviewing")
+            persona_catalog = evidence["payload"]["details"]["persona_catalog"]
+            self.assertEqual(persona_catalog["path"], "paulsha_cortex/persona/personas.yaml")
+            self.assertEqual(persona_catalog["commit"], "a" * 40)
+            self.assertEqual(persona_catalog["hash"], sha256(base_catalog.encode("utf-8")).hexdigest())
+            self.assertEqual(persona_catalog["source"], "repo-local")
 
 
 if __name__ == "__main__":
