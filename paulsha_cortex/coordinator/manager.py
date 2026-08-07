@@ -819,7 +819,13 @@ def _slice_review_authority_inputs(
         digest = payload.get("hash")
         if not isinstance(raw_path, str) or not isinstance(digest, str):
             raise ValueError(f"slice review {key} payload invalid")
-        path = Path(raw_path).resolve()
+        path = Path(raw_path)
+        # 對齊 _pinned_input_mismatches：legacy/回復情境可能留下相對 path（例如
+        # 舊版 pin_dispatch_inputs 寫入的 plan path），一律以 repo_root 為 base
+        # resolve，避免這裡誤用當前 cwd 解析而讀錯檔或拋例外。
+        if not path.is_absolute():
+            path = repo_root / path
+        path = path.resolve()
         relative = path.relative_to(repo_root.resolve()).as_posix()
         data = path.read_bytes()
         actual = verification.sha256_bytes(data)

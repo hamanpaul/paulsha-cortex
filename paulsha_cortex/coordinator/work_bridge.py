@@ -622,13 +622,13 @@ def _builder_binding(
 
 
 def _manager_archive_applied(run) -> bool:
-    return any(
-        step.phase == "ship"
-        and step.card == "openspec-archive"
-        and step.gate_result == "passed"
-        and (step.executor, step.model, step.domain) == ("cortex-manager", "deterministic", "cortex")
-        for step in run.steps
-    )
+    # 對齊 manager._manager_archive_applied 的語意：必須「恰好一筆」passed 的
+    # openspec-archive step 才算已完成；crash/retry 造成的多筆 passed step 視為
+    # 尚未完成（fail-closed），不得靠第二套判定漂移出不同結論。單一真實實作放在
+    # manager，這裡改為委派而非重寫一份，避免兩處各自演化。
+    from . import manager
+
+    return manager._manager_archive_applied(run)
 
 
 def _push_exact_candidate(

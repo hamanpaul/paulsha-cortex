@@ -273,6 +273,9 @@ def prepare_review_worktree(
         for row in input_snapshot:
             envelope = workflow_manager._read_workflow_input_content(row)
             ref = str(envelope["path"])
+            ref_path = Path(ref)
+            if ref_path.is_absolute() or ".." in ref_path.parts:
+                raise ValueError("review worktree authority seed ref path invalid")
             target = worktree / ref
             parent = worktree
             for part in Path(ref).parent.parts:

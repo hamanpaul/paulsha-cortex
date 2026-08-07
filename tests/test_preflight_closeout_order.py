@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -508,6 +509,53 @@ def _review_authority_fixture(tmp_path: Path) -> tuple[Path, str, object, dict[s
     return repo, candidate, run, authority, input_snapshot
 
 
+def test_slice_review_authority_inputs_resolves_relative_plan_path_against_repo_root(
+    tmp_path: Path,
+) -> None:
+    """``_pinned_input_mismatches`` explicitly supports a legacy/recovered slice
+    row whose ``plan.path`` is repo-relative, by resolving it against the
+    inferred ``repo_root``. ``_slice_review_authority_inputs`` operates on the
+    same slice rows to materialize foreign-review authority and must resolve
+    relative ``spec``/``plan`` paths the same way -- resolving against the
+    process cwd instead would read the wrong file (or raise) whenever pytest
+    (or the coordinator daemon) is not started from inside the target repo.
+    """
+    repo, candidate = _repo(
+        tmp_path / "authority-relative-repo", active_change=False, archived_change=False
+    )
+    plan_ref = "docs/superpowers/plans/relative-plan.md"
+    plan = repo / plan_ref
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan_bytes = b"# Relative plan\n\nFrozen.\n"
+    plan.write_bytes(plan_bytes)
+    spec_ref = "specs/relative-spec.md"
+    spec = repo / spec_ref
+    spec.parent.mkdir(parents=True, exist_ok=True)
+    spec_bytes = b"# Relative spec\n"
+    spec.write_bytes(spec_bytes)
+    subprocess.run(["git", "-C", str(repo), "add", plan_ref, spec_ref], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add relative inputs"], check=True)
+
+    slice_row = {
+        "slice_id": "slice-relative",
+        "spec": {"path": spec_ref, "hash": hashlib.sha256(spec_bytes).hexdigest()},
+        "plan": {"path": plan_ref, "hash": hashlib.sha256(plan_bytes).hexdigest()},
+    }
+
+    authority, rows = manager._slice_review_authority_inputs(
+        slice_row=slice_row,
+        repo_root=repo,
+        coordinator_root=tmp_path / "coordinator-relative",
+        candidate=candidate,
+    )
+
+    assert authority == {
+        plan_ref: hashlib.sha256(plan_bytes).hexdigest(),
+        spec_ref: hashlib.sha256(spec_bytes).hexdigest(),
+    }
+    assert {row["path"] for row in rows} == {plan_ref, spec_ref}
+
+
 def test_ship_validate_completes_local_archive_closeout_without_pr_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -747,6 +795,144 @@ def test_review_worktree_materializes_frozen_authority_with_attestation(
     )
     assert isinstance(missing.exception, ValueError)
     assert "authority" in str(missing.exception)
+
+
+def _malicious_authority_row(
+    *,
+    coordinator_root: Path,
+    malicious_path: str,
+    content: str = "malicious content\n",
+    run_id: str = "review-work",
+    work_id: str = "review-work",
+    repo: str = "acme/demo",
+    source_revision: str = "3" * 64,
+) -> tuple[dict[str, str], str]:
+    """Craft a workflow-input content blob whose *envelope* path is malicious.
+
+    Both real writers of these blobs (``_slice_review_authority_inputs`` and
+    ``_workflow_input_snapshot``) derive ``ref`` via ``Path.relative_to(root)``,
+    so a ``..``/absolute ``path`` can never occur through them. This directly
+    exercises ``manager._write_workflow_input_content`` instead, standing in
+    for a corrupted/forged content-ref blob, so that
+    ``prepare_review_worktree`` remains the last line of defense regardless
+    of how the input snapshot was produced.
+    """
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    identity = SimpleNamespace(
+        run_id=run_id,
+        work_id=work_id,
+        repo=repo,
+        source_revision=source_revision,
+    )
+    content_ref = manager._write_workflow_input_content(
+        coordinator_root=coordinator_root,
+        run=identity,
+        ref=malicious_path,
+        digest=digest,
+        content=content,
+    )
+    row = {
+        "pattern": malicious_path,
+        "path": malicious_path,
+        "sha256": digest,
+        "authority": "planning-authority",
+        "content_ref": content_ref,
+    }
+    return row, digest
+
+
+def _tree_snapshot(base: Path) -> set[str]:
+    entries: set[str] = set()
+    if not base.exists():
+        return entries
+    for dirpath, dirnames, filenames in os.walk(base):
+        for name in dirnames:
+            entries.add(str(Path(dirpath) / name))
+        for name in filenames:
+            entries.add(str(Path(dirpath) / name))
+    return entries
+
+
+@pytest.mark.parametrize(
+    "malicious_path",
+    [
+        "../escape-dir/evil.txt",
+        "../../../escape-dir/evil.txt",
+        "safe/../../escape-dir/evil.txt",
+    ],
+)
+def test_review_worktree_materialize_rejects_dotdot_ref_before_mkdir(
+    tmp_path: Path, malicious_path: str
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "review-repo-dotdot", active_change=False, archived_change=False
+    )
+    coordinator_root = tmp_path / "coordinator-dotdot"
+    row, digest = _malicious_authority_row(
+        coordinator_root=coordinator_root, malicious_path=malicious_path
+    )
+    authority = {malicious_path: digest}
+
+    before = _tree_snapshot(tmp_path)
+
+    outcome = _capture(
+        review.prepare_review_worktree,
+        repo_root=repo,
+        slice_id="slice-evil",
+        reviewer_job_id="evil-1",
+        candidate=candidate,
+        authority=authority,
+        input_snapshot=(row,),
+        source_revision=candidate,
+        subprocess_runner=None,
+        git_runner=None,
+    )
+
+    assert isinstance(outcome.exception, ValueError)
+    assert "ref path invalid" in str(outcome.exception)
+
+    after = _tree_snapshot(tmp_path)
+    # The only permissible new filesystem entries are git's own worktree
+    # bookkeeping (repo/.git/worktrees/...) and the sandboxed review worktree
+    # directory itself, created *before* authority materialization begins.
+    # Nothing named after the escape target may appear anywhere.
+    for entry in after - before:
+        assert "escape-dir" not in entry
+        assert "evil.txt" not in entry
+
+
+@pytest.mark.parametrize("escape_name", ["outside-repo-abs", "outside-repo-abs-2"])
+def test_review_worktree_materialize_rejects_absolute_ref_before_mkdir(
+    tmp_path: Path, escape_name: str
+) -> None:
+    repo, candidate = _repo(
+        tmp_path / "review-repo-abs", active_change=False, archived_change=False
+    )
+    coordinator_root = tmp_path / "coordinator-abs"
+    escape_target = tmp_path / escape_name / "evil.txt"
+    malicious_path = str(escape_target)
+    row, digest = _malicious_authority_row(
+        coordinator_root=coordinator_root, malicious_path=malicious_path
+    )
+    authority = {malicious_path: digest}
+
+    outcome = _capture(
+        review.prepare_review_worktree,
+        repo_root=repo,
+        slice_id="slice-evil-abs",
+        reviewer_job_id="evil-2",
+        candidate=candidate,
+        authority=authority,
+        input_snapshot=(row,),
+        source_revision=candidate,
+        subprocess_runner=None,
+        git_runner=None,
+    )
+
+    assert isinstance(outcome.exception, ValueError)
+    assert "ref path invalid" in str(outcome.exception)
+    assert not escape_target.exists()
+    assert not escape_target.parent.exists()
 
 
 def test_unexpected_exception_still_fails_closed(

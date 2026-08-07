@@ -13,6 +13,7 @@ import pytest
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     completion,
+    manager,
     manager_daemon,
     review,
     terminal_contract,
@@ -796,6 +797,67 @@ def test_archive_commit_invalidates_old_gates_without_pushing(
     )
     assert payload["marker"] == "current"
     assert selected["subject_head"] == reset.candidate_head
+
+
+@pytest.mark.parametrize(
+    "archive_step_count, expected",
+    [
+        (0, False),
+        (1, True),
+        # crash/retry 可能在 run.steps 留下不只一筆 passed 的 openspec-archive
+        # step；manager 版語意要求「恰好一筆」才算已完成，work_bridge 不得靠
+        # 第二套（any-based）判定漂移出不同答案，見 code review finding。
+        (2, False),
+        (3, False),
+    ],
+)
+def test_manager_archive_applied_semantics_match_between_manager_and_work_bridge(
+    archive_step_count: int, expected: bool
+) -> None:
+    passed_archive_step = WorkflowStep(
+        phase="ship",
+        persona="manager",
+        card="openspec-archive",
+        executor="cortex-manager",
+        model="deterministic",
+        domain="cortex",
+        inputs=(),
+        outputs=(),
+        gate_result="passed",
+    )
+    run = SimpleNamespace(steps=tuple(passed_archive_step for _ in range(archive_step_count)))
+
+    assert manager._manager_archive_applied(run) is expected
+    assert work_bridge._manager_archive_applied(run) is expected
+
+
+def test_manager_archive_applied_ignores_steps_with_mismatched_identity_or_result() -> None:
+    wrong_identity = WorkflowStep(
+        phase="ship",
+        persona="manager",
+        card="openspec-archive",
+        executor="human",
+        model=None,
+        domain=None,
+        inputs=(),
+        outputs=(),
+        gate_result="passed",
+    )
+    wrong_gate = WorkflowStep(
+        phase="ship",
+        persona="manager",
+        card="openspec-archive",
+        executor="cortex-manager",
+        model="deterministic",
+        domain="cortex",
+        inputs=(),
+        outputs=(),
+        gate_result="pending",
+    )
+    run = SimpleNamespace(steps=(wrong_identity, wrong_gate))
+
+    assert manager._manager_archive_applied(run) is False
+    assert work_bridge._manager_archive_applied(run) is False
 
 
 def test_installed_defaults_start_to_ship_handoff_remains_monitor_ongoing(
