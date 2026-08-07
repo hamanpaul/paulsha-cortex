@@ -2081,6 +2081,91 @@ class RunTickTests(unittest.TestCase):
             self.assertEqual(summary["dispatched"], [])
             self.assertFalse(summary["dispatch_skipped"])
 
+    def test_needs_human_slice_not_redispatched_on_next_tick(self) -> None:
+        # issue #339：slice 第一趟 tick 跑完落 needs_human 後，job 已離開 in-flight
+        # 集合（active 只看 dispatched/running）；ready_units 只查自己的 depends_on
+        # 有沒有滿足，不查自己是否已經跑過——沒有這層 handoff 過濾，下一趟 tick 會
+        # 對同一 slice 重新 fanout，撞 ScriptWorktreeCreator 的
+        # "worktree target already exists"。
+        #
+        # 用 _dispatch_meta（帶 _pinned_inputs）+ 可回應 git 呼叫的 git_runner，讓
+        # dispatch_ready 能真的走到 launcher.launch 這步（而非卡在 pin_dispatch_inputs
+        # 的檔案讀取），才能讓這個測試在拿掉 already_terminal 過濾後真的轉紅
+        # （非空性自證見 summary）。
+        def _git_runner(args):
+            if args and args[0] == "rev-parse":
+                return "f" * 40
+            if len(args) >= 5 and args[0] == "-C" and args[2] == "fetch":
+                return ""
+            if len(args) >= 4 and args[0] == "-C" and args[2] == "rev-parse":
+                return "e" * 40
+            if len(args) >= 6 and args[0] == "-C" and args[2] == "merge-base":
+                return ""
+            return ""
+
+        class _RecordingLauncher:
+            def __init__(self) -> None:
+                self.launched: list[str] = []
+
+            def launch(self, *, slice_id, prompt, worktree, log_dir):  # pragma: no cover
+                self.launched.append(slice_id)
+                raise AssertionError(f"已有 handoff 終局紀錄的 slice 不應被重派: {slice_id}")
+
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_job(reg, "s")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            disp._git_runner = _git_runner
+            hdir = Path(d) / "handoff"
+
+            # 第一趟 tick：complete_tick 把 handoff 寫進 hdir/s.json（gate_status 落
+            # needs_human，因為沒有對應 slice 的 pinned verification contract）。
+            first = manager.run_tick(disp, metas=[], handoff_dir=str(hdir), clock=lambda: "T0")
+            self.assertEqual(first["completed"], [{"slice_id": "s", "gate_status": "needs_human"}])
+            self.assertTrue((hdir / "s.json").exists())
+
+            # 第二趟 tick：即使 metas 裡帶著 "s"（且 is_satisfied 一律 True，逼出真正
+            # 要測的路徑），已有 handoff 終局紀錄的 slice 不得再進 dispatch_ready 候選集。
+            launcher = _RecordingLauncher()
+            metas = [_dispatch_meta("s")]
+            second = manager.run_tick(
+                disp, metas=metas, launcher=launcher, is_satisfied=lambda x: True,
+                handoff_dir=str(hdir), clock=lambda: "T1",
+            )
+
+            self.assertEqual(launcher.launched, [])
+            self.assertEqual(second["dispatched"], [])
+            self.assertFalse(any(e.get("stage") == "fanout" for e in second["errors"]))
+            self.assertEqual(
+                second["needs_human"],
+                [{"slice_id": "s", "gate_reason": "missing-slice-proof", "handoff_path": str(hdir / "s.json")}],
+            )
+
+    def test_idle_skip_still_reports_needs_human(self) -> None:
+        # idle gate 只擋「新工作（fanout）」，不得連帶把 needs_human 回報短路成空清單——
+        # 高負載（not-idle）時操作者更需要看到卡住待人工的清單。
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            job = _make_job(reg, "s")
+            disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
+            hdir = Path(d) / "handoff"
+
+            first = manager.run_tick(disp, metas=[], handoff_dir=str(hdir), clock=lambda: "T0")
+            self.assertEqual(first["completed"], [{"slice_id": "s", "gate_status": "needs_human"}])
+
+            metas = [{"slice_id": "s", "dispatch": "auto", "plan": "p.md", "depends_on": []}]
+            second = manager.run_tick(
+                disp, metas=metas, require_idle=True, max_load=1.0,
+                idle_probe=lambda: (99.0, 99.0, 99.0), handoff_dir=str(hdir), clock=lambda: "T1",
+            )
+
+            self.assertEqual(second["dispatch_skipped"], "not-idle")
+            self.assertEqual(second["dispatched"], [])
+            self.assertEqual(
+                second["needs_human"],
+                [{"slice_id": "s", "gate_reason": "missing-slice-proof", "handoff_path": str(hdir / "s.json")}],
+            )
+
     def test_reaper_result_recorded_in_summary(self) -> None:
         # 收尾 janitor（#161）：傳入 reaper → complete 後呼叫一次，結果進 summary["reaped"]
         calls = []

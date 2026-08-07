@@ -18,6 +18,7 @@ WORK_ACTIONS = frozenset(
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
+        "intake",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -101,6 +102,21 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             typed = kind in WORK_SOURCE_KINDS and isinstance(ref, str) and bool(ref.strip())
             if legacy == typed:
                 raise ValueError("work-action link requires exactly one of --issue or --kind/--ref")
+        if action == "intake":
+            # issue #203：intake 合成「（必要時）link + start」——issue/kind+ref
+            # 在 intake 是可省略的（work_id 已有 confirmed authority 時不需再帶），
+            # 但一旦帶了任何一個欄位，就必須符合與 link 相同的恰好擇一語法，
+            # 否則同樣 fail-closed（複用上面 link/unlink 的 legacy^typed 判準）。
+            issue = args.get("issue")
+            kind = args.get("kind")
+            ref = args.get("ref")
+            provided = issue is not None or kind is not None or ref is not None
+            legacy = isinstance(issue, int) and not isinstance(issue, bool) and issue > 0
+            typed = kind in WORK_SOURCE_KINDS and isinstance(ref, str) and bool(ref.strip())
+            if provided and legacy == typed:
+                raise ValueError(
+                    "work-action intake 若帶 issue/kind+ref，必須恰好擇一（或兩者皆不帶）"
+                )
         if action in {
             "retry-build", "retry-verify", "retry-review", "recover-repair-commit",
         } and (
@@ -108,19 +124,20 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{40}", args["expected_candidate"]) is None
         ):
             raise ValueError(f"work-action {action} requires exact expected_candidate")
-        if action == "start" and "combo" in args:
+        if action in {"start", "intake"} and "combo" in args:
             combo = args.get("combo")
             if (
                 not isinstance(combo, str)
                 or re.fullmatch(r"[a-z0-9][a-z0-9-]*", combo) is None
             ):
-                raise ValueError("work-action start combo invalid")
-        if action != "start" and "combo" in args:
-            # combo override 只在 start 有意義（見 --combo 說明）；其餘 action
-            # 夾帶 combo 一律 fail-closed 拒絕，contract 是所有入口的收斂點，
-            # 防止未經驗證的 combo 被 resume 等動作間接餵進
-            # start_canonical_workflow（見 code review finding：coordinator/
-            # cli.py、porcelain/run.py、coordinator/manager.py 三處縱深防禦）。
+                raise ValueError(f"work-action {action} combo invalid")
+        if action not in {"start", "intake"} and "combo" in args:
+            # combo override 只在 start／intake 有意義（intake 內部等價於
+            # start，見 --combo 說明）；其餘 action 夾帶 combo 一律 fail-closed
+            # 拒絕，contract 是所有入口的收斂點，防止未經驗證的 combo 被
+            # resume 等動作間接餵進 start_canonical_workflow（見 code review
+            # finding：coordinator/cli.py、porcelain/run.py、
+            # coordinator/manager.py 三處縱深防禦）。
             raise ValueError(f"work-action {action} must not include combo")
         if action == "recover-planning":
             expected_run_id = args.get("expected_run_id")

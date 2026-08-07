@@ -1973,9 +1973,14 @@ def run_tick(
     """跑完整 manager tick：fanout（dispatch_ready）→ complete_tick →（可選）收尾 janitor。
 
     require_idle 時以 1-min load average gate（reuse memory.dream.idle，可注入 probe）——
-    僅擋 fanout（新工作），complete_tick 一律跑。已有 dispatched/running job 的 slice
-    本趟不重派（冪等）。fanout 例外（DispatchReadyError/RequiresLauncher/ValueError 環）
-    收進 errors，不阻 complete。
+    僅擋 fanout（新工作），complete_tick 一律跑。已有 dispatched/running job **或已有
+    handoff 終局紀錄**的 slice 本趟不重派（冪等，issue #339）：`ready_units`/
+    `default_is_satisfied` 只檢查「別人 depends_on 我」是否滿足，從未檢查「我自己是否
+    已經跑過」——slice 一旦 exited 離開 IN_FLIGHT_STATUSES，若沒有這層過濾，下一趟
+    tick 會把它判定為就緒、對同一 branch/worktree 重新 fanout，撞
+    `ScriptWorktreeCreator.create` 的 "worktree target already exists"。
+    fanout 例外（DispatchReadyError/RequiresLauncher/ValueError 環）收進 errors，不阻
+    complete。
 
     reaper 為收尾 janitor（issue #161）：傳入時於 complete 後呼叫一次以回收孤兒 codex
     broker（多 worktree 派工殘留），其回傳放 summary["reaped"]；任何例外收進 errors（stage=reap），
@@ -1992,11 +1997,37 @@ def run_tick(
       `functools.partial(skill_janitor.run_janitor_tick, cards=cards, ledger_path=..., proposals_dir=...)`。
     兩者任一丟例外都收進 errors（stage 分別為 skill_ledger／skill_janitor），不影響
     dispatch/complete/reap 任何一段的結果。
-    回 {dispatch_skipped, dispatched, completed, errors, reaped, skill_usage_events, skill_janitor}。
+    回 {dispatch_skipped, dispatched, completed, errors, reaped, needs_human, skill_usage_events, skill_janitor}。
     """
     satisfied = is_satisfied if is_satisfied is not None else _satisfied_pred(handoff_dir)
     dispatched: list = []
     errors: list = []
+    # 已有 handoff 終局紀錄（needs_human/failed/passed/verified 皆算）的 slice：
+    # 不論 dispatch_skipped 與否都要掃描——這段刻意放在 idle 判斷之前、兩分支共用，
+    # 因為「idle gate 擋不擋新工作」跟「有沒有 job 卡在 needs_human 待人工」是兩件事，
+    # 高負載（not-idle）時操作者更需要看到 needs_human 清單，不能被 idle-skip 短路成空清單。
+    already_terminal: dict[str, dict] = {}
+    needs_human: list = []
+    for meta in metas:
+        slice_id = meta.get("slice_id") if isinstance(meta, dict) else None
+        if not isinstance(slice_id, str) or not slice_id:
+            continue
+        manifest_path = Path(handoff_dir) / f"{slice_id}.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        already_terminal[slice_id] = payload
+        if payload.get("gate_status") == "needs_human":
+            needs_human.append(
+                {
+                    "slice_id": slice_id,
+                    "gate_reason": payload.get("gate_reason"),
+                    "handoff_path": str(manifest_path),
+                }
+            )
     # idle gate 只擋「派工側（新工作，會啟 agent，昂貴）」；完成側（poll→manifest，便宜的
     # 回收/記帳）一律跑，否則高負載時 job 完成/失敗狀態與下游釋放會被埋住（review F-C）。
     if require_idle and not idle.is_idle(max_load=max_load, probe=idle_probe):
@@ -2011,7 +2042,11 @@ def run_tick(
             if registry is not None
             else set()
         )
-        fanout_metas = [m for m in metas if m.get("slice_id") not in active]
+        fanout_metas = [
+            m
+            for m in metas
+            if m.get("slice_id") not in active and m.get("slice_id") not in already_terminal
+        ]
         try:
             dispatched = autonomy.dispatch_ready(
                 fanout_metas,
@@ -2084,6 +2119,7 @@ def run_tick(
         "completed": complete["completed"],
         "errors": errors + complete["errors"] + ledger_errors + janitor_errors + reap_errors,
         "reaped": reaped,
+        "needs_human": needs_human,
         "skill_usage_events": skill_usage_events,
         "skill_janitor": skill_janitor_result,
     }
@@ -7738,12 +7774,15 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
     # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
     work_action_model_chain_override = extract_model_chain_override(args)
-    # combo 只在 start action 有效——resume 等動作即使夾帶 combo（不論來自
-    # 上游疏漏或 --payload 繞過）也不得轉交 start_canonical_workflow，避免
-    # 已在 define phase 之外 resume 時被未預期的 combo override 影響
-    # （contract.validate_request 已 fail-closed 擋掉此請求，這裡是 manager
-    # 層的縱深防禦，行為不依賴上游有沒有先擋下）。
-    work_action_combo_override = args.get("combo") if args.get("action") == "start" else None
+    # combo 只在 start／intake action 有效（issue #203：intake 內部等價於
+    # start）——resume 等動作即使夾帶 combo（不論來自上游疏漏或 --payload
+    # 繞過）也不得轉交 start_canonical_workflow，避免已在 define phase 之外
+    # resume 時被未預期的 combo override 影響（contract.validate_request 已
+    # fail-closed 擋掉此請求，這裡是 manager 層的縱深防禦，行為不依賴上游
+    # 有沒有先擋下）。
+    work_action_combo_override = (
+        args.get("combo") if args.get("action") in {"start", "intake"} else None
+    )
 
     def starter(authority, claim_key, reason):
         return start_canonical_workflow(

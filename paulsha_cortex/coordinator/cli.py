@@ -10,6 +10,7 @@ from . import autonomy, broker_reaper
 from .launcher import _ARGV_BUILDERS, AgentLauncher, SubprocessLauncher
 from .registry import JobRegistry
 from .seams import PaneSender, ScriptWorktreeCreator, TmuxPaneSender, WorktreeCreator
+from .usage_aggregate import aggregate_usage_by_run
 from .workflow import WorkflowRun
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 5.0
@@ -110,7 +111,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "查單一 Job 執行紀錄；--retry-classifications 依 retry 分類彙總 workflow runs；"
             "--decomposition-depths 依拆分深度彙總；"
-            "--combo-selections 依 combo provenance 彙總"
+            "--combo-selections 依 combo provenance 彙總；"
+            "--usage-by-run 依 workflow_run_id 彙總 token usage"
         ),
     )
     p_stat.add_argument("job_id", nargs="?", default=None)
@@ -128,6 +130,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--combo-selections",
         action="store_true",
         help="依 combo_selection 的 source × task_type 彙總 workflow runs（#202）",
+    )
+    p_stat.add_argument(
+        "--usage-by-run",
+        default=None,
+        metavar="WORKFLOW_RUN_ID",
+        help="依 workflow_run_id 彙總該 run 底下所有 job 的 token usage（#325）",
     )
 
     p_ready = sub.add_parser("ready", help="列出 dispatch:auto、plan 與 dependency 均就緒的 specs")
@@ -187,6 +195,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
             "retry-review", "recover-planning", "recover-pre-candidate",
             "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
+            "intake",
         ],
     )
     p_work.add_argument("work_id")
@@ -201,7 +210,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--reason", help="abandon 的單行審計理由（最多 500 字）")
     p_work.add_argument(
         "--combo",
-        help="start 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
+        help="start／intake 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
     )
     toggle = p_work.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_true")
@@ -375,7 +384,7 @@ def main(
             request_args["expected_run_id"] = args.expected_run_id
         if args.reason is not None:
             request_args["reason"] = args.reason
-        if args.combo is not None and args.action == "start":
+        if args.combo is not None and args.action in {"start", "intake"}:
             request_args["combo"] = args.combo
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)
@@ -483,9 +492,14 @@ def main(
                 counts[source][task_type] = counts[source].get(task_type, 0) + 1
             print(json.dumps({"combo_selections": counts}, ensure_ascii=False))
             return 0
+        if args.usage_by_run is not None:
+            summary = aggregate_usage_by_run(reg.list_jobs(), args.usage_by_run)
+            print(json.dumps({"usage_by_run": summary}, ensure_ascii=False))
+            return 0
         if args.job_id is None:
             print(
-                "錯誤: stat 需要 job_id（或 --retry-classifications／--decomposition-depths／--combo-selections）",
+                "錯誤: stat 需要 job_id（或 --retry-classifications／--decomposition-depths／"
+                "--combo-selections／--usage-by-run）",
                 file=sys.stderr,
             )
             return 1
