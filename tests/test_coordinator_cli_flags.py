@@ -259,6 +259,35 @@ class WorkActionFlagTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn("combo", submitted[0][1])
 
+    def test_work_intake_forwards_combo(self) -> None:
+        """issue #203：intake 內部等價於 start，--combo 一樣要轉送（見
+        test_work_start_forwards_combo 的對稱案例）。
+        """
+
+        submitted = []
+
+        def submit(req_type, args, requested_by):
+            submitted.append((req_type, args, requested_by))
+            return "request-1"
+
+        rc = cli.main(
+            [
+                "work", "intake", "demo", "--repo", "acme/demo",
+                "--combo", "fix-standard",
+            ],
+            control_read_status=lambda: {"degraded": False},
+            control_submit_request=submit,
+            control_poll_done=lambda *_args, **_kwargs: {
+                "status": "ok",
+                "result": {"action": "intake"},
+            },
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(submitted[0][0], "work-action")
+        self.assertEqual(submitted[0][1]["action"], "intake")
+        self.assertEqual(submitted[0][1]["combo"], "fix-standard")
+
     def test_work_link_parses_typed_kind_and_ref(self) -> None:
         args = _build_parser().parse_args(
             [

@@ -3064,3 +3064,178 @@ def test_archive_blocks_nonzero_policy_check_with_doc_reference_invalid(
             now=lambda: 200,
             runner=runner,
         )
+
+
+
+# issue #203：`intake` 合成「（必要時）link + start」，取代已停用的低階 dispatch，
+# 作為單一「拿到一個 issue/task 就進件」入口。三個場景對齊簡報 tests 欄：
+# (a) work_id 已有 confirmed authority，省略 issue 仍能建 run（等價 start）；
+# (b) 首次 intake 帶尚未被 mapped_todo_paths 涵蓋的 kind/ref，先寫一筆 override
+#     link 再依既有已授權的 issue 建 run，第二次相同輸入為幂等；
+# (c) 未 link 且未帶 issue/kind/ref 時 fail-closed，不建立任何 WorkflowRun。
+
+
+def test_intake_without_link_args_starts_using_existing_confirmed_authority(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    expected_claim_key = work_actions._expected_claim_key(authority)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+
+    intake = work_actions.execute_work_action(
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=work_actions._fallback_workflow_starter(
+            registry, tmp_path / "runs.json"
+        ),
+    )
+
+    assert intake["result"]["linked"] is False
+    assert intake["result"]["link_result"] is None
+    assert intake["result"]["action"] == "claim"
+    assert intake["result"]["run"]["claim_key"] == expected_claim_key
+    assert len(registry.list_workflow_runs()) == 1
+
+    # 第二次以相同輸入重送必須幂等：同一個 run_id，不新增第二個 active run。
+    second = work_actions.execute_work_action(
+        args={"action": "intake", "repo": "acme/demo", "work_id": "demo"},
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=work_actions._fallback_workflow_starter(
+            registry, tmp_path / "runs.json"
+        ),
+    )
+    assert second["result"]["run"]["run_id"] == intake["result"]["run"]["run_id"]
+    assert len(registry.list_workflow_runs()) == 1
+
+
+def test_intake_writes_missing_link_then_claims_using_preexisting_issue_authority(
+    tmp_path: Path,
+) -> None:
+    """首次 intake 帶一個尚未反映在受監控快照 mapped_todo_paths 的 Todo path
+    ref：intake 必須先把它寫進 override（供下一輪 monitor correlation 採信），
+    再依快照裡已經確認過的 issue（monitor 早於本次 override 就已授權）建立
+    run——見 `work_actions._intake_action` docstring：override 檔與受監控快照
+    是兩份分開維護的狀態，寫 override 這一步本身不會讓當下這次呼叫的快照
+    立刻反映新 mapped_todo_paths，intake 因此仰賴『同一列已有其他明文授權來
+    源（這裡是 mapped_issues）』才能在同一次呼叫內完成 claim，這是刻意的簡化
+    決策（見函式 docstring）。
+    """
+    repo_root = _init_repo(tmp_path / "repo")
+    snapshot = _snapshot(tmp_path / "snapshot.json", todo_paths=())
+    override_path = repo_root / ".cortex" / "work-items.yaml"
+    assert not override_path.exists()
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    starter = work_actions._fallback_workflow_starter(registry, tmp_path / "runs.json")
+
+    first = work_actions.execute_work_action(
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "kind": "path",
+            "ref": "docs/todo.md",
+            "repo_root": str(repo_root),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=starter,
+    )
+
+    assert first["result"]["linked"] is True
+    assert first["result"]["link_result"]["source"] == {
+        "kind": "path",
+        "ref": "docs/todo.md",
+    }
+    assert override_path.exists()
+    override_payload = work_actions.safe_load(override_path.read_text(encoding="utf-8"))
+    assert {"kind": "path", "ref": "docs/todo.md"} in (
+        override_payload["work_items"]["demo"]["links"]
+    )
+    assert first["result"]["action"] == "claim"
+    first_run_id = first["result"]["run"]["run_id"]
+    assert len(registry.list_workflow_runs()) == 1
+
+    second = work_actions.execute_work_action(
+        args={
+            "action": "intake",
+            "repo": "acme/demo",
+            "work_id": "demo",
+            "kind": "path",
+            "ref": "docs/todo.md",
+            "repo_root": str(repo_root),
+        },
+        requested_by="operator",
+        snapshot_path=snapshot,
+        state_path=tmp_path / "runs.json",
+        now=lambda: 200,
+        workflow_registry=registry,
+        workflow_starter=starter,
+    )
+    assert second["result"]["run"]["run_id"] == first_run_id
+    assert len(registry.list_workflow_runs()) == 1
+
+
+def test_intake_without_any_authority_or_link_args_fails_closed_without_creating_a_run(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema": "work-items-snapshot/v1",
+                "providers": {
+                    "github": {
+                        "provider_id": "github",
+                        "revision": "gh-1",
+                        "last_success_epoch": 100,
+                        "degraded": False,
+                    }
+                },
+                "work_items": [
+                    {
+                        "repo": "acme/demo",
+                        "work_id": "demo",
+                        "mapped_issues": [],
+                        "mapped_prs": [],
+                        "mapped_openspec": [],
+                        "mapped_todo_paths": [],
+                        "confirmed_todo": False,
+                        "auto_label": False,
+                        "source_revisions": ["issue:12@open"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+
+    with pytest.raises(ValueError, match="work-action intake 需要"):
+        work_actions.execute_work_action(
+            args={"action": "intake", "repo": "acme/demo", "work_id": "demo"},
+            requested_by="operator",
+            snapshot_path=snapshot,
+            state_path=tmp_path / "runs.json",
+            now=lambda: 200,
+            workflow_registry=registry,
+            workflow_starter=work_actions._fallback_workflow_starter(
+                registry, tmp_path / "runs.json"
+            ),
+        )
+
+    assert registry.list_workflow_runs() == []

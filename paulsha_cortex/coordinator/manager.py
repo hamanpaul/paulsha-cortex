@@ -7683,12 +7683,15 @@ def apply_work_action(*, args, requested_by, registry=None, runtime_factory=None
     # #205 R1：operator 在 `cortex run work start/resume/...` 帶入的 run-scoped
     # 模型鏈覆寫語法層抽取；是否合法留給 dispatch 時 fail closed（D4）。
     work_action_model_chain_override = extract_model_chain_override(args)
-    # combo 只在 start action 有效——resume 等動作即使夾帶 combo（不論來自
-    # 上游疏漏或 --payload 繞過）也不得轉交 start_canonical_workflow，避免
-    # 已在 define phase 之外 resume 時被未預期的 combo override 影響
-    # （contract.validate_request 已 fail-closed 擋掉此請求，這裡是 manager
-    # 層的縱深防禦，行為不依賴上游有沒有先擋下）。
-    work_action_combo_override = args.get("combo") if args.get("action") == "start" else None
+    # combo 只在 start／intake action 有效（issue #203：intake 內部等價於
+    # start）——resume 等動作即使夾帶 combo（不論來自上游疏漏或 --payload
+    # 繞過）也不得轉交 start_canonical_workflow，避免已在 define phase 之外
+    # resume 時被未預期的 combo override 影響（contract.validate_request 已
+    # fail-closed 擋掉此請求，這裡是 manager 層的縱深防禦，行為不依賴上游
+    # 有沒有先擋下）。
+    work_action_combo_override = (
+        args.get("combo") if args.get("action") in {"start", "intake"} else None
+    )
 
     def starter(authority, claim_key, reason):
         return start_canonical_workflow(

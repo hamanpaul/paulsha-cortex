@@ -187,6 +187,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
             "retry-review", "recover-planning", "recover-pre-candidate",
             "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
+            "intake",
         ],
     )
     p_work.add_argument("work_id")
@@ -201,7 +202,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--reason", help="abandon 的單行審計理由（最多 500 字）")
     p_work.add_argument(
         "--combo",
-        help="start 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
+        help="start／intake 專用：明示指定 combo id，跳過 task_type 自動選牌（authoritative override）",
     )
     toggle = p_work.add_mutually_exclusive_group()
     toggle.add_argument("--enable", action="store_true")
@@ -375,7 +376,7 @@ def main(
             request_args["expected_run_id"] = args.expected_run_id
         if args.reason is not None:
             request_args["reason"] = args.reason
-        if args.combo is not None and args.action == "start":
+        if args.combo is not None and args.action in {"start", "intake"}:
             request_args["combo"] = args.combo
         if args.enable or args.disable:
             request_args["enabled"] = bool(args.enable)

@@ -396,6 +396,102 @@ def _mutate_override(*, args: dict[str, Any], repo: str, work_id: str) -> dict[s
     return {"action": args["action"], "override_path": str(path), "source": ref}
 
 
+def _source_already_authorized(authority, source: dict[str, str]) -> bool:
+    """issue #203：intake 判斷『這個 source 是否已經在受監控快照中被授權』，
+    用來決定要不要再多寫一筆 override link。只認 WorkAuthority 已載入的
+    mapped_* 欄位——這些欄位是 monitor correlation 的產出，不是 override
+    檔本身（override 檔寫入後仍要等下一輪 monitor 收斂才會反映到快照，見
+    ``_intake_action`` docstring）。
+    """
+    kind = source["kind"]
+    ref = source["ref"]
+    if kind in {"github_issue", "github_pr"}:
+        match = re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#([1-9][0-9]*)", ref)
+        if match is None:
+            return False
+        number = int(match.group(1))
+        pool = authority.mapped_issues if kind == "github_issue" else authority.mapped_prs
+        return number in pool
+    if kind == "openspec":
+        return ref in authority.mapped_openspec
+    if kind == "path":
+        return ref in authority.mapped_todo_paths
+    return False
+
+
+def _intake_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    now_epoch: float,
+    state_path: Path,
+    snapshot_path: str | Path | None,
+    workflow_registry=None,
+    workflow_starter=None,
+    readiness_checker=None,
+) -> dict[str, Any]:
+    """issue #203：把「（必要時）link + start」合成單一 work-action，取代已
+    停用的低階 dispatch，作為『拿到一個 issue/task 就進件』的單一入口。
+
+    Intake 絕不能無中生有出新的 authority——呼叫端傳進來的 ``authority`` 已由
+    ``execute_work_action`` 透過既有 ``load_work_authority`` 載入（要求
+    ``(repo, work_id)`` 這一列本來就存在於受監控的權威快照裡），這裡只做兩
+    件事：(a) 若帶了 issue/kind+ref 且尚未反映在目前快照的 mapped_* 欄位，
+    寫一筆 override link 供下一輪 monitor correlation 採信；(b) 驗證『重新
+    載入後』的 authority 確實有至少一項明文授權的來源（confirmed_todo 或
+    mapped_issues/mapped_todo_paths），再原樣轉交 ``_claim_action``（start
+    語意）。
+
+    寫 override 這一步是非同步的：``.cortex/work-items.yaml`` 與受監控的
+    ``work-items.snapshot.json`` 是兩份分開維護的狀態，前者要等 monitor 下一
+    輪 correlation 才會併入後者（見 ``paulsha_cortex/monitor/correlation.py``
+    與 ``coordinator/claim.py`` 的 ``_load_snapshot``）。因此「首次連結就地
+    開工」在同一次呼叫內不保證成立——若重新載入後 authority 仍未授權該來
+    源，這裡 fail-closed 拒絕（不假裝已生效），而不是靜默略過驗證。這是刻意
+    的簡化決策：intake 不引入額外的可續傳（resumable）分段設計，只做「link
+    （若需要）→ reload → 驗證 → claim」這一條直路。
+    """
+    repo = authority.repo
+    work_id = authority.work_id
+    issue = args.get("issue")
+    kind = args.get("kind")
+    ref = args.get("ref")
+    provided_link_args = issue is not None or kind is not None or ref is not None
+    linked = False
+    link_result: dict[str, Any] | None = None
+    if provided_link_args:
+        source = _canonical_source(args=args, repo=repo)
+        if not _source_already_authorized(authority, source):
+            link_args = dict(args)
+            link_args["action"] = "link"
+            link_result = _mutate_override(args=link_args, repo=repo, work_id=work_id)
+            linked = True
+            authority = load_work_authority(
+                repo=repo, work_id=work_id, snapshot_path=snapshot_path
+            )
+    if not (authority.mapped_issues or authority.mapped_todo_paths or authority.confirmed_todo):
+        raise ValueError(
+            "work-action intake 需要 confirmed Todo 或已 link 的 issue/kind+ref，"
+            "或在同一次呼叫帶 issue/kind+ref 建立 link；純文字任務不得憑空建立 authority"
+        )
+    claim_result = _claim_action(
+        args=args,
+        authority=authority,
+        now_epoch=now_epoch,
+        state_path=state_path,
+        workflow_registry=workflow_registry,
+        workflow_starter=workflow_starter,
+        readiness_checker=readiness_checker,
+    )
+    # run 保留在頂層（而非巢狀於某個 "claim_result" 鍵下）：manager_daemon 的
+    # job 派工觸發（`result["result"]["run"]`）與 start/resume 共用同一個讀取
+    # 路徑，intake 必須維持相同形狀才能被同一段 dispatch 邏輯接住。
+    result = dict(claim_result)
+    result["linked"] = linked
+    result["link_result"] = link_result
+    return result
+
+
 def _run_state_path() -> Path:
     return paths.coordinator_root() / "delivery-journal.json"
 
@@ -3601,6 +3697,7 @@ def execute_work_action(
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "abandon", "auto", "ship", "review-attest",
+        "intake",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -3634,6 +3731,17 @@ def execute_work_action(
             authority=authority,
             now_epoch=now_epoch,
             state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+            workflow_starter=workflow_starter,
+            readiness_checker=readiness_checker,
+        )
+    elif action == "intake":
+        result = _intake_action(
+            args=args,
+            authority=authority,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            snapshot_path=snapshot_path,
             workflow_registry=workflow_registry,
             workflow_starter=workflow_starter,
             readiness_checker=readiness_checker,
