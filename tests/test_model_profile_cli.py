@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -93,6 +94,11 @@ def _report_yaml(
     )
 
 
+def _pin(seed: str) -> str:
+    """仿 patchmud pin 格式的 deterministic 64-hex。"""
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
 ENCOUNTERS = (
     "input-validation-v1",
     "input-validation-v2",
@@ -113,9 +119,16 @@ def fake_patchmud(tmp_path: Path) -> SimpleNamespace:
         encounter = deck / name
         encounter.mkdir(parents=True)
         (encounter / "card.yaml").write_text(f"id: {name}\n", encoding="utf-8")
-        # deck 指紋取自各 encounter 的 provenance pin（#466 A-3）。
+        # deck 指紋取自各 encounter 的 provenance pin（#466 A-3）。仿真 deck 的
+        # provenance 形狀：pin 之外還有多行自由文字欄位（zh-TW 折行）——
+        # subset YAML parser 讀不了整份文件，pin 必須以行掃描取（回歸鎖）。
         (encounter / "provenance.yaml").write_text(
-            f"content_sha256: sha-{name}\n", encoding="utf-8"
+            "schema_version: 1\n"
+            f"issue_id: {name}\n"
+            "variant_notes: 多行自由文字欄位\n"
+            "  ——第二行縮排折行，subset parser 不支援的 plain scalar\n"
+            f"content_sha256: {_pin(name)}\n",
+            encoding="utf-8",
         )
     (root / "VERSION").write_text("0.0.1\n", encoding="utf-8")
     tools = tmp_path / "tools"
@@ -217,7 +230,7 @@ def test_profile_apply_writes_registry_and_fingerprint_skip_then_force(
     # deck 內容 pin 變更（encounter provenance 重 pin）→ 指紋不同 → 重評。
     (
         fake_patchmud.root / "decks" / "pilot-v1" / ENCOUNTERS[0] / "provenance.yaml"
-    ).write_text("content_sha256: sha-mutated\n", encoding="utf-8")
+    ).write_text(f"content_sha256: {_pin('mutated')}\n", encoding="utf-8")
     changed = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
     assert _cells_by_key(changed)[("claude", "sonnet", "builder")]["status"] == "proposed"
 
@@ -357,7 +370,7 @@ def test_deck_fingerprint_stable_across_timings_overwrite(
     assert mp.deck_content_sha256(deck_dir) == before
 
     (deck_dir / ENCOUNTERS[0] / "provenance.yaml").write_text(
-        "content_sha256: sha-repinned\n", encoding="utf-8"
+        f"content_sha256: {_pin('repinned')}\n", encoding="utf-8"
     )
     assert mp.deck_content_sha256(deck_dir) != before
 
