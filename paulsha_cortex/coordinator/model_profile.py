@@ -74,6 +74,8 @@ DEFAULT_DECK_ID = "pilot-v1"
 DEFAULT_LOADOUT = "P0T0R0"
 
 _RATE_LIMIT_RE = re.compile(r"\b429\b|rate.?limit", re.IGNORECASE)
+#: encounter provenance 的 pin 行（patchmud 機器寫入：頂層 64-hex，容許引號）。
+_CONTENT_SHA_LINE_RE = re.compile(r"^content_sha256:\s*['\"]?([0-9a-f]{64})['\"]?\s*$")
 _MAX_ENCOUNTER_ATTEMPTS = 3
 _PLAIN_SCALAR_RE = re.compile(r"[A-Za-z][A-Za-z0-9._+:/@#-]*")
 
@@ -111,19 +113,28 @@ def deck_content_sha256(deck_dir: Path) -> str:
     for encounter in _encounter_dirs(deck_dir):
         provenance_path = encounter / "provenance.yaml"
         try:
-            provenance = safe_load(provenance_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, YAMLError) as exc:
+            text = provenance_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             raise ValueError(
                 f"encounter provenance 不可讀：{provenance_path}（{type(exc).__name__}: {exc}）"
             ) from exc
-        content_sha = (
-            provenance.get("content_sha256") if isinstance(provenance, Mapping) else None
-        )
-        if not isinstance(content_sha, str) or not content_sha.strip():
-            raise ValueError(f"encounter provenance 缺 content_sha256：{provenance_path}")
+        # 行掃描取 pin，不整份餵 subset YAML parser：provenance 含自由文字
+        # 多行欄位（如 variant_notes 折行），超出零依賴 parser 的子集，實跑
+        # pilot-v1 已踩到 fail-closed 誤觸。pin 行由 patchmud 機器寫入、
+        # 格式固定（頂層 `content_sha256: <64 hex>`），恰一行才收。
+        matches = [
+            match.group(1)
+            for line in text.splitlines()
+            if (match := _CONTENT_SHA_LINE_RE.match(line))
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"encounter provenance 應恰含一行 content_sha256 pin"
+                f"（實得 {len(matches)} 行）：{provenance_path}"
+            )
         digest.update(encounter.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(content_sha.strip().encode("utf-8"))
+        digest.update(matches[0].encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
 
