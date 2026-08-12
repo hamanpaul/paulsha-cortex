@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from .._yaml import YAMLError, safe_load
+from .._yaml import safe_load
 from .envelope_mapping import EnvelopeMappingError, map_report_to_envelope
 from .model_identities import (
     ENVELOPE_FIELDS,
@@ -521,10 +521,18 @@ def run_model_profile(
             cell["reason"] = "report-failed"
             cell["detail"] = report_output.strip()[:400]
             continue
-        report_path = report_root / "report.yaml"
+        # 機器契約優先（paulsha-patchmud#26）：report.json 零歧義；無檔時退回
+        # subset YAML parser（相容舊版 patchmud——PyYAML 的長 scalar 折行
+        # 形狀仍可能超出子集，實跑驗證已踩過，升級 patchmud 即免疫）。
+        json_path = report_root / "report.json"
+        yaml_path = report_root / "report.yaml"
         try:
-            report = safe_load(report_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, YAMLError) as exc:
+            if json_path.is_file():
+                report = json.loads(json_path.read_text(encoding="utf-8"))
+            else:
+                report = safe_load(yaml_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            # json.JSONDecodeError 與 YAMLError 皆為 ValueError 子類。
             cell["status"] = "failed"
             cell["reason"] = "report-unreadable"
             cell["detail"] = f"{type(exc).__name__}: {exc}"

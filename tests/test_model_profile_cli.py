@@ -60,8 +60,16 @@ def main():
     if cmd == "report":
         out = Path(opt(args, "--out"))
         out.mkdir(parents=True, exist_ok=True)
-        template = (HERE / "report-template.yaml").read_text(encoding="utf-8")
-        (out / "report.yaml").write_text(template, encoding="utf-8")
+        wrote = False
+        for name in ("report-template.json", "report-template.yaml"):
+            src = HERE / name
+            if src.exists():
+                target = out / name.replace("-template", "")
+                target.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+                wrote = True
+        if not wrote:
+            print("fake patchmud: no report template", file=sys.stderr)
+            return 2
         print("report 輸出：" + str(out / "report.yaml"))
         return 0
     print("未知子命令", file=sys.stderr)
@@ -73,24 +81,53 @@ if __name__ == "__main__":
 """
 
 
-def _report_yaml(
-    *, clears: int, runs: int = 8, model: str = "anthropic:claude-sonnet-5"
-) -> str:
+def _report_dict(
+    *,
+    clears: int,
+    runs: int = 8,
+    model: str = "anthropic:claude-sonnet-5",
+    loadout: str = "P0T0R0",
+) -> dict:
     # 聚合鍵 model 預設用 normalize 後的完整 spec（patchmud PR #15 起 run.yaml
     # 即如此記錄）——與 CLI 別名 `sonnet` 不同，鎖住 #466 A-1「鍵值從 report
     # 本身取」的修法。
+    return {
+        "schema_version": 1,
+        "runs_included": runs,
+        "runs_skipped": [],
+        "leaderboards": {
+            "clear_rate": {
+                "status": "ok",
+                "rows": [
+                    {"model": model, "loadout": loadout, "runs": runs, "clears": clears}
+                ],
+            }
+        },
+    }
+
+
+def _report_json(**kwargs) -> str:
+    """機器契約模板（paulsha-patchmud#26）——lane 預設走 report.json。"""
+    return json.dumps(_report_dict(**kwargs), ensure_ascii=False, sort_keys=True)
+
+
+def _report_yaml(**kwargs) -> str:
+    """YAML fallback 模板：舊版 patchmud 只落 report.yaml 的相容路徑。
+    刻意用 PyYAML 的 indentless sequence 形狀，一併鎖住 subset parser 修正。"""
+    payload = _report_dict(**kwargs)
+    row = payload["leaderboards"]["clear_rate"]["rows"][0]
     return (
-        "schema_version: 1\n"
-        f"runs_included: {runs}\n"
-        "runs_skipped: []\n"
         "leaderboards:\n"
         "  clear_rate:\n"
-        "    status: ok\n"
         "    rows:\n"
-        f"      - model: {model}\n"
-        "        loadout: P0T0R0\n"
-        f"        runs: {runs}\n"
-        f"        clears: {clears}\n"
+        f"    - clears: {row['clears']}\n"
+        f"      loadout: {row['loadout']}\n"
+        f"      model: {row['model']}\n"
+        f"      runs: {row['runs']}\n"
+        "    status: ok\n"
+        f"runs_included: {payload['runs_included']}\n"
+        "runs_skipped: []\n"
+        "schema_version: 1\n"
     )
 
 
@@ -136,7 +173,7 @@ def fake_patchmud(tmp_path: Path) -> SimpleNamespace:
     bin_path = tools / "patchmud"
     bin_path.write_text(_FAKE_PATCHMUD, encoding="utf-8")
     bin_path.chmod(bin_path.stat().st_mode | stat.S_IXUSR)
-    (tools / "report-template.yaml").write_text(_report_yaml(clears=6), encoding="utf-8")
+    (tools / "report-template.json").write_text(_report_json(clears=6), encoding="utf-8")
     registry = tmp_path / "model-identities.yaml"
     registry.write_text(REGISTRY_V3, encoding="utf-8")
     return SimpleNamespace(root=root, bin=bin_path, registry=registry, tools=tools)
@@ -240,8 +277,8 @@ def test_profile_apply_writes_registry_and_fingerprint_skip_then_force(
 
 
 def test_below_green_floor_is_never_written(fake_patchmud: SimpleNamespace) -> None:
-    (fake_patchmud.tools / "report-template.yaml").write_text(
-        _report_yaml(clears=1), encoding="utf-8"
+    (fake_patchmud.tools / "report-template.json").write_text(
+        _report_json(clears=1), encoding="utf-8"
     )
     result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
     cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
@@ -287,8 +324,8 @@ def test_rate_limit_backoff_retries_encounters(fake_patchmud: SimpleNamespace) -
 
 def test_incomplete_deck_sample_falls_back_to_default(fake_patchmud: SimpleNamespace) -> None:
     # report 只聚到 5/8 run → incomplete-deck-sample，誠實維持 default、不落檔。
-    (fake_patchmud.tools / "report-template.yaml").write_text(
-        _report_yaml(clears=4, runs=5), encoding="utf-8"
+    (fake_patchmud.tools / "report-template.json").write_text(
+        _report_json(clears=4, runs=5), encoding="utf-8"
     )
     result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
     cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
@@ -310,18 +347,33 @@ def test_report_group_key_taken_from_report_not_alias(
     assert cell["observation"]["model"] == "anthropic:claude-sonnet-5"
 
 
+def test_yaml_only_report_falls_back_to_subset_parser(
+    fake_patchmud: SimpleNamespace,
+) -> None:
+    """舊版 patchmud 只落 report.yaml：fallback 走 subset parser——模板刻意用
+    PyYAML 的 indentless sequence 形狀，一併鎖住 parser 修正（#466 實跑回歸）。"""
+    (fake_patchmud.tools / "report-template.json").unlink()
+    (fake_patchmud.tools / "report-template.yaml").write_text(
+        _report_yaml(clears=6), encoding="utf-8"
+    )
+    result = mp.run_model_profile(_options(fake_patchmud), sleep=lambda _s: None)
+    cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
+    assert cell["status"] == "proposed"
+    assert cell["envelope"]["accepts_bands"] == ["green", "yellow"]
+
+
 def test_report_with_multiple_groups_is_explicit_failure(
     fake_patchmud: SimpleNamespace,
 ) -> None:
     """profile 的 runs_root 為單一身分專用：report 多於一組聚合鍵＝污染，
     fail-closed 明確報錯，不得猜一組來映射。"""
-    template = _report_yaml(clears=6) + (
-        "      - model: agy:gemini-3.1-pro\n"
-        "        loadout: P0T0R0\n"
-        "        runs: 8\n"
-        "        clears: 8\n"
+    payload = _report_dict(clears=6)
+    payload["leaderboards"]["clear_rate"]["rows"].append(
+        {"model": "agy:gemini-3.1-pro", "loadout": "P0T0R0", "runs": 8, "clears": 8}
     )
-    (fake_patchmud.tools / "report-template.yaml").write_text(template, encoding="utf-8")
+    (fake_patchmud.tools / "report-template.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
     result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
     cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
     assert cell["status"] == "failed"
@@ -333,19 +385,11 @@ def test_report_row_without_model_is_explicit_failure(
     fake_patchmud: SimpleNamespace,
 ) -> None:
     """malformed row（缺 model）不得被 str(None) 誤當成合法聚合鍵（review）。"""
-    template = (
-        "schema_version: 1\n"
-        "runs_included: 8\n"
-        "runs_skipped: []\n"
-        "leaderboards:\n"
-        "  clear_rate:\n"
-        "    status: ok\n"
-        "    rows:\n"
-        "      - loadout: P0T0R0\n"
-        "        runs: 8\n"
-        "        clears: 6\n"
+    payload = _report_dict(clears=6)
+    del payload["leaderboards"]["clear_rate"]["rows"][0]["model"]
+    (fake_patchmud.tools / "report-template.json").write_text(
+        json.dumps(payload), encoding="utf-8"
     )
-    (fake_patchmud.tools / "report-template.yaml").write_text(template, encoding="utf-8")
     result = mp.run_model_profile(_options(fake_patchmud, apply=True), sleep=lambda _s: None)
     cell = _cells_by_key(result)[("claude", "sonnet", "builder")]
     assert cell["status"] == "failed"

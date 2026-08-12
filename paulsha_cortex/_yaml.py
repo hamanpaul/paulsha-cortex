@@ -78,6 +78,17 @@ def safe_load(text: str):
                 result[key] = _parse_scalar(value_text)
                 i += 1
                 continue
+            if (
+                i + 1 < len(lines)
+                and lines[i + 1][1] == current_indent
+                and lines[i + 1][2].startswith("- ")
+            ):
+                # indentless block sequence（PyYAML safe_dump 預設輸出）：
+                # `key:` 之後、同縮排的 `- ` 序列屬於該 key。只在「空值 key
+                # 緊接同縮排 dash」時觸發，純擴大接受集，不改既有可解文件。
+                nested, i = parse_list(i + 1, current_indent)
+                result[key] = nested
+                continue
             if i + 1 >= len(lines) or lines[i + 1][1] <= current_indent:
                 result[key] = {}
                 i += 1
