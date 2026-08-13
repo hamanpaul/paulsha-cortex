@@ -1,5 +1,5 @@
 policy_profile: flat
-policy_version: 1.0.15
+policy_version: 1.0.17
 tier: shareable
 code_paths:
   - ".project-policy.yml"

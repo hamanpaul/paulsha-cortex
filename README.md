@@ -676,7 +676,7 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
 ## 開發備註
 
 - repo 宣告 `tier: shareable`，所有範例與測試都必須維持去識別化。
-- repo policy 由 canonical `.project-policy.yml` 宣告，並 pin paulsha-conventions v1.0.15。
+- repo policy 由 canonical `.project-policy.yml` 宣告，並 pin paulsha-conventions v1.0.17。
 - agent 慣例檔採 symlink 模式：`AGENTS.md`、`GEMINI.md`、`.github/copilot-instructions.md` 都指向 `CLAUDE.md`。
 
 ## Version
