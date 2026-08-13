@@ -1,600 +1,652 @@
 version: 1
 work_items:
   unified-work-lifecycle:
-    title: Unified work lifecycle
+    title: 'Unified work lifecycle'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#14
-    - kind: openspec
-      ref: unified-work-lifecycle
-    - kind: path
-      ref: docs/superpowers/specs/2026-07-17-unified-work-lifecycle.md
-    - kind: path
-      ref: docs/superpowers/plans/2026-07-17-unified-work-lifecycle.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#14'
+      - kind: openspec
+        ref: 'unified-work-lifecycle'
+      - kind: path
+        ref: 'docs/superpowers/specs/2026-07-17-unified-work-lifecycle.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/2026-07-17-unified-work-lifecycle.md'
+    excludes: []
   docs-only-lifecycle-canary:
-    title: Unified lifecycle live canary
+    title: 'Unified lifecycle live canary'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#20
-    - kind: openspec
-      ref: docs-only-lifecycle-canary
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#20'
+      - kind: openspec
+        ref: 'docs-only-lifecycle-canary'
+    excludes: []
   docs-only-lifecycle-canary-v2:
-    title: Unified lifecycle clean live canary
+    title: 'Unified lifecycle clean live canary'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#27
-    - kind: openspec
-      ref: docs-only-lifecycle-canary-v2
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#27'
+      - kind: openspec
+        ref: 'docs-only-lifecycle-canary-v2'
+    excludes: []
   porcelain-bootstrap:
-    title: porcelain bootstrap (B5)
+    title: 'porcelain bootstrap (B5)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#91
-    - kind: openspec
-      ref: porcelain-bootstrap
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-bootstrap/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#91'
+      - kind: openspec
+        ref: 'porcelain-bootstrap'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-bootstrap/todo.md'
+    excludes: []
   porcelain-service:
-    title: porcelain service family (B4)
+    title: 'porcelain service family (B4)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#90
-    - kind: openspec
-      ref: porcelain-service
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-service/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#90'
+      - kind: openspec
+        ref: 'porcelain-service'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-service/todo.md'
+    excludes: []
   porcelain-inspect:
-    title: porcelain inspect family (B3)
+    title: 'porcelain inspect family (B3)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#89
-    - kind: openspec
-      ref: porcelain-inspect
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-inspect/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#89'
+      - kind: openspec
+        ref: 'porcelain-inspect'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-inspect/todo.md'
+    excludes: []
   release-pipeline:
-    title: release-pipeline (B9)
+    title: 'release-pipeline (B9)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#95
-    - kind: openspec
-      ref: release-pipeline
-    - kind: path
-      ref: docs/superpowers/workstreams/release-pipeline/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#95'
+      - kind: openspec
+        ref: 'release-pipeline'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/release-pipeline/todo.md'
+    excludes: []
   onboarding-docs:
-    title: onboarding-docs (B8)
+    title: 'onboarding-docs (B8)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#94
-    - kind: openspec
-      ref: onboarding-docs
-    - kind: path
-      ref: docs/superpowers/workstreams/onboarding-docs/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#94'
+      - kind: openspec
+        ref: 'onboarding-docs'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/onboarding-docs/todo.md'
+    excludes: []
   porcelain-init-sample:
-    title: porcelain init-sample (B7)
+    title: 'porcelain init-sample (B7)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#93
-    - kind: openspec
-      ref: porcelain-init-sample
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-init-sample/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#93'
+      - kind: openspec
+        ref: 'porcelain-init-sample'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-init-sample/todo.md'
+    excludes: []
   porcelain-run-recover:
-    title: porcelain run/recover families (B6)
+    title: 'porcelain run/recover families (B6)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#92
-    - kind: openspec
-      ref: porcelain-run-recover
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-run-recover/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#92'
+      - kind: openspec
+        ref: 'porcelain-run-recover'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-run-recover/todo.md'
+    excludes: []
   porcelain-request:
-    title: porcelain request family (B2)
+    title: 'porcelain request family (B2)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#88
-    - kind: openspec
-      ref: porcelain-request
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-request/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#88'
+      - kind: openspec
+        ref: 'porcelain-request'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-request/todo.md'
+    excludes: []
   porcelain-skeleton:
-    title: porcelain routing skeleton (B1)
+    title: 'porcelain routing skeleton (B1)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#87
-    - kind: openspec
-      ref: porcelain-skeleton
-    - kind: path
-      ref: docs/superpowers/workstreams/porcelain-skeleton/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#87'
+      - kind: openspec
+        ref: 'porcelain-skeleton'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/porcelain-skeleton/todo.md'
+    excludes: []
   add-cortex-version-flag:
-    title: cortex --version flag (porcelain dogfood canary)
+    title: 'cortex --version flag (porcelain dogfood canary)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#86
-    - kind: openspec
-      ref: add-cortex-version-flag
-    - kind: path
-      ref: docs/superpowers/workstreams/add-cortex-version-flag/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/add-cortex-version-flag-spec.md
-    - kind: path
-      ref: docs/superpowers/plans/add-cortex-version-flag.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#86'
+      - kind: openspec
+        ref: 'add-cortex-version-flag'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/add-cortex-version-flag/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/add-cortex-version-flag-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/add-cortex-version-flag.md'
+    excludes: []
   terminal-lifecycle-canary:
-    title: Unified lifecycle terminal live canary
+    title: 'Unified lifecycle terminal live canary'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#31
-    - kind: openspec
-      ref: terminal-lifecycle-canary
-    - kind: path
-      ref: docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#31'
+      - kind: openspec
+        ref: 'terminal-lifecycle-canary'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/terminal-lifecycle-canary/todo.md'
+    excludes: []
   fix-git-runner-cwd:
-    title: fix git runner cwd coupling (#99)
+    title: 'fix git runner cwd coupling (#99)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#99
-    - kind: openspec
-      ref: 2026-07-25-fix-git-runner-cwd
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-git-runner-cwd/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-git-runner-cwd-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-git-runner-cwd-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-git-runner-cwd.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#99'
+      - kind: openspec
+        ref: '2026-07-25-fix-git-runner-cwd'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-git-runner-cwd/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-git-runner-cwd-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-git-runner-cwd-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-git-runner-cwd.md'
+    excludes: []
   fix-dispatch-exception-detail:
-    title: fix DispatchReadyError detail + manager.log timestamp (#100)
+    title: 'fix DispatchReadyError detail + manager.log timestamp (#100)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#100
-    - kind: openspec
-      ref: 2026-07-25-fix-dispatch-exception-detail
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-dispatch-exception-detail/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-dispatch-exception-detail-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-dispatch-exception-detail-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-dispatch-exception-detail.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#100'
+      - kind: openspec
+        ref: '2026-07-25-fix-dispatch-exception-detail'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-dispatch-exception-detail/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dispatch-exception-detail-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dispatch-exception-detail-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-dispatch-exception-detail.md'
+    excludes: []
   fix-mutation-request-timeout:
-    title: fix mutation request 5s timeout (#152)
+    title: 'fix mutation request 5s timeout (#152)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#152
-    - kind: openspec
-      ref: 2026-07-25-fix-mutation-request-timeout
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-mutation-request-timeout/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-mutation-request-timeout-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-mutation-request-timeout-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-mutation-request-timeout.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#152'
+      - kind: openspec
+        ref: '2026-07-25-fix-mutation-request-timeout'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-mutation-request-timeout/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-mutation-request-timeout-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-mutation-request-timeout-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-mutation-request-timeout.md'
+    excludes: []
   multi-issue-worktree:
-    title: multi-issue Work Item + repo-scoped builder worktree (#134)
+    title: 'multi-issue Work Item + repo-scoped builder worktree (#134)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#134
-    - kind: openspec
-      ref: 2026-07-26-multi-issue-worktree
-    - kind: path
-      ref: docs/superpowers/workstreams/multi-issue-worktree/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/multi-issue-worktree-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/multi-issue-worktree-design.md
-    - kind: path
-      ref: docs/superpowers/plans/multi-issue-worktree.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#134'
+      - kind: openspec
+        ref: '2026-07-26-multi-issue-worktree'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/multi-issue-worktree/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/multi-issue-worktree-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/multi-issue-worktree-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/multi-issue-worktree.md'
+    excludes: []
   reclaim-pr-inheritance:
-    title: re-claim PR inheritance + closed-unmapped terminal correlation (#175)
+    title: 're-claim PR inheritance + closed-unmapped terminal correlation (#175)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#175
-    - kind: openspec
-      ref: 2026-07-26-reclaim-pr-inheritance
-    - kind: path
-      ref: docs/superpowers/workstreams/reclaim-pr-inheritance/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/reclaim-pr-inheritance-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/reclaim-pr-inheritance-design.md
-    - kind: path
-      ref: docs/superpowers/plans/reclaim-pr-inheritance.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#175'
+      - kind: openspec
+        ref: '2026-07-26-reclaim-pr-inheritance'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/reclaim-pr-inheritance/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/reclaim-pr-inheritance-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/reclaim-pr-inheritance-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/reclaim-pr-inheritance.md'
+    excludes: []
   driving-cortex-skill:
-    title: driving-cortex skill (#177)
+    title: 'driving-cortex skill (#177)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#177
-    - kind: openspec
-      ref: 2026-07-26-driving-cortex-skill
-    - kind: path
-      ref: docs/superpowers/workstreams/driving-cortex-skill/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/driving-cortex-skill-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/driving-cortex-skill-design.md
-    - kind: path
-      ref: docs/superpowers/plans/driving-cortex-skill.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#177'
+      - kind: openspec
+        ref: '2026-07-26-driving-cortex-skill'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/driving-cortex-skill/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/driving-cortex-skill-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/driving-cortex-skill-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/driving-cortex-skill.md'
+    excludes: []
   fix-dispatch-spec-path:
-    title: fix dispatch spec path resolution (#98)
+    title: 'fix dispatch spec path resolution (#98)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#98
-    - kind: openspec
-      ref: 2026-07-26-fix-dispatch-spec-path
-    - kind: path
-      ref: docs/superpowers/specs/fix-dispatch-spec-path-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-dispatch-spec-path-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-dispatch-spec-path.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#98'
+      - kind: openspec
+        ref: '2026-07-26-fix-dispatch-spec-path'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dispatch-spec-path-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dispatch-spec-path-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-dispatch-spec-path.md'
+    excludes: []
   fix-deck-emit-frontmatter:
-    title: fix deck emit frontmatter for dispatch contract (#101)
+    title: 'fix deck emit frontmatter for dispatch contract (#101)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#101
-    - kind: openspec
-      ref: 2026-07-26-fix-deck-emit-frontmatter
-    - kind: path
-      ref: docs/superpowers/specs/fix-deck-emit-frontmatter-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-deck-emit-frontmatter-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-deck-emit-frontmatter.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#101'
+      - kind: openspec
+        ref: '2026-07-26-fix-deck-emit-frontmatter'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-deck-emit-frontmatter-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-deck-emit-frontmatter-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-deck-emit-frontmatter.md'
+    excludes: []
   fix-builder-write-paths:
-    title: fix builder write_paths cross-repo (#118)
+    title: 'fix builder write_paths cross-repo (#118)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#118
-    - kind: openspec
-      ref: 2026-07-26-fix-builder-write-paths
-    - kind: path
-      ref: docs/superpowers/specs/fix-builder-write-paths-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-builder-write-paths-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-builder-write-paths.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#118'
+      - kind: openspec
+        ref: '2026-07-26-fix-builder-write-paths'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-builder-write-paths-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-builder-write-paths-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-builder-write-paths.md'
+    excludes: []
   docs-monitor-load-config:
-    title: docs monitor load_config explicit/ambient (#143)
+    title: 'docs monitor load_config explicit/ambient (#143)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#143
-    - kind: openspec
-      ref: 2026-07-26-docs-monitor-load-config
-    - kind: path
-      ref: docs/superpowers/specs/docs-monitor-load-config-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/docs-monitor-load-config-design.md
-    - kind: path
-      ref: docs/superpowers/plans/docs-monitor-load-config.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#143'
+      - kind: openspec
+        ref: '2026-07-26-docs-monitor-load-config'
+      - kind: path
+        ref: 'docs/superpowers/specs/docs-monitor-load-config-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/docs-monitor-load-config-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/docs-monitor-load-config.md'
+    excludes: []
   fix-service-install-overwrite:
-    title: fix service install overwrite guard (#148)
+    title: 'fix service install overwrite guard (#148)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#148
-    - kind: openspec
-      ref: 2026-07-26-fix-service-install-overwrite
-    - kind: path
-      ref: docs/superpowers/specs/fix-service-install-overwrite-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-service-install-overwrite-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-service-install-overwrite.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#148'
+      - kind: openspec
+        ref: '2026-07-26-fix-service-install-overwrite'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-service-install-overwrite-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-service-install-overwrite-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-service-install-overwrite.md'
+    excludes: []
   fix-slice-failed-deadend:
-    title: fix slice failed state dead-end (#153)
+    title: 'fix slice failed state dead-end (#153)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#153
-    - kind: openspec
-      ref: 2026-07-26-fix-slice-failed-deadend
-    - kind: path
-      ref: docs/superpowers/specs/fix-slice-failed-deadend-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-slice-failed-deadend-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-slice-failed-deadend.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#153'
+      - kind: openspec
+        ref: '2026-07-26-fix-slice-failed-deadend'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-slice-failed-deadend-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-slice-failed-deadend-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-slice-failed-deadend.md'
+    excludes: []
   docs-archived-spec-purpose:
-    title: docs archived spec Purpose TBD (#158)
+    title: 'docs archived spec Purpose TBD (#158)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#158
-    - kind: openspec
-      ref: 2026-07-26-docs-archived-spec-purpose
-    - kind: path
-      ref: docs/superpowers/specs/docs-archived-spec-purpose-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/docs-archived-spec-purpose-design.md
-    - kind: path
-      ref: docs/superpowers/plans/docs-archived-spec-purpose.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#158'
+      - kind: openspec
+        ref: '2026-07-26-docs-archived-spec-purpose'
+      - kind: path
+        ref: 'docs/superpowers/specs/docs-archived-spec-purpose-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/docs-archived-spec-purpose-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/docs-archived-spec-purpose.md'
+    excludes: []
   test-r21-regex-resilience:
-    title: test R-21 regex resilience CRLF + Windows (#169)
+    title: 'test R-21 regex resilience CRLF + Windows (#169)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#169
-    - kind: openspec
-      ref: 2026-07-26-test-r21-regex-resilience
-    - kind: path
-      ref: docs/superpowers/specs/test-r21-regex-resilience-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/test-r21-regex-resilience-design.md
-    - kind: path
-      ref: docs/superpowers/plans/test-r21-regex-resilience.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#169'
+      - kind: openspec
+        ref: '2026-07-26-test-r21-regex-resilience'
+      - kind: path
+        ref: 'docs/superpowers/specs/test-r21-regex-resilience-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/test-r21-regex-resilience-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/test-r21-regex-resilience.md'
+    excludes: []
   dispatch-reliability-batch:
-    title: dispatch reliability batch (abandoned,
+    title: 'dispatch reliability batch (abandoned,'
     links: []
     excludes:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#99
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#100
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#152
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#99'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#100'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#152'
   terminal-result-contract:
-    title: terminal/result contract 誠實表達 gate failure (#261)
+    title: 'terminal/result contract 誠實表達 gate failure (#261)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#261
-    - kind: openspec
-      ref: 2026-07-30-terminal-result-contract
-    - kind: path
-      ref: docs/superpowers/workstreams/terminal-result-contract/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/terminal-result-contract-spec.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#261'
+      - kind: openspec
+        ref: '2026-07-30-terminal-result-contract'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/terminal-result-contract/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/terminal-result-contract-spec.md'
+    excludes: []
   planning-claim-recovery:
-    title: planning claim 前向恢復與 abandon 釋放語意 (#256)
+    title: 'planning claim 前向恢復與 abandon 釋放語意 (#256)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#256
-    - kind: openspec
-      ref: 2026-07-30-planning-claim-recovery
-    - kind: path
-      ref: docs/superpowers/workstreams/planning-claim-recovery/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/planning-claim-recovery-spec.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#256'
+      - kind: openspec
+        ref: '2026-07-30-planning-claim-recovery'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/planning-claim-recovery/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/planning-claim-recovery-spec.md'
+    excludes: []
   dispatch-runtime-preflight:
-    title: dispatch 前 runtime capability 與 provider 新鮮度驗證 (#262)
+    title: 'dispatch 前 runtime capability 與 provider 新鮮度驗證 (#262)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#262
-    - kind: openspec
-      ref: 2026-07-30-dispatch-runtime-preflight
-    - kind: path
-      ref: docs/superpowers/workstreams/dispatch-runtime-preflight/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/dispatch-runtime-preflight-spec.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#262'
+      - kind: openspec
+        ref: '2026-07-30-dispatch-runtime-preflight'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/dispatch-runtime-preflight/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-runtime-preflight-spec.md'
+    excludes: []
   per-work-model-chain:
-    title: per-work 模型鏈覆寫 (#205)
+    title: 'per-work 模型鏈覆寫 (#205)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#205
-    - kind: openspec
-      ref: 2026-07-30-per-work-model-chain
-    - kind: path
-      ref: docs/superpowers/workstreams/per-work-model-chain/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/per-work-model-chain-spec.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#205'
+      - kind: openspec
+        ref: '2026-07-30-per-work-model-chain'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/per-work-model-chain/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/per-work-model-chain-spec.md'
+    excludes: []
   persona-enforce-required-check:
-    title: persona enforcement 切 enforce 並設 required check (#135)
+    title: 'persona enforcement 切 enforce 並設 required check (#135)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#135
-    - kind: openspec
-      ref: 2026-07-30-persona-enforce-required-check
-    - kind: path
-      ref: docs/superpowers/workstreams/persona-enforce-required-check/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/persona-enforce-required-check-spec.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#135'
+      - kind: openspec
+        ref: '2026-07-30-persona-enforce-required-check'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/persona-enforce-required-check/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/persona-enforce-required-check-spec.md'
+    excludes: []
   fix-persona-catalog-portability-v2:
-    title: persona catalog 可攜性 v2 重識別——#218 世代熔斷後續作 (#295/#291)
+    title: 'persona catalog 可攜性 v2 重識別——#218 世代熔斷後續作 (#295/#291)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#295
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#291
-    - kind: openspec
-      ref: 2026-08-04-fix-persona-catalog-portability
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-persona-catalog-portability-v2/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-persona-catalog-portability-v2-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-persona-catalog-portability-v2-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-persona-catalog-portability-v2.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#295'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#291'
+      - kind: openspec
+        ref: '2026-08-04-fix-persona-catalog-portability'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-persona-catalog-portability-v2/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-persona-catalog-portability-v2-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-persona-catalog-portability-v2-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-persona-catalog-portability-v2.md'
+    excludes: []
   fix-repair-commit-recovery:
-    title: repair commit 缺 terminal evidence 的窄化恢復與 stale job 選擇修正 (#260)
+    title: 'repair commit 缺 terminal evidence 的窄化恢復與 stale job 選擇修正 (#260)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#260
-    - kind: openspec
-      ref: 2026-08-04-fix-repair-commit-recovery
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-repair-commit-recovery/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-repair-commit-recovery-spec.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#260'
+      - kind: openspec
+        ref: '2026-08-04-fix-repair-commit-recovery'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-repair-commit-recovery/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-repair-commit-recovery-spec.md'
+    excludes: []
   feat-work-gc:
-    title: feat-work-gc（已由 -v2 重識別接手；舊 runs 為 superseded 審計）
+    title: 'feat-work-gc（已由 -v2 重識別接手；舊 runs 為 superseded 審計）'
     links:
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-work-gc/todo.md
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-work-gc/todo.md'
+    excludes: []
   design-task-type-taxonomy:
-    title: design-task-type-taxonomy（已由 -v2 重識別接手；舊 runs 為 superseded 審計）
+    title: 'design-task-type-taxonomy（已由 -v2 重識別接手；舊 runs 為 superseded 審計）'
     links:
-    - kind: path
-      ref: docs/superpowers/workstreams/design-task-type-taxonomy/todo.md
+      - kind: path
+        ref: 'docs/superpowers/workstreams/design-task-type-taxonomy/todo.md'
+    excludes: []
   feat-work-gc-v2:
-    title: cortex work gc v2 重識別——世代熔斷後續作 (#178)
+    title: 'cortex work gc v2 重識別——世代熔斷後續作 (#178)'
     links:
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-work-gc-v2/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/feat-work-gc-v2-spec.md
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-work-gc-v2/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/feat-work-gc-v2-spec.md'
+    excludes: []
   design-task-type-taxonomy-v2:
-    title: task_type taxonomy v2 重識別——世代熔斷後續作 (#139)
+    title: 'task_type taxonomy v2 重識別——世代熔斷後續作 (#139)'
     links:
-    - kind: path
-      ref: docs/superpowers/workstreams/design-task-type-taxonomy-v2/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/design-task-type-taxonomy-v2-spec.md
+      - kind: path
+        ref: 'docs/superpowers/workstreams/design-task-type-taxonomy-v2/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/design-task-type-taxonomy-v2-spec.md'
+    excludes: []
   feat-slice-executor-model:
-    title: per-slice executor/model 宣告與 depends_on 顯式診斷 (#294)
+    title: 'per-slice executor/model 宣告與 depends_on 顯式診斷 (#294)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#294
-    - kind: openspec
-      ref: 2026-08-04-feat-slice-executor-model
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-slice-executor-model/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/feat-slice-executor-model-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/feat-slice-executor-model-design.md
-    - kind: path
-      ref: docs/superpowers/plans/feat-slice-executor-model.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#294'
+      - kind: openspec
+        ref: '2026-08-04-feat-slice-executor-model'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-slice-executor-model/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/feat-slice-executor-model-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/feat-slice-executor-model-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/feat-slice-executor-model.md'
+    excludes: []
   fix-preflight-closeout-order:
-    title: 本地 closeout 先於 PR metadata preflight 與 frozen artifacts materialize (#263)
+    title: '本地 closeout 先於 PR metadata preflight 與 frozen artifacts materialize (#263)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#263
-    - kind: openspec
-      ref: 2026-08-04-fix-preflight-closeout-order
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-preflight-closeout-order/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-preflight-closeout-order-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/fix-preflight-closeout-order-design.md
-    - kind: path
-      ref: docs/superpowers/plans/fix-preflight-closeout-order.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#263'
+      - kind: openspec
+        ref: '2026-08-04-fix-preflight-closeout-order'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-preflight-closeout-order/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-preflight-closeout-order-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-preflight-closeout-order-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/fix-preflight-closeout-order.md'
+    excludes: []
   feat-task-type-combo-selector:
-    title: task_type 自動選 combo 與 fix-standard combo (#202)
+    title: 'task_type 自動選 combo 與 fix-standard combo (#202)'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#202
-    - kind: openspec
-      ref: 2026-08-04-feat-task-type-combo-selector
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-task-type-combo-selector/todo.md
-    - kind: path
-      ref: docs/superpowers/specs/feat-task-type-combo-selector-spec.md
-    - kind: path
-      ref: docs/superpowers/specs/feat-task-type-combo-selector-design.md
-    - kind: path
-      ref: docs/superpowers/plans/feat-task-type-combo-selector.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#202'
+      - kind: openspec
+        ref: '2026-08-04-feat-task-type-combo-selector'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-task-type-combo-selector/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/feat-task-type-combo-selector-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/feat-task-type-combo-selector-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/feat-task-type-combo-selector.md'
+    excludes: []
   fix-deck-verification-skeleton:
-    title: deck compile verification 骨架由 project policy 導出
+    title: 'deck compile verification 骨架由 project policy 導出'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#380
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-deck-verification-skeleton/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#380'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-deck-verification-skeleton/todo.md'
     excludes: []
   fix-packaging-release-path:
-    title: README release 安裝路徑與 packaging smoke matrix
+    title: 'README release 安裝路徑與 packaging smoke matrix'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#385
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-packaging-release-path/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#385'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-packaging-release-path/todo.md'
     excludes: []
   feat-digest-outbox:
-    title: 排程觸發的跨系統 digest 出口
+    title: '排程觸發的跨系統 digest 出口'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#372
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-digest-outbox/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#372'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-digest-outbox/todo.md'
     excludes: []
   fix-authority-restart-loop:
-    title: authority-restart 迴圈與 binding mismatch 抑制
+    title: 'authority-restart 迴圈與 binding mismatch 抑制'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#373
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-authority-restart-loop/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#373'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-authority-restart-loop/todo.md'
     excludes: []
   fix-registry-atomic-transitions:
-    title: record_action 原子性與 gate_state 轉換表
+    title: 'record_action 原子性與 gate_state 轉換表'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#382
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-registry-atomic-transitions/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#382'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-registry-atomic-transitions/todo.md'
     excludes: []
   fix-handoff-manifest-reconcile:
-    title: 殘留 handoff manifest 與 registry 對帳
+    title: '殘留 handoff manifest 與 registry 對帳'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#383
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-handoff-manifest-reconcile/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#383'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-handoff-manifest-reconcile/todo.md'
     excludes: []
   fix-installer-managed-env:
-    title: installer managed_env 與 lock/specs 路徑合併修正
+    title: 'installer managed_env 與 lock/specs 路徑合併修正'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#371
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#375
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-installer-managed-env/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#371'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#375'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-installer-managed-env/todo.md'
     excludes: []
   fix-rate-limit-classification:
-    title: GitHub rate limit 分類與 durable 退避
+    title: 'GitHub rate limit 分類與 durable 退避'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#370
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-rate-limit-classification/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#370'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-rate-limit-classification/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#506'
     excludes: []
   fix-spawn-admission-limiter:
-    title: per-provider spawn admission limiter
+    title: 'per-provider spawn admission limiter'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#381
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-spawn-admission-limiter/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#381'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-spawn-admission-limiter/todo.md'
     excludes: []
   feat-executor-auth-preflight:
-    title: dispatch 前 executor 登入態驗證與 provider 探測接線
+    title: 'dispatch 前 executor 登入態驗證與 provider 探測接線'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#369
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-executor-auth-preflight/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#369'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-executor-auth-preflight/todo.md'
     excludes: []
   feat-provider-failure-semantics:
-    title: LLM provider failure typed semantics 與 bounded recovery
+    title: 'LLM provider failure typed semantics 與 bounded recovery'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#384
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-provider-failure-semantics/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#384'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-provider-failure-semantics/todo.md'
     excludes: []
   feat-adversarial-evidence-review:
-    title: 對抗式 evidence 驗證掛卡
+    title: '對抗式 evidence 驗證掛卡'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#378
-    - kind: path
-      ref: docs/superpowers/workstreams/feat-adversarial-evidence-review/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#378'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/feat-adversarial-evidence-review/todo.md'
     excludes: []
   fix-gate-provenance:
-    title: gate 清單來源改 spec/plan 導出與判準不可變
+    title: 'gate 清單來源改 spec/plan 導出與判準不可變'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#379
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-gate-provenance/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#379'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-gate-provenance/todo.md'
     excludes: []
   fix-log-error-dedup-v4:
-    title: manager_daemon _log_error 多槽去重
+    title: 'manager_daemon _log_error 多槽去重'
     links:
-    - kind: github_issue
-      ref: hamanpaul/paulsha-cortex#374
-    - kind: path
-      ref: docs/superpowers/workstreams/fix-log-error-dedup-v4/todo.md
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#374'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-log-error-dedup-v4/todo.md'
+    excludes: []
+  fix-read-repo-tier-fail-closed:
+    title: 'fix-read-repo-tier-fail-closed'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#492'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-read-repo-tier-fail-closed/todo.md'
     excludes: []
