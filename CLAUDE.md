@@ -1,15 +1,15 @@
-<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.15 -->
+<!-- managed-by: hamanpaul/paulsha-conventions@v1.0.17 -->
 <!-- 此為 canonical 真檔；AGENTS.md / GEMINI.md / .github/copilot-instructions.md 為指向本檔的 symlink，只維護本檔 -->
-policy_version: 1.0.15
+policy_version: 1.0.17
 
 # Agent Policy Checklist
 
-本 repo 受 hamanpaul project policy v1.0.15 管轄。
+本 repo 受 hamanpaul project policy v1.0.17 管轄。
 所有 agent 進入 session 時，必須依下列 checklist 行動。
 
 ## 本 repo 的 profile
 - policy_profile: `flat` （見 `.project-policy.yml`）
-- policy_version: `1.0.15`
+- policy_version: `1.0.17`
 
 ## 本 repo 定位
 - `paulsha-cortex` 是治理平面拆包：persona 契約、coordinator 派工、control 檔案契約。

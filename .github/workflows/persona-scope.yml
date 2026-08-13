@@ -32,8 +32,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        # 不裝 pytest：scope_ci 不使用測試框架（pytest 屬 `.[test]` extra），
+        # 且安裝行出現 pytest 會被 R-19 解析器誤判為未確認的測試執行點。
         run: |
-          python -m pip install --upgrade pip pytest
+          python -m pip install --upgrade pip
           python -m pip install -e .
 
       - name: Run persona-scope
