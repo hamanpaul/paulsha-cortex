@@ -387,6 +387,28 @@ def test_reset_writes_immutable_content_addressed_evidence(tmp_path: Path) -> No
     assert verification.canonical_json_hash(body) == result["evidence"]["hash"]
 
 
+def test_reset_evidence_replay_is_idempotent_for_many_generations(tmp_path: Path) -> None:
+    """世代數多到 body 超過 4096 bytes 時，byte-identical 重放仍須冪等。
+
+    evidence body 隨 `cleared_run_ids` 線性成長，而 supersede-family 共用的
+    conflict 判準帶有防禦性大小上界；沿用 abandon 的 4096 會讓長歷史 work item
+    的重置一重放就被誤判成 conflict、冪等重入必然 fail。
+    """
+
+    body = work_actions._reclaim_reset_body(
+        repo="acme/demo",
+        work_id="demo",
+        actor="operator",
+        reason="長歷史 work item",
+        cleared_run_ids=[f"workflow-{index:020x}" for index in range(200)],
+        created_at="2025-08-12T12:00:00+00:00",
+    )
+    state_path = tmp_path / "journal.jsonl"
+    first = work_actions._reclaim_reset_record(body, state_path=state_path)
+    assert Path(first["ref"]).stat().st_size > 4096
+    assert work_actions._reclaim_reset_record(body, state_path=state_path) == first
+
+
 def test_reset_evidence_conflict_fails_closed(tmp_path: Path) -> None:
     """同名 evidence 檔內容不符時必須 raise，不得覆寫稽核紀錄。"""
 

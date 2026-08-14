@@ -2060,17 +2060,21 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
 
 
 def _validate_abandon_evidence_target(
-    target: Path, content: bytes, *, label: str = "abandon"
+    target: Path, content: bytes, *, label: str = "abandon", max_size: int = 4096
 ) -> None:
     # ``label`` 只影響錯誤訊息（#519 讓 reclaim-reset 說自己的名字），判準本身
-    # 對每一種 supersede-family evidence 完全一致。
+    # 對每一種 supersede-family evidence 完全一致。``max_size`` 是「evidence 是
+    # 小文件」的防禦性上界：abandon／retire-delivered 的 body 欄位固定，4096 綽
+    # 綽有餘；#519 的 reclaim-reset body 則隨被赦免的世代數線性成長，沿用 4096
+    # 會讓「世代夠多時，byte-for-byte 相同的重放被誤判成 conflict」——冪等重入
+    # 因此必然 fail。上界逐 caller 指定，判準其餘部分完全共用。
     try:
         metadata = target.stat()
         conflict = (
             target.is_symlink()
             or not target.is_file()
             or metadata.st_size != len(content)
-            or metadata.st_size > 4096
+            or metadata.st_size > max_size
             or metadata.st_mode & 0o222
             or target.read_bytes() != content
         )
@@ -2087,6 +2091,7 @@ def _write_supersede_evidence(
     subdir: str,
     stem: str | None = None,
     label: str = "abandon",
+    max_size: int = 4096,
 ) -> dict[str, str]:
     """Durable, content-addressed supersede-evidence writer shared by the
     ``work-abandon`` and ``work-retire-delivered`` paths (create-with-O_EXCL +
@@ -2107,7 +2112,7 @@ def _write_supersede_evidence(
         json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     if target.exists():
-        _validate_abandon_evidence_target(target, content, label=label)
+        _validate_abandon_evidence_target(target, content, label=label, max_size=max_size)
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
         try:
@@ -2125,7 +2130,9 @@ def _write_supersede_evidence(
             try:
                 os.link(temporary, target)
             except FileExistsError:
-                _validate_abandon_evidence_target(target, content, label=label)
+                _validate_abandon_evidence_target(
+                    target, content, label=label, max_size=max_size
+                )
             else:
                 directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
                 try:
@@ -2181,6 +2188,10 @@ def _reclaim_reset_record(body: dict[str, Any], *, state_path: Path) -> dict[str
         subdir="work-reclaim-reset",
         stem=str(body["work_id"]),
         label="reclaim-reset",
+        # body 隨 cleared_run_ids 線性成長（每筆 run_id 約 40 bytes），共用 4096
+        # 會讓世代較多的重置一重放就誤判 conflict；放寬到 64KiB 仍是「小文件」
+        # 的防禦性上界，且 st_size != len(content) 才是真正的正確性判準。
+        max_size=65536,
     )
 
 

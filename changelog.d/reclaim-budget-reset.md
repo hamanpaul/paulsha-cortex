@@ -38,8 +38,10 @@ scope: coordinator
   `repo`／`work_id`／`actor`／`reason`／重置前的世代數與其 run_id 清單／
   `created_at`；canonical json hash 命名、create-with-O_EXCL + hardlink + fsync
   + 0444、內容衝突 raise，全部沿用 `_write_supersede_evidence()`（新增 `stem`／
-  `label` 參數以支援 work-item 級而非 run 級的記錄）。順序比照 `#275`：先寫
-  durable evidence 再改狀態。
+  `label`／`max_size` 參數：支援 work-item 級而非 run 級的記錄，並讓大小上界逐
+  caller 指定——本 body 隨被赦免世代數線性成長，沿用 abandon 的 4096 會讓長歷史
+  work item 的 byte-identical 重放被誤判成 conflict、冪等重入必然 fail）。順序
+  比照 `#275`：先寫 durable evidence 再改狀態。
 - **熔斷訊息指出下一步**：`semantic-reclaim-budget-exhausted` 結果新增
   `reclaim_budget_limit`／`superseded_run_ids`／`legal_next_steps`／
   `next_step_hint`（比照 `#218 AC3` 的 `legal_next_steps` 慣例），operator 不再
