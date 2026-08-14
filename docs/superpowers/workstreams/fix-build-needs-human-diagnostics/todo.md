@@ -35,6 +35,36 @@ resolved_model_chain: {'builder': {'executor': 'codex', 'model_id': 'gpt-5.6-lun
 修正都已生效（claim 成功、繼承前代 artifact、150 秒後未被自我 supersede、builder 正確解析到
 `codex/gpt-5.6-luna`）。build 階段這道無聲停滯是鏈路上的下一層。
 
+## 根因（2026-08-14 已定位）
+
+`manager_daemon.py:983-996` 的 workflow resume 迴圈：
+
+```python
+except Exception as exc:
+    _log_error(exc, context={"action": "resume-workflow", "work_id": ..., ...})
+    registry._manager_update_workflow_run(
+        workflow.run_id, facets=("needs_human",), gate_status="running",
+    )
+```
+
+`_log_error()`（`:1404`）只 `print` 到 stderr，而 stderr 由 `scripts/service-manager.sh:149`
+（`>>"$manager_log" 2>&1`）導向 `~/.agents/log/manager.log`——**不進 journal、不進 evidence、
+不進 run**。run 上只留一個沒有理由的 `needs_human`，於是 `cortex status`／`work show`／
+`tick`／`complete` 四個介面同時沉默。例外物件 `exc` 就在 except 區塊內，資訊一直在手上，
+只是沒有寫進 run。
+
+本次的實際失敗（log 中該行，時間與 `14:58:28 進入 build → 約兩分鐘後 needs_human` 吻合）：
+
+```
+2026-08-14T06:59:32Z manager_daemon error: ValueError: worktree target already exists
+  (action=resume-workflow work_id=fix-brainstorm-revalidation-diagnostics ...)
+```
+
+`seams.py:70-77` `ScriptWorktreeCreator.create()` 對已存在的 target fail-closed。殘留物由
+**前一代**（即被 `#524` 自我 supersede 的那一代）建立、run 死亡時未回收，新一代的
+`worktree-isolation` 卡因此必然撞上。`manager.py:2180` 註解已記載此失敗模式（`#339`
+冪等過濾），但那層防護只涵蓋 slice 重複 fanout，不涵蓋「前代 run 殘留 → 後代 run 開新 worktree」。
+
 ## Tasks
 
 - [ ] **`needs_human` 必須永遠伴隨結構化理由**：所有設置該 facet 的路徑都要同時寫入 evidence（或在 run 記錄 `needs_human_reason`），無理由不得設置
@@ -42,4 +72,6 @@ resolved_model_chain: {'builder': {'executor': 'codex', 'model_id': 'gpt-5.6-lun
 - [ ] **`cortex status` 應呈現 needs_human 的 workflow run**，而非只呈現 slice；目前 run 停在 build 卻不出現在任何清單中
 - [ ] **`cortex work show` 的 `next_actions` 在此情境需給出可行動作**，或明確說明「無可用動作，原因為 X」，而非回空陣列
 - [ ] **釐清語意**：若此狀態實為設計上的等待（例如等待某外部條件），應以不同於 `needs_human` 的 facet 表達，避免與「需要人工介入」混淆
-- [ ] **找出並修正本次的實際成因**：build 階段從 facets 空 → `needs_human` 的那兩分鐘內究竟發生什麼（worktree-isolation／tdd-red 卡未派工），需在 evidence 中可追溯
+- [ ] **前代殘留回收**：run 被 supersede／abandon 時應回收其 build worktree，或讓後代能安全接手既有 worktree——否則 `#524` 每觸發一次就在磁碟留一顆地雷給下一代踩（與 `#478` 互為表裡：一邊只刪目錄未清 registry，一邊撞到目錄就 fail-closed）
+- [ ] **`recover-pre-candidate` 應出現在此情境的 `next_actions`**：該動作正是為「回收 worktree 後重跑」設計，但 operator 無從得知它可用——有動作卻不呈現等同沒有
+- [ ] **附帶：log 路徑未 instance-scope**：`scripts/service-manager.sh:135-136` 硬編 `$HOME/.agents/log/manager.log`，多 instance 錯誤交錯寫入同一檔案；與 `#518` 屬同一類 isolation 破口，修哪一邊需先裁定歸屬
