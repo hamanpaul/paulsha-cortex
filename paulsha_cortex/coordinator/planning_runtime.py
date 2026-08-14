@@ -335,7 +335,17 @@ def _extract_json(stdout: str, output_path: Path) -> object:
             detail = fallback_snippet if fallback_snippet is not None else "<no string field>"
             raise ValueError(f"planning launcher result is not JSON: {detail}")
         return value
-    raise ValueError("planning launcher returned no JSON object")
+    # 2026-08-14 實測：agy 服務暫時性 503 時**印錯誤文字但 exit 0**
+    # （`Error: Eligibility check failed: UNAVAILABLE (code 503)`），launcher
+    # 因此走到這裡。修法前這行不帶任何 stdout 內容，錯誤文字隨 temp_dir 一起
+    # 被丟棄——operator 只看得到「no JSON object」，診斷得靠手動重現。帶上
+    # 截斷片段後：(1) 503 當場可見；(2) 上游 `_is_planning_transient_service_failure`
+    # 能據此把分類從 `content` 改判 `environment`，recover-planning 才有路。
+    snippet = next(
+        (candidate[:160] for candidate in candidates if candidate),
+        "<empty output>",
+    )
+    raise ValueError(f"planning launcher returned no JSON object: {snippet}")
 
 
 def _seed_hermetic_claude_env(temp_dir: str) -> dict[str, str] | None:
