@@ -17,8 +17,8 @@ WORK_ACTIONS = frozenset(
     {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "abandon", "retire-delivered", "auto", "ship",
-        "review-attest", "intake",
+        "recover-repair-commit", "abandon", "retire-delivered",
+        "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -177,6 +177,27 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
             ):
                 raise ValueError(f"work-action {action} requires exact expected_run_id")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError(f"work-action {action} requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError(f"work-action {action} requires bounded reason")
+        if action == "reset-reclaim-budget":
+            # issue #519：明示重置 semantic-reclaim 世代熔斷。actor／reason 的
+            # 界限與 abandon／retire-delivered 完全一致（同樣是「一個人明示解
+            # 除一道安全機制」）；差別只在不要 expected_run_id——熔斷觸發的前
+            # 提就是沒有 active run 可供 CAS。
+            actor = args.get("actor")
+            reason = args.get("reason")
             if (
                 not isinstance(actor, str)
                 or actor != actor.strip()
