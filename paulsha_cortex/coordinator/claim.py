@@ -450,6 +450,28 @@ def _authority_from_row(
     )
 
 
+def _auto_label_from_observations(github: dict, issues: list[int]) -> bool:
+    """由 github provider 的 observations 判定 work item 是否掛 auto 派工 label。
+
+    來源：`monitor/providers.py` 的 `GitHubWorkProvider` 把持有 AUTO_LABEL 的
+    open issue 編號寫進 `observations["auto_label_issues"]`（issues 回應本來就含
+    labels，鏡像判定零額外 API）。缺失／形狀不合 → 保守 `False`。
+    """
+
+    observations = github.get("observations")
+    if not isinstance(observations, dict):
+        return False
+    raw = observations.get("auto_label_issues")
+    if not isinstance(raw, list):
+        return False
+    labeled: set[int] = set()
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+        labeled.add(value)
+    return any(number in labeled for number in issues)
+
+
 def _authority_from_canonical_row(
     *,
     row: dict,
@@ -748,7 +770,12 @@ def _authority_from_canonical_row(
         mapped_openspec=tuple(sorted(set(changes))),
         mapped_todo_paths=tuple(sorted(set(todo_paths))),
         confirmed_todo=confirmed_todo,
-        auto_label=False,
+        # R0.5 D1：auto label 改由 monitor 鏡像判定（GitHubWorkProvider 把持有
+        # `cortex:auto-on-going` 的 open issue 編號寫進 provider observations），
+        # 取代先前 canonical 路徑硬編 False＋manager 每 tick 逐 issue live 讀取。
+        # observations 缺失或形狀不合一律保守 False——auto 派工少跑一輪無害，
+        # 誤跑才有害；且 auto-claim 在真正 claim 前仍會做一次 targeted 複驗。
+        auto_label=_auto_label_from_observations(github, issues),
         source_revisions=source_revisions,
         provider_revision=revision,
         provider_id=provider_id,

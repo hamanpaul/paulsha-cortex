@@ -2115,10 +2115,13 @@ def test_periodic_auto_scan_reads_every_issue_and_any_label_claims(tmp_path: Pat
 
 
 def test_periodic_auto_scan_fails_closed_if_any_mapped_issue_read_fails(tmp_path: Path) -> None:
+    # R0.5 D1 語意更新：targeted 複驗在**第一次確認 label** 後即停（early-break），
+    # 之後的 issue 不再讀取——fail-closed 適用於「確認前」的讀取失敗。
+    # 故本測試讓第一個 mapped issue（12）讀取失敗：複驗尚無任何確認 → 整體 blocked。
     snapshot = _snapshot(tmp_path / "snapshot.json", issues=(12, 13))
 
     def runner(argv, **kwargs):
-        if argv[-1].endswith("/13"):
+        if argv[-1].endswith("/12"):
             return SimpleNamespace(returncode=1, stdout="", stderr="boom")
         return SimpleNamespace(
             returncode=0,
