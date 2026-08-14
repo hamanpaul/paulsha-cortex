@@ -23,11 +23,46 @@ BRAINSTORM_EVIDENCE_SCHEMA_VERSION = 1
 _STANDALONE_MARKERS = frozenset({"tbd", "[tbd]", "decision: tbd", "決策：未定"})
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _LIST_ITEM_RE = re.compile(r"^(?:[-+*]|\d+[.)])\s+(\S.*)$")
-_REQUIRED_HEADINGS = {
-    "spec": frozenset({"requirements", "requirement", "problem", "problem and outcome", "goals"}),
-    "design": frozenset({"decisions", "decision", "design", "architecture"}),
-    "plan": frozenset({"task", "tasks"}),
+# issue #520：驗收判準與 integrator prompt 的標題要求過去是兩份各自維護的真實來源，
+# 已因不同步造成兩次確定性失敗。這裡是唯一真檔：`_ACCEPTED_HEADINGS` 依「首選在前」
+# 排序（給 prompt 用的顯示形），`_REQUIRED_HEADINGS` 由它 casefold 派生（給驗收用），
+# prompt 文字則由 `required_heading_hint()` 機械產生，不得在 prompt 端另寫一份。
+_ACCEPTED_HEADINGS: dict[str, tuple[str, ...]] = {
+    "spec": ("Requirements", "Requirement", "Problem", "Problem and Outcome", "Goals"),
+    "design": ("Decisions", "Decision", "Design", "Architecture"),
+    "plan": ("Tasks", "Task"),
 }
+_REQUIRED_HEADINGS = {
+    kind: frozenset(title.casefold() for title in titles)
+    for kind, titles in _ACCEPTED_HEADINGS.items()
+}
+
+
+def required_heading_hint() -> str:
+    """回傳 integrator prompt 用的必要標題說明（由上面的判準常數機械產生）。
+
+    issue #520：舊 prompt 手寫「required headings: Requirements for spec, Decisions
+    for design, Tasks for plan」，原意是逐 kind 對應，字面卻同樣可讀成「必要標題就是
+    `Requirements for spec`」。模型採了後者、產出 `## Requirements for spec`，而
+    `_has_required_heading()` 是 casefold 後**完全相等**比對（`_headings_and_markers()`
+    的正規化只剝編號前綴，不剝 ` for spec` 尾綴），於是必然 `required-section-missing`。
+    此處逐 kind 給出精確標題、明確禁止附加 kind 名稱，並揭露完整可接受集合，讓模型有
+    合法替代選項而非單點命中。
+    """
+    preferred = ", ".join(
+        f'exactly "## {_ACCEPTED_HEADINGS[kind][0]}" for kind={kind}' for kind in PLANNING_KINDS
+    )
+    forbidden = ", ".join(f'"for {kind}"' for kind in PLANNING_KINDS)
+    alternatives = "; ".join(
+        f"{kind}: {', '.join(_ACCEPTED_HEADINGS[kind])}" for kind in PLANNING_KINDS
+    )
+    return (
+        "The required heading depends on the artifact kind: use "
+        f"{preferred}. The heading text is that word alone; do not append the kind name or "
+        f"any other suffix such as {forbidden} to it. Heading text is matched "
+        "case-insensitively against a fixed set, so any one of these is also accepted — "
+        f"{alternatives}."
+    )
 
 
 def _canonical_json(payload: object) -> str:

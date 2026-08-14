@@ -8,6 +8,19 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #520：必要標題要求改由驗收判準機械產生，消除雙讀法**——integrator
+  prompt 舊句「required headings: Requirements for spec, Decisions for design,
+  Tasks for plan」原意是逐 kind 對應，字面卻同樣可讀成「必要標題是
+  `Requirements for spec`」。planner 採了後者、產出 `## Requirements for spec`，
+  而 `_has_required_heading()` 是 casefold 後完全相等比對（標題正規化只剝編號
+  前綴、不剝 ` for spec` 尾綴），因此必然 `required-section-missing`，Phase 1
+  派工死鎖。修法採 `#520` 建議 4：`planning.py` 的 `_ACCEPTED_HEADINGS` 成為唯一
+  真檔，`_REQUIRED_HEADINGS` 由它 casefold 派生（判準值一字未改），新增純函式
+  `required_heading_hint()` 機械產生 prompt 文字，`planning_runtime.py` 直接呼叫
+  ——prompt 端不再持有第二份真實來源（判準與 prompt 不同步已造成 `#516`／`#520`
+  兩次確定性失敗）。產生的文字逐 kind 給精確標題、明確禁止附加 kind 名稱，並揭露
+  完整可接受集合。validator 邏輯與判準內容不動。
+  詳見 `changelog.d/planning-heading-prompt.md`。
 - **Issue #516：integrator prompt 補上兩個 echo-back 欄位的值來源**——
   `_validate_primary_integration()` 要求 integrator 輸出的 `question_pack_id`
   與 `secondary_evidence_hash` 與輸入完全相符，兩個值也都已在模型輸入裡
