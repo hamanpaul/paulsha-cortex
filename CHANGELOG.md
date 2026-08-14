@@ -18,6 +18,9 @@
   phase filter 納入 `define`；stalled define run 每 tick 由 `resume_workflow_run` 接手
   （其本已支援 define：reconcile planning transaction → dispatch planner 卡）。
   needs_human 縱深防禦守衛不變。
+- **#518 workstream todo scope 修正**——初版誤把 installer 已具備的 config-root 派生當成
+  待實作項；收斂為 legacy env 遷移＋exact-project workspace 語意＋doctor 共用 root 告警。
+  舊世代 run 已結算，此為換代邊界的 todo 修正。
 - **planner launcher 暫時性服務失敗被判 `content` 死路**——agy 暫時性 503 會印錯誤文字但
   exit 0，launcher parse 不到 JSON 即以 `content` 分類收場，而 `content` 禁用
   recover-planning：自癒型服務錯誤變永久死路。修法：`_extract_json` no-JSON 失敗帶 stdout
