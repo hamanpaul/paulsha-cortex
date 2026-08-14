@@ -3868,6 +3868,301 @@ def test_planning_artifact_publish_replaces_only_exact_baseline_and_rolls_back_g
     assert not (tmp_path / plan_ref).exists()
 
 
+# --- issue #511：planning artifact 拒收的診斷面 -------------------------------
+#
+# 修法前 `_publish_planning_artifacts` 只用 `assess_planning_artifact(...).accepted`
+# 的布林值，`reasons`／`blocking_markers` 全被丟棄，被拒的內容又只活在 planning
+# launcher 的 `TemporaryDirectory` 裡（`planning_runtime.py` 的 `last.json`），
+# context 結束即刪除——operator 只看得到 `planning artifact is not accepted: <path>`，
+# 無從得知是哪一條驗收條件不過、planner 到底寫了什麼，只能盲目重試（實測
+# abandon→重新 claim→同樣失敗，四次全同）。下列測試鎖住兩件事：
+#   A. 拒收原因（與 blocking markers 的行號／文字）進錯誤訊息
+#   B. 被拒 artifact 的完整內容落 `cortex-planning-artifact-rejection/v1` evidence
+_REJECTION_SPEC_REF = "docs/superpowers/specs/production-wiring-spec.md"
+_REJECTION_ALLOWED_REFS = ("docs/superpowers/specs/*production-wiring*-spec.md",)
+
+
+def _publish_rejected_spec(root: Path, content: str, *, coordinator_root: Path | None = None):
+    return manager._publish_planning_artifacts(
+        str(root),
+        [{"kind": "spec", "path": _REJECTION_SPEC_REF, "content": content}],
+        work_id="production-wiring",
+        allowed_refs=_REJECTION_ALLOWED_REFS,
+        coordinator_root=coordinator_root,
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_reason"),
+    [
+        # frontmatter 沒有 `status: accepted`
+        (
+            "---\nstatus: draft\n---\n# Spec\n## Requirements\nBound.\n",
+            "status-not-accepted",
+        ),
+        # 有 accepted 但缺 spec 必備英文標題（Requirements／Problem／Goals）
+        (
+            "---\nstatus: accepted\n---\n# Spec\n## Notes\nBound.\n",
+            "required-section-missing",
+        ),
+        # Open Questions 章節下的清單項目 → blocking marker
+        (
+            "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n"
+            "## Open Questions\n- 這條要不要收斂到 v2？\n",
+            "blocking-decision",
+        ),
+    ],
+)
+def test_planning_artifact_rejection_message_carries_assessment_reasons(
+    tmp_path: Path, content: str, expected_reason: str
+) -> None:
+    """issue #511 A：三種 `ArtifactAssessment.reasons` 都必須出現在錯誤訊息裡。"""
+
+    with pytest.raises(ValueError) as excinfo:
+        _publish_rejected_spec(tmp_path, content)
+
+    message = str(excinfo.value)
+    assert message.startswith(f"planning artifact is not accepted: {_REJECTION_SPEC_REF}")
+    assert f"reasons={expected_reason}" in message
+
+
+def test_planning_artifact_rejection_message_carries_blocking_marker_lines(
+    tmp_path: Path,
+) -> None:
+    """issue #511 A：`blocking-decision` 必須附上 markers 的行號與文字，
+    operator 才知道 planner 卡在哪一條未決問題。"""
+
+    content = (
+        "---\n"           # L1
+        "status: accepted\n"  # L2
+        "---\n"           # L3
+        "# Spec\n"        # L4
+        "## Requirements\n"   # L5
+        "Bound.\n"        # L6
+        "## Open Questions\n"  # L7
+        "- 誰負責 schema 遷移？\n"  # L8
+        "- 是否沿用既有 evidence 目錄？\n"  # L9
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _publish_rejected_spec(tmp_path, content)
+
+    message = str(excinfo.value)
+    assert "markers=" in message
+    assert "L8:誰負責 schema 遷移？" in message
+    assert "L9:是否沿用既有 evidence 目錄？" in message
+
+
+def test_planning_artifact_rejection_message_stays_single_line_and_bounded(
+    tmp_path: Path,
+) -> None:
+    """issue #511 A：訊息會被 `run_heterogeneous_brainstorm` 包進 needs_human 的
+    reason、再原樣落進 `cortex-planning-failure/v1` evidence 的 `reason` 欄位，
+    而 `work_actions`／`control.contract` 對 `failure_reason` 都拒收換行；長度
+    也必須有上限保護（比照 `manager_daemon.TICK_ERROR_REASON_MAX_LENGTH`）。"""
+
+    questions = "".join(f"- 第 {index} 條未決問題：{'長' * 120}\n" for index in range(40))
+    content = (
+        "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n"
+        f"## Open Questions\n{questions}"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _publish_rejected_spec(tmp_path, content)
+
+    message = str(excinfo.value)
+    assert "\n" not in message and "\r" not in message
+    assert len(message) <= manager.PLANNING_ARTIFACT_REJECTION_MESSAGE_MAX_LENGTH
+    # 上限保護不得吃掉最關鍵的診斷欄位：reasons 必須在截斷後仍看得到。
+    assert "reasons=blocking-decision" in message
+
+
+def test_planning_artifact_rejection_records_full_content_evidence(tmp_path: Path) -> None:
+    """issue #511 B：被拒 artifact 的 kind／path／完整 content／reasons／markers
+    必須落 evidence，operator 才能直接開檔看 planner 寫了什麼——修法前這份內容
+    只存在於 planning launcher 的 TemporaryDirectory，沒有任何副本留存。"""
+
+    coordinator_root = tmp_path / "coordinator"
+    artifact_root = tmp_path / "worktree"
+    content = (
+        "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n"
+        "## Open Questions\n- 要不要換 schema？\n"
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _publish_rejected_spec(artifact_root, content, coordinator_root=coordinator_root)
+
+    evidence_dir = coordinator_root / "evidence" / "planning-artifacts"
+    evidence_paths = sorted(evidence_dir.glob("*.json"))
+    assert len(evidence_paths) == 1, f"目錄內容：{list(evidence_dir.glob('*'))}"
+    body = json.loads(evidence_paths[0].read_text(encoding="utf-8"))
+    assert body["schema"] == "cortex-planning-artifact-rejection/v1"
+    assert body["work_id"] == "production-wiring"
+    assert body["kind"] == "spec"
+    assert body["path"] == _REJECTION_SPEC_REF
+    assert body["content"] == content
+    assert body["content_length"] == len(content)
+    assert body["truncated"] is False
+    assert body["reasons"] == ["blocking-decision"]
+    assert body["markers"] == [
+        {"kind": "open-question", "line": 8, "text": "要不要換 schema？"}
+    ]
+    assert isinstance(body.get("created_at"), str) and body["created_at"]
+    # evidence 落在 coordinator_root 底下，不得污染被監控的 artifact worktree。
+    assert not (artifact_root / "evidence").exists()
+    # 錯誤訊息要指向該檔，operator 不必自己猜路徑。
+    assert f"evidence={evidence_paths[0]}" in str(excinfo.value)
+
+
+def test_planning_artifact_rejection_evidence_truncates_oversized_content(
+    tmp_path: Path,
+) -> None:
+    """issue #511 B：artifact 可能很大，evidence 內容須設上限；超過時截斷並標記
+    `truncated: true` 與原始長度，避免 evidence 檔爆量。"""
+
+    coordinator_root = tmp_path / "coordinator"
+    limit = manager.PLANNING_ARTIFACT_REJECTION_CONTENT_MAX_CHARS
+    filler = "x" * (limit + 4096)
+    content = f"---\nstatus: draft\n---\n# Spec\n## Requirements\n{filler}\n"
+
+    with pytest.raises(ValueError):
+        _publish_rejected_spec(tmp_path / "worktree", content, coordinator_root=coordinator_root)
+
+    body = json.loads(
+        sorted((coordinator_root / "evidence" / "planning-artifacts").glob("*.json"))[0]
+        .read_text(encoding="utf-8")
+    )
+    assert body["truncated"] is True
+    assert body["content_length"] == len(content)
+    assert len(body["content"]) == limit
+    assert body["content"] == content[:limit]
+
+
+def test_planning_artifact_rejection_without_coordinator_root_still_reports_reasons(
+    tmp_path: Path,
+) -> None:
+    """未帶 `coordinator_root`（既有直呼叫端與測試）時不得落檔、也不得爆炸：
+    仍照舊 raise，只是訊息不帶 `evidence=`。"""
+
+    with pytest.raises(ValueError) as excinfo:
+        _publish_rejected_spec(tmp_path, "---\nstatus: draft\n---\n# Spec\n## Requirements\nBound.\n")
+
+    message = str(excinfo.value)
+    assert "reasons=status-not-accepted" in message
+    assert "evidence=" not in message
+    assert not (tmp_path / "evidence").exists()
+
+
+def test_planning_artifact_rejection_evidence_write_failure_does_not_mask_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """evidence 記錄本身 fail-open（比照 `_record_planning_failure_evidence`）：
+    落檔失敗只留 log，拒收本身仍照舊 raise，不得把真正的拒收原因換成 IO 錯誤。"""
+
+    def exploding_writer(**_kwargs):
+        raise OSError("evidence volume full")
+
+    monkeypatch.setattr(manager, "_write_planning_artifact_rejection_evidence", exploding_writer)
+
+    with pytest.raises(ValueError) as excinfo:
+        _publish_rejected_spec(
+            tmp_path / "worktree",
+            "---\nstatus: draft\n---\n# Spec\n## Requirements\nBound.\n",
+            coordinator_root=tmp_path / "coordinator",
+        )
+
+    assert "reasons=status-not-accepted" in str(excinfo.value)
+    assert "evidence volume full" not in str(excinfo.value)
+
+
+def test_planning_artifact_publish_accepts_valid_artifact_without_rejection_evidence(
+    tmp_path: Path,
+) -> None:
+    """回歸樁：成功路徑不得因為 #511 的診斷落檔而多寫任何 evidence。"""
+
+    coordinator_root = tmp_path / "coordinator"
+    artifact_root = tmp_path / "worktree"
+    rollback = _publish_rejected_spec(
+        artifact_root,
+        "---\nstatus: accepted\n---\n# Spec\n## Requirements\nBound.\n",
+        coordinator_root=coordinator_root,
+    )
+
+    assert (artifact_root / _REJECTION_SPEC_REF).is_file()
+    assert not (coordinator_root / "evidence" / "planning-artifacts").exists()
+    rollback()
+
+
+def test_define_wires_coordinator_root_into_planning_artifact_rejection_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #511 端到端接線：`apply_workflow_action` 的 define 路徑把
+    `artifact_writer` 綁在被監控的 worktree 上，evidence 必須改落
+    `transaction_root`（coordinator_root）——否則 #507 的 planning 失敗清樹會
+    連同這份診斷一起抹掉，等於白記。"""
+
+    coordinator_root = tmp_path / "coordinator"
+    coordinator_root.mkdir()
+    registry = JobRegistry(state_path=tmp_path / "registry.json")
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
+    args = _workflow_args(manifest_path, tmp_path)
+    identities = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "gpt-primary",
+                "independence_domain": "openai", "capabilities": ["planning"],
+            }
+        ]
+    )
+    rejected_content = "---\nstatus: draft\n---\n# Plan\n## Task 1\nBuild.\n"
+
+    def brainstorm_through_writer(**kwargs):
+        try:
+            kwargs["artifact_writer"](
+                [
+                    {
+                        "kind": "plan",
+                        "path": "docs/superpowers/plans/production-wiring.md",
+                        "content": rejected_content,
+                    }
+                ]
+            )
+        except ValueError as exc:
+            return BrainstormResult(
+                state="needs_human",
+                reason=f"primary-artifact-write-rejected: ValueError: {str(exc)[:160]}",
+                secondary_domain=None,
+                gate_refs=PlanningGateRefs(),
+            )
+        raise AssertionError("artifact_writer 應該拒收未 accepted 的 plan")
+
+    monkeypatch.setattr(manager, "run_heterogeneous_brainstorm", brainstorm_through_writer)
+
+    result = manager.apply_workflow_action(
+        registry,
+        args=args,
+        identity_registry=identities,
+        primary_questioner=lambda *a, **k: None,
+        secondary_planner=lambda *a, **k: None,
+        primary_integrator=lambda *a, **k: None,
+        coordinator_root=coordinator_root,
+    )
+
+    persisted = registry.get_workflow_run(result["run_id"])
+    assert persisted.facets == ("needs_human",)
+    assert "reasons=status-not-accepted" in result["reason"]
+    evidence_paths = sorted(
+        (coordinator_root / "evidence" / "planning-artifacts").glob(f"{persisted.run_id}-*.json")
+    )
+    assert len(evidence_paths) == 1
+    body = json.loads(evidence_paths[0].read_text(encoding="utf-8"))
+    assert body["run_id"] == persisted.run_id
+    assert body["content"] == rejected_content
+    assert not (tmp_path / "evidence" / "planning-artifacts").exists()
+
+
 def test_verify_terminal_evidence_cannot_substitute_for_declared_report(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "registry.json")
     log = tmp_path / "verify.jsonl"

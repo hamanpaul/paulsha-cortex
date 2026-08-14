@@ -8,6 +8,19 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #511（診斷面，前兩項）：planning artifact 被拒時的原因與內容可觀測**——
+  `manager._publish_planning_artifacts()` 過去只取 `assess_planning_artifact()`
+  的布林值，`reasons`／`blocking_markers` 全被丟棄，被拒內容又只活在 planning
+  launcher 的 `TemporaryDirectory` 而無副本留存，operator 只看得到一句「不被接受」，
+  只能盲目重試。現在 (1) 拒收訊息帶上
+  `(reasons=...; markers=Lnn:...; evidence=...)`，保證單行且長度受限
+  （`PLANNING_ARTIFACT_REJECTION_MESSAGE_MAX_LENGTH = 400`），並另落一筆
+  `planning-artifact-rejected` log；(2) 被拒 artifact 的 `kind`／`path`／完整
+  `content`／`reasons`／`markers` 落 `cortex-planning-artifact-rejection/v1`
+  evidence 至 `<coordinator_root>/evidence/planning-artifacts/`（內容上限 64K
+  字元，超過標記 `truncated`），evidence 記錄本身 fail-open。落點刻意避開被
+  cortex daemon 監控的 `artifact_root`（#507 會抹樹還原）。
+  詳見 `changelog.d/artifact-rejection-diagnostics.md`。
 - **Issue #506（部分實作）：Monitor GitHub 掃描 burst 減壓**——新增
   `paulsha_cortex/monitor/github_pressure.py` 的 `GitHubPressureGate`：
   (1) 每次 `gh` 請求前插入可設定的間隔＋jitter，把一輪數百次請求攤平而非齊發

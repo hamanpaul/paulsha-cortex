@@ -47,6 +47,7 @@ from .model_identities import (
 )
 from .planning import (
     ACCEPTANCE_SURFACE_RULES,
+    ArtifactAssessment,
     PlanningArtifact,
     PlanningScope,
     assess_planning_artifact,
@@ -5965,6 +5966,176 @@ def _is_planning_authority_residue_failure(reason: str | None) -> bool:
     )
 
 
+# --- issue #511：planning artifact 拒收的診斷面 -------------------------------
+#
+# 修法前拒收只丟一句 `planning artifact is not accepted: <path>`：
+# `assess_planning_artifact` 算出來的 `reasons`（status-not-accepted／
+# required-section-missing／blocking-decision）與 `blocking_markers`（行號＋文字）
+# 全被布林化丟棄，被拒的 artifact 內容又只活在 planning launcher 的
+# `TemporaryDirectory`（`planning_runtime.py` 的 `last.json`），context 一結束就
+# 沒了。operator 因此完全看不到 planner 寫了什麼、卡在哪一條驗收條件，只能盲目
+# 重試（實測 abandon→重新 claim→同樣失敗，四次全同）。下面補兩件事：
+#   A. reasons／markers 進錯誤訊息（單行、有長度上限）
+#   B. 完整內容落 `cortex-planning-artifact-rejection/v1` evidence
+PLANNING_ARTIFACT_REJECTION_SCHEMA = "cortex-planning-artifact-rejection/v1"
+# 目錄與既有的 `planning-recovery`（`cortex-planning-failure/v1`）並列於
+# `<coordinator_root>/evidence/` 下，刻意不混進同一個目錄——`work_actions.
+# _read_planning_failure_record` 用 `path.parent.name == "planning-recovery"`
+# 當作 recover-planning 的收容判準，塞進去會讓它多出一筆「無法解析」的候選、
+# 撞上 `planning failure evidence ambiguous` 的 fail-closed。
+PLANNING_ARTIFACT_REJECTION_DIRNAME = "planning-artifacts"
+# 訊息上限：比照 `manager_daemon.TICK_ERROR_REASON_MAX_LENGTH = 200` 的作法
+# （截斷後補 `…`），但這裡放寬到 400——本訊息除了 reason 本身還要塞下 artifact
+# 路徑、markers 與 evidence 絕對路徑，200 會把 markers 整段吃掉。上游
+# `run_heterogeneous_brainstorm` 對 artifact-write 例外另有 `str(exc)[:160]`
+# 的截斷（planning.py），故欄位順序刻意排成 reasons → markers → evidence：
+# 最關鍵、最短的 reasons 先寫，即使被上游截斷也還看得到；完整訊息則同時以
+# `logger.error` 落 log，evidence 檔本身也在固定目錄用 run_id 可查。
+PLANNING_ARTIFACT_REJECTION_MESSAGE_MAX_LENGTH = 400
+# 單一 marker 文字的顯示上限：未決問題常是整句 zh-tw 敘述，不設限的話兩三條就
+# 把整則訊息吃滿；完整文字一律以 evidence 為準，訊息只負責指路。
+_PLANNING_ARTIFACT_REJECTION_MARKER_TEXT_MAX_LENGTH = 48
+# 訊息裡最多列幾條 marker（其餘以 `+N` 帶過），理由同上。
+_PLANNING_ARTIFACT_REJECTION_MESSAGE_MARKER_LIMIT = 3
+# evidence 內容上限（字元數）：planning artifact 是 markdown 文件，正常只有數 KB；
+# 64K 足以完整收下真實案例，又能擋住失控輸出把 evidence 目錄灌爆。超過時截斷並
+# 標記 `truncated: true` 與原始長度 `content_length`。
+PLANNING_ARTIFACT_REJECTION_CONTENT_MAX_CHARS = 64_000
+
+
+def _single_line(text: str) -> str:
+    """把任意文字壓成單行：evidence 的 `reason` 欄位與 `recover-planning` 的
+    `failure_reason` 都明確拒收換行（見 `work_actions`／`control.contract` 對
+    `"\\n" in failure_reason` 的檢查），故拒收訊息不得帶任何換行或定位字元。"""
+
+    return " ".join(text.split())
+
+
+def _planning_artifact_rejection_message(
+    assessment: ArtifactAssessment, *, evidence_ref: str | None
+) -> str:
+    """組出單行、有長度上限的拒收訊息（issue #511 A）。
+
+    格式：``planning artifact is not accepted: <path> (reasons=...; markers=Lnn:...; evidence=...)``
+    ——`planning artifact is not accepted: ` 前綴與路徑必須保持在最前面，既有
+    測試與 operator 的 grep 習慣都以它為錨點。
+    """
+
+    details: list[str] = [f"reasons={','.join(assessment.reasons)}"]
+    markers = assessment.blocking_markers
+    if markers:
+        shown = markers[:_PLANNING_ARTIFACT_REJECTION_MESSAGE_MARKER_LIMIT]
+        rendered = [
+            f"L{marker.line}:"
+            + _single_line(marker.text)[:_PLANNING_ARTIFACT_REJECTION_MARKER_TEXT_MAX_LENGTH]
+            for marker in shown
+        ]
+        if len(markers) > len(shown):
+            rendered.append(f"+{len(markers) - len(shown)}")
+        details.append("markers=" + ", ".join(rendered))
+    if evidence_ref is not None:
+        details.append(f"evidence={evidence_ref}")
+    message = _single_line(
+        f"planning artifact is not accepted: {assessment.artifact.ref} ({'; '.join(details)})"
+    )
+    if len(message) > PLANNING_ARTIFACT_REJECTION_MESSAGE_MAX_LENGTH:
+        message = message[:PLANNING_ARTIFACT_REJECTION_MESSAGE_MAX_LENGTH].rstrip() + "…"
+    return message
+
+
+def _write_planning_artifact_rejection_evidence(
+    *,
+    coordinator_root: Path,
+    run_id: str,
+    work_id: str,
+    assessment: ArtifactAssessment,
+) -> str:
+    """把被拒 artifact 的完整內容落 evidence（issue #511 B）。
+
+    原子寫入手法與檔名慣例（canonical json hash、`{run_id}-{digest}.json`、
+    tmp→fsync→rename→0400、內容衝突 raise）一律比照
+    `_write_planning_failure_evidence`／`work_actions._recover_planning_record`，
+    不另創風格。
+    """
+
+    content = assessment.artifact.text
+    truncated = len(content) > PLANNING_ARTIFACT_REJECTION_CONTENT_MAX_CHARS
+    body = {
+        "schema": PLANNING_ARTIFACT_REJECTION_SCHEMA,
+        "run_id": run_id,
+        "work_id": work_id,
+        "kind": assessment.artifact.kind,
+        "path": assessment.artifact.ref,
+        "reasons": list(assessment.reasons),
+        "markers": [
+            {"kind": marker.kind, "line": marker.line, "text": marker.text}
+            for marker in assessment.blocking_markers
+        ],
+        "content": content[:PLANNING_ARTIFACT_REJECTION_CONTENT_MAX_CHARS] if truncated else content,
+        "content_length": len(content),
+        "truncated": truncated,
+        "created_at": _utcnow(),
+    }
+    digest = verification.canonical_json_hash(body)
+    directory = coordinator_root.resolve() / "evidence" / PLANNING_ARTIFACT_REJECTION_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{run_id}-{digest}.json"
+    payload = (json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if target.exists():
+        if target.is_symlink() or target.read_bytes() != payload:
+            raise RuntimeError("planning artifact rejection evidence conflict")
+        return str(target)
+    temporary = directory / f".{target.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        target.chmod(0o400)
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return str(target)
+
+
+def _record_planning_artifact_rejection_evidence(
+    *,
+    coordinator_root: Path | None,
+    run_id: str,
+    work_id: str,
+    assessment: ArtifactAssessment,
+) -> str | None:
+    """呼叫端 wrapper：evidence 記錄本身 fail-open，比照
+    `_record_planning_failure_evidence`——記不下診斷不得掩蓋真正的拒收原因，
+    否則 operator 拿到的會是 IO 錯誤而不是「artifact 為何不被接受」。
+    未帶 `coordinator_root`（既有直呼叫端／測試）時直接不落檔。
+    """
+
+    if coordinator_root is None:
+        return None
+    try:
+        return _write_planning_artifact_rejection_evidence(
+            coordinator_root=Path(coordinator_root),
+            run_id=run_id,
+            work_id=work_id,
+            assessment=assessment,
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence 記錄本身 fail-open
+        logger.error(
+            "planning-artifact-rejection-evidence-write-failed run_id=%s path=%s error=%s: %s",
+            run_id,
+            assessment.artifact.ref,
+            type(exc).__name__,
+            str(exc)[:200],
+        )
+        return None
+
+
 def _publish_planning_artifacts(
     root_value: str,
     rows: object,
@@ -5973,10 +6144,16 @@ def _publish_planning_artifacts(
     allowed_refs: tuple[str, ...],
     authorities: tuple[PlanningArtifactAuthority, ...] = (),
     transaction: _PlanningPublicationTransaction | None = None,
+    coordinator_root: str | Path | None = None,
 ) -> Callable[[], None]:
     if not isinstance(rows, list):
         raise ValueError("planning artifacts must be a list")
     root = Path(root_value).resolve()
+    # #511：拒收 evidence 的 run_id 沿用發佈交易的 run_id（define 路徑一定帶
+    # transaction），operator 才能用同一組 run_id 同時撈 planning-recovery 與
+    # planning-artifacts 兩份 evidence；沒有交易的直呼叫端沿用下方 ephemeral 交易
+    # 的同一個字面值，命名語意一致。
+    publication_run_id = transaction.run_id if transaction is not None else "ephemeral"
     authority_by_ref = {item.ref: item for item in authorities}
     if len(authority_by_ref) != len(authorities):
         raise ValueError("duplicate planning authority ref")
@@ -6019,8 +6196,27 @@ def _publish_planning_artifacts(
         path = unresolved.resolve()
         path.relative_to(root)
         artifact = PlanningArtifact(kind=str(row["kind"]), ref=path_value, text=content)
-        if not assess_planning_artifact(artifact).accepted:
-            raise ValueError(f"planning artifact is not accepted: {path_value}")
+        assessment = assess_planning_artifact(artifact)
+        if not assessment.accepted:
+            # #511：先落 evidence 再組訊息，好讓訊息帶得上 evidence 路徑。
+            evidence_ref = _record_planning_artifact_rejection_evidence(
+                coordinator_root=coordinator_root,
+                run_id=publication_run_id,
+                work_id=work_id,
+                assessment=assessment,
+            )
+            message = _planning_artifact_rejection_message(assessment, evidence_ref=evidence_ref)
+            # 上游 `run_heterogeneous_brainstorm` 會把本例外壓成
+            # `primary-artifact-write-rejected: ValueError: {str(exc)[:160]}`，
+            # evidence 路徑可能被截掉；完整訊息在此另落一筆 log（比照 #391 對
+            # needs_human reason 的處理），確保診斷至少有一條完整軌跡。
+            logger.error(
+                "planning-artifact-rejected run_id=%s work_id=%s %s",
+                publication_run_id,
+                work_id,
+                message,
+            )
+            raise ValueError(message)
         owner = authority_by_ref.get(path_value)
         baseline_hash: str | None = None
         if path.exists():
@@ -8803,6 +8999,11 @@ def apply_workflow_action(
             ),
             authorities=run.planning_authority,
             transaction=publication,
+            # #511：拒收 evidence 必須落在 coordinator_root，不能落在
+            # `artifact_root`——後者是被 cortex daemon 監控的 operator worktree，
+            # planning 失敗時會被整棵樹抹除再從 baseline 還原（#507），診斷會跟著
+            # 一起消失。與 `_record_planning_failure_evidence` 用同一個 root。
+            coordinator_root=transaction_root,
         ),
         evidence_writer=publication.write_evidence,
     )
