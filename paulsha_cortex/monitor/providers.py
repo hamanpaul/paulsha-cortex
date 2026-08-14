@@ -466,8 +466,18 @@ def _validate_canonical_coordinator_v2_root(payload: Mapping) -> list[dict[str, 
     migration path and violate the single-writer boundary.
     """
 
-    expected = {"schema_version", "seq", "jobs", "slices", "workflows", "legacy_records"}
-    if set(payload) != expected or payload.get("schema_version") != 2:
+    required = {"schema_version", "seq", "jobs", "slices", "workflows", "legacy_records"}
+    # #519：`reclaim_resets`（semantic-reclaim 熔斷的重置水位）是加法相容的可選
+    # 根欄位——寫入端不 bump schema_version，好讓本欄位出現前寫下的既有狀態檔照
+    # 常載入。Monitor 因此必須同時接受「有」與「沒有」兩種形狀；仍不接受任何其
+    # 他未知根欄位，維持既有的 fail-closed 嚴格度。
+    optional = {"reclaim_resets"}
+    keys = set(payload)
+    if (
+        not required <= keys
+        or not keys <= (required | optional)
+        or payload.get("schema_version") != 2
+    ):
         raise ValueError("canonical coordinator registry root keys are invalid")
     if (
         isinstance(payload.get("seq"), bool)
@@ -477,6 +487,7 @@ def _validate_canonical_coordinator_v2_root(payload: Mapping) -> list[dict[str, 
         or not isinstance(payload.get("slices"), list)
         or not isinstance(payload.get("workflows"), list)
         or not isinstance(payload.get("legacy_records"), Mapping)
+        or not isinstance(payload.get("reclaim_resets", []), list)
     ):
         raise ValueError("canonical coordinator registry root values are invalid")
     from paulsha_cortex.coordinator.workflow import WorkflowRun

@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -66,6 +67,11 @@ ShipExecutor = Callable[[dict[str, Any], object], dict[str, Any]]
 # last-known-good canonical GitHub authority (see the ``load_work_authority``
 # call in ``execute_work_action``). Every other action keeps fail-closed.
 _RETIREMENT_ACTIONS = frozenset({"abandon", "retire-delivered"})
+
+# #519：`reset-reclaim-budget` 與 retirement family 同屬「只動本機 coordinator
+# 狀態、不依賴 issue 當下 open/closed 的解卡動作」，適用同一條 rate-limit 容忍
+# 理由——系統被限流的當下，正是卡死的 work item 最需要被解開的時候。
+_LOCAL_UNBLOCK_ACTIONS = _RETIREMENT_ACTIONS | {"reset-reclaim-budget"}
 
 
 def _positive_int(value: object, *, field: str) -> int:
@@ -1323,6 +1329,31 @@ def _recoverable_maintainer_ship_stop(
     )
 
 
+def _effective_superseded_generations(workflow_registry, *, repo: str, work_id: str) -> list:
+    """#519：計入 semantic-reclaim 熔斷的 superseded 世代（扣掉已赦免者）。
+
+    `_claim_action` 的熔斷判定與 `reset-reclaim-budget` 動作共用同一支計數，
+    兩邊對「還剩幾代額度」的認知不可能分歧。registry 沒有
+    `reclaim_reset_cleared_run_ids`（舊版本或測試 double）時視為沒有任何赦免，
+    也就是維持熔斷最嚴格的既有行為——fail-closed 方向。
+    """
+
+    cleared_lookup = getattr(workflow_registry, "reclaim_reset_cleared_run_ids", None)
+    cleared = (
+        cleared_lookup(repo=repo, work_id=work_id)
+        if callable(cleared_lookup)
+        else frozenset()
+    )
+    return [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == repo
+        and run.work_id == work_id
+        and run.status == "superseded"
+        and run.run_id not in cleared
+    ]
+
+
 def _fallback_workflow_starter(workflow_registry, state_path: Path):
     """Test/embedding fallback; installed daemon supplies the production starter."""
 
@@ -1558,20 +1589,33 @@ def _claim_action(
         # 已累積 SEMANTIC_RECLAIM_LIMIT 個 superseded 世代（v1..v3）時，不得自動
         # 建立下一版 run（v4），強制 needs_human。計數以 registry 的 run 歷史為準
         # （跨 run_id，不受 active dict 換代歸零影響）。
+        # #519：計數改扣掉已被 `reset-reclaim-budget` 明示赦免的世代——熔斷原本
+        # 對全部歷史無條件累加且沒有任何重置路徑，根因（例如 #507／#511／#516
+        # 這些 cortex 自身缺陷）修好之後 work item 仍永久鎖死。
         if workflow_registry is not None:
-            superseded_generations = [
-                run
-                for run in workflow_registry.list_workflow_runs()
-                if run.repo == authority.repo
-                and run.work_id == authority.work_id
-                and run.status == "superseded"
-            ]
+            superseded_generations = _effective_superseded_generations(
+                workflow_registry, repo=authority.repo, work_id=authority.work_id
+            )
             if len(superseded_generations) >= SEMANTIC_RECLAIM_LIMIT:
                 return {
                     "action": "needs_human",
                     "reason": "semantic-reclaim-budget-exhausted",
                     "run": None,
                     "superseded_generations": len(superseded_generations),
+                    # #519：熔斷結果必須自帶下一步，否則 operator 只看到「額度
+                    # 用盡」而不知道有解（比照 #218 AC3 的 legal_next_steps 慣例）。
+                    "reclaim_budget_limit": SEMANTIC_RECLAIM_LIMIT,
+                    "superseded_run_ids": sorted(
+                        run.run_id for run in superseded_generations
+                    ),
+                    "legal_next_steps": ("reset-reclaim-budget",),
+                    "next_step_hint": (
+                        "世代熔斷已觸發；確認根因已排除後，以 "
+                        f"`cortex work reset-reclaim-budget {authority.work_id} "
+                        f"--repo {authority.repo} --actor <operator> --reason <單行理由>` "
+                        "明示重置額度（會留下 cortex-work-reclaim-reset/v1 稽核紀錄），"
+                        "再重新 start。"
+                    ),
                 }
         try:
             run = workflow_starter(authority, str(decision.claim_key), None)
@@ -2015,47 +2059,67 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
     }
 
 
-def _validate_abandon_evidence_target(target: Path, content: bytes) -> None:
+def _validate_abandon_evidence_target(
+    target: Path, content: bytes, *, label: str = "abandon", max_size: int = 4096
+) -> None:
+    # ``label`` 只影響錯誤訊息（#519 讓 reclaim-reset 說自己的名字），判準本身
+    # 對每一種 supersede-family evidence 完全一致。``max_size`` 是「evidence 是
+    # 小文件」的防禦性上界：abandon／retire-delivered 的 body 欄位固定，4096 綽
+    # 綽有餘；#519 的 reclaim-reset body 則隨被赦免的世代數線性成長，沿用 4096
+    # 會讓「世代夠多時，byte-for-byte 相同的重放被誤判成 conflict」——冪等重入
+    # 因此必然 fail。上界逐 caller 指定，判準其餘部分完全共用。
     try:
         metadata = target.stat()
         conflict = (
             target.is_symlink()
             or not target.is_file()
             or metadata.st_size != len(content)
-            or metadata.st_size > 4096
+            or metadata.st_size > max_size
             or metadata.st_mode & 0o222
             or target.read_bytes() != content
         )
     except OSError as error:
-        raise RuntimeError("workflow abandon evidence conflict") from error
+        raise RuntimeError(f"workflow {label} evidence conflict") from error
     if conflict:
-        raise RuntimeError("workflow abandon evidence conflict")
+        raise RuntimeError(f"workflow {label} evidence conflict")
 
 
 def _write_supersede_evidence(
-    body: dict[str, Any], *, state_path: Path, subdir: str
+    body: dict[str, Any],
+    *,
+    state_path: Path,
+    subdir: str,
+    stem: str | None = None,
+    label: str = "abandon",
+    max_size: int = 4096,
 ) -> dict[str, str]:
     """Durable, content-addressed supersede-evidence writer shared by the
     ``work-abandon`` and ``work-retire-delivered`` paths (create-with-O_EXCL +
     hardlink + fsync; a colliding target is re-validated byte-for-byte, so a
-    replayed write is idempotent rather than a conflict)."""
+    replayed write is idempotent rather than a conflict).
+
+    ``stem`` overrides the filename prefix for records that are not scoped to a
+    single run — #519's ``work-reclaim-reset`` is keyed by ``work_id`` because
+    a reclaim-budget reset is a work-item-level authorization, not a run-level
+    one. Everything else about the durability contract is shared verbatim.
+    """
 
     digest = verification.canonical_json_hash(body)
     root = state_path.resolve().parent / "evidence" / subdir
     root.mkdir(parents=True, exist_ok=True)
-    target = root / f"{body['run_id']}-{digest}.json"
+    target = root / f"{stem if stem is not None else body['run_id']}-{digest}.json"
     content = (
         json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     ).encode("utf-8")
     if target.exists():
-        _validate_abandon_evidence_target(target, content)
+        _validate_abandon_evidence_target(target, content, label=label, max_size=max_size)
     else:
         temporary = root / f".{target.name}.{uuid4().hex}.tmp"
         try:
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as error:
             raise RuntimeError(
-                "workflow abandon evidence temporary collision"
+                f"workflow {label} evidence temporary collision"
             ) from error
         try:
             with os.fdopen(fd, "wb") as handle:
@@ -2066,7 +2130,9 @@ def _write_supersede_evidence(
             try:
                 os.link(temporary, target)
             except FileExistsError:
-                _validate_abandon_evidence_target(target, content)
+                _validate_abandon_evidence_target(
+                    target, content, label=label, max_size=max_size
+                )
             else:
                 directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
                 try:
@@ -2085,6 +2151,47 @@ def _abandon_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]
 def _retire_delivered_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
     return _write_supersede_evidence(
         body, state_path=state_path, subdir="work-retire-delivered"
+    )
+
+
+def _reclaim_reset_body(
+    *,
+    repo: str,
+    work_id: str,
+    actor: str,
+    reason: str,
+    cleared_run_ids: list[str],
+    created_at: str,
+) -> dict[str, Any]:
+    """#519：`cortex-work-reclaim-reset/v1` 的 canonical evidence body。
+
+    內容即稽核事實：誰、為什麼、在什麼時間點、赦免了哪幾個 superseded 世代。
+    `cleared_run_ids` 排序後入 body，讓同一組世代永遠算出同一個 canonical hash。
+    """
+
+    return {
+        "schema": "cortex-work-reclaim-reset/v1",
+        "repo": repo,
+        "work_id": work_id,
+        "actor": actor,
+        "reason": reason,
+        "superseded_generations": len(cleared_run_ids),
+        "cleared_run_ids": sorted(cleared_run_ids),
+        "created_at": created_at,
+    }
+
+
+def _reclaim_reset_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+    return _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-reclaim-reset",
+        stem=str(body["work_id"]),
+        label="reclaim-reset",
+        # body 隨 cleared_run_ids 線性成長（每筆 run_id 約 40 bytes），共用 4096
+        # 會讓世代較多的重置一重放就誤判 conflict；放寬到 64KiB 仍是「小文件」
+        # 的防禦性上界，且 st_size != len(content) 才是真正的正確性判準。
+        max_size=65536,
     )
 
 
@@ -2803,6 +2910,130 @@ def _retire_delivered_action(
         "pr_terminal_status": pr_terminal_status,
         "evidence": record,
         "run": updated.to_dict(),
+    }
+
+
+def _validate_reclaim_reset_operator_inputs(args: dict[str, Any]) -> tuple[str, str]:
+    """#519：`reset-reclaim-budget` 的 actor／reason 入場驗證。
+
+    界限刻意與 retirement family（`_validate_retirement_operator_inputs`）逐字
+    相同——同樣是「一個人、為了一個寫得出來的理由，明示解除一道安全機制」，
+    稽核欄位的規格沒有理由分歧。差別只在這裡不要 `expected_run_id`：熔斷觸發
+    的前提就是沒有 active run 可以 CAS（`decide_*_claim` 判成 claim 才會走到
+    熔斷），硬要一個 exact run id 等同讓這條解鎖路徑永遠打不開。
+    """
+
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("reset-reclaim-budget requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("reset-reclaim-budget requires bounded reason")
+    return actor, reason
+
+
+def _reset_reclaim_budget_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """#519：明示重置 (repo, work_id) 的 semantic-reclaim 世代熔斷計數。
+
+    #218 AC2 的熔斷對全部 superseded 歷史無條件累加：不看時間窗、不看失敗原
+    因、不看引擎是否已修好，而且完全沒有重置路徑。實測（2026-08-14）一個
+    work item 在四分鐘內因三個 cortex 自身缺陷（成功卻被自行 supersede、codex
+    exec 逾時、前代殘留 artifact 使 authority fail-closed）耗盡額度後永久鎖
+    死——沒有一次是工作項本身的問題，卻再也無法派工。
+
+    重置的實作刻意是 **append-only 水位**：把「本次赦免的 superseded run_id」
+    寫成一筆 registry 授權列（`_manager_record_reclaim_reset`），熔斷計數改成
+    「superseded 世代扣掉所有已赦免 run_id」。既有 run row 一列不刪不改——run
+    歷史是稽核來源，重置是新增一筆授權事實，不是抹掉失敗紀錄。水位以 run_id
+    集合而非時間戳表達，因此不依賴任何時鐘假設，且重置後新產生的世代照常累
+    加，熔斷會再次上膛（不是永久關閉安全機制）。
+    """
+
+    extras = set(args) - {"action", "repo", "work_id", "actor", "reason"}
+    if extras:
+        raise ValueError(
+            f"reset-reclaim-budget rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    actor, reason = _validate_reclaim_reset_operator_inputs(args)
+    pending = _effective_superseded_generations(
+        workflow_registry, repo=authority.repo, work_id=authority.work_id
+    )
+    if not pending:
+        prior = [
+            entry
+            for entry in workflow_registry.list_reclaim_resets()
+            if entry.get("repo") == authority.repo
+            and entry.get("work_id") == authority.work_id
+        ]
+        if prior:
+            # 重送同一請求（含 crash window 重試）：額度已經是滿的，不再寫第二
+            # 筆授權，回報最後一筆既有紀錄讓呼叫端自證冪等。
+            latest = prior[-1]
+            return {
+                "action": "reclaim-budget-reset",
+                "already_reset": True,
+                "actor": actor,
+                "reason": reason,
+                "cleared_generations": 0,
+                "cleared_run_ids": [],
+                "reclaim_budget_limit": SEMANTIC_RECLAIM_LIMIT,
+                "evidence": {
+                    "ref": latest["evidence_ref"],
+                    "hash": latest["evidence_hash"],
+                },
+            }
+        # 從未燒過額度——重置是無意義的狀態變更，fail closed（比照本檔其餘
+        # recovery 動作「判準不符即拒絕，不做 best-effort」的慣例）。
+        raise RuntimeError("reset-reclaim-budget has no superseded generation to clear")
+    cleared_run_ids = sorted(run.run_id for run in pending)
+    body = _reclaim_reset_body(
+        repo=authority.repo,
+        work_id=authority.work_id,
+        actor=actor,
+        reason=reason,
+        cleared_run_ids=cleared_run_ids,
+        created_at=datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+    )
+    # #275 的順序慣例：先把稽核事實寫成 durable evidence，再改狀態。兩步之間
+    # crash 時最壞只留下一份未被引用的 evidence 檔（水位是 run_id 集合聯集，
+    # 重放同一份授權在語意上冪等），不會出現「狀態已放寬但查無授權依據」。
+    record = _reclaim_reset_record(body, state_path=state_path)
+    entry = workflow_registry._manager_record_reclaim_reset(
+        repo=authority.repo,
+        work_id=authority.work_id,
+        actor=actor,
+        reason=reason,
+        evidence_ref=record["ref"],
+        evidence_hash=record["hash"],
+        cleared_run_ids=cleared_run_ids,
+        created_at=body["created_at"],
+    )
+    return {
+        "action": "reclaim-budget-reset",
+        "already_reset": False,
+        "actor": actor,
+        "reason": reason,
+        "cleared_generations": len(cleared_run_ids),
+        "cleared_run_ids": list(entry["cleared_run_ids"]),
+        "reclaim_budget_limit": SEMANTIC_RECLAIM_LIMIT,
+        "evidence": record,
     }
 
 
@@ -4177,8 +4408,8 @@ def execute_work_action(
     if action not in {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "abandon", "retire-delivered", "auto", "ship",
-        "review-attest", "intake",
+        "recover-repair-commit", "abandon", "retire-delivered",
+        "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -4203,7 +4434,7 @@ def execute_work_action(
         # block cleanup — the very moment the system is throttled is when
         # stuck runs most need clearing. Claim/start and every other action
         # keep the strict fail-closed default: they need fresh authority.
-        allow_rate_limited_last_known_good=action in _RETIREMENT_ACTIONS,
+        allow_rate_limited_last_known_good=action in _LOCAL_UNBLOCK_ACTIONS,
     )
     now_epoch = now()
     resolved_state_path = Path(state_path) if state_path is not None else _run_state_path()
@@ -4290,6 +4521,14 @@ def execute_work_action(
             args=args,
             authority=authority,
             runner=runner,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "reset-reclaim-budget":
+        result = _reset_reclaim_budget_action(
+            args=args,
+            authority=authority,
+            now_epoch=now_epoch,
             state_path=resolved_state_path,
             workflow_registry=workflow_registry,
         )

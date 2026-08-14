@@ -80,9 +80,15 @@ class VersionedRegistryTests(unittest.TestCase):
                 {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []},
             )
             self.assertEqual(len(payload["jobs"]), 1)
+            # #519：`reclaim_resets`（semantic-reclaim 熔斷重置水位）為加法相容
+            # 的新根欄位——寫入端一律寫出，讀取端對缺欄位的舊檔仍照常載入。
+            self.assertEqual(payload["reclaim_resets"], [])
             self.assertEqual(
                 set(payload.keys()),
-                {"schema_version", "seq", "jobs", "slices", "workflows", "legacy_records"},
+                {
+                    "schema_version", "seq", "jobs", "slices", "workflows",
+                    "legacy_records", "reclaim_resets",
+                },
             )
 
     def test_missing_schema_version_is_rejected_without_rewrite(self) -> None:

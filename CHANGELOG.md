@@ -8,6 +8,18 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #519：semantic-reclaim 世代熔斷補上帶審計的重置路徑**——`#218 AC2` 的
+  世代熔斷對 `(repo, work_id)` 的全部 superseded 歷史無條件累加，且沒有任何重置
+  路徑，導致根因（`#507`／`#511`／`#516` 等 cortex 自身缺陷）修好之後 work item
+  仍永久鎖死。新增 `cortex work reset-reclaim-budget`（必帶 `--actor`／單行
+  `--reason`，走既有單一 writer work-action 路徑），以 **append-only 水位**
+  （狀態檔新增加法相容的 `reclaim_resets` 根欄位）記錄「本次赦免哪幾個 superseded
+  run_id」，熔斷計數改為扣掉已赦免者——既有 run 紀錄一列不刪不改，run 歷史維持
+  為稽核來源；重置後新產生的世代照常累加，熔斷會再次上膛。每次重置落一筆
+  immutable `cortex-work-reclaim-reset/v1` evidence（canonical json hash 命名、
+  原子唯讀寫入、內容衝突 raise）。熔斷本身的 `needs_human` 結果同步回報
+  `legal_next_steps`／`next_step_hint`，直接指出這條解鎖路徑。未採建議 1（引擎
+  版本維度），理由見 PR。詳見 `changelog.d/reclaim-budget-reset.md`。
 - **Issue #520：必要標題要求改由驗收判準機械產生，消除雙讀法**——integrator
   prompt 舊句「required headings: Requirements for spec, Decisions for design,
   Tasks for plan」原意是逐 kind 對應，字面卻同樣可讀成「必要標題是

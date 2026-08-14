@@ -61,6 +61,8 @@ cortex work retry-build unified-work-lifecycle --repo owner/repo --issue 14 --ac
 cortex work abandon stale-canary --repo owner/repo --actor operator \
   --expected-run-id workflow-0123456789abcdef0123 \
   --reason 'Superseded by the terminal canary.'
+cortex work reset-reclaim-budget stale-canary --repo owner/repo --actor operator \
+  --reason '三代 abandon 皆肇因於已修復的引擎缺陷，非工作項本身'
 cortex work auto unified-work-lifecycle --repo owner/repo --enable
 cortex work auto unified-work-lifecycle --repo owner/repo --disable
 cortex stat --combo-selections
@@ -116,6 +118,8 @@ transaction、凍結 authority 做 abandon CAS、不放寬 `claim.py` 既有的�
 `resume`／`retry-build` 的 job 選擇同樣於 #260 收斂：operator resume 遇到已 terminalized 的失敗 job 時（`status == "failed"`，或 `status == "exited"` 且 exit code 非 0），第一次 `cortex work resume` 即 dispatch replacement job，不再重選 stale failed job 空轉一輪（過去只認 `status == "failed"`，`exited` 非 0 的 stale terminal 會讓第一次 resume 只重新回報 `job-failed`、要再執行一次才 dispatch replacement）；exited/0 的既有三條路徑（unbound terminal recovery、malformed schema retry、正常 terminalize）條件式不動。replacement dispatch 後再次 resume 回報 in-flight，不產生第二個 replacement job。失敗回報一律附掛 `_terminal_parse_diagnostics` 的唯讀 `terminal_diagnostics`（observed HEAD、job id、失敗原因），與既有的 `authority_granted: false` 模型一致：可觀測不等於可授權，不會因此讓 candidate 取得任何 authority。
 
 `abandon`只處理尚未進入delivery的舊run：exact run CAS、current WorkAuthority refs、actor與單行reason全部重驗，且任何active Job、PR ref、passed ship step或CompletionRecord都會拒絕。成功後只把該run標成`superseded`，並以immutable `cortex-work-abandon/v1` evidence保存reason；不勾未完成tasks、不建立CompletionRecord，也不把abandoned work投影成done。重送同一CAS/reason冪等，不同reason或已有另一個active run則fail-closed。
+
+`reset-reclaim-budget`（#519）是語意 re-claim 世代熔斷（#218 AC2）的唯一解鎖路徑。同一 `(repo, work_id)` 累積 `SEMANTIC_RECLAIM_LIMIT`（3）個 superseded 世代後，`start`／auto-claim 都會停在 `needs_human: semantic-reclaim-budget-exhausted`；熔斷的計數對全部歷史累加，不看時間窗也不看失敗原因，因此當三次 abandon 全肇因於 cortex 自身缺陷（而非工作項本身）時，缺陷修好之後 work item 仍會永久鎖死。此 action 要求 `--actor` 與單行 `--reason`（界限與 `abandon`／`retire-delivered` 完全相同：actor ≤128 字、reason ≤500 字、單行、可列印），不需要 `--expected-run-id`——熔斷觸發的前提就是沒有 active run 可供 CAS。重置以 **append-only 水位**實作：把當下所有未赦免的 superseded `run_id` 記成一筆 registry 授權列（狀態檔的 `reclaim_resets` 根欄位），熔斷計數改為「superseded 世代扣掉所有已赦免 run_id」。既有 WorkflowRun row 一列不刪不改——run 歷史是稽核來源，重置是新增一筆授權事實，不是抹掉失敗紀錄。水位以 run_id 集合而非時間戳表達，因此重置後新產生的 superseded 世代照常累加、熔斷會再次上膛，不是永久關閉安全機制。每次重置寫入一筆 immutable `cortex-work-reclaim-reset/v1` evidence（`repo`／`work_id`／`actor`／`reason`／重置前的世代數與其 run_id 清單／`created_at`），落在 `<coordinator_root>/evidence/work-reclaim-reset/{work_id}-{hash}.json`，命名與原子寫入慣例比照 `cortex-work-abandon/v1`。沒有任何可赦免世代時 fail-closed 拒絕（已重置過則回報 `already_reset`，不寫第二筆授權）。熔斷本身的 `needs_human` 結果也會回報 `legal_next_steps`／`next_step_hint`，直接指出這條解鎖路徑與所需的理由參數。`reclaim_resets` 是加法相容的可選根欄位（不 bump `schema_version`），本欄位出現前寫下的既有狀態檔照常載入，缺欄位一律視為沒有任何重置授權。
 
 若 delivery 尚未建立 immutable binding，就因 PR／OpenSpec／Todo target 數量不是各一個而停在 `needs_human: multiple-delivery-targets-unsupported`，operator 修正 repo-local correlation 後可明確 `resume` 同一 WorkflowRun。Manager 只會在 current authority 已重新收斂為恰好一組 target 時清除此特定 stop；已建立 binding 或其他 `needs_human` 原因仍維持 fail-closed。
 

@@ -202,6 +202,16 @@ def _empty_legacy_records() -> dict[str, Any]:
     return {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []}
 
 
+# #519：semantic-reclaim 世代熔斷（work_actions.SEMANTIC_RECLAIM_LIMIT）的重置
+# 水位欄位集合。水位是 append-only 的「赦免名單」——記錄某次 operator 明示重置
+# 當下已存在的 superseded run_id，之後熔斷只計不在任何赦免名單裡的世代。刻意
+# 不改寫（更不刪除）任何既有 WorkflowRun row：run 歷史是稽核來源，重置是新增
+# 一筆授權事實，不是抹掉失敗紀錄。
+_RECLAIM_RESET_STRING_FIELDS = (
+    "repo", "work_id", "actor", "reason", "evidence_ref", "evidence_hash", "created_at",
+)
+
+
 def _fsync_directory(directory: Path) -> None:
     fd = os.open(directory, os.O_RDONLY)
     try:
@@ -255,6 +265,7 @@ class JobRegistry:
         self._slices: list[dict[str, Any]] = []
         self._workflows: list[WorkflowRun] = []
         self._legacy_records: dict[str, Any] = _empty_legacy_records()
+        self._reclaim_resets: list[dict[str, Any]] = []
         self._seq = seq_start
         self._state_mtime_ns: int | None = None
         self._state_size: int | None = None
@@ -355,12 +366,47 @@ class JobRegistry:
         ):
             raise ValueError(f"coordinator 狀態檔 workflow 重複識別（fail-closed）: {self._state_path}")
         self._validate_legacy_records(legacy_records)
+        # #519：`reclaim_resets` 刻意是「加法相容」的可選根欄位，不列入上面的
+        # `missing_v2_roots` fail-closed 清單，也不 bump schema_version——本欄位
+        # 出現前寫下的狀態檔（既有部署裡的每一份）都必須照常載入，否則升級即
+        # brick manager。缺欄位一律視為「沒有任何重置授權」，也就是熔斷維持最
+        # 嚴格的既有行為（fail-closed 方向）。
+        reclaim_resets = self._validate_reclaim_resets(payload.get("reclaim_resets", []))
         self._jobs = jobs
         self._slices = slices
         self._workflows = validated_workflows
         self._legacy_records = _deepcopy_json(legacy_records)
+        self._reclaim_resets = reclaim_resets
         self._seq = max(seq, self._seq)
         self._record_state_file_metadata()
+
+    def _validate_reclaim_resets(self, value: object) -> list[dict[str, Any]]:
+        """#519：semantic-reclaim 重置水位的載入驗證（malformed 一律 fail-closed）。"""
+
+        if not isinstance(value, list):
+            raise ValueError(
+                f"coordinator 狀態檔 reclaim_resets 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        validated: list[dict[str, Any]] = []
+        for entry in value:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"coordinator 狀態檔 reclaim_resets 格式錯誤（fail-closed）: {self._state_path}"
+                )
+            for field in _RECLAIM_RESET_STRING_FIELDS:
+                if not isinstance(entry.get(field), str) or not entry[field]:
+                    raise ValueError(
+                        "coordinator 狀態檔 reclaim_resets 欄位缺漏（fail-closed）: "
+                        f"{self._state_path}: {field}"
+                    )
+            cleared = entry.get("cleared_run_ids")
+            if not _is_ref_list(cleared) or not cleared:
+                raise ValueError(
+                    "coordinator 狀態檔 reclaim_resets cleared_run_ids 格式錯誤"
+                    f"（fail-closed）: {self._state_path}"
+                )
+            validated.append(_deepcopy_json(entry))
+        return validated
 
     def _validate_state_records(
         self, payload: dict[str, Any]
@@ -473,6 +519,7 @@ class JobRegistry:
             "slices": self._slices,
             "workflows": [run.to_dict() for run in self._workflows],
             "legacy_records": self._legacy_records,
+            "reclaim_resets": self._reclaim_resets,
         }
         try:
             self._write_payload_atomically(payload)
@@ -485,6 +532,7 @@ class JobRegistry:
             self._slices = []
             self._workflows = []
             self._legacy_records = _empty_legacy_records()
+            self._reclaim_resets = []
             self._seq = 0
             self._load()
             raise
@@ -1336,6 +1384,73 @@ class JobRegistry:
 
     def get_workflow_run(self, run_id: str) -> WorkflowRun:
         return self._copy_workflow_run(self._workflows[self._find_workflow_run_index(run_id)])
+
+    def list_reclaim_resets(self) -> list[dict[str, Any]]:
+        """#519：唯讀列出所有 semantic-reclaim 熔斷重置授權（append-only 稽核列）。"""
+
+        return _deepcopy_json(self._reclaim_resets)
+
+    def reclaim_reset_cleared_run_ids(self, *, repo: str, work_id: str) -> frozenset[str]:
+        """#519：某 (repo, work_id) 已被明示重置赦免的 superseded run_id 聯集。
+
+        熔斷計數改以「superseded 世代扣掉這個集合」為準，因此重置只赦免當下已
+        存在的世代——重置之後新產生的 superseded 世代照常累加，熔斷會再次上膛。
+        """
+
+        cleared: set[str] = set()
+        for entry in self._reclaim_resets:
+            if entry.get("repo") == repo and entry.get("work_id") == work_id:
+                cleared.update(str(item) for item in entry.get("cleared_run_ids", ()))
+        return frozenset(cleared)
+
+    def _manager_record_reclaim_reset(
+        self,
+        *,
+        repo: str,
+        work_id: str,
+        actor: str,
+        reason: str,
+        evidence_ref: str,
+        evidence_hash: str,
+        cleared_run_ids: list[str],
+        created_at: str,
+    ) -> dict[str, Any]:
+        """#519：登錄一筆 semantic-reclaim 熔斷重置授權（唯一 writer 走 manager）。
+
+        純 append：既有 WorkflowRun row 一個位元組都不動。被赦免的 run_id 必須
+        確實存在且為 superseded，否則 fail closed——重置只能赦免「已經發生的
+        世代」，不得預先授權未來的失敗。同一 evidence_ref 重入視為冪等（比照
+        abandon 的 crash-window 契約，#275），不產生第二筆授權。
+        """
+
+        if not cleared_run_ids:
+            raise ValueError("workflow reclaim reset requires cleared run ids")
+        for existing in self._reclaim_resets:
+            if existing.get("evidence_ref") == evidence_ref:
+                return _deepcopy_json(existing)
+        superseded = {
+            run.run_id
+            for run in self._workflows
+            if run.repo == repo and run.work_id == work_id and run.status == "superseded"
+        }
+        unknown = sorted(set(cleared_run_ids) - superseded)
+        if unknown:
+            raise ValueError(
+                f"workflow reclaim reset 指向非 superseded run（fail-closed）: {unknown[0]}"
+            )
+        entry = {
+            "repo": repo,
+            "work_id": work_id,
+            "actor": actor,
+            "reason": reason,
+            "evidence_ref": evidence_ref,
+            "evidence_hash": evidence_hash,
+            "cleared_run_ids": sorted(set(cleared_run_ids)),
+            "created_at": created_at,
+        }
+        self._reclaim_resets.append(entry)
+        self._persist()
+        return _deepcopy_json(entry)
 
     def _manager_create_workflow_run(
         self,

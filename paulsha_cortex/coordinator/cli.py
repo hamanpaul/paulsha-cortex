@@ -204,8 +204,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
             "retry-review", "recover-planning", "recover-pre-candidate",
-            "recover-repair-commit", "abandon", "retire-delivered", "auto",
-            "ship", "review-attest", "intake",
+            "recover-repair-commit", "abandon", "retire-delivered",
+            "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
         ],
     )
     p_work.add_argument("work_id")
@@ -221,7 +221,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="abandon／retire-delivered 使用的 exact WorkflowRun CAS",
     )
     p_work.add_argument(
-        "--reason", help="abandon／retire-delivered 的單行審計理由（最多 500 字）"
+        "--reason",
+        help="abandon／retire-delivered／reset-reclaim-budget 的單行審計理由（最多 500 字）",
     )
     p_work.add_argument(
         "--combo",
