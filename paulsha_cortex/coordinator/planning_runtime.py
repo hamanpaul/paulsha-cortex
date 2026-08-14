@@ -640,10 +640,18 @@ def build_production_planning_runtime(
     def integrator(pack: Mapping[str, object], evidence: Mapping[str, object]) -> object:
         # #406：prompt 必須把 validate_primary_integration 的結構約束逐條講給模型，
         # 只列欄位名（不給語意）時模型會把不確定的 artifact_refs 留空 → 必然驗證失敗。
+        # #516：同一教訓的第二輪，這次補的是 question_pack_id 與 secondary_evidence_hash
+        # 兩個 echo-back 欄位——兩個值都已在輸入裡（question_pack.pack_id、
+        # secondary_evidence.evidence_hash），模型只需原樣複製；但輸入欄位名
+        # （evidence_hash）與輸出欄位名（secondary_evidence_hash）不同，後者字面上
+        # 像是要模型自己算 hash，只列欄位名時會反覆撞 evidence hash mismatch。
         return invoke_primary(
             "Do not call tools or edit files. Integrate only the supplied evidence. Return exactly one "
             "JSON object with schema_version=1, question_pack_id, secondary_evidence_hash, resolutions, "
-            "and artifacts. Each resolution has only question_id, decision, artifact_kind, artifact_refs. "
+            "and artifacts. question_pack_id must be copied verbatim from the input question_pack.pack_id "
+            "value. secondary_evidence_hash must be copied verbatim from the input "
+            "secondary_evidence.evidence_hash field; do not compute, derive, or invent a hash. "
+            "Each resolution has only question_id, decision, artifact_kind, artifact_refs. "
             "Resolve every question exactly once. artifact_kind must equal the question kind without its "
             "'missing-' prefix. artifact_refs must be a NON-EMPTY list of the destination path(s) this "
             "resolution's artifact(s) are written to — the same strings used as artifacts[].path. "
