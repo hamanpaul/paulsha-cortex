@@ -8,6 +8,17 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #516：integrator prompt 補上兩個 echo-back 欄位的值來源**——
+  `_validate_primary_integration()` 要求 integrator 輸出的 `question_pack_id`
+  與 `secondary_evidence_hash` 與輸入完全相符，兩個值也都已在模型輸入裡
+  （`question_pack.pack_id`、`secondary_evidence.evidence_hash`），模型只需原樣
+  複製；但 prompt 只把它們當欄位名列在輸出鍵清單，且輸入欄位名（`evidence_hash`）
+  與輸出欄位名（`secondary_evidence_hash`）不同，後者字面上像是要模型自己算 hash。
+  planning 因此反覆以 `primary integration evidence hash mismatch` 落 needs_human，
+  Phase 1 派工死鎖。prompt 現在明寫兩者「copied verbatim from」的來源欄位並禁止
+  自行計算 hash（`do not compute, derive, or invent a hash`），`#406` 註解旁補記
+  本次補齊的欄位。只改 prompt 文字與對應測試，validator 邏輯與資料流不動。
+  詳見 `changelog.d/integrator-prompt-semantics.md`。
 - **Issue #511（診斷面，前兩項）：planning artifact 被拒時的原因與內容可觀測**——
   `manager._publish_planning_artifacts()` 過去只取 `assess_planning_artifact()`
   的布林值，`reasons`／`blocking_markers` 全被丟棄，被拒內容又只活在 planning

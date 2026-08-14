@@ -364,6 +364,58 @@ def test_questioner_and_integrator_prompts_include_json_output_contract(
     assert "must equal the union of all artifact_refs" in integrator_prompt
 
 
+def test_integrator_prompt_states_echo_back_field_sources(monkeypatch, tmp_path: Path) -> None:
+    """issue #516：`_validate_primary_integration()` 要求 `question_pack_id` 與
+    `secondary_evidence_hash` 與輸入完全相符，兩個值都已在模型輸入裡（分別是
+    `question_pack.pack_id` 與 `secondary_evidence.evidence_hash`），模型只需原樣
+    複製。但輸入欄位名（`evidence_hash`）與輸出欄位名（`secondary_evidence_hash`）
+    不同，後者字面上像是要模型自己算 hash——prompt 只列欄位名時模型必然猜錯，
+    planning 反覆以 `primary integration evidence hash mismatch` 失敗。"""
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary", "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy", "model_id": AGY_MODEL_ID, "independence_domain": "google",
+                "capabilities": ["planning"], "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    prompts: list[str] = []
+
+    def runner(argv, **kwargs):
+        if argv == ["agy", "models"]:
+            return _completed(f"{AGY_MODEL_ID}\n")
+        prompt = argv[argv.index("--print") + 1] if "--print" in argv else argv[2]
+        prompts.append(prompt)
+        return _completed(json.dumps({"schema_version": 1, "question_pack_id": "qp-x"}))
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"), worktree=tmp_path, runner=runner
+    )
+    runtime.primary_integrator(
+        {"schema_version": 1, "pack_id": "qp-x", "questions": []},
+        {
+            "schema_version": 1,
+            "question_pack_id": "qp-x",
+            "evidence": [],
+            "evidence_hash": "deadbeef",
+        },
+    )
+
+    integrator_prompt = prompts[-1]
+    # 兩個 echo-back 欄位都必須指名值的來源（輸入的哪個欄位），而非只列欄位名。
+    assert "copied verbatim from the input question_pack.pack_id" in integrator_prompt
+    assert (
+        "copied verbatim from the input secondary_evidence.evidence_hash" in integrator_prompt
+    )
+    # 明確禁止模型自行計算 hash——這正是 #516 的誤解來源。
+    assert "do not compute, derive, or invent a hash" in integrator_prompt
+
+
 def test_planning_source_material_rejects_symlink_traversal(tmp_path: Path) -> None:
     outside = tmp_path / "outside.md"
     outside.write_text("secret\n", encoding="utf-8")
