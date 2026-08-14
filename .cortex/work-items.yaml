@@ -682,3 +682,9 @@ work_items:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#527'
     excludes: []
+  fix-claim-provider-scope:
+    title: 'fix-claim-provider-scope'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-claim-provider-scope/todo.md'
+    excludes: []

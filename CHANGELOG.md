@@ -8,6 +8,19 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #530：claim 的 GitHub provider 檢查是 repo 範圍且無條件，把一次 GitHub 可用性
+  事故放大成整個 fleet 的派工停擺**——`_authority_from_canonical_row` 在驗完「必須有
+  todo-kind 來源」之後，完全不看那些 source 由誰供應，直接要求 `github:<repo>` 為 `ok`。
+  實測 2026-08-14 帳號遭 abuse-detection 封鎖 REST 期間，confirmed sources 只有一筆
+  `kind=todo`／`provider=repo:...` 的 work item（`fix-instance-config-isolation`）被
+  `provider-authority-rate-limited-canonical` 擋死——它要讀的 todo 就在磁碟上、內容從未變動。
+  連「修 GitHub 壓力問題」本身都因此做不了，形成「限流 → 無法派工 → 修不了限流」的死結。
+  修法為**收斂適用範圍而非放寬強度**：新增 `WorkAuthority.requires_github_authority`
+  （預設 True），由 confirmed sources 的 `provider` 前綴（`github:`／`github-terminal:`）
+  與 `kind` 判定；為 False 且 last-known-good 齊全時才豁免。`provider` 欄位缺席一律保守視為
+  需要 GitHub 權威。同時修正第二層放大：`_authority_is_fresh` 不再以 GitHub 的 last-success
+  時鐘判定不依賴 GitHub 之 authority 的過期。第三層（`reduce_lifecycle` 的
+  `provider_degraded_freeze` 與 `hard_gates.auto_claim`）留待後續。
 - **Issue #506：auto-claim scan 是 fleet 對 GitHub 最大的持續壓力來源，且不受
   `#512` 的節流閘門管轄**——`run_auto_claim_scan()` 對每個 `confirmed_todo` authority
   的每個 mapped issue 各發一次即時 `gh api` 讀 label。實測 cortex instance 有 57 個
