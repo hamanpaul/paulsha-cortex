@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Issue #506（部分實作）：Monitor GitHub 掃描 burst 減壓**——新增
+  `paulsha_cortex/monitor/github_pressure.py` 的 `GitHubPressureGate`：
+  (1) 每次 `gh` 請求前插入可設定的間隔＋jitter，把一輪數百次請求攤平而非齊發
+  （`github_request_interval_ms` 預設 200、設 0 停用；`github_throttle_budget_seconds`
+  作為上限保護並夾在 refresh interval 一半以下）；(2) rate-limit 型失敗時以
+  不計配額的 `gh api rate_limit` 分診 primary／secondary，給出可分辨的 diagnostic；
+  (3) 命中後採指數退避（尊重 `Retry-After`／`x-ratelimit-reset`），退避期間
+  provider 的 `scan()` 直接跳過、不發任何請求。`GitHubTerminalProvider` 一併接上
+  同一套分診與退避，且不再重試 rate-limit 失敗。所有 rate-limit diagnostic 維持
+  被 `is_rate_limit_signal` 認得，`coordinator/claim.py` 的
+  `provider-authority-rate-limited-canonical` 行為不變。
+  詳見 `changelog.d/rate-limit-pressure.md`。
+
 ## [0.1.8] - 2026-08-12
 
 ### Fixed

@@ -19,6 +19,12 @@ import yaml
 from paulsha_cortex.config import paths
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
+from .github_pressure import (
+    RATE_LIMIT_KIND_PRIMARY,
+    RATE_LIMIT_KIND_SECONDARY,
+    RATE_LIMIT_KIND_UNKNOWN,
+    GitHubPressureGate,
+)
 from .work_models import ProviderSnapshot, WorkSource
 
 
@@ -669,6 +675,129 @@ class SubprocessCommandRunner:
         )
 
 
+# #506：rate-limit 診斷字串。三者**都必須**讓
+# ``github_rate_limit.is_rate_limit_signal`` 為真——``coordinator/claim.py`` 靠它
+# 產生 ``provider-authority-rate-limited-canonical`` 這個 reason code（#370 的
+# 成果），字串一旦不含 "rate limit" 就會靜默回歸成「authority 損毀」語意。
+# tests/test_monitor_github_pressure_506.py 鎖住這點。
+_RATE_LIMIT_DIAGNOSTICS = {
+    RATE_LIMIT_KIND_SECONDARY: "secondary rate limit",
+    RATE_LIMIT_KIND_PRIMARY: "primary rate limit exhausted",
+    RATE_LIMIT_KIND_UNKNOWN: "rate limit exceeded",
+}
+
+_RETRY_AFTER = re.compile(r"retry[-\s]?after[\"'\s:=]+(\d+)", re.IGNORECASE)
+_RATE_LIMIT_RESET = re.compile(r"x-ratelimit-reset[\"'\s:=]+(\d+)", re.IGNORECASE)
+
+
+def _retry_after_seconds(message: str | None) -> float | None:
+    """從失敗訊息取出 ``Retry-After``／``x-ratelimit-reset`` 提示（沒有就 None）。
+
+    #506：gh 不保證把 header 透出到 stderr，所以這只是「有就尊重」的加值路徑；
+    取不到時退避純靠指數。
+    """
+
+    if not message:
+        return None
+    match = _RETRY_AFTER.search(message)
+    if match is not None:
+        return float(match.group(1))
+    match = _RATE_LIMIT_RESET.search(message)
+    if match is not None:
+        remaining = float(match.group(1)) - time.time()
+        return remaining if remaining > 0 else None
+    return None
+
+
+def _probe_rate_limit(
+    runner: CommandRunner, *, timeout_seconds: float
+) -> tuple[str, float | None]:
+    """#506：以 ``gh api rate_limit`` 分辨 primary 與 secondary rate limit。
+
+    ``rate_limit`` 端點**不計入配額**，所以即使已經被限流也能安全查詢：
+    ``remaining > 0`` 代表配額還在，403 只可能來自 secondary（abuse detection，
+    burst 觸發，攤平請求即可緩解）；``remaining == 0`` 才是 primary 配額耗盡
+    （只能等 reset）。兩者的處置完全不同，因此值得多花這一次不計費的請求。
+
+    回傳 ``(kind, reset_after_seconds)``；探測本身失敗／回應不可解時回
+    ``unknown``——寧可退回既有的通用診斷，也不要猜錯方向。
+    """
+
+    argv = ("gh", "api", "--method", "GET", "rate_limit")
+    try:
+        completed = runner.run(argv, timeout=timeout_seconds)
+    except (OSError, subprocess.TimeoutExpired):
+        return RATE_LIMIT_KIND_UNKNOWN, None
+    if completed.returncode != 0:
+        return RATE_LIMIT_KIND_UNKNOWN, None
+    stdout = (
+        completed.stdout.decode(errors="replace")
+        if isinstance(completed.stdout, bytes)
+        else completed.stdout
+    )
+    try:
+        payload = json.loads(stdout or "")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return RATE_LIMIT_KIND_UNKNOWN, None
+    if not isinstance(payload, Mapping):
+        return RATE_LIMIT_KIND_UNKNOWN, None
+    buckets: list[Mapping] = []
+    resources = payload.get("resources")
+    if isinstance(resources, Mapping):
+        # core 與 graphql 是本 monitor 實際會打的兩個 bucket（REST 與 graphql
+        # provider 各一），任一耗盡都算 primary。
+        buckets = [
+            bucket
+            for name in ("core", "graphql")
+            if isinstance(bucket := resources.get(name), Mapping)
+        ]
+    if not buckets and isinstance(payload.get("rate"), Mapping):
+        buckets = [payload["rate"]]
+    remainings = [
+        bucket
+        for bucket in buckets
+        if isinstance(bucket.get("remaining"), int)
+        and not isinstance(bucket.get("remaining"), bool)
+    ]
+    if not remainings:
+        return RATE_LIMIT_KIND_UNKNOWN, None
+    exhausted = [bucket for bucket in remainings if bucket["remaining"] <= 0]
+    if not exhausted:
+        return RATE_LIMIT_KIND_SECONDARY, None
+    resets = [
+        float(bucket["reset"])
+        for bucket in exhausted
+        if isinstance(bucket.get("reset"), int) and not isinstance(bucket.get("reset"), bool)
+    ]
+    reset_after = max(0.0, max(resets) - time.time()) if resets else None
+    return RATE_LIMIT_KIND_PRIMARY, reset_after
+
+
+def _rate_limit_diagnostic(
+    *,
+    runner: CommandRunner,
+    timeout_seconds: float,
+    message: str | None,
+    gate: GitHubPressureGate | None,
+    prefix: str,
+) -> str:
+    """分診 rate-limit 失敗、登記退避，並回傳要寫進 diagnostics 的字串。"""
+
+    kind, reset_after = _probe_rate_limit(runner, timeout_seconds=timeout_seconds)
+    hint = _retry_after_seconds(message)
+    if reset_after is not None:
+        hint = reset_after if hint is None else max(hint, reset_after)
+    diagnostic = f"{prefix} {_RATE_LIMIT_DIAGNOSTICS[kind]}"
+    if gate is None:
+        return diagnostic
+    delay = gate.note_rate_limited(kind=kind, retry_after_seconds=hint)
+    return f"{diagnostic}; backing off {delay:.0f}s"
+
+
+def _backoff_diagnostic(prefix: str, blocked_seconds: float) -> str:
+    return f"{prefix} rate limit backoff active; retry in {blocked_seconds:.0f}s"
+
+
 class GitHubWorkProvider:
     """Read GitHub entities through authenticated ``gh api`` JSON only."""
 
@@ -678,6 +807,7 @@ class GitHubWorkProvider:
         *,
         runner: CommandRunner | None = None,
         timeout_seconds: float = 30,
+        pressure_gate: GitHubPressureGate | None = None,
     ) -> None:
         if repo.count("/") != 1 or any(not part for part in repo.split("/")):
             raise ValueError("GitHub repo must use owner/name")
@@ -685,9 +815,17 @@ class GitHubWorkProvider:
         self.provider_id = f"github:{repo}"
         self.runner = runner or SubprocessCommandRunner()
         self.timeout_seconds = timeout_seconds
+        # #506：未注入 gate 時完全維持舊行為（不節流、不退避）。
+        self.pressure_gate = pressure_gate
 
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()
+        if self.pressure_gate is not None:
+            blocked = self.pressure_gate.blocked_seconds()
+            if blocked > 0:
+                # #506：退避期間直接跳過，不再硬撞一次 403 去加深限流。
+                return self._failure(attempted_at, _backoff_diagnostic("github", blocked))
+            self.pressure_gate.throttle()
         argv = (
             "gh",
             "api",
@@ -713,8 +851,18 @@ class GitHubWorkProvider:
             # and invite re-authenticating, so an auth-first check
             # misclassifies a retryable rate limit as a dead credential.
             if is_rate_limit_signal(message):
-                diagnostic = "github rate limit exceeded"
-            elif is_auth_signal(message):
+                # #506：403 再分診成 primary／secondary，並開啟退避窗。
+                return self._failure(
+                    attempted_at,
+                    _rate_limit_diagnostic(
+                        runner=self.runner,
+                        timeout_seconds=self.timeout_seconds,
+                        message=message,
+                        gate=self.pressure_gate,
+                        prefix="github",
+                    ),
+                )
+            if is_auth_signal(message):
                 diagnostic = "github authentication failed"
             else:
                 diagnostic = "github API request failed"
@@ -738,6 +886,9 @@ class GitHubWorkProvider:
                 for source in sources
             )
         )
+        if self.pressure_gate is not None:
+            # #506：一次成功即代表限流窗已過，清空退避與連續失敗計數。
+            self.pressure_gate.note_success()
         return ProviderSnapshot(
             provider_id=self.provider_id,
             status="ok",
@@ -783,6 +934,19 @@ class GitHubWorkProvider:
         )
 
 
+class _GitHubRateLimitError(OSError):
+    """#506：``_json`` 內部命中 rate limit 的專用訊號。
+
+    刻意繼承 ``OSError``——既有 ``scan()`` 的 catch-all（``except (OSError, ...)``）
+    仍然接得住，即使日後有人漏接這個新型別也只會退回舊的通用診斷，不會讓
+    provider 例外逸出。
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("gh api rate limited")
+        self.detail = message
+
+
 class GitHubTerminalProvider:
     """Read closing references and remote default-branch archive evidence."""
 
@@ -798,11 +962,15 @@ class GitHubTerminalProvider:
         retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
         sleeper: Callable[[float], None] = time.sleep,
         relevant_pr_numbers: tuple[int, ...] | None = None,
+        pressure_gate: GitHubPressureGate | None = None,
     ) -> None:
         self.repo = repo
         self.provider_id = f"github-terminal:{repo}"
         self.runner = runner or SubprocessCommandRunner()
         self.timeout_seconds = timeout_seconds
+        # #506：本 provider 是請求量最大的一支（graphql 分頁 + tree + 逐檔
+        # contents + 逐 PR compare），節流／退避沒接上它等於沒做減壓。
+        self.pressure_gate = pressure_gate
         if any(
             not isinstance(delay, (int, float))
             or isinstance(delay, bool)
@@ -829,6 +997,13 @@ class GitHubTerminalProvider:
 
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()
+        if self.pressure_gate is not None:
+            blocked = self.pressure_gate.blocked_seconds()
+            if blocked > 0:
+                # #506：退避期間整支 scan 跳過——這裡省下的是一輪裡最大宗的請求量。
+                return self._failure(
+                    attempted_at, _backoff_diagnostic("github terminal", blocked)
+                )
         owner, name = self.repo.split("/", 1)
         try:
             graph = self._json(self._pull_request_argv(owner=owner, name=name))
@@ -971,6 +1146,19 @@ class GitHubTerminalProvider:
                 )
         except subprocess.TimeoutExpired:
             return self._failure(attempted_at, "github terminal timeout")
+        except _GitHubRateLimitError as error:
+            # #506：與 GitHubWorkProvider 同一套分診／退避；本 provider 原本把
+            # 限流混進 "evidence unavailable"，下游完全分辨不出來。
+            return self._failure(
+                attempted_at,
+                _rate_limit_diagnostic(
+                    runner=self.runner,
+                    timeout_seconds=self.timeout_seconds,
+                    message=error.detail,
+                    gate=self.pressure_gate,
+                    prefix="github terminal",
+                ),
+            )
         except FileNotFoundError:
             return self._failure(attempted_at, "github CLI unavailable")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -988,6 +1176,9 @@ class GitHubTerminalProvider:
             "remote_todos": remote_todos,
             "branches": branches,
         }
+        if self.pressure_gate is not None:
+            # #506：整支 scan 走完都沒被限流，退避窗可以關掉。
+            self.pressure_gate.note_success()
         return ProviderSnapshot(
             provider_id=self.provider_id,
             status="ok",
@@ -1019,10 +1210,17 @@ class GitHubTerminalProvider:
     def _json(self, argv: Sequence[str]) -> Mapping:
         completed = None
         for attempt in range(len(self.retry_delays) + 1):
+            if self.pressure_gate is not None:
+                # #506：節流點在**每一次**請求前，含分頁與逐檔 contents——
+                # 一輪掃描的請求數就是靠這裡攤平的。
+                self.pressure_gate.throttle()
             completed = self.runner.run(argv, timeout=self.timeout_seconds)
             if completed.returncode == 0:
                 break
             error = f"{completed.stderr}\n{completed.stdout}"
+            if is_rate_limit_signal(error):
+                # #506：限流一律不重試——重試 403 只會把 secondary limit 撞得更深。
+                raise _GitHubRateLimitError(error)
             if (
                 attempt >= len(self.retry_delays)
                 or re.search(r"\bHTTP (?:502|503|504)\b", error) is None
