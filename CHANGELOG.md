@@ -14,6 +14,10 @@
   auto-claim scan 廢除每 tick O(mapped issues) 的 live label sweep（實測 57 次/tick），
   鏡像 False 零 API、鏡像 True 僅一次 targeted 複驗（以 live 為準、確認即 early-break）。
   observations 缺失一律保守 False。
+- **Issue #536（最小修）：define 階段的 ongoing run 不再對 tick resume 迴圈隱形**——
+  phase filter 納入 `define`；stalled define run 每 tick 由 `resume_workflow_run` 接手
+  （其本已支援 define：reconcile planning transaction → dispatch planner 卡）。
+  needs_human 縱深防禦守衛不變。
 - **planner launcher 暫時性服務失敗被判 `content` 死路**——agy 暫時性 503 會印錯誤文字但
   exit 0，launcher parse 不到 JSON 即以 `content` 分類收場，而 `content` 禁用
   recover-planning：自癒型服務錯誤變永久死路。修法：`_extract_json` no-JSON 失敗帶 stdout

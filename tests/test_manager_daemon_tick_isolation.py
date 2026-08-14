@@ -207,3 +207,118 @@ def test_periodic_tick_regression_no_failure_matches_existing_behavior(
     assert result["auto_claims"] == [{"work_id": "demo", "action": "claim"}]
     assert "auto_claim_failed" not in result
     assert "auto_claim_error" not in result
+
+
+def test_periodic_tick_resumes_stalled_define_phase_workflow(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#536 迴歸：define 階段的 ongoing run 必須在 resume 迴圈視野內。
+
+    實測現場（run `workflow-7a430d31eff66ef13630`）：brainstorm 成功、spec/design
+    已發佈到 operator worktree，但 run 狀態未推進——`updated_at` 停在建立時刻、
+    facets 空、無錯誤。修法前 resume 迴圈的 phase filter 排除 `define`，這種 run
+    對所有恢復機制永久隱形（無 facet 可呈現、無 next_actions、無任何 tick 會碰它）。
+    `resume_workflow_run` 本身完整支援 define（先 reconcile planning publication
+    transaction、再 dispatch planner 卡），排除毫無必要。
+    """
+
+    workflow = SimpleNamespace(
+        run_id="run-define-stalled",
+        work_id="fix-instance-config-isolation",
+        repo="acme/demo",
+        status="ongoing",
+        facets=(),
+        current_phase="define",
+        claim_key="claim:legacy:demo",
+        source_revision="",
+    )
+    registry = SimpleNamespace(
+        _state_path=str(tmp_path / "jobs.json"),
+        list_workflow_runs=lambda: [workflow],
+    )
+    dispatcher = SimpleNamespace(_registry=registry, _git_runner=lambda args: "")
+
+    resume_calls: list[str] = []
+
+    def fake_resume_workflow_run(dispatcher_arg, **kwargs):
+        resume_calls.append(kwargs["run_id"])
+
+    monkeypatch.setattr(
+        manager_daemon.manager, "resume_workflow_run", fake_resume_workflow_run
+    )
+
+    def fake_run_tick(dispatcher_arg, **kwargs):
+        return {
+            "dispatch_skipped": False,
+            "dispatched": [],
+            "completed": [],
+            "errors": [],
+            "reaped": None,
+        }
+
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        run_tick_fn=fake_run_tick,
+        scan_specs_fn=lambda specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=object(),
+    )
+
+    runner()
+
+    assert resume_calls == ["run-define-stalled"]
+
+
+def test_periodic_tick_still_skips_needs_human_define_workflow(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#536 反向守衛：define 納入後，needs_human 的 define run 仍須被跳過
+    （#373 縱深防禦不得因本修正而鬆動）。"""
+
+    workflow = SimpleNamespace(
+        run_id="run-define-nh",
+        work_id="demo",
+        repo="acme/demo",
+        status="ongoing",
+        facets=("needs_human",),
+        current_phase="define",
+        claim_key="claim:legacy:demo",
+        source_revision="",
+    )
+    registry = SimpleNamespace(
+        _state_path=str(tmp_path / "jobs.json"),
+        list_workflow_runs=lambda: [workflow],
+    )
+    dispatcher = SimpleNamespace(_registry=registry, _git_runner=lambda args: "")
+
+    resume_calls: list[str] = []
+
+    monkeypatch.setattr(
+        manager_daemon.manager,
+        "resume_workflow_run",
+        lambda dispatcher_arg, **kwargs: resume_calls.append(kwargs["run_id"]),
+    )
+
+    runner = manager_daemon.build_periodic_tick_runner(
+        dispatcher=dispatcher,
+        specs_dir=str(tmp_path / "specs"),
+        handoff_dir=str(tmp_path / "handoff"),
+        launcher=object(),
+        run_tick_fn=lambda dispatcher_arg, **kwargs: {
+            "dispatch_skipped": False,
+            "dispatched": [],
+            "completed": [],
+            "errors": [],
+            "reaped": None,
+        },
+        scan_specs_fn=lambda specs_dir: [],
+        auto_claim_fn=lambda: [],
+        workflow_identity_registry=object(),
+    )
+
+    runner()
+
+    assert resume_calls == []
