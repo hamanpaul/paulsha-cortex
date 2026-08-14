@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 from .config import MonitorConfig
 from .fs import checked_resolve, checked_stat_mode
+from .github_pressure import GitHubPressureGate
 from .server import MonitorServer
 from .snapshot import ChangeEvent, SnapshotStore
 from .watcher import HAS_WATCHDOG, StubWatcher, WatchdogFileWatcher, Watcher
@@ -51,6 +52,8 @@ class ProjectMonitorService:
             durable_store=self._durable_work_store,
             read_store=self._work_store,
             stale_after_seconds=config.provider_stale_after_seconds,
+            # #506：GitHub 掃描的節流／退避閘門，跨 repo、跨輪次共用一份。
+            github_pressure_gate=GitHubPressureGate.from_config(config),
         )
         self._server = server or MonitorServer(
             store=self._store,

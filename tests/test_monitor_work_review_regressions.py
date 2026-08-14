@@ -179,9 +179,12 @@ def test_default_terminal_provider_receives_only_registry_linked_prs(
     captured: list[tuple[str, tuple[int, ...] | None]] = []
 
     class CapturingTerminalProvider:
-        def __init__(self, repo: str, *, relevant_pr_numbers=None):
+        # #506：預設 terminal provider 現在還會收到共享的 GitHub 壓力閘門
+        # （節流／退避），簽章跟著 work_api 的預設建構路徑走。
+        def __init__(self, repo: str, *, relevant_pr_numbers=None, pressure_gate=None):
             captured.append((repo, relevant_pr_numbers))
             self.repo = repo
+            self.pressure_gate = pressure_gate
 
         def scan(self) -> ProviderSnapshot:
             return _provider(f"github-terminal:{self.repo}")

@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
+from .github_pressure import GitHubPressureGate
 from .lifecycle import ClosureEvidence, project_work_items
 from .models import ProjectState
 from .providers import (
@@ -403,6 +404,7 @@ class WorkModelRefresher:
         workflow_provider_factory: Callable[[str], WorkflowRegistryProvider] | None = None,
         stale_after_seconds: int = 900,
         now: Callable[[], datetime] | None = None,
+        github_pressure_gate: GitHubPressureGate | None = None,
     ) -> None:
         self.durable_store = durable_store
         self.read_store = read_store
@@ -410,9 +412,14 @@ class WorkModelRefresher:
         self.github_terminal_provider_factory = (
             github_terminal_provider_factory or GitHubTerminalProvider
         )
+        self._uses_default_github_provider = github_provider_factory is None
         self._uses_default_github_terminal_provider = (
             github_terminal_provider_factory is None
         )
+        # #506：跨 repo 共用的節流／退避閘門。掃描是 per-repo 建 provider、
+        # 但壓力是 per-token 的，所以閘門必須活得比 provider 久（由 refresher
+        # 持有），否則節流只在單一 repo 內生效、退避每個 repo 各燒一次 403。
+        self.github_pressure_gate = github_pressure_gate
         self.workflow_provider_factory = workflow_provider_factory or WorkflowRegistryProvider
         self.stale_after_seconds = stale_after_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -425,6 +432,9 @@ class WorkModelRefresher:
         include_github: bool,
     ) -> tuple[WorkChangeEvent, ...]:
         with self._lock:
+            if include_github and self.github_pressure_gate is not None:
+                # #506：一輪 GitHub 掃描開始，重置本輪節流預算。
+                self.github_pressure_gate.begin_cycle()
             previous = self.read_store.current_snapshot()
             providers = dict(previous.providers)
             active_provider_ids: set[str] = set()
@@ -480,7 +490,16 @@ class WorkModelRefresher:
                 github_id = f"github:{repo}"
                 terminal_id = f"github-terminal:{repo}"
                 if include_github and is_github:
-                    github_result = self.github_provider_factory(repo).scan()
+                    # #506：預設 provider 才注入壓力閘門；注入自訂 factory 的
+                    # 呼叫端（測試／上層組裝）行為完全不變。
+                    github_provider = (
+                        GitHubWorkProvider(
+                            repo, pressure_gate=self.github_pressure_gate
+                        )
+                        if self._uses_default_github_provider
+                        else self.github_provider_factory(repo)
+                    )
+                    github_result = github_provider.scan()
                     github = _retain_last_good(providers.get(github_id), github_result)
                     providers[github_id] = github
                     relevant.append(github)
@@ -491,6 +510,7 @@ class WorkModelRefresher:
                                 workflow,
                                 repo=repo,
                             ),
+                            pressure_gate=self.github_pressure_gate,
                         )
                         if self._uses_default_github_terminal_provider
                         else self.github_terminal_provider_factory(repo)

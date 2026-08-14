@@ -58,6 +58,29 @@ class MonitorConfig:
     socket_path: Path = field(default_factory=default_socket_path)
     ignore_dirs: tuple[str, ...] = ()
     hippo_projects: tuple[ProjectEntry, ...] = ()
+    # #506：GitHub 請求節流／退避參數（預算計算與取捨見
+    # monitor/github_pressure.py 的模組 docstring）。interval 設 0 即停用節流。
+    github_request_interval_ms: int = 200
+    github_request_jitter_ms: int = 100
+    github_throttle_budget_seconds: int = 120
+    github_backoff_base_seconds: int = 60
+    github_backoff_max_seconds: int = 1800
+
+    def github_throttle_budget(self) -> float:
+        """本輪節流可花掉的總睡眠秒數上限。
+
+        #506：節流的用途是攤平 burst，不是把掃描拖到追不上自己的週期。因此
+        設定值再大也夾在 ``github_refresh_interval_seconds`` 的一半以下——
+        刻意用夾擠而非 fail-loud：既有部署若把 refresh interval 調小，不該讓
+        monitor 因為一個預設值就啟動失敗。
+        """
+
+        return float(
+            min(
+                self.github_throttle_budget_seconds,
+                self.github_refresh_interval_seconds / 2,
+            )
+        )
 
 
 def _resolve_config_source(config_path: Path | None) -> Path | None:
@@ -145,10 +168,25 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         ("watch_debounce_ms", 500),
         ("github_refresh_interval_seconds", 300),
         ("provider_stale_after_seconds", 900),
+        # #506：節流預算與退避參數。
+        ("github_throttle_budget_seconds", 120),
+        ("github_backoff_base_seconds", 60),
+        ("github_backoff_max_seconds", 1800),
     ):
         value = monitor.get(field_name, default)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"config.monitor.{field_name} 必須是正整數，得到 {value!r}")
+        intervals[field_name] = value
+    # #506：節流間隔／jitter 允許 0（代表關閉節流），故與上面的正整數分開驗。
+    for field_name, default in (
+        ("github_request_interval_ms", 200),
+        ("github_request_jitter_ms", 100),
+    ):
+        value = monitor.get(field_name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"config.monitor.{field_name} 必須是非負整數，得到 {value!r}"
+            )
         intervals[field_name] = value
     poll_interval = intervals["poll_interval_seconds"]
     rescan_interval = intervals["rescan_interval_seconds"]
@@ -176,6 +214,11 @@ def _load_manual_config(resolved: Path) -> MonitorConfig:
         legacy_policy=legacy_policy,
         socket_path=socket_path,
         ignore_dirs=ignore_dirs,
+        github_request_interval_ms=intervals["github_request_interval_ms"],
+        github_request_jitter_ms=intervals["github_request_jitter_ms"],
+        github_throttle_budget_seconds=intervals["github_throttle_budget_seconds"],
+        github_backoff_base_seconds=intervals["github_backoff_base_seconds"],
+        github_backoff_max_seconds=intervals["github_backoff_max_seconds"],
     )
 
 
