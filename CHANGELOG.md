@@ -8,6 +8,12 @@
 ## [Unreleased]
 
 ### Fixed
+- **planner launcher 暫時性服務失敗被判 `content` 死路**——agy 暫時性 503 會印錯誤文字但
+  exit 0，launcher parse 不到 JSON 即以 `content` 分類收場，而 `content` 禁用
+  recover-planning：自癒型服務錯誤變永久死路。修法：`_extract_json` no-JSON 失敗帶 stdout
+  截斷片段（503 當場可見、不再隨 temp_dir 丟棄）；新增
+  `_is_planning_transient_service_failure` 判準（比照 #416 殘留例外），服務層暫時性樣態
+  改判 `environment` 使 recover-planning 可用；內容不從維持 `content`。
 - **Issue #523：degraded 保留分支的 ownership collision 讓 work model refresh 永久失敗**
   ——`monitor/lifecycle.py` 的保留分支只比對 work_id、不比對 sources，source 歸屬由
   fallback work item 轉移到新宣告的 work item 時，舊 fallback 連同舊 sources 被整筆放回，

@@ -5966,6 +5966,52 @@ def _is_planning_authority_residue_failure(reason: str | None) -> bool:
     )
 
 
+# --- planner launcher 的暫時性服務失敗 ----------------------------------------
+#
+# 實測（2026-08-14，run `workflow-88d089d71416a754dda8`）：agy 服務暫時回
+# `Error: Eligibility check failed: UNAVAILABLE (code 503)`——**印錯誤文字但
+# exit 0**，launcher 因此去 parse stdout、找不到 JSON，失敗以
+# `primary-integration-malformed: ValueError: planning launcher returned no
+# JSON object` 收場，預設分類 `content` → `recover-planning` 被 #393 的
+# fail-closed 禁止 → 一個幾分鐘後自癒的 503 變成永久死路（同一指令 10 分鐘
+# 後重跑即成功）。這是 transient-誤判-死路模式的第五次命中（#500、#507 的
+# content 誤分類、worktree 汙染誤分類皆同族）。
+#
+# 判準刻意窄：只認 CLI/service 層的暫時性錯誤樣態（服務不可用、限流、逾時、
+# 連線層失敗）。模型「內容不從」（回散文不回 JSON、schema 不合）不在此列，
+# 維持 `content` 分類與 fail-closed 意圖——分辨依據是這些字樣出自 launcher
+# 轉印的服務錯誤，不會出現在合法的規劃輸出裡。
+_PLANNING_TRANSIENT_SERVICE_MARKERS = (
+    "unavailable",
+    "503",
+    "429",
+    "rate limit",
+    "too many requests",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "overloaded",
+    "temporarily",
+    "service_unavailable",
+    "eligibility check failed",
+)
+
+
+def _is_planning_transient_service_failure(reason: str | None) -> bool:
+    """判斷 planning 失敗的 reason 是否為 launcher/service 層的暫時性失敗。
+
+    命中者分類改落 `environment`（與 #416 的殘留例外同路），讓
+    `_resume_decision` 浮現 `recover-planning`——暫時性服務錯誤等它過去重跑
+    即可，不該燒掉一個世代或落入 abandon 死路。
+    """
+
+    if reason is None:
+        return False
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _PLANNING_TRANSIENT_SERVICE_MARKERS)
+
+
 # --- issue #511：planning artifact 拒收的診斷面 -------------------------------
 #
 # 修法前拒收只丟一句 `planning artifact is not accepted: <path>`：
@@ -9015,11 +9061,14 @@ def apply_workflow_action(
         # （見 claim.py 的 fail-closed 判準），行為與 issue 393 的 fail-closed
         # 意圖一致。`result.reason` 理論上不應為空，仍防禦性 fallback 避免
         # evidence 的 reason 欄位落空字串。
-        # #416：唯一例外——reason 命中 `_is_planning_authority_residue_failure`
+        # #416：例外一——reason 命中 `_is_planning_authority_residue_failure`
         # 判準時（abandon 未回滾的發佈殘留撞見 `_publish_planning_artifacts`
         # 的 authority fail-closed），這其實是環境／狀態殘留而非模型內容
         # 缺陷，改歸 `environment`，讓 `_resume_decision` 可以浮現
         # recover-planning，不必再燒一個世代改名重識別才能繞過。
+        # 例外二——`_is_planning_transient_service_failure`：launcher/service 層
+        # 的暫時性錯誤（503/限流/逾時；agy 實測會印錯誤文字但 exit 0），同歸
+        # `environment`。一個幾分鐘後自癒的服務錯誤不得被判成 `content` 死路。
         brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
         run = registry._manager_update_workflow_run(
             run.run_id,
@@ -9031,6 +9080,7 @@ def apply_workflow_action(
                 classification=(
                     "environment"
                     if _is_planning_authority_residue_failure(brainstorm_not_ready_reason)
+                    or _is_planning_transient_service_failure(brainstorm_not_ready_reason)
                     else "content"
                 ),
                 reason=brainstorm_not_ready_reason,
