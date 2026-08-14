@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 from paulsha_cortex._yaml import safe_load
+from paulsha_cortex.github_rate_limit import is_rate_limit_signal
 
 from .claim import (
     ClaimCandidate,
@@ -3687,6 +3688,35 @@ def _recover_repair_commit_action(
     }
 
 
+#: `#506`：auto-claim scan 逐 issue 讀 label 之間的最小間隔（毫秒）。
+#:
+#: 這條路徑是 fleet 對 GitHub 最大的持續壓力來源——實測 cortex instance 有 57 個
+#: `confirmed_todo` authority 帶 mapped issue，每個 tick 就是 57 次連發的 `gh api`，
+#: 且 PR `#512` 的 `GitHubPressureGate` 只注入到 `monitor/providers.py`，coordinator
+#: 這一側完全不受節流也不受退避管（monitor 退避期間 manager 照打）。GitHub 的
+#: secondary／abuse-detection limit 抓的正是這種連發形狀，實測會把整個帳號推進
+#: 懲罰窗，進而讓 `provider-authority-rate-limited-canonical` 擋下所有 claim。
+#:
+#: 這裡採用與 monitor 相同的「攤平」策略而非降頻：把一輪的 N 次請求攤在 N × interval
+#: 秒內送出。設 0 可完全停用（保留舊行為，供測試與單 issue 部署使用）。
+DEFAULT_AUTO_CLAIM_GITHUB_INTERVAL_MS = 1000
+
+
+def _auto_claim_github_interval_seconds() -> float:
+    raw = os.environ.get("PSC_MANAGER_GITHUB_INTERVAL_MS", "").strip()
+    if not raw:
+        return DEFAULT_AUTO_CLAIM_GITHUB_INTERVAL_MS / 1000.0
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(
+            "PSC_MANAGER_GITHUB_INTERVAL_MS 必須是非負整數（毫秒）"
+        ) from error
+    if value < 0:
+        raise ValueError("PSC_MANAGER_GITHUB_INTERVAL_MS 必須是非負整數（毫秒）")
+    return value / 1000.0
+
+
 def run_auto_claim_scan(
     *,
     snapshot_path: str | Path | None = None,
@@ -3696,6 +3726,7 @@ def run_auto_claim_scan(
     workflow_registry=None,
     workflow_starter=None,
     readiness_checker=None,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> list[dict[str, Any]]:
     """Project the durable Monitor snapshot into Manager-owned auto claims."""
 
@@ -3713,13 +3744,35 @@ def run_auto_claim_scan(
     if workflow_starter is None:
         workflow_starter = _fallback_workflow_starter(workflow_registry, resolved_state)
     results: list[dict[str, Any]] = []
+    github_interval = _auto_claim_github_interval_seconds()
+    issued_github_reads = 0
+    # #506：一旦本輪撞到 rate limit 就整批停手。舊行為是每個 authority 各自撞一次
+    # 才 break 自己那圈，於是限流期間每個 tick 仍會送出 O(authorities) 次必定失敗
+    # 的請求——每一次都在延長帳號層級的懲罰窗，形成「越限流越打、越打越限流」的
+    # 正回饋。退避窗綁 token 不綁 repo，因此一次命中就足以判定整輪無效。
+    rate_limited = False
     for authority in authorities:
         if not authority.confirmed_todo:
             continue
         live_auto_label = False
         if authority.mapped_issues:
+            # 只有真的需要打 GitHub 的 authority 才受這道停手影響；沒有 mapped
+            # issue 的 authority 本來就不讀 label，限流與它無關，照常 claim。
+            if rate_limited:
+                results.append(
+                    {
+                        "repo": authority.repo,
+                        "work_id": authority.work_id,
+                        "action": "blocked",
+                        "reason": "github-rate-limited-scan-aborted",
+                    }
+                )
+                continue
             issue_reads_failed = False
             for issue in authority.mapped_issues:
+                if github_interval > 0 and issued_github_reads:
+                    sleeper(github_interval)
+                issued_github_reads += 1
                 completed = runner(
                     ["gh", "api", f"repos/{authority.repo}/issues/{issue}"],
                     shell=False,
@@ -3727,12 +3780,20 @@ def run_auto_claim_scan(
                     text=True,
                 )
                 if getattr(completed, "returncode", None) != 0:
+                    stderr = getattr(completed, "stderr", "") or ""
+                    stdout = getattr(completed, "stdout", "") or ""
+                    if is_rate_limit_signal(f"{stderr}\n{stdout}"):
+                        rate_limited = True
                     results.append(
                         {
                             "repo": authority.repo,
                             "work_id": authority.work_id,
                             "action": "blocked",
-                            "reason": "github-label-read-failed",
+                            "reason": (
+                                "github-rate-limited"
+                                if rate_limited
+                                else "github-label-read-failed"
+                            ),
                         }
                     )
                     issue_reads_failed = True

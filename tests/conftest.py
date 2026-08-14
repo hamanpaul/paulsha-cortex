@@ -29,6 +29,10 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     unset_root = tmp_path / "unset-psc-root-guard"
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
+    # #506：auto-claim scan 的 GitHub 節流在生產預設 1000ms／請求。測試不打真的
+    # GitHub，也不該為了節流而真的 sleep——預設關閉，需要驗證節流行為的測試自行
+    # setenv 覆寫並注入 sleeper。
+    monkeypatch.setenv("PSC_MANAGER_GITHUB_INTERVAL_MS", "0")
 
 
 @pytest.fixture(autouse=True)

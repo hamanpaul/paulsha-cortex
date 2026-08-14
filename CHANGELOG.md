@@ -8,6 +8,22 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #506：auto-claim scan 是 fleet 對 GitHub 最大的持續壓力來源，且不受
+  `#512` 的節流閘門管轄**——`run_auto_claim_scan()` 對每個 `confirmed_todo` authority
+  的每個 mapped issue 各發一次即時 `gh api` 讀 label。實測 cortex instance 有 57 個
+  這樣的 issue，配上 `PSC_MANAGER_INTERVAL_SECONDS=30` 就是 **114 次／分鐘的連發**；
+  而 PR `#512` 的 `GitHubPressureGate` 只注入到 `monitor/providers.py`，`coordinator/`
+  這一側完全不受節流也不受退避管——monitor 進入退避時 manager 照打。實測把整個帳號
+  推進 secondary 懲罰窗（`gh api rate_limit` 顯示 `core remaining 4991/5000`，同一條
+  `--paginate` 請求 0.4 秒即 403），`provider-authority-rate-limited-canonical` 因而
+  擋下所有 claim，形成「限流 → 無法派工 → 修不了限流」的死結。修法兩項：(1) 逐次讀取
+  之間插入 `PSC_MANAGER_GITHUB_INTERVAL_MS`（預設 1000ms）的間隔，且**跨 authority
+  累計**——secondary limit 綁 token 不綁 repo，per-authority 重置節流等於沒有節流；
+  (2) 命中 rate-limit 型失敗即**中止整輪掃描**，其餘 authority 標成
+  `github-rate-limited-scan-aborted`。舊行為是每個 authority 各自撞一次才 break 自己
+  那圈，於是限流期間每個 tick 仍送出 O(authorities) 次必定失敗的請求，每一次都在延長
+  懲罰窗——「越限流越打、越打越限流」的正回饋。非限流的讀取失敗維持舊語意（只擋該
+  authority），以測試釘住。
 - **Issue #524：planning 成功的 in-flight run 被自行 supersede，其產出又使後續
   世代 fail-closed**——`claim_key`／`run.source_revision` 都由
   `work_authority_digest()` 導出，而該 digest 折入 `source_revisions`；run 自己的

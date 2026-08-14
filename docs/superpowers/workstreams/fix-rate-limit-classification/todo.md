@@ -29,3 +29,27 @@ foreign review／digest 共用同一個帳號配額。實測（2026-08-13 fleet 
 - [ ] 全域 API 預算節流：scan／auto-advance／foreign review／digest 共用一個 in-process rate budget，逼近上限時降頻而非硬撞
 - [ ] 測試涵蓋：secondary 403（remaining>0）不得走憑證路徑、primary 403（remaining=0）睡到 reset、`gh auth status` 誤報 invalid 時的交叉驗證分支
 
+## 2026-08-14 量測：主壓力源是 manager，不是 monitor，且節流閘門沒涵蓋它
+
+PR `#512` 把 `GitHubPressureGate` 注入到 `monitor/providers.py` 的 provider，**`coordinator/`
+這一側完全沒有節流也沒有退避**。實測數字：
+
+| 來源 | 週期 | 每輪呼叫 | 換算 |
+|---|---|---|---|
+| cortex **manager**（`work_actions.py:3425` per-issue label 讀取） | **30s** | 57 個 mapped issue | **114 次／分鐘** |
+| hippo manager | 60s | 10 | 10 次／分鐘 |
+| cortex monitor（有節流） | 1200s | 約 300 | 約 15 次／分鐘 |
+
+manager 一支就是 monitor 的七倍以上、24 小時不停。**monitor 進入退避時 manager 照打**——
+一邊踩煞車一邊踩油門，這是先前反覆調 monitor 參數（1000ms → 2000ms → 收斂掃描面）都無法讓
+provider 離開 degraded 的原因。
+
+複現：`gh api --method GET --paginate --jq '.[]' "repos/<owner>/<repo>/issues?state=all&per_page=100"`
+**0.4 秒即回 403**（懲罰窗作用中），同時 `gh api rate_limit` 顯示 `core remaining 4991/5000`
+——再次印證這是 secondary 而非配額耗盡。
+
+- [ ] **`GitHubPressureGate` 必須涵蓋 coordinator 側所有 `gh` 呼叫**（退避窗既是帳號層級，就該由所有打 GitHub 的路徑共用；現況 monitor 退避期間 manager 仍照打）
+- [ ] **auto-claim scan 不得 per-tick per-issue 打即時 API**：monitor 的 `GitHubWorkProvider` 每輪已把 issues 連同 labels 全撈回來，coordinator 應消費那份資料或加 TTL 快取，而不是同一份資料由兩個子系統各自向 GitHub 索取、其中一個還高頻
+- [ ] **`doctor` 呈現「manager 週期 × mapped issue 數 ＝ 每分鐘請求數」**：這個數字目前對 operator 完全不可見，是本次繞遠路的直接原因
+- [ ] **重新檢視 `PSC_MANAGER_INTERVAL_SECONDS` 預設值**，並讓它隨 mapped issue 數自適應（或至少在超過安全速率時 fail-loud 告警）
+
