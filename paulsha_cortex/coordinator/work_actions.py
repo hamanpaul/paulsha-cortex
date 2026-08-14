@@ -22,6 +22,7 @@ from paulsha_cortex._yaml import safe_load
 
 from .claim import (
     ClaimCandidate,
+    authority_digest_without_planning_outputs,
     build_claim_key,
     build_label_argv,
     claim_identity_digest,
@@ -1432,6 +1433,9 @@ def _claim_action(
     """
 
     canonical_run = None
+    # #524：canonical_run 是靠「in-flight 保護傘」而非 claim_key／identity 比對
+    # 找回來的旗標，供下方 #216 AC5 的 resume 分支判定用（見該處註解）。
+    inflight_resume = False
     if workflow_registry is not None:
         all_runs = workflow_registry.list_workflow_runs()
         expected_key = _expected_claim_key(authority)
@@ -1463,6 +1467,64 @@ def _claim_action(
             if len(active) > 1:
                 raise RuntimeError("active workflow identity is ambiguous")
             canonical_run = active[0] if active else None
+        if canonical_run is None:
+            # #524：in-flight 保護傘——「已在 flight 且未失敗的 run 不得被新的
+            # claim 作廢」。
+            #
+            # 根因：`claim_key` 由 `work_authority_digest` 導出，而該 digest 折入
+            # `source_revisions`。run 自己的 planning 卡把 spec/design/plan 寫進
+            # governed roots 之後，monitor 會把這些檔案當成**新的 confirmed
+            # source** 併入同一個 work item，digest 因此改變、`claim_key` 隨之
+            # 漂移——run 是被自己的成功產出擠掉識別的。上面第一段用
+            # `_expected_claim_key(authority)` 比對 persisted `run.claim_key`
+            # 於是必然落空。
+            #
+            # 第二段 fallback 雖然改用不受 planning 產出影響的穩定識別
+            # （issue_refs/openspec_refs），卻只在 `automatic`（auto-scan）或
+            # `args["action"] == "resume"` 時才跑；`start`／`intake` 這兩個
+            # control-request 入口整段跳過，canonical_run 保持 None，claim 路徑
+            # 把它當成全新 claim，`registry._manager_create_workflow_run` 再無
+            # 條件把同 (repo, work_id) 的 ongoing run 全部標成 superseded
+            # （見 registry.py 的 supersede 迴圈）——這正是 #524 生產現場
+            # `workflow-009fe9ab303df196209d` 四張卡全 passed、phase 已達 build
+            # 卻在 90 秒後被自行作廢的路徑。
+            #
+            # 這裡補的是最後一道、不分呼叫端的防線，判準有二，缺一不可：
+            #
+            # (1)「未失敗」：`run.status == "ongoing"` 且
+            #     `workflow_status(run) == "ongoing"`。兩個都要——`workflow_status`
+            #     對 abandon 釋放過的 run（`superseded` + `planning_released`）
+            #     刻意回傳 `"ongoing"`（見 work_bridge.py），只看它會把
+            #     #256／#416 的 abandon→reclaim 出口一併鎖死；只看
+            #     `run.status` 又會把 needs_human／needs_decomposition／blocked
+            #     的 run 誤納入保護。
+            #
+            # (2)「漂移完全來自 run 自己的產出」：把 planning phase 自產的
+            #     `superpowers_spec:`／`superpowers_plan:` source 剝掉之後重算的
+            #     authority digest，必須與 run 持久化的 `source_revision`（claim
+            #     當下的 `work_authority_digest`）逐字相符。相符即代表「除了這個
+            #     run 自己寫出來的 spec/design/plan 以外，authority 一個字都沒
+            #     變」，此時換代純屬自我作廢。
+            #
+            # 判準 (2) 同時守住既有的 operator 逃生口：issue 開關、openspec
+            # revision、todo 成員變動等**真正的** authority 變更不會被剝除，
+            # digest 依然不同，`start` 照舊開新世代（見
+            # tests/test_work_actions.py::test_source_change_starts_new_canonical_run）。
+            inflight_digest = authority_digest_without_planning_outputs(authority)
+            inflight = [
+                run
+                for run in all_runs
+                if run.repo == authority.repo
+                and run.work_id == authority.work_id
+                and run.status == "ongoing"
+                and workflow_status(run) == "ongoing"
+                and run.source_revision == inflight_digest
+            ]
+            if len(inflight) > 1:
+                raise RuntimeError("active workflow identity is ambiguous")
+            if inflight:
+                canonical_run = inflight[0]
+                inflight_resume = True
         if canonical_run is None and args.get("action") == "resume":
             completed = [
                 run
@@ -1539,8 +1601,14 @@ def _claim_action(
     if (
         canonical_run is not None
         and canonical_run.claim_key != _expected_claim_key(authority)
-        and (automatic or args.get("action") == "resume")
+        and (automatic or args.get("action") == "resume" or inflight_resume)
     ):
+        # #524：`inflight_resume` 讓 `start`／`intake` 也走進本分支。上面的
+        # 保護傘既然把 in-flight run 找了回來，就必須在這裡以 resume 收尾——
+        # 否則會落到下方 `decide_manual_start` -> `_existing()`，那裡對
+        # 「persisted claim_key 與目前 authority 不符」是直接
+        # `raise ValueError("persisted claim key does not match authority")`，
+        # 等於把原本的自行 supersede 換成一個例外，run 一樣救不回來。
         # #216 AC5：authority 宣告已變更（claim_key 不比對即代表 authority_digest
         # 不同）——只 invalidate 依賴該 authority 內容的 verify/review gate，
         # build phase 已產出的 Candidate 保持不變。僅在 verify/review phase 且

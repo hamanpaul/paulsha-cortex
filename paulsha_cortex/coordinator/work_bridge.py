@@ -183,6 +183,32 @@ def default_workflow_manifest(work_id: str, *, change: str | None, combo_name: s
     return result.workflow_manifest
 
 
+def _superpowers_spec_kind(ref: str) -> str:
+    """把 monitor 的 ``superpowers_spec`` source 還原成 planning 產線的 kind。
+
+    #524（B）：monitor 的 provider 規則把 ``docs/superpowers/specs/**/*.md``
+    一律標成 ``superpowers_spec``（見 ``monitor/providers.py``），但 planning
+    產線的 canonical destinations（見 ``planning_runtime.py`` 的
+    ``{"spec": ...-spec.md, "design": ...-design.md, "plan": ...}``）把同一個
+    目錄底下的 ``*-design.md`` 定義為 kind ``design``。
+
+    這條差異過去被 ``_artifact_rows`` 直接抹平成 ``spec``，於是新世代 claim 時
+    seed 進 ``run.planning_authority`` 的 design 檔掛著 kind ``spec``；等
+    brainstorming 用 kind ``design`` 對同一路徑重新發佈，
+    ``manager._publish_planning_artifacts`` 的 ``owner.kind != row["kind"]``
+    立刻 fail-closed，訊息即生產現場 ``workflow-7bb3a83c2c1fc37359d5`` 的
+    ``primary-artifact-write-rejected: ValueError: planning artifact lacks
+    current planning authority: ...-design.md``。下一代因此永遠承接不了前一代
+    的 artifact authority，連 ``recover-planning`` 重跑也是同一堵牆。
+
+    只用檔名尾綴判定（不讀內容）：``-design.md`` 對應 kind ``design``，其餘
+    維持 ``spec``。這與 ``planning_runtime`` 的 destinations 是同一組字面約定，
+    也是唯一能在「尚未讀檔」的 claim 時點取得的訊號。
+    """
+
+    return "design" if ref.endswith("-design.md") else "spec"
+
+
 def _artifact_rows(root: Path, authority: WorkAuthority) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -197,7 +223,7 @@ def _artifact_rows(root: Path, authority: WorkAuthority) -> list[dict[str, str]]
         source_id = revision.rsplit("@", 1)[0]
         prefix = f"superpowers_spec:{authority.repo}:"
         if source_id.startswith(prefix):
-            add("spec", source_id[len(prefix) :])
+            add(_superpowers_spec_kind(source_id[len(prefix) :]), source_id[len(prefix) :])
         prefix = f"superpowers_plan:{authority.repo}:"
         if source_id.startswith(prefix):
             add("plan", source_id[len(prefix) :])
