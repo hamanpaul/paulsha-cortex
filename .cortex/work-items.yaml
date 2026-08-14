@@ -650,3 +650,35 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-read-repo-tier-fail-closed/todo.md'
     excludes: []
+  fix-brainstorm-revalidation-diagnostics:
+    title: 'fix-brainstorm-revalidation-diagnostics'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-brainstorm-revalidation-diagnostics/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#514'
+    excludes: []
+  fix-instance-config-isolation:
+    title: 'fix-instance-config-isolation'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-instance-config-isolation/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#518'
+    excludes: []
+  fix-planning-rollback-destroys-operator-work:
+    title: 'fix-planning-rollback-destroys-operator-work'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-planning-rollback-destroys-operator-work/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#507'
+    excludes: []
+  fix-build-needs-human-diagnostics:
+    title: 'fix-build-needs-human-diagnostics'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-build-needs-human-diagnostics/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#527'
+    excludes: []
