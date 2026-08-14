@@ -642,14 +642,55 @@ class WorkModelRefresher:
                 for provider_id, provider in providers.items()
                 if provider_id in active_provider_ids
             }
-            snapshot = WorkSnapshot(
-                sequence=previous.sequence + 1,
-                written_at=attempted_at,
-                providers=providers,
-                work_items=tuple(projected_items),
-                source_owners=source_owners,
-                exclusions=tuple(_dedupe_mappings(exclusions)),
-            )
+            try:
+                snapshot = WorkSnapshot(
+                    sequence=previous.sequence + 1,
+                    written_at=attempted_at,
+                    providers=providers,
+                    work_items=tuple(projected_items),
+                    source_owners=source_owners,
+                    exclusions=tuple(_dedupe_mappings(exclusions)),
+                )
+            except ValueError as error:
+                # #523：projection 層的 ownership 驗證失敗，原本會讓整個 refresh 拋
+                # 例外——而這個例外發生在 `replace_durably()` **之前**，於是那一輪算出
+                # 的 provider 新狀態（包含「rate limit backoff 已結束、provider 恢復
+                # ok」這個事實）**一併被丟棄**。`previous` 因此永遠停在崩潰前那一版、
+                # `correlation.degraded` 永遠為真，下一輪以相同輸入重演同樣的例外：
+                # provider 無法離開 degraded，因為記錄它恢復的那次寫入正是拋例外的
+                # 那次寫入。實測形成永不自癒的死鎖，且外觀與單純限流難以區分。
+                #
+                # projection 是衍生資料，provider 觀測是第一手事實——兩者不該同生共死。
+                # 因此降級為「保留上一版 projection，但讓新的 provider 觀測落地」，
+                # 並把失敗原因寫進 diagnostics 讓 operator 看得見。若連降級版本都建不
+                # 起來，那是真正的資料損毀，照常往外拋。
+                degraded_providers = {
+                    provider_id: replace(
+                        provider,
+                        status="degraded",
+                        diagnostics=tuple(
+                            dict.fromkeys(
+                                (
+                                    *provider.diagnostics,
+                                    "work model projection retained: "
+                                    f"{type(error).__name__}: {error}",
+                                )
+                            )
+                        ),
+                    )
+                    for provider_id, provider in providers.items()
+                }
+                snapshot = WorkSnapshot(
+                    sequence=previous.sequence + 1,
+                    written_at=attempted_at,
+                    providers=degraded_providers,
+                    work_items=previous.work_items,
+                    source_owners=dict(previous.source_owners),
+                    exclusions=tuple(_dedupe_mappings(list(previous.exclusions))),
+                )
+                return self.read_store.replace_durably(
+                    snapshot, self.durable_store.write
+                )
             return self.read_store.replace_durably(
                 snapshot, self.durable_store.write, explanations=explanations
             )

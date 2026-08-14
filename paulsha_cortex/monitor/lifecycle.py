@@ -166,8 +166,36 @@ def project_work_items(
 
     if correlation.degraded:
         projected_ids = {group.work_id for group in correlation.groups}
+        # #523：保留分支原本只比對 **work_id**，不比對 **sources**。當某個 source 的
+        # 歸屬從 fallback work item（`correlation.py:_fallback_work_id` 產生的
+        # `issue:<ref>`）轉移到新宣告的 work item 時，本輪 correlation 已不再產生那個
+        # fallback，於是它「不在 projected_ids 裡」→ 連同**舊的 sources** 被整筆放回
+        # → 兩個 work item 同時宣稱擁有同一個 source →
+        # `work_snapshot.validate_ownership()` raise → 整個 refresh 失敗。
+        #
+        # 而該例外發生在 `WorkSnapshot.__post_init__`、早於 `replace_durably()`，
+        # 所以那一輪算出的 provider 新狀態（包含「backoff 已結束」）一併被丟棄，
+        # `previous` 永遠停在崩潰前那一版、`degraded` 永遠為真 → 每輪重演。
+        # 亦即 provider 無法離開 degraded，因為記錄它恢復的那次寫入正是拋例外的那次。
+        #
+        # 修法：保留時剝除已被本輪認領的 source。source 全被認領（集合變空）代表這筆
+        # 舊 work item 的內容已完整轉移到新歸屬，整筆丟棄即可——保留一個沒有任何
+        # source 的空殼既無資訊也無意義。
+        claimed_source_ids = {
+            source.source_id for group in correlation.groups for source in group.sources
+        }
         for item in previous.values():
             if item.work_id in projected_ids:
+                continue
+            retained_sources = tuple(
+                source
+                for source in item.sources
+                if source.source_id not in claimed_source_ids
+            )
+            # 只有「原本有 source、且全部被本輪認領」才代表內容已完整轉移、該整筆丟棄。
+            # 原本就沒有 source 的 previous item（例如僅由 workflow_run 衍生的項目）
+            # 維持既有保留語意，不受本修正影響。
+            if item.sources and not retained_sources:
                 continue
             decision = reduce_lifecycle(
                 LifecycleFacts(
@@ -184,7 +212,7 @@ def project_work_items(
                     state=decision.state,
                     phase=item.phase,
                     facets=decision.facets,
-                    sources=item.sources,
+                    sources=retained_sources,
                     next_actions=item.next_actions,
                     workflow_run_id=item.workflow_run_id,
                     updated_at=updated_at,

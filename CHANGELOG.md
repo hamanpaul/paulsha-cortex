@@ -8,6 +8,17 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #523：degraded 保留分支的 ownership collision 讓 work model refresh 永久失敗**
+  ——`monitor/lifecycle.py` 的保留分支只比對 work_id、不比對 sources，source 歸屬由
+  fallback work item 轉移到新宣告的 work item 時，舊 fallback 連同舊 sources 被整筆放回，
+  兩者同時宣稱擁有同一個 source → `validate_ownership()` raise。而該例外發生在
+  `WorkSnapshot.__post_init__`、早於 `replace_durably()`，那一輪算出的 provider 新狀態
+  （含「backoff 已結束」）一併被丟棄，`previous` 永遠停在崩潰前那版、`degraded` 永遠為真，
+  下一輪重演——provider 無法離開 degraded，因為記錄它恢復的那次寫入正是拋例外的那次寫入。
+  修法：保留時剝除已被本輪認領的 source（全數被認領即整筆丟棄，原本無 source 者維持既有
+  語意）；projection 驗證失敗降級為保留上一版 projection ＋ 讓 provider 觀測落地，並把
+  失敗原因寫入 provider diagnostics。**成因更正**：先前記為「時序競態」有誤，真正的觸發
+  條件是 `correlation.degraded`，亦即限流本身——`#506` 與本缺陷互鎖。
 - **Issue #530：claim 的 GitHub provider 檢查是 repo 範圍且無條件，把一次 GitHub 可用性
   事故放大成整個 fleet 的派工停擺**——`_authority_from_canonical_row` 在驗完「必須有
   todo-kind 來源」之後，完全不看那些 source 由誰供應，直接要求 `github:<repo>` 為 `ok`。

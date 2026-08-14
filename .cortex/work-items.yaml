@@ -688,3 +688,9 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-claim-provider-scope/todo.md'
     excludes: []
+  fix-degraded-retention-collision:
+    title: 'fix-degraded-retention-collision'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-degraded-retention-collision/todo.md'
+    excludes: []
