@@ -8,6 +8,25 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #524：planning 成功的 in-flight run 被自行 supersede，其產出又使後續
+  世代 fail-closed**——`claim_key`／`run.source_revision` 都由
+  `work_authority_digest()` 導出，而該 digest 折入 `source_revisions`；run 自己的
+  `brainstorming`／`writing-plans` 卡把 spec/design/plan 寫進 governed roots 後，
+  monitor 會把它們當成新的 confirmed source 併入同一個 work item，digest 因此改變、
+  run 的持久化識別與「目前 authority 算出來的識別」再也對不上。`_claim_action()`
+  的 active-run 偵測第二段 fallback 只在 auto-scan／explicit resume 時才跑，
+  `start`／`intake` 整段跳過，於是把仍在 flight 的 run 當成陳舊世代，
+  `_manager_create_workflow_run()` 再無條件把同 `(repo, work_id)` 的 ongoing run
+  全部作廢（現場 `workflow-009fe9ab303df196209d` 四張卡全 passed、phase 已達 build
+  仍被 90 秒後自行 supersede）。修法在 `_claim_action()` 補上不分呼叫端的 in-flight
+  保護傘，判準為「`run.status` 與 `workflow_status()` 皆為 ongoing」且「剝除
+  `superpowers_spec:`／`superpowers_plan:` 這兩類 planning **產出** source 後重算的
+  authority digest 與 run 的 `source_revision` 逐字相符」——即整段漂移都是 run 自己
+  造成的才保護，真正的 authority 變更維持既有換代語意。另修 `_artifact_rows()` 依
+  檔名尾綴把 `*-design.md` 還原為 kind `design`（monitor 一律標成
+  `superpowers_spec`，與 planning 產線的 `design` 不一致），讓下一代能承接前代的
+  artifact authority，解開 `planning artifact lacks current planning authority`
+  的死結。詳見 `changelog.d/supersede-active-run.md`。
 - **Issue #519：semantic-reclaim 世代熔斷補上帶審計的重置路徑**——`#218 AC2` 的
   世代熔斷對 `(repo, work_id)` 的全部 superseded 歷史無條件累加，且沒有任何重置
   路徑，導致根因（`#507`／`#511`／`#516` 等 cortex 自身缺陷）修好之後 work item

@@ -731,21 +731,72 @@ def _safe_todo_path(value: object) -> bool:
     )
 
 
-def work_authority_digest(authority: WorkAuthority) -> str:
-    if not isinstance(authority, WorkAuthority):
-        raise ValueError("confirmed WorkAuthority is required")
-    payload = {
+def _authority_digest_payload(
+    authority: WorkAuthority, source_revisions: tuple[str, ...]
+) -> dict:
+    return {
         "repo": authority.repo,
         "work_id": authority.work_id,
         "provider_id": authority.github_provider_id,
-        "source_revisions": list(authority.source_revisions),
+        "source_revisions": list(source_revisions),
         "mapped_issues": list(authority.mapped_issues),
         "mapped_prs": list(authority.mapped_prs),
         "mapped_openspec": list(authority.mapped_openspec),
         "mapped_todo_paths": list(authority.mapped_todo_paths),
         "confirmed_todo": authority.confirmed_todo,
     }
-    return verification.canonical_json_hash(payload)
+
+
+def work_authority_digest(authority: WorkAuthority) -> str:
+    if not isinstance(authority, WorkAuthority):
+        raise ValueError("confirmed WorkAuthority is required")
+    return verification.canonical_json_hash(
+        _authority_digest_payload(authority, authority.source_revisions)
+    )
+
+
+# #524：monitor 的 repo provider 以 glob 掃 `docs/superpowers/specs/**/*.md` 與
+# `docs/superpowers/plans/**/*.md` 產生的 source id 前綴（見 monitor/providers.py）。
+#
+# 這兩類 source 依構造永遠是 **planning phase 自己的產出**，不可能是 operator 在
+# `.cortex/work-items.yaml` 宣告的授權來源——canonical row 解析
+# （`_authority_from_canonical_row`）只認 `github_issue`／`github_pr`／`openspec`／
+# `todo` 四種 kind，`superpowers_*` 完全不在其中，只會被 monitor 掃出來。因此它們
+# 在 authority 裡「出現」這件事，只代表該 work item 的 run 正在成功推進，不代表
+# authority 被任何外部事實改動過。
+PLANNING_OUTPUT_SOURCE_PREFIXES = ("superpowers_spec:", "superpowers_plan:")
+
+
+def authority_digest_without_planning_outputs(authority: WorkAuthority) -> str:
+    """把 planning phase 自產的 source 剝掉之後重算的 authority digest。
+
+    #524：`claim_key`／`run.source_revision` 都由 `work_authority_digest` 導出，
+    而該 digest 折入 `source_revisions`。run 的 brainstorming／writing-plans 卡一旦
+    把 spec/design/plan 寫進 governed roots，monitor 下一輪就把它們當成新的
+    confirmed source 併進同一個 work item——digest 因此改變，run 的持久化識別與
+    「目前 authority 算出來的識別」再也對不上，claim 路徑於是把仍在 flight 的 run
+    當成陳舊世代作廢。
+
+    本函式提供的是「若不算 run 自己的產出，authority 是否仍是 claim 當下那一份」
+    這個判準：與 `run.source_revision` 相等即代表**整段漂移都是自己造成的**，此時
+    不得換代。反之（issue 開關、openspec revision、todo 成員變動……）維持既有的
+    新世代語意，operator 明確 `start` 換代的逃生口不受影響。
+
+    生產現場驗證：以 2026-08-14 的 snapshot 剝除兩個 `superpowers_spec` 與一個
+    `superpowers_plan` source 後重算，digest 為
+    `039e89aab0a56384bce29bc89dc638c4e176f96873e9a4d89627b223d79a31bf`，與被誤
+    supersede 的 `workflow-009fe9ab303df196209d` 持久化的 `source_revision` 逐字
+    相符。
+    """
+
+    if not isinstance(authority, WorkAuthority):
+        raise ValueError("confirmed WorkAuthority is required")
+    kept = tuple(
+        revision
+        for revision in authority.source_revisions
+        if not revision.startswith(PLANNING_OUTPUT_SOURCE_PREFIXES)
+    )
+    return verification.canonical_json_hash(_authority_digest_payload(authority, kept))
 
 
 def claim_identity_digest(authority: WorkAuthority) -> str:
