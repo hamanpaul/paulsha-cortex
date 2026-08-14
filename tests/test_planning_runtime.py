@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from paulsha_cortex.coordinator import planning_runtime
+from paulsha_cortex.coordinator import planning, planning_runtime
 import pytest
 
 from paulsha_cortex.coordinator.model_identities import AGY_MODEL_ID, IdentityRegistry, ModelIdentity
@@ -414,6 +414,56 @@ def test_integrator_prompt_states_echo_back_field_sources(monkeypatch, tmp_path:
     )
     # 明確禁止模型自行計算 hash——這正是 #516 的誤解來源。
     assert "do not compute, derive, or invent a hash" in integrator_prompt
+
+
+def test_integrator_prompt_states_exact_required_heading_per_kind(monkeypatch, tmp_path: Path) -> None:
+    """issue #520：舊 prompt 寫「required headings: Requirements for spec, Decisions
+    for design, Tasks for plan」，原意是逐 kind 對應，但字面同樣可讀成「必要標題就是
+    `Requirements for spec`」。實測 planner 採了後者、產出 `## Requirements for spec`，
+    而 `planning._has_required_heading()` 是 casefold 後**完全相等**比對（標題正規化只
+    剝編號前綴，不剝 ` for spec` 尾綴），因此必然 `required-section-missing`。prompt
+    必須逐 kind 給出精確標題文字，並明確禁止在標題後附加 kind 名稱。"""
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary", "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy", "model_id": AGY_MODEL_ID, "independence_domain": "google",
+                "capabilities": ["planning"], "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    prompts: list[str] = []
+
+    def runner(argv, **kwargs):
+        if argv == ["agy", "models"]:
+            return _completed(f"{AGY_MODEL_ID}\n")
+        prompt = argv[argv.index("--print") + 1] if "--print" in argv else argv[2]
+        prompts.append(prompt)
+        return _completed(json.dumps({"schema_version": 1, "question_pack_id": "qp-x"}))
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"), worktree=tmp_path, runner=runner
+    )
+    runtime.primary_integrator(
+        {"schema_version": 1, "pack_id": "qp-x", "questions": []},
+        {"schema_version": 1, "question_pack_id": "qp-x", "evidence": [], "evidence_hash": "dead"},
+    )
+
+    integrator_prompt = prompts[-1]
+    # 逐 kind 的精確標題，不留第二種讀法。
+    assert 'exactly "## Requirements" for kind=spec' in integrator_prompt
+    assert 'exactly "## Decisions" for kind=design' in integrator_prompt
+    assert 'exactly "## Tasks" for kind=plan' in integrator_prompt
+    # 明確禁止附加 kind 名稱——這正是 #520 的誤解結果。
+    assert "do not append the kind name" in integrator_prompt.casefold()
+    # 產生 #520 失敗態的那個字串本身不得再出現在 prompt 裡。
+    assert "Requirements for spec" not in integrator_prompt
+    # #520 建議 4：這段文字由 `planning` 的判準常數機械產生，prompt 端不得另寫一份。
+    assert planning.required_heading_hint() in integrator_prompt
 
 
 def test_planning_source_material_rejects_symlink_traversal(tmp_path: Path) -> None:

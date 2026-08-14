@@ -22,6 +22,7 @@ from .model_identities import (
     load_model_identities,
     probe_agy_capability,
 )
+from .planning import required_heading_hint
 
 
 @dataclass(frozen=True)
@@ -645,6 +646,11 @@ def build_production_planning_runtime(
         # secondary_evidence.evidence_hash），模型只需原樣複製；但輸入欄位名
         # （evidence_hash）與輸出欄位名（secondary_evidence_hash）不同，後者字面上
         # 像是要模型自己算 hash，只列欄位名時會反覆撞 evidence hash mismatch。
+        # #520：第三輪，這次是必要標題。舊句「required headings: Requirements for
+        # spec, ...」字面上可讀成「標題就是 `Requirements for spec`」，模型照抄後必然
+        # 撞 required-section-missing。標題要求現改由 `planning.required_heading_hint()`
+        # 依驗收判準（`_ACCEPTED_HEADINGS` / `_REQUIRED_HEADINGS`）機械產生——prompt 端
+        # 不再持有第二份真實來源，判準改動會自動同步到 prompt。
         return invoke_primary(
             "Do not call tools or edit files. Integrate only the supplied evidence. Return exactly one "
             "JSON object with schema_version=1, question_pack_id, secondary_evidence_hash, resolutions, "
@@ -657,8 +663,9 @@ def build_production_planning_runtime(
             "resolution's artifact(s) are written to — the same strings used as artifacts[].path. "
             "The set of all artifacts[].path values must equal the union of all artifact_refs. "
             "Each artifact has only kind, path, content; content must be complete UTF-8 Markdown with "
-            "frontmatter status: accepted, the matching work_item, and required headings: Requirements "
-            "for spec, Decisions for design, Tasks for plan. Use the supplied destination paths. "
+            "frontmatter status: accepted and the matching work_item. "
+            + required_heading_hint()
+            + " Use the supplied destination paths. "
             + _JSON_OUTPUT_CONTRACT + " Input: "
             + json.dumps(
                 {

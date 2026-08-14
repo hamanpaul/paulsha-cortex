@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -10,10 +11,13 @@ from paulsha_cortex.coordinator.model_identities import (
     IdentityRegistry,
 )
 from paulsha_cortex.coordinator.planning import (
+    PLANNING_KINDS,
     PlanningArtifact,
     PlanningScope,
+    _REQUIRED_HEADINGS,
     assess_planning_artifact,
     assess_planning_completeness,
+    required_heading_hint,
     run_heterogeneous_brainstorm,
     validate_question_pack,
     validate_secondary_evidence,
@@ -89,6 +93,36 @@ def test_artifact_acceptance_requires_status_sections_and_no_blocking_marker() -
         )
     )
     assert "status-not-accepted" in duplicate_status.reasons
+
+
+def test_required_heading_criterion_is_the_single_source_of_the_prompt_hint() -> None:
+    """issue #520：驗收判準（`_REQUIRED_HEADINGS`）與 integrator prompt 的標題要求
+    過去是兩份各自維護的真實來源，已因不同步造成 #516／#520 兩次確定性失敗。
+    `required_heading_hint()` 必須由判準機械產生：首選標題真的通過驗收、完整可接受
+    集合都揭露給模型，且附加 kind 名稱的寫法確實會被拒收。"""
+    # 判準本身不因本次重構而改變（frozen expectation）。
+    assert _REQUIRED_HEADINGS == {
+        "spec": frozenset({"requirements", "requirement", "problem", "problem and outcome", "goals"}),
+        "design": frozenset({"decisions", "decision", "design", "architecture"}),
+        "plan": frozenset({"task", "tasks"}),
+    }
+
+    hint = required_heading_hint()
+    for kind in PLANNING_KINDS:
+        for title in _REQUIRED_HEADINGS[kind]:
+            assert re.search(rf"\b{re.escape(title)}\b", hint.casefold()), title
+
+    for kind, heading in (("spec", "Requirements"), ("design", "Decisions"), ("plan", "Tasks")):
+        assert f'exactly "## {heading}" for kind={kind}' in hint
+        accepted = assess_planning_artifact(
+            _artifact(kind, f"---\nstatus: accepted\n---\n# T\n\n## {heading}\n\nBody.\n")
+        )
+        assert accepted.accepted is True, kind
+
+    rejected = assess_planning_artifact(
+        _artifact("spec", "---\nstatus: accepted\n---\n# T\n\n## Requirements for spec\n\nBody.\n")
+    )
+    assert "required-section-missing" in rejected.reasons
 
 
 def test_canonical_accepted_source_spec_and_plan_satisfy_required_sections() -> None:
