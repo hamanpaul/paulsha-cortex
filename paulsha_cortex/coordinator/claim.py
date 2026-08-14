@@ -176,6 +176,12 @@ class WorkAuthority:
     github_provider_revision: str
     github_last_success_epoch: float
     snapshot_hash: str
+    #: `#530`：本 work item 的 confirmed sources 是否真的由 GitHub provider 供應。
+    #: 為 False 時（權威全部來自本機檔案系統 provider，例如只掛一份 workstream
+    #: `todo.md` 的 work item），GitHub provider 的健康度與新鮮度與這筆工作無關，
+    #: 不得用來擋 claim——否則一次 GitHub 可用性事故會放大成整個 fleet 的派工停擺。
+    #: 預設 True（保守：legacy schema 與未宣告來源者一律沿用嚴格 fail-closed）。
+    requires_github_authority: bool = True
 
     @classmethod
     def _verified(
@@ -194,6 +200,7 @@ class WorkAuthority:
         provider_id: str = GITHUB_PROVIDER_ID,
         last_success_epoch: float,
         snapshot_hash: str,
+        requires_github_authority: bool = True,
     ) -> "WorkAuthority":
         authority = object.__new__(cls)
         object.__setattr__(authority, "repo", repo)
@@ -209,6 +216,9 @@ class WorkAuthority:
         object.__setattr__(authority, "github_provider_revision", provider_revision)
         object.__setattr__(authority, "github_last_success_epoch", last_success_epoch)
         object.__setattr__(authority, "snapshot_hash", snapshot_hash)
+        object.__setattr__(
+            authority, "requires_github_authority", bool(requires_github_authority)
+        )
         return authority
 
 
@@ -544,6 +554,25 @@ def _authority_from_canonical_row(
             work_id=work_id_label,
             field="work_id",
         )
+    # #530：這筆 work item 的 confirmed sources 究竟由誰供應？只有真的用到 GitHub
+    # 的 work item 才該被 GitHub provider 的健康度擋下。
+    #
+    # 判準以 provider id 前綴為主（`github:`／`github-terminal:` 都是 GitHub 來源，
+    # `repo:` 是本機檔案系統），kind 為第二道保險——remote todo／openspec 由
+    # `github-terminal:` 供應，只看 kind 會漏掉它們。
+    #
+    # **資訊缺席一律保守**：`provider` 欄位缺失或非字串時視為「可能來自 GitHub」，
+    # 維持既有的嚴格 fail-closed。放寬只發生在 source 明確標示了非 GitHub provider
+    # 的情況——亦即我們有正面證據證明這筆工作不依賴 GitHub，而不是「沒看到證據」。
+    def _source_needs_github(source: dict) -> bool:
+        if source.get("kind") in {"github_issue", "github_pr"}:
+            return True
+        provider = source.get("provider")
+        if not isinstance(provider, str) or not provider:
+            return True
+        return provider.startswith(GITHUB_PROVIDER_ID)
+
+    requires_github_authority = any(_source_needs_github(source) for source in confirmed)
     provider_id = f"github:{repo}"
     github = providers.get(provider_id)
     if not isinstance(github, dict):
@@ -586,7 +615,16 @@ def _authority_from_canonical_row(
         have_last_known_good = (
             isinstance(revision, str) and bool(revision) and isinstance(last_success_at, str)
         )
-        if not (allow_rate_limited_last_known_good and rate_limited and have_last_known_good):
+        # #530：不依賴 GitHub 的 work item（confirmed sources 全部來自本機檔案系統
+        # provider）只要 snapshot 還留有 last-known-good 的 revision/timestamp，就
+        # 沿用它建構 authority——GitHub 此刻健不健康與這筆工作無關。這道豁免與上面
+        # 的退休語境豁免（#370 follow-up）條件並列而非取代：兩者都要求
+        # last-known-good 齊全，差別只在放行的理由。缺 revision／壞 timestamp 仍嚴格拒絕。
+        github_authority_waived = not requires_github_authority and have_last_known_good
+        if not (
+            github_authority_waived
+            or (allow_rate_limited_last_known_good and rate_limited and have_last_known_good)
+        ):
             if status != "ok":
                 if rate_limited:
                     raise AuthorityValidationError(
@@ -716,6 +754,7 @@ def _authority_from_canonical_row(
         provider_id=provider_id,
         last_success_epoch=last_success,
         snapshot_hash=snapshot_hash,
+        requires_github_authority=requires_github_authority,
     )
 
 
@@ -1202,6 +1241,13 @@ def _authority_is_fresh(authority: WorkAuthority, *, now_epoch: int | float) -> 
         or not math.isfinite(float(now_epoch))
     ):
         raise ValueError("claim clock must be finite")
+    # #530：新鮮度檢查衡量的是「GitHub 觀測有多舊」。權威不依賴 GitHub 的 work
+    # item（sources 全部來自本機檔案系統 provider）沒有這個維度可言——它的內容新鮮度
+    # 已由 `source_revisions` 承載，拿 GitHub 的 last-success 時間去擋它是錯配。
+    # 這是 `#530` 三層放大中的第二層；只修 `_authority_from_canonical_row` 而不修
+    # 這裡，claim 仍會在 decide_manual_start／auto-claim 被擋下。
+    if not getattr(authority, "requires_github_authority", True):
+        return True
     age = float(now_epoch) - authority.github_last_success_epoch
     return 0 <= age <= PROVIDER_MAX_AGE_SECONDS
 
