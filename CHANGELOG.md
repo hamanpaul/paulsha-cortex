@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+### Added
+- **Issue #506 / D4：monitor 的本機事件入口（spool）＋targeted refresh——事件是
+  **hint 不是 authority**——新增 `paulsha_cortex/monitor/event_spool.py` 作為本機
+  事件契約與唯一入口。D1–D3 把常態讀取壓到每 repo 每日 26 次計費請求，代價是**發現
+  延遲**：fleet 自己剛動過的物件也只能等下一次輪詢把整個清單再問一遍。D5（headless
+  agent hook，**不在本次**）將依本契約把「我剛動了 GitHub 物件」寫進 spool，monitor
+  每輪消費它。**spool 契約**：目錄 `monitor_event_spool_root()`（預設
+  `<agents>/monitor/event-spool/`，壞檔隔離到同層 `quarantine/`），**每事件一檔**
+  （`<emitted_at 壓平>-<event_id 前綴>.json`，因此消費就是 per-file `unlink`，不需
+  鎖或 offset 檔），**原子寫入**（temp 檔 `.` 前綴 → fsync → `os.replace`，消費端
+  不可能讀到半寫入的檔案），信封欄位 `schema_version`／`event_id`／`event_type`／
+  `emitted_at`／`source`＋選配 `job_id`／`payload`。**fire-and-forget 寫入端語意**：
+  `EventSpool.emit()` 不等回應、不與 monitor 交握、**永不 raise**——hook 掛在別人
+  （agent job）的工作路徑上，spool 寫不進去絕不能影響工作本體，掉一則 hint 的後果
+  只是退回原本的 refresh 週期延遲，而那正是 D3 每日 anti-entropy 的守備範圍。事件
+  **契約層就不給 producer 塞新狀態的欄位**，`action` 純屬診斷——對應 `correlation`
+  既有的 inferred→confirmed 語彙：spool hint 是 inferred 訊號，只有 targeted 驗證
+  回來的物件才是 confirmed、才進鏡像。**消費端**：D3 清單同步跑完後才消費 spool，
+  對被點名物件發單物件 `repos/{repo}/issues/{number}` 的**targeted 條件請求**，
+  per-object ETag 存進 `IssueSyncState.targeted_etags` 並與清單端點的 `etag` **分開
+  存**（兩者 request path 不同，混用會讓條件請求永遠落空；304 一路不取回應的 ETag，
+  與 D3 同一顆地雷）；targeted 讀回來的新狀態**不得推進 `since` 游標**（游標只能由
+  清單回應推進，否則會跳過那之間被更新的其他物件）。**去重**：同物件多事件收斂成
+  一次驗證，所有貢獻事件檔一起消費。**過期安全跳過**：事件早於本輪請求、且該物件已
+  被本輪讀取涵蓋（在增量 delta 裡，或本輪是全量）就直接消費、不花請求；清單回 304
+  **不算**一次讀取，不得算進涵蓋範圍。**處理成功才消費**：事件檔一路留到鏡像真的
+  落地為止。**fail safe**：targeted 請求失敗／壞 JSON／回錯物件一律不寫鏡像也不消費
+  事件；回 404 不從鏡像刪任何東西（刪除／transfer 只有每日全量對帳看得到），留給
+  anti-entropy。**壞檔隔離不阻塞**：壞 JSON／缺欄位／payload 形狀不合／超過 TTL 的
+  孤兒事件移進 `quarantine/`，同輪其餘事件照常處理。**per-cycle 上限 20**：hook 是
+  per-tool-call 觸發的，沒有上限等於把 D1–D3 省下的配額交還給事件量決定。**#498
+  擴充點**：`event_type` 為封閉列舉的擴充位，本次只消費 `github_object`；
+  `steering`／`job` 已在 `RESERVED_EVENT_TYPES` 佔位，掃到時**原地保留、只記 log 與
+  計數、絕不刪除**（那些事件屬於未來的另一個 consumer），未知型別與未知
+  `schema_version` 同樣保留不動。**D5 的 hook 注入不在本次**，launcher 未動；沒有
+  spool 目錄時 provider 行為與 D3 逐位元組相同。詳見
+  `changelog.d/d4-event-spool.md`。新增 `tests/test_monitor_event_spool_506.py`
+  （51 個測試）。
+
 ### Changed
 - **Issue #506 / D3：GitHub issues 改走 `state=all&since=` ＋ ETag 條件請求的增量
   同步，全量只作每日一次的 anti-entropy 對帳**——`GitHubWorkProvider` 過去每輪對

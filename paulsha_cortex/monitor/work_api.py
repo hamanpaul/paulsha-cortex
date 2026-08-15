@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
+from .event_spool import EventSpool
 from .git_mirror import GITHUB_HTTPS_REMOTE, GITHUB_SSH_REMOTE
 from .github_issue_sync import IssueSyncStore
 from .github_pressure import GitHubPressureGate
@@ -430,6 +431,7 @@ class WorkModelRefresher:
         now: Callable[[], datetime] | None = None,
         github_pressure_gate: GitHubPressureGate | None = None,
         issue_sync_store: IssueSyncStore | None = None,
+        event_spool: EventSpool | None = None,
     ) -> None:
         self.durable_store = durable_store
         self.read_store = read_store
@@ -449,6 +451,10 @@ class WorkModelRefresher:
         # 必須活得比 provider 久——provider 是 per-repo per-cycle 建的，游標卻要
         # 跨輪次續存，狀態掛在 provider 上等於每輪都全量。
         self.issue_sync_store = issue_sync_store or IssueSyncStore()
+        # #506 / D4：本機事件入口。跟游標一樣必須活得比 per-repo provider 久——
+        # spool 是跨 repo 的單一目錄，掃描結果由各 repo 的 provider 各取所需。
+        # 目錄不存在（D5 hook 尚未部署）就是一次空掃描，不建目錄、不報錯。
+        self.event_spool = event_spool or EventSpool()
         self.workflow_provider_factory = workflow_provider_factory or WorkflowRegistryProvider
         self.stale_after_seconds = stale_after_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -527,6 +533,9 @@ class WorkModelRefresher:
                             pressure_gate=self.github_pressure_gate,
                             # D3：沒有這個 store 就沒有游標可續，每輪都會退回全量。
                             sync_store=self.issue_sync_store,
+                            # D4：事件 spool 是加速器——沒有它就純粹退回 D3 的
+                            # refresh 週期發現延遲，不影響正確性。
+                            event_spool=self.event_spool,
                         )
                         if self._uses_default_github_provider
                         else self.github_provider_factory(repo)

@@ -78,3 +78,29 @@ REST rate limit 管轄。
 - **provenance**：`github-terminal:` provider 的 observations 多一個 `remote_reads`
   欄位，記 transport、checkout 路徑、本輪 fetch 的 refspec、缺席物件、blob 讀取數
   與 ancestry 判定數。
+
+## 事件入口（spool）：事件是 hint，不是 authority（#506 / D4）
+
+D1–D3 把常態讀取壓下來的代價是**發現延遲**——fleet 自己剛動過的物件，也只能等下
+一次輪詢把整個清單再問一遍。`paulsha_cortex.monitor.event_spool` 開一條本機通道：
+別的行程把「我剛動了哪個 GitHub 物件」寫成一個事件檔，monitor 每輪消費它，對被
+點名的物件做 targeted 條件驗證後才更新鏡像。
+
+- **spool 位置**：`monitor_event_spool_root()`，預設 `<agents>/monitor/event-spool/`
+  （隨 `PSC_MONITOR_STATE_ROOT` / `PSC_AGENTS_ROOT` 移動）。壞事件檔隔離到同層的
+  `quarantine/`。目錄由**寫入端**建立——monitor 掃到目錄不存在就是「這台機器沒有
+  事件 producer」，不是錯誤。
+- **一事件一檔、原子寫入**：temp 檔（`.` 前綴，掃描端跳過）→ fsync → `os.replace`，
+  0600。消費就是 per-file `unlink`，不需要鎖或 offset 檔。
+- **fire-and-forget**：`EventSpool.emit()` 永不 raise，失敗只回 `None`。寫入端掛在
+  別人的工作路徑上，spool 寫不進去不得影響工作本體。
+- **事件不帶新狀態**：`github_object` 事件只說「哪個 repo 的哪個編號被動了」，鏡像
+  只寫 GitHub 自己回的內容（`correlation` 的 inferred→confirmed 語彙）。
+- **targeted 驗證**：單物件 `repos/{repo}/issues/{number}`，帶 per-object ETag 的
+  條件請求（304 不計配額）。驗不到就不寫鏡像、不消費事件，留給每日 anti-entropy。
+  targeted 讀取**不推進** `since` 游標。
+- **上限**：預設一輪最多驗 20 個物件，超出的留到下一輪（依 `emitted_at` FIFO）。
+- **記帳**：`github:` provider 的 observations 多一個 `event_spool` 欄位（未接 spool
+  時不出現）。
+- **其他事件型別**：`steering` / `job`（#498）與未知型別一律**原地保留只記 log**，
+  等各自的 consumer 落地。
