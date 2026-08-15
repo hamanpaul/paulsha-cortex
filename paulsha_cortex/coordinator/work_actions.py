@@ -55,6 +55,7 @@ from .github_delivery import (
 )
 from . import engineering_outcome
 from . import verification
+from . import worktree_reclaim
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .work_bridge import current_sizing_snapshot, resolve_trusted_repo_root, workflow_status
 from .workflow import GateEvidenceRef
@@ -2484,6 +2485,56 @@ def _gc_abandoned_planning_artifacts(run) -> None:
             )
 
 
+def _reclaim_abandoned_build_worktrees(run, workflow_registry, *, state_path: Path) -> None:
+    """#478／#527：run 被 supersede（abandon）之後回收它名下的 build worktree。
+
+    #527 的根因之一是 supersede 只改 run 狀態、不動 build worktree——那份
+    worktree 連同它在 git registry 的記錄留著，下一世代重派同名分支時
+    `git worktree add` 直接以「branch used by worktree at ...」失敗。這裡與
+    `_gc_abandoned_planning_artifacts` 走同一個掛載點與同一套 best-effort 紀律：
+    回收只能是 abandon 的附帶效果，任何失敗只落 diagnostics，不得讓已經成立的
+    abandon 反悔（abandon 的 evidence 與終態轉換此時皆已 durable）。
+
+    範圍以 job 的 `workflow_run_id` 精準框定——與 `engineering_outcome.
+    emit_outcome` 同一條歸屬判準，不用 work_id 前綴猜。
+    """
+
+    try:
+        jobs = workflow_registry.list_jobs()
+    except Exception as exc:  # noqa: BLE001 - best-effort：不得讓 abandon 失敗
+        logger.warning(
+            "build-worktree-reclaim-listing-failed run_id=%s error=%s: %s",
+            run.run_id, type(exc).__name__, str(exc)[:200],
+        )
+        return
+    targets = [
+        job.get("worktree")
+        for job in jobs
+        if job.get("workflow_run_id") == run.run_id
+        and isinstance(job.get("worktree"), str)
+        and job.get("worktree")
+    ]
+    if not targets:
+        return
+    try:
+        results = worktree_reclaim.reclaim_worktrees(
+            targets, preserve_root=state_path.resolve().parent / "evidence"
+        )
+    except Exception as exc:  # noqa: BLE001 - best-effort：不得讓 abandon 失敗
+        logger.warning(
+            "build-worktree-reclaim-failed run_id=%s error=%s: %s",
+            run.run_id, type(exc).__name__, str(exc)[:200],
+        )
+        return
+    for result in results:
+        if result.ok:
+            continue
+        logger.warning(
+            "build-worktree-reclaim-failed run_id=%s path=%s detail=%s",
+            run.run_id, result.path, result.detail,
+        )
+
+
 def _superseded_abandon_body(
     run,
     *,
@@ -2631,6 +2682,9 @@ def _abandon_action(
         # 呼叫之前殘留仍未清乾淨」的窗口；已清過的項目在這裡自然是 no-op
         # （`_gc_one_abandoned_planning_artifact` 對已不存在的檔案直接略過）。
         _gc_abandoned_planning_artifacts(updated)
+        _reclaim_abandoned_build_worktrees(
+            updated, workflow_registry, state_path=state_path
+        )
         return {
             "action": "abandoned",
             "reason": reason,
@@ -2706,6 +2760,8 @@ def _abandon_action(
     # artifacts——放在狀態轉換之後，確保只有 abandon 真的成立時才動檔案；
     # GC 本身 best-effort、不 raise，失敗不得讓已經成功的 abandon 跟著失敗。
     _gc_abandoned_planning_artifacts(updated)
+    # #478／#527：supersede 也要回收 build worktree，紀律同上（best-effort）。
+    _reclaim_abandoned_build_worktrees(updated, workflow_registry, state_path=state_path)
     return {
         "action": "abandoned",
         "reason": reason,
@@ -3428,16 +3484,21 @@ def _recover_pre_candidate_action(
         slug = target_slice["branch"].replace("/", "-")
         wt_path = str(Path(paths.worktree_root()) / slug)
 
+    # #478：舊碼用裸 `subprocess.run(["git", "worktree", ...])`（無 `-C <repo>`，
+    # 實際跑在 manager 進程的 cwd 上）、`check=False` 吞錯，且只在目錄還在時
+    # 觸發——registry 殘留與「目錄已消失但 registry 還在」都清不掉。統一改走
+    # `worktree_reclaim`，後置條件不成立即 fail closed。
+    reclaim = None
     if wt_path and isinstance(wt_path, (str, Path)):
-        target_wt = Path(wt_path)
-        if target_wt.exists() or target_wt.is_symlink():
-            try:
-                subprocess.run(["git", "worktree", "remove", "--force", str(target_wt)], check=False)
-            except Exception:
-                pass
-            if target_wt.exists() or target_wt.is_symlink():
-                import shutil
-                shutil.rmtree(target_wt, ignore_errors=True)
+        reclaim = worktree_reclaim.reclaim_worktree(
+            wt_path,
+            preserve_root=state_path.resolve().parent / "evidence",
+        )
+        if not reclaim.ok:
+            raise RuntimeError(
+                "recover-pre-candidate worktree reclaim failed: "
+                f"{reclaim.detail or reclaim.status} ({reclaim.path})"
+            )
 
     actor = args.get("actor") or requested_by
     workflow_registry.record_action(
@@ -3456,13 +3517,16 @@ def _recover_pre_candidate_action(
         candidate=None,
     )
     updated = workflow_registry.get_slice(slice_id)
-    return {
+    payload: dict[str, Any] = {
         "action": "recover-pre-candidate",
         "reason": "pre-candidate-slice-reset",
         "slice_id": slice_id,
         "slice_state": updated.get("state"),
         "gate_state": updated.get("gate_state"),
     }
+    if reclaim is not None:
+        payload["worktree_reclaim"] = reclaim.to_dict()
+    return payload
 
 
 def _find_repair_adoption_record(

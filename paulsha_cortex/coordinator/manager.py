@@ -33,6 +33,7 @@ from . import seams
 from . import review as foreign_review
 from . import terminal_contract
 from . import verification
+from . import worktree_reclaim
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
@@ -192,6 +193,20 @@ def _supersede_handoff_manifest(
         handoff.write_manifest(manifest_path, payload)
     except OSError:
         pass
+
+
+def _reclaim_preserve_root(registry) -> Path:
+    """#478：worktree 回收時 dirty 內容的封存落點（`<state 檔目錄>/evidence`）。
+
+    與 `verification.write_verification_evidence`／`_recover_planning_record`
+    同一個 coordinator 狀態根，operator 只要看同一棵 evidence 樹就找得到；
+    registry 未帶 state path（測試 double）時退回 `paths.coordinator_root()`。
+    """
+
+    state_path = getattr(registry, "_state_path", None)
+    if isinstance(state_path, (str, Path)):
+        return Path(state_path).resolve().parent / "evidence"
+    return paths.coordinator_root() / "evidence"
 
 
 def _is_workflow_lane_job(job: dict) -> bool:
@@ -1395,17 +1410,24 @@ def apply_slice_action(
             slug = slice_row["branch"].replace("/", "-")
             wt_path = str(Path(paths.worktree_root()) / slug)
 
+        # #478：舊碼在 `runner is None`（生產 dispatcher 的合法狀態）時整段跳過
+        # git 清理只 rmtree 目錄，registry 記錄留下來讓下一 tick 的
+        # `git worktree add` 必失敗；且清理只在「目錄還在」時觸發，既存的
+        # 「目錄已消失、registry 殘留」壞狀態永遠自癒不了。改走單一回收函式：
+        # 預設 runner 由 `worktree_reclaim` 自行 fallback，後置條件（目錄不存在
+        # ＋ registry 無該筆）驗證不過就 fail closed，不再回報 ok。
+        reclaim = None
         if wt_path and isinstance(wt_path, (str, Path)):
-            target_wt = Path(wt_path)
-            if target_wt.exists() or target_wt.is_symlink():
-                if runner is not None:
-                    try:
-                        runner(["git", "worktree", "remove", "--force", str(target_wt)])
-                    except Exception:
-                        pass
-                if target_wt.exists() or target_wt.is_symlink():
-                    import shutil
-                    shutil.rmtree(target_wt, ignore_errors=True)
+            reclaim = worktree_reclaim.reclaim_worktree(
+                wt_path,
+                git_runner=runner,
+                preserve_root=_reclaim_preserve_root(registry),
+            )
+            if not reclaim.ok:
+                raise RuntimeError(
+                    "recover-pre-candidate worktree reclaim failed: "
+                    f"{reclaim.detail or reclaim.status} ({reclaim.path})"
+                )
 
         consumed_at = clock()
         registry.record_action(
@@ -1433,7 +1455,7 @@ def apply_slice_action(
             clock=clock,
         )
         latest = registry.get_slice(slice_id)
-        return {
+        payload = {
             "slice_id": slice_id,
             "action": action,
             "slice_state": latest.get("state"),
@@ -1442,6 +1464,9 @@ def apply_slice_action(
             "requested_at": requested_at,
             "consumed_at": consumed_at,
         }
+        if reclaim is not None:
+            payload["worktree_reclaim"] = reclaim.to_dict()
+        return payload
 
     if action == "retry-build":
         metas = scan_specs_fn(specs_dir)
@@ -5502,6 +5527,25 @@ def _sha256_path(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _planning_conflict_hint(path: Path, *, run_id: str | None) -> str:
+    """#535：no-clobber 衝突訊息附上殘留檔的歸屬與時間，供 operator 直接判讀。
+
+    `owner=` 取自檔名帶的 run identity（`brainstorm-<run_id>-<hash>.json`，見
+    `planning.brainstorm_evidence_filename`）；舊命名的殘留檔沒有這段，回
+    `legacy-unscoped`——那正是「前代殘留」最典型的樣態。
+    """
+
+    owner = "legacy-unscoped"
+    match = re.match(r"^[a-z-]+-(workflow-[0-9a-f]{20})-[0-9a-f]+\.json$", path.name)
+    if match is not None:
+        owner = match.group(1)
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+    except OSError:
+        modified = "unknown"
+    return f"existing owner={owner} mtime={modified} publishing run={run_id or 'unknown'}"
+
+
 class PlanningPublicationDrift(RuntimeError):
     """A durable planning intent cannot be safely committed or rolled back."""
 
@@ -5634,7 +5678,13 @@ class _PlanningPublicationTransaction:
             raise ValueError(f"planning immutable evidence mode conflict: {relative}")
         if existed and baseline_hash is None:
             if not idempotent_evidence:
-                raise ValueError(f"planning artifact no-clobber conflict: {relative}")
+                # #535：舊訊息只有相對路徑，operator 得自己挖 mtime 對時間軸才
+                # 知道那份殘留檔屬於哪個 run、是不是已 superseded 的前代產物。
+                # 這裡直接附上落點歸屬（檔名帶的 run identity）與 mtime。
+                raise ValueError(
+                    f"planning artifact no-clobber conflict: {relative}"
+                    f" ({_planning_conflict_hint(path, run_id=self.run_id)})"
+                )
         if baseline_hash is not None and (not existed or before_hash != baseline_hash):
             raise ValueError(f"planning artifact baseline CAS conflict: {relative}")
         missing_dirs: list[str] = []
@@ -9083,6 +9133,10 @@ def apply_workflow_action(
             coordinator_root=transaction_root,
         ),
         evidence_writer=publication.write_evidence,
+        # #535：brainstorm evidence 的 content-addressed 命名納入 run identity，
+        # 前一世代（已 abandon）的殘留檔才不會佔住新世代的落點。前代檔案原位
+        # 保留、原路徑仍可稽核——evidence 不搬不刪。
+        run_id=run.run_id,
     )
     if result.state != "ready" or result.gate_refs.brainstorm_peer is None:
         publication.rollback()

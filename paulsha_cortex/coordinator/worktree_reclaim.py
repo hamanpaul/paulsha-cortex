@@ -1,0 +1,460 @@
+"""issue #478：build worktree 的原子化回收（目錄 ＋ git worktree registry）。
+
+回收 build worktree 一直分散在兩處手寫片段（`manager.apply_slice_action` 的
+`recover-pre-candidate` 分支與 `work_actions._recover_pre_candidate_action`），
+兩處都只在「目錄還在」時才嘗試 git 清理、失敗一律吞掉，於是產生 #478 的生產
+現場：目錄刪了、`git worktree list --porcelain` 仍留著同一條 registry 記錄
+（`prunable gitdir file points to non-existent location`），下一個 tick 的
+`git worktree add` 立刻以 `cannot force update the branch ... used by worktree
+at ...` 失敗，slice 被打回 `needs_human`。
+
+本模組把回收收斂成單一函式，契約如下：
+
+- **原子性**：「目錄不存在」與「registry 無該筆記錄」兩個後置條件必須同時成立，
+  否則回收判定為 ``failed``——呼叫端據此 fail closed，不得回報成功。
+- **自癒**：既存壞狀態（目錄已不存在、registry 殘留）也要能收乾淨；因此
+  registry 探測先於目錄探測，不以目錄存在與否作為要不要清 registry 的條件。
+- **不銷毀證據**：目錄若帶未提交／未追蹤內容，先複製到 ``preserve_root`` 底下
+  的 reclaim 封存再刪；封存失敗即 ``failed``，一個位元組都不刪（#478 的
+  `.project-policy.yml` 資料遺失回報）。
+
+git_runner seam 沿用 `dispatcher.GitRunner` 契約：收 **git 子命令參數**（不含
+前導 ``git``、不含 ``-C``），對 repo root 執行，失敗時 raise。#478 驗收條款
+「do not prepend `git` if the seam accepts Git subcommand arguments only」指的
+就是舊碼在此處多塞一個 ``git`` 造成 `git -C <repo> git worktree remove ...`。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+from uuid import uuid4
+
+from paulsha_cortex.config import paths
+
+from .dispatcher import _default_git_runner
+
+logger = logging.getLogger(__name__)
+
+GitRunner = Callable[[list[str]], Any]
+
+# 回收結果三態。`absent` 與 `reclaimed` 都算成功（後置條件成立）；只有
+# `failed` 代表後置條件無法證實，呼叫端必須 fail closed。
+RECLAIM_RECLAIMED = "reclaimed"
+RECLAIM_ABSENT = "absent"
+RECLAIM_FAILED = "failed"
+
+# 封存單檔上限；超過者只記名不複製（builder worktree 偶有大型 build 產物，
+# 全複製會讓回收變成不可預期的 I/O）。
+PRESERVE_FILE_MAX_BYTES = 4 * 1024 * 1024
+# 封存檔數上限，理由同上。
+PRESERVE_FILE_MAX_COUNT = 512
+
+
+@dataclass(frozen=True)
+class WorktreeReclaim:
+    """單一 worktree 的回收結果（機器可讀，供 action record／診斷帶出）。"""
+
+    status: str
+    path: str
+    registry_entry_found: bool = False
+    registry_removed: bool = False
+    directory_removed: bool = False
+    preserved_ref: str | None = None
+    preserved_files: int = 0
+    detail: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {RECLAIM_RECLAIMED, RECLAIM_ABSENT}
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": self.status,
+            "path": self.path,
+            "registry_entry_found": self.registry_entry_found,
+            "registry_removed": self.registry_removed,
+            "directory_removed": self.directory_removed,
+        }
+        if self.preserved_ref is not None:
+            payload["preserved_ref"] = self.preserved_ref
+            payload["preserved_files"] = self.preserved_files
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        return payload
+
+
+def _pinned_git_runner(repo_root: Path) -> GitRunner:
+    def _runner(args: list[str]) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git -C {repo_root} {' '.join(args)} 失敗: {proc.stderr.strip()}"
+            )
+        return proc.stdout.strip()
+
+    return _runner
+
+
+def resolve_git_runner(
+    git_runner: GitRunner | None = None,
+    *,
+    repo_root: str | Path | None = None,
+) -> GitRunner:
+    """#478 驗收條款：未注入 runner 時必須退回 production-safe 的預設實作。
+
+    舊碼是 `runner = git_runner or getattr(dispatcher, "_git_runner", None)`，
+    而生產 dispatcher 的 `_git_runner` 合法為 ``None``（它自己在 dispatch 時
+    才 fallback 到預設），於是 recovery 整段 git 清理被跳過。
+    """
+
+    if git_runner is not None:
+        return git_runner
+    if repo_root is not None:
+        return _pinned_git_runner(Path(repo_root))
+    return _default_git_runner
+
+
+def _run(runner: GitRunner, args: list[str]) -> tuple[bool, str, str]:
+    """執行 git 子命令；回傳 (成功, stdout, 錯誤摘要)。
+
+    同時吃兩種 runner 回傳型別：dispatcher 風格（回 stdout 字串、失敗 raise）
+    與 `subprocess.CompletedProcess` 風格，避免呼叫端被迫改造既有 seam。
+    """
+
+    try:
+        raw = runner(list(args))
+    except Exception as exc:  # noqa: BLE001 - seam 失敗一律轉成結構化結果
+        return False, "", f"{type(exc).__name__}: {str(exc)[:400]}"
+    if isinstance(raw, str):
+        return True, raw, ""
+    returncode = getattr(raw, "returncode", None)
+    stdout = getattr(raw, "stdout", "") or ""
+    stderr = getattr(raw, "stderr", "") or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    if not isinstance(returncode, int):
+        # 無法判定回傳碼的 seam（多半是測試 double）視為成功但無輸出。
+        return True, str(stdout), ""
+    if returncode != 0:
+        return False, str(stdout), str(stderr).strip()[:400]
+    return True, str(stdout), ""
+
+
+def _identity_keys(path: str | Path) -> set[str]:
+    text = str(path)
+    keys = {text, os.path.normpath(text)}
+    try:
+        keys.add(os.path.realpath(text))
+    except OSError:  # pragma: no cover - realpath 幾乎不拋
+        pass
+    return {key.rstrip("/") or "/" for key in keys}
+
+
+def list_registered_worktrees(runner: GitRunner) -> tuple[list[str], str | None]:
+    """`git worktree list --porcelain` 的 worktree 路徑清單。
+
+    回傳 ``(paths, error)``；``error`` 非 None 代表無法取得清單——呼叫端必須
+    視為「後置條件不可證實」而 fail closed，不得當成「沒有殘留」。
+    """
+
+    ok, stdout, stderr = _run(runner, ["worktree", "list", "--porcelain"])
+    if not ok:
+        return [], stderr or "git worktree list failed"
+    entries = [
+        line[len("worktree ") :].strip()
+        for line in stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+    return entries, None
+
+
+def _registry_contains(runner: GitRunner, target: Path) -> tuple[bool, str | None]:
+    entries, error = list_registered_worktrees(runner)
+    if error is not None:
+        return False, error
+    wanted = _identity_keys(target)
+    for entry in entries:
+        if _identity_keys(entry) & wanted:
+            return True, None
+    return False, None
+
+
+def _looks_like_linked_worktree(target: Path) -> bool:
+    """linked worktree 的根目錄帶的是 `.git` **檔案**（內容 `gitdir: ...`）。
+
+    `.git` 是**目錄**代表那是一個主 checkout（獨立 repo，例如 run 的
+    `workspace_root`）——那絕不是本模組該遞迴刪除的東西，一律回 False。
+    """
+
+    marker = target / ".git"
+    return marker.is_file() and not marker.is_symlink()
+
+
+def _timestamp_slug() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _dirty_entries(runner: GitRunner, target: Path) -> tuple[list[str], str | None]:
+    """列出 worktree 內未提交／未追蹤（不含 ignored）的相對路徑。
+
+    透過 ``git -C <worktree>`` 走同一個 seam：git 允許重複 ``-C``，後者為絕對
+    路徑時直接生效，因此不必為了讀 worktree 狀態另開一條 runner 契約。
+
+    刻意**不用** ``git status --porcelain``：seam 契約回傳的是已 ``strip()`` 的
+    字串，porcelain 的兩字狀態碼首欄可能是空白（`` M README.md``），首筆記錄會
+    被 strip 掉一個字元、路徑跟著錯位。改用兩個只吐裸路徑的命令，對 strip 免疫。
+    """
+
+    entries: list[str] = []
+    ok, stdout, stderr = _run(
+        runner, ["-C", str(target), "diff", "--name-only", "-z", "HEAD"]
+    )
+    if not ok:
+        return [], stderr or "git diff failed"
+    entries.extend(field for field in stdout.split("\0") if field)
+    ok, stdout, stderr = _run(
+        runner,
+        ["-C", str(target), "ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    if not ok:
+        return [], stderr or "git ls-files failed"
+    entries.extend(field for field in stdout.split("\0") if field)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for entry in entries:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        unique.append(entry)
+    return unique, None
+
+
+def _preserve_dirty_content(
+    target: Path,
+    entries: list[str],
+    *,
+    preserve_root: Path,
+) -> tuple[str, int]:
+    """把 dirty 內容複製到 reclaim 封存目錄，回傳 (封存路徑, 檔數)。"""
+
+    destination = (
+        Path(preserve_root)
+        / "worktree-reclaim"
+        / f"{target.name}-{_timestamp_slug()}-{uuid4().hex[:8]}"
+    )
+    destination.mkdir(parents=True, exist_ok=False)
+    copied = 0
+    skipped: list[str] = []
+    for relative in entries[:PRESERVE_FILE_MAX_COUNT]:
+        source = target / relative
+        if source.is_symlink() or not source.is_file():
+            continue
+        if source.stat().st_size > PRESERVE_FILE_MAX_BYTES:
+            skipped.append(relative)
+            continue
+        copy_to = destination / relative
+        copy_to.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, copy_to)
+        copied += 1
+    overflow = entries[PRESERVE_FILE_MAX_COUNT:]
+    if skipped or overflow:
+        manifest = destination / "_reclaim-skipped.txt"
+        manifest.write_text(
+            "\n".join([*skipped, *overflow]) + "\n", encoding="utf-8"
+        )
+    return str(destination), copied
+
+
+def reclaim_worktree(
+    path: str | Path,
+    *,
+    git_runner: GitRunner | None = None,
+    repo_root: str | Path | None = None,
+    preserve_root: str | Path | None = None,
+) -> WorktreeReclaim:
+    """原子回收單一 build worktree（目錄 ＋ registry），並驗證後置條件。
+
+    後置條件（兩者皆須成立才回報成功）：
+
+    1. ``git worktree list --porcelain`` 不再含該路徑；
+    2. 該路徑在檔案系統上不存在。
+
+    任一條無法證實（含 registry 清單本身讀不到）一律回 ``failed``；呼叫端
+    MUST NOT 在 ``failed`` 上回報 recovery 成功——這正是 #478 的核心缺陷。
+    """
+
+    runner = resolve_git_runner(git_runner, repo_root=repo_root)
+    target = Path(path)
+    text = str(target)
+
+    registered, list_error = _registry_contains(runner, target)
+    if list_error is not None:
+        return WorktreeReclaim(
+            RECLAIM_FAILED, text, detail=f"worktree-registry-unreadable: {list_error}"
+        )
+
+    exists = target.exists() or target.is_symlink()
+    if not registered and not exists:
+        return WorktreeReclaim(RECLAIM_ABSENT, text)
+
+    # 安全閘（先於任何寫入／掃描）：registry 沒這筆、目錄本身也沒有
+    # linked-worktree 標記，代表這個路徑不是（也不曾是）build worktree——
+    # job／slice 記錄可能陳舊或指錯（實測 `job.worktree` 會等於 run 的
+    # `workspace_root`，那是主 checkout），遞迴刪除的爆炸半徑不可接受。
+    # 回報 failed 讓 operator 看見異常，而不是靜默刪掉別人的目錄，也不是
+    # 靜默留下會擋住下一次 `worktree add` 的殘骸。
+    if (
+        exists
+        and not registered
+        and not target.is_symlink()
+        and target.is_dir()
+        and not _looks_like_linked_worktree(target)
+    ):
+        return WorktreeReclaim(RECLAIM_FAILED, text, detail="worktree-path-not-a-worktree")
+
+    preserved_ref: str | None = None
+    preserved_files = 0
+    if exists and not target.is_symlink() and target.is_dir():
+        entries, dirty_error = _dirty_entries(runner, target)
+        if dirty_error is not None:
+            # gitdir 已壞（正是 #478 的殘留態）時 status 讀不到；此時目錄要嘛
+            # 不存在、要嘛只剩無主檔案，記錄後照常回收，不阻斷自癒。
+            logger.warning(
+                "worktree-reclaim-dirty-scan-unavailable path=%s error=%s",
+                text,
+                dirty_error,
+            )
+        elif entries:
+            root = Path(preserve_root) if preserve_root is not None else (
+                paths.coordinator_root() / "evidence"
+            )
+            try:
+                preserved_ref, preserved_files = _preserve_dirty_content(
+                    target, entries, preserve_root=root
+                )
+            except OSError as exc:
+                # 證據沒保住就一個位元組都不刪——#478 的 `.project-policy.yml`
+                # 資料遺失回報要求「preserve or fail closed」，不得兩者皆非。
+                return WorktreeReclaim(
+                    RECLAIM_FAILED,
+                    text,
+                    registry_entry_found=registered,
+                    detail=(
+                        "worktree-dirty-preserve-failed: "
+                        f"{type(exc).__name__}: {str(exc)[:200]}"
+                    ),
+                )
+
+    registry_removed = False
+    remove_error: str | None = None
+    if registered:
+        ok, _, stderr = _run(runner, ["worktree", "remove", "--force", text])
+        if not ok:
+            remove_error = stderr or "git worktree remove failed"
+            # `--force` 拒收時（例如 gitdir 檔已被外力刪除）再試 prune，
+            # 這是 native `git worktree prune` 的等價操作。
+            _run(runner, ["worktree", "prune"])
+        still_registered, list_error = _registry_contains(runner, target)
+        if list_error is not None:
+            return WorktreeReclaim(
+                RECLAIM_FAILED,
+                text,
+                registry_entry_found=True,
+                preserved_ref=preserved_ref,
+                preserved_files=preserved_files,
+                detail=f"worktree-registry-unreadable: {list_error}",
+            )
+        if still_registered:
+            return WorktreeReclaim(
+                RECLAIM_FAILED,
+                text,
+                registry_entry_found=True,
+                preserved_ref=preserved_ref,
+                preserved_files=preserved_files,
+                detail=(
+                    "worktree-registry-entry-remains: "
+                    f"{remove_error or 'git worktree remove reported success'}"
+                ),
+            )
+        registry_removed = True
+
+    directory_removed = False
+    if target.exists() or target.is_symlink():
+        is_link_or_file = target.is_symlink() or target.is_file()
+        try:
+            if is_link_or_file:
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+        except OSError as exc:
+            return WorktreeReclaim(
+                RECLAIM_FAILED,
+                text,
+                registry_entry_found=registered,
+                registry_removed=registry_removed,
+                preserved_ref=preserved_ref,
+                preserved_files=preserved_files,
+                detail=f"worktree-directory-remove-failed: {type(exc).__name__}: {str(exc)[:200]}",
+            )
+        directory_removed = True
+
+    if target.exists() or target.is_symlink():
+        return WorktreeReclaim(
+            RECLAIM_FAILED,
+            text,
+            registry_entry_found=registered,
+            registry_removed=registry_removed,
+            preserved_ref=preserved_ref,
+            preserved_files=preserved_files,
+            detail="worktree-directory-remains",
+        )
+
+    return WorktreeReclaim(
+        RECLAIM_RECLAIMED,
+        text,
+        registry_entry_found=registered,
+        registry_removed=registry_removed,
+        directory_removed=directory_removed,
+        preserved_ref=preserved_ref,
+        preserved_files=preserved_files,
+    )
+
+
+def reclaim_worktrees(
+    worktrees: list[str | Path],
+    *,
+    git_runner: GitRunner | None = None,
+    repo_root: str | Path | None = None,
+    preserve_root: str | Path | None = None,
+) -> list[WorktreeReclaim]:
+    """對多個 worktree 逐一回收（去重、保序）；不因單筆失敗而中止。"""
+
+    seen: set[str] = set()
+    results: list[WorktreeReclaim] = []
+    for item in worktrees:
+        text = str(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        results.append(
+            reclaim_worktree(
+                text,
+                git_runner=git_runner,
+                repo_root=repo_root,
+                preserve_root=preserve_root,
+            )
+        )
+    return results

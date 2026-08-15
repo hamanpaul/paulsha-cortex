@@ -66,6 +66,29 @@
   advisory lock、以及 worktree drift 仍被分類為 `content` 而禁用 `recover-planning`，
   均留待後續。
 
+- **Issue #478／#535（前代殘留回收族）：worktree registry 原子回收與 planning evidence
+  世代隔離**——`#478`：`recover-pre-candidate` 只刪 build worktree 目錄、未清 git worktree
+  registry，下一 tick 的 `git worktree add` 立即以 `cannot force update the branch ...
+  used by worktree at ...` 失敗，slice 被打回 `needs_human`。根因是兩份各自手寫的回收
+  片段——`manager.apply_slice_action` 在 `dispatcher._git_runner` 為 `None`（生產合法狀態）
+  時整段跳過 git 清理，且呼叫 seam 時多塞前導 `git`；`work_actions._recover_pre_candidate_action`
+  用裸 `subprocess.run` 無 `-C <repo>` 又 `check=False` 吞錯；兩者皆只在「目錄還在」時才
+  清理，「目錄已消失但 registry 殘留」的既存壞狀態永遠自癒不了。新增
+  `coordinator/worktree_reclaim.py` 收斂為單一回收函式：後置條件（目錄不存在 ＋ registry
+  無該筆）驗證不過即 fail closed 不回 `ok`；registry 探測先於目錄探測以支援自癒
+  （`worktree remove --force` 失敗再以 `worktree prune` 兜底）；dirty 內容先封存到
+  `evidence/worktree-reclaim/` 再刪，封存失敗即拒絕刪除（對應未追蹤 `.project-policy.yml`
+  被靜默刪除的回報）；並設安全閘拒收「非 linked worktree」的路徑，避免陳舊 job 記錄
+  （實測 `job.worktree` 會等於 run 的 `workspace_root`）讓回收遞迴刪掉主 checkout。
+  `abandon`（supersede）路徑改走同一支回收函式，補上 `#527` 根因之一的「supersede 不回收
+  build worktree」。`#535`：brainstorm evidence 的 content-addressed 檔名原本只由
+  `(scope, question_pack_id)` 決定，前代 abandon 後殘留檔佔住同一落點，下一世代 byte 不同
+  即撞 no-clobber fail-closed。改為命名空間帶 run identity
+  （`brainstorm-<run_id>-<hash>.json`，run_id 亦進 hash 輸入）——取捨為不搬動前代 evidence，
+  因為搬檔會讓前代 run 逐字記錄的 `gate_refs`／`evidence_refs` 絕對路徑整批懸空，違反審計
+  不可變原則；世代內的衝突偵測維持 fail closed。no-clobber 錯誤訊息另附
+  `existing owner=/mtime=/publishing run=`，operator 不必再挖 mtime 對時間軸。
+
 - **R0.5 D1（部分）：auto-claim label 判定改走 monitor 鏡像**——monitor 把持有
   `cortex:auto-on-going` 的 open issue 編號寫進 provider observations（issues 回應本來就含
   labels，零額外 API）；canonical claim 路徑據此導出 `auto_label`（原硬編 False）；
