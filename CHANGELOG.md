@@ -8,6 +8,12 @@
 ## [Unreleased]
 
 ### Fixed
+- **R0.5 D1（部分）：auto-claim label 判定改走 monitor 鏡像**——monitor 把持有
+  `cortex:auto-on-going` 的 open issue 編號寫進 provider observations（issues 回應本來就含
+  labels，零額外 API）；canonical claim 路徑據此導出 `auto_label`（原硬編 False）；
+  auto-claim scan 廢除每 tick O(mapped issues) 的 live label sweep（實測 57 次/tick），
+  鏡像 False 零 API、鏡像 True 僅一次 targeted 複驗（以 live 為準、確認即 early-break）。
+  observations 缺失一律保守 False。
 - **planner launcher 暫時性服務失敗被判 `content` 死路**——agy 暫時性 503 會印錯誤文字但
   exit 0，launcher parse 不到 JSON 即以 `content` 分類收場，而 `content` 禁用
   recover-planning：自癒型服務錯誤變永久死路。修法：`_extract_json` no-JSON 失敗帶 stdout

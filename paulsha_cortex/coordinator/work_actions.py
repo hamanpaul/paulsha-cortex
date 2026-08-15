@@ -22,6 +22,7 @@ from paulsha_cortex._yaml import safe_load
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
 
 from .claim import (
+    AUTO_LABEL,
     ClaimCandidate,
     authority_digest_without_planning_outputs,
     build_claim_key,
@@ -3754,10 +3755,18 @@ def run_auto_claim_scan(
     for authority in authorities:
         if not authority.confirmed_todo:
             continue
-        live_auto_label = False
-        if authority.mapped_issues:
-            # 只有真的需要打 GitHub 的 authority 才受這道停手影響；沒有 mapped
-            # issue 的 authority 本來就不讀 label，限流與它無關，照常 claim。
+        # R0.5 D1：auto label 先讀鏡像（monitor 的 GitHubWorkProvider 已把持有
+        # auto label 的 issue 編號寫進 provider observations，authority.auto_label
+        # 據此導出）。鏡像為 False 的 authority **零 API 呼叫**直接進 claim 決策
+        # （decide_auto_claim 以 auto-label-missing ignore）——這一步把先前
+        # 每 tick 對每個 mapped issue 各發一次 live gh api 的 O(n) sweep
+        # （實測 57 次/tick）降為 O(鏡像為 True 的 authority 數)，通常為 0。
+        # 鏡像為 True 時才做**一次 targeted 複驗**：label 可能在兩次 monitor
+        # refresh 之間被人類移除，claim 是不可逆動作，行前以單發 live 讀取確認。
+        live_auto_label = authority.auto_label
+        if live_auto_label and authority.mapped_issues:
+            # 只有真的需要打 GitHub 的 authority 才受這道停手影響；鏡像 False
+            # 或沒有 mapped issue 的 authority 不讀 label，限流與它無關，照常 claim。
             if rate_limited:
                 results.append(
                     {
@@ -3769,6 +3778,7 @@ def run_auto_claim_scan(
                 )
                 continue
             issue_reads_failed = False
+            verified = False
             for issue in authority.mapped_issues:
                 if github_interval > 0 and issued_github_reads:
                     sleeper(github_interval)
@@ -3818,9 +3828,13 @@ def run_auto_claim_scan(
                     )
                     issue_reads_failed = True
                     break
-                live_auto_label = live_auto_label or "cortex:auto-on-going" in names
+                if AUTO_LABEL in names:
+                    verified = True
+                    break
             if issue_reads_failed:
                 continue
+            # 複驗結果為準：鏡像說有、live 說沒有 → 以 live 為準（label 已被移除）。
+            live_auto_label = verified
         try:
             result = _claim_action(
                 args={"action": "auto-scan"},

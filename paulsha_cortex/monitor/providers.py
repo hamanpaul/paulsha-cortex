@@ -888,6 +888,7 @@ class GitHubWorkProvider:
             if any(not isinstance(entity, dict) for entity in entities):
                 raise ValueError("GitHub entity is not an object")
             sources = tuple(self._entity_source(entity) for entity in entities)
+            auto_label_issues = _auto_label_issue_numbers(entities)
         except (json.JSONDecodeError, TypeError, ValueError, KeyError):
             return self._failure(attempted_at, "github API returned malformed JSON")
         sources = tuple(sorted(sources, key=lambda source: (source.kind, source.ref)))
@@ -908,6 +909,11 @@ class GitHubWorkProvider:
             revision=revision,
             diagnostics=(),
             sources=sources,
+            # R0.5 D1：issues 回應本來就含 labels——把 auto 派工 label 的持有者
+            # 記進 observations，讓 manager 的 auto-claim scan 讀鏡像即可判定，
+            # 不必每 tick 對每個 mapped issue 各發一次 live `gh api`（實測
+            # 57 次/tick，是 fleet 對 GitHub 最大的持續壓力源）。
+            observations={"auto_label_issues": auto_label_issues},
         )
 
     def _failure(self, attempted_at: str, diagnostic: str) -> ProviderSnapshot:
@@ -943,6 +949,41 @@ class GitHubWorkProvider:
             provider=self.provider_id,
             title=title,
         )
+
+
+# 與 coordinator/claim.py 的 AUTO_LABEL、doctor.py 的 AUTO_LABEL 同值。monitor 不
+# import coordinator.claim（避免把 deck/verification 整串拉進 monitor 行程），以
+# 常數複本＋本註解維持對齊；改名時三處同步（測試 test_auto_label_constant_alignment
+# 釘住）。
+AUTO_CLAIM_LABEL = "cortex:auto-on-going"
+
+
+def _auto_label_issue_numbers(entities: list[dict]) -> list[int]:
+    """開啟 auto 派工 label 的 open issue 編號（排序去重）。
+
+    labels 欄位缺失或形狀不合時 raise——與 `_entity_source` 同一個 try 區塊，
+    整包降級成 `github API returned malformed JSON`，不靜默吞掉半壞回應。
+    PR（`pull_request` 鍵存在）不參與 auto 派工，跳過。
+    """
+
+    numbers: set[int] = set()
+    for entity in entities:
+        if "pull_request" in entity:
+            continue
+        if entity.get("state") != "open":
+            continue
+        labels = entity.get("labels", [])
+        if not isinstance(labels, list):
+            raise ValueError("invalid GitHub labels field")
+        for label in labels:
+            if not isinstance(label, dict) or not isinstance(label.get("name"), str):
+                raise ValueError("invalid GitHub label entry")
+            if label["name"] == AUTO_CLAIM_LABEL:
+                number = entity["number"]
+                if isinstance(number, bool) or not isinstance(number, int):
+                    raise ValueError("invalid issue number")
+                numbers.add(number)
+    return sorted(numbers)
 
 
 class _GitHubRateLimitError(OSError):

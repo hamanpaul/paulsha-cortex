@@ -279,3 +279,104 @@ def test_invalid_interval_env_fails_loud(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("PSC_MANAGER_GITHUB_INTERVAL_MS", "abc")
     with pytest.raises(ValueError, match="PSC_MANAGER_GITHUB_INTERVAL_MS"):
         work_actions._auto_claim_github_interval_seconds()
+
+
+# ---------------------------------------------------------------------------
+# R0.5 D1：鏡像優先——auto_label False 的 authority 零 API
+# ---------------------------------------------------------------------------
+
+
+def test_mirror_false_authorities_make_zero_github_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """鏡像（authority.auto_label）為 False 時不得發出任何 gh 呼叫。
+
+    這是 D1 的核心承諾：先前的 O(mapped issues) sweep（實測 57 次/tick）
+    降為 O(鏡像為 True 的 authority 數)，常態為零。
+    """
+
+    monkeypatch.setenv("PSC_MANAGER_GITHUB_INTERVAL_MS", "0")
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema": "work-items-snapshot/v1",
+                "providers": {
+                    "github": {
+                        "provider_id": "github",
+                        "revision": "gh-1",
+                        "last_success_epoch": 100,
+                        "degraded": False,
+                    }
+                },
+                "work_items": [
+                    {
+                        "repo": "acme/demo",
+                        "work_id": f"demo-{index}",
+                        "mapped_issues": [10 + index],
+                        "mapped_prs": [],
+                        "mapped_openspec": [f"demo-{index}"],
+                        "mapped_todo_paths": [f"docs/todo-{index}.md"],
+                        "confirmed_todo": True,
+                        "auto_label": False,
+                        "source_revisions": [
+                            f"issue:{10 + index}@open",
+                            f"openspec:demo-{index}@1",
+                        ],
+                    }
+                    for index in range(1, 4)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    calls: list[tuple[str, ...]] = []
+
+    def counting_runner(argv, **kwargs):
+        calls.append(tuple(argv))
+        return _ok_runner(argv, **kwargs)
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        runner=counting_runner,
+        workflow_registry=registry,
+        workflow_starter=work_actions._fallback_workflow_starter(registry, state),
+        sleeper=lambda _s: None,
+    )
+
+    assert calls == [], "鏡像 False 不得有任何 GitHub 呼叫"
+    # ignore 類決策不進 results（既有語意）：無可行動列＝正確
+    assert result == []
+    assert registry.list_workflow_runs() == []
+
+
+def test_mirror_true_but_label_removed_live_declines_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """targeted 複驗以 live 為準：鏡像說有、live 已被人類移除 → 不 claim。"""
+
+    monkeypatch.setenv("PSC_MANAGER_GITHUB_INTERVAL_MS", "0")
+    snapshot = _snapshot(tmp_path / "snapshot.json", count=1)  # rows auto_label=True
+    state = tmp_path / "runs.json"
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+
+    def no_label_runner(argv, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"labels": []}), stderr="")
+
+    result = work_actions.run_auto_claim_scan(
+        snapshot_path=snapshot,
+        state_path=state,
+        now=lambda: 200,
+        runner=no_label_runner,
+        workflow_registry=registry,
+        workflow_starter=work_actions._fallback_workflow_starter(registry, state),
+        sleeper=lambda _s: None,
+    )
+
+    # live 複驗未過 → decide_auto_claim ignore（不進 results）、不得建立 run
+    assert result == []
+    assert registry.list_workflow_runs() == []
