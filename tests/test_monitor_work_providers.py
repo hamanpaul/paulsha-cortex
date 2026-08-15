@@ -123,6 +123,23 @@ def _completed(payload, *, returncode=0, stderr=""):
     )
 
 
+def _gh_response(rows, *, status=200, headers=None):
+    """`gh api --include` 的輸出形狀（狀態行 LF、header CRLF、空行、body）。
+
+    這是實測 gh 2.45 的真實輸出（見 `monitor/github_issue_sync` 模組 docstring）。
+    """
+    lines = [f"HTTP/2.0 {status} OK"]
+    lines += [f"{name}: {value}\r" for name, value in (headers or {}).items()]
+    lines.append("\r")
+    body = "" if rows is None else json.dumps(rows)
+    return subprocess.CompletedProcess(
+        args=("gh",),
+        returncode=0 if status < 300 else 1,
+        stdout="\n".join(lines) + "\n" + body,
+        stderr="" if status < 300 else f"gh: HTTP {status}",
+    )
+
+
 def test_github_provider_uses_typed_argv_and_json():
     rows = [
         {
@@ -142,14 +159,7 @@ def test_github_provider_uses_typed_argv_and_json():
             "pull_request": {"url": "https://api.github.test/pr/15"},
         },
     ]
-    runner = FakeRunner(
-        subprocess.CompletedProcess(
-            args=("gh",),
-            returncode=0,
-            stdout="\n".join(json.dumps(row) for row in rows) + "\n",
-            stderr="",
-        )
-    )
+    runner = FakeRunner(_gh_response(rows))
 
     result = GitHubWorkProvider("example/acme", runner=runner, timeout_seconds=12).scan()
 
@@ -160,15 +170,15 @@ def test_github_provider_uses_typed_argv_and_json():
     ]
     assert result.sources[0].title == "umbrella"
     argv, timeout = runner.calls[0]
+    # D3：`--include` 取代 `--paginate --jq`——分頁由本地依 Link header 重建
+    # （path 永不採信伺服器給的絕對 URL），header 則是 ETag 條件請求的載體。
     assert argv == (
         "gh",
         "api",
         "--method",
         "GET",
-        "--paginate",
-        "--jq",
-        ".[]",
-        "repos/example/acme/issues?state=all&per_page=100",
+        "--include",
+        "repos/example/acme/issues?state=all&per_page=100&sort=updated&direction=desc",
     )
     assert timeout == 12
 
@@ -229,7 +239,7 @@ def test_github_provider_timeout_is_degraded():
 def test_github_provider_malformed_json_is_degraded():
     runner = FakeRunner(
         subprocess.CompletedProcess(
-            args=("gh",), returncode=0, stdout="not-json", stderr=""
+            args=("gh",), returncode=0, stdout="HTTP/2.0 200 OK\n\r\nnot-json", stderr=""
         )
     )
 
@@ -237,6 +247,18 @@ def test_github_provider_malformed_json_is_degraded():
 
     assert result.status == "degraded"
     assert any("JSON" in item for item in result.diagnostics)
+
+
+def test_github_provider_response_without_status_line_is_degraded():
+    """D3：缺狀態行不得寬容退化成「單頁、無 ETag」——那等於靜默截斷鏡像。"""
+    runner = FakeRunner(
+        subprocess.CompletedProcess(args=("gh",), returncode=0, stdout="[]", stderr="")
+    )
+
+    result = GitHubWorkProvider("example/acme", runner=runner).scan()
+
+    assert result.status == "degraded"
+    assert any("malformed response" in item for item in result.diagnostics)
 
 
 def test_workflow_registry_existing_completion_schema_remains_not_valid(monkeypatch, tmp_path):

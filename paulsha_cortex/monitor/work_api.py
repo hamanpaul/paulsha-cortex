@@ -14,6 +14,7 @@ from typing import Callable, Mapping, Sequence
 from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
 from .git_mirror import GITHUB_HTTPS_REMOTE, GITHUB_SSH_REMOTE
+from .github_issue_sync import IssueSyncStore
 from .github_pressure import GitHubPressureGate
 from .lifecycle import ClosureEvidence, project_work_items
 from .models import ProjectState
@@ -428,6 +429,7 @@ class WorkModelRefresher:
         stale_after_seconds: int = 900,
         now: Callable[[], datetime] | None = None,
         github_pressure_gate: GitHubPressureGate | None = None,
+        issue_sync_store: IssueSyncStore | None = None,
     ) -> None:
         self.durable_store = durable_store
         self.read_store = read_store
@@ -443,6 +445,10 @@ class WorkModelRefresher:
         # 但壓力是 per-token 的，所以閘門必須活得比 provider 久（由 refresher
         # 持有），否則節流只在單一 repo 內生效、退避每個 repo 各燒一次 403。
         self.github_pressure_gate = github_pressure_gate
+        # #506 / D3：issues 增量同步的 per-repo 游標／ETag／鏡像。跟壓力閘門一樣
+        # 必須活得比 provider 久——provider 是 per-repo per-cycle 建的，游標卻要
+        # 跨輪次續存，狀態掛在 provider 上等於每輪都全量。
+        self.issue_sync_store = issue_sync_store or IssueSyncStore()
         self.workflow_provider_factory = workflow_provider_factory or WorkflowRegistryProvider
         self.stale_after_seconds = stale_after_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -517,7 +523,10 @@ class WorkModelRefresher:
                     # 呼叫端（測試／上層組裝）行為完全不變。
                     github_provider = (
                         GitHubWorkProvider(
-                            repo, pressure_gate=self.github_pressure_gate
+                            repo,
+                            pressure_gate=self.github_pressure_gate,
+                            # D3：沒有這個 store 就沒有游標可續，每輪都會退回全量。
+                            sync_store=self.issue_sync_store,
                         )
                         if self._uses_default_github_provider
                         else self.github_provider_factory(repo)
