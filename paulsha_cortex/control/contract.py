@@ -15,8 +15,8 @@ REQUEST_TYPES = frozenset(
 )
 WORK_ACTIONS = frozenset(
     {
-        "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "recover-planning", "recover-pre-candidate",
+        "link", "unlink", "start", "resume", "retry-build", "retry-card",
+        "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
         "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
     }
@@ -159,10 +159,10 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or "\n" in failure_reason
             ):
                 raise ValueError("work-action recover-planning requires failure_reason")
-        if action in {"recover-repair-commit", "regenerate-gates"}:
+        if action in {"recover-repair-commit", "regenerate-gates", "retry-card"}:
             # #540：regenerate-gates 重跑 gate 的對象是一個具體的 WorkflowRun，
             # 與 recover-repair-commit 同樣以 exact run CAS 定錨，避免在 operator
-            # 心裡想的 run 之外的 run 上動手。
+            # 心裡想的 run 之外的 run 上動手。#545：retry-card 重派一張卡同理。
             expected_run_id = args.get("expected_run_id")
             if (
                 not isinstance(expected_run_id, str)
@@ -171,6 +171,17 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     f"work-action {action} requires exact expected_run_id"
                 )
+        if action == "retry-card":
+            # #545：run CAS 之外還要指名卡片——重派的對象是「run 內的某一張卡」，
+            # 少了卡名就不是精確定錨。合法性（是不是 builder 卡、是不是下一張要
+            # 派的卡、有沒有已採信的 evidence）由 work action fail-closed 驗，
+            # 這裡只做語法界限。
+            card = args.get("card")
+            if (
+                not isinstance(card, str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
+            ):
+                raise ValueError("work-action retry-card requires exact card id")
         if action in {"abandon", "retire-delivered"}:
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")

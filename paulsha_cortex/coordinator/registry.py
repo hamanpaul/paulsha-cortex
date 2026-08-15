@@ -1880,6 +1880,97 @@ class JobRegistry:
         self._persist()
         return self._copy_workflow_run(updated)
 
+    def _manager_reset_workflow_for_retry_card(
+        self,
+        run_id: str,
+        *,
+        expected_run_id: str,
+        card: str,
+        retry_classification: str | None = None,
+    ) -> WorkflowRun:
+        """#545：原子重開「最早一張尚未採信的 builder 卡」，含中段卡。
+
+        與 `_manager_reset_workflow_for_retry_build` 的差別是刻意的，不是重複：
+
+        - retry-build 是 **candidate 修復**語意，只受理最後一張 builder 卡，並
+          把該卡的 `action` 覆寫成 repair 指示；中段卡（tdd-red）若走那條路，
+          卡片本身的指示（「寫一個 RED regression test」）會被 repair 文案抹掉。
+          本方法**完全不動 `step.action`**——重派的就是原卡，prompt 由既有的
+          `_workflow_job_prompt` 依原卡重組（含 #541 的 canonical gate 名注入）。
+        - 已採信（`workflow_evidence` 已綁定）的卡一律拒絕：舊 job 與舊 envelope
+          是稽核紀錄，重派只允許產生**新** job 與**新** envelope，既有紀錄原樣保留。
+
+        `card` 必須精確等於「build phase 內最早一張 gate_result 非 passed 的
+        卡」——那也正是 `manager._current_workflow_step` 之後會派的那一張，兩邊
+        同一判準，避免宣告可行的重派實際落到另一張卡上（#382 的教訓）。
+        """
+
+        index = self._find_workflow_run_index(run_id)
+        current = self._workflows[index]
+        if current.run_id != expected_run_id:
+            raise ValueError("retry-card reset expected WorkflowRun CAS mismatch")
+        if (
+            current.status != "ongoing"
+            or current.current_phase != "build"
+            or "needs_human" not in current.facets
+        ):
+            raise ValueError(
+                "retry-card reset requires active needs_human build workflow"
+            )
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("status") in ACTIVE_JOB_STATUSES
+            for job in self._jobs
+        ):
+            raise ValueError("retry-card reset refuses active workflow job")
+        pending = [
+            step
+            for step in current.steps
+            if step.phase == "build" and step.gate_result != "passed"
+        ]
+        if not pending or pending[0].card != card:
+            raise ValueError(
+                "retry-card reset requires the earliest un-accepted builder card"
+            )
+        if pending[0].persona != "builder":
+            raise ValueError("retry-card reset requires a builder card")
+        if any(
+            job.get("workflow_run_id") == current.run_id
+            and job.get("workflow_phase") == "build"
+            and job.get("workflow_card") == card
+            and job.get("workflow_evidence") is not None
+            for job in self._jobs
+        ):
+            raise ValueError("retry-card reset refuses a card with accepted evidence")
+        steps = tuple(
+            # 只清掉「上一次是誰跑的」這類解析結果，讓下一次 dispatch 重新解析
+            # identity；`action`／`inputs`／`outputs`／`test_policy` 等卡片契約
+            # 原樣保留。
+            replace(step, executor=None, model=None, domain=None, gate_result="pending")
+            if step.phase == "build" and step.card == card
+            else step
+            for step in current.steps
+        )
+        updated = replace(
+            current,
+            steps=steps,
+            attempts={
+                **current.attempts,
+                "build": current.attempts.get("build", 0) + 1,
+            },
+            facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            gate_status="running",
+            retry_classification=(
+                current.retry_classification
+                if retry_classification is None
+                else retry_classification
+            ),
+            updated_at=_now_iso(),
+        )
+        self._workflows[index] = updated
+        self._persist()
+        return self._copy_workflow_run(updated)
+
     def _manager_adopt_repair_candidate(
         self,
         run_id: str,
