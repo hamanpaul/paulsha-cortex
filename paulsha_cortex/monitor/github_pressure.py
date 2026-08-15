@@ -13,6 +13,11 @@ Monitor 的 ``_github_refresh_loop``（``monitor/service.py``）每
   ＋ **每個** remote todo／archived tasks.md 一次 ``contents`` ＋ **每個**
   workflow-linked merged PR 一次 ``compare``
 
+  .. note:: #506 / D2 之後，上面那兩項「每個……一次」已改走本機 git
+     （``monitor/git_mirror``），不再消耗 REST 配額；``GitHubTerminalProvider``
+     的 REST 只剩 graphql 分頁與 1 次 git tree。下面的問題描述與預算計算保留
+     當時的實測基準，因為節流／退避機制本身沒有變。
+
 亦即 per-repo per-cycle 是 O(issues 分頁 + todo 檔數)。實際 workspace 約 40 個
 repo，一輪數百次請求在數秒內齊發，穩定觸發 GitHub secondary（abuse detection）
 rate limit——實測 ``github:`` 與 ``github-terminal:`` 兩個 provider 同時

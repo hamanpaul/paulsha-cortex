@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Mapping
 import os
 import shutil
+import subprocess
 
 import pytest
 
@@ -50,3 +52,113 @@ def _prefer_local_openspec(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper_parent = str(wrapper.parent.resolve())
     if wrapper_parent not in original_path.split(os.pathsep):
         monkeypatch.setenv("PATH", f"{wrapper_parent}{os.pathsep}{original_path}")
+
+
+# --- #506 / D2：git-native remote reads 用的真 git fixture --------------------
+#
+# monitor 的 remote 檔案讀取與 merge ancestry 已改走本機 git（``monitor/git_mirror``）。
+# 這類測試一律用本機 tmp git repo，**不打**任何真實 GitHub API／網路：
+# ``origin`` 的 URL 字面值寫成 GitHub HTTPS（鏡像的身分驗證讀的是 raw config），
+# 實際 transport 由 ``url.<local>.insteadOf`` 改寫到同一個 tmp 目錄下的 bare repo。
+
+
+class GitOriginFixture:
+    """一組 bare ``origin`` ＋ 一個本機 checkout，對外偽裝成 GitHub repo。"""
+
+    def __init__(self, root: Path, repo: str) -> None:
+        self.repo = repo
+        self.root = root
+        self.origin = root / "origin.git"
+        self.checkout = root / "checkout"
+        self.url = f"https://github.com/{repo}.git"
+        # ``-b main``：bare repo 的 HEAD 必須指向真的會存在的分支，否則
+        # ``git clone --depth=1`` 會把它當成空 repo。
+        self._git(("init", "--quiet", "--bare", "-b", "main", str(self.origin)), cwd=root)
+        self._git(("init", "--quiet", "-b", "main", str(self.checkout)), cwd=root)
+        self.git("remote", "add", "origin", self.url)
+        self.git("config", f"url.{self.origin}.insteadOf", self.url)
+        self.git("config", "user.email", "fixture@example.invalid")
+        self.git("config", "user.name", "fixture")
+
+    @staticmethod
+    def _git(argv: tuple[str, ...], *, cwd: Path) -> str:
+        completed = subprocess.run(
+            ("git", *argv),
+            cwd=str(cwd),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    def git(self, *argv: str) -> str:
+        return self._git(argv, cwd=self.checkout)
+
+    def commit(self, files: Mapping[str, str], *, message: str = "commit") -> str:
+        for relative, text in files.items():
+            target = self.checkout / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+            self.git("add", "--", relative)
+        self.git("commit", "--quiet", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def branch_commit(
+        self,
+        branch: str,
+        files: Mapping[str, str],
+        *,
+        message: str = "branch commit",
+        base: str = "main",
+    ) -> str:
+        self.git("checkout", "--quiet", "-b", branch, base)
+        head = self.commit(files, message=message)
+        self.git("checkout", "--quiet", "main")
+        return head
+
+    def merge(self, branch: str, *, message: str = "merge") -> str:
+        """真的 merge commit（``--no-ff``），parents >= 2。"""
+
+        self.git("merge", "--quiet", "--no-ff", "-m", message, branch)
+        return self.git("rev-parse", "HEAD")
+
+    def blob_sha(self, path: str, *, revision: str = "HEAD") -> str:
+        return self.git("rev-parse", f"{revision}:{path}")
+
+    def head(self, revision: str = "HEAD") -> str:
+        return self.git("rev-parse", revision)
+
+    def publish(self, branch: str = "main") -> None:
+        """把 checkout 的分支推到 bare origin（模擬遠端已經前進）。"""
+
+        self.git("push", "--quiet", "origin", f"{branch}:{branch}")
+
+    def publish_pull_head(self, number: int, revision: str) -> None:
+        """在 origin 上建立 ``refs/pull/<n>/head``（GitHub 才有的唯讀 ref）。"""
+
+        self.git("push", "--quiet", "origin", f"{revision}:refs/pull/{number}/head")
+
+    def detach(self) -> Path:
+        """回傳一個『只有 origin 設定、還沒有任何物件』的空 checkout。"""
+
+        empty = self.root / "empty-checkout"
+        self._git(("init", "--quiet", "-b", "main", str(empty)), cwd=self.root)
+        self._git(("remote", "add", "origin", self.url), cwd=empty)
+        self._git(("config", f"url.{self.origin}.insteadOf", self.url), cwd=empty)
+        return empty
+
+
+@pytest.fixture
+def git_origin(tmp_path: Path):
+    """factory：``git_origin("example/acme")`` → :class:`GitOriginFixture`。"""
+
+    created: list[GitOriginFixture] = []
+
+    def _make(repo: str = "example/acme") -> GitOriginFixture:
+        root = tmp_path / f"gitfixture-{len(created)}"
+        root.mkdir(parents=True, exist_ok=True)
+        fixture = GitOriginFixture(root, repo)
+        created.append(fixture)
+        return fixture
+
+    return _make

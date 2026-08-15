@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import base64
-import binascii
 import json
 import math
 import re
@@ -12,13 +10,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
-from urllib.parse import quote
 
 import yaml
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
+from .git_mirror import (
+    GitMirrorError,
+    GitRunner,
+    LocalGitMirror,
+    unavailable_provenance,
+)
 from .github_pressure import (
     RATE_LIMIT_KIND_PRIMARY,
     RATE_LIMIT_KIND_SECONDARY,
@@ -1015,13 +1018,21 @@ class GitHubTerminalProvider:
         sleeper: Callable[[float], None] = time.sleep,
         relevant_pr_numbers: tuple[int, ...] | None = None,
         pressure_gate: GitHubPressureGate | None = None,
+        repo_root: str | Path | None = None,
+        git_runner: GitRunner | None = None,
     ) -> None:
         self.repo = repo
         self.provider_id = f"github-terminal:{repo}"
         self.runner = runner or SubprocessCommandRunner()
         self.timeout_seconds = timeout_seconds
-        # #506：本 provider 是請求量最大的一支（graphql 分頁 + tree + 逐檔
-        # contents + 逐 PR compare），節流／退避沒接上它等於沒做減壓。
+        # #506 / D2：remote 檔案內容與 merge ancestry 一律走本機 git（見
+        # ``git_mirror``）。``repo_root`` 是該 repo 在 workspace 的 canonical
+        # checkout；缺它就沒有鏡像，本輪一旦真的需要讀檔／判 ancestry 就 fail
+        # closed（degraded），**不會**退回 REST，也不會當成「檔案不存在」。
+        self.repo_root = None if repo_root is None else Path(repo_root)
+        self.git_runner = git_runner
+        # #506：本 provider 仍是 REST 請求量最大的一支（graphql 分頁 + 1 次
+        # git tree），節流／退避沒接上它等於沒做減壓。
         self.pressure_gate = pressure_gate
         if any(
             not isinstance(delay, (int, float))
@@ -1091,10 +1102,7 @@ class GitHubTerminalProvider:
                 raise ValueError("default branch tree is truncated")
             if not isinstance(tree.get("tree"), list):
                 raise ValueError("default branch tree entries are invalid")
-            remote_todos = self._remote_todos(
-                tree,
-                default_revision=default_revision.lower(),
-            )
+            todo_entries = self._remote_todo_entries(tree)
             paths = {
                 row["path"]
                 for row in tree["tree"]
@@ -1136,6 +1144,9 @@ class GitHubTerminalProvider:
             links: dict[str, str] = {}
             remote_prs: list[dict[str, object]] = []
             branches: list[dict[str, str]] = []
+            # D2：ancestry 不再逐 PR 打 ``compare``；先把候選收集起來，等本輪唯一
+            # 一次 ``mirror.require()`` 把物件備齊後再用本機 ``merge-base`` 判定。
+            ancestry_candidates: list[tuple[int, str, dict[str, object]]] = []
             for pull in pull_nodes:
                 number = pull["number"]
                 pr_source_id = f"github_pr:{self.repo}#{number}"
@@ -1169,35 +1180,56 @@ class GitHubTerminalProvider:
                         or number in self.relevant_pr_numbers
                     )
                 )
-                if merge_commit:
-                    comparison = self._json(
-                        (
-                            "gh", "api", "--method", "GET",
-                            f"repos/{self.repo}/compare/{merge_revision}...{default_revision}",
-                        )
-                    )
-                    merge_commit = comparison.get("status") in {"ahead", "identical"}
                 candidate = pull.get("headRefOid")
-                remote_prs.append(
-                    {
-                        "source_id": pr_source_id,
-                        "candidate": (
-                            candidate.lower()
-                            if isinstance(candidate, str)
-                            and re.fullmatch(r"[0-9a-fA-F]{40}", candidate)
-                            else None
-                        ),
-                        "merge_revision": (
-                            merge_revision.lower()
-                            if isinstance(merge_revision, str)
-                            and re.fullmatch(r"[0-9a-fA-F]{40}", merge_revision)
-                            else None
-                        ),
-                        "merged_with_merge_commit": merge_commit,
-                    }
+                row: dict[str, object] = {
+                    "source_id": pr_source_id,
+                    "candidate": (
+                        candidate.lower()
+                        if isinstance(candidate, str)
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", candidate)
+                        else None
+                    ),
+                    "merge_revision": (
+                        merge_revision.lower()
+                        if isinstance(merge_revision, str)
+                        and re.fullmatch(r"[0-9a-fA-F]{40}", merge_revision)
+                        else None
+                    ),
+                    "merged_with_merge_commit": False,
+                }
+                if merge_commit:
+                    ancestry_candidates.append(
+                        (number, str(row["merge_revision"]), row)
+                    )
+                remote_prs.append(row)
+            mirror: LocalGitMirror | None = None
+            if todo_entries or ancestry_candidates:
+                mirror = self._mirror()
+                mirror.require(
+                    required=(
+                        default_revision.lower(),
+                        *(entry[1] for entry in todo_entries),
+                    ),
+                    ancestry=tuple(
+                        (number, revision)
+                        for number, revision, _ in ancestry_candidates
+                    ),
+                    default_branch=default_branch,
                 )
+            remote_todos = self._remote_todos(todo_entries, mirror=mirror)
+            if mirror is not None:
+                for _, merge_revision, row in ancestry_candidates:
+                    row["merged_with_merge_commit"] = mirror.is_ancestor(
+                        merge_revision, default_revision.lower()
+                    )
         except subprocess.TimeoutExpired:
             return self._failure(attempted_at, "github terminal timeout")
+        except GitMirrorError as error:
+            # D2：本機 git 讀不到就 fail closed——上層 ``_retain_last_good`` 會保留
+            # 上一份鏡像，絕不把讀取失敗降級成「檔案不存在／不是 ancestor」。
+            return self._failure(
+                attempted_at, f"github terminal git mirror unavailable: {error}"
+            )
         except _GitHubRateLimitError as error:
             # #506：與 GitHubWorkProvider 同一套分診／退避；本 provider 原本把
             # 限流混進 "evidence unavailable"，下游完全分辨不出來。
@@ -1227,6 +1259,18 @@ class GitHubTerminalProvider:
             "default_revision": default_revision.lower(),
             "remote_todos": remote_todos,
             "branches": branches,
+            # D2 provenance：這一輪的 remote 檔案內容與 ancestry 是從哪裡、用哪些
+            # ref 讀來的。degraded 的那一輪不會走到這裡，因此 provenance 永遠對應
+            # 一份成功的鏡像讀取。
+            "remote_reads": (
+                dict(mirror.provenance)
+                if mirror is not None
+                else dict(
+                    unavailable_provenance(
+                        "no remote artifact or ancestry required this cycle"
+                    )
+                )
+            ),
         }
         if self.pressure_gate is not None:
             # #506：整支 scan 走完都沒被限流，退避窗可以關掉。
@@ -1263,8 +1307,9 @@ class GitHubTerminalProvider:
         completed = None
         for attempt in range(len(self.retry_delays) + 1):
             if self.pressure_gate is not None:
-                # #506：節流點在**每一次**請求前，含分頁與逐檔 contents——
-                # 一輪掃描的請求數就是靠這裡攤平的。
+                # #506：節流點在**每一次** REST 請求前（graphql 分頁與 git tree）。
+                # D2 之後逐檔 contents 與逐 PR compare 已改走本機 git，不經此路徑
+                # ——git 協定不受 REST rate limit 管轄，節流它只是白白拖慢掃描。
                 self.pressure_gate.throttle()
             completed = self.runner.run(argv, timeout=self.timeout_seconds)
             if completed.returncode == 0:
@@ -1298,13 +1343,28 @@ class GitHubTerminalProvider:
             observations={},
         )
 
-    def _remote_todos(
-        self,
+    def _mirror(self) -> LocalGitMirror:
+        if self.repo_root is None:
+            raise GitMirrorError(
+                "no local checkout configured for git-native remote reads"
+            )
+        return LocalGitMirror(
+            self.repo_root,
+            repo=self.repo,
+            runner=self.git_runner,
+            timeout_seconds=self.timeout_seconds,
+        )
+
+    @staticmethod
+    def _remote_todo_entries(
         tree: Mapping,
-        *,
-        default_revision: str,
-    ) -> list[dict[str, object]]:
-        rows: list[dict[str, object]] = []
+    ) -> tuple[tuple[str, str, re.Match[str] | None], ...]:
+        """從 REST tree 挑出要讀的 blob（path、blob sha、archive match）。
+
+        只解析、不讀內容——內容統一在本輪唯一一次 ``git cat-file --batch`` 取得。
+        """
+
+        entries: list[tuple[str, str, re.Match[str] | None]] = []
         for entry in tree.get("tree", []):
             if not isinstance(entry, Mapping):
                 continue
@@ -1325,35 +1385,29 @@ class GitHubTerminalProvider:
                 r"[0-9a-fA-F]{40}", revision
             ) is None:
                 raise ValueError("remote Todo tree entry is invalid")
-            content_file = self._json(
-                (
-                    "gh", "api", "--method", "GET",
-                    (
-                        f"repos/{self.repo}/contents/{quote(path, safe='/')}"
-                        f"?ref={default_revision}"
-                    ),
-                )
-            )
-            if (
-                content_file.get("type") != "file"
-                or content_file.get("path") != path
-                or not isinstance(content_file.get("sha"), str)
-                or content_file["sha"].lower() != revision.lower()
-                or content_file.get("encoding") != "base64"
-            ):
-                raise ValueError("remote Todo content identity mismatch")
-            content = content_file.get("content")
-            if not isinstance(content, str):
-                raise ValueError("remote Todo content is invalid")
-            try:
-                text = base64.b64decode(
-                    re.sub(r"\s+", "", content), validate=True
-                ).decode("utf-8")
-            except (binascii.Error, UnicodeDecodeError) as error:
-                raise ValueError("remote Todo content is invalid") from error
+            entries.append((path, revision.lower(), archive_match))
+        return tuple(entries)
+
+    def _remote_todos(
+        self,
+        entries: Sequence[tuple[str, str, re.Match[str] | None]],
+        *,
+        mirror: LocalGitMirror | None,
+    ) -> list[dict[str, object]]:
+        if not entries:
+            return []
+        if mirror is None:  # pragma: no cover - 呼叫端保證 entries 非空即有鏡像
+            raise GitMirrorError("git mirror is required to read remote artifacts")
+        # D2：blob 一律以 tree 給的 sha 定址讀取。sha 定址本身就是內容識別，取代
+        # 舊 ``contents`` 路徑的 type／path／sha／encoding 四項比對；讀不到會由
+        # ``read_blobs`` raise（fail closed），不會退化成「檔案不存在」。
+        texts = mirror.read_blobs(tuple(revision for _, revision, _ in entries))
+        rows: list[dict[str, object]] = []
+        for path, revision, archive_match in entries:
+            text = texts[revision]
             row: dict[str, object] = {
                 "path": path,
-                "revision": revision.lower(),
+                "revision": revision,
                 "complete": _markdown_tasks_complete_text(text),
             }
             if archive_match is not None:

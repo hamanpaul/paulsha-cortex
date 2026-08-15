@@ -7,6 +7,34 @@
 
 ## [Unreleased]
 
+### Changed
+- **Issue #506 / D2：git 的資料走 git——monitor 對 GitHub REST 的兩類高量讀取改為本機
+  git 操作，一輪掃描的 REST `contents`／`compare` 呼叫數固定為 0**——
+  `GitHubTerminalProvider` 過去每個 remote `todo.md`／archived `tasks.md` 各打一次
+  `repos/{repo}/contents/...`（實測生產 workspace 一輪 **91 次**），每個
+  workflow-linked merged PR 各打一次 `repos/{repo}/compare/{merge}...{default}`；讀的
+  全是本機 git checkout 本來就有的東西，而 git 協定（fetch）不受 REST rate limit
+  管轄。新增 `paulsha_cortex/monitor/git_mirror.py`（`LocalGitMirror`）作為唯一入口：
+  blob 一律以 REST tree 給的 blob sha 定址、整批一次 `git cat-file --batch` 讀完
+  （sha 定址本身就是內容識別，取代舊 `contents` 路徑的 type／path／sha／encoding
+  四項比對）；ancestry 改用 `git merge-base --is-ancestor`，判準與 `compare` 的
+  `status in {ahead, identical}` 等價。一輪先做一次 `cat-file --batch-check` 批次
+  查缺，**有缺才** fetch（因此 fetch 頻率沿用既有 refresh 週期），refspec 帶
+  `--refmap=` 並寫進私有 namespace `refs/cortex/mirror/<hash>/*`，不動
+  `refs/remotes/origin/*`、工作區與任何本地分支；merge commit 不在本機的 PR 會把
+  `refs/pull/<n>/head` 一併掛進同一次 fetch（該 refspec 屬選配，remote 沒有它時退回
+  只 fetch default branch）。身分先驗讀 raw `remote.origin.url`（不套
+  `url.*.insteadOf` 改寫）確認 checkout 真的追著宣稱的 repo。**fail closed**：ref
+  不存在、fetch 失敗、blob 讀不到、沒有本機 checkout、origin 指向別的 repo、shallow
+  checkout 無法判 ancestry——一律 degraded 並由 `_retain_last_good` 保留上一份鏡像，
+  絕不把讀取失敗靜默降級成「檔案不存在」或「不是 ancestor」；provenance 落在
+  `observations["remote_reads"]`。`work_api` 把該 repo 在 workspace 的 canonical
+  checkout（與 `RepoWorkProvider` 同一個 root）傳給 provider。只動讀取路徑，寫入與
+  D3 的 `state=all&since=`＋ETag 增量不在本次；`coordinator/github_delivery.py` 的
+  `fetch_remote_closure`（每次 PR closure 1 次 compare ＋ N 次 contents，不在掃描
+  迴圈內）僅盤點未遷移。詳見 `changelog.d/d2-git-native-reads.md`。新增
+  `tests/test_monitor_git_native_reads_506.py`（16 個測試，含量化驗收樁）。
+
 ### Fixed
 - **Issue #536（後半）：planning artifacts 發佈與 run 狀態更新不是同一事務，中間態對
   所有恢復迴圈永久隱形**——define 的 brainstorm 有兩次分離的 durable 寫入：先發佈

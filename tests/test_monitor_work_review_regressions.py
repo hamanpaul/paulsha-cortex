@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -180,11 +181,20 @@ def test_default_terminal_provider_receives_only_registry_linked_prs(
 
     class CapturingTerminalProvider:
         # #506：預設 terminal provider 現在還會收到共享的 GitHub 壓力閘門
-        # （節流／退避），簽章跟著 work_api 的預設建構路徑走。
-        def __init__(self, repo: str, *, relevant_pr_numbers=None, pressure_gate=None):
-            captured.append((repo, relevant_pr_numbers))
+        # （節流／退避）與 D2 的本機 checkout root，簽章跟著 work_api 的預設
+        # 建構路徑走。
+        def __init__(
+            self,
+            repo: str,
+            *,
+            relevant_pr_numbers=None,
+            pressure_gate=None,
+            repo_root=None,
+        ):
+            captured.append((repo, relevant_pr_numbers, repo_root))
             self.repo = repo
             self.pressure_gate = pressure_gate
+            self.repo_root = repo_root
 
         def scan(self) -> ProviderSnapshot:
             return _provider(f"github-terminal:{self.repo}")
@@ -224,7 +234,9 @@ def test_default_terminal_provider_receives_only_registry_linked_prs(
         include_github=True,
     )
 
-    assert captured == [("example/acme", (9,))]
+    # D2：預設路徑必須把 repo 的 canonical checkout 傳下去，否則 provider 會因為
+    # 沒有鏡像而 fail closed。
+    assert captured == [("example/acme", (9,), Path(tmp_path))]
 
 
 def test_live_provider_freshness_uses_post_scan_clock(tmp_path):

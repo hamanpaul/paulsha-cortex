@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from .config import load_config
 from .correlation import InferredSignal, correlate_work_sources
+from .git_mirror import GITHUB_HTTPS_REMOTE, GITHUB_SSH_REMOTE
 from .github_pressure import GitHubPressureGate
 from .lifecycle import ClosureEvidence, project_work_items
 from .models import ProjectState
@@ -511,6 +512,10 @@ class WorkModelRefresher:
                                 repo=repo,
                             ),
                             pressure_gate=self.github_pressure_gate,
+                            # D2：remote 檔案內容與 merge ancestry 走本機 git，
+                            # 讀的就是這個 repo 在 workspace 的 canonical checkout
+                            # （與 ``RepoWorkProvider`` 同一個 root）。
+                            repo_root=root,
                         )
                         if self._uses_default_github_terminal_provider
                         else self.github_terminal_provider_factory(repo)
@@ -1058,8 +1063,11 @@ def _provider_repo(provider_id: str) -> str | None:
     return None
 
 
-_GITHUB_SSH = re.compile(r"^(?:ssh://)?git@github\.com[:/](?P<repo>[^/]+/[^/]+?)(?:\.git)?$")
-_GITHUB_HTTPS = re.compile(r"^https?://github\.com/(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$")
+# D2：與 ``git_mirror.LocalGitMirror`` 共用同一組 origin 樣式——provider 認定「這是
+# GitHub repo」與 mirror 認定「origin 真的指向它」必須用同一個判準，否則會出現
+# 「派了 GitHub provider、鏡像卻拒認 origin」的分歧。
+_GITHUB_SSH = GITHUB_SSH_REMOTE
+_GITHUB_HTTPS = GITHUB_HTTPS_REMOTE
 
 
 def _repo_identity(root: Path, fallback: str) -> tuple[str, bool]:
