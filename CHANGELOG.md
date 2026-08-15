@@ -8,6 +8,39 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #554：taxonomy marker 無詞界，與 #543 的 `<unavailable>` 佔位符相撞；worktree
+  drift 的 `content` 誤分類死鎖一併解除**——兩個缺陷共用同一組現場（planning worktree
+  drift 的失敗訊息）。**缺陷一**：`_operator_drift_message` 尾端是
+  `evidence={location}`，退化值原為 `"<unavailable>"`，而 PR #542 落地的
+  `outcome_taxonomy.TRANSIENT_SERVICE_MARKERS` 含**裸** `"unavailable"`（#533 為 agy
+  的 `UNAVAILABLE (code 503)` 而收），比對是無界子字串——於是「drift 且備份／報告雙雙
+  寫入失敗」這個純環境事件，會靠子字串巧合被判成 transient-service（`evidence=/tmp/
+  psc-report.json` → False，`evidence=<unavailable>` → True）。這是 #500（`\btimeout\b`
+  命中 nested tool result）、#487（`oauth` 命中 `doc-coauthoring`）的同族無界 token 缺陷
+  第三次命中。**兩邊都修**：(a) marker 比對改詞界（新增
+  `TRANSIENT_SERVICE_MARKER_RE`），擋住 marker 被埋在更長 word token 裡的誤中——全表
+  掃描顯示裸短字串 `"503"`／`"429"` 誤中面最大（`workflow-1a503f0429ab` 這種 run id 修
+  法前就會被判 transient），`"unavailable"` 次之（`envelope_unavailable` 等內部欄位
+  值）；(b) 佔位符改為
+  `planning_runtime.PLANNING_WORKTREE_DRIFT_EVIDENCE_PLACEHOLDER = "<not-written>"`
+  並附不變式測試——詞界擋不住「整個 token 就是 marker」，`<unavailable>` 與
+  `<evidence-unavailable>` 的 `<`／`>`／`-` 都不是 word char，詞界照樣成立。詞界化會讓
+  原本靠子字串巧合命中的真陽性落空，因此 `rate limited`／`rate limiting`／`timeouts`／
+  `timeouterror`／`timeoutexpired`／`serviceunavailable` 改為顯式列舉入表（CamelCase
+  例外類名尤其關鍵：`TimeoutExpired` 的訊息常在 reason 的 160 字截斷處被切掉
+  `timed out`，只剩型別名帶得動訊號）。**缺陷二**：「planning launcher modified
+  operator worktree」家族從 `content` 改判 `environment`——#543 之後 drift 不再銷毀任何
+  資料（只備份與報告），語意上就是環境事件，維持 `content` 只會讓唯一出口是
+  `abandon`（#507 comment 2 記錄、#543 明文留待後續的死鎖）。新增
+  `manager._is_planning_worktree_drift_failure`，判準只認 `planning_runtime` 新匯出的
+  穩定前綴 `PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX`，不依賴訊息尾段（尾段已在 #543
+  由 `changes rolled back` 改為 `operator content preserved`）；`disposable read-only
+  sandbox` 家族刻意不在此列，維持 `content`。並把 `_run_define_stage` 中段的三元表達式
+  抽成具名的 `_classify_planning_failure`，讓 reason → classification 有單一可測入口。
+  `recover-planning` 自身行為一字未改，本次只是讓 drift 案例走得到它。詳見
+  `changelog.d/marker-word-boundary.md`。新增
+  `tests/test_planning_drift_classification_554.py`（47 個回歸測試）。
+
 - **Issue #536（後半）：planning artifacts 發佈與 run 狀態更新不是同一事務，中間態對
   所有恢復迴圈永久隱形**——define 的 brainstorm 有兩次分離的 durable 寫入：先發佈
   spec/design/plan 到 operator worktree，再把 run 推進到 `plan` 並寫入 gate_refs／
