@@ -272,9 +272,9 @@ PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX = "planning launcher modified operator wo
 # transient-service。詞界比對擋不住這一種——整個 token 就是 marker——所以佔位符
 # 這一側必須自己保證**不含任何 taxonomy marker**。
 #
-# 換佔位符時務必重跑 `tests/test_outcome_taxonomy.py` 的佔位符不變式測試；
-# 注意 `<evidence-unavailable>` 這種看似安全的寫法仍會命中（`-` 不是 word
-# char，詞界照樣成立）。
+# 換佔位符時務必重跑 `tests/test_planning_drift_classification_554.py` 的佔位符
+# 不變式測試；注意 `<evidence-unavailable>` 這種看似安全的寫法仍會命中
+# （`-` 不是 word char，詞界照樣成立）。
 PLANNING_WORKTREE_DRIFT_EVIDENCE_PLACEHOLDER = "<not-written>"
 # 受保護的權威文件前綴：這些是 work item 的 source 文件與 cortex 自己登記在
 # `planning_authority` 內的受管產物，不論 `rollback_scope` 怎麼要求都不得被
