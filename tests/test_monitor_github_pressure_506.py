@@ -112,10 +112,11 @@ def _completed(payload, *, returncode=0, stderr=""):
 
 
 def _issues(*rows):
+    """D3：issues 讀取改走 `gh api --include`，body 是整個 JSON 陣列。"""
     return subprocess.CompletedProcess(
         args=("gh",),
         returncode=0,
-        stdout="\n".join(json.dumps(row) for row in rows) + "\n",
+        stdout='HTTP/2.0 200 OK\nEtag: W/"issues"\r\n\r\n' + json.dumps(list(rows)),
         stderr="",
     )
 

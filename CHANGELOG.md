@@ -8,6 +8,39 @@
 ## [Unreleased]
 
 ### Changed
+- **Issue #506 / D3：GitHub issues 改走 `state=all&since=` ＋ ETag 條件請求的增量
+  同步，全量只作每日一次的 anti-entropy 對帳**——`GitHubWorkProvider` 過去每輪對
+  **每個** configured repo 全量分頁抓 issues（`--paginate`）；D2 把 `contents`／
+  `compare` 歸零之後，這是 monitor 對 REST 配額剩下的主要常態消耗（約 13 個
+  configured repo × 每日 288 輪 = **3744 次計費請求／日**），而絕大多數回應與上一
+  輪逐位元組相同。新增 `paulsha_cortex/monitor/github_issue_sync.py` 作為增量協定
+  與 per-repo durable 狀態（游標／ETag／鏡像投影）的唯一入口。**`state=all` 不可
+  退讓**：`state=open&since=` 看不到剛被關閉的 issue，closure reducer 拿不到
+  `closed` 證據，manager 可能 auto-claim 已被人類在網頁端關掉的工作；closed issue
+  的 `updated_at` 會隨關閉事件更新，`state=all&since=` 的增量天然攜帶關閉事件且
+  delta 極小。**`sort=updated&direction=desc` 同樣不可退讓**：預設的 `created`
+  desc 排序下，「一個舊 issue 剛被更新」可能落在第 2 頁而**不改變第 1 頁**，第 1
+  頁的 ETag 就不再是整個 delta 的變更偵測器、條件請求會漏發。**ETag**：第 1 頁帶
+  `If-None-Match`，304 **不計入** rate limit 配額（實測 `x-ratelimit-used` 在條件
+  請求前後不變）；ETag 綁定它所屬的 request path，`since` 一前進即作廢，且 304
+  一路**不**取回應的 ETag——GitHub 的 304 回強形式 `"<hash>"`、200 回
+  `W/"<hash>"`，覆蓋回去會讓條件請求永遠落空而悄悄退化成每輪全額計費。**游標
+  紀律**：`since` 取自回應中最大的 `updated_at`（不是本機時鐘），只在整輪完整成功
+  後推進、永不倒退；分頁中斷時游標／ETag／鏡像三者原封不動。**每日全量
+  anti-entropy**：增量看不到 issue 被刪除／transfer 這類不留 `updated_at` 痕跡的
+  事件，因此每 86400s 強制一次不帶 `since`／不帶 `If-None-Match` 的全量重讀對帳，
+  drift 一律以全量為準並同時記 log 與 `observations["issue_sync"]["drift"]`。
+  **fail closed**：狀態缺失／損壞／游標格式不合／ETag 與 path 失聯一律退回全量
+  重建，單一 repo 的紀錄壞掉不拖垮其他 repo。分頁改為本地依 Link header 逐頁重建，
+  **不跟隨**伺服器給的絕對 URL（跟隨等於讓對方指定 `gh` 把 token 送去哪），連帶讓
+  每一頁都經過 `GitHubPressureGate.throttle`——改動前 `--paginate` 是 gh 在行程內
+  自己連發，閘門完全管不到。D1 的 `observations["auto_label_issues"]` 改由 durable
+  鏡像導出，網頁端關閉事件因此在**同一個** refresh 週期內就讓該 issue 退出 auto
+  派工名單。穩態計費請求降為每日 **26 次**（每 repo 1 次 anti-entropy 全量 ＋ 1 次
+  無法沿用 ETag 的增量）。只動 issues 讀取路徑；D2 的 `monitor/git_mirror.py` 未動，
+  寫入路徑、label API、events API 均不在本次。詳見
+  `changelog.d/d3-incremental-issue-sync.md`。新增
+  `tests/test_monitor_incremental_issue_sync_506.py`（34 個測試）。
 - **Issue #506 / D2：git 的資料走 git——monitor 對 GitHub REST 的兩類高量讀取改為本機
   git 操作，一輪掃描的 REST `contents`／`compare` 呼叫數固定為 0**——
   `GitHubTerminalProvider` 過去每個 remote `todo.md`／archived `tasks.md` 各打一次

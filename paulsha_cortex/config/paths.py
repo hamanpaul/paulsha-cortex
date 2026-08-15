@@ -47,6 +47,16 @@ def work_items_snapshot_path() -> Path:
     return monitor_state_root() / "work-items.snapshot.json"
 
 
+def github_issue_sync_path() -> Path:
+    """#506 / D3：GitHub issues 增量同步的 per-repo 游標／ETag／鏡像投影。
+
+    與 `work_items_snapshot_path()` 分開存放：這份是 monitor 對 GitHub 的**傳輸層
+    狀態**（下一次要從哪個 `since` 續讀、上次的 ETag），不是讀模型；讀模型損壞時
+    重建的代價是一次全量掃描，這份損壞時的代價也一樣，但兩者的生命週期無關。
+    """
+    return monitor_state_root() / "github-issue-sync.json"
+
+
 def skill_registry_root() -> Path:
     """Skill governance 治理平面根目錄（issue #204）：ledger／park state／proposal 共用。
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -22,6 +24,19 @@ from .git_mirror import (
     LocalGitMirror,
     unavailable_provenance,
 )
+from .github_issue_sync import (
+    DEFAULT_FULL_SYNC_INTERVAL_SECONDS,
+    GitHubResponse,
+    IssueEntry,
+    IssueSyncState,
+    IssueSyncStateError,
+    IssueSyncStore,
+    cursor_from,
+    dedupe_entries,
+    drift_between,
+    issues_request_path,
+    parse_include_response,
+)
 from .github_pressure import (
     RATE_LIMIT_KIND_PRIMARY,
     RATE_LIMIT_KIND_SECONDARY,
@@ -30,6 +45,8 @@ from .github_pressure import (
 )
 from .work_models import ProviderSnapshot, WorkSource
 
+
+logger = logging.getLogger(__name__)
 
 _ARCHIVE_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}-(?P<name>.+)$")
 
@@ -863,8 +880,35 @@ def _backoff_diagnostic(prefix: str, blocked_seconds: float) -> str:
     return f"{prefix} rate limit backoff active; retry in {blocked_seconds:.0f}s"
 
 
+class _GitHubRequestError(Exception):
+    """一次 issues 請求失敗，已附好要寫進 diagnostics 的字串。"""
+
+    def __init__(self, diagnostic: str) -> None:
+        super().__init__(diagnostic)
+        self.diagnostic = diagnostic
+
+
+@dataclass(frozen=True)
+class _FetchResult:
+    entries: tuple[IssueEntry, ...]
+    not_modified: bool
+    requests: int
+    pages: int
+    etag: str | None
+
+
 class GitHubWorkProvider:
-    """Read GitHub entities through authenticated ``gh api`` JSON only."""
+    """Read GitHub entities through authenticated ``gh api`` JSON only.
+
+    #506 / D3：讀取走 ``state=all&since=`` ＋ ETag 條件請求的增量協定，全量只作
+    每日一次的 anti-entropy 對帳。協定本身（游標紀律／ETag 綁定 path／fail-closed
+    條件／drift 對帳）全部定義在 ``monitor/github_issue_sync``；本類別只負責發
+    ``gh`` 請求、分診失敗、把鏡像投影成 ``ProviderSnapshot``。
+    """
+
+    # 100 筆/頁 × 50 頁＝5000 筆。超過視為分頁失控（伺服器沒收斂 Link），
+    # fail closed，不讓一輪掃描無上限地打下去。
+    _PAGE_LIMIT = 50
 
     def __init__(
         self,
@@ -873,6 +917,9 @@ class GitHubWorkProvider:
         runner: CommandRunner | None = None,
         timeout_seconds: float = 30,
         pressure_gate: GitHubPressureGate | None = None,
+        sync_store: IssueSyncStore | None = None,
+        full_sync_interval_seconds: float = DEFAULT_FULL_SYNC_INTERVAL_SECONDS,
+        now: Callable[[], str] | None = None,
     ) -> None:
         if repo.count("/") != 1 or any(not part for part in repo.split("/")):
             raise ValueError("GitHub repo must use owner/name")
@@ -882,70 +929,150 @@ class GitHubWorkProvider:
         self.timeout_seconds = timeout_seconds
         # #506：未注入 gate 時完全維持舊行為（不節流、不退避）。
         self.pressure_gate = pressure_gate
+        # D3：沒有 durable store 就沒有游標可續——每輪都是全量。這不是降級路徑，
+        # 是「無狀態即無增量」的誠實契約（測試與一次性呼叫端走的就是它）。
+        self.sync_store = sync_store
+        self.full_sync_interval_seconds = float(full_sync_interval_seconds)
+        self._now = now or _utcnow
+
+    # -- 掃描 -------------------------------------------------------------
 
     def scan(self) -> ProviderSnapshot:
-        attempted_at = _utcnow()
+        attempted_at = self._now()
         if self.pressure_gate is not None:
             blocked = self.pressure_gate.blocked_seconds()
             if blocked > 0:
                 # #506：退避期間直接跳過，不再硬撞一次 403 去加深限流。
                 return self._failure(attempted_at, _backoff_diagnostic("github", blocked))
-            self.pressure_gate.throttle()
-        argv = (
-            "gh",
-            "api",
-            "--method",
-            "GET",
-            "--paginate",
-            "--jq",
-            ".[]",
-            f"repos/{self.repo}/issues?state=all&per_page=100",
-        )
+        notes: list[str] = []
+        previous: IssueSyncState | None = None
+        if self.sync_store is not None:
+            try:
+                previous = self.sync_store.load(self.repo)
+            except IssueSyncStateError as error:
+                # 驗收 4：游標／ETag 狀態損壞 → fail closed 全量重建，
+                # **絕不**拿半壞的游標去做增量。
+                notes.append(f"github issue sync state unusable; rebuilt in full: {error}")
+                logger.warning(
+                    "github issue sync state for %s is unusable; rebuilding in full: %s",
+                    self.repo,
+                    error,
+                )
+        if previous is None:
+            mode, reason = "full", notes[0] if notes else "no durable cursor"
+        elif previous.needs_full_sync(
+            now=attempted_at, interval_seconds=self.full_sync_interval_seconds
+        ):
+            mode, reason = "full", "anti-entropy"
+        else:
+            mode, reason = "incremental", None
+
+        since = previous.since if (mode == "incremental" and previous is not None) else None
         try:
-            completed = self.runner.run(argv, timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            return self._failure(attempted_at, "github timeout")
-        except FileNotFoundError:
-            return self._failure(attempted_at, "github CLI unavailable")
-        except OSError:
-            return self._failure(attempted_at, "github provider I/O failure")
-        if completed.returncode != 0:
-            message = completed.stderr.decode(errors="replace") if isinstance(completed.stderr, bytes) else completed.stderr
-            # #370: rate limit must be checked *before* auth -- GitHub's own
-            # secondary/abuse-detection rate limit messages mention "OAuth"
-            # and invite re-authenticating, so an auth-first check
-            # misclassifies a retryable rate limit as a dead credential.
-            if is_rate_limit_signal(message):
-                # #506：403 再分診成 primary／secondary，並開啟退避窗。
-                return self._failure(
-                    attempted_at,
-                    _rate_limit_diagnostic(
-                        runner=self.runner,
-                        timeout_seconds=self.timeout_seconds,
-                        message=message,
-                        gate=self.pressure_gate,
-                        prefix="github",
+            base_path = issues_request_path(self.repo, since=since)
+        except IssueSyncStateError:
+            # 游標通過了 state 驗證卻做不出 path——只可能是驗證漏了，退回全量。
+            mode, reason, since = "full", "cursor rejected by request builder", None
+            base_path = issues_request_path(self.repo)
+        # anti-entropy 一輪刻意**不**帶 If-None-Match：全量的職責就是真的重讀一次，
+        # 拿 304 換來的「跟上次一樣」不是對帳，是把待驗證的假設當成結論。
+        etag = (
+            previous.etag
+            if (
+                mode == "incremental"
+                and previous is not None
+                and previous.etag is not None
+                and previous.etag_request == base_path
+            )
+            else None
+        )
+
+        try:
+            fetched = self._fetch_pages(base_path=base_path, since=since, etag=etag)
+        except _GitHubRequestError as error:
+            # 分頁中斷／任一頁失敗：游標、ETag、鏡像三者原封不動（上層
+            # `_retain_last_good` 續用上一份好的快照）。
+            return self._failure(attempted_at, error.diagnostic)
+
+        drift: dict[str, list[int]] | None = None
+        if fetched.not_modified:
+            # 驗收 2：304 不改 mirror、不動游標、不動 ETag——連寫都不寫。
+            # （ETag 也刻意不從 304 回應取回：GitHub 的 304 回的是強形式
+            # `"<hash>"`，與 200 給的 `W/"<hash>"` 不同，覆蓋回去會讓往後的條件
+            # 請求永遠落空。）
+            if previous is None:
+                # etag 只可能來自 previous，走到這裡代表狀態機被破壞。
+                return self._failure(attempted_at, "github returned 304 without a cursor")
+            state = previous
+            entries = previous.entries
+        else:
+            if mode == "full":
+                entries = fetched.entries
+                if previous is not None:
+                    drift = drift_between(previous.entries, entries)
+            else:
+                entries = (
+                    previous.merged(fetched.entries)
+                    if previous is not None
+                    else tuple(sorted(fetched.entries, key=lambda entry: entry.number))
+                )
+            try:
+                state = IssueSyncState(
+                    repo=self.repo,
+                    entries=entries,
+                    # 游標取自回應中最大的 updated_at（非本機時鐘），且永不倒退。
+                    since=cursor_from(
+                        fetched.entries,
+                        floor=previous.since if previous is not None else None,
+                    ),
+                    etag=fetched.etag,
+                    etag_request=base_path if fetched.etag else None,
+                    last_full_sync_at=(
+                        attempted_at
+                        if mode == "full"
+                        else (previous.last_full_sync_at if previous is not None else None)
                     ),
                 )
-            if is_auth_signal(message):
-                diagnostic = "github authentication failed"
-            else:
-                diagnostic = "github API request failed"
-            return self._failure(attempted_at, diagnostic)
-        stdout = completed.stdout.decode() if isinstance(completed.stdout, bytes) else completed.stdout
-        try:
-            entities = [
-                json.loads(line)
-                for line in stdout.splitlines()
-                if line.strip()
-            ]
-            if any(not isinstance(entity, dict) for entity in entities):
-                raise ValueError("GitHub entity is not an object")
-            sources = tuple(self._entity_source(entity) for entity in entities)
-            auto_label_issues = _auto_label_issue_numbers(entities)
-        except (json.JSONDecodeError, TypeError, ValueError, KeyError):
-            return self._failure(attempted_at, "github API returned malformed JSON")
-        sources = tuple(sorted(sources, key=lambda source: (source.kind, source.ref)))
+            except IssueSyncStateError as error:
+                # 合出來的狀態自己過不了驗證：degraded（上層續用上一份好的快照），
+                # 絕不讓例外逸出 provider 把整個 refresh 迴圈打斷。
+                return self._failure(
+                    attempted_at, f"github issue sync state rejected: {error}"
+                )
+
+        if drift is not None:
+            # 驗收 5：全量對帳發現 drift → 以全量為準，並同時留 log 與 observation。
+            logger.warning(
+                "github issue mirror drift for %s resolved in favour of the full sync: %s",
+                self.repo,
+                drift,
+            )
+            notes.append(f"github issue mirror drift resolved by full sync: {drift}")
+
+        persisted = True
+        if self.sync_store is not None and state is not previous:
+            try:
+                self.sync_store.save(state)
+            except OSError as error:
+                # 快照本身是對的，只是游標沒存下來——下一輪會退回全量重建（合併
+                # 本來就冪等），所以這是效能退化而非正確性問題，不該讓整輪 degraded。
+                persisted = False
+                notes.append(
+                    f"github issue sync state not persisted; next cycle rebuilds in full: {error}"
+                )
+                logger.warning(
+                    "github issue sync state for %s was not persisted: %s", self.repo, error
+                )
+
+        sources = tuple(
+            sorted(
+                (
+                    entry.to_source(repo=self.repo, provider_id=self.provider_id)
+                    for entry in entries
+                ),
+                key=lambda source: (source.kind, source.ref),
+            )
+        )
         revision = "github-snapshot:" + _digest(
             tuple(
                 f"{source.source_id}\0{source.revision}\0{source.status}".encode("utf-8")
@@ -961,14 +1088,143 @@ class GitHubWorkProvider:
             last_attempt_at=attempted_at,
             last_success_at=attempted_at,
             revision=revision,
-            diagnostics=(),
+            diagnostics=tuple(notes),
             sources=sources,
-            # R0.5 D1：issues 回應本來就含 labels——把 auto 派工 label 的持有者
-            # 記進 observations，讓 manager 的 auto-claim scan 讀鏡像即可判定，
-            # 不必每 tick 對每個 mapped issue 各發一次 live `gh api`（實測
-            # 57 次/tick，是 fleet 對 GitHub 最大的持續壓力源）。
-            observations={"auto_label_issues": auto_label_issues},
+            observations={
+                # R0.5 D1：issues 回應本來就含 labels——把 auto 派工 label 的持有者
+                # 記進 observations，讓 manager 的 auto-claim scan 讀鏡像即可判定，
+                # 不必每 tick 對每個 mapped issue 各發一次 live `gh api`（實測
+                # 57 次/tick，是 fleet 對 GitHub 最大的持續壓力源）。D3 之後這份
+                # 由 durable 鏡像導出，因此關閉事件一進增量就會讓該 issue 立刻
+                # 退出 auto 派工名單。
+                "auto_label_issues": _auto_label_issue_numbers(entries),
+                "issue_sync": {
+                    "mode": mode,
+                    "reason": reason,
+                    "not_modified": fetched.not_modified,
+                    "requests": fetched.requests,
+                    "conditional_requests": 1 if etag is not None else 0,
+                    # 304 不計入 GitHub rate limit 配額（實測 x-ratelimit-used
+                    # 在條件請求前後不變），因此配額帳與請求帳要分開記。
+                    "billed_requests": fetched.requests - (1 if fetched.not_modified else 0),
+                    "pages": fetched.pages,
+                    "delta_entries": len(fetched.entries),
+                    "mirror_entries": len(entries),
+                    "since": state.since,
+                    "drift": drift,
+                    "persisted": persisted,
+                },
+            },
         )
+
+    # -- 傳輸 -------------------------------------------------------------
+
+    def _fetch_pages(
+        self, *, base_path: str, since: str | None, etag: str | None
+    ) -> _FetchResult:
+        first = self._request(base_path, etag=etag)
+        if first.not_modified:
+            if etag is None:
+                # 沒送 If-None-Match 卻收到 304：協定被破壞。把它當成「沒有變更」
+                # 會讓鏡像被一份空回應定住，寧可 degraded。
+                raise _GitHubRequestError("github returned 304 without a conditional request")
+            return _FetchResult(
+                entries=(), not_modified=True, requests=1, pages=0, etag=etag
+            )
+        entries = list(self._entries(first))
+        requests = 1
+        pages = 1
+        response = first
+        while response.has_next_page:
+            if pages >= self._PAGE_LIMIT:
+                raise _GitHubRequestError("github issue pagination incomplete")
+            pages += 1
+            response = self._request(
+                issues_request_path(self.repo, since=since, page=pages)
+            )
+            requests += 1
+            if response.not_modified:
+                # 續頁沒送 If-None-Match，回 304 代表協定被破壞——寧可整輪
+                # degraded，也不能把一個空頁當成「這頁沒東西」而截斷鏡像。
+                raise _GitHubRequestError("github issue pagination returned 304")
+            entries.extend(self._entries(response))
+        return _FetchResult(
+            # 分頁跑的是活清單，同一個 issue 可能跨頁重複出現——傳輸層先收斂。
+            entries=dedupe_entries(entries),
+            not_modified=False,
+            requests=requests,
+            pages=pages,
+            etag=first.etag,
+        )
+
+    def _entries(self, response: GitHubResponse) -> tuple[IssueEntry, ...]:
+        try:
+            payload = json.loads(response.body)
+            if not isinstance(payload, list):
+                raise ValueError("GitHub issues response is not an array")
+            return tuple(IssueEntry.from_api(entity) for entity in payload)
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
+            raise _GitHubRequestError("github API returned malformed JSON") from error
+
+    def _request(self, path: str, *, etag: str | None = None) -> GitHubResponse:
+        if self.pressure_gate is not None:
+            # 節流改為 per-request：改動前一次 `--paginate` 是 gh 在行程內自己
+            # 連發分頁，閘門完全管不到那些請求。
+            self.pressure_gate.throttle()
+        argv: list[str] = ["gh", "api", "--method", "GET", "--include"]
+        if etag is not None:
+            argv += ["--header", f"If-None-Match: {etag}"]
+        argv.append(path)
+        try:
+            completed = self.runner.run(tuple(argv), timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            raise _GitHubRequestError("github timeout") from None
+        except FileNotFoundError:
+            raise _GitHubRequestError("github CLI unavailable") from None
+        except OSError:
+            raise _GitHubRequestError("github provider I/O failure") from None
+        stdout = (
+            completed.stdout.decode(errors="replace")
+            if isinstance(completed.stdout, bytes)
+            else (completed.stdout or "")
+        )
+        try:
+            response = parse_include_response(stdout)
+        except ValueError:
+            response = None
+        # 304 必須先判：gh 對任何非 2xx 都以非零離開（實測 `gh: HTTP 304`），
+        # 但條件請求命中是**成功**，不是失敗。
+        if response is not None and response.not_modified:
+            return response
+        if completed.returncode != 0:
+            message = (
+                completed.stderr.decode(errors="replace")
+                if isinstance(completed.stderr, bytes)
+                else (completed.stderr or "")
+            )
+            # #370: rate limit must be checked *before* auth -- GitHub's own
+            # secondary/abuse-detection rate limit messages mention "OAuth"
+            # and invite re-authenticating, so an auth-first check
+            # misclassifies a retryable rate limit as a dead credential.
+            if is_rate_limit_signal(message):
+                # #506：403 再分診成 primary／secondary，並開啟退避窗。
+                raise _GitHubRequestError(
+                    _rate_limit_diagnostic(
+                        runner=self.runner,
+                        timeout_seconds=self.timeout_seconds,
+                        message=message,
+                        gate=self.pressure_gate,
+                        prefix="github",
+                    )
+                )
+            if is_auth_signal(message):
+                raise _GitHubRequestError("github authentication failed")
+            raise _GitHubRequestError("github API request failed")
+        if response is None:
+            raise _GitHubRequestError("github API returned a malformed response")
+        if response.status // 100 != 2:
+            raise _GitHubRequestError("github API request failed")
+        return response
 
     def _failure(self, attempted_at: str, diagnostic: str) -> ProviderSnapshot:
         return ProviderSnapshot(
@@ -981,29 +1237,6 @@ class GitHubWorkProvider:
             sources=(),
         )
 
-    def _entity_source(self, entity: dict) -> WorkSource:
-        number = entity["number"]
-        title = entity["title"]
-        state = entity["state"]
-        node_id = entity["node_id"]
-        updated_at = entity["updated_at"]
-        if isinstance(number, bool) or not isinstance(number, int):
-            raise ValueError("invalid issue number")
-        if any(not isinstance(value, str) or not value for value in (title, state, node_id, updated_at)):
-            raise ValueError("invalid GitHub entity fields")
-        kind = "github_pr" if "pull_request" in entity else "github_issue"
-        ref = f"{self.repo}#{number}"
-        return WorkSource(
-            source_id=f"{kind}:{ref}",
-            kind=kind,
-            ref=ref,
-            revision=f"github:{node_id}:{updated_at}",
-            status=state,
-            confidence="confirmed",
-            provider=self.provider_id,
-            title=title,
-        )
-
 
 # 與 coordinator/claim.py 的 AUTO_LABEL、doctor.py 的 AUTO_LABEL 同值。monitor 不
 # import coordinator.claim（避免把 deck/verification 整串拉進 monitor 行程），以
@@ -1012,32 +1245,23 @@ class GitHubWorkProvider:
 AUTO_CLAIM_LABEL = "cortex:auto-on-going"
 
 
-def _auto_label_issue_numbers(entities: list[dict]) -> list[int]:
+def _auto_label_issue_numbers(entries: Sequence[IssueEntry]) -> list[int]:
     """開啟 auto 派工 label 的 open issue 編號（排序去重）。
 
-    labels 欄位缺失或形狀不合時 raise——與 `_entity_source` 同一個 try 區塊，
-    整包降級成 `github API returned malformed JSON`，不靜默吞掉半壞回應。
-    PR（`pull_request` 鍵存在）不參與 auto 派工，跳過。
+    D3 之後輸入是 durable 鏡像而非單輪回應：一個 issue 在網頁端被關閉，關閉事件
+    會隨 `state=all&since=` 的增量進來覆蓋掉鏡像那一列，該 issue 因此在同一個
+    refresh 週期內就退出這份名單——manager 不會再 auto-claim 它。
+    欄位形狀的嚴格驗證前移到 `IssueEntry`（回應與 durable 狀態兩邊共用同一套）。
+    PR 不參與 auto 派工，跳過。
     """
 
-    numbers: set[int] = set()
-    for entity in entities:
-        if "pull_request" in entity:
-            continue
-        if entity.get("state") != "open":
-            continue
-        labels = entity.get("labels", [])
-        if not isinstance(labels, list):
-            raise ValueError("invalid GitHub labels field")
-        for label in labels:
-            if not isinstance(label, dict) or not isinstance(label.get("name"), str):
-                raise ValueError("invalid GitHub label entry")
-            if label["name"] == AUTO_CLAIM_LABEL:
-                number = entity["number"]
-                if isinstance(number, bool) or not isinstance(number, int):
-                    raise ValueError("invalid issue number")
-                numbers.add(number)
-    return sorted(numbers)
+    return sorted(
+        entry.number
+        for entry in entries
+        if not entry.is_pull_request
+        and entry.state == "open"
+        and AUTO_CLAIM_LABEL in entry.labels
+    )
 
 
 class _GitHubRateLimitError(OSError):

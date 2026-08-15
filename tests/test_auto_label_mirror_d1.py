@@ -39,8 +39,8 @@ def test_auto_label_constant_alignment() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _issue_line(number: int, *, state: str = "open", labels: list[str] | None = None,
-                pull_request: bool = False) -> str:
+def _issue(number: int, *, state: str = "open", labels: list[str] | None = None,
+           pull_request: bool = False) -> dict:
     entity: dict = {
         "number": number,
         "title": f"issue {number}",
@@ -51,7 +51,12 @@ def _issue_line(number: int, *, state: str = "open", labels: list[str] | None = 
     }
     if pull_request:
         entity["pull_request"] = {"url": "x"}
-    return json.dumps(entity)
+    return entity
+
+
+def _issues_response(*entities: dict) -> str:
+    """D3：issues 讀取改走 `gh api --include`（狀態行 + header + JSON 陣列）。"""
+    return 'HTTP/2.0 200 OK\nEtag: W/"d1"\r\n\r\n' + json.dumps(list(entities))
 
 
 class _Runner:
@@ -63,27 +68,25 @@ class _Runner:
 
 
 def test_work_provider_records_auto_label_issue_numbers() -> None:
-    stdout = "\n".join(
-        [
-            _issue_line(7, labels=[AUTO_CLAIM_LABEL, "bug"]),
-            _issue_line(9, labels=["bug"]),
-            # closed 不參與 auto 派工
-            _issue_line(11, state="closed", labels=[AUTO_CLAIM_LABEL]),
-            # PR 不參與
-            _issue_line(13, labels=[AUTO_CLAIM_LABEL], pull_request=True),
-            _issue_line(21, labels=[AUTO_CLAIM_LABEL]),
-        ]
+    stdout = _issues_response(
+        _issue(7, labels=[AUTO_CLAIM_LABEL, "bug"]),
+        _issue(9, labels=["bug"]),
+        # closed 不參與 auto 派工
+        _issue(11, state="closed", labels=[AUTO_CLAIM_LABEL]),
+        # PR 不參與
+        _issue(13, labels=[AUTO_CLAIM_LABEL], pull_request=True),
+        _issue(21, labels=[AUTO_CLAIM_LABEL]),
     )
     snapshot = GitHubWorkProvider("acme/demo", runner=_Runner(stdout)).scan()
     assert snapshot.status == "ok"
-    assert snapshot.observations == {"auto_label_issues": [7, 21]}
+    assert snapshot.observations["auto_label_issues"] == [7, 21]
 
 
 def test_work_provider_malformed_labels_fail_closed() -> None:
-    entity = json.loads(_issue_line(7))
+    entity = _issue(7)
     entity["labels"] = "not-a-list"
     snapshot = GitHubWorkProvider(
-        "acme/demo", runner=_Runner(json.dumps(entity))
+        "acme/demo", runner=_Runner(_issues_response(entity))
     ).scan()
     assert snapshot.status == "degraded"
     assert "malformed" in snapshot.diagnostics[0]

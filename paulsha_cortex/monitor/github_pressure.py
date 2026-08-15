@@ -18,6 +18,13 @@ Monitor 的 ``_github_refresh_loop``（``monitor/service.py``）每
      的 REST 只剩 graphql 分頁與 1 次 git tree。下面的問題描述與預算計算保留
      當時的實測基準，因為節流／退避機制本身沒有變。
 
+  .. note:: #506 / D3 之後，``GitHubWorkProvider`` 改走
+     ``state=all&since=`` ＋ ETag 條件請求的增量協定（``monitor/github_issue_sync``），
+     穩態下每輪每 repo 是 **1 次免費 304**；全量只在每日一次的 anti-entropy
+     對帳、以及游標／ETag 狀態損壞的 fail-closed 重建時發生。分頁也從
+     ``--paginate``（gh 在行程內自己連發，閘門完全管不到）改成本地逐頁重建，
+     因此**每一頁**都會經過 :meth:`GitHubPressureGate.throttle`。
+
 亦即 per-repo per-cycle 是 O(issues 分頁 + todo 檔數)。實際 workspace 約 40 個
 repo，一輪數百次請求在數秒內齊發，穩定觸發 GitHub secondary（abuse detection）
 rate limit——實測 ``github:`` 與 ``github-terminal:`` 兩個 provider 同時
