@@ -205,6 +205,10 @@
   `tests/test_monitor_git_native_reads_506.py`（16 個測試，含量化驗收樁）。
 
 ### Fixed
+- **Issue #518：instance config isolation**——`cortex install service` 會遷移 legacy
+  instance env，原子產生可驗證的 exact-project monitor config 並保留 rollback；monitor
+  不再因父目錄 workspace 掃到 sibling repos，`cortex doctor` 也會從本機 env 檔告警 shared
+  project config root 與重複掃描影響。
 - **Issue #569：reviewer 卡的 `retry-verify` 只重置不重派——`retry-card` 放寬到
   verify／review 的 reviewer 卡**——實測 run `workflow-084f75e2178cf7547476` 的
   verification job（agy，#568 權限剖面缺陷）exit 0 但 log 無 JSON envelope，

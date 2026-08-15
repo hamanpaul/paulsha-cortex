@@ -44,6 +44,7 @@ def default_socket_path() -> Path:
 class WorkspaceConfig:
     path: Path
     name: str
+    exact_project: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,10 +124,16 @@ def _parse_workspaces(raw: Any) -> tuple[WorkspaceConfig, ...]:
             raise ValueError(f"config.workspaces[{index}].path 缺失")
         if not name_value:
             raise ValueError(f"config.workspaces[{index}].name 缺失")
+        exact_project = entry.get("exact_project", entry.get("exact", False))
+        if not isinstance(exact_project, bool):
+            raise ValueError(
+                f"config.workspaces[{index}].exact_project 必須是布林值"
+            )
         items.append(
             WorkspaceConfig(
                 path=Path(str(path_value)).expanduser(),
                 name=str(name_value),
+                exact_project=exact_project,
             )
         )
     return tuple(items)
@@ -261,4 +268,3 @@ def load_config(*, config_path: Path | None = None) -> MonitorConfig:
         _load_manual_config(resolved),
         hippo_projects=tuple(hippo_list),
     )
-

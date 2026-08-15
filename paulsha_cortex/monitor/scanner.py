@@ -179,7 +179,11 @@ def scan_workspaces_detailed(config: MonitorConfig) -> ScanResult:
     degraded_diagnostics: list[DegradedDiagnostic] = []
 
     for workspace in config.workspaces:
-        project_dirs, error = _list_project_dirs_checked(workspace.path, ignore)
+        if workspace.exact_project:
+            resolved_project, error = checked_resolve(workspace.path)
+            project_dirs = [] if error is not None else [resolved_project]
+        else:
+            project_dirs, error = _list_project_dirs_checked(workspace.path, ignore)
         if error is not None:
             degraded_roots.append(workspace.path)
             degraded_workspaces.append(workspace.name)

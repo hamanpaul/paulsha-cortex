@@ -874,6 +874,71 @@ def _managed_path_drift_probe(
     )
 
 
+def _shared_project_config_root_probe(
+    effective: Mapping[str, str], *, home: Path, instance: str
+) -> ProbeResult:
+    """Detect shared project config roots from local bootstrap env files only."""
+    raw_root = effective.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
+    if not raw_root:
+        return ProbeResult(
+            "shared-project-config-root",
+            "pass",
+            "PSC_PROJECT_CONFIG_ROOT is not set; shared-root check not applicable",
+            False,
+        )
+    project_root = Path(raw_root).expanduser().resolve()
+    runtime_dir = home / ".agents" / "core" / "runtime"
+    owners: dict[str, Path] = {instance: project_root}
+    if runtime_dir.is_dir():
+        for env_file in sorted(runtime_dir.glob("*-manager.env")):
+            name = env_file.name[: -len("-manager.env")]
+            if INSTANCE_RE.fullmatch(name) is None:
+                continue
+            try:
+                values = _parse_environment_file(env_file)
+            except (OSError, ValueError):
+                continue
+            candidate = values.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
+            if not candidate:
+                agents = values.get("PSC_AGENTS_ROOT", "").strip()
+                candidate = str(Path(agents).expanduser() / "config" / "paulsha") if agents else ""
+            if candidate:
+                owners[name] = Path(candidate).expanduser().resolve()
+    shared_instances = sorted(
+        name for name, candidate in owners.items() if candidate == project_root
+    )
+    if len(shared_instances) < 2:
+        return ProbeResult(
+            "shared-project-config-root",
+            "pass",
+            "project config root is not shared by multiple local instances",
+            False,
+        )
+
+    repo_paths: tuple[str, ...] = ()
+    config_path = project_root / "project-cortex.yaml"
+    try:
+        from .monitor.config import load_config
+        from .monitor.scanner import scan_workspaces
+
+        states = scan_workspaces(load_config(config_path=config_path))
+        repo_paths = tuple(sorted({str(Path(state.path).resolve()) for state in states}))
+    except (OSError, ValueError):
+        pass
+    impact = (
+        f"repeated scan repos={len(repo_paths)} ({', '.join(repo_paths)})"
+        if repo_paths
+        else "repeated scan repos=unknown"
+    )
+    return ProbeResult(
+        "shared-project-config-root",
+        "warn",
+        f"project config root {project_root} is shared by instances "
+        f"{', '.join(shared_instances)}; {impact}",
+        False,
+    )
+
+
 def _service_paths_probe(*, home: Path, instance: str, live: bool) -> ProbeResult:
     result, _effective = _service_environment_probe(
         home=home,
@@ -1048,6 +1113,7 @@ def run_doctor(
         service_probe,
         _repo_identity_probe(effective),
         _managed_path_drift_probe(effective, agents_root=agents_root, instance=instance),
+        _shared_project_config_root_probe(effective, home=home_path, instance=instance),
         state_probe,
         socket_probe,
     ]

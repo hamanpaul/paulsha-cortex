@@ -7,16 +7,22 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Sequence
+
+import yaml
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deploy import hooks as hook_reconcile
 
 _INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
 _SUPPORTED_EXECUTORS = frozenset({"copilot", "claude", "codex"})
+_PRESERVE_EXISTING_PATHS = frozenset(
+    {"PSC_INSTANCE", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT"}
+)
 
 
 @dataclass(frozen=True)
@@ -249,6 +255,111 @@ def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
     return runtime_dir / f"{instance}.env"
 
 
+def _is_exact_project_config(config_path: Path, repo_root: Path) -> bool:
+    try:
+        from paulsha_cortex.monitor.config import load_config
+
+        config = load_config(config_path=config_path)
+    except (OSError, ValueError):
+        return False
+    if len(config.workspaces) != 1:
+        return False
+    workspace = config.workspaces[0]
+    return (
+        workspace.exact_project
+        and workspace.path.expanduser().resolve() == repo_root.expanduser().resolve()
+    )
+
+
+def _is_loadable_model_identities(config_root: Path) -> bool:
+    try:
+        from paulsha_cortex.coordinator.model_identities import load_model_identities
+
+        load_model_identities(config_root, use_packaged_default=False)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _restore_file(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_bytes(previous)
+
+
+def _migrate_instance_config(
+    *,
+    env_file: Path,
+    existing: dict[str, str],
+    config_root: Path,
+    repo_root: Path,
+    managed_env: dict[str, str],
+) -> None:
+    """Adopt a legacy instance with a validated, rollback-safe config bundle."""
+    project_config = config_root / "project-cortex.yaml"
+    identities = config_root / "model-identities.yaml"
+    project_needs_update = not _is_exact_project_config(project_config, repo_root)
+    identities_need_update = not _is_loadable_model_identities(config_root)
+    current_root = existing.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
+    root_needs_update = (
+        not current_root
+        or Path(current_root).expanduser().resolve() != config_root.resolve()
+    )
+    if not (project_needs_update or identities_need_update or root_needs_update):
+        _write_managed_env(
+            env_file,
+            managed_env,
+            preserve_existing=_PRESERVE_EXISTING_PATHS,
+        )
+        return
+
+    config_root.mkdir(parents=True, exist_ok=True)
+    project_payload = {
+        "workspaces": [
+            {
+                "name": repo_root.name,
+                "path": str(repo_root),
+                "exact_project": True,
+            }
+        ]
+    }
+    project_text = yaml.safe_dump(project_payload, sort_keys=False)
+    identities_text = "schema_version: 3\nidentities: []\n"
+    previous = {
+        env_file: env_file.read_bytes() if env_file.is_file() else None,
+        project_config: project_config.read_bytes() if project_config.is_file() else None,
+        identities: identities.read_bytes() if identities.is_file() else None,
+    }
+    staging = Path(tempfile.mkdtemp(prefix=".cortex-migration-", dir=config_root))
+    try:
+        staged_project = staging / "project-cortex.yaml"
+        staged_identities = staging / "model-identities.yaml"
+        staged_project.write_text(project_text, encoding="utf-8")
+        staged_identities.write_text(identities_text, encoding="utf-8")
+        from paulsha_cortex.coordinator.model_identities import load_model_identities
+        from paulsha_cortex.monitor.config import load_config
+
+        load_config(config_path=staged_project)
+        load_model_identities(staging, use_packaged_default=False)
+        if project_needs_update:
+            os.replace(staged_project, project_config)
+        if identities_need_update:
+            os.replace(staged_identities, identities)
+        _write_managed_env(
+            env_file,
+            managed_env,
+            preserve_existing=_PRESERVE_EXISTING_PATHS,
+        )
+    except Exception:
+        _restore_file(env_file, previous[env_file])
+        _restore_file(project_config, previous[project_config])
+        _restore_file(identities, previous[identities])
+        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def install_service_result(
     instance: str, interval: int, repo_root: Path, *, rebind: bool = False
 ) -> InstallServiceResult:
@@ -318,23 +429,12 @@ def install_service_result(
         if executor_override not in _SUPPORTED_EXECUTORS:
             raise ValueError("PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
         managed_env["PSC_MANAGER_EXECUTOR"] = executor_override
-    _write_managed_env(
-        env_file,
-        managed_env,
-        # PSC_PROJECT_CONFIG_ROOT 與 PSC_CONTROL_ROOT 刻意不在這裡：兩者都是純粹
-        # 依 PSC_AGENTS_ROOT／instance 推導的 managed path，放進 preserve_existing
-        # 等於允許一個早期殘留的錯誤值被永久鎖死、重裝也修不好（#371 的根因；
-        # #375 加入 PSC_CONTROL_ROOT 時複驗明確警告過不得重蹈覆轍）。
-        # PSC_MANAGER_SPECS_DIR／PSC_COORDINATOR_ROOT／PSC_SPECS_ROOT 目前仍不在
-        # managed_env 之列（維持 operator 域，見 issue #375 comment 的評估與
-        # test_install_leaves_specs_and_coordinator_roots_as_operator_domain）。
-        preserve_existing=frozenset(
-            {
-                "PSC_INSTANCE",
-                "PSC_RUN_ROOT",
-                "PSC_MONITOR_STATE_ROOT",
-            }
-        ),
+    _migrate_instance_config(
+        env_file=env_file,
+        existing=existing,
+        config_root=Path(managed_env["PSC_PROJECT_CONFIG_ROOT"]),
+        repo_root=repo_root,
+        managed_env=managed_env,
     )
     hook_reconcile_result = hook_reconcile.reconcile_codex_hooks(
         hook_reconcile.default_codex_hooks_path(home)
