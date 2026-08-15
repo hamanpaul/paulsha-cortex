@@ -176,13 +176,18 @@ identities:
         encoding="utf-8",
     )
 
-    assert review.load_model_identity_registry(tmp_path) == {
-        ("agy", AGY_MODEL_ID): {
-            "executor": "agy",
-            "model_id": AGY_MODEL_ID,
-            "independence_domain": "google",
-        }
+    mapping = review.load_model_identity_registry(tmp_path)
+
+    # legacy 投影只帶三欄，不外洩 capabilities／live_probe 等 planner metadata。
+    assert mapping[("agy", AGY_MODEL_ID)] == {
+        "executor": "agy",
+        "model_id": AGY_MODEL_ID,
+        "independence_domain": "google",
     }
+    # #490：foreign review 改用與 manager／tick 同一份合併 registry，packaged
+    # 身分不必再被複製進 host overlay 才解析得到。
+    assert ("claude", "sonnet") in mapping
+    assert all(set(row) == {"executor", "model_id", "independence_domain"} for row in mapping.values())
 
 
 def test_agy_probe_requires_model_listing_and_safe_headless_smoke() -> None:

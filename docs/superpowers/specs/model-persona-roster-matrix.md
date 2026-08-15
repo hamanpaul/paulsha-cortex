@@ -57,6 +57,12 @@ patchmud 實測或明示預設兩種 provenance。
 （屬 `#452` C 解析實作票的範圍），但該格仍列待 benchmark——override 巷道是真實巷道，且
 benchmark 結果是日後決定是否擴充優先序的依據。
 
+> **`#534` 後續更新（2026-08）**：`select_secondary_planner` 已改走三層解析鏈
+> （`model_resolution.rank_candidates`），不再迭代 `PLANNER_PRIORITY`——該常數僅
+> 保留為 executor↔domain 對應的歷史記錄，不參與任何選擇。因此本註記描述的
+> 「cg planner 永遠不可達」限制**已解除**：cg 只要列在 host overlay，或評估
+> 合格並人工複核進 `model-eval-roster.yaml`，即可被自動 fallback 選到。
+
 補充註記（非排除，實作票需知）：reviewer persona 的結構化終局契約目前只有 claude 有
 `--json-schema` 綁定（`launcher.py:993-994` 只對 claude 傳 `review_terminal_kind`，
 `_claude_review_json_schema`）；codex／agy／cg reviewer 依賴 prompt 側終局契約＋harvest

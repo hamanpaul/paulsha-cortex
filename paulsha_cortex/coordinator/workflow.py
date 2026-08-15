@@ -22,13 +22,22 @@ STEP_GATE_RESULTS = frozenset({"pending", "running", "passed", "failed", "needs_
 # #205：run-scoped 模型鏈覆寫／解析結果三段固定為 planner／builder／reviewer，
 # 與 WorkflowStep.persona 的合法值對齊（見 deck.schema 對 persona 的定義）。
 MODEL_CHAIN_PERSONAS = frozenset({"planner", "builder", "reviewer"})
-# #452 C：source 值域擴充——"patchmud-profile"（該段身分帶該 persona 的實測
-# 側寫）／"default-envelope"（查表投影落在 DEFAULT_ENVELOPE 保守預設）。
-# "registry" 保留為既有 run 的 legacy 值（#452 前的紀錄照舊可載入）；新紀錄
-# 一律記 override／patchmud-profile／default-envelope 三者之一。
-MODEL_CHAIN_RESOLUTION_SOURCES = frozenset(
+# #534：source 改記**解析層** provenance——"run-override"（run-scoped 覆寫）／
+# "operator-overlay"（host overlay 人工指定）／"evaluated-roster"（patchmud 評估
+# 合格＋人工複核）／"packaged-fallback"（未評估候選池，fail-loud）。封套來源移到
+# 選配的 "envelope_source" 欄位（"measured"／"default"）。
+# legacy 值（"override"／"registry"／"patchmud-profile"／"default-envelope"）保留
+# 於值域內，讓 #534 之前寫下的 run 紀錄照舊可載入；新紀錄一律記解析層。
+MODEL_CHAIN_RESOLUTION_LAYERS = frozenset(
+    {"run-override", "operator-overlay", "evaluated-roster", "packaged-fallback"}
+)
+MODEL_CHAIN_RESOLUTION_LEGACY_SOURCES = frozenset(
     {"override", "registry", "patchmud-profile", "default-envelope"}
 )
+MODEL_CHAIN_RESOLUTION_SOURCES = (
+    MODEL_CHAIN_RESOLUTION_LAYERS | MODEL_CHAIN_RESOLUTION_LEGACY_SOURCES
+)
+MODEL_CHAIN_ENVELOPE_SOURCES = frozenset({"measured", "default"})
 COMBO_SELECTION_SOURCES = frozenset({"task-type-auto", "explicit-override", "bypass-default"})
 
 
@@ -53,9 +62,12 @@ def _validate_model_chain_override(value: object, *, field_name: str) -> None:
 
 
 def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
-    """#205 D5／#452 C：解析結果稽核紀錄——{persona: {executor, model_id,
-    independence_domain, source}}，source ∈ MODEL_CHAIN_RESOLUTION_SOURCES
-    （override／registry(legacy)／patchmud-profile／default-envelope）。"""
+    """#205 D5／#452 C／#534：解析結果稽核紀錄——{persona: {executor, model_id,
+    independence_domain, source, envelope_source?}}。
+
+    ``source`` ∈ MODEL_CHAIN_RESOLUTION_SOURCES（#534 的四個解析層，外加
+    #534 之前的 legacy 值以便舊 run 紀錄照舊可載入）；``envelope_source`` 為
+    #534 新增的**選配**欄位，缺席即為 #534 之前的紀錄。"""
     if value is None:
         return
     if not isinstance(value, dict):
@@ -64,8 +76,18 @@ def _validate_model_chain_resolution(value: object, *, field_name: str) -> None:
     for persona, row in value.items():
         if persona not in MODEL_CHAIN_PERSONAS:
             raise ValueError(f"workflow run {field_name} persona 非法: {persona!r}")
-        if not isinstance(row, dict) or set(row) != required_keys:
+        if not isinstance(row, dict) or not required_keys <= set(row):
             raise ValueError(f"workflow run {field_name}[{persona!r}] 格式錯誤")
+        if set(row) - (required_keys | {"envelope_source"}):
+            raise ValueError(f"workflow run {field_name}[{persona!r}] 格式錯誤")
+        if (
+            "envelope_source" in row
+            and row["envelope_source"] not in MODEL_CHAIN_ENVELOPE_SOURCES
+        ):
+            raise ValueError(
+                f"workflow run {field_name}[{persona!r}].envelope_source 非法: "
+                f"{row.get('envelope_source')!r}"
+            )
         for key in ("executor", "model_id", "independence_domain"):
             if not isinstance(row.get(key), str) or not row[key]:
                 raise ValueError(f"workflow run {field_name}[{persona!r}].{key} 必須為非空字串")

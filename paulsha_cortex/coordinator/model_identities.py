@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -11,7 +12,10 @@ from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
 
 from .._yaml import YAMLError, safe_load
+from . import model_resolution
 from .launcher import build_agy_argv
+
+logger = logging.getLogger(__name__)
 
 # #452 B：schema v3 新增封套四欄位＋profile_provenance（全選填）。v1/v2 檔案
 # 照載（缺省欄位由查表投影套 DEFAULT_ENVELOPE，見 project_envelope）。
@@ -25,6 +29,9 @@ AGY_MODEL_ID = "gemini-3.1-pro-high"
 _AGY_MODEL_ID_LEGACY_DISPLAY_NAME = "Gemini 3.1 Pro (High)"
 AGY_DOMAIN = "google"
 AGY_LIVE_PROBE = "agy-plan-sandbox"
+#: #534 起**不再是解析順序**：`select_secondary_planner` 改走三層解析鏈
+#: （model_resolution）。保留本常數僅為既有 executor↔domain 對應的歷史記錄
+#: （docs/superpowers/specs/model-persona-roster-matrix.md 引用），不參與任何選擇。
 PLANNER_PRIORITY = (
     ("agy", "google"),
     ("claude", "anthropic"),
@@ -288,8 +295,21 @@ class ModelIdentity:
     consistency_scope: tuple[str, ...] | None = None
     acceptance_modes: tuple[str, ...] | None = None
     # dict 不可 hash：排除在 __hash__ 之外（等值比較仍包含本欄位，shadow 檢查
-    # 語意不變——內容不同的同鍵身分仍會被 load_model_identities 拒載）。
+    # 語意不變——內容不同的同鍵身分在 load_model_identities 會被判為 overlay
+    # 覆寫 packaged，而不是相同列）。
     profile_provenance: Mapping[str, object] | None = field(default=None, hash=False)
+    # #534：解析層 provenance。三者皆為 loader 蓋章／overlay 指令，**不是** YAML
+    # 身分欄位，因此一律排除在等值比較與 hash 之外（shadow 判定只看身分內容），
+    # 也不進 `to_dict()`（registry 檔案格式不變，`write_registry_file` 寫出的
+    # packaged roster 逐欄與 #534 之前相同）。
+    #: 身分來自 host overlay 或 packaged roster（見 model_resolution）。
+    origin: str = field(
+        default=model_resolution.IDENTITY_ORIGIN_OVERLAY, compare=False, hash=False
+    )
+    #: overlay 對 packaged 身分的處置：None／"park"／"demote"（#509 殘項）。
+    operator_action: str | None = field(default=None, compare=False, hash=False)
+    #: overlay 是否明示宣告本列覆寫同鍵 packaged 身分（#509「合法覆寫語意」）。
+    override_packaged: bool = field(default=False, compare=False, hash=False)
 
     def legacy_dict(self) -> dict[str, str]:
         return {
@@ -329,6 +349,16 @@ class ModelIdentity:
 class IdentityRegistry:
     schema_version: int
     identities: tuple[ModelIdentity, ...]
+    # #534：本次載入的解析上下文（政策／評估合格清單／診斷）。手工建構的
+    # registry 不帶上下文，一律走 DEFAULT_CONTEXT（全視為 operator 指定，
+    # 維持既有順序語意）。不參與等值比較與 hash。
+    resolution: "model_resolution.ResolutionContext | None" = field(
+        default=None, compare=False, hash=False
+    )
+
+    @property
+    def resolution_context(self) -> "model_resolution.ResolutionContext":
+        return self.resolution or model_resolution.DEFAULT_CONTEXT
 
     @classmethod
     def from_rows(
@@ -336,6 +366,7 @@ class IdentityRegistry:
         rows: Iterable[Mapping[str, object]],
         *,
         schema_version: int = MODEL_IDENTITY_SCHEMA_VERSION,
+        origin: str = model_resolution.IDENTITY_ORIGIN_OVERLAY,
     ) -> "IdentityRegistry":
         identities: list[ModelIdentity] = []
         seen: set[tuple[str, str]] = set()
@@ -345,6 +376,8 @@ class IdentityRegistry:
             "independence_domain",
             "capabilities",
             "live_probe",
+            # #534／#509：overlay 明示覆寫同鍵 packaged 身分的旗標（選配）。
+            "override_packaged",
         }
         if int(schema_version) >= 3:
             # schema v3（#452 B）才認得封套欄位；v1/v2 帶了一律 fail-closed。
@@ -378,6 +411,11 @@ class IdentityRegistry:
                 if live_probe_raw is None
                 else _nonempty(live_probe_raw, f"model-identities[{index}].live_probe")
             )
+            override_packaged = row.get("override_packaged", False)
+            if not isinstance(override_packaged, bool):
+                raise ValueError(
+                    f"model-identities[{index}].override_packaged must be a boolean"
+                )
             if executor == "agy" and "planning" in capabilities:
                 if domain != AGY_DOMAIN or live_probe != AGY_LIVE_PROBE:
                     raise ValueError(
@@ -397,6 +435,8 @@ class IdentityRegistry:
                     independence_domain=domain,
                     capabilities=capabilities,
                     live_probe=live_probe,
+                    origin=origin,
+                    override_packaged=override_packaged,
                     **envelope,
                 )
             )
@@ -425,7 +465,9 @@ def _packaged_registry_path() -> Path:
     return Path(__file__).with_name("data") / "model-identities.yaml"
 
 
-def _load_model_identity_file(path: Path) -> IdentityRegistry:
+def _load_model_identity_file(
+    path: Path, *, origin: str = model_resolution.IDENTITY_ORIGIN_OVERLAY
+) -> IdentityRegistry:
     if not path.is_file():
         raise ValueError(f"model-identities missing: {path}")
     try:
@@ -436,7 +478,15 @@ def _load_model_identity_file(path: Path) -> IdentityRegistry:
         raise ValueError(f"model-identities unreadable: {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"model-identities invalid root: {path}")
-    extras = set(payload) - {"schema_version", "identities"}
+    # #534：新增兩個**選配**頂層區塊——`packaged_overrides`（demote／park packaged
+    # 身分）與 `resolution_policy`（packaged fallback 政策）。既有 overlay 檔案不
+    # 帶這兩個 key 照舊合法，不需為升級改任何一行。
+    extras = set(payload) - {
+        "schema_version",
+        "identities",
+        "packaged_overrides",
+        "resolution_policy",
+    }
     if extras:
         raise ValueError(f"model-identities unexpected top-level key: {sorted(extras)[0]}")
     schema_version = payload.get("schema_version")
@@ -474,7 +524,24 @@ def _load_model_identity_file(path: Path) -> IdentityRegistry:
         rows = normalized_rows
     # 封套欄位是 schema v3（#452 B）才有的契約；v1/v2 檔案帶了照舊 fail-closed
     # （閘門在 from_rows 內由 schema_version 推導，建構層與檔案層同一條規則）。
-    return IdentityRegistry.from_rows(rows, schema_version=int(schema_version))
+    registry = IdentityRegistry.from_rows(
+        rows, schema_version=int(schema_version), origin=origin
+    )
+    overrides = model_resolution.parse_packaged_overrides(payload.get("packaged_overrides"))
+    # 沒有 overlay 檔案的部署＝operator 未宣告任何東西，packaged roster 就是全世界
+    # ——此時 fallback 預設 allow（僅留 provenance）；有 overlay 檔案時預設 warn
+    # （fail-loud），operator 可自行改成 deny 走嚴格 fail-closed。
+    policy = model_resolution.parse_resolution_policy(
+        payload.get("resolution_policy"),
+        default=model_resolution.PACKAGED_FALLBACK_WARN,
+    )
+    context = model_resolution.ResolutionContext(
+        policy=policy,
+        packaged_overrides=overrides,
+        config_root=str(path.parent),
+        overlay_present=origin == model_resolution.IDENTITY_ORIGIN_OVERLAY,
+    )
+    return replace(registry, resolution=context)
 
 
 def load_model_identities(
@@ -482,37 +549,138 @@ def load_model_identities(
     *,
     use_packaged_default: bool = True,
 ) -> IdentityRegistry:
+    """載入 host overlay ＋ packaged 候選池，並蓋上 #534 的解析層 provenance。
+
+    #534：overlay 絕對優先。overlay 列在合併結果中一律排在 packaged 之前，且
+    **同鍵時 overlay 覆寫 packaged**——後者過去是 `raise ValueError`，一列過期
+    設定就能打掛整條 periodic tick（#509）。現在改為：
+
+    - 逐欄相等 → 視為同一列，沿用 overlay 那份（無診斷）；
+    - 內容不同且 overlay 明示 ``override_packaged: true`` → 合法覆寫（info 診斷）；
+    - 內容不同但未明示 → 仍以 overlay 為準（裁決：人工指定優先），但留下 warn
+      診斷並打 log，請 operator 補旗標或移除該列。**不再中止載入。**
+    """
+
     root = Path(config_root) if config_root is not None else paths.project_config_root()
     custom_path = root / "model-identities.yaml"
     if not use_packaged_default:
-        return _load_model_identity_file(custom_path)
+        overlay_only = _load_model_identity_file(
+            custom_path, origin=model_resolution.IDENTITY_ORIGIN_OVERLAY
+        )
+        return replace(
+            overlay_only,
+            resolution=replace(
+                overlay_only.resolution_context,
+                eval_roster=model_resolution.load_eval_roster_degraded(root),
+            ),
+        )
 
-    packaged = _load_model_identity_file(_packaged_registry_path())
+    packaged = _load_model_identity_file(
+        _packaged_registry_path(), origin=model_resolution.IDENTITY_ORIGIN_PACKAGED
+    )
+    eval_roster = model_resolution.load_eval_roster_degraded(root)
+    notes: list[model_resolution.ResolutionNote] = []
+    if eval_roster.load_error is not None:
+        notes.append(
+            model_resolution.ResolutionNote(
+                "eval-roster-unreadable",
+                "fail",
+                f"{eval_roster.load_error}（第 2 層視為空清單，解析不會因此多授予資格）",
+            )
+        )
     if not custom_path.is_file():
-        return packaged
-    custom = _load_model_identity_file(custom_path)
+        # operator 未宣告任何 overlay：packaged 就是全世界，fallback 預設 allow。
+        context = model_resolution.ResolutionContext(
+            policy=model_resolution.ResolutionPolicy(
+                model_resolution.PACKAGED_FALLBACK_ALLOW
+            ),
+            eval_roster=eval_roster,
+            notes=tuple(notes),
+            config_root=str(root),
+            overlay_present=False,
+        )
+        return replace(packaged, resolution=context)
+    custom = _load_model_identity_file(
+        custom_path, origin=model_resolution.IDENTITY_ORIGIN_OVERLAY
+    )
+    overlay_context = custom.resolution_context
     packaged_by_key = {
         (item.executor, item.model_id): item for item in packaged.identities
     }
+    overlay_keys = {(item.executor, item.model_id) for item in custom.identities}
     additions: list[ModelIdentity] = []
+    shadowed: set[tuple[str, str]] = set()
     for identity in custom.identities:
         key = (identity.executor, identity.model_id)
         packaged_identity = packaged_by_key.get(key)
-        if packaged_identity is not None and packaged_identity == identity:
-            continue
         if packaged_identity is not None:
-            # #452 對抗審查修正：roster 擴為 5 身分後，既有 host overlay 撞鍵的
-            # 機率大增（尤其 claude/sonnet 舊 operator 寫法）——錯誤訊息附行動
-            # 指引，操作者不用翻 code 就知道怎麼解。
-            raise ValueError(
-                f"model-identities custom identity shadows packaged default: {key[0]}/{key[1]}"
-                "（packaged roster v3 已收編此身分：請自 host overlay 移除該列，"
-                "或改成與 packaged 逐欄相等）"
-            )
+            shadowed.add(key)
+            if packaged_identity != identity:
+                if identity.override_packaged:
+                    notes.append(
+                        model_resolution.ResolutionNote(
+                            "packaged-override",
+                            "info",
+                            f"host overlay 明示覆寫 packaged 身分 {key[0]}/{key[1]}",
+                        )
+                    )
+                else:
+                    detail = (
+                        f"host overlay 的 {key[0]}/{key[1]} 與 packaged roster 同鍵但內容不同，"
+                        "已以 overlay 為準（人工指定優先）。請於該列加上 "
+                        "`override_packaged: true` 明示覆寫意圖，或移除該列改用 packaged 版本。"
+                    )
+                    notes.append(
+                        model_resolution.ResolutionNote(
+                            "unflagged-packaged-override", "warn", detail
+                        )
+                    )
+                    logger.warning("model-identities %s", detail)
         additions.append(identity)
+    # #509 殘項：overlay 可 demote／park packaged 身分。
+    overrides_by_key = {item.key: item for item in overlay_context.packaged_overrides}
+    for key, override in overrides_by_key.items():
+        if key not in packaged_by_key:
+            raise ValueError(
+                "model-identities packaged_overrides 指向不存在的 packaged 身分: "
+                f"{key[0]}/{key[1]}（可處置的 packaged 身分: "
+                + ", ".join(f"{a}/{b}" for a, b in packaged_by_key)
+                + "）"
+            )
+        if key in overlay_keys:
+            raise ValueError(
+                "model-identities packaged_overrides 與 identities 同時宣告同一身分: "
+                f"{key[0]}/{key[1]}（兩者意圖矛盾：請擇一）"
+            )
+        notes.append(
+            model_resolution.ResolutionNote(
+                f"packaged-{override.action}",
+                "info",
+                f"host overlay {override.action} packaged 身分 {key[0]}/{key[1]}：{override.reason}",
+            )
+        )
+    retained: list[ModelIdentity] = []
+    for identity in packaged.identities:
+        key = (identity.executor, identity.model_id)
+        if key in shadowed:
+            # overlay 已宣告同鍵身分：以 overlay 那列為準，packaged 版本不重複登錄。
+            continue
+        override = overrides_by_key.get(key)
+        retained.append(
+            identity if override is None else replace(identity, operator_action=override.action)
+        )
+    context = model_resolution.ResolutionContext(
+        policy=overlay_context.policy,
+        eval_roster=eval_roster,
+        packaged_overrides=overlay_context.packaged_overrides,
+        notes=tuple(notes),
+        config_root=str(root),
+        overlay_present=True,
+    )
     return IdentityRegistry(
         schema_version=MODEL_IDENTITY_SCHEMA_VERSION,
-        identities=tuple(additions) + packaged.identities,
+        identities=tuple(additions) + tuple(retained),
+        resolution=context,
     )
 
 
@@ -642,27 +810,39 @@ def select_secondary_planner(
     primary: tuple[str, str],
     probes: Mapping[tuple[str, str], CapabilityProbe],
 ) -> SecondarySelection:
+    """挑異質 domain 的次要 planner。
+
+    #534：候選順序改走三層解析鏈（operator overlay → 評估合格清單 → packaged
+    fallback），不再是 ``PLANNER_PRIORITY`` 的寫死 executor 順序。舊實作把
+    ``agy`` 釘在第一位，且只認 ``PLANNER_PRIORITY`` 列出的三組
+    ``(executor, domain)``——operator 在 overlay 宣告的 planner（例如 `cg` 或
+    任何新 executor）**永遠不可達**，packaged 的 agy 卻穩坐熱路徑首位，正是
+    #534 的主訴現場。合法性條件（planning capability、異質 domain、probe
+    ready 且 probe 身分相符）逐項不變。
+    """
+
     primary_identity = registry.get(*primary)
     if primary_identity is None:
         return SecondarySelection("needs_human", "primary-identity-unknown", None)
-    for executor, domain in PLANNER_PRIORITY:
-        for identity in registry.identities:
-            if identity.executor != executor or identity.independence_domain != domain:
-                continue
-            if "planning" not in identity.capabilities:
-                continue
-            if identity.independence_domain == primary_identity.independence_domain:
-                continue
-            probe = probes.get((identity.executor, identity.model_id))
-            if probe is None or not probe.ready:
-                continue
-            if probe.identity != (
-                identity.executor,
-                identity.model_id,
-                identity.independence_domain,
-            ):
-                continue
-            return SecondarySelection("ready", None, identity)
+    planning = [
+        identity for identity in registry.identities if "planning" in identity.capabilities
+    ]
+    ranked = model_resolution.rank_candidates(
+        planning, role="planning", context=registry.resolution_context
+    )
+    for identity in ranked.ordered:
+        if identity.independence_domain == primary_identity.independence_domain:
+            continue
+        probe = probes.get((identity.executor, identity.model_id))
+        if probe is None or not probe.ready:
+            continue
+        if probe.identity != (
+            identity.executor,
+            identity.model_id,
+            identity.independence_domain,
+        ):
+            continue
+        return SecondarySelection("ready", None, identity)
     return SecondarySelection("needs_human", "no-heterogeneous-planner", None)
 
 

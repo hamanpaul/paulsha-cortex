@@ -76,9 +76,15 @@ def _normalize_identity(
 
 
 def load_model_identity_registry(config_root: str | Path | None = None) -> dict[tuple[str, str], dict[str, str]]:
-    return model_identities.load_model_identities(
-        config_root, use_packaged_default=False
-    ).legacy_mapping()
+    """#490：foreign review 與 manager／tick 必須解析**同一份**合併 registry。
+
+    舊實作 `use_packaged_default=False` 只讀 host overlay，於是 packaged 身分
+    （例如 claude/sonnet）在 retry-review 被判 `reviewer-identity-unknown`，
+    operator 只能把 packaged 那列逐欄複製進 overlay——複製回來又踩 #509 的
+    shadow 中止。兩邊改用同一個合併載入器後，這條矛盾一併消失。
+    """
+
+    return model_identities.load_model_identities(config_root).legacy_mapping()
 
 
 def read_repo_tier(repo_root: str | Path | None = None) -> str:

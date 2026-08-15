@@ -41,6 +41,33 @@
   寫入路徑、label API、events API 均不在本次。詳見
   `changelog.d/d3-incremental-issue-sync.md`。新增
   `tests/test_monitor_incremental_issue_sync_506.py`（34 個測試）。
+- **Issue #534 / #509 / #490 / #475：模型引擎解析改為三層解析鏈，packaged roster 降級為
+  候選池**——落實使用者裁決「人工指定清單優先 → agent 從 patchmud 評估合格清單挑 →
+  未評估模型須先經 eval、合格後人工複核加入清單」。新增
+  `paulsha_cortex/coordinator/model_resolution.py` 作為解析鏈單一真值：第 1 層
+  `operator-overlay`（host overlay 人工指定，**列序即優先序**）、第 2 層
+  `evaluated-roster`（新契約 `model-eval-roster.yaml`，須 `verdict: pass` **且**
+  `review_status: approved` 且角色相符）、第 3 層 `packaged-fallback`（候選池，受
+  `resolution_policy.packaged_fallback` 的 allow／warn／deny 管制）。解析層是排序主鍵且
+  為 stable sort，`#452` 的 measured 側寫優先與 `#262` 的 `primary_domain` 偏好降級為
+  同層內次要偏好——packaged roster 的內建列序（「agy 維持首位」）不再壓過人工指定，
+  planner 也不會再跑到 operator 未核可的引擎上。`resolved_model_chain` 的 `source` 改記
+  解析層（`run-override`／`operator-overlay`／`evaluated-roster`／`packaged-fallback`），
+  封套來源移至新的選配欄位 `envelope_source`；#534 之前的紀錄維持可載入。兩處寫死的
+  優先序一併移除：`select_secondary_planner` 不再迭代 `PLANNER_PRIORITY`（該常數曾把
+  agy 釘在首位、且只認三組 `(executor, domain)`，operator 宣告的 cg／新 executor planner
+  永遠不可達），`work_bridge` 的 primary planner 不再寫死 `("codex","claude","agy")`。
+  **#509 殘項**：overlay 與 packaged 同鍵不再 `raise ValueError` 打掛 periodic tick——
+  改為以 overlay 為準並留下診斷（明示 `override_packaged: true` 記 info、未明示記 warn），
+  另新增 `packaged_overrides` 讓 overlay 明示 `park`／`demote` packaged 身分；新增
+  `cortex doctor` 的 `model-resolution` probe，走與 tick 相同的載入器與排序函式、明示
+  config root，並以不變式守衛「overlay 宣告某角色 → 生效解析必須在第 1 層」。**#490**：
+  `review.load_model_identity_registry` 改用合併 registry，packaged 身分不必複製進 overlay
+  才能被 retry-review 解析。**#475** 現場收編為測試 fixture（自訂 Claude-compatible 身分
+  不得被 packaged 同 executor 身分靜默取代；executable 綁定仍為未竟部分）。所有新能力皆為
+  選配欄位／檔案，既有 overlay 不改一行也照載照解析。詳見
+  `changelog.d/model-resolution-chain.md`。新增 `tests/test_model_resolution_chain_534.py`
+  （29 個測試）。
 - **Issue #506 / D2：git 的資料走 git——monitor 對 GitHub REST 的兩類高量讀取改為本機
   git 操作，一輪掃描的 REST `contents`／`compare` 呼叫數固定為 0**——
   `GitHubTerminalProvider` 過去每個 remote `todo.md`／archived `tasks.md` 各打一次

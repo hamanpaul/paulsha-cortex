@@ -1,7 +1,13 @@
 # #452 B／#456 R3：候選身分 roster（capabilities 為候選宣告，benchmark 前）。
 # 封套欄位「沒寫＝預設、有寫＝實測」（#453 R4：registry 永不寫入預設值）；
 # 實測值由 `cortex model profile` 產 diff、經人工複核 --apply 後落地。
-# 列序即候選優先序：agy 維持首位，保住既有 planner 熱路徑選擇不變。
+#
+# #534：本檔已降級為**候選池**，不再直接參與解析優先序。解析鏈為
+#   1. host overlay `model-identities.yaml`（operator 人工指定，列序即優先序）
+#   2. host `model-eval-roster.yaml`（patchmud 評估合格＋人工複核通過）
+#   3. 本檔（packaged fallback，fail-loud；可由 overlay 的 packaged_overrides
+#      park／demote）
+# 本檔的列序只在「同屬第 3 層」的候選之間有意義，**不再**壓過人工指定。
 schema_version: 3
 identities:
   - executor: agy

@@ -39,6 +39,7 @@ from .claim import (
     sizing_band,
     work_authority_digest,
 )
+from . import model_resolution
 from .diagnostics import diagnostic_reason
 from .github_delivery import GitHubDeliveryClient
 from .model_identities import IdentityRegistry, load_model_identities
@@ -487,10 +488,18 @@ def start_canonical_workflow(
     planning = [identity for identity in identities.identities if "planning" in identity.capabilities]
     if not planning:
         raise RuntimeError("no primary planning identity configured")
-    primary = next(
-        (identity for executor in ("codex", "claude", "agy") for identity in planning if identity.executor == executor),
-        planning[0],
+    # #534：primary planner 改依三層解析鏈挑（operator overlay → 評估合格清單 →
+    # packaged fallback）。舊實作寫死 executor 順序 ("codex", "claude", "agy")，
+    # 與 operator 在 host overlay 宣告的順序無關——人工指定形同不存在。
+    ranked = model_resolution.rank_candidates(
+        planning, role="planning", context=identities.resolution_context
     )
+    if not ranked.ordered:
+        raise RuntimeError(
+            "no resolvable primary planning identity"
+            f"（{ranked.exclusion_detail()}）"
+        )
+    primary = ranked.ordered[0]
     from . import manager
 
     result = manager.apply_workflow_action(

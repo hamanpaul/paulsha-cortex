@@ -313,6 +313,7 @@ def _run_models(*, json_output: bool) -> int:
         ceiling = envelope.get("invariant_ceiling")
         sys.stdout.write(
             f"{row['executor']}/{row['model_id']}\t{row['persona']}\t"
+            f"layer={row.get('resolution_layer')}\t"
             f"accepts_bands={envelope.get('accepts_bands')}({source.get('accepts_bands')})\t"
             f"invariant_ceiling={'∅(bypass)' if ceiling is None else ceiling}"
             f"({source.get('invariant_ceiling')})\t"
