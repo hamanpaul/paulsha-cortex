@@ -25,6 +25,7 @@ from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
 from . import completion
+from . import gate_ledger
 from . import planning_runtime
 from . import provider_backoff
 from . import provider_outcome
@@ -3170,21 +3171,13 @@ def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | Non
 
 
 def _expected_gate_names_for_test_policy(test_policy: str | None) -> frozenset[str]:
-    """#379：從 plan 的驗收條件（deck compile 依 combo/cards.yaml 綁在每個 build
-    phase 卡片上的 ``test_policy``）機械導出這個 phase 應驗的 gate 名稱集合。
-
-    ``test_policy`` 目前是 workflow lane 裡唯一由 spec/plan（而非 operator 的
-    ``PSC_GATE_CMD_*`` env）決定的驗收訊號：``None``／``"none"`` 代表卡片本就
-    不要求測試（例如 worktree-isolation 這類不動 candidate 程式碼的卡），維持
-    既有 #308 的合法空 ledger 放行語意；其餘合法值（``"red-required"``／
-    ``"focused"``／``"full"``）皆代表這張卡的正確產出需要跑測試，對應 ledger
-    裡 :data:`terminal_contract.RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這個
-    gate 名稱——與 #307 red-required 反轉引用的是同一個名稱來源，不另立一套。
+    """#379 的判準；實作已於 #540 移到
+    :func:`terminal_contract.expected_gate_names_for_test_policy`，讓 doctor 的
+    gate 宣告前置檢查能共用同一份判準而不必 import 整個 manager。此處保留既有
+    呼叫端與測試使用的名稱，不另立語意。
     """
 
-    if test_policy in (None, "none"):
-        return frozenset()
-    return frozenset({terminal_contract.RED_REQUIRED_TEST_GATE_NAME})
+    return terminal_contract.expected_gate_names_for_test_policy(test_policy)
 
 
 def _workflow_acceptance_definition_drifted(
@@ -6789,8 +6782,20 @@ def _workflow_job_prompt(
     coordinator_root: str | Path,
     input_snapshot: tuple[dict[str, str], ...] = (),
     candidate_checkout: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> str:
+    """組出單張 workflow card 的派工 prompt。
+
+    ``env``（#540）：canonical gate 名稱由這份 env 的 ``PSC_GATE_CMD_*`` 宣告
+    機械導出（預設 ``os.environ``——與 launcher 交給 wrapper 的 env 同源，見
+    ``launcher._git_scope_env``），因此 prompt 告訴模型的 gate 名稱集合，與
+    job 結束後 manager 自己寫出的 ledger 必為同一組。
+    """
     fallback = _LEGACY_CARD_EXECUTION.get(step.card, (None, None, None, None))
+    effective_test_policy = step.test_policy or fallback[3]
+    # #540：與 launcher 交給 gate ledger writer 的是同一份 env，因此這裡導出的
+    # 名稱就是 ledger 之後會有的名稱。
+    canonical_gate_names = gate_ledger.ledger_gate_names(env)
     source_material: list[dict[str, object]] = []
     for row in input_snapshot:
         envelope = _read_workflow_input_content(
@@ -6919,17 +6924,35 @@ def _workflow_job_prompt(
             },
             # #261 R2：模型自述跑了哪些 gate。Manager 會用它自己在你結束之後獨立
             # 產生的 gate ledger 對照這份宣告，任何不一致都會 fail closed。
+            #
+            # #540：canonical gate 名稱集合（`allowed_names`）與說明文字皆由
+            # operator 的 `PSC_GATE_CMD_*` 宣告機械產生（gate_ledger 與寫 ledger
+            # 用的是同一條導出路徑），不在此手寫第二份真實來源——舊 prompt 只寫
+            # 「gate name」，模型只能自己造名字，採信必然撞
+            # `gate-evidence-unknown-gate`。
             "gate_evidence": {
                 "type": "array",
-                "items": {"name": "gate name", "status": "passed | failed"},
+                "items": {
+                    "name": "one of allowed_names below",
+                    "status": "passed | failed",
+                },
+                "allowed_names": list(canonical_gate_names),
                 "description": (
                     "Declare every deterministic gate you actually ran and its real result. "
                     "The Manager independently re-runs the declared gate commands after your "
                     "process exits and compares; claiming a gate you did not run, or claiming "
-                    "passed for a gate that failed, fails the card closed."
+                    "passed for a gate that failed, fails the card closed. "
+                    + gate_ledger.gate_evidence_name_hint(env)
                 ),
             },
         }
+        if effective_test_policy == "red-required":
+            # #540：#307 的反轉判準過去只存在於 manager 側；泛用 status_policy
+            # 對 tdd-red 卡字面上要求回 failed，與實際採信規則相反。說明文字由
+            # terminal_contract 依同一組判準常數產生。
+            terminal_schema["red_required_policy"] = (
+                terminal_contract.red_required_status_hint()
+            )
     contract: dict[str, object] = {
         "schema_version": 1,
         "kind": "workflow-card-prompt",
@@ -6947,7 +6970,7 @@ def _workflow_job_prompt(
         "skill_ref": step.skill_ref or fallback[0],
         "action": step.action or fallback[1],
         "commit_policy": step.commit_policy or fallback[2],
-        "test_policy": step.test_policy or fallback[3],
+        "test_policy": effective_test_policy,
         "terminal_schema": terminal_schema,
     }
     if run.openspec_refs:

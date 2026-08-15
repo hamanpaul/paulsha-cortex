@@ -81,6 +81,52 @@ RED_REQUIRED_TEST_GATE_NAME = "pytest"
 # 合格 RED。
 PYTEST_EXIT_TESTS_FAILED = 1
 
+
+def expected_gate_names_for_test_policy(test_policy: str | None) -> frozenset[str]:
+    """#379：從 plan 的驗收條件（deck compile 依 combo/cards.yaml 綁在每個 build
+    phase 卡片上的 ``test_policy``）機械導出這個 phase 應驗的 gate 名稱集合。
+
+    ``test_policy`` 目前是 workflow lane 裡唯一由 spec/plan（而非 operator 的
+    ``PSC_GATE_CMD_*`` env）決定的驗收訊號：``None``／``"none"`` 代表卡片本就
+    不要求測試（例如 worktree-isolation 這類不動 candidate 程式碼的卡），維持
+    既有 #308 的合法空 ledger 放行語意；其餘合法值（``"red-required"``／
+    ``"focused"``／``"full"``）皆代表這張卡的正確產出需要跑測試，對應 ledger
+    裡 :data:`RED_REQUIRED_TEST_GATE_NAME`（"pytest"）這個 gate 名稱——與 #307
+    red-required 反轉引用的是同一個名稱來源，不另立一套。
+
+    #540：本函式自 ``manager`` 移來（`manager._expected_gate_names_for_test_policy`
+    改為轉呼叫，既有呼叫端不變），目的是讓 ``cortex doctor`` 的 gate 宣告前置
+    檢查能與 harvest 端共用同一個判準，而不必為此 import 整個 manager。
+    """
+
+    if test_policy in (None, "none"):
+        return frozenset()
+    return frozenset({RED_REQUIRED_TEST_GATE_NAME})
+
+
+def red_required_status_hint() -> str:
+    """回傳 red-required 卡的 prompt 說明（由 #307 的反轉判準機械產生）。
+
+    issue #540：``_apply_red_required_semantics`` 對 red-required 卡把
+    ``pytest`` gate 的 exit code 1 反轉成達成，但派工 prompt 的泛用
+    ``status_policy`` 寫的是「任一 gate failed 就回 failed」——tdd-red 卡的正確
+    行為（ledger 顯示 pytest failed，terminal 仍回 passed 並誠實自報
+    ``pytest: failed``）在 prompt 上讀起來像違規。文字由這裡依判準常數產生，
+    prompt 端不得另寫一份。
+    """
+
+    return (
+        f'This card has test_policy=red-required: the "{RED_REQUIRED_TEST_GATE_NAME}" gate is '
+        f"expected to FAIL with exit code {PYTEST_EXIT_TESTS_FAILED} because delivering a "
+        "genuinely failing regression test is what this card is for. For that one gate this "
+        "overrides status_policy above: report the observed result honestly in gate_evidence "
+        f'(\"{RED_REQUIRED_TEST_GATE_NAME}\" with status \"failed\") and still report '
+        "status=passed once the failing test is committed — the Manager performs the inversion, "
+        "you must not. A passing pytest gate means no RED test was produced and fails the card "
+        "closed."
+    )
+
+
 class TerminalContractError(ValueError):
     """確定性的 terminal contract 違規；一律 fail closed，且錯誤可被機器讀取。"""
 

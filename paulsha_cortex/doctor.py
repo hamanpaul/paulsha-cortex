@@ -167,6 +167,92 @@ def _load_runtime_preflight_command(env: Mapping[str, str]) -> tuple[str, ...]:
     return load_preflight_command(env=env)
 
 
+def _deck_required_gate_names() -> frozenset[str]:
+    """Gate names the packaged deck's acceptance criteria will demand at harvest.
+
+    Same judge as the harvest path
+    (``terminal_contract.expected_gate_names_for_test_policy``), fed by every
+    card's ``execution.test_policy`` in the packaged ``cards.yaml`` -- the union
+    over cards is the superset any combo can require, so a deployment covering it
+    covers every combo it might select.
+    """
+    from .coordinator.terminal_contract import expected_gate_names_for_test_policy
+    from .deck.schema import DEFAULT_CARDS_PATH, load_cards
+
+    required: set[str] = set()
+    for card in load_cards(DEFAULT_CARDS_PATH).values():
+        required |= expected_gate_names_for_test_policy(card.test_policy)
+    return frozenset(required)
+
+
+def _gate_declaration_probe(env: Mapping[str, str]) -> ProbeResult:
+    """#540: prove the gate declarations exist *before* a builder card is dispatched.
+
+    A manager whose environment declares no ``PSC_GATE_CMD_*`` still writes a
+    ``gates: []`` ledger when the job ends, so every build card carrying a
+    ``test_policy`` dies at harvest with
+    ``gate-ledger-missing-expected-gate`` -- correct fail-closed behaviour, but
+    the operator only learns about it after a builder has already produced a
+    valid Candidate (observed on run ``workflow-084f75e2178cf7547476``: a
+    conforming RED commit could not be accepted because
+    ``PSC_GATE_CMD_PYTEST`` was missing from one instance's manager env, and the
+    only trace was a line in ``manager.log``). This probe turns that into an
+    up-front, actionable diagnosis.
+    """
+    from .coordinator.gate_ledger import GATE_ENV_PREFIX, GateSpecError, declared_gate_names
+
+    try:
+        required = _deck_required_gate_names()
+    except Exception:
+        # Deck data unavailable/invalid is a different probe's business; never
+        # let it masquerade as a gate declaration failure.
+        return ProbeResult(
+            "gate-declarations",
+            "warn",
+            "packaged deck cards could not be read; gate declaration coverage not checked",
+            False,
+        )
+    try:
+        declared = frozenset(declared_gate_names(env))
+    except GateSpecError:
+        return ProbeResult(
+            "gate-declarations",
+            "fail",
+            f"{GATE_ENV_PREFIX}* declaration is invalid (typed argv required, shell wrappers "
+            "rejected); the gate ledger degrades to a single failed entry and every build card "
+            "fails closed",
+            True,
+        )
+    missing = sorted(required - declared)
+    if missing:
+        example = f"{GATE_ENV_PREFIX}{missing[0].upper()}"
+        return ProbeResult(
+            "gate-declarations",
+            "fail",
+            f"{GATE_ENV_PREFIX}* does not cover the gate(s) the deck's acceptance criteria "
+            f"require: {missing} (declared: {sorted(declared)}); builder cards will be rejected "
+            f"with gate-ledger-missing-expected-gate. Declare for example "
+            f"`{example}=python3 -m pytest -q` in the manager EnvironmentFile and restart the "
+            "service (the gate name is the lowercased suffix of the variable name)",
+            True,
+        )
+    if not declared:
+        return ProbeResult(
+            "gate-declarations",
+            "warn",
+            f"no {GATE_ENV_PREFIX}* declared; the gate ledger will always be empty, so passed "
+            "cards carry no independent evidence",
+            False,
+        )
+    return ProbeResult(
+        "gate-declarations",
+        "pass",
+        f"{GATE_ENV_PREFIX}* declares {sorted(declared)} and covers the deck-required gate(s) "
+        f"{sorted(required)}",
+        True,
+    )
+
+
 def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
     config_root = Path(
         env.get("PSC_PROJECT_CONFIG_ROOT", str(agents_root / "config" / "paulsha"))
@@ -857,6 +943,7 @@ def run_doctor(
         )
     probes: list[ProbeResult] = [
         _preflight_probe(effective),
+        _gate_declaration_probe(effective),
         _identity_probe(effective, agents_root),
         _review_sandbox_probe(
             effective,

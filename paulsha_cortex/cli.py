@@ -49,7 +49,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|abandon|retire-delivered|reset-reclaim-budget|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|reset-reclaim-budget|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -67,6 +67,7 @@ work item commands:
   recover-planning  對 define/needs_human 的 planning 失敗作可恢復重跑
   recover-pre-candidate  對 candidate 產生前的 builder 失敗作可恢復重跑並回收 worktree
   recover-repair-commit  對 repair commit 已存在但缺 terminal evidence 的 build 失敗做具 CAS 的採納恢復
+  regenerate-gates  以 exact WorkflowRun CAS，對既有 builder job log 依當前 PSC_GATE_CMD_* 宣告重跑 gate 並重寫 ledger（不改判、不重派 builder）
   reset-reclaim-budget  明示重置 semantic-reclaim 世代熔斷計數（需 --actor／--reason，落稽核 evidence）
   auto      管理 cortex:auto-on-going issue label
   review-attest  建立 exact-HEAD maintainer review evidence

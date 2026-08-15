@@ -3107,6 +3107,119 @@ def _reset_reclaim_budget_action(
     }
 
 
+def _regenerate_gates_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    workflow_registry,
+) -> dict[str, Any]:
+    """#540：對既有 builder job log 依**當前** gate 宣告重新產生 gate ledger。
+
+    gate ledger 是 job 結束當下依當時 env 寫成的檔案，之後即凍結。實測（run
+    ``workflow-084f75e2178cf7547476``）manager env 漏宣告 ``PSC_GATE_CMD_PYTEST``
+    時 ledger 是 ``gates: []``，builder 交付的合格 RED commit 撞
+    ``gate-ledger-missing-expected-gate``；operator 補上宣告並重啟之後，契約內
+    卻沒有任何路徑能讓那份 ledger 重新產生——``resume`` 只是重讀同一份舊 ledger
+    再拒一次，``retry-build`` 只受理「最後一張 builder 卡」（tdd-red 是中段卡），
+    ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
+    candidate）。唯一出路是 operator 手動跑 gate_ledger CLI。
+
+    本動作把那個手動步驟收進契約，但**只重跑 gate、不改判**：它重新執行
+    operator 宣告的 gate 命令、原子覆寫 ledger，然後就結束；run 仍停在
+    needs_human，採信與否由既有的 ``resume`` → harvest 流程重新評估。builder 的
+    commit 完全不動（它本來就是好的），也不重派任何模型。
+
+    fail closed 條件：exact WorkflowRun CAS、run 必須在 needs_human、且必須真的
+    找得到一個 gate-ledger 相關 phase、已終止、log 與 worktree 都還在的 job。
+    任一條不成立即拒絕，不做任何 side effect。
+    """
+
+    from . import gate_ledger, terminal_contract
+    from .manager import GATE_LEDGER_REQUIRED_PHASES
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_run_id",
+    }
+    if extras:
+        raise ValueError(
+            f"regenerate-gates rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    expected_run_id = args.get("expected_run_id")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("regenerate-gates requires exact expected_run_id")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("regenerate-gates issue is not authorized by WorkAuthority")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    active = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.status == "ongoing"
+        and run.issue_refs == expected_issues
+        and run.openspec_refs == authority.mapped_openspec
+    ]
+    if len(active) != 1:
+        raise RuntimeError("regenerate-gates requires one active canonical WorkflowRun")
+    run = active[0]
+    if run.run_id != expected_run_id:
+        raise RuntimeError("regenerate-gates expected WorkflowRun CAS mismatch")
+    if "needs_human" not in run.facets:
+        raise RuntimeError("regenerate-gates requires needs_human workflow")
+
+    candidates = [
+        job
+        for job in workflow_registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES
+        and job.get("status") in {"exited", "failed"}
+        and isinstance(job.get("log_path"), str)
+        and job.get("log_path")
+        and Path(job["log_path"]).is_file()
+    ]
+    if not candidates:
+        raise RuntimeError("regenerate-gates requires a terminal builder job log")
+    job = candidates[-1]
+    worktree = job.get("worktree")
+    if not isinstance(worktree, str) or not Path(worktree).is_dir():
+        raise RuntimeError("regenerate-gates requires the builder worktree to still exist")
+
+    ledger_path = terminal_contract.gate_ledger_path(job["log_path"])
+    try:
+        payload = gate_ledger.write_gate_ledger(
+            ledger_path=ledger_path,
+            worktree=worktree,
+        )
+    except gate_ledger.GateSpecError as exc:
+        # operator 宣告仍不合法：不寫出任何東西，把設定錯誤原樣回報。
+        raise RuntimeError(f"regenerate-gates gate declaration invalid: {exc}") from exc
+    gates = [
+        {"name": row.get("name"), "status": row.get("status"), "exit_code": row.get("exit_code")}
+        for row in payload.get("gates", [])
+        if isinstance(row, dict)
+    ]
+    return {
+        "action": "regenerate-gates",
+        # 刻意不叫 "recovered"：本動作沒有改變任何 run/slice 狀態，只是把獨立
+        # 證據重新產生出來，採信仍由既有流程負責。
+        "reason": "gate-ledger-regenerated",
+        "expected_run_id": expected_run_id,
+        "run_id": run.run_id,
+        "job_id": job.get("job_id"),
+        "card_id": job.get("workflow_card"),
+        "ledger_path": str(ledger_path),
+        "ledger_digest": terminal_contract.gate_ledger_digest(payload),
+        "gates": gates,
+        "next_actions": ["resume"],
+    }
+
+
 def _recover_planning_action(
     *,
     args: dict[str, Any],
@@ -4551,7 +4664,7 @@ def execute_work_action(
     if action not in {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "abandon", "retire-delivered",
+        "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
         "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
     }:
         raise ValueError("unsupported work action")
@@ -4642,6 +4755,12 @@ def execute_work_action(
             authority=authority,
             requested_by=requested_by,
             state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "regenerate-gates":
+        result = _regenerate_gates_action(
+            args=args,
+            authority=authority,
             workflow_registry=workflow_registry,
         )
     elif action == "recover-repair-commit":

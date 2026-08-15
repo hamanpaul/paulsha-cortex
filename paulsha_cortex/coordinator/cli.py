@@ -204,7 +204,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[
             "link", "unlink", "start", "resume", "retry-build", "retry-verify",
             "retry-review", "recover-planning", "recover-pre-candidate",
-            "recover-repair-commit", "abandon", "retire-delivered",
+            "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
             "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
         ],
     )
@@ -218,7 +218,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--failure-reason")
     p_work.add_argument(
         "--expected-run-id",
-        help="abandon／retire-delivered 使用的 exact WorkflowRun CAS",
+        help="abandon／retire-delivered／regenerate-gates 使用的 exact WorkflowRun CAS",
     )
     p_work.add_argument(
         "--reason",
