@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import re
 import shutil
 import stat
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Mapping
+from uuid import uuid4
 
 from .launcher import build_agy_argv
 from .model_identities import (
@@ -23,6 +26,9 @@ from .model_identities import (
     probe_agy_capability,
 )
 from .planning import required_heading_hint
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,37 @@ def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree
     raise ValueError(f"unsupported read-only planning executor: {identity.executor}")
 
 
+def _snapshot_skipped(relative: Path, name: str) -> bool:
+    """快照／drift 走訪共用的排除判準（`_tree_snapshot` 與 `_tree_manifest`）。
+
+    兩者必須永遠看同一組節點：`_tree_snapshot` 負責判斷「有沒有變」，
+    `_tree_manifest` 負責回答「變了什麼」。判準若各寫一份就會漂移，
+    出現「偵測到 dirty 卻報不出任何 diff」（或反之）的失真報告。
+
+    - `.git`：版控物件不在比對範圍。
+    - `__pycache__` / `*.pyc`（issue #397）：本機部署常見拓撲是 daemon 與
+      planning launcher 共用同一棵 operator 工作樹（daemon 以 repo 為
+      WorkingDirectory 常駐），daemon 對既有模組的 lazy import 會隨時在快照
+      窗口內重編 bytecode。這是可由原始碼 100% 重生的快取、不是 operator
+      內容，計入雜湊會把正常 churn 誤判成「planner 汙染 operator worktree」。
+      跳過的盲點取捨：CPython 的 .pyc 是 timestamp/hash-based 驗證（PEP 552），
+      植入的孤兒 .pyc 與對應 .py 不符會被直接忽略重編，不會被 import 採用；
+      真正的程式碼污染仍必須經過 .py／其他原始檔變更，不受此例外影響。
+    - 快照 root 直下的 `runtime/`（issue #399）：`.gitignore:8` 宣告的 daemon
+      狀態殘留（`runtime/handoff/wf-*.json` 每個 periodic tick 整份重寫，內容
+      含時間戳必變）。用 relative path 判斷而非只比對 dir name，避免誤跳深層
+      同名目錄（例如 `tests/fixtures/runtime/`）。
+    """
+
+    if name == ".git":
+        return True
+    if name == "__pycache__" or name.endswith(".pyc"):
+        return True
+    if relative == Path(".") and name == "runtime":
+        return True
+    return False
+
+
 def _tree_snapshot(root: Path) -> str:
     """Hash the complete tree shape, content, links, and stable metadata.
 
@@ -108,34 +145,9 @@ def _tree_snapshot(root: Path) -> str:
         elif stat.S_ISDIR(metadata.st_mode):
             digest.update(b"dir\0")
             for child in sorted(path.iterdir(), key=lambda item: item.name):
-                if child.name == ".git":
-                    continue
-                # issue #397：本機部署常見拓撲是 daemon 與 planning launcher
-                # 共用同一棵 operator 工作樹（daemon 以 repo 為
-                # WorkingDirectory 常駐），daemon 對既有模組的 lazy import
-                # 會隨時在快照窗口內重編 `__pycache__/*.pyc`。這是可由原始碼
-                # 100% 重生的 bytecode 快取、不是 operator 內容，計入雜湊會把
-                # 這種正常 churn 誤判成「planner 汙染 operator worktree」而
-                # fail-closed 到整段 raise + rollback。跳過的盲點取捨：CPython
-                # 的 .pyc 是 timestamp/hash-based 驗證（PEP 552），植入的孤兒
-                # .pyc 若與對應 .py 的 mtime／hash 不符會被直接忽略重新編譯，
-                # 不會被 import 採用，因此跳過雜湊不會讓惡意 bytecode 有機可乘
-                # ——真正的程式碼污染仍必須經過 .py／其他原始檔變更，那些不受
-                # 此例外規則影響，fail-closed 行為維持不變。
-                if child.name == "__pycache__" or child.name.endswith(".pyc"):
-                    continue
-                # issue #399：`.gitignore:8` 的 `/runtime/` 是 manager daemon
-                # 以 repo 為 WorkingDirectory 常駐時的狀態殘留（例如
-                # `runtime/handoff/wf-*.json` 每個 periodic tick 都會被整份
-                # 重寫，內容含時間戳必變，issue #373 的迴圈使其每 ~55 秒
-                # 必然發生一次）。它不受版控，verification gate 是讀 git
-                # diff 來判斷候選檔案，gitignored 的內容本就不會進候選
-                # 清單，跳過它的雜湊盲點可控——真正的程式碼污染必須經過
-                # git 追蹤的檔案，不受此例外規則影響，fail-closed 行為維持
-                # 不變。只跳過快照 root 直下的 `runtime/`（用 relative path
-                # 判斷，而非只比對 dir name），避免誤跳深層同名目錄（例如
-                # `tests/fixtures/runtime/`）。
-                if relative == Path(".") and child.name == "runtime":
+                # 排除判準見 `_snapshot_skipped`（與 `_tree_manifest` 共用同
+                # 一份，避免「偵測得到 dirty 卻報不出 diff」的判準漂移）。
+                if _snapshot_skipped(relative, child.name):
                     continue
                 visit(child, relative / child.name)
         elif stat.S_ISREG(metadata.st_mode):
@@ -179,11 +191,16 @@ def _copy_planning_sandbox(worktree: Path, destination: Path) -> None:
 
 
 def _make_tree_traversable(root: Path) -> None:
-    """Restore enough owner access to inspect and replace a hostile tree.
+    """Restore enough owner access to inspect and discard a hostile tree.
 
     The launcher can chmod directories through an absolute path.  Never follow
-    symlinks while recovering access; the immutable baseline restores the
-    original metadata after the polluted entries have been removed.
+    symlinks while recovering access.
+
+    issue #507：本函式**只能指向拋棄式 sandbox**。它把整棵樹的目錄 mode 強制
+    改成 0o700，本身就是一次寫入；修法前它被用在 operator worktree 上（靠事後
+    整棵還原把 mode 蓋回去）是可行的，移除整棵還原後就不再成立——對 operator
+    工作區只讀不寫是本 issue 的核心約束，drift 分析改走完全唯讀、對讀取失敗
+    容錯的 `_tree_manifest`。
     """
 
     if root.is_symlink():
@@ -203,26 +220,439 @@ def _make_tree_traversable(root: Path) -> None:
     visit(root)
 
 
-def _restore_operator_tree(worktree: Path, baseline: Path) -> None:
-    _make_tree_traversable(worktree)
-    for child in worktree.iterdir():
-        if child.name == ".git":
+# --- issue #507：operator worktree drift 的收斂處置 ---------------------------
+#
+# 修法前：`_invoke_json` 的 finally 區塊只要偵測到 T0→T1 之間 operator worktree
+# 有任何差異，就呼叫 `_restore_operator_tree()`——刪掉 worktree 內除 `.git` 以外
+# 的**全部內容**再從 T0 baseline 複本整棵還原。實測（2026-08-14，run
+# `workflow-0529388d8e290c8fb938`）兩種資料遺失：
+#   (1) operator 在 planning 視窗內新建的未追蹤檔（work item 的 todo 來源）
+#       被靜默銷毀，且 `.cortex/work-items.yaml` 留下懸空連結；
+#   (2) 前一代 planning **成功**產出的三份 artifact（未追蹤、不在本次 baseline
+#       內）被下一次失敗的 rollback 抹除，run 的 `planning_authority` 指向不
+#       存在的檔案 → `workflow planning input missing` → work item 卡死。
+#
+# 根因是歸因錯誤：launcher 以 `cwd=sandbox`（拋棄式複本）執行，operator 樹比對
+# 只是「防越界」的安全網；把安全網的補救動作設成整棵樹抹除，在多方並行（operator
+# 手動編輯、其他 agent、編輯器自動儲存、背景建置）的真實環境下誤傷機率遠高於
+# 真正的越界。加上 baseline 由非原子 `copytree` 取樣，歸因本身就不可靠。
+#
+# R0 修法（本檔）：
+#   1. 整棵還原的程式路徑**移除**，改為 `_contain_operator_drift()`。
+#   2. 預設不改寫 operator worktree 一個位元組——只做唯讀 diff、把受影響檔案
+#      完整備份進 run-scoped evidence，並落一份結構化報告供 operator 判讀。
+#   3. 還原改成需明示 opt-in 且逐路徑收斂（`rollback_scope`），並由三道
+#      fail-closed 閘門把守：不在本次 diff 內／命中受保護的權威文件／備份未
+#      成功者一律拒絕還原。
+#
+# 結構解（planning 產出完全不進 operator 樹）屬 R2 evidence 模型範疇，不在此。
+PLANNING_WORKTREE_DRIFT_SCHEMA = "cortex-planning-worktree-drift/v1"
+# evidence 目錄名刻意不用 `planning-recovery`——`work_actions.
+# _read_planning_failure_record` 用 `path.parent.name == "planning-recovery"`
+# 當 recover-planning 的收容判準，混進去會多出一筆無法解析的候選、撞上
+# `planning failure evidence ambiguous` 的 fail-closed（同 #511 對
+# `planning-artifacts` 目錄的處理）。
+PLANNING_WORKTREE_DRIFT_DIRNAME = "planning-worktree-drift"
+# 備份總量上限：drift 正常只有寥寥數檔，這個上限只用來擋住病態情境（例如
+# launcher 把整棵樹改寫）把 evidence 目錄灌爆。超出預算的檔案在報告內標記
+# `backed_up: false`，並且**一律逐出 rollback 範圍**——備份不成功就不准抹除，
+# 是本 issue 最低限度的保命索。
+PLANNING_DRIFT_BACKUP_MAX_BYTES = 64_000_000
+# 受保護的權威文件前綴：這些是 work item 的 source 文件與 cortex 自己登記在
+# `planning_authority` 內的受管產物，不論 `rollback_scope` 怎麼要求都不得被
+# rollback 動到。
+#   - `docs/superpowers/workstreams/**/todo.md`：work item 的 todo 來源
+#     （monitor repo provider 的 `todo` kind），被抹除即 `active_todo` 為假、
+#     lifecycle 退回 `topic`、不可 claim。
+#   - `docs/superpowers/specs/**`、`docs/superpowers/plans/**`：planning 產出
+#     的落地位置，同時是 provider 的 `superpowers_spec`／`superpowers_plan`
+#     來源；前代 run 的產出被抹除即造成 `workflow planning input missing`。
+#   - `openspec/changes/**`：openspec 變更提案，`_planning_destinations` 的
+#     首選錨點。
+#   - `.cortex/**`：work registry（`work-items.yaml`）本身。
+_PROTECTED_AUTHORITY_PREFIXES = (
+    ("docs", "superpowers", "workstreams"),
+    ("docs", "superpowers", "specs"),
+    ("docs", "superpowers", "plans"),
+    ("openspec", "changes"),
+    (".cortex",),
+)
+
+
+def _is_protected_authority_path(relative: str) -> bool:
+    """路徑是否落在受保護的權威文件範圍（見 `_PROTECTED_AUTHORITY_PREFIXES`）。"""
+
+    parts = PurePosixPath(relative).parts
+    return any(parts[: len(prefix)] == prefix for prefix in _PROTECTED_AUTHORITY_PREFIXES)
+
+
+def _entry_digest(path: Path, metadata: os.stat_result) -> dict[str, object]:
+    """單一節點的結構化描述；任何讀取錯誤都轉成欄位而非例外。"""
+
+    mode = f"{stat.S_IMODE(metadata.st_mode):04o}"
+    if stat.S_ISLNK(metadata.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            return {"kind": "symlink", "mode": mode, "error": type(exc).__name__}
+        return {"kind": "symlink", "mode": mode, "target": target}
+    if stat.S_ISDIR(metadata.st_mode):
+        return {"kind": "dir", "mode": mode}
+    if stat.S_ISREG(metadata.st_mode):
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            return {"kind": "file", "mode": mode, "error": type(exc).__name__}
+        return {
+            "kind": "file",
+            "mode": mode,
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    return {"kind": "special", "mode": mode, "rdev": metadata.st_rdev}
+
+
+def _tree_manifest(root: Path) -> dict[str, dict[str, object]]:
+    """唯讀走訪整棵樹，產出 `relative posix path -> 節點描述`。
+
+    與 `_tree_snapshot` 共用 `_snapshot_skipped` 的排除判準——前者回答「有沒有
+    變」，本函式回答「變了什麼」。
+
+    兩個刻意的設計約束：
+
+    1. **絕不寫入**。修法前為了讀取被 launcher chmod 0 的目錄，會先跑
+       `_make_tree_traversable()` 把整棵樹的目錄 mode 改成 0o700（再靠整棵還原
+       蓋回去）。移除整棵還原後這條路不能再走，否則 drift 分析本身就在改
+       operator 的工作區。
+    2. **對讀取失敗容錯**。任何 `OSError` 都記成節點上的 `error` 欄位並繼續，
+       報告不會因為樹裡有一個不可讀的角落就整份消失。
+    """
+
+    manifest: dict[str, dict[str, object]] = {}
+
+    def visit(path: Path, relative: Path) -> None:
+        key = relative.as_posix()
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            manifest[key] = {"kind": "unreadable", "error": type(exc).__name__}
+            return
+        entry = _entry_digest(path, metadata)
+        # xattr 也納入描述：`_tree_snapshot` 把它算進雜湊，這裡不看的話會出現
+        # 「偵測到 dirty 卻報不出任何 diff」的失真報告。
+        try:
+            names = sorted(os.listxattr(path, follow_symlinks=False))
+        except (AttributeError, OSError):
+            names = []
+        if names:
+            attributes: dict[str, str] = {}
+            for name in names:
+                try:
+                    value = os.getxattr(path, name, follow_symlinks=False)
+                except OSError:
+                    attributes[name] = "<unreadable>"
+                    continue
+                attributes[name] = hashlib.sha256(value).hexdigest()
+            entry["xattrs"] = attributes
+        manifest[key] = entry
+        if entry.get("kind") != "dir":
+            return
+        try:
+            children = sorted(path.iterdir(), key=lambda item: item.name)
+        except OSError as exc:
+            entry["children"] = f"unreadable:{type(exc).__name__}"
+            return
+        for child in children:
+            if _snapshot_skipped(relative, child.name):
+                continue
+            visit(child, relative / child.name)
+
+    visit(root, Path("."))
+    return manifest
+
+
+def _diff_tree_manifests(
+    baseline: Mapping[str, dict[str, object]],
+    observed: Mapping[str, dict[str, object]],
+) -> tuple[dict[str, object], ...]:
+    """兩份 manifest 的結構化 diff（`added` / `modified` / `removed`）。"""
+
+    rows: list[dict[str, object]] = []
+    for relative in sorted(set(baseline) | set(observed)):
+        before = baseline.get(relative)
+        after = observed.get(relative)
+        if before == after:
             continue
-        if child.is_symlink() or child.is_file():
-            child.unlink()
+        if before is None:
+            change = "added"
+        elif after is None:
+            change = "removed"
         else:
-            shutil.rmtree(child)
-    for source in baseline.iterdir():
-        target = worktree / source.name
-        if source.is_symlink():
-            target.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
-        elif source.is_dir():
-            shutil.copytree(source, target, symlinks=True)
+            change = "modified"
+        rows.append(
+            {"path": relative, "change": change, "baseline": before, "observed": after}
+        )
+    return tuple(rows)
+
+
+def _write_evidence_bytes(target: Path, payload: bytes) -> None:
+    """原子寫入 + 0400（比照 `manager._write_planning_failure_evidence`）。"""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.parent / f".{target.name}.{uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o400)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _backup_drift_entries(
+    *,
+    worktree: Path,
+    baseline: Path,
+    entries: tuple[dict[str, object], ...],
+    destination: Path,
+) -> tuple[dict[str, dict[str, object]], bool]:
+    """把 diff 命中的每個一般檔案的**兩個版本**完整備份進 evidence。
+
+    `observed/` 收 T1（也就是萬一被抹除就永久消失的那一版），`baseline/` 收
+    T0。symlink／目錄／特殊檔沒有位元組內容可存，其 target 與 mode 已完整記在
+    報告的 `baseline`／`observed` 欄位裡。
+
+    回傳 `(每條路徑的備份結果, 是否全數備份成功)`。任何一條備份失敗（讀不到、
+    超出預算）都會讓該路徑被逐出 rollback 範圍。
+    """
+
+    results: dict[str, dict[str, object]] = {}
+    complete = True
+    budget = PLANNING_DRIFT_BACKUP_MAX_BYTES
+    for row in entries:
+        relative = str(row["path"])
+        outcome: dict[str, object] = {"observed": None, "baseline": None}
+        for side, source_root in (("observed", worktree), ("baseline", baseline)):
+            descriptor = row.get(side)
+            if not isinstance(descriptor, dict) or descriptor.get("kind") != "file":
+                continue
+            source = source_root / PurePosixPath(relative)
+            try:
+                # 先看 size 再讀：病態情境（launcher 塞進一個超大檔）不該讓
+                # 備份本身先把記憶體吃光。
+                if source.lstat().st_size > budget:
+                    outcome[side] = {"backed_up": False, "reason": "budget-exceeded"}
+                    complete = False
+                    continue
+                payload = source.read_bytes()
+            except OSError as exc:
+                outcome[side] = {"backed_up": False, "reason": type(exc).__name__}
+                complete = False
+                continue
+            if len(payload) > budget:
+                outcome[side] = {"backed_up": False, "reason": "budget-exceeded"}
+                complete = False
+                continue
+            target = destination / side / PurePosixPath(relative)
+            try:
+                _write_evidence_bytes(target, payload)
+            except OSError as exc:
+                outcome[side] = {"backed_up": False, "reason": type(exc).__name__}
+                complete = False
+                continue
+            budget -= len(payload)
+            outcome[side] = {
+                "backed_up": True,
+                "path": str(target),
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        results[relative] = outcome
+    return results, complete
+
+
+def _restore_scoped_path(*, worktree: Path, baseline: Path, relative: str) -> None:
+    """把單一路徑還原成 baseline 版本（不在 baseline 內者刪除）。
+
+    只處理一般檔案與 symlink；目錄與特殊檔不在可還原範圍（見
+    `_contain_operator_drift` 的閘門）。
+    """
+
+    target = worktree / PurePosixPath(relative)
+    source = baseline / PurePosixPath(relative)
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    if source.is_symlink():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(os.readlink(source))
+    elif source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def _contain_operator_drift(
+    worktree: Path,
+    baseline: Path,
+    *,
+    evidence_root: Path | None,
+    run_id: str,
+    rollback_scope: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """收斂處置 operator worktree drift：唯讀 diff → 備份 → 報告 →（選擇性）逐路徑還原。
+
+    `rollback_scope` 是呼叫端**能證明由本次 run 自產**的 repo-relative 路徑；
+    預設空集合＝一個位元組都不動。三道 fail-closed 閘門：
+
+    1. 不在本次 diff 內的路徑不還原（避免把無關檔案捲進來）。
+    2. 命中 `_is_protected_authority_path` 的權威文件永不還原（todo.md 等 work
+       item source 文件、前代 planning artifact、work registry）。
+    3. 備份未成功（含 evidence 根不可用）的路徑永不還原——不可回復的抹除正是
+       本 issue 的核心傷害。
+
+    本函式不 raise：drift 報告是診斷面，寫不出去也不得掩蓋上游真正的失敗。
+    """
+
+    observed_manifest = _tree_manifest(worktree)
+    baseline_manifest = _tree_manifest(baseline)
+    entries = _diff_tree_manifests(baseline_manifest, observed_manifest)
+    counts = {
+        "added": sum(1 for row in entries if row["change"] == "added"),
+        "modified": sum(1 for row in entries if row["change"] == "modified"),
+        "removed": sum(1 for row in entries if row["change"] == "removed"),
+    }
+    drifted = {str(row["path"]) for row in entries}
+    summary: dict[str, object] = {
+        "schema": PLANNING_WORKTREE_DRIFT_SCHEMA,
+        "run_id": run_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "worktree": str(worktree),
+        "counts": counts,
+        "entries": list(entries),
+        "rollback_scope_requested": sorted(rollback_scope),
+        "rollback_scope_applied": [],
+        "rollback_scope_refused": [],
+        "backup_root": None,
+        "backup_complete": False,
+        "report_path": None,
+    }
+
+    refused: list[dict[str, str]] = []
+    candidates: list[str] = []
+    for relative in sorted(rollback_scope):
+        if relative not in drifted:
+            refused.append({"path": relative, "reason": "outside-observed-drift"})
+        elif _is_protected_authority_path(relative):
+            refused.append({"path": relative, "reason": "protected-authority-document"})
         else:
-            shutil.copy2(source, target)
-    shutil.copystat(baseline, worktree, follow_symlinks=False)
-    if _tree_snapshot(worktree) != _tree_snapshot(baseline):
-        raise RuntimeError("planning operator restore verification failed")
+            candidates.append(relative)
+
+    backups: dict[str, dict[str, object]] = {}
+    destination: Path | None = None
+    if evidence_root is not None and entries:
+        digest = hashlib.sha256(
+            json.dumps(list(entries), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        destination = (
+            Path(evidence_root).resolve()
+            / "evidence"
+            / PLANNING_WORKTREE_DRIFT_DIRNAME
+            / f"{run_id}-{digest}"
+        )
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            backups, complete = _backup_drift_entries(
+                worktree=worktree,
+                baseline=baseline,
+                entries=entries,
+                destination=destination,
+            )
+            summary["backup_root"] = str(destination)
+            summary["backup_complete"] = complete
+        except OSError as exc:
+            logger.error(
+                "planning-worktree-drift-backup-failed run_id=%s error=%s: %s",
+                run_id,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+            destination = None
+            backups = {}
+
+    for row in entries:
+        relative = str(row["path"])
+        row["backup"] = backups.get(relative)
+
+    rows_by_path = {str(row["path"]): row for row in entries}
+    applied: list[str] = []
+    for relative in candidates:
+        outcome = backups.get(relative)
+        row = rows_by_path[relative]
+        kinds: set[object] = set()
+        for side in ("baseline", "observed"):
+            descriptor = row.get(side)
+            if isinstance(descriptor, dict):
+                kinds.add(descriptor.get("kind"))
+        # 目錄／特殊檔／不可讀節點的還原語意不明（要不要遞迴？要不要重建
+        # mode？），一律不碰——這正是修法前整棵還原最容易造成附帶損害的部分。
+        if not kinds <= {"file", "symlink"}:
+            refused.append({"path": relative, "reason": "unsupported-node-kind"})
+            continue
+        if outcome is None or any(
+            isinstance(side, dict) and side.get("backed_up") is False
+            for side in outcome.values()
+        ):
+            refused.append({"path": relative, "reason": "backup-unavailable"})
+            continue
+        try:
+            _restore_scoped_path(worktree=worktree, baseline=baseline, relative=relative)
+        except OSError as exc:
+            refused.append({"path": relative, "reason": type(exc).__name__})
+            continue
+        applied.append(relative)
+
+    summary["rollback_scope_applied"] = applied
+    summary["rollback_scope_refused"] = refused
+
+    if destination is not None:
+        report = destination / "report.json"
+        try:
+            _write_evidence_bytes(
+                report,
+                (
+                    json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8"),
+            )
+        except OSError as exc:
+            logger.error(
+                "planning-worktree-drift-report-failed run_id=%s error=%s: %s",
+                run_id,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+        else:
+            summary["report_path"] = str(report)
+    return summary
+
+
+def _operator_drift_message(summary: Mapping[str, object]) -> str:
+    """drift 失敗訊息：計數在前、evidence 路徑在後。
+
+    上游 `run_heterogeneous_brainstorm` 會把本例外壓成 `secondary-output-
+    malformed: ...` 之類的短字串並截斷（`str(exc)[:160]`），因此把最短且最關鍵
+    的計數排在前面，即使被截掉尾巴也還看得到「動了幾個檔」；完整訊息另以
+    `logger.error` 落 log，evidence 也在固定目錄用 run_id 可查。
+    """
+
+    counts = summary.get("counts")
+    counts = counts if isinstance(counts, Mapping) else {}
+    location = summary.get("report_path") or summary.get("backup_root") or "<unavailable>"
+    return (
+        "planning launcher modified operator worktree; operator content preserved "
+        f"(added={counts.get('added', 0)} modified={counts.get('modified', 0)} "
+        f"removed={counts.get('removed', 0)}); evidence={location}"
+    )
 
 
 _FENCED_JSON = re.compile(
@@ -382,6 +812,8 @@ def _invoke_json(
     worktree: Path,
     runner: Callable[..., object],
     timeout_seconds: int,
+    evidence_root: str | Path | None = None,
+    run_id: str = "ephemeral",
 ) -> object:
     operator_before = _tree_snapshot(worktree)
     with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
@@ -438,15 +870,39 @@ def _invoke_json(
             except BaseException:
                 operator_dirty = True
             if operator_dirty:
+                # issue #507：偵測到 drift 一律 fail-closed（本次 planning 呼叫
+                # 的結果不可信），但**不得改寫 operator worktree**。
+                # `rollback_scope` 傳空集合是刻意的：launcher 以 `cwd=sandbox`
+                # 執行、`--add-dir` 也只指向 sandbox，這條路徑在 operator 樹裡
+                # 沒有任何「本次 run 自產」的產物可言，因此可證明的還原範圍就是
+                # 空的。planning artifact 的落地另走
+                # `manager._publish_planning_artifacts`（有交易與 authority 把
+                # 關），不在此。任何差異都當成 operator／其他 agent 的並行工作
+                # 保留原地，只做備份與報告。
                 try:
-                    _restore_operator_tree(worktree, baseline)
-                except BaseException as exc:
-                    failure = RuntimeError("planning operator restore failed")
-                    failure.__cause__ = exc
-                else:
-                    failure = ValueError(
-                        "planning launcher modified operator worktree; changes rolled back"
+                    summary = _contain_operator_drift(
+                        worktree,
+                        baseline,
+                        evidence_root=(
+                            Path(evidence_root) if evidence_root is not None else None
+                        ),
+                        run_id=run_id,
+                        rollback_scope=frozenset(),
                     )
+                except BaseException as exc:  # noqa: BLE001 - 診斷面 fail-open
+                    # drift 收斂只負責診斷；它自己壞掉時仍要拋出可辨識的
+                    # planning 失敗，不得換成一個與現場無關的例外（修法前那條
+                    # 「restore failed」出口就是這個反例）。
+                    logger.error(
+                        "planning-worktree-drift-containment-failed run_id=%s error=%s: %s",
+                        run_id,
+                        type(exc).__name__,
+                        str(exc)[:200],
+                    )
+                    summary = {"counts": {}, "report_path": None, "backup_root": None}
+                message = _operator_drift_message(summary)
+                logger.error("planning-worktree-drift run_id=%s %s", run_id, message)
+                failure = ValueError(message)
         if failure is not None:
             raise failure
         return result
@@ -458,6 +914,8 @@ def _probe_identity(
     worktree: Path,
     runner: Callable[..., object],
     timeout_seconds: int,
+    evidence_root: str | Path | None = None,
+    run_id: str = "ephemeral",
 ) -> CapabilityProbe:
     expected = {
         "capability": "cortex-planning-json",
@@ -474,6 +932,8 @@ def _probe_identity(
             worktree=worktree,
             runner=runner,
             timeout_seconds=timeout_seconds,
+            evidence_root=evidence_root,
+            run_id=run_id,
         )
     except Exception as exc:
         return CapabilityProbe(
@@ -587,8 +1047,17 @@ def build_production_planning_runtime(
     worktree: str | Path,
     runner: Callable[..., object] = subprocess.run,
     timeout_seconds: int = 120,
+    evidence_root: str | Path | None = None,
+    run_id: str = "ephemeral",
 ) -> ProductionPlanningRuntime:
-    """Build the daemon's real, safe, heterogeneous planning adapters."""
+    """Build the daemon's real, safe, heterogeneous planning adapters.
+
+    issue #507：`evidence_root`／`run_id` 供 operator worktree drift 的備份與
+    報告落地（`<evidence_root>/evidence/planning-worktree-drift/<run_id>-<digest>/`）。
+    未帶入時（直呼叫、探測、測試）**不寫任何 evidence**——刻意不 fallback 到
+    `paths.coordinator_root()`，避免非 daemon 的呼叫端在 operator 的執行期狀態
+    目錄下留下非預期檔案。
+    """
 
     root = Path(worktree).resolve()
     registry = load_model_identities()
@@ -606,6 +1075,8 @@ def build_production_planning_runtime(
                 worktree=root,
                 runner=runner,
                 timeout_seconds=timeout_seconds,
+                evidence_root=evidence_root,
+                run_id=run_id,
             )
 
     primary_identity = registry.get(*primary)
@@ -619,6 +1090,8 @@ def build_production_planning_runtime(
             worktree=root,
             runner=runner,
             timeout_seconds=timeout_seconds,
+            evidence_root=evidence_root,
+            run_id=run_id,
         )
 
     def questioner(report: Mapping[str, object]) -> object:
@@ -646,6 +1119,8 @@ def build_production_planning_runtime(
             worktree=root,
             runner=runner,
             timeout_seconds=timeout_seconds,
+            evidence_root=evidence_root,
+            run_id=run_id,
         )
 
     def integrator(pack: Mapping[str, object], evidence: Mapping[str, object]) -> object:
