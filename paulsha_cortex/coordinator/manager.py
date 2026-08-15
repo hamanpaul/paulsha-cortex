@@ -5550,6 +5550,17 @@ class PlanningPublicationDrift(RuntimeError):
     """A durable planning intent cannot be safely committed or rolled back."""
 
 
+# #536：journal 的 schema 版本。v3 新增 `phase` 欄位（見
+# `_PlanningPublicationTransaction.prepare_commit`），把「發佈 artifacts」與
+# 「registry 提交 run 狀態」之間那條事務邊界寫成 durable 事實，恢復路徑才能
+# 分辨「崩在發佈中途」與「崩在提交邊界」。v2 是升級前既有 journal 的格式，
+# 恢復路徑必須繼續接受它——實際部署上就有 v2 的殘留（#536 現場的
+# `workflow-7a430d31eff66ef13630`），自癒不能要求 operator 先手動搬遷。
+_PLANNING_TRANSACTION_SCHEMA_VERSION = 3
+_PLANNING_TRANSACTION_SCHEMA_VERSIONS = (2, _PLANNING_TRANSACTION_SCHEMA_VERSION)
+_PLANNING_TRANSACTION_PHASES = ("publishing", "prepared")
+
+
 class _PlanningPublicationTransaction:
     """Recoverable filesystem side of the brainstorm -> registry commit.
 
@@ -5569,6 +5580,12 @@ class _PlanningPublicationTransaction:
         self.run_id = run_id
         self.operations: list[dict[str, object]] = []
         self.expected_gate_ref: dict[str, str] | None = None
+        # #536：`publishing` = 檔案側還在發佈中，registry 提交尚未被嘗試；
+        # `prepared` = 檔案側已全部落地且已 fsync，下一步就是唯一的 commit
+        # point（registry 的 durable run row）。兩者都不改變 commit 判準
+        # （判準永遠是 registry row 上有沒有這次的 brainstorm gate ref），
+        # 只讓恢復路徑能誠實描述殘留是哪一種。
+        self.phase = "publishing"
         self.journal_root = journal_root.resolve() if journal_root is not None else None
         self.journal_path = (
             self.journal_root / "planning-transactions" / f"{run_id}.json"
@@ -5578,13 +5595,28 @@ class _PlanningPublicationTransaction:
 
     def _payload(self) -> dict[str, object]:
         return {
-            "schema_version": 2,
+            "schema_version": _PLANNING_TRANSACTION_SCHEMA_VERSION,
             "kind": "planning-publication-intent",
             "run_id": self.run_id,
             "root": str(self.root),
+            "phase": self.phase,
             "operations": self.operations,
             "expected_gate_ref": self.expected_gate_ref,
         }
+
+    def prepare_commit(self) -> None:
+        """封住檔案側、宣告下一步是 registry 這個唯一的 commit point。
+
+        呼叫端必須在「所有 artifacts／evidence 都已發佈完成」與「registry
+        提交 run 狀態」之間呼叫一次；之後不得再 `publish()`。這一筆
+        durable 記錄本身不是 commit——commit 由 registry 的原子寫入決定——
+        它只是把事務邊界寫進 journal，讓崩潰後的恢復路徑（見
+        `reconcile_planning_transactions`）能區分兩種殘留並如實回報。
+        """
+
+        if self.phase != "prepared":
+            self.phase = "prepared"
+            self._persist()
 
     def _persist(self) -> None:
         if self.journal_path is None:
@@ -5651,6 +5683,11 @@ class _PlanningPublicationTransaction:
         mode: int = 0o644,
         kind: str = "artifact",
     ) -> None:
+        if self.phase != "publishing":
+            # #536：事務邊界一旦封住（prepare_commit），檔案側就不得再變動——
+            # 否則 journal 記載的「已全部落地」與磁碟事實脫節，恢復路徑的
+            # 前滾驗證會拿不到一致的 after_hash 集合。
+            raise ValueError("planning publication is already prepared for commit")
         path = Path(os.path.abspath(path))
         boundary = self.root
         try:
@@ -5734,9 +5771,23 @@ class _PlanningPublicationTransaction:
         }
         self.publish(path, content, baseline_hash=None, mode=0o600, kind="evidence")
 
-    def rollback(self) -> None:
+    def rollback(self, *, adopted: Callable[[Path], bool] | None = None) -> tuple[str, ...]:
+        """回退本事務所有已落地的變動；回傳被 ``adopted`` 判定為「已被採納」
+        而**刻意跳過**的路徑。
+
+        ``adopted``（只有崩潰後的 sweep 會傳）用來擋住「這份未提交的發佈殘留
+        後來已被 operator 納入 git 追蹤」的情形——比照
+        `work_actions._gc_one_abandoned_planning_artifact` 的既有紀律：已被
+        git 追蹤的檔案不是未提交殘留，刪掉等同銷毀 operator 的工作（#507 的
+        教訓）。in-process 的回退一律不傳，語意與修法前逐位元組相同。
+        """
+
+        skipped: list[str] = []
         for operation in reversed(self.operations):
             path = Path(str(operation["path"]))
+            if adopted is not None and adopted(path):
+                skipped.append(str(path))
+                continue
             after_hash = str(operation["after_hash"])
             boundary = (
                 self.journal_root
@@ -5785,6 +5836,7 @@ class _PlanningPublicationTransaction:
                     pass
         self.operations.clear()
         self.commit()
+        return tuple(skipped)
 
     def commit(self) -> None:
         if self.journal_path is not None:
@@ -5921,19 +5973,34 @@ class _PlanningPublicationTransaction:
                 raise PlanningPublicationDrift("planning committed evidence binding drift")
 
     @classmethod
-    def reconcile(cls, *, root: Path, journal_root: Path, run) -> None:
+    def reconcile(
+        cls,
+        *,
+        root: Path,
+        journal_root: Path,
+        run,
+        adopted: Callable[[Path], bool] | None = None,
+    ) -> dict[str, object] | None:
+        """把一份 durable 發佈意圖收斂到與 registry 權威狀態一致。
+
+        判準只有一條：**registry 的 run row 上有沒有這次的 brainstorm gate
+        ref**。有 → 前滾（驗證每個已提交產物仍逐位元組吻合，然後退役
+        journal）；沒有 → 回退（把檔案側還原成發佈前的樣子）。沒有 journal
+        時回傳 ``None``；其餘回傳 ``{"outcome", "phase", "skipped"}``。
+        """
+
         path = journal_root.resolve() / "planning-transactions" / f"{run.run_id}.json"
         if path.is_symlink():
             raise PlanningPublicationDrift("planning transaction journal symlink rejected")
         if not path.is_file():
-            return
+            return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise PlanningPublicationDrift("planning transaction journal is unreadable") from exc
         if (
             not isinstance(payload, dict)
-            or payload.get("schema_version") != 2
+            or payload.get("schema_version") not in _PLANNING_TRANSACTION_SCHEMA_VERSIONS
             or payload.get("kind") != "planning-publication-intent"
             or payload.get("run_id") != run.run_id
             or payload.get("root") != str(root.resolve())
@@ -5942,7 +6009,19 @@ class _PlanningPublicationTransaction:
             and not isinstance(payload.get("expected_gate_ref"), dict)
         ):
             raise PlanningPublicationDrift("planning transaction journal is invalid")
+        # #536：v2 沒有 phase 欄位，一律視為 `publishing`（升級前的 journal
+        # 從未宣告過事務邊界）；v3 必須帶合法 phase。phase 純粹是診斷用的
+        # durable 事實，**不參與** commit 判準——判準永遠是 registry row。
+        if payload["schema_version"] == 2:
+            if "phase" in payload:
+                raise PlanningPublicationDrift("planning transaction journal is invalid")
+            phase = "publishing"
+        else:
+            phase = payload.get("phase")
+            if phase not in _PLANNING_TRANSACTION_PHASES:
+                raise PlanningPublicationDrift("planning transaction phase is invalid")
         transaction = cls(root=root, run_id=run.run_id, journal_root=journal_root)
+        transaction.phase = phase
         expected_gate_ref = payload["expected_gate_ref"]
         expected: GateEvidenceRef | None = None
         if expected_gate_ref is not None:
@@ -5972,11 +6051,171 @@ class _PlanningPublicationTransaction:
             for operation in transaction.operations:
                 transaction._validate_committed_operation(operation)
             transaction.commit()
-        else:
-            try:
-                transaction.rollback()
-            except RuntimeError as exc:
-                raise PlanningPublicationDrift("planning uncommitted rollback drift") from exc
+            return {"outcome": "committed", "phase": phase, "skipped": ()}
+        try:
+            skipped = transaction.rollback(adopted=adopted)
+        except RuntimeError as exc:
+            raise PlanningPublicationDrift("planning uncommitted rollback drift") from exc
+        return {
+            "outcome": "adopted" if skipped else "rolled-back",
+            "phase": phase,
+            "skipped": skipped,
+        }
+
+
+# #536：崩潰殘留的 journal 要多久之後才被視為「不可能還在飛」。發佈側最後
+# 一次 fsync 到 registry 提交之間正常是次秒級（`prepare_commit` 之後只剩
+# `_validated_brainstorm_planning_authority` 與一次原子寫入），這裡留 5 分鐘
+# 的極寬裕餘裕，純粹是為了讓 sweep 絕不可能誤傷一個仍在進行中的發佈——
+# 即使它是由 daemon 之外的行程（operator 的前景 `cortex work start`）發起。
+_PLANNING_TRANSACTION_GRACE_SECONDS = 300.0
+
+
+def _planning_artifact_adopted_by_git(path: Path, *, workspace_root: Path) -> bool:
+    """殘留檔是否已被 operator 納入 git 追蹤（＝不再是「未提交的發佈殘留」）。
+
+    與 `work_actions._gc_one_abandoned_planning_artifact` 同一條判準與同一個
+    理由：git 已追蹤代表 operator 已經採納這份產出，刪掉就是銷毀他人工作
+    （#507）。無法判定時（workspace 不是 git repo、git 不可用）回傳 False，
+    讓回退照常進行——回退本身還有逐位元組的 CAS 護欄（`before_exists=False`
+    ＋ `after_hash` 必須完全吻合），不依賴這層。
+    """
+
+    try:
+        relative = path.resolve().relative_to(workspace_root.resolve())
+    except (ValueError, OSError):
+        return False
+    try:
+        tracked = subprocess.run(
+            [
+                "git", "-C", str(workspace_root), "ls-files", "--error-unmatch",
+                "--", str(relative),
+            ],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return tracked.returncode == 0
+
+
+def reconcile_planning_transactions(
+    *,
+    registry,
+    coordinator_root: str | Path,
+    now: float | None = None,
+    grace_seconds: float = _PLANNING_TRANSACTION_GRACE_SECONDS,
+) -> list[dict[str, object]]:
+    """#536：把 planning-transactions journal 目錄整個掃過，逐份收斂。
+
+    根因：「發佈 planning artifacts」與「更新 run 狀態」是兩次分離的 durable
+    寫入，中間崩潰會留下「artifacts 已落地、run 狀態停在原地」的中間態。
+    journal 早就記了 before/after hash，但 `reconcile()` **只能由持有該 run
+    的呼叫端逐 run 觸發**（define 起始、`resume_workflow_run`）——一旦那個
+    run 離開 `ongoing`（superseded／done），或 run 從沒被任何迴圈再訪，
+    journal 與它描述的殘留檔就永遠沒有人看，正是 #536 說的「對所有恢復迴圈
+    隱形」。實測 coordinator root 上就躺著兩份這種孤兒 journal（其中一份正是
+    #536 現場的 `workflow-7a430d31eff66ef13630`，run 已 superseded）。
+
+    這個 sweep 是**唯一**的恢復路徑：不管 run 是 ongoing、superseded 還是
+    done，只要 journal 還在就把它收斂掉，因此既有殘留與未來崩潰走同一條
+    程式路徑自癒。每一份 journal 的結果都會回報並落 log，不得靜默。
+    """
+
+    journal_root = Path(coordinator_root).resolve()
+    directory = journal_root / "planning-transactions"
+    if directory.is_symlink() or not directory.is_dir():
+        return []
+    runs = {run.run_id: run for run in registry.list_workflow_runs()}
+    moment = time.time() if now is None else now
+    report: list[dict[str, object]] = []
+    for path in sorted(directory.glob("*.json")):
+        run_id = path.name[: -len(".json")]
+        record: dict[str, object] = {"run_id": run_id}
+        if path.is_symlink() or not path.is_file():
+            record.update(outcome="invalid", detail="journal is not a regular file")
+            logger.error(
+                "planning-transaction-invalid run_id=%s detail=%s", run_id, record["detail"]
+            )
+            report.append(record)
+            continue
+        try:
+            age = moment - path.stat().st_mtime
+        except OSError as exc:
+            record.update(outcome="invalid", detail=f"{type(exc).__name__}: {str(exc)[:120]}")
+            logger.error(
+                "planning-transaction-invalid run_id=%s detail=%s", run_id, record["detail"]
+            )
+            report.append(record)
+            continue
+        if age < grace_seconds:
+            # 仍可能在飛：不碰，下一輪再看。
+            record.update(outcome="in-flight", age_seconds=round(age, 3))
+            report.append(record)
+            continue
+        run = runs.get(run_id)
+        if run is None:
+            # fail-closed：沒有 run row 就無法驗證 journal 宣稱的 workspace
+            # root，不能拿 journal 自報的路徑去刪檔。留檔＋落 log，讓它可見。
+            record.update(outcome="unknown-run", detail="no workflow run owns this journal")
+            logger.error(
+                "planning-transaction-orphan run_id=%s detail=%s", run_id, record["detail"]
+            )
+            report.append(record)
+            continue
+        workspace_root = Path(run.workspace_root)
+        try:
+            outcome = _PlanningPublicationTransaction.reconcile(
+                root=workspace_root,
+                journal_root=journal_root,
+                run=run,
+                adopted=lambda target: _planning_artifact_adopted_by_git(
+                    target, workspace_root=workspace_root
+                ),
+            )
+        except PlanningPublicationDrift as exc:
+            record.update(outcome="drift", detail=str(exc)[:200], status=run.status)
+            logger.error(
+                "planning-transaction-drift run_id=%s status=%s detail=%s",
+                run_id,
+                run.status,
+                str(exc)[:200],
+            )
+            if run.status == "ongoing" and "needs_human" not in run.facets:
+                # 無法自動收斂的殘留必須有人接手——補 needs_human facet，
+                # 讓 `cortex status` 的 attention 清單與 next_actions 有話說。
+                try:
+                    registry._manager_update_workflow_run(
+                        run.run_id,
+                        facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                        gate_status="running",
+                    )
+                    record["surfaced"] = True
+                except Exception as surface_exc:  # noqa: BLE001 - 呈現失敗不得吃掉診斷
+                    logger.error(
+                        "planning-transaction-surface-failed run_id=%s error=%s: %s",
+                        run_id,
+                        type(surface_exc).__name__,
+                        str(surface_exc)[:200],
+                    )
+            report.append(record)
+            continue
+        if outcome is None:
+            continue
+        record.update(outcome, status=run.status)
+        record["skipped"] = list(outcome.get("skipped", ()))
+        logger.info(
+            "planning-transaction-reconciled run_id=%s outcome=%s phase=%s status=%s skipped=%d",
+            run_id,
+            record["outcome"],
+            record["phase"],
+            run.status,
+            len(record["skipped"]),
+        )
+        report.append(record)
+    return report
 
 
 # #416：`_publish_planning_artifacts` 對「檔案已存在但無/與目前 authority
@@ -9180,6 +9419,11 @@ def apply_workflow_action(
             result.reason,
         )
         return {"run_id": run.run_id, "current_phase": run.current_phase, "reason": result.reason}
+    # #536：檔案側到此為止全部落地且已 fsync，接下來 registry 的那一次原子
+    # 寫入就是本事務唯一的 commit point。把這條邊界寫成 durable 事實，崩潰
+    # 後的 sweep（`reconcile_planning_transactions`）才能誠實區分「崩在發佈
+    # 中途」與「崩在提交邊界」，而不是只看到一坨無主檔案。
+    publication.prepare_commit()
     try:
         planning_authority, planning_source_revision = _validated_brainstorm_planning_authority(
             run,

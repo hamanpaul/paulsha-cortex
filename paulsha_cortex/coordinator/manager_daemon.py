@@ -932,6 +932,8 @@ def build_periodic_tick_runner(
             _log_error(exc, context={"action": "auto-claim-scan"})
             auto_claims = []
             auto_claim_error = safe_exception_summary(exc)
+        planning_transactions: list[dict[str, Any]] = []
+        planning_transaction_error: str | None = None
         if registry is not None and hasattr(registry, "list_workflow_runs"):
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = (
@@ -939,6 +941,22 @@ def build_periodic_tick_runner(
                 if state_path is not None
                 else paths.coordinator_root().resolve()
             )
+            # #536：planning 發佈事務的唯一恢復路徑。「發佈 artifacts」與
+            # 「更新 run 狀態」是兩次分離的 durable 寫入，中間崩潰會留下
+            # 「artifacts 已落地、run 狀態停在原地」的中間態；journal 早有
+            # before/after hash，但過去只能由持有該 run 的呼叫端逐 run
+            # reconcile——run 一旦離開 ongoing（superseded／done）就再也沒人
+            # 看它。這個 sweep 掃整個 journal 目錄，與 run 狀態無關，因此
+            # 既有殘留與未來崩潰走同一條路自癒。比照 #246 的 tick isolation：
+            # 整個子系統失效不得癱瘓本輪 tick，降級後照常跑 resume 迴圈。
+            try:
+                planning_transactions = manager.reconcile_planning_transactions(
+                    registry=registry,
+                    coordinator_root=coordinator_root,
+                )
+            except Exception as exc:  # noqa: BLE001 - tick isolation
+                _log_error(exc, context={"action": "planning-transaction-sweep"})
+                planning_transaction_error = safe_exception_summary(exc)
             for workflow in registry.list_workflow_runs():
                 if (
                     workflow.status != "ongoing"
@@ -1056,6 +1074,17 @@ def build_periodic_tick_runner(
             )
         result = _call_with_supported_kwargs(run_tick_fn, dispatcher, **run_tick_kwargs)
         summary = {**result, "auto_claims": auto_claims}
+        # #536：只在有話可說時才進 summary，避免每輪 tick 都塞一個空清單。
+        # 收斂結果（rolled-back／committed／adopted／drift／unknown-run）必須
+        # 對 operator 可見，不得只活在 log 裡。
+        actionable = [
+            row for row in planning_transactions if row.get("outcome") != "in-flight"
+        ]
+        if actionable:
+            summary["planning_transactions"] = actionable
+        if planning_transaction_error is not None:
+            summary["planning_transaction_failed"] = True
+            summary["planning_transaction_error"] = planning_transaction_error
         if auto_claim_error is not None:
             # 讓 operator 能從 status/summary 看出 auto-claim 這輪降級了，
             # 而不是靜默吞掉——不含絕對路徑／token，只有型別＋訊息摘要。
