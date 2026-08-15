@@ -392,7 +392,14 @@ def test_retry_card_requires_exact_card_id(tmp_path: Path) -> None:
         _retry_card(tmp_path, snapshot, registry, expected_run_id=run.run_id)
 
 
-def test_retry_card_requires_build_phase(tmp_path: Path) -> None:
+def test_retry_card_refuses_a_build_card_once_the_run_left_build(tmp_path: Path) -> None:
+    """重派永遠落在**當前 phase 的當前卡**上。
+
+    #569 把 verify／review 的 reviewer 卡納入 `retry-card` 的受理範圍，因此這裡
+    不再是「非 build phase 一律拒絕」；但指名一張已經被留在身後的 build 卡仍必須
+    fail closed——重派的標的只能是 `manager._current_workflow_step` 會派的那一張。
+    """
+
     snapshot, registry, run, _job_id = _stuck_run(tmp_path)
     registry._manager_update_workflow_run(
         run.run_id,
@@ -403,10 +410,11 @@ def test_retry_card_requires_build_phase(tmp_path: Path) -> None:
         current_phase="verify",
     )
 
-    with pytest.raises(RuntimeError, match="requires build-phase workflow"):
+    with pytest.raises(RuntimeError, match="expected card mismatch"):
         _retry_card(
             tmp_path, snapshot, registry, expected_run_id=run.run_id, card="tdd-red"
         )
+    assert "needs_human" in registry.get_workflow_run(run.run_id).facets
 
 
 # ==========================================================================
@@ -465,7 +473,7 @@ def test_forced_retry_dispatches_a_new_job_for_the_midchain_card(
         identities=_identities(),
         launcher_factory=lambda _: _Launcher(prompts),
         coordinator_root=tmp_path / "coordinator",
-        force_new_build=True,
+        force_new_card=True,
     )
 
     assert replacement is not None
@@ -599,7 +607,7 @@ def test_public_work_retry_card_forces_one_new_manager_dispatched_builder(
     calls: list[bool] = []
 
     def forced_dispatch(*args, **kwargs):
-        calls.append(kwargs.get("force_new_build"))
+        calls.append(kwargs.get("force_new_card"))
         return {"job_id": "replacement-builder"}
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", forced_dispatch)
@@ -770,7 +778,7 @@ def test_coordinator_cli_forwards_card_to_the_control_request() -> None:
 def test_build_recovery_actions_surface_only_admissible_actions(tmp_path: Path) -> None:
     _snapshot_path, registry, run, job_id = _stuck_run(tmp_path)
 
-    exposed = work_actions._build_phase_recovery_actions(
+    exposed = work_actions._phase_recovery_actions(
         registry.get_workflow_run(run.run_id), registry
     )
 
@@ -783,7 +791,7 @@ def test_build_recovery_actions_surface_only_admissible_actions(tmp_path: Path) 
         locator={"kind": "workflow-build-result", "path": "evidence/tdd-red.json", "hash": "e" * 64},
         subject_head=HEAD,
     )
-    assert "retry-card" not in work_actions._build_phase_recovery_actions(
+    assert "retry-card" not in work_actions._phase_recovery_actions(
         registry.get_workflow_run(run.run_id), registry
     )
 
@@ -793,7 +801,7 @@ def test_build_recovery_actions_stay_empty_without_needs_human(tmp_path: Path) -
     registry._manager_update_workflow_run(run.run_id, facets=())
 
     assert (
-        work_actions._build_phase_recovery_actions(
+        work_actions._phase_recovery_actions(
             registry.get_workflow_run(run.run_id), registry
         )
         == ()

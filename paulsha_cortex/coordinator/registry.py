@@ -32,6 +32,17 @@ VALID_JOB_STATUSES = frozenset({"dispatched", "running", "exited", "failed"})
 ACTIVE_JOB_STATUSES = frozenset({"dispatched", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"exited", "failed"})
 
+# #545／#569：`retry-card` 受理的 phase 與該 phase 唯一合法的重派 persona。
+# build → builder（#545 的中段 builder 卡），verify／review → reviewer（#569 的
+# verification／code-review／adversarial-review 卡）。以 mapping 而非兩份散落的
+# 條件式表述，是為了讓 work action 層與 registry 層的 admission 共用同一份判準
+# ——兩邊漂移正是 #382 付過學費的教訓。
+RETRY_CARD_PHASE_PERSONA = {
+    "build": "builder",
+    "verify": "reviewer",
+    "review": "reviewer",
+}
+
 VALID_SLICE_STATES = frozenset(
     {
         "pending",
@@ -1961,7 +1972,13 @@ class JobRegistry:
         card: str,
         retry_classification: str | None = None,
     ) -> WorkflowRun:
-        """#545：原子重開「最早一張尚未採信的 builder 卡」，含中段卡。
+        """#545／#569：原子重開「當前 phase 內最早一張尚未採信的卡」。
+
+        受理範圍：build phase 的 builder 卡（#545 的中段卡）與 verify／review
+        phase 的 reviewer 卡（#569 的 verification／code-review／
+        adversarial-review）。兩者是同一個形狀的死結——卡片最新的終止 job 輸出
+        損壞、evidence 綁不上，harvest 每次重讀同一顆壞 job，而契約內沒有任何
+        路徑能產生新的 envelope。
 
         與 `_manager_reset_workflow_for_retry_build` 的差別是刻意的，不是重複：
 
@@ -1973,7 +1990,12 @@ class JobRegistry:
         - 已採信（`workflow_evidence` 已綁定）的卡一律拒絕：舊 job 與舊 envelope
           是稽核紀錄，重派只允許產生**新** job 與**新** envelope，既有紀錄原樣保留。
 
-        `card` 必須精確等於「build phase 內最早一張 gate_result 非 passed 的
+        與 `_manager_reset_workflow_for_retry_verify`／`..._retry_review` 的差別
+        同樣是刻意的：那兩者是 **phase 級**重置（整個 phase 的 step 全打回
+        pending、清 gate_refs，且把舊 exited job 改標 failed），本方法只動**指名
+        的那一張卡**，舊 job 一個位元組都不動。
+
+        `card` 必須精確等於「當前 phase 內最早一張 gate_result 非 passed 的
         卡」——那也正是 `manager._current_workflow_step` 之後會派的那一張，兩邊
         同一判準，避免宣告可行的重派實際落到另一張卡上（#382 的教訓）。
         """
@@ -1982,14 +2004,17 @@ class JobRegistry:
         current = self._workflows[index]
         if current.run_id != expected_run_id:
             raise ValueError("retry-card reset expected WorkflowRun CAS mismatch")
+        phase = current.current_phase
         if (
             current.status != "ongoing"
-            or current.current_phase != "build"
+            or phase not in RETRY_CARD_PHASE_PERSONA
             or "needs_human" not in current.facets
         ):
             raise ValueError(
-                "retry-card reset requires active needs_human build workflow"
+                "retry-card reset requires active needs_human "
+                "build/verify/review workflow"
             )
+        expected_persona = RETRY_CARD_PHASE_PERSONA[phase]
         if any(
             job.get("workflow_run_id") == current.run_id
             and job.get("status") in ACTIVE_JOB_STATUSES
@@ -1999,18 +2024,23 @@ class JobRegistry:
         pending = [
             step
             for step in current.steps
-            if step.phase == "build" and step.gate_result != "passed"
+            if step.phase == phase and step.gate_result != "passed"
         ]
         if not pending or pending[0].card != card:
             raise ValueError(
-                "retry-card reset requires the earliest un-accepted builder card"
+                f"retry-card reset requires the earliest un-accepted {expected_persona} card"
             )
-        if pending[0].persona != "builder":
-            raise ValueError("retry-card reset requires a builder card")
+        if pending[0].persona != expected_persona:
+            raise ValueError(f"retry-card reset requires a {expected_persona} card")
         if any(
             job.get("workflow_run_id") == current.run_id
-            and job.get("workflow_phase") == "build"
+            and job.get("workflow_phase") == phase
             and job.get("workflow_card") == card
+            # verify／review 的 job 以 candidate 定錨（與
+            # `manager._dispatch_workflow_card` 的 matching 同一組判準）：要拒絕
+            # 的是「這張卡對**現在這個 candidate** 已經有被採信的結論」，而不是
+            # 上一代 candidate 留下的歷史紀錄——後者拒絕等於再造一次 catch-22。
+            and (phase == "build" or job.get("subject_head") == current.candidate_head)
             and job.get("workflow_evidence") is not None
             for job in self._jobs
         ):
@@ -2018,9 +2048,10 @@ class JobRegistry:
         steps = tuple(
             # 只清掉「上一次是誰跑的」這類解析結果，讓下一次 dispatch 重新解析
             # identity；`action`／`inputs`／`outputs`／`test_policy` 等卡片契約
-            # 原樣保留。
+            # 原樣保留。#568 的 reviewer fail-over 正是依賴這個重新解析——複製舊
+            # job 的 executor／model 等於把壞掉的身分再派一次。
             replace(step, executor=None, model=None, domain=None, gate_result="pending")
-            if step.phase == "build" and step.card == card
+            if step.phase == phase and step.card == card
             else step
             for step in current.steps
         )
@@ -2029,7 +2060,7 @@ class JobRegistry:
             steps=steps,
             attempts={
                 **current.attempts,
-                "build": current.attempts.get("build", 0) + 1,
+                phase: current.attempts.get(phase, 0) + 1,
             },
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
             # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——

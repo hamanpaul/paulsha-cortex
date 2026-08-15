@@ -699,7 +699,7 @@ def test_public_work_retry_build_forces_one_new_manager_dispatched_builder(
     calls: list[bool] = []
 
     def forced_dispatch(*args, **kwargs):
-        calls.append(kwargs.get("force_new_build"))
+        calls.append(kwargs.get("force_new_card"))
         return {"job_id": "repair-builder"}
 
     monkeypatch.setattr(manager, "dispatch_workflow_card", forced_dispatch)
@@ -929,7 +929,7 @@ def test_forced_retry_build_dispatches_new_job_after_prior_success(
         ),
         launcher_factory=lambda _: Launcher(),
         coordinator_root=tmp_path / "coordinator",
-        force_new_build=True,
+        force_new_card=True,
     )
 
     assert replacement["job_id"] != old["job_id"]
