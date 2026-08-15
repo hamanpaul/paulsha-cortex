@@ -36,8 +36,17 @@ _RATE_LIMIT_PATTERN = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+# #487: the ``oauth`` alternative used to be unbounded, so it matched *inside*
+# ordinary identifiers — a Claude builder's normal init skill list contains
+# ``doc-coauthoring``, whose ``coauthoring`` substring contains ``oauth``. That
+# turned an unrelated tool failure into a non-retryable ``auth`` classification
+# and blocked the correct recovery path. The signal is now bounded to a
+# standalone token: ``oauth token`` / ``OAuth-2.0`` still match, ``coauthoring``
+# does not. ``authenticat`` stays unbounded on purpose — it is a prefix of
+# ``authenticate``/``authentication``/``authenticating`` and has no benign
+# substring host of the same kind.
 _AUTH_PATTERN = re.compile(
-    r"bad credentials|\b401\b|authenticat|oauth|token.*invalid|invalid.*token",
+    r"bad credentials|\b401\b|authenticat|\boauth\b|token.*invalid|invalid.*token",
     re.IGNORECASE,
 )
 

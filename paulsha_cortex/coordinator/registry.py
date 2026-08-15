@@ -599,12 +599,15 @@ class JobRegistry:
                 f"coordinator 狀態檔 workflow_evidence 格式錯誤（fail-closed）: {self._state_path}"
             )
         # #384：executor 失敗的 typed 分類（provider_outcome.py）。舊狀態檔沒有
-        # 這個欄位（None）；有的話必須是固定四鍵形狀，鍵值型別比照
+        # 這個欄位（None）；有的話必須帶齊四個必要鍵，鍵值型別比照
         # ProviderFailureClassification.to_dict()。
+        # #499：`reset_at`（provider 給的權威限流重置時刻，epoch 秒）為可選第五
+        # 鍵——只有結構化限流證據帶得到，故四鍵形狀的舊狀態檔仍原樣合法。
         provider_outcome = job.get("provider_outcome")
         if provider_outcome is not None and (
             not isinstance(provider_outcome, dict)
-            or set(provider_outcome) != {"outcome", "authority", "reason", "retryable"}
+            or not {"outcome", "authority", "reason", "retryable"} <= set(provider_outcome)
+            or set(provider_outcome) - {"outcome", "authority", "reason", "retryable", "reset_at"}
             or not isinstance(provider_outcome.get("outcome"), str)
             or not provider_outcome["outcome"]
             or not isinstance(provider_outcome.get("authority"), str)
@@ -612,6 +615,13 @@ class JobRegistry:
             or not isinstance(provider_outcome.get("reason"), str)
             or not provider_outcome["reason"]
             or not isinstance(provider_outcome.get("retryable"), bool)
+            or (
+                provider_outcome.get("reset_at") is not None
+                and (
+                    not isinstance(provider_outcome.get("reset_at"), int)
+                    or isinstance(provider_outcome.get("reset_at"), bool)
+                )
+            )
         ):
             raise ValueError(
                 f"coordinator 狀態檔 provider_outcome 格式錯誤（fail-closed）: {self._state_path}"
@@ -1057,9 +1067,11 @@ class JobRegistry:
             raise ValueError(
                 f"headless 完成結果 status 須為 'exited' 或 'failed'，收到: {status!r}"
             )
+        # #499：`reset_at` 為可選第五鍵（見 _validate_state 的同一份判準）。
         if provider_outcome is not None and (
             not isinstance(provider_outcome, Mapping)
-            or set(provider_outcome) != {"outcome", "authority", "reason", "retryable"}
+            or not {"outcome", "authority", "reason", "retryable"} <= set(provider_outcome)
+            or set(provider_outcome) - {"outcome", "authority", "reason", "retryable", "reset_at"}
         ):
             raise ValueError("provider_outcome 格式錯誤（fail-closed）")
         job = self._find_job(job_id)

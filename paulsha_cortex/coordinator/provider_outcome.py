@@ -30,18 +30,24 @@ hint 不升 authoritative」vs. recovery matrix 期待 rate_limited 在 copilot
   不矛盾。
 - :data:`SignalAuthority.HINT` —— exit code 非零但無任何已知訊號匹配。只供
   人類判讀，不驅動任何自動決策（既不 retry 也不變更 gate_reason 之外的欄位）。
+
+**#499／#500／#487（2026-08-15）**：分類器本身移交
+:mod:`paulsha_cortex.coordinator.outcome_taxonomy`——三個 lane 共用同一份
+markers 表與同一套證據分層，本模組只保留 build lane 的六值詞彙
+（:class:`ProviderOutcome`）與 authority 分級。三個實質修正隨之落地：
+
+- 結構化終局證據優先於文字關鍵字（#499：`rate_limit_event` / 429 終局狀態）。
+- nested tool result 與 init metadata 不再是分類證據（#500 / #487）。
+- rate-limit 帶回 provider 給的權威重置時刻（:attr:`ProviderFailureClassification.reset_at`）。
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
-from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
-
-from . import executor_auth
+from . import outcome_taxonomy
 
 __all__ = [
     "ProviderOutcome",
@@ -80,58 +86,31 @@ class SignalAuthority(str, Enum):
 # 沒有訊號可支持任何自動決策）。
 RETRYABLE_OUTCOMES = frozenset({ProviderOutcome.RATE_LIMITED, ProviderOutcome.TRANSIENT})
 
+# 分類結果 payload 的必要鍵。`reset_at` 是可選鍵（#499：只有帶得到權威重置
+# 時刻的 rate-limit 才會有），故舊狀態檔的四鍵 payload 仍原樣可讀。
 _PROVIDER_OUTCOME_FIELDS = frozenset({"outcome", "authority", "reason", "retryable"})
+_PROVIDER_OUTCOME_OPTIONAL_FIELDS = frozenset({"reset_at"})
 
-# Quota：固定週期用量上限（月配額、bulk usage limit），與 rate_limit（滑動時間窗、
-# 通常數十秒到數分鐘內重置）語意不同，值得分開分類以利未來對 quota 採不同的
-# backoff 策略（本票僅分類，不對 quota 做 bounded retry——見 RETRYABLE_OUTCOMES）。
-#
-# 刻意不收 "quota exceeded"／"usage limit" 這兩個措辭：`executor_auth`
-# 複用的 rate-limit 正則（見 executor_auth._RATE_LIMIT_RE／
-# github_rate_limit._RATE_LIMIT_PATTERN）已經把它們算進 rate-limit（兩者
-# 語意接近——都是「等時間窗過了就會恢復」），而 rate-limit 判定排在本模組
-# quota 檢查之前，故這兩個措辭實際上永遠命中不到這裡；本類別只收「不是等
-# 時間窗、而是要人工處理（帳單、方案升級）」的措辭，避免死碼與誤導。
-_QUOTA_RE = re.compile(
-    r"""
-    monthly\ limit
-    | plan\ limit
-    | billing
-    | insufficient\ credits?
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
+# markers 表已移交 outcome_taxonomy（#499／#500／#487／#485：三個 lane 共用
+# 單一真源）。以下對照表把 taxonomy 的細分訊號翻回本 lane 的六值詞彙。
+_OUTCOME_BY_TEXT_SIGNAL: dict[outcome_taxonomy.TextSignal, ProviderOutcome] = {
+    outcome_taxonomy.TextSignal.RATE_LIMIT: ProviderOutcome.RATE_LIMITED,
+    outcome_taxonomy.TextSignal.QUOTA: ProviderOutcome.QUOTA,
+    outcome_taxonomy.TextSignal.AUTH: ProviderOutcome.AUTH,
+    outcome_taxonomy.TextSignal.CONTENT: ProviderOutcome.CONTENT,
+    outcome_taxonomy.TextSignal.TRANSIENT: ProviderOutcome.TRANSIENT,
+    outcome_taxonomy.TextSignal.NONE: ProviderOutcome.UNKNOWN,
+}
 
-# Transient：網路/服務暫時性錯誤，與 rate limit 不同——這裡沒有「額度」語意，
-# 純粹是這一次呼叫失敗，重試通常會成功。
-_TRANSIENT_RE = re.compile(
-    r"""
-    connection\ reset
-    | econnreset
-    | timed?\ ?out
-    | \btimeout\b
-    | temporarily\ unavailable
-    | service\ unavailable
-    | bad\ gateway
-    | gateway\ time-?out
-    | \b50[0234]\b
-    | network\ error
-    | dns\b
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Content：模型基於內容政策拒答，屬於「這次呼叫本身不該被無腦重試」的類別。
-_CONTENT_RE = re.compile(
-    r"""
-    content\ (policy|filtered)
-    | refus(e|ed|ing)\ to\ (assist|help|continue)
-    | cannot\ assist
-    | violates\ (our|the)\ (usage\ )?polic
-    | safety\ (guidelines|system|filter)
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
+# 結構化訊號 → 本 lane 詞彙。`INTERRUPTED` 落 UNKNOWN：controller 中斷既非
+# provider 失敗也非模型內容缺陷，維持既有「不自動重試」處置（#500 要的正是
+# 不要再把它當成 transient 排重試）。
+_OUTCOME_BY_STRUCTURED_KIND: dict[outcome_taxonomy.StructuredKind, ProviderOutcome] = {
+    outcome_taxonomy.StructuredKind.RATE_LIMITED: ProviderOutcome.RATE_LIMITED,
+    outcome_taxonomy.StructuredKind.TRANSIENT: ProviderOutcome.TRANSIENT,
+    outcome_taxonomy.StructuredKind.AUTH: ProviderOutcome.AUTH,
+    outcome_taxonomy.StructuredKind.INTERRUPTED: ProviderOutcome.UNKNOWN,
+}
 
 
 @dataclass(frozen=True)
@@ -141,6 +120,10 @@ class ProviderFailureClassification:
     outcome: ProviderOutcome
     authority: SignalAuthority
     reason: str
+    # #499：provider 給的權威重置時刻（epoch 秒），目前只有結構化限流證據
+    # （Claude `rate_limit_event.resetsAt`）帶得到。None 時 `to_dict()` 不寫這個
+    # 鍵，舊讀取端與舊狀態檔的四鍵形狀完全不受影響。
+    reset_at: int | None = None
 
     @property
     def retryable(self) -> bool:
@@ -149,12 +132,15 @@ class ProviderFailureClassification:
         return self.authority is not SignalAuthority.HINT and self.outcome in RETRYABLE_OUTCOMES
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "outcome": self.outcome.value,
             "authority": self.authority.value,
             "reason": self.reason,
             "retryable": self.retryable,
         }
+        if self.reset_at is not None:
+            payload["reset_at"] = self.reset_at
+        return payload
 
     @classmethod
     def from_dict(cls, payload: object) -> "ProviderFailureClassification | None":
@@ -162,7 +148,12 @@ class ProviderFailureClassification:
         不阻塞既有讀路徑——這只是輔助分類，不是授權欄位）。
         """
 
-        if not isinstance(payload, Mapping) or set(payload) != _PROVIDER_OUTCOME_FIELDS:
+        if not isinstance(payload, Mapping):
+            return None
+        keys = set(payload)
+        if not _PROVIDER_OUTCOME_FIELDS <= keys or keys - (
+            _PROVIDER_OUTCOME_FIELDS | _PROVIDER_OUTCOME_OPTIONAL_FIELDS
+        ):
             return None
         outcome = payload.get("outcome")
         authority = payload.get("authority")
@@ -174,20 +165,38 @@ class ProviderFailureClassification:
             return None
         if not isinstance(reason, str) or not reason:
             return None
-        return cls(outcome=outcome_enum, authority=authority_enum, reason=reason)
+        reset_at = payload.get("reset_at")
+        if reset_at is not None and (not isinstance(reset_at, int) or isinstance(reset_at, bool)):
+            return None
+        return cls(
+            outcome=outcome_enum,
+            authority=authority_enum,
+            reason=reason,
+            reset_at=reset_at,
+        )
 
 
 def classify_provider_failure(*, exit_code: int, output: str | None) -> ProviderFailureClassification:
     """把一次 executor 失敗的 (exit_code, 合併 stdout/stderr 文字) 分類成 typed outcome。
 
-    Rate limit 判定必須排在 auth 判定之前（沿用 #369/#370 的教訓：GitHub／
-    provider 的限流訊息常同時帶有 "authenticate"／"login" 字樣）。呼叫端只在
-    確認這是一次失敗（exit_code != 0 或呼叫端已知 status == "failed"）時呼叫
-    本函式；exit_code == 0 時仍會回傳一個防禦性的 UNKNOWN/HINT 分類而不拋錯，
-    避免呼叫端誤用時整條鏈路炸掉。
+    分兩層，順序不可互換（#499／#500／#487）：
+
+    1. **結構化終局證據優先**（:func:`outcome_taxonomy.classify_structured_evidence`）
+       ——provider 自己用機器可讀欄位講明白的事（`rate_limit_event.status =
+       rejected`、終局 `api_error_status = 429`、controller 中斷）具
+       ``STRUCTURED`` authority，不該被下一層的關鍵字比對翻案。#499 的 429 與
+       #500 的 `aborted_streaming` 都在這一層定案。
+    2. **文字關鍵字**（:func:`outcome_taxonomy.classify_text`）——只掃
+       provider 層證據；nested tool result 與 init metadata 已在
+       :func:`outcome_taxonomy.parse_stream_evidence` 被排除（#500／#487），
+       模型散文只參與 content 判定。判定順序沿用 #369/#370（rate limit 先於
+       auth）。
+
+    呼叫端只在確認這是一次失敗（exit_code != 0 或呼叫端已知 status ==
+    "failed"）時呼叫本函式；exit_code == 0 時仍會回傳一個防禦性的 UNKNOWN/HINT
+    分類而不拋錯，避免呼叫端誤用時整條鏈路炸掉。
     """
 
-    text = output or ""
     if exit_code == 0:
         return ProviderFailureClassification(
             ProviderOutcome.UNKNOWN,
@@ -195,43 +204,29 @@ def classify_provider_failure(*, exit_code: int, output: str | None) -> Provider
             "exit code 0 -- classify_provider_failure 不應被呼叫在成功案例",
         )
 
-    cli_status, cli_detail = executor_auth.classify_cli_output(exit_code, text)
+    evidence = outcome_taxonomy.parse_stream_evidence(output)
 
-    if cli_status == "rate_limited" or is_rate_limit_signal(text):
+    structured = outcome_taxonomy.classify_structured_evidence(evidence)
+    if structured is not None:
         return ProviderFailureClassification(
-            ProviderOutcome.RATE_LIMITED,
-            SignalAuthority.TEXT_SIGNAL,
-            f"rate limit signal detected in executor output ({cli_detail})",
+            _OUTCOME_BY_STRUCTURED_KIND[structured.kind],
+            SignalAuthority.STRUCTURED,
+            structured.detail,
+            reset_at=structured.reset_at,
         )
-    if _QUOTA_RE.search(text):
-        return ProviderFailureClassification(
-            ProviderOutcome.QUOTA,
-            SignalAuthority.TEXT_SIGNAL,
-            "quota signal detected in executor output",
-        )
-    if cli_status == "logged_out" or is_auth_signal(text):
-        return ProviderFailureClassification(
-            ProviderOutcome.AUTH,
-            SignalAuthority.TEXT_SIGNAL,
-            f"auth/login signal detected in executor output ({cli_detail})",
-        )
-    if _CONTENT_RE.search(text):
-        return ProviderFailureClassification(
-            ProviderOutcome.CONTENT,
-            SignalAuthority.TEXT_SIGNAL,
-            "content-policy signal detected in executor output",
-        )
-    if _TRANSIENT_RE.search(text):
-        return ProviderFailureClassification(
-            ProviderOutcome.TRANSIENT,
-            SignalAuthority.TEXT_SIGNAL,
-            "transient/network signal detected in executor output",
-        )
-    return ProviderFailureClassification(
-        ProviderOutcome.UNKNOWN,
-        SignalAuthority.HINT,
-        f"no definitive signal (exit {exit_code})",
+
+    classification = outcome_taxonomy.classify_text(
+        exit_code=exit_code,
+        provider_text=evidence.provider_text,
+        model_text=evidence.model_text,
     )
+    outcome = _OUTCOME_BY_TEXT_SIGNAL[classification.signal]
+    authority = (
+        SignalAuthority.HINT
+        if classification.signal is outcome_taxonomy.TextSignal.NONE
+        else SignalAuthority.TEXT_SIGNAL
+    )
+    return ProviderFailureClassification(outcome, authority, classification.detail)
 
 
 def classification_from_job(job: Mapping[str, object]) -> ProviderFailureClassification | None:

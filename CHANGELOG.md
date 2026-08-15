@@ -89,6 +89,20 @@
   不可變原則；世代內的衝突偵測維持 fail closed。no-clobber 錯誤訊息另附
   `existing owner=/mtime=/publishing run=`，operator 不必再挖 mtime 對時間軸。
 
+- **Issue #499 #500 #487 #485：三套 outcome 分類器收編成單一 taxonomy 模組**——
+  「executor 失敗該歸哪一類」在 planning／build／review 三個 lane 各自實作、各自漂移，
+  同型缺陷已第六次命中。根因不是關鍵字表寫錯，是餵進表裡的東西一開始就不該進來
+  （nested tool result、init metadata、CLI banner），或該當證據的結構化終局記錄被忽略。
+  新增 `coordinator/outcome_taxonomy.py`：四大類 outcome family（transient-service／
+  content／environment／auth）＋共用 markers 表＋證據分層，三個 lane 共同消費；#533 的
+  planning 先行實作一併收編。四張 issue 各自的誤判：#499 Claude review 429 被投影成
+  `foreign-review-absent`／`provider_outcome` null，改以結構化權威落 `rate_limited` 並
+  保留權威重置時刻（新增可選欄位 `provider_outcome.reset_at`）；#500 nested tool result
+  的 `timeout` 字樣被判 network transient，改由證據分層排除、終局 `aborted_streaming` 落
+  `unknown`；#487 init skill 清單的 `doc-coauthoring` 命中無界 `oauth` 被判 auth，收緊為
+  `\boauth\b` 並排除 init metadata；#485 Codex stdin banner 讓每次 foreign review 都成
+  `invalid-process-output`，改為 parse 前只剝離精確、位於串流開頭的已知 banner。
+  各 lane 對每類 outcome 的後續處置（retry／needs_human／終止）維持現狀。
 - **R0.5 D1（部分）：auto-claim label 判定改走 monitor 鏡像**——monitor 把持有
   `cortex:auto-on-going` 的 open issue 編號寫進 provider observations（issues 回應本來就含
   labels，零額外 API）；canonical claim 路徑據此導出 `auto_label`（原硬編 False）；
