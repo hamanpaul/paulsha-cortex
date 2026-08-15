@@ -30,6 +30,16 @@ def coordinator_root() -> Path:
     return resolve_runtime_root("PSC_COORDINATOR_ROOT")
 
 
+def coverage_shadow_telemetry_root() -> Path:
+    """v4 R1（方案 A）coverage validator shadow 的 disagreement telemetry 落點。
+
+    每次 shadow 比對落一檔（原子寫入，見 `coordinator/coverage.py`），供兩週觀測期
+    的 disagreement 分析。掛在 `coordinator_root()`（`PSC_COORDINATOR_ROOT`）底下——
+    這是 coordinator 產出的 telemetry，與 monitor 的傳輸層狀態分族。
+    """
+    return coordinator_root() / "coverage-shadow"
+
+
 def specs_root() -> Path:
     return resolve_runtime_root("PSC_SPECS_ROOT")
 

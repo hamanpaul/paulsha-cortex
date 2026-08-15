@@ -41,6 +41,7 @@ _CARD_KEYS = frozenset(
         "slice_group",
         "execution",
         "runtime_capabilities",
+        "satisfies",
     }
 )
 # #262 R1：card 以資料宣告執行所需 runtime capability，形式為 `<kind>:<name>`
@@ -126,6 +127,13 @@ class Card:
     test_policy: str | None = None
     # #262 R1：dispatch 前 preflight 依這份宣告逐項檢查。
     runtime_capabilities: tuple[str, ...] = ()
+    # v4 R1（方案 A）：optional capability declaration——宣告「這張卡負責哪個 safety
+    # responsibility」。**非 self-certification**（只表達宣稱，不表達覆蓋已成立）。
+    # deck 層刻意只做結構檢查（非空字串、去重），不驗語意值域：responsibility 名稱的
+    # 唯一權威是 coordinator 的 coverage validator（`coordinator/coverage.py`），deck→
+    # coordinator 的依賴方向不反轉。不帶 `satisfies` 的現有 card 由 coverage validator
+    # 的 legacy `phase → satisfies` adapter 兜底，因此**現有 deck 檔不需改**。
+    satisfies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,6 +301,14 @@ def load_cards(path: str | Path) -> dict[str, Card]:
                 )
         if len(set(runtime_capabilities)) != len(runtime_capabilities):
             rec_errors.append(f"{cid}: runtime_capabilities 有重複宣告")
+        # v4 R1：satisfies 只做結構檢查（字串清單、非空、去重），語意值域交給
+        # coverage validator——deck 不認識 responsibility taxonomy，維持解耦。
+        satisfies = _str_tuple(rec.get("satisfies"), cid, "satisfies", rec_errors)
+        for token in satisfies:
+            if not token.strip():
+                rec_errors.append(f"{cid}: satisfies 不得含空字串")
+        if len(set(satisfies)) != len(satisfies):
+            rec_errors.append(f"{cid}: satisfies 有重複宣告")
         if rec_errors:
             errors.extend(rec_errors)
             continue
@@ -312,6 +328,7 @@ def load_cards(path: str | Path) -> dict[str, Card]:
             commit_policy=commit_policy,
             test_policy=test_policy,
             runtime_capabilities=runtime_capabilities,
+            satisfies=satisfies,
         )
     if errors:
         raise DeckSchemaError(f"cards 驗證失敗: {source}: " + "; ".join(errors))

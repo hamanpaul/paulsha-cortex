@@ -8,6 +8,16 @@
 ## [Unreleased]
 
 ### Added
+- **v4 R1（方案 A）：responsibility coverage validator 的 shadow 骨架（零行為變更）**
+  ——新增 `paulsha_cortex/coordinator/coverage.py`：新的 coverage validator 與現行
+  topology validator（`validate_manager_spine()`，未動）**並行跑、比對、記 telemetry**，
+  但 production 決策仍完全由舊 validator 主導。含 `SafetyStage` 列舉、
+  `ResponsibilityCoverage` 結構、legacy `phase → responsibility` adapter，deck card
+  schema 加 optional `satisfies`（capability declaration，非 self-certification；現有
+  deck 不需改）。shadow 掛在 `manager.py` production 派工 gate 旁，永不 raise，受
+  `PSC_RESPONSIBILITY_COVERAGE` 閘控（`off` 停用，預設 `on`）；disagreement telemetry
+  原子落 `coordinator_root()/coverage-shadow/`。詳見
+  `changelog.d/r1-coverage-validator-shadow.md`。新增 `tests/test_coverage_shadow_r1.py`。
 - **Issue #506 / D5：headless-only hook 儀器化（claude 先）——D4 spool 的第一個
   producer**——D4 開了本機事件通道卻**沒有任何 producer**：monitor 每輪掃到的永遠
   是空目錄，D1–D3 省下配額的代價（發現延遲）一分錢也沒買回來。新增
