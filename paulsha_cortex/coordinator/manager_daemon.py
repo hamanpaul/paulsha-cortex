@@ -20,6 +20,7 @@ from paulsha_cortex.config import paths
 from ..control import constants, contract
 from . import autonomy, backoff, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
+from .diagnostics import diagnostic_reason, summarize_exception
 from .dispatcher import Dispatcher
 from .model_identities import load_model_identities
 from .registry import JobRegistry
@@ -428,6 +429,25 @@ def build_runtime_status_provider(
                 slices.append(entry)
                 if entry.get("slice_state") == "needs_human":
                     attention.append(entry)
+        # #527：workflow run 過去完全不進 status——快照 provider 只走
+        # `list_slices()`，而 workflow lane 從不建立 slice row。run 停在 build
+        # 掛著 needs_human 時，`ready`／`held`／`slices`／`attention`／
+        # `recent_done` 五份清單一份都不含它，operator 無從分辨它是在等什麼、
+        # 還是已經壞掉。這裡把 ongoing 且 needs_human 的 run 投影進同一份
+        # attention 清單（連同結構化理由）。
+        list_workflow_runs = getattr(registry, "list_workflow_runs", None)
+        if callable(list_workflow_runs):
+            try:
+                runs = list(list_workflow_runs())
+            except Exception:  # noqa: BLE001 - 呈現面失效不得癱瘓整份 status
+                runs = []
+            for run in runs:
+                if (
+                    getattr(run, "status", None) != "ongoing"
+                    or "needs_human" not in getattr(run, "facets", ())
+                ):
+                    continue
+                attention.append(manager.workflow_status_entry(registry, run))
         return {
             "ready": ready,
             "held": held,
@@ -682,7 +702,7 @@ def build_request_executor(
                                 raise RuntimeError(
                                     f"{args.get('action')} produced no builder Job"
                                 )
-                        except Exception:
+                        except Exception as exc:
                             if forced_builder_retry:
                                 current = registry.get_workflow_run(run.run_id)
                                 registry._manager_update_workflow_run(
@@ -691,6 +711,15 @@ def build_request_executor(
                                         dict.fromkeys((*current.facets, "needs_human"))
                                     ),
                                     gate_status="running",
+                                    needs_human_reason=diagnostic_reason(
+                                        "forced-builder-retry-failed",
+                                        "operator 要求的 builder 重派沒有產生新 job："
+                                        f"{summarize_exception(exc)}",
+                                        source="manager_daemon._execute_request:retry-build",
+                                        run_id=run.run_id,
+                                        work_id=run.work_id,
+                                        action=str(args.get("action")),
+                                    ),
                                 )
                             raise
                         if job is not None:
@@ -1023,10 +1052,29 @@ def build_periodic_tick_runner(
                             "source_revision": workflow.source_revision,
                         },
                     )
+                    # #527 的根因就在這三行：例外只被 `_log_error` print 到
+                    # stderr，而 stderr 由 `service-manager.sh` 導向
+                    # `~/.agents/log/manager.log`——不進 journal、不進 evidence、
+                    # 不進 run。run 上只剩一個沒有理由的 `needs_human` facet，
+                    # 於是 `cortex status`／`work show`／`tick`／`complete`
+                    # 四個介面同時無話可說（實測 run
+                    # `workflow-6607ac1307feb02ffe06`：真正的原因是
+                    # `ValueError: worktree target already exists`，但 operator
+                    # 完全看不到）。exc 就在手上，寫進 run 的成本近乎零。
                     registry._manager_update_workflow_run(
                         workflow.run_id,
                         facets=("needs_human",),
                         gate_status="running",
+                        needs_human_reason=diagnostic_reason(
+                            "resume-workflow-failed",
+                            f"periodic tick 續跑 workflow 時擲出例外："
+                            f"{summarize_exception(exc)}",
+                            source="manager_daemon.periodic_tick:resume-workflow",
+                            run_id=workflow.run_id,
+                            work_id=workflow.work_id,
+                            repo=workflow.repo,
+                            phase=workflow.current_phase,
+                        ),
                     )
         metas = scan_specs_fn(specs_dir)
         _refuse_unsafe_fanout(metas, predicate, allow_unsafe=default_allow_unsafe)

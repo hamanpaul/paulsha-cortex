@@ -7,6 +7,7 @@ from typing import Any
 
 from . import verification
 from .claim import sizing_band as compute_sizing_band
+from .diagnostics import DiagnosticReason
 
 
 DEFAULT_WORKFLOW_COMBO = "feature-oneshot"
@@ -425,6 +426,22 @@ class WorkflowRun:
     # provenance，不影響既有 workflow 語意。
     resolved_model_chain: dict[str, dict[str, str]] | None = None
     combo_selection: dict[str, Any] | None = None
+    # 診斷 invariant 家族（#527／#514／#515／#511／#482）：把 run 轉入
+    # `needs_human` 的那一刻必須同時落一份結構化理由（`diagnostics.
+    # DiagnosticReason` 的 dict 投影：機器可讀 reason ＋ 人可讀 detail ＋ 來源
+    # 位置）。過去 reason 只活在 `_dispatch_workflow_card`／`resume_workflow_run`
+    # 的回傳值裡，daemon periodic tick 沒人消費回傳值，reason 隨呼叫堆疊蒸發
+    # ——run row 只剩一個查不出原因的 facet（#527 現場：四個介面同時沉默）。
+    #
+    # 這裡只**持有**理由，不做強制：強制點在 registry 的狀態轉移 API
+    # （`_manager_update_workflow_run`／`_manager_create_workflow_run`），
+    # 「忘記帶理由」因此在單元測試就炸。dataclass 這層只鎖住一條反向不變式
+    # ——**理由不得與 facet 脫鉤**（見下方 __post_init__）：facet 清掉了理由
+    # 卻留著，operator 會讀到上一輪的陳舊原因，比沒有理由更糟。
+    #
+    # 反過來「facet 有、理由沒有」則刻意放行：既有部署的狀態檔裡就躺著這種
+    # run（本 invariant 之前寫的），載入時 fail-closed 會直接把 manager 打掛。
+    needs_human_reason: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for field, value in (
@@ -597,6 +614,19 @@ class WorkflowRun:
         _validate_model_chain_override(self.model_chain_override, field_name="model_chain_override")
         _validate_model_chain_resolution(self.resolved_model_chain, field_name="resolved_model_chain")
         _validate_combo_selection(self.combo_selection)
+        if self.needs_human_reason is not None:
+            # 形狀驗證：DiagnosticReason.from_dict 自己 fail-closed（reason 必須
+            # 是 kebab-case 機器碼、detail 非空、source 為 <module>.<function>）。
+            reason = DiagnosticReason.from_dict(self.needs_human_reason)
+            if "needs_human" not in self.facets:
+                # 陳舊理由比沒有理由更糟：facet 已清掉代表阻塞已解除，理由卻還
+                # 留著會讓 `cortex status` 對一個正在跑的 run 顯示上一輪的原因。
+                # 清 facet 的呼叫端必須同時清理由（registry 的狀態轉移 API 會
+                # 自動代勞，直接 `replace()` 的呼叫端則由這條攔下）。
+                raise ValueError(
+                    "workflow run needs_human_reason 必須與 needs_human facet 同進同退"
+                )
+            object.__setattr__(self, "needs_human_reason", reason.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -652,6 +682,9 @@ class WorkflowRun:
             ),
             "combo_selection": (
                 dict(self.combo_selection) if self.combo_selection is not None else None
+            ),
+            "needs_human_reason": (
+                dict(self.needs_human_reason) if self.needs_human_reason is not None else None
             ),
         }
 
@@ -734,6 +767,14 @@ class WorkflowRun:
             model_chain_override=payload.get("model_chain_override"),
             resolved_model_chain=payload.get("resolved_model_chain"),
             combo_selection=payload.get("combo_selection"),
+            # 既有部署的狀態檔沒有這個欄位；缺席時維持 None（facet 有、理由沒有
+            # 的 legacy run 照常載入，見上方 __post_init__ 的說明）。facet 已清
+            # 掉卻殘留理由的狀態檔（手改／舊版寫壞）在此直接丟掉，避免載入即炸。
+            needs_human_reason=(
+                payload.get("needs_human_reason")
+                if "needs_human" in tuple(payload["facets"])
+                else None
+            ),
         )
 
 

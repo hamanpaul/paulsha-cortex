@@ -17,6 +17,8 @@ from paulsha_cortex.coordinator.claim import (
 )
 from paulsha_cortex.coordinator.registry import JobRegistry
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 RECOVERY_ACTION = "recover-planning"
 
 
@@ -167,6 +169,7 @@ def _seed_planning_failure_run(
         facets=("needs_human",),
         attempts={"claim": 1, "define": 1},
         evidence_refs=(failure_record,),
+        needs_human_reason=fixture_needs_human_reason(),
     )
     return run_id, registry, state, snapshot
 

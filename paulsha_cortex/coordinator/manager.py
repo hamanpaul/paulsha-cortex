@@ -39,6 +39,7 @@ from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_pro
 from .registry import slice_repin_eligible
 from ..config.paths import worktree_root_for
 from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
+from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
 from .model_identities import (
     AGY_DOMAIN,
     AGY_LIVE_PROBE,
@@ -672,6 +673,59 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
         "current_evidence_refs": list(slice_row.get("current_evidence_refs") or []),
         "current_evaluation_refs": list(slice_row.get("current_evaluation_refs") or []),
         "next_actions": allowed_slice_actions(registry, slice_row),
+        # 診斷 invariant：slice lane 的 attention 條目沿用既有的 `reason`／
+        # `provider_outcome`，沒有結構化理由可帶；`kind` 只是用來與同一份
+        # attention 清單裡的 workflow run 條目區分（#527 之前這份清單只有
+        # slice，run 完全不出現）。
+        "kind": "slice",
+        "blocking_reason": None,
+    }
+
+
+def workflow_status_entry(registry, run) -> dict[str, Any]:
+    """#527：把 `needs_human` 的 workflow run 投影成 attention 條目。
+
+    現場（run ``workflow-6607ac1307feb02ffe06``）：run 停在 build 階段掛著
+    `needs_human`，`cortex status` 的 `slices`／`ready`／`held`／`attention`
+    四份清單卻**一份都不含它**——狀態快照 provider 只走 `list_slices()`，從來
+    沒有呼叫過 `list_workflow_runs()`。`manager.reconcile_planning_transactions`
+    裡「補 needs_human facet，讓 cortex status 的 attention 清單有話說」那句
+    註解描述的投影，實際上並不存在。
+
+    欄位刻意沿用 slice 條目既有的詞彙（`slice_state`／`reason`／`next_actions`
+    ／`blocking_reason`），不另立一套平行欄位體系：既有的文字模式渲染與
+    `entry.get("slice_state") == "needs_human"` 這類過濾器因此原樣可用。
+    """
+
+    reason_payload = getattr(run, "needs_human_reason", None)
+    reason_code: str | None = None
+    if isinstance(reason_payload, dict):
+        value = reason_payload.get("reason")
+        if isinstance(value, str) and value:
+            reason_code = value
+    next_actions: tuple[str, ...] = ()
+    try:
+        from .work_actions import _build_phase_recovery_actions
+
+        next_actions = _build_phase_recovery_actions(run, registry)
+    except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
+        next_actions = ()
+    return {
+        "kind": "workflow_run",
+        "run_id": run.run_id,
+        "work_id": run.work_id,
+        "repo": run.repo,
+        "current_phase": run.current_phase,
+        "slice_state": "needs_human",
+        "gate_state": run.gate_status,
+        "reason": reason_code,
+        # 結構化理由整份帶出去（機器可讀 reason ＋ 人可讀 detail ＋ 來源位置
+        # ＋ evidence 位置）。欄位名沿用 `claim.ClaimDecision.blocking_reason`
+        # ——那是全庫既有的「為什麼卡住」欄位，不另發明。
+        "blocking_reason": dict(reason_payload) if isinstance(reason_payload, dict) else None,
+        "evidence_refs": list(run.evidence_refs),
+        "next_actions": list(next_actions),
+        "updated_at": run.updated_at,
     }
 
 
@@ -2753,27 +2807,69 @@ def _validated_brainstorm_planning_authority(
             target.relative_to(workspace)
         except ValueError as exc:
             raise ValueError("workflow brainstorm artifact escapes workspace") from exc
+        # #514：以下每一條 raise 過去都只有一句沒有主詞的英文。本函式在迴圈裡
+        # 掃多個 ref，operator 拿到訊息時完全不知道是哪一個 artifact 出問題——
+        # 而上游 `resume_workflow_run` 又把整個例外吞掉、只回一個籠統的
+        # `planning-authority-reconciliation-failed`。訊息一律補上 `ref=`。
         if not target.is_file():
-            raise ValueError("workflow brainstorm artifact hash drift")
+            raise ValueError(
+                f"workflow brainstorm artifact hash drift: ref={ref} (檔案不存在或不是一般檔案)"
+            )
         data = target.read_bytes()
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError("workflow brainstorm artifact hash drift")
+        actual_digest = hashlib.sha256(data).hexdigest()
+        if actual_digest != digest:
+            # 0814 adversarial review 的修正：「artifact 在磁碟上被改動」這個
+            # 情境**先在這裡**失敗，走不到下面的 assessment 分支。它才是
+            # revalidation 最常見的現場，因此診斷必須做在這一條上。
+            raise ValueError(
+                f"workflow brainstorm artifact hash drift: ref={ref} "
+                f"(evidence={digest[:12]}; disk={actual_digest[:12]})"
+            )
         existing = persisted.get(ref)
         if existing is None:
             if not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns):
-                raise ValueError("workflow brainstorm artifact outside planner outputs")
+                raise ValueError(
+                    f"workflow brainstorm artifact outside planner outputs: ref={ref} "
+                    f"(declared={','.join(declared_patterns) or '-'})"
+                )
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise ValueError("workflow brainstorm artifact unreadable") from exc
-            if not assess_planning_artifact(PlanningArtifact(kind=kind, ref=ref, text=text)).accepted:
-                raise ValueError("workflow brainstorm artifact is not accepted")
+                raise ValueError(
+                    f"workflow brainstorm artifact unreadable: ref={ref} "
+                    f"({type(exc).__name__}: {str(exc)[:80]})"
+                ) from exc
+            assessment = assess_planning_artifact(PlanningArtifact(kind=kind, ref=ref, text=text))
+            if not assessment.accepted:
+                # 沿用 #513 的 `(reasons=...; markers=Lnn:...; evidence=...)`
+                # 格式與 `cortex-planning-artifact-rejection/v1` evidence 落檔，
+                # 讓首次寫入拒收與重驗拒收對 operator 長得一模一樣。
+                evidence_ref = _record_planning_artifact_rejection_evidence(
+                    coordinator_root=Path(coordinator_root) if coordinator_root else None,
+                    run_id=run.run_id,
+                    work_id=run.work_id,
+                    assessment=assessment,
+                )
+                message = _planning_artifact_rejection_message(
+                    assessment, evidence_ref=evidence_ref
+                )
+                logger.error(
+                    "workflow-brainstorm-artifact-rejected run_id=%s work_id=%s %s",
+                    run.run_id,
+                    run.work_id,
+                    message,
+                )
+                raise ValueError(f"workflow brainstorm artifact is not accepted: {message}")
         elif (
             existing.kind != kind
             or existing.work_id != run.work_id
             or existing.baseline_sha256 != digest
         ):
-            raise ValueError("workflow brainstorm artifact differs from persisted authority")
+            raise ValueError(
+                f"workflow brainstorm artifact differs from persisted authority: ref={ref} "
+                f"(kind={existing.kind}→{kind}; "
+                f"baseline={existing.baseline_sha256[:12]}→{digest[:12]})"
+            )
         scanned[ref] = PlanningArtifactAuthority(
             ref=ref,
             kind=kind,
@@ -2806,7 +2902,10 @@ def _validated_brainstorm_planning_authority(
             )
         }
         if unresolved:
-            raise ValueError("workflow brainstorm evidence omits persisted authority")
+            raise ValueError(
+                "workflow brainstorm evidence omits persisted authority: refs="
+                + ",".join(sorted(unresolved)[:5])
+            )
     # `ordered` 起始自 `run.planning_authority`（即 `persisted` 的來源），
     # 因此上面被判定為合法副本的 materialized plan entry 原樣留在回傳值
     # 裡——它必須繼續存在，好讓 build worktree 透過 `_workflow_input_snapshot`
@@ -6239,6 +6338,17 @@ def reconcile_planning_transactions(
                         run.run_id,
                         facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
                         gate_status="running",
+                        needs_human_reason=diagnostic_reason(
+                            "planning-publication-drift",
+                            f"planning 發佈事務無法自動收斂：{str(exc)[:200]}",
+                            source="manager.reconcile_planning_transactions",
+                            run_id=run.run_id,
+                            # sweep 走的是 `list_workflow_runs()` 的任意 row，
+                            # 注入型測試會給不完整的替身；診斷欄位缺席不得讓
+                            # 「呈現 needs_human」這件事本身失敗。
+                            work_id=getattr(run, "work_id", None),
+                            journal=str(path),
+                        ),
                     )
                     record["surfaced"] = True
                 except Exception as surface_exc:  # noqa: BLE001 - 呈現失敗不得吃掉診斷
@@ -7593,9 +7703,31 @@ def _dispatch_workflow_card(
                 # 3）。每次 dispatch 都會重新檢查 sizing_band，band 跨帶上升
                 # 至 red 時同樣在此攔下、不會以原身分繼續推進（驗收條件 4）。
                 route = decomposition_route(decomposition_depth=run.decomposition_depth)
+                route_reason = (
+                    "decomposition-depth-exceeded"
+                    if route == "needs_human"
+                    else "needs-decomposition"
+                )
                 updated = registry._manager_update_workflow_run(
                     run.run_id,
                     facets=tuple(dict.fromkeys((*run.facets, route))),
+                    # route 為 `needs_decomposition` 時不帶理由（那不是本 invariant
+                    # 的管轄範圍，且它自己就是可讀的路由結論）；只有轉入
+                    # `needs_human`（拆分深度已達 #223 的上限、不能再拆）才落理由。
+                    needs_human_reason=(
+                        diagnostic_reason(
+                            route_reason,
+                            f"sizing_band=red 但 decomposition_depth 已達上限"
+                            f"（depth={run.decomposition_depth}），不得再拆一層",
+                            source="manager._dispatch_workflow_card:decomposition-route",
+                            run_id=run.run_id,
+                            work_id=run.work_id,
+                            sizing_band=run.sizing_band,
+                            decomposition_depth=str(run.decomposition_depth),
+                        )
+                        if route == "needs_human"
+                        else None
+                    ),
                 )
                 return {
                     "run_id": updated.run_id,
@@ -7619,7 +7751,18 @@ def _dispatch_workflow_card(
                 if gate_outcome is not None and not gate_outcome.ready:
                     if gate_outcome.terminal:
                         updated = registry._manager_update_workflow_run(
-                            run.run_id, facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                            run.run_id,
+                            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+                            needs_human_reason=diagnostic_reason(
+                                f"plan-review-{gate_outcome.failed_check}",
+                                "Yellow band 的機械 plan review 判定為終局不通過"
+                                f"（failed_check={gate_outcome.failed_check}）",
+                                source="manager._dispatch_workflow_card:plan-review",
+                                run_id=run.run_id,
+                                work_id=run.work_id,
+                                card=step.card,
+                                sizing_band=run.sizing_band,
+                            ),
                         )
                         return {
                             "run_id": updated.run_id,
@@ -7715,6 +7858,16 @@ def _dispatch_workflow_card(
         updated = registry._manager_update_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+            needs_human_reason=diagnostic_reason(
+                f"runtime-preflight-{gate.result.outcome.value}",
+                "runtime preflight 在建立 worktree／job 之前判定不可派工："
+                f"{gate.reason or gate.result.blocking_reason() or gate.result.outcome.value}",
+                source="manager._dispatch_workflow_card:runtime-preflight",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                card=step.card,
+                outcome=gate.result.outcome.value,
+            ),
         )
         return {
             "run_id": updated.run_id,
@@ -8229,9 +8382,19 @@ def resume_workflow_run(
             journal_root=Path(coordinator_root),
             run=run,
         )
-    except PlanningPublicationDrift:
+    except PlanningPublicationDrift as exc:
         updated = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), gate_status="running"
+            run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                "planning-publication-drift",
+                f"resume 前 reconcile planning 發佈事務偵測到 drift：{str(exc)[:200]}",
+                source="manager.resume_workflow_run:planning-publication-drift",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                phase=run.current_phase,
+            ),
         )
         return {
             "run_id": updated.run_id,
@@ -8249,12 +8412,26 @@ def resume_workflow_run(
                     coordinator_root=coordinator_root,
                 )
             )
-        except ValueError:
+        except ValueError as exc:
             current = registry.get_workflow_run(run.run_id)
             updated = registry._manager_update_workflow_run(
                 run.run_id,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
                 gate_status=pre_resume_gate_status,
+                # #514：這條路徑過去把例外整個丟掉，run 上只留下
+                # `planning-authority-reconciliation-failed` 這個籠統的回傳值
+                # （而回傳值在 daemon periodic tick 根本沒人消費）。
+                # `_validated_brainstorm_planning_authority` 現在會把 ref、
+                # assessment reasons 與 blocking marker 行號寫進例外訊息，
+                # 這裡原樣透傳進 run 的結構化理由。
+                needs_human_reason=diagnostic_reason(
+                    "planning-authority-reconciliation-failed",
+                    f"已發佈 planning artifact 的重驗失敗：{summarize_exception(exc, limit=300)}",
+                    source="manager.resume_workflow_run:planning-authority",
+                    run_id=run.run_id,
+                    work_id=run.work_id,
+                    phase=run.current_phase,
+                ),
             )
             return {
                 "run_id": updated.run_id,
@@ -8298,12 +8475,21 @@ def resume_workflow_run(
                 retry_failed=retry,
                 spawn_admission=spawn_admission,
             )
-        except Exception:
+        except Exception as exc:
             current = registry.get_workflow_run(bound_run.run_id)
             registry._manager_update_workflow_run(
                 bound_run.run_id,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
                 gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "workflow-card-dispatch-failed",
+                    f"派工卡片時擲出例外：{summarize_exception(exc)}",
+                    source="manager.resume_workflow_run:dispatch_or_stop",
+                    run_id=bound_run.run_id,
+                    work_id=bound_run.work_id,
+                    phase=bound_run.current_phase,
+                    retry="true" if retry else "false",
+                ),
             )
             raise
 
@@ -8346,6 +8532,14 @@ def resume_workflow_run(
                     run.run_id,
                     facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
                     gate_status="failed",
+                    needs_human_reason=diagnostic_reason(
+                        "review-advance-failed",
+                        f"review→ship 的 advance 擲出例外：{summarize_exception(exc)}",
+                        source="manager.resume_workflow_run:review-advance",
+                        run_id=run.run_id,
+                        work_id=run.work_id,
+                        card=last.card,
+                    ),
                 )
                 raise
         if run.current_phase == "ship" and run.status == "done" and post_merge_closure:
@@ -8473,7 +8667,19 @@ def resume_workflow_run(
                 }
             failure_reason = "provider-retry-exhausted"
         updated = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), gate_status="running"
+            run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                failure_reason,
+                "builder/reviewer job 以 provider 層失敗終局，"
+                f"bounded retry 已耗盡或不可重試：{diagnostics.reason or failure_reason}",
+                source="manager._poll_workflow_job:provider-failure",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=str(job["job_id"]),
+                card=step.card,
+            ),
         )
         return {
             "run_id": run.run_id,
@@ -8502,6 +8708,18 @@ def resume_workflow_run(
                 run.run_id,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
                 gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "card-terminal-schema-retry-exhausted",
+                    "同一張卡的 terminal envelope 連續 schema mismatch 已達上限"
+                    f"（{seen}/{terminal_contract.MAX_SCHEMA_RETRIES}）："
+                    f"{diagnostics.reason or 'terminal envelope 不符契約'}",
+                    source="manager._poll_workflow_job:schema-retry",
+                    run_id=run.run_id,
+                    work_id=run.work_id,
+                    job_id=str(job["job_id"]),
+                    card=step.card,
+                    validation_path=diagnostics.validation_path,
+                ),
             )
             return {
                 "run_id": run.run_id,
@@ -8541,7 +8759,7 @@ def resume_workflow_run(
             job_id=str(job["job_id"]),
             coordinator_root=coordinator_root,
         )
-    except Exception:
+    except Exception as exc:
         _discard_reviewer_sandbox(
             registry.get_job(str(job["job_id"])),
             coordinator_root=coordinator_root,
@@ -8552,6 +8770,15 @@ def resume_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
             gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                "terminalize-workflow-job-failed",
+                f"採信 terminal envelope 時擲出例外：{summarize_exception(exc)}",
+                source="manager._poll_workflow_job:terminalize",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=str(job["job_id"]),
+                card=step.card,
+            ),
         )
         raise
     phase_steps = [item for item in run.steps if item.phase == run.current_phase]
@@ -8591,6 +8818,16 @@ def resume_workflow_run(
             run.run_id,
             facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
             gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                "workflow-advance-failed",
+                f"卡片通過後推進 workflow 擲出例外：{summarize_exception(exc)}",
+                source="manager._poll_workflow_job:advance",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=str(job["job_id"]),
+                card=step.card,
+                next_phase=next_phase,
+            ),
         )
         raise
     updated = registry.get_workflow_run(run.run_id)
@@ -8850,7 +9087,18 @@ def apply_workflow_action(
                     raise ValueError("local Copilot evidence is never trusted")
                 if ship_validator is None:
                     updated = registry._manager_update_workflow_run(
-                        run_id, facets=("needs_human",), gate_status="running"
+                        run_id,
+                        facets=("needs_human",),
+                        gate_status="running",
+                        needs_human_reason=diagnostic_reason(
+                            "ship-validator-unavailable",
+                            "review→ship 需要 ship validator 判定交付狀態，"
+                            "但呼叫端沒有提供（無法自行採信本地 Copilot 證據）",
+                            source="manager.apply_workflow_action:advance-ship",
+                            run_id=run_id,
+                            work_id=current.work_id,
+                            card=card_id,
+                        ),
                     )
                     return {
                         "run_id": updated.run_id,
@@ -8881,13 +9129,27 @@ def apply_workflow_action(
                         "reason": "delivery-in-progress",
                     }
                 if status == "needs_human":
+                    delivery_reason = trusted.get("reason") or "delivery-needs-human"
                     updated = registry._manager_update_workflow_run(
-                        run_id, facets=("needs_human",), gate_status="running"
+                        run_id,
+                        facets=("needs_human",),
+                        gate_status="running",
+                        needs_human_reason=diagnostic_reason(
+                            "delivery-needs-human",
+                            "ship validator 判定交付需要人工介入："
+                            f"{delivery_reason}",
+                            source="manager.apply_workflow_action:advance-ship",
+                            run_id=run_id,
+                            work_id=current.work_id,
+                            card=card_id,
+                            candidate=current.candidate_head,
+                            delivery_reason=str(delivery_reason),
+                        ),
                     )
                     return {
                         "run_id": updated.run_id,
                         "current_phase": updated.current_phase,
-                        "reason": trusted.get("reason") or "delivery-needs-human",
+                        "reason": delivery_reason,
                     }
                 refs = {item.kind: item for item in current.gate_refs}
                 review_kind = trusted["review_kind"]
@@ -9058,6 +9320,17 @@ def apply_workflow_action(
                 candidate_head=candidate,
                 verified_head=verified,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+                needs_human_reason=diagnostic_reason(
+                    "blocking-findings",
+                    "reviewer 對 candidate 提出阻擋性 findings"
+                    f"（{len(evaluation.get('findings') or ())} 條），review gate 判定 rejected",
+                    source="manager.apply_workflow_action:advance-review",
+                    run_id=run_id,
+                    work_id=current.work_id,
+                    card=card_id,
+                    candidate=candidate,
+                    evidence_refs=(evidence_path,) if evidence_path else (),
+                ),
             )
             return {
                 "run_id": updated.run_id,
@@ -9079,11 +9352,23 @@ def apply_workflow_action(
             validate_workflow_phase_transition(current.current_phase, next_phase)
         facets = current.facets
         gate_status = current.gate_status
+        # 診斷 invariant：下面兩條會把 run 推進 needs_human 的分支各自帶上理由，
+        # 交給同一個 `_manager_update_workflow_run` 呼叫寫入（見結尾）。
+        facets_reason = None
         if current.current_phase == "review" and phase_done and next_phase == "ship":
             if ship_validator is None:
                 next_phase = "review"
                 facets = ("needs_human",)
                 gate_status = "running"
+                facets_reason = diagnostic_reason(
+                    "ship-validator-unavailable",
+                    "review 全數通過但呼叫端未提供 ship validator，"
+                    "無法判定交付狀態（本地 Copilot 證據一律不採信）",
+                    source="manager.apply_workflow_action:advance-phase",
+                    run_id=run_id,
+                    work_id=current.work_id,
+                    card=card_id,
+                )
             else:
                 status, trusted = validate_ship_result(
                     ship_validator(run=current, candidate=candidate),
@@ -9117,9 +9402,20 @@ def apply_workflow_action(
                     next_phase = "review"
                     gate_status = "running"
                     facets = ("needs_human",)
+                    facets_reason = diagnostic_reason(
+                        "delivery-needs-human",
+                        "ship validator 判定交付需要人工介入："
+                        f"{trusted.get('reason') or 'delivery-needs-human'}",
+                        source="manager.apply_workflow_action:advance-phase",
+                        run_id=run_id,
+                        work_id=current.work_id,
+                        card=card_id,
+                        candidate=candidate,
+                    )
         updated = registry._manager_update_workflow_run(
             run_id,
             current_phase=next_phase,
+            needs_human_reason=facets_reason,
             steps=(
                 _validated_ship_steps(
                     registry,
@@ -9275,9 +9571,19 @@ def apply_workflow_action(
             journal_root=transaction_root,
             run=run,
         )
-    except PlanningPublicationDrift:
+    except PlanningPublicationDrift as exc:
         run = registry._manager_update_workflow_run(
-            run.run_id, facets=("needs_human",), gate_status="running"
+            run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                "planning-publication-drift",
+                f"start 前 reconcile planning 發佈事務偵測到 drift：{str(exc)[:200]}",
+                source="manager.apply_workflow_action:start",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                artifact_root=str(artifact_root),
+            ),
         )
         return {
             "run_id": run.run_id,
@@ -9367,6 +9673,15 @@ def apply_workflow_action(
                 facets=("needs_human",),
                 brainstorm_required=True,
                 evidence_refs=evidence_refs,
+                needs_human_reason=diagnostic_reason(
+                    "planning-runtime-initialization-failed",
+                    f"planning runtime 初始化失敗：{summarize_exception(exc)}",
+                    source="manager.apply_workflow_action:start-planning-runtime",
+                    evidence_refs=evidence_refs,
+                    run_id=run.run_id,
+                    work_id=run.work_id,
+                    classification="environment",
+                ),
             )
             # #391：needs_human 的 reason 過去只塞進回傳值——daemon periodic
             # tick 觸發時（未經活人在旁的 request/response）沒人消費回傳值，
@@ -9406,6 +9721,16 @@ def apply_workflow_action(
             facets=("needs_human",),
             brainstorm_required=True,
             evidence_refs=evidence_refs,
+            needs_human_reason=diagnostic_reason(
+                "planning-runtime-unavailable",
+                "planning runtime 三個角色（primary_questioner／secondary_planner／"
+                "primary_integrator）未齊備，brainstorm 無法啟動",
+                source="manager.apply_workflow_action:start-planning-runtime",
+                evidence_refs=evidence_refs,
+                run_id=run.run_id,
+                work_id=run.work_id,
+                classification="environment",
+            ),
         )
         # #391：runtime_factory 沒被呼叫（或呼叫成功但沒補齊三個角色）時同樣
         # 落一筆 log，理由同上——reason 不能只活在回傳值裡。
@@ -9457,6 +9782,16 @@ def apply_workflow_action(
             coordinator_root=transaction_root,
         ),
         evidence_writer=publication.write_evidence,
+        # #515：post-integration 檢查判定 artifact 不合驗收條件時，被拒內容會在
+        # 緊接著的 `rollback_publication()` 被撤下——不先存一份，operator 就再也
+        # 看不到 planner 到底寫了什麼（#511 的同一個教訓）。沿用 #513 已建立的
+        # `cortex-planning-artifact-rejection/v1` evidence 落檔，不另創格式。
+        rejection_recorder=lambda assessment: _record_planning_artifact_rejection_evidence(
+            coordinator_root=transaction_root,
+            run_id=run.run_id,
+            work_id=run.work_id,
+            assessment=assessment,
+        ),
         # #535：brainstorm evidence 的 content-addressed 命名納入 run identity，
         # 前一世代（已 abandon）的殘留檔才不會佔住新世代的落點。前代檔案原位
         # 保留、原路徑仍可稽核——evidence 不搬不刪。
@@ -9482,15 +9817,34 @@ def apply_workflow_action(
         # worktree 在 planning 視窗內被動過。#543 之後 drift 不再銷毀任何資料
         # （只備份與報告），語意上就是環境事件，同歸 `environment`。
         brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
+        # #554／PR #560：分類收斂進具名的 `_classify_planning_failure`（reason →
+        # classification 的單一可測入口，含 worktree drift 的 environment 例外）。
+        # 這裡把它 hoist 成區域變數，好讓 evidence 與 needs_human_reason 兩者
+        # 引用**同一個**判定結果，不各算一次。
+        brainstorm_classification = _classify_planning_failure(brainstorm_not_ready_reason)
+        brainstorm_evidence_refs = _record_planning_failure_evidence(
+            run,
+            coordinator_root=transaction_root,
+            classification=brainstorm_classification,
+            reason=brainstorm_not_ready_reason,
+        )
         run = registry._manager_update_workflow_run(
             run.run_id,
             facets=("needs_human",),
             brainstorm_required=True,
-            evidence_refs=_record_planning_failure_evidence(
-                run,
-                coordinator_root=transaction_root,
-                classification=_classify_planning_failure(brainstorm_not_ready_reason),
-                reason=brainstorm_not_ready_reason,
+            evidence_refs=brainstorm_evidence_refs,
+            # #515／#511：`result.reason` 現在帶得動實際的拒收原因（哪一個
+            # artifact、哪一條驗收條件、還是環境類的路徑／編碼問題），不再是
+            # 一個籠統的 `primary-artifact-invalid`。這裡把它原樣落進 run，
+            # operator 不必再從 `~/.agents/log` 反推。
+            needs_human_reason=diagnostic_reason(
+                "brainstorm-not-ready",
+                f"brainstorm 未收斂（state={result.state}）：{brainstorm_not_ready_reason}",
+                source="manager.apply_workflow_action:start-brainstorm",
+                evidence_refs=brainstorm_evidence_refs,
+                run_id=run.run_id,
+                work_id=run.work_id,
+                classification=brainstorm_classification,
             ),
         )
         # #391：run_heterogeneous_brainstorm 沒能收斂到 ready 狀態時，同樣的

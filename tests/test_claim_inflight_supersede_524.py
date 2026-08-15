@@ -40,6 +40,8 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.work_bridge import _artifact_rows
 from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 _REPO = "acme/demo"
 _WORK_ID = "fix-inflight-supersede"
 
@@ -188,7 +190,7 @@ def test_failed_run_stays_reclaimable(tmp_path: Path) -> None:
         registry=registry, starter=starter, authority=before, state_path=state, action="start"
     )
     run_id = first["run"]["run_id"]
-    registry._manager_update_workflow_run(run_id, facets=("needs_human",))
+    registry._manager_update_workflow_run(run_id, facets=("needs_human",), needs_human_reason=fixture_needs_human_reason())
 
     after = load_work_authority(
         repo=_REPO,

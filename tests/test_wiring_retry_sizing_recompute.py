@@ -23,6 +23,8 @@ from paulsha_cortex.coordinator import work_actions
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority, WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 HEAD = "b" * 40
 
 _PERSONA_BY_PHASE = {
@@ -167,6 +169,9 @@ def _make_run(
         candidate_head=candidate_head,
         verified_head=verified_head,
         facets=facets,
+        needs_human_reason=(
+            fixture_needs_human_reason() if "needs_human" in facets else None
+        ),
         gate_status="running",
         planning_authority=planning_authority,
         sizing_score=sizing_score,

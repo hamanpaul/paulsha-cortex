@@ -45,6 +45,8 @@ from paulsha_cortex.deck.schema import (
 )
 from paulsha_cortex.porcelain import recover as porcelain_recover
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 HEAD = "d" * 40
 REPO = "acme/demo"
@@ -137,6 +139,7 @@ def _stuck_run(tmp_path: Path, *, stopped_at: str = "tdd-red"):
         attempts={"build": 1},
         facets=("needs_human",),
         gate_status="failed",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     # worktree-isolation 已錨定 candidate（現場即如此，所以 recover-pre-candidate
     # 也走不通）。
@@ -507,6 +510,7 @@ def test_retry_build_final_card_semantics_do_not_regress(tmp_path: Path) -> None
         attempts={"build": 1},
         facets=("needs_human",),
         gate_status="failed",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     unbound = registry.create_job(
         task="wf-subagent-build",

@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from hashlib import sha256
@@ -178,6 +179,58 @@ def review_verdict_path(worktree: str | Path) -> Path:
     return Path(worktree).resolve() / REVIEW_VERDICT_FILENAME
 
 
+# --- issue #482：pre-launch absent evaluation 的命名空間 ----------------------
+#
+# 修法前 absent 的落點只由 `(slice_id, builder_job_id, candidate)` 決定——
+# `reviewer_job_id` 在 reviewer job 誕生**之前**恆為 None，於是同一個 candidate
+# 的每一次 pre-launch 失敗都指向同一個 `...-absent.json`。實測現場：
+#
+#   1. builder 驗證完成、沒有 review identity → 寫下 `reviewer-identity-missing`
+#      （launch_identity 兩邊都是 null）。
+#   2. operator 依系統自己宣告的 next action 執行
+#      `cortex slice-action <slice> retry-review --review-executor codex
+#       --review-model <model>`。
+#   3. 該 identity 尚未註冊 → reviewer 選擇正確地改判
+#      `reviewer-identity-unknown`（launch_identity.builder 這次有值）。
+#   4. `write_gate_evaluation()` 解析到**同一個路徑**、看到不同 payload，
+#      raise `immutable gate evaluation already exists`。
+#
+# 沒有 reviewer job 被建立，官方復原動作因此無法回傳一個 typed absent 結果——
+# 而 immutable writer 本身是對的，錯的是 key 設計：它把「為什麼 absent」這件事
+# 排除在 identity 之外。修法即 issue 的第一項驗收條件——把**原因與請求身分**
+# 納入路徑，於是：
+#
+#   - 同原因＋同身分 → 同路徑 → byte-identical → 維持既有的冪等重寫語意；
+#   - 不同原因或不同身分 → 不同路徑 → 前一份 absent evidence 原位保留、
+#     新結果照常落地（`missing → unknown → registered` 這條合法的設定推進不再
+#     需要刪 evidence 才能前進）。
+#
+# **範圍**：只改 absent 這一支的命名。reviewer job 已存在時的
+# `{slice_id}-{reviewer_job_id}.json` 一字未動——那條路徑的 job id 重用碰撞是
+# 另一個獨立缺陷（見 issue #482 的 0812 留言），改它會動到 workflow lane 已
+# 落地的全部 evidence 路徑，不在本次診斷修正的範圍內。
+ABSENT_EVALUATION_KEY_LENGTH = 12
+
+
+def absent_evaluation_key(*, reason: str, launch_identity: Mapping[str, Any] | None) -> str:
+    """pre-launch absent evaluation 的原因＋身分指紋。
+
+    以 canonical JSON hash 取前 12 字元；輸入刻意只有 ``reason`` 與
+    ``launch_identity`` 兩項——它們正是同一個 `(slice, builder job, candidate)`
+    之下**唯一會變**的東西，也正是過去被排除在 key 之外、因而造成碰撞的東西。
+    """
+
+    if not isinstance(reason, str) or not reason:
+        raise ValueError("absent evaluation reason must be a non-empty string")
+    identity = launch_identity if isinstance(launch_identity, Mapping) else {}
+    fingerprint = {
+        "reason": reason,
+        "builder": identity.get("builder"),
+        "reviewer": identity.get("reviewer"),
+    }
+    return verification.canonical_json_hash(fingerprint)[:ABSENT_EVALUATION_KEY_LENGTH]
+
+
 def gate_evaluation_path(
     *,
     slice_id: str,
@@ -185,12 +238,17 @@ def gate_evaluation_path(
     candidate: str,
     reviewer_job_id: str | None,
     coordinator_root: str | Path | None = None,
+    absent_key: str | None = None,
 ) -> Path:
     root = Path(coordinator_root) if coordinator_root is not None else paths.coordinator_root()
     if verification.SAFE_SHA_RE.fullmatch(candidate) is None:
         raise ValueError(f"unsafe candidate: {candidate!r}")
     if reviewer_job_id is None:
         suffix = f"{builder_job_id}-{candidate.lower()[:12]}-absent"
+        if absent_key is not None:
+            if re.fullmatch(r"[0-9a-f]{4,64}", absent_key) is None:
+                raise ValueError(f"unsafe absent evaluation key: {absent_key!r}")
+            suffix = f"{suffix}-{absent_key}"
     else:
         suffix = reviewer_job_id
     return root.resolve() / "evidence" / "review" / f"{slice_id}-{suffix}.json"
@@ -728,6 +786,16 @@ def write_gate_evaluation(
         candidate=payload["candidate"],
         reviewer_job_id=payload.get("reviewer_job_id"),
         coordinator_root=coordinator_root,
+        # #482：只有 pre-launch absent（尚無 reviewer job）需要這把鑰匙——
+        # 它把「為什麼 absent」與「請求了誰當 reviewer」納入命名空間。
+        absent_key=(
+            absent_evaluation_key(
+                reason=payload["reason"],
+                launch_identity=payload.get("launch_identity"),
+            )
+            if payload.get("reviewer_job_id") is None
+            else None
+        ),
     )
     content_hash = verification.canonical_json_hash(payload)
     if path.exists():

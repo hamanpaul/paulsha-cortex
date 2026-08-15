@@ -21,6 +21,8 @@ from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 ACTION = "recover-repair-commit"
 
 _PERSONA_BY_PHASE = {
@@ -140,6 +142,9 @@ def _make_run(
         openspec_refs=authority.mapped_openspec,
         candidate_head=candidate_head,
         facets=facets,
+        needs_human_reason=(
+            fixture_needs_human_reason() if "needs_human" in facets else None
+        ),
         gate_status="running",
     )
 

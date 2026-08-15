@@ -17,6 +17,8 @@ from paulsha_cortex.coordinator.workflow import (
     validate_ship_stage_transition,
 )
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 def _legacy_v1_payload() -> dict[str, object]:
     job = {"job_id": "legacy-build-1", "status": "exited", "task": "legacy-build"}
@@ -88,6 +90,7 @@ def _create_run(registry: JobRegistry) -> WorkflowRun:
                 baseline_sha256="a" * 64,
             ),
         ),
+        needs_human_reason=fixture_needs_human_reason(),
     )
 
 

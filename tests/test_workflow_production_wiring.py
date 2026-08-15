@@ -36,6 +36,8 @@ from paulsha_cortex.coordinator.workflow import (
 from paulsha_cortex.deck.compile import compile_combo, emit
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 def _gate_ledger_passed(log_path, *, gates: list[dict[str, object]] | None = None) -> None:
     """#261：模擬 manager wrapper 在模型行程結束後寫下的 gate ledger。
@@ -635,6 +637,7 @@ def test_public_work_resume_preserves_define_retry_result(
         facets=("needs_human",),
         brainstorm_required=True,
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
     monkeypatch.setattr(
@@ -1006,6 +1009,7 @@ def test_periodic_resume_does_not_clear_needs_human_or_retry(tmp_path: Path) -> 
         attempts={"build": 1},
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
 
@@ -1225,6 +1229,7 @@ def test_post_merge_closure_skips_active_planning_path_reconciliation(
         facets=("needs_human",),
         gate_status="failed",
         brainstorm_required=True,
+        needs_human_reason=fixture_needs_human_reason(),
     )
     (tmp_path / "delivery-journal.json").write_text(
         json.dumps(
@@ -1535,6 +1540,7 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         attempts={"build": 1},
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     log = tmp_path / "needs-human.jsonl"
     log.write_text(json.dumps({
@@ -1644,6 +1650,7 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
         run.run_id,
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
 
     result = manager.resume_workflow_run(
@@ -1919,6 +1926,7 @@ def test_operator_resume_recovers_only_exact_legacy_agy_reviewer_terminal(
         attempts={"verify": 1},
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     builder = registry.create_job(
         task="wf-builder",
@@ -2287,6 +2295,7 @@ def test_operator_resume_reconciles_brainstorm_artifact_authority_before_dispatc
             GateEvidenceRef("brainstorm", str(evidence), manager._sha256_path(evidence)),
         ),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
     legacy_state["workflows"][0].pop("planning_source_revision")
@@ -2361,6 +2370,7 @@ def test_brainstorm_required_without_evidence_stays_stopped_before_dispatch(
         facets=("needs_human",),
         gate_status="running",
         brainstorm_required=True,
+        needs_human_reason=fixture_needs_human_reason(),
     )
     dispatched: list[str] = []
     monkeypatch.setattr(
@@ -2688,6 +2698,7 @@ def test_operator_resume_dispatch_error_restores_needs_human(
         attempts={"build": 1},
         facets=("needs_human", "degraded"),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     monkeypatch.setattr(
         manager,
@@ -3322,6 +3333,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         steps=replay_steps,
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     jobs_before_replay = len(registry.list_jobs())
     replayed = executor(build_request(
@@ -5129,6 +5141,7 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
         attempts={"verify": 1},
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     builder = registry.create_job(
         task="wf-builder",

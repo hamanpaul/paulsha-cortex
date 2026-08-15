@@ -465,7 +465,12 @@ def test_brainstorm_is_heterogeneous_persists_immutable_peer_evidence_and_keeps_
         secondary_planner=secondary_evidence,
         primary_integrator=primary_integrator,
     )
-    assert (unsafe.state, unsafe.reason) == ("needs_human", "primary-artifact-invalid")
+    # #515：`primary-artifact-invalid` 不再是一個沒有附加資訊的字面值——
+    # 環境類（路徑逃出 artifact root）與內容類（assessment 不合格）現在分得開，
+    # 且訊息帶得出是哪一個 ref。
+    assert unsafe.state == "needs_human"
+    assert unsafe.reason.startswith("primary-artifact-invalid: artifact-path-escapes-root")
+    assert "ref=../outside-root.md" in unsafe.reason
 
 
 def test_brainstorm_fails_closed_when_no_heterogeneous_peer_or_output_is_malformed(tmp_path: Path) -> None:
@@ -791,7 +796,10 @@ def test_primary_must_write_accepted_artifacts_before_brainstorm_gate_passes(tmp
         primary_integrator=integration,
     )
 
-    assert (result.state, result.reason) == ("needs_human", "primary-artifact-invalid")
+    # #515：整合階段宣稱的 artifact 根本沒落到磁碟上——過去與「內容不合驗收
+    # 條件」共用同一個 `primary-artifact-invalid`，現在分得開。
+    assert result.state == "needs_human"
+    assert result.reason.startswith("primary-artifact-invalid: artifact-not-a-regular-file")
     assert not (tmp_path / "evidence").exists()
 
     blocked_path = tmp_path / "docs/spec-blocked.md"
@@ -840,7 +848,12 @@ def test_primary_must_write_accepted_artifacts_before_brainstorm_gate_passes(tmp
         secondary_planner=secondary,
         primary_integrator=leaves_original_blocker,
     )
-    assert (blocker_result.state, blocker_result.reason) == (
-        "needs_human",
-        "primary-artifact-invalid",
+    # #515：這個 fixture 過去只斷言籠統的 `primary-artifact-invalid`，因而遮住
+    # 了它**真正**卡在哪裡——不是 blocking marker，而是 `docs/design.md` 這個
+    # 既有 artifact 根本沒落到磁碟上（fixture 只在記憶體裡造了 report）。
+    # reason 現在說得出 ref 與類別，正是本 issue 要修的東西。
+    assert blocker_result.state == "needs_human"
+    assert blocker_result.reason.startswith(
+        "primary-artifact-invalid: artifact-not-a-regular-file"
     )
+    assert "ref=docs/design.md" in blocker_result.reason

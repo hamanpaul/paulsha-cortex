@@ -23,6 +23,8 @@ from paulsha_cortex.coordinator import work_actions
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import PlanningArtifactAuthority, WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 HEAD = "b" * 40
 NOW = "2026-07-27T00:00:00+00:00"
@@ -137,6 +139,9 @@ def _make_run(
         candidate_head=candidate_head,
         verified_head=verified_head,
         facets=facets,
+        needs_human_reason=(
+            fixture_needs_human_reason() if "needs_human" in facets else None
+        ),
         gate_status="running",
         planning_authority=planning_authority,
     )
@@ -665,7 +670,10 @@ def test_repeated_automatic_scan_on_unchanged_authority_does_not_retrigger_resta
     # mismatch 後，manager_daemon.py 的 except handler 把 needs_human 寫回
     # （見 manager_daemon.py 的 resume 迴圈 except 分支）。
     registry._manager_update_workflow_run(
-        run.run_id, facets=("needs_human",), gate_status="running"
+        run.run_id,
+        facets=("needs_human",),
+        gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
 
     # Tick 2～4：authority 完全沒再變（模擬後續多次 daemon tick，snapshot 沒

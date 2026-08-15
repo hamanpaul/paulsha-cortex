@@ -108,6 +108,23 @@ def _print_status(status: dict[str, Any]) -> None:
             f"  provider_failure[{entry.get('slice_id', '-')}]: {outcome.get('outcome')} "
             f"(authority={outcome.get('authority')}, retryable={outcome.get('retryable')})\n"
         )
+    # 診斷 invariant（#527／#514／#515／#511／#482）：把 run 轉入 needs_human 的
+    # 那一刻必須落一份結構化理由。既然理由已經在 attention 條目上，文字模式就
+    # 該直接印出來——五個現場的共同症狀正是「理由存在於某處，但沒有任何一個
+    # operator 會看的介面印它」。格式比照上面的 provider_failure 摘要行。
+    for entry in status.get("attention", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        blocking = entry.get("blocking_reason")
+        if not isinstance(blocking, dict) or not blocking.get("reason"):
+            continue
+        subject = entry.get("run_id") or entry.get("slice_id") or "-"
+        sys.stdout.write(
+            f"  needs_human[{subject}]: {blocking.get('reason')}: {blocking.get('detail')} "
+            f"(source={blocking.get('source')})\n"
+        )
+        for ref in blocking.get("evidence_refs") or []:
+            sys.stdout.write(f"    evidence: {ref}\n")
     sys.stdout.write(
         "in_flight: " + json.dumps(status.get("in_flight", []), ensure_ascii=False, sort_keys=True) + "\n"
     )

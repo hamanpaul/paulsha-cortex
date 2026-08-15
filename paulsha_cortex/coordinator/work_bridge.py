@@ -39,6 +39,7 @@ from .claim import (
     sizing_band,
     work_authority_digest,
 )
+from .diagnostics import diagnostic_reason
 from .github_delivery import GitHubDeliveryClient
 from .model_identities import IdentityRegistry, load_model_identities
 from .planning import (
@@ -468,6 +469,17 @@ def start_canonical_workflow(
             sizing_band=claim_sizing_band,
             model_chain_override=effective_model_chain_override,
             combo_selection=_combo_selection_payload(combo_selection),
+            # 診斷 invariant：`needs_human_reason` 本來就是這條路徑的參數名，
+            # 過去只是個沒有落地的字串——run 建出來就掛 needs_human，理由卻
+            # 留在呼叫端。這裡把它升格成結構化理由寫進 run。
+            needs_human_reason=diagnostic_reason(
+                "claim-blocked",
+                f"claim 判定需要人工介入即建立 run：{needs_human_reason}",
+                source="work_bridge.start_workflow_for_authority",
+                work_id=authority.work_id,
+                repo=authority.repo,
+                claim_key=claim_key,
+            ),
         )
         return run
     manifest_path = _write_manifest(Path(coordinator_root), claim_key, manifest)

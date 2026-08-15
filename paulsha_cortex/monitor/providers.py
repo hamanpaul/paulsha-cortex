@@ -286,6 +286,7 @@ class WorkflowRegistryProvider:
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
             schema_retry: dict[str, dict[str, int]] = {}
+            needs_human_reasons: dict[str, dict[str, object]] = {}
             diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
@@ -323,6 +324,15 @@ class WorkflowRegistryProvider:
                 retry_rows = _schema_retry_rows(row.get("attempts"))
                 if retry_rows:
                     schema_retry.setdefault(work_id, {}).update(retry_rows)
+                # 診斷 invariant（#527）：run 掛著 needs_human 時，把它的結構化
+                # 理由帶進 observations，`cortex work show` 才有得印。手法比照
+                # 上面的 `schema_retry`——資料走既有的 observations 通道隨
+                # snapshot round-trip，不必在 WorkItem／WorkSnapshot 上新增欄位
+                # （新增欄位會讓每個 row 落在 `_WORKFLOW_V2_OPTIONAL_ROW_KEYS`
+                # 之外而讓整份 projection degraded，#261 已付過這個學費）。
+                blocking = _needs_human_reason_row(row)
+                if blocking is not None:
+                    needs_human_reasons[work_id] = {"run_id": run_id, **blocking}
                 if status != "superseded":
                     for ref in row.get("issue_refs", []):
                         _add_workflow_link(links, f"github_issue:{ref}", work_id)
@@ -360,6 +370,7 @@ class WorkflowRegistryProvider:
                 "workflow_links": links,
                 "validated_completions": validated_completions,
                 "schema_retry": schema_retry,
+                "needs_human_reasons": needs_human_reasons,
             },
         )
 
@@ -381,6 +392,40 @@ def _schema_retry_rows(attempts: object) -> dict[str, int]:
             continue
         rows[key[len(SCHEMA_RETRY_ATTEMPT_PREFIX):]] = value
     return rows
+
+
+def _needs_human_reason_row(row: Mapping[str, Any]) -> dict[str, object] | None:
+    """診斷 invariant（#527）：從 run row 取出 needs_human 的結構化理由。
+
+    只在 run 仍 ongoing 且確實掛著 `needs_human` 時回傳——已 done／superseded 的
+    run 的舊理由不該出現在 `cortex work show` 上。缺欄位（本 invariant 之前寫的
+    legacy run）回傳 ``None``，讓呈現面自然退回舊行為，不 fail-closed：
+    provider 一旦 degraded，整個 work item 的讀模型都會被凍住（#523）。
+    """
+
+    if row.get("status", "ongoing") != "ongoing":
+        return None
+    facets = row.get("facets")
+    if not isinstance(facets, (list, tuple)) or "needs_human" not in facets:
+        return None
+    payload = row.get("needs_human_reason")
+    if not isinstance(payload, Mapping):
+        return None
+    reason = payload.get("reason")
+    detail = payload.get("detail")
+    source = payload.get("source")
+    if not all(isinstance(item, str) and item for item in (reason, detail, source)):
+        return None
+    evidence_refs = payload.get("evidence_refs")
+    return {
+        "reason": reason,
+        "detail": detail,
+        "source": source,
+        "recorded_at": payload.get("recorded_at"),
+        "evidence_refs": [
+            item for item in (evidence_refs or []) if isinstance(item, str) and item
+        ],
+    }
 
 
 def _nonempty(value: object, field: str) -> str:
@@ -422,6 +467,12 @@ _WORKFLOW_V2_OPTIONAL_ROW_KEYS = frozenset(
         "model_chain_override", "resolved_model_chain",
         # #202：combo 選牌來源／task_type／bypass reason 的 provenance-only 欄位。
         "combo_selection",
+        # 診斷 invariant（#527／#514／#515／#511／#482）：run 被轉入 needs_human
+        # 時同時落地的結構化理由（機器可讀 reason ＋ 人可讀 detail ＋ 來源位置）。
+        # **必須列在這裡**：這個 whitelist 是封閉的，漏掉會讓每一個 run row 都被
+        # 判成「含不支援的欄位」，整份 workflow projection 因此 degraded——那正是
+        # #261 D5 選擇把 schema retry 計數塞進既有 `attempts` 而不新增欄位的原因。
+        "needs_human_reason",
     }
 )
 

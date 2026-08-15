@@ -15,6 +15,8 @@ import pytest
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 CLAIM_KEY = "claim:v1:" + "c" * 64
 
 
@@ -47,6 +49,8 @@ def _create_run(registry: JobRegistry, **overrides: object):
         "facets": ("needs_human",),
     }
     fields.update(overrides)
+    if "needs_human" in tuple(fields.get("facets") or ()):
+        fields.setdefault("needs_human_reason", fixture_needs_human_reason())
     return registry._manager_create_workflow_run(**fields)
 
 
