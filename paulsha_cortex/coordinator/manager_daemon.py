@@ -23,7 +23,7 @@ from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .diagnostics import diagnostic_reason, summarize_exception
 from .dispatcher import Dispatcher
 from .model_identities import load_model_identities
-from .registry import JobRegistry
+from .registry import RETRY_CARD_PHASE_PERSONA, JobRegistry
 from .seams import ScriptWorktreeCreator, TmuxPaneSender
 from .spawn_admission import DEFAULT_MIN_INTERVAL_SECONDS, SpawnAdmissionLimiter, build_default_limiter
 from .work_actions import safe_exception_summary
@@ -631,10 +631,12 @@ def build_request_executor(
                     args=dict(args),
                     requested_by=request["requested_by"],
                 )
-            # #545：`retry-card` 與 `retry-build` 共用同一條「強制重派 builder
+            # #545／#569：`retry-card` 與 `retry-build` 共用同一條「強制重派當前
             # 卡」的 dispatch 路徑（含失敗時把 needs_human 補回去的補償），差別
-            # 只在 work action 層允許的卡片位置與 reset 語意。
-            forced_builder_retry = args.get("action") in {"retry-build", "retry-card"}
+            # 只在 work action 層允許的卡片位置與 reset 語意。#569 之後
+            # `retry-card` 也涵蓋 verify／review 的 reviewer 卡，因此這個旗標
+            # 不再只針對 builder。
+            forced_card_retry = args.get("action") in {"retry-build", "retry-card"}
             if args.get("action") in {
                 "start", "resume", "retry-build", "retry-card", "intake",
             }:
@@ -696,14 +698,19 @@ def build_request_executor(
                                 identities=identities,
                                 launcher_factory=launcher_factory,
                                 coordinator_root=coordinator_root,
-                                force_new_build=forced_builder_retry,
+                                force_new_card=forced_card_retry,
                             )
-                            if forced_builder_retry and job is None:
+                            if forced_card_retry and job is None:
+                                # persona 依 phase 決定（build→builder、
+                                # verify／review→reviewer），與
+                                # `registry.RETRY_CARD_PHASE_PERSONA` 同一份判準。
                                 raise RuntimeError(
-                                    f"{args.get('action')} produced no builder Job"
+                                    f"{args.get('action')} produced no "
+                                    f"{RETRY_CARD_PHASE_PERSONA.get(run.current_phase, 'replacement')}"
+                                    " Job"
                                 )
                         except Exception as exc:
-                            if forced_builder_retry:
+                            if forced_card_retry:
                                 current = registry.get_workflow_run(run.run_id)
                                 registry._manager_update_workflow_run(
                                     run.run_id,
@@ -712,13 +719,14 @@ def build_request_executor(
                                     ),
                                     gate_status="running",
                                     needs_human_reason=diagnostic_reason(
-                                        "forced-builder-retry-failed",
-                                        "operator 要求的 builder 重派沒有產生新 job："
+                                        "forced-card-retry-failed",
+                                        "operator 要求的卡片重派沒有產生新 job："
                                         f"{summarize_exception(exc)}",
-                                        source="manager_daemon._execute_request:retry-build",
+                                        source="manager_daemon._execute_request:forced-card-retry",
                                         run_id=run.run_id,
                                         work_id=run.work_id,
                                         action=str(args.get("action")),
+                                        phase=run.current_phase,
                                     ),
                                 )
                             raise

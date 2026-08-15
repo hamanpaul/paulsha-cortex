@@ -36,7 +36,7 @@ from . import terminal_contract
 from . import verification
 from . import worktree_reclaim
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
-from .registry import slice_repin_eligible
+from .registry import RETRY_CARD_PHASE_PERSONA, slice_repin_eligible
 from ..config.paths import worktree_root_for
 from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
 from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
@@ -705,9 +705,9 @@ def workflow_status_entry(registry, run) -> dict[str, Any]:
             reason_code = value
     next_actions: tuple[str, ...] = ()
     try:
-        from .work_actions import _build_phase_recovery_actions
+        from .work_actions import _phase_recovery_actions
 
-        next_actions = _build_phase_recovery_actions(run, registry)
+        next_actions = _phase_recovery_actions(run, registry)
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         next_actions = ()
     return {
@@ -7610,22 +7610,29 @@ def _dispatch_workflow_card(
     coordinator_root: str | Path,
     retry_failed: bool = False,
     operator_recovery_job_id: str | None = None,
-    force_new_build: bool = False,
+    force_new_card: bool = False,
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
     """#381：workflow lane 的實際 spawn 點。spawn_admission 未注入時解析為
     零間隔 no-op（見 spawn_admission.resolve_limiter）——只有 resume_workflow_run
     /manager_daemon periodic tick 顯式注入同一個 instance 時，兩條 lane 才會
-    對同一 provider 共用節流時間軸。"""
+    對同一 provider 共用節流時間軸。
+
+    ``force_new_card``（#545 的 ``force_new_build`` 於 #569 一般化）：operator
+    已透過 ``retry-build``／``retry-card`` 明確授權重派當前這張卡，因此即使該卡
+    最新的 job 已經終止（``exited``／``failed``）也要派出**新** job，而不是把舊
+    的那顆回傳給呼叫端再讀一次。受理的卡與 ``registry.RETRY_CARD_PHASE_PERSONA``
+    同一份判準：build phase 的 builder 卡、verify／review phase 的 reviewer 卡。
+    """
     registry = getattr(dispatcher, "_registry", None)
     if registry is None:
         raise RuntimeError("workflow dispatch requires dispatcher registry")
     step = _current_workflow_step(run)
     if step is None or run.current_phase not in {"plan", "build", "verify", "review"}:
         return None
-    if force_new_build and (step.phase != "build" or step.persona != "builder"):
-        raise ValueError("forced workflow retry requires builder card")
+    if force_new_card and RETRY_CARD_PHASE_PERSONA.get(step.phase) != step.persona:
+        raise ValueError("forced workflow retry requires builder or reviewer card")
     matching = [
         job
         for job in registry.list_jobs()
@@ -7669,11 +7676,24 @@ def _dispatch_workflow_card(
                     )
                 )
             )
-            or (force_new_build and matching[-1].get("status") in TERMINAL_STATUSES)
+            or (force_new_card and matching[-1].get("status") in TERMINAL_STATUSES)
         )
     )
     if matching and not retryable_latest:
         return matching[-1]
+    # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名是
+    # `sha256(run_id:card:candidate)`（見 `_create_reviewer_sandbox`），重派同一
+    # 張卡＋同一個 candidate 必然撞上「stale reviewer sandbox requires
+    # reconciliation」而派不出去。`require_candidate_unchanged=True` 讓「reviewer
+    # 動過 candidate」fail closed——重派不得成為蓋掉這個事實的名義。刻意只掛在
+    # forced 路徑上：其餘既有路徑的 sandbox 已由 terminalize／resume 的既有回收
+    # 點處理，行為一個字節都不動。
+    if force_new_card and matching and step.persona == "reviewer":
+        _discard_reviewer_sandbox(
+            matching[-1],
+            coordinator_root=coordinator_root,
+            require_candidate_unchanged=True,
+        )
     if matching and step.persona == "planner":
         _discard_failed_planner_sandbox(
             matching[-1],
@@ -8171,7 +8191,7 @@ def dispatch_workflow_card(
     launcher_factory: Callable[[object], object],
     coordinator_root: str | Path,
     retry_failed: bool = False,
-    force_new_build: bool = False,
+    force_new_card: bool = False,
     forced_identity: object | None = None,
     spawn_admission: SpawnAdmissionLimiter | None = None,
 ) -> dict[str, object] | None:
@@ -8184,7 +8204,7 @@ def dispatch_workflow_card(
         launcher_factory=launcher_factory,
         coordinator_root=coordinator_root,
         retry_failed=retry_failed,
-        force_new_build=force_new_build,
+        force_new_card=force_new_card,
         forced_identity=forced_identity,
         spawn_admission=spawn_admission,
     )

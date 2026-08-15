@@ -36,6 +36,32 @@
   `tests/test_monitor_git_native_reads_506.py`（16 個測試，含量化驗收樁）。
 
 ### Fixed
+- **Issue #569：reviewer 卡的 `retry-verify` 只重置不重派——`retry-card` 放寬到
+  verify／review 的 reviewer 卡**——實測 run `workflow-084f75e2178cf7547476` 的
+  verification job（agy，#568 權限剖面缺陷）exit 0 但 log 無 JSON envelope，
+  `retry-verify` 受理後只重置卡片與 facet（回應 `job: None`），未在同一個 action 內
+  派新 job 也未 supersede 舊 job；之後每個 tick 的 resume 都重讀同一顆壞 job，run 對
+  tick 隱形四小時後 `needs_human` 原地回鍋——與 #545 builder 卡同型的 catch-22。修法
+  沿用 PR #552 的 `retry-card`：新增
+  `registry.RETRY_CARD_PHASE_PERSONA`（`build→builder`、`verify`／`review→reviewer`）
+  作為 work action 層與 registry 層共用的單一判準，`retry-card` 因此同時受理中段
+  builder 卡與 `verification`／`code-review`／`adversarial-review`。硬約束逐條沿用：
+  exact WorkflowRun CAS ＋卡名定錨、已對**現在這個 candidate** 綁定
+  `workflow_evidence` 的卡拒絕重派（上一代 candidate 的歷史 evidence 不參與判斷）、
+  舊 job 一個位元組都不動（不像 `retry-verify`／`retry-review` 會把舊 exited job 改
+  標 `failed`）、新 job 的身分由 identity registry 在 dispatch 當下**重新解析**而非
+  複製舊 job 的 executor／model（#568 的 reviewer fail-over 依賴這點）、dispatch 失敗
+  時把 `needs_human` 連同 #527 的結構化理由補回去。`manager._dispatch_workflow_card`
+  的 `force_new_build` 一般化為 `force_new_card`，並在重派 reviewer 卡前原子回收被取
+  代 job 的 sandbox（目錄名 `sha256(run_id:card:candidate)` 必然撞名；回收時
+  candidate checkout 已被改動則 fail closed）。`retry-verify`／`retry-review`／
+  `retry-build` 的 CAS 與 admission 一字未改（`fix-repair-commit-recovery-spec.md`
+  R4），並補上回歸樁。曝光面（#546 的一部分）：`_build_phase_recovery_actions` 更名
+  為 `_phase_recovery_actions` 並涵蓋 build／verify／review，`resume` 的
+  `next_actions` 與 #527 的 `cortex status` attention 條目因此對卡住的 reviewer 卡
+  說得出 `retry-card` 而不再只有 `abandon`。詳見
+  `changelog.d/reviewer-card-retry.md`；新增 `tests/test_reviewer_card_retry_569.py`
+  （23 項，含 facet 原子性總樁）。
 - **Issue #554：taxonomy marker 無詞界，與 #543 的 `<unavailable>` 佔位符相撞；worktree
   drift 的 `content` 誤分類死鎖一併解除**——兩個缺陷共用同一組現場（planning worktree
   drift 的失敗訊息）。**缺陷一**：`_operator_drift_message` 尾端是

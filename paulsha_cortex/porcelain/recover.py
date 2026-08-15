@@ -68,7 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
     work.add_argument("--actor", required=True)
     work.add_argument("--expected-candidate")
     work.add_argument("--expected-run-id")
-    work.add_argument("--card", help="retry-card 要重派的 builder card id")
+    work.add_argument("--card", help="retry-card 要重派的 builder／reviewer card id")
     work.add_argument("--reason")
     _add_tracking_options(work)
 
