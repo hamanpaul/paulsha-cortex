@@ -646,6 +646,30 @@ def test_continuation_pages_do_not_carry_the_conditional_header(store):
     assert "--header" not in runner.calls[1]
 
 
+def test_an_issue_updated_mid_pagination_does_not_crash_the_scan(store):
+    """分頁跑的是一個**活的**、依 updated 排序的清單。
+
+    某個 issue 在我們讀第 1 頁與第 2 頁之間被更新，就會在兩頁各出現一次。這是分頁
+    本身的產物，不是壞回應——但重複的 issue 號會讓 durable 狀態的驗證直接 raise，
+    例外若逸出 provider 會打斷整個 refresh 迴圈。收斂時保留較新的那筆。
+    """
+    runner = Runner(
+        ok(
+            issue(1, state="open", updated_at="2026-08-15T09:00:00Z"),
+            issue(2, state="open", updated_at="2026-08-15T08:00:00Z"),
+            next_page=True,
+        ),
+        # #2 在翻頁期間被關閉，於是在第 2 頁又出現一次（updated_at 更新）。
+        ok(issue(2, state="closed", updated_at="2026-08-15T09:30:00Z")),
+    )
+
+    snapshot = provider(store, runner).scan()
+
+    assert snapshot.status == "ok"
+    assert statuses(snapshot) == {"acme/demo#1": "open", "acme/demo#2": "closed"}
+    assert store.load(REPO).since == "2026-08-15T09:30:00Z"
+
+
 def test_runaway_pagination_fails_closed(store):
     runner = Runner(
         *[ok(issue(n + 1, updated_at="2026-08-15T09:00:00Z"), next_page=True) for n in range(60)]

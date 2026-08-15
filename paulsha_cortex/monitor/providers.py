@@ -32,6 +32,7 @@ from .github_issue_sync import (
     IssueSyncStateError,
     IssueSyncStore,
     cursor_from,
+    dedupe_entries,
     drift_between,
     issues_request_path,
     parse_include_response,
@@ -1015,21 +1016,29 @@ class GitHubWorkProvider:
                     if previous is not None
                     else tuple(sorted(fetched.entries, key=lambda entry: entry.number))
                 )
-            state = IssueSyncState(
-                repo=self.repo,
-                entries=entries,
-                # 游標取自回應中最大的 updated_at（非本機時鐘），且永不倒退。
-                since=cursor_from(
-                    fetched.entries, floor=previous.since if previous is not None else None
-                ),
-                etag=fetched.etag,
-                etag_request=base_path if fetched.etag else None,
-                last_full_sync_at=(
-                    attempted_at
-                    if mode == "full"
-                    else (previous.last_full_sync_at if previous is not None else None)
-                ),
-            )
+            try:
+                state = IssueSyncState(
+                    repo=self.repo,
+                    entries=entries,
+                    # 游標取自回應中最大的 updated_at（非本機時鐘），且永不倒退。
+                    since=cursor_from(
+                        fetched.entries,
+                        floor=previous.since if previous is not None else None,
+                    ),
+                    etag=fetched.etag,
+                    etag_request=base_path if fetched.etag else None,
+                    last_full_sync_at=(
+                        attempted_at
+                        if mode == "full"
+                        else (previous.last_full_sync_at if previous is not None else None)
+                    ),
+                )
+            except IssueSyncStateError as error:
+                # 合出來的狀態自己過不了驗證：degraded（上層續用上一份好的快照），
+                # 絕不讓例外逸出 provider 把整個 refresh 迴圈打斷。
+                return self._failure(
+                    attempted_at, f"github issue sync state rejected: {error}"
+                )
 
         if drift is not None:
             # 驗收 5：全量對帳發現 drift → 以全量為準，並同時留 log 與 observation。
@@ -1140,7 +1149,8 @@ class GitHubWorkProvider:
                 raise _GitHubRequestError("github issue pagination returned 304")
             entries.extend(self._entries(response))
         return _FetchResult(
-            entries=tuple(entries),
+            # 分頁跑的是活清單，同一個 issue 可能跨頁重複出現——傳輸層先收斂。
+            entries=dedupe_entries(entries),
             not_modified=False,
             requests=requests,
             pages=pages,

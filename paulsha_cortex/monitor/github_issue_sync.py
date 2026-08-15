@@ -396,6 +396,23 @@ class IssueSyncState:
         )
 
 
+def dedupe_entries(entries: Sequence[IssueEntry]) -> tuple[IssueEntry, ...]:
+    """同號去重，保留 ``updated_at`` 最新的那筆。
+
+    分頁跑的是一個**活的**、依 ``updated`` 排序的清單：某個 issue 在我們讀第 1 頁
+    與第 2 頁之間被更新，就會在兩頁各出現一次。這是分頁本身的產物，不是壞回應——
+    但重複進到 :class:`IssueSyncState` 會直接 raise，因此在傳輸層就收斂掉。
+    （反向的漏抓由每日全量 anti-entropy 兜底。）
+    """
+
+    latest: dict[int, IssueEntry] = {}
+    for entry in entries:
+        current = latest.get(entry.number)
+        if current is None or entry.updated_at >= current.updated_at:
+            latest[entry.number] = entry
+    return tuple(sorted(latest.values(), key=lambda entry: entry.number))
+
+
 def cursor_from(entries: Iterable[IssueEntry], *, floor: str | None = None) -> str | None:
     """游標＝回應中最大的 ``updated_at``（非本機時鐘），且永不倒退。
 
