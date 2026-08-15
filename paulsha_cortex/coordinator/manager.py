@@ -25,6 +25,7 @@ from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
 from . import completion
+from . import coverage
 from . import gate_ledger
 from . import planning_runtime
 from . import provider_backoff
@@ -9610,6 +9611,23 @@ def apply_workflow_action(
         raise ValueError(f"unsupported workflow action: {action}")
 
     manifest = _load_workflow_manifest(_required_workflow_string(args, "manifest_path"))
+    # v4 R1（方案 A）coverage validator **shadow**：在 production topology validator
+    # 呼叫點旁並行跑 coverage validator 並記 telemetry。**零行為變更**——
+    # run_coverage_shadow 全程 try/except、永不 raise，且受
+    # PSC_RESPONSIBILITY_COVERAGE 閘控（off 連比對都不跑）；下面的
+    # validate_manager_spine() 仍是唯一 production 真相源。coverage validator 的判定
+    # 只進 telemetry，絕不影響此處 gate。放在 validate 之前，是為了連 topology 即將
+    # raise 的案例也能被 shadow 觀測到（disagreement 資料才完整）。
+    coverage.run_coverage_shadow(
+        manifest,
+        callsite="manager.start",
+        context={
+            "work_id": args.get("work_id"),
+            "repo": args.get("repo"),
+            "claim_key": args.get("claim_key"),
+            "combo": manifest.combo,
+        },
+    )
     manifest.validate_manager_spine()
     # #208 收口 wiring 1：work_bridge.start_canonical_workflow 在呼叫端已算好
     # （fail-soft，可能是 None）的 claim-time sizing 快照透過 args 帶進來，這裡
