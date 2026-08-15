@@ -18,10 +18,12 @@
 ## GitHub 掃描壓力設定（#506）
 
 `_github_refresh_loop` 每 `github_refresh_interval_seconds` 會對每個 GitHub repo
-跑一次 `GitHubWorkProvider` 與 `GitHubTerminalProvider`，兩者的 `gh` 呼叫數是
-O(issues 分頁 + remote todo 檔數 + workflow-linked merged PR 數) 而非 O(1)。
-repo 一多，一輪數百次請求齊發就會觸發 GitHub 的 secondary（abuse detection）
-rate limit，兩個 provider 一起 degraded，連帶擋掉 `cortex work` 的 claim。
+跑一次 `GitHubWorkProvider` 與 `GitHubTerminalProvider`。repo 一多，一輪數百次
+請求齊發就會觸發 GitHub 的 secondary（abuse detection）rate limit，兩個 provider
+一起 degraded，連帶擋掉 `cortex work` 的 claim。
+
+D2 之後（見下節）`GitHubTerminalProvider` 的 REST 呼叫數已降為每輪固定 2 次
+（graphql PR 分頁 ＋ 1 次 git tree）；`GitHubWorkProvider` 仍是 O(issues 分頁)。
 
 `monitor:` 區段新增下列鍵（全部可省略，預設值即保守值）：
 
@@ -47,3 +49,32 @@ rate limit，兩個 provider 一起 degraded，連帶擋掉 `cortex work` 的 cl
 `coordinator/claim.py` 的 `provider-authority-rate-limited-canonical` 行為不變。
 退避期間 provider 的 `scan()` 直接跳過、不發任何請求；退避窗綁的是 token
 （帳號層級）而非單一 repo，因為 GitHub 的 secondary limit 本來就綁 token。
+
+## git 的資料走 git：remote 讀取不吃 REST 配額（#506 / D2）
+
+`GitHubTerminalProvider` 過去有兩類「每個……一次」的 REST 讀取，讀的都是本機
+git checkout 本來就有的東西：
+
+- 每個 remote `todo.md` / archived `tasks.md` 一次 `repos/{repo}/contents/...`
+  （實測生產 workspace 一輪 **91 次**）
+- 每個 workflow-linked merged PR 一次 `repos/{repo}/compare/{merge}...{default}`
+  （判「merge commit 還在不在 default branch 上」）
+
+兩者已改由 `paulsha_cortex.monitor.git_mirror.LocalGitMirror` 以本機 git 回答，
+**一輪的 REST `contents` / `compare` 呼叫數固定為 0**。git 協定（fetch）不受
+REST rate limit 管轄。
+
+- **讀哪個 checkout**：`work_api` 把該 repo 在 workspace 的 canonical checkout
+  （與 `RepoWorkProvider` 同一個 root）傳給 provider。
+- **身分驗證**：`git config --get remote.origin.url` 必須解析成同一個
+  `owner/name`（讀 raw config，不套 `url.*.insteadOf` 改寫），否則 fail closed。
+- **fetch 頻率**：沿用既有 refresh 週期——一輪最多 fetch 一次，而且只在本機真的
+  缺物件時才 fetch。refspec 一律寫進私有 namespace `refs/cortex/mirror/<hash>/*`
+  並帶 `--refmap=`，不動 `refs/remotes/origin/*`、工作區與任何本地分支。
+- **fail closed**：ref 不存在、fetch 失敗、blob 讀不到、shallow checkout 無法判
+  ancestry——一律 degraded（diagnostic 前綴 `github terminal git mirror
+  unavailable:`），由 `_retain_last_good` 保留上一份鏡像，**絕不**把讀不到當成
+  「檔案不存在」或「不是 ancestor」。
+- **provenance**：`github-terminal:` provider 的 observations 多一個 `remote_reads`
+  欄位，記 transport、checkout 路徑、本輪 fetch 的 refspec、缺席物件、blob 讀取數
+  與 ancestry 判定數。

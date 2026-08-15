@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import base64
 import subprocess
 from pathlib import Path
 
@@ -828,22 +827,32 @@ def test_workflow_registry_rejects_completion_record_outside_safe_root(tmp_path)
     )
 
 
-def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
+def test_github_terminal_provider_reads_closing_refs_and_remote_archive(git_origin):
+    repo = git_origin()
+    repo.commit(
+        {"openspec/changes/archive/2026-07-17-work/proposal.md": "# archived\n"},
+        message="archive",
+    )
+    head = repo.branch_commit("feature/9-work", {"src.py": "x = 1\n"})
+    merge = repo.merge("feature/9-work")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
                         {
                             "number": 9,
                             "body": "work_item: work\n",
-                            "headRefOid": "e" * 40,
+                            "headRefOid": head,
                             "state": "MERGED",
                             "mergedAt": "2026-07-17T10:00:00Z",
                             "mergeCommit": {
-                                "oid": "a" * 40,
+                                "oid": merge,
                                 "parents": {"totalCount": 2},
                             },
                             "closingIssuesReferences": {
@@ -862,11 +871,11 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
             {"path": "openspec/changes/archive/2026-07-17-work/proposal.md"}
         ]
     }
-    runner = SequenceRunner(
-        [_completed(graph), _completed(tree), _completed({"status": "ahead"})]
-    )
+    runner = SequenceRunner([_completed(graph), _completed(tree)])
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "ok"
     assert result.observations["closing_links"] == {
@@ -875,8 +884,8 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
     assert result.observations["remote_prs"] == [
         {
             "source_id": "github_pr:example/acme#9",
-            "candidate": "e" * 40,
-            "merge_revision": "a" * 40,
+            "candidate": head,
+            "merge_revision": merge,
             "merged_with_merge_commit": True,
         }
     ]
@@ -887,6 +896,8 @@ def test_github_terminal_provider_reads_closing_refs_and_remote_archive():
         "active": [],
         "archived": ["work"],
     }
+    # D2：ancestry 走本機 merge-base，一輪不再有 compare 請求。
+    assert not any("/compare/" in argv[-1] for argv in runner.calls)
 
 
 def test_github_terminal_provider_aggregates_pull_requests_across_pages():
@@ -1071,11 +1082,23 @@ def test_github_terminal_squash_merge_is_not_a_merge_commit():
     assert not result.observations["remote_prs"][0]["merged_with_merge_commit"]
 
 
-def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
+def test_github_terminal_merge_not_on_default_branch_is_not_terminal(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "# base\n"}, message="base")
+    repo.branch_commit("feature/9-work", {"src.py": "x = 1\n"})
+    # merge commit 落在側枝上，default branch 走不到它（等同舊 compare 的 diverged）。
+    repo.git("checkout", "--quiet", "-b", "release", "main")
+    repo.git("merge", "--quiet", "--no-ff", "-m", "side merge", "feature/9-work")
+    merge = repo.head("release")
+    repo.git("checkout", "--quiet", "main")
+    repo.commit({"README.md": "# moved on\n"}, message="advance")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head("main")},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
@@ -1084,7 +1107,7 @@ def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
                             "body": "work_item: work\n",
                             "state": "MERGED",
                             "mergedAt": "2026-07-17T10:00:00Z",
-                            "mergeCommit": {"oid": "a" * 40, "parents": {"totalCount": 2}},
+                            "mergeCommit": {"oid": merge, "parents": {"totalCount": 2}},
                             "closingIssuesReferences": {
                                 "pageInfo": {"hasNextPage": False},
                                 "nodes": [{"number": 7, "state": "CLOSED"}],
@@ -1096,28 +1119,39 @@ def test_github_terminal_merge_not_on_default_branch_is_not_terminal():
         }
     }
     runner = SequenceRunner(
-        [
-            _completed(graph),
-            _completed({"truncated": False, "tree": []}),
-            _completed({"status": "diverged"}),
-        ]
+        [_completed(graph), _completed({"truncated": False, "tree": []})]
     )
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert not result.observations["remote_prs"][0]["merged_with_merge_commit"]
 
 
-def test_github_terminal_compares_only_workflow_linked_prs():
-    def merged(number: int, merge: str) -> dict:
+def test_github_terminal_resolves_ancestry_only_for_workflow_linked_prs(git_origin):
+    repo = git_origin()
+    repo.commit({"README.md": "# base\n"}, message="base")
+    merges: dict[int, str] = {}
+    heads: dict[int, str] = {}
+    for number in (8, 9):
+        heads[number] = repo.branch_commit(
+            f"feature/{number}-work", {f"src{number}.py": "x = 1\n"}
+        )
+        merges[number] = repo.merge(f"feature/{number}-work")
+
+    def merged(number: int) -> dict:
         return {
             "number": number,
             "body": "",
             "headRefName": f"feature/{number}-work",
-            "headRefOid": str(number % 10) * 40,
+            "headRefOid": heads[number],
             "state": "MERGED",
             "mergedAt": "2026-07-17T10:00:00Z",
-            "mergeCommit": {"oid": merge, "parents": {"totalCount": 2}},
+            "mergeCommit": {
+                "oid": merges[number],
+                "parents": {"totalCount": 2},
+            },
             "closingIssuesReferences": {
                 "pageInfo": {"hasNextPage": False},
                 "nodes": [{"number": number, "state": "CLOSED"}],
@@ -1127,31 +1161,32 @@ def test_github_terminal_compares_only_workflow_linked_prs():
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
-                    "nodes": [merged(8, "a" * 40), merged(9, "b" * 40)],
+                    "nodes": [merged(8), merged(9)],
                 },
             }
         }
     }
     runner = SequenceRunner(
-        [
-            _completed(graph),
-            _completed({"truncated": False, "tree": []}),
-            _completed({"status": "ahead"}),
-        ]
+        [_completed(graph), _completed({"truncated": False, "tree": []})]
     )
 
     result = GitHubTerminalProvider(
-        "example/acme",
+        repo.repo,
         runner=runner,
         relevant_pr_numbers=(9,),
+        repo_root=repo.checkout,
     ).scan()
 
     assert result.status == "ok"
-    assert len(runner.calls) == 3
-    assert "compare/" + "b" * 40 in runner.calls[2][-1]
+    # D2：REST 只剩 graphql ＋ tree；ancestry 完全在本機解，且只解 workflow-linked 的那一個。
+    assert len(runner.calls) == 2
+    assert result.observations["remote_reads"]["ancestry_checks"] == 1
     by_number = {
         int(row["source_id"].rsplit("#", 1)[1]): row
         for row in result.observations["remote_prs"]
@@ -1233,17 +1268,29 @@ def test_github_terminal_does_not_retry_non_transient_api_failure():
     assert len(runner.calls) == 1
 
 
-def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
+def test_remote_default_branch_todo_blob_is_only_completion_authority(
+    tmp_path, git_origin
+):
     todo = tmp_path / "docs/superpowers/workstreams/work/todo.md"
     todo.parent.mkdir(parents=True)
     todo.write_text("---\nwork_item: work\n---\n- [x] local only\n", encoding="utf-8")
     local = RepoWorkProvider(tmp_path, repo="example/acme").scan()
     assert local.observations.get("closure_by_work", {}) == {}
 
+    # D2：remote 那一份現在從本機 git objects 讀（sha 定址），不再打 contents API。
+    repo = git_origin()
+    todo_path = "docs/superpowers/workstreams/work/todo.md"
+    repo.commit(
+        {todo_path: "---\nwork_item: work\n---\n- [x] remote task\n"},
+        message="remote todo",
+    )
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             }
         }
@@ -1252,74 +1299,68 @@ def test_remote_default_branch_todo_blob_is_only_completion_authority(tmp_path):
         "truncated": False,
         "tree": [
             {
-                "path": "docs/superpowers/workstreams/work/todo.md",
+                "path": todo_path,
                 "type": "blob",
-                "sha": "c" * 40,
+                "sha": repo.blob_sha(todo_path),
             }
         ],
     }
-    remote_body = "---\nwork_item: work\n---\n- [x] remote task\n"
-    blob = {
-        "type": "file",
-        "path": "docs/superpowers/workstreams/work/todo.md",
-        "encoding": "base64",
-        "content": base64.b64encode(remote_body.encode()).decode(),
-        "sha": "c" * 40,
-    }
-    runner = SequenceRunner([_completed(graph), _completed(tree), _completed(blob)])
+    runner = SequenceRunner([_completed(graph), _completed(tree)])
 
-    remote = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    remote = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert remote.status == "ok"
     assert remote.observations["remote_todos"] == [
         {
             "work_id": "work",
-            "path": "docs/superpowers/workstreams/work/todo.md",
-            "revision": "c" * 40,
+            "path": todo_path,
+            "revision": repo.blob_sha(todo_path),
             "complete": True,
         }
     ]
-    assert runner.calls[2] == (
-        "gh",
-        "api",
-        "--method",
-        "GET",
-        "repos/example/acme/contents/docs/superpowers/workstreams/work/todo.md?ref="
-        + "d" * 40,
-    )
+    assert len(runner.calls) == 2
+    assert not any("/contents/" in argv[-1] for argv in runner.calls)
 
 
-def test_remote_archived_openspec_tasks_are_todo_completion_evidence():
+def test_remote_archived_openspec_tasks_are_todo_completion_evidence(git_origin):
+    repo = git_origin()
+    task_path = "openspec/changes/archive/2026-07-17-canary/tasks.md"
+    repo.commit({task_path: "- [x] task one\n- [x] task two\n"}, message="archive")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             }
         }
     }
-    task_path = "openspec/changes/archive/2026-07-17-canary/tasks.md"
     tree = {
         "truncated": False,
-        "tree": [{"path": task_path, "type": "blob", "sha": "c" * 40}],
+        "tree": [
+            {
+                "path": task_path,
+                "type": "blob",
+                "sha": repo.blob_sha(task_path),
+            }
+        ],
     }
-    blob = {
-        "type": "file",
-        "path": task_path,
-        "encoding": "base64",
-        "content": base64.b64encode(b"- [x] task one\n- [x] task two\n").decode(),
-        "sha": "c" * 40,
-    }
-    runner = SequenceRunner([_completed(graph), _completed(tree), _completed(blob)])
+    runner = SequenceRunner([_completed(graph), _completed(tree)])
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "ok"
     assert result.observations["remote_todos"] == [
         {
             "openspec_ref": "canary",
             "path": task_path,
-            "revision": "c" * 40,
+            "revision": repo.blob_sha(task_path),
             "complete": True,
         }
     ]
@@ -1328,33 +1369,42 @@ def test_remote_archived_openspec_tasks_are_todo_completion_evidence():
     ]
 
 
-def test_remote_todo_contents_identity_mismatch_is_degraded():
+def test_remote_todo_blob_absent_from_git_is_degraded(git_origin):
+    """D2：舊的 ``contents`` identity mismatch 由 sha 定址取代。
+
+    blob sha 讀回來的內容不可能對不上（sha 就是內容），剩下的失敗模式只有「物件
+    不在」——那一格必須 degraded，**不得**靜默當成「檔案不存在」而讓 remote todo
+    憑空消失（fail closed）。
+    """
+
+    repo = git_origin()
+    path = "docs/superpowers/workstreams/work/todo.md"
+    repo.commit({path: "---\nwork_item: work\n---\n- [x] task\n"}, message="todo")
+    repo.publish()
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {
+                    "name": "main",
+                    "target": {"oid": repo.head()},
+                },
                 "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             }
         }
     }
-    path = "docs/superpowers/workstreams/work/todo.md"
     tree = {
         "truncated": False,
-        "tree": [{"path": path, "type": "blob", "sha": "c" * 40}],
+        "tree": [{"path": path, "type": "blob", "sha": "e" * 40}],
     }
-    contents = {
-        "type": "file",
-        "path": path,
-        "encoding": "base64",
-        "content": base64.b64encode(b"- [x] task\n").decode(),
-        "sha": "e" * 40,
-    }
-    runner = SequenceRunner([_completed(graph), _completed(tree), _completed(contents)])
+    runner = SequenceRunner([_completed(graph), _completed(tree)])
 
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "degraded"
     assert result.observations == {}
+    assert "git mirror" in result.diagnostics[0]
 
 
 def test_pr_body_work_item_is_not_confirmed_authority():

@@ -171,11 +171,16 @@ def test_new_claim_run_starts_with_empty_pr_refs(tmp_path: Path, monkeypatch: py
     assert start_run.pr_refs == ()
 
 
-def test_terminal_provider_skips_closed_unmerged_pr_closing_links():
+def test_terminal_provider_skips_closed_unmerged_pr_closing_links(git_origin):
+    # D2：merged PR 的 ancestry 走本機 git，因此本例需要一個真的 merge commit。
+    repo = git_origin()
+    repo.commit({"README.md": "# base\n"}, message="base")
+    merged_head = repo.branch_commit("feature/11-work", {"src.py": "x = 1\n"})
+    merge_revision = repo.merge("feature/11-work")
     graph = {
         "data": {
             "repository": {
-                "defaultBranchRef": {"name": "main", "target": {"oid": "d" * 40}},
+                "defaultBranchRef": {"name": "main", "target": {"oid": repo.head()}},
                 "pullRequests": {
                     "pageInfo": {"hasNextPage": False},
                     "nodes": [
@@ -206,11 +211,11 @@ def test_terminal_provider_skips_closed_unmerged_pr_closing_links():
                         {
                             "number": 11,
                             "body": "",
-                            "headRefOid": "g" * 40,
+                            "headRefOid": merged_head,
                             "state": "MERGED",
                             "mergedAt": "2026-07-17T10:00:00Z",
                             "mergeCommit": {
-                                "oid": "a" * 40,
+                                "oid": merge_revision,
                                 "parents": {"totalCount": 2},
                             },
                             "closingIssuesReferences": {
@@ -224,8 +229,10 @@ def test_terminal_provider_skips_closed_unmerged_pr_closing_links():
         }
     }
     tree = {"truncated": False, "tree": []}
-    runner = _FakeRunner([_completed(graph), _completed(tree), _completed({"status": "ahead"})])
-    result = GitHubTerminalProvider("example/acme", runner=runner).scan()
+    runner = _FakeRunner([_completed(graph), _completed(tree)])
+    result = GitHubTerminalProvider(
+        repo.repo, runner=runner, repo_root=repo.checkout
+    ).scan()
 
     assert result.status == "ok"
     assert result.observations["closing_links"] == {
