@@ -8,7 +8,7 @@ import math
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -24,8 +24,15 @@ from .git_mirror import (
     LocalGitMirror,
     unavailable_provenance,
 )
+from .event_spool import (
+    EventSpool,
+    TargetedRefresh,
+    coalesce_hints,
+    parse_event_timestamp,
+)
 from .github_issue_sync import (
     DEFAULT_FULL_SYNC_INTERVAL_SECONDS,
+    HTTP_NOT_FOUND,
     GitHubResponse,
     IssueEntry,
     IssueSyncState,
@@ -34,6 +41,7 @@ from .github_issue_sync import (
     cursor_from,
     dedupe_entries,
     drift_between,
+    issue_request_path,
     issues_request_path,
     parse_include_response,
 )
@@ -897,6 +905,17 @@ class _FetchResult:
     etag: str | None
 
 
+@dataclass(frozen=True)
+class _SpoolResult:
+    """D4：一輪 spool 消費的結果（鏡像增量 ＋ 新的 per-object ETag ＋ 記帳）。"""
+
+    entries: tuple[IssueEntry, ...]
+    targeted_etags: Mapping[int, str]
+    consume: tuple[Path, ...]
+    changed: bool
+    report: Mapping[str, Any]
+
+
 class GitHubWorkProvider:
     """Read GitHub entities through authenticated ``gh api`` JSON only.
 
@@ -904,11 +923,20 @@ class GitHubWorkProvider:
     每日一次的 anti-entropy 對帳。協定本身（游標紀律／ETag 綁定 path／fail-closed
     條件／drift 對帳）全部定義在 ``monitor/github_issue_sync``；本類別只負責發
     ``gh`` 請求、分診失敗、把鏡像投影成 ``ProviderSnapshot``。
+
+    #506 / D4：增量之後再消費一次本機事件 spool（``monitor/event_spool``）——對被
+    點名的物件做 targeted 條件請求，驗證通過才更新鏡像。事件是 **hint 不是
+    authority**，驗不到的變更一律不寫鏡像，留給每日 anti-entropy。
     """
 
     # 100 筆/頁 × 50 頁＝5000 筆。超過視為分頁失控（伺服器沒收斂 Link），
     # fail closed，不讓一輪掃描無上限地打下去。
     _PAGE_LIMIT = 50
+
+    # D4：一輪最多驗幾個被點名的物件。hook 是 per-tool-call 觸發的，一個活躍
+    # job 可以在半小時內點名幾十次；沒有上限就等於把 D1–D3 省下的配額交還給
+    # 事件量決定。超出的事件留在 spool，下一輪再服務（依 emitted_at FIFO）。
+    _TARGETED_LIMIT = 20
 
     def __init__(
         self,
@@ -919,6 +947,8 @@ class GitHubWorkProvider:
         pressure_gate: GitHubPressureGate | None = None,
         sync_store: IssueSyncStore | None = None,
         full_sync_interval_seconds: float = DEFAULT_FULL_SYNC_INTERVAL_SECONDS,
+        event_spool: EventSpool | None = None,
+        targeted_refresh_limit: int | None = None,
         now: Callable[[], str] | None = None,
     ) -> None:
         if repo.count("/") != 1 or any(not part for part in repo.split("/")):
@@ -933,6 +963,12 @@ class GitHubWorkProvider:
         # 是「無狀態即無增量」的誠實契約（測試與一次性呼叫端走的就是它）。
         self.sync_store = sync_store
         self.full_sync_interval_seconds = float(full_sync_interval_seconds)
+        # D4：沒有 spool（或 spool 目錄不存在，例如 D5 hook 尚未部署到這台機器）
+        # 就完全維持 D3 行為——事件入口是**加速器**，不是任何東西的必要條件。
+        self.event_spool = event_spool
+        self.targeted_refresh_limit = (
+            self._TARGETED_LIMIT if targeted_refresh_limit is None else int(targeted_refresh_limit)
+        )
         self._now = now or _utcnow
 
     # -- 掃描 -------------------------------------------------------------
@@ -1049,6 +1085,31 @@ class GitHubWorkProvider:
             )
             notes.append(f"github issue mirror drift resolved by full sync: {drift}")
 
+        # D4：清單同步結束後才消費事件 spool——先做便宜的批次讀取，被它涵蓋到的
+        # 事件就不必再各花一次 targeted 請求。
+        spool: _SpoolResult | None = None
+        if self.event_spool is not None:
+            spool = self._consume_event_spool(
+                state=state,
+                attempted_at=attempted_at,
+                delta_numbers=frozenset(entry.number for entry in fetched.entries),
+                # 全量輪次重讀了**所有**物件，因此涵蓋掉所有比它早的事件；304
+                # 不是一次讀取（它什麼都沒讀回來），不得算進涵蓋範圍。
+                full_read=(mode == "full" and not fetched.not_modified),
+                notes=notes,
+            )
+            targeted_etags = dict(spool.targeted_etags)
+            if spool.changed or targeted_etags != state.targeted_etags_by_number:
+                try:
+                    state = replace(state, entries=spool.entries).with_targeted_etags(
+                        targeted_etags
+                    )
+                except IssueSyncStateError as error:
+                    return self._failure(
+                        attempted_at, f"github issue sync state rejected: {error}"
+                    )
+                entries = state.entries
+
         persisted = True
         if self.sync_store is not None and state is not previous:
             try:
@@ -1063,6 +1124,15 @@ class GitHubWorkProvider:
                 logger.warning(
                     "github issue sync state for %s was not persisted: %s", self.repo, error
                 )
+
+        if spool is not None:
+            if persisted:
+                # 驗收：**處理成功才消費**。事件檔一路留到鏡像真的落地為止——
+                # 中途 crash 的代價只是下一輪重驗一次（條件請求命中 304，免費）。
+                spool.report["consumed"] = self.event_spool.consume(spool.consume)
+            else:
+                spool.report["consumed"] = 0
+                spool.report["deferred"] += len(spool.consume)
 
         sources = tuple(
             sorted(
@@ -1114,6 +1184,9 @@ class GitHubWorkProvider:
                     "drift": drift,
                     "persisted": persisted,
                 },
+                # D4：事件入口的記帳。沒接 spool 時整個鍵不出現（既有觀測消費端
+                # 一行都不用改）。
+                **({"event_spool": dict(spool.report)} if spool is not None else {}),
             },
         )
 
@@ -1157,6 +1230,193 @@ class GitHubWorkProvider:
             etag=first.etag,
         )
 
+    # -- D4：事件入口 -----------------------------------------------------
+
+    def _consume_event_spool(
+        self,
+        *,
+        state: IssueSyncState,
+        attempted_at: str,
+        delta_numbers: frozenset[int],
+        full_read: bool,
+        notes: list[str],
+    ) -> _SpoolResult:
+        """掃 spool → 對被點名物件做 targeted 條件驗證 → 更新鏡像。
+
+        規則（計畫 R0.5 原則 6）：
+
+        - **事件是 hint 不是 authority**：只有 GitHub 自己回的物件才進鏡像。驗證
+          失敗（請求錯誤）不寫鏡像**也不消費事件**；驗證回 404（物件被刪除／
+          transfer 走）不從鏡像刪任何東西——那是每日全量 anti-entropy 的職責，
+          單一 targeted 404 不足以區分「真的沒了」與「權限／路徑一時讀不到」。
+        - **去重**：同物件多事件收斂成一次驗證（見 ``coalesce_hints``）。
+        - **過期安全跳過**：事件比本輪清單讀取早、而該物件又已被本輪讀取涵蓋
+          （出現在增量 delta 裡，或本輪是全量），鏡像就已經至少和事件一樣新，
+          直接消費事件、不花請求。spool 是本機目錄，producer 與 consumer 共用
+          同一顆時鐘，這個時間比較才成立。
+        - **亂序無害**：事件本來就沒有全域順序，這裡也不推論順序——每個物件只問
+          GitHub「你現在長怎樣」，答案與事件先後無關。
+        """
+
+        assert self.event_spool is not None  # 呼叫端已檢查
+        report: dict[str, Any] = {
+            "pending": 0,
+            "objects": 0,
+            "superseded": 0,
+            "verified": 0,
+            "confirmed": 0,
+            "not_modified": 0,
+            "unverified": 0,
+            "requests": 0,
+            "billed_requests": 0,
+            "consumed": 0,
+            "deferred": 0,
+            "quarantined": 0,
+            "ignored": {},
+            "foreign_schema": 0,
+        }
+        scan = self.event_spool.scan(now=attempted_at)
+        report["quarantined"] = len(scan.quarantined)
+        report["ignored"] = dict(scan.ignored)
+        report["foreign_schema"] = scan.foreign_schema
+        hints = scan.for_repo(self.repo)
+        report["pending"] = len(hints)
+        refreshes = coalesce_hints(hints, repo=self.repo)
+        report["objects"] = len(refreshes)
+        if not refreshes:
+            return _SpoolResult(
+                entries=state.entries,
+                targeted_etags=state.targeted_etags_by_number,
+                consume=(),
+                changed=False,
+                report=report,
+            )
+
+        try:
+            cycle_started = parse_event_timestamp(attempted_at)
+        except ValueError:
+            cycle_started = None
+        by_number = state.by_number
+        etags = state.targeted_etags_by_number
+        consume: list[Path] = []
+        changed = False
+        for index, refresh in enumerate(refreshes):
+            if index >= self.targeted_refresh_limit:
+                # 超出本輪上限：事件留在 spool，下一輪照 emitted_at 先來先服務。
+                report["deferred"] += sum(len(row.paths) for row in refreshes[index:])
+                notes.append(
+                    "github event spool deferred "
+                    f"{len(refreshes) - index} object(s) past the per-cycle targeted limit"
+                )
+                break
+            if self._already_covered(
+                refresh,
+                cycle_started=cycle_started,
+                delta_numbers=delta_numbers,
+                full_read=full_read,
+            ):
+                report["superseded"] += 1
+                consume.extend(refresh.paths)
+                continue
+            try:
+                response = self._request(
+                    issue_request_path(self.repo, refresh.number),
+                    etag=etags.get(refresh.number),
+                    not_found_ok=True,
+                )
+            except _GitHubRequestError as error:
+                # 驗證不到就不寫鏡像、不消費事件——留給下一輪或每日 anti-entropy。
+                # 一併停掉本輪剩餘的 targeted 請求：第一個失敗多半是限流／認證，
+                # 繼續打只是把退避窗撐得更深。
+                report["deferred"] += sum(len(row.paths) for row in refreshes[index:])
+                notes.append(f"github event spool targeted refresh failed: {error.diagnostic}")
+                logger.warning(
+                    "github event spool targeted refresh for %s#%s failed: %s",
+                    self.repo,
+                    refresh.number,
+                    error.diagnostic,
+                )
+                break
+            report["requests"] += 1
+            if response.not_modified:
+                # 條件請求命中：物件自上次 targeted 讀取以來沒變，鏡像已經是對的。
+                # 304 不計配額，因此 billed_requests 不動。
+                report["not_modified"] += 1
+                consume.extend(refresh.paths)
+                continue
+            report["billed_requests"] += 1
+            if response.status == HTTP_NOT_FOUND:
+                # 物件讀不到——**不**動鏡像（不刪、不改）。刪除／transfer 這類
+                # 事件本來就只有每日全量對帳看得到，一次 404 不足以當證據。
+                report["unverified"] += 1
+                consume.extend(refresh.paths)
+                notes.append(
+                    f"github event spool hint for {refresh.repo}#{refresh.number} "
+                    "could not be verified (404); left to the daily anti-entropy sweep"
+                )
+                continue
+            try:
+                entry = IssueEntry.from_api(json.loads(response.body))
+            except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+                # 壞回應不寫鏡像，也不消費事件（下一輪重試）。
+                report["deferred"] += len(refresh.paths)
+                notes.append(
+                    f"github event spool targeted refresh for {refresh.repo}#{refresh.number} "
+                    "returned malformed JSON"
+                )
+                continue
+            if entry.number != refresh.number:
+                # 回的不是我們問的那個物件（transfer 重編號等）——不信。
+                report["deferred"] += len(refresh.paths)
+                notes.append(
+                    f"github event spool targeted refresh for {refresh.repo}#{refresh.number} "
+                    f"returned issue #{entry.number}"
+                )
+                continue
+            report["verified"] += 1
+            if response.etag is not None:
+                etags = {**etags, refresh.number: response.etag}
+            known = by_number.get(entry.number)
+            if known is None or known.differs_from(entry):
+                # inferred（事件）→ confirmed（GitHub 自己回的物件）才進鏡像。
+                by_number[entry.number] = entry
+                changed = True
+                report["confirmed"] += 1
+            consume.extend(refresh.paths)
+
+        return _SpoolResult(
+            entries=tuple(sorted(by_number.values(), key=lambda item: item.number)),
+            targeted_etags=etags,
+            consume=tuple(consume),
+            changed=changed,
+            report=report,
+        )
+
+    def _already_covered(
+        self,
+        refresh: TargetedRefresh,
+        *,
+        cycle_started: datetime | None,
+        delta_numbers: frozenset[int],
+        full_read: bool,
+    ) -> bool:
+        """本輪的清單讀取是否已經涵蓋這個事件（→ 免一次 targeted 請求）。
+
+        成立條件：事件在本輪請求發出**之前**產生，且該物件確實被本輪讀回來過
+        （出現在增量 delta，或本輪是全量重讀）。GitHub 端的 replication lag 是這
+        個推論唯一的殘餘風險，而那本來就是每日 anti-entropy 的守備範圍。
+        """
+
+        if cycle_started is None:
+            return False
+        try:
+            emitted = refresh.emitted_at_time
+        except ValueError:
+            return False
+        if emitted > cycle_started:
+            return False
+        return full_read or refresh.number in delta_numbers
+
     def _entries(self, response: GitHubResponse) -> tuple[IssueEntry, ...]:
         try:
             payload = json.loads(response.body)
@@ -1166,7 +1426,9 @@ class GitHubWorkProvider:
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as error:
             raise _GitHubRequestError("github API returned malformed JSON") from error
 
-    def _request(self, path: str, *, etag: str | None = None) -> GitHubResponse:
+    def _request(
+        self, path: str, *, etag: str | None = None, not_found_ok: bool = False
+    ) -> GitHubResponse:
         if self.pressure_gate is not None:
             # 節流改為 per-request：改動前一次 `--paginate` 是 gh 在行程內自己
             # 連發分頁，閘門完全管不到那些請求。
@@ -1195,6 +1457,11 @@ class GitHubWorkProvider:
         # 304 必須先判：gh 對任何非 2xx 都以非零離開（實測 `gh: HTTP 304`），
         # 但條件請求命中是**成功**，不是失敗。
         if response is not None and response.not_modified:
+            return response
+        # D4：targeted 驗證要能分辨 404（物件讀不到，交給 anti-entropy）與其他
+        # 失敗（重試）。與 304 同理，gh 對 404 也以非零離開，所以得在 returncode
+        # 分診之前先認狀態行——但只有明確要求的呼叫端才拿得到這個回應。
+        if not_found_ok and response is not None and response.status == HTTP_NOT_FOUND:
             return response
         if completed.returncode != 0:
             message = (

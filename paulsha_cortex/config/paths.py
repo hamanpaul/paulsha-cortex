@@ -57,6 +57,17 @@ def github_issue_sync_path() -> Path:
     return monitor_state_root() / "github-issue-sync.json"
 
 
+def monitor_event_spool_root() -> Path:
+    """#506 / D4：本機事件入口（spool）目錄。
+
+    與 `github_issue_sync_path()` 同一族（monitor 的傳輸層狀態），但生命週期相反：
+    這裡的檔案是**別的行程**（D5 的 headless agent hook）寫進來、monitor 消費掉即
+    消失的一次性 hint，不是 monitor 自己的 durable 狀態。目錄由寫入端建立——
+    monitor 掃到目錄不存在就是「這台機器沒有 hook」，不是錯誤。
+    """
+    return monitor_state_root() / "event-spool"
+
+
 def skill_registry_root() -> Path:
     """Skill governance 治理平面根目錄（issue #204）：ledger／park state／proposal 共用。
 

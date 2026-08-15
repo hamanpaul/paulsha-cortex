@@ -42,6 +42,12 @@ per-repo 至少 1 次、issue 數過 100 的 repo 每 100 個再多 1 次，而�
 6. **fail closed**：durable 狀態缺失／損壞／``since`` 格式不合／entries 形狀不對
    ——一律退回全量重建，**絕不**拿半壞的游標去做增量。
 
+7. **D4 的 per-object ETag**：``targeted_etags`` 存 ``repos/{repo}/issues/{number}``
+   這條 path 的條件請求 ETag，與清單端點的 ``etag`` 分開存——兩者 path 不同，
+   混用會讓條件請求永遠落空。它綁的 path 不含 ``since``，因此游標前進不會讓它
+   作廢；反過來，targeted 驗證讀回來的新狀態**不得**推進 ``since`` 游標（游標
+   只能由清單回應推進，否則會跳過那之間被更新的其他物件）。
+
 ``IssueSyncStore`` 是 per-repo durable 狀態（游標／ETag／鏡像投影）的唯一入口。
 """
 
@@ -51,7 +57,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -76,6 +82,7 @@ _API_TIMESTAMP = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 _STATUS_LINE = re.compile(r"\AHTTP/[0-9.]+ (?P<status>[0-9]{3})(?: |\Z)")
 
 HTTP_NOT_MODIFIED = 304
+HTTP_NOT_FOUND = 404
 
 
 class IssueSyncStateError(ValueError):
@@ -103,6 +110,20 @@ def issues_request_path(repo: str, *, since: str | None = None, page: int = 1) -
         # 布林訊號用，path 永遠由本地重建。
         query += f"&page={page}"
     return f"repos/{repo}/issues?{query}"
+
+
+def issue_request_path(repo: str, number: int) -> str:
+    """#506 / D4：單一物件的 targeted 請求 path。
+
+    ``issues/{number}`` 對 issue 與 PR 都成立（PR 在 issues 端點回一份帶
+    ``pull_request`` 鍵的物件），因此 D4 的 targeted 驗證不需要先知道被點名的是
+    哪一種——事件帶的 ``kind`` 只進診斷。path 與清單端點不同，它的 ETag 因此
+    **不會**隨 ``since`` 游標作廢，可以一直沿用到該物件真的變動為止。
+    """
+
+    if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+        raise ValueError("GitHub object number must be a positive int")
+    return f"repos/{repo}/issues/{number}"
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +342,10 @@ class IssueSyncState:
     etag: str | None = None
     etag_request: str | None = None
     last_full_sync_at: str | None = None
+    # D4：per-object targeted 請求的 ETag（``(number, etag)`` 對，依編號排序）。
+    # 與清單端點的 ``etag`` 分開存：兩者的 request path 不同，混用會讓條件請求
+    # 永遠落空。以 tuple 而非 dict 保存，frozen dataclass 才維持可雜湊。
+    targeted_etags: tuple[tuple[int, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.repo, str) or self.repo.count("/") != 1:
@@ -338,10 +363,45 @@ class IssueSyncState:
             raise IssueSyncStateError("issue ETag must travel with its request path")
         if self.last_full_sync_at is not None:
             _parse_local_timestamp(self.last_full_sync_at)
+        targeted: dict[int, str] = {}
+        for pair in self.targeted_etags:
+            try:
+                number, etag = pair
+            except (TypeError, ValueError) as error:
+                raise IssueSyncStateError("targeted ETag must be a (number, etag) pair") from error
+            if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+                raise IssueSyncStateError(f"invalid targeted ETag number: {number!r}")
+            if not isinstance(etag, str) or not etag:
+                raise IssueSyncStateError(f"invalid targeted ETag value: {etag!r}")
+            targeted[number] = etag
+        object.__setattr__(
+            self, "targeted_etags", tuple(sorted(targeted.items(), key=lambda row: row[0]))
+        )
 
     @property
     def by_number(self) -> dict[int, IssueEntry]:
         return {entry.number: entry for entry in self.entries}
+
+    @property
+    def targeted_etags_by_number(self) -> dict[int, str]:
+        return dict(self.targeted_etags)
+
+    def with_targeted_etags(self, etags: Mapping[int, str]) -> "IssueSyncState":
+        """換掉 per-object ETag 表，並丟掉鏡像裡已經沒有的物件那幾顆。
+
+        物件從鏡像消失（被刪除／transfer 走）之後留著它的 ETag 只會單調長大，
+        而那顆 ETag 也永遠不會再被送出。
+        """
+
+        live = self.by_number
+        return replace(
+            self,
+            targeted_etags=tuple(
+                sorted(
+                    (number, etag) for number, etag in etags.items() if number in live
+                )
+            ),
+        )
 
     def needs_full_sync(self, *, now: str, interval_seconds: float) -> bool:
         """是否該跑每日全量對帳。
@@ -374,6 +434,10 @@ class IssueSyncState:
             value = getattr(self, field_name)
             if value is not None:
                 payload[field_name] = value
+        if self.targeted_etags:
+            payload["targeted_etags"] = {
+                str(number): etag for number, etag in self.targeted_etags
+            }
         return payload
 
     @classmethod
@@ -392,8 +456,35 @@ class IssueSyncState:
         return cls(
             repo=repo,
             entries=tuple(IssueEntry.from_dict(row) for row in entries),
+            targeted_etags=_targeted_etags_from_dict(payload.get("targeted_etags")),
             **optional,
         )
+
+
+def _targeted_etags_from_dict(payload: object) -> tuple[tuple[int, str], ...]:
+    """D4：`{"123": "W/\\"abc\\""}` → `((123, 'W/"abc"'),)`；壞形狀 fail closed。
+
+    與其餘 durable 欄位同一套紀律：半壞的 ETag 表會讓條件請求送出對不上的
+    header，退化成每次 targeted 驗證都全額計費且毫無察覺，所以寧可整份 state
+    退回全量重建。
+    """
+
+    if payload is None:
+        return ()
+    if not isinstance(payload, Mapping):
+        raise IssueSyncStateError("issue sync state targeted_etags must be an object")
+    rows: list[tuple[int, str]] = []
+    for key, value in payload.items():
+        try:
+            number = int(key)
+        except (TypeError, ValueError) as error:
+            raise IssueSyncStateError(
+                f"targeted ETag key is not an issue number: {key!r}"
+            ) from error
+        if number <= 0 or not isinstance(value, str) or not value:
+            raise IssueSyncStateError(f"invalid targeted ETag for {key!r}")
+        rows.append((number, value))
+    return tuple(sorted(rows))
 
 
 def dedupe_entries(entries: Sequence[IssueEntry]) -> tuple[IssueEntry, ...]:
