@@ -66,6 +66,7 @@ __all__ = [
     "TextSignal",
     "StructuredKind",
     "TRANSIENT_SERVICE_MARKERS",
+    "TRANSIENT_SERVICE_MARKER_RE",
     "INTERRUPTION_MARKERS",
     "KNOWN_PROCESS_BANNERS",
     "QUOTA_RE",
@@ -143,21 +144,76 @@ class StructuredKind(str, Enum):
 # 不回 JSON、schema 不合）不在此列，維持 `content` 分類與 fail-closed 意圖
 # ——分辨依據是這些字樣出自 launcher 轉印的服務錯誤，不會出現在合法的規劃
 # 輸出裡。
+#
+# #554：本表**以詞界比對**（見 :data:`TRANSIENT_SERVICE_MARKER_RE`），不再是
+# 裸子字串。裸子字串比對是 #500／#487 同族的無界 token 缺陷——短 marker 對長
+# 訊息的誤中面極大：
+#   - `"503"`／`"429"` 會命中 run id／digest／路徑裡的任意數字片段
+#     （`workflow-1a503f…`、`…/run-4290/report.json`）；
+#   - `"unavailable"` 會命中 `envelope_unavailable`、`provider_unavailable`
+#     這類與服務層無關的內部欄位值。
+# 詞界化的代價是「靠子字串巧合命中的真陽性變體」會落空（`rate limited`、
+# `TimeoutExpired`、`ServiceUnavailable`……）。那些是真訊號，因此改為**顯式
+# 列舉**：表變長是刻意的——寧可每個變體都看得見，也不要再靠子字串巧合。
 TRANSIENT_SERVICE_MARKERS: tuple[str, ...] = (
     "unavailable",
     "503",
     "429",
     "rate limit",
+    # `rate limit` 的英文屈折變體。詞界化前靠 `rate limit` 的子字串涵蓋，
+    # 詞界化後必須各自列出（provider 訊息實測三種都出現過）。
+    "rate limits",
+    "rate limited",
+    "rate limiting",
     "too many requests",
     "timed out",
     "timeout",
+    "timeouts",
+    # CamelCase 例外類名。planning lane 的 reason 格式是
+    # `<stage>-<kind>: <ExceptionTypeName>: <str(exc)[:160]>`，其中
+    # `subprocess.TimeoutExpired` 的訊息（`Command '[...]' timed out after
+    # N seconds`）常因 argv 過長而在 160 字截斷處被切掉「timed out」，此時
+    # **只剩型別名帶得動訊號**。詞界化前靠 `timeout` 的子字串涵蓋。
+    "timeouterror",
+    "timeoutexpired",
     "connection reset",
     "connection refused",
     "overloaded",
     "temporarily",
     "service_unavailable",
+    # 詞界化前靠 `unavailable` 的子字串涵蓋（`_` 與駝峰都算 word char，詞界
+    # 比對不會從 `ServiceUnavailable` 中間切出 `unavailable`）。
+    "serviceunavailable",
     "eligibility check failed",
 )
+
+
+def _compile_marker_pattern(markers: Sequence[str]) -> re.Pattern[str]:
+    """把字面 marker 表編成**詞界**比對的單一 pattern（#554）。
+
+    `\\b` 是「word char ↔ 非 word char 的交界」。因此：
+
+    - `\\b503\\b` 不再命中 `1a503f`（前後都是 word char），但仍命中
+      `code 503`、`(503)`、`HTTP/1.1 503`；
+    - `\\bunavailable\\b` 不再命中 `envelope_unavailable`（`_` 是 word char），
+      但**仍會命中 `<unavailable>`**（`<`／`>` 不是 word char）——詞界解決不了
+      「整個 token 就是 marker」的佔位符相撞，那一半由呼叫端負責：佔位符本身
+      不得含 marker（見 `planning_runtime.
+      PLANNING_WORKTREE_DRIFT_EVIDENCE_PLACEHOLDER`）。兩邊都修才擋得住。
+
+    長 marker 排前面只是為了讓 alternation 的命中片段可讀（本函式只回布林，
+    順序不影響結果）。
+    """
+
+    ordered = sorted(markers, key=len, reverse=True)
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(marker) for marker in ordered) + r")\b",
+        re.IGNORECASE,
+    )
+
+
+#: :data:`TRANSIENT_SERVICE_MARKERS` 的詞界比對 pattern（#554）。
+TRANSIENT_SERVICE_MARKER_RE = _compile_marker_pattern(TRANSIENT_SERVICE_MARKERS)
 
 # Quota：固定週期用量上限（月配額、bulk usage limit），與 rate_limit（滑動時間窗、
 # 通常數十秒到數分鐘內重置）語意不同，值得分開分類以利未來對 quota 採不同的
@@ -259,13 +315,15 @@ def matches_transient_service_markers(reason: str | None) -> bool:
     """判斷一段失敗描述是否命中服務層暫時性樣態（:data:`TRANSIENT_SERVICE_MARKERS`）。
 
     planning lane（`manager._is_planning_transient_service_failure`）的判準即
-    本函式；收編自 #533 的先行實作，行為逐字不變。
+    本函式；收編自 #533 的先行實作。
+
+    #554：比對由裸子字串改為**詞界**（:data:`TRANSIENT_SERVICE_MARKER_RE`），
+    真陽性樣態逐一保留在表內、不靠子字串巧合。
     """
 
     if reason is None:
         return False
-    lowered = reason.lower()
-    return any(marker in lowered for marker in TRANSIENT_SERVICE_MARKERS)
+    return TRANSIENT_SERVICE_MARKER_RE.search(reason) is not None
 
 
 def strip_known_process_banners(lines: Sequence[str]) -> list[str]:

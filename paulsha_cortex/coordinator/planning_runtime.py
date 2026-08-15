@@ -258,6 +258,24 @@ PLANNING_WORKTREE_DRIFT_DIRNAME = "planning-worktree-drift"
 # `backed_up: false`，並且**一律逐出 rollback 範圍**——備份不成功就不准抹除，
 # 是本 issue 最低限度的保命索。
 PLANNING_DRIFT_BACKUP_MAX_BYTES = 64_000_000
+# #554：drift 失敗訊息的**穩定前綴**。這串字是下游分類（`manager.
+# _is_planning_worktree_drift_failure`）唯一可以依賴的部分——訊息尾段已經在
+# #543 改過一次（`changes rolled back` → `operator content preserved`），計數與
+# evidence 路徑更是每次都不同。改動本常數等同改動分類契約，必須同步改判準與
+# 其回歸測試。
+PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX = "planning launcher modified operator worktree"
+# #554：備份與報告雙雙寫不出去時，evidence 欄位的退化佔位符。
+#
+# 原值是 `<unavailable>`，而 `outcome_taxonomy.TRANSIENT_SERVICE_MARKERS` 含裸
+# `"unavailable"`（#533 為 agy 的 `UNAVAILABLE (code 503)` 而收）：於是「備份寫
+# 入失敗」這個純環境事件，會因為佔位符裡有 `unavailable` 六個字而被判成
+# transient-service。詞界比對擋不住這一種——整個 token 就是 marker——所以佔位符
+# 這一側必須自己保證**不含任何 taxonomy marker**。
+#
+# 換佔位符時務必重跑 `tests/test_outcome_taxonomy.py` 的佔位符不變式測試；
+# 注意 `<evidence-unavailable>` 這種看似安全的寫法仍會命中（`-` 不是 word
+# char，詞界照樣成立）。
+PLANNING_WORKTREE_DRIFT_EVIDENCE_PLACEHOLDER = "<not-written>"
 # 受保護的權威文件前綴：這些是 work item 的 source 文件與 cortex 自己登記在
 # `planning_authority` 內的受管產物，不論 `rollback_scope` 怎麼要求都不得被
 # rollback 動到。
@@ -647,9 +665,13 @@ def _operator_drift_message(summary: Mapping[str, object]) -> str:
 
     counts = summary.get("counts")
     counts = counts if isinstance(counts, Mapping) else {}
-    location = summary.get("report_path") or summary.get("backup_root") or "<unavailable>"
+    location = (
+        summary.get("report_path")
+        or summary.get("backup_root")
+        or PLANNING_WORKTREE_DRIFT_EVIDENCE_PLACEHOLDER
+    )
     return (
-        "planning launcher modified operator worktree; operator content preserved "
+        f"{PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX}; operator content preserved "
         f"(added={counts.get('added', 0)} modified={counts.get('modified', 0)} "
         f"removed={counts.get('removed', 0)}); evidence={location}"
     )

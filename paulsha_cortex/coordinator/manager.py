@@ -6320,6 +6320,65 @@ def _is_planning_transient_service_failure(reason: str | None) -> bool:
     return outcome_taxonomy.matches_transient_service_markers(reason)
 
 
+# --- issue #554：operator worktree drift 是環境事件，不是內容缺陷 -------------
+#
+# #507 前，drift 的處置是把 operator worktree 整棵抹除再從 baseline 還原——
+# 那確實會銷毀資料，把它歸 `content`（fail-closed、不給 recover-planning）
+# 在當時是合理的保守。#543 之後處置已改為「一個位元組都不動、只備份與報告」，
+# drift 於是變成一個純粹的環境事件：operator／其他 agent／編輯器在 planning
+# 視窗內動了樹，本次 planning 結果不可信，但**沒有任何東西被破壞**，重跑
+# planning 就好。維持 `content` 只會讓唯一出口是 abandon（燒一個世代），
+# 這是 #507 comment 2 記錄、#543 明文留待後續的死鎖。
+#
+# 判準只認 `planning_runtime` 匯出的穩定前綴：訊息尾段已在 #543 改過一次
+# （`changes rolled back` → `operator content preserved`），計數與 evidence 路徑
+# 每次都不同，任何依賴尾段字面的判準都會再壞一次。
+_PLANNING_WORKTREE_DRIFT_MARKER = planning_runtime.PLANNING_WORKTREE_DRIFT_MESSAGE_PREFIX
+
+
+def _is_planning_worktree_drift_failure(reason: str | None) -> bool:
+    """判斷 planning 失敗的 reason 是否為 operator worktree drift（#507／#554）。
+
+    reason 的實際樣貌是 `run_heterogeneous_brainstorm` 對 launcher 例外包出的
+    `<stage>-<kind>: ValueError: <drift message>`，因此比對用 `in` 而非
+    `startswith`——前綴指的是「drift 訊息自己的前綴」，不是整個 reason 的前綴。
+
+    判準刻意窄：只認 operator worktree 這一族。同一段 finally 另有
+    `planning launcher modified disposable read-only sandbox`（launcher 寫壞了
+    拋棄式沙箱）——那是 launcher 行為異常而非環境並行編輯，不在此列，維持
+    既有 `content` 分類。
+    """
+
+    return reason is not None and _PLANNING_WORKTREE_DRIFT_MARKER in reason
+
+
+def _classify_planning_failure(reason: str | None) -> str:
+    """brainstorm not-ready 的 reason → `environment` / `content` 的**單一判準**。
+
+    #393 的預設是 `content`（fail-closed，`_resume_decision` 不浮現
+    `recover-planning`）。三個具名例外改歸 `environment`：
+
+    1. `_is_planning_authority_residue_failure`（#416）——abandon 未回滾的發佈
+       殘留撞見 authority fail-closed，是狀態殘留而非模型內容缺陷。
+    2. `_is_planning_transient_service_failure`（#533）——launcher/service 層
+       的暫時性錯誤（503／限流／逾時），幾分鐘後自癒。
+    3. `_is_planning_worktree_drift_failure`（#507／#554）——operator worktree
+       在 planning 視窗內被動過；#543 之後不再銷毀資料，是環境事件。
+
+    三個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
+    單一可測的入口（過去它只以三元表達式活在 `_run_define_stage` 中段，測不到
+    也看不見）。
+    """
+
+    if (
+        _is_planning_authority_residue_failure(reason)
+        or _is_planning_transient_service_failure(reason)
+        or _is_planning_worktree_drift_failure(reason)
+    ):
+        return "environment"
+    return "content"
+
+
 # --- issue #511：planning artifact 拒收的診斷面 -------------------------------
 #
 # 修法前拒收只丟一句 `planning artifact is not accepted: <path>`：
@@ -9419,6 +9478,9 @@ def apply_workflow_action(
         # 例外二——`_is_planning_transient_service_failure`：launcher/service 層
         # 的暫時性錯誤（503/限流/逾時；agy 實測會印錯誤文字但 exit 0），同歸
         # `environment`。一個幾分鐘後自癒的服務錯誤不得被判成 `content` 死路。
+        # 例外三（#554）——`_is_planning_worktree_drift_failure`：operator
+        # worktree 在 planning 視窗內被動過。#543 之後 drift 不再銷毀任何資料
+        # （只備份與報告），語意上就是環境事件，同歸 `environment`。
         brainstorm_not_ready_reason = result.reason or "brainstorm-not-ready"
         run = registry._manager_update_workflow_run(
             run.run_id,
@@ -9427,12 +9489,7 @@ def apply_workflow_action(
             evidence_refs=_record_planning_failure_evidence(
                 run,
                 coordinator_root=transaction_root,
-                classification=(
-                    "environment"
-                    if _is_planning_authority_residue_failure(brainstorm_not_ready_reason)
-                    or _is_planning_transient_service_failure(brainstorm_not_ready_reason)
-                    else "content"
-                ),
+                classification=_classify_planning_failure(brainstorm_not_ready_reason),
                 reason=brainstorm_not_ready_reason,
             ),
         )
