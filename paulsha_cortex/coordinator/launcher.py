@@ -297,6 +297,61 @@ def _claude_review_settings(worktree: str) -> str:
     return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
+# #506 / D5：headless job 的事件 hook 命令。`cortex headless-hook post-tool-use`
+# 讀 stdin 的 PostToolUse payload，把被動過的 GitHub 物件寫進 monitor 的 D4 event
+# spool（見 `porcelain/headless_hook.py`）。
+#
+# `|| true`：hook 掛在別人（job）的工作路徑上。CLI 本身已一律 exit 0，這一段兜的是
+# CLI 之外的失敗——`cortex` 不在 PATH（127）、套件安裝損壞、python 起不來。任何情況
+# 下 hook 都不得讓 job 看到非零 exit（PostToolUse 的非零 exit 會被回報成 hook 失敗，
+# 甚至把 stderr 回饋給模型）。
+_CLAUDE_SPOOL_HOOK_COMMAND = "cortex headless-hook post-tool-use || true"
+
+# 逾時上限：hook 只寫一個本機檔案（外加最多一次本機 `git config` 讀取），秒級都嫌多；
+# 設上限是為了「hook 永不阻塞 job」這條硬約束，不是為了正常路徑。
+_CLAUDE_SPOOL_HOOK_TIMEOUT_SECONDS = 10
+
+
+def _claude_spool_hook_settings() -> str:
+    """Build the per-job PostToolUse hook settings for a headless Claude builder.
+
+    #506 / D5，使用者硬約束「**hook 不得影響正常的互動式 agent 使用**」的第一道
+    結構保證：這份宣告是每次 `launch()` 現場組出來、經 argv 的 `--settings` 交給
+    這一個 job 的行程，**從不寫入任何檔案**——尤其不寫 `~/.claude/settings.json`。
+    operator 自己開的互動 session 讀的是 operator 的設定，那裡永遠沒有這個 hook。
+
+    刻意只宣告 `hooks`：`--settings` 是與其他設定來源合併的一層 overlay，因此
+    builder job 既有的 operator 設定（permissions allowlist 等）原封不動——換成
+    hermetic `CLAUDE_CONFIG_DIR`（#404 為 planning 的純 JSON 回聲任務所做的選擇）
+    會把那些設定一併抽掉，對 builder 是遠超出 D5 範圍的行為變更（例如失去
+    permissions allowlist 會讓 headless job 卡在無人可核可的授權提示）。
+
+    第二道保證在 hook 自己身上：`porcelain/headless_hook.py` 沒有 `PSC_JOB_ID`
+    就是完全的 no-op。兩道保證彼此獨立。
+    """
+
+    settings = {
+        "hooks": {
+            "PostToolUse": [
+                {
+                    # 只掛 Bash：GitHub 物件的 mutation 一律經 `gh`（CLI 或 `gh api`）
+                    # 發生。其餘工具（Read/Edit/Task…）不可能動到遠端物件，掛上去
+                    # 只會讓每次 tool call 都多跑一個沒事做的行程。
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": _CLAUDE_SPOOL_HOOK_COMMAND,
+                            "timeout": _CLAUDE_SPOOL_HOOK_TIMEOUT_SECONDS,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
 def _git_scope_env() -> dict[str, str]:
     """Drop inherited Git repository/config selectors before scope binding."""
 
@@ -597,6 +652,14 @@ def build_claude_argv(
             "--no-chrome",
             "--no-session-persistence",
         ]
+    else:
+        # #506 / D5：只有 builder（可寫入、有 Bash、會動 GitHub 物件的那一種 job）
+        # 掛事件 hook。
+        # - read_only planner 走 `--tools ""`，連 Bash 都沒有，掛了也永遠不會觸發；
+        # - review_only reviewer 是 read-only 契約，且它的 `--settings` 是那份
+        #   sandbox 政策（deny 掉 $HOME 讀寫），事件根本寫不出去。
+        # 這一行是 hook 的**唯一**注入點：per-job、走 argv、不落地任何檔案。
+        argv += ["--settings", _claude_spool_hook_settings()]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None and not review_only:
@@ -938,6 +1001,7 @@ class SubprocessLauncher:
             env = {
                 **_git_scope_env(),
                 "PSC_SLICE_ID": slice_id,
+                "PSC_JOB_ID": slice_id,
                 "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
             }
             if self._relay_target is not None:
@@ -1006,6 +1070,12 @@ class SubprocessLauncher:
             env = {
                 **_git_scope_env(),
                 "PSC_SLICE_ID": slice_id,
+                # #506 / D5：cortex 派工的 headless job 標記。事件 hook 以它自守
+                # ——沒有這個變數就是完全的 no-op（見 `porcelain/headless_hook.py`）。
+                # 互動 session 的環境裡不存在，因此 hook 即使被誤裝也不會有事件。
+                # reviewer 分支刻意不設：它走 read-only 契約、不掛 hook，marker 與
+                # 注入點成對出現才不會出現「有標記卻沒 hook」的半套狀態。
+                "PSC_JOB_ID": slice_id,
                 "PSC_REPO_ROOT": str(Path(__file__).resolve().parents[2]),
             }
             if self._relay_target is not None:
