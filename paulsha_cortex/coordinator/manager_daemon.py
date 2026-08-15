@@ -952,7 +952,14 @@ def build_periodic_tick_runner(
                     or "needs_human" in workflow.facets
                 ):
                     continue
-                if workflow.current_phase not in {"plan", "build", "verify", "review"}:
+                # #536：define 必須在集合內。實測 run `workflow-7a430d31eff66ef13630`
+                # 停在 define/ongoing/facets 空（brainstorm 已發佈 artifacts 但 run
+                # 狀態未推進——發佈與狀態更新非同一事務），而 resume 迴圈排除
+                # define 使它**對所有恢復機制永久隱形**：無 facet 可呈現、無
+                # next_actions、無任何 tick 會再碰它。resume_workflow_run 本身
+                # 完整支援 define（先 reconcile planning publication transaction、
+                # 再 dispatch planner 卡），排除毫無必要。
+                if workflow.current_phase not in {"define", "plan", "build", "verify", "review"}:
                     continue
                 try:
                     active_ship_validator = workflow_ship_validator
