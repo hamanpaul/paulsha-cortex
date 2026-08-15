@@ -35,6 +35,8 @@ from paulsha_cortex.coordinator import terminal_contract as tc
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 # ==========================================================================
 # 段 1：doctor 前置驗證 gate 宣告存在且非空
@@ -375,6 +377,7 @@ def _stuck_run(tmp_path: Path):
         candidate_head=HEAD,
         facets=("needs_human",),
         gate_status="failed",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     worktree = tmp_path / "worktree"
     worktree.mkdir()

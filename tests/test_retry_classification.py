@@ -18,6 +18,8 @@ from paulsha_cortex.coordinator import work_actions
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowRun, WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 HEAD = "b" * 40
 NOW = "2026-07-27T00:00:00+00:00"
@@ -318,6 +320,7 @@ def test_retry_build_result_carries_orchestrator_retry_for_unbound_terminalizati
         candidate_head=HEAD,
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     job_args = {
         "task": "wf-demo-subagent-build",
@@ -383,6 +386,7 @@ def test_retry_build_result_carries_model_repair_after_review_needs_human(
         verified_head=HEAD,
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     result = work_actions.execute_work_action(
         args={

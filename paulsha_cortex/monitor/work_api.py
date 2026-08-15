@@ -252,7 +252,29 @@ class WorkReadModelStore:
             retries = self._schema_retry(item.repo, item.work_id)
             if retries:
                 envelope["schema_retry"] = retries
+            # 診斷 invariant（#527）：run 掛著 needs_human 時把結構化理由帶出來。
+            # 資料源與 `schema_retry` 完全相同（workflow provider 的
+            # observations），欄位名沿用 `claim.ClaimDecision.blocking_reason`
+            # ——那是全庫既有的「為什麼卡住」欄位，不另發明平行體系。
+            blocking = self._needs_human_reason(item.repo, item.work_id)
+            if blocking:
+                envelope["blocking_reason"] = blocking
             return envelope
+
+    def _needs_human_reason(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:"):
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("needs_human_reasons", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found.get("reason"):
+                return dict(found)
+        return {}
 
     def _schema_retry(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():

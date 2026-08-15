@@ -12,6 +12,11 @@ from typing import Any, Callable, Mapping
 from paulsha_cortex.config import paths
 from . import verification
 from .claim import claim_key_for_authority_digest
+from .diagnostics import (
+    DiagnosticInvariantError,
+    DiagnosticReason,
+    coerce_diagnostic_reason,
+)
 from .usage_extractors import extract_usage
 from .workflow import (
     GateEvidenceRef,
@@ -1464,6 +1469,49 @@ class JobRegistry:
         self._persist()
         return _deepcopy_json(entry)
 
+    # --- 診斷 invariant 的強制點（#527／#514／#515／#511／#482）-----------------
+    #
+    # 這是全庫**唯一**能把 `needs_human` facet 寫進 run row 的兩個入口
+    # （`_manager_create_workflow_run`／`_manager_update_workflow_run`）。invariant
+    # 因此在這裡強制，而不是逐個呼叫端人工檢查——五次逐案補洞已證明後者無效。
+    #
+    # 規則只有三條：
+    #   1. 這次更新把 `needs_human` **加進**facets（先前沒有）→ 必須帶
+    #      `needs_human_reason`，否則 `DiagnosticInvariantError`。
+    #   2. 這次更新把 `needs_human` **移出**facets → 理由一併清掉（陳舊理由比沒
+    #      理由更糟；見 `WorkflowRun.__post_init__`）。
+    #   3. facet 已經在、這次沒帶新理由 → 沿用既有理由（大量呼叫端會在同一個
+    #      run 上重複寫 `facets=("needs_human",)`，不該因此把第一次的理由洗掉）。
+    #
+    # **範圍**：本層只管理由有沒有落地，不改任何呼叫端的後續處置。
+    @staticmethod
+    def _resolve_needs_human_reason(
+        *,
+        run_id: str,
+        current_facets: tuple[str, ...],
+        next_facets: tuple[str, ...],
+        current_reason: dict[str, Any] | None,
+        supplied: DiagnosticReason | Mapping[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        reason = coerce_diagnostic_reason(supplied)
+        blocked = "needs_human" in next_facets
+        if reason is not None and not blocked:
+            raise DiagnosticInvariantError(
+                "workflow run 帶了 needs_human_reason 卻沒有設 needs_human facet"
+                f"（fail-closed）: {run_id}"
+            )
+        if not blocked:
+            return None
+        if reason is not None:
+            return reason.to_dict()
+        if "needs_human" not in current_facets:
+            raise DiagnosticInvariantError(
+                "把 workflow run 轉入 needs_human 必須同時提供結構化理由"
+                "（diagnostics.DiagnosticReason：機器可讀 reason ＋ 人可讀 detail "
+                f"＋ 來源位置）: {run_id}"
+            )
+        return dict(current_reason) if current_reason is not None else None
+
     def _manager_create_workflow_run(
         self,
         *,
@@ -1495,6 +1543,7 @@ class JobRegistry:
         frozen_readiness: dict[str, Any] | None = None,
         model_chain_override: dict[str, dict[str, str]] | None = None,
         combo_selection: dict[str, Any] | None = None,
+        needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
         matches = [
             existing
@@ -1524,6 +1573,13 @@ class JobRegistry:
         if any(run.run_id == run_id for run in self._workflows):
             raise ValueError(f"workflow run id collision: {run_id}")
         now = _now_iso()
+        resolved_needs_human_reason = self._resolve_needs_human_reason(
+            run_id=run_id,
+            current_facets=(),
+            next_facets=tuple(facets),
+            current_reason=None,
+            supplied=needs_human_reason,
+        )
         run = WorkflowRun(
             run_id=run_id,
             work_id=work_id,
@@ -1557,6 +1613,7 @@ class JobRegistry:
             frozen_readiness=frozen_readiness,
             model_chain_override=model_chain_override,
             combo_selection=combo_selection,
+            needs_human_reason=resolved_needs_human_reason,
         )
         superseded_at = _now_iso()
         next_workflows = [
@@ -1613,11 +1670,20 @@ class JobRegistry:
         model_chain_override: dict[str, dict[str, str]] | None = None,
         resolved_model_chain: dict[str, dict[str, str]] | None = None,
         combo_selection: dict[str, Any] | None = None,
+        needs_human_reason: DiagnosticReason | Mapping[str, Any] | None = None,
     ) -> WorkflowRun:
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
         next_phase = current.current_phase if current_phase is None else current_phase
         validate_workflow_phase_transition(current.current_phase, next_phase)
+        next_facets = current.facets if facets is None else tuple(facets)
+        resolved_needs_human_reason = self._resolve_needs_human_reason(
+            run_id=run_id,
+            current_facets=current.facets,
+            next_facets=next_facets,
+            current_reason=current.needs_human_reason,
+            supplied=needs_human_reason,
+        )
         updated = WorkflowRun(
             run_id=current.run_id,
             work_id=current.work_id,
@@ -1642,7 +1708,7 @@ class JobRegistry:
             primary_domain=current.primary_domain if primary_domain is None else primary_domain,
             candidate_head=current.candidate_head if candidate_head is None else candidate_head,
             verified_head=current.verified_head if verified_head is None else verified_head,
-            facets=current.facets if facets is None else tuple(facets),
+            facets=next_facets,
             gate_status=current.gate_status if gate_status is None else gate_status,
             created_at=current.created_at,
             updated_at=_now_iso(),
@@ -1712,6 +1778,7 @@ class JobRegistry:
             frozen_readiness=(
                 current.frozen_readiness if frozen_readiness is None else frozen_readiness
             ),
+            needs_human_reason=resolved_needs_human_reason,
         )
         self._workflows[index] = updated
         self._persist()
@@ -1754,6 +1821,9 @@ class JobRegistry:
             candidate_head=candidate_head,
             verified_head=None,
             facets=(),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             updated_at=_now_iso(),
         )
@@ -1868,6 +1938,9 @@ class JobRegistry:
             facets=tuple(
                 facet for facet in current.facets if facet != "needs_human"
             ),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             retry_classification=(
                 current.retry_classification
@@ -1959,6 +2032,9 @@ class JobRegistry:
                 "build": current.attempts.get("build", 0) + 1,
             },
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             retry_classification=(
                 current.retry_classification
@@ -2080,6 +2156,9 @@ class JobRegistry:
             candidate_head=adopted_candidate,
             verified_head=None,
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             evidence_refs=evidence_refs,
             updated_at=_now_iso(),
@@ -2150,6 +2229,9 @@ class JobRegistry:
             gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
             verified_head=None,
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             retry_classification=(
                 current.retry_classification
@@ -2224,6 +2306,9 @@ class JobRegistry:
             },
             gate_refs=tuple(ref for ref in current.gate_refs if ref.kind == "brainstorm"),
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             retry_classification=(
                 current.retry_classification
@@ -2303,6 +2388,9 @@ class JobRegistry:
             source_revision=authority_digest,
             verified_head=None,
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
+            # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
+            # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
+            needs_human_reason=None,
             gate_status="running",
             retry_classification="authority_restart",
             updated_at=_now_iso(),

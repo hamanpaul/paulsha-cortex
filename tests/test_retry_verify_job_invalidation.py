@@ -14,6 +14,8 @@ import pytest
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 CANDIDATE = "c" * 40
 
 
@@ -58,6 +60,7 @@ def _run_with_exited_verify_job(tmp_path: Path):
         attempts={"claim": 1, "verify": 1},
         facets=("needs_human",),
         candidate_head=CANDIDATE,
+        needs_human_reason=fixture_needs_human_reason(),
     )
     job = registry.create_job(
         task="wf-demo-verification",
@@ -156,6 +159,7 @@ def test_retry_review_reset_marks_exited_review_job_failed(tmp_path: Path) -> No
         facets=("needs_human",),
         candidate_head=CANDIDATE,
         verified_head=CANDIDATE,
+        needs_human_reason=fixture_needs_human_reason(),
     )
     job = registry.create_job(
         task="wf-demo-code-review",

@@ -69,6 +69,33 @@
   `changelog.d/marker-word-boundary.md`。新增
   `tests/test_planning_drift_classification_554.py`（47 個回歸測試）。
 
+- **診斷 invariant 家族（#527／#514／#515／#511／#482）：把「理由」從慣例升格成型別**
+  ——0813–0814 **五次**獨立命中同一條缺口：狀態被推向「人要接手」的那一刻，理由沒有
+  跟著落地。#527 的 build 階段無聲掛 `needs_human`（無 evidence、無 slice、
+  `cortex status` 不呈現、`next_actions` 空）、#514 的 brainstorm 重驗例外不含路徑與
+  原因、#515 的 `_post_integration_artifact_evidence()` **14 個裸 `return None`** 塌
+  縮成不透明的 `primary-artifact-invalid`、#511 的 planning artifact 拒收原因到不了
+  run、#482 的 absent evidence key 不含原因或 identity——五個形態不同、根卻同一條，
+  逐案補洞（#397／#408／#513 各補過一次）已證明無效。**invariant**：任何把 run 轉入
+  `needs_human`、或把 evidence 標為 absent 的狀態變更，必須同時落一份結構化理由（機
+  器可讀 reason ＋ 人可讀 detail ＋ 來源位置）並可由 `cortex status`／`work show` 曝
+  光。修法是把驗證層擋在**唯一**的進入點上：新增 `coordinator/diagnostics.py` 的
+  `DiagnosticReason`，並在 registry 的兩個狀態轉移 API（全庫唯一能把 `needs_human`
+  寫進 run row 的入口）強制「加 facet 必須帶理由／移除 facet 一併清理由／facet 已在
+  則沿用既有理由」三條規則，`WorkflowRun` 新增 `needs_human_reason` 欄位持有它；既有
+  部署那種「facet 有、理由沒有」的 legacy run 刻意放行，載入時 fail-closed 會把
+  manager 打掛。配套的**掃描式 invariant 測試**以 AST 枚舉全庫所有設置點斷言每一個都
+  帶理由（另有反證測試防止掃描器壞掉偽裝成通過）。呈現面：`manager.workflow_status_
+  entry()` 把 ongoing 且 needs_human 的 run 投影進 `cortex status` 的 `attention`
+  ——過去狀態快照 provider 只走 `list_slices()`，而 workflow lane 從不建立 slice
+  row，run 在五份清單裡一份都不出現；理由另經 monitor observations 曝光到
+  `cortex work show` 的 `blocking_reason`。#482 另把 pre-launch absent evaluation 的
+  落點納入原因與請求身分的指紋，`missing → unknown → registered` 這條合法的設定推進
+  不再需要刪 evidence 才能前進。**範圍紀律**：只修診斷與理由，後續處置（retry／
+  needs_human／fail-closed 邏輯）一律不變；呈現面沿用既有欄位機制，未另立平行欄位體
+  系。詳見 `changelog.d/diagnostic-invariant-family.md`。新增
+  `tests/test_diagnostic_invariant_family_527.py`（32 個測試）。
+
 - **Issue #536（後半）：planning artifacts 發佈與 run 狀態更新不是同一事務，中間態對
   所有恢復迴圈永久隱形**——define 的 brainstorm 有兩次分離的 durable 寫入：先發佈
   spec/design/plan 到 operator worktree，再把 run 推進到 `plan` 並寫入 gate_refs／

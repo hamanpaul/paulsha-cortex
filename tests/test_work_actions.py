@@ -24,6 +24,8 @@ from paulsha_cortex.coordinator.preflight import CommandResult, PreflightResult
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import GateEvidenceRef, PlanningArtifactAuthority
 
+from diagnostic_fixtures import fixture_needs_human_reason
+
 
 HEAD = "a" * 40
 TREE = "b" * 40
@@ -350,6 +352,7 @@ def test_retry_build_requires_exact_candidate_and_resets_downstream_authority(
         facets=("needs_human",),
         gate_refs=(GateEvidenceRef("foreign-review", "/evidence/review.json", "f" * 64),),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     args = {
         "action": "retry-build",
@@ -452,6 +455,7 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
         facets=("needs_human", "degraded"),
         gate_refs=(GateEvidenceRef("foreign-review", "/evidence/review.json", "f" * 64),),
         gate_status="failed",
+        needs_human_reason=fixture_needs_human_reason(),
     )
 
     result = work_actions.execute_work_action(
@@ -538,6 +542,7 @@ def test_retry_build_recovers_unbound_builder_terminalization(
         candidate_head=HEAD,
         facets=("needs_human",),
         gate_status="running",
+        needs_human_reason=fixture_needs_human_reason(),
     )
     job_args = {
         "task": "wf-demo-subagent-build",
@@ -1361,6 +1366,7 @@ def test_review_attest_writes_immutable_exact_head_evidence(
         gate_refs=(GateEvidenceRef("foreign-review", "/evidence/foreign.json", "f" * 64),),
         gate_status="passed",
         facets=("needs_human", "degraded"),
+        needs_human_reason=fixture_needs_human_reason(),
     )
 
     class GitHub:
@@ -1479,6 +1485,7 @@ def test_ship_reenters_copilot_stop_through_bound_maintainer_review(
         ),
         gate_status="passed",
         facets=("needs_human",),
+        needs_human_reason=fixture_needs_human_reason(),
     )
     _initialize_delivery_journal(snapshot=snapshot, state=state)
     persisted = json.loads(state.read_text(encoding="utf-8"))
@@ -2457,6 +2464,7 @@ def test_ship_resume_rearms_prebinding_target_cardinality_stop(tmp_path: Path) -
         run.run_id,
         source_revision=work_authority_digest(authority),
         facets=("needs_human", "degraded"),
+        needs_human_reason=fixture_needs_human_reason(),
     )
     work_bridge._rebase_delivery_journal_authority(
         state_root=state.parent,

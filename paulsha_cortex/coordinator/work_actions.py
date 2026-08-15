@@ -21,6 +21,7 @@ from paulsha_cortex.config import paths
 from paulsha_cortex._yaml import safe_load
 from paulsha_cortex.github_rate_limit import is_rate_limit_signal
 
+from .diagnostics import diagnostic_reason
 from .claim import (
     AUTO_LABEL,
     ClaimCandidate,
@@ -1406,6 +1407,18 @@ def _fallback_workflow_starter(workflow_registry, state_path: Path):
             attempts={"claim": 1, "define": 1},
             facets=("needs_human",) if reason is not None else (),
             gate_status="running",
+            needs_human_reason=(
+                diagnostic_reason(
+                    "claim-blocked",
+                    f"claim 判定需要人工介入即建立 run：{reason}",
+                    source="work_actions._fallback_workflow_starter",
+                    work_id=bound_authority.work_id,
+                    repo=bound_authority.repo,
+                    claim_key=claim_key,
+                )
+                if reason is not None
+                else None
+            ),
         )
 
     return start
@@ -4321,6 +4334,17 @@ def _ship_action(
             canonical_run.run_id,
             facets=("needs_human",),
             gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                "multiple-delivery-targets-unsupported",
+                "work item 綁到多於一組交付目標（PR／openspec change／todo 路徑），"
+                f"ship lane 不支援：prs={len(authority.mapped_prs)} "
+                f"openspec={len(authority.mapped_openspec)} "
+                f"todo={len(authority.mapped_todo_paths)}",
+                source="work_actions._ship_action:delivery-targets",
+                run_id=canonical_run.run_id,
+                work_id=canonical_run.work_id,
+                repo=authority.repo,
+            ),
         )
         return {
             "action": "needs_human",
@@ -4557,7 +4581,19 @@ def _ship_action(
             }
             _save_runs(state_path, state)
             workflow_registry._manager_update_workflow_run(
-                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+                canonical_run.run_id,
+                facets=("needs_human",),
+                gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "merged-awaiting-closure",
+                    "PR 已在遠端 merge，本地 closeout（openspec archive／todo 回寫）"
+                    "尚未完成，需要人工接手收尾",
+                    source="work_actions._ship_action:merged-awaiting-closure",
+                    run_id=canonical_run.run_id,
+                    work_id=canonical_run.work_id,
+                    head=expected_head,
+                    merge_commit=merge_status.merge_commit,
+                ),
             )
             return {"action": "merged-awaiting-closure", "head": expected_head}
 
@@ -4637,7 +4673,19 @@ def _ship_action(
             }
             _save_runs(state_path, state)
             workflow_registry._manager_update_workflow_run(
-                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+                canonical_run.run_id,
+                facets=("needs_human",),
+                gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "external-merge-without-authorization",
+                    "PR 在 cortex 授權之外被 merge（本地沒有對應的 merge "
+                    "authorization 紀錄），交付鏈路不得自行採信",
+                    source="work_actions._ship_action:external-merge",
+                    run_id=canonical_run.run_id,
+                    work_id=canonical_run.work_id,
+                    head=preflight.head,
+                    tree_hash=preflight.tree_hash,
+                ),
             )
             return {
                 "action": "needs_human",
@@ -4704,7 +4752,19 @@ def _ship_action(
             }
             _save_runs(state_path, state)
             workflow_registry._manager_update_workflow_run(
-                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+                canonical_run.run_id,
+                facets=("needs_human",),
+                gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "copilot-finding-budget-exhausted",
+                    f"Copilot review 修復輪次已達上限（{fix_rounds}/{max_fix_rounds}），"
+                    "不再自動重跑",
+                    source="work_actions._ship_action:copilot-budget",
+                    run_id=canonical_run.run_id,
+                    work_id=canonical_run.work_id,
+                    head=preflight.head,
+                    fix_rounds=str(fix_rounds),
+                ),
             )
             return {
                 "action": "needs_human",
@@ -4753,7 +4813,18 @@ def _ship_action(
         if float(now_epoch) - float(requested_at) > 15 * 60:
             active["ship"] = {**ship, "phase": "needs_human", "reason": "copilot-review-timeout"}
             workflow_registry._manager_update_workflow_run(
-                canonical_run.run_id, facets=("needs_human",), gate_status="running"
+                canonical_run.run_id,
+                facets=("needs_human",),
+                gate_status="running",
+                needs_human_reason=diagnostic_reason(
+                    "copilot-review-timeout",
+                    "已請求 Copilot review 超過 15 分鐘仍未收到對應 HEAD 的回覆",
+                    source="work_actions._ship_action:copilot-timeout",
+                    run_id=canonical_run.run_id,
+                    work_id=canonical_run.work_id,
+                    head=preflight.head,
+                    requested_at=str(requested_at),
+                ),
             )
             _save_runs(state_path, state)
             return {"action": "needs_human", "reason": "copilot-review-timeout"}
@@ -4795,7 +4866,19 @@ def _ship_action(
         active["ship"] = {**ship, "phase": "needs_human", "reason": copilot.reason}
         _save_runs(state_path, state)
         workflow_registry._manager_update_workflow_run(
-            canonical_run.run_id, facets=("needs_human",), gate_status="running"
+            canonical_run.run_id,
+            facets=("needs_human",),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                str(copilot.reason),
+                f"Copilot review loop 判定為需要人工介入：{copilot.reason}"
+                f"（阻擋性 findings {finding_count} 條）",
+                source="work_actions._ship_action:copilot-review-loop",
+                run_id=canonical_run.run_id,
+                work_id=canonical_run.work_id,
+                head=preflight.head,
+                fix_rounds=str(fix_rounds),
+            ),
         )
         extra = (
             _repair_budget_status(

@@ -951,54 +951,163 @@ def _validate_primary_integration(
     }
 
 
+# --- issue #515：post-integration artifact 檢查的 14 個裸 return None ----------
+#
+# 修法前這個函式的每一條失敗路徑都是 `return None`：symlink、路徑逃逸、非一般
+# 檔案、UTF-8 解碼失敗、`assess_planning_artifact()` 判定不合格……語意完全不同
+# 的失敗全部塌縮成同一個回傳值，呼叫端只能給出 `primary-artifact-invalid` 五個
+# 字。operator 因此無法分辨究竟是「planner 產出的內容不合驗收條件」（可改
+# prompt／需人工裁決）還是「檔案系統層的路徑／權限／編碼問題」（環境問題，
+# 處置完全不同），也不知道是哪一個 artifact。
+#
+# 這正是 #397／#408 已針對「裸吞分支」做過兩輪儀器化、本函式是同一類規模最大
+# 的殘留。改法與那兩輪一致：把失敗升格成帶原因的值。
+#
+# **範圍**：只改「回傳什麼」，不改「呼叫端據此做什麼」——`primary-artifact-invalid`
+# 仍然 needs_human＋rollback_publication，classification 仍然走既有判準。
+@dataclass(frozen=True)
+class ArtifactEvidenceFailure:
+    """一條 post-integration 檢查失敗的結構化原因。"""
+
+    reason: str
+    detail: str
+    ref: str | None = None
+    assessment: ArtifactAssessment | None = None
+
+    def rendered(self) -> str:
+        """壓成單行 reason 字串，供 `BrainstormResult.reason` 使用。
+
+        欄位順序刻意排成 reason → ref → detail：上游
+        `manager._publish_planning_artifacts` 的訊息會再被
+        `str(exc)[:160]` 截斷一次（見 #513 的教訓），最短、最關鍵的分類碼與
+        路徑必須排在最前面才能存活。
+        """
+
+        parts = [self.reason]
+        if self.ref is not None:
+            parts.append(f"ref={self.ref}")
+        parts.append(self.detail)
+        return " ".join(" ".join(str(part).split()) for part in parts)
+
+
+# 內容類：planner 寫出來的東西不合驗收條件——改 prompt／人工裁決可能有效。
+ARTIFACT_EVIDENCE_CONTENT_REASONS = frozenset(
+    {
+        "artifact-assessment-rejected",
+        "post-integration-incomplete",
+        "integration-resolutions-invalid",
+    }
+)
+# 環境類：檔案系統／編碼層面的問題——重跑同一個 planner 不會有幫助。
+ARTIFACT_EVIDENCE_ENVIRONMENT_REASONS = frozenset(
+    {
+        "artifact-root-unresolvable",
+        "artifact-path-escapes-root",
+        "artifact-symlink-rejected",
+        "artifact-not-a-regular-file",
+        "artifact-unreadable",
+    }
+)
+
+
 def _post_integration_artifact_evidence(
     integration: Mapping[str, object],
     artifact_root: str | Path,
     original_report: CompletenessReport,
-) -> tuple[dict[str, str], ...] | None:
+    *,
+    rejection_recorder: Callable[[ArtifactAssessment], str | None] | None = None,
+) -> tuple[dict[str, str], ...] | ArtifactEvidenceFailure:
+    """回傳 artifact evidence，或一條說明「為什麼不行」的 :class:`ArtifactEvidenceFailure`。
+
+    ``rejection_recorder`` 由呼叫端注入（manager 會傳
+    ``_record_planning_artifact_rejection_evidence`` 的閉包），讓
+    assessment 類拒收沿用 #513 的 ``cortex-planning-artifact-rejection/v1``
+    evidence 落檔——被拒內容會在稍後的 ``rollback_publication()`` 被撤下，不先
+    存一份 operator 就再也看不到 planner 到底寫了什麼。
+    """
+
     try:
         root = Path(artifact_root).resolve()
-    except OSError:
-        return None
+    except OSError as exc:
+        return ArtifactEvidenceFailure(
+            "artifact-root-unresolvable",
+            f"artifact root 無法解析: {type(exc).__name__}: {str(exc)[:120]}",
+        )
     rows = integration.get("resolutions")
     if not isinstance(rows, list):
-        return None
+        return ArtifactEvidenceFailure(
+            "integration-resolutions-invalid", "integration.resolutions 不是 list"
+        )
     integrated: dict[str, PlanningArtifact] = {}
-    for row in rows:
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            return None
+            return ArtifactEvidenceFailure(
+                "integration-resolutions-invalid", f"resolutions[{index}] 不是 object"
+            )
         kind = row.get("artifact_kind")
         refs = row.get("artifact_refs")
-        if kind not in PLANNING_KINDS or not isinstance(refs, list) or not refs:
-            return None
+        if kind not in PLANNING_KINDS:
+            return ArtifactEvidenceFailure(
+                "integration-resolutions-invalid",
+                f"resolutions[{index}].artifact_kind 非法: {kind!r}",
+            )
+        if not isinstance(refs, list) or not refs:
+            return ArtifactEvidenceFailure(
+                "integration-resolutions-invalid",
+                f"resolutions[{index}].artifact_refs 必須是非空 list",
+            )
         for ref in refs:
             if not isinstance(ref, str) or not ref.strip():
-                return None
+                return ArtifactEvidenceFailure(
+                    "integration-resolutions-invalid",
+                    f"resolutions[{index}].artifact_refs 含空白或非字串項目",
+                )
             relative = Path(ref)
             if relative.is_absolute() or ".." in relative.parts:
-                return None
+                return ArtifactEvidenceFailure(
+                    "artifact-path-escapes-root",
+                    "artifact ref 為絕對路徑或含 `..`，逃出 artifact root",
+                    ref=ref,
+                )
             try:
                 unresolved = root / relative
                 if unresolved.is_symlink():
-                    return None
+                    return ArtifactEvidenceFailure(
+                        "artifact-symlink-rejected",
+                        "artifact 路徑是 symlink（發佈鏈路一律拒收）",
+                        ref=ref,
+                    )
                 path = unresolved.resolve()
                 path.relative_to(root)
                 if path.is_symlink() or not path.is_file():
-                    return None
+                    return ArtifactEvidenceFailure(
+                        "artifact-not-a-regular-file",
+                        "artifact 解析後不是一般檔案（symlink／目錄／不存在）",
+                        ref=ref,
+                    )
                 text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError, ValueError):
-                return None
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                return ArtifactEvidenceFailure(
+                    "artifact-unreadable",
+                    f"讀取 artifact 失敗: {type(exc).__name__}: {str(exc)[:120]}",
+                    ref=ref,
+                )
             artifact = PlanningArtifact(kind=str(kind), ref=ref, text=text)
-            if not assess_planning_artifact(artifact).accepted:
-                return None
+            assessment = assess_planning_artifact(artifact)
+            if not assessment.accepted:
+                return _artifact_assessment_failure(assessment, rejection_recorder)
             integrated[ref] = artifact
 
     post_integration: dict[str, PlanningArtifact] = {}
-    for assessment in original_report.assessments:
-        original = assessment.artifact
+    for assessment_row in original_report.assessments:
+        original = assessment_row.artifact
         relative = Path(original.ref)
         if relative.is_absolute() or ".." in relative.parts:
-            return None
+            return ArtifactEvidenceFailure(
+                "artifact-path-escapes-root",
+                "既有 artifact ref 為絕對路徑或含 `..`，逃出 artifact root",
+                ref=original.ref,
+            )
         replacement = integrated.get(original.ref)
         if replacement is not None:
             post_integration[original.ref] = PlanningArtifact(
@@ -1010,7 +1119,11 @@ def _post_integration_artifact_evidence(
         unresolved = root / relative
         try:
             if unresolved.is_symlink() or not unresolved.is_file():
-                return None
+                return ArtifactEvidenceFailure(
+                    "artifact-not-a-regular-file",
+                    "整合階段未覆寫的既有 artifact 不是一般檔案（symlink／不存在）",
+                    ref=original.ref,
+                )
             resolved = unresolved.resolve()
             resolved.relative_to(root)
             post_integration[original.ref] = PlanningArtifact(
@@ -1018,8 +1131,12 @@ def _post_integration_artifact_evidence(
                 ref=original.ref,
                 text=resolved.read_text(encoding="utf-8"),
             )
-        except (OSError, UnicodeDecodeError, ValueError):
-            return None
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            return ArtifactEvidenceFailure(
+                "artifact-unreadable",
+                f"讀取既有 artifact 失敗: {type(exc).__name__}: {str(exc)[:120]}",
+                ref=original.ref,
+            )
     for ref, artifact in integrated.items():
         post_integration.setdefault(ref, artifact)
     final_artifacts: list[PlanningArtifact] = []
@@ -1029,13 +1146,21 @@ def _post_integration_artifact_evidence(
             relative = Path(artifact.ref)
             unresolved = root / relative
             if unresolved.is_symlink():
-                return None
+                return ArtifactEvidenceFailure(
+                    "artifact-symlink-rejected",
+                    "落 evidence 前重讀 artifact 時發現路徑已成為 symlink",
+                    ref=artifact.ref,
+                )
             resolved = unresolved.resolve()
             resolved.relative_to(root)
             content = resolved.read_bytes()
             text = content.decode("utf-8")
-        except (OSError, UnicodeDecodeError, ValueError):
-            return None
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            return ArtifactEvidenceFailure(
+                "artifact-unreadable",
+                f"落 evidence 前重讀 artifact 失敗: {type(exc).__name__}: {str(exc)[:120]}",
+                ref=artifact.ref,
+            )
         final_artifacts.append(PlanningArtifact(kind=artifact.kind, ref=artifact.ref, text=text))
         artifact_evidence.append(
             {
@@ -1044,9 +1169,58 @@ def _post_integration_artifact_evidence(
                 "sha256": hashlib.sha256(content).hexdigest(),
             }
         )
-    if not assess_planning_completeness(final_artifacts).complete:
-        return None
+    completeness = assess_planning_completeness(final_artifacts)
+    if not completeness.complete:
+        rejected = [
+            item for item in completeness.assessments if not item.accepted
+        ]
+        detail = "整合後的 artifact 集合仍不完整"
+        if completeness.missing_kinds:
+            detail += f"；missing_kinds={','.join(completeness.missing_kinds)}"
+        if rejected:
+            detail += "；rejected=" + ", ".join(
+                f"{item.artifact.ref}({','.join(item.reasons)})" for item in rejected[:3]
+            )
+        return ArtifactEvidenceFailure("post-integration-incomplete", detail)
     return tuple(artifact_evidence)
+
+
+def _artifact_assessment_failure(
+    assessment: ArtifactAssessment,
+    rejection_recorder: Callable[[ArtifactAssessment], str | None] | None,
+) -> ArtifactEvidenceFailure:
+    """把 `assess_planning_artifact()` 的 reasons／markers 組成結構化原因。
+
+    格式比照 #513 在 `manager._planning_artifact_rejection_message` 定案的
+    `(reasons=...; markers=Lnn:...)`，讓兩個拒收點對 operator 長得一樣。
+    """
+
+    details = [f"reasons={','.join(assessment.reasons)}"]
+    markers = assessment.blocking_markers
+    if markers:
+        rendered = [
+            f"L{marker.line}:" + " ".join(marker.text.split())[:48] for marker in markers[:3]
+        ]
+        if len(markers) > 3:
+            rendered.append(f"+{len(markers) - 3}")
+        details.append("markers=" + ", ".join(rendered))
+    evidence_ref: str | None = None
+    if rejection_recorder is not None:
+        # evidence 記錄本身 fail-open（比照 #513 的
+        # `_record_planning_artifact_rejection_evidence`）：記不下診斷不得掩蓋
+        # 真正的拒收原因。
+        try:
+            evidence_ref = rejection_recorder(assessment)
+        except Exception:  # noqa: BLE001 - evidence 記錄 fail-open
+            evidence_ref = None
+    if evidence_ref is not None:
+        details.append(f"evidence={evidence_ref}")
+    return ArtifactEvidenceFailure(
+        "artifact-assessment-rejected",
+        "; ".join(details),
+        ref=assessment.artifact.ref,
+        assessment=assessment,
+    )
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1344,7 @@ def run_heterogeneous_brainstorm(
     artifact_writer: Callable[[object], Callable[[], None] | None] | None = None,
     evidence_writer: Callable[[Path, object], None] | None = None,
     run_id: str | None = None,
+    rejection_recorder: Callable[[ArtifactAssessment], str | None] | None = None,
 ) -> BrainstormResult:
     empty_refs = PlanningGateRefs()
     if report.complete:
@@ -1246,13 +1421,21 @@ def run_heterogeneous_brainstorm(
                 empty_refs,
                 None,
             )
-    artifact_evidence = _post_integration_artifact_evidence(integration, artifact_root, report)
-    if artifact_evidence is None:
+    artifact_evidence = _post_integration_artifact_evidence(
+        integration,
+        artifact_root,
+        report,
+        rejection_recorder=rejection_recorder,
+    )
+    if isinstance(artifact_evidence, ArtifactEvidenceFailure):
         if rollback_publication is not None:
             rollback_publication()
+        # #515：`primary-artifact-invalid` 前綴保留（既有測試與 operator 的
+        # grep 習慣以它為錨點），但後面必須帶得出「哪一個 artifact、哪一條
+        # 判準」——過去這裡是一個沒有任何附加資訊的字面值。
         return BrainstormResult(
             "needs_human",
-            "primary-artifact-invalid",
+            f"primary-artifact-invalid: {artifact_evidence.rendered()}",
             selection.identity.independence_domain,
             empty_refs,
             None,

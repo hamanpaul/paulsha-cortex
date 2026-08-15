@@ -258,6 +258,17 @@ def _work_read_main(args: list[str], *, work_client=None) -> int:
         print(f"{item.get('work_id', '-')}  {item.get('state', '-')}  {item.get('title', '-')}")
         print(f"repo: {item.get('repo', '-')}")
         print(f"phase: {item.get('phase') or '-'}")
+        # 診斷 invariant（#527）：run 掛著 needs_human 時的結構化理由。過去
+        # `work show` 只印 work_id/state/title/repo/phase，理由（若存在）連
+        # `--json` 都拿不到——這是「四個介面同時沉默」的其中一個。
+        blocking = data.get("blocking_reason")
+        if isinstance(blocking, dict) and blocking.get("reason"):
+            print(f"needs_human: {blocking.get('reason')}: {blocking.get('detail')}")
+            print(f"  source: {blocking.get('source')}")
+            if blocking.get("run_id"):
+                print(f"  run_id: {blocking.get('run_id')}")
+            for ref in blocking.get("evidence_refs") or []:
+                print(f"  evidence: {ref}")
         if parsed.explain:
             print(json.dumps(data.get("explanation", {}), ensure_ascii=False, indent=2))
     return 0
