@@ -619,13 +619,25 @@ def run_model_profile(
 
 
 def envelope_display_rows(registry: IdentityRegistry) -> list[dict[str, object]]:
-    """`cortex inspect models` 的顯示資料：每身分 × persona 的封套投影＋來源。"""
+    """`cortex inspect models` 的顯示資料：每身分 × persona 的封套投影＋來源。
 
+    #534：加上 ``resolution_layer``（operator-overlay／evaluated-roster／
+    packaged-fallback／parked），讓 operator 一眼看出每顆模型憑什麼進熱路徑。
+    """
+
+    from . import model_resolution
+
+    context = registry.resolution_context
     display: list[dict[str, object]] = []
     for identity in registry.identities:
         for persona in ("planner", "builder", "reviewer"):
             if _PERSONA_CAPABILITY[persona] not in identity.capabilities:
                 continue
+            resolution_layer = model_resolution.identity_layer(
+                identity,
+                role=model_resolution.role_for_persona(persona),
+                eval_roster=context.eval_roster,
+            ) or "parked"
             projection = project_envelope(identity, persona)
             provenance_summary: dict[str, object] | None = None
             if projection.provenance is not None:
@@ -640,6 +652,7 @@ def envelope_display_rows(registry: IdentityRegistry) -> list[dict[str, object]]
                     "model_id": identity.model_id,
                     "independence_domain": identity.independence_domain,
                     "persona": persona,
+                    "resolution_layer": resolution_layer,
                     "envelope": {
                         key: (list(value) if isinstance(value, (list, tuple)) else value)
                         for key, value in projection.envelope.items()

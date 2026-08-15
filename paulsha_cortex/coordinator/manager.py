@@ -39,6 +39,7 @@ from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_pro
 from .registry import RETRY_CARD_PHASE_PERSONA, slice_repin_eligible
 from ..config.paths import worktree_root_for
 from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
+from . import model_resolution
 from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
 from .model_identities import (
     AGY_DOMAIN,
@@ -6936,7 +6937,66 @@ def _workflow_identity_candidates_for_persona(
                 f"no capable identity for workflow persona: {persona}（{detail}）"
             )
         candidates = ordered
-    return candidates
+    return _rank_candidates_by_resolution_layer(run, persona, candidates, identities)
+
+
+def _rank_candidates_by_resolution_layer(
+    run, persona: str, candidates: list, identities: IdentityRegistry
+) -> list:
+    """#534：把候選清單重排成三層解析鏈的順序，並套用 packaged fallback 政策。
+
+    層級是排序主鍵、**stable**：同層內完全維持上游既有順序，因此 #452 的
+    measured 側寫優先與 #262 的 primary_domain 偏好都原封不動地降級為同層內的
+    次要偏好。這正是本 issue 的核心修正——packaged roster 的內建列序（「agy 維持
+    首位」）不再有機會壓過 operator 在 host overlay 的人工指定。
+    """
+
+    role = model_resolution.role_for_persona(persona)
+    ranked = model_resolution.rank_candidates(
+        candidates, role=role, context=identities.resolution_context
+    )
+    for warning in ranked.warnings:
+        logger.warning(
+            "workflow run=%s persona=%s %s", getattr(run, "run_id", None), persona, warning
+        )
+    if ranked.excluded:
+        logger.info(
+            "workflow run=%s persona=%s 解析層剔除候選：%s（存活候選 %d）",
+            getattr(run, "run_id", None),
+            persona,
+            ranked.exclusion_detail(),
+            len(ranked.ordered),
+        )
+    if not ranked.ordered:
+        raise ValueError(
+            f"no resolvable identity for workflow persona: {persona}"
+            f"（{ranked.exclusion_detail()}）——第 1 層請於 host overlay 宣告身分，"
+            "第 2 層請以 patchmud 評估合格並人工複核後加入 model-eval-roster.yaml"
+        )
+    return list(ranked.ordered)
+
+
+def _resolution_layer_for(
+    identity, persona: str, identities: IdentityRegistry | None = None
+) -> str:
+    """本次解析結果落在哪一層（provenance 用；被 park 的身分不會走到這裡）。
+
+    `identities` 缺席（舊呼叫端／測試替身）時退回空的評估清單：overlay 來源
+    仍記第 1 層，packaged 來源記第 3 層——保守方向，不會把未評估的身分誤標成
+    已評估合格。
+    """
+
+    context = (
+        identities.resolution_context
+        if identities is not None
+        else model_resolution.DEFAULT_CONTEXT
+    )
+    layer = model_resolution.identity_layer(
+        identity,
+        role=model_resolution.role_for_persona(persona),
+        eval_roster=context.eval_roster,
+    )
+    return layer or model_resolution.RESOLUTION_LAYER_PACKAGED
 
 
 def _workflow_identity_candidates(run, step, identities: IdentityRegistry) -> list:
@@ -7155,36 +7215,44 @@ def _runtime_preflight_gate(
     )
 
 
-def _record_resolved_model_chain(registry, run, step, identity) -> None:
+def _record_resolved_model_chain(
+    registry, run, step, identity, identities: IdentityRegistry | None = None
+) -> None:
     """#205 R4/D5：把本次 dispatch 實際解析到的 executor/model/domain 與來源
     寫入 run，供事後稽核。純 provenance 寫入，逐段覆蓋合併既有紀錄，不影響
     既有 workflow 語意或推進邏輯。
 
-    #452 C：source 記錄實際解析依據——run-scoped 覆寫記 ``override``；身分帶
-    該 persona 的實測側寫記 ``patchmud-profile``；查表投影落在保守預設記
-    ``default-envelope``（``registry`` 保留為 #452 前既有紀錄的 legacy 值）。
+    #534：``source`` 改記**解析層**——``run-override``（run-scoped 覆寫）／
+    ``operator-overlay``／``evaluated-roster``／``packaged-fallback``。舊值
+    ``default-envelope``／``patchmud-profile`` 只說得出「封套來自實測或預設」，
+    說不出「這顆模型憑什麼進熱路徑」，operator 看到 `source: default-envelope`
+    根本無從得知跑的是未經核可的 packaged 候選。封套來源改記在獨立的
+    ``envelope_source`` 欄位，資訊不減。
     """
+    from .model_identities import (
+        DEFAULT_ENVELOPE,
+        ENVELOPE_SOURCE_DEFAULT,
+        ENVELOPE_SOURCE_MEASURED,
+        project_envelope,
+    )
+
     override = getattr(run, "model_chain_override", None)
     if isinstance(override, dict) and step.persona in override:
-        source = "override"
+        source = "run-override"
     else:
-        from .model_identities import (
-            DEFAULT_ENVELOPE,
-            ENVELOPE_SOURCE_MEASURED,
-            project_envelope,
-        )
-
-        source = "default-envelope"
-        if step.persona in DEFAULT_ENVELOPE:
-            projection = project_envelope(identity, step.persona)
-            if ENVELOPE_SOURCE_MEASURED in projection.source.values():
-                source = "patchmud-profile"
+        source = _resolution_layer_for(identity, step.persona, identities)
+    envelope_source = ENVELOPE_SOURCE_DEFAULT
+    if step.persona in DEFAULT_ENVELOPE:
+        projection = project_envelope(identity, step.persona)
+        if ENVELOPE_SOURCE_MEASURED in projection.source.values():
+            envelope_source = ENVELOPE_SOURCE_MEASURED
     resolved = dict(getattr(run, "resolved_model_chain", None) or {})
     resolved[step.persona] = {
         "executor": identity.executor,
         "model_id": identity.model_id,
         "independence_domain": identity.independence_domain,
         "source": source,
+        "envelope_source": envelope_source,
     }
     registry._manager_update_workflow_run(run.run_id, resolved_model_chain=resolved)
 
@@ -7915,7 +7983,7 @@ def _dispatch_workflow_card(
         launcher = _specialize_workflow_launcher(launcher, step)
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
-    _record_resolved_model_chain(registry, run, step, identity)
+    _record_resolved_model_chain(registry, run, step, identity, identities)
     builder_jobs = [
         job
         for job in registry.list_jobs()

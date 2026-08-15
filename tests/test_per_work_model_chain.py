@@ -295,24 +295,26 @@ def test_evidence_records_resolution_and_source(tmp_path: Path) -> None:
             "executor": "copilot",
             "model_id": "builder-two",
             "independence_domain": "microsoft",
-            "source": "override",
+            "source": "run-override",
+            "envelope_source": "default",
         }
     }
 
     # planner 段沒有覆寫，走共享 registry；來源標記必須能分辨兩者不同。
-    # #452 C：非覆寫段的 source 記實際解析依據——該身分無實測側寫、查表投影
-    # 落在保守預設 → "default-envelope"（"registry" 保留為 #452 前 legacy 值）。
+    # #534：非覆寫段的 source 記**解析層**——手工建構的 registry 視為 operator
+    # 指定（第 1 層）；封套來源改記在 envelope_source。
     planner_step = _step(after_builder, phase="plan", persona="planner")
     planner_identity = manager._select_workflow_identity(after_builder, planner_step, _BUILDER_IDENTITIES)
     manager._record_resolved_model_chain(registry, after_builder, planner_step, planner_identity)
 
     final_run = registry.get_workflow_run(run.run_id)
-    assert final_run.resolved_model_chain["builder"]["source"] == "override"
+    assert final_run.resolved_model_chain["builder"]["source"] == "run-override"
     assert final_run.resolved_model_chain["planner"] == {
         "executor": "claude",
         "model_id": "planner-one",
         "independence_domain": "anthropic",
-        "source": "default-envelope",
+        "source": "operator-overlay",
+        "envelope_source": "default",
     }
     # builder 段的紀錄沒有被 planner 段的更新蓋掉（逐段合併，不是整段覆蓋）。
     assert final_run.resolved_model_chain["builder"]["model_id"] == "builder-two"

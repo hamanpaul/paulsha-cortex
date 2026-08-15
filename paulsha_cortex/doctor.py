@@ -271,6 +271,99 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
     )
 
 
+def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
+    """#534／#509：診斷「overlay 宣告」與「生效解析」不一致。
+
+    #509 的假 PASS 有兩個成因：doctor 只驗 registry 載得起來，不驗**解析結果**；
+    而且沒有把自己讀的 config root 說出來，operator 無從發現 doctor 與 daemon
+    讀的根本是兩份檔案。本 probe 兩者都補：走與 tick 同一個合併載入器，跑與
+    manager 同一個 `model_resolution.rank_candidates`，並在 detail 裡明示
+    config root。
+    """
+
+    config_root = Path(
+        env.get("PSC_PROJECT_CONFIG_ROOT", str(agents_root / "config" / "paulsha"))
+    ).expanduser()
+    try:
+        from .coordinator import model_resolution
+        from .coordinator.model_identities import load_model_identities
+
+        registry = load_model_identities(config_root)
+    except Exception:
+        # registry 本身載不起來由 model-identities probe 負責報告，這裡不重複噪音。
+        return ProbeResult(
+            "model-resolution",
+            "fail",
+            f"identity registry unavailable at {config_root}; see model-identities probe",
+            True,
+        )
+    context = registry.resolution_context
+    failures: list[str] = []
+    warnings: list[str] = []
+    for note in context.notes:
+        if note.severity == "fail":
+            failures.append(f"{note.code}: {note.detail}")
+        elif note.severity == "warn":
+            warnings.append(f"{note.code}: {note.detail}")
+    summary: list[str] = []
+    for persona, role in sorted(model_resolution.ROLE_BY_PERSONA.items()):
+        candidates = [
+            identity for identity in registry.identities if role in identity.capabilities
+        ]
+        ranked = model_resolution.rank_candidates(
+            candidates, role=role, context=context
+        )
+        if not ranked.ordered:
+            failures.append(
+                f"{persona}: 無可解析身分（{ranked.exclusion_detail() or 'no candidate declared'}）"
+            )
+            continue
+        top = ranked.ordered[0]
+        layer = ranked.layer_of(top)
+        summary.append(f"{persona}={top.executor}/{top.model_id}[{layer}]")
+        overlay_declared = [
+            identity
+            for identity in candidates
+            if model_resolution.identity_origin(identity)
+            == model_resolution.IDENTITY_ORIGIN_OVERLAY
+        ]
+        if layer != model_resolution.RESOLUTION_LAYER_OVERLAY and overlay_declared:
+            # 不變式守衛：overlay 宣告了這個角色，生效解析就必須落在第 1 層。
+            # #534 之前正是這條不成立（packaged roster 的內建列序壓過人工指定），
+            # 而 doctor 只驗 registry 載得起來、驗不到解析結果，於是回報 PASS。
+            failures.append(
+                f"{persona}: overlay 宣告 "
+                + ", ".join(f"{i.executor}/{i.model_id}" for i in overlay_declared)
+                + f"，生效解析卻是 {top.executor}/{top.model_id}[{layer}]"
+            )
+        elif layer == model_resolution.RESOLUTION_LAYER_PACKAGED:
+            warnings.append(
+                f"{persona}: 解析落在 packaged 候選 {top.executor}/{top.model_id}"
+                "（未經 patchmud eval／人工複核）"
+            )
+    for entry in context.eval_roster.entries:
+        if registry.get(entry.executor, entry.model_id) is None:
+            warnings.append(
+                f"model-eval-roster 列出的 {entry.executor}/{entry.model_id} 不在 registry 內"
+                "（清單過期或身分已下架）"
+            )
+    detail_tail = f"（config root: {config_root}）"
+    if failures:
+        return ProbeResult(
+            "model-resolution", "fail", "; ".join(failures) + detail_tail, True
+        )
+    if warnings:
+        return ProbeResult(
+            "model-resolution", "warn", "; ".join(warnings) + detail_tail, False
+        )
+    return ProbeResult(
+        "model-resolution",
+        "pass",
+        "resolution chain consistent: " + ", ".join(summary) + detail_tail,
+        True,
+    )
+
+
 def _identity_failure_detail(exc: BaseException) -> str:
     message = str(exc).lower()
     if "model-identities missing" in message:
@@ -945,6 +1038,7 @@ def run_doctor(
         _preflight_probe(effective),
         _gate_declaration_probe(effective),
         _identity_probe(effective, agents_root),
+        _model_resolution_probe(effective, agents_root),
         _review_sandbox_probe(
             effective,
             agents_root,

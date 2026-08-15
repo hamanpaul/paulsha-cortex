@@ -110,10 +110,13 @@ def test_overlay_builder_survives_packaged_primary_domain_preference(tmp_path: P
         _run(primary_domain="anthropic"), _step("builder"), roster
     )
     keys = [(item.executor, item.model_id) for item in candidates]
-    # 偏好仍是偏好：同 domain 的 packaged 身分排前。
-    assert keys[0] == ("claude", "sonnet")
-    # overlay builder 不被剔除（v0.1.6 部署的實際可跑 builder 保住 fallback）。
-    assert ("codex", "gpt-5.4") in keys
+    # #534：解析層是排序主鍵——operator 在 host overlay 指定的 builder 排第一，
+    # primary_domain 偏好降級為**同層內**的次要偏好，不再有機會讓 packaged 候選
+    # （僅為候選宣告、未經評估）壓過人工指定。
+    assert keys[0] == ("codex", "gpt-5.4")
+    # packaged 候選仍保留在後（#262 preflight re-route 的 fallback 不丟）。
+    assert ("claude", "sonnet") in keys
+    assert keys.index(("codex", "gpt-5.4")) < keys.index(("claude", "sonnet"))
 
 
 def test_measured_band_filter_excludes_with_observable_reason(caplog) -> None:
@@ -172,17 +175,21 @@ class _RecordingRegistry:
 
 
 def test_resolved_model_chain_source_distinguishes_profile_and_default() -> None:
+    # #534：`source` 改記解析層，封套來源移到 `envelope_source`。REGISTRY 為手工
+    # 建構（無 loader 蓋章）→ 一律視為 operator 指定的第 1 層。
     registry = _RecordingRegistry()
     run = _run(sizing_band="green")
     measured_identity = REGISTRY.require("claude", "sonnet")
     manager._record_resolved_model_chain(registry, run, _step("builder"), measured_identity)
     resolved = registry.calls[-1][1]["resolved_model_chain"]
-    assert resolved["builder"]["source"] == "patchmud-profile"
+    assert resolved["builder"]["source"] == "operator-overlay"
+    assert resolved["builder"]["envelope_source"] == "measured"
 
     default_identity = REGISTRY.require("copilot", "gpt-5.4")
     manager._record_resolved_model_chain(registry, run, _step("builder"), default_identity)
     resolved = registry.calls[-1][1]["resolved_model_chain"]
-    assert resolved["builder"]["source"] == "default-envelope"
+    assert resolved["builder"]["source"] == "operator-overlay"
+    assert resolved["builder"]["envelope_source"] == "default"
 
     override_run = _run(
         sizing_band="green",
@@ -192,11 +199,20 @@ def test_resolved_model_chain_source_distinguishes_profile_and_default() -> None
         registry, override_run, _step("builder"), measured_identity
     )
     resolved = registry.calls[-1][1]["resolved_model_chain"]
-    assert resolved["builder"]["source"] == "override"
+    assert resolved["builder"]["source"] == "run-override"
 
 
 def test_workflow_validation_accepts_new_and_legacy_sources() -> None:
-    for source in ("override", "registry", "patchmud-profile", "default-envelope"):
+    for source in (
+        "override",
+        "registry",
+        "patchmud-profile",
+        "default-envelope",
+        "run-override",
+        "operator-overlay",
+        "evaluated-roster",
+        "packaged-fallback",
+    ):
         workflow._validate_model_chain_resolution(
             {
                 "builder": {

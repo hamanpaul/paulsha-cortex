@@ -128,8 +128,12 @@ class ModelIdentityRegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             config_root = Path(d)
 
-            with self.assertRaisesRegex(ValueError, "model-identities"):
-                review.load_model_identity_registry(config_root)
+            # #490／#534：foreign review 改走與 manager／tick 相同的合併載入器，
+            # 因此「沒有 host overlay」是合法部署（packaged 候選池即全部身分），
+            # 不再是錯誤；overlay 檔案本身的嚴格性（重複列、未知欄位、重複 key）
+            # 逐項不變。
+            packaged_only = review.load_model_identity_registry(config_root)
+            self.assertIn(("claude", "sonnet"), packaged_only)
 
             _write_model_identities(
                 config_root,

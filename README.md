@@ -201,12 +201,15 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    patchmud 目前僅有 anthropic adapter，roster 內只有 `claude/sonnet` 可被驅動；
    其餘身分會逐一回報 `adapter-unavailable` 並誠實維持預設封套。
 
+   `cortex inspect models` 另顯示每列的 `layer=`，即該身分在三層解析鏈中的位置
+   （`operator-overlay`／`evaluated-roster`／`packaged-fallback`／`parked`）。
+
    > **升級遷移註記**：packaged roster 已收編 `copilot/gpt-5.4`、
    > `claude/sonnet`、`codex/gpt-5.3-codex-spark`、`cg/glm-5.2` 四個身分。
-   > 若 host overlay（`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`）先前
-   > 已自行宣告其中任一鍵、且內容與 packaged 列不逐欄相等，升級後 registry
-   > 載入會 fail-closed（`custom identity shadows packaged default`）——請自
-   > overlay 移除該列，或改成與 packaged 逐欄相等。
+   > host overlay（`$PSC_PROJECT_CONFIG_ROOT/model-identities.yaml`）宣告其中
+   > 任一鍵時，**以 overlay 為準**（人工指定優先，見下方三層解析鏈）；建議在
+   > 該列加上 `override_packaged: true` 明示覆寫意圖，否則 `cortex doctor` 會
+   > 提出警示。（此處先前為 fail-closed 中止載入，已於 #534／#509 改為降級。）
 
 9. 用 `service` 家族管理 installer、systemd runtime 與 fallback logs：
 
@@ -529,13 +532,84 @@ identities:
     capabilities: [planning, review]
 ```
 
-- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity，自訂檔不得以不同內容 shadow 它。
+- schema v1 仍可讀取並由 runtime 正規化；新設定使用 schema v2 的 `capabilities` / `live_probe`。packaged registry 已登錄 canonical agy identity；host overlay 宣告同鍵身分時以 overlay 為準（見下方「模型引擎三層解析鏈」）。
 - planner/builder/reviewer 必須是 explicit `(executor, model_id)` 且可解析；agy 只有在 `doctor --probe-live` 的 model discovery 與 plan/sandbox smoke 都吻合時才可用。
 - fanout/tick 明確指定的 builder `(executor, model_id)`，以及 spec frontmatter 成對宣告的 `executor`／`model_id`，都會先查這份 registry；unknown identity 會在派工前 fail-closed 並列出可用 candidates。
 - workflow reviewer 只會選擇明示 `capabilities: [review]` 且與 Builder 不同 independence domain 的 schema v2 identity；legacy v1 identity 只取得 planning capability，不能被猜成 reviewer。
 - Verify/Review 以 executor 的 enforced read-only mode在exact Candidate的remote-free disposable clone檢查；Claude reviewer固定使用`dontAsk`與`safe-mode`，只暴露OS-sandboxed Bash並要求structured JSON object，不載入Candidate `CLAUDE.md`/skills/plugins/MCP/remote session，也不進Plan Mode。Filesystem預設拒讀整個home、`/run/user`與Docker sockets，只重開Candidate與Python user-site工具鏈，並對Candidate clone設deny-write；review subprocess只保留`PATH`、`HOME`、locale、`TMPDIR`、`VIRTUAL_ENV`等非密鑰基礎環境，且不啟動login shell。Linux/WSL host必須安裝`bubblewrap`、`socat`與官方sandbox runtime（Ubuntu可用`sudo apt-get install bubblewrap socat`，再用`npm install -g @anthropic-ai/sandbox-runtime`）；任一依賴缺失、Unix-socket seccomp失效或命令要求unsandboxed fallback都拒絕啟動。Manager在所有terminal/launch failure/operator retry路徑重驗原Candidate完整tree snapshot後清除clone。agent只回傳substantive result、findings與inline report body；report僅能發布至phase專屬的`reports/verify/*.md`或`reports/review/*.md`，並由durable publication journal把多檔CAS、canonical evidence與registry bind組成可rollback/roll-forward的transaction。Manager會從durable Job注入Candidate、builder/reviewer job ID與launch identity，agent不取得report或Candidate寫入權。
 - `cortex doctor`會在identity registry配置Claude `review` capability時把Claude Code 2.1.187+、必要CLI flags、`bubblewrap`、`socat`與`srt`執行能力列為required probe；`--probe-live`另跑native read-only與Unix-socket seccomp smoke。沒有Claude reviewer的部署只顯示非必要warn。Claude的protected bind targets位於deterministic disposable session root，exact Candidate則固定在其無污染的`candidate/` checkout。
 - 同 domain、未知 identity、缺 model 都會得到 `foreign-review-absent`（fail-closed）。
+- foreign review 與 manager／tick 解析**同一份**合併 registry（host overlay ＋ packaged 候選池）：packaged 身分不需要被複製進 overlay 才能被 retry-review 解析到。
+
+### 模型引擎三層解析鏈
+
+planner／builder／reviewer 的身分解析依序走三層，**層級是排序主鍵**：
+
+| 層 | provenance 值 | 來源 | 語意 |
+| --- | --- | --- | --- |
+| 1 | `operator-overlay` | host overlay `model-identities.yaml` | operator 人工指定；**列序即優先序**，壓過 packaged roster 的一切內建順序 |
+| 2 | `evaluated-roster` | host `model-eval-roster.yaml` | 經 patchmud 評估合格**且**人工複核通過的身分 |
+| 3 | `packaged-fallback` | packaged roster | 候選池：只供評估管線取材；解析落到這層一律 fail-loud |
+
+同層內維持既有偏好（`primary_domain` 偏好、patchmud 實測封套優先），因此這些偏好
+不會再把 operator 的人工指定擠到後面。run-scoped 覆寫（`--builder-model` 等）
+仍為最高優先，provenance 記 `run-override`。
+
+`WorkflowRun.resolved_model_chain` 逐段記錄解析層與封套來源：
+
+```json
+{"builder": {"executor": "codex", "model_id": "gpt-5.6-luna",
+             "independence_domain": "openai",
+             "source": "operator-overlay", "envelope_source": "default"}}
+```
+
+**第 2 層契約**——`$PSC_PROJECT_CONFIG_ROOT/model-eval-roster.yaml`（檔案不存在
+即空清單；可手工維護）：
+
+```yaml
+schema_version: 1
+entries:
+  - executor: claude
+    model_id: sonnet
+    roles: [build, review]        # planning / build / review
+    verdict: pass                 # pass / fail / pending（patchmud 評估結果）
+    evaluated_at: "2026-08-14"
+    eval_source: patchmud
+    eval_ref: patchmud-deck-v1/report-2026-08-14   # 選配：評估證據指標
+    review_status: approved       # approved / rejected / pending（人工複核）
+    reviewer: operator            # approved 時必填
+    reviewed_at: "2026-08-14"     # approved 時必填
+```
+
+只有 `verdict: pass` **且** `review_status: approved` **且**角色列於 `roles` 的
+身分才進第 2 層——「評估過」不等於「人工核可」。清單解析失敗時第 2 層視為空
+（保守方向，絕不因錯誤多授予資格），並由 `cortex doctor` 的 `model-resolution`
+probe 回報，不會中止 periodic tick。
+
+**overlay 的解析指令**（皆為選配，既有 overlay 檔案不改也照舊合法）：
+
+```yaml
+resolution_policy:
+  packaged_fallback: warn        # allow / warn（有 overlay 時的預設）/ deny
+identities:
+  - executor: claude
+    model_id: sonnet
+    independence_domain: anthropic
+    capabilities: [review]
+    override_packaged: true      # 明示覆寫同鍵 packaged 身分
+packaged_overrides:              # 對 packaged 身分的處置
+  - executor: agy
+    model_id: gemini-3.1-pro-high
+    action: park                 # park＝完全停用；demote＝降到同層最後
+    reason: operator 未核可此引擎
+```
+
+`packaged_fallback: deny` 時第 3 層完全不參與解析，某個 persona 因此無候選會
+fail-closed 並列出補救路徑（列入 overlay，或評估合格後加入 eval roster）。
+
+`cortex doctor` 的 `model-resolution` probe 走與 tick 相同的載入器與排序函式，
+回報每個 persona 的生效解析與所在層、使用的 config root；overlay 宣告了某角色
+卻不是生效解析（不變式被破壞）、或有 persona 無候選時 FAIL。
 
 ### Merge 限制與 completion/restart
 
