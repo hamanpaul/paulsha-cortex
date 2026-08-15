@@ -8,6 +8,30 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #536（後半）：planning artifacts 發佈與 run 狀態更新不是同一事務，中間態對
+  所有恢復迴圈永久隱形**——define 的 brainstorm 有兩次分離的 durable 寫入：先發佈
+  spec/design/plan 到 operator worktree，再把 run 推進到 `plan` 並寫入 gate_refs／
+  planning_authority。兩者之間崩潰就留下「artifacts 已落地、run 狀態停在原地」的中間
+  態。journal（`planning-transactions/<run_id>.json`）本來就記了 before/after hash，缺
+  的是**誰去看它**：`reconcile()` 只能由持有該 run 的呼叫端逐 run 觸發，run 一旦離開
+  `ongoing`（superseded／done）就再也沒有任何迴圈會碰它——實測 coordinator root 上就
+  躺著兩份孤兒 journal，其中一份正是 #536 現場的 `workflow-7a430d31eff66ef13630`（run
+  已 abandon 成 superseded，兩份 spec/design 殘留檔永久留在 operator worktree，成為
+  下一世代 define 撞 #416／#535 authority fail-closed 的地雷）。修法：新增
+  `prepare_commit()` 把事務邊界寫成 durable 事實（journal schema v3 的 `phase`，
+  `prepared` 之後不得再發佈）；新增 `reconcile_planning_transactions()`——掃整個 journal
+  目錄、與 run 狀態無關的**唯一**恢復路徑，由 tick 驅動，判準只有一條「registry 的 run
+  row 上有沒有這次的 brainstorm gate ref」：有則前滾（逐位元組驗證後退役 journal）、
+  沒有則回退（選回退的理由是沒有 gate ref 就代表這批產出從未被綁進任何 run，前滾在語意
+  上不成立；現場殘留的 `expected_gate_ref` 更是 `null`，根本沒有可前滾的目標）。既有
+  v2 journal 相容，因此實際部署的殘留與未來崩潰走同一條路自癒。護欄：未滿 5 分鐘的
+  journal 視為可能仍在飛而不碰；已被 git 追蹤的殘留檔跳過刪除並回報 `adopted`（#507
+  教訓）；找不到 run row 時 fail closed 只回報不刪檔；sweep 整批失效比照 #246 降級不
+  癱瘓 tick。收斂結果全部落結構化 log 並進 tick summary，drift 且 run 仍 ongoing 時補
+  `needs_human` facet。不動 #538 已修的 resume 迴圈 phase filter。詳見
+  `changelog.d/publish-state-transaction.md`。新增
+  `tests/test_planning_publication_transaction_536.py`（14 個回歸測試）。
+
 - **Issue #540：tdd-red terminal 採信三段連鎖——builder 的正確 RED commit 無法被採信**
   ——run `workflow-084f75e2178cf7547476` 的 builder 交付了合格 RED commit，terminal
   採信卻連撞三個獨立缺陷。**(1) gate 宣告缺漏事前無診斷**：manager env 漏
