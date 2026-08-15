@@ -1809,6 +1809,18 @@ def _claim_action(
     # 動作集合與具體 blocking reason 時一併回報。
     if decision.next_actions:
         response["next_actions"] = list(decision.next_actions)
+    # #546（部分）：build 卡卡在 needs_human 時，`_resume_decision` 看不到 job
+    # 層事實，宣告的唯一出口是 `abandon`（＝燒掉一個世代與合格的 commit）。
+    # 這裡把同樣以 run/job 事實判定為「真的會被受理」的 build 復原動作補進去，
+    # 順序維持「既有決策優先、補充在後」，不重排既有值。
+    if decision.action == "needs_human" and canonical_run is not None:
+        extra = [
+            item
+            for item in _build_phase_recovery_actions(canonical_run, workflow_registry)
+            if item not in response.get("next_actions", [])
+        ]
+        if extra:
+            response["next_actions"] = [*response.get("next_actions", []), *extra]
     if decision.blocking_reason is not None:
         response["blocking_reason"] = decision.blocking_reason
     return response
@@ -1997,6 +2009,189 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         "action": "retry-build",
         "reason": "candidate-repair-dispatched",
         "expected_candidate": expected_candidate.lower(),
+        "run": updated.to_dict(),
+        "retry_classification": retry_classification,
+    }
+
+
+def _build_phase_recovery_actions(run, workflow_registry) -> tuple[str, ...]:
+    """#546（部分）：build phase 停在 needs_human 時真的可用的 recovery 動作。
+
+    `claim._resume_decision` 只看得到 run 的 phase 與 planning failure 記錄，因此
+    build 卡卡住時它宣告的唯一出口是 `abandon`——實測（run
+    ``workflow-084f75e2178cf7547476``）operator 因此以為只能燒掉一個世代，而
+    `regenerate-gates`／`retry-card` 其實都可用。這個 helper 在 work action 層
+    （拿得到 JobRegistry）補上那段曝光面。
+
+    刻意**只宣告會被受理的動作**：每一項都用與該動作自身完全相同的前置驗
+    （同一份 job/step 判準）判定，拿不準就不宣告。宣告一個保證失敗的動作比不
+    宣告更糟——這是 #382 已經付過學費的教訓。
+    """
+
+    from .manager import _current_workflow_step
+    from .manager import GATE_LEDGER_REQUIRED_PHASES
+    from .registry import ACTIVE_JOB_STATUSES, TERMINAL_JOB_STATUSES
+
+    if (
+        run is None
+        or workflow_registry is None
+        or getattr(run, "status", None) != "ongoing"
+        or "needs_human" not in getattr(run, "facets", ())
+        or run.current_phase != "build"
+    ):
+        return ()
+    try:
+        jobs = list(workflow_registry.list_jobs())
+    except Exception:  # pragma: no cover - 曝光面不得因讀取失敗而讓 resume 死掉
+        return ()
+    run_jobs = [job for job in jobs if job.get("workflow_run_id") == run.run_id]
+    if any(job.get("status") in ACTIVE_JOB_STATUSES for job in run_jobs):
+        return ()
+
+    actions: list[str] = []
+    # regenerate-gates：與 `_regenerate_gates_action` 同一組 candidate 條件。
+    ledger_jobs = [
+        job
+        for job in run_jobs
+        if job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES
+        and job.get("status") in TERMINAL_JOB_STATUSES
+        and isinstance(job.get("log_path"), str)
+        and job.get("log_path")
+        and Path(job["log_path"]).is_file()
+    ]
+    if ledger_jobs:
+        worktree = ledger_jobs[-1].get("worktree")
+        if isinstance(worktree, str) and Path(worktree).is_dir():
+            actions.append("regenerate-gates")
+
+    # retry-card：與 `_retry_card_action` 同一組前置驗。
+    target = _current_workflow_step(run)
+    if target is not None and target.persona == "builder":
+        card_jobs = [
+            job
+            for job in run_jobs
+            if job.get("workflow_phase") == "build"
+            and job.get("workflow_card") == target.card
+        ]
+        if (
+            card_jobs
+            and card_jobs[-1].get("status") in TERMINAL_JOB_STATUSES
+            and all(job.get("workflow_evidence") is None for job in card_jobs)
+        ):
+            actions.append("retry-card")
+    return tuple(actions)
+
+
+def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+    """#545：以現行 prompt 重派「最早一張尚未採信的 builder 卡」（含中段卡）。
+
+    現場（run ``workflow-084f75e2178cf7547476``，#540 的殘留項）：builder 交付的
+    RED commit 合格、ledger 已由 ``regenerate-gates`` 重生成正確，但**舊 job 的
+    terminal envelope 是模型輸出**（自報 gate 名 ``'focused pytest RED
+    expectation'``），契約內不可竄改，``resume`` 重新採信仍必敗於
+    ``gate-evidence-unknown-gate``。唯一乾淨出路是以修好的 prompt（#541 已把
+    canonical gate 名機械注入 ``allowed_names``）重派那張卡產生**新** envelope，
+    但契約內沒有這條路：
+
+    - ``retry-build`` 只受理最後一張 builder 卡（tdd-red 是中段卡），且它是
+      candidate 修復語意——會把該卡的 ``action`` 覆寫成 repair 文案，中段卡走那
+      條路等於把卡片本身的指示抹掉。
+    - ``recover-pre-candidate`` 要求 null candidate（worktree-isolation 早已錨定
+      candidate）。
+    - ``abandon`` 會燒掉合格的 RED commit 與一個世代。
+
+    本動作補上那條路，且**只做重派**：不改任何既有 job 或 envelope（舊紀錄原樣
+    保留供稽核）、不動 builder 的 commit 與 worktree、不改判——新 job 的採信仍
+    走既有 harvest 流程。
+
+    fail closed 條件：exact WorkflowRun CAS、run 必須 ongoing 且帶
+    ``needs_human``、必須在 build phase、指名的卡必須**正是**下一次 dispatch 會
+    派的那一張（build phase 內最早一張非 passed 的 builder 卡）、該卡不得已有
+    綁定的 ``workflow_evidence``（已採信不可重派、evidence immutable）、該卡必須
+    已有一顆終止的 job（沒派過的卡屬 ``resume`` 的職責）、且 run 不得有 active
+    job。任一條不成立即拒絕，不做任何 side effect。
+    """
+
+    # 與 dispatch 端共用同一個「下一張要派哪張卡」判準——宣告可行的重派必須
+    # 真的落在同一張卡上（#382：宣告與實作不得各自為政）。
+    from .manager import _current_workflow_step
+    from .registry import TERMINAL_JOB_STATUSES
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
+    }
+    if extras:
+        raise ValueError(f"retry-card rejects caller evidence/input: {sorted(extras)[0]}")
+    expected_run_id = args.get("expected_run_id")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("retry-card requires exact expected_run_id")
+    card = args.get("card")
+    if (
+        not isinstance(card, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
+    ):
+        raise ValueError("retry-card requires exact card id")
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("retry-card issue is not authorized by WorkAuthority")
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    active = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.status == "ongoing"
+        and run.issue_refs == expected_issues
+        and run.openspec_refs == authority.mapped_openspec
+    ]
+    if len(active) != 1:
+        raise RuntimeError("retry-card requires one active canonical WorkflowRun")
+    run = active[0]
+    if run.run_id != expected_run_id:
+        raise RuntimeError("retry-card expected WorkflowRun CAS mismatch")
+    if "needs_human" not in run.facets:
+        raise RuntimeError("retry-card requires needs_human workflow")
+    if run.current_phase != "build":
+        raise RuntimeError("retry-card requires build-phase workflow")
+    target = _current_workflow_step(run)
+    if target is None or target.persona != "builder":
+        raise RuntimeError("retry-card requires a pending builder card")
+    if target.card != card:
+        raise RuntimeError("retry-card expected card mismatch")
+    card_jobs = [
+        job
+        for job in workflow_registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+        and job.get("workflow_phase") == "build"
+        and job.get("workflow_card") == card
+    ]
+    if any(job.get("workflow_evidence") is not None for job in card_jobs):
+        # 已採信的 evidence 不可重寫，也不得以「重派」名義繞過——那張卡已經有
+        # 被系統採信的結論了。
+        raise RuntimeError("retry-card refuses a card with accepted evidence")
+    if not card_jobs or card_jobs[-1].get("status") not in TERMINAL_JOB_STATUSES:
+        raise RuntimeError("retry-card requires a terminal job for the card")
+    retry_classification = _classify_retry(run, workflow_registry)
+    updated = workflow_registry._manager_reset_workflow_for_retry_card(
+        run.run_id,
+        expected_run_id=expected_run_id,
+        card=card,
+        retry_classification=retry_classification.value,
+    )
+    updated = _recompute_and_persist_sizing(workflow_registry, updated)
+    return {
+        "action": "retry-card",
+        "reason": "builder-card-redispatched",
+        "expected_run_id": expected_run_id,
+        "run_id": run.run_id,
+        "card_id": card,
+        # 舊 job 一個都不動；列出來只是讓 operator 知道稽核時該對照哪幾筆。
+        "superseded_job_ids": [str(job.get("job_id")) for job in card_jobs],
         "run": updated.to_dict(),
         "retry_classification": retry_classification,
     }
@@ -4726,8 +4921,8 @@ def execute_work_action(
     repo = args.get("repo")
     work_id = args.get("work_id")
     if action not in {
-        "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-        "retry-review", "recover-planning", "recover-pre-candidate",
+        "link", "unlink", "start", "resume", "retry-build", "retry-card",
+        "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
         "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
     }:
@@ -4789,6 +4984,12 @@ def execute_work_action(
         )
     elif action == "retry-build":
         result = _retry_build_action(
+            args=args,
+            authority=authority,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "retry-card":
+        result = _retry_card_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,

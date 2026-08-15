@@ -32,6 +32,34 @@
   `changelog.d/publish-state-transaction.md`。新增
   `tests/test_planning_publication_transaction_536.py`（14 個回歸測試）。
 
+- **Issue #545：`retry-build` 只受理最後一張 builder 卡——中段 builder 卡採信失敗後
+  沒有契約內的重派路徑**——run `workflow-084f75e2178cf7547476`（#540 的殘留項）卡在
+  build 階段的中段卡 `tdd-red`：builder 交付的 RED commit 合格、ledger 已由 #540 的
+  `regenerate-gates` 重生成正確（`pytest: failed` = 合格 RED），但**舊 job 的
+  terminal envelope 是模型輸出**——自報 gate 名 `'focused pytest RED expectation'`，
+  envelope 屬契約內不可竄改的證據，`resume` 重新採信仍必敗於 `TerminalContractError:
+  terminal 宣稱跑了 gate '...'，但 manager 的 ledger 沒有這一項`（0815 實證）。#540／
+  PR #541 已把 canonical gate 名機械注入 dispatch prompt 的 `allowed_names`，因此
+  **新的** `tdd-red` job 會產出可採信的 envelope；缺的只是「重派中段 builder 卡」這
+  條路——`retry-build` 只受理最後一張 builder 卡、`recover-pre-candidate` 要求 null
+  candidate（`worktree-isolation` 早已錨定 candidate）、`abandon` 會連合格的 RED
+  commit 與一個世代一起燒掉（該 run 已耗 2/3）。新增 `retry-card` work action：以
+  exact WorkflowRun CAS 加卡名定錨，原子清掉 `needs_human` facet 並讓 manager 以
+  **原卡片契約**重派一個新 job；舊 job 與舊 envelope 一個位元組都不動、原樣保留供
+  稽核，重派只允許產生新 job 與新 envelope，prompt 走既有的 `_workflow_job_prompt`
+  （含 #540 的 `allowed_names` 注入）不另開組裝路徑，dispatch 失敗時 `needs_human`
+  會被補回去、不留下「facet 清了但沒派出去」的中間態。**取捨**：選「新增 action」
+  而非放寬 `retry-build`——後者是 candidate 修復語意，會把目標卡的 `step.action`
+  覆寫成 repair 文案，中段卡走那條路等於把「寫一個 RED regression test」這個指示
+  抹掉；`retry-build` 的 CAS 與 admission 一字未改，另補回歸樁鎖定它仍拒絕中段卡
+  （與 #260 對 `recover-repair-commit` 的取捨同型）。順帶收口 **#546 的一部分**：
+  `claim._resume_decision` 拿不到 job 層事實，build 卡卡住時宣告的唯一出口是
+  `abandon`；work action 層新增 `_build_phase_recovery_actions`，以與
+  `regenerate-gates`／`retry-card` 完全相同的前置驗判定兩者是否真的會被受理，是才
+  補進 `resume` 回傳的 `next_actions`（只宣告會成功的動作，#382 的教訓）。詳見
+  `changelog.d/midchain-builder-retry.md`；新增
+  `tests/test_midchain_builder_retry_545.py`（23 個回歸測試）。
+
 - **Issue #540：tdd-red terminal 採信三段連鎖——builder 的正確 RED commit 無法被採信**
   ——run `workflow-084f75e2178cf7547476` 的 builder 交付了合格 RED commit，terminal
   採信卻連撞三個獨立缺陷。**(1) gate 宣告缺漏事前無診斷**：manager env 漏

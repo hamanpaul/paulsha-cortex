@@ -202,8 +202,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "action",
         choices=[
-            "link", "unlink", "start", "resume", "retry-build", "retry-verify",
-            "retry-review", "recover-planning", "recover-pre-candidate",
+            "link", "unlink", "start", "resume", "retry-build", "retry-card",
+            "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
             "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
             "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
         ],
@@ -218,7 +218,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument("--failure-reason")
     p_work.add_argument(
         "--expected-run-id",
-        help="abandon／retire-delivered／regenerate-gates 使用的 exact WorkflowRun CAS",
+        help="abandon／retire-delivered／regenerate-gates／retry-card 使用的 exact WorkflowRun CAS",
+    )
+    p_work.add_argument(
+        "--card",
+        help="retry-card 專用：要重派的 builder card id（必須是下一張待派的卡）",
     )
     p_work.add_argument(
         "--reason",
@@ -419,6 +423,8 @@ def main(
             request_args["failure_reason"] = args.failure_reason
         if args.expected_run_id is not None:
             request_args["expected_run_id"] = args.expected_run_id
+        if args.card is not None:
+            request_args["card"] = args.card
         if args.reason is not None:
             request_args["reason"] = args.reason
         if args.combo is not None and args.action in {"start", "intake"}:

@@ -611,7 +611,13 @@ def build_request_executor(
                     args=dict(args),
                     requested_by=request["requested_by"],
                 )
-            if args.get("action") in {"start", "resume", "retry-build", "intake"}:
+            # #545：`retry-card` 與 `retry-build` 共用同一條「強制重派 builder
+            # 卡」的 dispatch 路徑（含失敗時把 needs_human 補回去的補償），差別
+            # 只在 work action 層允許的卡片位置與 reset 語意。
+            forced_builder_retry = args.get("action") in {"retry-build", "retry-card"}
+            if args.get("action") in {
+                "start", "resume", "retry-build", "retry-card", "intake",
+            }:
                 registry = getattr(dispatcher, "_registry", None)
                 run_payload = result.get("result", {}).get("run") if isinstance(result, dict) else None
                 run_id = run_payload.get("run_id") if isinstance(run_payload, dict) else None
@@ -670,12 +676,14 @@ def build_request_executor(
                                 identities=identities,
                                 launcher_factory=launcher_factory,
                                 coordinator_root=coordinator_root,
-                                force_new_build=args.get("action") == "retry-build",
+                                force_new_build=forced_builder_retry,
                             )
-                            if args.get("action") == "retry-build" and job is None:
-                                raise RuntimeError("retry-build produced no builder Job")
+                            if forced_builder_retry and job is None:
+                                raise RuntimeError(
+                                    f"{args.get('action')} produced no builder Job"
+                                )
                         except Exception:
-                            if args.get("action") == "retry-build":
+                            if forced_builder_retry:
                                 current = registry.get_workflow_run(run.run_id)
                                 registry._manager_update_workflow_run(
                                     run.run_id,

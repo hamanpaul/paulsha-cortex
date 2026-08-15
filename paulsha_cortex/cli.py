@@ -49,7 +49,7 @@ run 'cortex <command> --help' for command-specific help.
 """
 
 _WORK_HELP = """\
-usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|reset-reclaim-budget|auto|review-attest|ship> ...
+usage: cortex work <show|gc|link|unlink|intake|start|resume|retry-build|retry-card|retry-verify|retry-review|recover-planning|recover-pre-candidate|recover-repair-commit|regenerate-gates|abandon|retire-delivered|reset-reclaim-budget|auto|review-attest|ship> ...
 
 work item commands:
   show      從 Monitor 讀取 Work Item 與關聯解釋
@@ -60,6 +60,7 @@ work item commands:
   start     手動 claim 並建立 WorkflowRun（可用 --combo 明示 override）
   resume    恢復 needs_human／blocked workflow
   retry-build  以 exact Candidate CAS 重開最後一個 builder card
+  retry-card  以 exact WorkflowRun CAS + --card 重派最早一張尚未採信的 builder card（含中段卡；已採信的 evidence 不可重派）
   retry-verify  以 exact Candidate CAS 只重跑 verification，不重建 candidate
   retry-review  以 exact Candidate CAS 只重跑 foreign review，不重跑 builder
   abandon   以 exact WorkflowRun CAS 將 pre-delivery run 標成 superseded

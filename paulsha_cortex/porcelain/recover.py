@@ -59,7 +59,7 @@ def _build_parser() -> argparse.ArgumentParser:
     work.add_argument(
         "action",
         choices=(
-            "retry-build", "resume", "recover-pre-candidate",
+            "retry-build", "retry-card", "resume", "recover-pre-candidate",
             "recover-repair-commit", "regenerate-gates", "abandon",
             "retire-delivered", "reset-reclaim-budget",
         ),
@@ -68,6 +68,7 @@ def _build_parser() -> argparse.ArgumentParser:
     work.add_argument("--actor", required=True)
     work.add_argument("--expected-candidate")
     work.add_argument("--expected-run-id")
+    work.add_argument("--card", help="retry-card 要重派的 builder card id")
     work.add_argument("--reason")
     _add_tracking_options(work)
 
@@ -105,7 +106,7 @@ def _work_args(args: argparse.Namespace) -> dict[str, Any]:
         "repo": args.repo,
         "actor": args.actor,
     }
-    for name in ("expected_candidate", "expected_run_id", "reason"):
+    for name in ("expected_candidate", "expected_run_id", "card", "reason"):
         value = getattr(args, name)
         if value is not None:
             payload[name] = value
