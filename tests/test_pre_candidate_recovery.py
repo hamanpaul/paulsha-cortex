@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 import pytest
@@ -40,11 +41,30 @@ def test_allowed_slice_actions_when_candidate_is_null(tmp_path: Path) -> None:
     assert "retry-build" not in actions
 
 
-def test_recover_pre_candidate_removes_worktree_and_resets_slice(tmp_path: Path) -> None:
+def _git(repo: Path, *args: str) -> None:
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    assert proc.returncode == 0, f"git {' '.join(args)} failed: {proc.stderr}"
+
+
+def test_recover_pre_candidate_removes_worktree_and_resets_slice(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # issue #478：這個 fixture 原本只是一個普通暫存目錄，因此只證明得了「檔案被
+    # 刪掉」、看不見 git worktree registry 殘留（正是 #478 連續四次在生產重現卻
+    # 測試全綠的原因）。改用真實 repo ＋ 真實 linked worktree。
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "recover@example.invalid")
+    _git(repo, "config", "user.name", "recover-test")
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-qm", "init")
+    monkeypatch.setenv("PSC_REPO_ROOT", str(repo))
     wt_dir = tmp_path / "wt" / "feature-slice-3a"
-    wt_dir.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-q", str(wt_dir), "-b", "feature/slice-3a")
     (wt_dir / "leftover.txt").write_text("residual", encoding="utf-8")
 
     builder_job = reg.create_job(
@@ -84,6 +104,12 @@ def test_recover_pre_candidate_removes_worktree_and_resets_slice(tmp_path: Path)
 
     assert res["result"] == "ok"
     assert not wt_dir.exists()
+    listing = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert str(wt_dir) not in listing
     latest_slice = reg.get_slice("slice-3a")
     assert latest_slice["state"] == "pending"
     assert latest_slice["gate_state"] == "pending"

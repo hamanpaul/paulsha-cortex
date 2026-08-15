@@ -1112,6 +1112,49 @@ def _write_immutable_json(path: Path, payload: object) -> None:
         os.close(directory_fd)
 
 
+SAFE_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def brainstorm_evidence_filename(
+    *,
+    scope: PlanningScope,
+    question_pack_id: str,
+    run_id: str | None = None,
+) -> str:
+    """brainstorm evidence 的檔名（issue #535：世代隔離的 content-addressed 命名）。
+
+    原本檔名只由 `(scope, question_pack_id)` 決定，於是同一個 work item 的**下一
+    世代**（前一世代已 abandon）重跑 brainstorm 時，落點與前代殘留檔完全相同；
+    模型輸出語意相同但 byte 不同，撞上 `_PlanningPublicationTransaction.publish()`
+    的 no-clobber fail-closed，新世代必然 `ValueError: planning artifact no-clobber
+    conflict`。
+
+    修法取 issue 建議的第 (b) 案——**讓命名空間帶 run identity**，而不是第 (a) 案
+    的「abandon 時把前代 evidence 搬到 archive」：evidence 不可銷毀（審計不可變
+    原則）意味著也不該被**搬動**，前代 run 的 `gate_refs`／`evidence_refs` 逐字
+    記著絕對路徑，搬檔會讓那些稽核指標整批懸空。帶 run identity 則前代 evidence
+    原位不動、原路徑仍可稽核，新世代自然不撞。
+
+    run_id 同時進檔名（可直接看出歸屬，免去 operator 挖 mtime 對時間軸）與 hash
+    輸入（避免有人手改檔名就偽造歸屬）。`run_id` 缺席或格式不安全時退回舊命名，
+    保持既有呼叫端與既有殘留檔的可讀性。
+    """
+
+    identity: str | None = None
+    if isinstance(run_id, str) and SAFE_RUN_ID_RE.fullmatch(run_id) is not None:
+        identity = run_id
+    key_payload: dict[str, object] = {
+        "scope": scope.to_dict(),
+        "question_pack_id": question_pack_id,
+    }
+    if identity is not None:
+        key_payload["run_id"] = identity
+    evidence_key = _hash_payload(key_payload)[:32]
+    if identity is None:
+        return f"brainstorm-{evidence_key}.json"
+    return f"brainstorm-{identity}-{evidence_key}.json"
+
+
 def run_heterogeneous_brainstorm(
     *,
     report: CompletenessReport,
@@ -1126,6 +1169,7 @@ def run_heterogeneous_brainstorm(
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object],
     artifact_writer: Callable[[object], Callable[[], None] | None] | None = None,
     evidence_writer: Callable[[Path, object], None] | None = None,
+    run_id: str | None = None,
 ) -> BrainstormResult:
     empty_refs = PlanningGateRefs()
     if report.complete:
@@ -1224,13 +1268,9 @@ def run_heterogeneous_brainstorm(
         "primary_integration": integration,
         "artifacts": list(artifact_evidence),
     }
-    evidence_key = _hash_payload(
-        {
-            "scope": scope.to_dict(),
-            "question_pack_id": pack.pack_id,
-        }
-    )[:32]
-    evidence_path = Path(evidence_dir) / f"brainstorm-{evidence_key}.json"
+    evidence_path = Path(evidence_dir) / brainstorm_evidence_filename(
+        scope=scope, question_pack_id=pack.pack_id, run_id=run_id
+    )
     try:
         if evidence_writer is None:
             _write_immutable_json(evidence_path, evidence_payload)
