@@ -47,6 +47,27 @@
   （51 個測試）。
 
 ### Changed
+- **v4 重構計畫 R0.5 D6：trust root 隔離 spec 定案（spec-only，本次不含實作）**——
+  新增 `docs/superpowers/specs/trust-root-isolation-spec.md`（R1–R12），定案 0.2.0
+  穩定版**不可豁免 join gate** 的契約。逐檔核對確認：路徑解析鏈本身即信任根
+  （`config/runtime.py:89`；bootstrap env 由 installer 裸寫、無 mode 檢查，
+  `deploy/installer.py:162`），全 repo **零 HMAC／零簽章**、所有 evidence 皆為
+  自我雜湊（只證明位元組未壞、不證明產生者），`chmod 0400`／`0444` 一線對 owner
+  全部無效。本 spec 另揭露一條比 `#484` 更根本的最短攻擊路徑：review verdict 是
+  reviewer 模型寫在 worktree 內的 `.psc-review-verdict.json`
+  （`coordinator/review.py:22-23,176-185`），同 UID 下 **builder 可直接代寫**，
+  即使 reviewer 被正確限制成 read-only 仍然成立。**路線裁決**：完整比較
+  (a) OS/MAC 邊界與 (b) 簽章＋強制驗簽後，建議以 (a) 為 0.2.0 的必要且充分基礎、
+  (b) 降為 Phase 3 的 defense-in-depth——因為 (b) 的三個前提（金鑰保密、verifier
+  完整性、單調計數器）**全部必須由 (a) 提供**，「只做 (b)」不是成本較高的方案而是
+  不成立的方案；(b) 的完整規格（canonical encoding／domain separation／
+  anti-replay／rotation-revocation／legacy 遷移／fail-closed）仍在本 spec 定案供
+  Phase 3 與 Elevated tier 使用。另定案 operator 授權通道（action-bound＋
+  single-use＋短效＋本體不落地）、reviewer 身分由 Manager registry 推導、四族 E2E
+  測試矩陣（含 negative control 與「實際重啟服務」的 enforcement-plane 十案）、
+  三階段落地（Phase 1 不需 root 可先行並帶降級運轉安全網），以及 `#484`／`#480`／
+  `#489` 的取代／補強對照與 10 項待 operator 拍板的未決問題。詳見
+  `changelog.d/d6-trust-root-spec.md`。本票不新增測試（docs-only）。
 - **Issue #506 / D3：GitHub issues 改走 `state=all&since=` ＋ ETag 條件請求的增量
   同步，全量只作每日一次的 anti-entropy 對帳**——`GitHubWorkProvider` 過去每輪對
   **每個** configured repo 全量分頁抓 issues（`--paginate`）；D2 把 `contents`／
