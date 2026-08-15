@@ -8963,6 +8963,14 @@ def apply_workflow_action(
             runtime = runtime_factory(
                 primary=primary,
                 worktree=_required_workflow_string(args, "artifact_root"),
+                # #507：planning launcher 偵測到 operator worktree drift 時
+                # 不再整棵還原，改為把受影響檔案完整備份進 run-scoped evidence
+                # 並落一份結構化 diff 報告；這裡把 evidence 根與 run_id 交給
+                # runtime，operator 才能用同一組 run_id 同時撈
+                # `planning-recovery`、`planning-artifacts` 與
+                # `planning-worktree-drift` 三份 evidence。
+                evidence_root=transaction_root,
+                run_id=run.run_id,
             )
         except Exception as exc:
             # #393：recover-planning 靠 `cortex-planning-failure/v1` evidence

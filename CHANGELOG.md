@@ -35,6 +35,37 @@
   `status=passed` 並誠實自報 `pytest: failed`」，消除泛用 `status_policy` 與實際採信
   規則相反的字面陷阱。詳見 `changelog.d/gate-acceptance-chain.md`。新增
   `tests/test_gate_acceptance_chain_540.py`（15 個回歸測試）與 2 個 doctor 整合測試。
+
+- **Issue #507：planning 失敗時整棵 operator worktree 抹除還原，靜默銷毀並行的 operator
+  工作（實測資料遺失）**——`planning_runtime._invoke_json` 的 finally 區塊只要偵測到
+  T0→T1 之間 operator worktree 有任何差異，就呼叫 `_restore_operator_tree()`：刪光
+  worktree 內除 `.git` 以外的**全部內容**再從 T0 baseline 整棵還原。偵測條件
+  （`_tree_snapshot` 前後比對）分不出「launcher 越界寫入」與「operator／其他 agent／
+  編輯器的正常並行編輯」，而 launcher 早已以 `cwd=sandbox`（拋棄式複本）執行——安全網的
+  補救動作被設成整棵樹抹除，誤傷機率遠高於它要防的越界；baseline 又由非原子 `copytree`
+  取樣，歸因本身就不可靠。Phase 1 dogfooding 兩次實測命中：(1) run
+  `workflow-0529388d8e290c8fb938` 抹除 operator 在視窗內新建的
+  `docs/superpowers/workstreams/<slug>/todo.md`，連帶讓 `.cortex/work-items.yaml` 留下
+  懸空連結、`active_todo` 為假、lifecycle 停在 `topic` 不可 claim；(2) 更嚴重的形態是
+  **被抹除的是 cortex 自己的成功產出**——前一代 planning 產出的三份合格 artifact 屬未追蹤
+  檔、不在後續那次的 baseline 內，遭下一次失敗的 rollback 刪除，run 的
+  `planning_authority` 隨即指向不存在的檔案（`workflow planning input missing`），work
+  item 卡死且 git 救不回。R0 修法四項：整棵還原的程式路徑**移除**
+  （`_restore_operator_tree()` 刪除，`_make_tree_traversable()` 收斂為只能指向拋棄式
+  sandbox）；drift 分析改走全新的**唯讀且對讀取失敗容錯**的 `_tree_manifest()`／
+  `_diff_tree_manifests()`，預設不改寫 operator worktree 一個位元組；受影響檔案的 T0／T1
+  兩版**完整備份**進 `<coordinator_root>/evidence/planning-worktree-drift/<run_id>-<digest>/`
+  並落一份 `cortex-planning-worktree-drift/v1` 結構化 diff 報告（失敗訊息帶計數與 evidence
+  路徑，另落完整 `logger.error`）；還原改為需明示 opt-in 的逐路徑 `rollback_scope`，經三道
+  fail-closed 閘門把守——不在本次 diff 內、命中受保護的權威文件
+  （`docs/superpowers/{workstreams,specs,plans}/**`、`openspec/changes/**`、`.cortex/**`）、
+  備份未成功者一律拒絕還原（**備份不成功就不准抹除**）。`manager.apply_workflow_action`
+  把 `evidence_root` 與 `run_id` 交給 runtime factory，operator 得以用同一組 run_id 同時撈
+  `planning-recovery`／`planning-artifacts`／`planning-worktree-drift` 三份 evidence。
+  結構解（planning 產出完全不進 operator 樹）、baseline 取樣的非原子 race、planning 期間的
+  advisory lock、以及 worktree drift 仍被分類為 `content` 而禁用 `recover-planning`，
+  均留待後續。
+
 - **R0.5 D1（部分）：auto-claim label 判定改走 monitor 鏡像**——monitor 把持有
   `cortex:auto-on-going` 的 open issue 編號寫進 provider observations（issues 回應本來就含
   labels，零額外 API）；canonical claim 路徑據此導出 `auto_label`（原硬編 False）；

@@ -351,7 +351,8 @@ def test_planning_runtime_initialization_failure_logs_reason_and_records_needs_h
     manifest_path.write_text(json.dumps(manifest.to_dict()), encoding="utf-8")
     args = _workflow_args(manifest_path, tmp_path)
 
-    def failing_runtime_factory(*, primary, worktree):
+    # #507：factory 另收 `evidence_root`／`run_id`（drift 報告的 run-scoped 落點）。
+    def failing_runtime_factory(*, primary, worktree, **_):
         raise RuntimeError("sandbox worktree creation refused")
 
     with caplog.at_level(logging.ERROR, logger="paulsha_cortex.coordinator.manager"):
@@ -5654,9 +5655,13 @@ def test_run_loop_workflow_request_calls_production_runtime_factory(
         ]
     )
     calls: list[tuple[tuple[str, str], Path]] = []
+    drift_wiring: list[tuple[Path, str]] = []
 
-    def factory(*, primary, worktree):
+    # #507：factory 另收 `evidence_root`／`run_id`——operator worktree drift 的
+    # 備份與報告要落在 run-scoped evidence 底下才找得到，這裡一併釘住 wiring。
+    def factory(*, primary, worktree, evidence_root, run_id):
         calls.append((primary, Path(worktree)))
+        drift_wiring.append((Path(evidence_root), run_id))
         return planning_runtime.ProductionPlanningRuntime(
             identities,
             {},
@@ -5683,6 +5688,11 @@ def test_run_loop_workflow_request_calls_production_runtime_factory(
     assert calls == [(('codex', 'gpt-primary'), tmp_path)]
     assert done and done["status"] == "ok"
     assert done["result"]["reason"] == "no-heterogeneous-planner"
+    assert len(drift_wiring) == 1
+    evidence_root, run_id = drift_wiring[0]
+    # `evidence_dir` 是 `<artifact_root>/evidence`，transaction_root 取其 parent。
+    assert evidence_root == tmp_path.resolve()
+    assert run_id == done["result"]["run_id"]
 
 
 def test_registry_restores_file_and_memory_when_directory_fsync_fails_after_replace(

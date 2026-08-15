@@ -479,25 +479,242 @@ def test_planning_source_material_rejects_symlink_traversal(tmp_path: Path) -> N
 
 
 def test_planning_runtime_rejects_any_worktree_mutation(tmp_path: Path) -> None:
+    """issue #507：偵測到 operator worktree drift 仍必須 fail-closed，但
+    **不得改寫 operator worktree 一個位元組**。修法前這裡呼叫
+    `_restore_operator_tree()` 整棵抹除還原，實測把 operator 在同一視窗內新建
+    的未追蹤檔（work item 的 todo 來源）與前一代 planning 成功產出的 artifact
+    一併銷毀。修法後：內容原封不動，diff 落 evidence 交回 operator 判讀。"""
+
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
-    baseline = tmp_path / "tracked.md"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    evidence_root = tmp_path / "coordinator"
+    baseline = worktree / "tracked.md"
     baseline.write_text("original\n", encoding="utf-8")
 
     def runner(argv, **kwargs):
         baseline.write_text("mutated\n", encoding="utf-8")
-        (tmp_path / "unexpected.md").write_text("leak\n", encoding="utf-8")
+        (worktree / "unexpected.md").write_text("leak\n", encoding="utf-8")
         return _completed("failure\n", returncode=9)
 
-    with pytest.raises(ValueError, match="operator worktree.*rolled back"):
+    with pytest.raises(ValueError, match="operator worktree.*content preserved"):
         planning_runtime._invoke_json(
             identity,
             "return JSON",
-            worktree=tmp_path,
+            worktree=worktree,
             runner=runner,
             timeout_seconds=30,
+            evidence_root=evidence_root,
+            run_id="workflow-507",
         )
-    assert baseline.read_text(encoding="utf-8") == "original\n"
-    assert not (tmp_path / "unexpected.md").exists()
+    assert baseline.read_text(encoding="utf-8") == "mutated\n"
+    assert (worktree / "unexpected.md").read_text(encoding="utf-8") == "leak\n"
+
+    report = _drift_report(evidence_root)
+    assert report["schema"] == planning_runtime.PLANNING_WORKTREE_DRIFT_SCHEMA
+    assert report["run_id"] == "workflow-507"
+    assert report["counts"] == {"added": 1, "modified": 1, "removed": 0}
+    assert report["rollback_scope_applied"] == []
+    changes = {row["path"]: row["change"] for row in report["entries"]}
+    assert changes == {"tracked.md": "modified", "unexpected.md": "added"}
+
+
+def _drift_report(evidence_root: Path) -> dict:
+    directory = (
+        evidence_root / "evidence" / planning_runtime.PLANNING_WORKTREE_DRIFT_DIRNAME
+    )
+    reports = sorted(directory.glob("*/report.json"))
+    assert len(reports) == 1, f"未見唯一 drift 報告，目錄內容：{list(directory.glob('*'))}"
+    return json.loads(reports[0].read_text(encoding="utf-8"))
+
+
+def test_operator_concurrent_untracked_file_survives_planning_drift(tmp_path: Path) -> None:
+    """issue #507 現場回歸：planning 視窗內由 operator（或其他 agent）新建的
+    未追蹤檔必須完好無損。實測 run `workflow-0529388d8e290c8fb938` 就是在這條
+    路徑上把 `docs/superpowers/workstreams/<slug>/todo.md` 抹除，連帶讓
+    `.cortex/work-items.yaml` 留下懸空連結、work item 不可 claim。"""
+
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    worktree = tmp_path / "worktree"
+    (worktree / "docs" / "superpowers" / "workstreams" / "fix-x").mkdir(parents=True)
+    evidence_root = tmp_path / "coordinator"
+    concurrent = (
+        worktree / "docs" / "superpowers" / "workstreams" / "fix-x" / "todo.md"
+    )
+
+    def runner(argv, **kwargs):
+        # 與 launcher 無關的第三方並行寫入：operator 在 planning 視窗內新建檔案。
+        concurrent.write_text("# operator todo\n", encoding="utf-8")
+        return _completed(json.dumps({"ok": True}))
+
+    with pytest.raises(ValueError, match="operator worktree.*content preserved"):
+        planning_runtime._invoke_json(
+            identity,
+            "return JSON",
+            worktree=worktree,
+            runner=runner,
+            timeout_seconds=30,
+            evidence_root=evidence_root,
+            run_id="workflow-507",
+        )
+
+    assert concurrent.read_text(encoding="utf-8") == "# operator todo\n"
+    report = _drift_report(evidence_root)
+    assert report["counts"]["added"] == 1
+    added = [row for row in report["entries"] if row["change"] == "added"]
+    assert [row["path"] for row in added] == [
+        "docs/superpowers/workstreams/fix-x/todo.md"
+    ]
+    # 備份必須落地且可回復：evidence 內容與 worktree 內容逐位元組相同。
+    backup = Path(added[0]["backup"]["observed"]["path"])
+    assert backup.read_bytes() == concurrent.read_bytes()
+
+
+def test_previous_generation_planning_artifacts_survive_drift_containment(
+    tmp_path: Path,
+) -> None:
+    """issue #507 追加現場：被抹除的是 **cortex 自己的成功產出**。前一代 run
+    產出的三份合格 artifact 是未追蹤檔、不在後續那次的 T0 baseline 內，整棵還原
+    會把它們當成 launcher 產物刪掉，run 的 `planning_authority` 隨即指向不存在
+    的檔案（`workflow planning input missing`），work item 卡死且 git 救不回。"""
+
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    worktree = tmp_path / "worktree"
+    specs = worktree / "docs" / "superpowers" / "specs"
+    plans = worktree / "docs" / "superpowers" / "plans"
+    specs.mkdir(parents=True)
+    plans.mkdir(parents=True)
+    evidence_root = tmp_path / "coordinator"
+    artifacts = {
+        specs / "fix-x-spec.md": "# spec\n",
+        specs / "fix-x-design.md": "# design\n",
+        plans / "fix-x.md": "# plan\n",
+    }
+
+    def runner(argv, **kwargs):
+        for path, body in artifacts.items():
+            path.write_text(body, encoding="utf-8")
+        return _completed(json.dumps({"ok": True}))
+
+    with pytest.raises(ValueError, match="operator worktree.*content preserved"):
+        planning_runtime._invoke_json(
+            identity,
+            "return JSON",
+            worktree=worktree,
+            runner=runner,
+            timeout_seconds=30,
+            evidence_root=evidence_root,
+            run_id="workflow-507",
+        )
+
+    for path, body in artifacts.items():
+        assert path.read_text(encoding="utf-8") == body
+    assert _drift_report(evidence_root)["counts"]["added"] == 3
+
+
+def test_drift_containment_refuses_to_roll_back_authority_documents(
+    tmp_path: Path,
+) -> None:
+    """issue #507：即使呼叫端明示要求還原，權威文件（work item 的 todo 來源、
+    前代 planning artifact、work registry）一律拒絕——這些是受管資產而非
+    launcher 汙染，抹除它們會讓 lifecycle／`planning_authority` 直接壞掉。"""
+
+    worktree = tmp_path / "worktree"
+    baseline = tmp_path / "baseline"
+    evidence_root = tmp_path / "coordinator"
+    for root in (worktree, baseline):
+        (root / "docs" / "superpowers" / "workstreams" / "fix-x").mkdir(parents=True)
+        (root / "docs" / "superpowers" / "specs").mkdir(parents=True)
+        (root / "openspec" / "changes" / "fix-x").mkdir(parents=True)
+        (root / ".cortex").mkdir(parents=True)
+    protected = {
+        "docs/superpowers/workstreams/fix-x/todo.md": "# todo\n",
+        "docs/superpowers/specs/fix-x-spec.md": "# spec\n",
+        "openspec/changes/fix-x/proposal.md": "# proposal\n",
+        ".cortex/work-items.yaml": "items: []\n",
+    }
+    for relative, body in protected.items():
+        (worktree / relative).write_text(body, encoding="utf-8")
+    (worktree / "scratch.txt").write_text("launcher\n", encoding="utf-8")
+
+    summary = planning_runtime._contain_operator_drift(
+        worktree,
+        baseline,
+        evidence_root=evidence_root,
+        run_id="workflow-507",
+        rollback_scope=frozenset({*protected, "scratch.txt"}),
+    )
+
+    for relative, body in protected.items():
+        assert (worktree / relative).read_text(encoding="utf-8") == body
+    refused = {row["path"]: row["reason"] for row in summary["rollback_scope_refused"]}
+    assert set(refused) == set(protected)
+    assert set(refused.values()) == {"protected-authority-document"}
+    # 範圍內、非權威文件、備份成功者才會被還原（此處 baseline 無該檔 → 刪除）。
+    assert summary["rollback_scope_applied"] == ["scratch.txt"]
+    assert not (worktree / "scratch.txt").exists()
+    backup = Path(_drift_report(evidence_root)["backup_root"])
+    assert (backup / "observed" / "scratch.txt").read_text(
+        encoding="utf-8"
+    ) == "launcher\n"
+
+
+def test_drift_containment_never_restores_a_path_it_could_not_back_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue #507 的最低保命索：備份不成功就不准抹除。修法前的整棵還原是
+    不可逆的，且錯誤訊息完全沒有指出檔案曾存在。"""
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    (worktree / "scratch.txt").write_text("launcher\n", encoding="utf-8")
+
+    # evidence 根不可用（None）＝ 沒有任何備份落地 → 一律拒絕還原。
+    summary = planning_runtime._contain_operator_drift(
+        worktree,
+        baseline,
+        evidence_root=None,
+        run_id="workflow-507",
+        rollback_scope=frozenset({"scratch.txt"}),
+    )
+
+    assert (worktree / "scratch.txt").read_text(encoding="utf-8") == "launcher\n"
+    assert summary["rollback_scope_applied"] == []
+    assert summary["rollback_scope_refused"] == [
+        {"path": "scratch.txt", "reason": "backup-unavailable"}
+    ]
+    assert summary["report_path"] is None
+
+
+def test_drift_containment_report_write_failure_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """drift 報告是診斷面：寫不出去只能記 log，不得掩蓋（或取代）上游真正的
+    planning 失敗。"""
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    (worktree / "scratch.txt").write_text("launcher\n", encoding="utf-8")
+
+    def refuse(target, payload):
+        raise OSError("read-only evidence volume")
+
+    monkeypatch.setattr(planning_runtime, "_write_evidence_bytes", refuse)
+    summary = planning_runtime._contain_operator_drift(
+        worktree,
+        baseline,
+        evidence_root=tmp_path / "coordinator",
+        run_id="workflow-507",
+        rollback_scope=frozenset(),
+    )
+
+    assert summary["counts"]["added"] == 1
+    assert summary["report_path"] is None
+    assert (worktree / "scratch.txt").exists()
 
 
 def test_planning_runtime_checks_disposable_sandbox_even_on_nonzero(tmp_path: Path) -> None:
@@ -521,42 +738,96 @@ def test_planning_runtime_checks_disposable_sandbox_even_on_nonzero(tmp_path: Pa
     assert not (tmp_path / "leak.md").exists()
 
 
-def test_planning_runtime_detects_and_rolls_back_directory_and_metadata_pollution(
+def test_drift_report_covers_directory_symlink_and_metadata_changes(
     tmp_path: Path,
 ) -> None:
+    """issue #507：目錄／symlink／mode 這些非檔案內容的變化一樣要進得了報告
+    ——`_tree_snapshot` 抓得到它們，`_tree_manifest` 若看不到就會出現「偵測到
+    dirty 卻報不出任何 diff」的失真報告。修法前這些變化的處置是整棵抹除還原。"""
+
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
-    tracked = tmp_path / "tracked.md"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    evidence_root = tmp_path / "coordinator"
+    tracked = worktree / "tracked.md"
     tracked.write_text("operator\n", encoding="utf-8")
     tracked.chmod(0o640)
-    empty = tmp_path / "empty"
+    empty = worktree / "empty"
     empty.mkdir()
-    target = tmp_path / "target"
+    target = worktree / "target"
     target.mkdir()
-    directory_link = tmp_path / "dir-link"
+    directory_link = worktree / "dir-link"
     directory_link.symlink_to("target", target_is_directory=True)
 
     def runner(argv, **kwargs):
         tracked.chmod(0o600)
         empty.rmdir()
-        (tmp_path / "pollution-empty").mkdir()
+        (worktree / "pollution-empty").mkdir()
         directory_link.unlink()
         directory_link.symlink_to("empty", target_is_directory=True)
         return _completed(json.dumps({"ok": True}))
 
-    with pytest.raises(ValueError, match="operator worktree.*rolled back"):
+    with pytest.raises(ValueError, match="operator worktree.*content preserved"):
         planning_runtime._invoke_json(
             identity,
             "return JSON",
-            worktree=tmp_path,
+            worktree=worktree,
             runner=runner,
             timeout_seconds=30,
+            evidence_root=evidence_root,
+            run_id="workflow-507",
         )
 
-    assert tracked.stat().st_mode & 0o777 == 0o640
-    assert empty.is_dir()
-    assert not (tmp_path / "pollution-empty").exists()
-    assert directory_link.is_symlink()
-    assert os.readlink(directory_link) == "target"
+    # 修法後不還原：launcher 造成的變化原樣留在原地，由報告交回 operator 判讀。
+    assert tracked.stat().st_mode & 0o777 == 0o600
+    assert not empty.exists()
+    assert (worktree / "pollution-empty").is_dir()
+    assert os.readlink(directory_link) == "empty"
+
+    report = _drift_report(evidence_root)
+    rows = {row["path"]: row for row in report["entries"]}
+    assert rows["tracked.md"]["change"] == "modified"
+    assert rows["tracked.md"]["baseline"]["mode"] == "0640"
+    assert rows["tracked.md"]["observed"]["mode"] == "0600"
+    assert rows["empty"]["change"] == "removed"
+    assert rows["pollution-empty"]["change"] == "added"
+    assert rows["dir-link"]["baseline"]["target"] == "target"
+    assert rows["dir-link"]["observed"]["target"] == "empty"
+
+
+def test_whole_tree_restore_code_path_is_gone(tmp_path: Path) -> None:
+    """issue #507 需求三：「整棵 worktree 還原」的程式路徑必須移除。這條斷言
+    是防回歸的門閂——`_restore_operator_tree()` 一旦被重新引入（或
+    `_make_tree_traversable()` 被重新指向 operator 樹），本測試立即 FAIL。"""
+
+    assert not hasattr(planning_runtime, "_restore_operator_tree")
+
+    identity = ModelIdentity("codex", "primary", "openai", ("planning",))
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "tracked.md").write_text("operator\n", encoding="utf-8")
+    protected = worktree / "protected"
+    protected.mkdir()
+    protected.chmod(0o750)
+
+    def runner(argv, **kwargs):
+        (worktree / "leak.md").write_text("launcher\n", encoding="utf-8")
+        return _completed(json.dumps({"ok": True}))
+
+    with pytest.raises(ValueError, match="operator worktree.*content preserved"):
+        planning_runtime._invoke_json(
+            identity,
+            "return JSON",
+            worktree=worktree,
+            runner=runner,
+            timeout_seconds=30,
+            evidence_root=tmp_path / "coordinator",
+            run_id="workflow-507",
+        )
+
+    # drift 分析全程唯讀：連「為了讀取而 chmod 0o700」都不得發生。
+    assert protected.stat().st_mode & 0o777 == 0o750
+    assert (worktree / "tracked.md").read_text(encoding="utf-8") == "operator\n"
 
 
 def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_path: Path) -> None:
@@ -584,9 +855,17 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
 
 
-def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) -> None:
+def test_snapshot_permission_error_still_produces_drift_evidence(tmp_path: Path) -> None:
+    """issue #507：launcher 把目錄 chmod 0 讓快照讀不下去時，仍必須 fail-closed
+    並產出可判讀的報告。修法前這條路徑走「整棵抹除還原」（先 chmod 整棵樹再刪
+    光重建）；修法後只做唯讀走訪，讀不到的節點記成 `unreadable` 繼續，baseline
+    版本完整備份進 evidence，operator 因此還救得回內容。"""
+
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
-    protected = tmp_path / "protected"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    evidence_root = tmp_path / "coordinator"
+    protected = worktree / "protected"
     protected.mkdir()
     tracked = protected / "tracked.md"
     tracked.write_text("baseline\n", encoding="utf-8")
@@ -604,16 +883,30 @@ def test_snapshot_permission_error_still_restores_operator_tree(tmp_path: Path) 
         protected.chmod(0)
         return _completed(json.dumps({"ok": True}))
 
-    with pytest.raises(ValueError, match="operator worktree.*rolled back"):
-        planning_runtime._invoke_json(
-            identity, "return JSON", worktree=tmp_path, runner=runner,
-            timeout_seconds=30,
-        )
+    try:
+        with pytest.raises(ValueError, match="operator worktree.*content preserved"):
+            planning_runtime._invoke_json(
+                identity,
+                "return JSON",
+                worktree=worktree,
+                runner=runner,
+                timeout_seconds=30,
+                evidence_root=evidence_root,
+                run_id="workflow-507",
+            )
 
-    assert protected.stat().st_mode & 0o777 == 0o750
-    assert tracked.read_text(encoding="utf-8") == "baseline\n"
-    if xattr_supported:
-        assert os.getxattr(tracked, "user.cortex-test") == b"baseline"
+        report = _drift_report(evidence_root)
+        rows = {row["path"]: row for row in report["entries"]}
+        assert rows["protected"]["change"] == "modified"
+        assert rows["protected"]["baseline"]["mode"] == "0750"
+        assert rows["protected"]["observed"]["mode"] == "0000"
+        assert str(rows["protected"]["observed"]["children"]).startswith("unreadable:")
+        # 讀不到的子節點在報告中呈現為 removed，且 baseline 版本已完整備份。
+        assert rows["protected/tracked.md"]["change"] == "removed"
+        backup = Path(rows["protected/tracked.md"]["backup"]["baseline"]["path"])
+        assert backup.read_text(encoding="utf-8") == "baseline\n"
+    finally:
+        protected.chmod(0o750)
 
 
 def test_tree_snapshot_ignores_pycache_directories_and_pyc_files(tmp_path: Path) -> None:
@@ -827,29 +1120,38 @@ def test_planning_runtime_tolerates_shared_worktree_runtime_handoff_churn(
     assert (tmp_path / "runtime" / "handoff" / "wf-1.json").exists()
 
 
-def test_operator_restore_fault_is_fail_closed(
+def test_drift_containment_fault_does_not_mask_the_planning_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """issue #507：drift 收斂本身故障（evidence 目錄不可寫等）時仍必須
+    fail-closed 拋出可辨識的 planning 失敗，而不是把例外換成一個與現場無關的
+    「restore failed」——後者曾是修法前唯一的出口。"""
+
     identity = ModelIdentity("codex", "primary", "openai", ("planning",))
-    tracked = tmp_path / "tracked.md"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    tracked = worktree / "tracked.md"
     tracked.write_text("baseline\n", encoding="utf-8")
-    real_restore = planning_runtime._restore_operator_tree
 
     def runner(argv, **kwargs):
         tracked.write_text("polluted\n", encoding="utf-8")
         return _completed(json.dumps({"ok": True}))
 
-    def restore_then_fail(worktree, baseline):
-        real_restore(worktree, baseline)
-        raise OSError("restore fsync fault")
+    def refuse(target, payload):
+        raise OSError("evidence volume is read-only")
 
-    monkeypatch.setattr(planning_runtime, "_restore_operator_tree", restore_then_fail)
-    with pytest.raises(RuntimeError, match="restore failed"):
+    monkeypatch.setattr(planning_runtime, "_write_evidence_bytes", refuse)
+    with pytest.raises(ValueError, match="operator worktree.*content preserved"):
         planning_runtime._invoke_json(
-            identity, "return JSON", worktree=tmp_path, runner=runner,
+            identity,
+            "return JSON",
+            worktree=worktree,
+            runner=runner,
             timeout_seconds=30,
+            evidence_root=tmp_path / "coordinator",
+            run_id="workflow-507",
         )
-    assert tracked.read_text(encoding="utf-8") == "baseline\n"
+    assert tracked.read_text(encoding="utf-8") == "polluted\n"
 
 
 def test_invoke_json_seeds_hermetic_claude_config_dir_from_home_credentials(
