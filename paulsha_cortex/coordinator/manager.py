@@ -28,6 +28,7 @@ from . import completion
 from . import gate_ledger
 from . import planning_runtime
 from . import provider_backoff
+from . import outcome_taxonomy
 from . import provider_outcome
 from . import seams
 from . import review as foreign_review
@@ -827,6 +828,20 @@ def _completion_candidate_ref(
 
 
 def _review_log_has_only_json_lines(log_path: object) -> bool:
+    """reviewer 的 evidence log 是否為純 JSONL（非純者一律 `invalid-process-output`）。
+
+    #485：Codex CLI 0.147.0 的 `codex exec ... --json` 會先把
+    `Reading additional input from stdin...` 印進同一份 evidence log，於是**每
+    一次**成功的 Codex foreign review 都在讀 verdict 之前就被判
+    `invalid-process-output`——process exit 0、`.psc-review-verdict.json` 也
+    寫好了，卻永遠到不了 verdict 驗證。
+
+    修法採 issue 列的第二條路：只在 parse 前剝離「精確、adapter 自有」的已知
+    banner（`outcome_taxonomy.KNOWN_PROCESS_BANNERS`，且只認開頭連續的那幾
+    行）。JSONL 純度檢查本身一格未放寬：不在該表上的任何非 JSON 文字仍舊
+    fail closed。
+    """
+
     if not isinstance(log_path, str) or not log_path:
         return True
     path = Path(log_path)
@@ -836,7 +851,7 @@ def _review_log_has_only_json_lines(log_path: object) -> bool:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
         return False
-    for line in lines:
+    for line in outcome_taxonomy.strip_known_process_banners(lines):
         if not line.strip():
             continue
         try:
@@ -1168,6 +1183,27 @@ def _launch_foreign_review(
         }
 
 
+def _review_failure_gate_reason(review_job: Mapping[str, object]) -> str:
+    """reviewer process 失敗時的 gate_reason（#499）。
+
+    修法前一律 `foreign-review-absent`：一個 provider 講得清清楚楚的限流
+    （Claude stream-json 帶 `rate_limit_event.status = rejected`、
+    `rateLimitType = five_hour`、`resetsAt`，終局 `api_error_status = 429`）
+    被壓平成「沒有 review 結論」，operator 得自己去翻 raw JSONL 才知道要等到
+    什麼時候才值得 retry-review。
+
+    分類已由 `Dispatcher._finalize_headless` 在 finalize 當下寫在 job 上，這裡
+    只是把它顯露出來。**後續處置不變**：仍是 needs_human、仍只提供既有的
+    手動 retry-review 出口——本修法只修「分錯類」，不動 recovery policy。
+    未分類（legacy job）或分不出來（UNKNOWN）維持既有字面值，不偽造分類。
+    """
+
+    classification = provider_outcome.classification_from_job(review_job)
+    if classification is None or classification.outcome is provider_outcome.ProviderOutcome.UNKNOWN:
+        return "foreign-review-absent"
+    return f"foreign-review-provider-{classification.outcome.value}"
+
+
 def _finalize_review_job(
     *,
     registry,
@@ -1220,7 +1256,11 @@ def _finalize_review_job(
             coordinator_root=coordinator_root,
         )
         _apply_review_evaluation(registry, slice_id, evaluation)
-        return evaluation, "needs_human", "foreign-review-absent"
+        # #499：gate_reason 帶上 typed provider outcome（gate evaluation
+        # artifact 的 `reason` 刻意維持 `reviewer-process-failed` 不變——那份
+        # artifact 是 immutable 的，改字面值會讓升級前後同一個 reviewer_job_id
+        # 的重新 finalize 撞 immutability）。
+        return evaluation, "needs_human", _review_failure_gate_reason(review_job)
     worktree = Path(str(review_job["worktree"]))
     review_head = verification._run_git(["-C", str(worktree), "rev-parse", "HEAD"], git_runner)
     if review_head["status"] != "ok" or review_head["stdout"].strip().lower() != candidate.lower():
@@ -1835,6 +1875,14 @@ def complete_tick(
                         identity_registry=identity_registry,
                         git_runner=git_runner,
                     )
+                    # #499：review lane 過去完全不投影分類，`provider_outcome`
+                    # 因此永遠是 null——一筆機器可讀的 429 被壓平成「沒有
+                    # review 結論」。build lane 早已這麼做（見下面
+                    # `elif status == "failed":`），這裡補上同一條線。
+                    if status == "failed":
+                        review_classification = provider_outcome.classification_from_job(job)
+                        if review_classification is not None:
+                            slice_provider_outcome_payload = review_classification.to_dict()
             else:
                 mismatches = _pinned_input_mismatches(slice_row) if slice_row is not None else []
 
@@ -6250,34 +6298,10 @@ def _is_planning_authority_residue_failure(reason: str | None) -> bool:
 
 # --- planner launcher 的暫時性服務失敗 ----------------------------------------
 #
-# 實測（2026-08-14，run `workflow-88d089d71416a754dda8`）：agy 服務暫時回
-# `Error: Eligibility check failed: UNAVAILABLE (code 503)`——**印錯誤文字但
-# exit 0**，launcher 因此去 parse stdout、找不到 JSON，失敗以
-# `primary-integration-malformed: ValueError: planning launcher returned no
-# JSON object` 收場，預設分類 `content` → `recover-planning` 被 #393 的
-# fail-closed 禁止 → 一個幾分鐘後自癒的 503 變成永久死路（同一指令 10 分鐘
-# 後重跑即成功）。這是 transient-誤判-死路模式的第五次命中（#500、#507 的
-# content 誤分類、worktree 汙染誤分類皆同族）。
-#
-# 判準刻意窄：只認 CLI/service 層的暫時性錯誤樣態（服務不可用、限流、逾時、
-# 連線層失敗）。模型「內容不從」（回散文不回 JSON、schema 不合）不在此列，
-# 維持 `content` 分類與 fail-closed 意圖——分辨依據是這些字樣出自 launcher
-# 轉印的服務錯誤，不會出現在合法的規劃輸出裡。
-_PLANNING_TRANSIENT_SERVICE_MARKERS = (
-    "unavailable",
-    "503",
-    "429",
-    "rate limit",
-    "too many requests",
-    "timed out",
-    "timeout",
-    "connection reset",
-    "connection refused",
-    "overloaded",
-    "temporarily",
-    "service_unavailable",
-    "eligibility check failed",
-)
+# #533 先行實作，2026-08-15 隨 #499／#500／#487／#485 收編進
+# `outcome_taxonomy`：三個 lane 共用同一張 markers 表，避免第七次同型漂移。
+# 這裡保留別名與判準函式，因為 planning lane 的呼叫端與其測試以此為名。
+_PLANNING_TRANSIENT_SERVICE_MARKERS = outcome_taxonomy.TRANSIENT_SERVICE_MARKERS
 
 
 def _is_planning_transient_service_failure(reason: str | None) -> bool:
@@ -6286,12 +6310,14 @@ def _is_planning_transient_service_failure(reason: str | None) -> bool:
     命中者分類改落 `environment`（與 #416 的殘留例外同路），讓
     `_resume_decision` 浮現 `recover-planning`——暫時性服務錯誤等它過去重跑
     即可，不該燒掉一個世代或落入 abandon 死路。
+
+    判準刻意窄：只認 CLI/service 層的暫時性錯誤樣態（服務不可用、限流、逾時、
+    連線層失敗）。模型「內容不從」（回散文不回 JSON、schema 不合）不在此列，
+    維持 `content` 分類與 fail-closed 意圖——分辨依據是這些字樣出自 launcher
+    轉印的服務錯誤，不會出現在合法的規劃輸出裡。
     """
 
-    if reason is None:
-        return False
-    lowered = reason.lower()
-    return any(marker in lowered for marker in _PLANNING_TRANSIENT_SERVICE_MARKERS)
+    return outcome_taxonomy.matches_transient_service_markers(reason)
 
 
 # --- issue #511：planning artifact 拒收的診斷面 -------------------------------
