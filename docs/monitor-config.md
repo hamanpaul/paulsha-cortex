@@ -104,3 +104,29 @@ D1–D3 把常態讀取壓下來的代價是**發現延遲**——fleet 自己�
   時不出現）。
 - **其他事件型別**：`steering` / `job`（#498）與未知型別一律**原地保留只記 log**，
   等各自的 consumer 落地。
+
+### producer：headless job 的 hook（#506 / D5）
+
+spool 目前唯一的 producer 是 headless **claude builder** job 的 PostToolUse hook
+（`cortex headless-hook post-tool-use`，實作在
+`paulsha_cortex/porcelain/headless_hook.py`）。job 每跑完一次 `Bash` 工具，hook 就
+從命令解析出被動過的 GitHub 物件並寫一則 `github_object` 事件。
+
+- **只在 headless 觸發（使用者硬約束：不得影響正常互動 agent）**，兩道獨立保證：
+  1. hook 宣告由 `SubprocessLauncher.launch()` 每次現場組出，經 argv 的
+     `--settings` 只交給該 job 的行程，**從不寫入任何檔案**——尤其不寫
+     `~/.claude/settings.json`。互動 session 讀 operator 自己的設定，那裡沒有這個
+     hook。打包的使用者全域模板 `scripts/hooks/claude.json` 刻意不含它。
+  2. 寫入端以 `PSC_JOB_ID` 自守：讀不到就直接返回，不建目錄、不寫檔、不起
+     subprocess、不解析命令。這個變數只由 launcher 為派工的 job 注入。
+- **只有 builder 掛**：read-only planner（`--tools ""`，沒有 Bash）與 review-only
+  reviewer（read-only 契約）都不注入。
+- **只認會改狀態的命令**：封閉列舉的 `gh issue`／`gh pr` 動詞，以及非 GET/HEAD 的
+  `gh api` 單物件路徑。命令沒帶 `--repo` 時從 job worktree 的 `origin` 補；補不到
+  就丟掉這則 hint（漏報退回輪詢週期，是安全的方向）。
+- **fire-and-forget**：解析／寫入的任何失敗都只記 debug log，CLI 一律 exit 0 且
+  stdout 保持空，注入的命令另以 `|| true` 與 `timeout` 兜底——hook 不得讓 job 看到
+  非零 exit，也不得阻塞它。
+- **心跳預留**：每則事件都帶 `job_id`，供 #536／#488 的心跳 consumer 日後消費；
+  本次不發 `job` 型別事件。
+- codex 免 hook（`codex exec --json` 的 JSONL 已被 parse）；copilot／agy 未接。

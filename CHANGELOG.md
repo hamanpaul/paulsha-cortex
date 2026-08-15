@@ -8,6 +8,45 @@
 ## [Unreleased]
 
 ### Added
+- **Issue #506 / D5：headless-only hook 儀器化（claude 先）——D4 spool 的第一個
+  producer**——D4 開了本機事件通道卻**沒有任何 producer**：monitor 每輪掃到的永遠
+  是空目錄，D1–D3 省下配額的代價（發現延遲）一分錢也沒買回來。新增
+  `paulsha_cortex/porcelain/headless_hook.py` 與 `cortex headless-hook
+  post-tool-use`：headless claude **builder** job 每跑完一次 `Bash` 工具，由
+  launcher 注入的 PostToolUse hook 從命令解析出被動過的 GitHub 物件，依 D4 契約寫一
+  則 `github_object` 事件。**使用者硬約束「hook 不得影響正常的互動式 agent 使用」以
+  兩道彼此獨立的結構保證落地**（任一道成立，互動 session 即完全 no-op）：(1) **hook
+  只經 launcher 注入且從不落地任何檔案**——宣告由 `SubprocessLauncher.launch()` 每次
+  現場組出（`_claude_spool_hook_settings()`），經 argv 的 `--settings` 只交給該 job
+  的行程，**不寫 `~/.claude/settings.json`、不寫任何 user 層設定、不寫磁碟**；互動
+  session 讀 operator 自己的設定，那裡沒有這個 hook，因此**連呼叫寫入端的機會都
+  沒有**；打包的使用者全域模板 `scripts/hooks/claude.json`（paulshaclaw thin install
+  的切點）刻意不含它，並有測試釘死。(2) **`PSC_JOB_ID` 自守**——`launch()`／
+  `executor_environment()` 為派工的 job 注入該標記，`emit_for_tool_use()` 讀不到就直
+  接返回，**不建 spool 目錄、不寫檔、不起 subprocess、連命令都不解析**。**只有
+  builder 掛 hook**：read-only planner 走 `--tools ""`（沒有 Bash），review-only
+  reviewer 是 read-only 契約且其 `--settings` 是那份 deny 掉 `$HOME` 的 sandbox 政策；
+  marker 與注入點成對出現，不留「有標記卻沒 hook」的半套狀態。**為何是 `--settings`
+  overlay 而非 hermetic `CLAUDE_CONFIG_DIR`**：#404 為 planning 的純 JSON 回聲任務所做
+  的 hermetic 選擇若搬到 builder，會一併抽掉 operator 的 `permissions` allowlist，讓
+  headless job 卡在無人可核可的授權提示——那是遠超出 D5 範圍的行為變更；overlay 同樣
+  是 per-job、走 argv、不落地，且 builder 既有設定原封不動。**hint 不是 authority**：
+  事件只帶 repo＋kind＋編號、**不帶新狀態**，`action` 純屬診斷；解析刻意往「寧可漏
+  報」失準——只認封閉列舉的 `gh issue`／`gh pr` mutation 動詞與非 GET/HEAD 的
+  `gh api` 單物件路徑（`issues/comments/{id}` 改的是留言、不會被誤認成 issue），旗標
+  一律當成吃一個值跳過（`--add-label 3` 的 `3` 不會被當編號），一行內 `&&`／`;` 串接
+  的多個命令全解析並收斂去重，沒帶 `--repo` 時從 job worktree 的 `origin` 補、補不到
+  就丟掉。漏報只是退回 refresh 週期延遲（D3 每日 anti-entropy 的守備範圍），誤報只是
+  白花一次條件請求且永遠不污染鏡像。**fire-and-forget**：所有失敗吞成 debug log，CLI
+  一律 exit 0 且 **stdout 保持空**（PostToolUse 的 stdout 會被當決策讀、非零 exit 會
+  被回報成 hook 失敗甚至回饋給模型），注入的命令再以 `|| true` 兜住 CLI 之外的失敗
+  （`cortex` 不在 PATH／套件損壞）並設 `timeout` 上限確保不阻塞 job。**#536／#488 心
+  跳本次只預留信封**：每則事件都帶 `job_id`，D4 信封的 `job_id` 欄位與
+  `RESERVED_EVENT_TYPES` 的 `job` 型別因此已備妥，心跳 consumer 落地時不需改寫入端契
+  約；本次不發 `job` 型別事件。**範圍**：codex 免 hook（`codex exec --json` 的 JSONL
+  已被 parse），copilot／agy 留後續，D4 消費端一行未動。詳見
+  `changelog.d/d5-headless-claude-hook.md`。新增
+  `tests/test_headless_claude_hook_506.py`（73 個測試）。
 - **Issue #506 / D4：monitor 的本機事件入口（spool）＋targeted refresh——事件是
   **hint 不是 authority**——新增 `paulsha_cortex/monitor/event_spool.py` 作為本機
   事件契約與唯一入口。D1–D3 把常態讀取壓到每 repo 每日 26 次計費請求，代價是**發現
