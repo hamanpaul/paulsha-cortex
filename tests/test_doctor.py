@@ -64,7 +64,11 @@ def _layout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         f"PSC_RUN_ROOT={agents / 'run' / 'cortex'}\n"
         f"PSC_MONITOR_STATE_ROOT={agents / 'monitor'}\n"
         f"PSC_PROJECT_CONFIG_ROOT={agents / 'config' / 'paulsha'}\n"
-        f"PSC_PREFLIGHT_CMD={preflight}\n",
+        f"PSC_PREFLIGHT_CMD={preflight}\n"
+        # #540：deck 的 build 卡宣告了 test_policy，harvest 端因此要求 ledger 有
+        # `pytest`；沒有這行宣告的部署，builder 交付的合格成果會在採信階段被
+        # `gate-ledger-missing-expected-gate` 拒絕，doctor 現在會事前擋下。
+        "PSC_GATE_CMD_PYTEST=python3 -m pytest -q\n",
         encoding="utf-8",
     )
     env = {
@@ -943,6 +947,64 @@ def test_run_doctor_reports_managed_path_drift_as_overall_failure(
     assert drift.status == "fail"
     assert drift.required is True
     assert "PSC_PROJECT_CONFIG_ROOT" in drift.detail
+
+
+def test_run_doctor_reports_missing_gate_declaration_as_overall_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#540：manager env 缺 `PSC_GATE_CMD_*` 宣告時，doctor 必須在開工前就紅。
+
+    現場（run `workflow-084f75e2178cf7547476`）是 builder 跑完、交付了合格的 RED
+    commit 之後才在採信階段撞 `gate-ledger-missing-expected-gate`，而錯誤只進
+    `manager.log`。
+    """
+
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+    env_file = home / ".agents" / "core" / "runtime" / "cortex-manager.env"
+    env_file.write_text(
+        "".join(
+            line + "\n"
+            for line in env_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("PSC_GATE_CMD_")
+        ),
+        encoding="utf-8",
+    )
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+
+    assert report.ok is False
+    gates = next(p for p in report.probes if p.name == "gate-declarations")
+    assert gates.status == "fail"
+    assert gates.required is True
+    assert "pytest" in gates.detail
+
+
+def test_run_doctor_passes_gate_declaration_probe_when_declared(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home, env = _layout(tmp_path)
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_preflight_command",
+        lambda environment: (environment["PSC_PREFLIGHT_CMD"],),
+    )
+    monkeypatch.setattr(
+        "paulsha_cortex.doctor._load_runtime_model_identities",
+        lambda config_root: 2,
+    )
+
+    report = run_doctor(probe_live=False, instance="cortex", env=env, home=home)
+
+    assert report.ok
+    gates = next(p for p in report.probes if p.name == "gate-declarations")
+    assert gates.status == "pass"
 
 
 def test_doctor_cli_json_and_help(monkeypatch, capsys) -> None:

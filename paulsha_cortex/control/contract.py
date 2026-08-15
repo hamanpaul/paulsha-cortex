@@ -17,7 +17,7 @@ WORK_ACTIONS = frozenset(
     {
         "link", "unlink", "start", "resume", "retry-build", "retry-verify",
         "retry-review", "recover-planning", "recover-pre-candidate",
-        "recover-repair-commit", "abandon", "retire-delivered",
+        "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
         "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
     }
 )
@@ -159,14 +159,17 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or "\n" in failure_reason
             ):
                 raise ValueError("work-action recover-planning requires failure_reason")
-        if action == "recover-repair-commit":
+        if action in {"recover-repair-commit", "regenerate-gates"}:
+            # #540：regenerate-gates 重跑 gate 的對象是一個具體的 WorkflowRun，
+            # 與 recover-repair-commit 同樣以 exact run CAS 定錨，避免在 operator
+            # 心裡想的 run 之外的 run 上動手。
             expected_run_id = args.get("expected_run_id")
             if (
                 not isinstance(expected_run_id, str)
                 or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
             ):
                 raise ValueError(
-                    "work-action recover-repair-commit requires exact expected_run_id"
+                    f"work-action {action} requires exact expected_run_id"
                 )
         if action in {"abandon", "retire-delivered"}:
             expected_run_id = args.get("expected_run_id")

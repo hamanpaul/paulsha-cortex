@@ -8,6 +8,33 @@
 ## [Unreleased]
 
 ### Fixed
+- **Issue #540：tdd-red terminal 採信三段連鎖——builder 的正確 RED commit 無法被採信**
+  ——run `workflow-084f75e2178cf7547476` 的 builder 交付了合格 RED commit，terminal
+  採信卻連撞三個獨立缺陷。**(1) gate 宣告缺漏事前無診斷**：manager env 漏
+  `PSC_GATE_CMD_PYTEST` 時 ledger 是 `gates: []`，帶 `test_policy` 的 build 卡必然以
+  `gate-ledger-missing-expected-gate` fail closed（正確的反自證行為），但錯誤只進
+  `manager.log`；新增 `cortex doctor` 的 `gate-declarations` probe，以 packaged deck
+  每張卡的 `test_policy` 經 `terminal_contract.expected_gate_names_for_test_policy`
+  （與 harvest 端同一判準，實作自 manager 移入、manager 保留薄轉呼叫）導出應驗 gate
+  集合並比對宣告，未涵蓋或宣告不合法皆為 required fail。**(2) ledger 凍結後無官方
+  重驗路徑**：`resume` 只重讀舊 ledger 再拒一次、`retry-build` 只受理最後一張 builder
+  卡（tdd-red 是中段卡）、`recover-pre-candidate` 需 null candidate，operator 只能手動
+  跑 gate_ledger CLI；新增 `regenerate-gates` work action，以 exact WorkflowRun CAS
+  對既有 builder job log 依當前宣告重跑 gate、原子覆寫 ledger，**不改判**——不重派
+  模型、不動 commit、不改任何 run 狀態，run 仍停在 needs_human 由既有 `resume` →
+  harvest 重新評估。**(3)【主修】dispatch prompt 從未告訴模型 canonical gate 名稱**：
+  採信要求 envelope 自報的 gate 名 ⊆ ledger 的 gate 名（由 `PSC_GATE_CMD_<NAME>` 導
+  出），prompt 卻只寫 `"gate name"`，模型自由發揮寫了 `'focused pytest RED
+  expectation'` → `gate-evidence-unknown-gate` 必敗（與 `#486` 同構）；比照 `#521`
+  改為機械生成：`gate_ledger.declared_gate_names()`／`ledger_gate_names()`／
+  `gate_evidence_name_hint()` 由 `load_gate_specs()`（ledger gate 名的唯一產生處）導
+  出，`_workflow_job_prompt` 新增 `env` 參數（與 launcher 交給 ledger writer 的 env
+  同源）把 `allowed_names` 與說明注入 `terminal_schema`，prompt 端不再持有第二份真實
+  來源。另補 `#307` 反轉語意的 prompt 面：`red-required` 卡附
+  `red_required_policy`（由反轉判準常數產生），明示「ledger 顯示 pytest failed 時仍回
+  `status=passed` 並誠實自報 `pytest: failed`」，消除泛用 `status_policy` 與實際採信
+  規則相反的字面陷阱。詳見 `changelog.d/gate-acceptance-chain.md`。新增
+  `tests/test_gate_acceptance_chain_540.py`（15 個回歸測試）與 2 個 doctor 整合測試。
 - **R0.5 D1（部分）：auto-claim label 判定改走 monitor 鏡像**——monitor 把持有
   `cortex:auto-on-going` 的 open issue 編號寫進 provider observations（issues 回應本來就含
   labels，零額外 API）；canonical claim 路徑據此導出 `auto_label`（原硬編 False）；
