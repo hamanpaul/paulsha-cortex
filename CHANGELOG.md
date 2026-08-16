@@ -8,6 +8,30 @@
 ## [Unreleased]
 
 ### Added
+- **#606：重派 prompt 機械附上前次採信失敗證據——無回饋的重試不再是決定論的重複**
+  ——現場 run `workflow-7812abefede9d9b5d601` 的 subagent-build（job 492／493）：builder
+  兩次自稱 `pytest: passed`，Manager 的 gate ledger 兩次獨立重跑抓到**同一個**失敗，兩次
+  `GateContradictionError` 逐字相同。根因不是重派錯誤（`retry-card` 刻意用原卡 prompt，
+  契約不可竄改是對的），而是 prompt 沒有任何通道攜帶「上一次為什麼被拒」。新增
+  `manager._workflow_retry_context()`：輸入是 `_dispatch_workflow_card` 既有的 `matching`
+  （同一張卡的先前 job），輸出機械組出一個 `retry_context` 區塊塞進 dispatch contract，
+  內容全部來自 **Manager 自產證據**、一個字都不取自模型輸出（與 #540 的不可竄改性同一條
+  紀律）——**採信錯誤類別＋canonical 訊息**（不讀敘事欄位，而是對舊 job 重跑既有採信路徑
+  的前兩段，`GateContradictionError` 與「log 無 JSON envelope」兩型都覆蓋）、**gate ledger
+  的 failed gates**（名稱＋exit code＋截尾輸出，「哪些算 failed」複用採信端的
+  `terminal_contract._ledger_outcomes`，不另立第二份判準），加上明示語句「前次嘗試因以下
+  Manager 獨立證據被拒；先重現並修復，再完成本卡」。`retry-card` 與 daemon 的 forced retry
+  都收斂在同一個 prompt 組裝點，兩條路徑同時拿到回饋。**首派逐字不變**：`retry_context`
+  預設 `None`，首派 `matching` 為空即不產生任何差異（測試釘住，含走真正 dispatch 路徑的
+  那條）。截斷上限 `RETRY_CONTEXT_EVIDENCE_LIMIT=2000`（全體 gate `detail` 合計預算，保留
+  尾段、被截明示 `detail_truncated`）與 `RETRY_CONTEXT_MESSAGE_LIMIT=600`，並 fail-soft
+  ——證據讀不到不得害死一次合法重派。附帶收斂 issue 的第二個觀察：
+  `terminal_schema.status_policy` 末段接上新的 `gate_ledger.gate_scope_honesty_hint()`，
+  明說「focused 綠不得推定宣告的 gate 綠」，且**實際會被 Manager 重跑的命令逐字進 prompt**
+  （與 #541 的 `allowed_names` 同一條機械生成紀律）。`retry_context` 另帶 `attempt`／
+  `redispatch_count`（由這張卡已燒掉的 job 數機械導出）作為 #555 per-card 熔斷的計數鉤子
+  ——**本票不實作熔斷**。詳見 `changelog.d/retry-feedback-context.md`。新增
+  `tests/test_retry_feedback_context_606.py`（14 測試）。
 - **R0.5 D6 / trust-root 隔離 Phase 2b：permgen 產 systemd unit ＋ polkit 規則，
   runbook 收斂為可執行版（仍不需 root）**——`permgen.py` 新增 `PathLayout`，把
   operator 0816 第二輪裁決的路徑（`/var/lib/cortex`、worktree pool
