@@ -106,6 +106,13 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS=86400
    ```
 
+   **`PSC_JOB_RUNNER`（trust-root Phase 2 降權啟動器）**：預設 `direct`＝headless job 與
+   Manager 同帳號執行（現行行為）。設為 `systemd-run` 後，builder persona 的 job 改以
+   `systemd-run --uid=cortex-builder` 的 transient unit 執行，只帶白名單 env（**不含任何
+   token**）。**這個開關要在 `cortex-builder` 帳號與 polkit 規則就位之後才可打開**，
+   步驟見 `docs/superpowers/runbooks/trust-root-phase2b-setup.md` 第 5 步；相關選配變數
+   為 `PSC_BUILDER_ACCOUNT`／`PSC_BUILDER_GROUP`／`PSC_BUILDER_HOME`／`PSC_BUILDER_PATH`。
+
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash

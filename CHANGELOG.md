@@ -34,6 +34,30 @@
   （Phase 1 自檢已知），本階段交付的是**通道結構**（路徑／守衛／登記／身分推導），
   OS 強制等 Phase 2b。詳見 `changelog.d/p2a-verdict-channel.md`。新增
   `tests/test_review_verdict_channel_p2a.py`（47 測試）。
+- **R0.5 D6 / trust-root 隔離 Phase 2a（降權啟動器，預設關閉）**——新增
+  `paulsha_cortex/coordinator/job_runner.py`：Manager spawn headless **builder** job 時
+  改經 `systemd-run --uid=cortex-builder` 的 transient unit 執行（operator 0816 第二輪
+  對「未決 1 降權機制」的裁決）。`PSC_JOB_RUNNER` **預設 `direct`＝現行行為逐字不變**，
+  設為 `systemd-run` 才降權；值非法時 fail-closed，不靜默當成 direct。builder job 的
+  環境改為**白名單**而非黑名單 scrub——transient unit 本來就不繼承呼叫端 environ，因此
+  job 只看得到轉發類 7 項（`PATH`／`LANG`／`LC_ALL`／`LC_CTYPE`／`SSL_CERT_FILE`／
+  `SSL_CERT_DIR`／`NODE_EXTRA_CA_CERTS`，每項在 `BUILDER_FORWARDED_ENV` 帶「為何需要」
+  的 rationale）加合成類 5 項（`PSC_JOB_ID`／`PSC_SLICE_ID`／`PSC_REPO_ROOT`／選配
+  `PSC_RELAY_TARGET`／選配 `HOME`），**gh token、daemon 的 `CLAUDE_CONFIG_DIR`／
+  `GH_CONFIG_DIR` 一律不在其中**（issue #588 第 1 點）；降權模式的 shell 改
+  `bash -c`（非 `-lc`，#588 第 2 點——login shell 會讓 `~/.profile` 在 env 約束建立後
+  重新匯入），**direct 模式維持 `-lc` 不動**。FD 只交出 stdin/stdout/stderr 且 stdin
+  顯式接 `/dev/null`。判定點與既有 persona 分支對齊：reviewer／planner 在二分方案裡與
+  Manager 同帳號，**不經降權**。fail-fast 走 #570 `DiagnosticReason` 契約——systemd-run
+  缺席／未以 systemd 開機／builder 帳號或 group 不存在在任何副作用前擋下，polkit 拒絕
+  與 unit 名衝突由起動確認（「client 已結束**且** exit sentinel 不存在」）擋下並帶回
+  systemd-run 的實際錯誤訊息，**任一條都不退回 direct**。unit 名前綴 `cortex-job-` 是與
+  Phase 2b polkit 規則成對的契約。**本項是機制不是生效**：實際降權要等 Phase 2b 建好
+  帳號＋polkit 後把 `PSC_JOB_RUNNER=systemd-run` 寫進 Manager env。同步改寫
+  `docs/superpowers/runbooks/trust-root-phase2b-setup.md` 第 5 步（含 polkit 只暴露 unit
+  名、不暴露 `--uid=` 的誠實標註）與 README 的 env 說明。詳見
+  `changelog.d/p2a-systemd-run-launcher.md`。新增
+  `tests/test_trust_root_job_runner_p2a.py`（61 測試，systemd-run 本體全程 mock）。
 - **v4 R1：shadow telemetry 的 aggregation reader ＋ TTL retention（Go/No-Go 的直接
   輸入）**——PR #590 落地了 coverage validator shadow 的 sink（一次比對一檔），但沒有
   讀端；R1 的 Go/No-Go 判準是「兩週 telemetry 中所有 disagreement 可解釋」，沒有統計
