@@ -215,8 +215,21 @@ def test_recover_pre_candidate_fail_closed_when_candidate_exists(tmp_path: Path)
         )
 
 
-def test_candidate_worktree_dirty_reevaluation_on_tick(tmp_path: Path, monkeypatch) -> None:
+def test_candidate_worktree_dirty_reevaluation_on_tick(tmp_path: Path, monkeypatch, git_origin) -> None:
     monkeypatch.setattr(manager, "_pinned_input_mismatches", lambda _slice: [])
+
+    # #610：`complete_tick` 的 completion 判準會對 slice 的 repo 根跑
+    # `git fetch --no-tags origin main`，而 repo 根是 `autonomy._infer_repo_root`
+    # 從 spec path 推出來的。原本 spec path 寫成相對的 `specs/slice-3b.md`，
+    # `Path.resolve()` 會把它接到「當下 cwd＝真實 cortex checkout」上，於是這個
+    # 單元測試每跑一次就對 github.com 發一次真的 fetch——正常環境靜默成功，
+    # sandbox（network allowlist）則整個 process 被殺（run 7812 死在 69% 就是這裡）。
+    # 改成本機 fixture repo：origin 的字面值仍是 GitHub HTTPS（保留生產形狀），
+    # 實際 transport 由 `url.<local>.insteadOf` 改寫到同一個 tmp 目錄下的 bare repo。
+    origin = git_origin("example/acme")
+    origin.commit({"README.md": "seed\n"})
+    origin.publish()
+    repo_root = origin.checkout
 
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
@@ -234,7 +247,7 @@ def test_candidate_worktree_dirty_reevaluation_on_tick(tmp_path: Path, monkeypat
 
     reg.create_slice(
         slice_id="slice-3b",
-        spec_path="specs/slice-3b.md",
+        spec_path=str(repo_root / "specs" / "slice-3b.md"),
         spec_hash="spec-sha",
         plan_path="plans/slice-3b.md",
         plan_hash="plan-sha",

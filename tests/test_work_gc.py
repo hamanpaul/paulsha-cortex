@@ -382,7 +382,23 @@ def test_apply_reverifies_before_mutating_toctou(tmp_path: Path) -> None:
     assert _branch_exists(repo, "feature/clean-merged")
 
 
-def test_cli_main_dry_run_text_and_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_main_dry_run_text_and_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #610：`gc.main` 是唯一會把 `default_pr_status_provider` 接上去的入口，而那個
+    # provider 直接 spawn 真的 `gh pr list`——讀 operator 的真 token、打 GitHub。
+    # 這裡要驗的是「CLI 有把 provider 佈線進 run_gc」，不是 gh 本身，因此把這條
+    # 網路 seam 換成本機假 provider，並反過來斷言它真的被呼叫到（比原本更嚴）。
+    pr_queries: list[tuple[Path, str]] = []
+
+    def fake_pr_status_provider(repo_root: Path, branch: str, **_kwargs: object) -> str | None:
+        pr_queries.append((Path(repo_root), branch))
+        return None
+
+    monkeypatch.setattr(gc, "default_pr_status_provider", fake_pr_status_provider)
+
     repo = tmp_path / "repo"
     _init_repo(repo)
 
@@ -413,6 +429,10 @@ def test_cli_main_dry_run_text_and_json(tmp_path: Path, capsys: pytest.CaptureFi
 
     # dry-run CLI 呼叫過後分支仍在。
     assert _branch_exists(repo, "feature/unmerged")
+
+    # CLI 兩次呼叫都要把 PR 狀態 seam 接上（unmerged-content 分支才會查詢）。
+    assert [branch for _, branch in pr_queries] == ["feature/unmerged", "feature/unmerged"]
+    assert {root.resolve() for root, _ in pr_queries} == {repo.resolve()}
 
 
 def test_json_report_matches_versioned_schema(tmp_path: Path) -> None:

@@ -759,6 +759,14 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
 - repo 宣告 `tier: shareable`，所有範例與測試都必須維持去識別化。
 - repo policy 由 canonical `.project-policy.yml` 宣告，並 pin paulsha-conventions v1.0.17。
 - agent 慣例檔採 symlink 模式：`AGENTS.md`、`GEMINI.md`、`.github/copilot-instructions.md` 都指向 `CLAUDE.md`。
+- **測試不得打真實網路（#610）**：`tests/network_guard.py` 是 session-scope、預設啟用的
+  守衛，攔 socket 層（白名單 AF_UNIX 與 loopback）與 subprocess 層（`git` 的 transport
+  subcommand 以 `git ls-remote --get-url` 解出 `insteadOf` 改寫後的實際 URL 再判本機性；
+  `gh`／`curl`／`wget`／`pip` 等純網路 client 一律違規）。違規當場失敗並指名測試 nodeid，
+  即使受測程式用 `except Exception:` 吞掉例外，per-test 帳本仍會在 teardown 讓它失敗。
+  需要 remote 的測試一律用本機 fixture（`git_origin` 造 tmp bare origin，或注入假
+  provider／runner）。本機除錯要放行整場用 `PSC_TEST_ALLOW_NETWORK=1`；本質上需要網路的
+  整合測試標 `@pytest.mark.network`（預設排除於全套，`--run-network` 才跑）。
 
 ## Version
 

@@ -8,6 +8,72 @@ import subprocess
 
 import pytest
 
+import network_guard
+
+
+# --- #610：測試不得出實網 ------------------------------------------------------
+#
+# builder 在 codex sandbox 內跑全套會被 egress 攔截整個殺掉（run 7812 死在 69%
+# 的 `git -C <真實 repo checkout> fetch origin main`），而正常環境網路是通的，
+# 缺陷從測試結果上完全看不出來。守衛把「靜默出網」變成當場失敗並指名測試。
+# 逃生口 `PSC_TEST_ALLOW_NETWORK=1` 在這裡讀——早於底下會清掉 `PSC_*` 的
+# `_clear_runtime_env`。
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "network: 本質上需要真實網路的整合測試；預設全套不跑（需 --run-network）。",
+    )
+    network_guard.install()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-network",
+        action="store_true",
+        default=False,
+        help="#610：連 @pytest.mark.network 的整合測試一起跑（會打真實網路）。",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--run-network"):
+        return
+    skip_network = pytest.mark.skip(
+        reason="#610：需要真實網路的整合測試，預設排除於全套（--run-network 才跑）"
+    )
+    for item in items:
+        if item.get_closest_marker("network") is not None:
+            item.add_marker(skip_network)
+
+
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    """讓守衛在任何 setup/call/teardown 出網時都能指名是哪個測試。"""
+
+    network_guard.set_current_test(item.nodeid)
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _network_guard(request: pytest.FixtureRequest):
+    """守衛的 per-test 帳本。
+
+    直接 raise 有可能被受測程式的 ``except Exception`` 吞掉（`_run_git` 就是
+    這種形狀），所以違規同時記在帳本裡，teardown 時無論如何都讓該測試失敗。
+    """
+
+    network_guard.drain_violations()
+    if request.node.get_closest_marker("network") is not None:
+        with network_guard.allow_network():
+            yield
+        network_guard.drain_violations()
+        return
+    yield
+    violations = network_guard.drain_violations()
+    if violations:
+        pytest.fail("\n\n".join(violations), pytrace=False)
+
 
 @pytest.fixture(autouse=True)
 def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
