@@ -348,6 +348,27 @@
   `tests/test_monitor_git_native_reads_506.py`（16 個測試，含量化驗收樁）。
 
 ### Fixed
+- **#565：`/tmp` 的空 `.git` 目錄使 `_infer_repo_root` 全域劫持到 `/tmp`，production
+  推斷與測試皆不 hermetic**——agent sandbox 基礎設施會在 sandbox 存活期間於 `/tmp`
+  暫態 `mkdir` 一個**空的** `.git`（teardown 後消失，`rm` 被防護 hook 擋下只能 `mv`
+  隔離），舊判準 `(parent / ".git").exists()` 把它認作 repo 根，於是任何 `/tmp` 底下
+  （含 pytest `tmp_path`）的 spec 路徑都被推斷成 `/tmp`。這使
+  `tests/test_fix_dispatch_spec_path.py` 的兩個推斷測試在「當下剛好有 sandbox 存活」
+  時必紅，Manager gate ledger 對 builder candidate 重跑全套 pytest 因而拒掉**合格**
+  candidate（`GateContradictionError`，0816 run `workflow-7812abefede9d9b5d601` 實測），
+  且與 builder 真實缺陷混在一起干擾判讀。**production 補兩道判準**：`.git` 必須是**有效**
+  repo 標記——目錄需含 `HEAD`、檔案需以 `gitdir:` 開頭（linked worktree／submodule）——
+  由新增的 `_is_git_repo_root()` 判定，**不 fork `git rev-parse`**（`_infer_repo_root`
+  在派工熱路徑上，對每個 parent 開 subprocess 的代價與 flakiness 都不划算，而檔案級
+  判準已足以排除唯一實測到的偽陽性）；同時新增 `_repo_search_boundaries()`
+  （`TMPDIR`／`/tmp`／`/var/tmp`）作為向上搜尋的**上界**，共享暫存根本身永遠不是任何
+  spec 的 repo 根，其**之下**的真 repo 照常命中。**測試 hermetic 化**：新增
+  `tests/git_fixtures.py`（`make_fake_repo()` 建含 `.git/HEAD` 的完整假 repo，
+  `make_empty_git_dir()` 建污染形狀），六個測試檔不再以空 `.git` 目錄冒充 repo 根；
+  `tests/test_fix_dispatch_spec_path.py` 補 8 個回歸（鏈上空 `.git` 必須穿過、只有空
+  `.git` 時落回既有 fallback、worktree `gitdir:` 檔案仍算 repo 根、共享根即使是有效
+  repo 也不落錨、上界之下的 repo 照常命中……），污染由測試自備，host `/tmp` 的當下
+  狀態不再影響任何判定。
 - **Issue #518：instance config isolation**——`cortex install service` 會遷移 legacy
   instance env，原子產生可驗證的 exact-project monitor config 並保留 rollback；monitor
   不再因父目錄 workspace 掃到 sibling repos，`cortex doctor` 也會從本機 env 檔告警 shared

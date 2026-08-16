@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from git_fixtures import make_fake_repo
 from paulsha_cortex.coordinator import manager, manager_daemon, verification
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -163,7 +164,7 @@ def _create_slice_in_needs_human(
 
 def test_retry_build_dispatches_new_builder_and_clears_current_refs(tmp_path):
     repo_root = tmp_path / "repo"
-    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    make_fake_repo(repo_root)
     state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"
     registry = JobRegistry(state_path=state_path)
     _create_slice_in_needs_human(registry, repo_root=repo_root, slice_id="slice-a")
@@ -204,7 +205,7 @@ def test_retry_build_dispatches_new_builder_and_clears_current_refs(tmp_path):
 
 def test_retry_review_rejected_without_verified_evidence(tmp_path):
     repo_root = tmp_path / "repo"
-    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    make_fake_repo(repo_root)
     state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"
     registry = JobRegistry(state_path=state_path)
     registry_slice = _create_slice_in_needs_human(registry, repo_root=repo_root, slice_id="slice-a")
@@ -233,7 +234,7 @@ def test_retry_review_rejected_without_verified_evidence(tmp_path):
 
 def test_abandon_marks_slice_failed_and_records_result(tmp_path):
     repo_root = tmp_path / "repo"
-    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    make_fake_repo(repo_root)
     state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"
     registry = JobRegistry(state_path=state_path)
     _create_slice_in_needs_human(registry, repo_root=repo_root, slice_id="slice-a")
@@ -268,7 +269,7 @@ def test_abandon_supersedes_stale_handoff_manifest(tmp_path):
     # （run_tick 的放行判定已改成跟 registry 對帳，不依賴這個標記，見
     # dispatch_gate_scan/_manifest_still_blocks_fanout；這裡純粹驗證稽核可見性）。
     repo_root = tmp_path / "repo"
-    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    make_fake_repo(repo_root)
     state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"
     registry = JobRegistry(state_path=state_path)
     _create_slice_in_needs_human(registry, repo_root=repo_root, slice_id="slice-a")
@@ -306,7 +307,7 @@ def test_abandon_supersedes_stale_handoff_manifest(tmp_path):
 
 def test_runtime_status_provider_includes_attention_next_actions(tmp_path):
     repo_root = tmp_path / "repo"
-    (repo_root / ".git").mkdir(parents=True, exist_ok=True)
+    make_fake_repo(repo_root)
     handoff_dir = tmp_path / "handoff"
     handoff_dir.mkdir(parents=True, exist_ok=True)
     state_path = tmp_path / "runtime" / "coordinator" / "jobs.json"

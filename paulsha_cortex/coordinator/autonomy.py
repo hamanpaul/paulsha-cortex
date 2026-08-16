@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -234,6 +235,54 @@ def _normalize_depends_on(value: object) -> list[str]:
     return []
 
 
+def _is_git_repo_root(candidate: Path) -> bool:
+    """`<candidate>/.git` 是否為**有效** git repo 標記（#565）。
+
+    原判準是 `(candidate / ".git").exists()`，把「存在」等同「是 repo」。實測
+    （#565）agent sandbox 基礎設施會在 `/tmp` **暫態**建立一個 `mkdir` 出來的
+    **空 `.git` 目錄**（sandbox 存活期間存在、teardown 消失），於是任何 `/tmp`
+    底下的 spec 路徑在向上搜尋時都會停在 `/tmp`，repo 根被全域劫持成 `/tmp`。
+
+    真 repo 的兩種合法形狀都能不開 subprocess 就分辨：
+    - 正規 repo：`.git` 是目錄且必含 `HEAD`（`git init` 寫的第一批檔案之一）；
+    - linked worktree／submodule：`.git` 是內含 `gitdir: <path>` 的檔案。
+
+    刻意不呼叫 `git rev-parse --git-dir`：`_infer_repo_root` 落在派工熱路徑上，
+    對每個 parent 都 fork 一次 git 的代價與 flakiness 都不划算，而 `HEAD`／
+    `gitdir:` 這兩個檔案級判準已足以排除「空目錄」這唯一實測到的偽陽性。
+    """
+    git_path = candidate / ".git"
+    if git_path.is_dir():
+        return (git_path / "HEAD").exists()
+    if git_path.is_file():
+        try:
+            head = git_path.read_bytes()[:8]
+        except OSError:
+            return False
+        return head.startswith(b"gitdir:")
+    return False
+
+
+def _repo_search_boundaries() -> frozenset[Path]:
+    """向上搜尋 repo 根時的上界——共享暫存根（#565）。
+
+    `/tmp`（與 `TMPDIR` 指到的任何目錄）是全機器互不相干的行程共用的，誰都能
+    在其下留下 `.git`。共享根本身永遠不是任何 spec 的 repo 根，因此搜尋到這裡
+    就停：`/tmp/<something>/repo` 這種真 repo 仍照常命中（它在上界**之下**），
+    但 `/tmp` 自己與其之上不再是候選。
+
+    另外開一個函式（而非 inline 常數）是為了讓測試能 monkeypatch 出一個 tmp_path
+    內的假共享根，驗證上界語意時不必依賴 host `/tmp` 的實際狀態。
+    """
+    roots: set[Path] = set()
+    for raw in (tempfile.gettempdir(), "/tmp", "/var/tmp"):
+        try:
+            roots.add(Path(raw).resolve())
+        except OSError:  # pragma: no cover - resolve 對不存在路徑不拋，僅防禦
+            continue
+    return frozenset(roots)
+
+
 def _infer_repo_root(spec_path: Path) -> Path:
     configured = paths.repo_root().resolve()
     resolved_spec = spec_path.resolve()
@@ -244,8 +293,11 @@ def _infer_repo_root(spec_path: Path) -> Path:
         pass
 
     agents_dir = Path.home() / ".agents"
+    boundaries = _repo_search_boundaries()
     for parent in [resolved_spec, *resolved_spec.parents]:
-        if (parent / ".git").exists():
+        if parent in boundaries:
+            break
+        if _is_git_repo_root(parent):
             if parent == agents_dir or parent.name in {".agents", "agents"}:
                 continue
             return parent
