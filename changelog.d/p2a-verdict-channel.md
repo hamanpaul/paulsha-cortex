@@ -54,4 +54,4 @@ spec `trust-root-isolation-spec.md` 背景 §3 認定的最短攻擊路徑是：
 UID 下 builder 技術上仍寫得進 `coordinator_root`**（Phase 1 自檢已知並 WARN）；本階段
 交付的是**通道結構**——路徑、守衛、R1 登記、身分推導與 permgen 等式，OS 強制等 Phase 2b。
 
-新增 `tests/test_review_verdict_channel_p2a.py`（43 測試）。
+新增 `tests/test_review_verdict_channel_p2a.py`（47 測試）。

@@ -33,7 +33,7 @@
   Phase 2b（分 UID／chown）之前同 UID 下 builder 技術上仍寫得進 `coordinator_root`
   （Phase 1 自檢已知），本階段交付的是**通道結構**（路徑／守衛／登記／身分推導），
   OS 強制等 Phase 2b。詳見 `changelog.d/p2a-verdict-channel.md`。新增
-  `tests/test_review_verdict_channel_p2a.py`（43 測試）。
+  `tests/test_review_verdict_channel_p2a.py`（47 測試）。
 - **v4 R1：shadow telemetry 的 aggregation reader ＋ TTL retention（Go/No-Go 的直接
   輸入）**——PR #590 落地了 coverage validator shadow 的 sink（一次比對一檔），但沒有
   讀端；R1 的 Go/No-Go 判準是「兩週 telemetry 中所有 disagreement 可解釋」，沒有統計

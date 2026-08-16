@@ -503,6 +503,90 @@ def test_spool_reader_rejects_unknown_content_keys(tmp_path: Path) -> None:
         )
 
 
+def test_spool_reader_keeps_frozen_authority_fail_closed(tmp_path: Path) -> None:
+    """`authority_hashes` 不是自述綁定欄位——它是內容，仍逐項比對 frozen baseline。"""
+
+    spool = foreign_review.prepare_review_verdict_spool(
+        reviewer_job_id="slice-x-7", coordinator_root=tmp_path
+    )
+    expected = {"docs/plan.md": "f" * 64}
+    spool.write_text(_spool_body(authority_hashes=dict(expected)), encoding="utf-8")
+
+    verdict = foreign_review.read_spool_review_verdict(
+        spool,
+        builder_job_id="b",
+        reviewer_job_id="r",
+        candidate=CANDIDATE,
+        launch_identity=dict(REVIEWER_IDENTITY),
+        expected_authority_hashes=expected,
+    )
+    assert verdict["authority_hashes"] == expected
+
+    with pytest.raises(ValueError, match="authority_hashes drift"):
+        foreign_review.read_spool_review_verdict(
+            spool,
+            builder_job_id="b",
+            reviewer_job_id="r",
+            candidate=CANDIDATE,
+            launch_identity=dict(REVIEWER_IDENTITY),
+            expected_authority_hashes={"docs/plan.md": "e" * 64},
+        )
+
+
+def test_spool_reader_rejects_unrequested_authority_hashes(tmp_path: Path) -> None:
+    """沒有 frozen authority 卻自帶 `authority_hashes` → 多餘鍵，fail-closed。"""
+
+    spool = foreign_review.prepare_review_verdict_spool(
+        reviewer_job_id="slice-x-7", coordinator_root=tmp_path
+    )
+    spool.write_text(_spool_body(authority_hashes={"docs/plan.md": "f" * 64}), encoding="utf-8")
+    with pytest.raises(ValueError, match="unexpected key: authority_hashes"):
+        foreign_review.read_spool_review_verdict(
+            spool,
+            builder_job_id="b",
+            reviewer_job_id="r",
+            candidate=CANDIDATE,
+            launch_identity=dict(REVIEWER_IDENTITY),
+        )
+
+
+def test_spool_reader_rejects_missing_findings(tmp_path: Path) -> None:
+    spool = foreign_review.prepare_review_verdict_spool(
+        reviewer_job_id="slice-x-7", coordinator_root=tmp_path
+    )
+    spool.write_text(
+        json.dumps({"schema_version": foreign_review.REVIEW_SCHEMA_VERSION}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing keys: findings"):
+        foreign_review.read_spool_review_verdict(
+            spool,
+            builder_job_id="b",
+            reviewer_job_id="r",
+            candidate=CANDIDATE,
+            launch_identity=dict(REVIEWER_IDENTITY),
+        )
+
+
+def test_sealed_verdict_is_still_re_readable_for_idempotent_finalize(tmp_path: Path) -> None:
+    """封存後再 finalize 一次仍可讀（tick 會重跑）；二次封存不炸。"""
+
+    spool = foreign_review.prepare_review_verdict_spool(
+        reviewer_job_id="slice-x-7", coordinator_root=tmp_path
+    )
+    spool.write_text(_spool_body(), encoding="utf-8")
+    foreign_review.seal_review_verdict_spool(spool)
+    verdict = foreign_review.read_spool_review_verdict(
+        spool,
+        builder_job_id="b",
+        reviewer_job_id="r",
+        candidate=CANDIDATE,
+        launch_identity=dict(REVIEWER_IDENTITY),
+    )
+    assert verdict["state"] == "passed"
+    foreign_review.seal_review_verdict_spool(spool)
+    assert stat.S_IMODE(spool.stat().st_mode) == 0o444
+
+
 def test_spool_reader_rejects_symlinked_verdict(tmp_path: Path) -> None:
     spool = foreign_review.prepare_review_verdict_spool(
         reviewer_job_id="slice-x-7", coordinator_root=tmp_path
