@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from sandbox_support import requires_af_unix_bind
+
 from paulsha_cortex import cli
 from paulsha_cortex.doctor import (
     DoctorReport,
@@ -498,6 +500,7 @@ def test_monitor_live_probe_requires_connectable_unix_socket(tmp_path: Path) -> 
     assert "monitor socket" in monitor_socket.detail
 
 
+@requires_af_unix_bind
 def test_monitor_protocol_probe_rejects_transport_only_listener(tmp_path: Path, monkeypatch) -> None:
     socket_path = tmp_path / "run" / "project-monitor.sock"
     socket_path.parent.mkdir()

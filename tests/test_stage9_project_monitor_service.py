@@ -40,6 +40,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from sandbox_support import AF_UNIX_SKIP_REASON, af_unix_bind_available
+
 # Imports from the Phase 3 modules (do not exist yet — Red).
 try:
     from paulsha_cortex.monitor.config import MonitorConfig, WorkspaceConfig
@@ -437,6 +439,7 @@ class Stage9StubWatcherTests(unittest.TestCase):
 # --- MonitorServer (Unix socket) ----------------------------------------
 
 
+@unittest.skipUnless(af_unix_bind_available(), AF_UNIX_SKIP_REASON)
 class Stage9ServerTests(unittest.TestCase):
     """Unix domain socket server: list / get / subscribe + permissions."""
 
@@ -864,6 +867,7 @@ class Stage9ServerTests(unittest.TestCase):
 # --- ProjectMonitorService end-to-end -----------------------------------
 
 
+@unittest.skipUnless(af_unix_bind_available(), AF_UNIX_SKIP_REASON)
 class Stage9ServiceTests(unittest.TestCase):
     """Full service: scanner + (stub) watcher + server."""
 
@@ -1116,6 +1120,7 @@ class Stage9ServiceTests(unittest.TestCase):
 # --- Real watchdog integration (optional) -------------------------------
 
 
+@unittest.skipUnless(af_unix_bind_available(), AF_UNIX_SKIP_REASON)
 @unittest.skipUnless(
     HAS_WATCHDOG_INTEGRATION,
     "requires real watchdog installed and WatchdogFileWatcher present",
