@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import pytest
 
+from git_fixtures import make_fake_repo
 from paulsha_cortex.coordinator import autonomy
 
 
@@ -33,8 +34,8 @@ def test_infer_repo_root_cross_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     """_infer_repo_root 應對 spec 檔解析其所屬 repo_root，無視 manager 的 PSC_REPO_ROOT 設定。"""
     repo_a = tmp_path / "repo_a"
     repo_b = tmp_path / "repo_b"
-    (repo_a / ".git").mkdir(parents=True)
-    (repo_b / ".git").mkdir(parents=True)
+    make_fake_repo(repo_a)
+    make_fake_repo(repo_b)
 
     spec_path = repo_a / "specs" / "feature-cross.md"
     spec_path.parent.mkdir(parents=True)
@@ -50,8 +51,8 @@ def test_pin_dispatch_inputs_cross_repo(tmp_path: Path, monkeypatch: pytest.Monk
     """pin_dispatch_inputs 應正確將 plan path 解析至 spec 所屬的 repo_a。"""
     repo_a = tmp_path / "repo_a"
     repo_b = tmp_path / "repo_b"
-    (repo_a / ".git").mkdir(parents=True)
-    (repo_b / ".git").mkdir(parents=True)
+    make_fake_repo(repo_a)
+    make_fake_repo(repo_b)
 
     specs_dir = repo_a / "specs"
     specs_dir.mkdir(parents=True)
@@ -85,8 +86,8 @@ def test_ready_and_fanout_consistency_cross_repo(tmp_path: Path, monkeypatch: py
     """斷言 ready 與 fanout (pinning) 對同一組跨 repo 輸入給出一致判定與相同的 repo_root。"""
     repo_a = tmp_path / "repo_a"
     repo_b = tmp_path / "repo_b"
-    (repo_a / ".git").mkdir(parents=True)
-    (repo_b / ".git").mkdir(parents=True)
+    make_fake_repo(repo_a)
+    make_fake_repo(repo_b)
 
     specs_dir = repo_a / "specs"
     specs_dir.mkdir(parents=True)
@@ -120,8 +121,8 @@ def test_ready_and_fanout_missing_plan_consistency(tmp_path: Path, monkeypatch: 
     """當 plan 檔不存在時，pin_dispatch_inputs 指向 repo_a 的正確報錯路徑，落實 fail-closed 判準。"""
     repo_a = tmp_path / "repo_a"
     repo_b = tmp_path / "repo_b"
-    (repo_a / ".git").mkdir(parents=True)
-    (repo_b / ".git").mkdir(parents=True)
+    make_fake_repo(repo_a)
+    make_fake_repo(repo_b)
 
     specs_dir = repo_a / "specs"
     specs_dir.mkdir(parents=True)

@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from git_fixtures import make_fake_repo
 from paulsha_cortex.coordinator import manager
 from paulsha_cortex.coordinator.autonomy import dispatch_ready
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -160,7 +161,7 @@ def _create_slice(
 ) -> dict:
     slice_id = job["task"]
     contract = _verification_contract(docs_class=docs_class)
-    (root / ".git").mkdir(exist_ok=True)
+    make_fake_repo(root)
     spec_path = root / "specs" / f"{slice_id}.md"
     plan_path = root / "docs" / "superpowers" / "plans" / f"{slice_id}.md"
     spec_path.parent.mkdir(parents=True, exist_ok=True)

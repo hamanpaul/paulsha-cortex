@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from git_fixtures import make_fake_repo
 from paulsha_cortex.coordinator import autonomy, completion, verification
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -181,7 +182,7 @@ class DependencyAncestryDispatchTests(unittest.TestCase):
     def test_dispatch_ready_uses_target_ref_sha_for_worktree_base(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / ".git").mkdir()
+            make_fake_repo(root)
             handoff = root / "handoff"
             target_sha = "c" * 40
             candidate = "b" * 40
@@ -228,7 +229,7 @@ class DependencyAncestryDispatchTests(unittest.TestCase):
     def test_dispatch_ready_blocks_when_upstream_candidate_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / ".git").mkdir()
+            make_fake_repo(root)
             handoff = root / "handoff"
             target_sha = "c" * 40
             candidate = "b" * 40
@@ -272,7 +273,7 @@ class DependencyAncestryDispatchTests(unittest.TestCase):
     def test_dispatch_ready_blocks_dependency_target_branch_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / ".git").mkdir()
+            make_fake_repo(root)
             handoff = root / "handoff"
             target_sha = "c" * 40
             candidate = "b" * 40

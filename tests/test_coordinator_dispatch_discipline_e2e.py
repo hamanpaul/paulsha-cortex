@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from git_fixtures import make_fake_repo
 from paulsha_cortex.coordinator import autonomy, completion, manager, review, verification
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.launcher import LaunchHandle
@@ -79,7 +80,7 @@ def _create_slice(
 ) -> dict:
     slice_id = job["task"]
     contract = _verification_contract(docs_class=docs_class)
-    (root / ".git").mkdir(exist_ok=True)
+    make_fake_repo(root)
     spec_path = root / "specs" / f"{slice_id}.md"
     plan_path = root / "docs" / "superpowers" / "plans" / f"{slice_id}.md"
     spec_path.parent.mkdir(parents=True, exist_ok=True)
@@ -670,7 +671,7 @@ class DispatchDisciplineCanaryTests(unittest.TestCase):
     def test_dispatch_ready_requires_target_base_to_include_upstream_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / ".git").mkdir()
+            make_fake_repo(root)
             handoff = root / "handoff"
             target_sha = "c" * 40
             candidate = "b" * 40
