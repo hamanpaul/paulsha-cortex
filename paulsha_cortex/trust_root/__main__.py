@@ -7,6 +7,11 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root selfcheck   # R3 自檢診斷（JSON）
     python -m paulsha_cortex.trust_root registry    # R1 登記表摘要（JSON）
     python -m paulsha_cortex.trust_root equation     # R1 雙向等式結果
+    python -m paulsha_cortex.trust_root permissions [two-way|three-way] [--commands]
+                                                    # Phase 2a 權限計畫（JSON 或命令序列）
+
+`permissions` 只**產生**權限計畫／命令字串，**絕不執行**任何 root 操作——命令供
+operator 在 Phase 2b runbook 中手動 sudo 執行。
 """
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import json
 import sys
 from typing import Sequence
 
-from . import registry, selfcheck
+from . import permgen, registry, selfcheck
 
 
 def _registry_summary() -> dict[str, object]:
@@ -69,6 +74,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             indent=2,
         ))
         return 0 if result.ok else 1
+    if command == "permissions":
+        rest = args[1:]
+        scheme_id = "two-way"
+        want_commands = False
+        for token in rest:
+            if token == "--commands":
+                want_commands = True
+            elif token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown permissions arg: {token}", file=sys.stderr)
+                return 2
+        plan = permgen.generate_plan(permgen.SCHEMES[scheme_id])
+        if want_commands:
+            for line in permgen.plan_to_commands(plan):
+                print(line)
+        else:
+            print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+        return 0
 
     print(f"unknown command: {command}", file=sys.stderr)
     return 2

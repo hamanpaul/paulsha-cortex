@@ -8,6 +8,23 @@
 ## [Unreleased]
 
 ### Added
+- **R0.5 D6 / trust-root 隔離 Phase 2a（權限產生器）＋ Phase 2b root 設定 runbook
+  （純程式碼＋文件、不需 root）**——新增 `paulsha_cortex/trust_root/permgen.py`：吃
+  R1 `ASSET_REGISTRY` ＋參數化的 `UidScheme`（persona→OS 帳號映射），機械產生登記表
+  每一項的目標 `owner:group mode` ＋ per-account POSIX ACL，輸出結構化計畫（JSON）與
+  runbook 可引用的 `chown`／`chmod`／`setfacl` **命令字串——只產生字串、絕不執行**。
+  二分（`TWO_WAY_SCHEME`：`cortex-builder`／`cortex-svc`）為預設；同一資料結構表達
+  三分（`THREE_WAY_SCHEME`：把 svc 拆成 `cortex-manager`＋`cortex-reviewer-planner`）
+  **不改一行程式碼**——測試證明三分嚴格收緊（builder 於兩方案皆零寫入 Manager-owned；
+  三分下全部 headless 帳號零寫入）。on-demand 入口
+  `python -m paulsha_cortex.trust_root permissions [two-way|three-way] [--commands]`。
+  另新增 `docs/superpowers/runbooks/trust-root-phase2b-setup.md`（Phase 2b root 設定
+  runbook 草稿，8 段：前置檢查／建 UID／分樹＋legacy-import／Manager 遷 system-level
+  unit＋加固／降權啟動器／升級流程／R9 四族驗收／回滾，逐步標 operator sudo vs 驗證
+  命令，權限命令引用產生器為單一真相，標記 7 個未決點與 WSL2 最高風險步驟）。**本票
+  只交付程式碼與文件**：不建 UID、不 chown、不動 systemd/pipx/`~/.agents`。詳見
+  `changelog.d/p2a-permission-generator.md`。新增 `tests/test_trust_root_permgen_p2a.py`
+  （33 測試）。
 - **R0.5 D6 / trust-root 隔離 Phase 1（純程式碼、不需 root、含降級安全網）**
   ——新增 `paulsha_cortex/trust_root/` 子套件，依 spec `trust-root-isolation-spec.md`
   Phase 1 與 operator 0816 裁決交付 join gate 未達成期間的契約層地基：**R1 資產登記表**

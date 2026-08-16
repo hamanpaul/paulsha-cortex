@@ -17,6 +17,6 @@ single-use nonce ledger、capability 通道的 Unix socket OS 隔離。Phase 1 �
 """
 from __future__ import annotations
 
-from . import capability, registry, selfcheck
+from . import capability, permgen, registry, selfcheck
 
-__all__ = ["registry", "selfcheck", "capability"]
+__all__ = ["registry", "selfcheck", "capability", "permgen"]
