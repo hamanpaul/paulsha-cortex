@@ -372,6 +372,27 @@
   `tests/test_monitor_git_native_reads_506.py`（16 個測試，含量化驗收樁）。
 
 ### Fixed
+- **#610：測試套件有測試打真實 github.com，builder sandbox 全套中止於 71%；兩處修為
+  hermetic ＋ 加上 conftest 層網路守衛**——run `workflow-7812abefede9d9b5d601`（job 494）
+  的 builder 在 codex sandbox（network allowlist）跑全套被 egress 攔截、整個 process 被殺
+  （`exit -1`），誠實 builder 因此無法完成驗證。以「socket monkeypatch ＋ `PATH` 上的
+  `git`／`gh` 記錄 shim ＋ `unshare -rn` 斷網對照」定位出兩處真兇：
+  `tests/test_pre_candidate_recovery.py::test_candidate_worktree_dirty_reevaluation_on_tick`
+  （collection 順序 69.0%，緊接 `test_porcelain_*` 批次之後）用相對 `spec_path` 讓
+  `autonomy._infer_repo_root` 解析到「當下 cwd ＝ 真實 cortex checkout」，於是
+  `manager.complete_tick` 對真實 repo 跑 `git fetch --no-tags origin main` 直打
+  github.com；`tests/test_work_gc.py::test_cli_main_dry_run_text_and_json` 走 `gc.main`
+  時把 `default_pr_status_provider` 接上真的 `gh pr list`。前者改用 conftest 既有的
+  `git_origin` fixture（`insteadOf` 改寫到本機 bare origin）＋ fixture repo 內的絕對
+  spec 路徑，後者注入本機假 provider 並反過來斷言 CLI 佈線。新增
+  `tests/network_guard.py`：session-scope、預設啟用的兩層守衛（socket 層白名單
+  AF_UNIX／loopback；subprocess 層檢查 `git` 的 transport subcommand——以
+  `git ls-remote --get-url` 解出 `insteadOf` 改寫後的實際 URL 再判本機性——與 `gh`／
+  `curl`／`wget`／`pip` 等純網路 client），違規當場失敗並指名測試 nodeid，另有 per-test
+  帳本防止 `except Exception:` 吞掉守衛例外；逃生口 `PSC_TEST_ALLOW_NETWORK=1` 與
+  `@pytest.mark.network`（預設排除，`--run-network` 才跑）。新增
+  `tests/test_network_guard_610.py`（33 測試）自證守衛會抓也會放行。詳見
+  `changelog.d/test-network-hermetic.md`。
 - **#565：`/tmp` 的空 `.git` 目錄使 `_infer_repo_root` 全域劫持到 `/tmp`，production
   推斷與測試皆不 hermetic**——agent sandbox 基礎設施會在 sandbox 存活期間於 `/tmp`
   暫態 `mkdir` 一個**空的** `.git`（teardown 後消失，`rm` 被防護 hook 擋下只能 `mv`
