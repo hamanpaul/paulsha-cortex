@@ -24,6 +24,14 @@
   只做 reader ＋ retention；#591 其餘項（`satisfies` projection、雙 legacy phase 對映
   收斂、第二呼叫點儀器化）屬 R2。詳見 `changelog.d/shadow-telemetry-reader.md`。
   新增 `tests/test_coverage_shadow_reader_591.py`（27 測試）。
+- **桶C「slice 迴圈家族」workstream 佈線（`#501`／`#497`／`#496`）**——新增三份 todo
+  來源（`fix-verification-contract-hash-overwrite`／`fix-superseded-terminal-replay`／
+  `fix-dirty-recheck-idempotency`）並在 `.cortex/work-items.yaml` 註冊對應 work item，
+  讓 cortex 可自行受理這三張 issue。三張已對 main `48b0205` 逐條複查，缺陷全部仍成立；
+  每份 todo 含現況查核段（精確檔案行號）、有界 scope（明列「主體是 X 不是 Y」與禁止
+  越界項）與可測驗收條件。三張刻意不合併：`#497` 是 terminal job 重播來源、`#496` 是
+  dirty recheck 迴圈、`#501` 是兩者共用的 `_apply_verification_result()` 污染原語。
+  純佈線變更，不改動任何執行路徑程式碼。詳見 `changelog.d/bucket-c-workstream-todos.md`。
 - **R0.5 D6 / trust-root 隔離 Phase 2a（權限產生器）＋ Phase 2b root 設定 runbook
   （純程式碼＋文件、不需 root）**——新增 `paulsha_cortex/trust_root/permgen.py`：吃
   R1 `ASSET_REGISTRY` ＋參數化的 `UidScheme`（persona→OS 帳號映射），機械產生登記表
