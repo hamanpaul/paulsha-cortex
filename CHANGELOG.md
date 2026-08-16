@@ -34,6 +34,30 @@
   （Phase 1 自檢已知），本階段交付的是**通道結構**（路徑／守衛／登記／身分推導），
   OS 強制等 Phase 2b。詳見 `changelog.d/p2a-verdict-channel.md`。新增
   `tests/test_review_verdict_channel_p2a.py`（43 測試）。
+- **v4 R1：shadow telemetry 的 aggregation reader ＋ TTL retention（Go/No-Go 的直接
+  輸入）**——PR #590 落地了 coverage validator shadow 的 sink（一次比對一檔），但沒有
+  讀端；R1 的 Go/No-Go 判準是「兩週 telemetry 中所有 disagreement 可解釋」，沒有統計
+  就無從判讀。新增**唯讀** aggregation reader `build_shadow_report()` 與 on-demand CLI
+  `python -m paulsha_cortex.coordinator.coverage --report [--json]`（比照
+  `python -m paulsha_cortex.trust_root ...` 的模組入口慣例，不動 `cortex` 傘狀 CLI）：
+  總筆數、agreement／disagreement 計數與比例、觀測窗、disagreement 依 `kind` 分組
+  （理論上只有 `topology-fail-coverage-pass`），每組附 combo／task_slug／callsite／
+  missing-responsibility 分佈與逐筆樣本（含 `context` 與 `satisfied_by`，足供人工
+  逐筆解釋）。同時加 TTL 清掃（`DEFAULT_SHADOW_TTL_SECONDS`，預設 30 天，比照 D4
+  event spool 慣例）——**只在 reader 執行時順帶清**、無 daemon 常駐邏輯，以
+  `recorded_at` 判齡、缺漏時降級用 mtime（壞檔亦隨時間退場），刪不掉只計數不 raise；
+  `--ttl-days` 可調、`--no-sweep` 純唯讀。單筆 JSON 壞損跳過並計數，絕不炸掉整份報告。
+  只做 reader ＋ retention；#591 其餘項（`satisfies` projection、雙 legacy phase 對映
+  收斂、第二呼叫點儀器化）屬 R2。詳見 `changelog.d/shadow-telemetry-reader.md`。
+  新增 `tests/test_coverage_shadow_reader_591.py`（27 測試）。
+- **桶C「slice 迴圈家族」workstream 佈線（`#501`／`#497`／`#496`）**——新增三份 todo
+  來源（`fix-verification-contract-hash-overwrite`／`fix-superseded-terminal-replay`／
+  `fix-dirty-recheck-idempotency`）並在 `.cortex/work-items.yaml` 註冊對應 work item，
+  讓 cortex 可自行受理這三張 issue。三張已對 main `48b0205` 逐條複查，缺陷全部仍成立；
+  每份 todo 含現況查核段（精確檔案行號）、有界 scope（明列「主體是 X 不是 Y」與禁止
+  越界項）與可測驗收條件。三張刻意不合併：`#497` 是 terminal job 重播來源、`#496` 是
+  dirty recheck 迴圈、`#501` 是兩者共用的 `_apply_verification_result()` 污染原語。
+  純佈線變更，不改動任何執行路徑程式碼。詳見 `changelog.d/bucket-c-workstream-todos.md`。
 - **R0.5 D6 / trust-root 隔離 Phase 2a（權限產生器）＋ Phase 2b root 設定 runbook
   （純程式碼＋文件、不需 root）**——新增 `paulsha_cortex/trust_root/permgen.py`：吃
   R1 `ASSET_REGISTRY` ＋參數化的 `UidScheme`（persona→OS 帳號映射），機械產生登記表
@@ -266,6 +290,21 @@
   instance env，原子產生可驗證的 exact-project monitor config 並保留 rollback；monitor
   不再因父目錄 workspace 掃到 sibling repos，`cortex doctor` 也會從本機 env 檔告警 shared
   project config root 與重複掃描影響。
+- **#586（缺陷 A）：builder sandbox 無法 bind AF_UNIX socket，全套 pytest 假失敗**
+  ——builder（codex，`codex exec --sandbox workspace-write`）的沙箱實測**允許**
+  `socket(AF_UNIX)` 建立與 `socketpair()`，但用 seccomp 把 **`bind()`** 擋成 EPERM
+  （網路隔離），即使 socket 路徑在可寫根內。凡是 bind 本地 unix-domain socket（起
+  `MonitorServer`／直接綁）的測試在 builder 沙箱內必失敗，令 builder 自跑整套
+  `python3 -m pytest -q` 永遠有失敗、與 manager 獨立 ledger（正常環境 passed）系統性
+  分歧。codex 的 seccomp 無法從本 repo 細粒度只放行 AF_UNIX bind（唯一開關是整片打開
+  網路的 `network_access`／`danger-full-access`，正是 #586 安全邊界所禁），故採環境修復：
+  新增 `tests/sandbox_support.py` 偵測當前 runtime 能否 bind AF_UNIX，凡需 bind 的測試
+  在無法 bind 的沙箱下**明確 skip（帶原因）**而非假失敗，使 builder 自跑 pytest 由「有
+  失敗」變 exit 0，與權威 ledger 源頭一致。**安全邊界**：只改「無法 bind 時 run vs skip」
+  的判定，不放寬任何 syscall／不打開網路／不允許 builder 連上 manager socket（與 #584
+  trust-root 隔離不衝突）。防護 `test_stage9_project_monitor_service.py`、
+  `test_monitor_work_api.py`、`test_doctor.py`；新增 `tests/test_sandbox_afunix_skip_586.py`
+  以模擬沙箱子行程證明防護測試 skip 而非 fail。
 - **Issue #569：reviewer 卡的 `retry-verify` 只重置不重派——`retry-card` 放寬到
   verify／review 的 reviewer 卡**——實測 run `workflow-084f75e2178cf7547476` 的
   verification job（agy，#568 權限剖面缺陷）exit 0 但 log 無 JSON envelope，
