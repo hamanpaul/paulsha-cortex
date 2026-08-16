@@ -32,6 +32,7 @@ job-visible 樹由對應 job 帳號寫、跨 persona 互不可寫。
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Mapping
@@ -245,9 +246,20 @@ _DIR_ASSET_IDS = frozenset({
     "combo-card-override",       # <agents_root>/config/combos/ 目錄
     "skill-park-proposals",
     "digest-outbox",
+    # 以下皆為 evidence／journal **目錄**（逐 slice／逐 run 一檔），asset_id 的
+    # token heuristic 會誤判成單檔，故明列（路徑對照見 `PathLayout.asset_paths`）：
+    "verification-evidence",        # <coordinator>/evidence/verification/
+    "maintainer-attestation",       # <coordinator>/evidence/maintainer-review/
+    "completion-record",            # <coordinator>/evidence/completion/
+    "full-suite-evidence",          # <coordinator>/evidence/full-suite/
+    "workflow-inputs",              # <coordinator>/evidence/workflow-inputs/
+    "workflow-evidence",            # <coordinator>/evidence/workflow/
+    "workflow-report-journal",      # <coordinator>/workflow-report-transactions/
+    "engineering-outcome-outbox",   # <coordinator>/engineering-outcomes/<repo>.jsonl 的容器
+    "gate-ledger",                  # <agents_root>/runtime/dispatch/（manager log_dir）
+    "review-verdict-spool",         # <coordinator>/review-verdicts/<reviewer_job_id>/
 })
 _FILE_ASSET_IDS = frozenset({
-    "engineering-outcome-outbox",  # 單一 .jsonl 檔（名稱含 outbox 但是檔）
     "control-daemon-lock",
     "control-status",
 })
@@ -334,10 +346,8 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
             "部署身分（root）擁有——enforcement plane（env／hooks），或 durable-state "
             "樹根（解析鏈即信任根，spec §1）：root 擁有使 headless／svc 皆無法 relink "
             "整棵樹；對全部 headless 唯讀，現況裸寫／group-writable 於此收斂。"
-        )
-        open_points.append(
-            "部署路徑最終位置待 operator 定（pipx tree 遷到 root/svc-owned 部署路徑；"
-            "bootstrap env／codex hooks 是否移出 operator HOME）。"
+            "0816 裁決已定案路徑：部署樹＝/opt/cortex、bootstrap env 落 /opt/cortex/etc/、"
+            "codex hooks 落 job 帳號 HOME 下的 root-owned .codex/（值見 PathLayout，勿手寫）。"
         )
 
     elif owner_class is OwnerClass.MANAGER_STATE:
@@ -398,8 +408,10 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
             # 容器由 Manager 擁有，per-job 子目錄在 spawn 時逐案 chown 給該 job 帳號。
             owner = trusted_owner
             runtime_managed = True
-            is_dir = True  # 多 persona 容器一律視為目錄（per-job 子物件容器）
-            mode = _dir_file_mode(True, 0o7, 0, 0o1)  # 0701：others 僅 traverse 進自己被 chown 的子目錄
+            # 目錄容器：0701——others 僅 traverse 進自己被 chown 的子目錄，不可列目錄。
+            # 檔案（如 per-job handoff manifest）：0600，owner-only；per-job owner 由
+            # 降權啟動器在 spawn 時逐案 chown，容器層不預先開放。
+            mode = _dir_file_mode(is_dir, 0o7 if is_dir else 0o6, 0, 0o1 if is_dir else 0)
             writer_accounts = frozenset({owner})  # 容器層僅 Manager 建子目錄
             rationale = (
                 "job-visible 多 persona 容器：Manager 擁有容器，per-job worktree 於 "
@@ -495,6 +507,11 @@ def _placeholder_path(entry: PermissionEntry) -> str:
     return f"<PATH:{entry.asset_id}>"
 
 
+#: per-job 路徑的標記 segment。帶此 segment 的資產由降權啟動器在 spawn 時逐案套用，
+#: **不**在 setup 階段執行——命令因此以註解形式輸出（可讀、不可誤執行）。
+PER_JOB_SEGMENT = "<job-id>"
+
+
 def plan_to_commands(
     plan: PermissionPlan,
     path_of: Mapping[str, str] | None = None,
@@ -502,21 +519,846 @@ def plan_to_commands(
     """把計畫轉成 runbook 可引用的命令序列（**只產生字串，絕不執行**）。
 
     `path_of`：asset_id→真實路徑字串；未提供者以 placeholder 呈現，供 runbook 以
-    shell 變數替換。輸出含分節註解，方便 operator 對照登記表逐項核可。
+    shell 變數替換（`PathLayout.asset_paths()` 可一次提供全部真實路徑）。輸出含
+    分節註解，方便 operator 對照登記表逐項核可；目錄資產會先出 `install -d`，
+    使整份輸出成為一份可直接執行的 setup script。
     """
     lines: list[str] = [
         f"# trust-root Phase 2b 權限套用命令（scheme={plan.scheme_id}）",
         "# 由 permgen 機械產生；operator 逐項 review 後手動 sudo 執行。",
-        "# 未提供真實路徑者以 <PATH:asset_id> placeholder 呈現。",
+        "# 帶 --paths 時路徑為 PathLayout 的真實絕對路徑；否則以 <PATH:asset_id> 呈現。",
+        f"# 含 {PER_JOB_SEGMENT} 的資產屬 per-job（降權啟動器逐案套用），已註解不執行。",
     ]
     for e in plan.entries:
         path = (path_of or {}).get(e.asset_id) or _placeholder_path(e)
+        per_job = PER_JOB_SEGMENT in path
         lines.append("")
         lines.append(f"# [{e.tier}] {e.asset_id} ({e.owner_class.value}) — {e.rationale}")
         if e.runtime_managed:
             lines.append("#   注意：per-child owner 由降權啟動器逐案 chown（本節僅容器層）。")
         for op in e.open_points:
-            lines.append(f"#   未決：{op}")
-        for cmd in e.commands(path):
-            lines.append(cmd)
+            lines.append(f"#   後續依賴：{op}")
+        if per_job:
+            lines.append("#   per-job：由降權啟動器在 spawn 時套用，setup 階段不執行。")
+        cmds = list(e.commands(path))
+        if e.is_directory:
+            # 目錄一定先建起來，後續 chown／chmod／setfacl 必然有對象。
+            cmds.insert(0, f"install -d {path}")
+        else:
+            # 葉檔在 setup 當下多半尚未存在（由服務首次寫入時建立）。加 `[ ! -e ] ||`
+            # 守衛：不存在就跳過（且在 `sh -e` 下不會中斷腳本），存在就套上目標權限。
+            # 尚未存在也安全——容器目錄已是 owner-only，且 unit 的 UMask=0077 讓新檔
+            # 出生即 0600。
+            lines.append(
+                f"#   葉檔守衛：{path} 尚未建立時跳過（服務以 UMask=0077 建立即符合目標）。"
+            )
+            cmds = [f"[ ! -e {path} ] || {cmd}" for cmd in cmds]
+        for cmd in cmds:
+            lines.append(f"#   {cmd}" if per_job else cmd)
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b：部署 layout（把登記表的抽象資產綁到目標主機的真實絕對路徑）
+#
+# operator 0816 第二輪裁決：durable state 落 `/var/lib/cortex`（worktree pool＝
+# `/var/lib/cortex/worktree`）、Manager 部署落 `/opt/cortex`。本 layout 是那份裁決
+# 的機器可讀形式——runbook 不再手寫路徑，全部從這裡取。
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExtraWritePath:
+    """非登記表資產、但服務身分確實需要寫的路徑（每條必須附理由）。
+
+    這是「無多餘」等式的唯一合法例外通道：ReadWritePaths 由登記表機械導出，
+    任何額外條目都必須在此明示宣告並說明理由，測試會強制理由非空。
+    """
+
+    path: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PathLayout:
+    """目標主機的絕對路徑 layout（0816 裁決值為預設）。"""
+
+    agents_root: str = "/var/lib/cortex"
+    worktree_root: str = "/var/lib/cortex/worktree"
+    deploy_root: str = "/opt/cortex"
+    instance: str = "cortex"
+    svc_home: str = "/var/lib/cortex-svc"
+    builder_home: str = "/var/lib/cortex-builder"
+    #: per-job 路徑的 segment；system unit 模板用 `%i`（systemd instance 名）。
+    job_segment: str = PER_JOB_SEGMENT
+
+    # -- 衍生根 -------------------------------------------------------------
+    @property
+    def control_root(self) -> str:
+        return f"{self.agents_root}/control"
+
+    @property
+    def coordinator_root(self) -> str:
+        return f"{self.agents_root}/coordinator"
+
+    @property
+    def specs_root(self) -> str:
+        return f"{self.agents_root}/specs"
+
+    @property
+    def monitor_state_root(self) -> str:
+        return f"{self.agents_root}/monitor"
+
+    @property
+    def project_config_root(self) -> str:
+        return f"{self.agents_root}/config/paulsha"
+
+    @property
+    def skill_registry_root(self) -> str:
+        return f"{self.agents_root}/registry"
+
+    @property
+    def run_root(self) -> str:
+        return f"{self.agents_root}/run/{self.instance}"
+
+    @property
+    def dispatch_log_root(self) -> str:
+        """Manager 的 job log_dir（`autonomy.py` 以相對 `runtime/dispatch/<slice>`
+        推導，故由 unit 的 `WorkingDirectory` 決定落點）。gate ledger 住在這裡。"""
+        return f"{self.agents_root}/runtime/dispatch"
+
+    @property
+    def job_spool_root(self) -> str:
+        """Manager 寫、job 只讀的 per-job 執行規格（`<id>/run.sh`）。"""
+        return f"{self.agents_root}/jobs"
+
+    @property
+    def venv_root(self) -> str:
+        return f"{self.deploy_root}/venv"
+
+    @property
+    def exec_start(self) -> str:
+        return f"{self.venv_root}/bin/cortex service run"
+
+    @property
+    def env_file(self) -> str:
+        return f"{self.deploy_root}/etc/{self.instance}-manager.env"
+
+    @property
+    def svc_cache(self) -> str:
+        return f"{self.svc_home}/cache"
+
+    @property
+    def builder_cache(self) -> str:
+        return f"{self.builder_home}/cache"
+
+    def with_job_segment(self, segment: str) -> "PathLayout":
+        """換掉 per-job segment（system unit 模板用 `%i`）。"""
+        return PathLayout(
+            agents_root=self.agents_root,
+            worktree_root=self.worktree_root,
+            deploy_root=self.deploy_root,
+            instance=self.instance,
+            svc_home=self.svc_home,
+            builder_home=self.builder_home,
+            job_segment=segment,
+        )
+
+    # -- 資產→路徑 ----------------------------------------------------------
+    def asset_paths(self) -> dict[str, str]:
+        """登記表每一項 asset_id → 目標主機絕對路徑（涵蓋全部、無多餘）。"""
+        a = self.agents_root
+        c = self.coordinator_root
+        ctl = self.control_root
+        mon = self.monitor_state_root
+        reg = self.skill_registry_root
+        wt = self.worktree_root
+        job = f"{wt}/{self.job_segment}"
+        return {
+            "runtime-agents-tree": a,
+            "control-root-tree": ctl,
+            "coordinator-root-tree": c,
+            "dispatch-specs-tree": self.specs_root,
+            "runtime-run-tree": self.run_root,
+            "project-config-tree": self.project_config_root,
+            "coverage-shadow-telemetry": f"{c}/coverage-shadow",
+            "monitor-state-tree": mon,
+            "monitor-work-items-snapshot": f"{mon}/work-items.snapshot.json",
+            "monitor-github-sync-cursor": f"{mon}/github-issue-sync.json",
+            "monitor-event-spool": f"{mon}/event-spool",
+            "skill-registry-tree": reg,
+            "skill-usage-ledger": f"{reg}/skill_usage.jsonl",
+            "skill-park-state": f"{reg}/skill_park.json",
+            "skill-park-proposals": f"{reg}/skill_park_proposals",
+            "control-request-queue": f"{ctl}/requests",
+            "control-done-queue": f"{ctl}/done",
+            "control-status": f"{ctl}/status.json",
+            "control-daemon-lock": f"{ctl}/manager.lock",
+            "repo-worktree": job,
+            "dispatch-worktree-pool": wt,
+            "jobs-registry": f"{c}/jobs.json",
+            "review-verdict": f"{job}/.psc-review-verdict.json",
+            # Phase 2a 受控通道（PR #599）：<coordinator>/review-verdicts/<reviewer_job_id>/
+            "review-verdict-spool": f"{c}/review-verdicts",
+            "verification-evidence": f"{c}/evidence/verification",
+            "maintainer-attestation": f"{c}/evidence/maintainer-review",
+            "completion-record": f"{c}/evidence/completion",
+            "full-suite-evidence": f"{c}/evidence/full-suite",
+            "workflow-inputs": f"{c}/evidence/workflow-inputs",
+            "workflow-evidence": f"{c}/evidence/workflow",
+            "gate-ledger": self.dispatch_log_root,
+            "delivery-journal": f"{c}/delivery-journal.json",
+            "provider-backoff": f"{c}/provider-rate-limit-backoff.json",
+            "workflow-report-journal": f"{c}/workflow-report-transactions",
+            "digest-outbox": f"{c}/digest/outbox",
+            "engineering-outcome-outbox": f"{c}/engineering-outcomes",
+            "model-identity-overlay": f"{self.project_config_root}/model-identities.yaml",
+            "combo-card-override": f"{a}/config/combos",
+            "handoff-manifest": f"{job}/.psc-handoff.json",
+            "runtime-bootstrap-env": self.env_file,
+            "codex-hooks": f"{self.builder_home}/.codex/hooks.json",
+            "work-items-yaml": f"{job}/.cortex/work-items.yaml",
+        }
+
+    # -- 非資產骨架目錄 -----------------------------------------------------
+    def scaffold_directories(self, scheme: UidScheme) -> tuple[tuple[str, str, str, int], ...]:
+        """`(path, owner, group, mode)`：不屬任何登記表資產、但必須先存在的父目錄。
+
+        原則：**凡是保護資產的父目錄，一律 root 擁有**——父目錄可寫者能 unlink／
+        rename 子物件，因此把 root-owned 檔放進 svc-owned 目錄等於沒保護。
+        """
+        svc = scheme.durable_state_owner
+        builder = scheme.resolve(Principal.BUILDER) or "cortex-builder"
+        root = scheme.deploy_account
+        g = scheme.group_of
+        return (
+            # 部署樹（enforcement plane）：全 root，對 svc／builder 唯讀。
+            (self.deploy_root, root, g(root), 0o755),
+            (f"{self.deploy_root}/etc", root, g(root), 0o755),
+            (self.venv_root, root, g(root), 0o755),
+            # durable state 樹的 root-owned 骨架（svc 不得 relink 這幾層）。
+            (f"{self.agents_root}/config", root, g(root), 0o755),
+            (f"{self.agents_root}/run", root, g(root), 0o755),
+            (f"{self.agents_root}/runtime", root, g(root), 0o755),
+            # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
+            (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
+            (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
+            # job spool：svc 寫 run.sh，job 帳號只 traverse＋讀（0711 不可列目錄）。
+            (self.job_spool_root, svc, g(svc), 0o711),
+            # 服務帳號 HOME：root 擁有（job 不得替換自己的 ~/.codex），只開 cache 子目錄。
+            (self.svc_home, root, g(root), 0o755),
+            (self.svc_cache, svc, g(svc), 0o700),
+            (self.builder_home, root, g(root), 0o755),
+            (f"{self.builder_home}/.codex", root, g(root), 0o755),
+            (self.builder_cache, builder, g(builder), 0o700),
+        )
+
+    # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
+    def manager_extra_write_paths(self) -> tuple[ExtraWritePath, ...]:
+        return (
+            ExtraWritePath(
+                self.job_spool_root,
+                "Manager 寫 per-job 執行規格（<id>/run.sh）供降權 job 讀取；job 帳號唯讀。",
+            ),
+            ExtraWritePath(
+                self.svc_cache,
+                "服務帳號 HOME 快取（git/gh/uv）；HOME 本身 root-owned，只開這一層。",
+            ),
+        )
+
+    def job_extra_write_paths(self) -> tuple[ExtraWritePath, ...]:
+        return (
+            ExtraWritePath(
+                self.builder_cache,
+                "job 帳號 HOME 快取（git/gh/uv）；HOME 與 ~/.codex 皆 root-owned 不可替換。",
+            ),
+        )
+
+
+DEFAULT_LAYOUT = PathLayout()
+
+
+def asset_paths(layout: PathLayout = DEFAULT_LAYOUT) -> dict[str, str]:
+    """模組層便利函式（CLI 與 runbook 引用）。"""
+    return layout.asset_paths()
+
+
+# ---------------------------------------------------------------------------
+# ReadWritePaths 的機械導出
+# ---------------------------------------------------------------------------
+
+def _parent_dir(path: str) -> str:
+    head = path.rsplit("/", 1)[0]
+    return head or "/"
+
+
+def _is_within(child: str, parent: str) -> bool:
+    """`child` 是否落在 `parent` 之內（含相等）——純字串前綴判定，無 IO。"""
+    return child == parent or child.startswith(parent.rstrip("/") + "/")
+
+
+def _minimize(paths: set[str]) -> tuple[str, ...]:
+    """去掉被其他條目涵蓋的子路徑，回傳排序後的最小覆蓋集合。"""
+    kept = [
+        p for p in paths
+        if not any(other != p and _is_within(p, other) for other in paths)
+    ]
+    return tuple(sorted(set(kept)))
+
+
+def required_write_targets(
+    plan: PermissionPlan,
+    layout: PathLayout,
+    account: str,
+) -> dict[str, str]:
+    """`asset_id → 該帳號必須可寫的目標路徑`（檔案取其父目錄）。
+
+    ProtectSystem=strict 下整個檔案系統唯讀；要**建立／取代**一個檔，必須對其
+    父目錄可寫，故檔案資產一律折算成父目錄。這就是「ReadWritePaths 由登記表機械
+    導出」的全部規則——沒有第二條。
+    """
+    targets: dict[str, str] = {}
+    paths = layout.asset_paths()
+    for entry in plan.entries:
+        if account not in plan.all_writable_accounts(entry):
+            continue
+        path = paths[entry.asset_id]
+        targets[entry.asset_id] = path if entry.is_directory else _parent_dir(path)
+    return targets
+
+
+def read_write_paths(
+    plan: PermissionPlan,
+    layout: PathLayout,
+    account: str,
+    extras: tuple[ExtraWritePath, ...] = (),
+) -> tuple[str, ...]:
+    """該帳號 unit 的 `ReadWritePaths=` 最小覆蓋集合（登記表導出 ∪ 明示 extras）。"""
+    wanted = set(required_write_targets(plan, layout, account).values())
+    wanted |= {e.path for e in extras}
+    return _minimize(wanted)
+
+
+def read_write_path_owners(
+    plan: PermissionPlan,
+    layout: PathLayout,
+    account: str,
+    extras: tuple[ExtraWritePath, ...] = (),
+) -> dict[str, tuple[str, ...]]:
+    """每條 ReadWritePaths → 它涵蓋的 asset_id（或 `extra:<reason>`），供逐條註解。"""
+    targets = required_write_targets(plan, layout, account)
+    result: dict[str, tuple[str, ...]] = {}
+    for rwp in read_write_paths(plan, layout, account, extras):
+        covered = sorted(aid for aid, t in targets.items() if _is_within(t, rwp))
+        covered += [f"extra:{e.reason}" for e in extras if _is_within(e.path, rwp)]
+        result[rwp] = tuple(covered)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# systemd unit 產生（Manager system unit ＋ 降權 job 模板 unit）
+# ---------------------------------------------------------------------------
+
+#: 加固指令 →（值, 為何）。逐項附註解是 spec §R3 的可審查性要求。
+_HARDENING: tuple[tuple[str, str, str], ...] = (
+    ("NoNewPrivileges", "yes",
+     "提權天花板：exec 後不得取得新特權，setuid 二進位／file capabilities 全部失效。"),
+    ("CapabilityBoundingSet", "",
+     "清空 capability 上界——服務永不具 root 能力（裁決：cortex 任何元件永不具 root）。"),
+    ("AmbientCapabilities", "",
+     "不夾帶任何 ambient capability；CAP_SETUID 路線已被裁決排除。"),
+    ("ProtectSystem", "strict",
+     "整個檔案系統唯讀，只有下方 ReadWritePaths 例外——/opt/cortex 部署樹因此唯讀。"),
+    ("ProtectHome", "yes",
+     "/home、/root、/run/user 一律不可見：state 已全數搬離 HOME，任何殘留的 HOME "
+     "路徑必須立刻失敗，而不是靜默沿用舊樹。"),
+    ("PrivateTmp", "yes",
+     "私有 /tmp、/var/tmp：切斷經共用 tmp 的跨 persona 檔案交換與 symlink 攻擊。"),
+    ("PrivateDevices", "yes",
+     "只掛最小 /dev；封掉 raw device 與 /dev/mem 這類旁路。"),
+    ("ProtectProc", "invisible",
+     "看不到其他 UID 的 /proc/<pid>——直接封 R9 族 4 的 environ／mem 讀取。"),
+    ("ProcSubset", "pid",
+     "/proc 只保留 pid 子集，隱藏 /proc/kcore 等核心介面。"),
+    ("ProtectControlGroups", "yes",
+     "cgroup 樹唯讀：不可經 cgroup 改寫資源或逃逸 unit 界線。"),
+    ("ProtectKernelModules", "yes", "禁止載入／卸載核心模組。"),
+    ("ProtectKernelTunables", "yes", "/proc/sys、/sys 唯讀，禁止改核心參數。"),
+    ("ProtectKernelLogs", "yes", "禁讀 kmsg，避免經核心日誌側錄他人資料。"),
+    ("ProtectClock", "yes", "禁止改系統時鐘——時間是 evidence 排序不變式的輸入。"),
+    ("ProtectHostname", "yes", "禁止改 hostname（稽核紀錄的主機標識）。"),
+    ("RestrictSUIDSGID", "yes",
+     "禁止建立 setuid/setgid 檔——關掉自製提權助手這條路。"),
+    ("RestrictNamespaces", "yes",
+     "禁止建立 namespace：user namespace 是 unprivileged 提權的常見起點。"),
+    ("RestrictRealtime", "yes", "禁 realtime 排程，避免 DoS 宿主。"),
+    ("RestrictAddressFamilies", "AF_UNIX AF_INET AF_INET6",
+     "只留 unix socket 與 IP：封掉 AF_NETLINK／AF_PACKET 等旁路。"),
+    ("LockPersonality", "yes", "鎖定執行域，禁止切換 personality 規避 seccomp。"),
+    ("MemoryDenyWriteExecute", "yes",
+     "禁 W+X 記憶體，封 JIT 型 shellcode。※ 若 Python C-extension（ctypes "
+     "trampoline）啟動失敗，這是第一嫌疑：先單獨註解本行複測。"),
+    ("SystemCallArchitectures", "native",
+     "只允許原生 ABI，封掉經 32-bit compat 介面規避 seccomp。"),
+    ("SystemCallFilter", "@system-service",
+     "seccomp 白名單：只留一般服務所需 syscall。"),
+    ("SystemCallErrorNumber", "EPERM",
+     "被過濾的 syscall 回 EPERM 而非 SIGSYS——失敗可觀測，不是無聲當掉。"),
+    ("RemoveIPC", "yes", "服務結束即清掉該 UID 的 IPC 物件，不留跨 job 殘留。"),
+    ("KeyringMode", "private", "私有 kernel keyring：不共用、不繼承金鑰。"),
+    ("UMask", "0077",
+     "新建檔預設 0600／目錄 0700，與權限產生器的 owner-only 基準一致。"),
+)
+
+
+@dataclass(frozen=True)
+class SystemdUnit:
+    """產生出來的 unit：**只有內容字串與結構化欄位，沒有任何寫檔／執行**。"""
+
+    unit_name: str
+    install_path: str
+    account: str
+    exec_start: str
+    environment_file: str | None
+    read_write_paths: tuple[str, ...]
+    content: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "unit_name": self.unit_name,
+            "install_path": self.install_path,
+            "account": self.account,
+            "exec_start": self.exec_start,
+            "environment_file": self.environment_file,
+            "read_write_paths": list(self.read_write_paths),
+            "content": self.content,
+        }
+
+
+def _hardening_lines(overrides: Mapping[str, str] | None = None) -> list[str]:
+    lines: list[str] = []
+    over = dict(overrides or {})
+    for key, value, why in _HARDENING:
+        effective = over.get(key, value)
+        lines.append(f"# {why}")
+        lines.append(f"{key}={effective}")
+    return lines
+
+
+def _rwp_lines(owners: Mapping[str, tuple[str, ...]]) -> list[str]:
+    lines = [
+        "# --- ReadWritePaths：由 R1 登記表機械導出（permgen），勿手擴 ---",
+        "# 每條後面列出它涵蓋的登記表資產；新增 durable state 時改登記表、重跑產生器。",
+    ]
+    for path, covered in owners.items():
+        lines.append(f"#   涵蓋：{', '.join(covered) if covered else '（無）'}")
+        lines.append(f"ReadWritePaths={path}")
+    return lines
+
+
+def build_manager_unit(
+    scheme: UidScheme,
+    layout: PathLayout = DEFAULT_LAYOUT,
+    plan: PermissionPlan | None = None,
+) -> SystemdUnit:
+    """Manager 的 system-level unit（`User=<durable_state_owner>`）。"""
+    plan = plan or generate_plan(scheme)
+    account = scheme.durable_state_owner
+    group = scheme.group_of(account)
+    extras = layout.manager_extra_write_paths()
+    owners = read_write_path_owners(plan, layout, account, extras)
+    unit_name = f"{layout.instance}-manager.service"
+
+    body = [
+        f"# {'/etc/systemd/system/' + unit_name}",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；改登記表後重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --manager",
+        "",
+        "[Unit]",
+        "Description=cortex Manager (trust-root Phase 2b, system-level)",
+        "Documentation=file://docs/superpowers/runbooks/trust-root-phase2b-setup.md",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "# 受信任服務身分。Manager 永不以 root 執行——root 操作只由 operator 手動 sudo。",
+        f"User={account}",
+        f"Group={group}",
+        "",
+        "# 部署樹在 root-owned 樹內，對本服務唯讀（ProtectSystem=strict 再加一層）：",
+        "# 改寫 verifier／注入 sitecustomize.py／.pth 皆 EACCES（spec §R3）。",
+        f"ExecStart={layout.exec_start}",
+        "# 相對 log_dir（runtime/dispatch/<slice>）由此解析，必須落在 ReadWritePaths 內。",
+        f"WorkingDirectory={layout.agents_root}",
+        "",
+        "# EnvironmentFile 無 '-' 前綴＝fail-closed：檔案缺席即拒絕啟動，",
+        "# MUST NOT 靜默落回 $HOME/.agents 預設（spec §R3 Scenario「刪除 EnvironmentFile」）。",
+        f"EnvironmentFile={layout.env_file}",
+        "# HOME 由 unit 指定；HOME 本身 root-owned，只有 cache 子目錄可寫。",
+        f"Environment=HOME={layout.svc_home}",
+        f"Environment=XDG_CACHE_HOME={layout.svc_cache}",
+        "",
+        "# --- 加固（spec §R3；逐項附理由供審查）---",
+    ]
+    body += _hardening_lines()
+    body += [""]
+    body += _rwp_lines(owners)
+    body += [
+        "",
+        "Restart=on-failure",
+        "RestartSec=5s",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+    ]
+    return SystemdUnit(
+        unit_name=unit_name,
+        install_path=f"/etc/systemd/system/{unit_name}",
+        account=account,
+        exec_start=layout.exec_start,
+        environment_file=layout.env_file,
+        read_write_paths=tuple(owners.keys()),
+        content="\n".join(body) + "\n",
+    )
+
+
+def build_job_unit(
+    scheme: UidScheme,
+    layout: PathLayout = DEFAULT_LAYOUT,
+    principal: Principal = Principal.BUILDER,
+    plan: PermissionPlan | None = None,
+) -> SystemdUnit:
+    """降權 job 的**模板** unit（`cortex-job@.service`）。
+
+    這是降權/提權分界線的另一半：`User=` 在 root-owned 的 unit 檔裡**硬寫死**，
+    呼叫端（Manager）只能給 instance 名，**無法選擇 UID、無法夾帶任何屬性**。
+    polkit 規則只放行這個模板的實例（見 `build_polkit_rule`）。
+    """
+    plan = plan or generate_plan(scheme)
+    account = scheme.resolve(principal)
+    if account is None:
+        raise ValueError(f"principal 未映射到帳號: {principal}")
+    group = scheme.group_of(account)
+    # per-job 路徑在模板 unit 中以 systemd 的 %i 表示。
+    job_layout = layout.with_job_segment("%i")
+    extras = job_layout.job_extra_write_paths()
+    owners = read_write_path_owners(plan, job_layout, account, extras)
+    unit_name = f"{layout.instance}-job@.service"
+
+    body = [
+        f"# {'/etc/systemd/system/' + unit_name}",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --job",
+        "#",
+        "# 降權/提權分界線：User= 在本 root-owned 檔內硬寫死。Manager（cortex-svc）",
+        "# 只能 `systemctl start cortex-job@<id>.service`，**不能**選 UID、不能傳屬性。",
+        "",
+        "[Unit]",
+        "Description=cortex headless job %i (downgraded, trust-root Phase 2b)",
+        f"After={layout.instance}-manager.service",
+        "",
+        "[Service]",
+        "Type=exec",
+        "# 硬寫死的 job 身分——這行是整套降權的唯一 UID 來源。",
+        f"User={account}",
+        f"Group={group}",
+        "",
+        "# 執行規格由 Manager 寫入 job spool（svc-owned，job 帳號唯讀）：",
+        "# job 因此無法改寫自己的命令列，也無法為下一個 job 埋伏。",
+        f"ExecStart=/bin/sh {job_layout.job_spool_root}/%i/run.sh",
+        f"WorkingDirectory={job_layout.worktree_root}/%i",
+        "# job 永不取得 gh token：GitHub 寫入由 Manager 代理（D1 outbox）。",
+        "Environment=GH_TOKEN=",
+        "Environment=GITHUB_TOKEN=",
+        f"Environment=HOME={job_layout.builder_home}",
+        f"Environment=XDG_CACHE_HOME={job_layout.builder_cache}",
+        "",
+        "# --- 加固（與 Manager 同一套；job 這側只多不少）---",
+    ]
+    body += _hardening_lines()
+    body += [""]
+    body += _rwp_lines(owners)
+    body += [
+        "",
+        "# job 為一次性：結束即回收 unit 狀態，不留可被重用的殘骸。",
+        "CollectMode=inactive-or-failed",
+        "Restart=no",
+        "StandardOutput=journal",
+        "StandardError=journal",
+    ]
+    return SystemdUnit(
+        unit_name=unit_name,
+        install_path=f"/etc/systemd/system/{unit_name}",
+        account=account,
+        exec_start=f"/bin/sh {job_layout.job_spool_root}/%i/run.sh",
+        environment_file=None,
+        read_write_paths=tuple(owners.keys()),
+        content="\n".join(body) + "\n",
+    )
+
+
+# ---------------------------------------------------------------------------
+# polkit 規則產生（授權面嚴格收窄）
+# ---------------------------------------------------------------------------
+
+#: 唯一被授權的 systemd polkit action。
+POLKIT_ACTION = "org.freedesktop.systemd1.manage-units"
+#: 唯一被授權的 verb（起／停 job；reload、mask、set-property 等一律拒）。
+POLKIT_ALLOWED_VERBS: tuple[str, ...] = ("start", "stop")
+
+
+class PolkitPlan(Enum):
+    """降權的兩個方案（operator 待拍板；兩案都完整產出，選了即可執行）。
+
+    - `TRANSIENT`（A）：Manager 以 `systemd-run` 起 transient unit（#603 的
+      `coordinator/job_runner.py` 已落地，`PSC_JOB_RUNNER=systemd-run` 開啟）。
+      polkit 能收窄的**只有**呼叫者 UID ＋ unit 名前綴；`User=`／`--uid=` **不在**
+      polkit detail 內，故「只能降到 job 帳號」這一半由 Manager 端封閉的 argv
+      產生器在 code level 保證，OS 層未強制（殘餘風險見 `plan_residual_risk`）。
+    - `TEMPLATE`（B）：root-owned 模板 unit（`<instance>-job@.service`）把 `User=`
+      硬寫死，polkit 只放行該模板的實例。**「降到哪個帳號」因此由 OS 強制**；
+      代價是 Manager 端要從 `systemd-run` 改成 `systemctl start <instance>-job@<id>`，
+      屬程式碼後續工項。
+    """
+
+    TRANSIENT = "transient"
+    TEMPLATE = "template"
+
+
+#: 明確被拒的特權 unit 屬性——列在規則檔開頭，讓審查者一眼看到邊界在哪。
+POLKIT_FORBIDDEN_PROPERTIES: tuple[str, ...] = (
+    "User=root",
+    "User=<任何非 job 帳號>",
+    "AmbientCapabilities=",
+    "CapabilityBoundingSet=",
+    "PrivateUsers=",
+    "SystemCallFilter=",
+    "ExecStart=（任意 argv）",
+)
+
+
+@dataclass(frozen=True)
+class PolkitRule:
+    """產生出來的 polkit 規則：**只有內容字串**，本模組不寫任何系統路徑。"""
+
+    install_path: str
+    plan: PolkitPlan
+    subject_account: str
+    target_account: str
+    unit_pattern: str
+    allowed_verbs: tuple[str, ...]
+    content: str
+    #: 本方案在 OS 層**未**強制的部分（空 tuple＝無殘餘）。
+    residual_risks: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "install_path": self.install_path,
+            "plan": self.plan.value,
+            "subject_account": self.subject_account,
+            "target_account": self.target_account,
+            "unit_pattern": self.unit_pattern,
+            "allowed_verbs": list(self.allowed_verbs),
+            "residual_risks": list(self.residual_risks),
+            "content": self.content,
+        }
+
+
+#: A 方案的 transient unit 名前綴——與 `coordinator/job_runner.UNIT_NAME_PREFIX`
+#: 是**成對契約**：改任一邊都必須同步改另一邊，否則 polkit 會拒掉所有 job。
+def transient_unit_prefix(layout: "PathLayout") -> str:
+    return f"{layout.instance}-job-"
+
+
+def job_unit_pattern(
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    plan: PolkitPlan = PolkitPlan.TEMPLATE,
+) -> str:
+    """被授權的 unit 名 regex（錨定）。"""
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    if plan is PolkitPlan.TRANSIENT:
+        return r"^" + layout.instance + r"-job-[a-z0-9][a-z0-9._-]{0,62}\.service$"
+    return r"^" + layout.instance + r"-job@[a-z0-9][a-z0-9._-]{0,62}\.service$"
+
+
+def plan_residual_risk(plan: PolkitPlan, scheme: UidScheme) -> tuple[str, ...]:
+    """本方案在 OS 層未強制的部分（誠實標註，runbook 與 PR 皆引用）。"""
+    if plan is PolkitPlan.TEMPLATE:
+        return ()
+    svc = scheme.durable_state_owner
+    # 只列會跑模型的 persona——它們是「被攻陷」的實際入口。
+    same_uid = sorted(
+        {
+            p.value
+            for p in (Principal.REVIEWER, Principal.PLANNER)
+            if scheme.resolve(p) == svc
+        }
+    )
+    risks = [
+        f"polkit 的 {POLKIT_ACTION} 只暴露 unit 名稱，**不暴露 User=／--uid=**；"
+        f"授權後 systemd 會照請求的任意 User= 起 unit。「只能降到 job 帳號」這一半"
+        f"由 Manager 端封閉的 argv 產生器在 code level 保證，OS 層未強制。",
+        f"因此**與 {svc} 同 UID 的任何行程**都持有這個 grant，可請求任意 User= 的"
+        f" transient unit（含 User=root）。",
+    ]
+    if same_uid:
+        risks.append(
+            f"在 {scheme.scheme_id} 方案下，跑模型的 {'／'.join(same_uid)} 與 {svc} 同帳號，"
+            f"故其中任一被攻陷即取得上一條的能力——這正是「是否提前三分」要衡量的東西。"
+        )
+    return tuple(risks)
+
+
+def build_polkit_rule(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    plan: PolkitPlan = PolkitPlan.TRANSIENT,
+    principal: Principal = Principal.BUILDER,
+) -> PolkitRule:
+    """產生降權授權的 polkit 規則內容（A／B 兩方案共用同一套產生邏輯）。
+
+    兩案的授權面都收窄到「`<svc>` 對特定 unit 名 pattern 的 start/stop」，且
+    **unit／verb 明細缺席即拒**；差別在「降到哪個帳號」由誰強制（見 `PolkitPlan`）。
+    """
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    svc = scheme.durable_state_owner
+    target = scheme.resolve(principal)
+    if target is None:
+        raise ValueError(f"principal 未映射到帳號: {principal}")
+    pattern = job_unit_pattern(layout, plan)
+    verbs = POLKIT_ALLOWED_VERBS
+    verb_check = " && ".join(f'verb !== "{v}"' for v in verbs)
+    residual = plan_residual_risk(plan, scheme)
+
+    if plan is PolkitPlan.TRANSIENT:
+        headline = (
+            f"// 方案 A（transient unit）：{svc} 可 start/stop 名為\n"
+            f"//   {transient_unit_prefix(layout)}<job 片段>-<sha8>.service 的 transient unit。\n"
+            f"// unit 名前綴與 coordinator/job_runner.UNIT_NAME_PREFIX 是**成對契約**——\n"
+            f"// 改任一邊都必須同步改另一邊，否則所有 job 會被 polkit 拒掉（fail-closed）。\n"
+            f"//\n"
+            f"// ===== 本方案在 OS 層未強制的部分（務必知悉）=====\n"
+            + "\n".join(f"// - {r}" for r in residual)
+            + "\n//\n"
+            f"// 要把這一半也搬到 OS 層，改用方案 B（root-owned 模板 unit，User= 寫死）：\n"
+            f"//   python3 -m paulsha_cortex.trust_root polkit {scheme.scheme_id} --template\n"
+        )
+    else:
+        headline = (
+            f"// 方案 B（root-owned 模板 unit）：{svc} 只能 start/stop\n"
+            f"//   {layout.instance}-job@<id>.service 的實例。\n"
+            f"// 模板檔 /etc/systemd/system/{layout.instance}-job@.service 由 root 擁有，\n"
+            f"// 內容硬寫死 User={target}、NoNewPrivileges=yes、CapabilityBoundingSet=（空）。\n"
+            f"// 因此 {svc} **無法選擇 job 的 UID**，也**無法夾帶任何特權屬性**：\n"
+            + "\n".join(f"//     - {p}" for p in POLKIT_FORBIDDEN_PROPERTIES)
+            + "\n"
+            f"// 這些屬性全部只存在於 root-owned 的模板檔裡，呼叫端連提都提不了。\n"
+            f"//\n"
+            f"// ===== 為什麼 transient unit 在本方案下一律拒 =====\n"
+            f"// StartTransientUnit 的 polkit 檢查**不帶 unit 屬性明細**（規則只看得到\n"
+            f"// action id，看不到 User=／AmbientCapabilities=／ExecStart=）。放行 transient\n"
+            f"// unit 就等於允許 {svc} 傳 User=root。下方「unit／verb 明細缺席即拒」與\n"
+            f"// 只認 `@` 實例名的 pattern 一起把這條路關死。\n"
+        )
+
+    content = f"""// /etc/polkit-1/rules.d/49-{layout.instance}-downgrade.rules
+// 由 permgen 機械產生（scheme={scheme.scheme_id}, plan={plan.value}）——勿手改；重跑：
+//   python3 -m paulsha_cortex.trust_root polkit {scheme.scheme_id} --{plan.value}
+//
+// ===== 這是 cortex 的降權/提權分界線 =====
+{headline}//
+// ===== 審查者的一眼結論 =====
+// 唯一的放行出口需要同時滿足：
+//   (1) subject 是 {svc}；(2) action 是 {POLKIT_ACTION}；
+//   (3) unit／verb 明細存在；(4) verb ∈ {{{", ".join(verbs)}}}；
+//   (5) unit 名匹配 {pattern}
+// 任一不成立即拒絕。函式只有最後一行放行。
+
+polkit.addRule(function(action, subject) {{
+    if (subject.user !== "{svc}") {{
+        // 不干涉 operator／其他帳號的既有授權（交回 polkit 預設）。
+        return polkit.Result.NOT_HANDLED;
+    }}
+    if (action.id !== "{POLKIT_ACTION}") {{
+        // {svc} 的其他 polkit action 一律拒（含 login1／hostname1／systemd1 其他面）。
+        return polkit.Result.NO;
+    }}
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (!unit || !verb) {{
+        // 明細缺席就無從判斷，一律拒（fail-closed）。
+        return polkit.Result.NO;
+    }}
+    if ({verb_check}) {{
+        return polkit.Result.NO;
+    }}
+    if (!/{pattern}/.test(unit)) {{
+        // 只有上述 pattern 的 job unit；{layout.instance}-manager.service 等一律拒。
+        return polkit.Result.NO;
+    }}
+    return polkit.Result.YES;
+}});
+"""
+    return PolkitRule(
+        install_path=f"/etc/polkit-1/rules.d/49-{layout.instance}-downgrade.rules",
+        plan=plan,
+        subject_account=svc,
+        target_account=target,
+        unit_pattern=pattern,
+        allowed_verbs=verbs,
+        content=content,
+        residual_risks=residual,
+    )
+
+
+def transient_unit_properties(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    principal: Principal = Principal.BUILDER,
+    plan: PermissionPlan | None = None,
+) -> tuple[str, ...]:
+    """A 方案的 `--property=` 建議清單（與 B 方案模板 unit 同源，機械產生）。
+
+    `job_runner` 目前只送 `NoNewPrivileges=yes`；本函式把同一套加固表與**由登記表
+    導出的 ReadWritePaths** 展開成 `systemd-run --property=` 形式，供 operator 在
+    A 方案下逐條加固，或作為「A 與 B 的加固面是否等價」的對照表。
+    """
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    plan = plan or generate_plan(scheme)
+    account = scheme.resolve(principal)
+    if account is None:
+        raise ValueError(f"principal 未映射到帳號: {principal}")
+    job_layout = layout.with_job_segment("%i")
+    props = [f"--property={key}={value}" for key, value, _why in _HARDENING]
+    for rwp in read_write_paths(
+        plan, job_layout, account, job_layout.job_extra_write_paths()
+    ):
+        props.append(f"--property=ReadWritePaths={rwp}")
+    return tuple(props)
+
+
+def evaluate_polkit(
+    rule: PolkitRule,
+    *,
+    user: str,
+    action_id: str,
+    unit: str | None = None,
+    verb: str | None = None,
+) -> str:
+    """規則決策的 Python 鏡像（polkit 無法本機執行，故以純函式測產生邏輯）。
+
+    與 `build_polkit_rule` 產出的 JS **共用同一組常數**（subject／action／verbs／
+    pattern），因此決策矩陣測到的就是規則檔的語意。回傳 `"YES"`／`"NO"`／
+    `"NOT_HANDLED"`。
+    """
+    if user != rule.subject_account:
+        return "NOT_HANDLED"
+    if action_id != POLKIT_ACTION:
+        return "NO"
+    if not unit or not verb:
+        return "NO"
+    if verb not in rule.allowed_verbs:
+        return "NO"
+    if re.search(rule.unit_pattern, unit) is None:
+        return "NO"
+    return "YES"

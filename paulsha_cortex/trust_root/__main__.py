@@ -7,11 +7,24 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root selfcheck   # R3 自檢診斷（JSON）
     python -m paulsha_cortex.trust_root registry    # R1 登記表摘要（JSON）
     python -m paulsha_cortex.trust_root equation     # R1 雙向等式結果
-    python -m paulsha_cortex.trust_root permissions [two-way|three-way] [--commands]
+    python -m paulsha_cortex.trust_root permissions [two-way|three-way] [--commands] [--paths]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
+    python -m paulsha_cortex.trust_root unit [two-way|three-way]
+                                        [--manager|--job|--job-properties]
+                                                    # Phase 2b systemd unit 內容
+                                                    # （--job-properties＝方案 A 的
+                                                    #   systemd-run --property= 清單）
+    python -m paulsha_cortex.trust_root polkit [two-way|three-way] [--transient|--template]
+                                                    # Phase 2b 降權 polkit 規則內容
+                                                    # （--transient＝方案 A，預設；
+                                                    #   --template＝方案 B）
+    python -m paulsha_cortex.trust_root scaffold [two-way|three-way]
+                                                    # Phase 2b 骨架目錄的 install -d 命令
 
-`permissions` 只**產生**權限計畫／命令字串，**絕不執行**任何 root 操作——命令供
-operator 在 Phase 2b runbook 中手動 sudo 執行。
+`permissions`／`unit`／`polkit`／`scaffold` 只**產生**計畫與內容字串，**絕不執行**
+任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook 中手動
+sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對路徑
+輸出（0816 裁決：/var/lib/cortex ＋ /opt/cortex），不再帶 placeholder。
 """
 from __future__ import annotations
 
@@ -78,9 +91,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         rest = args[1:]
         scheme_id = "two-way"
         want_commands = False
+        want_paths = False
         for token in rest:
             if token == "--commands":
                 want_commands = True
+            elif token == "--paths":
+                want_paths = True
             elif token in permgen.SCHEMES:
                 scheme_id = token
             else:
@@ -88,10 +104,75 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
         plan = permgen.generate_plan(permgen.SCHEMES[scheme_id])
         if want_commands:
-            for line in permgen.plan_to_commands(plan):
+            path_of = permgen.asset_paths() if want_paths else None
+            for line in permgen.plan_to_commands(plan, path_of=path_of):
                 print(line)
         else:
             print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if command == "unit":
+        rest = args[1:]
+        scheme_id = "two-way"
+        which = "manager"
+        for token in rest:
+            if token == "--manager":
+                which = "manager"
+            elif token == "--job":
+                which = "job"
+            elif token == "--job-properties":
+                which = "job-properties"
+            elif token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown unit arg: {token}", file=sys.stderr)
+                return 2
+        scheme = permgen.SCHEMES[scheme_id]
+        if which == "job-properties":
+            print("# 方案 A（systemd-run transient unit）的 --property= 建議清單。")
+            print("# 與方案 B 的模板 unit 同源（同一加固表 ＋ 同一份登記表導出的 RWP）。")
+            print("# 注意：%i 是 systemd 模板 specifier；A 方案（transient）請由呼叫端")
+            print("#       代入該 job 的實際 worktree 路徑。")
+            for prop in permgen.transient_unit_properties(scheme):
+                print(prop)
+            return 0
+        unit = (
+            permgen.build_manager_unit(scheme)
+            if which == "manager"
+            else permgen.build_job_unit(scheme)
+        )
+        print(unit.content, end="")
+        return 0
+    if command == "polkit":
+        rest = args[1:]
+        scheme_id = "two-way"
+        plan = permgen.PolkitPlan.TRANSIENT
+        for token in rest:
+            if token == "--transient":
+                plan = permgen.PolkitPlan.TRANSIENT
+            elif token == "--template":
+                plan = permgen.PolkitPlan.TEMPLATE
+            elif token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown polkit arg: {token}", file=sys.stderr)
+                return 2
+        rule = permgen.build_polkit_rule(permgen.SCHEMES[scheme_id], plan=plan)
+        print(rule.content, end="")
+        return 0
+    if command == "scaffold":
+        rest = args[1:]
+        scheme_id = "two-way"
+        for token in rest:
+            if token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown scaffold arg: {token}", file=sys.stderr)
+                return 2
+        scheme = permgen.SCHEMES[scheme_id]
+        print("# trust-root Phase 2b 骨架目錄（非登記表資產的父層）——只產生字串。")
+        print(f"# scheme={scheme_id}；operator review 後手動 sudo 執行。")
+        for path, owner, group, mode in permgen.DEFAULT_LAYOUT.scaffold_directories(scheme):
+            print(f"install -d -o {owner} -g {group} -m {format(mode, '04o')} {path}")
         return 0
 
     print(f"unknown command: {command}", file=sys.stderr)
