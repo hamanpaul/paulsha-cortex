@@ -274,7 +274,31 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         (Principal.REVIEWER, Principal.ANY_SAME_UID), (Principal.MANAGER,),
         IngressKind.DIRECT_FILE_WRITE,
         derived_in=("coordinator/review.py:22-23,176-185",),
-        note="§3 最短攻擊路徑：builder 同 UID 可直接代寫 reviewer 的 .psc-review-verdict.json。",
+        note=(
+            "§3 最短攻擊路徑：builder 同 UID 可直接代寫 reviewer 的 "
+            ".psc-review-verdict.json。**Phase 2a 起已非權威來源**——權威通道改為 "
+            "review-verdict-spool；本項僅保留為過渡期 legacy fallback（只對 Phase 2a "
+            "之前派工、job row 無 review_verdict_channel 標記的 reviewer job 生效），"
+            "採信時記 WARN＋DiagnosticReason。過渡期結束即應除役。"
+        ),
+    ),
+    TrustRootAsset(
+        "review-verdict-spool", _T0, _JV,
+        "paulsha_cortex.config.paths:review_verdict_spool_root",
+        (Principal.MANAGER, Principal.REVIEWER), (Principal.MANAGER,),
+        IngressKind.INTERPROCESS,
+        derived_in=(
+            "config/paths.py:review_verdict_spool_root",
+            "coordinator/review.py:review_verdict_spool_dir",
+        ),
+        note=(
+            "Phase 2a §R2 受控通道：`<coordinator_root>/review-verdicts/<reviewer_job_id>/"
+            "verdict.json`。**tree 分類比照 `monitor-event-spool`（單向 spool 一律 "
+            "job-visible）**，但 permgen 產出的實質是 Manager-owned：容器 owner＝"
+            "durable_state_owner、mode 0700，reviewer 僅獲 write-only ACL（寫得進自己"
+            "那格、讀不到他人 verdict），**builder 不在 writer 面故零寫入**。dispatch 前"
+            "該格必須不存在（pre-seed 守衛），Manager 落地後轉唯讀。"
+        ),
     ),
     TrustRootAsset(
         "verification-evidence", _T0, _MO, None,

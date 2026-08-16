@@ -40,6 +40,30 @@ def coverage_shadow_telemetry_root() -> Path:
     return coordinator_root() / "coverage-shadow"
 
 
+#: `review_verdict_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數
+#: 是為了讓 `coordinator/review.py` 的 per-job 定址與本 resolver 共用同一個字面量
+#: （R1 登記表的「重複路徑推導」Scenario 要求單一真相）。
+REVIEW_VERDICT_SPOOL_DIRNAME = "review-verdicts"
+
+
+def review_verdict_spool_root() -> Path:
+    """trust-root Phase 2a（spec §R2）：reviewer verdict 的 per-job 單向 spool 根。
+
+    背景 §3 的最短攻擊路徑是「verdict 由模型寫在 **worktree 內**」——同 UID 下
+    builder 可直接代寫 reviewer 的 `.psc-review-verdict.json`，不需偷任何
+    capability。§R2 因此要求 verdict「MUST NOT 停留在同 UID 可寫的 worktree 內
+    作為權威來源」，改由 reviewer 經**受控通道**交付、Manager 落地。
+
+    本函式即該通道的根：每個 reviewer job 在 `<此根>/<reviewer_job_id>/` 有且只有
+    自己那一格（`coordinator/review.py` 的 `review_verdict_spool_dir()` 是唯一
+    定址點）。掛在 `coordinator_root()` 底下——它是 Manager-owned 樹，Phase 2b
+    的 chown／ACL 由 `trust_root/permgen.py` 依 R1 登記表機械產生：Manager 擁有
+    並消費，reviewer 只獲 **write-only** ACL（寫得進自己那格、讀不到別人的），
+    builder 零寫入。
+    """
+    return coordinator_root() / REVIEW_VERDICT_SPOOL_DIRNAME
+
+
 def specs_root() -> Path:
     return resolve_runtime_root("PSC_SPECS_ROOT")
 

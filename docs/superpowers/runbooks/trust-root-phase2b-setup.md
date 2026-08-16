@@ -213,6 +213,33 @@ sudo install -d -o cortex-svc -g cortex-svc -m 0701 "$WORKTREE_ROOT"
 > `monitor-event-spool` 亦特殊：cortex-svc 擁有、以 `setfacl -m u:cortex-builder:wx`
 > 讓 builder 只能 append，consumer(svc) 讀＋消費。照抄產生器輸出。
 
+### 3b-2. review verdict spool（Phase 2a 已就位的受控通道）
+
+Phase 2a 已把 review verdict 的落點從 reviewer worktree 搬到
+`<coordinator_root>/review-verdicts/<reviewer_job_id>/verdict.json`（登記表
+`review-verdict-spool`，spec §R2 ＋未決 10-6 的 per-job spool 案）。**程式碼側
+已完成**：per-job 目錄由 Manager 在 dispatch 當下以 `0700` 建立、帶 pre-seed
+守衛，落地後轉 `0444`；reviewer 身分由 Manager job registry 推導，verdict payload
+的自述綁定欄位一律忽略。
+
+```bash
+# 🔧 operator sudo：spool 根由 cortex-svc（Manager）擁有；builder 完全無權限
+sudo install -d -o cortex-svc -g cortex-svc -m 0700 "$COORDINATOR_ROOT/review-verdicts"
+
+# 三分方案才需要：reviewer 帳號以 **write-only** ACL 進入（寫得進自己那格、讀不到他人）
+# sudo setfacl -m u:cortex-reviewer-planner:wx "$COORDINATOR_ROOT/review-verdicts"
+# sudo setfacl -d -m u:cortex-reviewer-planner:wx "$COORDINATOR_ROOT/review-verdicts"
+```
+
+> 二分方案下 reviewer 與 Manager 併帳（`cortex-svc`），owner 位已涵蓋寫入權，
+> 產生器不會輸出多餘 ACL。**builder（`cortex-builder`）在兩個方案下都拿不到任何
+> 權限**——這一步完成後，spec 背景 §3 的「builder 代寫 verdict」最短攻擊路徑才
+> 從「結構上不可能被採信」升級為「OS 層寫不進去」。
+>
+> 另：Phase 2a 的降權啟動器需把該 job 的 spool 目錄放進 executor sandbox 的放行
+> 清單（`--add-dir`，見 `SubprocessLauncher.as_verdict_spool_writer()`）——只放行
+> **那一格**，不是整棵 coordinator 樹。
+
 ### 3c. legacy-import 重新入帳（**不滿足 ship gate**）
 
 ```bash

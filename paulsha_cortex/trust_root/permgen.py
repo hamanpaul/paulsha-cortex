@@ -377,9 +377,16 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
 
         if asset.ingress_kind is IngressKind.INTERPROCESS:
             # spool：trusted consumer 擁有並讀＋unlink，untrusted producer 只准 append。
+            # Phase 2a 的 review verdict 通道（`review-verdict-spool`）走同一條政策：
+            # 容器 owner 是 Manager（durable_state_owner）、mode 0700，reviewer 只拿
+            # **write-only** ACL（`wx`，無 `r`——寫得進自己那格、讀不到他人 verdict），
+            # builder 不在 writer 面故完全拿不到權限。這正是 spec 10-6「headless 可寫、
+            # 不可讀不可改他人」的 per-job 單向語意。
             owner = trusted_owner
             mode = _dir_file_mode(is_dir, 0o7 if is_dir else 0o6, 0, 0)
-            for pacct in sorted(job_writers):
+            # owner 本身不需要 ACL（同帳號時 setfacl 只會是噪音；例如二分方案下
+            # reviewer 與 Manager 併帳，此時 owner 位已涵蓋寫入權）。
+            for pacct in sorted(a for a in job_writers if a != owner):
                 acls.append(AclEntry(pacct, "wx" if is_dir else "w"))
             writer_accounts = frozenset({owner} | job_writers)
             rationale = (

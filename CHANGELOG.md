@@ -8,6 +8,32 @@
 ## [Unreleased]
 
 ### Added
+- **R0.5 D6 / trust-root 隔離 Phase 2a：review verdict 受控通道（per-job 單向 spool）**
+  ——堵掉 spec 背景 §3 的最短攻擊路徑：verdict 原本由 reviewer 模型寫在**自己的
+  worktree 內**（`.psc-review-verdict.json`），同 UID 下 builder 可直接覆寫／預埋，
+  不需偷任何 capability 就能為自己的 candidate 產出一份「通過」的 foreign review。
+  依 §R2 把 verdict 落點搬到 Manager-owned 樹的 per-job 單向 spool
+  `<coordinator_root>/review-verdicts/<reviewer_job_id>/verdict.json`（未決 10-6 的
+  **per-job spool 案**，待 operator 最終拍板）：新增
+  `config/paths.py:review_verdict_spool_root()` 與 `coordinator/review.py` 的
+  `review_verdict_spool_dir()`／`prepare_review_verdict_spool()`（dispatch 前
+  pre-seed 守衛、目錄 `0700`）／`read_spool_review_verdict()`／
+  `seal_review_verdict_spool()`（落地後轉 `0444`）；登記進 R1 資產登記表為
+  `review-verdict-spool`（permgen 產出：owner＝Manager 帳號、reviewer 僅
+  **write-only** ACL、**builder 零寫入**，二分／三分皆然）。**reviewer 身分由 Manager
+  job registry 推導**——`builder_job_id`／`reviewer_job_id`／`candidate`／
+  `launch_identity` 四個綁定欄位不看 verdict payload 自述（與 workflow lane 早已成立
+  的形狀對齊），reviewer 只貢獻 `findings`。相容遷移以 job row 新欄位
+  `review_verdict_channel`（唯一合法值 `"spool"`）判定：有標記的 job **只認 spool、
+  不回退**；本修法之前派工的 in-flight job 才讀 legacy worktree 落點並記 WARN ＋
+  `DiagnosticReason`（`review-verdict-legacy-worktree-source`）。另新增
+  `SubprocessLauncher.as_verdict_spool_writer()`，沿用 `--add-dir` 只放行該 job 的
+  那一格 spool（未授權時 argv 與改動前逐字相同）。**範圍**：只改 slice lane；
+  workflow lane 從終局 JSON 收割、本來就不在 worktree 內，未動。**誠實邊界**：
+  Phase 2b（分 UID／chown）之前同 UID 下 builder 技術上仍寫得進 `coordinator_root`
+  （Phase 1 自檢已知），本階段交付的是**通道結構**（路徑／守衛／登記／身分推導），
+  OS 強制等 Phase 2b。詳見 `changelog.d/p2a-verdict-channel.md`。新增
+  `tests/test_review_verdict_channel_p2a.py`（47 測試）。
 - **v4 R1：shadow telemetry 的 aggregation reader ＋ TTL retention（Go/No-Go 的直接
   輸入）**——PR #590 落地了 coverage validator shadow 的 sink（一次比對一檔），但沒有
   讀端；R1 的 Go/No-Go 判準是「兩週 telemetry 中所有 disagreement 可解釋」，沒有統計
