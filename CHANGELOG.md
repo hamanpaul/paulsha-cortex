@@ -7,6 +7,30 @@
 
 ## [Unreleased]
 
+### Changed
+- **#584 / trust-root Phase 2b runbook：A／B 兩案並列收斂為 A+B 單一路徑（docs-only）**
+  ——落實 operator 0816 第三輪裁決。polkit 的 `manage-units` 只暴露 unit 名與 verb、
+  不暴露 `User=`（#603 實測），因此「誰持有授權」與「授權能做什麼」兩層一起收：
+  **A＝UID 三分**（`cortex-manager` 不跑模型且是唯一 polkit subject／
+  `cortex-reviewer-planner`／`cortex-builder`，`THREE_WAY_SCHEME` 由備選轉定案，
+  全文 `two-way` → `three-way`，二分縮為一行歷史註記）＋
+  **B＝root-owned template unit**（`cortex-job@.service`，`User=cortex-builder` 寫死）＋
+  **C 由 root-owned shim 承接**（`/opt/cortex/bin/cortex-job-shim` 讀 Manager-owned
+  job-spec spool 導出 argv），切換點 `PSC_JOB_RUNNER=systemd-template`。第 5 步由
+  10 小節的兩案並列收斂為一條九節路徑；反向測試由「4＋7 條、其中 1 條期望成功」
+  收斂為 11 條**全部期望被拒**。殘餘風險重寫為「僅剩 `cortex-manager` 帳號的
+  supply-chain 類」，並誠實標註 M1／M2 分段（`_degraded_runner()` 目前只對 builder
+  persona 降權，reviewer／planner 的行程面降權屬後續工項）。**R9 攻擊矩陣四族 →
+  五族**：族 1–4 各跑 builder 與 reviewer-planner 兩個 subject，新增族 5
+  privilege-boundary——(a) 以 `cortex-manager` 請求 transient unit `--uid=root`
+  的五種形式（含 `--user` bus 與 `busctl` 直打 `StartTransientUnit`）必須被 polkit 拒、
+  (b) 三個 headless 帳號 × 九種手法改寫 template unit／shim／polkit 規則必須被
+  root-owned 拒（27 條），兩族各附 negative control。執行前提補三帳號與
+  `RUNNER_MODES` 檢查、回滾段補齊 template／shim／polkit／切換點／三帳號各自的回滾，
+  並重新統計為 9 步 ＋ 3 附錄、**32 個 sudo 點、122 個驗證點**（逐段落明細表）。
+  transient 路徑降為附錄 B 的降級備援並標明殘餘風險。
+  詳見 `changelog.d/ab-runbook-converged.md`。
+
 ### Added
 - **#606：重派 prompt 機械附上前次採信失敗證據——無回饋的重試不再是決定論的重複**
   ——現場 run `workflow-7812abefede9d9b5d601` 的 subagent-build（job 492／493）：builder
