@@ -7,6 +7,8 @@ from unittest import mock
 
 import pytest
 
+from sandbox_support import requires_af_unix_bind
+
 from paulsha_cortex.monitor.config import MonitorConfig
 from paulsha_cortex.monitor.server import MonitorServer
 from paulsha_cortex.monitor.server import _Subscriber
@@ -199,6 +201,7 @@ def test_recv_fails_fast_when_socket_closes_before_newline():
         client.close()
 
 
+@requires_af_unix_bind
 def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
     project_store = SnapshotStore(config=MonitorConfig(workspaces=()))
     work_store = WorkReadModelStore(_snapshot(_item("active", "ongoing")))
@@ -254,6 +257,7 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
         thread.join(timeout=2)
 
 
+@requires_af_unix_bind
 def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
     healthy = ProviderSnapshot(
         provider_id="github:example/acme",
@@ -328,6 +332,7 @@ def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
         thread.join(timeout=2)
 
 
+@requires_af_unix_bind
 def test_server_stopped_before_start_never_signals_ready(tmp_path):
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),
@@ -349,6 +354,7 @@ def test_server_stopped_before_start_never_signals_ready(tmp_path):
     assert not server.wait_until_ready(timeout=0)
 
 
+@requires_af_unix_bind
 def test_old_server_teardown_does_not_unlink_replacement_socket(tmp_path):
     socket_path = tmp_path / "monitor.sock"
     store = SnapshotStore(config=MonitorConfig(workspaces=()))
@@ -391,6 +397,7 @@ def test_old_server_teardown_does_not_unlink_replacement_socket(tmp_path):
         old_thread.join(timeout=2.0)
 
 
+@requires_af_unix_bind
 def test_work_subscription_extension_preserves_legacy_queue_full_replacement(tmp_path):
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),

@@ -240,6 +240,21 @@
   instance env，原子產生可驗證的 exact-project monitor config 並保留 rollback；monitor
   不再因父目錄 workspace 掃到 sibling repos，`cortex doctor` 也會從本機 env 檔告警 shared
   project config root 與重複掃描影響。
+- **#586（缺陷 A）：builder sandbox 無法 bind AF_UNIX socket，全套 pytest 假失敗**
+  ——builder（codex，`codex exec --sandbox workspace-write`）的沙箱實測**允許**
+  `socket(AF_UNIX)` 建立與 `socketpair()`，但用 seccomp 把 **`bind()`** 擋成 EPERM
+  （網路隔離），即使 socket 路徑在可寫根內。凡是 bind 本地 unix-domain socket（起
+  `MonitorServer`／直接綁）的測試在 builder 沙箱內必失敗，令 builder 自跑整套
+  `python3 -m pytest -q` 永遠有失敗、與 manager 獨立 ledger（正常環境 passed）系統性
+  分歧。codex 的 seccomp 無法從本 repo 細粒度只放行 AF_UNIX bind（唯一開關是整片打開
+  網路的 `network_access`／`danger-full-access`，正是 #586 安全邊界所禁），故採環境修復：
+  新增 `tests/sandbox_support.py` 偵測當前 runtime 能否 bind AF_UNIX，凡需 bind 的測試
+  在無法 bind 的沙箱下**明確 skip（帶原因）**而非假失敗，使 builder 自跑 pytest 由「有
+  失敗」變 exit 0，與權威 ledger 源頭一致。**安全邊界**：只改「無法 bind 時 run vs skip」
+  的判定，不放寬任何 syscall／不打開網路／不允許 builder 連上 manager socket（與 #584
+  trust-root 隔離不衝突）。防護 `test_stage9_project_monitor_service.py`、
+  `test_monitor_work_api.py`、`test_doctor.py`；新增 `tests/test_sandbox_afunix_skip_586.py`
+  以模擬沙箱子行程證明防護測試 skip 而非 fail。
 - **Issue #569：reviewer 卡的 `retry-verify` 只重置不重派——`retry-card` 放寬到
   verify／review 的 reviewer 卡**——實測 run `workflow-084f75e2178cf7547476` 的
   verification job（agy，#568 權限剖面缺陷）exit 0 但 log 無 JSON envelope，
