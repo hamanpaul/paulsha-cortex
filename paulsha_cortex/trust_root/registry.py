@@ -301,6 +301,25 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
     ),
     TrustRootAsset(
+        "job-spec-spool", _T0, _MO,
+        "paulsha_cortex.config.paths:job_spec_spool_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.BUILDER),
+        IngressKind.MANAGER_INTERNAL,
+        derived_in=(
+            "config/paths.py:job_spec_spool_root",
+            "coordinator/job_runner.py:job_spec_path",
+            "coordinator/job_shim.py:load_spec",
+        ),
+        note=(
+            "0816 第三輪裁決 A+B 的帶外通道：`<coordinator_root>/job-specs/"
+            "<unit-instance-id>.json`。root-owned 的 `cortex-job@.service` 模板 unit 的 "
+            "`ExecStart=` 固定為 shim，per-job 的命令／worktree／白名單 env／log 路徑改由"
+            "本 spool 傳遞。**writer 只有 Manager**——builder 在 reader 面（唯讀 ACL），"
+            "因此改不了自己的命令列；`User=` 完全不在本檔內（它硬寫死在 root-owned 的 "
+            "unit 檔裡），spool 被竄改也無法選 UID。"
+        ),
+    ),
+    TrustRootAsset(
         "verification-evidence", _T0, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
         derived_in=("coordinator/verification.py:305-316",),

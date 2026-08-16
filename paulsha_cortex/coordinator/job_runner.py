@@ -50,16 +50,53 @@ Python `Popen` 預設 `close_fds=True`，且 launcher 在降權模式顯式把 s
 stderr 併進 JSONL log（`stderr=STDOUT`）。不加 `--quiet` 就等於在 terminal evidence 的
 來源檔裡插入非 JSON 行。
 
-本模組只組字串與做唯讀探測，**不執行任何 root 操作、不建帳號、不寫 polkit**。
+## 第三種模式：`systemd-template`（operator 0816 **第三輪**裁決 A+B 的 B 半）
+
+#603 的實測結論是：`org.freedesktop.systemd1.manage-units` 這個 polkit action
+**只暴露 unit 名稱**，不暴露 `User=`／`--uid=`。因此 `systemd-run` 模式裡「只能
+降到 builder」這一半在 OS 層是**沒有強制的**——持授權的帳號被攻陷即可請求
+`--uid=root`。裁決把它換成 root-owned 的**模板 unit**：
+
+    systemctl start --wait cortex-job@<instance>.service
+
+- `User=` 與 `ExecStart=` 都寫死在 root 擁有的 `cortex-job@.service` 裡，Manager
+  帳號**選不了 UID、也給不了命令列**（unit 檔它改不動）。
+- 命令列既然給不了，per-job 參數改走**帶外通道**：一份 spec JSON 原子寫進
+  Manager-owned spool（登記表資產 `job-spec-spool`，job 帳號唯讀），
+  `ExecStart=` 的 root-owned shim 讀完才 exec 真正的 job
+  （見 :mod:`paulsha_cortex.coordinator.job_shim`）。
+- spec **不含** `User`／`uid` 這類欄位（:data:`SPEC_FORBIDDEN_KEYS` 在寫端與讀端
+  各擋一次），也不含任何 token（沿用同一份 env 白名單）。
+
+**判活與 log 與 systemd-run 模式同一條路**：
+
+- `--wait` 讓 `systemctl` client 存活到 unit 結束（`systemctl(1)`：「For (re)start,
+  wait until service stopped again」，systemd ≥ 232），因此
+  `dispatcher.pid_alive()` 的 pid 判活不必改一行。
+- exit sentinel 仍由 wrapper script 在 job 內寫入，`poll_headless_done` 的第一判準
+  完全不變。
+- log：`systemctl` **沒有** `--pipe`，且 unit 的 `StandardOutput=append:` 會由
+  **root 在降權前**開檔（Manager 可寫的路徑上放 symlink 即成提權面），因此改由
+  shim 在**已降權之後**依 spec 的 `log_path` 以 `O_NOFOLLOW` 接管 stdout/stderr。
+  **harvest 讀的 log 路徑因此逐字不變**（`<log_dir>/<slice_id>.jsonl`）。
+
+fail-fast 三案（任一命中即 `DiagnosticReason` fail-closed，**絕不**退回其他模式）：
+模板 unit／shim 未安裝、同名 instance 已在跑、spec 寫入失敗。
+
+本模組只組字串、做唯讀探測、與寫入 Manager 自己的 spec spool，**不執行任何 root
+操作、不建帳號、不寫 polkit、不安裝任何 unit**。
 """
 from __future__ import annotations
 
 import grp
 import hashlib
+import json
 import os
 import pwd
 import re
 import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,27 +113,46 @@ __all__ = [
     "BUILDER_SYNTHESIZED_ENV",
     "CREDENTIAL_ENV_RE",
     "DEFAULT_BUILDER_ACCOUNT",
+    "DEFAULT_JOB_SHIM",
+    "DEFAULT_JOB_SPEC_SPOOL",
     "DEFAULT_START_TIMEOUT_MS",
+    "DEFAULT_TEMPLATE_UNIT",
     "ForwardedEnvVar",
     "JOB_RUNNER_ENV",
+    "JOB_SHIM_ENV",
+    "JOB_SPEC_SPOOL_ENV",
+    "JOB_SPEC_VERSION",
     "JobRunnerError",
     "RUNNER_DIRECT",
     "RUNNER_MODES",
     "RUNNER_SYSTEMD_RUN",
+    "RUNNER_SYSTEMD_TEMPLATE",
+    "SPEC_FORBIDDEN_KEYS",
+    "SPEC_REQUIRED_KEYS",
     "START_TIMEOUT_ENV",
     "SystemdRunPlan",
+    "SystemdTemplatePlan",
+    "TEMPLATE_UNIT_ENV",
+    "TEMPLATE_UNIT_PREFIX",
     "TRANSIENT_UNIT_PROPERTIES",
     "UNIT_NAME_PREFIX",
     "build_builder_env",
+    "build_job_spec",
+    "build_systemctl_start_argv",
     "build_systemd_run_argv",
+    "confirm_template_instance_started",
     "confirm_transient_unit_started",
+    "instance_name_valid",
+    "job_spec_path",
     "preflight_systemd_run",
+    "preflight_systemd_template",
     "prepare_systemd_run",
-    "resolve_builder_account",
-    "resolve_builder_group",
-    "resolve_runner_mode",
-    "resolve_start_timeout_ms",
+    "prepare_systemd_template",
+    "reject_unsafe_env",
+    "template_instance_id",
+    "template_unit_name",
     "transient_unit_name",
+    "write_job_spec",
 ]
 
 
@@ -132,7 +188,9 @@ DEFAULT_START_TIMEOUT_MS = 200
 
 RUNNER_DIRECT = "direct"
 RUNNER_SYSTEMD_RUN = "systemd-run"
-RUNNER_MODES = (RUNNER_DIRECT, RUNNER_SYSTEMD_RUN)
+#: 0816 第三輪裁決 B：root-owned 模板 unit。見本檔「模板實例模式」段。
+RUNNER_SYSTEMD_TEMPLATE = "systemd-template"
+RUNNER_MODES = (RUNNER_DIRECT, RUNNER_SYSTEMD_RUN, RUNNER_SYSTEMD_TEMPLATE)
 
 #: transient unit 名前綴。polkit 規則以 `action.lookup("unit")` 收窄授權面時，比對的
 #: 就是這個前綴（見 Phase 2b runbook 第 5 步）——因此它是**契約**，不可隨手改。
@@ -146,6 +204,61 @@ UNIT_NAME_PREFIX = "cortex-job-"
 #:   `trust_root.permgen` 機械產生並寫進 unit／runbook（operator 未決 5 的裁決），
 #:   在啟動器裡手寫會變成第二份真相。
 TRANSIENT_UNIT_PROPERTIES = ("NoNewPrivileges=yes",)
+
+
+# ---------------------------------------------------------------------------
+# 模板實例模式（0816 第三輪裁決 B）的 config
+#
+# 下面四個預設值與 `trust_root.permgen.DEFAULT_LAYOUT` 是**成對契約**（同一份路徑
+# 裁決的兩個落點）。刻意不在此 import permgen——`job_runner` 至今只依賴 stdlib ＋
+# `diagnostics`，讓派工熱路徑不必拖進整個 trust_root 子套件；改以
+# `tests/test_trust_root_job_template_ab.py` 的契約測試釘住兩邊逐字相等，任一邊
+# 漂移都會當場紅。
+# ---------------------------------------------------------------------------
+
+#: 模板 unit 名。polkit 規則（`permgen.build_polkit_rule(plan=TEMPLATE)`）比對的
+#: 就是它的實例形狀 `cortex-job@<id>.service`，因此是契約，不可隨手改。
+TEMPLATE_UNIT_ENV = "PSC_JOB_TEMPLATE_UNIT"
+TEMPLATE_UNIT_PREFIX = "cortex-job@"
+TEMPLATE_UNIT_SUFFIX = ".service"
+DEFAULT_TEMPLATE_UNIT = f"{TEMPLATE_UNIT_PREFIX}{TEMPLATE_UNIT_SUFFIX}"
+
+#: Manager-owned 的 per-job spec spool（登記表資產 `job-spec-spool`）。
+JOB_SPEC_SPOOL_ENV = "PSC_JOB_SPEC_SPOOL"
+DEFAULT_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs"
+
+#: root-owned shim（模板 unit 的固定 `ExecStart=`）。preflight 只檢查它存在且可執行。
+JOB_SHIM_ENV = "PSC_JOB_SHIM"
+DEFAULT_JOB_SHIM = "/opt/cortex/bin/cortex-job-shim"
+
+#: 模板 unit 檔的安裝位置（preflight 檢查「template 未安裝」用）。
+DEFAULT_TEMPLATE_UNIT_DIR = "/etc/systemd/system"
+
+#: spec schema 版本。shim 讀到不符的版本一律拒絕執行——「舊 Manager ＋ 新 shim」
+#: 或反之都不該靠猜。
+JOB_SPEC_VERSION = 1
+
+#: spec 的必要欄位（shim 端逐項檢查；缺一即 fail-closed）。
+SPEC_REQUIRED_KEYS: tuple[str, ...] = (
+    "spec_version",
+    "instance",
+    "job_id",
+    "unit",
+    "command",
+    "working_directory",
+    "log_path",
+    "env",
+)
+
+#: spec **絕不可**出現的欄位——身分只有一個來源：root-owned unit 檔的 `User=`。
+#: 這是 B 案全部價值的所在，因此在寫端與讀端各擋一次。
+SPEC_FORBIDDEN_KEYS: frozenset[str] = frozenset(
+    {"user", "group", "uid", "gid", "User", "Group", "properties", "exec_start"}
+)
+
+#: systemd unit 實例名允許的字元。systemd 本身還允許更多（`/` 需 escape），這裡
+#: 刻意更窄：instance 名會被 polkit 的 unit pattern 比對，也會被拼成 spec 檔名。
+INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +526,16 @@ EXCLUDED_ENV_RATIONALE: Mapping[str, str] = {
 }
 
 
+def reject_unsafe_env(env: Mapping[str, str], *, source: str) -> None:
+    """公開別名——讓 shim 端（`job_shim`）用**同一條**守衛驗它讀到的 spec env。
+
+    寫端與讀端共用一份判準，是為了讓「白名單被改壞」在兩邊都會炸；只在寫端自律，
+    等於相信一個 Manager 帳號可寫的檔案沒被動過手腳。
+    """
+
+    _reject_unsafe(env, source=source)
+
+
 def _reject_unsafe(env: Mapping[str, str], *, source: str) -> None:
     """最後一道守衛：白名單即使被改壞，憑證形狀與注入孔仍然出不去。
 
@@ -551,7 +674,10 @@ def preflight_systemd_run(
     *,
     account: str,
     group: str,
-    which: Callable[[str], str | None] = shutil.which,
+    # 預設值刻意是 None 而不是 `shutil.which`：後者會在 **def 時**就把函式物件綁進
+    # 預設值，`mock.patch.object(job_runner.shutil, "which", …)` 因此打不到它——
+    # 測試會靜默地驗到「真實主機上有沒有 systemd-run」而不是它想驗的分支。
+    which: Callable[[str], str | None] | None = None,
     account_exists: Callable[[str], bool] | None = None,
     group_exists: Callable[[str], bool] | None = None,
     systemd_booted: Callable[[], bool] | None = None,
@@ -565,7 +691,7 @@ def preflight_systemd_run(
     :func:`confirm_transient_unit_started` 在起動階段補上。
     """
 
-    resolved = which("systemd-run")
+    resolved = (which or shutil.which)("systemd-run")
     if not resolved:
         raise _fail(
             "job-runner-systemd-run-missing",
@@ -655,29 +781,489 @@ def confirm_transient_unit_started(
     時間收斂，代價是每次 builder 派工多 200ms，相對於一次 headless job 可忽略。
     """
 
+    status = _await_start(
+        process=process,
+        sentinel=sentinel,
+        timeout_ms=timeout_ms,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    if status is None:
+        return
+    raise _fail(
+        "job-runner-transient-unit-start-failed",
+        (
+            f"transient unit {unit} 未能以 {account} 起動"
+            f"（systemd-run exit={status}；常見原因：polkit 拒絕、"
+            f"unit 名衝突、帳號無法切換）{_log_tail(log_path)}"
+        ),
+        source="confirm_transient_unit_started",
+        unit=unit,
+        account=account,
+        exit_status=status,
+    )
+
+
+def _await_start(
+    *,
+    process,
+    sentinel: str,
+    timeout_ms: int,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> int | None:
+    """起動確認的共用核心：回傳「起動失敗時的 client exit status」，成功回 None。
+
+    判準對 `systemd-run --wait` 與 `systemctl start --wait` 完全一樣（兩者都是
+    「client 存活到 unit 結束」的語意）：**client 已結束且 exit sentinel 不存在**
+    才算起動失敗。真的跑完的極短命 job 必然留下 sentinel，因此不會誤判。
+    """
+
     deadline = monotonic() + max(timeout_ms, 0) / 1000.0
     while True:
         status = process.poll()
         if status is not None:
             if Path(sentinel).exists():
                 # job 真的跑完了（且已寫下 exit sentinel）——不是起動失敗。
-                return
-            raise _fail(
-                "job-runner-transient-unit-start-failed",
-                (
-                    f"transient unit {unit} 未能以 {account} 起動"
-                    f"（systemd-run exit={status}；常見原因：polkit 拒絕、"
-                    f"unit 名衝突、帳號無法切換）{_log_tail(log_path)}"
-                ),
-                source="confirm_transient_unit_started",
-                unit=unit,
-                account=account,
-                exit_status=status,
-            )
+                return None
+            return status
         remaining = deadline - monotonic()
         if remaining <= 0:
-            return
+            return None
         sleep(min(0.01, remaining))
+
+
+# ---------------------------------------------------------------------------
+# 模板實例模式（B 案）
+# ---------------------------------------------------------------------------
+
+def instance_name_valid(name: str) -> bool:
+    """instance 名是否符合 :data:`INSTANCE_NAME_RE`（shim 端共用同一條判準）。"""
+
+    return bool(name) and INSTANCE_NAME_RE.fullmatch(name) is not None
+
+
+def template_instance_id(job_id: str) -> str:
+    """job_id → systemd 模板實例名（`cortex-job@<這個>.service`）。
+
+    與 :func:`transient_unit_name` 同一套「可追蹤 ＋ 唯一」的推導，差別只在這裡
+    產出的是**實例名**而不是完整 unit 名：消毒後的可讀片段 ＋ job_id 的 sha256
+    前 8 碼（消毒後相同也不會撞名）。
+    """
+
+    raw = str(job_id).strip()
+    if not raw:
+        raise _fail(
+            "job-runner-instance-name-invalid",
+            "job_id 為空，無法組出可追蹤的模板實例名",
+            source="template_instance_id",
+        )
+    slug = re.sub(r"[^A-Za-z0-9_.-]", "-", raw).strip("-")[:48]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    if not slug or not slug[0].isalnum():
+        slug = f"job{slug}" if slug else "job"
+    instance = f"{slug}-{digest}"
+    if not instance_name_valid(instance):
+        raise _fail(
+            "job-runner-instance-name-invalid",
+            f"推導出的模板實例名不合法: {instance!r}（job_id={raw!r}）",
+            source="template_instance_id",
+            job_id=raw,
+        )
+    return instance
+
+
+def template_unit_name(instance: str, *, template: str = DEFAULT_TEMPLATE_UNIT) -> str:
+    """`cortex-job@.service` ＋ instance → `cortex-job@<instance>.service`。
+
+    模板名從 config 來（`PSC_JOB_TEMPLATE_UNIT`），因此必須現場驗形狀：值只要不是
+    `<前綴>@.service` 就 fail-closed——一個打錯的模板名會讓 polkit 全數拒絕，那時
+    的錯誤訊息（「Access denied」）完全指不出真正的原因。
+    """
+
+    if not template.endswith(f"@{TEMPLATE_UNIT_SUFFIX}"):
+        raise _fail(
+            "job-runner-template-unit-invalid",
+            f"{TEMPLATE_UNIT_ENV} 必須是 `<name>@{TEMPLATE_UNIT_SUFFIX}` 形狀，收到 {template!r}",
+            source="template_unit_name",
+            requested=template,
+        )
+    if not instance_name_valid(instance):
+        raise _fail(
+            "job-runner-instance-name-invalid",
+            f"模板實例名不合法（只允許 [A-Za-z0-9_.-]，首字元須為英數）: {instance!r}",
+            source="template_unit_name",
+            requested=instance,
+        )
+    stem = template[: -len(TEMPLATE_UNIT_SUFFIX)]  # `cortex-job@`
+    return f"{stem}{instance}{TEMPLATE_UNIT_SUFFIX}"
+
+
+def resolve_template_unit(env: Mapping[str, str]) -> str:
+    return (env.get(TEMPLATE_UNIT_ENV) or "").strip() or DEFAULT_TEMPLATE_UNIT
+
+
+def resolve_job_spec_spool(env: Mapping[str, str]) -> str:
+    return (env.get(JOB_SPEC_SPOOL_ENV) or "").strip() or DEFAULT_JOB_SPEC_SPOOL
+
+
+def resolve_job_shim(env: Mapping[str, str]) -> str:
+    return (env.get(JOB_SHIM_ENV) or "").strip() or DEFAULT_JOB_SHIM
+
+
+def job_spec_path(spool_dir: str, instance: str) -> str:
+    """`<spool>/<instance>.json`——與 `job_shim.resolve_spec_path()` 同一條推導。"""
+
+    return f"{spool_dir.rstrip('/')}/{instance}.json"
+
+
+def build_job_spec(
+    *,
+    job_id: str,
+    instance: str,
+    unit: str,
+    command: Sequence[str],
+    working_directory: str,
+    log_path: str,
+    env: Mapping[str, str],
+) -> dict[str, object]:
+    """組出 per-job spec（**不含任何身分欄位**）。純資料，無 IO。
+
+    「User 不在 spec 裡」是本模式全部的價值：身分只有一個來源＝root-owned unit
+    檔的 `User=`。因此這裡除了不放，還在寫端主動掃一次 forbidden key（未來有人
+    往 spec 加欄位時測試會紅），讀端（shim）再掃一次。
+    """
+
+    argv = [str(item) for item in command]
+    if not argv or not all(argv):
+        raise _fail(
+            "job-runner-job-spec-invalid",
+            "spec 的 command 不得為空、且每個元素都必須是非空字串",
+            source="build_job_spec",
+            instance=instance,
+        )
+    for label, value in (("working_directory", working_directory), ("log_path", log_path)):
+        if not str(value).startswith("/"):
+            raise _fail(
+                "job-runner-job-spec-invalid",
+                f"spec 的 {label} 必須是絕對路徑，收到 {value!r}",
+                source="build_job_spec",
+                instance=instance,
+            )
+    # env 走與 systemd-run 模式**同一條**守衛：模式換了，token 不得出去這件事不換。
+    _reject_unsafe(env, source="build_job_spec")
+    spec: dict[str, object] = {
+        "spec_version": JOB_SPEC_VERSION,
+        "instance": instance,
+        "job_id": str(job_id),
+        "unit": unit,
+        "command": argv,
+        "working_directory": str(working_directory),
+        "log_path": str(log_path),
+        "env": {str(k): str(v) for k, v in sorted(env.items())},
+    }
+    leaked = sorted(SPEC_FORBIDDEN_KEYS & set(spec))
+    if leaked:
+        raise _fail(
+            "job-runner-job-spec-invalid",
+            f"spec 不得攜帶身分／特權欄位 {leaked}——身分只由 root-owned unit 的 User= 決定",
+            source="build_job_spec",
+            instance=instance,
+        )
+    return spec
+
+
+def write_job_spec(spec_path: str, spec: Mapping[str, object]) -> str:
+    """把 spec **原子**寫進 Manager-owned spool；失敗即 fail-closed。
+
+    原子性（同目錄 temp ＋ `os.replace`）不是潔癖：spec 是 job 的命令列，一個被
+    讀到一半的檔會變成「執行了半條命令」。`os.replace` 在同一個檔案系統上是
+    rename(2)，讀端只會看到舊的或新的完整內容。
+
+    mode 明確設 `0o640` 而不是靠 umask：Manager unit 的 `UMask=0077` 會讓新檔出生
+    即 `0600`，而 group 位全關會**連帶把繼承下來的 ACL mask 也關掉**，job 帳號的
+    唯讀 ACL 因此形同虛設（讀 spec 會 EACCES）。group 仍是 Manager 自己的 group，
+    所以放寬 group-read 不會讓第三方讀到。
+    """
+
+    directory = os.path.dirname(spec_path) or "."
+    payload = json.dumps(spec, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".job-spec-", suffix=".tmp", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, 0o640)
+        os.replace(tmp_path, spec_path)
+        tmp_path = None
+    except OSError as exc:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise _fail(
+            "job-runner-job-spec-write-failed",
+            f"寫不進 job spec {spec_path}: {exc}（spool 是否已由 Phase 2b 建立？）",
+            source="write_job_spec",
+            spec_path=spec_path,
+        ) from exc
+    return spec_path
+
+
+def build_systemctl_start_argv(*, systemctl: str, unit: str) -> list[str]:
+    """組出模板實例的啟動 argv。**封閉：除了 unit 名沒有任何可變輸入。**
+
+    逐項理由：
+
+    - `start`：polkit 規則只放行 `start`／`stop` 兩個 verb。
+    - `--wait`：client 存活到 unit 結束（`systemctl(1)`「For (re)start, wait until
+      service stopped again」，systemd ≥ 232），`dispatcher.pid_alive()` 的 pid 判活
+      因此與 direct／systemd-run 模式同語意，dispatcher 零改動。
+    - `--no-ask-password`：headless daemon 沒有 tty；缺這個旗標時 polkit 若要互動
+      認證，`systemctl` 會**卡住**而不是失敗——fail-closed 的前提是會失敗。
+    - `--no-block` **刻意不用**：那會讓 client 在 job 排入佇列後立刻返回，pid 判活
+      當場失效。
+    - **沒有** `--property=`／`--uid=`：本模式的整個重點就是這些東西給不了。
+    """
+
+    return [systemctl, "start", "--wait", "--no-ask-password", unit]
+
+
+def preflight_systemd_template(
+    *,
+    account: str,
+    group: str,
+    template_unit: str,
+    shim: str,
+    spool_dir: str,
+    which: Callable[[str], str | None] | None = None,
+    account_exists: Callable[[str], bool] | None = None,
+    group_exists: Callable[[str], bool] | None = None,
+    systemd_booted: Callable[[], bool] | None = None,
+    unit_file_installed: Callable[[str], bool] | None = None,
+    executable: Callable[[str], bool] | None = None,
+    directory_exists: Callable[[str], bool] | None = None,
+) -> str:
+    """模板模式的靜態檢查；任一項不成立即 fail-closed，回傳 systemctl 絕對路徑。
+
+    比 A 案多三條，對應「本模式生效需要 Phase 2b 安裝」的三個前置物：模板 unit 檔、
+    root-owned shim、Manager-owned spec spool。**任何一條都不會退回其他模式**——
+    「以為降權生效但其實沒有」正是這整條票要消除的失效模式。
+
+    polkit 拒絕仍然沒有可靠的唯讀探測面，由
+    :func:`confirm_template_instance_started` 在起動階段補上。
+    """
+
+    resolved = (which or shutil.which)("systemctl")
+    if not resolved:
+        raise _fail(
+            "job-runner-systemctl-missing",
+            "PATH 上找不到 systemctl；模板實例模式無法執行",
+            source="preflight_systemd_template",
+        )
+    booted = systemd_booted or _systemd_booted
+    if not booted():
+        raise _fail(
+            "job-runner-systemd-unavailable",
+            "/run/systemd/system 不存在——本機未以 systemd 開機，模板 unit 不可用",
+            source="preflight_systemd_template",
+        )
+    exists_account = account_exists or _account_exists
+    if not exists_account(account):
+        raise _fail(
+            "job-runner-builder-account-missing",
+            f"builder 帳號不存在: {account}（Phase 2b runbook 第 1 步尚未執行？）",
+            source="preflight_systemd_template",
+            account=account,
+        )
+    exists_group = group_exists or _group_exists
+    if not exists_group(group):
+        raise _fail(
+            "job-runner-builder-group-missing",
+            f"builder group 不存在: {group}",
+            source="preflight_systemd_template",
+            group=group,
+        )
+    installed = unit_file_installed or _unit_file_installed
+    if not installed(template_unit):
+        raise _fail(
+            "job-runner-job-template-missing",
+            (
+                f"模板 unit {template_unit} 未安裝於 {DEFAULT_TEMPLATE_UNIT_DIR}"
+                "（Phase 2b：`trust_root unit --job` 的輸出尚未落地？）"
+            ),
+            source="preflight_systemd_template",
+            unit=template_unit,
+        )
+    is_executable = executable or _is_executable
+    if not is_executable(shim):
+        raise _fail(
+            "job-runner-job-shim-missing",
+            (
+                f"降權 shim 不存在或不可執行: {shim}"
+                "（Phase 2b：`trust_root shim` 的輸出尚未落地？）"
+            ),
+            source="preflight_systemd_template",
+            shim=shim,
+        )
+    has_dir = directory_exists or os.path.isdir
+    if not has_dir(spool_dir):
+        raise _fail(
+            "job-runner-job-spec-spool-missing",
+            f"job spec spool 目錄不存在: {spool_dir}（Phase 2b 權限套用尚未執行？）",
+            source="preflight_systemd_template",
+            spool_dir=spool_dir,
+        )
+    return resolved
+
+
+@dataclass(frozen=True)
+class SystemdTemplatePlan:
+    """一次模板派工要用到的、**已驗證過**的身分／unit／路徑資訊。"""
+
+    binary: str
+    template_unit: str
+    instance: str
+    unit: str
+    account: str
+    group: str
+    shim: str
+    spool_dir: str
+    spec_path: str
+
+
+def prepare_systemd_template(
+    env: Mapping[str, str],
+    *,
+    job_id: str,
+    unit_active: Callable[[str, str], bool] | None = None,
+) -> SystemdTemplatePlan:
+    """模板派工的前置：解析 config、靜態 preflight、算 instance／unit／spec 路徑，
+    並確認**同名 instance 沒有正在跑**。
+
+    最後一條特別重要：`systemctl start` 對一個**已經 active** 的 unit 會直接回 0，
+    什麼都不做。少了這個檢查，Manager 會以為自己起了一個 job，實際上是掛在別人的
+    unit 上等——而且 `--wait` 會一路等到那個別人的 job 結束。
+
+    **在任何副作用之前呼叫**：這裡每一個 raise 都代表本次派工不該發生。
+    """
+
+    account = resolve_builder_account(env)
+    group = resolve_builder_group(env)
+    template = resolve_template_unit(env)
+    shim = resolve_job_shim(env)
+    spool_dir = resolve_job_spec_spool(env)
+    binary = preflight_systemd_template(
+        account=account,
+        group=group,
+        template_unit=template,
+        shim=shim,
+        spool_dir=spool_dir,
+    )
+    instance = template_instance_id(job_id)
+    unit = template_unit_name(instance, template=template)
+    is_active = unit_active or _unit_is_active
+    if is_active(binary, unit):
+        raise _fail(
+            "job-runner-template-instance-busy",
+            (
+                f"模板實例 {unit} 已在執行中——`systemctl start` 會靜默成功卻不起新 job。"
+                "同一個 job_id 是否已有未回收的派工？"
+            ),
+            source="prepare_systemd_template",
+            unit=unit,
+            account=account,
+        )
+    return SystemdTemplatePlan(
+        binary=binary,
+        template_unit=template,
+        instance=instance,
+        unit=unit,
+        account=account,
+        group=group,
+        shim=shim,
+        spool_dir=spool_dir,
+        spec_path=job_spec_path(spool_dir, instance),
+    )
+
+
+def confirm_template_instance_started(
+    *,
+    process,
+    sentinel: str,
+    unit: str,
+    account: str,
+    log_path: str | None = None,
+    timeout_ms: int = DEFAULT_START_TIMEOUT_MS,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """確認模板實例真的起來了；起不來就 fail-closed（**絕不**退回其他模式）。
+
+    判準與 A 案共用 :func:`_await_start`：`systemctl start --wait` 與
+    `systemd-run --wait` 都是「client 存活到 unit 結束」，因此「client 已結束且
+    exit sentinel 不存在」在兩邊都恰好代表「job 從未真正執行」。
+    """
+
+    status = _await_start(
+        process=process,
+        sentinel=sentinel,
+        timeout_ms=timeout_ms,
+        monotonic=monotonic,
+        sleep=sleep,
+    )
+    if status is None:
+        return
+    raise _fail(
+        "job-runner-template-instance-start-failed",
+        (
+            f"模板實例 {unit} 未能起動（systemctl exit={status}；常見原因：polkit 拒絕、"
+            f"模板 unit 未安裝、shim 讀 spec 失敗——後者的逐字原因在 journal："
+            f"`journalctl -u {unit}`）{_log_tail(log_path)}"
+        ),
+        source="confirm_template_instance_started",
+        unit=unit,
+        account=account,
+        exit_status=status,
+    )
+
+
+def _unit_file_installed(unit_name: str) -> bool:
+    """模板 unit 檔是否已落地。刻意用檔案存在判定而不是 `systemctl cat`：
+
+    後者要開一次 D-Bus、也可能因為 polkit 而失敗，把「未安裝」與「無授權」混成
+    同一個錯誤；前者是一次 stat，且答案就是 operator 在 runbook 第 5 步做的事。
+    """
+
+    return os.path.isfile(os.path.join(DEFAULT_TEMPLATE_UNIT_DIR, unit_name))
+
+
+def _is_executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _unit_is_active(systemctl: str, unit: str) -> bool:
+    """`systemctl is-active --quiet <unit>` 的唯讀查詢（seam，測試一律 mock）。
+
+    查詢面不需要 polkit 授權（`is-active` 是唯讀 D-Bus 呼叫）。查不動時回 False
+    ——「查不到狀態」不該擋掉一次合法派工，真正起不來的情況由
+    :func:`confirm_template_instance_started` fail-closed。
+    """
+
+    try:
+        completed = subprocess.run(
+            [systemctl, "is-active", "--quiet", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
 
 
 def _log_tail(log_path: str | None, *, limit: int = 200) -> str:
