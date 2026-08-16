@@ -110,7 +110,10 @@ def test_manager_read_write_paths_have_no_redundant_entry(scheme) -> None:
     plan = generate_plan(scheme)
     unit = build_manager_unit(scheme, DEFAULT_LAYOUT)
     targets = required_write_targets(plan, DEFAULT_LAYOUT, scheme.durable_state_owner)
-    extras = {e.path for e in DEFAULT_LAYOUT.manager_extra_write_paths()}
+    extras = {
+        e.path
+        for e in DEFAULT_LAYOUT.manager_extra_write_paths(scheme.durable_state_owner)
+    }
 
     for rwp in unit.read_write_paths:
         if rwp in extras:
@@ -162,7 +165,11 @@ def test_read_write_paths_are_consistent_with_protect_home(scheme) -> None:
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
 def test_extra_write_paths_all_carry_a_reason(scheme) -> None:
-    for extra in DEFAULT_LAYOUT.manager_extra_write_paths() + DEFAULT_LAYOUT.job_extra_write_paths():
+    builder = scheme.resolve(Principal.BUILDER)
+    assert builder is not None
+    for extra in DEFAULT_LAYOUT.manager_extra_write_paths(
+        scheme.durable_state_owner
+    ) + DEFAULT_LAYOUT.job_extra_write_paths(builder):
         assert extra.path.startswith("/")
         assert extra.reason.strip(), extra.path
 
@@ -198,7 +205,7 @@ def test_job_unit_read_write_paths_match_builder_writable_assets(scheme) -> None
     assert targets
     for asset_id, target in targets.items():
         assert any(_within(target, rwp) for rwp in unit.read_write_paths), (asset_id, target)
-    extras = {e.path for e in job_layout.job_extra_write_paths()}
+    extras = {e.path for e in job_layout.job_extra_write_paths(builder)}
     for rwp in unit.read_write_paths:
         if rwp in extras:
             continue
@@ -284,13 +291,22 @@ def test_job_unit_scrubs_github_token(scheme) -> None:
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
-def test_job_unit_command_comes_from_manager_owned_spool(scheme) -> None:
-    """job 不得改寫自己的命令列：run.sh 落在 svc-owned spool，job 只讀。"""
+def test_job_unit_command_comes_from_root_owned_shim_and_manager_owned_spec(scheme) -> None:
+    """job 不得改寫自己的命令列。
+
+    0816 第三輪 A+B 之後這條的形狀變了（比原本更緊）：`ExecStart=` 不再是 spool 裡
+    的 `run.sh`，而是**固定**指向 root-owned 部署樹的 shim——連 Manager 都換不掉
+    job 執行的第一支程式。per-job 參數改走 Manager-owned 的 spec spool，job 帳號
+    對兩者皆零寫入。
+    """
     unit = build_job_unit(scheme, DEFAULT_LAYOUT)
-    assert DEFAULT_LAYOUT.job_spool_root in unit.exec_start
-    assert not any(
-        _within(DEFAULT_LAYOUT.job_spool_root, rwp) for rwp in unit.read_write_paths
-    )
+    assert unit.exec_start.startswith(DEFAULT_LAYOUT.job_shim + " ")
+    assert unit.exec_start.startswith(DEFAULT_LAYOUT.deploy_root + "/")
+    assert f"ExecStart={unit.exec_start}" in unit.content
+    # spec spool 的位置由 root-owned unit 檔宣告給 shim，且 job 側不可寫。
+    assert f"Environment=PSC_JOB_SPEC_SPOOL={DEFAULT_LAYOUT.job_spec_spool_root}" in unit.content
+    for protected in (DEFAULT_LAYOUT.job_spec_spool_root, DEFAULT_LAYOUT.deploy_root):
+        assert not any(_within(protected, rwp) for rwp in unit.read_write_paths), protected
 
 
 def test_units_are_deterministic() -> None:
@@ -500,7 +516,7 @@ def test_scaffold_directories_are_command_strings_only() -> None:
     by_path = {p: (o, m) for p, o, _g, m in dirs}
     assert by_path[DEFAULT_LAYOUT.builder_home][0] == "root"
     assert by_path[f"{DEFAULT_LAYOUT.builder_home}/.codex"][0] == "root"
-    assert by_path[DEFAULT_LAYOUT.svc_home][0] == "root"
+    assert by_path[DEFAULT_LAYOUT.home_of(TWO_WAY_SCHEME.durable_state_owner)][0] == "root"
     assert by_path[DEFAULT_LAYOUT.deploy_root][0] == "root"
 
 

@@ -7,6 +7,41 @@
 
 ## [Unreleased]
 
+### Added
+- **#584 / trust-root Phase 2b：0816 第三輪裁決 A+B 的程式碼側——三分 UID 定案 ＋
+  `job_runner` 的 template-instance 模式**——**A**：`permgen.DEFAULT_SCHEME`
+  改為 `THREE_WAY_SCHEME`（`cortex-manager`／`cortex-reviewer-planner`／
+  `cortex-builder`），`trust_root` CLI 未指定 scheme 時一律出三分、`two-way` 需顯式
+  打出（打錯字不會靜默退回較寬鬆的方案）；polkit 產生器預設方案同步改為 **B**
+  （`PolkitPlan.TEMPLATE`，subject＝`cortex-manager`、verb ∈ {start, stop}、pattern＝
+  `^cortex-job@…\.service$`，且**不放行任何 transient unit 形狀**）。**B**：
+  `coordinator/job_runner.py` 新增第三模式 `PSC_JOB_RUNNER=systemd-template`——把
+  per-job spec（command／worktree／白名單 env／log 路徑，**無任何身分欄位**）原子寫進
+  Manager-owned spool `<coordinator_root>/job-specs/<instance>.json`（新登記表資產
+  `job-spec-spool`，builder 唯讀），再
+  `systemctl start --wait --no-ask-password cortex-job@<instance>.service`；`User=` 與
+  `ExecStart=` 皆硬寫死在 root-owned 模板 unit 裡，Manager 帳號選不了 UID、也給不了
+  命令列。模板的固定 `ExecStart=` 是新的 root-owned shim
+  （`permgen.build_job_shim()` 產 stub，邏輯在 `coordinator/job_shim.py`：`O_NOFOLLOW`
+  讀 spec → 白名單 schema 驗證 → 接管 log → chdir → `execvpe`）；新增 CLI
+  `python3 -m paulsha_cortex.trust_root shim`。判活與 log 沿用既有機制（`--wait` 保住
+  pid 判活、exit sentinel 不變、harvest 的 log 路徑逐字不變）。fail-fast 涵蓋模板／
+  shim／spool 未安裝、同名 instance 已在跑、spec 寫入失敗，一律 `DiagnosticReason`
+  fail-closed 且**不退回其他模式**。`direct` 與 `systemd-run` 逐字不變。
+  **誠實邊界**：`PSC_JOB_RUNNER` 預設仍是 `direct`，template 模式生效需 Phase 2b 安裝。
+  詳見 `changelog.d/ab-template-job-runner.md`。新增
+  `tests/test_trust_root_job_template_ab.py`（80 測試）。
+
+### Fixed
+- **#584 順修（#614 runbook 實測發現的兩個 permgen 缺口）**——(a) 帳號 HOME／cache
+  改由帳號名機械導出（`PathLayout.home_of()`／`cache_of()`），不再是二分時代的字面量
+  `/var/lib/cortex-svc`：三分下 Manager 的 `Environment=HOME=` 原本會指向一個沒人擁有
+  的目錄；(b) `scaffold_directories()` 改由 `scheme.headless_accounts()` 導出帳號清單，
+  `cortex-reviewer-planner` 的 HOME／cache／`~/.codex` 因此自動入列（原本靠列舉，漏了
+  三分才出現的第三個帳號）。runbook 的手動補行 workaround 可移除。另修
+  `preflight_systemd_run()` 的 `which` seam：預設值原本在 def 時就綁定 `shutil.which`，
+  `mock.patch.object` 打不到，測試實際驗到的是「本機有沒有那個帳號」而非它宣稱的分支。
+
 ### Changed
 - **#584 / trust-root Phase 2b runbook：A／B 兩案並列收斂為 A+B 單一路徑（docs-only）**
   ——落實 operator 0816 第三輪裁決。polkit 的 `manage-units` 只暴露 unit 名與 verb、

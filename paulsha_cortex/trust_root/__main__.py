@@ -7,24 +7,31 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root selfcheck   # R3 自檢診斷（JSON）
     python -m paulsha_cortex.trust_root registry    # R1 登記表摘要（JSON）
     python -m paulsha_cortex.trust_root equation     # R1 雙向等式結果
-    python -m paulsha_cortex.trust_root permissions [two-way|three-way] [--commands] [--paths]
+    python -m paulsha_cortex.trust_root permissions [three-way|two-way] [--commands] [--paths]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
-    python -m paulsha_cortex.trust_root unit [two-way|three-way]
+    python -m paulsha_cortex.trust_root unit [three-way|two-way]
                                         [--manager|--job|--job-properties]
                                                     # Phase 2b systemd unit 內容
                                                     # （--job-properties＝方案 A 的
                                                     #   systemd-run --property= 清單）
-    python -m paulsha_cortex.trust_root polkit [two-way|three-way] [--transient|--template]
+    python -m paulsha_cortex.trust_root shim [three-way|two-way]
+                                                    # Phase 2b 方案 B 的降權 shim 內容
+                                                    # （模板 unit 的固定 ExecStart=）
+    python -m paulsha_cortex.trust_root polkit [three-way|two-way] [--template|--transient]
                                                     # Phase 2b 降權 polkit 規則內容
-                                                    # （--transient＝方案 A，預設；
-                                                    #   --template＝方案 B）
-    python -m paulsha_cortex.trust_root scaffold [two-way|three-way]
+                                                    # （--template＝方案 B，**預設**；
+                                                    #   --transient＝方案 A，對照用）
+    python -m paulsha_cortex.trust_root scaffold [three-way|two-way]
                                                     # Phase 2b 骨架目錄的 install -d 命令
 
-`permissions`／`unit`／`polkit`／`scaffold` 只**產生**計畫與內容字串，**絕不執行**
-任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook 中手動
-sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對路徑
-輸出（0816 裁決：/var/lib/cortex ＋ /opt/cortex），不再帶 placeholder。
+UID 方案未指定時一律用 **`three-way`**（operator 0816 第三輪裁決 A 的定案：
+`cortex-manager`／`cortex-reviewer-planner`／`cortex-builder`）。`two-way` 保留為
+向後相容選項，需**顯式**打出——打錯字不會靜默退回較寬鬆的方案。
+
+`permissions`／`unit`／`shim`／`polkit`／`scaffold` 只**產生**計畫與內容字串，
+**絕不執行**任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook
+中手動 sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對
+路徑輸出（0816 裁決：/var/lib/cortex ＋ /opt/cortex），不再帶 placeholder。
 """
 from __future__ import annotations
 
@@ -89,7 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if result.ok else 1
     if command == "permissions":
         rest = args[1:]
-        scheme_id = "two-way"
+        scheme_id = permgen.DEFAULT_SCHEME_ID
         want_commands = False
         want_paths = False
         for token in rest:
@@ -112,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "unit":
         rest = args[1:]
-        scheme_id = "two-way"
+        scheme_id = permgen.DEFAULT_SCHEME_ID
         which = "manager"
         for token in rest:
             if token == "--manager":
@@ -142,10 +149,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(unit.content, end="")
         return 0
+    if command == "shim":
+        rest = args[1:]
+        scheme_id = permgen.DEFAULT_SCHEME_ID
+        for token in rest:
+            if token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown shim arg: {token}", file=sys.stderr)
+                return 2
+        shim = permgen.build_job_shim(permgen.SCHEMES[scheme_id])
+        print(shim.content, end="")
+        return 0
     if command == "polkit":
         rest = args[1:]
-        scheme_id = "two-way"
-        plan = permgen.PolkitPlan.TRANSIENT
+        scheme_id = permgen.DEFAULT_SCHEME_ID
+        # 0816 第三輪裁決：方案 B（root-owned 模板 unit）定案，故為預設。
+        plan = permgen.PolkitPlan.TEMPLATE
         for token in rest:
             if token == "--transient":
                 plan = permgen.PolkitPlan.TRANSIENT
@@ -161,7 +181,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "scaffold":
         rest = args[1:]
-        scheme_id = "two-way"
+        scheme_id = permgen.DEFAULT_SCHEME_ID
         for token in rest:
             if token in permgen.SCHEMES:
                 scheme_id = token

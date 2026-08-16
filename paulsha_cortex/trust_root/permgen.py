@@ -9,26 +9,36 @@ spec §R10 Phase 2 第 2 條要求「目錄 owner／mode **由 R1 登記表產�
 **本模組純為產生器：只回傳資料與字串，絕不執行任何 root 操作、不 chown、不 chmod、
 不建 UID。** 命令字串供 operator 在 runbook 中手動 `sudo` 執行。
 
-## UID 方案的參數化（operator 0816 裁決：路線 A、Manager 專屬 UID、現階段先二分、
-## 但保留「二往三分」彈性）
+## UID 方案的參數化（operator 0816 **第三輪**裁決：三分定案，二分保留為向後相容選項）
 
 `UidScheme` 把每個 `Principal` 映射到具體 OS 帳號名，並指定：
 - `durable_state_owner`：擁有 Manager-owned durable state 樹的帳號；
 - `deploy_account`：enforcement plane（部署面）的擁有者（root／部署帳號）。
 
-**二分**（預設，`TWO_WAY_SCHEME`）：只有兩個 headless-相關帳號——
-`cortex-builder`（builder）與 `cortex-svc`（Manager＋reviewer＋planner＋monitor
-共用，且即 durable state owner）。reviewer 與 builder 因此落在互不可寫的不同帳號
-（滿足 spec §R2 對 independence 的最低要求）。
+**三分**（**定案**，`THREE_WAY_SCHEME`＝:data:`DEFAULT_SCHEME`）：三個帳號——
+`cortex-manager`（Manager＋monitor，durable state owner，**持 spawn 授權但不跑任何
+模型程式碼**）／`cortex-reviewer-planner`（reviewer＋planner 的模型 job）／
+`cortex-builder`（builder 的模型 job）。裁決的判準是 **「injection 可達的任何進程都
+不得持有 spawn 授權」**：二分下 reviewer／planner 與 Manager 併帳，任一被 prompt
+injection 攻陷即取得 polkit 的 start 授權；三分把模型執行面整個移出授權帳號。
 
-**三分**（`THREE_WAY_SCHEME`）：把 `cortex-svc` 拆為 `cortex-manager`（僅 Manager／
-monitor，且為 durable state owner）與 `cortex-reviewer-planner`（reviewer＋planner
-的 job 帳號，**不**擁有 durable state）。這實現裁決要保留的「未來把 Manager 拆成
-第三個 UID」彈性——**只換 config，不改本模組任何一行程式碼**。
+**二分**（`TWO_WAY_SCHEME`，向後相容）：`cortex-builder`＋`cortex-svc`（Manager＋
+reviewer＋planner＋monitor 共用）。保留是為了讓已按二分裝好的部署不必一次到位，
+**不是**新部署的建議值。
 
 兩個方案套用**同一套 policy 函式**，因此都能對登記表每一項產出一致（滿足同一組
 不變式）的權限集合：Manager-owned／deployment 樹對任何 headless 帳號皆不可寫，
-job-visible 樹由對應 job 帳號寫、跨 persona 互不可寫。
+job-visible 樹由對應 job 帳號寫、跨 persona 互不可寫。全部既有不變式測試對兩案
+逐一參數化跑（`tests/test_trust_root_permgen_p2a.py`／`_p2b.py` 的 `ALL_SCHEMES`）。
+
+## 降權機制（0816 第三輪裁決 A+B）
+
+- **A**＝上述三分。
+- **B**＝root-owned 模板 unit：`build_job_unit()` 產出 `cortex-job@.service`，
+  `User=` 硬寫死；`build_polkit_rule(plan=TEMPLATE)`（**預設**）只放行該模板實例的
+  start／stop。per-job 參數走 Manager-owned spec spool（登記表資產 `job-spec-spool`），
+  由 `build_job_shim()` 產出的 root-owned shim 讀取後 exec。
+- C（Manager 端封閉 argv 產生器）自動保留為第三層，見 `coordinator/job_runner.py`。
 """
 from __future__ import annotations
 
@@ -98,7 +108,9 @@ class UidScheme:
         return frozenset(accts)
 
 
-#: 二分（預設）：builder 一個帳號，其餘 headless／Manager／monitor 共用 cortex-svc。
+#: 二分（**向後相容選項**，非預設）：builder 一個帳號，其餘 headless／Manager／
+#: monitor 共用 cortex-svc。0816 第三輪裁決前的方案；已按此裝好的部署可續用，
+#: 但新部署一律走 :data:`DEFAULT_SCHEME`（三分）。
 TWO_WAY_SCHEME = UidScheme(
     scheme_id="two-way",
     account_of={
@@ -114,9 +126,9 @@ TWO_WAY_SCHEME = UidScheme(
     deploy_account="root",
 )
 
-#: 三分：把 cortex-svc 拆成 cortex-manager（durable state owner）與
-#: cortex-reviewer-planner（reviewer＋planner 的 job 帳號，不持有 durable state）。
-#: **與二分共用同一套 policy，僅換 config。**
+#: 三分（**定案**）：把 cortex-svc 拆成 cortex-manager（durable state owner，持 spawn
+#: 授權、不跑模型）與 cortex-reviewer-planner（reviewer＋planner 的模型 job 帳號，
+#: 不持有 durable state、不持 spawn 授權）。**與二分共用同一套 policy，僅換 config。**
 THREE_WAY_SCHEME = UidScheme(
     scheme_id="three-way",
     account_of={
@@ -136,6 +148,12 @@ SCHEMES: dict[str, UidScheme] = {
     TWO_WAY_SCHEME.scheme_id: TWO_WAY_SCHEME,
     THREE_WAY_SCHEME.scheme_id: THREE_WAY_SCHEME,
 }
+
+#: **定案方案**（0816 第三輪裁決 A）。CLI／產生器未指定 scheme 時一律用這個——
+#: 「預設就是最安全的那一個」是刻意的：要退回二分必須顯式打出 `two-way`，
+#: 打錯字不會靜默退回較寬鬆的方案（`SCHEMES` 查無即拒）。
+DEFAULT_SCHEME: UidScheme = THREE_WAY_SCHEME
+DEFAULT_SCHEME_ID: str = DEFAULT_SCHEME.scheme_id
 
 
 # ---------------------------------------------------------------------------
@@ -586,8 +604,15 @@ class PathLayout:
     worktree_root: str = "/var/lib/cortex/worktree"
     deploy_root: str = "/opt/cortex"
     instance: str = "cortex"
-    svc_home: str = "/var/lib/cortex-svc"
-    builder_home: str = "/var/lib/cortex-builder"
+    #: 服務／job 帳號 HOME 的父目錄。**每個帳號的 HOME 由帳號名機械導出**
+    #: （`home_of()`），不再是寫死的字面量——寫死會在換 scheme 時漂移：三分的
+    #: Manager 帳號是 `cortex-manager`，HOME 卻還指著二分時代的 `/var/lib/cortex-svc`，
+    #: unit 的 `Environment=HOME=` 與 scaffold 因此指向一個沒人擁有的目錄。
+    home_root: str = "/var/lib"
+    #: builder 的帳號名。只給 `asset_paths()` 用（`codex-hooks` 掛在 builder HOME 下），
+    #: 因為 `asset_paths()` 刻意不吃 scheme——兩個 scheme 對 BUILDER 的映射相同。
+    #: 其餘所有帳號相關路徑一律由 scheme 現場導出。
+    builder_account: str = "cortex-builder"
     #: per-job 路徑的 segment；system unit 模板用 `%i`（systemd instance 名）。
     job_segment: str = PER_JOB_SEGMENT
 
@@ -627,9 +652,24 @@ class PathLayout:
         return f"{self.agents_root}/runtime/dispatch"
 
     @property
-    def job_spool_root(self) -> str:
-        """Manager 寫、job 只讀的 per-job 執行規格（`<id>/run.sh`）。"""
-        return f"{self.agents_root}/jobs"
+    def job_spec_spool_root(self) -> str:
+        """Manager 寫、job 只讀的 per-job 執行規格（`<unit-instance-id>.json`）。
+
+        路徑與 `config.paths.job_spec_spool_root()` 是**成對契約**（登記表資產
+        `job-spec-spool`），由 `asset_paths()` 而非本 property 供給權限計畫；本
+        property 只是給 unit／shim 產生器引用的同一份字面量。
+        """
+        return f"{self.coordinator_root}/job-specs"
+
+    @property
+    def bin_root(self) -> str:
+        """部署樹的可執行檔目錄（root-owned）——降權 shim 住這裡。"""
+        return f"{self.deploy_root}/bin"
+
+    @property
+    def job_shim(self) -> str:
+        """降權 job 模板 unit 的固定 `ExecStart=`（root-owned，內容由 permgen 產）。"""
+        return f"{self.bin_root}/cortex-job-shim"
 
     @property
     def venv_root(self) -> str:
@@ -643,13 +683,26 @@ class PathLayout:
     def env_file(self) -> str:
         return f"{self.deploy_root}/etc/{self.instance}-manager.env"
 
+    # -- 帳號→HOME／cache（由帳號名機械導出，換 scheme 不會漂移）-------------
+    def home_of(self, account: str) -> str:
+        """該帳號的 HOME。HOME 本身 root-owned（見 `scaffold_directories`）。"""
+        return f"{self.home_root}/{account}"
+
+    def cache_of(self, account: str) -> str:
+        """該帳號 HOME 底下唯一可寫的那一層（git／gh／uv 的 cache）。"""
+        return f"{self.home_of(account)}/cache"
+
+    def codex_hooks_dir_of(self, account: str) -> str:
+        """該帳號的 `~/.codex`。root-owned——job 不得替換自己的 hooks。"""
+        return f"{self.home_of(account)}/.codex"
+
     @property
-    def svc_cache(self) -> str:
-        return f"{self.svc_home}/cache"
+    def builder_home(self) -> str:
+        return self.home_of(self.builder_account)
 
     @property
     def builder_cache(self) -> str:
-        return f"{self.builder_home}/cache"
+        return self.cache_of(self.builder_account)
 
     def with_job_segment(self, segment: str) -> "PathLayout":
         """換掉 per-job segment（system unit 模板用 `%i`）。"""
@@ -658,8 +711,8 @@ class PathLayout:
             worktree_root=self.worktree_root,
             deploy_root=self.deploy_root,
             instance=self.instance,
-            svc_home=self.svc_home,
-            builder_home=self.builder_home,
+            home_root=self.home_root,
+            builder_account=self.builder_account,
             job_segment=segment,
         )
 
@@ -699,6 +752,8 @@ class PathLayout:
             "review-verdict": f"{job}/.psc-review-verdict.json",
             # Phase 2a 受控通道（PR #599）：<coordinator>/review-verdicts/<reviewer_job_id>/
             "review-verdict-spool": f"{c}/review-verdicts",
+            # Phase 2b 方案 B（0816 第三輪 A+B）：模板 unit 的 per-job 執行規格。
+            "job-spec-spool": self.job_spec_spool_root,
             "verification-evidence": f"{c}/evidence/verification",
             "maintainer-attestation": f"{c}/evidence/maintainer-review",
             "completion-record": f"{c}/evidence/completion",
@@ -727,13 +782,29 @@ class PathLayout:
         rename 子物件，因此把 root-owned 檔放進 svc-owned 目錄等於沒保護。
         """
         svc = scheme.durable_state_owner
-        builder = scheme.resolve(Principal.BUILDER) or "cortex-builder"
         root = scheme.deploy_account
         g = scheme.group_of
+        # 每個 scheme 解析得到的帳號都要有 HOME／cache——**由 scheme 導出，不是列舉**。
+        # 二分下這是 {cortex-svc, cortex-builder}（與改動前逐字相同）；三分下自動多出
+        # `cortex-reviewer-planner`，不必在這裡補一行（補一行正是上一版漏掉它的原因）。
+        service_accounts = [svc] + sorted(scheme.headless_accounts() - {svc})
+        # 跑模型的 job 帳號還要一個 root-owned 的 ~/.codex（hooks 不得被 job 替換）。
+        job_accounts = sorted(scheme.headless_accounts() - {svc})
+        account_dirs: list[tuple[str, str, str, int]] = []
+        for account in service_accounts:
+            account_dirs.append((self.home_of(account), root, g(root), 0o755))
+            if account in job_accounts:
+                account_dirs.append(
+                    (self.codex_hooks_dir_of(account), root, g(root), 0o755)
+                )
+            account_dirs.append((self.cache_of(account), account, g(account), 0o700))
         return (
             # 部署樹（enforcement plane）：全 root，對 svc／builder 唯讀。
             (self.deploy_root, root, g(root), 0o755),
             (f"{self.deploy_root}/etc", root, g(root), 0o755),
+            # 降權 shim 的家：root-owned、對 svc／job 唯讀。模板 unit 的 ExecStart=
+            # 指向這裡，因此持 spawn 授權的帳號也改不了 job 實際執行的第一支程式。
+            (self.bin_root, root, g(root), 0o755),
             (self.venv_root, root, g(root), 0o755),
             # durable state 樹的 root-owned 骨架（svc 不得 relink 這幾層）。
             (f"{self.agents_root}/config", root, g(root), 0o755),
@@ -742,34 +813,33 @@ class PathLayout:
             # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
             (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
             (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
-            # job spool：svc 寫 run.sh，job 帳號只 traverse＋讀（0711 不可列目錄）。
-            (self.job_spool_root, svc, g(svc), 0o711),
-            # 服務帳號 HOME：root 擁有（job 不得替換自己的 ~/.codex），只開 cache 子目錄。
-            (self.svc_home, root, g(root), 0o755),
-            (self.svc_cache, svc, g(svc), 0o700),
-            (self.builder_home, root, g(root), 0o755),
-            (f"{self.builder_home}/.codex", root, g(root), 0o755),
-            (self.builder_cache, builder, g(builder), 0o700),
+            # job spec spool 不在此列：它已是登記表資產（`job-spec-spool`），權限由
+            # `plan_to_commands()` 依登記表機械產出（owner-only ＋ job 帳號唯讀 ACL），
+            # 在骨架再寫一次會變成第二份真相。
+            # 服務／job 帳號 HOME：root 擁有（job 不得替換自己的 ~/.codex），只開
+            # cache 子目錄。清單由 scheme 導出，見上方 `account_dirs`。
+            *account_dirs,
         )
 
     # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
-    def manager_extra_write_paths(self) -> tuple[ExtraWritePath, ...]:
+    def manager_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
+        # 註：job spec spool 曾經是這裡的一條 extra（`<agents_root>/jobs/<id>/run.sh`）。
+        # 0816 第三輪 A+B 把它升格為登記表資產 `job-spec-spool`，因此改由
+        # `required_write_targets()` 機械導出——例外通道少一條，等式多涵蓋一項。
         return (
             ExtraWritePath(
-                self.job_spool_root,
-                "Manager 寫 per-job 執行規格（<id>/run.sh）供降權 job 讀取；job 帳號唯讀。",
-            ),
-            ExtraWritePath(
-                self.svc_cache,
-                "服務帳號 HOME 快取（git/gh/uv）；HOME 本身 root-owned，只開這一層。",
+                self.cache_of(account),
+                f"服務帳號 {account} 的 HOME 快取（git/gh/uv）；HOME 本身 root-owned，只開這一層。",
             ),
         )
 
-    def job_extra_write_paths(self) -> tuple[ExtraWritePath, ...]:
+    def job_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
+        # 帳號由呼叫端（`build_job_unit` 的 principal）給：M2 要為 reviewer/planner
+        # 開第二個模板 unit 時，這裡不必改一行——換 principal 即換帳號。
         return (
             ExtraWritePath(
-                self.builder_cache,
-                "job 帳號 HOME 快取（git/gh/uv）；HOME 與 ~/.codex 皆 root-owned 不可替換。",
+                self.cache_of(account),
+                f"job 帳號 {account} 的 HOME 快取（git/gh/uv）；HOME 與 ~/.codex 皆 root-owned 不可替換。",
             ),
         )
 
@@ -910,6 +980,25 @@ _HARDENING: tuple[tuple[str, str, str], ...] = (
 )
 
 
+def job_unit_stem(
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    principal: Principal = Principal.BUILDER,
+) -> str:
+    """降權 job 模板 unit 的字幹（不含 `@.service`）。
+
+    **M2（#615，reviewer/planner 啟動面降權）的擴充點就是這裡。** 現階段只有
+    builder 走模板，字幹是 `cortex-job`（與 `coordinator/job_runner`
+    的 `TEMPLATE_UNIT_PREFIX` ＋ polkit pattern 成對契約）。要開第二個模板實例時
+    只需傳入另一個 `principal`：unit 名、`User=`、`Environment=HOME=`／
+    `XDG_CACHE_HOME=`、`ReadWritePaths=` 全部跟著 scheme 導出，`build_job_unit()`／
+    `build_polkit_rule()`／`build_job_shim()` 三支產生器**一行都不必改**。
+    """
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    if principal is Principal.BUILDER:
+        return f"{layout.instance}-job"
+    return f"{layout.instance}-{principal.value}-job"
+
+
 @dataclass(frozen=True)
 class SystemdUnit:
     """產生出來的 unit：**只有內容字串與結構化欄位，沒有任何寫檔／執行**。"""
@@ -964,7 +1053,7 @@ def build_manager_unit(
     plan = plan or generate_plan(scheme)
     account = scheme.durable_state_owner
     group = scheme.group_of(account)
-    extras = layout.manager_extra_write_paths()
+    extras = layout.manager_extra_write_paths(account)
     owners = read_write_path_owners(plan, layout, account, extras)
     unit_name = f"{layout.instance}-manager.service"
 
@@ -995,8 +1084,9 @@ def build_manager_unit(
         "# MUST NOT 靜默落回 $HOME/.agents 預設（spec §R3 Scenario「刪除 EnvironmentFile」）。",
         f"EnvironmentFile={layout.env_file}",
         "# HOME 由 unit 指定；HOME 本身 root-owned，只有 cache 子目錄可寫。",
-        f"Environment=HOME={layout.svc_home}",
-        f"Environment=XDG_CACHE_HOME={layout.svc_cache}",
+        "# 路徑由帳號名導出（`layout.home_of`）——換 scheme 時不會停在舊帳號的樹上。",
+        f"Environment=HOME={layout.home_of(account)}",
+        f"Environment=XDG_CACHE_HOME={layout.cache_of(account)}",
         "",
         "# --- 加固（spec §R3；逐項附理由供審查）---",
     ]
@@ -1033,6 +1123,19 @@ def build_job_unit(
     這是降權/提權分界線的另一半：`User=` 在 root-owned 的 unit 檔裡**硬寫死**，
     呼叫端（Manager）只能給 instance 名，**無法選擇 UID、無法夾帶任何屬性**。
     polkit 規則只放行這個模板的實例（見 `build_polkit_rule`）。
+
+    `ExecStart=` 同樣固定：永遠是 root-owned 的 shim（`build_job_shim()` 產出），
+    per-job 的命令／worktree／env／log 路徑改由 Manager-owned 的 spec spool
+    （登記表資產 `job-spec-spool`）傳遞，shim 讀完才 exec。
+
+    **為什麼不用 `StandardOutput=append:<log>`**：`file:`／`append:` 的目標檔是由
+    **PID 1（root）** 在降權之前開啟的；路徑裡只要有任何一段由 Manager 帳號掌控
+    （spec spool 或 log 目錄都是），Manager 就能在該位置放一個 symlink 讓 root 對
+    任意檔案 append——那是把「Manager 不具 root」這條裁決整個賣掉。模板是**單一
+    靜態檔**、per-job 的 log 路徑又必須維持 harvest 既有的
+    `<log_dir>/<slice>.jsonl`（`%i` 推不出來），兩者無法同時成立。因此 log 導引改由
+    **shim 在已降權之後**依 spec 的 `log_path` 自行接管（見 `coordinator/job_shim.py`），
+    unit 這層只留 journal 給 shim 讀 spec 失敗時的診斷。
     """
     plan = plan or generate_plan(scheme)
     account = scheme.resolve(principal)
@@ -1041,9 +1144,9 @@ def build_job_unit(
     group = scheme.group_of(account)
     # per-job 路徑在模板 unit 中以 systemd 的 %i 表示。
     job_layout = layout.with_job_segment("%i")
-    extras = job_layout.job_extra_write_paths()
+    extras = job_layout.job_extra_write_paths(account)
     owners = read_write_path_owners(plan, job_layout, account, extras)
-    unit_name = f"{layout.instance}-job@.service"
+    unit_name = f"{job_unit_stem(layout, principal)}@.service"
 
     body = [
         f"# {'/etc/systemd/system/' + unit_name}",
@@ -1063,15 +1166,24 @@ def build_job_unit(
         f"User={account}",
         f"Group={group}",
         "",
-        "# 執行規格由 Manager 寫入 job spool（svc-owned，job 帳號唯讀）：",
+        "# ExecStart 也是固定的：永遠是 root-owned 的 shim，呼叫端連命令列都給不了。",
+        "# per-job 執行規格由 Manager 原子寫入 spec spool（Manager-owned，job 帳號唯讀）：",
+        f"#   {job_layout.job_spec_spool_root}/%i.json",
         "# job 因此無法改寫自己的命令列，也無法為下一個 job 埋伏。",
-        f"ExecStart=/bin/sh {job_layout.job_spool_root}/%i/run.sh",
-        f"WorkingDirectory={job_layout.worktree_root}/%i",
+        f"ExecStart={job_layout.job_shim} %i",
+        "# 工作目錄：shim 會依 spec 的 working_directory 再 chdir 到該 job 的 worktree；",
+        "# 這裡只給恆存在的 pool 根（0701＝可 traverse、不可列目錄），避免 unit 因",
+        "# per-job 目錄尚未建立而在 exec 前就失敗（那會讓 log 裡沒有任何線索）。",
+        f"WorkingDirectory={job_layout.worktree_root}",
+        "# shim 讀 spec 的唯一合法來源：這一行在 root-owned 的 unit 檔裡，",
+        "# 因此持 spawn 授權的帳號也改不掉 spec 要從哪個目錄讀。shim 對未設此",
+        "# 變數的情況 fail-closed（不猜、不落回 $HOME 推導的預設）。",
+        f"Environment=PSC_JOB_SPEC_SPOOL={job_layout.job_spec_spool_root}",
         "# job 永不取得 gh token：GitHub 寫入由 Manager 代理（D1 outbox）。",
         "Environment=GH_TOKEN=",
         "Environment=GITHUB_TOKEN=",
-        f"Environment=HOME={job_layout.builder_home}",
-        f"Environment=XDG_CACHE_HOME={job_layout.builder_cache}",
+        f"Environment=HOME={job_layout.home_of(account)}",
+        f"Environment=XDG_CACHE_HOME={job_layout.cache_of(account)}",
         "",
         "# --- 加固（與 Manager 同一套；job 這側只多不少）---",
     ]
@@ -1083,6 +1195,10 @@ def build_job_unit(
         "# job 為一次性：結束即回收 unit 狀態，不留可被重用的殘骸。",
         "CollectMode=inactive-or-failed",
         "Restart=no",
+        "# 刻意**不**用 StandardOutput=append:<log>——那個檔由 PID 1（root）在降權前開啟，",
+        "# 路徑中只要有一段由 Manager 帳號掌控就成了 root-follows-symlink 的提權面。",
+        "# job 的 JSONL log 由 shim 在**已降權之後**依 spec 的 log_path 自行接管；",
+        "# 這裡的 journal 只承接 shim 讀 spec 失敗（尚未接管前）的診斷輸出。",
         "StandardOutput=journal",
         "StandardError=journal",
     ]
@@ -1090,9 +1206,97 @@ def build_job_unit(
         unit_name=unit_name,
         install_path=f"/etc/systemd/system/{unit_name}",
         account=account,
-        exec_start=f"/bin/sh {job_layout.job_spool_root}/%i/run.sh",
+        exec_start=f"{job_layout.job_shim} %i",
         environment_file=None,
         read_write_paths=tuple(owners.keys()),
+        content="\n".join(body) + "\n",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 降權 shim（root-owned，模板 unit 的固定 ExecStart）
+# ---------------------------------------------------------------------------
+
+#: shim 真正的實作模組。**刻意不是 heredoc 產出的一大段程式碼**：shim 要做的事
+#: （驗 instance 名／驗 spec 檔不是 symlink／驗 schema／接管 log／chdir／execve）
+#: 每一條都是可測的邏輯，塞進字串就只剩「字串比對」這種驗收方式。把邏輯放進
+#: repo 內的模組，它跟其他程式碼一樣被單元測試、被 lint、被 review；permgen 只
+#: 產出那支 3 行的 root-owned 啟動 stub。兩者都落在 root-owned 的部署樹裡，
+#: 「job 改不了自己執行的第一支程式」這條性質完全不變。
+JOB_SHIM_MODULE = "paulsha_cortex.coordinator.job_shim"
+
+
+@dataclass(frozen=True)
+class ShimScript:
+    """產生出來的 shim stub：**只有內容字串**，本模組不寫任何系統路徑。"""
+
+    install_path: str
+    interpreter: str
+    module: str
+    mode: int
+    owner: str
+    group: str
+    content: str
+
+    @property
+    def mode_str(self) -> str:
+        return format(self.mode, "04o")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "install_path": self.install_path,
+            "interpreter": self.interpreter,
+            "module": self.module,
+            "mode": self.mode_str,
+            "owner": self.owner,
+            "group": self.group,
+            "content": self.content,
+        }
+
+    def commands(self) -> list[str]:
+        """安裝命令字串（**只回傳字串，不執行**）。"""
+        return [
+            f"chown {self.owner}:{self.group} {self.install_path}",
+            f"chmod {self.mode_str} {self.install_path}",
+        ]
+
+
+def build_job_shim(
+    scheme: UidScheme = DEFAULT_SCHEME,
+    layout: PathLayout = DEFAULT_LAYOUT,
+) -> ShimScript:
+    """產生 `<deploy_root>/bin/cortex-job-shim` 的內容（root-owned 啟動 stub）。
+
+    stub 只做一件事：以部署 venv 的 interpreter 執行 :data:`JOB_SHIM_MODULE`，把
+    模板 unit 傳進來的 `%i`（instance 名）原封不動交過去。**不解析參數、不組命令、
+    不碰 spec 檔**——所有判斷都在那個模組裡，這裡沒有可被注入的表面。
+
+    interpreter 寫成部署 venv 的絕對路徑而不是 `/usr/bin/env python3`：後者會走
+    job 帳號的 `PATH`，等於讓 job 決定用哪個 interpreter 執行 root-owned 的 shim。
+    """
+    account = scheme.deploy_account
+    interpreter = f"{layout.venv_root}/bin/python3"
+    body = [
+        "#!/bin/sh",
+        f"# {layout.job_shim}",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root shim {scheme.scheme_id}",
+        "#",
+        "# root-owned、mode 0755：Manager 與 job 帳號皆唯讀。這是模板 unit 固定的",
+        f"# ExecStart=，因此持 spawn 授權的帳號也換不掉 job 執行的第一支程式。",
+        "#",
+        f"# $1 ＝ systemd 模板實例名（%i）。spec 由此推導：",
+        f"#   {layout.job_spec_spool_root}/$1.json（Manager 寫、job 唯讀）",
+        "set -eu",
+        f'exec "{interpreter}" -m {JOB_SHIM_MODULE} "$@"',
+    ]
+    return ShimScript(
+        install_path=layout.job_shim,
+        interpreter=interpreter,
+        module=JOB_SHIM_MODULE,
+        mode=0o755,
+        owner=account,
+        group=scheme.group_of(account),
         content="\n".join(body) + "\n",
     )
 
@@ -1108,17 +1312,18 @@ POLKIT_ALLOWED_VERBS: tuple[str, ...] = ("start", "stop")
 
 
 class PolkitPlan(Enum):
-    """降權的兩個方案（operator 待拍板；兩案都完整產出，選了即可執行）。
+    """降權的兩個方案。**0816 第三輪裁決：B 定案**（`TEMPLATE` 為預設）。
 
-    - `TRANSIENT`（A）：Manager 以 `systemd-run` 起 transient unit（#603 的
-      `coordinator/job_runner.py` 已落地，`PSC_JOB_RUNNER=systemd-run` 開啟）。
-      polkit 能收窄的**只有**呼叫者 UID ＋ unit 名前綴；`User=`／`--uid=` **不在**
-      polkit detail 內，故「只能降到 job 帳號」這一半由 Manager 端封閉的 argv
-      產生器在 code level 保證，OS 層未強制（殘餘風險見 `plan_residual_risk`）。
-    - `TEMPLATE`（B）：root-owned 模板 unit（`<instance>-job@.service`）把 `User=`
-      硬寫死，polkit 只放行該模板的實例。**「降到哪個帳號」因此由 OS 強制**；
-      代價是 Manager 端要從 `systemd-run` 改成 `systemctl start <instance>-job@<id>`，
-      屬程式碼後續工項。
+    - `TEMPLATE`（B，**定案／預設**）：root-owned 模板 unit（`<instance>-job@.service`）
+      把 `User=` 與 `ExecStart=` 都硬寫死，polkit 只放行該模板的實例。**「降到哪個
+      帳號」「執行哪支程式」因此都由 OS 強制**，`plan_residual_risk()` 回傳空 tuple。
+      Manager 端對應的啟動器模式是 `PSC_JOB_RUNNER=systemd-template`
+      （`coordinator/job_runner.py`）。
+    - `TRANSIENT`（A，保留為對照／過渡）：Manager 以 `systemd-run` 起 transient unit
+      （`PSC_JOB_RUNNER=systemd-run`）。polkit 能收窄的**只有**呼叫者 UID ＋ unit 名
+      前綴；`User=`／`--uid=` **不在** polkit detail 內（#603 實測），故「只能降到 job
+      帳號」這一半只能由 Manager 端封閉的 argv 產生器在 code level 保證——那正是本次
+      改採 B 案的原因，殘餘風險見 `plan_residual_risk`。
     """
 
     TRANSIENT = "transient"
@@ -1173,12 +1378,14 @@ def transient_unit_prefix(layout: "PathLayout") -> str:
 def job_unit_pattern(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     plan: PolkitPlan = PolkitPlan.TEMPLATE,
+    principal: Principal = Principal.BUILDER,
 ) -> str:
-    """被授權的 unit 名 regex（錨定）。"""
+    """被授權的 unit 名 regex（錨定）。`principal` 是 M2 的第二實例化擴充點。"""
     layout = layout if layout is not None else DEFAULT_LAYOUT
     if plan is PolkitPlan.TRANSIENT:
         return r"^" + layout.instance + r"-job-[a-z0-9][a-z0-9._-]{0,62}\.service$"
-    return r"^" + layout.instance + r"-job@[a-z0-9][a-z0-9._-]{0,62}\.service$"
+    stem = job_unit_stem(layout, principal)
+    return r"^" + stem + r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"
 
 
 def plan_residual_risk(plan: PolkitPlan, scheme: UidScheme) -> tuple[str, ...]:
@@ -1212,7 +1419,7 @@ def plan_residual_risk(plan: PolkitPlan, scheme: UidScheme) -> tuple[str, ...]:
 def build_polkit_rule(
     scheme: UidScheme,
     layout: "PathLayout" = None,  # type: ignore[assignment]
-    plan: PolkitPlan = PolkitPlan.TRANSIENT,
+    plan: PolkitPlan = PolkitPlan.TEMPLATE,
     principal: Principal = Principal.BUILDER,
 ) -> PolkitRule:
     """產生降權授權的 polkit 規則內容（A／B 兩方案共用同一套產生邏輯）。
@@ -1225,7 +1432,7 @@ def build_polkit_rule(
     target = scheme.resolve(principal)
     if target is None:
         raise ValueError(f"principal 未映射到帳號: {principal}")
-    pattern = job_unit_pattern(layout, plan)
+    pattern = job_unit_pattern(layout, plan, principal)
     verbs = POLKIT_ALLOWED_VERBS
     verb_check = " && ".join(f'verb !== "{v}"' for v in verbs)
     residual = plan_residual_risk(plan, scheme)
@@ -1246,9 +1453,12 @@ def build_polkit_rule(
     else:
         headline = (
             f"// 方案 B（root-owned 模板 unit）：{svc} 只能 start/stop\n"
-            f"//   {layout.instance}-job@<id>.service 的實例。\n"
-            f"// 模板檔 /etc/systemd/system/{layout.instance}-job@.service 由 root 擁有，\n"
-            f"// 內容硬寫死 User={target}、NoNewPrivileges=yes、CapabilityBoundingSet=（空）。\n"
+            f"//   {job_unit_stem(layout, principal)}@<id>.service 的實例。\n"
+            f"// 模板檔 /etc/systemd/system/{job_unit_stem(layout, principal)}@.service 由 root 擁有，\n"
+            f"// 內容硬寫死 User={target}、NoNewPrivileges=yes、CapabilityBoundingSet=（空），\n"
+            f"// 以及固定的 ExecStart={layout.job_shim} %i（root-owned shim）。\n"
+            f"// per-job 參數走 Manager-owned spec spool（{layout.job_spec_spool_root}/<id>.json，\n"
+            f"// job 帳號唯讀）——{svc} 給得出參數，但給不出 UID、也給不出命令列。\n"
             f"// 因此 {svc} **無法選擇 job 的 UID**，也**無法夾帶任何特權屬性**：\n"
             + "\n".join(f"//     - {p}" for p in POLKIT_FORBIDDEN_PROPERTIES)
             + "\n"
@@ -1331,7 +1541,7 @@ def transient_unit_properties(
     job_layout = layout.with_job_segment("%i")
     props = [f"--property={key}={value}" for key, value, _why in _HARDENING]
     for rwp in read_write_paths(
-        plan, job_layout, account, job_layout.job_extra_write_paths()
+        plan, job_layout, account, job_layout.job_extra_write_paths(account)
     ):
         props.append(f"--property=ReadWritePaths={rwp}")
     return tuple(props)

@@ -1064,25 +1064,40 @@ class SubprocessLauncher:
             return False
         return env.get("PSC_REPO_ROOT") is not None
 
-    def _degraded_runner(self, env: Mapping[str, str]) -> bool:
-        """本次 launch 是否要走 Phase 2a 的降權啟動器（`systemd-run` transient unit）。
+    def _downgraded_mode(self, env: Mapping[str, str]) -> str | None:
+        """本次 launch 要走哪一種降權啟動器（皆非時回 None＝direct，行為不變）。
 
         兩個條件同時成立才降權：
 
-        1. `PSC_JOB_RUNNER=systemd-run`（部署期設定；預設 `direct`＝現行行為不變）。
+        1. `PSC_JOB_RUNNER` ∈ {`systemd-run`, `systemd-template`}（部署期設定；
+           預設 `direct`＝現行行為不變）。
         2. **這是 builder persona**——判定點與本檔既有的 persona 分支完全對齊
            （`_should_run_gates`／`launch()` 的 env 分支用的是同一組條件）：
            `review_only`＝reviewer、`read_only`＝planner，兩者皆非才是 builder。
 
-        operator 0816 裁決的二分 UID 方案裡，reviewer 與 planner 和 Manager 同帳號
-        （`cortex-svc`），因此**不經降權**；只有 builder 落到 `cortex-builder`。
+        `systemd-run`（A 案）與 `systemd-template`（B 案，0816 第三輪裁決）在
+        launcher 這一層共用**完全相同**的 env 白名單與 `bash -c` 決定，差別只在
+        「怎麼把這條命令交給 systemd」——A 案經 `systemd-run` 的 argv，B 案經
+        Manager-owned spec 檔 ＋ root-owned 模板 unit。
+
         `PSC_JOB_RUNNER` 的值即使非法，也在這裡 fail-closed（見
         `job_runner.resolve_runner_mode`），不會被靜默當成 direct。
         """
 
-        if job_runner.resolve_runner_mode(env) != job_runner.RUNNER_SYSTEMD_RUN:
-            return False
-        return not self._review_only and not self._read_only
+        mode = job_runner.resolve_runner_mode(env)
+        if mode not in (job_runner.RUNNER_SYSTEMD_RUN, job_runner.RUNNER_SYSTEMD_TEMPLATE):
+            return None
+        if self._review_only or self._read_only:
+            # 三分 UID 方案下 reviewer／planner 有自己的帳號（`cortex-reviewer-planner`），
+            # 但它們的降權是**部署面**的事（Manager 自己的 unit 不會 spawn 它們到
+            # builder 帳號）；本啟動器只負責 builder job，維持 #603 的既有判定。
+            return None
+        return mode
+
+    def _degraded_runner(self, env: Mapping[str, str]) -> bool:
+        """是否走任一種降權啟動器（`executor_environment` 的 env 分支用）。"""
+
+        return self._downgraded_mode(env) is not None
 
     def executor_environment(self, *, slice_id: str = "preflight"):
         """#262 D2：回報正式 job 會實際看到的 executor 環境。
@@ -1141,9 +1156,15 @@ class SubprocessLauncher:
         # 非法或 builder 帳號不存在時，本次派工必須在還沒改動任何狀態前就 fail-closed，
         # 而不是先做一半再退回 direct。
         runner_plan: job_runner.SystemdRunPlan | None = None
-        if self._degraded_runner(os.environ):
+        template_plan: job_runner.SystemdTemplatePlan | None = None
+        runner_mode = self._downgraded_mode(os.environ)
+        if runner_mode == job_runner.RUNNER_SYSTEMD_RUN:
             runner_plan = job_runner.prepare_systemd_run(os.environ, job_id=slice_id)
-        degraded = runner_plan is not None
+        elif runner_mode == job_runner.RUNNER_SYSTEMD_TEMPLATE:
+            # B 案（0816 第三輪裁決）：模板 unit／shim／spec spool 三個前置物任一
+            # 缺席都在這裡 fail-closed，且**在寫任何 spec 之前**。
+            template_plan = job_runner.prepare_systemd_template(os.environ, job_id=slice_id)
+        degraded = runner_mode is not None
         resolved_worktree = Path(worktree).resolve(strict=True)
         if not resolved_worktree.is_dir():
             raise ValueError("launcher worktree must be a directory")
@@ -1277,9 +1298,54 @@ class SubprocessLauncher:
             # stdin 顯式接 /dev/null（direct 模式今天仍把 daemon 的 stdin 交給 job，
             # 降權模式在這點上比 direct 更緊）。
             popen_kwargs["stdin"] = subprocess.DEVNULL
-        with open(log_path, "wb") as logf:
+        log_mode = "wb"
+        if template_plan is not None:
+            # B 案：per-job 參數走 Manager-owned spec 檔（job 帳號唯讀），不走 argv
+            # ——模板 unit 的 ExecStart= 是固定的，Manager 給不了命令列。
+            # `User=` 刻意**不在** spec 內：身分只有 root-owned unit 檔一個來源。
+            spec = job_runner.build_job_spec(
+                job_id=slice_id,
+                instance=template_plan.instance,
+                unit=template_plan.unit,
+                command=argv,
+                working_directory=worktree,
+                log_path=log_path,
+                env=env,
+            )
+            job_runner.write_job_spec(template_plan.spec_path, spec)
+            argv = job_runner.build_systemctl_start_argv(
+                systemctl=template_plan.binary, unit=template_plan.unit
+            )
+            # systemctl **client 自己**的環境（同 A 案的理由：polkit 授權可能要查
+            # 呼叫端 session）。它不會流進 unit——unit 的環境來自 root-owned 模板檔，
+            # job 的環境則來自 spec，由 shim 在 exec 時直接指定。
+            popen_kwargs["env"] = _git_scope_env()
+            # systemctl client 不進 worktree：job 的 cwd 由 shim 依 spec 的
+            # working_directory 設定。三分方案下 per-job worktree 已 chown 給 job
+            # 帳號，Manager 未必進得去，硬把 client 的 cwd 指過去只會多一個
+            # PermissionError 失敗面。
+            popen_kwargs["cwd"] = None
+            popen_kwargs["stdin"] = subprocess.DEVNULL
+            # log 由 shim 在降權後以 O_APPEND 接管（unit 沒有 --pipe、也刻意不用
+            # StandardOutput=append:，理由見 job_runner 模組 docstring）。這裡先把
+            # 上一輪殘留截掉，再以 append 開檔——否則 systemctl client 的非 O_APPEND
+            # fd 會在 shim 已經寫了幾 KB 之後從 offset 0 覆蓋回去。
+            Path(log_path).write_bytes(b"")
+            log_mode = "ab"
+        with open(log_path, log_mode) as logf:
             popen_kwargs["stdout"] = logf
             proc = subprocess.Popen(argv, **popen_kwargs)
+        if template_plan is not None:
+            # polkit 拒絕／模板未安裝／shim 讀 spec 失敗只在起動當下才知道；
+            # 確認不到就 fail-closed，**絕不**退回其他模式。
+            job_runner.confirm_template_instance_started(
+                process=proc,
+                sentinel=sentinel,
+                unit=template_plan.unit,
+                account=template_plan.account,
+                log_path=log_path,
+                timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
+            )
         if runner_plan is not None:
             # polkit 拒絕／unit 名衝突只在起動當下才知道；確認不到就 fail-closed，
             # **絕不**退回 direct（見 job_runner.confirm_transient_unit_started）。

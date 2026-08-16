@@ -64,6 +64,28 @@ def review_verdict_spool_root() -> Path:
     return coordinator_root() / REVIEW_VERDICT_SPOOL_DIRNAME
 
 
+#: `job_spec_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數是為了讓
+#: `coordinator/job_runner.py` 的 per-job 定址、`trust_root/permgen.py` 的 layout 與本
+#: resolver 共用同一個字面量（R1 登記表的「重複路徑推導」Scenario 要求單一真相）。
+JOB_SPEC_SPOOL_DIRNAME = "job-specs"
+
+
+def job_spec_spool_root() -> Path:
+    """trust-root Phase 2b 方案 B：降權 job 的 per-job 執行規格 spool 根。
+
+    operator 0816 第三輪裁決 **A+B**：builder job 改經 root-owned 的
+    `cortex-job@.service` 模板實例起跑。模板 unit 的 `ExecStart=` 是**固定的**
+    （`<deploy_root>/bin/cortex-job-shim %i`），因此「這個 job 要跑什麼命令、在哪個
+    worktree、帶哪些 env、log 寫去哪」必須由一個**帶外通道**傳遞——就是本 spool：
+    `<此根>/<unit-instance-id>.json`，Manager 原子寫入，job 帳號**唯讀**（permgen 依
+    R1 登記表產出 owner＝durable_state_owner、mode 0700 ＋ per-account 唯讀 ACL）。
+
+    這是「即使持 spawn 授權的帳號被攻陷也無法向上」的另一半：unit 檔 root-owned 改不了、
+    spec 檔 job 帳號寫不了，因此 job **既不能選 UID、也不能改寫自己的命令列**。
+    """
+    return coordinator_root() / JOB_SPEC_SPOOL_DIRNAME
+
+
 def specs_root() -> Path:
     return resolve_runtime_root("PSC_SPECS_ROOT")
 
