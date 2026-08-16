@@ -34,21 +34,42 @@ R1 是重構的**觀測期**，不是切換期：
   self-certification。:func:`resolve_card_satisfies` 是它的 deck-side adapter——
   有宣告用宣告、沒宣告則從 ``phase`` 推導。R1 完整驗證並單測這個 adapter，但
   **尚未**把它 projection 進 manifest（那是 R2 的責任契約）。
+
+## Go/No-Go 的讀端：aggregation reader
+
+R1 的 Go/No-Go 判準是「兩週 telemetry 中所有 disagreement 可解釋」，因此 sink
+本身不夠——還需要一支把整個 ``coverage-shadow/`` 目錄收斂成統計的**唯讀** reader：
+
+    python -m paulsha_cortex.coordinator.coverage --report [--json]
+
+:func:`build_shadow_report` 是它的純函式核心：總筆數／agreement 比例／
+disagreement 依 kind 分組（理論上只有 ``topology-fail-coverage-pass``）／每組的
+combo・task_slug・callsite 分佈與樣本明細（含 ``satisfied_by``，足供人工逐筆解釋）。
+單筆 JSON 壞損只跳過並計數，絕不炸掉整份報告——telemetry 是觀測資料，一顆壞檔讓
+Go/No-Go 讀不出來是完全不成比例的代價。
+
+reader 同時順帶做 **TTL 清掃**（:data:`DEFAULT_SHADOW_TTL_SECONDS`，預設 30 天，
+比照 D4 event spool 的 ``DEFAULT_EVENT_TTL_SECONDS`` 慣例）：**只在 reader 執行時
+清**，不引入任何常駐 daemon 邏輯。刪不掉（唯讀掛載、Phase 2 之後 Manager-owned
+樹對 operator 唯讀）時只計數不 raise，report 照樣讀得出來。
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from paulsha_cortex.config.paths import coverage_shadow_telemetry_root
 
@@ -436,3 +457,500 @@ def run_coverage_shadow(
     except Exception as error:  # noqa: BLE001 - shadow 絕不影響 production
         logger.debug("coverage shadow skipped after error: %s", error)
         return None
+
+
+# ---------------------------------------------------------------------------
+# aggregation reader ＋ retention（R1 Go/No-Go 的直接輸入）
+# ---------------------------------------------------------------------------
+
+#: 彙總報告的 schema 版本（獨立於單筆 telemetry 的 :data:`SHADOW_TELEMETRY_SCHEMA`）。
+SHADOW_REPORT_SCHEMA = "1"
+
+#: shadow telemetry 的預設保留期。比照 D4 event spool 的
+#: ``DEFAULT_EVENT_TTL_SECONDS``：TTL 只在 reader 執行時順帶清掃，不加常駐 daemon。
+DEFAULT_SHADOW_TTL_SECONDS = 30 * 86_400.0
+
+#: 每組 disagreement 預設附幾筆樣本明細（``0`` ＝全部）。
+DEFAULT_SAMPLE_LIMIT = 5
+
+#: 記錄缺 ``disagreement.kind``（舊 schema／半截資料）時的分組名。
+UNKNOWN_DISAGREEMENT_KIND = "unknown"
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """寬鬆解析 ISO-8601 時間戳；解析不出來回 ``None`` 而非 raise。
+
+    比 ``monitor/event_spool.py`` 的 :func:`parse_event_timestamp` 寬鬆一級：那邊是
+    寫入端契約（壞掉就該隔離），這邊是**唯讀 reader**，任何一筆解析不出來都只能降級
+    成「用檔案 mtime 判齡」，絕不能讓整份報告讀不出來。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _as_mapping(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _as_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _as_name(value: object) -> str:
+    """把任意欄位值收斂成分佈統計用的 key（缺漏／型別不對一律 ``-``）。"""
+    return value if isinstance(value, str) and value else "-"
+
+
+def _ranked(counter: Counter[str]) -> dict[str, int]:
+    """分佈計數的 canonical 排序：count 由大到小，同 count 依名稱字典序。"""
+    return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
+
+
+@dataclass(frozen=True)
+class DisagreementGroup:
+    """同一個 ``disagreement.kind`` 的全部記錄之彙總。
+
+    ``combos`` / ``task_slugs`` / ``callsites`` / ``missing_responsibilities`` 是分佈
+    計數（供「這族 disagreement 集中在哪些 manifest／呼叫點」的判讀），``samples`` 是
+    逐筆明細（供人工解釋單一案例）。
+    """
+
+    kind: str
+    count: int
+    combos: Mapping[str, int]
+    task_slugs: Mapping[str, int]
+    callsites: Mapping[str, int]
+    missing_responsibilities: Mapping[str, int]
+    samples: tuple[Mapping[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "count": self.count,
+            "combos": dict(self.combos),
+            "task_slugs": dict(self.task_slugs),
+            "callsites": dict(self.callsites),
+            "missing_responsibilities": dict(self.missing_responsibilities),
+            "samples": [dict(sample) for sample in self.samples],
+        }
+
+
+@dataclass(frozen=True)
+class ShadowReport:
+    """整個 ``coverage-shadow/`` 目錄的彙總——R1 Go/No-Go 判讀的單一輸入。"""
+
+    root: Path
+    generated_at: str
+    root_exists: bool
+    root_error: str | None
+    total: int
+    agreements: int
+    disagreements: int
+    groups: tuple[DisagreementGroup, ...]
+    corrupt: tuple[str, ...]
+    swept: tuple[str, ...]
+    sweep_failed: tuple[str, ...]
+    ttl_seconds: float | None
+    earliest: str | None
+    latest: str | None
+
+    @property
+    def agreement_rate(self) -> float | None:
+        """agreement 佔比（``total`` 為 0 時為 ``None``，不編造 100%）。"""
+        if self.total <= 0:
+            return None
+        return self.agreements / self.total
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": SHADOW_REPORT_SCHEMA,
+            "generated_at": self.generated_at,
+            "root": str(self.root),
+            "root_exists": self.root_exists,
+            "root_error": self.root_error,
+            "records": {
+                "total": self.total,
+                "agreement": self.agreements,
+                "disagreement": self.disagreements,
+                "agreement_rate": self.agreement_rate,
+            },
+            "window": {"earliest": self.earliest, "latest": self.latest},
+            "corrupt": {"count": len(self.corrupt), "files": list(self.corrupt)},
+            "retention": {
+                "ttl_seconds": self.ttl_seconds,
+                "swept": {"count": len(self.swept), "files": list(self.swept)},
+                "sweep_failed": {
+                    "count": len(self.sweep_failed),
+                    "files": list(self.sweep_failed),
+                },
+            },
+            "disagreements": [group.to_dict() for group in self.groups],
+        }
+
+    def render_text(self) -> str:
+        lines = [
+            "coverage shadow telemetry 報告",
+            f"root: {self.root}",
+        ]
+        if not self.root_exists:
+            lines.append("（telemetry 目錄尚不存在——shadow 還沒寫過任何記錄）")
+        if self.root_error:
+            lines.append(f"（目錄讀取失敗：{self.root_error}）")
+        rate = self.agreement_rate
+        rate_text = "n/a" if rate is None else f"{rate * 100:.1f}%"
+        lines.append(
+            f"records: {self.total}"
+            f"（agreement {self.agreements} / disagreement {self.disagreements}"
+            f"；agreement rate {rate_text}）"
+        )
+        lines.append(f"window: {self.earliest or '-'} .. {self.latest or '-'}")
+        lines.append(f"壞檔（跳過、未計入統計）: {len(self.corrupt)}")
+        if self.ttl_seconds is None:
+            lines.append("retention: 本次未清掃（--no-sweep）")
+        else:
+            lines.append(
+                f"retention: TTL {self.ttl_seconds / 86_400:.1f} 天"
+                f"；本次清掃 {len(self.swept)} 筆"
+                f"；清掃失敗 {len(self.sweep_failed)} 筆"
+            )
+        lines.append("")
+        if not self.groups:
+            lines.append("disagreement 分組: （無）——所有記錄兩方判定一致。")
+            return "\n".join(lines) + "\n"
+        lines.append("disagreement 分組:")
+        for group in self.groups:
+            lines.append(f"  [{group.kind}] {group.count} 筆")
+            lines.append(f"    combo:     {_render_distribution(group.combos)}")
+            lines.append(f"    task_slug: {_render_distribution(group.task_slugs)}")
+            lines.append(f"    callsite:  {_render_distribution(group.callsites)}")
+            lines.append(
+                f"    missing:   {_render_distribution(group.missing_responsibilities)}"
+            )
+            lines.append(f"    樣本（{len(group.samples)}／{group.count}）:")
+            for index, sample in enumerate(group.samples, start=1):
+                lines.extend(_render_sample(index, sample))
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+
+def _render_distribution(distribution: Mapping[str, int]) -> str:
+    if not distribution:
+        return "（無）"
+    return "  ".join(f"{key}={count}" for key, count in distribution.items())
+
+
+def _render_sample(index: int, sample: Mapping[str, Any]) -> list[str]:
+    context = _as_mapping(sample.get("context"))
+    context_text = (
+        "  ".join(f"{key}={context[key]}" for key in sorted(context)) or "（無）"
+    )
+    satisfied_by = _as_mapping(sample.get("satisfied_by"))
+    lines = [
+        f"      {index}) {sample.get('recorded_at') or '-'}"
+        f"  file={sample.get('file') or '-'}",
+        f"         callsite={sample.get('callsite') or '-'}"
+        f"  combo={sample.get('combo') or '-'}"
+        f"  task_slug={sample.get('task_slug') or '-'}"
+        f"  steps={sample.get('steps')}",
+        f"         context: {context_text}",
+        f"         topology: {sample.get('topology_reason') or 'pass'}",
+        f"         coverage: {sample.get('coverage_reason') or 'pass'}",
+        f"         missing: {', '.join(sample.get('missing') or ()) or '（無）'}",
+    ]
+    if satisfied_by:
+        rendered = "; ".join(
+            f"{stage}={','.join(str(card) for card in cards)}"
+            for stage, cards in satisfied_by.items()
+            if isinstance(cards, (list, tuple))
+        )
+        lines.append(f"         satisfied_by: {rendered}")
+    return lines
+
+
+def _sample_of(payload: Mapping[str, Any], filename: str) -> dict[str, Any]:
+    """把一筆 telemetry 投影成報告樣本——**足供人工逐筆解釋**的最小欄位集。"""
+    manifest = _as_mapping(payload.get("manifest"))
+    disagreement = _as_mapping(payload.get("disagreement"))
+    topology = _as_mapping(payload.get("topology"))
+    coverage_payload = _as_mapping(payload.get("coverage"))
+    missing = disagreement.get("missing_responsibilities")
+    if not isinstance(missing, list):
+        missing = coverage_payload.get("missing")
+    return {
+        "file": filename,
+        "recorded_at": _as_text(payload.get("recorded_at")),
+        "callsite": _as_text(payload.get("callsite")),
+        "combo": _as_text(manifest.get("combo")),
+        "task_slug": _as_text(manifest.get("task_slug")),
+        "steps": manifest.get("steps"),
+        "context": dict(_as_mapping(payload.get("context"))),
+        "topology_reason": _as_text(disagreement.get("topology_reason"))
+        or _as_text(topology.get("reason")),
+        "coverage_reason": _as_text(disagreement.get("coverage_reason"))
+        or _as_text(coverage_payload.get("reason")),
+        "missing": [str(item) for item in missing] if isinstance(missing, list) else [],
+        "covered": [
+            str(item) for item in coverage_payload.get("covered", []) or ()
+        ],
+        "satisfied_by": dict(_as_mapping(coverage_payload.get("satisfied_by"))),
+    }
+
+
+class _GroupAccumulator:
+    """單一 disagreement kind 的可變累加器（只在 :func:`build_shadow_report` 內用）。"""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.count = 0
+        self.combos: Counter[str] = Counter()
+        self.task_slugs: Counter[str] = Counter()
+        self.callsites: Counter[str] = Counter()
+        self.missing: Counter[str] = Counter()
+        self.samples: list[Mapping[str, Any]] = []
+
+    def add(self, payload: Mapping[str, Any], filename: str, *, sample_limit: int) -> None:
+        manifest = _as_mapping(payload.get("manifest"))
+        self.count += 1
+        self.combos[_as_name(manifest.get("combo"))] += 1
+        self.task_slugs[_as_name(manifest.get("task_slug"))] += 1
+        self.callsites[_as_name(payload.get("callsite"))] += 1
+        sample = _sample_of(payload, filename)
+        for stage in sample["missing"]:
+            self.missing[stage] += 1
+        if sample_limit <= 0 or len(self.samples) < sample_limit:
+            self.samples.append(sample)
+
+    def freeze(self) -> DisagreementGroup:
+        return DisagreementGroup(
+            kind=self.kind,
+            count=self.count,
+            combos=_ranked(self.combos),
+            task_slugs=_ranked(self.task_slugs),
+            callsites=_ranked(self.callsites),
+            missing_responsibilities=_ranked(self.missing),
+            samples=tuple(self.samples),
+        )
+
+
+def _record_paths(directory: Path) -> tuple[list[Path], str | None]:
+    """列出目錄下的 telemetry 檔；不可讀時回 ``([], 錯誤訊息)``。
+
+    刻意跳過 dotfile：sink 的半寫入 temp 檔是 ``.coverage-*.tmp``，與 D4 event spool
+    同一個約定（掃描端跳過 dotfile ⟹ consumer 不可能讀到半寫入檔）。
+    """
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError as error:
+        return [], str(error)
+    return [
+        path
+        for path in entries
+        if path.suffix == ".json" and not path.name.startswith(".") and path.is_file()
+    ], None
+
+
+def build_shadow_report(
+    *,
+    root: str | Path | None = None,
+    ttl_seconds: float | None = DEFAULT_SHADOW_TTL_SECONDS,
+    sample_limit: int = DEFAULT_SAMPLE_LIMIT,
+    now: datetime | None = None,
+) -> ShadowReport:
+    """讀完整個 telemetry 目錄並收斂成 :class:`ShadowReport`（順帶做 TTL 清掃）。
+
+    語意合約：
+
+    1. **壞檔容錯**——單筆讀不到／不是 JSON／不是 object 一律跳過並計入
+       ``corrupt``，絕不讓整份報告失敗。
+    2. **TTL 清掃**（``ttl_seconds=None`` 停用）——記錄的 ``recorded_at`` 超過 TTL 就
+       刪；``recorded_at`` 缺漏或解析不出來（含壞檔）時降級用檔案 mtime 判齡，讓壞檔
+       也會隨時間退場而不是永久堆積。刪不掉只計入 ``sweep_failed``，不 raise。
+    3. **被清掉的記錄不計入統計**——報告描述的是「保留窗內」的母體。
+    """
+    directory = Path(root) if root is not None else coverage_shadow_telemetry_root()
+    horizon = now or _now_utc()
+    root_exists = directory.is_dir()
+    paths, root_error = _record_paths(directory) if root_exists else ([], None)
+
+    total = 0
+    agreements = 0
+    corrupt: list[str] = []
+    swept: list[str] = []
+    sweep_failed: list[str] = []
+    groups: dict[str, _GroupAccumulator] = {}
+    earliest: datetime | None = None
+    latest: datetime | None = None
+    earliest_text: str | None = None
+    latest_text: str | None = None
+
+    for path in paths:
+        payload = _load_record(path)
+        stamp = _parse_timestamp(payload.get("recorded_at")) if payload is not None else None
+        if stamp is None:
+            stamp = _file_mtime(path)
+        if (
+            ttl_seconds is not None
+            and stamp is not None
+            and (horizon - stamp).total_seconds() > ttl_seconds
+        ):
+            if _unlink_record(path):
+                swept.append(path.name)
+            else:
+                sweep_failed.append(path.name)
+            continue
+        if payload is None:
+            corrupt.append(path.name)
+            continue
+        total += 1
+        recorded_text = _as_text(payload.get("recorded_at"))
+        if stamp is not None:
+            if earliest is None or stamp < earliest:
+                earliest, earliest_text = stamp, recorded_text or stamp.isoformat()
+            if latest is None or stamp > latest:
+                latest, latest_text = stamp, recorded_text or stamp.isoformat()
+        if payload.get("agreement") is True:
+            agreements += 1
+            continue
+        kind = _as_text(_as_mapping(payload.get("disagreement")).get("kind"))
+        kind = kind or UNKNOWN_DISAGREEMENT_KIND
+        groups.setdefault(kind, _GroupAccumulator(kind)).add(
+            payload, path.name, sample_limit=sample_limit
+        )
+
+    ordered = tuple(
+        accumulator.freeze()
+        for accumulator in sorted(
+            groups.values(), key=lambda item: (-item.count, item.kind)
+        )
+    )
+    return ShadowReport(
+        root=directory,
+        generated_at=_utcnow(),
+        root_exists=root_exists,
+        root_error=root_error,
+        total=total,
+        agreements=agreements,
+        disagreements=total - agreements,
+        groups=ordered,
+        corrupt=tuple(corrupt),
+        swept=tuple(swept),
+        sweep_failed=tuple(sweep_failed),
+        ttl_seconds=ttl_seconds,
+        earliest=earliest_text,
+        latest=latest_text,
+    )
+
+
+def _load_record(path: Path) -> dict[str, Any] | None:
+    """讀一筆 telemetry；讀不到／不是 JSON object 一律回 ``None``（呼叫端計為壞檔）。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        logger.debug("coverage shadow record unreadable (%s): %s", path.name, error)
+        return None
+    if not isinstance(payload, dict):
+        logger.debug("coverage shadow record is not a JSON object: %s", path.name)
+        return None
+    return payload
+
+
+def _file_mtime(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def _unlink_record(path: Path) -> bool:
+    """刪一筆過期記錄；失敗只記 debug 回 ``False``（唯讀掛載／權限不足是合法現況）。"""
+    try:
+        path.unlink()
+    except OSError as error:
+        logger.debug("coverage shadow retention sweep failed (%s): %s", path.name, error)
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# CLI（唯讀 on-demand 入口；比照 `python -m paulsha_cortex.trust_root ...` 慣例）
+# ---------------------------------------------------------------------------
+
+
+def _build_report_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m paulsha_cortex.coordinator.coverage",
+        description=(
+            "讀 coverage validator shadow telemetry 並輸出 disagreement 統計"
+            "（R1 Go/No-Go 的直接輸入）；順帶做 TTL 清掃。"
+        ),
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="輸出彙總報告（目前唯一動作，必須明示）",
+    )
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="telemetry 目錄（預設 <coordinator_root>/coverage-shadow）",
+    )
+    parser.add_argument("--json", action="store_true", help="輸出結構化 JSON")
+    parser.add_argument(
+        "--ttl-days",
+        type=float,
+        default=DEFAULT_SHADOW_TTL_SECONDS / 86_400,
+        help="保留天數，超過即於本次執行順帶刪除（預設 30）",
+    )
+    parser.add_argument(
+        "--no-sweep",
+        action="store_true",
+        help="完全不清掃，純唯讀讀取",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=DEFAULT_SAMPLE_LIMIT,
+        help="每組 disagreement 附幾筆樣本明細（0＝全部，預設 5）",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_report_parser()
+    args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    if not args.report:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write("錯誤: 需指定 --report\n")
+        return 2
+    if args.ttl_days < 0:
+        sys.stderr.write("錯誤: --ttl-days 不可為負\n")
+        return 2
+    ttl_seconds = None if args.no_sweep else args.ttl_days * 86_400
+    report = build_shadow_report(
+        root=args.root,
+        ttl_seconds=ttl_seconds,
+        sample_limit=max(args.samples, 0),
+    )
+    if args.json:
+        sys.stdout.write(
+            json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True) + "\n"
+        )
+    else:
+        sys.stdout.write(report.render_text())
+    # 唯讀觀測工具：有沒有 disagreement 是 Go/No-Go 的人工判讀，不是本指令的 exit code。
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI 進入點
+    raise SystemExit(main())

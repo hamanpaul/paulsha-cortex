@@ -8,6 +8,22 @@
 ## [Unreleased]
 
 ### Added
+- **v4 R1：shadow telemetry 的 aggregation reader ＋ TTL retention（Go/No-Go 的直接
+  輸入）**——PR #590 落地了 coverage validator shadow 的 sink（一次比對一檔），但沒有
+  讀端；R1 的 Go/No-Go 判準是「兩週 telemetry 中所有 disagreement 可解釋」，沒有統計
+  就無從判讀。新增**唯讀** aggregation reader `build_shadow_report()` 與 on-demand CLI
+  `python -m paulsha_cortex.coordinator.coverage --report [--json]`（比照
+  `python -m paulsha_cortex.trust_root ...` 的模組入口慣例，不動 `cortex` 傘狀 CLI）：
+  總筆數、agreement／disagreement 計數與比例、觀測窗、disagreement 依 `kind` 分組
+  （理論上只有 `topology-fail-coverage-pass`），每組附 combo／task_slug／callsite／
+  missing-responsibility 分佈與逐筆樣本（含 `context` 與 `satisfied_by`，足供人工
+  逐筆解釋）。同時加 TTL 清掃（`DEFAULT_SHADOW_TTL_SECONDS`，預設 30 天，比照 D4
+  event spool 慣例）——**只在 reader 執行時順帶清**、無 daemon 常駐邏輯，以
+  `recorded_at` 判齡、缺漏時降級用 mtime（壞檔亦隨時間退場），刪不掉只計數不 raise；
+  `--ttl-days` 可調、`--no-sweep` 純唯讀。單筆 JSON 壞損跳過並計數，絕不炸掉整份報告。
+  只做 reader ＋ retention；#591 其餘項（`satisfies` projection、雙 legacy phase 對映
+  收斂、第二呼叫點儀器化）屬 R2。詳見 `changelog.d/shadow-telemetry-reader.md`。
+  新增 `tests/test_coverage_shadow_reader_591.py`（27 測試）。
 - **R0.5 D6 / trust-root 隔離 Phase 2a（權限產生器）＋ Phase 2b root 設定 runbook
   （純程式碼＋文件、不需 root）**——新增 `paulsha_cortex/trust_root/permgen.py`：吃
   R1 `ASSET_REGISTRY` ＋參數化的 `UidScheme`（persona→OS 帳號映射），機械產生登記表
