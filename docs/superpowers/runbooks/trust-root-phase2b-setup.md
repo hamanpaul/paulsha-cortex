@@ -29,6 +29,10 @@ Phase 2a 的權限產生器（`paulsha_cortex/trust_root/permgen.py`）已把 R1
   planner＋monitor 共用，且為 durable state owner）。**保留二往三分彈性**——未來把
   Manager 拆成第三個 UID 時，只需換 `permgen.THREE_WAY_SCHEME`，runbook 結構不變。
 - **Manager 落 system-level unit**（非 `--user`），以 `cortex-svc` 執行。
+- **降權機制＝`systemd-run` transient unit**（未決 1 已裁決）。程式碼面 Phase 2a 已落地
+  （`paulsha_cortex/coordinator/job_runner.py`，`PSC_JOB_RUNNER` 預設 `direct`）；
+  本 runbook 第 5 步是把開關打開的部署動作。polkit 授權面收窄到 `cortex-job-` 前綴的
+  transient unit。
 - **舊 state 走 legacy-import 重新入帳**，**不**直接 `chown` 沿用（spec §R6(e)）。
 - **降級運轉逐案核可**（`PSC_DEGRADED_OPERATION=per-case-approval`，Phase 1 已上線）。
 
@@ -137,11 +141,11 @@ id cortex-svc; id cortex-builder
 # 期望：兩者 primary group 不同、彼此不在對方 group
 ```
 
-> **⚠️ 未決 1（降權機制的先決條件）**：第 5 步的降權啟動器需要「`cortex-svc` 能把
-> 子行程降到 `cortex-builder`」。unprivileged 的 `cortex-svc` **無法**直接 setuid 到
-> 另一個 unprivileged 帳號——需 operator 在第 5 步的三個方案擇一（narrow polkit +
-> `systemd-run` transient unit／最小 setuid 助手／給 Manager unit 授
-> `AmbientCapabilities=CAP_SETUID CAP_SETGID`）。此決定影響本步是否要再建輔助群組。
+> **✅ 未決 1 已裁決**：降權經 **`systemd-run` transient unit** ＋ narrow polkit rule
+> （見第 5 步）。unprivileged 的 `cortex-svc` 無法直接 setuid，改由 systemd（PID 1）
+> 代為切換身分。本步因此**不需要**額外的輔助群組——只要兩個帳號各自有同名 primary
+> group（`job_runner` 的 `--gid` 預設即帳號同名 group，與 `permgen.UidScheme.group_of()`
+> 同一慣例）。
 
 ---
 
@@ -365,9 +369,10 @@ sudo systemctl enable --now cortex-manager.service
 ```
 
 > **`EnvironmentFile` 無 `-` 前綴**＝缺檔 fail-closed（spec §R3 Scenario「刪除
-> EnvironmentFile」）。`CapabilityBoundingSet=`（空）＝丟掉所有 capability；若第 5 步
-> 選 CAP_SETUID 方案，這裡要改成 `CapabilityBoundingSet=CAP_SETUID CAP_SETGID
-> CAP_SETPCAP` 並加 `AmbientCapabilities=`——**但這會擴大 Manager 權限，見未決 1**。
+> EnvironmentFile」）。`CapabilityBoundingSet=`（空）＝丟掉所有 capability，且因為
+> 未決 1 已裁決走 `systemd-run`（由 PID 1 代為切換身分，Manager 自己不需要任何
+> capability），**這裡維持空集合，不加 `AmbientCapabilities=`**——落選的 CAP_SETUID
+> 方案才需要放寬，那正是它被否決的理由。
 
 ```bash
 # ✅ 驗證：unit 以 cortex-svc 跑、加固生效
@@ -390,37 +395,115 @@ Manager（cortex-svc）spawn headless job 時降到 `cortex-builder`，且：
   沿用 D1 outbox）；
 - 只暴露該 job 自己被 chown 的 worktree 子目錄。
 
-> **⚠️ 未決 1（降權機制最終形態，最高風險決策）**：unprivileged 的 cortex-svc
-> 無法直接 setuid 到 cortex-builder。三個候選，operator 擇一：
+> **✅ 未決 1 已裁決（operator 0816 第二輪）**：降權機制＝**`systemd-run` transient
+> unit**（方案 A）。落選案留檔備查：B（最小 setuid 助手）引入 setuid 二進位＝新攻擊面；
+> C（Manager 授 `CAP_SETUID`）可切到**任意** uid，等於放大 Manager 權限。
 >
-> | 方案 | 做法 | 代價 |
-> |---|---|---|
-> | **A. `systemd-run` transient unit**（建議） | Manager 呼叫 `systemd-run --uid=cortex-builder --pipe --collect --property=...` 起 job；乾淨環境天然關 FD／scrub env | 需一條 **narrow polkit rule** 允許 cortex-svc 對 `cortex-builder` 起 transient unit；WSL2 的 polkit 行為需先在拋棄式環境驗 |
-> | **B. 最小 setuid 助手** | root 擁有、setuid-root、**寫死只 exec 成 cortex-builder** 的小程式，cortex-svc 可呼叫 | 引入一支 setuid 二進位＝新攻擊面，需嚴格審查與 argv 白名單 |
-> | **C. Manager 授 `CAP_SETUID`** | unit 加 `AmbientCapabilities=CAP_SETUID CAP_SETGID` | CAP_SETUID 可變成**任意** uid，等於放大 Manager 權限，最不建議 |
->
-> 本 runbook 以 **方案 A** 為預設示例；operator 定案前**第 5 步不可執行**。
+> 程式碼面已落地（Phase 2a，`paulsha_cortex/coordinator/job_runner.py`）：
+> `PSC_JOB_RUNNER` 預設 `direct`（現行行為不變），設為 `systemd-run` 才降權。
+> **本步驟即「把那個開關打開」的部署動作**，前提是本 runbook 第 1 步的帳號已建立、
+> 以及下面的 polkit 規則已就位。
+
+### 5a. Manager 端會實際發出的 argv（polkit 規則要收窄的那個面）
+
+`job_runner.build_systemd_run_argv()` 產出的形狀是**封閉**的（新增旗標要改程式碼並過
+測試），因此 polkit 規則可以據此收窄：
+
+```text
+systemd-run --quiet --collect --pipe --wait \
+  --unit=cortex-job-<job_id 片段>-<sha256 前 8 碼>.service \
+  --uid=cortex-builder --gid=cortex-builder \
+  --service-type=exec \
+  --working-directory=<該 job 的 worktree> \
+  --property=NoNewPrivileges=yes \
+  --setenv=<白名單 env 逐項> \
+  -- bash -c '<job wrapper script>'
+```
+
+- unit 名前綴固定為 `cortex-job-`（`job_runner.UNIT_NAME_PREFIX`，polkit 以
+  `action.lookup("unit")` 比對的就是它）；接上 job_id 的 sha256 前 8 碼確保消毒後仍唯一。
+- `--wait` 讓 client 與 unit 同壽命，Manager 既有的 `pid_alive()` 判活不必改。
+- `--quiet` 是必要的：`systemd-run` 的狀態訊息會被 `--pipe` 導進 job 的 JSONL log，
+  那份 log 是 terminal evidence 的來源。
+- FD：只有 stdin/stdout/stderr 三個（Python `close_fds=True`），且 **stdin 顯式接
+  `/dev/null`**；stdout/stderr 是 Manager 開的 job log。
+- **env 不是 scrub 黑名單，而是白名單**：transient unit 不繼承呼叫端的 environ，
+  job 只看得到 `--setenv` 列出的那幾項（`PATH`／`LANG`／`LC_ALL`／`LC_CTYPE`／
+  `SSL_CERT_FILE`／`SSL_CERT_DIR`／`NODE_EXTRA_CA_CERTS` ＋ `PSC_JOB_ID`／
+  `PSC_SLICE_ID`／`PSC_REPO_ROOT`／選配的 `PSC_RELAY_TARGET`／`HOME`）。
+  gh token、daemon 的 `CLAUDE_CONFIG_DIR`／`GH_CONFIG_DIR` 都**不在**白名單上。
 
 ```bash
-# ⚠️ 未決 1：以下為方案 A 的 polkit rule 示例（待 operator 定案）
-# 🔧 operator sudo：/etc/polkit-1/rules.d/49-cortex-spawn.rules（示例）
+# ✅ 驗證（不需 root）：印出本機會發出的白名單與旗標，與上表逐項對照
+python3 - <<'PY'
+from paulsha_cortex.coordinator import job_runner
+for item in job_runner.BUILDER_FORWARDED_ENV:
+    print(f"{item.name:22} {item.rationale}")
+print("synthesized:", job_runner.BUILDER_SYNTHESIZED_ENV)
+print("unit prefix:", job_runner.UNIT_NAME_PREFIX)
+print("properties :", job_runner.TRANSIENT_UNIT_PROPERTIES)
+PY
+```
+
+### 5b. polkit 規則（收窄到「只能以 cortex-builder 身分、限定 unit 名」）
+
+```bash
+# 🔧 operator sudo：/etc/polkit-1/rules.d/49-cortex-spawn.rules
 sudo tee /etc/polkit-1/rules.d/49-cortex-spawn.rules >/dev/null <<'RULES'
-// 僅允許 cortex-svc 對 cortex-builder 起 transient unit（最小授權）
+// 僅允許 cortex-svc 起「cortex-job-」前綴的 transient unit（最小授權）。
+// 注意：unit 名是 Manager 端產生的（job_runner.UNIT_NAME_PREFIX），這條規則與
+// 那個常數是成對契約——改任一邊都必須同步改另一邊。
 polkit.addRule(function(action, subject) {
-  if (action.id == "org.freedesktop.systemd1.manage-units" &&
-      subject.user == "cortex-svc") {
-    // TODO(operator): 收斂到只允許 --uid=cortex-builder 的 unit 名前綴
+  if (subject.user !== "cortex-svc") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  if (action.id !== "org.freedesktop.systemd1.manage-units") {
+    return polkit.Result.NOT_HANDLED;
+  }
+  var unit = action.lookup("unit");
+  if (unit && unit.indexOf("cortex-job-") === 0 && unit.indexOf(".service", unit.length - 8) !== -1) {
     return polkit.Result.YES;
   }
+  return polkit.Result.NOT_HANDLED;
 });
 RULES
 ```
 
+> **⚠️ 殘餘限制（誠實標註）**：polkit 的 `manage-units` action 只暴露 unit **名稱**，
+> **不暴露 `User=`／`--uid=`**。因此「只能降到 cortex-builder」這一半在 polkit 層
+> 無法強制，只能由 Manager 端的封閉 argv 產生器保證（`--uid` 來自
+> `PSC_BUILDER_ACCOUNT`，值受 POSIX 帳號名 pattern 檢查、拒絕注入）。要在 OS 層
+> 也硬化這一半，需另設一支 root 擁有的 wrapper unit template 並只授權該 template
+> ——屬 Phase 3 的加固，不是 0.2.0 的 join gate。
+
+### 5c. 打開開關（Manager env）
+
 ```bash
-# ✅ 驗證：以 cortex-svc 起一個降到 cortex-builder 的 transient job，檢查身分/FD/token
-sudo -u cortex-svc systemd-run --uid=cortex-builder --pipe --wait --collect \
+# 🔧 operator sudo：把降權模式寫進 Manager 的 EnvironmentFile（見第 4b 步）
+#   PSC_JOB_RUNNER=systemd-run        # 必要；預設 direct＝不降權
+#   PSC_BUILDER_ACCOUNT=cortex-builder # 選配（預設值即此）
+#   PSC_BUILDER_HOME=/var/lib/cortex-builder  # 選配；未設時 systemd 依 passwd 填
+#   PSC_BUILDER_PATH=...              # 選配；模型 CLI 不在 Manager PATH 上時用
+sudo systemctl restart cortex-manager
+```
+
+builder 帳號必須自己具備模型 CLI 的登入態（`sudo -u cortex-builder claude /login` 之類），
+**Manager 不會把自己的憑證傳過去**——那正是本步驟的重點。
+
+```bash
+# ✅ 驗證 1：以 cortex-svc 起一個降到 cortex-builder 的 transient job，檢查身分/FD/token
+sudo -u cortex-svc systemd-run --quiet --collect --pipe --wait \
+  --unit=cortex-job-smoke-00000000.service \
+  --uid=cortex-builder --gid=cortex-builder --service-type=exec \
+  --property=NoNewPrivileges=yes \
   /bin/sh -c 'id; echo "GH_TOKEN=[$GH_TOKEN]"; ls -l /proc/self/fd'
-# 期望：uid=cortex-builder；GH_TOKEN 為空；/proc/self/fd 無指向受保護資產的可寫 fd
+# 期望：uid=cortex-builder；GH_TOKEN 為空；/proc/self/fd 只有 0/1/2
+```
+
+```bash
+# ✅ 驗證 2（負控制）：暫時移除 polkit 規則後，dispatch 必須 fail-closed 而非退回 direct
+#   期望：job 落 needs_human，理由碼 job-runner-transient-unit-start-failed，
+#   detail 帶 systemd-run 的實際拒絕訊息。**不得**出現以 cortex-svc 身分跑起來的 job。
 ```
 
 ---
@@ -546,9 +629,11 @@ echo "PSC_DEGRADED_OPERATION=$PSC_DEGRADED_OPERATION"     # 期望 per-case-appr
 
 ## 對 WSL2 環境，本 runbook 最不確定／最高風險的步驟
 
-1. **第 5 步降權機制（最高風險）**：unprivileged→unprivileged 的降權在 WSL2 上
-   （polkit daemon 是否常駐、`systemd-run --uid` transient unit 行為）需**先在拋棄式
-   環境跑通 R9 族 4** 再上正式機。三個方案各有攻擊面權衡（未決 1）。
+1. **第 5 步降權機制（最高風險）**：機制已裁決為 `systemd-run` transient unit 且程式碼
+   已落地（`PSC_JOB_RUNNER=systemd-run`），但 WSL2 上 polkit daemon 是否常駐、
+   `systemd-run --uid` 的實際行為仍需**先在拋棄式環境跑通 R9 族 4** 再上正式機。
+   啟動器對「systemd 不可用／帳號不存在／unit 起不來（含 polkit 拒絕）」一律
+   fail-closed，不會靜默退回同 UID 執行——負控制驗證見第 5c 步驗證 2。
 2. **第 4c system-level unit 在 WSL2 的持久性**：WSL 關閉/重啟後 systemd system session
    是否可靠拉起 `cortex-manager.service`；lingering 對 system unit 無效，需驗 boot 行為。
 3. **第 4c 加固誤擋**：`ProtectSystem=strict` + `ReadWritePaths` 白名單若漏列某條實際

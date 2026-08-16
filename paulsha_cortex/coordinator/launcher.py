@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -11,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
-from . import gate_ledger, terminal_contract
+from . import gate_ledger, job_runner, terminal_contract
 
 
 _GIT_REPOSITORY_ENV_KEYS = frozenset(
@@ -38,10 +37,10 @@ _GIT_REPOSITORY_ENV_KEYS = frozenset(
     }
 )
 
-_CREDENTIAL_ENV_RE = re.compile(
-    r"(?:^|_)(?:API_?KEY|AUTH|COOKIE|CREDENTIALS?|PASSWORD|PRIVATE_?KEY|SECRET|TOKEN)(?:$|_)",
-    re.IGNORECASE,
-)
+# 憑證形狀的 env 名稱。定義搬到 `job_runner`（Phase 2a 降權啟動器的 env 白名單守衛
+# 需要同一份判準），這裡保留原名別名——reviewer sandbox 政策與 builder transient unit
+# 的憑證判準永遠是同一條 pattern，不會兩處漂移。
+_CREDENTIAL_ENV_RE = job_runner.CREDENTIAL_ENV_RE
 
 
 def _claude_review_json_schema(kind: str) -> str:
@@ -1065,6 +1064,26 @@ class SubprocessLauncher:
             return False
         return env.get("PSC_REPO_ROOT") is not None
 
+    def _degraded_runner(self, env: Mapping[str, str]) -> bool:
+        """本次 launch 是否要走 Phase 2a 的降權啟動器（`systemd-run` transient unit）。
+
+        兩個條件同時成立才降權：
+
+        1. `PSC_JOB_RUNNER=systemd-run`（部署期設定；預設 `direct`＝現行行為不變）。
+        2. **這是 builder persona**——判定點與本檔既有的 persona 分支完全對齊
+           （`_should_run_gates`／`launch()` 的 env 分支用的是同一組條件）：
+           `review_only`＝reviewer、`read_only`＝planner，兩者皆非才是 builder。
+
+        operator 0816 裁決的二分 UID 方案裡，reviewer 與 planner 和 Manager 同帳號
+        （`cortex-svc`），因此**不經降權**；只有 builder 落到 `cortex-builder`。
+        `PSC_JOB_RUNNER` 的值即使非法，也在這裡 fail-closed（見
+        `job_runner.resolve_runner_mode`），不會被靜默當成 direct。
+        """
+
+        if job_runner.resolve_runner_mode(env) != job_runner.RUNNER_SYSTEMD_RUN:
+            return False
+        return not self._review_only and not self._read_only
+
     def executor_environment(self, *, slice_id: str = "preflight"):
         """#262 D2：回報正式 job 會實際看到的 executor 環境。
 
@@ -1077,6 +1096,17 @@ class SubprocessLauncher:
 
         if self._review_only:
             env = _review_scope_env()
+        elif self._degraded_runner(os.environ):
+            # 降權模式下 job 實際看到的是 transient unit 的白名單 env，不是 daemon 的
+            # environ；preflight 若仍回報 daemon env，它報的 PATH／HOME 就與正式 job
+            # 無關（見本方法 docstring 的「不然只是安慰劑」）。
+            env = job_runner.build_builder_env(
+                manager_env=os.environ,
+                job_id=slice_id,
+                slice_id=slice_id,
+                repo_root=str(Path(__file__).resolve().parents[2]),
+                relay_target=self._relay_target,
+            )
         else:
             env = {
                 **_git_scope_env(),
@@ -1106,6 +1136,14 @@ class SubprocessLauncher:
         )
 
     def launch(self, *, slice_id: str, prompt: str, worktree: str, log_dir: str) -> LaunchHandle:
+        # Phase 2a 降權啟動器（#584 未決 1 裁決＝systemd-run transient unit）。
+        # 這一行在**任何**副作用（mkdir／清 sentinel／Popen）之前求值：`PSC_JOB_RUNNER`
+        # 非法或 builder 帳號不存在時，本次派工必須在還沒改動任何狀態前就 fail-closed，
+        # 而不是先做一半再退回 direct。
+        runner_plan: job_runner.SystemdRunPlan | None = None
+        if self._degraded_runner(os.environ):
+            runner_plan = job_runner.prepare_systemd_run(os.environ, job_id=slice_id)
+        degraded = runner_plan is not None
         resolved_worktree = Path(worktree).resolve(strict=True)
         if not resolved_worktree.is_dir():
             raise ValueError("launcher worktree must be a directory")
@@ -1155,6 +1193,19 @@ class SubprocessLauncher:
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。
         if self._review_only:
             env = _review_scope_env()
+        elif degraded:
+            # #588 第 1 點的結構性解法：transient unit **不繼承呼叫端的 environ**，
+            # 因此 builder 的環境就是這份白名單本身（不是「daemon environ 減去黑名單」）。
+            # gh token、daemon 的 CLAUDE_CONFIG_DIR 都不在白名單上，因此不會出現在
+            # job 裡——包括 `_copilot_credential_env()` 也因此自然回傳空 dict（它讀的是
+            # 這份 env，裡面沒有任何 token 候選），不必為降權模式另設特例。
+            env = job_runner.build_builder_env(
+                manager_env=os.environ,
+                job_id=slice_id,
+                slice_id=slice_id,
+                repo_root=str(Path(__file__).resolve().parents[2]),
+                relay_target=self._relay_target,
+            )
         else:
             env = {
                 **_git_scope_env(),
@@ -1197,14 +1248,48 @@ class SubprocessLauncher:
             stdin_prompt=stdin_prompt,
         )
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
-        argv = ["bash", "-c" if self._review_only else "-lc", script]
-        with open(log_path, "wb") as logf:
-            proc = subprocess.Popen(
-                argv,
-                cwd=worktree,
+        # 降權模式的 builder 同理（#588 第 2 點）：login shell 會在 transient unit 的
+        # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
+        # direct 模式的 builder 維持 `-lc` 不動——那是既有行為，本票不改。
+        argv = ["bash", "-c" if (self._review_only or degraded) else "-lc", script]
+        popen_kwargs: dict[str, object] = {
+            "cwd": worktree,
+            "env": env,
+            "stderr": subprocess.STDOUT,
+        }
+        if runner_plan is not None:
+            argv = job_runner.build_systemd_run_argv(
+                systemd_run=runner_plan.binary,
+                unit=runner_plan.unit,
+                account=runner_plan.account,
+                group=runner_plan.group,
+                working_directory=worktree,
                 env=env,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
+                command=argv,
+            )
+            # systemd-run **client 自己**的環境。它不會流進 transient unit——unit 的
+            # 環境只有 PID 1 的 manager environment 加上 `--setenv` 白名單（這正是
+            # #588 第 1 點在此模式下結構性成立的原因）。client 端保留完整 env 是刻意
+            # 的：polkit 授權可能要查呼叫端的 session（XDG_SESSION_ID 等），砍掉會讓
+            # 授權在某些部署下無故失敗。
+            popen_kwargs["env"] = _git_scope_env()
+            # FD：Popen 預設 close_fds=True，因此只有 0/1/2 會經 `--pipe` 進到 unit；
+            # stdin 顯式接 /dev/null（direct 模式今天仍把 daemon 的 stdin 交給 job，
+            # 降權模式在這點上比 direct 更緊）。
+            popen_kwargs["stdin"] = subprocess.DEVNULL
+        with open(log_path, "wb") as logf:
+            popen_kwargs["stdout"] = logf
+            proc = subprocess.Popen(argv, **popen_kwargs)
+        if runner_plan is not None:
+            # polkit 拒絕／unit 名衝突只在起動當下才知道；確認不到就 fail-closed，
+            # **絕不**退回 direct（見 job_runner.confirm_transient_unit_started）。
+            job_runner.confirm_transient_unit_started(
+                process=proc,
+                sentinel=sentinel,
+                unit=runner_plan.unit,
+                account=runner_plan.account,
+                log_path=log_path,
+                timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
             )
         return LaunchHandle(
             executor=self._executor,
