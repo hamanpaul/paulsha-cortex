@@ -8,6 +8,20 @@
 ## [Unreleased]
 
 ### Added
+- **R0.5 D6 / trust-root 隔離 Phase 1（純程式碼、不需 root、含降級安全網）**
+  ——新增 `paulsha_cortex/trust_root/` 子套件，依 spec `trust-root-isolation-spec.md`
+  Phase 1 與 operator 0816 裁決交付 join gate 未達成期間的契約層地基：**R1 資產登記表**
+  （`registry.py`，單一機器可讀真相＋`config/paths.py`／`control/constants.py` 的雙向
+  等式測試，涵蓋 builder／reviewer／planner 三 persona）、**R3 啟動自檢**（`selfcheck.py`，
+  用登記表對照現行部署把 group/other-writable 的 Manager-owned 路徑標為 job-writable；
+  掛在 `manager_daemon` 啟動點，受 `PSC_TRUST_ROOT_SELFCHECK` 閘控，Phase 1 **只 WARN**）、
+  **R7 capability 通道＋降級運轉**（`capability.py`，敏感 action 無 capability 時 100%
+  被拒；capability action-bound＋single-use＋短效＋不落地 durable state；降級開關
+  `PSC_DEGRADED_OPERATION` 預設 `per-case-approval`、可切 `disabled`）。on-demand 入口
+  `python -m paulsha_cortex.trust_root {selfcheck,registry,equation}`。**Phase 1 不提供**
+  （需 Phase 2 OS 邊界）：真正不可寫強制、持久 nonce ledger、socket OS 隔離、自檢
+  fail-closed。詳見 `changelog.d/d6-trust-root-phase1.md`。新增
+  `tests/test_trust_root_{registry_r1,selfcheck_r3,capability_r7}.py`（43 測試）。
 - **v4 R1（方案 A）：responsibility coverage validator 的 shadow 骨架（零行為變更）**
   ——新增 `paulsha_cortex/coordinator/coverage.py`：新的 coverage validator 與現行
   topology validator（`validate_manager_spine()`，未動）**並行跑、比對、記 telemetry**，
