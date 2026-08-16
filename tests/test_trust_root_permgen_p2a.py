@@ -218,10 +218,11 @@ def test_plan_is_json_serializable(scheme) -> None:
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
 def test_commands_are_strings_only_and_never_execute(scheme) -> None:
-    """產出只能是 chown／chmod／setfacl 字串——絕不執行任何 root 操作。"""
+    """產出只能是 install -d／chown／chmod／setfacl（可帶 `[ ! -e ] ||` 存在性守衛）
+    字串——絕不執行任何 root 操作。"""
     plan = _plan(scheme)
     lines = permgen.plan_to_commands(plan)
-    allowed = ("chown ", "chmod ", "setfacl ")
+    allowed = ("install -d ", "chown ", "chmod ", "setfacl ", "[ ! -e ")
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):

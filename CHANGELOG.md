@@ -8,6 +8,44 @@
 ## [Unreleased]
 
 ### Added
+- **R0.5 D6 / trust-root 隔離 Phase 2b：permgen 產 systemd unit ＋ polkit 規則，
+  runbook 收斂為可執行版（仍不需 root）**——`permgen.py` 新增 `PathLayout`，把
+  operator 0816 第二輪裁決的路徑（`/var/lib/cortex`、worktree pool
+  `/var/lib/cortex/worktree`、部署樹 `/opt/cortex`）固化為機器可讀 config，對 R1 登記表
+  每一項給出真實絕對路徑（等式測試：無遺漏、無多餘），runbook 因此不再有 placeholder。
+  `build_manager_unit()`／`build_job_unit()` 機械產生 system-level unit：`User=` 服務
+  帳號、`ExecStart` 指 root-owned 部署樹、`EnvironmentFile=` **無 `-` 前綴＝fail-closed**、
+  27 項加固指令**逐項附「為何」註解**，而 **`ReadWritePaths=` 由 R1 登記表機械導出**
+  （未決 5 定案）——等式測試同時釘住無遺漏／無多餘／最小性／與 `ProtectSystem`
+  `ProtectHome` 的一致性，非登記表的額外可寫路徑只能經 `ExtraWritePath` 明示宣告且
+  **每條必須附理由**。降權 job 走 **root-owned 模板 unit**（`User=cortex-builder`
+  硬寫死、token 清空、命令來自 Manager-owned spool 且 job 唯讀）。`build_polkit_rule()`
+  以同一套邏輯產出**兩個降權方案**的規則：**A（`--transient`，預設）**對應 #603 的
+  `systemd-run`，unit pattern 與 `job_runner.UNIT_NAME_PREFIX` 是成對契約，且把
+  「polkit 只暴露 unit 名稱、**不暴露 `User=`／`--uid=`**」導致的殘餘風險由 `UidScheme`
+  機械導出並逐條寫進規則檔開頭（二分下 reviewer／planner 與 Manager 併帳，三分下該條
+  自動消失）；**B（`--template`）**配合 root-owned 模板 unit 把 `User=` 硬寫死、
+  transient unit 一律拒，殘餘為零。兩案骨架相同（**unit／verb 明細缺席即拒**、只放行
+  `start`/`stop`、錨定 pattern）且互不放行對方的 unit 形狀；`evaluate_polkit()` 是與
+  JS 共用常數的 Python 鏡像，兩案各跑一份決策矩陣。`transient_unit_properties()` 把
+  同一套加固表 ＋ 同一份 RWP 展開成 A 方案的 `systemd-run --property=` 對照清單。
+  三者**只產生內容字串**，靜態測試把
+  `open(`／`write_text`／`mkdir`／`shutil` 也納入禁用字串。CLI 新增
+  `python -m paulsha_cortex.trust_root {unit,polkit,scaffold}`（含
+  `unit --job-properties`、`polkit --transient|--template`）與
+  `permissions --commands --paths`。runbook `trust-root-phase2b-setup.md` 由 draft
+  改為 **executable**：7 個 `⚠️ 未決` 全數替換為裁決定案表，結構為執行前提 ＋ 9 步
+  ＋ WSL2 風險段 ＋ 附錄（24 個 sudo 點、94 個驗證點）。第 5 步把 A／B 兩案**都**寫成
+  完整可執行（共用前提含「polkit 能／不能強制什麼」對照表與 A/B 比較表，各自的正向／
+  反向驗證，A 方案另含「移除 polkit 規則後 dispatch 必須 fail-closed」的負控制與一條
+  **預期會成功**的殘餘風險實測），並在開頭標明這是全 runbook 唯一還需 operator 拍板
+  的一點（且與「是否提前三分」連動）。第 3b 節吸收 #599 的 review verdict 受控通道；
+  第 8 步 R9 手動抽驗給出四族 43 條攻擊命令與預期輸出＋三組 negative control；
+  第 9 步含每階段回滾與「全部退回 Phase 1 降級運轉」的總回滾；WSL2 段補上開機拉起
+  驗證與 `ProtectSystem=strict` 誤擋診斷。**本票只交付程式碼與文件**：不建
+  UID、不 chown、不動 systemd／polkit／pipx／`~/.agents`。詳見
+  `changelog.d/p2b-runbook-executable.md`。新增 `tests/test_trust_root_permgen_p2b.py`
+  （61 測試）。
 - **R0.5 D6 / trust-root 隔離 Phase 2a：review verdict 受控通道（per-job 單向 spool）**
   ——堵掉 spec 背景 §3 的最短攻擊路徑：verdict 原本由 reviewer 模型寫在**自己的
   worktree 內**（`.psc-review-verdict.json`），同 UID 下 builder 可直接覆寫／預埋，
