@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from paulsha_cortex.config import paths
 from ..control import constants, contract
+from ..trust_root import selfcheck as trust_root_selfcheck
 from . import autonomy, backoff, manager, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .diagnostics import diagnostic_reason, summarize_exception
@@ -1159,6 +1160,25 @@ def build_periodic_tick_runner(
     return execute
 
 
+def _run_trust_root_selfcheck() -> None:
+    """R3（Phase 1）：啟動時跑一次 trust-root 自檢並以 WARN 送出（fire-and-forget）。
+
+    受 ``PSC_TRUST_ROOT_SELFCHECK`` 閘控（``off``／``0``／``false`` 停用，預設 on）。
+    Phase 1 **只 WARN、不 fail-closed**：自檢用 R1 登記表對照現行部署實況，指出哪些
+    Manager-owned 路徑現在其實 headless 可寫（group/other 寫入位）。永不 raise——
+    自檢失敗不得阻擋 daemon 啟動（fail-closed 切換是 Phase 2 R3）。
+    """
+    flag = (os.environ.get("PSC_TRUST_ROOT_SELFCHECK", "on") or "").strip().lower()
+    if flag in {"off", "0", "false", "no"}:
+        return
+    try:
+        trust_root_selfcheck.emit_startup_warnings(
+            emit=lambda line: print(f"{contract.utcnow()} {line}", file=sys.stderr)
+        )
+    except Exception:  # noqa: BLE001 — WARN-only：永不阻擋啟動
+        pass
+
+
 def run_loop(
     *,
     request_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -1273,6 +1293,8 @@ def run_loop(
 
     constants.requests_dir().mkdir(parents=True, exist_ok=True)
     constants.done_dir().mkdir(parents=True, exist_ok=True)
+
+    _run_trust_root_selfcheck()
 
     last_tick_at: str | None = None
     daemon_idle = True
