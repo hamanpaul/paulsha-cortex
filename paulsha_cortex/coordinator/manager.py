@@ -1030,6 +1030,26 @@ def _slice_review_authority_inputs(
     return authority, tuple(rows)
 
 
+def _spool_writable_launcher(review_launcher, spool_dir: Path):
+    """讓 reviewer 寫得進自己那一格 verdict spool 的 launcher 特化。
+
+    verdict 搬出 worktree 之後，executor 自己的 sandbox 會擋掉往
+    `<coordinator_root>/review-verdicts/<job>/` 的寫入（codex `--sandbox
+    workspace-write` 只放行 cwd；claude `acceptEdits` 只覆蓋工作目錄）。
+    `SubprocessLauncher.as_verdict_spool_writer()` 產生一份只多放行**這一個
+    目錄**的等價 launcher（走既有 `--add-dir` 機制）。
+
+    以 `getattr` 取用而非硬性要求：`AgentLauncher` protocol 只約定 `launch()`，
+    測試注入的 fake 與其他實作不必實作這個特化——沒有就照原樣用（fake 本來就
+    不受 sandbox 限制）。
+    """
+
+    specialize = getattr(review_launcher, "as_verdict_spool_writer", None)
+    if specialize is None:
+        return review_launcher
+    return specialize(str(spool_dir))
+
+
 def _launch_foreign_review(
     *,
     registry,
@@ -1160,6 +1180,12 @@ def _launch_foreign_review(
         # manifest 讀的是 reviewer job，slice_status_entry 的 fallback 也
         # reviewer-first，不繼承會落 null。
         workflow_repo=builder_job.get("workflow_repo"),
+        # trust-root Phase 2a：本 job 以 **verdict spool** 通道派工。這個標記是
+        # harvest 端「可不可以回退讀 worktree verdict」的唯一判準——有標記即不可
+        # （見 `_finalize_review_job`）。標記寫在 jobs.json（Manager-owned Tier-0
+        # 樹）而不是靠「spool 目錄在不在」，否則 builder 只要刪掉 spool 目錄再寫一份
+        # worktree verdict 就能把自己洗回 legacy 路徑。
+        review_verdict_channel=foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL,
     )
     try:
         authority_inputs = _slice_review_authority_inputs(
@@ -1180,16 +1206,23 @@ def _launch_foreign_review(
             git_runner=git_runner,
         )
         registry.update_job(reviewer_job["job_id"], worktree=str(review_worktree))
+        # Phase 2a：verdict 落點搬離 worktree。pre-seed 守衛（該 job 的 spool 位置
+        # 必須不存在）也一併搬到這裡；`prepare_review_worktree()` 內對 worktree
+        # verdict 的舊守衛保留為 defense-in-depth（legacy fallback 仍會讀它）。
+        verdict_spool_path = foreign_review.prepare_review_verdict_spool(
+            reviewer_job_id=reviewer_job["job_id"],
+            coordinator_root=coordinator_root,
+        )
         prompt = foreign_review.build_review_prompt(
             slice_id=slice_id,
             plan_path=slice_row["plan"]["path"],
-            verdict_path=str(foreign_review.review_verdict_path(review_worktree)),
+            verdict_path=str(verdict_spool_path),
             builder_job_id=builder_job_id,
             reviewer_job_id=reviewer_job["job_id"],
             candidate=candidate,
             launch_identity=reviewer_identity,
         )
-        handle = review_launcher.launch(
+        handle = _spool_writable_launcher(review_launcher, verdict_spool_path.parent).launch(
             slice_id=reviewer_job["job_id"],
             prompt=prompt,
             worktree=str(review_worktree),
@@ -1258,6 +1291,86 @@ def _review_failure_gate_reason(review_job: Mapping[str, object]) -> str:
     if classification is None or classification.outcome is provider_outcome.ProviderOutcome.UNKNOWN:
         return "foreign-review-absent"
     return f"foreign-review-provider-{classification.outcome.value}"
+
+
+def _resolve_review_verdict_source(
+    *,
+    review_job: Mapping[str, object],
+    worktree: Path,
+    coordinator_root: Path | None,
+) -> tuple[Path, str] | None:
+    """決定這個 reviewer job 的 verdict 從哪裡收（spool 優先，legacy 僅過渡期）。
+
+    trust-root Phase 2a 之後派工的 reviewer job，其 job row 帶
+    `review_verdict_channel == "spool"`；對這些 job **只**認 spool 落點——
+    找不到就是 `verdict-missing`，**不回退**讀 worktree。這一點是本修法的核心：
+    若允許回退，builder 只要刪掉 spool 目錄再往 worktree 寫一份「通過」的
+    verdict，最短攻擊路徑就原封不動地回來了。
+
+    只有本修法**之前**派工、job row 沒有這個標記的 in-flight reviewer job 才走
+    legacy worktree 落點（採信時記 WARN ＋ DiagnosticReason，見
+    `_warn_legacy_review_verdict_channel`）。這批 job 出清後即可移除本分支。
+    """
+
+    channel = review_job.get("review_verdict_channel")
+    job_id = review_job.get("job_id")
+    if isinstance(job_id, str) and job_id:
+        try:
+            spool_path = foreign_review.review_verdict_spool_path(
+                reviewer_job_id=job_id,
+                coordinator_root=coordinator_root,
+            )
+        except ValueError:
+            spool_path = None
+        if spool_path is not None and spool_path.is_file() and not spool_path.is_symlink():
+            return spool_path, foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL
+    if channel == foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL:
+        return None
+    legacy_path = foreign_review.review_verdict_path(worktree)
+    if legacy_path.is_file():
+        return legacy_path, foreign_review.REVIEW_VERDICT_CHANNEL_LEGACY_WORKTREE
+    return None
+
+
+def _warn_legacy_review_verdict_channel(
+    registry,
+    *,
+    slice_id: str,
+    review_job: Mapping[str, object],
+    verdict_path: Path,
+) -> DiagnosticReason:
+    """採信 legacy worktree verdict 時的 WARN ＋ 結構化理由（過渡期可稽核）。
+
+    處置一格未變（照樣採信、照樣走原本的 gate evaluation 路徑）——本函式只負責
+    讓「這一份 verdict 來自 Phase 2a 之前的不受控落點」在 log 與 slice action 上
+    留下痕跡，而不是靜默通過。
+    """
+
+    reason = diagnostic_reason(
+        "review-verdict-legacy-worktree-source",
+        (
+            "採信 worktree 內的 legacy review verdict（Phase 2a 之前派工的 reviewer job）"
+            "；該落點在同 UID 下可被 builder 代寫，僅為過渡期相容。"
+        ),
+        source="manager._finalize_review_job:legacy-verdict-channel",
+        reviewer_job_id=review_job.get("job_id"),
+        verdict_path=str(verdict_path),
+    )
+    logger.warning(
+        "review verdict legacy channel: slice=%s reviewer_job=%s path=%s",
+        slice_id,
+        review_job.get("job_id"),
+        verdict_path,
+    )
+    try:
+        registry.record_action(
+            slice_id,
+            action="foreign-review-legacy-verdict-source",
+            actor="manager",
+        )
+    except Exception:  # noqa: BLE001 - 稽核註記失敗不得讓合法 review 卡住
+        pass
+    return reason
 
 
 def _finalize_review_job(
@@ -1349,8 +1462,12 @@ def _finalize_review_job(
         )
         _apply_review_evaluation(registry, slice_id, evaluation)
         return evaluation, "needs_human", "foreign-review-absent"
-    verdict_path = foreign_review.review_verdict_path(worktree)
-    if not verdict_path.is_file():
+    verdict_source = _resolve_review_verdict_source(
+        review_job=review_job,
+        worktree=worktree,
+        coordinator_root=coordinator_root,
+    )
+    if verdict_source is None:
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
             state="absent",
@@ -1365,14 +1482,32 @@ def _finalize_review_job(
         )
         _apply_review_evaluation(registry, slice_id, evaluation)
         return evaluation, "needs_human", "foreign-review-absent"
+    verdict_path, verdict_channel = verdict_source
     try:
-        verdict = foreign_review.read_review_verdict_file(
-            verdict_path,
-            builder_job_id=builder_job["job_id"],
-            reviewer_job_id=review_job["job_id"],
-            candidate=candidate,
-            launch_identity=reviewer_identity,
-        )
+        if verdict_channel == foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL:
+            # 綁定欄位（job id／candidate／reviewer identity）由 Manager 依 job
+            # registry 推導，payload 自述一律忽略——見 read_spool_review_verdict()。
+            verdict = foreign_review.read_spool_review_verdict(
+                verdict_path,
+                builder_job_id=builder_job["job_id"],
+                reviewer_job_id=review_job["job_id"],
+                candidate=candidate,
+                launch_identity=reviewer_identity,
+            )
+        else:
+            _warn_legacy_review_verdict_channel(
+                registry,
+                slice_id=slice_id,
+                review_job=review_job,
+                verdict_path=verdict_path,
+            )
+            verdict = foreign_review.read_review_verdict_file(
+                verdict_path,
+                builder_job_id=builder_job["job_id"],
+                reviewer_job_id=review_job["job_id"],
+                candidate=candidate,
+                launch_identity=reviewer_identity,
+            )
     except Exception:
         evaluation = _write_gate_evaluation(
             slice_id=slice_id,
@@ -1402,6 +1537,9 @@ def _finalize_review_job(
         coordinator_root=coordinator_root,
     )
     _apply_review_evaluation(registry, slice_id, evaluation)
+    if verdict_channel == foreign_review.REVIEW_VERDICT_CHANNEL_SPOOL:
+        # 權威副本已落成 immutable gate evaluation；spool 那份轉唯讀。
+        foreign_review.seal_review_verdict_spool(verdict_path)
     gate_status = "passed" if verdict["state"] == "passed" else "failed"
     return evaluation, gate_status, reason
 

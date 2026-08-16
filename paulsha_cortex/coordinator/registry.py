@@ -571,10 +571,18 @@ class JobRegistry:
             "workflow_phase", "workflow_repo_root", "workflow_input_root", "source_revision",
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
             "workflow_test_policy", "usage_reason", "started_at", "exited_at",
+            "review_verdict_channel",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        # trust-root Phase 2a：通道標記只有一個合法字面值。任何其他值都可能是被
+        # 改過的狀態檔（想把新 job 偽裝成 legacy 以打開 worktree fallback）→ fail-closed。
+        verdict_channel = job.get("review_verdict_channel")
+        if verdict_channel is not None and verdict_channel != "spool":
+            raise ValueError(
+                f"coordinator 狀態檔 review_verdict_channel 非法（fail-closed）: {self._state_path}"
+            )
         for field in ("usage", "usage_raw"):
             value = job.get(field)
             if value is not None and not isinstance(value, dict):
@@ -859,6 +867,7 @@ class JobRegistry:
         workflow_builder_job_id: str | None = None,
         workflow_stage_execution_key: str | None = None,
         workflow_test_policy: str | None = None,
+        review_verdict_channel: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -911,6 +920,13 @@ class JobRegistry:
             # harvest 時與 registry 現有 WorkflowRun.steps 的現值比對，drift 一律
             # fail closed（見 manager._workflow_acceptance_definition_drifted）。
             "workflow_test_policy": workflow_test_policy,
+            # trust-root Phase 2a：reviewer job 的 verdict 交付通道。
+            # `"spool"` ＝ 以 per-job verdict spool 派工（`<coordinator_root>/
+            # review-verdicts/<job_id>/verdict.json`），harvest 端**只**認該落點；
+            # `None` ＝ 本修法之前派工的 in-flight job，harvest 端才允許回退讀
+            # worktree 內的 legacy verdict（並記 WARN）。舊狀態檔沒有這個欄位，
+            # 因此 legacy 判定天然正確，不需要遷移。
+            "review_verdict_channel": review_verdict_channel,
             "workflow_evidence": None,
             # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
             # `update_headless_result` 收到失敗結果且能分類時才會被寫入。

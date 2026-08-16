@@ -533,6 +533,34 @@ def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(path.resolve()) for path in required))
 
 
+def _verdict_spool_add_dirs(
+    verdict_spool_dir: str | None,
+    *,
+    read_only: bool,
+    review_only: bool,
+) -> tuple[str, ...]:
+    """trust-root Phase 2a：reviewer 專屬 verdict spool 的 `--add-dir` 放行清單。
+
+    verdict 落點搬出 worktree 之後（spec §R2），executor 自己的 sandbox 會把
+    `<coordinator_root>/review-verdicts/<job_id>/` 擋在工作區之外——codex
+    `--sandbox workspace-write` 只放行 cwd、claude `acceptEdits` 只覆蓋工作目錄。
+    這裡沿用既有的 `--add-dir` 機制**只**放行那一個 per-job 目錄（不是整棵
+    coordinator 樹），與 `_linked_worktree_git_write_dirs()` 的窄放行同一個模式。
+
+    read-only／review-only 契約下不放行任何寫入路徑：那些 persona 依契約不寫檔，
+    verdict 走終局 JSON 契約（workflow lane），不需要也不該開這個洞。
+    """
+
+    if verdict_spool_dir is None:
+        return ()
+    if read_only or review_only:
+        raise ValueError("read-only launcher cannot be granted a verdict spool write path")
+    path = Path(verdict_spool_dir)
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError("verdict spool directory must be an absolute non-symlink path")
+    return (str(path.resolve()),)
+
+
 def build_copilot_argv(
     *,
     prompt: str,
@@ -545,6 +573,7 @@ def build_copilot_argv(
     read_only: bool = False,
     review_only: bool = False,
     commit_required: bool = False,
+    verdict_spool_dir: str | None = None,
 ) -> list[str]:
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required Copilot builder requires enforced workspace-write")
@@ -577,6 +606,10 @@ def build_copilot_argv(
             argv += ["--add-dir", git_write_dir]
     elif allow_unsafe:
         argv.append("--allow-all")
+    for spool_dir in _verdict_spool_add_dirs(
+        verdict_spool_dir, read_only=read_only, review_only=review_only
+    ):
+        argv += ["--add-dir", spool_dir]
     return argv
 
 
@@ -593,6 +626,7 @@ def build_claude_argv(
     review_only: bool = False,
     review_terminal_kind: str | None = None,
     commit_required: bool = False,
+    verdict_spool_dir: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
@@ -674,6 +708,10 @@ def build_claude_argv(
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
+    for spool_dir in _verdict_spool_add_dirs(
+        verdict_spool_dir, read_only=read_only, review_only=review_only
+    ):
+        argv += ["--add-dir", spool_dir]
     return argv
 
 
@@ -689,6 +727,7 @@ def build_codex_argv(
     read_only: bool = False,
     review_only: bool = False,
     commit_required: bool = False,
+    verdict_spool_dir: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Codex planning cannot bypass sandbox")
@@ -719,6 +758,10 @@ def build_codex_argv(
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
+    for spool_dir in _verdict_spool_add_dirs(
+        verdict_spool_dir, read_only=read_only, review_only=review_only
+    ):
+        argv += ["--add-dir", spool_dir]
     if model is not None:
         argv += ["--model", model]
     argv.extend(["-o", str(Path(log_dir) / "last.json")])
@@ -868,6 +911,7 @@ class SubprocessLauncher:
         commit_required: bool = False,
         review_terminal_kind: str | None = None,
         effort: str | None = None,
+        verdict_spool_dir: str | None = None,
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
@@ -894,6 +938,11 @@ class SubprocessLauncher:
             raise ValueError("reviewer launcher terminal contract kind invalid")
         if not review_only and review_terminal_kind is not None:
             raise ValueError("reviewer terminal contract requires reviewer mode")
+        # trust-root Phase 2a：verdict spool 放行只對「可寫入的 slice-lane
+        # reviewer」有意義；read-only／review-only 契約下顯性拒絕（見
+        # `_verdict_spool_add_dirs`），不靜默降級成「開了洞卻寫不進去」。
+        if verdict_spool_dir is not None and (read_only or review_only):
+            raise ValueError("read-only launcher cannot be granted a verdict spool write path")
         self._executor = executor
         self._relay_target = relay_target
         self._codex_remote = codex_remote
@@ -911,6 +960,9 @@ class SubprocessLauncher:
         # 存下不驗證——合法值集合在 `build_cg_argv` 驗證，未指定時落地預設
         # `_CG_DEFAULT_EFFORT`；非 cg 的 executor 忽略此欄位。
         self._effort = effort
+        # trust-root Phase 2a：本 job 專屬的 verdict spool 目錄（唯一額外放行的
+        # 寫入路徑）。None ＝ 不放行任何 worktree 之外的寫入（既有行為）。
+        self._verdict_spool_dir = verdict_spool_dir
 
     @property
     def executor(self) -> str:
@@ -951,6 +1003,34 @@ class SubprocessLauncher:
             commit_required=False,
             review_terminal_kind=terminal_kind,
             effort=self._effort,
+        )
+
+    def as_verdict_spool_writer(self, spool_dir: str) -> "SubprocessLauncher":
+        """Return an equivalent launcher that may also write this job's verdict spool.
+
+        trust-root Phase 2a（spec §R2）：review verdict 的權威落點搬到
+        `<coordinator_root>/review-verdicts/<reviewer_job_id>/`，不再是 reviewer
+        worktree 內的檔案。executor 的 sandbox 預設把那裡視為工作區之外，因此
+        Manager 在派工當下用這個特化把**該 job 的那一格**（不是整棵 coordinator
+        樹）加進放行清單；其餘契約（allow_unsafe／model／commit_required）一律
+        原封不動。
+        """
+
+        if self._read_only or self._review_only:
+            raise ValueError("read-only launcher cannot be granted a verdict spool write path")
+        if self._verdict_spool_dir == spool_dir:
+            return self
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=self._allow_unsafe,
+            model=self._model,
+            read_only=False,
+            review_only=False,
+            commit_required=self._commit_required,
+            effort=self._effort,
+            verdict_spool_dir=spool_dir,
         )
 
     def as_commit_required(self) -> "SubprocessLauncher":
@@ -1054,6 +1134,15 @@ class SubprocessLauncher:
         # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
         if self._executor in {"codex", "copilot", "claude", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
+        # trust-root Phase 2a：只有支援 `--add-dir` 的三個 executor 能表達「額外
+        # 放行一個目錄」。agy／cg 是 zero-tool／plan-only，本來就寫不了檔，也不會
+        # 被指派成 slice-lane reviewer；對它們宣告 spool 放行是設定錯誤，顯性拒絕。
+        if self._verdict_spool_dir is not None:
+            if self._executor not in {"codex", "copilot", "claude"}:
+                raise ValueError(
+                    f"executor {self._executor} cannot be granted a verdict spool write path"
+                )
+            builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
         if self._executor == "cg":
