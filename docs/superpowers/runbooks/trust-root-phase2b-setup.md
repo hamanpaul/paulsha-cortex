@@ -4,6 +4,7 @@ work_item: trust-root-isolation
 phase: 2b
 audience: operator
 supersedes: none
+tracking: "#584 — trust-root D6 母議題（本票 reference-only，不 auto-close；R-17 走 policy-exempt:issue-link 豁免）"
 refs:
   - docs/superpowers/specs/trust-root-isolation-spec.md
   - paulsha_cortex/trust_root/registry.py
