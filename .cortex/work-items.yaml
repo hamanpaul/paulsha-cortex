@@ -694,3 +694,27 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-degraded-retention-collision/todo.md'
     excludes: []
+  fix-verification-contract-hash-overwrite:
+    title: 'fix-verification-contract-hash-overwrite'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-verification-contract-hash-overwrite/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#501'
+    excludes: []
+  fix-superseded-terminal-replay:
+    title: 'fix-superseded-terminal-replay'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-superseded-terminal-replay/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#497'
+    excludes: []
+  fix-dirty-recheck-idempotency:
+    title: 'fix-dirty-recheck-idempotency'
+    links:
+      - kind: path
+        ref: 'docs/superpowers/workstreams/fix-dirty-recheck-idempotency/todo.md'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#496'
+    excludes: []
