@@ -165,6 +165,41 @@ def gate_evidence_name_hint(env: Mapping[str, str] | None = None) -> str:
     )
 
 
+def gate_scope_honesty_hint(env: Mapping[str, str] | None = None) -> str:
+    """回傳 dispatch prompt 用的「gate 範圍紀律」說明（同樣由 gate 宣告機械產生）。
+
+    issue #606 的附帶觀察：builder 在兩個 run（``workflow-084f...`` 的 job 488、
+    ``workflow-7812...`` 的 job 492／493）重複出現同一個行為模式——只跑 focused
+    測試看到綠，就自報 ``status=passed`` 並宣稱整組 gate 通過；manager 事後以
+    宣告的 gate 命令獨立重跑，每次都抓到同一個失敗。prompt 的 ``status_policy``
+    過去只說「gate 實際通過才回 passed」，沒有點名「focused 綠 ≠ 宣告的 gate
+    綠」這個推定，模型因此把自己選的子集當成整組的證據。
+
+    修法與 :func:`gate_evidence_name_hint`（#541／#540）同一條紀律：說明文字裡的
+    具體值（gate 名稱與**它真正會被重跑的命令**）由 operator 的 ``PSC_GATE_CMD_*``
+    宣告機械導出，與 :func:`write_gate_ledger` 同源，不手寫第二份真實來源。
+    """
+
+    try:
+        specs = load_gate_specs(env)
+    except GateSpecError:
+        specs = ()
+    if not specs:
+        return (
+            "Scope discipline: a gate counts as passed only when the Manager's own declared "
+            "gate command passes as the Manager runs it. Running a narrower subset of your "
+            "own choosing never authorizes claiming the declared gate is green."
+        )
+    rendered = "; ".join(f'"{spec.name}" = `{spec.command}`' for spec in specs)
+    return (
+        "Scope discipline: after your process exits the Manager re-runs exactly these commands "
+        f"({rendered}), and a passed status is judged against those real results. Running a "
+        "focused subset first is fine, but then report only the scope you actually ran: a green "
+        "focused subset is NOT evidence that the declared gate is green, and inferring the full "
+        "gate from it fails the card closed."
+    )
+
+
 def _gate_timeout(env: Mapping[str, str]) -> int:
     raw = str(env.get(GATE_TIMEOUT_ENV, "")).strip()
     if not raw:

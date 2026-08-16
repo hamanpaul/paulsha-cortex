@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from paulsha_cortex.config import paths
@@ -7465,6 +7465,163 @@ def _repair_findings_prompt_suffix(run, *, coordinator_root: str | Path) -> str:
     return suffix[:2000]
 
 
+# #606：重派 prompt 內 retry-context 的截斷上限。retry-context 的內容全部來自
+# manager 自產證據（gate ledger 的 detail 是 gate 命令的 stderr/stdout 尾段，
+# 見 `gate_ledger.run_gates`），長度不受控——一個失敗的全套 pytest 可以吐出數萬
+# 字。沒有上限的話「附上證據」會直接把 dispatch prompt 撐爆，反而讓重派更糟。
+RETRY_CONTEXT_EVIDENCE_LIMIT = 2000
+RETRY_CONTEXT_MESSAGE_LIMIT = 600
+
+
+def _retry_context_error_row(exc: BaseException) -> dict[str, object]:
+    """把採信錯誤壓成 prompt 可帶的機械欄位（類別＋canonical 訊息＋reason）。
+
+    刻意只取例外物件自己的欄位：``TerminalContractError``／
+    ``GateContradictionError`` 的訊息是 manager 側判準產生的 canonical 文字
+    （見 :mod:`.terminal_contract`），不是模型講的話。
+    """
+
+    message = str(exc)
+    row: dict[str, object] = {
+        "error_class": type(exc).__name__,
+        "message": message[:RETRY_CONTEXT_MESSAGE_LIMIT],
+    }
+    if len(message) > RETRY_CONTEXT_MESSAGE_LIMIT:
+        row["message_truncated"] = True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, str) and reason:
+        row["reason"] = reason
+    validation_path = getattr(exc, "validation_path", None)
+    if isinstance(validation_path, str) and validation_path:
+        row["validation_path"] = validation_path
+    return row
+
+
+def _prior_card_acceptance_error(
+    job: Mapping[str, object], *, registry=None
+) -> dict[str, object] | None:
+    """重新導出「上一次這張卡為什麼沒被採信」的 canonical 錯誤。
+
+    不讀任何既存的敘事欄位（``run.needs_human_reason`` 在 ``retry-card`` 重置時
+    依診斷 invariant 已被清空，見 ``registry._manager_reset_workflow_for_retry_card``），
+    而是對舊 job 重跑既有採信路徑的前兩段——同一份 log、同一份 gate ledger、
+    同一組判準函式，因此拿到的錯誤與當初 harvest 擲出的逐字相同：
+
+    - log 裡沒有可用的 terminal JSON（#569 現場）→ :func:`_extract_terminal_json`
+      的 ``ValueError`` 文字；
+    - 有 envelope 但與 manager 自產 gate ledger 矛盾（#606 現場）→
+      :func:`_assert_terminal_gate_consistency` 擲出的
+      ``GateContradictionError``／``TerminalContractError``。
+
+    取不到就回 ``None``——證據是加值，不得讓「讀不到舊證據」害死一次合法重派。
+    """
+
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return None
+    try:
+        raw = _extract_terminal_json(log_path)
+    except ValueError as exc:
+        return _retry_context_error_row(exc)
+    except Exception:  # pragma: no cover - fail-soft：prompt 組裝不得炸掉 dispatch
+        return None
+    try:
+        _assert_terminal_gate_consistency(raw, job=job, registry=registry)
+    except terminal_contract.TerminalContractError as exc:
+        return _retry_context_error_row(exc)
+    except Exception:  # pragma: no cover - 同上
+        return None
+    return None
+
+
+def _prior_card_failed_gates(job: Mapping[str, object]) -> list[dict[str, object]]:
+    """從舊 job 的 gate ledger 機械讀出 failed gate（名稱＋exit code＋截尾輸出）。
+
+    「哪些算 failed」刻意複用 :func:`terminal_contract._ledger_outcomes`——採信端
+    判定矛盾用的就是它（exit_code 非 0 覆寫自述 status），retry-context 不得另立
+    第二份判準，否則 prompt 會告訴 builder 一組跟採信不同的失敗集合。
+
+    ``detail`` 依 :data:`RETRY_CONTEXT_EVIDENCE_LIMIT` 做**全體**預算截斷（保留
+    尾段，與 ``gate_ledger.run_gates`` 自己的 ``[-2000:]`` 同向：pytest 的 short
+    summary 在尾巴），被截的項目帶 ``detail_truncated`` 明示，不假裝完整。
+    """
+
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return []
+    try:
+        found = terminal_contract.read_gate_ledger(
+            terminal_contract.gate_ledger_path(log_path)
+        )
+        if found is None:
+            return []
+        outcomes = terminal_contract._ledger_outcomes(found[0])
+    except Exception:
+        # ledger 缺席／壞掉／是 symlink：沒有可附的獨立證據，回空集合即可。
+        return []
+    rows: list[dict[str, object]] = []
+    budget = RETRY_CONTEXT_EVIDENCE_LIMIT
+    for name, outcome in outcomes.items():
+        if outcome.get("status") == "passed":
+            continue
+        row: dict[str, object] = {"name": name, "status": "failed"}
+        exit_code = outcome.get("exit_code")
+        if type(exit_code) is int:
+            row["exit_code"] = exit_code
+        detail = outcome.get("detail")
+        if isinstance(detail, str) and detail:
+            kept = detail[-budget:] if budget > 0 else ""
+            budget -= len(kept)
+            row["detail"] = kept
+            if len(kept) < len(detail):
+                row["detail_truncated"] = True
+        rows.append(row)
+    return rows
+
+
+def _workflow_retry_context(
+    prior_jobs: Sequence[Mapping[str, object]], *, registry=None
+) -> dict[str, object] | None:
+    """#606：重派這張卡時要機械附進 prompt 的「前次採信失敗證據」。
+
+    現場（run ``workflow-7812abefede9d9b5d601`` 的 subagent-build，job 492／493）：
+    builder 兩次自稱 ``pytest: passed``，manager ledger 兩次獨立重跑抓到**同一個**
+    失敗，``GateContradictionError`` 逐字相同。``retry-card``（#545／#569）重派用
+    的是原卡 prompt——契約不可竄改，這是對的——但 prompt 裡沒有任何通道讓 builder
+    知道「上次為什麼被拒」，於是無回饋的重試就是決定論的重複，只是燒 job。
+
+    ``prior_jobs`` 就是 :func:`_dispatch_workflow_card` 算出的 ``matching``（同一
+    張卡、同一個 phase，verify／review 另以 candidate 定錨），因此：
+
+    - **首派必然是空集合 → 回 ``None`` → prompt 逐字不變**（#606 要求 2，有測試釘住）；
+    - 內容全部來自 manager 自產證據（自己的 gate ledger、自己的採信判準），一個
+      字都不取自模型輸出，與 #540 的不可竄改性一致。
+
+    ``attempt``／``redispatch_count`` 由這張卡已燒掉的 job 數機械導出，是 #555
+    （per-card 熔斷）要的計數鉤子：本 PR 不實作熔斷，只把計數落到 prompt 與
+    retry-context 上，讓熔斷判準之後有一個既有的、機械的來源可接。
+    """
+
+    if not prior_jobs:
+        return None
+    latest = prior_jobs[-1]
+    context: dict[str, object] = {
+        # 本次是這張卡的第 N 次派工；首派為 1，故 retry-context 恆有 attempt >= 2。
+        "attempt": len(prior_jobs) + 1,
+        # #555 的鉤子：已重派過幾次（首次重派為 1）。
+        "redispatch_count": len(prior_jobs),
+        "previous_job_id": str(latest.get("job_id")),
+        "previous_job_ids": [str(job.get("job_id")) for job in prior_jobs],
+        "evidence_source": "manager-independent",
+        "evidence_char_limit": RETRY_CONTEXT_EVIDENCE_LIMIT,
+        "failed_gates": _prior_card_failed_gates(latest),
+    }
+    error = _prior_card_acceptance_error(latest, registry=registry)
+    if error is not None:
+        context["acceptance_error"] = error
+    return context
+
+
 def _workflow_job_prompt(
     run,
     step,
@@ -7474,6 +7631,7 @@ def _workflow_job_prompt(
     input_snapshot: tuple[dict[str, str], ...] = (),
     candidate_checkout: str | None = None,
     env: Mapping[str, str] | None = None,
+    retry_context: Mapping[str, object] | None = None,
 ) -> str:
     """組出單張 workflow card 的派工 prompt。
 
@@ -7481,6 +7639,10 @@ def _workflow_job_prompt(
     機械導出（預設 ``os.environ``——與 launcher 交給 wrapper 的 env 同源，見
     ``launcher._git_scope_env``），因此 prompt 告訴模型的 gate 名稱集合，與
     job 結束後 manager 自己寫出的 ledger 必為同一組。
+
+    ``retry_context``（#606）：由 :func:`_workflow_retry_context` 從**這張卡的
+    前次 job** 機械導出的採信失敗證據。``None``（首派、或呼叫端未提供）時
+    prompt 逐字不變——重派回饋只加在真的有前次失敗的那條路徑上。
     """
     fallback = _LEGACY_CARD_EXECUTION.get(step.card, (None, None, None, None))
     effective_test_policy = step.test_policy or fallback[3]
@@ -7591,12 +7753,17 @@ def _workflow_job_prompt(
             # #261 R2：成功必須由 gate evidence 證明。模型自述、exit code 為 0、
             # 「沒看到錯誤」三者皆不構成成功授權；manager 會重讀 gate ledger 做
             # 確定性 cross-check，矛盾即 fail closed。
+            #
+            # #606：末段的範圍紀律（「focused 綠不得推定宣告的 gate 綠」）與
+            # 下面 gate_evidence 的 allowed_names 說明同一條機械生成紀律——具體
+            # 的 gate 名稱與命令由 operator 的 PSC_GATE_CMD_* 宣告導出，不手寫。
             "status_policy": (
                 "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
                 "policy) actually passed. Natural-language confidence, an exit code of 0, and "
                 "the absence of an explicit error do NOT authorize passed. If any gate failed, "
                 "report failed; the Manager re-reads the gate ledger and fails closed on any "
-                "contradiction, so a dishonest passed only costs you a retry."
+                "contradiction, so a dishonest passed only costs you a retry. "
+                + gate_ledger.gate_scope_honesty_hint(env)
             ),
             "outputs": {
                 "type": "array",
@@ -7670,6 +7837,9 @@ def _workflow_job_prompt(
         contract["builder_job_id"] = builder_job_id
     if candidate_checkout is not None:
         contract["candidate_checkout"] = candidate_checkout
+    if retry_context is not None:
+        # #606：首派沒有這個鍵，prompt 因此逐字不變（見 `_workflow_retry_context`）。
+        contract["retry_context"] = dict(retry_context)
     effective_commit_policy = step.commit_policy or fallback[2]
     tasks_path = (
         f"openspec/changes/{contract['openspec_ref']}/tasks.md"
@@ -7702,6 +7872,21 @@ def _workflow_job_prompt(
         if effective_commit_policy == "required"
         else ""
     )
+    # #606：明示語句與 retry_context 區塊成對出現。文字固定、數字機械帶入——
+    # 「上一次為什麼被拒」的內容一律留在 retry_context 的結構化欄位裡。
+    retry_context_contract = (
+        (
+            f" This card is being redispatched: attempt {int(retry_context.get('attempt', 2)) - 1} "
+            "was rejected by the Manager's own independent evidence, reproduced verbatim in "
+            "the retry_context block of the contract below. That block is Manager-generated "
+            "(its own gate ledger and its own acceptance error), not the previous attempt's "
+            "self-report, and it is not negotiable. Reproduce that failure first, fix it, and "
+            "only then complete this card; repeating the previous attempt without addressing "
+            "it will be rejected identically."
+        )
+        if retry_context is not None
+        else ""
+    )
     return (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
         "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
@@ -7715,6 +7900,7 @@ def _workflow_job_prompt(
         + reviewer_contract
         + commit_required_contract
         + repair_findings_contract
+        + retry_context_contract
         + " Contract: "
         + json.dumps(contract, ensure_ascii=False, sort_keys=True)
     )
@@ -8362,6 +8548,11 @@ def _dispatch_workflow_card(
                     if step.persona == "reviewer" and identity.executor == "claude"
                     else None
                 ),
+                # #606：`matching` 就是這張卡先前燒掉的 job（首派為空 →
+                # retry_context 為 None → prompt 逐字不變）。retry-card 的重派與
+                # daemon 的 forced retry 都走這唯一一條組裝路徑，因此兩者同時
+                # 拿到回饋，不需要第二份實作。
+                retry_context=_workflow_retry_context(matching, registry=registry),
             ),
             worktree=worktree,
             log_dir=str(Path(coordinator_root).resolve() / "logs" / "workflow"),
