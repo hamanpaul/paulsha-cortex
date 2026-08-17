@@ -685,12 +685,34 @@ def _builder_binding(
     *,
     state_root: Path,
     foreign_ref,
-) -> tuple[Path, str]:
+) -> str:
     """Use the foreign-review edge to select the exact builder job.
 
     A feature workflow legitimately has several build cards, so counting all
     successful build jobs is ambiguous. The terminal review evidence names the
     one builder job whose candidate it actually reviewed.
+
+    #653：回傳的是 **delivery branch**，不是那個 job 的工作區。
+
+    這個函式原本回 `(Path(row["worktree"]).resolve(strict=True), branch)`，而
+    ship 段接著就在那棵樹裡 `git diff`／`add`／`commit`／`rev-parse`／`push`、跑
+    preflight、跑 `_ship_action` 的測試。Phase 2b 三分下那棵樹是 `cortex-builder`
+    擁有的 `0700` clone，而 **#641 已把登記表裡 Manager 對 job 工作樹殘留的讀取
+    授權全部收掉**（runbook 稽核 5b 要求 `/var/lib/cortex/worktree/` 底下零
+    `setfacl`）⇒ 降權模式下 ship phase 會在**第一個 `git -C`** 就
+    `Permission denied`。
+
+    **不得把那條 ACL 加回來**：#644 的論證是那條授權唯一的消費端（在 builder
+    掌控的樹裡執行命令）本身就是一條提權路徑。因此改成「ship 段自己 provision
+    一棵 Manager-owned 的樹」（:func:`_manager_ship_workspace`），而這個函式只保留
+    它真正不可取代的職責——**採信鏈**：foreign review 指名的那一個 builder（或
+    post-archive 的 manager archive）job，必須是 `subject_head == candidate` 的
+    那一筆，delivery branch 由它決定。
+
+    `row["worktree"]` 因此**刻意不再被讀**：ship 段不需要它，而讀它就等於重新
+    宣告一次「Manager 進得去 job 的樹」這個已被撤銷的前提。連
+    `Path(...).resolve(strict=True)` 都不做——那會讓一棵已被 `cortex work gc`
+    回收的工作區把一條合法的交付卡死。
     """
 
     from . import review
@@ -734,12 +756,200 @@ def _builder_binding(
         or row.get("subject_head") != candidate
     ):
         raise RuntimeError("delivery requires the reviewed exact-candidate builder job")
-    worktree = row.get("worktree")
     branch = row.get("branch")
-    if not isinstance(worktree, str) or not isinstance(branch, str) or not branch:
+    if not isinstance(branch, str) or not branch:
         raise RuntimeError("builder delivery binding malformed")
-    root = Path(worktree).resolve(strict=True)
-    return root, branch
+    return branch
+
+
+def _ship_workspace_id(run, candidate: str) -> str:
+    """ship 段那棵 Manager-owned 工作區的識別（#653）——**唯一推導點**。
+
+    形狀與 `_manager_ship_job_task()` 對齊（`wf-<run 摘要>-…`），但多帶
+    candidate 的前綴：ship 段的工作區是綁在 **(run, 這個 candidate)** 上的，而
+    `openspec-archive` 一旦回收成功，`candidate_head` 就會前進到 archive commit
+    ——下一輪 ship 因此拿到**另一個**識別、另一棵樹，前一棵原地留著（它正是
+    `_record_manager_ship_job()` 記在 archive 卡上的 `worktree`，post-archive 的
+    verify／review 卡仍以它為 candidate 樹，見
+    `manager._dispatch_workflow_card()` 的 `builder_jobs[-1]["worktree"]`）。
+
+    反過來說，**同一個 candidate 的每一次 ship tick 共用同一棵樹**：ship phase 會
+    被 tick 很多次（等 preflight、等 PR、等 copilot、等 merge），每次都 clone 一
+    份 35MB 是白燒；而識別穩定之後「這棵樹是不是我的」就有一條可驗證的判準
+    （工作區標記檔的 `branch`／`base`），不必靠猜。
+    """
+
+    if verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        raise ValueError("ship workspace candidate is invalid")
+    digest = hashlib.sha256(run.run_id.encode()).hexdigest()[:10]
+    return f"wf-{digest}-ship-{candidate[:12]}"
+
+
+def _require_pristine_ship_workspace(worktree: Path, *, branch: str, candidate: str) -> None:
+    """ship 段開工前的三條不變式：branch 對、HEAD ＝ candidate、工作區乾淨。
+
+    這三條是 ship 段其餘每一步的前提，集中在這裡驗一次而不是散在各處：
+
+    - **branch**：`_push_exact_candidate()` 推的是 `HEAD:refs/heads/<branch>`，而
+      `_harvest_manager_ship_commit()` 的回收 refspec 也是 `refs/heads/<branch>`
+      ——detached HEAD 或 checkout 在別條 branch 上時兩者都會搬錯東西。
+    - **HEAD ＝ candidate**：archive commit 必須恰好長在被採信的 candidate 上。
+    - **乾淨**：archive 的 allowlist 判準是 `git diff HEAD` ＋
+      `ls-files --others`，任何開工前就存在的殘留都會被算進那個集合。這條同時
+      取代了舊模型裡 `_remove_canonical_untracked_reports()` 的角色——那時 ship
+      段借用 builder 的 clone，reviewer 發佈在裡面的 canonical report 是**未追蹤
+      檔**，必須先刪掉才不會弄髒 exact candidate；現在 ship 段有自己的 pristine
+      clone，「候選樹被 report 弄髒」在結構上不再可能發生。
+    """
+
+    for argv, expected, failure in (
+        (["symbolic-ref", "--quiet", "--short", "HEAD"], branch, "branch"),
+        (["rev-parse", "HEAD"], candidate, "head"),
+    ):
+        probe = subprocess.run(
+            ["git", "-C", str(worktree), *argv],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0 or probe.stdout.strip().lower() != expected.lower():
+            raise RuntimeError(f"manager ship workspace {failure} mismatch")
+    status = subprocess.run(
+        ["git", "-C", str(worktree), "status", "--porcelain"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        raise RuntimeError("manager ship workspace is not pristine")
+
+
+def _reset_ship_workspace(worktree: Path, *, branch: str, candidate: str) -> bool:
+    """把一棵**既有的** ship 工作區打回 `candidate` 的原狀；做不到就回 False。
+
+    ship 段的每一次進入都要求 pristine（見
+    :func:`_require_pristine_ship_workspace`）。前一次 tick 可能在裡面套用了
+    `openspec archive` 卻在 commit 之前掛掉——#653 明載的
+    `archive-applied-needs-commit` 重入路徑就是這條。**新模型的處置是「在新樹裡
+    重跑 archive」**（票上給的兩個選項之一）：套用 archive 是一個對同一個
+    candidate 完全可重現的確定性動作，把樹打回原狀再跑一次，比帶著一堆來歷不明
+    的 dirty 檔往下走安全得多，也讓「崩在中間」與「從沒跑過」收斂成同一個狀態。
+
+    已經 commit、但**還沒回收**的 archive commit 同樣被丟掉——那是對的：回收
+    （`_harvest_manager_ship_commit()`）是採信這件事發生的唯一時點，沒回收就代表
+    沒有任何下游依賴它，重做一次得到的是等價的 commit。回收**成功**之後
+    `candidate_head` 才前進，那時識別已經換了一個（見 :func:`_ship_workspace_id`），
+    根本走不到這裡。
+
+    best-effort：任何一步失敗都回 False，由呼叫端整棵重建，不在這裡 raise。
+    """
+
+    for argv in (
+        ["checkout", "--quiet", "--force", "-B", branch, candidate],
+        ["reset", "--quiet", "--hard", candidate],
+        ["clean", "-qffdx"],
+    ):
+        done = subprocess.run(
+            ["git", "-C", str(worktree), *argv],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if done.returncode != 0:
+            return False
+    try:
+        _require_pristine_ship_workspace(worktree, branch=branch, candidate=candidate)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _manager_ship_workspace(
+    *,
+    run,
+    branch: str,
+    candidate: str,
+    creator=None,
+) -> Path:
+    """#653：ship 段動手的那棵樹——**Manager-owned**，不是 builder 的 clone。
+
+    ## 為什麼一定要換一棵樹
+
+    ship 段（`openspec-archive`／`policy-commit`／preflight／push／`_ship_action`）
+    不是降權派工的對象：`manager._dispatch_workflow_card()` 對 ship phase 一律回
+    `None`，這兩張卡由 Manager 自己在本模組內以 `cortex-manager` 身分同步執行
+    （查證見 #654）。但它們原本全程在 `_builder_binding()` 交回來的 **builder 的
+    clone** 裡動手，而 #641 已把 Manager 對 job 工作樹的讀取授權全部收掉 ⇒ 降權
+    模式下第一個 `git -C` 就 `Permission denied`。**症狀是權限，不是 mount
+    namespace。**
+
+    ## 形狀
+
+    以 `run.candidate_head`（＝這一輪被採信的 candidate）為 base、用
+    `seams.ScriptWorktreeCreator` 在**來源樹**上 provision 一份自己的完整 clone。
+    來源樹 `/var/lib/cortex/repos/<slug>` 是 `cortex-manager` 擁有且可寫（0817
+    裁決），Manager 對自己 clone 出來的樹自然是 owner——commit／preflight／push
+    全部沒有權限問題，也**不需要**任何指向 job 工作樹的 ACL。
+
+    creator 的兩道既有守衛在這條 lane 上剛好就是我們要的：
+
+    - `rev-parse --verify <candidate>^{commit}`：來源樹必須已經有這個 commit
+      ——那正是 #654 的 build／ship 回收通道所保證的不變式。回收沒走完就 provision
+      不起來，而不是在很遠的地方以看不懂的訊息炸開。
+    - `merge-base --is-ancestor <branch> <candidate>`：來源樹的 delivery branch
+      不得帶著 candidate 以外的 commit。
+
+    ## 生命週期
+
+    識別由 :func:`_ship_workspace_id` 決定（穩定於 (run, candidate)）：同一個
+    candidate 的多次 tick 重用同一棵樹（重用前一律打回 pristine，見
+    :func:`_reset_ship_workspace`），candidate 前進時換一棵新的。**不在這裡刪**
+    ——archive 卡的 job 記錄指著這棵樹，post-archive 的 verify／review 卡仍以
+    `builder_jobs[-1]["worktree"]` 當 candidate 樹；回收交給 `cortex work gc`，
+    與 build 卡的 clone 同一套。
+
+    ## 紅線
+
+    沒有 `--reference`／`--shared`／任何把 object store 接回共用的優化（#623 判定
+    共用 object store 與三分隔離互斥），也沒有「Manager fetch 一棵 job 的 clone」
+    （`job_workspace` 模組 docstring 已判定該形狀在三分下結構性不成立）。archive
+    commit 回到來源樹走的是 #654 的 bundle ＋ append-only spool，consumer 仍是全
+    repo 唯一的 `job_workspace.harvest_branch()`。
+    """
+
+    from . import seams
+
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        raise RuntimeError("manager ship workspace source repo missing")
+    source = Path(source_repo)
+    pool = paths.worktree_root_for(source)
+    workspace_id = _ship_workspace_id(run, candidate)
+    target = job_workspace.workspace_path(pool, workspace_id)
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise RuntimeError("manager ship workspace path is not a directory")
+    if target.is_dir():
+        marker = job_workspace.read_marker(target)
+        reusable = (
+            job_workspace.is_job_clone(target)
+            and isinstance(marker, dict)
+            and marker.get("branch") == branch
+            and str(marker.get("base", "")).lower() == candidate.lower()
+        )
+        if reusable and _reset_ship_workspace(
+            target, branch=branch, candidate=candidate
+        ):
+            return target
+        if not job_workspace.is_job_clone(target):
+            # 認不出這是什麼就**不刪**（#478 的爆炸半徑教訓）。這條路徑只該在
+            # operator 手動放了東西進 pool 時走到。
+            raise RuntimeError("manager ship workspace path is occupied")
+        job_workspace.remove_clone(target)
+    if creator is None:
+        creator = seams.ScriptWorktreeCreator(repo=source, wt_root=pool, base="main")
+    created = Path(creator.create(branch, job_id=workspace_id, base_sha=candidate))
+    _require_pristine_ship_workspace(created, branch=branch, candidate=candidate)
+    return created
 
 
 def _manager_archive_applied(run) -> bool:
@@ -1294,132 +1504,6 @@ def _workflow_evidence_payload(
     return payload, job
 
 
-def _remove_canonical_untracked_reports(
-    *,
-    registry,
-    state_root: Path,
-    run,
-    worktree: Path,
-) -> None:
-    """Remove only exact, canonical report publications before delivery.
-
-    Reviewer reports are Manager-owned evidence material rather than Candidate
-    tree content.  They are needed while subsequent review cards snapshot their
-    inputs, but must not make the exact committed Candidate dirty at delivery.
-    Unknown, tracked, symlinked, stale, or hash-drifted paths remain a hard stop.
-    A hash-addressed cleanup intent makes a Manager-completed deletion replayable.
-    """
-
-    trusted: dict[str, str] = {}
-    for job in registry.list_jobs():
-        phase = job.get("workflow_phase")
-        locator = job.get("workflow_evidence")
-        if (
-            job.get("workflow_run_id") != run.run_id
-            or phase not in {"verify", "review"}
-            or job.get("subject_head") != run.candidate_head
-            or job.get("status") != "exited"
-            or job.get("exit_code") != 0
-            or not isinstance(locator, dict)
-            or not isinstance(locator.get("path"), str)
-            or not isinstance(locator.get("hash"), str)
-        ):
-            continue
-        evidence_ref = state_root / str(locator["path"])
-        envelope, _validated_job = _workflow_evidence_envelope(
-            registry=registry,
-            state_root=state_root,
-            run=run,
-            phase=str(phase),
-            expected_ref=str(evidence_ref),
-            expected_hash=str(locator["hash"]),
-        )
-        phase_root = f"reports/{'verify' if phase == 'verify' else 'review'}/"
-        for artifact in envelope["artifacts"]:
-            if (
-                not isinstance(artifact, dict)
-                or set(artifact) != {"path", "sha256", "baseline_sha256"}
-                or not isinstance(artifact.get("path"), str)
-                or not artifact["path"].startswith(phase_root)
-                or not isinstance(artifact.get("sha256"), str)
-                or re.fullmatch(r"[0-9a-f]{64}", str(artifact["sha256"])) is None
-                or artifact.get("baseline_sha256") is not None
-                and (
-                    not isinstance(artifact.get("baseline_sha256"), str)
-                    or re.fullmatch(
-                        r"[0-9a-f]{64}", str(artifact["baseline_sha256"])
-                    ) is None
-                )
-            ):
-                raise RuntimeError("canonical workflow report artifact malformed")
-            relative = Path(str(artifact["path"]))
-            if relative.is_absolute() or ".." in relative.parts:
-                raise RuntimeError("canonical workflow report path escapes repo")
-            # JobRegistry is append-ordered; a retry publication supersedes the
-            # prior canonical body at the same report path.
-            trusted[relative.as_posix()] = str(artifact["sha256"])
-
-    cleanup_payload = {
-        "schema": "cortex-workflow-report-cleanup/v1",
-        "run_id": run.run_id,
-        "candidate": run.candidate_head,
-        "reports": [
-            {"path": path, "sha256": sha256}
-            for path, sha256 in sorted(trusted.items())
-        ],
-    }
-    cleanup_digest = verification.canonical_json_hash(cleanup_payload)
-    cleanup_path = (
-        state_root.resolve() / "evidence" / "report-cleanup" / f"{cleanup_digest}.json"
-    )
-    cleanup_started = cleanup_path.exists() or cleanup_path.is_symlink()
-    if cleanup_started and (
-        cleanup_path.is_symlink()
-        or not cleanup_path.is_file()
-        or cleanup_path.stat().st_mode & 0o222
-    ):
-        raise RuntimeError("workflow report cleanup evidence is not immutable")
-
-    removals: list[Path] = []
-    for relative, expected_hash in sorted(trusted.items()):
-        path = worktree / relative
-        if not path.exists() and not path.is_symlink():
-            if cleanup_started:
-                continue
-            raise RuntimeError("canonical workflow report is missing before cleanup")
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError("canonical workflow report path is not a regular file")
-        resolved = path.resolve(strict=True)
-        try:
-            resolved.relative_to(worktree)
-        except ValueError as exc:
-            raise RuntimeError("canonical workflow report path escapes worktree") from exc
-        actual = hashlib.sha256(resolved.read_bytes()).hexdigest()
-        if actual != expected_hash:
-            raise RuntimeError("canonical workflow report hash drift")
-        tracked = subprocess.run(
-            ["git", "-C", str(worktree), "ls-files", "--error-unmatch", "--", relative],
-            shell=False,
-            capture_output=True,
-            text=True,
-        )
-        if tracked.returncode == 0:
-            raise RuntimeError("canonical workflow report unexpectedly tracked")
-        if tracked.returncode != 1:
-            raise RuntimeError("canonical workflow report tracking state unavailable")
-        removals.append(resolved)
-
-    if trusted:
-        _write_json_evidence(state_root, "report-cleanup", cleanup_payload)
-    for path in removals:
-        path.unlink()
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-
-
 def _run_exact_candidate_preflight(
     *,
     worktree: Path,
@@ -1675,8 +1759,15 @@ def build_production_ship_validator(
     runner: Callable[..., object] = subprocess.run,
     now: Callable[[], float] = time.time,
     snapshot_path: str | Path | None = None,
+    workspace_creator=None,
 ):
-    """Bind review completion to the authenticated, resumable delivery state machine."""
+    """Bind review completion to the authenticated, resumable delivery state machine.
+
+    `workspace_creator` 是 ship 段那棵 Manager-owned 工作區的 provisioning seam
+    （#653）。留 `None` 時由 `_manager_ship_workspace()` 依 `run.workspace_root`
+    自行組一個 `seams.ScriptWorktreeCreator`——生產路徑不必也不應該由呼叫端指定
+    工作區從哪來。
+    """
 
     state_root = Path(coordinator_root).resolve()
 
@@ -1705,18 +1796,21 @@ def build_production_ship_validator(
         expected_issues = tuple(f"{run.repo}#{number}" for number in authority.mapped_issues)
         if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
             raise RuntimeError("WorkflowRun refs differ from current WorkAuthority")
-        worktree, branch = _builder_binding(
+        branch = _builder_binding(
             registry,
             run,
             candidate,
             state_root=state_root,
             foreign_ref=foreign[0],
         )
-        _remove_canonical_untracked_reports(
-            registry=registry,
-            state_root=state_root,
+        # #653：ship 段從這一行起全部在 **Manager-owned** 的樹裡動手。以下每一段
+        # （archive 套用／commit／回收、preflight、push、`_ship_action` 連測試）
+        # 拿到的都是這棵樹，**沒有任何一處**再指向 builder 的 clone。
+        worktree = _manager_ship_workspace(
             run=run,
-            worktree=worktree,
+            branch=branch,
+            candidate=candidate,
+            creator=workspace_creator,
         )
         change = authority.mapped_openspec[0] if len(authority.mapped_openspec) == 1 else None
         active_change = worktree / "openspec" / "changes" / str(change) if change else None

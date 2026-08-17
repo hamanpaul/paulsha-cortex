@@ -27,7 +27,11 @@ work_item: fix-preflight-closeout-order
 
 ### 3. ship validator 三段重排（local closeout 前移）
 
-- [ ] `paulsha_cortex/coordinator/work_bridge.py`：`build_production_ship_validator` 的 `validate`（line 1378）重排——在 `_builder_binding`／`_remove_canonical_untracked_reports`（line 1403-1415）之後、`_pr_metadata`（line 1416）之前插入 local closeout 段：builder worktree 的 `openspec/changes/<change>` 目錄存在時，呼叫 `work_actions._validate_local_archive_inputs`（`work_actions.py:108`）→ 執行官方 archive argv → `_commit_archive_and_require_reverification`（line 783）→ 回傳 `candidate-reverification-required` trusted 結果。change slug 取自 `load_work_authority` 的 `mapped_openspec`（validate 內已有 authority，line 1395-1399），不依賴 `_ship_binding` 的 `pr_number`。
+- [ ] `paulsha_cortex/coordinator/work_bridge.py`：`build_production_ship_validator` 的 `validate`（line 1378）重排——在 `_builder_binding` 與 canonical report 清理（line 1403-1415）之後、`_pr_metadata`（line 1416）之前插入 local closeout 段：工作區的 `openspec/changes/<change>` 目錄存在時，呼叫 `work_actions._validate_local_archive_inputs`（`work_actions.py:108`）→ 執行官方 archive argv → `_commit_archive_and_require_reverification`（line 783）→ 回傳 `candidate-reverification-required` trusted 結果。change slug 取自 `load_work_authority` 的 `mapped_openspec`（validate 內已有 authority，line 1395-1399），不依賴 `_ship_binding` 的 `pr_number`。
+  > 事後註記（#653）：ship 段已改為在 **Manager-owned 的 pristine clone** 裡動手，
+  > 那棵樹不可能帶著 reviewer 發佈的未追蹤 report，上述「canonical report 清理」
+  > 那一步因此連同它的實作一併移除，改由 `_require_pristine_ship_workspace()` 這條
+  > 開工前不變式承擔同一個保證。本行的行號與函式清單保留當時的現場記錄。
 - [ ] `_pr_metadata`（line 1416）、初次 preflight（line 1427-1437）、push（line 1438）、PR 建立（line 1449）、既有 PR preflight＋push（line 1487-1524）與 `_ship_action`（line 1567）全部保持在 local closeout 段之後執行；`_ship_action` 內的 archive 段（`work_actions.py:2904-2924`）與 remote archive 檢查（`work_actions.py:2955-2956`）原樣保留。
 - [ ] 驗收：task 1 的 `test_ship_validate_completes_local_archive_closeout_without_pr_binding` 與 `test_stage_order_closeout_then_preflight_then_ship` 全綠。
 

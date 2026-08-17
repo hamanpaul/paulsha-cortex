@@ -5902,6 +5902,15 @@ def _workflow_report_cleanup_allows_missing(
     ref: str,
     expected_hash: str,
 ) -> bool:
+    """已發佈的 canonical report 不在 `repo_root` 時，是否有 Manager 的刪除意圖佐證。
+
+    #653 之後**產生**這種 evidence 的路徑已經沒有了：ship 段改在自己的 pristine
+    clone 裡動手，不再需要（也不再有權）到 job 的工作樹裡刪 report，因此「報告缺席」
+    不再是交付流程製造出來的正常狀態。本函式保留為**向後相容的容忍面**——升級當下
+    正在進行、已經寫過 `report-cleanup` evidence 的 run 仍要走得完。沒有那份 evidence
+    時一律回 False（缺席 ＝ artifact drift，fail-closed），語意與過去逐條相同。
+    """
+
     directory = coordinator_root / "evidence" / "report-cleanup"
     if directory.is_symlink() or not directory.is_dir():
         return False
