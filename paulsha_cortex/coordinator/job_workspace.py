@@ -580,9 +580,82 @@ def build_bundle_command(*, workspace: str | Path, bundle: str | Path) -> str:
     )
 
 
+def publish_commit_bundle(
+    *,
+    workspace: str | Path,
+    bundle: str | Path,
+    branch: str,
+    exclude: str | None,
+) -> Path:
+    """#649：**in-process 版**的 :func:`build_bundle_command`——producer 是 Manager
+    自己，不是 wrapper script 驅動的 builder。
+
+    存在的理由：ship phase 的 `openspec-archive` commit 由 **Manager 親手**做出來
+    （`work_bridge._commit_archive_and_require_reverification` 直接 `git commit`），
+    不是任何 job 的模型產物，因此沒有 wrapper script 可以掛那段 shell。但**回收
+    通道必須是同一條**——`harvest_branch()` 是「commit 進來源樹」的唯一實作，繞過
+    它另寫一次 `git fetch <某棵樹>` 會同時複製一份 fail-closed 分類，而且會把
+    「Manager fetch 一棵 job 的樹」這個模組 docstring 明文否決的形狀寫回程式碼。
+
+    因此這裡只補 producer 那一半：把 bundle 產出來，交給既有的 consumer 那一半。
+
+    - **正向 ref 寫死 `refs/heads/<branch>`**（不是 `symbolic-ref HEAD`）：呼叫端
+      是 Manager，branch 是它自己記錄的權威值；用 HEAD 反而會在 detached 時發表
+      一個 ref 名對不上的 bundle。
+    - **負向 ref 由呼叫端決定**（`exclude`），而不是寫死 :data:`BASE_REF`：Manager
+      要排除的是「來源樹**已經有**的那個 commit」（＝已被採信的 candidate），而
+      `refs/cortex/base` 是那棵 clone 自己 provision 當下的 pin，兩者不同。
+      `exclude=None` ⇒ 不排除任何東西，bundle 帶完整歷史、無 prerequisite——留給
+      「來源樹沒有那個 commit」的情形（升級前的既有 run、沒有走過 build harvest
+      的測試路徑），否則 `harvest_branch()` 會因缺 prerequisite 而 fail-closed。
+    - `.part` → 放寬 → `mv`：與 wrapper 那條逐條相同，spool 裡看得見的
+      `commits.bundle` 恆為完整檔。
+
+    `git bundle create` 對「沒有任何 commit 可帶」會拒絕產出（空 bundle）——那在
+    這條路徑上是真的出事（Manager 剛做完一個 commit），因此一律 raise，不回 None。
+    """
+
+    if not branch:
+        raise WorkspaceError("commit bundle publication requires a branch name")
+    bundle_path = Path(bundle)
+    if bundle_path.is_symlink() or bundle_path.parent.is_symlink():
+        raise WorkspaceError(f"job workspace commit bundle is a symlink: {bundle_path}")
+    part = bundle_path.with_name(bundle_path.name + COMMIT_BUNDLE_PART_SUFFIX)
+    part.unlink(missing_ok=True)
+    argv = ["-C", str(workspace), "bundle", "create", str(part), f"refs/heads/{branch}"]
+    if exclude is not None:
+        if _SHA_RE.fullmatch(exclude.lower()) is None:
+            raise WorkspaceError(f"commit bundle exclusion is not a commit sha: {exclude!r}")
+        argv.append(f"^{exclude.lower()}")
+    proc = _git(argv)
+    if proc.returncode != 0 or not part.is_file():
+        part.unlink(missing_ok=True)
+        raise WorkspaceError(
+            f"commit bundle creation failed: {(proc.stderr or proc.stdout).strip()}"
+            f"；工作區 {workspace} 的 refs/heads/{branch} 產不出 bundle。"
+            "常見原因：branch 不存在於該工作區、或排除範圍已涵蓋全部 commit"
+            "（`git bundle create` 拒絕產生空 bundle）"
+        )
+    spool_slot.publish_file(part)
+    part.replace(bundle_path)
+    return bundle_path
+
+
 # ---------------------------------------------------------------------------
 # 成果回收（Manager 拉，builder 不推）
 # ---------------------------------------------------------------------------
+
+def commit_present(repo: str | Path, sha: str) -> bool:
+    """`repo` 的 object store 裡有沒有這個 commit（#649）。
+
+    用途只有一個：決定 :func:`publish_commit_bundle` 的 `exclude` 能不能用——
+    bundle 的 prerequisite 必須是**來源樹已經有**的 commit，否則 `harvest_branch()`
+    會在 fetch 那一步以「prerequisite 缺席」fail-closed。
+    """
+
+    if not isinstance(sha, str) or _SHA_RE.fullmatch(sha.lower()) is None:
+        return False
+    return _git(["-C", str(repo), "rev-parse", "--verify", "--quiet", f"{sha.lower()}^{{commit}}"]).returncode == 0
 
 def source_branch_head(source_repo: str | Path, branch: str) -> str | None:
     """來源樹上 `refs/heads/<branch>` 現在指到哪；不存在／不可讀時回 None。"""

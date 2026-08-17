@@ -13,7 +13,29 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+
+
+def make_job_clone(source: Path, target: Path, *, branch: str) -> Path:
+    """#649：造出一棵**真的** per-job clone（#623 之後工作區的實際形狀）。
+
+    來源樹與工作區是兩個獨立的 object store，工作區 checkout 在 `<branch>` 上，
+    來源樹留在自己的預設 branch——那正是成果回收（`job_workspace.harvest_branch()`）
+    能成立的前提：`git fetch` **拒絕**寫入一條正被 checkout 的 branch。
+
+    測試若把工作區與來源樹寫成同一個目錄（#623 之前 `git worktree` 共用 object
+    store 時的殘留寫法），回收路徑會撞上那條拒絕，而那是 fixture 的問題不是產品的。
+    """
+
+    subprocess.run(
+        ["git", "clone", "-q", "--branch", branch, str(source), str(target)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(target), "config", "user.email", "test@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(target), "config", "user.name", "Test"], check=True)
+    return target
 
 
 def make_fake_repo(root: Path, *, branch: str = "main") -> Path:

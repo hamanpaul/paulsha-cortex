@@ -8,6 +8,50 @@
 ## [Unreleased]
 
 ### Added
+- **#649 / trust-root Phase 2b：ship phase 的成果回收——`openspec-archive` 的 commit
+  沒有進來源樹，`matches_candidate()` 的 ancestry 檢查因此是條死路**——票上的第一步是
+  查證，而查證結果改變了範圍。**(1) ship 卡不是降權派工的對象**：兩張 ship 卡的
+  persona 是 `manager`，而 `_dispatch_workflow_card()` 對 `current_phase == "ship"`
+  一律回 `None`——它們不經 launcher、不 spawn job，由 Manager 自己在 `work_bridge` 內
+  以 deterministic 身分執行。沒有 template unit、沒有 `ReadWritePaths=<pool>/%i`、
+  沒有 `226/NAMESPACE`；#649 票上「#648 的症狀在 ship phase 原封不動」這句不成立。
+  **(2) `matches_candidate()` 的 ancestry 檢查目前是壞的**：它只在 post-archive
+  repair 走到，並在 `run.workspace_root` 上跑 `merge-base --is-ancestor`；而 archive
+  commit 是 Manager 在**工作區**裡做的，#623 改成 per-job 完整 clone（各自的 object
+  store）之後來源樹沒有它 ⇒ git 回 **128**（`Not a valid commit name`，不是 1）⇒
+  該卡被濾掉 ⇒ ship audit fail-closed。既有測試綠著，是因為它的 fixture 把兩個 commit
+  都直接做在來源樹裡（#623 之前共用 object store 的形狀）。**(3) #651 讓同一個缺口多
+  長一個症狀**：build 卡改 per-job 之後 base ＝ `run.candidate_head`，post-archive 的
+  `retry-build` 因此拿 archive commit 當 base 去 provision，而 creator 的第一道守衛是
+  在來源樹 `rev-parse --verify <base>` ⇒ `git worktree base invalid`，重派連工作區都
+  建不起來。**回收模型選 (a)**（票上兩條路）：archive commit **就是**下一輪的
+  candidate（reset 之後 verify／review 對著它重跑、`_builder_binding()` 以它選工作區、
+  PR 推的也是它），把它排除在鏈外等於重寫整條 post-archive 語意，不是縮小範圍。沿用
+  #637 的 bundle ＋ append-only spool，但 **producer 換成 Manager 自己**——新增
+  `job_workspace.publish_commit_bundle()`（in-process 版的 `build_bundle_command()`），
+  consumer 那一半 `harvest_branch()` 一個位元組不變，「commit 進來源樹」全 repo 仍只有
+  一個實作；刻意不寫 `git -C <來源樹> fetch <那棵工作區>`，那正是 `job_workspace` 模組
+  docstring 已判定在三分下結構性不成立的形狀。順序是 `git commit` →
+  `reserve_job_id()` → 建 spool → 產 bundle → harvest → **回收後 branch head 必須恰等
+  於新 commit** → 才 `_record_manager_ship_job()` 與 `_manager_reset_workflow_after_archive()`；
+  `candidate_head` 一旦推進，整條鏈就開始假設來源樹有那個 commit，回收失敗必須擋在推進
+  之前。兩道附帶守衛：commit 必須在記錄的 branch 上（detached HEAD fail-closed）、
+  bundle 的排除點依來源樹有沒有那個 commit 決定（沒有就帶完整歷史，不讓缺
+  prerequisite 弄垮一次合法的回收）。**`matches_candidate()` 沒改**——修的是它的前提。
+  **範圍切分**：票上第 3 點「ship 卡的工作區改 per-job」**不做**，因為查證推翻了它的
+  動機（`%i` 不變式落不到 ship 卡上），並換上一個更大也更真的需求——ship 段全程在
+  **builder 的 clone** 裡動手（`git commit`／preflight／push／`_ship_action` 都在那裡），
+  而 #641 已把 Manager 對 job 工作樹的讀取授權全部收掉 ⇒ 降權模式下會在第一個
+  `git -C` 就 `Permission denied`。修法是把 ship 段搬進 Manager-owned 的樹（此時
+  per-job 目錄名才有意義），連帶處理 `_builder_binding()` 的來源與
+  `archive-applied-needs-commit` 重入路徑，已開後續票，且**必須**建立在本 PR 的回收
+  通道之上。新增 `tests/test_ship_phase_harvest_649.py`（9 條，全部跑正式路徑：真 git
+  repo、真 per-job clone、真 `ScriptWorktreeCreator`），含回收不變式、`rmtree` 後仍取
+  得成果、fail-closed 且不先推進、ancestry 正反兩向、`openspec-archive` →
+  `policy-commit` 接續、spool 定址、`direct` 零回歸；spool 封口對 producer 的強制力需要
+  不同 UID ＋ per-account ACL，單 UID 環境**明確 skip 並說明**（#638 的教訓），skip
+  之前先斷言可測的那一半。突變驗證：拿掉 harvest 之後 9 條轉紅 8 條。
+  詳見 `changelog.d/ship-phase-harvest.md`。
 - **#615 / trust-root Phase 2b M2：reviewer／planner 啟動面降權——三分的另外一半**——
   M1（#584／#603）之後三分只在**檔案權限層**成立：`cortex-reviewer-planner` 帳號、
   HOME、cache、verdict spool 的 `wx` 無 `r` ACL、gitconfig 全部到位，但
