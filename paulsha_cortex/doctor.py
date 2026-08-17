@@ -16,6 +16,7 @@ from urllib.parse import quote
 from unittest.mock import patch
 
 from .github_rate_limit import is_rate_limit_signal
+from .monitor.socket_path import socket_path_fits, socket_path_limit_detail
 
 DOCTOR_SCHEMA = "cortex-doctor/v1"
 AUTO_LABEL = "cortex:auto-on-going"
@@ -993,6 +994,17 @@ def _monitor_path_probes(
     run_root = socket_path.parent
     if not socket_path.is_absolute():
         monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket root must be absolute", True)
+    elif not socket_path_fits(socket_path):
+        # #608：`sun_path` 只有 108 bytes。超限時 bind/connect 會失敗成一句
+        # 沒有數字的 `OSError`，在 live probe 下會被記成「socket 沒在聽」——
+        # 與「monitor 根本沒跑」無法區分。在 live probe 之前先量，讓 doctor
+        # 直接說出這是路徑長度的環境限制，附實際 byte 數。
+        monitor_socket = ProbeResult(
+            "monitor-socket",
+            "fail",
+            socket_path_limit_detail(socket_path, role="monitor socket"),
+            True,
+        )
     elif not _root_is_creatable(run_root):
         monitor_socket = ProbeResult("monitor-socket", "fail", "monitor socket root is not writable/creatable", True)
     elif not live:

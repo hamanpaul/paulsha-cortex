@@ -202,10 +202,10 @@ def test_recv_fails_fast_when_socket_closes_before_newline():
 
 
 @requires_af_unix_bind
-def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
+def test_socket_work_item_read_apis_and_subscription_preserve_legacy(socket_dir):
     project_store = SnapshotStore(config=MonitorConfig(workspaces=()))
     work_store = WorkReadModelStore(_snapshot(_item("active", "ongoing")))
-    socket_path = tmp_path / "monitor.sock"
+    socket_path = socket_dir / "monitor.sock"
     server = MonitorServer(
         store=project_store, work_store=work_store, socket_path=socket_path
     )
@@ -258,7 +258,7 @@ def test_socket_work_item_read_apis_and_subscription_preserve_legacy(tmp_path):
 
 
 @requires_af_unix_bind
-def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
+def test_work_subscription_can_scope_duplicate_work_id_by_repo(socket_dir):
     healthy = ProviderSnapshot(
         provider_id="github:example/acme",
         status="ok",
@@ -284,7 +284,7 @@ def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
             providers={healthy.provider_id: healthy, degraded.provider_id: degraded},
         )
     )
-    socket_path = tmp_path / "monitor.sock"
+    socket_path = socket_dir / "monitor.sock"
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),
         work_store=work_store,
@@ -333,10 +333,10 @@ def test_work_subscription_can_scope_duplicate_work_id_by_repo(tmp_path):
 
 
 @requires_af_unix_bind
-def test_server_stopped_before_start_never_signals_ready(tmp_path):
+def test_server_stopped_before_start_never_signals_ready(socket_dir):
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),
-        socket_path=tmp_path / "monitor.sock",
+        socket_path=socket_dir / "monitor.sock",
     )
     server.stop()
 
@@ -355,8 +355,8 @@ def test_server_stopped_before_start_never_signals_ready(tmp_path):
 
 
 @requires_af_unix_bind
-def test_old_server_teardown_does_not_unlink_replacement_socket(tmp_path):
-    socket_path = tmp_path / "monitor.sock"
+def test_old_server_teardown_does_not_unlink_replacement_socket(socket_dir):
+    socket_path = socket_dir / "monitor.sock"
     store = SnapshotStore(config=MonitorConfig(workspaces=()))
     old_server = MonitorServer(store=store, socket_path=socket_path)
     old_thread = threading.Thread(target=old_server.serve_forever, daemon=True)
@@ -398,11 +398,11 @@ def test_old_server_teardown_does_not_unlink_replacement_socket(tmp_path):
 
 
 @requires_af_unix_bind
-def test_work_subscription_extension_preserves_legacy_queue_full_replacement(tmp_path):
+def test_work_subscription_extension_preserves_legacy_queue_full_replacement(socket_dir):
     server = MonitorServer(
         store=SnapshotStore(config=MonitorConfig(workspaces=())),
         work_store=WorkReadModelStore.empty(),
-        socket_path=tmp_path / "unused.sock",
+        socket_path=socket_dir / "unused.sock",
     )
     subscriber = _Subscriber(projects=None)
     for index in range(subscriber.queue.maxsize):

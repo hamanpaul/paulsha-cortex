@@ -27,21 +27,27 @@ from unittest import mock
 
 import sandbox_support
 from sandbox_support import af_unix_bind_available
+from socket_fixtures import short_socket_dir
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TESTS_DIR = Path(__file__).resolve().parent
 
 
 def _actual_bind_capability() -> bool:
-    """Ground truth：當場真的建立並 bind 一個 AF_UNIX socket。"""
+    """Ground truth：當場真的建立並 bind 一個 AF_UNIX socket。
 
-    with tempfile.TemporaryDirectory(prefix="psc-afunix-truth-") as tmp:
+    #608：路徑走短固定根而非 `TMPDIR`。ground truth 要量的是「這個 runtime 准不准
+    我 bind」，`TMPDIR` 一長，量到的會變成「這條路徑塞不塞得進 sun_path」——那是
+    另一件事，而且會讓這個測試與 probe 一起以錯誤的理由同時說謊。
+    """
+
+    with short_socket_dir(prefix="truth") as tmp:
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError:
             return False
         try:
-            sock.bind(str(Path(tmp) / "truth.sock"))
+            sock.bind(str(tmp / "t.sock"))
         except OSError:
             return False
         finally:

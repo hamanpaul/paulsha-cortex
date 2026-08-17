@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .snapshot import ChangeEvent, SnapshotStore
+from .socket_path import SocketPathTooLongError, validate_socket_path
 from .work_api import (
     WORK_API_SCHEMA,
     AmbiguousWorkItemError,
@@ -111,8 +112,22 @@ class MonitorServer:
         self._connection_threads: list[threading.Thread] = []
         self._connection_threads_lock = threading.Lock()
         self._serve_thread: threading.Thread | None = None
+        self._startup_error: BaseException | None = None
 
     # --- lifecycle ---
+
+    @property
+    def startup_error(self) -> BaseException | None:
+        """`serve_forever` 為何沒能開始服務；還沒失敗過則為 ``None``。
+
+        #608：`serve_forever` 常被丟進背景 thread 跑，此時它 raise 的東西不會回到
+        呼叫端——呼叫端只看到 `wait_until_ready()` 回 ``False``，一個「沒起來」的
+        空結果。socket 路徑超過 `sun_path` 上限正是會走這條路的環境失敗，而
+        「環境不合格」與「服務有缺陷」在那個空結果上完全分不出來。把原因留在這裡，
+        threaded 的呼叫端就能指名道姓地說出是哪一種。
+        """
+
+        return self._startup_error
 
     def _prepare_socket_path(self) -> None:
         if not self._socket_path.exists():
@@ -149,6 +164,17 @@ class MonitorServer:
         # Atomic bind + permission tightening.
         if self._stop_event.is_set():
             return
+        # #608: check `sun_path` *before* touching the filesystem. `bind()` would
+        # otherwise raise a bare `OSError("AF_UNIX path too long")` — no byte
+        # count, no limit, no remediation — after having already created the run
+        # directory. Fail closed on a named error that says which environment
+        # knob is at fault, so an over-long PSC_RUN_ROOT can never be mistaken
+        # for a defect in the service.
+        try:
+            validate_socket_path(self._socket_path, role="monitor socket")
+        except SocketPathTooLongError as exc:
+            self._startup_error = exc
+            raise
         self._socket_path.parent.mkdir(parents=True, exist_ok=True)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         bound = False

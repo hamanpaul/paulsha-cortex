@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from sandbox_support import requires_af_unix_bind
+from socket_fixtures import make_short_socket_dir
 
 from paulsha_cortex import cli
 from paulsha_cortex.doctor import (
@@ -34,8 +36,29 @@ class Result:
         self.stderr = stderr
 
 
+#: #608：`_layout` 在短固定根下造出來的假 home，於本模組跑完後統一清掉。
+#: 用 module-scope fixture 而非改 `_layout` 的簽章：後者要動 15 個呼叫端，而這裡
+#: 真正要保證的只有「socket 的家夠短」與「跑完不留垃圾」兩件事。
+_SHORT_HOME_ROOTS: list[Path] = []
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_short_home_roots():
+    yield
+    for path in _SHORT_HOME_ROOTS:
+        shutil.rmtree(path, ignore_errors=True)
+    _SHORT_HOME_ROOTS.clear()
+
+
 def _layout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
-    home = tmp_path / "home"
+    # #608：這個假 home 底下住著 monitor 的 AF_UNIX socket
+    # （`<home>/.agents/run/cortex/project-monitor.sock`，光固定段就 39 bytes），
+    # 吃 `sun_path` 的 107 bytes 上限。`tmp_path` 掛在 `TMPDIR` 下、長度由環境
+    # 決定，實測連預設 `/tmp` 都已經因為測試名夠長而超限（doctor 過去不量長度，
+    # 所以沒人發現）。home 因此改掛短固定根；`preflight` 與 workspace 沒有長度
+    # 上限，照舊留在 `tmp_path`。
+    home = make_short_socket_dir(prefix="doctor") / "home"
+    _SHORT_HOME_ROOTS.append(home.parent)
     agents = home / ".agents"
     preflight = tmp_path / "preflight"
     preflight.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -501,8 +524,12 @@ def test_monitor_live_probe_requires_connectable_unix_socket(tmp_path: Path) -> 
 
 
 @requires_af_unix_bind
-def test_monitor_protocol_probe_rejects_transport_only_listener(tmp_path: Path, monkeypatch) -> None:
-    socket_path = tmp_path / "run" / "project-monitor.sock"
+def test_monitor_protocol_probe_rejects_transport_only_listener(
+    tmp_path: Path, socket_dir: Path, monkeypatch
+) -> None:
+    # #608：socket 走短固定根（`tmp_path` 吃 TMPDIR 長度會撞 sun_path）；
+    # state root 不 bind，照舊留在 `tmp_path`。
+    socket_path = socket_dir / "run" / "project-monitor.sock"
     socket_path.parent.mkdir()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
