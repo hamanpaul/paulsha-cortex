@@ -246,6 +246,18 @@ class ScriptWorktreeCreator:
             if value:
                 self._run(["-C", str(target), "config", key, value])
 
+        # 成果 bundle 的 `^<base>` 錨點。bundle 要能被來源樹 fetch，它的
+        # prerequisite 就必須是**來源樹已有**的 commit——`exact_base` 正是來源 repo
+        # 自己 `rev-parse --verify` 出來的，所以這條性質由 provisioning 這個單一
+        # 推導點對**每一條 lane** 一致成立。pin 成 clone 內的一個 ref 是因為產
+        # bundle 的是 builder：它讀得到自己的 clone，讀不到 spool 也讀不到 Manager
+        # 的任何狀態（見 `job_workspace.BASE_REF`）。
+        pinned = self._run(
+            ["-C", str(target), "update-ref", job_workspace.BASE_REF, exact_base]
+        )
+        if pinned.returncode != 0:
+            raise ValueError(f"git worktree add failed: {pinned.stderr.strip()}")
+
         job_workspace.write_marker(
             target, branch=branch, base=exact_base, source_repo=self._repo
         )

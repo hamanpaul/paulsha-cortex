@@ -1291,7 +1291,10 @@ class ArgvTests(unittest.TestCase):
         script = argv[2]
         sentinel = str(exit_sentinel_path(handle.log_path))
         self.assertIn(shlex.quote(sentinel), script)
-        self.assertIn('"$?"', script)
+        # #623：模型的 `$?` 先存進 shell 變數（bundle 段夾在中間，見
+        # `build_wrapper_script`），寫進 sentinel 的仍然是**模型**的 exit code。
+        self.assertIn("__psc_rc=$?", script)
+        self.assertIn(f'printf %s "$__psc_rc" > {shlex.quote(sentinel)}', script)
         # 內層 argv 經 shlex.join 安全嵌入；含 -p PROMPT
         inner = shlex.join(["copilot", "-p", "PROMPT"])
         self.assertIn(inner, script)
