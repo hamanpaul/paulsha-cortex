@@ -601,7 +601,12 @@ def compile_combo(
     band: str | None = None,
     repo_root: str | Path | None = None,
 ) -> CompileResult:
-    effective_repo_root = Path(repo_root) if repo_root is not None else paths.repo_root()
+    # #612：`cortex deck compile` 是 operator 手動 CLI，未帶 `repo_root` 時「以當下
+    # 工作目錄為準」是它本來的語意（只讀 `.project-policy.yml` 產 verification
+    # skeleton，不做任何 git mutation），因此 cwd 退路在這裡**顯式**表態。
+    effective_repo_root = (
+        Path(repo_root) if repo_root is not None else paths.repo_root(allow_cwd=True)
+    )
     slug = slugify_task(task)
     if change is not None:
         change = _validate_change_name(change)

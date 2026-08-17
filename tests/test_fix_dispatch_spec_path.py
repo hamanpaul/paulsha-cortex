@@ -11,6 +11,12 @@ hermetic 手法有二，兩者都用：
    不再只 `mkdir` 一個空 `.git`——空目錄現在依契約就不是 repo 根；
 2. 污染由測試**自備**（`make_empty_git_dir()` / monkeypatch 搜尋上界），
    host `/tmp` 有沒有 `.git` 都不影響結果。
+
+#612 起再加一條：推斷**不得**有任何 cwd 通道。舊實作有兩條——相對 spec 路徑的
+`Path.resolve()`，以及 `paths.repo_root()` 未宣告時的 `Path.cwd()` 預設——兩條都
+會把 repo 根解析成 daemon 的工作目錄（＝ operator 的真實 checkout）。因此本檔的
+測試一律以**絕對** spec 路徑餵入，並在需要驗「未宣告」行為時顯式
+`delenv("PSC_REPO_ROOT")`（conftest 預設把它指向 per-test 暫存路徑）。
 """
 
 from pathlib import Path
@@ -19,15 +25,15 @@ import pytest
 
 from git_fixtures import make_empty_git_dir, make_fake_repo
 from paulsha_cortex.coordinator import autonomy
-from paulsha_cortex.coordinator.autonomy import _infer_repo_root
+from paulsha_cortex.coordinator.autonomy import RepoRootResolutionError, _infer_repo_root
 
 
 def _isolated_cwd(tmp_path: Path) -> Path:
-    """未設 `PSC_REPO_ROOT` 時 `paths.repo_root()` 退回 `Path.cwd()`。
+    """驗「向上搜尋」分支時用的無關 cwd。
 
-    要驗「向上搜尋」的分支，cwd 就不能是 spec 的祖先——否則第一段
-    `relative_to(configured)` 早退，根本走不到搜尋迴圈。給一個與受測路徑無
-    祖孫關係的空目錄當 cwd。
+    #612 後 cwd 已不參與推斷，這個 helper 因此不再是必要條件，而是**反向**斷言的
+    載體：把 cwd 換到一個與受測路徑無祖孫關係的空目錄，若哪天推斷又偷偷讀了 cwd，
+    結果就會與斷言不符。
     """
     cwd = tmp_path / "unrelated-cwd"
     cwd.mkdir(exist_ok=True)
@@ -59,7 +65,13 @@ def test_infer_repo_root_keeps_in_repo_path_for_repo_relative_spec(monkeypatch, 
     assert _infer_repo_root(spec_path) == repo_root
 
 
-def test_infer_repo_root_fallback_unchanged_without_configured_repo_root(monkeypatch, tmp_path):
+def test_infer_repo_root_never_falls_back_to_cwd_repo(monkeypatch, tmp_path):
+    """#612：spec 在任何 repo 之外、又沒宣告 `PSC_REPO_ROOT` → fail-closed。
+
+    舊實作回 `spec_path.parent`，而 `paths.repo_root()` 的 cwd 預設更會讓「spec
+    剛好在 cwd 底下」直接回 cwd。這裡把 cwd 設成一個**真的** repo（重演 daemon
+    在 operator checkout 裡跑的形狀）並斷言推斷**不會**採用它。
+    """
     repo_root = make_fake_repo(tmp_path / "repo")
     spec_path = tmp_path / "outside" / "specs" / "foo-spec.md"
     spec_path.parent.mkdir(parents=True)
@@ -68,7 +80,9 @@ def test_infer_repo_root_fallback_unchanged_without_configured_repo_root(monkeyp
     monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
     monkeypatch.chdir(repo_root)
 
-    assert _infer_repo_root(spec_path) == spec_path.parent
+    with pytest.raises(RepoRootResolutionError) as excinfo:
+        _infer_repo_root(spec_path)
+    assert excinfo.value.diagnostic.reason == "repo-root-unresolved"
 
 
 # --- #565 回歸：空 .git 目錄不得被當 repo 根 ---------------------------------
@@ -94,7 +108,11 @@ def test_empty_git_dir_on_path_chain_is_not_a_repo_root(monkeypatch, tmp_path):
 
 
 def test_empty_git_dir_alone_does_not_anchor_repo_root(monkeypatch, tmp_path):
-    """鏈上**只有**空 `.git`（沒有任何真 repo）時，落到既有 fallback 而非污染點。"""
+    """鏈上**只有**空 `.git`（沒有任何真 repo）時，不得落錨在污染點。
+
+    #565 的原斷言是「落到既有 fallback（`spec.parent`）」；#612 之後那條 fallback
+    本身也不存在了，所以斷言改成 fail-closed——重點不變：**污染點不是 repo 根**。
+    """
     polluted = tmp_path / "polluted"
     make_empty_git_dir(polluted)
     spec_path = polluted / "nested" / "specs" / "foo-spec.md"
@@ -104,7 +122,9 @@ def test_empty_git_dir_alone_does_not_anchor_repo_root(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
     monkeypatch.chdir(_isolated_cwd(tmp_path))
 
-    assert _infer_repo_root(spec_path) == spec_path.parent
+    with pytest.raises(RepoRootResolutionError) as excinfo:
+        _infer_repo_root(spec_path)
+    assert excinfo.value.diagnostic.reason == "repo-root-unresolved"
 
 
 def test_worktree_git_file_still_counts_as_repo_root(monkeypatch, tmp_path):
@@ -152,7 +172,9 @@ def test_search_stops_at_shared_temp_root(monkeypatch, tmp_path):
     monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
     monkeypatch.chdir(_isolated_cwd(tmp_path))
 
-    assert _infer_repo_root(spec_path) == spec_path.parent
+    with pytest.raises(RepoRootResolutionError) as excinfo:
+        _infer_repo_root(spec_path)
+    assert excinfo.value.diagnostic.reason == "repo-root-unresolved"
 
 
 def test_repo_below_shared_temp_root_still_resolves(monkeypatch, tmp_path):

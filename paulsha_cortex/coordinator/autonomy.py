@@ -10,6 +10,7 @@ from paulsha_cortex.config import paths
 from .._yaml import YAMLError, safe_load
 from . import completion
 from .contract_command import build_dispatch_prompt
+from .diagnostics import DiagnosticReason, diagnostic_reason
 from .dispatcher import _default_git_runner
 from .launcher import AgentLauncher, LaunchHandle
 from .model_identities import load_model_identities
@@ -118,6 +119,18 @@ def parse_spec_frontmatter(path) -> dict:
         meta["model_id"] = data.get("model_id") if isinstance(data.get("model_id"), str) else None
         meta["repo"] = data.get("repo") if isinstance(data.get("repo"), str) else None
         meta["parse_error"] = exc.as_payload()
+        return meta
+    except RepoRootResolutionError as exc:
+        # #612：spec 路徑推不出 repo 根（相對路徑／無 git 根且未宣告
+        # PSC_REPO_ROOT）。掃描不該因此炸掉整輪，但這份 spec 也**不得**被派工——
+        # 落成 parse_error，`dispatch` 就永遠停在 hold，理由則由 DiagnosticReason
+        # 帶著走。
+        meta["slice_id"] = data.get("slice_id") if isinstance(data.get("slice_id"), str) else None
+        meta["parse_error"] = {
+            "code": exc.diagnostic.reason,
+            "field": "path",
+            "message": exc.diagnostic.detail,
+        }
         return meta
 
 
@@ -283,14 +296,65 @@ def _repo_search_boundaries() -> frozenset[Path]:
     return frozenset(roots)
 
 
+class RepoRootResolutionError(ValueError):
+    """spec 路徑推不出 repo 根，且拒絕退回 cwd（#612）。
+
+    繼承 `ValueError` 是為了沿用既有的處置面：`complete_tick` 的 per-job
+    `except Exception`、`work` action 的 `ValueError` 出口、daemon 的 tick
+    isolation（#246）都已經接得住，因此本例外只改變「打在錯的樹上」這件事，
+    不改變任何呼叫端原本的錯誤處置形狀。
+
+    `diagnostic` 是 #570／#527 的 :class:`DiagnosticReason`：呼叫端要落 evidence
+    或推 `needs_human` 時直接取用，不必從字串反推理由。
+    """
+
+    def __init__(self, diagnostic: DiagnosticReason) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(f"{diagnostic.reason}: {diagnostic.detail}")
+
+
 def _infer_repo_root(spec_path: Path) -> Path:
-    configured = paths.repo_root().resolve()
+    """從 spec 路徑解析它所屬的 repo 根——**推不出來就失敗，絕不退回 cwd**（#612）。
+
+    舊實作有兩條靜默的 cwd 通道，兩條都會讓 production 動作打在錯的樹上：
+
+    1. `spec_path.resolve()` 對**相對**路徑是相對 cwd 解析的。daemon 的
+       `WorkingDirectory` 正是 operator 的真實 checkout，因此任何從 slice
+       spec／config／payload 滲入的相對路徑，都會把 repo 根解析成那個 checkout；
+    2. `paths.repo_root()` 未設 `PSC_REPO_ROOT` 時預設 `Path.cwd()`，於是連
+       第一段的 `relative_to(configured)` 早退也會命中同一個 checkout。
+
+    #610 實測的後果：`manager.complete_tick → _completion_candidate_ref` 對
+    operator 的真實 repo 跑 `git fetch --no-tags origin main`（連帶打真實
+    github.com）。fetch 本身良性，但同一條路徑家族還有 `_resolve_target_base_sha`
+    的 fetch、`_candidate_ancestry_summary` 的 `rev-parse`／`merge-base`、
+    verification／review 的 worktree 操作——只要其中一個有寫入語意就是事故。
+
+    #623 的 Phase 2b 佈局讓這條更緊：Manager unit 帶 `ProtectHome=yes`，repo 源碼
+    樹要搬進 Manager-owned 樹，任何「落回 cwd 或 operator checkout」的解析都是
+    **無聲的錯誤目標**。因此路徑正規化一律在進件邊界完成：進來的 spec 路徑必須
+    是絕對路徑，推不出 repo 根時 fail-closed 並帶 :class:`DiagnosticReason`。
+    """
+    if not spec_path.is_absolute():
+        raise RepoRootResolutionError(
+            diagnostic_reason(
+                "spec-path-not-absolute",
+                "spec 路徑為相對路徑，解析 repo 根會落在當下工作目錄（#612）；"
+                "spec 路徑必須在進件邊界正規化成絕對路徑後才能推斷 repo 根",
+                source="autonomy._infer_repo_root:relative-spec-path",
+                spec_path=str(spec_path),
+            )
+        )
+
+    configured_raw = paths.configured_repo_root()
+    configured = configured_raw.resolve() if configured_raw is not None else None
     resolved_spec = spec_path.resolve()
-    try:
-        resolved_spec.relative_to(configured)
-        return configured
-    except ValueError:
-        pass
+    if configured is not None:
+        try:
+            resolved_spec.relative_to(configured)
+            return configured
+        except ValueError:
+            pass
 
     agents_dir = Path.home() / ".agents"
     boundaries = _repo_search_boundaries()
@@ -302,9 +366,17 @@ def _infer_repo_root(spec_path: Path) -> Path:
                 continue
             return parent
 
-    if os.getenv("PSC_REPO_ROOT"):
+    if configured is not None:
         return configured
-    return resolved_spec.parent
+    raise RepoRootResolutionError(
+        diagnostic_reason(
+            "repo-root-unresolved",
+            "spec 路徑向上找不到 git repo 根，且未宣告 PSC_REPO_ROOT（#612）；"
+            "拒絕退回 spec 所在目錄／cwd——production 動作必須有顯式的目標 repo",
+            source="autonomy._infer_repo_root:unresolved",
+            spec_path=str(resolved_spec),
+        )
+    )
 
 
 def _resolve_contract_path(path_value: str | None, repo_root: Path) -> Path | None:

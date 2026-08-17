@@ -320,11 +320,21 @@ class TestRecoverPreCandidateOnFreshFailure:
     必須乾淨地一次到位（state/gate_state 同步回 pending），不留半復原中間態。"""
 
     def test_recover_pre_candidate_cleanly_resets_failed_failed_slice(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch
     ) -> None:
+        import subprocess
         from unittest.mock import MagicMock
 
         from paulsha_cortex.coordinator.dispatcher import Dispatcher
+
+        # #612：`recover-pre-candidate` 會走 `worktree_reclaim`，其預設 git runner
+        # 打的是 `paths.repo_root()`。舊實作未宣告 `PSC_REPO_ROOT` 時退回
+        # `Path.cwd()`＝ operator 的真實 checkout，因此這個測試以前是在**真 repo**
+        # 上跑 `git worktree list --porcelain`。改成自備一個空 repo 並顯式宣告。
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        monkeypatch.setenv("PSC_REPO_ROOT", str(repo))
 
         state_path = tmp_path / "jobs.json"
         reg = JobRegistry(state_path=state_path)

@@ -41,6 +41,34 @@ def specs_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture
+def policy_repo_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """#612：`init-sample` 的 verification 骨架來自 `<repo_root>/.project-policy.yml`。
+
+    以前 `paths.repo_root()` 未宣告時退回 `Path.cwd()`，於是這個測試讀的是
+    **operator 真實 checkout** 的 `.project-policy.yml`——測試綠不綠取決於在哪個
+    目錄跑 pytest。改成自備一份最小 policy 並顯式宣告 `PSC_REPO_ROOT`。
+    """
+    repo = tmp_path / "policy-repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / ".project-policy.yml").write_text(
+        "policy_version: 1.0.17\n"
+        "preflight:\n"
+        "  steps:\n"
+        "    - name: policy\n"
+        "      kind: validation\n"
+        '      argv: ["python3", "-m", "policy_check", "--repo", "."]\n'
+        "      timeout_seconds: 300\n"
+        "    - name: tests\n"
+        "      kind: tests\n"
+        '      argv: ["python3", "-m", "pytest", "tests/", "-q"]\n'
+        "      timeout_seconds: 1800\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PSC_REPO_ROOT", str(repo))
+    return repo
+
+
 def _seed_emitted_spec(specs_root: Path, *, change: str) -> Path:
     path = specs_root / f"{change}-build.md"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +102,7 @@ def _seed_non_hold_spec(specs_root: Path, *, change: str) -> Path:
 def test_init_sample_routes_before_coordinator_and_prints_hold_checklist(
     monkeypatch: pytest.MonkeyPatch,
     specs_root: Path,
+    policy_repo_root: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     emitted = _seed_emitted_spec(specs_root, change="demo-change")

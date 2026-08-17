@@ -137,6 +137,30 @@
   （自檢 `job_writable_count` **5 → 0**、R9 denied 條數等）。規模統計
   35 → **43** 個 sudo 點、133 → **156** 個驗證點。
   詳見 `changelog.d/phase2b-runbook-realign.md`。
+- **#612：repo root 的 cwd fallback 是危險預設——相對路徑輸入使 production 動作
+  （`git fetch` 等）落在真實 checkout**——`paths.repo_root()` 舊實作未宣告
+  `PSC_REPO_ROOT` 時退回 `Path.cwd()`，而 manager daemon 的 `WorkingDirectory` 正是
+  operator 的真實 cortex checkout；`autonomy._infer_repo_root` 對**相對** spec 路徑
+  的 `Path.resolve()` 也接到同一個 cwd。於是「解析不出目標 repo」不是失敗，而是
+  **靜默打在錯的樹上**。清點出九條這樣的呼叫路徑，其中三條有**寫入**語意
+  （`worktree_reclaim` 的 `git worktree remove --force`／`prune`、
+  `ScriptWorktreeCreator` 的 worktree 建立、`installer.render_units` 把錯的
+  `WorkingDirectory=` 持久化進 systemd unit），另有一條會把錯 repo 的 `rev-parse`
+  結果寫成 candidate SHA 進 handoff manifest。#565／#607 收掉的是 `/tmp` 那半，
+  本次收 cwd 這半。改法為 fail-closed 取代 silent fallback：`paths.repo_root()` 未
+  宣告即拋 `RepoRootUnresolvedError`（新增 `configured_repo_root()` 讓「有沒有宣告」
+  可被分辨，cwd 語意改由 `allow_cwd=True` 在 operator 手動 CLI 上顯式表態）；
+  `_infer_repo_root` 拒收相對 spec 路徑、推不出 repo 根時帶 `DiagnosticReason`
+  fail-closed（`spec-path-not-absolute`／`repo-root-unresolved`），不再回
+  `spec.parent`——那條退路會讓 `git` 自己向上走回被 #565 搜尋上界／`~/.agents` 名稱
+  規則刻意排除掉的 repo。與 #623 的 Phase 2b 佈局相容：repo 源碼樹遷入 Manager-owned
+  樹之後，唯一的目標來源就是顯式的 `PSC_REPO_ROOT` 或顯式的絕對 spec 路徑。新增
+  `tests/test_repo_root_fail_closed_612.py`（13 個不變式測試，每個都把 cwd 設成真
+  repo 並斷言零 git 打向它）。連帶修掉四處**非 hermetic** 測試：`conftest` 的
+  `_clear_runtime_env` 從未涵蓋 `PSC_REPO_ROOT`（全套測試的 manager 目標 repo 一直是
+  跑 pytest 的當下目錄，比照 #303 改指 per-test 暫存路徑）、兩個 recover-pre-candidate
+  測試實際在真 checkout 上跑 `git worktree list`、`init-sample` 測試讀的是真 checkout
+  的 `.project-policy.yml`。詳見 `changelog.d/repo-root-fail-closed.md`。
 - **#618 / trust-root Phase 2b：補上 `cortex service run`——permgen 的 manager unit
   `ExecStart` 指向一個不存在的 verb**——產生的 system unit 寫
   `ExecStart=<venv>/bin/cortex service run`，但 porcelain 只有 `install`／`start`／

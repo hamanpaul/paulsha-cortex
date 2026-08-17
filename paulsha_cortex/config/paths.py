@@ -163,8 +163,51 @@ def project_config_root() -> Path:
     return resolve_project_config_root()
 
 
-def repo_root() -> Path:
-    return _resolve_root("PSC_REPO_ROOT", Path.cwd())
+class RepoRootUnresolvedError(RuntimeError):
+    """`PSC_REPO_ROOT` 未宣告，且呼叫端沒有顯式表態要用 cwd（#612）。
+
+    刻意繼承 `RuntimeError` 而非 `ValueError`：daemon 的 tick isolation（#246）
+    攔的是 `(ValueError, RuntimeError, OSError)`，兩者都在其中，但 `RuntimeError`
+    可與 registry 那族「契約驗證失敗」的 `ValueError` 區分開來——這條不是資料不
+    合法，是**執行環境沒有宣告目標 repo**。
+    """
+
+
+def configured_repo_root() -> Path | None:
+    """只回 `PSC_REPO_ROOT` 顯式宣告的值；未宣告回 `None`（**不猜**）。
+
+    #612：`repo_root()` 舊實作的預設值是 `Path.cwd()`，於是「沒有宣告」與「宣告
+    成當下工作目錄」在型別上無從分辨，呼叫端也就無從 fail-closed。把「有沒有宣告」
+    這個資訊獨立出來，讓需要判斷的呼叫端（`autonomy._infer_repo_root`）能先問
+    「宣告了嗎」再決定要不要走推斷。
+    """
+    return _env_path("PSC_REPO_ROOT")
+
+
+def repo_root(*, allow_cwd: bool = False) -> Path:
+    """本 instance 治理的目標 repo 根。
+
+    #612：**預設 fail-closed**。舊實作 `_resolve_root("PSC_REPO_ROOT", Path.cwd())`
+    在未宣告時靜默退回 `Path.cwd()`，而 daemon 的 `WorkingDirectory` 正是 operator
+    的真實 checkout——於是任何解析不出目標的呼叫（相對 spec 路徑、缺 env 的
+    unit）都不是失敗，而是**打在錯的樹上**：`git fetch`／`rev-parse`／
+    `merge-base`／worktree 建立全部落到 operator 的工作區。#623 之後 repo 源碼樹
+    會搬進 Manager-owned 樹，「猜 cwd」只會更錯。
+
+    需要 cwd 語意的呼叫端（operator 手動 CLI）必須顯式傳 `allow_cwd=True`——意圖
+    寫在呼叫點上，不再由預設值默默生效。
+    """
+    explicit = configured_repo_root()
+    if explicit is not None:
+        return explicit
+    if allow_cwd:
+        return Path.cwd()
+    raise RepoRootUnresolvedError(
+        "PSC_REPO_ROOT 未宣告，拒絕退回 cwd（#612）："
+        "production 動作必須有顯式的目標 repo 才能執行。"
+        "請設定 PSC_REPO_ROOT，或由呼叫端顯式傳入 repo root；"
+        "operator 手動 CLI 若確實要以當下工作目錄為準，請顯式 allow_cwd=True。"
+    )
 
 
 def _canonical_repo_root(repo: Path) -> Path:
@@ -182,6 +225,10 @@ def worktree_root_for(repo: Path) -> Path:
     return repo.parent / f"{repo.name}-worktrees"
 
 
-def worktree_root() -> Path:
-    """coordinator 派工 worktree pool 的預設路徑。"""
-    return worktree_root_for(repo_root())
+def worktree_root(*, allow_cwd: bool = False) -> Path:
+    """coordinator 派工 worktree pool 的預設路徑。
+
+    `allow_cwd` 原樣傳給 `repo_root()`——worktree pool 是從 repo 根推導的，repo 根
+    猜錯，pool 就跟著建在錯的地方（#612）。
+    """
+    return worktree_root_for(repo_root(allow_cwd=allow_cwd))
