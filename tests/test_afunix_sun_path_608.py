@@ -58,12 +58,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 #: `socket_fixtures` 模組 docstring 的表）。
 _HOSTILE_TMPDIR_NAME = "psc608-hostile-" + ("a" * 32)
 
-#: 修復前會因 `sun_path` 超限而紅掉的測試（#608 內文點名三個，實測還有第四個）。
+#: 修復前會因長 `TMPDIR` 紅掉的測試。前四個是 `sun_path` 超限（#608 內文點名三個，
+#: 實測還有 `test_doctor` 的第四個）；最後一個機制不同但屬同族——拒收訊息有 400
+#: 字元上限且 evidence 絕對路徑排在最後，`TMPDIR` 一長就被截掉，測試對「完整路徑
+#: 必須出現」的斷言隨之落空。列在同一組是刻意的：ledger 不變式要守的是「環境形狀
+#: 不得偽造出 gate 失敗」，不是「socket 不得超長」。
 _FRAGILE_NODE_IDS = (
     "tests/test_monitor_work_api.py::test_socket_work_item_read_apis_and_subscription_preserve_legacy",
     "tests/test_monitor_work_api.py::test_work_subscription_can_scope_duplicate_work_id_by_repo",
     "tests/test_monitor_work_api.py::test_old_server_teardown_does_not_unlink_replacement_socket",
     "tests/test_doctor.py::test_monitor_protocol_probe_rejects_transport_only_listener",
+    "tests/test_workflow_production_wiring.py::test_planning_artifact_rejection_records_full_content_evidence",
 )
 
 

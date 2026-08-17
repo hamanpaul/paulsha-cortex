@@ -4024,7 +4024,26 @@ def test_planning_artifact_rejection_records_full_content_evidence(tmp_path: Pat
     # evidence 落在 coordinator_root 底下，不得污染被監控的 artifact worktree。
     assert not (artifact_root / "evidence").exists()
     # 錯誤訊息要指向該檔，operator 不必自己猜路徑。
-    assert f"evidence={evidence_paths[0]}" in str(excinfo.value)
+    #
+    # #608：這條原本斷言**完整絕對路徑**出現在訊息裡，但訊息有 400 字元上限，且
+    # `evidence` 刻意排在欄位順序最後（見 `_planning_artifact_rejection_message`
+    # 的註解：最短最關鍵的 reasons 先寫，被上游截斷時還看得到）。evidence 路徑
+    # 會不會被截掉，因此取決於 coordinator root 有多長——而那是 host `TMPDIR`
+    # 給的。實測 `len(TMPDIR)=92` 時本測必紅，是 ledger gate 環境敏感家族
+    # （#565／#586／#608／#610）的一員：Manager 重跑全套時，那筆紅與「交付真的
+    # 沒過」在 ledger 上無法區分。
+    #
+    # 修法是讓斷言只主張 production 真正保證的事：evidence 欄位存在，且它帶出的
+    # 字串是真實路徑的前綴。訊息沒被截斷時這等同原本的完整路徑比對（一般環境走
+    # 的就是這條），被截斷時仍然抓得到「指錯檔」的回歸——而結果不再隨 host 的
+    # 暫存根長度改變。
+    message = str(excinfo.value)
+    assert "evidence=" in message
+    # 未截斷時訊息以 `)` 收尾，截斷時以 `…` 收尾；兩種都剝掉才拿得到路徑本身。
+    emitted_ref = message.split("evidence=", 1)[1].removesuffix("…").removesuffix(")")
+    assert str(evidence_paths[0]).startswith(emitted_ref)
+    if not message.endswith("…"):
+        assert emitted_ref == str(evidence_paths[0])
 
 
 def test_planning_artifact_rejection_evidence_truncates_oversized_content(
