@@ -69,6 +69,49 @@
   `tests/test_trust_root_permgen_traverse_620.py`（26 測試，兩 scheme 參數化，含
   「拿掉導出授權即重現 issue 斷法」的反向對照）；runbook 補稽核 5 與正／負向驗證。
   詳見 `changelog.d/permgen-parent-traverse-acl.md`。
+- **#621 / trust-root Phase 2b runbook 與 M1 實機對齊：十三處逐條修正（docs-only）**
+  ——#584 M1（2026-08-17 實機）逐步對照後累積的落差，**沒有一條是安全破口**，
+  但每一條都會讓下一個執行者卡住或誤判。**(A) 舊佈局殘留**：`--home-dir`
+  `/var/lib/cortex-svc` → `/var/lib/cortex-manager`、刪掉已由 #616 涵蓋的四行手動
+  `install -d`、稽核 3 的 `grep -c cortex-svc` 期望 2 → **0**、驗證路徑同步改名。
+  **(B) job-spec spool 改版**：`/var/lib/cortex/jobs/<id>/run.sh` →
+  `<coordinator_root>/job-specs/<instance>.json`，且一律用
+  `job_runner.build_job_spec()` 產生；連帶修正「輸出在 spec 的 `log_path` 而非
+  journal」「job env 完全等於 spec 的 `env`、不繼承 unit 的 `Environment=`」兩個
+  會讓 smoke 直接看不到東西的誤導；刪掉不存在的 `/var/lib/cortex/jobs` 驗證。
+  **(C) R9 三條假期望**：T1.1 由「讀 EnvironmentFile 期望 denied」改為**測寫入四式**
+  （登記表 rationale 明寫「對全部 headless 唯讀」，可讀是設計）；T1.5 同理改測
+  spool 的寫入四式，讀取期望改為依 subject 而異，並在 5-3 表格註明
+  **per-job 讀隔離需 per-job UID、不在本方案範圍**；T2 delete 的 `rm -f` 改 `rm`
+  並補 `need()` 前置守衛（`-f` 對不存在的檔回 0＝必然假陽性）。
+  **(D) 族 4 假綠**：`pgrep` 在 `ProtectProc=invisible` 下必回空，測到的是
+  「pid 不存在」而非「權限被拒」——改由 operator 以
+  `systemctl show … -p MainPID --value` 取得後注入，並新增 `test -d /proc/<pid>`
+  直接證明 pid 不可見；8c 的 negative control 同步改用 `MainPID`。
+  **(E) 第 4a／第 6 步 pipx 遷移缺步**：`cp -a` 後 venv 仍有兩處指回 operator 樹
+  （`bin/*` shebang、`site-packages/pipx_shared.pth`），補上重寫 shebang 與移除
+  `.pth` 兩步（須在 `chmod a-w` 之前）＋總驗收，並說明這同時是**安全條件**。
+  **(F) 執行前提兩個硬性 gate**：`acl` 套件（缺它時跨帳號授權整段無聲 no-op）、
+  `/etc/sudoers.d/` 萬用 `ALL ALL=NOPASSWD: ALL`（三個服務帳號一建立就是無密碼
+  root）。**另補（issue 未列，實機對照時發現）**：R9 攻擊腳本加**身分鎖**
+  （腳本會真的 truncate／`rm`／`mv "$HOME/.codex"`，在沙箱外跑會弄壞 operator
+  自己的環境，而那些「成功」會被誤讀成邊界失守）；**第 3-0／3a-2**——裁決
+  「legacy-imported 不得滿足任何 ship gate」針對的是**模型產出的 state／evidence**，
+  `config/**`／`specs/**` 是 **operator 撰寫**的、不是 gate 的受檢對象，原本兩類
+  一起 quarantine 而沒有任何一步搬內容，實測導致 `cortex monitor --once` 直接
+  `錯誤: 無 project 設定`，新增分類表與明示逐檔複製段；**第 4d 的「裝好但不得啟動」
+  gate（#623）**——`PSC_DEGRADED_OPERATION=per-case-approval` **不會**阻止派工
+  （只 gate 四個敏感動作），monitor 一起來就會派出必然失敗的 builder job，
+  4d 驗證因此拆成安裝面／執行面兩段、正確終態為 `disabled`；**第 7b 功能面檢查**
+  ——M1 的驗收全是結構性的，這正是部署通過 M1 卻做不了實際工作的原因，新增
+  F1（`cortex monitor --once` 載得到設定）／F2（`cortex status`／`jobs`）／
+  F3（真實 intake 跑到 terminal，⛔ #623 前不得執行）；**第 2a 稽核 6（#626）**
+  ——permgen 為本機不存在的 principal 產出 `setfacl`，`sh -e` 下會中止整份 script
+  留下半套的樹，稽核在套用前攔下並禁止「拿掉 `-e` 硬跑」。另隨 PR #624 落地移除
+  #620 的手動繞過段、M2 追蹤 issue 更正為 #615、新增「M1 實機基準值」對照表
+  （自檢 `job_writable_count` **5 → 0**、R9 denied 條數等）。規模統計
+  35 → **43** 個 sudo 點、133 → **156** 個驗證點。
+  詳見 `changelog.d/phase2b-runbook-realign.md`。
 - **#618 / trust-root Phase 2b：補上 `cortex service run`——permgen 的 manager unit
   `ExecStart` 指向一個不存在的 verb**——產生的 system unit 寫
   `ExecStart=<venv>/bin/cortex service run`，但 porcelain 只有 `install`／`start`／
