@@ -31,7 +31,7 @@ OS** 的手動流程。
 
 | 未決點 | 定案（0816 第三輪，#584 留言） | 落在本 runbook |
 |---|---|---|
-| **降權機制** | **A+B 並行，單一路徑**。A＝UID **三分提前**；B＝**root-owned template unit**（`cortex-job@.service`，`User=` 寫死）。C（code-level argv 保證）自動保留為第三層，由 **root-owned shim** 承接 | 第 1、5 步 |
+| **降權機制** | **A+B 並行，單一路徑**。A＝UID **三分提前**；B＝**root-owned template unit**（`cortex-job@.service`；#643 起 node 型 executor 另有同源的 `cortex-job-jit@.service`，`User=` 兩份都寫死）。C（code-level argv 保證）自動保留為第三層，由 **root-owned shim** 承接 | 第 1、5 步 |
 | **UID 方案** | **三分為唯一路徑**：`cortex-manager`（Manager＋monitor，durable state owner，持 spawn 授權，**不跑任何模型程式碼**）／`cortex-reviewer-planner`（reviewer＋planner 模型 job）／`cortex-builder`（builder 模型 job）。`permgen.THREE_WAY_SCHEME` 由備選轉為**定案方案** | 第 1 步 |
 | durable state 路徑 | **`/var/lib/cortex`**；worktree pool＝**`/var/lib/cortex/worktree`** | 第 2 步 |
 | legacy-import | **物理隔離 ＋ hash manifest**（無簽章；簽章屬 Phase 3）。切換前 in-flight job **手動收尾** | 執行前提、第 3 步 |
@@ -78,7 +78,7 @@ OS** 的手動流程。
 
 | 里程碑 | 內容 | 本 runbook |
 |---|---|---|
-| **M1** | 三帳號建立、**檔案權限面完整三分**、builder job 經 `cortex-job@.service` 降權、polkit 只授 `cortex-manager` 對 `cortex-job@*` | ✅ 本 runbook 全程 |
+| **M1** | 三帳號建立、**檔案權限面完整三分**、builder job 經 `cortex-job@.service`／`cortex-job-jit@.service` 降權、polkit 只授 `cortex-manager` 對這**兩個具名模板** | ✅ 本 runbook 全程 |
 | **M2** | reviewer／planner job 也改經 template instance（`User=cortex-reviewer-planner`）落到自己的帳號 | ⏳ 程式碼工項 **#615**（範圍以該 PR 實際落地為準）。M1 已於 2026-08-17 完成，**M2 未做**——D6 的「三分已生效」全稱在 #615 之前 **BLOCKING** |
 
 **M1 下的誠實邊界**：`launcher.SubprocessLauncher._degraded_runner()` 目前只對 **builder
@@ -239,7 +239,7 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | 第 2 步：目標樹與權限（含 2c 來源樹） | 4 | 21 |
 | 第 3 步：legacy-import（含 operator 設定搬遷） | 3 | 11 |
 | 第 4 步：Manager／monitor 部署與 unit（含 4e toolchain／憑證） | 16 | 33 |
-| **第 5 步：降權（A+B）** | **7** | **28** |
+| **第 5 步：降權（A+B ＋ #643 per-executor 剖面）** | **8** | **38** |
 | 第 6 步：升級流程 | 5 | 6 |
 | 第 7 步：切換驗收（含功能面檢查） | 0 | 5 |
 | 第 8 步：R9 抽驗（五族） | 5 | 19 |
@@ -247,15 +247,18 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | WSL2 風險與診斷 | 2 | 12 |
 | 附錄 A：自我檢查 | 0 | 9 |
 | 附錄 B：降級備援 | 2 | 3 |
-| **合計** | **49** | **174** |
+| **合計** | **50** | **184** |
 
 （統計方式：全文 `🔧`／`✅` 標記出現次數，扣除說明性用法——「標記約定」的定義行、
 段落標題內的標記、以及表格裡當狀態記號用的那幾個。）
 
 - **步驟數**：9 步（未變）＋ 3 個附錄；第 5 步由「兩個並列方案（5-A 六節／5-B 四節，
-  共 10 節）」收斂為**一條九節路徑**（5-1…5-9）。
+  共 10 節）」收斂為**一條九節路徑**（5-1…5-9），#643 於其中插入 5-2b（真實加固面下
+  的雙剖面驗證）。
 - **反向測試**：原本分散在 5-A-5（4 條，其中 1 條「已知不會被拒」）與 5-B-4（7 條），
   收斂後集中在 5-7（**11 條**），且**全部期望為「被拒」**——不再有任何一條期望成功。
+  #643 再補第 12 條（三小條，期望為「拒絕確實發生」），並讓 (5)(7)(8)(9)(10) 對
+  **兩個**模板字幹各跑一次。
 - **R9 族數**：4 → **5**（新增族 5 privilege-boundary），且族 1–4 各跑**兩個 subject**
   （builder ／ reviewer-planner），實測條數約為舊版的兩倍。
 - **#621（M1 對照後的修正）新增**：執行前提兩個硬性 gate（`acl`／sudoers 萬用規則）、
@@ -275,6 +278,13 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   憑證「檔 job-owned／目錄 root-owned」的三條反向不變式），另在「產生器＝單一真相」
   與 5-5 各補一條 ✅、附錄 A 補兩條漂移自我檢查（版本分岔／憑證 owner）
   → **49** 個 sudo 點、**174** 個驗證點。
+- **#643（per-executor 加固剖面）新增**：第 5-2 步改為落**兩份** template unit
+  （strict／jit，差異必須只有 `MemoryDenyWriteExecute` 一項）、新增第 5-2b 步「在
+  真實加固面下驗證兩種剖面」（**含負向對照**：node 型 executor 在 strict 剖面下必須
+  失敗——只驗 jit 成功等於什麼都沒驗）、5-7 補第 12 條（Manager 選不了剖面）與
+  兩字幹複跑（含 `systemd-analyze verify` 的未知鍵落檔後檢查——#645 修的是產生器，
+  已落檔的 unit 不會自己更新），4e 的 executor 形態表回填「`copilot` 也需要 node」
+  → **50** 個 sudo 點、**184** 個驗證點。
 
 ---
 
@@ -291,7 +301,9 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | 登記表雙向等式 | 執行前提 4／第 7 步 | `ok: true`（切換前後皆是） |
 | legacy-import manifest | 第 3 步 | 78,674 檔；全量複驗 78,674/78,674 `OK` |
 | 5-6 正向 smoke | 第 5 步 | 成功；`uid=…(cortex-builder)`、token 已 scrub、fd 僅 0/1/2、`HOME=/var/lib/cortex-builder`（root-owned）、部署樹不可寫 |
-| 5-7 反向 11 條 | 第 5 步 | **全數非 0** |
+| 5-2b 雙剖面（#643） | 第 5 步 | 正向四段皆 rc=0 且版本相符；**負向對照**：`codex`／`copilot` 在 strict 剖面下**空輸出** |
+| 5-7 反向 11 條 | 第 5 步 | **全數非 0**（(5)(7)(8)(9)(10) 對兩個字幹各一次） |
+| 5-7 (12) 剖面不可選（#643） | 第 5 步 | 三小條**全部 0**（＝拒絕確實發生） |
 | 5-7 (11) fail-closed | 第 5 步 | 移除 polkit 規則後起 job **失敗**、還原後**成功**（證明是規則在守，不是全紅假綠） |
 | 8a 族 1–4（builder） | 第 8 步 | 46 `denied` ／ 3 條 `SUCCEEDED` 標記 → 三條**全部判定為非破口**，且**三條的成因就是本 runbook 這次修掉的 #621 第 7／8／9 條**（期望寫反、測錯面、`rm -f` 假陽性）。按修正後的腳本重跑應為**全數 denied** |
 | 8a 族 1–4（reviewer-planner） | 第 8 步 | 47 `denied` ／ 2 條標記；**T1.5 對它是拒絕的** ← 三分在檔案層生效的直接證據 |
@@ -334,9 +346,13 @@ python3 -m paulsha_cortex.trust_root unit three-way --manager
 python3 -m paulsha_cortex.trust_root unit three-way --monitor
 
 # ✅ job template unit 內容（User=cortex-builder 硬寫死；B 的核心）
+#    #643：**兩份**——strict（預設）與 jit（node 型 executor），差異只有
+#    MemoryDenyWriteExecute 一項；剖面對應表由 permgen.EXECUTOR_TOOLS 機械導出。
 python3 -m paulsha_cortex.trust_root unit three-way --job
+python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit
 
-# ✅ 降權 polkit 規則內容（只放行 cortex-job@*.service 的 start/stop）
+# ✅ 降權 polkit 規則內容
+#    （只放行 cortex-job@*.service 與 cortex-job-jit@*.service 的 start/stop）
 python3 -m paulsha_cortex.trust_root polkit three-way --template
 
 # ✅ root-owned shim 內容（/opt/cortex/bin/cortex-job-shim）—— #616 已 merge
@@ -1411,15 +1427,21 @@ job／服務帳號唯讀＋可執行）。理由是「job 跑的是哪個版本�
 
 **四個 CLI 的實體形態不同，搬移方式不能一概而論**（表在 `permgen.EXECUTOR_TOOLS`）：
 
-| executor | 形態 | 需要 node | 搬移方式 |
-|---|---|:--:|---|
-| `codex` | Node.js script（`.js` ＋ `#!/usr/bin/env node`） | ✅ | **整包** npm 套件樹，`bin/` 放進入點 symlink |
-| `claude` | 原生 ELF 執行檔 | — | 單檔複製 |
-| `copilot` | bash script | — | 單檔複製；**先 `head -n 20` 查它內部再叫什麼** |
-| `agy` | 原生 ELF 執行檔 | — | 單檔複製 |
+| executor | 形態 | 需要 node | 加固剖面（#643） | 搬移方式 |
+|---|---|:--:|---|---|
+| `codex` | Node.js script（`.js` ＋ `#!/usr/bin/env node`） | ✅ | `jit` | **整包** npm 套件樹，`bin/` 放進入點 symlink |
+| `claude` | 原生 ELF 執行檔 | — | `strict` | 單檔複製 |
+| `copilot` | bash script → **內部 exec node** | ✅ | `jit` | 單檔複製；**先 `head -n 20` 查它內部再叫什麼** |
+| `agy` | 原生 ELF 執行檔 | — | `strict` | 單檔複製 |
 
 > `claude`／`agy` 自帶原生執行檔，**不會因為 node 版本而行為改變**——因此系統層 node
-> 的版本風險只涵蓋 `codex` 一個。
+> 的版本風險只涵蓋 `codex`／`copilot` 兩個。
+>
+> **`copilot` 的「需要 node」是 #643 回填的**：#640 落表時只知道它是 shell script、
+> 還沒查它內部 exec 什麼（上表當時就寫著「先 `head -n 20` 查」）。#643 在真實加固面
+> 下量到它與 `codex` 的症狀逐字相同（`MemoryDenyWriteExecute=yes` 下空輸出、拿掉即
+> 正常）——那就是 node。**這一欄同時決定加固剖面**（`permgen.EXECUTOR_TOOLS` 的
+> `needs_node` 是唯一真相來源，剖面由它機械導出，見第 5-2 步）。
 
 ```bash
 # ✅ 先讀落位步驟（含每支 CLI 的形態與搬移方式；產生器＝單一真相）
@@ -1487,10 +1509,16 @@ sudo systemd-run --pipe --wait --collect \
   --setenv=HOME=/var/lib/cortex-builder \
   --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
   /opt/cortex/toolchain/bin/codex --version
-#   期望：與上一條同一個版本、rc=0。
-#   ⚠️ 若這條失敗而 `sudo -u` 那條成功，**第一嫌疑是 `MemoryDenyWriteExecute=yes`**
-#      （node 的 V8 需要 W→X 轉換）。單獨拿掉該 property 複測即可確認；確認後
-#      屬 unit 加固面的裁決，記進 #584 而不是在這裡自行放寬。
+#   期望（`codex` 這一支）：**空輸出**。
+#   ✅ 這不是失敗，是 #643 已經定案的事實：`MemoryDenyWriteExecute=yes` 與 V8 的 JIT
+#      天生互斥（node 崩在 `v8::internal::Runtime_CompileLazy`）。上面這條刻意保留
+#      **完整**加固面，是為了讓執行者親眼看到「為什麼需要第二份剖面」。
+#   ✅ 把 `--property=MemoryDenyWriteExecute=yes` 改成 `=no` 複跑，應印出與 operator
+#      側逐字相同的版本——那正是 `cortex-job-jit@.service`（jit 剖面）的加固面。
+#   ⚠️ 若**兩種**都失敗，那就不是 MDWE，回到上一條查 PATH／toolchain 可達性。
+#   ⚠️ `claude`／`agy` 在**兩種**下都應該 rc=0；若它們在完整加固面下也失敗，代表
+#      這台機器上還有第三個阻斷點——**停下來查清楚**，不要順手再放寬一項。
+#   完整的雙剖面驗證（含負向對照）在第 5-2b 步；這裡只是提早看見那條分岔。
 ```
 
 **per-account 憑證（0817 裁決 (b)）**：憑證**檔**由 job 帳號擁有（才 refresh 得了
@@ -1573,40 +1601,153 @@ sudo -u cortex-builder sh -c \
 
 | # | 物件／事實 | 路徑 | 擁有者 | 它強制什麼 |
 |---|---|---|---|---|
-| (a) | **polkit 規則** | `/etc/polkit-1/rules.d/49-cortex-downgrade.rules` | root:root 0644 | 只有 `cortex-manager`、只有 `start`／`stop`、只有 `cortex-job@*.service`。**不授權 `manage-units` 的 transient 建立** |
-| (b) | **template unit** | `/etc/systemd/system/cortex-job@.service` | root:root 0644 | `User=cortex-builder` 寫死、加固段寫死、`ExecStart=` 寫死。呼叫端**選不了 UID、傳不了屬性** |
+| (a) | **polkit 規則** | `/etc/polkit-1/rules.d/49-cortex-downgrade.rules` | root:root 0644 | 只有 `cortex-manager`、只有 `start`／`stop`、只有 `cortex-job@*.service` 與 `cortex-job-jit@*.service` 兩個**具名**模板。**不授權 `manage-units` 的 transient 建立** |
+| (b) | **template unit ×2** | `/etc/systemd/system/cortex-job@.service`（strict）<br>`/etc/systemd/system/cortex-job-jit@.service`（jit，#643） | root:root 0644 | `User=cortex-builder` 寫死、加固段寫死、`ExecStart=` 寫死。呼叫端**選不了 UID、傳不了屬性**。兩份的差異**只有** `MemoryDenyWriteExecute`（見 5-2 的剖面說明） |
 | (c) | **shim** | `/opt/cortex/bin/cortex-job-shim` | root:root 0755 | `ExecStart=` 的實體。argv 的**形狀**由 root-owned 程式從 Manager-owned job-spec 導出；Manager 只能給參數 |
 | — | **三分帳號事實** | — | — | polkit 的 subject 只有 `cortex-manager`，而它**不跑任何模型程式碼**；injection 可達的 job 帳號完全不在授權面上 |
 
 三者缺一都不成立：
 - 少了 (a)，`cortex-manager` 起不了 job（fail-closed，不會退回同 UID）。
 - 少了 (b)，`User=` 回到呼叫端手上——polkit 看不到它，等於沒守。
+  **只裝一份也不成立**：漏裝 `cortex-job-jit@.service` 時，走 node 型 executor
+  （`codex`／`copilot`）的派工會在 `prepare_systemd_template()` 的 preflight
+  fail-closed（`job-runner-job-template-missing`），不會靜默退回 strict 那份。
 - 少了 (c)，argv 的入口落在 Manager 可寫的樹裡；Manager 被攻陷即可換掉執行的東西。
 
-### 5-2. 安裝 (b) template unit
+### 5-2. 安裝 (b) template unit（**兩份**，#643 per-executor 加固剖面）
+
+> **為什麼是兩份**：`MemoryDenyWriteExecute=yes` 擋的是 JIT 型 shellcode，而 V8 的
+> JIT **必須**有 W+X 記憶體——這一項與 JS runtime 天生互斥。實機逐項隔離的結果是
+> 「唯一的阻斷點就是它」：`+MemoryDenyWriteExecute=yes` 下 `node` 直接崩在
+> `v8::internal::Runtime_CompileLazy`，其餘每一項（`ProtectSystem=strict`／
+> `PrivateTmp`／`RestrictNamespaces`／`SystemCallFilter=@system-service` ＋
+> `SystemCallErrorNumber=EPERM`）單獨加上去 `node` 都正常。
+>
+> 因此 operator 裁決走 **per-executor 剖面**：node 型 executor（`codex`／`copilot`）
+> 走 `cortex-job-jit@.service`，原生 ELF（`claude`／`agy`）維持嚴格的
+> `cortex-job@.service`。**兩份由同一張加固表產生**，只在 `MemoryDenyWriteExecute`
+> 這一項分岔（測試以集合比對釘住，見 `tests/test_trust_root_hardening_profile_643.py`）。
+>
+> **剖面選不到寬鬆那份**（這是本設計全部的價值）：對應表由
+> `permgen.EXECUTOR_TOOLS` 的 `needs_node` 機械導出，唯一的輸入是 **executor**，而
+> executor 是 Manager 的 dispatch 決定；job spec 結構性禁止攜帶任何剖面欄位
+> （`job_runner.SPEC_FORBIDDEN_KEYS`，寫端與讀端各擋一次），未知 executor
+> **fail-closed**（不落到寬鬆那份），`PSC_JOB_TEMPLATE_UNIT` 也不接受已帶剖面
+> 後綴的值（否則 operator 可以一鍵把所有 job 推到寬鬆剖面）。
+>
+> **代價**：走 jit 剖面的 job **失去 MDWE 這層防護**。這是為了保留 provider 多樣性
+> （`independence_domain` 的可選空間）付的代價，不是沒有代價——完整說明見 spec
+> §R3「per-executor 加固剖面」段，產生出來的 unit 檔頭也逐條寫著。
 
 ```bash
-# ✅ 先看內容
+# ✅ 先看兩份內容（剖面在檔頭以「=== 加固剖面 ===」段標明，含它接受的代價）
 python3 -m paulsha_cortex.trust_root unit three-way --job | less
-#   必須確認的三行：
+python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit | less
+#   兩份都必須確認的三行：
 #     User=cortex-builder      ← 唯一 UID 來源，寫死
 #     Group=cortex-builder
 #     ExecStart=…              ← 見 5-3；PR 落地後應指向 /opt/cortex/bin/cortex-job-shim
 
+# ✅ 兩份的差異必須**只有一項**（這條先跑；不成立就不要落檔）
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --job) \
+     <(python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit) \
+  | grep -E "^[<>] [A-Za-z]" | sort
+#   期望恰好兩行（同一個鍵的兩個值）：
+#     < MemoryDenyWriteExecute=yes
+#     > MemoryDenyWriteExecute=no
+#   ⚠️ 出現任何第三行 ⇒ 兩份剖面在加固表以外也分岔了，**停下來**：
+#      那代表產生器被改成兩段各自維護，本步驟的前提不再成立。
+
 # 🔧 sudo：落檔（root 擁有——這是 User= 不可被竄改的前提）
-python3 -m paulsha_cortex.trust_root unit three-way --job \
-  | sudo tee /etc/systemd/system/cortex-job@.service >/dev/null
-sudo chown root:root /etc/systemd/system/cortex-job@.service
-sudo chmod 0644 /etc/systemd/system/cortex-job@.service
+for P in "" "--profile jit"; do
+  U=$(python3 -m paulsha_cortex.trust_root unit three-way --job $P \
+        | sed -n '1s|^# /etc/systemd/system/||p')
+  python3 -m paulsha_cortex.trust_root unit three-way --job $P \
+    | sudo tee "/etc/systemd/system/$U" >/dev/null
+  sudo chown root:root "/etc/systemd/system/$U"
+  sudo chmod 0644 "/etc/systemd/system/$U"
+  echo "installed: $U"
+done
 sudo systemctl daemon-reload
+#   期望印出兩行：cortex-job@.service、cortex-job-jit@.service
 
 # ✅ 驗證：與產生器逐位元相同、User= 確實寫死
 diff <(python3 -m paulsha_cortex.trust_root unit three-way --job) \
-     /etc/systemd/system/cortex-job@.service && echo "job unit in sync: OK"
-grep -E "^(User|Group|ExecStart|NoNewPrivileges|CapabilityBoundingSet)=" \
-     /etc/systemd/system/cortex-job@.service
-#   期望：User=cortex-builder、Group=cortex-builder、NoNewPrivileges=yes、
-#         CapabilityBoundingSet=（空值）
+     /etc/systemd/system/cortex-job@.service && echo "job unit (strict) in sync: OK"
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit) \
+     /etc/systemd/system/cortex-job-jit@.service && echo "job unit (jit) in sync: OK"
+for U in cortex-job cortex-job-jit; do
+  echo "--- $U"
+  grep -E "^(User|Group|ExecStart|NoNewPrivileges|CapabilityBoundingSet|MemoryDenyWriteExecute)=" \
+       "/etc/systemd/system/$U@.service"
+done
+#   期望：兩份皆 User=cortex-builder、Group=cortex-builder、NoNewPrivileges=yes、
+#         CapabilityBoundingSet=（空值）；MemoryDenyWriteExecute 一份 yes 一份 no。
+
+# ✅ 驗證：systemd 解析兩份都無「未知鍵」（#645 修的 CollectMode 就是這一族）
+sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \
+                            /etc/systemd/system/cortex-job-jit@.service 2>&1 \
+  | grep -i "unknown key" && echo "❌ 有未知鍵，停下來" || echo "no unknown keys: OK"
+#   ⚠️ 舊版落檔的 unit 會在這裡報
+#      `Unknown key name 'CollectMode' in section 'Service', ignoring.`
+#      ——那表示「失敗的 instance 自動回收」從來沒有生效過（#645 已把它移回 [Unit]；
+#      **產生器修好不代表已落檔的 unit 跟著更新**，所以這條檢查在落檔後跑）。
+#      重新落檔即修好；順便清一次殘骸：
+#        systemctl list-units --failed 'cortex-job*'
+#        sudo systemctl reset-failed 'cortex-job@*' 'cortex-job-jit@*'
+```
+
+### 5-2b. 在**真實加固面下**驗證兩種剖面（#643 的核心驗收）
+
+**只驗寬鬆環境的 `--version` 會整個溜過去**——四支 executor 在 `sudo -u` 下全部
+rc=0、版本全部相符，而其中兩支在真實加固面下是空輸出。這一步的形狀比照第 4e 步：
+用 `systemd-run` 把**真的加固指令**帶上去跑，且**必須有負向對照**（strict 剖面下
+node 型 executor 應該失敗；只驗 jit 成功等於什麼都沒驗）。
+
+```bash
+# ✅ 直接從已落檔的 unit 取出加固面，組成 systemd-run 的 --property 清單
+#    （不要手打——手打的清單與 unit 漂移時，這一步驗的就不是 unit 了）
+props() {
+  sudo grep -E "^(NoNewPrivileges|CapabilityBoundingSet|AmbientCapabilities|ProtectSystem|ProtectHome|PrivateTmp|PrivateDevices|ProtectProc|ProcSubset|ProtectControlGroups|ProtectKernelModules|ProtectKernelTunables|ProtectKernelLogs|ProtectClock|ProtectHostname|RestrictSUIDSGID|RestrictNamespaces|RestrictRealtime|RestrictAddressFamilies|LockPersonality|MemoryDenyWriteExecute|SystemCallArchitectures|SystemCallFilter|SystemCallErrorNumber|RemoveIPC|KeyringMode|UMask)=" \
+    "/etc/systemd/system/$1@.service" | sed 's/^/--property=/'
+}
+run_under() {   # run_under <unit-stem> <cli>
+  sudo systemd-run --pipe --wait --collect --quiet \
+    --uid=cortex-builder --gid=cortex-builder \
+    $(props "$1") \
+    --setenv=HOME=/var/lib/cortex-builder \
+    --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+    "/opt/cortex/toolchain/bin/$2" --version
+}
+
+# ✅ (1) 正向：每個 executor 在**它自己的**剖面下必須跑得出版本
+for cli in claude agy; do echo "== $cli @strict"; run_under cortex-job     "$cli"; echo "rc=$?"; done
+for cli in codex copilot; do echo "== $cli @jit"; run_under cortex-job-jit "$cli"; echo "rc=$?"; done
+#   期望：四段皆印出版本字串且 rc=0，且版本與 operator 側逐字相同（第 4e 步那條）。
+
+# ✅ (2) **負向對照（不可省略）**：node 型 executor 在 strict 剖面下必須**失敗**
+for cli in codex copilot; do echo "== $cli @strict（期望空輸出／非 0）"; run_under cortex-job "$cli"; echo "rc=$?"; done
+#   期望：**空輸出**（V8 崩在 Runtime_CompileLazy）。
+#   ⚠️ 若這兩段也印出版本 ⇒ strict 那份 unit 的 MemoryDenyWriteExecute 沒生效
+#      （落檔錯／被 drop-in 覆蓋／props() 沒抓到那一行）。此時 (1) 的綠是假的，
+#      因為它證明不了「jit 剖面是必要的」，也證明不了「strict 剖面真的在守」。
+
+# ✅ (3) 對照：原生 ELF 在 jit 剖面下也會動（證明差異只在 node 型身上）
+run_under cortex-job-jit claude; echo "rc=$?"
+#   期望：rc=0。這條不是驗收條件，是在 (2) 失敗時區分「MDWE 沒生效」與
+#   「toolchain 根本不可達」的分流點。
+
+# ✅ (4) 剖面對應表：確認程式碼看到的分類與上面實測一致
+python3 - <<'PY'
+from paulsha_cortex.trust_root import permgen
+for tool in permgen.EXECUTOR_TOOLS:
+    p = permgen.executor_hardening_profile(tool.name)
+    print(f"{tool.name:8s} needs_node={str(tool.needs_node):5s} "
+          f"profile={p.profile_id:6s} unit={permgen.job_unit_stem(profile=p)}@.service")
+PY
+#   期望：codex/copilot → jit（cortex-job-jit@.service）；claude/agy → strict。
+#   ⚠️ 若實測 (1)(2) 與這張表對不上，**以實測為準**並回填 permgen.EXECUTOR_TOOLS
+#      的 needs_node（那張表是唯一真相來源），不要在 runbook 裡各記一份。
 ```
 
 ### 5-3. 部署 (c) root-owned shim
@@ -1659,8 +1800,9 @@ systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/wor
 #   （`feature-<slice_id>`），與 `%i` 永遠差一個前綴 ⇒ ReadWritePaths 指向不存在
 #   的路徑 ⇒ `Failed to set up mount namespacing` / `226/NAMESPACE`，job 起不來。
 
-# ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶）
-sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service
+# ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶；#643 起兩份都要驗）
+sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \
+                            /etc/systemd/system/cortex-job-jit@.service
 #   期望：**沒有** `Unknown key name 'CollectMode' in section 'Service', ignoring.`
 #   `CollectMode` 屬 `[Unit]`；放在 `[Service]` 只是被忽略（不影響行為），但
 #   「失敗的 instance 自動回收」這個用意不會生效，失敗殘骸會一直掛在
@@ -1693,8 +1835,12 @@ less /tmp/polkit-cortex.rules
 #   必須確認的五個條件（規則檔自己列在「審查者的一眼結論」段）：
 #     (1) subject 是 cortex-manager；(2) action 是 org.freedesktop.systemd1.manage-units；
 #     (3) unit／verb 明細存在；(4) verb ∈ {start, stop}；
-#     (5) unit 名匹配 ^cortex-job@[a-z0-9][a-z0-9._-]{0,62}\.service$
+#     (5) unit 名匹配 ^(?:cortex-job|cortex-job-jit)@[a-z0-9][a-z0-9._-]{0,62}\.service$
 #   **transient unit 的 StartTransientUnit 檢查不帶明細 ⇒ 條件 (3) 直接把它擋掉。**
+#   ⚠️ 條件 (5) 的字幹段是**列舉的交替**（#643：一個加固剖面一份 root-owned 模板檔
+#      ⇒ 兩個名字），**不是**萬用字元：前後仍然錨定、instance 段的字元類一字未改。
+#      仍然是**一條規則、一個 YES 出口**——放行面從「一個具名模板」變成「兩個具名
+#      模板」，沒有變成「任意 unit」。看到 `.*`／`[^`／`\w` 出現在字幹段就是被改壞了。
 
 # 🔧 sudo：落檔
 sudo install -o root -g root -m 0644 /tmp/polkit-cortex.rules \
@@ -1849,9 +1995,18 @@ sudo journalctl -u "cortex-job@$JOB.service" -n 20 --no-pager
 sudo -u cortex-manager systemctl stop "cortex-job@$JOB.service"; echo "exit=$?"   # 期望 0
 ```
 
-### 5-7. 反向驗證（**11 條全部必須被拒**）
+### 5-7. 反向驗證（**11 條全部必須被拒**，＋#643 的第 12 條）
+
+> **#643 起每一條都要對「兩個」字幹跑一次**：加固剖面讓 `cortex-job-jit@` 成為第二個
+> 被 polkit 放行的模板名。放行面從「一個具名模板」變成「兩個具名模板」——**不是**
+> 變成「任意 unit」——因此原本 11 條的每一條在新字幹上必須有**完全相同**的結果。
+> 下面在 (5)(7)(8)(9)(10) 逐條補上 `-jit` 版本，(7) 增加圍繞新字幹的混淆形式，
+> 並新增 (12)「Manager 選不了剖面」三小條。
 
 ```bash
+# ✅ (0) 兩個字幹的變數化（下面的條目共用；**不要只跑其中一個**）
+STEMS="cortex-job cortex-job-jit"
+
 # ✅ (1) 以 cortex-manager 起 transient unit（不指定 UID）：必須被拒
 sudo -u cortex-manager systemd-run --pipe --wait /bin/id; echo "exit=$?"
 
@@ -1868,29 +2023,51 @@ sudo -u cortex-manager systemd-run --uid=cortex-builder \
      --property=AmbientCapabilities=CAP_SETUID --pipe --wait /bin/id; echo "exit=$?"
 
 # ✅ (5) 借用 template 名字的 transient unit：必須被拒（明細缺席即拒）
-sudo -u cortex-manager systemd-run --unit="cortex-job@evil.service" --uid=0 \
-     --pipe --wait /bin/id; echo "exit=$?"
+for S in $STEMS; do
+  sudo -u cortex-manager systemd-run --unit="$S@evil.service" --uid=0 \
+       --pipe --wait /bin/id; echo "(5) $S exit=$?"
+done
 
 # ✅ (6) 起別的既存 unit（含 Manager 自己、sshd）：必須被拒
 sudo -u cortex-manager systemctl restart cortex-manager.service; echo "exit=$?"
 sudo -u cortex-manager systemctl start sshd.service 2>&1 | tail -1; echo "exit=$?"
 
 # ✅ (7) 名稱夾帶（前綴／後綴混淆）：必須被拒
-sudo -u cortex-manager systemctl start "evil-cortex-job@x.service"; echo "exit=$?"
-sudo -u cortex-manager systemctl start "cortex-job@x.service.evil"; echo "exit=$?"
+#     前兩條是原本的；其餘八條是 #643 新字幹周邊的混淆面
+#     （**新增一個字幹，最容易被鑽的就是這裡**）
+for BAD in \
+    "evil-cortex-job@x.service" \
+    "cortex-job@x.service.evil" \
+    "evil-cortex-job-jit@x.service" \
+    "cortex-job-jit@x.service.evil" \
+    "cortex-job-jitx@x.service" \
+    "cortex-job-ji@x.service" \
+    "cortex-job-jit-evil@x.service" \
+    "cortex-jit-job@x.service" \
+    "cortex-job-jit@.service" \
+    "cortex-job-jit@X.service"; do
+  sudo -u cortex-manager systemctl start "$BAD" 2>/dev/null; echo "(7) $BAD exit=$?"
+done
 
 # ✅ (8) 其他 verb：必須被拒
-sudo -u cortex-manager systemctl mask "cortex-job@$JOB.service"; echo "exit=$?"
-sudo -u cortex-manager systemctl daemon-reload; echo "exit=$?"
-sudo -u cortex-manager systemctl set-property "cortex-job@$JOB.service" User=root; echo "exit=$?"
+for S in $STEMS; do
+  sudo -u cortex-manager systemctl mask "$S@$JOB.service"; echo "(8) $S mask exit=$?"
+  sudo -u cortex-manager systemctl set-property "$S@$JOB.service" User=root
+  echo "(8) $S set-property exit=$?"
+done
+sudo -u cortex-manager systemctl daemon-reload; echo "(8) daemon-reload exit=$?"
 
 # ✅ (9) 非授權帳號起 job instance：必須被拒（polkit subject 只有 cortex-manager）
-sudo -u cortex-reviewer-planner systemctl start "cortex-job@$JOB.service"; echo "exit=$?"
-sudo -u cortex-builder systemctl start "cortex-job@$JOB.service"; echo "exit=$?"
+for S in $STEMS; do
+  sudo -u cortex-reviewer-planner systemctl start "$S@$JOB.service"; echo "(9) $S rp exit=$?"
+  sudo -u cortex-builder systemctl start "$S@$JOB.service"; echo "(9) $S builder exit=$?"
+done
 
 # ✅ (10) 改 template unit／shim／polkit 規則：三個服務帳號一律 EACCES
 for U in cortex-manager cortex-reviewer-planner cortex-builder; do
-  sudo -u "$U" sh -c 'printf "User=root\n" >> /etc/systemd/system/cortex-job@.service'; echo "$U unit exit=$?"
+  sudo -u "$U" sh -c 'printf "User=root\n" >> /etc/systemd/system/cortex-job@.service'; echo "$U unit(strict) exit=$?"
+  sudo -u "$U" sh -c 'printf "MemoryDenyWriteExecute=no\n" >> /etc/systemd/system/cortex-job@.service'; echo "$U mdwe(strict) exit=$?"
+  sudo -u "$U" sh -c 'printf "User=root\n" >> /etc/systemd/system/cortex-job-jit@.service'; echo "$U unit(jit) exit=$?"
   sudo -u "$U" sh -c 'printf "id\n" >> /opt/cortex/bin/cortex-job-shim'; echo "$U shim exit=$?"
   sudo -u "$U" sh -c 'printf "x\n" >> /etc/polkit-1/rules.d/49-cortex-downgrade.rules'; echo "$U polkit exit=$?"
 done
@@ -1904,9 +2081,61 @@ sudo -u cortex-manager systemctl start "cortex-job@$JOB.service"; echo "exit=$?"
 #     **不得**出現以 cortex-manager 身分跑起來的 job。
 sudo mv /tmp/polkit-cortex.disabled /etc/polkit-1/rules.d/49-cortex-downgrade.rules
 sudo systemctl restart polkit.service 2>/dev/null || sudo systemctl restart polkitd.service
+
+# ✅ (12) #643：Manager **選不了**加固剖面——剖面只跟著 executor 走
+#     這三條守的是「per-executor 剖面」不退化成「全域移除 MDWE」。
+#     ⚠️ 與其他反向條目相反：這三條**期望 exit=0**（0 代表「拒絕確實發生」）。
+
+#     (12a) PSC_JOB_TEMPLATE_UNIT 不接受已帶剖面後綴的值
+#           （接受的話，operator 一行 config 就能把**所有** job 推到寬鬆剖面）
+sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
+  PSC_JOB_TEMPLATE_UNIT=cortex-job-jit@.service \
+  /opt/cortex/venv/bin/python -c '
+import os, sys
+from paulsha_cortex.coordinator import job_runner as j
+try:
+    j.prepare_systemd_template(os.environ, job_id="probe", executor="claude")
+except j.JobRunnerError as exc:
+    print("refused:", exc.diagnostic.reason); sys.exit(0)
+sys.exit(1)
+'; echo "(12a) exit=$?"
+#   期望：exit=0，印出 refused: job-runner-template-unit-invalid
+
+#     (12b) 未登記的 executor fail-closed
+#           （**不得**落到寬鬆那份；也不得默默給嚴格那份而讓問題再埋一次）
+sudo -u cortex-manager /opt/cortex/venv/bin/python -c '
+import sys
+from paulsha_cortex.coordinator import job_runner as j
+try:
+    j.resolve_hardening_profile("mystery")
+except j.JobRunnerError as exc:
+    print("refused:", exc.diagnostic.reason); sys.exit(0)
+sys.exit(1)
+'; echo "(12b) exit=$?"
+#   期望：exit=0，印出 refused: job-runner-hardening-profile-unknown
+
+#     (12c) job spec 帶剖面欄位 ⇒ shim 讀端拒絕執行（寫端已在單元測試覆蓋）
+sudo -u cortex-manager /opt/cortex/venv/bin/python -c '
+import json, sys
+from paulsha_cortex.coordinator import job_shim
+spool = "/var/lib/cortex/coordinator/job-specs"
+spec = {"spec_version": 1, "instance": "profile-probe", "job_id": "profile-probe",
+        "unit": "cortex-job@profile-probe.service", "command": ["/bin/true"],
+        "working_directory": "/tmp", "log_path": "/tmp/probe.jsonl",
+        "env": {"PATH": "/usr/bin"}, "hardening_profile": "jit"}
+open(spool + "/profile-probe.json", "w").write(json.dumps(spec))
+try:
+    job_shim.load_spec("profile-probe", spool)
+except job_shim.ShimError as exc:
+    print("refused:", exc); sys.exit(0)
+sys.exit(1)
+'; echo "(12c) exit=$?"
+sudo rm -f /var/lib/cortex/coordinator/job-specs/profile-probe.json
+#   期望：exit=0，印出 refused: ... hardening_profile ...
 ```
 
-**通過條件**：5-6 正向成功且輸出符合期望；5-7 的 (1)–(11) **全部**非 0 退出。
+**通過條件**：5-6 正向成功且輸出符合期望；**5-2b 的 (1) 正向與 (2) 負向對照皆符合
+期望**；5-7 的 (1)–(11) **全部**非 0 退出、(12a)(12b)(12c) **全部** 0 退出。
 任一反向測試通過（即攻擊成功）＝**立即停止**，回到第 9 步回滾。
 
 ```bash
@@ -1914,6 +2143,7 @@ sudo systemctl restart polkit.service 2>/dev/null || sudo systemctl restart polk
 sudo systemctl stop "cortex-job@$JOB.service" 2>/dev/null || true
 sudo rm -f "/var/lib/cortex/coordinator/job-specs/$JOB.json"
 sudo rm -rf "/var/lib/cortex/worktree/$JOB"
+sudo systemctl reset-failed "cortex-job@*" "cortex-job-jit@*" 2>/dev/null || true
 ```
 
 ### 5-8. 殘餘風險（A+B 之後重新評估）
@@ -1964,6 +2194,11 @@ cases = [
     ("cortex-manager",          permgen.POLKIT_ACTION, "cortex-manager.service", "start", "NO"),
     ("cortex-manager",          permgen.POLKIT_ACTION, "evil-cortex-job@x.service", "start", "NO"),
     ("cortex-manager",          permgen.POLKIT_ACTION, "cortex-job@abc.service", "mask",  "NO"),
+    # #643：第二個加固剖面的模板同樣放行；圍繞它的混淆同樣拒。
+    ("cortex-manager",          permgen.POLKIT_ACTION, "cortex-job-jit@abc.service", "start", "YES"),
+    ("cortex-manager",          permgen.POLKIT_ACTION, "cortex-job-jitx@abc.service", "start", "NO"),
+    ("cortex-manager",          permgen.POLKIT_ACTION, "cortex-job-ji@abc.service", "start", "NO"),
+    ("cortex-manager",          permgen.POLKIT_ACTION, "cortex-job-jit-abc.service", "start", "NO"),
     ("cortex-reviewer-planner", permgen.POLKIT_ACTION, "cortex-job@abc.service", "start", "NOT_HANDLED"),
     ("cortex-builder",          permgen.POLKIT_ACTION, "cortex-job@abc.service", "start", "NOT_HANDLED"),
 ]
@@ -1978,6 +2213,7 @@ PY
 ```bash
 sudo rm -f /etc/polkit-1/rules.d/49-cortex-downgrade.rules \
            /etc/systemd/system/cortex-job@.service \
+           /etc/systemd/system/cortex-job-jit@.service \
            /opt/cortex/bin/cortex-job-shim
 sudo systemctl daemon-reload
 sudo systemctl restart polkit.service 2>/dev/null || true
@@ -2058,7 +2294,9 @@ sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_r
 diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root unit three-way --manager) \
      /etc/systemd/system/cortex-manager.service || echo "!! manager unit 需更新"
 diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root unit three-way --job) \
-     /etc/systemd/system/cortex-job@.service || echo "!! job template unit 需更新"
+     /etc/systemd/system/cortex-job@.service || echo "!! job template unit (strict) 需更新"
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit) \
+     /etc/systemd/system/cortex-job-jit@.service || echo "!! job template unit (jit) 需更新"
 diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root polkit three-way --template) \
      /etc/polkit-1/rules.d/49-cortex-downgrade.rules || echo "!! polkit 規則需更新"
 diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root shim three-way) \
@@ -2566,7 +2804,8 @@ sudo rm -f /var/lib/cortex/coordinator/job-specs/r9.json \
 sudo rm -rf /var/lib/cortex/worktree/r9 /var/lib/cortex/worktree/negctl5 \
             /var/lib/cortex/worktree/victim \
             /var/lib/cortex/coordinator/review-verdicts/victim \
-            /etc/systemd/system/cortex-job@.service.d
+            /etc/systemd/system/cortex-job@.service.d \
+            /etc/systemd/system/cortex-job-jit@.service.d
 sudo systemctl daemon-reload
 
 # ✅ 驗證：spool 內不得殘留任何抽驗用的 spec（它們是 job 的命令列）
@@ -2601,7 +2840,7 @@ Phase 1 完全不需 root 且含降級運轉安全網（`PSC_DEGRADED_OPERATION=
 | 第 4c（system unit） | WSL 重啟後未拉起／服務起不來 | `sudo systemctl disable --now cortex-manager.service`；改回 `systemctl --user start cortex-manager.service`（舊部署仍在 `$HOME/.local/share/pipx`） |
 | 第 4c（加固誤擋） | 服務起來但功能靜默失效 | 見下方「`ProtectSystem=strict` 誤擋診斷」；**臨時** drop-in 放行、**同一天**把該路徑回填 R1 登記表並重跑 permgen |
 | 第 4d（monitor unit） | monitor 起不來／新樹無寫入 | `sudo systemctl disable --now cortex-monitor.service`；改回 `systemctl --user start cortex-monitor.service`（**會與 system-level Manager 雙寫**，僅救急） |
-| **第 5-2（template unit）** | instance 起不來／unit 語法錯 | `sudo rm -f /etc/systemd/system/cortex-job@.service; sudo rm -rf /etc/systemd/system/cortex-job@.service.d; sudo systemctl daemon-reload`；(d) 一併關閉（見下一列） |
+| **第 5-2（template unit ×2）** | instance 起不來／unit 語法錯 | `sudo rm -f /etc/systemd/system/cortex-job@.service /etc/systemd/system/cortex-job-jit@.service; sudo rm -rf /etc/systemd/system/cortex-job@.service.d /etc/systemd/system/cortex-job-jit@.service.d; sudo systemctl daemon-reload`；(d) 一併關閉（見下一列）。**兩份要一起收**——只留一份會讓一半的 executor 在 preflight fail-closed |
 | **第 5-3（shim）** | job 起得來但 argv 不對／shim crash | `sudo rm -f /opt/cortex/bin/cortex-job-shim`；重新由產生器落檔並 `diff` 對齊；仍不對則關 (d) |
 | **第 5-4（polkit）** | 規則語法錯／`cortex-manager` 起不了任何 job | `sudo rm -f /etc/polkit-1/rules.d/49-cortex-downgrade.rules; sudo systemctl restart polkit.service`；此時降權面完全關閉（fail-closed，job 起不來但無提權） |
 | **第 5-5（切換點）** | 降權後 job 全數 needs_human | `sudo sed -i '/^PSC_JOB_RUNNER=/d;/^PSC_BUILDER_ACCOUNT=/d;/^PSC_BUILDER_HOME=/d' /opt/cortex/etc/cortex-manager.env; sudo systemctl restart cortex-manager.service`（回 `direct`）；Manager 以 `per-case-approval` 不 spawn job 運轉 |
@@ -2612,8 +2851,11 @@ Phase 1 完全不需 root 且含降級運轉安全網（`PSC_DEGRADED_OPERATION=
 ```bash
 # 🔧 sudo：停掉並移除 Phase 2 的一切（含 A+B 的三個 root-owned 物件與三帳號）
 sudo systemctl disable --now cortex-manager.service 2>/dev/null || true
-sudo rm -f /etc/systemd/system/cortex-manager.service /etc/systemd/system/cortex-job@.service
-sudo rm -rf /etc/systemd/system/cortex-job@.service.d
+sudo rm -f /etc/systemd/system/cortex-manager.service \
+           /etc/systemd/system/cortex-job@.service \
+           /etc/systemd/system/cortex-job-jit@.service
+sudo rm -rf /etc/systemd/system/cortex-job@.service.d \
+            /etc/systemd/system/cortex-job-jit@.service.d
 sudo rm -f /etc/polkit-1/rules.d/49-cortex-downgrade.rules
 sudo rm -f /opt/cortex/bin/cortex-job-shim
 #   （EnvironmentFile 隨 /opt/cortex 一併移除，PSC_JOB_RUNNER 自然失效）
@@ -2661,7 +2903,8 @@ systemctl show cortex-manager.service -p WantedBy
 #   期望：WantedBy=multi-user.target
 ls -l /etc/systemd/system/multi-user.target.wants/cortex-manager.service
 #   期望：symlink 存在
-#   注意：cortex-job@.service 是 template，**不需要也不應該** enable。
+#   注意：cortex-job@.service／cortex-job-jit@.service 都是 template，
+#         **不需要也不應該** enable。
 
 # ---- 3. 在 Windows 端執行：wsl --shutdown ----
 #      然後重新開一個 WSL shell，再回來跑本段第 4 項。
@@ -2763,7 +3006,8 @@ sudo systemctl daemon-reload && sudo systemctl restart cortex-manager.service
 > **鐵律**：被擋的路徑**只能**經「回填 R1 登記表 → 重跑 permgen → 重新落檔 unit」
 > 進入 `ReadWritePaths`。drop-in 只能作為**當天的**臨時措施，不得成為長期狀態——
 > 否則 unit 就不再是登記表的機械投影，`diff` 對齊檢查會紅。
-> **template unit 的 drop-in 更嚴**：`/etc/systemd/system/cortex-job@.service.d/` 一旦
+> **template unit 的 drop-in 更嚴**：`/etc/systemd/system/cortex-job@.service.d/`
+> 與 `cortex-job-jit@.service.d/`（#643）一旦
 > 存在就是提權面（族 5.2 有一條專門測它建不起來），診斷完**必須立刻刪除**。
 
 ### C. WSL2 其他已知風險
@@ -2797,6 +3041,7 @@ sudo systemctl daemon-reload && sudo systemctl restart cortex-manager.service
 # ✅ unit／polkit／shim 與產生器沒有漂移（建議排程每日跑）
 diff <(python3 -m paulsha_cortex.trust_root unit three-way --manager) /etc/systemd/system/cortex-manager.service
 diff <(python3 -m paulsha_cortex.trust_root unit three-way --job)     /etc/systemd/system/cortex-job@.service
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit) /etc/systemd/system/cortex-job-jit@.service
 diff <(python3 -m paulsha_cortex.trust_root polkit three-way --template) /etc/polkit-1/rules.d/49-cortex-downgrade.rules
 diff <(python3 -m paulsha_cortex.trust_root shim three-way)            /opt/cortex/bin/cortex-job-shim
 
@@ -2808,7 +3053,14 @@ sudo find /opt/cortex/venv -name "pipx_shared.pth" | head          # 期望：�
 sudo ls -l /var/lib/cortex/coordinator/job-specs
 
 # ✅ 沒有殘留的 template drop-in（族 5.2 的持久化面）
-ls -la /etc/systemd/system/cortex-job@.service.d 2>/dev/null && echo "!! 有 drop-in，查來源" || echo "no drop-in: OK"
+ls -la /etc/systemd/system/cortex-job@.service.d /etc/systemd/system/cortex-job-jit@.service.d \
+  2>/dev/null && echo "!! 有 drop-in，查來源" || echo "no drop-in: OK"
+# ✅ #643：兩份 job unit 的加固差異必須**只有** MemoryDenyWriteExecute 一項
+diff <(grep -E "^[A-Z][A-Za-z]*=" /etc/systemd/system/cortex-job@.service) \
+     <(grep -E "^[A-Z][A-Za-z]*=" /etc/systemd/system/cortex-job-jit@.service) \
+  | grep -E "^[<>]" | sort
+#   期望恰好兩行：`< MemoryDenyWriteExecute=yes` 與 `> MemoryDenyWriteExecute=no`。
+#   出現第三行 ⇒ 兩份剖面在加固表以外分岔了，回第 5-2 步重新落檔。
 
 # ✅ 三分帳號仍是三個、互不交集、皆無 sudo
 for U in cortex-manager cortex-reviewer-planner cortex-builder; do id -nG "$U"; done
@@ -2904,7 +3156,7 @@ PY
 | 第 1 步建**兩**個帳號（`cortex-svc` / `cortex-builder`） | 建**三**個（`cortex-manager` / `cortex-reviewer-planner` / `cortex-builder`） |
 | 全文 `two-way` | 全文 `three-way`；`two-way` 僅存於程式碼作為對照組 |
 | 第 5 步 A／B 並列，**待 operator 拍板** | 第 5 步 **A+B 合一，無分歧**；transient 降為附錄 B 備援 |
-| polkit 授 transient 建立（方案 A） | polkit **不授** transient 建立；只放行 `cortex-job@*.service` 的 start/stop |
+| polkit 授 transient 建立（方案 A） | polkit **不授** transient 建立；只放行 `cortex-job@*.service` 與 `cortex-job-jit@*.service`（#643 加固剖面）的 start/stop——**兩個具名模板，不是任意 unit** |
 | `ExecStart=` 指向 spool 內的 `run.sh` | 指向 **root-owned shim** `/opt/cortex/bin/cortex-job-shim`（C 層搬進 root-owned 檔） |
 | `PSC_JOB_RUNNER=systemd-run` | `PSC_JOB_RUNNER=systemd-template`（`systemd-run` 僅備援用） |
 | R9 四族，subject 為 `cortex-builder` | R9 **五族**，subject 為 builder ＋ reviewer-planner，新增族 5 privilege-boundary |

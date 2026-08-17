@@ -145,8 +145,11 @@ def test_prepare_systemd_template_agrees_with_provisioning(tmp_path: Path) -> No
         missing.append(f"builder 帳號 {account} 不存在")
     if not job_runner._group_exists(group):
         missing.append(f"builder group {group} 不存在")
-    if not job_runner._unit_file_installed(template):
-        missing.append(f"模板 unit {template} 未安裝")
+    # #643：每個加固剖面各有一份模板 unit，下面兩個 executor 各用一份——兩份都要在。
+    for profile in sorted(job_runner.TEMPLATE_UNIT_SUFFIX_BY_PROFILE):
+        unit = job_runner.template_unit_for_profile(template, profile)
+        if not job_runner._unit_file_installed(unit):
+            missing.append(f"模板 unit {unit}（剖面 {profile}）未安裝")
     if not job_runner._is_executable(shim):
         missing.append(f"降權 shim {shim} 不存在或不可執行")
     if not Path(spool).is_dir():
@@ -167,12 +170,15 @@ def test_prepare_systemd_template_agrees_with_provisioning(tmp_path: Path) -> No
             autonomy._branch_for_slice(job_id), job_id=job_id
         )
     )
-    plan = job_runner.prepare_systemd_template(
-        {}, job_id=job_id, unit_active=lambda _binary, _unit: False
-    )
-
-    assert workspace.name == plan.instance
-    assert plan.unit == f"cortex-job@{workspace.name}.service"
+    # #643：`executor` 決定加固剖面（＝哪一份模板 unit），因此是必填。這裡刻意用
+    # 兩個剖面各跑一次——本票的不變式是「instance 名」，它必須與剖面無關。
+    for executor, stem in (("claude", "cortex-job"), ("codex", "cortex-job-jit")):
+        plan = job_runner.prepare_systemd_template(
+            {}, job_id=job_id, executor=executor,
+            unit_active=lambda _binary, _unit: False,
+        )
+        assert workspace.name == plan.instance, executor
+        assert plan.unit == f"{stem}@{workspace.name}.service", executor
 
 
 def test_slice_lane_passes_the_same_id_to_provisioning_and_to_launch(

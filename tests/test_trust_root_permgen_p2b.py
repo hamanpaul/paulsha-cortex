@@ -345,7 +345,10 @@ def test_polkit_rule_binds_svc_to_job_units_only(scheme, plan) -> None:
     assert rule.target_account == scheme.resolve(Principal.BUILDER)
     assert rule.install_path == "/etc/polkit-1/rules.d/49-cortex-downgrade.rules"
     assert rule.allowed_verbs == ("start", "stop")
-    assert rule.unit_pattern.startswith("^cortex-job")
+    # 錨定兩端；字幹段在 TEMPLATE 下是「每個加固剖面一個」的列舉交替（#643），
+    # 因此只驗「以 cortex-job 這個字幹家族開頭」而不是單一字面前綴。
+    assert rule.unit_pattern.startswith("^")
+    assert "cortex-job" in rule.unit_pattern
     assert rule.unit_pattern.endswith("$")
 
 
@@ -358,15 +361,23 @@ def test_transient_plan_unit_prefix_is_the_job_runner_contract() -> None:
 
 
 def test_template_plan_matches_the_generated_template_unit() -> None:
-    """B 方案的 pattern 必須恰好認得 build_job_unit() 產出的模板實例。"""
+    """B 方案的 pattern 必須恰好認得 build_job_unit() 產出的**每一個**剖面的模板實例。
+
+    #643 之後每個加固剖面各有一份 root-owned 模板檔，因此各有一個字幹；pattern 是
+    這些字幹的列舉交替（不是萬用字元）。這裡改以「產生器產出的 unit 名 → pattern
+    必須放行」來驗，而不是比對 pattern 的字面前綴——後者在加第二個剖面時只會逼人
+    改斷言，驗不到任何語意。
+    """
     rule = build_polkit_rule(TWO_WAY_SCHEME, DEFAULT_LAYOUT, plan=PolkitPlan.TEMPLATE)
-    unit = build_job_unit(TWO_WAY_SCHEME, DEFAULT_LAYOUT)
-    assert unit.unit_name == "cortex-job@.service"
-    assert rule.unit_pattern.startswith("^cortex-job@")
-    assert evaluate_polkit(
-        rule, user=rule.subject_account, action_id=permgen.POLKIT_ACTION,
-        unit="cortex-job@abc.service", verb="start",
-    ) == "YES"
+    for profile in permgen.HARDENING_PROFILES:
+        unit = build_job_unit(TWO_WAY_SCHEME, DEFAULT_LAYOUT, profile=profile)
+        stem = unit.unit_name[: -len("@.service")]
+        assert unit.unit_name.endswith("@.service")
+        assert evaluate_polkit(
+            rule, user=rule.subject_account, action_id=permgen.POLKIT_ACTION,
+            unit=f"{stem}@abc.service", verb="start",
+        ) == "YES", unit.unit_name
+    assert build_job_unit(TWO_WAY_SCHEME, DEFAULT_LAYOUT).unit_name == "cortex-job@.service"
 
 
 @pytest.mark.parametrize("plan", ALL_PLANS, ids=lambda p: p.value)
@@ -551,5 +562,8 @@ def test_custom_layout_needs_no_code_change() -> None:
     assert all(p.startswith(("/srv/cortex", "/var/lib/cortex-svc")) for p in unit.read_write_paths)
     assert build_polkit_rule(TWO_WAY_SCHEME, alt, plan=PolkitPlan.TRANSIENT) \
         .unit_pattern.startswith("^alpha-job-")
-    assert build_polkit_rule(TWO_WAY_SCHEME, alt, plan=PolkitPlan.TEMPLATE) \
-        .unit_pattern.startswith("^alpha-job@")
+    assert evaluate_polkit(
+        build_polkit_rule(TWO_WAY_SCHEME, alt, plan=PolkitPlan.TEMPLATE),
+        user="cortex-svc", action_id=permgen.POLKIT_ACTION,
+        unit="alpha-job@abc.service", verb="start",
+    ) == "YES"

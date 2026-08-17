@@ -450,13 +450,20 @@ def test_executor_table_covers_the_four_dispatched_executors() -> None:
 
 
 def test_only_the_node_script_executor_depends_on_the_system_runtime() -> None:
-    """「node 的版本風險只涵蓋 codex 一個」這句話的機器可讀形式。
+    """「哪幾個 CLI 吃系統層 node 的版本風險」這句話的機器可讀形式。
 
-    `claude`／`agy` 自帶原生執行檔、`copilot` 是 shell script——它們不會因為系統層
-    node 換版本而行為改變。這條同時擋住「以後有人順手把某個 CLI 標成 needs_node」。
+    `claude`／`agy` 自帶原生執行檔，不會因為系統層 node 換版本而行為改變。
+    `codex`／`copilot` 會。
+
+    **#643 把 `copilot` 從 False 改為 True**：#640 落表時只知道它是 shell script、
+    還沒查它內部 exec 什麼（表上的 note 當時就寫著「安裝時務必 `head -n 20` 查一次」）。
+    #643 在真實加固面下量到 `copilot --version` 在 `MemoryDenyWriteExecute=yes` 下
+    空輸出、拿掉即正常，與 `codex` 的症狀逐字相同——它內部 exec 的就是 node。
+    這條同時是 #643 加固剖面的分類基準，因此改動它會連帶改動兩份 job unit 的對應
+    關係（見 `test_trust_root_hardening_profile_643.py`）。
     """
     needs_node = {t.name for t in EXECUTOR_TOOLS if t.needs_node}
-    assert needs_node == {"codex"}
+    assert needs_node == {"codex", "copilot"}
     assert TOOLCHAIN_SYSTEM_RUNTIMES == ("node",)
     by_name = {t.name: t for t in EXECUTOR_TOOLS}
     assert by_name["codex"].shape is ExecutorShape.NODE_SCRIPT

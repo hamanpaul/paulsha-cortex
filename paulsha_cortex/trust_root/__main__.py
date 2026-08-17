@@ -13,13 +13,21 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [three-way|two-way]
                                         [--manager|--monitor|--job|--job-properties]
+                                        [--profile strict|jit]
                                                     # Phase 2b systemd unit 內容
                                                     # （--monitor＝monitor 的 system-level
                                                     #   unit：與 manager 同帳號、同加固段，
                                                     #   但 ReadWritePaths 只由 monitor
                                                     #   persona 的登記表面導出，嚴格更窄；
                                                     #   --job-properties＝方案 A 的
-                                                    #   systemd-run --property= 清單）
+                                                    #   systemd-run --property= 清單；
+                                                    #   --profile＝#643 的 per-executor
+                                                    #   加固剖面，只對 --job／
+                                                    #   --job-properties 有意義。預設
+                                                    #   strict＝完整加固表；jit 只放寬
+                                                    #   MemoryDenyWriteExecute，給 node 型
+                                                    #   executor（codex／copilot）用，
+                                                    #   unit 名為 cortex-job-jit@.service）
     python -m paulsha_cortex.trust_root shim [three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
@@ -279,8 +287,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         rest = args[1:]
         scheme_id = permgen.DEFAULT_SCHEME_ID
         which = "manager"
+        profile_id = permgen.DEFAULT_HARDENING_PROFILE.profile_id
+        expect_profile = False
         for token in rest:
-            if token == "--manager":
+            if expect_profile:
+                if token not in permgen.HARDENING_PROFILES_BY_ID:
+                    print(
+                        f"unknown hardening profile: {token}"
+                        f"（可用：{sorted(permgen.HARDENING_PROFILES_BY_ID)}）",
+                        file=sys.stderr,
+                    )
+                    return 2
+                profile_id = token
+                expect_profile = False
+            elif token == "--manager":
                 which = "manager"
             elif token == "--monitor":
                 which = "monitor"
@@ -288,24 +308,50 @@ def main(argv: Sequence[str] | None = None) -> int:
                 which = "job"
             elif token == "--job-properties":
                 which = "job-properties"
+            elif token == "--profile":
+                expect_profile = True
+            elif token.startswith("--profile="):
+                candidate = token.split("=", 1)[1]
+                if candidate not in permgen.HARDENING_PROFILES_BY_ID:
+                    print(
+                        f"unknown hardening profile: {candidate}"
+                        f"（可用：{sorted(permgen.HARDENING_PROFILES_BY_ID)}）",
+                        file=sys.stderr,
+                    )
+                    return 2
+                profile_id = candidate
             elif token in permgen.SCHEMES:
                 scheme_id = token
             else:
                 print(f"unknown unit arg: {token}", file=sys.stderr)
                 return 2
+        if expect_profile:
+            print("--profile 需要一個剖面 id", file=sys.stderr)
+            return 2
         scheme = permgen.SCHEMES[scheme_id]
+        profile = permgen.HARDENING_PROFILES_BY_ID[profile_id]
         if which == "job-properties":
             print("# 方案 A（systemd-run transient unit）的 --property= 建議清單。")
             print("# 與方案 B 的模板 unit 同源（同一加固表 ＋ 同一份登記表導出的 RWP）。")
+            print(f"# 加固剖面：{profile_id}（--profile 可切換；預設為最嚴格的那一份）。")
             print("# 注意：%i 是 systemd 模板 specifier；A 方案（transient）請由呼叫端")
             print("#       代入該 job 的實際 worktree 路徑。")
-            for prop in permgen.transient_unit_properties(scheme):
+            for prop in permgen.transient_unit_properties(scheme, profile=profile):
                 print(prop)
             return 0
+        if which == "job":
+            print(permgen.build_job_unit(scheme, profile=profile).content, end="")
+            return 0
+        if profile_id != permgen.DEFAULT_HARDENING_PROFILE.profile_id:
+            # 剖面只對 job 模板 unit 有意義；靜默忽略會產出一份與旗標不符的內容。
+            print(
+                f"--profile 只適用於 --job／--job-properties（收到 {which}）",
+                file=sys.stderr,
+            )
+            return 2
         builders = {
             "manager": permgen.build_manager_unit,
             "monitor": permgen.build_monitor_unit,
-            "job": permgen.build_job_unit,
         }
         print(builders[which](scheme).content, end="")
         return 0

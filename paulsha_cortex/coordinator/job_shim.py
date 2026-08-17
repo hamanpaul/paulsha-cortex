@@ -52,6 +52,7 @@ from .job_runner import (
     JOB_SPEC_VERSION,
     SPEC_FORBIDDEN_KEYS,
     SPEC_REQUIRED_KEYS,
+    forbidden_spec_keys,
     instance_name_valid,
     reject_unsafe_env,
 )
@@ -59,6 +60,7 @@ from .job_runner import (
 __all__ = [
     "EXIT_SPEC_ERROR",
     "ShimError",
+    "forbidden_spec_keys",
     "load_spec",
     "main",
     "resolve_spec_path",
@@ -142,13 +144,14 @@ def load_spec(instance: str, spool_root: str) -> dict[str, object]:
     missing = [key for key in SPEC_REQUIRED_KEYS if key not in spec]
     if missing:
         raise ShimError(f"job spec 缺少必要欄位 {missing}: {path}")
-    # 身分欄位是**結構性禁止**，不是「忽略」：spec 一旦被容忍帶 user/uid，日後
-    # 有人「順手支援一下」就會把 B 案的整個保證還回去。
-    present_forbidden = sorted(k for k in SPEC_FORBIDDEN_KEYS if k in spec)
+    # 身分與加固剖面欄位是**結構性禁止**，不是「忽略」：spec 一旦被容忍帶 user/uid
+    # 或 hardening_profile，日後有人「順手支援一下」就會把 B 案／#643 的整個保證
+    # 還回去。掃的是與寫端**同一支** `forbidden_spec_keys()`。
+    present_forbidden = forbidden_spec_keys(spec)
     if present_forbidden:
         raise ShimError(
-            f"job spec 不得攜帶身分欄位 {present_forbidden}（身分只由 root-owned "
-            f"unit 的 User= 決定）: {path}"
+            f"job spec 不得攜帶身分／加固剖面欄位 {present_forbidden}（身分只由 "
+            f"root-owned unit 的 User= 決定，剖面只由 executor 決定）: {path}"
         )
     if spec.get("instance") != instance:
         raise ShimError(
