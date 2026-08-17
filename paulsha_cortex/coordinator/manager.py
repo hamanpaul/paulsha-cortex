@@ -8772,8 +8772,12 @@ def _dispatch_workflow_card(
                 )
             except BaseException as exc:
                 raise ValueError("workflow builder worktree creator unavailable") from exc
-        elif isinstance(creator, seams.ScriptWorktreeCreator) and (
-            str(Path(creator.repo_root).resolve()) != str(workspace_root.resolve())
+        #: #633：改問 `anchored_at()` 而不是自己比較 `creator.repo_root`——lazy 化
+        #: 之後「repo 尚未解析且環境沒宣告」是 dispatcher 上一個合法的 creator 狀態，
+        #: 直接讀 `repo_root` 會讓 `RepoRootUnresolvedError` 從一句比較裡漏出去。
+        #: 語意不變：錨定的不是本 run 的 workspace_root 就換一個錨定正確的。
+        elif isinstance(creator, seams.ScriptWorktreeCreator) and not creator.anchored_at(
+            workspace_root
         ):
             try:
                 creator = seams.ScriptWorktreeCreator(
