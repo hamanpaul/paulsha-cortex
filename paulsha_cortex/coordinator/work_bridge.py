@@ -128,7 +128,14 @@ def resolve_trusted_repo_root(repo: str, *, explicit: object = None) -> Path:
                 "explicit repo root must be the canonical git top-level and its remote must match owner/name"
             )
         return root
-    candidates.append(paths.repo_root())
+    # #612：候選只收「顯式宣告的」repo 根。舊實作用 `paths.repo_root()`，未宣告
+    # `PSC_REPO_ROOT` 時它會退回 cwd——daemon 的 cwd 就是 operator 的真實
+    # checkout，於是 owner/name 會被「解析」到一個沒人指定過的樹。改讀
+    # `configured_repo_root()`：沒宣告就不進候選，最後由下方「必須恰好命中一個」
+    # 的檢查 fail-closed。
+    configured = paths.configured_repo_root()
+    if configured is not None:
+        candidates.append(configured)
     try:
         from paulsha_cortex.monitor.config import load_config
 

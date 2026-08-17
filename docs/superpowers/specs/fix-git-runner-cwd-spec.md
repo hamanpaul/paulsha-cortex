@@ -11,7 +11,9 @@ work_item: fix-git-runner-cwd
 
 ### R1 git runner 顯式指定 repo root
 
-`paulsha_cortex/coordinator/dispatcher.py::_default_git_runner` MUST 以 `git -C <repo_root> <args>` 執行，`<repo_root>` 取自 `paulsha_cortex.config.paths.repo_root()`（`PSC_REPO_ROOT` 或 cwd 解析）。MUST NOT 依賴行程 cwd。既有 `GitRunner` 簽名（`Callable[[list[str]], str]`）保持不變；相對路徑參數在 `-C repo_root` 下解析行為與「cwd==repo_root」一致。
+`paulsha_cortex/coordinator/dispatcher.py::_default_git_runner` MUST 以 `git -C <repo_root> <args>` 執行，`<repo_root>` 取自 `paulsha_cortex.config.paths.repo_root()`。MUST NOT 依賴行程 cwd。既有 `GitRunner` 簽名（`Callable[[list[str]], str]`）保持不變；相對路徑參數在 `-C repo_root` 下解析行為與「cwd==repo_root」一致。
+
+> **issue #612 更新**：本節原文寫的是「`PSC_REPO_ROOT` 或 cwd 解析」。那條 cwd 退路已移除——`repo_root()` 未宣告 `PSC_REPO_ROOT` 時改拋 `RepoRootUnresolvedError`（見 README 路徑契約段）。R1 的意圖（git 執行與行程 cwd 無關）因此更強：不只不依賴 cwd，連「解析不出來時偷偷用 cwd」也不允許。
 
 ### R2 installer 模板含 WorkingDirectory
 

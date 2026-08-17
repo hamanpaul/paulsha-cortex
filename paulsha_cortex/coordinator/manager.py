@@ -248,6 +248,31 @@ def _slice_for_reviewer_job(registry, slice_id: str, job_id: str) -> dict | None
     return slice_row
 
 
+def _repo_root_for_slice_row(slice_row: Mapping | None) -> Path:
+    """從 slice row 解析目標 repo 根——**沒有就 fail-closed**（#612）。
+
+    舊實作在 `slice_row is None`（或推斷丟例外）時退回 `Path.cwd().resolve()`。
+    daemon 的 `WorkingDirectory` 正是 operator 的真實 checkout，於是那條退路把
+    「不知道目標」變成「打在 operator 的樹上」：`complete_tick` 的
+    `_candidate_for_evidence`（`git rev-parse`）、`_completion_candidate_ref`
+    （`git fetch --no-tags origin main`）、verification／review runner 全部跟著
+    落在錯的 repo，而且一路「成功」。
+
+    沒有 slice row 時退回 `paths.repo_root()`——它自 #612 起也是 fail-closed 的
+    （`PSC_REPO_ROOT` 未宣告即拋 `RepoRootUnresolvedError`），因此這裡要嘛拿到
+    operator 顯式宣告的目標，要嘛拋例外由呼叫端的錯誤通道記錄，不會再有第三種
+    「靜默猜一個」的結局。
+    """
+    spec_path = None
+    if isinstance(slice_row, Mapping):
+        spec = slice_row.get("spec")
+        if isinstance(spec, Mapping):
+            spec_path = spec.get("path")
+    if isinstance(spec_path, str) and spec_path:
+        return autonomy._infer_repo_root(Path(spec_path))
+    return paths.repo_root().resolve()
+
+
 def _pinned_input_mismatches(slice_row: dict) -> list[str]:
     repo_root = autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
     mismatches: list[str] = []
@@ -572,7 +597,14 @@ def _resolve_ancestry_status(slice_row: dict, *, git_runner) -> dict[str, Any]:
         summary["status"] = "repo-unresolved"
         return summary
     runner = git_runner or verification._default_git_runner
-    repo_root = autonomy._infer_repo_root(Path(spec_path))
+    try:
+        repo_root = autonomy._infer_repo_root(Path(spec_path))
+    except autonomy.RepoRootResolutionError:
+        # #612：推不出目標 repo 就不跑 git——舊實作會落到 cwd（daemon 的
+        # WorkingDirectory ＝ operator 的真實 checkout），ancestry 於是對錯的樹
+        # 作答，而且答得「成功」。
+        summary["status"] = "repo-unresolved"
+        return summary
     target_head = verification._run_git(["-C", str(repo_root), "rev-parse", target_ref], runner)
     target_sha = target_head["stdout"].strip().lower()
     if target_head["status"] != "ok" or verification.SAFE_SHA_RE.fullmatch(target_sha) is None:
@@ -1924,7 +1956,13 @@ def complete_tick(
                 spec_path = None
         if not isinstance(spec_path, str) or not spec_path:
             return None
-        return autonomy._infer_repo_root(Path(spec_path))
+        try:
+            return autonomy._infer_repo_root(Path(spec_path))
+        except autonomy.RepoRootResolutionError:
+            # #612：推不出目標 repo → 與「沒有 spec 路徑」同義（`None`），
+            # `default_is_satisfied` 因此走它既有的「無 repo 可查」分支，
+            # 而不是拿 cwd 當 repo 去問 handoff／ancestry。
+            return None
 
     def _ready_ids() -> set[str]:
         return {
@@ -1962,14 +2000,12 @@ def complete_tick(
                     try:
                         b_job = registry.get_job(builder_job_id)
                         if b_job.get("status") in TERMINAL_STATUSES:
-                            try:
-                                r_root = (
-                                    autonomy._infer_repo_root(Path(slice_item["spec"]["path"]))
-                                    if isinstance(slice_item.get("spec"), dict) and slice_item["spec"].get("path")
-                                    else Path.cwd().resolve()
-                                )
-                            except Exception:
-                                r_root = Path.cwd().resolve()
+                            # #612：舊實作在「slice 沒有 spec 路徑」與「推斷丟例外」
+                            # 兩種情況都退回 `Path.cwd().resolve()`，於是 dirty
+                            # worktree 的重驗會對 operator 的真實 checkout 跑
+                            # verification（含 git 操作）。改成 fail-closed：解析
+                            # 不出目標 repo 就不重驗，由底下的 except 收掉這一輪。
+                            r_root = _repo_root_for_slice_row(slice_item)
                             st_path = getattr(registry, "_state_path", None)
                             coord_root = Path(st_path).parent if st_path is not None else None
                             re_ev = verification_runner(
@@ -2023,11 +2059,7 @@ def complete_tick(
                 slice_row = _slice_for_job(registry, slice_id, job_id)
                 if slice_row is not None and slice_row.get("reviewer_job_id"):
                     continue
-            repo_root = (
-                autonomy._infer_repo_root(Path(slice_row["spec"]["path"]))
-                if slice_row is not None
-                else Path.cwd().resolve()
-            )
+            repo_root = _repo_root_for_slice_row(slice_row)
             state_path = getattr(registry, "_state_path", None)
             coordinator_root = Path(state_path).parent if state_path is not None else None
             evidence = None

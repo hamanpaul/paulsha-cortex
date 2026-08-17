@@ -24,11 +24,47 @@ def test_env_override_wins(monkeypatch, tmp_path):
     assert paths.control_root() == tmp_path / "ctl"
 
 
-def test_repo_root_env_then_cwd(monkeypatch, tmp_path):
+def test_repo_root_uses_env_and_fails_closed_without_it(monkeypatch, tmp_path):
+    """#612：`PSC_REPO_ROOT` 未宣告時**不得**退回 cwd，必須 fail-closed。
+
+    舊契約是 `repo_root() == Path.cwd()`。daemon 的 `WorkingDirectory` 正是
+    operator 的真實 checkout，所以那個預設值等同「解析不出目標就打在 operator
+    的樹上」——不是失敗，是靜默落在錯的 repo。
+    """
     monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path))
     assert paths.repo_root() == tmp_path
+
     monkeypatch.delenv("PSC_REPO_ROOT")
-    assert paths.repo_root() == Path.cwd()
+    with pytest.raises(paths.RepoRootUnresolvedError):
+        paths.repo_root()
+
+
+def test_repo_root_cwd_requires_explicit_opt_in(monkeypatch, tmp_path):
+    """#612：cwd 語意仍可用，但必須由呼叫端**顯式**表態（operator 手動 CLI）。"""
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert paths.repo_root(allow_cwd=True) == Path.cwd()
+
+    # 顯式宣告永遠優先於 cwd——`allow_cwd` 只是「沒宣告時可以用 cwd」。
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path / "declared"))
+    assert paths.repo_root(allow_cwd=True) == tmp_path / "declared"
+
+
+def test_configured_repo_root_reports_absence_instead_of_guessing(monkeypatch, tmp_path):
+    """#612：「有沒有宣告」必須可被呼叫端分辨，才有辦法 fail-closed。"""
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    assert paths.configured_repo_root() is None
+
+    monkeypatch.setenv("PSC_REPO_ROOT", str(tmp_path / "declared"))
+    assert paths.configured_repo_root() == tmp_path / "declared"
+
+
+def test_worktree_root_fails_closed_without_repo_root(monkeypatch):
+    """#612：worktree pool 是從 repo 根推導的——repo 根猜錯，pool 就建在錯的地方。"""
+    monkeypatch.delenv("PSC_WORKTREE_ROOT", raising=False)
+    monkeypatch.delenv("PSC_REPO_ROOT", raising=False)
+    with pytest.raises(paths.RepoRootUnresolvedError):
+        paths.worktree_root()
 
 
 def test_worktree_root_is_repo_sibling(monkeypatch, tmp_path):

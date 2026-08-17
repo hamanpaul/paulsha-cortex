@@ -717,10 +717,15 @@ cortex skill restore <skill_id> --approved-by "$ACTOR"
 | monitor state root | `~/.agents/monitor` | `PSC_MONITOR_STATE_ROOT` |
 | config root | `~/.config/paulshaclaw` | `PSC_CONFIG_ROOT` |
 | project config root | `~/.agents/config/paulsha` | `PSC_PROJECT_CONFIG_ROOT` |
-| repo root | 指定 install 時的 git repo top-level（`--repo-root`） | `PSC_REPO_ROOT` |
-| worktree root | `<repo>-worktrees` sibling | `PSC_WORKTREE_ROOT` |
+| repo root | 指定 install 時的 git repo top-level（`--repo-root`）；**無 cwd 預設**，未宣告即 fail-closed（見下方說明） | `PSC_REPO_ROOT` |
+| worktree root | `<repo>-worktrees` sibling（由 repo root 推導，因此同樣 fail-closed） | `PSC_WORKTREE_ROOT` |
 
 Multi-issue workflow build 階段將以 `issue` 清單中最小號碼作為主 branch，並始終以 run repository 作為 `ScriptWorktreeCreator` 的 git來源，以確保 builder worktree 在對應 repo 池內建立。
+
+**repo root 是 fail-closed 的（issue #612）**：`paths.repo_root()` 舊實作在 `PSC_REPO_ROOT` 未宣告時退回 `Path.cwd()`，而 manager daemon 的 `WorkingDirectory` 正是 operator 的真實 checkout——於是任何解析不出目標 repo 的呼叫都不是失敗，而是**靜默落在錯的樹上**（實測形態：相對 spec 路徑使 `complete_tick` 對真實 repo 跑 `git fetch --no-tags origin main`；同一族還有 `worktree_reclaim` 的 `git worktree remove --force`／`prune` 這類寫入動作）。現行契約：
+
+- 未宣告 `PSC_REPO_ROOT` 時 `paths.repo_root()` 拋 `RepoRootUnresolvedError`，不猜 cwd；需要「以當下目錄為準」的 operator 手動 CLI（`cortex work gc`、`cortex deck compile`）在呼叫點顯式帶 `allow_cwd=True`，`--repo-root` 一律優先。
+- spec 路徑必須是**絕對路徑**才能推導 repo root（`autonomy._infer_repo_root`）；相對路徑與「向上找不到 git repo 根又未宣告 `PSC_REPO_ROOT`」皆 fail-closed 並帶 `DiagnosticReason`（`spec-path-not-absolute`／`repo-root-unresolved`）。`cortex install service` 會把 `PSC_REPO_ROOT` 寫進 unit 的 `EnvironmentFile`，正常部署不受影響。
 
 `cortex install service` 會把 `PSC_CONTROL_ROOT` 寫成 `<agents_root>/control/<instance>`（比照 `PSC_RUN_ROOT` 的 `run/<instance>` 模式），讓 `manager.lock` 天生 per-instance；`service-manager.sh` 透過 `cortex control lock-path`（與 daemon 同一套 `config/runtime.py` 解析鏈）取得 lock 路徑，不再自行硬寫預設值（issue #375）。`PSC_PROJECT_CONFIG_ROOT` 與 `PSC_CONTROL_ROOT` 皆屬 installer 的 managed path：每次 `cortex install service` 都會依目前 `PSC_AGENTS_ROOT`／instance 重新推導並覆寫，不會被既有值鎖住（issue #371）；`cortex doctor` 的 `managed-path-drift` probe 可在尚未重跑 install 前就偵測到殘留的舊值。`PSC_MANAGER_SPECS_DIR`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT` 目前仍未 instance 化、也不在 installer 的 managed_env 之列（evaluate 後決定留待後續 follow-up；多 instance 共用同一 `PSC_AGENTS_ROOT` 時這三者會共用同一份 specs/coordinator 狀態）。
 

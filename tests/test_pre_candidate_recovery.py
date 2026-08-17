@@ -46,6 +46,27 @@ def _git(repo: Path, *args: str) -> None:
     assert proc.returncode == 0, f"git {' '.join(args)} failed: {proc.stderr}"
 
 
+def _seed_repo(tmp_path: Path) -> Path:
+    """建一個有一次 commit 的本機 repo，回傳其根。
+
+    `recover-pre-candidate` 會走 `worktree_reclaim`，而它的預設 git runner 是
+    `paths.repo_root()`——#612 之前那個預設是 `Path.cwd()`，也就是 operator 的
+    **真實 checkout**，於是這些測試實際上在真 repo 上跑
+    `git worktree list --porcelain`（同函式再走一步就是
+    `git worktree remove --force` / `git worktree prune` 這種**寫入**動作）。
+    測試必須自備目標 repo 並顯式 `PSC_REPO_ROOT`。
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "recover@example.invalid")
+    _git(repo, "config", "user.name", "recover-test")
+    (repo / "README.md").write_text("seed\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-qm", "init")
+    return repo
+
+
 def test_recover_pre_candidate_removes_worktree_and_resets_slice(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -115,11 +136,13 @@ def test_recover_pre_candidate_removes_worktree_and_resets_slice(
     assert latest_slice["gate_state"] == "pending"
 
 
-def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path) -> None:
+def test_recover_pre_candidate_supersedes_stale_handoff_manifest(tmp_path: Path, monkeypatch) -> None:
     # issue #383：recover-pre-candidate 撥回 pending 之後，殘留的舊終局 handoff
     # manifest 應被標記 superseded（稽核可見性）——run_tick 的放行判定本身已改成
     # 跟 registry 現況對帳（不依賴這個標記，見 dispatch_gate_scan/
     # _manifest_still_blocks_fanout），這裡單獨驗證標記本身確實落地。
+    # #612：目標 repo 顯式指定（見 `_seed_repo`），不再靠 `repo_root()` 的 cwd 預設。
+    monkeypatch.setenv("PSC_REPO_ROOT", str(_seed_repo(tmp_path)))
     state_path = tmp_path / "jobs.json"
     reg = JobRegistry(state_path=state_path)
     builder_job = reg.create_job(

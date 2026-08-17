@@ -114,6 +114,16 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         if name.startswith("PSC_") or name == "PAULSHACLAW_CONFIG":
             monkeypatch.delenv(name, raising=False)
     unset_root = tmp_path / "unset-psc-root-guard"
+    # #612：`PSC_REPO_ROOT` 與 `PSC_AGENTS_ROOT` 是同一類洩漏，只是洩漏的目標不同。
+    # `paths.repo_root()` 舊實作未宣告時退回 `Path.cwd()`，而跑測試的 cwd 就是
+    # operator 的**真實 cortex checkout**，於是任何忘了指定目標 repo 的測試都在真
+    # repo 上跑 git——#610 的實網事故（`git -C <真 checkout> fetch origin main`
+    # 打到 github.com）就是這樣來的，`worktree_reclaim` 的
+    # `git worktree remove --force`／`prune` 更是**寫入**動作。production 側自
+    # #612 起 fail-closed（未宣告即 `RepoRootUnresolvedError`），測試側則比照
+    # `PSC_AGENTS_ROOT` 指向 per-test 暫存路徑：需要真 repo 的測試自行 setenv／
+    # 建 fixture repo 覆寫，需要驗「未宣告」行為的測試自行 delenv。
+    monkeypatch.setenv("PSC_REPO_ROOT", str(unset_root / "repo"))
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
     # #506：auto-claim scan 的 GitHub 節流在生產預設 1000ms／請求。測試不打真的
