@@ -413,6 +413,24 @@ def test_adapter_rejects_bad_pr_numbers_and_gh_failures(tmp_path: Path) -> None:
     assert "ghp_secret" not in str(excinfo.value), "命令輸出不得進診斷訊息"
 
 
+def test_adapter_reports_a_missing_external_program_by_name(tmp_path: Path) -> None:
+    """`gh` 不在 PATH 上時要指回登記表，而不是丟一個裸 traceback。"""
+
+    def missing(argv, **kwargs):
+        raise FileNotFoundError(argv[0])
+
+    with pytest.raises(preflight_ci.PreflightAdapterError) as excinfo:
+        preflight_ci.load_pull_request("5", cwd=tmp_path, runner=missing)
+    assert "gh" in str(excinfo.value)
+    assert "SYSTEM_PROGRAMS" in str(excinfo.value)
+
+    def slow(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, 120)
+
+    with pytest.raises(preflight_ci.PreflightAdapterError):
+        preflight_ci.load_pull_request("5", cwd=tmp_path, runner=slow)
+
+
 def test_adapter_propagates_the_backend_exit_code(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     path = _metadata(tmp_path, {"title": "t", "body": "b", "labels": []})

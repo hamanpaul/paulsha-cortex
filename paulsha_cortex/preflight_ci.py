@@ -95,14 +95,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run(argv: Sequence[str], *, cwd: Path, runner: Runner) -> subprocess.CompletedProcess:
-    result = runner(
-        list(argv),
-        cwd=str(cwd),
-        shell=False,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = runner(
+            list(argv),
+            cwd=str(cwd),
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError as exc:
+        # `gh` 不在 PATH 上時原本會是一個裸 traceback；這一族外部程式在登記表的
+        # `SYSTEM_PROGRAMS` 上，訊息要指得回去而不是讓人去讀 stack。
+        raise PreflightAdapterError(
+            f"找不到外部程式 {argv[0]!r}——它應在服務的 PATH 上"
+            "（登記表 permgen.SYSTEM_PROGRAMS）。"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PreflightAdapterError(f"{argv[0]!r} 逾時") from exc
     returncode = getattr(result, "returncode", None)
     if not isinstance(returncode, int):
         raise PreflightAdapterError("runner returned no integer returncode")
