@@ -522,7 +522,11 @@ def test_scaffold_directories_are_command_strings_only() -> None:
 
 def test_commands_with_real_layout_have_no_placeholder_left() -> None:
     """runbook 引用形式：帶 layout 後輸出不再有 <PATH:...> placeholder。"""
-    plan = generate_plan(TWO_WAY_SCHEME)
+    # #626：命令輸出前必須先把部署決定型 principal 對應到真實帳號，否則 fail-closed。
+    plan = generate_plan(TWO_WAY_SCHEME.with_principal_accounts({
+        Principal.OPERATOR: "cortex-ops",
+        Principal.EXTERNAL: "cortex-outbox",
+    }))
     lines = permgen.plan_to_commands(plan, path_of=permgen.asset_paths())
     commands = [ln for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
     assert commands

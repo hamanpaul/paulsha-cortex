@@ -8,6 +8,8 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root registry    # R1 登記表摘要（JSON）
     python -m paulsha_cortex.trust_root equation     # R1 雙向等式結果
     python -m paulsha_cortex.trust_root permissions [three-way|two-way] [--commands] [--paths]
+                                        [--operator-account <帳號名|none>]
+                                        [--external-reader-account <帳號名|none>]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [three-way|two-way]
                                         [--manager|--monitor|--job|--job-properties]
@@ -36,14 +38,78 @@ UID 方案未指定時一律用 **`three-way`**（operator 0816 第三輪裁決 
 **絕不執行**任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook
 中手動 sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對
 路徑輸出（0816 裁決：/var/lib/cortex ＋ /opt/cortex），不再帶 placeholder。
+
+## 部署決定型 principal 的對應（#626）
+
+`operator` 與 `external`（outbox 下游 reader）是**抽象角色**，不是帳號名——對應到誰是
+部署決定。兩條注入管道，**CLI 旗標優先於 env**：
+
+    --operator-account <帳號名>          PSC_OPERATOR_ACCOUNT=<帳號名>
+    --external-reader-account <帳號名>   PSC_EXTERNAL_READER_ACCOUNT=<帳號名>
+
+值為 `none` 表示「本部署沒有這個角色的實體」，該 principal 的授權整組略去。
+兩者皆未給時 `--commands` **fail-closed**：印出可操作的錯誤訊息到 stderr、stdout 一行
+都不輸出、回傳碼 2。因為 runbook 第 2b 步以 `sudo sh -e` 執行整份 script，一行
+`setfacl -m u:<不存在的帳號>:rX` 就會中止它並留下半套用的權限樹。
+
+env 只在本 CLI 這一層讀取——`permgen` 維持純函式（不讀 env、不碰 IO）。
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Sequence
 
 from . import permgen, registry, selfcheck
+from .registry import Principal
+
+
+#: `--<principal>-account none` 的字面值——明示本部署沒有這個角色的實體。
+ABSENT_TOKEN = "none"
+
+
+def _account_overrides(
+    rest: list[str],
+    env: "dict[str, str] | None" = None,
+) -> "tuple[list[str], dict[Principal, str], str | None]":
+    """抽出部署決定型 principal 的對應（CLI 旗標優先於 env）。
+
+    回傳 `(剩餘 token, principal→帳號, 錯誤訊息)`。旗標與 env 變數名都由
+    `permgen.PRINCIPAL_ACCOUNT_OPTIONS` 導出——新增一個 principal 不必改本函式。
+    """
+    environ = os.environ if env is None else env
+    overrides: dict[Principal, str] = {}
+    for opt in permgen.PRINCIPAL_ACCOUNT_OPTIONS:
+        value = environ.get(opt.env_var)
+        if value:
+            overrides[opt.principal] = value
+
+    by_flag = {opt.cli_flag: opt for opt in permgen.PRINCIPAL_ACCOUNT_OPTIONS}
+    remaining: list[str] = []
+    pending = None
+    for token in rest:
+        if pending is not None:
+            overrides[pending.principal] = token
+            pending = None
+            continue
+        flag, sep, inline = token.partition("=")
+        opt = by_flag.get(flag)
+        if opt is None:
+            remaining.append(token)
+            continue
+        if sep:
+            if not inline:
+                return remaining, overrides, f"{opt.cli_flag} 需要一個帳號名（或 `none`）"
+            overrides[opt.principal] = inline
+        else:
+            pending = opt
+    if pending is not None:
+        return remaining, overrides, f"{pending.cli_flag} 需要一個帳號名（或 `none`）"
+    return remaining, {
+        p: (permgen.ABSENT_ACCOUNT if v == ABSENT_TOKEN else v)
+        for p, v in overrides.items()
+    }, None
 
 
 def _registry_summary() -> dict[str, object]:
@@ -99,7 +165,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ))
         return 0 if result.ok else 1
     if command == "permissions":
-        rest = args[1:]
+        rest, overrides, err = _account_overrides(args[1:])
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 2
         scheme_id = permgen.DEFAULT_SCHEME_ID
         want_commands = False
         want_paths = False
@@ -113,13 +182,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"unknown permissions arg: {token}", file=sys.stderr)
                 return 2
-        plan = permgen.generate_plan(permgen.SCHEMES[scheme_id])
+        try:
+            scheme = permgen.SCHEMES[scheme_id].with_principal_accounts(overrides)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        plan = permgen.generate_plan(scheme)
         if want_commands:
             path_of = permgen.asset_paths() if want_paths else None
-            for line in permgen.plan_to_commands(plan, path_of=path_of):
+            try:
+                # fail-closed：未解析的 principal 一律在**輸出前**攔下——stdout 保持
+                # 空的，被重導成 script 的檔案因此是空檔，而不是一份跑到一半會中止
+                # 的半套 script（#626）。
+                lines = permgen.plan_to_commands(plan, path_of=path_of)
+            except (permgen.UnresolvedPrincipalError,
+                    permgen.UnknownAccountInOutputError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            for line in lines:
                 print(line)
         else:
+            # JSON 是診斷模式：不 fail-closed，但未對應的 principal 必須看得見——
+            # 既在 payload 裡（`unresolved_principals`），也在 stderr 提醒一次。
             print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2))
+            unresolved = plan.unresolved_principals
+            if unresolved:
+                print(
+                    permgen.unresolved_principal_message(unresolved, scheme_id),
+                    file=sys.stderr,
+                )
         return 0
     if command == "unit":
         rest = args[1:]

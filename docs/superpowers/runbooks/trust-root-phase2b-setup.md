@@ -485,9 +485,24 @@ sudo groupdel cortex-manager; sudo groupdel cortex-reviewer-planner; sudo groupd
 # ✅ 產生骨架目錄 script（非登記表資產的父層：/opt/cortex、HOME、job spool…）
 python3 -m paulsha_cortex.trust_root scaffold three-way > /tmp/p2b-scaffold.sh
 
+# ✅ operator 與外部 outbox reader 是**抽象角色名**，不是帳號——對應到誰是**部署決定**，
+#    必須在產生當下指定（#626）。未指定時產生器 fail-closed：stdout 一行都不輸出、
+#    回傳碼 2，stderr 指出是哪個 principal 與怎麼指定。
+OPERATOR_ACCOUNT="$(id -un)"   # 單人機器＝現在這個登入帳號；多人／CI 部署請改成專用帳號
+getent passwd "$OPERATOR_ACCOUNT" >/dev/null \
+  && echo "operator account OK: $OPERATOR_ACCOUNT" \
+  || echo "!! $OPERATOR_ACCOUNT 不存在，先建帳號或改指定"
+
 # ✅ 產生權限 script（登記表每一項的 install -d／chown／chmod／setfacl）
+#    `--external-reader-account none`＝**明示**本部署沒有外送管線 reader 的實體，
+#    該角色的 ACL 整組略去（是一個被記錄下來的決定，不是漏掉）。之後真的有了
+#    再改成它的帳號名重跑即可。旗標也可改用 env：PSC_OPERATOR_ACCOUNT／
+#    PSC_EXTERNAL_READER_ACCOUNT（旗標優先）。
 python3 -m paulsha_cortex.trust_root permissions three-way --commands --paths \
+  --operator-account "$OPERATOR_ACCOUNT" \
+  --external-reader-account none \
   > /tmp/p2b-permissions.sh
+echo "exit=$?"   # 期望 0；2＝有 principal 沒對應到真實帳號（stderr 已指出是哪個）
 
 # ✅ 逐行讀過再執行——這是 operator 核可的實體動作
 less /tmp/p2b-scaffold.sh
@@ -499,7 +514,10 @@ grep -oE "chmod [0-7]{4}" /tmp/p2b-permissions.sh | sort -u \
         END{ if (!bad) print "no group/other write: OK" }'
 
 # ✅ 稽核 2：ACL 授「寫」只准出現在兩個 append-only 出口（三分下**恰好四行**）
-grep -E "^setfacl" /tmp/p2b-permissions.sh | grep -E ":[^ ]*w"
+grep -E "^setfacl" /tmp/p2b-permissions.sh | grep -E "u:[^:]+:[^ ]*w"
+#   注意 pattern 必須錨在 `u:<帳號>:` 之後才找 `w`——裸的 `:[^ ]*w` 會把
+#   `u:cortex-reviewer-planner:--x` 也撈進來（`reviewer` 自己帶一個 w），
+#   #620 的 traverse 節上線後這條稽核就一直多出一行假陽性。
 #   期望（三分）：**恰好四行**
 #     setfacl -m u:cortex-builder:wx           /var/lib/cortex/monitor/event-spool
 #     setfacl -d -m u:cortex-builder:wx        /var/lib/cortex/monitor/event-spool
@@ -529,7 +547,8 @@ grep -E "^setfacl -m u:[^ ]+:--x " /tmp/p2b-permissions.sh
 #     setfacl -m u:cortex-builder:--x           /var/lib/cortex/monitor
 #     setfacl -m u:cortex-builder:--x           /var/lib/cortex/coordinator
 #     setfacl -m u:cortex-reviewer-planner:--x  /var/lib/cortex/coordinator
-#   （另有 cortex-outbox／operator 的對應條目，同樣由葉節點 ACL 機械導出）
+#   （另有 `--operator-account` 指定的那個帳號的對應條目，同樣由葉節點 ACL 機械
+#     導出；外部 reader 明示 `none` 時，它那一組條目整組不出現）
 grep -E "^setfacl .*:r-x " /tmp/p2b-permissions.sh
 #   期望：空輸出。traverse 一律 `--x` 而非 `r-x`：走得到自己那格，但**列不出**
 #   coordinator/ 底下還有哪些 Manager 資產。
@@ -542,21 +561,39 @@ tail -n 20 /tmp/p2b-permissions.sh | grep -c ":--x "
 #   不會報錯）。因此也**不要**在執行完 permissions 之後再重跑 scaffold。
 
 # ✅ 稽核 6：script 裡出現的每個帳號名都**真的存在**（#626）
-#   `setfacl` 對解析不到的使用者名直接失敗，而 2b 是 `sh -e`——一條錯就**中止整份
-#   script**，留下**半套權限的樹**（前半已套、後半沒套，包括尾端的 traverse 節）。
+#   `setfacl` 對解析不到的使用者名直接失敗（`Invalid argument near character 3`），
+#   而 2b 是 `sh -e`——一條錯就**中止整份 script**，留下**半套權限的樹**（前半已套、
+#   後半沒套，包括尾端的 traverse 節），而錯誤訊息完全看不出是「帳號不存在」。
 #   實測命中的是 permgen 為 `operator`／`cortex-outbox` 這兩個「登記表上有 principal、
-#   本機卻沒有對應帳號」的名字產出的條目。
+#   本機卻沒有對應帳號」的名字產出的條目。#626 已在**產生器側**擋掉——未對應的
+#   principal 一律 fail-closed、一行都不輸出（見上方產生命令的 `exit=`）；本稽核是
+#   **實機側的第二道**：對應到的帳號**這台機器上真的有嗎**。
 for U in $(grep -oE "u:[A-Za-z0-9._-]+:" /tmp/p2b-permissions.sh | cut -d: -f2 | sort -u); do
   getent passwd "$U" >/dev/null && echo "OK      $U" || echo "!! 不存在 $U"
 done
 #   期望：全部 OK。
 #   出現 `!! 不存在` 時的處置（**兩者擇一，不可硬跑**）：
-#     (a) 該 principal 在本機確實該有對應帳號 ⇒ 先建帳號（比照第 1 步的形態）；
-#     (b) 它是本部署形態下不存在的 principal ⇒ **等 #626 的產生器修正**，
-#         或在 operator 核可下由 script 中移除那幾行後再套用，並在 #584 記錄。
+#     (a) 該 principal 在本機確實該有對應帳號 ⇒ 先建帳號（比照第 1 步的形態），
+#         或以 `--operator-account <既有帳號>` 重新產生 script；
+#     (b) 它是本部署形態下不存在的 principal ⇒ 以 `--<principal>-account none`
+#         **明示**它不存在後重新產生——該角色的 ACL 會整組略去，不必再手改 script。
 #   **不要**改用 `sh`（去掉 `-e`）硬跑：那會把「中止」換成「靜默略過」，
 #   結果是一棵你以為套好、其實少了幾條授權的樹。
+
+# ✅ 稽核 6b：骨架 script 的 owner 欄位同樣逐一 getent
+grep -oE "install -d -o [a-z_][a-z0-9_-]*" /tmp/p2b-scaffold.sh | awk '{print $4}' \
+ | sort -u | while read -r acct; do
+     getent passwd "$acct" >/dev/null \
+       && echo "scaffold owner OK: $acct" \
+       || echo "!! scaffold owner 不存在: $acct"
+   done
 ```
+
+> **中止後直接重跑是安全的**：兩份 script 都只由 `install -d`／`chown`／`chmod`／
+> `setfacl -m` 組成，全部是**冪等**操作。因此上面任何一條稽核紅了，修好成因（改
+> `--operator-account`／建帳號／明示 `none`）後**重新產生、整份重跑**即可，不需要
+> 先回滾、也不必只挑沒跑到的那幾行。順序要求仍在：先 scaffold、後 permissions
+> （`chmod` 會重寫 ACL mask，見稽核 5）。
 
 ### 2b. 執行（順序固定：先骨架、後權限）
 

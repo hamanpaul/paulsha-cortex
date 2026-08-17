@@ -24,6 +24,19 @@ from paulsha_cortex.trust_root.registry import ASSET_REGISTRY, Principal
 
 ALL_SCHEMES = [TWO_WAY_SCHEME, THREE_WAY_SCHEME]
 
+#: #626：`operator` 與 `external` 是部署決定，模組層方案刻意留 `None`——未注入時
+#: `plan_to_commands()` 一律 fail-closed（由
+#: `tests/test_trust_root_principal_account_mapping_626.py` 專門釘住）。本檔要驗
+#: 命令輸出的測試先注入一組示範對應。
+DEPLOYMENT_ACCOUNTS = {
+    Principal.OPERATOR: "cortex-ops",
+    Principal.EXTERNAL: "cortex-outbox",
+}
+
+
+def _resolved(scheme):
+    return scheme.with_principal_accounts(DEPLOYMENT_ACCOUNTS)
+
 
 def _plan(scheme) -> PermissionPlan:
     return generate_plan(scheme)
@@ -191,9 +204,11 @@ def test_custom_scheme_needs_no_code_change() -> None:
             Principal.PLANNER: "cortex-planner",
             Principal.BUILDER: "cortex-builder",
             Principal.HEADLESS_HOOK: "cortex-builder",
-            Principal.OPERATOR: "operator",
         },
         durable_state_owner="cortex-manager",
+        # #626：部署決定型 principal 走專屬欄位，不得混進 `account_of`。
+        operator_account="cortex-ops",
+        external_reader_account="cortex-outbox",
     )
     plan = generate_plan(four_way)
     assert len(plan.entries) == len(ASSET_REGISTRY)
@@ -220,7 +235,7 @@ def test_plan_is_json_serializable(scheme) -> None:
 def test_commands_are_strings_only_and_never_execute(scheme) -> None:
     """產出只能是 install -d／chown／chmod／setfacl（可帶 `[ ! -e ] ||` 存在性守衛）
     字串——絕不執行任何 root 操作。"""
-    plan = _plan(scheme)
+    plan = _plan(_resolved(scheme))
     lines = permgen.plan_to_commands(plan)
     allowed = ("install -d ", "chown ", "chmod ", "setfacl ", "[ ! -e ")
     for line in lines:
@@ -236,7 +251,7 @@ def test_commands_are_strings_only_and_never_execute(scheme) -> None:
 
 def test_commands_honour_supplied_paths() -> None:
     """runbook 帶入真實路徑時，命令引用該路徑；未帶入者以 placeholder。"""
-    plan = _plan(TWO_WAY_SCHEME)
+    plan = _plan(_resolved(TWO_WAY_SCHEME))
     lines = permgen.plan_to_commands(plan, path_of={"jobs-registry": "/srv/agents/coordinator/jobs.json"})
     joined = "\n".join(lines)
     assert "/srv/agents/coordinator/jobs.json" in joined

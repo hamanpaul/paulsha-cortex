@@ -39,11 +39,39 @@ job-visible 樹由對應 job 帳號寫、跨 persona 互不可寫。全部既有
   start／stop。per-job 參數走 Manager-owned spec spool（登記表資產 `job-spec-spool`），
   由 `build_job_shim()` 產出的 root-owned shim 讀取後 exec。
 - C（Manager 端封閉 argv 產生器）自動保留為第三層，見 `coordinator/job_runner.py`。
+
+## 部署決定型 principal 的對應（#626，fail-closed）
+
+`registry.Principal` 有兩個成員是**抽象角色**、不是服務帳號：`OPERATOR`（人類操作者）
+與 `EXTERNAL`（digest／engineering-outcome outbox 的下游 reader）。它們對應到哪個 OS
+帳號是**部署決定**，產生器猜不到——單人機器上 operator 就是那個人的登入帳號，多人／CI
+部署可能是專用帳號，而外部 reader 在很多部署裡**根本還不存在**。
+
+因此這兩個 principal **不放進 `account_of`**（放進去等於在程式碼裡寫死一個部署決定），
+而是 `UidScheme` 上兩個預設 `None` 的欄位（見 :data:`PRINCIPAL_ACCOUNT_OPTIONS`），由
+CLI 參數或 env 於**產生當下**注入。三種狀態嚴格區分：
+
+- `None`＝**未指定** → `plan_to_commands()` raise :class:`UnresolvedPrincipalError`，
+  **一行命令都不輸出**；
+- :data:`ABSENT_ACCOUNT`＝**明示本部署沒有這個角色的實體** → 該 principal 的授權整組
+  略去（是一個被記錄下來的決定，不是遺漏）；
+- 真實帳號名 → 照常產生 ACL。
+
+為什麼必須 fail-closed 而不是「印出來讓 operator 自己看」：runbook 第 2b 步以
+`sudo sh -e` 執行整份權限 script，而 `setfacl -m u:<不存在的帳號>:rX` 會回
+`Invalid argument near character 3` 並讓 `sh -e` **中止整份 script**，留下一棵
+**半套用**的權限樹——前段資產已 chown/chmod、後段完全沒動，而錯誤訊息完全看不出
+是「帳號不存在」（#626）。少印一行安全，多印一行會炸掉部署。
+
+輸出前另有一道自我檢查（:func:`assert_output_accounts_known`）：每一行命令裡出現的
+`u:<name>:` 與 `chown <owner>:<group>` 都必須落在**本方案宣告的帳號集合**
+（:meth:`UidScheme.declared_accounts`）內，否則 raise。這條擋的是「未來新增
+principal 時再犯同一個錯」——新 principal 只要沒進對應表，字面角色名一漏出即 raise。
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Mapping
 
@@ -59,6 +87,135 @@ from .registry import (
 
 
 # ---------------------------------------------------------------------------
+# 部署決定型 principal 的對應（#626）
+# ---------------------------------------------------------------------------
+
+#: 明示「本部署沒有這個角色的實體」的 sentinel。與「未指定」（`None`）**嚴格區分**：
+#: `None` 會讓產生器 fail-closed，本 sentinel 則是一個被記錄下來的決定——該 principal
+#: 的授權整組略去，輸出裡一行都不會出現。
+ABSENT_ACCOUNT: str = "<absent>"
+
+#: OS 帳號名的合法形狀（POSIX portable：小寫開頭、可含數字／底線／減號）。
+#: 這同時是**注入防線**：帳號名會被逐字嵌進 `setfacl`／`chown` 命令字串，帶空白或
+#: shell metacharacter 的值必須在產生階段就被拒絕，而不是等到 operator `sudo` 執行時。
+_ACCOUNT_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+
+
+@dataclass(frozen=True)
+class PrincipalAccountOption:
+    """一個「必須由部署提供對應」的 principal 及其注入管道。
+
+    這張表是唯一真相：`UidScheme` 的欄位、CLI 旗標、env 變數名、fail-closed 的錯誤
+    訊息全部由它導出。將來多一個部署決定型 principal，只需在
+    :data:`PRINCIPAL_ACCOUNT_OPTIONS` 加一列 ＋ `UidScheme` 加一個欄位。
+    """
+
+    principal: Principal
+    #: `UidScheme` 上對應的欄位名。
+    field_name: str
+    #: CLI 旗標（`python -m paulsha_cortex.trust_root permissions …`）。
+    cli_flag: str
+    #: env 變數名（CLI 未給時的來源；CLI 優先）。
+    env_var: str
+    #: 這個角色是什麼——進錯誤訊息，讓 operator 知道自己在決定什麼。
+    description: str
+
+
+PRINCIPAL_ACCOUNT_OPTIONS: tuple[PrincipalAccountOption, ...] = (
+    PrincipalAccountOption(
+        principal=Principal.OPERATOR,
+        field_name="operator_account",
+        cli_flag="--operator-account",
+        env_var="PSC_OPERATOR_ACCOUNT",
+        description=(
+            "人類操作者的登入帳號——單人機器＝那個人的帳號，多人／CI 部署可能是專用帳號"
+        ),
+    ),
+    PrincipalAccountOption(
+        principal=Principal.EXTERNAL,
+        field_name="external_reader_account",
+        cli_flag="--external-reader-account",
+        env_var="PSC_EXTERNAL_READER_ACCOUNT",
+        description=(
+            "外送管線／外部學習系統的唯讀 reader"
+            "——digest outbox 與 engineering-outcome outbox 的下游"
+        ),
+    ),
+)
+
+#: principal → 注入管道，供錯誤訊息與 CLI 反查。
+PRINCIPAL_ACCOUNT_OPTION_BY_PRINCIPAL: Mapping[Principal, PrincipalAccountOption] = {
+    opt.principal: opt for opt in PRINCIPAL_ACCOUNT_OPTIONS
+}
+
+
+class UnresolvedPrincipalError(ValueError):
+    """方案未把某個部署決定型 principal 對應到真實帳號（#626 的 fail-closed 出口）。
+
+    raise 的時機是**輸出前**：一行命令都還沒印出去。這是刻意的——runbook 以
+    `sudo sh -e` 跑整份 script，印出去一行指向不存在帳號的 `setfacl` 就足以中止
+    整份 script 並留下半套用的權限樹。
+    """
+
+    def __init__(self, unresolved: tuple[Principal, ...], scheme_id: str) -> None:
+        self.unresolved = tuple(unresolved)
+        self.scheme_id = scheme_id
+        super().__init__(unresolved_principal_message(self.unresolved, scheme_id))
+
+
+class UnknownAccountInOutputError(ValueError):
+    """輸出裡出現了不在本方案宣告帳號集合內的名字（自我檢查的最後一道）。"""
+
+    def __init__(self, unknown: tuple[str, ...], scheme_id: str, declared: frozenset[str]) -> None:
+        self.unknown = tuple(unknown)
+        self.scheme_id = scheme_id
+        self.declared = frozenset(declared)
+        super().__init__(
+            "permgen 自我檢查失敗：輸出含未宣告的帳號 "
+            f"{list(self.unknown)}（scheme={scheme_id}）。\n"
+            f"本方案宣告的帳號集合：{sorted(self.declared)}。\n"
+            "這代表某個 principal 的對應仍是**字面角色名**而不是真實 OS 帳號——"
+            "在 `sudo sh -e` 下會 `Invalid argument` 中止整份 script 並留下半套用的"
+            "權限樹（#626）。請把該 principal 補進對應表，或明示它在本部署不存在。"
+        )
+
+
+def unresolved_principal_message(
+    unresolved: tuple[Principal, ...],
+    scheme_id: str,
+) -> str:
+    """fail-closed 的可操作訊息：指出是哪個 principal、以及怎麼指定。"""
+    lines = [
+        f"permgen 拒絕輸出命令：scheme={scheme_id} 有 {len(unresolved)} 個 principal "
+        "未對應到真實 OS 帳號。",
+        "",
+    ]
+    for principal in unresolved:
+        opt = PRINCIPAL_ACCOUNT_OPTION_BY_PRINCIPAL.get(principal)
+        if opt is None:
+            lines.append(
+                f"  - principal `{principal.value}`：`UidScheme.account_of` 缺這一項，"
+                "請補上對應的 OS 帳號名。"
+            )
+            continue
+        lines += [
+            f"  - principal `{principal.value}`（{opt.description}）未對應到真實帳號。",
+            f"      指定：{opt.cli_flag} <帳號名>   或   env {opt.env_var}=<帳號名>",
+            f"      本部署沒有這個角色時，明示：{opt.cli_flag} none"
+            f"（等同 {opt.env_var}=none）——該 principal 的授權整組略去。",
+        ]
+    lines += [
+        "",
+        "為何不先印出來讓人自己看：runbook 第 2b 步以 `sudo sh -e` 執行整份權限 script，",
+        "而 `setfacl -m u:<不存在的帳號>:rX` 會回 `Invalid argument near character 3`",
+        "並**中止整份 script**，留下一棵半套用的權限樹（前段已 chown/chmod、後段完全沒動），",
+        "錯誤訊息還完全看不出是「帳號不存在」（#626）。",
+        "指定前請先確認帳號存在：`getent passwd <帳號名>`。",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # UID 方案 config（參數化——二分為預設，同一資料結構可表達三分）
 # ---------------------------------------------------------------------------
 
@@ -66,9 +223,14 @@ from .registry import (
 class UidScheme:
     """persona→OS 帳號的映射方案。
 
-    `account_of` 必須涵蓋登記表出現過的所有非 `ANY_SAME_UID` principal
+    `account_of` 必須涵蓋登記表出現過的所有**服務／job** principal
     （`ANY_SAME_UID` 是「現況同 UID 任意行程」的標記，正是 Phase 2 要移除的對象，
     故**不**映射到任何目標帳號）。
+
+    `INSTALLER`／`OPERATOR`／`EXTERNAL` 三者**不得**放進 `account_of`：前者永遠是
+    `deploy_account`，後兩者是部署決定，走各自的欄位（見
+    :data:`PRINCIPAL_ACCOUNT_OPTIONS`）。放進 `account_of` 會被靜默忽略，因此
+    `__post_init__` 直接拒絕——「兩份真相」正是 #626 的成因。
     """
 
     scheme_id: str
@@ -77,17 +239,49 @@ class UidScheme:
     durable_state_owner: str
     #: enforcement plane（unit／venv／launcher／env／codex hooks）的擁有者。
     deploy_account: str = "root"
-    #: 外部唯讀消費者（digest／engineering-outcome outbox 的下游）帳號。
-    external_reader: str = "cortex-outbox"
+    #: 人類操作者的登入帳號。**部署決定**：`None`＝未指定（產生器 fail-closed），
+    #: :data:`ABSENT_ACCOUNT`＝本部署沒有這個角色。
+    operator_account: str | None = None
+    #: 外部唯讀消費者（digest／engineering-outcome outbox 的下游）帳號。同上三態。
+    external_reader_account: str | None = None
+
+    def __post_init__(self) -> None:
+        managed = {opt.principal for opt in PRINCIPAL_ACCOUNT_OPTIONS} | {
+            Principal.INSTALLER, Principal.ANY_SAME_UID,
+        }
+        overlap = sorted(p.value for p in self.account_of if p in managed)
+        if overlap:
+            raise ValueError(
+                f"UidScheme(scheme_id={self.scheme_id!r})：{overlap} 不得出現在 "
+                "`account_of`——它們由專屬欄位決定（deploy_account／"
+                + "／".join(opt.field_name for opt in PRINCIPAL_ACCOUNT_OPTIONS)
+                + "），寫在 `account_of` 會被靜默忽略而形成第二份真相（#626）。"
+            )
+        for name in list(self.account_of.values()) + [
+            self.durable_state_owner, self.deploy_account,
+        ]:
+            _validate_account_name(name)
+        for opt in PRINCIPAL_ACCOUNT_OPTIONS:
+            value = getattr(self, opt.field_name)
+            if value is None or value == ABSENT_ACCOUNT:
+                continue
+            _validate_account_name(value, flag=opt.cli_flag)
 
     def resolve(self, principal: Principal) -> str | None:
-        """回傳 principal 的目標帳號；`ANY_SAME_UID` 與未映射者回傳 None。"""
+        """回傳 principal 的目標帳號；`ANY_SAME_UID`、未指定與明示不存在者回傳 None。
+
+        **回傳 None 不代表沒問題**：呼叫端要區分「本來就不該有帳號」
+        （`ANY_SAME_UID`／`ABSENT_ACCOUNT`）與「對應表缺項」——後者由
+        :meth:`unresolved_principals` 抓出來並讓產生器 fail-closed。
+        """
         if principal is Principal.ANY_SAME_UID:
             return None
         if principal is Principal.INSTALLER:
             return self.deploy_account
-        if principal is Principal.EXTERNAL:
-            return self.external_reader
+        opt = PRINCIPAL_ACCOUNT_OPTION_BY_PRINCIPAL.get(principal)
+        if opt is not None:
+            value = getattr(self, opt.field_name)
+            return None if value in (None, ABSENT_ACCOUNT) else value
         return self.account_of.get(principal)
 
     def group_of(self, account: str) -> str:
@@ -107,6 +301,74 @@ class UidScheme:
                 accts.add(a)
         return frozenset(accts)
 
+    def declared_accounts(self) -> frozenset[str]:
+        """本方案宣告過的**全部**帳號名——輸出自我檢查的比對基準。
+
+        任何出現在產生命令裡的帳號名都必須落在這個集合內；落在集合外就代表某處把
+        抽象角色名當帳號印出去了（#626）。
+        """
+        accts = set(self.account_of.values())
+        accts.add(self.durable_state_owner)
+        accts.add(self.deploy_account)
+        for opt in PRINCIPAL_ACCOUNT_OPTIONS:
+            value = getattr(self, opt.field_name)
+            if value is not None and value != ABSENT_ACCOUNT:
+                accts.add(value)
+        return frozenset(accts)
+
+    def unresolved_principals(
+        self,
+        assets: tuple[TrustRootAsset, ...] = registry.ASSET_REGISTRY,
+    ) -> tuple[Principal, ...]:
+        """登記表用到、但本方案**沒有**對應到帳號也沒明示不存在的 principal。
+
+        `ANY_SAME_UID` 不算（它本來就不該有帳號）；明示 :data:`ABSENT_ACCOUNT` 的
+        也不算（那是決定，不是遺漏）。回傳依 principal 值排序，確保訊息決定性。
+        """
+        missing: set[Principal] = set()
+        for asset in assets:
+            for principal in tuple(asset.writers) + tuple(asset.readers):
+                if principal is Principal.ANY_SAME_UID:
+                    continue
+                opt = PRINCIPAL_ACCOUNT_OPTION_BY_PRINCIPAL.get(principal)
+                if opt is not None:
+                    if getattr(self, opt.field_name) is None:
+                        missing.add(principal)
+                    continue
+                if self.resolve(principal) is None:
+                    missing.add(principal)
+        return tuple(sorted(missing, key=lambda p: p.value))
+
+    def with_principal_accounts(
+        self,
+        accounts: Mapping[Principal, str],
+    ) -> "UidScheme":
+        """回傳帶上部署決定型 principal 對應的新方案（本體 frozen，不就地改）。
+
+        CLI／env 注入的唯一入口。未列出的 principal 沿用原值。
+        """
+        overrides: dict[str, str] = {}
+        for principal, account in accounts.items():
+            opt = PRINCIPAL_ACCOUNT_OPTION_BY_PRINCIPAL.get(principal)
+            if opt is None:
+                raise ValueError(
+                    f"principal `{principal.value}` 不是部署決定型的對應項；"
+                    f"可指定的只有 {[o.principal.value for o in PRINCIPAL_ACCOUNT_OPTIONS]}。"
+                )
+            overrides[opt.field_name] = account
+        return replace(self, **overrides)
+
+
+def _validate_account_name(name: str, flag: str | None = None) -> None:
+    """帳號名必須是合法 POSIX 帳號形狀——名字會被逐字嵌進命令字串。"""
+    if not isinstance(name, str) or not _ACCOUNT_NAME_RE.match(name):
+        where = f"（{flag}）" if flag else ""
+        raise ValueError(
+            f"不是合法的 OS 帳號名{where}：{name!r}。"
+            "帳號名會被逐字嵌進 setfacl／chown 命令字串，只接受 "
+            "`^[a-z_][a-z0-9_-]*\\$?$`。"
+        )
+
 
 #: 二分（**向後相容選項**，非預設）：builder 一個帳號，其餘 headless／Manager／
 #: monitor 共用 cortex-svc。0816 第三輪裁決前的方案；已按此裝好的部署可續用，
@@ -120,10 +382,11 @@ TWO_WAY_SCHEME = UidScheme(
         Principal.PLANNER: "cortex-svc",
         Principal.BUILDER: "cortex-builder",
         Principal.HEADLESS_HOOK: "cortex-builder",
-        Principal.OPERATOR: "operator",
     },
     durable_state_owner="cortex-svc",
     deploy_account="root",
+    # operator_account／external_reader_account 刻意留 None：它們是部署決定，
+    # 由 CLI／env 於產生當下注入（#626）。寫死在這裡就是把部署決定編進程式碼。
 )
 
 #: 三分（**定案**）：把 cortex-svc 拆成 cortex-manager（durable state owner，持 spawn
@@ -138,10 +401,10 @@ THREE_WAY_SCHEME = UidScheme(
         Principal.PLANNER: "cortex-reviewer-planner",
         Principal.BUILDER: "cortex-builder",
         Principal.HEADLESS_HOOK: "cortex-builder",
-        Principal.OPERATOR: "operator",
     },
     durable_state_owner="cortex-manager",
     deploy_account="root",
+    # 同二分：operator／external reader 是部署決定，不寫死（#626）。
 )
 
 SCHEMES: dict[str, UidScheme] = {
@@ -493,6 +756,19 @@ class PermissionPlan:
     #: writers／readers，故把輸入資產一併帶著走。手工組出的 plan 留空 tuple，
     #: 此時 `required_write_targets` 退回 `registry.ASSET_REGISTRY` 查表。
     assets: tuple[TrustRootAsset, ...] = ()
+    #: 產生本計畫的方案**本體**。`scheme_id` 只是名字，查 `SCHEMES` 拿回來的是
+    #: 模組層那個**未注入部署對應**的方案（#626 之後 operator／external reader 是
+    #: 產生當下才注入的）——只憑 id 反查會把注入過的對應整個丟掉，自我檢查因此會
+    #: 誤判。故一律把方案本身帶著走；`compare=False` 讓兩份同方案計畫仍然相等。
+    scheme: "UidScheme | None" = field(default=None, compare=False, repr=False)
+
+    @property
+    def unresolved_principals(self) -> tuple[Principal, ...]:
+        """本計畫用到、但方案沒有對應到帳號的 principal（空 tuple＝可安全輸出）。"""
+        scheme = self.scheme or SCHEMES.get(self.scheme_id)
+        if scheme is None:
+            return ()
+        return scheme.unresolved_principals(self.assets or registry.ASSET_REGISTRY)
 
     def by_id(self, asset_id: str) -> PermissionEntry:
         for e in self.entries:
@@ -512,6 +788,9 @@ class PermissionPlan:
         return {
             "scheme_id": self.scheme_id,
             "asset_count": len(self.entries),
+            # 未對應的 principal 一律隨計畫一起出現：JSON 模式不會 raise（它是診斷
+            # 用途），但**必須**看得出「這份計畫少了誰的授權」，否則就是靜默漏授。
+            "unresolved_principals": [p.value for p in self.unresolved_principals],
             "entries": [e.to_dict() for e in self.entries],
         }
 
@@ -520,9 +799,74 @@ def generate_plan(
     scheme: UidScheme,
     assets: tuple[TrustRootAsset, ...] = registry.ASSET_REGISTRY,
 ) -> PermissionPlan:
-    """對登記表每一項機械產生權限，回傳完整計畫（涵蓋無遺漏）。"""
+    """對登記表每一項機械產生權限，回傳完整計畫（涵蓋無遺漏）。
+
+    **本函式不 fail-closed**：計畫是資料，看得到未對應的 principal 反而有助診斷
+    （`PermissionPlan.unresolved_principals`）。fail-closed 發生在
+    :func:`plan_to_commands`——也就是「要輸出會被 `sh -e` 執行的命令」的那一刻。
+    """
     entries = tuple(build_entry(a, scheme) for a in assets)
-    return PermissionPlan(scheme_id=scheme.scheme_id, entries=entries, assets=tuple(assets))
+    return PermissionPlan(
+        scheme_id=scheme.scheme_id,
+        entries=entries,
+        assets=tuple(assets),
+        scheme=scheme,
+    )
+
+
+def _scheme_for(plan: PermissionPlan, scheme: UidScheme | None) -> UidScheme:
+    """取本計畫該用的方案：顯式參數 > 計畫自帶 > `SCHEMES` 反查 > 預設。
+
+    順序不能反：`SCHEMES[plan.scheme_id]` 拿到的是**未注入部署對應**的模組層方案。
+    """
+    if scheme is not None:
+        return scheme
+    if plan.scheme is not None:
+        return plan.scheme
+    return SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+
+
+def assert_principals_resolved(plan: PermissionPlan, scheme: UidScheme) -> None:
+    """輸出前的 fail-closed 閘：有任何未對應的 principal 即 raise，一行都不輸出。"""
+    unresolved = scheme.unresolved_principals(plan.assets or registry.ASSET_REGISTRY)
+    if unresolved:
+        raise UnresolvedPrincipalError(unresolved, scheme.scheme_id)
+
+
+#: 命令字串裡的 ACL 帳號（`setfacl … u:<name>:<perms> …`）。前置的 `(?<![\w-])`
+#: 防止把 `menu:x:` 這種尾字為 `u` 的名字誤切成 `u:` 條目。
+_ACL_ACCOUNT_RE = re.compile(r"(?<![\w-])u:([^:\s]+):")
+#: `chown <owner>:<group> <path>`——owner／group 同樣必須是宣告過的帳號。
+_CHOWN_ACCOUNT_RE = re.compile(r"(?<![\w-])chown\s+([^:\s]+):([^:\s]+)\s")
+
+
+def unknown_accounts_in(lines: "list[str]", scheme: UidScheme) -> tuple[str, ...]:
+    """輸出行裡出現、卻不在方案宣告帳號集合內的名字（空 tuple＝乾淨）。
+
+    註解行**一併檢查**：per-job 資產是以註解形式輸出的，一個 phantom 帳號躲在
+    `#   setfacl …` 裡照樣會被人複製貼上去執行。
+    """
+    declared = scheme.declared_accounts()
+    seen: set[str] = set()
+    for line in lines:
+        for match in _ACL_ACCOUNT_RE.finditer(line):
+            seen.add(match.group(1))
+        for match in _CHOWN_ACCOUNT_RE.finditer(line):
+            seen.update(match.groups())
+    return tuple(sorted(seen - declared))
+
+
+def assert_output_accounts_known(lines: "list[str]", scheme: UidScheme) -> None:
+    """自我檢查：輸出裡每個帳號名都必須是本方案宣告過的，否則 raise。
+
+    這條擋的是**未來**——新增一個 principal 而忘了進對應表時，字面角色名一漏進
+    命令字串就 raise，不會再靜默產生一行 `sh -e` 下會炸掉的 `setfacl`（#626）。
+    """
+    unknown = unknown_accounts_in(lines, scheme)
+    if unknown:
+        raise UnknownAccountInOutputError(
+            unknown, scheme.scheme_id, scheme.declared_accounts()
+        )
 
 
 def _placeholder_path(entry: PermissionEntry) -> str:
@@ -552,7 +896,14 @@ def plan_to_commands(
     traverse ACL（`derive_traverse_grants`，#620）——沒有它，葉節點 ACL 全部正確
     但路徑走不通。`layout`／`scheme` 只影響那一節（骨架目錄的 owner／mode 是判斷
     「這層是否已可 traverse」的輸入），未給時取 `DEFAULT_LAYOUT` 與 plan 的 scheme。
+
+    **fail-closed（#626）**：方案裡有任何 principal 沒對應到真實 OS 帳號時，本函式
+    raise :class:`UnresolvedPrincipalError` 而**不輸出任何一行**；輸出組完後再過一道
+    :func:`assert_output_accounts_known` 自我檢查。理由見模組 docstring——半套用的
+    權限樹比「產生器拒絕產出」危險得多。
     """
+    scheme = _scheme_for(plan, scheme)
+    assert_principals_resolved(plan, scheme)
     lines: list[str] = [
         f"# trust-root Phase 2b 權限套用命令（scheme={plan.scheme_id}）",
         "# 由 permgen 機械產生；operator 逐項 review 後手動 sudo 執行。",
@@ -590,6 +941,7 @@ def plan_to_commands(
     lines += traverse_commands(
         derive_traverse_grants(plan, layout, scheme, path_of=path_of or {})
     )
+    assert_output_accounts_known(lines, scheme)
     return lines
 
 
@@ -1048,7 +1400,7 @@ def directory_facts(
 ) -> dict[str, DirectoryFacts]:
     """路徑→目標狀態（骨架目錄先鋪底，登記表資產覆蓋其上）。純函式、無 IO。"""
     layout = layout if layout is not None else DEFAULT_LAYOUT
-    scheme = scheme if scheme is not None else SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+    scheme = _scheme_for(plan, scheme)
     paths = dict(path_of) if path_of is not None else layout.asset_paths()
     facts: dict[str, DirectoryFacts] = {}
     for path, owner, group, mode in layout.scaffold_directories(scheme):
@@ -1159,7 +1511,7 @@ def derive_traverse_grants(
     一律跳過——不重複產生。回傳依 `(path, account)` 排序，確保輸出決定性。
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
-    scheme = scheme if scheme is not None else SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+    scheme = _scheme_for(plan, scheme)
     paths = dict(path_of) if path_of is not None else layout.asset_paths()
     facts = directory_facts(plan, layout, scheme, paths)
     roots = managed_roots(facts)
@@ -1198,7 +1550,7 @@ def unreachable_hops(
     這就是 #620 的驗收條件本身：葉節點 ACL 正確 **≠** 路徑走得通。
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
-    scheme = scheme if scheme is not None else SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+    scheme = _scheme_for(plan, scheme)
     paths = dict(path_of) if path_of is not None else layout.asset_paths()
     facts = directory_facts(plan, layout, scheme, paths)
     if grants is None:
