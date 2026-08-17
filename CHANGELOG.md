@@ -8,6 +8,25 @@
 ## [Unreleased]
 
 ### Added
+- **#622 / trust-root Phase 2b：`trust_root unit three-way --monitor`——monitor 的
+  system-level unit，同帳號、同加固段，可寫面嚴格窄於 Manager**——M1 之後 permgen
+  只產生 Manager unit，實機切換後 instance **完全沒有 monitor**：舊 `--user` unit 以
+  操作者身分跑、指向舊 `~/.agents/monitor`，起回來只會雙寫，且寫不進 `0700
+  cortex-manager` 的新樹；`monitor-event-spool` 因此只有 builder 的 `wx` 生產端、
+  沒有消費端。新增 `permgen.build_monitor_unit()` 與 CLI 旗標 `--monitor`：`User=`
+  取 `durable_state_owner`（UID 方案表即「`cortex-manager`＝Manager ＋ monitor」）、
+  加固段與 fail-closed 的 `EnvironmentFile` 與 Manager unit 同源、`HOME`／
+  `XDG_CACHE_HOME` 走 `layout.home_of()`／`cache_of()`。`ReadWritePaths` 多一層
+  **persona 過濾**（`permgen.principal_needs_write()`，規則只有兩條且都直接讀登記表：
+  persona 是 `writers` 之一，或是 `INTERPROCESS` 單向 spool 的 reader——消費＝unlink，
+  需要容器寫入權），因此 monitor 只拿到 `/var/lib/cortex/monitor`、
+  `/var/lib/cortex/run/cortex` 與服務帳號 HOME 快取三條，是 Manager 十一條的真子集；
+  `principals=None` 維持既有行為，Manager 與 job 模板 unit 的輸出**逐位元不變**。
+  `ExecStart` 形態比照 #618／PR #619 用 `<venv>/bin/cortex monitor`（既有 CLI verb，
+  不帶 `--once` 即長駐），不用 `python -m` 以免在部署樹裡開第二種進入點形態。
+  新增 `tests/test_trust_root_monitor_unit_622.py`（40 測試，含 ExecStart 契約鎖與
+  加固欄位對 Manager 的集合等式）；runbook 補第 4d 步。
+  詳見 `changelog.d/monitor-system-unit.md`。
 - **#584 / trust-root Phase 2b：0816 第三輪裁決 A+B 的程式碼側——三分 UID 定案 ＋
   `job_runner` 的 template-instance 模式**——**A**：`permgen.DEFAULT_SCHEME`
   改為 `THREE_WAY_SCHEME`（`cortex-manager`／`cortex-reviewer-planner`／

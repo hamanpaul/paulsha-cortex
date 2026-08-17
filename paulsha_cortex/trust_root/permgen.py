@@ -488,6 +488,11 @@ class PermissionPlan:
 
     scheme_id: str
     entries: tuple[PermissionEntry, ...]
+    #: 產生本計畫的登記表切片。`PermissionEntry` 只留權限結論、不留 persona 面，
+    #: 但 per-persona 的 ReadWritePaths 導出（`principals=` 過濾）需要回頭看
+    #: writers／readers，故把輸入資產一併帶著走。手工組出的 plan 留空 tuple，
+    #: 此時 `required_write_targets` 退回 `registry.ASSET_REGISTRY` 查表。
+    assets: tuple[TrustRootAsset, ...] = ()
 
     def by_id(self, asset_id: str) -> PermissionEntry:
         for e in self.entries:
@@ -517,7 +522,7 @@ def generate_plan(
 ) -> PermissionPlan:
     """對登記表每一項機械產生權限，回傳完整計畫（涵蓋無遺漏）。"""
     entries = tuple(build_entry(a, scheme) for a in assets)
-    return PermissionPlan(scheme_id=scheme.scheme_id, entries=entries)
+    return PermissionPlan(scheme_id=scheme.scheme_id, entries=entries, assets=tuple(assets))
 
 
 def _placeholder_path(entry: PermissionEntry) -> str:
@@ -692,6 +697,16 @@ class PathLayout:
         return f"{self.venv_root}/bin/cortex service run"
 
     @property
+    def monitor_exec_start(self) -> str:
+        """monitor 的 `ExecStart=`。
+
+        形態刻意與 Manager 同一種：**部署 venv 裡的 `cortex` console script ＋ 一個
+        既有的 CLI verb**，而不是 `python -m paulsha_cortex.monitor`。理由見
+        `build_monitor_unit()` 的 docstring 與 unit 內註解。
+        """
+        return f"{self.venv_root}/bin/cortex monitor"
+
+    @property
     def env_file(self) -> str:
         return f"{self.deploy_root}/etc/{self.instance}-manager.env"
 
@@ -845,6 +860,16 @@ class PathLayout:
             ),
         )
 
+    def monitor_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
+        """monitor unit 的額外可寫路徑。
+
+        三分 UID 方案表寫的是「`cortex-manager`：Manager ＋ **monitor**」——同一個
+        帳號、同一個 HOME，因此這裡**刻意複用** `manager_extra_write_paths()` 而不
+        另開一條例外：monitor 的 `git`／`gh`／`uv` 快取就是 Manager 的那一個
+        `XDG_CACHE_HOME`，寫成兩條會讓「例外通道」看起來比實際多一條。
+        """
+        return self.manager_extra_write_paths(account)
+
     def job_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
         # 帳號由呼叫端（`build_job_unit` 的 principal）給：M2 要為 reviewer/planner
         # 開第二個模板 unit 時，這裡不必改一行——換 principal 即換帳號。
@@ -887,22 +912,59 @@ def _minimize(paths: set[str]) -> tuple[str, ...]:
     return tuple(sorted(set(kept)))
 
 
+def principal_needs_write(
+    asset: TrustRootAsset,
+    principals: frozenset[Principal],
+) -> bool:
+    """該組 persona 是否需要對此資產可寫——**只看登記表，沒有第二條規則**。
+
+    兩種「需要寫」，都直接讀自登記表欄位：
+
+    1. **直接 writer**：persona 出現在 `asset.writers`。
+    2. **單向 spool 的 trusted consumer**：`IngressKind.INTERPROCESS` 的 reader。
+       消費＝讀完即 unlink（`monitor-event-spool` 的 note 就是這麼寫的：「別的
+       行程寫入、monitor 消費即消失」），而 unlink 需要對**容器目錄**的寫入權。
+       少了這條，monitor unit 會拿到一個「讀得到卻刪不掉」的 spool——事件會被
+       重複消費，spool 只增不減，正是 #622 描述的那個沒有消費端的狀態。
+
+    這條規則是**帳號過濾之外的第二層**：三分方案把 Manager 與 monitor 映到同一個
+    `cortex-manager` 帳號，單看帳號兩者的可寫面完全相同；要讓 monitor unit 真的
+    比 Manager 窄，必須回到 persona 這一層來切。
+    """
+    if any(p in principals for p in asset.writers):
+        return True
+    if asset.ingress_kind is IngressKind.INTERPROCESS:
+        return any(p in principals for p in asset.readers)
+    return False
+
+
 def required_write_targets(
     plan: PermissionPlan,
     layout: PathLayout,
     account: str,
+    principals: frozenset[Principal] | None = None,
 ) -> dict[str, str]:
     """`asset_id → 該帳號必須可寫的目標路徑`（檔案取其父目錄）。
 
     ProtectSystem=strict 下整個檔案系統唯讀；要**建立／取代**一個檔，必須對其
     父目錄可寫，故檔案資產一律折算成父目錄。這就是「ReadWritePaths 由登記表機械
     導出」的全部規則——沒有第二條。
+
+    `principals` 給定時再套一層 persona 過濾（見 `principal_needs_write`）：同一
+    帳號上跑多個 persona 時（三分的 `cortex-manager`＝Manager＋monitor），每個
+    unit 只拿自己那一份，而不是帳號的全集。`None`＝不過濾（帳號全集，Manager
+    unit 與 job 模板 unit 的既有行為）。
     """
     targets: dict[str, str] = {}
     paths = layout.asset_paths()
+    index = {a.asset_id: a for a in (plan.assets or registry.ASSET_REGISTRY)}
     for entry in plan.entries:
         if account not in plan.all_writable_accounts(entry):
             continue
+        if principals is not None:
+            asset = index.get(entry.asset_id)
+            if asset is None or not principal_needs_write(asset, principals):
+                continue
         path = paths[entry.asset_id]
         targets[entry.asset_id] = path if entry.is_directory else _parent_dir(path)
     return targets
@@ -913,9 +975,10 @@ def read_write_paths(
     layout: PathLayout,
     account: str,
     extras: tuple[ExtraWritePath, ...] = (),
+    principals: frozenset[Principal] | None = None,
 ) -> tuple[str, ...]:
     """該帳號 unit 的 `ReadWritePaths=` 最小覆蓋集合（登記表導出 ∪ 明示 extras）。"""
-    wanted = set(required_write_targets(plan, layout, account).values())
+    wanted = set(required_write_targets(plan, layout, account, principals).values())
     wanted |= {e.path for e in extras}
     return _minimize(wanted)
 
@@ -925,11 +988,12 @@ def read_write_path_owners(
     layout: PathLayout,
     account: str,
     extras: tuple[ExtraWritePath, ...] = (),
+    principals: frozenset[Principal] | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """每條 ReadWritePaths → 它涵蓋的 asset_id（或 `extra:<reason>`），供逐條註解。"""
-    targets = required_write_targets(plan, layout, account)
+    targets = required_write_targets(plan, layout, account, principals)
     result: dict[str, tuple[str, ...]] = {}
-    for rwp in read_write_paths(plan, layout, account, extras):
+    for rwp in read_write_paths(plan, layout, account, extras, principals):
         covered = sorted(aid for aid, t in targets.items() if _is_within(t, rwp))
         covered += [f"extra:{e.reason}" for e in extras if _is_within(e.path, rwp)]
         result[rwp] = tuple(covered)
@@ -1203,7 +1267,10 @@ def traverse_commands(grants: tuple[TraverseGrant, ...]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# systemd unit 產生（Manager system unit ＋ 降權 job 模板 unit）
+# systemd unit 產生（Manager／monitor system unit ＋ 降權 job 模板 unit）
+#
+# 三份 unit 共用同一份加固表（`_HARDENING`）與同一套 ReadWritePaths 導出
+# （`read_write_path_owners`）；差別只在 `User=`／`ExecStart=`／persona 過濾。
 # ---------------------------------------------------------------------------
 
 #: 加固指令 →（值, 為何）。逐項附註解是 spec §R3 的可審查性要求。
@@ -1384,6 +1451,132 @@ def build_manager_unit(
         install_path=f"/etc/systemd/system/{unit_name}",
         account=account,
         exec_start=layout.exec_start,
+        environment_file=layout.env_file,
+        read_write_paths=tuple(owners.keys()),
+        content="\n".join(body) + "\n",
+    )
+
+
+#: monitor unit 的 persona 過濾集合。ReadWritePaths 只從這組 persona 在登記表上的
+#: writer／spool-consumer 面導出——**這是 monitor unit 比 Manager unit 窄的機制**。
+MONITOR_PRINCIPALS: frozenset[Principal] = frozenset({Principal.MONITOR})
+
+
+def build_monitor_unit(
+    scheme: UidScheme,
+    layout: PathLayout = DEFAULT_LAYOUT,
+    plan: PermissionPlan | None = None,
+) -> SystemdUnit:
+    """monitor 的 system-level unit（`User=<durable_state_owner>`，與 Manager 同帳號）。
+
+    ## 為什麼 `User=` 與 Manager 同一個帳號
+
+    三分方案的 UID 表寫的就是「`cortex-manager`：Manager ＋ monitor」（見
+    :data:`THREE_WAY_SCHEME`）。裁決的判準是「injection 可達的任何進程都不得持有
+    spawn 授權」——monitor **不跑任何模型程式碼**，與 Manager 同屬那條線的內側；
+    而 `/var/lib/cortex/monitor` 是 `0700 cortex-manager`，monitor 若以別的身分跑
+    就根本寫不進自己的 state 樹（#622 的實機症狀正是如此：舊 `--user` monitor 以
+    操作者身分跑，只能靜默地繼續寫舊的 `~/.agents` 樹）。
+
+    ## 為什麼 ReadWritePaths 必須比 Manager 窄
+
+    同帳號**不代表**同可寫面。`required_write_targets()` 只按帳號過濾時，monitor
+    會拿到 Manager 的全集（`coordinator/`、`specs/`、`control/`、`worktree/`…），
+    等於把 monitor 的任何 bug／被餵入的惡意 GitHub 內容，變成對整棵 durable state
+    的寫入面。因此這裡多帶一層 persona 過濾（:data:`MONITOR_PRINCIPALS`），讓
+    ReadWritePaths 只由 **monitor 這個 persona 在登記表上的資產**導出：
+
+    - `monitor-state-tree`／`monitor-work-items-snapshot`／`monitor-github-sync-cursor`
+      （`writers=(MONITOR,)`）
+    - `monitor-event-spool`（`INTERPROCESS` spool 的 trusted consumer——消費＝unlink，
+      需要容器目錄的寫入權；#622 的「有生產端沒消費端」就是這一格）
+    - `runtime-run-tree`（`writers=(MANAGER, MONITOR)`——monitor 的 unix socket）
+
+    其餘全部落在 monitor 的 persona 面之外，因此**機械地**不會出現在這份 unit 上。
+    要讓某條回來，唯一的辦法是改登記表把 monitor 登記成該資產的 writer／consumer，
+    然後重跑產生器——沒有手擴的入口。
+
+    ## ExecStart 的形態（#618／PR #619 對齊）
+
+    與 Manager 同形：`<venv>/bin/cortex <verb>`，這裡的 verb 是**既有**的
+    `cortex monitor`（`cli.py` 轉發到 `paulsha_cortex.monitor.__main__:main`，不帶
+    `--once` 即長駐 `ProjectMonitorService.run_forever()`，符合 `Type=simple`）。
+    #618 的教訓是「ExecStart 契約只存在於產生器端、CLI 沒跟上」，因此本 PR 一併加了
+    契約鎖測試把兩端綁住；差別在 Manager 那次必須**補**一個 verb，monitor 這次
+    verb 早就在（`cortex monitor` 是 README 與 `cli.py` 的公開介面），所以只補鎖。
+
+    刻意**不用** `<venv>/bin/python -m paulsha_cortex.monitor`：那條路繞過 console
+    script，等於在部署樹裡開第二種進入點形態——`cortex service run` 與
+    `python -m ...` 之後會各自漂移，而 R-16 的 CLI help 對齊面只看得到前者。
+    """
+    plan = plan or generate_plan(scheme)
+    account = scheme.durable_state_owner
+    group = scheme.group_of(account)
+    extras = layout.monitor_extra_write_paths(account)
+    owners = read_write_path_owners(
+        plan, layout, account, extras, principals=MONITOR_PRINCIPALS
+    )
+    unit_name = f"{layout.instance}-monitor.service"
+
+    body = [
+        f"# {'/etc/systemd/system/' + unit_name}",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；改登記表後重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --monitor",
+        "#",
+        "# monitor 與 Manager 同帳號（UID 方案表：cortex-manager＝Manager ＋ monitor），",
+        "# 但**可寫面不同**：下方 ReadWritePaths 只由 monitor persona 在 R1 登記表上的",
+        "# writer／spool-consumer 面導出，是 Manager unit 的真子集。",
+        "",
+        "[Unit]",
+        "Description=cortex Monitor (trust-root Phase 2b, system-level)",
+        "Documentation=file://docs/superpowers/runbooks/trust-root-phase2b-setup.md",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "# 受信任服務身分。monitor 不跑任何模型程式碼，故與 Manager 同屬授權線內側；",
+        f"# 也唯有同帳號才寫得進 0700 {account} 的 {layout.monitor_state_root}。",
+        f"User={account}",
+        f"Group={group}",
+        "",
+        "# 與 Manager 同形態的進入點：部署 venv 的 console script ＋ 既有 CLI verb",
+        "# （`cortex monitor` → paulsha_cortex.monitor.__main__:main；不帶 --once 即長駐）。",
+        "# 不寫 `python -m paulsha_cortex.monitor`——那會在部署樹裡開第二種進入點形態，",
+        "# 與 `cortex service run` 各自漂移（#618 就是產生器與 CLI 單邊漂移的後果）。",
+        f"ExecStart={layout.monitor_exec_start}",
+        "# 落在 durable state 樹根（root-owned、對本服務唯讀）——monitor 的掃描目標一律",
+        "# 由 config 指定絕對路徑，這裡只要一個必然存在、不隨 operator HOME 漂移的 cwd。",
+        f"WorkingDirectory={layout.agents_root}",
+        "",
+        "# EnvironmentFile 無 '-' 前綴＝fail-closed：檔案缺席即拒絕啟動，",
+        "# MUST NOT 靜默落回 $HOME/.agents 預設。這正是 #622 的核心——舊 --user monitor",
+        "# 的 PSC_MONITOR_STATE_ROOT 指著舊樹，起回來只會雙寫。與 Manager 共用同一份",
+        "# instance-scoped env，兩個服務因此不可能解析到不同的 durable state 樹。",
+        f"EnvironmentFile={layout.env_file}",
+        "# HOME 由 unit 指定；HOME 本身 root-owned，只有 cache 子目錄可寫。",
+        "# 路徑由帳號名導出（`layout.home_of`）——換 scheme 時不會停在舊帳號的樹上。",
+        f"Environment=HOME={layout.home_of(account)}",
+        f"Environment=XDG_CACHE_HOME={layout.cache_of(account)}",
+        "",
+        "# --- 加固（與 Manager unit 逐項同一份表；集合比對有測試守著，不得單邊漂移）---",
+    ]
+    body += _hardening_lines()
+    body += [""]
+    body += _rwp_lines(owners)
+    body += [
+        "",
+        "Restart=on-failure",
+        "RestartSec=10s",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+    ]
+    return SystemdUnit(
+        unit_name=unit_name,
+        install_path=f"/etc/systemd/system/{unit_name}",
+        account=account,
+        exec_start=layout.monitor_exec_start,
         environment_file=layout.env_file,
         read_write_paths=tuple(owners.keys()),
         content="\n".join(body) + "\n",

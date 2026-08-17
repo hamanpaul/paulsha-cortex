@@ -36,7 +36,7 @@ OS** 的手動流程。
 | durable state 路徑 | **`/var/lib/cortex`**；worktree pool＝**`/var/lib/cortex/worktree`** | 第 2 步 |
 | legacy-import | **物理隔離 ＋ hash manifest**（無簽章；簽章屬 Phase 3）。切換前 in-flight job **手動收尾** | 執行前提、第 3 步 |
 | Manager 部署 | **`/opt/cortex`**（root 擁有，對服務唯讀）；system-level unit，`User=cortex-manager` | 第 4 步 |
-| `ReadWritePaths` | **由 R1 登記表經 permgen 機械產生**，不手寫 | 第 4c 步 |
+| `ReadWritePaths` | **由 R1 登記表經 permgen 機械產生**，不手寫；monitor 再多一層 persona 過濾，嚴格窄於 Manager | 第 4c／4d 步 |
 | root 命令 codify | **不 codify**——不提供 `cortex install trust-root --system`；cortex 只產生命令字串 | 第 6 步 |
 | R9 | **手動抽驗**（五族；完整自動化矩陣屬另一工項） | 第 8 步 |
 
@@ -191,11 +191,11 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | 段落 | 🔧 sudo 點 | ✅ 驗證點 |
 |---|---:|---:|
 | 執行前提 | 0 | 9 |
-| 產生器＝單一真相 | 0 | 6 |
+| 產生器＝單一真相 | 0 | 7 |
 | 第 1 步：建三帳號 | 4 | 5 |
 | 第 2 步：目標樹與權限 | 2 | 12 |
 | 第 3 步：legacy-import | 2 | 8 |
-| 第 4 步：Manager 部署與 unit | 5 | 12 |
+| 第 4 步：Manager／monitor 部署與 unit | 8 | 22 |
 | **第 5 步：降權（A+B）** | **7** | **24** |
 | 第 6 步：升級流程 | 2 | 5 |
 | 第 7 步：切換驗收 | 0 | 3 |
@@ -204,7 +204,7 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | WSL2 風險與診斷 | 1 | 12 |
 | 附錄 A：自我檢查 | 0 | 5 |
 | 附錄 B：降級備援 | 2 | 3 |
-| **合計** | **32** | **122** |
+| **合計** | **35** | **133** |
 
 （統計方式：全文 `🔧`／`✅` 標記出現次數，扣除說明性用法——「標記約定」的定義行、
 段落標題內的標記、以及表格裡當狀態記號用的那幾個。）
@@ -235,6 +235,9 @@ python3 -m paulsha_cortex.trust_root scaffold three-way
 
 # ✅ Manager system unit 內容（User=cortex-manager，ReadWritePaths 由登記表導出）
 python3 -m paulsha_cortex.trust_root unit three-way --manager
+
+# ✅ monitor system unit 內容（同帳號、同加固段，ReadWritePaths 嚴格窄於 Manager）
+python3 -m paulsha_cortex.trust_root unit three-way --monitor
 
 # ✅ job template unit 內容（User=cortex-builder 硬寫死；B 的核心）
 python3 -m paulsha_cortex.trust_root unit three-way --job
@@ -624,7 +627,7 @@ find "$HOME/.agents" -perm /022 -print | head
 
 ---
 
-## 第 4 步：Manager 遷 root-owned 部署 ＋ system-level unit
+## 第 4 步：Manager／monitor 遷 root-owned 部署 ＋ system-level unit
 
 ### 4a. venv 遷入 `/opt/cortex`
 
@@ -760,6 +763,105 @@ sudo systemctl restart cortex-manager.service && echo "restored: OK"
 **回滾**：`sudo systemctl disable --now cortex-manager.service;
 sudo rm /etc/systemd/system/cortex-manager.service; sudo systemctl daemon-reload`，
 再以 `systemctl --user start cortex-manager.service` 回到舊部署（見第 9 步）。
+
+### 4d. Monitor system-level unit（內容由 permgen 產生）
+
+> **不可省略**（issue #622）。舊的 `cortex-monitor.service` 是 `--user` unit、以
+> operator 身分跑、`PSC_MONITOR_STATE_ROOT` 指著舊的 `~/.agents/monitor`。第 4 步之後
+> 把它起回來只會**雙寫**——`monitor-state-tree`／`monitor-work-items-snapshot`／
+> `monitor-github-sync-cursor` 出現兩個來源，正是 Phase 2b 要收斂掉的狀態；而且它
+> 寫不進 `0700 cortex-manager` 的 `/var/lib/cortex/monitor`，只會靜默地繼續寫舊樹。
+> **跳過本步＝instance 沒有 monitor**：GitHub issue sync／work-items 快照停擺，
+> `monitor-event-spool` 只有 builder 的 `wx` 生產端、沒有消費端，spool 只增不減。
+
+monitor 與 Manager **同帳號**（UID 方案表：`cortex-manager`＝Manager ＋ monitor——
+唯有同帳號才寫得進自己的 `0700` state 樹），加固段與 EnvironmentFile 也是同一份；
+但 `ReadWritePaths` **嚴格更窄**：產生器只從 monitor persona 在 R1 登記表上的
+writer／spool-consumer 面導出。
+
+| `ReadWritePaths` | 涵蓋的登記表資產 |
+|---|---|
+| `/var/lib/cortex/monitor` | `monitor-state-tree`、`monitor-work-items-snapshot`、`monitor-github-sync-cursor`、`monitor-event-spool`（消費＝讀完 unlink，需要容器目錄的寫入權） |
+| `/var/lib/cortex/run/cortex` | `runtime-run-tree`（monitor 的 unix socket） |
+| `/var/lib/cortex-manager/cache` | 明示 extra：服務帳號 HOME 快取（git／gh／uv），與 Manager 是同一條、不是第二條 |
+
+`coordinator/`、`specs/`、`control/`、`worktree/`、`registry/`、`config/` 一律**不在**
+其中：monitor 在登記表上既不是它們的 writer、也不是它們的 spool consumer。要讓某條
+回來，唯一的辦法是改登記表再重跑產生器——unit 沒有手擴的入口。
+
+```bash
+# ✅ 先看內容（ReadWritePaths 逐條附「涵蓋哪些登記表資產」註解）
+python3 -m paulsha_cortex.trust_root unit three-way --monitor | less
+
+# ✅ 先驗「窄」這件事本身：monitor 的 RWP 必須是 Manager 的真子集
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --monitor | grep ^ReadWritePaths=) \
+     <(python3 -m paulsha_cortex.trust_root unit three-way --manager | grep ^ReadWritePaths=)
+#   期望：只有 `<` 那側缺行（monitor 少），**不得**出現 `>` 獨有的 monitor 條目
+
+# 🔧 sudo：寫入 unit（內容一字不改，直接由產生器落檔）
+python3 -m paulsha_cortex.trust_root unit three-way --monitor \
+  | sudo tee /etc/systemd/system/cortex-monitor.service >/dev/null
+sudo chown root:root /etc/systemd/system/cortex-monitor.service
+sudo chmod 0644 /etc/systemd/system/cortex-monitor.service
+
+# 🔧 sudo：確認舊的 --user monitor 已停用且不會被 lingering 拉回來
+systemctl --user disable --now cortex-monitor.service 2>/dev/null || true
+
+# 🔧 sudo：載入並啟用（system-level，非 --user）
+sudo systemctl daemon-reload
+sudo systemctl enable cortex-monitor.service
+sudo systemctl start cortex-monitor.service
+```
+
+```bash
+# ✅ 驗證：unit 檔內容與產生器輸出逐位元相同（防手改漂移）
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --monitor) \
+     /etc/systemd/system/cortex-monitor.service && echo "monitor unit in sync: OK"
+
+# ✅ 驗證：身分與加固段（應與 cortex-manager.service 逐項相同）
+systemctl show cortex-monitor.service \
+  -p User -p NoNewPrivileges -p ProtectSystem -p ProtectHome -p ProtectProc \
+  -p CapabilityBoundingSet -p MemoryDenyWriteExecute -p ReadWritePaths
+#   期望：**User=cortex-manager**、NoNewPrivileges=yes、ProtectSystem=strict、
+#         ProtectHome=yes、ProtectProc=invisible、CapabilityBoundingSet=（空）、
+#         MemoryDenyWriteExecute=yes；ReadWritePaths 僅上表三條
+
+# ✅ 驗證：monitor 行程確實以 cortex-manager 身分跑
+ps -o user=,pid=,cmd= -p "$(systemctl show cortex-monitor.service -p MainPID --value)"
+#   期望：user 欄為 cortex-manager，cmd 為 /opt/cortex/venv/bin/cortex monitor
+
+# ✅ 驗證：起得來、無 EPERM/EROFS（加固誤擋的第一現場）
+systemctl status cortex-monitor.service --no-pager
+sudo journalctl -u cortex-monitor.service -n 100 --no-pager \
+  | grep -Ei "eperm|erofs|eacces|read-only" || echo "no denial in log: OK"
+
+# ✅ 驗證：新樹確實有寫入（不是還在寫舊的 ~/.agents/monitor）
+sudo ls -la /var/lib/cortex/monitor
+sudo find /var/lib/cortex/monitor -maxdepth 1 -newermt '-5 minutes' -print
+#   期望：work-items.snapshot.json／github-issue-sync.json 於近幾分鐘內被更新
+ls -la "$HOME/.agents/monitor" 2>/dev/null && echo "⚠️ 舊樹仍在——確認其 mtime 未再前進"
+
+# ✅ 驗證：event-spool 真的被消費（#622 的契約面：有生產端也要有消費端）
+sudo ls /var/lib/cortex/monitor/event-spool | head
+#   期望：空的、或項目數會隨時間下降；持續單調增加代表消費端沒在跑
+
+# ✅ 驗證：monitor socket 落在 run root、由 cortex-manager 擁有
+sudo ls -la /var/lib/cortex/run/cortex/project-monitor.sock
+#   期望：owner cortex-manager、mode 0600
+
+# ✅ 驗證：fail-closed——刪掉 env 檔必須拒絕啟動（測完立刻還原）
+sudo mv /opt/cortex/etc/cortex-manager.env /opt/cortex/etc/cortex-manager.env.bak
+sudo systemctl restart cortex-monitor.service; echo "exit=$?"
+#   期望：restart 失敗（非 0），status 顯示 EnvironmentFile 缺檔
+sudo mv /opt/cortex/etc/cortex-manager.env.bak /opt/cortex/etc/cortex-manager.env
+sudo systemctl restart cortex-monitor.service && echo "restored: OK"
+```
+
+**回滾**：`sudo systemctl disable --now cortex-monitor.service;
+sudo rm /etc/systemd/system/cortex-monitor.service; sudo systemctl daemon-reload`，
+再以 `systemctl --user start cortex-monitor.service` 回到舊部署（見第 9 步）。
+**注意**：回滾後 monitor 會重新寫舊的 `~/.agents/monitor` 樹，與 system-level Manager
+的 `/var/lib/cortex/monitor` 形成雙寫——僅可作為短時間的救急手段。
 
 ---
 
@@ -1482,6 +1584,7 @@ Phase 1 完全不需 root 且含降級運轉安全網（`PSC_DEGRADED_OPERATION=
 | 第 4a（部署） | 新 venv 起不來 | `sudo rm -rf /opt/cortex/venv; sudo mv /opt/cortex/venv.prev /opt/cortex/venv; sudo systemctl restart cortex-manager` |
 | 第 4c（system unit） | WSL 重啟後未拉起／服務起不來 | `sudo systemctl disable --now cortex-manager.service`；改回 `systemctl --user start cortex-manager.service`（舊部署仍在 `$HOME/.local/share/pipx`） |
 | 第 4c（加固誤擋） | 服務起來但功能靜默失效 | 見下方「`ProtectSystem=strict` 誤擋診斷」；**臨時** drop-in 放行、**同一天**把該路徑回填 R1 登記表並重跑 permgen |
+| 第 4d（monitor unit） | monitor 起不來／新樹無寫入 | `sudo systemctl disable --now cortex-monitor.service`；改回 `systemctl --user start cortex-monitor.service`（**會與 system-level Manager 雙寫**，僅救急） |
 | **第 5-2（template unit）** | instance 起不來／unit 語法錯 | `sudo rm -f /etc/systemd/system/cortex-job@.service; sudo rm -rf /etc/systemd/system/cortex-job@.service.d; sudo systemctl daemon-reload`；(d) 一併關閉（見下一列） |
 | **第 5-3（shim）** | job 起得來但 argv 不對／shim crash | `sudo rm -f /opt/cortex/bin/cortex-job-shim`；重新由產生器落檔並 `diff` 對齊；仍不對則關 (d) |
 | **第 5-4（polkit）** | 規則語法錯／`cortex-manager` 起不了任何 job | `sudo rm -f /etc/polkit-1/rules.d/49-cortex-downgrade.rules; sudo systemctl restart polkit.service`；此時降權面完全關閉（fail-closed，job 起不來但無提權） |
