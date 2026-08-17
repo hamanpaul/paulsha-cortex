@@ -44,7 +44,7 @@
   而 #641 已把 Manager 對 job 工作樹的讀取授權全部收掉 ⇒ 降權模式下會在第一個
   `git -C` 就 `Permission denied`。修法是把 ship 段搬進 Manager-owned 的樹（此時
   per-job 目錄名才有意義），連帶處理 `_builder_binding()` 的來源與
-  `archive-applied-needs-commit` 重入路徑，已開後續票，且**必須**建立在本 PR 的回收
+  `archive-applied-needs-commit` 重入路徑，已開後續票 #653，且**必須**建立在本 PR 的回收
   通道之上。新增 `tests/test_ship_phase_harvest_649.py`（9 條，全部跑正式路徑：真 git
   repo、真 per-job clone、真 `ScriptWorktreeCreator`），含回收不變式、`rmtree` 後仍取
   得成果、fail-closed 且不先推進、ancestry 正反兩向、`openspec-archive` →

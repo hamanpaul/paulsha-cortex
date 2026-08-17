@@ -146,7 +146,7 @@ post-archive retry-build 的 clone base、下一張卡的 handoff base）就開�
   有意義），連帶要處理 `_builder_binding()` 的來源、`archive-applied-needs-commit`
   這條重入路徑、preflight／push／`_ship_action` 的 repo_root。那是獨立一票的體量，
   且**必須**建立在本 PR 的回收通道之上（沒有回收，換了樹之後 candidate 更是回不來）。
-  已開後續票追。
+  已開後續票 #653 追。
 
 本 PR 因此是「能獨立驗證的第一段」：它自己就修好三個現行缺陷（ancestry 死路、
 #651 的 post-archive retry-build 回歸、成果只存在於某棵工作區的磁碟上），

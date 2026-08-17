@@ -1935,7 +1935,7 @@ systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/wor
 #   #641 已把登記表裡 Manager 對 job 工作樹的讀取授權全部收掉（見第 2 步的稽核 5b）
 #   ⇒ 三分下第一個 `git -C` 就會 `Permission denied`。症狀是**權限**不是
 #   `226/NAMESPACE`，別往 mount namespace 的方向查。修法（ship 段搬進 Manager-owned
-#   的樹）在後續票。
+#   的樹）在 #653。
 
 # ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶；#643 起兩份都要驗）
 sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \
