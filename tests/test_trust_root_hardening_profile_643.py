@@ -486,12 +486,19 @@ class PolkitCoversBothProfilesTests(unittest.TestCase):
             self.assertEqual(self._decide(f"{stem}@psc-0643-deadbeef.service"), "YES", stem)
 
     def test_pattern_enumerates_the_stems_instead_of_widening(self) -> None:
-        """pattern 仍然錨定、instance 段字元類一字未改、沒有任何萬用字元。"""
+        """pattern 仍然錨定、instance 段字元類一字未改、沒有任何萬用字元。
+
+        #615（M2）之後字幹段是**兩層**列舉（principal × 剖面）；本測試守的性質不變：
+        字幹段必須恰好是那組列舉的交替，不得出現任何萬用字元。
+        """
         pattern = self.rule.unit_pattern
         self.assertTrue(pattern.startswith("^"))
         self.assertTrue(pattern.endswith(r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"))
-        stems = permgen.job_unit_stems(permgen.DEFAULT_LAYOUT, Principal.BUILDER)
-        self.assertEqual(stems, ("cortex-job", "cortex-job-jit"))
+        builder_stems = permgen.job_unit_stems(permgen.DEFAULT_LAYOUT, Principal.BUILDER)
+        self.assertEqual(builder_stems, ("cortex-job", "cortex-job-jit"))
+        stems = permgen.job_unit_stems(
+            permgen.DEFAULT_LAYOUT, permgen.DOWNGRADED_JOB_PRINCIPALS
+        )
         head = pattern[1 : -len(r"@[a-z0-9][a-z0-9._-]{0,62}\.service$")]
         self.assertEqual(head, "(?:" + "|".join(stems) + ")")
         for wildcard in (".*", "[^", "\\w", "+"):
@@ -546,13 +553,35 @@ class PolkitCoversBothProfilesTests(unittest.TestCase):
             "NOT_HANDLED",
         )
 
-    def test_reviewer_extension_point_still_isolated(self) -> None:
-        """M2 的第二 principal 與剖面正交：builder 的規則不放行 reviewer 的任一剖面。"""
+    def test_principal_and_profile_stay_orthogonal(self) -> None:
+        """principal 與剖面正交：**只**列 builder 的規則不放行 reviewer 的任一剖面。
+
+        #615 之前這條測的是「M2 的擴充點還沒接上」；M2 落地之後同一條性質改測
+        「產生器仍然逐 principal 收窄」——把 principals 限成 builder 就真的只放行
+        builder 的兩個字幹。這是「擴充放行面必須是顯式決定」的機械證明。
+        """
+        builder_only = permgen.build_polkit_rule(
+            permgen.DEFAULT_SCHEME,
+            plan=permgen.PolkitPlan.TEMPLATE,
+            principals=Principal.BUILDER,
+        )
         for profile in permgen.HARDENING_PROFILES:
             stem = permgen.job_unit_stem(
                 permgen.DEFAULT_LAYOUT, Principal.REVIEWER, profile
             )
-            self.assertEqual(self._decide(f"{stem}@a.service"), "NO", stem)
+            self.assertEqual(
+                permgen.evaluate_polkit(
+                    builder_only,
+                    user=builder_only.subject_account,
+                    action_id=permgen.POLKIT_ACTION,
+                    unit=f"{stem}@a.service",
+                    verb="start",
+                ),
+                "NO",
+                stem,
+            )
+            # 反之，實際落檔的那一份（預設＝全部降權角色）放行它。
+            self.assertEqual(self._decide(f"{stem}@a.service"), "YES", stem)
 
     def test_rule_documents_both_templates(self) -> None:
         for profile in permgen.HARDENING_PROFILES:

@@ -1200,16 +1200,58 @@ class SubprocessLauncher:
             return False
         return env.get("PSC_REPO_ROOT") is not None
 
+    def _is_review_persona(self) -> bool:
+        """本 launcher 派出去的是 reviewer／planner（而不是 builder）嗎。
+
+        **三個判準，缺一不可**——這是 #615 實作時發現的一個真缺口：
+
+        1. `review_only`＝workflow lane 的 reviewer（`as_review_only()`）；
+        2. `read_only`＝planner（`as_read_only()`）；
+        3. `verdict_spool_dir is not None`＝**slice lane 的 foreign reviewer**。
+
+        第 3 條容易漏掉，而漏掉的後果最嚴重。slice lane 的 foreign reviewer 走的是
+        `manager._spool_writable_launcher()` → `as_verdict_spool_writer()`，而那支
+        工廠產出的 launcher `read_only` 與 `review_only` **都是 False**（見它自己的
+        `__init__` 守衛：verdict spool 放行與 read-only 契約互斥，因為 read-only 的
+        executor 連 `--add-dir` 都拿不到）。若只看前兩條，這個 job 會被判成 builder
+        並以 `cortex-builder` 起跑——**而它正是寫 verdict 的那一個**。那等於把
+        verdict 通道交還給 builder 帳號，把 #638／#639 剛修好的東西整個抵銷掉。
+
+        換句話說：**「被授予了 verdict spool」本身就是 reviewer 的標記**，而那個授予
+        是 Manager 在 dispatch 當下做的決定（`as_verdict_spool_writer(spool_dir)`），
+        job 側完全碰不到。
+        """
+
+        return bool(self._review_only or self._read_only or self._verdict_spool_dir)
+
+    def _job_role(self) -> str:
+        """本 launcher 的降權 job 角色（#615 M2）——**唯一決定點**。
+
+        reviewer 與 planner 同屬 `review` 角色，因為三分方案把它們映到**同一個**
+        OS 帳號（`cortex-reviewer-planner`）；其餘為 `builder`。
+
+        **角色由 launcher 的建構契約導出，不由 job 導出**：三個判準
+        （見 :meth:`_is_review_persona`）在 `__init__` 就固定，此後 immutable。
+        prompt、worktree 內容、job spec 都在這之後才產生，而 spec 連提身分欄位都不准
+        （`job_runner.SPEC_FORBIDDEN_KEYS`）——job 影響不到自己會以哪個 UID 起跑。
+        """
+
+        if self._is_review_persona():
+            return job_runner.JOB_ROLE_REVIEW
+        return job_runner.JOB_ROLE_BUILDER
+
     def _downgraded_mode(self, env: Mapping[str, str]) -> str | None:
         """本次 launch 要走哪一種降權啟動器（皆非時回 None＝direct，行為不變）。
 
-        兩個條件同時成立才降權：
+        唯一條件：`PSC_JOB_RUNNER` ∈ {`systemd-run`, `systemd-template`}（部署期
+        設定；預設 `direct`＝現行行為不變）。
 
-        1. `PSC_JOB_RUNNER` ∈ {`systemd-run`, `systemd-template`}（部署期設定；
-           預設 `direct`＝現行行為不變）。
-        2. **這是 builder persona**——判定點與本檔既有的 persona 分支完全對齊
-           （`_should_run_gates`／`launch()` 的 env 分支用的是同一組條件）：
-           `review_only`＝reviewer、`read_only`＝planner，兩者皆非才是 builder。
+        **#615（M2）移除了第二個條件。** 在此之前這裡對 `review_only`／`read_only`
+        回 `None`，於是 reviewer／planner 仍在 Manager 行程內以 Manager 帳號執行
+        ——A+B 裁決的核心論述「injection 可達的進程皆無 spawn 授權」因此**只對
+        builder 成立**，而 reviewer 正是寫 verdict 的那一個。M2 之後三個會跑模型的
+        persona 全部離開 Manager 的 UID，persona 只決定**哪一個角色**
+        （:meth:`_job_role`），不再決定「降不降權」。
 
         `systemd-run`（A 案）與 `systemd-template`（B 案，0816 第三輪裁決）在
         launcher 這一層共用**完全相同**的 env 白名單與 `bash -c` 決定，差別只在
@@ -1222,11 +1264,6 @@ class SubprocessLauncher:
 
         mode = job_runner.resolve_runner_mode(env)
         if mode not in (job_runner.RUNNER_SYSTEMD_RUN, job_runner.RUNNER_SYSTEMD_TEMPLATE):
-            return None
-        if self._review_only or self._read_only:
-            # 三分 UID 方案下 reviewer／planner 有自己的帳號（`cortex-reviewer-planner`），
-            # 但它們的降權是**部署面**的事（Manager 自己的 unit 不會 spawn 它們到
-            # builder 帳號）；本啟動器只負責 builder job，維持 #603 的既有判定。
             return None
         return mode
 
@@ -1245,19 +1282,25 @@ class SubprocessLauncher:
 
         from .runtime_preflight import ExecutorEnvironment
 
-        if self._review_only:
-            env = _review_scope_env()
-        elif self._degraded_runner(os.environ):
-            # 降權模式下 job 實際看到的是 transient unit 的白名單 env，不是 daemon 的
+        # 降權判定**排在 review_only 之前**（#615 M2）：reviewer 也走降權之後，
+        # `_review_scope_env()` 那份「從 daemon environ 篩出來的最小集」對它已經
+        # 不再是實情——job 看到的是 unit 的白名單 env（HOME 是自己帳號的，不是
+        # daemon 的）。順序寫反的話 preflight 又會變回安慰劑，而且是**只有
+        # reviewer 會錯**的那一種安慰劑。
+        if self._degraded_runner(os.environ):
+            # 降權模式下 job 實際看到的是 unit 的白名單 env，不是 daemon 的
             # environ；preflight 若仍回報 daemon env，它報的 PATH／HOME 就與正式 job
             # 無關（見本方法 docstring 的「不然只是安慰劑」）。
-            env = job_runner.build_builder_env(
+            env = job_runner.build_job_env(
                 manager_env=os.environ,
                 job_id=slice_id,
                 slice_id=slice_id,
                 repo_root=str(Path(__file__).resolve().parents[2]),
                 relay_target=self._relay_target,
+                role=self._job_role(),
             )
+        elif self._review_only:
+            env = _review_scope_env()
         else:
             env = {
                 **_git_scope_env(),
@@ -1294,8 +1337,13 @@ class SubprocessLauncher:
         runner_plan: job_runner.SystemdRunPlan | None = None
         template_plan: job_runner.SystemdTemplatePlan | None = None
         runner_mode = self._downgraded_mode(os.environ)
+        # #615 M2：角色（＝哪個 job 帳號、哪一份 root-owned 模板）在這裡定案，與
+        # 加固剖面同一個位置、同一個時機——都在**任何** per-job 產物之前。
+        job_role = self._job_role()
         if runner_mode == job_runner.RUNNER_SYSTEMD_RUN:
-            runner_plan = job_runner.prepare_systemd_run(os.environ, job_id=slice_id)
+            runner_plan = job_runner.prepare_systemd_run(
+                os.environ, job_id=slice_id, role=job_role
+            )
         elif runner_mode == job_runner.RUNNER_SYSTEMD_TEMPLATE:
             # B 案（0816 第三輪裁決）：模板 unit／shim／spec spool 三個前置物任一
             # 缺席都在這裡 fail-closed，且**在寫任何 spec 之前**。
@@ -1307,7 +1355,7 @@ class SubprocessLauncher:
             # （`job_runner.SPEC_FORBIDDEN_KEYS`）。未登記的 executor 在這裡
             # fail-closed，不會落到放寬的那一份剖面。
             template_plan = job_runner.prepare_systemd_template(
-                os.environ, job_id=slice_id, executor=self._executor
+                os.environ, job_id=slice_id, executor=self._executor, role=job_role
             )
         degraded = runner_mode is not None
         resolved_worktree = Path(worktree).resolve(strict=True)
@@ -1357,21 +1405,27 @@ class SubprocessLauncher:
         # PSC_REPO_ROOT 讓已安裝 hook 的 `${PSC_REPO_ROOT}/scripts/coordinator/psc-relay-hook.sh`
         # 在 cwd=worktree（≠repo）時仍可解（worktree 雖是 repo checkout，但 hook 為全域安裝、
         # 不可依賴相對 cwd；互動 session 亦不應因相對路徑找不到 script 而報錯）。
-        if self._review_only:
-            env = _review_scope_env()
-        elif degraded:
-            # #588 第 1 點的結構性解法：transient unit **不繼承呼叫端的 environ**，
-            # 因此 builder 的環境就是這份白名單本身（不是「daemon environ 減去黑名單」）。
+        # 順序：**降權優先於 review_only**（#615 M2，與 `executor_environment()`
+        # 逐字一致）。`_review_scope_env()` 是「從 daemon environ 篩」的模型——它在
+        # 同 UID 下是唯一能做的事，但降權之後 job 根本不繼承 daemon 的 environ，
+        # 繼續用它只會把 daemon 的 HOME／PATH／VIRTUAL_ENV 硬塞進一個跑在別的 UID
+        # 上、根本進不去那些路徑的行程。
+        if degraded:
+            # #588 第 1 點的結構性解法：降權 unit **不繼承呼叫端的 environ**，
+            # 因此 job 的環境就是這份白名單本身（不是「daemon environ 減去黑名單」）。
             # gh token、daemon 的 CLAUDE_CONFIG_DIR 都不在白名單上，因此不會出現在
             # job 裡——包括 `_copilot_credential_env()` 也因此自然回傳空 dict（它讀的是
             # 這份 env，裡面沒有任何 token 候選），不必為降權模式另設特例。
-            env = job_runner.build_builder_env(
+            env = job_runner.build_job_env(
                 manager_env=os.environ,
                 job_id=slice_id,
                 slice_id=slice_id,
                 repo_root=str(Path(__file__).resolve().parents[2]),
                 relay_target=self._relay_target,
+                role=job_role,
             )
+        elif self._review_only:
+            env = _review_scope_env()
         else:
             env = {
                 **_git_scope_env(),
@@ -1405,8 +1459,14 @@ class SubprocessLauncher:
         # 解開。判準是 **persona**，不是 `PSC_JOB_RUNNER`：reviewer／planner 不產生
         # commit，給它們一格 spool 只會多一個沒人寫的空目錄；builder 兩種模式走完全
         # 相同的路徑（#634 的「以形狀判斷、不依旗標分支」原則）。
+        #
+        # #615：判準改用 `_is_review_persona()`——它多涵蓋 slice lane 的 foreign
+        # reviewer（`read_only`／`review_only` 皆為 False，但持有 verdict spool）。
+        # 修正前那個 job 會拿到一格 commit spool 並在 wrapper 裡跑 `git bundle
+        # create`；它從來不 commit，所以那一格永遠是空的（direct 模式下是浪費），
+        # 而降權之後 reviewer 帳號對 commit-spool **零寫入權**，那一段會逐 job 失敗。
         commit_bundle: str | None = None
-        if not (self._read_only or self._review_only):
+        if not self._is_review_persona():
             commit_bundle = str(job_workspace.prepare_commit_spool(spool_key=slice_id))
         # #638 缺陷 2：reviewer 寫出來的 verdict 由 **reviewer 的 uid** 建立
         # （降權 unit 常帶 `UMask=0077`），Manager 是那一格目錄的 owner 但那不給

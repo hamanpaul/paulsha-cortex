@@ -75,7 +75,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from . import registry
 from .registry import (
@@ -1267,6 +1267,17 @@ class PathLayout:
         return f"{self.coordinator_root}/commit-spool"
 
     @property
+    def review_verdict_spool_root(self) -> str:
+        """reviewer 寫、Manager 讀的 per-job verdict spool 根（登記表資產
+        `review-verdict-spool`，#599／#638）。
+
+        路徑與 `config.paths.review_verdict_spool_root()` 是**成對契約**，由
+        `asset_paths()` 而非本 property 供給權限計畫；本 property 只是給 unit
+        產生器引用的同一份字面量（比照 `commit_spool_root`／`job_spec_spool_root`）。
+        """
+        return f"{self.coordinator_root}/review-verdicts"
+
+    @property
     def job_spec_spool_root(self) -> str:
         """Manager 寫、job 只讀的 per-job 執行規格（`<unit-instance-id>.json`）。
 
@@ -1446,7 +1457,7 @@ class PathLayout:
             "jobs-registry": f"{c}/jobs.json",
             "review-verdict": f"{job}/.psc-review-verdict.json",
             # Phase 2a 受控通道（PR #599）：<coordinator>/review-verdicts/<reviewer_job_id>/
-            "review-verdict-spool": f"{c}/review-verdicts",
+            "review-verdict-spool": self.review_verdict_spool_root,
             # #623／#634 成果回收的 bundle spool：<coordinator>/commit-spool/<job-id>/
             "commit-spool": self.commit_spool_root,
             # Phase 2b 方案 B（0816 第三輪 A+B）：模板 unit 的 per-job 執行規格。
@@ -1633,11 +1644,35 @@ IN_PLACE_CONTENT_WRITE_ASSETS: frozenset[str] = frozenset({
 })
 
 
+#: 登記表上仍列該 persona 為 writer、但降權 job unit **刻意不放行**的資產（#615 M2）。
+#:
+#: 唯一一項是 `review-verdict`——reviewer worktree 內的
+#: `.psc-review-verdict.json`。它正是 spec 背景 §3 認定的**最短攻擊路徑**（同 UID 下
+#: builder 可代寫 reviewer 的 verdict），Phase 2a 已把權威通道整個換成
+#: `review-verdict-spool`：`manager._review_verdict_source()` 對任何帶
+#: `review_verdict_channel == "spool"` 標記的 job **只**認 spool 落點，而 Phase 2b
+#: 部署派出的每一個 reviewer job 都帶那個標記。因此在模板 unit 上放行這條路徑，
+#: 買到的是**零**（沒有消費者），付出的卻有兩項：
+#:
+#: 1. **語意**：等於在 OS 邊界上把一條已除役的 verdict 寫入面重新打開；
+#: 2. **可用性**：那條路徑是 `<worktree pool>/%i`，而 reviewer 的工作樹**不在** pool
+#:    底下（它是 Manager provision 的 review worktree）。systemd 對不存在的
+#:    `ReadWritePaths=` 目標會讓 unit 直接起不來——放行反而讓每個 reviewer job 起不來。
+#:
+#: 這條是**除役宣告**，不是例外通道：登記表仍完整記錄 `review-verdict` 的存在與它的
+#: writer（過渡期 legacy fallback 還要讀它），只是「Phase 2b 的 job unit 不再為它開
+#: 寫入面」。加一項到這裡必須同時附上「誰是它今天的消費者」的答案。
+RETIRED_JOB_WRITE_ASSETS: frozenset[str] = frozenset({
+    "review-verdict",
+})
+
+
 def required_write_targets(
     plan: PermissionPlan,
     layout: PathLayout,
     account: str,
     principals: frozenset[Principal] | None = None,
+    retired: frozenset[str] | None = None,
 ) -> dict[str, str]:
     """`asset_id → 該帳號必須可寫的目標路徑`（檔案取其父目錄）。
 
@@ -1650,12 +1685,18 @@ def required_write_targets(
     帳號上跑多個 persona 時（三分的 `cortex-manager`＝Manager＋monitor），每個
     unit 只拿自己那一份，而不是帳號的全集。`None`＝不過濾（帳號全集，Manager
     unit 與 job 模板 unit 的既有行為）。
+
+    `retired`（#615）給定時再扣掉一組**已除役**的 asset_id（見
+    :data:`RETIRED_JOB_WRITE_ASSETS`）。`None`＝不扣（Manager／monitor unit 的既有
+    行為）——除役宣告只適用於降權 job 的模板 unit。
     """
     targets: dict[str, str] = {}
     paths = layout.asset_paths()
     index = {a.asset_id: a for a in (plan.assets or registry.ASSET_REGISTRY)}
     for entry in plan.entries:
         if account not in plan.all_writable_accounts(entry):
+            continue
+        if retired is not None and entry.asset_id in retired:
             continue
         if principals is not None:
             asset = index.get(entry.asset_id)
@@ -1675,9 +1716,10 @@ def read_write_paths(
     account: str,
     extras: tuple[ExtraWritePath, ...] = (),
     principals: frozenset[Principal] | None = None,
+    retired: frozenset[str] | None = None,
 ) -> tuple[str, ...]:
-    """該帳號 unit 的 `ReadWritePaths=` 最小覆蓋集合（登記表導出 ∪ 明示 extras）。"""
-    wanted = set(required_write_targets(plan, layout, account, principals).values())
+    """該帳號 unit 的 `ReadWritePaths=` 最小覆蓋集合（登記表導出 − 除役 ∪ 明示 extras）。"""
+    wanted = set(required_write_targets(plan, layout, account, principals, retired).values())
     wanted |= {e.path for e in extras}
     return _minimize(wanted)
 
@@ -1688,11 +1730,12 @@ def read_write_path_owners(
     account: str,
     extras: tuple[ExtraWritePath, ...] = (),
     principals: frozenset[Principal] | None = None,
+    retired: frozenset[str] | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """每條 ReadWritePaths → 它涵蓋的 asset_id（或 `extra:<reason>`），供逐條註解。"""
-    targets = required_write_targets(plan, layout, account, principals)
+    targets = required_write_targets(plan, layout, account, principals, retired)
     result: dict[str, tuple[str, ...]] = {}
-    for rwp in read_write_paths(plan, layout, account, extras, principals):
+    for rwp in read_write_paths(plan, layout, account, extras, principals, retired):
         covered = sorted(aid for aid, t in targets.items() if _is_within(t, rwp))
         covered += [f"extra:{e.reason}" for e in extras if _is_within(e.path, rwp)]
         result[rwp] = tuple(covered)
@@ -2188,6 +2231,59 @@ def executor_hardening_profile(executor: str) -> HardeningProfile:
     return HARDENING_PROFILES_BY_ID[profile_id]
 
 
+#: **實際具備啟動面降權的 job principal**（＝各有一組 root-owned 模板 unit 的角色）。
+#:
+#: - `BUILDER`（M1，#603／#584）：`cortex-job@.service`／`cortex-job-jit@.service`。
+#: - `REVIEWER`（M2，#615）：`cortex-reviewer-job@.service`／
+#:   `cortex-reviewer-job-jit@.service`，`User=cortex-reviewer-planner`。
+#:
+#: **`PLANNER` 刻意不在表內，而且不是遺漏**：三分方案把 reviewer 與 planner 映到
+#: **同一個帳號**（`cortex-reviewer-planner`），而模板 unit 的唯一內容差異就是
+#: `User=`／HOME／`ReadWritePaths=`——那三者都由帳號決定。為 planner 再產一份逐字
+#: 相同、只是名字不同的 unit，等於多一個要同步維護的放行面（polkit pattern 也會多
+#: 一個字幹），卻換不到任何隔離。`REVIEWER` 在這裡是**那個帳號的代表 principal**，
+#: 由 :data:`JOB_PRINCIPAL_PERSONAS` 明載它代表誰。
+#:
+#: 這張表同時是 polkit unit pattern 的字幹來源（見 :func:`job_unit_pattern`）：
+#: 放行面 = 這張表 × :data:`HARDENING_PROFILES`，兩者都是列舉，沒有萬用字元。
+DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (Principal.BUILDER, Principal.REVIEWER)
+
+#: 每個 job 角色的 `PATH` 覆寫變數名。與 `coordinator/job_runner.JOB_ROLE_CONFIG`
+#: 的 `path_env` 是**成對契約**（同 `DEFAULT_TEMPLATE_UNIT` 的既有模式：permgen 與
+#: job_runner 刻意不互相 import，改由契約測試釘住兩邊逐字相等）。產生的 unit 內註解
+#: 要指出「真正的 PATH 來自哪個 Manager 端變數」，那個名字必須跟著角色走——寫死
+#: `PSC_BUILDER_PATH` 會讓 reviewer 的 unit 指到一個對它無效的變數。
+JOB_PATH_ENV_BY_PRINCIPAL: Mapping[Principal, str] = MappingProxyType(
+    {
+        Principal.BUILDER: "PSC_BUILDER_PATH",
+        Principal.REVIEWER: "PSC_REVIEWER_PATH",
+    }
+)
+
+#: 每份模板 unit 服務的 persona 家族（代表 principal → 實際會以該 unit 起跑的 persona）。
+#: 記錄在這裡而不是散在註解裡：`cortex-reviewer-job@.service` 同時是 planner 的 unit，
+#: 這件事必須是機器可讀的，否則「planner 的降權在哪」只能靠讀 commit 訊息回答。
+JOB_PRINCIPAL_PERSONAS: Mapping[Principal, frozenset[Principal]] = MappingProxyType(
+    {
+        Principal.BUILDER: frozenset({Principal.BUILDER, Principal.HEADLESS_HOOK}),
+        Principal.REVIEWER: frozenset({Principal.REVIEWER, Principal.PLANNER}),
+    }
+)
+
+
+def _as_principals(
+    principals: "Principal | Sequence[Principal]",
+) -> tuple[Principal, ...]:
+    """把「單一 principal」與「一組 principal」正規化成 tuple（順序即輸出順序）。"""
+
+    if isinstance(principals, Principal):
+        return (principals,)
+    ordered = tuple(principals)
+    if not ordered:
+        raise ValueError("至少要給一個 principal——空集合會產出一條放行面為空的 pattern")
+    return ordered
+
+
 def job_unit_stem(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     principal: Principal = Principal.BUILDER,
@@ -2195,12 +2291,13 @@ def job_unit_stem(
 ) -> str:
     """降權 job 模板 unit 的字幹（不含 `@.service`）。
 
-    **M2（#615，reviewer/planner 啟動面降權）的擴充點就是這裡。** 現階段只有
-    builder 走模板，字幹是 `cortex-job`（與 `coordinator/job_runner`
-    的 `TEMPLATE_UNIT_PREFIX` ＋ polkit pattern 成對契約）。要開第二個模板實例時
-    只需傳入另一個 `principal`：unit 名、`User=`、`Environment=HOME=`／
-    `XDG_CACHE_HOME=`、`ReadWritePaths=` 全部跟著 scheme 導出，`build_job_unit()`／
-    `build_polkit_rule()`／`build_job_shim()` 三支產生器**一行都不必改**。
+    **M2（#615，reviewer/planner 啟動面降權）已由此擴充點落地**：傳入
+    `Principal.REVIEWER` 即得 `cortex-reviewer-job`，unit 名、`User=`、
+    `Environment=HOME=`／`XDG_CACHE_HOME=`、`ReadWritePaths=` 全部跟著 scheme 導出，
+    `build_job_unit()`／`build_polkit_rule()`／`build_job_shim()` 三支產生器**一行
+    都沒有改**（M2 只改了「預設涵蓋哪些 principal」與 RWP 的除役集合）。
+    builder 的字幹維持 `cortex-job`（與 `coordinator/job_runner` 的
+    `TEMPLATE_UNIT_PREFIX` ＋ polkit pattern 成對契約），逐字不變。
 
     `profile` 是 **#643 的第二個擴充點**：加固剖面不同 ⇒ 必須是不同的 unit 檔
     （加固指令寫在檔案裡，一個模板只有一份），因此字幹尾端掛剖面後綴。嚴格剖面的
@@ -2546,6 +2643,13 @@ def build_job_unit(
     同一張 `_HARDENING` 表，只在 `PROFILE_DIVERGENCE_KEYS` 那一項分岔。哪個 job 用
     哪一份由 **executor** 決定（:func:`executor_hardening_profile`），而 executor 是
     Manager 的 dispatch 決定；job 自己（spec 也好、worktree 內容也好）碰不到這個選擇。
+
+    **`principal`（#615 M2）**：`BUILDER` ＋ `REVIEWER` 兩個角色各兩份剖面＝**四份**
+    unit（見 :data:`DOWNGRADED_JOB_PRINCIPALS`）。四份共用**同一張** `_HARDENING` 表
+    與**同一條** `ReadWritePaths` 導出規則——角色之間的全部差異都是「帳號」帶出來的
+    （`User=`／`Group=`／HOME／cache／登記表上該帳號的可寫面），本函式沒有任何一行
+    `if principal is …`。planner 不另產一份：它與 reviewer 同帳號，見
+    :data:`JOB_PRINCIPAL_PERSONAS`。
     """
     plan = plan or generate_plan(scheme)
     account = scheme.resolve(principal)
@@ -2555,7 +2659,9 @@ def build_job_unit(
     # per-job 路徑在模板 unit 中以 systemd 的 %i 表示。
     job_layout = layout.with_job_segment("%i")
     extras = job_layout.job_extra_write_paths(account)
-    owners = read_write_path_owners(plan, job_layout, account, extras)
+    owners = read_write_path_owners(
+        plan, job_layout, account, extras, retired=RETIRED_JOB_WRITE_ASSETS
+    )
     stem = job_unit_stem(layout, principal, profile)
     unit_name = f"{stem}@.service"
     profile_users = sorted(
@@ -2624,6 +2730,11 @@ def build_job_unit(
         "# 寫進這一格，Manager 再從那個 bundle **檔案** fetch——Manager 全程不碰 job 的樹。",
         "# 權限是 `wx` 無 `r`：寫得進自己那格、讀不到別人的 bundle。producer 只有 builder，",
         "# 因此這條只會出現在 builder 的模板 unit（RWP 由登記表機械導出，不是寫死的）。",
+        "# --- verdict 通道（登記表 review-verdict-spool，#599／#638）---",
+        f"#   {job_layout.review_verdict_spool_root}/<reviewer job id>/：reviewer 把 verdict",
+        "# 寫進自己那一格，Manager 收割後把**目錄**封口。同樣是 `wx` 無 `r`，因此它只會",
+        "# 出現在 reviewer／planner 的模板 unit——builder 完全不在該資產的 writer 面，",
+        "# 「builder 代寫 reviewer 的 verdict」這條 spec §3 最短攻擊路徑在 OS 層被關掉。",
         "# --- executor toolchain（登記表 executor-toolchain，#640）---",
         f"#   {job_layout.toolchain_root}：四個模型 CLI 的落點，root-owned 0755——",
         "# 本 job 帳號**唯讀＋可執行**。ProtectSystem=strict 讓 /opt 唯讀，但唯讀只擋",
@@ -2634,7 +2745,7 @@ def build_job_unit(
         "# 命令用的 PATH 來自 **spec 的 env**，不是本 unit 的 Environment=。在這裡寫一行",
         "# Environment=PATH= 只會產生一個看起來承載作用、實際被 shim 丟掉的設定。",
         "# 真正的來源是 Manager 端 root-owned EnvironmentFile 裡的（job 改不了）：",
-        f"#   PSC_BUILDER_PATH={job_layout.job_path_value()}",
+        f"#   {JOB_PATH_ENV_BY_PRINCIPAL[principal]}={job_layout.job_path_value()}",
         "# toolchain 排最前面是必要的：系統層可能另有一份同名但舊很多的 CLI（實機盤點",
         "# 到兩份 codex 差 100 個以上小版本），排後面會被它蓋掉，而症狀是「跑得起來但",
         "# 版本不是你以為的那個」。",
@@ -3089,12 +3200,25 @@ class PolkitRule:
     install_path: str
     plan: PolkitPlan
     subject_account: str
-    target_account: str
+    #: 本規則放行的模板會降到的**全部**目標帳號（#615 起可能不只一個）。
+    target_accounts: tuple[str, ...]
     unit_pattern: str
     allowed_verbs: tuple[str, ...]
     content: str
     #: 本方案在 OS 層**未**強制的部分（空 tuple＝無殘餘）。
     residual_risks: tuple[str, ...] = ()
+
+    @property
+    def target_account(self) -> str:
+        """第一個目標帳號。
+
+        #615 之前一條規則只服務一個 principal，這個欄位是純量；現在一條規則同時
+        涵蓋 builder 與 reviewer/planner 兩份模板，純量已經表達不了全貌。保留它是
+        為了既有呼叫端（runbook 的摘要輸出）不必同步改，**但任何「這條規則授權了
+        誰」的判斷都應該讀 `target_accounts`**。
+        """
+
+        return self.target_accounts[0]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -3102,6 +3226,7 @@ class PolkitRule:
             "plan": self.plan.value,
             "subject_account": self.subject_account,
             "target_account": self.target_account,
+            "target_accounts": list(self.target_accounts),
             "unit_pattern": self.unit_pattern,
             "allowed_verbs": list(self.allowed_verbs),
             "residual_risks": list(self.residual_risks),
@@ -3117,26 +3242,46 @@ def transient_unit_prefix(layout: "PathLayout") -> str:
 
 def job_unit_stems(
     layout: "PathLayout" = None,  # type: ignore[assignment]
-    principal: Principal = Principal.BUILDER,
+    principals: "Principal | Sequence[Principal]" = Principal.BUILDER,
 ) -> tuple[str, ...]:
-    """該 principal 的**全部**模板字幹（每個加固剖面一個），依剖面表順序。"""
+    """這些 principal 的**全部**模板字幹（principal × 加固剖面），依表順序。
+
+    `principals` 收單一 principal 或一組：前者是既有呼叫端（builder 一族），後者是
+    #615 之後真正落檔的集合（:data:`DOWNGRADED_JOB_PRINCIPALS`）。**兩層都是列舉**
+    ——字幹數 = principal 數 × 剖面數，沒有任何一層是萬用字元。
+    """
 
     layout = layout if layout is not None else DEFAULT_LAYOUT
-    return tuple(job_unit_stem(layout, principal, p) for p in HARDENING_PROFILES)
+    return tuple(
+        job_unit_stem(layout, principal, profile)
+        for principal in _as_principals(principals)
+        for profile in HARDENING_PROFILES
+    )
 
 
 def job_unit_pattern(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     plan: PolkitPlan = PolkitPlan.TEMPLATE,
-    principal: Principal = Principal.BUILDER,
+    principals: "Principal | Sequence[Principal]" = DOWNGRADED_JOB_PRINCIPALS,
 ) -> str:
-    """被授權的 unit 名 regex（錨定）。`principal` 是 M2 的第二實例化擴充點。
+    """被授權的 unit 名 regex（錨定）。
 
-    **#643 起字幹是一個列舉的交替，不是萬用字元**：每個加固剖面各有一份 root-owned
-    模板檔，因此各有一個字幹（`cortex-job` / `cortex-job-jit`）。交替項由
-    :data:`HARDENING_PROFILES` 機械導出——新增剖面時 pattern 自動涵蓋它，而**放行面
-    仍然是「兩個具名的模板」，不是「任意 unit」**：前後都錨定，instance 段的字元類
-    未變，`^` 與 `@` 之間不允許任何未列舉的字幹。
+    **字幹段是一個列舉的交替，不是萬用字元**，而且是**兩層**列舉：
+
+    - `principal`（#615 M2）：`cortex-job`（builder）與 `cortex-reviewer-job`
+      （reviewer＋planner），由 :data:`DOWNGRADED_JOB_PRINCIPALS` 導出；
+    - 加固剖面（#643）：每份剖面各有一份 root-owned 模板檔，因此各有一個字幹後綴
+      （空字串 / `-jit`），由 :data:`HARDENING_PROFILES` 導出。
+
+    兩層都是**具名模板的列舉**：前後都錨定，instance 段的字元類逐字未變，`^` 與 `@`
+    之間不允許任何未列舉的字幹。放行面因此從「兩個具名模板」變成「四個具名模板」，
+    **不是**「任意 unit」——四份 unit 檔全部 root-owned、`User=`／`ExecStart=` 都寫死，
+    呼叫端能選的只是「哪一份具名模板」。
+
+    **為什麼仍然只有一條 `polkit.addRule`**（#643 立下、#615 沿用）：第二條規則會把
+    subject／action／verb／明細缺席四個檢查複製一份，變成兩個要同步維護的放行出口，
+    而「全檔只有一個 `return polkit.Result.YES`」正是這份規則檔的可審查性性質。擴充
+    字幹段保留了單一出口。
 
     刻意**不**用 `re.escape()`：產出的字串會原樣嵌進 polkit 的 JS regex 字面量，而
     `re.escape` 會把 `-` escape 成 `\\-`（JS 的 unicode 模式視為錯誤）。字幹形狀改由
@@ -3145,7 +3290,7 @@ def job_unit_pattern(
     layout = layout if layout is not None else DEFAULT_LAYOUT
     if plan is PolkitPlan.TRANSIENT:
         return r"^" + layout.instance + r"-job-[a-z0-9][a-z0-9._-]{0,62}\.service$"
-    stems = job_unit_stems(layout, principal)
+    stems = job_unit_stems(layout, principals)
     alternation = stems[0] if len(stems) == 1 else "(?:" + "|".join(stems) + ")"
     return r"^" + alternation + r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"
 
@@ -3182,19 +3327,30 @@ def build_polkit_rule(
     scheme: UidScheme,
     layout: "PathLayout" = None,  # type: ignore[assignment]
     plan: PolkitPlan = PolkitPlan.TEMPLATE,
-    principal: Principal = Principal.BUILDER,
+    principals: "Principal | Sequence[Principal]" = DOWNGRADED_JOB_PRINCIPALS,
 ) -> PolkitRule:
     """產生降權授權的 polkit 規則內容（A／B 兩方案共用同一套產生邏輯）。
 
     兩案的授權面都收窄到「`<svc>` 對特定 unit 名 pattern 的 start/stop」，且
     **unit／verb 明細缺席即拒**；差別在「降到哪個帳號」由誰強制（見 `PolkitPlan`）。
+
+    `principals`（#615 M2）預設就是**實際落檔的那一組**
+    （:data:`DOWNGRADED_JOB_PRINCIPALS`）——預設值等於部署現實是刻意的：預設若停在
+    builder，`build_polkit_rule(scheme)` 產出的內容會與機器上那一份不同，而那正是
+    「產生器與部署漂移」的起點。要只看單一 principal 的放行面（測試／對照用）必須
+    顯式打出來。
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
     svc = scheme.durable_state_owner
-    target = scheme.resolve(principal)
-    if target is None:
-        raise ValueError(f"principal 未映射到帳號: {principal}")
-    pattern = job_unit_pattern(layout, plan, principal)
+    ordered = _as_principals(principals)
+    targets: list[str] = []
+    for principal in ordered:
+        target = scheme.resolve(principal)
+        if target is None:
+            raise ValueError(f"principal 未映射到帳號: {principal}")
+        if target not in targets:
+            targets.append(target)
+    pattern = job_unit_pattern(layout, plan, ordered)
     verbs = POLKIT_ALLOWED_VERBS
     verb_check = " && ".join(f'verb !== "{v}"' for v in verbs)
     residual = plan_residual_risk(plan, scheme)
@@ -3213,17 +3369,20 @@ def build_polkit_rule(
             f"//   python3 -m paulsha_cortex.trust_root polkit {scheme.scheme_id} --template\n"
         )
     else:
-        stems = job_unit_stems(layout, principal)
+        stems = job_unit_stems(layout, ordered)
         profile_lines = "".join(
             f"//     - {job_unit_stem(layout, principal, p)}@<id>.service"
-            f"（剖面 {p.profile_id}：{'完整加固表' if not p.overrides else '、'.join(f'{k}={v}' for k, v in sorted(p.overrides.items())) + '，其餘逐項同 strict'}）\n"
+            f"（User={scheme.resolve(principal)}，剖面 {p.profile_id}："
+            f"{'完整加固表' if not p.overrides else '、'.join(f'{k}={v}' for k, v in sorted(p.overrides.items())) + '，其餘逐項同 strict'}）\n"
+            for principal in ordered
             for p in HARDENING_PROFILES
         )
         headline = (
             f"// 方案 B（root-owned 模板 unit）：{svc} 只能 start/stop 下列**具名模板**的實例：\n"
             + profile_lines
-            + f"// 兩份模板檔都在 /etc/systemd/system/ 由 root 擁有，\n"
-            f"// 內容硬寫死 User={target}、NoNewPrivileges=yes、CapabilityBoundingSet=（空），\n"
+            + f"// {len(stems)} 份模板檔都在 /etc/systemd/system/ 由 root 擁有，\n"
+            f"// 內容硬寫死 User={'／'.join(targets)}、NoNewPrivileges=yes、"
+            f"CapabilityBoundingSet=（空），\n"
             f"// 以及固定的 ExecStart={layout.job_shim} %i（root-owned shim）。\n"
             f"// per-job 參數走 Manager-owned spec spool（{layout.job_spec_spool_root}/<id>.json，\n"
             f"// job 帳號唯讀）——{svc} 給得出參數，但給不出 UID、也給不出命令列。\n"
@@ -3232,15 +3391,20 @@ def build_polkit_rule(
             + "\n"
             f"// 這些屬性全部只存在於 root-owned 的模板檔裡，呼叫端連提都提不了。\n"
             f"//\n"
-            f"// ===== 為什麼有兩個字幹（#643 per-executor 加固剖面）=====\n"
-            f"// 加固指令寫在 unit 檔裡，一個模板只有一份 ⇒ 兩種剖面必然是兩個檔、兩個名字。\n"
+            f"// ===== 為什麼字幹段是一個交替（兩層列舉）=====\n"
+            f"// (a) **加固剖面**（#643）：加固指令寫在 unit 檔裡，一個模板只有一份 ⇒\n"
+            f"//     兩種剖面必然是兩個檔、兩個名字。\n"
+            f"// (b) **job 角色**（#615 M2）：builder 與 reviewer／planner 是**不同的 UID**，\n"
+            f"//     而 User= 同樣寫死在 unit 檔裡 ⇒ 同樣必然是不同的檔、不同的名字。\n"
             f"// 上面的 pattern 因此是**列舉的交替**（{'、'.join(stems)}），\n"
             f"// 不是萬用字元：`^` 與 `@` 之間不允許任何未列舉的字幹，instance 段的字元類\n"
-            f"// 一字未改。{svc} 選得了「哪一份模板」，但兩份都是 root-owned、User= 都寫死，\n"
-            f"// 兩份都不含任何可由呼叫端注入的東西——能選的只是「多一項或少一項加固」，\n"
-            f"// 而那一項（MemoryDenyWriteExecute）擋的是**本 job 自己位址空間內**的 W+X，\n"
-            f"// 不是跨 UID 的邊界。真正決定用哪一份的是 executor（Manager 的 dispatch\n"
-            f"// 決定），job 側完全碰不到。\n"
+            f"// 一字未改。{svc} 選得了「哪一份模板」，但每一份都是 root-owned、User= 都寫死，\n"
+            f"// 也都不含任何可由呼叫端注入的東西——能選的只是「哪個 job 帳號、多一項或少\n"
+            f"// 一項加固」。放寬的那一項（MemoryDenyWriteExecute）擋的是**本 job 自己位址\n"
+            f"// 空間內**的 W+X，不是跨 UID 的邊界；而帳號的選擇本身不構成提權——四份模板\n"
+            f"// 的 User= 全部是無 sudo、無 root、彼此互不可寫的降權服務帳號，沒有任何一份\n"
+            f"// 比 {svc} 自己更有權限。真正決定用哪一份的是 persona ＋ executor（都是\n"
+            f"// Manager 的 dispatch 決定），job 側完全碰不到。\n"
             f"//\n"
             f"// ===== 為什麼 transient unit 在本方案下一律拒 =====\n"
             f"// StartTransientUnit 的 polkit 檢查**不帶 unit 屬性明細**（規則只看得到\n"
@@ -3291,7 +3455,7 @@ polkit.addRule(function(action, subject) {{
         install_path=f"/etc/polkit-1/rules.d/49-{layout.instance}-downgrade.rules",
         plan=plan,
         subject_account=svc,
-        target_account=target,
+        target_accounts=tuple(targets),
         unit_pattern=pattern,
         allowed_verbs=verbs,
         content=content,
@@ -3321,7 +3485,11 @@ def transient_unit_properties(
     effective = profile.effective()
     props = [f"--property={key}={effective[key]}" for key, _value, _why in _HARDENING]
     for rwp in read_write_paths(
-        plan, job_layout, account, job_layout.job_extra_write_paths(account)
+        plan,
+        job_layout,
+        account,
+        job_layout.job_extra_write_paths(account),
+        retired=RETIRED_JOB_WRITE_ASSETS,
     ):
         props.append(f"--property=ReadWritePaths={rwp}")
     return tuple(props)
