@@ -10,9 +10,13 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root permissions [three-way|two-way] [--commands] [--paths]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [three-way|two-way]
-                                        [--manager|--job|--job-properties]
+                                        [--manager|--monitor|--job|--job-properties]
                                                     # Phase 2b systemd unit 內容
-                                                    # （--job-properties＝方案 A 的
+                                                    # （--monitor＝monitor 的 system-level
+                                                    #   unit：與 manager 同帳號、同加固段，
+                                                    #   但 ReadWritePaths 只由 monitor
+                                                    #   persona 的登記表面導出，嚴格更窄；
+                                                    #   --job-properties＝方案 A 的
                                                     #   systemd-run --property= 清單）
     python -m paulsha_cortex.trust_root shim [three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
@@ -124,6 +128,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         for token in rest:
             if token == "--manager":
                 which = "manager"
+            elif token == "--monitor":
+                which = "monitor"
             elif token == "--job":
                 which = "job"
             elif token == "--job-properties":
@@ -142,12 +148,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             for prop in permgen.transient_unit_properties(scheme):
                 print(prop)
             return 0
-        unit = (
-            permgen.build_manager_unit(scheme)
-            if which == "manager"
-            else permgen.build_job_unit(scheme)
-        )
-        print(unit.content, end="")
+        builders = {
+            "manager": permgen.build_manager_unit,
+            "monitor": permgen.build_monitor_unit,
+            "job": permgen.build_job_unit,
+        }
+        print(builders[which](scheme).content, end="")
         return 0
     if command == "shim":
         rest = args[1:]
