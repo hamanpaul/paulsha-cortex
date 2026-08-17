@@ -245,12 +245,103 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         IngressKind.MANAGER_INTERNAL,
         note="lock 檔實測 0o644；owner 可 unlink 後重建。",
     ),
+    # ---- per-job clone 的來源樹（#623）--------------------------------------
+    TrustRootAsset(
+        "repo-source-tree", _T0, _MO, None,
+        (Principal.MANAGER,),
+        (
+            Principal.MANAGER, Principal.MONITOR,
+            Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER,
+        ),
+        IngressKind.MANAGER_INTERNAL,
+        derived_in=("trust_root/permgen.py:PathLayout.repo_source_root",),
+        note=(
+            "`<agents_root>/repos/<slug>`——**Manager-owned 樹內的 working checkout**，"
+            "同時是 monitor 的掃描目標（`workstreams/*/todo.md` 等要有工作樹，bare 沒有）"
+            "與每個 job 的 **clone 來源**。#623 實測：共用 git object store 與三分隔離"
+            "**互斥**（builder 要 commit 就得能寫 object store，能寫就等於邊界在 git 這層"
+            "漏掉），因此 job 工作區由 `git worktree` 改為 **per-job 完整 clone**"
+            "（0.5 秒／35MB）。\n"
+            "**writer＝Manager（0817 裁決，推翻本票初版的 root-owned）**。初版把 writer "
+            "定成只有部署身分，機械分到 `owner_class=DEPLOYMENT`（root 0755）；實測那條"
+            "**走不通**：\n"
+            "    $ sudo -u cortex-manager git -C <來源樹> fetch <bundle> …\n"
+            "    error: cannot open '.git/FETCH_HEAD': Permission denied\n"
+            "`git fetch` 必須把 `FETCH_HEAD` 寫進**目標 repo**，而 #634 的成果回收正是"
+            "「fetch 進來源樹」；provisioning 那半邊也一樣要寫（`seams.py` 的 "
+            "`git branch -f <branch> <base>` 是對來源樹的寫入）。「Manager 唯讀」與"
+            "「Manager 回收成果」互斥，取後者。\n"
+            "**為何隔離沒有變弱**：威脅模型裡不受信任的是 **job 帳號**，而 Manager 本來"
+            "就擁有 gate ledger、evidence 樹與 jobs.json——Manager 被攻陷的話那些全都完了，"
+            "多這一棵樹不改變攻擊面。root-owned 買到的是「Manager 被攻陷後仍污染不了下一輪"
+            "job 的原始碼」這條供應鏈保護，但它讓成果回收整個不成立，因此取回收。改成 "
+            "Manager 可寫後實測整條通（`fetch` 真實 rc=0），而兩個 job 帳號對來源樹**仍"
+            "只有唯讀 ACL**（`rX`，一個 `w` 都沒有）——這條才是本資產真正在守的邊界。\n"
+            "**無 path_resolver**：程式碼解析的是**單一** repo（`PSC_REPO_ROOT` → "
+            "`<此樹>/<slug>`，見 `config/paths.py:repo_root`），本資產是**容器**，"
+            "沒有任何函式回傳它。"
+        ),
+    ),
+    TrustRootAsset(
+        "builder-gitconfig", _T0, _MO, None,
+        (Principal.INSTALLER,), (Principal.BUILDER,),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:build_account_gitconfig",),
+        note=(
+            "builder 帳號 HOME 下的 root-owned `.gitconfig`（0644），內容含來源 repo 的 "
+            "`safe.directory`——比照既有的 `codex-hooks`（root-owned、在 job 帳號 HOME 下），"
+            "不是新概念。**為何必須存在**：per-job clone 的來源樹不屬於 job 帳號，git 的 "
+            "dubious ownership 保護會讓 `git clone` 直接失敗；而 job 的 HOME 是 root-owned，"
+            "它自己放不了這個檔。**為何是 Tier-0**：gitconfig 可指定 `core.fsmonitor`／"
+            "`core.pager`／`alias.*` 等會執行外部命令的鍵，可寫者等於對該 job 帳號取得"
+            "任意程式碼執行——與 `codex-hooks` 同一條性質。內容由 permgen 產生"
+            "（`build_account_gitconfig()`），不手寫；每個來源 repo **兩條** "
+            "`safe.directory`（工作樹根 ＋ `<root>/.git`），理由見該函式。"
+        ),
+    ),
+    TrustRootAsset(
+        "reviewer-planner-gitconfig", _T0, _MO, None,
+        (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:build_account_gitconfig",),
+        note=(
+            "同 `builder-gitconfig`，落在 reviewer＋planner 的 job 帳號 HOME 下"
+            "（三分定案的 `cortex-reviewer-planner`）。兩個 job 帳號各一份是必要的："
+            "`.gitconfig` 讀取端是 `$HOME`，而三分的硬性要求就是 reviewer 與 builder "
+            "互不可寫、HOME 互不相同。"
+        ),
+    ),
+    TrustRootAsset(
+        "manager-gitconfig", _T0, _MO, None,
+        (Principal.INSTALLER,), (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:build_account_gitconfig",),
+        note=(
+            "與上面兩份**同構**（root-owned 0644、落在帳號 HOME 下、內容由 permgen 產），"
+            "但讀者是 `cortex-manager`（Manager ＋ monitor 同帳號、同 HOME）。\n"
+            "**為何必須存在**：Manager 也要對來源樹跑 git（provision 的 "
+            "`git branch -f`、成果回收的 `git fetch`、dispatch baseline 的 `rev-parse`），"
+            "而來源樹是由 root 建立、再 chown 給 `cortex-manager` 的——**chown 之前**或"
+            "任何 owner 不相符的中途狀態，git 一樣擋：\n"
+            "    fatal: detected dubious ownership in repository at '<來源樹>/<slug>'\n"
+            "owner 相符時這個檔是無害的冗餘；owner 不相符時它是「服務起得來但每一次 git "
+            "都失敗」與「正常運轉」的差別。缺這一份正是本票初版被實機複驗抓到的 blocking "
+            "缺口。\n"
+            "**writer 仍只有部署身分**：Manager 可寫的是**來源樹**，不是自己的 gitconfig"
+            "——`.gitconfig` 可指定 `core.fsmonitor`／`alias.*` 這類會執行外部命令的鍵，"
+            "讓 Manager 能改自己的 git 設定等於把 Tier-0 的執行面交還給它。"
+        ),
+    ),
     # ---- job-visible worktree 族 -------------------------------------------
     TrustRootAsset(
         "repo-worktree", _T1, _JV, "paulsha_cortex.config.paths:repo_root",
         (Principal.BUILDER,), (Principal.MANAGER,),
         IngressKind.STAGING_SPOOL,
-        note="builder write_paths:['**']，可寫 worktree 內任何路徑（含 .cortex/.github）。",
+        note=(
+            "builder write_paths:['**']，可寫工作區內任何路徑（含 .cortex/.github）。"
+            "#623 之後這個工作區是從 `repo-source-tree` 拉出來的 **per-job 完整 clone**"
+            "（整個 clone 由該 job 帳號擁有），不再是共用 object store 的 git worktree。"
+        ),
     ),
     TrustRootAsset(
         "dispatch-worktree-pool", _T1, _JV, "paulsha_cortex.config.paths:worktree_root",
@@ -298,6 +389,37 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "durable_state_owner、mode 0700，reviewer 僅獲 write-only ACL（寫得進自己"
             "那格、讀不到他人 verdict），**builder 不在 writer 面故零寫入**。dispatch 前"
             "該格必須不存在（pre-seed 守衛），Manager 落地後轉唯讀。"
+        ),
+    ),
+    TrustRootAsset(
+        "commit-spool", _T0, _JV,
+        "paulsha_cortex.config.paths:commit_spool_root",
+        (Principal.MANAGER, Principal.BUILDER), (Principal.MANAGER,),
+        IngressKind.INTERPROCESS,
+        derived_in=(
+            "config/paths.py:commit_spool_root",
+            "trust_root/permgen.py:PathLayout.commit_spool_root",
+        ),
+        note=(
+            "#623／#634 成果回收的 **bundle spool**：`<coordinator_root>/commit-spool/"
+            "<job-id>/`。形態**逐條比照 `review-verdict-spool`**——tree 分類 job-visible"
+            "（單向 spool 一律如此），permgen 產出的實質是 Manager-owned：容器 owner＝"
+            "durable_state_owner、mode 0700，producer 僅獲 **`wx` 無 `r`** 的 per-account "
+            "ACL（寫得進自己那格、讀不到他人的 bundle）；per-job 目錄由 Manager 在 dispatch "
+            "當下建立、落地後轉唯讀（pre-seed／seal 同一套語意）。\n"
+            "**為何需要這條通道**：#634 現行的回收是「Manager 伸手進 builder 的 clone "
+            "`fetch`」，那需要 (a) traverse 進 builder-owned 的 `0700` 樹——實測 "
+            "`Permission denied`；(b) 為**每個 job 路徑**加 `safe.directory`——而 git 2.43 "
+            "實測不吃路徑 glob，等於把 Manager 的 Tier-0 gitconfig 變成執行期可變狀態。"
+            "改走 bundle 之後 builder 在自己的 clone `git bundle create` 寫進本 spool，"
+            "Manager 從那個 **bundle 檔** fetch：Manager 全程不碰 builder 的樹，讀的是一個"
+            "**檔案**而非 repo，dubious-ownership 與 traverse 兩個問題同時消失。\n"
+            "**producer 只有 builder**：登記表裡唯一以 git commit 交付的 persona 就是它"
+            "（`repo-worktree` 的 writer 只有 BUILDER）；reviewer 的交付通道是 "
+            "`review-verdict-spool`、planner 的是 `dispatch-specs-tree`。多授一個 `wx` "
+            "ACL 給沒有 producer 的帳號，只是多開一條無人消費的寫入面。要納入時改登記表"
+            "並重跑產生器，不在此預留。\n"
+            "**本項只定義資產與權限**；bundle 的產生與消費在 coordinator 側，屬後續變更。"
         ),
     ),
     TrustRootAsset(
@@ -492,7 +614,11 @@ MUTATION_INGRESS: tuple[MutationIngress, ...] = (
     MutationIngress("config-overlay", IngressKind.CONFIG_OVERLAY, False, True,
                     "model-identity／combo／persona tool_allowlist_additions（只加不減、無上限）。"),
     MutationIngress("deployment-write", IngressKind.DEPLOYMENT_WRITE, False, True,
-                    "unit／venv／launcher／sitecustomize／.pth／PATH／~/.codex/hooks.json。"),
+                    "unit／venv／launcher／sitecustomize／.pth／PATH／~/.codex/hooks.json；"
+                    "#623 起另含**三份**帳號 HOME 下的 root-owned `.gitconfig`"
+                    "（builder／reviewer-planner／manager）——同一條性質：writer 只有部署"
+                    "身分，服務帳號對這些檔一律唯讀。來源樹本身**不在**此類（0817 裁決把"
+                    "它的 writer 改為 Manager，見 `repo-source-tree`）。"),
     MutationIngress("interprocess", IngressKind.INTERPROCESS, False, True,
                     "inherited FD／ptrace／/proc/<pid>/mem／signal。"),
 )

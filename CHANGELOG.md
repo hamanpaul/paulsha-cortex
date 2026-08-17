@@ -8,6 +8,42 @@
 ## [Unreleased]
 
 ### Added
+- **#623 / trust-root Phase 2b：per-job clone 的信任根層——`repo-source-tree`、三份
+  root-owned `.gitconfig` 與 `commit-spool` 進登記表，內容由 permgen 產生**——M1 之後
+  實機發現「這個部署做不了真實工作」：`ProtectHome=yes` 讓 `/home` 完全不可見，而登記表
+  **沒有定義 repo 源碼樹該放哪**；實測進一步證明 `git worktree` 在三分下結構性不成立
+  （worktree 的 `.git` 指向**共用 object store**，builder 只要 `git add` 就必須能寫它，
+  「builder 能 commit」與「三分隔離」互斥）。裁決改為 **per-job 完整 clone**
+  （0.5 秒／35MB per job）。本 PR 落地信任根層：
+  - `repo-source-tree`（`<agents_root>/repos`，**working checkout**——monitor 要掃工作樹
+    裡的檔案，bare 沒有工作樹；同一份 checkout 兼作掃描目標與 clone 來源）。**writer 是
+    Manager**（0817 裁決，推翻本票初版的 root-owned）：`git fetch` 必須把 `FETCH_HEAD`
+    寫進**目標 repo**，而成果回收正是「fetch 進來源樹」，實機在 root-owned 下實測
+    `error: cannot open '.git/FETCH_HEAD': Permission denied`——「Manager 唯讀」與
+    「Manager 回收成果」互斥，取後者。機械落點是 `owner_class=MANAGER_STATE`
+    （`cortex-manager` 0700），兩個 job 帳號各獲**唯讀** ACL（`rX`），monitor 靠 unit
+    的 persona 過濾（#622）仍寫不進去；隔離未變弱（不受信任的是 job 帳號，而 Manager
+    本來就擁有 gate ledger／evidence／`jobs.json`）。
+  - `builder-gitconfig`／`reviewer-planner-gitconfig`／`manager-gitconfig`（root-owned
+    0644，落在各自帳號 HOME 下，比照既有的 `codex-hooks`）。內容由 permgen 產生
+    （`build_account_gitconfig()` ＋ CLI `trust_root gitconfig [--builder|
+    --reviewer-planner|--manager] --source-repo <slug>`），每個來源 repo **兩條**
+    `safe.directory`（工作樹根 ＋ `<root>/.git`——實測從非 bare 來源 clone 時 git 檢查的
+    是後者）。Manager 那份是實機複驗補上的 blocking 缺口：來源樹是 root 建立後才 chown
+    過去的，owner 不相符的中途狀態會讓 Manager 的每一個 git 操作失敗。來源 repo 清單是
+    部署決定（比照 #626），未宣告即 fail-closed（`safe.directory` 只認逐字相等的路徑或
+    字面 `*`，實測 git 2.43 不吃 `<repos>/*`，而字面 `*` 等於整個關掉該保護）。
+  - `commit-spool`（`<coordinator_root>/commit-spool/<job-id>/`）＋ path resolver
+    `config.paths:commit_spool_root()`：成果回收改走 **bundle ＋ append-only spool**
+    （0817 裁決）——builder 在自己的 clone `git bundle create` 寫進 spool，Manager 從那個
+    **bundle 檔**（不是 repo）fetch，Manager 全程不碰 builder 的樹。形態逐條比照
+    `review-verdict-spool`：容器 `cortex-manager` 0700，producer 僅獲 **`wx` 無 `r`** 的
+    per-account ACL；**producer 只有 builder**（登記表裡唯一以 git commit 交付的 persona）。
+    本 PR 只定義資產與權限，bundle 的產生／消費在 coordinator 側，屬後續變更。
+
+  monitor 對 Manager 的**真子集**不變式（#622）仍成立。新增
+  `tests/test_trust_root_repo_source_tree_623.py`（68 測試）；runbook 補第 2c 步、
+  spec §R1 補兩段裁決。詳見 `changelog.d/repo-source-tree-assets.md`。
 - **#622 / trust-root Phase 2b：`trust_root unit three-way --monitor`——monitor 的
   system-level unit，同帳號、同加固段，可寫面嚴格窄於 Manager**——M1 之後 permgen
   只產生 Manager unit，實機切換後 instance **完全沒有 monitor**：舊 `--user` unit 以

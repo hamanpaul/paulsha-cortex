@@ -23,6 +23,15 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root shim [three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
+    python -m paulsha_cortex.trust_root gitconfig [three-way|two-way]
+                                        [--builder|--reviewer-planner|--manager]
+                                        --source-repo <slug> [--source-repo <slug>…]
+                                                    # #623：帳號 HOME 下 root-owned 的
+                                                    # .gitconfig 內容（來源樹的
+                                                    # safe.directory）。三份同構：兩個
+                                                    # job 帳號 ＋ Manager（Manager 也要
+                                                    # 對來源樹跑 git，同樣會撞 dubious
+                                                    # ownership）
     python -m paulsha_cortex.trust_root polkit [three-way|two-way] [--template|--transient]
                                                     # Phase 2b 降權 polkit 規則內容
                                                     # （--template＝方案 B，**預設**；
@@ -52,6 +61,16 @@ UID 方案未指定時一律用 **`three-way`**（operator 0816 第三輪裁決 
 都不輸出、回傳碼 2。因為 runbook 第 2b 步以 `sudo sh -e` 執行整份 script，一行
 `setfacl -m u:<不存在的帳號>:rX` 就會中止它並留下半套用的權限樹。
 
+## 來源 repo 的宣告（#623，同樣是部署決定）
+
+`gitconfig` 需要**逐字**的 `safe.directory` 路徑（git 不吃目錄萬用字元），而
+「本 instance 治理哪些 repo」是部署決定。兩條注入管道，**CLI 旗標優先於 env**：
+
+    --source-repo <slug>（可重複）      PSC_SOURCE_REPO_SLUGS=<slug>[,<slug>…]
+
+未給時 fail-closed（stdout 一行都不輸出、回傳碼 2）：空的 `[safe]` 段裝得起來、
+服務也起得來，然後**每個 job 在第一次 `git clone` 才失敗**——症狀離原因很遠。
+
 env 只在本 CLI 這一層讀取——`permgen` 維持純函式（不讀 env、不碰 IO）。
 """
 from __future__ import annotations
@@ -67,6 +86,45 @@ from .registry import Principal
 
 #: `--<principal>-account none` 的字面值——明示本部署沒有這個角色的實體。
 ABSENT_TOKEN = "none"
+
+#: 來源 repo slug 的 CLI 旗標與 env 變數（#623；旗標可重複，優先於 env）。
+SOURCE_REPO_FLAG = "--source-repo"
+SOURCE_REPO_ENV = "PSC_SOURCE_REPO_SLUGS"
+
+
+def _source_repo_slugs(
+    rest: list[str],
+    env: "dict[str, str] | None" = None,
+) -> "tuple[list[str], list[str], str | None]":
+    """抽出 `--source-repo <slug>`（可重複）；未給旗標時退回 env。
+
+    回傳 `(剩餘 token, slug 清單, 錯誤訊息)`。env 值以逗號／空白分隔。
+    """
+    environ = os.environ if env is None else env
+    remaining: list[str] = []
+    slugs: list[str] = []
+    pending = False
+    for token in rest:
+        if pending:
+            slugs.append(token)
+            pending = False
+            continue
+        flag, sep, inline = token.partition("=")
+        if flag != SOURCE_REPO_FLAG:
+            remaining.append(token)
+            continue
+        if sep:
+            if not inline:
+                return remaining, slugs, f"{SOURCE_REPO_FLAG} 需要一個 slug"
+            slugs.append(inline)
+        else:
+            pending = True
+    if pending:
+        return remaining, slugs, f"{SOURCE_REPO_FLAG} 需要一個 slug"
+    if not slugs:
+        raw = (environ.get(SOURCE_REPO_ENV) or "").replace(",", " ")
+        slugs = [part for part in raw.split() if part]
+    return remaining, slugs, None
 
 
 def _account_overrides(
@@ -257,6 +315,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
         shim = permgen.build_job_shim(permgen.SCHEMES[scheme_id])
         print(shim.content, end="")
+        return 0
+    if command == "gitconfig":
+        rest, slugs, err = _source_repo_slugs(args[1:])
+        if err is not None:
+            print(err, file=sys.stderr)
+            return 2
+        scheme_id = permgen.DEFAULT_SCHEME_ID
+        principal = Principal.BUILDER
+        # 旗標→persona 由 permgen 那張表導出：新增一份 .gitconfig 不必改本函式。
+        by_flag = {
+            flag: p for p, flag in permgen.ACCOUNT_GITCONFIG_FLAGS.items()
+        }
+        for token in rest:
+            if token in by_flag:
+                principal = by_flag[token]
+            elif token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown gitconfig arg: {token}", file=sys.stderr)
+                return 2
+        try:
+            layout = permgen.DEFAULT_LAYOUT.with_source_repo_slugs(slugs)
+            # fail-closed 與 `--commands` 同一個理由：一份「裝得起來但每一次 git 操作
+            # 都會失敗」的 .gitconfig，比產生器拒絕產出危險得多（#623）。
+            blob = permgen.build_account_gitconfig(
+                permgen.SCHEMES[scheme_id], layout, principal
+            )
+        except (permgen.UnresolvedSourceRepoError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(blob.content, end="")
         return 0
     if command == "polkit":
         rest = args[1:]

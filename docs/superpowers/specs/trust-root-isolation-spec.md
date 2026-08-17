@@ -407,6 +407,67 @@ state，證明清單漂移速度快於人工複核週期。
 - **WHEN** 同一個 durable 資產在兩處以字面量重複推導路徑
 - **THEN** 登記表一致性測試 MUST FAIL
 
+#### repo 源碼樹的放置（#623 裁決；登記表資產 `repo-source-tree`）
+
+Phase 2b 的登記表原本定義了 durable state 樹與部署樹，**沒有定義 repo 源碼樹該放
+哪**——實機因此撞到「`ProtectHome=yes` 讓 `/home` 完全不可見 ⇒ Manager 看不到自己的
+repo」。裁決前先排除了一條看似最省事的路：**`git worktree` 在三分下不成立**。實測
+（#623）：worktree 的 `.git` 是指向**共用 object store** 的指標，builder 只要 `git add`
+就必須能寫該 store，而 store 在 Manager-owned 樹內——「builder 能 commit」與「三分
+隔離」互斥，不是權限沒調好。
+
+因此裁決為 **per-job 完整 clone**（實測 0.5 秒／35MB per job），登記表新增：
+
+- `repo-source-tree`：`<agents_root>/repos/<slug>`，**working checkout**（不是 bare——
+  monitor 掃的是工作樹裡的檔案）。同時是 monitor 的掃描目標與每個 job 的 clone 來源。
+  **writer 是 Manager**（0817 裁決）：`owner_class=MANAGER_STATE`、owner＝
+  `durable_state_owner`、mode 0700，兩個 job 帳號各獲一條**唯讀** ACL（`rX`）。
+- `builder-gitconfig`／`reviewer-planner-gitconfig`／`manager-gitconfig`：對應帳號 HOME
+  下的 **root-owned** `.gitconfig`（0644），內容含來源 repo 的 `safe.directory`。跨擁有者
+  的 git 操作會被 dubious-ownership 保護擋下，而那些 HOME 都是 root-owned、帳號自己放不了
+  這個檔——與既有的 `codex-hooks`（root-owned、在帳號 HOME 下）同一個模式，不是新概念。
+  內容 SHALL 由權限產生器產生（比照 shim／polkit），MUST NOT 手寫；每個來源 repo SHALL
+  產生**兩條** `safe.directory`（工作樹根 ＋ `<root>/.git`）——實測從**非 bare** 來源
+  clone 時 git 檢查的是後者，而 `git -C <repo> …` 報的是前者。
+- `commit-spool`：`<coordinator_root>/commit-spool/<job-id>/`，builder 成果回收的
+  **bundle spool**。形態 SHALL 逐條比照 `review-verdict-spool`：容器 owner＝
+  `durable_state_owner`、mode 0700，producer 僅獲 **`wx` 無 `r`** 的 per-account ACL，
+  per-job 目錄由 Manager 在 dispatch 當下建立、落地後轉唯讀。
+
+##### `repo-source-tree` 的 owner：從 root 改為 Manager（0817 裁決）
+
+本節初版（PR #636 第一版）把 writer 定為部署身分，理由是「Manager 被攻陷也改不了每個
+job clone 的來源」。實機複驗後**推翻**：
+
+```
+$ sudo -u cortex-manager git -C /var/lib/cortex/repos/<slug> fetch <bundle> …
+error: cannot open '.git/FETCH_HEAD': Permission denied
+```
+
+`git fetch` MUST 把 `FETCH_HEAD` 寫進**目標 repo**，而成果回收正是「fetch 進來源樹」；
+provisioning 那半邊的 `git branch -f <branch> <base>`（`coordinator/seams.py`）同樣是對
+來源樹的寫入。**「Manager 唯讀」與「Manager 回收成果」互斥**，裁決取後者。
+
+隔離不因此變弱：威脅模型裡不受信任的是 **job 帳號**，它們對來源樹只有唯讀 ACL；而
+Manager 本來就擁有 gate ledger、evidence 樹與 `jobs.json`——Manager 被攻陷的話那些全都
+完了，多這一棵樹不改變攻擊面。root-owned 買到的是一條**供應鏈**保護（Manager 被攻陷後
+仍污染不了下一輪 job 的原始碼），但它讓回收整個不成立，因此取回收。
+
+monitor 仍**不得**寫這棵樹：monitor 與 Manager 同帳號，檔案層權限相同，差別由 monitor
+unit 的 persona 過濾（§R3／#622）產生——`ReadWritePaths` 只由 monitor persona 在登記表上
+的 writer／spool-consumer 面導出，來源樹因此機械地不會出現在那份 unit 上。
+
+##### 成果回收走 bundle spool，而不是 Manager 伸手進 job 的 clone（0817 裁決）
+
+#634 現行的回收是 `git -C <來源樹> fetch <builder 的 clone> …`。那條路要求 Manager
+(a) traverse 進 builder-owned 的 `0700` 樹——實測 `Permission denied`；(b) 為**每個 job
+路徑**加 `safe.directory`——而 git 2.43 實測不吃路徑 glob，等於把 Manager 的 Tier-0
+gitconfig 變成執行期可變狀態。
+
+改走 bundle：builder 在**自己的** clone `git bundle create <spool>/<job-id>/<name>.bundle`，
+Manager 從那個 **bundle 檔**（不是 repo）fetch。Manager 全程不碰 builder 的樹，讀的又是
+一個普通檔案，dubious-ownership 與 traverse 兩個問題同時消失。
+
 ### R2 所有 Tier-0／Tier-1 durable state 與 mutation ingress MUST 位於不受信任 headless persona 不可寫的 OS 邊界內
 
 系統 SHALL 使 builder／reviewer／planner 對登記表中 tier 0 與 1 的全部路徑
