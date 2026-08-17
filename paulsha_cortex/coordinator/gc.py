@@ -25,7 +25,7 @@ from typing import Any, Callable, Sequence
 from paulsha_cortex.config.paths import repo_root as default_repo_root
 from paulsha_cortex.config.paths import worktree_root_for
 
-from . import verification
+from . import job_workspace, verification
 
 GC_SCHEMA = "cortex-work-gc/v1"
 
@@ -173,6 +173,24 @@ def list_worktrees(repo_root: Path, git_runner: GitRunner | None = None) -> list
     return entries
 
 
+def list_clone_workspaces(
+    pool_root: Path, git_runner: GitRunner | None = None
+) -> list[_WorktreeEntry]:
+    """#623：列出 pool 底下的 per-job clone 工作區。
+
+    clone 沒有 `git worktree` registry——`git -C <repo> worktree list` 看不到它們，
+    因此掃描改由檔案系統負責（判準是 `job_workspace` 的標記檔，見該模組）。branch
+    取工作區自己 checked-out 的那條；detached 時為 None，與 worktree 的表示法一致。
+    """
+
+    entries: list[_WorktreeEntry] = []
+    for path in job_workspace.list_clone_workspaces(pool_root):
+        branch_result = _git(path, ["symbolic-ref", "--short", "HEAD"], git_runner)
+        branch = branch_result["stdout"].strip() if branch_result["status"] == "ok" else ""
+        entries.append(_WorktreeEntry(path=path, branch=branch or None))
+    return entries
+
+
 def list_local_branches(repo_root: Path, git_runner: GitRunner | None = None) -> list[str]:
     result = _git(
         repo_root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"], git_runner
@@ -294,13 +312,25 @@ def scan(
     artifacts: list[Artifact] = []
     protected_branches: set[str] = set()
 
-    for entry in list_worktrees(repo_root, git_runner):
+    #: 兩種形狀都要掃：#623 之後新工作區是 per-job clone（`git worktree list` 看
+    #: 不到），升級前既存的 linked worktree 仍須能被回收。以解析後的路徑去重——
+    #: 同一路徑不可能同時是兩者，但去重讓「掃描來源多一個」不會變成報表出現兩列。
+    seen_paths: set[str] = set()
+    pool_entries = [
+        *list_worktrees(repo_root, git_runner),
+        *list_clone_workspaces(pool_root, git_runner),
+    ]
+
+    for entry in pool_entries:
         try:
             resolved = entry.path.resolve()
         except OSError:
             continue
         if not _is_under(resolved, pool_root):
             continue
+        if str(resolved) in seen_paths:
+            continue
+        seen_paths.add(str(resolved))
         artifact = _classify_worktree(
             entry,
             repo_root=repo_root,
@@ -354,9 +384,21 @@ def _apply_worktree(
     merged, reason = _classify_merge(repo_root, default_branch, ref, git_runner)
     if not merged:
         return _keep_apply_error(artifact, "worktree no longer verified merged")
-    removal = _git(repo_root, ["worktree", "remove", str(path)], git_runner)
-    if removal["status"] != "ok":
-        return _keep_apply_error(artifact, f"git worktree remove failed: {removal['stderr']}")
+    # #623：per-job clone 沒有 `git worktree` registry，回收退化成單純的目錄刪除；
+    # 升級前既存的 linked worktree 仍走 `git worktree remove`（它同時要清 registry，
+    # 少了那一步就是 #478 的殘留態）。判準是工作區自己的形狀，不是部署模式旗標
+    # ——旗標會與磁碟上的實況漂移，形狀不會。
+    if job_workspace.is_job_clone(path):
+        try:
+            job_workspace.remove_clone(path)
+        except Exception as exc:  # noqa: BLE001 - 刪除失敗一律降為 keep，不誤報回收
+            return _keep_apply_error(
+                artifact, f"job workspace remove failed: {type(exc).__name__}: {str(exc)[:200]}"
+            )
+    else:
+        removal = _git(repo_root, ["worktree", "remove", str(path)], git_runner)
+        if removal["status"] != "ok":
+            return _keep_apply_error(artifact, f"git worktree remove failed: {removal['stderr']}")
     return Artifact(
         artifact.kind, artifact.identifier, ACTION_RECLAIM, reason,
         branch=artifact.branch, detail="removed",

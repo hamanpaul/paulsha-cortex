@@ -61,9 +61,16 @@ default branch MUST 依 `origin/HEAD` 解析，無法解析時退回 `main`；GC
 
 ### R4 回收範圍與報告
 
-候選範圍 SHALL 為：worktree pool（repo 同層 `<repo>-worktrees`，`PSC_WORKTREE_ROOT` 可覆寫）內的殘留 build worktree，與 repo 的 local branch。
+候選範圍 SHALL 為：worktree pool（repo 同層 `<repo>-worktrees`，`PSC_WORKTREE_ROOT` 可覆寫）內的殘留 build 工作區，與 repo 的 local branch。
 
-`--apply` 對 clean 且 merged 的 worktree MUST 以 `git worktree remove` 移除；對通過 R2 驗證鏈的 merged branch MUST 於刪除前重新驗證一次，再以 `git branch -D` 刪除。
+工作區有兩種形狀，掃描 MUST 同時涵蓋（#623）：
+
+- **per-job clone**（現行模型）：獨立 repo，`git worktree list` 看不到它們，掃描 SHALL 走檔案系統並以 `coordinator/job_workspace.py` 的標記檔為判準。
+- **linked worktree**（#623 升級前既存）：由 `git worktree list --porcelain` 列出。
+
+`--apply` 對 clean 且 merged 的工作區 MUST 依其形狀回收——per-job clone 為目錄刪除（無 worktree registry 可清），linked worktree 為 `git worktree remove`；對通過 R2 驗證鏈的 merged branch MUST 於刪除前重新驗證一次，再以 `git branch -D` 刪除。
+
+工作區仍在使用（未 merge）時其 branch MUST 落在 `keep`——clone 沒有 worktree registry，少了 clone 掃描這一步，正在跑的 job 的 branch 會被誤判為可回收。
 
 報告 MUST 逐項列出 artifact、判定與 reason；`--json` MUST 輸出 versioned schema（`cortex-work-gc/v1`），含 dry-run／apply 模式標記與逐項結果。
 

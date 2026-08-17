@@ -225,6 +225,33 @@
   `mock.patch.object` 打不到，測試實際驗到的是「本機有沒有那個帳號」而非它宣稱的分支。
 
 ### Changed
+- **#623 / trust-root Phase 2b：job 工作區模型由 `git worktree` 改為 per-job 完整
+  clone——provisioning、成果回收與回收層**——M1（#584）之後 builder 以
+  `cortex-builder`、Manager 以 `cortex-manager` 執行，實測顯示 `git worktree` 在三分
+  下**結構性不成立**：linked worktree 的 `.git` 是指向 Manager-owned 樹的指標檔，把
+  gitdir 也 chown 給 builder 之後 `git status` 過了但 `git add` 仍失敗——寫 object
+  需要寫**共用** object store，而能寫共用 object store，隔離邊界就在 git 這一層漏掉。
+  新增 `coordinator/job_workspace.py` 作為工作區模型的單一真相（標記／識別／列舉／
+  刪除／成果回收／封存）；`coordinator/seams.py` 的 provisioning 改為
+  `git clone --no-hardlinks`，四條守衛（target 已存在、base 必須是既有 commit、既有
+  branch 必須位於 base ancestry、fast-forward 後重掛）與錯誤訊息逐條等價，且失敗會把
+  已做的變更全部還原；工作區的 `origin` 指向**真正的上游**、指向來源 repo 的暫時
+  remote 一律移除、`refs/remotes/origin/*` 與本地 git identity 一併複製過去，因此
+  delivery 的 `git -C <工作區> push origin` 行為不變。新增成果回收
+  `job_workspace.harvest_branch()`——Manager 以 `git -C <來源 repo> fetch <clone>`
+  單向拉回（沿用 D2「git 讀」的方向，builder 永遠不 push 進 Manager 的樹；refspec 不帶
+  `+`，非 fast-forward fail-closed），掛在 canonical lane 的
+  `_verify_build_candidate_transition` 之後與 slice lane 的
+  `verification.run_result_verification` 讀 branch head 之前。`coordinator/gc.py` 的掃描
+  與 `--apply` 同時涵蓋 per-job clone 與升級前既存的 linked worktree，依工作區**自己的
+  形狀**分派回收方式；`coordinator/worktree_reclaim.py` 的安全閘擴充為認得兩種形狀，
+  並在刪除 clone 前把工作區 HEAD 封存進 `refs/cortex/reclaimed/**`（clone 的 `rmtree`
+  會連 object store 一起刪掉，與該模組「不銷毀證據」的契約相牴觸）。clone 模型對
+  `direct` 與降權模式走同一條 code path，所有新行為都以工作區標記檔為前置條件，既有
+  部署與測試裡的假路徑完全不觸發。新增
+  `tests/test_per_job_clone_provisioning_623.py`（27 測試，全部以真 git repo 驗證）；
+  全套 `python3 -m pytest tests/ -q`：3644 passed，零回歸。
+  詳見 `changelog.d/per-job-clone-provisioning.md`。
 - **#584 / trust-root Phase 2b runbook：A／B 兩案並列收斂為 A+B 單一路徑（docs-only）**
   ——落實 operator 0816 第三輪裁決。polkit 的 `manage-units` 只暴露 unit 名與 verb、
   不暴露 `User=`（#603 實測），因此「誰持有授權」與「授權能做什麼」兩層一起收：

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 
+from . import job_workspace
 from .._yaml import YAMLError, safe_load
 from ..persona import gate
 from ..persona.contract import PersonaContract, validate_persona_schema
@@ -694,6 +695,20 @@ def run_result_verification(
     except ContractValidationError as exc:
         details["contract_error"] = exc.as_payload()
         return _finish("needs_human", "verification-contract-invalid")
+
+    # #623：工作區是 per-job clone 時，builder 的 commit 只存在於 clone 自己的
+    # object store 裡——底下所有以 `resolved_repo_root` 為根的判讀（candidate、
+    # ancestry、required-artifact diff、persona scope diff）都會看不到它。先由
+    # Manager 單向 fetch 回自己的樹，才有東西可讀。worktree 模型（以及測試裡的
+    # 假路徑）沒有標記檔，這一步是 no-op，既有行為逐字不變。
+    if branch:
+        try:
+            job_workspace.harvest_if_job_clone(
+                source_repo=resolved_repo_root, workspace=worktree, branch=branch
+            )
+        except job_workspace.WorkspaceError as exc:
+            details["candidate_harvest_error"] = str(exc)
+            return _finish("needs_human", "candidate-harvest-failed")
 
     branch_result = _run_git(["-C", str(resolved_repo_root), "rev-parse", branch], git_runner)
     branch_stdout = branch_result["stdout"].strip()
