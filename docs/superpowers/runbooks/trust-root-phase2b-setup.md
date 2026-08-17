@@ -697,6 +697,27 @@ grep -E "setfacl" /tmp/p2b-permissions.sh | grep -E "/var/lib/cortex/worktree/"
 #   它是 `0701 cortex-manager`，Manager 是 owner、別的帳號只能 traverse，
 #   產生器對它只出 `install -d`／`chown`／`chmod`，本來就沒有 setfacl。
 
+# ✅ 稽核 5c：**即時回收沒有偷偷把那條 ACL 加回來**（#658）
+#   #658 讓 build 卡被採信之後即時回收它的工作區。回收身分是 **Manager 自己**，
+#   而且**刻意不新增任何授權**——推導是：抵達回收必須先走完
+#   `manager._verify_exact_candidate()`，那裡已經以 Manager 身分對**同一棵樹**跑過
+#   `git -C <worktree> rev-parse HEAD`。因此「Manager 進得去那棵樹」是**採信本身
+#   既有的前提**，不是 #658 新增的假設；稽核 5b 的「零 setfacl」因此仍然成立，
+#   上面那條 grep 就是本項的稽核（不需要另一條命令）。
+#   **降權部署下今天的實況**：#641 收掉 ACL 之後 `_verify_exact_candidate()` 會先
+#   fail-closed（訊息含 `blocked on #629`），所以那裡根本不會出現「被採信卻沒回收
+#   的工作區」。等 #629 把 candidate 驗證搬到 gate 執行身分之後，「誰讀得到那棵樹」
+#   會跟著改變——**屆時回收身分必須與 candidate 驗證身分一起重新裁決**，不得單獨
+#   為回收開一條授權。
+#   **運轉期稽核**（run 跑過之後看得到）：
+#     journalctl -u cortex-manager | grep workflow-build-workspace-reclaim
+#   期望：每張被採信的 build 卡各一行 `-reclaimed`。
+#     `-skipped reason=<code>` ⇒ 前置條件不成立（刻意不收），reason 逐字說明是哪一條；
+#     `-failed` ⇒ 試了但後置條件不成立，**採信不受影響**，殘留由 `cortex work gc` 收。
+#   pool 佔用的對照：一個進行中的 run 在 build phase 應只有**一個** build 工作區
+#   （正在跑的那一張卡）：
+#     sudo ls -1 /var/lib/cortex/worktree | grep -v -- '-review-' | wc -l
+
 # ✅ 稽核 6：script 裡出現的每個帳號名都**真的存在**（#626）
 #   `setfacl` 對解析不到的使用者名直接失敗（`Invalid argument near character 3`），
 #   而 2b 是 `sh -e`——一條錯就**中止整份 script**，留下**半套權限的樹**（前半已套、

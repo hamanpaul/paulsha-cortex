@@ -3395,6 +3395,188 @@ def _harvest_build_candidate(
     return harvested
 
 
+#: #658：即時回收的結構化 log 事件名。operator 的稽核面就是這一行——
+#: `journalctl -u cortex-manager | grep workflow-build-workspace-reclaim`。
+#: 三種結果各一個字尾：`-reclaimed`（真的收掉）／`-skipped`（前置條件不成立，
+#: 刻意不收）／`-failed`（試了但後置條件不成立，殘留交給 `cortex work gc`）。
+WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT = "workflow-build-workspace-reclaim"
+
+
+def _trusted_build_workspace_target(
+    job: Mapping[str, object], *, run, candidate: str
+) -> tuple[Path | None, str | None]:
+    """這張已被採信的 build 卡的工作區可不可以現在就回收？回 (路徑, 拒絕理由)。
+
+    恰有一個非 None。**任何一條不成立都回拒絕理由，不 raise、不猜、不回收**——
+    回收是清理，採信已經完成（#658 驗收：回收失敗不得擋住採信）。
+
+    六條前置條件，前四條防「刪到不該刪的東西」，後兩條防「刪到還沒有第二份副本
+    的東西」：
+
+    1. **記錄真的有一條絕對路徑**，且是目錄、不是 symlink。
+    2. **目錄名恰好是這個 job_id 經 `job_workspace.job_segment()` 導出的片段**。
+       這是 #645 的單一推導點，也是本函式最重要的一條安全閘：它把「回收哪一棵樹」
+       綁在 provisioning 的同一個推導上，而不是綁在一條可能陳舊的字串。#549 的
+       資料語意地雷（實測 `job.worktree` 會等於 run 的 `workspace_root`，那是
+       Manager 的 durable state）在這裡就被擋掉——來源樹的目錄名永遠不會是某個
+       job_id 的片段。刻意**不**拿 `paths.worktree_root_for()` 當判準：那是
+       config 解析出來的位置，會與磁碟上真正 provision 到哪裡漂開（注入 creator
+       的呼叫端就是），而「以形狀判斷，不依環境推導」正是 #634 的原則。
+    3. **它帶 `job_workspace` 的標記檔**（`is_job_clone`）。#646 的紅線：認不得的
+       目錄一律不刪。三分部署下 Manager 讀不進 `0700` 的 clone，這條會回 False
+       ⇒ 得到一個具名的 skip 理由，而不是一次注定失敗的 `rmtree`。
+    4. **標記檔的 `branch` 與 `source_repo` 都對得上**——分別對 job 記錄的 branch
+       與 run 的 `workspace_root`。標記檔是 provisioning 當下寫的，因此這一條驗的
+       是「這棵樹真的是本 run、這條交付線 provision 出來的」，不只是路徑長得像。
+    5. **來源樹裡真的有這顆 candidate**（`commit_present`）。
+    6. **來源樹的 `refs/heads/<branch>` 恰等於 candidate**。
+
+    5／6 是 `_harvest_build_candidate()` 的後置條件，這裡**當場對來源樹重驗一次**
+    而不是依賴呼叫順序：`EVIDENCE_HARVESTED` 這個 evidence 模型（見
+    `worktree_reclaim` 模組 docstring）的全部正當性就建立在這兩條上，而「呼叫端
+    在正確的位置呼叫」是一條會隨重構漂掉的約定，不是不變式。
+    """
+
+    worktree = job.get("worktree")
+    if not isinstance(worktree, str) or not worktree:
+        return None, "workspace-path-missing"
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        return None, "source-repo-missing"
+    branch = job.get("branch")
+    if not isinstance(branch, str) or not branch:
+        return None, "branch-missing"
+    job_id = job.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return None, "job-id-missing"
+    if verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        return None, "candidate-invalid"
+
+    target = Path(worktree)
+    if not target.is_absolute() or target.is_symlink() or not target.is_dir():
+        return None, "workspace-path-not-a-directory"
+    try:
+        expected = job_workspace.workspace_path(target.parent, job_id)
+    except job_workspace.WorkspaceError:
+        return None, "job-id-not-a-workspace-segment"
+    if target != expected:
+        # #549：`job.worktree` 指到 run 的 `workspace_root`（主 checkout）時走到
+        # 這裡。那是 Manager 的 durable state，遞迴刪除的爆炸半徑不可接受。
+        return None, "workspace-name-not-derived-from-job-id"
+    if not job_workspace.is_job_clone(target):
+        return None, "workspace-not-a-job-clone"
+    marker = job_workspace.read_marker(target) or {}
+    if marker.get("branch") != branch:
+        return None, "workspace-branch-mismatch"
+    recorded_source = marker.get("source_repo")
+    if not isinstance(recorded_source, str) or Path(recorded_source) != Path(source_repo):
+        return None, "workspace-source-repo-mismatch"
+
+    if not job_workspace.commit_present(source_repo, candidate):
+        return None, "candidate-not-in-source-repo"
+    if job_workspace.source_branch_head(source_repo, branch) != candidate.lower():
+        return None, "source-branch-head-mismatch"
+    return target, None
+
+
+def _reclaim_trusted_build_workspace(
+    job: Mapping[str, object], *, run, candidate: str
+):
+    """#658：build 卡被採信之後即時回收它的工作區。回傳 `WorktreeReclaim | None`。
+
+    ## 為什麼現在可以收
+
+    #648（後續 build 卡的 base 走 `run.candidate_head`，不讀前一張卡的工作區）、
+    #649／#653（ship 段有自己的 Manager-owned 樹）、#650／#659（verify／review 的
+    candidate 樹是 Manager 自己 clone 的）三票落地之後，**一張 build 卡被採信、
+    `_harvest_build_candidate()` 走完之後，它的工作區已經沒有任何下游消費端**。
+    per-job（#648）之後一個 run 會累積 N 棵這種樹（每棵約 35MB），即時回收因此是
+    自然的下一步——#650 驗收第 3 條移到本票。
+
+    ## 誰以什麼身分回收：**Manager，且不新增任何身分、不新增任何授權**
+
+    這是 #658 的核心問題，答案由一條既有的不變式決定：**「Manager 進得去那棵樹」
+    本來就是「這張卡被採信」的必要條件**。抵達本函式必須先走完
+    `_verify_build_candidate_transition()`，而它的第一件事就是以 Manager 身分對
+    **同一棵樹**跑 `git -C <worktree> cat-file` 與 `rev-parse HEAD`
+    （`_verify_exact_candidate()`）。因此回收不需要比採信更大的授權面——它要的權限
+    是採信路徑已經在用的那一份。
+
+    四個候選身分各自為什麼不選（票上列的那四個）：
+
+    - **(a) job wrapper 自刪**：被回收的對象自己決定回收，與 #540 的 acceptance
+      chain 方向相反；更根本的是 job **不知道自己有沒有被採信**（採信發生在它退出
+      之後、由 Manager 判定），自刪必然把未採信路徑的殘留一起銷毀——那正是 #601
+      重派要用的東西。
+    - **(b) #629 的 gate 執行身分**：登記表給 `GATE` 對 `repo-worktree` 的是 `rX`
+      **無 `w`**。授它 `w` 等於讓一個專門用來跑不受信任程式碼的帳號能改 builder
+      尚未 harvest 的交付樹，方向與 #629 自己的論證相反。
+    - **(c) `ExecStopPost=`／`RuntimeDirectory`**：時機錯——unit 停止是 **job 退出**
+      不是**被採信**，同 (a) 的失敗形態；而讓它跑得動 `rm -rf` 需要 `+` 前綴
+      （root 執行），與「cortex 任何元件永不具 root」這條既有裁決相斥。
+    - **(d) 依 `PSC_JOB_RUNNER` 分支（只在 `direct` 即時收）**：#634 的反模式。
+      真正決定回收成不成立的是**磁碟上的 owner**，不是旗標；以旗標分支會在
+      「旗標說降權、磁碟其實還是 Manager-owned」與其反面各錯一次。本函式改以
+      **能力判定**：前置條件不成立就具名 skip，收不掉就回 `failed` ＋ 診斷。
+
+    **三分／四分部署的誠實邊界**：#641 收掉 Manager 對 job 工作樹的 ACL 之後，
+    `_verify_exact_candidate()` 在那些部署上會先 fail-closed（訊息明文
+    `blocked on #629`）⇒ **那裡今天根本不存在「被採信卻沒回收的工作區」**，本函式
+    連跑都不會跑到。等 #629 把 candidate 驗證搬到第三執行身分之後，「誰讀得到那棵
+    樹」會跟著改變——屆時**回收身分必須與 candidate 驗證身分同進退**，這條依賴是
+    刻意寫在這裡的，不是留給下一個人重新推導。
+
+    ## 回收失敗不擋採信
+
+    採信在呼叫本函式之前就已經 durable（`_manager_update_workflow_run()` 已落盤）。
+    因此本函式**永不 raise**：失敗只留下 :data:`WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT`
+    的結構化 log，殘留由既有的 `cortex work gc` 掃除。
+
+    ## evidence 模型
+
+    走 `worktree_reclaim.EVIDENCE_HARVESTED`——完整論證在該模組的 docstring，前提由
+    `_trusted_build_workspace_target()` 的第 5／6 條**當場對來源樹複驗**。
+    """
+
+    job_id = job.get("job_id")
+    run_id = getattr(run, "run_id", None)
+    card = job.get("workflow_card")
+    target, refusal = _trusted_build_workspace_target(job, run=run, candidate=candidate)
+    if target is None:
+        logger.info(
+            "%s-skipped run_id=%s job_id=%s card=%s reason=%s",
+            WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT, run_id, job_id, card, refusal,
+        )
+        return None
+    try:
+        result = worktree_reclaim.reclaim_worktree(
+            target,
+            repo_root=str(getattr(run, "workspace_root", "")) or None,
+            evidence_model=worktree_reclaim.EVIDENCE_HARVESTED,
+        )
+    except Exception as exc:  # noqa: BLE001 - 清理不得讓已完成的採信反悔
+        logger.warning(
+            "%s-failed run_id=%s job_id=%s card=%s path=%s error=%s: %s",
+            WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT, run_id, job_id, card, target,
+            type(exc).__name__, str(exc)[:200],
+        )
+        return None
+    if result.ok:
+        logger.info(
+            "%s-reclaimed run_id=%s job_id=%s card=%s path=%s status=%s",
+            WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT, run_id, job_id, card,
+            result.path, result.status,
+        )
+    else:
+        logger.warning(
+            "%s-failed run_id=%s job_id=%s card=%s path=%s detail=%s"
+            "；採信不受影響，殘留工作區交給 `cortex work gc`",
+            WORKFLOW_BUILD_WORKSPACE_RECLAIM_EVENT, run_id, job_id, card,
+            result.path, result.detail,
+        )
+    return result
+
+
 def _review_builder_job_binding(
     registry,
     *,
@@ -10395,6 +10577,17 @@ def apply_workflow_action(
                 else None
             ),
         )
+        if current.current_phase == "build":
+            # #658：這張卡的採信此刻已經 durable（上面那次 `_manager_update_workflow_run`
+            # 已落盤），它的工作區從此沒有任何下游消費端 ⇒ 即時回收。
+            #
+            # **位置刻意在狀態更新之後**：若掛在 `_harvest_build_candidate()` 旁邊，
+            # 中間任何一條 raise（宣告了 outputs 卻沒有 artifact、`_audit_phase_steps`、
+            # phase transition 驗證……）都會讓 run 停在「工作區已刪、卡仍 pending」，
+            # 下一個 tick 的 `_verify_exact_candidate()` 會以 `git -C <已刪的路徑>`
+            # 失敗收場——一條由清理製造出來的死路。狀態落盤之後再收，重入的是
+            # `workflow card evidence replay rejected`（已採信的卡不再讀工作區）。
+            _reclaim_trusted_build_workspace(job, run=updated, candidate=str(candidate))
         reason = (
             "ship-validator-unavailable"
             if current.current_phase == "review" and phase_done and requested_phase == "ship" and ship_validator is None
