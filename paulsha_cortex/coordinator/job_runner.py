@@ -105,6 +105,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
 from . import job_workspace
@@ -123,7 +124,10 @@ __all__ = [
     "DEFAULT_JOB_SPEC_SPOOL",
     "DEFAULT_START_TIMEOUT_MS",
     "DEFAULT_TEMPLATE_UNIT",
+    "EXECUTOR_HARDENING_PROFILE",
     "ForwardedEnvVar",
+    "HARDENING_PROFILE_JIT",
+    "HARDENING_PROFILE_STRICT",
     "JOB_RUNNER_ENV",
     "JOB_SHIM_ENV",
     "JOB_SPEC_SPOOL_ENV",
@@ -140,6 +144,7 @@ __all__ = [
     "SystemdTemplatePlan",
     "TEMPLATE_UNIT_ENV",
     "TEMPLATE_UNIT_PREFIX",
+    "TEMPLATE_UNIT_SUFFIX_BY_PROFILE",
     "TRANSIENT_UNIT_PROPERTIES",
     "UNIT_NAME_PREFIX",
     "build_builder_env",
@@ -149,6 +154,7 @@ __all__ = [
     "build_systemd_run_argv",
     "confirm_template_instance_started",
     "confirm_transient_unit_started",
+    "forbidden_spec_keys",
     "instance_name_valid",
     "job_spec_path",
     "preflight_systemd_run",
@@ -156,7 +162,9 @@ __all__ = [
     "prepare_systemd_run",
     "prepare_systemd_template",
     "reject_unsafe_env",
+    "resolve_hardening_profile",
     "template_instance_id",
+    "template_unit_for_profile",
     "template_unit_name",
     "transient_unit_name",
     "write_job_spec",
@@ -225,10 +233,59 @@ TRANSIENT_UNIT_PROPERTIES = ("NoNewPrivileges=yes",)
 
 #: 模板 unit 名。polkit 規則（`permgen.build_polkit_rule(plan=TEMPLATE)`）比對的
 #: 就是它的實例形狀 `cortex-job@<id>.service`，因此是契約，不可隨手改。
+#:
+#: **這是「基底」模板名**（＝strict 剖面）。#643 之後真正被起動的 unit 還要再過一次
+#: :func:`template_unit_for_profile`：node 型 executor 走 `cortex-job-jit@.service`。
 TEMPLATE_UNIT_ENV = "PSC_JOB_TEMPLATE_UNIT"
 TEMPLATE_UNIT_PREFIX = "cortex-job@"
 TEMPLATE_UNIT_SUFFIX = ".service"
 DEFAULT_TEMPLATE_UNIT = f"{TEMPLATE_UNIT_PREFIX}{TEMPLATE_UNIT_SUFFIX}"
+
+
+# ---------------------------------------------------------------------------
+# per-executor 加固剖面（#643，operator 裁決＝方向 2）
+#
+# `MemoryDenyWriteExecute=yes` 與 JS runtime 天生互斥（V8 的 JIT 必須 W+X），而預設
+# executor（`codex`）正是 node 型。裁決是「node 型走一份只放寬這一項的 root-owned
+# 模板 unit，原生執行檔型維持嚴格」。
+#
+# **剖面的選擇不可由 job 決定**，否則整個設計退化成「全域移除 MDWE」。守法：
+#
+#   1. 唯一的輸入是 **executor**，而 executor 是 Manager 的 dispatch 決定
+#      （`SubprocessLauncher(executor=...)`，在 job spec 產生之前就固定了）；
+#   2. 對應表在下方**列舉且封閉**，未知 executor **fail-closed**（不落到寬鬆那份）；
+#   3. job spec 結構性禁止攜帶任何剖面欄位（見 :data:`SPEC_FORBIDDEN_KEYS`，
+#      寫端 `build_job_spec()` 與讀端 `job_shim.load_spec()` 各掃一次）；
+#   4. 兩份 unit 都是 root-owned、`User=`／`ExecStart=` 寫死，polkit 的 unit pattern
+#      只列舉這兩個字幹——呼叫端選得了「哪一份模板」，但兩份都選不出 UID 或命令列。
+#
+# 下面三個常數與 `trust_root.permgen` 的 `HARDENING_PROFILES`／
+# `EXECUTOR_HARDENING_PROFILE` 是**成對契約**（與 `DEFAULT_TEMPLATE_UNIT` 同一個
+# 理由：job_runner 刻意不 import permgen，讓派工熱路徑不必拖進整個 trust_root
+# 子套件），由 `tests/test_trust_root_hardening_profile_643.py` 釘住兩邊逐字相等。
+# permgen 那一份才是真相來源：它由 `EXECUTOR_TOOLS.needs_node` 機械導出。
+# ---------------------------------------------------------------------------
+
+HARDENING_PROFILE_STRICT = "strict"
+HARDENING_PROFILE_JIT = "jit"
+
+#: 剖面 → 模板字幹後綴。strict 為空字串，因此 `cortex-job@.service` 逐字不變。
+TEMPLATE_UNIT_SUFFIX_BY_PROFILE: Mapping[str, str] = MappingProxyType(
+    {HARDENING_PROFILE_STRICT: "", HARDENING_PROFILE_JIT: "-jit"}
+)
+
+#: executor → 剖面。**封閉列舉**：這裡沒有 fallback、沒有預設值、沒有 `.get(x, jit)`。
+#: `cg` 刻意不在表內——它只支援 read-only／review-only，而降權啟動器只服務 builder
+#: persona（`launcher._downgraded_mode` 對 review_only／read_only 回 None），因此它
+#: 走不到這裡；真的走到了就代表有人改壞了 persona 分支，那時 fail-closed 才是對的。
+EXECUTOR_HARDENING_PROFILE: Mapping[str, str] = MappingProxyType(
+    {
+        "codex": HARDENING_PROFILE_JIT,
+        "copilot": HARDENING_PROFILE_JIT,
+        "claude": HARDENING_PROFILE_STRICT,
+        "agy": HARDENING_PROFILE_STRICT,
+    }
+)
 
 #: Manager-owned 的 per-job spec spool（登記表資產 `job-spec-spool`）。
 JOB_SPEC_SPOOL_ENV = "PSC_JOB_SPEC_SPOOL"
@@ -257,10 +314,29 @@ SPEC_REQUIRED_KEYS: tuple[str, ...] = (
     "env",
 )
 
-#: spec **絕不可**出現的欄位——身分只有一個來源：root-owned unit 檔的 `User=`。
-#: 這是 B 案全部價值的所在，因此在寫端與讀端各擋一次。
+#: spec **絕不可**出現的欄位。兩族，同一條原則：
+#:
+#: 1. **身分**（`user`／`uid`／…）——身分只有一個來源：root-owned unit 檔的 `User=`。
+#:    這是 B 案全部價值的所在。
+#: 2. **加固剖面**（`hardening_profile`／`template`／…，#643）——剖面只有一個來源：
+#:    executor（Manager 的 dispatch 決定）。spec 是 Manager→shim 的**參數**通道；
+#:    讓它承載剖面等於把「用哪一份 unit」變成一個可寫進 spec 的輸入，而那正是
+#:    「per-executor 剖面」退化成「全域移除 MDWE」的路徑。
+#:
+#: 兩族都在寫端（`build_job_spec`）與讀端（`job_shim.load_spec`）各擋一次。
+#:
+#: 註：`unit` 仍是必要欄位（`SPEC_REQUIRED_KEYS`），而它的值確實隱含剖面——但它是
+#: 決定的**紀錄**，不是決定的**輸入**：shim 執行時降權與加固都已由 systemd 套用完畢，
+#: shim 只拿它與自己的 instance 交叉核對，改它不會改變任何已生效的加固面。
 SPEC_FORBIDDEN_KEYS: frozenset[str] = frozenset(
-    {"user", "group", "uid", "gid", "User", "Group", "properties", "exec_start"}
+    {
+        # 身分族
+        "user", "group", "uid", "gid", "User", "Group", "properties", "exec_start",
+        # 剖面族（#643）
+        "hardening", "hardening_profile", "profile",
+        "template", "template_unit", "unit_suffix",
+        "MemoryDenyWriteExecute",
+    }
 )
 
 #: systemd unit 實例名允許的字元。systemd 本身還允許更多（`/` 需 escape），這裡
@@ -917,6 +993,78 @@ def template_unit_name(instance: str, *, template: str = DEFAULT_TEMPLATE_UNIT) 
     return f"{stem}{instance}{TEMPLATE_UNIT_SUFFIX}"
 
 
+def resolve_hardening_profile(executor: str) -> str:
+    """executor → 加固剖面 id。**未知 executor 一律 fail-closed。**
+
+    fail-closed 的方向是本函式的全部重點：這裡**不是**「不確定就給嚴格的」，而是
+    「不確定就拒絕」。
+
+    - 若預設落到**寬鬆**那份，整個 per-executor 設計當場退化成「全域移除 MDWE」——
+      任何未登記的名字都能拿到放寬的 unit。
+    - 若預設落到**嚴格**那份，一個未被盤點過的 node 型 CLI 會在真實加固面下靜默
+      起不來（症狀是空輸出，離原因很遠——#643 就是這樣被埋掉半個 milestone 的）。
+
+    因此唯一正確的行為是要求它先被登記進 `permgen.EXECUTOR_TOOLS`（並標明
+    `needs_node`），再同步到本檔的 :data:`EXECUTOR_HARDENING_PROFILE`。
+    """
+
+    name = str(executor or "").strip()
+    profile = EXECUTOR_HARDENING_PROFILE.get(name)
+    if profile is None:
+        raise _fail(
+            "job-runner-hardening-profile-unknown",
+            (
+                f"未知的 executor {executor!r}，無法決定加固剖面（已登記："
+                f"{sorted(EXECUTOR_HARDENING_PROFILE)}）。新增 executor 必須先進 "
+                "trust_root.permgen.EXECUTOR_TOOLS 標明 needs_node，再同步到 "
+                "job_runner.EXECUTOR_HARDENING_PROFILE——剖面不得靠猜，"
+                "更不得預設落到放寬的那一份。"
+            ),
+            source="resolve_hardening_profile",
+            executor=name,
+        )
+    return profile
+
+
+def template_unit_for_profile(template: str, profile: str) -> str:
+    """基底模板名 ＋ 剖面 → 該剖面的模板名（`cortex-job@.service` → `cortex-job-jit@.service`）。
+
+    `template` 必須是**基底**（strict）名。config（`PSC_JOB_TEMPLATE_UNIT`）若已經被
+    設成某個剖面的名字，這裡 fail-closed 而不是再疊一層後綴——`cortex-job-jit-jit@`
+    這種名字會被 polkit 拒掉，而那時的錯誤訊息（Access denied）指不出真正的原因。
+    """
+
+    if not template.endswith(f"@{TEMPLATE_UNIT_SUFFIX}"):
+        raise _fail(
+            "job-runner-template-unit-invalid",
+            f"{TEMPLATE_UNIT_ENV} 必須是 `<name>@{TEMPLATE_UNIT_SUFFIX}` 形狀，收到 {template!r}",
+            source="template_unit_for_profile",
+            requested=template,
+        )
+    suffix = TEMPLATE_UNIT_SUFFIX_BY_PROFILE.get(profile)
+    if suffix is None:
+        raise _fail(
+            "job-runner-hardening-profile-unknown",
+            f"未知的加固剖面 {profile!r}（已登記：{sorted(TEMPLATE_UNIT_SUFFIX_BY_PROFILE)}）",
+            source="template_unit_for_profile",
+            requested=str(profile),
+        )
+    stem = template[: -len(f"@{TEMPLATE_UNIT_SUFFIX}")]
+    for known in TEMPLATE_UNIT_SUFFIX_BY_PROFILE.values():
+        if known and stem.endswith(known):
+            raise _fail(
+                "job-runner-template-unit-invalid",
+                (
+                    f"{TEMPLATE_UNIT_ENV} 必須是**基底**模板名（strict 剖面），"
+                    f"收到已帶剖面後綴的 {template!r}；剖面由 executor 決定並在此處"
+                    "自動套用，不該由 config 預先寫死。"
+                ),
+                source="template_unit_for_profile",
+                requested=template,
+            )
+    return f"{stem}{suffix}@{TEMPLATE_UNIT_SUFFIX}"
+
+
 def resolve_template_unit(env: Mapping[str, str]) -> str:
     return (env.get(TEMPLATE_UNIT_ENV) or "").strip() or DEFAULT_TEMPLATE_UNIT
 
@@ -933,6 +1081,18 @@ def job_spec_path(spool_dir: str, instance: str) -> str:
     """`<spool>/<instance>.json`——與 `job_shim.resolve_spec_path()` 同一條推導。"""
 
     return f"{spool_dir.rstrip('/')}/{instance}.json"
+
+
+def forbidden_spec_keys(spec: Mapping[str, object]) -> list[str]:
+    """spec 內出現的 :data:`SPEC_FORBIDDEN_KEYS`（排序後）。空 list＝乾淨。
+
+    **寫端（`build_job_spec`）與讀端（`job_shim.load_spec`）呼叫的是這同一支**，
+    兩邊只在「raise 哪一種例外」上不同。抽出來不是為了少寫一行，而是為了讓「兩端
+    掃的是同一份判準」成為結構事實而非約定——這條在 #643 之後承載的東西更多了
+    （不只身分，還有加固剖面）。
+    """
+
+    return sorted(key for key in SPEC_FORBIDDEN_KEYS if key in spec)
 
 
 def build_job_spec(
@@ -980,11 +1140,12 @@ def build_job_spec(
         "log_path": str(log_path),
         "env": {str(k): str(v) for k, v in sorted(env.items())},
     }
-    leaked = sorted(SPEC_FORBIDDEN_KEYS & set(spec))
+    leaked = forbidden_spec_keys(spec)
     if leaked:
         raise _fail(
             "job-runner-job-spec-invalid",
-            f"spec 不得攜帶身分／特權欄位 {leaked}——身分只由 root-owned unit 的 User= 決定",
+            f"spec 不得攜帶身分／加固剖面欄位 {leaked}——身分只由 root-owned unit 的 "
+            "User= 決定，剖面只由 executor 決定（#643）",
             source="build_job_spec",
             instance=instance,
         )
@@ -1201,27 +1362,40 @@ class SystemdTemplatePlan:
     shim: str
     spool_dir: str
     spec_path: str
+    #: 生效的加固剖面 id（#643）。由 `executor` 決定，不由 job 決定。
+    hardening_profile: str = HARDENING_PROFILE_STRICT
+    #: 決定剖面的 executor（Manager 的 dispatch 決定）。留在 plan 上供診斷／稽核。
+    executor: str = ""
+    #: config 給的**基底**模板名（未套剖面後綴前）。
+    base_template_unit: str = DEFAULT_TEMPLATE_UNIT
 
 
 def prepare_systemd_template(
     env: Mapping[str, str],
     *,
     job_id: str,
+    executor: str,
     unit_active: Callable[[str, str], bool] | None = None,
 ) -> SystemdTemplatePlan:
-    """模板派工的前置：解析 config、靜態 preflight、算 instance／unit／spec 路徑，
-    並確認**同名 instance 沒有正在跑**。
+    """模板派工的前置：解析 config、決定加固剖面、靜態 preflight、算 instance／unit／
+    spec 路徑，並確認**同名 instance 沒有正在跑**。
 
     最後一條特別重要：`systemctl start` 對一個**已經 active** 的 unit 會直接回 0，
     什麼都不做。少了這個檢查，Manager 會以為自己起了一個 job，實際上是掛在別人的
     unit 上等——而且 `--wait` 會一路等到那個別人的 job 結束。
+
+    `executor` 是**必填且無預設**（#643）：剖面選擇的唯一輸入就是它，而它是 Manager
+    的 dispatch 決定。給預設值等於允許某條路徑「忘了說是哪個 executor」還能派出去，
+    那個預設值不論指向哪一份剖面都是錯的（見 :func:`resolve_hardening_profile`）。
 
     **在任何副作用之前呼叫**：這裡每一個 raise 都代表本次派工不該發生。
     """
 
     account = resolve_builder_account(env)
     group = resolve_builder_group(env)
-    template = resolve_template_unit(env)
+    base_template = resolve_template_unit(env)
+    profile = resolve_hardening_profile(executor)
+    template = template_unit_for_profile(base_template, profile)
     shim = resolve_job_shim(env)
     spool_dir = resolve_job_spec_spool(env)
     binary = preflight_systemd_template(
@@ -1255,6 +1429,9 @@ def prepare_systemd_template(
         shim=shim,
         spool_dir=spool_dir,
         spec_path=job_spec_path(spool_dir, instance),
+        hardening_profile=profile,
+        executor=str(executor or "").strip(),
+        base_template_unit=base_template,
     )
 
 

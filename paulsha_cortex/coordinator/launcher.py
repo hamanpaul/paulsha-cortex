@@ -1299,7 +1299,16 @@ class SubprocessLauncher:
         elif runner_mode == job_runner.RUNNER_SYSTEMD_TEMPLATE:
             # B 案（0816 第三輪裁決）：模板 unit／shim／spec spool 三個前置物任一
             # 缺席都在這裡 fail-closed，且**在寫任何 spec 之前**。
-            template_plan = job_runner.prepare_systemd_template(os.environ, job_id=slice_id)
+            #
+            # #643：加固剖面在這裡定案。唯一的輸入是 `self._executor`——它由
+            # `SubprocessLauncher.__init__` 收下（Manager 的 dispatch 決定，且已對
+            # `_ARGV_BUILDERS` 驗過），此後 immutable。**job 影響不到它**：prompt、
+            # worktree 內容、spec 都在這行之後才產生，而 spec 連提剖面都不准
+            # （`job_runner.SPEC_FORBIDDEN_KEYS`）。未登記的 executor 在這裡
+            # fail-closed，不會落到放寬的那一份剖面。
+            template_plan = job_runner.prepare_systemd_template(
+                os.environ, job_id=slice_id, executor=self._executor
+            )
         degraded = runner_mode is not None
         resolved_worktree = Path(worktree).resolve(strict=True)
         if not resolved_worktree.is_dir():

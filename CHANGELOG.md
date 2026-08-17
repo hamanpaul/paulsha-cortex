@@ -8,6 +8,45 @@
 ## [Unreleased]
 
 ### Added
+- **#643 / trust-root Phase 2b：per-executor 加固剖面——`MemoryDenyWriteExecute` 與
+  node 型 executor 的互斥，只讓需要的那一類付代價**——#640／#642 落地後做實機驗證時
+  測出來的：**加固面本身與 toolchain 相衝**，不是安裝沒裝好。以 `cortex-builder` 身分
+  在真實加固面下逐項隔離（`systemd-run` 一次只加一個 property）：無加固時 `node` 正常、
+  `+MemoryDenyWriteExecute=yes` 時 V8 直接崩在 `v8::internal::Runtime_CompileLazy`，
+  其餘每一項（`ProtectSystem=strict`／`PrivateTmp`／`RestrictNamespaces`／
+  `SystemCallFilter=@system-service` ＋ `SystemCallErrorNumber=EPERM`）單獨加上去
+  `node` 都正常——**唯一的阻斷點就是它**（V8 的 JIT 必須有 W+X 記憶體）。影響面是四個
+  executor 掛掉兩個（`codex` node script、`copilot` shell → node 皆空輸出；`claude`／
+  `agy` 原生 ELF 正常），而預設的 `PSC_MANAGER_EXECUTOR=codex` 正是掛掉那一個。
+  operator 裁決走**方向 2（per-executor 剖面）**：
+  - **兩份 job 模板 unit，共用同一張 `_HARDENING` 表**：`cortex-job@.service`
+    （`strict`，完整 27 項，給原生 ELF）與 `cortex-job-jit@.service`（`jit`，給 node
+    型）。兩份**不是**複製貼上的兩段加固——`permgen.HARDENING_PROFILES` 只帶
+    `overrides`，`_hardening_lines()` 現場套用，日後往加固表加一項時兩份自動同時拿到。
+    分岔面由 `permgen.PROFILE_DIVERGENCE_KEYS`（目前＝`{MemoryDenyWriteExecute}`）框住，
+    覆寫不存在的鍵或白名單以外的鍵在 **import 時**即 `ValueError`。
+  - **剖面由 executor 決定，且 job 選不到**（做不到就退化成「全域移除 MDWE」）。四道
+    守法：對應表由既有的 `permgen.EXECUTOR_TOOLS` 的 `needs_node` **機械導出**（不另立
+    第二張清單）；唯一輸入是 `executor`，而它是 Manager 的 dispatch 決定，
+    `prepare_systemd_template()` 的 `executor` 參數**必填無預設**；job spec 結構性禁止
+    攜帶剖面欄位（`hardening_profile`／`profile`／`template`／`template_unit`／
+    `unit_suffix`／`MemoryDenyWriteExecute` 全進 `SPEC_FORBIDDEN_KEYS`，與「身分欄位
+    不入 spec」同一條原則，寫端與讀端各掃一次且掃的是同一支 `forbidden_spec_keys()`）；
+    `PSC_JOB_TEMPLATE_UNIT` 只接受**基底**模板名，帶剖面後綴的值一律拒。
+  - **未知 executor fail-closed**：`resolve_hardening_profile()` 不回傳任何剖面——不是
+    「不確定就給嚴格的」（那會讓未盤點的 node 型 CLI 靜默起不來，症狀是空輸出，
+    #643 本身就是這樣被埋掉的），更不是「不確定就給寬鬆的」（那等於沒做）。
+  - **polkit 維持一條規則、一個 YES 出口**：unit pattern 的字幹段改為列舉的交替
+    （`^(?:cortex-job|cortex-job-jit)@[a-z0-9][a-z0-9._-]{0,62}\.service$`），由
+    `HARDENING_PROFILES` 機械導出。放行面從「一個具名模板」變成「兩個具名模板」，
+    **不是**「任意 unit」；5-7 的反向測試（transient 五形式、名稱前後綴混淆）對新字幹
+    逐條同樣成立，另補圍繞 `-jit` 的十種混淆形式。
+  新增 `tests/test_trust_root_hardening_profile_643.py`（40 測試，其中 2 條在無 root／
+  無 systemd 的環境明確 skip 並附理由）。詳見
+  `changelog.d/per-executor-hardening.md`。
+- **`trust_root unit --job --profile strict|jit` CLI 旗標**：剖面只對 job 模板有意義，
+  用在 `--manager`／`--monitor` 上直接拒絕（靜默忽略會產出與旗標不符的內容）。
+  `trust_root toolchain` 的輸出也逐支列出該 executor 的剖面與對應 unit 名。
 - **#640 / trust-root Phase 2b：真實 dispatch 的最後一哩——executor toolchain 與
   per-account 憑證進登記表**——#623 那一族的第五個缺口，且比前四個都靠後：前四個解完
   之後，dispatch 會一路走到**呼叫模型**那一步才失敗。job unit 帶 `ProtectHome=yes`，
@@ -147,7 +186,9 @@
   `PSC_JOB_RUNNER=systemd-template` 下跑那條 lane，須先把工作區改成 per-job。
   **附帶**：`permgen.build_job_unit()` 把 `CollectMode=inactive-or-failed` 由 `[Service]`
   搬到 `[Unit]`——放錯段只被 systemd 忽略（`Unknown key name … ignoring.`），
-  「失敗的 instance 自動回收」的用意因此沒生效。
+  「失敗的 instance 自動回收」的用意因此沒生效。（#643 在 runbook 第 5-2 步補上落檔後的
+  `systemd-analyze verify | grep -i "unknown key"` 檢查與 `reset-failed` 清理，讓舊部署
+  的殘骸被看見；產生器側的修正已由本條完成，#643 不重複。）
 - **#641 / trust-root：`repo-worktree` 仍授 Manager 唯讀 ACL——交換面已改 bundle，
   這條授權沒有消費者，卻讓 #637 的不變式在實機上不成立**——#637 把成果回收換成
   bundle ＋ append-only spool 並加了「Manager 全程不碰 builder 的 clone」不變式測試，
@@ -366,6 +407,31 @@
   `mock.patch.object` 打不到，測試實際驗到的是「本機有沒有那個帳號」而非它宣稱的分支。
 
 ### Changed
+- **#643 / `permgen.EXECUTOR_TOOLS` 的 `copilot.needs_node` 由 `False` 改為 `True`**
+  ——#640 落表時只知道它是 shell script、還沒查它內部 exec 什麼（表上的 note 當時就
+  寫著「安裝時務必 `head -n 20` 查一次」）。#643 在真實加固面下量到 `copilot
+  --version` 在 `MemoryDenyWriteExecute=yes` 下**空輸出**、拿掉即正常，與 `codex` 的
+  症狀逐字相同——它內部 exec 的就是 node。因此「系統層 node 的版本風險只涵蓋 `codex`
+  一個」在 spec／runbook／表註解三處同步改為**涵蓋 `codex` 與 `copilot` 兩個**。把量
+  到的事實回填既有那張表，而不是為剖面另開一張。
+- **#643 / spec §R3 新增「per-executor 加固剖面」段並明載誠實的取捨**：走 `jit` 剖面
+  的 job **失去 `MemoryDenyWriteExecute` 這一層**（取得任意程式碼執行的攻擊者可在該
+  job 自己的位址空間內配置 W+X 記憶體，JIT 型 shellcode 在此可行）。**沒有失去的部分
+  同樣寫明**：其餘 26 項逐項不變，`User=` 一樣寫死在 root-owned unit 檔裡——W+X 只讓
+  攻擊者在自己這個 UID 內執行程式碼，跨 UID／跨檔案系統／提權那幾層完全沒有鬆動，而
+  §R2／§R3 保護的 Tier-0／Tier-1 資產靠的正是後者。**換到的是**保住 `codex`／
+  `copilot` 兩個 provider，即 §R5／§R8 的 `independence_domain` 仍有可選空間。spec 因此
+  **明文禁止**把本系統敘述成「所有 job 都有完整加固」，準確敘述是「原生 ELF executor
+  的 job 有 27 項；node 型的有 26 項，少的那一項是 `MemoryDenyWriteExecute`」，風險表
+  補兩列（被讀成完整加固／剖面被改成可由呼叫端選擇），並明載退出條件（node 型能在無
+  W+X 下執行時 `jit` 剖面 SHALL 被移除，而非長期保留）。
+- **#643 / Phase 2b runbook**：第 5-2 步改為落**兩份** unit（含「兩份差異必須恰好
+  兩行」的落檔前 gate 與 `systemd-analyze verify` 未知鍵檢查），新增第 5-2b 步「在
+  **真實加固面下**驗證兩種剖面」——形態比照 #640 第 4e 步且**含負向對照**（node 型
+  executor 在 `strict` 剖面下**必須失敗**；只驗寬鬆環境的 `--version` 會整個溜過去，
+  只驗 `jit` 成功也證明不了剖面分岔是必要的）。5-7 新增第 12 條（config 選不了剖面／
+  未知 executor fail-closed／spec 帶剖面欄位被讀端拒），並讓 (5)(7)(8)(9)(10) 對兩個
+  字幹各跑一次 → 合計 **50** 個 sudo 點、**184** 個驗證點。
 - **#640 / job 的 `PATH` 沿用既有的 `PSC_BUILDER_PATH`，並由「選配」改為「必填」**
   ——`PathLayout.job_path_value()` 給出正規值（`<toolchain>/bin` **排最前面**，尾段是
   系統層，不含任何 `sbin`）。**刻意不在模板 unit 裡寫 `Environment=PATH=`**：模板

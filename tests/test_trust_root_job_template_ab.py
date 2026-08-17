@@ -283,7 +283,10 @@ class PolkitPlanBTests(unittest.TestCase):
 
     def test_unit_pattern_is_the_template_instance_shape(self) -> None:
         rule = self._rule()
-        self.assertTrue(rule.unit_pattern.startswith("^cortex-job@"))
+        # #643：pattern 改成「每個加固剖面一個字幹」的列舉交替，因此不再是單一
+        # 字面前綴；語意（放行 strict 模板的實例）逐字不變。
+        self.assertTrue(rule.unit_pattern.startswith("^"))
+        self.assertTrue(rule.unit_pattern.endswith(r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"))
         self.assertEqual(
             permgen.evaluate_polkit(
                 rule,
@@ -430,7 +433,16 @@ class M2ExtensionPointTests(unittest.TestCase):
         rule = permgen.build_polkit_rule(
             scheme, plan=permgen.PolkitPlan.TEMPLATE, principal=Principal.REVIEWER
         )
-        self.assertTrue(rule.unit_pattern.startswith("^cortex-reviewer-job@"))
+        self.assertEqual(
+            permgen.evaluate_polkit(
+                rule,
+                user=rule.subject_account,
+                action_id=permgen.POLKIT_ACTION,
+                unit="cortex-reviewer-job@x.service",
+                verb="start",
+            ),
+            "YES",
+        )
         self.assertEqual(rule.target_account, "cortex-reviewer-planner")
         # builder 的規則不放行 reviewer 的模板實例，反之亦然。
         builder_rule = permgen.build_polkit_rule(scheme, plan=permgen.PolkitPlan.TEMPLATE)
@@ -660,7 +672,8 @@ class JobSpecContentTests(unittest.TestCase):
         # 它包住的才是那條封閉的 systemctl client argv。
         argv = _unwrap_exit_recorder(popen.call["argv"])
         self.assertEqual(argv[:4], ["/usr/bin/systemctl", "start", "--wait", "--no-ask-password"])
-        self.assertTrue(argv[4].startswith("cortex-job@"))
+        # #643：`codex` 是 node 型 ⇒ jit 剖面的模板（`cortex-job-jit@`）。
+        self.assertTrue(argv[4].startswith("cortex-job-jit@"), argv[4])
         self.assertTrue(argv[4].endswith(".service"))
         self.assertEqual(popen.call["cwd"], None)
         self.assertEqual(popen.call["stdin"], subprocess.DEVNULL)
@@ -699,7 +712,15 @@ class JobSpecContentTests(unittest.TestCase):
         self.assertEqual(spec["log_path"], ctx["log_path"])
         self.assertEqual(spec["env"]["PATH"], _BASE_ENV["PATH"])
         self.assertEqual(spec["env"]["PSC_JOB_ID"], "psc-0042-template")
-        self.assertEqual(spec["unit"], job_runner.template_unit_name(spec["instance"]))
+        self.assertEqual(
+            spec["unit"],
+            job_runner.template_unit_name(
+                spec["instance"],
+                template=job_runner.template_unit_for_profile(
+                    job_runner.DEFAULT_TEMPLATE_UNIT, job_runner.HARDENING_PROFILE_JIT
+                ),
+            ),
+        )
 
     def test_spec_uses_bash_c_not_login_shell(self) -> None:
         """#588 第 2 點：降權模式一律 `bash -c`（login shell 會重新匯入 ~/.profile）。"""

@@ -71,8 +71,10 @@ principal 時再犯同一個錯」——新 principal 只要沒進對應表，�
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from types import MappingProxyType
 from typing import Mapping
 
 from . import registry
@@ -428,14 +430,25 @@ class ExecutorTool:
     name: str
     shape: ExecutorShape
     #: 需要**系統層** runtime 才跑得起來（目前只有 node）。
+    #:
+    #: **這個欄位同時是加固剖面的分類來源**（#643）：node ⇒ V8 ⇒ JIT ⇒ 需要 W+X
+    #: 記憶體 ⇒ `MemoryDenyWriteExecute=yes` 下起不來。剖面由
+    #: :func:`executor_hardening_profile` 機械導出，**不另立第二張清單**。
     needs_node: bool
     #: 必須連同整包目錄複製（npm 套件樹），而不是單一檔案。
     copy_tree: bool
     note: str
 
 
-#: 0817 實機盤點的四個 executor。`needs_node` 為真者只有 `codex`——這正是「系統層
-#: node 的版本風險只涵蓋一個 CLI」這句話的機器可讀形式。
+#: 0817 實機盤點的四個 executor。`needs_node` 為真者是 `codex` 與 `copilot`——
+#: 這是「系統層 node 的版本風險涵蓋哪幾個 CLI」與「哪幾個 job 必須走放寬 W+X 的
+#: 加固剖面」（#643）兩句話共同的機器可讀形式。
+#:
+#: **`copilot` 的 `needs_node` 於 #643 由 False 改為 True**：#640 落表時只知道它是
+#: shell script、還沒查它內部 exec 什麼（表上的 note 當時就寫著「安裝時務必
+#: `head -n 20` 查一次」）。#643 在真實加固面下逐項隔離量到 `copilot --version` 在
+#: `MemoryDenyWriteExecute=yes` 下**空輸出**、拿掉即正常，與 `codex` 的症狀逐字相同
+#: ——它內部 exec 的就是 node。把量到的事實回填到既有那張表，而不是為剖面另開一張。
 EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ExecutorTool(
         "codex", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
@@ -451,11 +464,13 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
         note="自帶原生執行檔，**不因 node 版本而行為改變**——node 的版本風險不涵蓋它。",
     ),
     ExecutorTool(
-        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=False, copy_tree=False,
+        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=False,
         note=(
-            "shell script。腳本內部**可能再叫別的程式**（另一支 CLI、另一個 runtime），"
-            "安裝時務必 `head -n 20` 查一次它實際 exec 什麼，該相依同樣要在 job 的 "
-            "PATH 上或一併搬進 toolchain。"
+            "shell script，但**內部再 exec node**（#643 實機量測確認：完整加固面下 "
+            "`--version` 空輸出，單獨拿掉 `MemoryDenyWriteExecute` 即正常，與 codex "
+            "的症狀逐字相同）。因此它同樣吃系統層 node 的版本風險，加固剖面也與 "
+            "`codex` 同一份。安裝時仍應 `head -n 20` 查一次它實際 exec 什麼——它可能"
+            "再叫別的程式，該相依同樣要在 job 的 PATH 上或一併搬進 toolchain。"
         ),
     ),
     ExecutorTool(
@@ -1995,7 +2010,8 @@ _HARDENING: tuple[tuple[str, str, str], ...] = (
     ("LockPersonality", "yes", "鎖定執行域，禁止切換 personality 規避 seccomp。"),
     ("MemoryDenyWriteExecute", "yes",
      "禁 W+X 記憶體，封 JIT 型 shellcode。※ 若 Python C-extension（ctypes "
-     "trampoline）啟動失敗，這是第一嫌疑：先單獨註解本行複測。"),
+     "trampoline）或任何 JS runtime 啟動失敗，這是第一嫌疑：先單獨註解本行複測"
+     "（#643 實測 V8 的 Runtime_CompileLazy 會直接崩）。"),
     ("SystemCallArchitectures", "native",
      "只允許原生 ABI，封掉經 32-bit compat 介面規避 seccomp。"),
     ("SystemCallFilter", "@system-service",
@@ -2009,9 +2025,173 @@ _HARDENING: tuple[tuple[str, str, str], ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# per-executor 加固剖面（#643，operator 裁決＝方向 2）
+#
+# 問題：`MemoryDenyWriteExecute=yes` 與 JS runtime 天生互斥（V8 的 JIT 必須 W+X），
+# 而預設 executor 正是 node 型的 `codex`。三個方向裡 operator 選了「per-executor 剖面」
+# ——node 型 job 走一份**只在這一項**放寬的 unit，原生執行檔型維持嚴格。
+#
+# 這個設計成立的前提只有一條：**剖面不可由 job 自選**。若 job 能選到寬鬆那份，
+# 它就退化成「全域移除 MDWE」。守法（三層，缺一即退化）：
+#
+#   1. 剖面由 **executor** 決定，而 executor 是 Manager 的 dispatch 決定
+#      （`SubprocessLauncher(executor=...)`，job spec 產生之前就固定了）；
+#   2. 對應表由 :data:`EXECUTOR_TOOLS` 的 `needs_node` **機械導出**，未知 executor
+#      fail-closed（見 :func:`executor_hardening_profile`）——不得預設落到寬鬆那份；
+#   3. 兩份 unit 都是 root-owned、`User=`／`ExecStart=` 寫死；呼叫端只能
+#      `systemctl start <那兩個名字之一>@<id>.service`，選不了執行的第一支程式，
+#      也塞不進任何屬性（polkit 規則的 unit pattern 只列舉這兩個字幹）。
+#
+# **兩份 unit 共用同一張 `_HARDENING` 表**，只以 `overrides` 分岔：日後往加固表加一
+# 項時兩份自動同時拿到，不存在「改一份忘另一份」。
+# ---------------------------------------------------------------------------
+
+#: 加固表中**唯一**允許被剖面分岔的鍵。寫成常數而非散在各處：想放寬第二項就必須改
+#: 這裡，而這裡同時是測試的比對基準——「順手多放寬一項」不會靜默通過。
+PROFILE_DIVERGENCE_KEYS: frozenset[str] = frozenset({"MemoryDenyWriteExecute"})
+
+
+class UnknownExecutorProfileError(ValueError):
+    """未知 executor 的剖面查詢——**fail-closed**，絕不落到寬鬆那份。"""
+
+
+@dataclass(frozen=True)
+class HardeningProfile:
+    """job 模板 unit 的加固剖面（`_HARDENING` ＋ 一組受限覆寫）。"""
+
+    profile_id: str
+    #: unit 字幹的後綴。strict＝空字串，因此既有的 `cortex-job@.service` 逐字不變。
+    unit_suffix: str
+    #: 對 `_HARDENING` 的覆寫。鍵必須同時屬於 `_HARDENING` 與 `PROFILE_DIVERGENCE_KEYS`
+    #: （import 時由 `_validate_hardening_profiles()` 強制，打錯字不會靜默變成 no-op）。
+    overrides: Mapping[str, str]
+    #: 這份剖面為誰而設、為什麼。
+    rationale: str
+    #: 這份剖面**放棄**的防護。誠實標註：產物、spec 與 runbook 都引用它。
+    accepted_loss: tuple[str, ...] = ()
+
+    def effective(self) -> dict[str, str]:
+        """本剖面實際生效的加固表（鍵集合與 `_HARDENING` 恆等）。"""
+
+        table = {key: value for key, value, _why in _HARDENING}
+        table.update(self.overrides)
+        return table
+
+
+#: 嚴格剖面（**預設**）：完整加固表，一項不減。原生執行檔型 executor
+#: （`claude`／`agy`）在此剖面下實測全部可用，因此它們沒有理由降級。
+STRICT_PROFILE = HardeningProfile(
+    profile_id="strict",
+    unit_suffix="",
+    overrides={},
+    rationale=(
+        "原生 ELF executor（不依賴 JS runtime）的 job。完整加固面，含 "
+        "MemoryDenyWriteExecute=yes。"
+    ),
+)
+
+#: 放寬剖面：**只**放寬 `MemoryDenyWriteExecute`，其餘 26 項逐字不變。
+JIT_PROFILE = HardeningProfile(
+    profile_id="jit",
+    unit_suffix="-jit",
+    overrides={"MemoryDenyWriteExecute": "no"},
+    rationale=(
+        "node 型 executor（`EXECUTOR_TOOLS` 的 `needs_node`）的 job。V8 的 JIT 必須有 "
+        "W+X 記憶體，MemoryDenyWriteExecute=yes 下 Runtime_CompileLazy 直接崩（#643 "
+        "實機量測）——這一項與 JS runtime 天生互斥，不是設定錯誤。"
+    ),
+    accepted_loss=(
+        "本剖面的 job **失去 MemoryDenyWriteExecute 這層防護**：取得任意程式碼執行的"
+        "攻擊者可在本 job 內配置 W+X 記憶體，JIT 型 shellcode（不落地、不經 exec、"
+        "因此也不觸發 NoNewPrivileges／SystemCallFilter 之外的任何一層）在此可行。",
+        "換來的是保住 codex／copilot 兩個 provider——即 §R5／§R8 的 independence_domain "
+        "仍有可選空間。這是**付了代價的取捨**，不是沒有代價。",
+        "其餘 26 項加固（NoNewPrivileges／CapabilityBoundingSet 空／ProtectSystem=strict"
+        "／SystemCallFilter 等）在本剖面下**逐項不變**：W+X 只讓攻擊者在自己這個 UID "
+        "的位址空間內執行程式碼，跨 UID／跨檔案系統／提權的那幾層完全沒有鬆動。",
+    ),
+)
+
+#: 全部剖面。polkit 的 unit pattern 與測試的比對基準都由這裡導出。
+HARDENING_PROFILES: tuple[HardeningProfile, ...] = (STRICT_PROFILE, JIT_PROFILE)
+HARDENING_PROFILES_BY_ID: Mapping[str, HardeningProfile] = MappingProxyType(
+    {profile.profile_id: profile for profile in HARDENING_PROFILES}
+)
+
+#: 未指定時一律用**嚴格**那份。「預設就是最安全的那一個」與 `DEFAULT_SCHEME` 同一條
+#: 原則：要放寬必須顯式打出來，打錯字不會靜默退回較寬鬆的剖面。
+DEFAULT_HARDENING_PROFILE: HardeningProfile = STRICT_PROFILE
+
+
+def _validate_hardening_profiles() -> None:
+    """import 時的結構檢查：覆寫鍵必須真的存在、且在允許分岔的白名單內。"""
+
+    known = {key for key, _value, _why in _HARDENING}
+    missing = sorted(PROFILE_DIVERGENCE_KEYS - known)
+    if missing:
+        raise ValueError(f"PROFILE_DIVERGENCE_KEYS 指到 _HARDENING 沒有的鍵: {missing}")
+    suffixes: set[str] = set()
+    for profile in HARDENING_PROFILES:
+        bad = sorted(set(profile.overrides) - known)
+        if bad:
+            raise ValueError(
+                f"剖面 {profile.profile_id} 覆寫了 _HARDENING 沒有的鍵 {bad}"
+                "——打錯字會變成一個看起來有效、實際毫無作用的覆寫。"
+            )
+        outside = sorted(set(profile.overrides) - PROFILE_DIVERGENCE_KEYS)
+        if outside:
+            raise ValueError(
+                f"剖面 {profile.profile_id} 覆寫了 PROFILE_DIVERGENCE_KEYS 以外的鍵 "
+                f"{outside}——擴大分岔面必須是顯式決定。"
+            )
+        if profile.unit_suffix and not re.fullmatch(r"-[a-z0-9]+", profile.unit_suffix):
+            # 字幹會被拼進 polkit 的 regex（原字串，不 escape），因此形狀必須受限。
+            raise ValueError(f"剖面 {profile.profile_id} 的 unit_suffix 形狀不合法")
+        if profile.unit_suffix in suffixes:
+            raise ValueError(f"剖面 unit_suffix 重複: {profile.unit_suffix!r}")
+        suffixes.add(profile.unit_suffix)
+
+
+_validate_hardening_profiles()
+
+
+#: executor → 剖面 id。**由 `EXECUTOR_TOOLS` 機械導出，不是第二張清單**：改 executor
+#: 的形態只改那張表一列，這裡跟著動。
+EXECUTOR_HARDENING_PROFILE: Mapping[str, str] = MappingProxyType(
+    {
+        tool.name: (JIT_PROFILE if tool.needs_node else STRICT_PROFILE).profile_id
+        for tool in EXECUTOR_TOOLS
+    }
+)
+
+
+def executor_hardening_profile(executor: str) -> HardeningProfile:
+    """executor 名 → 加固剖面。**未知 executor 一律拒絕，不回傳任何剖面。**
+
+    fail-closed 的方向很重要：這裡不是「不確定就給嚴格的」，而是「不確定就拒絕」。
+    給嚴格的表面上安全，實際會讓一個從未被盤點過的 node 型 CLI 在真實加固面下靜默
+    起不來（症狀是空輸出，離原因很遠——#643 就是這樣被埋掉的）；而如果反過來預設
+    給寬鬆的，整個 per-executor 設計當場退化成「全域移除 MDWE」。兩邊都不可接受，
+    因此唯一正確的行為是要求它先被登記進 :data:`EXECUTOR_TOOLS`。
+    """
+
+    name = str(executor or "").strip()
+    profile_id = EXECUTOR_HARDENING_PROFILE.get(name)
+    if profile_id is None:
+        raise UnknownExecutorProfileError(
+            f"未知的 executor {executor!r}，無法決定加固剖面"
+            f"（已登記：{sorted(EXECUTOR_HARDENING_PROFILE)}）。新增 executor 必須先進 "
+            "permgen.EXECUTOR_TOOLS 並標明 needs_node——剖面不得靠猜，也不得預設"
+            "落到放寬的那一份。"
+        )
+    return HARDENING_PROFILES_BY_ID[profile_id]
+
+
 def job_unit_stem(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     principal: Principal = Principal.BUILDER,
+    profile: HardeningProfile = DEFAULT_HARDENING_PROFILE,
 ) -> str:
     """降權 job 模板 unit 的字幹（不含 `@.service`）。
 
@@ -2021,11 +2201,15 @@ def job_unit_stem(
     只需傳入另一個 `principal`：unit 名、`User=`、`Environment=HOME=`／
     `XDG_CACHE_HOME=`、`ReadWritePaths=` 全部跟著 scheme 導出，`build_job_unit()`／
     `build_polkit_rule()`／`build_job_shim()` 三支產生器**一行都不必改**。
+
+    `profile` 是 **#643 的第二個擴充點**：加固剖面不同 ⇒ 必須是不同的 unit 檔
+    （加固指令寫在檔案裡，一個模板只有一份），因此字幹尾端掛剖面後綴。嚴格剖面的
+    後綴是空字串，`cortex-job@.service` 這個既有名字逐字不變。
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
     if principal is Principal.BUILDER:
-        return f"{layout.instance}-job"
-    return f"{layout.instance}-{principal.value}-job"
+        return f"{layout.instance}-job{profile.unit_suffix}"
+    return f"{layout.instance}-{principal.value}-job{profile.unit_suffix}"
 
 
 @dataclass(frozen=True)
@@ -2039,6 +2223,8 @@ class SystemdUnit:
     environment_file: str | None
     read_write_paths: tuple[str, ...]
     content: str
+    #: 生效的加固剖面 id（#643）。Manager／monitor unit 恆為 `strict`。
+    hardening_profile: str = DEFAULT_HARDENING_PROFILE.profile_id
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -2048,16 +2234,58 @@ class SystemdUnit:
             "exec_start": self.exec_start,
             "environment_file": self.environment_file,
             "read_write_paths": list(self.read_write_paths),
+            "hardening_profile": self.hardening_profile,
             "content": self.content,
         }
 
 
-def _hardening_lines(overrides: Mapping[str, str] | None = None) -> list[str]:
+def _wrap_comment(text: str, prefix: str = "# ", width: int = 78) -> list[str]:
+    """把一段（可能很長的）中文說明折成多行註解。
+
+    `textwrap` 只在空白處斷行，對中文等於不折——產出的 unit 會出現數百字元的單行
+    註解，`systemctl cat` 讀起來完全失去可審查性。這裡改以顯示寬度計（CJK 算 2），
+    可在任意字元處斷行。
+    """
+
     lines: list[str] = []
-    over = dict(overrides or {})
+    current: list[str] = []
+    used = len(prefix)
+    for char in text:
+        size = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        if used + size > width and current:
+            lines.append((prefix + "".join(current)).rstrip())
+            current = []
+            used = len(prefix)
+            if char == " ":
+                # 斷在空白處時不把它帶到下一行的行首。
+                continue
+        current.append(char)
+        used += size
+    if current:
+        lines.append((prefix + "".join(current)).rstrip())
+    return lines or [prefix.rstrip()]
+
+
+def _hardening_lines(
+    profile: HardeningProfile = DEFAULT_HARDENING_PROFILE,
+) -> list[str]:
+    """展開加固表。**所有 unit 都走這一支**，剖面只以 `overrides` 分岔。
+
+    刻意不接受任意 override mapping：唯一的合法覆寫來源是 :data:`HARDENING_PROFILES`
+    ——那張表已在 import 時驗過「鍵存在且在 `PROFILE_DIVERGENCE_KEYS` 內」。開一個
+    自由的 override 參數等於讓任何呼叫端就地放寬一項加固而不被任何檢查看到。
+    """
+
+    lines: list[str] = []
     for key, value, why in _HARDENING:
-        effective = over.get(key, value)
+        effective = profile.overrides.get(key, value)
         lines.append(f"# {why}")
+        if effective != value:
+            lines += _wrap_comment(
+                f"※ 剖面覆寫（profile={profile.profile_id}）：嚴格剖面為 "
+                f"{key}={value}，本剖面改為 {key}={effective}。**這是本檔與 "
+                f"strict 剖面唯一的差異**；理由與接受的代價見檔頭「加固剖面」段。"
+            )
         lines.append(f"{key}={effective}")
     return lines
 
@@ -2292,6 +2520,7 @@ def build_job_unit(
     layout: PathLayout = DEFAULT_LAYOUT,
     principal: Principal = Principal.BUILDER,
     plan: PermissionPlan | None = None,
+    profile: HardeningProfile = DEFAULT_HARDENING_PROFILE,
 ) -> SystemdUnit:
     """降權 job 的**模板** unit（`cortex-job@.service`）。
 
@@ -2311,6 +2540,12 @@ def build_job_unit(
     `<log_dir>/<slice>.jsonl`（`%i` 推不出來），兩者無法同時成立。因此 log 導引改由
     **shim 在已降權之後**依 spec 的 `log_path` 自行接管（見 `coordinator/job_shim.py`），
     unit 這層只留 journal 給 shim 讀 spec 失敗時的診斷。
+
+    **`profile`（#643）**：加固剖面。同一個 principal 會產出**兩份** unit——
+    `cortex-job@.service`（strict）與 `cortex-job-jit@.service`（jit）——兩份共用
+    同一張 `_HARDENING` 表，只在 `PROFILE_DIVERGENCE_KEYS` 那一項分岔。哪個 job 用
+    哪一份由 **executor** 決定（:func:`executor_hardening_profile`），而 executor 是
+    Manager 的 dispatch 決定；job 自己（spec 也好、worktree 內容也好）碰不到這個選擇。
     """
     plan = plan or generate_plan(scheme)
     account = scheme.resolve(principal)
@@ -2321,18 +2556,38 @@ def build_job_unit(
     job_layout = layout.with_job_segment("%i")
     extras = job_layout.job_extra_write_paths(account)
     owners = read_write_path_owners(plan, job_layout, account, extras)
-    unit_name = f"{job_unit_stem(layout, principal)}@.service"
+    stem = job_unit_stem(layout, principal, profile)
+    unit_name = f"{stem}@.service"
+    profile_users = sorted(
+        name
+        for name, profile_id in EXECUTOR_HARDENING_PROFILE.items()
+        if profile_id == profile.profile_id
+    )
 
     body = [
         f"# {'/etc/systemd/system/' + unit_name}",
-        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
-        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --job",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}, profile={profile.profile_id}）",
+        "# ——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --job"
+        + (f" --profile {profile.profile_id}" if profile is not DEFAULT_HARDENING_PROFILE else ""),
         "#",
         "# 降權/提權分界線：User= 在本 root-owned 檔內硬寫死。Manager（cortex-svc）",
-        "# 只能 `systemctl start cortex-job@<id>.service`，**不能**選 UID、不能傳屬性。",
+        f"# 只能 `systemctl start {stem}@<id>.service`，**不能**選 UID、不能傳屬性。",
+        "#",
+        f"# === 加固剖面：{profile.profile_id}（#643 per-executor 剖面）===",
+        f"# 適用 executor：{'、'.join(profile_users) if profile_users else '（無）'}",
+    ]
+    body += _wrap_comment(f"理由：{profile.rationale}")
+    for loss in profile.accepted_loss:
+        body += _wrap_comment(f"⚠ 本剖面接受的代價：{loss}")
+    body += [
+        "# 剖面**不由 job 決定**：對應表由 permgen.EXECUTOR_TOOLS 的 needs_node 機械",
+        "# 導出，executor 則是 Manager 的 dispatch 決定；job spec 結構性禁止攜帶任何",
+        "# 剖面欄位（job_runner.SPEC_FORBIDDEN_KEYS，寫端與讀端各擋一次）。",
         "",
         "[Unit]",
-        "Description=cortex headless job %i (downgraded, trust-root Phase 2b)",
+        "Description=cortex headless job %i (downgraded, trust-root Phase 2b, "
+        f"hardening={profile.profile_id})",
         f"After={layout.instance}-manager.service",
         "# job 為一次性：結束即回收 unit 狀態，不留可被重用的殘骸。",
         "# `CollectMode` 是 **[Unit] 的鍵**，不是 [Service] 的（#645 附帶修正）——放錯段",
@@ -2402,9 +2657,11 @@ def build_job_unit(
         f"Environment=HOME={job_layout.home_of(account)}",
         f"Environment=XDG_CACHE_HOME={job_layout.cache_of(account)}",
         "",
-        "# --- 加固（與 Manager 同一套；job 這側只多不少）---",
+        f"# --- 加固（與 Manager 同一張 _HARDENING 表；剖面={profile.profile_id}）---",
+        "# 兩份 job unit 共用這張表，只在下方以 ※ 標出的那一項分岔；",
+        "# 日後往表裡加一項，兩份 unit 會自動同時拿到。",
     ]
-    body += _hardening_lines()
+    body += _hardening_lines(profile)
     body += [""]
     body += _rwp_lines(owners)
     body += [
@@ -2426,6 +2683,7 @@ def build_job_unit(
         environment_file=None,
         read_write_paths=tuple(owners.keys()),
         content="\n".join(body) + "\n",
+        hardening_profile=profile.profile_id,
     )
 
 
@@ -2741,11 +2999,14 @@ def build_toolchain_plan(
         f" -m 0755 {layout.toolchain_lib}",
     ]
     for tool in EXECUTOR_TOOLS:
+        profile = executor_hardening_profile(tool.name)
         lines += [
             "",
             f"# --- {tool.name}（{tool.shape.value}"
             + ("；**需要系統層 node**" if tool.needs_node else "")
             + f"）---",
+            f"#   加固剖面：{profile.profile_id} ⇒ "
+            f"{job_unit_stem(layout, Principal.BUILDER, profile)}@<id>.service（#643）",
             f"#   {tool.note}",
             f'#   SRC="$(readlink -f "$(command -v {tool.name})")"   '
             "# operator 實際在用的那一份",
@@ -2854,17 +3115,39 @@ def transient_unit_prefix(layout: "PathLayout") -> str:
     return f"{layout.instance}-job-"
 
 
+def job_unit_stems(
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    principal: Principal = Principal.BUILDER,
+) -> tuple[str, ...]:
+    """該 principal 的**全部**模板字幹（每個加固剖面一個），依剖面表順序。"""
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    return tuple(job_unit_stem(layout, principal, p) for p in HARDENING_PROFILES)
+
+
 def job_unit_pattern(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     plan: PolkitPlan = PolkitPlan.TEMPLATE,
     principal: Principal = Principal.BUILDER,
 ) -> str:
-    """被授權的 unit 名 regex（錨定）。`principal` 是 M2 的第二實例化擴充點。"""
+    """被授權的 unit 名 regex（錨定）。`principal` 是 M2 的第二實例化擴充點。
+
+    **#643 起字幹是一個列舉的交替，不是萬用字元**：每個加固剖面各有一份 root-owned
+    模板檔，因此各有一個字幹（`cortex-job` / `cortex-job-jit`）。交替項由
+    :data:`HARDENING_PROFILES` 機械導出——新增剖面時 pattern 自動涵蓋它，而**放行面
+    仍然是「兩個具名的模板」，不是「任意 unit」**：前後都錨定，instance 段的字元類
+    未變，`^` 與 `@` 之間不允許任何未列舉的字幹。
+
+    刻意**不**用 `re.escape()`：產出的字串會原樣嵌進 polkit 的 JS regex 字面量，而
+    `re.escape` 會把 `-` escape 成 `\\-`（JS 的 unicode 模式視為錯誤）。字幹形狀改由
+    `_validate_hardening_profiles()` 與 `layout.instance` 的既有約束保證。
+    """
     layout = layout if layout is not None else DEFAULT_LAYOUT
     if plan is PolkitPlan.TRANSIENT:
         return r"^" + layout.instance + r"-job-[a-z0-9][a-z0-9._-]{0,62}\.service$"
-    stem = job_unit_stem(layout, principal)
-    return r"^" + stem + r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"
+    stems = job_unit_stems(layout, principal)
+    alternation = stems[0] if len(stems) == 1 else "(?:" + "|".join(stems) + ")"
+    return r"^" + alternation + r"@[a-z0-9][a-z0-9._-]{0,62}\.service$"
 
 
 def plan_residual_risk(plan: PolkitPlan, scheme: UidScheme) -> tuple[str, ...]:
@@ -2930,10 +3213,16 @@ def build_polkit_rule(
             f"//   python3 -m paulsha_cortex.trust_root polkit {scheme.scheme_id} --template\n"
         )
     else:
+        stems = job_unit_stems(layout, principal)
+        profile_lines = "".join(
+            f"//     - {job_unit_stem(layout, principal, p)}@<id>.service"
+            f"（剖面 {p.profile_id}：{'完整加固表' if not p.overrides else '、'.join(f'{k}={v}' for k, v in sorted(p.overrides.items())) + '，其餘逐項同 strict'}）\n"
+            for p in HARDENING_PROFILES
+        )
         headline = (
-            f"// 方案 B（root-owned 模板 unit）：{svc} 只能 start/stop\n"
-            f"//   {job_unit_stem(layout, principal)}@<id>.service 的實例。\n"
-            f"// 模板檔 /etc/systemd/system/{job_unit_stem(layout, principal)}@.service 由 root 擁有，\n"
+            f"// 方案 B（root-owned 模板 unit）：{svc} 只能 start/stop 下列**具名模板**的實例：\n"
+            + profile_lines
+            + f"// 兩份模板檔都在 /etc/systemd/system/ 由 root 擁有，\n"
             f"// 內容硬寫死 User={target}、NoNewPrivileges=yes、CapabilityBoundingSet=（空），\n"
             f"// 以及固定的 ExecStart={layout.job_shim} %i（root-owned shim）。\n"
             f"// per-job 參數走 Manager-owned spec spool（{layout.job_spec_spool_root}/<id>.json，\n"
@@ -2942,6 +3231,16 @@ def build_polkit_rule(
             + "\n".join(f"//     - {p}" for p in POLKIT_FORBIDDEN_PROPERTIES)
             + "\n"
             f"// 這些屬性全部只存在於 root-owned 的模板檔裡，呼叫端連提都提不了。\n"
+            f"//\n"
+            f"// ===== 為什麼有兩個字幹（#643 per-executor 加固剖面）=====\n"
+            f"// 加固指令寫在 unit 檔裡，一個模板只有一份 ⇒ 兩種剖面必然是兩個檔、兩個名字。\n"
+            f"// 上面的 pattern 因此是**列舉的交替**（{'、'.join(stems)}），\n"
+            f"// 不是萬用字元：`^` 與 `@` 之間不允許任何未列舉的字幹，instance 段的字元類\n"
+            f"// 一字未改。{svc} 選得了「哪一份模板」，但兩份都是 root-owned、User= 都寫死，\n"
+            f"// 兩份都不含任何可由呼叫端注入的東西——能選的只是「多一項或少一項加固」，\n"
+            f"// 而那一項（MemoryDenyWriteExecute）擋的是**本 job 自己位址空間內**的 W+X，\n"
+            f"// 不是跨 UID 的邊界。真正決定用哪一份的是 executor（Manager 的 dispatch\n"
+            f"// 決定），job 側完全碰不到。\n"
             f"//\n"
             f"// ===== 為什麼 transient unit 在本方案下一律拒 =====\n"
             f"// StartTransientUnit 的 polkit 檢查**不帶 unit 屬性明細**（規則只看得到\n"
@@ -3005,6 +3304,7 @@ def transient_unit_properties(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     principal: Principal = Principal.BUILDER,
     plan: PermissionPlan | None = None,
+    profile: HardeningProfile = DEFAULT_HARDENING_PROFILE,
 ) -> tuple[str, ...]:
     """A 方案的 `--property=` 建議清單（與 B 方案模板 unit 同源，機械產生）。
 
@@ -3018,7 +3318,8 @@ def transient_unit_properties(
     if account is None:
         raise ValueError(f"principal 未映射到帳號: {principal}")
     job_layout = layout.with_job_segment("%i")
-    props = [f"--property={key}={value}" for key, value, _why in _HARDENING]
+    effective = profile.effective()
+    props = [f"--property={key}={effective[key]}" for key, _value, _why in _HARDENING]
     for rwp in read_write_paths(
         plan, job_layout, account, job_layout.job_extra_write_paths(account)
     ):

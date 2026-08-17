@@ -550,10 +550,12 @@ $ sudo -u cortex-builder env HOME=<job HOME> codex exec --help
   「job 跑的是哪個版本的模型 CLI」**會**影響產出，因此它必須是一個可稽核的部署決定，
   而不是跟著 operator 的環境漂移。
 - 四者的實體形態不同，搬移方式不能一概而論（表固化於
-  `permgen.EXECUTOR_TOOLS`）：`codex` 是 `#!/usr/bin/env node` 的 node script（**唯一
-  硬需要 node**，且必須整包搬 npm 套件樹）；`claude`／`agy` 自帶原生執行檔；`copilot`
-  是 shell script（腳本內部可能再叫別的程式，安裝時 SHALL 查一次）。**因此系統層 node
-  的版本風險只涵蓋 `codex` 一個。**
+  `permgen.EXECUTOR_TOOLS`）：`codex` 是 `#!/usr/bin/env node` 的 node script（必須整包
+  搬 npm 套件樹）；`claude`／`agy` 自帶原生執行檔；`copilot` 是 shell script，而它**內部
+  再 exec node**（#640 落表時尚未查證，#643 在真實加固面下量到與 `codex` 逐字相同的
+  症狀後回填）。**因此系統層 node 的版本風險涵蓋 `codex` 與 `copilot` 兩個。**
+  同一個 `needs_node` 欄位也是 §R3 per-executor 加固剖面的分類來源——**一張表，兩個
+  用途**，不另立第二份清單。
 - job 的 `PATH` SHALL 由 Manager 端既有的 `PSC_BUILDER_PATH` 注入，且 toolchain
   SHALL 排在**最前面**——系統層可能另有一份同名但舊很多的 CLI，排在後面的症狀是
   「跑得起來但版本不是預期的那個」，比 `command not found` 難查得多。**MUST NOT**
@@ -658,7 +660,8 @@ provider 帳號下的兩個 job 在 provider 眼中是同一個主體，配額�
 
 - systemd unit SHALL 加上加固指令（至少 `NoNewPrivileges=yes`、
   `ProtectSystem=strict`、`ProtectHome` 與明列的 `ReadWritePaths`、`PrivateTmp=yes`）。
-  現況三個 unit **一項都沒有**。
+  現況三個 unit **一項都沒有**。加固表固化於 `permgen._HARDENING`（27 項，逐項附
+  「為何」註解）；job 模板 unit 的加固面另受 **per-executor 剖面**約束，見下節。
 - `EnvironmentFile=-` 的缺檔靜默容忍 SHALL 改為 fail-closed（缺檔即拒絕啟動），
   否則刪檔即是一條無聲的重導路徑。
 - `PSC_MANAGER_INSTALLER`、`PSC_REPLY_BRIDGE`、`PSC_DIGEST_DELIVERY_CMD` 三個
@@ -674,6 +677,96 @@ provider 帳號下的兩個 job 在 provider 眼中是同一個主體，配額�
 或把 `<instance>-manager.env` 的 `PSC_COORDINATOR_ROOT` 指到自己的目錄，再重啟
 服務，即可整套繞過。這是計畫第七輪 critical 修正的核心，也是路線 B 單獨無法解決
 的一族。
+
+#### per-executor 加固剖面（#643 裁決；`permgen.HARDENING_PROFILES`）
+
+**`MemoryDenyWriteExecute=yes` 與 JS runtime 天生互斥。** 實機逐項隔離（以
+`cortex-builder` 身分、`systemd-run` 帶單一 property）的結果是：無加固時 `node` 正常；
+`+MemoryDenyWriteExecute=yes` 時 V8 直接崩在 `v8::internal::Runtime_CompileLazy`；其餘
+每一項（`ProtectSystem=strict`／`PrivateTmp`／`RestrictNamespaces`／
+`SystemCallFilter=@system-service` ＋ `SystemCallErrorNumber=EPERM`）單獨加上去 `node`
+都正常。**唯一的阻斷點就是它**——V8 的 JIT 必須有 W+X 記憶體。
+
+四個 executor 因此分成兩類（分類來源＝`permgen.EXECUTOR_TOOLS` 的 `needs_node`，
+與 §R1 executor 執行面那張表**同一張**，不另立清單）：
+
+| executor | 形態 | 完整加固面 | 加固剖面 | 模板 unit |
+|---|---|:--:|---|---|
+| `claude` | 原生 ELF | ✅ | `strict` | `cortex-job@.service` |
+| `agy` | 原生 ELF | ✅ | `strict` | `cortex-job@.service` |
+| `codex` | node script | ⛔ 空輸出 | `jit` | `cortex-job-jit@.service` |
+| `copilot` | shell → node | ⛔ 空輸出 | `jit` | `cortex-job-jit@.service` |
+
+**規範**：
+
+- job 模板 unit SHALL 有且僅有 `permgen.HARDENING_PROFILES` 列舉的那幾份，且**全部由
+  同一張 `_HARDENING` 表產生**；剖面之間的差異 SHALL 侷限於
+  `permgen.PROFILE_DIVERGENCE_KEYS`（目前是 `{MemoryDenyWriteExecute}` 這一項）。
+  複製兩段各自維護的加固表 MUST NOT 出現——那會讓「日後改一份忘另一份」變成必然。
+- 剖面 SHALL 由 **executor** 決定，而 executor SHALL 是 Manager 的 dispatch 決定
+  （`SubprocessLauncher(executor=...)`，在任何 per-job 產物之前就固定）。
+- job spec **MUST NOT** 攜帶任何決定剖面的欄位（`job_runner.SPEC_FORBIDDEN_KEYS` 的
+  剖面族），且 SHALL 在寫端（`build_job_spec`）與讀端（`job_shim.load_spec`）各掃一次
+  ——**這與「身分欄位不入 spec」是同一條原則**：身分只有一個來源（root-owned unit 的
+  `User=`），剖面也只有一個來源（executor）。
+- 未登記的 executor SHALL **fail-closed**，MUST NOT 預設落到放寬的那一份剖面。
+  （也刻意不預設落到嚴格那份：一個未被盤點過的 node 型 CLI 會在真實加固面下靜默
+  起不來，症狀是空輸出，離原因很遠——#643 本身就是這樣被埋掉的。）
+- 部署 config（`PSC_JOB_TEMPLATE_UNIT`）SHALL 只接受**基底**模板名；帶剖面後綴的值
+  MUST 被拒——否則一行 config 就能把**所有** job 推到寬鬆剖面，per-executor 設計當場
+  退化成「全域移除 MDWE」。
+- polkit 規則的 unit pattern SHALL **列舉**這些模板字幹（錨定的交替），MUST NOT 放寬
+  成萬用字元；`instance` 段的字元類 SHALL 維持不變。
+
+##### 誠實的取捨：哪一類 job 有哪一種保護
+
+**走 `jit` 剖面的 job（`codex`／`copilot`）失去 `MemoryDenyWriteExecute` 這一層。**
+具體代價：取得任意程式碼執行的攻擊者可在**該 job 自己的位址空間內**配置 W+X 記憶體，
+JIT 型 shellcode（不落地、不經 `exec`、因此不觸發任何依賴檔案或 exec 的偵測）在此可行。
+這是真的少了一層，不是換個寫法的等價物。
+
+**沒有失去的部分**（同樣要寫清楚，否則會被讀成比實際更弱）：其餘 26 項加固在 `jit`
+剖面下**逐項不變**——`NoNewPrivileges=yes`、`CapabilityBoundingSet=`（空）、
+`ProtectSystem=strict`、`ProtectHome=yes`、`RestrictNamespaces=yes`、
+`SystemCallFilter=@system-service`、`RestrictSUIDSGID=yes`… 全部照舊，`User=` 一樣寫死在
+root-owned 的 unit 檔裡。W+X 讓攻擊者能在**自己這個 UID** 內執行程式碼；**跨 UID、
+跨檔案系統、提權**那幾層完全沒有鬆動。換句話說：`jit` 剖面守不住的是「job 內部的
+程式碼完整性」，守得住的仍然是「job 出不了自己那個 UID 的邊界」——而 §R2／§R3 保護的
+Tier-0／Tier-1 資產靠的是後者。
+
+**換到什麼**：保住 `codex`／`copilot` 兩個 provider。若採方向 3（只用原生 ELF
+executor），build 域只剩 `claude`／`agy`，§R5／§R8 的 `independence_domain`
+（reviewer 不得與 builder 同 domain）可選空間當場減半。方向 1（全域移除 MDWE）則會讓
+**不需要**放寬的 `claude`／`agy` 一起失去這層——方向 2 的全部價值就在於「只讓需要的
+那一類付這個代價」。
+
+**因此 spec 明載**：本系統**不宣稱**「所有 job 都有完整加固」。準確的敘述是——
+**原生 ELF executor 的 job 有完整 27 項加固；node 型 executor 的 job 有 26 項，
+少的那一項是 `MemoryDenyWriteExecute`。** 任何引用本 spec 的稽核、報告或 PR 描述
+SHALL 用這句話，MUST NOT 簡化成「job 已完整加固」。
+
+**未來選項（不在本票範圍）**：若某天 node 型 executor 有辦法在無 W+X 下執行
+（V8 的 jitless 模式、或 CLI 改為原生編譯），`jit` 剖面 SHALL 被移除而不是長期保留；
+移除的判準就是上表「完整加固面」欄全部變 ✅。
+
+#### Scenario: node 型 executor 在嚴格剖面下起不來
+
+- **WHEN** 以 `codex`／`copilot` 為 executor 的 job 被派到 `cortex-job@.service`
+  （strict 剖面）
+- **THEN** 它 MUST 失敗（V8 崩在 `Runtime_CompileLazy`），MUST NOT 被視為可接受狀態；
+  驗收 SHALL 包含這條**負向對照**——只驗 `jit` 剖面成功無法證明剖面分岔是必要的
+
+#### Scenario: job 試圖選擇加固剖面
+
+- **WHEN** job spec（或任何 job 可影響的輸入）攜帶 `hardening_profile`／`profile`／
+  `template_unit` 等欄位
+- **THEN** 寫端與讀端 MUST 各自 fail-closed 拒絕執行，MUST NOT 忽略該欄位後照常執行
+
+#### Scenario: 未登記的 executor
+
+- **WHEN** dispatch 使用一個不在 `permgen.EXECUTOR_TOOLS` 內的 executor 名
+- **THEN** 降權啟動器 MUST fail-closed，MUST NOT 落到任一剖面（放寬的那份會讓設計退化，
+  嚴格的那份會讓問題再被埋一次）
 
 #### Scenario: 竄改 EnvironmentFile 重導 state 根
 
@@ -1094,6 +1187,8 @@ MUST NOT 標記為 stable；本項 MUST NOT 引用計畫「貫穿工項」第 7 
 | 路徑分樹破壞既有 `PSC_*` 契約，導致既有 instance 無法啟動 | fleet 停擺 | 分樹以登記表產生、保留舊路徑為唯讀相容層一個 release；`doctor` 增加分樹健檢；實測已發現部署中的 env 缺 `PSC_CONTROL_ROOT`，遷移前須先對帳 |
 | headless 失去 gh token 後功能退化 | headless 無法自行推 PR | 由 Manager 代理 GitHub 寫入（D1 outbox 記帳已是此方向）；Phase 2 前先量測哪些 headless 動作真的需要 token |
 | 資產盤點漏項 | 漏保護的 state 成為新破口 | R1 的雙向等式測試把漏項變成 CI FAIL；同時收斂六處重複的 journal 路徑推導 |
+| **per-executor 加固剖面（#643）被讀成「所有 job 都有完整加固」** | 稽核／報告高估實際保護面，日後出事時對不上 | §R3 的「誠實的取捨」段明載準確敘述（原生 ELF 27 項／node 型 26 項，少的是 `MemoryDenyWriteExecute`）；產生出來的 unit 檔頭逐條寫著它接受的代價；runbook 第 5-2 步要求執行者先讀那一段 |
+| **剖面被改成可由呼叫端選擇**（config、spec、或新增一個「方便」的參數） | 退化成「全域移除 MDWE」——`claude`／`agy` 一起失去該層，方向 2 的價值歸零 | 剖面族進 `SPEC_FORBIDDEN_KEYS`（寫端＋讀端各掃一次）；`PSC_JOB_TEMPLATE_UNIT` 拒絕帶剖面後綴的值；未知 executor fail-closed；polkit pattern 只列舉具名字幹。四條都有對應測試 |
 | Phase 3 簽章方案被誤當成可替代 Phase 2 | 投入密碼學工程卻仍可被繞過 | 「路線比較與裁決建議」段已論證 B 的三個前提都依賴 A；R6(c) 明載單調計數器必須在 OS 邊界內 |
 | reviewer 與 builder 分離推高資源與複雜度 | Phase 2 工期拉長 | independence 是 `#484` 與 D6 的共同要求，不可省；可先以兩個 UID（builder／非 builder）起步，planner 併入非 builder 域，待驗證後再細分 |
 | 降級運轉期間 fleet 產能下降 | 交付變慢 | 降級只涵蓋 acceptance／outbox mutation／ship 三條路徑，define／plan／build／verify 不受影響 |
