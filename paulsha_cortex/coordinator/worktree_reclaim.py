@@ -38,6 +38,7 @@ from uuid import uuid4
 
 from paulsha_cortex.config import paths
 
+from . import job_workspace
 from .dispatcher import _default_git_runner
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,10 @@ class WorktreeReclaim:
     directory_removed: bool = False
     preserved_ref: str | None = None
     preserved_files: int = 0
+    #: #623：per-job clone 被刪除前，其 HEAD 被封存到來源 repo 的哪一條 ref
+    #: （`job_workspace.ARCHIVE_REF_PREFIX` 底下）。worktree 模型、或 commit 已在
+    #: 來源 repo 裡（成果已回收）時為 None。
+    archived_ref: str | None = None
     detail: str | None = None
 
     @property
@@ -85,6 +90,8 @@ class WorktreeReclaim:
         if self.preserved_ref is not None:
             payload["preserved_ref"] = self.preserved_ref
             payload["preserved_files"] = self.preserved_files
+        if self.archived_ref is not None:
+            payload["archived_ref"] = self.archived_ref
         if self.detail is not None:
             payload["detail"] = self.detail
         return payload
@@ -192,12 +199,26 @@ def _registry_contains(runner: GitRunner, target: Path) -> tuple[bool, str | Non
     return False, None
 
 
-def _looks_like_linked_worktree(target: Path) -> bool:
-    """linked worktree 的根目錄帶的是 `.git` **檔案**（內容 `gitdir: ...`）。
+def _looks_like_job_workspace(target: Path) -> bool:
+    """這個路徑是不是「本模組該遞迴刪除的 build 工作區」。
 
-    `.git` 是**目錄**代表那是一個主 checkout（獨立 repo，例如 run 的
-    `workspace_root`）——那絕不是本模組該遞迴刪除的東西，一律回 False。
+    兩種形狀都算：
+
+    - **per-job clone**（#623 之後的模型）：`.git` 是目錄，但帶
+      `job_workspace` 的標記檔。
+    - **linked worktree**（升級前既存）：`.git` 是**檔案**（內容 `gitdir: ...`）。
+
+    `.git` 是目錄且**沒有**標記檔，代表那是一個主 checkout（獨立 repo，例如 run 的
+    `workspace_root`）——那絕不是本模組該遞迴刪除的東西，一律回 False。標記檔而非
+    「`.git` 是目錄」當判準，正是為了守住這條邊界：clone 模型下若改用寬鬆判準，
+    一筆陳舊的 `job.worktree` 就足以刪掉整個來源 repo。
     """
+
+    return job_workspace.is_job_clone(target) or _looks_like_linked_worktree(target)
+
+
+def _looks_like_linked_worktree(target: Path) -> bool:
+    """linked worktree 的根目錄帶的是 `.git` **檔案**（內容 `gitdir: ...`）。"""
 
     marker = target / ".git"
     return marker.is_file() and not marker.is_symlink()
@@ -321,9 +342,32 @@ def reclaim_worktree(
         and not registered
         and not target.is_symlink()
         and target.is_dir()
-        and not _looks_like_linked_worktree(target)
+        and not _looks_like_job_workspace(target)
     ):
         return WorktreeReclaim(RECLAIM_FAILED, text, detail="worktree-path-not-a-worktree")
+
+    # #623：clone 模型下 `rmtree` 會連 object store 一起刪掉——worktree 模型下這些
+    # commit 在共用 store 裡、branch 也還在主 repo，回收不銷毀任何東西。為了維持本
+    # 模組契約的「不銷毀證據」，刪除前先把工作區 HEAD 拉進來源 repo 的封存命名空間
+    # （已在來源 repo 裡的 commit 不重複封存）。封存本身是加分項，失敗不阻斷回收
+    # ——回收失敗才是 #478／#601 的生產事故。
+    archived_ref: str | None = None
+    if exists and not target.is_symlink() and job_workspace.is_job_clone(target):
+        # 來源 repo 優先取呼叫端給的值；沒給時取標記檔記錄的 provision 來源
+        # ——既有呼叫端（`manager.apply_slice_action` 的 recover-pre-candidate、
+        # `work_actions` 的 abandon 回收）都不傳 `repo_root`，硬要求它會讓封存
+        # 在生產路徑上永遠不觸發。
+        marker = job_workspace.read_marker(target) or {}
+        source = repo_root or marker.get("source_repo")
+        if isinstance(source, (str, Path)) and str(source):
+            try:
+                archived_ref = job_workspace.archive_workspace_head(
+                    source_repo=source, workspace=target
+                )
+            except Exception as exc:  # noqa: BLE001 - 封存失敗只記錄，不阻斷回收
+                logger.warning(
+                    "worktree-reclaim-archive-unavailable path=%s error=%s", text, exc
+                )
 
     preserved_ref: str | None = None
     preserved_files = 0
@@ -430,6 +474,7 @@ def reclaim_worktree(
         directory_removed=directory_removed,
         preserved_ref=preserved_ref,
         preserved_files=preserved_files,
+        archived_ref=archived_ref,
     )
 
 

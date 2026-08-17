@@ -27,6 +27,7 @@ from . import autonomy
 from . import completion
 from . import coverage
 from . import gate_ledger
+from . import job_workspace
 from . import planning_runtime
 from . import provider_backoff
 from . import outcome_taxonomy
@@ -3243,6 +3244,48 @@ def _verify_build_candidate_transition(
     if returncode != 0:
         raise ValueError("workflow build candidate ancestry unavailable")
     return candidate
+
+
+def _harvest_build_candidate(job: Mapping[str, object], *, run, candidate: str) -> str | None:
+    """#623：把 build card 的 candidate 從 job 的 per-job clone 取回 Manager 的樹。
+
+    clone 模型下 builder 的 commit 只存在於 clone 自己的 object store。後續每一段
+    都需要它在**來源 repo** 裡：review 卡的 `git worktree add --detach <candidate>`
+    （`coordinator/review.py`）、`_completion_candidate_ref` 的 merge-base、
+    `cortex work gc` 的 branch 分類，以及最基本的一件事——工作區被回收之後 commit
+    還在不在。
+
+    方向是 Manager **拉**（`git -C <來源 repo> fetch <clone>`），沿用 D2「git 讀」
+    的單向性；builder 永遠不 push 進 Manager 的樹。
+
+    掛在 candidate 驗證**之後**：`_verify_build_candidate_transition` 已確認
+    candidate 就是工作區的 HEAD 且單調延伸自基線，此處只負責把那個已被採信的
+    commit 搬進來，不引入新的採信路徑。
+
+    工作區不是 per-job clone（worktree 模型、或測試裡的假路徑）時回 None，不做任何
+    事——既有部署零回歸的掛點。
+    """
+
+    worktree = job.get("worktree")
+    branch = job.get("branch")
+    if not isinstance(worktree, str) or not worktree:
+        return None
+    if not isinstance(branch, str) or not branch:
+        return None
+    if not job_workspace.is_job_clone(worktree):
+        return None
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        raise ValueError("workflow build candidate harvest source repo missing")
+    harvested = job_workspace.harvest_branch(
+        source_repo=source_repo, workspace=worktree, branch=branch
+    )
+    if harvested.lower() != candidate.lower():
+        # 回收後來源 repo 的 branch 必須恰好是被採信的 candidate。對不上代表
+        # 工作區的 branch tip 與 HEAD 不同（模型在 detached HEAD 上 commit，
+        # 或 provision 後有第三方動過 ref）——fail-closed，不得繼續。
+        raise ValueError("workflow build candidate harvest head mismatch")
+    return harvested
 
 
 def _review_builder_job_binding(
@@ -9685,6 +9728,7 @@ def apply_workflow_action(
                 previous_candidate=candidate,
                 git_runner=git_runner,
             )
+            _harvest_build_candidate(job, run=current, candidate=candidate)
         elif current.current_phase in {"verify", "review"}:
             job_candidate = _verify_exact_candidate(job, git_runner=git_runner)
             if candidate != job_candidate:
