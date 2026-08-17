@@ -37,6 +37,7 @@ from paulsha_cortex.deck.compile import compile_combo, emit
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
 
 from diagnostic_fixtures import fixture_needs_human_reason
+from git_fixtures import StubWorktreeCreator as _StubWorktreeCreator
 
 
 def _gate_ledger_passed(log_path, *, gates: list[dict[str, object]] | None = None) -> None:
@@ -917,7 +918,16 @@ def test_forced_retry_build_dispatches_new_job_after_prior_success(
             )
 
     replacement = manager.dispatch_workflow_card(
-        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        # #648：build 卡改為 per-job provisioning，重派會走 creator。
+        type(
+            "D",
+            (),
+            {
+                "_registry": registry,
+                "_git_runner": None,
+                "_worktree_creator": _StubWorktreeCreator(tmp_path),
+            },
+        )(),
         run=run,
         identities=IdentityRegistry.from_rows(
             [{
@@ -1591,6 +1601,8 @@ def test_operator_resume_retries_bound_needs_human_terminal_without_rewriting_ol
     class ResumeDispatcher:
         _registry = registry
         _git_runner = None
+        # #648：build 卡改為 per-job provisioning，resume 重派會走 creator。
+        _worktree_creator = _StubWorktreeCreator(tmp_path)
 
         def poll_headless_done(self, job_id):
             return registry.get_job(job_id)
@@ -1867,6 +1879,8 @@ def test_operator_resume_retries_malformed_build_terminal_without_advancing(
     class ResumeDispatcher:
         _registry = registry
         _git_runner = None
+        # #648：build 卡改為 per-job provisioning，resume 重派會走 creator。
+        _worktree_creator = _StubWorktreeCreator(tmp_path)
 
         def poll_headless_done(self, job_id):
             return registry.get_job(job_id)
@@ -2988,10 +3002,14 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         raise AssertionError(argv)
 
     created_branches: list[str] = []
+    #: #648：canonical lane 的工作區改為 per-job，因此 provisioning 由「一個 run
+    #: 一次」變成「每張 build 卡一次」，且每次帶的是**那張卡自己的 job_id**。
+    created_job_ids: list[str | None] = []
 
     class WorktreeCreator:
         def create(self, branch, base_sha=None, *, job_id=None):
             created_branches.append(branch)
+            created_job_ids.append(job_id)
             return str(tmp_path)
 
     dispatcher = Dispatcher(
@@ -3414,7 +3432,11 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
         for job in workflow_jobs
         if job.get("workflow_phase") == "ship"
     } == {"openspec-archive", "policy-commit"}
-    assert created_branches == ["feature/production-wiring"]
+    # #648：branch 名一條不變（每張 build 卡都在同一條 branch 上接力），但工作區
+    # 改為 per-job——provisioning 次數 ＝ build 卡數，且帶的 job_id 逐一對應。
+    build_jobs = [job for job in workflow_jobs if job.get("workflow_phase") == "build"]
+    assert set(created_branches) == {"feature/production-wiring"}
+    assert created_job_ids == [job["job_id"] for job in build_jobs]
     assert all(job.get("workflow_evidence") for job in workflow_jobs)
     assert all(job.get("workflow_claim_key") == run.claim_key for job in workflow_jobs)
     assert all(isinstance(job.get("workflow_inputs"), list) for job in workflow_jobs)

@@ -830,6 +830,40 @@ class JobRegistry:
         except KeyError as exc:
             raise ValueError(f"{field} 指向不存在 job: {job_id}") from exc
 
+    def _allocate_job_id(self, task: str) -> str:
+        """配發下一個 job_id。**全 repo 唯一**的 job_id 產生點。
+
+        `create_job()` 與 `reserve_job_id()` 都走這裡：兩邊各自拼一次
+        `f"{task}-{seq}"` 就是兩個會漂移的來源，而那正是 #645 的形狀。
+        """
+
+        self._seq += 1
+        return f"{task}-{self._seq}"
+
+    def reserve_job_id(self, task: str) -> str:
+        """先把 job_id 配發出來（並持久化水位），稍後再以它建立 job（#648）。
+
+        存在的理由只有一個：**per-job 工作區的目錄名就是 job_id**
+        （`job_workspace.job_segment()`），而工作區必須在 `create_job()`
+        **之前**存在——canonical lane 的 `workflow_input_snapshot` /
+        `workflow_output_baseline` 都是從工作區的檔案算出來的，是 `create_job()`
+        的必填參數。順序因此只能是「先配 id → 建工作區 → 建 job」。
+
+        配發即消耗：`self._seq` 前進並落盤，因此即使後續 provision 失敗、這個 id
+        永遠不會被第二個 job 取用（只是燒掉一個序號，無害）。呼叫端必須把拿到的
+        id 原樣交回 `create_job(job_id=…)`；那裡會驗證它確實屬於同一個 `task`、
+        且尚未被使用。
+
+        **不是**「預測下一個 id」——預測會在任何一次插入之後漂掉。這裡是真的把
+        序號取走。
+        """
+
+        if not isinstance(task, str) or not task:
+            raise ValueError("reserve_job_id 需要非空 task")
+        job_id = self._allocate_job_id(task)
+        self._persist()
+        return job_id
+
     def create_job(
         self,
         *,
@@ -838,6 +872,7 @@ class JobRegistry:
         branch: str,
         pane: str,
         worktree: str,
+        job_id: str | None = None,
         dispatch_head: str | None = None,
         executor: str | None = None,
         session_name: str | None = None,
@@ -879,9 +914,21 @@ class JobRegistry:
         if kind not in {"build", "review"}:
             raise ValueError(f"非法 kind: {kind!r}")
         self._validate_existing_job_ref("workflow_builder_job_id", workflow_builder_job_id)
-        self._seq += 1
+        if job_id is None:
+            allocated = self._allocate_job_id(task)
+        else:
+            # #648：只接受**本 registry 配發過**的 id。放寬成「任意字串」等於讓
+            # 呼叫端自己造 job_id，那既繞過序號單調性，也讓工作區目錄名與 registry
+            # 身分脫鉤（#645 的復發面）。
+            prefix = f"{task}-"
+            suffix = job_id[len(prefix):] if job_id.startswith(prefix) else ""
+            if not suffix.isdigit() or int(suffix) > self._seq:
+                raise ValueError(f"create_job 收到未經配發的 job_id: {job_id!r}（task={task!r}）")
+            if any(existing.get("job_id") == job_id for existing in self._jobs):
+                raise ValueError(f"create_job 收到已被使用的 job_id: {job_id!r}")
+            allocated = job_id
         job: dict[str, Any] = {
-            "job_id": f"{task}-{self._seq}",
+            "job_id": allocated,
             "task": task,
             "persona": persona,
             "kind": kind,

@@ -14,6 +14,8 @@ import pytest
 
 from paulsha_cortex.coordinator import terminal_contract as tc
 
+from git_fixtures import StubWorktreeCreator
+
 
 CANONICAL_CARD = {
     "schema_version": 2,
@@ -580,6 +582,8 @@ def test_resume_bounds_schema_mismatch_retry_with_observable_counter(tmp_path: P
     class ResumeDispatcher:
         _registry = registry
         _git_runner = None
+        # #648：build 卡改為 per-job provisioning，resume 重派會走 creator。
+        _worktree_creator = StubWorktreeCreator(tmp_path)
 
         def poll_headless_done(self, job_id):
             return registry.get_job(job_id)

@@ -46,6 +46,7 @@ from paulsha_cortex.deck.schema import (
 from paulsha_cortex.porcelain import recover as porcelain_recover
 
 from diagnostic_fixtures import fixture_needs_human_reason
+from git_fixtures import StubWorktreeCreator
 
 
 HEAD = "d" * 40
@@ -468,7 +469,16 @@ def test_forced_retry_dispatches_a_new_job_for_the_midchain_card(
     prompts: list[str] = []
 
     replacement = manager.dispatch_workflow_card(
-        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        # #648：build 卡改為 per-job provisioning，重派會走 creator。
+        type(
+            "D",
+            (),
+            {
+                "_registry": registry,
+                "_git_runner": None,
+                "_worktree_creator": StubWorktreeCreator(tmp_path),
+            },
+        )(),
         run=registry.get_workflow_run(run.run_id),
         identities=_identities(),
         launcher_factory=lambda _: _Launcher(prompts),
@@ -571,7 +581,16 @@ def test_retry_card_reset_refuses_the_final_card_after_state_drift(tmp_path: Pat
 
 
 def _daemon_executor(tmp_path: Path, registry: JobRegistry, run, **kwargs):
-    dispatcher = type("D", (), {"_registry": registry, "_git_runner": None})()
+    dispatcher = type(
+        "D",
+        (),
+        {
+            "_registry": registry,
+            "_git_runner": None,
+            # #648：build 卡改為 per-job provisioning，重派會走 creator。
+            "_worktree_creator": StubWorktreeCreator(tmp_path),
+        },
+    )()
     return manager_daemon.build_request_executor(
         dispatcher=dispatcher,
         specs_dir=str(tmp_path / "specs"),

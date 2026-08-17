@@ -207,9 +207,10 @@ def test_build_worktree_uses_run_workspace_root_not_manager_repo(
     persisted = registry.get_job(job["job_id"])
 
     expected_pool = worktree_root_for(run_workspace)
-    # #645：目錄名由 build 身分（＝branch 去掉 `feature/`）經 job_workspace 導出，
-    # 不再是 branch slug；branch 名本身不變。
-    segment = job_workspace.job_segment("34-multi-issue-worktree")
+    # #645：目錄名由 id 經 job_workspace 導出，不再是 branch slug；branch 名本身不變。
+    # #648：那個 id 改為**這張卡自己的 job_id**（per-job 工作區），不再是 run 層級的
+    # build 身分——目錄名因此逐字等於這個 job 的 systemd 模板 instance 名。
+    segment = job_workspace.job_segment(str(persisted["job_id"]))
     expected_worktree = expected_pool / segment
     assert persisted["worktree"] == str(expected_worktree)
     assert expected_worktree.is_dir()

@@ -8,6 +8,44 @@
 ## [Unreleased]
 
 ### Added
+- **#648 / trust-root Phase 2b：canonical（workflow）lane 的工作區改為 per-job——
+  per-run 工作區使 `%i` 不變式結構上不成立，該 lane 在降權模式下不可用**——
+  canonical lane 的工作區是 per-run 的（build 卡 provision 之後，同 run 後續的卡沿用
+  `builder_jobs[-1]["worktree"]`，**一個工作區對多個 `job_id`**），而模板 unit 是
+  per-job 定址（`ReadWritePaths=<pool>/%i`）。一個工作區不可能同時等於多個 job id ⇒
+  `PSC_JOB_RUNNER=systemd-template` 下必然拿到指向不存在路徑的 RWP ⇒ `226/NAMESPACE`。
+  #645／#646 只把命名收斂成單一推導點，並在程式碼裡**明文把 canonical lane 排除在
+  不變式外**；本次把那個排除拿掉。**改法**：build phase 的每一張卡自己 clone 一份，
+  目錄名沿用唯一推導點 `job_workspace.job_segment(job_id)`（＝
+  `job_runner.template_instance_id()` 的同一個輸出）。目錄名由 job_id 導出、而
+  `create_job()` 的 input snapshot 又要從工作區算，順序只能是「先配 id → 建工作區 →
+  建 job」⇒ 新增 `JobRegistry.reserve_job_id(task)`（**配發即消耗**，不是預測；與
+  `create_job()` 共用同一個私有配發器，`f"{task}-{seq}"` 全 repo 仍只有一份）。
+  **卡與卡的交接顯式化**：沿用 #637 的 bundle ＋ append-only spool——前一張卡的成果
+  harvest 回來源樹的 `refs/heads/<branch>`（`_harvest_build_candidate()` 已強制它恰
+  等於被採信的 candidate），下一張卡以 `run.candidate_head` 為 base 從**來源樹**
+  clone，完全不讀前一張卡的工作區。**base 推導**：首張卡＝凍結集 base（#208／#211）、
+  後續／中段卡＝最後一張被採信的 candidate；`retry-card`（#545）不動 `candidate_head`，
+  因此中段卡重派拿到的仍是那個 candidate，而不是 run 的原始 base，也不是失敗那次留在
+  磁碟上的東西。推不出合法 SHA 一律 **raise**——退回 creator 預設（`main`）等於
+  `branch -f` 把整個 run 已採信的 commit 抹掉。**成本**：每張 build 卡一次 clone
+  （0.5 秒／35MB），`feature-oneshot` 三張 build 卡 ⇒ 約 1.5 秒／105MB；**刻意不用
+  `--reference`／`--shared`**——那會把 object store 接回共用，正是 #623 判定與三分隔離
+  互斥的東西。**`gc`／`worktree_reclaim` 不必改**：兩者都以形狀與呼叫端給的路徑為準，
+  沒有「一個 run 一個工作區」的假設；per-job 反而消滅了「回收一張卡把兄弟卡的樹一起
+  刪掉」的隱患，而 #601 的 `worktree target already exists` 在這條 lane 上結構性消失
+  （殘留回收仍屬 #601）。**`direct` 模式零回歸**：branch 名／來源樹 ref／標記檔／
+  spool key 推導／`dispatch_head`（仍是 run 層級）全部逐字不變，且本次沒有引入任何依
+  `PSC_JOB_RUNNER` 的分支。**範圍切分**：ship phase 的 manager 卡與 verify／review 卡
+  仍沿用前一張 build 卡的工作區——前者要先補「ship phase 成果回收」才動得了，後者不是
+  降權對象（`%i` 不變式不落在它們身上），各切成後續票。新增
+  `tests/test_canonical_per_job_workspace_648.py`（10 條，全部跑正式 dispatch 路徑：
+  真 creator、真 git repo、真 bundle ＋ spool 交接），含「把前一張卡的工作區刪掉、
+  後續卡仍拿得到 base」的不變式、突變守衛、fail-closed、中段卡重派與 gc／reclaim；
+  完整 `prepare_systemd_template()` 那一條需要 OS 層前置物，單 UID 環境**明確 skip 並
+  逐項列出缺哪一個**（#638 的教訓）。**bootstrap**：`cortex work intake` 走的正是這條
+  lane，本票讓它的 build phase 在降權下可用，cortex 自我託管的第一段因此打通。
+  詳見 `changelog.d/canonical-per-job-workspace.md`。
 - **#643 / trust-root Phase 2b：per-executor 加固剖面——`MemoryDenyWriteExecute` 與
   node 型 executor 的互斥，只讓需要的那一類付代價**——#640／#642 落地後做實機驗證時
   測出來的：**加固面本身與 toolchain 相衝**，不是安裝沒裝好。以 `cortex-builder` 身分
@@ -184,6 +222,8 @@
   **已知邊界**：canonical（workflow）lane 的工作區是 per-run 的（一個工作區對多個
   job_id），「目錄名 ＝ 該 job 的 instance 名」在那裡結構上不可能成立；要在
   `PSC_JOB_RUNNER=systemd-template` 下跑那條 lane，須先把工作區改成 per-job。
+  （**已由 #648 解掉**：build phase 的工作區已改 per-job，不變式在那裡成立且有測試
+  守著；ship／verify／review 卡的工作區另有後續票。）
   **附帶**：`permgen.build_job_unit()` 把 `CollectMode=inactive-or-failed` 由 `[Service]`
   搬到 `[Unit]`——放錯段只被 systemd 忽略（`Unknown key name … ignoring.`），
   「失敗的 instance 自動回收」的用意因此沒生效。（#643 在 runbook 第 5-2 步補上落檔後的

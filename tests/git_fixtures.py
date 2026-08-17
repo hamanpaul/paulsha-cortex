@@ -33,3 +33,25 @@ def make_empty_git_dir(root: Path) -> Path:
     git_dir = root / ".git"
     git_dir.mkdir(parents=True, exist_ok=True)
     return git_dir
+
+
+class StubWorktreeCreator:
+    """#648：canonical lane 的 build 卡改為 **per-job** provisioning 之後，每一次
+    build dispatch 都會呼叫 `WorktreeCreator`（以前只有一個 run 的第一張 build 卡
+    會呼叫，後續卡沿用 `builder_jobs[-1]["worktree"]`）。
+
+    不在意工作區本身、只在意 job 生命週期的測試，注入這個 stub 即可；不注入時
+    `manager._dispatch_workflow_card` 會自行建構真的 `ScriptWorktreeCreator`，而那
+    要求 `run.workspace_root` 是一棵真的 git repo。
+
+    `calls` 逐筆記下 `(branch, job_id, base_sha)`，讓需要驗「每張卡拿到自己的
+    job_id」的測試不必再自己包一層。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._root = str(root)
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str:
+        self.calls.append((branch, job_id, base_sha))
+        return self._root

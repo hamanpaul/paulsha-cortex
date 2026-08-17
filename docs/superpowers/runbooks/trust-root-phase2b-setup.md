@@ -1799,6 +1799,14 @@ systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/wor
 #   的 instance 名走的也是它）。#645 之前 provisioning 用的是 branch slug
 #   （`feature-<slice_id>`），與 `%i` 永遠差一個前綴 ⇒ ReadWritePaths 指向不存在
 #   的路徑 ⇒ `Failed to set up mount namespacing` / `226/NAMESPACE`，job 起不來。
+#
+#   #648：canonical（workflow）lane 的工作區在 #646 之前是 **per-run** 的（build 卡
+#   provision 之後，同一個 run 後續的卡沿用同一棵樹），一個工作區對多個 job_id ⇒
+#   同一個症狀在那條 lane 上對「第二張卡起」必然重現。已改為 per-job：每一張 build
+#   卡自己 clone 一份，卡與卡之間的交接走 bundle ＋ append-only spool（#637）。
+#   實機稽核：一個多卡 run 跑完後，pool 底下該有**每張 build 卡各一個**目錄，
+#   且每個目錄名都能在 `systemctl list-units 'cortex-job*@*'` 的 instance 名裡找到。
+#     ls /var/lib/cortex/worktree
 
 # ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶；#643 起兩份都要驗）
 sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \

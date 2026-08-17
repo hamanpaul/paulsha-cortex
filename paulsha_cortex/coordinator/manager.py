@@ -3285,6 +3285,56 @@ def _verify_build_candidate_transition(
     return candidate
 
 
+def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
+    """#648：中段／後續 build 卡的 clone base——**卡與卡交接的顯式通道**。
+
+    canonical lane 的工作區改成 per-job 之後，「前一張卡的產出留在磁碟上給下一張
+    用」這個隱含交接必須換成一個明講的通道。既有的那一條就是 #637 的 **bundle ＋
+    append-only spool**：前一張卡的 commit 由 builder 產成 bundle → 寫進
+    Manager-owned spool → `_harvest_build_candidate()` 把它 fetch 進來源樹的
+    `refs/heads/<branch>`，且**強制**回收後的 branch head 恰等於被採信的 candidate
+    （對不上即 fail-closed）。因此：
+
+        來源樹的 `refs/heads/<branch>` == `run.candidate_head`
+
+    在每一張 build 卡被採信之後成立，下一張卡只要以 `run.candidate_head` 為 base
+    去 clone，拿到的就是前一張卡的成果——**完全不必讀前一張卡的工作區**。
+
+    為什麼是 `run.candidate_head` 而不是「去讀來源樹的 branch tip」：candidate 是
+    Manager 採信鏈（#540）的產物，branch tip 只是磁碟現況。以採信值為準，兩者一旦
+    不一致就會在 `ScriptWorktreeCreator.create()` 的既有守衛上炸出來
+    （`rev-parse --verify` 找不到 ⇒ harvest 沒完成；`merge-base --is-ancestor`
+    失敗 ⇒ branch 上有 candidate 以外的 commit），而不是靜默沿用一個沒被採信的 tip。
+
+    **中段卡重派（#545 retry-card）**：`_manager_reset_workflow_for_retry_card()`
+    不動 `candidate_head`，只把那一張卡打回 pending。因此重派的中段卡在這裡拿到的
+    base 仍是「最後一張**被採信**的 build 卡」的 candidate——不是 run 的原始 base，
+    也不是那次失敗嘗試留在磁碟上的東西。失敗那次的工作區是另一個 job_id、另一個
+    目錄，既不會撞名（#601 的 `worktree target already exists` 在這條 lane 結構上
+    消失），也不會被下一次 provision 讀到。
+
+    **`candidate_head` 尚未錨定時不走這條路**：那代表 run 還沒採信過任何 build
+    成果（首張卡、或首張卡的 terminal 壞掉正在重派），呼叫端會退回「首張 build 卡」
+    的凍結 base。判準寫在呼叫端而不是這裡，因為那是「有沒有東西要交接」的問題。
+
+    推不出合法 SHA 時 raise：**不得**退回 creator 的預設 base（那是 `main`，等於把
+    整個 run 已採信的成果 reset 掉）。
+    """
+
+    for value in (
+        getattr(run, "candidate_head", None),
+        builder_jobs[-1].get("subject_head") if builder_jobs else None,
+    ):
+        if isinstance(value, str) and verification.SAFE_SHA_RE.fullmatch(value) is not None:
+            return value.lower()
+    raise ValueError(
+        "workflow build handoff base is unavailable: "
+        f"card={card}；run 已有被採信的 build 卡，卻推不出可 clone 的 candidate。"
+        "這代表上一張卡的成果回收（#637 bundle ＋ spool）沒有走完——不得以 run 的原始 "
+        "base 重新 provision，那會丟掉已採信的 commit"
+    )
+
+
 def _harvest_build_candidate(
     job: Mapping[str, object],
     *,
@@ -8460,6 +8510,15 @@ def _dispatch_workflow_card(
     builder_job_id = str(builder_jobs[-1]["job_id"]) if builder_jobs else None
     if step.persona == "reviewer" and builder_job_id is None:
         raise ValueError("workflow reviewer builder job unavailable")
+    task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
+    # #648：job_id 必須在 **provision 之前**就定案——per-job 工作區的目錄名就是
+    # `job_workspace.job_segment(job_id)`，而 `launcher.launch(slice_id=job_id)`
+    # 之後交給 `job_runner.prepare_systemd_template(job_id=…)` 算 instance 名的也是
+    # 同一個字串。順序不能反過來：`create_job()` 的 `workflow_input_snapshot` /
+    # `workflow_output_baseline` 都是從工作區的檔案算出來的。
+    # 配發即消耗（見 `registry.reserve_job_id`），因此 provision 失敗只是燒掉一個
+    # 序號，不會有兩個 job 共用同一個 id、進而共用同一個目錄。
+    reserved_job_id = registry.reserve_job_id(task)
     planner_sandbox: Path | None = None
     reviewer_sandbox: Path | None = None
     sandbox_hash: str | None = None
@@ -8483,8 +8542,6 @@ def _dispatch_workflow_card(
         planning_runtime._copy_planning_sandbox(Path(run.workspace_root), planner_sandbox)
         sandbox_hash = planning_runtime._tree_snapshot(planner_sandbox)
         worktree = str(planner_sandbox)
-    elif builder_jobs:
-        worktree = str(builder_jobs[-1]["worktree"])
     elif step.phase == "build":
         creator = getattr(dispatcher, "_worktree_creator", None)
         workspace_root = Path(run.workspace_root)
@@ -8518,34 +8575,65 @@ def _dispatch_workflow_card(
             f"{primary_issue}-{run.work_id}" if primary_issue is not None else run.work_id
         )
         builder_branch = f"feature/{builder_work_id}"
-        # #645：工作區目錄名改由 id 導出（不再是 branch slug）。canonical lane 傳的是
-        # **run 層級的 build 身分**而不是某一個 job_id——這條 lane 的工作區是
-        # per-run 的：build 卡 provision 之後，同一個 run 後續的卡直接沿用
-        # `builder_jobs[-1]["worktree"]`（見本函式上方）。因此這裡的目錄名恆等於
-        # 「第一張 build 卡的 run 身分」，而 `job_runner.template_instance_id()` 算的是
-        # **每一個 job 自己的** id——兩者在 canonical lane 結構上就不可能逐字相等
-        # （一個工作區對多個 job）。slice lane（`autonomy._launcher_worktree`）沒有這個
-        # 一對多，因此 #645 的不變式在那裡成立且有測試守著。canonical lane 要在
-        # `PSC_JOB_RUNNER=systemd-template` 底下跑，需要先把「工作區 per-run」改成
-        # 「per-job」——那是另一票的事，本次不動。
-        frozen_base_sha = None
-        if isinstance(run.frozen_readiness, dict):
-            candidate_base_sha = run.frozen_readiness.get("base_sha")
-            if isinstance(candidate_base_sha, str) and candidate_base_sha:
-                frozen_base_sha = candidate_base_sha
-        # #208 收口 wiring 5（#211 閉環）：凍結集存在時 worktree 必須以
-        # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導
-        # 一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base
-        # 缺陷）。無凍結集時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
+        # #648：canonical lane 的工作區改為 **per-job**——每一張 build 卡自己 clone
+        # 一份，目錄名 ＝ 這張卡的 job_id 經 `job_workspace.job_segment()` 導出的
+        # 片段，也就是 `job_runner.template_instance_id()` 算出來的 instance 名。
+        # #645／#646 之後 canonical lane 傳的是 run 層級的 build 身分，一個工作區
+        # 對多個 job_id，`ReadWritePaths=<pool>/%i` 對第二張卡起必然指向不存在的
+        # 路徑（`226/NAMESPACE`）；改 per-job 之後那個一對多消失，不變式成立。
+        # 這裡刻意與 slice lane（`autonomy._launcher_worktree`）用**同一個推導點**。
+        build_branch = (
+            str(builder_jobs[-1]["branch"])
+            if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+            else builder_branch
+        )
+        accepted_candidate = (
+            run.candidate_head
+            if isinstance(run.candidate_head, str)
+            and verification.SAFE_SHA_RE.fullmatch(run.candidate_head) is not None
+            else None
+        )
+        if builder_jobs and accepted_candidate is not None:
+            # 中段／後續 build 卡：base 是**來源樹上這條 branch 現在的位置**，也就是
+            # 前一張卡 harvest 回來（#637 bundle ＋ append-only spool）之後被採信的
+            # candidate。交接因此完全走 Manager 自己的 object store，不依賴前一張卡的
+            # 工作區還留在磁碟上——那個目錄可以已經被回收掉。
+            # `run.candidate_head` 是 Manager 採信的權威值；推不出時 fail-closed，
+            # **絕不**讓 base 落回 creator 的預設（那會是 `main`，等於把整個 run 的
+            # 成果 reset 掉）。base 對不上來源樹的實況時，creator 既有的兩道守衛會擋：
+            # `rev-parse --verify <base>` 找不到 commit ⇒ harvest 沒完成；
+            # `merge-base --is-ancestor <branch> <base>` ⇒ branch 上有 base 以外的
+            # commit（#613 的形狀），一律拒絕 provision。
+            build_base_sha = _workflow_build_handoff_base(
+                run, builder_jobs=builder_jobs, card=step.card
+            )
+        else:
+            # 首張 build 卡：#208 收口 wiring 5（#211 閉環）——凍結集存在時必須以
+            # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導一個
+            # 可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base 缺陷）。
+            build_base_sha = None
+            if isinstance(run.frozen_readiness, dict):
+                candidate_base_sha = run.frozen_readiness.get("base_sha")
+                if isinstance(candidate_base_sha, str) and candidate_base_sha:
+                    build_base_sha = candidate_base_sha
+        # 無凍結集且為首張卡時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
         # WorktreeCreator 實作 without base_sha 亦不受影響）。
-        if frozen_base_sha is not None:
+        if build_base_sha is not None:
             worktree = str(
                 creator.create(
-                    builder_branch, job_id=builder_work_id, base_sha=frozen_base_sha
+                    build_branch, job_id=reserved_job_id, base_sha=build_base_sha
                 )
             )
         else:
-            worktree = str(creator.create(builder_branch, job_id=builder_work_id))
+            worktree = str(creator.create(build_branch, job_id=reserved_job_id))
+    elif builder_jobs:
+        # verify／review／ship 卡：仍以**前一張 build 卡的工作區**為 candidate 樹。
+        # 這三種卡不是降權派工的對象（reviewer 走 `as_review_only()`，其實際
+        # 工作樹是 reviewer sandbox；ship 卡的成果目前沒有 harvest 通道），因此
+        # #648 的 `%i` 不變式不落在它們身上。把它們也搬到 per-job clone 需要先補
+        # 「ship phase 的成果回收」與「reviewer candidate 樹的來源」兩件事——見
+        # 後續票，本 PR 不動它們一個位元組。
+        worktree = str(builder_jobs[-1]["worktree"])
     else:
         worktree = run.workspace_root
     effective_repo_root = Path(worktree).resolve()
@@ -8620,14 +8708,13 @@ def _dispatch_workflow_card(
             ):
                 raise ValueError("workflow build phase base is unavailable")
             dispatch_base = base_value
-    task = f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{step.card}"
     try:
         branch = (
-            (
-                str(builder_jobs[-1]["branch"])
-                if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
-                else builder_branch
-            )
+            # #648：build 卡的 branch 已在 provisioning 當下定案（`build_branch`
+            # 就是傳給 `creator.create()` 的那一個）。在這裡重算一次等於再開一個
+            # 會漂移的來源——job 記錄的 branch 與工作區實際 checkout 的 branch 對不
+            # 上，harvest 的 refspec 就會指到別條 ref。
+            build_branch
             if step.phase == "build"
             else (
                 str(builder_jobs[-1]["branch"])
@@ -8637,6 +8724,7 @@ def _dispatch_workflow_card(
         )
         job = registry.create_job(
             task=task,
+            job_id=reserved_job_id,
             persona=step.persona,
             kind="review" if step.persona == "reviewer" else "build",
             branch=branch,
