@@ -699,12 +699,16 @@ def run_result_verification(
     # #623：工作區是 per-job clone 時，builder 的 commit 只存在於 clone 自己的
     # object store 裡——底下所有以 `resolved_repo_root` 為根的判讀（candidate、
     # ancestry、required-artifact diff、persona scope diff）都會看不到它。先由
-    # Manager 單向 fetch 回自己的樹，才有東西可讀。worktree 模型（以及測試裡的
-    # 假路徑）沒有標記檔，這一步是 no-op，既有行為逐字不變。
+    # Manager 從該 job 的成果 **bundle**（Manager-owned spool，不是 builder 的樹）
+    # 單向 fetch 回自己的樹，才有東西可讀。這個 job 沒有 spool 那一格（升級前既存
+    # 的工作區、測試裡的假 job 記錄）時是 no-op，既有行為逐字不變。
     if branch:
         try:
-            job_workspace.harvest_if_job_clone(
-                source_repo=resolved_repo_root, workspace=worktree, branch=branch
+            job_workspace.harvest_if_spooled(
+                source_repo=resolved_repo_root,
+                job=job,
+                branch=branch,
+                coordinator_root=coordinator_root,
             )
         except job_workspace.WorkspaceError as exc:
             details["candidate_harvest_error"] = str(exc)

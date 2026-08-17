@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
-from . import gate_ledger, job_runner, terminal_contract
+from . import gate_ledger, job_runner, job_workspace, terminal_contract
 
 
 _GIT_REPOSITORY_ENV_KEYS = frozenset(
@@ -159,6 +159,7 @@ def build_wrapper_script(
     run_gates: bool,
     stdin_prompt: str | None = None,
     write_sentinel: bool = True,
+    commit_bundle: str | None = None,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -168,6 +169,21 @@ def build_wrapper_script(
     2. 把 ``$?`` 寫入 exit sentinel（跨進程 durable 完成判定，早於 gate 階段，
        確保 gate 執行時間不會被算進模型的 exit code）；
     3. 由 manager 掌控的 gate ledger writer。
+
+    ``commit_bundle``（#623）：成果 bundle 的落點。非 None 時 script 改成**先把
+    模型的 ``$?`` 存進 shell 變數**，接著產 bundle，最後才寫 sentinel／跑 gate，
+    並以存下來的值收場。兩個理由：
+
+    - **順序**——sentinel 一出現，Manager 隨時可能在下一個 tick 判定完成並開始
+      回收。bundle 必須在 sentinel **之前**落地，否則回收會撞上一個還沒寫完的 spool。
+      降權模式沒有 job 側 sentinel，但 Manager 側的記帳 shell 等的是整個 unit
+      （``systemctl start --wait``），bundle 同樣先完成。
+    - **exit code 不得被污染**——降權模式下 unit 的 exit code 就是這支 script 的
+      exit code，而 Manager 的記帳 shell 記的正是它（#604）。多接一段 bundle 之後
+      若不還原 ``$?``，模型明明失敗卻會被記成成功（或反過來）。
+
+    ``commit_bundle`` 為 None 時（reviewer／planner，以及所有既有測試路徑）script
+    **逐字**與改動前相同。
 
     ``write_sentinel=False`` / ``run_gates=False``（#604，降權模式）：這支 script
     在降權模式下是以 **job 帳號**（`cortex-builder`）執行的，而 sentinel 與 ledger
@@ -201,6 +217,17 @@ def build_wrapper_script(
         command = (
             f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
         )
+    if commit_bundle is not None:
+        return _bundle_wrapper_script(
+            command=command,
+            sentinel=sentinel,
+            ledger=ledger,
+            worktree=worktree,
+            repo_root=repo_root,
+            run_gates=run_gates,
+            write_sentinel=write_sentinel,
+            commit_bundle=commit_bundle,
+        )
     if write_sentinel:
         script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
     else:
@@ -221,6 +248,56 @@ def build_wrapper_script(
         f"{script}; PYTHONPATH={shlex.quote(repo_root)} "
         f"{shlex.join(gate_argv)} >/dev/null 2>&1"
     )
+
+
+#: 存放模型 exit code 的 shell 變數名（#623 的 bundle 段用）。刻意帶 `__psc_` 前綴，
+#: 不與模型或 gate 階段可能設定的任何變數撞名。
+_RC_VAR = "__psc_rc"
+
+
+def _gate_segment(*, ledger: str, worktree: str, repo_root: str) -> str:
+    gate_argv = [
+        "python3",
+        "-m",
+        "paulsha_cortex.coordinator.gate_ledger",
+        "--out",
+        ledger,
+        "--worktree",
+        worktree,
+    ]
+    return (
+        f"PYTHONPATH={shlex.quote(repo_root)} {shlex.join(gate_argv)} >/dev/null 2>&1"
+    )
+
+
+def _bundle_wrapper_script(
+    *,
+    command: str,
+    sentinel: str,
+    ledger: str,
+    worktree: str,
+    repo_root: str | None,
+    run_gates: bool,
+    write_sentinel: bool,
+    commit_bundle: str,
+) -> str:
+    """#623：帶成果 bundle 的 wrapper。段序＝模型 → 存 `$?` → bundle → sentinel → gate → 還原 `$?`。
+
+    為什麼 bundle 段用 `git` 而不是像 gate 那樣呼叫一個 python module：降權模式下
+    builder 看到的是白名單 env、且它未必讀得到 Manager 的 repo root
+    （`ProtectHome=yes` 之後 `/home` 整個不可見，#623 缺口 1），`PYTHONPATH=<repo>`
+    這條路在那裡不成立。`git` 是 job 本來就必須有的工具。
+    """
+
+    segments = [command, f"{_RC_VAR}=$?", job_workspace.build_bundle_command(
+        workspace=worktree, bundle=commit_bundle
+    )]
+    if write_sentinel:
+        segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
+    if run_gates and repo_root:
+        segments.append(_gate_segment(ledger=ledger, worktree=worktree, repo_root=repo_root))
+    segments.append(f'exit "${_RC_VAR}"')
+    return "; ".join(segments)
 
 
 def _srt_runtime_root() -> Path | None:
@@ -1290,6 +1367,14 @@ class SubprocessLauncher:
         # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
         ledger = terminal_contract.gate_ledger_path(log_path)
         Path(ledger).unlink(missing_ok=True)
+        # #623：成果 bundle 的 per-job spool。`prepare_commit_spool()` 同樣負責清掉
+        # 上一輪殘留（與 sentinel／ledger 逐條一致），並把上一輪 harvest 之後的封存
+        # 解開。判準是 **persona**，不是 `PSC_JOB_RUNNER`：reviewer／planner 不產生
+        # commit，給它們一格 spool 只會多一個沒人寫的空目錄；builder 兩種模式走完全
+        # 相同的路徑（#634 的「以形狀判斷、不依旗標分支」原則）。
+        commit_bundle: str | None = None
+        if not (self._read_only or self._review_only):
+            commit_bundle = str(job_workspace.prepare_commit_spool(spool_key=slice_id))
         # cg（issue #442）走 stdin 傳 prompt，不是 argv 參數（見 build_cg_argv）：
         # 其餘 executor 維持既有「prompt 為 argv 一個元素」路徑，stdin_prompt=None
         # 時 build_wrapper_script 的行為與改動前逐字相同（零影響）。
@@ -1305,6 +1390,7 @@ class SubprocessLauncher:
             # #604：降權模式下 sentinel 改由 Manager 側的 exit 記帳 shell 寫；
             # job wrapper 內不得再出現任何指向 Manager log 目錄的寫入。
             write_sentinel=not degraded,
+            commit_bundle=commit_bundle,
         )
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         # 降權模式的 builder 同理（#588 第 2 點）：login shell 會在 transient unit 的

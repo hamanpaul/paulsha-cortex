@@ -49,9 +49,17 @@ from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 from paulsha_cortex.trust_root import permgen
 from paulsha_cortex.trust_root.registry import Principal, asset_by_id
 
+_ISOLATED_AGENTS_ROOT = tempfile.mkdtemp(prefix="psc-agents-root-")
+
 _BASE_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "HOME": "/var/lib/cortex-manager",
+    # conftest 的 `_clear_runtime_env` 把 PSC_AGENTS_ROOT 指向 per-test 暫存目錄，
+    # 但本檔的 launch 測試以 `clear=True` 重建整份 environ（要驗的就是白名單本身），
+    # 那層保護因此被清掉。顯式帶上一個 per-process 暫存根：`launcher.launch()` 會在
+    # coordinator 樹底下建這個 job 的成果 bundle spool（#623），少了它會落到 operator
+    # 的真實 `$HOME`——正是 conftest #303 註記要防的事。
+    "PSC_AGENTS_ROOT": _ISOLATED_AGENTS_ROOT,
     "LANG": "en_US.UTF-8",
     "PSC_REPO_ROOT": "/opt/cortex/venv/lib/python3/site-packages",
 }

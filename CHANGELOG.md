@@ -261,6 +261,32 @@
   `mock.patch.object` 打不到，測試實際驗到的是「本機有沒有那個帳號」而非它宣稱的分支。
 
 ### Changed
+- **#623 / trust-root Phase 2b：成果回收由「Manager 伸手進 builder 的 clone fetch」
+  改為 git bundle ＋ append-only spool**——#634 的回收做法
+  `git -C <來源樹> fetch <builder 的 clone>` 在三分下**行不通**（operator 0817 實機
+  驗證）：clone 是 builder-owned `0700`，Manager 直接 `cannot change to '…':
+  Permission denied`；而「對每個 job 的 clone 補 `safe.directory`」也不可行——實測
+  git 2.43 **不吃路徑 glob**，只認逐字相等或字面 `*`。改成 builder 在自己的 clone
+  產 bundle → 寫進 Manager-owned 的 append-only spool
+  （`<coordinator_root>/commit-spool/<job-id>/commits.bundle`，形態比照
+  `review-verdict-spool`：容器 `0700 cortex-manager`、producer 只獲 `wx` 無 `r` 的
+  per-account ACL、dispatch 當下 pre-seed、落地後 seal）→ Manager 從**那個檔案**
+  fetch。關鍵在 Manager 讀的是一個普通檔而不是一個 repo，dubious-ownership 與父鏈
+  traverse 兩個問題同時消失，回收全程**不存取 builder 的樹**（不變式測試以
+  `chmod 000` 釘住，並已做突變驗證）。bundle 在 wrapper 的模型 argv 之後、**exit
+  sentinel 之前**產生（sentinel 一出現 Manager 隨時可能開始回收），並以
+  `exit "$rc"` 還原模型的 exit code（降權模式下 unit 的 exit code 就是它，#604）。
+  `^<base>` 取自 provisioning 在 clone 內 pin 的 `refs/cortex/base`＝來源 repo 自己
+  `rev-parse --verify` 出來的 `exact_base`，因此「來源樹一定有 prerequisite」由單一
+  推導點對每條 lane 成立。bundle 缺席／prerequisite 缺席／帶錯 branch／非
+  fast-forward 四類全部 fail-closed 且訊息可操作（git 原文＋該怎麼辦）。bundle 成功
+  回收後保留並封存，取代 `refs/cortex/reclaimed/**` 對 clone 形狀的證據角色（該機制
+  本身也要 `git -C <clone>`，三分下同樣不可行）。`direct` 模式沿用 #634「以形狀判斷、
+  不依 `PSC_JOB_RUNNER` 分支」的原則，`commit_bundle=None` 時 wrapper 輸出逐字不變。
+  登記表資產與 OS 權限由 #636（已 merge）在 `trust_root/` 定義，路徑契約的權威
+  resolver 是 `config/paths.py:commit_spool_root()`；本次只做 coordinator 側。
+  新增 `tests/test_bundle_commit_harvest_623.py`（30 測試）。
+  詳見 `changelog.d/bundle-harvest.md`。
 - **#623 / trust-root Phase 2b：job 工作區模型由 `git worktree` 改為 per-job 完整
   clone——provisioning、成果回收與回收層**——M1（#584）之後 builder 以
   `cortex-builder`、Manager 以 `cortex-manager` 執行，實測顯示 `git worktree` 在三分

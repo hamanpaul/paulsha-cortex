@@ -4,7 +4,8 @@
 
 1. provision——守衛與 worktree 模型逐條等價，且失敗不留殘留
 2. 隔離——工作區裡沒有任何回寫來源 repo 的路徑；未回收前來源 repo 不受影響
-3. 成果回收——Manager 單向 fetch 回自己的樹，非 fast-forward fail-closed
+3. 成果回收——Manager 單向取回自己的樹（**搬運介面是 bundle**，見
+   `tests/test_bundle_commit_harvest_623.py`：Manager 不得存取 builder 的 clone）
 4. 回收——clone 走目錄刪除、封存 HEAD；linked worktree（升級前既存）仍走
    `git worktree remove`；主 checkout 一律拒絕
 """
@@ -68,6 +69,29 @@ def _builder_commit(workspace: Path, name: str = "builder.txt") -> str:
     _git(workspace, "add", name)
     _git(workspace, "commit", "-qm", f"builder: {name}")
     return _git(workspace, "rev-parse", "HEAD")
+
+
+def _produce_bundle(workspace: Path, spool_root: Path, *, key: str = "job-1") -> Path:
+    """以 **builder 身分**跑 production wrapper 裡那一段 bundle 命令，回傳落地的 bundle。
+
+    刻意不在測試裡自己組 `git bundle create`——另寫一份只會驗到測試自己。
+    """
+
+    bundle = job_workspace.prepare_commit_spool(spool_key=key, coordinator_root=spool_root)
+    subprocess.run(
+        ["bash", "-c", job_workspace.build_bundle_command(workspace=workspace, bundle=bundle)],
+        cwd=str(workspace), check=True, capture_output=True, text=True,
+    )
+    return bundle
+
+
+def _harvest(
+    repo: Path, workspace: Path, spool_root: Path, *, branch: str = _BRANCH, key: str = "job-1"
+) -> str:
+    """builder 產 bundle → Manager 從那個檔案回收（成果離開 job 帳號的唯一路徑）。"""
+
+    bundle = _produce_bundle(workspace, spool_root, key=key)
+    return job_workspace.harvest_branch(source_repo=repo, bundle=bundle, branch=branch)
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +287,7 @@ def test_manager_harvests_the_candidate_out_of_the_builder_clone(
     workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
     candidate = _builder_commit(workspace)
 
-    harvested = job_workspace.harvest_if_job_clone(
-        source_repo=repo, workspace=workspace, branch=_BRANCH
-    )
+    harvested = _harvest(repo, workspace, tmp_path / "coordinator")
 
     assert harvested == candidate
     assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == candidate
@@ -281,35 +303,41 @@ def test_harvest_rejects_a_rewritten_history_instead_of_absorbing_it(
     repo = _source_repo(tmp_path)
     workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
     first = _builder_commit(workspace)
-    job_workspace.harvest_branch(source_repo=repo, workspace=workspace, branch=_BRANCH)
+    _harvest(repo, workspace, tmp_path / "coordinator")
 
     _git(workspace, "reset", "-q", "--hard", "HEAD~1")
     _builder_commit(workspace, "rewritten.txt")
 
     with pytest.raises(job_workspace.WorkspaceError, match="not a fast-forward"):
-        job_workspace.harvest_branch(source_repo=repo, workspace=workspace, branch=_BRANCH)
+        _harvest(repo, workspace, tmp_path / "coordinator", key="job-2")
 
     assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == first
 
 
-def test_harvest_is_a_noop_for_a_workspace_that_is_not_a_job_clone(
+def test_harvest_is_a_noop_for_a_job_dispatched_before_the_spool_existed(
     tmp_path: Path,
 ) -> None:
-    """零回歸掛點：worktree 模型與測試裡的假路徑完全不受影響。"""
+    """零回歸掛點：worktree 模型與測試裡的假 job 記錄完全不受影響。"""
 
     repo = _source_repo(tmp_path)
     legacy = tmp_path / "legacy-worktree"
     _git(repo, "worktree", "add", "-q", "-b", "feature/legacy", str(legacy), "main")
 
     assert (
-        job_workspace.harvest_if_job_clone(
-            source_repo=repo, workspace=legacy, branch="feature/legacy"
+        job_workspace.harvest_if_spooled(
+            source_repo=repo,
+            job={"worktree": str(legacy), "log_path": str(tmp_path / "logs" / "legacy.jsonl")},
+            branch="feature/legacy",
+            coordinator_root=tmp_path / "coordinator",
         )
         is None
     )
     assert (
-        job_workspace.harvest_if_job_clone(
-            source_repo=repo, workspace=tmp_path / "does-not-exist", branch="feature/x"
+        job_workspace.harvest_if_spooled(
+            source_repo=repo,
+            job={"worktree": str(tmp_path / "does-not-exist")},
+            branch="feature/x",
+            coordinator_root=tmp_path / "coordinator",
         )
         is None
     )
@@ -325,7 +353,7 @@ def test_reclaim_removes_a_job_clone_and_leaves_no_residue(tmp_path: Path) -> No
     repo = _source_repo(tmp_path)
     workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
     _builder_commit(workspace)
-    job_workspace.harvest_branch(source_repo=repo, workspace=workspace, branch=_BRANCH)
+    _harvest(repo, workspace, tmp_path / "coordinator")
 
     result = worktree_reclaim.reclaim_worktree(workspace, repo_root=repo)
 
@@ -477,7 +505,7 @@ def test_gc_protects_the_branch_of_a_live_job_clone(tmp_path: Path) -> None:
     pool = tmp_path / "pool"
     workspace = Path(_creator(repo, pool).create(_BRANCH))
     _builder_commit(workspace)
-    job_workspace.harvest_branch(source_repo=repo, workspace=workspace, branch=_BRANCH)
+    _harvest(repo, workspace, tmp_path / "coordinator")
 
     artifacts = gc.scan(repo, worktree_root=pool)
     branch_rows = [item for item in artifacts if item.kind == "branch" and item.branch == _BRANCH]
@@ -523,10 +551,18 @@ def test_workflow_lane_harvests_the_candidate_when_the_card_is_accepted(
     repo = _source_repo(tmp_path)
     workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
     candidate = _builder_commit(workspace)
-    job = {"worktree": str(workspace), "branch": _BRANCH}
+    coordinator_root = tmp_path / "coordinator"
+    bundle = _produce_bundle(workspace, coordinator_root)
+    job = {
+        "worktree": str(workspace),
+        "branch": _BRANCH,
+        "log_path": str(tmp_path / "logs" / f"{bundle.parent.name}.jsonl"),
+    }
     run = SimpleNamespace(workspace_root=str(repo))
 
-    harvested = manager._harvest_build_candidate(job, run=run, candidate=candidate)
+    harvested = manager._harvest_build_candidate(
+        job, run=run, candidate=candidate, coordinator_root=coordinator_root
+    )
 
     assert harvested == candidate
     assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == candidate
@@ -535,20 +571,23 @@ def test_workflow_lane_harvests_the_candidate_when_the_card_is_accepted(
 def test_workflow_lane_harvest_is_a_noop_outside_the_clone_model(
     tmp_path: Path,
 ) -> None:
-    """既有部署零回歸：worktree 模型與測試裡的假 worktree 路徑完全不觸發回收。"""
+    """既有部署零回歸：worktree 模型與測試裡的假 job 記錄完全不觸發回收。"""
 
     repo = _source_repo(tmp_path)
     run = SimpleNamespace(workspace_root=str(repo))
+    coordinator_root = tmp_path / "coordinator"
 
     assert (
         manager._harvest_build_candidate(
-            {"worktree": str(repo), "branch": "main"}, run=run, candidate="0" * 40
+            {"worktree": str(repo), "branch": "main"},
+            run=run, candidate="0" * 40, coordinator_root=coordinator_root,
         )
         is None
     )
     assert (
         manager._harvest_build_candidate(
-            {"worktree": "", "branch": _BRANCH}, run=run, candidate="0" * 40
+            {"worktree": "", "branch": _BRANCH},
+            run=run, candidate="0" * 40, coordinator_root=coordinator_root,
         )
         is None
     )
@@ -560,11 +599,19 @@ def test_workflow_lane_harvest_fails_closed_when_the_head_does_not_match(
     repo = _source_repo(tmp_path)
     workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
     _builder_commit(workspace)
-    job = {"worktree": str(workspace), "branch": _BRANCH}
+    coordinator_root = tmp_path / "coordinator"
+    bundle = _produce_bundle(workspace, coordinator_root)
+    job = {
+        "worktree": str(workspace),
+        "branch": _BRANCH,
+        "log_path": str(tmp_path / "logs" / f"{bundle.parent.name}.jsonl"),
+    }
     run = SimpleNamespace(workspace_root=str(repo))
 
     with pytest.raises(ValueError, match="harvest head mismatch"):
-        manager._harvest_build_candidate(job, run=run, candidate="0" * 40)
+        manager._harvest_build_candidate(
+            job, run=run, candidate="0" * 40, coordinator_root=coordinator_root
+        )
 
 
 def test_slice_lane_verification_harvests_before_reading_the_branch(
@@ -580,6 +627,7 @@ def test_slice_lane_verification_harvests_before_reading_the_branch(
     base = _git(repo, "rev-parse", "main")
     workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
     candidate = _builder_commit(workspace)
+    bundle = _produce_bundle(workspace, tmp_path / "coordinator")
     contract = {
         "docs_class": "trivial",
         "review_policy": "not-required",
@@ -600,7 +648,12 @@ def test_slice_lane_verification_harvests_before_reading_the_branch(
             "dispatch_base": base,
             "verification": {"contract": contract},
         },
-        job={"task": "clone-623", "branch": _BRANCH, "worktree": str(workspace)},
+        job={
+            "task": "clone-623",
+            "branch": _BRANCH,
+            "worktree": str(workspace),
+            "log_path": str(tmp_path / "logs" / f"{bundle.parent.name}.jsonl"),
+        },
         repo_root=repo,
         coordinator_root=tmp_path / "coordinator",
     )
@@ -620,9 +673,7 @@ def test_end_to_end_provision_commit_harvest_reclaim(tmp_path: Path) -> None:
     # 檔案權限那一半屬 trust-root 的 chown／ACL，不在本層）
     assert job_workspace.SOURCE_REMOTE not in _git(workspace, "remote").splitlines()
 
-    harvested = job_workspace.harvest_branch(
-        source_repo=repo, workspace=workspace, branch=_BRANCH
-    )
+    harvested = _harvest(repo, workspace, tmp_path / "coordinator")
     assert harvested == candidate
     assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == candidate
 
