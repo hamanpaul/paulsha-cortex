@@ -76,7 +76,6 @@ chain：model 既不能自證成功、也不能自證失敗）。bundle 內容�
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import shutil
@@ -86,6 +85,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from paulsha_cortex.config import paths
+
+from . import spool_slot
 
 #: clone 工作區的識別標記檔名，寫在 clone 自己的 `.git/` 底下。
 #:
@@ -127,8 +128,9 @@ ARCHIVE_REF_PREFIX = "refs/cortex/reclaimed"
 #: :func:`harvest_branch` 的錯誤分類。
 BASE_REF = "refs/cortex/base"
 
-#: per-job spool 裡那一份 bundle 的檔名。
-COMMIT_BUNDLE_FILENAME = "commits.bundle"
+#: per-job spool 裡那一份 bundle 的檔名（權威定義在 `spool_slot`，與
+#: `review-verdict-spool` 的成果檔名並列在同一處）。
+COMMIT_BUNDLE_FILENAME = spool_slot.COMMIT_BUNDLE_FILENAME
 
 #: builder 產 bundle 時的暫存名。先寫 `<name>.part`、`chmod` 後 `mv` 成正式名，
 #: 讓 spool 裡「存在」的那個檔恆為完整檔——中途被 kill 只會留下 `.part`。
@@ -372,60 +374,57 @@ def prepare_commit_spool(
 ) -> Path:
     """dispatch 當下建立 per-job 那一格，回傳 bundle 應該落地的路徑。
 
+    生命週期本身走 :mod:`spool_slot`（與 `review-verdict-spool` 共用同一份實作，
+    #638）；本函式只負責 commit-spool 專屬的部分：路徑推導、symlink 守衛，以及把
+    共用層的錯誤翻成 :class:`WorkspaceError`。
+
     守衛與慣例：
 
-    - spool 目錄或 bundle 是 **symlink** → 一律移除／拒絕。Manager 之後會直接
+    - spool 目錄或 bundle 是 **symlink** → 一律拒絕。Manager 之後會直接
       `git fetch <那個檔案>`，讓它指向別處等於把回收路徑外包出去。
-    - 目錄以 `0700` 建立；**已存在時重新 `chmod 0700`**，把上一輪 harvest 之後的
-      封存（見 :func:`seal_commit_spool`）解開。同一個 key 會被重跑（retry 用同一個
-      slice_id／同一張卡重派），這與 `launcher.launch()` 對 exit sentinel 與 gate
-      ledger 的處置逐條一致。
-    - 殘留的 bundle（含 `.part`）在起跑前清掉。**這比「已存在即拒絕」更強**：預埋一份
-      bundle 的人得到的不是拒絕派工，而是自己的檔案被刪掉；而 Manager 是這一格的
-      owner，刪得掉 builder 寫的檔（目錄 `w`＋`x` 即可）。
+    - 那一格以 `reset=True` 建立：同一個 key 會被重跑（retry 用同一個 slice_id／
+      同一張卡重派），上一輪 harvest 之後的封存（見 :func:`seal_commit_spool`）
+      必須重新開封。這與 `launcher.launch()` 對 exit sentinel 與 gate ledger 的
+      處置逐條一致。`spool_slot.create_slot()` 的解封做法是**整格重建**而不是
+      `chmod` 回去——理由見該函式（`chmod` 只能猜一個 mask，正確的 mask 由
+      default ACL 重新繼承才拿得到，#638 缺陷 1）。
+    - 重建同時涵蓋了「殘留的 bundle（含 `.part`）在起跑前清掉」。**這比「已存在
+      即拒絕」更強**：預埋一份 bundle 的人得到的不是拒絕派工，而是自己的檔案被
+      刪掉；而 Manager 是這一格的 owner，刪得掉 builder 寫的檔。
 
-    真正的 owner／mode／ACL 由 Phase 2b 的 permgen 依 R1 登記表套用（資產由 #636
+    **不再傳明確 mode**（#638 缺陷 1）：在帶 default ACL 的樹上，`mkdir(mode=…)`
+    會把 mask 一起重設，把 builder 繼承來的具名條目壓成 `#effective:---`，實機
+    後果是 builder 連 `commits.bundle.part.lock` 都建不出來。初始權限交給 default
+    ACL，事後只**檢查**並收窄 `other`（見 `spool_slot.narrow_inherited_mode()`）。
+
+    真正的 owner／ACL 由 Phase 2b 的 permgen 依 R1 登記表套用（資產由 #636
     定義）；本函式只負責「這一格存在、而且是乾淨的」。
     """
 
     spool_dir = commit_spool_dir(spool_key=spool_key, coordinator_root=coordinator_root)
-    if spool_dir.is_symlink():
-        raise WorkspaceError(f"commit spool directory is a symlink: {spool_dir}")
-    spool_dir.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    spool_dir.mkdir(mode=0o700, exist_ok=True)
-    if not spool_dir.is_dir():
-        raise WorkspaceError(f"commit spool directory unavailable: {spool_dir}")
     try:
-        os.chmod(spool_dir, 0o700)
-    except OSError as exc:
-        raise WorkspaceError(f"commit spool directory not writable: {spool_dir}: {exc}") from exc
-    bundle = spool_dir / COMMIT_BUNDLE_FILENAME
-    for stale in (bundle, bundle.with_name(bundle.name + COMMIT_BUNDLE_PART_SUFFIX)):
-        if stale.is_symlink() or stale.exists():
-            stale.unlink(missing_ok=True)
-    return bundle
+        spool_slot.create_slot(spool_dir, reset=True)
+    except spool_slot.SpoolSlotError as exc:
+        if exc.kind == "symlink":
+            raise WorkspaceError(f"commit spool directory is a symlink: {spool_dir}") from exc
+        raise WorkspaceError(f"commit spool directory unavailable: {spool_dir}: {exc}") from exc
+    return spool_dir / COMMIT_BUNDLE_FILENAME
 
 
 def seal_commit_spool(bundle: str | Path) -> None:
     """成果落地後把該 job 那一格轉唯讀（append-only spool 的封口）。
 
-    封的是**目錄**（`0500`）而不是檔案：bundle 由 builder 的 uid 建立，Manager 不是
-    它的 owner、`chmod` 不了它；但 Manager 是目錄的 owner，收掉目錄的 `w` 之後該格
-    就再也建不了、改不了名、刪不掉任何檔——而 POSIX ACL 的 mask 同時被 `chmod` 收窄，
-    producer 的 `wx` 授權一併失效。
+    封的是**目錄**而不是檔案：bundle 由 builder 的 uid 建立，Manager 不是它的
+    owner、`chmod` 不了它（#638 缺陷 3）；但 Manager 是目錄的 owner，收掉目錄的
+    `w` 之後該格就再也建不了、改不了名、刪不掉任何檔——而 POSIX ACL 的 mask 同時
+    被 `chmod` 收窄，producer 具名條目的 `wx` 授權一併失效。實作與
+    `review-verdict-spool` 共用 `spool_slot.seal_slot()`。
 
     best-effort：封存失敗不得讓一次**已經成功**的回收反而失敗（回收失敗才是
     #478／#601 的生產事故）。權威副本此時已經在來源樹的 `refs/heads/<branch>` 裡。
     """
 
-    target = Path(bundle)
-    try:
-        spool_dir = target.parent
-        if spool_dir.is_symlink() or not spool_dir.is_dir():
-            return
-        os.chmod(spool_dir, 0o500)
-    except OSError:
-        return
+    spool_slot.seal_slot(Path(bundle).parent)
 
 
 def build_bundle_command(*, workspace: str | Path, bundle: str | Path) -> str:
@@ -448,9 +447,12 @@ def build_bundle_command(*, workspace: str | Path, bundle: str | Path) -> str:
     - **負向 ref 是 `^refs/cortex/base`**（provision 當下 pin 的來源樹 commit，見
       :data:`BASE_REF`），讓 bundle 只帶這一輪的增量而不是整部歷史。
     - **`.part` → `chmod` → `mv`**：spool 裡看得見的 `commits.bundle` 恆為完整檔；
-      `chmod 0644` 是因為檔由 builder 的 umask 建立（降權 unit 常帶 `UMask=0077`），
-      Manager 讀不到自己就沒東西可回收。放寬到 0644 不擴張暴露面——那一格的容器是
-      `0700 cortex-manager` ＋ per-account `wx`，別的帳號連 traverse 都進不來。
+      `chmod` 到 `spool_slot.PUBLISHED_FILE_MODE` 是 #638 缺陷 2 的修法（producer
+      自己放寬給 consumer）——檔由 builder 的 umask 建立（降權 unit 常帶
+      `UMask=0077`），Manager 讀不到自己就沒東西可回收。放寬不擴張暴露面：那一格的
+      容器是 `0700 cortex-manager` ＋ per-account `wx`，別的帳號連 traverse 都進不來。
+      `review-verdict-spool` 走同一個常數（那邊的 producer 是模型，因此改由 wrapper
+      script 的 `spool_slot.publish_file_command()` 段執行）。
 
     整段用 `&&` 串接：任何一步失敗都不會發表一個半成品 bundle。
     """
@@ -461,7 +463,7 @@ def build_bundle_command(*, workspace: str | Path, bundle: str | Path) -> str:
     return (
         f"git -C {workspace_arg} bundle create {part} "
         f'"$(git -C {workspace_arg} symbolic-ref HEAD)" ^{shlex.quote(BASE_REF)} '
-        f"&& chmod 0644 {part} && mv -f {part} {final}"
+        f"&& chmod {spool_slot.PUBLISHED_FILE_MODE:04o} {part} && mv -f {part} {final}"
     )
 
 

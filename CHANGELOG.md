@@ -88,6 +88,29 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#638 / trust-root：兩個 spool 的 producer／consumer 權限模型在三分下三處失效——
+  verdict 通道（Phase 2a）實際從未成立過，`commit-spool` 繼承了同樣的缺陷**——三個
+  獨立缺陷全部有 operator 的實機證據：(1) per-job 目錄以明確 mode 建立會**重設 ACL
+  mask**，把 default ACL 繼承來的具名條目壓成 `#effective:---`，producer 連建檔都不行
+  （實機 `fatal: Unable to create '…/commits.bundle.part.lock': Permission denied`）；
+  (2) `wx` 無 `r` 的那一格上，producer 建的檔由 producer 擁有，**consumer 讀不到**；
+  (3)「落地後轉唯讀」實作成 `chmod` producer 擁有的**檔案**，而只有 owner 或 root
+  能 chmod，該處又刻意不 raise ⇒ **無聲失敗**，實測 reviewer 可以在 Manager 判讀之後
+  回頭覆寫自己的 verdict。修法：per-job 目錄**不傳明確 mode**（初始權限交給 default
+  ACL，事後只檢查並收窄 `other`；有 ACL 時 `group` 位就是 mask，刻意不動）；producer
+  寫完後自己 `chmod 0644`（verdict 那邊由 wrapper script 在模型結束後補一段，排在
+  exit sentinel 之前且不污染 `$?`）；seal 改封**目錄**（`0500`——consumer 是目錄的
+  owner，收掉 `w` 讓那一格定版，`chmod` 同時把 mask 收成 `---`，producer 具名條目的
+  traverse 一併失效）。兩個 spool 的 per-job 生命週期收斂到新的
+  `coordinator/spool_slot.py`——這個 bug 之所以有兩個實例，正是因為兩邊各自實作。
+  pre-seed 守衛語意與 operator 看到的錯誤字串一字未變。新增
+  `tests/test_spool_permission_model_638.py`：**自己建出帶 default ACL 的容器**並直接
+  斷言具名條目的 **effective 權限**（不是斷言 mode），同一組不變式參數化涵蓋
+  `review-verdict-spool` 與 `commit-spool`，另含一條把「修法前的形狀在同一個 fixture
+  下必須是紅的」釘住的突變驗證；跨 UID 的正反向功能驗收需要 root，拿不到時（以及檔案
+  系統不支援 ACL 時）**明確 skip 並說明理由**，不靜默通過。本票是 M2（#615）的前置：
+  verdict 通道目前只因 reviewer 仍以 Manager 帳號在行程內跑而看似正常，M2 一落地即
+  整條斷。（Closes #638）
 - **#626 / trust-root：permgen 為不存在的 principal 產生 `setfacl`，`sh -e` 下中止整份
   script 留下半套用的權限樹**——`permissions --commands --paths` 會印出
   `setfacl -m u:operator:rX …` 與 `setfacl -m u:cortex-outbox:rX …`，但這兩個是

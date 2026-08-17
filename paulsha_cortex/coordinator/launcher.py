@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
-from . import gate_ledger, job_runner, job_workspace, terminal_contract
+from . import gate_ledger, job_runner, job_workspace, spool_slot, terminal_contract
 
 
 _GIT_REPOSITORY_ENV_KEYS = frozenset(
@@ -160,6 +160,7 @@ def build_wrapper_script(
     stdin_prompt: str | None = None,
     write_sentinel: bool = True,
     commit_bundle: str | None = None,
+    verdict_file: str | None = None,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -182,8 +183,18 @@ def build_wrapper_script(
       exit code，而 Manager 的記帳 shell 記的正是它（#604）。多接一段 bundle 之後
       若不還原 ``$?``，模型明明失敗卻會被記成成功（或反過來）。
 
-    ``commit_bundle`` 為 None 時（reviewer／planner，以及所有既有測試路徑）script
-    **逐字**與改動前相同。
+    ``verdict_file``（#638 缺陷 2）：reviewer verdict spool 的落點。非 None 時在
+    模型之後追加一段 ``chmod``，把 reviewer 寫出來的 verdict 放寬到 Manager 讀得到
+    ——那個檔由 **reviewer 的 uid** 建立、又常帶降權 unit 的 ``UMask=0077``，
+    Manager 是**目錄**的 owner 但那不給檔案內容的讀取權，consumer 讀不到整條
+    verdict 通道就不成立。與 bundle 段的 ``chmod`` 是**同一個修法的兩個實例**
+    （共用 :data:`spool_slot.PUBLISHED_FILE_MODE`），差別只在 bundle 的 producer
+    是 Manager 組出來的 ``git`` 命令、verdict 的 producer 是模型本身——模型不會
+    自己 chmod，所以那一步必須由 wrapper 在它結束後補上。段序同樣排在 sentinel
+    **之前**，理由與 bundle 一致。
+
+    ``commit_bundle`` 與 ``verdict_file`` 皆為 None 時（planner，以及所有既有測試
+    路徑）script **逐字**與改動前相同。
 
     ``write_sentinel=False`` / ``run_gates=False``（#604，降權模式）：這支 script
     在降權模式下是以 **job 帳號**（`cortex-builder`）執行的，而 sentinel 與 ledger
@@ -217,8 +228,8 @@ def build_wrapper_script(
         command = (
             f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
         )
-    if commit_bundle is not None:
-        return _bundle_wrapper_script(
+    if commit_bundle is not None or verdict_file is not None:
+        return _publishing_wrapper_script(
             command=command,
             sentinel=sentinel,
             ledger=ledger,
@@ -227,6 +238,7 @@ def build_wrapper_script(
             run_gates=run_gates,
             write_sentinel=write_sentinel,
             commit_bundle=commit_bundle,
+            verdict_file=verdict_file,
         )
     if write_sentinel:
         script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
@@ -270,7 +282,7 @@ def _gate_segment(*, ledger: str, worktree: str, repo_root: str) -> str:
     )
 
 
-def _bundle_wrapper_script(
+def _publishing_wrapper_script(
     *,
     command: str,
     sentinel: str,
@@ -279,19 +291,31 @@ def _bundle_wrapper_script(
     repo_root: str | None,
     run_gates: bool,
     write_sentinel: bool,
-    commit_bundle: str,
+    commit_bundle: str | None,
+    verdict_file: str | None,
 ) -> str:
-    """#623：帶成果 bundle 的 wrapper。段序＝模型 → 存 `$?` → bundle → sentinel → gate → 還原 `$?`。
+    """帶「成果發表」段的 wrapper。
+
+    段序＝模型 → 存 `$?` → bundle（#623）→ verdict 放寬（#638）→ sentinel →
+    gate → 還原 `$?`。
+
+    兩個發表段都排在 sentinel **之前**：sentinel 一出現，Manager 隨時可能在下一個
+    tick 判定完成並開始收割，成果必須先落地且已經是 consumer 讀得到的形狀。
 
     為什麼 bundle 段用 `git` 而不是像 gate 那樣呼叫一個 python module：降權模式下
     builder 看到的是白名單 env、且它未必讀得到 Manager 的 repo root
     （`ProtectHome=yes` 之後 `/home` 整個不可見，#623 缺口 1），`PYTHONPATH=<repo>`
-    這條路在那裡不成立。`git` 是 job 本來就必須有的工具。
+    這條路在那裡不成立。`git` 是 job 本來就必須有的工具；verdict 段只用 `chmod`，
+    同理。
     """
 
-    segments = [command, f"{_RC_VAR}=$?", job_workspace.build_bundle_command(
-        workspace=worktree, bundle=commit_bundle
-    )]
+    segments = [command, f"{_RC_VAR}=$?"]
+    if commit_bundle is not None:
+        segments.append(
+            job_workspace.build_bundle_command(workspace=worktree, bundle=commit_bundle)
+        )
+    if verdict_file is not None:
+        segments.append(spool_slot.publish_file_command(verdict_file))
     if write_sentinel:
         segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
     if run_gates and repo_root:
@@ -1375,6 +1399,16 @@ class SubprocessLauncher:
         commit_bundle: str | None = None
         if not (self._read_only or self._review_only):
             commit_bundle = str(job_workspace.prepare_commit_spool(spool_key=slice_id))
+        # #638 缺陷 2：reviewer 寫出來的 verdict 由 **reviewer 的 uid** 建立
+        # （降權 unit 常帶 `UMask=0077`），Manager 是那一格目錄的 owner 但那不給
+        # 檔案內容的讀取權——不補這一步，verdict 通道在三分下讀不到任何東西。
+        # 落點由 Manager 在 dispatch 當下決定（`as_verdict_spool_writer()` 帶進來
+        # 的就是那一格），因此這裡不需要、也不該讓模型自述路徑。
+        verdict_file: str | None = None
+        if self._verdict_spool_dir is not None:
+            verdict_file = str(
+                Path(self._verdict_spool_dir) / spool_slot.REVIEW_VERDICT_FILENAME
+            )
         # cg（issue #442）走 stdin 傳 prompt，不是 argv 參數（見 build_cg_argv）：
         # 其餘 executor 維持既有「prompt 為 argv 一個元素」路徑，stdin_prompt=None
         # 時 build_wrapper_script 的行為與改動前逐字相同（零影響）。
@@ -1391,6 +1425,7 @@ class SubprocessLauncher:
             # job wrapper 內不得再出現任何指向 Manager log 目錄的寫入。
             write_sentinel=not degraded,
             commit_bundle=commit_bundle,
+            verdict_file=verdict_file,
         )
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         # 降權模式的 builder 同理（#588 第 2 點）：login shell 會在 transient unit 的

@@ -434,6 +434,24 @@ repo」。裁決前先排除了一條看似最省事的路：**`git worktree` �
   `durable_state_owner`、mode 0700，producer 僅獲 **`wx` 無 `r`** 的 per-account ACL，
   per-job 目錄由 Manager 在 dispatch 當下建立、落地後轉唯讀。
 
+##### 兩個 spool 的 per-job 生命週期（#638）
+
+`review-verdict-spool` 與 `commit-spool` 的那一格 SHALL 走**同一套**實作
+（`coordinator/spool_slot.py`）——形態相同而各自實作，缺陷就會有兩個實例，#638 的
+三個缺陷正是這樣出現的。三條規則：
+
+- **per-job 目錄 MUST NOT 以明確 mode 建立。** 在帶 default ACL 的容器下，明確
+  mode 會連 **ACL mask** 一起重設，把繼承來的具名條目壓成 `#effective:---`，
+  producer 因此連建檔都不行。初始權限交給 default ACL，事後只**檢查**並收窄
+  `other` 位；`group` 位在有 ACL 時**就是 mask**，MUST NOT 被收窄。
+- **producer SHALL 在寫完後自行把成果放寬到 consumer 讀得到**（0644）。`wx` 無
+  `r` 的那一格上檔案由 producer 擁有，容器 owner 的身分不給檔案內容的讀取權。
+  放寬不擴張暴露面——容器是 `0700 <durable_state_owner>`，別的帳號連 traverse
+  都進不來。
+- **seal SHALL 封目錄，MUST NOT 只 `chmod` 成果檔。** 只有檔案 owner 或 root 能
+  `chmod`，而成果是 producer 擁有的；封目錄則是 consumer 對自己**擁有**的那一項
+  操作，且 `chmod` 同時把 mask 收成 `---`，producer 具名條目的 traverse 一併失效。
+
 ##### `repo-source-tree` 的 owner：從 root 改為 Manager（0817 裁決）
 
 本節初版（PR #636 第一版）把 writer 定為部署身分，理由是「Manager 被攻陷也改不了每個

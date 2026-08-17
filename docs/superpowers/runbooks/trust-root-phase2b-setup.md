@@ -805,6 +805,13 @@ sudo -u cortex-builder ls /var/lib/cortex/coordinator/commit-spool 2>&1 | tail -
 sudo -u cortex-reviewer-planner sh -c \
   "touch /var/lib/cortex/coordinator/commit-spool/probe" 2>&1 | tail -1
 #   期望：Permission denied（producer 只有 builder）
+
+# ✅ 驗證（#638）：dispatch 之後那**一格**的具名條目沒有被 mask 遮掉
+getfacl -p /var/lib/cortex/coordinator/commit-spool/<job-id> 2>/dev/null \
+  | grep -E '^(user:cortex-builder|mask)'
+#   期望：user:cortex-builder:-wx（**不得**帶 `#effective:---`）、mask::-wx 或更寬
+#   出現 `mask::---` ⇒ 那一格是以明確 mode 建立的（#638 缺陷 1 復發），
+#         builder 會在 `commits.bundle.part.lock` 這一步就 Permission denied。
 ```
 
 **更新來源樹**（日常操作）：Manager 現在是 owner，因此**服務自己就能** `fetch`；以
@@ -967,8 +974,27 @@ sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | x
 Phase 2a（PR #599）已把 review verdict 的落點從 reviewer worktree 搬到
 `/var/lib/cortex/coordinator/review-verdicts/<reviewer_job_id>/verdict.json`
 （登記表 `review-verdict-spool`，spec §R2）。**程式碼側已完成**：per-job 目錄由
-Manager 在 dispatch 當下以 `0700` 建立、帶 pre-seed 守衛，落地後轉 `0444`；reviewer
-身分由 Manager job registry 推導，verdict payload 的自述綁定欄位一律忽略。
+Manager 在 dispatch 當下建立、帶 pre-seed 守衛，落地後把**那一格目錄**轉唯讀
+（`0500`）；reviewer 身分由 Manager job registry 推導，verdict payload 的自述綁定
+欄位一律忽略。
+
+> **#638 修正的三件事**（三分下才看得見，單 UID 環境全部無感）：
+>
+> 1. per-job 目錄**不再以明確 mode 建立**——明確 mode 會把 default ACL 繼承來的
+>    具名條目連同 **mask** 一起重設成 `#effective:---`，reviewer 因此連 verdict
+>    都寫不出來（`commit-spool` 的同一個 bug 讓 builder 連 `.part.lock` 都建不了）。
+> 2. verdict 由 **reviewer 自己在寫完後 `chmod 0644`**（wrapper script 的發表段）
+>    ——否則檔由 reviewer 擁有、又常帶 `UMask=0077`，Manager 讀不到。
+> 3. seal 從「`chmod 0444` verdict 檔」改成「封**目錄**」——只有 owner 或 root 能
+>    `chmod`，Manager 不是 verdict 的 owner，舊做法必定 `PermissionError` 且刻意
+>    不 raise ⇒ **無聲失敗**，reviewer 可以在 Manager 判讀之後回頭覆寫自己的 verdict。
+>
+> 驗證（三分主機上，spool 那一格建立之後）：
+>
+> ```bash
+> # 期望：具名條目沒有 #effective:--- ，mask 不是 ---
+> sudo getfacl -p /var/lib/cortex/coordinator/review-verdicts/<reviewer_job_id>
+> ```
 
 spool 根的權限**已包含在第 2 步的權限 script 內**（它是登記表資產），這裡只做確認：
 
