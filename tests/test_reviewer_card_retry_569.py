@@ -125,7 +125,12 @@ def _steps_stopped_at(card: str):
 
 
 def _init_candidate_repo(repo: Path) -> str:
-    """真實 git repo：reviewer sandbox 是 `git clone` + `checkout <candidate>`。"""
+    """真實 git repo：reviewer sandbox 是 `git clone` + `checkout <candidate>`。
+
+    #650 之後這棵樹是 **run.workspace_root（來源樹）**，不再是 builder 的工作區：
+    candidate 由 `_harvest_build_candidate()` 搬進來源樹，verify／review 卡的
+    candidate 樹是 Manager 自己從那裡 clone 出來的。
+    """
 
     repo.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
@@ -178,14 +183,17 @@ def _stuck_reviewer_run(
     已有一顆乾淨終止（exit 0）但 log 無 JSON envelope、evidence 未綁定的 job。"""
 
     workspace = tmp_path / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / PLAN_REF).parent.mkdir(parents=True, exist_ok=True)
-    (workspace / PLAN_REF).write_text(PLAN_TEXT, encoding="utf-8")
     builder_worktree = tmp_path / "builder-worktree"
+    builder_worktree.mkdir(parents=True, exist_ok=True)
     if with_git:
-        candidate = _init_candidate_repo(builder_worktree)
+        # #650：candidate 在**來源樹**裡（harvest 之後的實況），reviewer 的 candidate
+        # 樹由 Manager 從這裡 clone。builder 的工作區留成一個普通目錄——本票的重點
+        # 就是 verify／review 派工不再讀它。
+        candidate = _init_candidate_repo(workspace)
     else:
-        builder_worktree.mkdir(parents=True, exist_ok=True)
+        workspace.mkdir(parents=True, exist_ok=True)
+        (workspace / PLAN_REF).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / PLAN_REF).write_text(PLAN_TEXT, encoding="utf-8")
         candidate = "d" * 40
 
     snapshot = _snapshot(tmp_path / "snapshot.json")

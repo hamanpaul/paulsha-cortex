@@ -769,9 +769,11 @@ def _ship_workspace_id(run, candidate: str) -> str:
     candidate 的前綴：ship 段的工作區是綁在 **(run, 這個 candidate)** 上的，而
     `openspec-archive` 一旦回收成功，`candidate_head` 就會前進到 archive commit
     ——下一輪 ship 因此拿到**另一個**識別、另一棵樹，前一棵原地留著（它正是
-    `_record_manager_ship_job()` 記在 archive 卡上的 `worktree`，post-archive 的
-    verify／review 卡仍以它為 candidate 樹，見
-    `manager._dispatch_workflow_card()` 的 `builder_jobs[-1]["worktree"]`）。
+    `_record_manager_ship_job()` 記在 archive 卡上的 `worktree`，是那張卡的稽核
+    定錨）。#650 之後 post-archive 的 verify／review 卡**不再讀這棵樹**：它們自己
+    從來源樹 clone 一棵 `wf-<run 摘要>-review-<candidate 前綴>`（見
+    `manager._reviewer_candidate_workspace()`），archive commit 已由 #649 的回收
+    通道搬進來源樹。
 
     反過來說，**同一個 candidate 的每一次 ship tick 共用同一棵樹**：ship phase 會
     被 tick 很多次（等 preflight、等 PR、等 copilot、等 merge），每次都 clone 一
@@ -904,9 +906,9 @@ def _manager_ship_workspace(
     識別由 :func:`_ship_workspace_id` 決定（穩定於 (run, candidate)）：同一個
     candidate 的多次 tick 重用同一棵樹（重用前一律打回 pristine，見
     :func:`_reset_ship_workspace`），candidate 前進時換一棵新的。**不在這裡刪**
-    ——archive 卡的 job 記錄指著這棵樹，post-archive 的 verify／review 卡仍以
-    `builder_jobs[-1]["worktree"]` 當 candidate 樹；回收交給 `cortex work gc`，
-    與 build 卡的 clone 同一套。
+    ——archive 卡的 job 記錄指著這棵樹（`_record_manager_ship_job()` 的
+    `worktree`／`workflow_repo_root`）；回收交給 `cortex work gc`，與 build 卡的
+    clone 同一套。
 
     ## 紅線
 

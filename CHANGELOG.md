@@ -8,6 +8,36 @@
 ## [Unreleased]
 
 ### Added
+- **#650：verify／review 卡的 candidate 樹搬出 builder 的 clone——解開擋住「卡被採信後
+  即時回收」的最後一條引用**——`_dispatch_workflow_card()` 的 reviewer 分支以
+  `builder_jobs[-1]["worktree"]` 為 candidate 樹，六個用途全掛在它身上；#648 之後一個 run
+  會累積 N 棵這種樹（每棵約 35MB），而 `_harvest_build_candidate()` 落地後**被採信的卡的
+  工作區已無任何獨佔資訊**（bundle 已封存、commit 已在來源樹），唯一還讓它回收不掉的就是
+  這條引用。**六個用途逐個查證**後只有 `_create_reviewer_sandbox()` 是「只需要 candidate
+  這個 commit」（來源樹就夠）；其餘五個都要一棵**真的 checkout 在 candidate 上、且 Manager
+  可寫**的樹——`_authority_map_with_checkbox_tolerance()` 要比對 builder 勾過的 `tasks.md`
+  實檔（#310），`_workflow_input_snapshot()` 會往樹裡 seed 缺席的 planning authority 檔，
+  `_workflow_output_baseline()` 必須與 canonical report 的發佈根同源，`_tree_snapshot()`
+  的逃逸偵測對象必須活過 sandbox 拆除，而 job 記錄的 `workflow_repo_root` 還是**卡與卡的
+  交接載體**（`adversarial-review.requires` 就是 `code-review.produces` 發佈進去的那份未
+  追蹤 report）。因此**票上的 A／B 皆不成立**（per-job clone 與 sandbox 都留不住上一張卡
+  的 report），C 是把耦合固化成回收特例；改採 **A′：per-(run, candidate) 的 Manager-owned
+  clone**，形狀完全沿用 #653 的 `_manager_ship_workspace()`——新增
+  `manager._reviewer_candidate_workspace_id()`（唯一推導點，
+  `wf-<run 摘要>-review-<candidate 前綴>`）、`_require_reviewer_candidate_workspace()`
+  （branch／HEAD＝candidate／**追蹤檔**無漂移；未追蹤的 canonical report 刻意放行，那是
+  交接載體不是殘留）與 `_reviewer_candidate_workspace()`（在來源樹上 clone，重用**不**打回
+  pristine）。票上點名的順序問題（input snapshot 是 sandbox 的輸入、算它時 sandbox 還不
+  存在）在 A′ 下**不存在**：借 #653 的「同一次派工內結構性共用同一個 provisioning」，
+  candidate 樹在 reviewer 分支之前建好一次，五個用途拿到同一棵樹。順帶收掉一個 #641 同型
+  缺口——舊模型下 Manager 對 builder 的 `0700` clone 做的不只是讀（seed 檔案、遞迴
+  snapshot），降權部署下必然 `Permission denied`。`_is_exact_reviewer_terminal_recovery()`
+  的 candidate 樹定錨改為唯一推導點，舊形狀保留為升級當下的容忍面。**即時回收拆後續票**：
+  `worktree_reclaim` 的「不銷毀證據」需要讀進 builder 的 `0700` clone，三分下必然失敗，
+  「誰以什麼身分回收、abandon／retry 的重入」自成一票（**#658**）。紅線全數遵守（沒有加回 job 工作樹
+  的 ACL、沒有 `--reference`／`--shared`、回收通道一個位元組沒改）。新增
+  `tests/test_reviewer_candidate_tree_650.py`（10 條 ＋ 1 條 skip，全部跑正式路徑；突變驗證 7 條轉紅，
+  `chmod 000` 那條逐字重現 `PermissionError: [Errno 13] Permission denied`）。
 - **#653 / trust-root Phase 2b：ship 段搬出 builder 的 clone——降權模式下 canonical lane
   終於跑得完整個 run**——#654 查證出的形狀：`openspec-archive`／`policy-commit`
   **不是降權派工的對象**（persona 是 `manager`，`_dispatch_workflow_card()` 對 ship phase

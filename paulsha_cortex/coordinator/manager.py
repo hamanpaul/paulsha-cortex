@@ -3204,8 +3204,10 @@ def _raise_if_worktree_read_blocked(result: object, *, what: str) -> None:
 
 def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> str:
     candidate = job.get("subject_head")
-    # reviewer 走 `workflow_repo_root`（Manager 自己的來源樹），不讀 reviewer 的
-    # 工作樹——#641 的同型問題在這條 lane 上本來就不存在。
+    # reviewer 走 `workflow_repo_root`，不讀 reviewer 的工作樹（那是 sandbox）。
+    # #650 之後那個欄位是 **Manager 自己從來源樹 clone 出來的 candidate 樹**
+    # （`_reviewer_candidate_workspace()`，HEAD 恰為 candidate），不再是前一張
+    # build 卡的工作區——因此 #641 的同型問題在這條 lane 上結構性不存在。
     worktree = (
         job.get("workflow_repo_root")
         if job.get("persona") == "reviewer"
@@ -4195,11 +4197,27 @@ def _is_exact_reviewer_terminal_recovery(
         )
     except ValueError:
         return False
+    # #650：candidate 樹的定錨從「等於 builder job 記錄的工作區」換成「等於本 run
+    # ＋本 candidate 的**唯一推導點**算出來的那一棵 Manager-owned clone」
+    # （`_reviewer_candidate_workspace_id`）。推導點比兄弟 job 的欄位穩定——後者正
+    # 是本票要拆掉的耦合，而且那個目錄在成果回收之後隨時可能被回收掉。
+    #
+    # 舊形狀（`workflow_repo_root` == 那張 build 卡的工作區）**保留為容忍面**：升級
+    # 當下正在進行、reviewer job 已派出去的 run 仍要走得完 operator recovery。兩者
+    # 都是「這個 repo_root 真的是本 run 的 candidate 樹」的定錨，容忍不放寬語意。
     builder_worktree = builder.get("worktree")
-    if (
-        not isinstance(builder_worktree, str)
-        or Path(repo_root_value).resolve() != Path(builder_worktree).resolve()
-    ):
+    recorded_root = Path(repo_root_value).resolve()
+    try:
+        expected_root = job_workspace.workspace_path(
+            worktree_root_for(Path(str(run.workspace_root))),
+            _reviewer_candidate_workspace_id(run, str(run.candidate_head).lower()),
+        ).resolve()
+    except (ValueError, OSError):
+        expected_root = None
+    legacy_root = (
+        Path(builder_worktree).resolve() if isinstance(builder_worktree, str) else None
+    )
+    if recorded_root not in {root for root in (expected_root, legacy_root) if root is not None}:
         return False
     expected = job.get("workflow_sandbox_hash")
     candidate_root = Path(repo_root_value)
@@ -5193,6 +5211,155 @@ def _discard_failed_planner_sandbox(
         shutil.rmtree(path)
     if path.exists() or path.is_symlink():
         raise ValueError("planner sandbox retry cleanup incomplete")
+
+
+def _reviewer_candidate_workspace_id(run, candidate: str) -> str:
+    """verify／review 卡那棵 candidate 樹的識別（#650）——**唯一推導點**。
+
+    形狀與 `work_bridge._ship_workspace_id()` 對齊（`wf-<run 摘要>-<段>-<candidate
+    前綴>`），只換中間那一段。穩定於 **(run, candidate)** 而**不是** per-job，這一點
+    是被產品契約逼出來的，不是省一次 clone 的優化：
+
+    `adversarial-review` 的 `requires` 是 `reports/review/*<task-slug>*.md`，也就是
+    前一張 `code-review` 卡的產出；而 canonical report 是 Manager 在
+    `terminalize_workflow_job()` 裡發佈到那張卡的 `workflow_repo_root` 的**未追蹤
+    檔**（#653 之後不再被 ship 段清掉）。同一個 candidate 的 verify／review 卡因此
+    必須共用同一棵樹，下一張卡的 `_workflow_input_snapshot()` 才 glob 得到它。
+    per-job 一棵樹會讓那個 glob 落空 ⇒ `workflow declared input missing`。
+
+    candidate 前進（retry-build、post-archive 重驗）就換一棵樹——那也正是對的：新
+    candidate 的 review phase 從頭跑起，舊 candidate 的 report 不該被它讀到。舊的
+    那一棵原地留著，回收交給 `cortex work gc`，與 build／ship 卡的 clone 同一套。
+    """
+
+    if verification.SAFE_SHA_RE.fullmatch(candidate) is None:
+        raise ValueError("workflow reviewer candidate invalid")
+    digest = hashlib.sha256(run.run_id.encode()).hexdigest()[:10]
+    return f"wf-{digest}-review-{candidate[:12]}"
+
+
+def _require_reviewer_candidate_workspace(
+    worktree: Path, *, branch: str, candidate: str
+) -> None:
+    """candidate 樹開工前的三條不變式：branch 對、HEAD ＝ candidate、追蹤檔無漂移。
+
+    - **branch**：job 記錄的 `branch` 與這棵樹實際 checkout 的 branch 必須一致
+      （與 `work_bridge._require_pristine_ship_workspace()` 同一條理由）。
+    - **HEAD ＝ candidate**：`_verify_exact_candidate()` 在採信時對 reviewer 的
+      `workflow_repo_root` 跑的正是 `rev-parse HEAD == candidate`；這裡先驗一次，
+      讓「樹不對」在派工當下就炸開，而不是等到一整個 session 跑完才發現。
+      `_authority_map_with_checkbox_tolerance()` 讀的 candidate 內容也以這條為前提。
+    - **追蹤檔無漂移**（`--untracked-files=no`）：**未追蹤檔刻意放行**——canonical
+      report 就是未追蹤檔，而它們正是 `code-review` → `adversarial-review` 的交接
+      載體（見 `_reviewer_candidate_workspace_id`）。這裡不能用 ship 段那條「完全
+      乾淨」，否則第二張 review 卡永遠開不了工。
+
+    這棵樹只有 Manager 寫（input seed ＋ canonical report 發佈），因此任何一條不成
+    立都代表有第三方動過它——fail-closed，不刪、不自癒。
+    """
+
+    for argv, expected, failure in (
+        (["symbolic-ref", "--quiet", "--short", "HEAD"], branch, "branch"),
+        (["rev-parse", "HEAD"], candidate, "head"),
+    ):
+        probe = subprocess.run(
+            ["git", "-C", str(worktree), *argv],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0 or probe.stdout.strip().lower() != expected.lower():
+            raise ValueError(f"workflow reviewer candidate workspace {failure} mismatch")
+    tracked = subprocess.run(
+        ["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=no"],
+        shell=False,
+        capture_output=True,
+        text=True,
+    )
+    if tracked.returncode != 0 or tracked.stdout.strip():
+        raise ValueError("workflow reviewer candidate workspace has tracked drift")
+
+
+def _reviewer_candidate_workspace(
+    *,
+    run,
+    branch: str,
+    candidate: str,
+    creator=None,
+) -> Path:
+    """#650：verify／review 卡的 candidate 樹——**Manager-owned**，不是 builder 的 clone。
+
+    ## 換掉的是什麼
+
+    在此之前 verify／review 卡以 `builder_jobs[-1]["worktree"]`（前一張 build 卡的
+    工作區）為 candidate 樹，六個用途全掛在它身上。#648 把 build phase 的工作區改成
+    per-job 之後，一個 run 會累積 N 棵這種樹（每棵約 35MB），而
+    `_harvest_build_candidate()` 落地之後**被採信的卡的工作區已經沒有任何獨佔資訊**
+    ——bundle 已封存、commit 已在來源樹裡。唯一還讓它回收不掉的就是這條引用。
+
+    ## 形狀（沿用 #653 的 `work_bridge._manager_ship_workspace()`）
+
+    以 `run.candidate_head` 為 base、用 `seams.ScriptWorktreeCreator` 在**來源樹**上
+    clone 一份。來源樹是 `cortex-manager` 擁有且可寫，Manager 對自己 clone 出來的樹
+    自然是 owner。creator 的兩道既有守衛在這條 lane 上剛好就是要的：
+
+    - `rev-parse --verify <candidate>^{commit}`：來源樹必須已經有這個 commit——那正是
+      `_harvest_build_candidate()`（#637 bundle ＋ append-only spool）保證的不變式
+      （build 卡）與 `work_bridge._harvest_manager_ship_commit()`（#649，archive
+      commit）保證的不變式。回收沒走完就 provision 不起來。
+    - `merge-base --is-ancestor <branch> <candidate>`：delivery branch 不得帶著
+      candidate 以外的 commit（#613 的形狀）。
+
+    ## 順帶收掉的一個 #641 同型缺口
+
+    舊模型下 Manager 在 reviewer 派工當下對 builder 的 clone 做的**不只是讀**：
+    `_workflow_input_snapshot()` 會把缺席的 planning authority 檔案 seed 進去
+    （`mkdir` ＋ `mkstemp` ＋ `os.replace`），`planning_runtime._tree_snapshot()` 會
+    遞迴走完整棵樹。三分部署下那棵樹是 `0700 cortex-builder`、且 #641 已收掉 Manager
+    的唯讀 ACL ⇒ 這兩步都是 `Permission denied`。換成 Manager 自己的樹之後，這條路徑
+    不需要任何指向 job 工作樹的授權。
+
+    ## 紅線
+
+    沒有 `--reference`／`--shared`／任何把 object store 接回共用的優化（#623 判定共用
+    object store 與三分隔離互斥），也沒有「Manager fetch 一棵 job 的 clone」。
+    """
+
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        raise ValueError("workflow reviewer candidate workspace source repo missing")
+    source = Path(source_repo)
+    pool = worktree_root_for(source)
+    workspace_id = _reviewer_candidate_workspace_id(run, candidate)
+    target = job_workspace.workspace_path(pool, workspace_id)
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise ValueError("workflow reviewer candidate workspace path is not a directory")
+    if target.is_dir():
+        marker = job_workspace.read_marker(target)
+        reusable = (
+            job_workspace.is_job_clone(target)
+            and isinstance(marker, dict)
+            and marker.get("branch") == branch
+            and str(marker.get("base", "")).lower() == candidate.lower()
+        )
+        if reusable:
+            # 重用**不打回 pristine**：未追蹤的 canonical report 是同一個 candidate
+            # 的下一張 review 卡的宣告輸入（見 `_reviewer_candidate_workspace_id`）。
+            # ship 段的 `_reset_ship_workspace()` 之所以能 `clean -ffdx`，是因為它
+            # 要 commit 一個 exact candidate；這裡的契約相反。
+            _require_reviewer_candidate_workspace(
+                target, branch=branch, candidate=candidate
+            )
+            return target
+        if not job_workspace.is_job_clone(target):
+            # 認不出這是什麼就**不刪**（#478 的爆炸半徑教訓）。
+            raise ValueError("workflow reviewer candidate workspace path is occupied")
+        job_workspace.remove_clone(target)
+    if creator is None:
+        creator = seams.ScriptWorktreeCreator(repo=source, wt_root=pool, base="main")
+    created = Path(creator.create(branch, job_id=workspace_id, base_sha=candidate))
+    _require_reviewer_candidate_workspace(created, branch=branch, candidate=candidate)
+    return created
 
 
 def _reviewer_sandbox_parent(
@@ -8677,13 +8844,40 @@ def _dispatch_workflow_card(
             )
         else:
             worktree = str(creator.create(build_branch, job_id=reserved_job_id))
+    elif step.persona == "reviewer":
+        # #650：verify／review 卡的 candidate 樹改為 **Manager 自己在來源樹上 clone
+        # 出來的一棵**，不再是 `builder_jobs[-1]["worktree"]`。
+        #
+        # 為什麼在這裡（而不是等到 reviewer 分支）provision：`_workflow_input_snapshot()`
+        # 是 `_create_reviewer_sandbox()` 的**輸入**，算它時 sandbox 還不存在——票上點名
+        # 的順序問題。解法沿用 #653 對 `archive-applied-needs-commit` 的處置：**同一次
+        # 派工內結構性共用同一個 provisioning**。candidate 樹在這裡建好一次，
+        # authority map／input snapshot／output baseline／sandbox clone 源／tree
+        # snapshot 五個用途全部拿到同一棵樹，順序問題因此不是被「解決」而是**不存在**。
+        #
+        # branch 與底下 job 記錄用的那一個是同一條推導（前一張 build 卡的 branch；
+        # post-archive 時是 `_record_manager_ship_job()` 記在 archive 卡上的那一條）。
+        reviewer_branch = (
+            str(builder_jobs[-1]["branch"])
+            if builder_jobs and isinstance(builder_jobs[-1].get("branch"), str)
+            else f"feature/{run.work_id}"
+        )
+        reviewer_candidate = run.candidate_head
+        if (
+            not isinstance(reviewer_candidate, str)
+            or verification.SAFE_SHA_RE.fullmatch(reviewer_candidate) is None
+        ):
+            # 與 `_create_reviewer_sandbox()` 逐字相同的訊息：candidate 推不出來時
+            # 這條 lane 本來就走不下去，只是現在擋在建樹之前。
+            raise ValueError("workflow reviewer candidate invalid")
+        worktree = str(
+            _reviewer_candidate_workspace(
+                run=run,
+                branch=reviewer_branch,
+                candidate=reviewer_candidate.lower(),
+            )
+        )
     elif builder_jobs:
-        # verify／review／ship 卡：仍以**前一張 build 卡的工作區**為 candidate 樹。
-        # 這三種卡不是降權派工的對象（reviewer 走 `as_review_only()`，其實際
-        # 工作樹是 reviewer sandbox；ship 卡的成果目前沒有 harvest 通道），因此
-        # #648 的 `%i` 不變式不落在它們身上。把它們也搬到 per-job clone 需要先補
-        # 「ship phase 的成果回收」與「reviewer candidate 樹的來源」兩件事——見
-        # 後續票，本 PR 不動它們一個位元組。
         worktree = str(builder_jobs[-1]["worktree"])
     else:
         worktree = run.workspace_root
