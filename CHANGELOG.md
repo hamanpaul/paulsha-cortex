@@ -33,6 +33,17 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#618 / trust-root Phase 2b：補上 `cortex service run`——permgen 的 manager unit
+  `ExecStart` 指向一個不存在的 verb**——產生的 system unit 寫
+  `ExecStart=<venv>/bin/cortex service run`，但 porcelain 只有 `install`／`start`／
+  `stop`／`restart`／`status`／`logs`／`uninstall`，unit 一 start 即
+  `unsupported service command`，Phase 2b 第 4c 步 blocking。加一個薄轉發 verb：
+  `run` 之後的 argv（含 `--help`）在 parse 前攔截並原樣交給
+  `coordinator.manager_daemon.main()`。**不沿用 `scripts/service-manager.sh`**：它會
+  `mkdir -p "$HOME/.agents/log"` 導 daemon 輸出，而 Phase 2b 的 `HOME` 為 root-owned
+  且 unit 帶 `ProtectHome=yes`——system-level 的正確形態是前景跑、log 進 journald。
+  新增 `tests/test_service_run_verb.py` 五條，含一條把「產生器 ExecStart」與
+  「CLI 實際 verb」綁在一起的迴歸鎖。
 - **#584 順修（#614 runbook 實測發現的兩個 permgen 缺口）**——(a) 帳號 HOME／cache
   改由帳號名機械導出（`PathLayout.home_of()`／`cache_of()`），不再是二分時代的字面量
   `/var/lib/cortex-svc`：三分下 Manager 的 `Environment=HOME=` 原本會指向一個沒人擁有
