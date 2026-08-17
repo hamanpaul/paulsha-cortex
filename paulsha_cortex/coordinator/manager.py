@@ -3167,8 +3167,34 @@ def _job_for_workflow_card(
     return job, identity
 
 
+def _raise_if_worktree_read_blocked(result: object, *, what: str) -> None:
+    """#641：這次 `git -C <job 樹>` 失敗若是「Manager 沒有讀取權」，換一個指得出下一步的錯誤。
+
+    canonical lane 的 candidate 驗證與 slice lane 的 `verification` 是同一個問題的
+    兩個實例：兩邊都以 Manager 身分伸手進 builder 的樹。#641 收掉 `repo-worktree`
+    的唯讀 ACL 之後，三分部署下這裡必然 `Permission denied`。**照樣 fail-closed**
+    （處置一格未變，仍然 raise），本函式只負責讓錯誤訊息指向 #629 的第三執行身分，
+    而不是留下一句在那個部署形態下毫無意義的「candidate does not exist」。
+    """
+
+    if isinstance(result, str) or result is None:
+        return
+    stderr = getattr(result, "stderr", "")
+    if not isinstance(stderr, str):
+        return
+    if not verification.worktree_read_blocked({"status": "non-zero", "stderr": stderr}):
+        return
+    raise ValueError(
+        f"workflow candidate worktree unreadable by manager ({what}); "
+        f"blocked on {verification.WORKTREE_READ_BLOCKED_ISSUE}: "
+        f"{verification.WORKTREE_READ_BLOCKED_DETAIL}"
+    )
+
+
 def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> str:
     candidate = job.get("subject_head")
+    # reviewer 走 `workflow_repo_root`（Manager 自己的來源樹），不讀 reviewer 的
+    # 工作樹——#641 的同型問題在這條 lane 上本來就不存在。
     worktree = (
         job.get("workflow_repo_root")
         if job.get("persona") == "reviewer"
@@ -3195,6 +3221,7 @@ def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> st
     else:
         exists_ok = getattr(exists, "returncode", 1) == 0
     if not exists_ok:
+        _raise_if_worktree_read_blocked(exists, what="cat-file")
         raise ValueError("workflow candidate does not exist")
     head = run_git(["git", "-C", worktree, "rev-parse", "HEAD"])
     if isinstance(head, str):
@@ -3204,6 +3231,7 @@ def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> st
         head_ok = getattr(head, "returncode", 1) == 0
         head_text = getattr(head, "stdout", "")
     if not head_ok or not isinstance(head_text, str) or head_text.strip().lower() != candidate:
+        _raise_if_worktree_read_blocked(head, what="rev-parse HEAD")
         raise ValueError("workflow candidate is not exact worktree HEAD")
     return candidate
 
@@ -3242,6 +3270,7 @@ def _verify_build_candidate_transition(
     if returncode == 1:
         raise ValueError("workflow build candidate is not a descendant")
     if returncode != 0:
+        _raise_if_worktree_read_blocked(ancestry, what="merge-base --is-ancestor")
         raise ValueError("workflow build candidate ancestry unavailable")
     return candidate
 

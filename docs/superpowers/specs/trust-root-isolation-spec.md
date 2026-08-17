@@ -260,7 +260,7 @@ install 的殘留），可見這條路徑契約在實機上已經漂移。
 | skill ledger／park／proposal | `skill_ledger.py:141-183`、`skill_janitor.py:312-387`（皆無 chmod） | Manager、operator | 僅 Manager UID | operator 唯讀 |
 | runtime bootstrap env | `installer.py:162`（裸寫、無 mode） | 每個 Manager／Monitor 行程啟動 | root 或 Manager UID | 全部行程唯讀 |
 | unit／launcher／executable／site-packages／codex hooks | `installer.py:298`、`hooks.py:53-60`、pipx | systemd、Python import、codex | root（部署身分） | 全部行程唯讀 |
-| worktree（派工工作區） | 對應 headless job | Manager（改走 git 讀，D2） | 對應 headless UID | Manager 唯讀／git 讀 |
+| worktree（派工工作區） | 對應 headless job | **無跨帳號 reader**（成果走 bundle spool，#637／#641） | 對應 headless UID | owner-only，Manager **不讀** |
 
 **三個 headless persona 必須分別處理**，不能只封 builder：
 
@@ -451,6 +451,40 @@ repo」。裁決前先排除了一條看似最省事的路：**`git worktree` �
 - **seal SHALL 封目錄，MUST NOT 只 `chmod` 成果檔。** 只有檔案 owner 或 root 能
   `chmod`，而成果是 producer 擁有的；封目錄則是 consumer 對自己**擁有**的那一項
   操作，且 `chmod` 同時把 mask 收成 `---`，producer 具名條目的 traverse 一併失效。
+
+##### job 工作樹對 Manager 完全不可讀（#641，0817 裁決）
+
+交換面改成 bundle spool 之後，登記表裡「Manager 讀 job 樹」那一族授權**全部沒有
+消費者**。實機複驗（operator，0817）證實它讓 #637 建立的不變式在部署上不成立：
+
+```
+只有 0700、無 ACL          → Manager `ls` 得到 Permission denied（#637 的不變式成立）
+套上登記表要求的那條 ACL    → Manager 讀得到（同一條不變式在實機上不成立）
+```
+
+因此 job 工作樹底下的每一項資產 SHALL 是 **owner-only、零跨帳號 ACL**。三項一起
+收，不得只收其中一條——traverse ACL 是由跨帳號 ACL **機械導出**的（#620），留任何
+一條，`<job 樹>` 乃至其子目錄的 `--x` 就會自己長回來：
+
+| 資產 | 落點 | 原授權 | 真正的消費者 |
+|---|---|---|---|
+| `repo-worktree` | `<job 樹>` | `u:<manager>:rX` | 成果改走 `commit-spool` 的 bundle（#637） |
+| `review-verdict` | `<job 樹>/.psc-review-verdict.json` | `u:<manager>:r` | 權威通道是 `review-verdict-spool`（#599／#639）；legacy fallback 只對 Phase 2a 之前派工的 job 生效，而那批 job 不可能出現在套了 Phase 2b ACL 的機器上 |
+| `work-items-yaml` | `<job 樹>/.cortex/work-items.yaml` | `u:<manager>:r` | monitor 讀的是**來源樹**那一份（`repo-source-tree`）；builder 的修改是 git-tracked，循 bundle 以 commit 旅行 |
+
+**這不只是最小權限，也是一條提權路徑的成立條件。** `coordinator/verification.py`
+以 `cwd=<job 樹>` **執行**宣告出來的 check／test／full-suite；`pytest` 會載入該樹的
+`conftest.py`／plugin，等於 builder 在 Manager 身分下取得任意程式碼執行——與 #629
+在 gate 執行面描述的是同一條路徑。收掉這條讀取權之後，那些命令在三分下連 spawn
+都不會成功。
+
+**verification 那組讀工作樹的檢查** SHALL 搬到 #629 的第三執行身分（既非 builder
+也非 Manager，在受控 checkout 判讀）。在那之前它 SHALL **明確 fail-closed**，理由碼
+`candidate-worktree-unreadable-pending-gate-identity`、evidence 帶 `blocked_on:
+"#629"` 與可操作處置。三條 MUST NOT：**不得**靜默略過；**不得**改以 bundle 內容替代
+（bundle 同樣由 builder 產生，兩邊同源會讓檢查退化成「builder 說什麼就是什麼」）；
+**不得**採信 builder 自報的工作樹狀態（違反 §R5 acceptance chain 與 #628 的證據
+作者歸屬）。
 
 ##### `repo-source-tree` 的 owner：從 root 改為 Manager（0817 裁決）
 
@@ -960,7 +994,10 @@ skill ledger、runtime bootstrap env。
    受保護樹；unit 加固指令切實生效。
 5. 降權啟動器：Manager 以降權方式 spawn headless job，明確關閉 FD 傳遞、
    不傳遞 gh token。
-6. 交換面：headless 產出改由 Manager 以 candidate SHA 走 git 讀（沿用 D2）；
+6. 交換面：headless 產出改走 **append-only spool**——builder 的 commit 以 git
+   bundle 交付（`commit-spool`，#637）、reviewer 的 verdict 走
+   `review-verdict-spool`（#599）；Manager 讀的一律是 Manager-owned 樹裡的一個
+   **檔案**，**不**伸手進 job 的工作樹（#641 把登記表殘留的讀取 ACL 收掉）。
    planning artifact 走 staging→publish 兩段，publish 只由 Manager 執行。
 7. R3 自檢切 fail-closed。
 8. R9 四族測試矩陣全綠。

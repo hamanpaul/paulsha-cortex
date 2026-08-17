@@ -476,6 +476,94 @@ def _run_git(args: list[str], git_runner: GitRunner | None) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# #641：Manager 對 job 工作樹沒有讀取權時的 fail-closed 面
+# ---------------------------------------------------------------------------
+#
+# 三分（trust-root Phase 2b）部署下，job 的工作樹是 `0700 <job 帳號>`，而登記表
+# 資產 `repo-worktree` 在 #641 之後**不再**授 Manager 唯讀 ACL——成果交付整條走
+# bundle spool（#637），Manager 沒有理由走進 builder 的樹。
+#
+# 但本模組底下這一組檢查（worktree HEAD == candidate、工作樹乾淨、以及以
+# `cwd=<job 樹>` 執行宣告出來的 check／test／full-suite）**確實**在讀那棵樹。
+# 它們在三分下會全部拿到 `Permission denied`。正確的落點是 #629 的第三執行身分
+# （既非 builder 也非 Manager，在受控 checkout 判讀）——理由不只是權限：以
+# `cwd=<builder 完全掌控內容的樹>` 跑 `pytest` 會載入該樹的 `conftest.py`／plugin，
+# 等於 builder 在 `cortex-manager` 身分下取得任意程式碼執行（同一段論證見
+# `trust_root/registry.py` 的 `gate-ledger` note 與 `launcher._should_run_gates`）。
+#
+# 在 #629 落地之前，這裡的行為只有一種是對的：**明確 fail-closed，且理由碼指得出
+# 下一步**。三條不得走的路，逐條寫在這裡以免日後被「順手修好」：
+#
+#   1. **不得靜默略過**——略過等於一張 build 卡沒有任何人檢查過工作樹狀態就往下走。
+#   2. **不得改讀 bundle 取代這組檢查**——bundle 的內容同樣由 builder 產生，兩邊
+#      同源，那道檢查會退化成「builder 說什麼就是什麼」（#637 PR body 已列此結論）。
+#   3. **不得讓 builder 自報「我的工作樹是乾淨的」**——違反 #540 的 acceptance chain
+#      （model 既不能自證成功、也不能自證失敗）與 #628 收斂好的證據作者歸屬。
+
+#: 讀不到 job 工作樹時的專屬 summary。與泛用的 `candidate-worktree-unreadable`
+#: 分開：後者是「那棵樹壞了」，前者是「Manager 本來就不該讀得到，等 #629」。
+WORKTREE_READ_BLOCKED_SUMMARY = "candidate-worktree-unreadable-pending-gate-identity"
+
+#: 阻擋原因所指向的票號——evidence 內逐字帶出，operator 不必回頭讀原始碼。
+WORKTREE_READ_BLOCKED_ISSUE = "#629"
+
+WORKTREE_READ_BLOCKED_DETAIL = (
+    "Manager 讀不到這個 job 的工作樹。trust-root 三分部署下工作樹是 "
+    "`0700 <job 帳號>`，而登記表資產 `repo-worktree` 自 #641 起不再授 Manager "
+    "唯讀 ACL（成果交付走 commit-spool 的 bundle，見 #637）。本組檢查"
+    "（worktree HEAD == candidate、工作樹乾淨、以及以 cwd=<job 樹> 執行宣告的 "
+    "check／test／full-suite）必須改由 #629 的第三執行身分在受控 checkout 執行；"
+    "在那之前一律 fail-closed。處置：等 #629，或在 `PSC_JOB_RUNNER=direct` "
+    "（Manager 與 job 同 UID）下重跑這張卡。**不得**放寬 `repo-worktree` 的權限、"
+    "**不得**改以 bundle 內容替代（同源，檢查會退化）、**不得**採信 builder "
+    "自報的工作樹狀態（#540／#628）。"
+)
+
+#: git／OS 在「走不進那棵樹」時吐出來的字串。逐條比對而不是只看 returncode——
+#: 非零 returncode 也可能是「這不是一個 repo」，那是完全不同的處置。
+#:
+#: 第一條是**實測**來的，不是猜的：以 git 2.43.0 對一個 `0700` 且屬於**別的 uid**
+#: 的真實 repo 跑本模組會用到的三種形狀，三者逐字相同、rc 皆為 128——
+#:
+#:     $ setpriv --reuid=<manager> git -C <job 樹> rev-parse HEAD
+#:     $ setpriv --reuid=<manager> git -C <job 樹> status --porcelain --untracked-files=all
+#:     $ setpriv --reuid=<manager> git -C <job 樹> merge-base --is-ancestor HEAD HEAD
+#:     fatal: cannot change to '<job 樹>': Permission denied
+#:
+#: 其餘幾條涵蓋非 git 的讀取面（`Path.exists()` 一類的 `PermissionError`、
+#: coreutils 的 `cannot access`）與 EPERM 形態。
+_WORKTREE_READ_BLOCKED_MARKERS = (
+    "permission denied",
+    "cannot change to",
+    "operation not permitted",
+    "cannot access",
+)
+
+
+def worktree_read_blocked(result: Mapping[str, Any]) -> bool:
+    """這次對 job 工作樹的讀取是不是「Manager 沒有權限」造成的？
+
+    `_run_git` 的回傳形狀；`status == "ok"` 一律不算（讀到了就是讀到了）。
+    """
+
+    if result.get("status") == "ok":
+        return False
+    stderr = str(result.get("stderr") or "").lower()
+    return any(marker in stderr for marker in _WORKTREE_READ_BLOCKED_MARKERS)
+
+
+def worktree_read_blocked_payload(result: Mapping[str, Any]) -> dict[str, Any]:
+    """寫進 verification evidence 的結構化阻擋原因（理由碼指向 #629）。"""
+
+    return {
+        "blocked_on": WORKTREE_READ_BLOCKED_ISSUE,
+        "reason": WORKTREE_READ_BLOCKED_SUMMARY,
+        "detail": WORKTREE_READ_BLOCKED_DETAIL,
+        "git": dict(result),
+    }
+
+
 def _load_catalog_from_text(text: str) -> dict[str, PersonaContract]:
     try:
         raw = safe_load(text)
@@ -722,10 +810,17 @@ def run_result_verification(
     candidate = branch_stdout.lower()
     details["candidate"] = candidate
 
+    # #641：以下每一次對 `worktree` 的存取都是 Manager 伸手進 builder 的樹。三分下
+    # 這裡是整個 verification **第一個**碰到那棵樹的點——排在 harvest 之後、任何
+    # `cwd=<job 樹>` 的命令執行之前，因此讀不到時不會有任何 builder 掌控的程式碼被
+    # 以 Manager 身分執行。完整推導見本檔 `WORKTREE_READ_BLOCKED_DETAIL`。
     worktree_head = _run_git(["-C", str(worktree), "rev-parse", "HEAD"], git_runner)
     worktree_head_stdout = worktree_head["stdout"].strip()
     if worktree_head["status"] != "ok" or SAFE_SHA_RE.fullmatch(worktree_head_stdout) is None:
         details["candidate_worktree_error"] = worktree_head
+        if worktree_read_blocked(worktree_head):
+            details["candidate_worktree_blocked"] = worktree_read_blocked_payload(worktree_head)
+            return _finish("needs_human", WORKTREE_READ_BLOCKED_SUMMARY)
         return _finish("needs_human", "candidate-worktree-unreadable")
     details["candidate_worktree_head"] = worktree_head_stdout.lower()
     if worktree_head_stdout.lower() != candidate:
@@ -740,6 +835,9 @@ def run_result_verification(
         "stderr": worktree_status["stderr"],
     }
     if worktree_status["status"] != "ok":
+        if worktree_read_blocked(worktree_status):
+            details["candidate_worktree_blocked"] = worktree_read_blocked_payload(worktree_status)
+            return _finish("needs_human", WORKTREE_READ_BLOCKED_SUMMARY)
         return _finish("needs_human", "candidate-worktree-status-error")
     if worktree_status["stdout"].strip():
         return _finish("needs_human", "candidate-worktree-dirty")
@@ -1021,6 +1119,12 @@ def run_result_verification(
         "stderr": worktree_status_after["stderr"],
     }
     if worktree_status_after["status"] != "ok":
+        # #641：與前一組同一條規則——讀不到就指名 #629，不與「那棵樹壞了」混為一談。
+        if worktree_read_blocked(worktree_status_after):
+            details["candidate_worktree_blocked"] = worktree_read_blocked_payload(
+                worktree_status_after
+            )
+            return _finish("needs_human", WORKTREE_READ_BLOCKED_SUMMARY)
         return _finish("needs_human", "candidate-worktree-status-error")
     if worktree_status_after["stdout"].strip():
         return _finish("needs_human", "candidate-worktree-dirty-after-verification")
@@ -1028,6 +1132,11 @@ def run_result_verification(
     details["candidate_worktree_head_after"] = final_worktree_head["stdout"].strip().lower()
     if final_worktree_head["status"] != "ok" or final_worktree_head["stdout"].strip().lower() != candidate:
         details["candidate_worktree_head_after_error"] = final_worktree_head
+        if worktree_read_blocked(final_worktree_head):
+            details["candidate_worktree_blocked"] = worktree_read_blocked_payload(
+                final_worktree_head
+            )
+            return _finish("needs_human", WORKTREE_READ_BLOCKED_SUMMARY)
         return _finish("needs_human", "candidate-worktree-moved-after-verification")
 
     final_branch = _run_git(["-C", str(resolved_repo_root), "rev-parse", branch], git_runner)

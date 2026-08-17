@@ -413,19 +413,49 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     # ---- job-visible worktree 族 -------------------------------------------
     TrustRootAsset(
         "repo-worktree", _T1, _JV, "paulsha_cortex.config.paths:repo_root",
-        (Principal.BUILDER,), (Principal.MANAGER,),
+        (Principal.BUILDER,), (Principal.BUILDER,),
         IngressKind.STAGING_SPOOL,
         note=(
             "builder write_paths:['**']，可寫工作區內任何路徑（含 .cortex/.github）。"
             "#623 之後這個工作區是從 `repo-source-tree` 拉出來的 **per-job 完整 clone**"
-            "（整個 clone 由該 job 帳號擁有），不再是共用 object store 的 git worktree。"
+            "（整個 clone 由該 job 帳號擁有），不再是共用 object store 的 git worktree。\n"
+            "**#641：reader 只剩 job 帳號自己，Manager 不在其中。** 本項原宣告 "
+            "`readers=(MANAGER,)`，permgen 因此產出 `setfacl -m u:cortex-manager:rX "
+            "<job 樹>`，理由是「交換面沿用 D2 git 讀」。#637 已把交換面整條換掉："
+            "builder 在自己的 clone `git bundle create` → 寫進 Manager-owned 的 "
+            "`commit-spool` → Manager 從**那個檔案** fetch。Manager 全程不需要、也不應該"
+            "走進 builder 的樹（#637 的不變式測試 `test_manager_never_touches_the_builder_"
+            "clone_while_harvesting` 就是釘這件事），而登記表卻主動授了那條讀取權——"
+            "**測試裡成立的不變式在照登記表部署的實機上不成立**，operator 0817 實測複驗過。\n"
+            "**為什麼不是「留著也沒差」**：那條 `rX` 不只是一條沒有消費者的讀取權。它"
+            "唯一還在使用的消費端是 `coordinator/verification.py`——那裡不但讀 HEAD／"
+            "dirty 狀態，還以 `cwd=<job 樹>` **執行**宣告出來的 check／test／full-suite "
+            "命令（`_resolve_worktree_cwd`）。`pytest` 會載入該樹的 `conftest.py`／plugin，"
+            "等於 builder 在 `cortex-manager` 身分下取得任意程式碼執行——正是 #629 要解的"
+            "那條提權路徑（同一段論證已寫在 `gate-ledger` 的 note 與 `launcher."
+            "_should_run_gates` 的 docstring）。收掉這條 ACL 因此不是「拿掉一個沒用的東西」，"
+            "而是**移除該提權路徑的成立條件**：沒有它，那些命令在三分下連 spawn 都不會成功。\n"
+            "**那組檢查怎麼辦**：搬到 #629 的第三執行身分（既非 builder 也非 Manager）。"
+            "在那之前 `verification` 讀不到工作樹時**明確 fail-closed** 並回 "
+            "`candidate-worktree-unreadable-pending-gate-identity`（理由碼與 evidence 的 "
+            "`blocked_on` 欄逐字指向 #629），**不得**靜默略過、**不得**改讀 bundle "
+            "（bundle 也是 builder 產的，兩邊同源會讓那道檢查退化）、更**不得**讓 builder "
+            "自報「我的工作樹是乾淨的」（違反 #540 的 acceptance chain 與 #628 的作者歸屬）。"
         ),
     ),
     TrustRootAsset(
         "dispatch-worktree-pool", _T1, _JV, "paulsha_cortex.config.paths:worktree_root",
         (Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER), (Principal.MANAGER,),
         IngressKind.STAGING_SPOOL,
-        note="派工 worktree pool；reviewer 與 builder 必須分屬互不可寫域（裁決 10-2）。",
+        note=(
+            "派工 worktree pool；reviewer 與 builder 必須分屬互不可寫域（裁決 10-2）。"
+            "**#641 複驗**：容器層 `0701`（owner＝Manager）給的是「別的帳號只能 traverse "
+            "進自己那格、列不出目錄」，**不是**「Manager 讀得進 job 的樹」——Manager 是容器"
+            "的 owner，本來就進得了容器，但每個 per-job 子目錄是 `0700 <job 帳號>`，收掉 "
+            "`repo-worktree` 的 `rX` 之後 Manager 就到此為止。容器層沒有任何為了「Manager "
+            "讀 job 樹」而設的額外授權（產生器對本項只出 `install -d`／`chown`／`chmod`，"
+            "零 `setfacl`）。"
+        ),
     ),
     # ---- path_resolver=None：在別處以字面量推導的 Tier-0／Tier-1 資產 --------
     TrustRootAsset(
@@ -440,7 +470,7 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     ),
     TrustRootAsset(
         "review-verdict", _T0, _JV, None,
-        (Principal.REVIEWER, Principal.ANY_SAME_UID), (Principal.MANAGER,),
+        (Principal.REVIEWER, Principal.ANY_SAME_UID), (Principal.REVIEWER,),
         IngressKind.DIRECT_FILE_WRITE,
         derived_in=("coordinator/review.py:22-23,176-185",),
         note=(
@@ -448,7 +478,17 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             ".psc-review-verdict.json。**Phase 2a 起已非權威來源**——權威通道改為 "
             "review-verdict-spool；本項僅保留為過渡期 legacy fallback（只對 Phase 2a "
             "之前派工、job row 無 review_verdict_channel 標記的 reviewer job 生效），"
-            "採信時記 WARN＋DiagnosticReason。過渡期結束即應除役。"
+            "採信時記 WARN＋DiagnosticReason。過渡期結束即應除役。\n"
+            "**#641：reader 不再含 Manager——這是 `repo-worktree` 的同型殘留。** 本項的"
+            "落點是 reviewer 工作樹內的 `.psc-review-verdict.json`，原宣告 "
+            "`readers=(MANAGER,)` 會產出 `setfacl -m u:cortex-manager:r <reviewer 樹>/"
+            ".psc-review-verdict.json`。但那條授權在**它會被套用的部署上永遠沒有消費者**："
+            "per-job ACL 只存在於 Phase 2b（三分）部署，而 `manager._review_verdict_source()`"
+            "對帶 `review_verdict_channel == \"spool\"` 標記的 job **只**認 spool 落點、"
+            "明確不回退讀 worktree；Phase 2b 部署派出的每個 reviewer job 都帶那個標記，"
+            "legacy 分支只對「Phase 2a 之前派工的 in-flight job」成立——那批 job 不可能"
+            "出現在一台已經套了三分 ACL 的機器上。留 `readers=(REVIEWER,)` 是誠實的：這個"
+            "檔今天唯一的讀者就是擁有它的那個 job 帳號自己。"
         ),
     ),
     TrustRootAsset(
@@ -639,10 +679,22 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     ),
     TrustRootAsset(
         "work-items-yaml", _T1, _JV, None,
-        (Principal.OPERATOR, Principal.BUILDER, Principal.ANY_SAME_UID), (Principal.MONITOR,),
+        (Principal.OPERATOR, Principal.BUILDER, Principal.ANY_SAME_UID), (Principal.BUILDER,),
         IngressKind.DIRECT_FILE_WRITE,
         derived_in=("monitor/correlation.py:79-80,463-487",),
-        note="git-tracked correlation authority；builder ['**'] 可寫，即一次 correlation 變更。",
+        note=(
+            "git-tracked correlation authority；builder ['**'] 可寫，即一次 correlation 變更。"
+            "**#641：reader 不再含 Monitor——第三個同型殘留。** 本項在 `PathLayout` 的落點是"
+            "**job 工作樹裡的那一份**（`<job 樹>/.cortex/work-items.yaml`，因為那裡才有不受"
+            "信任的 writer），原宣告 `readers=(MONITOR,)` 會產出 `setfacl -m "
+            "u:cortex-manager:r` 加一條導出的 `--x` traverse（#620）打進 job 樹。但 monitor "
+            "讀的**不是那一份**：`correlation.load_work_item_overrides(repo_root)` 與 "
+            "`work_actions._work_override_action` 都以 **Manager 進程自己的 `PSC_REPO_ROOT`**"
+            "為根，也就是 `repo-source-tree`（Manager-owned，monitor 已列在該項的 readers "
+            "裡）。builder 對這個檔的修改是 git-tracked 的，因此循 #637 的 bundle 回到來源樹"
+            "——以 commit 旅行，不以跨帳號檔案讀取旅行。留 `readers=(BUILDER,)` 對應的正是"
+            "「job 樹裡那一份的讀者只有 job 帳號自己」。"
+        ),
     ),
 )
 

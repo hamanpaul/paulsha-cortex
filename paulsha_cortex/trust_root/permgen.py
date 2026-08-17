@@ -820,7 +820,16 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
                 "本表只定容器層權限。"
             )
         else:
-            # 單一 job writer：owner＝該 job 帳號，Manager 以唯讀 ACL 讀取產出（D2 走 git）。
+            # 單一 job writer：owner＝該 job 帳號，owner-only。
+            #
+            # #641：本分支原本無條件補一條「trusted reader（Manager）唯讀 ACL」，
+            # 理由寫的是「交換面沿用 D2 git 讀」。那個交換面在 #637 之後已經不存在
+            # ——builder 的成果走 bundle → `commit-spool` → Manager 從**檔案** fetch，
+            # reviewer 的 verdict 走 `review-verdict-spool`。跨帳號讀取因此**只**在
+            # 登記表真的宣告了非 owner 的 reader 時才產生；本族三項（`repo-worktree`
+            # ／`review-verdict`／`work-items-yaml`）在 #641 之後都沒有，產出即為
+            # owner-only、零 ACL。rationale 也跟著條件化——operator review 的是這一行，
+            # 它不能在「這一項其實沒有任何跨帳號授權」時還宣稱有。
             owner = next(iter(job_writers), trusted_owner)
             mode = _dir_file_mode(is_dir, 0o7 if is_dir else 0o6, 0, 0)
             for racct in sorted(reader_accounts):
@@ -829,9 +838,20 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
                 acls.append(AclEntry(racct, "rX" if is_dir else "r"))
             writer_accounts = frozenset({owner})
             rationale = (
-                "job-visible 單一 writer：owner＝對應 job 帳號可寫；trusted reader "
-                "（Manager）以唯讀 ACL 讀取（交換面沿用 D2 git 讀）。"
+                "job-visible 單一 writer：owner＝對應 job 帳號可寫。"
             )
+            if acls:
+                rationale += (
+                    "登記表宣告了非 owner 的 reader，故以 per-account 唯讀 ACL 精確授予"
+                    "（每一條都必須在該資產的 note 指名真正的消費者——#641：成果交付"
+                    "一律走 spool，「Manager 讀 job 的樹」不是合法理由）。"
+                )
+            else:
+                rationale += (
+                    "**owner-only、零跨帳號 ACL**：成果交付走 spool（builder→"
+                    "`commit-spool` 的 bundle、reviewer→`review-verdict-spool` 的 "
+                    "verdict），Manager 不讀 job 的樹（#637／#641）。"
+                )
 
     # 安全網：group/other 一律不得帶 write 位（spec §R2「group 寫入權 MUST 移除」）。
     group_bits = _mask_write((mode >> 3) & 0o7)

@@ -120,6 +120,28 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#641 / trust-root：`repo-worktree` 仍授 Manager 唯讀 ACL——交換面已改 bundle，
+  這條授權沒有消費者，卻讓 #637 的不變式在實機上不成立**——#637 把成果回收換成
+  bundle ＋ append-only spool 並加了「Manager 全程不碰 builder 的 clone」不變式測試，
+  但登記表 rationale 仍停在 worktree 時代（「交換面沿用 D2 git 讀」），permgen 因此
+  照樣產出 `setfacl -m u:cortex-manager:rX /var/lib/cortex/worktree/<job-id>`；operator
+  實機複驗：沒有 ACL 時 Manager `ls` 得到 Permission denied（不變式成立），套上登記表
+  那條之後就讀得到（同一條不變式在實機上不成立）。**三條同型授權一起收**——
+  `repo-worktree` 的 `rX`、`review-verdict` 與 `work-items-yaml` 的 `r`，逐條論證過
+  各自的消費者都已移到 spool 或來源樹；必須一起收是因為 traverse ACL 由跨帳號 ACL
+  機械導出（#620），留任何一條 job 樹的 `--x` 就會自己長回來。收掉它同時**移除一條
+  提權路徑的成立條件**：那條 `rX` 唯一還在使用的消費端 `verification.py` 是以
+  `cwd=<builder 完全掌控內容的樹>` 執行宣告的 check／test／full-suite，`pytest` 會載入
+  該樹的 `conftest.py`／plugin ⇒ builder 在 `cortex-manager` 身分下取得任意程式碼執行
+  （與 #629 同一條路徑）。那組讀工作樹的檢查改為**明確 fail-closed 並指向 #629**：
+  權限造成的失敗改回專屬理由碼 `candidate-worktree-unreadable-pending-gate-identity`，
+  evidence 帶 `blocked_on: "#629"` 與可操作處置——不靜默略過、不改讀 bundle（同源會讓
+  檢查退化）、不採信 builder 自報工作樹乾淨（#540／#628）。reviewer 側同型殘留已一併
+  確認並處理；`dispatch-worktree-pool` 容器層（`0701`）複驗零 `setfacl`。新增
+  `tests/test_manager_worktree_acl_641.py`（31 測試，含需要 root 的 OS 層不變式——
+  非 root 時**明確 skip 並附理由**，不靜默通過），四組突變驗證全部實跑；理由碼的
+  判定字串以 git 2.43.0 對真實的跨 uid `0700` repo 實測取得。詳見
+  `changelog.d/drop-manager-worktree-acl.md`。
 - **#638 / trust-root：兩個 spool 的 producer／consumer 權限模型在三分下三處失效——
   verdict 通道（Phase 2a）實際從未成立過，`commit-spool` 繼承了同樣的缺陷**——三個
   獨立缺陷全部有 operator 的實機證據：(1) per-job 目錄以明確 mode 建立會**重設 ACL
