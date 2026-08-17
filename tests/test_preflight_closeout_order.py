@@ -71,6 +71,8 @@ class SpyRunner:
     ) -> None:
         self.repo = repo
         self.calls: list[list[str]] = []
+        #: #653：`openspec archive` 實際被套用在哪幾棵樹上（不變式測試用）。
+        self.archived_in: list[Path] = []
         self.remote_head: str | None = None
         self.metadata_preflight_returncode = metadata_preflight_returncode
         self.pr_preflight_returncode = pr_preflight_returncode
@@ -83,7 +85,11 @@ class SpyRunner:
         if command[:2] == ["openspec", "validate"]:
             return RunnerResult(0)
         if command[:2] == ["openspec", "archive"]:
-            self._apply_archive(command[-1])
+            #: #653：archive 的效果落在**呼叫端指定的 `cwd`** 上，不是 fixture 記
+            #: 住的某一棵樹。ship 段搬進 Manager-owned 工作區之後，那個 cwd 才是
+            #: 真的會被 commit 的樹；假 runner 若仍寫死一棵樹，測到的是 fixture
+            #: 自己的形狀而不是產品的。
+            self._apply_archive(command[-1], cwd=kwargs.get("cwd"))
             return RunnerResult(0)
         if command[:2] == ["git", "-C"] and "ls-remote" in command:
             if self.remote_head is None:
@@ -118,9 +124,11 @@ class SpyRunner:
                 )
         return subprocess.run(command, **kwargs)
 
-    def _apply_archive(self, change: str) -> None:
-        active = self.repo / "openspec" / "changes" / change
-        archived = self.repo / "openspec" / "changes" / "archive" / change
+    def _apply_archive(self, change: str, *, cwd: str | None = None) -> None:
+        root = Path(cwd) if cwd else self.repo
+        self.archived_in.append(root)
+        active = root / "openspec" / "changes" / change
+        archived = root / "openspec" / "changes" / "archive" / change
         if active.exists():
             archived.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(active), str(archived))
@@ -604,7 +612,13 @@ def test_ship_validate_completes_local_archive_closeout_without_pr_binding(
     assert updated.current_phase == "verify"
     assert updated.candidate_head is not None and updated.candidate_head != harness.candidate
     assert updated.pr_refs == ()
-    assert not (harness.worktree / "openspec" / "changes" / "work").exists()
+    # #653：archive 套用在 **Manager-owned 的 ship 工作區**裡，builder 的 clone
+    # 一個位元組沒動——那正是 #641 收掉讀取授權之後唯一可行的形狀。
+    assert (harness.worktree / "openspec" / "changes" / "work").is_dir()
+    assert harness.runner.archived_in and all(
+        root != harness.worktree and root != harness.repo
+        for root in harness.runner.archived_in
+    )
     # #649：archive commit 已回收進來源樹的 delivery branch。
     assert (
         job_workspace.source_branch_head(harness.repo, "feature/14-work")

@@ -8,6 +8,45 @@
 ## [Unreleased]
 
 ### Added
+- **#653 / trust-root Phase 2b：ship 段搬出 builder 的 clone——降權模式下 canonical lane
+  終於跑得完整個 run**——#654 查證出的形狀：`openspec-archive`／`policy-commit`
+  **不是降權派工的對象**（persona 是 `manager`，`_dispatch_workflow_card()` 對 ship phase
+  一律回 `None`），它們由 Manager 自己在 `work_bridge` 內以 `cortex-manager` 身分同步
+  執行；但**全程在 `_builder_binding()` 交回來的 builder 的 clone 裡動手**
+  （`resolve(strict=True)`、canonical report 清理、`openspec archive` 的 `cwd`、
+  `git diff/add/commit/rev-parse`、preflight、`ls-remote/push`、`_ship_action` 連測試），
+  而 #641 已把 Manager 對 job 工作樹的讀取授權全部收掉 ⇒ 三分下**第一個 `git -C` 就
+  `Permission denied`**。症狀是權限不是 `226/NAMESPACE`。**修法**：新增
+  `work_bridge._manager_ship_workspace()`，以 `run.candidate_head` 為 base、用
+  `seams.ScriptWorktreeCreator` 在來源樹上 provision 一棵 **Manager-owned 的完整 clone**
+  ——來源樹是 `cortex-manager` 擁有且可寫（0817 裁決），commit／preflight／push 全在自己的
+  樹裡發生，**不需要**任何指向 job 工作樹的 ACL（#644 的紅線：那條授權唯一的消費端本身
+  就是提權路徑，不得復活）。`_builder_binding()` 改為**只回 delivery branch**，選 job 的
+  採信鏈一個位元組沒改。工作區識別穩定於 **(run, candidate)**：同一個 candidate 的多次
+  tick 重用同一棵樹（ship phase 會 tick 很多次，每次 clone 35MB 是白燒），candidate 前進
+  則換一棵、前一棵原地留著——它正是 archive 卡 job 記錄上的 `worktree`，post-archive 的
+  verify／review 卡仍以它為 candidate 樹，回收交給 `cortex work gc`。
+  **`archive-applied-needs-commit` 重入路徑**（#653 明載）兩層處置：同一次 `validate()`
+  內套用與 commit 結構上就在同一棵樹；跨 tick 則在重用前 `checkout -f`／`reset --hard`／
+  `clean -ffdx` 打回 pristine 並以 `_require_pristine_ship_workspace()` 驗 branch／HEAD／
+  乾淨——取票上「在新樹裡重跑 archive」那條，讓「崩在中間」與「從沒跑過」收斂成同一個
+  狀態。`_remove_canonical_untracked_reports()` **移除**：它讀／刪的正是 builder 的 clone，
+  而 pristine clone 讓「report 弄髒 exact candidate」在結構上不再可能，改由開工前的不變式
+  承擔同一個保證；`manager._workflow_report_cleanup_allows_missing()` 保留為向後相容容忍面
+  並補上說明。**回收通道一個位元組沒改**——archive commit 仍走 #654 的 bundle ＋
+  append-only spool，consumer 仍是全 repo 唯一的 `harvest_branch()`；沒有 `--reference`／
+  `--shared`、沒有 `git -C <來源樹> fetch <job 的 clone>`。新增
+  `tests/test_ship_out_of_builder_clone_653.py`（7 條 ＋ 1 skip，全部跑正式路徑）：核心
+  不變式是把 builder 的 clone `chmod 000` 後 ship 段仍跑完（#637 範本），另含工作區身分、
+  重用＋pristine、重入路徑、archive→policy-commit 接續、`matches_candidate()` ancestry
+  守衛、`direct` 零回歸；OS 層語意（`0700 cortex-builder` vs `cortex-manager`、pool 零
+  `setfacl`）單 UID 測不出來，**明確 skip 並說明**，skip 前先斷言可測的那一半（#638 的
+  教訓）。突變驗證：把工作區改回 builder 的樹 ⇒ 8 條紅 7 條，chmod 那條逐字紅在
+  `PermissionError(13, 'Permission denied')`。runbook 的 `%i` 稽核段同步改寫（ship 段已可
+  在降權模式下跑完，並附上 ship 樹的實機稽核指令）。**附帶發現留給後續票**：兩張 ship 卡的
+  `runtime_capabilities`（#442）因為不 dispatch 在生產環境同樣無法生效；verify／review 卡
+  的 `workflow_repo_root` 仍是 builder 的 clone（#650）。
+  詳見 `changelog.d/ship-out-of-builder-clone.md`。
 - **#629 / gate 執行身分：第四個帳號 `cortex-gate`（`UidScheme` 三分 → 四分）**——
   `#604`／PR `#628` 把 gate ledger 與 exit sentinel 的**作者**收斂到 Manager，但刻意
   沒做執行面：operator 宣告的 gate 命令（`PSC_GATE_CMD_*`）在 **builder 完全掌控內容的

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from paulsha_cortex.config import paths
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     completion,
@@ -457,20 +458,24 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert updated.pr_refs == ("acme/demo#17",)
     assert updated.source_revision != run.source_revision
     assert updated.planning_source_revision == initial_source_revision
-    assert not report.exists()
-    assert plan.is_file()
-    assert subprocess.run(
-        ["git", "-C", str(repo), "branch", "--list", "feature/preflight-*"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout == ""
-    work_bridge._remove_canonical_untracked_reports(
-        registry=registry,
-        state_root=tmp_path / "state",
-        run=run,
-        worktree=repo,
+    # #653：ship 段在自己的 Manager-owned clone 裡動手，builder 記錄的樹（本
+    # fixture 就是來源樹）一個位元組沒動——canonical report 原地留著。舊模型是在
+    # 那棵樹裡把它刪掉，才不會弄髒要 commit 的 exact candidate；新模型的 ship
+    # 工作區是 pristine clone，未追蹤檔根本不會被 clone 過去。
+    assert report.is_file()
+    ship_workspace = job_workspace.workspace_path(
+        paths.worktree_root_for(repo), work_bridge._ship_workspace_id(run, candidate)
     )
+    assert ship_workspace.is_dir()
+    assert not (ship_workspace / "reports").exists()
+    assert plan.is_file()
+    for tree in (repo, ship_workspace):
+        assert subprocess.run(
+            ["git", "-C", str(tree), "branch", "--list", "feature/preflight-*"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout == ""
     journal = json.loads(
         (tmp_path / "state" / "delivery-journal.json").read_text(encoding="utf-8")
     )
@@ -497,126 +502,6 @@ def test_ship_adapter_creates_pr_after_metadata_preflight_and_binds_same_run(
     assert remote_head == candidate
     assert push_count == 2
     assert preflight_requests[-1].pr_number == 17
-
-
-def test_delivery_report_cleanup_rejects_hash_drift_without_deleting(
-    tmp_path: Path,
-) -> None:
-    repo, candidate = _repo(tmp_path / "repo")
-    state_root = tmp_path / "state"
-    report_ref = "reports/review/work-review.md"
-    report = repo / report_ref
-    report.parent.mkdir(parents=True)
-    canonical = b"# Historical canonical review\n"
-    latest = b"# Latest canonical review\n"
-    report.write_bytes(canonical)
-    run = SimpleNamespace(run_id="workflow-run", candidate_head=candidate)
-    job = {
-        "job_id": "review-job",
-        "workflow_run_id": run.run_id,
-        "workflow_claim_key": "claim:v1:" + "1" * 64,
-        "workflow_repo": "acme/demo",
-        "workflow_card": "review-card",
-        "workflow_phase": "review",
-        "workflow_inputs": [],
-        "workflow_outputs": [report_ref],
-        "workflow_output_baseline": [],
-        "source_revision": "source-revision",
-        "subject_head": candidate,
-        "status": "exited",
-        "exit_code": 0,
-    }
-    envelope = {
-        "schema_version": 1,
-        "kind": "review",
-        "job": {
-            "job_id": job["job_id"],
-            "run_id": run.run_id,
-            "claim_key": job["workflow_claim_key"],
-            "repo": job["workflow_repo"],
-            "source_revision": job["source_revision"],
-            "card_id": job["workflow_card"],
-            "phase": "review",
-            "inputs": [],
-            "outputs": [report_ref],
-            "output_baseline": [],
-        },
-        "payload": {},
-        "artifacts": [
-            {
-                "path": report_ref,
-                "sha256": hashlib.sha256(canonical).hexdigest(),
-                "baseline_sha256": None,
-            }
-        ],
-    }
-    content = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-    evidence = state_root / "evidence" / "workflow" / "review.json"
-    evidence.parent.mkdir(parents=True)
-    evidence.write_bytes(content)
-    job["workflow_evidence"] = {
-        "kind": "review",
-        "path": "evidence/workflow/review.json",
-        "hash": hashlib.sha256(content).hexdigest(),
-    }
-    latest_job = {
-        **job,
-        "job_id": "review-job-2",
-        "workflow_card": "adversarial-review-card",
-        "workflow_output_baseline": [
-            {"path": report_ref, "sha256": hashlib.sha256(canonical).hexdigest()}
-        ],
-    }
-    latest_envelope = {
-        **envelope,
-        "job": {
-            **envelope["job"],
-            "job_id": latest_job["job_id"],
-            "card_id": latest_job["workflow_card"],
-            "output_baseline": latest_job["workflow_output_baseline"],
-        },
-        "artifacts": [
-            {
-                "path": report_ref,
-                "sha256": hashlib.sha256(latest).hexdigest(),
-                "baseline_sha256": hashlib.sha256(canonical).hexdigest(),
-            }
-        ],
-    }
-    latest_content = (
-        json.dumps(latest_envelope, sort_keys=True, separators=(",", ":")).encode()
-        + b"\n"
-    )
-    latest_evidence = state_root / "evidence" / "workflow" / "review-2.json"
-    latest_evidence.write_bytes(latest_content)
-    latest_job["workflow_evidence"] = {
-        "kind": "review",
-        "path": "evidence/workflow/review-2.json",
-        "hash": hashlib.sha256(latest_content).hexdigest(),
-    }
-
-    class Registry:
-        @staticmethod
-        def list_jobs():
-            return [job, latest_job]
-
-    with pytest.raises(RuntimeError, match="report hash drift"):
-        work_bridge._remove_canonical_untracked_reports(
-            registry=Registry(),
-            state_root=state_root,
-            run=run,
-            worktree=repo,
-        )
-
-    assert report.read_bytes() == canonical
-    report.unlink()
-    with pytest.raises(RuntimeError, match="missing before cleanup"):
-        work_bridge._remove_canonical_untracked_reports(
-            registry=Registry(),
-            state_root=state_root,
-            run=run,
-            worktree=repo,
-        )
 
 
 def test_archive_commit_invalidates_old_gates_without_pushing(
@@ -1123,8 +1008,11 @@ identities:
 
     def fake_preflight(**kwargs):
         preflight_requests.append(kwargs["request"])
+        #: #653：preflight 回報的 head 是**它實際跑的那棵樹**的 head。ship 段搬進
+        #: Manager-owned 工作區之後，archive commit 不再落在 build 卡的 clone 裡，
+        #: 假 preflight 若仍去讀那棵樹會回報一個過期的 candidate。
         head = subprocess.run(
-            ["git", "-C", str(job_worktrees[0]), "rev-parse", "HEAD"],
+            ["git", "-C", str(kwargs["repo_root"]), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
@@ -1188,8 +1076,10 @@ identities:
             )
         if "push" in argv:
             assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
+            #: #653：推的是 `git -C <ship 工作區> push …`，遠端因此收到那棵樹的
+            #: HEAD。假 remote 從 argv 的 `-C` 讀，不再寫死 build 卡的 clone。
             pushed_head = subprocess.run(
-                ["git", "-C", str(job_worktrees[0]), "rev-parse", "HEAD"],
+                ["git", "-C", argv[2], "rev-parse", "HEAD"],
                 check=True,
                 capture_output=True,
                 text=True,

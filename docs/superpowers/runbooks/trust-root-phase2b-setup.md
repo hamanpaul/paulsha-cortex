@@ -2072,12 +2072,24 @@ systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/wor
 #   在 `work_bridge` 內以 deterministic 身分執行，它的 commit 走的是 #649 補上的
 #   回收通道（bundle ＋ commit-spool → 來源樹的 `refs/heads/<branch>`）。
 #
-#   **ship phase 目前仍不可在降權模式下跑完**：它全程在 `_builder_binding()` 交回來的
-#   **builder 的 clone** 裡動手（`git commit`／preflight／push／`_ship_action`），而
-#   #641 已把登記表裡 Manager 對 job 工作樹的讀取授權全部收掉（見第 2 步的稽核 5b）
-#   ⇒ 三分下第一個 `git -C` 就會 `Permission denied`。症狀是**權限**不是
-#   `226/NAMESPACE`，別往 mount namespace 的方向查。修法（ship 段搬進 Manager-owned
-#   的樹）在 #653。
+#   #653（已修）：ship 段在此之前全程在 `_builder_binding()` 交回來的 **builder 的
+#   clone** 裡動手（`git commit`／preflight／push／`_ship_action`），而 #641 已把
+#   登記表裡 Manager 對 job 工作樹的讀取授權全部收掉（見第 2 步的稽核 5b）⇒ 降權部署
+#   下（三分／四分皆然）第一個 `git -C` 就會 `Permission denied`。症狀是**權限**不是
+#   `226/NAMESPACE`，別往 mount namespace 的方向查。現在 ship 段以 `run.candidate_head`
+#   為 base，在
+#   來源樹上 provision 一棵**自己的 Manager-owned clone**（目錄名同樣由
+#   `job_workspace.job_segment()` 導出，形如 `wf-<run 摘要>-ship-<candidate 前綴>-…`），
+#   commit／preflight／push 全在那裡發生，**不需要**任何指向 job 工作樹的授權。
+#
+#   實機稽核：ship phase 跑過之後，pool 底下會多出 ship 卡自己的目錄，且
+#     stat -c '%U %a' /var/lib/cortex/worktree/wf-*-ship-*
+#   期望：`cortex-manager 700`（Manager 自己 clone 的，不是 job 帳號的）。
+#     getfacl -p /var/lib/cortex/worktree/wf-*-ship-* | grep -c '^user:'
+#   期望：`0`——ship 的樹不需要任何具名 ACL 條目；稽核 5b 的「零 `setfacl`」因此
+#   仍然成立。這些目錄與 build 卡的 clone 走同一套回收（`cortex work gc`，branch
+#   merge 後才回收），不由 ship 段自己刪：archive 卡的 job 記錄指著它，
+#   post-archive 的 verify／review 卡仍以它為 candidate 樹。
 
 # ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶；#643 起兩份都要驗）
 sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \
