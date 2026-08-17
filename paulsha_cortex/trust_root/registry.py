@@ -354,8 +354,22 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     TrustRootAsset(
         "gate-ledger", _T0, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
-        derived_in=("coordinator/terminal_contract.py:488-494",),
-        note="刻意放在 manager log_dir（模型 cwd 拿不到）——D6 要系統化的正面前例。",
+        derived_in=(
+            "coordinator/terminal_contract.py:gate_ledger_path",
+            "coordinator/dispatcher.py:exit_sentinel_path",
+        ),
+        note=(
+            "manager 的 dispatch log 目錄，**同時**是 gate ledger（`<slice>.gates.json`）"
+            "與 exit sentinel（`<slice>.exit`）的落點——兩者共用同一個資產，因為它們"
+            "共用同一個目錄與同一條信任性質。刻意放在 manager log_dir（模型 cwd 拿不到）"
+            "——D6 要系統化的正面前例。**#604**：`writers=(MANAGER,)` 這條宣告在 Phase 2b "
+            "之前只是同 UID 的巧合（wrapper script 是在 job 進程內寫這兩個檔的）；現在由"
+            "程式碼強制——sentinel 改由 Manager 側的 exit 記帳 shell 寫，且採信端一律以 "
+            "`terminal_contract.foreign_evidence_author()` 檢查檔案擁有者，非 Manager 產生"
+            "的 ledger/sentinel 不採信。gate **執行面**尚未移出 builder（見 issue #604 的"
+            "後續：需要一個既非 builder 也非 Manager 的 gate 執行身分），在那之前降權模式"
+            "不產生 ledger，build 卡照 `require_ledger` fail closed。"
+        ),
     ),
     TrustRootAsset(
         "delivery-journal", _T0, _MO, None,

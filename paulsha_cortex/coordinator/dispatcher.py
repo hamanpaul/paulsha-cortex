@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 from pathlib import Path
 from typing import Callable
 
 from paulsha_cortex.config import paths
 
+from . import terminal_contract
 from .completion import classify_completion
 from .provider_outcome import classify_provider_failure, read_log_tail
 from .registry import JobRegistry
@@ -45,18 +47,43 @@ def exit_sentinel_path(log_path: str) -> Path:
 
     SubprocessLauncher 在子進程結束時把 `$?` 寫入此檔；poll_headless_done 跨進程讀回，
     故完成判定不再依賴 os.waitpid（只有 spawn 子進程的進程能 reap）。確定性、零 I/O。
+
+    #604：降權模式下寫者已改為 Manager 側的 exit 記帳 shell（見
+    `job_runner.build_manager_exit_recorder_argv`），**路徑推導完全不變**——變的
+    只有「誰是寫者」，因此 harvest 端與所有既有呼叫端零改動。
     """
     return Path(log_path).with_suffix(".exit")
 
 
 def _read_exit_sentinel(log_path: str | None) -> int | None:
-    """讀 exit sentinel；不存在/壞檔 → None（視為尚未寫下 exit code）。"""
+    """讀 exit sentinel；不存在／壞檔／**非 Manager 產生** → None。
+
+    #604：sentinel 是 `poll_headless_done` 的第一判準，等於「這個 job 的終局是
+    什麼」的權威來源。OS 隔離上線後 builder 是另一個 uid，一份由 job 帳號擁有的
+    sentinel 就是「被隔離的一方自報 exit code」——不得採信。
+
+    採「視同尚未寫下」而不是 raise：呼叫端 `poll_headless_done` 對「沒有 sentinel
+    且行程已死」本來就有 fail-closed 分支（記為 `exit_code=1` → failed），沿用它
+    比新增一條例外路徑安全，也不會讓一個被動過手腳的檔案把整個 tick 打斷。
+
+    同時要求它是**普通檔**（`lstat` 不跟隨 symlink）：symlink 換掉的 sentinel 即使
+    擁有者看起來對，指向的內容也不是 Manager 寫的。
+    """
     if not log_path:
         return None
     p = exit_sentinel_path(log_path)
-    if not p.is_file():
+    try:
+        stat_result = os.lstat(p)
+    except OSError:
         return None
-    text = p.read_text(encoding="utf-8").strip()
+    if not stat.S_ISREG(stat_result.st_mode):
+        return None
+    if terminal_contract.foreign_evidence_author(p) is not None:
+        return None
+    try:
+        text = p.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
     try:
         return int(text)
     except ValueError:

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -134,6 +135,30 @@ class _nested:
         for manager in reversed(self._managers):
             manager.__exit__(*exc_info)
         return False
+
+
+def _unwrap_exit_recorder(argv: list[str]) -> list[str]:
+    """剝掉 #604 的 Manager 側 exit 記帳 shell，取回真正的 systemd client argv。
+
+    降權啟動的最外層現在恆為 `bash -c '<client…>; rc=$?; printf … > <sentinel>;
+    exit "$rc"'`（寫者＝Manager 的 uid，不是 job）。本 helper 同時**釘住那層的形狀**：
+    形狀變了就整批降權測試立刻紅，而不是靜默退回檢查外層 argv 的空集合。
+    """
+
+    assert argv[:2] == ["bash", "-c"], argv
+    head, sep, tail = argv[2].partition("; rc=$?; ")
+    assert sep, argv[2]
+    assert tail.startswith('printf %s "$rc" > '), tail
+    assert tail.endswith('; exit "$rc"'), tail
+    return shlex.split(head)
+
+
+def _recorded_sentinel(argv: list[str]) -> str:
+    """從 exit 記帳 shell 取出它會寫的 sentinel 路徑。"""
+
+    _, _, tail = argv[2].partition("; rc=$?; ")
+    written = tail[len('printf %s "$rc" > ') : -len('; exit "$rc"')]
+    return shlex.split(written)[0]
 
 
 def _setenv_map(argv: list[str]) -> dict[str, str]:
@@ -612,8 +637,27 @@ class DegradedLaunchTests(unittest.TestCase):
         )
         return popen
 
+    def _client_argv(self, *, env=None, executor: str = "codex") -> list[str]:
+        """降權啟動的 systemd client argv（已剝掉 #604 的 exit 記帳外層）。"""
+
+        return _unwrap_exit_recorder(
+            self._launch_builder(env=env, executor=executor).call["argv"]
+        )
+
+    def test_exit_sentinel_is_written_by_the_manager_side_recorder(self) -> None:
+        # #604：sentinel 的寫者必須在 Manager 這一側。外層 shell 由 Manager 的
+        # environ／uid 執行（見 `test_client_env_is_not_the_unit_env`），job 側的
+        # wrapper 內不得再出現任何 sentinel 重導向。
+        call = self._launch_builder().call
+        sentinel = _recorded_sentinel(call["argv"])
+        self.assertTrue(sentinel.endswith(".exit"), sentinel)
+        inner = _unwrap_exit_recorder(call["argv"])
+        job_script = inner[inner.index("--") + 1 :][2]
+        self.assertNotIn(sentinel, job_script)
+        self.assertNotIn('printf %s "$?"', job_script)
+
     def test_builder_is_wrapped_in_systemd_run(self) -> None:
-        argv = self._launch_builder().call["argv"]
+        argv = self._client_argv()
         self.assertEqual(argv[0], "/usr/bin/systemd-run")
         self.assertIn("--uid=cortex-builder", argv)
         self.assertIn("--gid=cortex-builder", argv)
@@ -621,20 +665,20 @@ class DegradedLaunchTests(unittest.TestCase):
         self.assertIn("--pipe", argv)
 
     def test_unit_name_carries_the_job_id(self) -> None:
-        argv = self._launch_builder().call["argv"]
+        argv = self._client_argv()
         unit = next(item for item in argv if item.startswith("--unit="))
         self.assertTrue(unit.startswith(f"--unit={job_runner.UNIT_NAME_PREFIX}"))
         self.assertIn("psc-0001-demo", unit)
 
     def test_inner_shell_is_non_login(self) -> None:
         # #588 第 2 點：login shell 會讓 ~/.profile 在白名單 env 之後重新匯入。
-        argv = self._launch_builder().call["argv"]
+        argv = self._client_argv()
         tail = argv[argv.index("--") + 1 :]
         self.assertEqual(tail[:2], ["bash", "-c"])
         self.assertNotIn("-lc", argv)
 
     def test_unit_env_never_contains_tokens(self) -> None:
-        argv = self._launch_builder().call["argv"]
+        argv = self._client_argv()
         unit_env = _setenv_map(argv)
         for name in _SECRET_ENV:
             self.assertNotIn(name, unit_env)
@@ -648,11 +692,11 @@ class DegradedLaunchTests(unittest.TestCase):
     def test_copilot_token_normalization_is_inert_under_degraded_runner(self) -> None:
         # direct 模式會把 GH_TOKEN 正規化成 COPILOT_GITHUB_TOKEN 送進 job；
         # 降權模式下 env 白名單裡沒有任何 token 候選，因此那條路徑自然變成 no-op。
-        argv = self._launch_builder(executor="copilot").call["argv"]
+        argv = self._client_argv(executor="copilot")
         self.assertNotIn("COPILOT_GITHUB_TOKEN", _setenv_map(argv))
 
     def test_unit_env_carries_job_markers(self) -> None:
-        unit_env = _setenv_map(self._launch_builder().call["argv"])
+        unit_env = _setenv_map(self._client_argv())
         self.assertEqual(unit_env["PSC_JOB_ID"], "psc-0001-demo")
         self.assertEqual(unit_env["PSC_SLICE_ID"], "psc-0001-demo")
         self.assertIn("PSC_REPO_ROOT", unit_env)
@@ -662,18 +706,20 @@ class DegradedLaunchTests(unittest.TestCase):
         call = self._launch_builder().call
         self.assertEqual(call["stdin"], subprocess.DEVNULL)
         worktree = call["cwd"]
-        self.assertIn(f"--working-directory={worktree}", call["argv"])
+        self.assertIn(
+            f"--working-directory={worktree}", _unwrap_exit_recorder(call["argv"])
+        )
 
     def test_client_env_is_not_the_unit_env(self) -> None:
         # systemd-run client 保留完整 env（polkit 可能要查 session），但那份 env
         # 不會進到 unit——unit 只看得到 `--setenv` 白名單。
         call = self._launch_builder().call
         self.assertIn("GH_TOKEN", call["env"])
-        self.assertNotIn("GH_TOKEN", _setenv_map(call["argv"]))
+        self.assertNotIn("GH_TOKEN", _setenv_map(_unwrap_exit_recorder(call["argv"])))
 
     def test_builder_account_override_flows_into_argv(self) -> None:
         env = _degraded_env(**{job_runner.BUILDER_ACCOUNT_ENV: "cortex-worker"})
-        argv = self._launch_builder(env=env).call["argv"]
+        argv = self._client_argv(env=env)
         self.assertIn("--uid=cortex-worker", argv)
         self.assertNotIn("--uid=cortex-builder", argv)
 
