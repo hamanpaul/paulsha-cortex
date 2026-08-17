@@ -22,6 +22,9 @@ from paulsha_cortex.coordinator import gc, job_workspace, manager, verification,
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
 
 _BRANCH = "feature/623-per-job-clone"
+_JOB_ID = "623-per-job-clone"
+#: #645：工作區目錄名由 job id 導出（不再是 branch slug）。
+_SEGMENT = job_workspace.job_segment(_JOB_ID)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -109,7 +112,7 @@ def test_provisioned_workspace_is_a_standalone_clone_not_a_linked_worktree(
     """
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
 
     assert (workspace / ".git").is_dir()
     assert not (workspace / ".git").is_file()
@@ -130,7 +133,7 @@ def test_provision_reuses_existing_branch_only_when_it_is_base_ancestor(
     _git(repo, "commit", "-qam", "main advances")
     expected = _git(repo, "rev-parse", "main")
 
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
 
     assert _git(repo, "rev-parse", _BRANCH) == expected
     assert _git(workspace, "rev-parse", "HEAD") == expected
@@ -154,10 +157,10 @@ def test_provision_rejects_diverged_existing_branch_without_moving_it(
     _git(repo, "commit", "-qm", "main only")
 
     with pytest.raises(ValueError, match="commits outside requested base"):
-        _creator(repo, tmp_path / "pool").create(_BRANCH)
+        _creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID)
 
     assert _git(repo, "rev-parse", _BRANCH) == branch_head
-    assert not (tmp_path / "pool" / _BRANCH.replace("/", "-")).exists()
+    assert not (tmp_path / "pool" / _SEGMENT).exists()
 
 
 def test_provision_fails_closed_on_existing_target_without_deleting_it(
@@ -171,12 +174,12 @@ def test_provision_fails_closed_on_existing_target_without_deleting_it(
 
     repo = _source_repo(tmp_path)
     pool = tmp_path / "pool"
-    stale = pool / _BRANCH.replace("/", "-")
+    stale = pool / _SEGMENT
     stale.mkdir(parents=True)
     (stale / "precious.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="worktree target already exists"):
-        _creator(repo, pool).create(_BRANCH)
+        _creator(repo, pool).create(_BRANCH, job_id=_JOB_ID)
 
     assert (stale / "precious.json").is_file()
 
@@ -190,10 +193,10 @@ def test_provision_rolls_back_the_branch_when_the_base_is_invalid(
     pool = tmp_path / "pool"
 
     with pytest.raises(ValueError, match="git worktree base invalid"):
-        ScriptWorktreeCreator(repo=repo, wt_root=pool, base="no-such-base").create(_BRANCH)
+        ScriptWorktreeCreator(repo=repo, wt_root=pool, base="no-such-base").create(_BRANCH, job_id=_JOB_ID)
 
     assert _try_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{_BRANCH}").returncode == 1
-    assert not (pool / _BRANCH.replace("/", "-")).exists()
+    assert not (pool / _SEGMENT).exists()
 
 
 def test_provision_creates_the_branch_in_the_source_repo(tmp_path: Path) -> None:
@@ -202,7 +205,7 @@ def test_provision_creates_the_branch_in_the_source_repo(tmp_path: Path) -> None
     repo = _source_repo(tmp_path)
     base = _git(repo, "rev-parse", "main")
 
-    _creator(repo, tmp_path / "pool").create(_BRANCH)
+    _creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID)
 
     assert _git(repo, "rev-parse", f"refs/heads/{_BRANCH}") == base
 
@@ -215,7 +218,7 @@ def test_provisioned_workspace_matches_the_worktree_model_git_environment(
     repo = _source_repo(tmp_path)
     upstream = _git(repo, "remote", "get-url", "origin")
 
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
 
     # `origin` 是**真正的上游**，不是來源 repo——否則 delivery 的
     # `git -C <工作區> push origin` 會把 candidate 推進 Manager 的樹。
@@ -232,7 +235,7 @@ def test_provision_works_without_an_upstream_remote(tmp_path: Path) -> None:
     """來源 repo 沒有 `origin`（測試環境常見）時工作區同樣沒有——與 worktree 等價。"""
 
     repo = _source_repo(tmp_path, with_upstream=False)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
 
     assert _git(workspace, "remote") == ""
     assert _builder_commit(workspace)
@@ -250,7 +253,7 @@ def test_workspace_has_no_git_path_back_into_the_source_repo(tmp_path: Path) -> 
     """
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
 
     remotes = _git(workspace, "remote").splitlines()
     assert job_workspace.SOURCE_REMOTE not in remotes
@@ -268,7 +271,7 @@ def test_builder_commits_do_not_reach_the_source_repo_before_harvest(
 
     repo = _source_repo(tmp_path)
     base = _git(repo, "rev-parse", "main")
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
 
     candidate = _builder_commit(workspace)
 
@@ -284,7 +287,7 @@ def test_manager_harvests_the_candidate_out_of_the_builder_clone(
     tmp_path: Path,
 ) -> None:
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     candidate = _builder_commit(workspace)
 
     harvested = _harvest(repo, workspace, tmp_path / "coordinator")
@@ -301,7 +304,7 @@ def test_harvest_rejects_a_rewritten_history_instead_of_absorbing_it(
     """refspec 刻意不帶 `+`：Manager 不會靜默吸收被改寫過的歷史。"""
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     first = _builder_commit(workspace)
     _harvest(repo, workspace, tmp_path / "coordinator")
 
@@ -351,7 +354,7 @@ def test_reclaim_removes_a_job_clone_and_leaves_no_residue(tmp_path: Path) -> No
     """#601／#613 關心的正是殘留：目錄與 registry 都不得留下任何一筆。"""
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     _builder_commit(workspace)
     _harvest(repo, workspace, tmp_path / "coordinator")
 
@@ -375,7 +378,7 @@ def test_reclaim_archives_unharvested_commits_before_deleting_the_clone(
     """
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     orphan = _builder_commit(workspace)
 
     result = worktree_reclaim.reclaim_worktree(workspace, repo_root=repo)
@@ -394,7 +397,7 @@ def test_reclaim_derives_the_source_repo_from_the_workspace_marker(
     """既有呼叫端都不傳 `repo_root`——封存必須靠標記檔自己找得到來源 repo。"""
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     orphan = _builder_commit(workspace)
 
     result = worktree_reclaim.reclaim_worktree(
@@ -416,7 +419,7 @@ def test_reclaim_preserves_dirty_content_inside_a_job_clone(tmp_path: Path) -> N
     """
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     (workspace / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
     preserve_root = tmp_path / "evidence"
 
@@ -460,7 +463,7 @@ def test_reclaim_still_refuses_a_main_checkout_under_the_clone_model(
 def test_gc_scan_sees_job_clones_that_git_worktree_list_cannot(tmp_path: Path) -> None:
     repo = _source_repo(tmp_path)
     pool = tmp_path / "pool"
-    workspace = Path(_creator(repo, pool).create(_BRANCH))
+    workspace = Path(_creator(repo, pool).create(_BRANCH, job_id=_JOB_ID))
 
     artifacts = gc.scan(repo, worktree_root=pool)
     rows = {
@@ -479,7 +482,7 @@ def test_gc_apply_reclaims_a_merged_job_clone_by_directory_removal(
 
     repo = _source_repo(tmp_path)
     pool = tmp_path / "pool"
-    workspace = Path(_creator(repo, pool).create(_BRANCH))
+    workspace = Path(_creator(repo, pool).create(_BRANCH, job_id=_JOB_ID))
 
     artifacts = gc.scan(repo, worktree_root=pool)
     applied = gc.apply_gc(repo, artifacts, default_branch="main")
@@ -503,7 +506,7 @@ def test_gc_protects_the_branch_of_a_live_job_clone(tmp_path: Path) -> None:
 
     repo = _source_repo(tmp_path)
     pool = tmp_path / "pool"
-    workspace = Path(_creator(repo, pool).create(_BRANCH))
+    workspace = Path(_creator(repo, pool).create(_BRANCH, job_id=_JOB_ID))
     _builder_commit(workspace)
     _harvest(repo, workspace, tmp_path / "coordinator")
 
@@ -549,7 +552,7 @@ def test_workflow_lane_harvests_the_candidate_when_the_card_is_accepted(
     """
 
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     candidate = _builder_commit(workspace)
     coordinator_root = tmp_path / "coordinator"
     bundle = _produce_bundle(workspace, coordinator_root)
@@ -597,7 +600,7 @@ def test_workflow_lane_harvest_fails_closed_when_the_head_does_not_match(
     tmp_path: Path,
 ) -> None:
     repo = _source_repo(tmp_path)
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     _builder_commit(workspace)
     coordinator_root = tmp_path / "coordinator"
     bundle = _produce_bundle(workspace, coordinator_root)
@@ -625,7 +628,7 @@ def test_slice_lane_verification_harvests_before_reading_the_branch(
 
     repo = _source_repo(tmp_path)
     base = _git(repo, "rev-parse", "main")
-    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH))
+    workspace = Path(_creator(repo, tmp_path / "pool").create(_BRANCH, job_id=_JOB_ID))
     candidate = _builder_commit(workspace)
     bundle = _produce_bundle(workspace, tmp_path / "coordinator")
     contract = {
@@ -666,7 +669,7 @@ def test_end_to_end_provision_commit_harvest_reclaim(tmp_path: Path) -> None:
 
     repo = _source_repo(tmp_path)
     pool = tmp_path / "pool"
-    workspace = Path(_creator(repo, pool).create(_BRANCH))
+    workspace = Path(_creator(repo, pool).create(_BRANCH, job_id=_JOB_ID))
 
     candidate = _builder_commit(workspace)
     # builder 寫不到來源 repo 的 ref（此處以「來源 repo 沒有這條路徑」驗證方向性；

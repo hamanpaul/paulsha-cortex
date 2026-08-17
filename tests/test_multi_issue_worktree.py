@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from paulsha_cortex.coordinator import manager, work_bridge
+from paulsha_cortex.coordinator import job_workspace, manager, work_bridge
 from paulsha_cortex.coordinator.launcher import LaunchHandle
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -44,7 +44,7 @@ class _RecordingCreator:
         self.repo_root = repo_root
         self.calls: list[str] = []
 
-    def create(self, branch: str, *, base_sha: str | None = None) -> str:
+    def create(self, branch: str, *, job_id: str | None = None, base_sha: str | None = None) -> str:
         self.calls.append(branch)
         return str(self.repo_root)
 
@@ -207,11 +207,15 @@ def test_build_worktree_uses_run_workspace_root_not_manager_repo(
     persisted = registry.get_job(job["job_id"])
 
     expected_pool = worktree_root_for(run_workspace)
-    expected_worktree = expected_pool / "feature-34-multi-issue-worktree"
+    # #645：目錄名由 build 身分（＝branch 去掉 `feature/`）經 job_workspace 導出，
+    # 不再是 branch slug；branch 名本身不變。
+    segment = job_workspace.job_segment("34-multi-issue-worktree")
+    expected_worktree = expected_pool / segment
     assert persisted["worktree"] == str(expected_worktree)
     assert expected_worktree.is_dir()
+    assert persisted["branch"] == "feature/34-multi-issue-worktree"
     # Manager-anchored pool must NOT receive the build worktree.
-    assert not (manager_pool / "feature-34-multi-issue-worktree").exists()
+    assert not (manager_pool / segment).exists()
 
 
 def test_pr_metadata_closes_all_mapped_issues(tmp_path: Path) -> None:

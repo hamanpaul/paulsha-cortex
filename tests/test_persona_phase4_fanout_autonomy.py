@@ -692,7 +692,7 @@ class FanoutTests(unittest.TestCase):
             def __init__(self):
                 self.created = []
 
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 self.created.append(branch)
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
@@ -739,7 +739,7 @@ class FanoutTests(unittest.TestCase):
                 raise AssertionError("launcher path must not send to pane")
 
         class _FakeWt:
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         class _FakeLauncher:
@@ -783,7 +783,7 @@ class FanoutTests(unittest.TestCase):
                 raise AssertionError("launcher path must not send to pane")
 
         class _FakeWt:
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         class _FailFirstLauncher:
@@ -835,7 +835,7 @@ class FanoutTests(unittest.TestCase):
                 raise AssertionError("launcher path must not send to pane")
 
         class _FakeWt:
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         class _OrderLauncher:
@@ -907,7 +907,7 @@ class FanoutTests(unittest.TestCase):
                 self.sent.append((pane_id, text))
 
         class _FakeWt:
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         class _FakeLauncher:
@@ -1065,7 +1065,7 @@ class CliTests(unittest.TestCase):
                 self.sent.append((pane_id, text))
 
         class _FakeWt:
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         with tempfile.TemporaryDirectory() as d:
@@ -1104,7 +1104,7 @@ class CliTests(unittest.TestCase):
                 self.sent.append((pane_id, text))
 
         class _FakeWt:
-            def create(self, branch):
+            def create(self, branch, *, job_id=None):
                 return f"/fake/wt/{branch.replace('/', '-')}"
 
         with tempfile.TemporaryDirectory() as d:

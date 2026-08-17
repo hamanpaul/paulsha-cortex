@@ -21,13 +21,13 @@ class FakeWorktreeCreator:
         self.root = root
         self.created: list[str] = []
 
-    def create(self, branch: str) -> str:
+    def create(self, branch: str, *, job_id: str | None = None) -> str:
         self.created.append(branch)
         return f"{self.root}/{branch.replace('/', '-')}"
 
 
 class _RaisingWorktreeCreator:
-    def create(self, branch: str) -> str:
+    def create(self, branch: str, *, job_id: str | None = None) -> str:
         raise ValueError("boom: worktree add failed")
 
 

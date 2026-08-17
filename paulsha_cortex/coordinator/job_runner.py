@@ -107,6 +107,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from . import job_workspace
 from .diagnostics import DiagnosticReason, diagnostic_reason
 
 __all__ = [
@@ -263,8 +264,10 @@ SPEC_FORBIDDEN_KEYS: frozenset[str] = frozenset(
 )
 
 #: systemd unit 實例名允許的字元。systemd 本身還允許更多（`/` 需 escape），這裡
-#: 刻意更窄：instance 名會被 polkit 的 unit pattern 比對，也會被拼成 spec 檔名。
-INSTANCE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+#: 刻意更窄：instance 名會被 polkit 的 unit pattern 比對、被拼成 spec 檔名，**也是
+#: job 工作區在 pool 底下的目錄名**（#645）。因此形狀的真相在 `job_workspace`，
+#: 本模組只別名過來——兩份 pattern 就是兩個會漂移的來源。
+INSTANCE_NAME_RE = job_workspace.JOB_SEGMENT_RE
 
 
 # ---------------------------------------------------------------------------
@@ -862,37 +865,30 @@ def _await_start(
 def instance_name_valid(name: str) -> bool:
     """instance 名是否符合 :data:`INSTANCE_NAME_RE`（shim 端共用同一條判準）。"""
 
-    return bool(name) and INSTANCE_NAME_RE.fullmatch(name) is not None
+    return job_workspace.job_segment_valid(name)
 
 
 def template_instance_id(job_id: str) -> str:
     """job_id → systemd 模板實例名（`cortex-job@<這個>.service`）。
 
-    與 :func:`transient_unit_name` 同一套「可追蹤 ＋ 唯一」的推導，差別只在這裡
-    產出的是**實例名**而不是完整 unit 名：消毒後的可讀片段 ＋ job_id 的 sha256
-    前 8 碼（消毒後相同也不會撞名）。
+    **推導本身不在這裡**：唯一推導點是 :func:`job_workspace.job_segment`，因為同一個
+    字串同時是 job 工作區在 pool 底下的目錄名——模板 unit 只有 `%i` 可用，
+    `ReadWritePaths=<pool>/%i` 因此把「instance 名」與「目錄名」綁成同一個東西
+    （#645）。本函式只負責把那裡的錯誤翻成 `job_runner` 的診斷契約。
+
+    與 :func:`transient_unit_name` 同一套「可追蹤 ＋ 唯一」的形狀（消毒後的可讀片段
+    ＋ job_id 的 sha256 前 8 碼），差別只在這裡產出的是**實例名**而不是完整 unit 名。
     """
 
-    raw = str(job_id).strip()
-    if not raw:
+    try:
+        return job_workspace.job_segment(job_id)
+    except job_workspace.WorkspaceError as exc:
         raise _fail(
             "job-runner-instance-name-invalid",
-            "job_id 為空，無法組出可追蹤的模板實例名",
+            f"無法由 job_id 導出模板實例名: {exc}",
             source="template_instance_id",
-        )
-    slug = re.sub(r"[^A-Za-z0-9_.-]", "-", raw).strip("-")[:48]
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
-    if not slug or not slug[0].isalnum():
-        slug = f"job{slug}" if slug else "job"
-    instance = f"{slug}-{digest}"
-    if not instance_name_valid(instance):
-        raise _fail(
-            "job-runner-instance-name-invalid",
-            f"推導出的模板實例名不合法: {instance!r}（job_id={raw!r}）",
-            source="template_instance_id",
-            job_id=raw,
-        )
-    return instance
+            job_id=str(job_id).strip(),
+        ) from exc
 
 
 def template_unit_name(instance: str, *, template: str = DEFAULT_TEMPLATE_UNIT) -> str:

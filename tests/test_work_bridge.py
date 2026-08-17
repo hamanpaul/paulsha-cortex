@@ -972,7 +972,7 @@ identities:
     branches: list[str] = []
 
     class WorktreeCreator:
-        def create(self, branch, base_sha=None):
+        def create(self, branch, base_sha=None, *, job_id=None):
             branches.append(branch)
             return str(repo)
 

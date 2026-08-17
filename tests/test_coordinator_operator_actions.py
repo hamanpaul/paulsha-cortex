@@ -22,7 +22,7 @@ class _WorktreeCreator:
         self._base_dir = base_dir
         self.calls: list[tuple[str, str | None]] = []
 
-    def create(self, branch: str, base_sha: str | None = None) -> str:
+    def create(self, branch: str, base_sha: str | None = None, *, job_id: str | None = None) -> str:
         self.calls.append((branch, base_sha))
         worktree = self._base_dir / branch.replace("/", "__")
         worktree.mkdir(parents=True, exist_ok=True)

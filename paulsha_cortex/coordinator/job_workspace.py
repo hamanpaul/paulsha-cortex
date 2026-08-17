@@ -75,6 +75,7 @@ chain：model 既不能自證成功、也不能自證失敗）。bundle 內容�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
@@ -143,8 +144,120 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SPOOL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
+#: per-job **具名片段**允許的字元。systemd unit 的 instance 名本身還允許更多
+#: （`/` 需 escape），這裡刻意更窄：同一個字串會被 polkit 的 unit pattern 比對、
+#: 被拼成 spec 檔名，也會成為 worktree pool 底下的一個目錄名。
+JOB_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+
+
 class WorkspaceError(ValueError):
     """工作區 provision／回收的可操作錯誤。"""
+
+
+# ---------------------------------------------------------------------------
+# per-job 具名片段（#645：工作區目錄名 ＝ systemd 模板 instance 名，單一推導點）
+# ---------------------------------------------------------------------------
+
+def job_segment_valid(name: str) -> bool:
+    """`name` 是否符合 :data:`JOB_SEGMENT_RE`（shim 端共用同一條判準）。"""
+
+    return bool(name) and JOB_SEGMENT_RE.fullmatch(name) is not None
+
+
+def job_segment(job_id: str) -> str:
+    """job_id → 這個 job 的**具名片段**。全 repo 唯一的推導點。
+
+    這一個字串同時是三個東西，而它們必須**逐字相等**：
+
+    ==================================  ==========================================
+    用途                                 由誰讀
+    ==================================  ==========================================
+    工作區目錄名 `<pool>/<segment>`      `seams.ScriptWorktreeCreator.create()`
+    systemd 模板 instance 名             `job_runner.template_instance_id()`
+    模板 unit 的 `%i`                    `permgen.build_job_unit()` 產的
+                                        `ReadWritePaths=<pool>/%i`
+    ==================================  ==========================================
+
+    #645 的生產事故正是這三者曾經**各自推導**：provisioning 走 branch slug
+    （`feature/<slice_id>` → `feature-<slice_id>`）、instance 走 job_id，兩者永遠差一個
+    `feature-` 前綴，於是模板 unit 的 `ReadWritePaths` 指向一個不存在的路徑，systemd
+    連 mount namespace 都建不起來（`226/NAMESPACE`）——降權派工因此從未經正式路徑
+    成功啟動過任何 job。修法是把推導收斂成本函式；**呼叫端一律傳 job_id，不得自己
+    拼名字**（兩邊各自算、剛好相等，撐不過下一次改名）。
+
+    形狀：消毒後的可讀片段（保留可追蹤性）＋ job_id 的 sha256 前 8 碼（消毒後撞形
+    也不會撞名）。與 #616 起既有的 instance 名推導**逐字相同**，因此既有部署的
+    spec spool 檔名、polkit pattern 與 unit 名都不因本次變更而改變。
+    """
+
+    raw = str(job_id).strip()
+    if not raw:
+        raise WorkspaceError("job_id 為空，無法組出可追蹤的 per-job 片段")
+    slug = re.sub(r"[^A-Za-z0-9_.-]", "-", raw).strip("-")[:48]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    if not slug or not slug[0].isalnum():
+        slug = f"job{slug}" if slug else "job"
+    segment = f"{slug}-{digest}"
+    if not job_segment_valid(segment):
+        raise WorkspaceError(
+            f"推導出的 per-job 片段不合法: {segment!r}（job_id={raw!r}）"
+        )
+    return segment
+
+
+def workspace_path(pool_root: str | Path, job_id: str) -> Path:
+    """這個 job 的工作區絕對路徑：`<pool_root>/<job_segment(job_id)>`。"""
+
+    return Path(pool_root) / job_segment(job_id)
+
+
+def legacy_branch_slug(branch: str) -> str:
+    """#645 **之前**的工作區目錄名：`branch.replace("/", "-")`。
+
+    只給**回收／診斷**路徑用，provisioning 一律不得再產生這個形狀。既有部署的磁碟上
+    仍可能留著這種目錄（升級前 provision 的、或失敗殘留的），回收端必須認得它——
+    但認得不等於刪得掉：實際刪除仍走 `worktree_reclaim`／`gc` 的形狀判準
+    （標記檔或 `.git` 檔），認不出來的目錄一律 fail-closed，不刪。
+    """
+
+    return str(branch).replace("/", "-")
+
+
+def reclaim_candidate_paths(
+    pool_root: str | Path,
+    *,
+    job_id: str | None = None,
+    branch: str | None = None,
+) -> list[Path]:
+    """某個 job 的工作區**可能**落在哪些路徑（新形狀優先、保序去重）。
+
+    job／slice 記錄沒有 `worktree` 欄位時（舊列、或 provision 途中就炸掉），回收端只能
+    由 id／branch 反推。#645 換名之後「反推」必須同時涵蓋兩種形狀，否則升級當下磁碟上
+    的 `feature-<id>` 殘留會被回收端當成「不存在」而靜默略過，下一次 provision 就撞
+    `worktree target already exists`（#601 的生產現場）。
+
+    只回傳**候選路徑**，不做任何刪除判斷：呼叫端把每一條交給
+    `worktree_reclaim.reclaim_worktree()`，那裡的安全閘負責「不認得就不刪」。
+    """
+
+    root = Path(pool_root)
+    candidates: list[Path] = []
+    if job_id:
+        try:
+            candidates.append(workspace_path(root, job_id))
+        except WorkspaceError:
+            pass
+    if branch:
+        candidates.append(root / legacy_branch_slug(branch))
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +756,7 @@ __all__ = [
     "BASE_REF",
     "COMMIT_BUNDLE_FILENAME",
     "COMMIT_BUNDLE_PART_SUFFIX",
+    "JOB_SEGMENT_RE",
     "MARKER_NAME",
     "MARKER_SCHEMA_VERSION",
     "SOURCE_REMOTE",
@@ -658,14 +772,19 @@ __all__ = [
     "harvest_if_spooled",
     "is_job_clone",
     "is_linked_worktree",
+    "job_segment",
+    "job_segment_valid",
+    "legacy_branch_slug",
     "list_clone_workspaces",
     "marker_path",
     "prepare_commit_spool",
     "read_marker",
+    "reclaim_candidate_paths",
     "remove_clone",
     "seal_commit_spool",
     "source_branch_head",
     "spool_key_for_job",
     "workspace_branch",
+    "workspace_path",
     "write_marker",
 ]

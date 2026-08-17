@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from paulsha_cortex.coordinator import job_workspace
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
 
 
@@ -38,13 +39,16 @@ def test_worktree_creator_reuses_existing_branch_only_when_it_is_base_ancestor(
 ) -> None:
     repo = _repo(tmp_path)
     branch = "feature/31-terminal-lifecycle-canary"
+    job_id = "31-terminal-lifecycle-canary"
     _git(repo, "branch", branch)
     (repo / "tracked.txt").write_text("two\n", encoding="utf-8")
     _git(repo, "commit", "-am", "main advances")
     expected = _git(repo, "rev-parse", "main")
 
     target = Path(
-        ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "worktrees").create(branch)
+        ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "worktrees").create(
+            branch, job_id=job_id
+        )
     )
 
     assert _git(repo, "rev-parse", branch) == expected
@@ -57,6 +61,7 @@ def test_worktree_creator_rejects_diverged_existing_branch_without_moving_it(
 ) -> None:
     repo = _repo(tmp_path)
     branch = "feature/31-terminal-lifecycle-canary"
+    job_id = "31-terminal-lifecycle-canary"
     _git(repo, "switch", "-c", branch)
     (repo / "feature.txt").write_text("feature\n", encoding="utf-8")
     _git(repo, "add", "feature.txt")
@@ -68,7 +73,11 @@ def test_worktree_creator_rejects_diverged_existing_branch_without_moving_it(
     _git(repo, "commit", "-m", "main only")
 
     with pytest.raises(ValueError, match="commits outside requested base"):
-        ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "worktrees").create(branch)
+        ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "worktrees").create(
+            branch, job_id=job_id
+        )
 
     assert _git(repo, "rev-parse", branch) == branch_head
+    # #645：目錄名由 job id 導出；舊的 branch-slug 形狀也不得留下殘留。
+    assert not (tmp_path / "worktrees" / job_workspace.job_segment(job_id)).exists()
     assert not (tmp_path / "worktrees" / "feature-31-terminal-lifecycle-canary").exists()

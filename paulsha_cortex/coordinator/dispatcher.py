@@ -145,10 +145,12 @@ class Dispatcher:
     ) -> dict[str, object]:
         branch = _branch_for_task(task)
         # (1) 先建 worktree；失敗則 raise（不送命令、不記 job — fail-closed）
+        #     #645：工作區目錄名由 job id 導出（本 lane 的 job id ＝ task），不再是
+        #     branch slug；`job_id` 為必填，因此 TypeError 退路也必須帶著它。
         try:
-            worktree = self._worktree_creator.create(branch, base_sha=base_sha)
+            worktree = self._worktree_creator.create(branch, job_id=task, base_sha=base_sha)
         except TypeError:
-            worktree = self._worktree_creator.create(branch)
+            worktree = self._worktree_creator.create(branch, job_id=task)
         # (2) 忠實轉送呼叫者給的完整 command（本 change 不組裝 copilot 指令）
         self._pane_sender.send(pane_id, command)
         # (3) 取 dispatch 當下的 branch head（baseline）；取不到記 None。

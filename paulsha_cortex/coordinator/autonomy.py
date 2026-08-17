@@ -798,16 +798,25 @@ def _resolve_target_base_sha(
 
 
 def _launcher_worktree(dispatcher, slice_id: str, *, base_sha: str | None = None) -> str:
+    """provision 這條 slice 的 build 工作區。
+
+    #645：目錄名由 **slice_id** 導出（`job_workspace.job_segment()`），而
+    `launcher.launch(slice_id=…)` 又把同一個字串交給
+    `job_runner.prepare_systemd_template(job_id=…)` 產 instance 名——兩者因此是同一個
+    推導點的同一個輸出，模板 unit 的 `ReadWritePaths=<pool>/%i` 必然對得上。branch 名
+    仍是 `feature/<slice_id>`，只是不再決定目錄叫什麼。
+    """
+
     worktree_creator = getattr(dispatcher, "_worktree_creator", None)
     if worktree_creator is None:
         return str(Path.cwd())
     branch = _branch_for_slice(slice_id)
     if base_sha is None:
-        return worktree_creator.create(branch)
+        return worktree_creator.create(branch, job_id=slice_id)
     try:
-        return worktree_creator.create(branch, base_sha=base_sha)
+        return worktree_creator.create(branch, job_id=slice_id, base_sha=base_sha)
     except TypeError:
-        return worktree_creator.create(branch)
+        return worktree_creator.create(branch, job_id=slice_id)
 
 
 def _record_launching_job(

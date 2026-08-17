@@ -26,6 +26,8 @@ from paulsha_cortex.coordinator import job_workspace, launcher, manager, verific
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
 
 _BRANCH = "feature/623-bundle-harvest"
+#: #645：工作區目錄名由 job id 導出（branch 名不變）。
+_JOB_ID = "623-bundle-harvest"
 _KEY = "job-623-0001"
 
 
@@ -58,7 +60,11 @@ def _source_repo(tmp_path: Path) -> Path:
 
 
 def _workspace(repo: Path, pool: Path) -> Path:
-    return Path(ScriptWorktreeCreator(repo=repo, wt_root=pool, base="main").create(_BRANCH))
+    return Path(
+        ScriptWorktreeCreator(repo=repo, wt_root=pool, base="main").create(
+            _BRANCH, job_id=_JOB_ID
+        )
+    )
 
 
 def _builder_commit(workspace: Path, name: str = "builder.txt") -> str:
@@ -140,7 +146,7 @@ def test_provision_pins_the_base_at_the_requested_base_sha(tmp_path: Path) -> No
 
     workspace = Path(
         ScriptWorktreeCreator(repo=repo, wt_root=tmp_path / "pool", base="main").create(
-            _BRANCH, base_sha=pinned_at
+            _BRANCH, job_id=_JOB_ID, base_sha=pinned_at
         )
     )
 

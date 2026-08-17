@@ -478,6 +478,60 @@ def reclaim_worktree(
     )
 
 
+def reclaim_recorded_or_derived(
+    *,
+    recorded_path: str | Path | None = None,
+    pool_root: str | Path | None = None,
+    job_id: str | None = None,
+    branch: str | None = None,
+    git_runner: GitRunner | None = None,
+    repo_root: str | Path | None = None,
+    preserve_root: str | Path | None = None,
+) -> WorktreeReclaim | None:
+    """回收某個 slice 的 build 工作區——記錄有路徑就用它，沒有才反推。
+
+    `recover-pre-candidate` 有兩處實作（`manager.apply_slice_action` 與
+    `work_actions`），兩處都得回答同一個問題：「這條 slice 的工作區在哪」。收斂成
+    本函式，兩邊就不會在 #645 換名之後各自更新一半。
+
+    - **記錄有 `worktree`** → 逐字回收那一條，行為與 #645 之前完全相同。
+    - **記錄沒有** → 由 `job_workspace.reclaim_candidate_paths()` 反推候選：#645 之後
+      的 `<pool>/<job_segment(job_id)>` 與 #645 之前的 `<pool>/<branch slug>`。
+      **兩種形狀都要試**，否則升級當下磁碟上的舊目錄會被當成「不存在」而略過，
+      下一次 provision 直接撞 `worktree target already exists`（#601 的現場）。
+
+    回傳挑選規則：任一筆 `failed` → 回那一筆（呼叫端據此 fail closed）；否則有
+    實際回收到的 → 回那一筆；否則回第一筆（`absent`）；完全沒有候選 → None。
+    **不認得的目錄一律由 `reclaim_worktree()` 的安全閘擋下（回 failed），本函式不
+    會、也不得靜默刪除任何形狀不明的目錄。**
+    """
+
+    targets: list[Path] = []
+    if recorded_path and isinstance(recorded_path, (str, Path)):
+        targets = [Path(recorded_path)]
+    elif pool_root is not None:
+        targets = job_workspace.reclaim_candidate_paths(
+            pool_root, job_id=job_id, branch=branch
+        )
+    if not targets:
+        return None
+    results = reclaim_worktrees(
+        list(targets),
+        git_runner=git_runner,
+        repo_root=repo_root,
+        preserve_root=preserve_root,
+    )
+    if not results:
+        return None
+    for result in results:
+        if result.status == RECLAIM_FAILED:
+            return result
+    for result in results:
+        if result.status == RECLAIM_RECLAIMED:
+            return result
+    return results[0]
+
+
 def reclaim_worktrees(
     worktrees: list[str | Path],
     *,

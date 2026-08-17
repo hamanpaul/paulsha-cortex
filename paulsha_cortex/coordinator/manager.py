@@ -1673,9 +1673,6 @@ def apply_slice_action(
                 pass
         if not wt_path:
             wt_path = slice_row.get("worktree")
-        if not wt_path and isinstance(slice_row.get("branch"), str):
-            slug = slice_row["branch"].replace("/", "-")
-            wt_path = str(Path(paths.worktree_root()) / slug)
 
         # #478：舊碼在 `runner is None`（生產 dispatcher 的合法狀態）時整段跳過
         # git 清理只 rmtree 目錄，registry 記錄留下來讓下一 tick 的
@@ -1683,18 +1680,31 @@ def apply_slice_action(
         # 「目錄已消失、registry 殘留」壞狀態永遠自癒不了。改走單一回收函式：
         # 預設 runner 由 `worktree_reclaim` 自行 fallback，後置條件（目錄不存在
         # ＋ registry 無該筆）驗證不過就 fail closed，不再回報 ok。
-        reclaim = None
-        if wt_path and isinstance(wt_path, (str, Path)):
-            reclaim = worktree_reclaim.reclaim_worktree(
-                wt_path,
-                git_runner=runner,
-                preserve_root=_reclaim_preserve_root(registry),
+        # #645：記錄沒有 worktree 時的反推改走共用 helper，新舊兩種目錄形狀都試。
+        # pool root **只在真的要反推時才解析**——`paths.worktree_root()` 在
+        # `PSC_REPO_ROOT` 未宣告時是 fail-closed 的（#612），記錄已有路徑卻因此炸掉
+        # 會讓回收比 #645 之前更脆弱。
+        recorded = wt_path if isinstance(wt_path, (str, Path)) and wt_path else None
+        pool_root = None
+        if recorded is None:
+            try:
+                pool_root = paths.worktree_root()
+            except Exception:
+                pool_root = None
+        branch_hint = slice_row.get("branch")
+        reclaim = worktree_reclaim.reclaim_recorded_or_derived(
+            recorded_path=recorded,
+            pool_root=pool_root,
+            job_id=slice_id,
+            branch=branch_hint if isinstance(branch_hint, str) else None,
+            git_runner=runner,
+            preserve_root=_reclaim_preserve_root(registry),
+        )
+        if reclaim is not None and not reclaim.ok:
+            raise RuntimeError(
+                "recover-pre-candidate worktree reclaim failed: "
+                f"{reclaim.detail or reclaim.status} ({reclaim.path})"
             )
-            if not reclaim.ok:
-                raise RuntimeError(
-                    "recover-pre-candidate worktree reclaim failed: "
-                    f"{reclaim.detail or reclaim.status} ({reclaim.path})"
-                )
 
         consumed_at = clock()
         registry.record_action(
@@ -8504,25 +8514,38 @@ def _dispatch_workflow_card(
             if (match := re.fullmatch(rf"{re.escape(run.repo)}#([1-9][0-9]*)", ref))
         ]
         primary_issue = min(issue_numbers) if issue_numbers else None
-        builder_branch = (
-            f"feature/{primary_issue}-{run.work_id}"
-            if primary_issue is not None
-            else f"feature/{run.work_id}"
+        builder_work_id = (
+            f"{primary_issue}-{run.work_id}" if primary_issue is not None else run.work_id
         )
-        # #208 收口 wiring 5（#211 閉環）：凍結集存在時 worktree 必須以
-        # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導
-        # 一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base
-        # 缺陷）。無凍結集時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
-        # WorktreeCreator 實作 without base_sha 亦不受影響）。
+        builder_branch = f"feature/{builder_work_id}"
+        # #645：工作區目錄名改由 id 導出（不再是 branch slug）。canonical lane 傳的是
+        # **run 層級的 build 身分**而不是某一個 job_id——這條 lane 的工作區是
+        # per-run 的：build 卡 provision 之後，同一個 run 後續的卡直接沿用
+        # `builder_jobs[-1]["worktree"]`（見本函式上方）。因此這裡的目錄名恆等於
+        # 「第一張 build 卡的 run 身分」，而 `job_runner.template_instance_id()` 算的是
+        # **每一個 job 自己的** id——兩者在 canonical lane 結構上就不可能逐字相等
+        # （一個工作區對多個 job）。slice lane（`autonomy._launcher_worktree`）沒有這個
+        # 一對多，因此 #645 的不變式在那裡成立且有測試守著。canonical lane 要在
+        # `PSC_JOB_RUNNER=systemd-template` 底下跑，需要先把「工作區 per-run」改成
+        # 「per-job」——那是另一票的事，本次不動。
         frozen_base_sha = None
         if isinstance(run.frozen_readiness, dict):
             candidate_base_sha = run.frozen_readiness.get("base_sha")
             if isinstance(candidate_base_sha, str) and candidate_base_sha:
                 frozen_base_sha = candidate_base_sha
+        # #208 收口 wiring 5（#211 閉環）：凍結集存在時 worktree 必須以
+        # frozen_readiness["base_sha"] 為基底，不得讓 dispatch 自行重新推導
+        # 一個可能更新鮮（或更陳舊）的 base（hippo #18 #2／#41 v2 的 stale-base
+        # 缺陷）。無凍結集時完全不傳 base_sha 引數，維持現行為（呼叫端保有舊
+        # WorktreeCreator 實作 without base_sha 亦不受影響）。
         if frozen_base_sha is not None:
-            worktree = str(creator.create(builder_branch, base_sha=frozen_base_sha))
+            worktree = str(
+                creator.create(
+                    builder_branch, job_id=builder_work_id, base_sha=frozen_base_sha
+                )
+            )
         else:
-            worktree = str(creator.create(builder_branch))
+            worktree = str(creator.create(builder_branch, job_id=builder_work_id))
     else:
         worktree = run.workspace_root
     effective_repo_root = Path(worktree).resolve()
