@@ -2990,7 +2990,7 @@ def test_control_queue_manager_executes_heterogeneous_brainstorm_before_plan(tmp
     created_branches: list[str] = []
 
     class WorktreeCreator:
-        def create(self, branch, base_sha=None):
+        def create(self, branch, base_sha=None, *, job_id=None):
             created_branches.append(branch)
             return str(tmp_path)
 

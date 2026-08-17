@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from paulsha_cortex.coordinator import manager, work_actions, worktree_reclaim
+from paulsha_cortex.coordinator import job_workspace, manager, work_actions, worktree_reclaim
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
@@ -278,10 +278,11 @@ def test_recover_pre_candidate_clears_registry_and_allows_redispatch(
     assert str(worktree) not in _registered_worktrees(repo)
     assert registry.get_slice("slice-e")["state"] == "pending"
     # 下一 tick 的實際動作：dispatch 會呼叫 ScriptWorktreeCreator.create()。
+    # #645：目錄名改由 job id 導出（branch 名不變），因此重建的位置是新形狀那一個。
     recreated = ScriptWorktreeCreator(repo=repo, wt_root=pool, base="main").create(
-        "feature/slice-e"
+        "feature/slice-e", job_id="slice-e"
     )
-    assert Path(recreated) == worktree
+    assert Path(recreated) == pool / job_workspace.job_segment("slice-e")
 
 
 def test_recover_pre_candidate_self_heals_orphan_registry_entry(
@@ -316,7 +317,9 @@ def test_recover_pre_candidate_self_heals_orphan_registry_entry(
 
     assert result["result"] == "ok"
     assert str(worktree) not in _registered_worktrees(repo)
-    ScriptWorktreeCreator(repo=repo, wt_root=pool, base="main").create("feature/slice-f")
+    ScriptWorktreeCreator(repo=repo, wt_root=pool, base="main").create(
+        "feature/slice-f", job_id="slice-f"
+    )
 
 
 def test_recover_pre_candidate_fails_closed_when_reclaim_fails(

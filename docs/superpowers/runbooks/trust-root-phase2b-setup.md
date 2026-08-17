@@ -1651,6 +1651,21 @@ systemctl cat cortex-job@.service | grep -E "^ExecStart="
 systemctl cat cortex-job@.service | grep -E "^Environment=PSC_JOB_SPEC_SPOOL="
 #   期望：Environment=PSC_JOB_SPEC_SPOOL=/var/lib/cortex/coordinator/job-specs
 
+# ✅ 檢查 job 工作區的 ReadWritePaths（#645）
+systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/worktree/%i$"
+#   期望：命中。`%i` 這個 segment 與 provisioning 產生的**目錄名**是同一個推導點
+#   （`coordinator/job_workspace.py` 的 `job_segment(job_id)`，`job_runner`
+#   的 instance 名走的也是它）。#645 之前 provisioning 用的是 branch slug
+#   （`feature-<slice_id>`），與 `%i` 永遠差一個前綴 ⇒ ReadWritePaths 指向不存在
+#   的路徑 ⇒ `Failed to set up mount namespacing` / `226/NAMESPACE`，job 起不來。
+
+# ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶）
+sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service
+#   期望：**沒有** `Unknown key name 'CollectMode' in section 'Service', ignoring.`
+#   `CollectMode` 屬 `[Unit]`；放在 `[Service]` 只是被忽略（不影響行為），但
+#   「失敗的 instance 自動回收」這個用意不會生效，失敗殘骸會一直掛在
+#   `systemctl list-units --failed` 上、擋住同名 instance 的下一次 start。
+
 # 🔧 sudo：落檔（root 擁有、可執行、對三個服務帳號唯讀）
 sudo install -d -o root -g root -m 0755 /opt/cortex/bin
 sudo install -o root -g root -m 0755 /tmp/cortex-job-shim /opt/cortex/bin/cortex-job-shim
@@ -1754,6 +1769,15 @@ sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | x
 > 行程內執行（見開頭「分段落地」）。
 
 ### 5-6. 正向驗證（**必須成功**）
+
+> **這一段只驗隔離，驗不了功能**（#645 的教訓）：底下的 worktree 是 operator
+> **手工**建在 `/var/lib/cortex/worktree/$JOB`——也就是刻意挑了一個與 instance 名
+> 相符的路徑。真實派工的工作區由 `seams.ScriptWorktreeCreator.create()` 產生，
+> instance 名由 `job_runner.prepare_systemd_template()` 產生；#645 之前這兩條鏈各自
+> 導出、永遠差一個 `feature-` 前綴，而手工組 spec 恰好把它繞過去。因此本步驟通過
+> **不代表**降權派工能起得來——請務必另跑一次**真實 dispatch 路徑**的功能 smoke。
+> 兩條鏈現已收斂到 `coordinator/job_workspace.py` 的 `job_segment()` 單一推導點，
+> 並由 `tests/test_worktree_dir_naming_645.py` 的不變式守著。
 
 ```bash
 JOB=selftest

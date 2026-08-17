@@ -162,7 +162,7 @@ class _RecordingWorktreeCreator:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str | None]] = []
 
-    def create(self, branch: str, *, base_sha: str | None = None) -> str:
+    def create(self, branch: str, *, job_id: str | None = None, base_sha: str | None = None) -> str:
         self.calls.append((branch, base_sha))
         return f"/fake/wt/{branch.replace('/', '-')}"
 

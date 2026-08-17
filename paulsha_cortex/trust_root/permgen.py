@@ -2334,6 +2334,12 @@ def build_job_unit(
         "[Unit]",
         "Description=cortex headless job %i (downgraded, trust-root Phase 2b)",
         f"After={layout.instance}-manager.service",
+        "# job 為一次性：結束即回收 unit 狀態，不留可被重用的殘骸。",
+        "# `CollectMode` 是 **[Unit] 的鍵**，不是 [Service] 的（#645 附帶修正）——放錯段",
+        "# systemd 只會 `Unknown key name 'CollectMode' in section 'Service', ignoring.`，",
+        "# 於是「失敗的 instance 自動回收」這個用意整個沒生效，失敗殘骸會一直掛在",
+        "# `systemctl list-units --failed` 上、擋住同名 instance 的下一次 start。",
+        "CollectMode=inactive-or-failed",
         "",
         "[Service]",
         "Type=exec",
@@ -2403,8 +2409,7 @@ def build_job_unit(
     body += _rwp_lines(owners)
     body += [
         "",
-        "# job 為一次性：結束即回收 unit 狀態，不留可被重用的殘骸。",
-        "CollectMode=inactive-or-failed",
+        "# job 為一次性，不自動重啟（`CollectMode` 在上方 [Unit] 段）。",
         "Restart=no",
         "# 刻意**不**用 StandardOutput=append:<log>——那個檔由 PID 1（root）在降權前開啟，",
         "# 路徑中只要有一段由 Manager 帳號掌控就成了 root-follows-symlink 的提權面。",

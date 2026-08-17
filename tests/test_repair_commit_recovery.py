@@ -574,7 +574,7 @@ class _FakeWorktreeCreator:
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    def create(self, branch: str, base_sha: str | None = None) -> Path:
+    def create(self, branch: str, base_sha: str | None = None, *, job_id: str | None = None) -> Path:
         return self._path
 
 

@@ -3743,25 +3743,33 @@ def _recover_pre_candidate_action(
             pass
     if not wt_path:
         wt_path = target_slice.get("worktree")
-    if not wt_path and isinstance(target_slice.get("branch"), str):
-        slug = target_slice["branch"].replace("/", "-")
-        wt_path = str(Path(paths.worktree_root()) / slug)
 
     # #478：舊碼用裸 `subprocess.run(["git", "worktree", ...])`（無 `-C <repo>`，
     # 實際跑在 manager 進程的 cwd 上）、`check=False` 吞錯，且只在目錄還在時
     # 觸發——registry 殘留與「目錄已消失但 registry 還在」都清不掉。統一改走
     # `worktree_reclaim`，後置條件不成立即 fail closed。
-    reclaim = None
-    if wt_path and isinstance(wt_path, (str, Path)):
-        reclaim = worktree_reclaim.reclaim_worktree(
-            wt_path,
-            preserve_root=state_path.resolve().parent / "evidence",
+    # #645：記錄沒有 worktree 時的反推走共用 helper（與 `manager.apply_slice_action`
+    # 同一份），新舊兩種目錄形狀都試；pool root 只在真的要反推時才解析（#612）。
+    recorded = wt_path if isinstance(wt_path, (str, Path)) and wt_path else None
+    pool_root = None
+    if recorded is None:
+        try:
+            pool_root = paths.worktree_root()
+        except Exception:
+            pool_root = None
+    branch_hint = target_slice.get("branch")
+    reclaim = worktree_reclaim.reclaim_recorded_or_derived(
+        recorded_path=recorded,
+        pool_root=pool_root,
+        job_id=slice_id,
+        branch=branch_hint if isinstance(branch_hint, str) else None,
+        preserve_root=state_path.resolve().parent / "evidence",
+    )
+    if reclaim is not None and not reclaim.ok:
+        raise RuntimeError(
+            "recover-pre-candidate worktree reclaim failed: "
+            f"{reclaim.detail or reclaim.status} ({reclaim.path})"
         )
-        if not reclaim.ok:
-            raise RuntimeError(
-                "recover-pre-candidate worktree reclaim failed: "
-                f"{reclaim.detail or reclaim.status} ({reclaim.path})"
-            )
 
     actor = args.get("actor") or requested_by
     workflow_registry.record_action(

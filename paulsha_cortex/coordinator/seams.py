@@ -18,15 +18,20 @@ class PaneSender(Protocol):
 
 @runtime_checkable
 class WorktreeCreator(Protocol):
-    """為某分支建立 per-job git 工作區、回傳其路徑的 seam。
+    """為某 job 建立 per-job git 工作區、回傳其路徑的 seam。
 
     協定名沿用 ``WorktreeCreator``（以及 job 記錄的 ``worktree`` 欄位）：#623 之後
     實作已改為 per-job 完整 clone，但這兩個名字是**已持久化的契約**——job registry
     的既有列、以及注入 fake 的大量既有測試都靠它。改名不會讓任何東西更正確，只會
     製造一次不必要的資料遷移。實際的工作區模型見 `coordinator/job_workspace.py`。
+
+    ``job_id`` 是**必填**（#645）：目錄名由它經 `job_workspace.job_segment()` 導出，
+    而那同時是 systemd 模板的 instance 名。留一個預設值等於留一條「忘了傳就退回舊
+    命名」的路，那正是 #645 的復發面。``branch`` 仍是 branch——它決定 clone 出來
+    checkout 哪一條，**不再**決定目錄叫什麼。
     """
 
-    def create(self, branch: str, *, base_sha: str | None = None) -> str: ...
+    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str: ...
 
 
 class TmuxPaneSender:
@@ -89,6 +94,11 @@ class ScriptWorktreeCreator:
     任何一步失敗都會把**已做的變更全部還原**（部分 clone 目錄刪除、branch 回到
     provision 前的位置或刪除）——殘留正是 #601／#613 的生產現場。
 
+    **目錄名（#645）**：`<worktree_root>/<job_workspace.job_segment(job_id)>`。
+    #645 之前是 `<worktree_root>/<branch.replace("/", "-")>`，與模板 unit 期望的
+    `<worktree_root>/%i` 永遠差一個 `feature-` 前綴，systemd 建 mount namespace 直接
+    失敗（`226/NAMESPACE`）。branch 名不變，只有磁碟上的目錄名改。
+
     單元測試 MUST 注入 fake，不實體化此類。
     """
 
@@ -114,9 +124,13 @@ class ScriptWorktreeCreator:
     def _source(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return self._run(["-C", str(self._repo), *args])
 
-    def create(self, branch: str, *, base_sha: str | None = None) -> str:
-        slug = branch.replace("/", "-")
-        target = self._wt_root / slug
+    def create(self, branch: str, *, job_id: str, base_sha: str | None = None) -> str:
+        #: #645：目錄名由 **job id** 導出，不再是 branch slug。降權派工的模板 unit
+        #: 只有 `%i` 可用（`ReadWritePaths=<pool>/%i`），推不出 branch slug，因此
+        #: 兩個名字要對齊，只能讓目錄名這一側讓步。推導點只有
+        #: `job_workspace.job_segment()` 一個——`job_runner.template_instance_id()`
+        #: 走的是同一個函式，兩者因此不是「剛好相等」而是**同一個字串**。
+        target = job_workspace.workspace_path(self._wt_root, job_id)
         self._wt_root.mkdir(parents=True, exist_ok=True)
         base = base_sha or self._base
         #: provision 前的 branch 位置：None＝當時不存在。失敗時據此還原。

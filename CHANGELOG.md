@@ -120,6 +120,34 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#645 / trust-root：模板 unit 的 `%i` 與 worktree 目錄名永遠對不上——降權派工從未經
+  正式路徑成功啟動過任何 job**——`seams.ScriptWorktreeCreator.create()` 以 **branch
+  slug** 命名工作區（`feature/<slice_id>` → `<pool>/feature-<slice_id>`），而模板 unit 的
+  `ReadWritePaths=<pool>/%i` 期望的是 `job_runner.prepare_systemd_template()` 由 **job
+  id** 算出的 instance 名；兩者永遠差一個 `feature-` 前綴 ⇒ `ReadWritePaths` 指向不存在
+  的路徑 ⇒ systemd 建 mount namespace 直接失敗（`226/NAMESPACE`）。M1 的正向 smoke 用的
+  是**手工組的 job spec**（自然挑了與 instance 名相符的路徑），把這個 bug 繞過去了——
+  與 #584／#623 同一條方法論教訓：手工 spec 只能驗隔離，驗不了功能。
+  **修法（operator 裁決）改目錄名這一側，不改 instance 名**：模板 unit 只有 `%i` 可用、
+  推不出 branch slug，而「job 的工作區以 job id 定址」本來就與登記表既有的 per-job 模型
+  （spool／sentinel／gate ledger）一致。**branch 名完全不變**，只有磁碟上的目錄名改。
+  收斂為**單一推導點** `coordinator/job_workspace.py:job_segment(job_id)`——
+  `job_runner.template_instance_id()` 改為委派給它（形狀逐字不變，既有部署的 spec 檔名／
+  polkit pattern／unit 名皆不改變），`seams.create()` 加上**必填**的 `job_id` 關鍵字
+  （留預設值等於留一條「忘了傳就退回舊命名」的復發路徑）。新增
+  `tests/test_worktree_dir_naming_645.py` 直接比對兩個真實推導函式的輸出（不對常數斷言）、
+  一條突變守衛與一條接線測試；完整 `prepare_systemd_template()` 那一條需要 OS 層前置物，
+  單 UID 環境**明確 skip 並列出缺哪一項**（#638 的教訓）。
+  **既有殘留**：`gc`／`worktree_reclaim` 以**形狀**（標記檔／`.git` 檔）判斷、與名字無關，
+  舊目錄照樣回收得掉；真正會漏的 `recover-pre-candidate` 反推路徑（`manager` 與
+  `work_actions` 各一份）收斂到 `worktree_reclaim.reclaim_recorded_or_derived()`，
+  新舊兩種形狀都試，而形狀不明的目錄仍一律 fail-closed **不刪**。
+  **已知邊界**：canonical（workflow）lane 的工作區是 per-run 的（一個工作區對多個
+  job_id），「目錄名 ＝ 該 job 的 instance 名」在那裡結構上不可能成立；要在
+  `PSC_JOB_RUNNER=systemd-template` 下跑那條 lane，須先把工作區改成 per-job。
+  **附帶**：`permgen.build_job_unit()` 把 `CollectMode=inactive-or-failed` 由 `[Service]`
+  搬到 `[Unit]`——放錯段只被 systemd 忽略（`Unknown key name … ignoring.`），
+  「失敗的 instance 自動回收」的用意因此沒生效。
 - **#641 / trust-root：`repo-worktree` 仍授 Manager 唯讀 ACL——交換面已改 bundle，
   這條授權沒有消費者，卻讓 #637 的不變式在實機上不成立**——#637 把成果回收換成
   bundle ＋ append-only spool 並加了「Manager 全程不碰 builder 的 clone」不變式測試，

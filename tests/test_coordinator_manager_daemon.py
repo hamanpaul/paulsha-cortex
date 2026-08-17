@@ -212,7 +212,7 @@ class FakeWorktreeCreator:
         self._base_dir = base_dir
         self.calls: list[str] = []
 
-    def create(self, branch: str) -> str:
+    def create(self, branch: str, *, job_id: str | None = None) -> str:
         self.calls.append(branch)
         return str(self._base_dir / branch.replace("/", "__"))
 
