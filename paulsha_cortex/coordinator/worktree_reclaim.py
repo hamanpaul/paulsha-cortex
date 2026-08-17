@@ -14,9 +14,67 @@ at ...` 失敗，slice 被打回 `needs_human`。
   否則回收判定為 ``failed``——呼叫端據此 fail closed，不得回報成功。
 - **自癒**：既存壞狀態（目錄已不存在、registry 殘留）也要能收乾淨；因此
   registry 探測先於目錄探測，不以目錄存在與否作為要不要清 registry 的條件。
-- **不銷毀證據**：目錄若帶未提交／未追蹤內容，先複製到 ``preserve_root`` 底下
-  的 reclaim 封存再刪；封存失敗即 ``failed``，一個位元組都不刪（#478 的
-  `.project-policy.yml` 資料遺失回報）。
+- **不銷毀證據**：見下節。回收永遠不得讓「還沒有第二份副本的東西」消失。
+
+## 「不銷毀證據」的兩種模型（#658）
+
+原始契約只有一種做法：目錄若帶未提交／未追蹤內容，先複製到 ``preserve_root``
+底下的 reclaim 封存再刪；封存失敗即 ``failed``，一個位元組都不刪（#478 的
+`.project-policy.yml` 資料遺失回報）。#658 把它拆成**兩個具名模型**，呼叫端必須
+明講自己屬於哪一種——**不是靜默跳過**：
+
+:data:`EVIDENCE_PRESERVE`（預設，語意與 #478 逐字相同）
+    「這棵樹裡可能有還沒有第二份副本的東西」。所有**未採信**路徑一律走這條：
+    `recover-pre-candidate`（#478／#547）、`abandon` 的回收（#527）、#601 的
+    retry 前殘留。這些路徑的共同性質是**成果沒有被 harvest 過**——工作區裡的
+    commit 只存在於它自己的 object store，未提交內容更是沒有任何其他副本。
+
+:data:`EVIDENCE_HARVESTED`（#658 新增）
+    「這棵樹裡的每一樣**受治理**的東西都已經有第二份副本，且那份副本在
+    Manager-owned 的樹裡」。呼叫端 MUST 在傳入這個值之前證明該前提；本模組
+    **不**代為證明（它只拿得到一個路徑）。目前唯一的合法呼叫端是
+    `manager._reclaim_trusted_build_workspace()`——它在
+    `_harvest_build_candidate()` 之後、且**當場對來源樹複驗** candidate 已經
+    在裡面、`refs/heads/<branch>` 恰等於它，才會用這個模型。
+
+### 為什麼 `harvested` 底下可以不做 preserve（#658 的論證，不是省略）
+
+被回收的是 canonical lane 一張**已被採信**的 build 卡的工作區。逐條盤點它當下
+還持有什麼，以及那樣東西的第二份副本在哪：
+
+===============================  ===================================================
+工作區裡的東西                    第二份副本
+===============================  ===================================================
+被採信的 commit                   來源樹的 ``refs/heads/<branch>``（#637 bundle ＋
+                                 append-only spool；`_harvest_build_candidate()`
+                                 強制「回收後 branch head 恰等於 candidate」）
+bundle 本身                       Manager-owned 的 `commit-spool`（封口後仍在）
+gate ledger                       `gate-ledger-spool` → Manager 重寫的 `gate-ledger`
+                                 （#628／#629，作者一律是 Manager）
+exit sentinel                     Manager 自己寫（#604／#628）
+JSONL log                         `log_dir`（Manager-owned），本來就不在工作區裡
+宣告的 outputs                    採信當下已由 `_read_job_workflow_evidence()` 逐檔
+                                 hash 進 immutable canonical evidence
+canonical report                  #650／#659 之後發佈在 reviewer 的 candidate 樹，
+                                 不在 build 卡的工作區
+===============================  ===================================================
+
+**剩下的就只有「模型做了、但既沒 commit、也沒宣告為 output」的未追蹤殘渣。**
+它在採信面上的地位是零——#540 的 acceptance chain 採信的是 candidate commit，
+未提交內容從定義上就不在採信面內；#628 更明講「被驗方不得在自己的進程裡產生
+自己的驗收證據」，而這些檔案正是 builder 完全掌控的內容。把它們複製進
+Manager-owned 的 ``evidence/`` 樹，實際效果是**把不受信任的內容搬進受信任的
+樹**，並且把本次要回收的位元組原地搬個家（一張卡就可能是 512 檔 × 4MB）——
+那與 #658 要解的「工作區佔用隨 build 卡數線性成長」是同一個問題換個目錄。
+
+**#478 的現場不適用**：那次遺失的是 operator 自己 worktree 裡的真實工作，
+發生在**未採信**路徑上。那條路徑仍然、也必須走 :data:`EVIDENCE_PRESERVE`。
+
+**兩個模型共用的保險絲**：`job_workspace.archive_workspace_head()` 在**兩種模型
+下都跑**。它把工作區 HEAD 拉進來源樹的封存命名空間，且「commit 已在來源樹裡」
+時直接回 None。因此在 `harvested` 模型下它正常是 no-op；一旦呼叫端的前提其實
+不成立（commit 沒進來源樹），它就會把那顆 commit 救回來——這是模型選錯時的
+安全網，不是可有可無的加分項。
 
 git_runner seam 沿用 `dispatcher.GitRunner` 契約：收 **git 子命令參數**（不含
 前導 ``git``、不含 ``-C``），對 repo root 執行，失敗時 raise。#478 驗收條款
@@ -57,6 +115,12 @@ PRESERVE_FILE_MAX_BYTES = 4 * 1024 * 1024
 # 封存檔數上限，理由同上。
 PRESERVE_FILE_MAX_COUNT = 512
 
+# 「不銷毀證據」的兩種模型（完整論證見模組 docstring）。**預設一律是
+# `EVIDENCE_PRESERVE`**：新呼叫端忘了表態時得到的是保守的那一個。
+EVIDENCE_PRESERVE = "preserve"
+EVIDENCE_HARVESTED = "harvested"
+_EVIDENCE_MODELS = frozenset({EVIDENCE_PRESERVE, EVIDENCE_HARVESTED})
+
 
 @dataclass(frozen=True)
 class WorktreeReclaim:
@@ -73,6 +137,9 @@ class WorktreeReclaim:
     #: （`job_workspace.ARCHIVE_REF_PREFIX` 底下）。worktree 模型、或 commit 已在
     #: 來源 repo 裡（成果已回收）時為 None。
     archived_ref: str | None = None
+    #: #658：本次回收採用的「不銷毀證據」模型（見模組 docstring）。帶進 action
+    #: record／診斷是刻意的——operator 看得到某一次回收**為什麼**沒有 preserve 封存。
+    evidence_model: str = EVIDENCE_PRESERVE
     detail: str | None = None
 
     @property
@@ -86,6 +153,7 @@ class WorktreeReclaim:
             "registry_entry_found": self.registry_entry_found,
             "registry_removed": self.registry_removed,
             "directory_removed": self.directory_removed,
+            "evidence_model": self.evidence_model,
         }
         if self.preserved_ref is not None:
             payload["preserved_ref"] = self.preserved_ref
@@ -305,6 +373,7 @@ def reclaim_worktree(
     git_runner: GitRunner | None = None,
     repo_root: str | Path | None = None,
     preserve_root: str | Path | None = None,
+    evidence_model: str = EVIDENCE_PRESERVE,
 ) -> WorktreeReclaim:
     """原子回收單一 build worktree（目錄 ＋ registry），並驗證後置條件。
 
@@ -315,8 +384,14 @@ def reclaim_worktree(
 
     任一條無法證實（含 registry 清單本身讀不到）一律回 ``failed``；呼叫端
     MUST NOT 在 ``failed`` 上回報 recovery 成功——這正是 #478 的核心缺陷。
+
+    ``evidence_model``（#658）決定「不銷毀證據」怎麼落實，兩個合法值的語意與
+    適用條件見模組 docstring。**不接受未知值**：那代表呼叫端沒有真的表態，而
+    靜默退回預設會讓一次本該 preserve 的回收看起來像是刻意跳過。
     """
 
+    if evidence_model not in _EVIDENCE_MODELS:
+        raise ValueError(f"unknown worktree reclaim evidence model: {evidence_model!r}")
     runner = resolve_git_runner(git_runner, repo_root=repo_root)
     target = Path(path)
     text = str(target)
@@ -324,12 +399,15 @@ def reclaim_worktree(
     registered, list_error = _registry_contains(runner, target)
     if list_error is not None:
         return WorktreeReclaim(
-            RECLAIM_FAILED, text, detail=f"worktree-registry-unreadable: {list_error}"
+            RECLAIM_FAILED,
+            text,
+            evidence_model=evidence_model,
+            detail=f"worktree-registry-unreadable: {list_error}",
         )
 
     exists = target.exists() or target.is_symlink()
     if not registered and not exists:
-        return WorktreeReclaim(RECLAIM_ABSENT, text)
+        return WorktreeReclaim(RECLAIM_ABSENT, text, evidence_model=evidence_model)
 
     # 安全閘（先於任何寫入／掃描）：registry 沒這筆、目錄本身也沒有
     # linked-worktree 標記，代表這個路徑不是（也不曾是）build worktree——
@@ -344,13 +422,22 @@ def reclaim_worktree(
         and target.is_dir()
         and not _looks_like_job_workspace(target)
     ):
-        return WorktreeReclaim(RECLAIM_FAILED, text, detail="worktree-path-not-a-worktree")
+        return WorktreeReclaim(
+            RECLAIM_FAILED,
+            text,
+            evidence_model=evidence_model,
+            detail="worktree-path-not-a-worktree",
+        )
 
     # #623：clone 模型下 `rmtree` 會連 object store 一起刪掉——worktree 模型下這些
     # commit 在共用 store 裡、branch 也還在主 repo，回收不銷毀任何東西。為了維持本
     # 模組契約的「不銷毀證據」，刪除前先把工作區 HEAD 拉進來源 repo 的封存命名空間
     # （已在來源 repo 裡的 commit 不重複封存）。封存本身是加分項，失敗不阻斷回收
     # ——回收失敗才是 #478／#601 的生產事故。
+    #
+    # #658：這一段在**兩種 evidence 模型下都跑**。`harvested` 模型下它正常是 no-op
+    # （commit 已在來源樹裡 ⇒ 直接回 None），但呼叫端的前提萬一不成立，它就是把那顆
+    # commit 救回來的安全網——正因為如此，`harvested` 略過的只有 preserve 那一段。
     archived_ref: str | None = None
     if exists and not target.is_symlink() and job_workspace.is_job_clone(target):
         # 來源 repo 優先取呼叫端給的值；沒給時取標記檔記錄的 provision 來源
@@ -371,7 +458,12 @@ def reclaim_worktree(
 
     preserved_ref: str | None = None
     preserved_files = 0
-    if exists and not target.is_symlink() and target.is_dir():
+    if (
+        evidence_model == EVIDENCE_PRESERVE
+        and exists
+        and not target.is_symlink()
+        and target.is_dir()
+    ):
         entries, dirty_error = _dirty_entries(runner, target)
         if dirty_error is not None:
             # gitdir 已壞（正是 #478 的殘留態）時 status 讀不到；此時目錄要嘛
@@ -396,6 +488,7 @@ def reclaim_worktree(
                     RECLAIM_FAILED,
                     text,
                     registry_entry_found=registered,
+                    evidence_model=evidence_model,
                     detail=(
                         "worktree-dirty-preserve-failed: "
                         f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -419,6 +512,7 @@ def reclaim_worktree(
                 registry_entry_found=True,
                 preserved_ref=preserved_ref,
                 preserved_files=preserved_files,
+                evidence_model=evidence_model,
                 detail=f"worktree-registry-unreadable: {list_error}",
             )
         if still_registered:
@@ -428,6 +522,7 @@ def reclaim_worktree(
                 registry_entry_found=True,
                 preserved_ref=preserved_ref,
                 preserved_files=preserved_files,
+                evidence_model=evidence_model,
                 detail=(
                     "worktree-registry-entry-remains: "
                     f"{remove_error or 'git worktree remove reported success'}"
@@ -451,6 +546,7 @@ def reclaim_worktree(
                 registry_removed=registry_removed,
                 preserved_ref=preserved_ref,
                 preserved_files=preserved_files,
+                evidence_model=evidence_model,
                 detail=f"worktree-directory-remove-failed: {type(exc).__name__}: {str(exc)[:200]}",
             )
         directory_removed = True
@@ -463,6 +559,7 @@ def reclaim_worktree(
             registry_removed=registry_removed,
             preserved_ref=preserved_ref,
             preserved_files=preserved_files,
+            evidence_model=evidence_model,
             detail="worktree-directory-remains",
         )
 
@@ -475,6 +572,7 @@ def reclaim_worktree(
         preserved_ref=preserved_ref,
         preserved_files=preserved_files,
         archived_ref=archived_ref,
+        evidence_model=evidence_model,
     )
 
 
@@ -487,6 +585,7 @@ def reclaim_recorded_or_derived(
     git_runner: GitRunner | None = None,
     repo_root: str | Path | None = None,
     preserve_root: str | Path | None = None,
+    evidence_model: str = EVIDENCE_PRESERVE,
 ) -> WorktreeReclaim | None:
     """回收某個 slice 的 build 工作區——記錄有路徑就用它，沒有才反推。
 
@@ -520,6 +619,7 @@ def reclaim_recorded_or_derived(
         git_runner=git_runner,
         repo_root=repo_root,
         preserve_root=preserve_root,
+        evidence_model=evidence_model,
     )
     if not results:
         return None
@@ -538,6 +638,7 @@ def reclaim_worktrees(
     git_runner: GitRunner | None = None,
     repo_root: str | Path | None = None,
     preserve_root: str | Path | None = None,
+    evidence_model: str = EVIDENCE_PRESERVE,
 ) -> list[WorktreeReclaim]:
     """對多個 worktree 逐一回收（去重、保序）；不因單筆失敗而中止。"""
 
@@ -554,6 +655,7 @@ def reclaim_worktrees(
                 git_runner=git_runner,
                 repo_root=repo_root,
                 preserve_root=preserve_root,
+                evidence_model=evidence_model,
             )
         )
     return results

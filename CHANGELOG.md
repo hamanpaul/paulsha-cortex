@@ -8,6 +8,39 @@
 ## [Unreleased]
 
 ### Added
+- **#658：build 卡被採信之後即時回收其工作區——回收身分 ＝ 採信身分，preserve 契約拆成
+  兩個具名模型**——#648 之後一個 run 會累積 N 棵約 35MB 的 per-job clone，而 #649／#653
+  （ship 段自己的樹）與 #650／#659（verify／review 的 candidate 樹）落地後**被採信的
+  build 卡的工作區已無任何下游消費端**。票上的核心難點是「誰以什麼身分回收」：三分部署下
+  Manager 讀不進 builder 的 `0700` clone。**查證結論改變了選路**——抵達回收必須先走完
+  `_verify_exact_candidate()`，而它已經以 Manager 身分對**同一棵樹**跑過 `git -C … rev-parse
+  HEAD`，因此「Manager 進得去那棵樹」**本來就是「這張卡被採信」的必要條件**，回收不需要比
+  採信更大的授權面 ⇒ **不新增任何身分、不新增任何授權**。票上四個候選逐一否掉：job 自刪
+  違反 #540 且不知道自己有沒有被採信（會銷毀 #601 重派要用的殘留）；#629 的 `GATE` 只有
+  `rX` 無 `w`，授 `w` 等於讓跑不受信任程式碼的帳號能改尚未 harvest 的交付樹；
+  `ExecStopPost=` 的時機是 job 退出不是被採信，且 `+` 前綴＝root 執行，與「cortex 永不具
+  root」相斥；依 `PSC_JOB_RUNNER` 分支是 #634 反模式（決定回收成不成立的是磁碟上的 owner，
+  不是旗標）。改以**能力判定**：前置條件不成立就具名 skip、收不掉就 `failed`＋診斷，
+  **兩者都不擋採信**。另修正票上一處前提：preserve 讀不到時是記 warning 後繼續（真正
+  fail-closed 的是 `rmtree`）；且 #641 之後降權部署的 `_verify_exact_candidate()` 就已經先
+  fail-closed（`blocked on #629`）⇒ **那裡今天不存在「被採信卻沒回收的工作區」**，#629 落地
+  時回收身分必須與 candidate 驗證身分一起重新裁決。**契約改動**：`worktree_reclaim` 的
+  「不銷毀證據」拆成 `EVIDENCE_PRESERVE`（預設，#478 語意逐字不變，未採信路徑一律走它）與
+  `EVIDENCE_HARVESTED`（採信路徑；逐條盤點後未提交／未追蹤殘渣在採信面上地位為零——commit
+  在來源樹、bundle 在 spool、ledger／sentinel 由 Manager 寫、log 在 Manager-owned 樹、
+  outputs 已 hash 進 immutable evidence、canonical report 在 reviewer 的樹；把它複製進
+  `evidence/` 等於把不受信任內容搬進受信任的樹，且只是把要回收的位元組換個目錄）；未知值
+  一律 `raise`，`archive_workspace_head()` **兩種模型下都照跑**作為模型選錯時的安全網。
+  新增 `manager._trusted_build_workspace_target()`（六條 fail-closed 前置條件，核心安全閘是
+  「目錄名 ＝ `job_segment(job_id)`」這個 #645 單一推導點，結構性擋掉 #549 的
+  `worktree == workspace_root` 地雷）與 `_reclaim_trusted_build_workspace()`（永不 raise，
+  三種結果各一行結構化 log）。呼叫點刻意在狀態落盤**之後**——掛在 harvest 旁邊會留下
+  「工作區已刪、卡仍 pending」的死路。重入：#601 的未採信殘留完全不動、retry-card 的 base
+  走來源樹、abandon 的回收得到 `absent`（成功）、#613 的 branch 一個位元組沒碰且 `gc` 的
+  「未 merge ⇒ keep」仍頂得住。新增 `tests/test_immediate_worktree_reclaim_658.py`
+  （15 條 ＋ 1 條 skip，全部跑正式路徑；突變驗證停掉回收 6 條轉紅、拿掉兩道安全閘 3 條轉紅；
+  跨帳號擁有權語意單一 pytest 進程結構性測不到 ⇒ 明確 skip，可測的那一半另有 `chmod 000`
+  一條並在 docstring 講明它證得了什麼）。
 - **#650：verify／review 卡的 candidate 樹搬出 builder 的 clone——解開擋住「卡被採信後
   即時回收」的最後一條引用**——`_dispatch_workflow_card()` 的 reviewer 分支以
   `builder_jobs[-1]["worktree"]` 為 candidate 樹，六個用途全掛在它身上；#648 之後一個 run
