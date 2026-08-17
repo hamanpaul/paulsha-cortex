@@ -80,6 +80,7 @@ from typing import Mapping, Sequence
 from . import registry
 from .registry import (
     HEADLESS_PERSONAS,
+    UNTRUSTED_EXECUTION_PRINCIPALS,
     AssetTier,
     IngressKind,
     Principal,
@@ -199,6 +200,15 @@ def unresolved_principal_message(
                 f"  - principal `{principal.value}`：`UidScheme.account_of` 缺這一項，"
                 "請補上對應的 OS 帳號名。"
             )
+            if principal is Principal.GATE:
+                lines += [
+                    "      這是 #629 新增的 **gate 執行身分**。它不能併到任何既有帳號：",
+                    "      併到 builder＝模型自證（#540）、併到 manager＝把任意程式碼執行",
+                    "      引到持 spawn 授權的帳號、併到 reviewer-planner＝把 builder 對",
+                    "      verdict 通道的影響力重新打開（#638／#639）。",
+                    "      改用四分方案：`--scheme four-way`（預設值），並先建立帳號：",
+                    "      `sudo useradd --system --no-create-home --shell /usr/sbin/nologin cortex-gate`",
+                ]
             continue
         lines += [
             f"  - principal `{principal.value}`（{opt.description}）未對應到真實帳號。",
@@ -233,6 +243,14 @@ class UidScheme:
     `deploy_account`，後兩者是部署決定，走各自的欄位（見
     :data:`PRINCIPAL_ACCOUNT_OPTIONS`）。放進 `account_of` 會被靜默忽略，因此
     `__post_init__` 直接拒絕——「兩份真相」正是 #626 的成因。
+
+    `account_of` 的值可以是 :data:`ABSENT_ACCOUNT`（#629），語意與部署決定型欄位
+    的那個 sentinel **逐字相同**：「本方案明示沒有這個角色的實體」。它與「沒有這個
+    鍵」嚴格區分——後者讓產生器 fail-closed（`unresolved_principals()` 會指名它），
+    前者是一個**被記錄下來的決定**，該 principal 的授權整組略去、輸出裡一行都不會
+    出現。二分／三分對 `GATE` 用的就是它：那兩個方案沒有第四個帳號，因此沒有 gate
+    執行面，build 卡照 `require_ledger` fail closed（＝#629 之前的現況），但方案的
+    其餘部分仍然完整可產出——不會為了一個它們本來就沒有的角色而整份拒絕輸出。
     """
 
     scheme_id: str
@@ -262,6 +280,10 @@ class UidScheme:
         for name in list(self.account_of.values()) + [
             self.durable_state_owner, self.deploy_account,
         ]:
+            # `ABSENT_ACCOUNT`（#629）不是帳號名，是「本方案沒有這個角色」的 sentinel；
+            # 它永遠不會被印進任何命令，因此不受 `_ACCOUNT_NAME_RE` 約束。
+            if name == ABSENT_ACCOUNT:
+                continue
             _validate_account_name(name)
         for opt in PRINCIPAL_ACCOUNT_OPTIONS:
             value = getattr(self, opt.field_name)
@@ -284,20 +306,47 @@ class UidScheme:
         if opt is not None:
             value = getattr(self, opt.field_name)
             return None if value in (None, ABSENT_ACCOUNT) else value
-        return self.account_of.get(principal)
+        mapped = self.account_of.get(principal)
+        # `ABSENT_ACCOUNT`（#629）與缺鍵在這裡故意收斂成同一個回傳值：兩者都代表
+        # 「沒有帳號可用」。**分辨兩者是 `unresolved_principals()` 的職責**——它才是
+        # 決定「這是決定還是遺漏」的地方。
+        return None if mapped == ABSENT_ACCOUNT else mapped
 
     def group_of(self, account: str) -> str:
         """帳號的 primary group（慣例：每帳號一個同名 group）。"""
         return account
 
     def headless_accounts(self) -> frozenset[str]:
-        """全部 headless persona（含 headless hook）解析到的帳號集合。
+        """全部**執行不受信任程式碼**的身分解析到的帳號集合。
 
         Manager-owned／deployment 樹對這些帳號**必須**零寫入權——這是本產生器的
         核心不變式。
+
+        #629 起來源是 :data:`registry.UNTRUSTED_EXECUTION_PRINCIPALS`（headless
+        persona ＋ headless hook ＋ **gate**），而不是只有 `HEADLESS_PERSONAS`：
+        gate 執行的是 operator 宣告的命令，但那些命令跑在 builder 完全掌控內容的
+        工作樹上，載入的是該樹的 `conftest.py`／plugin——在「Manager-owned 樹對它
+        必須零寫入權」這件事上，它與跑模型的三個 persona 完全同級。方法名維持
+        `headless_accounts` 是刻意的：它的**語意**（不受信任的執行帳號集合）沒有
+        改變，改名只會讓十幾個呼叫端跟著動而換不到任何東西。
         """
         accts: set[str] = set()
-        for p in list(HEADLESS_PERSONAS) + [Principal.HEADLESS_HOOK]:
+        for p in sorted(UNTRUSTED_EXECUTION_PRINCIPALS, key=lambda x: x.value):
+            a = self.resolve(p)
+            if a is not None:
+                accts.add(a)
+        return frozenset(accts)
+
+    def model_job_accounts(self) -> frozenset[str]:
+        """**跑模型 CLI** 的 job 帳號集合（`HEADLESS_PERSONAS` 解析結果）。
+
+        與 :meth:`headless_accounts` 的差別只有一項——`cortex-gate` 不在其中——但那
+        一項決定了「要不要幫這個帳號準備 root-owned 的 `~/.codex` 與 executor 憑證
+        檔」。gate 不跑模型，因此那兩個前置物對它是純多餘：多兩個沒有消費者的
+        root-owned 目錄，還會讓「無多餘」那組等式測試被迫放寬。
+        """
+        accts: set[str] = set()
+        for p in sorted(HEADLESS_PERSONAS, key=lambda x: x.value):
             a = self.resolve(p)
             if a is not None:
                 accts.add(a)
@@ -309,7 +358,7 @@ class UidScheme:
         任何出現在產生命令裡的帳號名都必須落在這個集合內；落在集合外就代表某處把
         抽象角色名當帳號印出去了（#626）。
         """
-        accts = set(self.account_of.values())
+        accts = {a for a in self.account_of.values() if a != ABSENT_ACCOUNT}
         accts.add(self.durable_state_owner)
         accts.add(self.deploy_account)
         for opt in PRINCIPAL_ACCOUNT_OPTIONS:
@@ -336,6 +385,10 @@ class UidScheme:
                 if opt is not None:
                     if getattr(self, opt.field_name) is None:
                         missing.add(principal)
+                    continue
+                # #629：`ABSENT_ACCOUNT` 是決定、缺鍵才是遺漏。兩者 `resolve()` 都回
+                # None，因此這裡要直接看原始對應表，不能只看解析結果。
+                if self.account_of.get(principal) == ABSENT_ACCOUNT:
                     continue
                 if self.resolve(principal) is None:
                     missing.add(principal)
@@ -501,6 +554,12 @@ TWO_WAY_SCHEME = UidScheme(
         Principal.PLANNER: "cortex-svc",
         Principal.BUILDER: "cortex-builder",
         Principal.HEADLESS_HOOK: "cortex-builder",
+        # #629：本方案沒有 gate 執行身分（明示，不是遺漏）。二分把 Manager／monitor／
+        # reviewer／planner 全併在 `cortex-svc`，若把 gate 也併進去就等於讓 builder
+        # 交出來的 `conftest.py` 在 durable state owner 的身分下執行——比 #629 要修的
+        # 缺口更嚴重。因此二分**不提供 gate 執行面**：降權模式下 build 卡照
+        # `require_ledger` fail closed（＝#629 之前的現況）。要用 gate 就升四分。
+        Principal.GATE: ABSENT_ACCOUNT,
     },
     durable_state_owner="cortex-svc",
     deploy_account="root",
@@ -520,21 +579,79 @@ THREE_WAY_SCHEME = UidScheme(
         Principal.PLANNER: "cortex-reviewer-planner",
         Principal.BUILDER: "cortex-builder",
         Principal.HEADLESS_HOOK: "cortex-builder",
+        # #629：同二分——三分也沒有第四個帳號可以承接 gate。三個候選逐一皆不可用
+        # （見 `FOUR_WAY_SCHEME` 的說明），因此明示「本方案沒有這個角色」而不是併帳。
+        Principal.GATE: ABSENT_ACCOUNT,
     },
     durable_state_owner="cortex-manager",
     deploy_account="root",
     # 同二分：operator／external reader 是部署決定，不寫死（#626）。
 )
 
+#: 四分（**#629 定案**）：三分再拆出 `cortex-gate`——operator 宣告的 gate 命令的執行
+#: 身分。**與二分／三分共用同一套 policy，僅換 config。**
+#:
+#: ## 為什麼一定要是第四個帳號
+#:
+#: gate 命令跑在 **builder 完全掌控內容的工作樹**上，`pytest` 會載入該樹的
+#: `conftest.py` 與 plugin ⇒ **執行 gate 的身分等於對 builder 開放任意程式碼執行**。
+#: 既有的三個帳號逐一檢查，沒有一個能承接：
+#:
+#: - `cortex-builder`：模型自證自己的驗收證據，違反 #540 的 acceptance chain；
+#: - `cortex-manager`：持 spawn 授權、擁有全部 Manager-owned durable state，是三分
+#:   授權線的**內側**——這是 issue #629 本文的整段論證；
+#: - `cortex-reviewer-planner`：它是寫 verdict 的那一個。把 gate 掛上去，被攻陷的
+#:   builder 就能經由 gate 執行影響 reviewer 的帳號，等於把 #638／#639 剛關掉的
+#:   「builder 對 verdict 通道的影響力」重新打開。
+#:
+#: ## 為什麼不能「不開帳號」
+#:
+#: 唯一認真的無新帳號候選是 systemd 的 `DynamicUser=yes`（每次起 unit 配一個暫時
+#: UID，不必建帳號）。它**結構性地**不成立，理由不是偏好而是機制：本方案兩端都靠
+#: **具名 POSIX ACL** 授權——`gate-ledger-spool` 那一格要給 gate `wx` 無 `r`，
+#: `repo-worktree` 要給 gate `rX`——而 `setfacl -m u:<名>:…` 在**產生權限的當下**就
+#: 要解析得到那個帳號；DynamicUser 的 UID 在 unit 起動前不存在、每次還不同，根本
+#: 沒有可寫進 ACL 的名字。退而求其次的 `User=nobody` 更糟：那是一個與系統上任何
+#: 其他服務共用的帳號，授它 Tier-0 spool 的寫入權等於把那條通道開給所有 `nobody`
+#: 行程。
+#:
+#: ## 誠實邊界（spec §R3 有對應段落）
+#:
+#: 第四帳號買到的是**圍堵**，不是「ledger 不可偽造」。取得 ACE 的 builder 依然能
+#: 影響**自己那一份** ledger 的內容——那是「執行對方交出來的測試碼」這件事本身的
+#: 性質，換誰執行都一樣。它買到的是：那個 ACE 碰不到 Manager 的 durable state、
+#: 碰不到 verdict 通道、碰不到別的 job 的工作樹、也沒有 spawn 授權。
+FOUR_WAY_SCHEME = UidScheme(
+    scheme_id="four-way",
+    account_of={
+        Principal.MANAGER: "cortex-manager",
+        Principal.MONITOR: "cortex-manager",
+        Principal.REVIEWER: "cortex-reviewer-planner",
+        Principal.PLANNER: "cortex-reviewer-planner",
+        Principal.BUILDER: "cortex-builder",
+        Principal.HEADLESS_HOOK: "cortex-builder",
+        Principal.GATE: "cortex-gate",
+    },
+    durable_state_owner="cortex-manager",
+    deploy_account="root",
+    # 同二分／三分：operator／external reader 是部署決定，不寫死（#626）。
+)
+
 SCHEMES: dict[str, UidScheme] = {
     TWO_WAY_SCHEME.scheme_id: TWO_WAY_SCHEME,
     THREE_WAY_SCHEME.scheme_id: THREE_WAY_SCHEME,
+    FOUR_WAY_SCHEME.scheme_id: FOUR_WAY_SCHEME,
 }
 
-#: **定案方案**（0816 第三輪裁決 A）。CLI／產生器未指定 scheme 時一律用這個——
-#: 「預設就是最安全的那一個」是刻意的：要退回二分必須顯式打出 `two-way`，
-#: 打錯字不會靜默退回較寬鬆的方案（`SCHEMES` 查無即拒）。
-DEFAULT_SCHEME: UidScheme = THREE_WAY_SCHEME
+#: **定案方案**（#629；在此之前是 0816 第三輪裁決 A 的三分）。CLI／產生器未指定
+#: scheme 時一律用這個——「預設就是最安全的那一個」是刻意的：要退回三分／二分必須
+#: 顯式打出 `three-way`／`two-way`，打錯字不會靜默退回較寬鬆的方案（`SCHEMES` 查無即拒）。
+#:
+#: **三分／二分在 #629 之後會 fail-closed**，而且是刻意的：登記表已有兩個資產把
+#: `GATE` 列為 writer，那兩個方案對它沒有帳號對應，`unresolved_principals()` 因此
+#: 會指名它並讓 `plan_to_commands()` 一行都不輸出（#626 的既有出口）。這比「靜默把
+#: gate 併到某個既有帳號」正確得多——併進去的每一種選法都是上面剛否決掉的那三條。
+DEFAULT_SCHEME: UidScheme = FOUR_WAY_SCHEME
 DEFAULT_SCHEME_ID: str = DEFAULT_SCHEME.scheme_id
 
 
@@ -786,12 +903,17 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
         writer_accounts = frozenset(writer_accounts)
 
     else:  # JOB
+        # 「哪些 writer 算 untrusted producer」＝ `UNTRUSTED_EXECUTION_PRINCIPALS`
+        # （#629 起含 `GATE`）。用它而不是逐項列舉，是為了讓「新增一個執行不受信任
+        # 程式碼的身分」只需要改登記表那一個集合——漏改這裡的後果是**靜默 fail-open**
+        # 的相反面：該身分的 `wx` ACL 不會被產生，它連自己那格 spool 都寫不進去，
+        # 而症狀出現在部署當天而不是產生器。
         job_writers = frozenset(
             a
             for a in (
                 scheme.resolve(w)
                 for w in asset.writers
-                if w in HEADLESS_PERSONAS or w is Principal.HEADLESS_HOOK
+                if w in UNTRUSTED_EXECUTION_PRINCIPALS
             )
             if a is not None
         )
@@ -1278,6 +1400,27 @@ class PathLayout:
         return f"{self.coordinator_root}/review-verdicts"
 
     @property
+    def gate_ledger_spool_root(self) -> str:
+        """gate 寫、Manager 讀的 per-job ledger spool 根（登記表資產
+        `gate-ledger-spool`，#629）。
+
+        路徑與 `config.paths.gate_ledger_spool_root()` 是**成對契約**，由
+        `asset_paths()` 而非本 property 供給權限計畫；本 property 只是給 unit
+        產生器引用的同一份字面量（比照 `commit_spool_root`）。
+        """
+        return f"{self.coordinator_root}/gate-ledger-spool"
+
+    @property
+    def gate_worktree_root(self) -> str:
+        """gate 執行身分的拋棄式工作區 pool 根（登記表資產 `gate-worktree-pool`，#629）。
+
+        與 `config.paths.gate_worktree_root()` 成對契約。掛在 `agents_root` 底下而不是
+        `worktree_root`：那個 pool 的容器已為 job persona 的三個帳號套好 ACL，把一個
+        **不同帳號**的樹混進同一棵容器只會讓「誰進得了哪一格」變成要逐格推敲的事。
+        """
+        return f"{self.agents_root}/gate-worktree"
+
+    @property
     def job_spec_spool_root(self) -> str:
         """Manager 寫、job 只讀的 per-job 執行規格（`<unit-instance-id>.json`）。
 
@@ -1462,6 +1605,13 @@ class PathLayout:
             "commit-spool": self.commit_spool_root,
             # Phase 2b 方案 B（0816 第三輪 A+B）：模板 unit 的 per-job 執行規格。
             "job-spec-spool": self.job_spec_spool_root,
+            # #629 gate 執行身分：拋棄式工作區 pool ＋ ledger 單向 spool。
+            # 工作區 pool 登記的是**容器**（不帶 per-job segment）：它只有一個 writer
+            # ＝`cortex-gate`，因此容器本身就 owner-only 0700，per-job 那一格由 gate
+            # 自己建、自己重建——不像 `dispatch-worktree-pool` 要 Manager 逐案 chown 給
+            # 三個不同帳號。少一個 runtime-managed 的環節就少一個會漏掉的環節。
+            "gate-worktree-pool": self.gate_worktree_root,
+            "gate-ledger-spool": self.gate_ledger_spool_root,
             "verification-evidence": f"{c}/evidence/verification",
             "maintainer-attestation": f"{c}/evidence/maintainer-review",
             "completion-record": f"{c}/evidence/completion",
@@ -1497,7 +1647,10 @@ class PathLayout:
         # `cortex-reviewer-planner`，不必在這裡補一行（補一行正是上一版漏掉它的原因）。
         service_accounts = [svc] + sorted(scheme.headless_accounts() - {svc})
         # 跑模型的 job 帳號還要一個 root-owned 的 ~/.codex（hooks 不得被 job 替換）。
-        job_accounts = sorted(scheme.headless_accounts() - {svc})
+        # **來源是 `model_job_accounts()` 而不是 `headless_accounts()`**（#629）：
+        # `cortex-gate` 也是不受信任的執行帳號、也要 HOME／cache，但它不跑模型 CLI，
+        # 給它 `~/.codex` 與一份 executor 憑證只會多兩個沒有消費者的 root-owned 目錄。
+        job_accounts = sorted(scheme.model_job_accounts() - {svc})
         account_dirs: list[tuple[str, str, str, int]] = []
         for account in service_accounts:
             account_dirs.append((self.home_of(account), root, g(root), 0o755))
@@ -2244,9 +2397,18 @@ def executor_hardening_profile(executor: str) -> HardeningProfile:
 #: 一個字幹），卻換不到任何隔離。`REVIEWER` 在這裡是**那個帳號的代表 principal**，
 #: 由 :data:`JOB_PRINCIPAL_PERSONAS` 明載它代表誰。
 #:
+#: - `GATE`（#629）：`cortex-gate-job@.service`／`cortex-gate-job-jit@.service`，
+#:   `User=cortex-gate`。它不跑模型，跑的是 operator 宣告的 gate 命令——但那些命令
+#:   載入的是 builder 工作樹裡的 `conftest.py`／plugin，所以在「必須被關進盒子」這件
+#:   事上與前兩者同級。
+#:
 #: 這張表同時是 polkit unit pattern 的字幹來源（見 :func:`job_unit_pattern`）：
 #: 放行面 = 這張表 × :data:`HARDENING_PROFILES`，兩者都是列舉，沒有萬用字元。
-DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (Principal.BUILDER, Principal.REVIEWER)
+DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (
+    Principal.BUILDER,
+    Principal.REVIEWER,
+    Principal.GATE,
+)
 
 #: 每個 job 角色的 `PATH` 覆寫變數名。與 `coordinator/job_runner.JOB_ROLE_CONFIG`
 #: 的 `path_env` 是**成對契約**（同 `DEFAULT_TEMPLATE_UNIT` 的既有模式：permgen 與
@@ -2257,18 +2419,51 @@ JOB_PATH_ENV_BY_PRINCIPAL: Mapping[Principal, str] = MappingProxyType(
     {
         Principal.BUILDER: "PSC_BUILDER_PATH",
         Principal.REVIEWER: "PSC_REVIEWER_PATH",
+        Principal.GATE: "PSC_GATE_PATH",
     }
 )
 
 #: 每份模板 unit 服務的 persona 家族（代表 principal → 實際會以該 unit 起跑的 persona）。
 #: 記錄在這裡而不是散在註解裡：`cortex-reviewer-job@.service` 同時是 planner 的 unit，
 #: 這件事必須是機器可讀的，否則「planner 的降權在哪」只能靠讀 commit 訊息回答。
+#: 產生每份模板 unit 的 CLI 旗標（`python -m paulsha_cortex.trust_root unit …`）。
+#: 產出的 unit 檔頭會印出「重跑用哪一行」，那一行必須跟著角色走——寫死 `--job` 會讓
+#: operator 照抄之後拿到 builder 的 unit 覆蓋掉 reviewer／gate 的那一份。
+JOB_UNIT_CLI_FLAG: Mapping[Principal, str] = MappingProxyType(
+    {
+        Principal.BUILDER: "--job",
+        Principal.REVIEWER: "--review-job",
+        Principal.GATE: "--gate-job",
+    }
+)
+
 JOB_PRINCIPAL_PERSONAS: Mapping[Principal, frozenset[Principal]] = MappingProxyType(
     {
         Principal.BUILDER: frozenset({Principal.BUILDER, Principal.HEADLESS_HOOK}),
         Principal.REVIEWER: frozenset({Principal.REVIEWER, Principal.PLANNER}),
+        # #629：gate 不代表任何 persona——它就是它自己。這一格不是佔位符，是斷言：
+        # 「有沒有哪個 persona 其實是以 gate 帳號起跑的」必須是機器可讀的 **否**。
+        Principal.GATE: frozenset({Principal.GATE}),
     }
 )
+
+
+def downgraded_job_principals(scheme: UidScheme) -> tuple[Principal, ...]:
+    """本方案**真的會落檔**的那一組降權 job principal（依表順序）。
+
+    :data:`DOWNGRADED_JOB_PRINCIPALS` 是「本系統支援哪些降權角色」；本函式是「這個
+    部署有哪些」。兩者在四分方案下相同，在二分／三分下差一項——那兩個方案對
+    `GATE` 明示 :data:`ABSENT_ACCOUNT`（#629），因此不會有 `cortex-gate-job@.service`
+    這份 unit 檔。
+
+    **為什麼 polkit pattern 必須用這一支而不是那張表**：pattern 是放行面。放行一個
+    在本機**不存在**的 unit 名不會讓任何 job 起得來（unit 檔不在就是不在），但它會
+    讓「這條規則授權了什麼」與「這台機器上實際有什麼」對不起來——而那條規則的全部
+    價值就在於它可以被逐字讀懂。同理 `build_job_unit()` 對未映射的 principal 直接
+    raise：產生一份 `User=` 空白的 unit 比不產生危險得多。
+    """
+
+    return tuple(p for p in DOWNGRADED_JOB_PRINCIPALS if scheme.resolve(p) is not None)
 
 
 def _as_principals(
@@ -2302,6 +2497,9 @@ def job_unit_stem(
     `profile` 是 **#643 的第二個擴充點**：加固剖面不同 ⇒ 必須是不同的 unit 檔
     （加固指令寫在檔案裡，一個模板只有一份），因此字幹尾端掛剖面後綴。嚴格剖面的
     後綴是空字串，`cortex-job@.service` 這個既有名字逐字不變。
+
+    **#629 由同一個擴充點再加一個角色**：`Principal.GATE` → `cortex-gate-job`
+    （`User=cortex-gate`）。產生器同樣一行都沒有改。
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
     if principal is Principal.BUILDER:
@@ -2669,26 +2867,43 @@ def build_job_unit(
         for name, profile_id in EXECUTOR_HARDENING_PROFILE.items()
         if profile_id == profile.profile_id
     )
+    # 產生本檔的旗標必須跟著角色走：註解裡寫著「重跑用 --job」卻產出 reviewer／gate
+    # 的 unit，會讓 operator 照抄之後拿到**另一份** unit 覆蓋掉這一份。
+    unit_flag = JOB_UNIT_CLI_FLAG[principal]
 
     body = [
         f"# {'/etc/systemd/system/' + unit_name}",
         f"# 由 permgen 機械產生（scheme={scheme.scheme_id}, profile={profile.profile_id}）",
         "# ——勿手改；重跑：",
-        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --job"
+        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} {unit_flag}"
         + (f" --profile {profile.profile_id}" if profile is not DEFAULT_HARDENING_PROFILE else ""),
         "#",
-        "# 降權/提權分界線：User= 在本 root-owned 檔內硬寫死。Manager（cortex-svc）",
+        "# 降權/提權分界線：User= 在本 root-owned 檔內硬寫死。Manager"
+        f"（{scheme.durable_state_owner}）",
         f"# 只能 `systemctl start {stem}@<id>.service`，**不能**選 UID、不能傳屬性。",
         "#",
         f"# === 加固剖面：{profile.profile_id}（#643 per-executor 剖面）===",
-        f"# 適用 executor：{'、'.join(profile_users) if profile_users else '（無）'}",
     ]
+    if principal is Principal.GATE:
+        # gate 不跑任何模型 CLI，列 executor 名單只會誤導（讀的人會以為這份 unit 是
+        # 給 `agy`／`claude` 用的）。剖面來源也不同：operator 平面，不是 executor。
+        body += _wrap_comment(
+            "適用對象：gate 執行身分（#629）——它不跑模型 CLI，因此沒有「適用 "
+            "executor」可言。剖面由 operator 的 PSC_GATE_HARDENING_PROFILE 決定"
+            "（宣告 gate 命令與宣告它需要哪份剖面是同一個人、同一個平面的決定）；"
+            "宣告 node 型 gate（npm test）時必須顯式打出 jit，否則 V8 會直接崩。"
+        )
+    else:
+        body += [
+            f"# 適用 executor：{'、'.join(profile_users) if profile_users else '（無）'}",
+        ]
     body += _wrap_comment(f"理由：{profile.rationale}")
     for loss in profile.accepted_loss:
         body += _wrap_comment(f"⚠ 本剖面接受的代價：{loss}")
     body += [
-        "# 剖面**不由 job 決定**：對應表由 permgen.EXECUTOR_TOOLS 的 needs_node 機械",
-        "# 導出，executor 則是 Manager 的 dispatch 決定；job spec 結構性禁止攜帶任何",
+        "# 剖面**不由 job 決定**：模型 job 的對應表由 permgen.EXECUTOR_TOOLS 的",
+        "# needs_node 機械導出，executor 則是 Manager 的 dispatch 決定；gate 的剖面",
+        "# 由 operator 平面決定（#629）。兩者共同點是 job spec 結構性禁止攜帶任何",
         "# 剖面欄位（job_runner.SPEC_FORBIDDEN_KEYS，寫端與讀端各擋一次）。",
         "",
         "[Unit]",
@@ -3327,7 +3542,7 @@ def build_polkit_rule(
     scheme: UidScheme,
     layout: "PathLayout" = None,  # type: ignore[assignment]
     plan: PolkitPlan = PolkitPlan.TEMPLATE,
-    principals: "Principal | Sequence[Principal]" = DOWNGRADED_JOB_PRINCIPALS,
+    principals: "Principal | Sequence[Principal] | None" = None,
 ) -> PolkitRule:
     """產生降權授權的 polkit 規則內容（A／B 兩方案共用同一套產生邏輯）。
 
@@ -3342,7 +3557,11 @@ def build_polkit_rule(
     """
     layout = layout if layout is not None else DEFAULT_LAYOUT
     svc = scheme.durable_state_owner
-    ordered = _as_principals(principals)
+    # `None`＝依本方案導出（#629）。預設不再是那張**支援表**，而是「這個部署真的會有
+    # 哪幾份 unit」——二分／三分沒有 gate 帳號，規則就不該提 `cortex-gate-job@`。
+    ordered = _as_principals(
+        downgraded_job_principals(scheme) if principals is None else principals
+    )
     targets: list[str] = []
     for principal in ordered:
         target = scheme.resolve(principal)

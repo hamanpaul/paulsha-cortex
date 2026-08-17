@@ -27,6 +27,7 @@ from . import autonomy
 from . import completion
 from . import coverage
 from . import gate_ledger
+from . import job_runner
 from . import job_workspace
 from . import planning_runtime
 from . import provider_backoff
@@ -3635,6 +3636,14 @@ def _terminal_parse_diagnostics(
 # deterministic verification report 管線（schema／binding／report 重驗）。
 GATE_LEDGER_REQUIRED_PHASES = frozenset({"build"})
 
+# #629：降權模式下由**第四個帳號**（`cortex-gate`）重跑 gate 的 phase。
+#
+# 與 `GATE_LEDGER_REQUIRED_PHASES` **刻意是同一個集合**，而不是「所有會寫 candidate
+# 的 phase」：跑 gate 的唯一理由就是有人要求那份 ledger，而要求它的只有上面那一條
+# 規則。兩者若分家，就會出現「跑了 gate、產出的 ledger 沒有任何採信端會讀」的空轉，
+# 或者反過來「要求 ledger 的 phase 沒人替它跑」——後者正是 #629 之前的現況。
+GATE_EXECUTION_PHASES = GATE_LEDGER_REQUIRED_PHASES
+
 
 def _workflow_step_test_policy(registry, job: Mapping[str, object]) -> str | None:
     """#307：從 job 綁定的 :class:`WorkflowRun` 撈出目前 card 的 ``execution.test_policy``。
@@ -3694,6 +3703,30 @@ def _workflow_acceptance_definition_drifted(
     if pinned is None:
         return False
     return pinned != fresh_test_policy
+
+
+def _run_gate_execution_identity(job: Mapping[str, object]) -> None:
+    """#629：降權模式下補上缺席的 gate ledger（`direct` 模式為 no-op）。
+
+    **失敗一律翻成 `TerminalContractError` 並 fail closed**，不吞、不降級。gate 跑
+    不起來（polkit 拒絕、模板未安裝、快照失敗、spool 被塞了不合法內容）與「gate 沒
+    通過」在**授權**這件事上是同一個結論：沒有獨立證據就不採信。差別只在訊息——
+    這裡把 `GateRunnerError` 的診斷碼與 systemctl 的 exit code 原樣帶出來，否則
+    operator 看到的只會是後面那個 `gate-ledger-missing`，指不出真正的原因（#643 的
+    教訓：症狀是空輸出的失敗最難查）。
+    """
+
+    from . import gate_runner
+
+    try:
+        gate_runner.ensure_gate_ledger(job, phases=GATE_EXECUTION_PHASES)
+    except (gate_runner.GateRunnerError, job_runner.JobRunnerError) as exc:
+        reason = getattr(exc, "reason", None) or "gate-execution-failed"
+        raise terminal_contract.TerminalContractError(
+            f"gate 執行身分未能產生 ledger（{reason}）：{exc}",
+            reason=str(reason),
+            validation_path="$.gate_evidence",
+        ) from exc
 
 
 def _assert_terminal_gate_consistency(
@@ -5446,6 +5479,15 @@ def terminalize_workflow_job(
     if phase not in {"plan", "build", "verify", "review"}:
         raise ValueError("workflow job phase is not terminalizable")
     raw = _extract_terminal_json(job.get("log_path"))
+    # #629：降權模式下 job wrapper 不跑 gate（跑了就是模型自證，見
+    # `launcher._should_run_gates`），ledger 因此在這一刻還不存在。這裡以**第四個
+    # 帳號**（`cortex-gate`）重跑 operator 宣告的命令，產出經 spool 回到 Manager
+    # 手上、由 Manager 自己落地——`direct` 模式下本呼叫是 no-op（ledger 已由
+    # wrapper 寫好），行為與 #629 之前逐字相同。
+    #
+    # 位置在 `_assert_terminal_gate_consistency` **正前方**：那裡是唯一會讀 ledger
+    # 的採信點，證據必須在被讀之前就已經落地，且**不得**在採信開始之後才產生。
+    _run_gate_execution_identity(job)
     # #261 R2／D3：矛盾偵測排在任何狀態採信之前。放在 per-phase schema 驗證之前，
     # 是為了避免「先按 passed 走一段流程、後面才發現不對」造成的部分副作用。
     # #307：帶入 registry 讓 red-required 卡的測試 gate 語意反轉生效。

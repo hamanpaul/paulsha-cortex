@@ -103,6 +103,52 @@ def commit_spool_root() -> Path:
     return coordinator_root() / COMMIT_SPOOL_DIRNAME
 
 
+#: `gate_ledger_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數的理由
+#: 與 `COMMIT_SPOOL_DIRNAME` 逐字相同（R1 登記表的「重複路徑推導」Scenario）。
+GATE_LEDGER_SPOOL_DIRNAME = "gate-ledger-spool"
+
+
+def gate_ledger_spool_root() -> Path:
+    """#629：gate 執行身分交付 ledger 的 **per-job 單向 spool** 根。
+
+    `#604`／PR `#628` 把 gate ledger 的**作者**收斂到 Manager，但執行面留在原地：
+    operator 宣告的 gate 命令（`PSC_GATE_CMD_*`）跑在 builder 完全掌控內容的工作樹
+    上，`pytest` 會載入該樹的 `conftest.py`／plugin——誰執行 gate，誰就對 builder 開
+    放一條任意程式碼執行。因此執行身分既不能是 builder（模型自證，違反 #540 的
+    acceptance chain）、也不能是 Manager 或 reviewer／planner（兩者都在授權線內側：
+    前者持 spawn 授權，後者寫 verdict）。#629 的答案是**第四個帳號** `cortex-gate`。
+
+    本函式即它的交付通道根：每個 job 在 `<此根>/<job-id>/ledger.json` 有且只有自己
+    那一格。掛在 `coordinator_root()` 底下的 Manager-owned 樹；Phase 2b 的 chown／ACL
+    由 `trust_root/permgen.py` 依 R1 登記表資產 `gate-ledger-spool` 機械產生：容器
+    owner＝durable_state_owner、mode 0700，gate 只獲 **write-only** ACL（`wx` 無
+    `r`），Manager 擁有並消費。
+
+    **為什麼要多一跳而不讓 gate 直接寫 `gate-ledger`**：#628 的採信端以
+    `terminal_contract.foreign_evidence_author()` 檢查檔案擁有者，非 Manager 產生的
+    ledger 一律不採信；而那個目錄同時是 exit sentinel 的落點。權威 ledger 因此一律
+    由 Manager 依本 spool 的內容**自己重寫一份**（`coordinator/gate_runner.py`）。
+    """
+    return coordinator_root() / GATE_LEDGER_SPOOL_DIRNAME
+
+
+def gate_worktree_root() -> Path:
+    """#629：gate 執行身分的**拋棄式工作區** pool 根（`<agents_root>/gate-worktree`）。
+
+    gate 命令一律在**副本**上跑，不在 builder 交付的那棵樹上跑：
+
+    - **唯讀不可行**——`pytest` 要寫 `.pytest_cache`／`__pycache__`，`npm test`／
+      `cargo test`／`make` 更是必寫。把工作樹掛成唯讀只會讓每個真實 gate 以 EROFS
+      收場，那正是 #629 要修掉的「安全但不能用」。
+    - 副本另外買到：gate 的寫入不污染 builder 交付的樹（harvest 讀到的仍是 builder
+      自己的成果），且快照在單一時點取得，builder 留下的背景行程改不了跑到一半的樹。
+
+    複製由 **gate 自己**執行（它是唯一同時讀得到來源、寫得進目的地的身分）；#641 之後
+    Manager 讀不到 builder 的樹，那條刻意不回頭放寬。
+    """
+    return agents_root() / "gate-worktree"
+
+
 #: `job_spec_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數是為了讓
 #: `coordinator/job_runner.py` 的 per-job 定址、`trust_root/permgen.py` 的 layout 與本
 #: resolver 共用同一個字面量（R1 登記表的「重複路徑推導」Scenario 要求單一真相）。

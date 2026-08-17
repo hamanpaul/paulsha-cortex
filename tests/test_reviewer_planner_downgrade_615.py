@@ -43,7 +43,11 @@ from paulsha_cortex.trust_root.registry import Principal
 
 REAL_HARDENING = os.environ.get("PSC_TEST_REAL_HARDENING") == "1"
 
-SCHEME = permgen.THREE_WAY_SCHEME
+# #629 把定案方案推進到四分（多一個 `cortex-gate`）。本檔測的是 M2 的不變式，而
+# M2 的不變式在四分下逐條仍然成立——改綁 `DEFAULT_SCHEME` 是為了讓「產生器產出的
+# 那一組 unit／polkit 字幹」與部署現實同步，否則這裡測到的是一份沒人會裝的規則。
+SCHEME = permgen.DEFAULT_SCHEME
+GATE_ACCOUNT = "cortex-gate"
 LAYOUT = permgen.DEFAULT_LAYOUT
 JOB_LAYOUT = LAYOUT.with_job_segment("%i")
 REVIEW_ACCOUNT = "cortex-reviewer-planner"
@@ -678,7 +682,7 @@ class PolkitReviewStemTests(unittest.TestCase):
                 stem = permgen.job_unit_stem(LAYOUT, principal, profile)
                 self.assertIn(f"{stem}@<id>.service", self.rule.content, stem)
         self.assertEqual(
-            self.rule.target_accounts, (BUILDER_ACCOUNT, REVIEW_ACCOUNT)
+            self.rule.target_accounts, (BUILDER_ACCOUNT, REVIEW_ACCOUNT, GATE_ACCOUNT)
         )
         self.assertEqual(self.rule.residual_risks, ())
 
@@ -723,17 +727,30 @@ class HardeningParityTests(unittest.TestCase):
             for profile in permgen.HARDENING_PROFILES
         }
 
-    def test_there_are_exactly_four_templates(self) -> None:
+    def test_template_count_is_roles_times_profiles(self) -> None:
+        """份數＝角色 × 剖面，**機械導出不硬編**（#629 加第三個角色時這裡自動跟上）。"""
         names = {unit.unit_name for unit in self.units.values()}
-        self.assertEqual(len(names), 4, names)
+        self.assertEqual(
+            len(names),
+            len(permgen.DOWNGRADED_JOB_PRINCIPALS) * len(permgen.HARDENING_PROFILES),
+            names,
+        )
         self.assertEqual(
             names,
             {
-                "cortex-job@.service",
-                "cortex-job-jit@.service",
-                "cortex-reviewer-job@.service",
-                "cortex-reviewer-job-jit@.service",
+                f"{permgen.job_unit_stem(LAYOUT, principal, profile)}@.service"
+                for principal in permgen.DOWNGRADED_JOB_PRINCIPALS
+                for profile in permgen.HARDENING_PROFILES
             },
+        )
+        # M2 的兩份與 #629 的第三份都必須在裡面——名字逐字釘死，避免字幹被悄悄改掉。
+        self.assertLessEqual(
+            {
+                "cortex-job@.service",
+                "cortex-reviewer-job@.service",
+                "cortex-gate-job@.service",
+            },
+            names,
         )
 
     def test_key_set_is_identical_across_every_template(self) -> None:
@@ -744,13 +761,15 @@ class HardeningParityTests(unittest.TestCase):
     def test_same_profile_across_roles_is_value_identical(self) -> None:
         """角色不改變任何一項加固——差異只能來自剖面。"""
         for profile in permgen.HARDENING_PROFILES:
-            builder = _hardening_table(
-                self.units[(Principal.BUILDER, profile.profile_id)].content
-            )
-            review = _hardening_table(
-                self.units[(Principal.REVIEWER, profile.profile_id)].content
-            )
-            self.assertEqual(builder, review, profile.profile_id)
+            tables = {
+                principal: _hardening_table(
+                    self.units[(principal, profile.profile_id)].content
+                )
+                for principal in permgen.DOWNGRADED_JOB_PRINCIPALS
+            }
+            reference = tables[Principal.BUILDER]
+            for principal, table in tables.items():
+                self.assertEqual(table, reference, (principal, profile.profile_id))
 
     def test_profile_divergence_is_bounded_for_every_role(self) -> None:
         for principal in permgen.DOWNGRADED_JOB_PRINCIPALS:
@@ -766,15 +785,14 @@ class HardeningParityTests(unittest.TestCase):
             self.assertIn(f"Group={account}\n", unit.content, (principal, profile_id))
             self.assertEqual(unit.exec_start, f"{LAYOUT.job_shim} %i")
 
-    def test_the_two_roles_never_share_a_home_or_cache(self) -> None:
-        homes = {
-            SCHEME.resolve(p): LAYOUT.home_of(SCHEME.resolve(p))
-            for p in permgen.DOWNGRADED_JOB_PRINCIPALS
-        }
-        self.assertEqual(len(set(homes.values())), 2, homes)
-        self.assertNotEqual(
-            LAYOUT.cache_of(BUILDER_ACCOUNT), LAYOUT.cache_of(REVIEW_ACCOUNT)
-        )
+    def test_no_two_roles_share_a_home_or_cache(self) -> None:
+        """每個角色一個帳號、一個 HOME、一個 cache——**共用即等於沒有隔離**。"""
+        accounts = [SCHEME.resolve(p) for p in permgen.DOWNGRADED_JOB_PRINCIPALS]
+        self.assertEqual(len(set(accounts)), len(accounts), accounts)
+        homes = {LAYOUT.home_of(a) for a in accounts}
+        caches = {LAYOUT.cache_of(a) for a in accounts}
+        self.assertEqual(len(homes), len(accounts), homes)
+        self.assertEqual(len(caches), len(accounts), caches)
 
 
 # ---------------------------------------------------------------------------
@@ -805,12 +823,13 @@ class PairedContractTests(unittest.TestCase):
         )
 
     def test_path_env_names_match(self) -> None:
+        roles = {
+            Principal.BUILDER: job_runner.JOB_ROLE_BUILDER,
+            Principal.REVIEWER: job_runner.JOB_ROLE_REVIEW,
+            Principal.GATE: job_runner.JOB_ROLE_GATE,
+        }
         for principal in permgen.DOWNGRADED_JOB_PRINCIPALS:
-            role = (
-                job_runner.JOB_ROLE_BUILDER
-                if principal is Principal.BUILDER
-                else job_runner.JOB_ROLE_REVIEW
-            )
+            role = roles[principal]
             self.assertEqual(
                 permgen.JOB_PATH_ENV_BY_PRINCIPAL[principal],
                 job_runner.JOB_ROLE_CONFIG[role].path_env,
@@ -879,13 +898,26 @@ class GateExecutionBoundaryTests(unittest.TestCase):
             REVIEW_ACCOUNT, {a.account for a in entry.acls}
         )
 
-    def test_only_two_roles_exist_no_gate_role_was_smuggled_in(self) -> None:
-        """第四個帳號（gate 執行身分）屬 #629，本票不得順手建立。"""
-        self.assertEqual(set(job_runner.JOB_ROLES), {"builder", "review"})
+    def test_the_gate_role_is_a_fourth_account_not_the_reviewer(self) -> None:
+        """#629 已落地：gate 執行身分存在，而且**不是** reviewer／builder／Manager。
+
+        本測項是 M2 那條「不得把 gate 掛到 reviewer 上」邊界的**接續**，不是它的
+        廢止：#615 當時斷言「還沒有第四個角色」，#629 把它換成「有第四個角色，而且
+        它與前三個逐一不同」。把 gate 併到既有任一帳號都會讓這裡當場紅。
+        """
+        self.assertEqual(
+            set(job_runner.JOB_ROLES), {"builder", "review", "gate"}
+        )
         self.assertEqual(
             set(SCHEME.account_of.values()),
-            {MANAGER_ACCOUNT, REVIEW_ACCOUNT, BUILDER_ACCOUNT},
+            {MANAGER_ACCOUNT, REVIEW_ACCOUNT, BUILDER_ACCOUNT, GATE_ACCOUNT},
         )
+        gate = SCHEME.resolve(Principal.GATE)
+        self.assertEqual(gate, GATE_ACCOUNT)
+        for other in (Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER,
+                      Principal.MANAGER, Principal.MONITOR):
+            self.assertNotEqual(gate, SCHEME.resolve(other), other)
+        self.assertNotEqual(gate, SCHEME.durable_state_owner)
 
 
 if __name__ == "__main__":  # pragma: no cover

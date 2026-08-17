@@ -7,12 +7,13 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
     python -m paulsha_cortex.trust_root selfcheck   # R3 自檢診斷（JSON）
     python -m paulsha_cortex.trust_root registry    # R1 登記表摘要（JSON）
     python -m paulsha_cortex.trust_root equation     # R1 雙向等式結果
-    python -m paulsha_cortex.trust_root permissions [three-way|two-way] [--commands] [--paths]
+    python -m paulsha_cortex.trust_root permissions [four-way|three-way|two-way]
+                                        [--commands] [--paths]
                                         [--operator-account <帳號名|none>]
                                         [--external-reader-account <帳號名|none>]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
-    python -m paulsha_cortex.trust_root unit [three-way|two-way]
-                                        [--manager|--monitor|--job|--review-job
+    python -m paulsha_cortex.trust_root unit [four-way|three-way|two-way]
+                                        [--manager|--monitor|--job|--review-job|--gate-job
                                          |--job-properties]
                                         [--profile strict|jit]
                                                     # Phase 2b systemd unit 內容
@@ -25,19 +26,24 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     #   ＋planner 模板 unit（同帳號，
                                                     #   User=cortex-reviewer-planner，
                                                     #   unit 名 cortex-reviewer-job@.service）；
+                                                    #   --gate-job＝#629 的 gate 執行身分
+                                                    #   模板 unit（User=cortex-gate，
+                                                    #   unit 名 cortex-gate-job@.service；
+                                                    #   只有 four-way 有這個帳號）；
                                                     #   --job-properties＝方案 A 的
                                                     #   systemd-run --property= 清單；
                                                     #   --profile＝#643 的 per-executor
                                                     #   加固剖面，只對 --job／--review-job／
-                                                    #   --job-properties 有意義。預設
+                                                    #   --gate-job／--job-properties 有意義。
+                                                    #   預設
                                                     #   strict＝完整加固表；jit 只放寬
                                                     #   MemoryDenyWriteExecute，給 node 型
                                                     #   executor（codex／copilot）用，
                                                     #   unit 名尾綴 -jit）
-    python -m paulsha_cortex.trust_root shim [three-way|two-way]
+    python -m paulsha_cortex.trust_root shim [four-way|three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
-    python -m paulsha_cortex.trust_root gitconfig [three-way|two-way]
+    python -m paulsha_cortex.trust_root gitconfig [four-way|three-way|two-way]
                                         [--builder|--reviewer-planner|--manager]
                                         --source-repo <slug> [--source-repo <slug>…]
                                                     # #623：帳號 HOME 下 root-owned 的
@@ -46,26 +52,32 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # job 帳號 ＋ Manager（Manager 也要
                                                     # 對來源樹跑 git，同樣會撞 dubious
                                                     # ownership）
-    python -m paulsha_cortex.trust_root toolchain [three-way|two-way]
+    python -m paulsha_cortex.trust_root toolchain [four-way|three-way|two-way]
                                                     # #640：executor toolchain 的落位
                                                     # 步驟（四個模型 CLI 進
                                                     # <deploy_root>/toolchain、node 走
                                                     # 系統層、job 的 PSC_BUILDER_PATH）
-    python -m paulsha_cortex.trust_root polkit [three-way|two-way] [--template|--transient]
+    python -m paulsha_cortex.trust_root polkit [four-way|three-way|two-way]
+                                        [--template|--transient]
                                                     # Phase 2b 降權 polkit 規則內容
                                                     # （--template＝方案 B，**預設**；
                                                     #   --transient＝方案 A，對照用）
-                                                    # 內容涵蓋**全部**降權 job 角色的
-                                                    # 具名模板（#615 M2 起＝builder ＋
-                                                    # reviewer/planner，各兩個加固剖面
-                                                    # ＝四個字幹），仍是**單一** addRule、
-                                                    # 單一 return YES
-    python -m paulsha_cortex.trust_root scaffold [three-way|two-way]
+                                                    # 內容涵蓋**該方案實際落檔**的全部
+                                                    # 降權 job 角色具名模板（#629 起，
+                                                    # four-way＝builder ＋ reviewer/planner
+                                                    # ＋ gate，各兩個加固剖面＝六個字幹；
+                                                    # three-way／two-way 沒有 gate 帳號，
+                                                    # 因此不含 gate 字幹），仍是**單一**
+                                                    # addRule、單一 return YES
+    python -m paulsha_cortex.trust_root scaffold [four-way|three-way|two-way]
                                                     # Phase 2b 骨架目錄的 install -d 命令
 
-UID 方案未指定時一律用 **`three-way`**（operator 0816 第三輪裁決 A 的定案：
-`cortex-manager`／`cortex-reviewer-planner`／`cortex-builder`）。`two-way` 保留為
-向後相容選項，需**顯式**打出——打錯字不會靜默退回較寬鬆的方案。
+UID 方案未指定時一律用 **`four-way`**（#629 的定案：`cortex-manager`／
+`cortex-reviewer-planner`／`cortex-builder`／**`cortex-gate`**）。`three-way`
+（0816 第三輪裁決 A）與 `two-way` 保留為向後相容選項，需**顯式**打出——打錯字不會
+靜默退回較寬鬆的方案。那兩個方案對 `GATE` 明示「本部署沒有這個角色」，因此不產生
+gate 的 unit／ACL／polkit 字幹，降權模式下 build 卡照 `require_ledger` fail closed
+（＝#629 之前的現況）。
 
 `permissions`／`unit`／`shim`／`gitconfig`／`toolchain`／`polkit`／`scaffold` 只**產生**計畫與內容字串，
 **絕不執行**任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook
@@ -319,6 +331,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 which = "job"
             elif token == "--review-job":
                 which = "review-job"
+            elif token == "--gate-job":
+                which = "gate-job"
             elif token == "--job-properties":
                 which = "job-properties"
             elif token == "--profile":
@@ -355,11 +369,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         if which == "job":
             print(permgen.build_job_unit(scheme, profile=profile).content, end="")
             return 0
-        if which == "review-job":
+        if which in ("review-job", "gate-job"):
             # #615 M2：reviewer＋planner 的模板（同一份，兩者同帳號）。
+            # #629：gate 執行身分的模板（第四個帳號，不代表任何 persona）。
+            principal = (
+                Principal.REVIEWER if which == "review-job" else Principal.GATE
+            )
+            if scheme.resolve(principal) is None:
+                print(
+                    f"scheme={scheme.scheme_id} 沒有 `{principal.value}` 帳號，"
+                    f"因此沒有這份模板 unit（#629：改用 --scheme four-way）",
+                    file=sys.stderr,
+                )
+                return 2
             print(
                 permgen.build_job_unit(
-                    scheme, principal=Principal.REVIEWER, profile=profile
+                    scheme, principal=principal, profile=profile
                 ).content,
                 end="",
             )
@@ -367,7 +392,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if profile_id != permgen.DEFAULT_HARDENING_PROFILE.profile_id:
             # 剖面只對 job 模板 unit 有意義；靜默忽略會產出一份與旗標不符的內容。
             print(
-                f"--profile 只適用於 --job／--review-job／--job-properties（收到 {which}）",
+                "--profile 只適用於 --job／--review-job／--gate-job／--job-properties"
+                f"（收到 {which}）",
                 file=sys.stderr,
             )
             return 2

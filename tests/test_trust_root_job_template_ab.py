@@ -188,9 +188,34 @@ def _only_spec(spool: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class ThreeWaySchemeIsTheDecisionTests(unittest.TestCase):
-    def test_default_scheme_is_three_way(self) -> None:
-        self.assertIs(permgen.DEFAULT_SCHEME, permgen.THREE_WAY_SCHEME)
-        self.assertEqual(permgen.DEFAULT_SCHEME_ID, "three-way")
+    def test_default_scheme_is_the_widest_split_available(self) -> None:
+        """預設永遠是**分得最細**的那一個方案（#629 起＝四分）。
+
+        0816 第三輪裁決 A 的性質是「預設就是最安全的那一個，要退回較寬鬆的方案必須
+        顯式打出來」。#629 把定案往前推一格（多出 `cortex-gate`），因此這裡斷言的
+        是那個**性質**而不是某個字面 id：預設方案的帳號數必須 ≥ 其餘每一個方案，
+        且三分／二分都仍在表上、都要顯式指定才拿得到。
+        """
+        self.assertIs(permgen.DEFAULT_SCHEME, permgen.FOUR_WAY_SCHEME)
+        self.assertEqual(permgen.DEFAULT_SCHEME_ID, "four-way")
+        widest = max(
+            len(s.declared_accounts()) for s in permgen.SCHEMES.values()
+        )
+        self.assertEqual(len(permgen.DEFAULT_SCHEME.declared_accounts()), widest)
+        for legacy_id in ("two-way", "three-way"):
+            self.assertIn(legacy_id, permgen.SCHEMES)
+            self.assertIsNot(permgen.SCHEMES[legacy_id], permgen.DEFAULT_SCHEME)
+
+    def test_three_way_remains_available_and_declares_no_gate_identity(self) -> None:
+        """三分沒有第四個帳號——而且那是**明示的決定**，不是遺漏（#629）。"""
+        three = permgen.THREE_WAY_SCHEME
+        self.assertEqual(
+            three.account_of[Principal.GATE], permgen.ABSENT_ACCOUNT
+        )
+        self.assertIsNone(three.resolve(Principal.GATE))
+        # 明示不存在 ⇒ 不算未對應，產生器照樣輸出得了三分的其餘部分。
+        self.assertNotIn(Principal.GATE, three.unresolved_principals())
+        self.assertNotIn("cortex-gate", three.declared_accounts())
 
     def test_three_way_splits_the_model_personas_off_the_spawn_authority(self) -> None:
         """裁決的判準：持 spawn 授權的帳號不得跑任何模型程式碼。"""
@@ -448,7 +473,8 @@ class M2ExtensionPointTests(unittest.TestCase):
                     stem,
                 )
         self.assertEqual(
-            rule.target_accounts, ("cortex-builder", "cortex-reviewer-planner")
+            rule.target_accounts,
+            ("cortex-builder", "cortex-reviewer-planner", "cortex-gate"),
         )
         # 仍然只有一個放行出口。
         self.assertEqual(rule.content.count("polkit.Result.YES"), 1)
