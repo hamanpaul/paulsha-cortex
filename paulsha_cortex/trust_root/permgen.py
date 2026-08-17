@@ -533,6 +533,8 @@ PER_JOB_SEGMENT = "<job-id>"
 def plan_to_commands(
     plan: PermissionPlan,
     path_of: Mapping[str, str] | None = None,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    scheme: UidScheme | None = None,
 ) -> list[str]:
     """把計畫轉成 runbook 可引用的命令序列（**只產生字串，絕不執行**）。
 
@@ -540,6 +542,11 @@ def plan_to_commands(
     shell 變數替換（`PathLayout.asset_paths()` 可一次提供全部真實路徑）。輸出含
     分節註解，方便 operator 對照登記表逐項核可；目錄資產會先出 `install -d`，
     使整份輸出成為一份可直接執行的 setup script。
+
+    帶 `path_of`（真實路徑）時，輸出**尾端**另附一節由跨帳號 ACL 機械導出的父目錄
+    traverse ACL（`derive_traverse_grants`，#620）——沒有它，葉節點 ACL 全部正確
+    但路徑走不通。`layout`／`scheme` 只影響那一節（骨架目錄的 owner／mode 是判斷
+    「這層是否已可 traverse」的輸入），未給時取 `DEFAULT_LAYOUT` 與 plan 的 scheme。
     """
     lines: list[str] = [
         f"# trust-root Phase 2b 權限套用命令（scheme={plan.scheme_id}）",
@@ -573,6 +580,11 @@ def plan_to_commands(
             cmds = [f"[ ! -e {path} ] || {cmd}" for cmd in cmds]
         for cmd in cmds:
             lines.append(f"#   {cmd}" if per_job else cmd)
+    # 父層 traverse ACL 一律殿後——見 `traverse_commands` 的順序說明（chmod 會重寫
+    # ACL mask）。placeholder 模式（未給 path_of）沒有真實路徑階層可推，故不出這節。
+    lines += traverse_commands(
+        derive_traverse_grants(plan, layout, scheme, path_of=path_of or {})
+    )
     return lines
 
 
@@ -922,6 +934,272 @@ def read_write_path_owners(
         covered += [f"extra:{e.reason}" for e in extras if _is_within(e.path, rwp)]
         result[rwp] = tuple(covered)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 父目錄 traverse ACL 的機械導出（#620）
+#
+# POSIX 要求路徑上**每一層**都帶 `x`（search）位才走得到葉節點。葉節點的跨帳號 ACL
+# 再精確，只要中間任何一層是 `0700 <別人>`，實際結果就是 `Permission denied`——而且
+# 錯誤訊息指的是那個父目錄，與真正缺的那條授權**不在同一層**，極難診斷（Phase 2b
+# 實機兩條正向路徑同時全斷即為此）。
+#
+# 因此 traverse 權**必須與葉節點 ACL 同源機械導出**，不能留給 runbook 手補：它是
+# 「正向路徑成立」的必要條件，漏掉會讓整套降權部署看起來「裝好了但 job 全部失敗」。
+# ---------------------------------------------------------------------------
+
+#: 父層 traverse ACL 的 perms。**必須是 `--x` 而不是 `r-x`**：只給 search，不給
+#: 列目錄。builder 因此走得到 `<monitor>/event-spool`，卻列不出 `coordinator/`
+#: 底下還有哪些 Manager 資產——「能走到自己那格」與「看得見別人有哪些格」是兩件事，
+#: 這裡只授前者。
+TRAVERSE_PERMS = "--x"
+
+
+@dataclass(frozen=True)
+class DirectoryFacts:
+    """某目錄在**目標狀態**下的 owner／group／mode／具名 ACL（推導 traverse 用）。
+
+    來源有二，合起來就是本產生器對「路徑上每一層長什麼樣」的全部知識：
+    登記表資產的 `PermissionEntry`（目錄型）與 `PathLayout.scaffold_directories()`。
+    不在其中的目錄一律保守視為**不可 traverse**（fail-closed：寧可多產一條 `--x`，
+    也不要漏掉一條而讓正向路徑靜默斷掉）。
+    """
+
+    path: str
+    owner: str
+    group: str
+    mode: int
+    #: account → ACL perms。只收 access ACL；default ACL 決定的是**子物件**的初值，
+    #: 不影響「能不能走過這個目錄本身」。
+    acl_perms: Mapping[str, str] = field(default_factory=dict)
+    #: `asset:<asset_id>` 或 `scaffold`——供診斷時指出這層是誰定的。
+    source: str = ""
+
+
+def directory_facts(
+    plan: PermissionPlan,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    scheme: UidScheme | None = None,
+    path_of: Mapping[str, str] | None = None,
+) -> dict[str, DirectoryFacts]:
+    """路徑→目標狀態（骨架目錄先鋪底，登記表資產覆蓋其上）。純函式、無 IO。"""
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    scheme = scheme if scheme is not None else SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+    paths = dict(path_of) if path_of is not None else layout.asset_paths()
+    facts: dict[str, DirectoryFacts] = {}
+    for path, owner, group, mode in layout.scaffold_directories(scheme):
+        facts[path] = DirectoryFacts(
+            path=path, owner=owner, group=group, mode=mode, source="scaffold"
+        )
+    for entry in plan.entries:
+        if not entry.is_directory:
+            continue
+        path = paths.get(entry.asset_id)
+        if not path:
+            continue
+        facts[path] = DirectoryFacts(
+            path=path,
+            owner=entry.owner,
+            group=entry.group,
+            mode=entry.mode,
+            acl_perms={a.account: a.perms for a in entry.acls if not a.default},
+            source=f"asset:{entry.asset_id}",
+        )
+    return facts
+
+
+def can_traverse(
+    facts: DirectoryFacts | None,
+    account: str,
+    scheme: UidScheme,
+) -> bool:
+    """該帳號在目標狀態下能否 search 進這個目錄。
+
+    依 POSIX ACL 的判定順序：owner 條目優先；具名 user 條目一旦存在就**取代**
+    group／other 位（不是疊加——`r--` 的具名條目會擋掉 other 的 x）；都沒有才看
+    group、最後看 other。未知目錄回 `False`（fail-closed）。
+    """
+    if facts is None:
+        return False
+    if facts.owner == account:
+        return bool(facts.mode & 0o100)
+    perms = facts.acl_perms.get(account)
+    if perms is not None:
+        # setfacl 的 `X` ＝「目錄才給 x」；本函式的對象都是目錄，故等同 x。
+        return "x" in perms or "X" in perms
+    if facts.group == scheme.group_of(account):
+        return bool(facts.mode & 0o010)
+    return bool(facts.mode & 0o001)
+
+
+def managed_roots(facts: Mapping[str, DirectoryFacts]) -> tuple[str, ...]:
+    """本 layout 管理的樹根（沒有其他已知目錄是其祖先者）。
+
+    traverse 推導往上走到這裡為止。再往上（`/var/lib`、`/var`、`/`）是發行版標準的
+    root-owned 0755，不歸本產生器管——對那幾層下 `setfacl` 是越權，也毫無必要。
+    """
+    return _minimize(set(facts))
+
+
+def _ancestors_within(path: str, roots: tuple[str, ...]) -> tuple[str, ...]:
+    """`path` 由內而外的祖先目錄，只取仍落在管理樹內者。"""
+    chain: list[str] = []
+    current = _parent_dir(path)
+    while any(_is_within(current, r) for r in roots):
+        chain.append(current)
+        parent = _parent_dir(current)
+        if parent == current:
+            break
+        current = parent
+    return tuple(chain)
+
+
+@dataclass(frozen=True)
+class TraverseGrant:
+    """單條父層 traverse ACL：`setfacl -m u:<account>:--x <path>`。"""
+
+    path: str
+    account: str
+    #: 需要這條才走得到的葉資產（一個中間目錄常同時服務多個葉）。
+    required_by: tuple[str, ...] = ()
+
+    @property
+    def acl(self) -> AclEntry:
+        """對應的 ACL 條目。**永遠 access-only**（`default=False`）：default ACL 會讓
+        該目錄底下**新建的每個物件**都繼承這條授權，等於把一條 traverse 洩漏成整棵
+        子樹的授權——與「不可列目錄、不可讀他人資產」的目的正好相反。"""
+        return AclEntry(self.account, TRAVERSE_PERMS)
+
+    def render(self) -> str:
+        return self.acl.render(self.path)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "account": self.account,
+            "perms": TRAVERSE_PERMS,
+            "required_by": list(self.required_by),
+        }
+
+
+def derive_traverse_grants(
+    plan: PermissionPlan,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    scheme: UidScheme | None = None,
+    path_of: Mapping[str, str] | None = None,
+) -> tuple[TraverseGrant, ...]:
+    """對每個授了跨帳號 ACL 的資產，沿路徑往上補齊該帳號的 traverse 權。
+
+    規則只有一條，沒有第二條：**葉節點被授權的帳號，其路徑上每一層都必須可 search**。
+    已經允許該帳號 traverse 的中間層（owner 相符、other 帶 x、或既有 ACL 已帶 x）
+    一律跳過——不重複產生。回傳依 `(path, account)` 排序，確保輸出決定性。
+    """
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    scheme = scheme if scheme is not None else SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+    paths = dict(path_of) if path_of is not None else layout.asset_paths()
+    facts = directory_facts(plan, layout, scheme, paths)
+    roots = managed_roots(facts)
+
+    needed: dict[tuple[str, str], set[str]] = {}
+    for entry in plan.entries:
+        path = paths.get(entry.asset_id)
+        if not path:
+            continue
+        for acl in entry.acls:
+            # default ACL 只決定子物件初值；owner 自己不需要 ACL。
+            if acl.default or acl.account == entry.owner:
+                continue
+            for ancestor in _ancestors_within(path, roots):
+                if can_traverse(facts.get(ancestor), acl.account, scheme):
+                    continue
+                needed.setdefault((ancestor, acl.account), set()).add(entry.asset_id)
+    return tuple(
+        TraverseGrant(path=p, account=a, required_by=tuple(sorted(ids)))
+        for (p, a), ids in sorted(needed.items())
+    )
+
+
+def unreachable_hops(
+    plan: PermissionPlan,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    scheme: UidScheme | None = None,
+    *,
+    account: str,
+    asset_id: str,
+    path_of: Mapping[str, str] | None = None,
+    grants: tuple[TraverseGrant, ...] | None = None,
+) -> tuple[str, ...]:
+    """套用導出的 traverse 授權後，該帳號**仍**走不過去的中間層（空 tuple＝整條通）。
+
+    這就是 #620 的驗收條件本身：葉節點 ACL 正確 **≠** 路徑走得通。
+    """
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    scheme = scheme if scheme is not None else SCHEMES.get(plan.scheme_id, DEFAULT_SCHEME)
+    paths = dict(path_of) if path_of is not None else layout.asset_paths()
+    facts = directory_facts(plan, layout, scheme, paths)
+    if grants is None:
+        grants = derive_traverse_grants(plan, layout, scheme, paths)
+    granted: dict[str, set[str]] = {}
+    for grant in grants:
+        granted.setdefault(grant.path, set()).add(grant.account)
+
+    blocked: list[str] = []
+    for ancestor in _ancestors_within(paths[asset_id], managed_roots(facts)):
+        if account in granted.get(ancestor, set()):
+            continue
+        if can_traverse(facts.get(ancestor), account, scheme):
+            continue
+        blocked.append(ancestor)
+    return tuple(blocked)
+
+
+def account_can_reach(
+    plan: PermissionPlan,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    scheme: UidScheme | None = None,
+    *,
+    account: str,
+    asset_id: str,
+    path_of: Mapping[str, str] | None = None,
+    grants: tuple[TraverseGrant, ...] | None = None,
+) -> bool:
+    """該帳號套完產生器輸出後是否走得到這個資產（整條路徑鏈皆可 search）。"""
+    return not unreachable_hops(
+        plan, layout, scheme,
+        account=account, asset_id=asset_id, path_of=path_of, grants=grants,
+    )
+
+
+def traverse_commands(grants: tuple[TraverseGrant, ...]) -> list[str]:
+    """把 traverse 授權轉成命令序列（**只產生字串，絕不執行**）。
+
+    這一節必須排在整份 script 的**最後**：`chmod` 在有 ACL 的物件上會把 group 位
+    寫進 ACL **mask**，先 `setfacl` 再 `chmod 0700` 會讓所有具名條目的有效權限被
+    mask 成空——順序反了不會報錯，只會靜默失效。
+    """
+    if not grants:
+        return []
+    lines = [
+        "",
+        "# ===== 父目錄 traverse ACL（由上方跨帳號 ACL 機械導出，#620）=====",
+        "# POSIX 要求路徑上每一層都有 x（search）位；葉節點 ACL 再精確，中間只要有一層",
+        "# 是 0700 <別人>，整條就走不通，而錯誤訊息還指在父目錄（與缺的授權不同層）。",
+        f"# perms 固定為 {TRAVERSE_PERMS}：**只給 traverse、不給列目錄**——帳號走得到自己",
+        "# 那格，卻列不出該目錄底下還有哪些別人的資產。",
+        "# 一律只設 access ACL、**不設 default ACL**：default 會讓底下新建的每個物件都",
+        "# 繼承這條授權，等於把一條 traverse 放大成整棵子樹的授權。",
+        "# 本節排在最後是必要的：chmod 會重寫 ACL mask，先 setfacl 再 chmod 會讓具名",
+        "# 條目被 mask 成空（靜默失效，不會報錯）。",
+    ]
+    for grant in grants:
+        per_job = PER_JOB_SEGMENT in grant.path
+        lines.append(f"#   走得到：{', '.join(grant.required_by)}")
+        if per_job:
+            lines.append("#   per-job：由降權啟動器在 spawn 時套用，setup 階段不執行。")
+            lines.append(f"#   {grant.render()}")
+        else:
+            lines.append(grant.render())
+    return lines
 
 
 # ---------------------------------------------------------------------------

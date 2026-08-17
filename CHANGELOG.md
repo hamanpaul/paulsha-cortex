@@ -33,6 +33,23 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#620 / trust-root：permgen 機械導出父目錄 traverse ACL——三分下 builder／
+  reviewer-planner 走不到自己的 spool，正向路徑全斷**——葉節點的跨帳號 ACL 完全正確
+  （`u:cortex-builder:wx` 掛在 `<monitor>/event-spool` 上），但父目錄是
+  `0700 cortex-manager`；POSIX 要求路徑上**每一層**都帶 `x`（search）位，於是 Phase 2b
+  實機兩條 append-only 正向路徑同時 `Permission denied`，且錯誤訊息指的是**父目錄**、
+  與真正缺的授權不在同一層。`permgen` 新增 `derive_traverse_grants()`：對每個授了跨帳號
+  ACL 的資產沿路徑往上走到管理樹根，逐層以 `can_traverse()` 判斷該帳號是否已經走得過去
+  （owner 位相符／others 帶 x／既有 ACL 已含 x），只為真正缺的那幾層產生一條 `--x`；
+  中間層的目標狀態由登記表 `PermissionEntry` ＋ `scaffold_directories()` 兩個既有真相
+  合出（`directory_facts()`），沒有第二份手寫清單。**`--x` 而非 `r-x`、且一律不設
+  default ACL**：前者讓 job 帳號走得到自己那格卻列不出 `coordinator/` 底下還有哪些
+  Manager 資產，後者避免一條 traverse 被子物件繼承成整棵子樹的授權。命令排在輸出**尾端**
+  ——`chmod` 會重寫 ACL mask，順序反了會靜默失效。另新增 `account_can_reach()`／
+  `unreachable_hops()` 讓「鏈是否完整」成為可測的純函式判定。新增
+  `tests/test_trust_root_permgen_traverse_620.py`（26 測試，兩 scheme 參數化，含
+  「拿掉導出授權即重現 issue 斷法」的反向對照）；runbook 補稽核 5 與正／負向驗證。
+  詳見 `changelog.d/permgen-parent-traverse-acl.md`。
 - **#618 / trust-root Phase 2b：補上 `cortex service run`——permgen 的 manager unit
   `ExecStart` 指向一個不存在的 verb**——產生的 system unit 寫
   `ExecStart=<venv>/bin/cortex service run`，但 porcelain 只有 `install`／`start`／

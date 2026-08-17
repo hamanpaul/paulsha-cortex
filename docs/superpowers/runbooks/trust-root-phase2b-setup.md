@@ -410,6 +410,24 @@ grep -c "cortex-svc" /tmp/p2b-scaffold.sh
 
 # ✅ 稽核 4：setfacl 可用（缺 acl 套件會讓跨帳號唯讀授權整段失效）
 command -v setfacl >/dev/null && echo "setfacl: OK" || echo "!! 請先 sudo apt-get install acl"
+
+# ✅ 稽核 5：父目錄 traverse ACL 已由產生器導出（#620）
+grep -E "^setfacl -m u:[^ ]+:--x " /tmp/p2b-permissions.sh
+#   期望（三分）：**至少**含下列三行——它們是兩條正向路徑成立的**必要條件**
+#     setfacl -m u:cortex-builder:--x           /var/lib/cortex/monitor
+#     setfacl -m u:cortex-builder:--x           /var/lib/cortex/coordinator
+#     setfacl -m u:cortex-reviewer-planner:--x  /var/lib/cortex/coordinator
+#   （另有 cortex-outbox／operator 的對應條目，同樣由葉節點 ACL 機械導出）
+grep -E "^setfacl .*:r-x " /tmp/p2b-permissions.sh
+#   期望：空輸出。traverse 一律 `--x` 而非 `r-x`：走得到自己那格，但**列不出**
+#   coordinator/ 底下還有哪些 Manager 資產。
+grep -E "^setfacl -d -m u:[^ ]+:--x " /tmp/p2b-permissions.sh
+#   期望：空輸出。traverse 只設 access ACL、不設 default——default 會讓該目錄底下
+#   新建的每個物件都繼承這條授權，等於把一條 traverse 放大成整棵子樹的授權。
+tail -n 20 /tmp/p2b-permissions.sh | grep -c ":--x "
+#   期望：> 0。traverse 節**必須留在 script 尾端**：`chmod` 在帶 ACL 的物件上會重寫
+#   ACL **mask**，先 setfacl 再 chmod 會讓具名條目的有效權限被 mask 成空（靜默失效，
+#   不會報錯）。因此也**不要**在執行完 permissions 之後再重跑 scaffold。
 ```
 
 ### 2b. 執行（順序固定：先骨架、後權限）
@@ -452,6 +470,26 @@ sudo getfacl -p /var/lib/cortex/monitor/event-spool 2>/dev/null | grep -E "^user
 #   期望：user:cortex-builder:-wx（producer 只能 append，不可讀他人）
 sudo getfacl -p /var/lib/cortex/coordinator/review-verdicts 2>/dev/null | grep -E "^user:"
 #   期望：user:cortex-reviewer-planner:-wx（**無 r**）
+
+# ✅ 驗證：父目錄 traverse 已就位——**正向路徑真的走得通**（#620）
+sudo getfacl -p /var/lib/cortex/monitor 2>/dev/null | grep -E "^user:"
+#   期望：user:cortex-builder:--x（**無 r**）
+sudo getfacl -p /var/lib/cortex/coordinator 2>/dev/null | grep -E "^user:"
+#   期望：user:cortex-builder:--x、user:cortex-reviewer-planner:--x（皆**無 r**）
+sudo -u cortex-builder sh -c 'echo x > /var/lib/cortex/monitor/event-spool/probe.json' \
+  && sudo rm -f /var/lib/cortex/monitor/event-spool/probe.json \
+  && echo "builder → event-spool: OK"
+sudo -u cortex-reviewer-planner mkdir /var/lib/cortex/coordinator/review-verdicts/probe \
+  && sudo rmdir /var/lib/cortex/coordinator/review-verdicts/probe \
+  && echo "reviewer-planner → review-verdicts: OK"
+#   期望：兩行 OK。任一 `Permission denied` 就停下來查——先看它抱怨的是**哪一層**，
+#   父目錄的錯與葉節點的錯訊息長得很像但缺的授權不同層。
+
+# ✅ 驗證（負向）：traverse 沒有連帶開放列目錄
+sudo -u cortex-builder ls /var/lib/cortex/coordinator 2>&1 | tail -1
+#   期望：Permission denied（--x 只給 search，不給 read）
+sudo -u cortex-builder ls /var/lib/cortex/coordinator/evidence 2>&1 | tail -1
+#   期望：Permission denied（走得到 job-specs，仍看不到別的 Manager 資產）
 
 # ✅ 驗證：三個 HOME 與 ~/.codex 由 root 擁有（帳號不得替換自己的設定）
 ls -ld /var/lib/cortex-svc /var/lib/cortex-svc/cache
