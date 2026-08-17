@@ -52,6 +52,30 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#626 / trust-root：permgen 為不存在的 principal 產生 `setfacl`，`sh -e` 下中止整份
+  script 留下半套用的權限樹**——`permissions --commands --paths` 會印出
+  `setfacl -m u:operator:rX …` 與 `setfacl -m u:cortex-outbox:rX …`，但這兩個是
+  `registry.Principal` 的**抽象角色名**、不是真實帳號（`SCHEMES` 只把服務帳號那幾個
+  principal 對應到真實帳號——**對應表缺項，不是填錯**）。實機 `setfacl` 回
+  `Invalid argument near character 3`，而 runbook 第 2b 步是
+  `sudo sh -e /tmp/p2b-permissions.sh`：第一條就**中止整份 script**，權限樹停在半套用
+  狀態（前段已 chown/chmod、後段完全沒動），而且**看起來像裝好了**——錯誤訊息完全看不出
+  是「帳號不存在」。修法：`UidScheme` 新增 `operator_account`／`external_reader_account`
+  兩個**預設 `None`** 的欄位，由 `--operator-account`／`PSC_OPERATOR_ACCOUNT`（及
+  external reader 的對應旗標／env，旗標優先）於產生當下注入；值 `none` 是**明示**本部署
+  沒有這個角色的實體，該 principal 的授權整組略去。未指定時 `plan_to_commands()`
+  **fail-closed**：raise `UnresolvedPrincipalError`、**一行都不輸出**（CLI stdout 全空、
+  回傳碼 2，被重導的檔案是空檔而不是半套 script），訊息指出是哪個 principal、走哪個旗標／
+  env、以及「先 `getent passwd`」。另加一道輸出後自我檢查
+  `assert_output_accounts_known()`：每一行的 `u:<name>:` 與 `chown <owner>:<group>`
+  都必須落在方案宣告的帳號集合內（註解行一併檢查），擋的是**未來新增 principal 時再犯**。
+  `UidScheme.__post_init__` 拒絕把這幾個 principal 塞回 `account_of`（會被靜默忽略而形成
+  第二份真相，正是本 issue 的成因），帳號名另做 `^[a-z_][a-z0-9_-]*$` 形狀驗證（名字會被
+  逐字嵌進命令字串）。env 只在 CLI 這一層讀取，`permgen` 維持純函式。新增
+  `tests/test_trust_root_principal_account_mapping_626.py`（46 測試，兩 scheme 參數化，
+  含「輸出不得出現任何不在帳號集合內的字面值」這條擋復發的不變式）；runbook 第 2a 步補
+  稽核 6／6b（每個 ACL 帳號與 scaffold owner 都必須 `getent passwd` 得到）並明說 script
+  冪等、中止後直接重跑安全。詳見 `changelog.d/principal-account-mapping.md`。
 - **#608 / ledger gate 環境健壯性（#565、#586 同族第三例）：AF_UNIX socket 路徑不再
   吃 `TMPDIR` 長度，長暫存根無法再偽造出一筆 gate 失敗**——Linux 的 `sun_path` 只有
   108 bytes（含結尾 NUL，可用 107），而 pytest `tmp_path` 與 `tempfile.mkdtemp()` 都

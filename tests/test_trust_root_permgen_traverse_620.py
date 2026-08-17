@@ -20,9 +20,7 @@ import pytest
 from paulsha_cortex.trust_root import permgen
 from paulsha_cortex.trust_root.permgen import (
     DEFAULT_LAYOUT,
-    THREE_WAY_SCHEME,
     TRAVERSE_PERMS,
-    TWO_WAY_SCHEME,
     PathLayout,
     account_can_reach,
     can_traverse,
@@ -31,7 +29,21 @@ from paulsha_cortex.trust_root.permgen import (
     generate_plan,
     unreachable_hops,
 )
+from paulsha_cortex.trust_root.permgen import THREE_WAY_SCHEME as _THREE_WAY_BASE
+from paulsha_cortex.trust_root.permgen import TWO_WAY_SCHEME as _TWO_WAY_BASE
 from paulsha_cortex.trust_root.registry import Principal
+
+#: #626：`operator` 與 `external` 是**部署決定**，模組層方案刻意留 `None`，未注入時
+#: 產生器 fail-closed。traverse 推導的驗收本來就涵蓋這兩個帳號的中間層授權
+#: （`cortex-outbox` 對 `coordinator`／`coordinator/digest`、operator 對 `coordinator`），
+#: 故本檔一律用**注入後**的方案；fail-closed 本身由
+#: `tests/test_trust_root_principal_account_mapping_626.py` 專門釘住。
+DEPLOYMENT_ACCOUNTS = {
+    Principal.OPERATOR: "cortex-ops",
+    Principal.EXTERNAL: "cortex-outbox",
+}
+TWO_WAY_SCHEME = _TWO_WAY_BASE.with_principal_accounts(DEPLOYMENT_ACCOUNTS)
+THREE_WAY_SCHEME = _THREE_WAY_BASE.with_principal_accounts(DEPLOYMENT_ACCOUNTS)
 
 ALL_SCHEMES = [TWO_WAY_SCHEME, THREE_WAY_SCHEME]
 
