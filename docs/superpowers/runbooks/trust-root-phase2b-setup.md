@@ -234,20 +234,20 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | 段落 | 🔧 sudo 點 | ✅ 驗證點 |
 |---|---:|---:|
 | 執行前提（含 G1／G2 兩個硬性 gate） | 0 | 11 |
-| 產生器＝單一真相 | 0 | 9 |
+| 產生器＝單一真相 | 0 | 10 |
 | 第 1 步：建三帳號 | 3 | 5 |
 | 第 2 步：目標樹與權限（含 2c 來源樹） | 4 | 21 |
 | 第 3 步：legacy-import（含 operator 設定搬遷） | 3 | 11 |
-| 第 4 步：Manager／monitor 部署與 unit | 12 | 24 |
-| **第 5 步：降權（A+B）** | **7** | **27** |
+| 第 4 步：Manager／monitor 部署與 unit（含 4e toolchain／憑證） | 16 | 33 |
+| **第 5 步：降權（A+B）** | **7** | **28** |
 | 第 6 步：升級流程 | 5 | 6 |
 | 第 7 步：切換驗收（含功能面檢查） | 0 | 5 |
 | 第 8 步：R9 抽驗（五族） | 5 | 19 |
 | 第 9 步：回滾 | 2 | 1 |
 | WSL2 風險與診斷 | 2 | 12 |
-| 附錄 A：自我檢查 | 0 | 7 |
+| 附錄 A：自我檢查 | 0 | 9 |
 | 附錄 B：降級備援 | 2 | 3 |
-| **合計** | **45** | **161** |
+| **合計** | **49** | **174** |
 
 （統計方式：全文 `🔧`／`✅` 標記出現次數，扣除說明性用法——「標記約定」的定義行、
 段落標題內的標記、以及表格裡當狀態記號用的那幾個。）
@@ -269,6 +269,12 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   `.gitconfig`」——2 個 sudo 點、5 個驗證點（來源樹 Manager 可寫／job 唯讀、job 真的
   clone 得動、三份 `.gitconfig` 對應帳號不可寫、commit spool 的 `wx` 無 `r`）
   → **45** 個 sudo 點、**161** 個驗證點。
+- **#640（executor 執行面）新增**：第 4e 步「executor toolchain 落位 ＋ per-account
+  憑證」——4 個 sudo 點、9 個驗證點（toolchain 對 job 唯讀、以 job 帳號實跑
+  `--help` 期望 rc=0、**版本與 operator 側逐字相同**、在真實加固面下複跑一次、
+  憑證「檔 job-owned／目錄 root-owned」的三條反向不變式），另在「產生器＝單一真相」
+  與 5-5 各補一條 ✅、附錄 A 補兩條漂移自我檢查（版本分岔／憑證 owner）
+  → **49** 個 sudo 點、**174** 個驗證點。
 
 ---
 
@@ -342,6 +348,10 @@ python3 -m paulsha_cortex.trust_root shim three-way
 python3 -m paulsha_cortex.trust_root gitconfig three-way --builder --source-repo <slug>
 python3 -m paulsha_cortex.trust_root gitconfig three-way --reviewer-planner --source-repo <slug>
 python3 -m paulsha_cortex.trust_root gitconfig three-way --manager --source-repo <slug>
+
+# ✅ executor toolchain 的落位步驟（#640；四個模型 CLI 進 /opt/cortex/toolchain、
+#    node 走系統層、job 的 PSC_BUILDER_PATH 值）——見第 4e 步
+python3 -m paulsha_cortex.trust_root toolchain three-way
 ```
 
 **job-spec 的欄位契約也已隨 #616 落地**——`coordinator/job_runner.py` 的
@@ -1361,6 +1371,176 @@ sudo rm /etc/systemd/system/cortex-monitor.service; sudo systemctl daemon-reload
 **注意**：回滾後 monitor 會重新寫舊的 `~/.agents/monitor` 樹，與 system-level Manager
 的 `/var/lib/cortex/monitor` 形成雙寫——僅可作為短時間的救急手段。
 
+### 4e. executor toolchain 落位 ＋ per-account 憑證（#640）
+
+**沒有這一步，前面全部做完 dispatch 仍會在「呼叫模型」那一步失敗。** job unit 帶
+`ProtectHome=yes`，而四個 executor 原本全在 operator 的 HOME 底下：
+
+```
+$ sudo -u cortex-builder env HOME=/var/lib/cortex-builder codex exec --help
+/usr/bin/env: ‘node’: No such file or directory        rc=127
+```
+
+**0817 裁決 (a)**：`node` 走**系統層**（通用 runtime，換版本幾乎不影響產出）；四個
+模型 CLI 落進 `/opt/cortex/toolchain`（登記表資產 `executor-toolchain`，root-owned、
+job／服務帳號唯讀＋可執行）。理由是「job 跑的是哪個版本的模型 CLI」**會**影響產出，
+那必須是一個可稽核的部署決定。
+
+> **為什麼不是「系統層有什麼就用什麼」**：這台機器上實測有**兩份** `codex`——系統層
+> `/usr/lib/node_modules/@openai/codex` 是 **0.42.0**，operator 實際在用的 nvm 那份是
+> **0.147.0**，差 100 個以上小版本。裁決要防的漂移在這裡**已經是現況**，不是假設。
+> 所以來源一律取 operator 實際在用的那一份（`command -v` 解出來的），**不要**另外
+> `npm install -g` 裝一份。
+
+**四個 CLI 的實體形態不同，搬移方式不能一概而論**（表在 `permgen.EXECUTOR_TOOLS`）：
+
+| executor | 形態 | 需要 node | 搬移方式 |
+|---|---|:--:|---|
+| `codex` | Node.js script（`.js` ＋ `#!/usr/bin/env node`） | ✅ | **整包** npm 套件樹，`bin/` 放進入點 symlink |
+| `claude` | 原生 ELF 執行檔 | — | 單檔複製 |
+| `copilot` | bash script | — | 單檔複製；**先 `head -n 20` 查它內部再叫什麼** |
+| `agy` | 原生 ELF 執行檔 | — | 單檔複製 |
+
+> `claude`／`agy` 自帶原生執行檔，**不會因為 node 版本而行為改變**——因此系統層 node
+> 的版本風險只涵蓋 `codex` 一個。
+
+```bash
+# ✅ 先讀落位步驟（含每支 CLI 的形態與搬移方式；產生器＝單一真相）
+python3 -m paulsha_cortex.trust_root toolchain three-way | less
+
+# 🔧 sudo：系統層 node（apt；nodesource repo 已設定時候選為 20.x）
+sudo apt-get install -y nodejs
+node --version
+#   期望：v20 以上。codex 0.147.0 宣告 `node >=16`，故 20 可用。
+#   ⚠️ node 版本是**部署決定**：某個 CLI 哪天提高下限時要一併升，
+#      否則它會變成下一個無聲漂移點。
+
+# 🔧 sudo：建骨架並把四個 CLI 從 operator 實際在用的那一份複製進來
+#   （逐支的來源與方式照 `trust_root toolchain` 的輸出；以下為 codex 的形狀）
+sudo install -d -o root -g root -m 0755 /opt/cortex/toolchain{,/bin,/lib}
+SRC="$(readlink -f "$(command -v codex)")"
+PKG="$(cd "$(dirname "$SRC")/.." && pwd)"     # npm 套件根（單搬 .js 會缺 node_modules）
+sudo cp -a "$PKG" /opt/cortex/toolchain/lib/codex
+sudo ln -sfn "/opt/cortex/toolchain/lib/codex/$(basename "$SRC")" \
+  /opt/cortex/toolchain/bin/codex
+for cli in claude copilot agy; do
+  sudo cp -a "$(readlink -f "$(command -v "$cli")")" "/opt/cortex/toolchain/bin/$cli"
+done
+
+# 🔧 sudo：統一收權（root 擁有、全部 job／服務帳號唯讀＋可執行）
+sudo chown -R root:root /opt/cortex/toolchain
+sudo chmod -R u=rwX,go=rX /opt/cortex/toolchain
+```
+
+```bash
+# ✅ 驗證：權限與登記表產生的計畫逐位元一致
+python3 -m paulsha_cortex.trust_root permissions three-way --commands --paths \
+  --operator-account "$USER" --external-reader-account none \
+  | grep -A3 "executor-toolchain"
+ls -ld /opt/cortex/toolchain
+#   期望：drwxr-xr-x root root（**一個 group／other 的 w 都不得有**）
+
+# ✅ 驗證：job 帳號寫不進去（這條才是邊界）
+sudo -u cortex-builder sh -c "touch /opt/cortex/toolchain/bin/evil" 2>&1 | tail -1
+#   期望：Permission denied
+
+# ✅ 功能驗證（本票的核心驗收）：以 job 帳號實跑一次 `--help`，期望 rc=0
+for cli in codex claude copilot agy; do
+  sudo -u cortex-builder env HOME=/var/lib/cortex-builder \
+    PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+    "$cli" --help >/dev/null 2>&1; echo "$cli rc=$?"
+done
+#   期望：四行皆 rc=0。**rc=127 ＝ #640 的原症狀**（CLI 或它的 runtime 不可達）：
+#     先 `sudo -u cortex-builder ... command -v <cli>` 看解到哪裡，
+#     再 `head -n 1 /opt/cortex/toolchain/bin/codex` 確認 shebang 解得開（node 在系統層）。
+
+# ✅ 驗證（**裁決 (a) 真正要守的那條**）：job 帳號跑出來的版本 == operator 側的版本
+sudo -u cortex-builder env HOME=/var/lib/cortex-builder \
+  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin codex --version
+codex --version
+#   期望：**兩行逐字相同**。只驗 rc=0 是不夠的——系統層那份 0.42.0 一樣會 rc=0，
+#   而 job 跑的就變成 operator 從未判讀過的版本（症狀是「結果對不上」，不是報錯）。
+#   不同 ⇒ PATH 順序錯（toolchain 沒排最前面），或複製到的是系統那份。
+
+# ✅ 驗證（**在真實加固面下**跑一次）：`sudo -u` 沒有 unit 的加固，兩者可能不同結果
+sudo systemd-run --pipe --wait --collect \
+  --uid=cortex-builder --gid=cortex-builder \
+  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
+  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
+  --setenv=HOME=/var/lib/cortex-builder \
+  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  /opt/cortex/toolchain/bin/codex --version
+#   期望：與上一條同一個版本、rc=0。
+#   ⚠️ 若這條失敗而 `sudo -u` 那條成功，**第一嫌疑是 `MemoryDenyWriteExecute=yes`**
+#      （node 的 V8 需要 W→X 轉換）。單獨拿掉該 property 複測即可確認；確認後
+#      屬 unit 加固面的裁決，記進 #584 而不是在這裡自行放寬。
+```
+
+**per-account 憑證（0817 裁決 (b)）**：憑證**檔**由 job 帳號擁有（才 refresh 得了
+過期 token），**放它的目錄維持 root-owned**。
+
+> **這個組合的安全性質**：job **能**就地改寫自己那份憑證的內容；但**建不了新檔、
+> 刪不掉、也換不掉**同目錄下的其他 root-owned 檔（例如 `codex-hooks` 的
+> `hooks.json`）——建立／unlink／rename 需要的是**目錄**的寫入權，而目錄對 job 只有
+> `r-x`。
+>
+> **已知限制**：因此「暫存檔 ＋ rename 原子替換」形式的 refresh 會失敗（它要在同目錄
+> 建檔），只有就地覆寫的 refresh 走得通。這是裁決刻意接受的代價。
+>
+> **這買到的是什麼**：把 operator 的憑證複製給 job 帳號，代表 job 用的是**同一個
+> provider 帳號**。三分買到的是**檔案系統層**的隔離（job 偷不到 Manager 的 token、
+> 改不了 Manager 的 state、也讀不到另一個 job 帳號的憑證），**不是** provider 層的
+> 獨立——與 `independence_domain` 不是同一件事（見 spec §R1）。
+
+```bash
+# 🔧 sudo：把 operator 那份憑證複製給兩個 job 帳號，owner 給該帳號、目錄維持 root 的
+for who in builder reviewer-planner; do
+  sudo install -o "cortex-$who" -g "cortex-$who" -m 0600 \
+    "$HOME/.codex/auth.json" "/var/lib/cortex-$who/.codex/auth.json"
+done
+#   ↑ `.codex/` 目錄本身由第 2b 步的骨架建成 root:root 0755，這裡**不要**動它。
+#   其他 executor 的憑證檔位置不同（`claude` 等各有自己的落點，本票未實測）：
+#   落位規則完全一樣——先確認該 CLI 實際寫哪個檔，再以同一條 install 命令落位；
+#   若該檔的父目錄還不存在，用 `sudo install -d -o root -g root -m 0755 <dir>` 補。
+```
+
+```bash
+# ✅ 驗證：檔案 owner 是 job 帳號、**目錄** owner 是 root
+ls -ld /var/lib/cortex-builder/.codex
+ls -l  /var/lib/cortex-builder/.codex/auth.json
+#   期望：目錄 drwxr-xr-x root root；檔案 -rw------- cortex-builder cortex-builder
+
+# ✅ 驗證：與登記表產生的計畫一致
+python3 -m paulsha_cortex.trust_root permissions three-way --commands --paths \
+  --operator-account "$USER" --external-reader-account none \
+  | grep "executor-credential"
+#   期望：chown cortex-builder:cortex-builder … ＋ chmod 0600 …（帶 `[ ! -e ] ||` 守衛）
+
+# ✅ 驗證（**不變式：能改內容、不能增刪換**）
+sudo -u cortex-builder sh -c \
+  "printf '{}' > /var/lib/cortex-builder/.codex/auth.json" && echo "改內容: OK"
+#   期望：OK（refresh 走得通）——測完記得把真的憑證放回去
+sudo -u cortex-builder sh -c \
+  "touch /var/lib/cortex-builder/.codex/newfile" 2>&1 | tail -1
+#   期望：Permission denied ← **建不了新檔**
+sudo -u cortex-builder sh -c \
+  "rm -f /var/lib/cortex-builder/.codex/auth.json" 2>&1 | tail -1
+#   期望：Permission denied ← **刪不掉**
+sudo -u cortex-builder sh -c \
+  "mv /var/lib/cortex-builder/.codex/auth.json /var/lib/cortex-builder/.codex/hooks.json" \
+  2>&1 | tail -1
+#   期望：Permission denied ← **換不掉同目錄下的 root-owned 檔**
+```
+
+> **job unit 會因為憑證缺席而起不來**：模板 unit 的 `ReadWritePaths` 直接掛在憑證
+> **檔**上（不是它的父目錄），而 systemd 對不存在的 `ReadWritePaths` 目標會讓 unit
+> 起不來。那是刻意的 fail-closed——沒有登入態的 job 本來就做不了事，在 exec 前失敗
+> 比走到呼叫模型那一步才 rc=127 好查得多。journal 若出現
+> `Failed to set up mount namespacing … No such file or directory`，先回頭看這一步。
+
+**回滾**：`sudo rm -rf /opt/cortex/toolchain
+/var/lib/cortex-{builder,reviewer-planner}/.codex/auth.json`。
+
 ---
 
 ## 第 5 步：降權啟用（**A+B 單一路徑**）
@@ -1513,11 +1693,16 @@ PY
 ### 5-5. (d) 打開切換點 `PSC_JOB_RUNNER=systemd-template`
 
 ```bash
+# ✅ 先取 PSC_BUILDER_PATH 的正規值（產生器＝單一真相，**不要手打**）
+python3 -m paulsha_cortex.trust_root unit three-way --job | grep PSC_BUILDER_PATH
+#   期望：PSC_BUILDER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
+
 # 🔧 sudo：把降權模式寫進第 4b 步的 EnvironmentFile
 sudo tee -a /opt/cortex/etc/cortex-manager.env >/dev/null <<'ENVFILE'
 PSC_JOB_RUNNER=systemd-template
 PSC_BUILDER_ACCOUNT=cortex-builder
 PSC_BUILDER_HOME=/var/lib/cortex-builder
+PSC_BUILDER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
 ENVFILE
 sudo systemctl restart cortex-manager.service
 
@@ -1529,9 +1714,25 @@ sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | x
 ```
 
 > `PSC_JOB_RUNNER` 預設 `direct`＝不降權；值非法時**fail-closed**（不會靜默當成
-> `direct`）。`PSC_BUILDER_PATH` 選配——模型 CLI 不在 Manager `PATH` 上時才需要。
-> **builder 帳號必須自己有模型 CLI 的登入態**（`sudo -u cortex-builder claude /login`
-> 之類）；Manager 不會把自己的憑證傳過去，那正是本步驟的重點。
+> `direct`）。
+>
+> **`PSC_BUILDER_PATH` 是必填，不再是選配（#640 改）**：未設時 job 會拿到 Manager
+> 轉發的 `PATH`，而 Manager 以 system unit 跑、拿到的是 systemd 的預設 `PATH`
+> （`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`）——裡面**沒有**
+> `/opt/cortex/toolchain/bin`。toolchain 必須排在最前面：系統層可能另有一份同名但舊
+> 很多的 CLI（本機實測兩份 `codex` 差 100 個以上小版本），排後面的症狀是「跑得起來
+> 但版本不是預期的那個」。
+>
+> **為什麼是 `PSC_BUILDER_PATH` 而不是模板 unit 的 `Environment=PATH=`**：模板 unit
+> 的 `ExecStart` 是 root-owned shim，shim 以 `execvpe(argv[0], argv, spec['env'])`
+> **整份換掉**環境——job 解析命令用的 `PATH` 來自 **spec 的 env**（即 Manager 端這個
+> 變數），不是 unit 的 `Environment=`。寫在 unit 上只會是一個看起來承載作用、實際被
+> shim 丟掉的設定。產生的 job unit 內有一段註解把這個取捨寫在產物本身。
+>
+> **憑證**：見第 4e 步——由 root 複製進 job 帳號 HOME、chown 給該帳號（0600），
+> **不是**讓 builder 自己 `login`（toolchain 未落位前 `login` 這個動作本身就跑不起來，
+> 而且 job 的 HOME 是 root-owned，CLI 也建不了 `auth.json`）。Manager 不會在執行期把
+> 自己的憑證傳過去——job 的登入態是一次性的部署動作。
 > **M2 之前**：`PSC_JOB_RUNNER` 只影響 builder persona；reviewer／planner 仍在 Manager
 > 行程內執行（見開頭「分段落地」）。
 
@@ -2573,6 +2774,16 @@ for U in cortex-manager cortex-reviewer-planner cortex-builder; do id -nG "$U"; 
 
 # ✅ 權限沒有漂移
 sudo find /var/lib/cortex /opt/cortex -perm /022 -print | head
+
+# ✅ executor toolchain 仍可用，且版本沒有跟 operator 側分岔（#640）
+sudo -u cortex-builder env HOME=/var/lib/cortex-builder \
+  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin codex --version
+codex --version
+#   期望：兩行逐字相同。分岔＝某一側被升級了而另一側沒有——那正是裁決 (a) 要防的漂移。
+
+# ✅ 憑證仍是「檔 job-owned／目錄 root-owned」（#640 裁決 (b)）
+stat -c '%n %U:%G %a' /var/lib/cortex-builder/.codex /var/lib/cortex-builder/.codex/auth.json
+#   期望：目錄 root:root 755、檔案 cortex-builder:cortex-builder 600
 
 # ✅ 產生器本身的等式測試（含 ReadWritePaths 無遺漏無多餘）
 python3 -m pytest tests/test_trust_root_permgen_p2a.py tests/test_trust_root_permgen_p2b.py -q

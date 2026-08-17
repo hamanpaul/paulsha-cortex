@@ -384,6 +384,96 @@ def _validate_repo_slug(slug: str) -> None:
         )
 
 
+#: executor 憑證在帳號 HOME 下的相對路徑形狀（#640）。**必須至少含一個 `/`**：
+#: 裁決 (b) 的性質建立在「檔案 job-owned、放它的**目錄** root-owned」上，憑證直接
+#: 落在 HOME 根本身就沒有那一層目錄可保護。段名限縮成無 shell metacharacter，且
+#: 明確擋掉 `..`——這個值會被接成絕對路徑並嵌進 root 執行的 chown／chmod 命令。
+_CREDENTIAL_RELPATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$")
+
+
+def _validate_credential_relpath(relpath: str) -> None:
+    if (
+        not isinstance(relpath, str)
+        or not _CREDENTIAL_RELPATH_RE.match(relpath)
+        or any(seg == ".." for seg in relpath.split("/"))
+    ):
+        raise ValueError(
+            f"不是合法的憑證相對路徑：{relpath!r}。它會被接成 <帳號 HOME>/<relpath> "
+            "並嵌進 root 執行的 chown／chmod 命令，只接受 "
+            "`^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+$` 且不得含 `..`。"
+            "**必須至少含一層目錄**——裁決 (b) 的「目錄 root-owned、檔案 job-owned」"
+            "沒有那一層就不成立。"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 四個模型 executor 的實體形態（#640 實機盤點）
+#
+# 形態不同 ⇒ 搬進部署樹的方式不能一概而論，因此固化成一張表：runbook 的安裝步驟與
+# 測試都由它導出，新增／換掉一個 executor 只改這裡一列。
+# ---------------------------------------------------------------------------
+
+class ExecutorShape(Enum):
+    """executor 在檔案系統上的實體形態。"""
+
+    NODE_SCRIPT = "node-script"    # `#!/usr/bin/env node` ＋ JS 本體（需 node runtime）
+    NATIVE_ELF = "native-elf"      # 自帶原生執行檔（不依賴任何 runtime）
+    SHELL_SCRIPT = "shell-script"  # shell script（可能再叫別的程式，安裝時要查一次）
+
+
+@dataclass(frozen=True)
+class ExecutorTool:
+    """一個模型 CLI 的搬移契約。"""
+
+    name: str
+    shape: ExecutorShape
+    #: 需要**系統層** runtime 才跑得起來（目前只有 node）。
+    needs_node: bool
+    #: 必須連同整包目錄複製（npm 套件樹），而不是單一檔案。
+    copy_tree: bool
+    note: str
+
+
+#: 0817 實機盤點的四個 executor。`needs_node` 為真者只有 `codex`——這正是「系統層
+#: node 的版本風險只涵蓋一個 CLI」這句話的機器可讀形式。
+EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
+    ExecutorTool(
+        "codex", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
+        note=(
+            "唯一硬需要 node 的：本體是 JS，進入點的 shebang 是 `#!/usr/bin/env node`。"
+            "單搬那支 `.js` 會缺 `node_modules`，必須整包搬 npm 套件樹。"
+            "**版本漂移的實例就在它身上**：同一台機器上系統層是 0.42.0、operator 實際"
+            "在用的是 0.147.0，差 100 個以上小版本。"
+        ),
+    ),
+    ExecutorTool(
+        "claude", ExecutorShape.NATIVE_ELF, needs_node=False, copy_tree=False,
+        note="自帶原生執行檔，**不因 node 版本而行為改變**——node 的版本風險不涵蓋它。",
+    ),
+    ExecutorTool(
+        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=False, copy_tree=False,
+        note=(
+            "shell script。腳本內部**可能再叫別的程式**（另一支 CLI、另一個 runtime），"
+            "安裝時務必 `head -n 20` 查一次它實際 exec 什麼，該相依同樣要在 job 的 "
+            "PATH 上或一併搬進 toolchain。"
+        ),
+    ),
+    ExecutorTool(
+        "agy", ExecutorShape.NATIVE_ELF, needs_node=False, copy_tree=False,
+        note="自帶原生執行檔，同 `claude`：不受系統層 node 版本影響。",
+    ),
+)
+
+#: 走**系統層**的通用 runtime（裁決 (a) 的另一半）。node 換版本幾乎不影響模型輸出，
+#: 因此不進部署樹；但它仍是**部署決定**——某個 CLI 哪天提高下限（目前 codex 宣告
+#: `node >=16`，apt 候選 20.x 可用）時要一併升，否則它會變成下一個無聲漂移點。
+TOOLCHAIN_SYSTEM_RUNTIMES: tuple[str, ...] = ("node",)
+
+#: job `PATH` 的系統層尾段（toolchain 之後）。`node`（codex 的 runtime）、`git`、
+#: wrapper 內的 `python3` 都在這裡。刻意不含任何 `sbin`。
+JOB_PATH_SYSTEM_TAIL: tuple[str, ...] = ("/usr/local/bin", "/usr/bin", "/bin")
+
+
 #: 二分（**向後相容選項**，非預設）：builder 一個帳號，其餘 headless／Manager／
 #: monitor 共用 cortex-svc。0816 第三輪裁決前的方案；已按此裝好的部署可續用，
 #: 但新部署一律走 :data:`DEFAULT_SCHEME`（三分）。
@@ -554,10 +644,15 @@ _DIR_ASSET_IDS = frozenset({
     "gate-ledger",                  # <agents_root>/runtime/dispatch/（manager log_dir）
     "review-verdict-spool",         # <coordinator>/review-verdicts/<reviewer_job_id>/
     "commit-spool",                 # <coordinator>/commit-spool/<job-id>/
+    "executor-toolchain",           # <deploy_root>/toolchain/（四個模型 CLI 的落點）
 })
 _FILE_ASSET_IDS = frozenset({
     "control-daemon-lock",
     "control-status",
+    # #640：憑證是**單一檔**（`<HOME>/<relpath>`）。這條明列不是裝飾——file/dir 的
+    # 判定直接決定 permgen 會不會把一整個目錄 chown 給 job 帳號，而該目錄必須維持
+    # root-owned 才有「能改內容、不能增刪換」那條性質。
+    "builder-executor-credential",
 })
 
 
@@ -974,6 +1069,25 @@ def plan_to_commands(
 # 的機器可讀形式——runbook 不再手寫路徑，全部從這裡取。
 # ---------------------------------------------------------------------------
 
+def _dedupe_scaffold(
+    entries: tuple[tuple[str, str, str, int], ...],
+) -> tuple[tuple[str, str, str, int], ...]:
+    """同一個路徑只留第一次出現的那一筆（順序不變）。
+
+    骨架清單是由**多條獨立規則**疊出來的（`~/.codex` 來自 hooks、憑證父目錄來自
+    #640），預設 layout 下兩者指向同一層。去重讓 `install -d` 不會重複輸出，也讓
+    「無多餘」那類等式測試不必為一個純顯示層的重複而放寬。
+    """
+    seen: set[str] = set()
+    kept: list[tuple[str, str, str, int]] = []
+    for entry in entries:
+        if entry[0] in seen:
+            continue
+        seen.add(entry[0])
+        kept.append(entry)
+    return tuple(kept)
+
+
 @dataclass(frozen=True)
 class ExtraWritePath:
     """非登記表資產、但服務身分確實需要寫的路徑（每條必須附理由）。
@@ -1018,8 +1132,18 @@ class PathLayout:
     #: 字元，見 `build_account_gitconfig`），猜不到就只能猜錯。未指定時
     #: `build_account_gitconfig()` fail-closed，比照 #626 的部署決定型 principal。
     source_repo_slugs: tuple[str, ...] = ()
+    #: executor 憑證在帳號 HOME 下的相對路徑（登記表資產 `*-executor-credential`）。
+    #: **部署決定**：預設對齊本部署的 `PSC_MANAGER_EXECUTOR=codex`（`~/.codex/auth.json`，
+    #: 也就是 #640 實測的那一個）。換 executor 時只改這一個值——`asset_paths()`、
+    #: 骨架目錄（那一層 root-owned 的父目錄）與 unit 的 `ReadWritePaths` 全部跟著動。
+    executor_credential_relpath: str = ".codex/auth.json"
     #: per-job 路徑的 segment；system unit 模板用 `%i`（systemd instance 名）。
     job_segment: str = PER_JOB_SEGMENT
+
+    def __post_init__(self) -> None:
+        # 值會被接成絕對路徑並嵌進 root 執行的命令字串，因此在**建構**當下就驗形狀，
+        # 不等到 operator `sudo` 執行（比照 `_validate_account_name`／`_validate_repo_slug`）。
+        _validate_credential_relpath(self.executor_credential_relpath)
 
     # -- 衍生根 -------------------------------------------------------------
     @property
@@ -1123,6 +1247,38 @@ class PathLayout:
         return f"{self.deploy_root}/bin"
 
     @property
+    def toolchain_root(self) -> str:
+        """四個模型 executor 的部署樹落點（登記表資產 `executor-toolchain`，#640）。
+
+        掛在 `deploy_root` 而不是 `agents_root`：它是**隨版本走的部署產物**（哪一版的
+        模型 CLI），不是隨 instance 治理的資料——與 venv／shim 同一棵樹、同一個 owner
+        （root）、同一條升級路徑。
+        """
+        return f"{self.deploy_root}/toolchain"
+
+    @property
+    def toolchain_bin(self) -> str:
+        """job 的 `PATH` 上那一段——四個 executor 的進入點都在這裡。"""
+        return f"{self.toolchain_root}/bin"
+
+    @property
+    def toolchain_lib(self) -> str:
+        """需要整包搬的 CLI（npm 套件樹）的落點；`bin/` 內的進入點指進來。"""
+        return f"{self.toolchain_root}/lib"
+
+    def job_path_value(self) -> str:
+        """job 應該拿到的 `PATH`（＝ Manager 端 `PSC_BUILDER_PATH` 的值，#640）。
+
+        **toolchain 必須排在最前面**：系統層可能另有一份同名但舊很多的 CLI（實機盤點
+        到的兩份 `codex` 差 100 個以上小版本），排在後面就會被系統那份蓋掉，而症狀是
+        「跑得起來、但跑的不是你以為的版本」——比 `command not found` 難查得多。
+
+        尾段給的是系統層：`node`（codex 的 runtime）、`git`、`python3`（wrapper 內的
+        gate ledger writer）都在那裡。刻意**不含** `sbin`——job 不需要任何管理工具。
+        """
+        return ":".join((self.toolchain_bin,) + JOB_PATH_SYSTEM_TAIL)
+
+    @property
     def job_shim(self) -> str:
         """降權 job 模板 unit 的固定 `ExecStart=`（root-owned，內容由 permgen 產）。"""
         return f"{self.bin_root}/cortex-job-shim"
@@ -1161,6 +1317,19 @@ class PathLayout:
     def codex_hooks_dir_of(self, account: str) -> str:
         """該帳號的 `~/.codex`。root-owned——job 不得替換自己的 hooks。"""
         return f"{self.home_of(account)}/.codex"
+
+    def executor_credential_of(self, account: str) -> str:
+        """該帳號的 executor 憑證檔（#640 裁決 (b)）。**檔案由該帳號擁有**（0600）。
+
+        與 `codex_hooks_dir_of()` 刻意落在**同一層**目錄：那一層是 root-owned 的骨架
+        目錄，因此 job 能就地改寫自己這份憑證的內容（refresh），卻建不了新檔、刪不掉、
+        也換不掉同目錄下的 `hooks.json`——「增／刪／換」需要的是**目錄**的寫入權。
+        """
+        return f"{self.home_of(account)}/{self.executor_credential_relpath}"
+
+    def executor_credential_dir_of(self, account: str) -> str:
+        """憑證檔的父目錄。**必須 root-owned**——裁決 (b) 的性質全部落在這一層。"""
+        return _parent_dir(self.executor_credential_of(account))
 
     def gitconfig_of(self, account: str) -> str:
         """該帳號的 `~/.gitconfig`。root-owned——job 不得替換自己的 git 設定（#623）。
@@ -1232,6 +1401,11 @@ class PathLayout:
             "builder-gitconfig": self.gitconfig_of(self.builder_account),
             "reviewer-planner-gitconfig": self.gitconfig_of(self.reviewer_planner_account),
             "manager-gitconfig": self.gitconfig_of(self.manager_account),
+            # #640：四個模型 executor 的部署樹落點 ＋ 兩個 job 帳號各自的憑證。
+            "executor-toolchain": self.toolchain_root,
+            "builder-executor-credential": self.executor_credential_of(
+                self.builder_account
+            ),
             "repo-worktree": job,
             "dispatch-worktree-pool": wt,
             "jobs-registry": f"{c}/jobs.json",
@@ -1285,8 +1459,17 @@ class PathLayout:
                 account_dirs.append(
                     (self.codex_hooks_dir_of(account), root, g(root), 0o755)
                 )
+                # #640 裁決 (b)：憑證**檔**由 job 帳號擁有，放它的**目錄**維持
+                # root-owned——job 因此改得了自己那份憑證的內容，卻建不了新檔、
+                # 刪不掉、也換不掉同目錄下的 root-owned `hooks.json`。預設 relpath
+                # 下這一層就是上面那個 `~/.codex`，去重後不會重複出現；由
+                # `executor_credential_dir_of()` **導出**而非再寫死一次，換 relpath
+                # 時這條保護才會跟著走。
+                account_dirs.append(
+                    (self.executor_credential_dir_of(account), root, g(root), 0o755)
+                )
             account_dirs.append((self.cache_of(account), account, g(account), 0o700))
-        return (
+        return _dedupe_scaffold((
             # 部署樹（enforcement plane）：全 root，對 svc／builder 唯讀。
             (self.deploy_root, root, g(root), 0o755),
             (f"{self.deploy_root}/etc", root, g(root), 0o755),
@@ -1307,7 +1490,7 @@ class PathLayout:
             # 服務／job 帳號 HOME：root 擁有（job 不得替換自己的 ~/.codex），只開
             # cache 子目錄。清單由 scheme 導出，見上方 `account_dirs`。
             *account_dirs,
-        )
+        ))
 
     # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
     def manager_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
@@ -1399,6 +1582,22 @@ def principal_needs_write(
     return False
 
 
+#: 「只改內容、不增刪換」的葉檔資產（#640 裁決 (b)）。
+#:
+#: 一般規則把檔案資產折算成**父目錄**——因為要「建立／取代」一個檔，必須對父目錄可寫。
+#: 這一族刻意**不**具備建立／取代的能力：目錄維持 root-owned（`scaffold_directories`），
+#: job 只是把自己擁有的那一個檔就地改寫（`O_TRUNC` 覆寫，例如 token refresh）。因此
+#: `ReadWritePaths` 只掛在**檔案本身**，父目錄（同時放著 root-owned 的 `codex-hooks`）
+#: 連 mount 層都不開放可寫——「檔案 job-owned、目錄 root-owned」這條性質因此在
+#: **檔案系統**與 **systemd mount** 兩層同時成立，而不是只靠其中一層。
+#:
+#: 代價（裁決刻意接受）：以「暫存檔 ＋ rename 原子替換」形式 refresh 的 CLI 會失敗，
+#: 因為那需要在同目錄建檔。診斷方式見 Phase 2b runbook 第 4e 步。
+IN_PLACE_CONTENT_WRITE_ASSETS: frozenset[str] = frozenset({
+    "builder-executor-credential",
+})
+
+
 def required_write_targets(
     plan: PermissionPlan,
     layout: PathLayout,
@@ -1409,7 +1608,8 @@ def required_write_targets(
 
     ProtectSystem=strict 下整個檔案系統唯讀；要**建立／取代**一個檔，必須對其
     父目錄可寫，故檔案資產一律折算成父目錄。這就是「ReadWritePaths 由登記表機械
-    導出」的全部規則——沒有第二條。
+    導出」的全部規則——唯一的例外是 :data:`IN_PLACE_CONTENT_WRITE_ASSETS`
+    （只改內容、不增刪換的葉檔），它們掛在檔案本身而**不**折算成父目錄。
 
     `principals` 給定時再套一層 persona 過濾（見 `principal_needs_write`）：同一
     帳號上跑多個 persona 時（三分的 `cortex-manager`＝Manager＋monitor），每個
@@ -1427,7 +1627,10 @@ def required_write_targets(
             if asset is None or not principal_needs_write(asset, principals):
                 continue
         path = paths[entry.asset_id]
-        targets[entry.asset_id] = path if entry.is_directory else _parent_dir(path)
+        if entry.is_directory or entry.asset_id in IN_PLACE_CONTENT_WRITE_ASSETS:
+            targets[entry.asset_id] = path
+        else:
+            targets[entry.asset_id] = _parent_dir(path)
     return targets
 
 
@@ -2140,6 +2343,29 @@ def build_job_unit(
         "# 寫進這一格，Manager 再從那個 bundle **檔案** fetch——Manager 全程不碰 job 的樹。",
         "# 權限是 `wx` 無 `r`：寫得進自己那格、讀不到別人的 bundle。producer 只有 builder，",
         "# 因此這條只會出現在 builder 的模板 unit（RWP 由登記表機械導出，不是寫死的）。",
+        "# --- executor toolchain（登記表 executor-toolchain，#640）---",
+        f"#   {job_layout.toolchain_root}：四個模型 CLI 的落點，root-owned 0755——",
+        "# 本 job 帳號**唯讀＋可執行**。ProtectSystem=strict 讓 /opt 唯讀，但唯讀只擋",
+        "# 寫入，讀取與執行完全不受影響；下方 ReadWritePaths 因此機械地不含它",
+        "# （writer 只有部署身分）。",
+        "# **PATH 刻意不寫在這份 unit 上**：模板 unit 的 ExecStart 是 root-owned shim，",
+        "# 而 shim 以 `execvpe(argv[0], argv, spec['env'])` **整份換掉**環境——job 解析",
+        "# 命令用的 PATH 來自 **spec 的 env**，不是本 unit 的 Environment=。在這裡寫一行",
+        "# Environment=PATH= 只會產生一個看起來承載作用、實際被 shim 丟掉的設定。",
+        "# 真正的來源是 Manager 端 root-owned EnvironmentFile 裡的（job 改不了）：",
+        f"#   PSC_BUILDER_PATH={job_layout.job_path_value()}",
+        "# toolchain 排最前面是必要的：系統層可能另有一份同名但舊很多的 CLI（實機盤點",
+        "# 到兩份 codex 差 100 個以上小版本），排後面會被它蓋掉，而症狀是「跑得起來但",
+        "# 版本不是你以為的那個」。",
+        "# --- executor 憑證（登記表 *-executor-credential，#640 裁決 (b)）---",
+        f"#   {job_layout.executor_credential_of(account)}：**檔案**由本 job 帳號擁有",
+        "# （0600，token 過期可自行 refresh），**放它的目錄維持 root-owned**——因此",
+        "# 本帳號建不了新檔、刪不掉、也換不掉同目錄下的 root-owned hooks.json。",
+        "# 下方 ReadWritePaths 只掛**那一個檔**，不是它的父目錄（一般規則會折算成父",
+        "# 目錄，這一族是明示的例外，見 permgen.IN_PLACE_CONTENT_WRITE_ASSETS）。",
+        "# 憑證尚未落位時本 unit 會**起不來**（systemd 對不存在的 ReadWritePaths 目標",
+        "# 報錯）——那是刻意的 fail-closed：沒有登入態的 job 本來就做不了事，在 exec",
+        "# 前失敗比走到呼叫模型那一步才 rc=127 好查得多。",
         "# shim 讀 spec 的唯一合法來源：這一行在 root-owned 的 unit 檔裡，",
         "# 因此持 spawn 授權的帳號也改不掉 spec 要從哪個目錄讀。shim 對未設此",
         "# 變數的情況 fail-closed（不猜、不落回 $HOME 推導的預設）。",
@@ -2433,6 +2659,100 @@ def build_account_gitconfig(
         safe_directories=safe_dirs,
         content="\n".join(body) + "\n",
     )
+
+
+# ---------------------------------------------------------------------------
+# executor toolchain 的落位計畫（#640）
+# ---------------------------------------------------------------------------
+
+def build_toolchain_plan(
+    scheme: UidScheme = DEFAULT_SCHEME,
+    layout: PathLayout = DEFAULT_LAYOUT,
+) -> list[str]:
+    """產生 executor toolchain 的落位步驟（**只回傳字串，絕不執行**）。
+
+    分工：**權限**由登記表經 `plan_to_commands()` 產出（`executor-toolchain` 那一節），
+    本函式產的是**內容落位**——哪一支 CLI 用哪種方式搬進 `<deploy_root>/toolchain`，
+    比照 `build_job_shim()`／`build_account_gitconfig()` 的定位。
+
+    來源路徑刻意留成 shell 變數：那是 operator 機器上的位置（nvm 樹／`~/.local/bin`），
+    產生器猜不到也不該猜。但**來源的判準**是固定的，寫進輸出裡：一律取 operator
+    **實際在用的那一份**（`command -v` 解出來的），不是另外裝一份系統的。
+    """
+    tail = ", ".join(JOB_PATH_SYSTEM_TAIL)
+    lines = [
+        f"# {layout.toolchain_root} —— executor toolchain（登記表資產 executor-toolchain）",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root toolchain {scheme.scheme_id}",
+        "#",
+        "# ===== 裁決 (a)（#640）=====",
+        "# node 走**系統層**（通用 runtime，換版本幾乎不影響產出）；四個模型 CLI 落進",
+        "# 部署樹，因為「job 跑的是哪個版本的模型 CLI」**會**影響產出——那必須是一個",
+        "# 可稽核的部署決定，而不是跟著 operator 自己的環境漂移。",
+        "#",
+        "# ===== 來源一律取 operator 實際在用的那一份 =====",
+        "# **不要** `npm install -g` 另裝一份系統的。實機盤點：同一台機器上系統層的",
+        "# codex 是 0.42.0、operator 實際在用的是 0.147.0（差 100 個以上小版本）——",
+        "# 照「系統層有什麼就用什麼」，job 會跑一份 operator 從未判讀過的版本，而",
+        "# 症狀是「跑得起來但結果對不上」，不是 `command not found`。",
+        "#",
+        "# ===== 系統層 runtime（apt，不進部署樹）=====",
+    ]
+    for runtime in TOOLCHAIN_SYSTEM_RUNTIMES:
+        lines.append(
+            f"#   {runtime}：版本本身仍是**部署決定**——某個 CLI 哪天提高下限時要一併升，"
+            "否則它會變成下一個無聲漂移點。"
+        )
+    lines += [
+        f"#   目前只有 `codex` 需要它；`claude`／`agy` 自帶原生執行檔、`copilot` 是 "
+        "shell script。",
+        "",
+        "# --- 目錄骨架（權限與登記表那一節逐位元相同）---",
+        f"install -d -o {scheme.deploy_account} -g {scheme.group_of(scheme.deploy_account)}"
+        f" -m 0755 {layout.toolchain_root}",
+        f"install -d -o {scheme.deploy_account} -g {scheme.group_of(scheme.deploy_account)}"
+        f" -m 0755 {layout.toolchain_bin}",
+        f"install -d -o {scheme.deploy_account} -g {scheme.group_of(scheme.deploy_account)}"
+        f" -m 0755 {layout.toolchain_lib}",
+    ]
+    for tool in EXECUTOR_TOOLS:
+        lines += [
+            "",
+            f"# --- {tool.name}（{tool.shape.value}"
+            + ("；**需要系統層 node**" if tool.needs_node else "")
+            + f"）---",
+            f"#   {tool.note}",
+            f'#   SRC="$(readlink -f "$(command -v {tool.name})")"   '
+            "# operator 實際在用的那一份",
+        ]
+        if tool.copy_tree:
+            lines += [
+                "#   整包搬（單搬進入點會缺 node_modules）：先找出套件根，再整棵複製——",
+                f'#     PKG="$(cd "$(dirname "$SRC")/.." && pwd)"',
+                f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                f"#     ln -sfn {layout.toolchain_lib}/{tool.name}/<套件內的進入點>"
+                f" {layout.toolchain_bin}/{tool.name}",
+                "#   落定後確認進入點的 shebang 解得開：`head -n 1` 應為 "
+                "`#!/usr/bin/env node`，且 `command -v node` 落在系統層。",
+            ]
+        else:
+            lines += [
+                f'#     cp -a "$SRC" {layout.toolchain_bin}/{tool.name}',
+            ]
+    lines += [
+        "",
+        "# --- 統一收權（root 擁有、全部 job／服務帳號唯讀＋可執行）---",
+        f"chown -R {scheme.deploy_account}:{scheme.group_of(scheme.deploy_account)}"
+        f" {layout.toolchain_root}",
+        f"chmod -R u=rwX,go=rX {layout.toolchain_root}",
+        "",
+        "# ===== job 的 PATH =====",
+        "# toolchain **必須排在最前面**：系統層可能另有一份同名但舊很多的 CLI，排後面",
+        "# 就會被它蓋掉。尾段給的是系統層（" + tail + "）——node／git／python3 在那裡；",
+        "# 刻意不含任何 sbin。值寫進 Manager 端 root-owned 的 EnvironmentFile：",
+        f"#   PSC_BUILDER_PATH={layout.job_path_value()}",
+    ]
+    return lines
 
 
 # ---------------------------------------------------------------------------

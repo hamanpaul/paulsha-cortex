@@ -32,6 +32,11 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # job 帳號 ＋ Manager（Manager 也要
                                                     # 對來源樹跑 git，同樣會撞 dubious
                                                     # ownership）
+    python -m paulsha_cortex.trust_root toolchain [three-way|two-way]
+                                                    # #640：executor toolchain 的落位
+                                                    # 步驟（四個模型 CLI 進
+                                                    # <deploy_root>/toolchain、node 走
+                                                    # 系統層、job 的 PSC_BUILDER_PATH）
     python -m paulsha_cortex.trust_root polkit [three-way|two-way] [--template|--transient]
                                                     # Phase 2b 降權 polkit 規則內容
                                                     # （--template＝方案 B，**預設**；
@@ -43,7 +48,7 @@ UID 方案未指定時一律用 **`three-way`**（operator 0816 第三輪裁決 
 `cortex-manager`／`cortex-reviewer-planner`／`cortex-builder`）。`two-way` 保留為
 向後相容選項，需**顯式**打出——打錯字不會靜默退回較寬鬆的方案。
 
-`permissions`／`unit`／`shim`／`polkit`／`scaffold` 只**產生**計畫與內容字串，
+`permissions`／`unit`／`shim`／`gitconfig`／`toolchain`／`polkit`／`scaffold` 只**產生**計畫與內容字串，
 **絕不執行**任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook
 中手動 sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對
 路徑輸出（0816 裁決：/var/lib/cortex ＋ /opt/cortex），不再帶 placeholder。
@@ -346,6 +351,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 2
         print(blob.content, end="")
+        return 0
+    if command == "toolchain":
+        rest = args[1:]
+        scheme_id = permgen.DEFAULT_SCHEME_ID
+        for token in rest:
+            if token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown toolchain arg: {token}", file=sys.stderr)
+                return 2
+        for line in permgen.build_toolchain_plan(permgen.SCHEMES[scheme_id]):
+            print(line)
         return 0
     if command == "polkit":
         rest = args[1:]

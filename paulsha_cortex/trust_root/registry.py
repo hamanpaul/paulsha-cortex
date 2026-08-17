@@ -332,6 +332,84 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "讓 Manager 能改自己的 git 設定等於把 Tier-0 的執行面交還給它。"
         ),
     ),
+    # ---- executor 執行面：toolchain ＋ per-account 憑證（#640）--------------
+    TrustRootAsset(
+        "executor-toolchain", _T0, _MO, None,
+        (Principal.INSTALLER,),
+        (
+            Principal.MANAGER, Principal.MONITOR,
+            Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER,
+        ),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.toolchain_root",),
+        note=(
+            "`<deploy_root>/toolchain`——四個模型 executor（`codex`／`claude`／"
+            "`copilot`／`agy`）的**部署樹落點**。root-owned 0755：全部 job／服務帳號"
+            "**唯讀＋可執行**，一個 `w` 都沒有（機械結果：writer 只有部署身分 → "
+            "`owner_class=DEPLOYMENT`，與 `runtime-agents-tree`／venv 同一類）。\n"
+            "**為何必須存在（#640 實測）**：Phase 2b 的 job unit 帶 `ProtectHome=yes`，"
+            "而四個 executor 原本全在 operator 的 HOME 底下（nvm 樹與 `~/.local/bin`），"
+            "`/home` 整個不可見——\n"
+            "    $ sudo -u cortex-builder env HOME=<job HOME> codex exec --help\n"
+            "    /usr/bin/env: ‘node’: No such file or directory      rc=127\n"
+            "沒有任何一個 executor 可用，dispatch 會一路走到**呼叫模型**那一步才失敗。\n"
+            "**0817 裁決 (a)**：`node` 走**系統層**（它是通用 runtime，換版本幾乎不影響"
+            "產出），四個模型 CLI 則落進本資產。理由是「job 跑的是哪個版本的模型 CLI」"
+            "**會**影響產出，那必須是一個**可稽核的部署決定**，而不是跟著 operator 自己"
+            "的環境漂移。這不是假設——實機盤點在同一台機器上就有兩份 `codex`（系統層 "
+            "0.42.0 vs operator 實際在用的 0.147.0，差 100 個以上小版本）；照「系統層有"
+            "什麼就用什麼」的做法，job 會跑一份 operator 從未判讀過的版本。因此安裝步驟"
+            "是**從 operator 實際使用的那一份複製進來**，不是另外 `npm install -g` 裝一份。\n"
+            "**node 的版本風險只涵蓋 codex 一個**：`claude` 與 `agy` 自帶原生執行檔、"
+            "`copilot` 是 shell script，只有 `codex` 是 `#!/usr/bin/env node` 的 node "
+            "script。系統層 node 的版本本身仍是**部署決定**（某個 CLI 哪天提高下限時要"
+            "一併升），形態表見 `permgen.EXECUTOR_TOOLS`。\n"
+            "**ProtectSystem=strict 下 `/opt` 唯讀**：讀取與執行完全不受影響，被擋的只有"
+            "寫入——因此本資產機械地不會出現在任何 unit 的 `ReadWritePaths` 上。"
+        ),
+    ),
+    TrustRootAsset(
+        "builder-executor-credential", _T0, _JV, None,
+        (Principal.BUILDER,), (Principal.BUILDER,),
+        IngressKind.DIRECT_FILE_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
+        note=(
+            "builder 帳號 HOME 下那份 executor 憑證（預設 `~/.codex/auth.json`，"
+            "＝本部署 `PSC_MANAGER_EXECUTOR` 的那一個；落點由 "
+            "`PathLayout.executor_credential_relpath` 這個**部署決定**導出）。\n"
+            "**0817 裁決 (b)：檔案由 job 帳號擁有（0600），放它的目錄維持 root-owned**"
+            "（`<HOME>/.codex` 已是既有的 root-owned 骨架目錄，`codex-hooks` 就住在裡面）。"
+            "淨效果——job **能就地改寫自己那份憑證的內容**（token 過期可自行 refresh），"
+            "但在該目錄**建不了新檔、刪不掉、也換不掉同目錄下的其他 root-owned 檔**"
+            "（例如 `codex-hooks`）：建立／unlink／rename 需要的是**目錄**的寫入權，"
+            "而目錄是 `root 0755`，job 落在 `other` 位（`r-x`）。\n"
+            "**已知限制**：因此「以暫存檔 ＋ rename 原子替換」形式做 refresh 的 CLI 會"
+            "失敗（它需要在同目錄建檔）；只有就地 `O_TRUNC` 覆寫的 refresh 走得通。"
+            "這是裁決 (b) 刻意接受的代價，不是漏掉的情況。\n"
+            "**為何 writer 不含部署身分**：root 當然放得進去（安裝時就是 root 放的），"
+            "但 `writers` 描述的是**執行期**的合法 mutator——寫成 INSTALLER 會讓機械分類"
+            "落到 `owner_class=DEPLOYMENT`（owner＝root），憑證就 refresh 不了，與裁決"
+            "相反。\n"
+            "**這買到的是什麼、不是什麼**：把 operator 的憑證複製給 job 帳號，代表 job "
+            "用的是**同一個 provider 帳號**。三分買到的是**檔案系統層**的隔離（job 偷不到"
+            "Manager 的 token、改不了 Manager 的 state），**不是** provider 層的獨立——與 "
+            "`model-identity-overlay` 的 `independence_domain` 想表達的不是同一件事。"
+            "真正的 provider 層獨立需要每個 job 帳號各自的 provider 帳號，屬未來選項"
+            "（spec §R1 有完整說明）。\n"
+            "**為何只登記 builder 這一份**（與 `codex-hooks` 逐條同構，不是遺漏）："
+            "登記表資產是 1:1 綁到一條絕對路徑的，而路徑要由帳號名推導；`cortex-builder` "
+            "是**兩個 scheme 都相同**的唯一 job 帳號，也是目前唯一真的以模板 unit 降權"
+            "起 job 的 persona。reviewer／planner 在二分下與 Manager 併帳"
+            "（`cortex-svc`），登記第二份會讓 Manager unit 的 `ReadWritePaths` 出現一條"
+            "**二分部署裡根本不存在**的 HOME 路徑——systemd 對不存在的 `ReadWritePaths` "
+            "目標直接讓 unit 起不來，等於用一個 M2 才需要的資產弄壞一個現存的部署形態。\n"
+            "**機制本身已經是 per-account 的**：`PathLayout.executor_credential_of()` 吃"
+            "任意帳號，`scaffold_directories()` 也已為**每一個** job 帳號建出 root-owned "
+            "的憑證父目錄（因此 `cortex-reviewer-planner` 那一份憑證照同一條規則落位、"
+            "同樣受保護）。M2（#615）把 reviewer／planner 移上模板 unit 時，登記表補第二"
+            "列即可，產生器一行都不必改。"
+        ),
+    ),
     # ---- job-visible worktree 族 -------------------------------------------
     TrustRootAsset(
         "repo-worktree", _T1, _JV, "paulsha_cortex.config.paths:repo_root",
@@ -618,7 +696,10 @@ MUTATION_INGRESS: tuple[MutationIngress, ...] = (
                     "#623 起另含**三份**帳號 HOME 下的 root-owned `.gitconfig`"
                     "（builder／reviewer-planner／manager）——同一條性質：writer 只有部署"
                     "身分，服務帳號對這些檔一律唯讀。來源樹本身**不在**此類（0817 裁決把"
-                    "它的 writer 改為 Manager，見 `repo-source-tree`）。"),
+                    "它的 writer 改為 Manager，見 `repo-source-tree`）；#640 起另含 "
+                    "`executor-toolchain`（四個模型 CLI 的部署樹落點，root-owned、"
+                    "全部 job／服務帳號唯讀＋可執行）。executor **憑證**同樣不在此類——"
+                    "檔案由 job 帳號擁有才 refresh 得了，見 `builder-executor-credential`。"),
     MutationIngress("interprocess", IngressKind.INTERPROCESS, False, True,
                     "inherited FD／ptrace／/proc/<pid>/mem／signal。"),
 )

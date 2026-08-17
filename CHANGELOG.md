@@ -8,6 +8,38 @@
 ## [Unreleased]
 
 ### Added
+- **#640 / trust-root Phase 2b：真實 dispatch 的最後一哩——executor toolchain 與
+  per-account 憑證進登記表**——#623 那一族的第五個缺口，且比前四個都靠後：前四個解完
+  之後，dispatch 會一路走到**呼叫模型**那一步才失敗。job unit 帶 `ProtectHome=yes`，
+  而四個 executor 原本全在 operator 的 HOME 底下，實測
+  `sudo -u cortex-builder env HOME=<job HOME> codex exec --help` →
+  `/usr/bin/env: ‘node’: No such file or directory`（rc=127）；登記表對 toolchain 與
+  job 帳號憑證**都沒有預留資產**，permgen 因此也不會產生它們的權限。0817 裁決落地為
+  兩個新資產：
+  - `executor-toolchain`（`<deploy_root>/toolchain`，root-owned 0755，全部 job／服務
+    帳號**唯讀＋可執行**）：`node` 走**系統層**（通用 runtime）；四個模型 CLI 落進
+    部署樹，因為「job 跑的是哪個版本的模型 CLI」**會**影響產出——那必須是可稽核的部署
+    決定，而不是跟著 operator 的環境漂移。實機盤點在同一台機器上就有兩份 `codex`
+    （系統層 0.42.0 vs operator 實際在用的 0.147.0），因此安裝來源一律取 operator
+    實際在用的那一份，不另外 `npm install -g`。四者形態不同（`codex` 是 node script、
+    **唯一硬需要 node** 且要整包搬 npm 套件樹；`claude`／`agy` 自帶原生執行檔；
+    `copilot` 是 shell script），固化為 `permgen.EXECUTOR_TOOLS`——**系統層 node 的版本
+    風險因此只涵蓋 `codex` 一個**。`ProtectSystem=strict` 下 `/opt` 唯讀只擋寫入不擋
+    執行，故本資產機械地不出現在任何 unit 的 `ReadWritePaths` 上。
+  - `builder-executor-credential`（預設 `<job HOME>/.codex/auth.json`）：**檔案由 job
+    帳號擁有**（0600，能自行 refresh 過期 token），**放它的目錄維持 root-owned**
+    （0755）——job 因此改得了自己那份憑證的內容，卻**建不了新檔、刪不掉、也換不掉**
+    同目錄下的 root-owned `codex-hooks`（增／刪／換要的是目錄的寫入權）。
+    `ReadWritePaths` 只掛憑證**檔本身**而非父目錄（新的
+    `permgen.IN_PLACE_CONTENT_WRITE_ASSETS` 例外），使「目錄 root-owned」在檔案系統與
+    systemd mount 兩層同時成立。已知限制（裁決刻意接受）：以「暫存檔 ＋ rename」
+    refresh 的 CLI 會失敗。落點由新的部署決定欄位
+    `PathLayout.executor_credential_relpath` 導出，骨架的 root-owned 保護跟著它走；
+    `scaffold_directories()` 已為每一個 job 帳號建出該父目錄，登記表只掛
+    `cortex-builder` 一份（與 `codex-hooks` 逐條同構）。
+- **`trust_root toolchain` CLI verb ＋ `permgen.build_toolchain_plan()`**：toolchain 的
+  落位步驟由產生器出（逐支 CLI 的形態／搬移方式／來源判準／統一收權／
+  `PSC_BUILDER_PATH` 正規值），runbook 不手寫；與 `shim`／`gitconfig` 同一個定位。
 - **#623 / trust-root Phase 2b：per-job clone 的信任根層——`repo-source-tree`、三份
   root-owned `.gitconfig` 與 `commit-spool` 進登記表，內容由 permgen 產生**——M1 之後
   實機發現「這個部署做不了真實工作」：`ProtectHome=yes` 讓 `/home` 完全不可見，而登記表
@@ -284,6 +316,28 @@
   `mock.patch.object` 打不到，測試實際驗到的是「本機有沒有那個帳號」而非它宣稱的分支。
 
 ### Changed
+- **#640 / job 的 `PATH` 沿用既有的 `PSC_BUILDER_PATH`，並由「選配」改為「必填」**
+  ——`PathLayout.job_path_value()` 給出正規值（`<toolchain>/bin` **排最前面**，尾段是
+  系統層，不含任何 `sbin`）。**刻意不在模板 unit 裡寫 `Environment=PATH=`**：模板
+  unit 的 `ExecStart` 是 root-owned shim，shim 以 `execvpe(argv[0], argv, spec['env'])`
+  整份換掉環境，job 解析命令用的 `PATH` 來自 **spec 的 env**——寫在 unit 上只會是一個
+  看起來承載作用、實際被 shim 丟掉的設定。toolchain 排最前面是必要的：否則系統層那份
+  舊版會蓋掉它，症狀是「跑得起來但版本不是預期的那個」。取捨連同理由寫進產生出來的
+  job unit 註解裡。
+- **#640 / spec §R1 明載一個誠實限制**：把 operator 的憑證複製給 job 帳號，代表 job
+  用的是**同一個 provider 帳號**。三分買到的是**檔案系統層**的隔離（job 偷不到
+  Manager 的 token、改不了 Manager 的 state、讀不到另一個 job 帳號的憑證），**不是**
+  provider 層的獨立——與 `independence_domain`（§R5／§R8 的 anti-collusion 控制）不是
+  同一件事，兩者不得互相當作證據。真正的 provider 層獨立需要每個 job 帳號各自的
+  provider 帳號，屬未來選項。
+- **#640 / Phase 2b runbook 新增第 4e 步**「executor toolchain 落位 ＋ per-account
+  憑證」（4 個 sudo 點、9 個驗證點）：系統層 node（版本本身是部署決定）、逐支 CLI 的
+  搬移方式、**以 job 帳號實跑一次 `--help` 期望 rc=0**、**版本與 operator 側逐字相同**
+  （只驗 rc=0 不夠——系統層那份舊的一樣 rc=0）、在真實加固面下以 `systemd-run` 複跑
+  （`MemoryDenyWriteExecute=yes` 對 node 的 V8 是第一嫌疑），以及憑證「能改內容／
+  建不了新檔／刪不掉／換不掉鄰居」的反向不變式。5-5 的 `PSC_BUILDER_PATH` 與
+  「builder 自己 `login`」兩段一併改寫，附錄 A 補兩條漂移自我檢查 → 合計 **49** 個
+  sudo 點、**174** 個驗證點。
 - **#623 / trust-root Phase 2b：成果回收由「Manager 伸手進 builder 的 clone fetch」
   改為 git bundle ＋ append-only spool**——#634 的回收做法
   `git -C <來源樹> fetch <builder 的 clone>` 在三分下**行不通**（operator 0817 實機
