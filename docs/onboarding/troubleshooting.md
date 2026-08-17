@@ -34,8 +34,8 @@
 | --- | --- | --- |
 | 未設定 `PSC_PREFLIGHT_CMD` | `required` | 設定環境變數為 typed argv，確認 delivery preflight 可直接執行 |
 | 命令格式不符 | `malformed` | 使用 argv 參數而非 shell 指令字串 |
-| 使用 shell wrapper | `shell-wrapper-not-allowed` | 改用直接 module/executable，例如 `python3 -m project_preflight` |
-| executable 不可用 | `executable-unavailable` | 安裝/調整 PATH，或改用可執行的絕對/相對命令，避免 shell 包裹 |
+| 使用 shell wrapper | `shell-wrapper-not-allowed` | 改用直接 module/executable，例如 `python3 -m paulsha_cortex.preflight_ci`（僅在 argv 第一段真的是 `bash`／`sh` 且帶 `-c` 時才會命中這一類） |
+| executable 不可用 | `executable-unavailable` | 安裝/調整 PATH，或改用可執行的絕對/相對命令，避免 shell 包裹。**服務化部署**（`ProtectHome=yes`）下 `$HOME` 底下的路徑一律不可達，值請指向部署樹內的絕對路徑，例如 `/opt/cortex/venv/bin/python3 -m paulsha_cortex.preflight_ci` |
 
 ## manager degraded
 

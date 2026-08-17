@@ -901,7 +901,13 @@ sudo -u cortex-reviewer-planner ls /var/lib/cortex/coordinator/job-specs/gate 2>
 ```bash
 # 🔧 sudo：把受治理的 repo 放進來源樹，並交給 Manager 擁有
 SLUG=paulsha-cortex          # 目錄名；下面每個命令都用它
+UPSTREAM=https://github.com/<owner>/"$SLUG"   # ← 真正的上游，不是本機路徑
 sudo git clone <來源 remote 或 operator 的 checkout> /var/lib/cortex/repos/"$SLUG"
+
+# 🔧 sudo：**把 origin 指回真正的上游**（#661；從 operator 的 checkout clone 時必做）
+sudo git -C /var/lib/cortex/repos/"$SLUG" remote set-url origin "$UPSTREAM"
+sudo git -C /var/lib/cortex/repos/"$SLUG" fetch --prune origin
+
 sudo chown -R cortex-manager:cortex-manager /var/lib/cortex/repos/"$SLUG"
 # 兩個 job 帳號要讀得到整棵樹（容器的 default ACL 只涵蓋**之後**新建的物件，
 # 這一步是把 clone 當下已存在的那幾萬個檔一次補齊）。
@@ -910,6 +916,22 @@ sudo setfacl -R -m u:cortex-builder:rX,u:cortex-reviewer-planner:rX \
 sudo setfacl -R -d -m u:cortex-builder:rX,u:cortex-reviewer-planner:rX \
   /var/lib/cortex/repos/"$SLUG"
 ```
+
+> **⚠️ 為什麼一定要 `remote set-url origin`（#661 實機踩到，兩個獨立後果）**：
+> 從 operator 的 checkout clone 時，git 會把 `origin` 設成**那條本機路徑**。
+>
+> 1. **doctor 立刻紅**：`PSC_REPO_IDENTITY` 宣告的是 `git:github.com/<owner>/<repo>`，
+>    而 `repo-identity` probe 是拿 `PSC_REPO_ROOT` 解出來的**現況** identity 去比對，
+>    本機路徑解不出那個值 ⇒ `PSC_REPO_ROOT identity drift`（required fail）。
+> 2. **更要緊的是 ship 段會推錯地方**：#656 的 ship 走 `push origin`——`origin` 指向
+>    operator 的 checkout 時，Manager 會把交付推進**本機那棵樹**，而不是 GitHub。
+>    那不會報錯，只會安靜地什麼都沒送上去。
+>
+> 先 `set-url` 再 `fetch`，再 `chown`：順序不可調換（chown 之後 root 對 `.git` 的寫入
+> 會踩到 dubious ownership，而此時 Manager 的 `.gitconfig` 還沒落位）。
+>
+> ✅ 驗證：`sudo git -C /var/lib/cortex/repos/"$SLUG" remote get-url origin`
+> 期望印出 `$UPSTREAM`，**不得**是任何 `/home/...` 或本機路徑。
 
 > **為什麼 `cortex-manager` 擁有而不是 root 擁有**（0817 裁決，推翻本 runbook 前一版）：
 > `git fetch` 必須把 `FETCH_HEAD` 寫進**目標 repo**，而成果回收正是「fetch 進來源樹」；
@@ -1319,6 +1341,45 @@ sudo find /opt/cortex/venv -name "sitecustomize.py" -o -name "*.pth" | xargs -r 
 > spec §R3：executable／deps／launcher／venv 對 headless **不可寫**、owner=root。
 > 這封掉背景 §5 的「改寫 verifier／注入 `sitecustomize.py`／`.pth`」攻擊面。
 
+**delivery preflight 的 backend 也裝進這個 venv（#661）**。它不是可執行檔而是一個
+python 套件，因此落點不是 toolchain 而是這棵已經 root-owned 的樹——`PSC_PREFLIGHT_CMD`
+指向的 `paulsha_cortex.preflight_ci` 只是個 typed-argv 轉接器，真正跑 CI-parity 檢查的
+是治理引擎自己的 `policy_check.preflight`。
+
+```bash
+# 🔧 sudo：在**硬化之前**（chmod a-w 之前）裝進 venv.new；版本必須逐字等於
+#         .project-policy.yml 的 policy_version
+POLICY_VERSION="$(grep -oE '^policy_version:[[:space:]]*[0-9.]+' \
+  /var/lib/cortex/repos/paulsha-cortex/.project-policy.yml | grep -oE '[0-9.]+$')"
+sudo /opt/cortex/venv.new/bin/pip install --no-input \
+  "git+https://github.com/hamanpaul/paulsha-conventions@v${POLICY_VERSION}#egg=policy-check"
+#   ⚠️ 唯一相依是 PyYAML（venv 裡已經有），不會拉進其他東西。
+#   ⚠️ 已經硬化過（a-w）才想補裝時：pip 會 Permission denied——回到 4a 開頭重做整棵，
+#      不要 `chmod +w` 之後補裝（那會在部署樹留下一個可寫窗口）。
+```
+
+```bash
+# ✅ 驗證：版本逐字相符（引擎自己也會驗，對不上就 fail-closed）
+/opt/cortex/venv/bin/python3 -c \
+  "from importlib.metadata import version; print(version('policy-check'))"
+#   期望：與 .project-policy.yml 的 policy_version 逐字相同。
+#   這與 R-23（workflow pin ⟷ policy_version）是同一個部署決定的兩半：兩條都成立時，
+#   本機 preflight 跑的引擎版本 == CI 跑的引擎版本。
+
+# ✅ 驗證：轉接器與 backend 都 import 得到、且 doctor 收得下這個值
+sudo -u cortex-manager /opt/cortex/venv/bin/python3 -c \
+  "import paulsha_cortex.preflight_ci, policy_check.preflight; print('ok')"
+#   期望：ok
+
+# ✅ 驗證：doctor 的 preflight probe 由紅轉綠
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/cortex inspect doctor --json' | \
+  python3 -c "import json,sys;[print(p['name'],p['status'],p['detail']) for p in json.load(sys.stdin)['probes'] if p['name']=='preflight']"
+#   期望：preflight pass。
+#   ⛔ `executable-unavailable` ⇒ EnvironmentFile 的路徑打錯或 venv 尚未切成 active。
+```
+
 ### 4b. bootstrap env 遷入部署樹（root 擁有、fail-closed）
 
 env 檔放在 **`/opt/cortex/etc/`**（全 root-owned 樹）而**不是** `/var/lib/cortex` 底下：
@@ -1330,12 +1391,10 @@ root-owned 檔案**——把 env 檔放進去等於沒保護。
 sudo tee /opt/cortex/etc/cortex-manager.env >/dev/null <<'ENVFILE'
 PSC_INSTANCE="cortex"
 PSC_AGENTS_ROOT="/var/lib/cortex"
-PSC_CONTROL_ROOT="/var/lib/cortex/control"
-PSC_COORDINATOR_ROOT="/var/lib/cortex/coordinator"
-PSC_SPECS_ROOT="/var/lib/cortex/specs"
-PSC_MONITOR_STATE_ROOT="/var/lib/cortex/monitor"
+# ⚠️ 五個 root **刻意不列**（#661）：PSC_CONTROL_ROOT／PSC_COORDINATOR_ROOT／
+#    PSC_SPECS_ROOT／PSC_MONITOR_STATE_ROOT／PSC_RUN_ROOT 由 PSC_AGENTS_ROOT 導出。
+#    顯式列出反而製造漂移——理由見本段下方的說明方塊。
 PSC_PROJECT_CONFIG_ROOT="/var/lib/cortex/config/paulsha"
-PSC_RUN_ROOT="/var/lib/cortex/run/cortex"
 PSC_WORKTREE_ROOT="/var/lib/cortex/worktree"
 PSC_DEGRADED_OPERATION="per-case-approval"
 # --- 操作變數（#623 缺口 2／#633）：少了這一段，服務起得來但**做不了事** ---
@@ -1348,12 +1407,38 @@ PSC_MANAGER_GITHUB_INTERVAL_MS="600000"
 # gate 命令是**命令列**，天生含空格 ⇒ 這一族就是「值含空格」的常態，不是邊角案例。
 PSC_GATE_CMD_PYTEST="python3 -m pytest -q"
 PSC_GATE_TIMEOUT="900"
+# delivery preflight（#661）。值由產生器出，不要手打：
+#   python3 -m paulsha_cortex.trust_root toolchain four-way | grep PSC_PREFLIGHT_CMD
+PSC_PREFLIGHT_CMD="/opt/cortex/venv/bin/python3 -m paulsha_cortex.preflight_ci"
 ENVFILE
 sudo chown root:root /opt/cortex/etc/cortex-manager.env
 sudo chmod 0644 /opt/cortex/etc/cortex-manager.env
 ```
 
-> **⚠️ 值一律加引號，而 `PSC_PREFLIGHT_CMD` 刻意留白**（#633）。
+> **⚠️ 只設 `PSC_AGENTS_ROOT`，其餘 root 一律讓它 derive**（#661 實機踩到）。
+>
+> 本模板前一版顯式設了 `PSC_CONTROL_ROOT`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT`／
+> `PSC_MONITOR_STATE_ROOT`／`PSC_RUN_ROOT`。它看起來只是「把導出值寫明」，實際上是
+> **在製造漂移**：doctor 的 `managed-path-drift` probe 比對的是 installer 的 managed_env
+> 推導公式（`deploy/installer.py`），而 `PSC_CONTROL_ROOT` 在那條公式裡是
+> **instance-scoped** 的 `control/<instance>`——模板寫的 `control` 與它不相等：
+>
+> ```
+> FAIL managed-path-drift: managed path drift detected
+>      PSC_CONTROL_ROOT: effective=/var/lib/cortex/control derived=/var/lib/cortex/control/cortex
+> ```
+>
+> 拿掉之後 `config/runtime.py` 的 `resolve_runtime_root()` 會由 `PSC_AGENTS_ROOT` 導出
+> `<agents_root>/control`，**逐字等於 `permgen.PathLayout.control_root`**——也就是登記表
+> 與 unit `ReadWritePaths` 實際保護的那條路徑。換句話說：不列出來不只是「drift 消失」，
+> 是解析結果與保護面對齊；列出來反而讓兩者分岔。
+>
+> 保留 `PSC_PROJECT_CONFIG_ROOT`（它的顯式值與兩邊的推導都相同，且 probe 對「鍵缺席」
+> 只給 warn）與 `PSC_WORKTREE_ROOT`（不在 `RUNTIME_ROOT_DEFAULTS` 裡，沒有導出值）。
+>
+> ✅ 驗證：`cortex inspect doctor --json` 的 `managed-path-drift` 不得為 `fail`。
+
+> **⚠️ 值一律加引號，`PSC_PREFLIGHT_CMD` 自 #661 起有值**（#633／#661）。
 >
 > **加引號**：systemd 的 `EnvironmentFile` 把 `=` 之後整段當值，加不加引號它都對
 > （加了會剝掉）。加引號是為了**讀這個檔的另外兩種方式**——`sh` 的 `.`（source）
@@ -1361,9 +1446,12 @@ sudo chmod 0644 /opt/cortex/etc/cortex-manager.env
 > `. <envfile>` 會把 `-m` 當成命令執行（`sh: -m: not found`）。一份三邊都讀得對的
 > 檔案比「只有 systemd 讀得對」便宜太多，所以整份統一加。
 >
-> **`PSC_PREFLIGHT_CMD` 未列**：舊值 `~/.local/bin/cortex-preflight-ci` 在
-> `ProtectHome=yes` 下不可達，搬到哪裡是 #623 的部署樹問題，未決之前刻意留白而不是
-> 填一個跑不起來的值。
+> **`PSC_PREFLIGHT_CMD` 的落定（#661，取代 #633 當時的「刻意留白」）**：舊值
+> `~/.local/bin/cortex-preflight-ci` 是 shell wrapper，它指向的 backend
+> （另一個 repo 的 `preflight.sh`）也在 `/home` 底下——`ProtectHome=yes` 之後**兩層
+> 都不可達**（doctor 報的是 `executable-unavailable`）。新值是 typed argv、絕對路徑、
+> 落在既有的 root-owned 部署 venv 裡，因此天生在保護面內。**它需要第 4a 步一併把
+> backend 裝進同一個 venv**（見 4a 末段），否則 doctor 會過、ship 當下才失敗。
 >
 > **`PSC_REPO_ROOT` 未宣告時的行為（#633）**：Manager **起得來**——`ScriptWorktreeCreator`
 > 的 repo 解析自 #633 起是 lazy 的，因此缺這個變數只讓「派不了工」，不再讓 daemon
@@ -1601,7 +1689,7 @@ sudo rm /etc/systemd/system/cortex-monitor.service; sudo systemctl daemon-reload
 **注意**：回滾後 monitor 會重新寫舊的 `~/.agents/monitor` 樹，與 system-level Manager
 的 `/var/lib/cortex/monitor` 形成雙寫——僅可作為短時間的救急手段。
 
-### 4e. executor toolchain 落位 ＋ per-account 憑證（#640）
+### 4e. toolchain 落位 ＋ per-account 憑證（#640；#661 擴到非 executor）
 
 **沒有這一步，前面全部做完 dispatch 仍會在「呼叫模型」那一步失敗。** job unit 帶
 `ProtectHome=yes`，而四個 executor 原本全在 operator 的 HOME 底下：
@@ -1622,14 +1710,52 @@ job／服務帳號唯讀＋可執行）。理由是「job 跑的是哪個版本�
 > 所以來源一律取 operator 實際在用的那一份（`command -v` 解出來的），**不要**另外
 > `npm install -g` 裝一份。
 
-**四個 CLI 的實體形態不同，搬移方式不能一概而論**（表在 `permgen.EXECUTOR_TOOLS`）：
+> **⚠️ #661：這一步要搬的**不只**四個 executor。** #640 的盤點只涵蓋 dispatch 直接
+> 執行的四支模型 CLI，而實機 doctor 在四分部署完成後仍紅在
+> `review-sandbox`——原因是 `srt`（Claude sandbox runtime）同樣住在 operator 的 nvm 樹
+> 底下、同樣被 `ProtectHome=yes` 擋掉。`openspec`（ship 段的 archive／validate）是同一族
+> 的第三個。判準不是「是不是 executor」，而是「**這支程式的版本會不會影響治理產出**」。
+> 完整名冊在 `permgen.EXECUTOR_TOOLS` ＋ `permgen.SERVICE_TOOLS`，系統層那一半在
+> `permgen.SYSTEM_PROGRAMS`；三張表都由 `trust_root toolchain` 印出來。
 
-| executor | 形態 | 需要 node | 加固剖面（#643） | 搬移方式 |
-|---|---|:--:|---|---|
-| `codex` | Node.js script（`.js` ＋ `#!/usr/bin/env node`） | ✅ | `jit` | **整包** npm 套件樹，`bin/` 放進入點 symlink |
-| `claude` | 原生 ELF 執行檔 | — | `strict` | 單檔複製 |
-| `copilot` | bash script → **內部 exec node** | ✅ | `jit` | 單檔複製；**先 `head -n 20` 查它內部再叫什麼** |
-| `agy` | 原生 ELF 執行檔 | — | `strict` | 單檔複製 |
+**各支的實體形態不同，搬移方式不能一概而論**（表在 `permgen.EXECUTOR_TOOLS` ／
+`permgen.SERVICE_TOOLS`）：
+
+| 程式 | 名冊 | 形態 | 需要 node | 執行面／加固剖面 | 搬移方式 |
+|---|---|---|:--:|---|---|
+| `codex` | executor | Node.js script（`.js` ＋ `#!/usr/bin/env node`） | ✅ | `jit` | **整包** npm 套件樹，`bin/` 放進入點 symlink |
+| `claude` | executor | 原生 ELF 執行檔 | — | `strict` | 單檔複製 |
+| `copilot` | executor | bash script → **內部 exec node** | ✅ | `jit` | 單檔複製；**先 `head -n 20` 查它內部再叫什麼** |
+| `agy` | executor | 原生 ELF 執行檔 | — | `strict` | 單檔複製 |
+| `srt` | 非 executor | Node.js script（ESM） | ✅ | 由 `claude` exec ⇒ `strict` ⚠️ | **整包** npm 套件樹，`bin/srt` 必須是 symlink |
+| `openspec` | 非 executor | Node.js script | ✅ | 由 Manager 的 system unit exec ⚠️ | **整包** npm 套件樹，`bin/openspec` 必須是 symlink |
+
+> **`srt` 為什麼一定要整包搬、而且 `bin/` 那一支必須是 symlink**（#661 實機量到的
+> 兩個後果，第二個是**無聲**的）：
+>
+> 1. `dist/cli.js` 是 ESM，第一行就 `import { quote } from './utils/shell-quote.js'`。
+>    單檔複製到 `<toolchain>/bin/srt` 之後相對 import 解到 `<toolchain>/bin/utils/…`：
+>
+>    ```
+>    Error [ERR_MODULE_NOT_FOUND]: Cannot find module
+>      '/opt/cortex/toolchain/bin/utils/shell-quote.js'     rc=1
+>    ```
+>
+>    而 doctor 的 `review-sandbox` probe 會實跑 `srt --version`，rc≠0 就報
+>    `Claude sandbox dependency execution failed`——**症狀離原因很遠**：兩支相依都
+>    `command -v` 得到，看起來「都找得到了」。
+> 2. `coordinator/launcher.py` 的 `_srt_runtime_root()` 是從 `which("srt")` 往上找
+>    `package.json` 且 `name == "@anthropic-ai/sandbox-runtime"` 來解出套件根，再把它
+>    加進 reviewer sandbox 政策的 `allowRead`。單檔形態下它解出 `None`——沙箱政策少一
+>    條放行，**而且不報錯**。symlink 形態下 `readlink -f` 落在套件樹內，才解得到。
+
+> ⚠️ **`srt` 與 `openspec` 的加固面是一個已知的未決點（#661 盤點結果）**：兩者都是
+> node（V8 的 JIT 需要 W→X），但執行它們的 unit 目前都是 `MemoryDenyWriteExecute=yes`
+> ——`srt` 由 `claude`（`strict` 剖面）exec、`openspec` 由 Manager 的 system unit exec。
+> #643 的剖面推導看不到這一格：它的唯一輸入是 **executor 名**，涵蓋不了「executor
+> 在執行途中再 exec 出來的 node 程式」。下方有專門的量測步驟；**量到才改，不得就地
+> 放寬**——回報 issue 由 operator 裁決（#643 的先例）。可列舉的形式：
+> `python3 -c "from paulsha_cortex.trust_root import permgen; print(permgen.unresolved_node_execution_surfaces())"`
 
 > `claude`／`agy` 自帶原生執行檔，**不會因為 node 版本而行為改變**——因此系統層 node
 > 的版本風險只涵蓋 `codex`／`copilot` 兩個。
@@ -1651,14 +1777,26 @@ node --version
 #   ⚠️ node 版本是**部署決定**：某個 CLI 哪天提高下限時要一併升，
 #      否則它會變成下一個無聲漂移點。
 
-# 🔧 sudo：建骨架並把四個 CLI 從 operator 實際在用的那一份複製進來
-#   （逐支的來源與方式照 `trust_root toolchain` 的輸出；以下為 codex 的形狀）
+# 🔧 sudo：系統層那一半（#661 補完盤點：不只 node）
+sudo apt-get install -y bubblewrap socat git
+#   bwrap／socat 是 `srt` 在 Linux 上的相依（doctor 的 review-sandbox probe 會逐一
+#   實跑 `bwrap --version`／`socat -V`）；gh 若尚未安裝，依 GitHub CLI 的 apt repo 裝。
+for p in node git gh bwrap socat; do printf '%-8s %s\n' "$p" "$(command -v "$p" || echo MISSING)"; done
+#   期望：五支都解得到，且**都不在 /home 底下**（在 /home ⇒ ProtectHome 之後不可達）。
+
+# 🔧 sudo：建骨架並把整包搬的那幾支從 operator 實際在用的那一份複製進來
+#   （逐支的來源與方式照 `trust_root toolchain` 的輸出）
 sudo install -d -o root -g root -m 0755 /opt/cortex/toolchain{,/bin,/lib}
-SRC="$(readlink -f "$(command -v codex)")"
-PKG="$(cd "$(dirname "$SRC")/.." && pwd)"     # npm 套件根（單搬 .js 會缺 node_modules）
-sudo cp -a "$PKG" /opt/cortex/toolchain/lib/codex
-sudo ln -sfn "/opt/cortex/toolchain/lib/codex/$(basename "$SRC")" \
-  /opt/cortex/toolchain/bin/codex
+for pkgcli in codex srt openspec; do
+  SRC="$(readlink -f "$(command -v "$pkgcli")")"
+  PKG="$(cd "$(dirname "$SRC")/.." && pwd)"   # npm 套件根（單搬進入點會缺 node_modules）
+  # ⚠️ 進入點若在 `dist/` 或 `bin/` 底下，套件根是**再上一層**：以「哪一層有
+  #    package.json」為準，不要照抄 `..`。
+  while [ ! -f "$PKG/package.json" ] && [ "$PKG" != / ]; do PKG="$(dirname "$PKG")"; done
+  sudo cp -a "$PKG" "/opt/cortex/toolchain/lib/$pkgcli"
+  REL="${SRC#"$PKG"/}"                        # 進入點在套件內的相對路徑
+  sudo ln -sfn "/opt/cortex/toolchain/lib/$pkgcli/$REL" "/opt/cortex/toolchain/bin/$pkgcli"
+done
 for cli in claude copilot agy; do
   sudo cp -a "$(readlink -f "$(command -v "$cli")")" "/opt/cortex/toolchain/bin/$cli"
 done
@@ -1666,6 +1804,29 @@ done
 # 🔧 sudo：統一收權（root 擁有、全部 job／服務帳號唯讀＋可執行）
 sudo chown -R root:root /opt/cortex/toolchain
 sudo chmod -R u=rwX,go=rX /opt/cortex/toolchain
+```
+
+```bash
+# ✅ 驗證（#661 的核心驗收）：整包搬的三支，`bin/` 那一支必須是 symlink 且指進 lib/
+ls -l /opt/cortex/toolchain/bin/{codex,srt,openspec}
+#   期望：三行都是 `->` 指向 /opt/cortex/toolchain/lib/<name>/… 的 symlink。
+#   ⛔ 若是 regular file（-rwxr-xr-x），就是單檔複製——**回上面重做**。
+#      單檔形態下 `srt --version` 會 ERR_MODULE_NOT_FOUND，而 `_srt_runtime_root()`
+#      會安靜地解出 None（沙箱政策少一條 allowRead 且不報錯）。
+
+# ✅ 驗證：srt 的套件根解得到（這條就是 `_srt_runtime_root()` 走的那條路）
+PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  /opt/cortex/venv/bin/python3 -c \
+  "from paulsha_cortex.coordinator.launcher import _srt_runtime_root; print(_srt_runtime_root())"
+#   期望：/opt/cortex/toolchain/lib/srt（**不得是 None**）
+
+# ✅ 驗證：doctor 的 review-sandbox 相依逐條實跑（與 probe 同一組命令）
+for c in "bwrap --version" "socat -V" "srt --version" "claude --version"; do
+  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin sh -c "$c" >/dev/null 2>&1
+  echo "$c rc=$?"
+done
+#   期望：四行皆 rc=0。`srt --version` rc≠0 ⇒ doctor 會報
+#   `Claude sandbox dependency execution failed`（#661 的原症狀）。
 ```
 
 ```bash
@@ -1716,6 +1877,42 @@ sudo systemd-run --pipe --wait --collect \
 #   ⚠️ `claude`／`agy` 在**兩種**下都應該 rc=0；若它們在完整加固面下也失敗，代表
 #      這台機器上還有第三個阻斷點——**停下來查清楚**，不要順手再放寬一項。
 #   完整的雙剖面驗證（含負向對照）在第 5-2b 步；這裡只是提早看見那條分岔。
+```
+
+```bash
+# ✅ 量測（#661 的未決點，**只量不改**）：非 executor 的 node 程式跑在誰的加固面上
+#    先列出待量的組合（由登記表機械導出，不要手抄）
+python3 -c "from paulsha_cortex.trust_root import permgen
+for s in permgen.unresolved_node_execution_surfaces(): print(s.program, '←', s.detail)"
+#   目前預期兩列：srt ← executor claude ⇒ strict；openspec ← manager-unit。
+
+# (1) srt 在 reviewer job 的 strict 剖面下（＝ claude 實際 exec 它的那個加固面）
+sudo systemd-run --pipe --wait --collect \
+  --uid=cortex-reviewer-planner --gid=cortex-reviewer-planner \
+  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
+  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
+  --setenv=HOME=/var/lib/cortex-reviewer-planner \
+  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  /opt/cortex/toolchain/bin/srt --version
+
+# (2) openspec 在 Manager system unit 的加固面下
+sudo systemd-run --pipe --wait --collect \
+  --uid=cortex-manager --gid=cortex-manager \
+  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
+  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
+  --setenv=HOME=/var/lib/cortex-manager \
+  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  /opt/cortex/toolchain/bin/openspec --version
+
+#   ⚠️ 兩條**預期都會失敗（空輸出或非零）**，症狀與 #643 的 codex／copilot 逐字相同：
+#      node 的 V8 崩在 `Runtime_CompileLazy`，`MemoryDenyWriteExecute=yes` 與 JIT 天生互斥。
+#   ✅ 確認方式：把該條的 `--property=MemoryDenyWriteExecute=yes` 改成 `=no` 複跑，
+#      若印得出版本，就確認阻斷點是它、不是別的。
+#   ⛔ **不要就地把 unit 的 MDWE 改掉**。#643 的先例是「量到才改，而且改的是一份具名
+#      剖面，不是全域放寬」——reviewer 要不要走 jit 剖面、Manager 這一面要不要動，
+#      是 operator 的裁決。把兩條的實際輸出貼回 #661 的 follow-up issue。
+#   （這也是本 repo 測試裡**明確 skip** 的那一族：單 UID／無 systemd 加固面的環境
+#     重現不了這個語意，不得靜默宣稱已驗證——見 #638／#657 的教訓。）
 ```
 
 **per-account 憑證（0817 裁決 (b)）**：憑證**檔**由 job 帳號擁有（才 refresh 得了

@@ -424,6 +424,15 @@ def _load_runtime_model_identities(config_root: Path) -> int:
     return int(registry.schema_version)
 
 
+#: review sandbox 要跑起來所需的外部程式（#661 起是常數而非行內字面值）。
+#:
+#: 提出來的理由不是可讀性，而是**它必須可被登記表比對**：#661 的實機症狀正是這張
+#: 清單裡的 `srt` 從未進過 `permgen` 的 toolchain 名冊，於是四分部署把四個 executor
+#: 都搬進部署樹之後，doctor 仍紅在 `review-sandbox`。測試以這個常數對照登記表，
+#: 讓「probe 要求的程式」與「登記表涵蓋的程式」不能再各走各的。
+REVIEW_SANDBOX_EXECUTABLES: tuple[str, ...] = ("claude", "bwrap", "socat", "srt", "python3")
+
+
 def _review_sandbox_probe(
     env: Mapping[str, str],
     agents_root: Path,
@@ -480,7 +489,7 @@ def _review_sandbox_checks(
     search_path = env.get("PATH")
     executables = {
         name: shutil.which(name, path=search_path)
-        for name in ("claude", "bwrap", "socat", "srt", "python3")
+        for name in REVIEW_SANDBOX_EXECUTABLES
     }
     missing = [name for name, path in executables.items() if path is None]
     if missing:

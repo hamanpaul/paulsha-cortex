@@ -8,6 +8,21 @@
 ## [Unreleased]
 
 ### Added
+- **#661：`permgen.node_execution_surfaces()`／`unresolved_node_execution_surfaces()`
+  ——#643 剖面推導的盲區變成可列舉、不會靜默消失的東西**——#643 由
+  `EXECUTOR_TOOLS.needs_node` 機械導出加固剖面，而那條推導唯一的輸入是 **executor 名**：
+  它涵蓋不了「executor 在執行途中再 exec 出來的 node 程式」，也涵蓋不了 Manager 的 system
+  unit。#661 的完整盤點正好撞出兩格——`srt` 由 `claude`（`strict` 剖面）exec、`openspec`
+  由 Manager unit exec，兩者目前都是 `MemoryDenyWriteExecute=yes`，而 #643 已在實機量到
+  V8 的 `Runtime_CompileLazy` 在該項下直接崩。**本 PR 只讓它可列舉，不做裁決也不放寬任何
+  一面**：這是 OS／systemd 層語意，本 repo 的測試環境沒有那個加固面，對應的測試**明確
+  skip 並寫明理由**（#638／#657 的教訓），實機量測步驟寫進 runbook 第 4e 步（`systemd-run`
+  帶該 unit 的關鍵 property，附「量到才改、不得就地放寬」的處置規矩）。
+- **#661：`paulsha_cortex.preflight_ci`——`PSC_PREFLIGHT_CMD` 的 typed-argv 進入點**
+  ——把 cortex 的 preflight 契約（`--pr <N>` | `--metadata <路徑>`、`--skip-tests`）翻譯成
+  治理引擎 `policy_check.preflight` 的契約。**不 import 引擎**，只以 typed argv spawn；
+  引擎解析走 `--offline`＋已安裝發行版並由引擎驗 `installed == policy_version`，因此不需要
+  網路、不需要 cache、也不會在降權部署裡造出「服務帳號寫得到又執行得到」的執行面。
 - **#658：build 卡被採信之後即時回收其工作區——回收身分 ＝ 採信身分，preserve 契約拆成
   兩個具名模型**——#648 之後一個 run 會累積 N 棵約 35MB 的 per-job clone，而 #649／#653
   （ship 段自己的樹）與 #650／#659（verify／review 的 candidate 樹）落地後**被採信的
@@ -426,6 +441,22 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#661 / trust-root Phase 2 收尾：實機四分部署 doctor 剩的兩個 FAIL，同一個成因
+  （job／服務需要的外部程式不在登記表上）**——(1) `review-sandbox`：`srt` 被**單檔複製**
+  而它是 npm 套件樹，`dist/cli.js` 的 ESM 相對 import 解到 `<toolchain>/bin/utils/…`
+  ⇒ `ERR_MODULE_NOT_FOUND`、`srt --version` rc=1 ⇒ doctor 報
+  `Claude sandbox dependency execution failed`；**第二個後果無聲**——
+  `launcher._srt_runtime_root()` 解不到套件根，reviewer sandbox 政策少一條 `allowRead`
+  且不報錯。修法與 `codex` 同形（整包搬套件樹＋`bin/srt` 為指進 `lib/` 的 symlink），
+  以修正後的形狀在實機複驗 probe 的 static／live 兩路皆 pass。(2) `preflight`：舊值
+  是 shell wrapper ＋ 另一個 repo 的 shell backend，兩層都在 `/home` 底下、
+  `ProtectHome=yes` 之後都不可達；**票上「整包搬進部署樹」的前提在查證中過期**——該功能
+  自 conventions 1.0.17 起已上游化為 typed-argv 模組 `policy_check.preflight`，因此落點是
+  既有的 root-owned 部署 venv 而非 toolchain。順帶修正票上一處前提：舊值並非被
+  `shell-wrapper-not-allowed` 擋下（那個類別只在 argv 第一段真的是 `bash`／`sh` 且帶 `-c`
+  時成立），實機報的是 `is required`、填回舊值則是 `executable-unavailable`。
+  詳見 `changelog.d/external-deps.md`。新增
+  `tests/test_trust_root_external_deps_661.py`（37 測試 ＋ 1 具名 skip）。
 - **#633 / trust-root Phase 2b：`ScriptWorktreeCreator` 的 repo 解析改 lazy——Manager 不再
   「因為少一個 env 變數」啟動即崩**——#612／#630 讓 `paths.repo_root()` 在未宣告
   `PSC_REPO_ROOT` 時 fail-closed，方向正確，但它命中的位置在**啟動路徑**上：
@@ -763,6 +794,26 @@
   `mock.patch.object` 打不到，測試實際驗到的是「本機有沒有那個帳號」而非它宣稱的分支。
 
 ### Changed
+- **#661：登記表的外部程式盤點由「四個 executor」擴為完整名冊，但**刻意分成兩張表****
+  ——`permgen` 新增 `SERVICE_TOOLS`（`srt`／`openspec`）與 `SYSTEM_PROGRAMS`
+  （`node`／`git`／`gh`／`bwrap`／`socat`），落位計畫改由 `TOOLCHAIN_PROGRAMS`
+  （＝`EXECUTOR_TOOLS ∪ SERVICE_TOOLS`）導出，`TOOLCHAIN_SYSTEM_RUNTIMES` 由寫死的
+  `("node",)` 改為導出值。**不直接擴充 `EXECUTOR_TOOLS`** 的理由是它同時是 dispatch 的
+  executor 名字判準（`executor_hardening_profile()` 對表外的名字 fail-closed，spec §R8），
+  併進去等於讓 `executor: srt` 這種派工變成合法。另把 `doctor` 的 review-sandbox 相依清單
+  由行內字面值提成常數 `REVIEW_SANDBOX_EXECUTABLES`，並加測試與登記表對照——#661 的實機
+  症狀正是「probe 要求的程式」與「登記表涵蓋的程式」各走各的。盤點過程另發現同一族的
+  **第三個**成員 `openspec`（`@fission-ai/openspec` node script，住在 operator 的 nvm 樹）。
+- **#661：runbook 兩項實機修正**——(1) 第 2c 步來源樹建立補
+  `git remote set-url origin <上游>`：從 operator 的 checkout clone 會讓 `origin` 指向本機
+  路徑，除了 doctor 判 `repo-identity` drift，更要緊的是 #656 的 ship 段 `push origin` 會把
+  交付安靜地推進本機那棵樹。(2) 第 4b 步 EnvironmentFile 模板移除五個顯式覆寫
+  （`PSC_CONTROL_ROOT`／`PSC_COORDINATOR_ROOT`／`PSC_SPECS_ROOT`／`PSC_MONITOR_STATE_ROOT`／
+  `PSC_RUN_ROOT`）：`PSC_CONTROL_ROOT` 的模板值與 installer managed_env 的
+  `control/<instance>` 不相等 ⇒ `managed-path-drift`；拿掉後由 `PSC_AGENTS_ROOT` 導出的值
+  **逐字等於 `permgen.PathLayout.control_root`**，也就是 unit `ReadWritePaths` 實際保護的
+  那條路徑——**顯式列出反而讓解析結果與保護面分岔**。同步補上 4a 的 backend 安裝步驟與
+  4b 的 `PSC_PREFLIGHT_CMD` 值。
 - **#633：trust-root Phase 2b runbook——EnvironmentFile 的展開慣用法、模板引號，以及兩條
   ACL 警語**——(1) **`env $(grep -v '^#' <envfile> | xargs)` 全數改掉（10 處）**：
   `$(… | xargs)` 依**空白**切詞，因此任何值含空格的變數都會被拆成多個參數；實機補上
