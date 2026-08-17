@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -494,6 +495,41 @@ def gate_ledger_path(log_path: str | Path) -> Path:
     return path.with_name(path.stem + ".gates.json")
 
 
+def _effective_uid() -> int | None:
+    """本行程的 effective uid；平台沒有 uid 概念（Windows）時回 ``None``。"""
+
+    geteuid = getattr(os, "geteuid", None)
+    return None if geteuid is None else int(geteuid())
+
+
+def foreign_evidence_author(path: str | Path) -> int | None:
+    """回傳「這份證據檔的擁有者 uid，若它不是 Manager 自己」；否則 ``None``。
+
+    #604：``gate-ledger`` 這個登記表資產（Manager 的 dispatch log 目錄，含 gate
+    ledger 與 exit sentinel）宣告的 writer 只有 Manager。Phase 2b OS 隔離上線前，
+    這份宣告靠的是「job 與 Manager 同 UID，所以誰寫都一樣」；上線之後 builder 是
+    另一個 uid，「誰寫的」第一次變成一個**可以在檔案系統上直接問出來的事實**。
+
+    這支函式就是把那個事實接進採信路徑：以 ``lstat``（不跟隨 symlink）取得擁有者，
+    與本行程的 effective uid 比對。回 ``None`` 的三種情況都代表「沒有偵測到外來
+    作者」：檔案不存在／stat 不到、擁有者就是自己、平台無 uid 概念。
+
+    刻意用 uid 而不是別的（簽章、hash chain）：這一層要擋的是「被隔離的一方自己
+    寫下自己的驗收證據」，而 OS 已經替我們記了作者；再疊一層應用層密碼學在
+    Phase 2b 的威脅模型裡不會多擋任何東西（Phase 3 才處理簽章）。
+    """
+
+    euid = _effective_uid()
+    if euid is None:
+        return None
+    try:
+        stat_result = os.lstat(path)
+    except OSError:
+        return None
+    owner = int(stat_result.st_uid)
+    return None if owner == euid else owner
+
+
 def gate_ledger_digest(payload: Mapping[str, Any]) -> str:
     """gate ledger 的 canonical digest；重驗以「讀檔＋比 hash」為主（D2）。"""
 
@@ -515,6 +551,19 @@ def read_gate_ledger(ledger_path: str | Path) -> tuple[dict[str, Any], str] | No
         )
     if not path.is_file():
         return None
+    foreign_uid = foreign_evidence_author(path)
+    if foreign_uid is not None:
+        # #604：ledger 不是 Manager 寫的。降權模式下這代表 builder（或任何其他
+        # 非 Manager 身分）在 Manager-owned 的證據樹裡放了一份自證檔案——它既不是
+        # 「manager 獨立產生的 evidence」，也不能被降級成 hint 後照樣採信，一律
+        # fail closed。direct 模式下 job 與 Manager 同 uid，這條永遠不會命中，
+        # 因此對既有部署零影響。
+        raise TerminalContractError(
+            f"gate ledger 非 Manager 產生（owner uid={foreign_uid}）；"
+            "model 不得自證 gate 結果",
+            reason="gate-ledger-foreign-author",
+            validation_path="$.gate_evidence",
+        )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:

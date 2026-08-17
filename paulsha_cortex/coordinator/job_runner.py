@@ -73,8 +73,12 @@ stderr 併進 JSONL log（`stderr=STDOUT`）。不加 `--quiet` 就等於在 ter
 - `--wait` 讓 `systemctl` client 存活到 unit 結束（`systemctl(1)`：「For (re)start,
   wait until service stopped again」，systemd ≥ 232），因此
   `dispatcher.pid_alive()` 的 pid 判活不必改一行。
-- exit sentinel 仍由 wrapper script 在 job 內寫入，`poll_headless_done` 的第一判準
-  完全不變。
+- exit sentinel **不再由 job 進程自寫**（#604）：改由 Manager 側的 exit 記帳 shell
+  （:func:`build_manager_exit_recorder_argv`）包住 client argv，記下 client 的 `$?`。
+  `poll_headless_done` 讀的路徑逐字不變，變的只有「誰是寫者」——降權模式下 job 帳號
+  對那個目錄本來就無寫入權（`gate-ledger` 資產＝`0700 cortex-manager`，且不在 job
+  模板 unit 的 `ReadWritePaths=` 內），繼續要求 job 自寫等於要求它做一件必定 EROFS
+  的事，而在 direct 模式下它又等於讓被驗方自報 exit code。
 - log：`systemctl` **沒有** `--pipe`，且 unit 的 `StandardOutput=append:` 會由
   **root 在降權前**開檔（Manager 可寫的路徑上放 symlink 即成提權面），因此改由
   shim 在**已降權之後**依 spec 的 `log_path` 以 `O_NOFOLLOW` 接管 stdout/stderr。
@@ -94,6 +98,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -138,6 +143,7 @@ __all__ = [
     "UNIT_NAME_PREFIX",
     "build_builder_env",
     "build_job_spec",
+    "build_manager_exit_recorder_argv",
     "build_systemctl_start_argv",
     "build_systemd_run_argv",
     "confirm_template_instance_started",
@@ -766,6 +772,7 @@ def confirm_transient_unit_started(
     timeout_ms: int = DEFAULT_START_TIMEOUT_MS,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    manager_authored_sentinel: bool = False,
 ) -> None:
     """確認 transient unit 真的起來了；起不來就 fail-closed。
 
@@ -787,6 +794,7 @@ def confirm_transient_unit_started(
         timeout_ms=timeout_ms,
         monotonic=monotonic,
         sleep=sleep,
+        manager_authored_sentinel=manager_authored_sentinel,
     )
     if status is None:
         return
@@ -811,18 +819,32 @@ def _await_start(
     timeout_ms: int,
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
+    manager_authored_sentinel: bool = False,
 ) -> int | None:
     """起動確認的共用核心：回傳「起動失敗時的 client exit status」，成功回 None。
 
     判準對 `systemd-run --wait` 與 `systemctl start --wait` 完全一樣（兩者都是
     「client 存活到 unit 結束」的語意）：**client 已結束且 exit sentinel 不存在**
     才算起動失敗。真的跑完的極短命 job 必然留下 sentinel，因此不會誤判。
+
+    ``manager_authored_sentinel``（#604）：sentinel 改由 Manager 側的 exit 記帳
+    wrapper 寫入（:func:`build_manager_exit_recorder_argv`）之後，「sentinel 存在」
+    不再能區分兩件事——**那層 wrapper 在 client 起不來時也會寫**（它記的正是那個
+    非零狀態）。因此這條路徑改用單一判準：**確認窗內 client 已結束且狀態非 0**。
+    這在語意上成立，因為 `--wait` 的 client 只有在 unit 已經跑完之後才會返回，而
+    unit 啟動（systemd 排程 → 降權 → shim 讀 spec → exec 模型 CLI）不可能在預設
+    200ms 的窗內走完；反之 polkit 拒絕／模板未安裝是**立刻**回非 0。極端情況下若
+    真有一個 job 在窗內就以非零收場，結果是**拒絕這次派工**（fail-closed，可重派），
+    不是採信一個沒跑過的 job。
     """
 
     deadline = monotonic() + max(timeout_ms, 0) / 1000.0
     while True:
         status = process.poll()
         if status is not None:
+            if manager_authored_sentinel:
+                # Manager 記帳模式：sentinel 一定會被寫，故不能拿它當判準。
+                return status if status != 0 else None
             if Path(sentinel).exists():
                 # job 真的跑完了（且已寫下 exit sentinel）——不是起動失敗。
                 return None
@@ -1032,6 +1054,56 @@ def build_systemctl_start_argv(*, systemctl: str, unit: str) -> list[str]:
     return [systemctl, "start", "--wait", "--no-ask-password", unit]
 
 
+def build_manager_exit_recorder_argv(
+    *, client_argv: Sequence[str], sentinel: str
+) -> list[str]:
+    """把降權啟動器的 client argv 包進一層 **Manager 身分**的 exit 記帳 shell。
+
+    #604：exit sentinel 過去由 job 進程內的 wrapper script 寫（`launcher.
+    build_wrapper_script` 的第 2 段）。OS 隔離上線後這條路同時有兩個問題：
+
+    1. **信任面**：sentinel 是 `dispatcher.poll_headless_done` 的第一判準，卻由被
+       隔離的一方自報。builder 只要寫得進去就能宣告自己的 exit code。
+    2. **可行性**：登記表資產 `gate-ledger`（＝Manager 的 dispatch log 目錄）在
+       Phase 2b 是 `0700 cortex-manager`，且**不在** job 模板 unit 的
+       `ReadWritePaths=` 內（`ProtectSystem=strict` → EROFS）。job 根本寫不進去，
+       於是每個降權 job 都在 `poll_headless_done` 落到「行程已死、無 sentinel」的
+       fail-closed 分支，被記成 failed。
+
+    修法：`systemd-run --wait` 與 `systemctl start --wait` 的 client 本來就跑在
+    **Manager 這一側**（見 `launcher.launch()` 的 `popen_kwargs["env"]`），且會存活
+    到 unit 結束。把它包進一層 `bash -c`，由這層 shell 寫下 client 的 `$?`——寫者
+    因此是 Manager 的 uid，落點仍是 Manager-owned 的 log 目錄，job 側完全不參與。
+
+    `exit "$rc"`：把 client 的狀態原樣傳回給 `Popen` 物件，讓
+    :func:`_await_start` 仍拿得到「client 起不來時的 exit status」。
+
+    退出碼語意：`systemctl start --wait` 在 unit 成功結束時回 0、unit 失敗（或
+    根本起不來）時回非 0。`completion.classify_completion` 只分「0 / 非 0」，因此
+    這個粒度足夠；模型的逐字 exit code 本來就不是採信判準（採信走 gate ledger）。
+    """
+
+    if not client_argv or not all(isinstance(item, str) and item for item in client_argv):
+        raise _fail(
+            "job-runner-exit-recorder-invalid",
+            "exit 記帳 wrapper 需要非空的 client argv",
+            source="build_manager_exit_recorder_argv",
+        )
+    if not sentinel.startswith("/"):
+        raise _fail(
+            "job-runner-exit-recorder-invalid",
+            f"exit sentinel 必須是絕對路徑（Manager 的 log 目錄）: {sentinel!r}",
+            source="build_manager_exit_recorder_argv",
+            sentinel=sentinel,
+        )
+    script = (
+        f"{shlex.join(list(client_argv))}; rc=$?; "
+        f"printf %s \"$rc\" > {shlex.quote(sentinel)}; exit \"$rc\""
+    )
+    # `-c` 而非 `-lc`：這層 shell 是 Manager 的一部分，不該重新 source ~/.profile。
+    return ["bash", "-c", script]
+
+
 def preflight_systemd_template(
     *,
     account: str,
@@ -1200,12 +1272,15 @@ def confirm_template_instance_started(
     timeout_ms: int = DEFAULT_START_TIMEOUT_MS,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    manager_authored_sentinel: bool = False,
 ) -> None:
     """確認模板實例真的起來了；起不來就 fail-closed（**絕不**退回其他模式）。
 
     判準與 A 案共用 :func:`_await_start`：`systemctl start --wait` 與
     `systemd-run --wait` 都是「client 存活到 unit 結束」，因此「client 已結束且
     exit sentinel 不存在」在兩邊都恰好代表「job 從未真正執行」。
+    ``manager_authored_sentinel=True`` 時判準改為「確認窗內 client 以非零收場」
+    （#604，理由見 :func:`_await_start`）。
     """
 
     status = _await_start(
@@ -1214,6 +1289,7 @@ def confirm_template_instance_started(
         timeout_ms=timeout_ms,
         monotonic=monotonic,
         sleep=sleep,
+        manager_authored_sentinel=manager_authored_sentinel,
     )
     if status is None:
         return

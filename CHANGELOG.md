@@ -52,6 +52,31 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#604 / trust-root：gate ledger 與 exit sentinel 的作者收斂到 Manager——降權後
+  「被隔離的一方自寫驗收證據」的第一步修法**——登記表資產 `gate-ledger`（Manager 的
+  dispatch log 目錄，同時放 `<slice>.gates.json` 與 `<slice>.exit`）宣告
+  `writers=(MANAGER,)`，但兩個檔一直由 `launcher.build_wrapper_script` 的 wrapper
+  **在 job 進程內**寫。Phase 2b M1 實機上線（`PSC_JOB_RUNNER=systemd-template`，job
+  以 `uid=cortex-builder` 跑）之後這條路同時有兩個問題：**信任面**——sentinel 是
+  `poll_headless_done` 的第一判準、ledger 是 `authorize_terminal` 採信 `passed` 的唯一
+  背書，卻由被驗方自報（違反 #540 的「model 既不能自證成功、也不能自證失敗」）；
+  **可行性**——該目錄是 `0700 cortex-manager` 且不在 builder 模板 unit 的
+  `ReadWritePaths=` 內（`ProtectSystem=strict`），job 寫進去必然 EROFS，於是降權模式
+  下每個 builder job 都在「行程已死、無 sentinel」的分支被記成 failed。修法：(1) 新增
+  `job_runner.build_manager_exit_recorder_argv()`，把 `--wait` 的 client argv 包進一層
+  跑在 **Manager 身分**的 `bash -c` 由它寫 `$?`（**sentinel 路徑逐字不變**，harvest 端
+  零改動）；(2) `confirm_*_started()` 新增 `manager_authored_sentinel=` 旗標，判準改為
+  「確認窗內 client 以非零收場」（未傳＝既有語意，零回歸）；(3) `build_wrapper_script()`
+  新增 `write_sentinel=`，降權模式連同 gate 階段一併移出 job wrapper；(4) 新增
+  `terminal_contract.foreign_evidence_author()`，`read_gate_ledger()` 對非 Manager 產生
+  的 ledger 以新 reason `gate-ledger-foreign-author` fail closed、
+  `dispatcher._read_exit_sentinel()` 對非 Manager 產生／非普通檔的 sentinel 視同尚未
+  寫下。direct 模式下 job 與 Manager 同 uid，(4) 永遠不會命中，既有部署零影響。
+  **本票不含 gate 執行面的搬遷**：把 gate 重跑直接放進 Manager 進程會讓 builder 掌控的
+  `conftest.py`／pytest plugin 取得 `cortex-manager` 的任意程式碼執行，比要修的缺口更
+  嚴重；正確落點是一個既非 builder 也非 Manager 的 gate 執行身分（需動 permgen 的 UID
+  scheme 與 unit 產生器），在那之前降權模式不產生 ledger，build 卡照 `require_ledger`
+  fail closed。
 - **#620 / trust-root：permgen 機械導出父目錄 traverse ACL——三分下 builder／
   reviewer-planner 走不到自己的 spool，正向路徑全斷**——葉節點的跨帳號 ACL 完全正確
   （`u:cortex-builder:wx` 掛在 `<monitor>/event-spool` 上），但父目錄是

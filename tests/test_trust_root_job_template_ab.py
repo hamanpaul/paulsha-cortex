@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -604,6 +605,16 @@ class TemplateInstanceNameTests(unittest.TestCase):
         )
 
 
+def _unwrap_exit_recorder(argv: list[str]) -> list[str]:
+    """剝掉 #604 的 Manager 側 exit 記帳 shell，取回封閉的 systemctl client argv。"""
+
+    assert argv[:2] == ["bash", "-c"], argv
+    head, sep, tail = argv[2].partition("; rc=$?; ")
+    assert sep, argv[2]
+    assert tail.startswith('printf %s "$rc" > '), tail
+    return shlex.split(head)
+
+
 class SystemctlArgvTests(unittest.TestCase):
     def test_argv_is_closed(self) -> None:
         argv = job_runner.build_systemctl_start_argv(
@@ -637,7 +648,9 @@ class JobSpecContentTests(unittest.TestCase):
     def test_launch_writes_one_spec_and_starts_the_instance(self) -> None:
         popen = _RecordingPopen()
         ctx = _launch_template(SubprocessLauncher("codex"), popen=popen)
-        argv = popen.call["argv"]
+        # #604：最外層是 Manager 側的 exit 記帳 shell（sentinel 的寫者不再是 job）；
+        # 它包住的才是那條封閉的 systemctl client argv。
+        argv = _unwrap_exit_recorder(popen.call["argv"])
         self.assertEqual(argv[:4], ["/usr/bin/systemctl", "start", "--wait", "--no-ask-password"])
         self.assertTrue(argv[4].startswith("cortex-job@"))
         self.assertTrue(argv[4].endswith(".service"))
@@ -884,18 +897,19 @@ class TemplateFailFastTests(unittest.TestCase):
 
 class HarvestCompatibilityTests(unittest.TestCase):
     def test_log_and_sentinel_paths_are_unchanged(self) -> None:
+        popen = _RecordingPopen()
         with tempfile.TemporaryDirectory() as d:
-            ctx = _launch_template(
-                SubprocessLauncher("codex"), popen=_RecordingPopen(), workdir=d
-            )
+            ctx = _launch_template(SubprocessLauncher("codex"), popen=popen, workdir=d)
             spec = _only_spec(ctx["spool"])
         # harvest（`dispatcher.poll_headless_done` → `_read_exit_sentinel`）讀的是
         # `<log_dir>/<slice>.jsonl` 與同名 `.exit`——兩者都必須與 direct 模式一致。
+        sentinel = str(Path(ctx["log_dir"]) / "psc-0042-template.exit")
         self.assertEqual(spec["log_path"], str(Path(ctx["log_dir"]) / "psc-0042-template.jsonl"))
-        self.assertIn(
-            str(Path(ctx["log_dir"]) / "psc-0042-template.exit"),
-            spec["command"][2],
-        )
+        # #604：**路徑不變，作者改變**。sentinel 現在由 Manager 側的 exit 記帳 shell
+        # 寫（`popen` 的 argv），job spec 的 command 內不得再出現它——那個目錄是
+        # `0700 cortex-manager`，job 寫進去只會 EROFS，而且那本來就是自報。
+        self.assertIn(sentinel, popen.call["argv"][2])
+        self.assertNotIn(sentinel, spec["command"][2])
 
     def test_log_file_is_truncated_then_appended(self) -> None:
         """systemctl client 用 append fd，避免蓋掉 shim 已經寫進去的內容。"""
@@ -979,7 +993,8 @@ class NoRegressionTests(unittest.TestCase):
                     )
         finally:
             launcher_module.subprocess.Popen = original
-        argv = popen.call["argv"]
+        # #604：A 案與 B 案一樣，最外層是 Manager 側的 exit 記帳 shell。
+        argv = _unwrap_exit_recorder(popen.call["argv"])
         self.assertEqual(argv[0], "/usr/bin/systemd-run")
         for flag in ("--pipe", "--wait", "--collect", "--uid=cortex-builder"):
             self.assertIn(flag, argv)

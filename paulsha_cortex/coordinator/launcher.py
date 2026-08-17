@@ -158,6 +158,7 @@ def build_wrapper_script(
     repo_root: str | None,
     run_gates: bool,
     stdin_prompt: str | None = None,
+    write_sentinel: bool = True,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -167,6 +168,17 @@ def build_wrapper_script(
     2. 把 ``$?`` 寫入 exit sentinel（跨進程 durable 完成判定，早於 gate 階段，
        確保 gate 執行時間不會被算進模型的 exit code）；
     3. 由 manager 掌控的 gate ledger writer。
+
+    ``write_sentinel=False`` / ``run_gates=False``（#604，降權模式）：這支 script
+    在降權模式下是以 **job 帳號**（`cortex-builder`）執行的，而 sentinel 與 ledger
+    的落點屬登記表資產 ``gate-ledger``（Manager 的 dispatch log 目錄，`0700
+    cortex-manager`，且不在 job 模板 unit 的 ``ReadWritePaths=`` 內）。讓 job 去寫
+    那兩個檔在信任面上是「被隔離的一方自證 exit code 與 gate 結果」，在可行性上則
+    是必定 EROFS。降權模式因此把兩段都拿掉：sentinel 改由 Manager 側的 exit 記帳
+    shell 寫（見 :func:`job_runner.build_manager_exit_recorder_argv`），gate 的重跑
+    與 ledger 產生留待 Manager 側的 gate 執行面（見本檔 :meth:`SubprocessLauncher.
+    _should_run_gates` 的說明），在那之前 ``require_ledger`` 會照既有規則 fail
+    closed——**不會**因為少了這一段而讓任何 build 卡靜默通過。
 
     gate 階段的 stdout/stderr 一律導向 /dev/null：JSONL log 是 terminal evidence 的
     來源，混入 gate 輸出會讓 ``_extract_terminal_json`` 讀到非 terminal 的內容。
@@ -189,7 +201,10 @@ def build_wrapper_script(
         command = (
             f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
         )
-    script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
+    if write_sentinel:
+        script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
+    else:
+        script = command
     if not run_gates or not repo_root:
         return script
     gate_argv = [
@@ -1058,9 +1073,29 @@ class SubprocessLauncher:
         不應在它的 sandbox 內跑 gate；operator 未宣告任何 ``PSC_GATE_CMD_*`` 時仍會
         寫出一份 ``gates: []`` 的 ledger，讓 harvest 能區分「沒宣告 gate」與
         「wrapper 根本沒跑完」。
+
+        **#604：降權模式一律不在 job wrapper 內跑 gate。** 理由有兩層——
+
+        1. 信任面：wrapper 跑在 builder 的 uid 底下，ledger 因此是「被驗方在自己的
+           進程裡產生自己的驗收證據」。#540 的 gate acceptance chain 要求 model 既
+           不能自證成功、也不能自證失敗。
+        2. 可行性：ledger 的落點是登記表資產 ``gate-ledger``（`0700 cortex-manager`，
+           不在 job 模板 unit 的 ``ReadWritePaths=`` 內），job 寫進去必然 EROFS。
+
+        **為什麼不直接把 gate 搬進 Manager 進程**（＝本票只做到「不再由 job 自寫」
+        這一步的原因）：宣告出來的 gate 命令（`PSC_GATE_CMD_PYTEST` 之類）是在
+        **builder 完全掌控內容的 worktree** 裡執行的；`pytest` 會載入該 worktree 的
+        `conftest.py`／plugin，等於讓 builder 在 `cortex-manager` 身分下取得任意程式
+        碼執行——那比本票要修的缺口更嚴重。正確的落點是一個**既非 builder、也非
+        Manager** 的 gate 執行身分（Manager 起、以獨立降權帳號跑、產出直接落在
+        Manager-owned 樹），那需要動 permgen 的 UID scheme 與 unit 產生器，屬後續票。
+        在那之前，降權模式下的 build 卡會因 ``require_ledger`` 而 fail closed——這是
+        刻意的：沒有獨立證據就不採信，而不是採信一份 builder 自己寫的。
         """
 
         if self._review_only or self._read_only:
+            return False
+        if self._degraded_runner(os.environ):
             return False
         return env.get("PSC_REPO_ROOT") is not None
 
@@ -1267,6 +1302,9 @@ class SubprocessLauncher:
             repo_root=env.get("PSC_REPO_ROOT"),
             run_gates=self._should_run_gates(env),
             stdin_prompt=stdin_prompt,
+            # #604：降權模式下 sentinel 改由 Manager 側的 exit 記帳 shell 寫；
+            # job wrapper 內不得再出現任何指向 Manager log 目錄的寫入。
+            write_sentinel=not degraded,
         )
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         # 降權模式的 builder 同理（#588 第 2 點）：login shell 會在 transient unit 的
@@ -1287,6 +1325,10 @@ class SubprocessLauncher:
                 working_directory=worktree,
                 env=env,
                 command=argv,
+            )
+            # #604：client 跑在 Manager 這一側且存活到 unit 結束，由它記 exit code。
+            argv = job_runner.build_manager_exit_recorder_argv(
+                client_argv=argv, sentinel=sentinel
             )
             # systemd-run **client 自己**的環境。它不會流進 transient unit——unit 的
             # 環境只有 PID 1 的 manager environment 加上 `--setenv` 白名單（這正是
@@ -1315,6 +1357,10 @@ class SubprocessLauncher:
             job_runner.write_job_spec(template_plan.spec_path, spec)
             argv = job_runner.build_systemctl_start_argv(
                 systemctl=template_plan.binary, unit=template_plan.unit
+            )
+            # #604：同 A 案——sentinel 由 Manager 側這層 shell 寫，job 不參與。
+            argv = job_runner.build_manager_exit_recorder_argv(
+                client_argv=argv, sentinel=sentinel
             )
             # systemctl **client 自己**的環境（同 A 案的理由：polkit 授權可能要查
             # 呼叫端 session）。它不會流進 unit——unit 的環境來自 root-owned 模板檔，
@@ -1345,6 +1391,7 @@ class SubprocessLauncher:
                 account=template_plan.account,
                 log_path=log_path,
                 timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
+                manager_authored_sentinel=True,
             )
         if runner_plan is not None:
             # polkit 拒絕／unit 名衝突只在起動當下才知道；確認不到就 fail-closed，
@@ -1356,6 +1403,7 @@ class SubprocessLauncher:
                 account=runner_plan.account,
                 log_path=log_path,
                 timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
+                manager_authored_sentinel=True,
             )
         return LaunchHandle(
             executor=self._executor,
