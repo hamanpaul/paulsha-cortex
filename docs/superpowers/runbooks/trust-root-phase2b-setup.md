@@ -236,7 +236,7 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | 執行前提（含 G1／G2 兩個硬性 gate） | 0 | 11 |
 | 產生器＝單一真相 | 0 | 9 |
 | 第 1 步：建三帳號 | 3 | 5 |
-| 第 2 步：目標樹與權限（含 2c 來源樹） | 4 | 19 |
+| 第 2 步：目標樹與權限（含 2c 來源樹） | 4 | 21 |
 | 第 3 步：legacy-import（含 operator 設定搬遷） | 3 | 11 |
 | 第 4 步：Manager／monitor 部署與 unit | 12 | 24 |
 | **第 5 步：降權（A+B）** | **7** | **27** |
@@ -247,7 +247,7 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | WSL2 風險與診斷 | 2 | 12 |
 | 附錄 A：自我檢查 | 0 | 7 |
 | 附錄 B：降級備援 | 2 | 3 |
-| **合計** | **45** | **159** |
+| **合計** | **45** | **161** |
 
 （統計方式：全文 `🔧`／`✅` 標記出現次數，扣除說明性用法——「標記約定」的定義行、
 段落標題內的標記、以及表格裡當狀態記號用的那幾個。）
@@ -265,9 +265,10 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   注入並新增 T4.0 可見性測項、族 1 的 T1.1／T1.5 由「讀」改測「寫」並新增
   `d()`／`need()`／身分鎖三個判讀守衛。合計（#624／#625 落地後的 35／133 基礎上）
   → **43** 個 sudo 點、**156** 個驗證點。
-- **#623（per-job clone）新增**：第 2c 步「建立來源樹 ＋ 落兩份 root-owned
-  `.gitconfig`」——2 個 sudo 點、3 個驗證點（來源樹對 Manager／job 皆唯讀、job 真的
-  clone 得動、`.gitconfig` job 不可寫）→ **45** 個 sudo 點、**159** 個驗證點。
+- **#623（per-job clone）新增**：第 2c 步「建立來源樹 ＋ 落**三份** root-owned
+  `.gitconfig`」——2 個 sudo 點、5 個驗證點（來源樹 Manager 可寫／job 唯讀、job 真的
+  clone 得動、三份 `.gitconfig` 對應帳號不可寫、commit spool 的 `wx` 無 `r`）
+  → **45** 個 sudo 點、**161** 個驗證點。
 
 ---
 
@@ -335,10 +336,12 @@ python3 -m paulsha_cortex.trust_root polkit three-way --template
 # ✅ root-owned shim 內容（/opt/cortex/bin/cortex-job-shim）—— #616 已 merge
 python3 -m paulsha_cortex.trust_root shim three-way
 
-# ✅ job 帳號 HOME 下 root-owned 的 .gitconfig 內容（per-job clone 的來源樹 safe.directory）
+# ✅ 帳號 HOME 下 root-owned 的 .gitconfig 內容（來源樹的 safe.directory）
 #    <slug> ＝ 來源樹底下那一格的目錄名（見第 2c 步）；未給即 fail-closed。
+#    三份同構：兩個 job 帳號 ＋ Manager（Manager 也對來源樹跑 git，同樣會撞 dubious ownership）。
 python3 -m paulsha_cortex.trust_root gitconfig three-way --builder --source-repo <slug>
 python3 -m paulsha_cortex.trust_root gitconfig three-way --reviewer-planner --source-repo <slug>
+python3 -m paulsha_cortex.trust_root gitconfig three-way --manager --source-repo <slug>
 ```
 
 **job-spec 的欄位契約也已隨 #616 落地**——`coordinator/job_runner.py` 的
@@ -695,11 +698,11 @@ sudo -u cortex-reviewer-planner ls /var/lib/cortex/coordinator/job-specs 2>&1 | 
 #   期望：Permission denied（spool 只對 builder 開唯讀 ACL——三分在檔案層的證據）
 ```
 
-### 2c. 建立來源樹 ＋ 落兩份 root-owned `.gitconfig`（#623）
+### 2c. 建立來源樹 ＋ 落三份 root-owned `.gitconfig`（#623）
 
 第 2b 步已把 `/var/lib/cortex/repos`（登記表資產 `repo-source-tree`）建成
-**root:root 0755** 的空容器。本步把受治理的 repo 放進去，並讓兩個 job 帳號有辦法
-從它 clone。
+**`cortex-manager` 擁有、0700**、兩個 job 帳號各帶一條唯讀 ACL（`rX`）的空容器。
+本步把受治理的 repo 放進去，並讓 Manager 與兩個 job 帳號都有辦法對它跑 git。
 
 **為什麼是 per-job 完整 clone 而不是 `git worktree`**：#623 實測——worktree 的
 `.git` 是指向共用 object store 的指標，builder 要 `git add`／`git commit` 就必須能寫
@@ -711,73 +714,112 @@ sudo -u cortex-reviewer-planner ls /var/lib/cortex/coordinator/job-specs 2>&1 | 
 掃描目標與 job 的 clone 來源。
 
 ```bash
-# 🔧 sudo：把受治理的 repo 放進來源樹（**以 root 執行 ⇒ 整棵樹 root 擁有**）
+# 🔧 sudo：把受治理的 repo 放進來源樹，並交給 Manager 擁有
 SLUG=paulsha-cortex          # 目錄名；下面每個命令都用它
 sudo git clone <來源 remote 或 operator 的 checkout> /var/lib/cortex/repos/"$SLUG"
-sudo chown -R root:root /var/lib/cortex/repos/"$SLUG"
-sudo chmod -R a+rX,go-w /var/lib/cortex/repos/"$SLUG"
+sudo chown -R cortex-manager:cortex-manager /var/lib/cortex/repos/"$SLUG"
+# 兩個 job 帳號要讀得到整棵樹（容器的 default ACL 只涵蓋**之後**新建的物件，
+# 這一步是把 clone 當下已存在的那幾萬個檔一次補齊）。
+sudo setfacl -R -m u:cortex-builder:rX,u:cortex-reviewer-planner:rX \
+  /var/lib/cortex/repos/"$SLUG"
+sudo setfacl -R -d -m u:cortex-builder:rX,u:cortex-reviewer-planner:rX \
+  /var/lib/cortex/repos/"$SLUG"
 ```
 
-> **為什麼 root 擁有而不是 `cortex-manager` 擁有**：ReadWritePaths 由登記表**純由
-> 「誰可寫」機械導出**——只要來源樹的 owner 是 `cortex-manager`，Manager unit 就會
-> 自動拿到它的寫入權。「Manager 唯讀」與「owner＝Manager」在產生器裡互斥，裁決取
-> 前者：**來源樹由 operator 以 root 更新，Manager／monitor／兩個 job 帳號一律唯讀**。
-> 代價是 Manager 不能自己 `git fetch` 更新來源樹（見下方「更新來源樹」）；換到的是
-> 「Manager 被攻陷也改不了每個 job clone 的來源」。
+> **為什麼 `cortex-manager` 擁有而不是 root 擁有**（0817 裁決，推翻本 runbook 前一版）：
+> `git fetch` 必須把 `FETCH_HEAD` 寫進**目標 repo**，而成果回收正是「fetch 進來源樹」；
+> provisioning 那半邊的 `git branch -f <branch> <base>` 同樣是對來源樹的寫入。
+> root-owned 下實測：
+>
+> ```
+> error: cannot open '.git/FETCH_HEAD': Permission denied
+> ```
+>
+> **「Manager 唯讀」與「Manager 回收成果」互斥**，取後者。隔離不因此變弱：不受信任的
+> 是 **job 帳號**，它們對這棵樹只有 `rX`；Manager 本來就擁有 gate ledger／evidence／
+> `jobs.json`——多這一棵樹不改變攻擊面。monitor 雖與 Manager 同帳號，但它的 unit 少了
+> 那條 `ReadWritePaths`，因此仍寫不進去（#622 的 persona 過濾）。
 
 ```bash
-# 🔧 sudo：兩份 root-owned .gitconfig（內容由 permgen 產生，勿手寫）
-python3 -m paulsha_cortex.trust_root gitconfig three-way --builder --source-repo "$SLUG" \
-  | sudo tee /var/lib/cortex-builder/.gitconfig >/dev/null
-python3 -m paulsha_cortex.trust_root gitconfig three-way --reviewer-planner --source-repo "$SLUG" \
-  | sudo tee /var/lib/cortex-reviewer-planner/.gitconfig >/dev/null
-sudo chown root:root /var/lib/cortex-builder/.gitconfig /var/lib/cortex-reviewer-planner/.gitconfig
-sudo chmod 0644 /var/lib/cortex-builder/.gitconfig /var/lib/cortex-reviewer-planner/.gitconfig
+# 🔧 sudo：三份 root-owned .gitconfig（內容由 permgen 產生，勿手寫）
+# 旗標名與帳號後綴刻意同名：--<who> 的產物落在 /var/lib/cortex-<who>/.gitconfig。
+for who in builder reviewer-planner manager; do
+  python3 -m paulsha_cortex.trust_root gitconfig three-way --"$who" --source-repo "$SLUG" \
+    | sudo tee "/var/lib/cortex-$who/.gitconfig" >/dev/null
+done
+sudo chown root:root /var/lib/cortex-{builder,reviewer-planner,manager}/.gitconfig
+sudo chmod 0644 /var/lib/cortex-{builder,reviewer-planner,manager}/.gitconfig
 ```
 
-> **為什麼需要這兩個檔**：clone 來源不屬於 job 帳號，git 的 dubious-ownership 保護會
-> 讓 `git clone` 直接失敗；解法只有 `safe.directory`，而它**必須由 root 放進 job 的
-> HOME**——job 的 HOME 是 root-owned，它自己放不了這個檔。與既有的
-> `~/.codex/hooks.json` 同一個模式（登記表資產 `builder-gitconfig`／
-> `reviewer-planner-gitconfig`）。
+> **為什麼需要這三個檔**：來源樹與讀它的帳號不同 owner 時，git 的 dubious-ownership
+> 保護會擋下操作；解法只有 `safe.directory`，而它**必須由 root 放進該帳號的 HOME**
+> ——那些 HOME 都是 root-owned，帳號自己放不了這個檔。與既有的 `~/.codex/hooks.json`
+> 同一個模式（登記表資產 `builder-gitconfig`／`reviewer-planner-gitconfig`／
+> `manager-gitconfig`）。**Manager 那份不是冗餘**：來源樹是 root 建立後才 chown 過去的，
+> chown 前或任何 owner 不相符的中途狀態，Manager 的每一個 git 操作都會失敗
+> （`fatal: detected dubious ownership in repository at '<來源樹>/<slug>'`）。
+>
+> **為什麼每個 repo 是兩條 `safe.directory`**：實測從**非 bare** 來源 clone 時 git 檢查
+> 的是 `<repo>/.git`，而 `git -C <repo> …` 報的是工作樹根——兩個位置就是兩條逐字的值。
+> 產生器已自動出兩條，不必手加。
 >
 > **為什麼逐個列 repo 而不是萬用字元**：git 的 `safe.directory` 只認**逐字相等**的
 > 路徑或字面 `*`（實測 git 2.43：`<repos>/*` 仍被拒），而字面 `*` 等於對該帳號整個
 > 關掉這個保護。多一個受治理 repo 就多帶一次 `--source-repo`。
 
 ```bash
-# ✅ 驗證：來源樹 root 擁有、job 帳號讀得到但寫不進去
+# ✅ 驗證：來源樹由 Manager 擁有、Manager 寫得進去
 ls -ld /var/lib/cortex/repos /var/lib/cortex/repos/"$SLUG"
-#   期望：兩層皆 root:root 0755
+#   期望：容器 cortex-manager 0700；<slug> 亦 cortex-manager 擁有
+sudo -u cortex-manager git -C /var/lib/cortex/repos/"$SLUG" fetch --prune origin
+#   期望：rc=0。若出現 `cannot open '.git/FETCH_HEAD': Permission denied` ⇒ chown 沒做完；
+#         若出現 `fatal: detected dubious ownership` ⇒ manager 那份 .gitconfig 沒生效。
+
+# ✅ 驗證：兩個 job 帳號讀得到、但一個位元都寫不進去
 sudo -u cortex-builder git -C /var/lib/cortex/repos/"$SLUG" rev-parse --short HEAD
 #   期望：印出 commit（讀得到）
 sudo -u cortex-builder sh -c "touch /var/lib/cortex/repos/$SLUG/evil" 2>&1 | tail -1
 #   期望：Permission denied ← **這條才是邊界**
-sudo -u cortex-manager sh -c "touch /var/lib/cortex/repos/$SLUG/evil" 2>&1 | tail -1
-#   期望：Permission denied（Manager 亦唯讀——裁決如此）
+sudo -u cortex-reviewer-planner sh -c "touch /var/lib/cortex/repos/$SLUG/evil" 2>&1 | tail -1
+#   期望：Permission denied
 
 # ✅ 驗證：兩個 job 帳號真的 clone 得動（.gitconfig 生效）
 sudo -u cortex-builder git clone --no-hardlinks \
   /var/lib/cortex/repos/"$SLUG" /tmp/clone-probe-builder
 #   期望：成功。若出現 `fatal: detected dubious ownership` ⇒ .gitconfig 沒生效：
-#         先確認檔案 root:root 0644、且 job 的 HOME 與 unit 的 Environment=HOME 一致。
+#         先確認檔案 root:root 0644、且該帳號的 HOME 與 unit 的 Environment=HOME 一致，
+#         再確認 `[safe]` 段裡**同時**有工作樹根與 `<root>/.git` 兩條。
 sudo rm -rf /tmp/clone-probe-builder
 
-# ✅ 驗證：兩份 .gitconfig job 帳號不可寫
-sudo -u cortex-builder sh -c 'printf x >> /var/lib/cortex-builder/.gitconfig' 2>&1 | tail -1
-#   期望：Permission denied
+# ✅ 驗證：三份 .gitconfig 對應帳號皆不可寫
+for who in builder reviewer-planner manager; do
+  sudo -u "cortex-$who" sh -c "printf x >> /var/lib/cortex-$who/.gitconfig" 2>&1 | tail -1
+done
+#   期望：三行皆 Permission denied
+
+# ✅ 驗證：commit spool 是 `wx` 無 `r`（builder 寫得進、讀不到他人）
+getfacl -p /var/lib/cortex/coordinator/commit-spool 2>/dev/null | grep '^user:cortex-builder'
+#   期望：user:cortex-builder:-wx（**沒有 r**）
+sudo -u cortex-builder ls /var/lib/cortex/coordinator/commit-spool 2>&1 | tail -1
+#   期望：Permission denied（列不出別人的 bundle）
+sudo -u cortex-reviewer-planner sh -c \
+  "touch /var/lib/cortex/coordinator/commit-spool/probe" 2>&1 | tail -1
+#   期望：Permission denied（producer 只有 builder）
 ```
 
-**更新來源樹**（日常操作，operator 手動）：
+**更新來源樹**（日常操作）：Manager 現在是 owner，因此**服務自己就能** `fetch`；以
+operator 身分手動更新時記得別把 owner 換掉：
 
 ```bash
-sudo git -C /var/lib/cortex/repos/"$SLUG" fetch --prune
-sudo git -C /var/lib/cortex/repos/"$SLUG" merge --ff-only origin/main
-sudo chown -R root:root /var/lib/cortex/repos/"$SLUG"   # 保險：新物件仍歸 root
+sudo -u cortex-manager git -C /var/lib/cortex/repos/"$SLUG" fetch --prune
+sudo -u cortex-manager git -C /var/lib/cortex/repos/"$SLUG" merge --ff-only origin/main
+# 服務以 UMask=0077 建檔，新物件對 job 帳號預設不可讀；補一次遞迴 ACL 讓 clone 仍成立。
+sudo setfacl -R -m u:cortex-builder:rX,u:cortex-reviewer-planner:rX \
+  /var/lib/cortex/repos/"$SLUG"
 ```
 
-**回滾**：`sudo rm -rf /var/lib/cortex/repos /var/lib/cortex-builder/.gitconfig
-/var/lib/cortex-reviewer-planner/.gitconfig`。
+**回滾**：`sudo rm -rf /var/lib/cortex/repos
+/var/lib/cortex-{builder,reviewer-planner,manager}/.gitconfig`。
 
 ---
 

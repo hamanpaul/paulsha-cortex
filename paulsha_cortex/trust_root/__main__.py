@@ -24,11 +24,14 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
     python -m paulsha_cortex.trust_root gitconfig [three-way|two-way]
-                                        [--builder|--reviewer-planner]
+                                        [--builder|--reviewer-planner|--manager]
                                         --source-repo <slug> [--source-repo <slug>…]
-                                                    # #623：job 帳號 HOME 下 root-owned
-                                                    # 的 .gitconfig 內容（per-job clone
-                                                    # 的來源樹 safe.directory）
+                                                    # #623：帳號 HOME 下 root-owned 的
+                                                    # .gitconfig 內容（來源樹的
+                                                    # safe.directory）。三份同構：兩個
+                                                    # job 帳號 ＋ Manager（Manager 也要
+                                                    # 對來源樹跑 git，同樣會撞 dubious
+                                                    # ownership）
     python -m paulsha_cortex.trust_root polkit [three-way|two-way] [--template|--transient]
                                                     # Phase 2b 降權 polkit 規則內容
                                                     # （--template＝方案 B，**預設**；
@@ -320,11 +323,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         scheme_id = permgen.DEFAULT_SCHEME_ID
         principal = Principal.BUILDER
+        # 旗標→persona 由 permgen 那張表導出：新增一份 .gitconfig 不必改本函式。
+        by_flag = {
+            flag: p for p, flag in permgen.ACCOUNT_GITCONFIG_FLAGS.items()
+        }
         for token in rest:
-            if token == "--builder":
-                principal = Principal.BUILDER
-            elif token == "--reviewer-planner":
-                principal = Principal.REVIEWER
+            if token in by_flag:
+                principal = by_flag[token]
             elif token in permgen.SCHEMES:
                 scheme_id = token
             else:
@@ -332,9 +337,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
         try:
             layout = permgen.DEFAULT_LAYOUT.with_source_repo_slugs(slugs)
-            # fail-closed 與 `--commands` 同一個理由：一份「裝得起來但每個 job 都會在
-            # git clone 失敗」的 .gitconfig，比產生器拒絕產出危險得多（#623）。
-            blob = permgen.build_job_gitconfig(
+            # fail-closed 與 `--commands` 同一個理由：一份「裝得起來但每一次 git 操作
+            # 都會失敗」的 .gitconfig，比產生器拒絕產出危險得多（#623）。
+            blob = permgen.build_account_gitconfig(
                 permgen.SCHEMES[scheme_id], layout, principal
             )
         except (permgen.UnresolvedSourceRepoError, ValueError) as exc:

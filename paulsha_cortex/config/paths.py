@@ -64,6 +64,45 @@ def review_verdict_spool_root() -> Path:
     return coordinator_root() / REVIEW_VERDICT_SPOOL_DIRNAME
 
 
+#: `commit_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數的理由與
+#: `REVIEW_VERDICT_SPOOL_DIRNAME` 逐字相同：coordinator 側的 per-job 定址與本
+#: resolver 必須共用同一個字面量（R1 登記表的「重複路徑推導」Scenario）。
+COMMIT_SPOOL_DIRNAME = "commit-spool"
+
+
+def commit_spool_root() -> Path:
+    """#623／#634：builder 成果回收的 **bundle spool** 根（append-only，per-job 一格）。
+
+    ## 為什麼成果回收要走 spool 而不是「Manager 直接 fetch builder 的 clone」
+
+    per-job clone 模型下 builder 的整棵 clone 由 `cortex-builder` 擁有、mode `0700`。
+    Manager 要 `git -C <來源樹> fetch <clone> …` 就必須：
+
+    1. **traverse 進 builder 的樹**——實測 `cannot change to '…': Permission denied`；
+    2. 為 `<clone>` 加 `safe.directory`——而 clone 路徑是 **per-job** 的，git 2.43 實測
+       **不吃路徑 glob**（只認逐字相等或字面 `*`），因此每起一個 job 就要動一次
+       Manager 的 gitconfig，把一個 Tier-0 檔案變成執行期可變狀態。
+
+    operator 裁決改走 **bundle ＋ append-only spool**：builder 在**自己的** clone 裡
+    `git bundle create <此根>/<job-id>/<name>.bundle …`，Manager 再從那個 **bundle 檔**
+    `fetch`。Manager 全程不碰 builder 的樹（實測 `ls` 仍 `Permission denied`），而且
+    Manager 讀的是一個**普通檔案**、不是 repo——dubious-ownership 與 traverse 兩個問題
+    同時消失。
+
+    ## 權限形態（與 `review_verdict_spool_root()` 逐條相同）
+
+    掛在 `coordinator_root()` 底下的 Manager-owned 樹；Phase 2b 的 chown／ACL 由
+    `trust_root/permgen.py` 依 R1 登記表資產 `commit-spool` 機械產生：容器
+    owner＝durable_state_owner、mode 0700，producer（builder）只獲 **write-only** ACL
+    （`wx`，無 `r`——寫得進自己那格、讀不到別人的 bundle），Manager 擁有並消費。
+    per-job 目錄由 Manager 在 dispatch 當下建立、落地後轉唯讀（pre-seed／seal，與
+    review verdict 通道同一套語意）。
+
+    **本 resolver 只定義路徑**；bundle 的產生與消費在 coordinator 側，屬後續變更。
+    """
+    return coordinator_root() / COMMIT_SPOOL_DIRNAME
+
+
 #: `job_spec_spool_root()` 在 `coordinator_root()` 底下的目錄名。獨立成常數是為了讓
 #: `coordinator/job_runner.py` 的 per-job 定址、`trust_root/permgen.py` 的 layout 與本
 #: resolver 共用同一個字面量（R1 登記表的「重複路徑推導」Scenario 要求單一真相）。
