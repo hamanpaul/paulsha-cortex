@@ -28,11 +28,14 @@ skip 並說明理由**，不用 `sudo -u`／裸跑當替身（那只會產生一
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
 import re
 import stat
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -97,6 +100,26 @@ class _RecordingRunner:
     def expect_output(self, path: str | Path) -> "_RecordingRunner":
         self._out = str(path)
         return self
+
+
+def _function_body_source(func) -> str:
+    """函式的**程式碼本體**（剝掉 docstring，且不含註解）。
+
+    `ast.unparse` 一併丟掉註解是刻意的：本檔用它來斷言「這段程式碼不再呼叫某個
+    函式」，而註解與 docstring 裡提到那個名字是合理的（它們正在解釋為什麼不再呼叫）。
+    """
+
+    src = textwrap.dedent(inspect.getsource(func))
+    node = ast.parse(src).body[0]
+    body = getattr(node, "body", [])
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        node.body = body[1:]
+    return ast.unparse(node)
 
 
 def _nested(patches):
@@ -954,13 +977,13 @@ class RegenerateGatesConvergenceTests(unittest.TestCase):
     """#629：手動救援不得留在 Manager 進程內跑 builder 交出來的 `conftest.py`。"""
 
     def test_the_action_calls_the_shared_entry_point_not_write_gate_ledger(self) -> None:
-        import inspect
-
         from paulsha_cortex.coordinator import work_actions
 
-        source = inspect.getsource(work_actions._regenerate_gates_action)
         # docstring 會提到舊寫法（那是它為什麼改的說明），因此只看**程式碼本體**。
-        body = source.replace(work_actions._regenerate_gates_action.__doc__ or "", "")
+        # 用 `ast` 剝掉 docstring 而不是 `source.replace(fn.__doc__, "")`：後者在
+        # Python 3.13 會失效——3.13 起 `__doc__` 的共同前置縮排在編譯期就被移除，
+        # 與原始碼裡的字串不再逐字相等（3.10–3.12 相等，因此那個寫法只在部分版本綠）。
+        body = _function_body_source(work_actions._regenerate_gates_action)
         self.assertIn("gate_runner.run_declared_gates(", body)
         self.assertNotIn("gate_ledger.write_gate_ledger(", body)
 
