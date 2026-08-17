@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -749,8 +750,17 @@ def test_prepare_systemd_template_agrees_with_canonical_provisioning(
             missing.append(f"模板 unit {unit}（剖面 {profile}）未安裝")
     if not job_runner._is_executable(shim):
         missing.append(f"降權 shim {shim} 不存在或不可執行")
-    if not Path(spool).is_dir():
-        missing.append(f"job spec spool {spool} 不存在")
+    # #657：`Path.is_dir()` 在 EACCES 時**會 raise**（只吞 ENOENT／ENOTDIR 一類），
+    # 而 spool 的父層對非 Manager 帳號本來就是 0700——用 `os.path.isdir()`（吞掉所有
+    # OSError）才是這個 skip 判斷該有的語意。
+    if not os.path.isdir(spool):
+        missing.append(f"job spec spool {spool} 不存在（#657 起每個角色一格）")
+    else:
+        # 「存在」不等於「那個身分讀得到」——那正是 #657。前置物清單一併涵蓋它，
+        # 否則本條會在一台 spool 存在但 ACL 未套用的機器上以真實派工失敗收場。
+        ok, why = job_runner._spool_readable_by(spool, account)
+        if not ok:
+            missing.append(f"builder 讀不到自己的 spec spool（{why}）")
     if missing:
         pytest.skip(
             "本機沒有 trust-root Phase 2b 的降權前置物（"

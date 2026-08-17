@@ -1422,13 +1422,27 @@ class PathLayout:
 
     @property
     def job_spec_spool_root(self) -> str:
-        """Manager 寫、job 只讀的 per-job 執行規格（`<unit-instance-id>.json`）。
+        """per-principal spec spool 的**容器**（登記表資產 `job-spec-spool`）。
 
-        路徑與 `config.paths.job_spec_spool_root()` 是**成對契約**（登記表資產
-        `job-spec-spool`），由 `asset_paths()` 而非本 property 供給權限計畫；本
-        property 只是給 unit／shim 產生器引用的同一份字面量。
+        路徑與 `config.paths.job_spec_spool_root()` 是**成對契約**，由 `asset_paths()`
+        而非本 property 供給權限計畫；本 property 只是給 unit／shim 產生器引用的同一份
+        字面量。
+
+        **#657 起沒有任何 job 讀得到這一層**：它 owner-only 0700、零跨帳號 ACL，
+        降權帳號只會拿到機械導出的 `--x` traverse。spec 落在
+        :meth:`job_spec_spool_for` 的子 spool。
         """
         return f"{self.coordinator_root}/job-specs"
+
+    def job_spec_spool_for(self, principal: Principal) -> str:
+        """#657：**該降權 principal 專屬**的 spec spool（`<容器>/<principal>`）。
+
+        與 `config.paths.job_spec_spool_for()` 是**成對契約**（登記表資產
+        `job-spec-spool-<principal>`）。模板 unit 的
+        `Environment=PSC_JOB_SPEC_SPOOL=` 用的就是本函式——「哪個身分讀哪個 spool」
+        因此是 root-owned unit 檔上可逐字稽核的一行。
+        """
+        return f"{self.job_spec_spool_root}/{principal.value}"
 
     @property
     def bin_root(self) -> str:
@@ -1604,7 +1618,16 @@ class PathLayout:
             # #623／#634 成果回收的 bundle spool：<coordinator>/commit-spool/<job-id>/
             "commit-spool": self.commit_spool_root,
             # Phase 2b 方案 B（0816 第三輪 A+B）：模板 unit 的 per-job 執行規格。
+            # #657：容器 ＋ per-principal 子 spool。子項由登記表的同一張
+            # `DOWNGRADED_JOB_PRINCIPALS` 導出，不逐項寫死——asset_paths() 漏一項的
+            # 症狀是 `plan_to_commands()` 對該資產用 placeholder 路徑，等於漏授。
             "job-spec-spool": self.job_spec_spool_root,
+            **{
+                registry.job_spec_spool_asset_id(principal): self.job_spec_spool_for(
+                    principal
+                )
+                for principal in registry.DOWNGRADED_JOB_PRINCIPALS
+            },
             # #629 gate 執行身分：拋棄式工作區 pool ＋ ledger 單向 spool。
             # 工作區 pool 登記的是**容器**（不帶 per-job segment）：它只有一個 writer
             # ＝`cortex-gate`，因此容器本身就 owner-only 0700，per-job 那一格由 gate
@@ -2404,11 +2427,12 @@ def executor_hardening_profile(executor: str) -> HardeningProfile:
 #:
 #: 這張表同時是 polkit unit pattern 的字幹來源（見 :func:`job_unit_pattern`）：
 #: 放行面 = 這張表 × :data:`HARDENING_PROFILES`，兩者都是列舉，沒有萬用字元。
-DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (
-    Principal.BUILDER,
-    Principal.REVIEWER,
-    Principal.GATE,
-)
+#:
+#: **#657：真相搬進 `registry`，本名只是別名。** 這張表同時決定「登記表有哪些
+#: per-principal spec spool 資產」（`registry.job_spec_spool_asset_id`），而
+#: `permgen` import `registry`（反向不成立）——留在這裡會讓登記表得從產生器 import
+#: 回來。搬過去之後兩邊仍是**同一個 tuple 物件**，不是兩份會漂移的清單。
+DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = registry.DOWNGRADED_JOB_PRINCIPALS
 
 #: 每個 job 角色的 `PATH` 覆寫變數名。與 `coordinator/job_runner.JOB_ROLE_CONFIG`
 #: 的 `path_env` 是**成對契約**（同 `DEFAULT_TEMPLATE_UNIT` 的既有模式：permgen 與
@@ -2925,7 +2949,11 @@ def build_job_unit(
         "",
         "# ExecStart 也是固定的：永遠是 root-owned 的 shim，呼叫端連命令列都給不了。",
         "# per-job 執行規格由 Manager 原子寫入 spec spool（Manager-owned，job 帳號唯讀）：",
-        f"#   {job_layout.job_spec_spool_root}/%i.json",
+        f"#   {job_layout.job_spec_spool_for(principal)}/%i.json",
+        "# **本 principal 專屬的 spool**（#657）：容器 <…>/job-specs/ 對本帳號只有",
+        "# traverse（--x），讀得到的只有自己這一格。shim 是 systemd 套完上面的 User=",
+        "# **之後**才執行的，它以 job 身分讀 spec——所以「這個身分讀得到哪個 spool」",
+        "# 必須是這份 root-owned unit 上可逐字稽核的一行，不是一組共用目錄的 ACL 交集。",
         "# job 因此無法改寫自己的命令列，也無法為下一個 job 埋伏。",
         f"ExecStart={job_layout.job_shim} %i",
         "# 工作目錄：shim 會依 spec 的 working_directory 再 chdir 到該 job 的 worktree；",
@@ -2976,7 +3004,7 @@ def build_job_unit(
         "# shim 讀 spec 的唯一合法來源：這一行在 root-owned 的 unit 檔裡，",
         "# 因此持 spawn 授權的帳號也改不掉 spec 要從哪個目錄讀。shim 對未設此",
         "# 變數的情況 fail-closed（不猜、不落回 $HOME 推導的預設）。",
-        f"Environment=PSC_JOB_SPEC_SPOOL={job_layout.job_spec_spool_root}",
+        f"Environment=PSC_JOB_SPEC_SPOOL={job_layout.job_spec_spool_for(principal)}",
         "# job 永不取得 gh token：GitHub 寫入由 Manager 代理（D1 outbox）。",
         "Environment=GH_TOKEN=",
         "Environment=GITHUB_TOKEN=",
@@ -3086,7 +3114,10 @@ def build_job_shim(
         f"# ExecStart=，因此持 spawn 授權的帳號也換不掉 job 執行的第一支程式。",
         "#",
         f"# $1 ＝ systemd 模板實例名（%i）。spec 由此推導：",
-        f"#   {layout.job_spec_spool_root}/$1.json（Manager 寫、job 唯讀）",
+        f"#   $PSC_JOB_SPEC_SPOOL/$1.json（Manager 寫、job 唯讀）",
+        "# spool 根**只**來自模板 unit 的 Environment=PSC_JOB_SPEC_SPOOL=，而那是",
+        f"#   {layout.job_spec_spool_root}/<principal>（#657：一個降權身分一格）。",
+        "# 本 shim 對三個角色逐字相同——身分與 spool 都由 root-owned 的 unit 決定。",
         "set -eu",
         f'exec "{interpreter}" -m {JOB_SHIM_MODULE} "$@"',
     ]
@@ -3603,7 +3634,7 @@ def build_polkit_rule(
             f"// 內容硬寫死 User={'／'.join(targets)}、NoNewPrivileges=yes、"
             f"CapabilityBoundingSet=（空），\n"
             f"// 以及固定的 ExecStart={layout.job_shim} %i（root-owned shim）。\n"
-            f"// per-job 參數走 Manager-owned spec spool（{layout.job_spec_spool_root}/<id>.json，\n"
+            f"// per-job 參數走 Manager-owned spec spool（{layout.job_spec_spool_root}/<principal>/<id>.json，\n"
             f"// job 帳號唯讀）——{svc} 給得出參數，但給不出 UID、也給不出命令列。\n"
             f"// 因此 {svc} **無法選擇 job 的 UID**，也**無法夾帶任何特權屬性**：\n"
             + "\n".join(f"//     - {p}" for p in POLKIT_FORBIDDEN_PROPERTIES)

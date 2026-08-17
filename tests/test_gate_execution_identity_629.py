@@ -146,6 +146,11 @@ def _preflight_patches(binary: str = "/usr/bin/systemctl"):
         mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
         mock.patch.object(job_runner, "_is_executable", return_value=True),
         mock.patch.object(job_runner, "_unit_is_active", return_value=False),
+        # #657：preflight 現在會算「該 job 身分讀不讀得到自己的 spool」的 effective
+        # 權限；本檔宣稱的帳號在單 UID 的開發機／CI 上不存在，故同一條 seam 一併
+        # stub。真正驗這條語意的是 `tests/test_per_principal_spec_spool_657.py`。
+        mock.patch.object(job_runner, "_spool_readable_by", return_value=(True, "")),
+        mock.patch.object(job_runner, "_spec_readable_by", return_value=(True, "")),
     ]
 
 
@@ -627,7 +632,9 @@ class GateExecutionTests(unittest.TestCase):
         env = {
             **_BASE_ENV,
             job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE,
+            # #657：gate 讀的是**自己的** spool 變數。
             job_runner.JOB_SPEC_SPOOL_ENV: spool_dir,
+            job_runner.GATE_JOB_SPEC_SPOOL_ENV: spool_dir,
             "PSC_GATE_CMD_PYTEST": "python3 -m pytest -q",
             **(env_extra or {}),
         }
@@ -781,7 +788,10 @@ class GateExecutionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), _nested(_preflight_patches()):
             with self.assertRaises(job_runner.JobRunnerError):
                 job_runner.prepare_systemd_template(
-                    {job_runner.JOB_SPEC_SPOOL_ENV: "/tmp"},
+                    {
+                        job_runner.JOB_SPEC_SPOOL_ENV: "/tmp",
+                        job_runner.GATE_JOB_SPEC_SPOOL_ENV: "/tmp",
+                    },
                     job_id="j", executor="codex", role=job_runner.JOB_ROLE_GATE,
                 )
 
@@ -789,7 +799,10 @@ class GateExecutionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True), _nested(_preflight_patches()):
             with self.assertRaises(job_runner.JobRunnerError):
                 job_runner.prepare_systemd_template(
-                    {job_runner.JOB_SPEC_SPOOL_ENV: "/tmp"},
+                    {
+                        job_runner.JOB_SPEC_SPOOL_ENV: "/tmp",
+                        job_runner.GATE_JOB_SPEC_SPOOL_ENV: "/tmp",
+                    },
                     job_id="j", executor=None, role=job_runner.JOB_ROLE_BUILDER,
                 )
 

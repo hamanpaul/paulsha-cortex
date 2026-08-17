@@ -80,6 +80,42 @@ UNTRUSTED_EXECUTION_PRINCIPALS: frozenset[Principal] = (
     HEADLESS_PERSONAS | {Principal.HEADLESS_HOOK, Principal.GATE}
 )
 
+#: **具備啟動面降權的 job principal**——各有一組 root-owned 模板 unit，因此各有一個
+#: **自己的** spec spool（#657）。這張表是那一族的唯一清單：登記表資產
+#: （:func:`job_spec_spool_asset_id`）、路徑（`config.paths.job_spec_spool_for`）、
+#: unit 的 `Environment=PSC_JOB_SPEC_SPOOL=`、polkit 的 unit 字幹全部由它導出。
+#:
+#: - `BUILDER`（M1，#603／#584）：`cortex-job@.service`／`cortex-job-jit@.service`。
+#: - `REVIEWER`（M2，#615）：`cortex-reviewer-job@.service`／`-jit`，
+#:   `User=cortex-reviewer-planner`。
+#: - `GATE`（#629）：`cortex-gate-job@.service`／`-jit`，`User=cortex-gate`。
+#:
+#: **`PLANNER` 刻意不在表內，而且不是遺漏**：三分／四分方案把 reviewer 與 planner
+#: 映到**同一個帳號**，而 unit 與 spool 的全部內容差異都由帳號決定。為 planner 再
+#: 產一份逐字相同、只是名字不同的 unit 與 spool，等於多一個要同步維護的放行面，
+#: 卻換不到任何隔離。`REVIEWER` 在這裡是**那個帳號的代表 principal**，由
+#: `permgen.JOB_PRINCIPAL_PERSONAS` 明載它代表誰。
+#:
+#: 定義在登記表而非 `permgen`：permgen import registry（反向不成立），而本清單同時
+#: 要決定**登記表有哪些資產**。放在 permgen 會讓資產清單得從產生器 import 回來。
+#: `permgen.DOWNGRADED_JOB_PRINCIPALS` 是指向本項的別名，不是第二份。
+DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (
+    Principal.BUILDER,
+    Principal.REVIEWER,
+    Principal.GATE,
+)
+
+
+def job_spec_spool_asset_id(principal: Principal) -> str:
+    """該降權 principal 的 per-principal spec spool 資產 id（#657）。
+
+    容器（`job-spec-spool`）與子 spool（`job-spec-spool-<principal>`）是**兩種不同
+    的東西**：容器 owner-only、對 job 只有機械導出的 `--x` traverse（走得進去、列不
+    出來）；子 spool 才帶該帳號的唯讀 ACL。
+    """
+
+    return f"job-spec-spool-{principal.value}"
+
 
 class IngressKind(Enum):
     """spec §C mutation ingress 盤點的種類。"""
@@ -111,6 +147,15 @@ class TrustRootAsset:
     writers: tuple[Principal, ...]
     readers: tuple[Principal, ...]
     ingress_kind: IngressKind
+    #: 呼叫 `path_resolver` 時要帶的引數（#657）。同一支 resolver 可以服務**一族**
+    #: 資產（per-principal spool：`job_spec_spool_for("gate")`），此時 asset 之間的
+    #: 差別就是這一組引數。空 tuple＝零引數 resolver（絕大多數）。
+    #:
+    #: 為什麼不是「一族三支零引數函式」：那會把「哪些 principal 有自己的 spool」
+    #: 複製成第二份清單，而那份清單漏一項的症狀正是本票要修的東西（漏授＝該身分
+    #: 每個 job 以 78/CONFIG 收場）。resolver 帶引數之後，這族資產與它們的路徑同樣
+    #: **由單一 principal 清單機械導出**。
+    path_resolver_args: tuple[str, ...] = ()
     #: 現況路徑推導位置（`檔案:行號`），供 Phase 2 收斂與交叉複驗；spec §R1 要求
     #: 把重複推導收斂到登記表，故一律登記全部已知推導點。
     derived_in: tuple[str, ...] = ()
@@ -138,6 +183,54 @@ _T0 = AssetTier.TIER_0
 _T1 = AssetTier.TIER_1
 _MO = TrustTree.MANAGER_OWNED
 _JV = TrustTree.JOB_VISIBLE
+
+
+def _job_spec_spool_assets() -> tuple[TrustRootAsset, ...]:
+    """per-principal spec spool 的登記表項（#657）——由
+    :data:`DOWNGRADED_JOB_PRINCIPALS` **機械導出**，不逐項手寫。
+
+    手寫三項的代價不是打字量，是**漏一項的失效模式**：漏掉的那個 principal 不會有
+    任何 ACL，於是它的每一個 job 都在 shim 讀 spec 時 `EACCES` → `78/CONFIG`，而
+    產生器、CI、單 UID 的測試全部是綠的（那正是 #657 的病史）。導出之後，新增一個
+    降權角色只要動那張表一行，資產／路徑／unit env／traverse ACL 一起跟上。
+
+    每一項的 reader 面**只有它自己**（＋Manager，它是 writer 兼消費者）：跨 principal
+    互讀 spec 在本設計下不成立，而那正是選 per-principal 而非「共用 spool 擴大 reader
+    面」的理由之一。
+    """
+
+    return tuple(
+        TrustRootAsset(
+            job_spec_spool_asset_id(principal), _T0, _MO,
+            "paulsha_cortex.config.paths:job_spec_spool_for",
+            (Principal.MANAGER,), (Principal.MANAGER, principal),
+            IngressKind.MANAGER_INTERNAL,
+            path_resolver_args=(principal.value,),
+            derived_in=(
+                "config/paths.py:job_spec_spool_for",
+                "trust_root/permgen.py:PathLayout.job_spec_spool_for",
+                "coordinator/job_runner.py:JOB_ROLE_CONFIG",
+                "coordinator/job_runner.py:job_spec_path",
+                "coordinator/job_shim.py:load_spec",
+            ),
+            note=(
+                f"#657：`{principal.value}` **專屬**的 per-job 執行規格 spool"
+                f"（`<coordinator_root>/job-specs/{principal.value}/"
+                "<unit-instance-id>.json`）。root-owned 模板 unit 的 `ExecStart=` 固定"
+                "為 shim，per-job 的命令／worktree／白名單 env／log 路徑由本 spool 傳遞；"
+                "**writer 只有 Manager**，該 job 帳號在 reader 面（唯讀 ACL），因此改不了"
+                "自己的命令列，`User=` 也完全不在本檔內（硬寫死在 root-owned unit 檔裡）。\n"
+                "**為什麼一個 principal 一個 spool**：shim 是 systemd 套完 `User=` 之後才"
+                "執行的，它以 job 身分讀 spec；共用一個 spool 時「哪個身分讀得到」變成一組"
+                "共用目錄上多條 ACL 的交集，漏授的症狀是該身分每個 job 以 78/CONFIG 收場"
+                "（#657 實機）。拆開之後這件事是 root-owned unit 上可逐字稽核的一行"
+                "`Environment=PSC_JOB_SPEC_SPOOL=`，而且不必新開「跨 persona 互讀 spec」"
+                "這個性質。"
+            ),
+        )
+        for principal in DOWNGRADED_JOB_PRINCIPALS
+    )
+
 
 ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     # ---- resolver-backed 容器樹 --------------------------------------------
@@ -627,22 +720,21 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     TrustRootAsset(
         "job-spec-spool", _T0, _MO,
         "paulsha_cortex.config.paths:job_spec_spool_root",
-        (Principal.MANAGER,), (Principal.MANAGER, Principal.BUILDER),
+        (Principal.MANAGER,), (Principal.MANAGER,),
         IngressKind.MANAGER_INTERNAL,
         derived_in=(
             "config/paths.py:job_spec_spool_root",
-            "coordinator/job_runner.py:job_spec_path",
-            "coordinator/job_shim.py:load_spec",
+            "trust_root/permgen.py:PathLayout.job_spec_spool_root",
         ),
         note=(
-            "0816 第三輪裁決 A+B 的帶外通道：`<coordinator_root>/job-specs/"
-            "<unit-instance-id>.json`。root-owned 的 `cortex-job@.service` 模板 unit 的 "
-            "`ExecStart=` 固定為 shim，per-job 的命令／worktree／白名單 env／log 路徑改由"
-            "本 spool 傳遞。**writer 只有 Manager**——builder 在 reader 面（唯讀 ACL），"
-            "因此改不了自己的命令列；`User=` 完全不在本檔內（它硬寫死在 root-owned 的 "
-            "unit 檔裡），spool 被竄改也無法選 UID。"
+            "0816 第三輪裁決 A+B 的帶外通道**容器**：`<coordinator_root>/job-specs/`。"
+            "**#657 起它本身不再是任何 job 讀得到的目錄**——reader 只有 Manager，"
+            "mode 0700、零跨帳號 ACL；降權帳號在這一層只會拿到 `derive_traverse_grants()` "
+            "機械導出的 `--x`（走得進自己那格、列不出這台機器上還有誰的 job）。"
+            "實際的 spec 落在 per-principal 子 spool（`job-spec-spool-<principal>`）。"
         ),
     ),
+    *_job_spec_spool_assets(),
     TrustRootAsset(
         "verification-evidence", _T0, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,

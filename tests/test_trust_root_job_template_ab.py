@@ -110,7 +110,12 @@ def _template_env(spool: str, **overrides: str) -> dict[str, str]:
         **_BASE_ENV,
         **_SECRET_ENV,
         job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE,
+        # #657：spool 是 per-principal 的（builder／review／gate 各一個變數）。
+        # 測試把三個都指向同一個暫存目錄——這裡驗的是「spec 內容與起動形狀」，
+        # 不是隔離；隔離由 `tests/test_per_principal_spec_spool_657.py` 驗。
         job_runner.JOB_SPEC_SPOOL_ENV: spool,
+        job_runner.REVIEW_JOB_SPEC_SPOOL_ENV: spool,
+        job_runner.GATE_JOB_SPEC_SPOOL_ENV: spool,
     }
     env.update(overrides)
     return env
@@ -130,6 +135,16 @@ def _preflight_patches(*, unit_active: bool = False, **overrides):
         "shim": mock.patch.object(job_runner, "_is_executable", return_value=True),
         "active": mock.patch.object(
             job_runner, "_unit_is_active", return_value=unit_active
+        ),
+        # #657：preflight 現在會算「該 job 身分讀不讀得到自己的 spool」的
+        # **effective** 權限。上面那些 seam 宣稱的帳號（cortex-builder…）在單 UID
+        # 的開發機／CI 上並不存在，因此這裡把同一條 seam 一併 stub 掉——真正驗這條
+        # 語意的是 `tests/test_per_principal_spec_spool_657.py`（自建真實 ACL 樹）。
+        "spool_readable": mock.patch.object(
+            job_runner, "_spool_readable_by", return_value=(True, "")
+        ),
+        "spec_readable": mock.patch.object(
+            job_runner, "_spec_readable_by", return_value=(True, "")
         ),
     }
     defaults.update(overrides)
@@ -518,13 +533,26 @@ class M2ExtensionPointTests(unittest.TestCase):
 
 class JobSpecSpoolAssetTests(unittest.TestCase):
     def test_asset_is_registered_and_manager_owned(self) -> None:
-        asset = registry.asset_by_id("job-spec-spool")
+        """容器（#657 之後 reader 只有 Manager）與 builder 那一格。"""
+        container = registry.asset_by_id("job-spec-spool")
+        self.assertIs(container.tree, registry.TrustTree.MANAGER_OWNED)
+        self.assertEqual(container.writers, (Principal.MANAGER,))
+        # #657：容器本身不再授任何 job 帳號——它只是一個 0700 的殼，job 在這一層
+        # 只會拿到機械導出的 `--x`（走得進自己那格、列不出別人的）。
+        self.assertNotIn(Principal.BUILDER, container.readers)
+        self.assertEqual(
+            container.path_resolver, "paulsha_cortex.config.paths:job_spec_spool_root"
+        )
+        asset = registry.asset_by_id(
+            registry.job_spec_spool_asset_id(Principal.BUILDER)
+        )
         self.assertIs(asset.tree, registry.TrustTree.MANAGER_OWNED)
         self.assertEqual(asset.writers, (Principal.MANAGER,))
         self.assertIn(Principal.BUILDER, asset.readers)
         self.assertEqual(
-            asset.path_resolver, "paulsha_cortex.config.paths:job_spec_spool_root"
+            asset.path_resolver, "paulsha_cortex.config.paths:job_spec_spool_for"
         )
+        self.assertEqual(asset.path_resolver_args, ("builder",))
 
     def test_registry_equation_still_holds(self) -> None:
         result = registry.check_registry_equation()
@@ -534,7 +562,7 @@ class JobSpecSpoolAssetTests(unittest.TestCase):
         """permgen 不變式：builder 只讀得到 spec，改不了自己的命令列。"""
         for scheme in (permgen.DEFAULT_SCHEME, permgen.TWO_WAY_SCHEME):
             plan = permgen.generate_plan(scheme)
-            entry = plan.by_id("job-spec-spool")
+            entry = plan.by_id(registry.job_spec_spool_asset_id(Principal.BUILDER))
             builder = scheme.resolve(Principal.BUILDER)
             writable = plan.all_writable_accounts(entry)
             self.assertEqual(writable, frozenset({scheme.durable_state_owner}), scheme.scheme_id)
@@ -554,6 +582,16 @@ class JobSpecSpoolAssetTests(unittest.TestCase):
             permgen.DEFAULT_LAYOUT.asset_paths()["job-spec-spool"],
             permgen.DEFAULT_LAYOUT.job_spec_spool_root,
         )
+        # #657：per-principal 那一族同樣要落在 asset_paths()——漏一項的症狀是
+        # `plan_to_commands()` 對它用 placeholder 路徑（＝該身分零授權）。
+        for principal in registry.DOWNGRADED_JOB_PRINCIPALS:
+            self.assertEqual(
+                permgen.DEFAULT_LAYOUT.asset_paths()[
+                    registry.job_spec_spool_asset_id(principal)
+                ],
+                f"{permgen.DEFAULT_LAYOUT.job_spec_spool_root}/{principal.value}",
+                principal,
+            )
 
     def test_spool_is_not_writable_from_the_job_unit(self) -> None:
         unit = permgen.build_job_unit(permgen.DEFAULT_SCHEME, permgen.DEFAULT_LAYOUT)
@@ -570,7 +608,11 @@ class JobRunnerPermgenContractTests(unittest.TestCase):
 
     def test_defaults_match_the_layout(self) -> None:
         layout = permgen.DEFAULT_LAYOUT
-        self.assertEqual(job_runner.DEFAULT_JOB_SPEC_SPOOL, layout.job_spec_spool_root)
+        # #657：預設值是 builder **自己那一格**，不是容器。
+        self.assertEqual(
+            job_runner.DEFAULT_JOB_SPEC_SPOOL,
+            layout.job_spec_spool_for(Principal.BUILDER),
+        )
         self.assertEqual(job_runner.DEFAULT_JOB_SHIM, layout.job_shim)
         self.assertEqual(
             job_runner.DEFAULT_TEMPLATE_UNIT,

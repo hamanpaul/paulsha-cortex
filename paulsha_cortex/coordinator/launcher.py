@@ -1544,7 +1544,9 @@ class SubprocessLauncher:
                 log_path=log_path,
                 env=env,
             )
-            job_runner.write_job_spec(template_plan.spec_path, spec)
+            job_runner.write_job_spec(
+                template_plan.spec_path, spec, account=template_plan.account
+            )
             argv = job_runner.build_systemctl_start_argv(
                 systemctl=template_plan.binary, unit=template_plan.unit
             )
