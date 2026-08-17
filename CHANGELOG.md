@@ -393,6 +393,24 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#657 / trust-root Phase 2b：gate（與 reviewer／planner）的 template unit 讀不到自己的
+  job spec——spec spool 改為 per-principal，preflight 改驗「那個身分讀得到」**——#629 落地
+  後實機每個 gate job 都以 `78/CONFIG` 收場：三份模板 unit 共用同一個
+  `Environment=PSC_JOB_SPEC_SPOOL=<coordinator>/job-specs`，而登記表只授 builder 唯讀 ACL；
+  shim 是 systemd 套完 `User=` **之後**才執行的，它以 job 身分讀 spec ⇒ 必然 `EACCES`。
+  reviewer／planner 同型（已查證，#652 未驗到這層）。裁決取 **per-principal spool**：
+  `<coordinator_root>/job-specs/{builder,reviewer,gate}`，各自只授自己；容器降為 owner-only
+  ＋ 機械導出的 `--x` traverse。「哪個身分讀哪個 spool」因此是 root-owned unit 上可逐字稽核
+  的一行，而不是共用目錄上多條 ACL 的交集，也不引入「跨 persona 互讀 spec」這個新性質。
+  三個資產／三條路徑／六份 unit 的 `Environment=` 全部由
+  `registry.DOWNGRADED_JOB_PRINCIPALS` 機械導出。`prepare_systemd_template()` 的 preflight
+  由「目錄存在」升級為「該 job 身分的 **effective** 權限」（`os.stat` ＋ POSIX ACL xattr，
+  含 mask 與整條 traverse 鏈），spec 落地後再就地複驗一次；失敗因此發生在派工之前、
+  訊息在 Manager 端。新增 `tests/test_per_principal_spec_spool_657.py`：**自建真實 ACL 樹**
+  並以 effective 權限斷言（與 `getfacl` 交叉核對），需要第二個 UID 的部分明確 skip 並寫出
+  理由。runbook 新增 §5-3a（含以各 job 身分實測讀得到的正反向步驟）。**需 operator 重跑
+  權限計畫並重落六份 unit，順序：先權限、後 unit。** 詳見
+  `changelog.d/per-principal-spec-spool.md`。
 - **權威 gate ledger 一律由 Manager 自己重寫，spool 內容以不受信任輸入對待（#629）**——
   讓 gate 直接寫 `gate-ledger` 會被 `#628` 的 `foreign_evidence_author()` 當場以
   `gate-ledger-foreign-author` 拒掉；而那個資產**同時**是 exit sentinel 的落點，開放

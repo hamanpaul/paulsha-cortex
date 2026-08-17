@@ -412,14 +412,16 @@ python3 -m paulsha_cortex.trust_root toolchain four-way
 #    **不自行捏造欄位**（手捏的 spec 會被 shim 的白名單 schema 拒絕）
 python3 - <<'PY'
 from paulsha_cortex.coordinator import job_runner
-print("spool 預設      :", job_runner.DEFAULT_JOB_SPEC_SPOOL)
-print("spec 路徑推導   :", job_runner.job_spec_path(job_runner.DEFAULT_JOB_SPEC_SPOOL, "<instance>"))
+for role in job_runner.JOB_ROLES:
+    s = job_runner.resolve_job_spec_spool({}, role=role)
+    print(f"spool[{role:<8}]:", s, "→", job_runner.job_spec_path(s, "<instance>"))
 print("spec_version    :", job_runner.JOB_SPEC_VERSION)
 print("必填欄位        :", job_runner.SPEC_REQUIRED_KEYS)
 print("禁用（身分）欄位:", sorted(job_runner.SPEC_FORBIDDEN_KEYS))
 PY
-#   期望：spool = /var/lib/cortex/coordinator/job-specs（**不是** /var/lib/cortex/jobs）；
-#         spec 路徑 = <spool>/<instance>.json（**一個檔，不是一個目錄**）；
+#   期望：spool = /var/lib/cortex/coordinator/job-specs/builder（#657：**per-principal**，
+#         `role=` 決定哪一格；**不是** /var/lib/cortex/jobs，也不是無尾段的 job-specs）；
+#         spec 路徑 = <該角色的 spool>/<instance>.json（**一個檔，不是一個目錄**）；
 #         禁用欄位含 user／uid／group／gid／properties／exec_start
 #         ——身分只有一個來源＝root-owned unit 檔的 `User=`，spec 連提都不准提。
 ```
@@ -790,22 +792,40 @@ ls -ld /var/lib/cortex-builder /var/lib/cortex-builder/.codex /var/lib/cortex-bu
 #   期望：HOME 與 .codex 皆 root:root 0755；三個 cache 各自 <帳號>:<帳號> 0700。
 #   （Manager 不跑模型，故無 `~/.codex` 這一條。）
 
-# ✅ 驗證：job-spec spool 根 cortex-manager 擁有、0700 ＋ builder 唯讀 ACL
-#   ⚠️ 路徑是 **<coordinator_root>/job-specs**，不是舊版寫的 /var/lib/cortex/jobs
-#      ——後者是 run.sh 時代的 per-job 目錄，**已不在登記表、也不會被建立**。
+# ✅ 驗證：job-spec spool 是 **per-principal** 的（#657）——容器 ＋ 三格
+#   ⚠️ 路徑是 **<coordinator_root>/job-specs/<principal>**。#657 之前三份模板 unit
+#      共用一個 `<coordinator_root>/job-specs`，而 ACL 只授 builder ⇒ reviewer／gate
+#      的**每一個** job 都在 shim 讀 spec 時 EACCES → 78/CONFIG。詳見 5-3a。
 ls -ld /var/lib/cortex/coordinator/job-specs
-#   期望：cortex-manager:cortex-manager 0700
-sudo getfacl -p /var/lib/cortex/coordinator/job-specs | grep -E "^(user|default:user):"
-#   期望：user:cortex-builder:r-x ＋ default:user:cortex-builder:r-x
-#   **builder 讀得到是設計**（見 5-3 表格下的說明）：template unit 的
-#   `User=cortex-builder` 由 systemd 在 `ExecStart` **之前**套用，shim 本身就是以
-#   builder 身分去讀 spec——讀不到就起不了 job。守的是**寫入面**（下一條）。
-sudo -u cortex-builder ls /var/lib/cortex/coordinator/job-specs >/dev/null \
-  && echo "builder 可列 spool（BY DESIGN）"
-sudo -u cortex-builder sh -c 'printf "{}" > /var/lib/cortex/coordinator/job-specs/probe.json' 2>&1 | tail -1
+#   期望：cortex-manager:cortex-manager 0700（容器本身**不授**任何 job 帳號讀權）
+sudo getfacl -p /var/lib/cortex/coordinator/job-specs | grep -E "^(user|mask):"
+#   期望：三條 `user:cortex-{builder,reviewer-planner,gate}:--x`（只給 traverse）
+#         ＋ `mask::--x`。**看 mask**：mask 收窄成 `---` 會讓上面三條全部
+#         `#effective:---`，ACL 還在但沒有作用（見 5-3a 的 mask 陷阱）。
+for P in builder reviewer gate; do
+  ls -ld "/var/lib/cortex/coordinator/job-specs/$P"
+  sudo getfacl -p "/var/lib/cortex/coordinator/job-specs/$P" \
+    | grep -E "^(user|default:user|mask|default:mask):"
+done
+#   期望（逐格）：cortex-manager:cortex-manager 0700，
+#         builder  格 → user:cortex-builder:r-x           ＋ default 同一條
+#         reviewer 格 → user:cortex-reviewer-planner:r-x  ＋ default 同一條
+#         gate     格 → user:cortex-gate:r-x              ＋ default 同一條
+#         且**沒有任何 `#effective:` 註記**（有就是被 mask 吃掉了）。
+#   **job 帳號讀得到自己那格是設計**（見 5-3 表格下的說明）：template unit 的
+#   `User=` 由 systemd 在 `ExecStart` **之前**套用，shim 本身就是以 job 身分去讀
+#   spec——讀不到就起不了 job。守的是**寫入面**（下面第二條）。
+sudo -u cortex-builder ls /var/lib/cortex/coordinator/job-specs/builder >/dev/null \
+  && echo "builder 可列自己那格（BY DESIGN）"
+sudo -u cortex-builder sh -c 'printf "{}" > /var/lib/cortex/coordinator/job-specs/builder/probe.json' 2>&1 | tail -1
 #   期望：Permission denied ← **這條才是邊界**（builder 改不了自己的命令列）
-sudo -u cortex-reviewer-planner ls /var/lib/cortex/coordinator/job-specs 2>&1 | tail -1
-#   期望：Permission denied（spool 只對 builder 開唯讀 ACL——三分在檔案層的證據）
+sudo -u cortex-builder ls /var/lib/cortex/coordinator/job-specs 2>&1 | tail -1
+#   期望：Permission denied（容器只給 traverse，不給列目錄——builder 因此連
+#         「這台機器上還有誰的 job」都看不到）
+sudo -u cortex-gate ls /var/lib/cortex/coordinator/job-specs/builder 2>&1 | tail -1
+sudo -u cortex-reviewer-planner ls /var/lib/cortex/coordinator/job-specs/gate 2>&1 | tail -1
+#   期望：兩行 Permission denied（跨 principal 讀不到彼此的 spec——#657 選
+#         per-principal 而非「擴大共用 spool 的 reader 面」買到的正是這一條）
 ```
 
 ### 2c. 建立來源樹 ＋ 落三份 root-owned `.gitconfig`（#623）
@@ -1683,6 +1703,18 @@ sudo -u cortex-builder sh -c \
 
 ### 5-2. 安裝 (b) template unit（**六份**＝3 角色 × 2 加固剖面）
 
+> **⚠️ 已部署過 #657 之前版本的機器：這一節與第 2 步都必須重跑，且有順序。**
+> #657 把 spec spool 從「一個共用根」改成「一個降權身分一格」，因此
+> **unit 的 `Environment=PSC_JOB_SPEC_SPOOL=` 與 spool 的落點同時改變**。
+> 順序是 **先權限、後 unit**：
+>
+> 1. 重跑第 2 步的權限 script（建出三格並套 ACL，見 5-3a 的第一個命令）；
+> 2. 重落這六份 unit ＋ `daemon-reload`；
+> 3. 跑 5-3a 的實測（**以各 job 身分**讀自己的 spec）。
+>
+> 反過來（先換 unit 後套權限）會讓每個 job 在 shim 讀 spec 時 `EACCES` →
+> `78/CONFIG`，而那正是 #657 的症狀，會白白花掉一輪診斷。
+
 > **為什麼是六份**：unit 檔裡寫死兩件事，兩件都不能靠參數傳——
 >
 > - **`User=`**（#615 M2、#629）：builder／reviewer-planner／gate 是三個不同的
@@ -2015,8 +2047,9 @@ job 的 argv 不再由 Manager 行程直接組出並交給 systemd，而是由 r
 | 角色 | 路徑 | 擁有者 | 權限意義 |
 |---|---|---|---|
 | shim（root-owned 程式） | `/opt/cortex/bin/cortex-job-shim` | root:root 0755 | 三個服務帳號皆**不可寫**（`/opt/cortex` 整棵 root-owned） |
-| job-spec spool 根 | `/var/lib/cortex/coordinator/job-specs` | cortex-manager 0700 ＋ builder `r-x` ACL | **只有 Manager 寫得進去**；builder 唯讀。spool 是登記表資產 `job-spec-spool`，權限由 permgen 機械產生 |
-| per-job spec | `<spool>/<instance>.json`（**一個檔，不是一個目錄**） | cortex-manager 0640 ＋ builder 唯讀 ACL | builder **改不了自己的命令列，也埋伏不了下一個 job**——見下方「守的是寫入面」 |
+| job-spec spool **容器** | `/var/lib/cortex/coordinator/job-specs` | cortex-manager 0700 ＋ 三條 `--x` traverse ACL | **零讀權**：job 走得進自己那格，列不出這台機器上還有誰的 job。登記表資產 `job-spec-spool` |
+| per-principal spool（#657） | `<容器>/{builder,reviewer,gate}` | cortex-manager 0700 ＋ **該帳號** `r-x` ACL（access ＋ default） | 一個降權身分一格。登記表資產 `job-spec-spool-<principal>`，由 `DOWNGRADED_JOB_PRINCIPALS` 機械導出 |
+| per-job spec | `<該角色的 spool>/<instance>.json`（**一個檔，不是一個目錄**） | cortex-manager 0640 ＋ 該帳號唯讀 ACL（default 繼承） | job **改不了自己的命令列，也埋伏不了下一個 job**——見下方「守的是寫入面」 |
 
 > **守的是寫入面，不是讀取面**（M1 實測校正，#584／#621）：
 > template unit 的 `User=cortex-builder` 由 systemd 在 `ExecStart` **之前**套用，
@@ -2025,10 +2058,13 @@ job 的 argv 不再由 Manager 行程直接組出並交給 systemd，而是由 r
 > builder 無法在 spool 內**建立**新 spec、**追加**自己的 spec、用 **symlink 換掉**、
 > 或**刪除**任何 spec。「改不了自己的命令列、埋伏不了下一個 job」就落在這四條上。
 >
-> **per-job 的讀隔離不在本方案範圍**：所有 builder job 共用**同一個 UID**，
+> **per-job 的讀隔離不在本方案範圍**：同一個 persona 的所有 job 共用**同一個 UID**，
 > 因此彼此的 spec 本來就互讀得到——這在威脅模型內（同 persona 的 job 之間不設界）。
 > 要做到 per-job 讀隔離必須 **per-job UID**（動態 UID／`DynamicUser=` 一類），
 > 那是另一個方案，**Phase 2b 不宣稱**。舊版此表寫「job 只讀自己那格」並不精確。
+>
+> **但 per-persona 的讀隔離在 #657 之後成立**：三個降權身分各有自己的 spool 根，
+> 跨 persona 讀不到彼此的 spec（實測步驟在 5-3a）。
 >
 > `User=` 完全不在 spec 內（`build_job_spec()` 對 `user`／`uid`／`group`／`gid`／
 > `properties`／`exec_start` 主動 fail-closed，shim 讀端再驗一次），
@@ -2045,8 +2081,19 @@ systemctl cat cortex-job@.service | grep -E "^ExecStart="
 #   （那是 run.sh 時代的形狀，spool 路徑也還是舊的）——先升級部署樹再繼續。
 
 # ✅ 檢查 spec 從哪裡讀（unit 用 Environment= 寫死，呼叫端改不了）
-systemctl cat cortex-job@.service | grep -E "^Environment=PSC_JOB_SPEC_SPOOL="
-#   期望：Environment=PSC_JOB_SPEC_SPOOL=/var/lib/cortex/coordinator/job-specs
+#   #657：**六份 unit 各指自己那格**，三條路徑必須互不相同。
+for U in cortex-job cortex-job-jit \
+         cortex-reviewer-job cortex-reviewer-job-jit \
+         cortex-gate-job cortex-gate-job-jit; do
+  printf '%-28s ' "$U"
+  systemctl cat "$U@.service" | grep -E "^Environment=PSC_JOB_SPEC_SPOOL="
+done
+#   期望：
+#     cortex-job / cortex-job-jit                   → …/job-specs/builder
+#     cortex-reviewer-job / cortex-reviewer-job-jit → …/job-specs/reviewer
+#     cortex-gate-job / cortex-gate-job-jit         → …/job-specs/gate
+#   任一份仍指向容器 `…/job-specs`（沒有尾段）⇒ 那是 #657 之前的 unit，
+#   該角色的每一個 job 都會以 78/CONFIG 收場。重跑 5-2 的落檔步驟。
 
 # ✅ 檢查 job 工作區的 ReadWritePaths（#645）
 systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/worktree/%i$"
@@ -2131,6 +2178,91 @@ done
 ls -l /opt/cortex/bin/cortex-job-shim
 #   期望：-rwxr-xr-x root root
 ```
+
+### 5-3a. per-principal spec spool（#657）——**以各 job 身分實測讀得到**
+
+> **本節不是「檔案在不在」的檢查。** #657 的實機病灶是：spool 目錄存在、Manager
+> 寫得進去、`getfacl` 上也看得到唯讀 ACL——而 gate／reviewer 的每一個 job 仍以
+> `78/CONFIG` 死掉，因為 shim 是 systemd 套完 `User=` **之後**才執行的，它以 job
+> 身分讀 spec。因此本節的每一條驗收都要**變成那個身分**去做，或至少讀 `getfacl`
+> 的 **`#effective:`**，而不是「有沒有那條 ACL」。
+
+**mask 陷阱（實機量到過，務必看這一條）**：`chmod` 會重寫 ACL 的 mask，因此
+「先 `setfacl` 再 `chmod`」會讓具名條目靜默失效——`getfacl` 仍列出
+`user:cortex-builder:r-x`，後面卻跟著 `#effective:---`，實際權限是零。產生器輸出的
+命令順序（`chown` → `chmod` → `setfacl`，父層 traverse 一律殿後）已經避開它；
+**手動補過 ACL 之後又 `chmod` 過的機器會踩到**。判準一律看 `mask::` 與
+`#effective:`。
+
+```bash
+# 🔧 sudo：重跑權限計畫（#657 之後 spool 從一格變四格，必須重跑）
+python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
+  --operator-account "$(id -un)" --external-reader-account none > /tmp/perm-657.sh
+less /tmp/perm-657.sh          # 先讀過，這份會以 `sh -e` 整份執行
+sudo sh -e /tmp/perm-657.sh
+
+# ✅ 落檔：容器 ＋ 三格
+ls -ld /var/lib/cortex/coordinator/job-specs \
+       /var/lib/cortex/coordinator/job-specs/{builder,reviewer,gate}
+#   期望：四行都是 cortex-manager:cortex-manager 0700
+
+# ✅ effective（不是「有沒有 ACL」）——容器只給 traverse
+sudo getfacl -p /var/lib/cortex/coordinator/job-specs | grep -E "^(user:|mask::)"
+#   期望：三條 user:cortex-*:--x ＋ mask::--x，且**沒有任何 `#effective:` 註記**
+
+# ✅ effective——每格只授自己
+for PAIR in builder:cortex-builder reviewer:cortex-reviewer-planner gate:cortex-gate; do
+  P="${PAIR%%:*}"; A="${PAIR##*:}"
+  echo "--- $P"
+  sudo getfacl -p "/var/lib/cortex/coordinator/job-specs/$P" \
+    | grep -E "^(user:|default:user:|mask::|default:mask::)"
+done
+#   期望（逐格）：`user:<自己>:r-x` ＋ `default:user:<自己>:r-x` ＋
+#         `mask::r-x` ＋ `default:mask::r-x`，**無 `#effective:` 註記**、
+#         **無其他 principal 的條目**。
+#   看到 `#effective:---` ⇒ mask 被 chmod 打掉了，重跑上面那份 script。
+
+# ✅✅ **正向實測：每個身分讀得到自己的 spec**（本節的核心，不可以只驗檔案存在）
+for PAIR in builder:cortex-builder reviewer:cortex-reviewer-planner gate:cortex-gate; do
+  P="${PAIR%%:*}"; A="${PAIR##*:}"
+  S="/var/lib/cortex/coordinator/job-specs/$P/probe-657.json"
+  # Manager 寫（＝正式路徑的寫端：原子寫入 ＋ chmod 0640，讓繼承的 ACL mask 不被關掉）
+  sudo -u cortex-manager sh -c "printf '{\"probe\":1}' > $S && chmod 0640 $S"
+  # 那個身分讀（＝shim 在 systemd 套完 User= 之後做的事）
+  sudo -u "$A" cat "$S" >/dev/null \
+    && echo "$A 讀得到自己的 spec：OK" \
+    || echo "$A 讀不到自己的 spec：**FAIL（這就是 #657）**"
+done
+
+# ✅✅ **反向實測：跨 principal 讀不到彼此的 spec**
+sudo -u cortex-gate cat /var/lib/cortex/coordinator/job-specs/builder/probe-657.json 2>&1 | tail -1
+sudo -u cortex-builder cat /var/lib/cortex/coordinator/job-specs/gate/probe-657.json 2>&1 | tail -1
+sudo -u cortex-reviewer-planner cat /var/lib/cortex/coordinator/job-specs/gate/probe-657.json 2>&1 | tail -1
+#   期望：三行 Permission denied
+
+# ✅ 寫入面仍全拒（M1 起的不變式，本票不得放寬）
+for PAIR in builder:cortex-builder reviewer:cortex-reviewer-planner gate:cortex-gate; do
+  P="${PAIR%%:*}"; A="${PAIR##*:}"
+  sudo -u "$A" sh -c "printf x > /var/lib/cortex/coordinator/job-specs/$P/evil.json" 2>&1 | tail -1
+  sudo -u "$A" sh -c "printf x >> /var/lib/cortex/coordinator/job-specs/$P/probe-657.json" 2>&1 | tail -1
+  sudo -u "$A" rm -f "/var/lib/cortex/coordinator/job-specs/$P/probe-657.json" 2>&1 | tail -1
+done
+#   期望：九行全部 Permission denied（job 建不了、改不了、刪不掉自己的命令列）
+
+# 🧹 清理
+sudo rm -f /var/lib/cortex/coordinator/job-specs/{builder,reviewer,gate}/probe-657.json
+```
+
+> **Manager 端還有一道同語意的閘**：`prepare_systemd_template()` 的 preflight 在
+> #657 之後檢查的是「該 job 身分的 **effective** 權限」而不是「目錄存在」——它以
+> `os.stat` ＋ POSIX ACL xattr 直接算 kernel 用的那條 access check（含 mask 與
+> 整條 traverse 鏈），因此上面任何一條 FAIL 都會在**派工之前**變成
+> `job-runner-job-spec-spool-unreadable`，而不是 journal 裡的一行 78/CONFIG。
+> spec 落地後另有一次就地複驗（`job-runner-job-spec-unreadable-by-job`）。
+>
+> 那道閘**算不到**的三件事，正是本節 `sudo -u` 步驟不可省略的理由：mount 選項
+> （唯讀掛載）、mount namespace（unit 的 `ProtectSystem=strict` 等）、LSM
+> （SELinux／AppArmor）。
 
 ### 5-4. 安裝 (a) polkit 規則
 
@@ -2315,7 +2447,9 @@ import sys
 from paulsha_cortex.coordinator import job_runner
 
 instance = sys.argv[1]
-spool = job_runner.DEFAULT_JOB_SPEC_SPOOL
+# #657：spool 是 per-principal 的——`role=` 決定寫進哪一格。
+spool = job_runner.resolve_job_spec_spool({}, role=job_runner.JOB_ROLE_BUILDER)
+account = "cortex-builder"
 smoke = (
     'echo "== identity =="; id; '
     'echo "== tokens =="; echo "GH_TOKEN=[$GH_TOKEN] GITHUB_TOKEN=[$GITHUB_TOKEN]"; '
@@ -2323,7 +2457,7 @@ smoke = (
     'echo "== home =="; echo "HOME=$HOME"; ls -ld "$HOME"; '
     'echo "== deployment writable? =="; (printf x >> /opt/cortex/venv/bin/cortex) 2>&1 | tail -1; '
     'echo "== spec spool writable? =="; '
-    '(printf x > /var/lib/cortex/coordinator/job-specs/evil.json) 2>&1 | tail -1'
+    '(printf x > /var/lib/cortex/coordinator/job-specs/builder/evil.json) 2>&1 | tail -1'
 )
 spec = job_runner.build_job_spec(
     job_id=f"{instance}-smoke",
@@ -2337,7 +2471,10 @@ spec = job_runner.build_job_spec(
     #    而 token 類的名字 build_job_spec() 直接拒收（見下方註）。
     env={"HOME": "/var/lib/cortex-builder", "PATH": "/usr/local/bin:/usr/bin:/bin"},
 )
-print("wrote:", job_runner.write_job_spec(job_runner.job_spec_path(spool, instance), spec))
+# `account=` 讓寫端在落地後就地複驗「那個身分讀得到這個檔」（#657）——
+# 失敗會是一個 Manager 端的清楚錯誤，而不是 journal 裡的 78/CONFIG。
+print("wrote:", job_runner.write_job_spec(
+    job_runner.job_spec_path(spool, instance), spec, account=account))
 PY
 #   ↑ 以 **cortex-manager 身分**寫——spool 是 Manager-owned，這一步本身就在證明
 #     「writer 只有 Manager」；若這裡就 Permission denied，代表第 2 步權限沒套好。
@@ -2387,7 +2524,9 @@ import sys
 from paulsha_cortex.coordinator import job_runner
 
 instance = sys.argv[1]
-spool = job_runner.DEFAULT_JOB_SPEC_SPOOL
+# #657：spool 是 per-principal 的——`role=` 決定寫進哪一格。
+spool = job_runner.resolve_job_spec_spool({}, role=job_runner.JOB_ROLE_BUILDER)
+account = "cortex-builder"
 smoke = (
     'echo "== identity =="; id; '
     'echo "== tokens =="; echo "GH_TOKEN=[$GH_TOKEN] GITHUB_TOKEN=[$GITHUB_TOKEN]"; '
@@ -2419,7 +2558,10 @@ spec = job_runner.build_job_spec(
         "PATH": "/usr/local/bin:/usr/bin:/bin",
     },
 )
-print("wrote:", job_runner.write_job_spec(job_runner.job_spec_path(spool, instance), spec))
+# `account=` 讓寫端在落地後就地複驗「那個身分讀得到這個檔」（#657）——
+# 失敗會是一個 Manager 端的清楚錯誤，而不是 journal 裡的 78/CONFIG。
+print("wrote:", job_runner.write_job_spec(
+    job_runner.job_spec_path(spool, instance), spec, account=account))
 PY
 
 # ✅ 正向：以 cortex-manager 身分起 reviewer instance——**必須成功**
@@ -2444,7 +2586,7 @@ sudo cat "/var/lib/cortex-reviewer-planner/cache/$RJOB.log"
 # 🔧 清理
 sudo -u cortex-manager systemctl stop "cortex-reviewer-job@$RJOB.service" 2>/dev/null
 sudo rm -rf /var/lib/cortex/coordinator/review-verdicts/probe
-sudo rm -f "/var/lib/cortex/coordinator/job-specs/$RJOB.json" \
+sudo rm -f "/var/lib/cortex/coordinator/job-specs/reviewer/$RJOB.json" \
            "/var/lib/cortex-reviewer-planner/cache/$RJOB.log"
 ```
 
@@ -2602,7 +2744,7 @@ sys.exit(1)
 sudo -u cortex-manager /opt/cortex/venv/bin/python -c '
 import json, sys
 from paulsha_cortex.coordinator import job_shim
-spool = "/var/lib/cortex/coordinator/job-specs"
+spool = "/var/lib/cortex/coordinator/job-specs/builder"
 spec = {"spec_version": 1, "instance": "profile-probe", "job_id": "profile-probe",
         "unit": "cortex-job@profile-probe.service", "command": ["/bin/true"],
         "working_directory": "/tmp", "log_path": "/tmp/probe.jsonl",
@@ -2614,7 +2756,7 @@ except job_shim.ShimError as exc:
     print("refused:", exc); sys.exit(0)
 sys.exit(1)
 '; echo "(12c) exit=$?"
-sudo rm -f /var/lib/cortex/coordinator/job-specs/profile-probe.json
+sudo rm -f /var/lib/cortex/coordinator/job-specs/builder/profile-probe.json
 #   期望：exit=0，印出 refused: ... hardening_profile ...
 ```
 
@@ -2625,7 +2767,7 @@ sudo rm -f /var/lib/cortex/coordinator/job-specs/profile-probe.json
 ```bash
 # 🔧 sudo：清掉 selftest 殘留（spec 是一個檔，worktree 是一個目錄）
 sudo systemctl stop "cortex-job@$JOB.service" 2>/dev/null || true
-sudo rm -f "/var/lib/cortex/coordinator/job-specs/$JOB.json"
+sudo rm -f "/var/lib/cortex/coordinator/job-specs/builder/$JOB.json"
 sudo rm -rf "/var/lib/cortex/worktree/$JOB"
 sudo systemctl reset-failed "cortex-job@*" "cortex-job-jit@*" 2>/dev/null || true
 ```
@@ -2922,7 +3064,8 @@ d() { printf '%s :: ' "$1"; shift; if "$@" >/dev/null 2>&1; then echo "readable 
 # need() = 目標檔必須先存在，否則「刪不掉／讀不到」測的是「檔不存在」而非「被拒」。
 need() { [ -e "$1" ] || printf '!! 前置缺失：%s 不存在——對它的刪除／截斷／讀取測項會是假綠，請先由 operator 以 cortex-manager 身分預建\n' "$1"; }
 A=/var/lib/cortex
-SPOOL=$A/coordinator/job-specs
+# #657：spool 是 per-principal 的；R9 攻擊腳本以模型 job 身分執行，看的是自己那格。
+SPOOL=$A/coordinator/job-specs/builder
 
 # ⛔ 身分鎖（**不可移除**）：本腳本會真的執行破壞性動作——truncate、`rm`、
 #    `mv "$HOME/.codex"`、覆寫 hooks.json。在沙箱外（例如 operator 帳號）
@@ -3077,7 +3220,9 @@ import sys
 from paulsha_cortex.coordinator import job_runner
 
 instance, manager_pid = sys.argv[1], sys.argv[2]
-spool = job_runner.DEFAULT_JOB_SPEC_SPOOL
+# #657：spool 是 per-principal 的——`role=` 決定寫進哪一格。
+spool = job_runner.resolve_job_spec_spool({}, role=job_runner.JOB_ROLE_BUILDER)
+account = "cortex-builder"
 spec = job_runner.build_job_spec(
     job_id=f"{instance}-attack",
     instance=instance,
@@ -3093,7 +3238,10 @@ spec = job_runner.build_job_spec(
         "MANAGER_PID": manager_pid,
     },
 )
-print("wrote:", job_runner.write_job_spec(job_runner.job_spec_path(spool, instance), spec))
+# `account=` 讓寫端在落地後就地複驗「那個身分讀得到這個檔」（#657）——
+# 失敗會是一個 Manager 端的清楚錯誤，而不是 journal 裡的 78/CONFIG。
+print("wrote:", job_runner.write_job_spec(
+    job_runner.job_spec_path(spool, instance), spec, account=account))
 PY
 sudo -u cortex-manager systemctl start "cortex-job@$JOB.service"
 # ⚠️ 報告在 **spec 的 log_path**，不在 journal——shim 在已降權之後接管 stdout/stderr。
@@ -3113,7 +3261,9 @@ import sys
 from paulsha_cortex.coordinator import job_runner
 
 instance, manager_pid = sys.argv[1], sys.argv[2]
-spool = job_runner.DEFAULT_JOB_SPEC_SPOOL
+# #657：spool 是 per-principal 的——`role=` 決定寫進哪一格。
+spool = job_runner.resolve_job_spec_spool({}, role=job_runner.JOB_ROLE_REVIEW)
+account = "cortex-reviewer-planner"
 spec = job_runner.build_job_spec(
     job_id=f"{instance}-r9",
     instance=instance,
@@ -3129,7 +3279,10 @@ spec = job_runner.build_job_spec(
         "MANAGER_PID": manager_pid,
     },
 )
-print("wrote:", job_runner.write_job_spec(job_runner.job_spec_path(spool, instance), spec))
+# `account=` 讓寫端在落地後就地複驗「那個身分讀得到這個檔」（#657）——
+# 失敗會是一個 Manager 端的清楚錯誤，而不是 journal 裡的 78/CONFIG。
+print("wrote:", job_runner.write_job_spec(
+    job_runner.job_spec_path(spool, instance), spec, account=account))
 PY
 sudo -u cortex-manager systemctl start "cortex-reviewer-job@$RJOB.service"
 sudo cat "/var/lib/cortex-reviewer-planner/cache/$RJOB.log" | tee /tmp/r9-reviewer.txt
@@ -3341,7 +3494,7 @@ PY
 
 # 🔧 清理
 sudo rm -rf "$SPOOLDIR" /var/lib/cortex/coordinator/review-verdicts/negctl
-sudo rm -f "/var/lib/cortex/coordinator/job-specs/$VJOB.json" \
+sudo rm -f "/var/lib/cortex/coordinator/job-specs/reviewer/$VJOB.json" \
            "/var/lib/cortex-reviewer-planner/cache/$VJOB.log"
 ```
 
@@ -3371,7 +3524,9 @@ try "T5.1 write dispatch log dir"      ": > $A/runtime/dispatch/psc-probe"
 # T5.2 寫其他 Tier-0 Manager-owned 資產
 try "T5.2 write jobs registry"         ": > $A/coordinator/jobs.json.probe"
 try "T5.2 write evidence tree"         ": > $A/coordinator/evidence/.probe"
-try "T5.2 write job-spec spool"        ": > $A/coordinator/job-specs/.probe"
+try "T5.2 write job-spec spool"        ": > $A/coordinator/job-specs/gate/.probe"
+try "T5.2 read another persona spool"  "ls $A/coordinator/job-specs/builder"
+try "T5.2 list the spool container"    "ls $A/coordinator/job-specs"
 try "T5.2 write repo source tree"      ": > $A/repos/.probe"
 # T5.3 寫 builder 的工作樹（讀得到，但不可寫）
 for d in $A/worktree/*/; do try "T5.3 write builder worktree" ": > ${d}psc-probe"; break; done
@@ -3496,8 +3651,8 @@ sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | x
 ```bash
 # 🔧 sudo：清掉 R9 抽驗的全部殘留（含 drop-in 目錄——它本身就是提權面）
 sudo systemctl stop "cortex-job@r9.service" "cortex-job@negctl5.service" 2>/dev/null || true
-sudo rm -f /var/lib/cortex/coordinator/job-specs/r9.json \
-           /var/lib/cortex/coordinator/job-specs/negctl5.json \
+sudo rm -f /var/lib/cortex/coordinator/job-specs/builder/r9.json \
+           /var/lib/cortex/coordinator/job-specs/builder/negctl5.json \
            /var/lib/cortex/r9-attack.sh
 sudo rm -rf /var/lib/cortex/worktree/r9 /var/lib/cortex/worktree/negctl5 \
             /var/lib/cortex/worktree/victim \
@@ -3506,8 +3661,8 @@ sudo rm -rf /var/lib/cortex/worktree/r9 /var/lib/cortex/worktree/negctl5 \
             /etc/systemd/system/cortex-job-jit@.service.d
 sudo systemctl daemon-reload
 
-# ✅ 驗證：spool 內不得殘留任何抽驗用的 spec（它們是 job 的命令列）
-sudo ls -l /var/lib/cortex/coordinator/job-specs
+# ✅ 驗證：spool 內不得殘留任何抽驗用的 spec（它們是 job 的命令列）——**逐格看**
+sudo ls -l /var/lib/cortex/coordinator/job-specs/{builder,reviewer,gate}
 #   期望：不含 r9.json／negctl5.json／selftest.json／evil.json
 ```
 
@@ -3639,7 +3794,7 @@ sudo -u cortex-manager systemctl start cortex-job@negctl5.service \
   && echo "降權重啟後仍可用" || echo "!! 降權失效，查 polkit"
 sudo grep -o "uid=[0-9]*(cortex-builder)" /var/lib/cortex/worktree/negctl5/negctl5.log
 # 🔧 sudo：驗完立刻清掉（spec 是 job 的命令列，不留過夜）
-sudo rm -f /var/lib/cortex/coordinator/job-specs/negctl5.json
+sudo rm -f /var/lib/cortex/coordinator/job-specs/builder/negctl5.json
 sudo rm -rf /var/lib/cortex/worktree/negctl5
 
 # ✅ 7. 降權反向：重啟後提權仍被拒（規則沒有因重啟而失效）
@@ -3747,8 +3902,13 @@ diff <(python3 -m paulsha_cortex.trust_root shim four-way)            /opt/corte
 sudo grep -rIl -- "/.local/share/pipx" /opt/cortex/venv | head    # 期望：空輸出
 sudo find /opt/cortex/venv -name "pipx_shared.pth" | head          # 期望：空輸出
 
-# ✅ job-spec spool 沒有留下過夜的 spec（每一份都是某個 job 的命令列）
-sudo ls -l /var/lib/cortex/coordinator/job-specs
+# ✅ job-spec spool 沒有留下過夜的 spec（每一份都是某個 job 的命令列）——**逐格看**
+sudo ls -l /var/lib/cortex/coordinator/job-specs/{builder,reviewer,gate}
+# ✅ #657：六份 unit 各指自己那格（共用一條＝該角色每個 job 必以 78/CONFIG 收場）
+for U in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit \
+         cortex-gate-job cortex-gate-job-jit; do
+  systemctl cat "$U@.service" | grep -E "^Environment=PSC_JOB_SPEC_SPOOL="
+done | sort -u | wc -l          # 期望：3
 
 # ✅ 沒有殘留的 template drop-in（族 5.2 的持久化面）——**四份都要看**
 for S in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit; do

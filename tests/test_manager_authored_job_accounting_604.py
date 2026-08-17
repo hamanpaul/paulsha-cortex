@@ -182,6 +182,11 @@ def _seams(*, template: bool):
             mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
             mock.patch.object(job_runner, "_is_executable", return_value=True),
             mock.patch.object(job_runner, "_unit_is_active", return_value=False),
+            # #657：preflight／落地複驗現在算的是「該 job 身分的 effective 權限」，
+            # 而本檔宣稱的帳號在單 UID 環境不存在。真正驗那條語意的是
+            # `tests/test_per_principal_spec_spool_657.py`（自建真實 ACL 樹）。
+            mock.patch.object(job_runner, "_spool_readable_by", return_value=(True, "")),
+            mock.patch.object(job_runner, "_spec_readable_by", return_value=(True, "")),
         ]
     return patches
 
@@ -204,7 +209,10 @@ def _launch(
             env = {
                 **_BASE_ENV,
                 job_runner.JOB_RUNNER_ENV: mode,
+                # #657：spool per-principal；本檔只跑 builder，其餘一併指同一格。
                 job_runner.JOB_SPEC_SPOOL_ENV: spool,
+                job_runner.REVIEW_JOB_SPEC_SPOOL_ENV: spool,
+                job_runner.GATE_JOB_SPEC_SPOOL_ENV: spool,
                 **(extra_env or {}),
             }
             log_dir = str(Path(root) / "logs")

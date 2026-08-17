@@ -62,9 +62,9 @@ stderr 併進 JSONL log（`stderr=STDOUT`）。不加 `--quiet` 就等於在 ter
 - `User=` 與 `ExecStart=` 都寫死在 root 擁有的 `cortex-job@.service` 裡，Manager
   帳號**選不了 UID、也給不了命令列**（unit 檔它改不動）。
 - 命令列既然給不了，per-job 參數改走**帶外通道**：一份 spec JSON 原子寫進
-  Manager-owned spool（登記表資產 `job-spec-spool`，job 帳號唯讀），
-  `ExecStart=` 的 root-owned shim 讀完才 exec 真正的 job
-  （見 :mod:`paulsha_cortex.coordinator.job_shim`）。
+  Manager-owned spool（登記表資產 `job-spec-spool-<principal>`，**該** job 帳號
+  唯讀；#657 起一個降權身分一格），`ExecStart=` 的 root-owned shim 讀完才 exec
+  真正的 job（見 :mod:`paulsha_cortex.coordinator.job_shim`）。
 - spec **不含** `User`／`uid` 這類欄位（:data:`SPEC_FORBIDDEN_KEYS` 在寫端與讀端
   各擋一次），也不含任何 token（沿用同一份 env 白名單）。
 
@@ -124,6 +124,8 @@ __all__ = [
     "DEFAULT_GATE_TEMPLATE_UNIT",
     "DEFAULT_JOB_SHIM",
     "DEFAULT_JOB_SPEC_SPOOL",
+    "DEFAULT_GATE_JOB_SPEC_SPOOL",
+    "DEFAULT_REVIEW_JOB_SPEC_SPOOL",
     "DEFAULT_REVIEWER_ACCOUNT",
     "DEFAULT_REVIEW_TEMPLATE_UNIT",
     "DEFAULT_START_TIMEOUT_MS",
@@ -145,6 +147,10 @@ __all__ = [
     "JOB_RUNNER_ENV",
     "JOB_SHIM_ENV",
     "JOB_SPEC_SPOOL_ENV",
+    "GATE_JOB_SPEC_SPOOL_ENV",
+    "REVIEW_JOB_SPEC_SPOOL_ENV",
+    "POSIX_ACL_ACCESS_XATTR",
+    "POSIX_ACL_DEFAULT_XATTR",
     "JOB_SPEC_VERSION",
     "JobRoleConfig",
     "JobRunnerError",
@@ -175,7 +181,9 @@ __all__ = [
     "build_systemd_run_argv",
     "confirm_template_instance_started",
     "confirm_transient_unit_started",
+    "effective_perms_for_account",
     "forbidden_spec_keys",
+    "inherited_perms_for_account",
     "instance_name_valid",
     "job_spec_path",
     "preflight_systemd_run",
@@ -186,6 +194,7 @@ __all__ = [
     "resolve_hardening_profile",
     "resolve_job_account",
     "resolve_job_group",
+    "resolve_job_spec_spool",
     "resolve_job_role",
     "template_instance_id",
     "template_unit_for_profile",
@@ -289,6 +298,32 @@ TEMPLATE_UNIT_PREFIX = "cortex-job@"
 TEMPLATE_UNIT_SUFFIX = ".service"
 DEFAULT_TEMPLATE_UNIT = f"{TEMPLATE_UNIT_PREFIX}{TEMPLATE_UNIT_SUFFIX}"
 
+# ---------------------------------------------------------------------------
+# per-principal spec spool（#657）
+#
+# 在此之前三份模板 unit 共用同一個 spool 根，而登記表只授 builder 唯讀 ACL——shim 是
+# systemd 套完 `User=` **之後**才執行的，因此 reviewer／gate 的每一個 job 都在讀 spec
+# 時 `EACCES` → `78/CONFIG`（實機實測）。現在每個角色有自己的 spool（登記表資產
+# `job-spec-spool-<principal>`），路徑由 root-owned 的模板 unit 以
+# `Environment=PSC_JOB_SPEC_SPOOL=` 宣告——**shim 端因此一行都不必改**，它讀的永遠是
+# 「這份 unit 說的那一個」，而那一行是可稽核的。
+#
+# 下面三組預設值與 `trust_root.permgen.PathLayout.job_spec_spool_for()` 是**成對契約**
+# （與 `DEFAULT_TEMPLATE_UNIT` 同一個既有模式：job_runner 刻意不 import permgen，改由
+# `tests/test_per_principal_spec_spool_657.py` 釘住兩邊逐字相等）。
+#
+# **per-role 的變數名是刻意的**：共用一個 `PSC_JOB_SPEC_SPOOL` 會讓「Manager 的環境裡
+# 剛好有這個變數」把三個角色一起導回同一個目錄——那正好是本票要修掉的那個狀態，而且
+# 會靜默生效。
+# ---------------------------------------------------------------------------
+
+JOB_SPEC_SPOOL_ENV = "PSC_JOB_SPEC_SPOOL"
+DEFAULT_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs/builder"
+REVIEW_JOB_SPEC_SPOOL_ENV = "PSC_REVIEW_JOB_SPEC_SPOOL"
+DEFAULT_REVIEW_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs/reviewer"
+GATE_JOB_SPEC_SPOOL_ENV = "PSC_GATE_JOB_SPEC_SPOOL"
+DEFAULT_GATE_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs/gate"
+
 
 # ---------------------------------------------------------------------------
 # job 角色（#615 M2：reviewer／planner 啟動面降權）
@@ -329,6 +364,11 @@ class JobRoleConfig:
     path_env: str
     template_env: str
     default_template: str
+    #: #657：**本角色專屬**的 spec spool。與模板 unit 的
+    #: `Environment=PSC_JOB_SPEC_SPOOL=` 是同一條路徑的兩個落點（Manager 寫端／
+    #: shim 讀端），由 `trust_root.permgen` 機械產出。
+    spec_spool_env: str
+    default_spec_spool: str
     #: 這個角色是誰、為什麼要獨立一份（進錯誤訊息與產物註解）。
     rationale: str
 
@@ -344,6 +384,8 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             path_env=BUILDER_PATH_ENV,
             template_env=TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_TEMPLATE_UNIT,
+            spec_spool_env=JOB_SPEC_SPOOL_ENV,
+            default_spec_spool=DEFAULT_JOB_SPEC_SPOOL,
             rationale=(
                 "builder persona——唯一會在自己完全掌控的工作區裡跑 untrusted repo "
                 "code 的角色，攻擊面最大。M1（#603／#584）已落地。"
@@ -358,6 +400,8 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             path_env=REVIEWER_PATH_ENV,
             template_env=REVIEW_TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_REVIEW_TEMPLATE_UNIT,
+            spec_spool_env=REVIEW_JOB_SPEC_SPOOL_ENV,
+            default_spec_spool=DEFAULT_REVIEW_JOB_SPEC_SPOOL,
             rationale=(
                 "reviewer ＋ planner persona（三分方案下同一個 OS 帳號）。M2（#615）："
                 "在此之前它們仍在 Manager 行程內以 Manager 帳號執行，"
@@ -373,6 +417,8 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             path_env=GATE_PATH_ENV,
             template_env=GATE_TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_GATE_TEMPLATE_UNIT,
+            spec_spool_env=GATE_JOB_SPEC_SPOOL_ENV,
+            default_spec_spool=DEFAULT_GATE_JOB_SPEC_SPOOL,
             rationale=(
                 "gate 執行身分（#629）——operator 宣告的 `PSC_GATE_CMD_*` 在這裡執行。"
                 "它不跑模型，但那些命令載入的是 builder 完全掌控的工作樹裡的 "
@@ -455,10 +501,6 @@ EXECUTOR_HARDENING_PROFILE: Mapping[str, str] = MappingProxyType(
         "agy": HARDENING_PROFILE_STRICT,
     }
 )
-
-#: Manager-owned 的 per-job spec spool（登記表資產 `job-spec-spool`）。
-JOB_SPEC_SPOOL_ENV = "PSC_JOB_SPEC_SPOOL"
-DEFAULT_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs"
 
 #: root-owned shim（模板 unit 的固定 `ExecStart=`）。preflight 只檢查它存在且可執行。
 JOB_SHIM_ENV = "PSC_JOB_SHIM"
@@ -1361,8 +1403,18 @@ def resolve_template_unit(env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDE
     return (env.get(config.template_env) or "").strip() or config.default_template
 
 
-def resolve_job_spec_spool(env: Mapping[str, str]) -> str:
-    return (env.get(JOB_SPEC_SPOOL_ENV) or "").strip() or DEFAULT_JOB_SPEC_SPOOL
+def resolve_job_spec_spool(env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
+    """該角色**自己的** spec spool（#657；由 :data:`JOB_ROLE_CONFIG` 查表）。
+
+    `role` 的預設值是 builder，與 :func:`resolve_job_account` 等同族函式一致——理由也
+    一樣：忘了傳 `role` 的後果是「reviewer 的 spec 被寫進 builder 的 spool」，那個 job
+    起不來（它的 unit 讀的是 reviewer 的 spool），而**起不來是安全的失敗方向**；反過來
+    若讓寫端落回一個共用目錄，才會回到 #657 那個「看起來成功、實際上每個 job 78/CONFIG」
+    的狀態。
+    """
+
+    config = resolve_job_role(role)
+    return (env.get(config.spec_spool_env) or "").strip() or config.default_spec_spool
 
 
 def resolve_job_shim(env: Mapping[str, str]) -> str:
@@ -1444,7 +1496,9 @@ def build_job_spec(
     return spec
 
 
-def write_job_spec(spec_path: str, spec: Mapping[str, object]) -> str:
+def write_job_spec(
+    spec_path: str, spec: Mapping[str, object], *, account: str | None = None
+) -> str:
     """把 spec **原子**寫進 Manager-owned spool；失敗即 fail-closed。
 
     原子性（同目錄 temp ＋ `os.replace`）不是潔癖：spec 是 job 的命令列，一個被
@@ -1455,6 +1509,13 @@ def write_job_spec(spec_path: str, spec: Mapping[str, object]) -> str:
     即 `0600`，而 group 位全關會**連帶把繼承下來的 ACL mask 也關掉**，job 帳號的
     唯讀 ACL 因此形同虛設（讀 spec 會 EACCES）。group 仍是 Manager 自己的 group，
     所以放寬 group-read 不會讓第三方讀到。
+
+    **`account`（#657）**：落地之後就地複驗「那個身分讀得到這個檔」。preflight 算的
+    是 spool 目錄的 default ACL（spec 當時還不存在，那是唯一能算的東西）；這裡算的是
+    **真的那個 inode**，把上面那段 `chmod 0640` ⟷ ACL mask 的推導從註解升級成斷言。
+    `account=None` 或帳號不在 passwd 時略過——那兩種情形在正式派工路徑上不可達
+    （`prepare_systemd_template()` 已對帳號 fail-closed），只出現在直接呼叫本函式的
+    測試裡。
     """
 
     directory = os.path.dirname(spec_path) or "."
@@ -1481,6 +1542,20 @@ def write_job_spec(spec_path: str, spec: Mapping[str, object]) -> str:
             source="write_job_spec",
             spec_path=spec_path,
         ) from exc
+    if account:
+        ok, why = _spec_readable_by(spec_path, account)
+        if not ok:
+            raise _fail(
+                "job-runner-job-spec-unreadable-by-job",
+                (
+                    f"spec 已落地但 {account} 讀不到它: {why}。shim 會在 systemd 套完 "
+                    "User= 之後以該身分讀這個檔，因此本次派工必定以 78/CONFIG 收場"
+                    "——在這裡擋掉，而不是讓它變成 journal 裡的一行（#657）。"
+                ),
+                source="write_job_spec",
+                spec_path=spec_path,
+                account=account,
+            )
     return spec_path
 
 
@@ -1567,12 +1642,20 @@ def preflight_systemd_template(
     unit_file_installed: Callable[[str], bool] | None = None,
     executable: Callable[[str], bool] | None = None,
     directory_exists: Callable[[str], bool] | None = None,
+    spool_readable: Callable[[str, str], tuple[bool, str]] | None = None,
 ) -> str:
     """模板模式的靜態檢查；任一項不成立即 fail-closed，回傳 systemctl 絕對路徑。
 
     比 A 案多三條，對應「本模式生效需要 Phase 2b 安裝」的三個前置物：模板 unit 檔、
     root-owned shim、Manager-owned spec spool。**任何一條都不會退回其他模式**——
     「以為降權生效但其實沒有」正是這整條票要消除的失效模式。
+
+    **spool 那一條在 #657 之後檢查的是「`account` 讀得到」而不是「目錄存在」。**
+    舊的 `os.path.isdir()` 對 #657 完全無感：那台實機上 spool 目錄存在、Manager 也
+    寫得進去，缺的只是 `cortex-gate` 的 ACL——於是 preflight 綠、`systemctl start`
+    回 0、job 在 shim 讀 spec 時才以 `78/CONFIG` 死掉，逐字原因只在 journal 裡。
+    現在改以 :func:`_spool_readable_by` 算該帳號的 **effective** 權限（見該函式的
+    誠實邊界），失敗點因此回到「派工之前、Manager 自己的錯誤訊息裡」。
 
     polkit 拒絕仍然沒有可靠的唯讀探測面，由
     :func:`confirm_template_instance_started` 在起動階段補上。
@@ -1634,9 +1717,28 @@ def preflight_systemd_template(
     if not has_dir(spool_dir):
         raise _fail(
             "job-runner-job-spec-spool-missing",
-            f"job spec spool 目錄不存在: {spool_dir}（Phase 2b 權限套用尚未執行？）",
+            (
+                f"job spec spool 目錄不存在: {spool_dir}（#657 起每個降權角色一格；"
+                "Phase 2b 權限套用尚未重跑？）"
+            ),
             source="preflight_systemd_template",
             spool_dir=spool_dir,
+        )
+    readable = spool_readable or _spool_readable_by
+    ok, why = readable(spool_dir, account)
+    if not ok:
+        raise _fail(
+            "job-runner-job-spec-spool-unreadable",
+            (
+                f"job 身分 {account} 讀不到自己的 spec spool: {why}。"
+                "（#657：spool 存在不等於那個身分讀得到——shim 是 systemd 套完 "
+                "`User=` **之後**才執行的，它以 job 身分讀 spec。重跑 "
+                "`python3 -m paulsha_cortex.trust_root permissions --commands --paths` "
+                "並套用，或見 runbook 的 per-principal spool 段。）"
+            ),
+            source="preflight_systemd_template",
+            spool_dir=spool_dir,
+            account=account,
         )
     return resolved
 
@@ -1743,7 +1845,7 @@ def prepare_systemd_template(
     profile = _resolve_profile_for_role(env, role=role, executor=executor)
     template = template_unit_for_profile(base_template, profile)
     shim = resolve_job_shim(env)
-    spool_dir = resolve_job_spec_spool(env)
+    spool_dir = resolve_job_spec_spool(env, role=role)
     binary = preflight_systemd_template(
         account=account,
         group=group,
@@ -1900,3 +2002,303 @@ def _group_exists(name: str) -> bool:
     except KeyError:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# 「**那個身分**讀得到嗎」——effective 權限判定（#657）
+#
+# 本族 bug（#638／#657）全部是同一個形狀：測試與 preflight 檢查的是「檔案／目錄
+# 存在」，而實機失敗的是「**該 job 身分**讀不到它」。兩者在單 UID 環境下無法區分，
+# 於是 CI 綠、實機每個 job 以 78/CONFIG 收場。
+#
+# Manager 不是那個身分，`os.access()` 問的是「**我**讀不讀得到」，因此答不了這題。
+# 但核心的判定並不需要變成那個身分：POSIX.1e 的 access check 是**對 inode 的中繼資料
+# 做的一次純計算**（owner／group／mode ＋ ACL），而那些中繼資料 Manager 讀得到。
+# 下面就是那個計算——不是近似，是 kernel 用的同一條規則。
+#
+# 它**不**涵蓋的（誠實邊界，見 runbook 的實測步驟）：
+#   - mount 選項（`noexec`／唯讀掛載）與 LSM（SELinux／AppArmor）；
+#   - mount namespace（模板 unit 的 `ProtectSystem=strict` 等）；
+#   - root 對 DAC 的豁免（本族評的都是非 root 的 job 帳號，不適用）。
+# 那三項只有「真的以該身分開一次檔」才驗得到，所以 runbook 保留 `sudo -u <帳號>`
+# 的實測步驟，而測試對「需要第二個 UID 才驗得到」的部分**明確 skip 並說明理由**。
+# ---------------------------------------------------------------------------
+
+#: POSIX.1e access ACL 的 xattr 名（Linux）。`getfacl` 讀的就是這個。
+POSIX_ACL_ACCESS_XATTR = "system.posix_acl_access"
+#: 目錄的 default ACL——決定**底下新建的檔**會繼承到哪些具名條目。spec 檔在 preflight
+#: 當下還不存在（它是 preflight 通過之後才寫的），因此「job 讀不讀得到自己的 spec」
+#: 在這個時點只能、也**足以**由這一份決定（另一半是 `write_job_spec()` 的 0640）。
+POSIX_ACL_DEFAULT_XATTR = "system.posix_acl_default"
+
+_ACL_TAG_USER_OBJ = 0x01
+_ACL_TAG_USER = 0x02
+_ACL_TAG_GROUP_OBJ = 0x04
+_ACL_TAG_GROUP = 0x08
+_ACL_TAG_MASK = 0x10
+_ACL_TAG_OTHER = 0x20
+_ACL_XATTR_VERSION = 2
+_ACL_UNDEFINED_ID = 0xFFFFFFFF
+
+_PERM_R = 0o4
+_PERM_W = 0o2
+_PERM_X = 0o1
+
+
+def _perm_str(bits: int) -> str:
+    """`0o5` → `"r-x"`。錯誤訊息裡的可讀形狀（與 `getfacl` 同一種寫法）。"""
+
+    return "".join(
+        letter if bits & bit else "-"
+        for letter, bit in (("r", _PERM_R), ("w", _PERM_W), ("x", _PERM_X))
+    )
+
+
+def _parse_acl_xattr(blob: bytes) -> list[tuple[int, int, int]]:
+    """POSIX.1e ACL xattr → `[(tag, perms, id), …]`。格式不認得即空 list。
+
+    佈局（`<linux/posix_acl_xattr.h>`）：4-byte little-endian version，其後每 8 bytes
+    一條：`u16 tag`、`u16 perm`、`u32 id`。
+    """
+
+    if len(blob) < 4 or (len(blob) - 4) % 8:
+        return []
+    if int.from_bytes(blob[:4], "little") != _ACL_XATTR_VERSION:
+        return []
+    entries: list[tuple[int, int, int]] = []
+    for offset in range(4, len(blob), 8):
+        tag = int.from_bytes(blob[offset:offset + 2], "little")
+        perm = int.from_bytes(blob[offset + 2:offset + 4], "little")
+        ident = int.from_bytes(blob[offset + 4:offset + 8], "little")
+        entries.append((tag, perm, ident))
+    return entries
+
+
+def _read_acl(path: str, xattr_name: str) -> list[tuple[int, int, int]]:
+    """讀一份 ACL；沒有 ACL／不支援 xattr／非 Linux 一律回空 list。
+
+    空 list **不是** fail-open：呼叫端在那種情形下退回傳統 mode 位判定，而那正是
+    「這個檔系統上沒有 ACL 時 kernel 用的規則」。
+    """
+
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:  # pragma: no cover - 非 Linux
+        return []
+    try:
+        return _parse_acl_xattr(getxattr(path, xattr_name))
+    except OSError:
+        return []
+
+
+def _account_ids(account: str) -> tuple[int, frozenset[int]] | None:
+    """帳號 → `(uid, 全部 gid)`；passwd 查不到即 None（呼叫端須 fail-closed）。"""
+
+    try:
+        entry = pwd.getpwnam(account)
+    except KeyError:
+        return None
+    try:
+        gids = frozenset(os.getgrouplist(entry.pw_name, entry.pw_gid))
+    except (OSError, AttributeError):  # pragma: no cover - 平台差異
+        gids = frozenset({entry.pw_gid})
+    return entry.pw_uid, gids
+
+
+def effective_perms_for_account(path: str, account: str) -> int | None:
+    """`account` 對 `path` 的 **effective** 權限位（`0o7` 之內）；無法判定即 None。
+
+    這是 POSIX.1e §Access Check Algorithm 的直譯：owner 位優先、其次具名 user 條目
+    （**經 mask 收斂**）、其次 group 類條目的聯集（同樣經 mask）、最後 other 位。
+
+    **mask 那一段是本族 bug 的核心**：`setfacl -m u:x:rX` 之後再 `chmod 0700` 會把
+    mask 打成 `---`，具名條目於是靜默失效——ACL 還在（`getfacl` 看得到），有效權限
+    卻是零。只看「有沒有那條 ACL」的檢查會漏掉它；本函式看的是 kernel 實際會算出
+    的那個值。
+    """
+
+    ids = _account_ids(account)
+    if ids is None:
+        return None
+    uid, gids = ids
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+
+    mode = stat_result.st_mode
+    entries = _read_acl(path, POSIX_ACL_ACCESS_XATTR)
+    if not entries:
+        # 沒有 ACL：傳統三段式。
+        if uid == stat_result.st_uid:
+            return (mode >> 6) & 0o7
+        if stat_result.st_gid in gids:
+            return (mode >> 3) & 0o7
+        return mode & 0o7
+
+    mask = 0o7
+    has_mask = False
+    for tag, perm, _ident in entries:
+        if tag == _ACL_TAG_MASK:
+            mask = perm & 0o7
+            has_mask = True
+
+    if uid == stat_result.st_uid:
+        for tag, perm, _ident in entries:
+            if tag == _ACL_TAG_USER_OBJ:
+                return perm & 0o7  # owner 位不過 mask
+        return (mode >> 6) & 0o7
+    for tag, perm, ident in entries:
+        if tag == _ACL_TAG_USER and ident == uid:
+            return perm & mask if has_mask else perm & 0o7
+    group_bits = 0
+    matched_group = False
+    for tag, perm, ident in entries:
+        if tag == _ACL_TAG_GROUP_OBJ and stat_result.st_gid in gids:
+            matched_group = True
+            group_bits |= perm & 0o7
+        elif tag == _ACL_TAG_GROUP and ident in gids:
+            matched_group = True
+            group_bits |= perm & 0o7
+    if matched_group:
+        return group_bits & mask if has_mask else group_bits
+    for tag, perm, _ident in entries:
+        if tag == _ACL_TAG_OTHER:
+            return perm & 0o7
+    return mode & 0o7
+
+
+def inherited_perms_for_account(directory: str, account: str) -> int | None:
+    """新建於 `directory` 的**檔**會讓 `account` 拿到的權限位；無法判定即 None。
+
+    來源是目錄的 default ACL。`write_job_spec()` 在 `os.replace` 前 `chmod 0640`，
+    因此新檔的 ACL mask 會被重算成 `r--`——這一段與本函式相加，就是「job 讀不讀得到
+    自己的 spec」的完整答案，而且**在 spec 還沒寫出來之前就答得出來**。
+    """
+
+    ids = _account_ids(account)
+    if ids is None:
+        return None
+    uid, gids = ids
+    entries = _read_acl(directory, POSIX_ACL_DEFAULT_XATTR)
+    if not entries:
+        # 沒有 default ACL：新檔只帶傳統 mode 位，而 `write_job_spec()` 給的是 0640
+        # （owner rw、group r、other 0）。非 owner 的 job 帳號因此只可能經由 group
+        # 拿到讀權——那要它與 Manager 同 group，是部署決定，不是本函式能假設的。
+        try:
+            owner_uid = os.stat(directory).st_uid
+        except OSError:
+            return None
+        return 0o6 if uid == owner_uid else 0
+    mask = 0o7
+    has_mask = False
+    for tag, perm, _ident in entries:
+        if tag == _ACL_TAG_MASK:
+            mask = perm & 0o7
+            has_mask = True
+    for tag, perm, ident in entries:
+        if tag == _ACL_TAG_USER and ident == uid:
+            return perm & mask if has_mask else perm & 0o7
+    group_bits = 0
+    matched_group = False
+    for tag, perm, ident in entries:
+        if tag == _ACL_TAG_GROUP and ident in gids:
+            matched_group = True
+            group_bits |= perm & 0o7
+    if matched_group:
+        return group_bits & mask if has_mask else group_bits
+    try:
+        owner_uid = os.stat(directory).st_uid
+    except OSError:
+        return None
+    if uid == owner_uid:
+        for tag, perm, _ident in entries:
+            if tag == _ACL_TAG_USER_OBJ:
+                return perm & 0o7
+        return 0o6
+    return 0
+
+
+def _managed_ancestors(path: str) -> list[str]:
+    """`path` 由淺至深的祖先目錄（含 `/`，不含 `path` 自己）。
+
+    traverse 權要整條都成立才有意義：葉節點 ACL 再精確，中間有一層走不過去，
+    `open()` 就是 `EACCES`——而錯誤訊息指的是那一層，與缺的授權不同層（#620）。
+    """
+
+    parts = os.path.normpath(path).split("/")
+    ancestors: list[str] = ["/"]
+    current = ""
+    for segment in parts[1:-1]:
+        current = f"{current}/{segment}"
+        ancestors.append(current)
+    return ancestors
+
+
+def _spool_readable_by(spool_dir: str, account: str) -> tuple[bool, str]:
+    """`account` 是否**真的**讀得到將寫進 `spool_dir` 的 spec。`(ok, 原因)`。
+
+    三段，缺一即不成立：
+
+    1. 路徑上每一層都要有 `x`（traverse）——`derive_traverse_grants()` 產的 `--x`；
+    2. spool 目錄本身要有 `x`（shim 以固定檔名開檔，不需要 `r`；只要求 `x` 是刻意
+       的——要求 `r` 會讓一個「只給 traverse、能正常運作」的更嚴部署被誤判為壞掉）；
+    3. spool 目錄的 **default ACL** 要讓該帳號在新建檔上拿得到 `r`——這一條就是
+       #657 的正面判準，而它在 spec 檔還不存在時就答得出來。
+    """
+
+    if _account_ids(account) is None:
+        return False, (
+            f"帳號 {account} 在 passwd 裡查不到，無法判定它讀不讀得到 spec"
+            "（前一項帳號存在檢查若被 stub 掉，這裡就是唯一會發現的地方）"
+        )
+    for ancestor in _managed_ancestors(spool_dir):
+        bits = effective_perms_for_account(ancestor, account)
+        if bits is None:
+            return False, f"{ancestor}：無法判定 {account} 的 effective 權限（stat 失敗？）"
+        if not bits & _PERM_X:
+            return False, (
+                f"{ancestor}：{account} 沒有 traverse（x）權，effective="
+                f"{_perm_str(bits)}——整條路徑因此走不通"
+                f"（Phase 2b 權限計畫的父目錄 traverse ACL 尚未套用？）"
+            )
+    bits = effective_perms_for_account(spool_dir, account)
+    if bits is None:
+        return False, f"{spool_dir}：無法判定 {account} 的 effective 權限"
+    if not bits & _PERM_X:
+        return False, (
+            f"{spool_dir}：{account} 進不去自己的 spool，effective={_perm_str(bits)}"
+        )
+    inherited = inherited_perms_for_account(spool_dir, account)
+    if inherited is None:
+        return False, f"{spool_dir}：無法判定新建 spec 檔會給 {account} 什麼權限"
+    if not inherited & _PERM_R:
+        return False, (
+            f"{spool_dir}：新建的 spec 檔不會讓 {account} 讀得到"
+            f"（default ACL 推得的 effective={_perm_str(inherited)}）——"
+            f"這正是 #657 的形狀：spool 存在、Manager 寫得進去，而 shim 在 systemd "
+            f"套完 User={account} 之後讀它會 EACCES 並以 78/CONFIG 收場"
+        )
+    return True, ""
+
+
+def _spec_readable_by(spec_path: str, account: str) -> tuple[bool, str]:
+    """spec **落地之後**就地複驗「那個身分讀得到這個 inode」。`(ok, 原因)`。
+
+    與 :func:`_spool_readable_by` 的分工：那一支在**寫之前**算目錄的 default ACL
+    （spec 當時還不存在），這一支在**寫之後**算真的那個檔。兩支合起來把
+    `write_job_spec()` 那段「`chmod 0640` 是為了讓繼承下來的 ACL mask 不被關掉」的
+    推導從註解升級成斷言——那段推導錯了的話，症狀就是 #657 的 78/CONFIG。
+
+    帳號不在 passwd 時回 `(True, …)`：那在正式派工路徑上不可達
+    （`prepare_systemd_template()` 已對帳號 fail-closed），只會出現在直接呼叫
+    `write_job_spec()` 的測試裡；在這裡 fail-closed 只會把測試的 seam 變成產線行為。
+    """
+
+    if _account_ids(account) is None:
+        return True, f"帳號 {account} 不在 passwd（本機無此身分，略過就地複驗）"
+    bits = effective_perms_for_account(spec_path, account)
+    if bits is None:
+        return False, f"{spec_path}：無法判定 {account} 的 effective 權限"
+    if not bits & _PERM_R:
+        return False, f"{spec_path}：effective={_perm_str(bits)}（缺 r）"
+    return True, ""

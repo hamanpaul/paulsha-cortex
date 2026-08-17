@@ -471,7 +471,7 @@ def _run_as_gate_identity(
         log_path=str(spool_ledger.parent / GATE_LOG_FILENAME),
         env=gate_env,
     )
-    job_runner.write_job_spec(plan.spec_path, spec)
+    job_runner.write_job_spec(plan.spec_path, spec, account=plan.account)
     start = job_runner.build_systemctl_start_argv(
         systemctl=plan.binary, unit=plan.unit
     )

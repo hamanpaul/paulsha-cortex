@@ -117,6 +117,11 @@ def _preflight_patches(binary: str = "/usr/bin/systemctl"):
         mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
         mock.patch.object(job_runner, "_is_executable", return_value=True),
         mock.patch.object(job_runner, "_unit_is_active", return_value=False),
+        # #657：preflight 現在會算「該 job 身分讀不讀得到自己的 spool」的 effective
+        # 權限；本檔宣稱的帳號在單 UID 的開發機／CI 上不存在，故同一條 seam 一併
+        # stub。真正驗這條語意的是 `tests/test_per_principal_spec_spool_657.py`。
+        mock.patch.object(job_runner, "_spool_readable_by", return_value=(True, "")),
+        mock.patch.object(job_runner, "_spec_readable_by", return_value=(True, "")),
     ]
 
 
@@ -125,7 +130,12 @@ def _template_env(spool: str, **overrides: str) -> dict[str, str]:
         **_BASE_ENV,
         **_SECRET_ENV,
         job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE,
+        # #657：spool 是 per-principal 的（builder／review／gate 各一個變數）。
+        # 測試把三個都指向同一個暫存目錄——這裡驗的是「spec 內容與起動形狀」，
+        # 不是隔離；隔離由 `tests/test_per_principal_spec_spool_657.py` 驗。
         job_runner.JOB_SPEC_SPOOL_ENV: spool,
+        job_runner.REVIEW_JOB_SPEC_SPOOL_ENV: spool,
+        job_runner.GATE_JOB_SPEC_SPOOL_ENV: spool,
     }
     env.update(overrides)
     return env

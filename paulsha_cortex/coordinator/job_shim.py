@@ -6,8 +6,13 @@ operator 0816 第三輪裁決 **A+B** 的 B 半：builder job 不再由 Manager 
 `User=` 與 `ExecStart=` 都硬寫死，Manager 帳號**選不了 UID、也給不了命令列**。
 
 命令列既然給不了，per-job 的參數就得走一條**帶外通道**：Manager 把一份 spec
-原子寫進 Manager-owned spool（登記表資產 `job-spec-spool`，job 帳號唯讀），
-systemd 起 unit、unit exec 本模組、本模組讀 spec 後 exec 真正的 job。
+原子寫進 Manager-owned spool（登記表資產 `job-spec-spool-<principal>`，該 job 帳號
+唯讀），systemd 起 unit、unit exec 本模組、本模組讀 spec 後 exec 真正的 job。
+
+**#657：spool 是 per-principal 的，而本模組因此一行都沒改。** spool 根的唯一來源
+是模板 unit 的 `Environment=PSC_JOB_SPEC_SPOOL=`（root-owned，本模組對未設此變數
+fail-closed、不猜、不落回預設）——「哪個身分讀哪個 spool」是那份 unit 檔上可逐字
+稽核的一行，不是本模組的推導。
 
 ## 這支程式在信任鏈上的位置
 

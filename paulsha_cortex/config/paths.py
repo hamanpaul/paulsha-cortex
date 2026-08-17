@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from .runtime import resolve_project_config_root, resolve_run_root, resolve_runtime_root
@@ -156,19 +157,60 @@ JOB_SPEC_SPOOL_DIRNAME = "job-specs"
 
 
 def job_spec_spool_root() -> Path:
-    """trust-root Phase 2b 方案 B：降權 job 的 per-job 執行規格 spool 根。
+    """trust-root Phase 2b 方案 B：降權 job 的 per-job 執行規格 spool **容器**。
 
     operator 0816 第三輪裁決 **A+B**：builder job 改經 root-owned 的
     `cortex-job@.service` 模板實例起跑。模板 unit 的 `ExecStart=` 是**固定的**
     （`<deploy_root>/bin/cortex-job-shim %i`），因此「這個 job 要跑什麼命令、在哪個
-    worktree、帶哪些 env、log 寫去哪」必須由一個**帶外通道**傳遞——就是本 spool：
-    `<此根>/<unit-instance-id>.json`，Manager 原子寫入，job 帳號**唯讀**（permgen 依
-    R1 登記表產出 owner＝durable_state_owner、mode 0700 ＋ per-account 唯讀 ACL）。
+    worktree、帶哪些 env、log 寫去哪」必須由一個**帶外通道**傳遞——就是本 spool。
+
+    **#657 起本函式回傳的是容器，不是任何 job 讀得到的目錄。** 實際的 spec 落在
+    per-principal 的子 spool（:func:`job_spec_spool_for`），容器本身維持
+    owner-only 0700、對每個降權帳號只有機械導出的 `--x` traverse——因此沒有任何
+    job 帳號列得出「這台機器上還有誰的 job」。
 
     這是「即使持 spawn 授權的帳號被攻陷也無法向上」的另一半：unit 檔 root-owned 改不了、
     spec 檔 job 帳號寫不了，因此 job **既不能選 UID、也不能改寫自己的命令列**。
     """
     return coordinator_root() / JOB_SPEC_SPOOL_DIRNAME
+
+
+#: per-principal spool 的目錄名形狀。只允許小寫字母／數字／`-`，且必須以字母開頭
+#: ——這個字串會被接進絕對路徑並寫進 root-owned unit 的 `Environment=`，容忍
+#: `..`／`/` 等於把「spec 一定落在 Manager-owned 樹裡」這條性質交給呼叫端自律。
+_SPOOL_PRINCIPAL_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+def job_spec_spool_for(principal_id: str) -> Path:
+    """#657：**該降權 principal 專屬**的 spec spool（`<容器>/<principal>`）。
+
+    ## 為什麼不是一個共用 spool
+
+    #629 的 gate 執行身分落地後，實機上每個 gate job 都以 `78/CONFIG` 收場：
+    `cortex-gate-job@.service` 與 builder 的模板 unit 指向**同一個** spool，而登記表
+    只授 builder 唯讀 ACL。shim 是 systemd 套完 `User=` **之後**才跑的，因此它以 job
+    身分讀 spec ⇒ 必然 `EACCES`。reviewer／planner 是同一型（#652 未驗到這層）。
+
+    修法有兩個候選：把共用 spool 的 reader 面擴成「全部降權 principal」，或每個
+    principal 一個 spool 根。取後者，理由是**可稽核性**：這樣「哪個身分讀哪個 spool」
+    是 root-owned unit 檔上可以逐字讀懂的一行（`Environment=PSC_JOB_SPEC_SPOOL=`），
+    而不是一組共用目錄上三條 ACL 的交集；而且它不必新開「跨 persona 互讀 spec」這個
+    性質——那在共用 spool 下是無法避免的副作用（spec 內容是命令列與白名單 env）。
+
+    第三個候選（spec 檔由 root 預先 chown 給該 job 帳號）不成立：spec 是 Manager 寫的，
+    chown 給別的 owner 需要 root，而「cortex 任何元件永不具 root」是既有裁決。
+
+    `principal_id` 是 `trust_root.registry.Principal` 的 `value`（`builder`／
+    `reviewer`／`gate`），由登記表機械導出；本模組不 import trust_root（path 契約
+    對治理平面零依賴），故以字串傳入並在此驗形狀。
+    """
+
+    name = str(principal_id or "").strip()
+    if not _SPOOL_PRINCIPAL_RE.match(name):
+        raise ValueError(
+            f"principal id 不合法（只允許 ^[a-z][a-z0-9-]*$）: {principal_id!r}"
+        )
+    return job_spec_spool_root() / name
 
 
 def specs_root() -> Path:

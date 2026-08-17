@@ -11,7 +11,7 @@ review-verdicts 兩條正向路徑全部 `Permission denied`——而錯誤訊�
 - (b) 產生的是 `--x` 不是 `r-x`——只給 traverse，列目錄仍須被拒；
 - (c) 已允許該帳號 traverse 的中間層不重複產生；
 - (d) 三分方案下 builder→event-spool、reviewer-planner→review-verdicts、
-      builder→job-specs 三條路徑的**完整鏈**每一層都有授權。
+      builder→自己的 job-specs 三條路徑的**完整鏈**每一層都有授權。
 """
 from __future__ import annotations
 
@@ -58,7 +58,11 @@ ALL_SCHEMES = [TWO_WAY_SCHEME, THREE_WAY_SCHEME]
 FORWARD_PATHS = (
     (Principal.BUILDER, "monitor-event-spool"),
     (Principal.REVIEWER, "review-verdict-spool"),
-    (Principal.BUILDER, "job-spec-spool"),
+    # #657：spec spool 是 per-principal 的，因此正向路徑也是逐個 principal 的
+    # ——這正好把「reviewer／gate 的鏈有沒有補齊」納入本檔的覆蓋面（在 #657 之前
+    # 這裡只驗 builder，而那條共用路徑對 reviewer／gate 從來沒成立過）。
+    (Principal.BUILDER, "job-spec-spool-builder"),
+    (Principal.REVIEWER, "job-spec-spool-reviewer"),
 )
 
 
@@ -114,9 +118,15 @@ def test_without_the_derived_grants_the_paths_are_broken(scheme) -> None:
     )
     assert blocked == (f"{DEFAULT_LAYOUT.monitor_state_root}",)
     blocked = unreachable_hops(
-        plan, scheme=scheme, account=builder, asset_id="job-spec-spool", grants=()
+        plan, scheme=scheme, account=builder,
+        asset_id="job-spec-spool-builder", grants=(),
     )
-    assert blocked == (f"{DEFAULT_LAYOUT.coordinator_root}",)
+    # #657：多一跳——容器 <coordinator>/job-specs 對 job 帳號同樣是 0700 別人的，
+    # 因此少了導出的 traverse，斷點是**兩層**而不是一層。
+    assert blocked == (
+        DEFAULT_LAYOUT.job_spec_spool_root,
+        f"{DEFAULT_LAYOUT.coordinator_root}",
+    )
 
 
 # ---------------------------------------------------------------------------

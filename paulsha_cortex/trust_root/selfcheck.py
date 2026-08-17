@@ -150,7 +150,9 @@ def _resolve_asset_path(asset: TrustRootAsset) -> Path | None:
 
         mod = importlib.import_module(modname)
         func = getattr(mod, funcname)
-        result = func()
+        # #657：一支 resolver 可以服務一族資產（per-principal spool），此時
+        # asset 之間的差別就是 `path_resolver_args`。零引數是絕大多數的情形。
+        result = func(*asset.path_resolver_args)
     except Exception:  # noqa: BLE001 — 唯讀自檢永不 raise
         return None
     return result if isinstance(result, Path) else None
