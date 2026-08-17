@@ -486,6 +486,82 @@ gitconfig 變成執行期可變狀態。
 Manager 從那個 **bundle 檔**（不是 repo）fetch。Manager 全程不碰 builder 的樹，讀的又是
 一個普通檔案，dubious-ownership 與 traverse 兩個問題同時消失。
 
+#### executor 執行面：toolchain 與 per-account 憑證（#640 裁決；登記表資產 `executor-toolchain`／`builder-executor-credential`）
+
+`ProtectHome=yes` 讓 job 帳號看不到 `/home`，而四個模型 executor（`codex`／`claude`／
+`copilot`／`agy`）原本**全部**落在 operator 的 HOME 底下（nvm 樹與 `~/.local/bin`）。
+實測：
+
+```
+$ sudo -u cortex-builder env HOME=<job HOME> codex exec --help
+/usr/bin/env: ‘node’: No such file or directory        rc=127
+```
+
+登記表對 toolchain 與 job 帳號憑證**都沒有預留資產**，因此 permgen 也不會產生它們的
+權限——這是「provisioning → clone → bundle → harvest 全通、但 dispatch 走到呼叫模型
+那一步才失敗」的最後一哩。
+
+##### (a) toolchain：node 走系統層、模型 CLI 進部署樹
+
+- `node` SHALL 由**系統層**提供（apt）。它是通用 runtime，換版本幾乎不影響產出；
+  但版本本身仍是**部署決定**，某個 CLI 提高下限時 SHALL 一併升，否則它會變成下一個
+  無聲漂移點。
+- 四個模型 CLI SHALL 落進 `<deploy_root>/toolchain`（登記表資產 `executor-toolchain`）：
+  `owner_class=DEPLOYMENT`、owner＝root、mode `0755`——**全部 job／服務帳號唯讀＋
+  可執行**，一個 `w` 都沒有。`ProtectSystem=strict` 下 `/opt` 唯讀只擋寫入，讀取與
+  執行不受影響，因此本資產 MUST NOT 出現在任何 unit 的 `ReadWritePaths` 上。
+- 安裝來源 SHALL 是 **operator 實際在用的那一份**（`command -v` 解得到的），
+  MUST NOT 另外 `npm install -g` 裝一份系統的。理由不是假設：實機盤點在同一台機器上
+  就有兩份 `codex`——系統層 0.42.0、operator 實際在用的 0.147.0（差 100 個以上小版本）。
+  「job 跑的是哪個版本的模型 CLI」**會**影響產出，因此它必須是一個可稽核的部署決定，
+  而不是跟著 operator 的環境漂移。
+- 四者的實體形態不同，搬移方式不能一概而論（表固化於
+  `permgen.EXECUTOR_TOOLS`）：`codex` 是 `#!/usr/bin/env node` 的 node script（**唯一
+  硬需要 node**，且必須整包搬 npm 套件樹）；`claude`／`agy` 自帶原生執行檔；`copilot`
+  是 shell script（腳本內部可能再叫別的程式，安裝時 SHALL 查一次）。**因此系統層 node
+  的版本風險只涵蓋 `codex` 一個。**
+- job 的 `PATH` SHALL 由 Manager 端既有的 `PSC_BUILDER_PATH` 注入，且 toolchain
+  SHALL 排在**最前面**——系統層可能另有一份同名但舊很多的 CLI，排在後面的症狀是
+  「跑得起來但版本不是預期的那個」，比 `command not found` 難查得多。**MUST NOT**
+  改以模板 unit 的 `Environment=PATH=` 提供：模板 unit 的 `ExecStart` 是 root-owned
+  shim，shim 以 `execvpe(argv[0], argv, spec['env'])` 整份換掉環境，job 解析命令用的
+  `PATH` 來自 **spec 的 env**——寫在 unit 上只會是一個看起來承載作用、實際被丟掉的設定。
+
+##### (b) 憑證：檔案 job-owned、目錄 root-owned
+
+憑證**檔**（預設 `<job HOME>/.codex/auth.json`，＝本部署 `PSC_MANAGER_EXECUTOR` 的那
+一個）SHALL 由該 job 帳號擁有、mode `0600`；**放它的目錄** SHALL 維持 root-owned
+`0755`（既有的 `<job HOME>/.codex/` 就是這個形態，`codex-hooks` 住在同一層）。
+淨效果：
+
+- job **能**就地改寫自己那份憑證的內容（過期 token 可自行 refresh）；
+- job **建不了新檔、刪不掉、也換不掉**同目錄下的其他 root-owned 檔——建立／unlink／
+  rename 需要的是**目錄**的寫入權，而目錄對它只有 `r-x`。
+
+`ReadWritePaths` SHALL 只掛**憑證檔本身**而非其父目錄（`permgen`
+的 `IN_PLACE_CONTENT_WRITE_ASSETS`；一般規則把檔案折算成父目錄，這一族是明示例外），
+使「目錄 root-owned」在**檔案系統**與 **systemd mount** 兩層同時成立。
+
+**已知限制（裁決刻意接受）**：以「暫存檔 ＋ rename 原子替換」形式 refresh 的 CLI 會
+失敗，因為那需要在同目錄建檔；只有就地 `O_TRUNC` 覆寫的 refresh 走得通。
+
+##### 這買到的是檔案系統層的隔離，**不是** provider 層的獨立
+
+把 operator 的憑證複製給 job 帳號，代表 job 用的是**同一個 provider 帳號**。三分買到
+的是**檔案系統層**的隔離——job 偷不到 Manager 的 token、改不了 Manager 的 state、也讀
+不到另一個 job 帳號的憑證（HOME 互不可讀）。它**不是** provider 層的獨立：同一個
+provider 帳號下的兩個 job 在 provider 眼中是同一個主體，配額、速率限制、稽核紀錄與
+帳號層的封鎖全部共用。
+
+這與 `independence_domain`（§R5／§R8）想表達的**不是同一件事**。`independence_domain`
+是 anti-collusion 控制，講的是「審的人與被審的人不得是同一個模型身分」；它由 Manager
+在派工時決定並寫入 registry，與 OS 帳號、與憑證檔在哪一個 HOME 全無關係。本節的檔案
+系統隔離既不蘊含它、也不被它蘊含——**兩者 MUST NOT 互相當作證據**，spec 在此明載是為
+了避免把「三分 ＋ 各自的憑證檔」讀成比實際更強的保證。
+
+真正的 provider 層獨立需要**每個 job 帳號各自的 provider 帳號**，成本最高（帳號、
+計費、配額各自管理），屬**未來選項**，不在本票範圍。
+
 ### R2 所有 Tier-0／Tier-1 durable state 與 mutation ingress MUST 位於不受信任 headless persona 不可寫的 OS 邊界內
 
 系統 SHALL 使 builder／reviewer／planner 對登記表中 tier 0 與 1 的全部路徑
