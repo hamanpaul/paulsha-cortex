@@ -12,22 +12,28 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                         [--external-reader-account <帳號名|none>]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [three-way|two-way]
-                                        [--manager|--monitor|--job|--job-properties]
+                                        [--manager|--monitor|--job|--review-job
+                                         |--job-properties]
                                         [--profile strict|jit]
                                                     # Phase 2b systemd unit 內容
                                                     # （--monitor＝monitor 的 system-level
                                                     #   unit：與 manager 同帳號、同加固段，
                                                     #   但 ReadWritePaths 只由 monitor
                                                     #   persona 的登記表面導出，嚴格更窄；
+                                                    #   --job＝builder 的模板 unit；
+                                                    #   --review-job＝#615 M2 的 reviewer
+                                                    #   ＋planner 模板 unit（同帳號，
+                                                    #   User=cortex-reviewer-planner，
+                                                    #   unit 名 cortex-reviewer-job@.service）；
                                                     #   --job-properties＝方案 A 的
                                                     #   systemd-run --property= 清單；
                                                     #   --profile＝#643 的 per-executor
-                                                    #   加固剖面，只對 --job／
+                                                    #   加固剖面，只對 --job／--review-job／
                                                     #   --job-properties 有意義。預設
                                                     #   strict＝完整加固表；jit 只放寬
                                                     #   MemoryDenyWriteExecute，給 node 型
                                                     #   executor（codex／copilot）用，
-                                                    #   unit 名為 cortex-job-jit@.service）
+                                                    #   unit 名尾綴 -jit）
     python -m paulsha_cortex.trust_root shim [three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
@@ -49,6 +55,11 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # Phase 2b 降權 polkit 規則內容
                                                     # （--template＝方案 B，**預設**；
                                                     #   --transient＝方案 A，對照用）
+                                                    # 內容涵蓋**全部**降權 job 角色的
+                                                    # 具名模板（#615 M2 起＝builder ＋
+                                                    # reviewer/planner，各兩個加固剖面
+                                                    # ＝四個字幹），仍是**單一** addRule、
+                                                    # 單一 return YES
     python -m paulsha_cortex.trust_root scaffold [three-way|two-way]
                                                     # Phase 2b 骨架目錄的 install -d 命令
 
@@ -306,6 +317,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 which = "monitor"
             elif token == "--job":
                 which = "job"
+            elif token == "--review-job":
+                which = "review-job"
             elif token == "--job-properties":
                 which = "job-properties"
             elif token == "--profile":
@@ -342,10 +355,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         if which == "job":
             print(permgen.build_job_unit(scheme, profile=profile).content, end="")
             return 0
+        if which == "review-job":
+            # #615 M2：reviewer＋planner 的模板（同一份，兩者同帳號）。
+            print(
+                permgen.build_job_unit(
+                    scheme, principal=Principal.REVIEWER, profile=profile
+                ).content,
+                end="",
+            )
+            return 0
         if profile_id != permgen.DEFAULT_HARDENING_PROFILE.profile_id:
             # 剖面只對 job 模板 unit 有意義；靜默忽略會產出一份與旗標不符的內容。
             print(
-                f"--profile 只適用於 --job／--job-properties（收到 {which}）",
+                f"--profile 只適用於 --job／--review-job／--job-properties（收到 {which}）",
                 file=sys.stderr,
             )
             return 2

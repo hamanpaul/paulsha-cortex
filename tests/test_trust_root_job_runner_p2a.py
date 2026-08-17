@@ -731,8 +731,12 @@ class DegradedLaunchTests(unittest.TestCase):
         self.assertIn("--uid=cortex-worker", argv)
         self.assertNotIn("--uid=cortex-builder", argv)
 
-    def test_reviewer_is_never_degraded(self) -> None:
-        # 二分方案：reviewer 與 Manager 同帳號（cortex-svc），不經降權。
+    def test_reviewer_is_degraded_to_its_own_account(self) -> None:
+        """#615（M2）：reviewer 不再留在 Manager 行程內，改降到自己的帳號。
+
+        M1 期間這一條測的是相反的性質（「reviewer 永不降權」），那正是
+        「injection 可達的進程皆無 spawn 授權」只對 builder 成立的原因。
+        """
         popen = _RecordingPopen()
         _launch(
             SubprocessLauncher("claude").as_review_only(
@@ -741,13 +745,39 @@ class DegradedLaunchTests(unittest.TestCase):
             env=_degraded_env(),
             popen=popen,
         )
-        self.assertEqual(popen.call["argv"][:2], ["bash", "-c"])
-        self.assertNotIn("stdin", popen.call)
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+        self.assertIn(f"--uid={job_runner.DEFAULT_REVIEWER_ACCOUNT}", argv)
+        self.assertIn(f"--gid={job_runner.DEFAULT_REVIEWER_ACCOUNT}", argv)
+        self.assertNotIn(f"--uid={job_runner.DEFAULT_BUILDER_ACCOUNT}", argv)
+        # 降權模式的 job shell 一律 `bash -c`（非 login shell），與 builder 相同。
+        job_argv = argv[argv.index("--") + 1 :]
+        self.assertEqual(job_argv[:2], ["bash", "-c"])
+        # token 不隨 job 出去：白名單 env 不分角色。
+        self.assertNotIn("GH_TOKEN", _setenv_map(argv))
 
-    def test_planner_is_never_degraded(self) -> None:
+    def test_planner_is_degraded_to_the_review_account(self) -> None:
+        """planner 與 reviewer 同帳號、同模板——三分方案的定義就是這樣。"""
         popen = _RecordingPopen()
         _launch(SubprocessLauncher("codex").as_read_only(), env=_degraded_env(), popen=popen)
-        self.assertEqual(popen.call["argv"][:2], ["bash", "-lc"])
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+        self.assertIn(f"--uid={job_runner.DEFAULT_REVIEWER_ACCOUNT}", argv)
+        job_argv = argv[argv.index("--") + 1 :]
+        self.assertEqual(job_argv[:2], ["bash", "-c"])
+
+    def test_review_account_override_flows_into_argv(self) -> None:
+        """reviewer 的帳號覆寫走**自己的**變數，不是 builder 的。"""
+        env = _degraded_env(**{job_runner.REVIEWER_ACCOUNT_ENV: "cortex-judge"})
+        popen = _RecordingPopen()
+        _launch(SubprocessLauncher("codex").as_read_only(), env=env, popen=popen)
+        argv = _unwrap_exit_recorder(popen.call["argv"])
+        self.assertIn("--uid=cortex-judge", argv)
+        # builder 的覆寫對 reviewer 無效（兩個角色不共用一組 config）。
+        env2 = _degraded_env(**{job_runner.BUILDER_ACCOUNT_ENV: "cortex-worker"})
+        popen2 = _RecordingPopen()
+        _launch(SubprocessLauncher("codex").as_read_only(), env=env2, popen=popen2)
+        argv2 = _unwrap_exit_recorder(popen2.call["argv"])
+        self.assertIn(f"--uid={job_runner.DEFAULT_REVIEWER_ACCOUNT}", argv2)
+        self.assertNotIn("--uid=cortex-worker", argv2)
 
     def test_missing_account_fails_closed_without_spawning(self) -> None:
         popen = _RecordingPopen()

@@ -31,7 +31,7 @@ OS** 的手動流程。
 
 | 未決點 | 定案（0816 第三輪，#584 留言） | 落在本 runbook |
 |---|---|---|
-| **降權機制** | **A+B 並行，單一路徑**。A＝UID **三分提前**；B＝**root-owned template unit**（`cortex-job@.service`；#643 起 node 型 executor 另有同源的 `cortex-job-jit@.service`，`User=` 兩份都寫死）。C（code-level argv 保證）自動保留為第三層，由 **root-owned shim** 承接 | 第 1、5 步 |
+| **降權機制** | **A+B 並行，單一路徑**。A＝UID **三分提前**；B＝**root-owned template unit**（#643 起每個角色兩份加固剖面、#615 起兩個角色 ⇒ 共**四份**：`cortex-job@` / `cortex-job-jit@` / `cortex-reviewer-job@` / `cortex-reviewer-job-jit@`，`User=` 四份都寫死）。C（code-level argv 保證）自動保留為第三層，由 **root-owned shim** 承接 | 第 1、5 步 |
 | **UID 方案** | **三分為唯一路徑**：`cortex-manager`（Manager＋monitor，durable state owner，持 spawn 授權，**不跑任何模型程式碼**）／`cortex-reviewer-planner`（reviewer＋planner 模型 job）／`cortex-builder`（builder 模型 job）。`permgen.THREE_WAY_SCHEME` 由備選轉為**定案方案** | 第 1 步 |
 | durable state 路徑 | **`/var/lib/cortex`**；worktree pool＝**`/var/lib/cortex/worktree`** | 第 2 步 |
 | legacy-import | **物理隔離 ＋ hash manifest**（無簽章；簽章屬 Phase 3）。切換前 in-flight job **手動收尾** | 執行前提、第 3 步 |
@@ -78,15 +78,30 @@ OS** 的手動流程。
 
 | 里程碑 | 內容 | 本 runbook |
 |---|---|---|
-| **M1** | 三帳號建立、**檔案權限面完整三分**、builder job 經 `cortex-job@.service`／`cortex-job-jit@.service` 降權、polkit 只授 `cortex-manager` 對這**兩個具名模板** | ✅ 本 runbook 全程 |
-| **M2** | reviewer／planner job 也改經 template instance（`User=cortex-reviewer-planner`）落到自己的帳號 | ⏳ 程式碼工項 **#615**（範圍以該 PR 實際落地為準）。M1 已於 2026-08-17 完成，**M2 未做**——D6 的「三分已生效」全稱在 #615 之前 **BLOCKING** |
+| **M1** | 三帳號建立、**檔案權限面完整三分**、builder job 經 `cortex-job@.service`／`cortex-job-jit@.service` 降權、polkit 只授 `cortex-manager` 對這**兩個具名模板** | ✅ 已於 2026-08-17 實機完成 |
+| **M2** | reviewer／planner job 也改經 template instance（`User=cortex-reviewer-planner`）落到自己的帳號 | ✅ 程式碼已落地（**#615**）。落檔與驗證步驟已收進本 runbook：第 5-2 步落**四份** unit、5-4 polkit 涵蓋四個字幹、5-5 補 reviewer 的 env、5-6b 正向、5-7 反向、8b-2 verdict 端到端 |
 
-**M1 下的誠實邊界**：`launcher.SubprocessLauncher._degraded_runner()` 目前只對 **builder
-persona** 降權（`review_only`＝reviewer、`read_only`＝planner 兩者皆非才降權）；因此在
-M2 之前，reviewer／planner 仍在 Manager 行程內以 `cortex-manager` 身分執行。
-「**injection 可達的進程皆無 spawn 授權**」這條在 M1 **只對 builder 成立**——而 builder
-正是攻擊面最大的那個（唯一會跑 untrusted repo code 的 persona）。M2 落地前，
-reviewer／planner 的三分只在**檔案權限層**成立（第 8 步族 2 會實測這一層）。
+**M2 之後可以宣稱的**：三個會跑模型的 persona（builder／reviewer／planner）**啟動面
+全部離開 Manager 的 UID**，且每一個的 `User=` 都寫死在 root-owned 的 template unit 裡
+——「**injection 可達的進程皆無 spawn 授權**」這條的**全稱**因此成立，D6 的「三分已
+生效」不再被 #615 blocking。
+
+**M2 仍未涵蓋的（不得順手宣稱）**：
+
+- **gate 執行身分**（#629）：gate 命令在 builder 完全掌控的 worktree 裡跑，`pytest`
+  會載入該 worktree 的 `conftest.py` ⇒ 執行者取得任意程式碼執行。**刻意不掛在
+  `cortex-reviewer-planner` 上**——那會讓被攻陷的 builder 經由 gate 執行影響到寫
+  verdict 的那個帳號，把 #638／#639 剛修好的東西整個抵銷。它需要**第四個帳號**，
+  屬 #629。在那之前降權 build 卡對 `require_ledger` fail closed。
+- **reviewer 的 executor 憑證就地 refresh**：`cortex-reviewer-planner` 的 `~/.codex`
+  骨架目錄已由 `scaffold_directories()` 建出並保護（root-owned），憑證檔由 root 於
+  第 4e 步複製並 chown 給它；但**該檔不在 reviewer 模板 unit 的 `ReadWritePaths=`
+  內**（登記表目前只登記 `builder-executor-credential` 一份，理由見該資產的 note：
+  在二分部署上登記第二份會讓 Manager unit 的 RWP 指向一條不存在的路徑而起不來）。
+  淨效果：reviewer 的 token 過期時**無法自行 refresh**，需 operator 重跑第 4e 步。
+- **reviewer 的工作樹位置**：仍是 Manager provision 的 review worktree
+  （`<來源樹>/.psc-review-worktrees/…`），不是 per-job clone。reviewer 是 read-only
+  契約，對它只需**唯讀**可達；per-job clone 化屬 #623／#648 的範圍。
 
 ---
 
@@ -285,6 +300,17 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   兩字幹複跑（含 `systemd-analyze verify` 的未知鍵落檔後檢查——#645 修的是產生器，
   已落檔的 unit 不會自己更新），4e 的 executor 形態表回填「`copilot` 也需要 node」
   → **50** 個 sudo 點、**184** 個驗證點。
+- **#615（M2：reviewer／planner 啟動面降權）新增**：第 5-2 步再擴為落**四份**
+  template unit（2 角色 × 2 剖面，另含「四份加固表集合比對」與「reviewer 的 RWP
+  恰好兩條且不含任何 `%i` 路徑」兩條 gate）、5-5 補 reviewer 那一組 env ＋ 角色解析
+  複驗、新增 **5-6b**（reviewer 模板的正向 smoke：`id` 必須是
+  `cortex-reviewer-planner`，並逐條驗它對 builder 工作區／commit spool／來源樹／
+  gate ledger 皆不可寫）、5-7 的字幹改由產生器導出成**四個**並補 10 條 reviewer 字幹
+  混淆、(10) 擴為四份 unit 逐一試、8a pass 2 由「operator sudo 模擬」升級為**真實
+  template instance**、新增 **8b-2 族 6「verdict 通道端到端」**（#638／#639 的修法
+  第一次被真正驗到：檔案 owner 是 reviewer／Manager 讀得到／builder 零權限／
+  seal 後 reviewer 改不動，含 negative control）
+  → **54** 個 sudo 點、**205** 個驗證點。
 
 ---
 
@@ -345,14 +371,19 @@ python3 -m paulsha_cortex.trust_root unit three-way --manager
 # ✅ monitor system unit 內容（同帳號、同加固段，ReadWritePaths 嚴格窄於 Manager）
 python3 -m paulsha_cortex.trust_root unit three-way --monitor
 
-# ✅ job template unit 內容（User=cortex-builder 硬寫死；B 的核心）
-#    #643：**兩份**——strict（預設）與 jit（node 型 executor），差異只有
-#    MemoryDenyWriteExecute 一項；剖面對應表由 permgen.EXECUTOR_TOOLS 機械導出。
+# ✅ job template unit 內容（`User=` 硬寫死；B 的核心）——**四份**
+#    #643（加固剖面）：strict（預設）與 jit（node 型 executor），差異只有
+#      MemoryDenyWriteExecute 一項；對應表由 permgen.EXECUTOR_TOOLS 機械導出。
+#    #615（job 角色）：--job＝builder；--review-job＝reviewer＋planner
+#      （同帳號同模板）。兩個角色的差異全部由帳號帶出來。
 python3 -m paulsha_cortex.trust_root unit three-way --job
 python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit
+python3 -m paulsha_cortex.trust_root unit three-way --review-job
+python3 -m paulsha_cortex.trust_root unit three-way --review-job --profile jit
 
-# ✅ 降權 polkit 規則內容
-#    （只放行 cortex-job@*.service 與 cortex-job-jit@*.service 的 start/stop）
+# ✅ 降權 polkit 規則內容（**單一檔、單一 addRule、單一 return YES**）
+#    放行的是四個具名模板的 start/stop：cortex-job@ / cortex-job-jit@ /
+#    cortex-reviewer-job@ / cortex-reviewer-job-jit@（皆 *.service）
 python3 -m paulsha_cortex.trust_root polkit three-way --template
 
 # ✅ root-owned shim 內容（/opt/cortex/bin/cortex-job-shim）—— #616 已 merge
@@ -1601,8 +1632,8 @@ sudo -u cortex-builder sh -c \
 
 | # | 物件／事實 | 路徑 | 擁有者 | 它強制什麼 |
 |---|---|---|---|---|
-| (a) | **polkit 規則** | `/etc/polkit-1/rules.d/49-cortex-downgrade.rules` | root:root 0644 | 只有 `cortex-manager`、只有 `start`／`stop`、只有 `cortex-job@*.service` 與 `cortex-job-jit@*.service` 兩個**具名**模板。**不授權 `manage-units` 的 transient 建立** |
-| (b) | **template unit ×2** | `/etc/systemd/system/cortex-job@.service`（strict）<br>`/etc/systemd/system/cortex-job-jit@.service`（jit，#643） | root:root 0644 | `User=cortex-builder` 寫死、加固段寫死、`ExecStart=` 寫死。呼叫端**選不了 UID、傳不了屬性**。兩份的差異**只有** `MemoryDenyWriteExecute`（見 5-2 的剖面說明） |
+| (a) | **polkit 規則** | `/etc/polkit-1/rules.d/49-cortex-downgrade.rules` | root:root 0644 | 只有 `cortex-manager`、只有 `start`／`stop`、只有四個**具名**模板（`cortex-job@` / `cortex-job-jit@` / `cortex-reviewer-job@` / `cortex-reviewer-job-jit@`，皆 `*.service`）。**不授權 `manage-units` 的 transient 建立** |
+| (b) | **template unit ×4** | `/etc/systemd/system/cortex-job@.service`（builder, strict）<br>`cortex-job-jit@.service`（builder, jit，#643）<br>`cortex-reviewer-job@.service`（reviewer＋planner, strict，#615）<br>`cortex-reviewer-job-jit@.service`（reviewer＋planner, jit） | root:root 0644 | `User=` 寫死、加固段寫死、`ExecStart=` 寫死。呼叫端**選不了 UID、傳不了屬性**。四份的差異只有兩軸：加固剖面（`MemoryDenyWriteExecute`）與帳號（`User=`／HOME／RWP），見 5-2 |
 | (c) | **shim** | `/opt/cortex/bin/cortex-job-shim` | root:root 0755 | `ExecStart=` 的實體。argv 的**形狀**由 root-owned 程式從 Manager-owned job-spec 導出；Manager 只能給參數 |
 | — | **三分帳號事實** | — | — | polkit 的 subject 只有 `cortex-manager`，而它**不跑任何模型程式碼**；injection 可達的 job 帳號完全不在授權面上 |
 
@@ -1614,7 +1645,52 @@ sudo -u cortex-builder sh -c \
   fail-closed（`job-runner-job-template-missing`），不會靜默退回 strict 那份。
 - 少了 (c)，argv 的入口落在 Manager 可寫的樹裡；Manager 被攻陷即可換掉執行的東西。
 
-### 5-2. 安裝 (b) template unit（**兩份**，#643 per-executor 加固剖面）
+### 5-2. 安裝 (b) template unit（**四份**＝2 角色 × 2 加固剖面）
+
+> **為什麼是四份**：unit 檔裡寫死兩件事，兩件都不能靠參數傳——
+>
+> - **`User=`**（#615 M2）：builder 與 reviewer／planner 是不同的 OS 帳號
+>   ⇒ 不同的檔、不同的名字。planner **不另開第三份**：三分方案把它與 reviewer 映到
+>   同一個帳號（`cortex-reviewer-planner`），同帳號 ⇒ 同 unit。
+> - **加固指令**（#643）：一個模板只有一份加固段 ⇒ 兩種剖面必然是兩個檔。
+>
+> 四份**共用同一張 `_HARDENING` 表與同一條 `ReadWritePaths` 導出規則**：角色之間的
+> 全部差異都是「帳號」帶出來的（`User=`／`Group=`／HOME／cache／登記表上該帳號的
+> 可寫面），產生器裡沒有任何一行 `if principal is …`。測試以**集合比對**釘住
+> （`tests/test_reviewer_planner_downgrade_615.py::HardeningParityTests`）。
+
+| unit | `User=` | 給誰 |
+|---|---|---|
+| `cortex-job@.service` | `cortex-builder` | builder，原生 ELF executor（`claude`／`agy`） |
+| `cortex-job-jit@.service` | `cortex-builder` | builder，node 型 executor（`codex`／`copilot`） |
+| `cortex-reviewer-job@.service` | `cortex-reviewer-planner` | reviewer＋planner，原生 ELF executor |
+| `cortex-reviewer-job-jit@.service` | `cortex-reviewer-planner` | reviewer＋planner，node 型 executor |
+
+```bash
+# ✅ 先看 reviewer 那兩份（與 builder 的差異必須**只有帳號帶出來的那幾行**）
+python3 -m paulsha_cortex.trust_root unit three-way --review-job | less
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --job) \
+     <(python3 -m paulsha_cortex.trust_root unit three-way --review-job) \
+  | grep -E "^[<>] [A-Za-z]" | sort
+#   期望只出現這幾類指令行的差異（其餘逐字相同）：
+#     User= / Group=                      ← 帳號
+#     Environment=HOME= / XDG_CACHE_HOME= ← 帳號的 HOME
+#     ReadWritePaths=                     ← 登記表上該帳號的可寫面
+#   ⚠️ 若 `MemoryDenyWriteExecute` 或任何其他加固鍵出現在差異裡 ⇒ 兩個角色的加固面
+#      分岔了，**停下來**：本步驟的前提（四份共用同一張表）不再成立。
+
+# ✅ reviewer 的 ReadWritePaths 必須**恰好兩條**，且不含 builder 的任何面
+python3 -m paulsha_cortex.trust_root unit three-way --review-job | grep '^ReadWritePaths='
+#   期望恰好兩行：
+#     ReadWritePaths=/var/lib/cortex-reviewer-planner/cache
+#     ReadWritePaths=/var/lib/cortex/coordinator/review-verdicts
+#   ⚠️ 出現 /var/lib/cortex/worktree/%i、commit-spool、runtime/dispatch 任何一條
+#      ⇒ 停下來：reviewer 拿到了 builder 的工作面或 Manager 的證據面。
+#   ⚠️ 出現任何帶 `%i` 的路徑 ⇒ 停下來：reviewer 的工作樹不在 pool 底下，
+#      systemd 對不存在的 ReadWritePaths 目標會讓每一個 reviewer job 起不來。
+```
+
+### 5-2a. 兩份 builder 模板（#643 per-executor 加固剖面）
 
 > **為什麼是兩份**：`MemoryDenyWriteExecute=yes` 擋的是 JIT 型 shellcode，而 V8 的
 > JIT **必須**有 W+X 記憶體——這一項與 JS runtime 天生互斥。實機逐項隔離的結果是
@@ -1658,36 +1734,74 @@ diff <(python3 -m paulsha_cortex.trust_root unit three-way --job) \
 #   ⚠️ 出現任何第三行 ⇒ 兩份剖面在加固表以外也分岔了，**停下來**：
 #      那代表產生器被改成兩段各自維護，本步驟的前提不再成立。
 
-# 🔧 sudo：落檔（root 擁有——這是 User= 不可被竄改的前提）
-for P in "" "--profile jit"; do
-  U=$(python3 -m paulsha_cortex.trust_root unit three-way --job $P \
-        | sed -n '1s|^# /etc/systemd/system/||p')
-  python3 -m paulsha_cortex.trust_root unit three-way --job $P \
-    | sudo tee "/etc/systemd/system/$U" >/dev/null
-  sudo chown root:root "/etc/systemd/system/$U"
-  sudo chmod 0644 "/etc/systemd/system/$U"
-  echo "installed: $U"
+# 🔧 sudo：落檔**四份**（root 擁有——這是 User= 不可被竄改的前提）
+for W in --job --review-job; do
+  for P in "" "--profile jit"; do
+    U=$(python3 -m paulsha_cortex.trust_root unit three-way $W $P \
+          | sed -n '1s|^# /etc/systemd/system/||p')
+    python3 -m paulsha_cortex.trust_root unit three-way $W $P \
+      | sudo tee "/etc/systemd/system/$U" >/dev/null
+    sudo chown root:root "/etc/systemd/system/$U"
+    sudo chmod 0644 "/etc/systemd/system/$U"
+    echo "installed: $U"
+  done
 done
 sudo systemctl daemon-reload
-#   期望印出兩行：cortex-job@.service、cortex-job-jit@.service
+#   期望印出四行：cortex-job@ / cortex-job-jit@ /
+#                 cortex-reviewer-job@ / cortex-reviewer-job-jit@（.service）
 
 # ✅ 驗證：與產生器逐位元相同、User= 確實寫死
 diff <(python3 -m paulsha_cortex.trust_root unit three-way --job) \
      /etc/systemd/system/cortex-job@.service && echo "job unit (strict) in sync: OK"
 diff <(python3 -m paulsha_cortex.trust_root unit three-way --job --profile jit) \
      /etc/systemd/system/cortex-job-jit@.service && echo "job unit (jit) in sync: OK"
-for U in cortex-job cortex-job-jit; do
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --review-job) \
+     /etc/systemd/system/cortex-reviewer-job@.service && echo "review unit (strict) in sync: OK"
+diff <(python3 -m paulsha_cortex.trust_root unit three-way --review-job --profile jit) \
+     /etc/systemd/system/cortex-reviewer-job-jit@.service && echo "review unit (jit) in sync: OK"
+for U in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit; do
   echo "--- $U"
   grep -E "^(User|Group|ExecStart|NoNewPrivileges|CapabilityBoundingSet|MemoryDenyWriteExecute)=" \
        "/etc/systemd/system/$U@.service"
 done
-#   期望：兩份皆 User=cortex-builder、Group=cortex-builder、NoNewPrivileges=yes、
-#         CapabilityBoundingSet=（空值）；MemoryDenyWriteExecute 一份 yes 一份 no。
+#   期望：ExecStart 四份皆 /opt/cortex/bin/cortex-job-shim %i；
+#         User= 兩份 cortex-builder、兩份 cortex-reviewer-planner；
+#         NoNewPrivileges=yes、CapabilityBoundingSet=（空值）四份皆同；
+#         MemoryDenyWriteExecute 每個角色各一份 yes、一份 no。
 
-# ✅ 驗證：systemd 解析兩份都無「未知鍵」（#645 修的 CollectMode 就是這一族）
+# ✅ 驗證：systemd 解析四份都無「未知鍵」（#645 修的 CollectMode 就是這一族）
 sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \
-                            /etc/systemd/system/cortex-job-jit@.service 2>&1 \
+                            /etc/systemd/system/cortex-job-jit@.service \
+                            /etc/systemd/system/cortex-reviewer-job@.service \
+                            /etc/systemd/system/cortex-reviewer-job-jit@.service 2>&1 \
   | grep -i "unknown key" && echo "❌ 有未知鍵，停下來" || echo "no unknown keys: OK"
+
+# ✅ 驗證（#615）：四份的加固表除剖面差異外**逐項相同**（集合比對，不硬編）
+python3 - <<'PY'
+from paulsha_cortex.trust_root import permgen
+keys = {k for k, _v, _w in permgen._HARDENING}
+tables = {}
+for p in permgen.DOWNGRADED_JOB_PRINCIPALS:
+    for prof in permgen.HARDENING_PROFILES:
+        u = permgen.build_job_unit(permgen.DEFAULT_SCHEME, principal=p, profile=prof)
+        t = {}
+        for line in u.content.splitlines():
+            s = line.strip()
+            if s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            if k in keys:
+                t[k] = v
+        tables[u.unit_name] = t
+assert len({frozenset(t) for t in tables.values()}) == 1, "加固鍵集合不一致"
+strict = tables["cortex-job@.service"]
+for name, t in tables.items():
+    diff = {k for k in t if t[k] != strict[k]}
+    expect = set() if "-jit@" not in name else permgen.PROFILE_DIVERGENCE_KEYS
+    assert diff == expect, (name, diff)
+print(f"hardening parity across {len(tables)} units: OK")
+PY
+#   期望：`hardening parity across 4 units: OK`。任何 AssertionError ⇒ 停下來。
 #   ⚠️ 舊版落檔的 unit 會在這裡報
 #      `Unknown key name 'CollectMode' in section 'Service', ignoring.`
 #      ——那表示「失敗的 instance 自動回收」從來沒有生效過（#645 已把它移回 [Unit]；
@@ -1845,10 +1959,15 @@ less /tmp/polkit-cortex.rules
 #     (3) unit／verb 明細存在；(4) verb ∈ {start, stop}；
 #     (5) unit 名匹配 ^(?:cortex-job|cortex-job-jit)@[a-z0-9][a-z0-9._-]{0,62}\.service$
 #   **transient unit 的 StartTransientUnit 檢查不帶明細 ⇒ 條件 (3) 直接把它擋掉。**
-#   ⚠️ 條件 (5) 的字幹段是**列舉的交替**（#643：一個加固剖面一份 root-owned 模板檔
-#      ⇒ 兩個名字），**不是**萬用字元：前後仍然錨定、instance 段的字元類一字未改。
-#      仍然是**一條規則、一個 YES 出口**——放行面從「一個具名模板」變成「兩個具名
-#      模板」，沒有變成「任意 unit」。看到 `.*`／`[^`／`\w` 出現在字幹段就是被改壞了。
+#   ⚠️ 條件 (5) 的字幹段是**列舉的交替**，而且是**兩層**列舉，**不是**萬用字元：
+#        (a) 加固剖面（#643）：一份剖面一個 root-owned 模板檔 ⇒ 兩個後綴；
+#        (b) job 角色（#615 M2）：builder 與 reviewer/planner 是不同的 UID，而
+#            User= 同樣寫死在檔裡 ⇒ 兩個字幹頭。
+#      2 × 2 ＝ 四個具名模板。前後仍然錨定、instance 段的字元類一字未改，仍然是
+#      **一條規則、一個 YES 出口**——放行面是「四個具名模板」，不是「任意 unit」。
+#      看到 `.*`／`[^`／`\w` 出現在字幹段就是被改壞了。
+#      四份模板的 User= 全部是無 sudo、無 root、彼此互不可寫的降權服務帳號，
+#      因此「多一個字幹」擴大的是**降權目標的選擇**，不是提權面。
 
 # 🔧 sudo：落檔
 sudo install -o root -g root -m 0644 /tmp/polkit-cortex.rules \
@@ -1867,13 +1986,18 @@ rule = permgen.build_polkit_rule(
     permgen.SCHEMES["three-way"], plan=permgen.PolkitPlan.TEMPLATE
 )
 print("subject       :", rule.subject_account)
-print("target        :", rule.target_account)
+print("targets       :", rule.target_accounts)
 print("unit_pattern  :", rule.unit_pattern)
 print("allowed_verbs :", rule.allowed_verbs)
 print("residual_risks:", rule.residual_risks or "(none — OS 層封閉)")
+print("grants        :", rule.content.count("polkit.Result.YES"),
+      "addRule:", rule.content.count("polkit.addRule("))
 PY
-#   期望：subject=cortex-manager、target=cortex-builder、verbs=('start','stop')、
-#         residual_risks 為空。
+#   期望：subject=cortex-manager、
+#         targets=('cortex-builder', 'cortex-reviewer-planner')（#615 M2）、
+#         verbs=('start','stop')、residual_risks 為空、grants=1、addRule=1。
+#   ⚠️ grants 或 addRule 不是 1 ⇒ 停下來：這份規則檔的可審查性性質就是
+#      「全檔只有一個放行出口」。
 ```
 
 ### 5-5. (d) 打開切換點 `PSC_JOB_RUNNER=systemd-template`
@@ -1883,14 +2007,36 @@ PY
 python3 -m paulsha_cortex.trust_root unit three-way --job | grep PSC_BUILDER_PATH
 #   期望：PSC_BUILDER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
 
+# ✅ #615：reviewer／planner 那一組（**與 builder 不共用**，見下方說明）
+python3 -m paulsha_cortex.trust_root unit three-way --review-job | grep PSC_REVIEWER_PATH
+#   期望：PSC_REVIEWER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
+
 # 🔧 sudo：把降權模式寫進第 4b 步的 EnvironmentFile
 sudo tee -a /opt/cortex/etc/cortex-manager.env >/dev/null <<'ENVFILE'
 PSC_JOB_RUNNER=systemd-template
 PSC_BUILDER_ACCOUNT=cortex-builder
 PSC_BUILDER_HOME=/var/lib/cortex-builder
 PSC_BUILDER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
+PSC_REVIEWER_ACCOUNT=cortex-reviewer-planner
+PSC_REVIEWER_HOME=/var/lib/cortex-reviewer-planner
+PSC_REVIEWER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
 ENVFILE
 sudo systemctl restart cortex-manager.service
+
+# ✅ 驗證（#615）：兩個角色各自解析到自己的帳號與模板，**不會互相污染**
+sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
+  /opt/cortex/venv/bin/python - <<'PY'
+import os
+from paulsha_cortex.coordinator import job_runner as jr
+for role in jr.JOB_ROLES:
+    print(f"{role:8s} account={jr.resolve_job_account(os.environ, role=role):24s} "
+          f"template={jr.resolve_template_unit(os.environ, role=role)}")
+PY
+#   期望：
+#     builder  account=cortex-builder           template=cortex-job@.service
+#     review   account=cortex-reviewer-planner  template=cortex-reviewer-job@.service
+#   ⚠️ review 那行若是 cortex-builder ⇒ 停下來：reviewer 會以 builder 身分起跑，
+#      而 reviewer 正是寫 verdict 的那一個——那等於把 verdict 通道交還給 builder。
 
 # ✅ 驗證：模式確實被解析成 template（值非法必須 fail-closed，不得靜默當成 direct）
 sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
@@ -1919,8 +2065,16 @@ sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | x
 > **不是**讓 builder 自己 `login`（toolchain 未落位前 `login` 這個動作本身就跑不起來，
 > 而且 job 的 HOME 是 root-owned，CLI 也建不了 `auth.json`）。Manager 不會在執行期把
 > 自己的憑證傳過去——job 的登入態是一次性的部署動作。
-> **M2 之前**：`PSC_JOB_RUNNER` 只影響 builder persona；reviewer／planner 仍在 Manager
-> 行程內執行（見開頭「分段落地」）。
+> **#615 M2 起**：`PSC_JOB_RUNNER` 對**三個** persona 都生效。persona 不再決定
+> 「降不降權」，只決定**降到哪個角色**（builder／review）——判定點在
+> `launcher.SubprocessLauncher._job_role()`，由 launcher 的建構契約導出，job 側碰不到。
+>
+> **角色判定的三個來源（缺一即誤判）**：`review_only`（workflow lane reviewer）、
+> `read_only`（planner）、**`verdict_spool_dir is not None`（slice lane 的 foreign
+> reviewer）**。第三條容易漏：foreign reviewer 走
+> `manager._spool_writable_launcher()` → `as_verdict_spool_writer()`，而那支工廠產出的
+> launcher 前兩個旗標**都是 False**（verdict spool 放行與 read-only 契約互斥）。只看前
+> 兩條會把它判成 builder 並以 `cortex-builder` 起跑——**而它正是寫 verdict 的那一個**。
 
 ### 5-6. 正向驗證（**必須成功**）
 
@@ -2003,17 +2157,106 @@ sudo journalctl -u "cortex-job@$JOB.service" -n 20 --no-pager
 sudo -u cortex-manager systemctl stop "cortex-job@$JOB.service"; echo "exit=$?"   # 期望 0
 ```
 
-### 5-7. 反向驗證（**11 條全部必須被拒**，＋#643 的第 12 條）
+### 5-6b. 正向驗證（**reviewer／planner 模板**，#615 M2）
 
-> **#643 起每一條都要對「兩個」字幹跑一次**：加固剖面讓 `cortex-job-jit@` 成為第二個
-> 被 polkit 放行的模板名。放行面從「一個具名模板」變成「兩個具名模板」——**不是**
-> 變成「任意 unit」——因此原本 11 條的每一條在新字幹上必須有**完全相同**的結果。
-> 下面在 (5)(7)(8)(9)(10) 逐條補上 `-jit` 版本，(7) 增加圍繞新字幹的混淆形式，
-> 並新增 (12)「Manager 選不了剖面」三小條。
+> **與 5-6 逐條同構，只換模板名與帳號。** 它要證明的是一件 M1 完全沒有證據的事：
+> reviewer 的 job **不是**以 `cortex-manager` 跑的，也**不是**以 `cortex-builder` 跑的。
+>
+> 同 5-6 的誠實邊界：這一段是手工 spec，**只驗隔離、驗不了功能**；功能面由第 8b-2 步
+> 的真實 dispatch 驗。
 
 ```bash
-# ✅ (0) 兩個字幹的變數化（下面的條目共用；**不要只跑其中一個**）
-STEMS="cortex-job cortex-job-jit"
+RJOB=selftest-review
+
+# 🔧 sudo：寫 reviewer 的 job-spec（同樣以 cortex-manager 身分寫）
+sudo -u cortex-manager /opt/cortex/venv/bin/python - "$RJOB" <<'PY'
+import sys
+from paulsha_cortex.coordinator import job_runner
+
+instance = sys.argv[1]
+spool = job_runner.DEFAULT_JOB_SPEC_SPOOL
+smoke = (
+    'echo "== identity =="; id; '
+    'echo "== tokens =="; echo "GH_TOKEN=[$GH_TOKEN] GITHUB_TOKEN=[$GITHUB_TOKEN]"; '
+    'echo "== home =="; echo "HOME=$HOME"; ls -ld "$HOME"; '
+    'echo "== verdict spool writable? =="; '
+    'D=/var/lib/cortex/coordinator/review-verdicts/probe; '
+    '(mkdir -p "$D" && printf "{}" > "$D/verdict.json" && echo "verdict write OK") 2>&1 | tail -1; '
+    'echo "== builder workspace writable? =="; '
+    '(printf x > /var/lib/cortex/worktree/evil) 2>&1 | tail -1; '
+    'echo "== commit spool writable? =="; '
+    '(printf x > /var/lib/cortex/coordinator/commit-spool/evil) 2>&1 | tail -1; '
+    'echo "== source tree writable? =="; '
+    '(printf x > /var/lib/cortex/repos/evil) 2>&1 | tail -1; '
+    'echo "== gate ledger writable? =="; '
+    '(printf x > /var/lib/cortex/runtime/dispatch/evil) 2>&1 | tail -1; '
+    'echo "== source tree readable? =="; ls /var/lib/cortex/repos >/dev/null 2>&1 '
+    '&& echo "source tree readable OK" || echo "source tree NOT readable"'
+)
+spec = job_runner.build_job_spec(
+    job_id=f"{instance}-smoke",
+    instance=instance,
+    unit=f"cortex-reviewer-job@{instance}.service",
+    command=["/bin/sh", "-c", smoke],
+    # reviewer 的工作樹**不在** pool 底下；這裡用 unit 的 WorkingDirectory（恆存在）。
+    working_directory="/var/lib/cortex/worktree",
+    log_path=f"/var/lib/cortex-reviewer-planner/cache/{instance}.log",
+    env={
+        "HOME": "/var/lib/cortex-reviewer-planner",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+    },
+)
+print("wrote:", job_runner.write_job_spec(job_runner.job_spec_path(spool, instance), spec))
+PY
+
+# ✅ 正向：以 cortex-manager 身分起 reviewer instance——**必須成功**
+sudo -u cortex-manager systemctl start "cortex-reviewer-job@$RJOB.service"; echo "exit=$?"
+
+sudo cat "/var/lib/cortex-reviewer-planner/cache/$RJOB.log"
+#   期望輸出（逐條）：
+#     uid=…(cortex-reviewer-planner) gid=…(cortex-reviewer-planner)
+#         ← **這一行就是 M2 的全部**：不是 cortex-manager，也不是 cortex-builder
+#     GH_TOKEN=[] GITHUB_TOKEN=[]
+#     HOME=/var/lib/cortex-reviewer-planner，且該目錄為 root:root
+#     verdict write OK                      ← 正向：verdict 通道通
+#     builder workspace writable? → Permission denied / Read-only file system
+#     commit spool  writable? → Permission denied / Read-only file system
+#     source tree   writable? → Permission denied / Read-only file system
+#     gate ledger   writable? → Permission denied / Read-only file system
+#     source tree readable OK               ← 唯讀可達（review 要讀 candidate）
+#   ⚠️ 任何一條「writable?」印出成功 ⇒ 停下來：RWP 或 ACL 有一層沒套上。
+#   ⚠️ `verdict write OK` 沒出現 ⇒ 停下來：verdict 通道在三分下不通，
+#      這正是 #638 缺陷 1（mkdir 重設 ACL mask）與父層 traverse ACL（#620）的症狀。
+
+# 🔧 清理
+sudo -u cortex-manager systemctl stop "cortex-reviewer-job@$RJOB.service" 2>/dev/null
+sudo rm -rf /var/lib/cortex/coordinator/review-verdicts/probe
+sudo rm -f "/var/lib/cortex/coordinator/job-specs/$RJOB.json" \
+           "/var/lib/cortex-reviewer-planner/cache/$RJOB.log"
+```
+
+### 5-7. 反向驗證（**11 條全部必須被拒**，＋#643 的第 12 條）
+
+> **#643 起每一條都要對「兩個」字幹跑一次，#615 M2 起是「四個」**：加固剖面帶來
+> `-jit` 後綴（#643），job 角色帶來 `cortex-reviewer-job` 字幹頭（#615）。放行面因此是
+> 「四個具名模板」——**不是**「任意 unit」——原本 11 條的每一條在**每一個**新字幹上
+> 必須有**完全相同**的結果。下面在 (5)(7)(8)(9)(10) 用 `$STEMS` 一次涵蓋四個，
+> (7) 增加圍繞兩個新字幹的混淆形式，並有 (12)「Manager 選不了剖面」三小條。
+>
+> **不要只跑其中一個字幹。** 「新增一個放行的名字」最容易被鑽的就是它周邊的混淆面，
+> 而那個面只有在對**新**字幹逐條重跑時才驗得到。
+
+```bash
+# ✅ (0) 四個字幹的變數化（下面的條目共用；**不要只跑其中一個**）
+#    直接由產生器導出，不手打——手打與產生器漂移時，驗的就不是實際落檔的那組。
+STEMS=$(python3 - <<'PY'
+from paulsha_cortex.trust_root import permgen
+print(" ".join(permgen.job_unit_stems(
+    permgen.DEFAULT_LAYOUT, permgen.DOWNGRADED_JOB_PRINCIPALS)))
+PY
+)
+echo "STEMS=$STEMS"
+#   期望：cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit
 
 # ✅ (1) 以 cortex-manager 起 transient unit（不指定 UID）：必須被拒
 sudo -u cortex-manager systemd-run --pipe --wait /bin/id; echo "exit=$?"
@@ -2041,7 +2284,8 @@ sudo -u cortex-manager systemctl restart cortex-manager.service; echo "exit=$?"
 sudo -u cortex-manager systemctl start sshd.service 2>&1 | tail -1; echo "exit=$?"
 
 # ✅ (7) 名稱夾帶（前綴／後綴混淆）：必須被拒
-#     前兩條是原本的；其餘八條是 #643 新字幹周邊的混淆面
+#     前兩條是原本的；接著八條是 #643 `-jit` 周邊的混淆面；
+#     最後十條是 #615 `cortex-reviewer-job` 周邊的混淆面
 #     （**新增一個字幹，最容易被鑽的就是這裡**）
 for BAD in \
     "evil-cortex-job@x.service" \
@@ -2053,9 +2297,21 @@ for BAD in \
     "cortex-job-jit-evil@x.service" \
     "cortex-jit-job@x.service" \
     "cortex-job-jit@.service" \
-    "cortex-job-jit@X.service"; do
+    "cortex-job-jit@X.service" \
+    "evil-cortex-reviewer-job@x.service" \
+    "cortex-reviewer-job@x.service.evil" \
+    "cortex-reviewer-jobs@x.service" \
+    "cortex-reviewer-jo@x.service" \
+    "cortex-reviewer-job-evil@x.service" \
+    "cortex-job-reviewer@x.service" \
+    "cortex-reviewer@x.service" \
+    "cortex-reviewer-planner-job@x.service" \
+    "cortex-reviewer-job@.service" \
+    "cortex-reviewer-job@X.service"; do
   sudo -u cortex-manager systemctl start "$BAD" 2>/dev/null; echo "(7) $BAD exit=$?"
 done
+#   期望：**20 條全部非 0**。`cortex-reviewer-planner-job@` 那條特別重要——
+#   把帳號名當字幹是最直覺的猜法，而它不在放行的四個字幹裡。
 
 # ✅ (8) 其他 verb：必須被拒
 for S in $STEMS; do
@@ -2072,13 +2328,20 @@ for S in $STEMS; do
 done
 
 # ✅ (10) 改 template unit／shim／polkit 規則：三個服務帳號一律 EACCES
+#     **四份 unit 逐一試**——漏掉一份就等於那一份的 User= 沒被證明是不可竄改的。
 for U in cortex-manager cortex-reviewer-planner cortex-builder; do
-  sudo -u "$U" sh -c 'printf "User=root\n" >> /etc/systemd/system/cortex-job@.service'; echo "$U unit(strict) exit=$?"
-  sudo -u "$U" sh -c 'printf "MemoryDenyWriteExecute=no\n" >> /etc/systemd/system/cortex-job@.service'; echo "$U mdwe(strict) exit=$?"
-  sudo -u "$U" sh -c 'printf "User=root\n" >> /etc/systemd/system/cortex-job-jit@.service'; echo "$U unit(jit) exit=$?"
-  sudo -u "$U" sh -c 'printf "id\n" >> /opt/cortex/bin/cortex-job-shim'; echo "$U shim exit=$?"
-  sudo -u "$U" sh -c 'printf "x\n" >> /etc/polkit-1/rules.d/49-cortex-downgrade.rules'; echo "$U polkit exit=$?"
+  for S in $STEMS; do
+    sudo -u "$U" sh -c "printf 'User=root\n' >> /etc/systemd/system/$S@.service"
+    echo "(10) $U $S User= exit=$?"
+    sudo -u "$U" sh -c "printf 'MemoryDenyWriteExecute=no\n' >> /etc/systemd/system/$S@.service"
+    echo "(10) $U $S MDWE exit=$?"
+    sudo -u "$U" sh -c "printf 'ReadWritePaths=/\n' >> /etc/systemd/system/$S@.service"
+    echo "(10) $U $S RWP exit=$?"
+  done
+  sudo -u "$U" sh -c 'printf "id\n" >> /opt/cortex/bin/cortex-job-shim'; echo "(10) $U shim exit=$?"
+  sudo -u "$U" sh -c 'printf "x\n" >> /etc/polkit-1/rules.d/49-cortex-downgrade.rules'; echo "(10) $U polkit exit=$?"
 done
+#   期望：全部非 0（3 帳號 × (4 unit × 3 + 2) ＝ 42 條）。
 
 # ✅ (11) 負控制：暫時移除 polkit 規則後，dispatch 必須 fail-closed 而非退回 direct
 sudo mv /etc/polkit-1/rules.d/49-cortex-downgrade.rules /tmp/polkit-cortex.disabled
@@ -2178,10 +2441,13 @@ sudo systemctl reset-failed "cortex-job@*" "cortex-job-jit@*" 2>/dev/null || tru
 | **Manager 自身邏輯被攻陷** | Manager 程式碼路徑被誘導寫出惡意 job-spec | root-owned shim 限定 argv 形狀（5-3）；spec 的 schema 是**白名單**且身分欄位 fail-closed（寫端 `build_job_spec()`、讀端 `job_shim.load_spec()` 各驗一次）；job 仍降到 `cortex-builder`、拿不到 token | shim 只能保證「身分／入口不可選」，**不**保證 command 內容良性——惡意 spec 仍可讓 builder 跑任意命令（上界＝builder 權限）。這條要靠 Manager 端的派工邏輯與 R9 族 2 的檔案邊界共同壓住 |
 | **operator 帳號** | 有 `sudo`，可改任何東西 | 設計上信任邊界之外（本 runbook 全部 root 操作都由 operator 親自輸入） | 不在本階段範圍 |
 | **polkit 不可用** | polkit 掛掉 ⇒ 全部 job 起不來 | fail-closed（安全但功能全停）；執行前提第 6 項＋WSL2 段第 5 項複驗 | 需監控，否則表現為「靜默停擺」 |
-| **M2 未完成** | reviewer／planner 仍在 Manager 行程內以 `cortex-manager` 身分跑 ⇒ 這兩個 persona 的 injection 可達行程**目前**仍與 grant 同 UID | 檔案權限面已三分（第 3b 步實測）；builder（最大攻擊面）已完全移出 | **這是 M1 唯一的行程面殘餘**，必須在 #584 明示記錄，並隨 M2 關閉 |
+| ~~**M2 未完成**~~ | ~~reviewer／planner 仍在 Manager 行程內以 `cortex-manager` 身分跑~~ | **已關閉（#615）**：三個會跑模型的 persona 啟動面全部離開 Manager 的 UID；5-6b／8b-2 為其驗收 | — |
+| **gate 執行身分**（#629） | gate 命令在 builder 掌控的 worktree 裡跑，`pytest` 載入該 worktree 的 `conftest.py` ⇒ 執行者取得任意程式碼執行 | 降權模式下 job **不跑 gate**（`_should_run_gates()` 對三個 persona 皆 False），build 卡對 `require_ledger` **fail closed**——沒有獨立證據就不採信 | 需要**第四個帳號**（既非 builder 也非 reviewer／planner，更非 Manager）。**刻意不掛在 `cortex-reviewer-planner` 上**：那會讓被攻陷的 builder 經由 gate 執行影響寫 verdict 的帳號，抵銷 #638／#639。屬 #629 |
+| **reviewer 憑證無法就地 refresh** | `cortex-reviewer-planner` 的 executor 憑證不在其模板 unit 的 `ReadWritePaths=` 內 | 憑證檔本身由 root 於第 4e 步放置並 chown（0600），父目錄 root-owned；讀取不受影響 | token 過期需 operator 重跑第 4e 步。登記表目前只登記 `builder-executor-credential` 一份，理由見該資產 note（二分部署上登記第二份會讓 Manager unit 的 RWP 指向不存在的路徑而起不來） |
 
-> **記錄要求**：完成第 5 步後，把 5-7 的 11 條 exit code、5-4 的 `residual_risks` 輸出、
-> 以及本表最後一列（M2 是否已完成）貼到 #584。D6 的通過判定引用這份紀錄。
+> **記錄要求**：完成第 5 步後，把 5-7 的 12 組 exit code（**四個字幹各一輪**）、
+> 5-4 的 `targets`／`residual_risks`／`grants` 輸出、5-6b 的 `id` 那一行、
+> 以及 8b-2 的 (3)(4)(5)(7) 四組結果貼到 #584。D6 的通過判定引用這份紀錄。
 
 ### 5-9. 產生邏輯的離線對照
 
@@ -2622,22 +2888,43 @@ sudo cat "/var/lib/cortex/worktree/$JOB/$JOB.log" | tee /tmp/r9-builder.txt
 sudo journalctl -u "cortex-job@$JOB.service" -n 30 --no-pager
 #   期望：journal 只有 systemd 的起停紀錄，**沒有** `cortex-job-shim: …` 錯誤。
 
-# 🔧 sudo：pass 2——以 **cortex-reviewer-planner** 身分
-#   M2 之前 reviewer／planner 沒有自己的 template instance，因此這一趟用 **operator 的
-#   sudo** 直接起（不是用 cortex-manager 的 grant）。它測的是**檔案權限面**的三分，
-#   不是啟動面；啟動面由 5-7 (9) 覆蓋。
-#   ⚠️ 必須帶上 ProtectProc／ProcSubset：否則 pass 2 的 /proc 語意與 template unit
-#      不同，族 4 兩趟的結果不可比（T4.0 會在 pass 2 「成功」而被誤記為破口）。
-sudo systemd-run --quiet --collect --pipe --wait \
-  --uid=cortex-reviewer-planner --gid=cortex-reviewer-planner --service-type=exec \
-  --property=NoNewPrivileges=yes \
-  --property=ProtectProc=invisible --property=ProcSubset=pid \
-  --setenv=HOME=/var/lib/cortex-reviewer-planner \
-  --setenv=R9_SUBJECT=reviewer-planner \
-  --setenv="R9_INSTANCE=$JOB" \
-  --setenv="MANAGER_PID=$MANAGER_PID" \
-  --working-directory=/var/lib/cortex/worktree \
-  /bin/sh /var/lib/cortex/r9-attack.sh | tee /tmp/r9-reviewer.txt
+# 🔧 pass 2——以 **cortex-reviewer-planner** 身分（#615 M2：改走**真實啟動面**）
+#   M1 時 reviewer／planner 沒有自己的 template instance，這一趟只能用 operator 的
+#   sudo 直接起 transient unit——它測到的是**檔案權限面**的三分，**不是啟動面**，
+#   而且那份加固面是手打的（與實際 unit 隨時可能漂移）。
+#   M2 之後這一趟改成與 pass 1 **完全同構**：寫 spec → 以 cortex-manager 的 grant
+#   起 `cortex-reviewer-job@` instance。加固面因此直接來自已落檔的 unit，不再手打。
+RJOB=r9-review
+sudo -u cortex-manager /opt/cortex/venv/bin/python - "$RJOB" "$MANAGER_PID" <<'PY'
+import sys
+from paulsha_cortex.coordinator import job_runner
+
+instance, manager_pid = sys.argv[1], sys.argv[2]
+spool = job_runner.DEFAULT_JOB_SPEC_SPOOL
+spec = job_runner.build_job_spec(
+    job_id=f"{instance}-r9",
+    instance=instance,
+    unit=f"cortex-reviewer-job@{instance}.service",
+    command=["/bin/sh", "/var/lib/cortex/r9-attack.sh"],
+    working_directory="/var/lib/cortex/worktree",
+    log_path=f"/var/lib/cortex-reviewer-planner/cache/{instance}.log",
+    env={
+        "HOME": "/var/lib/cortex-reviewer-planner",
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "R9_SUBJECT": "reviewer-planner",
+        "R9_INSTANCE": instance,
+        "MANAGER_PID": manager_pid,
+    },
+)
+print("wrote:", job_runner.write_job_spec(job_runner.job_spec_path(spool, instance), spec))
+PY
+sudo -u cortex-manager systemctl start "cortex-reviewer-job@$RJOB.service"
+sudo cat "/var/lib/cortex-reviewer-planner/cache/$RJOB.log" | tee /tmp/r9-reviewer.txt
+sudo journalctl -u "cortex-reviewer-job@$RJOB.service" -n 30 --no-pager
+#   期望：journal 只有 systemd 的起停紀錄，**沒有** `cortex-job-shim: …` 錯誤。
+#   ⚠️ 這一趟必須以 `cortex-manager` 的 grant 起（不是 operator 的 sudo）——
+#      那正是 M2 要證明的事：Manager 起得動 reviewer 的模板，而模板把 UID 寫死。
+#   ⚠️ 報告開頭的 `id` 若不是 `uid=…(cortex-reviewer-planner)` ⇒ 停下來。
 ```
 
 **預期輸出**：兩份報告中**每一條 `t()` 測項**都是 `denied (OK) rc=<非 0>`；
@@ -2731,6 +3018,118 @@ diff <(python3 -m paulsha_cortex.trust_root unit three-way --job) \
 
 # ✅ 5.2 事後複驗：分界線改過之後仍成立（族 3「重啟後仍綠」的同一條紀律）
 sudo -u cortex-manager systemd-run --uid=0 --pipe --wait /bin/id; echo "post-negctl exit=$?"   # 期望非 0
+```
+
+### 8b-2. 族 6：verdict 通道端到端（**#615 M2 才第一次驗得到**，#638／#639）
+
+> **為什麼這一族到現在才存在**：#638 修的三個缺陷（`mkdir` 重設 ACL mask、consumer
+> 讀不到 producer 建的檔、consumer `chmod` 不了 producer 的檔）**全部只在「producer
+> 與 consumer 是不同 UID」時才成立**。M2 之前 reviewer 跑在 Manager 行程內，三個缺陷
+> 在那個部署上一個都不會發生——修法也因此一次都沒有被真正驗到。這一族就是那個驗證。
+>
+> **這一族不可用 `sudo -u` 模擬**：`sudo -u cortex-reviewer-planner` 起的行程沒有降權
+> unit 的 `UMask=0077`，而「檔案出生即 0600、consumer 因此讀不到」正是缺陷 2 的成因。
+> 用 sudo 模擬會得到一個永遠綠的測試。**必須走真實的 template instance。**
+
+```bash
+VJOB=verdict-e2e
+SPOOLDIR=/var/lib/cortex/coordinator/review-verdicts/$VJOB
+
+# 🔧 (1) Manager 建那一格（＝ review.prepare_review_verdict_spool() 的實際路徑）
+sudo -u cortex-manager /opt/cortex/venv/bin/python - "$SPOOLDIR" <<'PY'
+import sys
+from paulsha_cortex.coordinator import spool_slot
+print("slot:", spool_slot.create_slot(sys.argv[1], reset=False))
+PY
+#   ⚠️ 若這裡就 Permission denied ⇒ 第 2 步的 spool 權限沒套好，停下來。
+
+# 🔧 (2) 以 reviewer 的**真實 template instance** 寫 verdict（含 publish 那一步）
+sudo -u cortex-manager /opt/cortex/venv/bin/python - "$VJOB" "$SPOOLDIR" <<'PY'
+import sys
+from paulsha_cortex.coordinator import job_runner, spool_slot
+
+instance, slot = sys.argv[1], sys.argv[2]
+verdict = f"{slot}/{spool_slot.REVIEW_VERDICT_FILENAME}"
+script = (
+    f'printf %s \'{{"schema_version":1,"findings":[]}}\' > {verdict}; '
+    # producer 自己放寬給 consumer——與 launcher wrapper 的那一段是同一支函式
+    f'{spool_slot.publish_file_command(verdict)}; '
+    f'echo "wrote as $(id -un)"'
+)
+spec = job_runner.build_job_spec(
+    job_id=f"{instance}-verdict",
+    instance=instance,
+    unit=f"cortex-reviewer-job@{instance}.service",
+    command=["/bin/sh", "-c", script],
+    working_directory="/var/lib/cortex/worktree",
+    log_path=f"/var/lib/cortex-reviewer-planner/cache/{instance}.log",
+    env={"HOME": "/var/lib/cortex-reviewer-planner", "PATH": "/usr/bin:/bin"},
+)
+print("wrote:", job_runner.write_job_spec(
+    job_runner.job_spec_path(job_runner.DEFAULT_JOB_SPEC_SPOOL, instance), spec))
+PY
+sudo -u cortex-manager systemctl start "cortex-reviewer-job@$VJOB.service"
+sudo cat "/var/lib/cortex-reviewer-planner/cache/$VJOB.log"
+#   期望：`wrote as cortex-reviewer-planner`
+
+# ✅ (3) 檔案的 owner 確實是 reviewer、不是 Manager——**這一條就是「不同 UID」的證據**
+sudo stat -c "%U:%G %a %n" "$SPOOLDIR/verdict.json"
+#   期望：cortex-reviewer-planner:cortex-reviewer-planner 644 …
+#   ⚠️ owner 若是 cortex-manager ⇒ 那個 job 沒有以 reviewer 身分跑，整族作廢。
+#   ⚠️ mode 若是 600 ⇒ producer 的 publish 段沒跑到（缺陷 2 會在下一步顯現）。
+
+# ✅ (4) Manager（consumer）讀得到內容
+sudo -u cortex-manager cat "$SPOOLDIR/verdict.json"; echo "(4) exit=$?"
+#   期望：印出 JSON、exit=0。**這一條就是 #638 缺陷 2 的驗收。**
+
+# ✅ (5) builder 對整條通道零權限（連 traverse 都進不去）
+sudo -u cortex-builder ls "$SPOOLDIR" 2>&1 | tail -1; echo "(5) ls exit=$?"
+sudo -u cortex-builder sh -c "printf x > $SPOOLDIR/verdict.json" 2>&1 | tail -1
+echo "(5) overwrite exit=$?"
+#   期望：兩條皆非 0（Permission denied）。**這一條是 spec §3 最短攻擊路徑的驗收**：
+#   builder 代寫 reviewer 的 verdict，在 OS 層不成立。
+
+# ✅ (6) reviewer 讀不到**別人**那一格（`wx` 無 `r`）
+sudo -u cortex-reviewer-planner ls /var/lib/cortex/coordinator/review-verdicts 2>&1 | tail -1
+echo "(6) exit=$?"
+#   期望：非 0（Permission denied）——寫得進自己那格，列不出別人有哪些格。
+
+# ✅ (7) Manager seal 之後 reviewer 改不動（#638 缺陷 3）
+sudo -u cortex-manager /opt/cortex/venv/bin/python - "$SPOOLDIR" <<'PY'
+import sys
+from paulsha_cortex.coordinator import spool_slot
+print("sealed:", spool_slot.seal_slot(sys.argv[1]))
+PY
+sudo stat -c "%a %n" "$SPOOLDIR"
+#   期望：sealed: True、mode 500
+sudo -u cortex-reviewer-planner sh -c "printf x > $SPOOLDIR/verdict.json" 2>&1 | tail -1
+echo "(7) rewrite exit=$?"
+sudo -u cortex-reviewer-planner sh -c "printf x > $SPOOLDIR/second.json" 2>&1 | tail -1
+echo "(7) create exit=$?"
+sudo -u cortex-reviewer-planner sh -c "rm -f $SPOOLDIR/verdict.json" 2>&1 | tail -1
+echo "(7) delete exit=$?"
+#   期望：**三條全部非 0**。
+#   ⚠️ 這三條是 #638 缺陷 3 的驗收：修法前 seal 封的是**檔案**，而 Manager `chmod`
+#      不了 reviewer 擁有的檔、該處又刻意不 raise ⇒ **無聲失敗**，reviewer 可以在
+#      Manager 判讀之後回頭覆寫自己的 verdict。封**目錄**才是 consumer 做得到的那一個。
+#   ⚠️ 任一條 exit=0 ⇒ 停下來：verdict 在落地後仍可被改寫，foreign review 不可信。
+
+# ✅ (8) negative control：Manager 自己在 seal 之前寫得進那一格
+#     （否則上面的紅可能只是「這棵樹整個不可寫」的假綠）
+sudo -u cortex-manager /opt/cortex/venv/bin/python - <<'PY'
+from pathlib import Path
+from paulsha_cortex.coordinator import spool_slot
+slot = Path("/var/lib/cortex/coordinator/review-verdicts/negctl")
+spool_slot.create_slot(slot, reset=False)
+(slot / "probe.json").write_text("{}", encoding="utf-8")
+print("NEG-CONTROL-OK")
+PY
+#   期望：印出 NEG-CONTROL-OK。
+
+# 🔧 清理
+sudo rm -rf "$SPOOLDIR" /var/lib/cortex/coordinator/review-verdicts/negctl
+sudo rm -f "/var/lib/cortex/coordinator/job-specs/$VJOB.json" \
+           "/var/lib/cortex-reviewer-planner/cache/$VJOB.log"
 ```
 
 ### 8c. negative control（受信任身分做同樣的事**必須成功**）
@@ -2848,7 +3247,7 @@ Phase 1 完全不需 root 且含降級運轉安全網（`PSC_DEGRADED_OPERATION=
 | 第 4c（system unit） | WSL 重啟後未拉起／服務起不來 | `sudo systemctl disable --now cortex-manager.service`；改回 `systemctl --user start cortex-manager.service`（舊部署仍在 `$HOME/.local/share/pipx`） |
 | 第 4c（加固誤擋） | 服務起來但功能靜默失效 | 見下方「`ProtectSystem=strict` 誤擋診斷」；**臨時** drop-in 放行、**同一天**把該路徑回填 R1 登記表並重跑 permgen |
 | 第 4d（monitor unit） | monitor 起不來／新樹無寫入 | `sudo systemctl disable --now cortex-monitor.service`；改回 `systemctl --user start cortex-monitor.service`（**會與 system-level Manager 雙寫**，僅救急） |
-| **第 5-2（template unit ×2）** | instance 起不來／unit 語法錯 | `sudo rm -f /etc/systemd/system/cortex-job@.service /etc/systemd/system/cortex-job-jit@.service; sudo rm -rf /etc/systemd/system/cortex-job@.service.d /etc/systemd/system/cortex-job-jit@.service.d; sudo systemctl daemon-reload`；(d) 一併關閉（見下一列）。**兩份要一起收**——只留一份會讓一半的 executor 在 preflight fail-closed |
+| **第 5-2（template unit ×4）** | instance 起不來／unit 語法錯 | `for S in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit; do sudo rm -f "/etc/systemd/system/$S@.service"; sudo rm -rf "/etc/systemd/system/$S@.service.d"; done; sudo systemctl daemon-reload`；(d) 一併關閉（見下一列）。**四份要一起收**——只留一部分會讓對應的 executor／persona 在 preflight fail-closed |
 | **第 5-3（shim）** | job 起得來但 argv 不對／shim crash | `sudo rm -f /opt/cortex/bin/cortex-job-shim`；重新由產生器落檔並 `diff` 對齊；仍不對則關 (d) |
 | **第 5-4（polkit）** | 規則語法錯／`cortex-manager` 起不了任何 job | `sudo rm -f /etc/polkit-1/rules.d/49-cortex-downgrade.rules; sudo systemctl restart polkit.service`；此時降權面完全關閉（fail-closed，job 起不來但無提權） |
 | **第 5-5（切換點）** | 降權後 job 全數 needs_human | `sudo sed -i '/^PSC_JOB_RUNNER=/d;/^PSC_BUILDER_ACCOUNT=/d;/^PSC_BUILDER_HOME=/d' /opt/cortex/etc/cortex-manager.env; sudo systemctl restart cortex-manager.service`（回 `direct`）；Manager 以 `per-case-approval` 不 spawn job 運轉 |
@@ -2859,11 +3258,11 @@ Phase 1 完全不需 root 且含降級運轉安全網（`PSC_DEGRADED_OPERATION=
 ```bash
 # 🔧 sudo：停掉並移除 Phase 2 的一切（含 A+B 的三個 root-owned 物件與三帳號）
 sudo systemctl disable --now cortex-manager.service 2>/dev/null || true
-sudo rm -f /etc/systemd/system/cortex-manager.service \
-           /etc/systemd/system/cortex-job@.service \
-           /etc/systemd/system/cortex-job-jit@.service
-sudo rm -rf /etc/systemd/system/cortex-job@.service.d \
-            /etc/systemd/system/cortex-job-jit@.service.d
+sudo rm -f /etc/systemd/system/cortex-manager.service
+for S in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit; do
+  sudo rm -f "/etc/systemd/system/$S@.service"
+  sudo rm -rf "/etc/systemd/system/$S@.service.d"
+done
 sudo rm -f /etc/polkit-1/rules.d/49-cortex-downgrade.rules
 sudo rm -f /opt/cortex/bin/cortex-job-shim
 #   （EnvironmentFile 隨 /opt/cortex 一併移除，PSC_JOB_RUNNER 自然失效）
@@ -3060,15 +3459,25 @@ sudo find /opt/cortex/venv -name "pipx_shared.pth" | head          # 期望：�
 # ✅ job-spec spool 沒有留下過夜的 spec（每一份都是某個 job 的命令列）
 sudo ls -l /var/lib/cortex/coordinator/job-specs
 
-# ✅ 沒有殘留的 template drop-in（族 5.2 的持久化面）
-ls -la /etc/systemd/system/cortex-job@.service.d /etc/systemd/system/cortex-job-jit@.service.d \
-  2>/dev/null && echo "!! 有 drop-in，查來源" || echo "no drop-in: OK"
-# ✅ #643：兩份 job unit 的加固差異必須**只有** MemoryDenyWriteExecute 一項
-diff <(grep -E "^[A-Z][A-Za-z]*=" /etc/systemd/system/cortex-job@.service) \
-     <(grep -E "^[A-Z][A-Za-z]*=" /etc/systemd/system/cortex-job-jit@.service) \
-  | grep -E "^[<>]" | sort
-#   期望恰好兩行：`< MemoryDenyWriteExecute=yes` 與 `> MemoryDenyWriteExecute=no`。
-#   出現第三行 ⇒ 兩份剖面在加固表以外分岔了，回第 5-2 步重新落檔。
+# ✅ 沒有殘留的 template drop-in（族 5.2 的持久化面）——**四份都要看**
+for S in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit; do
+  ls -la "/etc/systemd/system/$S@.service.d" 2>/dev/null \
+    && echo "!! $S 有 drop-in，查來源"
+done; echo "drop-in scan done"
+# ✅ #643：同一角色兩份 unit 的加固差異必須**只有** MemoryDenyWriteExecute 一項
+for PAIR in "cortex-job cortex-job-jit" "cortex-reviewer-job cortex-reviewer-job-jit"; do
+  set -- $PAIR
+  echo "--- $1 vs $2"
+  diff <(grep -E "^[A-Z][A-Za-z]*=" "/etc/systemd/system/$1@.service") \
+       <(grep -E "^[A-Z][A-Za-z]*=" "/etc/systemd/system/$2@.service") \
+    | grep -E "^[<>]" | sort
+done
+#   期望每一組恰好兩行：`< MemoryDenyWriteExecute=yes` 與 `> MemoryDenyWriteExecute=no`。
+#   出現第三行 ⇒ 剖面在加固表以外分岔了，回第 5-2 步重新落檔。
+# ✅ #615：兩個角色的 User= 確實不同，且都不是 cortex-manager
+grep -h "^User=" /etc/systemd/system/cortex-job@.service \
+                 /etc/systemd/system/cortex-reviewer-job@.service | sort -u
+#   期望恰好兩行：User=cortex-builder、User=cortex-reviewer-planner。
 
 # ✅ 三分帳號仍是三個、互不交集、皆無 sudo
 for U in cortex-manager cortex-reviewer-planner cortex-builder; do id -nG "$U"; done
@@ -3164,7 +3573,7 @@ PY
 | 第 1 步建**兩**個帳號（`cortex-svc` / `cortex-builder`） | 建**三**個（`cortex-manager` / `cortex-reviewer-planner` / `cortex-builder`） |
 | 全文 `two-way` | 全文 `three-way`；`two-way` 僅存於程式碼作為對照組 |
 | 第 5 步 A／B 並列，**待 operator 拍板** | 第 5 步 **A+B 合一，無分歧**；transient 降為附錄 B 備援 |
-| polkit 授 transient 建立（方案 A） | polkit **不授** transient 建立；只放行 `cortex-job@*.service` 與 `cortex-job-jit@*.service`（#643 加固剖面）的 start/stop——**兩個具名模板，不是任意 unit** |
+| polkit 授 transient 建立（方案 A） | polkit **不授** transient 建立；只放行四個具名模板的 start/stop：`cortex-job@` / `cortex-job-jit@`（#643 加固剖面）/ `cortex-reviewer-job@` / `cortex-reviewer-job-jit@`（#615 job 角色），皆 `*.service`——**四個具名模板，不是任意 unit** |
 | `ExecStart=` 指向 spool 內的 `run.sh` | 指向 **root-owned shim** `/opt/cortex/bin/cortex-job-shim`（C 層搬進 root-owned 檔） |
 | `PSC_JOB_RUNNER=systemd-run` | `PSC_JOB_RUNNER=systemd-template`（`systemd-run` 僅備援用） |
 | R9 四族，subject 為 `cortex-builder` | R9 **五族**，subject 為 builder ＋ reviewer-planner，新增族 5 privilege-boundary |

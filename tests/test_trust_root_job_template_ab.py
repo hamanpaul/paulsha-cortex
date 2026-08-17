@@ -410,10 +410,11 @@ class SchemeDerivedHomeTests(unittest.TestCase):
 
 
 class M2ExtensionPointTests(unittest.TestCase):
-    """#615（M2：reviewer/planner 啟動面降權）的第二實例化必須是換參數，不是改核心。
+    """#615（M2：reviewer/planner 啟動面降權）——第二實例化確實是換參數。
 
-    本 PR **不**實作 M2——這裡只釘住「擴充點存在且真的通」，避免 M2 開工時才發現
-    要動 `build_job_unit`／`build_polkit_rule` 的內部。
+    這個類原本釘的是「擴充點存在且真的通」（M2 未實作時的前置驗收）。M2 落地後
+    改釘「擴充點真的只換了參數」：`build_job_unit`／`build_polkit_rule` 的內部沒有
+    任何 `if principal is …`，兩個角色的差異全部由 scheme 的帳號映射帶出來。
     """
 
     def test_a_second_template_instance_is_a_parameter_change(self) -> None:
@@ -424,38 +425,34 @@ class M2ExtensionPointTests(unittest.TestCase):
         self.assertEqual(unit.account, "cortex-reviewer-planner")
         self.assertIn("User=cortex-reviewer-planner\n", unit.content)
         self.assertIn("Environment=HOME=/var/lib/cortex-reviewer-planner\n", unit.content)
-        # 與 builder 的模板互不重疊（unit 名不同 ⇒ polkit 授權面不會被順帶擴大）。
+        # 與 builder 的模板互不重疊（unit 名不同 ⇒ 每一份的授權面各自具名）。
         builder_unit = permgen.build_job_unit(scheme, layout)
         self.assertNotEqual(unit.unit_name, builder_unit.unit_name)
+        self.assertNotEqual(unit.account, builder_unit.account)
 
-    def test_a_second_polkit_grant_is_a_parameter_change(self) -> None:
+    def test_the_deployed_polkit_rule_covers_every_downgraded_role(self) -> None:
         scheme = permgen.DEFAULT_SCHEME
-        rule = permgen.build_polkit_rule(
-            scheme, plan=permgen.PolkitPlan.TEMPLATE, principal=Principal.REVIEWER
-        )
+        rule = permgen.build_polkit_rule(scheme, plan=permgen.PolkitPlan.TEMPLATE)
+        for principal in permgen.DOWNGRADED_JOB_PRINCIPALS:
+            for profile in permgen.HARDENING_PROFILES:
+                stem = permgen.job_unit_stem(permgen.DEFAULT_LAYOUT, principal, profile)
+                self.assertEqual(
+                    permgen.evaluate_polkit(
+                        rule,
+                        user=rule.subject_account,
+                        action_id=permgen.POLKIT_ACTION,
+                        unit=f"{stem}@x.service",
+                        verb="start",
+                    ),
+                    "YES",
+                    stem,
+                )
         self.assertEqual(
-            permgen.evaluate_polkit(
-                rule,
-                user=rule.subject_account,
-                action_id=permgen.POLKIT_ACTION,
-                unit="cortex-reviewer-job@x.service",
-                verb="start",
-            ),
-            "YES",
+            rule.target_accounts, ("cortex-builder", "cortex-reviewer-planner")
         )
-        self.assertEqual(rule.target_account, "cortex-reviewer-planner")
-        # builder 的規則不放行 reviewer 的模板實例，反之亦然。
-        builder_rule = permgen.build_polkit_rule(scheme, plan=permgen.PolkitPlan.TEMPLATE)
-        self.assertEqual(
-            permgen.evaluate_polkit(
-                builder_rule,
-                user=builder_rule.subject_account,
-                action_id=permgen.POLKIT_ACTION,
-                unit="cortex-reviewer-job@x.service",
-                verb="start",
-            ),
-            "NO",
-        )
+        # 仍然只有一個放行出口。
+        self.assertEqual(rule.content.count("polkit.Result.YES"), 1)
+        self.assertEqual(rule.content.count("polkit.addRule("), 1)
 
     def test_builder_stem_is_unchanged_by_the_extension_point(self) -> None:
         self.assertEqual(
@@ -466,21 +463,24 @@ class M2ExtensionPointTests(unittest.TestCase):
             f"{permgen.job_unit_stem(permgen.DEFAULT_LAYOUT)}@.service",
         )
 
-    def test_runner_side_second_instance_is_pure_config(self) -> None:
-        """啟動器側的第二實例化＝三個 env，不動一行程式碼。"""
-        env = {
-            job_runner.TEMPLATE_UNIT_ENV: "cortex-reviewer-job@.service",
-            job_runner.BUILDER_ACCOUNT_ENV: "cortex-reviewer-planner",
-        }
+    def test_runner_side_second_instance_is_a_role_lookup(self) -> None:
+        """啟動器側的第二實例化＝查一張表，兩個角色不共用一組 env 變數。"""
         self.assertEqual(
-            job_runner.resolve_template_unit(env), "cortex-reviewer-job@.service"
+            job_runner.resolve_template_unit({}, role=job_runner.JOB_ROLE_REVIEW),
+            "cortex-reviewer-job@.service",
         )
         self.assertEqual(
-            job_runner.resolve_builder_account(env), "cortex-reviewer-planner"
+            job_runner.resolve_job_account({}, role=job_runner.JOB_ROLE_REVIEW),
+            "cortex-reviewer-planner",
         )
+        self.assertEqual(job_runner.resolve_template_unit({}), "cortex-job@.service")
+        self.assertEqual(job_runner.resolve_job_account({}), "cortex-builder")
         self.assertEqual(
             job_runner.template_unit_name(
-                "demo-deadbeef", template=job_runner.resolve_template_unit(env)
+                "demo-deadbeef",
+                template=job_runner.resolve_template_unit(
+                    {}, role=job_runner.JOB_ROLE_REVIEW
+                ),
             ),
             "cortex-reviewer-job@demo-deadbeef.service",
         )
@@ -1029,7 +1029,13 @@ class NoRegressionTests(unittest.TestCase):
             self.assertIn(flag, argv)
         self.assertEqual(popen.call["cwd"], os.path.realpath(popen.call["cwd"]))
 
-    def test_reviewer_and_planner_never_take_the_template_path(self) -> None:
+    def test_reviewer_and_planner_take_the_review_template(self) -> None:
+        """#615（M2）：兩個 persona 都走模板路徑，且走的是 **reviewer 那一份**。
+
+        M1 期間這條測的是「reviewer／planner 永不走模板」——那是當時的誠實邊界。
+        M2 之後守的性質變成「它們走的是自己那一份模板、不是 builder 的」：走錯一份
+        會讓 reviewer 以 `cortex-builder` 起跑，等於把 verdict 的寫入面交還給 builder。
+        """
         for kwargs in (
             {"review_only": True, "review_terminal_kind": "workflow-review-result"},
             {"read_only": True},
@@ -1043,7 +1049,7 @@ class NoRegressionTests(unittest.TestCase):
                     os.environ,
                     _template_env(str(Path(d) / "job-specs")),
                     clear=True,
-                ):
+                ), _nested(_preflight_patches()):
                     Path(d, "job-specs").mkdir(parents=True, exist_ok=True)
                     launcher.launch(
                         slice_id="psc-0002-review",
@@ -1051,12 +1057,21 @@ class NoRegressionTests(unittest.TestCase):
                         worktree=d,
                         log_dir=str(Path(d) / "logs"),
                     )
-                    self.assertEqual(
-                        sorted(Path(d, "job-specs").iterdir()), [], kwargs
-                    )
+                    specs = sorted(Path(d, "job-specs").iterdir())
+                    self.assertEqual(len(specs), 1, kwargs)
+                    spec = json.loads(specs[0].read_text(encoding="utf-8"))
             finally:
                 launcher_module.subprocess.Popen = original
-            self.assertEqual(popen.call["argv"][0], "bash", kwargs)
+            # codex＝node 型 ⇒ jit 剖面；角色＝review ⇒ reviewer 的字幹。
+            self.assertTrue(
+                spec["unit"].startswith("cortex-reviewer-job-jit@"), (kwargs, spec["unit"])
+            )
+            self.assertNotIn("cortex-job@", spec["unit"])
+            # 身分欄位仍然不得出現在 spec 裡（唯一來源是 root-owned unit 的 User=）。
+            self.assertEqual(job_runner.forbidden_spec_keys(spec), [], kwargs)
+            argv = _unwrap_exit_recorder(popen.call["argv"])
+            self.assertEqual(argv[0], "/usr/bin/systemctl", kwargs)
+            self.assertIn(spec["unit"], argv, kwargs)
 
 
 # ---------------------------------------------------------------------------

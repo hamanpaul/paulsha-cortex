@@ -122,17 +122,29 @@ __all__ = [
     "DEFAULT_BUILDER_ACCOUNT",
     "DEFAULT_JOB_SHIM",
     "DEFAULT_JOB_SPEC_SPOOL",
+    "DEFAULT_REVIEWER_ACCOUNT",
+    "DEFAULT_REVIEW_TEMPLATE_UNIT",
     "DEFAULT_START_TIMEOUT_MS",
     "DEFAULT_TEMPLATE_UNIT",
     "EXECUTOR_HARDENING_PROFILE",
     "ForwardedEnvVar",
     "HARDENING_PROFILE_JIT",
     "HARDENING_PROFILE_STRICT",
+    "JOB_ROLES",
+    "JOB_ROLE_BUILDER",
+    "JOB_ROLE_CONFIG",
+    "JOB_ROLE_REVIEW",
     "JOB_RUNNER_ENV",
     "JOB_SHIM_ENV",
     "JOB_SPEC_SPOOL_ENV",
     "JOB_SPEC_VERSION",
+    "JobRoleConfig",
     "JobRunnerError",
+    "REVIEWER_ACCOUNT_ENV",
+    "REVIEWER_GROUP_ENV",
+    "REVIEWER_HOME_ENV",
+    "REVIEWER_PATH_ENV",
+    "REVIEW_TEMPLATE_UNIT_ENV",
     "RUNNER_DIRECT",
     "RUNNER_MODES",
     "RUNNER_SYSTEMD_RUN",
@@ -148,6 +160,7 @@ __all__ = [
     "TRANSIENT_UNIT_PROPERTIES",
     "UNIT_NAME_PREFIX",
     "build_builder_env",
+    "build_job_env",
     "build_job_spec",
     "build_manager_exit_recorder_argv",
     "build_systemctl_start_argv",
@@ -163,6 +176,9 @@ __all__ = [
     "prepare_systemd_template",
     "reject_unsafe_env",
     "resolve_hardening_profile",
+    "resolve_job_account",
+    "resolve_job_group",
+    "resolve_job_role",
     "template_instance_id",
     "template_unit_for_profile",
     "template_unit_name",
@@ -196,6 +212,18 @@ BUILDER_HOME_ENV = "PSC_BUILDER_HOME"
 #: builder 的 PATH 覆寫。未設時轉發 Manager 的 PATH（見 `BUILDER_FORWARDED_ENV`）；
 #: Phase 2b 若把模型 CLI 裝在 builder 才讀得到的路徑，用這個覆寫。
 BUILDER_PATH_ENV = "PSC_BUILDER_PATH"
+
+#: reviewer＋planner 的 OS 帳號名（#615 M2）。三分方案把兩個 persona 映到**同一個**
+#: 帳號，因此只有一組變數、一份模板 unit——不是漏了 planner，是 planner 就是它。
+REVIEWER_ACCOUNT_ENV = "PSC_REVIEWER_ACCOUNT"
+DEFAULT_REVIEWER_ACCOUNT = "cortex-reviewer-planner"
+REVIEWER_GROUP_ENV = "PSC_REVIEWER_GROUP"
+REVIEWER_HOME_ENV = "PSC_REVIEWER_HOME"
+REVIEWER_PATH_ENV = "PSC_REVIEWER_PATH"
+
+#: reviewer／planner 的模板 unit 名（與 `permgen.job_unit_stem(…, REVIEWER)` 成對契約）。
+REVIEW_TEMPLATE_UNIT_ENV = "PSC_REVIEW_JOB_TEMPLATE_UNIT"
+DEFAULT_REVIEW_TEMPLATE_UNIT = "cortex-reviewer-job@.service"
 
 #: transient unit 起動確認窗（毫秒）。見 :func:`confirm_transient_unit_started`。
 START_TIMEOUT_ENV = "PSC_JOB_RUNNER_START_TIMEOUT_MS"
@@ -243,6 +271,101 @@ DEFAULT_TEMPLATE_UNIT = f"{TEMPLATE_UNIT_PREFIX}{TEMPLATE_UNIT_SUFFIX}"
 
 
 # ---------------------------------------------------------------------------
+# job 角色（#615 M2：reviewer／planner 啟動面降權）
+#
+# M1 只有一個降權角色（builder），因此「哪個帳號、哪份模板、哪個 PATH 覆寫」四組
+# config 直接寫成模組層常數就夠了。M2 之後有**兩個**角色，而它們的差異全部落在
+# 「用哪一組 config」——身分、模板、加固剖面選法、env 白名單、preflight、spec 形狀、
+# 起動確認**逐條相同**。因此這裡不是兩條 code path，而是**一張表 ＋ 一個參數**。
+#
+# 這張表是唯一真相：`resolve_job_account()`／`resolve_job_group()`／
+# `build_job_env()`／`prepare_systemd_template()`／`prepare_systemd_run()` 全部由
+# `role` 查表，沒有任何一支帶 `if role == …` 的分支。
+#
+# **為什麼 planner 不是第三個角色**：三分方案（`permgen.THREE_WAY_SCHEME`）把
+# REVIEWER 與 PLANNER 映到同一個 OS 帳號 `cortex-reviewer-planner`。角色的全部內容
+# 就是「哪個帳號」——同帳號 ⇒ 同 unit、同 RWP、同 HOME，多一個角色只會多一個要同步
+# 維護的名字與一個要放進 polkit pattern 的字幹，換不到任何隔離。
+# ---------------------------------------------------------------------------
+
+JOB_ROLE_BUILDER = "builder"
+#: reviewer ＋ planner（同一個 OS 帳號、同一份模板 unit）。
+JOB_ROLE_REVIEW = "review"
+JOB_ROLES = (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW)
+
+
+@dataclass(frozen=True)
+class JobRoleConfig:
+    """一個降權 job 角色的完整 config 面（env 變數名 ＋ 預設值 ＋ 為什麼）。"""
+
+    role_id: str
+    account_env: str
+    default_account: str
+    group_env: str
+    home_env: str
+    path_env: str
+    template_env: str
+    default_template: str
+    #: 這個角色是誰、為什麼要獨立一份（進錯誤訊息與產物註解）。
+    rationale: str
+
+
+JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
+    {
+        JOB_ROLE_BUILDER: JobRoleConfig(
+            role_id=JOB_ROLE_BUILDER,
+            account_env=BUILDER_ACCOUNT_ENV,
+            default_account=DEFAULT_BUILDER_ACCOUNT,
+            group_env=BUILDER_GROUP_ENV,
+            home_env=BUILDER_HOME_ENV,
+            path_env=BUILDER_PATH_ENV,
+            template_env=TEMPLATE_UNIT_ENV,
+            default_template=DEFAULT_TEMPLATE_UNIT,
+            rationale=(
+                "builder persona——唯一會在自己完全掌控的工作區裡跑 untrusted repo "
+                "code 的角色，攻擊面最大。M1（#603／#584）已落地。"
+            ),
+        ),
+        JOB_ROLE_REVIEW: JobRoleConfig(
+            role_id=JOB_ROLE_REVIEW,
+            account_env=REVIEWER_ACCOUNT_ENV,
+            default_account=DEFAULT_REVIEWER_ACCOUNT,
+            group_env=REVIEWER_GROUP_ENV,
+            home_env=REVIEWER_HOME_ENV,
+            path_env=REVIEWER_PATH_ENV,
+            template_env=REVIEW_TEMPLATE_UNIT_ENV,
+            default_template=DEFAULT_REVIEW_TEMPLATE_UNIT,
+            rationale=(
+                "reviewer ＋ planner persona（三分方案下同一個 OS 帳號）。M2（#615）："
+                "在此之前它們仍在 Manager 行程內以 Manager 帳號執行，"
+                "「injection 可達的進程皆無 spawn 授權」因此只對 builder 成立。"
+            ),
+        ),
+    }
+)
+
+
+def resolve_job_role(role: str) -> JobRoleConfig:
+    """角色 id → config。**未知角色 fail-closed**，不落回 builder。
+
+    落回 builder 會是最糟的失敗模式：一個 reviewer job 會被以 `cortex-builder`
+    起跑，等於把 verdict 的寫入面交還給 builder 帳號——正好抵銷 #639／#638 修好的
+    東西，而且**看起來是成功的**。
+    """
+
+    name = str(role or "").strip()
+    config = JOB_ROLE_CONFIG.get(name)
+    if config is None:
+        raise _fail(
+            "job-runner-role-unknown",
+            f"未知的降權 job 角色 {role!r}（已登記：{sorted(JOB_ROLE_CONFIG)}）",
+            source="resolve_job_role",
+            requested=name,
+        )
+    return config
+
+
+# ---------------------------------------------------------------------------
 # per-executor 加固剖面（#643，operator 裁決＝方向 2）
 #
 # `MemoryDenyWriteExecute=yes` 與 JS runtime 天生互斥（V8 的 JIT 必須 W+X），而預設
@@ -275,9 +398,15 @@ TEMPLATE_UNIT_SUFFIX_BY_PROFILE: Mapping[str, str] = MappingProxyType(
 )
 
 #: executor → 剖面。**封閉列舉**：這裡沒有 fallback、沒有預設值、沒有 `.get(x, jit)`。
-#: `cg` 刻意不在表內——它只支援 read-only／review-only，而降權啟動器只服務 builder
-#: persona（`launcher._downgraded_mode` 對 review_only／read_only 回 None），因此它
-#: 走不到這裡；真的走到了就代表有人改壞了 persona 分支，那時 fail-closed 才是對的。
+#:
+#: `cg` 刻意仍不在表內。#615（M2）之後 reviewer／planner 也走降權啟動器，因此以 `cg`
+#: 派出的 reviewer **會**走到這裡並 fail-closed——**那是正確結果，不是缺口**：`cg` 是
+#: operator 提供的 wrapper（自帶 throwaway HOME），本 repo 從未盤點過它實際 exec 什麼，
+#: 而剖面的判準正是「它內部是不是 node」（#643：`copilot` 就是 shell script 外殼、內部
+#: exec node，量到症狀才回填的）。猜嚴格 ⇒ 它可能靜默起不來（症狀是空輸出）；猜寬鬆 ⇒
+#: per-executor 設計退化。要在降權模式用 `cg`，先把它登記進 `permgen.EXECUTOR_TOOLS`
+#: 並標明 `needs_node`（`head -n 20 $(command -v cg)` 一次就查得出來）。`direct` 模式
+#: 完全不受影響。
 EXECUTOR_HARDENING_PROFILE: Mapping[str, str] = MappingProxyType(
     {
         "codex": HARDENING_PROFILE_JIT,
@@ -449,29 +578,46 @@ def _resolve_identity(env: Mapping[str, str], *, key: str, default: str, source:
     return name
 
 
-def resolve_builder_account(env: Mapping[str, str]) -> str:
-    """builder 的 OS 帳號名（`PSC_BUILDER_ACCOUNT`，預設 `cortex-builder`）。"""
+def resolve_job_account(env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
+    """該角色的 OS 帳號名（由 :data:`JOB_ROLE_CONFIG` 查表）。"""
 
+    config = resolve_job_role(role)
     return _resolve_identity(
         env,
-        key=BUILDER_ACCOUNT_ENV,
-        default=DEFAULT_BUILDER_ACCOUNT,
-        source="resolve_builder_account",
+        key=config.account_env,
+        default=config.default_account,
+        source="resolve_job_account",
     )
 
 
-def resolve_builder_group(env: Mapping[str, str]) -> str:
-    """builder 的 primary group（`PSC_BUILDER_GROUP`，預設＝帳號名）。
+def resolve_job_group(env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
+    """該角色的 primary group（未設時＝帳號名）。
 
     預設值沿用 `trust_root.permgen.UidScheme.group_of()`：每帳號一個同名 group。
     """
 
+    config = resolve_job_role(role)
     return _resolve_identity(
         env,
-        key=BUILDER_GROUP_ENV,
-        default=resolve_builder_account(env),
-        source="resolve_builder_group",
+        key=config.group_env,
+        default=resolve_job_account(env, role=role),
+        source="resolve_job_group",
     )
+
+
+def resolve_builder_account(env: Mapping[str, str]) -> str:
+    """builder 的 OS 帳號名（`PSC_BUILDER_ACCOUNT`，預設 `cortex-builder`）。
+
+    **保留為 builder 角色的具名別名**（既有呼叫端與 runbook 診斷片段直接用它）。
+    """
+
+    return resolve_job_account(env, role=JOB_ROLE_BUILDER)
+
+
+def resolve_builder_group(env: Mapping[str, str]) -> str:
+    """builder 的 primary group（`PSC_BUILDER_GROUP`，預設＝帳號名）。"""
+
+    return resolve_job_group(env, role=JOB_ROLE_BUILDER)
 
 
 def resolve_start_timeout_ms(env: Mapping[str, str]) -> int:
@@ -646,6 +792,48 @@ def _reject_unsafe(env: Mapping[str, str], *, source: str) -> None:
             )
 
 
+def build_job_env(
+    *,
+    manager_env: Mapping[str, str],
+    job_id: str,
+    slice_id: str,
+    repo_root: str,
+    relay_target: str | None = None,
+    role: str = JOB_ROLE_BUILDER,
+) -> dict[str, str]:
+    """算出降權 job unit 的**完整**環境（白名單，非黑名單 scrub）。
+
+    回傳值就是會逐項變成 `--setenv=`／spec `env` 的內容——沒列在這裡的名字不會出現
+    在 job 的環境裡，因為 transient／模板 unit 本來就不繼承呼叫端的 environ。
+
+    **白名單本身不分角色**（#615）：`BUILDER_FORWARDED_ENV` 的判準是「缺了它模型
+    CLI 或 wrapper 會直接失敗，且它本身不是憑證」——那對 reviewer 與 builder 逐條
+    相同。角色只決定 `PATH`／`HOME` 的**覆寫變數名**（見 :data:`JOB_ROLE_CONFIG`）：
+    兩個帳號的 HOME 與 toolchain 可見性不同，共用一個 `PSC_BUILDER_PATH` 會讓
+    reviewer 的 PATH 只能跟著 builder 走。
+    """
+
+    config = resolve_job_role(role)
+    env: dict[str, str] = {}
+    for forwarded in BUILDER_FORWARDED_ENV:
+        value = manager_env.get(forwarded.name)
+        if value:
+            env[forwarded.name] = value
+    path_override = (manager_env.get(config.path_env) or "").strip()
+    if path_override:
+        env["PATH"] = path_override
+    home = (manager_env.get(config.home_env) or "").strip()
+    if home:
+        env["HOME"] = home
+    env["PSC_SLICE_ID"] = slice_id
+    env["PSC_JOB_ID"] = job_id
+    env["PSC_REPO_ROOT"] = repo_root
+    if relay_target is not None:
+        env["PSC_RELAY_TARGET"] = relay_target
+    _reject_unsafe(env, source="build_job_env")
+    return env
+
+
 def build_builder_env(
     *,
     manager_env: Mapping[str, str],
@@ -654,30 +842,16 @@ def build_builder_env(
     repo_root: str,
     relay_target: str | None = None,
 ) -> dict[str, str]:
-    """算出 builder transient unit 的**完整**環境（白名單，非黑名單 scrub）。
+    """builder 角色的具名別名（既有呼叫端與測試直接用它）。"""
 
-    回傳值就是會逐項變成 `--setenv=` 的內容——沒列在這裡的名字不會出現在 job 的
-    環境裡，因為 transient unit 本來就不繼承呼叫端的 environ。
-    """
-
-    env: dict[str, str] = {}
-    for forwarded in BUILDER_FORWARDED_ENV:
-        value = manager_env.get(forwarded.name)
-        if value:
-            env[forwarded.name] = value
-    path_override = (manager_env.get(BUILDER_PATH_ENV) or "").strip()
-    if path_override:
-        env["PATH"] = path_override
-    home = (manager_env.get(BUILDER_HOME_ENV) or "").strip()
-    if home:
-        env["HOME"] = home
-    env["PSC_SLICE_ID"] = slice_id
-    env["PSC_JOB_ID"] = job_id
-    env["PSC_REPO_ROOT"] = repo_root
-    if relay_target is not None:
-        env["PSC_RELAY_TARGET"] = relay_target
-    _reject_unsafe(env, source="build_builder_env")
-    return env
+    return build_job_env(
+        manager_env=manager_env,
+        job_id=job_id,
+        slice_id=slice_id,
+        repo_root=repo_root,
+        relay_target=relay_target,
+        role=JOB_ROLE_BUILDER,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +968,7 @@ def preflight_systemd_run(
     if not exists_account(account):
         raise _fail(
             "job-runner-builder-account-missing",
-            f"builder 帳號不存在: {account}（Phase 2b runbook 第 1 步尚未執行？）",
+            f"job 帳號不存在: {account}（Phase 2b runbook 第 1 步尚未執行？）",
             source="preflight_systemd_run",
             account=account,
         )
@@ -802,7 +976,7 @@ def preflight_systemd_run(
     if not exists_group(group):
         raise _fail(
             "job-runner-builder-group-missing",
-            f"builder group 不存在: {group}",
+            f"job group 不存在: {group}",
             source="preflight_systemd_run",
             group=group,
         )
@@ -821,23 +995,28 @@ class SystemdRunPlan:
     unit: str
     account: str
     group: str
+    #: 本次派工的降權角色（#615）。留在 plan 上供診斷／稽核。
+    role: str = JOB_ROLE_BUILDER
 
 
-def prepare_systemd_run(env: Mapping[str, str], *, job_id: str) -> SystemdRunPlan:
+def prepare_systemd_run(
+    env: Mapping[str, str], *, job_id: str, role: str = JOB_ROLE_BUILDER
+) -> SystemdRunPlan:
     """降權派工的前置：解析身分 config、跑靜態 preflight、算出 transient unit 名。
 
     **在任何副作用之前呼叫**——這裡的每一個 raise 都代表本次派工不該發生，呼叫端
     必須讓它往上傳（fail-closed），不得改走 direct。
     """
 
-    account = resolve_builder_account(env)
-    group = resolve_builder_group(env)
+    account = resolve_job_account(env, role=role)
+    group = resolve_job_group(env, role=role)
     binary = preflight_systemd_run(account=account, group=group)
     return SystemdRunPlan(
         binary=binary,
         unit=transient_unit_name(job_id),
         account=account,
         group=group,
+        role=resolve_job_role(role).role_id,
     )
 
 
@@ -1065,8 +1244,11 @@ def template_unit_for_profile(template: str, profile: str) -> str:
     return f"{stem}{suffix}@{TEMPLATE_UNIT_SUFFIX}"
 
 
-def resolve_template_unit(env: Mapping[str, str]) -> str:
-    return (env.get(TEMPLATE_UNIT_ENV) or "").strip() or DEFAULT_TEMPLATE_UNIT
+def resolve_template_unit(env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
+    """該角色的**基底**模板 unit 名（未套加固剖面後綴前）。"""
+
+    config = resolve_job_role(role)
+    return (env.get(config.template_env) or "").strip() or config.default_template
 
 
 def resolve_job_spec_spool(env: Mapping[str, str]) -> str:
@@ -1304,7 +1486,7 @@ def preflight_systemd_template(
     if not exists_account(account):
         raise _fail(
             "job-runner-builder-account-missing",
-            f"builder 帳號不存在: {account}（Phase 2b runbook 第 1 步尚未執行？）",
+            f"job 帳號不存在: {account}（Phase 2b runbook 第 1 步尚未執行？）",
             source="preflight_systemd_template",
             account=account,
         )
@@ -1312,7 +1494,7 @@ def preflight_systemd_template(
     if not exists_group(group):
         raise _fail(
             "job-runner-builder-group-missing",
-            f"builder group 不存在: {group}",
+            f"job group 不存在: {group}",
             source="preflight_systemd_template",
             group=group,
         )
@@ -1368,6 +1550,8 @@ class SystemdTemplatePlan:
     executor: str = ""
     #: config 給的**基底**模板名（未套剖面後綴前）。
     base_template_unit: str = DEFAULT_TEMPLATE_UNIT
+    #: 本次派工的降權角色（#615）。決定帳號與模板，由 persona 導出、job 碰不到。
+    role: str = JOB_ROLE_BUILDER
 
 
 def prepare_systemd_template(
@@ -1375,6 +1559,7 @@ def prepare_systemd_template(
     *,
     job_id: str,
     executor: str,
+    role: str = JOB_ROLE_BUILDER,
     unit_active: Callable[[str, str], bool] | None = None,
 ) -> SystemdTemplatePlan:
     """模板派工的前置：解析 config、決定加固剖面、靜態 preflight、算 instance／unit／
@@ -1388,12 +1573,20 @@ def prepare_systemd_template(
     的 dispatch 決定。給預設值等於允許某條路徑「忘了說是哪個 executor」還能派出去，
     那個預設值不論指向哪一份剖面都是錯的（見 :func:`resolve_hardening_profile`）。
 
+    `role`（#615 M2）決定**身分與模板**，由 persona 導出（`launcher` 的
+    `review_only`／`read_only` 分支），同樣是 Manager 的 dispatch 決定。它的預設值
+    刻意是 builder 而非「必填」——與 `executor` 不同的地方在於：忘了傳 `role` 的
+    後果是「reviewer 被以 builder 帳號起跑」，那是**降權到一個一樣受限的帳號**，
+    不是提權；而忘了傳 `executor` 的後果是「拿到一份不該給它的加固剖面」。前者由
+    `launcher` 的單一決定點 ＋ 不變式測試守住，後者必須在型別層擋。
+
     **在任何副作用之前呼叫**：這裡每一個 raise 都代表本次派工不該發生。
     """
 
-    account = resolve_builder_account(env)
-    group = resolve_builder_group(env)
-    base_template = resolve_template_unit(env)
+    role_config = resolve_job_role(role)
+    account = resolve_job_account(env, role=role)
+    group = resolve_job_group(env, role=role)
+    base_template = resolve_template_unit(env, role=role)
     profile = resolve_hardening_profile(executor)
     template = template_unit_for_profile(base_template, profile)
     shim = resolve_job_shim(env)
@@ -1432,6 +1625,7 @@ def prepare_systemd_template(
         hardening_profile=profile,
         executor=str(executor or "").strip(),
         base_template_unit=base_template,
+        role=role_config.role_id,
     )
 
 

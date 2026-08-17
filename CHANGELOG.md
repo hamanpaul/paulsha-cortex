@@ -8,6 +8,55 @@
 ## [Unreleased]
 
 ### Added
+- **#615 / trust-root Phase 2b M2：reviewer／planner 啟動面降權——三分的另外一半**——
+  M1（#584／#603）之後三分只在**檔案權限層**成立：`cortex-reviewer-planner` 帳號、
+  HOME、cache、verdict spool 的 `wx` 無 `r` ACL、gitconfig 全部到位，但
+  `launcher.SubprocessLauncher._degraded_runner()` **只對 builder persona 回 True**，
+  reviewer／planner 的模型 job 仍在 Manager 行程內以 `cortex-manager` 身分執行。
+  A+B 裁決的核心論述「**injection 可達的進程皆無 spawn 授權**」因此只對 builder 成立
+  ——而 reviewer 正是寫 verdict 的那一個。本次把缺的那一半補上：
+  - **`launcher`**：`_downgraded_mode()` 移除「只有 builder 才降權」那條判斷。persona
+    不再決定「降不降權」，只決定**降到哪個角色**（`_job_role()` → `builder`／`review`）。
+    降權判定同時**排到 `review_only` 之前**（`launch()` 與 `executor_environment()`
+    兩處逐字一致）：`_review_scope_env()` 是「從 daemon environ 篩」的模型，降權後 job
+    根本不繼承 daemon 的 environ，繼續用它只會把 daemon 的 HOME／PATH／`VIRTUAL_ENV`
+    硬塞進一個跑在別的 UID 上、根本進不去那些路徑的行程。
+  - **`job_runner`**：新增 `JOB_ROLE_CONFIG` 一張表（角色 → 帳號／group／HOME／PATH／
+    模板 unit 的 env 變數名 ＋ 預設值 ＋ 理由），`resolve_job_account()`／
+    `resolve_job_group()`／`build_job_env()`／`prepare_systemd_template()`／
+    `prepare_systemd_run()` 全部改為查表，**沒有任何 `if role == …` 分支**。未知角色
+    **fail-closed**（落回 builder 是最糟的失敗模式：reviewer 以 builder 身分跑起來，
+    而且看起來是成功的）。`resolve_builder_account()`／`build_builder_env()` 保留為
+    builder 角色的具名別名，既有呼叫端零改動。
+  - **`permgen`**：`DOWNGRADED_JOB_PRINCIPALS = (BUILDER, REVIEWER)`。unit 產生器
+    **一行都沒有為 M2 改**——`build_job_unit(principal=REVIEWER)` 直接產出
+    `cortex-reviewer-job@.service`（`User=cortex-reviewer-planner`），`User=`／HOME／
+    cache／`ReadWritePaths=` 全部由 scheme 的帳號映射導出。**planner 不另開第三份**：
+    三分方案把它與 reviewer 映到同一個 OS 帳號，同帳號 ⇒ 同 unit、同 RWP、同 HOME，
+    多一份只會多一個要同步維護的名字與一個要放進 polkit pattern 的字幹，換不到任何
+    隔離（`JOB_PRINCIPAL_PERSONAS` 把「那份 unit 服務誰」寫成機器可讀）。
+  - **polkit 沿用 #643 的單一交替 pattern 擴充字幹段**，
+    `^(?:cortex-job|cortex-job-jit|cortex-reviewer-job|cortex-reviewer-job-jit)@…$`
+    ——**不加第二條 `addRule`**，全檔仍只有一個 `return polkit.Result.YES`（第二條規則
+    會把 subject／action／verb／明細缺席四個檢查複製一份，變成兩個要同步維護的放行
+    出口，那正是這份規則檔的可審查性性質要避免的）。字幹段是**兩層列舉**
+    （principal × 加固剖面 ＝ 四個具名模板），前後仍錨定、instance 段字元類一字未改。
+    四份模板的 `User=` 全部是無 sudo、無 root、彼此互不可寫的降權服務帳號，因此
+    「多一個字幹」擴大的是**降權目標的選擇**，不是提權面。
+  - **reviewer 的可寫面由登記表機械導出**，恰好兩條：
+    `/var/lib/cortex-reviewer-planner/cache`（HOME 快取，明示 extra）與
+    `/var/lib/cortex/coordinator/review-verdicts`（登記表資產 `review-verdict-spool`，
+    `wx` 無 `r`）。**明確不含** builder 的 per-job clone／worktree pool／commit spool、
+    來源樹（唯讀 ACL）、Manager 的 durable state（coordinator／control／gate ledger／
+    job-spec spool／monitor state）與部署樹。
+  新增 `tests/test_reviewer_planner_downgrade_615.py`（50 測試，其中 2 條在單 UID／
+  無 root 環境**明確 skip 並附理由**——#638 的教訓：那些語意測了也永遠綠）。
+  runbook 的「分段落地」M2 由 ⏳ 改為 ✅，並補上第 5-2（落**四份** unit）／5-5（reviewer
+  的 env）／**5-6b**（reviewer 模板正向 smoke）／5-7（四字幹反向）／8a pass 2（由
+  operator sudo 模擬升級為**真實 template instance**）／**8b-2**（verdict 通道端到端）
+  的實機驗證步驟。詳見 `changelog.d/reviewer-planner-downgrade.md`。
+- **`trust_root unit --review-job` CLI 旗標**：產生 reviewer＋planner 的模板 unit
+  （可與 `--profile jit` 併用）。`polkit` 子命令的輸出自動涵蓋全部降權角色。
 - **#648 / trust-root Phase 2b：canonical（workflow）lane 的工作區改為 per-job——
   per-run 工作區使 `%i` 不變式結構上不成立，該 lane 在降權模式下不可用**——
   canonical lane 的工作區是 per-run 的（build 卡 provision 之後，同 run 後續的卡沿用
@@ -197,6 +246,29 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#615：slice lane 的 foreign reviewer 差一點被以 `cortex-builder` 起跑**——實作 M2
+  時發現的真缺口。foreign reviewer 走 `manager._spool_writable_launcher()` →
+  `SubprocessLauncher.as_verdict_spool_writer()`，而那支工廠產出的 launcher
+  `read_only` 與 `review_only` **都是 `False`**（`__init__` 明文拒絕「read-only 契約
+  ＋ verdict spool 放行」的組合，因為 read-only 的 executor 連 `--add-dir` 都拿不到）。
+  只看那兩個旗標的角色判定會把它判成 builder——**而它正是寫 verdict 的那一個**，那
+  等於把 verdict 通道交還給 builder 帳號，抵銷 #638／#639 剛修好的東西。角色判定因此
+  收斂為 `_is_review_persona()` 的三個判準，第三條是「**被授予了 verdict spool** 本身
+  就是 reviewer 的標記」（而那個授予是 Manager 在 dispatch 當下做的決定，job 側碰不到）。
+  同一個判準一併修掉「foreign reviewer 會拿到一格 commit spool 並在 wrapper 裡跑
+  `git bundle create`」：它從不 commit，那一格在 `direct` 模式下永遠是空的（浪費），
+  而降權之後 reviewer 帳號對 commit-spool **零寫入權**，那一段會逐 job 失敗。
+- **#615：`permgen.RETIRED_JOB_WRITE_ASSETS`——已除役的 verdict 寫入面不再進 RWP**。
+  `review-verdict`（reviewer worktree 內的 `.psc-review-verdict.json`）是 spec §3 認定
+  的最短攻擊路徑，Phase 2a 已把權威通道整個換成 `review-verdict-spool`：
+  `manager._review_verdict_source()` 對任何帶 `review_verdict_channel == "spool"` 標記
+  的 job **只**認 spool 落點，而 Phase 2b 部署派出的每一個 reviewer job 都帶那個標記。
+  在模板 unit 上放行它買到的是**零**（沒有消費者），付出的卻有兩項：語意上等於在 OS
+  邊界重新打開一條已除役的 verdict 寫入面；可用性上它的路徑是 `<worktree pool>/%i`，
+  而 reviewer 的工作樹**不在** pool 底下 ⇒ systemd 對不存在的 `ReadWritePaths=` 目標會
+  讓每一個 reviewer job 直接起不來。登記表仍完整記錄該資產（過渡期 legacy fallback 還
+  要讀它），除役的只是「Phase 2b 的 job unit 為它開寫入面」這件事——**嚴格更緊**。
+  builder 的 RWP 逐字不變（它本來就不在該資產的 writer 面上）。
 - **#645 / trust-root：模板 unit 的 `%i` 與 worktree 目錄名永遠對不上——降權派工從未經
   正式路徑成功啟動過任何 job**——`seams.ScriptWorktreeCreator.create()` 以 **branch
   slug** 命名工作區（`feature/<slice_id>` → `<pool>/feature-<slice_id>`），而模板 unit 的
