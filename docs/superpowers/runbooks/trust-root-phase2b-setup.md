@@ -1921,6 +1921,21 @@ systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/wor
 #   實機稽核：一個多卡 run 跑完後，pool 底下該有**每張 build 卡各一個**目錄，
 #   且每個目錄名都能在 `systemctl list-units 'cortex-job*@*'` 的 instance 名裡找到。
 #     ls /var/lib/cortex/worktree
+#
+#   #649（範圍界線，避免誤查）：**ship phase 的兩張卡不在這條稽核裡**。
+#   `openspec-archive`／`policy-commit` 的 persona 是 `manager`，而
+#   `manager._dispatch_workflow_card()` 對 `current_phase == "ship"` 一律回 None
+#   ——它們不經 launcher、不 spawn job，因此 pool 底下**不會**、也不該出現 ship 卡的
+#   目錄，`systemctl list-units` 上也不會有它們的 instance。ship 卡由 Manager 自己
+#   在 `work_bridge` 內以 deterministic 身分執行，它的 commit 走的是 #649 補上的
+#   回收通道（bundle ＋ commit-spool → 來源樹的 `refs/heads/<branch>`）。
+#
+#   **ship phase 目前仍不可在降權模式下跑完**：它全程在 `_builder_binding()` 交回來的
+#   **builder 的 clone** 裡動手（`git commit`／preflight／push／`_ship_action`），而
+#   #641 已把登記表裡 Manager 對 job 工作樹的讀取授權全部收掉（見第 2 步的稽核 5b）
+#   ⇒ 三分下第一個 `git -C` 就會 `Permission denied`。症狀是**權限**不是
+#   `226/NAMESPACE`，別往 mount namespace 的方向查。修法（ship 段搬進 Manager-owned
+#   的樹）在 #653。
 
 # ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶；#643 起兩份都要驗）
 sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \

@@ -13,6 +13,7 @@ import pytest
 from paulsha_cortex.control.contract import build_request
 from paulsha_cortex.coordinator import (
     completion,
+    job_workspace,
     manager,
     manager_daemon,
     review,
@@ -31,6 +32,8 @@ from paulsha_cortex.coordinator.workflow import (
     PlanningArtifactAuthority,
     WorkflowStep,
 )
+
+from git_fixtures import make_job_clone
 
 
 def _repo(root: Path) -> tuple[Path, str]:
@@ -626,6 +629,12 @@ def test_archive_commit_invalidates_old_gates_without_pushing(
     (repo / "CHANGELOG.md").write_text("# Changelog\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add change"], check=True)
+    # #649：ship 卡的 commit 現在要被回收進**來源樹**的 `refs/heads/<branch>`，
+    # 因此 fixture 必須是 #623 之後的真實形狀：來源樹上有那條 branch（build harvest
+    # 之後它就等於 candidate）但停在預設 branch，工作區是另一棵 checkout 在該 branch
+    # 上的 clone。原本工作區與來源樹是同一個目錄，那是 `git worktree` 共用 object
+    # store 時代的殘留。
+    subprocess.run(["git", "-C", str(repo), "branch", "feature/14-work"], check=True)
     candidate = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True,
@@ -661,10 +670,11 @@ def test_archive_commit_invalidates_old_gates_without_pushing(
         gate_status="running",
     )
 
-    archive = repo / "openspec" / "changes" / "archive"
+    worktree = make_job_clone(repo, tmp_path / "ship-worktree", branch="feature/14-work")
+    archive = worktree / "openspec" / "changes" / "archive"
     archive.mkdir(parents=True)
-    active.rename(archive / "work")
-    with (repo / "CHANGELOG.md").open("a", encoding="utf-8") as handle:
+    (worktree / "openspec" / "changes" / "work").rename(archive / "work")
+    with (worktree / "CHANGELOG.md").open("a", encoding="utf-8") as handle:
         handle.write("- Archive work.\n")
 
     remote_head: str | None = None
@@ -694,7 +704,7 @@ def test_archive_commit_invalidates_old_gates_without_pushing(
         state_root=state_root,
         run=run,
         authority=authority,
-        worktree=repo,
+        worktree=worktree,
         branch="feature/14-work",
         candidate=candidate,
         runner=delivery_runner,
@@ -702,6 +712,12 @@ def test_archive_commit_invalidates_old_gates_without_pushing(
 
     assert reset.current_phase == "verify"
     assert remote_head is None
+    # #649：archive commit 已被回收進來源樹——`candidate_head` 推進到它的同時，
+    # 來源樹的 `refs/heads/<branch>` 必須恰好也在那裡（ship audit 的 ancestry
+    # 檢查、post-archive retry-build 的 clone base 都以此為前提）。
+    assert (
+        job_workspace.source_branch_head(repo, "feature/14-work") == reset.candidate_head
+    )
     assert reset.candidate_head is not None
     assert reset.candidate_head != candidate
     assert reset.verified_head is None
@@ -895,6 +911,9 @@ def test_installed_defaults_start_to_ship_handoff_remains_monitor_ongoing(
         target.write_text(body, encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "add planning"], check=True)
+    # #649：同上——工作區是一棵 checkout 在 `feature/14-work` 上的獨立 clone，
+    # 來源樹留在預設 branch 並持有同名 branch（build harvest 之後的形狀）。
+    subprocess.run(["git", "-C", str(repo), "branch", "feature/14-work"], check=True)
     candidate = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         check=True,
@@ -974,11 +993,20 @@ identities:
     #: 變成「每張 build 卡一次」；branch 名一條不變，只是被要求得更多次。
     provisioned_job_ids: list[str | None] = []
 
+    #: #649：工作區是**獨立 clone**，不是來源樹本身——ship 卡的成果回收
+    #: （`git fetch <bundle> refs/heads/<b>:refs/heads/<b>`）會被 git 拒絕寫入一條
+    #: 正被 checkout 的 branch，而那正是「工作區 ≠ 來源樹」在 #623 之後的實況。
+    job_worktrees: list[Path] = []
+
     class WorktreeCreator:
         def create(self, branch, base_sha=None, *, job_id=None):
             branches.append(branch)
             provisioned_job_ids.append(job_id)
-            return str(repo)
+            if not job_worktrees:
+                job_worktrees.append(
+                    make_job_clone(repo, tmp_path / "job-worktree", branch=branch)
+                )
+            return str(job_worktrees[0])
 
     dispatcher = Dispatcher(
         registry,
@@ -1096,7 +1124,7 @@ identities:
     def fake_preflight(**kwargs):
         preflight_requests.append(kwargs["request"])
         head = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            ["git", "-C", str(job_worktrees[0]), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
@@ -1139,8 +1167,11 @@ identities:
         if argv[:3] == ["python3", "-m", "policy_check"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if argv[:2] == ["openspec", "archive"]:
-            active = repo / "openspec" / "changes" / "work"
-            archived = repo / "openspec" / "changes" / "archive" / "2026-08-06-work"
+            # #649：archive 落在**呼叫端指定的工作區**，不是來源樹——真正的
+            # `openspec archive` 也是以 `cwd` 為準。
+            cwd = Path(kwargs["cwd"])
+            active = cwd / "openspec" / "changes" / "work"
+            archived = cwd / "openspec" / "changes" / "archive" / "2026-08-06-work"
             archived.parent.mkdir(parents=True, exist_ok=True)
             if active.exists():
                 shutil.move(str(active), str(archived))
@@ -1158,7 +1189,7 @@ identities:
         if "push" in argv:
             assert argv[-3:] == ["push", "origin", "HEAD:refs/heads/feature/14-work"]
             pushed_head = subprocess.run(
-                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                ["git", "-C", str(job_worktrees[0]), "rev-parse", "HEAD"],
                 check=True,
                 capture_output=True,
                 text=True,

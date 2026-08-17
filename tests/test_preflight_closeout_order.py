@@ -11,7 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.coordinator import manager, review, work_actions, work_bridge
+from paulsha_cortex.coordinator import (
+    job_workspace,
+    manager,
+    review,
+    work_actions,
+    work_bridge,
+)
 from paulsha_cortex.coordinator.claim import load_work_authority, work_authority_digest
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -20,6 +26,8 @@ from paulsha_cortex.coordinator.workflow import (
     PlanningArtifactAuthority,
     WorkflowStep,
 )
+
+from git_fixtures import make_job_clone
 
 
 @dataclass
@@ -38,6 +46,8 @@ class RunnerResult:
 @dataclass
 class ShipHarness:
     repo: Path
+    #: #649：ship 段實際操作的工作區（per-job clone），與來源樹 `repo` 是兩棵樹。
+    worktree: Path
     candidate: str
     snapshot: Path
     state_root: Path
@@ -207,6 +217,10 @@ def _repo(root: Path, *, active_change: bool, archived_change: bool) -> tuple[Pa
         (target / "tasks.md").write_text("- [x] ready\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
     subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True)
+    # #649：來源樹持有 delivery branch 但**不 checkout** 它——ship 卡的成果回收是
+    # `git fetch <bundle> refs/heads/<b>:refs/heads/<b>`，git 拒絕寫入正被 checkout
+    # 的 branch。production 的來源樹本來就停在預設 branch。
+    subprocess.run(["git", "-C", str(root), "branch", "feature/14-work"], check=True)
     head = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         check=True,
@@ -285,14 +299,25 @@ def _steps(*, review_passed: bool) -> tuple[WorkflowStep, ...]:
     return tuple(steps)
 
 
-def _seed_foreign_review(*, registry: JobRegistry, run, repo: Path, candidate: str, state_root: Path) -> None:
+def _seed_foreign_review(
+    *,
+    registry: JobRegistry,
+    run,
+    repo: Path,
+    candidate: str,
+    state_root: Path,
+    worktree: Path | None = None,
+) -> None:
+    #: #649：builder job 記錄的 `worktree` 就是 ship 段會拿到的工作區
+    #: （`work_bridge._builder_binding`），預設仍是來源樹本身以維持既有呼叫端。
+    worktree = repo if worktree is None else worktree
     builder = registry.create_job(
         task="wf-build",
         persona="builder",
         kind="build",
         branch="feature/14-work",
         pane="",
-        worktree=str(repo),
+        worktree=str(worktree),
         executor="codex",
         model_id="gpt",
         independence_domain="openai",
@@ -302,7 +327,7 @@ def _seed_foreign_review(*, registry: JobRegistry, run, repo: Path, candidate: s
         workflow_repo=run.repo,
         workflow_card="build-card",
         workflow_phase="build",
-        workflow_repo_root=str(repo),
+        workflow_repo_root=str(worktree),
         source_revision=run.source_revision,
     )
     registry.update_headless_result(builder["job_id"], status="exited", exit_code=0)
@@ -313,7 +338,7 @@ def _seed_foreign_review(*, registry: JobRegistry, run, repo: Path, candidate: s
         kind="review",
         branch="feature/14-work",
         pane="",
-        worktree=str(repo),
+        worktree=str(worktree),
         executor="claude",
         model_id="sonnet",
         independence_domain="anthropic",
@@ -323,7 +348,7 @@ def _seed_foreign_review(*, registry: JobRegistry, run, repo: Path, candidate: s
         workflow_repo=run.repo,
         workflow_card="review-card",
         workflow_phase="review",
-        workflow_repo_root=str(repo),
+        workflow_repo_root=str(worktree),
         workflow_outputs=(report_ref,),
         workflow_output_baseline=(),
         source_revision=run.source_revision,
@@ -349,7 +374,9 @@ def _seed_foreign_review(*, registry: JobRegistry, run, repo: Path, candidate: s
             },
         },
     )
-    report = repo / report_ref
+    # #649：canonical report 發表在 candidate 樹（＝工作區），delivery 的清理段
+    # 也在那裡找它。
+    report = worktree / report_ref
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text("# Canonical review\n", encoding="utf-8")
     report_hash = hashlib.sha256(report.read_bytes()).hexdigest()
@@ -430,15 +457,17 @@ def _ship_harness(
         verified_head=candidate,
         gate_status="running",
     )
+    worktree = make_job_clone(repo, tmp_path / "job-worktree", branch="feature/14-work")
     _seed_foreign_review(
         registry=registry,
         run=run,
         repo=repo,
         candidate=candidate,
         state_root=state_root,
+        worktree=worktree,
     )
     runner = SpyRunner(
-        repo=repo,
+        repo=worktree,
         metadata_preflight_returncode=metadata_preflight_returncode,
     )
     monkeypatch.setattr(work_bridge, "load_preflight_command", lambda: ("preflight",))
@@ -451,6 +480,7 @@ def _ship_harness(
     )
     return ShipHarness(
         repo=repo,
+        worktree=worktree,
         candidate=candidate,
         snapshot=snapshot,
         state_root=state_root,
@@ -574,7 +604,12 @@ def test_ship_validate_completes_local_archive_closeout_without_pr_binding(
     assert updated.current_phase == "verify"
     assert updated.candidate_head is not None and updated.candidate_head != harness.candidate
     assert updated.pr_refs == ()
-    assert not (harness.repo / "openspec" / "changes" / "work").exists()
+    assert not (harness.worktree / "openspec" / "changes" / "work").exists()
+    # #649：archive commit 已回收進來源樹的 delivery branch。
+    assert (
+        job_workspace.source_branch_head(harness.repo, "feature/14-work")
+        == updated.candidate_head
+    )
     assert not harness.runner.saw_push()
     assert not harness.runner.saw_gh()
 
@@ -682,8 +717,10 @@ def test_pr_created_automatically_after_closeout_and_preflight_pass(
 
 def test_archive_commit_does_not_push(tmp_path: Path) -> None:
     repo, _initial = _repo(tmp_path / "archive-repo", active_change=True, archived_change=False)
-    active = repo / "openspec" / "changes" / "work"
-    archived = repo / "openspec" / "changes" / "archive" / "work"
+    # #649：archive 的檔案異動落在工作區（per-job clone），不是來源樹。
+    worktree = make_job_clone(repo, tmp_path / "archive-worktree", branch="feature/14-work")
+    active = worktree / "openspec" / "changes" / "work"
+    archived = worktree / "openspec" / "changes" / "archive" / "work"
     archived.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(active), str(archived))
     candidate = subprocess.run(
@@ -719,14 +756,14 @@ def test_archive_commit_does_not_push(tmp_path: Path) -> None:
         verified_head=candidate,
         gate_status="running",
     )
-    runner = SpyRunner(repo=repo)
+    runner = SpyRunner(repo=worktree)
 
     reset = work_bridge._commit_archive_and_require_reverification(
         registry=registry,
         state_root=state_root,
         run=run,
         authority=authority,
-        worktree=repo,
+        worktree=worktree,
         branch="feature/14-work",
         candidate=candidate,
         runner=runner,
@@ -735,6 +772,10 @@ def test_archive_commit_does_not_push(tmp_path: Path) -> None:
     assert reset.current_phase == "verify"
     assert reset.candidate_head != candidate
     assert not runner.saw_push()
+    # #649：不 push，但**要**回收——來源樹的 delivery branch 必須就是新 candidate。
+    assert (
+        job_workspace.source_branch_head(repo, "feature/14-work") == reset.candidate_head
+    )
 
 
 def test_reviewer_dispatch_fail_closed_on_frozen_hash_drift(tmp_path: Path) -> None:

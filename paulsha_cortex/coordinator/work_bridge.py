@@ -31,6 +31,7 @@ from paulsha_cortex.deck.schema import (
 )
 from paulsha_cortex.deck.task_types import load_task_types
 
+from . import job_workspace
 from . import verification
 from .claim import (
     WorkAuthority,
@@ -874,6 +875,103 @@ def _archive_path_allowed(path: str, *, change: str) -> bool:
     )
 
 
+def _manager_ship_job_task(*, run, card: str) -> str:
+    """ship 卡那一筆 job 記錄的 `task`——**唯一推導點**（#649）。
+
+    `reserve_job_id()` 與 `create_job()` 必須拿到逐字相同的 task（registry 會驗
+    「這個 id 確實屬於同一個 task」），因此不再讓兩處各自組一次字串。與
+    `manager._dispatch_workflow_card()` 的 build／verify／review 卡同一個公式。
+    """
+
+    return f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{card}"
+
+
+def _harvest_manager_ship_commit(
+    *,
+    state_root: Path,
+    run,
+    worktree: Path,
+    branch: str,
+    spool_key: str,
+    baseline: str,
+    new_head: str,
+) -> str:
+    """#649：把 ship phase 的 Manager commit 收進**來源樹**的 `refs/heads/<branch>`。
+
+    ## 為什麼 ship phase 需要這條通道
+
+    build phase 的每一張卡在被採信之後都會走 `manager._harvest_build_candidate()`，
+    因此
+
+        來源樹的 `refs/heads/<branch>` == `run.candidate_head`
+
+    在每一張 build 卡之後成立。`openspec-archive` 是**唯一會產生 commit 的 ship
+    卡**（`policy-commit` 的 `new_head == old_head`，不 commit），而它做完 commit 之後
+    `_manager_reset_workflow_after_archive()` 會把 `candidate_head` 推進到那個新
+    commit——**但那個 commit 只存在於做 commit 的那棵工作樹裡**。#623 把工作區從
+    `git worktree`（共用 object store）換成 per-job 完整 clone 之後，「順便就在來源樹
+    裡」這件事不再成立，上面那條不變式因此在 ship phase 斷掉。三個已知後果：
+
+    1. `manager._validated_ship_steps()` 的 `matches_candidate()` 對 post-archive
+       repair 允許 `openspec-archive` 的 `subject_head` 是 final candidate 的祖先，
+       而那條 ancestry 檢查跑在 `run.workspace_root` 上——來源樹沒有 archive commit
+       時 `git merge-base --is-ancestor` 回 128（`Not a valid commit name`），
+       `matches_candidate()` 回 False，整個 ship audit fail-closed。
+    2. #651 之後 build 卡改成 per-job clone，base ＝ `run.candidate_head`。
+       post-archive 的 `retry-build` 因此會拿 archive commit 當 base 去 provision，
+       而 `ScriptWorktreeCreator.create()` 的 `rev-parse --verify <base>` 在來源樹
+       上找不到它 ⇒ `git worktree base invalid`，重派直接起不來。
+    3. 「成果只在磁碟上的某一棵工作區裡」本身就是 #637／#651 要消除的形狀——
+       那棵樹被回收（`cortex work gc`）之後 commit 就沒了。
+
+    ## 通道形狀：沿用 #637 的 bundle ＋ append-only spool
+
+    producer 換成 Manager 自己（見 `job_workspace.publish_commit_bundle()`），
+    consumer 那一半（`harvest_branch()`）一個位元組不變：**「commit 進來源樹」全
+    repo 仍然只有一個實作**，fail-closed 分類、非 fast-forward 拒絕、prerequisite
+    診斷全部沿用。刻意不走 `git -C <來源樹> fetch <那棵工作區>`——`job_workspace`
+    模組 docstring 已判定那個形狀在三分部署下結構性不成立（Manager 走不進 job 的樹、
+    `safe.directory` 不吃路徑 glob），寫回來等於預先埋一顆下一階段必炸的雷。
+
+    ## 回收後的不變式
+
+    來源樹的 `refs/heads/<branch>` 必須**恰等於**剛做出來的 commit，對不上即
+    fail-closed——與 `_harvest_build_candidate()` 逐條相同的判準。呼叫端在這之後
+    才推進 `candidate_head`，因此「採信值」與「來源樹實況」不會分岔。
+
+    `baseline` 是 bundle 的排除點（＝ archive 之前那個已被採信的 candidate）。
+    來源樹沒有它時（升級前既存的 run、或沒走過 build harvest 的路徑）改為不排除，
+    bundle 帶完整歷史——寧可多搬一點，也不要因為缺 prerequisite 而讓一次**合法**的
+    回收失敗。
+    """
+
+    source_repo = getattr(run, "workspace_root", None)
+    if not isinstance(source_repo, str) or not source_repo:
+        raise RuntimeError("manager ship commit harvest source repo missing")
+    # 回收的 refspec 是 `refs/heads/<branch>`——commit 若不在那條 ref 上（detached
+    # HEAD、或第三方在 commit 之後動過 ref），bundle 帶的就是別的東西。與
+    # `_harvest_build_candidate()` 的 head mismatch 同一條判準，先擋在這裡讓訊息說
+    # 得出成因，而不是讓 `git bundle create` 丟一句 `ambiguous argument`。
+    if job_workspace.source_branch_head(worktree, branch) != new_head.lower():
+        raise RuntimeError("manager ship commit is not on the recorded branch")
+    bundle = job_workspace.prepare_commit_spool(
+        spool_key=spool_key, coordinator_root=state_root
+    )
+    job_workspace.publish_commit_bundle(
+        workspace=worktree,
+        bundle=bundle,
+        branch=branch,
+        exclude=baseline if job_workspace.commit_present(source_repo, baseline) else None,
+    )
+    harvested = job_workspace.harvest_branch(
+        source_repo=source_repo, bundle=bundle, branch=branch
+    )
+    if harvested.lower() != new_head.lower():
+        raise RuntimeError("manager ship commit harvest head mismatch")
+    job_workspace.seal_commit_spool(bundle)
+    return harvested
+
+
 def _record_manager_ship_job(
     *,
     registry,
@@ -884,6 +982,7 @@ def _record_manager_ship_job(
     card: str,
     old_head: str,
     new_head: str,
+    job_id: str | None = None,
 ):
     existing = [
         job
@@ -901,7 +1000,11 @@ def _record_manager_ship_job(
     if existing:
         raise RuntimeError("manager ship card audit is ambiguous")
     job = registry.create_job(
-        task=f"wf-{hashlib.sha256(run.run_id.encode()).hexdigest()[:10]}-{card}",
+        task=_manager_ship_job_task(run=run, card=card),
+        # #649：job_id 由呼叫端先 `reserve_job_id()` 取得——回收那一格的 spool key
+        # 就是它，而 spool 必須在 job 之前建立（bundle 得先落地才 harvest 得動）。
+        # 順序與 #648 的 build 卡逐條相同：先配 id → 用它定址 → 再建 job。
+        job_id=job_id,
         persona="manager",
         kind="build",
         branch=branch,
@@ -1032,6 +1135,23 @@ def _commit_archive_and_require_reverification(
     new_head = head.stdout.strip().lower()
     if head.returncode != 0 or verification.SAFE_SHA_RE.fullmatch(new_head) is None or new_head == candidate:
         raise RuntimeError("archive commit did not produce a new exact Candidate")
+    # #649：ship phase 的**成果回收**。這一步排在 `_record_manager_ship_job()` 與
+    # `_manager_reset_workflow_after_archive()` **之前**：candidate_head 一旦推進到
+    # archive commit，整條鏈（ship audit 的 ancestry、post-archive retry-build 的
+    # clone base、下一張卡的 handoff base）就會假設來源樹有它。回收失敗時必須在推
+    # 進之前 fail-closed，而不是先推進再讓後面某一段以看不懂的訊息炸開。
+    job_id = registry.reserve_job_id(
+        _manager_ship_job_task(run=run, card="openspec-archive")
+    )
+    _harvest_manager_ship_commit(
+        state_root=state_root,
+        run=run,
+        worktree=worktree,
+        branch=branch,
+        spool_key=job_id,
+        baseline=candidate,
+        new_head=new_head,
+    )
     _record_manager_ship_job(
         registry=registry,
         state_root=state_root,
@@ -1041,6 +1161,7 @@ def _commit_archive_and_require_reverification(
         card="openspec-archive",
         old_head=candidate,
         new_head=new_head,
+        job_id=job_id,
     )
     return registry._manager_reset_workflow_after_archive(
         run.run_id,
