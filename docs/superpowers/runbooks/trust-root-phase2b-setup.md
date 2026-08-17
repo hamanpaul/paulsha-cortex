@@ -581,6 +581,23 @@ tail -n 20 /tmp/p2b-permissions.sh | grep -c ":--x "
 #   ACL **mask**，先 setfacl 再 chmod 會讓具名條目的有效權限被 mask 成空（靜默失效，
 #   不會報錯）。因此也**不要**在執行完 permissions 之後再重跑 scaffold。
 
+# ✅ 稽核 5b：**job 工作樹底下不得有任何 setfacl**（#641）
+#   註解掉的 per-job 行也算數——那些是降權啟動器逐案要套的，因此連 `#` 開頭的行
+#   一起看：
+grep -E "setfacl" /tmp/p2b-permissions.sh | grep -E "/var/lib/cortex/worktree/"
+#   期望：**空輸出**。
+#   #637 把成果交付整條換成 bundle spool（builder 產 bundle → commit-spool →
+#   Manager 從**檔案** fetch），reviewer 的 verdict 走 review-verdict-spool。
+#   Manager 因此沒有任何理由讀 job 的樹；#641 把登記表裡殘留的三條讀取授權
+#   （`repo-worktree` 的 `rX`、`review-verdict` 與 `work-items-yaml` 的 `r`）
+#   一起收掉。
+#   **非空輸出 ⇒ 部署樹比 #641 舊，先升級再繼續**——照舊值套用會讓
+#   #637 的不變式（Manager 全程不碰 builder 的 clone）在實機上不成立，而測試
+#   仍是綠的。
+#   注意 `/var/lib/cortex/worktree`（pool 容器本身，無 `/` 結尾）**不在**此列：
+#   它是 `0701 cortex-manager`，Manager 是 owner、別的帳號只能 traverse，
+#   產生器對它只出 `install -d`／`chown`／`chmod`，本來就沒有 setfacl。
+
 # ✅ 稽核 6：script 裡出現的每個帳號名都**真的存在**（#626）
 #   `setfacl` 對解析不到的使用者名直接失敗（`Invalid argument near character 3`），
 #   而 2b 是 `sh -e`——一條錯就**中止整份 script**，留下**半套權限的樹**（前半已套、

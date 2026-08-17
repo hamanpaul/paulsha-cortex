@@ -31,7 +31,14 @@ from paulsha_cortex.trust_root.permgen import (
 )
 from paulsha_cortex.trust_root.permgen import THREE_WAY_SCHEME as _THREE_WAY_BASE
 from paulsha_cortex.trust_root.permgen import TWO_WAY_SCHEME as _TWO_WAY_BASE
-from paulsha_cortex.trust_root.registry import Principal
+from paulsha_cortex.trust_root.registry import (
+    ASSET_REGISTRY,
+    AssetTier,
+    IngressKind,
+    Principal,
+    TrustRootAsset,
+    TrustTree,
+)
 
 #: #626：`operator` 與 `external` 是**部署決定**，模組層方案刻意留 `None`，未注入時
 #: 產生器 fail-closed。traverse 推導的驗收本來就涵蓋這兩個帳號的中間層授權
@@ -241,15 +248,48 @@ def test_owner_of_the_leaf_never_gets_a_redundant_grant() -> None:
 
 
 def test_unknown_intermediate_directory_is_fail_closed() -> None:
-    """登記表／骨架都沒描述的中間層（job 自建的 `<worktree>/.cortex`）保守視為
-    不可 traverse——寧可多產一條 `--x`，也不要漏掉而讓正向路徑靜默斷掉。"""
+    """登記表／骨架都沒描述的中間層保守視為不可 traverse——寧可多產一條 `--x`，
+    也不要漏掉而讓正向路徑靜默斷掉。
+
+    #641 之前這條以 `work-items-yaml`（落點 `<job 樹>/.cortex/work-items.yaml`）
+    當實例，因為它是當時登記表裡唯一「跨帳號 ACL 的路徑經過一個沒人描述的中間層」
+    的資產。#641 收掉 job 樹上全部三條跨帳號讀取 ACL 之後，登記表**剛好**沒有這種
+    資產了——但被驗的性質（`can_traverse(None, …) is False` ⇒ 導出一條 `--x`）完全
+    沒變。因此改以**合成資產**驗，不再綁在某一項登記表資料上：那個耦合正是這條測試
+    會隨無關變更一起紅掉的原因。
+    """
     assert can_traverse(None, "cortex-builder", THREE_WAY_SCHEME) is False
-    grants = derive_traverse_grants(
-        generate_plan(THREE_WAY_SCHEME), scheme=THREE_WAY_SCHEME
+
+    synthetic = TrustRootAsset(
+        "synthetic-nested-leaf", AssetTier.TIER_1, TrustTree.MANAGER_OWNED, None,
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.BUILDER),
+        IngressKind.MANAGER_INTERNAL,
     )
-    hidden = [g for g in grants if g.path.endswith("/.cortex")]
-    assert hidden, "work-items.yaml 的 .cortex 中間層必須被推導出來"
-    assert hidden[0].account == THREE_WAY_SCHEME.durable_state_owner
+    nested = f"{DEFAULT_LAYOUT.coordinator_root}/undescribed/leaf.json"
+    plan = generate_plan(THREE_WAY_SCHEME, ASSET_REGISTRY + (synthetic,))
+    grants = derive_traverse_grants(
+        plan,
+        scheme=THREE_WAY_SCHEME,
+        path_of={**permgen.asset_paths(), "synthetic-nested-leaf": nested},
+    )
+    hidden = [g for g in grants if g.path.endswith("/undescribed")]
+    assert hidden, "沒人描述的中間層必須被推導出一條 traverse"
+    assert hidden[0].account == THREE_WAY_SCHEME.resolve(Principal.BUILDER)
+
+
+def test_no_traverse_grant_reaches_into_a_job_worktree() -> None:
+    """#641：job 的工作樹底下不得有任何導出的 traverse 授權。
+
+    traverse 是機械導出的（#620）——只要登記表在 job 樹裡留下**任何一條**跨帳號
+    ACL，`<job 樹>` 乃至其子目錄就會自動被補上 `--x`。因此「收掉 `repo-worktree`
+    的 `rX`」若沒有把 `review-verdict`／`work-items-yaml` 一起收掉，洞會從 traverse
+    這一側自己長回來。這條就是釘住那件事。
+    """
+    job_root = permgen.asset_paths()["repo-worktree"]
+    for scheme in ALL_SCHEMES:
+        grants = derive_traverse_grants(generate_plan(scheme), scheme=scheme)
+        intruders = [g for g in grants if g.path == job_root or g.path.startswith(job_root + "/")]
+        assert not intruders, (scheme.scheme_id, [(g.path, g.account, g.required_by) for g in intruders])
 
 
 # ---------------------------------------------------------------------------
