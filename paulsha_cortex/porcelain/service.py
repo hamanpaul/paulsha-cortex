@@ -57,6 +57,13 @@ def _build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--instance", default=os.environ.get("PSC_INSTANCE", "cortex"))
     uninstall.add_argument("--purge", action="store_true", help="一併移除 bootstrap env")
     uninstall.add_argument("--json", action="store_true", help="輸出 cortex-porcelain/service/v1 JSON")
+
+    # issue #618：trust-root Phase 2b 的 system-level unit 以此為 ExecStart
+    # （permgen.ManagerUnit 產生 `<venv>/bin/cortex service run`）。與 start/stop
+    # 不同——它不是 systemctl 包裝，而是 daemon 迴圈本身。
+    # 參數不在此宣告：`main` 會在 parse 前攔截 run，把其餘 argv（含 --help）
+    # 原樣交給 daemon，避免在這裡複製一份會與 daemon parser 漂移的宣告。
+    sub.add_parser("run", help="前景執行 manager daemon（system unit 的 ExecStart）")
     return parser
 
 
@@ -586,9 +593,27 @@ def _run_uninstall(*, instance: str, purge: bool, json_output: bool) -> int:
     return 0
 
 
+def _run_foreground(daemon_argv: Sequence[str]) -> int:
+    """前景跑 manager daemon（issue #618）。
+
+    stdout/stderr 一律交給呼叫端（system unit 下即 journald），不自建 log 檔——
+    Phase 2b 的 `HOME` 為 root-owned 且 unit 帶 `ProtectHome=yes`，
+    `scripts/service-manager.sh` 那套 `$HOME/.agents/log` 導向在該佈局下寫不進去。
+    daemon 迴圈本身即阻塞並回傳 0/1，符合 `Type=simple` 的期待。
+    """
+    # 延後匯入：daemon 會拉進整個 coordinator 相依圖，不該在每次 `cortex` 呼叫
+    # 註冊 porcelain 命令時就付這個成本。
+    from paulsha_cortex.coordinator import manager_daemon
+
+    return manager_daemon.main(list(daemon_argv))
+
+
 def main(argv: Sequence[str]) -> int:
+    items = _normalize_argv(argv)
+    if items and items[0] == "run":
+        return _run_foreground(items[1:])
     parser = _build_parser()
-    args = parser.parse_args(_normalize_argv(argv))
+    args = parser.parse_args(items)
     try:
         instance = installer._validate_instance(getattr(args, "instance", "cortex"))
         if args.command == "install":
