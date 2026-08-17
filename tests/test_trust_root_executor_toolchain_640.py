@@ -461,10 +461,18 @@ def test_only_the_node_script_executor_depends_on_the_system_runtime() -> None:
     空輸出、拿掉即正常，與 `codex` 的症狀逐字相同——它內部 exec 的就是 node。
     這條同時是 #643 加固剖面的分類基準，因此改動它會連帶改動兩份 job unit 的對應
     關係（見 `test_trust_root_hardening_profile_643.py`）。
+
+    **#661 放寬了本測試的後半段**：`TOOLCHAIN_SYSTEM_RUNTIMES` 原本斷言逐字等於
+    `("node",)`，而那不是一條性質，是「當時只盤點到 node」的快照——`srt` 實際還要
+    `bwrap`／`socat`，Manager 還要 `git`／`gh`。現在它由 `SYSTEM_PROGRAMS` 導出，
+    本測試只保留真正的性質：**`node` 必須在系統層**（＝不進部署樹），因為那才是
+    裁決 (a) 對「通用 runtime」的處置。完整盤點的斷言在
+    `test_trust_root_external_deps_661.py`。
     """
     needs_node = {t.name for t in EXECUTOR_TOOLS if t.needs_node}
     assert needs_node == {"codex", "copilot"}
-    assert TOOLCHAIN_SYSTEM_RUNTIMES == ("node",)
+    assert "node" in TOOLCHAIN_SYSTEM_RUNTIMES
+    assert "node" not in {tool.name for tool in EXECUTOR_TOOLS}
     by_name = {t.name: t for t in EXECUTOR_TOOLS}
     assert by_name["codex"].shape is ExecutorShape.NODE_SCRIPT
     assert by_name["codex"].copy_tree, "node 套件單搬進入點會缺 node_modules"

@@ -563,6 +563,51 @@ $ sudo -u cortex-builder env HOME=<job HOME> codex exec --help
   shim，shim 以 `execvpe(argv[0], argv, spec['env'])` 整份換掉環境，job 解析命令用的
   `PATH` 來自 **spec 的 env**——寫在 unit 上只會是一個看起來承載作用、實際被丟掉的設定。
 
+##### (a2) 盤點範圍：**所有**外部程式，不只 executor（#661）
+
+(a) 的判準是「版本會不會影響治理產出」，而 #640 落地時把它**誤讀成「是不是 executor」**。
+實機四分部署完成後 doctor 仍紅在 `review-sandbox`，原因就是這個範圍錯誤：Claude review
+sandbox 的執行面 `srt`（`@anthropic-ai/sandbox-runtime`）從未進過名冊，同樣住在 operator
+的 HOME 底下、同樣被 `ProtectHome=yes` 擋掉。`openspec`（ship 的 archive／validate 判準）
+是同一族的第三個。
+
+- 登記表 SHALL 涵蓋 **job／服務執行面需要的每一支外部程式**，而不只是 dispatch 得到的
+  模型 CLI。落點沿用同一條判準：版本會影響治理產出者進 `<deploy_root>/toolchain`
+  （`permgen.EXECUTOR_TOOLS` ∪ `permgen.SERVICE_TOOLS`）；純通用 runtime／傳輸層走系統層
+  （`permgen.SYSTEM_PROGRAMS`：`node`／`git`／`gh`／`bwrap`／`socat`）。
+- 非 executor 的程式 SHALL 登記在 `SERVICE_TOOLS` 而 **MUST NOT** 併進 `EXECUTOR_TOOLS`：
+  後者同時是 §R8 dispatch 的 executor 名字判準（`executor_hardening_profile()` 對表外的
+  名字 fail-closed），併進去等於讓 `executor: srt` 這種派工變成合法。兩張名冊、同一個
+  形狀、同一棵樹、同一份權限。
+- npm 套件型的程式（`codex`／`srt`／`openspec`）SHALL **整包**搬套件樹，且
+  `<toolchain>/bin/<name>` SHALL 是指進 `lib/` 的 symlink。單檔複製有兩個後果，其中
+  第二個是**無聲**的：(i) ESM 的相對 import 解到 `bin/` 底下 ⇒ `ERR_MODULE_NOT_FOUND`；
+  (ii) 「從 `which()` 往上找 `package.json`」這類套件根解析（`launcher._srt_runtime_root()`）
+  解出 `None`，於是 reviewer sandbox 政策少一條 `allowRead` 而**不報錯**。
+- **已知未決點（#661 盤點結果，尚待裁決）**：`needs_node` 的非 executor 程式跑在**消費者
+  的**加固面上，而 §R3 的剖面推導（下方）唯一的輸入是 executor 名——它涵蓋不了「executor
+  在執行途中再 exec 出來的 node 程式」。目前有兩格落在這個盲區：`srt` 由 `claude`
+  （`strict` 剖面）exec、`openspec` 由 Manager 的 system unit exec，兩者皆
+  `MemoryDenyWriteExecute=yes`。可列舉形式為
+  `permgen.unresolved_node_execution_surfaces()`；實機量測步驟在 runbook 第 4e 步。
+  **MUST NOT** 在未量測的情況下放寬任何一面。
+
+##### (a3) delivery preflight 的落點與形態（#661）
+
+`PSC_PREFLIGHT_CMD` SHALL 是 **typed argv**，且第一段 SHALL 是部署 venv interpreter 的
+**絕對路徑**（`<deploy_root>/venv/bin/python3 -m <module>`）。理由與 (a) 同源但落點不同：
+preflight 不是一支自帶內容的程式，而是一條跨多個外部程式的**管線**，因此它的正確落點是
+**既有的部署 venv**（同樣 root-owned、job／服務唯讀＋可執行），而不是 toolchain。
+
+- cortex 側 SHALL 只提供 typed-argv **轉接器**（`paulsha_cortex.preflight_ci`），把
+  cortex 的契約（`--pr <N>` | `--metadata <路徑>`、`--skip-tests`）翻譯成治理引擎的契約。
+  轉接器 **MUST NOT** import 治理引擎，只以 typed argv spawn；未安裝時 fail-closed。
+- 引擎解析 SHALL 走 `--offline`＋已安裝的發行版，並由引擎驗
+  `installed == .project-policy.yml 的 policy_version`。**MUST NOT** 使用會在執行期
+  clone 引擎原始碼再執行它的路徑：那會在降權部署裡造出一塊「服務帳號寫得到、又執行得到」
+  的執行面，與 §R3「executable plane 必須 root 擁有、對 headless 不可寫」直接衝突。
+  版本一致性由 R-23（workflow pin ⟷ `policy_version`）遞移涵蓋 CI 那一半。
+
 ##### (b) 憑證：檔案 job-owned、目錄 root-owned
 
 憑證**檔**（預設 `<job HOME>/.codex/auth.json`，＝本部署 `PSC_MANAGER_EXECUTOR` 的那
@@ -696,6 +741,12 @@ provider 帳號下的兩個 job 在 provider 眼中是同一個主體，配額�
 | `agy` | 原生 ELF | ✅ | `strict` | `cortex-job@.service` |
 | `codex` | node script | ⛔ 空輸出 | `jit` | `cortex-job-jit@.service` |
 | `copilot` | shell → node | ⛔ 空輸出 | `jit` | `cortex-job-jit@.service` |
+
+> **#661：這條推導有一個已知的盲區。** 它的唯一輸入是 **executor 名**，因此涵蓋不了
+> 「executor 在執行途中再 exec 出來的 node 程式」，也涵蓋不了 Manager 的 system unit。
+> `srt`（由 `claude` exec、`strict` 剖面）與 `openspec`（由 Manager exec）目前都落在
+> 這個盲區裡。列舉形式見 §R1 (a2) 與 `permgen.unresolved_node_execution_surfaces()`；
+> 處置與 #643 同一條規矩：**量到才改，且改的是一份具名剖面，不是全域放寬**。
 
 **規範**：
 

@@ -462,14 +462,30 @@ def _validate_credential_relpath(relpath: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 四個模型 executor 的實體形態（#640 實機盤點）
+# 部署樹 toolchain 的實體形態（#640 實機盤點；#661 擴到非 executor）
 #
 # 形態不同 ⇒ 搬進部署樹的方式不能一概而論，因此固化成一張表：runbook 的安裝步驟與
-# 測試都由它導出，新增／換掉一個 executor 只改這裡一列。
+# 測試都由它導出，新增／換掉一支程式只改這裡一列。
+#
+# **#661：這張表原本只涵蓋四個 executor，那是一個真實的缺口。** job／服務需要的外部
+# 程式不只 executor——review sandbox 另有 `srt`、ship 另有 `openspec`，兩者同樣住在
+# operator 的 HOME 底下，`ProtectHome=yes` 之後同樣不可達。因此本節現在有**兩張
+# 名冊**（`EXECUTOR_TOOLS` 與 `SERVICE_TOOLS`），共用同一個形狀與同一棵樹，落位計畫
+# 由兩者的聯集 `TOOLCHAIN_PROGRAMS` 導出。
+#
+# **為何不是把 `srt`／`openspec` 併進 `EXECUTOR_TOOLS`**：那張表不只是清單，它同時是
+# **dispatch 的 executor 名字判準**——`executor_hardening_profile()` 對不在表上的名字
+# fail-closed（spec §R8），把非 executor 併進去等於讓 `executor: srt` 這種派工變成
+# 合法。兩張表是為了讓「盤點完整」與「dispatch 仍 fail-closed」同時成立。
 # ---------------------------------------------------------------------------
 
+#: `consumed_by` 的特別值：由 Manager／monitor 的 **system unit** 執行，而不是任何
+#: job 模板 unit。它沒有 per-executor 剖面可分岔，走的就是共用的 `_HARDENING`。
+MANAGER_SURFACE = "manager-unit"
+
+
 class ExecutorShape(Enum):
-    """executor 在檔案系統上的實體形態。"""
+    """toolchain 程式在檔案系統上的實體形態。"""
 
     NODE_SCRIPT = "node-script"    # `#!/usr/bin/env node` ＋ JS 本體（需 node runtime）
     NATIVE_ELF = "native-elf"      # 自帶原生執行檔（不依賴任何 runtime）
@@ -477,8 +493,8 @@ class ExecutorShape(Enum):
 
 
 @dataclass(frozen=True)
-class ExecutorTool:
-    """一個模型 CLI 的搬移契約。"""
+class ToolchainProgram:
+    """一支落進部署樹 toolchain 的外部程式的搬移契約。"""
 
     name: str
     shape: ExecutorShape
@@ -491,6 +507,16 @@ class ExecutorTool:
     #: 必須連同整包目錄複製（npm 套件樹），而不是單一檔案。
     copy_tree: bool
     note: str
+    #: **誰在執行期 exec 它**（#661）。executor 是被 dispatch 直接執行的，因此留空；
+    #: 非 executor 一定經由某個消費者被 exec，而**消費者所在的 unit 決定它實際跑在哪
+    #: 一份加固面下**——這正是 #643 的剖面推導（只看 executor 名）看不到的那一格。
+    #: 值為 executor 名（⇒ 該 executor 的 job 模板 unit）或 :data:`MANAGER_SURFACE`。
+    consumed_by: tuple[str, ...] = ()
+
+
+#: #640 的名字，保留為別名：那時表上只有 executor，型別名跟著語意走；#661 把非
+#: executor 收進同一個形狀之後型別改叫 `ToolchainProgram`，舊名不動以免無謂的擾動。
+ExecutorTool = ToolchainProgram
 
 
 #: 0817 實機盤點的四個 executor。`needs_node` 為真者是 `codex` 與 `copilot`——
@@ -532,14 +558,139 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ),
 )
 
-#: 走**系統層**的通用 runtime（裁決 (a) 的另一半）。node 換版本幾乎不影響模型輸出，
-#: 因此不進部署樹；但它仍是**部署決定**——某個 CLI 哪天提高下限（目前 codex 宣告
-#: `node >=16`，apt 候選 20.x 可用）時要一併升，否則它會變成下一個無聲漂移點。
-TOOLCHAIN_SYSTEM_RUNTIMES: tuple[str, ...] = ("node",)
+
+#: **非 executor** 的部署樹程式（#661）。與 :data:`EXECUTOR_TOOLS` 同一個形狀、同一棵
+#: 樹、同一份權限（root-owned 0755，全部 job／服務帳號唯讀＋可執行），只是**不是**
+#: dispatch 得到的模型 CLI，因此不參與 `executor_hardening_profile()` 的名字判準。
+#:
+#: 落點判準沿用 #640 裁決 (a)：**版本會不會影響治理產出**——會 ⇒ 部署樹（可稽核的
+#: 部署決定）；純通用 runtime／傳輸層 ⇒ 系統層（見 :data:`SYSTEM_PROGRAMS`）。
+#:
+#: 每一列都必須填 `consumed_by`：非 executor 的程式沒有自己的 unit，它跑在**消費者
+#: 的**加固面上，而那一格 #643 的剖面推導看不到（見 :func:`node_execution_surfaces`）。
+SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
+    ToolchainProgram(
+        "srt", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
+        note=(
+            "`@anthropic-ai/sandbox-runtime` 的進入點（npm bin `srt` → `dist/cli.js`），"
+            "**Claude review sandbox 的強制面**：doctor 的 `review-sandbox` probe 與 "
+            "`coordinator/launcher.py` 都要它。\n"
+            "**必須整包搬**——這是 #661 實機量到的失敗，不是預防性判斷：`dist/cli.js` 是 "
+            "ESM，第一行就 `import { quote } from './utils/shell-quote.js'`，單搬那一支到 "
+            "`<toolchain>/bin/srt` 之後相對 import 會解到 `<toolchain>/bin/utils/…`：\n"
+            "    Error [ERR_MODULE_NOT_FOUND]: Cannot find module "
+            "'<toolchain>/bin/utils/shell-quote.js'      rc=1\n"
+            "而 `srt --version` rc≠0 正是 doctor 的 `Claude sandbox dependency execution "
+            "failed`。套件另有自己的 `node_modules`（socks5-server／commander／node-forge／"
+            "zod）與 `vendor/`（`apply-seccomp`），單檔複製一個都拿不到。\n"
+            "**第二個、更安靜的後果**：`launcher._srt_runtime_root()` 是從 "
+            "`which(\"srt\")` 往上找 `package.json` 且 `name == @anthropic-ai/"
+            "sandbox-runtime` 來解出套件根，再把它加進 reviewer sandbox 政策的 "
+            "`allowRead`。單檔形態下它解出 `None`——沙箱政策少一條放行且**不報錯**。"
+            "因此 `bin/srt` 必須是指進 `lib/` 套件樹的 symlink（與 `codex` 同形），"
+            "`resolve()` 之後才找得到那個 `package.json`。\n"
+            "**版本是部署決定**：它決定 sandbox 政策**怎麼被套用**，與模型 CLI 同級。"
+        ),
+        consumed_by=("claude",),
+    ),
+    ToolchainProgram(
+        "openspec", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
+        note=(
+            "`@fission-ai/openspec` 的進入點（`bin/openspec.js`）。ship 段的 "
+            "`openspec archive -y` 與 preflight 的 `openspec validate` 都是**採信判準**"
+            "——它的版本直接決定一筆交付能不能被接受，因此與模型 CLI 同級，進部署樹。\n"
+            "**#661 實機盤點**：它和四個 executor 一樣住在 operator 的 nvm 樹底下"
+            "（`~/.nvm/.../lib/node_modules/@fission-ai/openspec`），`ProtectHome=yes` "
+            "之後同樣不可達——這是 #640 那一族**第三個**沒被盤到的成員。node script ＋ "
+            "npm 套件樹，搬法與 `codex`／`srt` 逐字相同。"
+        ),
+        consumed_by=(MANAGER_SURFACE,),
+    ),
+)
+
+#: 部署樹 toolchain 的**完整**盤點（executor ∪ 非 executor）。落位計畫由它導出；
+#: `executor_hardening_profile()` 刻意只看 `EXECUTOR_TOOLS`。
+TOOLCHAIN_PROGRAMS: tuple[ToolchainProgram, ...] = EXECUTOR_TOOLS + SERVICE_TOOLS
+
+
+@dataclass(frozen=True)
+class SystemProgram:
+    """走**系統層**（發行版套件）的外部程式：不進部署樹，但仍是部署決定。"""
+
+    name: str
+    #: 取得方式（apt 套件名；非 apt 者寫來源形態）。
+    source: str
+    #: 誰需要它——用來讓 runbook 的驗證步驟知道要以**哪個帳號**實跑一次。
+    required_by: tuple[str, ...]
+    note: str
+
+
+#: 走系統層的那一半（#640 裁決 (a) 的另一半，#661 補完）。判準：版本換掉幾乎不影響
+#: 治理產出（通用 runtime 或純傳輸層）。它們仍是**部署決定**——某個 CLI 哪天提高下限
+#: 時要一併升，否則會變成下一個無聲漂移點。
+#:
+#: **#661 之前這裡只有 `node` 一列**，而那是不完整的盤點：`srt` 在 Linux 上實際會去
+#: exec `bwrap` 與 `socat`（doctor 的 `review-sandbox` probe 逐一跑它們的 `--version`），
+#: Manager 則需要 `git`／`gh`。缺任何一支的症狀都不是「設定錯」而是「跑到一半才失敗」。
+SYSTEM_PROGRAMS: tuple[SystemProgram, ...] = (
+    SystemProgram(
+        "node", "apt: nodejs", ("codex", "copilot", "srt", "openspec"),
+        note=(
+            "通用 JS runtime，換版本幾乎不影響產出，因此不進部署樹；但版本本身仍是"
+            "部署決定（目前 codex 宣告 `node >=16`）。所有 `needs_node` 的 toolchain "
+            "程式都吃它。"
+        ),
+    ),
+    SystemProgram(
+        "git", "apt: git", ("manager", "builder", "reviewer-planner"),
+        note="來源樹／per-job clone／baseline 解析全靠它；純工具，版本不影響治理判準。",
+    ),
+    SystemProgram(
+        "gh", "apt: gh（GitHub CLI apt repo）", ("manager",),
+        note=(
+            "Manager 對 GitHub 的傳輸層（PR metadata、checks、merge），以及 preflight "
+            "以 `--pr <N>` 取 PR 上下文時的來源。純傳輸層 ⇒ 系統層。"
+        ),
+    ),
+    SystemProgram(
+        "bwrap", "apt: bubblewrap", ("srt",),
+        note=(
+            "`srt` 在 Linux 上的 namespace 隔離實作。doctor 的 `review-sandbox` probe "
+            "會實跑 `bwrap --version`，rc≠0 即 fail。隨發行版走 ⇒ 系統層。"
+        ),
+    ),
+    SystemProgram(
+        "socat", "apt: socat", ("srt",),
+        note=(
+            "`srt` 網路政策那一段的 socket 轉發。同樣由 `review-sandbox` probe 實跑 "
+            "`socat -V` 驗證。"
+        ),
+    ),
+)
+
+#: 系統層程式的名字（既有名稱保留；值由 :data:`SYSTEM_PROGRAMS` 機械導出，避免兩份
+#: 真相）。**#661 之前它是寫死的 `("node",)`**——那不是設計，是盤點沒做完。
+TOOLCHAIN_SYSTEM_RUNTIMES: tuple[str, ...] = tuple(p.name for p in SYSTEM_PROGRAMS)
 
 #: job `PATH` 的系統層尾段（toolchain 之後）。`node`（codex 的 runtime）、`git`、
 #: wrapper 內的 `python3` 都在這裡。刻意不含任何 `sbin`。
 JOB_PATH_SYSTEM_TAIL: tuple[str, ...] = ("/usr/local/bin", "/usr/bin", "/bin")
+
+#: `PSC_PREFLIGHT_CMD` 指向的模組（#661）。**它住在 cortex 自己的套件裡**，因此隨
+#: `/opt/cortex/venv` 一起是 root-owned 部署產物，不需要第二個檔案系統資產。
+PREFLIGHT_ADAPTER_MODULE = "paulsha_cortex.preflight_ci"
+
+#: preflight adapter 的 backend（typed argv 的第二段）。**cortex 不 import 它**——
+#: adapter 只以 typed argv spawn `<venv python> -m <這個模組>`，未安裝時以清楚訊息
+#: fail-closed。它是 `.project-policy.yml` 宣告的那個治理引擎（`policy-check` 發行
+#: 版）自己提供的 CI-parity preflight 進入點。
+PREFLIGHT_BACKEND_MODULE = "policy_check.preflight"
+
+#: preflight backend 所在的 python 發行版。落點是**部署 venv**（既有 root-owned 資產）
+#: 而不是 toolchain：它不是可執行檔，是一個 import 得到才有意義的 python 套件；且它的
+#: 版本必須逐字等於 `.project-policy.yml` 的 `policy_version`（引擎自己會驗，對不上就
+#: fail-closed），因此「裝哪一版」與 R-23 的 workflow pin 是同一個部署決定。
+PREFLIGHT_BACKEND_DISTRIBUTION = "policy-check"
 
 
 #: 二分（**向後相容選項**，非預設）：builder 一個帳號，其餘 headless／Manager／
@@ -1481,6 +1632,24 @@ class PathLayout:
         """
         return ":".join((self.toolchain_bin,) + JOB_PATH_SYSTEM_TAIL)
 
+    def preflight_command_value(self) -> str:
+        """`PSC_PREFLIGHT_CMD` 應該拿到的值（#661）。
+
+        形態是 **typed argv、絕對路徑的部署 venv interpreter ＋ `-m <module>`**：
+
+        - **typed argv**：`coordinator/preflight.py` 的 `_validate_typed_command()`
+          會拒絕 shell wrapper，doctor 也把它列為一個獨立的失敗類別；
+        - **絕對路徑**：`load_preflight_command()` 對絕對路徑會實際檢查
+          `is_file() and os.access(X_OK)`，缺件在 doctor 就看得到，而不是等到 ship
+          當下才 `command not found`；走 `PATH` 則要看 unit 注入了什麼；
+        - **部署 venv 的 interpreter**：`ProtectHome=yes` 之後 operator HOME 底下的
+          任何東西都不可達（#661 的原症狀：舊值 `~/.local/bin/cortex-preflight-ci`
+          是個 shell wrapper，它指向的 backend 也在 `/home` 底下——**兩層都不可達**）。
+          `/opt/cortex/venv` 是既有的 root-owned 部署樹，job／服務唯讀＋可執行，
+          與 `executor-toolchain` 同一類，因此模組**天生**落在受保護面內。
+        """
+        return f"{self.venv_root}/bin/python3 -m {PREFLIGHT_ADAPTER_MODULE}"
+
     @property
     def job_shim(self) -> str:
         """降權 job 模板 unit 的固定 `ExecStart=`（root-owned，內容由 permgen 產）。"""
@@ -2407,6 +2576,70 @@ def executor_hardening_profile(executor: str) -> HardeningProfile:
     return HARDENING_PROFILES_BY_ID[profile_id]
 
 
+@dataclass(frozen=True)
+class NodeExecutionSurface:
+    """一支 `needs_node` 的**非 executor** 程式 × 它實際跑在哪個加固面上（#661）。"""
+
+    program: str
+    #: executor 名，或 :data:`MANAGER_SURFACE`。
+    surface: str
+    #: 執行它的 unit 目前是否允許 W+X 記憶體（＝`MemoryDenyWriteExecute` 不是 `yes`）。
+    allows_wx: bool
+    detail: str
+
+
+def _surface_allows_wx(surface: str) -> tuple[bool, str]:
+    """該執行面的 `MemoryDenyWriteExecute` 實際值（由既有產生器導出，不另抄一份）。"""
+
+    if surface == MANAGER_SURFACE:
+        table = {key: value for key, value, _why in _HARDENING}
+        value = table["MemoryDenyWriteExecute"]
+        return value != "yes", f"{MANAGER_SURFACE}（MemoryDenyWriteExecute={value}）"
+    profile = executor_hardening_profile(surface)
+    value = profile.effective()["MemoryDenyWriteExecute"]
+    return value != "yes", (
+        f"executor {surface} ⇒ 剖面 {profile.profile_id}"
+        f"（MemoryDenyWriteExecute={value}）"
+    )
+
+
+def node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
+    """把「node 程式實際跑在誰的加固面上」這句話機械化（#661）。
+
+    **這是 #643 的剖面推導看不到的那一格。** #643 把「哪個 job 要放寬 W+X」由
+    `EXECUTOR_TOOLS.needs_node` 機械導出，而那條推導的唯一輸入是 **executor 名**——
+    它涵蓋「被 dispatch 直接執行的那一支是不是 node」，**不涵蓋**「那一支在執行途中
+    再 exec 出來的 node 程式」。#661 的完整盤點正好撞出兩個這種格子：
+
+    - `srt`：由 `claude`（原生 ELF ⇒ **strict** 剖面）在 review 時 exec；
+    - `openspec`：由 **Manager 的 system unit** 在 ship 時 exec。
+
+    兩者所在的 unit 目前都是 `MemoryDenyWriteExecute=yes`，而 #643 已在實機量到 V8
+    的 `Runtime_CompileLazy` 在該項下直接崩。因此這兩格**預期會失敗**——但這是
+    **OS 層語意**，本 repo 的測試環境沒有那個加固面，不得在這裡宣稱已驗證。本函式
+    只負責讓它們**可列舉、不會靜默消失**；實機量測步驟在 runbook 第 4e 步，裁決
+    （放寬哪一面、放寬到什麼程度）屬 operator，見 #643 的先例：量到才改，且不得
+    就地放寬。
+    """
+
+    surfaces: list[NodeExecutionSurface] = []
+    for tool in SERVICE_TOOLS:
+        if not tool.needs_node:
+            continue
+        for consumer in tool.consumed_by:
+            allows, detail = _surface_allows_wx(consumer)
+            surfaces.append(
+                NodeExecutionSurface(tool.name, consumer, allows, detail)
+            )
+    return tuple(surfaces)
+
+
+def unresolved_node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
+    """`node_execution_surfaces()` 裡**執行面仍禁 W+X** 的那些（＝已知會失敗的組合）。"""
+
+    return tuple(surface for surface in node_execution_surfaces() if not surface.allows_wx)
+
+
 #: **實際具備啟動面降權的 job principal**（＝各有一組 root-owned 模板 unit 的角色）。
 #:
 #: - `BUILDER`（M1，#603／#584）：`cortex-job@.service`／`cortex-job-jit@.service`。
@@ -3309,11 +3542,16 @@ def build_toolchain_plan(
     scheme: UidScheme = DEFAULT_SCHEME,
     layout: PathLayout = DEFAULT_LAYOUT,
 ) -> list[str]:
-    """產生 executor toolchain 的落位步驟（**只回傳字串，絕不執行**）。
+    """產生部署樹 toolchain 的落位步驟（**只回傳字串，絕不執行**）。
 
     分工：**權限**由登記表經 `plan_to_commands()` 產出（`executor-toolchain` 那一節），
-    本函式產的是**內容落位**——哪一支 CLI 用哪種方式搬進 `<deploy_root>/toolchain`，
+    本函式產的是**內容落位**——哪一支程式用哪種方式搬進 `<deploy_root>/toolchain`，
     比照 `build_job_shim()`／`build_account_gitconfig()` 的定位。
+
+    **#661：涵蓋範圍由「四個 executor」擴為 `TOOLCHAIN_PROGRAMS`**（executor ∪ 非
+    executor）。原本的盤點漏掉 `srt` 與 `openspec`，兩者同樣住在 operator 的 HOME
+    底下、`ProtectHome=yes` 之後同樣不可達，而症狀分別是 doctor 的 `review-sandbox`
+    FAIL 與 ship 段的 archive 失敗。
 
     來源路徑刻意留成 shell 變數：那是 operator 機器上的位置（nvm 樹／`~/.local/bin`），
     產生器猜不到也不該猜。但**來源的判準**是固定的，寫進輸出裡：一律取 operator
@@ -3321,14 +3559,18 @@ def build_toolchain_plan(
     """
     tail = ", ".join(JOB_PATH_SYSTEM_TAIL)
     lines = [
-        f"# {layout.toolchain_root} —— executor toolchain（登記表資產 executor-toolchain）",
+        f"# {layout.toolchain_root} —— 部署樹 toolchain（登記表資產 executor-toolchain）",
         f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
         f"#   python3 -m paulsha_cortex.trust_root toolchain {scheme.scheme_id}",
         "#",
-        "# ===== 裁決 (a)（#640）=====",
-        "# node 走**系統層**（通用 runtime，換版本幾乎不影響產出）；四個模型 CLI 落進",
-        "# 部署樹，因為「job 跑的是哪個版本的模型 CLI」**會**影響產出——那必須是一個",
-        "# 可稽核的部署決定，而不是跟著 operator 自己的環境漂移。",
+        "# ===== 裁決 (a)（#640）＋ 完整盤點（#661）=====",
+        "# 通用 runtime／傳輸層走**系統層**（換版本幾乎不影響治理產出）；版本會影響",
+        "# 治理產出的程式落進部署樹，因為那必須是一個**可稽核的部署決定**，而不是跟著",
+        "# operator 自己的環境漂移。#661 把後者由「四個模型 CLI」補成完整盤點：",
+        f"#   executor（dispatch 直接執行）："
+        + "、".join(t.name for t in EXECUTOR_TOOLS),
+        f"#   非 executor（由別人 exec，但同樣是 job／服務跑得起來的必要條件）："
+        + "、".join(t.name for t in SERVICE_TOOLS),
         "#",
         "# ===== 來源一律取 operator 實際在用的那一份 =====",
         "# **不要** `npm install -g` 另裝一份系統的。實機盤點：同一台機器上系統層的",
@@ -3336,16 +3578,17 @@ def build_toolchain_plan(
         "# 照「系統層有什麼就用什麼」，job 會跑一份 operator 從未判讀過的版本，而",
         "# 症狀是「跑得起來但結果對不上」，不是 `command not found`。",
         "#",
-        "# ===== 系統層 runtime（apt，不進部署樹）=====",
+        "# ===== 系統層程式（不進部署樹，但仍是部署決定）=====",
     ]
-    for runtime in TOOLCHAIN_SYSTEM_RUNTIMES:
-        lines.append(
-            f"#   {runtime}：版本本身仍是**部署決定**——某個 CLI 哪天提高下限時要一併升，"
-            "否則它會變成下一個無聲漂移點。"
-        )
+    for program in SYSTEM_PROGRAMS:
+        lines += [
+            f"#   {program.name}（{program.source}）— 需要它的是："
+            + "、".join(program.required_by),
+            f"#     {program.note}",
+        ]
     lines += [
-        f"#   目前只有 `codex` 需要它；`claude`／`agy` 自帶原生執行檔、`copilot` 是 "
-        "shell script。",
+        "#   版本本身仍是**部署決定**——某個 CLI 哪天提高下限時要一併升，否則它會變成",
+        "#   下一個無聲漂移點。",
         "",
         "# --- 目錄骨架（權限與登記表那一節逐位元相同）---",
         f"install -d -o {scheme.deploy_account} -g {scheme.group_of(scheme.deploy_account)}"
@@ -3355,16 +3598,27 @@ def build_toolchain_plan(
         f"install -d -o {scheme.deploy_account} -g {scheme.group_of(scheme.deploy_account)}"
         f" -m 0755 {layout.toolchain_lib}",
     ]
-    for tool in EXECUTOR_TOOLS:
-        profile = executor_hardening_profile(tool.name)
+    for tool in TOOLCHAIN_PROGRAMS:
         lines += [
             "",
             f"# --- {tool.name}（{tool.shape.value}"
             + ("；**需要系統層 node**" if tool.needs_node else "")
             + f"）---",
-            f"#   加固剖面：{profile.profile_id} ⇒ "
-            f"{job_unit_stem(layout, Principal.BUILDER, profile)}@<id>.service（#643）",
-            f"#   {tool.note}",
+        ]
+        if tool.consumed_by:
+            for consumer in tool.consumed_by:
+                _, detail = _surface_allows_wx(consumer)
+                lines.append(f"#   執行面：{detail}")
+        else:
+            profile = executor_hardening_profile(tool.name)
+            lines.append(
+                f"#   加固剖面：{profile.profile_id} ⇒ "
+                f"{job_unit_stem(layout, Principal.BUILDER, profile)}@<id>.service（#643）"
+            )
+        # note 可能是多行（#661 起有實測輸出要照抄）——逐行加註解前綴，否則計畫裡會
+        # 出現既不是註解也不是命令的行，落地時被當成命令貼進 shell。
+        lines += [f"#   {segment}" for segment in tool.note.split("\n")]
+        lines += [
             f'#   SRC="$(readlink -f "$(command -v {tool.name})")"   '
             "# operator 實際在用的那一份",
         ]
@@ -3377,11 +3631,32 @@ def build_toolchain_plan(
                 f" {layout.toolchain_bin}/{tool.name}",
                 "#   落定後確認進入點的 shebang 解得開：`head -n 1` 應為 "
                 "`#!/usr/bin/env node`，且 `command -v node` 落在系統層。",
+                f"#   ⚠️ `{layout.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 "
+                "symlink**，不是把進入點複製出來的單檔（#661 實測）：ESM 的相對 "
+                "import、以及「從 `which()` 往上找 `package.json`」這類套件根解析，"
+                "靠的都是 `readlink -f` 之後落在套件樹裡的那條路徑。",
             ]
         else:
             lines += [
                 f'#     cp -a "$SRC" {layout.toolchain_bin}/{tool.name}',
             ]
+    unresolved = unresolved_node_execution_surfaces()
+    if unresolved:
+        lines += [
+            "",
+            "# ===== ⚠️ 已知的 W+X 衝突（#661 盤點結果，尚待 operator 裁決）=====",
+            "# 下列程式是 node（V8 的 JIT 需要 W→X），但**執行它的那個 unit 目前仍是**",
+            "# `MemoryDenyWriteExecute=yes`。#643 已在實機量到 V8 的 Runtime_CompileLazy",
+            "# 在該項下直接崩，症狀是**空輸出**而不是報錯——離原因很遠。",
+            "# 這一格 #643 的剖面推導看不到：那條推導的唯一輸入是 executor 名，涵蓋不了",
+            "# 「executor 在執行途中再 exec 出來的 node 程式」。",
+        ]
+        for surface in unresolved:
+            lines.append(f"#   {surface.program} ← {surface.detail}")
+        lines += [
+            "# 實機量測步驟見 runbook 第 4e 步（systemd-run 帶該 unit 的關鍵 property）。",
+            "# **量到才改，且不得就地放寬**——回報 issue 由 operator 裁決（#643 的先例）。",
+        ]
     lines += [
         "",
         "# --- 統一收權（root 擁有、全部 job／服務帳號唯讀＋可執行）---",
@@ -3394,6 +3669,16 @@ def build_toolchain_plan(
         "# 就會被它蓋掉。尾段給的是系統層（" + tail + "）——node／git／python3 在那裡；",
         "# 刻意不含任何 sbin。值寫進 Manager 端 root-owned 的 EnvironmentFile：",
         f"#   PSC_BUILDER_PATH={layout.job_path_value()}",
+        "",
+        "# ===== delivery preflight（#661）=====",
+        "# preflight 的 backend **不是**可執行檔而是一個 python 套件，因此它的落點不是",
+        f"# toolchain 而是既有的部署 venv（{layout.venv_root}，同樣 root-owned、job／服務",
+        "# 唯讀）。版本必須逐字等於 .project-policy.yml 的 policy_version——引擎自己會驗，",
+        "# 對不上就 fail-closed；那與 R-23 的 workflow pin 是同一個部署決定。",
+        f"#   {layout.venv_root}/bin/pip install "
+        f"'{PREFLIGHT_BACKEND_DISTRIBUTION}==<policy_version>'",
+        "# 值寫進 Manager 端 root-owned 的 EnvironmentFile：",
+        f"#   PSC_PREFLIGHT_CMD=\"{layout.preflight_command_value()}\"",
     ]
     return lines
 

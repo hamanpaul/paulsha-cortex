@@ -59,10 +59,18 @@ python3 -m paulsha_cortex.cli --version
 在第一次執行 `cortex bootstrap` 前，請先設定 `PSC_PREFLIGHT_CMD`，避免第一次就撞到 delivery preflight 的 fail-closed。
 
 ```bash
-export PSC_PREFLIGHT_CMD='python3 -m project_preflight'
+export PSC_PREFLIGHT_CMD='python3 -m paulsha_cortex.preflight_ci'
 ```
 
-此為 typed argv 示例，`project_preflight` 請換成 repo 實際提供的 preflight module / executable。請避免使用 shell wrapper（例如 `sh -c`）。
+cortex 內建的 `paulsha_cortex.preflight_ci` 是一個 typed-argv 轉接器，會把 delivery 的
+`--pr <N>` / `--metadata <路徑>` / `--skip-tests` 翻譯給 `paulsha-conventions` 的
+CI-parity preflight（`policy_check.preflight`）。使用它需要在**同一個 Python 環境**裝上與
+`.project-policy.yml` 的 `policy_version` 逐字相同的 `policy-check`；版本對不上時引擎會
+fail-closed 並直接說出期望版本。
+
+若你的 repo 有自己的 preflight，把值換成該 module / executable 即可（同樣要是 typed argv）。
+請避免使用 shell wrapper（例如 `sh -c`）；也不要指向 `$HOME` 底下的路徑——服務化部署帶
+`ProtectHome=yes` 時那些路徑一律不可達。
 
 在 `bootstrap` 或 `cortex inspect doctor --json` 前後都可用下面指令驗證：
 
