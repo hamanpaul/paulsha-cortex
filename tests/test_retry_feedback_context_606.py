@@ -40,6 +40,7 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
 
 from diagnostic_fixtures import fixture_needs_human_reason
+from git_fixtures import StubWorktreeCreator
 
 
 HEAD = "d" * 40
@@ -568,7 +569,16 @@ def test_forced_redispatch_prompt_carries_the_evidence(
     prompts: list[str] = []
 
     replacement = manager.dispatch_workflow_card(
-        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        # #648：build 卡改為 per-job provisioning，每次派工都會走 creator。
+        type(
+            "D",
+            (),
+            {
+                "_registry": registry,
+                "_git_runner": None,
+                "_worktree_creator": StubWorktreeCreator(tmp_path),
+            },
+        )(),
         run=registry.get_workflow_run(run.run_id),
         identities=_identities(),
         launcher_factory=lambda _: _Launcher(prompts),
@@ -615,7 +625,16 @@ def test_first_dispatch_through_the_real_path_has_no_retry_context(
     prompts: list[str] = []
 
     manager.dispatch_workflow_card(
-        type("D", (), {"_registry": registry, "_git_runner": None})(),
+        # #648：build 卡改為 per-job provisioning，每次派工都會走 creator。
+        type(
+            "D",
+            (),
+            {
+                "_registry": registry,
+                "_git_runner": None,
+                "_worktree_creator": StubWorktreeCreator(tmp_path),
+            },
+        )(),
         run=registry.get_workflow_run(run.run_id),
         identities=_identities(),
         launcher_factory=lambda _: _Launcher(prompts),

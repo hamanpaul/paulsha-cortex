@@ -970,10 +970,14 @@ identities:
 
     registry = JobRegistry()
     branches: list[str] = []
+    #: #648：canonical lane 的工作區改為 per-job，provisioning 由「一個 run 一次」
+    #: 變成「每張 build 卡一次」；branch 名一條不變，只是被要求得更多次。
+    provisioned_job_ids: list[str | None] = []
 
     class WorktreeCreator:
         def create(self, branch, base_sha=None, *, job_id=None):
             branches.append(branch)
+            provisioned_job_ids.append(job_id)
             return str(repo)
 
     dispatcher = Dispatcher(
@@ -1203,7 +1207,16 @@ identities:
     run = registry.get_workflow_run(run_id)
     assert run.current_phase == "review"
     assert run.pr_refs == ("acme/demo#17",)
-    assert branches == ["feature/14-work"]
+    build_job_ids = [
+        job["job_id"]
+        for job in registry.list_jobs()
+        if job.get("workflow_run_id") == run_id and job.get("workflow_phase") == "build"
+    ]
+    assert set(branches) == {"feature/14-work"}
+    # #648：每張 build 卡 provision 一次，且帶的是**那張卡自己的 job_id**——
+    # 目錄名（`job_workspace.job_segment(job_id)`）因此逐字等於該 job 的 systemd
+    # 模板 instance 名。
+    assert provisioned_job_ids == build_job_ids
     assert preflight_requests[0].metadata_path is not None
     assert preflight_requests[0].pr_number is None
     assert created[0]["branch"] == "feature/14-work"
