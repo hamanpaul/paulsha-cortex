@@ -245,12 +245,71 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         IngressKind.MANAGER_INTERNAL,
         note="lock 檔實測 0o644；owner 可 unlink 後重建。",
     ),
+    # ---- per-job clone 的來源樹（#623）--------------------------------------
+    TrustRootAsset(
+        "repo-source-tree", _T0, _MO, None,
+        (Principal.INSTALLER,),
+        (
+            Principal.MANAGER, Principal.MONITOR,
+            Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER,
+        ),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.repo_source_root",),
+        note=(
+            "`<agents_root>/repos/<slug>`——**Manager-owned 樹內的 working checkout**，"
+            "同時是 monitor 的掃描目標（`workstreams/*/todo.md` 等要有工作樹，bare 沒有）"
+            "與每個 job 的 **clone 來源**。#623 實測：共用 git object store 與三分隔離"
+            "**互斥**（builder 要 commit 就得能寫 object store，能寫就等於邊界在 git 這層"
+            "漏掉），因此 job 工作區由 `git worktree` 改為 **per-job 完整 clone**"
+            "（0.5 秒／35MB）。\n"
+            "**writer 只有部署身分（root）**：來源樹由 operator 以 root 更新，"
+            "**全部服務帳號（含 Manager）唯讀**——owner_class 因此機械分到 DEPLOYMENT"
+            "而非 MANAGER_STATE（permgen 的 ReadWritePaths 純由「誰可寫」導出，"
+            "owner＝cortex-manager 會讓 Manager unit 自動拿到寫入權）。tree 仍是 "
+            "MANAGER_OWNED（headless 零寫入），與 `runtime-agents-tree` 同形。\n"
+            "**無 path_resolver**：程式碼解析的是**單一** repo（`PSC_REPO_ROOT` → "
+            "`<此樹>/<slug>`，見 `config/paths.py:repo_root`），本資產是**容器**，"
+            "沒有任何函式回傳它。"
+        ),
+    ),
+    TrustRootAsset(
+        "builder-gitconfig", _T0, _MO, None,
+        (Principal.INSTALLER,), (Principal.BUILDER,),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:build_job_gitconfig",),
+        note=(
+            "builder 帳號 HOME 下的 root-owned `.gitconfig`（0644），內容含來源 repo 的 "
+            "`safe.directory`——比照既有的 `codex-hooks`（root-owned、在 job 帳號 HOME 下），"
+            "不是新概念。**為何必須存在**：per-job clone 的來源樹不屬於 job 帳號，git 的 "
+            "dubious ownership 保護會讓 `git clone` 直接失敗；而 job 的 HOME 是 root-owned，"
+            "它自己放不了這個檔。**為何是 Tier-0**：gitconfig 可指定 `core.fsmonitor`／"
+            "`core.pager`／`alias.*` 等會執行外部命令的鍵，可寫者等於對該 job 帳號取得"
+            "任意程式碼執行——與 `codex-hooks` 同一條性質。內容由 permgen 產生"
+            "（`build_job_gitconfig()`），不手寫。"
+        ),
+    ),
+    TrustRootAsset(
+        "reviewer-planner-gitconfig", _T0, _MO, None,
+        (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:build_job_gitconfig",),
+        note=(
+            "同 `builder-gitconfig`，落在 reviewer＋planner 的 job 帳號 HOME 下"
+            "（三分定案的 `cortex-reviewer-planner`）。兩個 job 帳號各一份是必要的："
+            "`.gitconfig` 讀取端是 `$HOME`，而三分的硬性要求就是 reviewer 與 builder "
+            "互不可寫、HOME 互不相同。"
+        ),
+    ),
     # ---- job-visible worktree 族 -------------------------------------------
     TrustRootAsset(
         "repo-worktree", _T1, _JV, "paulsha_cortex.config.paths:repo_root",
         (Principal.BUILDER,), (Principal.MANAGER,),
         IngressKind.STAGING_SPOOL,
-        note="builder write_paths:['**']，可寫 worktree 內任何路徑（含 .cortex/.github）。",
+        note=(
+            "builder write_paths:['**']，可寫工作區內任何路徑（含 .cortex/.github）。"
+            "#623 之後這個工作區是從 `repo-source-tree` 拉出來的 **per-job 完整 clone**"
+            "（整個 clone 由該 job 帳號擁有），不再是共用 object store 的 git worktree。"
+        ),
     ),
     TrustRootAsset(
         "dispatch-worktree-pool", _T1, _JV, "paulsha_cortex.config.paths:worktree_root",
@@ -492,7 +551,9 @@ MUTATION_INGRESS: tuple[MutationIngress, ...] = (
     MutationIngress("config-overlay", IngressKind.CONFIG_OVERLAY, False, True,
                     "model-identity／combo／persona tool_allowlist_additions（只加不減、無上限）。"),
     MutationIngress("deployment-write", IngressKind.DEPLOYMENT_WRITE, False, True,
-                    "unit／venv／launcher／sitecustomize／.pth／PATH／~/.codex/hooks.json。"),
+                    "unit／venv／launcher／sitecustomize／.pth／PATH／~/.codex/hooks.json；"
+                    "#623 起另含 per-job clone 的來源樹與 job 帳號 HOME 下的 root-owned "
+                    "`.gitconfig`——同一條性質：writer 只有部署身分，服務帳號一律唯讀。"),
     MutationIngress("interprocess", IngressKind.INTERPROCESS, False, True,
                     "inherited FD／ptrace／/proc/<pid>/mem／signal。"),
 )

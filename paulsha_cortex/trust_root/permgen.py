@@ -370,6 +370,20 @@ def _validate_account_name(name: str, flag: str | None = None) -> None:
         )
 
 
+#: repo slug 的合法形狀。slug 會被逐字嵌進 root 產生的 `.gitconfig`，且會被接成
+#: `<repo_source_root>/<slug>`——不得含 `/`、空白、shell metacharacter，也不得以 `.`
+#: 開頭（擋掉 `..` 這類往上跳的相對段）。
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_repo_slug(slug: str) -> None:
+    if not isinstance(slug, str) or not _REPO_SLUG_RE.match(slug):
+        raise ValueError(
+            f"不是合法的 repo slug：{slug!r}。slug 會被接成 <repo_source_root>/<slug> "
+            "並逐字寫進 root-owned 的 .gitconfig，只接受 `^[A-Za-z0-9][A-Za-z0-9._-]*$`。"
+        )
+
+
 #: 二分（**向後相容選項**，非預設）：builder 一個帳號，其餘 headless／Manager／
 #: monitor 共用 cortex-svc。0816 第三輪裁決前的方案；已按此裝好的部署可續用，
 #: 但新部署一律走 :data:`DEFAULT_SCHEME`（三分）。
@@ -629,6 +643,10 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
             "整棵樹；對全部 headless 唯讀，現況裸寫／group-writable 於此收斂。"
             "0816 裁決已定案路徑：部署樹＝/opt/cortex、bootstrap env 落 /opt/cortex/etc/、"
             "codex hooks 落 job 帳號 HOME 下的 root-owned .codex/（值見 PathLayout，勿手寫）。"
+            "**凡 writer 只有部署身分的資產皆歸此類**，因此 #623 的 per-job clone 來源樹"
+            "與 job 帳號 HOME 下的 root-owned .gitconfig 也在其中：owner＝root 即代表"
+            "**全部服務帳號（含 Manager）唯讀**——ReadWritePaths 純由「誰可寫」導出，"
+            "這條分類就是「來源樹由 operator 以 root 更新、Manager 唯讀」裁決的機械落點。"
         )
 
     elif owner_class is OwnerClass.MANAGER_STATE:
@@ -978,10 +996,21 @@ class PathLayout:
     #: Manager 帳號是 `cortex-manager`，HOME 卻還指著二分時代的 `/var/lib/cortex-svc`，
     #: unit 的 `Environment=HOME=` 與 scaffold 因此指向一個沒人擁有的目錄。
     home_root: str = "/var/lib"
-    #: builder 的帳號名。只給 `asset_paths()` 用（`codex-hooks` 掛在 builder HOME 下），
-    #: 因為 `asset_paths()` 刻意不吃 scheme——兩個 scheme 對 BUILDER 的映射相同。
-    #: 其餘所有帳號相關路徑一律由 scheme 現場導出。
+    #: builder 的帳號名。只給 `asset_paths()` 用（`codex-hooks`／`builder-gitconfig` 掛在
+    #: builder HOME 下），因為 `asset_paths()` 刻意不吃 scheme——兩個 scheme 對 BUILDER
+    #: 的映射相同。其餘所有帳號相關路徑一律由 scheme 現場導出。
     builder_account: str = "cortex-builder"
+    #: reviewer＋planner 的 job 帳號名（`reviewer-planner-gitconfig` 掛在它的 HOME 下）。
+    #: 與 `builder_account` 同一個理由存在，但**多一個前提**：兩個 scheme 對 REVIEWER／
+    #: PLANNER 的映射**不同**——這裡取的是**定案的三分**。二分是向後相容選項，其
+    #: reviewer／planner 與 Manager 併帳（`cortex-svc`）、且尚未經模板 unit 降權起 job，
+    #: 因此那個部署形態下本資產不適用（產生的命令帶 `[ ! -e ] ||` 守衛，會直接跳過）。
+    reviewer_planner_account: str = "cortex-reviewer-planner"
+    #: 本 instance 治理的來源 repo slug（`<repo_source_root>/<slug>`）。**部署決定**，
+    #: 刻意留空：job 帳號的 `.gitconfig` 需要**逐字**的 `safe.directory` 路徑（git 不吃
+    #: 目錄萬用字元，見 `build_job_gitconfig`），猜不到就只能猜錯。未指定時
+    #: `build_job_gitconfig()` fail-closed，比照 #626 的部署決定型 principal。
+    source_repo_slugs: tuple[str, ...] = ()
     #: per-job 路徑的 segment；system unit 模板用 `%i`（systemd instance 名）。
     job_segment: str = PER_JOB_SEGMENT
 
@@ -1009,6 +1038,24 @@ class PathLayout:
     @property
     def skill_registry_root(self) -> str:
         return f"{self.agents_root}/registry"
+
+    @property
+    def repo_source_root(self) -> str:
+        """per-job clone 的**來源樹容器**（登記表資產 `repo-source-tree`，#623）。
+
+        每個受治理 repo 一格：`<此根>/<slug>`，是 **working checkout**（不是 bare）——
+        monitor 要掃工作樹裡的 `workstreams/*/todo.md`，bare 沒有工作樹；同一份 checkout
+        因此兼作 monitor 的掃描目標與 job 的 clone 來源。
+
+        掛在 `agents_root` 底下而不是部署樹（`/opt/cortex`）：它是**每個 instance 一份的
+        資料**（隨 instance 治理的 repo 走），不是隨版本走的部署產物；換 layout 時它跟著
+        durable state 樹搬，而不是跟著 venv 搬。
+        """
+        return f"{self.agents_root}/repos"
+
+    def source_repo_paths(self) -> tuple[str, ...]:
+        """已宣告的來源 repo 絕對路徑（`<repo_source_root>/<slug>`；未宣告即空）。"""
+        return tuple(f"{self.repo_source_root}/{slug}" for slug in self.source_repo_slugs)
 
     @property
     def run_root(self) -> str:
@@ -1075,6 +1122,14 @@ class PathLayout:
         """該帳號的 `~/.codex`。root-owned——job 不得替換自己的 hooks。"""
         return f"{self.home_of(account)}/.codex"
 
+    def gitconfig_of(self, account: str) -> str:
+        """該帳號的 `~/.gitconfig`。root-owned——job 不得替換自己的 git 設定（#623）。
+
+        git 只在 `$HOME/.gitconfig`（global scope，屬 git 的 *protected configuration*）
+        認 `safe.directory`，因此位置由帳號的 HOME 決定，與 `~/.codex` 同一個模式。
+        """
+        return f"{self.home_of(account)}/.gitconfig"
+
     @property
     def builder_home(self) -> str:
         return self.home_of(self.builder_account)
@@ -1084,16 +1139,23 @@ class PathLayout:
         return self.cache_of(self.builder_account)
 
     def with_job_segment(self, segment: str) -> "PathLayout":
-        """換掉 per-job segment（system unit 模板用 `%i`）。"""
-        return PathLayout(
-            agents_root=self.agents_root,
-            worktree_root=self.worktree_root,
-            deploy_root=self.deploy_root,
-            instance=self.instance,
-            home_root=self.home_root,
-            builder_account=self.builder_account,
-            job_segment=segment,
-        )
+        """換掉 per-job segment（system unit 模板用 `%i`）。
+
+        以 `dataclasses.replace` 而非逐欄位重建：欄位表只有一份，新增欄位不會在這裡
+        被靜默重設回預設值（那會讓 job layout 與 setup layout 指向不同的樹）。
+        """
+        return replace(self, job_segment=segment)
+
+    def with_source_repo_slugs(self, slugs: "tuple[str, ...] | list[str]") -> "PathLayout":
+        """回傳帶上來源 repo 宣告的新 layout（本體 frozen，不就地改）。
+
+        slug 會被逐字嵌進 root 產生的 `.gitconfig`，因此在**產生階段**就驗形狀，
+        不等到 operator 落檔（比照帳號名的 `_validate_account_name`）。
+        """
+        checked = tuple(str(s) for s in slugs)
+        for slug in checked:
+            _validate_repo_slug(slug)
+        return replace(self, source_repo_slugs=checked)
 
     # -- 資產→路徑 ----------------------------------------------------------
     def asset_paths(self) -> dict[str, str]:
@@ -1125,6 +1187,10 @@ class PathLayout:
             "control-done-queue": f"{ctl}/done",
             "control-status": f"{ctl}/status.json",
             "control-daemon-lock": f"{ctl}/manager.lock",
+            # #623：per-job clone 的來源樹（容器；每個受治理 repo 一格 <此根>/<slug>）。
+            "repo-source-tree": self.repo_source_root,
+            "builder-gitconfig": self.gitconfig_of(self.builder_account),
+            "reviewer-planner-gitconfig": self.gitconfig_of(self.reviewer_planner_account),
             "repo-worktree": job,
             "dispatch-worktree-pool": wt,
             "jobs-registry": f"{c}/jobs.json",
@@ -1777,6 +1843,15 @@ def build_manager_unit(
         "# 相對 log_dir（runtime/dispatch/<slice>）由此解析，必須落在 ReadWritePaths 內。",
         f"WorkingDirectory={layout.agents_root}",
         "",
+        "# --- per-job clone 的來源樹（登記表 repo-source-tree，#623）：本服務**唯讀** ---",
+        f"#   {layout.repo_source_root}/<slug>（root 擁有 0755，PSC_REPO_ROOT 指向它）。",
+        "# ProtectSystem=strict 下「唯讀」是預設，因此讀不需要任何額外指令；而下方",
+        "# ReadWritePaths **不含**它——來源樹的 writer 只有部署身分（root），更新來源樹是",
+        "# operator 的 root 動作。取捨：Manager 因此不能自己 `git fetch` 更新來源樹，換到的",
+        "# 是「Manager 被攻陷也改不了每個 job clone 的來源」——攻擊面最小的那一邊。",
+        "# 要改成 Manager 可更新，唯一的正當作法是把它登記為 Manager 的 writer 並重跑",
+        "# 產生器（RWP 會跟著出現），不是在這裡手加一條。",
+        "",
         "# EnvironmentFile 無 '-' 前綴＝fail-closed：檔案缺席即拒絕啟動，",
         "# MUST NOT 靜默落回 $HOME/.agents 預設（spec §R3 Scenario「刪除 EnvironmentFile」）。",
         f"EnvironmentFile={layout.env_file}",
@@ -1901,6 +1976,12 @@ def build_monitor_unit(
         "# 由 config 指定絕對路徑，這裡只要一個必然存在、不隨 operator HOME 漂移的 cwd。",
         f"WorkingDirectory={layout.agents_root}",
         "",
+        "# --- monitor 的掃描目標（登記表 repo-source-tree，#623）：**唯讀** ---",
+        f"#   {layout.repo_source_root}/<slug>——**working checkout**（不是 bare），因為",
+        "# monitor 掃的是工作樹裡的檔案（workstreams/*/todo.md…），bare 沒有工作樹。",
+        "# ProtectSystem=strict 下讀是預設允許的，故不需要任何指令；而下方 ReadWritePaths",
+        "# **不含**它——monitor 在登記表上不是它的 writer，掃描本來就只需要讀。",
+        "",
         "# EnvironmentFile 無 '-' 前綴＝fail-closed：檔案缺席即拒絕啟動，",
         "# MUST NOT 靜默落回 $HOME/.agents 預設。這正是 #622 的核心——舊 --user monitor",
         "# 的 PSC_MONITOR_STATE_ROOT 指著舊樹，起回來只會雙寫。與 Manager 共用同一份",
@@ -1998,6 +2079,13 @@ def build_job_unit(
         "# 這裡只給恆存在的 pool 根（0701＝可 traverse、不可列目錄），避免 unit 因",
         "# per-job 目錄尚未建立而在 exec 前就失敗（那會讓 log 裡沒有任何線索）。",
         f"WorkingDirectory={job_layout.worktree_root}",
+        "# --- clone 來源（登記表 repo-source-tree，#623）：對 job **唯讀** ---",
+        f"#   {job_layout.repo_source_root}/<slug> → `git clone --no-hardlinks` 到",
+        f"#   {job_layout.worktree_root}/%i（整個 clone 由本 job 帳號擁有，已在下方 RWP 內）。",
+        "# 來源樹**不在** ReadWritePaths：job 讀得到、寫不進去，共用 object store 那條",
+        "# 「builder 能寫 Manager 的樹」的路因此在 git 這一層就不存在。",
+        f"# 跨擁有者 clone 由 {job_layout.gitconfig_of(account)} 的 safe.directory 放行",
+        "# （root-owned、本帳號唯讀；登記表資產，內容同樣由 permgen 產生）。",
         "# shim 讀 spec 的唯一合法來源：這一行在 root-owned 的 unit 檔裡，",
         "# 因此持 spawn 授權的帳號也改不掉 spec 要從哪個目錄讀。shim 對未設此",
         "# 變數的情況 fail-closed（不猜、不落回 $HOME 推導的預設）。",
@@ -2120,6 +2208,151 @@ def build_job_shim(
         mode=0o755,
         owner=account,
         group=scheme.group_of(account),
+        content="\n".join(body) + "\n",
+    )
+
+
+# ---------------------------------------------------------------------------
+# job 帳號的 root-owned `.gitconfig`（per-job clone 的必要條件，#623）
+# ---------------------------------------------------------------------------
+
+#: 需要一份 root-owned `.gitconfig` 的 job persona → 登記表 asset_id。
+#: reviewer 與 planner 共用同一個帳號（三分定案），故共用同一份檔，由 REVIEWER 代表。
+JOB_GITCONFIG_ASSETS: Mapping[Principal, str] = {
+    Principal.BUILDER: "builder-gitconfig",
+    Principal.REVIEWER: "reviewer-planner-gitconfig",
+}
+
+#: `.gitconfig` 的 mode。**0644 而非 0600**：檔案 root 擁有、job 帳號要讀得到，
+#: 與 `codex-hooks`（同樣 root-owned、同樣落在 job HOME 下）逐位元相同。
+JOB_GITCONFIG_MODE = 0o644
+
+
+class UnresolvedSourceRepoError(ValueError):
+    """layout 沒宣告任何來源 repo——`.gitconfig` 產不出有用的 `safe.directory`（#623）。
+
+    fail-closed 而不是輸出一份空的 `[safe]` 段：空的檔案照樣裝得起來、服務照樣起得來，
+    然後**每一個 job 在第一次 `git clone` 時失敗**（`fatal: detected dubious ownership`），
+    而症狀出現的位置離原因很遠——正是 #623 要消滅的那一類缺口。
+    """
+
+    def __init__(self, layout_hint: str) -> None:
+        super().__init__(
+            "permgen 拒絕產生 .gitconfig：layout 未宣告任何來源 repo slug。\n"
+            f"來源樹容器：{layout_hint}\n"
+            "  指定：--source-repo <slug>（可重複）  或  env PSC_SOURCE_REPO_SLUGS=<slug>[,<slug>…]\n"
+            "\n"
+            "為何不能省略、也不能用萬用字元：git 的 `safe.directory` 只認**逐字相等**的\n"
+            "路徑或字面 `*`（實測 git 2.43：`<repos>/*` 仍被拒），而字面 `*` 等於對這個\n"
+            "帳號整個關掉 dubious-ownership 保護——那是 opt-out，不是授權。\n"
+            "slug 即來源樹底下的目錄名：`<repo_source_root>/<slug>`（例如 repo 的名字）。"
+        )
+
+
+@dataclass(frozen=True)
+class GitConfigFile:
+    """產生出來的 `.gitconfig`：**只有內容字串與結構化欄位**，本模組不寫任何路徑。"""
+
+    install_path: str
+    #: 讀這個檔的 job 帳號（`$HOME` 就是它的 HOME）。
+    account: str
+    owner: str
+    group: str
+    mode: int
+    #: 被授信的來源 repo 絕對路徑（逐字寫進 `safe.directory`）。
+    safe_directories: tuple[str, ...]
+    content: str
+
+    @property
+    def mode_str(self) -> str:
+        return format(self.mode, "04o")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "install_path": self.install_path,
+            "account": self.account,
+            "owner": self.owner,
+            "group": self.group,
+            "mode": self.mode_str,
+            "safe_directories": list(self.safe_directories),
+            "content": self.content,
+        }
+
+    def commands(self) -> list[str]:
+        """安裝命令字串（**只回傳字串，不執行**）。"""
+        return [
+            f"chown {self.owner}:{self.group} {self.install_path}",
+            f"chmod {self.mode_str} {self.install_path}",
+        ]
+
+
+def build_job_gitconfig(
+    scheme: UidScheme = DEFAULT_SCHEME,
+    layout: PathLayout = DEFAULT_LAYOUT,
+    principal: Principal = Principal.BUILDER,
+) -> GitConfigFile:
+    """產生 job 帳號 HOME 下那份 root-owned `.gitconfig` 的內容（#623）。
+
+    ## 為什麼這個檔是必要的
+
+    #623 裁決把 job 工作區從 `git worktree` 改成 **per-job 完整 clone**（實測：共用
+    git object store 與三分隔離互斥——builder 要 commit 就得能寫 object store）。
+    clone 的來源樹屬 root（登記表資產 `repo-source-tree`），job 帳號跨擁有者 clone 會
+    被 git 的 dubious-ownership 保護擋下：
+
+        fatal: detected dubious ownership in repository at '<來源樹>/<slug>'
+
+    唯一的解是 `safe.directory`，而它**必須由 root 放進 job 的 HOME**——job 的 HOME 是
+    root-owned，它自己放不了這個檔。這正是登記表既有的 `codex-hooks`
+    （root-owned、在 job 帳號 HOME 下）同一個模式，不需要新概念。
+
+    ## 為什麼逐個列出來源 repo，而不是 `<repos>/*` 或 `*`
+
+    - git 的 `safe.directory` **不支援目錄萬用字元**（實測 git 2.43：值寫成
+      `<repos>/*` 時 clone 仍被拒），只認逐字相等的路徑或字面 `*`；
+    - 字面 `*` 等於對這個帳號整個關掉該保護——那是 opt-out，不是授權，且會讓「這個
+      帳號被授信的來源有哪些」這件事在檔案裡完全看不出來。
+
+    因此來源 repo 清單是**部署決定**，由 `layout.source_repo_slugs` 於產生當下注入
+    （比照 #626 的部署決定型 principal），未宣告即 :class:`UnresolvedSourceRepoError`。
+    """
+    account = scheme.resolve(principal)
+    if account is None:
+        raise ValueError(f"principal 未映射到帳號: {principal}")
+    safe_dirs = layout.source_repo_paths()
+    if not safe_dirs:
+        raise UnresolvedSourceRepoError(layout.repo_source_root)
+    install_path = layout.gitconfig_of(account)
+    asset_id = JOB_GITCONFIG_ASSETS.get(principal, "builder-gitconfig")
+    flag = "--builder" if principal is Principal.BUILDER else "--reviewer-planner"
+    slug_args = " ".join(f"--source-repo {slug}" for slug in layout.source_repo_slugs)
+    body = [
+        f"# {install_path}",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root gitconfig {scheme.scheme_id} "
+        f"{flag} {slug_args}",
+        "#",
+        f"# 登記表資產 `{asset_id}`：root 擁有、mode "
+        f"{format(JOB_GITCONFIG_MODE, '04o')}、{account} **唯讀**。",
+        "# HOME 本身也是 root-owned，因此 job 既改不了這個檔，也放不了自己的版本。",
+        "#",
+        "# 為什麼需要它：#623 把 job 工作區從 git worktree 改為 per-job 完整 clone；",
+        "# 來源樹屬 root，跨擁有者 clone 會被 git 的 dubious-ownership 保護擋下",
+        "# （fatal: detected dubious ownership in repository at ...）。",
+        "#",
+        "# 為什麼逐個列出而不是萬用字元：git 的 safe.directory 只認逐字相等的路徑或",
+        "# 字面 `*`（實測 git 2.43：`<repos>/*` 仍被拒），而字面 `*` 等於對這個帳號",
+        "# 整個關掉該保護——那是 opt-out，不是授權。",
+        "[safe]",
+    ]
+    body += [f"\tdirectory = {path}" for path in safe_dirs]
+    return GitConfigFile(
+        install_path=install_path,
+        account=account,
+        owner=scheme.deploy_account,
+        group=scheme.group_of(scheme.deploy_account),
+        mode=JOB_GITCONFIG_MODE,
+        safe_directories=safe_dirs,
         content="\n".join(body) + "\n",
     )
 

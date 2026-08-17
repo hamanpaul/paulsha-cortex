@@ -407,6 +407,30 @@ state，證明清單漂移速度快於人工複核週期。
 - **WHEN** 同一個 durable 資產在兩處以字面量重複推導路徑
 - **THEN** 登記表一致性測試 MUST FAIL
 
+#### repo 源碼樹的放置（#623 裁決；登記表資產 `repo-source-tree`）
+
+Phase 2b 的登記表原本定義了 durable state 樹與部署樹，**沒有定義 repo 源碼樹該放
+哪**——實機因此撞到「`ProtectHome=yes` 讓 `/home` 完全不可見 ⇒ Manager 看不到自己的
+repo」。裁決前先排除了一條看似最省事的路：**`git worktree` 在三分下不成立**。實測
+（#623）：worktree 的 `.git` 是指向**共用 object store** 的指標，builder 只要 `git add`
+就必須能寫該 store，而 store 在 Manager-owned 樹內——「builder 能 commit」與「三分
+隔離」互斥，不是權限沒調好。
+
+因此裁決為 **per-job 完整 clone**（實測 0.5 秒／35MB per job），登記表新增：
+
+- `repo-source-tree`：`<agents_root>/repos/<slug>`，**working checkout**（不是 bare——
+  monitor 掃的是工作樹裡的檔案）。同時是 monitor 的掃描目標與每個 job 的 clone 來源。
+  **writer 只有部署身分（root）**：來源樹由 operator 以 root 更新，Manager／monitor／
+  兩個 job 帳號**一律唯讀**。這條不是風格選擇——ReadWritePaths 由登記表純以「誰可寫」
+  機械導出，owner＝Manager 會讓 Manager unit 自動取得寫入權，「Manager 唯讀」與
+  「owner＝Manager」在產生器裡互斥，取前者（攻擊面最小：Manager 被攻陷也改不了每個
+  job clone 的來源）。
+- `builder-gitconfig`／`reviewer-planner-gitconfig`：job 帳號 HOME 下的 **root-owned**
+  `.gitconfig`（0644），內容含來源 repo 的 `safe.directory`。跨擁有者 clone 會被 git 的
+  dubious-ownership 保護擋下，而 job 的 HOME 是 root-owned、它自己放不了這個檔——與
+  既有的 `codex-hooks`（root-owned、在 job 帳號 HOME 下）同一個模式，不是新概念。
+  內容 SHALL 由權限產生器產生（比照 shim／polkit），MUST NOT 手寫。
+
 ### R2 所有 Tier-0／Tier-1 durable state 與 mutation ingress MUST 位於不受信任 headless persona 不可寫的 OS 邊界內
 
 系統 SHALL 使 builder／reviewer／planner 對登記表中 tier 0 與 1 的全部路徑

@@ -8,6 +8,29 @@
 ## [Unreleased]
 
 ### Added
+- **#623 / trust-root Phase 2b：per-job clone 的信任根層——`repo-source-tree` ＋ 兩份
+  root-owned `.gitconfig` 進登記表，內容由 permgen 產生**——M1 之後實機發現「這個部署
+  做不了真實工作」：`ProtectHome=yes` 讓 `/home` 完全不可見，而登記表**沒有定義 repo
+  源碼樹該放哪**；實測進一步證明 `git worktree` 在三分下結構性不成立（worktree 的
+  `.git` 指向**共用 object store**，builder 只要 `git add` 就必須能寫它，「builder 能
+  commit」與「三分隔離」互斥）。裁決改為 **per-job 完整 clone**（0.5 秒／35MB per job）。
+  本 PR 落地信任根層：新增登記表資產 `repo-source-tree`（`<agents_root>/repos`，
+  **working checkout**——monitor 要掃工作樹裡的檔案，bare 沒有工作樹；同一份 checkout
+  兼作掃描目標與 clone 來源）與 `builder-gitconfig`／`reviewer-planner-gitconfig`
+  （root-owned 0644，落在各自 job 帳號 HOME 下，比照既有的 `codex-hooks`）。
+  來源樹的 **writer 只有部署身分（root）**，owner_class 因此機械分到 `DEPLOYMENT`、
+  owner＝root 0755，**Manager／monitor／兩個 job 帳號一律唯讀**——ReadWritePaths 純由
+  「誰可寫」導出，owner＝`cortex-manager` 會讓 Manager unit 自動拿到寫入權，
+  「Manager 唯讀」與「owner＝Manager」互斥，取前者（攻擊面最小；代價是更新來源樹改為
+  operator 的 root 動作）。`.gitconfig` 的**內容**同樣由 permgen 產生
+  （`build_job_gitconfig()` ＋ CLI `trust_root gitconfig … --source-repo <slug>`），含
+  來源 repo 的 `safe.directory`——跨擁有者 clone 會被 git 的 dubious-ownership 保護擋
+  下，而 job 的 HOME 是 root-owned、它自己放不了這個檔；來源 repo 清單是部署決定
+  （比照 #626），未宣告即 fail-closed（git 的 `safe.directory` 只認逐字相等的路徑或
+  字面 `*`，實測 git 2.43 不吃 `<repos>/*`，而字面 `*` 等於整個關掉該保護）。三份 unit
+  的 `ReadWritePaths` 逐位元不變，monitor 對 Manager 的真子集不變式（#622）仍成立。
+  新增 `tests/test_trust_root_repo_source_tree_623.py`（45 測試）；runbook 補第 2c 步、
+  spec §R1 補裁決段。詳見 `changelog.d/repo-source-tree-assets.md`。
 - **#622 / trust-root Phase 2b：`trust_root unit three-way --monitor`——monitor 的
   system-level unit，同帳號、同加固段，可寫面嚴格窄於 Manager**——M1 之後 permgen
   只產生 Manager unit，實機切換後 instance **完全沒有 monitor**：舊 `--user` unit 以
