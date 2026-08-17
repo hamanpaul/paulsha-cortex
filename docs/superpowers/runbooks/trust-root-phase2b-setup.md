@@ -311,6 +311,18 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   第一次被真正驗到：檔案 owner 是 reviewer／Manager 讀得到／builder 零權限／
   seal 後 reviewer 改不動，含 negative control）
   → **54** 個 sudo 點、**205** 個驗證點。
+- **#633（env 展開慣用法 ＋ ACL 結構變更）新增**：第 4b 的 EnvironmentFile 模板補上
+  操作變數（`PSC_REPO_ROOT`／`PSC_REPO_IDENTITY`／`PSC_MANAGER_EXECUTOR`／
+  `PSC_GATE_CMD_PYTEST`／`PSC_GATE_TIMEOUT`／兩個 interval）**且全部加引號**，並補一條
+  「這份 env 檔 shell 也 source 得動」的驗證；全文 **10 處** `env $(… | xargs)` 改為
+  `sh -c 'set -a; . <envfile>; set +a; …'`（前者依空白切詞，會把
+  `PSC_GATE_CMD_PYTEST="python3 -m pytest -q"` 拆成多個參數 → `env: ‘-m’: …` rc=127；
+  systemd 自己沒事，壞的只有驗證指令）；第 7b 補 **F2b**（`paths.repo_root()` 真的指向
+  來源樹——#633 之後 repo 解析是 lazy 的，`is-active` 全綠**不代表**派得了工）；
+  第 2b 補「升級既有部署重跑也要守 scaffold→permissions 順序」的警語；5-3a 補「改 ACL
+  結構時舊的 default ACL 會靜默繼承」的警語 ＋ `setfacl -k <容器>` 步驟 ＋ 一條機械
+  判準（每格具名條目 `foreign=0`、`#effective:` 註記為 0）
+  → **55** 個 sudo 點、**208** 個驗證點。
 
 ---
 
@@ -347,6 +359,8 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 > `setfacl` 條目，`sh -e` 下會中止整份權限 script、留下半套的樹（第 2a 稽核 6）；
 > **#623**——monitor unit 起得來但 job 跑不完（`ProtectHome=yes` 讓 repo 不可達、
 > EnvironmentFile 缺八個操作變數），因此 **4d 裝好但不得啟動**（見第 4d 步）。
+> **（#633 已補：第 4b 的模板現在含那八個操作變數且值一律加引號；缺 `PSC_REPO_ROOT`
+> 也不再讓 Manager 啟動即崩——repo 解析改 lazy，只是派不了工。）**
 
 ---
 
@@ -745,6 +759,26 @@ echo "exit=${PIPESTATUS[0]}"     # 期望 0
 > `/var/lib/cortex/runtime`、三個 HOME 以 root 身分就位，權限 script 之後只會補
 > 葉節點，不會把 root-owned 父層蓋成服務帳號所有。
 
+> ### ⚠️ 升級既有部署時**重跑也要守同一個順序**（0817 實機，#633）
+>
+> 上面那條理由是針對「全新安裝」寫的，但它在**重跑**時同樣成立，而且後果更難查——
+> 樹已經存在，兩份 script 都不會報錯，只是把權限靜默地弄成錯的：
+>
+> * **scaffold 在後**：`install -d -m <mode>` 對**既存**目錄不是 no-op，它會把 mode
+>   重設回骨架宣告的那一組，蓋掉權限 script 剛套好的值。
+> * **`chmod` 重寫 ACL mask**：而 scaffold 的 mode 重設就是一次 `chmod`。於是權限
+>   script 剛放上去的具名條目全部變成 `#effective:---`——**ACL 還在**、`getfacl`
+>   逐條看得到、實際權限是零。這正是 5-3a「mask 陷阱」的同一個成因，只是觸發點從
+>   「手動補 ACL」換成「兩份 script 跑反了」。
+>
+> **因此**：任何一次重跑（升級、改登記表、改 ACL 結構）都是
+> `p2b-scaffold.sh` → `p2b-permissions.sh`，**不可只跑其中一份、也不可調換順序**。
+> 只跑 permissions 會漏掉新增的目錄；只跑 scaffold 會把既有 ACL 的 mask 打掉。
+>
+> **驗收判準與 5-3a 一致**：看 `mask::` 與 `#effective:`，**不是**「有沒有那條 ACL」。
+> 重跑後至少複驗一次下面「兩個 append-only 出口的 ACL 已就位」與「父目錄 traverse」
+> 兩組，以及 5-3a 的 per-principal 那一組。
+
 ```bash
 # ✅ 驗證：樹根 root 擁有、Manager-owned 子樹 cortex-manager 0700、無 g+w／o+w
 ls -ld /var/lib/cortex /opt/cortex
@@ -1086,8 +1120,11 @@ for f in /var/lib/cortex/config/paulsha/*.yaml; do
 done
 
 # ✅ 驗證（功能面）：設定真的被載入——這條是 3a-2 的**存在理由**
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/cortex monitor --once 2>&1 | head -20
+#   展開 env 用 source 而非 `env $(… | xargs)`（#633：後者會拆壞含空格的值）。
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/cortex monitor --once
+' 2>&1 | head -20
 #   期望：**不得**出現
 #     `錯誤: 無 project 設定：manual（project-cortex.yaml / legacy）與 project-hippo.yaml 皆不存在`
 #   出現這行 ⇒ 設定沒搬到／檔名不符／路徑被寫死指回舊樹，回上面重做。
@@ -1270,20 +1307,48 @@ root-owned 檔案**——把 env 檔放進去等於沒保護。
 ```bash
 # 🔧 sudo：寫 EnvironmentFile（instance-scoped，修掉背景 §7 的多 instance 共用漏洞）
 sudo tee /opt/cortex/etc/cortex-manager.env >/dev/null <<'ENVFILE'
-PSC_INSTANCE=cortex
-PSC_AGENTS_ROOT=/var/lib/cortex
-PSC_CONTROL_ROOT=/var/lib/cortex/control
-PSC_COORDINATOR_ROOT=/var/lib/cortex/coordinator
-PSC_SPECS_ROOT=/var/lib/cortex/specs
-PSC_MONITOR_STATE_ROOT=/var/lib/cortex/monitor
-PSC_PROJECT_CONFIG_ROOT=/var/lib/cortex/config/paulsha
-PSC_RUN_ROOT=/var/lib/cortex/run/cortex
-PSC_WORKTREE_ROOT=/var/lib/cortex/worktree
-PSC_DEGRADED_OPERATION=per-case-approval
+PSC_INSTANCE="cortex"
+PSC_AGENTS_ROOT="/var/lib/cortex"
+PSC_CONTROL_ROOT="/var/lib/cortex/control"
+PSC_COORDINATOR_ROOT="/var/lib/cortex/coordinator"
+PSC_SPECS_ROOT="/var/lib/cortex/specs"
+PSC_MONITOR_STATE_ROOT="/var/lib/cortex/monitor"
+PSC_PROJECT_CONFIG_ROOT="/var/lib/cortex/config/paulsha"
+PSC_RUN_ROOT="/var/lib/cortex/run/cortex"
+PSC_WORKTREE_ROOT="/var/lib/cortex/worktree"
+PSC_DEGRADED_OPERATION="per-case-approval"
+# --- 操作變數（#623 缺口 2／#633）：少了這一段，服務起得來但**做不了事** ---
+# 目標 repo。第 2c 步建立的來源樹，**不是** operator 的 checkout。
+PSC_REPO_ROOT="/var/lib/cortex/repos/paulsha-cortex"
+PSC_REPO_IDENTITY="hamanpaul/paulsha-cortex"
+PSC_MANAGER_EXECUTOR="codex"
+PSC_MANAGER_INTERVAL_SECONDS="60"
+PSC_MANAGER_GITHUB_INTERVAL_MS="600000"
+# gate 命令是**命令列**，天生含空格 ⇒ 這一族就是「值含空格」的常態，不是邊角案例。
+PSC_GATE_CMD_PYTEST="python3 -m pytest -q"
+PSC_GATE_TIMEOUT="900"
 ENVFILE
 sudo chown root:root /opt/cortex/etc/cortex-manager.env
 sudo chmod 0644 /opt/cortex/etc/cortex-manager.env
 ```
+
+> **⚠️ 值一律加引號，而 `PSC_PREFLIGHT_CMD` 刻意留白**（#633）。
+>
+> **加引號**：systemd 的 `EnvironmentFile` 把 `=` 之後整段當值，加不加引號它都對
+> （加了會剝掉）。加引號是為了**讀這個檔的另外兩種方式**——`sh` 的 `.`（source）
+> 與下面各節的驗證指令。`PSC_GATE_CMD_PYTEST=python3 -m pytest -q` 未加引號時
+> `. <envfile>` 會把 `-m` 當成命令執行（`sh: -m: not found`）。一份三邊都讀得對的
+> 檔案比「只有 systemd 讀得對」便宜太多，所以整份統一加。
+>
+> **`PSC_PREFLIGHT_CMD` 未列**：舊值 `~/.local/bin/cortex-preflight-ci` 在
+> `ProtectHome=yes` 下不可達，搬到哪裡是 #623 的部署樹問題，未決之前刻意留白而不是
+> 填一個跑不起來的值。
+>
+> **`PSC_REPO_ROOT` 未宣告時的行為（#633）**：Manager **起得來**——`ScriptWorktreeCreator`
+> 的 repo 解析自 #633 起是 lazy 的，因此缺這個變數只讓「派不了工」，不再讓 daemon
+> 啟動即崩、被 `Restart=on-failure` 推進 crash-loop（#630 落地當下的實機症狀：
+> `NRestarts` 連跳 7 次）。fail-closed 沒有放寬，只是挪到派工當下：第一次 dispatch
+> 會拿到 `PSC_REPO_ROOT 未宣告，拒絕退回 cwd（#612）` 這條可操作的訊息。
 
 ```bash
 # ✅ 驗證：owner/mode 與 permgen 的 deployment 區塊一致
@@ -1292,12 +1357,30 @@ python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
 ls -l /opt/cortex/etc/cortex-manager.env
 #   期望：-rw-r--r-- root root
 
+# ✅ 驗證：這份 env 檔 shell 也 source 得動（含空格的值不會炸）
+sh -c 'set -a; . /opt/cortex/etc/cortex-manager.env; set +a; echo "[$PSC_GATE_CMD_PYTEST]"'
+#   期望：`[python3 -m pytest -q]`（**一個**值，含空格）。
+#   ⛔ `sh: -m: not found` ⇒ 某一行的值沒加引號，回上面補。
+
 # ✅ 驗證：env 生效後路徑解析全部落在受保護樹內
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/python -c \
-  "from paulsha_cortex.config import paths; print(paths.agents_root(), paths.control_root(), paths.coordinator_root())"
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/python -c "from paulsha_cortex.config import paths; print(paths.agents_root(), paths.control_root(), paths.coordinator_root())"
+'
 #   期望：三者都在 /var/lib/cortex 底下
 ```
+
+> **⚠️ 展開 env 檔一律用 `sh -c 'set -a; . <envfile>; set +a; …'`，不要用
+> `env $(grep -v '^#' <envfile> | xargs)`**（#633，本 runbook 原有 10 處已全部改掉）。
+> `$(… | xargs)` 依**空白**切詞，於是任何值含空格的變數都會被拆成多個參數：補上
+> `PSC_GATE_CMD_PYTEST` 之後，實機那 10 條驗證指令全數變成
+>
+> ```
+> env: ‘-m’: No such file or directory        ← rc=127
+> ```
+>
+> 而**systemd 自己完全沒事**——壞的只有驗證指令。這種錯最貴的地方在於它讓
+> operator 以為是部署壞了，回頭去改一份其實正確的 env 檔。
 
 > **為何 unit 的 `EnvironmentFile` 一定生效**：`config/runtime.py` 的
 > `resolve_runtime_root()` **先看行程 env**，其次才看 `$HOME/.agents/core/runtime/`
@@ -1380,6 +1463,12 @@ sudo rm /etc/systemd/system/cortex-manager.service; sudo systemctl daemon-reload
 > 路徑不可達；EnvironmentFile 缺八個操作變數（含 `PSC_GATE_CMD_PYTEST`）。
 > 後果是**燒模型額度、產生 needs_human 噪音、留下半死的 run 狀態**——
 > 全部發生在「看起來裝好了」之後，而且沒有任何一條 M1 的結構性驗收會變紅。
+>
+> **#633 補充**：第 4b 的模板已含那八個操作變數（值一律加引號）。**但這個 gate 仍然
+> 成立**，而且理由更需要寫清楚：#633 之後 repo 解析是 lazy 的，缺 `PSC_REPO_ROOT`
+> 只讓「派不了工」而不是「Manager 起不來」——因此 `systemctl is-active` 全綠、自檢
+> `ok=true`，**看起來完全正常**。判準是第 7b 的 **F2b**（`paths.repo_root()` 印得出
+> 來源樹），不是服務狀態。
 >
 > **本步的正確終態**：unit 已落檔、與產生器逐位元相同、`systemctl show` 的身分與
 > 加固段全部驗過，而服務保持 **`disabled` ／ `inactive`**。
@@ -2194,8 +2283,40 @@ ls -l /opt/cortex/bin/cortex-job-shim
 **手動補過 ACL 之後又 `chmod` 過的機器會踩到**。判準一律看 `mask::` 與
 `#effective:`。
 
+> ### ⚠️ 改變 ACL **結構**時：舊的 default ACL 會靜默地跟著新物件走（0817 實機）
+>
+> **這是升級既有部署才會踩到的，全新安裝不會。** default ACL（`default:` 那幾條）
+> 的作用對象是**容器底下之後新建的每一個物件**。因此當一個容器的授權結構被改掉——
+> 從「一格、只授某一個 principal」變成「per-principal 多格」——**舊的那條 default 會
+> 原封不動地繼承進每一個新建的子目錄**，而它正是新結構要防的東西。
+>
+> **實機案例**：`job-specs` 原本是 builder 專用，容器上帶著
+> `default:user:cortex-builder:r-x`。#657（PR #660）把它改成 per-principal 三格之後，
+> 新建的 `builder`／`reviewer`／`gate` **三格全部繼承了那一條**——於是 builder 一開始
+> 就讀得到 reviewer 與 gate 的格，而「跨 principal 讀不到彼此的 spec」正是 #657 選
+> per-principal 買到的**唯一**那條性質。三格的 `getfacl` 看起來都很正常（自己那條在、
+> mask 也對），多出來的那條混在裡面不顯眼。
+>
+> **處置**：改結構時，先 `setfacl -k <容器>` 清掉**容器層**過時的 default ACL，再重跑
+> 權限計畫讓產生器把正確的那組放回去。`-k` 只動 default ACL，不動 access ACL，因此
+> 容器自己的 traverse 授權不受影響。順序是「先清、後跑」——反過來會把剛套好的
+> default 一起清掉。
+>
+> **驗收判準同 mask 陷阱**：不是「有沒有那條 ACL」，而是**每一格的具名條目集合恰好
+> 只有自己那一條**，且 `mask::` 與 `#effective:` 都對。下面「effective——每格只授
+> 自己」那一條的 `**無其他 principal 的條目**` 就是為此存在，不要跳過。
+
 ```bash
+# 🔧 sudo：清掉容器層過時的 default ACL（#633：改 ACL 結構的必要步驟）
+#   `-k` 只刪 default ACL，access ACL（容器自己的 --x traverse）不受影響。
+#   全新安裝時這條是 no-op；**升級既有部署時不做，三格會繼承舊的那條 default**。
+sudo getfacl -p /var/lib/cortex/coordinator/job-specs | grep '^default:' || echo "(無 default ACL)"
+#   ← 先看清楚要清掉什麼。出現 `default:user:cortex-builder:r-x` 就是舊結構的殘留。
+sudo setfacl -k /var/lib/cortex/coordinator/job-specs
+
 # 🔧 sudo：重跑權限計畫（#657 之後 spool 從一格變四格，必須重跑）
+#   ⚠️ 順序：scaffold 先、permissions 後（同第 2b 步）。這條在**升級既有部署**時
+#      同樣成立——理由見 2b「為何要先 scaffold」。
 python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
   --operator-account "$(id -un)" --external-reader-account none > /tmp/perm-657.sh
 less /tmp/perm-657.sh          # 先讀過，這份會以 `sh -e` 整份執行
@@ -2221,6 +2342,21 @@ done
 #         `mask::r-x` ＋ `default:mask::r-x`，**無 `#effective:` 註記**、
 #         **無其他 principal 的條目**。
 #   看到 `#effective:---` ⇒ mask 被 chmod 打掉了，重跑上面那份 script。
+
+# ✅ 機械判準（#633）：每格的具名條目**恰好只有自己**，且沒有任何 `#effective:`
+#    ——這條抓的是「舊 default ACL 被繼承進新格」，肉眼掃 getfacl 會漏掉。
+for PAIR in builder:cortex-builder reviewer:cortex-reviewer-planner gate:cortex-gate; do
+  P="${PAIR%%:*}"; A="${PAIR##*:}"
+  FOREIGN=$(sudo getfacl -p "/var/lib/cortex/coordinator/job-specs/$P" \
+    | grep -E "^(default:)?user:[a-z]" | grep -cv ":$A:")
+  EFF=$(sudo getfacl -p "/var/lib/cortex/coordinator/job-specs/$P" | grep -c "#effective:")
+  echo "$P foreign=$FOREIGN effective_notes=$EFF"
+done
+#   期望：三行都是 `foreign=0 effective_notes=0`。
+#   ⛔ `foreign>0` ⇒ 舊結構的 default ACL 被繼承進來了（見上面的警語）：
+#      `sudo setfacl -k <容器>` 之後把三格砍掉重跑權限計畫。
+#      **不要**只 `setfacl -x` 掉那一條——容器的 default 還在，下次新建照樣復發。
+#   ⛔ `effective_notes>0` ⇒ mask 陷阱，重跑上面那份 script。
 
 # ✅✅ **正向實測：每個身分讀得到自己的 spec**（本節的核心，不可以只驗檔案存在）
 for PAIR in builder:cortex-builder reviewer:cortex-reviewer-planner gate:cortex-gate; do
@@ -2360,8 +2496,11 @@ ENVFILE
 sudo systemctl restart cortex-manager.service
 
 # ✅ 驗證（#615）：兩個角色各自解析到自己的帳號與模板，**不會互相污染**
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/python - <<'PY'
+#   `sh -c` 的腳本來自 argv，stdin 原樣留給下面的 heredoc（`python -` 讀得到）。
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/python -
+' <<'PY'
 import os
 from paulsha_cortex.coordinator import job_runner as jr
 for role in jr.JOB_ROLES:
@@ -2384,9 +2523,10 @@ sudo -u cortex-gate /opt/cortex/venv/bin/python3 -c \
 #      症狀會是每張 build 卡都停在 gate-spool-empty（空輸出型失敗，最難查）。
 
 # ✅ 驗證：模式確實被解析成 template（值非法必須 fail-closed，不得靜默當成 direct）
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/python -c \
-  "import os; from paulsha_cortex.coordinator import job_runner; print(job_runner.resolve_runner_mode(os.environ))"
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/python -c "import os; from paulsha_cortex.coordinator import job_runner; print(job_runner.resolve_runner_mode(os.environ))"
+'
 #   期望：systemd-template
 ```
 
@@ -2714,9 +2854,11 @@ sudo systemctl restart polkit.service 2>/dev/null || sudo systemctl restart polk
 
 #     (12a) PSC_JOB_TEMPLATE_UNIT 不接受已帶剖面後綴的值
 #           （接受的話，operator 一行 config 就能把**所有** job 推到寬鬆剖面）
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  PSC_JOB_TEMPLATE_UNIT=cortex-job-jit@.service \
-  /opt/cortex/venv/bin/python -c '
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+export PSC_JOB_TEMPLATE_UNIT=cortex-job-jit@.service
+exec /opt/cortex/venv/bin/python -
+' <<'PY'
 import os, sys
 from paulsha_cortex.coordinator import job_runner as j
 try:
@@ -2724,7 +2866,8 @@ try:
 except j.JobRunnerError as exc:
     print("refused:", exc.diagnostic.reason); sys.exit(0)
 sys.exit(1)
-'; echo "(12a) exit=$?"
+PY
+echo "(12a) exit=$?"
 #   期望：exit=0，印出 refused: job-runner-template-unit-invalid
 
 #     (12b) 未登記的 executor fail-closed
@@ -2959,9 +3102,10 @@ sudo -u cortex-manager systemd-run --uid=0 --pipe --wait /bin/id; echo "exit=$?"
 
 ```bash
 # ✅ 以 cortex-manager（Manager 身分）跑自檢——Manager-owned 樹應無 job-writable
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/python -m paulsha_cortex.trust_root selfcheck \
-  | tee "/tmp/trust-root-after-$(date +%Y%m%d-%H%M).json"
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/python -m paulsha_cortex.trust_root selfcheck
+' | tee "/tmp/trust-root-after-$(date +%Y%m%d-%H%M).json"
 #   期望：JSON 的 "ok": true、"job_writable_count": 0
 #   M1 實測：`job_writable_count` 由 baseline 的 **5** 收斂為 **0**、`remaining` 為空。
 
@@ -2995,18 +3139,34 @@ python3 -m paulsha_cortex.trust_root equation
 
 ```bash
 # ✅ F1（最便宜）：monitor 載得到自己的設定——第 3a-2 的守門條款
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/cortex monitor --once 2>&1 | head -20
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/cortex monitor --once
+' 2>&1 | head -20
 #   期望：正常跑完一輪。
 #   ⛔ 出現 `錯誤: 無 project 設定：…皆不存在` ⇒ 第 3a-2 沒做或做錯，回去補。
 #   這條**兩秒鐘**，卻是 M1 唯一漏掉的那一類缺口的最短偵測路徑。
 
 # ✅ F2：Manager 的 porcelain 在新樹上答得出話（路徑契約真的解析得到）
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/cortex status 2>&1 | head -20
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/cortex jobs 2>&1 | head -10
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/cortex status
+' 2>&1 | head -20
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/cortex jobs
+' 2>&1 | head -10
 #   期望：兩者都正常輸出（新樹為空是合理的，**報錯不是**）。
+
+# ✅ F2b（#633）：目標 repo 真的被宣告，且指向**來源樹**而不是 operator 的 checkout
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/python -c "from paulsha_cortex.config import paths; print(paths.repo_root())"
+'
+#   期望：印出 /var/lib/cortex/repos/<slug>（第 2c 步建立的來源樹）。
+#   ⛔ `RepoRootUnresolvedError: PSC_REPO_ROOT 未宣告…` ⇒ 第 4b 的操作變數那段沒補。
+#      **服務本身仍是 active 的**（#633 之後 repo 解析是 lazy 的），所以
+#      `systemctl is-active` 全綠**不代表**派得了工——這條才是判準。
 
 # ⏳ F3（最重，但這才是「能用」的定義）：真實 intake 一案並跑到 terminal
 #   ⛔ **#623 關閉前不要做**——job 現在必然失敗（ProtectHome 讓 repo 不可達、
@@ -3641,8 +3801,10 @@ sudo grep -o "uid=[0-9]*(cortex-builder)" /var/lib/cortex/worktree/negctl5/negct
 sudo systemctl restart cortex-manager.service
 sleep 3
 systemctl is-active cortex-manager.service
-sudo -u cortex-manager env $(grep -v '^#' /opt/cortex/etc/cortex-manager.env | xargs) \
-  /opt/cortex/venv/bin/python -m paulsha_cortex.trust_root selfcheck | head -20
+sudo -u cortex-manager sh -c '
+set -a; . /opt/cortex/etc/cortex-manager.env; set +a
+exec /opt/cortex/venv/bin/python -m paulsha_cortex.trust_root selfcheck
+' | head -20
 #   期望：服務 active、自檢仍 ok=true（族 3／5 的攻擊沒有留下任何持久效果）
 ```
 

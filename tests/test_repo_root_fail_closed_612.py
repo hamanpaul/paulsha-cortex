@@ -245,9 +245,17 @@ def test_default_git_runner_fails_closed_without_declared_repo_root(cwd_repo: Pa
 
 
 def test_worktree_creator_fails_closed_without_declared_repo_root(cwd_repo: Path) -> None:
-    """worktree 建立是**寫入**動作，落在錯的 repo 就是事故而不只是誤讀。"""
+    """worktree 建立是**寫入**動作，落在錯的 repo 就是事故而不只是誤讀。
+
+    #633 只改**時機**：解析從建構子搬到第一次真正要用時。本條因此改為釘死
+    `create()`（＝真的要在磁碟上開一棵樹）仍然 `RepoRootUnresolvedError`，
+    「建構子不拋」由 `tests/test_lazy_repo_root_633.py` 另行釘死。
+    """
+    creator = seams.ScriptWorktreeCreator()
     with pytest.raises(paths.RepoRootUnresolvedError):
-        seams.ScriptWorktreeCreator()
+        creator.create("feature/whatever", job_id="job-1")
+    # 一棵樹都不該被開出來：cwd repo 底下不得多出任何 worktree pool。
+    assert not (cwd_repo.parent / f"{cwd_repo.name}-worktrees").exists()
 
 
 def test_trusted_repo_root_resolution_does_not_fall_back_to_cwd(cwd_repo: Path) -> None:

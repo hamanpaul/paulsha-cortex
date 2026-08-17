@@ -99,6 +99,25 @@ class ScriptWorktreeCreator:
     `<worktree_root>/%i` 永遠差一個 `feature-` 前綴，systemd 建 mount namespace 直接
     失敗（`226/NAMESPACE`）。branch 名不變，只有磁碟上的目錄名改。
 
+    **#633：解析時機（repo／worktree pool 一律 lazy）**。#612／#630 讓
+    `paths.repo_root()` 在未宣告 `PSC_REPO_ROOT` 時 fail-closed——方向正確，但這裡
+    舊實作在 `__init__` 就解析，而 `manager_daemon.run_loop → ensure_dispatcher()`
+    會在**建 dispatcher 時**實體化本類。於是「env 少一個變數」的後果不是「派不了
+    工」而是 **Manager 啟動即崩**，`Restart=on-failure` 再把它變成 crash-loop
+    （實機 `NRestarts` 連跳 7 次）——一台什麼都做不了、也什麼都不告訴你的機器。
+
+    改法只動**時機**、不動**性質**：repo 與 worktree pool 改為第一次真正要用時才
+    解析（`_repo` / `_wt_root` 兩個 property，解析結果 memoize）。因此
+
+    * 沒有宣告目標 repo 的 Manager **起得來**，其餘職責（tick、monitor、狀態回報、
+      降級運轉）照常——這與 `PSC_DEGRADED_OPERATION` 的精神一致：能做的繼續做。
+    * 第一次 `create()`（＝真的要在磁碟上開一棵樹）仍然 `RepoRootUnresolvedError`
+      **原樣**拋出，訊息逐字不變，只是出現在**派工當下**而不是啟動當下——那也正是
+      operator 看得懂它的時刻。
+    * fail-closed 一個位元組都沒放寬：沒有新增任何 cwd 退路，也沒有把例外吞掉。
+      唯一「不拋」的新入口是 :meth:`anchored_at`，而它回的是 `False`（＝不能用），
+      不是一個猜出來的路徑。
+
     單元測試 MUST 注入 fake，不實體化此類。
     """
 
@@ -108,13 +127,58 @@ class ScriptWorktreeCreator:
         wt_root: str | Path | None = None,
         base: str = "main",
     ) -> None:
-        self._repo = Path(paths.repo_root() if repo is None else repo)
-        self._wt_root = Path(paths.worktree_root() if wt_root is None else wt_root)
+        #: #633：**未給定時不在建構子解析**——只記下「沒有顯式值」，第一次真正要
+        #: 用時才問 `paths`。理由見類別 docstring 的「#633：解析時機」段。
+        self._repo_resolved: Path | None = None if repo is None else Path(repo)
+        self._wt_root_resolved: Path | None = None if wt_root is None else Path(wt_root)
         self._base = base
+
+    # -- #633：lazy 解析（解析結果 memoize，一個 creator 一棵樹） -----------------
+
+    @property
+    def _repo(self) -> Path:
+        """來源 repo 根。未顯式給定時第一次存取才解析，且**解析失敗即拋**。
+
+        memoize 是刻意的：舊實作在建構子解析一次、其後這個值就是凍結的，全部既有
+        呼叫端（含 `_source()` 每一次 git 呼叫）都建立在「同一個 creator 永遠對同一
+        棵樹動手」之上。lazy 只改**第一次**解析發生的時機，不讓 env 在 creator 存活
+        期間改變它指向哪裡。
+        """
+        if self._repo_resolved is None:
+            self._repo_resolved = Path(paths.repo_root())
+        return self._repo_resolved
+
+    @property
+    def _wt_root(self) -> Path:
+        """worktree pool 根。同上——未顯式給定時第一次存取才解析並 memoize。
+
+        `paths.worktree_root()` 內部也會走 `repo_root()`，因此它與 `_repo` 是同一條
+        fail-closed；分開 memoize 只是為了讓「顯式給 wt_root、repo 交給 env」這個
+        既有組合（`__init__` 兩個參數本來就各自獨立）維持原語意。
+        """
+        if self._wt_root_resolved is None:
+            self._wt_root_resolved = Path(paths.worktree_root())
+        return self._wt_root_resolved
 
     @property
     def repo_root(self) -> Path:
         return self._repo
+
+    def anchored_at(self, root: str | Path) -> bool:
+        """本 creator 是否錨定在 `root` 這棵樹上。
+
+        #633：repo 解析改 lazy 之後，「尚未解析且環境沒有宣告」是一個**合法狀態**
+        （Manager 在未宣告 `PSC_REPO_ROOT` 時仍起得來）。呼叫端問的是「這個 creator
+        能不能拿來對 `root` 派工」，而一個解析不出來的 creator 對任何具體的 `root`
+        都答不出「是」——因此回 `False`，讓呼叫端走它既有的「換一個錨定正確的
+        creator」分支，而不是把 `RepoRootUnresolvedError` 從一句比較裡漏出去。
+        fail-closed 沒有被放寬：真的要動手時 `create()` 仍會解析、仍會拋。
+        """
+        try:
+            mine = self._repo
+        except paths.RepoRootUnresolvedError:
+            return False
+        return str(mine.resolve()) == str(Path(root).resolve())
 
     # -- git 小工具（皆對來源 repo 或工作區執行，回傳 CompletedProcess） ---------
 
