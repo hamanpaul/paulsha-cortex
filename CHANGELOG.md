@@ -52,6 +52,25 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#608 / ledger gate 環境健壯性（#565、#586 同族第三例）：AF_UNIX socket 路徑不再
+  吃 `TMPDIR` 長度，長暫存根無法再偽造出一筆 gate 失敗**——Linux 的 `sun_path` 只有
+  108 bytes（含結尾 NUL，可用 107），而 pytest `tmp_path` 與 `tempfile.mkdtemp()` 都
+  掛在 `TMPDIR` 下，socket 路徑長度因此由環境決定。實測 `origin/main`：`len(TMPDIR)`
+  ＝47 時全套 **4 failed**、66 時 **18 failed**、91 時全綠但 AF_UNIX 家族 **36 測
+  靜默 skip**（#586 探針自己也建在 `TMPDIR` 下，先超限 → `bind()` 失敗 → 被誤判成
+  「sandbox 禁止 bind」，覆蓋消失而套件是綠的）。Manager gate ledger 對 candidate
+  重跑全套 pytest 是採信的硬 gate（#540），那些 `failed` 進 ledger 後與「交付真的
+  沒過」無法區分，合格 candidate 會被 `GateContradictionError` 拒掉。主修法比照 #565
+  的 `tests/git_fixtures.py`：新增 `tests/socket_fixtures.py`（短固定根 ＋ per-uid
+  `0700` 容器 ＋ 短亂數名目錄，與 `TMPDIR` 無關）與 conftest 的 `socket_dir` fixture，
+  五個測試檔的 bind／connect 路徑改用它，工作區與快照仍留在 `tmp_path`。次修法：新增
+  `paulsha_cortex/monitor/socket_path.py` 收攏 107／108 常數與 byte 級判定，
+  `MonitorServer.serve_forever()`／`MonitorSocketClient.request()` 超限時 fail closed
+  在 `SocketPathTooLongError`（`ValueError` 子類，刻意不繼承 `OSError` 以免被
+  「transport 出事」的處理吸收），另補 `MonitorServer.startup_error` 與 `cortex doctor`
+  在 live probe 前的長度診斷。刻意不改用抽象命名空間——它沒有權限位、會打開現行
+  `chmod 0o600` 的 socket，且仍吃同一條 108 bytes 上限。
+  詳見 `changelog.d/afunix-sunpath-hermetic.md`。
 - **#604 / trust-root：gate ledger 與 exit sentinel 的作者收斂到 Manager——降權後
   「被隔離的一方自寫驗收證據」的第一步修法**——登記表資產 `gate-ledger`（Manager 的
   dispatch log 目錄，同時放 `<slice>.gates.json` 與 `<slice>.exit`）宣告

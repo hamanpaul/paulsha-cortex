@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping
 import os
 import shutil
 import subprocess
@@ -9,6 +9,25 @@ import subprocess
 import pytest
 
 import network_guard
+from socket_fixtures import short_socket_dir
+
+
+# --- #608：AF_UNIX socket 路徑不得吃 TMPDIR 長度 ------------------------------
+
+
+@pytest.fixture
+def socket_dir() -> "Iterator[Path]":
+    """短固定根底下的空目錄，專供要 `bind()` / `connect()` 的測試放 socket。
+
+    `tmp_path` 掛在 `TMPDIR` 下，長度由環境決定，超過 `sun_path` 的 107 bytes
+    就整批紅掉——而那種紅會被 manager 的 gate ledger 記成「交付沒過」。理由與
+    實測數據見 `tests/socket_fixtures.py` 的模組 docstring。
+
+    只把 **socket 本身**搬過來；工作區／設定檔／快照照舊留在 `tmp_path`。
+    """
+
+    with short_socket_dir(prefix="pytest") as path:
+        yield path
 
 
 # --- #610：測試不得出實網 ------------------------------------------------------

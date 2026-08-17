@@ -41,6 +41,7 @@ from pathlib import Path
 from unittest import mock
 
 from sandbox_support import AF_UNIX_SKIP_REASON, af_unix_bind_available
+from socket_fixtures import make_short_socket_dir
 
 # Imports from the Phase 3 modules (do not exist yet — Red).
 try:
@@ -446,6 +447,9 @@ class Stage9ServerTests(unittest.TestCase):
     def setUp(self) -> None:
         _require_phase3(self)
         self.tmp = Path(tempfile.mkdtemp(prefix="stage9-server-"))
+        # #608：只有**要 bind 的 socket** 需要躲開 TMPDIR 長度（sun_path 上限
+        # 107 bytes）；workspace／snapshot 沒有長度上限，照舊留在 self.tmp。
+        self.sock_dir = make_short_socket_dir(prefix="stage9s")
         _mkdir_resilient(self.tmp / "ws")
         _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         _make_workspace(self.tmp / "ws", "projB", DEFAULT_TODO)
@@ -455,7 +459,7 @@ class Stage9ServerTests(unittest.TestCase):
         )
         self.store = SnapshotStore(config=self.cfg)
         self.store.load()
-        self.socket_path = self.tmp / "monitor.sock"
+        self.socket_path = self.sock_dir / "monitor.sock"
         self.server = MonitorServer(store=self.store, socket_path=self.socket_path)
         self.server_thread = threading.Thread(
             target=self.server.serve_forever, daemon=True
@@ -480,6 +484,7 @@ class Stage9ServerTests(unittest.TestCase):
         import shutil
 
         shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.sock_dir, ignore_errors=True)
 
     def _connect(self) -> socket.socket:
         deadline = time.time() + 1.0
@@ -576,7 +581,7 @@ class Stage9ServerTests(unittest.TestCase):
             release_chmod.wait(timeout=2.0)
             return real_chmod(path, mode, **kwargs)
 
-        other_socket_path = self.tmp / "chmod-race.sock"
+        other_socket_path = self.sock_dir / "chmod-race.sock"
         server = MonitorServer(store=self.store, socket_path=other_socket_path)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         try:
@@ -627,7 +632,7 @@ class Stage9ServerTests(unittest.TestCase):
         below and issue #425). Asserting `os.umask` is never called is the
         direct, non-timing-sensitive proof that the race class is gone.
         """
-        other_socket_path = self.tmp / "no-umask-call.sock"
+        other_socket_path = self.sock_dir / "no-umask-call.sock"
         server = MonitorServer(store=self.store, socket_path=other_socket_path)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         with mock.patch(
@@ -675,7 +680,7 @@ class Stage9ServerTests(unittest.TestCase):
             release_bind.wait(timeout=2.0)
             return real_bind(sock_self, address)
 
-        other_socket_path = self.tmp / "umask-race.sock"
+        other_socket_path = self.sock_dir / "umask-race.sock"
         server = MonitorServer(store=self.store, socket_path=other_socket_path)
         new_dir = self.tmp / "concurrent-race" / "nested" / "leaf"
         try:
@@ -793,7 +798,7 @@ class Stage9ServerTests(unittest.TestCase):
             contender_thread.join(timeout=2.0)
 
     def test_server_reclaims_stale_socket_file(self) -> None:
-        stale_path = self.tmp / "stale-monitor.sock"
+        stale_path = self.sock_dir / "stale-monitor.sock"
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(str(stale_path))
         stale.close()
@@ -830,7 +835,7 @@ class Stage9ServerTests(unittest.TestCase):
             reclaimed_thread.join(timeout=2.0)
 
     def test_server_refuses_to_delete_non_socket_path(self) -> None:
-        bad_path = self.tmp / "not-a-socket"
+        bad_path = self.sock_dir / "not-a-socket"
         bad_path.write_text("occupied", encoding="utf-8")
         contender = MonitorServer(store=self.store, socket_path=bad_path)
         with self.assertRaisesRegex(RuntimeError, "不是 Unix socket"):
@@ -838,7 +843,7 @@ class Stage9ServerTests(unittest.TestCase):
         self.assertTrue(bad_path.exists())
 
     def test_server_timeout_probe_treats_socket_as_live(self) -> None:
-        busy_path = self.tmp / "busy-monitor.sock"
+        busy_path = self.sock_dir / "busy-monitor.sock"
         busy = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         busy.bind(str(busy_path))
         busy.close()
@@ -874,6 +879,8 @@ class Stage9ServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         _require_phase3(self)
         self.tmp = Path(tempfile.mkdtemp(prefix="stage9-svc-"))
+        # #608：run dir 底下要 bind socket，必須落在短固定根（見上）。
+        self.sock_dir = make_short_socket_dir(prefix="stage9v")
         _mkdir_resilient(self.tmp / "ws")
         self.project_dir = _make_workspace(self.tmp / "ws", "projA", DEFAULT_TODO)
         _mkdir_resilient(self.project_dir / ".git" / "refs" / "heads")
@@ -881,7 +888,7 @@ class Stage9ServiceTests(unittest.TestCase):
         (self.project_dir / ".git" / "refs" / "heads" / "main").write_text("deadbeef\n")
         _mkdir_resilient(self.project_dir / "node_modules" / "pkg")
         (self.project_dir / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1;\n")
-        self.run_dir = self.tmp / "run"
+        self.run_dir = self.sock_dir / "run"
         self.socket_path = self.run_dir / "project-monitor.sock"
         self.cfg = MonitorConfig(
             workspaces=(WorkspaceConfig(path=self.tmp / "ws", name="ws"),),
@@ -915,6 +922,7 @@ class Stage9ServiceTests(unittest.TestCase):
         import shutil
 
         shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.sock_dir, ignore_errors=True)
 
     def _connect(self) -> socket.socket:
         deadline = time.time() + 1.0
@@ -1017,7 +1025,7 @@ class Stage9ServiceTests(unittest.TestCase):
         cfg = MonitorConfig(
             workspaces=(WorkspaceConfig(path=self.tmp / "ws", name="ws"),),
             legacy_policy="list-only",
-            socket_path=self.tmp / "fallback.sock",
+            socket_path=self.sock_dir / "fallback.sock",
         )
         with mock.patch.object(service_module, "HAS_WATCHDOG", False):
             fallback_service = ProjectMonitorService(config=cfg)

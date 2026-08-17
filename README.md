@@ -767,6 +767,20 @@ export PSC_DIGEST_DELIVERY_CMD='/path/to/relay-script --channel ops'
   需要 remote 的測試一律用本機 fixture（`git_origin` 造 tmp bare origin，或注入假
   provider／runner）。本機除錯要放行整場用 `PSC_TEST_ALLOW_NETWORK=1`；本質上需要網路的
   整合測試標 `@pytest.mark.network`（預設排除於全套，`--run-network` 才跑）。
+- **AF_UNIX socket 路徑不得掛在 `TMPDIR` 下（#608）**：Linux 的 `sun_path` 只有 108
+  bytes（含結尾 NUL，可用 107），而 `tmp_path`／`tempfile.mkdtemp()` 的長度由環境給。
+  凡是要 `bind()`／`connect()` 的路徑一律取自 `tests/socket_fixtures.py` 的短固定根
+  （pytest 用 conftest 的 `socket_dir` fixture，`unittest.TestCase` 用
+  `make_short_socket_dir()`）；工作區、設定檔、快照沒有長度上限，照舊留在 `tmp_path`。
+  production 端由 `paulsha_cortex/monitor/socket_path.py` 統一判定，超限時 fail closed
+  在 `SocketPathTooLongError` 並附 byte 數，不退化成「服務沒起來」或「socket 沒在聽」。
+- **ledger gate 環境健壯性（#565 / #586 / #608 / #610 同族，一律 P1）**：Manager 的 gate
+  ledger 對 candidate 重跑全套 pytest 是採信的硬 gate（#540），因此凡是「全套 pytest 的
+  結果會隨 host 環境形狀改變」的測試，污染的都是**採信判斷**——環境噪音會被讀成「這次
+  交付真的沒過」，讓合格 candidate 撞上 `GateContradictionError`。發現這類測試一律比照
+  上述四例 hermetic 化：污染／環境條件由測試自備，且必須附**負控制**（同一條路徑上真正的
+  失敗仍然要被記成失敗），否則「修好了」與「什麼都判成通過」無法區分。靜默 skip 同樣算
+  失敗——覆蓋消失而套件是綠的，比紅掉更難發現。
 
 ## Version
 

@@ -22,6 +22,13 @@ run → pass）在源頭一致，消除 envelope/ledger 分歧。正常環境／
 
 安全邊界：本模組**只**改變測試在「無法 bind AF_UNIX」時的判定（run vs skip），
 不放寬任何 syscall、不打開網路、不允許 builder 連上 manager 既有 socket。
+
+#608：探針本身原本建在 `tempfile.TemporaryDirectory()`（＝`TMPDIR`）底下，於是
+`TMPDIR` 一長（實測 > 70 bytes），探針路徑先撞上 `sun_path` 的 107 bytes 上限，
+`bind()` 以 `ENAMETOOLONG` 失敗，被這裡判成「sandbox 禁止 bind」——整個 AF_UNIX
+家族帶著**錯誤的理由**靜默 skip，套件是綠的但覆蓋沒了。探針因此改建在
+`socket_fixtures.short_socket_root()` 的短固定根下：它量的必須是「能不能 bind」
+這件事本身，不能被環境的路徑長度污染。
 """
 
 from __future__ import annotations
@@ -29,10 +36,10 @@ from __future__ import annotations
 import errno
 import functools
 import socket
-import tempfile
-from pathlib import Path
 
 import pytest
+
+from socket_fixtures import assert_socket_path_fits, short_socket_dir
 
 AF_UNIX_SKIP_REASON = (
     "builder sandbox forbids binding an AF_UNIX socket (bind() -> EPERM); "
@@ -52,10 +59,21 @@ def af_unix_bind_available() -> bool:
     unexpected ``OSError`` is likewise treated as unavailable so a guarded test
     skips rather than erroring in a hostile environment; a normal host binds
     cleanly and returns ``True``.
+
+    #608: the probe path lives under a short fixed root, **not** ``TMPDIR`` —
+    otherwise a long ``TMPDIR`` makes the probe itself exceed ``sun_path`` and
+    this function answers "the sandbox forbids bind" when the truth is "the
+    path was too long", silently skipping the whole AF_UNIX family for a reason
+    that is not true. Over-length is therefore asserted *before* ``bind()``
+    rather than folded into ``False``: under a root this short it can only mean
+    the fixture itself is broken, and a broken fixture must be loud. (CPython
+    rejects an over-long ``sun_path`` before the syscall, raising a bare
+    ``OSError("AF_UNIX path too long")`` with ``errno is None`` — indistinguishable
+    from a sandbox denial by errno alone, hence the explicit check.)
     """
 
-    with tempfile.TemporaryDirectory(prefix="psc-afunix-probe-") as tmp:
-        sock_path = Path(tmp) / "probe.sock"
+    with short_socket_dir(prefix="afunix") as tmp:
+        sock_path = assert_socket_path_fits(tmp / "p.sock")
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         except (PermissionError, OSError):

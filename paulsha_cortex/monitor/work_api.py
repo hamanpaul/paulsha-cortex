@@ -25,6 +25,7 @@ from .providers import (
     RepoWorkProvider,
     WorkflowRegistryProvider,
 )
+from .socket_path import validate_socket_path
 from ..coordinator.terminal_contract import MAX_SCHEMA_RETRIES as SCHEMA_RETRY_LIMIT
 from .work_models import ProviderSnapshot
 from .work_models import WorkItem
@@ -392,6 +393,13 @@ class MonitorSocketClient:
         self.timeout = timeout
 
     def request(self, payload: Mapping) -> dict:
+        # #608: an over-long socket path makes `connect()` raise a bare
+        # `OSError("AF_UNIX path too long")`, which every caller here treats as
+        # "the monitor is not listening" — a transport verdict for what is really
+        # an environment limit. Check first and fail closed on a named error
+        # (`SocketPathTooLongError`, a ValueError, deliberately *not* an OSError)
+        # so the two stay distinguishable.
+        validate_socket_path(self.socket_path, role="monitor socket")
         body = (json.dumps(dict(payload), ensure_ascii=False) + "\n").encode("utf-8")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(self.timeout)
