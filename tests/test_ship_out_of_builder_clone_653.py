@@ -355,9 +355,9 @@ def test_archive_to_policy_commit_handoff_binds_the_archive_job(
     assert archive_job["persona"] == "manager"
     assert archive_job["executor"] == "cortex-manager"
     # #653：記在 archive 卡上的工作區是 **Manager-owned 的 ship 樹**，不是
-    # builder 的 clone。post-archive 的 verify／review 卡以
-    # `builder_jobs[-1]["worktree"]` 當 candidate 樹，因此這棵樹不得在 ship 段
-    # 結束時被刪掉（回收交給 `cortex work gc`，與 build 卡的 clone 同一套）。
+    # builder 的 clone。這棵樹是 archive 卡的稽核定錨，不得在 ship 段結束時被刪掉
+    # （回收交給 `cortex work gc`，與 build 卡的 clone 同一套）。#650 之後
+    # post-archive 的 verify／review 卡改用自己的 `-review-` 樹，不再讀這一棵。
     assert archive_job["worktree"] == str(workspace)
     assert workspace.is_dir()
     assert workspace != harness.worktree

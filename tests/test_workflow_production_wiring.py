@@ -5130,27 +5130,33 @@ def test_reviewer_disposable_checkout_detects_candidate_mutation(tmp_path: Path)
 def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     tmp_path: Path,
 ) -> None:
+    # #650：candidate 必須在**來源樹**（`run.workspace_root`）裡——那是
+    # `_harvest_build_candidate()` 之後的實況，也是 verify／review 卡的 candidate 樹
+    # 現在 clone 的來源。`repo` 留成 builder 那一份 clone（本票之後派工不再讀它，只
+    # 有既有 job 記錄還指著它）。
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "init", "-q"], check=True)
     subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "canary@example.invalid"],
+        ["git", "-C", str(workspace), "config", "user.email", "canary@example.invalid"],
         check=True,
     )
     subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Canary"], check=True
+        ["git", "-C", str(workspace), "config", "user.name", "Canary"], check=True
     )
-    (repo / "README.md").write_text("candidate\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    (workspace / "README.md").write_text("candidate\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(workspace), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(workspace), "commit", "-qm", "base"], check=True)
     candidate = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-hardlinks", str(workspace), str(repo)], check=True
+    )
     steps = tuple(
         WorkflowStep.from_dict(
             {

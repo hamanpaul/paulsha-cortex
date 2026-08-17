@@ -2088,8 +2088,23 @@ systemctl cat cortex-job@.service | grep -E "^ReadWritePaths=/var/lib/cortex/wor
 #     getfacl -p /var/lib/cortex/worktree/wf-*-ship-* | grep -c '^user:'
 #   期望：`0`——ship 的樹不需要任何具名 ACL 條目；稽核 5b 的「零 `setfacl`」因此
 #   仍然成立。這些目錄與 build 卡的 clone 走同一套回收（`cortex work gc`，branch
-#   merge 後才回收），不由 ship 段自己刪：archive 卡的 job 記錄指著它，
-#   post-archive 的 verify／review 卡仍以它為 candidate 樹。
+#   merge 後才回收），不由 ship 段自己刪：archive 卡的 job 記錄指著它。
+#
+#   #650（已修）：verify／review 卡在此之前以 `builder_jobs[-1]["worktree"]`（前一張
+#   build 卡的工作區）為 candidate 樹，而 Manager 在那棵樹上做的**不只是讀**——
+#   `_workflow_input_snapshot()` 會往裡面 seed 缺席的 planning authority 檔、
+#   `planning_runtime._tree_snapshot()` 會遞迴走完整棵樹 ⇒ 收掉唯讀 ACL 之後這條 lane
+#   同樣是 `Permission denied`（與 ship 段同型，症狀一樣是**權限**）。現在 verify／
+#   review 卡也在來源樹上 provision 一棵自己的 Manager-owned clone，識別穩定於
+#   **(run, candidate)**（形如 `wf-<run 摘要>-review-<candidate 前綴>-…`）。
+#
+#   實機稽核：verify／review phase 跑過之後
+#     stat -c '%U %a' /var/lib/cortex/worktree/wf-*-review-*
+#   期望：`cortex-manager 700`。
+#     getfacl -p /var/lib/cortex/worktree/wf-*-review-* | grep -c '^user:'
+#   期望：`0`（同上，稽核 5b 的「零 `setfacl`」仍然成立）。
+#   注意這棵樹裡會有**未追蹤**的 canonical report（`reports/verify|review/*.md`）
+#   ——那是 `code-review` → `adversarial-review` 的宣告輸入，不是殘留，不要手動清。
 
 # ✅ 檢查 unit 沒有被忽略的鍵（#645 附帶；#643 起兩份都要驗）
 sudo systemd-analyze verify /etc/systemd/system/cortex-job@.service \
