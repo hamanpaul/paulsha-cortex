@@ -749,6 +749,58 @@ SHALL 用這句話，MUST NOT 簡化成「job 已完整加固」。
 （V8 的 jitless 模式、或 CLI 改為原生編譯），`jit` 剖面 SHALL 被移除而不是長期保留；
 移除的判準就是上表「完整加固面」欄全部變 ✅。
 
+##### 誠實的取捨：gate 執行身分買到的是圍堵，不是不可偽造（`#629`）
+
+operator 宣告的 gate 命令（`PSC_GATE_CMD_*`）在 **builder 完全掌控內容的工作樹**上
+執行，而 `pytest` 會載入該樹的 `conftest.py` 與 plugin。**「執行 gate」與「執行被驗
+方交出來的程式碼」在信任面上是同一件事**，這一點沒有任何工程手段能移除——唯一的
+替代是不跑 gate，而那等於放棄 §R2 的獨立重驗。
+
+因此系統 SHALL 把該執行關進一個**第四個**降權帳號（`cortex-gate`），而 **MUST NOT**
+掛在任何既有身分上。三個候選逐一皆不可用：
+
+| 候選 | 為什麼不行 |
+|---|---|
+| `cortex-builder` | 模型自證自己的驗收證據，違反 `#540` 的 acceptance chain |
+| `cortex-manager` | 持 spawn 授權、擁有全部 Manager-owned durable state，是授權線的**內側** |
+| `cortex-reviewer-planner` | 它是寫 verdict 的那一個；掛上去等於把 builder 對 verdict 通道的影響力重新打開（抵銷 `#638`／`#639`） |
+
+**沒有買到的**（必須明載，否則會被讀成比實際更強）：取得任意程式碼執行的 builder
+**依然能影響自己那一份 ledger 的內容**——它可以讓宣告的 gate 命令回 0 並在
+`detail` 裡寫任何東西。第四帳號**不**使 gate 結果不可偽造。
+
+**買到的**：那個執行
+
+1. 寫不進 `gate-ledger`（含 exit sentinel）與任何其他 Manager-owned Tier-0 資產；
+2. 寫不進 builder 的工作樹（只有 `rX`），因此污染不了 harvest 的來源；
+3. 碰不到 `review-verdict-spool`／`commit-spool`，讀不到他人在 `gate-ledger-spool`
+   的那一格（`wx` 無 `r`）；
+4. 沒有任何 polkit grant，起不了任何 unit；
+5. 影響範圍**限於它自己那一個 job 的 ledger**——不能跨 job、不能跨 persona。
+
+**因此 spec 明載**：準確的敘述是——**gate ledger 是「operator 宣告的命令，在一個
+除了自己那一格 spool 與自己的拋棄式副本之外什麼都碰不到的身分下，跑過一次」的
+記錄**；它 MUST NOT 被敘述成「不可被 builder 影響」。權威副本由 Manager 依 spool
+內容自行重寫，因此 `#628` 的作者歸屬（`foreign_evidence_author()`）逐字不變，而
+spool 內容一律以**不受信任輸入**驗證（schema 嚴格、gate 名稱 MUST ⊆ operator 的
+宣告集合、payload 有界）。
+
+**未來選項（不在本票範圍）**：要讓 gate 結果真正不可偽造，需要的是「在不執行被驗
+方程式碼的前提下判定它」——那不是身分問題，而是 Phase 3 的簽章／可重現建置範疇。
+
+#### Scenario: gate 執行身分寫 Manager 的證據樹
+
+- **WHEN** gate 執行身分試圖寫 `gate-ledger`（ledger 或 exit sentinel）
+- **THEN** 檔案層 MUST 拒絕（該資產不在它的 `ReadWritePaths=` 內）；即使以特權植入，
+  採信端 MUST 以 `gate-ledger-foreign-author` 拒絕非 Manager 擁有的 ledger
+
+#### Scenario: gate 命令在被驗的工作樹上就地執行
+
+- **WHEN** 系統把 gate 命令的 cwd 設成 builder 的工作樹本身
+- **THEN** 該設計 MUST 被拒絕：gate 需要可寫暫存（`.pytest_cache`／`__pycache__`／
+  build 產物），就地執行不是「唯讀因此安全」，而是「gate 的寫入污染了 harvest 的
+  來源」。命令 SHALL 在**拋棄式副本**上執行，來源對 gate 唯讀
+
 #### Scenario: node 型 executor 在嚴格剖面下起不來
 
 - **WHEN** 以 `codex`／`copilot` 為 executor 的 job 被派到 `cortex-job@.service`
@@ -1040,6 +1092,27 @@ skill ledger、runtime bootstrap env。
 | T4.3 | 讀 `/proc/<manager_pid>/mem`、`environ` | `EACCES` |
 | T4.4 | 對 Manager 送 signal（`SIGSTOP`／`SIGKILL`） | `EPERM` |
 
+**族 5：gate 執行身分（`#629`）**——前提改成「builder 在自己的工作樹裡取得任意
+程式碼執行」，因為那正是宣告出來的 gate 命令必然給它的東西（`pytest` 會載入該樹的
+`conftest.py` 與 plugin）。本族驗的不是「那個執行不會發生」，而是**它被關在哪裡**。
+
+| ID | 動作（以 gate 執行身分 `cortex-gate` 進行） | 期望 |
+|---|---|---|
+| T5.1 | 寫 `gate-ledger`（Manager dispatch log 目錄，含 exit sentinel） | `EACCES`／`EROFS` |
+| T5.2 | 寫任何其他 Tier-0 Manager-owned 資產（jobs registry、verification evidence、delivery journal…） | `EACCES`／`EROFS` |
+| T5.3 | 寫 builder 的 per-job 工作樹（`repo-worktree`） | `EACCES`——ACL 只授 `rX` |
+| T5.4 | 讀／寫 `review-verdict-spool` 或 `commit-spool` | `EACCES`——gate 不在兩者的 writer／reader 面 |
+| T5.5 | 讀他人在 `gate-ledger-spool` 的那一格 | `EACCES`——`wx` 無 `r` |
+| T5.6 | `systemctl start` 任何非 `cortex-gate-job@*` 的 unit | polkit 拒絕（subject 是 Manager，不是 gate；gate 自己完全沒有 grant） |
+| T5.7 | 在被驗的工作樹留下檔案（污染 harvest 的來源） | 不可能——命令跑在拋棄式副本上，來源對它唯讀 |
+| T5.8 | builder 預先在 `gate-ledger-spool` 佔位一份「全過」的 ledger | 該檔在起 gate 前被 Manager 刪除（pre-seed 守衛）；且 builder 連容器都 traverse 不進來 |
+| T5.9 | builder 竄改工作樹內的 `conftest.py` 以影響 **Manager** 身分 | 不可能——gate 命令不在 `cortex-manager` 下執行，Manager 只讀 spool 的 JSON |
+| T5.10 | gate 直接把權威 ledger 寫進 `gate-ledger` 讓採信端讀 | 採信端 `gate-ledger-foreign-author` 拒（#628），且 T5.1 已先擋在檔案層 |
+
+**族 5 的 negative control**：以 `cortex-manager` 執行 T5.1／T5.2 MUST 成功；以
+`cortex-gate` 執行「寫自己那一格 spool」MUST 成功。兩者皆失敗即代表帳號或 ACL 沒
+套上，該族結果 MUST 視為未通過。
+
 **negative control（必要）**：每一族 MUST 附一組以受信任身分執行相同動作且
 **必須成功**的對照案例。無 negative control 的測試會在環境壞掉（例如目錄根本
 不存在）時假綠。
@@ -1055,6 +1128,18 @@ skill ledger、runtime bootstrap env。
 
 - **WHEN** 以受信任身分執行族 2 的寫入動作
 - **THEN** MUST 成功——若同樣失敗，表示測試環境無效，該族結果 MUST 視為未通過
+
+#### Scenario: gate 執行身分不得與任何既有身分合併
+
+- **WHEN** UID 方案把 `gate` 映到 `builder`／`manager`／`reviewer-planner` 任一帳號
+- **THEN** 該方案 MUST 被視為未滿足 R9 族 5——三者分別對應「模型自證」「把任意程式碼
+  執行引到持 spawn 授權的帳號」「把 builder 對 verdict 通道的影響力重新打開」
+
+#### Scenario: 沒有 gate 執行身分的部署
+
+- **WHEN** UID 方案明示「本部署沒有 gate 角色」（`ABSENT_ACCOUNT`）
+- **THEN** 系統 MUST NOT 以任何其他身分代跑 gate；`require_ledger` 的卡照既有規則
+  fail closed，MUST NOT 靜默通過
 
 ### R10 落地 MUST 分三階段交付，Phase 1 MUST 可在不需 root 的前提下先行
 
@@ -1189,6 +1274,8 @@ MUST NOT 標記為 stable；本項 MUST NOT 引用計畫「貫穿工項」第 7 
 | 資產盤點漏項 | 漏保護的 state 成為新破口 | R1 的雙向等式測試把漏項變成 CI FAIL；同時收斂六處重複的 journal 路徑推導 |
 | **per-executor 加固剖面（#643）被讀成「所有 job 都有完整加固」** | 稽核／報告高估實際保護面，日後出事時對不上 | §R3 的「誠實的取捨」段明載準確敘述（原生 ELF 27 項／node 型 26 項，少的是 `MemoryDenyWriteExecute`）；產生出來的 unit 檔頭逐條寫著它接受的代價；runbook 第 5-2 步要求執行者先讀那一段 |
 | **剖面被改成可由呼叫端選擇**（config、spec、或新增一個「方便」的參數） | 退化成「全域移除 MDWE」——`claude`／`agy` 一起失去該層，方向 2 的價值歸零 | 剖面族進 `SPEC_FORBIDDEN_KEYS`（寫端＋讀端各掃一次）；`PSC_JOB_TEMPLATE_UNIT` 拒絕帶剖面後綴的值；未知 executor fail-closed；polkit pattern 只列舉具名字幹。四條都有對應測試 |
+| **`#629` 的第四帳號被讀成「gate ledger 因此不可偽造」** | 稽核高估實際保護面；真正出事時對不上 | §R3 的「誠實的取捨」段明載準確敘述：第四帳號買到的是**圍堵**（那個執行碰不到 Manager durable state、verdict 通道、他人工作樹，也沒有 spawn 授權），不是「取得 ACE 的 builder 影響不了自己那一份 ledger」——後者是「執行對方交出來的測試碼」這件事本身的性質，換誰執行都一樣 |
+| **gate 執行被「順手」掛回既有帳號**（省一個帳號、或圖 `regenerate-gates` 好寫） | 三種掛法各自對應一條已知提權路徑，且都看起來是成功的 | `UidScheme` 上 gate 是獨立 principal；`permgen` 對未對應的 gate fail-closed 並在訊息裡逐條列出為什麼不能併；`work_actions._regenerate_gates_action` 與自動路徑共用**同一個**進入點，測試以原始碼比對釘住它不得回頭直呼 `write_gate_ledger()` |
 | Phase 3 簽章方案被誤當成可替代 Phase 2 | 投入密碼學工程卻仍可被繞過 | 「路線比較與裁決建議」段已論證 B 的三個前提都依賴 A；R6(c) 明載單調計數器必須在 OS 邊界內 |
 | reviewer 與 builder 分離推高資源與複雜度 | Phase 2 工期拉長 | independence 是 `#484` 與 D6 的共同要求，不可省；可先以兩個 UID（builder／非 builder）起步，planner 併入非 builder 域，待驗證後再細分 |
 | 降級運轉期間 fleet 產能下降 | 交付變慢 | 降級只涵蓋 acceptance／outbox mutation／ship 三條路徑，define／plan／build／verify 不受影響 |

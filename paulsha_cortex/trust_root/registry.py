@@ -50,14 +50,34 @@ class Principal(Enum):
     BUILDER = "builder"              # headless
     REVIEWER = "reviewer"            # headless
     PLANNER = "planner"              # headless
+    GATE = "gate"                    # #629：operator 宣告的 gate 命令的執行身分
     HEADLESS_HOOK = "headless-hook"  # D5 headless 事件 hook（寫 event-spool）
     EXTERNAL = "external"            # 外送管線／外部學習系統（唯讀）
     ANY_SAME_UID = "any-same-uid"    # 現況：同 UID 任何行程皆可寫（含全部 headless persona）
 
 
 #: 三個不受信任 headless persona；spec §R1 要求盤點必須分別涵蓋，不能只封 builder。
+#:
+#: **判準是「這個 principal 會執行一個模型 CLI」**，因此 #629 的 :data:`Principal.GATE`
+#: 不在其中：gate 不跑模型，它跑的是 operator 宣告的命令。兩者在「不受信任」這件事上
+#: 完全同級（見 :data:`UNTRUSTED_EXECUTION_PRINCIPALS`），差別只在**需要哪些前置物**
+#: ——模型 job 帳號要有 root-owned 的 `~/.codex` 與 executor 憑證檔，gate 一個都不要。
 HEADLESS_PERSONAS: frozenset[Principal] = frozenset(
     {Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER}
+)
+
+#: **全部「執行不受信任程式碼」的身分**——Manager-owned／deployment 樹對這些帳號必須
+#: 零寫入權（`permgen.UidScheme.headless_accounts()` 的來源，也是產生器的核心不變式）。
+#:
+#: #629 起它比 :data:`HEADLESS_PERSONAS` 多兩項：
+#:
+#: - `HEADLESS_HOOK`（D5 事件 hook，與 builder 同帳號）；
+#: - `GATE`——operator 宣告的 gate 命令是在 **builder 完全掌控內容的工作樹**上跑的，
+#:   `pytest` 會載入該樹的 `conftest.py`／plugin，所以「執行 gate」與「執行模型交出來
+#:   的程式碼」在信任面上是同一件事。它必須被關進與 builder 同級的盒子，只是**不同的
+#:   那一個**盒子（同一個盒子＝模型自證，見 issue #540 的 acceptance chain）。
+UNTRUSTED_EXECUTION_PRINCIPALS: frozenset[Principal] = (
+    HEADLESS_PERSONAS | {Principal.HEADLESS_HOOK, Principal.GATE}
 )
 
 
@@ -413,7 +433,7 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     # ---- job-visible worktree 族 -------------------------------------------
     TrustRootAsset(
         "repo-worktree", _T1, _JV, "paulsha_cortex.config.paths:repo_root",
-        (Principal.BUILDER,), (Principal.BUILDER,),
+        (Principal.BUILDER,), (Principal.BUILDER, Principal.GATE),
         IngressKind.STAGING_SPOOL,
         note=(
             "builder write_paths:['**']，可寫工作區內任何路徑（含 .cortex/.github）。"
@@ -440,7 +460,71 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "`candidate-worktree-unreadable-pending-gate-identity`（理由碼與 evidence 的 "
             "`blocked_on` 欄逐字指向 #629），**不得**靜默略過、**不得**改讀 bundle "
             "（bundle 也是 builder 產的，兩邊同源會讓那道檢查退化）、更**不得**讓 builder "
-            "自報「我的工作樹是乾淨的」（違反 #540 的 acceptance chain 與 #628 的作者歸屬）。"
+            "自報「我的工作樹是乾淨的」（違反 #540 的 acceptance chain 與 #628 的作者歸屬）。\n"
+            "**#629：`readers` 補回一個帳號，但不是 Manager——是 `GATE`。** gate 執行身分"
+            "要重跑 operator 宣告的命令，就必須讀得到被驗的那棵樹；而它讀完做的第一件事是"
+            "**複製到自己的拋棄式工作區**（`gate-worktree-pool`），命令一律在副本上跑。"
+            "授的是 `rX`（讀＋traverse），**沒有 `w`**——gate 改不了 builder 的樹，因此"
+            "後續 harvest 拿到的仍是 builder 自己交付的那份成果。這條與 #641 收掉的那條"
+            "**形狀相同、方向相反**：`cortex-manager` 的 `rX` 是把 ACE 引到授權線內側，"
+            "`cortex-gate` 的 `rX` 是把同一個 ACE 引到一個**除了自己的副本與自己那格 "
+            "spool 以外什麼都碰不到**的帳號上。"
+        ),
+    ),
+    # ---- #629：gate 執行身分的兩個資產 --------------------------------------
+    TrustRootAsset(
+        "gate-worktree-pool", _T1, _JV,
+        "paulsha_cortex.config.paths:gate_worktree_root",
+        (Principal.GATE,), (Principal.GATE,),
+        IngressKind.STAGING_SPOOL,
+        derived_in=(
+            "config/paths.py:gate_worktree_root",
+            "trust_root/permgen.py:PathLayout.gate_worktree_root",
+            "coordinator/gate_runner.py:gate_worktree_dir",
+        ),
+        note=(
+            "gate 執行身分的**拋棄式工作區** pool：`<agents_root>/gate-worktree/<job-id>/`。"
+            "形態逐條比照 `dispatch-worktree-pool`（容器 owner＝Manager、per-job 一格、"
+            "格內由該身分擁有）。\n"
+            "**為什麼是拋棄式副本而不是「工作樹對 gate 唯讀」**：唯讀在可行性上不成立"
+            "——`pytest` 要寫 `.pytest_cache`／`__pycache__`，`npm test`／`cargo test`／"
+            "`make` 更是必寫；把工作樹掛成唯讀只會讓每一個真實 gate 以 EROFS 收場，那正是"
+            "#629 要修掉的「安全但不能用」。副本另外買到兩件事：(a) gate 的寫入**不會**"
+            "污染 builder 交付的那棵樹（harvest 讀到的仍是 builder 自己的成果）；(b) 快照"
+            "在單一時點取得，builder 留下的背景行程改不了 gate 跑到一半的樹（TOCTOU）。\n"
+            "**誰複製**：gate 自己（它是唯一同時讀得到來源、寫得進目的地的身分）。Manager "
+            "不複製——它在 #641 之後**讀不到** builder 的樹，這條刻意不回頭放寬。\n"
+            "**回收**：每次 gate 執行前整格重建（`spool_slot.create_slot(reset=True)`），"
+            "因此殘留副本不會累積，也不會被下一輪採信。"
+        ),
+    ),
+    TrustRootAsset(
+        "gate-ledger-spool", _T0, _JV,
+        "paulsha_cortex.config.paths:gate_ledger_spool_root",
+        (Principal.MANAGER, Principal.GATE), (Principal.MANAGER,),
+        IngressKind.INTERPROCESS,
+        derived_in=(
+            "config/paths.py:gate_ledger_spool_root",
+            "trust_root/permgen.py:PathLayout.gate_ledger_spool_root",
+            "coordinator/gate_runner.py:gate_ledger_spool_dir",
+        ),
+        note=(
+            "#629 gate 執行結果的**單向 spool**：`<coordinator_root>/gate-ledger-spool/"
+            "<job-id>/ledger.json`。形態**逐條比照 `commit-spool`**——tree 分類 job-visible"
+            "（單向 spool 一律如此），permgen 產出的實質是 Manager-owned：容器 owner＝"
+            "durable_state_owner、mode 0700，producer（gate）僅獲 **`wx` 無 `r`** 的 "
+            "per-account ACL；per-job 目錄由 Manager 在起 gate 當下建立（pre-seed 守衛與 "
+            "seal 共用 `coordinator/spool_slot.py`，不另寫一份），消費後封口。\n"
+            "**為什麼 gate 不直接寫 `gate-ledger`**：#628 已把採信端改成 "
+            "`terminal_contract.foreign_evidence_author()`——**非 Manager 擁有的 ledger 一律"
+            "不採信**。讓 gate 直接寫那個目錄，寫出來的檔 owner 是 `cortex-gate`，採信端會"
+            "當場 `gate-ledger-foreign-author` 拒掉；要讓它被採信就得放寬那條檢查，等於把 "
+            "#628 拆掉。而且 `gate-ledger` 這個資產**同時**是 exit sentinel 的落點，開放"
+            "寫入面等於讓一個跑 untrusted code 的帳號能偽造**任何** job 的完成狀態。\n"
+            "因此權威 ledger 一律由 **Manager 自己**依本 spool 的內容重寫一份到 "
+            "`gate-ledger`（`coordinator/gate_runner.py`），作者歸屬與 #628 逐字不變；"
+            "spool 內容一律以**不受信任輸入**對待（schema 嚴格驗證 ＋ gate 名稱必須落在 "
+            "operator 的 `PSC_GATE_CMD_*` 宣告集合內）。"
         ),
     ),
     TrustRootAsset(

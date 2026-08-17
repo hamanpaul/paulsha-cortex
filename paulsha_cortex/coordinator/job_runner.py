@@ -120,6 +120,8 @@ __all__ = [
     "BUILDER_SYNTHESIZED_ENV",
     "CREDENTIAL_ENV_RE",
     "DEFAULT_BUILDER_ACCOUNT",
+    "DEFAULT_GATE_ACCOUNT",
+    "DEFAULT_GATE_TEMPLATE_UNIT",
     "DEFAULT_JOB_SHIM",
     "DEFAULT_JOB_SPEC_SPOOL",
     "DEFAULT_REVIEWER_ACCOUNT",
@@ -128,11 +130,17 @@ __all__ = [
     "DEFAULT_TEMPLATE_UNIT",
     "EXECUTOR_HARDENING_PROFILE",
     "ForwardedEnvVar",
+    "GATE_ACCOUNT_ENV",
+    "GATE_GROUP_ENV",
+    "GATE_HOME_ENV",
+    "GATE_PATH_ENV",
+    "GATE_TEMPLATE_UNIT_ENV",
     "HARDENING_PROFILE_JIT",
     "HARDENING_PROFILE_STRICT",
     "JOB_ROLES",
     "JOB_ROLE_BUILDER",
     "JOB_ROLE_CONFIG",
+    "JOB_ROLE_GATE",
     "JOB_ROLE_REVIEW",
     "JOB_RUNNER_ENV",
     "JOB_SHIM_ENV",
@@ -221,6 +229,18 @@ REVIEWER_GROUP_ENV = "PSC_REVIEWER_GROUP"
 REVIEWER_HOME_ENV = "PSC_REVIEWER_HOME"
 REVIEWER_PATH_ENV = "PSC_REVIEWER_PATH"
 
+#: gate 執行身分的 OS 帳號名（#629）。**第四個帳號**，與 builder／reviewer-planner／
+#: manager 三者皆不同——理由見 `trust_root.permgen.FOUR_WAY_SCHEME` 的說明。
+GATE_ACCOUNT_ENV = "PSC_GATE_ACCOUNT"
+DEFAULT_GATE_ACCOUNT = "cortex-gate"
+GATE_GROUP_ENV = "PSC_GATE_GROUP"
+GATE_HOME_ENV = "PSC_GATE_HOME"
+GATE_PATH_ENV = "PSC_GATE_PATH"
+
+#: gate 的模板 unit 名（與 `permgen.job_unit_stem(…, GATE)` 成對契約）。
+GATE_TEMPLATE_UNIT_ENV = "PSC_GATE_JOB_TEMPLATE_UNIT"
+DEFAULT_GATE_TEMPLATE_UNIT = "cortex-gate-job@.service"
+
 #: reviewer／planner 的模板 unit 名（與 `permgen.job_unit_stem(…, REVIEWER)` 成對契約）。
 REVIEW_TEMPLATE_UNIT_ENV = "PSC_REVIEW_JOB_TEMPLATE_UNIT"
 DEFAULT_REVIEW_TEMPLATE_UNIT = "cortex-reviewer-job@.service"
@@ -291,7 +311,10 @@ DEFAULT_TEMPLATE_UNIT = f"{TEMPLATE_UNIT_PREFIX}{TEMPLATE_UNIT_SUFFIX}"
 JOB_ROLE_BUILDER = "builder"
 #: reviewer ＋ planner（同一個 OS 帳號、同一份模板 unit）。
 JOB_ROLE_REVIEW = "review"
-JOB_ROLES = (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW)
+#: operator 宣告的 gate 命令（#629）。**不跑模型**，但跑的是 builder 工作樹裡的
+#: `conftest.py`／plugin，因此與前兩者同級地必須被關進盒子——只是**不同的**盒子。
+JOB_ROLE_GATE = "gate"
+JOB_ROLES = (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW, JOB_ROLE_GATE)
 
 
 @dataclass(frozen=True)
@@ -339,6 +362,23 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
                 "reviewer ＋ planner persona（三分方案下同一個 OS 帳號）。M2（#615）："
                 "在此之前它們仍在 Manager 行程內以 Manager 帳號執行，"
                 "「injection 可達的進程皆無 spawn 授權」因此只對 builder 成立。"
+            ),
+        ),
+        JOB_ROLE_GATE: JobRoleConfig(
+            role_id=JOB_ROLE_GATE,
+            account_env=GATE_ACCOUNT_ENV,
+            default_account=DEFAULT_GATE_ACCOUNT,
+            group_env=GATE_GROUP_ENV,
+            home_env=GATE_HOME_ENV,
+            path_env=GATE_PATH_ENV,
+            template_env=GATE_TEMPLATE_UNIT_ENV,
+            default_template=DEFAULT_GATE_TEMPLATE_UNIT,
+            rationale=(
+                "gate 執行身分（#629）——operator 宣告的 `PSC_GATE_CMD_*` 在這裡執行。"
+                "它不跑模型，但那些命令載入的是 builder 完全掌控的工作樹裡的 "
+                "`conftest.py`／plugin，等於一條任意程式碼執行；既有三個帳號逐一皆不可"
+                "承接（builder＝模型自證、manager＝授權線內側、reviewer-planner＝寫 "
+                "verdict 的那一個），故必須是第四個帳號。"
             ),
         ),
     }
@@ -830,8 +870,38 @@ def build_job_env(
     env["PSC_REPO_ROOT"] = repo_root
     if relay_target is not None:
         env["PSC_RELAY_TARGET"] = relay_target
+    if config.role_id == JOB_ROLE_GATE:
+        env.update(gate_declaration_env(manager_env))
     _reject_unsafe(env, source="build_job_env")
     return env
+
+
+#: gate 角色**額外**轉發的變數（#629）：operator 的 gate 宣告本身。
+#:
+#: 它們不在 `BUILDER_FORWARDED_ENV` 裡，因為對模型 job 而言那是純多餘的暴露面
+#: （builder 不該知道自己等一下會被哪些命令驗——#606 的 scope 紀律靠 prompt 給，
+#: 不靠 env）。對 gate 而言它們**就是工作內容**：`gate_ledger.load_gate_specs()`
+#: 只認 `PSC_GATE_CMD_*`，讓 Manager 改用 argv 傳命令會多出第二份真實來源。
+GATE_DECLARATION_ENV_PREFIX = "PSC_GATE_CMD_"
+GATE_DECLARATION_ENV_NAMES = ("PSC_GATE_TIMEOUT",)
+
+
+def gate_declaration_env(manager_env: Mapping[str, str]) -> dict[str, str]:
+    """從 Manager env 取出要轉發給 gate 的宣告（`PSC_GATE_CMD_*` ＋ 逾時）。
+
+    刻意只認**前綴 ＋ 具名白名單**，不認任何 `PSC_GATE_*`：`PSC_GATE_ACCOUNT`／
+    `PSC_GATE_HARDENING_PROFILE`／`PSC_GATE_JOB_TEMPLATE_UNIT` 都是**身分與加固**
+    的設定，轉發進 job 的環境等於把「這個 job 該以什麼形態跑」放進它自己看得到、
+    未來也可能被誰讀去用的地方。gate 需要知道的只有「要跑哪些命令、逾時多久」。
+    """
+
+    forwarded: dict[str, str] = {}
+    for name in sorted(manager_env):
+        if name.startswith(GATE_DECLARATION_ENV_PREFIX) or name in GATE_DECLARATION_ENV_NAMES:
+            value = manager_env.get(name)
+            if value:
+                forwarded[name] = str(value)
+    return forwarded
 
 
 def build_builder_env(
@@ -1205,6 +1275,46 @@ def resolve_hardening_profile(executor: str) -> str:
     return profile
 
 
+#: gate 角色的加固剖面覆寫（#629）。**operator 平面的決定**，不是 job 平面的。
+#:
+#: #643 對模型 job 立下的紀律是「剖面由 executor 決定，config 選不了」——因為那裡
+#: 存在一個 job 碰不到、又能唯一決定剖面的輸入（Manager 選的 executor）。gate 沒有
+#: 那個輸入：它跑的是 operator 用 `PSC_GATE_CMD_*` **自己宣告**的命令，因此「這些
+#: 命令需要哪一份剖面」與「這些命令是什麼」是同一個人在同一個平面上的決定，宣告
+#: 命令卻不能宣告剖面才是不一致的。
+#:
+#: 預設 `strict`：多數宣告的 gate 是 `pytest`／`make`／原生 ELF，它們在
+#: `MemoryDenyWriteExecute=yes` 下正常。宣告 node 型 gate（`npm test`）的部署必須
+#: 顯式打出 `jit`——**不顯式就會壞掉，而且壞得看得見**（V8 直接崩，見 #643），
+#: 這比「不確定就給寬鬆的」正確：後者等於所有部署都少一層加固。
+GATE_HARDENING_PROFILE_ENV = "PSC_GATE_HARDENING_PROFILE"
+DEFAULT_GATE_HARDENING_PROFILE = HARDENING_PROFILE_STRICT
+
+
+def resolve_gate_hardening_profile(env: Mapping[str, str]) -> str:
+    """gate 角色的加固剖面 id；未設＝`strict`，值不合法即 fail-closed。
+
+    不合法時**不落回預設**：一個打錯的剖面名（`jti`）落回 strict 會讓 operator
+    以為自己開了 jit 卻沒有，症狀是 node 型 gate 全崩而設定看起來是對的（#643
+    本身就是這樣被埋掉的）。
+    """
+
+    raw = str(env.get(GATE_HARDENING_PROFILE_ENV, "") or "").strip()
+    if not raw:
+        return DEFAULT_GATE_HARDENING_PROFILE
+    if raw not in TEMPLATE_UNIT_SUFFIX_BY_PROFILE:
+        raise _fail(
+            "job-runner-hardening-profile-unknown",
+            (
+                f"{GATE_HARDENING_PROFILE_ENV} 只接受 "
+                f"{sorted(TEMPLATE_UNIT_SUFFIX_BY_PROFILE)}，收到 {raw!r}"
+            ),
+            source="resolve_gate_hardening_profile",
+            requested=raw,
+        )
+    return raw
+
+
 def template_unit_for_profile(template: str, profile: str) -> str:
     """基底模板名 ＋ 剖面 → 該剖面的模板名（`cortex-job@.service` → `cortex-job-jit@.service`）。
 
@@ -1554,11 +1664,47 @@ class SystemdTemplatePlan:
     role: str = JOB_ROLE_BUILDER
 
 
+def _resolve_profile_for_role(
+    env: Mapping[str, str], *, role: str, executor: str | None
+) -> str:
+    """該角色的加固剖面 id。**兩個角色族、兩條來源，互斥且皆 fail-closed。**
+
+    - 模型 job（builder／review）：唯一輸入是 `executor`（#643），`None` 即拒。
+    - gate（#629）：沒有 executor 可言，唯一輸入是 operator 的
+      `PSC_GATE_HARDENING_PROFILE`；傳了 executor 即拒。
+    """
+
+    if role == JOB_ROLE_GATE:
+        if executor:
+            raise _fail(
+                "job-runner-gate-executor-not-applicable",
+                (
+                    f"gate 角色不得帶 executor（收到 {executor!r}）——它不跑模型 CLI，"
+                    f"剖面由 {GATE_HARDENING_PROFILE_ENV} 決定，不隨 Manager 的 "
+                    "executor 漂移（#629）"
+                ),
+                source="_resolve_profile_for_role",
+                requested=str(executor),
+            )
+        return resolve_gate_hardening_profile(env)
+    if executor is None:
+        raise _fail(
+            "job-runner-executor-missing",
+            (
+                f"角色 {role!r} 的加固剖面唯一輸入是 executor，不得為 None"
+                "（#643：忘了說是哪個 executor 就不該派得出去）"
+            ),
+            source="_resolve_profile_for_role",
+            requested=role,
+        )
+    return resolve_hardening_profile(executor)
+
+
 def prepare_systemd_template(
     env: Mapping[str, str],
     *,
     job_id: str,
-    executor: str,
+    executor: str | None,
     role: str = JOB_ROLE_BUILDER,
     unit_active: Callable[[str, str], bool] | None = None,
 ) -> SystemdTemplatePlan:
@@ -1580,6 +1726,13 @@ def prepare_systemd_template(
     不是提權；而忘了傳 `executor` 的後果是「拿到一份不該給它的加固剖面」。前者由
     `launcher` 的單一決定點 ＋ 不變式測試守住，後者必須在型別層擋。
 
+    **`role=gate`（#629）時 `executor` 必須是 `None`**，而且是雙向強制：gate 不跑
+    任何模型 CLI，所以「哪個 executor」對它沒有意義，剖面改由
+    :func:`resolve_gate_hardening_profile` 從 operator 平面取得。傳了 executor 就是
+    呼叫端把 gate 當成模型 job 在派——那會讓剖面跟著 `PSC_MANAGER_EXECUTOR` 漂移，
+    而 gate 跑什麼命令與 Manager 用哪個模型完全無關。反過來，模型 job 傳 `None`
+    也一樣 fail-closed（那正是 #643 要擋的「忘了說是哪個 executor」）。
+
     **在任何副作用之前呼叫**：這裡每一個 raise 都代表本次派工不該發生。
     """
 
@@ -1587,7 +1740,7 @@ def prepare_systemd_template(
     account = resolve_job_account(env, role=role)
     group = resolve_job_group(env, role=role)
     base_template = resolve_template_unit(env, role=role)
-    profile = resolve_hardening_profile(executor)
+    profile = _resolve_profile_for_role(env, role=role, executor=executor)
     template = template_unit_for_profile(base_template, profile)
     shim = resolve_job_shim(env)
     spool_dir = resolve_job_spec_spool(env)

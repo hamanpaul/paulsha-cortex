@@ -24,12 +24,14 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from . import terminal_contract
+from . import spool_slot, terminal_contract
 
 
 # operator 宣告 gate 的環境變數前綴；``PSC_GATE_CMD_PYTEST`` → gate ``pytest``。
@@ -262,6 +264,54 @@ def run_gates(
     return rows
 
 
+class SnapshotError(OSError):
+    """拋棄式副本無法建立（#629）。**不寫 ledger**，讓採信端照 `require_ledger` 拒。"""
+
+
+def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
+    """把被驗的工作樹複製成一份**拋棄式副本**，回傳副本路徑（#629）。
+
+    ## 為什麼是副本而不是「工作樹對 gate 唯讀」
+
+    - **唯讀不可行**：`pytest` 要寫 `.pytest_cache`／`__pycache__`，operator 宣告的
+      `npm test`／`cargo test`／`make` 更是必寫。把工作樹掛成唯讀只會讓每個真實
+      gate 以 EROFS 收場——那正是 #629 要修掉的「安全但不能用」。
+    - **副本另外買到兩件事**：(a) gate 的寫入不會污染 builder 交付的那棵樹，harvest
+      讀到的仍是 builder 自己的成果；(b) 快照在單一時點取得，builder 留下的背景
+      行程改不了 gate 跑到一半的樹（TOCTOU）。
+
+    ## 兩條刻意的取捨
+
+    `symlinks=True`——symlink **原樣複製成 symlink，絕不跟隨**。跟隨的後果有兩個：
+    指向樹外的絕對 symlink 會把外部內容**複製進**副本（gate 於是在自己的可寫區內
+    得到一份 `/etc` 的複本），而指向上層目錄的 symlink 會讓 `copytree` 走進無界的
+    遞迴。不跟隨之後，副本裡的 symlink 仍然是 symlink，解析它們是 gate 命令自己的
+    事，而 gate 的 unit 已經把可寫面收斂到自己那兩個目錄。
+
+    目的地**先整個移除再重建**：留下上一輪的殘留等於讓前一次 gate 的產物（甚至前一
+    次被攻陷的 gate 留下的東西）參與這一次的判定。與 `spool_slot.create_slot(
+    reset=True)` 同一條理由——重建比「就地清理」少一個要窮舉的清單。
+    """
+
+    src = Path(source)
+    dst = Path(destination)
+    if src.is_symlink() or not src.is_dir():
+        raise SnapshotError(f"gate snapshot source is not a directory: {src}")
+    if dst == src or src in dst.parents:
+        # 副本落在來源樹**裡面**會遞迴複製自己；落在同一個路徑則直接毀掉來源。
+        raise SnapshotError(f"gate snapshot destination overlaps its source: {dst}")
+    try:
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.is_dir():
+            shutil.rmtree(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dst, symlinks=True, ignore_dangling_symlinks=True)
+    except OSError as exc:
+        raise SnapshotError(f"gate snapshot failed: {src} -> {dst}: {exc}") from exc
+    return dst
+
+
 def build_ledger(
     gates: Sequence[Mapping[str, object]],
     *,
@@ -298,24 +348,69 @@ def write_gate_ledger(
         runner=runner,
     )
     payload = build_ledger(gates, slice_id=source.get("PSC_SLICE_ID"))
+    write_ledger_payload(ledger_path, payload)
+    return payload
+
+
+def encode_ledger(payload: Mapping[str, object]) -> str:
+    """ledger 的 canonical JSON 編碼（與 `terminal_contract.gate_ledger_digest` 同形）。"""
+
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def write_ledger_payload(
+    ledger_path: str | Path, payload: Mapping[str, object]
+) -> Path:
+    """把 ledger payload **原子**寫到指定路徑，回傳該路徑。
+
+    抽出來是為了讓 **Manager 自己重寫權威 ledger** 這條路徑（#629 的
+    `coordinator/gate_runner.py`）與本模組共用同一份編碼與同一套原子寫入——兩邊
+    若各寫一次，`terminal_contract.gate_ledger_digest()` 算出來的 digest 就可能因為
+    一個空白而不同，而那個 digest 是要進 evidence 的。
+    """
+
     target = Path(ledger_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
-    )
+    tmp.write_text(encode_ledger(payload), encoding="utf-8")
     os.replace(tmp, target)
-    return payload
+    return target
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="paulsha-cortex-gate-ledger")
     parser.add_argument("--out", required=True, help="gate ledger 輸出路徑")
     parser.add_argument("--worktree", required=True, help="執行 gate 的工作目錄")
+    parser.add_argument(
+        "--snapshot-from",
+        default=None,
+        help=(
+            "#629：先把這棵樹複製成 --worktree 的拋棄式副本，再在副本上跑 gate。"
+            "gate 執行身分（cortex-gate）對來源只有唯讀 ACL，寫入一律落在副本。"
+        ),
+    )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help=(
+            "寫完 ledger 後放寬到 0644，讓 spool 的 consumer（Manager）讀得到"
+            "（#638 缺陷 2 的同一個修法；`wx` 無 `r` 的那一格上，檔由 producer 擁有）。"
+        ),
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.snapshot_from is not None:
+        try:
+            snapshot_worktree(args.snapshot_from, args.worktree)
+        except SnapshotError as exc:
+            # **刻意不寫任何 ledger**：快照失敗代表我們根本沒有可判定的樹，寫一份
+            # 「全部 failed」會把「沒驗到」偽裝成「驗過但沒過」。採信端看到 ledger
+            # 不存在，照 `require_ledger` fail closed，理由在本行程的 stderr 上。
+            print(str(exc), file=sys.stderr)
+            return 74
     try:
         write_gate_ledger(ledger_path=args.out, worktree=args.worktree)
+        if args.publish:
+            spool_slot.publish_file(args.out)
     except GateSpecError:
         # operator 宣告錯誤：仍寫出一份「沒有任何 gate 通過」的 ledger，讓 harvest
         # fail closed 且訊息可追溯，而不是留下空目錄讓人以為 gate 沒被要求。
@@ -339,6 +434,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             encoding="utf-8",
         )
+        if args.publish:
+            # 宣告壞掉時**同樣要放寬**：那份「gate-spec failed」的 ledger 就是這一輪
+            # 的結論，consumer 讀不到它等於把「設定錯誤」退化成「什麼都沒發生」。
+            spool_slot.publish_file(args.out)
         return 78
     return 0
 

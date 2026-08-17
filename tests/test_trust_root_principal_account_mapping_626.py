@@ -372,10 +372,49 @@ def test_registry_needs_exactly_the_two_deployment_decisions() -> None:
         used.update(asset.writers)
         used.update(asset.readers)
     covered = {opt.principal for opt in PRINCIPAL_ACCOUNT_OPTIONS}
-    fully_mapped = _resolved(THREE_WAY_SCHEME)
+    # **判準是「定案方案」**，不是某個字面 id：#629 把定案推進到四分（多一個
+    # `cortex-gate`），三分對 `GATE` 明示 `ABSENT_ACCOUNT`，因此那個方案下 `GATE`
+    # 永遠 resolve 不到帳號——那是決定，不是 #626 要擋的那種遺漏。
+    fully_mapped = _resolved(permgen.DEFAULT_SCHEME)
     unmapped = {
         p for p in used
         if p is not Principal.ANY_SAME_UID and fully_mapped.resolve(p) is None
     }
     assert unmapped == set(), sorted(p.value for p in unmapped)
     assert covered <= used
+
+
+def test_absent_in_account_of_is_a_decision_not_an_omission() -> None:
+    """#629：`account_of` 也吃 `ABSENT_ACCOUNT`，語意與部署決定型欄位逐字相同。
+
+    三個狀態必須可分辨：缺鍵＝遺漏（fail-closed 並指名）、`ABSENT_ACCOUNT`＝
+    「本方案沒有這個角色」（略去、不 fail）、帳號名＝有。少了中間那一態，
+    「二分／三分沒有 gate 執行面」就只能靠讓整個產生器拒絕輸出來表達。
+    """
+    three = _resolved(THREE_WAY_SCHEME)
+    four = _resolved(permgen.FOUR_WAY_SCHEME)
+
+    assert three.account_of[Principal.GATE] == permgen.ABSENT_ACCOUNT
+    assert three.resolve(Principal.GATE) is None
+    assert Principal.GATE not in three.unresolved_principals()
+    assert permgen.ABSENT_ACCOUNT not in three.declared_accounts()
+
+    assert four.resolve(Principal.GATE) == "cortex-gate"
+    assert "cortex-gate" in four.declared_accounts()
+
+    # 缺鍵（既不是帳號也不是明示不存在）仍然 fail-closed 並指名。
+    missing = permgen.UidScheme(
+        scheme_id="gate-omitted",
+        account_of={
+            p: a for p, a in four.account_of.items() if p is not Principal.GATE
+        },
+        durable_state_owner=four.durable_state_owner,
+        operator_account=four.operator_account,
+        external_reader_account=four.external_reader_account,
+    )
+    assert Principal.GATE in missing.unresolved_principals()
+    message = permgen.unresolved_principal_message(
+        (Principal.GATE,), missing.scheme_id
+    )
+    assert "four-way" in message
+    assert "cortex-gate" in message

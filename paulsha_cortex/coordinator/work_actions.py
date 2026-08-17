@@ -3451,9 +3451,21 @@ def _regenerate_gates_action(
     fail closed 條件：exact WorkflowRun CAS、run 必須在 needs_human、且必須真的
     找得到一個 gate-ledger 相關 phase、已終止、log 與 worktree 都還在的 job。
     任一條不成立即拒絕，不做任何 side effect。
+
+    **#629：執行面收斂到 gate 執行身分。** 本動作原本在 **Manager 進程內**直接呼叫
+    `gate_ledger.write_gate_ledger()`——那等於以 `cortex-manager` 的身分，在 builder
+    完全掌控內容的工作樹上跑 `pytest`，而 `pytest` 會載入該樹的 `conftest.py` 與
+    plugin。direct 模式下 builder 與 Manager 同 UID，這件事本來就沒有邊界可言；OS
+    隔離上線後它是一條**真的**提權路徑，而且是最容易被忽略的那一種——它不在派工的
+    熱路徑上，只在 operator 手動救援時才走到。
+
+    改法不是在這裡另寫一套降權，而是改呼叫 `gate_runner.run_declared_gates()`：自動
+    路徑（`manager.terminalize_workflow_job`）與本動作因此走**同一支**，不會出現
+    「自動的那條降權了、手動的那條還在 Manager 進程裡跑」。direct 模式下該函式逐字
+    沿用既有行為（就地 `write_gate_ledger`），本動作的產出與訊息面零變化。
     """
 
-    from . import gate_ledger, terminal_contract
+    from . import gate_ledger, gate_runner, terminal_contract
     from .manager import GATE_LEDGER_REQUIRED_PHASES
 
     extras = set(args) - {
@@ -3510,14 +3522,26 @@ def _regenerate_gates_action(
         raise RuntimeError("regenerate-gates requires the builder worktree to still exist")
 
     ledger_path = terminal_contract.gate_ledger_path(job["log_path"])
+    spool_key = gate_runner.spool_key_for_job(job)
+    if spool_key is None:
+        raise RuntimeError("regenerate-gates requires a resolvable gate spool key")
     try:
-        payload = gate_ledger.write_gate_ledger(
+        payload = gate_runner.run_declared_gates(
+            job_id=str(job.get("job_id") or spool_key),
+            spool_key=spool_key,
             ledger_path=ledger_path,
             worktree=worktree,
         )
     except gate_ledger.GateSpecError as exc:
         # operator 宣告仍不合法：不寫出任何東西，把設定錯誤原樣回報。
         raise RuntimeError(f"regenerate-gates gate declaration invalid: {exc}") from exc
+    except gate_runner.GateRunnerError as exc:
+        # 降權模式下 gate 執行身分起不來／沒交付 ledger。**不退回 Manager 進程內
+        # 執行**——那正是本動作要移除的那條提權路徑；診斷碼原樣帶出來讓 operator
+        # 修部署，而不是靜默換一個更寬的身分把它跑起來。
+        raise RuntimeError(
+            f"regenerate-gates gate execution failed ({exc.reason}): {exc}"
+        ) from exc
     gates = [
         {"name": row.get("name"), "status": row.get("status"), "exit_code": row.get("exit_code")}
         for row in payload.get("gates", [])
