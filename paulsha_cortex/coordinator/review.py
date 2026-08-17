@@ -15,7 +15,7 @@ from paulsha_cortex.config import paths
 
 from ..persona import render
 from ..project_policy import ProjectPolicyError, resolve_project_policy
-from . import model_identities, verification
+from . import model_identities, spool_slot, verification
 
 MODEL_IDENTITY_SCHEMA_VERSION = model_identities.MODEL_IDENTITY_SCHEMA_VERSION
 REVIEW_SCHEMA_VERSION = 1
@@ -24,8 +24,9 @@ REVIEW_SCHEMA_VERSION = 1
 #: 之前派工、job row 無 `review_verdict_channel` 標記」的 reviewer job 保留讀取。
 REVIEW_VERDICT_FILENAME = ".psc-review-verdict.json"
 REVIEW_WORKTREE_DIRNAME = ".psc-review-worktrees"
-#: per-job verdict spool 內的檔名（目錄本身以 reviewer job id 定址）。
-REVIEW_VERDICT_SPOOL_FILENAME = "verdict.json"
+#: per-job verdict spool 內的檔名（目錄本身以 reviewer job id 定址）。權威定義在
+#: `spool_slot`——`launcher` 組 wrapper 的發表段時也要用同一個字串（#638 缺陷 2）。
+REVIEW_VERDICT_SPOOL_FILENAME = spool_slot.REVIEW_VERDICT_FILENAME
 #: reviewer job row 上的通道標記。有此標記 ⇒ 該 job 是經 spool 通道派工的，
 #: **不得**回退讀 worktree（否則 builder 只要刪掉 spool 再寫 worktree 就能洗白）。
 REVIEW_VERDICT_CHANNEL_SPOOL = "spool"
@@ -228,8 +229,14 @@ def review_verdict_path(worktree: str | Path) -> Path:
 #      ACL、builder 完全無權限。
 #   2. **job-addressed ＋ pre-seed 守衛**——dispatch 前該 job 的 spool 位置必須
 #      不存在（`prepare_review_verdict_spool()`）；已存在即拒絕派工。
-#   3. **落地後唯讀**——Manager 收割並落成 Tier-0 gate evaluation 後把 spool
-#      verdict 轉 0o444（`seal_review_verdict_spool()`）。
+#   3. **落地後封口**——Manager 收割並落成 Tier-0 gate evaluation 後把該 job 的
+#      **那一格目錄**轉唯讀（`seal_review_verdict_spool()`）。#638 之前這裡封的是
+#      verdict 檔本身（`chmod 0o444`），但檔案是 reviewer 擁有的、Manager `chmod`
+#      不了它，該處又刻意不 raise ⇒ 無聲失敗。封目錄才是 consumer 做得到的那一個。
+#
+# per-job 那一格的生命週期（建立 → producer 寫 → consumer 讀 → seal）與
+# `commit-spool` 共用 `coordinator/spool_slot.py`；#638 的三個缺陷之所以有兩個
+# 實例，正是因為兩邊原本各自實作了這一段。
 #
 # **誠實邊界**：Phase 2b（分 UID／chown）之前，同 UID 下 builder 技術上仍寫得進
 # coordinator_root（Phase 1 自檢已知並 WARN）。本階段交付的是**通道結構**——路徑、
@@ -268,26 +275,31 @@ def prepare_review_verdict_spool(
 ) -> Path:
     """建立 per-job spool 目錄並執行 pre-seed 守衛；回傳 verdict 檔路徑。
 
-    守衛（全部 fail-closed，任何一項成立即拒絕派工）：
+    守衛（全部 fail-closed，任何一項成立即拒絕派工，語意與修法前逐字相同）：
 
     - spool 目錄或 verdict 檔已存在／是 symlink → 有人預埋，拒絕；
     - 目錄建立競態（`FileExistsError`）→ 同樣視為預埋，拒絕。
 
     這是舊 `prepare_review_worktree()` 內那道「verdict 檔不得預先存在」守衛搬到
     新落點的版本；舊守衛保留為 defense-in-depth（legacy fallback 仍會讀它）。
+
+    生命週期本身走 :mod:`spool_slot`（與 `commit-spool` 共用同一份實作，#638）。
+    `reset=False` 就是上面那道 pre-seed 守衛：那一格必須不存在。commit-spool 用
+    `reset=True`（同一個 slice_id 會被 retry 重跑），而 reviewer job 每次派工都是
+    **新的 job id**，因此這裡不需要、也不該有解封路徑。
+
+    **不再傳明確 mode**（#638 缺陷 1）：在帶 default ACL 的樹上，`mkdir(mode=…)`
+    會把 ACL mask 一起重設，把 reviewer 繼承來的具名條目壓成 `#effective:---`，
+    實機後果是 reviewer 連 verdict 都寫不出來。初始權限交給 default ACL，事後只
+    **檢查**並收窄 `other`（見 `spool_slot.narrow_inherited_mode()`）。
     """
 
     spool_dir = review_verdict_spool_dir(
         reviewer_job_id=reviewer_job_id, coordinator_root=coordinator_root
     )
-    if spool_dir.is_symlink() or spool_dir.exists():
-        raise RuntimeError(f"preseeded review verdict spool detected: {spool_dir}")
-    # spool 根：owner-only。已存在時不 chmod——真正的 owner/mode 由 Phase 2b 的
-    # permgen 計畫套用（見 `trust_root/permgen.py` 的 `review-verdict-spool`）。
-    spool_dir.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     try:
-        spool_dir.mkdir(mode=0o700)
-    except FileExistsError as exc:
+        spool_slot.create_slot(spool_dir, reset=False)
+    except spool_slot.SpoolSlotError as exc:
         raise RuntimeError(f"preseeded review verdict spool detected: {spool_dir}") from exc
     verdict_path = spool_dir / REVIEW_VERDICT_SPOOL_FILENAME
     if verdict_path.exists() or verdict_path.is_symlink():
@@ -295,22 +307,53 @@ def prepare_review_verdict_spool(
     return verdict_path
 
 
+def publish_review_verdict(path: str | Path) -> bool:
+    """reviewer 寫完 verdict 後把它放寬給 Manager 讀（#638 缺陷 2）。
+
+    `wx` 無 `r` 的那一格上，verdict 由 **reviewer 的 uid** 建立、又常帶降權 unit
+    的 `UMask=0077`，Manager 是**目錄**的 owner 但那不給檔案內容的讀取權——
+    consumer 讀不到，verdict 通道整條不成立。
+
+    真正在生產路徑上執行這一步的是 wrapper script 裡的
+    `spool_slot.publish_file_command()` 段（producer 是模型，它不會自己 chmod）；
+    本函式是 in-process producer 的等價入口，兩者共用同一個 mode 常數。
+    """
+
+    return spool_slot.publish_file(path)
+
+
 def seal_review_verdict_spool(path: str | Path) -> None:
-    """Manager 落地後把 spool verdict 轉唯讀（0o444）。
+    """Manager 落地後把該 job 那一格封口。
+
+    **封的是目錄，不是 verdict 檔**（#638 缺陷 3）。修法前這裡是
+    `os.chmod(<verdict>, 0o444)`，但只有檔案 owner 或 root 能 `chmod`，而 verdict
+    是 **reviewer 擁有**的——三分下必定 `PermissionError`，而這裡刻意不 raise，
+    於是**無聲失敗**：operator 實機驗到 reviewer 可以在 Manager 判讀之後回頭
+    `printf TAMPERED > <verdict>`，spec §R2 要守的東西根本沒有成立過。
+
+    改成封目錄之後，consumer 封的是自己**擁有**的那一項：收掉目錄的 `w` 讓那一格
+    定版，而 `chmod` 同時把 ACL mask 收成 `---`，reviewer 具名條目的 `x`
+    （traverse）一併失效——它連既有的 verdict 檔都再也打不開。`spool_slot` 另對
+    目錄內既有檔做一次 best-effort `0444`，那一次只在同 UID（`direct` 模式）下會
+    成功，是額外一層、不是封口的效力來源。
 
     權威副本是已落地的 Tier-0 gate evaluation（immutable，見
-    `write_gate_evaluation()`）；封存 spool 只是讓「同一個 job 的 verdict 被事後
-    改寫」在檔案層留下痕跡。**在 Phase 2b 之前這不是強制**——同 UID 的 owner 可以
-    chmod 回去，故刻意不對失敗 raise（封存失敗不該讓一次合法的 review 反而卡住）。
+    `write_gate_evaluation()`）；封存只是讓「同一個 job 的 verdict 被事後改寫」在
+    檔案層留下痕跡，故仍刻意不對失敗 raise（封存失敗不該讓一次合法的 review
+    反而卡住）。
+
+    verdict 缺席（或是 symlink）時**完全不動**：既有的容忍語意一個位元組沒變，而
+    且封的既然是目錄，「路徑指到哪一格」這件事必須由一個真的落在那一格裡的成果
+    確認過，不能只憑呼叫端給的字串推導。
     """
 
     target = Path(path)
     try:
         if target.is_symlink() or not target.is_file():
             return
-        os.chmod(target, 0o444)
     except OSError:
         return
+    spool_slot.seal_slot(target.parent)
 
 
 # --- issue #482：pre-launch absent evaluation 的命名空間 ----------------------
