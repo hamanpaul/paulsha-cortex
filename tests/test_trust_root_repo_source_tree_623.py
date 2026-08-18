@@ -122,7 +122,9 @@ def test_gitconfig_assets_mirror_the_codex_hooks_shape(asset_id, readers) -> Non
     `.gitconfig` 可指定 `core.fsmonitor`／`alias.*` 這類會執行外部命令的鍵。
     """
     asset = registry.asset_by_id(asset_id)
-    hooks = registry.asset_by_id("codex-hooks")
+    # #698：`codex-hooks` 已拆成 per-account 兩份（`enforcement_asset_ids()` 導出）。
+    # 拿 builder 那一份當比較基準即可——兩份同形。
+    hooks = registry.asset_by_id("builder-codex-hooks")
     assert asset.tier is hooks.tier is AssetTier.TIER_0
     assert asset.tree is hooks.tree is TrustTree.MANAGER_OWNED
     assert asset.ingress_kind is hooks.ingress_kind is IngressKind.DEPLOYMENT_WRITE
@@ -331,6 +333,11 @@ def test_monitor_read_write_paths_stay_strictly_narrower_than_manager(scheme) ->
     assert monitor < manager, (sorted(monitor), sorted(manager))
 
 
+def _prefix_of(account: str) -> str:
+    """OS 帳號名 → 登記表資產 id 前綴（#698 的 hooks 資產 id 由它拼出來）。"""
+    return DEFAULT_LAYOUT.credential_prefix_of(account)
+
+
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
 def test_job_template_unit_excludes_the_source_tree_but_keeps_its_own_clone(scheme) -> None:
     """job 側：來源樹唯讀（不在 RWP），clone 落點 `<worktree>/%i` 在 RWP 內。"""
@@ -342,10 +349,15 @@ def test_job_template_unit_excludes_the_source_tree_but_keeps_its_own_clone(sche
         scheme.scheme_id, unit.read_write_paths,
     )
     assert any(_within(clone, rwp) for rwp in unit.read_write_paths), unit.read_write_paths
-    # 兩個 root-owned 設定檔（hooks／gitconfig）同樣不可寫。
-    for protected in (job_layout.gitconfig_of(unit.account),
-                      job_layout.codex_hooks_dir_of(unit.account)):
-        assert not any(_within(protected, rwp) for rwp in unit.read_write_paths), protected
+    # root-owned 的 `.gitconfig` 不可寫（連 mount 層都不放行）。
+    protected = job_layout.gitconfig_of(unit.account)
+    assert not any(_within(protected, rwp) for rwp in unit.read_write_paths), protected
+    # #698：`~/.codex` 那一層**改由 DAC 守**（root-owned ＋ sticky），整棵必須進 RWP
+    # 才能讓 codex 起得來。mount 層守的改成樹裡那個 enforcement 檔本身——它必須
+    # 逐字出現在 `ReadOnlyPaths=` 上，否則本形狀比 #640 淨退一層。
+    hooks = job_layout.asset_paths()[f"{_prefix_of(unit.account)}-codex-hooks"]
+    assert hooks in unit.read_only_paths, (hooks, unit.read_only_paths)
+    assert any(_within(hooks, rwp) for rwp in unit.read_write_paths), "巢狀關係是前提"
 
 
 # ---------------------------------------------------------------------------

@@ -246,6 +246,16 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
    ACL 的目錄，但它要改 permgen 的 mode 管線（`_mask_write` 會拿掉 group 寫入位、
    `mode & 0o700` 會吃掉 sticky 位，那是 spec §R2 的既有不變式），且「codex 能不能在一個
    它**不擁有**的 `$CODEX_HOME` 下跑起來」**沒有實機證據** ⇒ 依 D13 不得宣稱可用。
+
+   > **✅ U-9 已於 #698 結案（0818，operator 裁決採方案 A＝上述候選解）。** 觸發它的是
+   > **實測**而不是討論：R9 族 3 的 T3.9 在 `cortex-reviewer-planner` 上量到
+   > `!! SUCCEEDED (FAIL)`——該帳號**真的植入了** `hooks.json`，而 codex hooks 會執行
+   > 命令 ⇒ 跨 job 持久化。#698 把上面兩個「不做的理由」逐條消掉：mode 管線改成
+   > `mode & (STICKY_BIT | 0o700)`（§R2 的 group／other 不可寫**一行未放寬**），而
+   > 「不擁有的 `$CODEX_HOME`」已在完整模板 unit 加固面下實測（runbook 第 4e-2b 步）。
+   > **範圍涵蓋兩個帳號**：形狀改由 `EXECUTOR_ENFORCEMENT_LEAVES` 一條規則導出、在
+   > import 當下強制，builder 一併遷移。R-6 的其餘部分不變（token 葉檔仍可被該帳號
+   > 刪除或替換——sticky 保護的是 root 擁有的那些檔）。
    **同一個裁決也涵蓋 builder**：它在模板 unit 下跑 codex 會撞同一條阻斷。
 4. **`manager-claude-credential` 沒有依 plan 原文刪除。** plan 寫「第三項因為本票的裁決是
    『planning 一律走降權 job』」——那個裁決的**落地**是票 F（#687）的切換，而 direct 路徑

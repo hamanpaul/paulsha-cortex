@@ -493,6 +493,10 @@ def test_planning_log_spool_needs_no_new_write_surface() -> None:
     )
     unit = permgen.build_job_unit(permgen.THREE_WAY_SCHEME, principal=Principal.REVIEWER)
     assert sorted(unit.read_write_paths) == [
+        # #698：codex 的狀態樹從 `cache/codex` 搬成 HOME 底下的 root-owned sticky 真
+        # 目錄，因此多這一條。**這不是本票（票 D／planning log）開的通道**——同一棵樹
+        # 換位置，換到的是「目錄由 root 擁有」（`hooks.json` 守得住的前提，#698）。
+        permgen.asset_paths(layout)["reviewer-planner-codex-state"],
         layout.cache_of(layout.reviewer_planner_account),
         layout.review_verdict_spool_root,
     ]

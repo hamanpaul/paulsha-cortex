@@ -271,6 +271,8 @@ def test_inapplicable_assets_are_enumerable_not_silent() -> None:
         "reviewer-planner-codex-state",
         "reviewer-planner-agy-state",
         "reviewer-planner-claude-state",
+        # #698：那個帳號的 codex hooks 也掛在同一個 HOME 下，因此同樣不適用於二分。
+        "reviewer-planner-codex-hooks",
     }, sorted(two_way)
     # 定案的兩個方案完全沒有不適用項——有的話就是 layout 的帳號欄位與方案對不上。
     for scheme in ALL_SCHEMES:
@@ -544,9 +546,12 @@ def test_every_downgraded_principal_appears_somewhere_in_the_inventory() -> None
 def test_home_anchored_assets_are_derived_not_hand_written() -> None:
     """憑證／per-account 設定那一族由 `asset_paths()` 機械導出，不是手抄清單。"""
     assert home_anchored_asset_ids() == frozenset({
-        "builder-executor-credential",
+        # #698：builder 的 codex 憑證改成 sticky 樹（舊 id `builder-executor-credential`），
+        # 而 `codex-hooks` 拆成 per-account 兩份——兩者都由憑證表那條規則導出。
+        "builder-codex-state",
+        "builder-codex-hooks",
+        "reviewer-planner-codex-hooks",
         "builder-gitconfig",
-        "codex-hooks",
         GH_CONFIG,
         GH_CREDENTIAL,
         "manager-gitconfig",
@@ -572,8 +577,13 @@ def test_deferred_dependencies_stay_enumerable() -> None:
       （U-5 裁決）為那個帳號登記了三格登入態（codex／agy／claude）。原本那條 deferred
       的 `disposition` 寫的是「補登記表第二列（產生器一行都不必改）」，而 #686 的實測
       證明那句話是錯的：codex 需要 `$CODEX_HOME` 整棵可寫，單檔不夠。
-    - `reviewer-planner-codex-hooks` **留著，但理由整段換掉**：它現在不是「還沒補」，
-      而是與 codex 的可用性**在 `$CODEX_HOME` 這一層互斥**（升為 U-9）。
+    - `reviewer-planner-codex-hooks` 在 #685 當時**留著**，理由是它與 codex 的可用性
+      **在 `$CODEX_HOME` 這一層互斥**（升為 U-9）。**#698 把它關掉了**，而且不是
+      「刪一列」：operator 裁決採方案 A（sticky ＋ root-owned hooks）之後那條張力
+      **真的不存在了**——兩件事同時成立，兩份 hooks 都成為登記表資產。
+      關閉的前提有兩個，兩個都已在本 PR 內完成：mode 管線能表達 sticky
+      （`build_entry()` 的安全網），以及「codex 在一個它不擁有的 `$CODEX_HOME` 下
+      跑得起來」的實機證據（runbook 第 4e-2b 步，完整模板 unit 加固面）。
     - `manager-claude-credential` 在 #685 當時**留著**：U-5 解除了它的機械阻礙
       （表達得了了），但「要不要給 Manager 一份模型憑證」是 #672 的核心裁決，答案是
       不要；本項由票 F（#687）切換之後隨 direct 路徑一起消失，**不是**當時刪掉。
@@ -586,8 +596,10 @@ def test_deferred_dependencies_stay_enumerable() -> None:
     deferred = deferred_run_dependencies()
     assert {item.name for item in deferred} == {
         "gate-gitconfig",
-        "reviewer-planner-codex-hooks",
     }, sorted(item.name for item in deferred)
+    # #698：關閉的那一項不得以任何形式「改個名字留下來」，而且它必須真的變成資產。
+    assert "reviewer-planner-codex-hooks" not in {item.name for item in deferred}
+    assert "reviewer-planner-codex-hooks" in {a.asset_id for a in ASSET_REGISTRY}
     # #687：被移除的那一項不得以任何形式「改個名字留下來」。
     assert "manager-claude-credential" not in {item.name for item in deferred}
     for item in deferred:
