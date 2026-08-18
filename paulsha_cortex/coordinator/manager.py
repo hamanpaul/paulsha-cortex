@@ -51,6 +51,7 @@ from .model_identities import (
     CapabilityProbe,
     IdentityRegistry,
     ModelIdentity,
+    is_environment_grade_rejection_reason,
     load_model_identities,
 )
 from .planning import (
@@ -7181,11 +7182,30 @@ def _is_planning_worktree_drift_failure(reason: str | None) -> bool:
     return reason is not None and _PLANNING_WORKTREE_DRIFT_MARKER in reason
 
 
+# --- issue #682（#672 票 A）：拒因表裡的 environment 級拒因 -------------------
+#
+# `no-heterogeneous-planner` 今天一律落 `content`，而 `content` 在
+# `_resume_decision` 一律不浮現 `recover-planning` ⇒ 死路。但那個 reason 底下
+# 其實混著三類完全不同的失敗：拓撲問題（roster 真的沒有異質 planner）、輸出
+# 不合約（#670 的 code fence／`agy models` 兩欄漂移），以及 executor 根本起不
+# 來（#672 實測的沙箱／憑證缺口）。後者是環境事件，重跑或修環境就好，不該被
+# 判成模型內容缺陷。
+#
+# 判準刻意**不**對整串 reason 做 substring-search：拒因表的 diagnostic 帶的是
+# 模型 stdout 節錄，一個回「planning-executor-failed」的模型就能把 content
+# 失敗偽裝成 environment。改成讀渲染端算好、且**錨在字串開頭**的 `grade=`
+# 欄位（`model_identities.render_secondary_rejection_reason`）。
+def _is_planning_candidate_rejection_environment_failure(reason: str | None) -> bool:
+    """判斷 planning 失敗的 reason 是否為帶 environment 級拒因的逐候選拒因表。"""
+
+    return is_environment_grade_rejection_reason(reason)
+
+
 def _classify_planning_failure(reason: str | None) -> str:
     """brainstorm not-ready 的 reason → `environment` / `content` 的**單一判準**。
 
     #393 的預設是 `content`（fail-closed，`_resume_decision` 不浮現
-    `recover-planning`）。三個具名例外改歸 `environment`：
+    `recover-planning`）。四個具名例外改歸 `environment`：
 
     1. `_is_planning_authority_residue_failure`（#416）——abandon 未回滾的發佈
        殘留撞見 authority fail-closed，是狀態殘留而非模型內容缺陷。
@@ -7193,8 +7213,11 @@ def _classify_planning_failure(reason: str | None) -> str:
        的暫時性錯誤（503／限流／逾時），幾分鐘後自癒。
     3. `_is_planning_worktree_drift_failure`（#507／#554）——operator worktree
        在 planning 視窗內被動過；#543 之後不再銷毀資料，是環境事件。
+    4. `_is_planning_candidate_rejection_environment_failure`（#682／#672 票 A）
+       ——`no-heterogeneous-planner` 的逐候選拒因表裡有 environment 級拒因
+       （job 起不來、executor 異常退出）。
 
-    三個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
+    四個判準合成一個具名函式，是為了讓「reason → classification」這條映射有
     單一可測的入口（過去它只以三元表達式活在 `_run_define_stage` 中段，測不到
     也看不見）。
     """
@@ -7203,6 +7226,7 @@ def _classify_planning_failure(reason: str | None) -> str:
         _is_planning_authority_residue_failure(reason)
         or _is_planning_transient_service_failure(reason)
         or _is_planning_worktree_drift_failure(reason)
+        or _is_planning_candidate_rejection_environment_failure(reason)
     ):
         return "environment"
     return "content"

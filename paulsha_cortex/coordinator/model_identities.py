@@ -6,7 +6,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 from paulsha_cortex.config import paths
 from paulsha_cortex.deck.schema import BAND_LEVELS
@@ -718,6 +718,139 @@ def _failed_agy(reason: str, diagnostic: str | None = None) -> CapabilityProbe:
     return CapabilityProbe(False, "agy", AGY_MODEL_ID, AGY_DOMAIN, reason, diagnostic)
 
 
+# ---------------------------------------------------------------------------
+# issue #682（#672 票 A）：錯誤語意三分
+#
+# 修法前 planning 失敗只有一個字面值 `no-heterogeneous-planner`——它把三類
+# 結構上完全不同的失敗壓成同一個「拓撲問題」：
+#
+#   1. job／executor 起不來（沙箱、PATH、runtime、polkit、模板未安裝）
+#   2. executor 起來了但異常退出（含「連錯誤訊息都沒有」的靜默退出）
+#   3. executor 正常退出但輸出不合約（parse 不了、內容不符、model 不在列）
+#
+# #670 就是被這樣誤診的：真因是 `agy models` 兩欄漂移造成 100%
+# `model-not-listed` ＋ code fence 造成 25% parse 失敗，blocking reason 說的
+# 卻是「沒有異質 planner」，排查方向整個帶偏。
+#
+# 族名在此定義（design D8／spec R6）；票 C（probe 快取）與票 E
+# （`JobPlanningInvoker`）落地時直接消費同一組常數，不再各自發明一套。
+# ---------------------------------------------------------------------------
+
+#: job 起不來：polkit 拒絕、模板未安裝、shim 不可執行、spec spool 不可寫、
+#: instance 已 active、`confirm_template_instance_started` 逾時。
+PLANNING_FAILURE_JOB_START = "planning-job-start-failed"
+#: job／行程起來了，但 executor 非零退出或零輸出。
+PLANNING_FAILURE_EXECUTOR = "planning-executor-failed"
+#: executor 正常退出，輸出不符契約（parse 失敗、身分不符、model 不在列）。
+PLANNING_FAILURE_OUTPUT = "planning-output-malformed"
+#: `planning-executor-failed` 的子類：rc≠0 且 stdout／stderr 皆空。
+#:
+#: 這是整個家族裡最難查的一種——**連錯誤訊息都沒有**，歸因於是會落到模型、
+#: prompt、逾時或憑證，而不會落到執行環境。它 MUST 被顯式命名，MUST NOT 被
+#: 壓成任何拓撲原因（spec R6）。
+PLANNING_FAILURE_EXECUTOR_SILENT_EXIT = "executor-silent-exit"
+#: 尚未歸類的 probe 失敗。**fail-closed**：不當作環境問題，只當作「這個族還
+#: 沒被對應過」的可見標記——新增 probe 失敗原因時會直接在拒因表上現形，而不是
+#: 被默默塞進三族之一。
+PLANNING_FAILURE_UNCLASSIFIED = "planning-probe-unclassified"
+
+PLANNING_FAILURE_FAMILIES = (
+    PLANNING_FAILURE_JOB_START,
+    PLANNING_FAILURE_EXECUTOR,
+    PLANNING_FAILURE_OUTPUT,
+    PLANNING_FAILURE_UNCLASSIFIED,
+)
+
+#: 哪些族屬「環境」——命中者讓 `manager._classify_planning_failure` 改判
+#: `environment`，`_resume_decision` 因而得以浮現 `recover-planning`。
+#: `planning-output-malformed` 刻意**不在**此列：那是模型內容／格式問題，
+#: 維持 `content` 的 fail-closed 意圖（反向誤報同樣不可接受）。
+ENVIRONMENT_GRADE_PLANNING_FAMILIES = frozenset(
+    {PLANNING_FAILURE_JOB_START, PLANNING_FAILURE_EXECUTOR}
+)
+
+#: probe 失敗原因 → 三分族的明表。散落的 `if` 是漂移的來源，這裡只留一張表。
+_PROBE_REASON_FAMILIES: dict[str, str] = {
+    # `agy models` 這一次 CLI 呼叫死掉／非零退出：CLI 根本起不來或環境不對。
+    "models-probe-failed": PLANNING_FAILURE_EXECUTOR,
+    # smoke 呼叫非零退出。
+    "smoke-failed": PLANNING_FAILURE_EXECUTOR,
+    # CLI 正常退出但列表裡沒有我們要的 model（#670 的兩欄漂移就落在這裡）：
+    # 輸出與 roster 契約不符，不是環境壞掉。
+    "model-not-listed": PLANNING_FAILURE_OUTPUT,
+    "malformed-output": PLANNING_FAILURE_OUTPUT,
+    "identity-mismatch": PLANNING_FAILURE_OUTPUT,
+    # 票 C／票 E 之後 probe 自己就會回族名，這裡讓它原樣通過。
+    PLANNING_FAILURE_JOB_START: PLANNING_FAILURE_JOB_START,
+    PLANNING_FAILURE_EXECUTOR: PLANNING_FAILURE_EXECUTOR,
+    PLANNING_FAILURE_OUTPUT: PLANNING_FAILURE_OUTPUT,
+}
+
+#: `_probe_identity` 的 `safe-probe-failed` 只帶例外**型別名**（不帶訊息），
+#: 那個型別名就是唯一能機械分辨「executor 死了」還是「輸出不合約」的線索。
+_PROBE_FAILED_REASON = "safe-probe-failed"
+_ENVIRONMENT_EXCEPTION_NAMES = frozenset(
+    {
+        "BrokenPipeError",
+        "CalledProcessError",
+        "ConnectionError",
+        "ConnectionResetError",
+        "FileNotFoundError",
+        "IsADirectoryError",
+        "NotADirectoryError",
+        "OSError",
+        "PermissionError",
+        "SubprocessError",
+        "TimeoutError",
+        "TimeoutExpired",
+    }
+)
+_OUTPUT_EXCEPTION_NAMES = frozenset(
+    {
+        "JSONDecodeError",
+        "KeyError",
+        "TypeError",
+        "ValueError",
+    }
+)
+
+
+def classify_probe_failure(reason: str | None, diagnostic: str | None = None) -> str:
+    """probe 的失敗 reason（＋diagnostic）→ 三分族。
+
+    未知 reason 一律落 `planning-probe-unclassified`（content 級）——**寧可
+    標成未分類，也不擅自宣稱是環境問題**。把未知失敗當 environment 會讓
+    `recover-planning` 對著一個永遠不會自癒的失敗一直重試；當 content 則最多
+    是多要一次人工判斷，而且拒因表上會直接看到「unclassified」這個字。
+    """
+
+    if not reason:
+        return PLANNING_FAILURE_UNCLASSIFIED
+    if reason == _PROBE_FAILED_REASON:
+        # diagnostic 是 `type(exc).__name__`，由 `_probe_identity` 產生，
+        # 不含例外訊息，也就不含路徑／env／憑證。
+        name = (diagnostic or "").strip()
+        if name in _ENVIRONMENT_EXCEPTION_NAMES:
+            return PLANNING_FAILURE_EXECUTOR
+        if name in _OUTPUT_EXCEPTION_NAMES:
+            return PLANNING_FAILURE_OUTPUT
+        return PLANNING_FAILURE_UNCLASSIFIED
+    return _PROBE_REASON_FAMILIES.get(reason, PLANNING_FAILURE_UNCLASSIFIED)
+
+
+def _exit_diagnostic(returncode: int, stdout: str, stderr: str) -> str:
+    """非零退出的 diagnostic：`exit-code:N`，全空輸出時加註 silent-exit 子類。
+
+    只讀 rc 與「stdout／stderr 是否為空」兩件事，**不把 stderr 內容帶進
+    diagnostic**——stderr 是最容易夾帶路徑、env 與憑證錯誤原文的通道，而
+    diagnostic 會一路進 log／evidence／`blocking_reason`。
+    """
+
+    if not stdout.strip() and not stderr.strip():
+        return f"exit-code:{returncode} {PLANNING_FAILURE_EXECUTOR_SILENT_EXIT}"
+    return f"exit-code:{returncode}"
+
+
 # issue #670：開頭 fence 允許帶 info string（``` 後面的語言標籤，例如 `json`），
 # 但字元集刻意收斂到「語言標籤長得出來的樣子」——絕不可含 `{`／反引號，否則
 # 單行形態 ```` ```{"a":1}``` ```` 會被整串當成 info string 吃掉。
@@ -837,11 +970,13 @@ def probe_agy_capability(
     }
     try:
         listed_raw = process_runner(["agy", "models"], **common)
-        listed_rc, listed_stdout, _listed_stderr = _process_fields(listed_raw)
+        listed_rc, listed_stdout, listed_stderr = _process_fields(listed_raw)
     except Exception as exc:
         return _failed_agy("models-probe-failed", type(exc).__name__)
     if listed_rc != 0:
-        return _failed_agy("models-probe-failed", f"exit-code:{listed_rc}")
+        return _failed_agy(
+            "models-probe-failed", _exit_diagnostic(listed_rc, listed_stdout, listed_stderr)
+        )
     listed_lines = {line.strip() for line in listed_stdout.splitlines() if line.strip()}
     cli_model_token = _resolve_agy_cli_token(AGY_MODEL_ID, listed_lines)
     if cli_model_token is None:
@@ -872,11 +1007,13 @@ def probe_agy_capability(
     )
     try:
         smoke_raw = process_runner(argv, **common)
-        smoke_rc, smoke_stdout, _smoke_stderr = _process_fields(smoke_raw)
+        smoke_rc, smoke_stdout, smoke_stderr = _process_fields(smoke_raw)
     except Exception as exc:
         return _failed_agy("smoke-failed", type(exc).__name__)
     if smoke_rc != 0:
-        return _failed_agy("smoke-failed", f"exit-code:{smoke_rc}")
+        return _failed_agy(
+            "smoke-failed", _exit_diagnostic(smoke_rc, smoke_stdout, smoke_stderr)
+        )
     try:
         payload = json.loads(strip_code_fence(smoke_stdout))
     except (json.JSONDecodeError, TypeError):
@@ -886,11 +1023,230 @@ def probe_agy_capability(
     return CapabilityProbe.ready_for("agy", AGY_MODEL_ID, AGY_DOMAIN)
 
 
+# ---------------------------------------------------------------------------
+# issue #682（#672 票 A）：逐候選拒因表
+#
+# `select_secondary_planner()` 的迴圈裡有四個 `continue`，全部靜默——每個候選
+# 被跳過的真正理由（同 domain？probe 缺席？probe 沒 ready？ready 但身分不
+# 符？）都在原地被吃掉，最後只剩一個沒有任何附加資訊的 `no-heterogeneous-
+# planner`。拒因表把那四個 `continue` 各記一筆，讓「格式問題」與「拓撲問題」
+# 在同一個字串裡是**兩個不同的欄位**，不必重跑六遍才發現（design D8）。
+# ---------------------------------------------------------------------------
+
+#: 候選與 primary 同 independence domain（純拓撲事實）。
+REJECTION_SAME_DOMAIN = "same-domain"
+#: 這個候選根本沒有被 probe 過（probes 表沒有這一格）。
+REJECTION_PROBE_ABSENT = "probe-absent"
+#: probe 跑了但沒 ready——真正的失敗原因在 `family`／`diagnostic` 兩欄。
+REJECTION_PROBE_NOT_READY = "probe-not-ready"
+#: probe ready，但它回報的身分與 roster 這一列不符（probe 問到了別人）。
+REJECTION_PROBE_IDENTITY_MISMATCH = "probe-identity-mismatch"
+
+REJECTION_REASONS = (
+    REJECTION_SAME_DOMAIN,
+    REJECTION_PROBE_ABSENT,
+    REJECTION_PROBE_NOT_READY,
+    REJECTION_PROBE_IDENTITY_MISMATCH,
+)
+
+
+@dataclass(frozen=True)
+class CandidateRejection:
+    """一個 planning-capable identity 為什麼沒被選上。
+
+    欄位刻意只有六個，而且**沒有任何一個接得到 env、argv、檔案內容或
+    stderr**——這份資料會一路進 log／evidence／`blocking_reason`，能不能夾帶
+    憑證是欄位面就要回答的問題，不是渲染時再過濾。
+
+    - `executor`／`model_id`／`domain`：roster 常數（`model-identities.yaml`）。
+    - `reason`：四個 `continue` 之一，見 `REJECTION_REASONS`。
+    - `diagnostic`：probe 側的自由文字。最寬的來源是模型對一段**固定 probe
+      prompt** 的 stdout 節錄（PR #674 的 `stdout_excerpt`）與例外**型別名**
+      （`type(exc).__name__`，不含訊息）。
+    - `family`：三分族（`PLANNING_FAILURE_*`）。`same-domain`／`probe-absent`
+      這類拓撲拒因為空字串——它們不是「執行失敗」，不該被硬塞進三族之一。
+    """
+
+    executor: str
+    model_id: str
+    domain: str
+    reason: str
+    diagnostic: str = ""
+    family: str = ""
+
+    @property
+    def environment_grade(self) -> bool:
+        return self.family in ENVIRONMENT_GRADE_PLANNING_FAMILIES
+
+    @classmethod
+    def from_probe(
+        cls, identity: "ModelIdentity", probe: CapabilityProbe
+    ) -> "CandidateRejection":
+        """probe 沒 ready ⇒ 帶著 probe 自己的 reason／diagnostic 一起落表。
+
+        **這裡就是 PR #674 與本票的接縫**：#674 讓 `probe_agy_capability`
+        失敗時帶 stdout 節錄，本方法讓那份節錄不在 `select_secondary_planner`
+        被 `continue` 吃掉，而是原樣（僅做單行化）活到 blocking reason。
+        """
+
+        probe_reason = (probe.reason or "").strip()
+        probe_diagnostic = (probe.diagnostic or "").strip()
+        detail = " ".join(part for part in (probe_reason, probe_diagnostic) if part)
+        return cls(
+            executor=identity.executor,
+            model_id=identity.model_id,
+            domain=identity.independence_domain,
+            reason=REJECTION_PROBE_NOT_READY,
+            diagnostic=detail,
+            family=classify_probe_failure(probe_reason, probe_diagnostic),
+        )
+
+    @classmethod
+    def topological(
+        cls, identity: "ModelIdentity", reason: str, diagnostic: str = ""
+    ) -> "CandidateRejection":
+        return cls(
+            executor=identity.executor,
+            model_id=identity.model_id,
+            domain=identity.independence_domain,
+            reason=reason,
+            diagnostic=diagnostic,
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "executor": self.executor,
+            "model_id": self.model_id,
+            "domain": self.domain,
+            "reason": self.reason,
+            "diagnostic": self.diagnostic,
+            "family": self.family,
+        }
+
+    def head(self) -> str:
+        """身分 ＋ 拒因 ＋ 族名。**這一段永不被截斷**（見 `render_...`）。"""
+
+        head = f"{self.executor}/{self.model_id}[{self.domain}]: {self.reason}"
+        return f"{head} {self.family}" if self.family else head
+
+
+#: 單一候選 diagnostic 的字元上限。超出部分以 `…+Nc` 就地記帳。
+#: 160 與 `summarize_exception`／`#397` 既有的例外摘要上限同數量級，
+#: 足以完整看見一個 fence 開頭與 JSON 前綴。
+REJECTION_TABLE_DETAIL_LIMIT = 160
+#: 整張表（含前綴）的字元預算。roster 五個 identity、每格 diagnostic 上限
+#: 160 時綽綽有餘；超出時**只犧牲 diagnostic、不犧牲身分列**。
+REJECTION_TABLE_TOTAL_LIMIT = 1200
+
+#: C0／C1 控制字元（換行、tab、ANSI escape 的 ESC）。diagnostic 帶的是模型
+#: 輸出，直接進單行 log 會被它污染。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+#: 環境級拒因表的辨識式。**錨在字串開頭**，因此模型 stdout 節錄裡就算逐字
+#: 寫著 `planning-executor-failed`，也騙不到 `_classify_planning_failure`：
+#: grade 是渲染端依 `CandidateRejection.family` 算出來的一個欄位，不是對整串
+#: reason 做 substring-search 的結果。
+_ENVIRONMENT_GRADE_REASON_RE = re.compile(
+    r"\A[a-z0-9-]+ grade=environment candidates=\d+ \("
+)
+
+
+def _single_line_detail(text: str) -> str:
+    return " ".join(_CONTROL_CHARS_RE.sub(" ", text).split())
+
+
+def _truncate_detail(detail: str, limit: int) -> str:
+    if len(detail) <= limit:
+        return detail
+    return f"{detail[:limit]}…+{len(detail) - limit}c"
+
+
+def rejection_table_grade(rejections: Sequence[CandidateRejection]) -> str:
+    """拒因表 → `environment` / `content`。任一條 environment 級即整體 environment。"""
+
+    return (
+        "environment"
+        if any(rejection.environment_grade for rejection in rejections)
+        else "content"
+    )
+
+
+def render_secondary_rejection_reason(
+    base_reason: str | None,
+    rejections: Sequence[CandidateRejection],
+    *,
+    detail_limit: int = REJECTION_TABLE_DETAIL_LIMIT,
+    total_limit: int = REJECTION_TABLE_TOTAL_LIMIT,
+) -> str | None:
+    """把拒因表渲染進 blocking reason（design D8 的格式）。
+
+    ``<base> grade=<environment|content> candidates=<N> (<逐條>; <逐條>)``
+
+    三段都是必要的：``grade`` 讓下游分類有一個**不必去 substring-search 模型
+    輸出**的欄位；``candidates=<N>`` 讓「表裡應該有幾條」變成一個可核對的
+    數字。沒有任何候選時原樣回傳 ``base_reason``——roster 裡真的沒有別人時，
+    `no-heterogeneous-planner` 是真話，不必生一張空表。
+
+    **截斷策略**（issue #682 明列的要求：截斷不得讓「哪一條被截掉」變成不可
+    知）：
+
+    1. 每一條的**身分 ＋ 拒因 ＋ 族名**（`head()`）永不被截斷、永不被整列丟
+       棄。表再長也答得出「有幾個候選、分別是誰、各自為什麼落選」。
+    2. 只有 `diagnostic` 會被截。單條超過 `detail_limit` 時就地記帳
+       `…+Nc`（少了幾個字寫在原處）。
+    3. 全表仍超過 `total_limit` 時，從**最長的 diagnostic 開始**整格換成
+       `<detail-elided:Nc>`，同樣就地記帳。因此「被犧牲的是哪一條、犧牲了
+       多少」永遠讀得出來。
+    4. 身分列本身就撐爆預算時（roster 大到病態）寧可超出預算也不丟列——
+       丟列會讓拒因表失去它存在的唯一理由。
+    """
+
+    if not rejections:
+        return base_reason
+    prefix = (
+        f"{base_reason} grade={rejection_table_grade(rejections)} "
+        f"candidates={len(rejections)} "
+    )
+    heads = [rejection.head() for rejection in rejections]
+    details = [
+        _truncate_detail(_single_line_detail(rejection.diagnostic), detail_limit)
+        for rejection in rejections
+    ]
+
+    def assemble() -> str:
+        entries = [
+            f"{head} {detail}" if detail else head for head, detail in zip(heads, details)
+        ]
+        return f"{prefix}({'; '.join(entries)})"
+
+    rendered = assemble()
+    # 由長到短逐格讓位；同長度時取索引小的，讓結果與輸入順序一樣是決定性的。
+    order = sorted(range(len(details)), key=lambda index: (-len(details[index]), index))
+    for index in order:
+        if len(rendered) <= total_limit:
+            break
+        if not details[index]:
+            continue
+        details[index] = f"<detail-elided:{len(details[index])}c>"
+        rendered = assemble()
+    return rendered
+
+
+def is_environment_grade_rejection_reason(reason: str | None) -> bool:
+    """reason 是否為帶 environment 級拒因的拒因表（`manager` 的分類例外用）。"""
+
+    return bool(reason) and _ENVIRONMENT_GRADE_REASON_RE.match(reason) is not None
+
+
 @dataclass(frozen=True)
 class SecondarySelection:
     state: str
     reason: str | None
     identity: ModelIdentity | None
+    #: issue #682：逐候選拒因表。`reason` 本身刻意維持原字面值
+    #: （`no-heterogeneous-planner` 是下游既有的機器判準），拒因走這個新欄位，
+    #: 由 `run_heterogeneous_brainstorm` 渲染進 `BrainstormResult.reason`。
+    rejections: tuple[CandidateRejection, ...] = ()
 
 
 def select_secondary_planner(
@@ -908,6 +1264,14 @@ def select_secondary_planner(
     任何新 executor）**永遠不可達**，packaged 的 agy 卻穩坐熱路徑首位，正是
     #534 的主訴現場。合法性條件（planning capability、異質 domain、probe
     ready 且 probe 身分相符）逐項不變。
+
+    #682（#672 票 A）：迴圈裡四個 `continue` 過去全部靜默，於是失敗時只剩一個
+    沒有任何附加資訊的 `no-heterogeneous-planner`。現在每次 `continue` 都記一筆
+    `CandidateRejection`，經 `SecondarySelection.rejections` 交給
+    `run_heterogeneous_brainstorm` 渲染進 blocking reason。
+
+    `reason` 欄位本身**刻意不變**（仍是 `no-heterogeneous-planner`）：它是下游
+    既有的機器判準與既有測試的斷言對象，拒因表走新欄位而不是把字串改長。
     """
 
     primary_identity = registry.get(*primary)
@@ -919,20 +1283,48 @@ def select_secondary_planner(
     ranked = model_resolution.rank_candidates(
         planning, role="planning", context=registry.resolution_context
     )
+    rejections: list[CandidateRejection] = []
     for identity in ranked.ordered:
         if identity.independence_domain == primary_identity.independence_domain:
+            # primary 自己也在 planning 名單裡，而它與自己當然同 domain。
+            # 記一條「primary 因為與 primary 同 domain 而落選」是**零資訊的
+            # 套套邏輯**，只會讓每張表都以一條廢話開頭，所以不記——它不是候選，
+            # 它是被拿來比對的那一方。同 domain 的**其他**身分照記。
+            if (identity.executor, identity.model_id) != (
+                primary_identity.executor,
+                primary_identity.model_id,
+            ):
+                rejections.append(
+                    CandidateRejection.topological(identity, REJECTION_SAME_DOMAIN)
+                )
             continue
         probe = probes.get((identity.executor, identity.model_id))
-        if probe is None or not probe.ready:
+        if probe is None:
+            rejections.append(
+                CandidateRejection.topological(identity, REJECTION_PROBE_ABSENT)
+            )
+            continue
+        if not probe.ready:
+            rejections.append(CandidateRejection.from_probe(identity, probe))
             continue
         if probe.identity != (
             identity.executor,
             identity.model_id,
             identity.independence_domain,
         ):
+            rejections.append(
+                CandidateRejection.topological(
+                    identity,
+                    REJECTION_PROBE_IDENTITY_MISMATCH,
+                    # probe 回報的身分是 roster／probe 兩側的常數，不含自由文字。
+                    diagnostic="probe-reported=" + "/".join(probe.identity),
+                )
+            )
             continue
         return SecondarySelection("ready", None, identity)
-    return SecondarySelection("needs_human", "no-heterogeneous-planner", None)
+    return SecondarySelection(
+        "needs_human", "no-heterogeneous-planner", None, tuple(rejections)
+    )
 
 
 # ---------------------------------------------------------------------------
