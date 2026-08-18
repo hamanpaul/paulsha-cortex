@@ -3239,30 +3239,43 @@ sudo systemctl cat cortex-job@.service | grep -c '^Environment=PATH='
 #   期望（升級前）：0 ⇒ 落檔的是舊版產生器的 unit，第 2 步會換掉它。
 
 # --- 1) 補三個 PSC_*_PATH（值由產生器導出，不要手打）---
-{
-  echo "# --- #679：job 的 PATH，未宣告即 fail-closed ---"
-  for pair in "--job PSC_BUILDER_PATH" "--review-job PSC_REVIEWER_PATH" \
-              "--gate-job PSC_GATE_PATH"; do
-    set -- $pair
-    val="$(python3 -m paulsha_cortex.trust_root unit four-way "$1" \
-           | sed -n 's/^Environment=PATH=//p' | head -1)"
-    [ -n "$val" ] || { echo "⛔ 產生器沒有輸出 PATH——cortex 尚未升級到 #679" >&2; exit 1; }
-    echo "$2=$val"
-  done
-} | sudo tee -a /opt/cortex/etc/cortex-manager.env
+#     **先全部組好再一次寫入**：中途 abort 會在 root-owned 的 env 檔留下半套宣告，
+#     而「三個裡有兩個」的部署會是「兩個角色能派、一個角色每次都 fail」——比全都
+#     沒有更難查。
+BLOCK="# --- #679：job 的 PATH，未宣告即 fail-closed ---"
+for pair in "--job:PSC_BUILDER_PATH" "--review-job:PSC_REVIEWER_PATH" \
+            "--gate-job:PSC_GATE_PATH"; do
+  flag="${pair%%:*}"; var="${pair##*:}"
+  val="$(python3 -m paulsha_cortex.trust_root unit four-way "$flag" \
+         | sed -n 's/^Environment=PATH=//p' | head -1)"
+  if [ -z "$val" ]; then
+    echo "⛔ 產生器沒有輸出 Environment=PATH=——這份 cortex 還沒升級到 #679，停下來" >&2
+    unset BLOCK
+    break
+  fi
+  BLOCK="$BLOCK
+$var=$val"
+done
+[ -n "${BLOCK:-}" ] && printf '%s\n' "$BLOCK" | sudo tee -a /opt/cortex/etc/cortex-manager.env
 #   ⚠️ EnvironmentFile 是 root-owned 的（第 4b 步）——這是刻意的：job 改不了自己的
 #      PATH。因此這一步必須 sudo，而不是讓任何服務帳號自己補。
 
 # --- 2) 重新落檔六份模板 unit（它們現在多了 Environment=PATH=）---
-for pair in "--job cortex-job" "--review-job cortex-reviewer-job" \
-            "--gate-job cortex-gate-job"; do
-  set -- $pair
-  for prof in strict jit; do
-    suffix=""; [ "$prof" = jit ] && suffix="-jit"
-    python3 -m paulsha_cortex.trust_root unit four-way "$1" --profile "$prof" \
-      | sudo tee "/etc/systemd/system/$2$suffix@.service" >/dev/null
-  done
-done
+#     unit 檔名（含剖面後綴）由產生器導出，**不要手拼 `-jit`**：後綴是
+#     `permgen.HARDENING_PROFILES` 的一部分，手拼等於第二份會漂移的真相。
+python3 - <<'PY' | sudo sh -e
+from paulsha_cortex.trust_root import permgen as p
+scheme = p.SCHEMES["four-way"]
+for principal in p.downgraded_job_principals(scheme):
+    flag = p.JOB_UNIT_CLI_FLAG[principal]
+    for profile in p.HARDENING_PROFILES:
+        stem = p.job_unit_stem(p.DEFAULT_LAYOUT, principal, profile)
+        print(
+            f"python3 -m paulsha_cortex.trust_root unit four-way {flag}"
+            f" --profile {profile.profile_id}"
+            f" > /etc/systemd/system/{stem}@.service"
+        )
+PY
 sudo systemctl daemon-reload
 #   ⚠️ 只 `daemon-reload`，**不要** restart 任何 job unit——模板 unit 是一次性的，
 #      下一個 job 起來時就是新的那份。正在跑的 job 不受影響（也不該被打斷）。
