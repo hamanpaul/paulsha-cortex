@@ -111,7 +111,10 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    `systemd-run --uid=cortex-builder` 的 transient unit 執行，只帶白名單 env（**不含任何
    token**）。**這個開關要在 `cortex-builder` 帳號與 polkit 規則就位之後才可打開**，
    步驟見 `docs/superpowers/runbooks/trust-root-phase2b-setup.md` 第 5 步；相關選配變數
-   為 `PSC_BUILDER_ACCOUNT`／`PSC_BUILDER_GROUP`／`PSC_BUILDER_HOME`／`PSC_BUILDER_PATH`。
+   為 `PSC_BUILDER_ACCOUNT`／`PSC_BUILDER_GROUP`／`PSC_BUILDER_HOME`。
+   **`PSC_BUILDER_PATH` 不是選配**（#679）：它與 `PSC_REVIEWER_PATH`／`PSC_GATE_PATH`
+   同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
+   `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
 
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 

@@ -56,6 +56,11 @@ MANAGER_ACCOUNT = "cortex-manager"
 
 _BASE_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
+    # #679：job 的 PATH 只由本角色的 `PSC_*_PATH` 決定（daemon 的 PATH 不再轉發），
+    # 未宣告即 fail-closed。三個角色各給一份，測試才驗得到「不會互相污染」。
+    "PSC_BUILDER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
+    "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
+    "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
     "HOME": "/var/lib/cortex-manager",
     "LANG": "en_US.UTF-8",
 }

@@ -27,6 +27,7 @@
 | F34 / stale `venv` | `cortex inspect service --json` | unit 指向已刪的安裝位置，或 service 還在跑舊碼 | 看 [stale venv 或 exec path drift](#stale-venv-或-exec-path-drift-f34) |
 | build 卡全數在採信階段被拒（`gate-ledger-missing-expected-gate`），但 gate 宣告看起來正常 | `sudo -u <gate 帳號> env HOME=<gate HOME> python3 -m pytest --version` | 降權部署下 gate 宣告的 `python3` 解析到**系統層** interpreter，而 `pytest` 只裝在 operator 的 user site-packages（`ProtectHome` 之後不可達） | 看 [降權部署下 gate ledger 為空](#降權部署下-gate-ledger-為空) |
 | monitor 起得來但兩個 github provider `degraded`；doctor 的 `gh-*` probe 全紅 | `sudo -u <manager 帳號> env HOME=<manager HOME> gh auth status` | 降權部署下 Manager 沒有自己的 `gh` 登入態（operator 的在 `/home` 底下，`ProtectHome` 之後不可達） | 看 [降權部署下 Manager 沒有 gh 登入態](#降權部署下-manager-沒有-gh-登入態) |
+| 升級後每一次派工都 `job-runner-path-undeclared` | `sudo grep PSC_ /opt/cortex/etc/cortex-manager.env` | #679 起三個 `PSC_*_PATH` 是**必填**；升級前的部署一個都沒宣告 | 看 [job-runner-path-undeclared](#job-runner-path-undeclared) |
 
 ## delivery preflight 失敗
 
@@ -140,7 +141,11 @@ cortex inspect service --instance cortex --json
 ```bash
 # HOME 由產生器導出，不要手寫絕對路徑（換 layout 時這裡會跟著動）
 GATE_HOME="$(python3 -c 'from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT as L; print(L.home_of("cortex-gate"))')"
-sudo -u cortex-gate env HOME="$GATE_HOME" python3 -m pytest --version
+# ⚠️ 這一條問的是「**系統層那支** python3 import 得到 pytest 嗎」，因此 interpreter 走
+#    絕對路徑、且**不自帶 PATH**（#679）。「gate 實際會解到哪一支 python3」是另一個
+#    命題，走 Runbook 第 4e-2 步的反向不變式——兩者混在一起正是 #679 的機制。
+SYS_PY="$(command -v python3)"   # 系統層那一支（不是部署 venv 的）
+sudo -u cortex-gate env HOME="$GATE_HOME" "$SYS_PY" -m pytest --version
 #   `No module named pytest` ⇒ 就是這一條
 ```
 
@@ -165,6 +170,29 @@ sudo -u cortex-manager env HOME="$MANAGER_HOME" gh auth status
 （`0600`，token 要 refresh 得回來），`config.yml` 維持 `root:root 0644`（它的 `aliases`
 可宣告 `!` shell alias，讓服務帳號改得了它等於多一條執行面）。若落位後仍顯示未登入，先確認
 沒有人設了 `XDG_CONFIG_HOME` 或 `GH_CONFIG_DIR`——那會讓 `gh` 去看別的目錄，而檔案還在原處。
+
+## job-runner-path-undeclared
+
+**升級到 #679 之後才會出現，而且是刻意的。** 症狀：降權模式下每一次派工都在 Manager
+端當場失敗，理由 `job-runner-path-undeclared: PSC_BUILDER_PATH 未宣告…`。
+
+成因：#679 之前 `build_job_env()` 對三個 `PSC_*_PATH` 是 **fail-open** 的——未宣告時
+job 靜默拿到 **Manager daemon 的** `PATH`（那份值是否含 `<toolchain>/bin` 純看該機器的
+EnvironmentFile 被誰手動加過什麼；Manager 自己也沒有 `PATH` 時，`os.execvpe` 退回
+`os.defpath`＝`:/bin:/usr/bin`）。兩種情形下 `codex` 都可能**靜默**解到 `/usr/bin/codex`
+（實機 0.42.0，toolchain 那份是 0.147.0）：不報錯，只是每一筆產出都來自一支從未被判讀
+過的 CLI。現在未宣告即當場失敗——**「當場失敗且訊息可讀」嚴格優於「靜默跑錯版本」**。
+
+```bash
+# 值由產生器導出，不要手打（三個角色各一份）
+for flag in --job --review-job --gate-job; do
+  python3 -m paulsha_cortex.trust_root unit four-way "$flag" | grep '^Environment=PATH='
+done
+```
+
+完整的升級步驟（補三個變數、重新落檔六份模板 unit、重啟 Manager、跑反向不變式）在
+Runbook 第 **5-5b** 步。**不要**把 `PSC_JOB_RUNNER` 改回 `direct` 來繞開：那會讓 Phase 2b
+的全部隔離一次失效，只為了避開一個補三行設定就能解的錯誤。
 
 ## 什麼時候該直接走 Runbook
 

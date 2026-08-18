@@ -64,7 +64,10 @@ REVIEW_ACCOUNT = "cortex-reviewer-planner"
 MANAGER_ACCOUNT = "cortex-manager"
 
 _BASE_ENV = {
+    # daemon 自己的 PATH。#679 起它**不會**流進 job——job 的 PATH 只由
+    # `PSC_GATE_PATH` 決定，未宣告即 fail-closed。
     "PATH": "/usr/local/bin:/usr/bin:/bin",
+    job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
     "HOME": "/var/lib/cortex-manager",
     "LANG": "en_US.UTF-8",
     "PSC_REPO_ROOT": "/opt/cortex",
@@ -791,6 +794,8 @@ class GateExecutionTests(unittest.TestCase):
                     {
                         job_runner.JOB_SPEC_SPOOL_ENV: "/tmp",
                         job_runner.GATE_JOB_SPEC_SPOOL_ENV: "/tmp",
+                        job_runner.BUILDER_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/bin",
+                        job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/bin",
                     },
                     job_id="j", executor="codex", role=job_runner.JOB_ROLE_GATE,
                 )
@@ -802,6 +807,8 @@ class GateExecutionTests(unittest.TestCase):
                     {
                         job_runner.JOB_SPEC_SPOOL_ENV: "/tmp",
                         job_runner.GATE_JOB_SPEC_SPOOL_ENV: "/tmp",
+                        job_runner.BUILDER_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/bin",
+                        job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/bin",
                     },
                     job_id="j", executor=None, role=job_runner.JOB_ROLE_BUILDER,
                 )

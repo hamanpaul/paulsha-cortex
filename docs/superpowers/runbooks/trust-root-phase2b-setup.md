@@ -332,6 +332,21 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   結構時舊的 default ACL 會靜默繼承」的警語 ＋ `setfacl -k <容器>` 步驟 ＋ 一條機械
   判準（每格具名條目 `foreign=0`、`#effective:` 註記為 0）
   → **55** 個 sudo 點、**208** 個驗證點。
+- **#679（job 沒有 PATH ／ 驗證環境供應了 production 不供應的東西）新增**：
+  新增 **4e-2「反向不變式：job 在零額外 env 下解到哪一份 CLI」**（產生器出矩陣：
+  `trust_root path-probe`，角色 × executor 全列舉、剖面跟著 executor 走）與
+  **5-5b「升級既有部署」**（補三個 `PSC_*_PATH`、重新落檔六份 unit、重啟 Manager，
+  含降級路徑警語）；**共用探針 `psc_run_under` 移除 `--setenv=PATH=`、`psc_probe_path()`
+  整支刪除**——PATH 現由 `unit_replica_properties()` 從落檔 unit 的
+  `Environment=PATH=`（#679 補上）自動帶進複本；4e／5-3／5-4／附錄 A 五處自帶 `PATH`
+  的驗證改為絕對路徑或改走 4e-2；5-5 的三個 `PSC_*_PATH` 改由產生器導出（此前手打的
+  `PSC_GATE_PATH` 少了 toolchain 段，與 permgen／#666 的紀錄不一致＝第三份真相）。
+  **起因**：模板 unit 沒有 `Environment=PATH=`、shim 不補、`build_job_env()` fail-open、
+  部署 EnvironmentFile 三個變數皆未宣告 ⇒ `codex` 靜默解到系統層 0.42.0
+  （toolchain 是 0.147.0）。缺陷活過五輪驗證，因為**每一條驗證都自己帶 `PATH`**——
+  runbook 4e 甚至逐字預言了症狀、版本號都對上了，但那條驗證是 `sudo -u … env PATH=…`
+  跑的。這是「綠燈不承載語意」的第五個實例，且是新的一類：複本比 production **多**。
+  → **57** 個 sudo 點、**219** 個驗證點。
 
 ---
 
@@ -1858,25 +1873,60 @@ ls -ld /opt/cortex/toolchain
 sudo -u cortex-builder sh -c "touch /opt/cortex/toolchain/bin/evil" 2>&1 | tail -1
 #   期望：Permission denied
 
-# ✅ 功能驗證（本票的核心驗收）：以 job 帳號實跑一次 `--help`，期望 rc=0
+# ✅ 檔案面驗證：以 job 帳號、**用絕對路徑**實跑一次 `--help`，期望 rc=0
+#    這一條驗的是「toolchain 那幾支檔案對 job 帳號可讀可執行、runtime 也解得開」。
+#    ⚠️ 它**不驗**「job 會解到哪一份」——那是下面反向不變式那一節的事，兩者不可互相
+#       代替（#679：把這兩個命題混為一談，正是這個缺陷活過五輪驗證的機制）。
 for cli in codex claude copilot agy; do
   sudo -u cortex-builder env HOME=/var/lib/cortex-builder \
-    PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-    "$cli" --help >/dev/null 2>&1; echo "$cli rc=$?"
+    "/opt/cortex/toolchain/bin/$cli" --help >/dev/null 2>&1; echo "$cli rc=$?"
 done
 #   期望：四行皆 rc=0。**rc=127 ＝ #640 的原症狀**（CLI 或它的 runtime 不可達）：
-#     先 `sudo -u cortex-builder ... command -v <cli>` 看解到哪裡，
-#     再 `head -n 1 /opt/cortex/toolchain/bin/codex` 確認 shebang 解得開（node 在系統層）。
+#     `head -n 1 /opt/cortex/toolchain/bin/codex` 確認 shebang 解得開（node 在系統層）。
 
-# ✅ 驗證（**裁決 (a) 真正要守的那條**）：job 帳號跑出來的版本 == operator 側的版本
-sudo -u cortex-builder env HOME=/var/lib/cortex-builder \
-  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin codex --version
-codex --version
-#   期望：**兩行逐字相同**。只驗 rc=0 是不夠的——系統層那份 0.42.0 一樣會 rc=0，
-#   而 job 跑的就變成 operator 從未判讀過的版本（症狀是「結果對不上」，不是報錯）。
-#   不同 ⇒ PATH 順序錯（toolchain 沒排最前面），或複製到的是系統那份。
+# ✅ 記下 operator 側判讀過的版本（＝登記表登記的那一份，反向不變式要比對它）
+for cli in codex claude copilot agy; do
+  printf '%-8s %s\n' "$cli" "$(/opt/cortex/toolchain/bin/$cli --version 2>&1 | head -1)"
+done
+#   期望：`codex` 那行是 operator 實際在用的版本（本機實測 0.147.0），**不是** 0.42.0。
+#   ⚠️ **這一條到此為止只證明「toolchain 裡那份是對的版本」**。它一個字都沒有說到
+#      「job 實際會解到哪一份」——#679 之前這裡寫的是
+#      `sudo -u cortex-builder env PATH=<toolchain 在最前> codex --version`，
+#      PATH 是**驗證者給的**，而 production 一個 `PSC_*_PATH` 都沒宣告。警語（「系統層
+#      那份 0.42.0 一樣會 rc=0」）在、版本號也對上了，缺陷仍然活了五輪。
+#      → 「job 會解到哪一份」一律走第 4e-2 步（**零額外 env**）。
 
 ```
+
+#### 4e-2. 反向不變式：job 在**零額外 env** 下解到哪一份 CLI（#679）
+
+> **這一節的存在理由是驗證方法本身**。#679 的缺陷是一個 `if path_override:`
+> ——`PSC_*_PATH` 未宣告時 `build_job_env()` 靜默省略 `PATH`，`execvpe` 退回
+> `os.defpath`（`:/bin:/usr/bin`），`claude`／`agy` rc=127，而 `codex` **靜默**解到
+> `/usr/bin/codex`＝0.42.0（toolchain 是 0.147.0）。它活過五輪驗證，因為**每一條
+> 驗證都自己帶 `--setenv=PATH=`**：驗證環境供應了 production 不供應的東西，
+> 於是「job 沒有 PATH」在結構上不可能被觀察到。
+>
+> **規矩（#677 的規矩再推一格）**：加固面複本必須連「production **沒有**設什麼」
+> 也一起複製。`unit_replica_properties()` 天生做得到（它從落檔的 unit 全量導出）；
+> 要拿掉的是探針**額外**疊上去的那一行。**凡是驗「job 會解到哪一份 CLI」的檢查，
+> 一律不得帶 `PATH`。**
+
+```bash
+# 前置：先貼上下一節的共用探針 `psc_run_under`（本步驟**呼叫它、不重造**——
+#       加固面的定義只有一份，連呼叫它的那幾行 shell 也不該有第二份複本）。
+# 矩陣由產生器出（角色 × executor 全列舉，剖面跟著 executor 走）：
+python3 -m paulsha_cortex.trust_root path-probe four-way
+#   → 貼進 shell 直接跑。產出**刻意不含任何 --setenv=**；未定義 psc_run_under 時
+#     它會 fail-closed（而不是靜默跑出一組沒有加固面的假綠）。
+#   ⛔ 任何一列失敗時**不要**加 `--setenv=PATH=` 讓它過——那正是讓這個缺陷活了五輪
+#      的那個動作。要補的是兩層本身：
+#        (1) 模板 unit 的 `Environment=PATH=`（#679 起由 permgen 產生）
+#            → 該 unit 若沒有這一行＝落檔的是舊版產生器的產物，重跑第 5-2 步落檔；
+#        (2) Manager EnvironmentFile 的 `PSC_BUILDER_PATH`／`PSC_REVIEWER_PATH`／
+#            `PSC_GATE_PATH`（第 5-5 步）。
+```
+
 
 #### 共用探針：`psc_run_under`（在**真實加固面**下跑一條命令）
 
@@ -1889,16 +1939,17 @@ codex --version
 > 同一份 unit 上的 `SystemCallErrorNumber=EPERM`，於是複本落回 systemd 預設的
 > `SECCOMP_RET_KILL_PROCESS`——**比 production 更嚴格**，量出一個 production 沒有的
 > `rc=1`。**手抄子集的假紅與假綠一樣會發生，方向不由人選。**
+>
+> **#679 起：探針不再自帶 `PATH`。** 在此之前 `psc_run_under` 尾端有一行
+> `--setenv=PATH="$(psc_probe_path)"`，而 `psc_probe_path()` 在 `PSC_*_PATH` 全部
+> 未宣告時會退回 EnvironmentFile 裡 **Manager 自己**那條 `PATH=`——於是探針拿到一份
+> production 的 job 從來拿不到的 PATH，「job 沒有 PATH」因此不可能被量到。
+> 複本必須連「production **沒有**設什麼」也一起複製；`unit_replica_properties()`
+> 是全量機械導出的，模板 unit 的 `Environment=PATH=`（#679 補上）會自動帶進 `--property=`，
+> 因此探針**什麼都不必補**——補了就錯。
 
 ```bash
 # 一次貼進 shell，之後各步驟直接呼叫。
-psc_probe_path() {
-  # PATH 也不手打：job 的 PATH 來自 Manager 端 root-owned 的 EnvironmentFile
-  # （模板 unit 刻意不寫 Environment=PATH=，因為 shim 會整份換掉環境）。
-  sudo grep -hoE '^(PSC_[A-Z]+_PATH|PATH)=.*' /opt/cortex/etc/cortex-manager.env \
-    | head -1 | cut -d= -f2-
-}
-
 psc_run_under() {   # psc_run_under <unit 字幹> <命令> [參數…]
   local stem="$1"; shift
   local -a props
@@ -1913,10 +1964,16 @@ psc_run_under() {   # psc_run_under <unit 字幹> <命令> [參數…]
     echo "⛔ 加固面複本只有 ${#props[@]} 條——unit 落檔不完整或產生器已漂移，停下來" >&2
     return 90
   fi
+  # ⛔ **這裡不得再加任何 --setenv=**（#679）。環境完全由上面的複本決定，
+  #    複本完全由落檔的 unit 決定——這兩句話成立，量到的才是 production。
   sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
-    "${props[@]}" --setenv=PATH="$(psc_probe_path)" "$@"
+    "${props[@]}" "$@"
 }
 ```
+
+> **`psc_probe_path()` 已刪除**（#679）。若你在別處的筆記裡還留著它：那個函式本身
+> 就是缺陷的載體，不要復活它。要知道 job 的 PATH 是什麼，讀**落檔的 unit**：
+> `sudo systemctl cat cortex-job@.service | grep '^Environment=PATH='`。
 
 **兩個必須先做的前置**（做不到就是探針本身壞了，不是被驗的東西壞了）：
 
@@ -1969,8 +2026,10 @@ psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/srt --version
 #     Manager 不是模板 unit，字幹沒有 `@`——直接餵檔案（--instance 用不到）。
 mapfile -t mprops < <(sudo systemctl cat cortex-manager.service \
   | python3 -m paulsha_cortex.trust_root unit-replica -)
+#     ⚠️ **不補 --setenv=**（#679）：Manager unit 的複本已含它的
+#        `EnvironmentFile=`（PATH 就在那份檔裡），再疊一層只會蓋掉 production 的值。
 sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
-  "${mprops[@]}" --setenv=PATH="$(psc_probe_path)" \
+  "${mprops[@]}" \
   /opt/cortex/toolchain/bin/openspec --version
 
 #   ⚠️ 兩條**預期都失敗（stdout 空、rc=1）**，症狀與 #643 的 codex／copilot 逐字
@@ -2103,9 +2162,11 @@ sudo pip install --break-system-packages 'pytest>=7' 'PyYAML>=6'
 
 ```bash
 # ✅ 驗證（1）：**以 gate 身分實測**，不是只驗檔案存在
+#    interpreter 用絕對路徑，**不自帶 PATH**（#679）：這一條驗的是「系統層那支
+#    python3 import 得到 pytest」，而不是「gate 會解到哪一支 python3」——後者是
+#    第 4e-2 步的事，混在一起正是 #679 的機制。
 sudo -u cortex-gate env HOME=/var/lib/cortex-gate \
-  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-  python3 -m pytest --version
+  /usr/bin/python3 -m pytest --version
 #   期望：印出版本，rc=0（不是 `No module named pytest`）
 sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -c 'import yaml; print(yaml.__version__)'
 #   期望：印出版本
@@ -2122,10 +2183,11 @@ sudo chown cortex-gate:cortex-gate "$PROBE/test_probe.py"
 #    WorkingDirectory 指向探測目錄——**其餘一條都不減**。
 mapfile -t gprops < <(sudo systemctl cat cortex-gate-job@.service \
   | python3 -m paulsha_cortex.trust_root unit-replica - --instance probe)
+#    ⚠️ **不補 --setenv=**（#679）：PATH 由複本從 gate 模板 unit 的
+#       `Environment=PATH=` 帶進來，那才是 production 的值。
 sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
   "${gprops[@]}" \
   --property=WorkingDirectory="$PROBE" \
-  --setenv=PATH="$(psc_probe_path)" \
   /usr/bin/python3 -m pytest -q
 #   期望：`1 passed`，rc=0。
 #   ⚠️ `--property=WorkingDirectory=` 必須排在複本**之後**才覆寫得掉（systemd 取
@@ -2248,7 +2310,7 @@ sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status
 mapfile -t mprops < <(sudo systemctl cat cortex-manager.service \
   | python3 -m paulsha_cortex.trust_root unit-replica -)
 sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
-  "${mprops[@]}" --setenv=PATH="$(psc_probe_path)" \
+  "${mprops[@]}" \
   /usr/bin/gh auth status
 #   期望：同上。`gh` 是原生 ELF，MDWE 不影響它。
 #   ⚠️ 這份複本會連 `EnvironmentFile=/opt/cortex/etc/cortex-manager.env` 一起帶上
@@ -3052,20 +3114,22 @@ PY
 ### 5-5. (d) 打開切換點 `PSC_JOB_RUNNER=systemd-template`
 
 ```bash
-# ✅ 先取 PSC_BUILDER_PATH 的正規值（產生器＝單一真相，**不要手打**）
-python3 -m paulsha_cortex.trust_root unit four-way --job | grep PSC_BUILDER_PATH
-#   期望：PSC_BUILDER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
-
-# ✅ #615：reviewer／planner 那一組（**與 builder 不共用**，見下方說明）
-python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep PSC_REVIEWER_PATH
-#   期望：PSC_REVIEWER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
-
-# ✅ #629：gate 執行身分那一組。**PATH 刻意不含 toolchain**——gate 不跑任何模型 CLI，
-#    它跑的是 operator 宣告的 gate 命令（pytest／make／npm…）。把 toolchain 排進去
-#    只會多開一條「gate 也能起模型」的面，換不到任何東西。
-python3 -m paulsha_cortex.trust_root unit four-way --gate-job | grep PSC_GATE_PATH
+# ✅ 三個 PSC_*_PATH 的正規值全部由產生器導出（**不要手打**，#679）。
+#    #679 起模板 unit 自己也有 `Environment=PATH=`，兩層同源——就從 unit 上取：
+for flag in --job --review-job --gate-job; do
+  python3 -m paulsha_cortex.trust_root unit four-way "$flag" \
+    | grep -E '^(Environment=PATH=|#   PSC_[A-Z]+_PATH=)'
+done
+#   期望：三組各兩行，`Environment=PATH=` 與 `PSC_*_PATH=` 的值**逐字相同**，
+#   且都是 /opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin。
+#   ⚠️ **toolchain 必須在最前面，三個角色皆然**。gate 也要：`PSC_GATE_CMD_PYTEST=
+#      "python3 -m pytest -q"` 是相對名、同樣走 PATH 解析（#666），gate 沒有 PATH
+#      的後果與 builder 逐字同型。
+#      （歷史註記：#679 之前這份 runbook 手打的 `PSC_GATE_PATH` 少了 toolchain 段，
+#      與 permgen／#666 的紀錄不一致——那是第三份真相。現在只有產生器一份。）
 
 # 🔧 sudo：把降權模式寫進第 4b 步的 EnvironmentFile
+#    ⚠️ 下面的 PATH 三行是**產生器的值**，若產生器輸出與這裡不同，以產生器為準。
 sudo tee -a /opt/cortex/etc/cortex-manager.env >/dev/null <<'ENVFILE'
 PSC_JOB_RUNNER=systemd-template
 PSC_BUILDER_ACCOUNT=cortex-builder
@@ -3077,7 +3141,7 @@ PSC_REVIEWER_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
 # --- #629 gate 執行身分 ---
 PSC_GATE_ACCOUNT=cortex-gate
 PSC_GATE_HOME=/var/lib/cortex-gate
-PSC_GATE_PATH=/usr/local/bin:/usr/bin:/bin
+PSC_GATE_PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
 # gate 用來跑 ledger writer 的直譯器。必須是**絕對路徑且 gate 讀得到**——
 # Manager 的 repo root 在 /home 底下，而 job unit 帶 ProtectHome=yes，
 # `PYTHONPATH=<repo>` 那條路在那裡不成立（#623 缺口 1 的同一件事）。
@@ -3125,18 +3189,24 @@ exec /opt/cortex/venv/bin/python -c "import os; from paulsha_cortex.coordinator 
 > `PSC_JOB_RUNNER` 預設 `direct`＝不降權；值非法時**fail-closed**（不會靜默當成
 > `direct`）。
 >
-> **`PSC_BUILDER_PATH` 是必填，不再是選配（#640 改）**：未設時 job 會拿到 Manager
-> 轉發的 `PATH`，而 Manager 以 system unit 跑、拿到的是 systemd 的預設 `PATH`
-> （`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`）——裡面**沒有**
-> `/opt/cortex/toolchain/bin`。toolchain 必須排在最前面：系統層可能另有一份同名但舊
-> 很多的 CLI（本機實測兩份 `codex` 差 100 個以上小版本），排後面的症狀是「跑得起來
-> 但版本不是預期的那個」。
+> **三個 `PSC_*_PATH` 全部必填，未宣告即 fail-closed（#679 改；#640 起就已經是宣告上
+> 的必填，但程式碼直到 #679 才跟上）**：在此之前 `build_job_env()` 是 fail-open 的
+> ——未宣告就整個不寫 `PATH` 這個鍵，而 job spec 的 `env` 就是 job 的**完整**環境，
+> 於是 `execvpe` 退回 `os.defpath`＝`:/bin:/usr/bin`：`claude`／`agy` rc=127，
+> `codex` **靜默**解到 `/usr/bin/codex`（系統層 0.42.0，toolchain 那份 0.147.0）。
+> **不報錯，只是產出來自一支 operator 從未判讀過的 CLI。**
+> 現在未宣告時 Manager 會在派工前就以 `job-runner-path-undeclared` 失敗。
 >
-> **為什麼是 `PSC_BUILDER_PATH` 而不是模板 unit 的 `Environment=PATH=`**：模板 unit
-> 的 `ExecStart` 是 root-owned shim，shim 以 `execvpe(argv[0], argv, spec['env'])`
-> **整份換掉**環境——job 解析命令用的 `PATH` 來自 **spec 的 env**（即 Manager 端這個
-> 變數），不是 unit 的 `Environment=`。寫在 unit 上只會是一個看起來承載作用、實際被
-> shim 丟掉的設定。產生的 job unit 內有一段註解把這個取捨寫在產物本身。
+> **PATH 現在是兩層（#679）**：
+> 1. **spec 的 `env`**——來自 Manager 端這三個變數，`build_job_env()` 對未宣告
+>    fail-closed；
+> 2. **模板 unit 的 `Environment=PATH=`**——由 permgen 機械產生，root-owned、可逐字
+>    稽核。shim 在 spec 的 env 沒有 `PATH` 時改用它（退回的是**更可信**的來源，不是
+>    猜預設值），兩層都缺才拒絕 exec。
+>
+> 第 2 層不是多餘的：它涵蓋「手工組 spec 繞過產生器」（#645 逐字記錄過的同型前例）
+> 與「spool 裡還躺著升級前寫的舊 spec」，而且讓 `unit_replica_properties()` 產生的
+> 加固面複本**自動**帶上 production 的 PATH——探針因此什麼都不必補（見 4e-2）。
 >
 > **憑證**：見第 4e 步——由 root 複製進 job 帳號 HOME、chown 給該帳號（0600），
 > **不是**讓 builder 自己 `login`（toolchain 未落位前 `login` 這個動作本身就跑不起來，
@@ -3152,6 +3222,92 @@ exec /opt/cortex/venv/bin/python -c "import os; from paulsha_cortex.coordinator 
 > `manager._spool_writable_launcher()` → `as_verdict_spool_writer()`，而那支工廠產出的
 > launcher 前兩個旗標**都是 False**（verdict spool 放行與 read-only 契約互斥）。只看前
 > 兩條會把它判成 builder 並以 `cortex-builder` 起跑——**而它正是寫 verdict 的那一個**。
+
+#### 5-5b. 升級既有部署到 #679（**已在跑降權模式的機器必做**）
+
+> **為什麼一定要做**：#679 之前裝好的機器，`/opt/cortex/etc/cortex-manager.env` 裡
+> **一個 `PSC_*_PATH` 都沒有**，六份模板 unit 也**沒有** `Environment=PATH=`。升級
+> cortex 之後，Manager 會在**下一次派工**就以 `job-runner-path-undeclared` 失敗。
+> **那是正確行為**：在此之前它不失敗，只是每一筆 `codex` 產出都來自系統層 0.42.0。
+> 「當場失敗且訊息可讀」嚴格優於「靜默跑錯版本」，但它需要 operator 先做完下面三步。
+
+```bash
+# --- 0) 先確認你是不是受影響的部署（三個變數一個都沒有 ⇒ 是）---
+sudo grep -cE '^PSC_(BUILDER|REVIEWER|GATE)_PATH=' /opt/cortex/etc/cortex-manager.env
+#   期望（升級前）：0 或 <3 ⇒ 往下做。已經是 3 ⇒ 只需做第 2 步（unit 落檔）。
+sudo systemctl cat cortex-job@.service | grep -c '^Environment=PATH='
+#   期望（升級前）：0 ⇒ 落檔的是舊版產生器的 unit，第 2 步會換掉它。
+
+# --- 1) 補三個 PSC_*_PATH（值由產生器導出，不要手打）---
+#     **先全部組好再一次寫入**：中途 abort 會在 root-owned 的 env 檔留下半套宣告，
+#     而「三個裡有兩個」的部署會是「兩個角色能派、一個角色每次都 fail」——比全都
+#     沒有更難查。
+BLOCK="# --- #679：job 的 PATH，未宣告即 fail-closed ---"
+for pair in "--job:PSC_BUILDER_PATH" "--review-job:PSC_REVIEWER_PATH" \
+            "--gate-job:PSC_GATE_PATH"; do
+  flag="${pair%%:*}"; var="${pair##*:}"
+  val="$(python3 -m paulsha_cortex.trust_root unit four-way "$flag" \
+         | sed -n 's/^Environment=PATH=//p' | head -1)"
+  if [ -z "$val" ]; then
+    echo "⛔ 產生器沒有輸出 Environment=PATH=——這份 cortex 還沒升級到 #679，停下來" >&2
+    unset BLOCK
+    break
+  fi
+  BLOCK="$BLOCK
+$var=$val"
+done
+[ -n "${BLOCK:-}" ] && printf '%s\n' "$BLOCK" | sudo tee -a /opt/cortex/etc/cortex-manager.env
+#   ⚠️ EnvironmentFile 是 root-owned 的（第 4b 步）——這是刻意的：job 改不了自己的
+#      PATH。因此這一步必須 sudo，而不是讓任何服務帳號自己補。
+
+# --- 2) 重新落檔六份模板 unit（它們現在多了 Environment=PATH=）---
+#     unit 檔名（含剖面後綴）由產生器導出，**不要手拼 `-jit`**：後綴是
+#     `permgen.HARDENING_PROFILES` 的一部分，手拼等於第二份會漂移的真相。
+python3 - <<'PY' | sudo sh -e
+from paulsha_cortex.trust_root import permgen as p
+scheme = p.SCHEMES["four-way"]
+for principal in p.downgraded_job_principals(scheme):
+    flag = p.JOB_UNIT_CLI_FLAG[principal]
+    for profile in p.HARDENING_PROFILES:
+        stem = p.job_unit_stem(p.DEFAULT_LAYOUT, principal, profile)
+        print(
+            f"python3 -m paulsha_cortex.trust_root unit four-way {flag}"
+            f" --profile {profile.profile_id}"
+            f" > /etc/systemd/system/{stem}@.service"
+        )
+PY
+sudo systemctl daemon-reload
+#   ⚠️ 只 `daemon-reload`，**不要** restart 任何 job unit——模板 unit 是一次性的，
+#      下一個 job 起來時就是新的那份。正在跑的 job 不受影響（也不該被打斷）。
+
+# --- 3) 重啟 Manager 讓它讀到新的 EnvironmentFile ---
+sudo systemctl restart cortex-manager.service
+```
+
+```bash
+# ✅ 驗證（1）：三個變數都在，且值與產生器逐字相同
+sudo grep -E '^PSC_(BUILDER|REVIEWER|GATE)_PATH=' /opt/cortex/etc/cortex-manager.env
+#   期望：三行，值都是 /opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
+
+# ✅ 驗證（2）：六份落檔的 unit 都有 Environment=PATH=
+for stem in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit \
+            cortex-gate-job cortex-gate-job-jit; do
+  printf '%-26s %s\n' "$stem" \
+    "$(sudo systemctl cat "$stem@.service" | grep '^Environment=PATH=' || echo '<NO PATH>')"
+done
+#   期望：六行都印出 Environment=PATH=…，**一個 `<NO PATH>` 都不能有**。
+#   （#679 的原始證據就是這張表全是 `<NO PATH>`。）
+
+# ✅ 驗證（3）：**反向不變式**——回第 4e-2 步整段跑一次（零額外 env）。
+#    這一條才是升級真正的驗收；前兩條只驗宣告，不驗解析。
+python3 -m paulsha_cortex.trust_root path-probe four-way
+```
+
+> **降級路徑**：若第 3 步之後 Manager 因 `job-runner-path-undeclared` 拒絕派工，
+> **不要**把 `PSC_JOB_RUNNER` 改回 `direct` 來繞開——那會讓所有 job 回到不降權的
+> 狀態（Phase 2b 的全部隔離一次失效），只為了避開一個補三行設定就能解的錯誤。
+> 正確做法是回到第 1 步確認那三行真的進了 EnvironmentFile、且 Manager 真的重啟過
+> （`sudo systemctl show cortex-manager.service -p Environment | tr ' ' '\n' | grep PSC_`）。
 
 ### 5-6. 正向驗證（**必須成功**）
 
@@ -3198,9 +3354,12 @@ spec = job_runner.build_job_spec(
     command=["/bin/sh", "-c", smoke],
     working_directory=f"/var/lib/cortex/worktree/{instance}",
     log_path=f"/var/lib/cortex/worktree/{instance}/{instance}.log",
-    # ⚠️ job 的 env **就是**這一份，不繼承 unit 的 Environment=——shim 是
-    #    `execvpe(command, spec["env"])`。因此 PATH／HOME 要在這裡給，
-    #    而 token 類的名字 build_job_spec() 直接拒收（見下方註）。
+    # ⚠️ job 的 env **就是**這一份——shim 是 `execvpe(command, spec["env"])`。
+    #    #679 起 `PATH` 多一層保險：spec 沒給時 shim 改用模板 unit 的
+    #    `Environment=PATH=`（root-owned），兩層都沒有才拒絕 exec。
+    #    這裡刻意給一份**不含 toolchain** 的 PATH：本步驟只驗隔離（身分／token／
+    #    可寫面），不驗模型 CLI 解析——後者是第 4e-2 步的反向不變式，而那一條
+    #    **不得手工組 spec**（#645：手工挑路徑恰好把 bug 繞過去的同型前例）。
     env={"HOME": "/var/lib/cortex-builder", "PATH": "/usr/local/bin:/usr/bin:/bin"},
 )
 # `account=` 讓寫端在落地後就地複驗「那個身分讀得到這個檔」（#657）——
@@ -4690,11 +4849,12 @@ for U in cortex-manager cortex-reviewer-planner cortex-builder; do id -nG "$U"; 
 # ✅ 權限沒有漂移
 sudo find /var/lib/cortex /opt/cortex -perm /022 -print | head
 
-# ✅ executor toolchain 仍可用，且版本沒有跟 operator 側分岔（#640）
-sudo -u cortex-builder env HOME=/var/lib/cortex-builder \
-  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin codex --version
-codex --version
-#   期望：兩行逐字相同。分岔＝某一側被升級了而另一側沒有——那正是裁決 (a) 要防的漂移。
+# ✅ executor toolchain 仍可用，且版本沒有跟 operator 側分岔（#640／#679）
+#    ⚠️ **不自帶 PATH**（#679）：自帶就變成「驗證者給的 PATH 下解到哪一份」，
+#       與 job 實際會解到哪一份無關。改走反向不變式的產生器探針：
+python3 -m paulsha_cortex.trust_root path-probe four-way
+#   期望：每一組「PATH 解出來的那支」與「<toolchain>/bin/<cli> 絕對路徑那支」
+#   印出逐字相同的版本。分岔＝某一側被升級了而另一側沒有，或 job 根本沒有 PATH。
 
 # ✅ 憑證仍是「檔 job-owned／目錄 root-owned」（#640 裁決 (b)）
 stat -c '%n %U:%G %a' /var/lib/cortex-builder/.codex /var/lib/cortex-builder/.codex/auth.json
@@ -4712,9 +4872,19 @@ sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status >/dev/nul
   && echo "manager gh: OK"
 
 # ✅ gate 跑得動 pytest，且版本沒有無聲換掉（#666；第 4f 步）
+#    interpreter 用絕對路徑、**不自帶 PATH**（#679）：這一條驗的是「系統層那支
+#    python3 import 得到 pytest」。「gate 會解到哪一支 python3」由第 4e-2 步驗。
 sudo -u cortex-gate env HOME=/var/lib/cortex-gate \
-  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin python3 -m pytest --version
+  /usr/bin/python3 -m pytest --version
 #   期望：與部署紀錄裡記下的那一版逐字相同。換掉了而沒人知道 ⇒ gate 判準已漂移。
+
+# ✅ 六份模板 unit 都還有 Environment=PATH=（#679 的原始證據是這張表全空）
+for stem in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit \
+            cortex-gate-job cortex-gate-job-jit; do
+  printf '%-26s %s\n' "$stem" \
+    "$(sudo systemctl cat "$stem@.service" | grep '^Environment=PATH=' || echo '<NO PATH>')"
+done
+#   期望：六行都有值。任何一行 `<NO PATH>` ⇒ 落檔的是舊產生器的 unit，回第 5-5b 步。
 
 # ✅ 窮舉盤點仍雙向封閉（#666；第 4h 步）——非空即代表登記表已落後於程式碼
 python3 -c "from paulsha_cortex.trust_root import permgen as p

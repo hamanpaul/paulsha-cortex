@@ -4254,15 +4254,30 @@ def build_job_unit(
         "# 本 job 帳號**唯讀＋可執行**。ProtectSystem=strict 讓 /opt 唯讀，但唯讀只擋",
         "# 寫入，讀取與執行完全不受影響；下方 ReadWritePaths 因此機械地不含它",
         "# （writer 只有部署身分）。",
-        "# **PATH 刻意不寫在這份 unit 上**：模板 unit 的 ExecStart 是 root-owned shim，",
-        "# 而 shim 以 `execvpe(argv[0], argv, spec['env'])` **整份換掉**環境——job 解析",
-        "# 命令用的 PATH 來自 **spec 的 env**，不是本 unit 的 Environment=。在這裡寫一行",
-        "# Environment=PATH= 只會產生一個看起來承載作用、實際被 shim 丟掉的設定。",
-        "# 真正的來源是 Manager 端 root-owned EnvironmentFile 裡的（job 改不了）：",
+        "# --- PATH：**兩層都補**（#679）---",
+        "# #679 之前這份 unit 刻意不寫 PATH，理由是「shim 以 execvpe(argv[0], argv,",
+        "# spec['env']) 整份換掉環境，寫在 unit 上會被丟掉」。那個理由對了一半、也因此",
+        "# 錯得很貴：spec 的 env 確實是 job 的完整環境，但產生那份 env 的",
+        "# `job_runner.build_job_env()` 當時是 **fail-open** 的——Manager 端沒宣告",
+        "# PSC_*_PATH 就整個不寫 PATH 這個鍵，execvpe 於是退回 os.defpath",
+        "# （`:/bin:/usr/bin`），`codex` 靜默解到系統層那份舊 CLI。實機部署的",
+        "# EnvironmentFile 三個變數一個都沒有，於是三個角色全中。",
+        "# 現在是兩層：",
+        "#   1. spec 的 env——`build_job_env()` 對未宣告 fail-closed（不再靜默省略）；",
+        "#   2. **這一行**——shim 在 spec 的 env 沒有 PATH 時，改用本 unit 給的這一份",
+        "#      （root-owned、可逐字稽核），兩層都缺才 fail-closed。",
+        "# 第 2 層不是 fail-open：它退回的是**更可信**的來源（root-owned unit），不是",
+        "# 猜一個預設值。它同時涵蓋「手工組 spec 繞過產生器」（#645 的同型前例）。",
+        f"Environment=PATH={job_layout.job_path_value()}",
+        "# 值與 Manager 端 root-owned EnvironmentFile 裡的這個變數同源（job 改不了）：",
         f"#   {JOB_PATH_ENV_BY_PRINCIPAL[principal]}={job_layout.job_path_value()}",
         "# toolchain 排最前面是必要的：系統層可能另有一份同名但舊很多的 CLI（實機盤點",
         "# 到兩份 codex 差 100 個以上小版本），排後面會被它蓋掉，而症狀是「跑得起來但",
         "# 版本不是你以為的那個」。",
+        "# ⚠️ 驗「job 會解到哪一份 CLI」的檢查**不得自帶 PATH**（#679 的核心教訓）：",
+        "#    `unit_replica_properties()` 會把上面這一行機械帶進 --property=，複本因此",
+        "#    連「production 供應什麼／不供應什麼」都一起複製。再加一個 --setenv=PATH=",
+        "#    就等於驗證環境供應了 production 不供應的東西，結構上永遠驗不出這個缺陷。",
         "# --- executor 憑證（登記表 *-executor-credential，#640 裁決 (b)）---",
         f"#   {job_layout.executor_credential_of(account)}：**檔案**由本 job 帳號擁有",
         "# （0600，token 過期可自行 refresh），**放它的目錄維持 root-owned**——因此",
@@ -5340,6 +5355,194 @@ def unit_replica_properties(
                 "`python3 -m paulsha_cortex.trust_root unit …`。"
             )
     return tuple(props)
+
+
+# ---------------------------------------------------------------------------
+# 反向不變式：job 在**零額外 env** 下解到哪一份 CLI（#679）
+#
+# ## 這一節要修的不是程式，是驗證方法
+#
+# #679 的缺陷本身很小（一個 `if path_override:`），但它**存活了五輪驗證**：runbook
+# 4e／5-2b、#661 與 #664 的量測、以及事故當天的每一次探針，全部長這樣：
+#
+#     systemd-run … --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin
+#
+# 驗證環境**供應了 production 不供應的東西**，於是「job 拿不到 PATH」在結構上不可能
+# 被觀察到。runbook 4e 甚至逐字預言了症狀（「系統層那份 0.42.0 一樣會 rc=0，而 job
+# 跑的就變成 operator 從未判讀過的版本」），連版本號都對上了——但那一條是
+# `sudo -u … env PATH=…` 跑的，所以它驗的是「toolchain 裡那份是對的版本」，
+# 不是「job 實際會解到哪一份」。
+#
+# 這是「綠燈不承載語意」的**第五**個實例，而且是新的一類：前四次（#638 單 UID、
+# #657 同型、#673 假紅兩次）是「複本比 production 弱或強」，這次是「複本比
+# production **多**」。因此 #677 立下的規矩要再推一格：
+#
+#   **複本必須連「production 沒有設什麼」也一起複製。**
+#
+# `unit_replica_properties()` 天生做得到——它是從落檔的 unit 全量機械導出的，unit 有
+# `Environment=PATH=` 它就帶、沒有就不帶。真正要拿掉的是探針**額外**疊上去的那一行
+# `--setenv=PATH=`。本節的產生器因此有一條硬性質，由測試釘住：
+# **輸出裡不得出現任何 `--setenv=`，PATH 只能來自 unit 複本本身。**
+# ---------------------------------------------------------------------------
+
+#: 探針**可執行的那些行**禁止出現的片段。`--setenv=` 一律禁止（不只 `PATH=`）：
+#: 探針補任何一個 production 不供應的變數，都是同一個失效模式的下一個版本。
+PATH_PROBE_FORBIDDEN_FRAGMENTS: tuple[str, ...] = ("--setenv=", "PATH=")
+
+#: runbook 第 4e 步的共用探針名（#673 落地、#677 定案）。反向不變式**呼叫它、不重造**
+#: ——加固面的定義只有一份（:func:`unit_replica_properties`），連呼叫它的那幾行 shell
+#: 也不該有第二份會漂移的複本。runbook 那一節與本產生器共用這個名字。
+PATH_PROBE_HELPER = "psc_run_under"
+
+
+def path_probe_env_injections(lines: Sequence[str]) -> tuple[str, ...]:
+    """探針裡**注入了環境變數**的可執行行（正常應為空 tuple）。
+
+    只看非註解行是刻意的：這一節的註解必須講得出「為什麼不能加 `--setenv=PATH=`」，
+    而講這句話就得寫出那個字串。判準是「探針**做**了什麼」，不是「探針**提**到什麼」。
+    """
+
+    offenders: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if any(fragment in stripped for fragment in PATH_PROBE_FORBIDDEN_FRAGMENTS):
+            offenders.append(line)
+    return tuple(offenders)
+
+
+@dataclass(frozen=True)
+class PathResolutionCase:
+    """反向不變式的一列：某個 job 角色 × 某支 executor。
+
+    「角色 × executor」是**兩層列舉**，與 :func:`job_unit_stems` 同一個理由：
+    executor 決定加固剖面（#643），因此同一個角色的 `codex` 與 `claude` 跑的是**兩份
+    不同的 unit 檔**——只驗其中一份等於沒驗另一份的 PATH。
+    """
+
+    principal: Principal
+    account: str
+    executor: str
+    #: 該 (角色, executor) 實際會被起動的模板字幹（含剖面後綴）。
+    unit_stem: str
+    hardening_profile: str
+    #: 這一列要斷言的解析結果：`<toolchain>/bin/<executor>`。
+    expected_binary: str
+    #: 版本的比對對象＝**同一支檔案的絕對路徑**。登記表把 toolchain 落點登記成
+    #: `<toolchain>/bin/<cli>`，因此「PATH 解出來的那支」與「絕對路徑那支」印出同一
+    #: 個版本字串，就是「job 跑的是登記表登記的那一份」的直接證據——不需要第二份
+    #: 手抄的版本清單（那會立刻變成下一個會漂移的真相）。
+    version_reference: str
+
+
+def path_resolution_cases(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+) -> tuple[PathResolutionCase, ...]:
+    """`DOWNGRADED_JOB_PRINCIPALS` × :data:`EXECUTOR_TOOLS` 的完整矩陣。
+
+    本 scheme 沒有的角色（two-way／three-way 沒有 `GATE`）機械略去，不留空列。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    cases: list[PathResolutionCase] = []
+    for principal in downgraded_job_principals(scheme):
+        account = scheme.resolve(principal)
+        if account is None:  # pragma: no cover - downgraded_job_principals 已過濾
+            continue
+        for tool in EXECUTOR_TOOLS:
+            profile = executor_hardening_profile(tool.name)
+            binary = f"{layout.toolchain_bin}/{tool.name}"
+            cases.append(
+                PathResolutionCase(
+                    principal=principal,
+                    account=account,
+                    executor=tool.name,
+                    unit_stem=job_unit_stem(layout, principal, profile),
+                    hardening_profile=profile.profile_id,
+                    expected_binary=binary,
+                    version_reference=binary,
+                )
+            )
+    return tuple(cases)
+
+
+def build_path_resolution_probe(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+) -> list[str]:
+    """反向不變式的實機探針（**只回傳字串，不執行**）。
+
+    形態與 :func:`build_toolchain_plan` 一致：產生器出內容，runbook 貼上去跑。
+    要求逐條寫在產物本身，因為讀它的人正是會忍不住「補一個 PATH 讓它過」的人。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    cases = path_resolution_cases(scheme, layout)
+    lines: list[str] = [
+        "# === #679 反向不變式：job 在**零額外 env** 下解到哪一份 CLI ===",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root path-probe {scheme.scheme_id}",
+        "#",
+    ]
+    lines += _wrap_comment(
+        "本探針**刻意不帶任何 `--setenv=`**。這是本票的核心教訓：在此之前每一條驗證"
+        "都自己帶 `--setenv=PATH=…`，於是驗證環境供應了 production 不供應的東西，"
+        "「job 根本沒有 PATH」在結構上不可能被觀察到。加固面複本由 "
+        "`unit_replica_properties()` 從**落檔的 unit** 全量導出，因此它連"
+        "「production 沒有設什麼」也一起複製——只要不再往上疊，量到的就是 job 真正"
+        "會拿到的環境。"
+    )
+    lines += [
+        "#",
+        "# ⛔ 這條探針失敗時**不要**加 `--setenv=PATH=` 讓它過——那正是讓這個缺陷活了",
+        "#    五輪驗證的那個動作。要補的是 unit 的 `Environment=PATH=`（重跑產生器並",
+        "#    重新落檔）與 Manager EnvironmentFile 的 `PSC_*_PATH`。",
+        "#",
+    ]
+    lines += _wrap_comment(
+        "本探針量的是**第 2 層**（模板 unit 的 `Environment=PATH=`）：systemd-run "
+        "起的是探針命令，不經過 shim，因此看不到 spec 那一層。第 1 層（spec 的 env）"
+        "由 `job_runner.resolve_job_path()` 的 fail-closed ＋ 契約測試守住，兩層的值"
+        "同源（都是 `PathLayout.job_path_value()`）。要一併驗第 1 層，走 runbook 的"
+        "真實 dispatch smoke，不要在這裡手工組 spec——#645 逐字記錄過那條路怎麼把"
+        "bug 繞過去。"
+    )
+    lines += [
+        "",
+        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
+        "# **本產生器刻意不自己定義一份**——加固面的定義只有一份"
+        "（`unit_replica_properties()`），",
+        "# 連呼叫它的那幾行 shell 也不該有第二份複本；兩份複本會漂移，而漂移的方向",
+        "# 不由人選（#638／#657／#673／#679 是同一族事故的第一到第四次）。",
+        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
+        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
+        "  return 1 2>/dev/null || exit 1",
+        "}",
+        "",
+    ]
+    for case in cases:
+        lines += [
+            f"# --- {case.principal.value} × {case.executor}"
+            f"（{case.account}／{case.unit_stem}@／剖面 {case.hardening_profile}）---",
+            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'",
+            f"#   期望逐字：{case.expected_binary}",
+            f"#   ⛔ 空輸出 ⇒ job 沒有 PATH（或 toolchain 不在上面）；",
+            f"#      /usr/bin/{case.executor} ⇒ **本票的原症狀**：解到系統層那一份，",
+            "#      不報錯、只是產出來自一支沒人判讀過的 CLI。",
+            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c '{case.executor} --version'",
+            f"{case.version_reference} --version",
+            "#   期望：**兩行逐字相同**（PATH 解出來的那支 == 登記表登記的那支）。",
+            "",
+        ]
+    lines += _wrap_comment(
+        "gate 角色同樣在矩陣內，而且不是湊數：gate 宣告的 "
+        "`PSC_GATE_CMD_PYTEST=\"python3 -m pytest -q\"` 是相對名，同樣走 PATH 解析"
+        "（#666）。gate 這三列驗的是「gate 的 PATH 確實生效且順序正確」，那條性質對 "
+        "`python3` 與對 `codex` 是同一條。"
+    )
+    return lines
 
 
 def evaluate_polkit(
