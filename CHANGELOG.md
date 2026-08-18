@@ -8,6 +8,25 @@
 ## [Unreleased]
 
 ### Added
+- **#667：R3 testpilot case 素材盤點——四路盲測 sweep 合成為 102 筆去重候選清單**——
+  `docs/superpowers/workstreams/r3-testpilot-case-corpus/{todo.md,case-candidates.md}`。
+  **唯一產出是文件**：不寫 case yaml、不建 harness、不動 `paulsha_cortex/`（`#667` scope
+  fence）。四路（症狀家族／子系統／生命週期階段／artifact 型別）互相盲測共 **155 個原始
+  條目**，以「真實事件」為單位跨軸去重後 **102 筆**；`hit_by` 分佈為四路 **1**、三路 **9**、
+  二路 **31**、單路 **61**。**單路命中全數保留**——artifact 路的 24 筆純實測發現沒有對應
+  issue，掃 issue 的三路在結構上不可能命中。排序依「**可以最早開始長**」而非 `hit_by` 數量
+  （分 T1–T6 六個 tier）：第 1 名是單路命中、零 harness 前置、oracle 為集合相等的 `#490`；
+  唯一四路命中的 `#501` 排第 59，因為它需要 tick 推進與**可控的 review-launch 失敗**
+  （issue 明言 happy path 會遮蔽該缺陷，只跑快樂路徑必然是一條永遠綠的假 case）。文件保留
+  三個橫向發現：**oracle 品質分級**（差分／集合相等型無法靠放寬任一邊滿足，結構上擋得住
+  fail-open；閾值型與存在性型容易被放寬成空過，每筆均標注型別）、**既有陷阱必須進
+  `harness_needs` 並強制拆 tier**（多 UID／root／`direct` 模式／缺 `acl` 時**標
+  `unsupported`，不得標 `pass`**；且「手抄 property 子集 ＝ 驗證無效」已有四個實例，
+  `#638`／`#657`／`#673` 原 body 為假綠、`#673` 的 repro 為**假紅**）、**define 八環串聯
+  攻關鏈應整組存在**不得拆為八個獨立 case。另含 **`evidence-insufficient` 32 筆**（四路原始
+  41 筆去重，每筆保留「缺什麼證據才能判定」；3 筆與候選重疊者為四路真實判斷分歧，兩邊皆
+  保留）與**四格覆蓋缺口**（08-12 波 6 張未深讀；**ship／delivery 零條語意候選是覆蓋度與
+  風險落差最大的一格**；porcelain 分不出穩定與繞過；deck-combo 自動選型零事故）。
 - **#673：seccomp 過濾**語意**是加固剖面之外的第二個維度，且它是**承重**的**——
   `@system-service` 確實過濾掉 V8 啟動時要用的 `pkey_alloc`（x86_64 330，systemd 歸在
   `@pkey`；**不是** `@sandbox` 的 `landlock_*`／`seccomp`，kernel audit `type=1326 …
