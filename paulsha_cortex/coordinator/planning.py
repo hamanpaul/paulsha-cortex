@@ -16,6 +16,7 @@ from .model_identities import (
     render_secondary_rejection_reason,
     select_secondary_planner,
 )
+from .outcome_taxonomy import TRANSIENT_SERVICE_MARKER_RE
 from .workflow import GateEvidenceRef
 
 PLANNING_KINDS = ("spec", "design", "plan")
@@ -466,7 +467,10 @@ def _plan_review_contract_compatibility(
     frontmatter, body, _ = _frontmatter_and_body(plan_artifact.text)
     excludes_raw = frontmatter.get("scope_excludes", [])
     if not isinstance(excludes_raw, list) or any(not isinstance(item, str) for item in excludes_raw):
-        raise ValueError("plan frontmatter scope_excludes 必須為字串列表")
+        raise ValueError(
+            "plan frontmatter scope_excludes 必須為字串列表: "
+            + _render_difference("scope_excludes", "<str list>", excludes_raw)
+        )
     excludes = frozenset(item.strip().casefold() for item in excludes_raw if item.strip())
     haystack = "\n".join(_collect_task_items(body)).casefold()
 
@@ -510,14 +514,31 @@ def _plan_review_envelope(
     frontmatter, _, _ = _frontmatter_and_body(plan_artifact.text)
     invariant_count = frontmatter.get("invariant_count")
     if not isinstance(invariant_count, int) or isinstance(invariant_count, bool) or invariant_count < 0:
-        raise ValueError("plan frontmatter 缺少合法的 invariant_count（需為 >=0 整數宣告）")
+        # #701：三種失敗（欄位缺席／型別不是 int／負值）塌縮成同一句。
+        raise ValueError(
+            "plan frontmatter 缺少合法的 invariant_count（需為 >=0 整數宣告）: "
+            + _render_difference(
+                "invariant_count",
+                "<int >=0>",
+                frontmatter.get("invariant_count", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     artifact_classes_raw = frontmatter.get("artifact_classes")
     if (
         not isinstance(artifact_classes_raw, list)
         or not artifact_classes_raw
         or any(not isinstance(item, str) or not item.strip() for item in artifact_classes_raw)
     ):
-        raise ValueError("plan frontmatter 缺少合法的 artifact_classes（需為非空字串列表宣告）")
+        # #701：四種失敗（欄位缺席／不是 list／空 list／含非字串或空白項）塌縮
+        # 成同一句。
+        raise ValueError(
+            "plan frontmatter 缺少合法的 artifact_classes（需為非空字串列表宣告）: "
+            + _render_difference(
+                "artifact_classes",
+                "<non-empty str list>",
+                frontmatter.get("artifact_classes", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     artifact_classes = frozenset(item.strip() for item in artifact_classes_raw)
 
     # #209（能力封套）未落地：可插拔 provider，缺席時可觀測 bypass 通過。
@@ -536,7 +557,20 @@ def _plan_review_envelope(
         or not isinstance(envelope_artifact_classes_raw, list)
         or any(not isinstance(item, str) for item in envelope_artifact_classes_raw)
     ):
-        raise ValueError("builder envelope 格式錯誤")
+        # #701：五個條件（invariant_count 三種 ＋ artifact_classes 兩種）塌縮成
+        # 同一句。envelope 是 provider 供給、不是模型輸出，但塌縮是同一型。
+        raise ValueError(
+            "builder envelope 格式錯誤: "
+            + _render_difference(
+                "invariant_count", "<int >=0>", envelope.get("invariant_count", DIAGNOSTIC_ABSENT_PLACEHOLDER)
+            )
+            + " "
+            + _render_difference(
+                "artifact_classes",
+                "<str list>",
+                envelope.get("artifact_classes", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     envelope_artifact_classes = frozenset(str(item).strip() for item in envelope_artifact_classes_raw)
     over_budget = artifact_classes - envelope_artifact_classes
     if invariant_count > envelope_invariant_count or over_budget:
@@ -656,7 +690,10 @@ def _declared_dimension(frontmatter: Mapping[str, object], field: str) -> int:
     比照 PlanningScope.__post_init__ 風格）。"""
     value = frontmatter.get(field)
     if not isinstance(value, int) or isinstance(value, bool) or not (0 <= value <= 2):
-        raise ValueError(f"plan frontmatter 缺少合法的 {field}（需為 0–2 整數宣告）")
+        raise ValueError(
+            f"plan frontmatter 缺少合法的 {field}（需為 0–2 整數宣告）: "
+            + _render_difference(field, "<int 0..2>", frontmatter.get(field, DIAGNOSTIC_ABSENT_PLACEHOLDER))
+        )
     return value
 
 
@@ -707,12 +744,17 @@ def compute_sizing_score(
     state_consistency = _declared_dimension(frontmatter, "state_consistency")
 
     if gate_spine_count < 0:
-        raise ValueError("gate_spine_count 不得為負")
+        raise ValueError(f"gate_spine_count 不得為負: got={gate_spine_count}")
     unknown_rules = applicable_contract_rules - ACCEPTANCE_SURFACE_RULES
     if unknown_rules:
         raise ValueError(f"applicable_contract_rules 含未知規則: {sorted(unknown_rules)}")
     if cards_count < 0 or persona_binding_count < 0 or persona_binding_count > cards_count:
-        raise ValueError("cards_count/persona_binding_count 不合法")
+        # #701：三種失敗（cards 為負／binding 為負／binding 多於 cards）塌縮成
+        # 同一句、且兩個值都不印。呼叫端算好的整數，不是模型輸出，但塌縮同型。
+        raise ValueError(
+            "cards_count/persona_binding_count 不合法: "
+            f"cards_count={cards_count} persona_binding_count={persona_binding_count}"
+        )
 
     # acceptance_surfaces：核心 gate_spine 計數 + 適用規則數的組合訊號，門檻切三級。
     acceptance_signal = gate_spine_count + len(applicable_contract_rules)
@@ -748,40 +790,330 @@ def compute_sizing_score(
     )
 
 
+# --- issue #701：模型輸出驗證失敗的逐欄診斷 -----------------------------------
+#
+# 修法前 `validate_question_pack()` 的最後一關是 `to_dict()` 整體相等：
+#
+#     if normalized.to_dict() != report.default_question_pack.to_dict():
+#         raise ValueError("question pack does not cover exact completeness blockers")
+#
+# `pack_id`／任一 `question_id`／`kind`／`prompt`／`source_refs`／questions 的
+# 順序／數量——**六種以上結構完全不同的失敗塌縮成同一句話**，而模型實際回了
+# 什麼一個字都沒留。實機後果：define 穩定卡住（兩筆 work item × 兩種觸發路徑，
+# 四次皆同），落檔 evidence 只有那句話，沒有人查得動。同型塌縮在
+# `validate_secondary_evidence()`／`_validate_primary_integration()` 各還有數處
+# （見各自的 raise），本節的三個工具三處共用：
+#
+#   1. `_render_difference()`——第一個差異的 `<locator> expected=… got=…`。
+#      **locator 永不被截斷**，被犧牲的只有值，且犧牲多少就地記帳。
+#   2. `_guard_classification_markers()`——讓模型可控的值不可能偽裝成
+#      `manager._classify_planning_failure` 的分類標記。
+#   3. `summarize_planning_exception()`——四個 `except` 分支共用的例外摘要。
+#
+# 本節**不動任何驗證判準**：什麼算合法、什麼算不合法逐位元不變，只讓「不合法
+# 在哪裡」變成看得見的。
+
+#: 單一值在診斷訊息裡的字元上限。兩個值（expected／got）＋ locator ＋ 原句約
+#: 落在 300 字元內，仍在 `PLANNING_FAILURE_DETAIL_LIMIT` 之內。
+PLANNING_DIAGNOSTIC_VALUE_LIMIT = 72
+#: 值視窗對齊到第一個相異字元時，差異點**之前**保留的字元數。長 prompt 的前
+#: 72 個字往往兩邊一模一樣，直接取前綴等於印兩份相同的字：視窗必須跟著差異
+#: 點走，「看得出差在哪」才成立。
+PLANNING_DIAGNOSTIC_WINDOW_LEAD = 16
+#: `run_heterogeneous_brainstorm` 四個 `except` 分支對底層例外訊息的字元預算。
+#: #397 定的 160 是「只有一句話」時代的數字，逐欄差異裝不下（locator ＋ 兩個
+#: 值就超過）；1200 是票 A 拒因表的全表預算，這裡取其零頭。
+PLANNING_FAILURE_DETAIL_LIMIT = 480
+
+#: 值不存在（questions 少一列、欄位缺席）時的顯示形。佔位符本身不得含任何
+#: taxonomy marker——`<unavailable>` 就是這樣撞上 #554 的。
+DIAGNOSTIC_ABSENT_PLACEHOLDER = "<absent>"
+
+#: `manager._classify_planning_failure` 以**裸子字串**比對整串 reason 的分類
+#: 標記：#416 的 authority 殘留兩條，與 #507／#554 的 operator worktree drift
+#: 一條。字面值刻意複製於此而不 import——`manager` 與 `planning_runtime` 都反
+#: 向依賴本模組，import 會成環；`tests/test_planning_diagnostics_701.py` 有一
+#: 條交叉比對測試釘住兩邊同步（那邊改了、這邊沒跟上，測試當場紅）。
+_CLASSIFICATION_MARKER_PHRASES = (
+    "planning artifact lacks current planning authority",
+    "planning artifact current authority drift",
+    "planning launcher modified operator worktree",
+)
+#: 上列 phrase 命中時的替代字（本身不含任何 marker）。
+CLASSIFICATION_MARKER_PLACEHOLDER = "<classification-marker-elided>"
+_CLASSIFICATION_MARKER_PHRASE_RE = re.compile(
+    "|".join(re.escape(phrase) for phrase in _CLASSIFICATION_MARKER_PHRASES),
+    re.IGNORECASE,
+)
+#: C0／C1 控制字元。診斷會進單行 log／`blocking_reason`，模型輸出裡的換行與
+#: ANSI escape 不得污染它（與票 A 的 `_CONTROL_CHARS_RE` 同一條規矩）。
+_DIAGNOSTIC_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def _guard_classification_markers(text: str) -> str:
+    """讓一段**模型可控**的文字不可能偽裝成 `_classify_planning_failure` 的標記。
+
+    票 A（#682／PR #688）為 probe 拒因表立下的規矩是：分類器讀渲染端算好、
+    **錨在字串開頭**的 `grade=` 欄位，不對整串 reason 做 substring search。本
+    票新增的逐欄差異走的是另一條路——它進的是 `question-pack-malformed: …`
+    這類 reason 的**尾段**，`grade=` 的錨定式（`\\A[a-z0-9-]+ grade=environment
+    candidates=\\d+ \\(`）在結構上碰不到它。
+
+    但 `_classify_planning_failure` 還有三條**不錨定**的判準：#533／#554 的
+    `outcome_taxonomy.TRANSIENT_SERVICE_MARKER_RE`（詞界比對整串）、#416 的
+    authority 殘留、#507 的 worktree drift（兩者裸子字串比對整串）。把模型的
+    值原樣丟進 reason，等於讓模型只要在某個 `prompt` 裡寫上 `timeout` 或
+    `503`，就能把一個**內容**失敗改判成 environment、讓 `recover-planning`
+    對著一個永遠不會自癒的失敗一直重試。本函式在**產生端**堵掉這條：
+
+    - 詞界類 marker（`timeout`／`503`／`overloaded`…）：兩側各加一個 `_`。
+      `_` 是 word char，`\\btimeout\\b` 於是不成立，而**字面一個字都沒少**
+      ——這正是 `test_every_marker_needs_word_boundaries`（#554）已經釘住的
+      性質（`x_{marker}_x` 不命中）反過來用。
+    - 裸子字串類 phrase（三條長句）：詞界破不了它們（`in` 不看邊界），只能
+      整段換成 `CLASSIFICATION_MARKER_PLACEHOLDER`。這三條是很長的特定句
+      子，出現在合法規劃輸出裡的機率遠低於前者，代價可接受。
+
+    只作用在**模型／repo 值**上。launcher 轉印的服務錯誤（`planning launcher
+    returned no JSON object: …Eligibility check failed…`）**不**走本函式：
+    #533 的判準刻意要看見那一段，遮掉它等於把 503 自癒路徑砍掉。
+    """
+
+    guarded = _CLASSIFICATION_MARKER_PHRASE_RE.sub(CLASSIFICATION_MARKER_PLACEHOLDER, text)
+    return TRANSIENT_SERVICE_MARKER_RE.sub(lambda match: f"_{match.group(0)}_", guarded)
+
+
+def _display_form(value: object) -> str:
+    """值 → 單行顯示形。字串原樣，其餘走 canonical JSON（不可序列化則 `repr`）。"""
+
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = _canonical_json(value)
+        except (TypeError, ValueError):
+            text = repr(value)
+    return " ".join(_DIAGNOSTIC_CONTROL_RE.sub(" ", text).split())
+
+
+def _windowed_value(text: str, *, start: int = 0, limit: int = PLANNING_DIAGNOSTIC_VALUE_LIMIT) -> str:
+    """把顯示形壓成有界視窗，**被犧牲的字數就地記帳**（票 A 的截斷策略）。
+
+    `'<+12c>missing design<+40c>'`：前面少了 12 個字、後面少了 40 個字。記帳
+    數字算的是**遮罩前**的原始字元，因此「這個值總共多長」永遠推得回來。
+    """
+
+    start = max(0, min(start, len(text)))
+    body = text[start : start + limit]
+    prefix = f"<+{start}c>" if start else ""
+    dropped = len(text) - start - len(body)
+    suffix = f"<+{dropped}c>" if dropped > 0 else ""
+    return f"'{prefix}{_guard_classification_markers(body)}{suffix}'"
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    length = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        length += 1
+    return length
+
+
+def _render_difference(
+    locator: str,
+    expected: object,
+    got: object,
+    *,
+    limit: int = PLANNING_DIAGNOSTIC_VALUE_LIMIT,
+) -> str:
+    """`<locator> expected=<值> got=<值>`——本票所有差異訊息的唯一文法。
+
+    `locator`（`questions[2].kind`、`pack_id`、`resolutions[0].artifact_kind`）
+    是**判準端算出來的**，永不截斷、永不遮罩：它就是「差在哪」本身。兩個值
+    才是可犧牲的部分。
+    """
+
+    expected_text = _display_form(expected)
+    got_text = _display_form(got)
+    start = 0
+    if len(expected_text) > limit or len(got_text) > limit:
+        common = _common_prefix_length(expected_text, got_text)
+        if common > limit - PLANNING_DIAGNOSTIC_WINDOW_LEAD:
+            start = common - PLANNING_DIAGNOSTIC_WINDOW_LEAD
+    expected_rendered = _windowed_value(expected_text, start=start, limit=limit)
+    got_rendered = _windowed_value(got_text, start=start, limit=limit)
+    return f"{locator} expected={expected_rendered} got={got_rendered}"
+
+
+def _render_absent(locator: str, expected: object, *, limit: int = PLANNING_DIAGNOSTIC_VALUE_LIMIT) -> str:
+    return (
+        f"{locator} expected={_windowed_value(_display_form(expected), limit=limit)} "
+        f"got={DIAGNOSTIC_ABSENT_PLACEHOLDER}"
+    )
+
+
+def _render_unexpected(locator: str, got: object, *, limit: int = PLANNING_DIAGNOSTIC_VALUE_LIMIT) -> str:
+    return (
+        f"{locator} expected={DIAGNOSTIC_ABSENT_PLACEHOLDER} "
+        f"got={_windowed_value(_display_form(got), limit=limit)}"
+    )
+
+
+def summarize_planning_exception(
+    exc: BaseException, *, limit: int = PLANNING_FAILURE_DETAIL_LIMIT
+) -> str:
+    """`<ExceptionTypeName>: <訊息>`——四個 `except` 分支共用的例外摘要。
+
+    #397 起這四處就併入例外型別與訊息，本票只改兩件事：預算由 160 放寬到
+    `PLANNING_FAILURE_DETAIL_LIMIT`（逐欄差異裝不進 160），以及截斷改為
+    **就地記帳** `…+Nc`（原本是裸切，讀的人看不出還有沒有下文）。單行化與
+    型別名在前的順序不變——`outcome_taxonomy` 的 `timeoutexpired` 這類 marker
+    靠的就是型別名活著。
+    """
+
+    message = " ".join(_DIAGNOSTIC_CONTROL_RE.sub(" ", str(exc)).split())
+    if len(message) > limit:
+        message = f"{message[:limit]}…+{len(message) - limit}c"
+    return f"{type(exc).__name__}: {message}"
+
+
 def _strict_string_list(value: object, field: str, *, allow_empty: bool = False) -> tuple[str, ...]:
-    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
-        raise ValueError(f"{field} must be a string list")
+    """字串列表判準。判準逐位元不變，只把「哪一項不合」講出來（#701）。
+
+    修法前三種失敗（不是 list／某一項不是字串／某一項是空白）塌縮成同一句
+    `must be a string list`，連是第幾項都沒有。
+    """
+
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{field} must be a string list: "
+            + _render_difference("type", "list", type(value).__name__)
+        )
+    for index, item in enumerate(value):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"{field}[{index}] must be a string: "
+                + _render_difference("type", "str", type(item).__name__)
+                + f" value={_windowed_value(_display_form(item))}"
+            )
+        if not item.strip():
+            raise ValueError(f"{field}[{index}] must not be blank")
     normalized = tuple(item.strip() for item in value)
     if not allow_empty and not normalized:
         raise ValueError(f"{field} must not be empty")
     return normalized
 
 
+#: `validate_question_pack` 的整體相等判準不相等時的**原句**。前綴逐字保留
+#: （operator 的 grep 習慣、既有 log 與 issue #701 都以它為錨點），逐欄差異接
+#: 在冒號之後。
+QUESTION_PACK_MISMATCH_MESSAGE = "question pack does not cover exact completeness blockers"
+
+
+def describe_question_pack_difference(got: QuestionPack, expected: QuestionPack) -> str:
+    """回傳 `got` 與 `expected` 的**第一個**差異描述；完全相等時回傳空字串。
+
+    掃描順序即報告順序：`schema_version` → `pack_id` → 逐列逐欄
+    （`question_id` → `kind` → `prompt` → `source_refs`）→ 列數。列數放最後
+    是因為「第 0 列的 kind 就錯了」比「總共少一列」更接近成因；但列數本身
+    **一律**寫在訊息開頭的 `rows expected=N got=M`，兩件事都答得出來
+    （票 A：「有幾條、分別是誰、各自為什麼」不得被犧牲）。
+
+    本函式**不參與判準**——判準仍是 `to_dict()` 逐位元相等，這裡只負責在它
+    說「不等」之後回答「哪裡不等」。
+    """
+
+    if got.schema_version != expected.schema_version:
+        return _render_difference("schema_version", expected.schema_version, got.schema_version)
+    if got.pack_id != expected.pack_id:
+        return _render_difference("pack_id", expected.pack_id, got.pack_id)
+    for index, (expected_question, got_question) in enumerate(zip(expected.questions, got.questions)):
+        for name in ("question_id", "kind", "prompt", "source_refs"):
+            expected_value = getattr(expected_question, name)
+            got_value = getattr(got_question, name)
+            if expected_value == got_value:
+                continue
+            if isinstance(expected_value, tuple):
+                expected_value = list(expected_value)
+            if isinstance(got_value, tuple):
+                got_value = list(got_value)
+            return _render_difference(f"questions[{index}].{name}", expected_value, got_value)
+    expected_rows = len(expected.questions)
+    got_rows = len(got.questions)
+    if got_rows < expected_rows:
+        return _render_absent(
+            f"questions[{got_rows}].question_id", expected.questions[got_rows].question_id
+        )
+    if got_rows > expected_rows:
+        return _render_unexpected(
+            f"questions[{expected_rows}].question_id", got.questions[expected_rows].question_id
+        )
+    return ""
+
+
 def validate_question_pack(payload: object, *, report: CompletenessReport) -> QuestionPack:
     if not isinstance(payload, dict):
-        raise ValueError("question pack must be an object")
+        raise ValueError(
+            "question pack must be an object: "
+            + _render_difference("type", "dict", type(payload).__name__)
+        )
     extras = set(payload) - {"schema_version", "pack_id", "questions"}
     if extras:
-        raise ValueError(f"question pack unexpected key: {sorted(extras)[0]}")
+        raise ValueError(f"question pack unexpected key: {sorted(extras)[0]} (all={sorted(extras)})")
     if payload.get("schema_version") != QUESTION_PACK_SCHEMA_VERSION:
-        raise ValueError("question pack schema_version invalid")
+        # #701：修法前這句不說「實際收到什麼」——缺欄位、型別不對、版本號不同
+        # 三種失敗看起來一模一樣。
+        raise ValueError(
+            "question pack schema_version invalid: "
+            + _render_difference(
+                "schema_version",
+                QUESTION_PACK_SCHEMA_VERSION,
+                payload.get("schema_version", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     pack_id = payload.get("pack_id")
     rows = payload.get("questions")
-    if not isinstance(pack_id, str) or not pack_id or not isinstance(rows, list):
-        raise ValueError("question pack identity/questions invalid")
+    if not isinstance(pack_id, str) or not pack_id:
+        # #701：`identity/questions invalid` 一句話塌縮了三種失敗（pack_id 不是
+        # 字串／pack_id 是空字串／questions 不是 list）。拆成兩句、各自帶值。
+        raise ValueError(
+            "question pack pack_id invalid: "
+            + _render_difference("pack_id", "<non-empty str>", payload.get("pack_id", DIAGNOSTIC_ABSENT_PLACEHOLDER))
+        )
+    if not isinstance(rows, list):
+        raise ValueError(
+            "question pack questions invalid: "
+            + _render_difference("questions type", "list", type(rows).__name__)
+        )
     questions: list[PlanningQuestion] = []
     seen: set[str] = set()
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            raise ValueError(f"questions[{index}] must be an object")
+            raise ValueError(
+                f"questions[{index}] must be an object: "
+                + _render_difference("type", "dict", type(row).__name__)
+            )
         extras = set(row) - {"question_id", "kind", "prompt", "source_refs"}
         if extras:
-            raise ValueError(f"questions[{index}] unexpected key: {sorted(extras)[0]}")
+            raise ValueError(
+                f"questions[{index}] unexpected key: {sorted(extras)[0]} (all={sorted(extras)})"
+            )
         question_id = row.get("question_id")
         kind = row.get("kind")
         prompt = row.get("prompt")
-        if not all(isinstance(value, str) and value.strip() for value in (question_id, kind, prompt)):
-            raise ValueError(f"questions[{index}] has invalid scalar")
+        for name, value in (("question_id", question_id), ("kind", kind), ("prompt", prompt)):
+            # #701：`has invalid scalar` 把三個欄位 × 兩種缺陷（非字串／空白）
+            # 共六種失敗塌縮成一句，連是哪一欄都不說。
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"questions[{index}].{name} must be a string: "
+                    + _render_difference(
+                        "type", "str", DIAGNOSTIC_ABSENT_PLACEHOLDER if name not in row else type(value).__name__
+                    )
+                )
+            if not value.strip():
+                raise ValueError(f"questions[{index}].{name} must not be blank")
         if question_id in seen:
             raise ValueError(f"duplicate question_id: {question_id}")
         seen.add(question_id)
@@ -795,7 +1127,18 @@ def validate_question_pack(payload: object, *, report: CompletenessReport) -> Qu
         )
     normalized = QuestionPack(pack_id=pack_id, questions=tuple(questions))
     if normalized.to_dict() != report.default_question_pack.to_dict():
-        raise ValueError("question pack does not cover exact completeness blockers")
+        # #701：判準逐位元不變（仍是整份 `to_dict()` 相等），但失敗不再塌縮成
+        # 一句話——列數 ＋ 第一個差異的欄位與兩邊的值一起進 reason／evidence。
+        expected_pack = report.default_question_pack
+        difference = (
+            describe_question_pack_difference(normalized, expected_pack)
+            or "<no field-level difference found>"
+        )
+        raise ValueError(
+            f"{QUESTION_PACK_MISMATCH_MESSAGE}: "
+            f"rows expected={len(expected_pack.questions)} got={len(normalized.questions)}; "
+            f"first diff at {difference}"
+        )
     return normalized
 
 
@@ -829,27 +1172,69 @@ class SecondaryEvidence:
 
 def validate_secondary_evidence(payload: object, *, question_pack: QuestionPack) -> SecondaryEvidence:
     if not isinstance(payload, dict):
-        raise ValueError("secondary evidence must be an object")
+        raise ValueError(
+            "secondary evidence must be an object: "
+            + _render_difference("type", "dict", type(payload).__name__)
+        )
     extras = set(payload) - {"schema_version", "question_pack_id", "evidence"}
     if extras:
-        raise ValueError(f"secondary evidence unexpected key: {sorted(extras)[0]}")
-    if payload.get("schema_version") != 1 or payload.get("question_pack_id") != question_pack.pack_id:
-        raise ValueError("secondary evidence identity invalid")
+        raise ValueError(
+            f"secondary evidence unexpected key: {sorted(extras)[0]} (all={sorted(extras)})"
+        )
+    # #701：`identity invalid` 一句話塌縮了兩件毫無關係的事——schema 版本不對
+    # （契約漂移）與 pack_id 抄錯（模型沒 echo-back）。處置完全不同，訊息卻
+    # 一模一樣。
+    if payload.get("schema_version") != 1:
+        raise ValueError(
+            "secondary evidence schema_version invalid: "
+            + _render_difference(
+                "schema_version", 1, payload.get("schema_version", DIAGNOSTIC_ABSENT_PLACEHOLDER)
+            )
+        )
+    if payload.get("question_pack_id") != question_pack.pack_id:
+        raise ValueError(
+            "secondary evidence question_pack_id mismatch: "
+            + _render_difference(
+                "question_pack_id",
+                question_pack.pack_id,
+                payload.get("question_pack_id", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     rows = payload.get("evidence")
     if not isinstance(rows, list):
-        raise ValueError("secondary evidence must be a list")
+        raise ValueError(
+            "secondary evidence must be a list: "
+            + _render_difference("evidence type", "list", type(rows).__name__)
+        )
     expected = {question.question_id for question in question_pack.questions}
     seen: set[str] = set()
     items: list[SecondaryEvidenceItem] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
-            raise ValueError(f"evidence[{index}] must be an object")
+            raise ValueError(
+                f"evidence[{index}] must be an object: "
+                + _render_difference("type", "dict", type(row).__name__)
+            )
         extras = set(row) - {"question_id", "claims", "source_refs"}
         if extras:
-            raise ValueError(f"evidence[{index}] unexpected key: {sorted(extras)[0]}")
+            raise ValueError(
+                f"evidence[{index}] unexpected key: {sorted(extras)[0]} (all={sorted(extras)})"
+            )
         question_id = row.get("question_id")
-        if not isinstance(question_id, str) or question_id not in expected or question_id in seen:
-            raise ValueError(f"evidence[{index}].question_id invalid")
+        # #701：三種失敗（不是字串／不在 pack 裡／同一題答兩次）塌縮成同一句。
+        if not isinstance(question_id, str):
+            raise ValueError(
+                f"evidence[{index}].question_id must be a string: "
+                + _render_difference("type", "str", type(question_id).__name__)
+            )
+        if question_id not in expected:
+            raise ValueError(
+                f"evidence[{index}].question_id is not in the question pack: "
+                f"got={_windowed_value(_display_form(question_id))} "
+                f"unanswered={_windowed_value(_display_form(sorted(expected - seen)))}"
+            )
+        if question_id in seen:
+            raise ValueError(f"evidence[{index}].question_id answered twice: {question_id}")
         seen.add(question_id)
         items.append(
             SecondaryEvidenceItem(
@@ -859,7 +1244,15 @@ def validate_secondary_evidence(payload: object, *, question_pack: QuestionPack)
             )
         )
     if seen != expected:
-        raise ValueError("secondary evidence does not cover every question")
+        # #701：修法前只說「沒有覆蓋每一題」，**沒說少了哪幾題**——而少一題與
+        # 少五題、少的是哪一題，排查方向完全不同。多出來的題在上面就被擋掉，
+        # 因此走到這裡的一定是「少」。
+        missing = sorted(expected - seen)
+        raise ValueError(
+            "secondary evidence does not cover every question: "
+            f"answered={len(seen)}/{len(expected)} "
+            f"missing={_windowed_value(_display_form(missing))}"
+        )
     return SecondaryEvidence(question_pack.pack_id, tuple(items))
 
 
@@ -870,7 +1263,10 @@ def _validate_primary_integration(
     secondary_evidence_hash: str,
 ) -> dict[str, object]:
     if not isinstance(payload, dict):
-        raise ValueError("primary integration must be an object")
+        raise ValueError(
+            "primary integration must be an object: "
+            + _render_difference("type", "dict", type(payload).__name__)
+        )
     extras = set(payload) - {
         "schema_version",
         "question_pack_id",
@@ -879,39 +1275,98 @@ def _validate_primary_integration(
         "artifacts",
     }
     if extras:
-        raise ValueError(f"primary integration unexpected key: {sorted(extras)[0]}")
+        raise ValueError(
+            f"primary integration unexpected key: {sorted(extras)[0]} (all={sorted(extras)})"
+        )
     if payload.get("schema_version") != 1:
-        raise ValueError("primary integration schema invalid")
+        raise ValueError(
+            "primary integration schema invalid: "
+            + _render_difference(
+                "schema_version", 1, payload.get("schema_version", DIAGNOSTIC_ABSENT_PLACEHOLDER)
+            )
+        )
+    # #516 的兩個 echo-back 欄位：值都已在模型輸入裡，模型只需原樣複製。#701：
+    # 「抄錯了」與「抄成什麼」是兩件事，修法前只說得出前者——而這正是 #516
+    # 反覆撞牆時最需要的一格（模型是把 hash 自己算了？抄了 pack_id？還是留空？）。
     if payload.get("question_pack_id") != question_pack.pack_id:
-        raise ValueError("primary integration pack mismatch")
+        raise ValueError(
+            "primary integration pack mismatch: "
+            + _render_difference(
+                "question_pack_id",
+                question_pack.pack_id,
+                payload.get("question_pack_id", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     if payload.get("secondary_evidence_hash") != secondary_evidence_hash:
-        raise ValueError("primary integration evidence hash mismatch")
+        raise ValueError(
+            "primary integration evidence hash mismatch: "
+            + _render_difference(
+                "secondary_evidence_hash",
+                secondary_evidence_hash,
+                payload.get("secondary_evidence_hash", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+            )
+        )
     rows = payload.get("resolutions")
     if not isinstance(rows, list):
-        raise ValueError("primary integration resolutions must be a list")
+        raise ValueError(
+            "primary integration resolutions must be a list: "
+            + _render_difference("resolutions type", "list", type(rows).__name__)
+        )
     expected = {question.question_id for question in question_pack.questions}
     seen: set[str] = set()
     normalized: list[dict[str, object]] = []
+    required_resolution_keys = {"question_id", "decision", "artifact_kind", "artifact_refs"}
     for index, row in enumerate(rows):
-        if not isinstance(row, dict) or set(row) != {
-            "question_id",
-            "decision",
-            "artifact_kind",
-            "artifact_refs",
-        }:
-            raise ValueError(f"resolutions[{index}] invalid keys")
+        # #701：`invalid keys` 塌縮了「根本不是 object」「少了哪幾個鍵」「多了
+        # 哪幾個鍵」三種失敗，而且一個鍵名都不說。
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"resolutions[{index}] must be an object: "
+                + _render_difference("type", "dict", type(row).__name__)
+            )
+        if set(row) != required_resolution_keys:
+            raise ValueError(
+                f"resolutions[{index}] invalid keys: "
+                f"missing={sorted(required_resolution_keys - set(row))} "
+                f"unexpected={sorted(set(row) - required_resolution_keys)}"
+            )
         question_id = row.get("question_id")
         decision = row.get("decision")
-        if not isinstance(question_id, str) or question_id not in expected or question_id in seen:
-            raise ValueError(f"resolutions[{index}].question_id invalid")
+        # #701：三種失敗（不是字串／不在 pack 裡／同一題解兩次）塌縮成同一句。
+        if not isinstance(question_id, str):
+            raise ValueError(
+                f"resolutions[{index}].question_id must be a string: "
+                + _render_difference("type", "str", type(question_id).__name__)
+            )
+        if question_id not in expected:
+            raise ValueError(
+                f"resolutions[{index}].question_id is not in the question pack: "
+                f"got={_windowed_value(_display_form(question_id))} "
+                f"unresolved={_windowed_value(_display_form(sorted(expected - seen)))}"
+            )
+        if question_id in seen:
+            raise ValueError(f"resolutions[{index}].question_id resolved twice: {question_id}")
         if not isinstance(decision, str) or not decision.strip():
-            raise ValueError(f"resolutions[{index}].decision invalid")
+            raise ValueError(
+                f"resolutions[{index}].decision invalid: "
+                + _render_difference("decision", "<non-blank str>", decision)
+            )
         artifact_kind = row.get("artifact_kind")
         if artifact_kind not in PLANNING_KINDS:
-            raise ValueError(f"resolutions[{index}].artifact_kind invalid")
+            raise ValueError(
+                f"resolutions[{index}].artifact_kind invalid: "
+                + _render_difference("artifact_kind", list(PLANNING_KINDS), artifact_kind)
+            )
         question = next(item for item in question_pack.questions if item.question_id == question_id)
         if question.kind.startswith("missing-") and artifact_kind != question.kind.removeprefix("missing-"):
-            raise ValueError(f"resolutions[{index}].artifact_kind mismatch")
+            raise ValueError(
+                f"resolutions[{index}].artifact_kind mismatch: "
+                + _render_difference(
+                    f"artifact_kind for question kind={question.kind}",
+                    question.kind.removeprefix("missing-"),
+                    artifact_kind,
+                )
+            )
         seen.add(question_id)
         normalized.append(
             {
@@ -924,25 +1379,66 @@ def _validate_primary_integration(
             }
         )
     if seen != expected:
-        raise ValueError("primary integration does not resolve every question")
+        # #701：同 `validate_secondary_evidence`——少了哪幾題才是可行動的資訊。
+        missing = sorted(expected - seen)
+        raise ValueError(
+            "primary integration does not resolve every question: "
+            f"resolved={len(seen)}/{len(expected)} "
+            f"missing={_windowed_value(_display_form(missing))}"
+        )
     artifacts_raw = payload.get("artifacts", [])
     if not isinstance(artifacts_raw, list):
-        raise ValueError("primary integration artifacts must be a list")
+        raise ValueError(
+            "primary integration artifacts must be a list: "
+            + _render_difference("artifacts type", "list", type(artifacts_raw).__name__)
+        )
+    required_artifact_keys = {"kind", "path", "content"}
     artifacts: list[dict[str, str]] = []
     for index, row in enumerate(artifacts_raw):
-        if not isinstance(row, dict) or set(row) != {"kind", "path", "content"}:
-            raise ValueError(f"artifacts[{index}] invalid keys")
+        if not isinstance(row, dict):
+            raise ValueError(
+                f"artifacts[{index}] must be an object: "
+                + _render_difference("type", "dict", type(row).__name__)
+            )
+        if set(row) != required_artifact_keys:
+            raise ValueError(
+                f"artifacts[{index}] invalid keys: "
+                f"missing={sorted(required_artifact_keys - set(row))} "
+                f"unexpected={sorted(set(row) - required_artifact_keys)}"
+            )
         kind = row.get("kind")
         path = row.get("path")
         content = row.get("content")
-        if kind not in PLANNING_KINDS or not isinstance(path, str) or not path or not isinstance(content, str):
-            raise ValueError(f"artifacts[{index}] invalid")
+        # #701：修法前這四種失敗（kind 非法／path 非字串／path 空字串／content
+        # 非字串）共用同一句 `artifacts[i] invalid`。
+        if kind not in PLANNING_KINDS:
+            raise ValueError(
+                f"artifacts[{index}].kind invalid: "
+                + _render_difference("kind", list(PLANNING_KINDS), kind)
+            )
+        if not isinstance(path, str) or not path:
+            raise ValueError(
+                f"artifacts[{index}].path invalid: "
+                + _render_difference("path", "<non-empty str>", path)
+            )
+        if not isinstance(content, str):
+            raise ValueError(
+                f"artifacts[{index}].content must be a string: "
+                + _render_difference("type", "str", type(content).__name__)
+            )
         artifacts.append({"kind": str(kind), "path": path, "content": content})
     referenced = {
         ref for resolution in normalized for ref in resolution["artifact_refs"]
     }
-    if artifacts and {item["path"] for item in artifacts} != referenced:
-        raise ValueError("primary integration artifact content/ref mismatch")
+    written = {item["path"] for item in artifacts}
+    if artifacts and written != referenced:
+        # #701：這是 #406 反覆撞的那一條。修法前只說「對不上」，不說是「寫了
+        # 沒人引用」還是「引用了沒寫」——兩者的 prompt 修法完全相反。
+        raise ValueError(
+            "primary integration artifact content/ref mismatch: "
+            f"written_not_referenced={_windowed_value(_display_form(sorted(written - referenced)))} "
+            f"referenced_not_written={_windowed_value(_display_form(sorted(referenced - written)))}"
+        )
     return {
         "schema_version": 1,
         "question_pack_id": question_pack.pack_id,
@@ -1197,6 +1693,20 @@ def _artifact_assessment_failure(
     """
 
     details = [f"reasons={','.join(assessment.reasons)}"]
+    if "required-section-missing" in assessment.reasons:
+        # #701：這是 #520 的同型缺口——`required-section-missing` 五個字塌縮了
+        # 「一個標題都沒有」與「寫了標題但字面不在可接受集合」（#520 實機是
+        # `## Requirements for spec`）。修法前 planner 到底寫了什麼標題沒有任何
+        # 地方留下，而那正是唯一能分辨兩者的資訊。判準不動，只把兩邊印出來。
+        _, body, offset = _frontmatter_and_body(assessment.artifact.text)
+        found, _ = _headings_and_markers(body, line_offset=offset)
+        accepted = _ACCEPTED_HEADINGS.get(assessment.artifact.kind, ())
+        details.append(
+            "headings accepted="
+            + _windowed_value(_display_form(list(accepted)))
+            + " found="
+            + _windowed_value(_display_form(sorted(found)))
+        )
     markers = assessment.blocking_markers
     if markers:
         rendered = [
@@ -1243,7 +1753,10 @@ class PlanningGateRefs:
             if value is not None:
                 refs.append(value.ref)
         if len(refs) != len(set(refs)):
-            raise ValueError("planning gate refs must be distinct")
+            duplicates = sorted({ref for ref in refs if refs.count(ref) > 1})
+            raise ValueError(
+                f"planning gate refs must be distinct: duplicates={duplicates}"
+            )
 
     def as_tuple(self) -> tuple[GateEvidenceRef, ...]:
         return tuple(
@@ -1377,12 +1890,16 @@ def run_heterogeneous_brainstorm(
         # 內容是什麼——排障要另外重跑加 print 才查得到（曾經雙重誤導：真正
         # 原因是 planning launcher 把 operator worktree 判成被汙染而
         # ValueError，卻只顯示成籠統的「question-pack-malformed」）。這裡併入
-        # 例外型別與訊息前 160 字，供 #393 的 planning-failure evidence 與
+        # 例外型別與訊息，供 #393 的 planning-failure evidence 與
         # recover-planning 的 `_read_planning_failure_record` 直接讀出；兩者
         # 都只要求 reason 為非空字串，加長不影響既有契約。
+        #
+        # #701：摘要改走 `summarize_planning_exception()`——預算由 160 放寬到
+        # `PLANNING_FAILURE_DETAIL_LIMIT`（逐欄差異裝不進 160），截斷改為就地
+        # 記帳。四處共用同一支，避免第五種格式。
         return BrainstormResult(
             "needs_human",
-            f"question-pack-malformed: {type(exc).__name__}: {str(exc)[:160]}",
+            f"question-pack-malformed: {summarize_planning_exception(exc)}",
             None,
             empty_refs,
             None,
@@ -1395,7 +1912,7 @@ def run_heterogeneous_brainstorm(
     except Exception as exc:
         return BrainstormResult(
             "needs_human",
-            f"secondary-output-malformed: {type(exc).__name__}: {str(exc)[:160]}",
+            f"secondary-output-malformed: {summarize_planning_exception(exc)}",
             selection.identity.independence_domain,
             empty_refs,
             None,
@@ -1412,7 +1929,7 @@ def run_heterogeneous_brainstorm(
     except Exception as exc:
         return BrainstormResult(
             "needs_human",
-            f"primary-integration-malformed: {type(exc).__name__}: {str(exc)[:160]}",
+            f"primary-integration-malformed: {summarize_planning_exception(exc)}",
             selection.identity.independence_domain,
             empty_refs,
             None,
@@ -1421,7 +1938,16 @@ def run_heterogeneous_brainstorm(
     if artifact_writer is not None:
         try:
             if not integration.get("artifacts"):
-                raise ValueError("structured artifact content missing")
+                # #701：「鍵不存在」與「鍵在但是空 list」是兩種不同的模型行為
+                # （前者沒照 prompt 給欄位、後者給了卻沒內容），修法前同一句話。
+                raise ValueError(
+                    "structured artifact content missing: "
+                    + _render_difference(
+                        "artifacts",
+                        "<non-empty list>",
+                        integration.get("artifacts", DIAGNOSTIC_ABSENT_PLACEHOLDER),
+                    )
+                )
             rollback_publication = artifact_writer(integration.get("artifacts", []))
         except Exception as exc:
             # #408：這是 #397 儀器化時漏掉的第四個裸吞分支——artifact write 的
@@ -1429,7 +1955,7 @@ def run_heterogeneous_brainstorm(
             # 分支的例外摘要格式一致。
             return BrainstormResult(
                 "needs_human",
-                f"primary-artifact-write-rejected: {type(exc).__name__}: {str(exc)[:160]}",
+                f"primary-artifact-write-rejected: {summarize_planning_exception(exc)}",
                 selection.identity.independence_domain,
                 empty_refs,
                 None,
