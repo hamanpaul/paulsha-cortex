@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- runbook 的「M2′ 之後仍未涵蓋的」清單更正兩條陳舊項（gate 執行身分 #629 已完成、reviewer 憑證 refresh 已由 #685 解決），並加上「not-covered 清單本身也是宣稱」的約束（#696）。
 
 ### Fixed
 - **#687（#672 票 F）：planner 的 define／brainstorm 正式離開 Manager 行程——切換、
