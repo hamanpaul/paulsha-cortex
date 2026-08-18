@@ -433,6 +433,20 @@ class SchemeDerivedHomeTests(unittest.TestCase):
             } | {
                 permgen.DEFAULT_LAYOUT.codex_hooks_dir_of(a) for a in expected
             } | {
+                # #685：per-(account, executor) 憑證表產生的骨架——`IN_PLACE_FILE` 的
+                # root-owned 父目錄，與 `HOME_REDIRECT_TREE` 落在該帳號 `cache` 底下的
+                # 目標。**逐格由那張表導出、不手抄**，因此加一格憑證時這裡自動涵蓋；
+                # 兩者都仍在本 scheme 解析得到的帳號 HOME 底下，「無多餘」的原意
+                # （不得殘留別的 scheme 的帳號樹）未被放寬。
+                target
+                for _aid, acct, path, cred in permgen.DEFAULT_LAYOUT.credential_placements()
+                if acct in expected
+                for target in (
+                    (permgen.DEFAULT_LAYOUT.credential_target_of(acct, cred),)
+                    if cred.shape is permgen.CredentialShape.HOME_REDIRECT_TREE
+                    else (path.rsplit("/", 1)[0],)
+                )
+            } | {
                 # #666：durable state owner 另有 root-owned 的 `~/.config` 與
                 # `~/.config/gh`（`gh` 的登入態落點）。仍在**本 scheme 解析得到的
                 # 帳號**底下，因此「無多餘」這條的原意未被放寬。
@@ -442,16 +456,36 @@ class SchemeDerivedHomeTests(unittest.TestCase):
             self.assertTrue(homes <= resolved, (scheme.scheme_id, homes - resolved))
 
     def test_every_model_job_account_gets_a_root_owned_codex_dir(self) -> None:
-        """跑模型的帳號都不得替換自己的 `~/.codex`（hooks 是 Tier-0 資產）。"""
+        """跑模型的帳號都不得替換自己的 codex 設定落點。
+
+        **#685 之後這條分兩種形狀成立，不再是「兩個帳號都有 root-owned `~/.codex`」。**
+        原因是 #686 的實測：codex 需要 `$CODEX_HOME` **整棵**可寫，因此
+        `cortex-reviewer-planner` 的 `~/.codex` 改成導進 `cache` 的 root-owned symlink。
+        「job 換不掉」這條性質**沒有消失，只是換了守它的那一層**：
+
+        - builder（`IN_PLACE_FILE`）：`~/.codex` 是 root-owned 目錄 ⇒ 連同 `hooks.json`
+          一起擋住；
+        - reviewer-planner（`HOME_REDIRECT_TREE`）：`~/.codex` 是 root-owned **symlink**，
+          放在 root-owned 的 HOME 裡 ⇒ job 換不掉它的**指向**（但擋不住樹裡的內容，
+          那正是 U-9 那筆 deferred 記錄的代價）。
+        """
         scheme = permgen.THREE_WAY_SCHEME
+        layout = permgen.DEFAULT_LAYOUT
         by_path = {
             path: owner
-            for path, owner, _g, _m in permgen.DEFAULT_LAYOUT.scaffold_directories(scheme)
+            for path, owner, _g, _m in layout.scaffold_directories(scheme)
         }
-        for account in ("cortex-builder", "cortex-reviewer-planner"):
-            self.assertEqual(
-                by_path[permgen.DEFAULT_LAYOUT.codex_hooks_dir_of(account)], "root", account
-            )
+        # builder：root-owned 的真目錄。
+        self.assertEqual(by_path[layout.codex_hooks_dir_of("cortex-builder")], "root")
+        # reviewer-planner：`~/.codex` **不得**是骨架目錄（它是 symlink），而它的 HOME
+        # 是 root-owned ⇒ 換不掉那條 symlink。
+        planner = "cortex-reviewer-planner"
+        self.assertNotIn(layout.codex_hooks_dir_of(planner), by_path)
+        self.assertEqual(by_path[layout.home_of(planner)], "root")
+        # symlink 的目標由該帳號自己擁有，且落在既有的 `cache` 底下（不新增可寫面）。
+        target = layout.symlink_targets()["reviewer-planner-codex-state"]
+        self.assertEqual(by_path[target], planner)
+        self.assertTrue(target.startswith(layout.cache_of(planner) + "/"), target)
 
     def test_custom_home_root_needs_no_code_change(self) -> None:
         alt = permgen.PathLayout(home_root="/srv/homes")

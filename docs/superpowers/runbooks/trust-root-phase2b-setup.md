@@ -2069,16 +2069,17 @@ sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
 > 改不了 Manager 的 state、也讀不到另一個 job 帳號的憑證），**不是** provider 層的
 > 獨立——與 `independence_domain` 不是同一件事（見 spec §R1）。
 
+> **⚠️ #685：本形態（單檔）現在只適用 `cortex-builder`。** `cortex-reviewer-planner`
+> 的三份登入態改走「root-owned symlink 導進 `cache`」的形狀——理由是 #686 實測 codex
+> 需要 `$CODEX_HOME` **整個目錄**可寫，單檔放行時它連起都起不來。那個帳號的步驟在
+> **第 4e-2b 步**，不要用下面這一段。
+
 ```bash
-# 🔧 sudo：把 operator 那份憑證複製給兩個 job 帳號，owner 給該帳號、目錄維持 root 的
-for who in builder reviewer-planner; do
-  sudo install -o "cortex-$who" -g "cortex-$who" -m 0600 \
-    "$HOME/.codex/auth.json" "/var/lib/cortex-$who/.codex/auth.json"
-done
+# 🔧 sudo：把 operator 那份憑證複製給 **builder**，owner 給該帳號、目錄維持 root 的
+sudo install -o cortex-builder -g cortex-builder -m 0600 \
+  "$HOME/.codex/auth.json" /var/lib/cortex-builder/.codex/auth.json
 #   ↑ `.codex/` 目錄本身由第 2b 步的骨架建成 root:root 0755，這裡**不要**動它。
-#   其他 executor 的憑證檔位置不同（`claude` 等各有自己的落點，本票未實測）：
-#   落位規則完全一樣——先確認該 CLI 實際寫哪個檔，再以同一條 install 命令落位；
-#   若該檔的父目錄還不存在，用 `sudo install -d -o root -g root -m 0755 <dir>` 補。
+#   ⚠️ `cortex-reviewer-planner` **不在**這一段（見第 4e-2b 步）。
 ```
 
 ```bash
@@ -2115,8 +2116,150 @@ sudo -u cortex-builder sh -c \
 > 比走到呼叫模型那一步才 rc=127 好查得多。journal 若出現
 > `Failed to set up mount namespacing … No such file or directory`，先回頭看這一步。
 
-**回滾**：`sudo rm -rf /opt/cortex/toolchain
-/var/lib/cortex-{builder,reviewer-planner}/.codex/auth.json`。
+**回滾**：`sudo rm -rf /opt/cortex/toolchain /var/lib/cortex-builder/.codex/auth.json`。
+
+---
+
+#### 4e-2b. `cortex-reviewer-planner` 的三份登入態（#685／#672 票 D；U-4／U-5／U-7）
+
+> **這一節取代 0818 的手動部署。** 那次是手工 `install` ＋ 手工 `ln -s`，**重跑 runbook
+> 不會產生它們**——本節讓它可重現：路徑、owner、mode、symlink 目標全部由
+> `python3 -m paulsha_cortex.trust_root permissions｜scaffold` 出，不手抄。
+
+**形狀（`permgen.CredentialShape.HOME_REDIRECT_TREE`）**：HOME 底下一條 root-owned
+symlink，指向該帳號 `cache` 裡的一格。
+
+| executor | symlink | 目標 | token 葉檔 |
+|---|---|---|---|
+| `codex` | `~/.codex` | `~/cache/codex` | `auth.json` |
+| `agy` | `~/.gemini` | `~/cache/gemini` | `antigravity-cli/antigravity-oauth-token` |
+| `claude` | `~/.claude` | `~/cache/claude` | `.credentials.json` |
+
+> **為什麼不是 builder 那種單檔**（#686 實測，逐條可複驗）：
+>
+> - `codex` 在 `$CODEX_HOME` 底下建 `state_5.sqlite`／`logs_2.sqlite`／`sessions/`／
+>   `skills/`／`plugins/`／`thread-writer-locks/`……唯讀時回
+>   `Error: failed to initialize in-process app-server client: Read-only file system
+>   (os error 30)`。把 cwd 換成可寫的 `/tmp` **症狀完全相同**；維持唯讀 cwd、只把
+>   `CODEX_HOME` 指到可寫目錄則 **rc=0**。所以阻斷點是 `CODEX_HOME`，不是 cwd。
+>   檔名帶版本序號 ⇒ **逐項列舉會在下一次 CLI 升版時無聲失效**。
+> - `agy` 往 `~/.gemini/antigravity-cli/` 寫 conversations SQLite、crashes、presence
+>   lock、builtin skills，並自解出一個 17 MB 的 `bin/webm_encoder`。
+> - `claude` 在 job 沙箱下 CLI rc=0 但回 `Not logged in · Please run /login`。
+>
+> **為什麼導進 `cache`**：那一層**早已**在模板 unit 的 `ReadWritePaths=` 內，因此
+> 這一步做完之後 **unit 的 `ReadWritePaths=` 逐字不變、零新增可寫面**——executor 能做
+> 的事，該帳號今天就已經能做。symlink 本身放在 root-owned 的 HOME 裡，job 換不掉指向。
+>
+> **代價（R-6，明講）**：目標樹由 job 帳號擁有 ⇒ 樹裡的 token 葉檔**可被該帳號刪除或
+> 替換**（builder 的單檔形態擋得住「刪／換」，這裡擋不住）。影響面限於它自己的登入態。
+> 直接後果：**同一棵樹裡不得再放任何 root-owned 的 enforcement 檔**——
+> `reviewer-planner-codex-hooks` 因此仍是未決項（U-9），見
+> `permgen.deferred_run_dependencies()`。
+
+**部署順序固定為四步，順序錯了 unit 會起不來或 executor 解不到路徑：**
+
+```bash
+# 1️⃣ 骨架：建出三個目標（該帳號擁有 0700，落在既有的 cache 內）
+python3 -m paulsha_cortex.trust_root scaffold four-way | grep '/cache/'
+#   期望三行：install -d -o cortex-reviewer-planner … /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}
+sudo sh -e -c "$(python3 -m paulsha_cortex.trust_root scaffold four-way)"
+#   ⚠️ 目標**必須先存在**：對一條懸空 symlink 建目錄的 syscall 回 EEXIST（不是「建出
+#      目標」），executor 於是死在一個與權限完全無關的錯誤上。
+
+# 2️⃣ 遷移既有登入態（0818 手動部署留下的那一份）
+#    舊位置是**真目錄** /var/lib/cortex-reviewer-planner/.codex/，先把內容搬進目標，
+#    再把那個目錄清掉——第 3 步的 `ln -sfn` 不會覆蓋一個非空的真目錄。
+sudo sh -c '
+  d=/var/lib/cortex-reviewer-planner
+  if [ -d "$d/.codex" ] && [ ! -L "$d/.codex" ]; then
+    cp -a "$d/.codex/." "$d/cache/codex/" && rm -rf "$d/.codex"
+  fi
+  if [ -d "$d/.gemini" ] && [ ! -L "$d/.gemini" ]; then
+    cp -a "$d/.gemini/." "$d/cache/gemini/" && rm -rf "$d/.gemini"
+  fi
+  chown -R cortex-reviewer-planner:cortex-reviewer-planner "$d/cache"
+'
+#   ⚠️ 0818 的 `.gemini` 本來就是 symlink（指向同一個目標），上面的 `[ ! -L ]` 會跳過它。
+#   ⚠️ 舊 `.codex/hooks.json` 若存在，**不要**搬進去（那棵樹 job 可寫，root-owned 的
+#      hooks 在裡面擋不住替換 ⇒ 是名義上的 enforcement）。見 U-9。
+
+# 3️⃣ 落 symlink（由權限計畫出，不手打）
+python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
+  --operator-account "$USER" --external-reader-account none \
+  | grep -E 'reviewer-planner-(codex|agy|claude)-state' -A6 | grep -E '^\[ ! -e'
+#   期望六行（三格 × `ln -sfn` ＋ `chown -h`），全部帶
+#   `[ ! -e /var/lib/cortex-reviewer-planner ] || ` 守衛
+#   ——守衛掛在**父目錄**上：本方案沒有這個帳號時整段跳過（二分部署）。
+#   套用時走整份權限 script（第 2b 步），不要只挑這六行執行。
+
+# 4️⃣ 放 token（三個 provider 各自的登入態，落點見上表）
+sudo install -o cortex-reviewer-planner -g cortex-reviewer-planner -m 0600 \
+  "$HOME/.codex/auth.json" /var/lib/cortex-reviewer-planner/cache/codex/auth.json
+sudo install -D -o cortex-reviewer-planner -g cortex-reviewer-planner -m 0600 \
+  "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" \
+  /var/lib/cortex-reviewer-planner/cache/gemini/antigravity-cli/antigravity-oauth-token
+sudo install -o cortex-reviewer-planner -g cortex-reviewer-planner -m 0600 \
+  "$HOME/.claude/.credentials.json" \
+  /var/lib/cortex-reviewer-planner/cache/claude/.credentials.json
+#   ⚠️ 來源路徑依 operator 自己的登入態而定，先 `ls` 確認；三份都是**同一個 provider
+#      帳號**的複本 ⇒ 這一步就是 U-4 追認的 R-3（該帳號被攻陷時三邊 token 一起失）。
+```
+
+**成對前置：`PSC_REVIEWER_HOME` 必須同時宣告（第 5-5c 步）。** 三條 symlink 的路徑
+**全部以 `$HOME` 為根**，而模板模式下 shim 以 `os.execvpe` 整份換掉環境，unit 的
+`Environment=HOME=` 到不了模型（#686 實機更正）。沒有它，本節做得再對，job 內一條也
+解不到——而症狀（`$HOME is not defined`／`Not logged in`）與「憑證沒放好」長得一模
+一樣。產生器出的值：
+
+```bash
+python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep PSC_REVIEWER_HOME
+#   期望：#      PSC_REVIEWER_HOME=/var/lib/cortex-reviewer-planner
+```
+
+```bash
+# ✅ 驗證 1：形狀（symlink root-owned、目標該帳號擁有）
+ls -ld /var/lib/cortex-reviewer-planner/.{codex,gemini,claude}
+#   期望三行：lrwxrwxrwx root root … -> /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}
+ls -ld /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}
+#   期望三行：drwx------ cortex-reviewer-planner cortex-reviewer-planner
+
+# ✅ 驗證 2：**零新增可寫面**——unit 的 RWP 逐字不變
+python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep '^ReadWritePaths='
+#   期望**恰好**：ReadWritePaths=/var/lib/cortex-reviewer-planner/cache
+#                 ReadWritePaths=/var/lib/cortex/coordinator/review-verdicts
+#   ⛔ 多出任何一條含 `.codex`／`.gemini`／`.claude` 的路徑 ⇒ 有人把資產的 writer 面
+#      改成 job principal 了，回去看登記表，**不要**就地改 unit。
+
+# ✅ 驗證 3（跨 UID，**在真實加固面下**）：換不掉指向、但寫得進樹
+psc_run_under cortex-reviewer-job /bin/sh -c \
+  'ln -sfn /tmp/evil /var/lib/cortex-reviewer-planner/.gemini'
+#   期望：Permission denied ← symlink 在 root-owned 的 HOME 裡
+psc_run_under cortex-reviewer-job /bin/sh -c \
+  'touch /var/lib/cortex-reviewer-planner/.gemini/psc-probe && echo STATE-TREE-WRITABLE'
+#   期望：STATE-TREE-WRITABLE ← 目標在 cache 內，已在 unit 的 RWP 中
+#   （收尾：sudo rm -f /var/lib/cortex-reviewer-planner/cache/gemini/psc-probe）
+#   ⚠️ `psc_run_under` 的 property 清單由 `permgen.unit_replica_properties()` 從**落檔
+#      的 unit** 全量導出。**不得**自行組 `--property=`、**不得**自帶 `--setenv=PATH=`
+#      ——本 repo 兩個方向的事故各兩次（#638／#657 假綠；#673 body 與 repro 假紅）。
+
+# ✅ 驗證 4：三個 executor 在該 unit 下**真的跑得起來**（這一格才是驗收）
+psc_run_under cortex-reviewer-job-jit /opt/cortex/toolchain/bin/codex exec --json \
+  'Return only this JSON object and do not call tools: {"capability":"cortex-planning-json"}'
+#   期望：rc=0。**#686 當時這一格是紅的**（`Read-only file system`）——本節做完必須翻綠。
+psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/claude --version
+psc_run_under cortex-reviewer-job /bin/sh -c \
+  '/opt/cortex/toolchain/bin/claude -p "hi" --output-format json --tools ""'
+#   期望：rc=0 且**不再**是 `Not logged in · Please run /login`（#686 那一格的成因）。
+psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/agy \
+  --print 'Return only this JSON object and do not call tools: {"capability":"cortex-planning-json","executor":"agy","model":"gemini-3.1-pro-high"}' \
+  --mode plan --sandbox --model gemini-3.1-pro-high
+#   期望：rc=0、輸出逐位元等於 expected（0818 與 #686 兩次實測皆如此）。
+```
+
+**回滾**：`sudo rm -f /var/lib/cortex-reviewer-planner/.{codex,gemini,claude}` ＋
+`sudo rm -rf /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}`。
+（回滾之後降權 planning 與 reviewer job 都會退回「沒有登入態」的狀態，不是壞掉。）
 
 ---
 

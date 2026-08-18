@@ -202,29 +202,59 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
 
 ### 4. 票 D｜permgen 把 planner 憑證面 codify（對應 R5；依賴 U-4／U-5／U-7 裁決）
 
-- [ ] `tests/test_trust_root_planner_credentials_672.py`（TDD RED）：
-  - `test_reviewer_planner_credential_is_registered`：登記表有
-    `reviewer-planner-executor-credential`，且列在 `IN_PLACE_CONTENT_WRITE_ASSETS`。
-  - `test_reviewer_template_rwp_includes_credential_file_not_parent`：reviewer 模板
-    unit 的 `ReadWritePaths` 含**檔案本身**，不含父目錄。
-  - `test_two_way_scheme_unaffected`：二分方案下該資產經
-    `inapplicable_home_anchored_assets()` 機械排除，Manager unit 的 RWP 不多出
-    不存在的路徑（＝#640 當年不敢登記的那個理由已被 #671 拆掉）。
-  - `test_deferred_dependencies_shrink`：`deferred_run_dependencies()` 不再含
-    `reviewer-planner-executor-credential`、`reviewer-planner-codex-hooks`、
-    `manager-claude-credential` 三項（第三項因為本票的裁決是「planning 一律走降權
-    job」，Manager 不再需要 claude 登入態）。
-- [ ] `paulsha_cortex/trust_root/registry.py`：新增憑證資產列；
-      `paulsha_cortex/trust_root/permgen.py`：加進 `IN_PLACE_CONTENT_WRITE_ASSETS`、
-      移除對應的 `DeferredDependency`、`asset_paths()` 補 `codex-hooks` 的 per-account 版。
-- [ ] 依 U-5 的裁決處理 `executor_credential_relpath`（維持單一 vs 擴成
-      per-(account, executor) 表）。若裁決是擴表，本票範圍會顯著變大，應再切一張子票。
-- [ ] 依 U-7 的裁決處理 agy 狀態樹（symlink 資產 vs env 導向 `cache`）。
-- [ ] runbook `docs/superpowers/runbooks/trust-root-phase2b-setup.md` 第 4e 步：
-      補「逐帳號 × 逐 executor」的反向驗證矩陣（#668 的 C 項），並固定部署順序
-      「憑證落位 → 重跑產生器 → daemon-reload → `systemctl status` 確認 unit 起得來」。
-- 驗收：`python -m paulsha_cortex.trust_root permissions` 產出的 reviewer 模板 unit
-      逐字含憑證檔那一條 RWP；二分方案的產出不含它；deferred 清單縮短且測試釘住。
+**已由 issue #685 land。** U-4／U-5／U-7 由 operator 於 0818 裁決（追認雙 domain／
+兩者皆「照設計做」）。
+
+- [x] `tests/test_trust_root_planner_credentials_672.py`（24 條 ＋ 1 條具名 skip）。
+      **測試名與 plan 原文不同，因為驗收條件被 #686 的實測改寫**，見下方「實作補充」。
+- [x] `paulsha_cortex/trust_root/registry.py`：新增三份登入態資產
+      （`reviewer-planner-{codex,agy,claude}-state`）；
+      `paulsha_cortex/trust_root/permgen.py`：新增 per-(account, executor) 憑證表
+      （`CredentialShape`／`ExecutorCredential`／`EXECUTOR_CREDENTIALS`／
+      `CREDENTIALED_ACCOUNTS`）、symlink 資產 kind、`IN_PLACE_CONTENT_WRITE_ASSETS` 與
+      `_FILE_ASSET_IDS` 改為由表導出、移除已關閉的 `DeferredDependency`。
+- [x] U-5：`executor_credential_relpath` 擴成 per-(account, executor) 表。原欄位**保留**
+      為表上 primary 那一格的**值**（#640 的「換 executor 只改一個值」因此仍成立）。
+- [x] U-7：agy 狀態樹走 design 的 (a)——symlink 類資產（登記表新增 kind）。
+- [x] runbook 第 **4e-2b** 步：`cortex-reviewer-planner` 三份登入態的四步部署順序
+      （骨架目標 → 遷移 0818 手動落位的舊目錄 → 由權限計畫落 symlink → 放 token）＋
+      跨 UID 反向驗證 ＋ 三個 executor 在真實加固面下的 rc 驗收。
+- 驗收（**改寫後的形態**）：二分方案的產出不含那三格（`inapplicable_home_anchored_assets()`
+      機械排除，有測試釘住）；`deferred_run_dependencies()` 縮短一項；reviewer 模板 unit 的
+      `ReadWritePaths=` **逐字不變**。
+
+**#685 的實作補充**（plan／design 之外的四處，票 F 沿用）：
+
+1. **驗收條件「RWP 逐字含憑證**檔案**」被 #686 的實測推翻，已改寫。** 原條件的前提是
+   「codex 的登入態＝一個 `auth.json`」；#686 在完整 reviewer unit 沙箱下量到 codex 需要
+   `$CODEX_HOME` **整個目錄**可寫（`state_5.sqlite`／`sessions/`／`plugins/`…，檔名帶版本
+   序號 ⇒ 逐項列舉會在下次升版無聲失效），唯讀時回 `failed to initialize in-process
+   app-server client: Read-only file system`，且與 cwd 無關。**照字面滿足原條件會產出一個
+   codex 仍然跑不起來的部署。** 因此 planner 帳號改走新形狀 `HOME_REDIRECT_TREE`
+   （HOME 底下 root-owned symlink → 該帳號既有的 `cache`），不變式換成更強的一條：
+   **unit 的 `ReadWritePaths=` 逐字不變、零新增可寫面**。builder 維持 `IN_PLACE_FILE`
+   一行未改——「同一個 executor 在不同帳號上是不同形狀」正是 U-5 要 per-(account, executor)
+   而不是 per-executor 的具體理由。
+2. **claude 的憑證缺口一併關掉**（#686 矩陣裡「CLI rc=0、回 `Not logged in`」那一列）。
+   reviewer 的預設 executor 就是 claude，缺它時「reviewer 已降權」買到的是一個跑不動的 job。
+3. **新增安全退步 R-6**：`HOME_REDIRECT_TREE` 的目標樹由 job 帳號擁有 ⇒ 樹裡的 token 葉檔
+   可被該帳號刪除或替換（builder 的形狀擋得住）。影響面限於它自己的登入態，換到的是
+   executor 起不起得來；同時**修掉** #640 刻意接受的「rename 式 refresh 走不通」。
+   直接後果 ⇒ **U-9（新提，待 operator）**：`reviewer-planner-codex-hooks` 與 codex 的
+   可用性在 `$CODEX_HOME` 這一層**互斥**，因此**沒有**按 plan 原文關閉，理由整段換掉並留在
+   `deferred_run_dependencies()`。候選解是 root-owned ＋ sticky bit ＋ 給 job 一條 `rwx`
+   ACL 的目錄，但它要改 permgen 的 mode 管線（`_mask_write` 會拿掉 group 寫入位、
+   `mode & 0o700` 會吃掉 sticky 位，那是 spec §R2 的既有不變式），且「codex 能不能在一個
+   它**不擁有**的 `$CODEX_HOME` 下跑起來」**沒有實機證據** ⇒ 依 D13 不得宣稱可用。
+   **同一個裁決也涵蓋 builder**：它在模板 unit 下跑 codex 會撞同一條阻斷。
+4. **`manager-claude-credential` 沒有依 plan 原文刪除。** plan 寫「第三項因為本票的裁決是
+   『planning 一律走降權 job』」——那個裁決的**落地**是票 F（#687）的切換，而 direct 路徑
+   今天逐字還在。U-5 只解除了它的**機械**阻礙（表達得了了），要不要登記則答案是**不要**
+   （Manager 是 durable state owner ＋ spawn 授權持有者）。現在刪等於宣稱一件還沒成立的事。
+5. **`PSC_REVIEWER_HOME` 是本票的成對前置**（#686 查到）：三份登入態全部以 `$HOME` 為根，
+   而 shim 以 `os.execvpe` 整份換掉環境 ⇒ unit 的 `Environment=HOME=` 到不了模型。新增
+   `permgen.JOB_HOME_ENV_BY_PRINCIPAL`／`PathLayout.job_home_value()`（與 job_runner 的
+   成對契約由測試釘住，比照 #679 的 PATH），模板 unit 直接印出 operator 要落的那一行。
 
 ### 5. 票 E｜`JobPlanningInvoker`（對應 R1／R2／R4／R7／R8；依賴票 B、票 C、PATH 前置票）
 

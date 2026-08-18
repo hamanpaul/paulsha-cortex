@@ -263,6 +263,14 @@ def test_inapplicable_assets_are_enumerable_not_silent() -> None:
         GH_CONFIG,
         "manager-gitconfig",
         "reviewer-planner-gitconfig",
+        # #685：per-(account, executor) 憑證表的三格全掛在 `cortex-reviewer-planner`
+        # 的 HOME 下，而二分方案把 reviewer／planner 併進 `cortex-svc` ⇒ 那三條路徑在
+        # 二分部署裡不存在。**這正是 #640 當年「乾脆不登記第二份憑證」的那個陷阱**，
+        # 而 #671 的 `inapplicable_home_anchored_assets()` 已經把它變成一條機械規則：
+        # 二分方案的產出因此不含它們，Manager unit 的 RWP 不會多出不存在的路徑。
+        "reviewer-planner-codex-state",
+        "reviewer-planner-agy-state",
+        "reviewer-planner-claude-state",
     }, sorted(two_way)
     # 定案的兩個方案完全沒有不適用項——有的話就是 layout 的帳號欄位與方案對不上。
     for scheme in ALL_SCHEMES:
@@ -543,18 +551,35 @@ def test_home_anchored_assets_are_derived_not_hand_written() -> None:
         GH_CREDENTIAL,
         "manager-gitconfig",
         "reviewer-planner-gitconfig",
+        # #685（#672 票 D）：per-(account, executor) 憑證表為 `cortex-reviewer-planner`
+        # 展開的三格。它們**是機械導出的結果**——這條測試本身就是在驗那件事：新增一個
+        # 掛在帳號 HOME 下的資產而沒有把它列進 `RUN_EXTERNAL_DEPENDENCIES`，
+        # `unlisted_roster_entries()` 就會非空（見下一條）。
+        "reviewer-planner-codex-state",
+        "reviewer-planner-agy-state",
+        "reviewer-planner-claude-state",
     }), sorted(home_anchored_asset_ids())
 
 
 def test_deferred_dependencies_stay_enumerable() -> None:
     """比照 #661 的 `unresolved_node_execution_surfaces()`：不裁決，但不得靜默消失。
 
-    這四項都是「per-account 的機制已就緒、登記表只登記了其中一份」。補上或悄悄拿掉
-    都會讓這條紅——那正是要的：它們必須是一個**被看見的**決定。
+    補上或悄悄拿掉都會讓這條紅——那正是要的：它們必須是一個**被看見的**決定。
+
+    **#685（#672 票 D）縮短了這份清單，並更正了另外兩項的理由**：
+
+    - `reviewer-planner-executor-credential` **已關閉**——per-(account, executor) 憑證表
+      （U-5 裁決）為那個帳號登記了三格登入態（codex／agy／claude）。原本那條 deferred
+      的 `disposition` 寫的是「補登記表第二列（產生器一行都不必改）」，而 #686 的實測
+      證明那句話是錯的：codex 需要 `$CODEX_HOME` 整棵可寫，單檔不夠。
+    - `reviewer-planner-codex-hooks` **留著，但理由整段換掉**：它現在不是「還沒補」，
+      而是與 codex 的可用性**在 `$CODEX_HOME` 這一層互斥**（升為 U-9）。
+    - `manager-claude-credential` **留著**：U-5 解除了它的機械阻礙（表達得了了），但
+      「要不要給 Manager 一份模型憑證」是 #672 的核心裁決，答案是不要；本項由票 F
+      （#687）切換之後隨 direct 路徑一起消失，**不是**現在刪掉。
     """
     deferred = deferred_run_dependencies()
     assert {item.name for item in deferred} == {
-        "reviewer-planner-executor-credential",
         "gate-gitconfig",
         "reviewer-planner-codex-hooks",
         "manager-claude-credential",
@@ -569,26 +594,43 @@ def test_deferred_dependencies_stay_enumerable() -> None:
         assert item.name not in listed, item.name
 
 
-def test_the_reviewer_credential_gap_is_real_not_theoretical() -> None:
-    """把上面那條 deferred 的**症狀**釘成可驗證的事實，而不是一段散文。
+def test_the_reviewer_credential_gap_is_closed_without_widening_the_write_surface() -> None:
+    """#685 把上面那條 deferred 的**症狀**翻面：缺口關了，而且沒有付出可寫面。
 
-    M2（#615）的 reviewer 模板 unit 已經在產生器裡，但它的 `ReadWritePaths` 不含
-    reviewer 帳號那份 executor 憑證 ⇒ `ProtectSystem=strict` 下讀得到、改不了。
-    哪天有人補上登記表第二列，這條會紅——**那正是提醒去刪掉這條測試與那筆 deferred**。
+    本測試的前身是 `test_the_reviewer_credential_gap_is_real_not_theoretical`，它的
+    docstring 逐字寫著「哪天有人補上登記表第二列，這條會紅——那正是提醒去刪掉這條測試
+    與那筆 deferred」。#685 就是那一天，所以它按設計被翻成正向的形態。
+
+    **翻面的方式與 #640 當初預期的不同，這一點必須釘住**：預期是「reviewer 模板 unit
+    的 RWP 逐字含憑證**檔案**」，而 #686 實測 codex 需要 `$CODEX_HOME` 整棵可寫 ⇒ 那個
+    帳號的三份登入態改走 `HOME_REDIRECT_TREE`（root-owned symlink → 該帳號既有的
+    `cache`）。因此正確的不變式是**更強的那一條**：
+
+      unit 的 `ReadWritePaths` **逐字不變**，而三份登入態全部落在它已經涵蓋的 `cache`
+      底下 ⇒ 憑證面可寫、可 refresh，且**零新增可寫面**。
     """
     scheme = FOUR_WAY_SCHEME
     plan = generate_plan(scheme)
     account = scheme.resolve(Principal.REVIEWER)
     assert account is not None
-    credential = DEFAULT_LAYOUT.executor_credential_of(account)
     rwp = read_write_paths(
         plan, DEFAULT_LAYOUT, account,
         extras=DEFAULT_LAYOUT.job_extra_write_paths(account),
         principals=permgen.JOB_PRINCIPAL_PERSONAS[Principal.REVIEWER],
         retired=permgen.RETIRED_JOB_WRITE_ASSETS,
     )
-    assert not any(path == credential for path in rwp), sorted(rwp)
-    # 對照：builder 那一份**有**（同一條導出路徑，差別只在登記表登記了幾列）。
+    cache = DEFAULT_LAYOUT.cache_of(account)
+    for asset_id, target in DEFAULT_LAYOUT.symlink_targets().items():
+        if not asset_id.startswith("reviewer-planner-"):
+            continue
+        # (a) 落在 cache 底下 ⇒ 已被既有那條 RWP 涵蓋；
+        assert target.startswith(cache + "/"), (asset_id, target)
+        # (b) 自己**不**出現在 RWP 上（`_minimize()` 吃掉子路徑，且 writer 只有 root）。
+        assert target not in rwp, (asset_id, sorted(rwp))
+        assert DEFAULT_LAYOUT.asset_paths()[asset_id] not in rwp, asset_id
+    assert cache in rwp, sorted(rwp)
+    # 對照：builder 那一份仍是 `IN_PLACE_FILE`，RWP 逐字掛在**檔案本身**（#640 裁決 (b)
+    # 一行未改）——同一張表，兩種形狀，這正是 U-5 要 per-(account, executor) 的理由。
     builder = scheme.resolve(Principal.BUILDER)
     builder_rwp = read_write_paths(
         plan, DEFAULT_LAYOUT, builder,
