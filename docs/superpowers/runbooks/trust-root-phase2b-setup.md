@@ -2040,7 +2040,9 @@ sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -c 'import yaml; print
 #   期望：印出版本
 
 # ✅ 驗證（2）：**在完整加固面下**複跑（`sudo -u` 沒有 unit 的加固面）
-sudo install -d -o root -g root -m 0755 /tmp/psc-gate-probe
+#    探測目錄給 gate 帳號擁有——pytest 會在 rootdir 建 `.pytest_cache`，root-owned 的
+#    目錄會讓它印一段與待驗命題無關的 cache 警告，白白製造雜訊。
+sudo install -d -o cortex-gate -g cortex-gate -m 0755 /tmp/psc-gate-probe
 printf 'def test_ok():\n    assert True\n' \
   | sudo tee /tmp/psc-gate-probe/test_probe.py >/dev/null
 sudo systemd-run --pipe --wait --collect \
