@@ -4370,6 +4370,24 @@ exec /opt/cortex/venv/bin/python -c "from paulsha_cortex.config import paths; pr
 | 4 | 行程間路徑 | builder ／ reviewer-planner | 依三帳號重寫 |
 | **5** | **privilege-boundary（A+B 新增）** | **cortex-manager**（授權帳號自身）＋三個 headless | **✅ 新增** |
 
+> **0818 兩個 subject 各跑一次的結果（族 1–4，皆在完整模板 unit 加固面下，
+> 加固面由 `unit-replica` 全量導出 38 條 property）**：
+>
+> | | `cortex-builder` | `cortex-reviewer-planner` |
+> |---|---|---|
+> | denied（OK） | 51 | 52 |
+> | **SUCCEEDED（FAIL）** | 1（T1.3，假失敗，本次已修） | **2（T1.3 ＋ T3.9）** |
+>
+> - **T1.3 兩個 subject 都 FAIL ⇒ 它測錯東西**，本次已改（見下方該行的註解）。
+>   「兩個身分得到同一個結果」本身就是「這條與身分無關」的證據——**下次再看到某條
+>   在所有 subject 上同時失敗，先懷疑斷言，不要先懷疑邊界。**
+> - **T3.9 只有 `reviewer-planner` FAIL，是真的**：`#698`。成因是 `#685` 把該帳號的
+>   `~/.codex` 改成指向 job-owned `cache/codex` 的 symlink（`#686` 實測 codex 需要
+>   `$CODEX_HOME` **整棵**可寫才跑得起來），代價是該帳號能植入 `hooks.json`——
+>   而 codex hooks **會執行命令** ⇒ **跨 job 持久化**。`builder` 因為 `.codex` 仍是
+>   root-owned 目錄而守得住，**但它一旦也要在降權 unit 下跑 codex 就會撞同一條**。
+>   在 `#698` 裁決之前，這一行的 `SUCCEEDED (FAIL)` 是**已知且已追蹤**的，不是新事故。
+
 ### 8a. 攻擊腳本（族 1–4，以模型 job 身分執行）
 
 ```bash
@@ -4426,7 +4444,18 @@ t "T1.1 刪 EnvironmentFile"        rm /opt/cortex/etc/cortex-manager.env
 d "T1.1 讀 EnvironmentFile（設計為唯讀）" cat /opt/cortex/etc/cortex-manager.env
 t "T1.1 讀 manager HOME cache"     ls /var/lib/cortex-manager/cache
 t "T1.2 連 Manager control socket" sh -c "ls $A/run/cortex && cat $A/run/cortex/*.sock"
-t "T1.3 呼叫 operator CLI"         /opt/cortex/venv/bin/cortex work ship --help
+# T1.3：斷言的是「operator CLI **做得到事**」，不是「binary 跑得起來」。
+#   ⛔ 舊寫法 `cortex work ship --help` 是**假失敗**：`--help` 只是 argparse 印字就結束，
+#      而 job **必須**能執行那個 venv——`cortex-job-shim` 本身就是
+#      `/opt/cortex/venv/bin/python3 -m …job_shim`。0818 實測兩個 subject **都**回
+#      `SUCCEEDED (FAIL)`，正說明它與身分無關，測的是錯的東西。
+#   ✅ 邊界實際擋在**資料層**（見族 2 全數 denied）：以 job 身分跑真正的 work-action
+#      會停在「manager daemon 未就緒」——因為 T1.2（control socket）與 T1.4
+#      （control queue）都已被拒，它構不成控制平面的請求。
+t "T1.3 operator CLI 真的做得到事" /opt/cortex/venv/bin/cortex work ship r9-nonexistent --repo hamanpaul/paulsha-cortex
+# 0818 實測輸出：`錯誤: manager daemon 未就緒（missing）；無法處理 work-action`（rc=1 ⇒ denied）。
+#   ⚠️ 若這條變成 `SUCCEEDED (FAIL)`，代表 job 摸得到控制平面了——那才是真的失守。
+d "T1.3 CLI binary 可執行（設計如此）" /opt/cortex/venv/bin/cortex work ship --help
 t "T1.4 直寫 control queue"        sh -c "printf x > $A/control/requests/evil.json"
 
 # ⚠️ T1.5：job-spec spool 的載重同樣在**寫入面**。
