@@ -487,6 +487,26 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#670：`probe_agy_capability()` 對「模型加了 code fence」偽失敗，並把格式問題誤報成
+  `no-heterogeneous-planner`**——probe 問的是語言模型卻直接
+  `json.loads(smoke_stdout.strip())`；票上實測 6 次有 1 次模型把**完全正確**的 JSON 包進
+  ```` ```json ```` fence ⇒ `malformed-output` ⇒ probe not ready ⇒
+  `select_secondary_planner()` 回 `no-heterogeneous-planner` ⇒ run 進 `needs_human`。約 17%
+  的 define 階段憑空死掉，而 blocking_reason 指向**拓撲問題**，排查方向整個帶偏。新增可測
+  的 `strip_code_fence()`（```` ``` ````／```` ```json ```` 兩種開頭、有無尾隨 fence、CRLF、
+  前後空白、單行 fence），刻意只處理「整串剛好是單一 fenced block」——與
+  `planning_runtime._find_json_object` 頂層語意一致，**不會把「內容真的不對」順手救成
+  ready**（內容不符仍是 `identity-mismatch`，有測試釘住）。prompt 同步補上顯式輸出契約
+  在源頭壓低 fence 機率。
+- **#670：probe 失敗時帶出實際 stdout 節錄**——`malformed-output` 過去 `diagnostic=None`，
+  現場零線索（票上成因是人工重跑六遍才看見）。新增 `stdout_excerpt()`（前 200 字元、空白
+  壓成單一空格、空輸出標 `<empty>`），`malformed-output` 與 `identity-mismatch` 兩路都帶。
+  節錄是模型對**寫死在本模組**的 probe prompt 的回應，argv 不帶憑證、env 不回顯。
+- **#670 附帶：`agy models` 改成 `id\tDisplay Name` 兩欄輸出後，probe 100% 死在
+  `model-not-listed`**——2026-08-18 實機驗證 fence 修復時撞到，比 fence 偽失敗更早更絕對
+  （整行正規化成 `gemini-3-1-pro-high-gemini-3-1-pro-high`，字面與正規化雙雙落空，連 smoke
+  階段都到不了）。`_resolve_agy_cli_token()` 改為比對可用整行或任一欄、但**回傳一律是 id
+  欄**（`--model` 不吃顯示名）；單欄舊格式行為逐字不變。
 - **#666：實機為啟用 monitor 手動補的兩項收斂回登記表——`pytest`（系統層 python 套件）與
   Manager 的 `gh` 憑證**。兩項在實機都已生效，但**產生器的計畫產不出它們**：重跑
   `permissions`／`toolchain` 不會有、換一台機器部署也不會有。
