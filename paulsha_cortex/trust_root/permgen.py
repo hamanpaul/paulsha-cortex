@@ -5313,7 +5313,13 @@ def unit_replica_properties(
     for key, value in _unit_service_directives(unit_text):
         if key in UNIT_REPLICA_EXCLUDED_KEYS:
             continue
-        expanded = value.replace("%i", instance).replace("%%", "%")
+        # `%%` 是 systemd 的跳脫（＝一個字面 `%`），**必須先抽走**：否則 `%%i` 會被
+        # 下一步當成 specifier 展開成 `%<instance>`，而它的正確結果是字面 `%i`。
+        # 這種錯法不會報錯，只會讓探針的加固面與 unit 悄悄不同——正是本票要根除的那類。
+        sentinel = "\x00PCT\x00"
+        expanded = (
+            value.replace("%%", sentinel).replace("%i", instance).replace(sentinel, "%")
+        )
         leftover = re.search(r"%[a-zA-Z]", expanded)
         if leftover is not None:
             raise UnitReplicaDriftError(

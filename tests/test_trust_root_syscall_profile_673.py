@@ -358,6 +358,18 @@ class UnitReplicaTests(unittest.TestCase):
                 "[Service]\nWorkingDirectory=/srv/%n\n", require_hardening=False
             )
 
+    def test_escaped_percent_is_not_mistaken_for_a_specifier(self) -> None:
+        """`%%i` 的正確結果是字面 `%i`，**不是** `%<instance>`。
+
+        錯了不會報錯，只會讓探針的加固面與 unit 悄悄不同——正是本票要根除的那類。
+        """
+
+        props = permgen.unit_replica_properties(
+            "[Service]\nEnvironment=FMT=%%i-%i\n",
+            instance="job-9", require_hardening=False,
+        )
+        self.assertEqual(props, ("--property=Environment=FMT=%i-job-9",))
+
     def test_all_eight_units_survive_a_round_trip(self) -> None:
         for name, content in _all_units().items():
             props = permgen.unit_replica_properties(content, instance="probe")
