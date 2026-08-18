@@ -8,8 +8,15 @@ prompt，起一個 `cortex-reviewer-job@<instance>.service` 實例，以
 `cortex-reviewer-planner` 的身分執行模型 CLI，再把輸出取回來。
 
 `cortex-manager` 的 passwd 註記逐字寫著 `no model code`。#615（M2）讓 reviewer 兌現了
-那句話，planner 沒有——它至今仍在 daemon 行程內 `subprocess.run` 模型 CLI（#672）。
-本檔是那半條的補齊。
+那句話，planner 沒有——在 #687 切換之前它仍在 daemon 行程內 `subprocess.run` 模型
+CLI（#672）。本檔是那半條的補齊。
+
+**#687（票 F）之後的狀態**：四分部署的 `PSC_JOB_RUNNER=systemd-template` 使本類成為
+planning 的實際執行後端，`direct` 在該部署上不是可達組態。實機一輪 define 的每一次
+模型呼叫（probe／questioner／secondary／integrator）都落成一個
+`cortex-reviewer-job@`／`-jit@` 實例，`User=cortex-reviewer-planner`；同一段期間
+`systemd-cgls -u cortex-manager.service` 只有 daemon ＋ `systemctl start --wait`
+兩層，零 executor（runbook 第 5-6c 步）。
 
 ## 十條防線（design D2）在本實作裡分別由誰保證
 

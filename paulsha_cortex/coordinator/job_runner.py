@@ -410,9 +410,17 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             spec_spool_env=REVIEW_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_REVIEW_JOB_SPEC_SPOOL,
             rationale=(
-                "reviewer ＋ planner persona（三分方案下同一個 OS 帳號）。M2（#615）："
-                "在此之前它們仍在 Manager 行程內以 Manager 帳號執行，"
-                "「injection 可達的進程皆無 spawn 授權」因此只對 builder 成立。"
+                "reviewer ＋ planner persona（三分方案下同一個 OS 帳號）。"
+                "**兩者的降權是兩張票、相隔三個月**：\n"
+                "M2（#615）只搬了 **reviewer**——`launcher.SubprocessLauncher` 這條路徑。"
+                "**planner 的 define／brainstorm 不走 launcher**，它走 "
+                "`planning_runtime._invoke_json()`，因此 #615 一行都沒有碰到它；"
+                "「injection 可達的進程皆無 spawn 授權」在那之後仍**只對 builder 與 "
+                "reviewer 成立**（#672 的證據鏈）。\n"
+                "M2′（#672 票 A～F／#682-#687）補上 planner：`JobPlanningInvoker` 讓四個 "
+                "planning adapter 與全部 probe 都經本角色起 job，`PSC_JOB_RUNNER="
+                "systemd-template` 下 `_select_planning_invoker()` 對其餘值 fail-closed。"
+                "**至此該全稱才成立**，實機驗收見 runbook 第 5-6c 步。"
             ),
         ),
         JOB_ROLE_GATE: JobRoleConfig(
@@ -1535,6 +1543,59 @@ def forbidden_spec_keys(spec: Mapping[str, object]) -> list[str]:
     return sorted(key for key in SPEC_FORBIDDEN_KEYS if key in spec)
 
 
+def malformed_job_command(command: object) -> str | None:
+    """job spec 的 `command` 合法嗎？不合法時回一句可讀理由，合法回 `None`。
+
+    **與 `forbidden_spec_keys()` 同一個模式**：寫端（:func:`build_job_spec`）與讀端
+    （`job_shim.load_spec`）各呼叫一次**同一支**函式，兩端的判準因此不可能漂移。
+    #679 買過一次「同一件事兩份實作」的單，這裡不再重演。
+
+    ## 判準：`argv` 非空、`argv[0]` 非空、每個元素都是 `str`
+
+    `argv[0]` 是要 exec 的程式名——空字串沒有任何意義，`execvpe("", …)` 的失敗訊息
+    也不可讀，因此 fail-closed。**其餘元素可以是任何字串，包含空字串**：那是 POSIX
+    argv 本來的語意。
+
+    ## 為什麼「其餘元素也必須非空」這條要拿掉（#687／#672 票 F）
+
+    原判準是 `not all(argv)`，寫在 `fe7d5f5`（三分 UID 定案）——當時 spec 的唯一
+    產生者是 builder 的 `launcher`，它組出來的 argv 從來沒有空元素，所以這條**從未
+    被執行過的路徑證偽**。票 E（#686）把 planning 接上同一條通道之後，
+    `planning_runtime._planning_argv()` 對 `claude` 產出的
+    `["claude", "-p", …, "--tools", "", …]` 在**每一次** define 都撞上它：
+
+        job-runner-job-spec-invalid: spec 的 command 不得為空、且每個元素都必須是
+        非空字串 (source=job_runner.build_job_spec)
+
+    而 `--tools ""` 是 CLI 的成文 API（`claude --help` 逐字：`Use "" to disable all
+    tools`），也是 #404 之後 planning「模型完全沒有工具可呼叫」的唯一保證，不能改。
+    實測過的「等價寫法」`--tools=` **會讓模型拿回全部工具**（真實 unit 加固面下量到
+    模型發出 Bash 呼叫），那是靜默放寬，比這條守衛壞得多。
+
+    ## 放寬的安全論證
+
+    這條**不是**信任控制，是 well-formedness 檢查。spec 上真正承重的三道是
+    :func:`forbidden_spec_keys`（身分／加固剖面結構性禁止）、
+    :func:`reject_unsafe_env`（憑證與 `LD_PRELOAD`）、以及
+    `working_directory`／`log_path` 的絕對路徑要求——**沒有一道靠元素長度**。
+
+    而 argv 裡**早就**有任意的、攻擊者可影響的字串：planning 的 prompt 逐字含
+    untrusted issue 內容，它就是 `argv[2]`。在那個前提下多允許一個空字串換不到任何
+    新能力——空字串命名不了程式、指不到路徑、夾帶不了 token。相對地，繼續禁止它換到
+    的是「claude 這個 planning／reviewer 的預設 executor 結構性派不出 job」。
+    """
+
+    if not isinstance(command, (list, tuple)):
+        return "spec 的 command 必須是字串陣列"
+    if not command:
+        return "spec 的 command 不得為空"
+    if not all(isinstance(item, str) for item in command):
+        return "spec 的 command 每個元素都必須是字串"
+    if not command[0]:
+        return "spec 的 command[0]（要 exec 的程式名）不得為空字串"
+    return None
+
+
 def build_job_spec(
     *,
     job_id: str,
@@ -1550,13 +1611,20 @@ def build_job_spec(
     「User 不在 spec 裡」是本模式全部的價值：身分只有一個來源＝root-owned unit
     檔的 `User=`。因此這裡除了不放，還在寫端主動掃一次 forbidden key（未來有人
     往 spec 加欄位時測試會紅），讀端（shim）再掃一次。
+
+    #687：`command` 的合法性判準搬進 :func:`malformed_job_command`——與
+    `forbidden_spec_keys()` 同一個模式，讀端（shim）呼叫**同一支**函式。
+    先做 `str()` 正規化再驗，是因為本函式的型別契約是 `Sequence[str]`
+    （呼叫端全部逐字給 str，見 `launcher`／`gate_runner`／`planning_job`）；
+    shim 那端沒有型別契約可言（bytes 剛從磁碟讀回來），因此它驗的是原值。
     """
 
     argv = [str(item) for item in command]
-    if not argv or not all(argv):
+    problem = malformed_job_command(argv)
+    if problem is not None:
         raise _fail(
             "job-runner-job-spec-invalid",
-            "spec 的 command 不得為空、且每個元素都必須是非空字串",
+            problem,
             source="build_job_spec",
             instance=instance,
         )

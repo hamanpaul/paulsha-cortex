@@ -366,13 +366,16 @@ def test_the_overdue_reviewer_credential_entry_is_gone() -> None:
     assert "reviewer-planner-executor-credential" not in names, sorted(names)
 
 
-def test_the_two_entries_that_could_not_be_closed_say_why() -> None:
-    """**沒關掉的兩條必須說得出新的阻礙，而不是留著舊理由。**
+def test_the_entry_that_could_not_be_closed_says_why() -> None:
+    """**沒關掉的那條必須說得出新的阻礙，而不是留著舊理由。**
 
-    - `reviewer-planner-codex-hooks`：與 codex 的可用性在 `$CODEX_HOME` 這一層互斥
-      （U-9）；
-    - `manager-claude-credential`：U-5 解除了它的機械阻礙，但「要不要給 Manager 一份
-      模型憑證」的答案是不要，而它的消失要等票 F 切換。
+    `reviewer-planner-codex-hooks`：與 codex 的可用性在 `$CODEX_HOME` 這一層互斥
+    （U-9）。
+
+    **#687（票 F）之後這裡只剩它一條。** 原本並列的 `manager-claude-credential`
+    已由票 F 移除——切換之後 Manager 不再 exec 任何 executor，該項不是「被登記」
+    而是**消失**（見 `test_the_manager_credential_entry_disappeared_by_switching`）。
+    本測試因此從 `..._two_entries_...` 改名為單數。
     """
     by_name = {item.name: item for item in permgen.deferred_run_dependencies()}
     hooks = by_name["reviewer-planner-codex-hooks"]
@@ -380,9 +383,27 @@ def test_the_two_entries_that_could_not_be_closed_say_why() -> None:
     assert "CODEX_HOME" in hooks.reason
     # 舊理由不得還「作為理由」留在上面——它必須是被**引述後推翻**的那一段。
     assert "做不到" in hooks.reason and "#686" in hooks.reason
-    manager = by_name["manager-claude-credential"]
-    assert "#687" in manager.disposition
-    assert "executor_credential_relpath` 是**單一**部署決定" not in manager.reason
+
+
+def test_the_manager_credential_entry_disappeared_by_switching() -> None:
+    """#687：`manager-claude-credential` 移除，且**不得**改以資產形式偷渡回來。
+
+    票 D（#685）刻意留著它，理由逐字是「切換尚未發生，direct 路徑逐字還在，現在刪
+    等於宣稱一件還沒成立的事」。票 F 讓它成立：`PSC_JOB_RUNNER=systemd-template`
+    下 `_select_planning_invoker()` 恆回 `JobPlanningInvoker`，Manager 行程內不再
+    exec 任何 executor。
+
+    因此正確的收法是**兩件事同時成立**：deferred 清單少一項，而登記表**沒有**多出
+    一格 Manager 的 executor 憑證。只驗前者的話，「刪掉逾期項」與「把它登記成資產」
+    看起來一模一樣——而後者正是 #672 要消除的東西（Manager 是 durable state owner
+    ＋ spawn 授權持有者，passwd 註記逐字寫著 `no model code`）。
+    """
+    names = {item.name for item in permgen.deferred_run_dependencies()}
+    assert "manager-claude-credential" not in names, sorted(names)
+    manager_account = permgen.DEFAULT_LAYOUT.manager_account
+    assert manager_account not in permgen.CREDENTIALED_ACCOUNTS, (
+        f"{manager_account} 不得取得任何 executor 憑證——那正是 #672 的核心裁決"
+    )
 
 
 def test_the_inventory_stays_closed_in_both_directions() -> None:

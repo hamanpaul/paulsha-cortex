@@ -96,6 +96,15 @@ UNTRUSTED_EXECUTION_PRINCIPALS: frozenset[Principal] = (
 #: 卻換不到任何隔離。`REVIEWER` 在這裡是**那個帳號的代表 principal**，由
 #: `permgen.JOB_PRINCIPAL_PERSONAS` 明載它代表誰。
 #:
+#: **本表是「產得出哪幾份 unit／spool」，不是「哪些執行路徑真的走上它」（#687）。**
+#: `REVIEWER` 這一格從 #615 起就在表上，但 planner 的 define／brainstorm 直到
+#: #672 票 A～F（#682-#687）才真的以它起 job——在那之前 `job-specs/reviewer/`
+#: 從未被寫過任何一個 spec（#686 查證、#687 於實機複驗）。判定執行路徑的是
+#: `coordinator/planning_runtime._select_planning_invoker()` 與
+#: `coordinator/launcher.SubprocessLauncher._job_role()`，不是本表。
+#: （本段與 `permgen.DOWNGRADED_JOB_PRINCIPALS` 的同一段是**成對**的，改一邊
+#: 就要改另一邊——兩者是同一個 tuple 物件的兩份說明。）
+#:
 #: 定義在登記表而非 `permgen`：permgen import registry（反向不成立），而本清單同時
 #: 要決定**登記表有哪些資產**。放在 permgen 會讓資產清單得從產生器 import 回來。
 #: `permgen.DOWNGRADED_JOB_PRINCIPALS` 是指向本項的別名，不是第二份。

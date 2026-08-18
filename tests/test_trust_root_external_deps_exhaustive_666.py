@@ -574,16 +574,22 @@ def test_deferred_dependencies_stay_enumerable() -> None:
       證明那句話是錯的：codex 需要 `$CODEX_HOME` 整棵可寫，單檔不夠。
     - `reviewer-planner-codex-hooks` **留著，但理由整段換掉**：它現在不是「還沒補」，
       而是與 codex 的可用性**在 `$CODEX_HOME` 這一層互斥**（升為 U-9）。
-    - `manager-claude-credential` **留著**：U-5 解除了它的機械阻礙（表達得了了），但
-      「要不要給 Manager 一份模型憑證」是 #672 的核心裁決，答案是不要；本項由票 F
-      （#687）切換之後隨 direct 路徑一起消失，**不是**現在刪掉。
+    - `manager-claude-credential` 在 #685 當時**留著**：U-5 解除了它的機械阻礙
+      （表達得了了），但「要不要給 Manager 一份模型憑證」是 #672 的核心裁決，答案是
+      不要；本項由票 F（#687）切換之後隨 direct 路徑一起消失，**不是**當時刪掉。
+
+    **#687（票 F）把它移除了，而且是「消失」不是「登記」。** 四分部署的
+    `PSC_JOB_RUNNER=systemd-template` 讓 `_select_planning_invoker()` 恆回
+    `JobPlanningInvoker`，模型 CLI 只在 `cortex-reviewer-job@` 實例內執行，Manager
+    不再 exec 任何 executor ⇒ 它不需要 executor 憑證。清單因此**再縮短一項**，剩兩項。
     """
     deferred = deferred_run_dependencies()
     assert {item.name for item in deferred} == {
         "gate-gitconfig",
         "reviewer-planner-codex-hooks",
-        "manager-claude-credential",
     }, sorted(item.name for item in deferred)
+    # #687：被移除的那一項不得以任何形式「改個名字留下來」。
+    assert "manager-claude-credential" not in {item.name for item in deferred}
     for item in deferred:
         assert item.principals, item.name
         assert item.reason.strip() and item.symptom.strip(), item.name

@@ -62,6 +62,7 @@ from .job_runner import (
     SPEC_REQUIRED_KEYS,
     forbidden_spec_keys,
     instance_name_valid,
+    malformed_job_command,
     reject_unsafe_env,
 )
 
@@ -70,6 +71,7 @@ __all__ = [
     "ShimError",
     "forbidden_spec_keys",
     "load_spec",
+    "malformed_job_command",
     "main",
     "resolve_job_env",
     "resolve_spec_path",
@@ -168,13 +170,13 @@ def load_spec(instance: str, spool_root: str) -> dict[str, object]:
             f"{instance!r}）: {path}"
         )
 
-    command = spec.get("command")
-    if (
-        not isinstance(command, list)
-        or not command
-        or not all(isinstance(item, str) and item for item in command)
-    ):
-        raise ShimError(f"job spec 的 command 必須是非空的字串陣列: {path}")
+    # #687：判準與寫端 `job_runner.build_job_spec()` 走**同一支**
+    # `malformed_job_command()`——`argv` 非空、`argv[0]` 非空、每個元素都是 str，
+    # 但**其餘元素允許空字串**（`claude --tools ""` 是成文 API，見該函式 docstring）。
+    # 這裡不再自寫一份判準：#679 已經買過「同一件事兩份實作會漂移」的單。
+    problem = malformed_job_command(spec.get("command"))
+    if problem is not None:
+        raise ShimError(f"job spec 的 command 不合法（{problem}）: {path}")
     for key in ("working_directory", "log_path"):
         value = spec.get(key)
         if not isinstance(value, str) or not value.startswith("/"):

@@ -4212,33 +4212,23 @@ _DEFERRED_RUN_DEPENDENCIES: tuple[DeferredDependency, ...] = (
             "導出的實測不得宣稱可用。"
         ),
     ),
-    DeferredDependency(
-        "manager-claude-credential", DependencyKind.CREDENTIAL,
-        (Principal.MANAGER,),
-        reason=(
-            "`planning_runtime` 的 **direct 模式**在 Manager 行程內直接 exec `claude`，"
-            "並讀 `<HOME>/.claude/.credentials.json` 播種一次性的 `CLAUDE_CONFIG_DIR`。"
-            "四分部署下 Manager 的 HOME 底下沒有那個檔，登記表也沒有對應資產。\n"
-            "**#685 解除了本項的機械阻礙，但沒有解除它本身。** 原文寫的阻礙是"
-            "「`executor_credential_relpath` 是單一部署決定，一個帳號只表達得了一份憑證」"
-            "——U-5 的裁決已經把它擴成 per-(account, executor) 表"
-            "（:data:`CREDENTIALED_ACCOUNTS`），現在**表達得了**。剩下的是**要不要登記**"
-            "這一格，而那是 #672 的核心裁決：Manager 是 durable state owner ＋ spawn "
-            "授權持有者，passwd 註記逐字寫著 `no model code`——給它一份模型憑證正是 #672 "
-            "要消除的東西。因此本票**刻意不登記**。"
-        ),
-        symptom=(
-            "程式碼在查無憑證時**明確回 `None` 並不代為猜測**，讓 claude CLI 自己回報"
-            "未登入——因此它不是靜默失敗，但也不是可用狀態。實機 direct 模式的 planning "
-            "走 `agy`，所以這條還沒有被踩到。"
-        ),
-        disposition=(
-            "由**票 F（#687）**收尾：`PSC_JOB_RUNNER` 切到 `systemd-template` 之後，"
-            "planning 一律走降權 job（票 E／#686 已把 `JobPlanningInvoker` land），Manager "
-            "行程內不再 exec 任何 executor，本項隨之消失而不是被登記。**本票不預先刪掉它**"
-            "——切換尚未發生，direct 路徑逐字還在，現在刪等於宣稱一件還沒成立的事。"
-        ),
-    ),
+    # #687（#672 票 F）：`manager-claude-credential` 已移除。
+    #
+    # 它從來不是「還沒補的憑證」，而是「Manager 在 direct 模式下自己 exec `claude`」
+    # 這件事的登記表投影。票 F 的裁決是 **planning 一律走降權 job**：四分部署的
+    # `PSC_JOB_RUNNER=systemd-template` 使 `planning_runtime._select_planning_invoker()`
+    # 恆回 `JobPlanningInvoker`，模型 CLI 只在 `cortex-reviewer-job@` 實例內、以
+    # `cortex-reviewer-planner` 執行。Manager 不再 exec 任何 executor ⇒ 它不需要
+    # 任何 executor 憑證 ⇒ 本項**消失**，而不是被登記成一格資產。
+    #
+    # **這條裁決不是「刪一列」，它有可驗證的內容**：`_select_planning_invoker` 對
+    # `systemd-run`（A 案）與任何非法值 fail-closed、**不退回 in-process**——因此
+    # 「Manager 又開始跑模型」這件事不可能靜默發生。direct 模式的程式碼逐字保留
+    # （開發機、離線重現），它在四分部署上不是一個可達的組態。
+    #
+    # 票 D（#685）刻意沒刪，理由是「切換尚未發生，現在刪等於宣稱一件還沒成立的
+    # 事」。票 F 讓它成立了：實機一輪 define 的每一次模型呼叫都落成一個模板 unit
+    # 實例（PR #687 的 E2E evidence）。
 )
 
 
@@ -4259,6 +4249,15 @@ def deferred_run_dependencies() -> tuple[DeferredDependency, ...]:
 #: 相同、只是名字不同的 unit，等於多一個要同步維護的放行面（polkit pattern 也會多
 #: 一個字幹），卻換不到任何隔離。`REVIEWER` 在這裡是**那個帳號的代表 principal**，
 #: 由 :data:`JOB_PRINCIPAL_PERSONAS` 明載它代表誰。
+#:
+#: **本表是「unit／spool 產得出哪幾份」，不是「哪些執行路徑真的走上它」（#687）。**
+#: 這兩件事在 #615～#686 之間**分岔了三個月**：本表從 #615 起就宣稱 reviewer／planner
+#: 這一格已降權，而 planner 的 define／brainstorm 當時仍在 Manager 行程內跑模型
+#: （#672）——因為它走的是 `planning_runtime`，不是 `SubprocessLauncher`。
+#: 產生器面永遠不會發現這件事：unit 產得出來，只是沒有人拿它起 job。
+#: 「執行路徑走不走上這份 unit」的答案在
+#: `coordinator/planning_runtime._select_planning_invoker()` 與
+#: `coordinator/launcher.SubprocessLauncher._job_role()` 兩處，不在本表。
 #:
 #: - `GATE`（#629）：`cortex-gate-job@.service`／`cortex-gate-job-jit@.service`，
 #:   `User=cortex-gate`。它不跑模型，跑的是 operator 宣告的 gate 命令——但那些命令

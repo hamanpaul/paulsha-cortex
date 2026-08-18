@@ -112,6 +112,14 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    token**）。**這個開關要在 `cortex-builder` 帳號與 polkit 規則就位之後才可打開**，
    步驟見 `docs/superpowers/runbooks/trust-root-phase2b-setup.md` 第 5 步；相關選配變數
    為 `PSC_BUILDER_ACCOUNT`／`PSC_BUILDER_GROUP`／`PSC_BUILDER_HOME`。
+
+   **`systemd-template` 是定案路徑（0816 第三輪裁決 B 案），涵蓋面比上一段廣**：
+   builder（#603／#584）、reviewer（#615）、gate（#629）、以及 **define／brainstorm
+   的 planning**（#672 票 A～F／#682-#687）四條執行路徑全部改經 root-owned 模板 unit。
+   最後一條是 #687 才接上的：在那之前 planning 走 `planning_runtime` 而非
+   `SubprocessLauncher`，`PSC_JOB_RUNNER` 對它**完全沒有效果**，模型 CLI 就在 Manager
+   行程內以 `cortex-manager` 執行（該帳號的 passwd 註記逐字寫著 `no model code`）。
+   `systemd-run`（A 案）對 planning **fail-closed，不退回行程內執行**。
    **`PSC_BUILDER_PATH` 不是選配**（#679）：它與 `PSC_REVIEWER_PATH`／`PSC_GATE_PATH`
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
