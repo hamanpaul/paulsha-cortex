@@ -54,12 +54,12 @@
   `<toolchain>/bin ＋ JOB_PATH_SYSTEM_TAIL`）不一致。三個 `PSC_*_PATH` 現一律由產生器
   導出，runbook 不再手打。
 
-  **測試**：`tests/test_job_path_fail_closed_679.py`（46 條）——三個角色各自缺席／空值
+  **測試**：`tests/test_job_path_fail_closed_679.py`（47 條）——三個角色各自缺席／空值
   的 fail-closed、角色互不污染、錯誤訊息的 `trust_root unit` 旗標與
   `permgen.JOB_UNIT_CLI_FLAG` 一致、六份 unit 皆有 `Environment=PATH=` 且值由
   `PathLayout` 導出（換部署根即跟著換）、shim 三種情形（spec 優先／退回 unit／兩層都缺
   即 `ShimError` 且不建 log）、**複本的 PATH 逐字來自 unit 且 unit 沒有時複本也沒有**、
-  探針產生器的可執行行不得出現 `--setenv=`（含偵測器自己的 negative control）、矩陣
+  探針產生器的可執行行不得出現 `--setenv=`（含偵測器自己的 negative control）、**探針呼叫共用的 `psc_run_under` 而不自帶第二份定義**（未定義時 fail-closed）、矩陣
   完整性與剖面對應。OS 層語意（真的解到哪個檔）需要第二個 UID ＋ 真實 systemd 加固面
   ＋ 兩份同名不同版的 CLI，本環境全部沒有，因此以**具名 `@pytest.mark.skip` ＋ 完整
   理由**標示，並列出改由哪三個地方守——不靜默通過。
