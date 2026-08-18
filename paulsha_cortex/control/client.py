@@ -86,6 +86,10 @@ def _ok_status(payload: dict[str, Any], updated_at: object) -> dict[str, Any]:
         "held": list(payload.get("held", [])),
         "slices": list(payload.get("slices", [])),
         "attention": list(payload.get("attention", [])),
+        # #669：claim 判定不可 claim（`missing_issue`）而刻意不建 run 的 work item。
+        # 與 `attention` 並列但分開——`attention` 只留可行動的項目，這份是「已知
+        # 不可行動、但不得變成盲區」的紀錄。
+        "not_claimable": list(payload.get("not_claimable", [])),
         "in_flight": list(payload.get("in_flight", [])),
         "recent_done": list(payload.get("recent_done", [])),
         "degraded": False,
@@ -134,6 +138,9 @@ def _degraded_status(reason: str, payload: dict[str, Any] | None = None) -> dict
         "held": list(payload.get("held", [])) if isinstance(payload, dict) else [],
         "slices": list(payload.get("slices", [])) if isinstance(payload, dict) else [],
         "attention": list(payload.get("attention", [])) if isinstance(payload, dict) else [],
+        "not_claimable": (
+            list(payload.get("not_claimable", [])) if isinstance(payload, dict) else []
+        ),
         "in_flight": [],
         "recent_done": [],
         "degraded": True,

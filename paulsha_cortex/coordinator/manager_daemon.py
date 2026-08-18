@@ -19,7 +19,7 @@ from typing import Any, Callable
 from paulsha_cortex.config import paths
 from ..control import constants, contract
 from ..trust_root import selfcheck as trust_root_selfcheck
-from . import autonomy, backoff, manager, planning_runtime
+from . import autonomy, backoff, manager, not_claimable, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .diagnostics import diagnostic_reason, summarize_exception
 from .dispatcher import Dispatcher
@@ -252,6 +252,28 @@ def _in_flight_status(registry) -> list[dict[str, Any]]:
     return in_flight
 
 
+def _not_claimable_status(registry) -> list[dict[str, Any]]:
+    """#669：把 `not-claimable` ledger 投影進 status 快照。
+
+    ledger 與 `jobs.json` 同住 coordinator root，故由 registry 的 state path 推導
+    （與 `work_actions` 的 ``state_path.parent`` 同一個慣例）。推不出路徑（測試
+    double 沒有 ``_state_path``）時退回 `paths.coordinator_root()`；讀取失敗一律
+    回空清單——一份輔助紀錄壞掉不得讓整份 status 死掉（比照下方
+    `list_workflow_runs()` 的 try/except）。
+    """
+
+    state_path = getattr(registry, "_state_path", None)
+    try:
+        root = (
+            Path(state_path).resolve().parent
+            if state_path is not None
+            else paths.coordinator_root().resolve()
+        )
+        return not_claimable.list_entries(not_claimable.ledger_path(root))
+    except Exception:  # noqa: BLE001 - 呈現面失效不得癱瘓整份 status
+        return []
+
+
 def _available_identity_candidates(identity_registry) -> str:
     identities = getattr(identity_registry, "identities", ())
     return ", ".join(
@@ -456,6 +478,11 @@ def build_runtime_status_provider(
             "recent_done": recent_done_provider(),
             "slices": slices,
             "attention": attention,
+            # #669：claim 判定「不可 claim」的 work item 不再物化成 needs_human
+            # run，因此不會出現在 `attention`（那份清單只留可行動的項目）。但
+            # 「不建 run 就跳過」若沒有任何可查詢的出口，就只是把噪音換成盲區
+            # ——fail-loud 換 fail-silent，方向是錯的。這份清單就是那個出口。
+            "not_claimable": _not_claimable_status(registry),
         }
 
     return provider
@@ -1419,6 +1446,8 @@ def run_loop(
                 status_payload["held"] = list(snapshot.get("held", []))
                 status_payload["slices"] = list(snapshot.get("slices", []))
                 status_payload["attention"] = list(snapshot.get("attention", []))
+                # #669：claim 判定不可 claim 而**沒有**建立 run 的 work item。
+                status_payload["not_claimable"] = list(snapshot.get("not_claimable", []))
                 contract.atomic_write_json(constants.status_path(), status_payload)
             except Exception as exc:  # noqa: BLE001
                 _log_error(exc)

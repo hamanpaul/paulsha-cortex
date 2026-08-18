@@ -2055,7 +2055,7 @@ def test_explicit_resume_selects_unique_done_ship_run_after_authority_changes(
     assert result["run"]["run_id"] == terminal.run_id
 
 
-def test_periodic_auto_scan_claims_labeled_work_and_persists_missing_issue(tmp_path: Path) -> None:
+def test_periodic_auto_scan_claims_labeled_work_and_skips_missing_issue(tmp_path: Path) -> None:
     snapshot = _snapshot(tmp_path / "snapshot.json")
     state = tmp_path / "runs.json"
     claimed = work_actions.run_auto_claim_scan(
@@ -2071,19 +2071,31 @@ def test_periodic_auto_scan_claims_labeled_work_and_persists_missing_issue(tmp_p
     assert claimed[0]["action"] == "claim"
     assert claimed[0]["run"]["status"] == "ongoing"
 
+    # #669：missing-issue 的情境改用**獨立的 coordinator root**。原本兩段共用
+    # `tmp_path/jobs.json`，而舊行為建立 missing_issue run 時
+    # `_manager_create_workflow_run` 會把同 (repo, work_id) 的 ongoing run 全部
+    # 標成 superseded——上一段剛 claim 成功的 run 就是被它作廢的（這正是「判定
+    # missing_issue 卻建 run」的第二層傷害），最後那個 `resume` 才會回 `claim`。
+    # 修正後不再建 run，共用 registry 會讓 resume 正確地接回上一段那個 run
+    # （回 `resume`），與本測試想驗的「missing → issue 補上 → 可 claim」無關。
+    missing_root = tmp_path / "missing"
     missing_snapshot = _snapshot(
-        tmp_path / "missing.json",
+        missing_root / "missing.json",
         issues=(),
         source_revisions=("openspec:demo@2",),
     )
-    missing_state = tmp_path / "missing-runs.json"
+    missing_state = missing_root / "runs.json"
     attention = work_actions.run_auto_claim_scan(
         snapshot_path=missing_snapshot,
         state_path=missing_state,
         now=lambda: 200,
     )
-    assert attention[0]["action"] == "needs_human"
-    assert attention[0]["run"]["reason"] == "missing_issue"
+    # #669：`missing_issue` 不再物化成 run——掃描回報 `not_claimable` 且 run 為
+    # None，理由改落在耐久的 `not-claimable` ledger（operator 從 `cortex status`
+    # 的 `not_claimable` 區塊查得到）。
+    assert attention[0]["action"] == "not_claimable"
+    assert attention[0]["reason"] == "missing_issue"
+    assert attention[0]["run"] is None
 
     _snapshot(
         missing_snapshot,

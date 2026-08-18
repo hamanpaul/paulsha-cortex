@@ -43,7 +43,14 @@ def test_assemble_digest_builds_structured_summary_from_status_snapshot() -> Non
     assert result["status_updated_at"] == "2026-08-10T12:30:00+00:00"
     assert result["degraded"] is False
     assert result["degraded_reason"] is None
-    assert result["counts"] == {"attention": 1, "ready": 1, "held": 1, "recent_done": 1}
+    assert result["counts"] == {
+        "attention": 1,
+        # #669：claim 判定不可 claim 而刻意不建 run 的 work item 計數。
+        "not_claimable": 0,
+        "ready": 1,
+        "held": 1,
+        "recent_done": 1,
+    }
     assert result["attention"] == status["attention"]
     assert result["ready"] == status["ready"]
     assert result["held"] == status["held"]
@@ -59,7 +66,13 @@ def test_assemble_digest_tolerates_sparse_or_degraded_status() -> None:
 
     assert result["degraded"] is True
     assert result["degraded_reason"] == "stalled"
-    assert result["counts"] == {"attention": 0, "ready": 0, "held": 0, "recent_done": 0}
+    assert result["counts"] == {
+        "attention": 0,
+        "not_claimable": 0,
+        "ready": 0,
+        "held": 0,
+        "recent_done": 0,
+    }
     assert result["attention"] == []
     assert result["ready"] == []
     assert result["held"] == []
@@ -72,7 +85,7 @@ def test_render_digest_text_lists_attention_ready_held_recent_done() -> None:
     text = digest_module.render_digest_text(digest)
 
     assert f"digest @ {FIXED_NOW}" in text
-    assert "attention=1 ready=1 held=1 recent_done=1" in text
+    assert "attention=1 not_claimable=0 ready=1 held=1 recent_done=1" in text
     assert "- slice-c: verify-failed" in text
     assert "- slice-a" in text
     assert "- slice-b: dispatch-hold" in text

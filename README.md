@@ -376,6 +376,7 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 - `in_flight`：正在執行的 Job。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason 與當下合法的 `next_actions`。
+- `not_claimable`（#669）：claim 判定**現在不可 claim、且刻意不建立 run** 的 work item。最典型的是 `docs/superpowers/workstreams/*`——那類 work item 設計上就不對應單一 issue，`missing_issue` 是**預期狀態而非異常**，過去卻被物化成停在 `current_phase: claim`、永遠不會推進的 `needs_human` run（實測一次產出 24 個，把 `attention` 信噪比壓成 1:24）。現在改記在耐久的 `<coordinator_root>/not-claimable.json`（schema `cortex-not-claimable/v1`），欄位含 `reason`、`detail`、`first_observed_at`／`last_observed_at`／`observations`（卡多久了）與 `next_step_hint`（照抄即可執行的下一步）。work item 一旦變成可 claim，該筆紀錄於下一次判定時自動消失。`attention` 因此只留可行動的項目，被跳過的項目也不會變成盲區。
 - `recent_done`：最近完成或進入 terminal gate 的 slice 摘要，含 `slice_id`、`gate_status`、`at`、`gate_reason`、`job_id`、`branch`、明確的 `repo` project 歸屬（manifest 缺該欄時為 `null`）。`attention`／`slices` 也只接受明確的 slice 或 workflow job repo；不從 branch、worktree 或 path 猜測 project。只回溯 `--recent-done-window-seconds`（預設 86400 秒／24 小時，可用 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫）內完成的 handoff manifest；window 內沒有資料時回空陣列，不會回退撈更舊的紀錄，過期 manifest 檔案本身的清理屬於 #178 program teardown GC 的範圍，不在 `recent_done` provider 職責內。
 
 Job `exited` 只代表 Agent process 以 exit code 0 結束，**不代表任務交付完成**。只有 Slice 通過 deterministic verification、必要的 foreign review，且 Candidate 已進入 target branch 後，才會變成 `completed` 並釋放下游 dependency。

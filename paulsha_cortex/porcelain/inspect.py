@@ -125,6 +125,26 @@ def _print_status(status: dict[str, Any]) -> None:
         )
         for ref in blocking.get("evidence_refs") or []:
             sys.stdout.write(f"    evidence: {ref}\n")
+    # #669：claim 判定 `missing_issue` 時不再建立 run（那會把「workstream 本來就
+    # 不對應單一 issue」這個**預期狀態**物化成永遠不會推進的 needs_human 殭屍，
+    # 實機一次產出 24 個、把 attention 信噪比壓成 1:24）。但只是不建 run 等於把
+    # fail-loud 換成 fail-silent，因此改記在這份 ledger，並在這裡印出來——
+    # operator 巡檢時看得到「哪些 work item 被跳過、為什麼、多久了、下一步」。
+    not_claimable = status.get("not_claimable", []) or []
+    sys.stdout.write(
+        "not_claimable: " + json.dumps(not_claimable, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+    for entry in not_claimable:
+        if not isinstance(entry, dict):
+            continue
+        sys.stdout.write(
+            f"  not_claimable[{entry.get('repo', '-')}/{entry.get('work_id', '-')}]: "
+            f"{entry.get('reason')}: {entry.get('detail')} "
+            f"(since={entry.get('first_observed_at')}, seen={entry.get('observations')})\n"
+        )
+        hint = entry.get("next_step_hint")
+        if hint:
+            sys.stdout.write(f"    next: {hint}\n")
     sys.stdout.write(
         "in_flight: " + json.dumps(status.get("in_flight", []), ensure_ascii=False, sort_keys=True) + "\n"
     )

@@ -133,7 +133,13 @@ Verify/Review dispatch只接受schema v2明示`review` capability、且independe
 
 舊版曾把 planning-only canonical Agy 誤派成 reviewer，亦曾把Claude reviewer啟動在Plan Mode而得到`exited-0`卻沒有terminal payload。這些既存 terminal 不會成為 evidence；只有 operator 明確執行 `cortex work resume`，且最新 Job 的 run/claim/repo/source/card/phase/Candidate/builder/reviewer identity/output/sandbox snapshot contract 全部精確吻合時，Manager 才保留舊 Job/log並重派一次。Reviewer的原始Candidate root必須精確等於已驗證Builder Job worktree，而不是WorkflowRun主workspace。Periodic runner 不取得此 recovery authority。
 
-工作預設 manual。Auto claim 同時要求 confirmed Todo、confirmed issue 與 `cortex:auto-on-going` label；移除 label 只阻止尚未 claim 的工作，不會中止 active workflow。Todo 缺 issue 時不會自動建立 issue，而是 `needs_human: missing_issue`。
+工作預設 manual。Auto claim 同時要求 confirmed Todo、confirmed issue 與 `cortex:auto-on-going` label；移除 label 只阻止尚未 claim 的工作，不會中止 active workflow。Todo 缺 issue 時不會自動建立 issue。
+
+**缺 issue 不建立 run（#669）。** 判定 `missing_issue` 時，claim 回 `action: not_claimable`、`run: None`，**不呼叫 workflow starter**。舊行為是「先建 run 再宣告 blocked」（run 的理由逐字寫著「claim 判定需要人工介入即建立 run」），於是 `docs/superpowers/workstreams/*` 這類**設計上就不對應單一 issue** 的 work item，每一個都被物化成停在 `current_phase: claim`、`gate_state: running`、`evidence_refs: []`、`next_actions: []` 的 `needs_human` run——實測首輪掃描一次產出 24 個，永遠不會推進，把 `attention` 的信噪比壓成 1:24。`missing_issue` 對這類 work item 是**預期狀態，不是異常**，不該進入 durable 的 run 生命週期。
+
+但「不建 run」不得等於「靜默略過」，否則真的漏開 issue 的 work item 會變成盲區（fail-loud 換成 fail-silent）。每一次跳過都會在 `<coordinator_root>/not-claimable.json`（schema `cortex-not-claimable/v1`）記一筆：`reason`／`detail`／`source`、`first_observed_at`／`last_observed_at`／`observations`（卡多久、被判過幾次）與可照抄的 `next_step_hint`；`cortex status` 以獨立的 `not_claimable` 區塊呈現（`attention` 因此只留可行動的項目），`cortex digest` 帶計數。work item 一旦重新可 claim（補了 issue、或既有殭屍 run 已被 abandon），下一次判定即自動清掉該筆，不留永久假警報。
+
+修正**不會自行清除**修正前建立的殭屍 run（沿用「auto-claim 不得自動清除或重試 `needs_human` run」的守衛）。這類 run 有唯一可機械辨識的簽名——ongoing ＋ 停在 `claim` phase ＋ 掛 `needs_human` ＋ 結構化理由為 `claim-blocked`／`work_bridge.start_workflow_for_authority` ＋ 零 evidence 與 PR——命中時 claim 回 `reason: claim-blocked-stale-run`、附上該 `run_id` 與完整的 `cortex work abandon … --expected-run-id …` 指令，由 operator 明示清除。少任何一項簽名都不算殭屍，停在 build／verify／review 的 `needs_human` run 不受影響。
 
 合法且exact-bound的review `state=rejected`會保存immutable GateEvaluation、把當前card標成`needs_human`並停在原phase；periodic runner不得重派。只有operator explicit `cortex work resume`可在Candidate、report與evaluation hash重驗後建立fresh reviewer Job。Blocking category只描述Candidate或acceptance缺陷；若只是前份review report的措辭／列舉精度且不改變Candidate verdict，fresh reviewer應以non-blocking `style`留下更正，不得冒充Candidate correctness。
 
