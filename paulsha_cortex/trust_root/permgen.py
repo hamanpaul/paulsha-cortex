@@ -1790,6 +1790,32 @@ class PathLayout:
         return f"{self.coordinator_root}/review-verdicts"
 
     @property
+    def planning_job_log_spool_root(self) -> str:
+        """planning job 寫、Manager 讀的輸出通道根（登記表資產
+        `planning-job-log-spool`，#686）。
+
+        路徑與 `config.paths.planning_job_log_spool_root()` 是**成對契約**，由
+        `asset_paths()` 供給權限計畫；本 property 只是給 unit 產生器引用的同一份
+        字面量（比照 `review_verdict_spool_root`）。
+
+        **掛在 `review_verdict_spool_root` 底下是刻意的**（design D3「不新開通道」／
+        U-3 未裁決）：`_minimize()` 因此把它從模板 unit 的 `ReadWritePaths=` 吃掉，
+        planner 帳號的寫入面逐字不變，default ACL 自動繼承。理由全文見
+        `config/paths.py:planning_job_log_spool_root`。
+        """
+        return f"{self.review_verdict_spool_root}/planning-logs"
+
+    @property
+    def planning_scratch_root(self) -> str:
+        """planning job 的 per-invocation **唯讀** scratch pool 根（登記表資產
+        `planning-scratch-pool`，#686）。
+
+        它**不**出現在任何 job 模板 unit 的 `ReadWritePaths=`——那是登記表 writer 面
+        只有 Manager 的機械後果，不是這裡的字面決定（見該資產的 note）。
+        """
+        return f"{self.coordinator_root}/planning-scratch"
+
+    @property
     def gate_ledger_spool_root(self) -> str:
         """gate 寫、Manager 讀的 per-job ledger spool 根（登記表資產
         `gate-ledger-spool`，#629）。
@@ -2101,6 +2127,11 @@ class PathLayout:
             "review-verdict-spool": self.review_verdict_spool_root,
             # #623／#634 成果回收的 bundle spool：<coordinator>/commit-spool/<job-id>/
             "commit-spool": self.commit_spool_root,
+            # #686（#672 票 E）：降權 planning job 的輸出通道與唯讀 scratch pool。
+            # 前者進 reviewer 模板 unit 的 RWP（writer 面含 PLANNER），後者**不**進
+            # （writer 面只有 MANAGER）——U-2「scratch 唯讀」因此是機械導出的。
+            "planning-job-log-spool": self.planning_job_log_spool_root,
+            "planning-scratch-pool": self.planning_scratch_root,
             # Phase 2b 方案 B（0816 第三輪 A+B）：模板 unit 的 per-job 執行規格。
             # #657：容器 ＋ per-principal 子 spool。子項由登記表的同一張
             # `DOWNGRADED_JOB_PRINCIPALS` 導出，不逐項寫死——asset_paths() 漏一項的

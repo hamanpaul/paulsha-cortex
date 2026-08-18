@@ -168,11 +168,30 @@ def test_invoker_selection_follows_resolve_runner_mode(monkeypatch) -> None:
     """
 
     # 1／2：唯一輸入 ＋ 非法值 fail-closed。
-    for value in (None, "", job_runner.RUNNER_DIRECT, job_runner.RUNNER_SYSTEMD_TEMPLATE):
+    #
+    # #686（票 E）更新：`systemd-template` 這一格從 `InProcessPlanningInvoker` 改成
+    # `JobPlanningInvoker`。票 B 當時的值是**刻意的過渡態**（見
+    # `_select_planning_invoker` 的 docstring：「票 E 新增 JobPlanningInvoker 之後，
+    # 改的只有本函式的對應表一處」），本次改的就是那一處。這條斷言因此是**收緊**
+    # 而不是放寬：原本三種模式都回同一個物件，現在每一種模式各自被釘住。
+    for value in (None, "", job_runner.RUNNER_DIRECT):
         env = {} if value is None else {job_runner.JOB_RUNNER_ENV: value}
         assert isinstance(
             planning_runtime._select_planning_invoker(env),
             planning_runtime.InProcessPlanningInvoker,
+        )
+    from paulsha_cortex.coordinator.planning_job import JobPlanningInvoker
+
+    assert isinstance(
+        planning_runtime._select_planning_invoker(
+            {job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE}
+        ),
+        JobPlanningInvoker,
+    )
+    # A 案（`systemd-run`）**不得**靜默退回 in-process——那種失敗看起來是成功的。
+    with pytest.raises(ValueError):
+        planning_runtime._select_planning_invoker(
+            {job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_RUN}
         )
     with pytest.raises(job_runner.JobRunnerError):
         planning_runtime._select_planning_invoker({job_runner.JOB_RUNNER_ENV: "definitely-not-a-mode"})

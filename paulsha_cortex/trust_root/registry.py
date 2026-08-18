@@ -907,6 +907,67 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
     ),
     TrustRootAsset(
+        "planning-job-log-spool", _T0, _JV,
+        "paulsha_cortex.config.paths:planning_job_log_spool_root",
+        (Principal.MANAGER, Principal.PLANNER), (Principal.MANAGER,),
+        IngressKind.INTERPROCESS,
+        derived_in=(
+            "config/paths.py:planning_job_log_spool_root",
+            "coordinator/planning_job.py:JobPlanningInvoker",
+        ),
+        note=(
+            "#686（#672 票 E）：降權 planning job 的**輸出通道**"
+            "（`<review-verdict-spool>/planning-logs/<instance>/planning.log`）。planning "
+            "搬上 `cortex-reviewer-job@.service` 之後，模型 stdout 不再由 "
+            "`subprocess.run(capture_output=True)` 取回；這一格就是 design D-i 的 job 側"
+            "對應，per-invocation 生命週期走 `coordinator/spool_slot.py`（與另外兩個 spool "
+            "同一份實作）。\n"
+            "**路徑掛在 `review-verdict-spool` 底下是刻意的**：design D3 第一句是「不新開"
+            "通道」，U-3 更把「新開一條 job→Manager 的寫入面」列為**未決、待 operator "
+            "裁決**。`cortex-reviewer-planner` 今天唯一既 Manager-owned 又對它開放寫入的"
+            "落點就是 verdict spool，掛在它底下因此 (i) 不新增任何寫入面（那個帳號本來就"
+            "寫得進這棵樹）、(ii) `read_write_paths()` 的 `_minimize()` 會吃掉被涵蓋的子"
+            "路徑 ⇒ 模板 unit 的 `ReadWritePaths=` **逐字不變、零部署動作**、(iii) 仍是"
+            "獨立登記表資產，治理面沒有因為省下一條 RWP 而消失。\n"
+            "**一處刻意的不同：log 檔由 Manager 預先建立（mode 0620），不是由 job 建。**"
+            "另外兩個 spool 靠 producer 在模型跑完之後自己 `chmod 0644`（#638 缺陷 2 的"
+            "既有繞法）讓 Manager 讀得到，那需要一段跑在模型之後的 wrapper；而 planning "
+            "的 job **刻意只有模型 argv 一段**（design D3：wrapper 自產的任何文字都會污染 "
+            "`_extract_json` 的輸入），沒有掛 publish 的位置。Manager 先建檔讓檔案 owner "
+            "恆為 Manager，job 只拿到繼承自 default ACL 的 `w`——寫得進、換不掉、刪不掉"
+            "（它對容器沒有 `w`）。\n"
+            "**writer 是 PLANNER 而不是 REVIEWER**：三分方案下兩者是同一個 OS 帳號，因此"
+            "產出的 ACL 逐字相同；宣告成 PLANNER 是為了讓登記表講的是**誰在用這條通道**"
+            "——reviewer 的通道是 `review-verdict-spool`，兩條不共用。二分方案下 PLANNER "
+            "映到哪個帳號由 `SCHEME` 決定，機制與 `review-verdict-spool` 相同。"
+        ),
+    ),
+    TrustRootAsset(
+        "planning-scratch-pool", _T1, _MO,
+        "paulsha_cortex.config.paths:planning_scratch_root",
+        (Principal.MANAGER,), (Principal.MANAGER, Principal.PLANNER),
+        IngressKind.MANAGER_INTERNAL,
+        derived_in=(
+            "config/paths.py:planning_scratch_root",
+            "coordinator/planning_job.py:JobPlanningInvoker",
+        ),
+        note=(
+            "#686（#672 票 E）：降權 planning job 的 per-invocation **唯讀** scratch "
+            "（`<coordinator_root>/planning-scratch/<instance>`，模型的 cwd）。\n"
+            "**writers 只有 MANAGER 是本項的全部重點**——U-2 的裁決是「scratch 對 job "
+            "唯讀」，而 `required_write_targets()` 只收 writer 面，因此「本根不出現在任何 "
+            "job 模板 unit 的 `ReadWritePaths=`」是**機械導出**的結果，不是靠註解約定。"
+            "`ProtectSystem=strict` 於是讓「模型弄髒自己的拋棄式 sandbox」**結構上不可能**"
+            "，design D-d 的偵測需求隨之消失（那條偵測在 job 側由 Manager 執行本來就"
+            "不可行——scratch 若可寫，弄髒它的是 job、看得到的也只有 job）。\n"
+            "readers 含 PLANNER：模型要 chdir 進去、要讀得到裡面的東西，因此需要 `rX`；"
+            "產生器據此出 traverse／讀取 ACL，而**不**出任何寫入授權。\n"
+            "executor 需要的可寫落點（codex 的 `-o`、agy 的 log／state）改指向 unit 的 "
+            "`PrivateTmp=yes` 私有 `/tmp`——per-invocation、job-owned、unit 結束即消失，"
+            "且 Manager 看不到它。"
+        ),
+    ),
+    TrustRootAsset(
         "workflow-report-journal", _T1, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
         derived_in=("coordinator/manager.py:4434",),

@@ -2120,6 +2120,103 @@ sudo -u cortex-builder sh -c \
 
 ---
 
+#### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
+
+> **這一節驗的是一條「結構上不可能」的性質，不是一個開關。** 降權 planning job 的
+> cwd 是 `<coordinator_root>/planning-scratch/<instance>/cwd`；該 pool 的登記表資產
+> `planning-scratch-pool` 的 **writer 面只有 Manager**，因此
+> `permgen.required_write_targets()` 機械地不收它 ⇒ 它不出現在任何 job 模板 unit 的
+> `ReadWritePaths=` ⇒ `ProtectSystem=strict` 下模型連寫都寫不進去。
+> design D-d 的「模型是否弄髒了自己的拋棄式 sandbox」偵測需求因此**消失**，而不是
+> 退步成一條 Manager 在 job 側做不到的偵測（R-1）。
+
+```bash
+# 前置：一格可讀不可寫的 scratch（收尾記得 rm -rf）
+sudo install -d -o cortex-manager -g cortex-manager -m 0755 \
+  /var/lib/cortex/coordinator/planning-scratch
+sudo install -d -o cortex-manager -g cortex-manager -m 0755 \
+  /var/lib/cortex/coordinator/planning-scratch/probe
+
+# ✅ 驗證：在**真實加固面**下，job 對自己的 cwd 寫入必須回 EROFS
+psc_run_under cortex-reviewer-job /bin/sh -c \
+  'cd /var/lib/cortex/coordinator/planning-scratch/probe && touch w'
+#   期望：`touch: cannot touch 'w': Read-only file system`（0818 實測逐字如此）
+#   ⛔ 若成功寫進去：代表有人把這個 pool 加進了某份 unit 的 ReadWritePaths——
+#      **不要就地改 unit**，回去看登記表 writer 面為什麼多了一個 principal。
+
+# ✅ 對照：executor 的可寫落點是 unit 的 PrivateTmp 私有 /tmp（不是 cwd）
+psc_run_under cortex-reviewer-job /bin/sh -c 'touch /tmp/t && echo PRIVATETMP-WRITABLE'
+#   期望：PRIVATETMP-WRITABLE（0818 實測）
+```
+
+**逐 executor 的唯讀 cwd 實測（0818，本機）**——這是 U-2 裁決前必跑的那一輪：
+
+| executor | 剖面 | 唯讀 cwd 下的結果 | 它到底要寫什麼 |
+|---|---|---|---|
+| `agy` | strict | **rc=0，模型輸出逐位元等於 expected** | 只寫 `$HOME/.gemini → cache/gemini`（已在 RWP 內） |
+| `claude` | strict | **rc=0**（CLI 走完整條，回 `Not logged in`＝憑證缺口，非 cwd） | 無 cwd 寫入 |
+| `codex` | jit | 起不來，但**與 cwd 無關**（見下） | `$CODEX_HOME`（預設 `$HOME/.codex`）**整個目錄**要可寫 |
+
+> **codex 那一格必須逐字記下來，因為它很容易被誤記成「唯讀 scratch 跑不動」。**
+> 把 cwd 換成可寫的 `/tmp` 之後**症狀完全相同**；把 `CODEX_HOME` 指到一個可寫目錄
+> 之後，**同一個唯讀 cwd 下 rc=0、輸出正確**。所以阻斷點是 `CODEX_HOME`，不是 cwd。
+> codex 會在 `$CODEX_HOME` 底下建 `state_5.sqlite`／`logs_2.sqlite`／`sessions/`／
+> `skills/`／`plugins/`／`thread-writer-locks/` 等一整棵狀態樹——**只放行
+> `auth.json` 一個檔不夠**（那正是 `permgen.deferred_run_dependencies()` 第一項與
+> 票 D／#685 目前寫的範圍）。實機錯誤逐字：
+> `Error: failed to initialize in-process app-server client: Read-only file system (os error 30)`。
+> **這是 #686 查到、design 未預期的部署缺口，處置屬票 D（#685）／U-4；本票不擅自
+> 放寬任何路徑。**
+
+#### 4e-4. planning 的輸出通道（跨 UID ＋ ACL mask）
+
+> log 落在 `<review-verdict-spool>/planning-logs/<instance>/planning.log`：**掛在既有
+> verdict spool 底下是刻意的**（design D3「不新開通道」／U-3 未裁決）——那個帳號本來
+> 就對這棵樹有 `wx`，`_minimize()` 又會把子路徑吃掉，因此模板 unit 的
+> `ReadWritePaths=` **逐字不變、零部署動作**，default ACL 自動繼承。
+
+```bash
+# ✅ 驗證：Manager 建的目錄自動繼承 producer 的 wx（不需要任何 setfacl）
+sudo -u cortex-manager mkdir -p \
+  /var/lib/cortex/coordinator/review-verdicts/planning-logs
+sudo getfacl -p /var/lib/cortex/coordinator/review-verdicts/planning-logs | \
+  grep -E 'user:cortex-reviewer-planner|^mask'
+#   期望：user:cortex-reviewer-planner:-wx ＋ mask::-wx（0818 實測逐字如此）
+#   ⛔ 若看到 `#effective:---`：那是 #638 缺陷 1——有人用明確 mode 建了這個目錄，
+#      把繼承來的 ACL mask 壓掉了。刪掉重建，**不要**手動 setfacl 補回去。
+```
+
+> **log 檔的 mode 是 `0620` 而不是 `0600`，這一格不能省。** POSIX ACL 下新檔的 mask
+> 由 `open(2)` 的 mode 參數之 group 位夾擠：用 `0600` 建檔會把繼承來的
+> `user:<planner>:wx` 壓成 `#effective:---`，job 於是連 append 都不行——與缺陷 1 是
+> 同一個機制，只是換到檔案這一層。Manager 預建檔案（而不是讓 job 自己建）則是缺陷 2
+> 的解：job 建的檔由 job 擁有、帶 `UMask=0077`，Manager 是目錄 owner 但那不給檔案
+> 內容的讀取權。
+
+#### 4e-5. 「Manager 行程樹無 executor」的實機取證（#686 驗收 2）
+
+```bash
+# 一輪 planning 進行中，同時抓三張快照。executor 應該只出現在第二張裡。
+#   (a) 呼叫端（Manager 側）的完整後代行程樹
+ps -e -o uname:26,pid,args --no-headers   # 再以 ppid 由呼叫端 pid 遞迴展開
+#   (b) job unit 的 cgroup
+systemd-cgls -u 'cortex-reviewer-job@<instance>.service'
+#   (c) cortex-manager.service 的 cgroup
+systemd-cgls -u cortex-manager.service
+```
+
+0818 實測（逐字）：(a) 只有 `python3 → bash -c "… systemctl start --wait …" → systemctl`
+三個行程，**沒有任何 executor 可執行檔**；(b) `└─<pid> agy --print …`；
+(c) 只有 `/opt/cortex/venv/bin/cortex service run` 一個行程。
+`ps -o uname:26` 顯示 (a) 三個都是 `cortex-manager`、(b) 的 agy 是
+`cortex-reviewer-planner`。
+
+**收尾**：`sudo rm -rf /var/lib/cortex/coordinator/planning-scratch
+/var/lib/cortex/coordinator/review-verdicts/planning-logs`（兩個 pool 都由 Manager 在
+執行期自建，留著空目錄不影響，但取證用的 `probe` 那一格請務必刪掉）。
+
+---
+
 ### 4f. 系統層 python 套件（#666 漂移項 1：`pytest`）
 
 **沒有這一步，前面全部做完 dispatch 也走得完——但每張 build 卡都會在採信階段被拒。**
@@ -3308,6 +3405,49 @@ python3 -m paulsha_cortex.trust_root path-probe four-way
 > 狀態（Phase 2b 的全部隔離一次失效），只為了避開一個補三行設定就能解的錯誤。
 > 正確做法是回到第 1 步確認那三行真的進了 EnvironmentFile、且 Manager 真的重啟過
 > （`sudo systemctl show cortex-manager.service -p Environment | tr ' ' '\n' | grep PSC_`）。
+
+#### 5-5c. 補宣告 `PSC_REVIEWER_HOME`／`PSC_GATE_HOME`（#686 實機查到，**與 #679 同型**）
+
+> **這是 #679 的 PATH 缺口在 `HOME` 上的同一份複本。** `build_job_env()` 的舊註解寫著
+> 「`HOME` 未給時 systemd 依 passwd 填入該帳號自己的正確值（而且模板 unit 另有一行
+> `Environment=HOME=`）」——**那對模板模式不成立**：`cortex-job-shim` 以
+> `os.execvpe(command[0], command, job_env)` 把環境**整份換掉**，unit 的
+> `Environment=HOME=` 到不了模型行程。實機現況：`PSC_BUILDER_HOME` **有**宣告，
+> `PSC_REVIEWER_HOME`／`PSC_GATE_HOME` **沒有**——與 #679 逐字同一個形狀。
+>
+> 0818 實測（#686 取證）：未宣告時降權 planning job 的 agy 死在
+> `resolving log directory: getting home directory: $HOME is not defined`；
+> 補上 `PSC_REVIEWER_HOME=/var/lib/cortex-reviewer-planner` 之後同一條呼叫 rc=0、
+> 輸出逐位元等於 expected。
+
+```bash
+# --- 0) 確認你是不是受影響的部署 ---
+sudo grep -cE '^PSC_(BUILDER|REVIEWER|GATE)_HOME=' /opt/cortex/etc/cortex-manager.env
+#   期望（修正前）：1（只有 builder）⇒ 往下做。
+
+# --- 1) 補兩個變數（值＝該角色的帳號 HOME，由產生器導出，不要手打）---
+python3 -c 'from paulsha_cortex.trust_root import permgen as p; \
+from paulsha_cortex.trust_root.registry import Principal as P; \
+l = p.DEFAULT_LAYOUT; s = p.SCHEMES["four-way"]; \
+print("# --- #686：job 的 HOME；shim 的 execvpe 會整份換掉環境 ---"); \
+print("PSC_REVIEWER_HOME=" + l.home_of(s.resolve(P.REVIEWER))); \
+print("PSC_GATE_HOME=" + l.home_of(s.resolve(P.GATE)))' \
+  | sudo tee -a /opt/cortex/etc/cortex-manager.env
+
+# --- 2) 重啟 Manager 讓它讀到新的 EnvironmentFile ---
+sudo systemctl restart cortex-manager.service
+```
+
+```bash
+# ✅ 驗證：三個變數都在
+sudo grep -E '^PSC_(BUILDER|REVIEWER|GATE)_HOME=' /opt/cortex/etc/cortex-manager.env
+#   期望：三行。
+```
+
+> **為什麼 #686 不順手把 `HOME` 也改成 fail-closed（如 #679 對 PATH 所做）**：那會讓
+> **所有角色**的既有派工在 EnvironmentFile 補齊之前當場失敗（gate 今天也沒有
+> `PSC_GATE_HOME`）。那屬於需要獨立票 ＋ 升級程序的改動；#686 只把事實記正確
+> （`build_job_env()` 的 docstring）並補上本步驟。
 
 ### 5-6. 正向驗證（**必須成功**）
 

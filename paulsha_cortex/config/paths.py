@@ -133,6 +133,84 @@ def gate_ledger_spool_root() -> Path:
     return coordinator_root() / GATE_LEDGER_SPOOL_DIRNAME
 
 
+#: `planning_job_log_spool_root()` 在 `review_verdict_spool_root()` 底下的目錄名。
+#: 獨立成常數的理由與 `REVIEW_VERDICT_SPOOL_DIRNAME` 逐字相同（R1 登記表的「重複
+#: 路徑推導」Scenario 要求單一真相）。
+PLANNING_JOB_LOG_SPOOL_DIRNAME = "planning-logs"
+
+
+def planning_job_log_spool_root() -> Path:
+    """#686（#672 票 E）：降權 planning job 的**輸出通道**根。
+
+    planning 搬上 `cortex-reviewer-job@.service` 之後，模型的 stdout 不再由
+    `subprocess.run(capture_output=True)` 取回——job 跑在另一個 UID、另一個 mount
+    namespace 的加固面下，Manager 唯一拿得到輸出的方式是「job 寫得進、Manager 讀得到」
+    的一格落點（design D-i／D3）。
+
+    ## 為什麼掛在 `review_verdict_spool_root()` **底下**而不是自己一個根
+
+    design D3 的第一句是「**不新開通道**」，U-3 更把「新開一條 job→Manager 的寫入面」
+    明列為**未決、待 operator 裁決**的事項。`cortex-reviewer-planner` 今天**唯一**
+    既是 Manager-owned、又對它開放寫入的落點就是 review verdict spool
+    （`user:cortex-reviewer-planner:wx`、default ACL 會傳給子項）。掛在它底下因此：
+
+    1. **不新增任何寫入面**——那個帳號本來就寫得進這棵樹，多的只是它自己那一格；
+    2. **不需要任何部署動作**——`read_write_paths()` 的 `_minimize()` 會把被涵蓋的
+       子路徑吃掉，模板 unit 的 `ReadWritePaths=` 逐字不變，default ACL 自動繼承；
+    3. 仍是**登記表資產**（`planning-job-log-spool`）——它有自己的 note、自己的
+       writer／reader 面、自己的 ACL 命令，治理面沒有因為省了一條 RWP 而消失。
+
+    真正**不能**沿用的是 launcher 那條 reviewer log 路徑（`<log_dir>/<slice>.jsonl`，
+    實機解到 `/var/lib/cortex/runtime/review/<slice>/`）：它既不在模板 unit 的
+    `ReadWritePaths=` 內，Manager 自己也建不出那層目錄（`/var/lib/cortex/runtime`
+    是 root-owned 0755）。design D3 寫的「reviewer 已在用同一條通道」在本機**不成立**
+    ——實機 `job-specs/reviewer/` 是空的，那條路從未被真正走過（見 #686 PR body）。
+
+    ## per-invocation 那一格的形態
+
+    每次呼叫在 `<此根>/<instance>/` 有且只有自己那一格（生命週期走
+    `coordinator/spool_slot.py`，與另外兩個 spool 同一份實作），log 檔由 **Manager
+    預先建立**（mode `0620`），job 只是以 `O_APPEND` 接管它。
+
+    理由是 #638 缺陷 2——job 自己建的檔由 job 擁有、又帶 unit 的 `UMask=0077`，Manager
+    是**目錄**的 owner 但那不給檔案內容的讀取權。verdict／commit 兩個 spool 靠
+    producer 自己 `chmod 0644` 繞過（`spool_slot.publish_file_command`），那需要在模型
+    之後再跑一段 wrapper；而 planning 的 job **刻意只有模型 argv 一段**（design D3：
+    wrapper 自產的任何文字都會污染 `_extract_json` 的輸入），沒有可以掛 publish 的
+    位置。改由 Manager 先建檔就同時解掉兩件事：檔案 owner 恆為 Manager（讀得到），
+    job 只獲得繼承自 default ACL 的 `w`（寫得進、換不掉、刪不掉——它對那一格沒有 `w`）。
+
+    `0620` 不是隨手挑的：POSIX ACL 下新檔的 `mask` 由 open(2) 的 mode 參數之 group 位
+    夾擠。用 `0600` 建檔會把繼承來的 `user:<planner>:-wx` 壓成 `#effective:---`
+    （＝#638 缺陷 1 的同一個機制），job 於是連 append 都不行。
+    """
+    return review_verdict_spool_root() / PLANNING_JOB_LOG_SPOOL_DIRNAME
+
+
+#: `planning_scratch_root()` 在 `coordinator_root()` 底下的目錄名（同上，單一真相）。
+PLANNING_SCRATCH_DIRNAME = "planning-scratch"
+
+
+def planning_scratch_root() -> Path:
+    """#686（#672 票 E）：降權 planning job 的**唯讀** per-invocation scratch pool 根。
+
+    這一格是 design D-a／D-c 的 job 側對應：模型的 cwd 必須是一個一次性的、不是
+    operator 樹的目錄。U-2 的裁決是**唯讀**（design 的傾向 (2)）——本根**刻意不出現在
+    任何 job 模板 unit 的 `ReadWritePaths=`** 中，因此 `ProtectSystem=strict` 下模型連
+    寫都寫不進去：design D-d 的「模型是否弄髒了自己的拋棄式 sandbox」偵測需求因此
+    **結構上消失**，而不是退步成一條做不到的偵測（R-1）。
+
+    登記表資產 `planning-scratch-pool` 的 writers 只有 MANAGER、readers 含 PLANNER
+    ——「不進 RWP」因此也是**機械導出**的結果，不是靠註解約定：`required_write_targets()`
+    只收 writer 面。
+
+    executor 需要的可寫落點（codex 的 `-o`、agy 的 log/state）改指向 unit 的
+    `PrivateTmp=yes` 私有 `/tmp`：那是 per-invocation、job-owned、unit 結束即消失的，
+    而 Manager 看不到它——「弄髒它不產生任何後果」在這裡是結構事實。
+    """
+    return coordinator_root() / PLANNING_SCRATCH_DIRNAME
+
+
 def gate_worktree_root() -> Path:
     """#629：gate 執行身分的**拋棄式工作區** pool 根（`<agents_root>/gate-worktree`）。
 
