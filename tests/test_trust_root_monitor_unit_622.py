@@ -108,6 +108,21 @@ def test_monitor_hardening_is_set_equal_to_manager(scheme) -> None:
     assert keys <= set(monitor)
 
 
+def _comment_block_above(lines: list[str], index: int) -> str:
+    """directive 上方那一段**連續**註解，去掉 `# ` 前綴與空白後接成一串。
+
+    `_wrap_comment` 會在任意 CJK 字元處斷行、並在斷於空白時吞掉那個空白，因此逐行
+    比對已不可行；去空白後接成一串再找子字串，是對折行**穩健**的比法。
+    """
+
+    collected: list[str] = []
+    cursor = index - 1
+    while cursor >= 0 and lines[cursor].startswith("#"):
+        collected.append(lines[cursor].lstrip("#").strip())
+        cursor -= 1
+    return "".join(reversed(collected)).replace(" ", "")
+
+
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
 def test_monitor_unit_carries_every_hardening_directive_with_a_comment(scheme) -> None:
     """每項加固都要帶「為何」的註解——可審查性要求，與 Manager unit 同標準。"""
@@ -117,7 +132,10 @@ def test_monitor_unit_carries_every_hardening_directive_with_a_comment(scheme) -
         assert directive in lines, directive
         index = lines.index(directive)
         assert lines[index - 1].startswith("# "), directive
-        assert why.split("：")[0][:6] in lines[index - 1], directive
+        # #673：加固表的理由現在會折行（`_wrap_comment`，CJK 可在任意字元處斷），
+        # 因此比對的是 directive 上方**整段連續註解**，不是它正上方那一行。
+        block = _comment_block_above(lines, index)
+        assert why.split("：")[0][:6].replace(" ", "") in block, directive
 
 
 # ---------------------------------------------------------------------------

@@ -300,6 +300,15 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   兩字幹複跑（含 `systemd-analyze verify` 的未知鍵落檔後檢查——#645 修的是產生器，
   已落檔的 unit 不會自己更新），4e 的 executor 形態表回填「`copilot` 也需要 node」
   → **50** 個 sudo 點、**184** 個驗證點。
+- **#673（加固面複本必須全量導出）新增**：4e 新增「共用探針 `psc_run_under`」一節，
+  加固面改由 `permgen.unit_replica_properties()`（CLI：`trust_root unit-replica`）從
+  **已落檔的 unit** 全量導出——4e 的三條、5-3 的 pytest、5-4 的 `gh` 原本各自手抄
+  四條 property，5-2b 則是一份手維護的 27 鍵 grep 白名單且不含
+  `ReadWritePaths=`／`WorkingDirectory=`／per-account `Environment=`；5-2b 的驗收
+  由「正向四段」改為 **4 executor × 2 剖面 × 2 角色 unit 的全矩陣**（新增**反向對照**：
+  `claude`／`agy` 在 jit 剖面下仍須 rc=0），並補「失敗原因要對得上」與 seccomp 過濾
+  語意不變式兩條。**起因**：一份漏抄 `SystemCallErrorNumber=EPERM` 的手抄複本比
+  production 更嚴格，量出一個不存在的 P0——手抄子集的假紅與假綠一樣會發生。
 - **#615（M2：reviewer／planner 啟動面降權）新增**：第 5-2 步再擴為落**四份**
   template unit（2 角色 × 2 剖面，另含「四份加固表集合比對」與「reviewer 的 RWP
   恰好兩條且不含任何 `%i` 路徑」兩條 gate）、5-5 補 reviewer 那一組 env ＋ 角色解析
@@ -339,7 +348,7 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
 | 登記表雙向等式 | 執行前提 4／第 7 步 | `ok: true`（切換前後皆是） |
 | legacy-import manifest | 第 3 步 | 78,674 檔；全量複驗 78,674/78,674 `OK` |
 | 5-6 正向 smoke | 第 5 步 | 成功；`uid=…(cortex-builder)`、token 已 scrub、fd 僅 0/1/2、`HOME=/var/lib/cortex-builder`（root-owned）、部署樹不可寫 |
-| 5-2b 雙剖面（#643） | 第 5 步 | 正向四段皆 rc=0 且版本相符；**負向對照**：`codex`／`copilot` 在 strict 剖面下**空輸出** |
+| 5-2b 雙剖面（#643／#673） | 第 5 步 | **在 `unit-replica` 全量導出的加固面下**跑滿 4 executor × 2 剖面 × 2 角色 unit：正向四格 rc=0 且版本相符；**負向對照** `codex`／`copilot` @strict 失敗且 stderr 為 V8 的 `Runtime_CompileLazy`（**不是**空 stderr）；**反向對照** `claude`／`agy` @jit 仍 rc=0 |
 | 5-7 反向 11 條 | 第 5 步 | **全數非 0**（(5)(7)(8)(9)(10) 對兩個字幹各一次） |
 | 5-7 (12) 剖面不可選（#643） | 第 5 步 | 三小條**全部 0**（＝拒絕確實發生） |
 | 5-7 (11) fail-closed | 第 5 步 | 移除 polkit 規則後起 job **失敗**、還原後**成功**（證明是規則在守，不是全紅假綠） |
@@ -1867,24 +1876,83 @@ codex --version
 #   而 job 跑的就變成 operator 從未判讀過的版本（症狀是「結果對不上」，不是報錯）。
 #   不同 ⇒ PATH 順序錯（toolchain 沒排最前面），或複製到的是系統那份。
 
+```
+
+#### 共用探針：`psc_run_under`（在**真實加固面**下跑一條命令）
+
+> **本 runbook 之後每一條「在真實加固面下」的驗證都用它，不再手打 `--property=`。**
+> 這是 #638（單 UID 讓 ACL 斷言真空）／#657（同型）／#673（同型）三次同一族事故
+> 之後定下的規矩：**加固面的定義只有一份，在 `permgen.unit_replica_properties()`**。
+> runbook 與 `tests/test_trust_root_syscall_profile_673.py` 共用它。
+>
+> #673 值得逐字記住：那份手抄複本抄了 `SystemCallFilter=@system-service`、**漏抄**
+> 同一份 unit 上的 `SystemCallErrorNumber=EPERM`，於是複本落回 systemd 預設的
+> `SECCOMP_RET_KILL_PROCESS`——**比 production 更嚴格**，量出一個 production 沒有的
+> `rc=1`。**手抄子集的假紅與假綠一樣會發生，方向不由人選。**
+
+```bash
+# 一次貼進 shell，之後各步驟直接呼叫。
+psc_probe_path() {
+  # PATH 也不手打：job 的 PATH 來自 Manager 端 root-owned 的 EnvironmentFile
+  # （模板 unit 刻意不寫 Environment=PATH=，因為 shim 會整份換掉環境）。
+  sudo grep -hoE '^(PSC_[A-Z]+_PATH|PATH)=.*' /opt/cortex/etc/cortex-manager.env \
+    | head -1 | cut -d= -f2-
+}
+
+psc_run_under() {   # psc_run_under <unit 字幹> <命令> [參數…]
+  local stem="$1"; shift
+  local -a props
+  # `systemctl cat` 帶上 drop-in，因此驗到的是**實際生效**的那一份，不是主檔而已。
+  mapfile -t props < <(
+    sudo systemctl cat "${stem}@.service" \
+      | python3 -m paulsha_cortex.trust_root unit-replica - --instance probe
+  )
+  # unit-replica 在落檔的 unit 少任一加固鍵時 fail-closed（stdout 空、rc=2）——
+  # 這一關不能省：空清單會讓下面那條變成「完全沒有加固的探針」，然後全綠。
+  if [ "${#props[@]}" -lt 30 ]; then
+    echo "⛔ 加固面複本只有 ${#props[@]} 條——unit 落檔不完整或產生器已漂移，停下來" >&2
+    return 90
+  fi
+  sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
+    "${props[@]}" --setenv=PATH="$(psc_probe_path)" "$@"
+}
+```
+
+**兩個必須先做的前置**（做不到就是探針本身壞了，不是被驗的東西壞了）：
+
+```bash
+# 1) 模板 unit 的 ReadWritePaths 含 %i（builder 的 /var/lib/cortex/worktree/%i）。
+#    systemd 對不存在的 ReadWritePaths 目標**在 exec 前就失敗**（rc=226 EXIT_NAMESPACE，
+#    輸出全空——症狀與「CLI 起不來」一模一樣）。--instance probe 因此需要一格真目錄。
+sudo install -d -o cortex-builder -g cortex-builder -m 0700 /var/lib/cortex/worktree/probe
+#    收尾：sudo rm -rf /var/lib/cortex/worktree/probe
+#    ⚠️ **這一格正是手抄四 property 複本永遠看不到的東西**——那份複本連
+#       ReadWritePaths 都沒有，所以它從來不會因為這個原因失敗，也就從來沒驗到它。
+
+# 2) 確認複本條數與 unit 相符（漂移偵測；數字會隨加固表成長，不要寫死在別處）
+sudo systemctl cat cortex-reviewer-job@.service \
+  | python3 -m paulsha_cortex.trust_root unit-replica - | wc -l
+#    期望：與 `grep -cE '^[A-Za-z]+=' <unit 的 [Service] 段>` 扣掉執行面指令後相同，
+#    且**至少**含 27 條加固鍵。少於 30 ⇒ 停下來，不要繼續往下驗。
+```
+
+回到 4e 那條「在真實加固面下驗 toolchain 可達性」的驗證——現在它走共用探針：
+
+```bash
 # ✅ 驗證（**在真實加固面下**跑一次）：`sudo -u` 沒有 unit 的加固，兩者可能不同結果
-sudo systemd-run --pipe --wait --collect \
-  --uid=cortex-builder --gid=cortex-builder \
-  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
-  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
-  --setenv=HOME=/var/lib/cortex-builder \
-  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-  /opt/cortex/toolchain/bin/codex --version
-#   期望（`codex` 這一支）：**空輸出**。
+#    這一步**不再手打 --property=**（#673：手抄的子集抄了 SystemCallFilter 卻漏抄
+#    SystemCallErrorNumber，量出一個 production 根本沒有的失敗）。
+psc_run_under cortex-job /opt/cortex/toolchain/bin/codex --version
+#   期望（`codex` 在 **strict** 剖面下）：**stdout 空**、rc≠0。
 #   ✅ 這不是失敗，是 #643 已經定案的事實：`MemoryDenyWriteExecute=yes` 與 V8 的 JIT
-#      天生互斥（node 崩在 `v8::internal::Runtime_CompileLazy`）。上面這條刻意保留
-#      **完整**加固面，是為了讓執行者親眼看到「為什麼需要第二份剖面」。
-#   ✅ 把 `--property=MemoryDenyWriteExecute=yes` 改成 `=no` 複跑，應印出與 operator
-#      側逐字相同的版本——那正是 `cortex-job-jit@.service`（jit 剖面）的加固面。
+#      天生互斥。stderr 會出現 V8 的 `Check failed: 12 == (*__errno_location ())`
+#      ——那就是它（V8 期待 mmap 回 ENOMEM(12)，被 MDWE 擋成 EPERM(1)）。
+#   ✅ 改跑 `psc_run_under cortex-job-jit /opt/cortex/toolchain/bin/codex --version`，
+#      應印出與 operator 側逐字相同的版本——那正是 jit 剖面的加固面。
 #   ⚠️ 若**兩種**都失敗，那就不是 MDWE，回到上一條查 PATH／toolchain 可達性。
 #   ⚠️ `claude`／`agy` 在**兩種**下都應該 rc=0；若它們在完整加固面下也失敗，代表
 #      這台機器上還有第三個阻斷點——**停下來查清楚**，不要順手再放寬一項。
-#   完整的雙剖面驗證（含負向對照）在第 5-2b 步；這裡只是提早看見那條分岔。
+#   完整的雙剖面驗證（含負向對照與反向矩陣）在第 5-2b 步；這裡只是提早看見那條分岔。
 ```
 
 ```bash
@@ -1895,27 +1963,30 @@ for s in permgen.unresolved_node_execution_surfaces(): print(s.program, '←', s
 #   目前預期兩列：srt ← executor claude ⇒ strict；openspec ← manager-unit。
 
 # (1) srt 在 reviewer job 的 strict 剖面下（＝ claude 實際 exec 它的那個加固面）
-sudo systemd-run --pipe --wait --collect \
-  --uid=cortex-reviewer-planner --gid=cortex-reviewer-planner \
-  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
-  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
-  --setenv=HOME=/var/lib/cortex-reviewer-planner \
-  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-  /opt/cortex/toolchain/bin/srt --version
+psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/srt --version
 
 # (2) openspec 在 Manager system unit 的加固面下
-sudo systemd-run --pipe --wait --collect \
-  --uid=cortex-manager --gid=cortex-manager \
-  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
-  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
-  --setenv=HOME=/var/lib/cortex-manager \
-  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+#     Manager 不是模板 unit，字幹沒有 `@`——直接餵檔案（--instance 用不到）。
+mapfile -t mprops < <(sudo systemctl cat cortex-manager.service \
+  | python3 -m paulsha_cortex.trust_root unit-replica -)
+sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
+  "${mprops[@]}" --setenv=PATH="$(psc_probe_path)" \
   /opt/cortex/toolchain/bin/openspec --version
 
-#   ⚠️ 兩條**預期都會失敗（空輸出或非零）**，症狀與 #643 的 codex／copilot 逐字相同：
-#      node 的 V8 崩在 `Runtime_CompileLazy`，`MemoryDenyWriteExecute=yes` 與 JIT 天生互斥。
-#   ✅ 確認方式：把該條的 `--property=MemoryDenyWriteExecute=yes` 改成 `=no` 複跑，
-#      若印得出版本，就確認阻斷點是它、不是別的。
+#   ⚠️ 兩條**預期都失敗（stdout 空、rc=1）**，症狀與 #643 的 codex／copilot 逐字
+#      相同——#673 已在完整加固面下複驗，兩條的 stderr 都是同一段 V8 stack trace：
+#          # Check failed: 12 == (*__errno_location ()).
+#          … v8::internal::Runtime_CompileLazy …
+#      `MemoryDenyWriteExecute=yes` 與 V8 的 JIT 天生互斥（V8 期待 mmap 回
+#      ENOMEM(12)，被 MDWE 擋成 EPERM(1)，於是那個 CHECK 炸掉）。
+#   ✅ 確認阻斷點是 MDWE 而非別的：改跑 `psc_run_under cortex-reviewer-job-jit
+#      /opt/cortex/toolchain/bin/srt --version`（jit 剖面，與 strict 只差 MDWE 一項）
+#      ——#673 實機為 `1.0.0`、rc=0。openspec 沒有對應的 jit Manager unit，
+#      因此 (2) 目前**無解**，維持 #661 的未決狀態。
+#   ⚠️ **注意 stderr 不是空的**。#673 的原始回報寫「stdout 與 stderr 皆空」，那是
+#      因為它的手抄複本漏掉 `SystemCallErrorNumber=EPERM`，行程被 SIGSYS 當場殺掉、
+#      連 V8 的錯誤都來不及印。在**真實**加固面下這一族失敗是有 stack trace 的
+#      ——看到空 stderr 就代表你的複本不等於 production，回去查複本。
 #   ⛔ **不要就地把 unit 的 MDWE 改掉**。#643 的先例是「量到才改，而且改的是一份具名
 #      剖面，不是全域放寬」——reviewer 要不要走 jit 剖面、Manager 這一面要不要動，
 #      是 operator 的裁決。把兩條的實際輸出貼回 #661 的 follow-up issue。
@@ -2040,24 +2111,36 @@ sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -c 'import yaml; print
 #   期望：印出版本
 
 # ✅ 驗證（2）：**在完整加固面下**複跑（`sudo -u` 沒有 unit 的加固面）
-#    探測目錄給 gate 帳號擁有——pytest 會在 rootdir 建 `.pytest_cache`，root-owned 的
-#    目錄會讓它印一段與待驗命題無關的 cache 警告，白白製造雜訊。
-sudo install -d -o cortex-gate -g cortex-gate -m 0755 /tmp/psc-gate-probe
-printf 'def test_ok():\n    assert True\n' \
-  | sudo tee /tmp/psc-gate-probe/test_probe.py >/dev/null
-sudo systemd-run --pipe --wait --collect \
-  --uid=cortex-gate --gid=cortex-gate \
-  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
-  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
-  --setenv=HOME=/var/lib/cortex-gate \
-  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-  --working-directory=/tmp/psc-gate-probe \
+#    探測目錄放在 gate **自己登記表上的可寫面**底下（`/var/lib/cortex/gate-worktree`），
+#    不放 /tmp——理由見下方 ⚠️。並給 gate 帳號擁有：pytest 會在 rootdir 建
+#    `.pytest_cache`，root-owned 的目錄會讓它印一段與待驗命題無關的警告。
+PROBE=/var/lib/cortex/gate-worktree/psc-probe
+sudo install -d -o cortex-gate -g cortex-gate -m 0700 "$PROBE"
+printf 'def test_ok():\n    assert True\n' | sudo tee "$PROBE/test_probe.py" >/dev/null
+sudo chown cortex-gate:cortex-gate "$PROBE/test_probe.py"
+#    加固面從已落檔的 gate 模板 unit 機械導出（見上方「共用探針」），只覆寫
+#    WorkingDirectory 指向探測目錄——**其餘一條都不減**。
+mapfile -t gprops < <(sudo systemctl cat cortex-gate-job@.service \
+  | python3 -m paulsha_cortex.trust_root unit-replica - --instance probe)
+sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
+  "${gprops[@]}" \
+  --property=WorkingDirectory="$PROBE" \
+  --setenv=PATH="$(psc_probe_path)" \
   /usr/bin/python3 -m pytest -q
 #   期望：`1 passed`，rc=0。
+#   ⚠️ `--property=WorkingDirectory=` 必須排在複本**之後**才覆寫得掉（systemd 取
+#      最後一次指定的值）。
+#   ⚠️ **不要把探測目錄放在 /tmp**：完整加固面含 `PrivateTmp=yes`，host 上的
+#      `/tmp/psc-gate-probe` 在 unit 的私有 /tmp 裡根本不存在，`WorkingDirectory=`
+#      指過去會在 exec **之前**就失敗——rc=226（EXIT_NAMESPACE）、輸出全空，
+#      症狀與「pytest 起不來」一模一樣。#673 實機踩到並複驗過。
+#      **這正是舊版四 property 複本看不到的東西**：那份複本沒有 PrivateTmp，
+#      所以 /tmp 一直能用，於是這條驗證多年來驗的都不是 production 的條件。
 #   ✅ **這一條在完整加固面下就應該過，不需要放寬任何一項**：CPython 不是 V8，
 #      `MemoryDenyWriteExecute=yes` 對它沒有影響（與 #643 的 node 型 executor 相反）。
+#      #673 實機複驗：完整 38 條複本下 `1 passed`、rc=0。
 #   ⚠️ 若這一條失敗而拿掉 MDWE 才過，那是新發現——**停下來記回 issue**，不要就地放寬。
-sudo rm -rf /tmp/psc-gate-probe
+sudo rm -rf "$PROBE"
 
 # ✅ 驗證（3）：**版本是明示的部署決定** —— 記下來並與 operator 側比對
 python3 -m pytest --version                                  # operator 側
@@ -2160,14 +2243,17 @@ sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status
 #      `XDG_CONFIG_HOME`／`GH_CONFIG_DIR`（見上方那條無聲漂移的警告）。
 
 # ✅ 驗證（3）：**在完整加固面下**複跑（`sudo -u` 沒有 unit 的加固面）
-sudo systemd-run --pipe --wait --collect \
-  --uid=cortex-manager --gid=cortex-manager \
-  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
-  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
-  --setenv=HOME=/var/lib/cortex-manager \
-  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+#    加固面從已落檔的 Manager unit 機械導出——手打子集抄漏一條就驗不到 production
+#    的條件（#673）。Manager 不是模板 unit，因此不需要 --instance。
+mapfile -t mprops < <(sudo systemctl cat cortex-manager.service \
+  | python3 -m paulsha_cortex.trust_root unit-replica -)
+sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
+  "${mprops[@]}" --setenv=PATH="$(psc_probe_path)" \
   /usr/bin/gh auth status
 #   期望：同上。`gh` 是原生 ELF，MDWE 不影響它。
+#   ⚠️ 這份複本會連 `EnvironmentFile=/opt/cortex/etc/cortex-manager.env` 一起帶上
+#      （它是 [Service] 段的一部分）——那是刻意的：Manager 的 PSC_* 設定同屬它的
+#      執行條件。檔案缺席時 unit 本來就 fail-closed，探針一起失敗是正確行為。
 
 # ✅ 驗證（4）：**不變式「改得了內容、建不了新檔」**（與 4e 的憑證逐條同構）
 sudo -u cortex-manager sh -c \
@@ -2441,47 +2527,69 @@ PY
 #        sudo systemctl reset-failed 'cortex-job@*' 'cortex-job-jit@*'
 ```
 
-### 5-2b. 在**真實加固面下**驗證兩種剖面（#643 的核心驗收）
+### 5-2b. 在**真實加固面下**驗證兩種剖面（#643 的核心驗收；#673 改為全矩陣）
 
 **只驗寬鬆環境的 `--version` 會整個溜過去**——四支 executor 在 `sudo -u` 下全部
-rc=0、版本全部相符，而其中兩支在真實加固面下是空輸出。這一步的形狀比照第 4e 步：
-用 `systemd-run` 把**真的加固指令**帶上去跑，且**必須有負向對照**（strict 剖面下
-node 型 executor 應該失敗；只驗 jit 成功等於什麼都沒驗）。
+rc=0、版本全部相符，而其中兩支在真實加固面下是空輸出。
+
+**但「比 production 弱的複本」只是兩種錯法的其中一種。** #673 量到另一個方向：
+一份手抄的十 property 複本抄了 `SystemCallFilter=` 卻**漏抄** `SystemCallErrorNumber=EPERM`，
+於是它比 production **更嚴格**（seccomp 落回預設的 `SECCOMP_RET_KILL_PROCESS`），
+量出一個 production 根本不存在的 `codex`／`copilot` rc=1，並據此開了一張「預設派工
+路徑是壞的」的 P0。**手抄子集的假綠與假紅一樣會發生，方向不由人選。**
+
+因此本步驟的規矩是：
+
+1. **加固面一律走 `psc_run_under`**（見第 4e 步的「共用探針」），由
+   `permgen.unit_replica_properties()` 從**已落檔的 unit** 全量導出，不手抄、不 grep
+   白名單。落檔的 unit 少任一加固鍵時該函式 fail-closed，不會產出半套清單。
+2. **驗的是矩陣，不是四段**：每個 executor × 每個剖面都要跑，因為「A 在自己的剖面下
+   能動」證明不了「B 在同一份剖面下沒被弄壞」。
 
 ```bash
-# ✅ 直接從已落檔的 unit 取出加固面，組成 systemd-run 的 --property 清單
-#    （不要手打——手打的清單與 unit 漂移時，這一步驗的就不是 unit 了）
-props() {
-  sudo grep -E "^(NoNewPrivileges|CapabilityBoundingSet|AmbientCapabilities|ProtectSystem|ProtectHome|PrivateTmp|PrivateDevices|ProtectProc|ProcSubset|ProtectControlGroups|ProtectKernelModules|ProtectKernelTunables|ProtectKernelLogs|ProtectClock|ProtectHostname|RestrictSUIDSGID|RestrictNamespaces|RestrictRealtime|RestrictAddressFamilies|LockPersonality|MemoryDenyWriteExecute|SystemCallArchitectures|SystemCallFilter|SystemCallErrorNumber|RemoveIPC|KeyringMode|UMask)=" \
-    "/etc/systemd/system/$1@.service" | sed 's/^/--property=/'
-}
-run_under() {   # run_under <unit-stem> <cli>
-  sudo systemd-run --pipe --wait --collect --quiet \
-    --uid=cortex-builder --gid=cortex-builder \
-    $(props "$1") \
-    --setenv=HOME=/var/lib/cortex-builder \
-    --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
-    "/opt/cortex/toolchain/bin/$2" --version
-}
+# 前置：--instance probe 需要一格真的 worktree（見第 4e 步的說明）
+sudo install -d -o cortex-builder -g cortex-builder -m 0700 /var/lib/cortex/worktree/probe
 
-# ✅ (1) 正向：每個 executor 在**它自己的**剖面下必須跑得出版本
-for cli in claude agy; do echo "== $cli @strict"; run_under cortex-job     "$cli"; echo "rc=$?"; done
-for cli in codex copilot; do echo "== $cli @jit"; run_under cortex-job-jit "$cli"; echo "rc=$?"; done
-#   期望：四段皆印出版本字串且 rc=0，且版本與 operator 側逐字相同（第 4e 步那條）。
+# ✅ (1) 全矩陣：4 executor × 2 剖面 × 2 角色 unit，一次跑完並列印
+for stem in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit; do
+  for cli in claude agy codex copilot; do
+    out="$(psc_run_under "$stem" "/opt/cortex/toolchain/bin/$cli" --version 2>/dev/null)"; rc=$?
+    printf '%-26s %-8s rc=%-3s out=[%s]\n' "$stem" "$cli" "$rc" "$(echo "$out" | tr -d '\n' | cut -c1-34)"
+  done
+done
+```
 
-# ✅ (2) **負向對照（不可省略）**：node 型 executor 在 strict 剖面下必須**失敗**
-for cli in codex copilot; do echo "== $cli @strict（期望空輸出／非 0）"; run_under cortex-job "$cli"; echo "rc=$?"; done
-#   期望：**空輸出**（V8 崩在 Runtime_CompileLazy）。
-#   ⚠️ 若這兩段也印出版本 ⇒ strict 那份 unit 的 MemoryDenyWriteExecute 沒生效
-#      （落檔錯／被 drop-in 覆蓋／props() 沒抓到那一行）。此時 (1) 的綠是假的，
-#      因為它證明不了「jit 剖面是必要的」，也證明不了「strict 剖面真的在守」。
+**期望矩陣**（#673 實機逐格量測，`cortex-job*`＝builder、`cortex-reviewer-job*`＝
+reviewer／planner；同一剖面下兩個角色**必須**逐格相同，不同代表帳號面有分岔）：
 
-# ✅ (3) 對照：原生 ELF 在 jit 剖面下也會動（證明差異只在 node 型身上）
-run_under cortex-job-jit claude; echo "rc=$?"
-#   期望：rc=0。這條不是驗收條件，是在 (2) 失敗時區分「MDWE 沒生效」與
-#   「toolchain 根本不可達」的分流點。
+| executor | `…-job@`（strict） | `…-job-jit@`（jit） |
+|---|---|---|
+| `claude` | **rc=0** `2.1.233 (Claude Code)` | **rc=0** 同左 |
+| `agy` | **rc=0** `1.1.13` | **rc=0** 同左 |
+| `codex` | rc=1、stdout 空 | **rc=0** `codex-cli 0.147.0` |
+| `copilot` | rc=1、stdout 空 | **rc=0** `0.0.330` |
 
-# ✅ (4) 剖面對應表：確認程式碼看到的分類與上面實測一致
+- **正向**（每個 executor 在**它自己的**剖面下）：`claude`／`agy` 看 strict 欄，
+  `codex`／`copilot` 看 jit 欄——**四格皆 rc=0，且版本與 operator 側逐字相同**
+  （第 4e 步那條）。
+- **負向對照（不可省略）**：`codex`／`copilot` 的 strict 欄**必須失敗**。
+  只驗 jit 成功等於什麼都沒驗。
+- **反向對照（#673 新增，同樣不可省略）**：`claude`／`agy` 的 **jit** 欄必須
+  rc=0。放寬剖面若弄壞了原本好的兩支，這是唯一看得見的地方。
+
+```bash
+# ✅ (2) 負向那兩格的**失敗原因**要對得上，不能只看 rc
+psc_run_under cortex-job /opt/cortex/toolchain/bin/codex --version
+#   期望 stderr 含：`Check failed: 12 == (*__errno_location ())` 與
+#                   `v8::internal::Runtime_CompileLazy`
+#   ——那是 MDWE：V8 期待 mmap 回 ENOMEM(12)，被擋成 EPERM(1)。
+#   ⚠️ **stderr 空**是另一回事，不是這一條：那代表行程被 SIGSYS 當場殺掉，
+#      ＝你的複本漏了 `SystemCallErrorNumber=EPERM`（#673 的原始誤判）。
+#      看到空 stderr 先回去查複本，不要開票說 executor 壞了。
+#   ⚠️ 若這兩格反而**印出版本** ⇒ strict 那份 unit 的 MDWE 沒生效（落檔錯／被
+#      drop-in 覆蓋）。此時正向的綠是假的：它證明不了 jit 剖面是必要的。
+
+# ✅ (3) 剖面對應表：確認程式碼看到的分類與上面實測一致
 python3 - <<'PY'
 from paulsha_cortex.trust_root import permgen
 for tool in permgen.EXECUTOR_TOOLS:
@@ -2490,9 +2598,29 @@ for tool in permgen.EXECUTOR_TOOLS:
           f"profile={p.profile_id:6s} unit={permgen.job_unit_stem(profile=p)}@.service")
 PY
 #   期望：codex/copilot → jit（cortex-job-jit@.service）；claude/agy → strict。
-#   ⚠️ 若實測 (1)(2) 與這張表對不上，**以實測為準**並回填 permgen.EXECUTOR_TOOLS
+#   ⚠️ 若實測 (1) 與這張表對不上，**以實測為準**並回填 permgen.EXECUTOR_TOOLS
 #      的 needs_node（那張表是唯一真相來源），不要在 runbook 裡各記一份。
+
+# ✅ (4) seccomp 過濾語意的不變式（#673）：與剖面**正交**的第二個維度
+python3 - <<'PY'
+from paulsha_cortex.trust_root import permgen
+for f in permgen.filtered_syscall_surfaces():
+    print(f"{f.program:9s} {','.join(f.syscalls):12s} fatal={f.fatal!s:5s} {f.detail}")
+PY
+#   期望：四列（codex／copilot／srt／openspec），**fatal 全部 False**。
+#   出現 fatal=True ⇒ 那支程式會在該面上靜默死（rc=1、stdout 與 stderr 皆空）。
+#   （permgen import 時就會擋下這種狀態，因此這裡看到的是「檢查有跑」的確認。）
+
+sudo rm -rf /var/lib/cortex/worktree/probe   # 收尾
 ```
+
+> **不要把 `pkey_alloc`／`@pkey`／`@sandbox` 加進 `SystemCallFilter=`。**
+> #673 量到：`@system-service` 確實過濾掉 V8 要用的 `pkey_alloc`（x86_64 330），
+> 但同一份 unit 上的 `SystemCallErrorNumber=EPERM` 讓它只回錯誤碼、不殺行程，V8
+> 走 fallback，四支 executor 全部正常。放行那支 syscall 是**放寬過濾器**且沒有
+> 量測支撐；`EPERM` **不放行任何 syscall**。沿用 #643 的先例：量到才改，改的是
+> 一份具名剖面，不是全域放寬——而這次量到的結論是**不用改**。
+> （順帶：`@sandbox` 對此症狀完全無效，實測加了照樣死。）
 
 ### 5-2c. 兩份 gate 模板（#629 gate 執行身分）
 
@@ -4630,6 +4758,11 @@ print("unit prefix contract OK:", prefix)
 PY
 
 # ✅ 正向：transient job 起得來且降到 cortex-builder
+# ⚠️ 這一條**刻意不是**加固面複本（因此不走 `psc_run_under`）：它驗的是「Manager 起得了
+#    transient unit 且降得到 cortex-builder」，＝ A 方案的**派工**能力，與加固面無關。
+#    A 方案本來就只送 `NoNewPrivileges=yes`（見 `job_runner`），這裡逐字反映那個現況。
+#    A 方案的完整加固建議清單另有出處：`trust_root unit --job-properties`。
+#    **不要**把這一條當成「真實加固面下的驗證」——那一族全部走第 4e 步的共用探針（#673）。
 sudo -u cortex-manager systemd-run --quiet --collect --pipe --wait \
   --unit=cortex-job-smoke-00000000.service \
   --uid=cortex-builder --gid=cortex-builder --service-type=exec \
