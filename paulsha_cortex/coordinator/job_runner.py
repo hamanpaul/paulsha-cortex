@@ -1559,8 +1559,8 @@ def malformed_job_command(command: object) -> str | None:
     ## 為什麼「其餘元素也必須非空」這條要拿掉（#687／#672 票 F）
 
     原判準是 `not all(argv)`，寫在 `fe7d5f5`（三分 UID 定案）——當時 spec 的唯一
-    產生者是 builder 的 `launcher`，它組出來的 argv 從來沒有空元素，所以這條**從未
-    被執行過的路徑證偽**。票 E（#686）把 planning 接上同一條通道之後，
+    產生者是 builder 的 `launcher`，它組出來的 argv 從來沒有空元素，因此這條判準
+    **從未被任何真實 argv 證偽過**。票 E（#686）把 planning 接上同一條通道之後，
     `planning_runtime._planning_argv()` 對 `claude` 產出的
     `["claude", "-p", …, "--tools", "", …]` 在**每一次** define 都撞上它：
 
