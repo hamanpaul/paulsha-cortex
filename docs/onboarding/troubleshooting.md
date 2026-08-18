@@ -138,7 +138,9 @@ cortex inspect service --instance cortex --json
 之後系統層的 `python3` import 不到它。
 
 ```bash
-sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -m pytest --version
+# HOME 由產生器導出，不要手寫絕對路徑（換 layout 時這裡會跟著動）
+GATE_HOME="$(python3 -c 'from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT as L; print(L.home_of("cortex-gate"))')"
+sudo -u cortex-gate env HOME="$GATE_HOME" python3 -m pytest --version
 #   `No module named pytest` ⇒ 就是這一條
 ```
 
@@ -154,7 +156,8 @@ sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -m pytest --version
 `~/.config/gh/` 不可見。
 
 ```bash
-sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status
+MANAGER_HOME="$(python3 -c 'from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT as L; print(L.home_of(L.manager_account))')"
+sudo -u cortex-manager env HOME="$MANAGER_HOME" gh auth status
 #   `You are not logged into any GitHub hosts.` ⇒ 就是這一條
 ```
 
