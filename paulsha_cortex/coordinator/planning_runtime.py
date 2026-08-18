@@ -26,6 +26,7 @@ from .model_identities import (
     ModelIdentity,
     load_model_identities,
     probe_agy_capability,
+    stdout_excerpt,
 )
 from .planning import required_heading_hint
 
@@ -803,12 +804,22 @@ def _extract_json_candidates(stdout: str, output_text: str | None) -> object:
                 if extracted is not None:
                     return extracted
                 if fallback_snippet is None:
-                    fallback_snippet = nested[:160]
+                    # 裁切交給下面的 `stdout_excerpt()`——由它統一單行化並在
+                    # 截斷處留 `…`，這裡先留全文（#701）。
+                    fallback_snippet = nested
             # 全部抽取失敗：絕不能 fall through 把整個 envelope dict 當成
             # 輸出本體回傳（修復前的行為）——那會讓下游驗證（例如
             # `validate_question_pack`）報出 `unexpected key: api_error_status`
             # 這種完全誤導的診斷。改為明確 raise，訊息帶散文片段方便除錯。
-            detail = fallback_snippet if fallback_snippet is not None else "<no string field>"
+            # #701：片段改走 `stdout_excerpt()`（#674 的既有函式）而非裸切
+            # ——模型的散文常含換行，裸切會把多行內容帶進單行 log／reason。
+            # 長度上限維持 160，`test_no_json_error_snippet_is_truncated` 的
+            # 「片段本身有界」不變。
+            detail = (
+                stdout_excerpt(fallback_snippet, limit=160)
+                if fallback_snippet is not None
+                else "<no string field>"
+            )
             raise ValueError(f"planning launcher result is not JSON: {detail}")
         return value
     # 2026-08-14 實測：agy 服務暫時性 503 時**印錯誤文字但 exit 0**
@@ -817,8 +828,13 @@ def _extract_json_candidates(stdout: str, output_text: str | None) -> object:
     # 被丟棄——operator 只看得到「no JSON object」，診斷得靠手動重現。帶上
     # 截斷片段後：(1) 503 當場可見；(2) 上游 `_is_planning_transient_service_failure`
     # 能據此把分類從 `content` 改判 `environment`，recover-planning 才有路。
+    #
+    # #701：片段同樣改走 `stdout_excerpt()`（單行化 ＋ 截斷處留 `…`）。`<empty
+    # output>` 這個哨兵**刻意保留**、不換成 `stdout_excerpt` 的 `<empty>`
+    # ——`test_no_json_error_with_empty_output_says_so` 以它為斷言對象，而且
+    # 「候選全空」與「候選只有空白」在這裡本來就是同一件事。
     snippet = next(
-        (candidate[:160] for candidate in candidates if candidate),
+        (stdout_excerpt(candidate, limit=160) for candidate in candidates if candidate),
         "<empty output>",
     )
     raise ValueError(f"planning launcher returned no JSON object: {snippet}")
@@ -1150,8 +1166,17 @@ def _invoke_json(
         )
     )
     if outcome.returncode != 0 or not isinstance(outcome.stdout, str):
+        # issue #701：修法前這句只有 executor/model 兩個常數——rc 是幾、模型／
+        # CLI 到底印了什麼，全部隨 invoker 的 tempdir 一起消失。questioner／
+        # secondary／integrator 三個 adapter 走的都是本函式，因此 #670／PR #674
+        # 為 probe 建立的 `stdout_excerpt()` 那條路，在這裡等於一次補齊三個。
+        #
+        # **只取 stdout，不取 stderr**——這是票 A（PR #688）已寫下、本票沿用的
+        # 邊界：stderr 是最容易夾帶路徑、env 與憑證錯誤原文的通道。
         raise ValueError(
-            f"planning launcher failed: {identity.executor}/{identity.model_id}"
+            f"planning launcher failed: {identity.executor}/{identity.model_id} "
+            f"rc={outcome.returncode} stdout="
+            + (stdout_excerpt(outcome.stdout) if isinstance(outcome.stdout, str) else "<no stdout>")
         )
     return _extract_json_candidates(outcome.stdout, outcome.output_text)
 

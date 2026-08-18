@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- planning 的模型輸出驗證失敗改為**逐欄可診斷**：question-pack 的六種以上失敗不再塌縮成同一句話（改報「第一個差異的索引／欄位／expected／got」與列數），secondary evidence／primary integration／plan frontmatter／required headings 的同型塌縮一併掃過；三個 adapter 共用的 `_invoke_json` 於 rc≠0 時沿用 #674 的 `stdout_excerpt()` 保存模型輸出（只讀 stdout、不讀 stderr）；差異文字經產生端遮罩，模型無法偽裝成分類標記（#701）。
 - R9 的 T1.3 斷言改為驗「operator CLI 做得到事」而非「binary 跑得起來」（兩個 subject 同時假失敗）；runbook 記錄 0818 兩 subject 實測結果並標明 T3.9 對 reviewer-planner 為已知追蹤項（#698）（#699）。
 - runbook 的「M2′ 之後仍未涵蓋的」清單更正兩條陳舊項（gate 執行身分 #629 已完成、reviewer 憑證 refresh 已由 #685 解決），並加上「not-covered 清單本身也是宣稱」的約束（#696）。
 
