@@ -861,6 +861,17 @@ class JobSpecContentTests(unittest.TestCase):
         self.assertTrue(leftovers[0].endswith(".json"), leftovers)
 
     def test_build_job_spec_rejects_relative_paths_and_empty_command(self) -> None:
+        """#687：`["bash", ""]` 那一格改成 `["", "-c", "true"]`（空的是 argv[0]）。
+
+        原判準是 `not all(argv)`＝「每個元素都必須非空」。票 E（#686）把 planning
+        接上同一條 spec 通道之後，`claude` 的 production argv
+        （`… --tools "" …`，CLI 成文 API「`Use "" to disable all tools`」）在**每一次**
+        define 都撞上它。判準因此收斂成「`argv` 非空且 `argv[0]` 非空」，其餘元素
+        依 POSIX 語意允許空字串；完整論證見
+        `job_runner.malformed_job_command()` 與 `tests/test_planning_job_argv_687.py`。
+        本格改測**現在仍應被擋**的那一種，不是把斷言刪掉。
+        """
+
         base = {
             "job_id": "j",
             "instance": "j-deadbeef",
@@ -872,7 +883,7 @@ class JobSpecContentTests(unittest.TestCase):
         }
         for override in (
             {"command": []},
-            {"command": ["bash", ""]},
+            {"command": ["", "-c", "true"]},
             {"working_directory": "relative/wt"},
             {"log_path": "relative.jsonl"},
         ):

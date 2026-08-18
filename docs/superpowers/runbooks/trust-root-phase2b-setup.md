@@ -62,6 +62,12 @@ OS** 的手動流程。
 - **A（三分）縮小「誰持有授權」**：polkit 的 subject 只有 `cortex-manager`，而
   `cortex-manager` **不跑任何模型程式碼**。prompt injection 可達的進程
   （builder／reviewer／planner job）因此**完全不在授權面上**。
+  > **這句在 #687（M2′）之後才對 planner 成立。** #615 之後到 #687 之前，
+  > define／brainstorm 的模型 CLI 就在 `cortex-manager` 的行程樹裡跑（#672），
+  > 而 planning 的 prompt 逐字含 untrusted issue 內容——「injection 可達的進程完全
+  > 不在授權面上」在那段期間是**假的**。現在的實機證據：一次 planning 呼叫期間
+  > `systemd-cgls -u cortex-manager.service` 只有 daemon ＋ `systemctl start --wait`
+  > 兩層，零 executor（第 5-6c 步）。
 - **B（template unit）縮小「授權能做什麼」**：被授權的唯一動作是 start／stop 一個
   **root-owned** template 的 instance；`User=cortex-builder`、加固段、`ExecStart=` 全部
   寫死在 root 擁有的檔案裡。**即使 `cortex-manager` 整個被攻陷，也改不了 `User=`、
@@ -79,14 +85,28 @@ OS** 的手動流程。
 | 里程碑 | 內容 | 本 runbook |
 |---|---|---|
 | **M1** | 三帳號建立、**檔案權限面完整三分**、builder job 經 `cortex-job@.service`／`cortex-job-jit@.service` 降權、polkit 只授 `cortex-manager` 對這**兩個具名模板** | ✅ 已於 2026-08-17 實機完成 |
-| **M2** | reviewer／planner job 也改經 template instance（`User=cortex-reviewer-planner`）落到自己的帳號 | ✅ 程式碼已落地（**#615**）。落檔與驗證步驟已收進本 runbook：第 5-2 步落**四份** unit、5-4 polkit 涵蓋四個字幹、5-5 補 reviewer 的 env、5-6b 正向、5-7 反向、8b-2 verdict 端到端 |
+| **M2** | **reviewer** 的模型 job 改經 template instance（`User=cortex-reviewer-planner`）落到自己的帳號 | ✅ 程式碼已落地（**#615**）。落檔與驗證步驟已收進本 runbook：第 5-2 步落**四份** unit、5-4 polkit 涵蓋四個字幹、5-5 補 reviewer 的 env、5-6b 正向、5-7 反向、8b-2 verdict 端到端。**⚠️ M2 不含 planner 的 define／brainstorm**，見下方 M2′ |
+| **M2′** | **planner（define／brainstorm）** 的模型呼叫改經同一份 template instance | ✅ 程式碼 **#682～#686**（#672 票 A～E）、切換與實機驗收 **#687**（票 F）。驗證步驟見第 5-6c 步 |
 
-**M2 之後可以宣稱的**：三個會跑模型的 persona（builder／reviewer／planner）**啟動面
-全部離開 Manager 的 UID**，且每一個的 `User=` 都寫死在 root-owned 的 template unit 裡
-——「**injection 可達的進程皆無 spawn 授權**」這條的**全稱**因此成立，D6 的「三分已
-生效」不再被 #615 blocking。
+**M2 之後可以宣稱的（逐字，不得放大）**：**builder 與 reviewer** 兩個 persona 的模型
+job **啟動面已離開 Manager 的 UID**，且兩者的 `User=` 都寫死在 root-owned 的 template
+unit 裡。
 
-**M2 仍未涵蓋的（不得順手宣稱）**：
+**M2 當時不成立、要到 M2′（#687）才成立的**：
+
+- 「**三個**會跑模型的 persona 啟動面全部離開 Manager 的 UID」——**M2 之後這句是假的**。
+  planner 的 define／brainstorm 走的是 `planning_runtime._invoke_json()`，一條**完全
+  不經過 `SubprocessLauncher`** 的 code path，#615 一行都沒有碰到它（#672 的證據鏈）。
+- 「**injection 可達的進程皆無 spawn 授權**」這條的**全稱**——planning 的 prompt 逐字
+  含 untrusted issue 內容，而它在 M2′ 之前就在 `cortex-manager`（唯一的 polkit
+  subject）的行程裡跑。全稱在那之前**恰恰不成立**。
+- 「D6 的**三分已生效**」——對 planner 這一支在 M2′ 之前不成立。
+
+> **這三句在 #615 當時就被寫進本節，是本 repo「為了收尾而宣稱過頭」的樣本案例**：
+> 下面那份「不得順手宣稱」清單看起來窮舉，卻漏掉了最大的一項。#687 逐條更正它們，
+> 並補上 planner 那一條（見下）。M2′ 的實機證據見第 5-6c 步。
+
+**M2′ 之後仍未涵蓋的（不得順手宣稱）**：
 
 - **gate 執行身分**（#629）：gate 命令在 builder 完全掌控的 worktree 裡跑，`pytest`
   會載入該 worktree 的 `conftest.py` ⇒ 執行者取得任意程式碼執行。**刻意不掛在
@@ -102,6 +122,14 @@ OS** 的手動流程。
 - **reviewer 的工作樹位置**：仍是 Manager provision 的 review worktree
   （`<來源樹>/.psc-review-worktrees/…`），不是 per-job clone。reviewer 是 read-only
   契約，對它只需**唯讀**可達；per-job clone 化屬 #623／#648 的範圍。
+- **planner 的 `codex` executor 在 job 模式下不 ready**（#687 實測）：`codex exec --json`
+  的第二輸出候選 `-o last.json` 落在 job 的 `PrivateTmp` 私有 `/tmp`，Manager 讀不到
+  ⇒ `_extract_json` 只剩單一候選 ⇒ probe 落 `planning-output-malformed`。這是票 E
+  （#686）**已具名的安全退步 R-2**，不是新缺口；淨效果是 planning 的異質性由
+  `claude`（anthropic）＋`agy`（google）承擔，`codex` 這一格落選並在拒因表上現形。
+- **`cg` executor 結構性不可用**：未登記於 `EXECUTOR_HARDENING_PROFILE` ⇒
+  `prepare_systemd_template` fail-closed ⇒ probe 永遠 not ready。**這是設計要的**
+  （剖面表是白名單），拒因表逐字記錄它。
 
 ---
 
@@ -484,7 +512,7 @@ PY
 
 | 帳號 | 跑什麼 | durable state owner | 持 spawn 授權（polkit subject） |
 |---|---|:--:|:--:|
-| `cortex-manager` | Manager ＋ monitor。**不跑任何模型程式碼** | ✔ | ✔ |
+| `cortex-manager` | Manager ＋ monitor。**不跑任何模型程式碼**（此欄自 **#687** 起才對**全部**執行面成立：builder＝#603／#584、reviewer＝#615、**planner 的 define／brainstorm＝#687**。passwd 的 `no model code` 註記在此之前對 define 階段是假的——見 #672） | ✔ | ✔ |
 | `cortex-reviewer-planner` | reviewer ＋ planner 模型 job | ✘ | ✘ |
 | `cortex-builder` | builder 模型 job（會跑 untrusted repo code） | ✘ | ✘ |
 | **`cortex-gate`**（#629） | operator 宣告的 gate 命令（`PSC_GATE_CMD_*`）。**不跑模型**，但跑 builder 工作樹裡的 `conftest.py`／plugin ⇒ 同樣是 untrusted 執行 | ✘ | ✘ |
@@ -2632,7 +2660,7 @@ for d in p.deferred_run_dependencies(): print('-', d.name, '→', d.disposition)
 | (a) | **polkit 規則** | `/etc/polkit-1/rules.d/49-cortex-downgrade.rules` | root:root 0644 | 只有 `cortex-manager`、只有 `start`／`stop`、只有四個**具名**模板（`cortex-job@` / `cortex-job-jit@` / `cortex-reviewer-job@` / `cortex-reviewer-job-jit@`，皆 `*.service`）。**不授權 `manage-units` 的 transient 建立** |
 | (b) | **template unit ×4** | `/etc/systemd/system/cortex-job@.service`（builder, strict）<br>`cortex-job-jit@.service`（builder, jit，#643）<br>`cortex-reviewer-job@.service`（reviewer＋planner, strict，#615）<br>`cortex-reviewer-job-jit@.service`（reviewer＋planner, jit） | root:root 0644 | `User=` 寫死、加固段寫死、`ExecStart=` 寫死。呼叫端**選不了 UID、傳不了屬性**。四份的差異只有兩軸：加固剖面（`MemoryDenyWriteExecute`）與帳號（`User=`／HOME／RWP），見 5-2 |
 | (c) | **shim** | `/opt/cortex/bin/cortex-job-shim` | root:root 0755 | `ExecStart=` 的實體。argv 的**形狀**由 root-owned 程式從 Manager-owned job-spec 導出；Manager 只能給參數 |
-| — | **三分帳號事實** | — | — | polkit 的 subject 只有 `cortex-manager`，而它**不跑任何模型程式碼**；injection 可達的 job 帳號完全不在授權面上 |
+| — | **三分帳號事實** | — | — | polkit 的 subject 只有 `cortex-manager`，而它**不跑任何模型程式碼**（builder＝#603／#584、reviewer＝#615、**planner 的 define／brainstorm＝#687**；三票缺任一則本格不成立）；injection 可達的 job 帳號完全不在授權面上 |
 
 三者缺一都不成立：
 - 少了 (a)，`cortex-manager` 起不了 job（fail-closed，不會退回同 UID）。
@@ -3452,9 +3480,19 @@ exec /opt/cortex/venv/bin/python -c "import os; from paulsha_cortex.coordinator 
 > **不是**讓 builder 自己 `login`（toolchain 未落位前 `login` 這個動作本身就跑不起來，
 > 而且 job 的 HOME 是 root-owned，CLI 也建不了 `auth.json`）。Manager 不會在執行期把
 > 自己的憑證傳過去——job 的登入態是一次性的部署動作。
-> **#615 M2 起**：`PSC_JOB_RUNNER` 對**三個** persona 都生效。persona 不再決定
+> **#615 M2 起**：`PSC_JOB_RUNNER` 對**走 `SubprocessLauncher` 的三個 persona**
+> （builder／reviewer／workflow lane 的 planner 卡）都生效。persona 不再決定
 > 「降不降權」，只決定**降到哪個角色**（builder／review）——判定點在
 > `launcher.SubprocessLauncher._job_role()`，由 launcher 的建構契約導出，job 側碰不到。
+>
+> **#687（M2′）起有第二個消費者，而它不在 launcher 上**：define／brainstorm 的
+> planning **不建立 `SubprocessLauncher`**，它讀同一個 `PSC_JOB_RUNNER`，經
+> `planning_runtime._select_planning_invoker()` 選 `JobPlanningInvoker`。
+> 兩處共用**同一支** `job_runner.resolve_runner_mode()`（刻意不新增
+> `PSC_PLANNING_INVOKER` 之類的第二個開關），但**選擇點有兩個**——
+> 「判定點只有 `_job_role()` 一個」這句在 #687 之後要讀成「launcher 這條路徑上
+> 只有一個」。這正是 #672 之所以能存在三個月而沒被發現的機制：所有人都在讀
+> launcher，而 planner 從來不經過它。
 >
 > **角色判定的三個來源（缺一即誤判）**：`review_only`（workflow lane reviewer）、
 > `read_only`（planner）、**`verdict_spool_dir is not None`（slice lane 的 foreign
@@ -3681,10 +3719,15 @@ sudo journalctl -u "cortex-job@$JOB.service" -n 20 --no-pager
 sudo -u cortex-manager systemctl stop "cortex-job@$JOB.service"; echo "exit=$?"   # 期望 0
 ```
 
-### 5-6b. 正向驗證（**reviewer／planner 模板**，#615 M2）
+### 5-6b. 正向驗證（**reviewer 模板**，#615 M2）
 
 > **與 5-6 逐條同構，只換模板名與帳號。** 它要證明的是一件 M1 完全沒有證據的事：
 > reviewer 的 job **不是**以 `cortex-manager` 跑的，也**不是**以 `cortex-builder` 跑的。
+>
+> **標題原本寫「reviewer／planner 模板」，#687 改掉了。** 本節的 spec 由手工寫、
+> 走 builder spool、驗的是 reviewer 面；planner 的 define／brainstorm 那一半在本節
+> **沒有任何證據**（它連 `job-specs/reviewer/` 都沒寫過一個檔——#686 查證、#687 於
+> 實機複驗：切換當天該目錄為空）。planner 的正向驗證是**第 5-6c 步**。
 >
 > 同 5-6 的誠實邊界：這一段是手工 spec，**只驗隔離、驗不了功能**；功能面由第 8b-2 步
 > 的真實 dispatch 驗。
@@ -3763,6 +3806,85 @@ sudo rm -rf /var/lib/cortex/coordinator/review-verdicts/probe
 sudo rm -f "/var/lib/cortex/coordinator/job-specs/reviewer/$RJOB.json" \
            "/var/lib/cortex-reviewer-planner/cache/$RJOB.log"
 ```
+
+### 5-6c. 正向驗證（**planner／define 端到端**，#687 M2′）
+
+> **這一節是本 runbook 的新增缺口**（#687 查到）：#615～#686 之間，全文對
+> `define`／`brainstorm` **零覆蓋**——5-6b 驗 reviewer、8b-2 驗 verdict 通道，
+> 沒有任何一步碰過 planning 這條 code path。缺口的具體代價是 `job-specs/reviewer/`
+> 在切換當天仍是**空目錄**：那條通道從來沒有被端到端跑過，而所有人都以為它跑過了。
+>
+> **與 5-6b 的差別是「誰組 spec」**：5-6b 的 spec 由 operator 手工寫進 spool，
+> 因此它驗得了加固面與身分、**驗不到 Manager 側的 `build_job_spec()`**。5-6c 走的是
+> daemon 自己的派工路徑，這一段才是 #687 唯一撞到的那個阻斷點（`claude` 的
+> `--tools ""` 撞上 `build_job_spec` 的 `not all(argv)`）。
+> **教訓可推廣**：`psc_run_under`／`unit_replica_properties()` 複製的是**加固面**，
+> 它證明得了「executor 在那個沙箱下跑得起來」，證明不了「Manager 派得出那個 job」。
+> D13 沒有錯，它只是不涵蓋這一維——**兩維都要有實跑證據**。
+
+```bash
+# 前置：`PSC_JOB_RUNNER=systemd-template` 已在 EnvironmentFile 內（5-5），daemon 已重啟。
+#       planning 與 reviewer 共用同一份模板 unit，因此 5-2／5-4 之外零額外部署。
+
+# (1) 確認 planning **選到的是 job invoker**——這是「切換有沒有生效」的機械答案，
+#     不要靠讀 EnvironmentFile 推論（那只說明變數存在，不說明它被誰消費）。
+sudo -u cortex-manager env PSC_JOB_RUNNER=systemd-template /opt/cortex/venv/bin/python3 -c \
+  "from paulsha_cortex.coordinator.planning_runtime import _select_planning_invoker
+print(type(_select_planning_invoker({'PSC_JOB_RUNNER':'systemd-template'})).__name__)"
+#   期望逐字：JobPlanningInvoker
+#   ⛔ 印出 InProcessPlanningInvoker ⇒ 切換沒生效，**停下來**。
+#   ⛔ 拋例外 ⇒ `PSC_JOB_RUNNER` 是 `systemd-run` 或非法值：那條路徑刻意 fail-closed，
+#      **不會**靜默退回行程內執行（#686）。
+
+# (2) 觸發一輪真實 define，並在**同時**取樣 Manager 的 cgroup。
+#     ⚠️ 這是正常的工作流動作（`resume` 對 needs_human 的 define run 重呼叫
+#        workflow_starter），不是手改 durable state。
+( cortex work resume <work_id> --repo <owner>/<repo> & )
+for i in $(seq 1 40); do
+  echo "[$(date -u +%H:%M:%S)] $(sudo systemd-cgls -u cortex-manager.service --no-pager \
+      | grep -cE '(codex|claude|agy|copilot)') executor(s) in manager cgroup | jobs: \
+      $(sudo systemctl list-units 'cortex-*job*' --all --no-legend --plain | awk '{print $1}' | tr '\n' ' ')"
+  sleep 3
+done
+#   期望：**executor 計數恆為 0**，而 job 欄位依序出現
+#         cortex-reviewer-job@plan-<run>-probe-N-…／-questioner-N-…／-secondary-N-…／
+#         -integrator-N-…（codex 那格是 `-jit` 字幹）。
+#   期望 Manager cgroup 裡**只有三層**：daemon ＋ `bash -c systemctl start --wait …`
+#         ＋ `systemctl start --wait …`。那兩層是 #604 的 exit 記帳 shell，不是模型。
+#   ⛔ 出現任何 executor 可執行檔 ⇒ 切換沒有一次到位，停下來。
+
+# (3) 逐個 job 的身分（root 端佐證，不靠 job 自證）
+sudo journalctl --since "-10 minutes" -o short-iso \
+  | grep -oP 'cortex-reviewer-job(-jit)?@plan-[a-z0-9-]+\.service' | sort -u \
+  | while read -r u; do echo "$u user=$(systemctl show "$u" -p User --value)"; done
+#   期望：每一行 user=cortex-reviewer-planner。
+#   ⚠️ **不要**改用 job 自己印出的 `id`——被驗方不得在自己的進程裡產生自己的驗收證據
+#      （#628／#540）。`systemctl show -p User` 讀的是 root-owned unit。
+
+# (4) probe 快取：指紋的 `job_runner_mode` 必須全部是 systemd-template
+sudo python3 -c "
+import json;d=json.load(open('/var/lib/cortex/coordinator/planning-probe-cache.json'))
+print({v['fingerprint_inputs']['job_runner_mode'] for v in d['items'].values()})
+for k,v in sorted(d['items'].items()): print(k, v['ready'], v['hardening_profile'], v['unit'])"
+#   期望：{'systemd-template'}；每一格的 unit 是 cortex-reviewer-job@.service
+#         （agy／claude＝strict）或 cortex-reviewer-job-jit@.service（codex＝jit）。
+#   ⛔ 混到 'direct' ⇒ 有一半的結論是開發機環境背書的，清掉快取重探（#684 的指紋
+#      本來就會讓它自動失效；混用代表指紋算錯了）。
+
+# (5) `job-specs/reviewer/` 用過了沒有——切換前它是空的
+sudo ls -la /var/lib/cortex/coordinator/job-specs/reviewer/
+#   期望：跑完之後是空的（spec 是 create-then-consume），但目錄 mtime 已更新。
+#   要看內容請在 (2) 的取樣迴圈裡加一行 `sudo ls` ——spec 的生命週期以秒計。
+```
+
+**0818（#687）實機結果**：`_select_planning_invoker` → `JobPlanningInvoker`；
+一輪 define 落成 6 個模板 instance（`probe-1`／`probe-2`／`probe-3`(jit)／
+`questioner-5`／`secondary-6`／`integrator-7`），全部 `User=cortex-reviewer-planner`；
+Manager cgroup 全程零 executor；probe 快取五格的 `job_runner_mode` 全為
+`systemd-template`；`no-heterogeneous-planner` 消失（primary＝claude/anthropic、
+secondary＝agy/google）。**未涵蓋**：該 run 的 brainstorm 因 `blocking-decision`
+（planner 誠實回報來源材料不足）落 `content` 級失敗，因此 build／review 兩階段在這一輪
+**沒有被執行到**——見 PR #687 的誠實邊界段。
 
 ### 5-7. 反向驗證（**11 條全部必須被拒**，＋#643 的第 12 條）
 
@@ -3956,7 +4078,7 @@ sudo systemctl reset-failed "cortex-job@*" "cortex-job-jit@*" 2>/dev/null || tru
 | 舊殘餘 | A+B 之後 |
 |---|---|
 | 「polkit 看不到 `User=`，授權後可請求任意 UID」 | **不再成立**——polkit 根本沒授權 transient 建立；唯一能起的是 root-owned template 的 instance，`User=` 在 root-owned 檔內寫死。5-7 (2)(3) 實測 |
-| 「跑模型的 reviewer／planner 與 Manager 併帳，其中任一被攻陷即取得 grant」 | **不再成立**——三分把它們移到 `cortex-reviewer-planner`；polkit subject 只有 `cortex-manager`，而它**不跑模型程式碼**。5-7 (9) 實測 |
+| 「跑模型的 reviewer／planner 與 Manager 併帳，其中任一被攻陷即取得 grant」 | **不再成立**——三分把它們移到 `cortex-reviewer-planner`；polkit subject 只有 `cortex-manager`，而它**不跑模型程式碼**。reviewer 由 #615 落地（5-7 (9) 實測）、**planner 的 define／brainstorm 由 #687 落地**（5-6c 實測）。**#615～#687 之間這一格對 planner 是假的**：帳號映射面成立，但執行面沒有——模型 CLI 仍在 `cortex-manager` 的行程樹裡 |
 | 「授權帳號被攻陷即可提權」 | **降級為「無法向上」**——`cortex-manager` 即使被完全攻陷，也改不了 `User=`（unit 是 root-owned）、傳不了屬性（transient 被拒）、換不掉 argv 入口（shim 是 root-owned）。它能做的上界是「以 `cortex-builder` 身分起 job」，而那正是設計要它做的事 |
 
 **polkit 粗粒度仍在，但已不構成提權**：規則只能看到 unit 名與 verb，**這在 A+B 下
@@ -3973,7 +4095,9 @@ sudo systemctl reset-failed "cortex-job@*" "cortex-job-jit@*" 2>/dev/null || tru
 | **Manager 自身邏輯被攻陷** | Manager 程式碼路徑被誘導寫出惡意 job-spec | root-owned shim 限定 argv 形狀（5-3）；spec 的 schema 是**白名單**且身分欄位 fail-closed（寫端 `build_job_spec()`、讀端 `job_shim.load_spec()` 各驗一次）；job 仍降到 `cortex-builder`、拿不到 token | shim 只能保證「身分／入口不可選」，**不**保證 command 內容良性——惡意 spec 仍可讓 builder 跑任意命令（上界＝builder 權限）。這條要靠 Manager 端的派工邏輯與 R9 族 2 的檔案邊界共同壓住 |
 | **operator 帳號** | 有 `sudo`，可改任何東西 | 設計上信任邊界之外（本 runbook 全部 root 操作都由 operator 親自輸入） | 不在本階段範圍 |
 | **polkit 不可用** | polkit 掛掉 ⇒ 全部 job 起不來 | fail-closed（安全但功能全停）；執行前提第 6 項＋WSL2 段第 5 項複驗 | 需監控，否則表現為「靜默停擺」 |
-| ~~**M2 未完成**~~ | ~~reviewer／planner 仍在 Manager 行程內以 `cortex-manager` 身分跑~~ | **已關閉（#615）**：三個會跑模型的 persona 啟動面全部離開 Manager 的 UID；5-6b／8b-2 為其驗收 | — |
+| ~~**M2 未完成（reviewer 這一半）**~~ | ~~reviewer 仍在 Manager 行程內以 `cortex-manager` 身分跑~~ | **已關閉（#615）**：**reviewer** 的模型 job 啟動面離開 Manager 的 UID；5-6b／8b-2 為其驗收 | — |
+| ~~**M2′ 未完成（planner 這一半）**~~ | ~~planner 的 define／brainstorm 仍在 Manager 行程內以 `cortex-manager` 身分跑模型~~ | **已關閉（#687／#672 票 F）**：`planning_runtime` 的四個 adapter 與全部 probe 改經 `JobPlanningInvoker` → `cortex-reviewer-job@`；`PSC_JOB_RUNNER=systemd-template` 下 `_select_planning_invoker()` 對 `direct` 之外的退路 fail-closed。驗收＝第 5-6c 步 | — |
+| ⚠️ **原本這一列寫的是「已關閉（#615）：三個會跑模型的 persona 啟動面全部離開 Manager 的 UID」** | 那句話對 planner **不成立**——#615 只改了 `SubprocessLauncher`，而 define／brainstorm 根本不走它 | #687 把它拆成上面兩列，各自指名自己的票與驗收步驟 | 這一列保留為**紀錄**：一句過寬的「已關閉」讓這個缺口在殘餘風險表上隱形了三天 |
 | **gate 執行身分**（#629） | gate 命令在 builder 掌控的 worktree 裡跑，`pytest` 載入該 worktree 的 `conftest.py` ⇒ 執行者取得任意程式碼執行 | 降權模式下 job **不跑 gate**（`_should_run_gates()` 對三個 persona 皆 False），build 卡對 `require_ledger` **fail closed**——沒有獨立證據就不採信 | 需要**第四個帳號**（既非 builder 也非 reviewer／planner，更非 Manager）。**刻意不掛在 `cortex-reviewer-planner` 上**：那會讓被攻陷的 builder 經由 gate 執行影響寫 verdict 的帳號，抵銷 #638／#639。屬 #629 |
 | **reviewer 憑證無法就地 refresh** | `cortex-reviewer-planner` 的 executor 憑證不在其模板 unit 的 `ReadWritePaths=` 內 | 憑證檔本身由 root 於第 4e 步放置並 chown（0600），父目錄 root-owned；讀取不受影響 | token 過期需 operator 重跑第 4e 步。登記表目前只登記 `builder-executor-credential` 一份，理由見該資產 note（二分部署上登記第二份會讓 Manager unit 的 RWP 指向不存在的路徑而起不來） |
 

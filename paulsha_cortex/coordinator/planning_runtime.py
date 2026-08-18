@@ -1345,7 +1345,12 @@ def build_production_planning_runtime(
     2. `runner=`——注入 process runner，等同「用 in-process invoker 跑」。
        這是既有呼叫端與大量既有測試的用法，逐字保留。
     3. 兩者皆無（＝daemon 的實際呼叫形態）——由 `_select_planning_invoker`
-       依 `PSC_JOB_RUNNER` 決定。**這是全庫唯一的執行後端選擇點。**
+       依 `PSC_JOB_RUNNER` 決定。**這是 planning 這條路徑唯一的執行後端選擇點。**
+       （#687 的範圍限定：本行原文寫「全庫唯一」，那與 `launcher._job_role()`
+       docstring 的「唯一決定點」互相矛盾——兩者其實是**兩條 code path 各一個**
+       選擇點，共用同一支 `job_runner.resolve_runner_mode()`。全庫唯一的是那支
+       **解析函式**，不是選擇點。#672 的三個月盲區正是「以為只有 launcher 一條」
+       造成的，因此這兩個 docstring 都改成帶範圍的說法。）
 
     四個 adapter 與兩種 probe 全部走同一個 invoker——票 E 因此只換一個物件，
     不必再碰任何呼叫端。

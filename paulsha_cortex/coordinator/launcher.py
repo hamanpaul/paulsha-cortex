@@ -1206,8 +1206,17 @@ class SubprocessLauncher:
         **三個判準，缺一不可**——這是 #615 實作時發現的一個真缺口：
 
         1. `review_only`＝workflow lane 的 reviewer（`as_review_only()`）；
-        2. `read_only`＝planner（`as_read_only()`）；
+        2. `read_only`＝**workflow lane 的 planner 卡**（`as_read_only()`）；
         3. `verdict_spool_dir is not None`＝**slice lane 的 foreign reviewer**。
+
+        **第 2 條的範圍要看清楚（#672／#687）**：它涵蓋的是 workflow lane 上
+        `persona == "planner"` 的那幾張卡（`manager._specialize_workflow_launcher()`
+        呼叫 `as_read_only()`）。**define／brainstorm 的 planning 不在其中**——那條路
+        根本不建立 `SubprocessLauncher`，它走 `planning_runtime._invoke_json()`。
+        這個 docstring 曾經是「planner 已經降權了」這個假直覺的來源之一：讀完三個
+        判準，很自然會以為 planner 全部路徑都在本函式的射程內。它不是。
+        planning 那一條由 `planning_runtime._select_planning_invoker()` 決定
+        （#686 接上 `JobPlanningInvoker`、#687 切換）。
 
         第 3 條容易漏掉，而漏掉的後果最嚴重。slice lane 的 foreign reviewer 走的是
         `manager._spool_writable_launcher()` → `as_verdict_spool_writer()`，而那支
@@ -1225,10 +1234,17 @@ class SubprocessLauncher:
         return bool(self._review_only or self._read_only or self._verdict_spool_dir)
 
     def _job_role(self) -> str:
-        """本 launcher 的降權 job 角色（#615 M2）——**唯一決定點**。
+        """本 launcher 的降權 job 角色（#615 M2）——**launcher 這條路徑的唯一決定點**。
 
         reviewer 與 planner 同屬 `review` 角色，因為三分方案把它們映到**同一個**
         OS 帳號（`cortex-reviewer-planner`）；其餘為 `builder`。
+
+        **「唯一」的範圍限定（#687）**：本函式原本寫「唯一決定點」，那在 #686 之後
+        不再是全稱——`planning_job.JobPlanningInvoker` 是第二個消費者，它把角色**在
+        建構期固定**成 `JOB_ROLE_REVIEW`（不經本函式，也不從 spec 導出）。兩處共用
+        同一組角色常數與同一支 `resolve_runner_mode()`，但「哪些程式碼決定角色」
+        的答案是**兩個地方**。這不是缺陷，是兩條 code path 的事實；把它寫清楚，是
+        因為 #672 的三個月盲區正是由「大家都在讀 launcher」造成的。
 
         **角色由 launcher 的建構契約導出，不由 job 導出**：三個判準
         （見 :meth:`_is_review_persona`）在 `__init__` 就固定，此後 immutable。
@@ -1249,9 +1265,16 @@ class SubprocessLauncher:
         **#615（M2）移除了第二個條件。** 在此之前這裡對 `review_only`／`read_only`
         回 `None`，於是 reviewer／planner 仍在 Manager 行程內以 Manager 帳號執行
         ——A+B 裁決的核心論述「injection 可達的進程皆無 spawn 授權」因此**只對
-        builder 成立**，而 reviewer 正是寫 verdict 的那一個。M2 之後三個會跑模型的
-        persona 全部離開 Manager 的 UID，persona 只決定**哪一個角色**
-        （:meth:`_job_role`），不再決定「降不降權」。
+        builder 成立**，而 reviewer 正是寫 verdict 的那一個。M2 之後**經過本
+        launcher 的**派工，persona 只決定**哪一個角色**（:meth:`_job_role`），
+        不再決定「降不降權」。
+
+        **原文寫的是「M2 之後三個會跑模型的 persona 全部離開 Manager 的 UID」，
+        #687 更正了它。** 那句話的射程被誤讀成全稱：define／brainstorm 的 planning
+        不經過本 launcher，因此 #615 對它零效果，它到 #672 票 A～F（#682-#687）才
+        離開 Manager 的 UID。本函式今天能宣稱的，逐字是「**走本 launcher 的**派工
+        全部降權」。全稱要合上 `planning_runtime._select_planning_invoker()` 那一半
+        才成立。
 
         `systemd-run`（A 案）與 `systemd-template`（B 案，0816 第三輪裁決）在
         launcher 這一層共用**完全相同**的 env 白名單與 `bash -c` 決定，差別只在
