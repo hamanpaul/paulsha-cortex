@@ -533,11 +533,109 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "（`cortex-svc`），登記第二份會讓 Manager unit 的 `ReadWritePaths` 出現一條"
             "**二分部署裡根本不存在**的 HOME 路徑——systemd 對不存在的 `ReadWritePaths` "
             "目標直接讓 unit 起不來，等於用一個 M2 才需要的資產弄壞一個現存的部署形態。\n"
-            "**機制本身已經是 per-account 的**：`PathLayout.executor_credential_of()` 吃"
-            "任意帳號，`scaffold_directories()` 也已為**每一個** job 帳號建出 root-owned "
-            "的憑證父目錄（因此 `cortex-reviewer-planner` 那一份憑證照同一條規則落位、"
-            "同樣受保護）。M2（#615）把 reviewer／planner 移上模板 unit 時，登記表補第二"
-            "列即可，產生器一行都不必改。"
+            "**#685 更正「補第二列即可」這句話**（原文寫於 #640，前提已被 #686 的實測"
+            "推翻）：reviewer／planner 那一份**不能**照抄本形態。#686 在完整 reviewer "
+            "unit 沙箱下實測，codex 需要 `$CODEX_HOME`（預設 `~/.codex`）**整個目錄**可寫"
+            "——只放行 `auth.json` 一個檔時它連起都起不來（`failed to initialize in-process "
+            "app-server client: Read-only file system`），且症狀與 cwd 無關。因此那個帳號"
+            "改走 `reviewer-planner-codex-state`（`CredentialShape.HOME_REDIRECT_TREE`）。\n"
+            "**builder 維持本形態不動**：這份部署已存在、runbook 第 4e-2 步有「建不了新檔／"
+            "刪不掉／換不掉」的反向驗證，而改它會同時賣掉 `codex-hooks` 的 enforcement"
+            "（同目錄下的 root-owned 檔擋不住一個擁有該目錄的 job）——那是 operator 的"
+            "裁決（U-9），不是本票能順手做的事。**代價已知並記錄**：builder 在模板 unit 下"
+            "跑 codex 會撞到與 #686 同一條 `$CODEX_HOME` 唯讀阻斷，見 `deferred` 與 runbook。"
+        ),
+    ),
+    # ---- reviewer／planner 帳號的三份登入態（#685／#672 票 D；U-4 追認雙 domain）----
+    #
+    # 三項同形，因此共用這一段說明，各自的 note 只寫「這個 executor 特有的部分」。
+    #
+    # **形狀**：`permgen.CredentialShape.HOME_REDIRECT_TREE`——HOME 底下一條 root-owned
+    # symlink，指向該帳號 `cache` 裡的一格。三條性質同時成立，而且都是機械結果：
+    #
+    #   1. **不新增任何可寫面**：`cache` 早已在 reviewer 模板 unit 的 `ReadWritePaths` 內
+    #      （`PathLayout.job_extra_write_paths`），`_minimize()` 因此吃掉目標路徑 ⇒ unit 的
+    #      `ReadWritePaths=` **逐字不變**。executor 能做的事，該帳號今天就已經能做。
+    #   2. **job 換不掉指向**：symlink 落在 root-owned 的 HOME（`scaffold_directories()`
+    #      產出 root:root 0755），換 symlink 需要對父目錄的寫入權。
+    #   3. **writers 只有 INSTALLER**：`required_write_targets()` 只收 writer 面，因此
+    #      這三項機械地不會產生任何 RWP 條目，也不會產生任何跨帳號 ACL。
+    #
+    # **為什麼不是「把憑證檔登記成葉節點」**（#640 對 builder 的做法）：#686 實測 codex
+    # 與 agy 要寫的都是**一整棵**狀態樹，檔名還帶版本序號（`state_5.sqlite`）——逐項列舉
+    # 會在下一次 CLI 升版時無聲失效。claude 同理。
+    #
+    # **U-4 的追認範圍**：這三格代表 `cortex-reviewer-planner` 同時持有 openai／google／
+    # anthropic 三個 provider 的登入態。design 的安全退步 **R-3**（該帳號被攻陷時多邊
+    # token 一起失，而 planner 正是吃 untrusted issue 內容的角色）是**明文接受的有界
+    # 殘餘風險**——它在後續任何「planner 攻擊面」討論中不得被當成未知。
+    #
+    # **本形狀新增的退步（R-6，明講）**：目標樹由 job 帳號擁有 ⇒ 樹裡的 token 葉檔可被
+    # 該 job 刪除或替換（builder 的 `IN_PLACE_FILE` 擋得住「刪／換」，這裡擋不住）。
+    # 影響面限於該帳號自己的登入態；換到的是 codex／claude **能不能起得來**。直接後果：
+    # 同一棵樹裡**不得**再放任何 root-owned 的 enforcement 檔——`reviewer-planner-codex-hooks`
+    # 因此仍留在 `permgen.deferred_run_dependencies()` 並升為 **U-9**。
+    TrustRootAsset(
+        "reviewer-planner-codex-state", _T0, _JV, None,
+        (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
+        note=(
+            "`<HOME>/.codex` → `<HOME>/cache/codex` 的 root-owned symlink：codex 的 "
+            "`$CODEX_HOME` 整棵，token 葉檔是它底下的 `auth.json`。\n"
+            "**為何是整棵而不是一個檔**（#686 實測，design 未預期）：唯讀時 codex 回 "
+            "`Error: failed to initialize in-process app-server client: Read-only file "
+            "system (os error 30)`；把 cwd 換成可寫的 `/tmp` **症狀完全相同**，維持唯讀 "
+            "cwd 只把 `CODEX_HOME` 指到可寫目錄則 **rc=0、輸出正確**。阻斷點是 "
+            "`CODEX_HOME`，不是 cwd。它在底下建 `state_5.sqlite`／`logs_2.sqlite`／"
+            "`queue_1.sqlite`／`memories_1.sqlite`／`sessions/`／`skills/`／`plugins/`／"
+            "`thread-writer-locks/`／`models_cache.json`／`installation_id`。\n"
+            "**為何不用 `CODEX_HOME=` 這個環境變數而用 symlink**：env 覆寫要經 "
+            "`job_runner.build_job_env()` 的白名單，那是第二條要維護的放行面；而 symlink "
+            "讓 executor 的**預設**路徑解析就落在對的地方，job 側零改動。代價是 "
+            "`~/.codex` 這個名字被佔用（見上方 R-6 與 U-9）。"
+        ),
+    ),
+    TrustRootAsset(
+        "reviewer-planner-agy-state", _T0, _JV, None,
+        (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
+        note=(
+            "`<HOME>/.gemini` → `<HOME>/cache/gemini` 的 root-owned symlink：agy 的可寫"
+            "狀態樹，token 葉檔是 `antigravity-cli/antigravity-oauth-token`。**U-7 的裁決"
+            "就是這一項**（design 的選項 (a)：登記成 symlink 類資產）。\n"
+            "agy 執行時往 `~/.gemini/antigravity-cli/` 寫 conversations SQLite、crashes、"
+            "presence lock、builtin skills，並**自解出一個 17 MB 的可執行檔** "
+            "`bin/webm_encoder`——這正是「單檔憑證」表達不了的那一類。\n"
+            "**這是三項裡唯一端到端實測全綠的一格**：0818 以 `cortex-reviewer-planner` "
+            "身分、在逐條複製落檔 unit 全部 property 的沙箱下跑 "
+            "`agy --print … --mode plan --sandbox --model gemini-3.1-pro-high`，rc=0、輸出"
+            "逐位元等於 `probe_agy_capability()` 的 expected；#686 以 `JobPlanningInvoker` "
+            "端到端複驗同一結論。**0818 的部署是手動落位的，本項讓重跑產生器能重現它。**"
+        ),
+    ),
+    TrustRootAsset(
+        "reviewer-planner-claude-state", _T0, _JV, None,
+        (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
+        note=(
+            "`<HOME>/.claude` → `<HOME>/cache/claude` 的 root-owned symlink：claude 的"
+            "登入態與狀態樹，token 葉檔是 `.credentials.json`。\n"
+            "**這一格是 #686 驗收矩陣裡唯一「CLI 全綠、卻做不了事」的那一列**：job 沙箱下"
+            "claude 走得完整條（rc=0），回的是 "
+            "`{\"is_error\":true,…,\"result\":\"Not logged in · Please run /login\"}`"
+            "——擋住的是憑證，不是加固面。它同時是 `reviewer-planner` 這個帳號**唯一**"
+            "在 M2（#615）之後就該有、卻從來沒有過的登入態：reviewer 的預設 executor 是 "
+            "`claude`，因此本項缺席時「reviewer 已降權」這句話買到的是一個跑不動的 job。\n"
+            "**job 模式下 `CLAUDE_CONFIG_DIR` 不可用**（它在 `job_runner.DENIED_ENV_NAMES` "
+            "內，design D-g 的帳號隔離取代了 in-process 的一次性 config dir），因此 claude "
+            "解到的就是 `$HOME/.claude`——也就是本項。\n"
+            "**`$HOME` 必須在 job 內解得到**：模板模式下 shim 以 `os.execvpe` 整份換掉環境"
+            "，unit 的 `Environment=HOME=` 到不了模型（#686 更正）。三項憑證的路徑**全部**"
+            "以 `$HOME` 為根，因此它們與 `PSC_REVIEWER_HOME` 的宣告**必須一起成立**；"
+            "產生器出的值見 `permgen.PathLayout.job_home_value()`，runbook 第 5-5c 步。"
         ),
     ),
     # ---- Manager 的 GitHub 傳輸層憑證（#666）--------------------------------

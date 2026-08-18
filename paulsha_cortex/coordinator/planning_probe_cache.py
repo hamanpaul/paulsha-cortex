@@ -235,18 +235,28 @@ def _search_path(mode: str, env: Mapping[str, str]) -> str:
     return job_runner.resolve_job_path(env, role=job_runner.JOB_ROLE_REVIEW)
 
 
-def _credential_path(mode: str, env: Mapping[str, str]) -> str:
-    """本模式下 executor 憑證的落點。
+def _credential_path(mode: str, env: Mapping[str, str], executor: str) -> str:
+    """本模式下**這個 executor** 的登入態落點。
 
-    - direct：probe 用的是 Manager 行程的 `$HOME`，因此憑證就在那底下；
+    - direct：probe 用的是 Manager 行程的 `$HOME`，因此登入態就在那底下；
     - job：`permgen` 的部署決定欄位（`reviewer_planner_account`）導出。
 
-    **已知限制（U-5／票 D）**：`PathLayout.executor_credential_relpath` 目前是
-    **單一**值（預設 `.codex/auth.json`），還沒有 per-(account, executor) 的表——
-    那正是 design 列為未決的 U-5。因此 agy 的 `~/.gemini` 狀態樹目前**不**在指紋
-    裡：它 refresh 時不會即時失效，最長由 not-ready TTL（預設 300s）兜住。票 D 把
-    憑證面 codify 之後，這裡跟著 `executor_credential_of` 的新簽章走即可，不必在
-    本模組另造一張表（那就是第二份真相）。
+    **票 D（#685）之後這裡是 per-(account, executor) 的。** 票 C 的原註解寫著
+    「`executor_credential_relpath` 目前是單一值……票 D 把憑證面 codify 之後，這裡跟著
+    `executor_credential_of` 的新簽章走即可，不必在本模組另造一張表」——本函式做的就是
+    那件事：多傳一個 `executor`，形狀（單檔 vs 導進 `cache` 的狀態樹）由 permgen 那張表
+    決定，本模組**不知道**也不需要知道差別。agy 的 `~/.gemini` 與 claude 的 `~/.claude`
+    因此**現在進得了指紋**（票 C 當時明列的已知限制解除）。
+
+    `(account, executor)` 不在表上時（例如 `copilot`，它不做 planning）permgen 會 raise
+    `UnregisteredExecutorCredentialError`，由 `compute_fingerprint` 的 `_safe` 收成
+    `<unresolved:UnregisteredExecutorCredentialError>`。那個標記是**穩定**的（同一個部署
+    上恆定），因此快取照常運作；而它一旦被登記進表，指紋就變、快取自動失效——與
+    「PATH 未宣告」那一格是同一條原則：**取不到答案本身也是一個會變的答案**。
+
+    取的是 `credential_token_path_of()`（**token 葉檔**）而不是登記表資產那個節點：
+    `HOME_REDIRECT_TREE` 的資產是一條 symlink，`stat` 它只看得到目標目錄的 mtime，而
+    token 就地覆寫時目錄 mtime 不變 ⇒ 「憑證換了」偵測不到。
     """
 
     from ..trust_root import permgen
@@ -256,8 +266,16 @@ def _credential_path(mode: str, env: Mapping[str, str]) -> str:
         home = (env.get("HOME") or "").strip()
         if not home:
             raise ValueError("HOME undeclared")
-        return os.path.join(home, layout.executor_credential_relpath)
-    return layout.executor_credential_of(layout.reviewer_planner_account)
+        # direct 模式跑在 Manager 帳號上，而 Manager **刻意沒有**任何登記表憑證資產
+        # （#672 的核心裁決）。因此這裡取的是「同一個 executor 在 job 帳號上的相對
+        # 落點」套到 Manager 的 HOME——那正是 direct 模式實際會解到的路徑。
+        prefix = layout.credential_prefix_of(layout.reviewer_planner_account)
+        credential = permgen.credential_for(prefix, executor)
+        relpath = layout.credential_relpath_of(credential)
+        if credential.token_leaf:
+            relpath = f"{relpath}/{credential.token_leaf}"
+        return os.path.join(home, relpath)
+    return layout.credential_token_path_of(layout.reviewer_planner_account, executor)
 
 
 def compute_fingerprint(
@@ -296,7 +314,9 @@ def compute_fingerprint(
         return _stat_marker(found, fields=_BINARY_STAT_FIELDS)
 
     def _credential() -> str:
-        return _stat_marker(_credential_path(mode, environ), fields=_FILE_STAT_FIELDS)
+        return _stat_marker(
+            _credential_path(mode, environ, identity.executor), fields=_FILE_STAT_FIELDS
+        )
 
     def _profile() -> str:
         return job_runner.resolve_hardening_profile(identity.executor)
