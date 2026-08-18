@@ -331,7 +331,7 @@ def _empty() -> dict[str, Any]:
     return {"schema": CACHE_SCHEMA, "items": {}}
 
 
-def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+def _ttl_from_env(env: Mapping[str, str], name: str, default: int) -> int:
     """TTL 的 env 覆寫。**非法值一律當 0（＝永遠 miss）**，不落回預設。
 
     落回預設會讓一個打錯的 `PSC_..._TTL_SECONDS=3O0` 靜默地維持一小時的快取，
@@ -422,8 +422,8 @@ class ProbeCache:
 
     def ttl_seconds(self, *, ready: bool) -> int:
         if ready:
-            return _positive_int(self.env, READY_TTL_ENV, DEFAULT_READY_TTL_SECONDS)
-        return _positive_int(self.env, NOT_READY_TTL_ENV, DEFAULT_NOT_READY_TTL_SECONDS)
+            return _ttl_from_env(self.env, READY_TTL_ENV, DEFAULT_READY_TTL_SECONDS)
+        return _ttl_from_env(self.env, NOT_READY_TTL_ENV, DEFAULT_NOT_READY_TTL_SECONDS)
 
     def get(
         self, identity: ModelIdentity, *, fingerprint: ProbeFingerprint
