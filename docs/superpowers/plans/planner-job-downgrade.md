@@ -46,11 +46,13 @@ claude／agy 兩種剖面皆 rc=0——**現行 `EXECUTOR_HARDENING_PROFILE` 就
 
 ### 1. 票 A｜錯誤語意三分 ＋ 逐候選拒因表（對應 R6，**不依賴任何部署面改動**）
 
+**已由 issue #682 land。**
+
 最先做，因為它**立刻**降低今天的排查成本。PR #674（#670）已經把 probe 那一端的診斷
 補齊（`strip_code_fence()`／`stdout_excerpt()`），票 A 要做的是讓那份診斷**活著抵達**
 blocking reason——兩者剛好接得起來，缺任何一半都還是查不出原因。
 
-- [ ] `tests/test_planning_failure_taxonomy_672.py`（TDD RED）：
+- [x] `tests/test_planning_failure_taxonomy_672.py`（TDD RED）：
   - `test_no_heterogeneous_planner_reason_carries_per_candidate_rejections`：
     給一組 probe（agy=not-ready/malformed-output、claude=not-ready/safe-probe-failed、
     codex=same-domain），`run_heterogeneous_brainstorm` 的 reason 必須同時含三個
@@ -62,19 +64,33 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
     使 `_resume_decision` 得以浮現 `recover-planning`。
   - `test_content_grade_rejections_stay_content`：全部拒因都是 `same-domain` 時仍為
     `content`（不得把拓撲問題誤判成環境問題——反向誤報同樣不可接受）。
-- [ ] `paulsha_cortex/coordinator/model_identities.py`：新增
+- [x] `paulsha_cortex/coordinator/model_identities.py`：新增
       `CandidateRejection` dataclass；`SecondarySelection` 增 `rejections` 欄位；
       `select_secondary_planner()` 的每個 `continue` 改成記錄一筆拒因。
-- [ ] `paulsha_cortex/coordinator/planning.py`：`run_heterogeneous_brainstorm` 把拒因表
+- [x] `paulsha_cortex/coordinator/planning.py`：`run_heterogeneous_brainstorm` 把拒因表
       渲染進 `BrainstormResult.reason`（格式見 design D8）。
-- [ ] `paulsha_cortex/coordinator/manager.py`：`_classify_planning_failure` 增一條
+- [x] `paulsha_cortex/coordinator/manager.py`：`_classify_planning_failure` 增一條
       environment 例外（比照既有的 `_is_planning_authority_residue_failure`／
       `_is_planning_transient_service_failure`／`_is_planning_worktree_drift_failure`
       三條，同一個模式，不新發明）。
-- [ ] 三個失敗族的具名常數（`planning-job-start-failed`／`planning-executor-failed`／
+- [x] 三個失敗族的具名常數（`planning-job-start-failed`／`planning-executor-failed`／
       `planning-output-malformed` ＋ `executor-silent-exit` 子類）先定義，票 C 才有東西可落。
 - 驗收：既有 planning 測試一行不改全綠；新測試全綠；`no-heterogeneous-planner` 的
   reason 可用正規表示式釘住必含拒因表。
+
+**#682 的實作補充**（design D8 之外的兩處收斂，後續票沿用）：
+
+1. **`CandidateRejection` 多一個 `family` 欄位**（三分族）。D8 的示意 dataclass 只有
+   `reason`／`diagnostic` 兩欄，但整體分級若要靠 reason 字串的 substring-search 就會出
+   一個洩漏面：拒因表的 `diagnostic` 帶的是**模型輸出**，一個回「planning-executor-failed」
+   的模型即可把 content 失敗偽裝成 environment。改成渲染端依 `family` 算出
+   `grade=<environment|content>` 並**錨在字串開頭**，`_classify_planning_failure` 只讀
+   那個欄位。另加一個 fail-closed 的 `planning-probe-unclassified`：未知 probe 失敗一律
+   落 content 且在表上現形，不擅自宣稱是環境問題。
+2. **primary 自己不佔一條拒因**。`primary` 也在 planning 名單裡，而它與自己當然同 domain；
+   記一條「primary 因為與 primary 同 domain 而落選」是零資訊的套套邏輯。同 domain 的
+   **其他**身分照記。副作用是「roster 裡真的只有 primary」時拒因表為空、reason 維持原
+   字面值——那個情境下 `no-heterogeneous-planner` 本來就是真話。
 
 ### 2. 票 B｜`PlanningInvoker` 抽象（對應 R1 的結構面，**純重構、行為零改變**）
 

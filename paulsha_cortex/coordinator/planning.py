@@ -13,6 +13,7 @@ from .model_identities import (
     CapabilityProbe,
     IdentityRegistry,
     ModelIdentity,
+    render_secondary_rejection_reason,
     select_secondary_planner,
 )
 from .workflow import GateEvidenceRef
@@ -1351,7 +1352,19 @@ def run_heterogeneous_brainstorm(
         return BrainstormResult("ready", None, None, empty_refs, None)
     selection = select_secondary_planner(registry=registry, primary=primary, probes=probes)
     if selection.state != "ready" or selection.identity is None:
-        return BrainstormResult("needs_human", selection.reason, None, empty_refs, None)
+        # issue #682（#672 票 A）：`no-heterogeneous-planner` 從**結論**變成
+        # **結論 ＋ 每個候選為什麼落選**。這一行就是「讓誤報不可能」的機制
+        # 本身——PR #674 讓 probe 失敗帶得出 stdout 節錄，這裡讓那份節錄活著
+        # 抵達 blocking reason，不再被 `select_secondary_planner` 的 `continue`
+        # 吃掉。沒有任何候選時（roster 裡真的只有 primary）拒因表為空，reason
+        # 維持原字面值。
+        return BrainstormResult(
+            "needs_human",
+            render_secondary_rejection_reason(selection.reason, selection.rejections),
+            None,
+            empty_refs,
+            None,
+        )
     try:
         questioner_input = {
             **report.to_dict(),

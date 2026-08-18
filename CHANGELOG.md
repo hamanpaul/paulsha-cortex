@@ -8,6 +8,36 @@
 ## [Unreleased]
 
 ### Fixed
+- **#682（#672 票 A）：planner 失敗的錯誤語意三分 ＋ `no-heterogeneous-planner` 攜帶逐候選
+  拒因表**——修法前 `select_secondary_planner()` 失敗時只回一個沒有任何附加資訊的字面值
+  `no-heterogeneous-planner`，而迴圈裡四個 `continue`（同 domain／probe 缺席／probe 沒
+  ready／probe 身分不符）**全部靜默**，於是三類結構上完全不同的失敗（job／executor 起不來、
+  executor 異常退出、輸出不合約）被壓成同一個「拓撲問題」。#670 就是這樣被誤診的：真因是
+  `agy models` 兩欄漂移造成 100% `model-not-listed` ＋ code fence 造成 parse 失敗，blocking
+  reason 說的卻是「沒有異質 planner」，最後靠人工重跑六遍才看出來。修法四件：(1) **三分的
+  具名族**（`planning-job-start-failed`／`planning-executor-failed`／
+  `planning-output-malformed` ＋ `executor-silent-exit` 子類 ＋ fail-closed 的
+  `planning-probe-unclassified`）與 `classify_probe_failure()` 的單一明表，票 C／票 E 直接
+  消費同一組常數；`probe_agy_capability` 的非零退出改帶 `_exit_diagnostic()`，rc≠0 且
+  stdout／stderr 皆空時就地標記 `executor-silent-exit`（stderr 內容本身不入 diagnostic）。
+  (2) **逐候選拒因表** `CandidateRejection` ＋ `SecondarySelection.rejections`，四個
+  `continue` 各記一筆；`SecondarySelection.reason` **刻意維持原字面值**——它是下游既有的
+  機器判準，拒因表走新欄位而不是把那個字串改長。(3) `run_heterogeneous_brainstorm` 經
+  `render_secondary_rejection_reason()` 把表渲染進 blocking reason
+  （`no-heterogeneous-planner grade=<environment|content> candidates=<N> (<逐條>)`，可用
+  正規表示式釘住），**PR #674 的 probe stdout 節錄自此端到端活著抵達 blocking reason**，
+  不再被 `continue` 吃掉；截斷只犧牲 diagnostic、身分列永不被丟，單條超限就地記帳 `…+Nc`、
+  全表超預算改成 `<detail-elided:Nc>`——「哪一條被截掉、少了多少」永遠讀得出來。
+  (4) `manager._classify_planning_failure()` 增第四條 environment 例外（比照 #416／#533／
+  #554 的同一個模式）：拒因表含 environment 級拒因時整體改判 `environment`，
+  `_resume_decision` 得以浮現 `recover-planning`；全部是拓撲／格式級時仍為 `content`
+  （反向誤報同樣不可接受）。判準讀的是渲染端算好、**錨在字串開頭**的 `grade=` 欄位而非對
+  整串 reason 做 substring-search——拒因表的 diagnostic 帶的是模型輸出，否則一個回
+  「planning-executor-failed」的模型就能把 content 失敗偽裝成 environment。機密面：
+  `CandidateRejection` 六個欄位沒有一個接得到 env、argv、檔案內容或 stderr，自由文字入口
+  只有 probe 的 reason／diagnostic（模型對固定 probe prompt 的 stdout 節錄、例外**型別名**），
+  渲染時另剝除 C0／C1 控制字元並單行化。測試 `tests/test_planning_failure_taxonomy_672.py`；
+  **既有測試一行未改**。
 - **#679：job 的 `PATH` 沒有一個來源是被決定過的——兩層都補、fail-closed，並禁止驗證
   指令自帶 `PATH`**。降權模式下 job 解到哪一份 CLI 取決於三件沒人裁決過的事：六份模板
   unit 沒有一份有 `Environment=PATH=`；`build_job_env()` 對 `PSC_*_PATH` **fail-open**；
