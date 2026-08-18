@@ -487,6 +487,21 @@
   `tests/test_trust_root_job_template_ab.py`（80 測試）。
 
 ### Fixed
+- **#669：claim 判定 `missing_issue` 不再建立 run；跳過改記在可查詢的 `not-claimable`
+  ledger**——舊行為「先建 run 再宣告 blocked」讓自我託管首輪掃描在八秒內產出 24 個內容完全
+  同型的 `needs_human` 殭屍 run（全部停在 `current_phase: claim`、`evidence_refs: []`、
+  `next_actions: []`，永遠不會推進），把 `attention` 的信噪比壓成 1:24。根因是類別錯誤：
+  `missing_issue` 對 `docs/superpowers/workstreams/*` 這類 work item 是**預期狀態而非異常**
+  （`cost-governance-cluster/todo.md` 開頭逐字寫著「本 workstream 不對應單一 issue」），不該
+  進入 durable 的 run 生命週期。`_claim_action` 現在回 `not_claimable`／`run: None`，
+  **一次都不呼叫 workflow starter**；每一次跳過都在
+  `<coordinator_root>/not-claimable.json`（`cortex-not-claimable/v1`）留一筆帶
+  `first_observed_at`／`observations`／`next_step_hint` 的紀錄，由 `cortex status` 的新
+  `not_claimable` 區塊與 `cortex digest` 計數呈現——「不建 run」不得等於「靜默略過」，否則
+  只是把噪音換成盲區。work item 重新可 claim 時該筆自動清除。修正前留下的殭屍 run 不由系統
+  自行清除（沿用 `#373` 守衛），而是以唯一可機械辨識的簽名認出後，回
+  `reason: claim-blocked-stale-run` 並附完整的 `cortex work abandon … --expected-run-id …`
+  指令交由 operator 執行。
 - **#670：`probe_agy_capability()` 對「模型加了 code fence」偽失敗，並把格式問題誤報成
   `no-heterogeneous-planner`**——probe 問的是語言模型卻直接
   `json.loads(smoke_stdout.strip())`；票上實測 6 次有 1 次模型把**完全正確**的 JSON 包進

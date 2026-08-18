@@ -457,6 +457,18 @@ def start_canonical_workflow(
         workspace_root=root, combo_name=manifest.combo, artifact_rows=artifact_rows
     )
     if needs_human_reason is not None:
+        # #669：這條路徑**不再由 claim 的 `missing_issue` 判定觸發**。
+        #
+        # 舊行為是「先建 run 再宣告 blocked」，於是「workstream 本來就不對應單一
+        # issue」這個預期狀態被物化成 24 個 `current_phase: claim`／
+        # `evidence_refs: []`／`next_actions: []` 的 needs_human 殭屍 run。
+        # `work_actions._claim_action` 現在在判定 `missing_issue` 時直接回
+        # `not_claimable`（記進 `not-claimable` ledger、**不呼叫本函式**），
+        # 那條不變式由 `tests/test_claim_not_claimable_669.py` 釘住：
+        # workflow_starter 在 missing_issue 時一次都不得被呼叫。
+        #
+        # 分支本身保留：它是「以指定理由建立一個 needs_human run」的通用設施，
+        # 與 claim 判定的語意無關。
         if existing_run is not None:
             return existing_run
         run = registry._manager_create_workflow_run(

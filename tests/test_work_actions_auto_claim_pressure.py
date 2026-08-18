@@ -265,10 +265,12 @@ def test_rate_limited_scan_still_claims_authorities_needing_no_github_read(
 
     by_work = {row["work_id"]: row for row in result}
     assert by_work["with-issue"]["reason"] == "github-rate-limited"
-    # 沒有 mapped issue 的 authority 仍走完 _claim_action（此處因 auto_label 為 False
-    # 而落在 needs_human——那是既有語意，與限流無關）；重點是它**沒有**被停手擋掉。
+    # 沒有 mapped issue 的 authority 仍走完 _claim_action（#669 之後落在
+    # `not_claimable`／`missing_issue`：不建 run，只記進 not-claimable ledger）；
+    # 重點是它**沒有**被限流停手擋掉。
     assert by_work["no-issue"].get("reason") != "github-rate-limited-scan-aborted"
-    assert by_work["no-issue"]["action"] == "needs_human"
+    assert by_work["no-issue"]["action"] == "not_claimable"
+    assert by_work["no-issue"]["run"] is None
 
 
 def test_invalid_interval_env_fails_loud(monkeypatch: pytest.MonkeyPatch) -> None:

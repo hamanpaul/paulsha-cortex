@@ -70,6 +70,10 @@ def assemble_digest(status: Mapping[str, Any], *, now: str) -> dict[str, Any]:
     """把 `read_status()` 快照彙整成結構化 digest（JSON-ready，含人類可讀摘要）。"""
 
     attention = _as_list(status.get("attention"))
+    # #669：claim 判定不可 claim（`missing_issue`）而刻意不建 run 的 work item。
+    # 只帶計數不帶明細——digest 是推播摘要，明細留給 `cortex status`；但計數必須
+    # 在，否則「被跳過的項目」在推播面完全不存在，等於再造一次盲區。
+    not_claimable = _as_list(status.get("not_claimable"))
     ready = _as_list(status.get("ready"))
     held = _as_list(status.get("held"))
     recent_done = _as_list(status.get("recent_done"))
@@ -84,6 +88,7 @@ def assemble_digest(status: Mapping[str, Any], *, now: str) -> dict[str, Any]:
         "degraded_reason": degraded_reason if isinstance(degraded_reason, str) else None,
         "counts": {
             "attention": len(attention),
+            "not_claimable": len(not_claimable),
             "ready": len(ready),
             "held": len(held),
             "recent_done": len(recent_done),
@@ -132,7 +137,9 @@ def render_digest_text(digest: Mapping[str, Any]) -> str:
         f"status_updated_at: {digest.get('status_updated_at')}",
         f"degraded: {digest.get('degraded')} ({digest.get('degraded_reason')})",
         (
-            f"attention={counts.get('attention', 0)} ready={counts.get('ready', 0)} "
+            f"attention={counts.get('attention', 0)} "
+            f"not_claimable={counts.get('not_claimable', 0)} "
+            f"ready={counts.get('ready', 0)} "
             f"held={counts.get('held', 0)} recent_done={counts.get('recent_done', 0)}"
         ),
     ]

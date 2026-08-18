@@ -55,6 +55,7 @@ from .github_delivery import (
     evaluate_delivery_gate,
 )
 from . import engineering_outcome
+from . import not_claimable
 from . import verification
 from . import worktree_reclaim
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
@@ -1424,6 +1425,108 @@ def _fallback_workflow_starter(workflow_registry, state_path: Path):
     return start
 
 
+# #669：`work_bridge.start_canonical_workflow` 在 claim 判定需要人工介入時建立的
+# run，其結構化理由固定帶這組 (reason, source)。這是「修正前留下的殭屍 run」唯一
+# 可機械辨識的簽名，用它把清理指引精準綁到那批 run 上，不會誤傷任何真的在跑的
+# needs_human run（build／verify／review 卡住的 run 既不在 claim phase，
+# `source` 也不是這一支）。
+_CLAIM_BLOCKED_REASON = "claim-blocked"
+_CLAIM_BLOCKED_SOURCE = "work_bridge.start_workflow_for_authority"
+
+_NOT_CLAIMABLE_SOURCE = "work_actions._claim_action:not-claimable"
+
+
+def _claim_blocked_stale_run(run) -> Any | None:
+    """#669 修正前留下的 claim-blocked 殭屍 run；不是的話回 ``None``。
+
+    判準刻意收到最窄：**ongoing ＋ 停在 `claim` phase ＋ 掛 `needs_human` ＋ 結構化
+    理由正是 `claim-blocked`／`work_bridge.start_workflow_for_authority` ＋ 沒有任何
+    evidence／PR**。少任何一項都不算——宣告一個「可以直接清掉」的 run 卻其實握有
+    工作成果，比不宣告更糟。
+    """
+
+    if run is None or getattr(run, "status", None) != "ongoing":
+        return None
+    if getattr(run, "current_phase", None) != "claim":
+        return None
+    if "needs_human" not in tuple(getattr(run, "facets", ()) or ()):
+        return None
+    if tuple(getattr(run, "evidence_refs", ()) or ()) or tuple(getattr(run, "pr_refs", ()) or ()):
+        return None
+    payload = getattr(run, "needs_human_reason", None)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("reason") != _CLAIM_BLOCKED_REASON:
+        return None
+    if payload.get("source") != _CLAIM_BLOCKED_SOURCE:
+        return None
+    return run
+
+
+def _not_claimable_response(
+    *,
+    authority,
+    state_path: Path,
+    stale_run=None,
+) -> dict[str, Any]:
+    """#669：記一筆耐久的 `not-claimable` 並回報「沒有建立 run」。
+
+    回傳的 ``run`` 恆為 ``None``——這正是本次修正的重點：判定「不可 claim」不再
+    留下任何 durable run。既有殭屍 run（修正前建立的）以 ``stale_run_id`` 如實
+    揭露並附上清理指令，不隱藏、也不由系統自行清除（清除是 operator 的明示動作，
+    見 `#373` 的守衛：auto-claim 不得自動清除或重試 needs_human run）。
+    """
+
+    # 兩種 row 分開命名，operator 一眼就知道要不要動手：
+    # - `missing_issue`：沒建 run，work item 現在就是不可 claim（workstream 多半
+    #   永遠停在這個狀態，屬預期）。
+    # - `claim-blocked-stale-run`：#669 修正前留下的殭屍 run 還在，需要一次清理。
+    reason = "missing_issue" if stale_run is None else "claim-blocked-stale-run"
+    detail = "claim 判定 work item 目前不可 claim，且刻意不建立 run：missing_issue"
+    if stale_run is not None:
+        detail += f"；另有 #669 修正前留下的 claim-blocked run {stale_run.run_id} 待清理"
+    if stale_run is not None:
+        hint = (
+            f"殭屍 run {stale_run.run_id} 是 #669 修正前「判定 missing_issue 仍建立 run」"
+            "留下的，永遠不會推進。確認無誤後以 `cortex work abandon "
+            f"{authority.work_id} --repo {authority.repo} --expected-run-id "
+            f"{stale_run.run_id} --actor <operator> --reason '#669 claim-blocked zombie'` "
+            "清除；清掉之後本項目只會留在 not_claimable 清單，不再佔用 attention。"
+        )
+    else:
+        hint = (
+            "本 work item 沒有對應的 GitHub issue，claim 因此不建立 run。"
+            "workstream 類（`docs/superpowers/workstreams/*`，設計上不對應單一 issue）"
+            "維持現狀即可；若這是漏開 issue，開好之後以 `cortex work link "
+            f"{authority.work_id} --repo {authority.repo} --issue <N>` 綁定，"
+            "下一輪掃描即自動 claim，本筆記錄同時自動消失。"
+        )
+    entry = not_claimable.record(
+        not_claimable.ledger_path(Path(state_path).parent),
+        repo=authority.repo,
+        work_id=authority.work_id,
+        reason=reason,
+        detail=detail,
+        source=_NOT_CLAIMABLE_SOURCE,
+        next_step_hint=hint,
+        authority_digest=work_authority_digest(authority),
+        mapped_openspec=authority.mapped_openspec,
+        mapped_todo_paths=authority.mapped_todo_paths,
+        stale_run_id=None if stale_run is None else stale_run.run_id,
+    )
+    response: dict[str, Any] = {
+        "action": "not_claimable",
+        "reason": reason,
+        "run": None,
+        "not_claimable": entry,
+        "next_step_hint": hint,
+    }
+    if stale_run is not None:
+        response["stale_run_id"] = stale_run.run_id
+        response["legal_next_steps"] = ("abandon",)
+    return response
+
+
 def _claim_action(
     *,
     args: dict[str, Any],
@@ -1666,6 +1769,19 @@ def _claim_action(
         if automatic
         else decide_manual_start(candidate, now_epoch=now_epoch)
     )
+    # #669：這一輪判定「不可 claim」與否，決定 `not-claimable` ledger 該記還是該收。
+    # 兩者共用同一個布林，兩邊對「這件事還在不在」的認知不可能分歧——ledger 因此
+    # 不會留下永久假警報（issue 補上、或既有殭屍 run 被 abandon 之後自動消失）。
+    stale_claim_blocked_run = _claim_blocked_stale_run(canonical_run)
+    work_item_not_claimable = decision.action == "needs_human" and (
+        decision.reason == "missing_issue" or stale_claim_blocked_run is not None
+    )
+    if not work_item_not_claimable:
+        not_claimable.clear(
+            not_claimable.ledger_path(Path(state_path).parent),
+            repo=authority.repo,
+            work_id=authority.work_id,
+        )
     if decision.action == "claim":
         if workflow_starter is None:
             raise RuntimeError("canonical workflow starter unavailable")
@@ -1719,6 +1835,33 @@ def _claim_action(
                 ),
             }
         active = run.to_dict()
+    elif work_item_not_claimable:
+        # #669：`missing_issue` 不得再物化成 run。
+        #
+        # 舊行為是「先建 run 再宣告 blocked」（`work_bridge.start_canonical_workflow`
+        # 的 `needs_human_reason` 分支，detail 逐字寫著「claim 判定需要人工介入即
+        # 建立 run」）。實機首輪掃描後 24 個 workstream work item 因此各自變成一個
+        # `current_phase: claim`／`gate_state: running`／`evidence_refs: []`／
+        # `next_actions: []` 的 `needs_human` run，永遠不會推進，`attention` 信噪比
+        # 1:24——真正該人看的 blocker 被埋掉。
+        #
+        # 而 `missing_issue` 對 workstream 而言**是預期狀態，不是異常**：
+        # `docs/superpowers/workstreams/cost-governance-cluster/todo.md` 開頭逐字
+        # 寫著「本 workstream 不對應單一 issue」。把預期狀態物化成 durable state
+        # 是根本的類別錯誤。
+        #
+        # 但「只是不建 run」會把 fail-loud 換成 fail-silent：真的該有 issue 卻沒有
+        # 的 work item 會被靜默略過。因此每一次跳過都必須在 `not-claimable` ledger
+        # 留一筆 operator 查得到的紀錄（`cortex status` 的 `not_claimable` 區塊）。
+        #
+        # 第二個判準（`_claim_blocked_stale_run`）只涵蓋**修正前既有的殭屍 run**：
+        # 它們存在時 `_resume_decision` 會先回 `human-intervention-required`，
+        # `missing_issue` 這條判準看不到它們，operator 因此也拿不到清理指引。
+        return _not_claimable_response(
+            authority=authority,
+            state_path=state_path,
+            stale_run=stale_claim_blocked_run,
+        )
     elif decision.action == "needs_human":
         claim_key = build_claim_key(
             ClaimCandidate(

@@ -74,7 +74,14 @@ def test_digest_emit_writes_file_outbox_by_default_and_reports_json(
     assert written_path.parent == digest_runtime["coordinator_root"] / "digest" / "outbox"
     on_disk = json.loads(written_path.read_text(encoding="utf-8"))
     assert on_disk["attention"][0]["slice_id"] == "slice-c"
-    assert on_disk["counts"] == {"attention": 1, "ready": 1, "held": 1, "recent_done": 1}
+    assert on_disk["counts"] == {
+        "attention": 1,
+        # #669：claim 判定不可 claim 而刻意不建 run 的 work item 計數。
+        "not_claimable": 0,
+        "ready": 1,
+        "held": 1,
+        "recent_done": 1,
+    }
 
 
 def test_digest_emit_human_output_lists_attention_and_delivery_path(

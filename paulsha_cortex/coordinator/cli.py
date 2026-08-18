@@ -237,7 +237,10 @@ def _build_parser() -> argparse.ArgumentParser:
     toggle.add_argument("--disable", action="store_true")
     p_work.add_argument("--payload", help="額外 manager-side evidence refs JSON object")
 
-    sub.add_parser("status", help="讀取 manager daemon 的 ready/held/slices/attention 快照")
+    sub.add_parser(
+        "status",
+        help="讀取 manager daemon 的 ready/held/slices/attention/not_claimable 快照",
+    )
 
     p_reap = sub.add_parser("reap-brokers", help="操作員 dry-run/apply 孤兒 codex broker 回收")
     p_reap.add_argument("--apply", action="store_true")
