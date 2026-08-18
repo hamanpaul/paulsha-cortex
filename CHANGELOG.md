@@ -7,6 +7,35 @@
 
 ## [Unreleased]
 
+### Fixed
+- **#679：job 的 `PATH` 沒有一個來源是被決定過的——兩層都補、fail-closed，並禁止驗證
+  指令自帶 `PATH`**。降權模式下 job 解到哪一份 CLI 取決於三件沒人裁決過的事：六份模板
+  unit 沒有一份有 `Environment=PATH=`；`build_job_env()` 對 `PSC_*_PATH` **fail-open**；
+  而 `PATH` 當時還在**轉發類**白名單上，因此未宣告時 job 靜默拿到 **Manager daemon 的**
+  `PATH`（daemon 自己也沒有時，`os.execvpe` 退回 `os.defpath`＝`:/bin:/usr/bin`）。終點
+  一樣：`claude`／`agy` rc=127，`codex` **靜默**解到 `/usr/bin/codex`（實機 0.42.0，
+  toolchain 那份 0.147.0）——不報錯，只是產出來自沒人判讀過的 CLI；三個角色全中。
+  修法四件：(1) 新增 `job_runner.resolve_job_path()`，三個 `PSC_*_PATH` 未宣告即
+  `job-runner-path-undeclared` fail-closed（採裁決 (a) raise，不採「退回產生器預設」——
+  #453「registry 永不寫入預設值」的同一條立場）；(2) **`PATH` 移出轉發白名單**（本票真正
+  的 fail-open，issue 證據鏈少的那一環：daemon 的 `PATH` 帶著 `<deploy_root>/venv/bin`，
+  與 `HOME`／`VIRTUAL_ENV` 同一類錯誤）；(3) 六份模板 unit 補 `Environment=PATH=`（permgen
+  機械產生、與 Manager 端變數同源），`job_shim` 在 spec 缺 `PATH` 時退回這一層（root-owned
+  ⇒ 不是 fail-open），兩層都缺才拒絕 exec 且失敗發生在**接管 log 之前**；(4) 驗證方法：
+  共用探針 `psc_run_under` 移除 `--setenv=PATH=`、`psc_probe_path()` 刪除，新增
+  `permgen.build_path_resolution_probe()`／CLI `trust_root path-probe` 的**角色 × executor
+  全列舉**反向不變式（零額外 env、斷言解到 `<toolchain>/bin/<cli>` 且版本與同一支檔案的
+  絕對路徑逐字相同）。**為什麼它活過五輪驗證**：每一條驗證都自帶 `--setenv=PATH=`——
+  驗證環境供應了 production 不供應的東西；runbook 4e 逐字預言了症狀、連 0.42.0 都寫對了，
+  但那條是 `sudo -u … env PATH=…` 跑的。這是「綠燈不承載語意」的第五個實例、新的一類
+  （前四次是複本比 production 弱或強，這次是**多**），#677 的規矩因此再推一格：**複本必須
+  連「production 沒有設什麼」也一起複製**。順手收掉 runbook 手打的 `PSC_GATE_PATH`
+  少 toolchain 段這條第三份真相（與 permgen／#666 不一致）；三個變數一律由產生器導出。
+  runbook 新增 **4e-2**（反向不變式）與 **5-5b**（升級既有部署：補三個變數、重新落檔六份
+  unit、重啟 Manager，含降級路徑警語），troubleshooting 新增 `job-runner-path-undeclared`
+  一節。測試 `tests/test_job_path_fail_closed_679.py`；OS 層語意以具名
+  `@pytest.mark.skip` ＋ 完整理由標示，不靜默通過。
+
 ### Added
 - **#672：planner 降權的設計交付（spec ＋ design ＋ 實作切分計畫，零 code）**——planning
   （define／brainstorm）從來沒有被降權：`planning_runtime.py:830` `_invoke_json()` 以

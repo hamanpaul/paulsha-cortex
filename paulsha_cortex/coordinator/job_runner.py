@@ -194,6 +194,7 @@ __all__ = [
     "resolve_hardening_profile",
     "resolve_job_account",
     "resolve_job_group",
+    "resolve_job_path",
     "resolve_job_spec_spool",
     "resolve_job_role",
     "template_instance_id",
@@ -226,8 +227,12 @@ BUILDER_GROUP_ENV = "PSC_BUILDER_GROUP"
 #: 反之 daemon 的 HOME 絕不可轉發（那是 cortex-svc 的樹，且是 #588 第 1 點的核心）。
 BUILDER_HOME_ENV = "PSC_BUILDER_HOME"
 
-#: builder 的 PATH 覆寫。未設時轉發 Manager 的 PATH（見 `BUILDER_FORWARDED_ENV`）；
-#: Phase 2b 若把模型 CLI 裝在 builder 才讀得到的路徑，用這個覆寫。
+#: builder 的 PATH。**必填，且未設時 fail-closed**（#679）。
+#:
+#: #640 起它就已經是「必填」的部署契約（runbook 明講），但程式碼這一側直到 #679 都
+#: 還是 fail-open：未設就整個不寫 `PATH`，於是 `execvpe` 退回 `os.defpath`
+#: （`:/bin:/usr/bin`）——`codex` 靜默解到系統層那份舊 CLI，不報錯、只是產出來自一支
+#: operator 從未判讀過的執行檔。宣告與實作的落差本身就是那個缺陷。
 BUILDER_PATH_ENV = "PSC_BUILDER_PATH"
 
 #: reviewer＋planner 的 OS 帳號名（#615 M2）。三分方案把兩個 persona 映到**同一個**
@@ -750,16 +755,6 @@ class ForwardedEnvVar:
 #: `CLAUDE_CONFIG_DIR`／`GH_CONFIG_DIR`、以及下面「刻意排除」段列出的項目。
 BUILDER_FORWARDED_ENV: tuple[ForwardedEnvVar, ...] = (
     ForwardedEnvVar(
-        "PATH",
-        # 沒有 PATH，transient unit 只會拿到 PID 1 的 manager PATH（通常是
-        # /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin），裡面沒有 npm global／
-        # pipx shim，`claude`／`codex`／`copilot` 一律 127；wrapper 內的 `python3`
-        # （gate ledger writer，見 launcher.build_wrapper_script）與 `git`（builder
-        # 要 commit candidate）同樣靠它解析。可用 PSC_BUILDER_PATH 覆寫成 builder
-        # 帳號讀得到的路徑。
-        "模型 CLI（claude／codex／copilot）、wrapper 的 python3 gate writer 與 git 的解析路徑",
-    ),
-    ForwardedEnvVar(
         "LANG",
         # claude／copilot 是 node CLI、codex 是 rust CLI，prompt 與 candidate 檔案
         # 常含非 ASCII（本 repo 的 spec／CHANGELOG 全是 zh-tw）；locale 缺失時
@@ -801,8 +796,16 @@ BUILDER_FORWARDED_ENV: tuple[ForwardedEnvVar, ...] = (
 #: - `PSC_RELAY_TARGET`：僅在 launcher 有設定時才出現（與 direct 模式同條件）。
 #: - `HOME`：僅在 `PSC_BUILDER_HOME` 明示時才設；未設時交給 systemd 依 passwd 填入
 #:   builder 帳號自己的 HOME。**任何情況下都不會是 daemon 的 HOME。**
+#: - `PATH`：#679 起由 :func:`resolve_job_path` 從**本角色的** `PSC_*_PATH` 算出，
+#:   未宣告即 fail-closed。**它以前在轉發類白名單上，那是本票真正的 fail-open**：
+#:   未宣告時 job 靜默拿到 **Manager daemon 的** `PATH`——一個沒有人為「job 該解到
+#:   哪一份 CLI」做過決定的值，而且它是否含 `<toolchain>/bin` 完全看那台機器的
+#:   EnvironmentFile 被誰手動加過什麼。轉發 daemon 的 `PATH` 與轉發 daemon 的
+#:   `HOME`／`VIRTUAL_ENV`（早就在排除表上）是同一類錯誤：daemon 的 `PATH` 還帶著
+#:   `<deploy_root>/venv/bin`，等於把 job 的 `python3` 綁回 Manager 的 venv。
 BUILDER_SYNTHESIZED_ENV = (
     "HOME",
+    "PATH",
     "PSC_JOB_ID",
     "PSC_RELAY_TARGET",
     "PSC_REPO_ROOT",
@@ -824,6 +827,11 @@ BUILDER_SYNTHESIZED_ENV = (
 #:   PATH 決定，不該被綁進 Manager 的 venv。
 EXCLUDED_ENV_RATIONALE: Mapping[str, str] = {
     "HOME": "systemd 依 passwd 填入 builder 自己的 HOME；daemon 的 HOME 絕不轉發",
+    "PATH": (
+        "#679：daemon 的 PATH 絕不轉發——它帶著 <deploy_root>/venv/bin，且是否含 "
+        "toolchain 全看那台機器被手動加過什麼。job 的 PATH 只由本角色的 "
+        "PSC_*_PATH 決定（resolve_job_path，未宣告即 fail-closed）"
+    ),
     "HTTPS_PROXY": "proxy URL 可內嵌 user:pass，屬憑證面；由 builder 自己的 drop-in 提供",
     "HTTP_PROXY": "同 HTTPS_PROXY",
     "LOGNAME": "systemd 依 passwd 填入",
@@ -874,6 +882,67 @@ def _reject_unsafe(env: Mapping[str, str], *, source: str) -> None:
             )
 
 
+#: `resolve_job_path()` 的錯誤訊息要指出「去哪一份 unit 取正規值」——角色與
+#: `trust_root unit` 旗標的對應（與 `permgen.JOB_UNIT_CLI_FLAG` 成對契約，由
+#: `tests/test_job_path_fail_closed_679.py` 釘住兩邊一致）。
+_UNIT_FLAG_HINT: Mapping[str, str] = MappingProxyType(
+    {
+        JOB_ROLE_BUILDER: "--job",
+        JOB_ROLE_REVIEW: "--review-job",
+        JOB_ROLE_GATE: "--gate-job",
+    }
+)
+
+
+def resolve_job_path(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
+    """解析本角色的 job `PATH`。**未宣告即 fail-closed，絕不省略、絕不猜預設。**
+
+    ## 為什麼是 raise 而不是「退回一份預設值」（#679 裁決 (a)）
+
+    在此之前這裡是 fail-open：
+
+        path_override = (manager_env.get(config.path_env) or "").strip()
+        if path_override:
+            env["PATH"] = path_override      # 沒設就整個不寫 PATH
+
+    而 job spec 的 `env` 就是 job 的**完整**環境（shim 以
+    `os.execvpe(command[0], command, spec["env"])` 整份換掉），少了 `PATH` 這個鍵
+    不是「用系統預設」，是 `execvpe` 退回 `os.defpath`＝`:/bin:/usr/bin`。實機後果：
+    `claude`／`agy` rc=127（只存在於 toolchain），而 `codex` **靜默**解到
+    `/usr/bin/codex`——系統層 0.42.0，toolchain 那份是 0.147.0。不失敗、不報錯，
+    只是每一筆產出都來自一支 operator 從未判讀過的 CLI。
+
+    退回「permgen 導出的預設」（#679 的選項 (b)）看起來溫和，但那正是本 repo 已經
+    否決過的形態：#453「registry 永不寫入預設值」。一個沒有宣告 `PSC_*_PATH` 的部署
+    ＝operator 沒有對「job 解哪一份 CLI」做過決定，而那是**必須有人做**的決定；
+    替他做一次、只在 spec 上留一行痕跡，等於把「未宣告」與「宣告成這樣」壓成同一種
+    狀態，下一次漂移一樣看不見。
+
+    **升級既有部署會痛，而那是對的**：現況是靜默跑錯版本，改完之後是下一次派工當場
+    以可讀理由失敗。runbook 第 5-5 步有逐字的補宣告步驟。
+    """
+
+    config = resolve_job_role(role)
+    value = (manager_env.get(config.path_env) or "").strip()
+    if not value:
+        raise _fail(
+            "job-runner-path-undeclared",
+            (
+                f"{config.path_env} 未宣告——{config.role_id} job 會拿不到 PATH。"
+                "job spec 的 env 就是 job 的完整環境（shim 以 execvpe 整份換掉），"
+                "少了 PATH 不是「用系統預設」而是退回 os.defpath（:/bin:/usr/bin）："
+                "toolchain 裡的 CLI 一律 rc=127，而系統層同名的舊版本會被**靜默**解到。"
+                "請在 Manager 的 root-owned EnvironmentFile 宣告（值由產生器導出，"
+                "不要手打）：`python3 -m paulsha_cortex.trust_root unit four-way "
+                f"{_UNIT_FLAG_HINT.get(config.role_id, '--job')} | grep '^Environment=PATH='`"
+            ),
+            source="resolve_job_path",
+            role=config.role_id,
+            variable=config.path_env,
+        )
+    return value
+
+
 def build_job_env(
     *,
     manager_env: Mapping[str, str],
@@ -893,6 +962,11 @@ def build_job_env(
     相同。角色只決定 `PATH`／`HOME` 的**覆寫變數名**（見 :data:`JOB_ROLE_CONFIG`）：
     兩個帳號的 HOME 與 toolchain 可見性不同，共用一個 `PSC_BUILDER_PATH` 會讓
     reviewer 的 PATH 只能跟著 builder 走。
+
+    **`PATH` 是必要鍵，不是選配**（#679）：未宣告 `PSC_*_PATH` 時
+    :func:`resolve_job_path` 直接 raise。`HOME` 仍是選配，兩者的差別是實質的——
+    `HOME` 未給時 systemd 依 passwd 填入該帳號自己的正確值（而且模板 unit 另有一行
+    `Environment=HOME=`），`PATH` 未給時沒有任何一層會填出正確值。
     """
 
     config = resolve_job_role(role)
@@ -901,9 +975,7 @@ def build_job_env(
         value = manager_env.get(forwarded.name)
         if value:
             env[forwarded.name] = value
-    path_override = (manager_env.get(config.path_env) or "").strip()
-    if path_override:
-        env["PATH"] = path_override
+    env["PATH"] = resolve_job_path(manager_env, role=config.role_id)
     home = (manager_env.get(config.home_env) or "").strip()
     if home:
         env["HOME"] = home

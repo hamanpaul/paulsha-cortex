@@ -556,12 +556,26 @@ $ sudo -u cortex-builder env HOME=<job HOME> codex exec --help
   症狀後回填）。**因此系統層 node 的版本風險涵蓋 `codex` 與 `copilot` 兩個。**
   同一個 `needs_node` 欄位也是 §R3 per-executor 加固剖面的分類來源——**一張表，兩個
   用途**，不另立第二份清單。
-- job 的 `PATH` SHALL 由 Manager 端既有的 `PSC_BUILDER_PATH` 注入，且 toolchain
-  SHALL 排在**最前面**——系統層可能另有一份同名但舊很多的 CLI，排在後面的症狀是
-  「跑得起來但版本不是預期的那個」，比 `command not found` 難查得多。**MUST NOT**
-  改以模板 unit 的 `Environment=PATH=` 提供：模板 unit 的 `ExecStart` 是 root-owned
-  shim，shim 以 `execvpe(argv[0], argv, spec['env'])` 整份換掉環境，job 解析命令用的
-  `PATH` 來自 **spec 的 env**——寫在 unit 上只會是一個看起來承載作用、實際被丟掉的設定。
+- job 的 `PATH` SHALL 由**本角色的** `PSC_*_PATH`（`PSC_BUILDER_PATH`／
+  `PSC_REVIEWER_PATH`／`PSC_GATE_PATH`）注入，且 toolchain SHALL 排在**最前面**——
+  系統層可能另有一份同名但舊很多的 CLI，排在後面的症狀是「跑得起來但版本不是預期的
+  那個」，比 `command not found` 難查得多。
+- 該變數未宣告時 `build_job_env()` **SHALL fail-closed**（#679）。它 **MUST NOT**
+  靜默省略 `PATH`，也 **MUST NOT** 落回 Manager daemon 的 `PATH`——後者是 #679 的
+  實際成因：`PATH` 曾在轉發類白名單上，於是未宣告時 job 拿到的是「沒有人為它做過
+  決定」的值（daemon 的 `PATH` 帶著 `<deploy_root>/venv/bin`，且是否含
+  `<toolchain>/bin` 純看該機器被誰手動加過什麼）。Manager 自己也沒有 `PATH` 時，
+  `os.execvpe` 退回 `os.defpath`（`:/bin:/usr/bin`），`codex` 因此**靜默**解到系統層
+  那一份（實機 0.42.0，toolchain 是 0.147.0）——不報錯，只是產出來自沒人判讀過的 CLI。
+- 模板 unit **SHALL** 另外帶一行 `Environment=PATH=`（由 permgen 機械產生，與上述
+  變數同源）。#640 當時判斷「寫在 unit 上會被 shim 丟掉」——那對了一半：spec 的 env
+  確實是 job 的完整環境，但產生它的那一支當時 fail-open，於是兩層同時為空。現在是
+  兩層：spec 那層 fail-closed，unit 這層是 shim 的退路（root-owned、比 spec 更可信，
+  因此**不是** fail-open），兩層都缺時 shim SHALL 拒絕 exec。
+- **驗「job 會解到哪一份 CLI」的檢查 MUST NOT 自帶 `PATH`**（#679）。加固面複本
+  （`permgen.unit_replica_properties()`）SHALL 連「production **沒有**設什麼」也一起
+  複製；探針 MUST NOT 額外疊 `--setenv=`。反向不變式（角色 × executor，零額外 env）
+  由 `permgen.build_path_resolution_probe()` 機械導出。
 
 ##### (a2) 盤點範圍：**所有**外部程式，不只 executor（#661）
 

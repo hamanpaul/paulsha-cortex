@@ -32,9 +32,20 @@ from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 # 每一輪 launch 測試都在乾淨的 env 上疊加，避免 operator 自己的 shell 汙染判定。
 _ISOLATED_AGENTS_ROOT = tempfile.mkdtemp(prefix="psc-agents-root-")
 
+#: #679：job 的 PATH 只由**本角色的** `PSC_*_PATH` 決定，未宣告即 fail-closed。
+#: 三個角色各給一份可辨識的值，測試才驗得到「角色不會互相污染」。
+_JOB_PATH_ENV = {
+    job_runner.BUILDER_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
+    job_runner.REVIEWER_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
+    job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+}
+
 _BASE_ENV = {
+    # daemon 自己的 PATH。**#679 起它不再被轉發**——留在這裡正是為了驗那件事：
+    # job 的 PATH 不得等於 daemon 的 PATH。
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "HOME": "/var/lib/cortex-svc",
+    **_JOB_PATH_ENV,
     # conftest 的 `_clear_runtime_env` 把 PSC_AGENTS_ROOT 指向 per-test 暫存目錄，
     # 但本檔的 launch 測試以 `clear=True` 重建整份 environ（要驗的就是白名單本身），
     # 那層保護因此被清掉。顯式帶上一個 per-process 暫存根：`launcher.launch()` 會在
@@ -297,10 +308,28 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         self.assertEqual(env["HOME"], "/var/lib/cortex-builder")
         self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
 
-    def test_path_is_forwarded_and_overridable(self) -> None:
-        self.assertEqual(self._build()["PATH"], _BASE_ENV["PATH"])
-        env = self._build(**{job_runner.BUILDER_PATH_ENV: "/opt/cortex/bin:/usr/bin"})
-        self.assertEqual(env["PATH"], "/opt/cortex/bin:/usr/bin")
+    def test_path_comes_from_the_role_variable_and_never_from_the_daemon(self) -> None:
+        """#679：job 的 PATH 只有一個來源＝本角色的 `PSC_*_PATH`。
+
+        在此之前 `PATH` 在**轉發類**白名單上，於是未宣告 `PSC_BUILDER_PATH` 時 job
+        靜默拿到 daemon 的 PATH——一個沒有人為「job 該解到哪一份 CLI」做過決定的值。
+        """
+
+        env = self._build()
+        self.assertEqual(env["PATH"], _JOB_PATH_ENV[job_runner.BUILDER_PATH_ENV])
+        self.assertNotEqual(env["PATH"], _BASE_ENV["PATH"], "daemon 的 PATH 不得外流")
+        overridden = self._build(**{job_runner.BUILDER_PATH_ENV: "/opt/cortex/bin:/usr/bin"})
+        self.assertEqual(overridden["PATH"], "/opt/cortex/bin:/usr/bin")
+
+    def test_path_is_fail_closed_when_the_role_variable_is_absent(self) -> None:
+        """未宣告時**不得**靜默省略、也不得落回 daemon 的 PATH——一律 raise。"""
+
+        manager_env = {k: v for k, v in _BASE_ENV.items() if k not in _JOB_PATH_ENV}
+        with self.assertRaises(JobRunnerError) as ctx:
+            job_runner.build_builder_env(
+                manager_env=manager_env, job_id="j", slice_id="s", repo_root="/r"
+            )
+        self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-path-undeclared")
 
     def test_relay_target_only_when_configured(self) -> None:
         manager_env = {**_BASE_ENV}
@@ -338,7 +367,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         with mock.patch.object(job_runner, "BUILDER_FORWARDED_ENV", poisoned):
             with self.assertRaises(JobRunnerError) as ctx:
                 job_runner.build_builder_env(
-                    manager_env={"SOME_API_KEY": "leaked"},
+                    manager_env={"SOME_API_KEY": "leaked", **_JOB_PATH_ENV},
                     job_id="j",
                     slice_id="s",
                     repo_root="/r",
@@ -346,9 +375,13 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-credential-env-leak")
 
     def test_newline_in_value_is_rejected(self) -> None:
+        # #679：注入點跟著 PATH 的來源走——現在是 `PSC_BUILDER_PATH`，不是 daemon 的
+        # `PATH`（後者已不再轉發）。守衛必須仍然攔得到。
         with self.assertRaises(JobRunnerError) as ctx:
             job_runner.build_builder_env(
-                manager_env={"PATH": "/usr/bin\n--property=User=root"},
+                manager_env={
+                    job_runner.BUILDER_PATH_ENV: "/usr/bin\n--property=User=root"
+                },
                 job_id="j",
                 slice_id="s",
                 repo_root="/r",
@@ -708,7 +741,9 @@ class DegradedLaunchTests(unittest.TestCase):
         self.assertEqual(unit_env["PSC_JOB_ID"], "psc-0001-demo")
         self.assertEqual(unit_env["PSC_SLICE_ID"], "psc-0001-demo")
         self.assertIn("PSC_REPO_ROOT", unit_env)
-        self.assertEqual(unit_env["PATH"], _BASE_ENV["PATH"])
+        # #679：unit 的 PATH 來自 `PSC_BUILDER_PATH`，**不是** daemon 的 PATH。
+        self.assertEqual(unit_env["PATH"], _JOB_PATH_ENV[job_runner.BUILDER_PATH_ENV])
+        self.assertNotEqual(unit_env["PATH"], _BASE_ENV["PATH"])
 
     def test_stdin_is_devnull_and_working_directory_is_the_worktree(self) -> None:
         call = self._launch_builder().call
@@ -826,7 +861,8 @@ class DegradedLaunchTests(unittest.TestCase):
         ):
             reported = SubprocessLauncher("codex").executor_environment()
         self.assertEqual(reported.home, "/var/lib/cortex-builder")
-        self.assertEqual(reported.path, _BASE_ENV["PATH"])
+        # #679：preflight 報的 PATH 也必須是 job 真的會拿到的那一份。
+        self.assertEqual(reported.path, _JOB_PATH_ENV[job_runner.BUILDER_PATH_ENV])
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -26,7 +26,10 @@ fail-closed、不猜、不落回預設）——「哪個身分讀哪個 spool」
 - schema 驗證是**白名單**：spec 裡出現 `user`／`uid`／`group`／`gid` 這類身分欄位
   一律拒絕。身分只有一個來源＝root-owned 的 unit 檔，spec 連提都不准提；
 - env 走與 `job_runner` **同一條** `CREDENTIAL_ENV_RE`／`DENIED_ENV_NAMES` 守衛，
-  spec 被塞進 token 或 `LD_PRELOAD` 時 fail-closed，而不是照單 exec。
+  spec 被塞進 token 或 `LD_PRELOAD` 時 fail-closed，而不是照單 exec；
+- **`PATH` 兩層都缺時 fail-closed**（#679，見 :func:`resolve_job_env`）：spec 的 env
+  沒有 `PATH` 時退回模板 unit 的 `Environment=PATH=`（root-owned，比 spec 更可信），
+  兩層都沒有才拒絕 exec——絕不讓 `execvpe` 退回 `os.defpath` 去靜默解系統層那份。
 
 ## 為什麼 log 由這裡接管，而不是 unit 的 `StandardOutput=append:`
 
@@ -68,6 +71,7 @@ __all__ = [
     "forbidden_spec_keys",
     "load_spec",
     "main",
+    "resolve_job_env",
     "resolve_spec_path",
 ]
 
@@ -189,6 +193,44 @@ def load_spec(instance: str, spool_root: str) -> dict[str, object]:
     return spec
 
 
+def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> dict[str, str]:
+    """spec 的 `env` → job 的**完整**環境，並補上 `PATH` 這一條的第二層（#679）。
+
+    ## 為什麼這裡要有第二層
+
+    `os.execvpe(file, args, env)` 解析 `file` 用的是 **`env` 這個參數裡的 `PATH`**，
+    不是本行程的 `os.environ`；`env` 沒有 `PATH` 時退回 `os.defpath`＝`:/bin:/usr/bin`。
+    也就是說「spec 的 env 少了 PATH」不會報錯，只會讓 job 解到系統層那份同名 CLI
+    ——實機上 `codex` 因此跑的是 0.42.0，而 toolchain（登記表登記的那份）是 0.147.0。
+
+    第二層的來源是**模板 unit 的 `Environment=PATH=`**（#679 同時補上的那一行）：
+    root-owned、可逐字稽核、job 帳號改不了。因此這**不是** fail-open——它退回的是比
+    spec 更可信的來源，而不是猜一個預設值。它涵蓋兩種現實情況：
+
+    - Manager 端的產生器被繞過（手工組 spec；#645 逐字記錄過的同型前例）；
+    - spool 裡還躺著升級前寫的舊 spec。
+
+    兩層**都**沒有時 fail-closed。這一條刻意不落回 `os.defpath`：那正是本票的原症狀，
+    而它的失敗模式是「不報錯、只是版本不對」——最難查的那一種。
+    """
+
+    env = {str(k): str(v) for k, v in dict(spec["env"]).items()}  # type: ignore[index]
+    if (env.get("PATH") or "").strip():
+        return env
+    inherited = (environ.get("PATH") or "").strip()
+    if not inherited:
+        raise ShimError(
+            "job spec 的 env 沒有 PATH，模板 unit 也沒有 Environment=PATH=——"
+            "execvpe 會退回 os.defpath（:/bin:/usr/bin）並**靜默**解到系統層那份同名 "
+            "CLI（實機：codex 0.42.0，而 toolchain 是 0.147.0）。兩層都缺時一律拒絕 "
+            "exec：請確認 Manager 端已宣告 PSC_BUILDER_PATH／PSC_REVIEWER_PATH／"
+            "PSC_GATE_PATH，且模板 unit 是由現行 permgen 產生的那一份"
+            "（`python3 -m paulsha_cortex.trust_root unit four-way --job` 等）。"
+        )
+    env["PATH"] = inherited
+    return env
+
+
 def _take_over_stdio(log_path: str) -> None:
     """把 stdout／stderr 接到 spec 指定的 JSONL log（append、`O_NOFOLLOW`）。
 
@@ -226,6 +268,10 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
                 f"spool 根（root-owned unit 檔是這個值唯一的合法來源）"
             )
         spec = load_spec(args[0], spool_root)
+        # PATH 的解析刻意在**接管 log 之前**（與 spool 根 fail-closed 同一段）：
+        # 這一族失敗代表 job 根本不該起跑，理由要進 journal，而不是進一份 job
+        # 自己的 log——那份 log 在 Manager 眼裡與「job 跑了但沒輸出」長得一樣。
+        job_env = resolve_job_env(spec, env)
         _take_over_stdio(str(spec["log_path"]))
         os.chdir(str(spec["working_directory"]))
     except ShimError as exc:
@@ -236,7 +282,6 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
         return EXIT_SPEC_ERROR
 
     command = [str(item) for item in spec["command"]]  # type: ignore[index]
-    job_env = {str(k): str(v) for k, v in dict(spec["env"]).items()}  # type: ignore[index]
     try:
         # execvpe：同一個 pid 直接變成 job，unit 的 MAINPID 因此就是 job 本身
         # （`systemctl start --wait` 的等待語意與 exit sentinel 都建立在這點上）。

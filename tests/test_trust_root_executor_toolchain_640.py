@@ -492,18 +492,32 @@ def test_job_path_puts_the_toolchain_first() -> None:
     assert not any(seg.endswith("/sbin") for seg in segments)
 
 
-def test_job_unit_documents_where_path_actually_comes_from() -> None:
-    """取捨寫在產物本身：模板 unit 的 `Environment=PATH=` 會被 shim 丟掉。
+def test_job_unit_carries_path_as_the_second_layer() -> None:
+    """#679：模板 unit **必須**有 `Environment=PATH=`，且值由產生器導出。
 
-    shim 以 `execvpe(argv[0], argv, spec['env'])` 整份換掉環境，job 解析命令用的
-    PATH 因此來自 **spec 的 env**（Manager 端 `PSC_BUILDER_PATH`），不是 unit。
-    在 unit 裡寫一行 `Environment=PATH=` 只會是一個看起來承載作用、實際無效的設定。
+    #640 當時的判斷是「shim 以 `execvpe(argv[0], argv, spec['env'])` 整份換掉環境，
+    寫在 unit 上會被丟掉」——對了一半：spec 的 env 確實是 job 的完整環境，但產生它的
+    `build_job_env()` 當時 fail-open，於是「spec 沒給 PATH」與「unit 沒有 PATH」同時
+    成立，兩層皆空。#679 兩層都補：spec 那層 fail-closed，unit 這層是 shim 的退路
+    （root-owned、比 spec 更可信），並讓加固面複本自動帶上 production 的 PATH。
     """
     unit = build_job_unit(THREE_WAY_SCHEME, DEFAULT_LAYOUT)
-    assert "\nEnvironment=PATH=" not in unit.content, "不得產生無效的 PATH 指令"
+    assert f"\nEnvironment=PATH={DEFAULT_LAYOUT.job_path_value()}\n" in unit.content
     assert f"PSC_BUILDER_PATH={DEFAULT_LAYOUT.job_path_value()}" in unit.content
     assert DEFAULT_LAYOUT.toolchain_root in unit.content
     assert "execvpe" in unit.content, "取捨的理由必須留在產物裡"
+
+
+def test_job_unit_path_is_derived_not_hardcoded() -> None:
+    """值必須跟著 `PathLayout` 走——改部署根就跟著改，不是寫死的字面量。"""
+    from paulsha_cortex.trust_root.permgen import PathLayout
+
+    layout = PathLayout(instance="acme", deploy_root="/srv/acme")
+    unit = build_job_unit(THREE_WAY_SCHEME, layout)
+    assert f"\nEnvironment=PATH={layout.job_path_value()}\n" in unit.content
+    emitted = unit.content.split("\nEnvironment=PATH=", 1)[1].split("\n", 1)[0]
+    assert emitted.startswith("/srv/acme/toolchain/bin:"), emitted
+    assert DEFAULT_LAYOUT.toolchain_bin not in emitted
 
 
 def test_builder_path_env_name_matches_the_job_runner_contract() -> None:
