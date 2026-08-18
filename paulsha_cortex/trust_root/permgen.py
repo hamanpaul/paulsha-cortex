@@ -2128,6 +2128,10 @@ class PathLayout:
             "gate-ledger": self.dispatch_log_root,
             "delivery-journal": f"{c}/delivery-journal.json",
             "provider-backoff": f"{c}/provider-rate-limit-backoff.json",
+            # #684：planning probe 的跨 tick 快取。Manager-owned 葉檔，**不**列入
+            # 任何 job 模板 unit 的 RWP（登記表的 writers/readers 只有 MANAGER，
+            # 因此 `required_write_targets()` 對 job 帳號機械地不會產出這一條）。
+            "planning-probe-cache": f"{c}/planning-probe-cache.json",
             "workflow-report-journal": f"{c}/workflow-report-transactions",
             "digest-outbox": f"{c}/digest/outbox",
             "engineering-outcome-outbox": f"{c}/engineering-outcomes",

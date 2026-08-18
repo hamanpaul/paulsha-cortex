@@ -16,7 +16,8 @@ from pathlib import PurePosixPath
 from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
-from . import job_runner
+from ..config import paths
+from . import job_runner, planning_probe_cache
 from .launcher import build_agy_argv
 from .model_identities import (
     AGY_MODEL_ID,
@@ -1283,6 +1284,7 @@ def build_production_planning_runtime(
     timeout_seconds: int = 120,
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
+    probe_cache_path: str | Path | None = None,
 ) -> ProductionPlanningRuntime:
     """Build the daemon's real, safe, heterogeneous planning adapters.
 
@@ -1303,6 +1305,12 @@ def build_production_planning_runtime(
 
     四個 adapter 與兩種 probe 全部走同一個 invoker——票 E 因此只換一個物件，
     不必再碰任何呼叫端。
+
+    issue #684（票 C）：probe 結果跨 tick 快取。`probe_cache_path` 未給時落在
+    `<coordinator_root>/planning-probe-cache.json`（登記表資產
+    `planning-probe-cache`，Manager-owned 0600）。快取層**永不 raise**：讀不回來
+    ／指紋不符／TTL 過期一律視為 miss 重探，因此本函式的失敗語意與 #684 之前逐字
+    相同（見 `planning_probe_cache` 的模組 docstring）。
     """
 
     if invoker is not None and runner is not None:
@@ -1315,20 +1323,38 @@ def build_production_planning_runtime(
         )
     root = Path(worktree).resolve()
     registry = load_model_identities()
+    cache = planning_probe_cache.ProbeCache.open(
+        probe_cache_path
+        if probe_cache_path is not None
+        else planning_probe_cache.cache_path(paths.coordinator_root())
+    )
+    roster = planning_probe_cache.roster_digest(registry)
     probes: dict[tuple[str, str], CapabilityProbe] = {}
+    planning_keys: list[tuple[str, str]] = []
     for identity in registry.identities:
         if "planning" not in identity.capabilities:
+            continue
+        key = (identity.executor, identity.model_id)
+        planning_keys.append(key)
+        # #684：指紋是「這一格的 probe 前提」——`PSC_JOB_RUNNER`、PATH 解析到的
+        # executor 絕對路徑與 stat、憑證檔 stat、加固剖面、**模板 unit 檔本身**的
+        # stat、roster 摘要。任何一格變了就重探；算不出來的那一格落
+        # `<unresolved:…>`，同樣是一個會變的值。
+        fingerprint = planning_probe_cache.compute_fingerprint(identity, roster=roster)
+        cached = cache.get(identity, fingerprint=fingerprint)
+        if cached is not None:
+            probes[key] = cached
             continue
         if identity.executor == "agy" and identity.model_id == AGY_MODEL_ID:
             # agy 的能力探測是兩步 CLI 協定，不是一個 prompt——它拿的是 invoker
             # 的 `capability_probe_runner()` 接縫（見該方法的 docstring），
             # 而不再是呼叫端手上的裸 runner。
-            probes[(identity.executor, identity.model_id)] = probe_agy_capability(
+            probe = probe_agy_capability(
                 runner=invoker.capability_probe_runner(),
                 timeout_seconds=min(timeout_seconds, 45),
             )
         else:
-            probes[(identity.executor, identity.model_id)] = _probe_identity(
+            probe = _probe_identity(
                 identity,
                 worktree=root,
                 invoker=invoker,
@@ -1336,6 +1362,11 @@ def build_production_planning_runtime(
                 evidence_root=evidence_root,
                 run_id=run_id,
             )
+        probes[key] = probe
+        cache.put(identity, probe, fingerprint=fingerprint)
+    # roster 不再含有的 identity 自動清除（`not_claimable.clear()` 的同型）：
+    # 沒有消費者的探測結果留著只會讓 operator 對一筆永不更新的紀錄猜。
+    cache.flush(keep=planning_keys)
 
     primary_identity = registry.get(*primary)
 
