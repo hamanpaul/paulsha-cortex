@@ -512,6 +512,16 @@ class ToolchainProgram:
     #: 一份加固面下**——這正是 #643 的剖面推導（只看 executor 名）看不到的那一格。
     #: 值為 executor 名（⇒ 該 executor 的 job 模板 unit）或 :data:`MANAGER_SURFACE`。
     consumed_by: tuple[str, ...] = ()
+    #: 在 `SystemCallFilter=@system-service` 下，本程式**實機量到**會撞上的、被過濾
+    #: 掉的 syscall（#673）。
+    #:
+    #: **這是與 `needs_node` 正交的第二個加固維度，刻意不共用那個欄位**：
+    #: `needs_node` 導向「換一份放寬 `MemoryDenyWriteExecute` 的剖面」，本欄位導向
+    #: 「被過濾時不得致命」——處置方向相反，適用面也不同（本欄位涵蓋跑在 Manager
+    #: unit 上的非 executor，那一格根本沒有剖面）。詳見 `SECCOMP_FATALITY_KEY` 段。
+    #:
+    #: 只填**有 audit record 背書**的（`type=1326 … syscall=<n>`），不填形態推論。
+    filtered_syscalls: tuple[str, ...] = ()
 
 
 #: #640 的名字，保留為別名：那時表上只有 executor，型別名跟著語意走；#661 把非
@@ -531,6 +541,7 @@ ExecutorTool = ToolchainProgram
 EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ExecutorTool(
         "codex", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
+        filtered_syscalls=("pkey_alloc",),
         note=(
             "唯一硬需要 node 的：本體是 JS，進入點的 shebang 是 `#!/usr/bin/env node`。"
             "單搬那支 `.js` 會缺 `node_modules`，必須整包搬 npm 套件樹。"
@@ -544,6 +555,7 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ),
     ExecutorTool(
         "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=False,
+        filtered_syscalls=("pkey_alloc",),
         note=(
             "shell script，但**內部再 exec node**（#643 實機量測確認：完整加固面下 "
             "`--version` 空輸出，單獨拿掉 `MemoryDenyWriteExecute` 即正常，與 codex "
@@ -571,6 +583,7 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
 SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
     ToolchainProgram(
         "srt", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
+        filtered_syscalls=("pkey_alloc",),
         note=(
             "`@anthropic-ai/sandbox-runtime` 的進入點（npm bin `srt` → `dist/cli.js`），"
             "**Claude review sandbox 的強制面**：doctor 的 `review-sandbox` probe 與 "
@@ -595,6 +608,7 @@ SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
     ),
     ToolchainProgram(
         "openspec", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
+        filtered_syscalls=("pkey_alloc",),
         note=(
             "`@fission-ai/openspec` 的進入點（`bin/openspec.js`）。ship 段的 "
             "`openspec archive -y` 與 preflight 的 `openspec validate` 都是**採信判準**"
@@ -2781,9 +2795,16 @@ _HARDENING: tuple[tuple[str, str, str], ...] = (
     ("SystemCallArchitectures", "native",
      "只允許原生 ABI，封掉經 32-bit compat 介面規避 seccomp。"),
     ("SystemCallFilter", "@system-service",
-     "seccomp 白名單：只留一般服務所需 syscall。"),
+     "seccomp 白名單：只留一般服務所需 syscall。※ #673 實機量到它會過濾掉 "
+     "`pkey_alloc`（V8 啟動時會叫），但**不放寬**：處置在下一行的過濾語意，"
+     "不在白名單。"),
     ("SystemCallErrorNumber", "EPERM",
-     "被過濾的 syscall 回 EPERM 而非 SIGSYS——失敗可觀測，不是無聲當掉。"),
+     "被過濾的 syscall 回 EPERM 而非 SIGSYS——失敗可觀測，不是無聲當掉。"
+     "※ **本行承重，刪掉會讓六份 job unit 上的 codex／copilot 同時靜默死**"
+     "（#673 實機：systemd 預設的 SECCOMP_RET_KILL_PROCESS 會在 V8 叫 "
+     "`pkey_alloc` 時當場殺掉 node，rc=1、stdout 與 stderr 皆空）。它**不放行"
+     "任何 syscall**，被擋的照樣擋，因此不是放寬。要動它必須先讀 "
+     "`SECCOMP_FATALITY_KEY` 那一段——import 時有強制檢查。"),
     ("RemoveIPC", "yes", "服務結束即清掉該 UID 的 IPC 物件，不留跨 job 殘留。"),
     ("KeyringMode", "private", "私有 kernel keyring：不共用、不繼承金鑰。"),
     ("UMask", "0077",
@@ -2952,6 +2973,171 @@ def executor_hardening_profile(executor: str) -> HardeningProfile:
             "落到放寬的那一份。"
         )
     return HARDENING_PROFILES_BY_ID[profile_id]
+
+
+# ---------------------------------------------------------------------------
+# seccomp 過濾語意（#673）——與加固剖面**正交**的第二個維度
+#
+# #643 的剖面只有一個軸：「這個 executor 要不要 W+X 記憶體」（`needs_node` ⇒
+# `MemoryDenyWriteExecute`）。#673 在實機量到第二個軸，而它**不是**剖面問題：
+#
+#   `SystemCallFilter=@system-service` 會過濾掉 `pkey_alloc`（x86_64 syscall 330，
+#   systemd 歸在 `@pkey`，而 `@pkey` 不在 `@system-service` 的 16 個子集合裡）。
+#   V8 啟動時會叫它。在 systemd **預設**的過濾語意（`SECCOMP_RET_KILL_PROCESS`）下，
+#   node 當場被 SIGSYS 殺掉——rc=1、stdout 與 stderr **皆空**；在
+#   `SystemCallErrorNumber=EPERM` 下，V8 收到 `EPERM` 走 fallback，一切正常。
+#   （kernel audit 直接證據：`type=1326 … comm="node" sig=31 syscall=330
+#   code=0x80000000`；全程沒有任何一筆 `landlock_*`／`seccomp` 的 record。）
+#
+# 因此承重的不是「放不放行那支 syscall」，而是「被過濾時致不致命」。兩者在安全面
+# 上差很多：放行 `pkey_alloc` 是**放寬過濾器**（多一支 syscall 可用）；
+# `SystemCallErrorNumber=EPERM` **不放行任何 syscall**——被擋的照樣擋，只是回錯誤碼
+# 而非殺行程。#673 的量測結論因此是**不放寬**：`SystemCallFilter=@system-service`
+# 在八份 unit（六份 job 模板 ＋ manager ＋ monitor）上逐字不動。
+#
+# **為何不把這個維度塞進 `needs_node`**（那樣兩件事會繼續混在一起）：
+#   1. **適用面比剖面大**。剖面只覆蓋 `EXECUTOR_TOOLS`；`openspec` 是
+#      `SERVICE_TOOLS`，跑在 **Manager unit** 上——那一格沒有剖面，卻同樣撞
+#      `pkey_alloc`（#673 實機 audit 確認）。綁在剖面上會整個漏掉 Manager 面。
+#   2. **處置方向相反**。`needs_node` 導向「換一份放寬的剖面」；本維度導向「一個
+#      所有剖面都**不得**分岔的鎖定鍵」。
+#   3. **證據等級不同**。`filtered_syscalls` 每一列都有 audit record 背書，不是
+#      「它是 node，所以大概會」。
+#
+# 落法沿用 permgen 既有做法：事實填在既有那張登記表（`ToolchainProgram.
+# filtered_syscalls`）上一格，需求由它**機械導出**，import 時強制——不另立第二張
+# 人工對照表，也不靠 review 記得。
+# ---------------------------------------------------------------------------
+
+#: 加固表中決定「被 `SystemCallFilter=` 擋掉的 syscall 致不致命」的那一個鍵。
+SECCOMP_FATALITY_KEY: str = "SystemCallErrorNumber"
+
+#: 剖面**永遠不得**分岔的鍵：seccomp 白名單本身，與它的過濾語意。
+#:
+#: 白名單在此是因為「放寬 syscall」必須是全域可稽核的一次決定，不能變成某份剖面
+#: 偷偷多開一支；過濾語意在此是因為它是**全部** node 型程式的存活條件，per-profile
+#: 分岔等於讓其中一份剖面靜默地殺掉 codex／copilot。
+#:
+#: 與 :data:`PROFILE_DIVERGENCE_KEYS` 恆為互斥（import 時強制）：想分岔其中任一項，
+#: 必須先把它從這裡拿掉——而那是一個看得見的 diff。
+PROFILE_LOCKED_KEYS: frozenset[str] = frozenset(
+    {"SystemCallFilter", SECCOMP_FATALITY_KEY}
+)
+
+
+def seccomp_filter_is_fatal(table: Mapping[str, str]) -> bool:
+    """該加固表下，被過濾的 syscall 會不會**殺掉行程**。
+
+    systemd 的語意：`SystemCallErrorNumber=` 未設或設為空 ⇒ 預設動作是
+    `SECCOMP_RET_KILL_PROCESS`（SIGSYS）；設成 errno 名或數字 ⇒ 該 syscall 回那個
+    錯誤碼、行程續跑。
+    """
+
+    return not str(table.get(SECCOMP_FATALITY_KEY, "") or "").strip()
+
+
+@dataclass(frozen=True)
+class FilteredSyscallSurface:
+    """一支**量到會撞被過濾 syscall** 的程式 × 它實際跑的加固面上的過濾語意。"""
+
+    program: str
+    #: 實機量到的、被 `@system-service` 擋掉的 syscall。
+    syscalls: tuple[str, ...]
+    #: 剖面 id（executor）或 :data:`MANAGER_SURFACE`（非 executor 的消費者面）。
+    surface: str
+    #: 該面上被過濾的 syscall 是否致命——**為真即是缺陷**。
+    fatal: bool
+    detail: str
+
+
+def _surface_hardening_table(surface: str) -> tuple[dict[str, str], str]:
+    """加固面名 → 該面生效的加固表。與 :func:`_surface_allows_wx` 同一組判準。"""
+
+    if surface == MANAGER_SURFACE:
+        return {key: value for key, value, _why in _HARDENING}, MANAGER_SURFACE
+    profile = executor_hardening_profile(surface)
+    return profile.effective(), f"executor {surface} ⇒ 剖面 {profile.profile_id}"
+
+
+def filtered_syscall_surfaces() -> tuple[FilteredSyscallSurface, ...]:
+    """全部 `filtered_syscalls` 非空的程式 × 它跑的每一個加固面（機械導出）。
+
+    executor 走自己的剖面；非 executor 走 `consumed_by` 指到的消費者面（executor
+    名 ⇒ 該 executor 的剖面；:data:`MANAGER_SURFACE` ⇒ Manager／monitor unit 的
+    加固表）。**不另立清單**：改一支程式的形態只改 :data:`TOOLCHAIN_PROGRAMS`
+    上那一列，這裡跟著動。
+    """
+
+    executor_names = {tool.name for tool in EXECUTOR_TOOLS}
+    findings: list[FilteredSyscallSurface] = []
+    for tool in TOOLCHAIN_PROGRAMS:
+        if not tool.filtered_syscalls:
+            continue
+        surfaces = (
+            (tool.name,) if tool.name in executor_names else tuple(tool.consumed_by)
+        )
+        if not surfaces:
+            # `consumed_by` 空的非 executor 無從得知它跑在哪一面——那是登記表的漏，
+            # 不是可以省略的一格。fail-closed 交給 `_validate_seccomp_tolerance`。
+            findings.append(
+                FilteredSyscallSurface(
+                    program=tool.name,
+                    syscalls=tool.filtered_syscalls,
+                    surface="",
+                    fatal=True,
+                    detail="未登記 consumed_by，無法判定它跑在哪一份加固面上",
+                )
+            )
+            continue
+        for surface in surfaces:
+            table, label = _surface_hardening_table(surface)
+            fatal = seccomp_filter_is_fatal(table)
+            findings.append(
+                FilteredSyscallSurface(
+                    program=tool.name,
+                    syscalls=tool.filtered_syscalls,
+                    surface=surface,
+                    fatal=fatal,
+                    detail=(
+                        f"{label}（{SECCOMP_FATALITY_KEY}="
+                        f"{table.get(SECCOMP_FATALITY_KEY, '') or '（未設＝致命）'}）"
+                    ),
+                )
+            )
+    return tuple(findings)
+
+
+def _validate_seccomp_tolerance() -> None:
+    """import 時強制 #673 的不變式。三條，缺一即讓 import 炸掉。"""
+
+    overlap = sorted(PROFILE_LOCKED_KEYS & PROFILE_DIVERGENCE_KEYS)
+    if overlap:
+        raise ValueError(
+            f"PROFILE_LOCKED_KEYS 與 PROFILE_DIVERGENCE_KEYS 重疊: {overlap}"
+            "——鎖定鍵的意思就是任何剖面都不得分岔它。"
+        )
+    known = {key for key, _value, _why in _HARDENING}
+    missing = sorted(PROFILE_LOCKED_KEYS - known)
+    if missing:
+        raise ValueError(
+            f"PROFILE_LOCKED_KEYS 指到 _HARDENING 沒有的鍵: {missing}"
+            "——鎖一個不存在的鍵不會擋住任何東西。"
+        )
+    broken = [item for item in filtered_syscall_surfaces() if item.fatal]
+    if broken:
+        detail = "；".join(
+            f"{item.program}（{', '.join(item.syscalls)}）在 {item.detail}"
+            for item in broken
+        )
+        raise ValueError(
+            "#673 不變式失守：下列程式實機量到會撞被 `SystemCallFilter=` 過濾掉的 "
+            f"syscall，而它們的執行面是**致命**過濾語意 ⇒ 會靜默死（rc=1、無輸出）：{detail}。"
+            f"處置是把該面的 `{SECCOMP_FATALITY_KEY}` 設成一個 errno（現行為 EPERM），"
+            "**不是**把那些 syscall 加進 `SystemCallFilter=` 白名單——後者是放寬，前者不是。"
+        )
+
+
+_validate_seccomp_tolerance()
 
 
 @dataclass(frozen=True)
@@ -5023,6 +5209,126 @@ def transient_unit_properties(
         retired=RETIRED_JOB_WRITE_ASSETS,
     ):
         props.append(f"--property=ReadWritePaths={rwp}")
+    return tuple(props)
+
+
+# ---------------------------------------------------------------------------
+# 從**已落檔的 unit** 機械導出 systemd-run 的 --property= 清單（#673）
+#
+# 為什麼不能用上面的 `transient_unit_properties()` 代替：那一支是從**產生器**展開
+# 的，它回答的是「permgen 現在會產出什麼」。runbook 要驗的是另一個命題——「磁碟上
+# 那份 unit 現在是什麼」。兩者會漂移（runbook 自己就記著「產生器修好 ≠ 已落檔的
+# unit 跟著更新，#643 的教訓」），而漂移正是要被驗出來的東西。
+#
+# 為什麼不能手抄子集：#638（單 UID 讓 ACL 斷言真空）、#657（同型）、#673 是同一族
+# 事故的第一、二、三次。#673 特別值得記：它的複本抄了 `SystemCallFilter=` 卻漏抄
+# `SystemCallErrorNumber=EPERM`，於是複本比 production **更嚴格**，量出一個
+# production 沒有的 rc=1——**手抄子集的假綠與假紅一樣會發生**，方向不由人選。
+#
+# 因此本函式的契約是「全帶，不選」：`[Service]` 段除了明示排除的執行面指令
+# （`ExecStart=` 之類，探針要換掉它）以外**全部**帶進 `--property=`。新增一項加固
+# 時 runbook 不必改、也不會漏——這就是它與 grep 白名單的差別。
+# ---------------------------------------------------------------------------
+
+#: 複製加固面時**不該**帶進 `systemd-run` 的 `[Service]` 指令。
+#:
+#: 判準是「這一項描述的是**跑什麼／怎麼收尾**，不是**在什麼條件下跑**」。刻意寫成
+#: 排除表而非允許表：允許表漏一項＝複本比 production 弱一項且沒人看得見，排除表漏
+#: 一項＝探針多帶一個無害的屬性、最壞情況是 `systemd-run` 當場報錯（看得見）。
+UNIT_REPLICA_EXCLUDED_KEYS: frozenset[str] = frozenset({
+    "ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
+    "ExecReload", "ExecCondition",
+    "Type", "Restart", "RestartSec", "RemainAfterExit", "GuessMainPID",
+    "PIDFile", "BusName", "NotifyAccess", "WatchdogSec",
+    "TimeoutStartSec", "TimeoutStopSec", "TimeoutSec", "RuntimeMaxSec",
+    "KillMode", "KillSignal", "SuccessExitStatus", "FinalKillSignal",
+    "StandardInput", "StandardOutput", "StandardError", "SyslogIdentifier",
+})
+
+
+class UnitReplicaDriftError(ValueError):
+    """已落檔的 unit 少了加固表上的鍵——複本會**比 production 弱**，一律拒絕產出。
+
+    這是本函式存在的唯一理由：靜默產出一份少幾條的清單，就是把 #673 再演一次。
+    """
+
+
+def _unit_service_directives(unit_text: str) -> list[tuple[str, str]]:
+    """把一份 unit 的 `[Service]` 段讀成 (key, value) 序列（保留重複鍵的順序）。"""
+
+    directives: list[tuple[str, str]] = []
+    section: str | None = None
+    pending: str | None = None
+    for raw in unit_text.splitlines():
+        line = raw.rstrip("\n")
+        if pending is not None:
+            # 續行：systemd 以行尾 `\` 續行，值以空白接續。
+            merged = pending + " " + line.strip()
+            if merged.endswith("\\"):
+                pending = merged[:-1].rstrip()
+                continue
+            pending = None
+            key, _, value = merged.partition("=")
+            directives.append((key.strip(), value.strip()))
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        header = re.fullmatch(r"\[([^\]]+)\]", stripped)
+        if header is not None:
+            section = header.group(1)
+            continue
+        if section != "Service" or "=" not in stripped:
+            continue
+        if stripped.endswith("\\"):
+            pending = stripped[:-1].rstrip()
+            continue
+        key, _, value = stripped.partition("=")
+        directives.append((key.strip(), value.strip()))
+    return directives
+
+
+def unit_replica_properties(
+    unit_text: str,
+    *,
+    instance: str = "probe",
+    require_hardening: bool = True,
+) -> tuple[str, ...]:
+    """一份**已落檔**的 unit → `systemd-run --property=` 的**完整**清單。
+
+    runbook 與測試共用這一支，因此「真實加固面」在兩邊是同一個定義。
+
+    :param instance: 模板 unit 的 `%i` 代入值（探針用的假 job id）。
+    :param require_hardening: 產出前強制比對 :data:`_HARDENING` 的每一個鍵都在
+        unit 裡。**預設開啟**——關掉它就回到「複本可能比 production 弱」的世界。
+    :raises UnitReplicaDriftError: 落檔的 unit 少了加固鍵，或值裡留有本函式展不開的
+        systemd specifier（展不開就代表複本與 unit 不同義，寧可炸掉）。
+    """
+
+    props: list[str] = []
+    seen: set[str] = set()
+    for key, value in _unit_service_directives(unit_text):
+        if key in UNIT_REPLICA_EXCLUDED_KEYS:
+            continue
+        expanded = value.replace("%i", instance).replace("%%", "%")
+        leftover = re.search(r"%[a-zA-Z]", expanded)
+        if leftover is not None:
+            raise UnitReplicaDriftError(
+                f"{key}= 的值含本函式展不開的 systemd specifier "
+                f"{leftover.group(0)!r}：{value!r}。複本與 unit 不同義時**不產出**"
+                "——請先把該 specifier 加進展開規則，不要讓探針帶著一個字面上的 % 跑。"
+            )
+        seen.add(key)
+        props.append(f"--property={key}={expanded}")
+    if require_hardening:
+        missing = [key for key, _value, _why in _HARDENING if key not in seen]
+        if missing:
+            raise UnitReplicaDriftError(
+                f"已落檔的 unit 缺少加固鍵 {missing}——用它組出來的複本會**比 "
+                "production 弱**，在那個複本下取得的綠不承載任何語意（#638／#657／"
+                "#673 同一族事故）。先重跑產生器落檔："
+                "`python3 -m paulsha_cortex.trust_root unit …`。"
+            )
     return tuple(props)
 
 

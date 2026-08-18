@@ -40,6 +40,21 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     #   MemoryDenyWriteExecute，給 node 型
                                                     #   executor（codex／copilot）用，
                                                     #   unit 名尾綴 -jit）
+    python -m paulsha_cortex.trust_root unit-replica <unit 檔路徑|->
+                                        [--instance <job id>]
+                                        [--allow-drift]
+                                                    # #673：把一份**已落檔**的 unit 讀成
+                                                    # systemd-run 的 --property= 完整清單，
+                                                    # 供 runbook／測試在**真實加固面**下
+                                                    # 跑探針。`-` 讀 stdin（可接
+                                                    # `systemctl cat`）。
+                                                    # 契約是「全帶，不選」：[Service] 段
+                                                    # 除執行面指令（ExecStart= 之類）外
+                                                    # 全部帶出——手抄子集是 #638／#657／
+                                                    # #673 同一族事故的成因。
+                                                    # 落檔的 unit 少了任一加固鍵即
+                                                    # **拒絕產出**（--allow-drift 可關，
+                                                    # 但那等於放棄本命令的用途）
     python -m paulsha_cortex.trust_root shim [four-way|three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
@@ -114,6 +129,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from . import permgen, registry, selfcheck
@@ -402,6 +418,56 @@ def main(argv: Sequence[str] | None = None) -> int:
             "monitor": permgen.build_monitor_unit,
         }
         print(builders[which](scheme).content, end="")
+        return 0
+    if command == "unit-replica":
+        rest = args[1:]
+        source: str | None = None
+        instance = "probe"
+        require_hardening = True
+        expect_instance = False
+        for token in rest:
+            if expect_instance:
+                instance = token
+                expect_instance = False
+            elif token == "--instance":
+                expect_instance = True
+            elif token.startswith("--instance="):
+                instance = token.split("=", 1)[1]
+            elif token == "--allow-drift":
+                require_hardening = False
+            elif not token.startswith("--") and source is None:
+                source = token
+            else:
+                print(f"unknown unit-replica arg: {token}", file=sys.stderr)
+                return 2
+        if expect_instance:
+            print("--instance 需要一個 job id", file=sys.stderr)
+            return 2
+        if source is None:
+            print(
+                "unit-replica 需要一個 unit 檔路徑（`-` 讀 stdin）",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            text = (
+                sys.stdin.read()
+                if source == "-"
+                else Path(source).read_text(encoding="utf-8")
+            )
+        except OSError as exc:
+            print(f"讀不到 unit: {exc}", file=sys.stderr)
+            return 2
+        try:
+            props = permgen.unit_replica_properties(
+                text, instance=instance, require_hardening=require_hardening
+            )
+        except permgen.UnitReplicaDriftError as exc:
+            # fail-closed：stdout 保持空的，被 `$(...)` 展開時不會產生半套清單。
+            print(str(exc), file=sys.stderr)
+            return 2
+        for prop in props:
+            print(prop)
         return 0
     if command == "shim":
         rest = args[1:]

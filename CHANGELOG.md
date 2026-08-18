@@ -8,6 +8,31 @@
 ## [Unreleased]
 
 ### Added
+- **#673：seccomp 過濾**語意**是加固剖面之外的第二個維度，且它是**承重**的**——
+  `@system-service` 確實過濾掉 V8 啟動時要用的 `pkey_alloc`（x86_64 330，systemd 歸在
+  `@pkey`；**不是** `@sandbox` 的 `landlock_*`／`seccomp`，kernel audit `type=1326 …
+  syscall=330` 為證，加 `@sandbox` 實測完全無效），但同一份 unit 上的
+  `SystemCallErrorNumber=EPERM` 讓被過濾的 syscall 只回錯誤碼、不殺行程，V8 走 fallback
+  ——以**完整 37 條** property 複製真 unit，四支 executor **全部 rc=0**，#673 回報的
+  「預設派工路徑靜默壞掉」不成立。新增 `ToolchainProgram.filtered_syscalls`（實機量到、
+  有 audit record 背書的被過濾 syscall；**刻意不共用 `needs_node`**——處置方向相反，
+  且 `openspec` 跑在根本沒有剖面的 Manager unit 上）、`SECCOMP_FATALITY_KEY`／
+  `PROFILE_LOCKED_KEYS`（`SystemCallFilter` 與 `SystemCallErrorNumber` 任何剖面都不得
+  分岔）、`filtered_syscall_surfaces()`（程式 × 執行面，由 `TOOLCHAIN_PROGRAMS` 機械
+  導出）與 import 時強制的 `_validate_seccomp_tolerance()`。**沒有放寬任何 syscall**：
+  八份 unit 的 `SystemCallFilter=@system-service` 逐字不動（沿用 #643 的「量到才改」，
+  而這次量到的結論是不用改）。
+- **#673：`permgen.unit_replica_properties()` ／ CLI `trust_root unit-replica`——加固面
+  複本改為從**已落檔的 unit** 全量機械導出**。#673 的 repro 是一份手抄的十 property
+  複本，抄了 `SystemCallFilter=` 卻漏抄 `SystemCallErrorNumber=EPERM`，於是**比
+  production 更嚴格**，量出一個不存在的 P0——#638（單 UID 讓 ACL 斷言真空）、#657、
+  #673 是同一族的第一到第三次，而**假紅與假綠一樣會發生**。新函式的契約是「全帶，
+  不選」：`[Service]` 段除執行面指令外全部帶出（含 `ReadWritePaths=`／
+  `WorkingDirectory=`／per-account `Environment=`），落檔的 unit 少任一加固鍵即
+  `UnitReplicaDriftError` 且 stdout 保持空。runbook 4e／5-2b／5-3／5-4 的手抄子集全部
+  改走它，5-2b 的驗收由「正向四段」改為 **4 executor × 2 剖面 × 2 角色 unit 的全矩陣**
+  ＋**反向對照**（`claude`／`agy` 在 jit 剖面下仍須 rc=0），並更正其措辭（原宣稱是在
+  弱化環境下取得的）。
 - **#666：外部相依的窮舉盤點——判準從「這一類東西有哪些」改成「跑完一個 run 需要碰到
   什麼」**——`#640`（executor toolchain ＋ job 憑證）、`#661`／`#664`（`srt`／`openspec`／
   preflight backend）、#666（`pytest` ＋ Manager 的 gh 憑證）是同一族的第一到第五個成員，
