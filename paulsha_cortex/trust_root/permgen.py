@@ -75,7 +75,7 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from . import registry
 from .registry import (
@@ -632,6 +632,13 @@ class SystemProgram:
 #: **#661 之前這裡只有 `node` 一列**，而那是不完整的盤點：`srt` 在 Linux 上實際會去
 #: exec `bwrap` 與 `socat`（doctor 的 `review-sandbox` probe 逐一跑它們的 `--version`），
 #: Manager 則需要 `git`／`gh`。缺任何一支的症狀都不是「設定錯」而是「跑到一半才失敗」。
+#:
+#: **#666 的窮舉盤點又補上三支**，而三支都是「一直在用、只是從來沒被寫下來」的那種：
+#: `bash`（每一支 job 的 `command[0]` 就是它——wrapper 是 `bash -c <script>`）、
+#: `python3`（gate 宣告 `python3 -m pytest` 時解析到的是**系統層**那一支，不是部署
+#: venv 的）、`systemctl`（B 案定案之後，Manager 派工的第一個動作就是 exec 它）。
+#: 判準沒有改變——它們仍是「版本換掉幾乎不影響治理產出」的通用工具；改變的只是
+#: 「盤點有沒有做完」。
 SYSTEM_PROGRAMS: tuple[SystemProgram, ...] = (
     SystemProgram(
         "node", "apt: nodejs", ("codex", "copilot", "srt", "openspec"),
@@ -666,6 +673,54 @@ SYSTEM_PROGRAMS: tuple[SystemProgram, ...] = (
             "`socat -V` 驗證。"
         ),
     ),
+    SystemProgram(
+        "bash", "apt: bash（base system）", ("builder", "reviewer-planner", "manager"),
+        note=(
+            "**每一支 job 的 `command[0]` 就是它**（#666 窮舉盤點補上）。"
+            "`launcher.build_wrapper_script()` 產的是一段 shell script，"
+            "`launcher` 交給 runner 的 argv 是 `bash -c <script>`（reviewer 與降權 "
+            "builder）或 `bash -lc <script>`（direct builder）；降權模式下 shim 的 "
+            "`os.execvpe(command[0], …)` 執行的第一支程式因此是 `bash`。Manager 側的 "
+            "exit 記帳 shell（`job_runner.build_manager_exit_recorder_argv`）同樣是 "
+            "`bash -c`。\n"
+            "**為什麼它一直沒被盤到**：它落在 `JOB_PATH_SYSTEM_TAIL` 的 `/bin` 裡、"
+            "而且從來沒缺過，所以「沒被登記」與「不需要」在實機上長得一樣。這正是本"
+            "族每一次的形態——把它寫下來的價值不在於它會缺，而在於它是 job 執行面的"
+            "**第一段**：`ProtectSystem=strict` 或 `NoExecPaths` 之類的加固項哪天涵蓋"
+            "到 `/bin`，症狀會是「每一個 job 都起不來且沒有輸出」。"
+        ),
+    ),
+    SystemProgram(
+        "python3", "apt: python3", ("gate", "srt", "manager"),
+        note=(
+            "**gate 宣告解析到的是這一支，不是部署 venv 的那一支**（#666）。"
+            "`PSC_GATE_CMD_PYTEST=\"python3 -m pytest -q\"` 是相對名，由 gate 的 "
+            "`PSC_GATE_PATH`（`<toolchain>/bin` ＋ `JOB_PATH_SYSTEM_TAIL`）解析 ⇒ "
+            "`/usr/bin/python3`。gate unit 自己的 `ExecStart` 用的是 "
+            "`gate_runner.DEFAULT_GATE_PYTHON`（`<venv>/bin/python3`），但那只涵蓋 "
+            "ledger writer 本身；**operator 宣告的 gate 命令另外解析一次**。\n"
+            "這是 #666 兩個漂移項之一的機械成因：pytest 裝在 operator 的 user "
+            "site-packages 時，系統層的 `python3` 在 `ProtectHome=yes` 之後 import "
+            "不到它 ⇒ 每張 build 卡的 ledger 為空 ⇒ 撞 #540 的 acceptance chain。"
+            "系統層需要哪些 python 套件見 :data:`SYSTEM_PYTHON_DISTRIBUTIONS`。\n"
+            "doctor 的 `review-sandbox` probe 也把它列進 "
+            "`REVIEW_SANDBOX_EXECUTABLES`（`srt` 的沙箱 smoke test 拿它當被關的程式），"
+            "同樣走 `PATH` 解析。"
+        ),
+    ),
+    SystemProgram(
+        "systemctl", "apt: systemd", ("manager",),
+        note=(
+            "**B 案（模板 unit，0816 第三輪定案）的派工 client**（#666）。"
+            "`job_runner.build_systemctl_start_argv()` ／ `gate_runner` 起 job 與 gate "
+            "的方式就是 `systemctl start --wait <模板實例>`，`is-active` 查狀態亦然；"
+            "polkit 規則放行的也正是這條路徑。Manager 以 system unit 跑，因此它必須"
+            "落在 Manager 自己的 `PATH` 上——`job_runner` 是以 `which(\"systemctl\")` "
+            "解的，解不到就是「降權派工整條不可用」而不是單一 job 失敗。\n"
+            "**`systemd-run` 不另立一列**：那是附錄 B 的降級備援（A 案 transient unit），"
+            "同一個 `systemd` 套件出的，升降級不會只有其中一支在場。"
+        ),
+    ),
 )
 
 #: 系統層程式的名字（既有名稱保留；值由 :data:`SYSTEM_PROGRAMS` 機械導出，避免兩份
@@ -691,6 +746,172 @@ PREFLIGHT_BACKEND_MODULE = "policy_check.preflight"
 #: 版本必須逐字等於 `.project-policy.yml` 的 `policy_version`（引擎自己會驗，對不上就
 #: fail-closed），因此「裝哪一版」與 R-23 的 workflow pin 是同一個部署決定。
 PREFLIGHT_BACKEND_DISTRIBUTION = "policy-check"
+
+
+# ---------------------------------------------------------------------------
+# python 發行版（#666）——**第四種**外部相依，前三張表都收不下它
+#
+# `TOOLCHAIN_PROGRAMS` 與 `SYSTEM_PROGRAMS` 的形狀都是「一個落在 `PATH` 上的可執行
+# 檔」，而這一族不是：`pytest`／`PyYAML`／`policy-check` 是 **python 發行版**，
+# `import` 或 `python3 -m` 得到才有意義，`command -v` 對它們一律無解。硬塞進
+# `SYSTEM_PROGRAMS` 會讓「`TOOLCHAIN_SYSTEM_RUNTIMES` 的每一項都應該 `which` 得到」
+# 這條既有性質變成假的——那是把盤點完整性拿去換掉一條真的不變式，正是 #661 對
+# 「不要把 `srt` 併進 `EXECUTOR_TOOLS`」的同一條論證。
+#
+# **落在哪一個 interpreter 是關鍵，而且兩個都有人用**：
+#
+# - **系統層**（`/usr/bin/python3`）：operator 宣告的 gate 命令 `PSC_GATE_CMD_PYTEST=
+#   "python3 -m pytest -q"` 是**相對名**，由 gate 的 `PSC_GATE_PATH` 解析，落在
+#   `JOB_PATH_SYSTEM_TAIL` 的 `/usr/bin`。#666 的實機症狀就是這一格：pytest 只裝在
+#   operator 的 user site-packages，`ProtectHome=yes` 之後系統層的 `python3` import
+#   不到 ⇒ ledger 空 ⇒ 撞 #540 的 acceptance chain。
+# - **部署 venv**（`<deploy_root>/venv`）：cortex 自己與 preflight backend 住的地方，
+#   既有的 root-owned 部署資產，不需要新增檔案系統資產（#661 已裁決）。
+# ---------------------------------------------------------------------------
+
+#: :class:`PythonDistribution.interpreter` 的兩個值。
+SYSTEM_INTERPRETER = "system"
+DEPLOYMENT_VENV_INTERPRETER = "deployment-venv"
+
+
+@dataclass(frozen=True)
+class PythonDistribution:
+    """一個 python 發行版的部署決定（#666）。不是可執行檔，因此不進前兩張表。"""
+
+    #: PyPI 發行版名（`pip install` 用的那個名字）。
+    name: str
+    #: `import` ／ `python3 -m` 用的模組名（與發行版名常常不同，例如 PyYAML→yaml）。
+    module: str
+    #: 落在哪一個 interpreter：:data:`SYSTEM_INTERPRETER` 或
+    #: :data:`DEPLOYMENT_VENV_INTERPRETER`。
+    interpreter: str
+    #: **版本要求本身**——這是「明示的部署決定」那一半。刻意寫成 requirement 字串而
+    #: 不是解析出來的版本號：產生器是純函式，讀不到實機裝了哪一版；它能負責的是
+    #: 「約束從哪裡來」，實際落定的版本由 runbook 的驗證步驟記錄並比對。
+    requirement: str
+    #: 上面那條約束的**宣告來源**（唯一真相在哪個檔）。
+    declared_in: str
+    #: 誰需要它（帳號／角色名，讓 runbook 知道要以哪個身分實跑驗證）。
+    required_by: tuple[str, ...]
+    note: str
+
+    @property
+    def module_invocation(self) -> tuple[str, ...]:
+        """以 `-m` 執行時的 argv 尾段（可執行的那一族才有意義）。"""
+        return ("-m", self.module)
+
+
+#: **系統層** python 發行版（#666）。判準與 :data:`SYSTEM_PROGRAMS` 同一條：它們是
+#: 通用工具，換版本不改變治理判準；但「gate 用哪一版 pytest 跑測試」仍必須是可稽核
+#: 的部署決定，而不是跟著 operator 的 `pip install --user` 漂移。
+#:
+#: **這張表的存在條件是 operator 的 gate 宣告用相對名 `python3`**（見
+#: :data:`GATE_COMMAND_DECLARATIONS`）。改宣告成部署 venv 的絕對路徑 interpreter，
+#: 系統層這一份需求就整個消失——那是 operator 平面的裁決，不是產生器能替它做的，
+#: 因此這裡記的是**目前這個部署決定的後果**，不是唯一可能的形態。
+SYSTEM_PYTHON_DISTRIBUTIONS: tuple[PythonDistribution, ...] = (
+    PythonDistribution(
+        "pytest", "pytest", SYSTEM_INTERPRETER,
+        requirement="pytest>=7",
+        declared_in="pyproject.toml [project.optional-dependencies] test",
+        required_by=("gate",),
+        note=(
+            "gate 執行身分實際跑的 test runner。#666 實機症狀：裝在 operator 的 "
+            "`~/.local/lib/python3.12/site-packages`，`ProtectHome=yes` 之後 gate 身分"
+            "讀不到——\n"
+            "    $ sudo -u cortex-gate env HOME=<gate HOME> python3 -m pytest --version\n"
+            "    /usr/bin/python3: No module named pytest\n"
+            "後果不是「gate 失敗」而是**每張 build 卡的 ledger 為空**，接著整條 #540 "
+            "的 acceptance chain 卡住，而錯誤只在 manager.log 裡。\n"
+            "**落系統層而不是部署樹**：它是通用 test runner，不是「換版本會改變治理"
+            "產出」的那一類（與 `node` 同一條理由，與模型 CLI 相反）。但**版本仍是"
+            "部署決定**：約束由 `pyproject.toml` 的 `test` extra 宣告，實機解出來的"
+            "版本必須記進 runbook 並與 operator 側比對——同一台機器上兩個 "
+            "interpreter 各有一份 pytest 是常態，而版本分岔的症狀是「gate 判定與"
+            "本機跑不一樣」，不是報錯。\n"
+            "**加固面已實測**：CPython 不是 V8，`MemoryDenyWriteExecute=yes` 不影響"
+            "它（與 #643 的 node 型 executor 相反），完整加固面下跑得完。"
+        ),
+    ),
+    PythonDistribution(
+        "PyYAML", "yaml", SYSTEM_INTERPRETER,
+        requirement="PyYAML>=6",
+        declared_in="pyproject.toml [project] dependencies",
+        required_by=("gate",),
+        note=(
+            "**不是 pytest 的相依，是被測樹的相依**（#666 窮舉盤點；票上只點名了 "
+            "pytest，但實機兩個是一起裝的，理由在這裡）。gate 命令的 cwd 是 gate "
+            "自己那份工作樹副本，pytest 會把 rootdir 插進 `sys.path`，於是 "
+            "`import paulsha_cortex` 解到**被驗的那棵樹**，而 cortex 的 runtime "
+            "相依裡有 PyYAML。系統層的 `python3` 沒有它，收集階段就 ImportError ⇒ "
+            "pytest exit code 落在 `2`（collection error）⇒ 依 #307 的判準**不會**被"
+            "當成合格 RED，而是照一般規則記 failed。\n"
+            "**這條的一般形式**：`PSC_GATE_CMD_*` 用系統 interpreter 時，"
+            "**被治理 repo 的整組 runtime 相依**都成了系統層的部署決定。目前受治理的"
+            "只有 cortex 自己（PyYAML 一項），治理面擴到別的 repo 時這一列要跟著長。"
+        ),
+    ),
+)
+
+#: **部署 venv** 裡的 python 發行版（#666 把既有的兩個散落常數收進同一張表）。
+#: 落點是既有的 root-owned 部署資產（`<deploy_root>/venv`），因此**不新增任何檔案
+#: 系統資產**——這與 #661 對 preflight backend 的裁決逐字相同。
+DEPLOYMENT_PYTHON_DISTRIBUTIONS: tuple[PythonDistribution, ...] = (
+    PythonDistribution(
+        PREFLIGHT_BACKEND_DISTRIBUTION, PREFLIGHT_BACKEND_MODULE.split(".")[0],
+        DEPLOYMENT_VENV_INTERPRETER,
+        requirement=f"{PREFLIGHT_BACKEND_DISTRIBUTION}==<policy_version>",
+        declared_in=".project-policy.yml policy_version（＋ R-23 的 workflow pin）",
+        required_by=("manager",),
+        note=(
+            "preflight adapter 的 backend（#661）。版本必須逐字等於 "
+            "`.project-policy.yml` 的 `policy_version`——引擎自己會驗，對不上 "
+            "fail-closed；CI 端 R-23 另外釘住 workflow pin ⟷ `policy_version`，"
+            "兩條遞移出「本機跑的引擎版本 == CI 跑的引擎版本」。"
+        ),
+    ),
+    PythonDistribution(
+        "PyYAML", "yaml", DEPLOYMENT_VENV_INTERPRETER,
+        requirement="PyYAML>=6",
+        declared_in="pyproject.toml [project] dependencies",
+        required_by=("manager", "monitor"),
+        note=(
+            "cortex 自己唯一的 runtime 相依（deck／persona／model-identities 全是 "
+            "YAML）。隨 `pip install paulsha-cortex` 進 venv，**與系統層那一份是兩個"
+            "不同 interpreter 下的兩份**——列在這裡是為了讓「同一個發行版在兩個落點"
+            "各有一份」這件事是明寫的，而不是靠讀者自己發現。"
+        ),
+    ),
+)
+
+#: 兩個落點的聯集——窮舉盤點的輸入之一。
+PYTHON_DISTRIBUTIONS: tuple[PythonDistribution, ...] = (
+    SYSTEM_PYTHON_DISTRIBUTIONS + DEPLOYMENT_PYTHON_DISTRIBUTIONS
+)
+
+
+#: operator 應該宣告的 gate 命令（`PSC_GATE_CMD_<NAME>` → typed argv，#666）。
+#:
+#: 與 `job_path_value()`／`preflight_command_value()` 同一個定位：**產生器出建議值、
+#: operator 落進 root-owned 的 EnvironmentFile**，不是第二份執行期真相（執行期真相
+#: 永遠是 `gate_ledger.load_gate_specs()` 讀到的那份 env）。
+#:
+#: 把它寫下來買到兩件既有形態買不到的事：
+#:
+#: 1. **gate 宣告的每一段都可以被機械對照到某張表**——`python3` 必須在
+#:    :data:`SYSTEM_PROGRAMS` 上、`-m <module>` 必須在
+#:    :data:`SYSTEM_PYTHON_DISTRIBUTIONS` 上。#666 的漂移正是這條不成立而沒人看得見。
+#: 2. **覆蓋率**：doctor 的 `gate-declarations` probe 以 packaged deck 每張卡的
+#:    `test_policy` 導出應驗 gate 集合，宣告沒涵蓋到就是 required fail。本表必須是
+#:    那個集合的**超集**，否則照 runbook 裝出來的部署一開機 doctor 就是紅的。
+GATE_COMMAND_DECLARATIONS: Mapping[str, tuple[str, ...]] = MappingProxyType({
+    "pytest": ("python3", "-m", "pytest", "-q"),
+})
+
+#: gate 宣告的環境變數前綴。**與 `coordinator.gate_ledger.GATE_ENV_PREFIX` 是成對
+#: 契約**（同 `DEFAULT_TEMPLATE_UNIT`／`JOB_PATH_ENV_BY_PRINCIPAL` 的既有模式：
+#: `permgen` 與 `coordinator` 刻意不互相 import，改由契約測試釘住兩邊逐字相等）。
+GATE_COMMAND_ENV_PREFIX = "PSC_GATE_CMD_"
 
 
 #: 二分（**向後相容選項**，非預設）：builder 一個帳號，其餘 headless／Manager／
@@ -936,6 +1157,10 @@ _FILE_ASSET_IDS = frozenset({
     # 判定直接決定 permgen 會不會把一整個目錄 chown 給 job 帳號，而該目錄必須維持
     # root-owned 才有「能改內容、不能增刪換」那條性質。
     "builder-executor-credential",
+    # #666：`~/.config/gh/` 底下的兩個檔，理由與上一條逐字相同——那一層目錄必須維持
+    # root-owned，`hosts.yml` 與 `config.yml` 才能是**不同 owner** 的兩個檔。
+    "manager-gh-credential",
+    "manager-gh-config",
 })
 
 
@@ -1650,6 +1875,30 @@ class PathLayout:
         """
         return f"{self.venv_root}/bin/python3 -m {PREFLIGHT_ADAPTER_MODULE}"
 
+    def gate_command_env(self) -> dict[str, str]:
+        """`PSC_GATE_CMD_<NAME>` 的建議值（#666）。
+
+        由 :data:`GATE_COMMAND_DECLARATIONS` 機械導出，**不接受第二份手寫清單**。
+        值刻意是相對名（`python3`）而不是絕對路徑，理由與 `preflight_command_value()`
+        **相反**，因此值得寫清楚：
+
+        - preflight 的 backend 是**部署產物**（隨 cortex 進同一個 venv），落點由部署
+          決定，寫絕對路徑才驗得到「缺件在 doctor 就看得見」；
+        - gate 命令跑的是**被驗那棵樹的測試**，用的是 gate 的 `PSC_GATE_PATH`
+          （`<toolchain>/bin` ＋ :data:`JOB_PATH_SYSTEM_TAIL`）解析出來的系統
+          interpreter。這條路徑上的 python 需要哪些套件，見
+          :data:`SYSTEM_PYTHON_DISTRIBUTIONS`。
+
+        **改成部署 venv 的絕對 interpreter 是一個 operator 可以做、但本產生器不會替
+        它做的裁決**：那會讓系統層那兩個 python 套件的需求整個消失，同時也讓 gate 跑
+        的 pytest 版本與 cortex 自己的部署版本綁在一起。兩邊各有取捨，因此這裡只出
+        「目前這個部署決定」的值。
+        """
+        return {
+            f"{GATE_COMMAND_ENV_PREFIX}{name.upper()}": " ".join(argv)
+            for name, argv in GATE_COMMAND_DECLARATIONS.items()
+        }
+
     @property
     def job_shim(self) -> str:
         """降權 job 模板 unit 的固定 `ExecStart=`（root-owned，內容由 permgen 產）。"""
@@ -1710,6 +1959,53 @@ class PathLayout:
         認 `safe.directory`，因此位置由帳號的 HOME 決定，與 `~/.codex` 同一個模式。
         """
         return f"{self.home_of(account)}/.gitconfig"
+
+    def declared_accounts(self) -> tuple[str, ...]:
+        """本 layout 以**部署決定欄位**寫死的帳號名（#666）。
+
+        `asset_paths()` 刻意不吃 scheme，因此幾個掛在帳號 HOME 下的資產只能由這三個
+        欄位導出路徑，而它們取的是**定案的三分／四分**。二分把 Manager／reviewer／
+        planner 併進 `cortex-svc`，於是這三條路徑在二分部署裡不存在——「哪些資產在
+        本方案不適用」因此要拿這張清單去對 `UidScheme.declared_accounts()`，見
+        :func:`inapplicable_home_anchored_assets`。
+        """
+        return (self.builder_account, self.reviewer_planner_account, self.manager_account)
+
+    def gh_config_dir_of(self, account: str) -> str:
+        """該帳號的 `gh` 設定目錄（`~/.config/gh`）。**必須 root-owned**（#666）。
+
+        **為什麼是這條路徑而不是別條**：`gh` 依序看 `$GH_CONFIG_DIR` →
+        `$XDG_CONFIG_HOME/gh` → `$HOME/.config/gh`。產生出來的 unit 設 `HOME=` 與
+        `XDG_CACHE_HOME=`，**刻意不設 `XDG_CONFIG_HOME=`**，因此解析結果就是這一條。
+        哪天有人在 unit 或 EnvironmentFile 補上 `XDG_CONFIG_HOME`，憑證的實際落點會
+        跟著搬走而登記表不會知道——那是**無聲**的漂移（`gh auth status` 會變成
+        「未登入」，兩個 github provider 一起 `degraded`，而檔案還好端端躺在原處）。
+
+        與 `codex_hooks_dir_of()`／`executor_credential_dir_of()` 同一個模式：目錄
+        root-owned，底下才放得下「檔案 job/服務-owned、目錄 root-owned」那組性質。
+        """
+        return f"{self.home_of(account)}/.config/gh"
+
+    def gh_credential_of(self, account: str) -> str:
+        """該帳號的 `gh` **憑證**檔（`~/.config/gh/hosts.yml`）。由該帳號擁有、0600。
+
+        `hosts.yml` 是 `gh` 唯一寫回 token 的檔（`gh auth login`／`refresh` 就地覆寫
+        它）。因此它與 #640 裁決 (b) 的 `auth.json` 同一族：**檔案**由使用它的帳號
+        擁有（token 過期要 refresh 得回來），**放它的目錄維持 root-owned**。
+        """
+        return f"{self.gh_config_dir_of(account)}/hosts.yml"
+
+    def gh_settings_of(self, account: str) -> str:
+        """該帳號的 `gh` **非憑證**設定（`~/.config/gh/config.yml`）。root-owned、0644。
+
+        它與 `hosts.yml` **刻意不同 owner**，而且不是疏漏：`config.yml` 放的是
+        editor／pager／aliases／`prompt` 這類偏好，其中 **`aliases` 可以宣告 `!`
+        開頭的 shell alias**——讓服務帳號改得了它，等於把一條「Manager 自己就能把
+        任意命令掛進每一次 `gh` 呼叫」的執行面交還給它，與 `.gitconfig` 維持
+        root-owned 的理由（`core.fsmonitor`／`alias.*`）**逐字相同**。它不承載 token、
+        也不需要被寫回，因此 root-owned、對服務帳號唯讀就夠。
+        """
+        return f"{self.gh_config_dir_of(account)}/config.yml"
 
     @property
     def builder_home(self) -> str:
@@ -1778,6 +2074,11 @@ class PathLayout:
             "builder-executor-credential": self.executor_credential_of(
                 self.builder_account
             ),
+            # #666：Manager 的 gh 登入態。**兩個檔刻意不同 owner**——`hosts.yml` 承載
+            # token（要 refresh ⇒ 服務帳號擁有），`config.yml` 是偏好設定（可宣告
+            # `!` shell alias ⇒ 必須 root-owned 唯讀）。
+            "manager-gh-credential": self.gh_credential_of(self.manager_account),
+            "manager-gh-config": self.gh_settings_of(self.manager_account),
             "repo-worktree": job,
             "dispatch-worktree-pool": wt,
             "jobs-registry": f"{c}/jobs.json",
@@ -1860,6 +2161,18 @@ class PathLayout:
                     (self.executor_credential_dir_of(account), root, g(root), 0o755)
                 )
             account_dirs.append((self.cache_of(account), account, g(account), 0o700))
+        # #666：**durable state owner 才需要** `~/.config/gh` 那兩層。`gh` 依序看
+        # `$GH_CONFIG_DIR` → `$XDG_CONFIG_HOME/gh` → `$HOME/.config/gh`，而產生出來的
+        # unit 只設 `HOME=` 與 `XDG_CACHE_HOME=`（**刻意不設 `XDG_CONFIG_HOME=`**），
+        # 因此落點就是這一條。兩層都 root-owned：底下要放得下「`hosts.yml` 服務帳號
+        # 擁有、`config.yml` root-owned」這組不同 owner 的檔，而那組性質全部建立在
+        # 「目錄沒有 `w` 位給服務帳號」上。
+        #
+        # **job 帳號刻意沒有這一層**：job unit 帶 `Environment=GH_TOKEN=`／
+        # `GITHUB_TOKEN=` 把 token 清空，GitHub 寫入一律由 Manager 代理（D1 outbox）。
+        # 為 job 建出 gh 設定目錄等於替一條被明確關掉的通道預留位置。
+        account_dirs.append((f"{self.home_of(svc)}/.config", root, g(root), 0o755))
+        account_dirs.append((self.gh_config_dir_of(svc), root, g(root), 0o755))
         return _dedupe_scaffold((
             # 部署樹（enforcement plane）：全 root，對 svc／builder 唯讀。
             (self.deploy_root, root, g(root), 0o755),
@@ -1986,6 +2299,14 @@ def principal_needs_write(
 #: 因為那需要在同目錄建檔。診斷方式見 Phase 2b runbook 第 4e 步。
 IN_PLACE_CONTENT_WRITE_ASSETS: frozenset[str] = frozenset({
     "builder-executor-credential",
+    # #666：Manager 的 gh token。與上一條同形，但**洩漏面不同級**，這點不得混談：
+    # #640 的憑證是給 **job 帳號**的，job unit 另有 `Environment=GH_TOKEN=` 把 token
+    # 清空、成果一律走 spool 由 Manager 代理推送；這一份是給 **Manager** 的，而
+    # Manager 是 durable state owner——它的 token 推得動 PR、關得掉 issue、改得了
+    # label。折算成父目錄會讓 Manager unit 的 mount 層開放整個 `~/.config/gh`，
+    # 連 root-owned 的 `config.yml`（可宣告 `!` shell alias）一起可寫，等於把「改不了
+    # 自己的 gh 設定」這條性質從兩層拆成零層。
+    "manager-gh-credential",
 })
 
 
@@ -2010,6 +2331,58 @@ IN_PLACE_CONTENT_WRITE_ASSETS: frozenset[str] = frozenset({
 RETIRED_JOB_WRITE_ASSETS: frozenset[str] = frozenset({
     "review-verdict",
 })
+
+
+def home_anchored_account(layout: PathLayout, path: str) -> str | None:
+    """`path` 掛在**哪一個 layout 帳號欄位**的 HOME 底下（否則回 `None`）。純字串。
+
+    比對來源刻意只有 :meth:`PathLayout.declared_accounts`（三個部署決定欄位），
+    **不是**「`home_root` 底下的第一段」——durable state 樹本身就住在
+    `<home_root>/cortex`，用字串切段會把整棵樹誤判成某個叫 `cortex` 的帳號的 HOME。
+    """
+    for account in layout.declared_accounts():
+        home = layout.home_of(account)
+        if path == home or path.startswith(home.rstrip("/") + "/"):
+            return account
+    return None
+
+
+def inapplicable_home_anchored_assets(
+    plan: PermissionPlan,
+    layout: PathLayout,
+) -> tuple[tuple[str, str], ...]:
+    """`(asset_id, path)`：掛在**本方案不存在的帳號** HOME 下的資產（#666）。
+
+    登記表資產是 1:1 綁到一條絕對路徑的，而幾個 HOME-anchored 資產的路徑由
+    :class:`PathLayout` 的**部署決定欄位**（`manager_account`／
+    `reviewer_planner_account`）導出，那幾個欄位取的是**定案的三分／四分**；二分
+    方案把 Manager／reviewer／planner 全併進 `cortex-svc`，於是同一條路徑在二分
+    部署裡**根本不存在**。這在登記表既有的 note 裡已經寫成「二分下該資產不適用」，
+    而權限那一半也早就以 `[ ! -e ] || …` 守衛表達了它。
+
+    **本函式補的是 `ReadWritePaths` 那一半**：systemd 對不存在的 `ReadWritePaths=`
+    目標會讓 unit **直接起不來**，因此「不適用」不能只在權限面成立。#642 當時的處置
+    是「乾脆不登記第二份憑證」（`builder-executor-credential` 的 note 有整段論證）；
+    #666 要登記 Manager 的 gh 憑證時同一個陷阱又出現一次，因此把「不適用」做成一條
+    **可列舉的機械規則**，而不是每次都用「不要登記」繞過去。
+
+    刻意做成可列舉而不是靜默過濾：靜默扣掉一條 RWP 與「漏授一條 RWP」在輸出上長得
+    一樣，而後者的症狀是 job 跑到一半 EROFS。要看它扣了什麼，呼叫這個函式。
+    """
+    scheme = plan.scheme or SCHEMES.get(plan.scheme_id)
+    if scheme is None:
+        return ()
+    declared = scheme.declared_accounts()
+    paths = layout.asset_paths()
+    found: list[tuple[str, str]] = []
+    for entry in plan.entries:
+        path = paths.get(entry.asset_id)
+        if path is None:
+            continue
+        anchor = home_anchored_account(layout, path)
+        if anchor is not None and anchor not in declared:
+            found.append((entry.asset_id, path))
+    return tuple(sorted(found))
 
 
 def required_write_targets(
@@ -2038,8 +2411,13 @@ def required_write_targets(
     targets: dict[str, str] = {}
     paths = layout.asset_paths()
     index = {a.asset_id: a for a in (plan.assets or registry.ASSET_REGISTRY)}
+    # #666：本方案不存在的帳號 HOME 底下的資產一律不進 RWP——systemd 對不存在的
+    # `ReadWritePaths=` 目標會讓 unit 起不來（見 `inapplicable_home_anchored_assets`）。
+    inapplicable = {aid for aid, _path in inapplicable_home_anchored_assets(plan, layout)}
     for entry in plan.entries:
         if account not in plan.all_writable_accounts(entry):
+            continue
+        if entry.asset_id in inapplicable:
             continue
         if retired is not None and entry.asset_id in retired:
             continue
@@ -2638,6 +3016,477 @@ def unresolved_node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
     """`node_execution_surfaces()` 裡**執行面仍禁 W+X** 的那些（＝已知會失敗的組合）。"""
 
     return tuple(surface for surface in node_execution_surfaces() if not surface.allows_wx)
+
+
+# ---------------------------------------------------------------------------
+# 窮舉盤點（#666）：降權帳號在完整加固面下跑完一個 run 需要碰到的**全部**外部相依
+#
+# ## 為什麼要有這一節
+#
+# `#640`（executor toolchain ＋ job 憑證）、`#661`／`#664`（`srt`／`openspec`／
+# preflight backend）、`#666`（`pytest`／Manager 的 gh 憑證）——**同一族的第一到第五
+# 個成員**，每一次都是「症狀出現才補一項」。症狀還一次比一次遠：從 `rc=127`，到
+# doctor 一個看不出原因的 FAIL，到「ledger 空 ⇒ 每張 build 卡在採信階段被拒」。
+#
+# 前三張表（:data:`EXECUTOR_TOOLS`／:data:`SERVICE_TOOLS`／:data:`SYSTEM_PROGRAMS`）
+# 各自都是完整的——但它們回答的是「**這一類**東西有哪些」，沒有任何一個地方回答
+# 「跑完一個 run 需要碰到的東西有哪些」。這一節就是後者：**判準改成從 run 反推**，
+# 而不是等下一個症狀。
+#
+# ## 它怎麼防止自己過期
+#
+# 兩個方向都釘住，缺任一邊測試就紅：
+#
+# - :func:`uncovered_run_dependencies`：盤點列出的每一項都必須**真的**落在某張表或
+#   某個登記表資產上（不是字串相等，是回頭去那張表／`ASSET_REGISTRY` 裡查）；
+# - :func:`unlisted_roster_entries`：反過來，每張表上的每一項、以及每一個掛在帳號
+#   HOME 下的登記表資產，都必須被盤點列到。往 `SERVICE_TOOLS` 加一支程式而忘了說明
+#   它在 run 的哪一段被誰碰到，測試會紅。
+#
+# 已知**還沒有**歸宿的那些不塞進主表充數，改由 :func:`deferred_run_dependencies`
+# 列舉（比照 :func:`unresolved_node_execution_surfaces` 的先例：不做裁決、不放寬、
+# 但也不讓它靜默消失）。
+# ---------------------------------------------------------------------------
+
+class DependencyKind(Enum):
+    """外部相依的種類——決定它應該落在哪一張表。"""
+
+    #: 部署樹 `<toolchain>/bin`（版本會影響治理產出 ⇒ 可稽核的部署決定）。
+    TOOLCHAIN_PROGRAM = "toolchain-program"
+    #: 發行版套件（通用 runtime／傳輸層／基礎工具）。
+    SYSTEM_PROGRAM = "system-program"
+    #: python 發行版——**不是可執行檔**，`import`／`-m` 得到才有意義（#666 新增的
+    #: 第四類；前三張表的形狀都收不下它，見 :class:`PythonDistribution`）。
+    PYTHON_DISTRIBUTION = "python-distribution"
+    #: 帳號 HOME 下的**憑證**檔（登記表資產；檔案該帳號擁有、目錄 root-owned）。
+    CREDENTIAL = "credential"
+    #: 帳號 HOME 下的**非憑證**設定（登記表資產；一律 root-owned 唯讀）。
+    ACCOUNT_CONFIG = "account-config"
+
+
+class RunStage(Enum):
+    """一個 run 的各段——用來回答「這項相依是在哪一步被碰到的」。"""
+
+    DISPATCH = "dispatch"        # Manager 決定派工並起 job
+    MODEL_CALL = "model-call"    # job 帳號實際呼叫模型 CLI
+    REVIEW = "review"            # reviewer 在 sandbox 內覆核
+    GATE = "gate"                # gate 執行身分重跑 operator 宣告的命令
+    SHIP = "ship"                # preflight／archive／推送
+    MONITOR = "monitor"          # monitor 的輪詢與 provider
+
+
+@dataclass(frozen=True)
+class RunDependency:
+    """窮舉盤點的一列：**誰**在 run 的**哪一段**碰到**什麼**，以及它登記在哪。"""
+
+    name: str
+    kind: DependencyKind
+    #: 哪些 principal 在**完整加固面下**會碰到它（不是「誰理論上可能用到」）。
+    principals: tuple[Principal, ...]
+    stages: tuple[RunStage, ...]
+    #: 涵蓋它的那張表的名字，或登記表資產的 `asset_id`。**這個欄位會被真的拿去查**
+    #: （見 :func:`uncovered_run_dependencies`），寫錯字就是紅的。
+    covered_by: str
+    note: str
+
+    @property
+    def key(self) -> tuple[str, str]:
+        """盤點內的唯一鍵。**名字本身不夠**——同一個 python 發行版（PyYAML）在系統層
+        與部署 venv 各有一份，那是兩個不同的部署決定，不能被去重掉。"""
+        return (self.name, self.covered_by)
+
+
+#: **窮舉盤點的本體**（#666）。順序＝一個 run 走過的順序，方便對著 runbook 讀。
+RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
+    # ---- DISPATCH：Manager 起 job -----------------------------------------
+    RunDependency(
+        "systemctl", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.MANAGER,), (RunStage.DISPATCH,),
+        covered_by="SYSTEM_PROGRAMS",
+        note="B 案的派工 client：`systemctl start --wait <模板實例>`。#666 補進表。",
+    ),
+    RunDependency(
+        "manager-gitconfig", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.MANAGER, Principal.MONITOR), (RunStage.DISPATCH, RunStage.SHIP),
+        covered_by="manager-gitconfig",
+        note=(
+            "來源樹的 `safe.directory`（#623）。Manager 對 root-owned 的來源樹跑 "
+            "`fetch`／`rev-parse`／`branch -f`，缺它就是每一次 git 都 dubious ownership。"
+        ),
+    ),
+    RunDependency(
+        "git", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.MANAGER, Principal.MONITOR, Principal.BUILDER,
+         Principal.REVIEWER, Principal.PLANNER),
+        (RunStage.DISPATCH, RunStage.MODEL_CALL, RunStage.SHIP, RunStage.MONITOR),
+        covered_by="SYSTEM_PROGRAMS",
+        note=(
+            "per-job clone、bundle 產出與回收、monitor 的 mirror 掃描、ship 段的 "
+            "push／ls-remote 全靠它。**gate 刻意不在 principals 內**——那一格是未決的，"
+            "見 `deferred_run_dependencies()`。"
+        ),
+    ),
+    # ---- MODEL_CALL：job 帳號呼叫模型 --------------------------------------
+    RunDependency(
+        "bash", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.MANAGER, Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER),
+        (RunStage.DISPATCH, RunStage.MODEL_CALL),
+        covered_by="SYSTEM_PROGRAMS",
+        note=(
+            "**每一支 job 的 `command[0]`**（wrapper 是 `bash -c <script>`），"
+            "以及 Manager 側的 exit 記帳 shell。#666 補進表。"
+        ),
+    ),
+    RunDependency(
+        "codex", DependencyKind.TOOLCHAIN_PROGRAM,
+        (Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER),
+        (RunStage.MODEL_CALL,),
+        covered_by="EXECUTOR_TOOLS",
+        note="dispatch 直接執行的模型 CLI；本部署的 `PSC_MANAGER_EXECUTOR` 預設值。",
+    ),
+    RunDependency(
+        "claude", DependencyKind.TOOLCHAIN_PROGRAM,
+        (Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER, Principal.MANAGER),
+        (RunStage.MODEL_CALL, RunStage.REVIEW),
+        covered_by="EXECUTOR_TOOLS",
+        note=(
+            "**Manager 也在 principals 內，而且不是筆誤**：`planning_runtime` 的 JSON "
+            "呼叫是在 **Manager 行程內**直接 exec `claude` 的（不是派一個降權 job），"
+            "因此它跑在 Manager unit 的加固面上、讀的是 Manager HOME。那條路徑的登入態"
+            "目前沒有登記表資產，見 `deferred_run_dependencies()`。"
+        ),
+    ),
+    RunDependency(
+        "copilot", DependencyKind.TOOLCHAIN_PROGRAM,
+        (Principal.BUILDER,), (RunStage.MODEL_CALL,),
+        covered_by="EXECUTOR_TOOLS",
+        note="shell script，但內部再 exec node（#643 實機量測）⇒ 走 `jit` 剖面。",
+    ),
+    RunDependency(
+        "agy", DependencyKind.TOOLCHAIN_PROGRAM,
+        (Principal.PLANNER, Principal.MANAGER), (RunStage.MODEL_CALL, RunStage.DISPATCH),
+        covered_by="EXECUTOR_TOOLS",
+        note=(
+            "planning 的 canonical executor。Manager 另外會跑 `agy models`（"
+            "`model_identities` 的 live probe ＋ doctor 的 `agy` probe），因此它同樣"
+            "要在 Manager 的 `PATH` 上。"
+        ),
+    ),
+    RunDependency(
+        "node", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER, Principal.MANAGER),
+        (RunStage.MODEL_CALL, RunStage.REVIEW, RunStage.SHIP),
+        covered_by="SYSTEM_PROGRAMS",
+        note="全部 `needs_node` 的 toolchain 程式共用的系統層 runtime。",
+    ),
+    RunDependency(
+        "builder-executor-credential", DependencyKind.CREDENTIAL,
+        (Principal.BUILDER,), (RunStage.MODEL_CALL,),
+        covered_by="builder-executor-credential",
+        note=(
+            "**job 帳號**的 provider 憑證（#640 裁決 (b)）。洩漏面＝一次模型呼叫的額度"
+            "——job unit 另有 `Environment=GH_TOKEN=` 把 GitHub token 清空，成果一律走 "
+            "`commit-spool` 由 Manager 代理推送。**與 `manager-gh-credential` 不同級**。"
+        ),
+    ),
+    RunDependency(
+        "codex-hooks", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.BUILDER,), (RunStage.MODEL_CALL,),
+        covered_by="codex-hooks",
+        note="enforcement plane：root-owned，job 不得替換自己的 hooks（#623）。",
+    ),
+    RunDependency(
+        "builder-gitconfig", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.BUILDER,), (RunStage.MODEL_CALL,),
+        covered_by="builder-gitconfig",
+        note="per-job clone 的 `safe.directory`；root-owned（`alias.*` 會執行外部命令）。",
+    ),
+    RunDependency(
+        "reviewer-planner-gitconfig", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.REVIEWER, Principal.PLANNER), (RunStage.REVIEW,),
+        covered_by="reviewer-planner-gitconfig",
+        note="同 `builder-gitconfig`，掛在 reviewer／planner 共用的那個帳號 HOME 下。",
+    ),
+    # ---- REVIEW：reviewer 在 sandbox 內覆核 --------------------------------
+    RunDependency(
+        "srt", DependencyKind.TOOLCHAIN_PROGRAM,
+        (Principal.REVIEWER,), (RunStage.REVIEW,),
+        covered_by="SERVICE_TOOLS",
+        note=(
+            "Claude review sandbox 的強制面（#661）。由 `claude` 在執行途中 exec ⇒ "
+            "跑在 `strict` 剖面上，那一格仍未決，見 `unresolved_node_execution_surfaces()`。"
+        ),
+    ),
+    RunDependency(
+        "bwrap", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.REVIEWER,), (RunStage.REVIEW,),
+        covered_by="SYSTEM_PROGRAMS",
+        note="`srt` 在 Linux 上的 namespace 隔離實作；doctor 會實跑 `--version`。",
+    ),
+    RunDependency(
+        "socat", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.REVIEWER,), (RunStage.REVIEW,),
+        covered_by="SYSTEM_PROGRAMS",
+        note="`srt` 網路政策那一段的 socket 轉發。",
+    ),
+    RunDependency(
+        "python3", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.GATE, Principal.REVIEWER, Principal.MANAGER),
+        (RunStage.GATE, RunStage.REVIEW),
+        covered_by="SYSTEM_PROGRAMS",
+        note=(
+            "**gate 宣告 `python3 -m pytest` 時解析到的是這一支**（系統層），不是部署 "
+            "venv 的那一支——#666 兩個漂移項之一的機械成因。`srt` 的沙箱 smoke test 也"
+            "拿它當被關的程式。#666 補進表。"
+        ),
+    ),
+    # ---- GATE：gate 執行身分重跑 operator 宣告的命令 -----------------------
+    RunDependency(
+        "pytest", DependencyKind.PYTHON_DISTRIBUTION,
+        (Principal.GATE,), (RunStage.GATE,),
+        covered_by="SYSTEM_PYTHON_DISTRIBUTIONS",
+        note=(
+            "#666 漂移項 1。裝在 operator 的 user site-packages 時 gate 身分讀不到 ⇒ "
+            "每張 build 卡的 ledger 為空 ⇒ 撞 #540 的 acceptance chain。版本約束由 "
+            "`pyproject.toml` 的 `test` extra 宣告（明示的部署決定）。"
+        ),
+    ),
+    RunDependency(
+        "PyYAML", DependencyKind.PYTHON_DISTRIBUTION,
+        (Principal.GATE,), (RunStage.GATE,),
+        covered_by="SYSTEM_PYTHON_DISTRIBUTIONS",
+        note=(
+            "**被測樹的 runtime 相依**，不是 pytest 的（#666 窮舉盤點才撞出來）。缺它"
+            "的症狀是 pytest exit code `2`（collection error），依 #307 的判準不會被誤"
+            "判成合格 RED，但整張卡照樣過不了。"
+        ),
+    ),
+    # ---- SHIP：preflight／archive／推送 ------------------------------------
+    RunDependency(
+        "openspec", DependencyKind.TOOLCHAIN_PROGRAM,
+        (Principal.MANAGER,), (RunStage.SHIP,),
+        covered_by="SERVICE_TOOLS",
+        note=(
+            "`openspec archive -y`／`validate --strict` 都是**採信判準**（#661），因此"
+            "版本進部署樹。由 Manager 的 system unit exec ⇒ 那一格同樣仍未決。"
+        ),
+    ),
+    RunDependency(
+        PREFLIGHT_BACKEND_DISTRIBUTION, DependencyKind.PYTHON_DISTRIBUTION,
+        (Principal.MANAGER,), (RunStage.SHIP,),
+        covered_by="DEPLOYMENT_PYTHON_DISTRIBUTIONS",
+        note=(
+            "preflight 的 backend（#661）。落點是既有的部署 venv ⇒ **不新增檔案系統"
+            "資產**；版本必須逐字等於 `.project-policy.yml` 的 `policy_version`。"
+        ),
+    ),
+    RunDependency(
+        "PyYAML", DependencyKind.PYTHON_DISTRIBUTION,
+        (Principal.MANAGER, Principal.MONITOR),
+        (RunStage.DISPATCH, RunStage.SHIP, RunStage.MONITOR),
+        covered_by="DEPLOYMENT_PYTHON_DISTRIBUTIONS",
+        note=(
+            "cortex 自己唯一的 runtime 相依，隨 venv 走。**與系統層那一份是兩個不同 "
+            "interpreter 下的兩份**，因此在盤點裡也是兩列（`RunDependency.key` 用 "
+            "`(name, covered_by)` 正是為了這個）。"
+        ),
+    ),
+    RunDependency(
+        "gh", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.MANAGER, Principal.MONITOR), (RunStage.SHIP, RunStage.MONITOR),
+        covered_by="SYSTEM_PROGRAMS",
+        note="Manager 對 GitHub 的傳輸層；monitor 的兩個 github provider 也直接跑它。",
+    ),
+    RunDependency(
+        "manager-gh-credential", DependencyKind.CREDENTIAL,
+        (Principal.MANAGER, Principal.MONITOR), (RunStage.SHIP, RunStage.MONITOR),
+        covered_by="manager-gh-credential",
+        note=(
+            "#666 漂移項 2。**洩漏面與 job 憑證不同級**：Manager 是 durable state "
+            "owner，這個 token 推得動 PR、關得掉 issue、merge 得了分支。"
+        ),
+    ),
+    RunDependency(
+        "manager-gh-config", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.MANAGER, Principal.MONITOR), (RunStage.SHIP, RunStage.MONITOR),
+        covered_by="manager-gh-config",
+        note=(
+            "同目錄下的非憑證設定，**owner 刻意與 `hosts.yml` 不同**：`aliases` 可宣告 "
+            "`!` shell alias ⇒ 必須 root-owned 唯讀（與三份 `.gitconfig` 同一條理由）。"
+        ),
+    ),
+)
+
+
+#: 盤點的 `covered_by` 可以指向哪些**名冊**（其餘視為登記表 `asset_id`）。
+_DEPENDENCY_ROSTERS: Mapping[str, Callable[[], frozenset[str]]] = MappingProxyType({
+    "EXECUTOR_TOOLS": lambda: frozenset(t.name for t in EXECUTOR_TOOLS),
+    "SERVICE_TOOLS": lambda: frozenset(t.name for t in SERVICE_TOOLS),
+    "SYSTEM_PROGRAMS": lambda: frozenset(p.name for p in SYSTEM_PROGRAMS),
+    "SYSTEM_PYTHON_DISTRIBUTIONS": lambda: frozenset(
+        d.name for d in SYSTEM_PYTHON_DISTRIBUTIONS
+    ),
+    "DEPLOYMENT_PYTHON_DISTRIBUTIONS": lambda: frozenset(
+        d.name for d in DEPLOYMENT_PYTHON_DISTRIBUTIONS
+    ),
+})
+
+
+def home_anchored_asset_ids(layout: "PathLayout | None" = None) -> frozenset[str]:
+    """掛在**帳號 HOME** 底下的登記表資產 id（＝憑證／per-account 設定那一族）。
+
+    由 `asset_paths()` × :func:`home_anchored_account` 機械導出，**不是手寫清單**：
+    新增一個掛在帳號 HOME 下的資產而沒有把它列進 :data:`RUN_EXTERNAL_DEPENDENCIES`，
+    :func:`unlisted_roster_entries` 就會非空。
+    """
+    resolved = layout if layout is not None else DEFAULT_LAYOUT
+    return frozenset(
+        asset_id
+        for asset_id, path in resolved.asset_paths().items()
+        if home_anchored_account(resolved, path) is not None
+    )
+
+
+def uncovered_run_dependencies() -> tuple[RunDependency, ...]:
+    """盤點裡 `covered_by` **查不到東西**的那些列（正常應為空）。
+
+    這不是字串比對：名冊型的 `covered_by` 會回頭去那張 tuple 裡找同名項，資產型的會
+    去 `registry.ASSET_REGISTRY` 找 `asset_id`。把一項從表上拿掉、或打錯資產 id，
+    這裡就會非空。
+    """
+    known_assets = {a.asset_id for a in registry.ASSET_REGISTRY}
+    missing: list[RunDependency] = []
+    for dep in RUN_EXTERNAL_DEPENDENCIES:
+        roster = _DEPENDENCY_ROSTERS.get(dep.covered_by)
+        if roster is not None:
+            if dep.name not in roster():
+                missing.append(dep)
+            continue
+        if dep.covered_by not in known_assets or dep.name != dep.covered_by:
+            missing.append(dep)
+    return tuple(missing)
+
+
+def unlisted_roster_entries(layout: "PathLayout | None" = None) -> tuple[str, ...]:
+    """**反方向**：名冊／登記表上有、但窮舉盤點沒列到的項目（正常應為空）。
+
+    回傳 `"<名冊或 registry>:<名字>"`。這條是本節真正的價值所在——它讓「往
+    `SERVICE_TOOLS` 加一支程式」與「說明它在 run 的哪一段被誰碰到」變成同一件事，
+    而不是兩件可以只做一半的事。#640→#661→#666 每一次的形態都是後者只做了一半。
+    """
+    listed = {dep.key for dep in RUN_EXTERNAL_DEPENDENCIES}
+    orphans: list[str] = []
+    for roster_name, members in _DEPENDENCY_ROSTERS.items():
+        for name in sorted(members()):
+            if (name, roster_name) not in listed:
+                orphans.append(f"{roster_name}:{name}")
+    for asset_id in sorted(home_anchored_asset_ids(layout)):
+        if (asset_id, asset_id) not in listed:
+            orphans.append(f"registry:{asset_id}")
+    return tuple(orphans)
+
+
+@dataclass(frozen=True)
+class DeferredDependency:
+    """盤點撞到、但**尚未有歸宿**的相依（#666）。不做裁決，只讓它不會靜默消失。"""
+
+    name: str
+    kind: DependencyKind
+    principals: tuple[Principal, ...]
+    #: 為什麼它現在沒有登記表資產／沒有產生器步驟。
+    reason: str
+    #: 實機上會怎麼表現出來（症狀，不是推測）。
+    symptom: str
+    #: 誰要裁決、往哪裡走。
+    disposition: str
+
+
+#: **窮舉盤點撞到的未決項**（#666）。比照 :func:`unresolved_node_execution_surfaces`
+#: 的先例：本 PR **不做裁決、不放寬任何一面**，只讓它們可列舉——落位計畫會把它們印在
+#: 輸出裡，測試釘住目前的內容，補上或悄悄拿掉都會讓測試變紅。
+#:
+#: 四項的共同形態是「**per-account 的機制已經就緒，但登記表只登記了其中一份**」——
+#: 與 #640 對 `builder-executor-credential` 的處置逐條同構（那一條的 note 有完整
+#: 論證），差別只在那時候 M2 還沒落地、現在落地了。
+_DEFERRED_RUN_DEPENDENCIES: tuple[DeferredDependency, ...] = (
+    DeferredDependency(
+        "reviewer-planner-executor-credential", DependencyKind.CREDENTIAL,
+        (Principal.REVIEWER, Principal.PLANNER),
+        reason=(
+            "登記表只登記 builder 那一份。#640 的理由是「登記第二份會讓二分部署的 "
+            "Manager unit 出現一條不存在的 `ReadWritePaths`，unit 直接起不來」，並寫明"
+            "「M2（#615）把 reviewer／planner 移上模板 unit 時補第二列即可」。**M2 已經"
+            "落地**（`cortex-reviewer-job@.service` 已在產生器裡），所以這條現在是逾期"
+            "未做，不再是「時候未到」。\n"
+            "#666 順帶把當年的阻礙拆掉了：`inapplicable_home_anchored_assets()` 讓"
+            "「本方案不存在的帳號 HOME 下的資產」機械地不進 RWP，二分部署不會再被"
+            "第二列弄壞。**但補這一列會改動 reviewer 模板 unit 的 RWP，屬 operator 的"
+            "部署面裁決，不在本票範圍。**"
+        ),
+        symptom=(
+            "檔案由 runbook 第 4e 步落位（owner 正確、0600），但 reviewer 模板 unit 的 "
+            "`ReadWritePaths` 不含它 ⇒ `ProtectSystem=strict` 下**讀得到、改不了** ⇒ "
+            "token 過期那天 reviewer 的 refresh 靜默失敗。"
+        ),
+        disposition="補登記表第二列（產生器一行都不必改）；建議另開票，實機驗 RWP 後再上。",
+    ),
+    DeferredDependency(
+        "gate-gitconfig", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.GATE,),
+        reason=(
+            "`ACCOUNT_GITCONFIG_ASSETS` 只有 BUILDER／REVIEWER／MANAGER 三個 principal"
+            "——#629 開出 `cortex-gate` 時沒有一併考慮它需不需要 git 設定。"
+        ),
+        symptom=(
+            "gate 把 builder 的樹**複製**到自己的拋棄式工作區後才跑命令，因此複本由 "
+            "gate 自己擁有、多數情況不會撞 dubious ownership。真正會撞的是「gate 命令"
+            "碰到 `.git`」的情形（`setuptools-scm`、`git describe`、需要 git 的 pytest "
+            "plugin）。**目前 `PSC_GATE_CMD_PYTEST` 沒有這種相依，因此這是預防面而不是"
+            "現行症狀**——寫在這裡是為了不讓它變成第六個「症狀出現才補」。"
+        ),
+        disposition="等第一個需要 git 的 gate 宣告出現時再補，或 operator 主動裁決。",
+    ),
+    DeferredDependency(
+        "reviewer-planner-codex-hooks", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.REVIEWER, Principal.PLANNER),
+        reason=(
+            "`asset_paths()` 把 `codex-hooks` 寫死在 `builder_home` 下，而 "
+            "`scaffold_directories()` 已為**每一個**跑模型的 job 帳號建出 root-owned "
+            "的 `~/.codex`。與上一項同一個形態：機制 per-account，登記表只登記一份。"
+        ),
+        symptom=(
+            "reviewer／planner 以 `codex` 為 executor 時拿不到 hooks（enforcement "
+            "plane 少一層）。目前 reviewer 走的是 `claude`，因此**尚未**在實機表現出來。"
+        ),
+        disposition="與 reviewer 憑證同一張票處理；兩者都是「補第二列」。",
+    ),
+    DeferredDependency(
+        "manager-claude-credential", DependencyKind.CREDENTIAL,
+        (Principal.MANAGER,),
+        reason=(
+            "`planning_runtime` 的 JSON 呼叫在 **Manager 行程內**直接 exec `claude`"
+            "（不是派一個降權 job），並讀 `<HOME>/.claude/.credentials.json` 播種一次性"
+            "的 `CLAUDE_CONFIG_DIR`。四分部署下 Manager 的 HOME 底下沒有那個檔，登記表"
+            "也沒有對應資產——`executor_credential_relpath` 是**單一**部署決定"
+            "（`.codex/auth.json`），一個帳號只表達得了一份憑證。"
+        ),
+        symptom=(
+            "程式碼在查無憑證時**明確回 `None` 並不代為猜測**，讓 claude CLI 自己回報"
+            "未登入——因此它不是靜默失敗，但也不是可用狀態。實機目前 planning 走 `agy`，"
+            "所以這條還沒有被踩到。"
+        ),
+        disposition=(
+            "要嘛把 `executor_credential_relpath` 擴成 per-executor 的一張表（產生器"
+            "改動不小），要嘛裁決「Manager 不直接跑模型、planning 一律走降權 job」。"
+            "兩條路都是設計裁決，屬 operator。"
+        ),
+    ),
+)
+
+
+def deferred_run_dependencies() -> tuple[DeferredDependency, ...]:
+    """窮舉盤點撞到、尚未有歸宿的相依（#666）。純函式；內容由測試釘住。"""
+    return _DEFERRED_RUN_DEPENDENCIES
 
 
 #: **實際具備啟動面降權的 job principal**（＝各有一組 root-owned 模板 unit 的角色）。
@@ -3680,6 +4529,147 @@ def build_toolchain_plan(
         "# 值寫進 Manager 端 root-owned 的 EnvironmentFile：",
         f"#   PSC_PREFLIGHT_CMD=\"{layout.preflight_command_value()}\"",
     ]
+    lines += _system_python_lines(layout)
+    lines += _manager_gh_credential_lines(scheme, layout)
+    lines += _dependency_inventory_lines()
+    return lines
+
+
+def _system_python_lines(layout: PathLayout) -> list[str]:
+    """系統層 python 發行版的落位段（#666 漂移項 1）。"""
+    lines = [
+        "",
+        "# ===== 系統層 python 發行版（#666 漂移項 1：pytest）=====",
+        "# **這一段不是 toolchain，也不是系統層可執行檔**——它是第四種相依：python",
+        "# 發行版，`import`／`-m` 得到才有意義，`command -v` 對它一律無解。",
+        "#",
+        "# **為什麼落在系統層而不是部署 venv**：operator 宣告的 gate 命令用的是相對名",
+        f"#   {' / '.join(f'{k}=\"{v}\"' for k, v in layout.gate_command_env().items())}",
+        "# 而 gate 的 PSC_GATE_PATH 尾段是系統層 ⇒ `python3` 解到 /usr/bin/python3。",
+        "# gate unit 自己的 ExecStart 用的是部署 venv 的 interpreter，但那只涵蓋 ledger",
+        "# writer 本身；**operator 宣告的命令另外解析一次**。兩者是不同的 interpreter。",
+        "#",
+        "# ⚠️ 裝在 operator 的 user site-packages（`pip install --user`）是**不夠的**：",
+        "#   ProtectHome=yes 之後 /home 整個不可見——",
+        "#     $ sudo -u <gate 帳號> env HOME=<gate HOME> python3 -m pytest --version",
+        "#     /usr/bin/python3: No module named pytest",
+        "#   而症狀不是「gate 失敗」，是**每張 build 卡的 ledger 為空** ⇒ 撞 #540 的",
+        "#   acceptance chain ⇒ 交付全部卡住，錯誤只在 manager.log 裡。",
+    ]
+    for dist in SYSTEM_PYTHON_DISTRIBUTIONS:
+        lines += [
+            "",
+            f"# --- {dist.name}（module `{dist.module}`；interpreter＝{dist.interpreter}）---",
+            f"#   版本約束：{dist.requirement}   ← 宣告在 {dist.declared_in}",
+        ]
+        lines += [f"#   {segment}" for segment in dist.note.split("\n")]
+        lines += [
+            f"#     sudo pip install --break-system-packages '{dist.requirement}'",
+            "#   ✅ 版本是**明示的部署決定**：裝完把解出來的版本記進 runbook，並與",
+            "#      operator 側逐字比對——同一台機器上兩個 interpreter 各有一份是常態，",
+            "#      而版本分岔的症狀是「gate 判定與本機跑不一樣」，不是報錯：",
+            f"#     python3 -m {dist.module} --version   # 系統層（gate 實際用的那一份）",
+        ]
+    lines += [
+        "",
+        "# ✅ 在**完整加固面下**實測（`sudo -u` 沒有 unit 的加固面，兩者可能不同結果）：",
+        "#   systemd-run --uid=<gate 帳號> … --property=MemoryDenyWriteExecute=yes \\",
+        "#     /usr/bin/python3 -m pytest -q",
+        "#   期望 rc=0。CPython **不是** V8——MDWE 對它沒有影響（與 #643 的 node 型",
+        "#   executor 相反），因此這一條在完整加固面下就應該過，不必放寬任何一項。",
+    ]
+    return lines
+
+
+def _manager_gh_credential_lines(scheme: UidScheme, layout: PathLayout) -> list[str]:
+    """Manager 的 gh 憑證落位段（#666 漂移項 2）。"""
+    account = scheme.durable_state_owner
+    root = scheme.deploy_account
+    group = scheme.group_of(root)
+    cred = layout.gh_credential_of(layout.manager_account)
+    settings = layout.gh_settings_of(layout.manager_account)
+    return [
+        "",
+        "# ===== Manager 的 gh 憑證（#666 漂移項 2；登記表 manager-gh-credential）=====",
+        "# 形態沿用 #640 裁決 (b)：**目錄 root-owned、憑證檔服務帳號 owned**。兩層",
+        "# 目錄由 `trust_root scaffold` 產出（本計畫不重複產），權限由登記表經",
+        "# `trust_root permissions … --commands` 產出。這裡只出**內容落位**。",
+        "#",
+        "# ⚠️ **兩個檔刻意不同 owner，這不是疏漏**——下一個讀到這裡的人最可能做的事",
+        "#    就是把兩個都設成同一種，因此把理由寫在計畫裡：",
+        f"#      {cred}",
+        f"#        → {account}:{scheme.group_of(account)} 0600"
+        "   ← `gh` 唯一寫回 token 的檔，要 refresh 得回來",
+        f"#      {settings}",
+        f"#        → {root}:{group} 0644"
+        "   ← 非憑證；但 `aliases` 可宣告 `!` shell alias ⇒ 唯讀",
+        "#    後者與三份 `.gitconfig` 維持 root-owned 是**同一條理由**（`core.fsmonitor`",
+        "#    ／`alias.*` 同樣會執行外部命令）。",
+        "#",
+        "# ⚠️ **與 #640 的 job 憑證形狀相同、洩漏面不同級，不要混為一談**：#640 那一份",
+        "#    是給 **job 帳號**的模型 provider 憑證（job unit 另有 `Environment=GH_TOKEN=`",
+        "#    把 GitHub token 清空，成果一律走 spool 由 Manager 代理推送）；這一份是給",
+        "#    **Manager** 的，而 Manager 是 durable state owner——這個 token 推得動 PR、",
+        "#    關得掉 issue、merge 得了分支。因此它只掛在 durable state owner 的 HOME 下，",
+        "#    job 帳號刻意沒有 `~/.config/gh` 那一層目錄。",
+        "#",
+        "# 🔧 落位（來源取 operator 實際在用的那一份）：",
+        f'#     sudo install -o {account} -g {scheme.group_of(account)} -m 0600 \\',
+        f'#       "$HOME/.config/gh/hosts.yml" {cred}',
+        f'#     sudo install -o {root} -g {group} -m 0644 \\',
+        f'#       "$HOME/.config/gh/config.yml" {settings}',
+        "#",
+        "# ✅ 驗證要**以該身分實測**，不是只驗檔案存在：",
+        f'#     sudo -u {account} env HOME={layout.home_of(layout.manager_account)} \\',
+        "#       gh auth status",
+        "#     期望：以 fleet 正式身分登入成功（不是 `You are not logged into any "
+        "GitHub hosts.`）",
+        "# ✅ 不變式「改得了內容、建不了新檔」（與 #640 的憑證逐條同構）：",
+        f'#     sudo -u {account} sh -c \'printf "" >> {cred}\'        # 期望：OK',
+        f'#     sudo -u {account} sh -c \'touch {_parent_dir(cred)}/x\' # 期望：Permission denied',
+        f'#     sudo -u {account} sh -c \'rm -f {settings}\'            # 期望：Permission denied',
+    ]
+
+
+def _dependency_inventory_lines() -> list[str]:
+    """窮舉盤點的摘要 ＋ 未決項（#666）。"""
+    lines = [
+        "",
+        "# ===== 窮舉盤點（#666）=====",
+        "# 判準：**降權帳號在完整加固面下，跑完一個 run 需要碰到的所有外部程式與憑證**",
+        "#（而不是「這一類東西有哪些」——前者才是 #640→#661→#666 每次漏掉的那個問題）。",
+        "# 機器可讀形式在 permgen.RUN_EXTERNAL_DEPENDENCIES，兩個方向都有測試釘住：",
+        "#   uncovered_run_dependencies()  盤點列到但表上查無 ⇒ 必須是空的",
+        "#   unlisted_roster_entries()     表上有但盤點沒列到 ⇒ 必須是空的",
+        f"# 目前共 {len(RUN_EXTERNAL_DEPENDENCIES)} 項，逐段列出：",
+    ]
+    for stage in RunStage:
+        rows = [d for d in RUN_EXTERNAL_DEPENDENCIES if stage in d.stages]
+        if not rows:
+            continue
+        lines.append(f"#   [{stage.value}]")
+        for dep in rows:
+            who = "／".join(p.value for p in dep.principals)
+            lines.append(
+                f"#     {dep.name}  ({dep.kind.value}; {who}) ← {dep.covered_by}"
+            )
+    deferred = deferred_run_dependencies()
+    if deferred:
+        lines += [
+            "#",
+            "# ===== ⚠️ 盤點撞到、**尚未有歸宿**的相依（不做裁決，只讓它不會消失）=====",
+        ]
+        for item in deferred:
+            who = "／".join(p.value for p in item.principals)
+            lines += [
+                f"#   {item.name}  ({item.kind.value}; {who})",
+                f"#     症狀：{item.symptom.splitlines()[0]}",
+                f"#     處置：{item.disposition}",
+            ]
+        lines += [
+            "#   完整理由：permgen.deferred_run_dependencies()。與 #661 的",
+            "#   unresolved_node_execution_surfaces() 同一個定位——**量到／裁決之前不動**。",
+        ]
     return lines
 
 

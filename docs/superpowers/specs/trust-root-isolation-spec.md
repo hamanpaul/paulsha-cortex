@@ -643,6 +643,77 @@ provider 帳號下的兩個 job 在 provider 眼中是同一個主體，配額�
 真正的 provider 層獨立需要**每個 job 帳號各自的 provider 帳號**，成本最高（帳號、
 計費、配額各自管理），屬**未來選項**，不在本票範圍。
 
+##### (b2) Manager 的傳輸層憑證：同一個形狀，**不同級的洩漏面**（#666；登記表資產 `manager-gh-credential`／`manager-gh-config`）
+
+Manager／monitor 帳號在 `ProtectHome=yes` 之後同樣拿不到 operator 的 `gh` 登入態：
+
+```
+$ sudo -u cortex-manager env HOME=<manager HOME> gh auth status
+You are not logged into any GitHub hosts.
+```
+
+- `<manager HOME>/.config/gh/hosts.yml` SHALL 由 durable state owner 擁有、mode `0600`，
+  並比照 (b) 掛在 `IN_PLACE_CONTENT_WRITE_ASSETS`——它是 `gh` 唯一寫回 token 的檔
+  （`auth login`／`refresh` 就地覆寫），不歸該帳號就 refresh 不回來。
+- 放它的兩層目錄（`<HOME>/.config`、`<HOME>/.config/gh`）SHALL 維持 root-owned `0755`。
+  落點之所以是這一條，是因為產生出來的 unit 設 `HOME=` 與 `XDG_CACHE_HOME=` 而**刻意
+  不設 `XDG_CONFIG_HOME=`**；日後在 unit 或 EnvironmentFile 補上它會讓憑證的實際落點
+  **無聲**搬走（症狀是「未登入」，而檔案還在原處）。
+- `<manager HOME>/.config/gh/config.yml` SHALL **root-owned `0644`**——與 `hosts.yml`
+  **刻意不同 owner**。它不承載憑證，但其 `aliases` 可宣告 `!` 開頭的 shell alias；讓
+  服務帳號改得了它，等於給 Manager 一條「自己把任意命令掛進每一次 `gh` 呼叫」的執行面，
+  與三份 `.gitconfig` 維持 root-owned 的理由（`core.fsmonitor`／`alias.*`）逐字相同。
+- job 帳號 SHALL **NOT** 取得這一層目錄或這份憑證。job 模板 unit 已帶
+  `Environment=GH_TOKEN=`／`GITHUB_TOKEN=`，GitHub 寫入一律由 Manager 代理（D1 outbox）。
+
+**這一份與 (b) 的 job 憑證 MUST NOT 被當成同一件事。** 形狀相同（檔案帳號 owned、目錄
+root-owned），洩漏面不同級：(b) 是**job 帳號**的模型 provider 憑證，被竊只換得到模型
+呼叫額度，且 job 交出來的成果仍要經過 spool 與 Manager 的採信鏈；本節這一份是給
+**Manager** 的，而 Manager 是 durable state owner——這個 token 推得動 PR、關得掉 issue、
+改得了 label、merge 得了分支，也就是**治理平面對上游 repo 的寫入權**。因此它只掛在
+durable state owner 的 HOME 下，且不對任何 job 帳號開放。
+
+##### (c) 外部相依的盤點判準：**從一個 run 反推**，而不是逐類列舉（#666）
+
+`#640`（executor toolchain ＋ job 憑證）、`#661`（`srt`／`openspec`／preflight backend）、
+`#666`（`pytest`／Manager 的 gh 憑證）是同一族的第一到第五個成員，每一次都是「症狀出現
+才補一項」。前面各張表本身都完整，但它們回答的是「**這一類**東西有哪些」——沒有任何一處
+回答「跑完一個 run 需要碰到的東西有哪些」。
+
+- 登記表 SHALL 維護一份以「**降權帳號在完整加固面下跑完一個 run 需要碰到的所有外部程式
+  與憑證**」為判準的窮舉盤點（`permgen.RUN_EXTERNAL_DEPENDENCIES`），逐項標明 kind、
+  哪些 principal、run 的哪一段、以及**它登記在哪**。
+- 盤點 SHALL **雙向封閉**：`uncovered_run_dependencies()`（盤點列到但表上查無）與
+  `unlisted_roster_entries()`（表上有但盤點沒列到）皆 MUST 為空，且兩者皆有測試。後者
+  是關鍵——它讓「加一支相依」與「說明它在 run 的哪一段被誰碰到」變成同一件事。
+- 盤到但**尚無歸宿**者 MUST NOT 塞進主盤點充數，SHALL 由
+  `permgen.deferred_run_dependencies()` 列舉（比照 `unresolved_node_execution_surfaces()`
+  的先例：不裁決、不放寬、但不得靜默消失）。
+
+**新增的第四種相依：python 發行版。** `pytest`／`PyYAML`／`policy-check` 不是落在 `PATH`
+上的可執行檔，`command -v` 對它們一律無解；把它們塞進 `SYSTEM_PROGRAMS` 會讓「名冊上每一
+項都解析得到執行檔」這條既有性質變成假的（與「不得把 `srt` 併進 `EXECUTOR_TOOLS`」同一條
+論證）。因此另立 `permgen.SYSTEM_PYTHON_DISTRIBUTIONS`／`DEPLOYMENT_PYTHON_DISTRIBUTIONS`
+兩張表，各自標明落在哪一個 interpreter 與版本約束的**唯一宣告來源**。
+
+- operator 宣告的 gate 命令（`PSC_GATE_CMD_*`）若使用相對名 `python3`，它 SHALL 被理解為
+  由 gate 的 `PSC_GATE_PATH` 解析出來的**系統層** interpreter——gate unit 自己的
+  `ExecStart` 用部署 venv 的 interpreter，但那只涵蓋 ledger writer 本身，**宣告的命令另外
+  解析一次**。因此該命令所需的 python 套件 SHALL 裝在系統層，且版本 SHALL 是明示的部署
+  決定（約束宣告於 `pyproject.toml`，實際落定的版本記入 runbook 並與 operator 側比對）。
+- 產生器 SHALL 出一份建議的 gate 宣告（`permgen.GATE_COMMAND_DECLARATIONS` →
+  `PathLayout.gate_command_env()`），且該宣告 SHALL 覆蓋 packaged deck 依 `test_policy`
+  導出的每一個 gate 名——否則照 runbook 裝出來的部署一開機 doctor 的 `gate-declarations`
+  就是紅的，而症狀要到 builder 交出合格 candidate 之後才在採信階段現形（#540）。
+
+**HOME-anchored 資產在不適用的方案下 MUST NOT 進入 `ReadWritePaths`。** 幾個掛在帳號 HOME
+下的資產由 `PathLayout` 的部署決定欄位導出路徑，而那些欄位取的是定案的三分／四分；二分把
+Manager／reviewer／planner 併進 `cortex-svc`，同一條路徑在二分部署裡不存在，而 systemd 對
+不存在的 `ReadWritePaths=` 目標會讓 unit **直接起不來**。此前的處置是「乾脆不登記第二份」
+（#640 對 reviewer 憑證的決定）；#666 起改由機械規則
+`permgen.inapplicable_home_anchored_assets()` 表達，並**可列舉**——靜默扣掉一條 RWP 與漏授
+一條在輸出上長得一樣，後者的症狀是 job 跑到一半 EROFS。
+
 ### R2 所有 Tier-0／Tier-1 durable state 與 mutation ingress MUST 位於不受信任 headless persona 不可寫的 OS 邊界內
 
 系統 SHALL 使 builder／reviewer／planner 對登記表中 tier 0 與 1 的全部路徑

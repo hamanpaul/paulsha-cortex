@@ -427,6 +427,12 @@ class SchemeDerivedHomeTests(unittest.TestCase):
                 permgen.DEFAULT_LAYOUT.cache_of(a) for a in expected
             } | {
                 permgen.DEFAULT_LAYOUT.codex_hooks_dir_of(a) for a in expected
+            } | {
+                # #666：durable state owner 另有 root-owned 的 `~/.config` 與
+                # `~/.config/gh`（`gh` 的登入態落點）。仍在**本 scheme 解析得到的
+                # 帳號**底下，因此「無多餘」這條的原意未被放寬。
+                f"{permgen.DEFAULT_LAYOUT.home_of(scheme.durable_state_owner)}/.config",
+                permgen.DEFAULT_LAYOUT.gh_config_dir_of(scheme.durable_state_owner),
             }
             self.assertTrue(homes <= resolved, (scheme.scheme_id, homes - resolved))
 

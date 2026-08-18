@@ -164,13 +164,21 @@ def test_monitor_read_write_paths_cover_every_monitor_asset(scheme) -> None:
         plan, DEFAULT_LAYOUT, scheme.durable_state_owner,
         principals=permgen.MONITOR_PRINCIPALS,
     )
-    assert set(targets) == {
+    expected = {
         "runtime-run-tree",
         "monitor-state-tree",
         "monitor-work-items-snapshot",
         "monitor-github-sync-cursor",
         "monitor-event-spool",
-    }, sorted(targets)
+    }
+    # #666：monitor 的 GitHub provider 直接跑 `gh api`，token 過期時的 refresh 發生
+    # 在哪一個行程不由我們決定，因此 `manager-gh-credential` 的 writer 含 MONITOR。
+    # **二分不在其中而且不是遺漏**：該資產掛在 `cortex-manager` 的 HOME 下，而二分
+    # 沒有那個帳號 ⇒ `inapplicable_home_anchored_assets()` 機械地把它扣掉（掛一條不
+    # 存在的 `ReadWritePaths=` 會讓 unit 直接起不來）。
+    if permgen.DEFAULT_LAYOUT.manager_account in scheme.declared_accounts():
+        expected.add("manager-gh-credential")
+    assert set(targets) == expected, sorted(targets)
     for asset_id, target in targets.items():
         assert any(_within(target, rwp) for rwp in unit.read_write_paths), (asset_id, target)
 
