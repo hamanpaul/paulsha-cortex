@@ -485,10 +485,16 @@ class ReviewerWritableSurfaceTests(unittest.TestCase):
             )
         )
         self.assertEqual(self.rwp, expected)
-        # 導出結果目前恰好是兩條，逐條都有登記表或明示 extra 的來源。
+        # 導出結果目前恰好是三條，逐條都有登記表或明示 extra 的來源。
         self.assertEqual(
             sorted(self.rwp),
             [
+                # #698：codex 的 `$CODEX_HOME` 整棵（root-owned ＋ sticky 的真目錄）。
+                # 它取代了 #685 的 `cache/codex` 那棵 job-owned 樹——可寫的東西一樣多，
+                # 換到的是「目錄由 root 擁有」，也就是樹裡的 root-owned `hooks.json`
+                # 刪不掉／改不掉名字。同一份 unit 另有一條 `ReadOnlyPaths=` 把那個檔
+                # 在 mount 層也收回唯讀。
+                permgen.asset_paths(LAYOUT)["reviewer-planner-codex-state"],
                 LAYOUT.cache_of(REVIEW_ACCOUNT),
                 LAYOUT.review_verdict_spool_root,
             ],

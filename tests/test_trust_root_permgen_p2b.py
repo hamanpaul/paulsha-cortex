@@ -188,6 +188,13 @@ def test_job_unit_read_write_paths_exclude_manager_owned(scheme) -> None:
         builder = scheme.resolve(Principal.BUILDER)
         if builder in plan.all_writable_accounts(entry):
             continue  # spool 之類以 ACL 明示授權者（見下一個測試）
+        if target in unit.read_only_paths:
+            # #698：enforcement 檔（`hooks.json`）住在 sticky 樹**裡**，而那棵樹整棵
+            # 必須進 RWP（codex 才起得來）。它因此是本規則唯一的巢狀例外，而例外的
+            # 代價已被同一份 unit 的 `ReadOnlyPaths=` 收回——mount 層對它仍是唯讀。
+            # 實測（0818，本機 systemd）：巢狀 ReadOnlyPaths 生效，寫入回
+            # `Read-only file system`；DAC 那一層另外把 unlink／rename 也關上。
+            continue
         assert not any(_within(target, rwp) for rwp in unit.read_write_paths), (
             scheme.scheme_id, entry.asset_id, unit.read_write_paths,
         )
@@ -540,11 +547,15 @@ def test_scaffold_directories_are_command_strings_only() -> None:
         assert path not in seen, f"骨架目錄重複：{path}"
         seen.add(path)
         assert owner and group
-        assert 0 <= mode <= 0o777
+        assert 0 <= mode <= 0o1777
+        assert not (mode & 0o6000), (path, oct(mode))  # setuid/setgid 永不出現
     # 保護資產的父層一律 root 擁有（父目錄可寫者能 unlink/rename 子物件）。
     by_path = {p: (o, m) for p, o, _g, m in dirs}
     assert by_path[DEFAULT_LAYOUT.builder_home][0] == "root"
-    assert by_path[f"{DEFAULT_LAYOUT.builder_home}/.codex"][0] == "root"
+    # #698：`~/.codex` **不再**是骨架目錄——它升格為登記表資產（sticky 1755 ＋ 具名
+    # ACL），由權限計畫落位。留在骨架會是第二份真相，而 `_dedupe_scaffold()` 只留
+    # 第一筆 ⇒ 骨架那份 0755 會把 sticky 位靜默蓋掉。
+    assert f"{DEFAULT_LAYOUT.builder_home}/.codex" not in by_path
     assert by_path[DEFAULT_LAYOUT.home_of(TWO_WAY_SCHEME.durable_state_owner)][0] == "root"
     assert by_path[DEFAULT_LAYOUT.deploy_root][0] == "root"
 

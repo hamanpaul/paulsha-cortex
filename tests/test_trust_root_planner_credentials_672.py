@@ -57,11 +57,14 @@ from paulsha_cortex.trust_root.permgen import (  # noqa: E402
 
 PLANNER_ACCOUNT = DEFAULT_LAYOUT.reviewer_planner_account
 BUILDER_ACCOUNT = DEFAULT_LAYOUT.builder_account
-PLANNER_ASSETS = (
-    "reviewer-planner-codex-state",
+#: #698 起 planner 帳號的三格分成兩族：codex 走 `HOME_STICKY_TREE`（真目錄），
+#: agy／claude 仍是 `HOME_REDIRECT_TREE`（symlink）。本檔的 symlink 類斷言因此只
+#: 涵蓋後兩者——那不是「少驗了一項」，是那一項換了形狀，由 #698 的測試接手。
+PLANNER_SYMLINK_ASSETS = (
     "reviewer-planner-agy-state",
     "reviewer-planner-claude-state",
 )
+PLANNER_ASSETS = ("reviewer-planner-codex-state",) + PLANNER_SYMLINK_ASSETS
 
 
 def _reviewer_rwp(scheme=FOUR_WAY_SCHEME) -> tuple[str, ...]:
@@ -83,22 +86,58 @@ def _reviewer_rwp(scheme=FOUR_WAY_SCHEME) -> tuple[str, ...]:
 def test_the_table_has_two_axes_and_both_are_consulted() -> None:
     """per-(account, executor) 而不是 per-executor——差別要驗得出來。
 
-    判準：**同一個 executor 在兩個帳號上是兩種形狀**。builder×codex 仍是 #640 的
-    單檔（那份部署已存在、有 runbook 反向驗證），reviewer-planner×codex 是導進
-    `cache` 的狀態樹（#686 實測 codex 需要整棵可寫）。一張 per-executor 的表表達
-    不了這件事——這就是 U-5 要兩軸的具體理由。
+    **判準在 #698 之後換了一格，而換掉的理由本身就是本測試要記的事。**
+
+    #685 時的判準是「同一個 executor 在兩個帳號上是**兩種**形狀」（builder×codex＝
+    `IN_PLACE_FILE`、reviewer-planner×codex＝`HOME_REDIRECT_TREE`）。0818 的 R9 T3.9
+    證明那個分岔不是設計而是一個尚未爆的洞——`HOME_REDIRECT_TREE` 的樹 job-owned，
+    該帳號成功植入了 `hooks.json`（codex hooks 會執行命令 ⇒ 跨 job 持久化）。#698 的
+    裁決因此讓**同一個 executor 在所有帳號上形狀相同**（由
+    `EXECUTOR_ENFORCEMENT_LEAVES` 那條規則導出，import 當下強制）。
+
+    兩軸**仍然必要**，判準改成：`reviewer-planner` 有三格而 `builder` 只有一格，
+    且 agy／claude 與 codex 是不同形狀。一張 per-executor 的表表達不了「哪個帳號被
+    核可持有哪幾份登入態」——那正是 U-4／U-5 的內容。
     """
     builder = permgen.credential_for("builder", "codex")
     planner = permgen.credential_for("reviewer-planner", "codex")
-    assert builder.shape is CredentialShape.IN_PLACE_FILE
-    assert planner.shape is CredentialShape.HOME_REDIRECT_TREE
-    assert builder is not planner
+    # #698：同一個 executor ⇒ **同一列**（形狀不可能只改一格）。
+    assert builder is planner
+    assert builder.shape is CredentialShape.HOME_STICKY_TREE
+    # 但帳號軸仍然有內容：planner 多兩格，且那兩格是另一種形狀。
+    assert permgen.credential_for("reviewer-planner", "agy").shape is (
+        CredentialShape.HOME_REDIRECT_TREE
+    )
+    with pytest.raises(UnregisteredExecutorCredentialError):
+        permgen.credential_for("builder", "agy")
+
+
+def test_the_shape_rule_is_enforced_at_import_time() -> None:
+    """#698：形狀由**一條規則**導出，而規則在 import 當下強制、不是靠 review。
+
+    這條測的是「只修 reviewer-planner 那格、在 builder 上留一個等著爆的差異」在
+    結構上做不到。
+    """
+    assert set(permgen.EXECUTOR_ENFORCEMENT_LEAVES) == {"codex"}
+    for prefix, cred in permgen.credential_rows():
+        want = permgen.EXECUTOR_ENFORCEMENT_LEAVES.get(cred.executor)
+        assert bool(want) == (cred.shape is CredentialShape.HOME_STICKY_TREE), (prefix, cred)
+    # 反向對照：把某一格改回舊形狀，展開點必須炸——否則本規則只是註解。
+    broken = dict(permgen.CREDENTIALED_ACCOUNTS)
+    broken["builder"] = (("codex", CredentialShape.HOME_REDIRECT_TREE),)
+    original = permgen.CREDENTIALED_ACCOUNTS
+    try:
+        permgen.CREDENTIALED_ACCOUNTS = broken  # type: ignore[assignment]
+        with pytest.raises(permgen.UnregisteredExecutorCredentialError):
+            permgen._assert_shape_follows_enforcement_rule()
+    finally:
+        permgen.CREDENTIALED_ACCOUNTS = original  # type: ignore[assignment]
 
 
 def test_the_account_axis_is_the_u4_ratification() -> None:
     """U-4 追認的範圍＝planner 帳號那一列有幾格。"""
     assert dict(CREDENTIALED_ACCOUNTS)["builder"] == (
-        ("codex", CredentialShape.IN_PLACE_FILE),
+        ("codex", CredentialShape.HOME_STICKY_TREE),
     )
     planner_cells = dict(CREDENTIALED_ACCOUNTS)["reviewer-planner"]
     assert [executor for executor, _shape in planner_cells] == ["codex", "agy", "claude"]
@@ -118,7 +157,7 @@ def test_every_table_row_is_a_registered_asset_and_vice_versa() -> None:
         if any("executor_credential_of" in src for src in asset.derived_in)
     }
     assert from_table == from_registry, (sorted(from_table), sorted(from_registry))
-    assert from_table == set(PLANNER_ASSETS) | {"builder-executor-credential"}
+    assert from_table == set(PLANNER_ASSETS) | {"builder-codex-state"}
     for asset_id in from_table:
         assert asset_id in DEFAULT_LAYOUT.asset_paths(), asset_id
 
@@ -143,10 +182,12 @@ def test_the_primary_relpath_stays_a_single_deployment_decision() -> None:
     #640 的「換 executor 只改一個值」因此仍然成立；把它的值抄一份進表就是第二份真相。
     """
     alt = PathLayout(executor_credential_relpath=".claude/credentials.json")
-    assert alt.executor_credential_of(BUILDER_ACCOUNT).endswith("/.claude/credentials.json")
-    # 骨架那條 root-owned 保護跟著走（不是寫死 `.codex`）。
-    scaffold = {p: (o, m) for p, o, _g, m in alt.scaffold_directories(THREE_WAY_SCHEME)}
-    assert scaffold[alt.executor_credential_dir_of(BUILDER_ACCOUNT)] == ("root", 0o755)
+    # #698：那一個值被切成 head（sticky 樹＝登記節點）與 tail（token 葉檔）。
+    assert alt.executor_credential_of(BUILDER_ACCOUNT).endswith("/.claude")
+    assert alt.credential_token_path_of(BUILDER_ACCOUNT).endswith("/.claude/credentials.json")
+    # enforcement 檔跟著樹走——留在 `.codex` 會是一個**不會報錯**的缺口（codex 不看它）。
+    hooks = {aid: path for aid, _a, path, _c in alt.enforcement_placements()}
+    assert hooks["builder-codex-hooks"].endswith("/.claude/hooks.json")
     # 表上有明確 relpath 的那幾格**不**受它影響。
     assert alt.executor_credential_of(PLANNER_ACCOUNT, "agy").endswith("/.gemini")
 
@@ -167,7 +208,7 @@ def test_relpath_shapes_are_validated_at_construction_time() -> None:
 def test_state_trees_are_registered_as_root_owned_symlinks() -> None:
     """U-7 的裁決＝design 的 (a)：登記成 symlink 類資產（登記表新增的 kind）。"""
     plan = generate_plan(FOUR_WAY_SCHEME)
-    for asset_id in PLANNER_ASSETS:
+    for asset_id in PLANNER_SYMLINK_ASSETS:
         entry = plan.by_id(asset_id)
         assert entry.is_symlink, asset_id
         assert not entry.is_directory, asset_id
@@ -184,7 +225,7 @@ def test_symlink_commands_never_use_a_bare_chown_or_chmod() -> None:
     那棵樹歸 job 帳號正是本形狀的全部重點，所以這條不是風格檢查。
     """
     plan = generate_plan(FOUR_WAY_SCHEME)
-    for asset_id in PLANNER_ASSETS:
+    for asset_id in PLANNER_SYMLINK_ASSETS:
         entry = plan.by_id(asset_id)
         path = DEFAULT_LAYOUT.asset_paths()[asset_id]
         target = DEFAULT_LAYOUT.symlink_targets()[asset_id]
@@ -199,7 +240,7 @@ def test_the_state_tree_target_lives_inside_the_accounts_own_cache() -> None:
     """「不新增可寫面」的**前提**：目標必須落在該帳號本來就可寫的那一層裡。"""
     cache = DEFAULT_LAYOUT.cache_of(PLANNER_ACCOUNT)
     for asset_id, target in DEFAULT_LAYOUT.symlink_targets().items():
-        assert asset_id in PLANNER_ASSETS, asset_id
+        assert asset_id in PLANNER_SYMLINK_ASSETS, asset_id
         assert target.startswith(cache + "/"), (asset_id, target)
 
 
@@ -209,11 +250,13 @@ def test_scaffold_creates_the_target_but_not_a_directory_at_the_symlink() -> Non
         path: (owner, mode)
         for path, owner, _g, mode in DEFAULT_LAYOUT.scaffold_directories(FOUR_WAY_SCHEME)
     }
-    for asset_id in PLANNER_ASSETS:
+    for asset_id in PLANNER_SYMLINK_ASSETS:
         link = DEFAULT_LAYOUT.asset_paths()[asset_id]
         target = DEFAULT_LAYOUT.symlink_targets()[asset_id]
         assert link not in scaffold, asset_id
         assert scaffold[target] == (PLANNER_ACCOUNT, 0o700), asset_id
+    # #698：codex 那一格是 sticky 樹 ⇒ 既不在骨架（它是登記表資產），也沒有 symlink 目標。
+    assert DEFAULT_LAYOUT.asset_paths()["reviewer-planner-codex-state"] not in scaffold
     # symlink 自己的保護來自 HOME 那一層。
     assert scaffold[DEFAULT_LAYOUT.home_of(PLANNER_ACCOUNT)] == ("root", 0o755)
 
@@ -233,10 +276,11 @@ def test_the_token_leaf_is_what_the_fingerprint_should_stat() -> None:
     assert DEFAULT_LAYOUT.credential_token_path_of(PLANNER_ACCOUNT, "claude").endswith(
         "/.claude/.credentials.json"
     )
-    # `IN_PLACE_FILE` 兩者相同。
-    assert DEFAULT_LAYOUT.credential_token_path_of(
-        BUILDER_ACCOUNT
-    ) == DEFAULT_LAYOUT.executor_credential_of(BUILDER_ACCOUNT)
+    # #698：builder 走同一列 ⇒ 樹是 `~/.codex`、葉是它底下的 `auth.json`。
+    assert DEFAULT_LAYOUT.executor_credential_of(BUILDER_ACCOUNT).endswith("/.codex")
+    assert DEFAULT_LAYOUT.credential_token_path_of(BUILDER_ACCOUNT).endswith(
+        "/.codex/auth.json"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -244,17 +288,25 @@ def test_the_token_leaf_is_what_the_fingerprint_should_stat() -> None:
 # ---------------------------------------------------------------------------
 
 def test_home_redirect_adds_no_writable_surface_to_the_reviewer_unit() -> None:
-    """reviewer 模板 unit 的 `ReadWritePaths` **逐字不變**，且憑證面仍然可寫。
+    """agy／claude 兩格：reviewer 模板 unit 的可寫面**一條都不必多**。
 
-    這條比 issue 原文的驗收更強：不是「多一條放行」，是「一條都不必多」。機制是
-    `_minimize()`——目標落在 `cache` 之內，被那條既有的 RWP 涵蓋。
+    機制是 `_minimize()`——目標落在 `cache` 之內，被那條既有的 RWP 涵蓋。
+
+    **#698 把 codex 那一格移出本斷言，而那不是放寬。** 那一格改成 HOME 底下的
+    root-owned sticky **真目錄**，因此 `cache` 那一條吃不掉它，unit 多一條
+    `ReadWritePaths=<planner HOME>/.codex`。**可寫的東西沒有變多**：同一棵 codex
+    狀態樹換了位置（`cache/codex` → `.codex`），換到的是「這棵樹的目錄由 root 擁有」
+    ——也就是 `hooks.json` 守得住的前提。那棵樹裡唯一新增的**不可**寫項目是 hooks
+    自己（見下一條）。
     """
     unit = build_job_unit(FOUR_WAY_SCHEME, principal=Principal.REVIEWER)
+    codex_tree = DEFAULT_LAYOUT.asset_paths()["reviewer-planner-codex-state"]
     assert set(unit.read_write_paths) == {
         DEFAULT_LAYOUT.cache_of(PLANNER_ACCOUNT),
         DEFAULT_LAYOUT.review_verdict_spool_root,
+        codex_tree,
     }, unit.read_write_paths
-    for asset_id in PLANNER_ASSETS:
+    for asset_id in PLANNER_SYMLINK_ASSETS:
         link = DEFAULT_LAYOUT.asset_paths()[asset_id]
         target = DEFAULT_LAYOUT.symlink_targets()[asset_id]
         assert link not in unit.read_write_paths, asset_id
@@ -263,18 +315,64 @@ def test_home_redirect_adds_no_writable_surface_to_the_reviewer_unit() -> None:
         assert target.startswith(DEFAULT_LAYOUT.cache_of(PLANNER_ACCOUNT) + "/")
 
 
-def test_the_builder_in_place_credential_is_untouched() -> None:
-    """#640 裁決 (b) 一行未改——RWP 逐字掛在**檔案本身**，不是它的父目錄。"""
-    unit = build_job_unit(FOUR_WAY_SCHEME, principal=Principal.BUILDER)
-    credential = DEFAULT_LAYOUT.executor_credential_of(BUILDER_ACCOUNT)
-    assert "builder-executor-credential" in IN_PLACE_CONTENT_WRITE_ASSETS
-    assert credential in unit.read_write_paths
-    parent = DEFAULT_LAYOUT.executor_credential_dir_of(BUILDER_ACCOUNT)
-    assert parent not in unit.read_write_paths
-    assert not any(
-        parent == rwp or parent.startswith(rwp.rstrip("/") + "/")
-        for rwp in unit.read_write_paths
-    ), unit.read_write_paths
+def test_the_planner_codex_tree_is_sticky_and_its_hooks_are_root_owned() -> None:
+    """#698 的驗收面（產生器側）：0818 R9 T3.9 攻破的那條，在表達層關上了。
+
+    三件事一起才算數，缺任何一件 T3.9 都會再紅一次：
+      (1) 樹 root-owned ＋ sticky ⇒ job 刪不掉／改不掉名字別人的檔；
+      (2) 樹裡的 `hooks.json` root-owned 0644 ⇒ job 改不了內容；
+      (3) 那個檔**在權限計畫裡就會被種出來**（sticky 不管「建一個還不存在的檔」）。
+    """
+    plan = generate_plan(FOUR_WAY_SCHEME)
+    tree = plan.by_id("reviewer-planner-codex-state")
+    assert tree.owner == "root" and tree.sticky and tree.mode_str == "1755"
+    assert [(a.account, a.perms, a.default) for a in tree.acls] == [
+        (PLANNER_ACCOUNT, "rwx", False)
+    ]
+    hooks = plan.by_id("reviewer-planner-codex-hooks")
+    assert hooks.owner == "root" and hooks.mode_str == "0644" and hooks.acls == ()
+    paths = DEFAULT_LAYOUT.asset_paths()
+    assert paths["reviewer-planner-codex-hooks"] == (
+        f"{paths['reviewer-planner-codex-state']}/hooks.json"
+    )
+    resolved = generate_plan(FOUR_WAY_SCHEME.with_principal_accounts({
+        Principal.OPERATOR: "cortex-ops", Principal.EXTERNAL: "cortex-outbox",
+    }))
+    joined = "\n".join(
+        permgen.plan_to_commands(resolved, path_of=paths, layout=DEFAULT_LAYOUT)
+    )
+    hooks_path = paths["reviewer-planner-codex-hooks"]
+    assert f"[ -e {hooks_path} ] || cat >" in joined, joined
+    # ⛔ 一般葉檔那條「不存在就跳過」用在這裡會**靜默把整個裁決變成空的**。
+    assert f"[ ! -e {hooks_path} ]" not in joined
+
+
+def test_the_builder_credential_now_shares_the_planner_shape() -> None:
+    """#698 取代了 #685 的 `..._in_place_credential_is_untouched`。
+
+    那條原本釘的是「builder 那一格一行未改：RWP 逐字掛在**檔案本身**」。#698 的
+    operator 裁決明文涵蓋 builder（「不要只修 reviewer-planner 那格、在 builder 上留
+    一個等著爆的差異」），因此正確的斷言反過來：**兩個帳號的形狀相同**。
+
+    換掉的代價與換到的東西都寫在這裡：
+      - 換掉：`IN_PLACE_FILE` 的「job 建不了新檔、刪不掉自己的 auth.json」。那一半是
+        自我 DoS 面，不是跨邊界面；R-6 早已為 planner 帳號接受同一件事。
+      - 換到：builder 在降權 unit 下 codex **起得來**（#685 逐字記錄過它起不來），
+        而 `hooks.json` 仍然守得住——DAC 三個動詞全關 ＋ mount 層的 ReadOnlyPaths。
+    """
+    paths = DEFAULT_LAYOUT.asset_paths()
+    for principal, prefix, account in (
+        (Principal.BUILDER, "builder", BUILDER_ACCOUNT),
+        (Principal.REVIEWER, "reviewer-planner", PLANNER_ACCOUNT),
+    ):
+        unit = build_job_unit(FOUR_WAY_SCHEME, principal=principal)
+        tree = paths[f"{prefix}-codex-state"]
+        hooks = paths[f"{prefix}-codex-hooks"]
+        assert tree == f"{DEFAULT_LAYOUT.home_of(account)}/.codex"
+        assert tree in unit.read_write_paths, (prefix, unit.read_write_paths)
+        assert hooks in unit.read_only_paths, (prefix, unit.read_only_paths)
+    # `IN_PLACE_CONTENT_WRITE_ASSETS` 的憑證那一半因此導出為空集（見該常數的說明）。
+    assert not (set(permgen.credential_asset_ids()) & set(IN_PLACE_CONTENT_WRITE_ASSETS))
 
 
 def test_the_state_trees_are_absent_from_manager_and_monitor_units() -> None:
@@ -366,23 +464,23 @@ def test_the_overdue_reviewer_credential_entry_is_gone() -> None:
     assert "reviewer-planner-executor-credential" not in names, sorted(names)
 
 
-def test_the_entry_that_could_not_be_closed_says_why() -> None:
-    """**沒關掉的那條必須說得出新的阻礙，而不是留著舊理由。**
+def test_the_u9_entry_is_closed_by_the_shape_change_not_by_deletion() -> None:
+    """#698：`reviewer-planner-codex-hooks` 從 deferred **消失**，且變成真的資產。
 
-    `reviewer-planner-codex-hooks`：與 codex 的可用性在 `$CODEX_HOME` 這一層互斥
-    （U-9）。
-
-    **#687（票 F）之後這裡只剩它一條。** 原本並列的 `manager-claude-credential`
-    已由票 F 移除——切換之後 Manager 不再 exec 任何 executor，該項不是「被登記」
-    而是**消失**（見 `test_the_manager_credential_entry_disappeared_by_switching`）。
-    本測試因此從 `..._two_entries_...` 改名為單數。
+    取代 #685 的 `test_the_entry_that_could_not_be_closed_says_why`。那條當年釘的是
+    「沒關掉的那條必須說得出新的阻礙」；本票關掉了它，因此正確的斷言是「兩件事同時
+    成立」——deferred 少一項，而登記表**多一格真的管得住的資產**。只驗前者的話，
+    「解決了」與「悄悄放棄了」看起來一模一樣。
     """
-    by_name = {item.name: item for item in permgen.deferred_run_dependencies()}
-    hooks = by_name["reviewer-planner-codex-hooks"]
-    assert "U-9" in hooks.disposition
-    assert "CODEX_HOME" in hooks.reason
-    # 舊理由不得還「作為理由」留在上面——它必須是被**引述後推翻**的那一段。
-    assert "做不到" in hooks.reason and "#686" in hooks.reason
+    names = {item.name for item in permgen.deferred_run_dependencies()}
+    assert "reviewer-planner-codex-hooks" not in names, sorted(names)
+    assert names == {"gate-gitconfig"}, sorted(names)
+    asset_ids = {a.asset_id for a in registry.ASSET_REGISTRY}
+    assert "reviewer-planner-codex-hooks" in asset_ids
+    assert "builder-codex-hooks" in asset_ids
+    # 而且它真的進了那個帳號 unit 的 ReadOnlyPaths（不是只在登記表上好看）。
+    unit = build_job_unit(FOUR_WAY_SCHEME, principal=Principal.REVIEWER)
+    assert DEFAULT_LAYOUT.asset_paths()["reviewer-planner-codex-hooks"] in unit.read_only_paths
 
 
 def test_the_manager_credential_entry_disappeared_by_switching() -> None:

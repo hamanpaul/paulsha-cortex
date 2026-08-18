@@ -254,9 +254,16 @@ def _credential_path(mode: str, env: Mapping[str, str], executor: str) -> str:
     上恆定），因此快取照常運作；而它一旦被登記進表，指紋就變、快取自動失效——與
     「PATH 未宣告」那一格是同一條原則：**取不到答案本身也是一個會變的答案**。
 
-    取的是 `credential_token_path_of()`（**token 葉檔**）而不是登記表資產那個節點：
-    `HOME_REDIRECT_TREE` 的資產是一條 symlink，`stat` 它只看得到目標目錄的 mtime，而
-    token 就地覆寫時目錄 mtime 不變 ⇒ 「憑證換了」偵測不到。
+    取的是 **token 葉檔**而不是登記表資產那個節點，兩者在三種形狀下都可能不同：
+    `HOME_REDIRECT_TREE` 的資產是一條 symlink、`HOME_STICKY_TREE`（#698）的資產是一棵
+    目錄——`stat` 它們只看得到目錄的 mtime，而 token 就地覆寫時目錄 mtime 不變 ⇒
+    「憑證換了」偵測不到。
+
+    **#698 修掉了本函式的一份複本**：direct 那一支原本自己拼 `relpath + token_leaf`，
+    而 #698 讓 codex 那一列的樹與葉**都**由 `executor_credential_relpath` 的 head／tail
+    導出（`relpath is None`／`token_leaf` 留空）。那份複本因此拼出目錄本身，指紋退化成
+    「stat `~/.codex`」——refresh 偵測不到。改走 `credential_token_relpath_of()` 這個
+    唯一來源之後，本模組同樣**不知道**也不需要知道三種形狀的差別。
     """
 
     from ..trust_root import permgen
@@ -271,10 +278,7 @@ def _credential_path(mode: str, env: Mapping[str, str], executor: str) -> str:
         # 落點」套到 Manager 的 HOME——那正是 direct 模式實際會解到的路徑。
         prefix = layout.credential_prefix_of(layout.reviewer_planner_account)
         credential = permgen.credential_for(prefix, executor)
-        relpath = layout.credential_relpath_of(credential)
-        if credential.token_leaf:
-            relpath = f"{relpath}/{credential.token_leaf}"
-        return os.path.join(home, relpath)
+        return os.path.join(home, layout.credential_token_relpath_of(credential))
     return layout.credential_token_path_of(layout.reviewer_planner_account, executor)
 
 

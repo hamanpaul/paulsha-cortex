@@ -520,7 +520,16 @@ gitconfig 變成執行期可變狀態。
 Manager 從那個 **bundle 檔**（不是 repo）fetch。Manager 全程不碰 builder 的樹，讀的又是
 一個普通檔案，dubious-ownership 與 traverse 兩個問題同時消失。
 
-#### executor 執行面：toolchain 與 per-account 憑證（#640 裁決；登記表資產 `executor-toolchain`／`builder-executor-credential`）
+#### executor 執行面：toolchain 與 per-account 憑證（#640 裁決；登記表資產 `executor-toolchain`／`builder-codex-state`）
+
+> **#698 更正**：本節描述的憑證形狀是 #640 的 `IN_PLACE_FILE`（單檔，資產 id 當時叫
+> `builder-executor-credential`）。0818 的 R9 T3.9 實測攻破了它的姊妹形態
+> （`HOME_REDIRECT_TREE`，見 #685），operator 裁決改採 **sticky 樹**並**涵蓋兩個帳號**：
+> `<job HOME>/.codex` 是 root-owned ＋ sticky（`1755`）的真目錄，job 以具名 access ACL
+> 取得整棵寫入權，樹裡放一個 root-owned 的 `hooks.json`。下文「目錄 root-owned `0755`
+> ⇒ job 建不了新檔／刪不掉」那一段因此**只在 #698 之前為真**——現在守 `hooks.json` 的
+> 是 sticky（unlink／rename）＋ 檔案自己的 mode（內容）＋ unit 的巢狀 `ReadOnlyPaths=`。
+> 逐條見 `permgen.CredentialShape.HOME_STICKY_TREE` 與 runbook 第 4e-2b 步。
 
 `ProtectHome=yes` 讓 job 帳號看不到 `/home`，而四個模型 executor（`codex`／`claude`／
 `copilot`／`agy`）原本**全部**落在 operator 的 HOME 底下（nvm 樹與 `~/.local/bin`）。

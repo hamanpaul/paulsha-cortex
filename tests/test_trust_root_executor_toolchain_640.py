@@ -75,7 +75,10 @@ THREE_WAY_SCHEME = _THREE_WAY_BASE.with_principal_accounts(DEPLOYMENT_ACCOUNTS)
 ALL_SCHEMES = [TWO_WAY_SCHEME, THREE_WAY_SCHEME]
 
 TOOLCHAIN = "executor-toolchain"
-CREDENTIAL = "builder-executor-credential"
+# #698：builder 的 codex 憑證從 `IN_PLACE_FILE` 單檔（舊 id `builder-executor-credential`）
+# 改成 root-owned ＋ sticky 的**整棵樹**，與 reviewer-planner 那一格共用同一列憑證表。
+CREDENTIAL = "builder-codex-state"
+HOOKS = "builder-codex-hooks"
 NEW_ASSET_IDS = (TOOLCHAIN, CREDENTIAL)
 
 
@@ -116,17 +119,30 @@ def test_toolchain_is_deployment_owned_and_job_accounts_are_not_writers() -> Non
         assert reader in asset.readers, reader
 
 
-def test_credential_writer_is_the_job_persona_not_the_installer() -> None:
-    """裁決 (b) 的機械落點：writer 是 job persona，才會分到 `owner_class=JOB`。
+def test_credential_writers_are_both_the_installer_and_the_job_persona() -> None:
+    """#698：writer 面**兩個都要有**，而兩個各自撐住一半的形狀。
 
-    寫成 `INSTALLER` 會讓 `classify_owner()` 落到 `DEPLOYMENT`（owner＝root），
-    憑證就 refresh 不了——與裁決正好相反。這條把那個反轉釘死。
+    - `INSTALLER`：這棵樹由 root 建立、root 擁有。少了它，`classify_owner()` 不會
+      落到 `STICKY_SHARED`，owner 會變成 job 帳號——而目錄 owner 對 sticky 免疫
+      （POSIX：目錄 owner 刪得掉裡面任何檔），`hooks.json` 當場守不住。
+    - `BUILDER`：job 必須寫得進整棵樹，否則 codex 起不來（#686）。它同時是
+      `required_write_targets()` 產出 RWP 的依據，以及 `build_entry()` 產出那條
+      具名 `rwx` ACL 的依據（走 `UNTRUSTED_EXECUTION_PRINCIPALS`）。
+
+    **#640 的原斷言是相反的**（「writer 是 job persona，**不是** INSTALLER，否則會
+    落到 DEPLOYMENT、憑證就 refresh 不了」）。那條在 `IN_PLACE_FILE` 形狀下正確：
+    當時登記的節點是**憑證檔自己**，它必須 job-owned。#698 之後登記的節點是**樹**，
+    而 token 葉檔在樹裡、仍由 job 擁有（unit 的 `UMask=0077`）——refresh 照樣走得通，
+    見 `test_the_enforcement_leaf_lives_inside_the_state_tree_and_belongs_to_root`。
     """
     asset = registry.asset_by_id(CREDENTIAL)
-    assert asset.writers == (Principal.BUILDER,)
-    assert Principal.INSTALLER not in asset.writers
+    assert set(asset.writers) == {Principal.INSTALLER, Principal.BUILDER}
     assert asset.tree is TrustTree.JOB_VISIBLE
-    assert permgen.classify_owner(asset) is OwnerClass.JOB
+    assert permgen.classify_owner(asset) is OwnerClass.STICKY_SHARED
+    # enforcement 檔則相反：writer **只有** INSTALLER ⇒ 它落回 DEPLOYMENT、零 job 授權。
+    hooks = registry.asset_by_id(HOOKS)
+    assert hooks.writers == (Principal.INSTALLER,)
+    assert permgen.classify_owner(hooks) is OwnerClass.DEPLOYMENT
 
 
 # ---------------------------------------------------------------------------
@@ -195,16 +211,19 @@ def test_toolchain_lives_in_the_deployment_tree_not_the_state_tree() -> None:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
-def test_credential_file_is_owned_by_the_job_account(scheme) -> None:
+def test_the_state_tree_is_root_owned_and_sticky(scheme) -> None:
+    """#698：`$CODEX_HOME` 整棵——目錄 root-owned ＋ sticky，job 以具名 ACL 取得 rwx。
+
+    **owner 必須是 root**：POSIX 的 sticky 規則對**目錄 owner** 免疫（目錄 owner 刪得掉
+    裡面任何檔），把這一層交給 job 等於整條規則不存在。
+    """
     entry = generate_plan(scheme).by_id(CREDENTIAL)
     builder = scheme.resolve(Principal.BUILDER)
-    assert entry.owner == builder, scheme.scheme_id
-    assert entry.group == scheme.group_of(builder)
-    assert not entry.is_directory, "憑證是單一檔——目錄型會讓整層被 chown 給 job"
-    assert entry.mode == 0o600, entry.mode_str
-    # 跨帳號一條 ACL 都不給：Manager 沒有理由讀 job 的登入態。
-    assert entry.acls == ()
-    assert plan_writers(scheme, CREDENTIAL) == frozenset({builder})
+    assert entry.owner == scheme.deploy_account == "root", scheme.scheme_id
+    assert entry.is_directory, "#698 起它是整棵樹，不是單檔"
+    assert entry.sticky and entry.mode_str == "1755", entry.mode_str
+    assert [(a.account, a.perms, a.default) for a in entry.acls] == [(builder, "rwx", False)]
+    assert plan_writers(scheme, CREDENTIAL) == frozenset({"root", builder})
 
 
 def plan_writers(scheme, asset_id: str) -> frozenset[str]:
@@ -213,56 +232,56 @@ def plan_writers(scheme, asset_id: str) -> frozenset[str]:
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
-def test_credential_parent_directory_stays_root_owned(scheme) -> None:
-    """裁決 (b) 的全部性質都落在這一層：目錄 root-owned ⇒ job 增／刪／換不了。"""
+def test_the_state_trees_parent_home_stays_root_owned(scheme) -> None:
+    """整棵樹**換不掉**的那一層仍在骨架上：HOME 是 root-owned 0755。
+
+    #698 把樹本身從骨架移進登記表（sticky ＋ ACL 表達不了在骨架那個四元組裡），
+    但「job 換不掉整棵 `~/.codex`」這條性質沒有搬家——它一直是 HOME 那一層守的。
+    """
     scaffold = {
         path: (owner, mode)
         for path, owner, _group, mode in DEFAULT_LAYOUT.scaffold_directories(scheme)
     }
-    builder = scheme.resolve(Principal.BUILDER)
-    cred_dir = DEFAULT_LAYOUT.executor_credential_dir_of(DEFAULT_LAYOUT.builder_account)
-    assert cred_dir in scaffold, (scheme.scheme_id, sorted(scaffold))
-    owner, mode = scaffold[cred_dir]
-    assert owner == scheme.deploy_account == "root"
-    assert mode == 0o755
-    # 「目錄沒有 w 位給 job」就是那條不變式本身。
-    assert not mode & 0o020 and not mode & 0o002, format(mode, "04o")
-    # 憑證檔確實落在那一層底下，而不是別處。
-    cred = DEFAULT_LAYOUT.asset_paths()[CREDENTIAL]
-    assert cred == f"{cred_dir}/auth.json"
-    assert cred.startswith(DEFAULT_LAYOUT.home_of(DEFAULT_LAYOUT.builder_account) + "/")
-    assert builder  # scheme 一定解析得出 builder 帳號
+    home = DEFAULT_LAYOUT.home_of(DEFAULT_LAYOUT.builder_account)
+    assert scaffold[home] == ("root", 0o755)
+    # 樹自己**不在**骨架（第二份真相會被 `_dedupe_scaffold()` 靜默取前者）。
+    cred_dir = DEFAULT_LAYOUT.asset_paths()[CREDENTIAL]
+    assert cred_dir not in scaffold, (scheme.scheme_id, cred_dir)
+    assert cred_dir == f"{home}/.codex"
 
 
-def test_credential_shares_its_directory_with_a_root_owned_tier0_file() -> None:
-    """同目錄下就放著 root-owned 的 `codex-hooks`——那正是「換不掉」要守的東西。"""
+def test_the_enforcement_leaf_lives_inside_the_state_tree_and_belongs_to_root() -> None:
+    """樹裡放著 root-owned 的 `hooks.json`——那正是 sticky 換到的東西。"""
     paths = DEFAULT_LAYOUT.asset_paths()
-    cred_dir = DEFAULT_LAYOUT.executor_credential_dir_of(DEFAULT_LAYOUT.builder_account)
-    assert _within(paths["codex-hooks"], cred_dir)
-    assert _within(paths[CREDENTIAL], cred_dir)
-    hooks = generate_plan(THREE_WAY_SCHEME).by_id("codex-hooks")
-    assert hooks.owner == "root", "同目錄的 hooks 仍是 root 的"
+    tree = paths[CREDENTIAL]
+    assert _within(paths[HOOKS], tree)
+    assert paths[HOOKS] == f"{tree}/hooks.json"
+    hooks = generate_plan(THREE_WAY_SCHEME).by_id(HOOKS)
+    assert hooks.owner == "root"
+    assert hooks.mode_str == "0644"
+    assert hooks.acls == (), "零跨帳號授權——job 連讀寫 ACL 都不該有"
+    # token 葉檔則相反：它必須是 job 的（token 過期要 refresh 得回來）。
+    token = DEFAULT_LAYOUT.credential_token_path_of(DEFAULT_LAYOUT.builder_account)
+    assert token == f"{tree}/auth.json"
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
-def test_credential_read_write_path_is_the_file_itself_not_its_parent(scheme) -> None:
-    """一般規則把檔案折算成父目錄；這一族是**明示**的例外。
+def test_the_state_tree_is_writable_but_the_hooks_file_is_mount_read_only(scheme) -> None:
+    """#698：整棵進 RWP（codex 才起得來），樹裡的 hooks 再以 ReadOnlyPaths 收回。
 
-    折算成父目錄會讓 job unit 的 mount 層開放整個 `~/.codex`（裡面還有 root-owned 的
-    `hooks.json`）；掛在檔案本身則讓「目錄 root-owned」在**檔案系統**與 **systemd
-    mount** 兩層同時成立。#623 那條「兩個 root-owned 設定檔不可寫」的既有不變式因此
-    仍然逐字成立。
+    #640 的 `IN_PLACE_FILE` 讓 hooks 同時被 DAC 與 systemd mount 兩層擋住。本形狀若
+    只做 DAC 就是**淨退一層**，因此 mount 那一層改由巢狀 `ReadOnlyPaths=` 提供。
     """
-    assert CREDENTIAL in IN_PLACE_CONTENT_WRITE_ASSETS
     unit = build_job_unit(scheme, DEFAULT_LAYOUT)
-    cred = DEFAULT_LAYOUT.asset_paths()[CREDENTIAL]
-    cred_dir = DEFAULT_LAYOUT.executor_credential_dir_of(DEFAULT_LAYOUT.builder_account)
-    assert cred in unit.read_write_paths, unit.read_write_paths
-    assert cred_dir not in unit.read_write_paths, unit.read_write_paths
-    # 父目錄不得被任何一條 RWP 涵蓋（含更上層的 HOME）。
-    assert not any(_within(cred_dir, rwp) for rwp in unit.read_write_paths), (
-        unit.read_write_paths
-    )
+    tree = DEFAULT_LAYOUT.asset_paths()[CREDENTIAL]
+    hooks = DEFAULT_LAYOUT.asset_paths()[HOOKS]
+    assert tree in unit.read_write_paths, unit.read_write_paths
+    assert hooks in unit.read_only_paths, unit.read_only_paths
+    # 巢狀關係是前提：ReadOnlyPaths 要覆蓋掉的就是外層那條 RWP。
+    assert any(_within(hooks, rwp) for rwp in unit.read_write_paths)
+    # HOME 那一層仍然不在 RWP 內（換不掉整棵樹）。
+    home = DEFAULT_LAYOUT.home_of(DEFAULT_LAYOUT.builder_account)
+    assert not any(_within(home, rwp) for rwp in unit.read_write_paths)
 
 
 def test_credential_is_absent_from_the_manager_and_monitor_units() -> None:
@@ -279,32 +298,27 @@ def test_credential_is_absent_from_the_manager_and_monitor_units() -> None:
 
 
 def test_credential_relpath_is_a_validated_deployment_decision() -> None:
-    """換 executor 只改一個值，且值的形狀在**建構當下**就驗（不等到 root 執行）。"""
+    """換 executor 只改一個值，且值的形狀在**建構當下**就驗（不等到 root 執行）。
+
+    **#698 起那一個值被切成 head／tail 兩半**：head 是 sticky 樹（登記節點），
+    tail 是 token 葉檔。兩半來自同一個字串 ⇒ 不可能各改一半。
+    """
     alt = PathLayout(executor_credential_relpath=".claude/credentials.json")
     account = alt.builder_account
-    assert alt.executor_credential_of(account).endswith("/.claude/credentials.json")
-    assert alt.executor_credential_dir_of(account).endswith("/.claude")
-    # 換了 relpath，骨架的那條 root-owned 保護必須**跟著走**（不是寫死 `.codex`）。
-    scaffold = {p: (o, m) for p, o, _g, m in alt.scaffold_directories(THREE_WAY_SCHEME)}
-    assert scaffold[alt.executor_credential_dir_of("cortex-builder")] == ("root", 0o755)
+    assert alt.executor_credential_of(account).endswith("/.claude")
+    assert alt.credential_token_path_of(account).endswith("/.claude/credentials.json")
+    # hooks 跟著樹走——換了 relpath 之後它不能還留在 `.codex` 底下（那樣 codex 根本
+    # 不會去讀它，是一個**不會報錯**的 enforcement 缺口）。
+    hooks = {aid: path for aid, _a, path, _c in alt.enforcement_placements()}
+    assert hooks[HOOKS].endswith("/.claude/hooks.json")
+    assert alt.codex_hooks_dir_of(account).endswith("/.claude")
     for bad in ("auth.json", "/etc/passwd", "../../etc/passwd", "..", ".codex/a b"):
         with pytest.raises(ValueError):
             PathLayout(executor_credential_relpath=bad)
 
 
-def test_scaffold_gives_every_model_job_account_a_root_owned_credential_dir() -> None:
-    """機制是 per-account 的：登記表只掛 builder 一份，保護面卻涵蓋全部 job 帳號。"""
-    scaffold = {
-        p: (o, m)
-        for p, o, _g, m in DEFAULT_LAYOUT.scaffold_directories(THREE_WAY_SCHEME)
-    }
-    for account in ("cortex-builder", "cortex-reviewer-planner"):
-        cred_dir = DEFAULT_LAYOUT.executor_credential_dir_of(account)
-        assert scaffold[cred_dir] == ("root", 0o755), account
-
-
 def test_scaffold_has_no_duplicate_paths() -> None:
-    """預設 relpath 下憑證父目錄與 `~/.codex` 是同一層——去重後只出現一次。"""
+    """骨架清單去重後每條路徑只出現一次（`_dedupe_scaffold` 只留第一筆）。"""
     for scheme in ALL_SCHEMES:
         dirs = DEFAULT_LAYOUT.scaffold_directories(scheme)
         paths = [p for p, _o, _g, _m in dirs]
@@ -312,75 +326,35 @@ def test_scaffold_has_no_duplicate_paths() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3b. 「能改內容、不能增刪換」——真的 OS 語意（#638 的教訓）
+# 3b. 「整棵可寫、但動不了 root 的檔」——真的 OS 語意（#638 的教訓）
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(
-    os.geteuid() == 0,
+@pytest.mark.skip(
     reason=(
-        "root 不受 DAC 限制：以 root 跑時目錄少了 w 位照樣建得了檔，"
-        "本組驗的語意在 root 下不存在——刻意 skip 而非空過"
-    ),
+        "#698：sticky bit 的語意**需要第二個 UID**，CI 重現不了——因此具名 skip，"
+        "不靜默通過。\n"
+        "sticky 的 kernel 判定（`fs/namei.c: check_sticky()`）是：目錄帶 S_ISVTX 時，"
+        "只有『**檔案 owner** == 行程 uid』或『**目錄 owner** == 行程 uid』或 "
+        "CAP_FOWNER，才准 unlink／rename 那個檔。它比對的是 **uid**，因此無法像 "
+        "#640 的 `IN_PLACE_FILE` 那樣用『把 owner 位調成 r-x』來重現：那一條守的是"
+        "『目錄有沒有 w 位』（同一個 uid 就驗得到），這一條守的是『檔案屬不屬於我』"
+        "（同一個 uid 永遠為真 ⇒ 測試必然全綠，是**假綠**）。\n"
+        "本組因此改由 runbook 第 8 步的 R9 T3.9 在**真實部署、真實兩個 headless "
+        "帳號、完整模板 unit 加固面**下實跑（#627 的身分鎖確保它只能以那兩個帳號執行）。"
+        "0818 的實測結果逐字記在 runbook 的第 8 步表格：兩個 subject 都 "
+        "`denied (OK) rc=2`（修前 reviewer-planner 是 `!! SUCCEEDED (FAIL)`）。\n"
+        "另有一組 OS 層量測記在 runbook 第 4e-2b 步：以 `systemd-run` 起兩個剖面，"
+        "分別驗『巢狀 ReadOnlyPaths 生效（Read-only file system）』與『DAC 三個動詞"
+        "全關（Permission denied／Operation not permitted ×2）』。\n"
+        "⛔ 不要把本組改成『用同一個 uid 建一棵 sticky 目錄』就當驗過了——那正是"
+        "#638 那一族假綠的形態（單 UID 讓斷言真空）。"
+    )
 )
-class TestInPlaceCredentialOsSemantics:
-    """把裁決 (b) 的三條性質對**真的檔案系統**驗一次。
+class TestStickyTreeOsSemantics:
+    """佔位：sticky 的真實語意在 CI 環境（單一 uid）結構性驗不到。見上方 skip 理由。"""
 
-    #638 的教訓是「涉及 OS 層語意的不變式，測試要能真的驗到那個語意」。這裡不需要
-    第二個 UID：裁決 (b) 守的規則是「**目錄沒有 `w` 位給這個行程**」——真實部署裡
-    job 帳號落在 root-owned `0755` 的 `other` 位（`r-x`），本測試以 owner 位為
-    `r-x`（`0555`）重現**同一條 kernel 檢查**（`inode_permission(dir, MAY_WRITE)`）。
-    兩者走的是同一段判定，只是命中的是不同那一組權限位。
-
-    真正需要第二個 UID 的只有「檔案 owner 不是本行程」那一半，而那一半由上面的
-    產生器測試（`entry.owner == builder`）釘住，不重複用一個要 root 才跑得起來的
-    測試去驗同一件事。
-    """
-
-    @pytest.fixture()
-    def tree(self, tmp_path: Path):
-        """`~/.codex` 的最小重現：目錄不可寫、憑證檔可寫、旁邊一個不可換的鄰居。"""
-        cred_dir = tmp_path / ".codex"
-        cred_dir.mkdir()
-        cred = cred_dir / "auth.json"
-        cred.write_text('{"token": "old"}\n', encoding="utf-8")
-        cred.chmod(0o600)
-        # 同目錄下的 root-owned 鄰居（真實部署裡是 `hooks.json`）。
-        neighbour = cred_dir / "hooks.json"
-        neighbour.write_text("{}\n", encoding="utf-8")
-        # 目錄：對本行程 `r-x`——重現 job 帳號在 root-owned 0755 目錄上的有效權限。
-        cred_dir.chmod(0o555)
-        try:
-            yield cred_dir, cred, neighbour
-        finally:
-            # 還原後 pytest 才收得掉這棵樹（不可寫的目錄 rmtree 會失敗）。
-            cred_dir.chmod(0o755)
-
-    def test_content_can_be_rewritten_in_place(self, tree) -> None:
-        """refresh 走得通：憑證檔是自己的，`O_TRUNC` 覆寫不需要目錄的寫入權。"""
-        _cred_dir, cred, _neighbour = tree
-        cred.write_text('{"token": "refreshed"}\n', encoding="utf-8")
-        assert "refreshed" in cred.read_text(encoding="utf-8")
-        assert stat.S_IMODE(cred.stat().st_mode) == 0o600
-
-    def test_new_files_cannot_be_created_in_the_directory(self, tree) -> None:
-        """「建不了新檔」——這同時封掉「暫存檔 ＋ rename」那條原子替換路徑。"""
-        cred_dir, _cred, _neighbour = tree
-        with pytest.raises(PermissionError):
-            (cred_dir / "auth.json.tmp").write_text("x", encoding="utf-8")
-
-    def test_the_credential_cannot_be_unlinked(self, tree) -> None:
-        """「刪不掉」——unlink 需要的是**目錄**的寫入權，不是檔案的。"""
-        _cred_dir, cred, _neighbour = tree
-        with pytest.raises(PermissionError):
-            cred.unlink()
-        assert cred.exists()
-
-    def test_the_root_owned_neighbour_cannot_be_replaced(self, tree) -> None:
-        """「換不掉同目錄下的其他 root-owned 檔」——rename 同樣要目錄的寫入權。"""
-        _cred_dir, cred, neighbour = tree
-        with pytest.raises(PermissionError):
-            os.replace(cred, neighbour)
-        assert neighbour.read_text(encoding="utf-8") == "{}\n"
+    def test_root_owned_neighbour_cannot_be_unlinked_by_another_uid(self) -> None:
+        raise AssertionError("需要第二個 UID——見 class 的 skip 理由")
 
 
 # ---------------------------------------------------------------------------

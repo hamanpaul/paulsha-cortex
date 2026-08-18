@@ -240,7 +240,8 @@ planner 上 job 之後不需要任何剖面面的前置修正。
 1. 實機 `cortex-reviewer-job@.service` 的 `ReadWritePaths=` 只有
    `/var/lib/cortex-reviewer-planner/cache` 與 `/var/lib/cortex/coordinator/review-verdicts`
    ——**不含 `.codex/auth.json`**。該 unit 自己的註解花了七行描述這條路徑該怎麼掛，
-   但登記表只有 `builder-executor-credential` 一列，所以產生器產不出它。淨效果：
+   但登記表只有 `builder-executor-credential` 一列（#698 之後該資產叫
+   `builder-codex-state`，且兩個帳號**共用同一列憑證表**），所以產生器產不出它。淨效果：
    `ProtectSystem=strict` 下憑證**讀得到、改不了**，token 過期那天靜默 refresh 失敗。
    這正是 `permgen.deferred_run_dependencies()` 第一項逐字描述的逾期項。
 2. `.gemini → cache/gemini` 這個 root-owned symlink 是一條**手動落位、登記表不知道**

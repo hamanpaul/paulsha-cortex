@@ -2157,8 +2157,202 @@ sudo -u cortex-builder sh -c \
 
 ---
 
-#### 4e-2b. `cortex-reviewer-planner` 的三份登入態（#685／#672 票 D；U-4／U-5／U-7）
+#### 4e-2b. 兩個 job 帳號的 codex 狀態樹（#698 方案 A：sticky ＋ root-owned hooks）
 
+> **這一節在 #698 之前只涵蓋 `cortex-reviewer-planner`，而那正是被實測攻破的形狀。**
+> 0818 的 R9 T3.9 在該帳號上 `!! SUCCEEDED`：`~/.codex` 是導進 job-owned `cache/codex`
+> 的 symlink ⇒ 該帳號**植得進 `hooks.json`**。codex hooks **會執行命令** ⇒ 跨 job
+> 持久化 ⇒ 四分隔離「每個 job 一次性」的前提在該帳號上不成立，而它正是吃 untrusted
+> issue 內容的那個帳號。
+>
+> operator 裁決（#698）採**方案 A**：**目錄 sticky bit ＋ `hooks.json` 由 root 擁有**，
+> 且**兩個帳號的形狀由同一條規則導出**（`permgen.EXECUTOR_ENFORCEMENT_LEAVES`，
+> import 當下強制）。builder 因此**一併遷移**——它當天守得住只是因為 `.codex` 還沒遷成
+> 可寫樹，而那個形態的代價是 codex 在降權 unit 下**根本起不來**（#686、#685 已記錄）。
+
+**形狀（`permgen.CredentialShape.HOME_STICKY_TREE`）**：HOME 底下一棵 **root-owned ＋
+sticky bit** 的真目錄，job 帳號以一條具名 **access** ACL 取得 `rwx`。
+
+| 帳號 | `$CODEX_HOME` | mode | ACL | 樹裡的 root-owned 檔 | token 葉檔 |
+|---|---|---|---|---|---|
+| `cortex-builder` | `~/.codex` | `1755` | `u:cortex-builder:rwx` | `hooks.json`（root:root 0644） | `auth.json` |
+| `cortex-reviewer-planner` | `~/.codex` | `1755` | `u:cortex-reviewer-planner:rwx` | 同上 | `auth.json` |
+
+> **為什麼這個形狀同時買到兩件在 #685 下互斥的事**：
+>
+> 1. **整棵可寫 ⇒ codex 起得來**。#686 實測：唯讀時 codex 回
+>    `Error: failed to initialize in-process app-server client: Read-only file system
+>    (os error 30)`；把 cwd 換成可寫的 `/tmp` **症狀完全相同**，維持唯讀 cwd、只把
+>    `CODEX_HOME` 指到可寫目錄則 **rc=0**。阻斷點是 `CODEX_HOME`，不是 cwd。它在底下
+>    建 `state_5.sqlite`／`logs_2.sqlite`／`sessions/`／`skills/`／`plugins/`／
+>    `thread-writer-locks/`……**檔名帶版本序號 ⇒ 逐項列舉會在下一次 CLI 升版時無聲失效**。
+> 2. **`hooks.json` 三個動詞全關**。sticky bit（`chmod +t`）的 POSIX 語意是「目錄可寫，
+>    但只有**檔案 owner／目錄 owner／root** 刪得掉或改得掉裡面的檔名」：
+>    - `unlink` → `Operation not permitted`（sticky）
+>    - `rename` → `Operation not permitted`（sticky）
+>    - 改內容 → `Permission denied`（檔案 root:root 0644，job 落在 `other` 位）
+>    另有 mount 層的第二道：模板 unit 帶一條巢狀的
+>    `ReadOnlyPaths=<HOME>/.codex/hooks.json`（見下方 3️⃣），寫入回
+>    `Read-only file system`。
+>
+> **⛔ 目錄 owner 必須是 root。** POSIX 的 sticky 規則對**目錄 owner** 免疫——目錄
+> owner 刪得掉裡面任何檔。把這一層交給 job 帳號等於整條規則不存在。
+>
+> **⛔ 不設 default ACL。** default ACL 決定「**之後**在這個目錄裡新建的物件」的初值，
+> 包含 root 日後重放一次 `hooks.json` 的那一次。設了它等於把 hooks 自動交還給 job。
+> 產生器刻意只出 `setfacl -m`（access），不出 `setfacl -d -m`。
+>
+> **⛔ `hooks.json` 必須先存在。** sticky 管的是「刪／改名**別人的**檔」，**不管
+> 「建一個還不存在的檔」**。缺這個檔時 job 直接 `printf x > $HOME/.codex/hooks.json`
+> 就會成功——那正是 R9 T3.9 的攻擊字面。產生器因此對它出 **create-if-absent**
+> （`[ -e … ] || cat > … <<'EOF'`），而不是其他葉檔那條「不存在就跳過」。
+>
+> **代價（R-6，不變也不多）**：樹由 job 寫 ⇒ 樹裡的 **token 葉檔**仍可被該 job 刪除或
+> 替換。那是刻意的——token 過期必須 refresh 得回來；sticky 保護的是 root 擁有的那些檔。
+>
+> **對 builder 換掉了什麼**：#640 的 `IN_PLACE_FILE` 另外擋住「job 建不了新檔、刪不掉
+> 自己的 `auth.json`」。那一半是**自我 DoS 面**，不是跨邊界面，而 R-6 早已為 planner
+> 帳號接受同一件事。換到的是 builder 的 codex 在降權 unit 下**真的跑得起來**。
+
+##### 遷移（operator 執行；**兩個帳號的既有形態不同，順序不同**）
+
+⚠️ **產生器出的是 greenfield 命令。** 既有部署的 `.codex` 可能是**真目錄**（builder）
+也可能是 **symlink**（reviewer-planner，#685 之後）。權限計畫因此在
+`install -d` **之前**先出一條 `[ ! -L <path> ] || { echo …; exit 1; }` 守衛——
+`install -d` 對既有 symlink **不會報錯也不會取代它**，它會**跟著連結**去建目標，
+於是 `chown`／`chmod`／`setfacl` 全部套到 `cache/codex` 那棵 job-owned 的樹上，
+而現場看起來一切正常。**那是安靜地做錯事，必須由本節顯式拆掉連結。**
+
+```bash
+BH=/var/lib/cortex-builder
+PH=/var/lib/cortex-reviewer-planner
+
+# 0️⃣ 先確認沒有 job 在跑（遷移期間 `$CODEX_HOME` 會短暫不存在）
+systemctl list-units 'cortex-*job@*' --no-legend | grep -v '^$' && \
+  echo "⛔ 還有 job 在跑，等它結束" || echo "無 in-flight job"
+
+# 1️⃣ builder：既有就是**真目錄**（root:root 0755）⇒ 就地加 sticky ＋ ACL
+sudo test ! -L "$BH/.codex" || { echo "⛔ 非預期：builder 的 .codex 是 symlink"; }
+sudo chown root:root "$BH/.codex"
+sudo chmod 1755 "$BH/.codex"
+sudo setfacl -m u:cortex-builder:rwx "$BH/.codex"
+
+# 2️⃣ reviewer-planner：既有是 **symlink → cache/codex** ⇒ 拆連結、建真目錄、搬內容
+if sudo test -L "$PH/.codex"; then
+  OLD="$(sudo readlink -f "$PH/.codex")"      # 期望 /var/lib/cortex-reviewer-planner/cache/codex
+  echo "old target=$OLD"
+  sudo rm "$PH/.codex"                        # ⚠️ 只拆**連結**；`rm -rf` 會連目標樹一起刪掉
+  sudo install -d "$PH/.codex"
+  sudo cp -a "$OLD/." "$PH/.codex/"           # 保留每個檔的 owner／mode（登入態不重放）
+  sudo rm -rf "$OLD"
+fi
+#   ⚠️ **`cp -a src/. dst/` 會把 src 目錄自己的 owner／mode／ACL 蓋到 dst 上。**
+#      0818 遷移實際踩到：剛設好的 `root:root 1755 + ACL` 被還原成
+#      `cortex-reviewer-planner 0700`，sticky 與 ACL 一起消失，而 `cp` 不會抱怨。
+#      因此**先搬內容、後套權限**——下一行不是重複，它是修正那個副作用。
+sudo chown root:root "$PH/.codex"
+sudo chmod 1755 "$PH/.codex"
+sudo setfacl -m u:cortex-reviewer-planner:rwx "$PH/.codex"
+
+# 3️⃣ 種 root-owned 的 hooks.json（**兩份都要**；缺它 sticky 什麼也擋不住）
+for P in "$BH/.codex/hooks.json" "$PH/.codex/hooks.json"; do
+  sudo test ! -L "$P" || { echo "⛔ $P 是 symlink（job 可能預埋）——停下來查"; continue; }
+  sudo sh -c "[ -e '$P' ] || printf '%s\n' '{' '  \"hooks\": {}' '}' > '$P'"
+  sudo chown root:root "$P"
+  sudo chmod 0644 "$P"
+done
+#   內容刻意是**空的** hooks 文件，不是 `paulsha_cortex/scripts/hooks/codex.json` 那份
+#   relay hook：本檔的價值在於「這個位置由 root 佔住、job 換不掉」，不在於跑什麼。
+#   把 relay hook 種進 job 帳號會憑空多一條執行面（而且 job 寫不進 coordinator，
+#   每次 codex session 只會多一串失敗）。之後要放什麼是 root 的決定。
+#   ⚠️ **`[ ! -L ]` 守衛不是形式主義**：這兩個位置在 job 可寫的樹裡，job 預埋一條
+#      **懸空** symlink 時 `[ -e ]` 為假、root 的 `cat >` 會跟著它寫到別處去。
+
+# 4️⃣ 落新 unit（RWP 改掛整棵樹 ＋ 新增巢狀 ReadOnlyPaths）——**必須在 3️⃣ 之後**
+for spec in "--job:cortex-job@.service:strict" "--job:cortex-job-jit@.service:jit" \
+            "--review-job:cortex-reviewer-job@.service:strict" \
+            "--review-job:cortex-reviewer-job-jit@.service:jit"; do
+  flag="${spec%%:*}"; rest="${spec#*:}"; name="${rest%%:*}"; prof="${rest##*:}"
+  python3 -m paulsha_cortex.trust_root unit four-way "$flag" --profile "$prof" > "/tmp/$name"
+  sudo install -m 0644 -o root -g root "/tmp/$name" "/etc/systemd/system/$name"
+done
+sudo systemctl daemon-reload
+#   ⚠️ 順序不可顛倒：`ReadOnlyPaths=` **刻意沒有 `-` 前綴**，hooks.json 不存在時
+#      unit 直接起不來。那是要的行為（缺那個檔 ⇒ job 植得進 hooks ⇒ 不該起得來），
+#      但先落 unit 再種檔會讓所有 job 在中間那段時間全部失敗。
+```
+
+##### 驗證（**用 `getfacl`，不要用 `ls -ld`**）
+
+```bash
+# ✅ 驗證 1：形狀
+for D in /var/lib/cortex-builder/.codex /var/lib/cortex-reviewer-planner/.codex; do
+  sudo stat -c '%n %U:%G %a' "$D"        # 期望：root:root 1755
+  sudo getfacl -p "$D" | grep -E '^(user|group::|mask::|other::|default:)'
+  sudo stat -c '  %n %U:%G %a' "$D/hooks.json"   # 期望：root:root 644
+done
+#   期望（逐字）：
+#     user::rwx / user:<該 job 帳號>:rwx / group::r-x / mask::rwx / other::r-x
+#     **default: 一條都沒有**——有的話 root 日後補放的檔會自動帶上 job 的 rwx。
+#   ⚠️ `ls -ld` 會顯示成 `drwxrwxr-t`：那個 group `rwx` 是 POSIX ACL 的 **mask**，
+#      不是 group 寫入權（`group::` 才是，它必須是 `r-x`）。spec §R2 因此未被放寬。
+#      **只看 `ls` 會誤判成「開了 group 寫入」而去把它關掉——關掉會連 ACL 一起廢掉。**
+#   ⚠️ 之後任何一次對這個目錄的 `chmod` 都會重設 mask ⇒ **chmod 之後必須重跑 setfacl**
+#      （權限計畫本來就是 `chmod` → `setfacl` 這個順序，照抄即可）。
+
+# ✅ 驗證 2：unit 的兩條
+sudo grep -E '^(ReadWritePaths|ReadOnlyPaths)=.*\.codex' \
+  /etc/systemd/system/cortex-{job,reviewer-job}@.service
+#   期望每份各兩行：ReadWritePaths=<HOME>/.codex 與 ReadOnlyPaths=<HOME>/.codex/hooks.json
+
+# ✅ 驗證 3（OS 語意，兩層各驗一次；在**真實加固面**下）
+#    前置：貼上第 4e 步的共用探針 psc_run_under。
+psc_run_under cortex-job /bin/sh -c 'printf x > /var/lib/cortex-builder/.codex/hooks.json'
+#   期望：`Read-only file system` ← mount 層（ReadOnlyPaths）
+psc_run_under cortex-job /bin/sh -c 'rm -f /var/lib/cortex-builder/.codex/hooks.json'
+#   期望：`Operation not permitted` ← DAC 層（sticky）
+psc_run_under cortex-job /bin/sh -c 'mv /var/lib/cortex-builder/.codex/hooks.json /tmp/h'
+#   期望：`Operation not permitted` ← DAC 層（sticky）
+psc_run_under cortex-job /bin/sh -c 'touch /var/lib/cortex-builder/.codex/psc-probe && echo TREE-WRITABLE'
+#   期望：TREE-WRITABLE ← 整棵仍可寫（codex 才起得來）
+#   （收尾：sudo rm -f /var/lib/cortex-builder/.codex/psc-probe）
+#   ⚠️ 三條的錯誤訊息**不同**，而那個差別有資訊：`Read-only file system` 是 mount 層、
+#      `Operation not permitted` 是 sticky、`Permission denied` 是檔案 mode。
+#      只剩一層時仍會 denied——因此**三條都要跑**，不要看到紅字就過。
+
+# ✅ 驗證 4：executor 在該 unit 下**真的跑得起來**（這一格才是驗收的另一半）
+psc_run_under cortex-job-jit /bin/sh -c \
+  'cd /tmp && /opt/cortex/toolchain/bin/codex exec --skip-git-repo-check --json \
+   "Return only this JSON object and do not call tools: {\"capability\":\"cortex-planning-json\"}"'
+psc_run_under cortex-reviewer-job-jit /bin/sh -c \
+  'cd /tmp && /opt/cortex/toolchain/bin/codex exec --skip-git-repo-check --json \
+   "Return only this JSON object and do not call tools: {\"capability\":\"cortex-planning-json\"}"'
+#   期望兩份都出 `turn.completed`。
+#   ⚠️ **builder 那一格在 #698 之前是紅的**（`failed to initialize in-process app-server
+#      client: Read-only file system`）——本節做完必須翻綠。它翻不綠就是遷移沒做完，
+#      不要靠改 unit 讓它過。
+```
+
+**0818 實測（本機，四分部署，遷移前 → 遷移後）**：
+
+| 量測 | 遷移前 | 遷移後 |
+|---|---|---|
+| R9 T3.9 `cortex-builder` | `denied (OK) rc=2` | `denied (OK) rc=2` |
+| R9 T3.9 `cortex-reviewer-planner` | **`!! SUCCEEDED (FAIL)`** | **`denied (OK) rc=2`** |
+| `codex exec` @ `cortex-job-jit` | **`Error: failed to initialize in-process app-server client: Read-only file system (os error 30)`** | **`turn.completed`（rc=0）** |
+| `codex exec` @ `cortex-reviewer-job-jit` | `turn.completed`（rc=0） | `turn.completed`（rc=0） |
+
+**回滾**：`sudo cp /tmp/psc-698-unit-backup/*.service /etc/systemd/system/ && sudo
+systemctl daemon-reload`，再把 `~/.codex` 改回 #685 的形態（`rm hooks.json`、
+`chmod 0755`、`setfacl -b`；reviewer-planner 另需把樹搬回 `cache/codex` 並重建 symlink）。
+**回滾之後 R9 T3.9 會在 reviewer-planner 上重新變紅**——那是 #698 的破口，不是新事故。
+
+#### 4e-2c. `cortex-reviewer-planner` 的 agy／claude 登入態（#685／#672 票 D；U-4／U-7）
+
+> **codex 已於 #698 改走 4e-2b 的 sticky 樹**，因此本節只剩兩格。分界不是帳號，是
+> `permgen.EXECUTOR_ENFORCEMENT_LEAVES` 那條規則：**狀態樹裡住著 root-owned
+> enforcement 檔的 executor 才需要 sticky**；agy／claude 沒有，維持 symlink 形態。
+>
 > **這一節取代 0818 的手動部署。** 那次是手工 `install` ＋ 手工 `ln -s`，**重跑 runbook
 > 不會產生它們**——本節讓它可重現：路徑、owner、mode、symlink 目標全部由
 > `python3 -m paulsha_cortex.trust_root permissions｜scaffold` 出，不手抄。
@@ -2168,18 +2362,11 @@ symlink，指向該帳號 `cache` 裡的一格。
 
 | executor | symlink | 目標 | token 葉檔 |
 |---|---|---|---|
-| `codex` | `~/.codex` | `~/cache/codex` | `auth.json` |
 | `agy` | `~/.gemini` | `~/cache/gemini` | `antigravity-cli/antigravity-oauth-token` |
 | `claude` | `~/.claude` | `~/cache/claude` | `.credentials.json` |
 
-> **為什麼不是 builder 那種單檔**（#686 實測，逐條可複驗）：
+> **為什麼不是單檔**（#686 實測，逐條可複驗）：
 >
-> - `codex` 在 `$CODEX_HOME` 底下建 `state_5.sqlite`／`logs_2.sqlite`／`sessions/`／
->   `skills/`／`plugins/`／`thread-writer-locks/`……唯讀時回
->   `Error: failed to initialize in-process app-server client: Read-only file system
->   (os error 30)`。把 cwd 換成可寫的 `/tmp` **症狀完全相同**；維持唯讀 cwd、只把
->   `CODEX_HOME` 指到可寫目錄則 **rc=0**。所以阻斷點是 `CODEX_HOME`，不是 cwd。
->   檔名帶版本序號 ⇒ **逐項列舉會在下一次 CLI 升版時無聲失效**。
 > - `agy` 往 `~/.gemini/antigravity-cli/` 寫 conversations SQLite、crashes、presence
 >   lock、builtin skills，並自解出一個 17 MB 的 `bin/webm_encoder`。
 > - `claude` 在 job 沙箱下 CLI rc=0 但回 `Not logged in · Please run /login`。
@@ -2189,65 +2376,62 @@ symlink，指向該帳號 `cache` 裡的一格。
 > 的事，該帳號今天就已經能做。symlink 本身放在 root-owned 的 HOME 裡，job 換不掉指向。
 >
 > **代價（R-6，明講）**：目標樹由 job 帳號擁有 ⇒ 樹裡的 token 葉檔**可被該帳號刪除或
-> 替換**（builder 的單檔形態擋得住「刪／換」，這裡擋不住）。影響面限於它自己的登入態。
-> 直接後果：**同一棵樹裡不得再放任何 root-owned 的 enforcement 檔**——
-> `reviewer-planner-codex-hooks` 因此仍是未決項（U-9），見
-> `permgen.deferred_run_dependencies()`。
+> 替換**。影響面限於它自己的登入態。直接後果：**同一棵樹裡不得再放任何 root-owned 的
+> enforcement 檔**——這條在 #698 之前只是註解，現在由
+> `permgen._assert_shape_follows_enforcement_rule()` 在 import 當下強制（宣告了
+> enforcement 檔就必須改走 sticky 樹）。
 
 **部署順序固定為四步，順序錯了 unit 會起不來或 executor 解不到路徑：**
 
 ```bash
-# 1️⃣ 骨架：建出三個目標（該帳號擁有 0700，落在既有的 cache 內）
+# 1️⃣ 骨架：建出兩個目標（該帳號擁有 0700，落在既有的 cache 內）
 python3 -m paulsha_cortex.trust_root scaffold four-way | grep '/cache/'
-#   期望三行：install -d -o cortex-reviewer-planner … /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}
+#   期望兩行：install -d -o cortex-reviewer-planner … /var/lib/cortex-reviewer-planner/cache/{gemini,claude}
+#   ⚠️ #698 之後**不再有 `cache/codex` 那一行**——codex 改成 HOME 底下的 sticky 真目錄
+#      （4e-2b）。還看得到它 ⇒ 落檔的是舊版產生器的產物。
 sudo sh -e -c "$(python3 -m paulsha_cortex.trust_root scaffold four-way)"
 #   ⚠️ 目標**必須先存在**：對一條懸空 symlink 建目錄的 syscall 回 EEXIST（不是「建出
 #      目標」），executor 於是死在一個與權限完全無關的錯誤上。
 
 # 2️⃣ 遷移既有登入態（0818 手動部署留下的那一份）
-#    舊位置是**真目錄** /var/lib/cortex-reviewer-planner/.codex/，先把內容搬進目標，
-#    再把那個目錄清掉——第 3 步的 `ln -sfn` 不會覆蓋一個非空的真目錄。
+#    舊位置可能是**真目錄**，先把內容搬進目標，再把那個目錄清掉——第 3 步的
+#    `ln -sfn` 不會覆蓋一個非空的真目錄。
 sudo sh -c '
   d=/var/lib/cortex-reviewer-planner
-  if [ -d "$d/.codex" ] && [ ! -L "$d/.codex" ]; then
-    cp -a "$d/.codex/." "$d/cache/codex/" && rm -rf "$d/.codex"
-  fi
-  if [ -d "$d/.gemini" ] && [ ! -L "$d/.gemini" ]; then
-    cp -a "$d/.gemini/." "$d/cache/gemini/" && rm -rf "$d/.gemini"
-  fi
+  for n in gemini claude; do
+    case "$n" in gemini) dot=.gemini ;; claude) dot=.claude ;; esac
+    if [ -d "$d/$dot" ] && [ ! -L "$d/$dot" ]; then
+      cp -a "$d/$dot/." "$d/cache/$n/" && rm -rf "$d/$dot"
+    fi
+  done
   chown -R cortex-reviewer-planner:cortex-reviewer-planner "$d/cache"
 '
 #   ⚠️ 0818 的 `.gemini` 本來就是 symlink（指向同一個目標），上面的 `[ ! -L ]` 會跳過它。
-#   ⚠️ 舊 `.codex/hooks.json` 若存在，**不要**搬進去（那棵樹 job 可寫，root-owned 的
-#      hooks 在裡面擋不住替換 ⇒ 是名義上的 enforcement）。見 U-9。
 
 # 3️⃣ 落 symlink（由權限計畫出，不手打）
 python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
   --operator-account "$USER" --external-reader-account none \
-  | grep -E 'reviewer-planner-(codex|agy|claude)-state' -A6 | grep -E '^\[ ! -e'
-#   期望六行（三格 × `ln -sfn` ＋ `chown -h`），全部帶
+  | grep -E 'reviewer-planner-(agy|claude)-state' -A6 | grep -E '^\[ ! -e'
+#   期望四行（兩格 × `ln -sfn` ＋ `chown -h`），全部帶
 #   `[ ! -e /var/lib/cortex-reviewer-planner ] || ` 守衛
 #   ——守衛掛在**父目錄**上：本方案沒有這個帳號時整段跳過（二分部署）。
-#   套用時走整份權限 script（第 2b 步），不要只挑這六行執行。
+#   套用時走整份權限 script（第 2b 步），不要只挑這四行執行。
 
-# 4️⃣ 放 token（三個 provider 各自的登入態，落點見上表）
-sudo install -o cortex-reviewer-planner -g cortex-reviewer-planner -m 0600 \
-  "$HOME/.codex/auth.json" /var/lib/cortex-reviewer-planner/cache/codex/auth.json
+# 4️⃣ 放 token（兩個 provider 各自的登入態，落點見上表）
 sudo install -D -o cortex-reviewer-planner -g cortex-reviewer-planner -m 0600 \
   "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" \
   /var/lib/cortex-reviewer-planner/cache/gemini/antigravity-cli/antigravity-oauth-token
 sudo install -o cortex-reviewer-planner -g cortex-reviewer-planner -m 0600 \
   "$HOME/.claude/.credentials.json" \
   /var/lib/cortex-reviewer-planner/cache/claude/.credentials.json
-#   ⚠️ 來源路徑依 operator 自己的登入態而定，先 `ls` 確認；三份都是**同一個 provider
-#      帳號**的複本 ⇒ 這一步就是 U-4 追認的 R-3（該帳號被攻陷時三邊 token 一起失）。
+#   ⚠️ 來源路徑依 operator 自己的登入態而定，先 `ls` 確認；連同 4e-2b 的 codex 那一份，
+#      三份都是**同一個 provider 帳號**的複本 ⇒ 這就是 U-4 追認的 R-3。
 ```
 
-**成對前置：`PSC_REVIEWER_HOME` 必須同時宣告（第 5-5c 步）。** 三條 symlink 的路徑
-**全部以 `$HOME` 為根**，而模板模式下 shim 以 `os.execvpe` 整份換掉環境，unit 的
+**成對前置：`PSC_REVIEWER_HOME` 必須同時宣告（第 5-5c 步）。** 登入態路徑**全部以
+`$HOME` 為根**，而模板模式下 shim 以 `os.execvpe` 整份換掉環境，unit 的
 `Environment=HOME=` 到不了模型（#686 實機更正）。沒有它，本節做得再對，job 內一條也
-解不到——而症狀（`$HOME is not defined`／`Not logged in`）與「憑證沒放好」長得一模
-一樣。產生器出的值：
+解不到——而症狀（`$HOME is not defined`／`Not logged in`）與「憑證沒放好」長得一模一樣。
 
 ```bash
 python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep PSC_REVIEWER_HOME
@@ -2256,17 +2440,19 @@ python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep PSC_REVIE
 
 ```bash
 # ✅ 驗證 1：形狀（symlink root-owned、目標該帳號擁有）
-ls -ld /var/lib/cortex-reviewer-planner/.{codex,gemini,claude}
-#   期望三行：lrwxrwxrwx root root … -> /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}
-ls -ld /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}
-#   期望三行：drwx------ cortex-reviewer-planner cortex-reviewer-planner
+ls -ld /var/lib/cortex-reviewer-planner/.{gemini,claude}
+#   期望兩行：lrwxrwxrwx root root … -> /var/lib/cortex-reviewer-planner/cache/{gemini,claude}
+ls -ld /var/lib/cortex-reviewer-planner/cache/{gemini,claude}
+#   期望兩行：drwx------ cortex-reviewer-planner cortex-reviewer-planner
 
-# ✅ 驗證 2：**零新增可寫面**——unit 的 RWP 逐字不變
+# ✅ 驗證 2：這兩格**零新增可寫面**——它們不得在 RWP 上多出任何一條
 python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep '^ReadWritePaths='
-#   期望**恰好**：ReadWritePaths=/var/lib/cortex-reviewer-planner/cache
-#                 ReadWritePaths=/var/lib/cortex/coordinator/review-verdicts
-#   ⛔ 多出任何一條含 `.codex`／`.gemini`／`.claude` 的路徑 ⇒ 有人把資產的 writer 面
-#      改成 job principal 了，回去看登記表，**不要**就地改 unit。
+#   期望**恰好三條**：
+#     ReadWritePaths=/var/lib/cortex-reviewer-planner/.codex        ← #698 的 sticky 樹
+#     ReadWritePaths=/var/lib/cortex-reviewer-planner/cache
+#     ReadWritePaths=/var/lib/cortex/coordinator/review-verdicts
+#   ⛔ 多出任何一條含 `.gemini`／`.claude` 的路徑 ⇒ 有人把資產的 writer 面改成 job
+#      principal 了，回去看登記表，**不要**就地改 unit。
 
 # ✅ 驗證 3（跨 UID，**在真實加固面下**）：換不掉指向、但寫得進樹
 psc_run_under cortex-reviewer-job /bin/sh -c \
@@ -2280,10 +2466,7 @@ psc_run_under cortex-reviewer-job /bin/sh -c \
 #      的 unit** 全量導出。**不得**自行組 `--property=`、**不得**自帶 `--setenv=PATH=`
 #      ——本 repo 兩個方向的事故各兩次（#638／#657 假綠；#673 body 與 repro 假紅）。
 
-# ✅ 驗證 4：三個 executor 在該 unit 下**真的跑得起來**（這一格才是驗收）
-psc_run_under cortex-reviewer-job-jit /opt/cortex/toolchain/bin/codex exec --json \
-  'Return only this JSON object and do not call tools: {"capability":"cortex-planning-json"}'
-#   期望：rc=0。**#686 當時這一格是紅的**（`Read-only file system`）——本節做完必須翻綠。
+# ✅ 驗證 4：兩個 executor 在該 unit 下**真的跑得起來**（codex 那格見 4e-2b 驗證 4）
 psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/claude --version
 psc_run_under cortex-reviewer-job /bin/sh -c \
   '/opt/cortex/toolchain/bin/claude -p "hi" --output-format json --tools ""'
@@ -2291,14 +2474,12 @@ psc_run_under cortex-reviewer-job /bin/sh -c \
 psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/agy \
   --print 'Return only this JSON object and do not call tools: {"capability":"cortex-planning-json","executor":"agy","model":"gemini-3.1-pro-high"}' \
   --mode plan --sandbox --model gemini-3.1-pro-high
-#   期望：rc=0、輸出逐位元等於 expected（0818 與 #686 兩次實測皆如此）。
+#   期望：rc=0、輸出逐位元等於 expected（0818 三次實測皆如此，最近一次在 #698）。
 ```
 
-**回滾**：`sudo rm -f /var/lib/cortex-reviewer-planner/.{codex,gemini,claude}` ＋
-`sudo rm -rf /var/lib/cortex-reviewer-planner/cache/{codex,gemini,claude}`。
+**回滾**：`sudo rm -f /var/lib/cortex-reviewer-planner/.{gemini,claude}` ＋
+`sudo rm -rf /var/lib/cortex-reviewer-planner/cache/{gemini,claude}`。
 （回滾之後降權 planning 與 reviewer job 都會退回「沒有登入態」的狀態，不是壞掉。）
-
----
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 
@@ -4371,22 +4552,43 @@ exec /opt/cortex/venv/bin/python -c "from paulsha_cortex.config import paths; pr
 | **5** | **privilege-boundary（A+B 新增）** | **cortex-manager**（授權帳號自身）＋三個 headless | **✅ 新增** |
 
 > **0818 兩個 subject 各跑一次的結果（族 1–4，皆在完整模板 unit 加固面下，
-> 加固面由 `unit-replica` 全量導出 38 條 property）**：
+> 加固面由 `unit-replica` 全量導出 38 條 property；`#698` 落地後為 40 條——新增的是
+> 那條巢狀 `ReadOnlyPaths=`）**：
 >
 > | | `cortex-builder` | `cortex-reviewer-planner` |
 > |---|---|---|
-> | denied（OK） | 51 | 52 |
-> | **SUCCEEDED（FAIL）** | 1（T1.3，假失敗，本次已修） | **2（T1.3 ＋ T3.9）** |
+> | denied（OK），`#698` 前 | 51 | 52 |
+> | **SUCCEEDED（FAIL）**，`#698` 前 | 1（T1.3，假失敗，已修） | **2（T1.3 ＋ T3.9）** |
+> | denied（OK），**`#698` 後** | **54** | **56** |
+> | **SUCCEEDED（FAIL）**，**`#698` 後** | **0** | **0** |
 >
-> - **T1.3 兩個 subject 都 FAIL ⇒ 它測錯東西**，本次已改（見下方該行的註解）。
+> （`#698` 後的 denied 數多 2，是因為 T3.9 從 1 條攻擊擴成 3 條——`sticky` 關的是
+> **三個動詞**，只驗「改內容」會漏掉 unlink／rename 那兩條真正靠 sticky 擋的。）
+>
+> - **T1.3 兩個 subject 都 FAIL ⇒ 它測錯東西**，已改（見下方該行的註解）。
 >   「兩個身分得到同一個結果」本身就是「這條與身分無關」的證據——**下次再看到某條
 >   在所有 subject 上同時失敗，先懷疑斷言，不要先懷疑邊界。**
-> - **T3.9 只有 `reviewer-planner` FAIL，是真的**：`#698`。成因是 `#685` 把該帳號的
->   `~/.codex` 改成指向 job-owned `cache/codex` 的 symlink（`#686` 實測 codex 需要
->   `$CODEX_HOME` **整棵**可寫才跑得起來），代價是該帳號能植入 `hooks.json`——
->   而 codex hooks **會執行命令** ⇒ **跨 job 持久化**。`builder` 因為 `.codex` 仍是
->   root-owned 目錄而守得住，**但它一旦也要在降權 unit 下跑 codex 就會撞同一條**。
->   在 `#698` 裁決之前，這一行的 `SUCCEEDED (FAIL)` 是**已知且已追蹤**的，不是新事故。
+> - **T3.9 曾經只有 `reviewer-planner` FAIL，而且是真的**：`#698`。成因是 `#685` 把該
+>   帳號的 `~/.codex` 改成指向 job-owned `cache/codex` 的 symlink（`#686` 實測 codex
+>   需要 `$CODEX_HOME` **整棵**可寫才跑得起來），代價是該帳號能植入 `hooks.json`——
+>   而 codex hooks **會執行命令** ⇒ **跨 job 持久化**。
+>   **`#698` 已修復並實測，兩個 subject 現在都是 `denied (OK) rc=2`**：
+>
+>   ```
+>   cortex-builder          :: T3.9 改 codex hooks   :: denied (OK) rc=2
+>   cortex-builder          :: T3.9 刪掉 codex hooks :: denied (OK) rc=1
+>   cortex-builder          :: T3.9 改名 codex hooks :: denied (OK) rc=1
+>   cortex-reviewer-planner :: T3.9 改 codex hooks   :: denied (OK) rc=2
+>   cortex-reviewer-planner :: T3.9 刪掉 codex hooks :: denied (OK) rc=1
+>   cortex-reviewer-planner :: T3.9 改名 codex hooks :: denied (OK) rc=1
+>   ```
+>
+>   修法是 operator 裁決的方案 A（sticky ＋ root-owned `hooks.json`），**兩個帳號的
+>   形狀由同一條規則導出**——builder 一併遷移，不留「等著爆」的差異。遷移步驟與
+>   兩層的逐條驗證在第 4e-2b 步。
+> - ⚠️ **T3.9 的前提是 `hooks.json` 存在**：sticky 管的是「刪／改名別人的檔」，不管
+>   「建一個還不存在的檔」。那個檔缺席時本項會以「建得出新檔」翻紅——**那是正確的
+>   紅字**，處置是回第 4e-2b 步把它種回去，不是把測項改掉。
 
 ### 8a. 攻擊腳本（族 1–4，以模型 job 身分執行）
 
@@ -4407,7 +4609,11 @@ t() { printf '%s :: ' "$1"; shift; if "$@" >/dev/null 2>&1; then echo "!! SUCCEE
 #       不可寫才是守的東西」有實測背書，而不是靠註解宣稱。
 d() { printf '%s :: ' "$1"; shift; if "$@" >/dev/null 2>&1; then echo "readable (BY DESIGN)"; else echo "!! 讀不到——與登記表 rationale 不符，查"; fi; }
 # need() = 目標檔必須先存在，否則「刪不掉／讀不到」測的是「檔不存在」而非「被拒」。
-need() { [ -e "$1" ] || printf '!! 前置缺失：%s 不存在——對它的刪除／截斷／讀取測項會是假綠，請先由 operator 以 cortex-manager 身分預建\n' "$1"; }
+# ⚠️ `need()` 用的是 `[ -e ]`，而它在**看不到**（路徑上某層沒有 traverse 權）時同樣
+#    為假。`cortex-reviewer-planner` 對 `<A>/monitor/` 沒有 traverse ⇒ 它必然印出
+#    這一行，而那不是「檔不存在」。判讀時先以 `cortex-manager` 身分 `ls -l` 該路徑
+#    確認：檔真的在 ⇒ 這是身分造成的，該 subject 對應的測項本來就該是 denied。
+need() { [ -e "$1" ] || printf '!! 前置缺失：%s 不存在**或本身分看不到**——對它的刪除／截斷／讀取測項可能是假綠，請以 cortex-manager 身分確認該檔是否存在\n' "$1"; }
 A=/var/lib/cortex
 # #657：spool 是 per-principal 的；R9 攻擊腳本以模型 job 身分執行，看的是自己那格。
 SPOOL=$A/coordinator/job-specs/builder
@@ -4513,7 +4719,13 @@ t "T3.3 改 Manager unit"           sh -c "printf x >> /etc/systemd/system/corte
 t "T3.4 改 EnvironmentFile"        sh -c "printf 'PSC_COORDINATOR_ROOT=/tmp/evil' >> /opt/cortex/etc/cortex-manager.env"
 t "T3.5 刪 EnvironmentFile"        rm -f /opt/cortex/etc/cortex-manager.env
 t "T3.6 改 venv launcher"          sh -c "printf x >> /opt/cortex/venv/bin/cortex"
+# ⛔ #698：這一條的前提是那個檔**存在**。sticky bit 管的是「刪／改名別人的檔」，
+#    **不管「建一個還不存在的檔」**——檔不在時本項會以「建得出新檔」翻紅，那是正確
+#    的紅字（該帳號當下真的植得進 hooks），處置是回 runbook 第 4e-2b 步把它種回去。
+need "$HOME/.codex/hooks.json"
 t "T3.9 改 codex hooks"            sh -c "printf x > $HOME/.codex/hooks.json"
+t "T3.9 刪掉 codex hooks"          rm "$HOME/.codex/hooks.json"
+t "T3.9 改名 codex hooks"          mv "$HOME/.codex/hooks.json" "$HOME/.codex/hooks.json.bak"
 t "T3.9 換掉 ~/.codex 目錄"        sh -c "mv $HOME/.codex $HOME/.codex.bak"
 
 echo "===== 族 4 行程間路徑 ====="

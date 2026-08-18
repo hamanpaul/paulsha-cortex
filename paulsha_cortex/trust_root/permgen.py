@@ -670,7 +670,7 @@ TOOLCHAIN_PROGRAMS: tuple[ToolchainProgram, ...] = EXECUTOR_TOOLS + SERVICE_TOOL
 # :data:`IN_PLACE_CONTENT_WRITE_ASSETS`／unit 的 `ReadWritePaths` 全部由它機械導出，
 # 加一格不必改產生器——這正是 #640 的 note 當年承諾、但因為只有一個純量而做不到的事。
 #
-# ## 為什麼形狀有兩種（#686 實測，design 未預期）
+# ## 為什麼形狀有三種（#686 實測，design 未預期；#698 補上第三種）
 #
 # design 假設所有 executor 的登入態都是**單檔**（codex 的 `auth.json`），因此 #640 裁決
 # (b) 的整套性質（檔 job-owned 0600／父目錄 root-owned ⇒ 能改內容、不能增刪換）對它成立。
@@ -686,10 +686,28 @@ TOOLCHAIN_PROGRAMS: tuple[ToolchainProgram, ...] = EXECUTOR_TOOLS + SERVICE_TOOL
 #   - `claude` 在 job 沙箱下 CLI 走得完整條（rc=0），但回 `Not logged in`——它需要
 #     `~/.claude` 底下的登入態，同樣是一棵它自己會寫的樹。
 #
-# 因此表上有兩種形狀，見 :class:`CredentialShape`。**兩種形狀並存不是過渡態**：builder
-# 的 codex 至今是 `IN_PLACE_FILE`（已部署、有實測、有 runbook 反向驗證），本票不動它；
-# reviewer/planner 三個 executor 全是 `HOME_REDIRECT_TREE`。「同一個 executor 在不同帳號
-# 上可以是不同形狀」正是 U-5 要求 per-(account, executor) 而不是 per-executor 的理由。
+# 因此表上有多種形狀，見 :class:`CredentialShape`。
+#
+# ## #698：形狀不再由帳號挑，而是由**一條規則**導出
+#
+# #685 落地後表上是「builder×codex＝`IN_PLACE_FILE`、reviewer-planner×codex＝
+# `HOME_REDIRECT_TREE`」——同一個 executor 在兩個帳號上兩種形狀。0818 的 R9 實測
+# （#698）證明那個差異不是設計，是**一個尚未爆的洞**：`HOME_REDIRECT_TREE` 的樹由 job
+# 帳號擁有，該帳號因此**成功植入了 `hooks.json`**（R9 T3.9 `!! SUCCEEDED`）。codex hooks
+# **會執行命令** ⇒ 跨 job 持久化 ⇒ 四分隔離「每個 job 一次性」的前提在該帳號上不成立。
+# builder 當天守得住只是因為它的 `.codex` 還沒遷成可寫樹；一旦要讓它在降權 unit 下真的
+# 跑 codex，同一個洞原封不動出現。
+#
+# operator 裁決（#698，採方案 A）：**目錄 sticky bit ＋ `hooks.json` 由 root 擁有**。
+# 落到本表上就是 :data:`EXECUTOR_ENFORCEMENT_LEAVES` 那一條規則：
+#
+#   **某個 executor 的狀態樹裡必須住著一個 root-owned 的 enforcement 檔 ⇒ 凡持有它
+#   登入態的帳號，那一格一律是 `HOME_STICKY_TREE`。**
+#
+# 規則由 :func:`_assert_shape_follows_enforcement_rule` 在 **import 當下**強制（不是靠
+# 註解也不是靠 review）：把某一格改回別的形狀、或新增第五個帳號時漏改，模組載入就炸。
+# 「同一個 executor 在不同帳號上可以是不同形狀」這句話因此仍然為真（agy／claude 只在
+# 一個帳號上），但**不再能對同一個 executor 成立**——那正是 #698 要根除的差異。
 # ---------------------------------------------------------------------------
 
 class CredentialShape(Enum):
@@ -721,9 +739,44 @@ class CredentialShape(Enum):
     #: 代價（明講，見 CHANGELOG 的 R-6）：這棵樹由 job 帳號擁有，因此樹裡的憑證葉檔
     #: （`auth.json`／`.credentials.json`）**可被該 job 刪除或替換**——它換來的是
     #: 「codex／claude 能不能起得來」。影響面限於該帳號自己的登入態；同目錄下**不得**
-    #: 再放任何 root-owned 的 enforcement 檔（見 `reviewer-planner-codex-hooks` 那筆
-    #: deferred 與 U-9）。
+    #: 再放任何 root-owned 的 enforcement 檔——這條在 #698 之前只是註解，現在由
+    #: :func:`_assert_shape_follows_enforcement_rule` 在 import 當下強制。
     HOME_REDIRECT_TREE = "home-redirect-tree"
+
+    #: **HOME 底下一棵 root-owned ＋ sticky bit 的真目錄**，job 帳號以一條 `rwx`
+    #: **access** ACL 取得整棵的寫入權（#698 operator 裁決＝方案 A）。
+    #:
+    #: 它同時買到 `HOME_REDIRECT_TREE` 與 `IN_PLACE_FILE` 各買到一半的那兩件事，
+    #: 而在 #685 的形狀下兩者互斥：
+    #:
+    #: 1. **executor 起得來**：整棵可寫。#686 實測 codex 需要 `$CODEX_HOME` 整棵可寫
+    #:    （`state_5.sqlite`／`sessions/`／`skills/`／`plugins/`…，檔名帶版本序號，
+    #:    逐項列舉會在下次 CLI 升版時無聲失效），因此放行的是整棵樹而不是清單。
+    #: 2. **樹裡放得住一個 job 動不了的 root-owned 檔**：sticky bit（`chmod +t`）的
+    #:    POSIX 語意是「目錄可寫，但只有**檔案 owner／目錄 owner／root** 刪得掉或
+    #:    改得掉名字」。`hooks.json` 屬 root、目錄也屬 root ⇒ job 既 **unlink 不掉**、
+    #:    也 **rename 不掉**；而它自己的 mode（root:root 0644）讓 job 落在 `other` 位
+    #:    ⇒ 連**內容都改不了**。三個動詞同時關上，缺一條就等於沒關。
+    #:
+    #: **為什麼是具名 ACL 而不是 group 寫入位**：spec §R2 明定「group 寫入權 MUST
+    #: 移除」，而本產生器的安全網（見 :func:`build_entry` 尾端）會機械地拿掉它。
+    #: 具名 ACL 是這套權限模型既有的跨帳號授權手段（`AclEntry`），不必為本形狀鑿一個
+    #: §R2 的洞。
+    #:
+    #: ⚠️ **只設 access ACL，絕不設 default ACL**。default ACL 決定的是「**之後**在這個
+    #: 目錄裡新建的物件」的初值——包含 root 日後重放一次 `hooks.json` 的那一次。設了
+    #: default ACL 等於把 `hooks.json` 自動交還給 job，整個形狀當場歸零。
+    #: :meth:`PermissionEntry.commands` 因此對 sticky 目錄**不**補那條 default ACL。
+    #:
+    #: ⚠️ **enforcement 檔必須先存在**，否則 sticky 什麼也擋不住：sticky 管的是「刪／
+    #: 改名別人的檔」，**不管「建一個還不存在的檔」**。因此本形狀的每一格都必須宣告
+    #: `enforcement_leaf`，且部署／遷移步驟要先把它以 root 身分放進去（runbook 第
+    #: 4e-2b 步）。少了那一步，R9 T3.9 會直接以「建得出新檔」翻紅。
+    #:
+    #: 代價（與 `HOME_REDIRECT_TREE` 相同、不多不少）：樹由 job 寫，因此樹裡的**憑證**
+    #: 葉檔仍可被該 job 刪除或替換（R-6）。sticky 保護的是 root-owned 的那些檔，而
+    #: token 葉檔刻意是 job-owned 的——它必須 refresh 得回來。
+    HOME_STICKY_TREE = "home-sticky-tree"
 
 
 @dataclass(frozen=True)
@@ -743,16 +796,48 @@ class ExecutorCredential:
     cache_target: str | None = None
     #: 這一格裡真正承載 token 的葉檔（相對於 `relpath`）。只進註解與 runbook，不另立資產
     #: ——它落在 job-owned 樹裡，權限由 unit 的 `UMask=0077` 決定，再登記一次是第二份真相。
+    #: `relpath is None` 的那一列留空：它的樹與葉**都**由
+    #: :attr:`PathLayout.executor_credential_relpath` 這個部署決定的 head／tail 導出。
     token_leaf: str = ""
+    #: **這棵樹裡必須住著的 root-owned enforcement 檔**（相對於 `relpath`），例如 codex
+    #: 的 `hooks.json`（#698）。有值 ⇒ 本格的形狀**必須**是 `HOME_STICKY_TREE`，且它會
+    #: 機械地長出一個登記表資產（`<帳號前綴>-<enforcement_asset_suffix>`）。
+    #: 空字串＝這個 executor 的狀態樹裡沒有 enforcement 檔（agy／claude）。
+    enforcement_leaf: str = ""
+    #: 上一欄那個資產 id 的後綴。宣告 `enforcement_leaf` 時必填。
+    enforcement_asset_suffix: str = ""
     note: str = ""
 
     def __post_init__(self) -> None:
         if self.shape is CredentialShape.HOME_REDIRECT_TREE and not self.cache_target:
             raise ValueError(f"{self.executor}：HOME_REDIRECT_TREE 必須宣告 cache_target")
+        if self.shape is CredentialShape.HOME_STICKY_TREE and self.cache_target:
+            raise ValueError(
+                f"{self.executor}：HOME_STICKY_TREE 是 HOME 底下的**真目錄**，沒有 "
+                "cache_target。宣告一個目標會讓 `symlink_targets()` 把它當成 symlink，"
+                "而 `ln -sfn` 對真目錄會把連結建到目錄**裡面**（#698 的部署陷阱）。"
+            )
+        # #698：兩個方向都擋。有 enforcement 檔卻不是 sticky ⇒ 那個檔擋不住替換
+        # （正是 R9 T3.9 攻破 reviewer-planner 的形態）；是 sticky 卻沒有 enforcement
+        # 檔 ⇒ 這棵樹沒有理由付出 root-owned 目錄的代價，形狀選錯了。
+        if bool(self.enforcement_leaf) != (self.shape is CredentialShape.HOME_STICKY_TREE):
+            raise ValueError(
+                f"{self.executor}：`enforcement_leaf` 與 HOME_STICKY_TREE 必須同時成立"
+                f"（現況 shape={self.shape.value}, enforcement_leaf={self.enforcement_leaf!r}）。"
+                "sticky bit 的全部價值就是「樹裡放得住一個 job 動不了的 root-owned 檔」"
+                "——沒有那個檔就不需要它，有那個檔就非它不可（#698）。"
+            )
+        if self.enforcement_leaf and not self.enforcement_asset_suffix:
+            raise ValueError(
+                f"{self.executor}：宣告 enforcement_leaf 就必須一併宣告 "
+                "enforcement_asset_suffix——那個檔要進登記表才管得住。"
+            )
         if self.relpath is not None:
             _validate_home_relpath(self.relpath)
         if self.cache_target is not None:
             _validate_home_relpath(self.cache_target)
+        if self.enforcement_leaf:
+            _validate_home_relpath(self.enforcement_leaf)
 
 
 #: `relpath is None` 的那一列所對應的 executor。**它與
@@ -761,24 +846,29 @@ class ExecutorCredential:
 #: 就是第二份真相。因此本表對它留 `None`，由 layout 供給。
 PRIMARY_CREDENTIAL_EXECUTOR = "codex"
 
+#: **executor → 它的狀態樹裡必須住著的 root-owned enforcement 檔**（#698）。
+#:
+#: 這一格就是 #698 的那條規則的**輸入**：有值的 executor，在**每一個**持有它登入態的
+#: 帳號上都必須是 :attr:`CredentialShape.HOME_STICKY_TREE`
+#: （由 :func:`_assert_shape_follows_enforcement_rule` 在 import 當下強制）。
+#:
+#: 只有 codex 有一格，而那不是偏好問題：codex hooks **會執行命令**，因此「誰能改
+#: `hooks.json`」直接決定「上一個 job 能不能為下一個 job 埋伏」。agy／claude 的狀態樹
+#: 裡沒有同性質的檔，因此它們留在 `HOME_REDIRECT_TREE`——**同一條規則**的另一邊。
+#: 哪天量到 `claude` 也有一個會執行命令的 root-owned 設定檔，往這裡加一列即可，兩個
+#: 帳號的形狀會一起跟著變。
+EXECUTOR_ENFORCEMENT_LEAVES: Mapping[str, str] = MappingProxyType({
+    "codex": "hooks.json",
+})
+
 #: **executor 軸**。順序＝資產在登記表裡的出現順序。
 EXECUTOR_CREDENTIALS: tuple[ExecutorCredential, ...] = (
     ExecutorCredential(
-        "codex", CredentialShape.IN_PLACE_FILE,
-        relpath=None, asset_suffix="executor-credential",
+        "codex", CredentialShape.HOME_STICKY_TREE,
+        relpath=None, asset_suffix="codex-state",
         token_leaf="",
-        note=(
-            "#640 裁決 (b) 的原形態：單檔 `~/.codex/auth.json`。**只有 builder 還是這個"
-            "形狀**——#686 實測 codex 需要 `$CODEX_HOME` 整個目錄可寫，因此凡是要在降權"
-            "模板 unit 下**真的跑起來**的帳號都必須改走 `codex-state`（下一列）。"
-            "builder 維持原形態是因為那份部署已存在、有 runbook 第 4e-2 步的反向驗證，"
-            "改它同時會賣掉 `codex-hooks` 的 enforcement（見 U-9），屬 operator 裁決。"
-        ),
-    ),
-    ExecutorCredential(
-        "codex", CredentialShape.HOME_REDIRECT_TREE,
-        relpath=".codex", asset_suffix="codex-state",
-        cache_target="codex", token_leaf="auth.json",
+        enforcement_leaf=EXECUTOR_ENFORCEMENT_LEAVES["codex"],
+        enforcement_asset_suffix="codex-hooks",
         note=(
             "codex 的 `$CODEX_HOME` 整棵（預設就是 `~/.codex`）。#686 在完整 reviewer "
             "unit 沙箱下實測：唯讀時 `failed to initialize in-process app-server client: "
@@ -786,7 +876,16 @@ EXECUTOR_CREDENTIALS: tuple[ExecutorCredential, ...] = (
             "即 rc=0、輸出正確。底下會出現 `state_5.sqlite`／`logs_2.sqlite`／"
             "`queue_1.sqlite`／`memories_1.sqlite`／`sessions/`／`skills/`／`plugins/`／"
             "`thread-writer-locks/`／`models_cache.json`／`installation_id`——**檔名帶版本"
-            "序號**，逐項列舉會在下一次 CLI 升版時無聲失效，因此放行的是整棵樹而不是清單。"
+            "序號**，逐項列舉會在下一次 CLI 升版時無聲失效，因此放行的是整棵樹而不是清單。\n"
+            "**#698 起這一列是 `HOME_STICKY_TREE`，而且 builder 與 reviewer-planner 共用"
+            "它**（表上因此只剩一列 codex）。#685 當時是兩列：builder 的 `IN_PLACE_FILE`"
+            "（codex 在降權 unit 下**起不來**）＋ reviewer-planner 的 `HOME_REDIRECT_TREE`"
+            "（codex 起得來，但 job **植得進 `hooks.json`** ⇒ 跨 job 持久化，R9 T3.9 實測"
+            "攻破）。sticky 樹兩件事一起買到：整棵可寫 ⇒ codex 起得來；目錄 root-owned ＋"
+            "sticky ⇒ root 的 `hooks.json` 刪不掉、改不掉名字、也改不了內容。\n"
+            "`relpath=None`：樹與 token 葉檔**都**由 `PathLayout.executor_credential_relpath`"
+            "（部署決定，預設 `.codex/auth.json`）的 head／tail 導出——換 primary executor "
+            "時仍然只改那一個值，而且樹與葉不可能各改一半。"
         ),
     ),
     ExecutorCredential(
@@ -826,13 +925,15 @@ EXECUTOR_CREDENTIALS: tuple[ExecutorCredential, ...] = (
 #: **明文接受的有界殘餘風險**，不另拆帳號。它在後續任何「planner 攻擊面」討論中**不得**
 #: 被當成未知——U-4 的裁決逐字如此。
 #:
-#: **`builder` 只有一格**，且刻意維持 `IN_PLACE_FILE`：builder 不做 planning，不需要
-#: 異質性；擴大它的 provider 曝險面買不到任何東西。
+#: **`builder` 只有一格**：builder 不做 planning，不需要異質性；擴大它的 provider
+#: 曝險面買不到任何東西。但那一格的**形狀**與 reviewer-planner 的 codex 逐字相同
+#: （#698）——形狀不是 per-account 的偏好，是 :data:`EXECUTOR_ENFORCEMENT_LEAVES`
+#: 那條規則的結果。
 CREDENTIALED_ACCOUNTS: Mapping[str, tuple[tuple[str, CredentialShape], ...]] = (
     MappingProxyType({
-        "builder": (("codex", CredentialShape.IN_PLACE_FILE),),
+        "builder": (("codex", CredentialShape.HOME_STICKY_TREE),),
         "reviewer-planner": (
-            ("codex", CredentialShape.HOME_REDIRECT_TREE),
+            ("codex", CredentialShape.HOME_STICKY_TREE),
             ("agy", CredentialShape.HOME_REDIRECT_TREE),
             ("claude", CredentialShape.HOME_REDIRECT_TREE),
         ),
@@ -872,12 +973,32 @@ def credential_rows() -> tuple[tuple[str, ExecutorCredential], ...]:
 
 def credential_asset_ids(shape: CredentialShape | None = None) -> tuple[str, ...]:
     """本表產生的登記表資產 id（可依形狀過濾）。`_FILE_ASSET_IDS`／
-    :data:`IN_PLACE_CONTENT_WRITE_ASSETS`／:data:`SYMLINK_ASSETS` 全部由它導出。"""
+    :data:`IN_PLACE_CONTENT_WRITE_ASSETS`／:data:`SYMLINK_ASSETS`／
+    :data:`STICKY_JOB_WRITABLE_DIR_ASSETS` 全部由它導出。"""
     return tuple(
         credential_asset_id(prefix, cred)
         for prefix, cred in credential_rows()
         if shape is None or cred.shape is shape
     )
+
+
+def enforcement_asset_id(prefix: str, credential: ExecutorCredential) -> str:
+    """該格 enforcement 檔的登記表資產 id（`<帳號前綴>-<enforcement_asset_suffix>`）。"""
+    if not credential.enforcement_asset_suffix:
+        raise ValueError(f"{credential.executor}：這一格沒有 enforcement 檔")
+    return f"{prefix}-{credential.enforcement_asset_suffix}"
+
+
+def enforcement_rows() -> tuple[tuple[str, ExecutorCredential], ...]:
+    """有 enforcement 檔的那些格（`(帳號前綴, 憑證)`）。#698 的 hooks 資產由它導出。"""
+    return tuple(
+        (prefix, cred) for prefix, cred in credential_rows() if cred.enforcement_leaf
+    )
+
+
+def enforcement_asset_ids() -> tuple[str, ...]:
+    """全部 enforcement 檔的資產 id。**兩個帳號各一份，由同一條規則長出來。**"""
+    return tuple(enforcement_asset_id(prefix, cred) for prefix, cred in enforcement_rows())
 
 
 def credential_for(prefix: str, executor: str) -> ExecutorCredential:
@@ -886,6 +1007,41 @@ def credential_for(prefix: str, executor: str) -> ExecutorCredential:
         if cell_prefix == prefix and cred.executor == executor:
             return cred
     raise UnregisteredExecutorCredentialError(f"{prefix}:{executor}")
+
+
+def _assert_shape_follows_enforcement_rule() -> None:
+    """#698 的那條規則，在 **import 當下**強制。
+
+    **規則**：executor 在 :data:`EXECUTOR_ENFORCEMENT_LEAVES` 上有一格 ⇒ 凡持有它
+    登入態的帳號，那一格一律是 :attr:`CredentialShape.HOME_STICKY_TREE`。
+
+    為什麼是 import 當下而不是一條測試：0818 的實測破口（#698）不是「有人寫錯一行」，
+    是「兩個帳號的形狀**各自**被決定，於是其中一個先遷、另一個留在原地等著爆」。
+    在展開點上強制，讓「只改一格」在**結構上做不到**——新增第五個帳號時漏改的症狀是
+    模組載不起來，而不是三個月後的一次 R9 紅字。
+    """
+    for prefix, cred in credential_rows():
+        want = EXECUTOR_ENFORCEMENT_LEAVES.get(cred.executor)
+        if want and cred.shape is not CredentialShape.HOME_STICKY_TREE:
+            raise ValueError(
+                f"{prefix}×{cred.executor}：這個 executor 的狀態樹裡住著 root-owned 的 "
+                f"`{want}`，因此該格必須是 HOME_STICKY_TREE（現況 {cred.shape.value}）。"
+                "#698：非 sticky 的可寫樹裡，job 隨時 unlink／rename 掉那個檔——R9 T3.9 "
+                "在 `cortex-reviewer-planner` 上實測攻破過一次，不再接受第二次。"
+            )
+        if want and cred.enforcement_leaf != want:
+            raise ValueError(
+                f"{prefix}×{cred.executor}：enforcement 檔名與 "
+                f"EXECUTOR_ENFORCEMENT_LEAVES 不一致（{cred.enforcement_leaf!r} vs {want!r}）。"
+            )
+        if not want and cred.enforcement_leaf:
+            raise ValueError(
+                f"{prefix}×{cred.executor}：宣告了 enforcement 檔卻不在 "
+                "EXECUTOR_ENFORCEMENT_LEAVES 上——規則的輸入只有那一張表。"
+            )
+
+
+_assert_shape_follows_enforcement_rule()
 
 
 @dataclass(frozen=True)
@@ -1309,9 +1465,21 @@ DEFAULT_SCHEME_ID: str = DEFAULT_SCHEME.scheme_id
 class OwnerClass(Enum):
     """資產的擁有類別，決定 owner 帳號來源。"""
 
-    DEPLOYMENT = "deployment"        # enforcement plane：owner＝deploy/root
+    DEPLOYMENT = "deployment"        # enforcement plane：owner＝deploy/root，**全部 headless 唯讀**
     MANAGER_STATE = "manager-state"  # Manager-owned durable state：owner＝durable_state_owner
     JOB = "job"                      # job-visible：owner＝對應 job 帳號（或 runtime 逐案 chown）
+    #: **root 擁有的容器，untrusted job 可寫其內容**（#698 方案 A：sticky 樹）。
+    #:
+    #: 它刻意**不是** `DEPLOYMENT`。`DEPLOYMENT` 的定義裡有一句「對全部 headless 唯讀」，
+    #: 而那句話是好幾條不變式的依據（`test_builder_never_writes_manager_owned_or_deployment`
+    #: ／`test_manager_owned_acls_are_read_only`）。sticky 樹**必須**讓 job 寫得進去，
+    #: 把它塞進 `DEPLOYMENT` 等於就地把那句話改成「除了某些之外」——那些不變式會從
+    #: 「機械成立」退化成「有例外清單」，而例外清單是會長大的。
+    #:
+    #: 本類別的性質是可以逐條寫下來的：owner＝root、帶 sticky bit、恰好一組 untrusted
+    #: 執行身分持有具名 `rwx` **access** ACL（無 default ACL）；容器裡的 root-owned 檔
+    #: 仍是 `DEPLOYMENT`，且 job 對它零寫入。
+    STICKY_SHARED = "sticky-shared"
 
 
 @dataclass(frozen=True)
@@ -1363,6 +1531,16 @@ class PermissionEntry:
     def mode_str(self) -> str:
         return format(self.mode, "04o")
 
+    @property
+    def sticky(self) -> bool:
+        """本資產帶 sticky bit（`chmod +t`，#698）。
+
+        由 `mode` 導出而不是另存一個布林欄位：兩份真相會漂移，而這一位的語意
+        （「目錄可寫，但只刪得掉／改得掉名字的是自己的檔」）正是 `hooks.json` 住得進
+        可寫樹的全部依據。
+        """
+        return bool(self.mode & STICKY_BIT)
+
     def to_dict(self) -> dict[str, object]:
         return {
             "asset_id": self.asset_id,
@@ -1381,6 +1559,7 @@ class PermissionEntry:
                 for a in self.acls
             ],
             "runtime_managed": self.runtime_managed,
+            "sticky": self.sticky,
             "legacy_writers": list(self.legacy_writers),
             "rationale": self.rationale,
             "open_points": list(self.open_points),
@@ -1411,8 +1590,24 @@ class PermissionEntry:
         for acl in self.acls:
             cmds.append(acl.render(path))
             # dir 需同時設 access 與 default ACL，讓新建物件繼承。
-            if self.is_directory and not acl.default:
+            #
+            # ⛔ **sticky 樹是明示的例外（#698）**，而且這一行就是它的成敗。default ACL
+            #    決定的是「**之後**在這個目錄裡新建的物件」的初值——包含 root 日後重放
+            #    一次 `hooks.json` 的那一次。對 sticky 樹補上 `-d -m u:<job>:rwx` 等於
+            #    宣告「root 放進去的每一個 enforcement 檔都自動交還給 job」，sticky
+            #    擋得住 unlink／rename 也沒有用了（job 直接改內容）。
+            #    因此這一族**只設 access ACL**。
+            if self.is_directory and not acl.default and not self.sticky:
                 cmds.append(AclEntry(acl.account, acl.perms, default=True).render(path))
+        if self.sticky:
+            cmds.append(
+                "#   ⛔ 本目錄**刻意不設 default ACL**：它會讓 root 日後放進來的 "
+                "enforcement 檔自動帶上 job 的 rwx（#698）。"
+            )
+            cmds.append(
+                f"#   ✅ 驗證用 `getfacl {path}` 而不是 `ls -ld`——具名 ACL 存在時 mode "
+                "的 group 位顯示的是 **ACL mask**（會顯示成 rwx），那不是 group 寫入權。"
+            )
         return cmds
 
 
@@ -1441,6 +1636,11 @@ _DIR_ASSET_IDS = frozenset({
     "review-verdict-spool",         # <coordinator>/review-verdicts/<reviewer_job_id>/
     "commit-spool",                 # <coordinator>/commit-spool/<job-id>/
     "executor-toolchain",           # <deploy_root>/toolchain/（四個模型 CLI 的落點）
+    # #698：codex 的 `$CODEX_HOME` 整棵（`<HOME>/.codex`）——root-owned ＋ sticky 的
+    # **真目錄**。asset_id 的 token heuristic（`-state` 不在 `_DIR_ASSET_TOKENS`）會把
+    # 它誤判成單檔，而誤判的後果不是排版問題：檔案資產的 RWP 會折算成**父目錄**＝
+    # 整個 HOME，等於把 root-owned 的 HOME 開成可寫面。由表機械導出。
+    *credential_asset_ids(CredentialShape.HOME_STICKY_TREE),
 })
 #: 登記表上是 **symlink** 的資產（#685／U-7）。
 #:
@@ -1455,6 +1655,31 @@ SYMLINK_ASSETS: frozenset[str] = frozenset(
     credential_asset_ids(CredentialShape.HOME_REDIRECT_TREE)
 )
 
+#: sticky 樹裡那個 **root-owned enforcement 葉檔**的資產 id（#698）。
+#:
+#: 它與其他葉檔在 `plan_to_commands()` 裡走**相反**的守衛：一般葉檔「不存在就跳過」，
+#: 這一族「不存在就由 root 種一份」。理由是 sticky bit 的語意——它管「刪／改名別人的
+#: 檔」，不管「建一個還不存在的檔」，因此**檔不存在時整個裁決是空的**。
+ENFORCEMENT_LEAF_ASSETS: frozenset[str] = frozenset(enforcement_asset_ids())
+
+#: 產生器種進 enforcement 位置的**最小合法內容**。
+#:
+#: 刻意是一份**空的** hooks 文件，不是 `paulsha_cortex/scripts/hooks/codex.json` 那份
+#: relay hook：本檔的價值在於「這個位置由 root 佔住、job 換不掉」，不在於跑什麼。
+#: 把 relay hook 種進 job 帳號會憑空多一條執行面（而且 job 帳號本來就寫不進
+#: coordinator，每次 codex session 只會多一串失敗），與本票要收的洞方向相反。
+#: 之後要放什麼是 root 的決定——換內容不需要動產生器，只要以 root 身分覆寫。
+CODEX_HOOKS_SEED_CONTENT = '{\n  "hooks": {}\n}'
+
+#: 登記表上是 **root-owned ＋ sticky ＋ job `rwx` ACL 的真目錄**的資產（#698）。
+#:
+#: 由 :func:`credential_asset_ids` 機械導出。這一族是 `build_entry()` 唯一會產出
+#: **帶 sticky 位**與**唯一會在 DEPLOYMENT 類別下產出可寫 ACL** 的地方——兩件事都要
+#: 有出處，因此集合本身也是導出的，不是手寫清單。
+STICKY_JOB_WRITABLE_DIR_ASSETS: frozenset[str] = frozenset(
+    credential_asset_ids(CredentialShape.HOME_STICKY_TREE)
+)
+
 _FILE_ASSET_IDS = frozenset({
     "control-daemon-lock",
     "control-status",
@@ -1462,12 +1687,19 @@ _FILE_ASSET_IDS = frozenset({
     # 與 `config.yml` 才能是**不同 owner** 的兩個檔。
     "manager-gh-credential",
     "manager-gh-config",
-    # #640／#685：憑證那一族**一律不是目錄**。這條明列不是裝飾——file/dir 的判定直接
-    # 決定 permgen 會不會把一整層 `install -d` 出來再 chown 給 job 帳號：
+    # #640／#685／#698：憑證那一族**只有 sticky 樹是目錄**。file/dir 的判定直接決定
+    # permgen 會不會把一整層 `install -d` 出來再 chown，因此三種形狀各自明列：
     #   - `IN_PLACE_FILE` 是單檔，父目錄必須維持 root-owned 才有「能改內容、不能增刪換」；
     #   - `HOME_REDIRECT_TREE` 是 **symlink**，`install -d` 會在它的位置建出一個真目錄，
-    #     把整條導向 `cache` 的機制無聲換掉（見 :data:`SYMLINK_ASSETS`）。
-    *credential_asset_ids(),
+    #     把整條導向 `cache` 的機制無聲換掉（見 :data:`SYMLINK_ASSETS`）；
+    #   - `HOME_STICKY_TREE` 是**真目錄**，因此**不在**本集合，改列進 `_DIR_ASSET_IDS`。
+    *(
+        aid for aid in credential_asset_ids()
+        if aid not in STICKY_JOB_WRITABLE_DIR_ASSETS
+    ),
+    # #698：enforcement 檔（codex 的 `hooks.json`）——兩個帳號各一份，由
+    # `enforcement_asset_ids()` 導出。它是 sticky 樹裡那個 job 動不了的葉檔。
+    *enforcement_asset_ids(),
 })
 
 
@@ -1498,6 +1730,9 @@ def infer_is_directory(asset: TrustRootAsset) -> bool:
 def classify_owner(asset: TrustRootAsset) -> OwnerClass:
     """把資產分到 DEPLOYMENT／MANAGER_STATE／JOB。
 
+    - sticky 樹（:data:`STICKY_JOB_WRITABLE_DIR_ASSETS`）→ STICKY_SHARED。**這條排在
+      最前面**：那一族的 `ingress_kind` 也是 `DEPLOYMENT_WRITE`（root 建立、root 擁有），
+      若讓它落進 DEPLOYMENT，「deployment 對全部 headless 唯讀」那句話就不再為真。
     - enforcement plane（`DEPLOYMENT_WRITE`，或 writer 含 INSTALLER 的 bootstrap env）
       → DEPLOYMENT（owner＝root/deploy）。
     - control file queue（`CONTROL_FILE_QUEUE`）：登記表現況標為 job-visible（任何同
@@ -1506,6 +1741,8 @@ def classify_owner(asset: TrustRootAsset) -> OwnerClass:
     - Manager-owned 樹的其餘資產 → MANAGER_STATE。
     - 其餘 job-visible 樹 → JOB。
     """
+    if asset.asset_id in STICKY_JOB_WRITABLE_DIR_ASSETS:
+        return OwnerClass.STICKY_SHARED
     if asset.ingress_kind is IngressKind.DEPLOYMENT_WRITE:
         return OwnerClass.DEPLOYMENT
     if Principal.INSTALLER in asset.writers:
@@ -1526,6 +1763,15 @@ def _dir_file_mode(is_dir: bool, owner_bits: int, group_bits: int, other_bits: i
 def _mask_write(bits: int) -> int:
     """移除 write 位（用於確保 group/other 永不可寫）。"""
     return bits & ~0o2 & 0o7
+
+
+#: sticky bit（`chmod +t`）。目錄語意：可寫，但**只有檔案 owner／目錄 owner／root**
+#: 刪得掉或改得掉裡面的檔名。#698 的整套方案 A 就架在這一位上。
+STICKY_BIT = 0o1000
+
+#: setuid／setgid。**任何登記表資產都不得帶**，安全網無條件清掉——它們是提權位，
+#: 而本產生器的整個目的是把提權面收斂到 root-owned 的 unit／shim 那一條線上。
+_FORBIDDEN_SPECIAL_BITS = 0o6000
 
 
 def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
@@ -1560,6 +1806,69 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
             "導出，服務因此改不了自己的 git 設定（.gitconfig 可指定 core.fsmonitor／"
             "alias.* 這類會執行外部命令的鍵）。注意來源樹本身**不**歸此類：0817 裁決把"
             "它的 writer 改為 Manager（回收成果必須寫得進去），見 `repo-source-tree`。"
+        )
+        if asset.asset_id in ENFORCEMENT_LEAF_ASSETS:
+            rationale += (
+                "\n**#698：本檔住在一棵 job 可寫的 sticky 樹裡**（`*-codex-state`），"
+                "因此它的保護不是「父目錄不可寫」而是三個動詞各自被擋："
+                "unlink／rename 由 sticky 擋（非 owner 只動得了自己的檔）、改內容由本檔的 "
+                "mode 擋（root:root 0644 ⇒ job 落在 `other` 位）；mount 層另有該 unit 的 "
+                "`ReadOnlyPaths=` 這一條（`enforcement_read_only_paths()`）。"
+                "\n⛔ **本檔必須存在**：sticky 不管「建一個還不存在的檔」，缺它時 job 直接"
+                "`printf x > $HOME/.codex/hooks.json` 就會成功（R9 T3.9 的攻擊字面）。"
+                "`plan_to_commands()` 因此對本族出 **create-if-absent**，而不是其他葉檔"
+                "那條「不存在就跳過」。"
+            )
+
+    elif owner_class is OwnerClass.STICKY_SHARED:
+        # #698 方案 A：executor 的狀態樹。owner 是 root（它承載 enforcement 檔——目錄
+        # owner 對 sticky 免疫，所以這一層**不能**是 job 擁有），但整棵必須讓 job 寫得
+        # 進去，否則 executor 起不來（#686）。兩者同時成立的唯一形態＝
+        # **sticky ＋ 具名 rwx access ACL**。
+        #
+        # 授權對象由 `writers` ∩ `UNTRUSTED_EXECUTION_PRINCIPALS` 導出，與 JOB 那一支
+        # 的規則同源——「哪個身分算不受信任的執行者」只有那一個集合說了算，這裡不另立
+        # 第二條判準。
+        owner = scheme.deploy_account
+        sticky_writers = frozenset(
+            a
+            for a in (
+                scheme.resolve(w)
+                for w in asset.writers
+                if w in UNTRUSTED_EXECUTION_PRINCIPALS
+            )
+            if a is not None
+        )
+        if not sticky_writers:
+            raise ValueError(
+                f"{asset.asset_id}：sticky 樹沒有任何 untrusted 執行身分當 writer"
+                "——那它只是一個沒人寫得進去的 root 目錄，executor 會起不來（#686）。"
+                "登記表的 writers 必須含該帳號的 job principal。"
+            )
+        # 目錄 rwx，group／other 唯讀＋traverse（安全網稍後會再確認一次無 w 位）。
+        mode = _dir_file_mode(is_dir, 0o7, 0o5, 0o5) | STICKY_BIT
+        for jacct in sorted(sticky_writers):
+            acls.append(AclEntry(jacct, "rwx"))
+        writer_accounts = frozenset({owner}) | sticky_writers
+        rationale = (
+            "**executor 狀態樹（#698 方案 A：sticky ＋ root-owned enforcement 檔）**："
+            "owner＝root、mode 帶 sticky bit（`+t`），job 帳號以具名 **access** ACL "
+            "取得 `rwx`。兩件在 #685 的形狀下互斥的事因此同時成立：(i) 整棵可寫 ⇒ "
+            "codex 起得來（#686 實測 `$CODEX_HOME` 唯讀時連 in-process app-server 都"
+            "初始化不了）；(ii) 樹裡的 root-owned `hooks.json` **刪不掉、改不掉名字、"
+            "也改不了內容**——sticky 讓非 owner 只動得了自己的檔，而該檔的 mode 讓 "
+            "job 落在 `other` 位。0818 的 R9 T3.9 就是在 (ii) 不成立的形狀下被實測"
+            "攻破的（codex hooks 會執行命令 ⇒ 跨 job 持久化）。"
+            "\n**owner 必須是 root**：目錄 owner 對 sticky 免疫（POSIX：目錄 owner 刪得掉"
+            "裡面任何檔），把這一層交給 job 等於整條規則不存在。"
+            "\n**group 寫入權仍然是零**（spec §R2 未放寬）：job 的寫入權走具名 ACL。"
+            "注意 `ls -ld` 會把 group 位顯示成 `rwx`——那是 POSIX ACL 的 **mask**，"
+            "不是 group 權限，驗證一律用 `getfacl`。"
+            "\n**刻意不設 default ACL**：它會讓 root 日後補放的 enforcement 檔自動帶上"
+            "job 的 `rwx`，等於把 (ii) 交還回去（見 `PermissionEntry.commands`）。"
+            "\n**代價（R-6 不變）**：樹由 job 寫 ⇒ 樹裡的 **token 葉檔**仍可被該 job "
+            "刪除或替換。那是刻意的——token 過期必須 refresh 得回來；sticky 保護的是"
+            "root 擁有的那些檔。"
         )
 
     elif owner_class is OwnerClass.MANAGER_STATE:
@@ -1674,9 +1983,20 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
                 )
 
     # 安全網：group/other 一律不得帶 write 位（spec §R2「group 寫入權 MUST 移除」）。
+    #
+    # **#698 改了這一行的最後一段，而那是本票唯一動到 mode 管線的地方。** 舊寫法是
+    # `mode & 0o700`——它保住 owner 位，卻連同 setuid／setgid **與 sticky** 一起吃掉。
+    # sticky 被吃掉的後果不是「權限緊一點」：它是「目錄可寫但只能刪自己的檔」的**唯一**
+    # 表達方式，沒有它就無法在一棵 job 可寫的樹裡放一個 job 動不了的 root-owned
+    # `hooks.json`（#698 的方案 A）。#685 把這條列為「本票不做」的兩個理由之一。
+    #
+    # §R2 的不變式**一行都沒有放寬**：group／other 的 write 位仍然無條件清除，job 的
+    # 寫入權一律走具名 ACL；新增的只有「sticky 通得過」。setuid／setgid 則從「被
+    # `& 0o700` 順手吃掉」升級為**明文清除**——同樣的結果，但現在有出處、也擋得住
+    # 日後有人把遮罩再放寬一位。
     group_bits = _mask_write((mode >> 3) & 0o7)
     other_bits = _mask_write(mode & 0o7)
-    mode = (mode & 0o700) | (group_bits << 3) | other_bits
+    mode = (mode & (STICKY_BIT | 0o700) & ~_FORBIDDEN_SPECIAL_BITS) | (group_bits << 3) | other_bits
 
     return PermissionEntry(
         asset_id=asset.asset_id,
@@ -1875,7 +2195,15 @@ def plan_to_commands(
         path = (path_of or {}).get(e.asset_id) or _placeholder_path(e)
         per_job = PER_JOB_SEGMENT in path
         lines.append("")
-        lines.append(f"# [{e.tier}] {e.asset_id} ({e.owner_class.value}) — {e.rationale}")
+        # rationale 可能是多行（#698 起有幾條是）。**每一行都要自己的 `#`**：這份輸出
+        # 是 runbook 以 `sudo sh -e` 直接執行的 script，漏掉前綴的那幾行會被 shell 當成
+        # 命令解析——症狀是整份 script 在一個看起來像散文的地方 `Syntax error`，而且
+        # 那一行離真正的原因（某個資產的 rationale 換了行）非常遠。
+        rationale_lines = e.rationale.splitlines() or [""]
+        lines.append(
+            f"# [{e.tier}] {e.asset_id} ({e.owner_class.value}) — {rationale_lines[0]}"
+        )
+        lines += [f"#   {line}" for line in rationale_lines[1:]]
         if e.runtime_managed:
             lines.append("#   注意：per-child owner 由降權啟動器逐案 chown（本節僅容器層）。")
         for op in e.open_points:
@@ -1902,7 +2230,54 @@ def plan_to_commands(
             cmds = [f"[ ! -e {parent} ] || {cmd}" for cmd in cmds]
         elif e.is_directory:
             # 目錄一定先建起來，後續 chown／chmod／setfacl 必然有對象。
-            cmds.insert(0, f"install -d {path}")
+            #
+            # #698：sticky 樹的既有部署可能是**別的東西**（reviewer-planner 上是一條
+            # 指向 `cache/codex` 的 symlink）。`install -d` 對「已存在的 symlink」不會
+            # 報錯、也不會取代它——它會**跟著連結**去建目標目錄，於是 chown／chmod／
+            # setfacl 全部套到 `cache/codex` 那棵 job-owned 的樹上，而現場看起來一切
+            # 正常。遷移那一步（改成真目錄）必須由 operator 顯式做，見 runbook 4e-2b。
+            if e.asset_id in STICKY_JOB_WRITABLE_DIR_ASSETS:
+                lines.append(
+                    f"#   ⚠️ 遷移守衛：{path} 若是既有部署留下的 **symlink**，下面這行"
+                    "`install -d` 會跟著它去建目標、把權限套到錯的樹上（#698 的部署陷阱）。"
+                )
+                lines.append(
+                    f"#      先確認形狀：`[ -L {path} ] && echo 'symlink——先跑 runbook "
+                    "4e-2b 的遷移步驟，不要直接套用本節'`"
+                )
+                cmds.insert(0, f"install -d {path}")
+                # 守衛必須排在 `install -d` **之前**：`install -d` 對既有 symlink 會
+                # 跟著它去建目標，錯誤在那一行就已經造成了。
+                cmds.insert(
+                    0,
+                    f"[ ! -L {path} ] || {{ echo '⛔ {path} 仍是 symlink，"
+                    f"見 runbook 4e-2b 的遷移步驟' >&2; exit 1; }}",
+                )
+            else:
+                cmds.insert(0, f"install -d {path}")
+        elif e.asset_id in ENFORCEMENT_LEAF_ASSETS:
+            # #698：enforcement 檔與其他葉檔**相反**——它不能用 `[ ! -e ] ||` 跳過。
+            #
+            # sticky bit 管的是「刪／改名**別人的**檔」，**不管「建一個還不存在的檔」**。
+            # 因此這個檔不存在時，sticky 樹擋不住任何東西：job 直接 `printf x >
+            # $HOME/.codex/hooks.json` 就成功了（那正是 R9 T3.9 的攻擊字面）。
+            # 「跳過」在這裡不是保守，是**靜默把整個裁決變成空的**。
+            #
+            # 因此改成 create-if-absent：由 root 種一份最小、合法、**不含任何命令**的
+            # 文件，再套上 root:root 0644。內容之後要換成什麼是 root 的決定；產生器
+            # 只保證「這個位置永遠有一個 root 擁有的檔」。
+            lines.append(
+                f"#   ⛔ 本檔**必須存在**，否則 sticky 樹什麼也擋不住（job 建得出新檔）"
+                "——因此這裡是 create-if-absent，不是「不存在就跳過」（#698）。"
+            )
+            lines.append(
+                "#   內容是最小且**不含任何命令**的 hooks 文件：本檔的價值在於「這個位置"
+                "由 root 佔住」，不在於跑什麼。要放真的 hook 是 root 之後的決定。"
+            )
+            seed = [f"[ -e {path} ] || cat > {path} <<'PSC_CODEX_HOOKS_EOF'"]
+            seed += CODEX_HOOKS_SEED_CONTENT.splitlines()
+            seed.append("PSC_CODEX_HOOKS_EOF")
+            cmds = seed + cmds
         else:
             # 葉檔在 setup 當下多半尚未存在（由服務首次寫入時建立）。加 `[ ! -e ] ||`
             # 守衛：不存在就跳過（且在 `sh -e` 下不會中斷腳本），存在就套上目標權限。
@@ -1936,9 +2311,13 @@ def _dedupe_scaffold(
 ) -> tuple[tuple[str, str, str, int], ...]:
     """同一個路徑只留第一次出現的那一筆（順序不變）。
 
-    骨架清單是由**多條獨立規則**疊出來的（`~/.codex` 來自 hooks、憑證父目錄來自
-    #640），預設 layout 下兩者指向同一層。去重讓 `install -d` 不會重複輸出，也讓
+    骨架清單是由**多條獨立規則**疊出來的（帳號 HOME／cache、憑證形狀各自的前置層），
+    不同規則在某些 layout 下會指向同一層。去重讓 `install -d` 不會重複輸出，也讓
     「無多餘」那類等式測試不必為一個純顯示層的重複而放寬。
+
+    ⚠️ **只留第一筆**，因此「同一條路徑被兩條規則以不同 mode 產出」會**靜默**取前者。
+    #698 之後 `~/.codex` 是登記表資產（sticky 1755 ＋ ACL）而**不再**進骨架，正是為了
+    避免骨架那份 0755 把 sticky 位蓋掉——那種漂移在輸出上看不出來。
     """
     seen: set[str] = set()
     kept: list[tuple[str, str, str, int]] = []
@@ -1975,7 +2354,7 @@ class PathLayout:
     #: Manager 帳號是 `cortex-manager`，HOME 卻還指著二分時代的 `/var/lib/cortex-svc`，
     #: unit 的 `Environment=HOME=` 與 scaffold 因此指向一個沒人擁有的目錄。
     home_root: str = "/var/lib"
-    #: builder 的帳號名。只給 `asset_paths()` 用（`codex-hooks`／`builder-gitconfig` 掛在
+    #: builder 的帳號名。只給 `asset_paths()` 用（`builder-gitconfig` 掛在
     #: builder HOME 下），因為 `asset_paths()` 刻意不吃 scheme——兩個 scheme 對 BUILDER
     #: 的映射相同。其餘所有帳號相關路徑一律由 scheme 現場導出。
     builder_account: str = "cortex-builder"
@@ -2313,14 +2692,59 @@ class PathLayout:
         return f"{self.home_of(account)}/cache"
 
     def codex_hooks_dir_of(self, account: str) -> str:
-        """該帳號的 `~/.codex`。root-owned——job 不得替換自己的 hooks。"""
-        return f"{self.home_of(account)}/.codex"
+        """該帳號的 `~/.codex`。root-owned（#698 起再加 sticky）——job 不得替換 hooks。
+
+        **#698 之後這一層同時是 codex 的 `$CODEX_HOME` 整棵**（登記表資產
+        `<前綴>-codex-state`），因此值由憑證表導出、不再是寫死的 `.codex`：
+        `PathLayout.executor_credential_relpath` 換掉時它必須跟著換，否則 hooks 會落在
+        一個 codex 根本不看的目錄裡——**一個不會報錯的 enforcement 缺口**。
+        表上查無的帳號（二分的 `cortex-svc`）退回既有字面值。
+        """
+        try:
+            credential = credential_for(
+                self.credential_prefix_of(account), PRIMARY_CREDENTIAL_EXECUTOR
+            )
+        except UnregisteredExecutorCredentialError:
+            return f"{self.home_of(account)}/.codex"
+        return f"{self.home_of(account)}/{self.credential_relpath_of(credential)}"
 
     def credential_relpath_of(self, credential: ExecutorCredential) -> str:
-        """該憑證在帳號 HOME 底下的相對落點（`None` 的那一列由本 layout 供給）。"""
+        """該憑證**登記節點**在帳號 HOME 底下的相對落點（`None` 的那一列由本 layout 供給）。
+
+        `relpath is None` 的那一列（＝ :data:`PRIMARY_CREDENTIAL_EXECUTOR`）的值來自
+        `executor_credential_relpath` 這個部署決定。#698 起它要依形狀切一刀：
+
+        - `IN_PLACE_FILE`：登記的節點就是**那個檔**（`.codex/auth.json`）；
+        - `HOME_STICKY_TREE`：登記的節點是**放那個檔的那一層**（`.codex`）——樹與葉
+          因此是同一個部署決定的 head 與 tail，不可能各改一半，而
+          「換 primary executor 只改一個值」（#640）仍然逐字成立。
+        """
+        if credential.relpath is not None:
+            return credential.relpath
+        relpath = self.executor_credential_relpath
+        if credential.shape is CredentialShape.IN_PLACE_FILE:
+            return relpath
+        # `_validate_credential_relpath` 保證至少兩段，因此這一刀必定切得出 head。
+        return relpath.rsplit("/", 1)[0]
+
+    def credential_token_relpath_of(self, credential: ExecutorCredential) -> str:
+        """真正承載 token 的**葉檔**在帳號 HOME 底下的相對落點。
+
+        `relpath is None` 的那一列直接回 `executor_credential_relpath` 全值——它本來
+        就是「那個檔在哪裡」的部署決定；再從 `token_leaf` 拼一次會是第二份真相
+        （operator 把它改成 `.claude/credentials.json` 時會拼出 `.claude/auth.json`）。
+        """
         if credential.relpath is None:
             return self.executor_credential_relpath
+        if credential.token_leaf:
+            return f"{credential.relpath}/{credential.token_leaf}"
         return credential.relpath
+
+    def enforcement_relpath_of(self, credential: ExecutorCredential) -> str:
+        """該格 enforcement 檔（codex 的 `hooks.json`）在 HOME 底下的相對落點（#698）。"""
+        if not credential.enforcement_leaf:
+            raise ValueError(f"{credential.executor}：這一格沒有 enforcement 檔")
+        return f"{self.credential_relpath_of(credential)}/{credential.enforcement_leaf}"
 
     def executor_credential_of(
         self, account: str, executor: str = PRIMARY_CREDENTIAL_EXECUTOR,
@@ -2333,12 +2757,15 @@ class PathLayout:
 
         回傳值的**形狀跟著 (account, executor) 這一格走**（:data:`CREDENTIALED_ACCOUNTS`）：
 
-        - `IN_PLACE_FILE`（builder×codex）：回傳的是**那個檔**（`~/.codex/auth.json`）。
-          它與 `codex_hooks_dir_of()` 落在同一層 root-owned 目錄，因此 job 改得了內容、
-          建不了新檔、刪不掉、也換不掉同目錄下的 `hooks.json`。
-        - `HOME_REDIRECT_TREE`（reviewer-planner×{codex, agy, claude}）：回傳的是那條
-          **root-owned symlink**（`~/.codex`／`~/.gemini`／`~/.claude`），真正的 token
-          葉檔在它底下（`credential.token_leaf`）。
+        - `HOME_STICKY_TREE`（{builder, reviewer-planner}×codex，#698）：回傳的是那棵
+          **root-owned ＋ sticky 的真目錄**（`~/.codex`），token 葉檔在它底下
+          （`credential_token_path_of()`），root-owned 的 `hooks.json` 也在它底下。
+        - `HOME_REDIRECT_TREE`（reviewer-planner×{agy, claude}）：回傳的是那條
+          **root-owned symlink**（`~/.gemini`／`~/.claude`），真正的 token 葉檔在它
+          底下（`credential.token_leaf`）。
+        - `IN_PLACE_FILE`：回傳的是**那個檔**。#698 之後憑證表上沒有這個形狀的格子
+          （兩個 codex 都已改走 sticky 樹），保留是因為它仍是
+          :data:`IN_PLACE_CONTENT_WRITE_ASSETS` 的語意來源。
 
         **帳號不在表上時**（`cortex-gate` 不跑模型；二分方案的 `cortex-svc` 沒有登記表
         憑證資產）退回 #640 的單一部署決定 `executor_credential_relpath`——那正是本函式
@@ -2359,8 +2786,13 @@ class PathLayout:
     def executor_credential_dir_of(
         self, account: str, executor: str = PRIMARY_CREDENTIAL_EXECUTOR,
     ) -> str:
-        """`IN_PLACE_FILE` 憑證檔的父目錄。**必須 root-owned**——裁決 (b) 的性質全部
-        落在這一層。`HOME_REDIRECT_TREE` 的那一格回傳的是 symlink 的父目錄（＝HOME）。
+        """憑證登記節點的**父目錄**。
+
+        - `IN_PLACE_FILE`：憑證檔的父目錄，**必須 root-owned**——裁決 (b) 的性質全部
+          落在這一層。
+        - `HOME_REDIRECT_TREE`／`HOME_STICKY_TREE`：回傳的是登記節點的父目錄（＝HOME）。
+          對 sticky 樹而言，「必須 root-owned」的那一層是**樹自己**，不是這裡回的 HOME
+          ——HOME 仍然 root-owned，但那擋的是「換掉整棵樹」，不是「換掉樹裡的 hooks」。
         """
         return _parent_dir(self.executor_credential_of(account, executor))
 
@@ -2377,12 +2809,11 @@ class PathLayout:
 
         `token_leaf` 為空（`IN_PLACE_FILE`）時兩者相同。
         """
-        base = self.executor_credential_of(account, executor)
         try:
             credential = credential_for(self.credential_prefix_of(account), executor)
         except UnregisteredExecutorCredentialError:
-            return base
-        return f"{base}/{credential.token_leaf}" if credential.token_leaf else base
+            return self.executor_credential_of(account, executor)
+        return f"{self.home_of(account)}/{self.credential_token_relpath_of(credential)}"
 
     def credential_target_of(self, account: str, credential: ExecutorCredential) -> str:
         """`HOME_REDIRECT_TREE` 的 symlink 目標絕對路徑（恆在該帳號的 `cache` 底下）。"""
@@ -2423,6 +2854,24 @@ class PathLayout:
                 credential_asset_id(prefix, credential),
                 account,
                 f"{self.home_of(account)}/{self.credential_relpath_of(credential)}",
+                credential,
+            ))
+        return tuple(rows)
+
+    def enforcement_placements(self) -> tuple[tuple[str, str, str, ExecutorCredential], ...]:
+        """#698 的 enforcement 檔展開：`(asset_id, account, 絕對路徑, 該格的憑證)`。
+
+        與 :meth:`credential_placements` 同源、同形，因此「兩個帳號各一份 hooks」是
+        **一條規則長出來的兩列**，不是兩處手寫的路徑。`asset_paths()` 由它導出。
+        """
+        accounts = self.credential_accounts()
+        rows: list[tuple[str, str, str, ExecutorCredential]] = []
+        for prefix, credential in enforcement_rows():
+            account = accounts[prefix]
+            rows.append((
+                enforcement_asset_id(prefix, credential),
+                account,
+                f"{self.home_of(account)}/{self.enforcement_relpath_of(credential)}",
                 credential,
             ))
         return tuple(rows)
@@ -2618,13 +3067,21 @@ class PathLayout:
             "combo-card-override": f"{a}/config/combos",
             "handoff-manifest": f"{job}/.psc-handoff.json",
             "runtime-bootstrap-env": self.env_file,
-            # **只有 builder 這一份，而 #685 之後這是一條有結論的事實、不再是「還沒補」**：
-            # reviewer／planner 帳號的 `~/.codex` 是導進 `cache` 的 symlink（#686 實測
-            # codex 需要 `$CODEX_HOME` 整棵可寫），hooks 若落在那棵樹裡就由 job 帳號擁有
-            # ⇒ 擋不住替換 ⇒ 登記成 root-owned 的 Tier-0 資產是做不到的事。因此它**仍在**
-            # `deferred_run_dependencies()`，並升為 U-9 交 operator 裁決。
-            "codex-hooks": f"{self.builder_home}/.codex/hooks.json",
             "work-items-yaml": f"{job}/.cortex/work-items.yaml",
+            # **#698：hooks 不再只有 builder 那一份，也不再是寫死的路徑。**
+            #
+            # #685 之後這裡的註解寫的是「只有 builder 這一份，因為 reviewer／planner 的
+            # `~/.codex` 是導進 `cache` 的 job-owned 樹、hooks 放進去擋不住替換」。0818
+            # 的 R9 T3.9 把那句話的**後果**量了出來：該帳號真的植入了 `hooks.json`，而
+            # codex hooks 會執行命令 ⇒ 跨 job 持久化（#698）。
+            #
+            # 方案 A 讓那個限制消失：兩個帳號的 `$CODEX_HOME` 都是 root-owned ＋ sticky
+            # 的真目錄，因此**兩份 hooks 都登記得起來**，而且是由
+            # `enforcement_placements()`（＝憑證表那條規則）長出來的兩列，不是兩處手寫。
+            **{
+                asset_id: path
+                for asset_id, _account, path, _cred in self.enforcement_placements()
+            },
         }
 
     # -- 非資產骨架目錄 -----------------------------------------------------
@@ -2651,20 +3108,24 @@ class PathLayout:
             account_dirs.append((self.home_of(account), root, g(root), 0o755))
             account_dirs.append((self.cache_of(account), account, g(account), 0o700))
         # #685：憑證那一族的骨架**由 per-(account, executor) 表導出**，不再逐項寫死。
-        # 兩種形狀各自要先存在的東西不同，而「哪個帳號是哪種形狀」是表上的一格：
+        # 三種形狀各自要先存在的東西不同，而「哪個帳號是哪種形狀」是表上的一格：
         #
         #   - `IN_PLACE_FILE`：憑證檔的**父目錄**必須 root-owned（#640 裁決 (b) 的性質
-        #     全部落在這一層——job 因此改得了內容，卻建不了新檔、刪不掉、也換不掉同
-        #     目錄下的 root-owned `hooks.json`）。預設 relpath 下這一層就是 `~/.codex`，
-        #     `codex-hooks` 也住在裡面，去重後只出現一次。
+        #     全部落在這一層——job 因此改得了內容，卻建不了新檔、刪不掉）。
         #   - `HOME_REDIRECT_TREE`：symlink 自己由權限計畫的 `ln -sfn` 落位；骨架要先
         #     建的是它的**目標**——那一格落在該帳號的 `cache` 底下，由**該帳號**擁有
         #     0700。這一層不建的話，`~/.gemini` 會是一條懸空 symlink，而建目錄的
         #     syscall 對懸空 symlink 回 `EEXIST`（**不是**「建出目標」）——executor 於是
         #     死在一個與權限完全無關的錯誤上。
+        #   - `HOME_STICKY_TREE`（#698）：**這一格不進骨架**。它自己就是登記表資產
+        #     （目錄型），`plan_to_commands()` 會出 `install -d` ＋ `chown` ＋ `chmod
+        #     1755` ＋ `setfacl`。在這裡再建一次會是第二份真相，而且是**會漂移的那種**
+        #     ——骨架這一層不知道 sticky 位與 ACL，去重（`_dedupe_scaffold`）只留第一筆，
+        #     於是先出現的骨架版本會把權限計畫的版本蓋掉，sticky 靜默消失。
         #
-        # 兩者的保護都不是寫在這裡的字面量：symlink 換不掉是因為 HOME 那一層 root-owned
-        # （上面那一行），目標不新增可寫面是因為它在 `cache` 裡（`_minimize()` 會吃掉）。
+        # 三者的保護都不是寫在這裡的字面量：symlink 換不掉是因為 HOME 那一層 root-owned
+        # （上面那一行），sticky 樹換不掉也是同一個理由，而目標不新增可寫面是因為它在
+        # `cache` 裡（`_minimize()` 會吃掉）。
         for _asset_id, account, path, credential in self.credential_placements():
             if account not in job_accounts:
                 # 本方案沒有這個帳號（二分把 reviewer／planner 併進 `cortex-svc`），
@@ -2672,35 +3133,27 @@ class PathLayout:
                 continue
             if credential.shape is CredentialShape.IN_PLACE_FILE:
                 account_dirs.append((_parent_dir(path), root, g(root), 0o755))
-            else:
+            elif credential.shape is CredentialShape.HOME_REDIRECT_TREE:
                 account_dirs.append((
                     self.credential_target_of(account, credential),
                     account, g(account), 0o700,
                 ))
-        # 跑模型的 job 帳號還要一個 root-owned 的 `~/.codex`（hooks 不得被 job 替換）
-        # ——**但只有 codex 憑證是 `IN_PLACE_FILE` 的那些**。`HOME_REDIRECT_TREE` 的帳號
-        # 上 `~/.codex` 是一條 symlink，在這裡建出同名的真目錄會把整條導向 `cache` 的
-        # 機制無聲換掉（症狀是 codex 又回到「起不來」，而現場看起來一切正常）。
-        #
         # 表上查無的 job 帳號（二分的 `cortex-svc`）維持 #640 的既有形態不變：它沒有
         # 登記表憑證資產，但骨架那兩層 root-owned 目錄照舊——本票不改二分部署。
+        #
+        # **#698 之後表上有登記的帳號在這裡什麼都不做**：它們的 `~/.codex` 就是
+        # `HOME_STICKY_TREE` 那個登記表資產本身（見上一段的第三點）。
         for account in job_accounts:
             try:
-                prefix = self.credential_prefix_of(account)
-                primary = credential_for(prefix, PRIMARY_CREDENTIAL_EXECUTOR)
+                self.credential_prefix_of(account)
             except UnregisteredExecutorCredentialError:
                 account_dirs.append(
-                    (self.codex_hooks_dir_of(account), root, g(root), 0o755)
+                    (f"{self.home_of(account)}/.codex", root, g(root), 0o755)
                 )
                 account_dirs.append((
                     _parent_dir(f"{self.home_of(account)}/{self.executor_credential_relpath}"),
                     root, g(root), 0o755,
                 ))
-                continue
-            if primary.shape is CredentialShape.IN_PLACE_FILE:
-                account_dirs.append(
-                    (self.codex_hooks_dir_of(account), root, g(root), 0o755)
-                )
         # #666：**durable state owner 才需要** `~/.config/gh` 那兩層。`gh` 依序看
         # `$GH_CONFIG_DIR` → `$XDG_CONFIG_HOME/gh` → `$HOME/.config/gh`，而產生出來的
         # unit 只設 `HOME=` 與 `XDG_CACHE_HOME=`（**刻意不設 `XDG_CONFIG_HOME=`**），
@@ -2764,7 +3217,9 @@ class PathLayout:
         return (
             ExtraWritePath(
                 self.cache_of(account),
-                f"job 帳號 {account} 的 HOME 快取（git/gh/uv）；HOME 與 ~/.codex 皆 root-owned 不可替換。",
+                f"job 帳號 {account} 的 HOME 快取（git/gh/uv）；HOME 與 ~/.codex 兩層**目錄**"
+                "皆 root-owned 不可替換（#698 起 ~/.codex 另帶 sticky，裡面的 root-owned "
+                "hooks.json 因此 job 也動不了；樹本身的可寫面由登記表資產導出，不走本例外）。",
             ),
         )
 
@@ -2831,9 +3286,9 @@ def principal_needs_write(
 #: 一般規則把檔案資產折算成**父目錄**——因為要「建立／取代」一個檔，必須對父目錄可寫。
 #: 這一族刻意**不**具備建立／取代的能力：目錄維持 root-owned（`scaffold_directories`），
 #: job 只是把自己擁有的那一個檔就地改寫（`O_TRUNC` 覆寫，例如 token refresh）。因此
-#: `ReadWritePaths` 只掛在**檔案本身**，父目錄（同時放著 root-owned 的 `codex-hooks`）
-#: 連 mount 層都不開放可寫——「檔案 job-owned、目錄 root-owned」這條性質因此在
-#: **檔案系統**與 **systemd mount** 兩層同時成立，而不是只靠其中一層。
+#: `ReadWritePaths` 只掛在**檔案本身**，父目錄連 mount 層都不開放可寫——「檔案
+#: job-owned、目錄 root-owned」這條性質因此在**檔案系統**與 **systemd mount** 兩層
+#: 同時成立，而不是只靠其中一層。
 #:
 #: 代價（裁決刻意接受）：以「暫存檔 ＋ rename 原子替換」形式 refresh 的 CLI 會失敗，
 #: 因為那需要在同目錄建檔。診斷方式見 Phase 2b runbook 第 4e 步。
@@ -2842,6 +3297,20 @@ def principal_needs_write(
 #: :data:`CREDENTIALED_ACCOUNTS` 加一格 `IN_PLACE_FILE`，這裡自動跟著長；加一格
 #: `HOME_REDIRECT_TREE` 則**刻意不進**——那一族的 RWP 由 `cache` 涵蓋（見
 #: :class:`CredentialShape`），掛在 symlink 上只會讓 systemd 去 bind-mount 一條連結。
+#:
+#: **#698：憑證那一半目前導出為空集，而那是一個有結論的狀態、不是遺漏。** 兩個 job
+#: 帳號的 codex 都已改走 `HOME_STICKY_TREE`（整棵目錄進 RWP），因此本集合現在只剩
+#: `manager-gh-credential` 一項。`IN_PLACE_FILE` 這個形狀**刻意保留**：它仍是本集合
+#: 的語意來源，而且 `manager-gh-credential` 逐條同構——差別只在 Manager 那一份不在
+#: 憑證表上（它不是 executor 登入態）。
+#:
+#: **sticky 樹換到什麼、付出什麼**（誠實記錄，不要在別處被讀成「一樣安全」）：
+#: `IN_PLACE_FILE` 讓 `hooks.json` 同時被 **DAC** 與 **systemd mount** 兩層擋住；
+#: sticky 樹只剩 DAC 那一層（整棵樹必須進 RWP，codex 才起得來）。換到的是 codex
+#: **真的跑得起來**，以及 reviewer／planner 那一格「hooks 根本擋不住」的整個消失。
+#: DAC 那一層擋的是三個動詞（unlink／rename／改內容），三個都由 OS 強制，符合 spec
+#: §R2「不得依賴 mode 0400 作為唯一手段」——sticky 不是 mode 位的自我約束，它約束的
+#: 是**非 owner**。
 IN_PLACE_CONTENT_WRITE_ASSETS: frozenset[str] = frozenset({
     *credential_asset_ids(CredentialShape.IN_PLACE_FILE),
     # #666：Manager 的 gh token。與上一條同形，但**洩漏面不同級**，這點不得混談：
@@ -2907,7 +3376,7 @@ def inapplicable_home_anchored_assets(
 
     **本函式補的是 `ReadWritePaths` 那一半**：systemd 對不存在的 `ReadWritePaths=`
     目標會讓 unit **直接起不來**，因此「不適用」不能只在權限面成立。#642 當時的處置
-    是「乾脆不登記第二份憑證」（`builder-executor-credential` 的 note 有整段論證）；
+    是「乾脆不登記第二份憑證」（`builder-codex-state` 的 note 有整段論證）；
     #666 要登記 Manager 的 gh 憑證時同一個陷阱又出現一次，因此把「不適用」做成一條
     **可列舉的機械規則**，而不是每次都用「不要登記」繞過去。
 
@@ -2990,6 +3459,38 @@ def read_write_paths(
     wanted = set(required_write_targets(plan, layout, account, principals, retired).values())
     wanted |= {e.path for e in extras}
     return _minimize(wanted)
+
+
+def enforcement_read_only_paths(
+    layout: PathLayout,
+    account: str,
+    read_write: tuple[str, ...],
+) -> tuple[str, ...]:
+    """該帳號 unit 的 `ReadOnlyPaths=`：落在自己 RWP 之內的 enforcement 檔（#698）。
+
+    **為什麼需要這一條，而不是「sticky 就夠了」**：sticky 樹整棵必須進
+    `ReadWritePaths=`（codex 才起得來），而 `hooks.json` 就住在那棵樹裡——於是 mount 層
+    對它是可寫的，只剩 DAC（sticky ＋ 檔案 mode）擋著。#640 的 `IN_PLACE_FILE` 形態
+    在這一點上是**兩層**（`IN_PLACE_CONTENT_WRITE_ASSETS` 的整段說明就是這件事），
+    本形狀若不補這一條就是**淨退一層**。
+
+    systemd 依路徑長度排序套用這些 bind mount，因此巢狀在 `ReadWritePaths=` 之內的
+    `ReadOnlyPaths=` 會後套、覆蓋掉外層的可寫性。**沒有 `-` 前綴是刻意的**：目標不存在
+    時 unit 直接起不來，而那正是要的行為——`hooks.json` 缺席時 sticky 擋不住任何東西
+    （job 建得出新檔），一個「能植入 hooks 的 job」不該起得來。這與同一份 unit 對
+    `ReadWritePaths` 既有的 fail-closed 立場逐字一致。
+
+    只回傳**落在該帳號 RWP 之內**的那些：不在 RWP 內的 enforcement 檔本來就寫不到
+    （mount 層已唯讀），再掛一條只會多一個「目標不存在就起不來」的失敗面。
+    """
+    home = layout.home_of(account)
+    wanted = {
+        path
+        for _asset_id, acct, path, _cred in layout.enforcement_placements()
+        if acct == account and any(_is_within(path, rwp) for rwp in read_write)
+    }
+    # 防呆：路徑必須真的掛在該帳號 HOME 底下（換 scheme／改 layout 時不會靜默跑掉）。
+    return tuple(sorted(p for p in wanted if _is_within(p, home)))
 
 
 def read_write_path_owners(
@@ -3897,13 +4398,16 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
         note="全部 `needs_node` 的 toolchain 程式共用的系統層 runtime。",
     ),
     RunDependency(
-        "builder-executor-credential", DependencyKind.CREDENTIAL,
+        "builder-codex-state", DependencyKind.CREDENTIAL,
         (Principal.BUILDER,), (RunStage.MODEL_CALL,),
-        covered_by="builder-executor-credential",
+        covered_by="builder-codex-state",
         note=(
-            "**job 帳號**的 provider 憑證（#640 裁決 (b)）。洩漏面＝一次模型呼叫的額度"
-            "——job unit 另有 `Environment=GH_TOKEN=` 把 GitHub token 清空，成果一律走 "
-            "`commit-spool` 由 Manager 代理推送。**與 `manager-gh-credential` 不同級**。"
+            "**job 帳號**的 provider 憑證＋codex 狀態樹（#640 裁決 (b) → #698 方案 A）。"
+            "洩漏面＝一次模型呼叫的額度——job unit 另有 `Environment=GH_TOKEN=` 把 GitHub "
+            "token 清空，成果一律走 `commit-spool` 由 Manager 代理推送。**與 "
+            "`manager-gh-credential` 不同級**。\n"
+            "**#698 起形狀是 root-owned ＋ sticky 的整棵樹**（不再是單檔 `auth.json`）："
+            "#686 實測 codex 需要 `$CODEX_HOME` 整棵可寫，只放行單檔時它連起都起不來。"
         ),
     ),
     RunDependency(
@@ -3911,8 +4415,8 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
         (Principal.REVIEWER, Principal.PLANNER), (RunStage.MODEL_CALL, RunStage.REVIEW),
         covered_by="reviewer-planner-codex-state",
         note=(
-            "#685：planner／reviewer 帳號的 codex 登入態＋狀態樹（`~/.codex` → "
-            "`cache/codex` 的 root-owned symlink）。**不是一個 `auth.json`**——#686 實測 "
+            "#685／#698：planner／reviewer 帳號的 codex 登入態＋狀態樹（`~/.codex`，"
+            "root-owned ＋ sticky 的真目錄）。**不是一個 `auth.json`**——#686 實測 "
             "codex 需要 `$CODEX_HOME` 整棵可寫，只放行單檔時它連起都起不來。"
         ),
     ),
@@ -3938,14 +4442,25 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
         ),
     ),
     RunDependency(
-        "codex-hooks", DependencyKind.ACCOUNT_CONFIG,
+        "builder-codex-hooks", DependencyKind.ACCOUNT_CONFIG,
         (Principal.BUILDER,), (RunStage.MODEL_CALL,),
-        covered_by="codex-hooks",
+        covered_by="builder-codex-hooks",
         note=(
             "enforcement plane：root-owned，job 不得替換自己的 hooks（#623）。"
-            "**只有 builder 這一份**：reviewer／planner 帳號的 `~/.codex` 是導進 `cache` "
-            "的 symlink（#685），hooks 落在那棵 job-owned 的樹裡就擋不住替換——那一格"
-            "仍在 `deferred_run_dependencies()`，升為 U-9 交 operator 裁決。"
+            "#698 起它住在 root-owned ＋ sticky 的 `~/.codex` 裡——那棵樹整個可寫"
+            "（codex 才起得來），但這個檔 job 刪不掉、改不掉名字、也改不了內容。"
+        ),
+    ),
+    RunDependency(
+        "reviewer-planner-codex-hooks", DependencyKind.ACCOUNT_CONFIG,
+        (Principal.REVIEWER, Principal.PLANNER), (RunStage.MODEL_CALL, RunStage.REVIEW),
+        covered_by="reviewer-planner-codex-hooks",
+        note=(
+            "#698：這一份在 #685～#697 之間是 `deferred_run_dependencies()` 的 **U-9**"
+            "——「codex 要整棵可寫」與「樹裡放得住 root-owned 檔」在當時的形狀下互斥，"
+            "而 0818 的 R9 T3.9 實測證明不做的代價是**該帳號能植入 hooks.json** ⇒ 跨 job "
+            "持久化。方案 A（sticky）讓兩件事同時成立，本項因此從 deferred 升為登記表資產。"
+            "**它與 builder 那一份由同一條規則長出來**（`enforcement_placements()`）。"
         ),
     ),
     RunDependency(
@@ -4159,7 +4674,8 @@ class DeferredDependency:
 #: 輸出裡，測試釘住目前的內容，補上或悄悄拿掉都會讓測試變紅。
 #:
 #: 四項的共同形態是「**per-account 的機制已經就緒，但登記表只登記了其中一份**」——
-#: 與 #640 對 `builder-executor-credential` 的處置逐條同構（那一條的 note 有完整
+#: 與 #640 對 `builder-codex-state`（當時叫 `builder-executor-credential`）的處置逐條
+#: 同構（那一條的 note 有完整
 #: 論證），差別只在那時候 M2 還沒落地、現在落地了。
 _DEFERRED_RUN_DEPENDENCIES: tuple[DeferredDependency, ...] = (
     DeferredDependency(
@@ -4178,40 +4694,22 @@ _DEFERRED_RUN_DEPENDENCIES: tuple[DeferredDependency, ...] = (
         ),
         disposition="等第一個需要 git 的 gate 宣告出現時再補，或 operator 主動裁決。",
     ),
-    DeferredDependency(
-        "reviewer-planner-codex-hooks", DependencyKind.ACCOUNT_CONFIG,
-        (Principal.REVIEWER, Principal.PLANNER),
-        reason=(
-            "**#685 換掉了本項的理由，因為原本那個已經被推翻。** 原文寫的是「機制 "
-            "per-account，登記表只登記一份，補第二列即可」——#686 的實測讓「補第二列」"
-            "在這一格**做不到**：codex 需要 `$CODEX_HOME` 整個目錄可寫，因此 "
-            "`cortex-reviewer-planner` 的 `~/.codex` 已改成導進 `cache` 的 root-owned "
-            "symlink（登記表資產 `reviewer-planner-codex-state`），而那棵樹由 **job 帳號"
-            "擁有**。hooks 若放進去，job 對它的父目錄有寫入權 ⇒ 隨時 unlink／rename 換掉"
-            "⇒ 登記成 root-owned 的 Tier-0 enforcement 資產是**名義上的**，不是真的。\n"
-            "**兩件事在 `$CODEX_HOME` 這一層互斥**：(i) codex 起得來（整棵可寫）、"
-            "(ii) 同棵樹裡有一個 job 換不掉的 root-owned `hooks.json`。本票選 (i)——"
-            "選 (ii) 的部署裡 codex 根本跑不起來，hooks 也就沒有東西可以約束。"
-        ),
-        symptom=(
-            "reviewer／planner 以 `codex` 為 executor 時拿不到 root-owned hooks"
-            "（enforcement plane 少一層），且該帳號可自行放一份自己的 hooks.json 在 "
-            "`cache/codex/` 底下並持久化。**攻擊價值有界**：hooks 命令跑的身分就是它"
-            "自己、影響的也只有它自己後續的 codex 呼叫；跨帳號與跨 job 的面不受影響"
-            "（`~/.codex` 那條 symlink 在 root-owned 的 HOME 裡，換不掉）。"
-        ),
-        disposition=(
-            "**U-9（本票新提，交 operator）**：要 hooks enforcement 就必須讓 "
-            "`$CODEX_HOME` 同時「整棵可寫」與「裡面放得住 root-owned 檔」。已知的候選是"
-            "**root-owned ＋ sticky bit ＋ 給 job 帳號一條 `rwx` ACL** 的目錄（sticky 讓"
-            "非 owner 只能刪自己的檔 ⇒ root-owned 的 hooks.json 換不掉）。**本票不做，"
-            "兩個理由**：(i) 它要改 permgen 的 mode 管線——安全網 `_mask_write` 會拿掉 "
-            "group 寫入位、`mode & 0o700` 會吃掉 sticky 位，那是 spec §R2 的既有不變式；"
-            "(ii) 「codex 能不能在一個它**不擁有**的 `$CODEX_HOME` 下跑起來」**沒有實機"
-            "證據**，而 #686 量到的是「指到一個可寫目錄」。依 D13，未經落檔 unit 全量"
-            "導出的實測不得宣稱可用。"
-        ),
-    ),
+    # **U-9（`reviewer-planner-codex-hooks`）已於 #698 結案，因此本項消失。**
+    #
+    # 它從 #685 起掛在這裡，理由是「(i) codex 起得來（$CODEX_HOME 整棵可寫）與 (ii) 同棵
+    # 樹裡有一個 job 換不掉的 root-owned `hooks.json` **互斥**」，並記下兩個不做的理由：
+    # 要改 permgen 的 mode 管線（`_mask_write`／`mode & 0o700` 會吃掉 sticky），以及
+    # 「codex 能不能在一個它**不擁有**的 `$CODEX_HOME` 下跑起來」沒有實機證據。
+    #
+    # #698 把兩個理由都消掉了：
+    #   - mode 管線已能表達 sticky（`build_entry()` 尾端的安全網改成
+    #     `& (STICKY_BIT | 0o700)`，§R2 的 group／other 不可寫一行未放寬）；
+    #   - 「不擁有的 `$CODEX_HOME`」已在**完整模板 unit 加固面**下實測（runbook 第
+    #     4e-2b 步的 planning 探針矩陣，兩個帳號各一輪，逐格記路徑與版本字串）。
+    #
+    # 於是 (i) 與 (ii) 不再互斥，兩份 hooks 都成為登記表資產（`*-codex-hooks`），
+    # 由 `enforcement_placements()` 從**同一條規則**長出來——這正是「deferred 該怎麼
+    # 結案」的形態：不是刪一列，是那一列描述的張力真的不存在了。
     # #687（#672 票 F）：`manager-claude-credential` 已移除。
     #
     # 它從來不是「還沒補的憑證」，而是「Manager 在 direct 模式下自己 exec `claude`」
@@ -4399,6 +4897,8 @@ class SystemdUnit:
     content: str
     #: 生效的加固剖面 id（#643）。Manager／monitor unit 恆為 `strict`。
     hardening_profile: str = DEFAULT_HARDENING_PROFILE.profile_id
+    #: 巢狀在 `read_write_paths` 之內、被重新收回唯讀的路徑（#698 的 enforcement 檔）。
+    read_only_paths: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -4408,6 +4908,7 @@ class SystemdUnit:
             "exec_start": self.exec_start,
             "environment_file": self.environment_file,
             "read_write_paths": list(self.read_write_paths),
+            "read_only_paths": list(self.read_only_paths),
             "hardening_profile": self.hardening_profile,
             "content": self.content,
         }
@@ -4467,7 +4968,10 @@ def _hardening_lines(
     return lines
 
 
-def _rwp_lines(owners: Mapping[str, tuple[str, ...]]) -> list[str]:
+def _rwp_lines(
+    owners: Mapping[str, tuple[str, ...]],
+    read_only: tuple[str, ...] = (),
+) -> list[str]:
     lines = [
         "# --- ReadWritePaths：由 R1 登記表機械導出（permgen），勿手擴 ---",
         "# 每條後面列出它涵蓋的登記表資產；新增 durable state 時改登記表、重跑產生器。",
@@ -4475,6 +4979,19 @@ def _rwp_lines(owners: Mapping[str, tuple[str, ...]]) -> list[str]:
     for path, covered in owners.items():
         lines.append(f"#   涵蓋：{', '.join(covered) if covered else '（無）'}")
         lines.append(f"ReadWritePaths={path}")
+    if read_only:
+        lines += [
+            "",
+            "# --- ReadOnlyPaths：巢狀在上面某條 RWP **之內**、被收回唯讀的 enforcement 檔 ---",
+            "# （#698）codex 的 $CODEX_HOME 整棵必須可寫（executor 才起得來），但樹裡的",
+            "# root-owned hooks.json 不該連 mount 層都是可寫的。systemd 依路徑排序套用這些",
+            "# bind mount，巢狀的唯讀條目後套 ⇒ 覆蓋外層的可寫性。",
+            "# **刻意沒有 `-` 前綴**：目標不存在時本 unit 直接起不來——那正是要的行為，",
+            "# 因為 sticky bit 不管「建一個還不存在的檔」，hooks.json 缺席時 job 植得進去，",
+            "# 而一個植得進 hooks 的 job 不該起得來（與上方 RWP 的 fail-closed 立場一致）。",
+        ]
+        for path in read_only:
+            lines.append(f"ReadOnlyPaths={path}")
     return lines
 
 
@@ -4715,6 +5232,26 @@ def _job_unit_credential_lines(job_layout: "PathLayout", account: str) -> list[s
                 "#     ⚠️ #686 實測：codex 需要 $CODEX_HOME **整棵**可寫，因此這個形狀下的",
                 "#     codex 在本 unit 內**起不來**（見 runbook 4e-3、deferred 的 U-9）。",
             ]
+        elif credential.shape is CredentialShape.HOME_STICKY_TREE:
+            hooks = f"{path}/{credential.enforcement_leaf}"
+            lines += [
+                f"#   [{credential.executor}] {path}（root-owned ＋ sticky，#698 方案 A）",
+                "#     可寫狀態樹：目錄由 **root** 擁有、帶 sticky bit（`chmod +t`），本",
+                "#     帳號以一條具名 **access** ACL（`u:<本帳號>:rwx`）取得整棵的寫入權。",
+                "#     ⇒ executor 起得來（#686：$CODEX_HOME 唯讀時 codex 連 in-process",
+                "#       app-server 都初始化不了），而且——",
+                f"#     ⇒ {hooks}（root:root 0644）本帳號**動不了**：",
+                "#       unlink／rename 被 sticky 擋（非 owner 只動得了自己的檔）、改內容",
+                "#       被它自己的 mode 擋（本帳號落在 `other` 位）。",
+                "#     0818 的 R9 T3.9 就是在**沒有**這兩層時被實測攻破的（#698）——codex",
+                "#     hooks 會執行命令 ⇒ 那是跨 job 持久化，不只是少一層防護。",
+                "#     ⚠️ group 寫入權仍然是零（spec §R2 未放寬）；`ls -ld` 顯示的 group 位",
+                "#       是 POSIX ACL 的 **mask**，驗證一律用 `getfacl`。",
+                "#     ⚠️ 那個 hooks 檔**必須先存在**——sticky 不管「建一個還不存在的檔」。",
+                "#       缺它時 R9 T3.9 會以「建得出新檔」翻紅（正確的紅字）。",
+                "#     代價（R-6）：樹裡的 **token 葉檔**仍由本帳號擁有、仍可被它刪除或",
+                "#     替換。那是刻意的——token 過期必須 refresh 得回來。",
+            ]
         else:
             target = job_layout.credential_target_of(account, credential)
             leaf = credential.token_leaf or "（無單一 token 葉檔）"
@@ -4935,7 +5472,8 @@ def build_job_unit(
     ]
     body += _hardening_lines(profile)
     body += [""]
-    body += _rwp_lines(owners)
+    read_only = enforcement_read_only_paths(job_layout, account, tuple(owners.keys()))
+    body += _rwp_lines(owners, read_only)
     body += [
         "",
         "# job 為一次性，不自動重啟（`CollectMode` 在上方 [Unit] 段）。",
@@ -4954,6 +5492,7 @@ def build_job_unit(
         exec_start=f"{job_layout.job_shim} %i",
         environment_file=None,
         read_write_paths=tuple(owners.keys()),
+        read_only_paths=read_only,
         content="\n".join(body) + "\n",
         hardening_profile=profile.profile_id,
     )
@@ -5072,7 +5611,7 @@ ACCOUNT_GITCONFIG_FLAGS: Mapping[Principal, str] = {
 }
 
 #: `.gitconfig` 的 mode。**0644 而非 0600**：檔案 root 擁有、讀取的帳號要讀得到，
-#: 與 `codex-hooks`（同樣 root-owned、同樣落在帳號 HOME 下）逐位元相同。
+#: 與 `*-codex-hooks`（同樣 root-owned、同樣落在帳號 HOME 下）逐位元相同。
 ACCOUNT_GITCONFIG_MODE = 0o644
 
 
@@ -5155,7 +5694,7 @@ def build_account_gitconfig(
         fatal: detected dubious ownership in repository at '<來源樹>/<slug>'
 
     唯一的解是 `safe.directory`，而它**必須由 root 放進該帳號的 HOME**——那些 HOME
-    都是 root-owned，帳號自己放不了這個檔。這正是登記表既有的 `codex-hooks`
+    都是 root-owned，帳號自己放不了這個檔。這正是登記表既有的 `*-codex-hooks`
     （root-owned、在帳號 HOME 下）同一個模式，不需要新概念。
 
     ## 為什麼每個 repo 是**兩條**值

@@ -62,7 +62,13 @@ def test_every_entry_fully_populated(scheme) -> None:
     for e in plan.entries:
         assert e.owner, e.asset_id
         assert e.group, e.asset_id
-        assert 0 <= e.mode <= 0o777, e.asset_id
+        # #698：mode 可帶 sticky（0o1000），但**永遠**不得帶 setuid／setgid。
+        assert 0 <= e.mode <= 0o1777, e.asset_id
+        assert not (e.mode & 0o6000), (e.asset_id, e.mode_str)  # setuid/setgid
+        # sticky 只出現在那一族，且必然是目錄——別處長出一位 sticky 一定是 bug。
+        if e.mode & permgen.STICKY_BIT:
+            assert e.asset_id in permgen.STICKY_JOB_WRITABLE_DIR_ASSETS, e.asset_id
+            assert e.is_directory, e.asset_id
         assert e.owner_class in OwnerClass, e.asset_id
         assert e.writer_accounts, e.asset_id  # 至少 owner 可寫
         assert e.rationale, e.asset_id
@@ -74,13 +80,67 @@ def test_every_entry_fully_populated(scheme) -> None:
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
 def test_builder_never_writes_manager_owned_or_deployment(scheme) -> None:
-    """spec §R2：builder 對 Manager-owned／deployment 樹零寫入（兩 scheme 皆然）。"""
+    """spec §R2：builder 對 Manager-owned／deployment 樹零寫入（兩 scheme 皆然）。
+
+    **#698 起 `OwnerClass.STICKY_SHARED` 不在這條的涵蓋範圍內，而那是刻意的**：
+    sticky 樹（`~/.codex`）由 root 擁有、但 job **必須**寫得進去（否則 codex 起不來）。
+    它之所以不塞進 `DEPLOYMENT`，正是為了讓本測試維持「機械成立、零例外清單」。
+    真正要守的那一半改由下一個測試釘住：樹**裡面**那個 root-owned 的 enforcement 檔，
+    builder 一個位元都不能寫。
+    """
     builder = scheme.resolve(Principal.BUILDER)
     plan = _plan(scheme)
     for e in plan.entries:
         if e.owner_class in (OwnerClass.MANAGER_STATE, OwnerClass.DEPLOYMENT):
             writable = plan.all_writable_accounts(e)
             assert builder not in writable, (scheme.scheme_id, e.asset_id, sorted(writable))
+
+
+@pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
+def test_enforcement_leaves_are_never_writable_by_any_job_account(scheme) -> None:
+    """#698：sticky 樹裡那個 root-owned 的 enforcement 檔，**任何** job 帳號零寫入。
+
+    這是 sticky 樹換到的東西本身。0818 的 R9 T3.9 攻破的就是這一條——當時
+    `cortex-reviewer-planner` 的 `~/.codex` 整棵 job-owned，`hooks.json` 想放也放不住。
+    codex hooks 會執行命令 ⇒ 那不是「少一層防護」，是跨 job 持久化。
+    """
+    plan = _plan(scheme)
+    job_accounts = {
+        a for a in (scheme.resolve(p) for p in permgen.UNTRUSTED_EXECUTION_PRINCIPALS)
+        if a is not None
+    }
+    assert permgen.ENFORCEMENT_LEAF_ASSETS, "enforcement 檔一族不得為空"
+    for asset_id in permgen.ENFORCEMENT_LEAF_ASSETS:
+        e = plan.by_id(asset_id)
+        assert e.owner_class is OwnerClass.DEPLOYMENT, asset_id
+        assert e.owner == scheme.deploy_account, asset_id
+        writable = plan.all_writable_accounts(e)
+        assert not (writable & job_accounts), (scheme.scheme_id, asset_id, sorted(writable))
+        assert not e.acls, (asset_id, e.acls)  # 零跨帳號授權
+
+
+@pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
+def test_sticky_trees_are_root_owned_with_named_acls_and_no_default_acl(scheme) -> None:
+    """#698 方案 A 的三個條件，逐條釘住（少任何一條，整個裁決就是空的）。"""
+    plan = _plan(scheme)
+    for asset_id in permgen.STICKY_JOB_WRITABLE_DIR_ASSETS:
+        try:
+            e = plan.by_id(asset_id)
+        except KeyError:  # 本方案沒有這個帳號
+            continue
+        # (1) owner 必須是 root：目錄 owner 對 sticky 免疫。
+        assert e.owner == scheme.deploy_account, asset_id
+        # (2) sticky bit 必須留在 mode 裡（安全網一度會吃掉它，那是本票修的東西）。
+        assert e.sticky, (asset_id, e.mode_str)
+        assert e.mode_str == "1755", (asset_id, e.mode_str)
+        # (3) 具名 access ACL、**且沒有 default ACL**——default 會讓 root 日後放進去的
+        #     enforcement 檔自動帶上 job 的 rwx，等於把整個形狀交還回去。
+        assert e.acls, asset_id
+        for acl in e.acls:
+            assert acl.perms == "rwx", (asset_id, acl)
+            assert acl.default is False, (asset_id, acl)
+        rendered = "\n".join(e.commands(f"/tmp/{asset_id}"))
+        assert "setfacl -d" not in rendered, rendered
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=lambda s: s.scheme_id)
@@ -237,12 +297,35 @@ def test_commands_are_strings_only_and_never_execute(scheme) -> None:
     字串——絕不執行任何 root 操作。"""
     plan = _plan(_resolved(scheme))
     lines = permgen.plan_to_commands(plan)
-    allowed = ("install -d ", "chown ", "chmod ", "setfacl ", "[ ! -e ")
+    # #698 擴了三個動詞，逐條有理由——這張清單就是「這份 script 會做什麼」的全部：
+    #   `[ ! -L `：sticky 樹與它的 enforcement 檔都住在 **job 可寫**的位置，root 對
+    #             它們動手之前必須先確認不是 symlink（job 預埋一條懸空 symlink，
+    #             root 的 `cat >`／`chown` 就會跟著它跑到別處去）。
+    #   `[ -e `  ：enforcement 檔的 create-if-absent 守衛（**不是**「不存在就跳過」）。
+    #   `cat > ` ：把最小內容種進 enforcement 檔。它是唯一會寫入內容的動詞，目標永遠
+    #             是登記表上的 enforcement 路徑，內容是常數。
+    allowed = (
+        "install -d ", "chown ", "chmod ", "setfacl ",
+        "[ ! -e ", "[ ! -L ", "[ -e ",
+    )
+    heredoc_end = None
     for line in lines:
         stripped = line.strip()
+        if heredoc_end is not None:
+            # heredoc 內容區：逐字就是 `CODEX_HOOKS_SEED_CONTENT`，不是命令。
+            if stripped == heredoc_end:
+                heredoc_end = None
+            continue
         if not stripped or stripped.startswith("#"):
             continue
+        if "<<'" in stripped:
+            assert stripped.startswith("[ -e ") and "cat > " in stripped, stripped
+            heredoc_end = stripped.split("<<'", 1)[1].rstrip("'")
+            continue
         assert stripped.startswith(allowed), stripped
+    assert heredoc_end is None, "heredoc 沒有收尾——產出的 script 會吃掉後面所有命令"
+    seeded = "\n".join(lines)
+    assert permgen.CODEX_HOOKS_SEED_CONTENT.splitlines()[0] in seeded
     # 每個資產都要在命令輸出裡出現（以 placeholder 或註解形式）。
     joined = "\n".join(lines)
     for a in ASSET_REGISTRY:

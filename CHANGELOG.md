@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#698：`cortex-reviewer-planner` 可植入 codex hooks（R9 T3.9 實測攻破）已修——採 operator 裁決的方案 A：`$CODEX_HOME` 改成 root-owned ＋ **sticky bit** 的真目錄，job 以具名 access ACL 取得整棵寫入權，樹裡放一個 root-owned 的 `hooks.json`（unlink／rename 由 sticky 擋、改內容由檔案 mode 擋、mount 層另有巢狀 `ReadOnlyPaths=`）。permgen 的 §R2 安全網改為讓 sticky 通過（group／other 不可寫一行未放寬，setuid／setgid 改為明文清除），新增 `OwnerClass.STICKY_SHARED`。**兩個帳號的形狀由 `EXECUTOR_ENFORCEMENT_LEAVES` 一條規則導出並在 import 當下強制**，builder 一併遷移（它舊形態下 codex 在降權 unit 內根本起不來）。U-9 因此關閉、`reviewer-planner-codex-hooks` 從 deferred 升為登記表資產。實測：T3.9 兩個 subject 皆 `denied (OK)`，且 builder 的 `codex exec` 從 `Read-only file system` 翻成 `turn.completed`（#698）。
 - planning 的模型輸出驗證失敗改為**逐欄可診斷**：question-pack 的六種以上失敗不再塌縮成同一句話（改報「第一個差異的索引／欄位／expected／got」與列數），secondary evidence／primary integration／plan frontmatter／required headings 的同型塌縮一併掃過；三個 adapter 共用的 `_invoke_json` 於 rc≠0 時沿用 #674 的 `stdout_excerpt()` 保存模型輸出（只讀 stdout、不讀 stderr）；差異文字經產生端遮罩，模型無法偽裝成分類標記（#701）。
 - R9 的 T1.3 斷言改為驗「operator CLI 做得到事」而非「binary 跑得起來」（兩個 subject 同時假失敗）；runbook 記錄 0818 兩 subject 實測結果並標明 T3.9 對 reviewer-planner 為已知追蹤項（#698）（#699）。
 - runbook 的「M2′ 之後仍未涵蓋的」清單更正兩條陳舊項（gate 執行身分 #629 已完成、reviewer 憑證 refresh 已由 #685 解決），並加上「not-covered 清單本身也是宣稱」的約束（#696）。

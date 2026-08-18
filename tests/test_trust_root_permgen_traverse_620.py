@@ -380,8 +380,23 @@ def test_traverse_section_comes_after_every_chmod(scheme) -> None:
 def test_traverse_commands_are_strings_only(scheme) -> None:
     """維持 permgen 的非執行不變式：本節仍只有 setfacl 字串。"""
     lines = _commands(scheme)
+    # #698：允許動詞與 `test_commands_are_strings_only_and_never_execute` 同一張清單
+    # （sticky 樹的 symlink 守衛 ＋ enforcement 檔的 create-if-absent）。
+    allowed = (
+        "install -d ", "chown ", "chmod ", "setfacl ",
+        "[ ! -e ", "[ ! -L ", "[ -e ",
+    )
+    heredoc_end = None
     for line in _executable(lines):
-        assert line.startswith(("install -d ", "chown ", "chmod ", "setfacl ", "[ ! -e "))
+        if heredoc_end is not None:
+            if line.strip() == heredoc_end:
+                heredoc_end = None
+            continue
+        if "<<'" in line:
+            heredoc_end = line.split("<<'", 1)[1].rstrip("'")
+            continue
+        assert line.startswith(allowed), line
+    assert heredoc_end is None
     assert not any("<PATH:" in ln for ln in _executable(lines))
 
 

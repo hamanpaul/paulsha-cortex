@@ -507,57 +507,98 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "寫入——因此本資產機械地不會出現在任何 unit 的 `ReadWritePaths` 上。"
         ),
     ),
+    # ---- 兩個 job 帳號的 codex 狀態樹（#698：形狀由同一條規則導出）----
+    #
+    # **這兩項在 #698 之前是兩種形狀**：`builder-executor-credential`（`IN_PLACE_FILE`，
+    # 單檔 `~/.codex/auth.json`）與 `reviewer-planner-codex-state`
+    # （`HOME_REDIRECT_TREE`，導進 job-owned `cache/codex` 的 symlink）。0818 的 R9 實測
+    # 證明那個差異是一個**尚未爆的洞**而不是設計，兩邊各壞一半：
+    #
+    #   - `IN_PLACE_FILE` 那一半：hooks 守得住，但 codex 在降權 unit 下**起不來**
+    #     （#686：`$CODEX_HOME` 唯讀時連 in-process app-server 都初始化不了）。
+    #   - `HOME_REDIRECT_TREE` 那一半：codex 起得來，但整棵樹 job-owned ⇒ 該帳號
+    #     **成功植入 `hooks.json`**（T3.9 `!! SUCCEEDED`）。codex hooks 會執行命令 ⇒
+    #     跨 job 持久化 ⇒ 四分隔離「每個 job 一次性」的前提在該帳號上不成立，而它正是
+    #     吃 untrusted issue 內容的那個帳號。
+    #
+    # operator 裁決（#698，方案 A）＝ `CredentialShape.HOME_STICKY_TREE`：**root-owned
+    # ＋ sticky bit ＋ job 一條 `rwx` access ACL 的真目錄**，裡面住著 root-owned 的
+    # `<前綴>-codex-hooks`。整棵可寫 ⇒ codex 起得來；sticky ⇒ job 刪不掉／改不掉名字別人
+    # 的檔，而 hooks 的 mode 讓它連內容都改不了。
+    #
+    # **兩個帳號共用同一列憑證表**（`permgen.EXECUTOR_CREDENTIALS` 的 codex 那一列），
+    # 因此形狀不可能只改一格——`_assert_shape_follows_enforcement_rule()` 在 import 當下
+    # 強制 `EXECUTOR_ENFORCEMENT_LEAVES` 那條規則。
+    #
+    # **writers 含 INSTALLER 是刻意的**（與 #640 的 `IN_PLACE_FILE` 相反）：owner 必須是
+    # root，否則 sticky 什麼也擋不住（目錄 owner 本來就刪得掉裡面任何檔）。job 的寫入權
+    # 改由 `build_entry()` 依 `UNTRUSTED_EXECUTION_PRINCIPALS` 產生具名 ACL——它**也**在
+    # writers 裡，因此 `required_write_targets()` 仍然機械地把這棵樹放進該帳號的 RWP。
+    #
+    # **R-6 不變**：樹裡的 **token 葉檔**（`auth.json`）仍由 job 擁有、仍可被它刪除或
+    # 替換。那是必要的（token 過期要 refresh 得回來），sticky 保護的是 root 擁有的那些檔。
     TrustRootAsset(
-        "builder-executor-credential", _T0, _JV, None,
-        (Principal.BUILDER,), (Principal.BUILDER,),
-        IngressKind.DIRECT_FILE_WRITE,
+        "builder-codex-state", _T0, _JV, None,
+        (Principal.INSTALLER, Principal.BUILDER), (Principal.BUILDER,),
+        IngressKind.DEPLOYMENT_WRITE,
         derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
         note=(
-            "builder 帳號 HOME 下那份 executor 憑證（預設 `~/.codex/auth.json`，"
-            "＝本部署 `PSC_MANAGER_EXECUTOR` 的那一個；落點由 "
-            "`PathLayout.executor_credential_relpath` 這個**部署決定**導出）。\n"
-            "**0817 裁決 (b)：檔案由 job 帳號擁有（0600），放它的目錄維持 root-owned**"
-            "（`<HOME>/.codex` 已是既有的 root-owned 骨架目錄，`codex-hooks` 就住在裡面）。"
-            "淨效果——job **能就地改寫自己那份憑證的內容**（token 過期可自行 refresh），"
-            "但在該目錄**建不了新檔、刪不掉、也換不掉同目錄下的其他 root-owned 檔**"
-            "（例如 `codex-hooks`）：建立／unlink／rename 需要的是**目錄**的寫入權，"
-            "而目錄是 `root 0755`，job 落在 `other` 位（`r-x`）。\n"
-            "**已知限制**：因此「以暫存檔 ＋ rename 原子替換」形式做 refresh 的 CLI 會"
-            "失敗（它需要在同目錄建檔）；只有就地 `O_TRUNC` 覆寫的 refresh 走得通。"
-            "這是裁決 (b) 刻意接受的代價，不是漏掉的情況。\n"
-            "**為何 writer 不含部署身分**：root 當然放得進去（安裝時就是 root 放的），"
-            "但 `writers` 描述的是**執行期**的合法 mutator——寫成 INSTALLER 會讓機械分類"
-            "落到 `owner_class=DEPLOYMENT`（owner＝root），憑證就 refresh 不了，與裁決"
-            "相反。\n"
+            "builder 帳號的 `$CODEX_HOME` 整棵（`~/.codex`，落點由 "
+            "`PathLayout.executor_credential_relpath` 這個**部署決定**的 head 導出；"
+            "token 葉檔是它的 tail，預設 `auth.json`）。\n"
+            "**#698 起與 `reviewer-planner-codex-state` 逐字同形**。在此之前它是 #640 "
+            "裁決 (b) 的 `IN_PLACE_FILE`（資產 id `builder-executor-credential`），"
+            "而那個形態的代價是**降權 unit 下的 codex 起不來**——#685 把它記成「已知並"
+            "記錄的代價」，#698 的裁決把它連同 reviewer-planner 那半邊一起收掉。\n"
             "**這買到的是什麼、不是什麼**：把 operator 的憑證複製給 job 帳號，代表 job "
-            "用的是**同一個 provider 帳號**。三分買到的是**檔案系統層**的隔離（job 偷不到"
+            "用的是**同一個 provider 帳號**。四分買到的是**檔案系統層**的隔離（job 偷不到"
             "Manager 的 token、改不了 Manager 的 state），**不是** provider 層的獨立——與 "
             "`model-identity-overlay` 的 `independence_domain` 想表達的不是同一件事。"
             "真正的 provider 層獨立需要每個 job 帳號各自的 provider 帳號，屬未來選項"
             "（spec §R1 有完整說明）。\n"
-            "**為何只登記 builder 這一份**（與 `codex-hooks` 逐條同構，不是遺漏）："
-            "登記表資產是 1:1 綁到一條絕對路徑的，而路徑要由帳號名推導；`cortex-builder` "
-            "是**兩個 scheme 都相同**的唯一 job 帳號，也是目前唯一真的以模板 unit 降權"
-            "起 job 的 persona。reviewer／planner 在二分下與 Manager 併帳"
-            "（`cortex-svc`），登記第二份會讓 Manager unit 的 `ReadWritePaths` 出現一條"
-            "**二分部署裡根本不存在**的 HOME 路徑——systemd 對不存在的 `ReadWritePaths` "
-            "目標直接讓 unit 起不來，等於用一個 M2 才需要的資產弄壞一個現存的部署形態。\n"
-            "**#685 更正「補第二列即可」這句話**（原文寫於 #640，前提已被 #686 的實測"
-            "推翻）：reviewer／planner 那一份**不能**照抄本形態。#686 在完整 reviewer "
-            "unit 沙箱下實測，codex 需要 `$CODEX_HOME`（預設 `~/.codex`）**整個目錄**可寫"
-            "——只放行 `auth.json` 一個檔時它連起都起不來（`failed to initialize in-process "
-            "app-server client: Read-only file system`），且症狀與 cwd 無關。因此那個帳號"
-            "改走 `reviewer-planner-codex-state`（`CredentialShape.HOME_REDIRECT_TREE`）。\n"
-            "**builder 維持本形態不動**：這份部署已存在、runbook 第 4e-2 步有「建不了新檔／"
-            "刪不掉／換不掉」的反向驗證，而改它會同時賣掉 `codex-hooks` 的 enforcement"
-            "（同目錄下的 root-owned 檔擋不住一個擁有該目錄的 job）——那是 operator 的"
-            "裁決（U-9），不是本票能順手做的事。**代價已知並記錄**：builder 在模板 unit 下"
-            "跑 codex 會撞到與 #686 同一條 `$CODEX_HOME` 唯讀阻斷，見 `deferred` 與 runbook。"
+            "**#640 的「以暫存檔 ＋ rename 原子替換的 refresh 走不通」這條限制隨形狀消失**"
+            "：sticky 樹裡 job 建得了自己的檔，也 rename 得動自己的檔。它擋不住的是"
+            "**別人的**檔——那正是要擋的那一個。"
+        ),
+    ),
+    TrustRootAsset(
+        "reviewer-planner-codex-state", _T0, _JV, None,
+        (Principal.INSTALLER, Principal.REVIEWER, Principal.PLANNER),
+        (Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
+        note=(
+            "reviewer／planner 帳號的 `$CODEX_HOME` 整棵（`~/.codex`），token 葉檔是它"
+            "底下的 `auth.json`。與 `builder-codex-state` **逐字同形**（#698）。\n"
+            "**為何是整棵而不是一個檔**（#686 實測，design 未預期）：唯讀時 codex 回 "
+            "`Error: failed to initialize in-process app-server client: Read-only file "
+            "system (os error 30)`；把 cwd 換成可寫的 `/tmp` **症狀完全相同**，維持唯讀 "
+            "cwd 只把 `CODEX_HOME` 指到可寫目錄則 **rc=0、輸出正確**。阻斷點是 "
+            "`CODEX_HOME`，不是 cwd。它在底下建 `state_5.sqlite`／`logs_2.sqlite`／"
+            "`queue_1.sqlite`／`memories_1.sqlite`／`sessions/`／`skills/`／`plugins/`／"
+            "`thread-writer-locks/`／`models_cache.json`／`installation_id`。\n"
+            "**#685→#698 的形狀變更**：#685 把它做成導進 `cache/codex` 的 root-owned "
+            "symlink。那個形狀讓 codex 起得來，代價是整棵樹 job-owned ⇒ 該帳號 0818 "
+            "**實測植入了 `hooks.json`**（R9 T3.9）。sticky 樹保住前者、收掉後者。\n"
+            "**為何不用 `CODEX_HOME=` 這個環境變數**：env 覆寫要經 "
+            "`job_runner.build_job_env()` 的白名單，那是第二條要維護的放行面；讓 "
+            "executor 的**預設**路徑解析就落在對的地方，job 側零改動。\n"
+            "**這一格的 RWP 不再被 `cache` 那一條吃掉**（#685 時會）：樹搬出 `cache`、"
+            "成為 HOME 底下的真目錄，因此 reviewer 模板 unit 多一條 `ReadWritePaths=`。"
+            "**可寫面沒有變大**——同一棵 codex 狀態樹換了位置，`cache` 那一條原本就涵蓋"
+            "它；換到的是「這棵樹的目錄由 root 擁有」，也就是 hooks 守得住的前提。"
         ),
     ),
     # ---- reviewer／planner 帳號的三份登入態（#685／#672 票 D；U-4 追認雙 domain）----
     #
-    # 三項同形，因此共用這一段說明，各自的 note 只寫「這個 executor 特有的部分」。
+    # ---- reviewer／planner 帳號的登入態（#685／#672 票 D；U-4 追認雙 domain）----
+    #
+    # **#698 起這一段只涵蓋 agy 與 claude 兩項**：同帳號的 codex 已改走
+    # `HOME_STICKY_TREE`（見上方那一對 `*-codex-state`），因為只有它的狀態樹裡住著一個
+    # root-owned 的 enforcement 檔。兩者的分界是 `permgen.EXECUTOR_ENFORCEMENT_LEAVES`
+    # 那條規則，不是帳號——同一條規則同時決定了 builder 那一格。
+    #
+    # 兩項同形，因此共用這一段說明，各自的 note 只寫「這個 executor 特有的部分」。
     #
     # **形狀**：`permgen.CredentialShape.HOME_REDIRECT_TREE`——HOME 底下一條 root-owned
     # symlink，指向該帳號 `cache` 裡的一格。三條性質同時成立，而且都是機械結果：
@@ -568,43 +609,22 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     #   2. **job 換不掉指向**：symlink 落在 root-owned 的 HOME（`scaffold_directories()`
     #      產出 root:root 0755），換 symlink 需要對父目錄的寫入權。
     #   3. **writers 只有 INSTALLER**：`required_write_targets()` 只收 writer 面，因此
-    #      這三項機械地不會產生任何 RWP 條目，也不會產生任何跨帳號 ACL。
+    #      這兩項機械地不會產生任何 RWP 條目，也不會產生任何跨帳號 ACL。
     #
     # **為什麼不是「把憑證檔登記成葉節點」**（#640 對 builder 的做法）：#686 實測 codex
     # 與 agy 要寫的都是**一整棵**狀態樹，檔名還帶版本序號（`state_5.sqlite`）——逐項列舉
     # 會在下一次 CLI 升版時無聲失效。claude 同理。
     #
-    # **U-4 的追認範圍**：這三格代表 `cortex-reviewer-planner` 同時持有 openai／google／
-    # anthropic 三個 provider 的登入態。design 的安全退步 **R-3**（該帳號被攻陷時多邊
-    # token 一起失，而 planner 正是吃 untrusted issue 內容的角色）是**明文接受的有界
-    # 殘餘風險**——它在後續任何「planner 攻擊面」討論中不得被當成未知。
+    # **U-4 的追認範圍**：連同上方的 codex 那一格，`cortex-reviewer-planner` 同時持有
+    # openai／google／anthropic 三個 provider 的登入態。design 的安全退步 **R-3**（該帳號
+    # 被攻陷時多邊 token 一起失，而 planner 正是吃 untrusted issue 內容的角色）是**明文
+    # 接受的有界殘餘風險**——它在後續任何「planner 攻擊面」討論中不得被當成未知。
     #
     # **本形狀新增的退步（R-6，明講）**：目標樹由 job 帳號擁有 ⇒ 樹裡的 token 葉檔可被
-    # 該 job 刪除或替換（builder 的 `IN_PLACE_FILE` 擋得住「刪／換」，這裡擋不住）。
-    # 影響面限於該帳號自己的登入態；換到的是 codex／claude **能不能起得來**。直接後果：
-    # 同一棵樹裡**不得**再放任何 root-owned 的 enforcement 檔——`reviewer-planner-codex-hooks`
-    # 因此仍留在 `permgen.deferred_run_dependencies()` 並升為 **U-9**。
-    TrustRootAsset(
-        "reviewer-planner-codex-state", _T0, _JV, None,
-        (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
-        IngressKind.DEPLOYMENT_WRITE,
-        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
-        note=(
-            "`<HOME>/.codex` → `<HOME>/cache/codex` 的 root-owned symlink：codex 的 "
-            "`$CODEX_HOME` 整棵，token 葉檔是它底下的 `auth.json`。\n"
-            "**為何是整棵而不是一個檔**（#686 實測，design 未預期）：唯讀時 codex 回 "
-            "`Error: failed to initialize in-process app-server client: Read-only file "
-            "system (os error 30)`；把 cwd 換成可寫的 `/tmp` **症狀完全相同**，維持唯讀 "
-            "cwd 只把 `CODEX_HOME` 指到可寫目錄則 **rc=0、輸出正確**。阻斷點是 "
-            "`CODEX_HOME`，不是 cwd。它在底下建 `state_5.sqlite`／`logs_2.sqlite`／"
-            "`queue_1.sqlite`／`memories_1.sqlite`／`sessions/`／`skills/`／`plugins/`／"
-            "`thread-writer-locks/`／`models_cache.json`／`installation_id`。\n"
-            "**為何不用 `CODEX_HOME=` 這個環境變數而用 symlink**：env 覆寫要經 "
-            "`job_runner.build_job_env()` 的白名單，那是第二條要維護的放行面；而 symlink "
-            "讓 executor 的**預設**路徑解析就落在對的地方，job 側零改動。代價是 "
-            "`~/.codex` 這個名字被佔用（見上方 R-6 與 U-9）。"
-        ),
-    ),
+    # 該 job 刪除或替換。影響面限於該帳號自己的登入態；換到的是 agy／claude **能不能起
+    # 得來**。直接後果：同一棵樹裡**不得**再放任何 root-owned 的 enforcement 檔——這條在
+    # #698 之前是註解，現在由 `permgen._assert_shape_follows_enforcement_rule()` 在 import
+    # 當下強制（宣告了 enforcement 檔就必須改走 `HOME_STICKY_TREE`）。
     TrustRootAsset(
         "reviewer-planner-agy-state", _T0, _JV, None,
         (Principal.INSTALLER,), (Principal.REVIEWER, Principal.PLANNER),
@@ -1118,13 +1138,46 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         derived_in=("config/runtime.py:61-66", "deploy/installer.py:162"),
         note="裸寫、無 mode；實測 -rw-rw-r--。改此檔的 PSC_* 即重導整棵 durable state。",
     ),
-    TrustRootAsset(
-        "codex-hooks", _T0, _MO, None,
-        (Principal.INSTALLER, Principal.ANY_SAME_UID), (Principal.MANAGER,),
-        IngressKind.DEPLOYMENT_WRITE,
-        derived_in=("deploy/hooks.py:48-60",),
-        note="$HOME/.codex/hooks.json；enforcement plane 的一部分。",
-    ),
+    # ---- codex hooks：**兩個 job 帳號各一份**（#698）----
+    #
+    # #698 之前這裡只有一項 `codex-hooks`，路徑寫死在 builder 的 HOME 底下，理由是
+    # 「reviewer／planner 的 `~/.codex` 是 job-owned 的樹，root-owned 的 hooks 放進去
+    # 擋不住替換」。0818 的 R9 T3.9 把那個理由的**後果**量了出來：該帳號真的植入了
+    # `hooks.json`。codex hooks **會執行命令**，因此那不是「少一層防護」而是**跨 job
+    # 持久化**——上一個 job 留得下在下一個 job 啟動時執行的東西。
+    #
+    # 方案 A 之後兩份都登記得起來，而且是同一條規則長出來的兩列
+    # （`permgen.enforcement_placements()`）：加一個跑 codex 的帳號 ⇒ 這裡自動多一份，
+    # 不必也不能手寫第三項。
+    #
+    # **這個檔必須先存在，sticky 才擋得住什麼**：sticky 管的是「刪／改名**別人的**檔」，
+    # 不管「建一個還不存在的檔」。缺這個檔時 R9 T3.9 會以「建得出新檔」翻紅——那是
+    # 正確的紅字，不是誤報。部署順序見 runbook 第 4e-2b 步。
+    *[
+        TrustRootAsset(
+            asset_id, _T0, _MO, None,
+            (Principal.INSTALLER,), (Principal.MANAGER,) + tuple(job_principals),
+            IngressKind.DEPLOYMENT_WRITE,
+            derived_in=("deploy/hooks.py:48-60", "trust_root/permgen.py:PathLayout.enforcement_placements"),
+            note=(
+                f"{home_hint}/hooks.json；enforcement plane 的一部分，**root-owned**。\n"
+                "它住在一棵 job 可寫的 sticky 樹裡（`*-codex-state`），三個動詞同時關上："
+                "unlink／rename 被 sticky 擋（非 owner 只動得了自己的檔）、改內容被自己的 "
+                "mode 擋（root:root 0644 ⇒ job 落在 `other` 位）。\n"
+                "**writers 只有 INSTALLER**：`required_write_targets()` 只收 writer 面，"
+                "因此本項機械地不進任何 job unit 的 `ReadWritePaths`；job 帳號對 codex 樹的"
+                "寫入權來自 `*-codex-state` 那一項的具名 ACL，涵蓋不到這個檔。"
+            ),
+        )
+        for asset_id, home_hint, job_principals in (
+            ("builder-codex-hooks", "<builder HOME>/.codex", (Principal.BUILDER,)),
+            (
+                "reviewer-planner-codex-hooks",
+                "<reviewer-planner HOME>/.codex",
+                (Principal.REVIEWER, Principal.PLANNER),
+            ),
+        )
+    ],
     TrustRootAsset(
         "work-items-yaml", _T1, _JV, None,
         (Principal.OPERATOR, Principal.BUILDER, Principal.ANY_SAME_UID), (Principal.BUILDER,),
