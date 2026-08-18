@@ -718,10 +718,89 @@ def _failed_agy(reason: str, diagnostic: str | None = None) -> CapabilityProbe:
     return CapabilityProbe(False, "agy", AGY_MODEL_ID, AGY_DOMAIN, reason, diagnostic)
 
 
+# issue #670：開頭 fence 允許帶 info string（``` 後面的語言標籤，例如 `json`），
+# 但字元集刻意收斂到「語言標籤長得出來的樣子」——絕不可含 `{`／反引號，否則
+# 單行形態 ```` ```{"a":1}``` ```` 會被整串當成 info string 吃掉。
+_CODE_FENCE_OPEN = re.compile(r"\A```[A-Za-z0-9_+.\-]*[ \t]*\r?\n?")
+_CODE_FENCE_CLOSE = re.compile(r"\r?\n?[ \t]*```\Z")
+
+#: `_failed_agy` diagnostic 帶的原始 stdout 節錄長度上限（issue #670）。
+STDOUT_EXCERPT_LIMIT = 200
+
+
+def strip_code_fence(text: str) -> str:
+    """剝掉「整串剛好被一個 markdown code fence 包住」時的 fence，回傳本體。
+
+    issue #670：`probe_agy_capability` 問的是語言模型，實測約 1/6 次會把
+    正確的 JSON 包進 ```` ```json ```` fence，於是 `json.loads` 拋錯 ⇒
+    `malformed-output` ⇒ probe not ready ⇒ `no-heterogeneous-planner` ⇒ run
+    進 `needs_human`。內容明明正確，卻被誤報成拓撲問題。
+
+    支援的形態：``` 與 ```json 兩種開頭、有無尾隨 fence、fence 前後的空白／
+    換行、以及單行的 ``` ```json {...}``` ```。
+
+    刻意**只**處理「整串就是單一 fenced block」：帶前言散文的輸出
+    （``"Here you go:\\n```json\\n{...}\\n```"``）原樣回傳，交給呼叫端的
+    `json.loads` 失敗成 `malformed-output`。這與 `planning_runtime`
+    `_find_json_object` 的頂層嚴格語意一致——剝 fence 是**純結構**動作，
+    不負責從散文裡撈 JSON，更不負責救「內容真的不對」的輸出：本函式回傳後
+    仍要走原本的 `json.loads` 與 `payload != expected` 比對，內容錯誤照樣
+    落在 `identity-mismatch`。
+    """
+    stripped = text.strip()
+    opened = _CODE_FENCE_OPEN.match(stripped)
+    if opened is None:
+        return stripped
+    body = stripped[opened.end() :]
+    closed = _CODE_FENCE_CLOSE.search(body)
+    if closed is not None:
+        body = body[: closed.start()]
+    return body.strip()
+
+
+def stdout_excerpt(text: str, *, limit: int = STDOUT_EXCERPT_LIMIT) -> str:
+    """把 probe 的原始 stdout 壓成單行節錄，供失敗 diagnostic 使用（issue #670）。
+
+    修復前 `malformed-output` 的 diagnostic 是 `None`，現場零線索——#670 是靠
+    人工重跑六遍才看見成因是 code fence。這裡把實際 stdout 前 `limit` 個字元
+    帶進 diagnostic，讓下一次同類失敗一眼看得出是格式問題還是別的。
+
+    節錄內容是**模型對一段固定 probe prompt 的回應**：prompt 由本模組寫死
+    （只含 `capability`／`model` 兩個常數），argv 不帶任何憑證，env 也不會被
+    回顯，因此沒有把 token／憑證帶進 log 或 evidence 的路徑。換行與連續空白
+    一律壓成單一空格，避免多行內容污染單行 log。
+    """
+    collapsed = " ".join(text.split())
+    if not collapsed:
+        return "<empty>"
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "…"
+
+
 def _normalize_model_token(value: str) -> str:
     """正規化 model id／顯示名，容忍 `agy models` 輸出格式（顯示名 vs kebab id、
     大小寫、空白/括號等標點差異）未來再次改版。"""
     return re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+
+
+def _agy_model_line_tokens(line: str) -> tuple[str, tuple[str, ...]]:
+    """把 `agy models` 的一行拆成 ``(要傳給 --model 的字面 token, 可比對候選)``。
+
+    issue #670 實測附帶發現：2026-08-18 實機的 `agy models` 已改成**兩欄
+    tab 分隔**——``gemini-3.1-pro-high\\tGemini 3.1 Pro (High)``。整行拿去比對
+    時字面與正規化雙雙落空（整行正規化後是
+    `gemini-3-1-pro-high-gemini-3-1-pro-high`），於是 probe **100%** 死在
+    `model-not-listed`——比 #670 的 fence 偽失敗更早、更絕對。
+
+    多欄時 `--model` 只吃得下第一欄的 kebab id，顯示名（`Gemini 3.1 Pro (High)`）
+    不是合法 CLI 值，因此**比對**可以用整行或任一欄，**回傳**一律是第一欄。
+    單欄（舊格式）時 token 就是整行，行為與修復前逐字相同。
+    """
+    fields = [field.strip() for field in line.split("\t") if field.strip()]
+    if len(fields) <= 1:
+        return line, (line,)
+    return fields[0], (line, *fields)
 
 
 def _resolve_agy_cli_token(expected: str, listed: Iterable[str]) -> str | None:
@@ -729,15 +808,17 @@ def _resolve_agy_cli_token(expected: str, listed: Iterable[str]) -> str | None:
 
     優先字面完全比對；找不到時退而用正規化比對，讓顯示名／kebab id 之間的
     命名落差不必等到常數再次寫死才修（issue #255）。回傳的是 `agy models`
-    實際印出的那一行，因為 `--model` 必須用 CLI 認得的字面值呼叫。
+    實際印出的字面值（單欄輸出是整行、多欄輸出是 id 欄），因為 `--model`
+    必須用 CLI 認得的字面值呼叫。
     """
-    listed_set = {line for line in listed if line}
-    if expected in listed_set:
-        return expected
+    entries = [_agy_model_line_tokens(line) for line in listed if line]
+    for token, candidates in entries:
+        if expected in candidates:
+            return token
     target = _normalize_model_token(expected)
-    for line in listed_set:
-        if _normalize_model_token(line) == target:
-            return line
+    for token, candidates in entries:
+        if any(_normalize_model_token(candidate) == target for candidate in candidates):
+            return token
     return None
 
 
@@ -771,7 +852,15 @@ def probe_agy_capability(
         )
 
     expected = {"capability": "cortex-plan-sandbox", "model": AGY_MODEL_ID}
+    # issue #670：軟性措辭（「Return only ...」）不足以讓模型穩定不加 fence，
+    # 補上與 `planning_runtime._JSON_OUTPUT_CONTRACT` 同款的顯式輸出契約，把
+    # fence 機率壓在源頭；`strip_code_fence` 則是模型仍不從時的保底。
+    # 契約放在 payload **之前**，比照 `planning_runtime` 把 `_JSON_OUTPUT_CONTRACT`
+    # 排在 `Input:` 之前的既有寫法，讓「指示 → 目標物」的順序一致，
+    # 也讓 prompt 尾端仍然剛好是那個 JSON 物件。
     prompt = (
+        "Output contract: reply with exactly one JSON object and nothing else — "
+        "no prose, no explanation, no code fences. Your reply MUST start with '{'. "
         "Return only this compact JSON object and perform no tool calls: "
         + json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
     )
@@ -789,11 +878,11 @@ def probe_agy_capability(
     if smoke_rc != 0:
         return _failed_agy("smoke-failed", f"exit-code:{smoke_rc}")
     try:
-        payload = json.loads(smoke_stdout.strip())
+        payload = json.loads(strip_code_fence(smoke_stdout))
     except (json.JSONDecodeError, TypeError):
-        return _failed_agy("malformed-output")
+        return _failed_agy("malformed-output", stdout_excerpt(smoke_stdout))
     if payload != expected:
-        return _failed_agy("identity-mismatch")
+        return _failed_agy("identity-mismatch", stdout_excerpt(smoke_stdout))
     return CapabilityProbe.ready_for("agy", AGY_MODEL_ID, AGY_DOMAIN)
 
 

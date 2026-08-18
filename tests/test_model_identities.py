@@ -7,11 +7,14 @@ import pytest
 from paulsha_cortex.coordinator.model_identities import (
     AGY_LIVE_PROBE,
     AGY_MODEL_ID,
+    STDOUT_EXCERPT_LIMIT,
     CapabilityProbe,
     IdentityRegistry,
     load_model_identities,
     probe_agy_capability,
     select_secondary_planner,
+    stdout_excerpt,
+    strip_code_fence,
 )
 
 
@@ -236,6 +239,187 @@ def test_agy_probe_fails_closed_on_drift(model_stdout, smoke_result, reason) -> 
 
     assert probe.ready is False
     assert probe.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # 裸輸入：原樣（只 strip）回傳。
+        ('{"a":1}', '{"a":1}'),
+        ('  {"a":1}\n', '{"a":1}'),
+        # ```json 前綴（#670 實測到的真實形態）。
+        ('```json\n{"a":1}\n```', '{"a":1}'),
+        # 裸 ``` 前綴。
+        ('```\n{"a":1}\n```', '{"a":1}'),
+        # 尾隨空白／換行，以及 fence 前後的空白。
+        ('```json\n{"a":1}\n```\n\n  ', '{"a":1}'),
+        ('\n  ```JSON\n{"a":1}\n```  \n', '{"a":1}'),
+        # 沒有尾隨 fence（輸出被截斷）也要能取出本體。
+        ('```json\n{"a":1}', '{"a":1}'),
+        # 單行 fence：info string 有無皆可，且不得把本體當成 info string 吃掉。
+        ('```json {"a":1}```', '{"a":1}'),
+        ('```{"a":1}```', '{"a":1}'),
+        # CRLF。
+        ('```json\r\n{"a":1}\r\n```', '{"a":1}'),
+        # 空字串。
+        ("", ""),
+        # 帶前言散文的 fence **不**處理：維持與 planning_runtime 頂層一致的
+        # 嚴格「整串才算」語意，交給呼叫端 json.loads 失敗。
+        ('Here you go:\n```json\n{"a":1}\n```', 'Here you go:\n```json\n{"a":1}\n```'),
+    ],
+)
+def test_strip_code_fence_handles_fenced_and_bare_inputs(raw: str, expected: str) -> None:
+    assert strip_code_fence(raw) == expected
+
+
+def test_agy_probe_accepts_fenced_json_from_the_model() -> None:
+    """#670：模型把正確 JSON 包進 code fence 時，probe 必須照樣 ready。"""
+    fenced = f'```json\n{{"capability":"cortex-plan-sandbox","model":"{AGY_MODEL_ID}"}}\n```\n'
+    responses = iter([_completed(stdout=f"{AGY_MODEL_ID}\n"), _completed(stdout=fenced)])
+
+    probe = probe_agy_capability(runner=lambda *a, **k: next(responses))
+
+    assert probe.ready is True
+    assert probe.reason is None
+
+
+def test_agy_probe_accepts_bare_fence_without_language_tag() -> None:
+    fenced = f'```\n{{"capability":"cortex-plan-sandbox","model":"{AGY_MODEL_ID}"}}\n```'
+    responses = iter([_completed(stdout=f"{AGY_MODEL_ID}\n"), _completed(stdout=fenced)])
+
+    probe = probe_agy_capability(runner=lambda *a, **k: next(responses))
+
+    assert probe.ready is True
+
+
+def test_agy_probe_still_reports_identity_mismatch_for_fenced_wrong_content() -> None:
+    """剝 fence 不得順手吞掉「內容真的不對」——這是 #670 最容易改壞的一格。
+
+    fence 剝法只處理結構；本體 JSON 合法但欄位不符時，reason 必須仍是
+    `identity-mismatch`（拓撲／身分問題），不能因為「有 fence」就被誤救成
+    ready，也不能退化成 `malformed-output`。
+    """
+    fenced = '```json\n{"capability":"wrong","model":"some-other-model"}\n```'
+    responses = iter([_completed(stdout=f"{AGY_MODEL_ID}\n"), _completed(stdout=fenced)])
+
+    probe = probe_agy_capability(runner=lambda *a, **k: next(responses))
+
+    assert probe.ready is False
+    assert probe.reason == "identity-mismatch"
+    assert probe.diagnostic is not None
+    assert "wrong" in probe.diagnostic
+
+
+def test_agy_probe_malformed_output_diagnostic_carries_stdout_excerpt() -> None:
+    """#670：`malformed-output` 過去 diagnostic 為 None，現場零線索。"""
+    responses = iter(
+        [
+            _completed(stdout=f"{AGY_MODEL_ID}\n"),
+            _completed(stdout="I cannot comply with that request.\nPlease clarify.\n"),
+        ]
+    )
+
+    probe = probe_agy_capability(runner=lambda *a, **k: next(responses))
+
+    assert probe.ready is False
+    assert probe.reason == "malformed-output"
+    assert probe.diagnostic is not None
+    assert "I cannot comply with that request." in probe.diagnostic
+    # 多行 stdout 壓成單行，不污染 log。
+    assert "\n" not in probe.diagnostic
+
+
+def test_agy_probe_malformed_output_diagnostic_is_bounded() -> None:
+    responses = iter(
+        [_completed(stdout=f"{AGY_MODEL_ID}\n"), _completed(stdout="x" * 4096)]
+    )
+
+    probe = probe_agy_capability(runner=lambda *a, **k: next(responses))
+
+    assert probe.reason == "malformed-output"
+    assert probe.diagnostic is not None
+    assert len(probe.diagnostic) <= STDOUT_EXCERPT_LIMIT + 1
+
+
+def test_stdout_excerpt_collapses_whitespace_and_marks_empty() -> None:
+    assert stdout_excerpt("  a\n\n b\t c  ") == "a b c"
+    assert stdout_excerpt("") == "<empty>"
+    assert stdout_excerpt("   \n  ") == "<empty>"
+    assert stdout_excerpt("y" * 300, limit=10) == "y" * 10 + "…"
+
+
+def test_agy_probe_accepts_two_column_models_listing() -> None:
+    """#670 實測附帶發現：`agy models` 已改成 `id\\tDisplay Name` 兩欄輸出。
+
+    整行比對時字面與正規化都不中，probe 100% 死在 `model-not-listed`——比
+    fence 偽失敗更早、更絕對。要能認出 id 欄，且傳給 `--model` 的必須是
+    kebab id，不是顯示名。
+    """
+    listing = (
+        "gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n"
+        f"{AGY_MODEL_ID}\tGemini 3.1 Pro (High)\n"
+        "claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n"
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv == ["agy", "models"]:
+            return _completed(stdout=listing)
+        return _completed(
+            stdout=f'{{"capability":"cortex-plan-sandbox","model":"{AGY_MODEL_ID}"}}'
+        )
+
+    probe = probe_agy_capability(runner=runner)
+
+    assert probe.ready is True
+    assert calls[1][calls[1].index("--model") + 1] == AGY_MODEL_ID
+
+
+def test_agy_probe_two_column_listing_prefers_id_column_over_display_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """兩欄輸出且只有顯示名語意相符時，仍必須挑 id 欄，不能回傳顯示名。"""
+    monkeypatch.setattr(
+        "paulsha_cortex.coordinator.model_identities.AGY_MODEL_ID", "Gemini 3.1 Pro (High)"
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv == ["agy", "models"]:
+            return _completed(stdout="gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n")
+        return _completed(
+            stdout='{"capability":"cortex-plan-sandbox","model":"Gemini 3.1 Pro (High)"}'
+        )
+
+    probe = probe_agy_capability(runner=runner)
+
+    assert probe.ready is True
+    assert calls[1][calls[1].index("--model") + 1] == "gemini-3.1-pro-high"
+
+
+def test_agy_probe_prompt_forbids_code_fences_at_the_source() -> None:
+    """保底之外，prompt 本身也要顯式禁止 fence（#670 源頭壓制）。"""
+    calls: list[list[str]] = []
+
+    def runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv == ["agy", "models"]:
+            return _completed(stdout=f"{AGY_MODEL_ID}\n")
+        return _completed(
+            stdout=f'{{"capability":"cortex-plan-sandbox","model":"{AGY_MODEL_ID}"}}'
+        )
+
+    probe = probe_agy_capability(runner=runner)
+
+    assert probe.ready is True
+    prompt = calls[1][calls[1].index("--print") + 1]
+    assert "no code fences" in prompt
+    # #670 實測：`--json-schema` 在 `--output-format text`（build_agy_argv 現行
+    # 形態）下被 CLI 直接拒絕（rc=1），因此 argv 保持不變。
+    assert "--json-schema" not in calls[1]
+    assert "--output-format" not in calls[1]
 
 
 def test_secondary_selection_uses_priority_and_excludes_primary_domain() -> None:
