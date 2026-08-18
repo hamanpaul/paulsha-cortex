@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- R9 的 T1.3 斷言改為驗「operator CLI 做得到事」而非「binary 跑得起來」（兩個 subject 同時假失敗）；runbook 記錄 0818 兩 subject 實測結果並標明 T3.9 對 reviewer-planner 為已知追蹤項（#698）（#699）。
 - runbook 的「M2′ 之後仍未涵蓋的」清單更正兩條陳舊項（gate 執行身分 #629 已完成、reviewer 憑證 refresh 已由 #685 解決），並加上「not-covered 清單本身也是宣稱」的約束（#696）。
 
 ### Fixed
