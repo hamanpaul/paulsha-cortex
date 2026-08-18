@@ -8,6 +8,37 @@
 ## [Unreleased]
 
 ### Added
+- **#672：planner 降權的設計交付（spec ＋ design ＋ 實作切分計畫，零 code）**——planning
+  （define／brainstorm）從來沒有被降權：`planning_runtime.py:830` `_invoke_json()` 以
+  `subprocess.run` 在**呼叫端行程內**執行、`:43` `_planning_argv()` 回傳裸 executor argv
+  （無 `systemd-run`／無 shim／無模板 unit），而呼叫端是以 `User=cortex-manager` 執行的
+  daemon（`manager_daemon.py:970`／`:1241`）。#615（M2）只把 **reviewer** 導上
+  `cortex-reviewer-job@.service`（`launcher.py:1239 _is_review_persona()`），planner 走的是
+  完全不同的一條 code path——`job_runner.py:405-408` 的 rationale 與
+  `permgen.deferred_run_dependencies()` 第四項都已把這條記成逾期項，後者的 `disposition`
+  給的兩條路之一正是本票的裁決（「planning 一律走降權 job」）。**這是結構性搬遷，因此本票
+  只出設計，不動一行 `paulsha_cortex/`。** 設計定案 R1–R8：執行身分（單一開關、不新增第二個）、
+  一次性 sandbox 的**十條防線逐條對應表**（operator 樹保護由「事後偵測」升級為 mount 層
+  不可寫；claude hermetic config 升級為帳號隔離）、probe 快取（指紋含 `PSC_JOB_RUNNER` 與
+  **模板 unit 檔本身**，fail-closed）、剖面零新增判定點、憑證由登記表機械導出（沿用 #671 的
+  `IN_PLACE_CONTENT_WRITE_ASSETS` 與 `inapplicable_home_anchored_assets()`，不重造）、
+  錯誤語意三分 ＋ **`no-heterogeneous-planner` 攜帶逐候選拒因表**（讓 #670 那種「格式問題被
+  報成拓撲問題」結構上不可能；PR #674 已修好 probe 那一端，本設計補的是「診斷活著抵達上游」
+  那一層）、逾時由 Manager 側 `systemctl stop` 強制終止。**剖面面沒有前置**——現行
+  `EXECUTOR_HARDENING_PROFILE` 實測可用（八份 unit 全帶 `SystemCallErrorNumber=EPERM`，
+  被過濾的 syscall 回 `EPERM` 而非 `KILL_PROCESS`，codex／copilot 在 `jit` 剖面 rc=0）。
+  另以 **D13** 把加固面的驗證方法定為設計驗收的依據：一律從已落檔 unit **機械讀出全部
+  property**，不得手抄子集——**該機制已由 PR #677 落地**（`unit_replica_properties()`／
+  CLI `trust_root unit-replica`／runbook 共用探針 `psc_run_under`），本設計消費它、不重造。
+  規則的理由仍記在設計裡（planner 是下一個會做這種宣稱的地方）：判準**雙向**，本 repo
+  已有四個實例、兩個方向都出現過（#638／#657 偏寬得假綠，#673 原 body 與其 repro 偏嚴得
+  假紅）。並消費 #677 的第二個維度（seccomp 過濾語意在剖面**之外**）——probe 快取的指紋
+  因此含**模板 unit 檔本身**而非只有剖面名，`executor-silent-exit` 的診斷帶
+  `seccomp_filter_is_fatal()` 的結果。誠實標註 4 條安全退步與 8 條未決裁決；實作切分成
+  六張票，其中三張不依賴任何部署面改動、可獨立 land。**另查到一條沒有票的部署缺口**：
+  `/opt/cortex/etc/cortex-manager.env` 未宣告 `PSC_REVIEWER_PATH` ⇒ 降權 job 拿到 PID 1 的
+  預設 PATH ⇒ `claude`／`agy` rc=127、`codex` **安靜地**解到系統層 `0.42.0`（toolchain 為
+  `0.147.0`，不會失敗、只是產出來自舊 CLI），**今天的 reviewer job 已受影響**。
 - **#667：R3 testpilot case 素材盤點——四路盲測 sweep 合成為 102 筆去重候選清單**——
   `docs/superpowers/workstreams/r3-testpilot-case-corpus/{todo.md,case-candidates.md}`。
   **唯一產出是文件**：不寫 case yaml、不建 harness、不動 `paulsha_cortex/`（`#667` scope
