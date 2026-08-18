@@ -108,17 +108,26 @@ unit 裡。
 
 **M2′ 之後仍未涵蓋的（不得順手宣稱）**：
 
-- **gate 執行身分**（#629）：gate 命令在 builder 完全掌控的 worktree 裡跑，`pytest`
-  會載入該 worktree 的 `conftest.py` ⇒ 執行者取得任意程式碼執行。**刻意不掛在
+> **⚠️ 本清單有兩條曾經長期陳舊。** 它們描述的缺口在 #629／#685 落地後就不成立，
+> 但清單沒跟著改——於是「Phase 2 還沒好」被讀成比實際更嚴重。**這份清單本身是
+> 一種宣稱，同樣受「不得順手宣稱」約束：修好了就要當場改掉，否則它會反向說謊。**
+> 兩條的更正紀錄保留在下方，作為「陳舊的 not-covered 清單也是一種假訊息」的實例。
+
+- ~~**gate 執行身分**（#629）：需要**第四個帳號**~~ ——**已完成（#629，已 CLOSED）**。
+  `cortex-gate` 帳號、`cortex-gate-job@`／`-jit` 兩份模板 unit 均已落地。
+  原始理由仍成立且值得保留：gate 命令在 builder 完全掌控的 worktree 裡跑，`pytest`
+  會載入該 worktree 的 `conftest.py` ⇒ 執行者取得任意程式碼執行；**刻意不掛在
   `cortex-reviewer-planner` 上**——那會讓被攻陷的 builder 經由 gate 執行影響到寫
-  verdict 的那個帳號，把 #638／#639 剛修好的東西整個抵銷。它需要**第四個帳號**，
-  屬 #629。在那之前降權 build 卡對 `require_ledger` fail closed。
-- **reviewer 的 executor 憑證就地 refresh**：`cortex-reviewer-planner` 的 `~/.codex`
-  骨架目錄已由 `scaffold_directories()` 建出並保護（root-owned），憑證檔由 root 於
-  第 4e 步複製並 chown 給它；但**該檔不在 reviewer 模板 unit 的 `ReadWritePaths=`
-  內**（登記表目前只登記 `builder-executor-credential` 一份，理由見該資產的 note：
-  在二分部署上登記第二份會讓 Manager unit 的 RWP 指向一條不存在的路徑而起不來）。
-  淨效果：reviewer 的 token 過期時**無法自行 refresh**，需 operator 重跑第 4e 步。
+  verdict 的那個帳號，把 #638／#639 剛修好的東西整個抵銷。
+- ~~**reviewer 的 executor 憑證就地 refresh**：該檔不在 reviewer 模板 unit 的
+  `ReadWritePaths=` 內，token 過期時無法自行 refresh~~ ——**已解（#685／#672 票 D）**。
+  三份登入態改走 `HOME_REDIRECT_TREE`：`~/.codex`／`~/.gemini`／`~/.claude` 是
+  **root-owned symlink**（job 換不掉指向），目標落在 `<HOME>/cache/{codex,gemini,claude}`，
+  而 `cache` **早已**在模板 unit 的 `ReadWritePaths=` 內 ⇒ **unit 的 RWP 逐字不變、
+  零新增可寫面，而憑證檔可寫、refresh 可行**。0818 實機以該帳號在完整加固面下
+  `touch -c "$HOME/.codex/auth.json"` 實測通過。
+  原 note 提到的「二分部署登記第二份會讓 Manager unit 的 RWP 指向不存在的路徑」
+  已由 #666／PR #671 的 `inapplicable_home_anchored_assets()` 機械處理。
 - **reviewer 的工作樹位置**：仍是 Manager provision 的 review worktree
   （`<來源樹>/.psc-review-worktrees/…`），不是 per-job clone。reviewer 是 read-only
   契約，對它只需**唯讀**可達；per-job clone 化屬 #623／#648 的範圍。
