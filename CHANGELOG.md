@@ -106,6 +106,31 @@
   ——那就是「純重構」的定義，也是本票行為零改變的主要證據。
 
 ### Added
+- **#684（#672 票 C）：planning capability probe 的跨 tick 結果快取，指紋含模板 unit 檔本身**
+  ——`build_production_planning_runtime()` 對每個 planning-capable identity 各跑一次 probe
+  （`_probe_identity` 每次兩次整棵 repo 的 `copytree`；`probe_agy_capability` 兩次 CLI
+  呼叫），而它由 periodic tick（實機 `PSC_MANAGER_INTERVAL_SECONDS=600`）與
+  `apply_work_action()` 兩條路徑呼叫；票 E 把 planning 搬上降權 job 之後**每一次 probe 就是
+  一個 systemd unit 實例**，等於每 10 分鐘起一批 job 去問模型「你是誰」。新增
+  `coordinator/planning_probe_cache.py`：指紋六格＝`PSC_JOB_RUNNER` 解析後模式、roster 解析
+  結果的 canonical JSON 雜湊、以該角色 PATH 解析出的 executor 絕對路徑 ＋
+  `st_dev/st_ino/st_size/st_mtime_ns`、憑證檔的 `st_size/st_mtime_ns`（**不讀內容**）、
+  `resolve_hardening_profile(executor)`、以及**模板 unit 檔本身**的 `st_size/st_mtime_ns`。
+  放 unit 檔而不是剖面名是因為 #677 的 `PROFILE_LOCKED_KEYS`——剖面名相同不代表 unit 內容
+  相同，只認剖面名會沿用一個對新 unit 不成立的 `ready`；放 unit 的 stat 則把**部署動作**與
+  **快取失效**綁成同一件事。含 `PSC_JOB_RUNNER` 是因為 direct 與 job 的執行環境完全不同，
+  它同時是「票 F 的切換必須一次到位」的機械保證。**fail-closed**：壞檔／schema 不符／row
+  形狀不合／身分欄位被改／同時帶 ready 與失敗診斷／指紋不符／TTL 過期／時鐘倒退一律視為
+  **miss 重探**，沒有任何一條路徑會因為「上次是 ready」而在無法重探時回答 ready；壞檔另落
+  可辨識的 `planning-probe-cache-unreadable`，與「probe 失敗」分開。與 `not_claimable`
+  （#675）**刻意的一處不同**是壞檔不 raise（輔助紀錄不該取得它不該有的否決權），ledger 形狀
+  與原子寫入則逐項沿用。TTL 兩段（ready 3600s／not-ready 300s，env 可覆寫，讀取時判定因此
+  調短立即生效；非法值當 0 而不落回預設）。落點是新增的登記表資產 `planning-probe-cache`
+  （`<coordinator_root>/planning-probe-cache.json`，Manager-owned 0600，writers／readers 只有
+  `Principal.MANAGER`），**刻意不進任何 job 模板 unit 的 `ReadWritePaths`**——job 一旦寫得動
+  快取，「這個 provider 是 ready 的」就變成模型可以自證的東西。指紋計算**永不 raise**，
+  算不出來的分量落 `<unresolved:<例外型別名>>`（只帶型別名不帶訊息），而那本身也是一個會變
+  的值。測試 `tests/test_planning_probe_cache_672.py`（40 條）；**既有測試一行未改**。
 - **#672：planner 降權的設計交付（spec ＋ design ＋ 實作切分計畫，零 code）**——planning
   （define／brainstorm）從來沒有被降權：`planning_runtime.py:830` `_invoke_json()` 以
   `subprocess.run` 在**呼叫端行程內**執行、`:43` `_planning_argv()` 回傳裸 executor argv

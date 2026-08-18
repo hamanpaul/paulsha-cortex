@@ -140,7 +140,9 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
 
 ### 3. 票 C｜probe 結果快取（對應 R3；依賴票 A 的診斷欄位、票 B 的 invoker）
 
-- [ ] `tests/test_planning_probe_cache_672.py`（TDD RED）：
+**已由 issue #684 land。**
+
+- [x] `tests/test_planning_probe_cache_672.py`（TDD RED）：
   - `test_cache_key_includes_job_runner_mode`：`PSC_JOB_RUNNER` 由 `direct` 改
     `systemd-template` ⇒ 快取必失效（**這條是本票最重要的不變式**）。
   - `test_cache_invalidated_by_executor_binary_fingerprint`：可執行檔 mtime／inode 改變 ⇒ 失效。
@@ -154,16 +156,49 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
     stdout 前 200 字／unit／resolved_binary／binary_version。
   - `test_cache_asset_not_in_any_job_unit_rwp`：登記表資產不出現在任一 job 模板 unit
     的 `ReadWritePaths` 產出中。
-- [ ] `paulsha_cortex/trust_root/registry.py`：新增資產 `planning-probe-cache`
+- [x] `paulsha_cortex/trust_root/registry.py`：新增資產 `planning-probe-cache`
       （`<coordinator_root>/planning-probe-cache.json`，Manager-owned 0600，
-      writers／readers 只有 `Principal.MANAGER`），並補進
-      `permgen.RUN_EXTERNAL_DEPENDENCIES` 的雙向封閉（否則
-      `unlisted_roster_entries()` 的測試會紅）。
-- [ ] `paulsha_cortex/coordinator/planning_probe_cache.py`（新檔）：指紋計算、讀寫、
+      writers／readers 只有 `Principal.MANAGER`），並補進 `permgen.PathLayout.asset_paths()`。
+      **`RUN_EXTERNAL_DEPENDENCIES` 不需要動**——見下方實作補充第 4 點。
+- [x] `paulsha_cortex/coordinator/planning_probe_cache.py`（新檔）：指紋計算、讀寫、
       TTL、fail-closed 語意。
-- [ ] `build_production_planning_runtime()` 改成先查快取、miss 才 probe。
+- [x] `build_production_planning_runtime()` 改成先查快取、miss 才 probe。
 - 驗收：direct 模式下連續兩次建構 runtime，第二次的 executor 呼叫次數為 0；
   改動任一指紋輸入後第二次必須重探；`python3 -m pytest tests/ -q` 全綠。
+
+**#684 的實作補充**（design D5 之外的六處收斂，票 E／票 F 沿用）：
+
+1. **`PSC_JOB_RUNNER` 進指紋的是「解析後的模式」，不是字面值。** design 的取法欄寫
+   「字面值」，但 `""`／`direct`／`DIRECT` 是**同一個部署**，用字面值會讓一次大小寫或
+   顯式化的整理造成一批無意義的重探；而解析走的正是 design D1 指定的
+   `job_runner.resolve_runner_mode()`，非法值在那支函式已 fail-closed。
+2. **指紋計算永不 raise，取不到的分量落 `<unresolved:<例外型別名>>`。** 這是必要的：
+   票 E 的前置「PATH 宣告票」尚未 land，而生產環境已是 `PSC_JOB_RUNNER=systemd-template`
+   ——`resolve_job_path(role=review)` 現在會 raise（#679 的 fail-closed 是對的）。若指紋
+   計算跟著 raise，票 C 一 land 就會把 planning 打掛。落標記則兩件事同時成立：這一輪照常
+   重探；PATH 補上之後指紋改變、快取自動失效。**取不到答案本身也是一個會變的答案。**
+   標記只帶例外**型別名**不帶訊息，與票 A `classify_probe_failure()` 依賴的是同一條邊界。
+3. **指紋多兩個不進 digest 的診斷欄位**（`resolved_binary`／`unit`）。內容已包含在對應的
+   digest 欄位字串裡，單獨列出只是讓快取 row 不必解析字串就能回答「當時解到哪一支、哪一
+   份 unit」——那正是 D8 拒因表要指名的兩件事。有測試逐欄釘住「六格改任一格 digest 必變、
+   這兩格改了 digest 必不變」。
+4. **`RUN_EXTERNAL_DEPENDENCIES` 不需要補。** plan 原文擔心的 `unlisted_roster_entries()`
+   只涵蓋**掛在帳號 HOME 底下**的資產（`home_anchored_asset_ids()` 由
+   `asset_paths()` × `home_anchored_account()` 機械導出）；本資產在
+   `<coordinator_root>`＝`<agents_root>/coordinator`，不在任何 `declared_accounts()` 的
+   HOME 下，因此雙向封閉本來就成立（已實跑
+   `tests/test_trust_root_external_deps_exhaustive_666.py` 確認）。
+5. **TTL 在讀取時依當下設定判定**（row 只存 `probed_at_epoch`），因此調短立即對既有 row
+   生效；非法值一律當 0（＝永遠 miss）而**不落回預設**——落回預設會讓一個打錯的值靜默
+   維持一小時的快取，那是 #643／#679 反覆買過單的形態。另加一條 design 沒寫的 fail-closed：
+   `probed_at` 落在未來（時鐘倒退）視為 miss，否則一次 NTP 校正就能讓 TTL 對某列永久失效。
+6. **並行不加鎖，但落盤前重讀磁碟合併。** Manager daemon 是單執行緒 poll 迴圈
+   （`manager_daemon.run_loop`，無 `threading`／`asyncio`），因此同一行程內兩輪 tick
+   不會重疊；跨行程（CLI 的 `apply_work_action` 與 daemon 同時跑）則可能兩邊同時 miss。
+   選擇是**接受多探一次**而不是加鎖：鎖住的那一邊會在 Manager 的 tick 迴圈裡等對方跑完
+   一批模型呼叫（每格上限 45s），那個代價比重探大得多。原子寫入（temp ＋ `os.replace`）
+   保證檔案永不半寫，落盤前重讀合併則保證「並行的代價」不會升級成「掉別人剛寫好的
+   結果」。**票 F 切換時仍須一次到位**——不是因為並行，而是因為指紋含 `PSC_JOB_RUNNER`。
 
 ### 4. 票 D｜permgen 把 planner 憑證面 codify（對應 R5；依賴 U-4／U-5／U-7 裁決）
 

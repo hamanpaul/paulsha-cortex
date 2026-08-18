@@ -888,6 +888,25 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         derived_in=("coordinator/provider_backoff.py:22,38-39",),
     ),
     TrustRootAsset(
+        "planning-probe-cache", _T1, _MO, None,
+        (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
+        derived_in=("coordinator/planning_probe_cache.py:cache_path",),
+        note=(
+            "#684（#672 票 C）：planning capability probe 的跨 tick 結果快取"
+            "（`<coordinator_root>/planning-probe-cache.json`）。\n"
+            "**writers／readers 刻意只有 Manager，且刻意不進任何 job 模板 unit 的 "
+            "`ReadWritePaths`**：job 不該知道別的 provider 的探測結果，更不該寫得動它"
+            "——快取一旦可由 job 寫，「這個 provider 是 ready 的」就變成模型可以自證的"
+            "東西，而 `select_secondary_planner()` 的整個異質性論證就建立在那個判定不是"
+            "模型說了算上。tier 是 T1 而非 T0：它改不了 acceptance、也給不了 ship "
+            "authority，最壞情況是讓 planning 選到一個實際不可用的 secondary（下一次"
+            "呼叫即失敗）。\n"
+            "快取本身 fail-closed：讀不回來一律視為 miss 重探，**絕不**沿用 ready"
+            "（見 `planning_probe_cache` 的模組 docstring 對 `not_claimable` 那處"
+            "刻意差異的說明）。"
+        ),
+    ),
+    TrustRootAsset(
         "workflow-report-journal", _T1, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,
         derived_in=("coordinator/manager.py:4434",),
