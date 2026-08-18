@@ -540,6 +540,74 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "列即可，產生器一行都不必改。"
         ),
     ),
+    # ---- Manager 的 GitHub 傳輸層憑證（#666）--------------------------------
+    TrustRootAsset(
+        "manager-gh-credential", _T0, _MO, None,
+        (Principal.MANAGER, Principal.MONITOR),
+        (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.DIRECT_FILE_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.gh_credential_of",),
+        note=(
+            "Manager／monitor 帳號 HOME 下的 `gh` 登入態（`~/.config/gh/hosts.yml`）。"
+            "形態沿用 #640 裁決 (b)：**檔案由使用它的帳號擁有（0600）、放它的目錄維持 "
+            "root-owned 0755**——`hosts.yml` 是 `gh` 唯一寫回 token 的檔（`gh auth "
+            "login`／`refresh` 就地覆寫它），不歸該帳號就 refresh 不回來。\n"
+            "**為何必須存在（#666 實機）**：Manager system unit 帶 `ProtectHome=yes`，"
+            "而 operator 的登入態在 `~/.config/gh/` 底下，`/home` 整個不可見——\n"
+            "    $ sudo -u cortex-manager env HOME=<manager HOME> gh auth status\n"
+            "    You are not logged into any GitHub hosts.\n"
+            "monitor 起來之後兩個 github provider 一起 `degraded`；doctor 的 "
+            "`gh-auth`／`gh-permissions`／`auto-label` 三個 required probe 也全紅。"
+            "這是 #623／#640／#661 那一族的第五個成員，形態逐字相同：**job／服務需要"
+            "的外部相依散落在 operator home，`ProtectHome` 之後不可達**。\n"
+            "**與 #640 的 job 憑證形狀相同、洩漏面不同級——不得混為一談。** "
+            "`builder-executor-credential` 是給 **job 帳號**的模型 provider 憑證：job "
+            "拿它只能呼叫模型，且 job unit 另有 `Environment=GH_TOKEN=`／"
+            "`GITHUB_TOKEN=` 把 GitHub token 清空，成果一律走 `commit-spool` 由 "
+            "Manager 代理推送（D1 outbox）。本資產是給 **Manager** 的，而 Manager 是 "
+            "durable state owner：這個 token **推得動 PR、關得掉 issue、改得了 "
+            "label、merge 得了分支**——它洩漏的是治理平面對上游 repo 的寫入權，不是"
+            "一次模型呼叫的額度。因此\n"
+            "  1. 它**只**掛在 durable state owner 的 HOME 下（job 帳號刻意沒有這一層"
+            "     目錄，見 `scaffold_directories()`）；\n"
+            "  2. 它列在 `permgen.IN_PLACE_CONTENT_WRITE_ASSETS`——`ReadWritePaths` 掛"
+            "     在**檔案本身**，父目錄連 mount 層都不開放可寫；\n"
+            "  3. reader／writer 都只有 MANAGER 與 MONITOR（同一個帳號、同一個 HOME），"
+            "     沒有任何 job persona 在其中，因此機械上不會產生任何跨帳號 ACL。\n"
+            "**monitor 也是 writer 而不是只有 reader**：monitor 的 GitHub provider 直接"
+            "跑 `gh api`（`monitor/providers.py`），token 過期時 refresh 發生在**哪一個"
+            "行程**不由我們決定。只給讀取權會做出一個「平常好好的、token 到期那天 "
+            "monitor 整條 provider 靜默 degraded」的部署。#622 的不變式（monitor 的 "
+            "`ReadWritePaths` 嚴格窄於 Manager）不受影響：兩者都拿到這一條，而 Manager "
+            "另有整棵 durable state 樹。"
+        ),
+    ),
+    TrustRootAsset(
+        "manager-gh-config", _T1, _MO, None,
+        (Principal.INSTALLER,),
+        (Principal.MANAGER, Principal.MONITOR),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.gh_settings_of",),
+        note=(
+            "同一個目錄下的**非憑證**設定（`~/.config/gh/config.yml`：editor／pager／"
+            "prompt／aliases）。root-owned 0644，服務帳號唯讀。\n"
+            "**它與 `manager-gh-credential` 的 owner 刻意不同，這不是疏漏**——下一個"
+            "讀到這裡的人最可能做的事就是「兩個都設成同一種」，因此把理由寫在這裡：\n"
+            "  - `hosts.yml` **承載 token 且會被 `gh` 自己寫回**（refresh／re-login），"
+            "    不歸服務帳號就 refresh 不回來 ⇒ 檔案必須是服務帳號的、0600；\n"
+            "  - `config.yml` **不承載任何憑證、也沒有任何寫回它的執行期路徑**，但它的 "
+            "    `aliases` 可以宣告 `!` 開頭的 **shell alias**——讓服務帳號改得了它，"
+            "    等於給 Manager 一條「自己把任意命令掛進每一次 `gh` 呼叫」的執行面。"
+            "    這與三份 `.gitconfig` 維持 root-owned 的理由（`core.fsmonitor`／"
+            "    `alias.*` 同樣會執行外部命令）**逐字相同**，因此結論也相同：root 擁有、"
+            "    唯讀就夠。\n"
+            "機械落點：`writers` 只有部署身分 ⇒ `classify_owner()` → `DEPLOYMENT` ⇒ "
+            "owner＝root、`0644`、不出現在任何 unit 的 `ReadWritePaths` 上。與 "
+            "`builder-gitconfig` 那一族完全同構。\n"
+            "**Tier-1 而不是 Tier-0**：它改不了 token、也不直接授權發佈；但它能改變 "
+            "`gh` 的行為（alias 執行面），因此不是 advisory。"
+        ),
+    ),
     # ---- job-visible worktree 族 -------------------------------------------
     TrustRootAsset(
         "repo-worktree", _T1, _JV, "paulsha_cortex.config.paths:repo_root",

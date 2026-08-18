@@ -415,8 +415,16 @@ python3 -m paulsha_cortex.trust_root gitconfig four-way --manager --source-repo 
 
 # ✅ executor toolchain 的落位步驟（#640；四個模型 CLI 進 /opt/cortex/toolchain、
 #    node 走系統層、job 的 PSC_BUILDER_PATH 值）——見第 4e 步
+#    #661 起同一份輸出另含：srt／openspec 的搬移、preflight backend 的 venv 落點；
+#    #666 起再含：系統層 python 套件（第 4f 步）、Manager 的 gh 憑證（第 4g 步），
+#    以及**窮舉盤點**與已知未決項（第 4h 步）。
 python3 -m paulsha_cortex.trust_root toolchain four-way
 ```
+
+> **「重跑計畫後零漂移」是本步的驗收方式**（#666）：實機手動補過的東西，如果產生器出
+> 不出來，換一台機器部署就不會有它。上面那一行 ＋ `permissions`／`scaffold` 三份輸出
+> 合起來必須涵蓋 `/opt/cortex/toolchain`、系統層 python 套件、以及每一個帳號 HOME 下的
+> 憑證／設定；**逐項對完仍為空差異**才算這一步做完。
 
 **job-spec 的欄位契約也已隨 #616 落地**——`coordinator/job_runner.py` 的
 `build_job_spec()` 是**唯一**的產生入口，`coordinator/job_shim.py` 是唯一的讀取端：
@@ -1979,6 +1987,244 @@ sudo -u cortex-builder sh -c \
 
 **回滾**：`sudo rm -rf /opt/cortex/toolchain
 /var/lib/cortex-{builder,reviewer-planner}/.codex/auth.json`。
+
+---
+
+### 4f. 系統層 python 套件（#666 漂移項 1：`pytest`）
+
+**沒有這一步，前面全部做完 dispatch 也走得完——但每張 build 卡都會在採信階段被拒。**
+症狀離原因最遠的一步就是這一個，因此它獨立成一節。
+
+`PSC_GATE_CMD_PYTEST="python3 -m pytest -q"` 是**相對名**，由 gate 的 `PSC_GATE_PATH`
+（`/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin`）解析 ⇒ `/usr/bin/python3`，
+**系統層那一支**。gate unit 自己的 `ExecStart` 用的是 `/opt/cortex/venv/bin/python3`，
+但那只涵蓋 ledger writer 本身——**operator 宣告的命令另外解析一次**。兩者是不同的
+interpreter，這是本節存在的唯一理由。
+
+```
+$ sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -m pytest --version
+/usr/bin/python3: No module named pytest
+```
+
+> **後果不是「gate 失敗」**：wrapper 仍會寫出 ledger，只是每一項都記 `failed`／或
+> 整份為空 ⇒ 每張帶 `test_policy` 的 build 卡在 harvest 撞
+> `gate-ledger-missing-expected-gate`（#540 的 acceptance chain）⇒ **交付全部卡住**，
+> 而唯一的痕跡是 `manager.log` 裡的一行。`cortex doctor` 的 `gate-declarations` probe
+> 只驗宣告的 argv 形狀，**驗不到「那個模組 import 得到嗎」**——這一節補的正是那個缺口。
+
+**要裝哪些、為什麼是兩個**（清單由產生器出，不要手抄）：
+
+```bash
+# ✅ 清單與版本約束（含每一項的理由）
+python3 -m paulsha_cortex.trust_root toolchain four-way | sed -n '/系統層 python 發行版/,/完整加固面下/p'
+#   期望兩項：
+#     pytest —— gate 實際跑的 test runner；約束宣告在 pyproject.toml 的 test extra
+#     PyYAML —— **被測樹**的 runtime 相依（不是 pytest 的）：gate 的 cwd 是被驗那棵樹
+#                的副本，pytest 會把 rootdir 插進 sys.path ⇒ `import paulsha_cortex`
+#                解到被驗的樹 ⇒ 它 import yaml。缺它的症狀是 pytest exit code 2
+#                （collection error），不是「測試失敗」。
+```
+
+```bash
+# 🔧 sudo：裝到系統層（**不是** `pip install --user`——ProtectHome 之後讀不到）
+sudo pip install --break-system-packages 'pytest>=7' 'PyYAML>=6'
+```
+
+```bash
+# ✅ 驗證（1）：**以 gate 身分實測**，不是只驗檔案存在
+sudo -u cortex-gate env HOME=/var/lib/cortex-gate \
+  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  python3 -m pytest --version
+#   期望：印出版本，rc=0（不是 `No module named pytest`）
+sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -c 'import yaml; print(yaml.__version__)'
+#   期望：印出版本
+
+# ✅ 驗證（2）：**在完整加固面下**複跑（`sudo -u` 沒有 unit 的加固面）
+#    探測目錄給 gate 帳號擁有——pytest 會在 rootdir 建 `.pytest_cache`，root-owned 的
+#    目錄會讓它印一段與待驗命題無關的 cache 警告，白白製造雜訊。
+sudo install -d -o cortex-gate -g cortex-gate -m 0755 /tmp/psc-gate-probe
+printf 'def test_ok():\n    assert True\n' \
+  | sudo tee /tmp/psc-gate-probe/test_probe.py >/dev/null
+sudo systemd-run --pipe --wait --collect \
+  --uid=cortex-gate --gid=cortex-gate \
+  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
+  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
+  --setenv=HOME=/var/lib/cortex-gate \
+  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  --working-directory=/tmp/psc-gate-probe \
+  /usr/bin/python3 -m pytest -q
+#   期望：`1 passed`，rc=0。
+#   ✅ **這一條在完整加固面下就應該過，不需要放寬任何一項**：CPython 不是 V8，
+#      `MemoryDenyWriteExecute=yes` 對它沒有影響（與 #643 的 node 型 executor 相反）。
+#   ⚠️ 若這一條失敗而拿掉 MDWE 才過，那是新發現——**停下來記回 issue**，不要就地放寬。
+sudo rm -rf /tmp/psc-gate-probe
+
+# ✅ 驗證（3）：**版本是明示的部署決定** —— 記下來並與 operator 側比對
+python3 -m pytest --version                                  # operator 側
+sudo -u cortex-gate env HOME=/var/lib/cortex-gate python3 -m pytest --version   # gate 側
+#   ⚠️ 兩者**可以**不同（兩個 interpreter 各有一份是常態），但**必須被記下來**：
+#      版本分岔的症狀是「gate 判定與本機跑不一樣」，不是報錯。把 gate 側那一版寫進
+#      本 runbook 的部署紀錄；哪天要升，升的是 gate 側那一份。
+
+# ✅ 驗證（4）：宣告本身
+sh -c 'set -a; . /opt/cortex/etc/cortex-manager.env; set +a; echo "[$PSC_GATE_CMD_PYTEST]"'
+#   期望：`[python3 -m pytest -q]`（產生器出的建議值；見 4b 步）
+python3 -m paulsha_cortex.trust_root toolchain four-way | grep 'PSC_GATE_CMD_'
+```
+
+> **為什麼不乾脆把宣告改成 `/opt/cortex/venv/bin/python3 -m pytest`？** 那是一個
+> **operator 可以做、但產生器不會替你做**的裁決：改了之後系統層這兩個套件的需求整個
+> 消失，但 gate 跑的 pytest 版本就與 cortex 自己的部署版本綁在一起（升 cortex 會連帶
+> 換掉 gate 的判準）。兩邊各有取捨。**若你改了宣告，這一節就不再適用**——同時要把
+> `permgen.SYSTEM_PYTHON_DISTRIBUTIONS` 一起改掉，測試會提醒你。
+
+**回滾**：`sudo pip uninstall --break-system-packages pytest`（`PyYAML` 通常是系統套件
+的相依，**不要**動它）。
+
+---
+
+### 4g. Manager 的 gh 憑證（#666 漂移項 2）
+
+**沒有這一步，monitor 起得來但兩個 github provider 一起 `degraded`**，且 doctor 的
+`gh-auth`／`gh-permissions`／`auto-label` 三個 required probe 全紅。
+
+```
+$ sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status
+You are not logged into any GitHub hosts.
+```
+
+operator 側的登入態在 `~/.config/gh/` 底下，`ProtectHome=yes` 之後 `/home` 整個不可見
+——與 #640／#661 的成因逐字相同，這是那一族的**第五個**成員。
+
+> **⚠️ 這一份與 4e 的 job 憑證形狀相同、洩漏面不同級，不要混為一談。**
+> 4e 那一份是給 **job 帳號**的模型 provider 憑證：被竊只換得到模型呼叫額度，而且 job
+> 模板 unit 另有 `Environment=GH_TOKEN=`／`GITHUB_TOKEN=` 把 GitHub token 清空，成果
+> 一律走 `commit-spool` 由 Manager 代理推送。
+> 本節這一份是給 **Manager** 的，而 Manager 是 durable state owner——這個 token
+> **推得動 PR、關得掉 issue、改得了 label、merge 得了分支**，洩漏的是治理平面對上游
+> repo 的寫入權。因此它只落在 Manager 的 HOME 下；**job 帳號刻意沒有 `~/.config/gh`
+> 這一層目錄**（`trust_root scaffold` 不會為它們建，建了就是多開一條被明確關掉的通道）。
+
+> **⚠️ 兩個檔的 owner 刻意不同，這不是疏漏**（下一個人最可能做錯的就是把兩個設成同一種）：
+>
+> | 檔 | owner / mode | 為什麼 |
+> |---|---|---|
+> | `.config/`、`.config/gh/` | `root:root 0755` | 增／刪／換需要**目錄**的寫入權；性質全部落在這一層 |
+> | `hosts.yml` | `cortex-manager:cortex-manager 0600` | `gh` **唯一寫回 token 的檔**（`auth login`／`refresh` 就地覆寫），不歸它就 refresh 不回來 |
+> | `config.yml` | `root:root 0644` | 非憑證；但 `aliases` 可宣告 `!` 開頭的 **shell alias** ⇒ 讓服務帳號改得了它等於給 Manager 一條「把任意命令掛進每一次 `gh` 呼叫」的執行面。與三份 `.gitconfig` 維持 root-owned 是**同一條理由**（`core.fsmonitor`／`alias.*`） |
+
+> **落點為什麼是 `~/.config/gh` 而不是別條**：`gh` 依序看 `$GH_CONFIG_DIR` →
+> `$XDG_CONFIG_HOME/gh` → `$HOME/.config/gh`，而產生出來的 unit 設 `HOME=` 與
+> `XDG_CACHE_HOME=`、**刻意不設 `XDG_CONFIG_HOME=`**。哪天有人在 unit 或
+> EnvironmentFile 補上 `XDG_CONFIG_HOME`，憑證的實際落點會跟著搬走而登記表不會知道
+> ——那是**無聲**的漂移：`gh auth status` 變成「未登入」，而檔案還好端端躺在原處。
+
+```bash
+# ✅ 先確認兩層目錄已由骨架建出（第 2b 步；這裡只驗，不建）
+python3 -m paulsha_cortex.trust_root scaffold four-way | grep '\.config'
+#   期望兩行：
+#     install -d -o root -g root -m 0755 /var/lib/cortex-manager/.config
+#     install -d -o root -g root -m 0755 /var/lib/cortex-manager/.config/gh
+ls -ld /var/lib/cortex-manager/.config /var/lib/cortex-manager/.config/gh
+#   期望：兩層皆 drwxr-xr-x root root
+```
+
+```bash
+# 🔧 sudo：把 operator 那份登入態複製過去（**兩個檔、兩種 owner**）
+sudo install -o cortex-manager -g cortex-manager -m 0600 \
+  "$HOME/.config/gh/hosts.yml" /var/lib/cortex-manager/.config/gh/hosts.yml
+sudo install -o root -g root -m 0644 \
+  "$HOME/.config/gh/config.yml" /var/lib/cortex-manager/.config/gh/config.yml
+#   ↑ `.config/gh/` 目錄本身**不要**動。
+#   落位步驟也由產生器出（含理由與驗證）：
+#     python3 -m paulsha_cortex.trust_root toolchain four-way | sed -n '/Manager 的 gh 憑證/,/Permission denied/p'
+```
+
+```bash
+# ✅ 驗證（1）：與登記表產生的計畫逐字一致
+python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
+  --operator-account "$USER" --external-reader-account none | grep 'config/gh'
+#   期望四行（皆帶 `[ ! -e ] ||` 守衛）：
+#     chown cortex-manager:cortex-manager …/hosts.yml
+#     chmod 0600                            …/hosts.yml
+#     chown root:root                       …/config.yml
+#     chmod 0644                            …/config.yml
+ls -l /var/lib/cortex-manager/.config/gh/
+#   期望：-rw------- cortex-manager cortex-manager hosts.yml
+#         -rw-r--r-- root           root           config.yml
+
+# ✅ 驗證（2）：**以 Manager 身分實測**（不是只驗檔案存在）
+sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status
+#   期望：以 fleet 正式身分登入成功、`Token scopes` 列得出來。
+#   ⚠️ 若仍是 `You are not logged into any GitHub hosts.`：先看有沒有人設了
+#      `XDG_CONFIG_HOME`／`GH_CONFIG_DIR`（見上方那條無聲漂移的警告）。
+
+# ✅ 驗證（3）：**在完整加固面下**複跑（`sudo -u` 沒有 unit 的加固面）
+sudo systemd-run --pipe --wait --collect \
+  --uid=cortex-manager --gid=cortex-manager \
+  --property=NoNewPrivileges=yes --property=ProtectSystem=strict \
+  --property=ProtectHome=yes --property=MemoryDenyWriteExecute=yes \
+  --setenv=HOME=/var/lib/cortex-manager \
+  --setenv=PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin \
+  /usr/bin/gh auth status
+#   期望：同上。`gh` 是原生 ELF，MDWE 不影響它。
+
+# ✅ 驗證（4）：**不變式「改得了內容、建不了新檔」**（與 4e 的憑證逐條同構）
+sudo -u cortex-manager sh -c \
+  "cat /var/lib/cortex-manager/.config/gh/hosts.yml > /tmp/psc-hosts.bak && \
+   cat /tmp/psc-hosts.bak > /var/lib/cortex-manager/.config/gh/hosts.yml" && echo "改內容: OK"
+#   期望：OK（token refresh 走得通）
+sudo -u cortex-manager sh -c \
+  "touch /var/lib/cortex-manager/.config/gh/newfile" 2>&1 | tail -1
+#   期望：Permission denied ← **建不了新檔**（同時封掉「暫存檔＋rename」那條路）
+sudo -u cortex-manager sh -c \
+  "rm -f /var/lib/cortex-manager/.config/gh/config.yml" 2>&1 | tail -1
+#   期望：Permission denied ← **刪不掉 root-owned 的鄰居**
+sudo -u cortex-manager sh -c \
+  "printf 'aliases:\n  x: \"!id\"\n' > /var/lib/cortex-manager/.config/gh/config.yml" 2>&1 | tail -1
+#   期望：Permission denied ← **改不了 config.yml 的內容**（`!` shell alias 那條執行面關著）
+sudo rm -f /tmp/psc-hosts.bak
+
+# ✅ 驗證（5）：unit 的 ReadWritePaths 只掛**那一個檔**，不是父目錄
+python3 -m paulsha_cortex.trust_root unit four-way --manager | grep 'config/gh'
+python3 -m paulsha_cortex.trust_root unit four-way --monitor | grep 'config/gh'
+#   期望兩者都只有 `ReadWritePaths=/var/lib/cortex-manager/.config/gh/hosts.yml`
+#   （出現 `…/.config/gh` 這條目錄＝父目錄被開放，`config.yml` 會跟著可寫 ⇒ 錯）
+
+# ✅ 驗證（6）：job 側必須是**反向**的
+python3 -m paulsha_cortex.trust_root unit four-way --job | grep -c 'config/gh' || true
+#   期望：0
+python3 -m paulsha_cortex.trust_root unit four-way --job | grep 'GH_TOKEN'
+#   期望：`Environment=GH_TOKEN=`（空值）
+```
+
+**回滾**：`sudo rm -f /var/lib/cortex-manager/.config/gh/{hosts.yml,config.yml}`。
+
+---
+
+### 4h. 窮舉盤點的複核（#666）——**每次部署都跑一次**
+
+前面 4e／4f／4g 三節各自處理一族，但真正要防的是「下一個沒被盤到的相依」。把盤點印出來
+逐項對一次，比等症狀出現便宜得多。
+
+```bash
+# ✅ 完整盤點（判準：降權帳號在完整加固面下跑完一個 run 需要碰到的所有外部程式與憑證）
+python3 -m paulsha_cortex.trust_root toolchain four-way | sed -n '/窮舉盤點/,$p'
+#   逐段列出 dispatch／model-call／review／gate／ship／monitor 六段各需要什麼、
+#   由哪個 principal 碰到、登記在哪張表。
+
+# ✅ 雙向封閉（兩個都必須是空的；非空＝盤點已漂移，先修再往下裝）
+python3 -c "from paulsha_cortex.trust_root import permgen as p
+print('uncovered:', p.uncovered_run_dependencies())
+print('unlisted :', p.unlisted_roster_entries())"
+#   期望：兩行皆為 `()`。
+
+# ✅ 已知未決項（**不是**待辦清單，是「已經被看見的決定」）
+python3 -c "from paulsha_cortex.trust_root import permgen as p
+for d in p.deferred_run_dependencies(): print('-', d.name, '→', d.disposition)"
+#   目前四項；每一項的完整理由與症狀在 permgen.deferred_run_dependencies() 的 note 裡。
+#   ⚠️ 這幾項**尚未落地**，不要照著自己補——它們各自需要 operator 的部署面裁決。
+```
 
 ---
 
@@ -4326,8 +4572,32 @@ codex --version
 stat -c '%n %U:%G %a' /var/lib/cortex-builder/.codex /var/lib/cortex-builder/.codex/auth.json
 #   期望：目錄 root:root 755、檔案 cortex-builder:cortex-builder 600
 
+# ✅ Manager 的 gh 憑證仍是「兩個檔、兩種 owner」（#666；第 4g 步）
+stat -c '%n %U:%G %a' /var/lib/cortex-manager/.config/gh \
+  /var/lib/cortex-manager/.config/gh/hosts.yml \
+  /var/lib/cortex-manager/.config/gh/config.yml
+#   期望：目錄 root:root 755、hosts.yml cortex-manager:cortex-manager 600、
+#         config.yml root:root 644。
+#   ⚠️ 若 config.yml 變成 cortex-manager owned，`aliases` 的 `!` shell alias 執行面
+#      就打開了——那是最容易被「順手統一成同一種 owner」弄壞的一格。
+sudo -u cortex-manager env HOME=/var/lib/cortex-manager gh auth status >/dev/null \
+  && echo "manager gh: OK"
+
+# ✅ gate 跑得動 pytest，且版本沒有無聲換掉（#666；第 4f 步）
+sudo -u cortex-gate env HOME=/var/lib/cortex-gate \
+  PATH=/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin python3 -m pytest --version
+#   期望：與部署紀錄裡記下的那一版逐字相同。換掉了而沒人知道 ⇒ gate 判準已漂移。
+
+# ✅ 窮舉盤點仍雙向封閉（#666；第 4h 步）——非空即代表登記表已落後於程式碼
+python3 -c "from paulsha_cortex.trust_root import permgen as p
+assert p.uncovered_run_dependencies() == (), p.uncovered_run_dependencies()
+assert p.unlisted_roster_entries() == (), p.unlisted_roster_entries()
+print('inventory closed:', len(p.RUN_EXTERNAL_DEPENDENCIES), 'deps;',
+      len(p.deferred_run_dependencies()), 'deferred')"
+
 # ✅ 產生器本身的等式測試（含 ReadWritePaths 無遺漏無多餘）
-python3 -m pytest tests/test_trust_root_permgen_p2a.py tests/test_trust_root_permgen_p2b.py -q
+python3 -m pytest tests/test_trust_root_permgen_p2a.py tests/test_trust_root_permgen_p2b.py \
+  tests/test_trust_root_external_deps_exhaustive_666.py -q
 ```
 
 ---
