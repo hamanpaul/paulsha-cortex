@@ -5317,10 +5317,11 @@ def unit_replica_properties(
         # 下一步當成 specifier 展開成 `%<instance>`，而它的正確結果是字面 `%i`。
         # 這種錯法不會報錯，只會讓探針的加固面與 unit 悄悄不同——正是本票要根除的那類。
         sentinel = "\x00PCT\x00"
-        expanded = (
-            value.replace("%%", sentinel).replace("%i", instance).replace(sentinel, "%")
-        )
+        expanded = value.replace("%%", sentinel).replace("%i", instance)
+        # 未知 specifier 的檢查必須在**還原跳脫之前**：還原後的字面 `%i` 長得跟
+        # specifier 一模一樣，先還原會把合法的 `%%i` 誤判成展不開的 specifier。
         leftover = re.search(r"%[a-zA-Z]", expanded)
+        expanded = expanded.replace(sentinel, "%")
         if leftover is not None:
             raise UnitReplicaDriftError(
                 f"{key}= 的值含本函式展不開的 systemd specifier "
