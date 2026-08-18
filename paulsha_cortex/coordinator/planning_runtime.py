@@ -10,12 +10,13 @@ import stat
 import subprocess
 import tempfile
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
+from . import job_runner
 from .launcher import build_agy_argv
 from .model_identities import (
     AGY_MODEL_ID,
@@ -756,9 +757,31 @@ def _find_json_object(text: str, *, allow_partial: bool = False) -> object | Non
 
 
 def _extract_json(stdout: str, output_path: Path) -> object:
+    """就地讀取第二輸出候選（codex 的 `-o last.json`）後交給共用抽取層。
+
+    issue #683：抽取本身移到 `_extract_json_candidates`，因為降權之後
+    「第二候選是哪來的」由 invoker 決定（in-process 是 tempdir 裡的檔案，
+    job 模式下 Manager 讀不到 job-owned scratch，只剩 stdout——design D-j 的
+    退步）。本函式維持既有簽章，供直接持有 `output_path` 的呼叫端使用。
+    """
+
+    output_text = (
+        output_path.read_text(encoding="utf-8") if output_path.is_file() else None
+    )
+    return _extract_json_candidates(stdout, output_text)
+
+
+def _extract_json_candidates(stdout: str, output_text: str | None) -> object:
+    """兩個候選（第二輸出優先、再 stdout）→ 模型輸出本體。
+
+    JSON 抽取刻意**留在共用層**、不進 invoker：兩個 invoker 吃同一份
+    envelope 處理與 fail-closed 判準（design D1）。本 repo 已經在 #401／#516／
+    #520 買過三次「同一件事兩份真相」的單。
+    """
+
     candidates = [stdout.strip()]
-    if output_path.is_file():
-        candidates.insert(0, output_path.read_text(encoding="utf-8").strip())
+    if output_text is not None:
+        candidates.insert(0, output_text.strip())
     for candidate in candidates:
         value = _find_json_object(candidate)
         if not isinstance(value, dict):
@@ -827,114 +850,301 @@ def _seed_hermetic_claude_env(temp_dir: str) -> dict[str, str] | None:
     return {**os.environ, "CLAUDE_CONFIG_DIR": str(config_dir)}
 
 
+# ---------------------------------------------------------------------------
+# issue #683（#672 票 B）：`PlanningInvoker` 抽象
+#
+# 修法前 `_invoke_json` 把三件事揉在一起：**怎麼跑一個 executor**（sandbox、
+# cwd、env、逾時、雙向快照、drift 收容）、**跑之前準備什麼**（prompt）、
+# **跑完之後怎麼解讀**（JSON 抽取）。票 E（#686）要把第一件事換成降權 job，
+# 而第二／第三件事逐字不變——沒有接縫時那次改動會落在同一支函式裡，變成
+# `if degraded:` 分岔，於是「哪幾條防線在哪個模式下生效」只能靠讀 `if` 才知道
+# （design D1）。
+#
+# 切面因此切在「拿 identity ＋ prompt，回傳 stdout／stderr／rc」這一層：
+#
+#   進 invoker（＝**怎麼跑**）：一次性 sandbox、`cwd`、hermetic claude env、
+#     逾時、以及**執行前後的雙向快照與 drift 收容**——後者看似屬於呼叫端，
+#     但它們的作用對象（sandbox 與 operator 樹的關係）完全由「怎麼跑」決定：
+#     job 模式下 operator 樹由 `ProtectSystem=strict` 在 kernel 層擋掉（D-e
+#     從偵測升級為阻擋），那時這幾條就**不該**再由呼叫端執行一次。
+#   留呼叫端（＝**跑之前跑之後**）：prompt 組裝、rc 判定、JSON 抽取與 envelope
+#     處理（design D1 明文要求兩個 invoker 吃同一份）。
+#
+# 本票**只**新增接縫，不新增第二個實作、不改任何行為。
+# ---------------------------------------------------------------------------
+
+#: `PlanningInvocation.purpose` 的四個 production 值（design D9）。只進 instance
+#: 名與診斷，**不參與任何決策**——票 E 用它讓
+#: `systemctl list-units 'cortex-reviewer-job@*'` 的輸出直接說得出「這一批 job
+#: 在做什麼」，不必回頭查 spec。
+PLANNING_PURPOSE_PROBE = "probe"
+PLANNING_PURPOSE_QUESTIONER = "questioner"
+PLANNING_PURPOSE_SECONDARY = "secondary"
+PLANNING_PURPOSE_INTEGRATOR = "integrator"
+#: 直呼叫（測試、診斷）的預設。production 的四條路徑一律明示 purpose。
+PLANNING_PURPOSE_UNSPECIFIED = "planning"
+
+
+@dataclass(frozen=True)
+class PlanningInvocation:
+    """一次 planning 模型呼叫的完整輸入（design D1）。
+
+    `evidence_root`／`run_id` 對 in-process 是 drift 報告的落點，對票 E 的 job
+    invoker 則是 instance 命名的來源（`plan-<run_id 前 12 字>-<purpose>-<序號>`）
+    ——兩邊都需要，因此屬於 invocation 而非 invoker 的建構參數。
+    """
+
+    identity: ModelIdentity
+    prompt: str
+    purpose: str
+    timeout_seconds: int
+    worktree: Path
+    evidence_root: str | Path | None = None
+    run_id: str = "ephemeral"
+
+
+@dataclass(frozen=True)
+class PlanningOutcome:
+    """一次呼叫的原始結果——**不含任何解讀**。
+
+    `output_text` 是 codex `-o last.json` 這個第二輸出候選的內容（無則 ``None``）。
+    它必須在這裡被讀出來，因為 in-process 的落點在 invoker 自己的一次性 tempdir
+    裡，invoker 一返回就消失；job 模式下 Manager 讀不到 job-owned scratch，這一格
+    恆為 ``None``（design D-j 的 R-2 退步）。
+
+    `diagnostics` 本票不產出任何內容（direct 模式沒有第二個資訊來源）；票 E 的
+    D8 會在這裡放 `unit`／`hardening_profile`／`resolved_binary`，讓
+    `executor-silent-exit` 這種「連錯誤訊息都沒有」的失敗有方向可查。
+    """
+
+    returncode: int | None
+    stdout: str | None
+    stderr: str | None = None
+    output_text: str | None = None
+    diagnostics: Mapping[str, str] = field(default_factory=dict)
+
+
+class PlanningInvoker(Protocol):
+    """planning 的執行後端。票 E 換掉的就是這個介面的實作。"""
+
+    def run(self, invocation: PlanningInvocation) -> PlanningOutcome:
+        """跑一次 identity＋prompt 呼叫，回傳原始結果。
+
+        契約：executor 非零退出**不是**本方法的錯誤（交呼叫端判定）；但
+        「執行過程違反了隔離契約」（弄髒拋棄式 sandbox、動到 operator 樹）
+        MUST 由本方法 fail-closed 拋出——那是 invoker 才有的視角。
+        """
+
+    def capability_probe_runner(self) -> Callable[..., object]:
+        """`probe_agy_capability` 兩次裸 CLI 呼叫用的執行接縫。
+
+        為什麼不是 `run()`：agy 的能力探測不是「一個 prompt」，而是一段兩步
+        CLI 協定（`agy models` 列出 model id，再拿解析到的 token 跑 smoke）。
+        那段協定的真相在 `model_identities.probe_agy_capability`，把它複製一份
+        到這裡就是第二份真相。因此 invoker 交出一個 `ProcessRunner` 形狀的
+        callable，讓既有 probe 原樣使用——**兩次 CLI 呼叫各算一次 invocation**
+        （plan 票 B）。票 E 在這裡回傳的是「一個 argv → 一個降權 job」的閉包。
+        """
+
+
+class InProcessPlanningInvoker:
+    """在呼叫端行程內執行（＝**現行行為**，direct 模式）。
+
+    design D2 的十條防線在 direct 模式下全部由本類別保證：D-a 一次性 tempdir、
+    D-b sandbox 複本、D-c `cwd=sandbox`、D-d sandbox 弄髒即 fail-closed、
+    D-e operator 樹雙向快照、D-f drift 唯讀收容、D-g claude hermetic env、
+    D-h `subprocess` 逾時、D-i `capture_output`、D-j codex 第二輸出候選。
+
+    本檔唯一持有 `subprocess.run` 的地方（issue #683 驗收第二條）。
+    """
+
+    def __init__(self, runner: Callable[..., object] | None = None) -> None:
+        self._runner = runner if runner is not None else subprocess.run
+
+    def capability_probe_runner(self) -> Callable[..., object]:
+        # direct 模式下「一次 agy CLI 呼叫」就是「一次 process 呼叫」，因此
+        # 接縫退化成底層 runner 本身——行為與修法前逐字相同（本票是純重構）。
+        # 注意 `probe_agy_capability` 刻意**不**帶 cwd／sandbox：那是它繞過
+        # `_invoke_json` 全部防線的既有事實（#672 母票已記錄），本票不改變它，
+        # 只讓它從此有一個能被票 E 換掉的接縫。
+        return self._runner
+
+    def run(self, invocation: PlanningInvocation) -> PlanningOutcome:
+        identity = invocation.identity
+        worktree = invocation.worktree
+        run_id = invocation.run_id
+        evidence_root = invocation.evidence_root
+        operator_before = _tree_snapshot(worktree)
+        with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
+            baseline = Path(temp_dir) / "baseline"
+            sandbox = Path(temp_dir) / "checkout"
+            _copy_planning_sandbox(worktree, baseline)
+            shutil.copytree(baseline, sandbox, symlinks=True)
+            sandbox_before = _tree_snapshot(sandbox)
+            output_path = Path(temp_dir) / "last.json"
+            argv = _planning_argv(identity, invocation.prompt, temp_dir, sandbox)
+            run_kwargs: dict[str, object] = {}
+            if identity.executor == "claude":
+                # 僅 claude 路徑帶 env 覆寫；其他 executor（codex/agy）維持不帶，
+                # 避免行為外溢。
+                env = _seed_hermetic_claude_env(temp_dir)
+                if env is not None:
+                    run_kwargs["env"] = env
+            failure: BaseException | None = None
+            outcome: PlanningOutcome | None = None
+            try:
+                raw = self._runner(
+                    argv,
+                    cwd=str(sandbox),
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=invocation.timeout_seconds,
+                    **run_kwargs,
+                )
+                returncode = getattr(raw, "returncode", None)
+                stdout = getattr(raw, "stdout", None)
+                # 第二候選必須在 tempdir 消失之前讀出來（見 `PlanningOutcome`）。
+                # 讀取條件與修法前逐字相同：修法前 `_extract_json` 只在
+                # 「rc==0 且 stdout 是字串」時才被呼叫，因此 `last.json`
+                # 在失敗路徑上**從不被讀**。無條件讀會讓「檔案存在但讀不出來」
+                # （非 UTF-8、權限）在失敗路徑上換掉例外型別，而例外型別正是
+                # `_probe_identity` 的 `safe-probe-failed` diagnostic 唯一內容、
+                # 也是票 A `classify_probe_failure()` 的分類輸入。
+                output_text: str | None = None
+                if returncode == 0 and isinstance(stdout, str) and output_path.is_file():
+                    output_text = output_path.read_text(encoding="utf-8")
+                outcome = PlanningOutcome(
+                    returncode=returncode,
+                    stdout=stdout,
+                    stderr=getattr(raw, "stderr", None),
+                    output_text=output_text,
+                )
+            except BaseException as exc:
+                failure = exc
+            finally:
+                try:
+                    sandbox_dirty = _tree_snapshot(sandbox) != sandbox_before
+                except BaseException:
+                    sandbox_dirty = True
+                    try:
+                        _make_tree_traversable(sandbox)
+                    except BaseException:
+                        pass
+                if sandbox_dirty:
+                    failure = ValueError(
+                        "planning launcher modified disposable read-only sandbox"
+                    )
+
+                operator_dirty = False
+                try:
+                    operator_dirty = _tree_snapshot(worktree) != operator_before
+                except BaseException:
+                    operator_dirty = True
+                if operator_dirty:
+                    # issue #507：偵測到 drift 一律 fail-closed（本次 planning 呼叫
+                    # 的結果不可信），但**不得改寫 operator worktree**。
+                    # `rollback_scope` 傳空集合是刻意的：launcher 以 `cwd=sandbox`
+                    # 執行、`--add-dir` 也只指向 sandbox，這條路徑在 operator 樹裡
+                    # 沒有任何「本次 run 自產」的產物可言，因此可證明的還原範圍就是
+                    # 空的。planning artifact 的落地另走
+                    # `manager._publish_planning_artifacts`（有交易與 authority 把
+                    # 關），不在此。任何差異都當成 operator／其他 agent 的並行工作
+                    # 保留原地，只做備份與報告。
+                    try:
+                        summary = _contain_operator_drift(
+                            worktree,
+                            baseline,
+                            evidence_root=(
+                                Path(evidence_root) if evidence_root is not None else None
+                            ),
+                            run_id=run_id,
+                            rollback_scope=frozenset(),
+                        )
+                    except BaseException as exc:  # noqa: BLE001 - 診斷面 fail-open
+                        # drift 收斂只負責診斷；它自己壞掉時仍要拋出可辨識的
+                        # planning 失敗，不得換成一個與現場無關的例外（修法前那條
+                        # 「restore failed」出口就是這個反例）。
+                        logger.error(
+                            "planning-worktree-drift-containment-failed run_id=%s error=%s: %s",
+                            run_id,
+                            type(exc).__name__,
+                            str(exc)[:200],
+                        )
+                        summary = {"counts": {}, "report_path": None, "backup_root": None}
+                    message = _operator_drift_message(summary)
+                    logger.error("planning-worktree-drift run_id=%s %s", run_id, message)
+                    failure = ValueError(message)
+            if failure is not None:
+                raise failure
+            if outcome is None:  # pragma: no cover - failure 為 None ⇒ 必已賦值
+                raise ValueError("planning invoker produced no outcome")
+            return outcome
+
+
+def _select_planning_invoker(env: Mapping[str, str]) -> PlanningInvoker:
+    """依部署宣告挑執行後端。**選擇點只有這一個**（design D1）。
+
+    唯一輸入是 `PSC_JOB_RUNNER`，與 launcher 共用同一支解析函式——非法值在該
+    函式已 fail-closed，這裡不重寫一份判定。刻意**不**新增
+    `PSC_PLANNING_INVOKER` 之類的 planning 專屬開關：第二個開關的失效模式是
+    「以為降權了、其實沒有」，而那種失敗看起來是成功的。
+
+    issue #683（票 B）只交付接縫，因此三種模式目前**全部**回 in-process
+    ——這正是「純重構、行為零改變」的意思。票 E（#686）新增
+    `JobPlanningInvoker` 之後，改的只有本函式的對應表一處。
+    """
+
+    job_runner.resolve_runner_mode(env)
+    return InProcessPlanningInvoker()
+
+
 def _invoke_json(
     identity: ModelIdentity,
     prompt: str,
     *,
     worktree: Path,
-    runner: Callable[..., object],
+    runner: Callable[..., object] | None = None,
+    invoker: PlanningInvoker | None = None,
+    purpose: str = PLANNING_PURPOSE_UNSPECIFIED,
     timeout_seconds: int,
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
 ) -> object:
-    operator_before = _tree_snapshot(worktree)
-    with tempfile.TemporaryDirectory(prefix="cortex-planning-") as temp_dir:
-        baseline = Path(temp_dir) / "baseline"
-        sandbox = Path(temp_dir) / "checkout"
-        _copy_planning_sandbox(worktree, baseline)
-        shutil.copytree(baseline, sandbox, symlinks=True)
-        sandbox_before = _tree_snapshot(sandbox)
-        output_path = Path(temp_dir) / "last.json"
-        argv = _planning_argv(identity, prompt, temp_dir, sandbox)
-        run_kwargs: dict[str, object] = {}
-        if identity.executor == "claude":
-            # 僅 claude 路徑帶 env 覆寫；其他 executor（codex/agy）維持不帶，
-            # 避免行為外溢。
-            env = _seed_hermetic_claude_env(temp_dir)
-            if env is not None:
-                run_kwargs["env"] = env
-        failure: BaseException | None = None
-        result: object | None = None
-        try:
-            raw = runner(
-                argv,
-                cwd=str(sandbox),
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                **run_kwargs,
-            )
-            returncode = getattr(raw, "returncode", None)
-            stdout = getattr(raw, "stdout", None)
-            if returncode != 0 or not isinstance(stdout, str):
-                raise ValueError(
-                    f"planning launcher failed: {identity.executor}/{identity.model_id}"
-                )
-            result = _extract_json(stdout, output_path)
-        except BaseException as exc:
-            failure = exc
-        finally:
-            try:
-                sandbox_dirty = _tree_snapshot(sandbox) != sandbox_before
-            except BaseException:
-                sandbox_dirty = True
-                try:
-                    _make_tree_traversable(sandbox)
-                except BaseException:
-                    pass
-            if sandbox_dirty:
-                failure = ValueError("planning launcher modified disposable read-only sandbox")
+    """呼叫端這一半：組 invocation → 交 invoker → 判 rc → 抽 JSON。
 
-            operator_dirty = False
-            try:
-                operator_dirty = _tree_snapshot(worktree) != operator_before
-            except BaseException:
-                operator_dirty = True
-            if operator_dirty:
-                # issue #507：偵測到 drift 一律 fail-closed（本次 planning 呼叫
-                # 的結果不可信），但**不得改寫 operator worktree**。
-                # `rollback_scope` 傳空集合是刻意的：launcher 以 `cwd=sandbox`
-                # 執行、`--add-dir` 也只指向 sandbox，這條路徑在 operator 樹裡
-                # 沒有任何「本次 run 自產」的產物可言，因此可證明的還原範圍就是
-                # 空的。planning artifact 的落地另走
-                # `manager._publish_planning_artifacts`（有交易與 authority 把
-                # 關），不在此。任何差異都當成 operator／其他 agent 的並行工作
-                # 保留原地，只做備份與報告。
-                try:
-                    summary = _contain_operator_drift(
-                        worktree,
-                        baseline,
-                        evidence_root=(
-                            Path(evidence_root) if evidence_root is not None else None
-                        ),
-                        run_id=run_id,
-                        rollback_scope=frozenset(),
-                    )
-                except BaseException as exc:  # noqa: BLE001 - 診斷面 fail-open
-                    # drift 收斂只負責診斷；它自己壞掉時仍要拋出可辨識的
-                    # planning 失敗，不得換成一個與現場無關的例外（修法前那條
-                    # 「restore failed」出口就是這個反例）。
-                    logger.error(
-                        "planning-worktree-drift-containment-failed run_id=%s error=%s: %s",
-                        run_id,
-                        type(exc).__name__,
-                        str(exc)[:200],
-                    )
-                    summary = {"counts": {}, "report_path": None, "backup_root": None}
-                message = _operator_drift_message(summary)
-                logger.error("planning-worktree-drift run_id=%s %s", run_id, message)
-                failure = ValueError(message)
-        if failure is not None:
-            raise failure
-        return result
+    `runner` 與 `invoker` 互斥。前者是既有呼叫端（與大量既有測試）注入 process
+    runner 的方式，等同「用 in-process invoker 跑」；兩者同時給等於同一件事有
+    兩份真相，fail-closed。
+    """
+
+    if invoker is None:
+        invoker = InProcessPlanningInvoker(runner)
+    elif runner is not None:
+        raise ValueError("planning invoker and runner are mutually exclusive")
+    outcome = invoker.run(
+        PlanningInvocation(
+            identity=identity,
+            prompt=prompt,
+            purpose=purpose,
+            timeout_seconds=timeout_seconds,
+            worktree=Path(worktree),
+            evidence_root=evidence_root,
+            run_id=run_id,
+        )
+    )
+    if outcome.returncode != 0 or not isinstance(outcome.stdout, str):
+        raise ValueError(
+            f"planning launcher failed: {identity.executor}/{identity.model_id}"
+        )
+    return _extract_json_candidates(outcome.stdout, outcome.output_text)
 
 
 def _probe_identity(
     identity: ModelIdentity,
     *,
     worktree: Path,
-    runner: Callable[..., object],
+    invoker: PlanningInvoker,
     timeout_seconds: int,
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
@@ -952,7 +1162,8 @@ def _probe_identity(
             identity,
             prompt,
             worktree=worktree,
-            runner=runner,
+            invoker=invoker,
+            purpose=PLANNING_PURPOSE_PROBE,
             timeout_seconds=timeout_seconds,
             evidence_root=evidence_root,
             run_id=run_id,
@@ -1067,7 +1278,8 @@ def build_production_planning_runtime(
     *,
     primary: tuple[str, str],
     worktree: str | Path,
-    runner: Callable[..., object] = subprocess.run,
+    runner: Callable[..., object] | None = None,
+    invoker: PlanningInvoker | None = None,
     timeout_seconds: int = 120,
     evidence_root: str | Path | None = None,
     run_id: str = "ephemeral",
@@ -1079,8 +1291,28 @@ def build_production_planning_runtime(
     未帶入時（直呼叫、探測、測試）**不寫任何 evidence**——刻意不 fallback 到
     `paths.coordinator_root()`，避免非 daemon 的呼叫端在 operator 的執行期狀態
     目錄下留下非預期檔案。
+
+    issue #683：執行後端改由 `PlanningInvoker` 承載。三種注入方式的優先序
+    （由高到低、互斥）：
+
+    1. `invoker=`——直接指定後端（票 E 的 `JobPlanningInvoker` 與測試用）。
+    2. `runner=`——注入 process runner，等同「用 in-process invoker 跑」。
+       這是既有呼叫端與大量既有測試的用法，逐字保留。
+    3. 兩者皆無（＝daemon 的實際呼叫形態）——由 `_select_planning_invoker`
+       依 `PSC_JOB_RUNNER` 決定。**這是全庫唯一的執行後端選擇點。**
+
+    四個 adapter 與兩種 probe 全部走同一個 invoker——票 E 因此只換一個物件，
+    不必再碰任何呼叫端。
     """
 
+    if invoker is not None and runner is not None:
+        raise ValueError("planning invoker and runner are mutually exclusive")
+    if invoker is None:
+        invoker = (
+            InProcessPlanningInvoker(runner)
+            if runner is not None
+            else _select_planning_invoker(os.environ)
+        )
     root = Path(worktree).resolve()
     registry = load_model_identities()
     probes: dict[tuple[str, str], CapabilityProbe] = {}
@@ -1088,14 +1320,18 @@ def build_production_planning_runtime(
         if "planning" not in identity.capabilities:
             continue
         if identity.executor == "agy" and identity.model_id == AGY_MODEL_ID:
+            # agy 的能力探測是兩步 CLI 協定，不是一個 prompt——它拿的是 invoker
+            # 的 `capability_probe_runner()` 接縫（見該方法的 docstring），
+            # 而不再是呼叫端手上的裸 runner。
             probes[(identity.executor, identity.model_id)] = probe_agy_capability(
-                runner=runner, timeout_seconds=min(timeout_seconds, 45)
+                runner=invoker.capability_probe_runner(),
+                timeout_seconds=min(timeout_seconds, 45),
             )
         else:
             probes[(identity.executor, identity.model_id)] = _probe_identity(
                 identity,
                 worktree=root,
-                runner=runner,
+                invoker=invoker,
                 timeout_seconds=timeout_seconds,
                 evidence_root=evidence_root,
                 run_id=run_id,
@@ -1103,14 +1339,15 @@ def build_production_planning_runtime(
 
     primary_identity = registry.get(*primary)
 
-    def invoke_primary(prompt: str) -> object:
+    def invoke_primary(prompt: str, *, purpose: str) -> object:
         if primary_identity is None:
             raise ValueError("primary planning identity is not configured")
         return _invoke_json(
             primary_identity,
             prompt,
             worktree=root,
-            runner=runner,
+            invoker=invoker,
+            purpose=purpose,
             timeout_seconds=timeout_seconds,
             evidence_root=evidence_root,
             run_id=run_id,
@@ -1121,7 +1358,8 @@ def build_production_planning_runtime(
             "Return only the exact question-pack JSON required to resolve this completeness report. "
             + _JSON_OUTPUT_CONTRACT
             + " Input: "
-            + json.dumps(report, ensure_ascii=False, sort_keys=True)
+            + json.dumps(report, ensure_ascii=False, sort_keys=True),
+            purpose=PLANNING_PURPOSE_QUESTIONER,
         )
 
     def secondary(pack: Mapping[str, object], identity: ModelIdentity) -> object:
@@ -1139,7 +1377,8 @@ def build_production_planning_runtime(
                 sort_keys=True,
             ),
             worktree=root,
-            runner=runner,
+            invoker=invoker,
+            purpose=PLANNING_PURPOSE_SECONDARY,
             timeout_seconds=timeout_seconds,
             evidence_root=evidence_root,
             run_id=run_id,
@@ -1182,7 +1421,8 @@ def build_production_planning_runtime(
                 },
                 ensure_ascii=False,
                 sort_keys=True,
-            )
+            ),
+            purpose=PLANNING_PURPOSE_INTEGRATOR,
         )
 
     return ProductionPlanningRuntime(registry, probes, questioner, secondary, integrator)

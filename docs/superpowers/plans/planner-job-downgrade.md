@@ -94,7 +94,9 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
 
 ### 2. 票 B｜`PlanningInvoker` 抽象（對應 R1 的結構面，**純重構、行為零改變**）
 
-- [ ] `tests/test_planning_invoker_672.py`（TDD RED）：
+**已由 issue #683 land。**
+
+- [x] `tests/test_planning_invoker_672.py`（TDD RED）：
   - `test_in_process_invoker_preserves_sandbox_contract`：sandbox 被弄髒仍拋
     `planning launcher modified disposable read-only sandbox`。
   - `test_in_process_invoker_preserves_operator_drift_containment`：operator 樹 drift
@@ -102,17 +104,39 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
     （那是下游分類契約）。
   - `test_invoker_selection_follows_resolve_runner_mode`：`PSC_JOB_RUNNER` 的值是**唯一**
     輸入；非法值 fail-closed；不存在第二個開關。
-- [ ] `paulsha_cortex/coordinator/planning_runtime.py`：抽出 `PlanningInvocation`／
+- [x] `paulsha_cortex/coordinator/planning_runtime.py`：抽出 `PlanningInvocation`／
       `PlanningInvoker`／`PlanningOutcome`；把現行 `_invoke_json` 的執行段搬進
       `InProcessPlanningInvoker`；JSON 抽取（`_extract_json`／`_find_json_object`／
       envelope 處理）留在共用層。
-- [ ] `build_production_planning_runtime()` 接受 `invoker` 參數（預設由
+- [x] `build_production_planning_runtime()` 接受 `invoker` 參數（預設由
       `resolve_runner_mode` 決定），四個 adapter 與 `_probe_identity` 全部改走它。
-- [ ] `probe_agy_capability()` 目前直接吃 `runner`（＝`subprocess.run`）且**繞過**
+- [x] `probe_agy_capability()` 目前直接吃 `runner`（＝`subprocess.run`）且**繞過**
       `_invoke_json` 的全部防線——把它一併改走 invoker，兩次 CLI 呼叫各算一次 invocation。
 - 驗收：既有 planning／probe 測試**一行不改**全綠（這就是「行為零改變」的定義）；
   `git grep -n "subprocess.run" paulsha_cortex/coordinator/planning_runtime.py` 只剩
   `InProcessPlanningInvoker` 內部一處。
+
+**#683 的實作補充**（design D1 之外的三處收斂，票 E 沿用）：
+
+1. **`probe_agy_capability` 的接縫形狀與 `run()` 不同，是刻意的。** agy 的能力探測不是
+   「一個 prompt」，而是一段**兩步 CLI 協定**（`agy models` 列出 model id → 拿解析到的
+   token 跑 smoke）。那段協定的真相在 `model_identities.probe_agy_capability`，把它複製
+   一份到 `planning_runtime` 就是第二份真相。因此 invoker 多一個
+   `capability_probe_runner() -> ProcessRunner` 方法，讓既有 probe 原樣消費；
+   direct 模式下它就是底層 runner 本身（行為逐字不變），票 E 在這裡回傳的是
+   「一個 argv → 一個降權 job」的閉包，**兩次 CLI 呼叫各算一次 invocation**。
+2. **`PlanningInvocation` 是 frozen dataclass，不是 Protocol。** design 的示意寫成
+   `class PlanningInvocation(Protocol)`，但它是呼叫端**建構**的值物件，不是呼叫端要
+   實作的介面；`PlanningInvoker` 才是 Protocol。欄位另比 design 多三個
+   （`worktree`／`evidence_root`／`run_id`）——前者是 in-process 的 sandbox 來源，
+   後兩者對 in-process 是 drift 報告落點、對票 E 是 D9 instance 命名的來源。
+3. **唯一刻意的行為差異**：daemon 路徑（不注入 `runner`／`invoker`）現在會在建構
+   planning runtime 時解析 `PSC_JOB_RUNNER`，非法值 fail-closed。design D1 明文要求
+   選擇點走 `resolve_runner_mode`，而該函式對非法值本來就 raise；launcher 早已對同一個
+   值 fail-closed，因此不會產生新的「本來能跑、現在不能跑」的部署。
+   `PlanningOutcome.diagnostics` 本票不產出任何內容（direct 模式沒有第二個資訊來源），
+   欄位先立在型別上，讓票 E 的 D8（`unit`／`hardening_profile`／`resolved_binary`）
+   不必再改一次 outcome 形狀。
 
 ### 3. 票 C｜probe 結果快取（對應 R3；依賴票 A 的診斷欄位、票 B 的 invoker）
 
