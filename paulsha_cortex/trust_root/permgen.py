@@ -4537,6 +4537,12 @@ def build_toolchain_plan(
 
 def _system_python_lines(layout: PathLayout) -> list[str]:
     """系統層 python 發行版的落位段（#666 漂移項 1）。"""
+    # 刻意先組成字串再放進 list：巢狀 f-string ＋ 同款引號是 PEP 701（3.12+）語法，
+    # 而本 repo 的 `requires-python` 從 3.10 起——CI 的 3.10／3.11 會直接 SyntaxError。
+    declarations = " / ".join(
+        '{}="{}"'.format(key, value)
+        for key, value in layout.gate_command_env().items()
+    )
     lines = [
         "",
         "# ===== 系統層 python 發行版（#666 漂移項 1：pytest）=====",
@@ -4544,7 +4550,7 @@ def _system_python_lines(layout: PathLayout) -> list[str]:
         "# 發行版，`import`／`-m` 得到才有意義，`command -v` 對它一律無解。",
         "#",
         "# **為什麼落在系統層而不是部署 venv**：operator 宣告的 gate 命令用的是相對名",
-        f"#   {' / '.join(f'{k}=\"{v}\"' for k, v in layout.gate_command_env().items())}",
+        f"#   {declarations}",
         "# 而 gate 的 PSC_GATE_PATH 尾段是系統層 ⇒ `python3` 解到 /usr/bin/python3。",
         "# gate unit 自己的 ExecStart 用的是部署 venv 的 interpreter，但那只涵蓋 ledger",
         "# writer 本身；**operator 宣告的命令另外解析一次**。兩者是不同的 interpreter。",
