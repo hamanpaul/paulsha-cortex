@@ -3866,7 +3866,10 @@ def _hardening_lines(
     lines: list[str] = []
     for key, value, why in _HARDENING:
         effective = profile.overrides.get(key, value)
-        lines.append(f"# {why}")
+        # 折行（#673）：加固表的理由已長到單行數百字元，`systemctl cat` 讀起來完全
+        # 失去可審查性——而「這一行為什麼在這裡」正是這份 root-owned 檔存在的理由。
+        # `_wrap_comment` 就是為此而寫的（見它的 docstring），這裡沿用同一支。
+        lines += _wrap_comment(why)
         if effective != value:
             lines += _wrap_comment(
                 f"※ 剖面覆寫（profile={profile.profile_id}）：嚴格剖面為 "

@@ -56,6 +56,12 @@ syscall**，被擋的照樣擋，只是不殺行程。（若哪天真的需要�
 - **`_validate_seccomp_tolerance()`**：import 時強制——任何 `filtered_syscalls` 非空
   的程式，其執行面若是致命過濾語意，**permgen 直接炸**，並在錯誤訊息裡把處置講清楚
   （設 errno，**不是**把 syscall 加進白名單）。
+- **加固表的註解改走既有的 `_wrap_comment`**：那支 helper 的 docstring 早就寫著
+  「數百字元的單行註解會讓 `systemctl cat` 完全失去可審查性」，但 `_hardening_lines`
+  一直是 `f"# {why}"` 直出。「這一行為什麼在這裡」正是這份 root-owned 檔存在的理由，
+  讀不了等於沒有。指令值一字未改，純粹是 unit 的呈現。兩個既有測試（manager／monitor
+  的「每項加固都要帶註解」）改為比對 directive 上方**整段連續註解**——比原本的「正上方
+  那一行」更強，也對折行穩健。
 
 ## 更重要的一半：加固面複本必須全量機械導出
 
