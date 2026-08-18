@@ -4758,6 +4758,11 @@ print("unit prefix contract OK:", prefix)
 PY
 
 # ✅ 正向：transient job 起得來且降到 cortex-builder
+# ⚠️ 這一條**刻意不是**加固面複本（因此不走 `psc_run_under`）：它驗的是「Manager 起得了
+#    transient unit 且降得到 cortex-builder」，＝ A 方案的**派工**能力，與加固面無關。
+#    A 方案本來就只送 `NoNewPrivileges=yes`（見 `job_runner`），這裡逐字反映那個現況。
+#    A 方案的完整加固建議清單另有出處：`trust_root unit --job-properties`。
+#    **不要**把這一條當成「真實加固面下的驗證」——那一族全部走第 4e 步的共用探針（#673）。
 sudo -u cortex-manager systemd-run --quiet --collect --pipe --wait \
   --unit=cortex-job-smoke-00000000.service \
   --uid=cortex-builder --gid=cortex-builder --service-type=exec \
