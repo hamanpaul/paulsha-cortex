@@ -5389,6 +5389,11 @@ def unit_replica_properties(
 #: 探針補任何一個 production 不供應的變數，都是同一個失效模式的下一個版本。
 PATH_PROBE_FORBIDDEN_FRAGMENTS: tuple[str, ...] = ("--setenv=", "PATH=")
 
+#: runbook 第 4e 步的共用探針名（#673 落地、#677 定案）。反向不變式**呼叫它、不重造**
+#: ——加固面的定義只有一份（:func:`unit_replica_properties`），連呼叫它的那幾行 shell
+#: 也不該有第二份會漂移的複本。runbook 那一節與本產生器共用這個名字。
+PATH_PROBE_HELPER = "psc_run_under"
+
 
 def path_probe_env_injections(lines: Sequence[str]) -> tuple[str, ...]:
     """探針裡**注入了環境變數**的可執行行（正常應為空 tuple）。
@@ -5506,19 +5511,14 @@ def build_path_resolution_probe(
     )
     lines += [
         "",
-        "psc_path_probe() {   # psc_path_probe <unit 字幹> <命令> [參數…]",
-        "  local stem=\"$1\"; shift",
-        "  local -a props",
-        "  mapfile -t props < <(",
-        "    sudo systemctl cat \"${stem}@.service\" \\",
-        "      | python3 -m paulsha_cortex.trust_root unit-replica - --instance probe",
-        "  )",
-        "  if [ \"${#props[@]}\" -lt 30 ]; then",
-        "    echo \"⛔ 加固面複本只有 ${#props[@]} 條——先修 unit 落檔，不要繼續\" >&2",
-        "    return 90",
-        "  fi",
-        "  sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \\",
-        "    \"${props[@]}\" \"$@\"",
+        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
+        "# **本產生器刻意不自己定義一份**——加固面的定義只有一份"
+        "（`unit_replica_properties()`），",
+        "# 連呼叫它的那幾行 shell 也不該有第二份複本；兩份複本會漂移，而漂移的方向",
+        "# 不由人選（#638／#657／#673／#679 是同一族事故的第一到第四次）。",
+        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
+        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
+        "  return 1 2>/dev/null || exit 1",
         "}",
         "",
     ]
@@ -5526,12 +5526,12 @@ def build_path_resolution_probe(
         lines += [
             f"# --- {case.principal.value} × {case.executor}"
             f"（{case.account}／{case.unit_stem}@／剖面 {case.hardening_profile}）---",
-            f"psc_path_probe {case.unit_stem} /bin/sh -c 'command -v {case.executor}'",
+            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'",
             f"#   期望逐字：{case.expected_binary}",
             f"#   ⛔ 空輸出 ⇒ job 沒有 PATH（或 toolchain 不在上面）；",
             f"#      /usr/bin/{case.executor} ⇒ **本票的原症狀**：解到系統層那一份，",
             "#      不報錯、只是產出來自一支沒人判讀過的 CLI。",
-            f"psc_path_probe {case.unit_stem} /bin/sh -c '{case.executor} --version'",
+            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c '{case.executor} --version'",
             f"{case.version_reference} --version",
             "#   期望：**兩行逐字相同**（PATH 解出來的那支 == 登記表登記的那支）。",
             "",

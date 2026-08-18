@@ -1913,9 +1913,12 @@ done
 > 一律不得帶 `PATH`。**
 
 ```bash
-# 探針與矩陣都由產生器出（角色 × executor 全列舉，剖面跟著 executor 走）：
+# 前置：先貼上下一節的共用探針 `psc_run_under`（本步驟**呼叫它、不重造**——
+#       加固面的定義只有一份，連呼叫它的那幾行 shell 也不該有第二份複本）。
+# 矩陣由產生器出（角色 × executor 全列舉，剖面跟著 executor 走）：
 python3 -m paulsha_cortex.trust_root path-probe four-way
-#   → 貼進 shell 直接跑。產出**刻意不含任何 --setenv=**。
+#   → 貼進 shell 直接跑。產出**刻意不含任何 --setenv=**；未定義 psc_run_under 時
+#     它會 fail-closed（而不是靜默跑出一組沒有加固面的假綠）。
 #   ⛔ 任何一列失敗時**不要**加 `--setenv=PATH=` 讓它過——那正是讓這個缺陷活了五輪
 #      的那個動作。要補的是兩層本身：
 #        (1) 模板 unit 的 `Environment=PATH=`（#679 起由 permgen 產生）

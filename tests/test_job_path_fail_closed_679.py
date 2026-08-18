@@ -345,7 +345,27 @@ def test_the_probe_explains_why_it_must_not_inject() -> None:
 
     text = "\n".join(permgen.build_path_resolution_probe(FOUR_WAY_SCHEME))
     assert "--setenv=" in text, "產物要講得出禁止的是什麼"
-    assert "unit-replica" in text, "加固面必須走共用的全量複本"
+    assert "unit_replica_properties" in text, "加固面必須走共用的全量複本"
+
+
+def test_the_probe_reuses_the_shared_helper_instead_of_redefining_it() -> None:
+    """加固面的定義只有一份——連呼叫它的那幾行 shell 也不該有第二份複本。
+
+    #638／#657／#673／#679 是同一族事故：**兩份複本一定會漂移，而方向不由人選**
+    （偏寬得假綠、偏嚴得假紅，後者更貴）。因此本產生器**呼叫** runbook 第 4e 步的
+    `psc_run_under`，並在它未定義時 fail-closed——而不是自己再定義一份長得一樣的。
+    """
+
+    lines = permgen.build_path_resolution_probe(FOUR_WAY_SCHEME)
+    text = "\n".join(lines)
+    assert f"{permgen.PATH_PROBE_HELPER} " in text
+    assert f"{permgen.PATH_PROBE_HELPER}() {{" not in text, "不得自帶第二份定義"
+    assert f"declare -F {permgen.PATH_PROBE_HELPER}" in text, "未定義時必須 fail-closed"
+    # 也不得繞過共用探針自己叫 systemd-run。
+    assert not [
+        line for line in lines
+        if line.strip().startswith("sudo systemd-run") or line.strip().startswith("systemd-run")
+    ]
 
 
 def test_the_injection_detector_actually_detects() -> None:
