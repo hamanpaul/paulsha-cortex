@@ -230,7 +230,9 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
 
 本票是整個搬遷的主體，也是唯一會改變執行身分的一張。
 
-- [ ] `tests/test_planning_job_invoker_672.py`（TDD RED）：
+**已由 issue #686 land。**
+
+- [x] `tests/test_planning_job_invoker_672.py`（TDD RED）：
   - `test_role_is_review_and_not_derivable_from_spec`：角色恆為 `JOB_ROLE_REVIEW`，
     且 job spec 不含任何身分／剖面欄位（`SPEC_FORBIDDEN_KEYS` 兩端各擋一次）。
   - `test_profile_comes_only_from_executor`：剖面唯一輸入是 `identity.executor`；
@@ -252,13 +254,13 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
     `planning-output-malformed`，detail 帶 stdout 前綴。
   - `test_operator_tree_not_in_job_rwp`：`repo-source-tree` 不在 reviewer 模板 unit 的
     RWP 產出中（＝ D-e 的 kernel 層保證有測試釘住，不只靠 unit 註解）。
-- [ ] `paulsha_cortex/coordinator/planning_job.py`（新檔）：`JobPlanningInvoker`。
+- [x] `paulsha_cortex/coordinator/planning_job.py`（新檔）：`JobPlanningInvoker`。
       復用 `job_runner.prepare_systemd_template`／`build_job_spec`／`write_job_spec`／
       `build_systemctl_start_argv`／`build_manager_exit_recorder_argv`／
       `confirm_template_instance_started`；**不複製**任何一份 job_runner 的邏輯。
-- [ ] 依 U-1／U-2 的裁決實作 scratch（空 vs 複製；job 可寫 vs 唯讀＋`PrivateTmp`）。
-- [ ] 依 U-3 的裁決處理 codex 的第二輸出候選。
-- [ ] 實機驗收矩陣（R8）：`{codex, claude, agy} × {實際剖面}`，在**真實 unit 的完整
+- [x] 依 U-1／U-2 的裁決實作 scratch（空 vs 複製；job 可寫 vs 唯讀＋`PrivateTmp`）。
+- [x] 依 U-3 的裁決處理 codex 的第二輸出候選。
+- [x] 實機驗收矩陣（R8）：`{codex, claude, agy} × {實際剖面}`，在**真實 unit 的完整
       property 集合**下實跑，每格記錄 rc、stdout 前 80 字、**解析到的絕對路徑與版本
       字串**。矩陣 MUST 走 runbook 第 4e 步的共用探針 `psc_run_under`（其加固面由
       `permgen.unit_replica_properties()` 全量導出），MUST NOT 自行組 `--property=`
@@ -266,6 +268,40 @@ blocking reason——兩者剛好接得起來，缺任何一半都還是查不�
       （#638／#657 假綠，#673 原 body 與其 repro 假紅）。
 - 驗收：矩陣全綠；`cortex-manager` 的行程樹在一輪完整 planning 期間不出現任何
       executor 可執行檔（以 `systemd-cgls` 或 `ps --ppid` 佐證）。
+
+**#686 的實作補充**（design 之外的收斂與更正，票 F 必須沿用）：
+
+1. **U-2 裁決＝唯讀 scratch，而且它不是一個 `if`。** 登記表新增資產
+   `planning-scratch-pool`，writers 只有 `Principal.MANAGER` ⇒
+   `required_write_targets()` 機械地不收它 ⇒ 它不出現在任何 job 模板 unit 的
+   `ReadWritePaths=` ⇒ `ProtectSystem=strict` 下寫入回 EROFS。R-1 因此從「失去行為
+   訊號」變成「結構上不可能」。實機逐 executor 複驗見 runbook 第 4e-3 步。
+2. **U-1 在 job 模式只能是 (b)（空 scratch），而且 design 的取捨論證要更正。**
+   (a) 需要一套「把 Manager 建的整棵樹遞迴授權給 job 帳號」的機制（Manager unit 帶
+   `UMask=0077`，複本每個檔都是 `0600 cortex-manager`），那是新的一整個授權面。
+   另外 design 寫「(b) 是收緊（模型從理論上讀得到 repo 變成讀不到）」——**在 job
+   模式下不成立**：`ProtectSystem=strict` 只擋寫不擋讀，`/var/lib/cortex/repos/<slug>`
+   對 `cortex-reviewer-planner` 可讀（0818 複驗）。差別只在它不是 cwd。
+3. **U-3 不需要動用：輸出通道掛在既有 `review-verdict-spool` 底下。** design D3 第一句
+   是「不新開通道」，U-3 把「新開一條 job→Manager 的寫入面」列為未決；而
+   `cortex-reviewer-planner` 今天唯一既 Manager-owned 又對它開放寫入的落點就是那個
+   spool。掛在它底下 ⇒ `_minimize()` 吃掉子路徑 ⇒ 模板 unit 的 `ReadWritePaths=`
+   **逐字不變、零部署動作**、default ACL 自動繼承。新資產 `planning-job-log-spool`
+   仍獨立登記（治理面不因省下一條 RWP 而消失）。
+4. **`planning-job-timeout` 是 `planning-executor-failed` 的子類，不是第四個族。**
+   票 A 已把 `ENVIRONMENT_GRADE_PLANNING_FAMILIES` 釘成**逐字相等**的不變式；新增第
+   四個 environment 級族名會動到那條契約。分級結果與 D4 要求一致（environment ⇒
+   `recover-planning` 浮得出來），差別只在它掛在哪一個族底下——與
+   `executor-silent-exit` 同一種收法。
+5. **`PSC_JOB_RUNNER=systemd-run`（A 案）對 planning fail-closed，不退回 in-process。**
+   A 案下加固面由呼叫端而非 root-owned unit 決定，那正是 planning 這個吃 untrusted
+   內容的角色最需要的性質。退回 in-process 的失敗**看起來像成功**。
+6. **本票查到兩個 design 未預期的部署缺口，都不在本票處置範圍**（見 runbook）：
+   (i) `PSC_REVIEWER_HOME`／`PSC_GATE_HOME` 未宣告 ⇒ shim 的 `execvpe` 整份換掉環境，
+   unit 的 `Environment=HOME=` 到不了模型 ⇒ agy 死在 `$HOME is not defined`
+   （與 #679 的 PATH **同型**；runbook 第 5-5c 步）；(ii) codex 需要**整個
+   `$CODEX_HOME` 目錄**可寫（sqlite／sessions／skills／plugins），只放行
+   `auth.json` 一個檔不夠 ⇒ 屬票 D（#685）／U-4（runbook 第 4e-3 步）。
 
 ### 6. 票 F｜切換、宣稱更正與收尾（依賴票 D、票 E）
 

@@ -974,9 +974,23 @@ def build_job_env(
     reviewer 的 PATH 只能跟著 builder 走。
 
     **`PATH` 是必要鍵，不是選配**（#679）：未宣告 `PSC_*_PATH` 時
-    :func:`resolve_job_path` 直接 raise。`HOME` 仍是選配，兩者的差別是實質的——
-    `HOME` 未給時 systemd 依 passwd 填入該帳號自己的正確值（而且模板 unit 另有一行
-    `Environment=HOME=`），`PATH` 未給時沒有任何一層會填出正確值。
+    :func:`resolve_job_path` 直接 raise。
+
+    **`HOME` 目前仍是選配，但它的舊理由在模板模式下是錯的（#686 實機更正）。**
+    本段原文寫著「`HOME` 未給時 systemd 依 passwd 填入該帳號自己的正確值（而且模板
+    unit 另有一行 `Environment=HOME=`）」——後半句對**模板模式**不成立：`cortex-job-shim`
+    以 `os.execvpe(command[0], command, job_env)` 把環境**整份換掉**
+    （`job_shim.resolve_job_env`），unit 的 `Environment=HOME=` 因此到不了模型行程。
+    0818 實機複驗：`PSC_REVIEWER_HOME` 未宣告 ⇒ 降權 planning job 的 agy 死在
+    `resolving log directory: getting home directory: $HOME is not defined`；補上該變數
+    之後同一條呼叫 rc=0。`PSC_BUILDER_HOME` 在實機**有**宣告，`PSC_REVIEWER_HOME`／
+    `PSC_GATE_HOME` 沒有——與 #679 的 PATH 是**同一個形狀**（builder 那一份被宣告過，
+    另外兩個角色沒有）。
+
+    為什麼本票不順手把它也改成 fail-closed：那會讓**所有角色**的既有派工在
+    EnvironmentFile 補齊之前當場失敗（gate 今天也沒有 `PSC_GATE_HOME`），屬於
+    #679 那種需要獨立票 ＋ runbook 升級程序的改動。本票只把事實記正確，並在
+    runbook 第 5-5c 步補上宣告步驟。
     """
 
     config = resolve_job_role(role)

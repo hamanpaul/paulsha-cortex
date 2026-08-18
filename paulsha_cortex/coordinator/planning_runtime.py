@@ -1091,13 +1091,28 @@ def _select_planning_invoker(env: Mapping[str, str]) -> PlanningInvoker:
     `PSC_PLANNING_INVOKER` 之類的 planning 專屬開關：第二個開關的失效模式是
     「以為降權了、其實沒有」，而那種失敗看起來是成功的。
 
-    issue #683（票 B）只交付接縫，因此三種模式目前**全部**回 in-process
-    ——這正是「純重構、行為零改變」的意思。票 E（#686）新增
-    `JobPlanningInvoker` 之後，改的只有本函式的對應表一處。
+    issue #686（票 E）接上 `JobPlanningInvoker`：`systemd-template` ⇒ 降權 job。
+
+    **`systemd-run`（A 案）刻意 fail-closed，不退回 in-process。** A 案下 Manager 自己
+    組 `--property=`／`--setenv=`，「身分與加固面只由 root-owned unit 決定」這條性質
+    不成立——而那正是 planning 這個**吃 untrusted issue 內容**的角色最需要的性質。
+    退回 in-process 的失敗會**看起來像成功**（planning 照跑、產出正常），那正是 #672
+    整張票要消除的失效模式；因此這裡寧可讓部署當場以可讀理由停下來。
     """
 
-    job_runner.resolve_runner_mode(env)
-    return InProcessPlanningInvoker()
+    mode = job_runner.resolve_runner_mode(env)
+    if mode == job_runner.RUNNER_DIRECT:
+        return InProcessPlanningInvoker()
+    if mode == job_runner.RUNNER_SYSTEMD_TEMPLATE:
+        from .planning_job import JobPlanningInvoker
+
+        return JobPlanningInvoker(env=env)
+    raise ValueError(
+        f"{job_runner.JOB_RUNNER_ENV}={mode} 尚未支援 planning 降權"
+        "（#686 只實作模板模式；A 案下加固面由呼叫端而非 root-owned unit 決定，"
+        "planning 不走它）。改用 systemd-template，或以 direct 明示不降權——"
+        "**本函式不會靜默退回行程內執行**。"
+    )
 
 
 def _invoke_json(
@@ -1141,6 +1156,42 @@ def _invoke_json(
     return _extract_json_candidates(outcome.stdout, outcome.output_text)
 
 
+def _probe_failure(identity: ModelIdentity, exc: BaseException) -> CapabilityProbe:
+    """一次失敗的 probe → `CapabilityProbe`，**族名活著抵達拒因表**。
+
+    #683 之前（也就是 direct 模式今天仍走的那條路）只留得下 `type(exc).__name__`，
+    而票 A 的 `classify_probe_failure()` 就是靠那個型別名把失敗分成三族。job 模式有
+    **更好的資訊**：`PlanningJobError` 自己就帶著族名（job 起不來 vs executor 死），
+    那是型別名推不出來的區分。
+
+    `_PROBE_REASON_FAMILIES` 已經預留了這條路（票 A：「票 C／票 E 之後 probe 自己就會
+    回族名，這裡讓它原樣通過」），因此這裡把族名放進 `reason`、把 detail 放進
+    `diagnostic`，分類器原樣採用，不需要第二張表。
+
+    direct 模式逐字不變——那條路上不會出現 `PlanningJobError`。
+    """
+
+    from .planning_job import PlanningJobError
+
+    if isinstance(exc, PlanningJobError):
+        return CapabilityProbe(
+            False,
+            identity.executor,
+            identity.model_id,
+            identity.independence_domain,
+            exc.family,
+            exc.detail,
+        )
+    return CapabilityProbe(
+        False,
+        identity.executor,
+        identity.model_id,
+        identity.independence_domain,
+        "safe-probe-failed",
+        type(exc).__name__,
+    )
+
+
 def _probe_identity(
     identity: ModelIdentity,
     *,
@@ -1170,14 +1221,7 @@ def _probe_identity(
             run_id=run_id,
         )
     except Exception as exc:
-        return CapabilityProbe(
-            False,
-            identity.executor,
-            identity.model_id,
-            identity.independence_domain,
-            "safe-probe-failed",
-            type(exc).__name__,
-        )
+        return _probe_failure(identity, exc)
     if value != expected:
         return CapabilityProbe(
             False,
