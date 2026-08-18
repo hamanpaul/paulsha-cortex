@@ -230,9 +230,11 @@ BUILDER_HOME_ENV = "PSC_BUILDER_HOME"
 #: builder 的 PATH。**必填，且未設時 fail-closed**（#679）。
 #:
 #: #640 起它就已經是「必填」的部署契約（runbook 明講），但程式碼這一側直到 #679 都
-#: 還是 fail-open：未設就整個不寫 `PATH`，於是 `execvpe` 退回 `os.defpath`
-#: （`:/bin:/usr/bin`）——`codex` 靜默解到系統層那份舊 CLI，不報錯、只是產出來自一支
-#: operator 從未判讀過的執行檔。宣告與實作的落差本身就是那個缺陷。
+#: 還是 fail-open——而且是兩段的：`PATH` 當時在 :data:`BUILDER_FORWARDED_ENV` 上，
+#: 因此未設此變數時 job 先靜默拿到 **Manager daemon 的** `PATH`（一個沒有人為「job
+#: 該解到哪一份 CLI」做過決定的值）；daemon 自己也沒有 `PATH` 時，spec 連這個鍵都
+#: 沒有，`execvpe` 退回 `os.defpath`（`:/bin:/usr/bin`）。兩段的終點相同：`codex`
+#: 靜默解到系統層那份舊 CLI，不報錯、只是產出來自一支 operator 從未判讀過的執行檔。
 BUILDER_PATH_ENV = "PSC_BUILDER_PATH"
 
 #: reviewer＋planner 的 OS 帳號名（#615 M2）。三分方案把兩個 persona 映到**同一個**
@@ -903,13 +905,19 @@ def resolve_job_path(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
 
         path_override = (manager_env.get(config.path_env) or "").strip()
         if path_override:
-            env["PATH"] = path_override      # 沒設就整個不寫 PATH
+            env["PATH"] = path_override      # 沒設就不覆寫
 
-    而 job spec 的 `env` 就是 job 的**完整**環境（shim 以
-    `os.execvpe(command[0], command, spec["env"])` 整份換掉），少了 `PATH` 這個鍵
-    不是「用系統預設」，是 `execvpe` 退回 `os.defpath`＝`:/bin:/usr/bin`。實機後果：
-    `claude`／`agy` rc=127（只存在於 toolchain），而 `codex` **靜默**解到
-    `/usr/bin/codex`——系統層 0.42.0，toolchain 那份是 0.147.0。不失敗、不報錯，
+    而它上面那一圈轉發迴圈當時**含 `PATH`**，所以「沒設」的實際後果分兩段：
+
+    1. Manager 自己有 `PATH` ⇒ job 逐字沿用 **daemon 的** `PATH`。那份值是否含
+       `<toolchain>/bin` 純看那台機器的 EnvironmentFile 被誰手動加過什麼，而且它帶著
+       `<deploy_root>/venv/bin`——等於把 job 的 `python3` 綁回 Manager 的 venv。
+    2. Manager 自己也沒有 `PATH` ⇒ spec 連這個鍵都沒有。job spec 的 `env` 就是 job 的
+       **完整**環境（shim 以 `os.execvpe(command[0], command, spec["env"])` 整份換掉），
+       少了 `PATH` 不是「用系統預設」，是 `execvpe` 退回 `os.defpath`＝`:/bin:/usr/bin`。
+
+    兩段的終點相同：`claude`／`agy` rc=127（只存在於 toolchain），而 `codex` **靜默**
+    解到 `/usr/bin/codex`——系統層 0.42.0，toolchain 那份是 0.147.0。不失敗、不報錯，
     只是每一筆產出都來自一支 operator 從未判讀過的 CLI。
 
     退回「permgen 導出的預設」（#679 的選項 (b)）看起來溫和，但那正是本 repo 已經
@@ -919,7 +927,9 @@ def resolve_job_path(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
     狀態，下一次漂移一樣看不見。
 
     **升級既有部署會痛，而那是對的**：現況是靜默跑錯版本，改完之後是下一次派工當場
-    以可讀理由失敗。runbook 第 5-5 步有逐字的補宣告步驟。
+    以可讀理由失敗。runbook 第 **5-5b** 步有逐字的升級程序（補三個變數、重新落檔六份
+    模板 unit、重啟 Manager、跑反向不變式），`docs/onboarding/troubleshooting.md` 的
+    `job-runner-path-undeclared` 一節是同一件事的簡版。
     """
 
     config = resolve_job_role(role)
