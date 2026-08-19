@@ -772,7 +772,7 @@ def test_the_template_units_describe_their_own_git_trust_shape() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_probe_carries_no_hand_rolled_hardening(capsys) -> None:
+def test_the_probe_carries_no_hand_rolled_hardening() -> None:
     """D13：不得自組 `--property=`、不得自帶 `--setenv=PATH=`。"""
 
     lines = permgen.build_job_git_trust_probe(permgen.DEFAULT_SCHEME)

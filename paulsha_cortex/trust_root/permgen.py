@@ -5902,7 +5902,7 @@ def _job_unit_git_trust_lines(
             "#      同級，`alias.*`／`core.fsmonitor` 經它塞進來會**執行外部命令**——那正是",
             f"#      {job_layout.gitconfig_of(account)} 必須 root-owned 的理由，本管道不得",
             "#      成為它的繞法。",
-            "#   ⛔ 也**不得**改成往靜態 .gitconfig 加一條萬用字元：實測 git 2.43,",
+            "#   ⛔ 也**不得**改成往靜態 .gitconfig 加一條萬用字元：實測 git 2.43，",
             "#      `<repos>/*` 仍被拒，而字面 `*` 等於對這個帳號整個關掉該保護（opt-out，",
             "#      不是授權）。",
         ]
