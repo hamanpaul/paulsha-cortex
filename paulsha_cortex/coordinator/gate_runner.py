@@ -527,6 +527,17 @@ def _run_as_gate_identity(
         spool_key=spool_key, coordinator_root=coordinator_root
     )
     snapshot = gate_worktree_dir(spool_key=spool_key)
+    # #710：gate 的工作區可達性走 `pool-owned-by-job`——pool 根的 owner 就是
+    # `cortex-gate`、per-job 那一格由 gate 自己 `copytree` 出來，因此**執行期零動作**。
+    # 仍然在這裡跑一次，是因為三個降權角色由**同一條規則**導出（
+    # `registry.JOB_WORKSPACE_REACH` ↔ `job_runner.JobRoleConfig.workspace_reach`），
+    # 而規則的價值在於它對每一格都**被檢查**：這一支會以 mask-aware 的有效權限複驗
+    # 「gate 進得去自己的 pool 根」，deployment 把那一格的 owner 改掉（例如「比照
+    # dispatch pool 改成 Manager-owned」）時當場 fail-closed，而不是讓每一次 gate 以
+    # 一個沒有 ledger 的失敗收場。
+    job_runner.ensure_workspace_reachable(
+        env, role=job_runner.JOB_ROLE_GATE, workspace=paths.gate_worktree_root()
+    )
     gate_env = job_runner.build_job_env(
         manager_env=env,
         job_id=job_id,

@@ -68,7 +68,7 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.coordinator import manager, spool_slot, verification
-from paulsha_cortex.trust_root import permgen
+from paulsha_cortex.trust_root import permgen, registry
 from paulsha_cortex.trust_root.permgen import DEFAULT_LAYOUT, generate_plan
 from paulsha_cortex.trust_root.registry import ASSET_REGISTRY, Principal, asset_by_id
 
@@ -148,10 +148,66 @@ def _pre_641_registry() -> tuple:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=SCHEME_IDS)
-def test_no_cross_account_grant_anywhere_inside_a_job_worktree(scheme) -> None:
-    """#641 的驗收本身：job 樹底下不得有任何授給非 owner 的 ACL。"""
+def test_no_manager_grant_anywhere_inside_a_job_worktree(scheme) -> None:
+    """#641 的驗收本身，**由 #710 重述**：job 樹底下不得有任何授給 Manager 的 ACL。
 
-    assert cross_account_grants_into_the_job_tree(ASSET_REGISTRY, scheme) == []
+    ## 為什麼判準從「非 owner」改成「Manager」（逐條）
+
+    #641 原本的形狀是「job 樹 owner＝job 帳號、零 ACL」，於是「非 owner 的 ACL」與
+    「Manager 的 ACL」在那個形狀下是同一件事，寫成前者比較嚴。**#710 查證出那個形狀
+    從來不曾存在於實機上，而且結構上不可能存在**：per-job clone 是 Manager 用
+    `git clone` 建的，把它 `chown` 給 job 帳號需要 `CAP_CHOWN`，而 Manager unit 帶
+    `CapabilityBoundingSet=`（空）。實機 `stat` 回的一直是
+    `cortex-manager:cortex-manager 700`、零具名 ACL——builder job 因此連 `chdir` 都
+    進不去（#710 的原症狀）。
+
+    形態更正為 **Manager 擁有 ＋ job 具名 ACL** 之後，「非 owner 的 ACL」就必然非空
+    （job 自己那條就是），照原樣留著只會讓這條測試表達「本修法不得存在」。因此判準
+    收斂到 #641 真正在守的那一半——**`durable_state_owner` 不得經由 ACL 取得 job 樹的
+    存取**，而「有哪些跨帳號授權」則由下一條測試逐條釘死（不是放寬成「隨便誰都行」）。
+
+    ## 誠實邊界：這條測試守不住「Manager 進不去 job 樹」
+
+    Manager 是那一格的 **owner**，owner 位給的存取收不掉。#641 真正想擋的提權路徑
+    （`verification` 以 `cwd=<job 樹>` 執行 job 交出來的 `conftest.py`）因此**不是**
+    由這棵樹的權限擋住的，而是由 `verification` 的 fail-closed
+    （`candidate-worktree-unreadable-pending-gate-identity`）與 #629 的第三執行身分
+    擋住。這在實機 0817 起就已經是事實；#710 只是讓登記表與產生器停止宣稱相反的事
+    （#696 的同型）。
+    """
+
+    manager = scheme.durable_state_owner
+    offenders = [
+        row
+        for row in cross_account_grants_into_the_job_tree(ASSET_REGISTRY, scheme)
+        if row[1] == manager
+    ]
+    assert offenders == []
+
+
+@pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=SCHEME_IDS)
+def test_grants_into_the_job_tree_are_exactly_what_the_rule_declares(scheme) -> None:
+    """job 樹底下的每一條跨帳號授權都必須出自 `JOB_WORKSPACE_REACH`（#710）。
+
+    上一條只擋 Manager；這一條擋「除了規則宣告的那些以外，什麼都不准出現」——兩條
+    合起來才等價於 #641 原本那句「零跨帳號 ACL」在新形態下的意思。
+    """
+
+    reach = registry.job_workspace_reach_for(Principal.BUILDER)
+    job_account = scheme.resolve(reach.persona)
+    # access ＋ default 兩條（perms 刻意不同：遞迴套在既有檔上用大寫 `X`，
+    # default 沒有「既有檔」可參照因此用 `x`）。
+    expected = {
+        ("repo-worktree", job_account, reach.access_perms),
+        ("repo-worktree", job_account, reach.default_perms),
+    }
+    for reader_principal, reader_perms in reach.extra_reader_perms:
+        account = scheme.resolve(reader_principal)
+        if account is None:  # two-way／three-way 沒有 gate
+            continue
+        expected.add(("repo-worktree", account, reader_perms))
+    granted = set(cross_account_grants_into_the_job_tree(ASSET_REGISTRY, scheme))
+    assert granted == expected
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=SCHEME_IDS)
@@ -164,14 +220,30 @@ def test_the_job_tree_invariant_actually_covers_something(scheme) -> None:
     assert covered >= {"repo-worktree", "review-verdict", "work-items-yaml", "handoff-manifest"}
 
 
-def test_repo_worktree_is_owner_only_with_zero_acl() -> None:
-    """job 樹本身：owner＝該 job 帳號、`0700`、零 ACL。"""
+def test_repo_worktree_is_manager_owned_with_a_named_job_acl() -> None:
+    """job 樹本身：owner＝**Manager**、`0700`、job 帳號以具名 ACL 取得可寫面。
+
+    **#710 修改本測試的理由**：原斷言是「owner＝job 帳號、`entry.acls == ()`」。
+    那個形態從來沒有被實作過（全 `coordinator/` 零個 `chown`），而且 Manager
+    結構上做不到它（`CAP_CHOWN` 不在 `CapabilityBoundingSet=` 內）——實機一直是
+    `cortex-manager:cortex-manager 700` ＋ 零 ACL，於是 builder job 連 `chdir` 都
+    進不去。斷言照原樣留著就是「測試綠、實機死」，正是 #641 自己記錄過的那個形狀
+    （「測試裡成立的不變式在照登記表部署的實機上不成立」）。
+
+    `0700` 與 `is_directory` 兩條**一行未改**：group／other 仍然零權限，跨帳號授權
+    一律走具名 ACL。
+    """
 
     entry = generate_plan(THREE_WAY).by_id("repo-worktree")
-    assert entry.owner == THREE_WAY.resolve(Principal.BUILDER)
+    assert entry.owner == THREE_WAY.durable_state_owner
     assert entry.mode == 0o700
-    assert entry.acls == ()
     assert entry.is_directory is True
+    reach = registry.job_workspace_reach_for(Principal.BUILDER)
+    builder = THREE_WAY.resolve(Principal.BUILDER)
+    assert [(a.account, a.perms, a.default, a.recursive) for a in entry.acls] == [
+        (builder, reach.access_perms, False, True),
+        (builder, reach.default_perms, True, True),
+    ]
 
 
 def test_registry_no_longer_declares_manager_as_a_reader_of_the_job_tree() -> None:
@@ -214,16 +286,59 @@ def _command_lines(scheme) -> list[str]:
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=SCHEME_IDS)
-def test_generated_commands_contain_no_setfacl_into_a_job_worktree(scheme) -> None:
-    """產生的權限 script（含註解掉的 per-job 段）沒有任何指向 job 樹的 setfacl。"""
+def test_generated_commands_grant_no_manager_setfacl_into_a_job_worktree(scheme) -> None:
+    """產生的權限 script（含註解掉的 per-job 段）沒有任何**授給 Manager** 的 setfacl。
+
+    **#710 修改本測試的理由**：原斷言是「job 樹底下零 setfacl」。#710 之後那一格
+    **必然**有 setfacl——job 帳號的可寫面就是靠它（`chown` 需要 `CAP_CHOWN`，Manager
+    沒有）。判準因此與上方 `test_no_manager_grant_anywhere_inside_a_job_worktree`
+    對齊到 #641 真正在守的那一半；「那裡有哪些 setfacl」則由下一條逐字釘死，不是
+    放寬成「隨便幾條都行」。
+    """
 
     root = _job_tree_root(DEFAULT_LAYOUT.asset_paths())
+    manager = scheme.durable_state_owner
     offenders = [
         line
         for line in _command_lines(scheme)
-        if line.startswith("setfacl") and (line.endswith(" " + root) or f" {root}/" in line)
+        if line.startswith("setfacl")
+        and f"u:{manager}:" in line
+        and (line.endswith(" " + root) or f" {root}/" in line)
     ]
     assert offenders == [], offenders
+
+
+@pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=SCHEME_IDS)
+def test_the_job_tree_setfacl_lines_are_exactly_the_rule(scheme) -> None:
+    """job 樹那一段的 `setfacl` 逐字等於 `JOB_WORKSPACE_REACH` 導出的那幾條（#710）。
+
+    這是上一條的另一半：Manager 不得出現，而**該出現的那幾條要逐字對上**——少一條
+    是 #710 的原症狀（job `chdir` 不進去），多一條就是一個沒有人宣告過的授權面。
+    順帶釘住 `-R`：只在樹根下一條 ACL 的話，job 進得去卻讀不到裡面任何東西。
+    """
+
+    root = _job_tree_root(DEFAULT_LAYOUT.asset_paths())
+    reach = registry.job_workspace_reach_for(Principal.BUILDER)
+    job_account = scheme.resolve(reach.persona)
+    expected = [
+        f"setfacl -R -m u:{job_account}:{reach.access_perms} {root}",
+        f"setfacl -R -d -m u:{job_account}:{reach.default_perms} {root}",
+    ]
+    for reader_principal, reader_perms in reach.extra_reader_perms:
+        account = scheme.resolve(reader_principal)
+        if account is None:  # two-way／three-way 沒有 gate
+            continue
+        expected += [
+            f"setfacl -R -m u:{account}:{reader_perms} {root}",
+            f"setfacl -R -d -m u:{account}:{reader_perms} {root}",
+        ]
+    found = [
+        line
+        for line in _command_lines(scheme)
+        if line.startswith("setfacl")
+        and (line.endswith(" " + root) or f" {root}/" in line)
+    ]
+    assert found == expected
 
 
 @pytest.mark.parametrize("scheme", ALL_SCHEMES, ids=SCHEME_IDS)
@@ -237,12 +352,21 @@ def test_the_job_tree_section_still_sets_owner_and_mode(scheme) -> None:
 
 
 def test_the_rationale_no_longer_claims_a_manager_read() -> None:
-    """operator review 的是 rationale 那一行——它不能還在宣稱「Manager 以唯讀 ACL 讀取」。"""
+    """operator review 的是 rationale 那一行——它不能還在宣稱「Manager 以唯讀 ACL 讀取」。
+
+    **#710 換掉第三條斷言的理由**：`"owner-only" in rationale` 驗的是「job 樹是
+    owner-only、零 ACL」那個**從未存在**的形態（見
+    `test_repo_worktree_is_manager_owned_with_a_named_job_acl`）。換成驗它現在**必須
+    講出來**的那件事——「owner 是 Manager、job 走具名 ACL、而 `chown` 不是選項」。
+    前兩條（不得再宣稱 D2 git 讀／trusted reader）**一字未改**：#641 收掉的那條
+    Manager 讀取權沒有回來。
+    """
 
     entry = generate_plan(THREE_WAY).by_id("repo-worktree")
     assert "D2 git 讀" not in entry.rationale
     assert "trusted reader" not in entry.rationale
-    assert "owner-only" in entry.rationale
+    assert "CAP_CHOWN" in entry.rationale
+    assert "具名 ACL" in entry.rationale
 
 
 # ---------------------------------------------------------------------------
@@ -253,18 +377,33 @@ def test_the_rationale_no_longer_claims_a_manager_read() -> None:
 def test_the_pre_641_registry_shape_would_still_fail_this_fixture(scheme) -> None:
     """沒有這一條，上面的斷言有可能哪天只是因為 fixture 不再涵蓋 job 樹而空過。"""
 
-    grants = cross_account_grants_into_the_job_tree(_pre_641_registry(), scheme)
+    manager = scheme.durable_state_owner
+    grants = [
+        row
+        for row in cross_account_grants_into_the_job_tree(_pre_641_registry(), scheme)
+        if row[1] == manager
+    ]
+    # **#710 只加了一道過濾，判準本身未變**：修法後 job 樹底下本來就會有 job 帳號
+    # 自己那兩條具名 ACL（那是 #710 的修法本體），突變驗證要看的仍然是「Manager
+    # 有沒有跟著回來」——不濾掉的話這條會被修法本體的那幾列蓋過去，變成永遠成立。
     if scheme is TWO_WAY:
         # 二分下 reviewer／planner 與 Manager 併帳，`review-verdict` 的 owner 就是
         # Manager 自己，那一條退化成 no-op；另外兩條照樣復發。
-        assert {asset_id for asset_id, _, _ in grants} == {"repo-worktree", "work-items-yaml"}
+        #
+        # #710：`repo-worktree` 的 owner 在二分下也是 Manager（`durable_state_owner`
+        # ＝`cortex-svc`），因此把 MANAGER 放回 readers 同樣是 no-op，只剩
+        # `work-items-yaml` 復發。少掉的那一格由本檔第 1 節的形態斷言承接。
+        assert {asset_id for asset_id, _, _ in grants} == {"work-items-yaml"}
         return
+    # 三分／四分：`repo-worktree` 的 owner 是 Manager，因此把 MANAGER 放回它的
+    # readers 一樣是 no-op（產生器對 owner 自己不出 ACL）——這正是 #710 之後
+    # 「Manager 讀 job 樹」不再是一條**可被 ACL 表達**的東西的直接後果，而不是
+    # 突變驗證失效：另外兩格照樣復發，且全部指向 Manager。
     assert {asset_id for asset_id, _, _ in grants} == {
-        "repo-worktree",
         "review-verdict",
         "work-items-yaml",
     }
-    assert all(account == THREE_WAY.durable_state_owner for _, account, _ in grants)
+    assert grants, "突變後一條都沒復發 ⇒ 這條測試證不出東西"
 
 
 def test_the_pre_641_shape_reopens_the_derived_traverse_into_the_job_tree() -> None:

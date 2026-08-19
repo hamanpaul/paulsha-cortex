@@ -396,6 +396,21 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   M1 的正向驗證之所以沒抓到，是因為當時 operator **手工組 spec、log 路徑自己挑**
   ——與 #645 逐字同型（本探針因此改由 `spool_slot.prepare_job_log()` 本人建那一格）。
   → **59** 個 sudo 點、**227** 個驗證點。
+- **#710（per-job clone 建好後沒有交給 job 帳號）新增**：新增
+  **4e-2e「per-job 工作區的具名 ACL」**（形狀對照表 ＋ `getfacl` 的 **mask 判準** ＋
+  per-job 隔離的反向驗證 ＋ **反向不變式** `trust_root workspace-probe` ＋ 真實派工
+  smoke）。**起因**：per-job clone 是 **Manager** 用 `git clone` 建的 ⇒
+  `cortex-manager:cortex-manager 700`、**零具名 ACL**，模板 unit 的
+  `ReadWritePaths=<pool>/%i` 在 mount 層放行、**DAC 層擋死**；`#708` 修好 log 之後
+  `shim-error.json` 第一次交出這條逐字原因
+  （`[Errno 13] Permission denied: '/var/lib/cortex/worktree/wf-…'`）。
+  `cortex-reviewer-job@.service` 的註解宣稱「整個 clone 由本 job 帳號擁有」，
+  **全 `coordinator/` 零個 `chown`**——而且 Manager 結構上做不到（`chown` 給另一個
+  使用者要 `CAP_CHOWN`，Manager unit 帶 `CapabilityBoundingSet=`）。**這不是漏寫
+  一行，是方案與降權模型衝突。** 三個降權 principal 的工作區可達性自 #710 起由
+  `registry.JOB_WORKSPACE_REACH` 一條規則導出（builder 具名 ACL／reviewer 繼承
+  default ACL／gate pool 根 owner），缺一格模組**載不起來**。
+  → **60** 個 sudo 點、**235** 個驗證點。
 
 ---
 
@@ -2591,6 +2606,124 @@ sudo -u cortex-manager stat -c '%i %n' \
 **回滾**：`sudo rm -rf /var/lib/cortex/coordinator/commit-spool/build-logs
 /var/lib/cortex/coordinator/gate-ledger-spool/gate-logs` ＋ 退回上一版 cortex。
 （回滾之後 builder job 會退回 #708 的原症狀：`78/CONFIG`，job 一行 log 都寫不出來。）
+
+#### 4e-2e. per-job 工作區的**具名 ACL**（#710）
+
+> **這一步大多是驗證，不是遷移。** per-job 那一格的 ACL 由 **Manager 在 provision
+> 當下**逐案套上（`coordinator/job_workspace.grant_workspace_acl()`），不是部署時的
+> 一次性動作——路徑帶 `<job-id>`，部署當下還不存在。本步要確認的是「產生器、執行期、
+> 與磁碟上的形狀三者一致」，以及 `acl` 套件真的在。
+>
+> 0819 實機症狀（`#708` 修好 log 之後 `shim-error.json` 交出的下一個逐字原因）：
+>
+> ```json
+> {"schema": "cortex-job-shim-error/1",
+>  "error": "[Errno 13] Permission denied: '/var/lib/cortex/worktree/wf-…-2-be5433ea'"}
+> ```
+>
+> ```
+> $ stat -c '%U:%G %a' /var/lib/cortex/worktree/wf-…-2-be5433ea
+> cortex-manager:cortex-manager 700          ← 零 named ACL
+> ```
+>
+> **`chown` 不是選項**：把它交給 job 帳號需要 `CAP_CHOWN`，而 Manager unit 帶
+> `CapabilityBoundingSet=`（空）。`setfacl` 由**目錄 owner** 執行、不需要任何
+> capability ⇒ Manager 做得到。保留 owner 另外買到一件事：`gc`／`worktree_reclaim`
+> 仍 `rmtree` 得掉整棵樹。
+
+**三個降權 principal 的形狀不同，而且是查證過的**（`registry.JOB_WORKSPACE_REACH`）：
+
+| principal | 工作區 | 誰建 | 可達性怎麼來 |
+| --- | --- | --- | --- |
+| `builder` | `<pool>/<job-id>`（per-job clone） | Manager（`seams.ScriptWorktreeCreator`） | **本票補上的**具名 ACL（`rwX` ＋ default `rwx`，遞迴） |
+| `reviewer`／`planner` | `<repos>/<slug>/.psc-review-worktrees/<…>`、`<coordinator>/planning-scratch/<…>/cwd` | Manager（`review.prepare_review_worktree`／`planning_job._prepare_scratch`） | 兩棵樹的**根**已帶 `default:user:cortex-reviewer-planner:r-x` ⇒ 自動繼承，**零動作** |
+| `gate` | `<agents>/gate-worktree/<key>` | **gate 自己**（`gate_ledger.snapshot_worktree`） | pool 根的 owner 就是 `cortex-gate`，**零動作、零 ACL** |
+
+```bash
+# ✅ 驗證 0：`acl` 套件在（0818 三個部署陷阱之一就是它缺席）
+command -v setfacl getfacl
+#   期望：/usr/bin/setfacl 與 /usr/bin/getfacl。缺 ⇒ `sudo apt install acl`，
+#   否則**每一個** builder job 都會在 shim 的 chdir 當場 EACCES。
+#   它自 #710 起是登記表登記過的執行期相依（permgen.SYSTEM_PROGRAMS ／
+#   RUN_EXTERNAL_DEPENDENCIES，兩個方向都有測試釘住）。
+
+# ✅ 驗證 1：產生器對 per-job 那一格出的是什麼（**註解形式**，不在 setup 階段執行）
+python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
+  | grep -A8 -E '^# \[TIER_1\] repo-worktree'
+#   期望逐字（順序也要對——`chmod` 必須排在 `setfacl` **之前**，見下方 mask 陷阱）：
+#     chown cortex-manager:cortex-manager /var/lib/cortex/worktree/<job-id>
+#     chmod 0700 /var/lib/cortex/worktree/<job-id>
+#     setfacl -R -m u:cortex-builder:rwX /var/lib/cortex/worktree/<job-id>
+#     setfacl -R -d -m u:cortex-builder:rwx /var/lib/cortex/worktree/<job-id>
+#     setfacl -R -m u:cortex-gate:rX /var/lib/cortex/worktree/<job-id>
+#     setfacl -R -d -m u:cortex-gate:rX /var/lib/cortex/worktree/<job-id>
+#   ⛔ 看到 `chown cortex-builder …` ⇒ 落檔的是舊版產生器的產物（那個形態 Manager
+#      做不到，見上方）。
+
+# ✅ 驗證 2：⚠️ **pool 根不得有任何 job 帳號的 default ACL**
+sudo getfacl -p /var/lib/cortex/worktree
+#   期望：`user::rwx / group::--- / other::--x`，**完全沒有** `user:` 具名條目、
+#   **完全沒有** `default:` 區塊。
+#   ⛔ 出現 `default:user:cortex-*` ⇒ 有人把授權下在 pool 根上了：**每個** job 帳號
+#      會進得去**每個** job 的目錄，裁決 10-2 的 per-job 隔離當場歸零。處置是
+#      `sudo setfacl -k /var/lib/cortex/worktree`（只刪 default ACL），不是把
+#      per-job 那一格的授權也拿掉。
+#      這條在程式面由 permgen 的 import 期斷言擋著（加上去 ⇒ 模組載不起來）。
+
+# ✅ 驗證 3：⚠️ **mask 判準**——判的是 `mask::` 與 `#effective:`，不是「ACL 行存在」
+#    先起一輪 build（或跑驗證 5 的探針）拿到一個真的工作區，再看它：
+sudo getfacl -p /var/lib/cortex/worktree/<job-id>
+#   期望含：
+#     user::rwx
+#     user:cortex-builder:rwx
+#     user:cortex-gate:r-x
+#     mask::rwx
+#     default:user:cortex-builder:rwx
+#     default:user:cortex-gate:r-x
+#   ⛔ 看到 `user:cortex-builder:rwx	#effective:---` ⇒ **有人在 setfacl 之後又
+#      chmod 了一次**（4e-2b 記過的同一個陷阱）。ACL 行還在，有效權限卻是零。
+#   ⛔ 只有樹根有、`<job-id>/.git/HEAD` 沒有 ⇒ 那條 ACL 不是遞迴套的；job 進得去、
+#      卻讀不到裡面任何東西（比原症狀更難查）。
+sudo getfacl -p /var/lib/cortex/worktree/<job-id>/.git/HEAD
+#   期望含 `user:cortex-builder:rw-`（大寫 `X` 只給目錄與已可執行的檔）。
+
+# ✅ 驗證 4：**反向**——別的 job 帳號進不去這一格
+sudo -u cortex-reviewer-planner ls /var/lib/cortex/worktree/<job-id>
+#   期望：`Permission denied`。成功 ⇒ 授權下錯層級（見驗證 2）。
+
+# ✅ 驗證 5（**反向不變式**，零額外 env、真實加固面、真實 provisioning）
+python3 -m paulsha_cortex.trust_root workspace-probe four-way
+#   它對三個 principal 各出一段：
+#     builder —— 以 `seams.ScriptWorktreeCreator` ＋ `job_runner.
+#       ensure_workspace_reachable()`（**產品程式碼**，不是手工前置物）建出並授權，
+#       再以 `psc_run_under` 在真實加固面下 `cd` 進去寫檔，並反向斷言另外兩個 job
+#       帳號進不去；
+#     reviewer —— 驗兩棵 pool 根的 default ACL，並反向斷言工作區對它**唯讀**；
+#     gate —— 驗 pool 根的 owner 就是 `cortex-gate`。
+#   ⚠️ property 清單由 `permgen.unit_replica_properties()` 從**落檔的 unit** 全量導出。
+#      **不得**自行組 `--property=`、**不得**自帶 `--setenv=PATH=`（design D13）。
+#   ⚠️ 工作區**不得手工前置**：#645 逐字記錄過手工前置物會把 bug 繞過去，而 #710
+#      正是那一族的下一個成員（M1 當時 operator 手工挑路徑、恰好避開了這個缺陷）。
+
+# ✅ 驗證 6：真實派工 smoke（D13 caveat：psc_run_under 複製的是加固面，不是派工路徑）
+#    起一輪 build，確認 job 的 log 裡**沒有** shim 的 chdir 失敗，且工作區裡有東西。
+sudo -u cortex-manager cat \
+  /var/lib/cortex/coordinator/commit-spool/build-logs/<slice>/shim-error.json 2>/dev/null
+#   期望：**檔案不存在**。存在且 error 是 `Permission denied: '<pool>/<job-id>'`
+#   ⇒ 本步沒生效（先看驗證 0 的 `acl` 套件，再看驗證 3 的 mask）。
+```
+
+**已知邊界（不是本步沒做完，是另一票）**：builder 終於寫得出東西之後，工作區裡會
+出現 **builder 擁有**的 inode。default ACL 讓 `cortex-gate` 對它們仍然讀得到（POSIX：
+目錄帶 default ACL 時 **umask 不生效**，因此 unit 的 `UMask=0077` 不會把 mask 壓成
+`---`），但 **Manager 沒有**那些 inode 上的任何條目（它不在 `repo-worktree` 的
+readers 面，#641 收掉了）⇒ `cortex work gc` 的 `rmtree` 走不進 builder 新建的子目錄，
+工作區會殘留。補 Manager 的 default ACL 會把 #641 關掉的「Manager 以 `cwd=<job 樹>`
+執行 job 交出來的 `conftest.py`」提權面整條打開，因此**刻意不補**；殘留先以
+`sudo rm -rf <pool>/<job-id>` 收，回收面的處置另立一票。
+
+**回滾**：本步沒有部署期動作可回滾。要退掉執行期那條授權就是退回上一版 cortex
+（退回之後 builder job 會回到 #710 的原症狀：shim 在 `os.chdir()` 當場 EACCES）。
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 

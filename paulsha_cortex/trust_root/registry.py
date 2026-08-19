@@ -290,6 +290,300 @@ def _assert_every_downgraded_principal_has_a_job_log_spool() -> None:
 _assert_every_downgraded_principal_has_a_job_log_spool()
 
 
+class WorkspaceReach(Enum):
+    """job 取得**自己工作區可達性**的機制（#710）。
+
+    三個降權 principal 各屬其一，而且**現況本來就不同**——`#710` 的要求不是把三者
+    改成同一個形狀（那會為了對稱而破壞各自成立的理由），是讓「每個 job 都進得去自己
+    的工作區」這條性質由**一張表**導出、由 import 期斷言強制。
+    """
+
+    #: pool 根的 owner 就是該 job 帳號，per-job 那一格由 job **自己**建立
+    #: ⇒ 可達性在部署當下一次成立，執行期零動作。gate 屬此（`gate-worktree-pool`）。
+    POOL_OWNED_BY_JOB = "pool-owned-by-job"
+
+    #: pool 根帶該帳號的 **default ACL** ⇒ Manager 在裡面建的每一格自動繼承。
+    #: reviewer／planner 屬此（`repo-source-tree` 的 review worktree、
+    #: `planning-scratch-pool` 的 per-invocation scratch）。
+    #:
+    #: **它只在「pool 底下每一格都給同一個帳號」時才合法**：default ACL 是整棵樹的
+    #: 性質，給不出 per-job 差別。
+    INHERITED_DEFAULT_ACL = "inherited-default-acl"
+
+    #: pool 根**刻意零 default ACL**（多個 job 帳號共用同一個容器），因此可達性只能
+    #: 由 Manager 在 provision 當下對**那一格**下具名 ACL。builder 屬此
+    #: （`dispatch-worktree-pool` 底下的 `repo-worktree`）。
+    #:
+    #: ⚠️ **不得改成往 pool 根下 default ACL**：那會讓**每個** job 帳號進得去
+    #: **每個** job 的目錄，per-job 隔離當場歸零。這條由
+    #: `permgen._assert_job_workspace_reach_matches_the_plan()` 在 import 當下強制。
+    PER_JOB_NAMED_ACL = "per-job-named-acl"
+
+
+@dataclass(frozen=True)
+class JobWorkspaceReach:
+    """一個降權 job principal 的**工作區可達性**宣告（#710）。
+
+    這張表的存在理由與 :data:`JOB_LOG_SPOOLS` 逐字同型，是一條**機制事實**：
+    `coordinator/job_shim.py` 在降權之後、exec 之前 `os.chdir(spec["working_directory"])`
+    ——那一步走不進去，job 就死在它做任何事之前（#710 實機：
+    `[Errno 13] Permission denied: '/var/lib/cortex/worktree/wf-…'`）。
+
+    ⇒ **凡在 :data:`DOWNGRADED_JOB_PRINCIPALS` 上的 principal，一律要有一格。**
+    """
+
+    #: :data:`DOWNGRADED_JOB_PRINCIPALS` 上的那一格。
+    principal: Principal
+    #: 真正走這條路的 persona（reviewer 那一列同時代表 `PLANNER`，理由與
+    #: :class:`JobLogSpool` 的同名欄位逐字相同：三分／四分下兩者是同一個 OS 帳號）。
+    persona: Principal
+    reach: WorkspaceReach
+    #: 該 principal 的工作區**落在哪些登記表資產底下**。多於一項是誠實的：
+    #: reviewer 帳號的工作區有兩種（foreign review 的 worktree 在 `repo-source-tree`
+    #: 底下、planning 的 scratch 在 `planning-scratch-pool` 底下），兩者都必須成立。
+    pool_asset_ids: tuple[str, ...]
+    #: per-job 那一格自己的登記表資產 id。**只有 `PER_JOB_NAMED_ACL` 有**——另外
+    #: 兩種形態的 per-job 那一格不是獨立資產（gate 自己建、reviewer 繼承）。
+    per_job_asset_id: str | None
+    #: job 帳號在自己的工作區上**最終必須擁有**的權限位。這是「進得去」這句話的
+    #: 可驗形式：反向不變式與執行期的 preflight 檢查比對的就是它（mask 之後的
+    #: **有效**權限，`coordinator/job_runner.effective_perms_for_account()`）。
+    #: **三種形態一律非空**——不論可達性由 owner 位、繼承或具名 ACL 供給，
+    #: 「job 要能做到什麼」都必須寫得出來。
+    required_perms: str
+    #: 具名 **access** ACL 的 perms（`setfacl -m` 的右手邊）。大寫 `X`＝只有目錄與
+    #: **已經可執行**的檔拿到 `x`，遞迴套用時不會把整棵樹的一般檔案變成可執行檔。
+    #: **空字串＝本形態不下任何 ACL**（`POOL_OWNED_BY_JOB`，可達性來自 owner 位）。
+    access_perms: str
+    #: 對應的 **default** ACL perms（`setfacl -d -m` 的右手邊）。
+    default_perms: str
+    #: 除了 job 自己以外，**同一次** per-job setfacl 還要授予誰（persona → perms）。
+    #: builder 那一列的 `GATE: rX` 就是 #629 宣告、但在本票之前只存在於註解裡的那條。
+    extra_reader_perms: tuple[tuple[Principal, str], ...]
+    note: str
+
+
+#: **#710 那條規則的表**：三個 principal 一格都不能少。
+#:
+#: 每一列都是**現況查證後**的形狀，不是統一過的理想形狀——#710 的 issue body 逐字
+#: 要求「三者現況不同，不要假設一致」。查證結果：
+#:
+#: | principal | 工作區 | 誰建 | 可達性怎麼來 |
+#: |---|---|---|---|
+#: | builder | `<worktree pool>/<job-id>`（per-job clone） | Manager（`seams.ScriptWorktreeCreator`） | **本票補上的那一條**具名 ACL |
+#: | reviewer | `<repos>/<slug>/.psc-review-worktrees/<…>`／`<planning-scratch>/<…>/cwd` | Manager（`review.prepare_review_worktree`／`planning_job._prepare_scratch`） | pool 根的 default ACL 繼承 |
+#: | gate | `<gate-worktree>/<key>` | **gate 自己**（`gate_ledger.snapshot_worktree`） | pool 根 owner 就是 gate |
+#:
+#: **為什麼是一張表而不是三處各自成立**：#623／#648 決定 per-job clone 時，
+#: 「整個 clone 由本 job 帳號擁有」只被寫進 unit 註解，沒有任何程式實作，而且
+#: Manager **結構上做不到**（`chown` 給另一個使用者要 `CAP_CHOWN`，Manager unit 帶
+#: `CapabilityBoundingSet=`）。三個 principal 各自被決定，於是其中兩個恰好成立、
+#: 一個等到 builder job 第一次由 daemon 經正規路徑派出來才當場死。導出之後，
+#: 「只修一格」在**結構上做不到**：新增第四個降權角色而漏了這裡，模組**載不起來**
+#: （:func:`_assert_every_downgraded_principal_has_a_workspace_reach`）。
+#: 前例：#698 的 `EXECUTOR_ENFORCEMENT_LEAVES`、#708 的 :data:`JOB_LOG_SPOOLS`。
+JOB_WORKSPACE_REACH: tuple[JobWorkspaceReach, ...] = (
+    JobWorkspaceReach(
+        principal=Principal.BUILDER,
+        persona=Principal.BUILDER,
+        reach=WorkspaceReach.PER_JOB_NAMED_ACL,
+        pool_asset_ids=("dispatch-worktree-pool",),
+        per_job_asset_id="repo-worktree",
+        required_perms="rwx",
+        access_perms="rwX",
+        default_perms="rwx",
+        extra_reader_perms=((Principal.GATE, "rX"),),
+        note=(
+            "**#710 的原症狀就在這一格。** Manager 以 `git clone --no-hardlinks` 建出 "
+            "`<worktree pool>/<job-id>`，而那個目錄的 owner 是 **Manager**、mode `0700`、"
+            "零具名 ACL ⇒ builder job 的 shim 在 `os.chdir()` 就 `[Errno 13] "
+            "Permission denied`（模板 unit 的 `ReadWritePaths=<pool>/%i` 在 **mount 層**"
+            "放行，DAC 層擋死——兩層要同時成立）。\n"
+            "**owner 為什麼不能改成 builder**：(a) `chown` 給另一個使用者需要 "
+            "`CAP_CHOWN`，Manager unit 的 `CapabilityBoundingSet=` 是空的——這不是漏寫"
+            "一行，是方案與降權模型衝突；(b) 就算做得到也不該做——`gc`／"
+            "`worktree_reclaim` 要 `rmtree` 整棵樹，那需要樹**內**的寫入權，交出 owner "
+            "等於讓工作區回收不了（#478／#601 的生產事故面）。\n"
+            "因此 owner 維持 Manager，job 拿**具名 ACL**：`setfacl` 由目錄 owner 執行、"
+            "**不需要任何 capability**。\n"
+            "**誠實邊界（本票不解、但因為本票才第一次可觀察到）**：builder 終於寫得出"
+            "東西之後，樹裡開始出現 **builder 擁有**的 inode。default ACL 讓它們自動帶上"
+            "宣告的具名條目（POSIX：目錄帶 default ACL 時 **umask 不生效**，因此 unit 的 "
+            "`UMask=0077` 不會把 mask 壓成 `---`——這一點與 #638 缺陷 1 的形狀相反，已實測"
+            "確認），所以 **gate 的 `rX` 對 builder 新建的檔仍然成立**。但 **Manager 沒有"
+            "在那些 inode 上的任何條目**（它不在 readers 面，#641 收掉了）⇒ "
+            "`gc`／`worktree_reclaim` 的 `rmtree` 走不進 builder **新建的子目錄**，工作區"
+            "會殘留在磁碟上。這條在「clone 由 job 帳號擁有」的原設計下**更嚴重**（Manager "
+            "連樹根都進不去），因此不是本票造成的退步；補上 Manager 的 default ACL 會把 "
+            "#641 關掉的那條「Manager 以 cwd=<job 樹> 執行 job 交出來的 conftest.py」提權面"
+            "整條打開，故**刻意不補**——回收面的處置要另立一票（候選：由 #629 的 gate 身分"
+            "或一支 root-owned 的回收 helper 執行，兩者都不是把讀取權交還給 Manager）。\n"
+            "⚠️ **必須下在 per-job 那一格，不能下在 pool 根**：pool 根（`0701 "
+            "cortex-manager`）是 builder／reviewer／planner 三個帳號共用的容器，在它身上"
+            "下 default ACL 會讓每個 job 帳號進得去每個 job 的目錄，裁決 10-2 的 per-job "
+            "隔離當場歸零。這條由 permgen 的 import 期斷言強制（pool 根上出現任何 job "
+            "帳號的 default ACL ⇒ 模組載不起來）。"
+        ),
+    ),
+    JobWorkspaceReach(
+        principal=Principal.REVIEWER,
+        persona=Principal.PLANNER,
+        reach=WorkspaceReach.INHERITED_DEFAULT_ACL,
+        pool_asset_ids=("repo-source-tree", "planning-scratch-pool"),
+        per_job_asset_id=None,
+        required_perms="rx",
+        access_perms="rX",
+        default_perms="rX",
+        extra_reader_perms=(),
+        note=(
+            "reviewer 帳號的工作區**不在** worktree pool 底下（那是 builder 的），因此"
+            "它不需要、也不該拿到本票為 builder 補上的那條 `rwx`：\n"
+            "  - foreign review：Manager 以 `git worktree add --detach` 在 "
+            "`<repo-source-tree>/<slug>/.psc-review-worktrees/` 底下開一棵 linked "
+            "worktree（`coordinator/review.py:prepare_review_worktree`）；\n"
+            "  - planning／define：Manager 在 `planning-scratch-pool` 底下開一格空的 "
+            "per-invocation scratch（`coordinator/planning_job.py:_prepare_scratch`）。\n"
+            "兩棵樹的**根**都已經帶 `setfacl -d -m u:<reviewer 帳號>:rX`（登記表的 "
+            "`readers` 機械導出），Manager 在裡面建的每一格因此自動繼承 ⇒ 可達性已經"
+            "成立，本票對這一格**不新增任何 ACL**。\n"
+            "**唯讀是刻意的**：reviewer 的交付通道是 `review-verdict-spool`，planner 的"
+            "是 `dispatch-specs-tree`；給工作區寫入權買不到任何東西，卻會把 #628／#639 "
+            "關掉的「被驗方在自己的工作區裡產生自己的證據」重新打開。"
+        ),
+    ),
+    JobWorkspaceReach(
+        principal=Principal.GATE,
+        persona=Principal.GATE,
+        reach=WorkspaceReach.POOL_OWNED_BY_JOB,
+        pool_asset_ids=("gate-worktree-pool",),
+        per_job_asset_id=None,
+        required_perms="rwx",
+        access_perms="",
+        default_perms="",
+        extra_reader_perms=(),
+        note=(
+            "gate 的 pool 根 owner **就是** `cortex-gate`（單一 job writer ⇒ permgen 產出 "
+            "`chown cortex-gate` ＋ `0700`），而 per-job 那一格是 gate **自己**用 "
+            "`shutil.copytree` 建的（`gate_ledger.snapshot_worktree`）——它天生擁有自己"
+            "產出的每一個 inode。可達性因此在部署當下就成立，執行期零動作、零 ACL。\n"
+            "**gate 的 cwd 也不是那一格**：spec 的 `working_directory` 是 pool **根**"
+            "（`gate_runner._run_as_gate_identity`），因為副本在 unit 起動的當下還不"
+            "存在。要驗的性質因此是「gate 進得去自己的 pool 根」。\n"
+            "**但 gate 要讀得到被驗的樹**：來源是 builder 的 clone，登記表 "
+            "`repo-worktree` 的 `readers` 已宣告 `GATE`（#629），那條 `rX` 與 builder 的 "
+            "`rwX` 由**同一次** per-job setfacl 一起落地——在本票之前它與 builder 那條"
+            "一樣只存在於註解裡。"
+        ),
+    ),
+)
+
+
+def job_workspace_reach_for(principal: Principal) -> JobWorkspaceReach:
+    """該降權 principal 的工作區可達性宣告；查無即 fail-closed（#710）。"""
+
+    for reach in JOB_WORKSPACE_REACH:
+        if reach.principal is principal:
+            return reach
+    raise KeyError(
+        f"{principal.value} 沒有登記工作區可達性——凡經模板 unit 派出的 job 都要 "
+        "`chdir` 進自己的工作區（#710）。"
+    )
+
+
+def per_job_named_acl_workspace_assets() -> dict[str, JobWorkspaceReach]:
+    """`per_job_asset_id → 宣告`，只含 :attr:`WorkspaceReach.PER_JOB_NAMED_ACL` 那些。
+
+    permgen 以它決定哪些 per-job 資產要走「Manager 擁有 ＋ job 具名 ACL」的形態，
+    因此那個形態的**輸入只有本表**，不是產生器裡的一組 asset_id 字面量。
+    """
+
+    return {
+        reach.per_job_asset_id: reach
+        for reach in JOB_WORKSPACE_REACH
+        if reach.reach is WorkspaceReach.PER_JOB_NAMED_ACL and reach.per_job_asset_id
+    }
+
+
+def _assert_every_downgraded_principal_has_a_workspace_reach() -> None:
+    """#710 的那條規則，在 **import 當下**強制（registry 這一半）。
+
+    **規則**：`principal` 在 :data:`DOWNGRADED_JOB_PRINCIPALS` 上有一格
+    ⇒ 它在 :data:`JOB_WORKSPACE_REACH` 上**必須**也有恰好一格，且該格的形態自洽。
+
+    為什麼是 import 當下而不是一條測試：理由與 #698／#708 逐字相同——#710 的破口
+    不是「有人寫錯一行」，是「三個 principal 的工作區可達性**各自**被決定，於是其中
+    兩個恰好成立、一個在 unit 註解裡宣稱成立但沒有任何程式實作」。在展開點上強制，
+    讓「只修一格」在**結構上做不到**。
+
+    （另一半——「宣告的形態與權限計畫是否真的一致」——需要 scheme 與 layout，因此由
+    `permgen._assert_job_workspace_reach_matches_the_plan()` 在它那一側強制。）
+    """
+
+    declared = [reach.principal for reach in JOB_WORKSPACE_REACH]
+    if len(declared) != len(set(declared)):
+        raise ValueError(f"JOB_WORKSPACE_REACH 有重複的 principal: {declared}")
+    missing = [p for p in DOWNGRADED_JOB_PRINCIPALS if p not in declared]
+    if missing:
+        raise ValueError(
+            f"降權 principal {[p.value for p in missing]} 沒有工作區可達性宣告——"
+            "模板 unit 的 shim 在降權之後 `os.chdir(working_directory)`，走不進去的 job "
+            "死在它做任何事之前（#710 實機：builder `[Errno 13] Permission denied`）。"
+            "請往 JOB_WORKSPACE_REACH 加一列，不要在別處手寫一條 setfacl。"
+        )
+    extra = [p for p in declared if p not in DOWNGRADED_JOB_PRINCIPALS]
+    if extra:
+        raise ValueError(
+            f"JOB_WORKSPACE_REACH 宣告了非降權 principal {[p.value for p in extra]}——"
+            "本表的輸入只有 DOWNGRADED_JOB_PRINCIPALS（沒有模板 unit 就沒有 shim，"
+            "也就沒有這一格要解決的問題）。"
+        )
+    for reach in JOB_WORKSPACE_REACH:
+        if not reach.pool_asset_ids:
+            raise ValueError(
+                f"{reach.principal.value}：沒有宣告任何 pool 資產——「工作區落在哪一棵"
+                "已登記的樹底下」是本規則唯一的輸入（#710）。"
+            )
+        if reach.persona not in UNTRUSTED_EXECUTION_PRINCIPALS:
+            raise ValueError(
+                f"{reach.principal.value}：persona {reach.persona.value} 不在 "
+                "UNTRUSTED_EXECUTION_PRINCIPALS 上——那樣 permgen 不會為它產出任何"
+                "跨帳號 ACL，job 到了實機一樣進不去（#657 的失效模式）。"
+            )
+        has_leaf = reach.per_job_asset_id is not None
+        wants_leaf = reach.reach is WorkspaceReach.PER_JOB_NAMED_ACL
+        if has_leaf != wants_leaf:
+            raise ValueError(
+                f"{reach.principal.value}：`per_job_asset_id` 與 reach "
+                f"{reach.reach.value} 不相容——具名 ACL 形態**必須**指名那一格是哪一個"
+                "登記表資產（要下 setfacl 就要有落點），其餘形態**必須**留 None"
+                "（那一格不是獨立資產：gate 自己建、reviewer 繼承）。"
+            )
+        if not reach.required_perms:
+            raise ValueError(
+                f"{reach.principal.value}：`required_perms` 為空——「job 進得去自己的"
+                "工作區」這句話必須寫得出可驗形式，不論可達性由 owner 位、繼承還是"
+                "具名 ACL 供給（#710）。"
+            )
+        if reach.extra_reader_perms and reach.reach is not WorkspaceReach.PER_JOB_NAMED_ACL:
+            raise ValueError(
+                f"{reach.principal.value}：只有 PER_JOB_NAMED_ACL 形態有「同一次 "
+                "setfacl」可以搭便車，其餘形態的額外 reader 必須自己在登記表上宣告"
+                "（#710）。"
+            )
+        owner_reach = reach.reach is WorkspaceReach.POOL_OWNED_BY_JOB
+        if owner_reach == bool(reach.access_perms):
+            raise ValueError(
+                f"{reach.principal.value}：`access_perms`={reach.access_perms!r} 與 "
+                f"reach {reach.reach.value} 對不上——`POOL_OWNED_BY_JOB` 的可達性來自 "
+                "**owner 位**，用 ACL perms 描述它會讓人以為某處有一條 setfacl；其餘"
+                "兩種形態則必須寫出 job 需要的那組權限，那是 permgen 拿去比對權限計畫"
+                "（繼承形態）與執行期真的會下的那條命令（具名形態）的同一個值（#710）。"
+            )
+
+
+_assert_every_downgraded_principal_has_a_workspace_reach()
+
+
 def job_spec_spool_asset_id(principal: Principal) -> str:
     """該降權 principal 的 per-principal spec spool 資產 id（#657）。
 
@@ -961,8 +1255,26 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         IngressKind.STAGING_SPOOL,
         note=(
             "builder write_paths:['**']，可寫工作區內任何路徑（含 .cortex/.github）。"
-            "#623 之後這個工作區是從 `repo-source-tree` 拉出來的 **per-job 完整 clone**"
-            "（整個 clone 由該 job 帳號擁有），不再是共用 object store 的 git worktree。\n"
+            "#623 之後這個工作區是從 `repo-source-tree` 拉出來的 **per-job 完整 clone**，"
+            "不再是共用 object store 的 git worktree。\n"
+            "**#710：owner 是 Manager，builder 的可寫面走具名 ACL——不是「整個 clone 由該 "
+            "job 帳號擁有」。** 那句話從 #623／#648 起就寫在本 note 與模板 unit 的註解裡，"
+            "但**沒有任何程式實作它**，而且 Manager 結構上做不到：`chown` 給另一個使用者"
+            "需要 `CAP_CHOWN`，Manager unit 帶 `CapabilityBoundingSet=`（空）。代價是 "
+            "builder job 第一次由 daemon 經正規路徑派出來就死在 shim 的 `os.chdir()`"
+            "（實機 `[Errno 13] Permission denied`）。形態因此更正為 **Manager 擁有 ＋ "
+            "job 具名 ACL**（`WorkspaceReach.PER_JOB_NAMED_ACL`，見 "
+            ":data:`JOB_WORKSPACE_REACH`）：`setfacl` 由目錄 owner 執行、不需要任何 "
+            "capability，且 `gc`／`worktree_reclaim` 仍 `rmtree` 得掉整棵樹（交出 owner "
+            "反而讓工作區回收不了）。\n"
+            "**Manager 進得去這棵樹，因此不是一條可以靠 DAC 守住的邊界**——#641 收掉的是"
+            "「登記表**主動授予** Manager 的跨帳號 ACL」，那條仍然不存在（本項的 readers "
+            "不含 MANAGER，產生器也不為它出任何一條 `u:cortex-manager:` 的 setfacl）；"
+            "但 owner 位給的存取不是 ACL 給的，收不掉。`verification` 那條「以 "
+            "`cwd=<job 樹>` 執行宣告出來的命令」的提權路徑因此**只由 fail-closed ＋ #629 "
+            "的第三執行身分**擋住（`candidate-worktree-unreadable-pending-gate-identity` "
+            "與 gate 的拋棄式副本），不由這棵樹的權限擋住。這是實機 0817 起就成立的狀態，"
+            "#710 只是讓登記表與產生器停止宣稱相反的事（#696 的同型）。\n"
             "**#641：reader 只剩 job 帳號自己，Manager 不在其中。** 本項原宣告 "
             "`readers=(MANAGER,)`，permgen 因此產出 `setfacl -m u:cortex-manager:rX "
             "<job 樹>`，理由是「交換面沿用 D2 git 讀」。#637 已把交換面整條換掉："
@@ -1008,8 +1320,13 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
         note=(
             "gate 執行身分的**拋棄式工作區** pool：`<agents_root>/gate-worktree/<job-id>/`。"
-            "形態逐條比照 `dispatch-worktree-pool`（容器 owner＝Manager、per-job 一格、"
-            "格內由該身分擁有）。\n"
+            "\n**#710 更正**：本項的形態**不**比照 `dispatch-worktree-pool`。gate 是本 pool "
+            "的**唯一** writer ⇒ 單一 job writer 分支 ⇒ 產生器出的是 `chown cortex-gate` ＋ "
+            "`0700`、**零 ACL**，容器 owner 就是 gate 自己；per-job 那一格由 gate 用 "
+            "`shutil.copytree` 自己建，因此天生屬於它。`dispatch-worktree-pool` 之所以要"
+            "容器 owner＝Manager，是因為那一棵是**三個帳號共用**的容器（見該項的 note 與 "
+            ":data:`JOB_WORKSPACE_REACH`）——本項沒有那個約束，多抄一次它的形態只會讓"
+            "讀的人去找一個不存在的 per-job chown 步驟。\n"
             "**為什麼是拋棄式副本而不是「工作樹對 gate 唯讀」**：唯讀在可行性上不成立"
             "——`pytest` 要寫 `.pytest_cache`／`__pycache__`，`npm test`／`cargo test`／"
             "`make` 更是必寫；把工作樹掛成唯讀只會讓每一個真實 gate 以 EROFS 收場，那正是"
@@ -1058,11 +1375,17 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note=(
             "派工 worktree pool；reviewer 與 builder 必須分屬互不可寫域（裁決 10-2）。"
             "**#641 複驗**：容器層 `0701`（owner＝Manager）給的是「別的帳號只能 traverse "
-            "進自己那格、列不出目錄」，**不是**「Manager 讀得進 job 的樹」——Manager 是容器"
-            "的 owner，本來就進得了容器，但每個 per-job 子目錄是 `0700 <job 帳號>`，收掉 "
-            "`repo-worktree` 的 `rX` 之後 Manager 就到此為止。容器層沒有任何為了「Manager "
-            "讀 job 樹」而設的額外授權（產生器對本項只出 `install -d`／`chown`／`chmod`，"
-            "零 `setfacl`）。"
+            "進自己那格、列不出目錄」。容器層沒有任何為了「Manager 讀 job 樹」而設的額外"
+            "授權（產生器對本項只出 `install -d`／`chown`／`chmod`，零 `setfacl`）。\n"
+            "⚠️ **#710：本項的「零 `setfacl`」是硬性質，不是巧合**。per-job 那一格的可達性"
+            "走**具名 ACL**（`repo-worktree`，見 :data:`JOB_WORKSPACE_REACH`）；只要有人為了"
+            "省事把那條授權往**本項**（pool 根）下成 default ACL，**每個** job 帳號就進得去"
+            "**每個** job 的目錄，裁決 10-2 的 per-job 隔離當場歸零。因此「pool 根上不得出現"
+            "任何 job 帳號的 default ACL」由 "
+            "`permgen._assert_job_workspace_reach_matches_the_plan()` 在 import 當下強制。\n"
+            "**#710 更正**：每個 per-job 子目錄**不是** `0700 <job 帳號>`，而是 `0700 "
+            "<Manager>` ＋ 該 job 帳號的具名 ACL——Manager 沒有 `CAP_CHOWN`，「spawn 時 "
+            "chown 給 job 帳號」從來不曾、也不可能發生（見 `repo-worktree` 的 note）。"
         ),
     ),
     # ---- path_resolver=None：在別處以字面量推導的 Tier-0／Tier-1 資產 --------
