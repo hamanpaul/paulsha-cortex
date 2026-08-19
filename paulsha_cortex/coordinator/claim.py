@@ -1202,6 +1202,35 @@ def _existing(candidate: ClaimCandidate) -> ClaimDecision | None:
     return _resume_decision(candidate)
 
 
+def needs_human_next_actions(
+    *,
+    phase: str | None,
+    planning_failure_classification: str | None,
+) -> tuple[str, ...]:
+    """`needs_human` run 的基礎合法動作集合——**單一導出點，回傳值永不為空**。
+
+    #256 R2 的判準原本只長在 `_resume_decision` 裡；`cortex status` 的 attention
+    投影（`manager.workflow_status_entry`）另走 `work_actions.
+    _phase_recovery_actions` 一條，而後者只涵蓋 build／verify／review 三個 phase
+    （`registry.RETRY_CARD_PHASE_PERSONA`）。兩份導出漂移的後果就是 #728 的現場：
+    `plan` phase 的 needs_human run（`planning-authority-reconciliation-failed`）
+    拿到 `next_actions: []`——fail-closed 可以，**無出路不行**。
+
+    判準本身不變，只是被抬成兩側共用的函式：
+
+    - `abandon` **永遠**合法（#256 R3：釋放後可重 claim），因此本函式不可能回空
+      集合；這就是「至少給得出一個合法動作」的機械保證。
+    - `recover-planning` 只在「停在 `define` 的環境類 planning 失敗」才浮現
+      （R1 fail-closed），與 `work_actions._recover_planning_action` 自身的前置驗
+      （`run.current_phase != "define"` 與 `classification != "environment"` 兩條
+      拒收）同一組條件——宣告一個保證失敗的動作比不宣告更糟（#382）。
+    """
+
+    if planning_failure_classification == "environment" and phase == "define":
+        return ("recover-planning", "abandon")
+    return ("abandon",)
+
+
 def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
     if candidate.active_status == "done":
         return ClaimDecision(
@@ -1217,8 +1246,12 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
         # 環境類 planning 失敗」時才是合法出口——內容類失敗不得由本路徑繞過
         # （R1 fail-closed），拿不到 evidence 時也不宣稱它可用。
         classification = candidate.active_planning_failure_classification
-        recoverable = classification == "environment" and candidate.active_phase == "define"
-        next_actions = ("recover-planning", "abandon") if recoverable else ("abandon",)
+        # #728：判準抬進 `needs_human_next_actions`，讓 attention 投影
+        # （`manager.workflow_status_entry`）讀**同一個**函式而不是自己再寫一份。
+        next_actions = needs_human_next_actions(
+            phase=candidate.active_phase,
+            planning_failure_classification=classification,
+        )
         blocking_reason = (
             f"planning-failure:{classification}:{candidate.active_planning_failure_reason}"
             if classification is not None and candidate.active_planning_failure_reason

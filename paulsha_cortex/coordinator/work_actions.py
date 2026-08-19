@@ -60,7 +60,7 @@ from . import verification
 from . import worktree_reclaim
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
 from .work_bridge import current_sizing_snapshot, resolve_trusted_repo_root, workflow_status
-from .workflow import GateEvidenceRef
+from .workflow import GateEvidenceRef, brainstorm_authority_bound
 
 
 logger = logging.getLogger(__name__)
@@ -3816,6 +3816,31 @@ def _recover_planning_action(
     actor_value = actor if isinstance(actor, str) and actor.strip() else requested_by
     if not isinstance(actor_value, str) or not actor_value.strip():
         actor_value = "operator"
+    # #728 裁決（(B)）：`recovery_basis: "planning-runtime-retry"` 的語意是
+    # 「**解除封鎖、讓下一拍重跑**」，不是「recover 內部已經重跑過 planning」。
+    # 逐字證據（本函式與 manager 的實作，非推測）：
+    #
+    # 1. 本函式全程沒有任何 planner／runtime 呼叫——沒有 `runtime_factory`、沒有
+    #    `run_heterogeneous_brainstorm`、沒有寫 `gate_refs`／`planning_authority`
+    #    ／`planning_source_revision`。它只讀失敗 evidence、落一份稽核紀錄、
+    #    清掉 `needs_human`／`blocked` 兩個 facet。
+    # 2. 全庫**唯一**產生 brainstorm gate evidence 的路徑是
+    #    `manager.apply_workflow_action` 的 define 段（`run_heterogeneous_
+    #    brainstorm` → `gate_refs=result.gate_refs.as_tuple()` 與 `current_phase
+    #    ="plan"` 在**同一次** registry 原子寫入內完成）。
+    # 3. 而那條路徑的入口守衛逐字是 `if run.current_phase not in {"claim",
+    #    "define"}: return ... "already-claimed"`；`work_bridge.
+    #    start_canonical_workflow` 另有一條 `if existing_run.current_phase !=
+    #    "define": return existing_run` 短路。
+    #
+    # ⇒ 把 phase 推到 `plan` 不是「前進」，而是**永久關掉**產生 brainstorm 背書
+    # 的唯一入口。因此 `brainstorm_required` 且尚無自己的 brainstorm ref 時，
+    # recover 必須留在 `define`，由正常 define 流程重跑並自然產生 evidence。
+    #
+    # 判準不在這裡另寫一份：直接拿 reconciliation 用的**同一個**函式，去問
+    # 「我打算寫進去的那個 phase，是不是對帳的合法入口狀態」。答案是否就退回
+    # `define`——出口狀態因此在結構上不可能不是合法入口狀態。
+    recovered_phase = "plan" if brainstorm_authority_bound(run, phase="plan") else "define"
     record = _recover_planning_record(
         run,
         state_path=state_path,
@@ -3823,7 +3848,7 @@ def _recover_planning_action(
         failure_classification=failure_classification,
         failure_reason=failure_reason,
         evidence_ref=failure["evidence_ref"],
-        recovered_phase="plan",
+        recovered_phase=recovered_phase,
     )
     current_facets = tuple(
         facet for facet in run.facets if facet not in {"needs_human", "blocked"}
@@ -3833,7 +3858,7 @@ def _recover_planning_action(
         evidence_refs = (*evidence_refs, record["ref"])
     updated = workflow_registry._manager_update_workflow_run(
         run.run_id,
-        current_phase="plan",
+        current_phase=recovered_phase,
         facets=current_facets,
         gate_status="running",
         evidence_refs=evidence_refs,
@@ -3842,6 +3867,9 @@ def _recover_planning_action(
         "action": "recovered",
         "reason": "planning-recovery-dispatched",
         "expected_run_id": expected_run_id,
+        # #728：出口 phase 是本動作的裁決結果，不再是寫死的 `plan`——operator
+        # 不必翻 evidence 檔就看得到這次 recover 把 run 留在哪裡。
+        "recovered_phase": recovered_phase,
         "failure_classification": failure_classification,
         "failure_reason": failure_reason,
         "failure_basis": failure,

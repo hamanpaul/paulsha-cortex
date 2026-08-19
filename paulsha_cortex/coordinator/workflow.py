@@ -800,6 +800,75 @@ class WorkflowRun:
         )
 
 
+#: planning-authority 對帳在「缺 brainstorm 背書」時的**唯一**訊息字面值。
+#: `manager._validated_brainstorm_planning_authority` 是唯一擲出者，
+#: `work_actions._recover_planning_action` 以同一份判準（下面的
+#: `brainstorm_authority_bound`）避免製造出這個狀態；兩側不得各寫一份字串。
+BRAINSTORM_AUTHORITY_MISSING = "workflow brainstorm evidence missing"
+
+#: brainstorm 背書的**生產者**仍然可達的 phase 集合。
+#:
+#: 唯一產生 brainstorm gate evidence 的路徑是 `manager.apply_workflow_action`
+#: 的 define 段（`run_heterogeneous_brainstorm` → `gate_refs` 與
+#: `current_phase="plan"` 在同一次 registry 原子寫入內完成），而它的入口守衛
+#: 逐字是 ``if run.current_phase not in {"claim", "define"}: return
+#: "already-claimed"``；`work_bridge.start_canonical_workflow` 另有一條
+#: ``if existing_run.current_phase != "define": return existing_run`` 短路。
+#:
+#: 也就是說：**這個集合內的 phase 還沒有發佈任何 planning artifact，因此不得
+#: 要求它出示背書；集合外的 phase 已經沒有辦法再生出背書，因此必須出示。**
+#: 兩個守衛的字面集合與此處必須一致，不得漂移。
+PLANNING_PUBLICATION_PENDING_PHASES = frozenset({"claim", "define"})
+
+
+def brainstorm_authority_bound(run, *, phase: str | None = None) -> bool:
+    """planning-authority 對帳的 brainstorm 前置條件（**單一導出點**）。
+
+    #728：`recover-planning` 的**出口狀態**必須是 planning-authority
+    reconciliation 的**合法入口狀態**。修正前兩側各自表述——
+
+    - recover（`work_actions._recover_planning_action`）無條件把 phase 從
+      `define` 推到 `plan`，但它全程沒有任何 planner／runtime 呼叫，也不寫
+      `gate_refs`／`planning_authority`；
+    - reconciliation（`manager._validated_brainstorm_planning_authority`，由
+      `manager.resume_workflow_run:planning-authority` 呼叫）對
+      `brainstorm_required` 的 run 硬性要求它**自己的** `kind == "brainstorm"`
+      gate ref。
+
+    現場 run ``workflow-ef40fb2793c5b83818d9`` 因此在 recover 後的下一拍必定
+    fail-closed，而 `plan` phase 不在 `registry.RETRY_CARD_PHASE_PERSONA` 內、
+    `recover-planning` 又只受理 `define`，attention 的 `next_actions` 為空 ⇒
+    確定性死結，只剩 abandon 整代重來。
+
+    判準兩條，兩側共用：
+
+    1. run 還在 `PLANNING_PUBLICATION_PENDING_PHASES` 內時無條件成立——它還沒
+       發佈任何東西，而且 brainstorm 的生產者對它仍然可達。（修正前少了這條：
+       `define`／`needs_human` 且 `brainstorm_required` 的 run 是三條 planning
+       失敗路徑的**正常**產物，operator 一下 `cortex work resume`
+       （`operator_resume=True`）就會在 `define` 撞上同一句
+       `workflow brainstorm evidence missing`——實測 main 上 `define` 與 `plan`
+       兩個 phase 都會 wedge。）
+    2. 離開那個集合之後，`brainstorm_required` 的 run 必須帶著它自己的
+       brainstorm gate ref；不要求 brainstorm 的 run 無條件成立。
+
+    ``phase`` 預設取 ``run.current_phase``。recover 側傳入它**打算**寫進去的
+    phase，問的正是「我即將造出來的狀態，是不是對帳的合法入口狀態」——這就是
+    兩側共用同一組斷言的方式，而不是各自寫一份（#708／#710／#712 一路沿用的
+    「同一條規則機械導出」）。
+    """
+
+    effective_phase = getattr(run, "current_phase", None) if phase is None else phase
+    if effective_phase in PLANNING_PUBLICATION_PENDING_PHASES:
+        return True
+    if not getattr(run, "brainstorm_required", False):
+        return True
+    return any(
+        getattr(ref, "kind", None) == "brainstorm"
+        for ref in getattr(run, "gate_refs", ()) or ()
+    )
+
+
 def validate_workflow_phase_transition(current: str, new: str) -> None:
     if current not in WORKFLOW_PHASES or new not in WORKFLOW_PHASES:
         raise ValueError(f"非法 workflow phase transition: {current!r} -> {new!r}")
