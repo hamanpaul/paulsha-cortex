@@ -54,6 +54,8 @@ REVIEW_ACCOUNT = "cortex-reviewer-planner"
 BUILDER_ACCOUNT = "cortex-builder"
 MANAGER_ACCOUNT = "cortex-manager"
 
+_ISOLATED_AGENTS_ROOT = tempfile.mkdtemp(prefix="psc-615-agents-root-")
+
 _BASE_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     # #679：job 的 PATH 只由本角色的 `PSC_*_PATH` 決定（daemon 的 PATH 不再轉發），
@@ -62,6 +64,14 @@ _BASE_ENV = {
     "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
     "HOME": "/var/lib/cortex-manager",
+    # #708：reviewer job 現在也有一格由登記表導出的 log spool（掛在
+    # `review-verdict-spool` 底下），因此 `launcher.launch()` 會在 coordinator 樹底下
+    # 建東西——在此之前 review persona 走的是「不建 commit spool」那條，整個 launch
+    # 一個 coordinator 路徑都沒碰。本檔的 launch 測試以 `clear=True` 重建整份 environ
+    # （要驗的就是白名單本身），conftest 的 `_clear_runtime_env` 保護因此被清掉；
+    # 顯式帶一個 per-process 暫存根，否則會寫到 `HOME` 宣稱的那棵真實樹上
+    # （與 `tests/test_trust_root_job_template_ab.py` 逐字相同的處置）。
+    "PSC_AGENTS_ROOT": _ISOLATED_AGENTS_ROOT,
     "LANG": "en_US.UTF-8",
 }
 _SECRET_ENV = {

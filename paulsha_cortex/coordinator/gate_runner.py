@@ -85,8 +85,17 @@ DEFAULT_GATE_PYTHON = "/opt/cortex/venv/bin/python3"
 #: gate 那一格裡的 ledger 檔名（目錄本身以 spool key 定址）。
 GATE_LEDGER_FILENAME = "ledger.json"
 
-#: gate unit 的 stdout／stderr 落點（同一格內）。**診斷用，不是證據**：權威結論在
-#: ledger 裡，每個 gate 的輸出尾段由 `gate_ledger.run_gates()` 放進 `detail`。
+#: gate unit 的 stdout／stderr 落點的檔名。**診斷用，不是證據**：權威結論在 ledger
+#: 裡，每個 gate 的輸出尾段由 `gate_ledger.run_gates()` 放進 `detail`。
+#:
+#: **#708 起它落在自己的一格**（登記表資產 `gate-job-log-spool`，
+#: `<gate-ledger-spool>/gate-logs/<key>/`），不再與 ledger 共用那一格。理由不是潔癖，
+#: 是**它原本 Manager 讀不到**：舊路徑下這個檔由 gate job 自己建（shim 的
+#: `O_CREAT`），帶降權 unit 的 `UMask=0077` ⇒ `0600 cortex-gate`，而 Manager 只是
+#: **目錄**的 owner，那不給檔案內容的讀取權（#638 缺陷 2 的同一個機制）。結果是
+#: gate 失敗時逐字原因只存在於一個 Manager 讀不到的檔裡。改由 Manager 預先建立
+#: （`spool_slot.prepare_job_log()`，mode `0620`）之後，`_run_as_gate_identity()`
+#: 的錯誤訊息才帶得出 job 端的 tail。
 GATE_LOG_FILENAME = "gate.log"
 
 #: ledger 每一列 `detail` 的上限（與 `gate_ledger.run_gates` 的 `[-2000:]` 同數量級）。
@@ -143,6 +152,55 @@ def gate_spool_ledger_path(
         gate_ledger_spool_dir(spool_key=spool_key, coordinator_root=coordinator_root)
         / GATE_LEDGER_FILENAME
     )
+
+
+def gate_job_log_spool_root(coordinator_root: str | Path | None = None) -> Path:
+    """`<gate-ledger-spool>/gate-logs/`（登記表資產 `gate-job-log-spool`，#708）。
+
+    掛在 gate **既有**的輸出通道底下，因此 `permgen.read_write_paths()` 的
+    `_minimize()` 把它吃掉——`cortex-gate-job@.service` 的 `ReadWritePaths=` 逐字
+    不變、default ACL 自動繼承、零部署動作。
+    """
+
+    if coordinator_root is None:
+        return paths.job_log_spool_root("gate")
+    return (
+        Path(coordinator_root)
+        / paths.GATE_LEDGER_SPOOL_DIRNAME
+        / paths.GATE_JOB_LOG_SPOOL_DIRNAME
+    )
+
+
+def gate_job_log_path(
+    *, spool_key: str, coordinator_root: str | Path | None = None
+) -> Path:
+    """gate job 的 log 檔（Manager 預建、gate 以 `O_APPEND` 接管的那一個）。"""
+
+    _validate_spool_key(spool_key)
+    root = gate_job_log_spool_root(coordinator_root).resolve()
+    return root / spool_key / GATE_LOG_FILENAME
+
+
+def prepare_gate_job_log(
+    *, spool_key: str, coordinator_root: str | Path | None = None
+) -> Path:
+    """建出 gate 的 log 一格並由 Manager 預先建檔；回傳 log 路徑（#708）。
+
+    與另外兩個 principal 共用 `spool_slot.prepare_job_log()`——三格的差別只在
+    「掛在哪一條既有通道底下」，那件事由 `registry.JOB_LOG_SPOOLS` 一張表決定。
+    """
+
+    log_path = gate_job_log_path(
+        spool_key=spool_key, coordinator_root=coordinator_root
+    )
+    try:
+        return spool_slot.prepare_job_log(log_path.parent, log_path)
+    except (spool_slot.SpoolSlotError, OSError) as exc:
+        raise GateRunnerError(
+            "gate-job-log-unavailable",
+            f"gate job log slot unavailable: {log_path.parent}: {exc}",
+            spool_dir=str(log_path.parent),
+        ) from exc
 
 
 def gate_worktree_dir(
@@ -419,6 +477,22 @@ def run_declared_gates(
     )
 
 
+def _gate_log_tail(log_path: Path, *, limit: int = 2000) -> str:
+    """gate job 端 log 的尾段（診斷用）。**#708 之後 Manager 才讀得到它。**
+
+    讀不到就回空字串——診斷用的補充資訊不該反過來變成新的失敗來源（與
+    `job_runner._log_tail()` 逐字同一條原則）。
+    """
+
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    return f"gate job log 尾段: {text[-limit:]}\n"
+
+
 def _run_as_gate_identity(
     *,
     job_id: str,
@@ -446,6 +520,12 @@ def _run_as_gate_identity(
     spool_ledger = prepare_gate_spool(
         spool_key=spool_key, coordinator_root=coordinator_root
     )
+    # #708：log 走自己那一格，且**由 Manager 預先建檔**——舊路徑（與 ledger 同格、
+    # 由 job 自己建）下這個檔是 `0600 cortex-gate`，Manager 讀不到，於是 gate 失敗時
+    # 逐字原因只存在於一個看不見的檔裡。
+    gate_log = prepare_gate_job_log(
+        spool_key=spool_key, coordinator_root=coordinator_root
+    )
     snapshot = gate_worktree_dir(spool_key=spool_key)
     gate_env = job_runner.build_job_env(
         manager_env=env,
@@ -468,7 +548,7 @@ def _run_as_gate_identity(
         # cwd 是 gate 自己的 pool 根，不是被驗的樹：那棵樹對 gate 只有 `rX`，而
         # 副本在 unit 起動的當下還不存在（是 gate 的第一個動作才建的）。
         working_directory=str(paths.gate_worktree_root()),
-        log_path=str(spool_ledger.parent / GATE_LOG_FILENAME),
+        log_path=str(gate_log),
         env=gate_env,
     )
     job_runner.write_job_spec(plan.spec_path, spec, account=plan.account)
@@ -489,7 +569,11 @@ def _run_as_gate_identity(
             exc.reason,
             f"{exc}\n"
             f"gate unit={plan.unit} account={plan.account} "
-            f"profile={plan.hardening_profile} systemctl_exit={returncode}\n"
+            f"profile={plan.hardening_profile} systemctl_exit={returncode}"
+            # #708：shim 在接管 log 之前的失敗只進 journal，Manager 讀不到；那一族
+            # 現在另外留一筆機器可讀紀錄在 job 自己那一格 log spool 裡。
+            f"{job_runner.read_shim_error(str(gate_log))}\n"
+            f"{_gate_log_tail(gate_log)}"
             f"{(getattr(completed, 'stderr', '') or '').strip()[-2000:]}",
             **{**exc.context, "unit": plan.unit, "systemctl_exit": returncode},
         ) from exc
@@ -497,6 +581,10 @@ def _run_as_gate_identity(
     # 就是這個檔的擁有者。gate 交付的那一份留在 spool 裡封起來，不進採信路徑。
     gate_ledger.write_ledger_payload(ledger_path, payload)
     seal_gate_spool(spool_ledger)
+    # log 那一格同樣封口（best-effort，語意與 ledger 那一格逐字相同）：已經被判讀過
+    # 的診斷不該再被追寫。封的是**目錄**——Manager 是它的 owner，收掉 `w` 之後 gate
+    # 具名條目的 `wx` 隨 ACL mask 一併失效。
+    spool_slot.seal_slot(gate_log.parent)
     return payload
 
 
@@ -563,6 +651,9 @@ __all__ = [
     "DEFAULT_GATE_PYTHON",
     "GATE_LEDGER_FILENAME",
     "GATE_LOG_FILENAME",
+    "gate_job_log_path",
+    "gate_job_log_spool_root",
+    "prepare_gate_job_log",
     "GATE_PYTHON_ENV",
     "GateRunnerError",
     "MAX_DETAIL_CHARS",

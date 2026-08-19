@@ -63,6 +63,20 @@ COMMIT_BUNDLE_FILENAME = "commits.bundle"
 #: producer 寫完成果後放寬到的 mode（缺陷 2）。consumer 讀得到即可，不需要 `w`。
 PUBLISHED_FILE_MODE = 0o644
 
+#: **job log 檔由 consumer（Manager）預先建立**時用的 mode（#686 → #708 起三個
+#: principal 共用）。
+#:
+#: **不是 0600**：POSIX ACL 下新檔的 `mask` 由 open(2) 的 mode 參數之 group 位夾擠，
+#: `0600` 會把繼承來的 `user:<job>:-wx` 壓成 `#effective:---`（＝缺陷 1 的同一個
+#: 機制），job 於是連 append 都不行。
+#:
+#: **為什麼由 Manager 建而不是讓 job 自己建**：job 建的檔由 job 擁有、又帶降權 unit
+#: 的 `UMask=0077`，Manager 是**目錄**的 owner 但那不給檔案內容的讀取權（缺陷 2）。
+#: 另外兩個 spool 靠 producer 自己 `chmod 0644` 繞過（:func:`publish_file_command`），
+#: 那需要一段跑在 job 之後的 wrapper；而 log 是 **shim 在 exec 之前**就接管的東西，
+#: job 失敗得越早就越沒有機會放寬自己的 log——而那正是 #708 要修的那個時序。
+JOB_LOG_FILE_MODE = 0o620
+
 #: seal 時對那一格內既有檔案的 best-effort 唯讀化。**只有在 consumer 恰好也是檔案
 #: owner 時才會成功**（同 UID／`direct` 模式）；三分下必然 `PermissionError`，屬
 #: 預期內，真正的封口是 :data:`SEALED_SLOT_MODE`。
@@ -213,6 +227,36 @@ def _remove_slot(path: Path) -> None:
         raise SpoolSlotError("unavailable", f"spool slot not reusable: {path}: {exc}") from exc
 
 
+
+def prepare_job_log(slot: str | Path, log_path: str | Path) -> Path:
+    """建出 per-job 的 log 一格，並**由 consumer 預先建立** log 檔（#686／#708）。
+
+    這是三個降權 principal 共用的那一份實作（`registry.JOB_LOG_SPOOLS` 的三列各自
+    只決定「掛在哪一條既有通道底下」）。少了共用，#638 的三個缺陷會在每一個呼叫端
+    各長一次——那正是本模組存在的理由。
+
+    `create_slot(reset=True)`：同一個 key／instance 撞名只可能是上一輪的殘骸（retry
+    用同一個 slice_id、同一張卡重派），`reset=False` 的 pre-seed 守衛在這裡會把殘骸
+    變成一次拒絕派工。commit-spool 走的就是 `reset=True`，同一個理由。
+
+    回傳建好的 log 檔路徑（＝傳入的 `log_path`，供呼叫端串接）。
+    """
+
+    slot_path = Path(slot)
+    slot_path.parent.mkdir(parents=True, exist_ok=True)
+    create_slot(slot_path, reset=True)
+    target = Path(log_path)
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, JOB_LOG_FILE_MODE)
+    try:
+        # umask 會把 open(2) 的 mode 夾掉（Manager unit 帶 `UMask=0077`），因此一定要
+        # 再 fchmod 一次；那一次同時把 ACL mask 設成 group 位＝`w`，繼承來的
+        # `user:<job>:wx` 於是 effective `-w-`。
+        os.fchmod(fd, JOB_LOG_FILE_MODE)
+    finally:
+        os.close(fd)
+    return target
+
+
 def publish_file(path: str | Path) -> bool:
     """producer 寫完後把成果放寬給 consumer（缺陷 2）；成功回 True。
 
@@ -277,6 +321,7 @@ def _chmod_regular_file(path: str | Path, mode: int) -> bool:
 __all__ = [
     "ACCESS_ACL_XATTR",
     "COMMIT_BUNDLE_FILENAME",
+    "JOB_LOG_FILE_MODE",
     "PUBLISHED_FILE_MODE",
     "REVIEW_VERDICT_FILENAME",
     "SEALED_FILE_MODE",
@@ -286,6 +331,7 @@ __all__ = [
     "ensure_container",
     "has_posix_acl",
     "narrow_inherited_mode",
+    "prepare_job_log",
     "publish_file",
     "publish_file_command",
     "seal_slot",

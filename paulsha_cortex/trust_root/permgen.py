@@ -2483,21 +2483,31 @@ class PathLayout:
         """
         return f"{self.coordinator_root}/review-verdicts"
 
+    def job_log_spool_root(self, principal: Principal) -> str:
+        """該降權 principal 的 job log spool 根（登記表資產由 `JOB_LOG_SPOOLS` 導出）。
+
+        路徑與 `config.paths.job_log_spool_root()` 是**成對契約**，由 `asset_paths()`
+        供給權限計畫；本方法只是同一份字面量的另一個入口（比照
+        :meth:`job_spec_spool_for`）。
+
+        **掛在該 principal 既有的輸出通道底下是刻意的**（#686 design D3「不新開通道」／
+        U-3 未裁決，#708 起適用於三個 principal）：`_minimize()` 因此把它從模板 unit 的
+        `ReadWritePaths=` 吃掉，那個帳號的寫入面逐字不變，default ACL 自動繼承。
+        理由全文見 `config/paths.py:job_log_spool_root` 與該資產的 note。
+
+        **通道根不在這裡重算**——它由 :meth:`asset_paths` 上那條通道資產的值供給，
+        因此「掛在既有通道底下」是查表的結果，不是又一個手寫前綴（手寫前綴漂掉的
+        症狀是 permgen 對一條路徑出 ACL、runtime 寫另一條，兩邊都不報錯）。
+        """
+        spool = registry.job_log_spool_for(principal)
+        return f"{self.asset_paths()[spool.channel_asset_id]}/{spool.dirname}"
+
     @property
     def planning_job_log_spool_root(self) -> str:
         """planning job 寫、Manager 讀的輸出通道根（登記表資產
-        `planning-job-log-spool`，#686）。
-
-        路徑與 `config.paths.planning_job_log_spool_root()` 是**成對契約**，由
-        `asset_paths()` 供給權限計畫；本 property 只是給 unit 產生器引用的同一份
-        字面量（比照 `review_verdict_spool_root`）。
-
-        **掛在 `review_verdict_spool_root` 底下是刻意的**（design D3「不新開通道」／
-        U-3 未裁決）：`_minimize()` 因此把它從模板 unit 的 `ReadWritePaths=` 吃掉，
-        planner 帳號的寫入面逐字不變，default ACL 自動繼承。理由全文見
-        `config/paths.py:planning_job_log_spool_root`。
-        """
-        return f"{self.review_verdict_spool_root}/planning-logs"
+        `planning-job-log-spool`，#686；#708 起是 :data:`registry.JOB_LOG_SPOOLS`
+        的一列）。回傳值逐字不變。"""
+        return self.job_log_spool_root(Principal.REVIEWER)
 
     @property
     def planning_scratch_root(self) -> str:
@@ -2976,7 +2986,7 @@ class PathLayout:
         reg = self.skill_registry_root
         wt = self.worktree_root
         job = f"{wt}/{self.job_segment}"
-        return {
+        paths: dict[str, str] = {
             "runtime-agents-tree": a,
             "control-root-tree": ctl,
             "coordinator-root-tree": c,
@@ -3024,10 +3034,10 @@ class PathLayout:
             "review-verdict-spool": self.review_verdict_spool_root,
             # #623／#634 成果回收的 bundle spool：<coordinator>/commit-spool/<job-id>/
             "commit-spool": self.commit_spool_root,
-            # #686（#672 票 E）：降權 planning job 的輸出通道與唯讀 scratch pool。
-            # 前者進 reviewer 模板 unit 的 RWP（writer 面含 PLANNER），後者**不**進
-            # （writer 面只有 MANAGER）——U-2「scratch 唯讀」因此是機械導出的。
-            "planning-job-log-spool": self.planning_job_log_spool_root,
+            # #686（#672 票 E）：降權 planning job 的唯讀 scratch pool。它**不**進任何
+            # job 模板 unit 的 RWP（writer 面只有 MANAGER）——U-2「scratch 唯讀」因此
+            # 是機械導出的。三個 principal 的 **log** spool 由本 dict 之後那一段依
+            # `registry.JOB_LOG_SPOOLS` 導出（#708）。
             "planning-scratch-pool": self.planning_scratch_root,
             # Phase 2b 方案 B（0816 第三輪 A+B）：模板 unit 的 per-job 執行規格。
             # #657：容器 ＋ per-principal 子 spool。子項由登記表的同一張
@@ -3083,6 +3093,14 @@ class PathLayout:
                 for asset_id, _account, path, _cred in self.enforcement_placements()
             },
         }
+        # #708：三個降權 principal 的 job log spool。**掛在既有通道底下這件事在這裡
+        # 是結構事實，不是又一個手寫前綴**——前綴直接取自本 dict 上那條通道資產的值，
+        # 因此通道路徑改一次，三條 log 路徑自動跟著改；而「通道」是不是真的是那個
+        # principal 今天就寫得進去的落點，由
+        # `_assert_job_log_spools_hang_off_existing_channels()` 在 import 當下強制。
+        for spool in registry.JOB_LOG_SPOOLS:
+            paths[spool.asset_id] = f"{paths[spool.channel_asset_id]}/{spool.dirname}"
+        return paths
 
     # -- 非資產骨架目錄 -----------------------------------------------------
     def scaffold_directories(self, scheme: UidScheme) -> tuple[tuple[str, str, str, int], ...]:
@@ -3232,6 +3250,8 @@ def asset_paths(layout: PathLayout = DEFAULT_LAYOUT) -> dict[str, str]:
     return layout.asset_paths()
 
 
+
+
 # ---------------------------------------------------------------------------
 # ReadWritePaths 的機械導出
 # ---------------------------------------------------------------------------
@@ -3253,6 +3273,73 @@ def _minimize(paths: set[str]) -> tuple[str, ...]:
         if not any(other != p and _is_within(p, other) for other in paths)
     ]
     return tuple(sorted(set(kept)))
+
+
+def _assert_job_log_spools_hang_off_existing_channels() -> None:
+    """#708 那條規則的**另一半**，在 import 當下強制。
+
+    registry 那一半管「三個 principal 一格都不能少」；本函式管「掛的是不是**既有**
+    通道」——那才是「可寫面逐字不變、零部署動作」這句話的來源。逐條檢查：
+
+    1. `channel_asset_id` 真的是一個已登記的資產（打錯字 ⇒ `asset_paths()` 會 KeyError，
+       但那個 traceback 指的是產生器內部，不是「你少宣告了一條通道」）；
+    2. 該通道資產的 writer 面**在帳號層**本來就含這一列的 writer。判準刻意是**帳號**
+       而不是 principal：`review-verdict-spool` 的 writer 宣告是 `REVIEWER`，而 planning
+       這條通道的 writer 是 `PLANNER`——三分／四分下兩者是同一個 OS 帳號，產出的 ACL
+       逐字相同，而「不新增可寫面」講的正是那個帳號的可寫面。少了這一條，「掛在既有
+       通道底下」會退化成「掛在一條這個帳號其實寫不進去的路徑底下」——那不是省一條
+       RWP，是**新開一條**，而且是沒有人宣告過的那種；
+    3. log spool 的路徑**嚴格落在**通道路徑之內（且不等於它）。這是 `_minimize()` 會
+       把它吃掉的**充要條件**：吃不掉就代表模板 unit 的 `ReadWritePaths=` 多了一行，
+       「逐字不變、零部署動作」當場失效；
+    4. writer 與 principal 在 :data:`DEFAULT_SCHEME` 下解到**同一個帳號**。reviewer 那
+       一列的 writer 是 `PLANNER`（登記表講的是「誰在用這條通道」），兩者在三分／四分
+       下併帳；哪天不併帳了，這一條會當場翻紅而不是產出一組對不上帳號的 ACL。
+
+    為什麼是 import 當下而不是一條測試：理由與 registry 那一半、與 #698 的
+    :func:`_assert_shape_follows_enforcement_rule` 逐字相同——要讓「只修一格」在
+    **結構上做不到**，檢查就必須在展開點上，而不是在一個可以被 `-k` 跳過的測試裡。
+    """
+
+    index = {a.asset_id: a for a in registry.ASSET_REGISTRY}
+    paths = DEFAULT_LAYOUT.asset_paths()
+    for spool in registry.JOB_LOG_SPOOLS:
+        channel = index.get(spool.channel_asset_id)
+        if channel is None:
+            raise ValueError(
+                f"{spool.asset_id}：channel_asset_id {spool.channel_asset_id!r} 不在"
+                "登記表上——job log 只能掛在**既有**的輸出通道底下（#708）。"
+            )
+        writer_account = DEFAULT_SCHEME.resolve(spool.writer)
+        channel_accounts = {
+            acct
+            for acct in (DEFAULT_SCHEME.resolve(w) for w in channel.writers)
+            if acct is not None
+        }
+        if writer_account is None or writer_account not in channel_accounts:
+            raise ValueError(
+                f"{spool.asset_id}：{spool.writer.value}（帳號 {writer_account}）不在 "
+                f"{spool.channel_asset_id} 的 writer 帳號面 {sorted(channel_accounts)} 上"
+                "——那條通道對這個帳號本來就不開放，"
+                "掛上去不是「省一條 ReadWritePaths」，是**新開一條沒有人宣告過的寫入面**"
+                "（#686 design D3／U-3：新開 job→Manager 的寫入面未決、待 operator 裁決）。"
+            )
+        child, parent = paths[spool.asset_id], paths[spool.channel_asset_id]
+        if child == parent or not _is_within(child, parent):
+            raise ValueError(
+                f"{spool.asset_id}：路徑 {child} 沒有嚴格落在通道 {parent} 之內，"
+                "`_minimize()` 因此吃不掉它 ⇒ 模板 unit 的 `ReadWritePaths=` 會多一行，"
+                "「可寫面逐字不變、零部署動作」不再成立（#708）。"
+            )
+        if DEFAULT_SCHEME.resolve(spool.writer) != DEFAULT_SCHEME.resolve(spool.principal):
+            raise ValueError(
+                f"{spool.asset_id}：writer {spool.writer.value} 與 principal "
+                f"{spool.principal.value} 在 {DEFAULT_SCHEME.scheme_id} 下不是同一個帳號"
+                "——ACL 會產在一個帳號上、模板 unit 卻以另一個帳號執行（#657 的失效模式）。"
+            )
+
+
+_assert_job_log_spools_hang_off_existing_channels()
 
 
 def principal_needs_write(
@@ -6712,6 +6799,113 @@ def build_path_resolution_probe(
         "`PSC_GATE_CMD_PYTEST=\"python3 -m pytest -q\"` 是相對名，同樣走 PATH 解析"
         "（#666）。gate 這三列驗的是「gate 的 PATH 確實生效且順序正確」，那條性質對 "
         "`python3` 與對 `codex` 是同一條。"
+    )
+    return lines
+
+
+#: #708 的探針在每一格 log spool 底下用的 per-run 目錄名。固定字面量是刻意的：
+#: operator 重跑時同一格會被 `spool_slot.create_slot(reset=True)` 整格重建，不會在
+#: 樹裡留下一堆 `probe-<timestamp>` 需要人去掃。
+JOB_LOG_PROBE_KEY = "probe-708"
+
+
+def build_job_log_probe(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+) -> list[str]:
+    """#708 反向不變式的實機探針（**只回傳字串，不執行**）。
+
+    要證的是**兩個方向**，缺一不可：
+
+    1. **正向**——每個降權 principal 在**零額外 env**、真實模板 unit 的加固面下
+       `>>` 得進自己那一格 log，而且 Manager 讀得回來（`0620` ＋ default ACL 的
+       effective 位真的是 `w`，不是被 mask 壓成 `#effective:---`）；
+    2. **反向**——同一個身分對 Manager 的 dispatch log 目錄仍然寫不進去。少了這一半，
+       「掛在既有通道底下、可寫面逐字不變」就只是一句宣稱：真正要排除的失敗是
+       「順手把 log 目錄加進 `ReadWritePaths=` 讓它過」，而那會連 gate ledger 與
+       exit sentinel 一起開放（#604）。
+
+    加固面複本一律由 `psc_run_under` → :func:`unit_replica_properties` 從**落檔的
+    unit** 全量導出（design D13）。**本產生器不自組 `--property=`、不帶
+    `--setenv=`**——本 repo 兩個方向的事故各兩次（#638／#657 假綠；#673 body 與
+    repro 假紅），第五次是 #679 的「複本比 production 多」。
+
+    per-job 那一格**由 `spool_slot.prepare_job_log()` 本人建**，不是探針自己建目錄
+    再建一個空檔：#645 逐字記錄過「手工組前置物剛好把 bug 繞過去」的代價，而本票
+    （#708）正是那一族的下一個成員——M1 當時 operator 手工挑 log 路徑，恰好避開了
+    這個缺陷，於是它活到 define 首次收斂的那一天。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    manager = scheme.durable_state_owner
+    paths_by_asset = layout.asset_paths()
+    python = f"{layout.deploy_root}/venv/bin/python3"
+    lines: list[str] = [
+        "# === #708 反向不變式：三個降權 principal 各自寫得出 job log 嗎 ===",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root job-log-probe {scheme.scheme_id}",
+        "#",
+    ]
+    lines += _wrap_comment(
+        "本探針**刻意不帶任何 `--setenv=`、也不自組 `--property=`**（design D13）。"
+        "加固面複本由 `unit_replica_properties()` 從落檔的 unit 全量導出，因此它連"
+        "「production 沒有設什麼」也一起複製——只要不再往上疊，量到的就是 job 真正"
+        "會拿到的環境。"
+    )
+    lines += [
+        "#",
+        "# ⛔ 任何一條紅掉時**不要**把 log 目錄加進模板 unit 的 `ReadWritePaths=`——",
+        "#    那一層住著 gate ledger 與 exit sentinel（#604），開放它等於把「證據由",
+        "#    Manager 寫」這條保證賣掉。要改的是登記表那一列掛在哪條既有通道底下。",
+        "#",
+        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
+        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
+        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
+        "  return 1 2>/dev/null || exit 1",
+        "}",
+        "",
+    ]
+    for principal in downgraded_job_principals(scheme):
+        account = scheme.resolve(principal)
+        if account is None:  # pragma: no cover - downgraded_job_principals 已過濾
+            continue
+        spool = registry.job_log_spool_for(principal)
+        root = paths_by_asset[spool.asset_id]
+        channel = paths_by_asset[spool.channel_asset_id]
+        slot = f"{root}/{JOB_LOG_PROBE_KEY}"
+        log = f"{slot}/probe.jsonl"
+        stem = job_unit_stem(layout, principal, DEFAULT_HARDENING_PROFILE)
+        lines += [
+            f"# --- {principal.value}（{account}／{stem}@／資產 {spool.asset_id}）---",
+            f"#   通道：{spool.channel_asset_id} = {channel}",
+            "#   1) 那一格由**產品程式碼**建（`spool_slot.prepare_job_log`），不是",
+            "#      operator 自己建目錄／建空檔——手工前置物會剛好繞過本票要驗的缺陷",
+            "#      （#645 逐字記錄過同型前例；本票就是那一族的下一個成員）。",
+            f"sudo -u {manager} {python} -c "
+            f"'from paulsha_cortex.coordinator import spool_slot as s; "
+            f's.prepare_job_log("{slot}", "{log}")\'',
+            "#   2) 正向：零額外 env、真實加固面下，job 身分 append 得進去。",
+            f"{PATH_PROBE_HELPER} {stem} /bin/sh -c 'printf \"JOB-LOG-WRITABLE\\n\" >> {log}'",
+            "#      期望：rc=0、無輸出。`Permission denied` ⇒ ACL mask 把繼承來的 `w`",
+            "#      壓成 `#effective:---`（#638 缺陷 1）；`Read-only file system` ⇒",
+            "#      這一格沒被 `_minimize()` 涵蓋進模板 unit 的 ReadWritePaths。",
+            "#   3) Manager 讀得回來（檔案 owner 是 Manager、mode 0620）。",
+            f"sudo -u {manager} cat {log}",
+            "#      期望逐字：JOB-LOG-WRITABLE",
+            "#   4) **反向**：同一個身分對 Manager 的 dispatch log 目錄仍然寫不進去。",
+            f"{PATH_PROBE_HELPER} {stem} /bin/sh -c "
+            f"'printf x >> {layout.coordinator_root}/logs/workflow/{JOB_LOG_PROBE_KEY}'",
+            "#      期望：**非零**，且訊息是 `Read-only file system`（mount 層）或",
+            "#      `Permission denied`（DAC）。rc=0 ⇒ 有人把那一層開成可寫面了，",
+            "#      gate ledger 與 exit sentinel 當場不再是 Manager 專屬（#604）。",
+            "#   5) 收乾淨。",
+            f"sudo -u {manager} rm -rf {slot}",
+            "",
+        ]
+    lines += _wrap_comment(
+        "本探針量的是 **mount ＋ ACL 兩層的實際結果**，證明不了「Manager 派得出那個 "
+        "job」——那一維要走 runbook 的真實 dispatch smoke（#687 的 D13 caveat 逐字適用："
+        "psc_run_under 複製的是加固面，不是派工路徑）。兩維都要有實跑證據。"
     )
     return lines
 

@@ -129,11 +129,10 @@ PLANNING_JOB_TIMEOUT = "planning-job-timeout"
 STOP_CONFIRM_TIMEOUT_SECONDS = 30.0
 STOP_CONFIRM_POLL_SECONDS = 0.2
 
-#: Manager 預建 log 檔的 mode。**不是 0600**：POSIX ACL 下新檔的 mask 由 open(2) 的
-#: mode 參數之 group 位夾擠，`0600` 會把繼承來的 `user:<planner>:wx` 壓成
-#: `#effective:---`（＝#638 缺陷 1 的同一個機制），job 於是連 append 都不行。
-#: 見 `config/paths.py:planning_job_log_spool_root` 的完整論證。
-LOG_FILE_MODE = 0o620
+#: Manager 預建 log 檔的 mode。**#708 起真相在 `spool_slot.JOB_LOG_FILE_MODE`**
+#: （三個降權 principal 共用同一個值與同一份論證）；本名稱保留為別名，避免既有
+#: 呼叫端／測試多一次無意義的改名。
+LOG_FILE_MODE = spool_slot.JOB_LOG_FILE_MODE
 
 #: 失敗診斷帶回的 log 尾段上限。診斷會一路進 log／evidence／`blocking_reason`。
 LOG_EXCERPT_LIMIT = 400
@@ -227,7 +226,7 @@ class JobPlanningInvoker:
         self._log_spool_root = (
             Path(log_spool_root)
             if log_spool_root is not None
-            else paths.planning_job_log_spool_root()
+            else paths.job_log_spool_root("reviewer")
         )
         self._popen = popen if popen is not None else subprocess.Popen
         self._unit_active = unit_active if unit_active is not None else job_runner._unit_is_active
@@ -449,6 +448,10 @@ class JobPlanningInvoker:
                 unit=plan.unit,
                 account=plan.account,
                 log_path=str(client_log),
+                # #708 第 3 項：shim 在接管 log 之前的失敗只進 unit journal，Manager
+                # 讀不到；那一族現在另外留一筆機器可讀紀錄在 job 自己那一格 log
+                # spool 裡（`job_shim.write_shim_error`）。
+                job_log_path=str(log_path),
                 timeout_ms=job_runner.resolve_start_timeout_ms(self._env),
                 manager_authored_sentinel=True,
             )
@@ -541,24 +544,12 @@ class JobPlanningInvoker:
     def _prepare_log(self, slot: Path, log_path: Path) -> None:
         """建出 per-invocation 的 log 一格，並**由 Manager 預先建立** log 檔。
 
-        `create_slot(reset=True)`：同一個 instance 撞名只可能是上一輪的殘骸（見
-        `_prepare_scratch`），而 `reset=False` 的 pre-seed 守衛在這裡會把殘骸變成一次
-        拒絕派工。commit-spool 走的就是 `reset=True`，同一個理由。
-
-        log 檔的 mode 見 :data:`LOG_FILE_MODE`：Manager 建檔讓檔案 owner 恆為 Manager
-        （讀得到），job 只拿到繼承自 default ACL 的 `w`。
+        **#708 起實作在 `spool_slot.prepare_job_log()`**，三個降權 principal 共用同一
+        份（builder 與 gate 各自的 log spool 走的是逐字相同的一段）。本方法保留只是
+        為了讓 planning 這邊的呼叫點與錯誤翻譯不變——邏輯一個位元組都沒有第二份。
         """
 
-        slot.parent.mkdir(parents=True, exist_ok=True)
-        spool_slot.create_slot(slot, reset=True)
-        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, LOG_FILE_MODE)
-        try:
-            # umask 會把 open(2) 的 mode 夾掉（Manager unit 帶 `UMask=0077`），因此
-            # 一定要再 fchmod 一次；那一次同時把 ACL mask 設成 group 位＝`w`，
-            # 繼承來的 `user:<planner>:wx` 於是 effective `-w-`。
-            os.fchmod(fd, LOG_FILE_MODE)
-        finally:
-            os.close(fd)
+        spool_slot.prepare_job_log(slot, log_path)
 
     def _cleanup(self, reservation: "_Reservation", log_slot: Path) -> None:
         """D-a：呼叫結束即銷毀。診斷面失敗不得反過來變成新的失敗來源。"""

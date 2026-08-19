@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
@@ -115,6 +116,180 @@ DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (
 )
 
 
+@dataclass(frozen=True)
+class JobLogSpool:
+    """一個降權 job principal 的 **job log 落點**宣告（#708）。
+
+    這張表的存在理由是一條**機制事實**，不是偏好：`coordinator/job_shim.py` 的
+    `_take_over_stdio()` 在**接管 stdio 之前**就 `os.open(log_path)`，因此凡經模板
+    unit 派出的 job，只要那個路徑寫不進去，它連一行 log 都寫不出來就死
+    ——**失敗發生在它能記錄失敗之前**，Manager 端只看得到 `78/CONFIG`。
+
+    ⇒ **凡在 :data:`DOWNGRADED_JOB_PRINCIPALS` 上的 principal，一律要有一格。**
+    """
+
+    #: :data:`DOWNGRADED_JOB_PRINCIPALS` 上的那一格（＝哪一份模板 unit／哪一個帳號）。
+    principal: Principal
+    #: 真正走這條通道的 persona。**reviewer 那一列是 `PLANNER`**——三分／四分下兩者
+    #: 是同一個 OS 帳號（ACL 逐字相同），宣告成 PLANNER 是為了讓登記表講的是「誰在用
+    #: 這條通道」：reviewer 的通道是 `review-verdict-spool` 本身，兩條不共用。
+    writer: Principal
+    asset_id: str
+    #: 掛在**哪一條既有的輸出通道**底下。`_assert_job_log_spools_hang_off_existing_channels()`
+    #: 在 import 當下強制它真的是一個已登記、且該 writer 已經寫得進去的資產。
+    channel_asset_id: str
+    #: 掛在通道根底下的目錄名。與 `config/paths.py` 的同名常數是**成對契約**
+    #: （本模組不被 `config.paths` import，反向亦然）。
+    dirname: str
+    #: 這一格的專屬說明（其餘 note 由規則產生）。
+    note: str
+
+
+#: **#708 那條規則的表**：三個 principal 一格都不能少。
+#:
+#: 每一列的 `channel_asset_id` 都是該 principal **今天就已經寫得進去**的落點，因此：
+#:
+#: 1. **不新增任何寫入面**——那個帳號本來就寫得進這棵樹，多的只是它自己那一格；
+#: 2. `permgen.read_write_paths()` 的 `_minimize()` 把被涵蓋的子路徑吃掉 ⇒ 模板 unit
+#:    的 `ReadWritePaths=` **逐字不變、default ACL 自動繼承、零部署動作**；
+#: 3. 仍是**獨立登記表資產**——各自有 note、writer／reader 面、ACL 命令，治理面沒有
+#:    因為省下一條 RWP 而消失。
+#:
+#: **為什麼是一張表而不是三處手寫**：#686（票 E）只做了 planner 那一格，代價是 #708
+#: ——define 首次收斂、builder job 第一次由 daemon 經正規路徑派出來就當場死。同一族的
+#: 前例是 #679（修 PATH 沒看隔壁的 HOME ⇒ #692）。導出之後，「只修一格」在**結構上
+#: 做不到**：新增第四個降權角色而漏了這裡，模組**載不起來**
+#: （:func:`_assert_every_downgraded_principal_has_a_job_log_spool`）。
+JOB_LOG_SPOOLS: tuple[JobLogSpool, ...] = (
+    JobLogSpool(
+        principal=Principal.BUILDER,
+        writer=Principal.BUILDER,
+        asset_id="build-job-log-spool",
+        channel_asset_id="commit-spool",
+        dirname="build-logs",
+        note=(
+            "**#708 的原症狀就在這一格。** builder job 的 log 原本落在 Manager 的 "
+            "dispatch log 目錄（`<coordinator_root>/logs/workflow/<slice>.jsonl`），而"
+            "那個目錄 `0700 cortex-manager`、零具名 ACL ⇒ shim 連 traverse 都進不去"
+            "（實機 `[Errno 13] Permission denied`，unit `78/CONFIG`）。\n"
+            "**那個目錄刻意不開放**：gate ledger（`<slice>.gates.json`）與 exit "
+            "sentinel（`<slice>.exit`）住在同一層，而 #604 的整個保證就是「它們由 "
+            "Manager 寫、採信端以 `foreign_evidence_author()` 檢查擁有者」。給 builder "
+            "一條進得去那一層的 RWP，等於把剛關上的門重新打開——因此 log 改掛在 "
+            "`commit-spool` 底下，Manager 端那條 harvest 路徑則以 **hard link** 對上"
+            "同一個 inode（見 `coordinator/job_workspace.py:prepare_job_log_spool`）："
+            "`log_path` 的字面量、exit sentinel、gate ledger、spool key 的推導"
+            "**一個位元組都沒有變**。"
+        ),
+    ),
+    JobLogSpool(
+        principal=Principal.REVIEWER,
+        writer=Principal.PLANNER,
+        asset_id="planning-job-log-spool",
+        channel_asset_id="review-verdict-spool",
+        dirname="planning-logs",
+        note=(
+            "#686（#672 票 E）：降權 planning job 的輸出通道。planning 搬上 "
+            "`cortex-reviewer-job@.service` 之後，模型 stdout 不再由 "
+            "`subprocess.run(capture_output=True)` 取回；這一格就是 design D-i 的 job "
+            "側對應，per-invocation 生命週期走 `coordinator/spool_slot.py`。\n"
+            "**#708 起它是規則的一列而不是特例**，路徑與行為逐字不變（實機零遷移）。"
+        ),
+    ),
+    JobLogSpool(
+        principal=Principal.GATE,
+        writer=Principal.GATE,
+        asset_id="gate-job-log-spool",
+        channel_asset_id="gate-ledger-spool",
+        dirname="gate-logs",
+        note=(
+            "#708：gate job 的輸出通道。**gate 這一格的病徵與 builder 不同**——它的 "
+            "log 原本就落在 ledger spool 的 per-job 那一格裡"
+            "（`<gate-ledger-spool>/<key>/gate.log`），因此 gate **寫得進去**、不會像 "
+            "builder 那樣當場死；但那個檔是 **job 自己建的**，帶降權 unit 的 "
+            "`UMask=0077` ⇒ owner 是 `cortex-gate`、mode `0600`，Manager 是目錄的 owner "
+            "但那不給檔案內容的讀取權（#638 缺陷 2 的同一個機制）。結果是 gate 失敗時"
+            "**逐字原因只存在於一個 Manager 讀不到的檔裡**。\n"
+            "改掛到獨立的一格之後，log 檔改由 **Manager 預先建立**（mode `0620`，與"
+            "planning 逐字相同的理由），Manager 因此讀得到，`gate_runner` 的錯誤訊息"
+            "也才帶得出 job 端的 tail。"
+        ),
+    ),
+)
+
+
+#: `JobLogSpool.dirname` 允許的形狀。理由見
+#: :func:`_assert_every_downgraded_principal_has_a_job_log_spool`。
+_JOB_LOG_DIRNAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+def job_log_spool_for(principal: Principal) -> JobLogSpool:
+    """該降權 principal 的 job log 落點宣告；查無即 fail-closed（#708）。"""
+
+    for spool in JOB_LOG_SPOOLS:
+        if spool.principal is principal:
+            return spool
+    raise KeyError(
+        f"{principal.value} 沒有登記 job log spool——凡經模板 unit 派出的 job 都要"
+        "寫 log（#708）。"
+    )
+
+
+def _assert_every_downgraded_principal_has_a_job_log_spool() -> None:
+    """#708 的那條規則，在 **import 當下**強制。
+
+    **規則**：`principal` 在 :data:`DOWNGRADED_JOB_PRINCIPALS` 上有一格
+    ⇒ 它在 :data:`JOB_LOG_SPOOLS` 上**必須**也有恰好一格。
+
+    為什麼是 import 當下而不是一條測試：#686 的破口不是「有人寫錯一行」，是「三個
+    principal 的 log 落點**各自**被決定，於是其中一個先遷、另外兩個留在原地等著爆」。
+    在展開點上強制，讓「只修一格」在**結構上做不到**——新增第四個降權角色時漏改的
+    症狀是模組載不起來，而不是三個月後實機上的一次 `78/CONFIG`。
+
+    （另一半——「掛的是不是既有通道」——需要 scheme 與 layout，因此由
+    `permgen._assert_job_log_spools_hang_off_existing_channels()` 在它那一側強制。）
+    """
+
+    declared = [spool.principal for spool in JOB_LOG_SPOOLS]
+    if len(declared) != len(set(declared)):
+        raise ValueError(f"JOB_LOG_SPOOLS 有重複的 principal: {declared}")
+    missing = [p for p in DOWNGRADED_JOB_PRINCIPALS if p not in declared]
+    if missing:
+        raise ValueError(
+            f"降權 principal {[p.value for p in missing]} 沒有 job log spool 資產——"
+            "模板 unit 的 shim 會在接管 stdio 之前 `os.open()` log，寫不進去的 job "
+            "死在它能記錄失敗之前（#708 實機：builder `78/CONFIG`）。"
+            "請往 JOB_LOG_SPOOLS 加一列，不要在別處手寫一個路徑。"
+        )
+    extra = [p for p in declared if p not in DOWNGRADED_JOB_PRINCIPALS]
+    if extra:
+        raise ValueError(
+            f"JOB_LOG_SPOOLS 宣告了非降權 principal {[p.value for p in extra]}——"
+            "本表的輸入只有 DOWNGRADED_JOB_PRINCIPALS（沒有模板 unit 就沒有 shim，"
+            "也就沒有這一格要解決的問題）。"
+        )
+    for spool in JOB_LOG_SPOOLS:
+        # `dirname` 會被逐字接進一條絕對路徑（`<通道根>/<dirname>`），而那條路徑會
+        # 被 permgen 拿去出 `install -d`／`chown`／`setfacl`。容忍 `..`／`/`／空字串
+        # 等於把「log 一定落在該 principal 的既有通道之內」交給打字精確度——形狀因此
+        # 在**宣告當下**驗，與 `config.paths._SPOOL_PRINCIPAL_RE` 同一條理由。
+        if not _JOB_LOG_DIRNAME_RE.match(spool.dirname):
+            raise ValueError(
+                f"{spool.asset_id}：dirname {spool.dirname!r} 形狀不合法"
+                "（只允許 ^[a-z][a-z0-9-]*$）——它會被接進一條會被 chown／setfacl 的"
+                "絕對路徑（#708）。"
+            )
+        if spool.writer not in UNTRUSTED_EXECUTION_PRINCIPALS:
+            raise ValueError(
+                f"{spool.asset_id}：writer {spool.writer.value} 不在 "
+                "UNTRUSTED_EXECUTION_PRINCIPALS 上——那樣 `permgen.build_entry()` 不會"
+                "為它產出任何 `wx` ACL，job 到了實機一樣寫不進去（#657 的失效模式）。"
+            )
+
+
+_assert_every_downgraded_principal_has_a_job_log_spool()
+
+
 def job_spec_spool_asset_id(principal: Principal) -> str:
     """該降權 principal 的 per-principal spec spool 資產 id（#657）。
 
@@ -192,6 +367,50 @@ _T0 = AssetTier.TIER_0
 _T1 = AssetTier.TIER_1
 _MO = TrustTree.MANAGER_OWNED
 _JV = TrustTree.JOB_VISIBLE
+
+
+def _job_log_spool_assets() -> tuple[TrustRootAsset, ...]:
+    """job log spool 的登記表項——由 :data:`JOB_LOG_SPOOLS` **機械導出**。
+
+    形態與 :func:`_job_spec_spool_assets` 逐條相同（同樣是一支 resolver ＋
+    per-principal 引數），差別只在方向：spec spool 是 Manager 寫、job 讀；log spool
+    是 job 寫、Manager 讀，因此 `ingress_kind` 是 `INTERPROCESS`，產生器據此出
+    **write-only** ACL（`wx` 無 `r`——寫得進自己那一格、讀不到別人的 log）。
+    """
+
+    return tuple(
+        TrustRootAsset(
+            spool.asset_id, _T0, _JV,
+            "paulsha_cortex.config.paths:job_log_spool_root",
+            (Principal.MANAGER, spool.writer), (Principal.MANAGER,),
+            IngressKind.INTERPROCESS,
+            path_resolver_args=(spool.principal.value,),
+            derived_in=(
+                "config/paths.py:job_log_spool_root",
+                "trust_root/registry.py:JOB_LOG_SPOOLS",
+                "trust_root/permgen.py:PathLayout.job_log_spool_root",
+                "coordinator/spool_slot.py:prepare_job_log",
+                "coordinator/job_shim.py:_take_over_stdio",
+            ),
+            note=(
+                f"**#708 的規則：凡經模板 unit 派出的 job 都要寫得出 log** ⇒ "
+                f"`{spool.principal.value}` 這一格。路徑掛在既有通道 "
+                f"`{spool.channel_asset_id}` 底下（`<那條通道>/{spool.dirname}/"
+                "<unit-instance>/…`）：那個帳號本來就寫得進這棵樹，因此 (i) 不新增任何"
+                "寫入面、(ii) `_minimize()` 把它從模板 unit 的 `ReadWritePaths=` 吃掉 ⇒ "
+                "**逐字不變、default ACL 自動繼承、零部署動作**、(iii) 仍是獨立資產，"
+                "治理面沒有因為省下一條 RWP 而消失。\n"
+                "**log 檔由 Manager 預先建立（mode `0620`），不是由 job 建**：job 自己"
+                "建的檔由 job 擁有、又帶 unit 的 `UMask=0077`，Manager 是**目錄**的 owner "
+                "但那不給檔案內容的讀取權（#638 缺陷 2）。`0620` 不是隨手挑的——POSIX ACL "
+                "下新檔的 mask 由 open(2) 的 mode 參數之 group 位夾擠，用 `0600` 建檔會把"
+                "繼承來的 `user:<job>:-wx` 壓成 `#effective:---`，job 於是連 append 都不行"
+                "（#638 缺陷 1 的同一個機制）。\n"
+                f"{spool.note}"
+            ),
+        )
+        for spool in JOB_LOG_SPOOLS
+    )
 
 
 def _job_spec_spool_assets() -> tuple[TrustRootAsset, ...]:
@@ -1033,42 +1252,11 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
             "刻意差異的說明）。"
         ),
     ),
-    TrustRootAsset(
-        "planning-job-log-spool", _T0, _JV,
-        "paulsha_cortex.config.paths:planning_job_log_spool_root",
-        (Principal.MANAGER, Principal.PLANNER), (Principal.MANAGER,),
-        IngressKind.INTERPROCESS,
-        derived_in=(
-            "config/paths.py:planning_job_log_spool_root",
-            "coordinator/planning_job.py:JobPlanningInvoker",
-        ),
-        note=(
-            "#686（#672 票 E）：降權 planning job 的**輸出通道**"
-            "（`<review-verdict-spool>/planning-logs/<instance>/planning.log`）。planning "
-            "搬上 `cortex-reviewer-job@.service` 之後，模型 stdout 不再由 "
-            "`subprocess.run(capture_output=True)` 取回；這一格就是 design D-i 的 job 側"
-            "對應，per-invocation 生命週期走 `coordinator/spool_slot.py`（與另外兩個 spool "
-            "同一份實作）。\n"
-            "**路徑掛在 `review-verdict-spool` 底下是刻意的**：design D3 第一句是「不新開"
-            "通道」，U-3 更把「新開一條 job→Manager 的寫入面」列為**未決、待 operator "
-            "裁決**。`cortex-reviewer-planner` 今天唯一既 Manager-owned 又對它開放寫入的"
-            "落點就是 verdict spool，掛在它底下因此 (i) 不新增任何寫入面（那個帳號本來就"
-            "寫得進這棵樹）、(ii) `read_write_paths()` 的 `_minimize()` 會吃掉被涵蓋的子"
-            "路徑 ⇒ 模板 unit 的 `ReadWritePaths=` **逐字不變、零部署動作**、(iii) 仍是"
-            "獨立登記表資產，治理面沒有因為省下一條 RWP 而消失。\n"
-            "**一處刻意的不同：log 檔由 Manager 預先建立（mode 0620），不是由 job 建。**"
-            "另外兩個 spool 靠 producer 在模型跑完之後自己 `chmod 0644`（#638 缺陷 2 的"
-            "既有繞法）讓 Manager 讀得到，那需要一段跑在模型之後的 wrapper；而 planning "
-            "的 job **刻意只有模型 argv 一段**（design D3：wrapper 自產的任何文字都會污染 "
-            "`_extract_json` 的輸入），沒有掛 publish 的位置。Manager 先建檔讓檔案 owner "
-            "恆為 Manager，job 只拿到繼承自 default ACL 的 `w`——寫得進、換不掉、刪不掉"
-            "（它對容器沒有 `w`）。\n"
-            "**writer 是 PLANNER 而不是 REVIEWER**：三分方案下兩者是同一個 OS 帳號，因此"
-            "產出的 ACL 逐字相同；宣告成 PLANNER 是為了讓登記表講的是**誰在用這條通道**"
-            "——reviewer 的通道是 `review-verdict-spool`，兩條不共用。二分方案下 PLANNER "
-            "映到哪個帳號由 `SCHEME` 決定，機制與 `review-verdict-spool` 相同。"
-        ),
-    ),
+    # #708：三個降權 principal 的 job log spool——由 `JOB_LOG_SPOOLS` 那一條規則
+    # **機械導出**，不逐項手寫。#686 手寫了 planner 那一格（原本就在這個位置），
+    # 代價是 builder／gate 兩格從缺，而 builder 那格在 define 首次收斂當天就爆
+    # （#708 實機 `78/CONFIG`）。導出之後「只修一格」在結構上做不到。
+    *_job_log_spool_assets(),
     TrustRootAsset(
         "planning-scratch-pool", _T1, _MO,
         "paulsha_cortex.config.paths:planning_scratch_root",

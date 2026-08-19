@@ -34,17 +34,31 @@ fail-closed、不猜、不落回預設）——「哪個身分讀哪個 spool」
 ## 為什麼 log 由這裡接管，而不是 unit 的 `StandardOutput=append:`
 
 `file:`／`append:` 的目標檔由 **PID 1（root）在降權之前**開啟。log 路徑必然含有
-Manager 帳號可寫的段落（`<log_dir>/<slice>.jsonl`），把它交給 root 開啟等於允許
-Manager 用一個 symlink 讓 root 對任意檔案 append——那會把「cortex 任何元件永不
-具 root」這條裁決賣掉。改由本模組在**已降權之後**用 `O_NOFOLLOW` 開同一個檔，
-最壞情況只是一個 builder 權限的寫入，而 harvest 讀的 log 路徑**完全不變**。
+Manager 帳號可寫的段落，把它交給 root 開啟等於允許 Manager 用一個 symlink 讓 root
+對任意檔案 append——那會把「cortex 任何元件永不具 root」這條裁決賣掉。改由本模組在
+**已降權之後**用 `O_NOFOLLOW` 開同一個檔，最壞情況只是一個 job 權限的寫入。
+
+## spec 的 `log_path` 指向哪裡（#708）
+
+本模組**只認 spec 給的那一條**，不推導、不猜。而它是不是寫得進去，取決於派工端把它
+指到哪裡：在 #708 之前 builder 那條指的是 Manager 的 dispatch log 目錄
+（`0700 cortex-manager`、零具名 ACL），於是**每一個** builder job 都死在上面那個
+`os.open()`——連一行 log 都寫不出來，**失敗發生在它能記錄失敗之前**。修法在派工端：
+三個降權 principal 各有一格由登記表導出的 log spool（`registry.JOB_LOG_SPOOLS`），
+Manager 端的 harvest 路徑則以 hard link 指向同一個 inode，因此 harvest 讀的 log 路徑
+**逐字不變**（見 `coordinator/job_workspace.py:prepare_job_log_spool`）。
 
 錯誤處理分兩段（這是刻意的可觀測性設計）：
 
-1. **接管 log 之前**的失敗（instance 名非法、spec 缺席／是 symlink／schema 不合）
-   寫 stderr → 進 journal。此時 Manager 那邊的 log 檔會是空的，但 `systemctl start
-   --wait` 會以非零收場，Manager 的 `confirm_template_instance_started()` 因此
-   fail-closed，operator 從 journal 拿得到逐字原因。
+1. **接管 log 之前**的失敗（instance 名非法、spec 缺席／是 symlink／schema 不合、
+   log 開不起來）寫 stderr → 進 journal。此時 Manager 那邊的 log 檔會是空的，但
+   `systemctl start --wait` 會以非零收場，Manager 的
+   `confirm_template_instance_started()` 因此 fail-closed。
+   **#708 起這一族另外留一筆機器可讀紀錄**（:func:`write_shim_error` →
+   `<log 那一格>/shim-error.json`，由 `job_runner.read_shim_error()` 撿回錯誤訊息）
+   ——journal 只有 operator 登入才讀得到，而 Manager 端在此之前只看得到
+   `systemctl exit=1`。唯一仍然只有 journal 的是「連 spec 都讀不到」那一族：那時
+   job 對「自己該往哪裡寫」沒有任何可信來源。
 2. **接管之後**的失敗與 job 自身的輸出全部進那份 JSONL log，與 direct／
    systemd-run 模式逐字同路徑。
 """
@@ -68,6 +82,8 @@ from .job_runner import (
 
 __all__ = [
     "EXIT_SPEC_ERROR",
+    "SHIM_ERROR_FILENAME",
+    "SHIM_ERROR_SCHEMA",
     "ShimError",
     "forbidden_spec_keys",
     "load_spec",
@@ -75,11 +91,24 @@ __all__ = [
     "main",
     "resolve_job_env",
     "resolve_spec_path",
+    "write_shim_error",
 ]
 
 #: `EX_CONFIG`（sysexits.h）。刻意不用 1：1 是「job 自己失敗」的正常出口，
 #: 78 讓 operator 一眼分辨「job 跑了但失敗」與「job 根本沒起來」。
 EXIT_SPEC_ERROR = 78
+
+#: shim 在**接管 log 之前**失敗時，留給 Manager 的那一筆機器可讀紀錄的檔名（#708）。
+#:
+#: 它落在 **job 自己那一格 log spool 目錄裡**（＝`dirname(log_path)`）。這個位置不是
+#: 隨手挑的：#708 之後那一格是這個 job 帳號**唯一**由登記表保證寫得進去的落點
+#: （`registry.JOB_LOG_SPOOLS`），而「寫不進去」正是本紀錄要描述的那一族失敗之一。
+SHIM_ERROR_FILENAME = "shim-error.json"
+
+#: 上述紀錄的 schema 標記。採信端（`job_runner.read_shim_error`）以它辨識版本；
+#: 內容只有診斷用途，**不進任何採信路徑**——它由 job 帳號寫，因此可被偽造，
+#: 只用來把 operator 的排查從 journal 拉回 Manager 讀得到的地方。
+SHIM_ERROR_SCHEMA = "cortex-job-shim-error/1"
 
 #: spec 檔大小上限。spec 帶的是 wrapper script（含 prompt），可以不小，但也不該
 #: 無界——讀進一個被灌爆的檔只會讓 job 帳號自己 OOM。
@@ -233,6 +262,56 @@ def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> d
     return env
 
 
+def write_shim_error(log_path: str, instance: str, message: str) -> bool:
+    """把「shim 在接管 log 之前就失敗了」寫成一筆機器可讀紀錄（**best-effort**）。
+
+    ## 為什麼需要這一筆
+
+    `_take_over_stdio()` 之前的失敗只寫 stderr ⇒ 只進 **unit journal**，而 Manager
+    帳號讀不到那份 journal。Manager 端看得到的因此只有 `systemctl exit=1`／
+    `78/CONFIG`，逐字原因要人登入去翻——#708 的整個排查就是這樣開始的
+    （「**失敗發生在它能記錄失敗之前**」）。
+
+    ## 為什麼寫在 `dirname(log_path)`
+
+    #708 之後那是這個 job 帳號由登記表保證寫得進去的一格（`JOB_LOG_SPOOLS`），也是
+    Manager 一定讀得到、且**已經知道路徑**的一格（它就是自己建的那一格）。不新開任
+    何通道，不需要 job 知道任何額外的路徑。
+
+    ## 幾個刻意的選擇
+
+    - **`O_EXCL`**：只寫第一筆。同一格重跑會由 Manager 側整格重建，因此「已存在」
+      只可能是同一輪的第二次失敗，第一筆才是根因。
+    - **`O_NOFOLLOW` ＋ 明確 `0644` ＋ `fchmod`**：降權 unit 帶 `UMask=0077`，不補
+      `fchmod` 的話 Manager 是目錄 owner 也讀不到檔案內容（#638 缺陷 2）。
+    - **全部例外吞掉並回 `False`**：診斷面失敗絕不能變成新的失敗來源，也不能改變
+      shim 的退出碼——它的 exit code 是 Manager 的 fail-closed 判準。
+    """
+
+    try:
+        directory = os.path.dirname(log_path) or "."
+        target = os.path.join(directory, SHIM_ERROR_FILENAME)
+        payload = json.dumps(
+            {
+                "schema": SHIM_ERROR_SCHEMA,
+                "instance": instance,
+                "log_path": log_path,
+                "error": message,
+            },
+            ensure_ascii=False,
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        fd = os.open(target, flags, 0o644)
+        try:
+            os.fchmod(fd, 0o644)
+            os.write(fd, (payload + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except Exception:  # noqa: BLE001 - 診斷面失敗不得掩蓋上游的真實失敗
+        return False
+
+
 def _take_over_stdio(log_path: str) -> None:
     """把 stdout／stderr 接到 spec 指定的 JSONL log（append、`O_NOFOLLOW`）。
 
@@ -258,6 +337,11 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
 
     args = list(sys.argv[1:] if argv is None else argv)
     env = os.environ if environ is None else environ
+    instance = args[0] if len(args) == 1 else ""
+    # spec 一旦讀進來，`log_path` 就是已知的——它同時是「job 那一格 log spool 在哪
+    # 裡」。#708 之後那一格是本帳號唯一由登記表保證寫得進去的落點，因此接下來每一種
+    # 失敗都留得下一筆 Manager 讀得到的紀錄（見 :func:`write_shim_error`）。
+    known_log_path = ""
     try:
         if len(args) != 1:
             raise ShimError(
@@ -270,17 +354,21 @@ def main(argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = 
                 f"spool 根（root-owned unit 檔是這個值唯一的合法來源）"
             )
         spec = load_spec(args[0], spool_root)
+        known_log_path = str(spec["log_path"])
         # PATH 的解析刻意在**接管 log 之前**（與 spool 根 fail-closed 同一段）：
         # 這一族失敗代表 job 根本不該起跑，理由要進 journal，而不是進一份 job
         # 自己的 log——那份 log 在 Manager 眼裡與「job 跑了但沒輸出」長得一樣。
         job_env = resolve_job_env(spec, env)
-        _take_over_stdio(str(spec["log_path"]))
+        _take_over_stdio(known_log_path)
         os.chdir(str(spec["working_directory"]))
-    except ShimError as exc:
+    except (ShimError, OSError) as exc:
         print(f"cortex-job-shim: {exc}", file=sys.stderr, flush=True)
-        return EXIT_SPEC_ERROR
-    except OSError as exc:
-        print(f"cortex-job-shim: {exc}", file=sys.stderr, flush=True)
+        # **journal 之外再留一筆**（#708 第 3 項）。stderr 那一行維持不動——它是
+        # operator 在機器上的既有入口，本紀錄補的是 **Manager 端**看得到的那一半。
+        # 讀不到 spec ⇒ 連 log 落點都不知道 ⇒ 這一族仍然只有 journal（結構如此：
+        # 那時 job 對「自己該往哪裡寫」沒有任何可信來源）。
+        if known_log_path:
+            write_shim_error(known_log_path, instance, str(exc))
         return EXIT_SPEC_ERROR
 
     command = [str(item) for item in spec["command"]]  # type: ignore[index]

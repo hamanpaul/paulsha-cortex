@@ -65,6 +65,16 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # 驗證環境供應 production 不供應的
                                                     # 東西，正是讓 #679 活過五輪驗證的
                                                     # 那個動作。
+    python -m paulsha_cortex.trust_root job-log-probe [four-way|three-way|two-way]
+                                                    # #708：反向不變式的實機探針——
+                                                    # 每個降權 principal 以**零額外
+                                                    # env**、真實模板 unit 的加固面
+                                                    # 起一段命令，正向斷言「寫得出自己
+                                                    # 那一格 log 且 Manager 讀得回來」、
+                                                    # 反向斷言「Manager 的 dispatch log
+                                                    # 目錄仍然寫不進去」（那一層住著
+                                                    # gate ledger 與 exit sentinel）。
+                                                    # 同樣**不含任何 --setenv=**（D13）。
     python -m paulsha_cortex.trust_root shim [four-way|three-way|two-way]
                                                     # Phase 2b 方案 B 的降權 shim 內容
                                                     # （模板 unit 的固定 ExecStart=）
@@ -104,7 +114,7 @@ UID 方案未指定時一律用 **`four-way`**（#629 的定案：`cortex-manage
 gate 的 unit／ACL／polkit 字幹，降權模式下 build 卡照 `require_ledger` fail closed
 （＝#629 之前的現況）。
 
-`permissions`／`unit`／`shim`／`gitconfig`／`toolchain`／`polkit`／`scaffold`／`path-probe`
+`permissions`／`unit`／`shim`／`gitconfig`／`toolchain`／`polkit`／`scaffold`／`path-probe`／`job-log-probe`
 只**產生**計畫與內容字串，
 **絕不執行**任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook
 中手動 sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對
@@ -490,6 +500,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"unknown path-probe arg: {token}", file=sys.stderr)
                 return 2
         for line in permgen.build_path_resolution_probe(permgen.SCHEMES[scheme_id]):
+            print(line)
+        return 0
+    if command == "job-log-probe":
+        rest = args[1:]
+        scheme_id = permgen.DEFAULT_SCHEME_ID
+        for token in rest:
+            if token in permgen.SCHEMES:
+                scheme_id = token
+            else:
+                print(f"unknown job-log-probe arg: {token}", file=sys.stderr)
+                return 2
+        for line in permgen.build_job_log_probe(permgen.SCHEMES[scheme_id]):
             print(line)
         return 0
     if command == "shim":
