@@ -672,6 +672,46 @@ def prepare_commit_spool(
 #: :func:`prepare_job_log_spool`），而 harvest 端的 `usage_extractors` 讀的就是 JSONL。
 JOB_LOG_FILENAME = "job.jsonl"
 
+#: executor 的「最後一則訊息」落點副檔名（codex 的 `--output-last-message`／`-o`，#714）。
+JOB_LAST_MESSAGE_SUFFIX = ".last.json"
+
+
+def job_last_message_path(job_log_path: str | Path) -> Path:
+    """該 job 的 `-o last message` 落點：**它自己那份 log 的兄弟檔**（#714）。
+
+    ## 修的是什麼
+
+    `#708`／PR #709 把 job log 搬進 `<commit-spool>/build-logs/<job>/`，但 codex 的
+    `--output-last-message` 仍指著**舊的** `<coordinator_root>/logs/workflow/`——那一格
+    `0700 cortex-manager`、零具名 ACL，正是 #708 的原症狀。實機 0819 逐字：
+
+        Failed to write last message file
+        "/var/lib/cortex/coordinator/logs/workflow/last.json": Permission denied (os error 13)
+
+    **而且它是共用路徑**（`last.json`，不帶 job id）⇒ 就算補了授權，並行的兩個 job
+    也會互相蓋掉。
+
+    ## 為什麼是「log 的兄弟檔」這一條規則，而不是第二個落點決定
+
+    因為那正是 #708 已經替每個角色回答過的問題：「這個 job 寫得進去的那一格在哪」。
+    再決定一次就會再錯一次（#708 的破口逐字是「三個 principal 的 log 落點**各自**被
+    決定」）。由 job log 路徑機械導出之後，兩種派工模式都自動落在對的地方，且**都帶
+    job id**：
+
+    - 降權（模板 unit）：`<build-logs>/<job>/job.jsonl` ⇒ `…/<job>/job.last.json`
+      ——那一格是 `registry.JOB_LOG_SPOOLS` 導出的、該 principal 已經有 `wx` 的資產，
+      掛在既有通道底下 ⇒ 模板 unit 的 `ReadWritePaths=` **逐字不變、零部署動作**；
+    - direct：`<log_dir>/<slice>.jsonl` ⇒ `<log_dir>/<slice>.last.json`
+      ——同一個目錄（direct 模式下 Manager 就是寫者），但檔名帶了 slice id，共用路徑
+      的並行覆寫一併解掉。
+
+    **它不是證據面**：沒有任何採信路徑讀它（`gate_ledger`／exit sentinel／harvest 讀的
+    都是別的檔），因此把它放進 job 寫得到的那一格不會動到 #604 的作者性保證。
+    """
+
+    log = Path(job_log_path)
+    return log.with_name(log.stem + JOB_LAST_MESSAGE_SUFFIX)
+
 
 def job_log_spool_dir(*, principal_id: str, spool_key: str) -> Path:
     """該 principal 那一格 job log spool 目錄（唯一定址點，#708）。

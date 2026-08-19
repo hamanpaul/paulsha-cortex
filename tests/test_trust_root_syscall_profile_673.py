@@ -43,8 +43,22 @@ _REAL_SURFACE = bool(os.environ.get("PSC_TEST_REAL_HARDENING"))
 #: 實機量到的、被 `@system-service` 過濾掉的 syscall（#673）。
 _MEASURED_SYSCALL = "pkey_alloc"
 
-#: 本票推測、但實測**無效**的 systemd syscall 群。不得出現在任何 unit 上。
-_REJECTED_FILTER_TOKENS = ("@sandbox", "@pkey", "pkey_alloc", "landlock")
+#: 推測過、但**沒有量測支撐**的 systemd syscall 群。不得出現在任何 unit 上。
+#:
+#: **#714 把 `@sandbox`／`landlock` 從這張表移到下面 `_REQUIRED_FILTER_TOKENS`**：
+#: #673 的結論「`@sandbox` 對症狀完全無效」在它量的那個症狀上**至今成立**——V8 的
+#: `pkey_alloc` 與 landlock 毫無關係，那次的 audit 也逐字沒有任何 `landlock_*` record，
+#: 處置仍然是非致命的過濾語意而不是放行 syscall。#714 量到的是**另一個**症狀
+#: （executor 自帶的內層沙箱裝不上），而那個症狀的成因確實就是這四支被擋。
+#: 兩個結論不衝突：一個說「它治不好 A」，一個說「它是 B 的必要條件」。
+#:
+#: **`@mount` 留在拒絕清單上，而且是 #714 加的**：那是路線 A（保留 bubblewrap）第 4 道
+#: 牆的解法，實機量到有效——但它是「讓 job 有能力 mount」，與本檔案第 1 節的整個立場
+#: 相反。把它寫成一條不變式，等於把「我們沒有走 A」這個決定變成機器擋得住的東西。
+_REJECTED_FILTER_TOKENS = ("@pkey", "pkey_alloc", "@mount", "pivot_root")
+
+#: #714 實機量到**必須**放行的群組（方向與放寬相反：只能讓行程把自己關得更緊）。
+_REQUIRED_FILTER_TOKENS = ("@sandbox",)
 
 
 def _service_directives(content: str) -> list[tuple[str, str]]:
@@ -92,17 +106,28 @@ class NoWideningTests(unittest.TestCase):
 
         self.assertEqual(len(_all_units()), 8, sorted(_all_units()))
 
-    def test_every_unit_keeps_the_untouched_system_service_filter(self) -> None:
+    def test_every_unit_keeps_one_and_the_same_system_service_filter(self) -> None:
+        """八份 unit 的白名單**逐字相同**，且等於加固表上的那一個值。
+
+        #714 之前這一條斷言的是字面量 `@system-service`。改成「與加固表相等 ＋ 八份
+        一致」不是放寬檢查，而是把它對準真正承重的性質：**白名單只有一個值**（＝沒有
+        任何剖面分岔它，這正是 `PROFILE_LOCKED_KEYS` 的意思）。釘死字面量只會讓「全域
+        加一個群組」與「某份剖面偷偷多開一支」在測試上長得一樣——兩者都是紅的，而後者
+        才是那把鎖要擋的。字面量本身改由下面兩條（拒絕清單／必要清單）逐 token 守住。
+        """
+
+        table = {key: value for key, value, _why in permgen._HARDENING}
+        expected = table["SystemCallFilter"]
         for name, content in _all_units().items():
             values = [v for k, v in _service_directives(content)
                       if k == "SystemCallFilter"]
-            self.assertEqual(values, ["@system-service"], name)
+            self.assertEqual(values, [expected], name)
 
     def test_no_unit_mentions_the_rejected_syscall_sets_as_a_filter_value(self) -> None:
-        """`@sandbox`／`@pkey`／`pkey_alloc` 都不得被放進過濾器。
+        """`@pkey`／`pkey_alloc`／`@mount`／`pivot_root` 都不得被放進過濾器。
 
-        它們可以出現在**註解**裡（#673 的量測結論就寫在那），但一旦出現在指令值上
-        就是無量測支撐的放寬。
+        它們可以出現在**註解**裡（#673／#714 的量測結論就寫在那），但一旦出現在指令值
+        上就是「有更便宜的解卻選了放寬」。
         """
 
         for name, content in _all_units().items():
@@ -110,10 +135,26 @@ class NoWideningTests(unittest.TestCase):
                 for token in _REJECTED_FILTER_TOKENS:
                     self.assertNotIn(
                         token, value,
-                        f"{name} 的 {key}= 值出現 {token}——#673 實機量到 @sandbox "
-                        "對症狀完全無效，而 @pkey／pkey_alloc 沒有必要（處置是"
-                        "非致命的過濾語意，不是放行 syscall）",
+                        f"{name} 的 {key}= 值出現 {token}——@pkey／pkey_alloc 沒有必要"
+                        "（#673：處置是非致命的過濾語意，不是放行 syscall），"
+                        "@mount／pivot_root 則是 #714 明確否決的路線 A"
+                        "（讓 job 有能力 mount，與整個外層加固面的立場相反）",
                     )
+
+    def test_every_unit_allows_the_measured_inner_sandbox_syscalls(self) -> None:
+        """#714：`@sandbox` 必須在**每一份** unit 的白名單上。
+
+        少了它，executor 自帶的內層沙箱裝不上（實機：codex 的 legacy landlock 路徑在
+        `SeccompInstall … EPERM` 上 panic），job 於是只剩 systemd 這一層——而那件事
+        在 log 上長得像「模型自己決定回 needs_human」。
+        """
+
+        for name, content in _all_units().items():
+            values = [v for k, v in _service_directives(content)
+                      if k == "SystemCallFilter"]
+            self.assertEqual(len(values), 1, name)
+            for token in _REQUIRED_FILTER_TOKENS:
+                self.assertIn(token, values[0].split(), name)
 
     def test_every_unit_carries_the_non_fatal_filter_semantics(self) -> None:
         for name, content in _all_units().items():
@@ -137,7 +178,12 @@ class ProfileDerivationTests(unittest.TestCase):
             self.assertEqual(profile.profile_id, profile_id, executor)
             table = profile.effective()
             # 剖面**不影響** seccomp 這兩項——這正是 #673 的重點：兩者正交。
-            self.assertEqual(table["SystemCallFilter"], "@system-service", executor)
+            # #714 起白名單多了 `@sandbox`（全域、方向相反），但「剖面不影響它」
+            # 這條性質**逐字不變**——所以這裡改成與加固表比對，不是與字面量比對。
+            hardening = {key: value for key, value, _why in permgen._HARDENING}
+            self.assertEqual(
+                table["SystemCallFilter"], hardening["SystemCallFilter"], executor
+            )
             self.assertEqual(table[permgen.SECCOMP_FATALITY_KEY], "EPERM", executor)
 
     def test_profile_mapping_is_derived_not_a_second_roster(self) -> None:
@@ -374,7 +420,15 @@ class UnitReplicaTests(unittest.TestCase):
         for name, content in _all_units().items():
             props = permgen.unit_replica_properties(content, instance="probe")
             self.assertGreaterEqual(len(props), 30, name)
-            self.assertIn("--property=SystemCallFilter=@system-service", props, name)
+            # #714：白名單的值改由加固表導出（多了 `@sandbox`）。這一條要釘的是
+            # 「複本帶得出白名單那一條」，不是那一條長什麼樣——字面量已由第 1 節
+            # 逐 token 守住，這裡再抄一份只會變成第二個要同步的地方。
+            hardening = {key: value for key, value, _why in permgen._HARDENING}
+            self.assertIn(
+                f"--property=SystemCallFilter={hardening['SystemCallFilter']}",
+                props,
+                name,
+            )
             self.assertIn(
                 f"--property={permgen.SECCOMP_FATALITY_KEY}=EPERM", props, name
             )

@@ -515,6 +515,113 @@ class ExecutorShape(Enum):
     SHELL_SCRIPT = "shell-script"  # shell script（可能再叫別的程式，安裝時要查一次）
 
 
+# ---------------------------------------------------------------------------
+# executor 自帶的**內層沙箱**（#714）——第三個與 `needs_node` 正交的加固維度
+#
+# ## 為什麼要有這一格
+#
+# job 已經被 systemd 關在四分降權 ＋ 完整加固面裡，而 executor 自己**還會**再開一層
+# 沙箱來關住模型跑的 shell 命令。那一層與外層加固面是會打架的：#714 實機在 builder
+# 的 job log 裡量到 **5 個 `command_execution` 全部 `status: failed`**，逐字都是
+#
+#     bwrap: Can't read /proc/sys/kernel/overflowuid: No such file or directory
+#
+# ——`ProcSubset=pid` 讓 `/proc/sys` 整個消失，codex 的 bubblewrap 起不來，於是它跑的
+# 每一個命令都 `exit 1`，模型最後合理地回 `needs_human`。Manager 端看到的
+# `card-terminal-schema-retry-exhausted` 是**症狀**，離病因四層遠。
+#
+# ## 為什麼落在**這張表**上，而不是加固剖面上
+#
+# 這與 #673 把 `filtered_syscalls` 放在同一張表上是同一個判斷：**事實是「這支程式跑
+# 起來需要什麼」，屬於程式；處置才屬於加固面。** 而且與 `needs_node` 那條軸不同——
+# `needs_node` 導向「換一份放寬的具名剖面」，本欄位導向「**全域**多放行一組**方向
+# 相反**的 syscall」，因此不能共用那個欄位（#673 的教訓逐字：兩件事混在一個欄位上，
+# 適用面與處置方向都會錯）。
+#
+# ## 0819 實機量到四道牆（逐條，其餘 property 固定，每次只加一條）
+#
+# 走 `psc_run_under` 全量導出（D13），跑 codex 自帶的 `codex-resources/bwrap`：
+#
+#     1  jit 剖面原樣            bwrap: Can't read /proc/sys/kernel/overflowuid
+#     2  +ProcSubset=all         bwrap: No permissions to create a new namespace
+#     3  +RestrictNamespaces=no  bwrap: loopback: Failed to create NETLINK_ROUTE socket
+#     4  +AF_NETLINK             bwrap: Failed to make / slave: Operation not permitted
+#     5  +SystemCallFilter 加 @mount   rc=0
+#
+# 也就是說「保留 bwrap」要付的是**四條**放寬，其中第 2、4 條放寬的正是 user namespace
+# 與 mount——外層加固面存在的理由本身（`RestrictNamespaces` 那一列的註解逐字寫著
+# 「user namespace 是 unprivileged 提權的常見起點」），而第 4 條的鍵是
+# :data:`PROFILE_LOCKED_KEYS` 裡的 `SystemCallFilter`。0819 裁決因此由「A＝具名剖面
+# 放寬 `ProcSubset`」更正為**票上的 C＝換一個不需要 bwrap 的執行形態**：
+#
+#     psc_run_under（全量導出）＋ SystemCallFilter=@system-service @sandbox
+#       codex sandbox --enable use_legacy_landlock -- /bin/pwd   → rc=0
+#       …-- sh -c 'echo hi > <builder HOME>/.codex/PWN'          → Permission denied
+#       …-- sh -c 'getent hosts api.openai.com'                  → rc=2（網路被擋）
+#
+# 一條、全域、方向相反，其餘 26 項加固**逐字不動**（`ProcSubset=pid`／
+# `RestrictNamespaces=yes`／`RestrictAddressFamilies` 全部留著）。
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InnerSandboxSpec:
+    """一個 executor 自帶的內層沙箱形態 × 它在外層加固面上的**執行條件**（#714）。"""
+
+    #: 形態名（進產物註解與錯誤訊息）。
+    kind: str
+    #: 讓該 executor 走這個形態所需的 argv。空 tuple＝它預設就走這個形態。
+    #:
+    #: ⚠️ **這是對某一版工具的觀察，不是不變式**：旗標名、預設值、甚至旗標存不存在
+    #: 都隨 executor 版本而異。因此它必須被一條**反向不變式探針**盯著
+    #: （:func:`build_inner_sandbox_probe`），而不是只寫在註解裡。
+    argv: tuple[str, ...]
+    #: 這個形態在真實加固面下**實機量到**必須放行的 systemd syscall 群組。
+    #: 由 `_validate_inner_sandbox_support()` 在 import 當下比對 `_HARDENING`。
+    syscall_groups: tuple[str, ...]
+    #: 相對於「executor 的預設沙箱形態」放棄了什麼。誠實標註：登記表、產物與 runbook
+    #: 都引用它。
+    accepted_loss: tuple[str, ...]
+    note: str
+
+
+#: codex 的內層沙箱形態（#714 實機，codex-cli 0.147.0）。
+#:
+#: 預設形態是 **bubblewrap**：user／mount／pid／net namespace ＋ 自己一套 mount 表。
+#: 那個形態在本系統的加固面下要付四條放寬（見上方逐條量測），因此改走它的
+#: **landlock ＋ seccomp** 路徑——不建立任何 namespace，只用兩個「把自己關得更緊」的
+#: 核心介面。
+CODEX_LEGACY_LANDLOCK = InnerSandboxSpec(
+    kind="landlock-seccomp",
+    argv=("--enable", "use_legacy_landlock"),
+    syscall_groups=("@sandbox",),
+    accepted_loss=(
+        "**沒有 PID namespace**（bwrap 的形態有）。跨 UID 那一面由外層的 "
+        "`ProtectProc=invisible` ＋ `ProcSubset=pid` 覆蓋——job 眼中的 `/proc` 只有"
+        "自己這個 UID 的項；剩下的差異是「同一個 job 內部的行程彼此看得見」，那本來"
+        "就不是隔離邊界（它們是同一個模型跑出來的同一串命令）。**這條是明載的取捨，"
+        "不是隱性假設。**",
+        "**沒有 mount namespace**，因此內層擋不住「把別的路徑 bind 進工作區」這類"
+        "手法——但那需要 `mount(2)`，而 `SystemCallFilter=@system-service` 本來就沒有"
+        "放行 `@mount`（#714 第 4 道牆量到的正是它）。外層擋住的東西不因內層換形態"
+        "而鬆動。",
+        "**依賴 codex 的 `use_legacy_landlock` 旗標**。旗標名帶 `legacy`，隨時可能被"
+        "上游拿掉；拿掉時 codex 逐字回 `Error: Unknown feature flag: …` 並以非零收場"
+        "（0819 實機驗過），因此失敗是**吵的**、不是靜默退回「沒有內層沙箱但一切看似"
+        "正常」。`trust_root inner-sandbox-probe` 是盯著它的那條反向不變式。",
+    ),
+    note=(
+        "0819 實機（codex-cli 0.147.0）：`codex sandbox --enable use_legacy_landlock "
+        "-- /bin/pwd` 在 builder 的真實加固面下 rc=0；同一條命令改寫 "
+        "`$CODEX_HOME/PWN` 得 `Permission denied`（landlock 生效）、`getent hosts` "
+        "rc=2（seccomp 擋網路）。不加旗標則走 bubblewrap，逐字死在 "
+        "`bwrap: Can't read /proc/sys/kernel/overflowuid`。"
+        "※ `--disable use_linux_sandbox_bwrap` **不會**切走 bwrap（0819 實測仍是 "
+        "bwrap 的錯誤），因此不能拿它當同義的開關。"
+    ),
+)
+
+
 @dataclass(frozen=True)
 class ToolchainProgram:
     """一支落進部署樹 toolchain 的外部程式的搬移契約。"""
@@ -545,6 +652,15 @@ class ToolchainProgram:
     #:
     #: 只填**有 audit record 背書**的（`type=1326 … syscall=<n>`），不填形態推論。
     filtered_syscalls: tuple[str, ...] = ()
+    #: 這支程式**自己會再開一層沙箱**來關住它跑的命令時，那一層的形態與執行條件
+    #: （#714）。`None` ＝ 它不開內層沙箱（或還沒被量過——兩者在這裡是同一格，
+    #: 因此新增 executor 時這一欄要與 `needs_node` 一樣被實機量一次）。
+    #:
+    #: **與 `needs_node`／`filtered_syscalls` 都正交**：`needs_node` 導向具名剖面，
+    #: `filtered_syscalls` 導向「被過濾時不得致命」，本欄位導向「全域放行一組方向相反
+    #: 的 syscall ＋ executor argv 上的一個形態選擇」。三個處置方向兩兩不同，因此是
+    #: 三個欄位而不是一個（#673 立的規矩，本票是第二個實例）。
+    inner_sandbox: "InnerSandboxSpec | None" = None
 
 
 #: #640 的名字，保留為別名：那時表上只有 executor，型別名跟著語意走；#661 把非
@@ -565,6 +681,7 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ExecutorTool(
         "codex", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
         filtered_syscalls=("pkey_alloc",),
+        inner_sandbox=CODEX_LEGACY_LANDLOCK,
         note=(
             "唯一硬需要 node 的：本體是 JS，進入點的 shebang 是 `#!/usr/bin/env node`。"
             "單搬那支 `.js` 會缺 `node_modules`，必須整包搬 npm 套件樹。"
@@ -4312,10 +4429,21 @@ _HARDENING: tuple[tuple[str, str, str], ...] = (
      "（#643 實測 V8 的 Runtime_CompileLazy 會直接崩）。"),
     ("SystemCallArchitectures", "native",
      "只允許原生 ABI，封掉經 32-bit compat 介面規避 seccomp。"),
-    ("SystemCallFilter", "@system-service",
+    ("SystemCallFilter", "@system-service @sandbox",
      "seccomp 白名單：只留一般服務所需 syscall。※ #673 實機量到它會過濾掉 "
      "`pkey_alloc`（V8 啟動時會叫），但**不放寬**：處置在下一行的過濾語意，"
-     "不在白名單。"),
+     "不在白名單。"
+     "※ **`@sandbox` 是 #714 加的，而它與「放寬」方向相反**："
+     "`@sandbox`＝`landlock_create_ruleset`／`landlock_add_rule`／"
+     "`landlock_restrict_self`／`seccomp` 四支，能力上限是**讓呼叫者把自己關得更緊**"
+     "——它們拿不到任何本來拿不到的資源。少了它，executor 自帶的內層沙箱裝不上"
+     "（#714 實機：codex 的 legacy landlock 路徑在 `SeccompInstall … EPERM` 上 panic），"
+     "於是 job 只剩 systemd 這一層。**加在全域而不是某份剖面**：這正是 "
+     ":data:`PROFILE_LOCKED_KEYS` 那條理由要的形態（白名單的變動必須是一次全域可稽核"
+     "的決定），因此 `SystemCallFilter` 至今仍是鎖定鍵、沒有任何剖面分岔它。"
+     "需求由 :data:`TOOLCHAIN_PROGRAMS` 的 `inner_sandbox` 機械導出，"
+     "import 時由 `_validate_inner_sandbox_support()` 強制——把 `@sandbox` 刪掉，"
+     "這個模組**載不起來**。"),
     ("SystemCallErrorNumber", "EPERM",
      "被過濾的 syscall 回 EPERM 而非 SIGSYS——失敗可觀測，不是無聲當掉。"
      "※ **本行承重，刪掉會讓六份 job unit 上的 codex／copilot 同時靜默死**"
@@ -4656,6 +4784,148 @@ def _validate_seccomp_tolerance() -> None:
 
 
 _validate_seccomp_tolerance()
+
+
+# ---------------------------------------------------------------------------
+# 內層沙箱的執行條件（#714）——與剖面正交的第三個維度，處置是**全域**、方向相反
+# ---------------------------------------------------------------------------
+
+#: 加固表中決定「executor 自帶的內層沙箱裝不裝得上」的那一個鍵。
+#:
+#: 與 :data:`SECCOMP_FATALITY_KEY` 是同一張表上的兩個鄰居，但問的是不同的問題：
+#: 那一個問「被擋的 syscall 會不會殺掉行程」，這一個問「內層沙箱要用的 syscall 有沒有
+#: 被放行」。兩者都指向 `SystemCallFilter=` 這一族，因此都在 :data:`PROFILE_LOCKED_KEYS`
+#: 的守備範圍內——**處置一律全域，不得由剖面分岔**。
+INNER_SANDBOX_SYSCALL_KEY: str = "SystemCallFilter"
+
+
+@dataclass(frozen=True)
+class InnerSandboxSurface:
+    """一支**自帶內層沙箱**的程式 × 它實際跑的加固面上，那一層裝不裝得上（#714）。"""
+
+    program: str
+    kind: str
+    #: 剖面 id（executor）或 :data:`MANAGER_SURFACE`。
+    surface: str
+    #: 該形態宣告需要、而該面**沒有放行**的 syscall 群組（空 tuple＝裝得上）。
+    missing_groups: tuple[str, ...]
+    detail: str
+
+    @property
+    def satisfied(self) -> bool:
+        return not self.missing_groups
+
+
+def executor_inner_sandbox(executor: str) -> InnerSandboxSpec | None:
+    """executor 名 → 它自帶的內層沙箱形態（無則 ``None``）；**未知 executor 一律拒絕**。
+
+    fail-closed 的方向與 :func:`executor_hardening_profile` 逐字相同，理由也相同：
+    「不確定就回 ``None``」看起來安全，實際會讓一個沒被盤點過的 executor 在真實加固面
+    下**每一條命令都失敗**，而症狀（模型回 `needs_human`）離原因四層遠——那正是 #714
+    被埋掉 30 分鐘的方式。
+    """
+
+    name = str(executor or "").strip()
+    for tool in EXECUTOR_TOOLS:
+        if tool.name == name:
+            return tool.inner_sandbox
+    raise UnknownExecutorProfileError(
+        f"未知的 executor {executor!r}，無法決定內層沙箱形態"
+        f"（已登記：{sorted(t.name for t in EXECUTOR_TOOLS)}）。新增 executor 必須先進 "
+        "permgen.EXECUTOR_TOOLS，並在真實加固面下量一次它的內層沙箱（#714）。"
+    )
+
+
+def _surface_allows_syscall_groups(
+    surface: str, groups: Sequence[str]
+) -> tuple[tuple[str, ...], str]:
+    """該加固面的 `SystemCallFilter=` 少了哪幾個群組（由既有產生器導出，不另抄一份）。"""
+
+    table, label = _surface_hardening_table(surface)
+    allowed = str(table.get(INNER_SANDBOX_SYSCALL_KEY, "") or "").split()
+    missing = tuple(group for group in groups if group not in allowed)
+    return missing, f"{label}（{INNER_SANDBOX_SYSCALL_KEY}={' '.join(allowed) or '（未設）'}）"
+
+
+def inner_sandbox_surfaces() -> tuple[InnerSandboxSurface, ...]:
+    """全部宣告了 `inner_sandbox` 的程式 × 它跑的每一個加固面（機械導出）。
+
+    與 :func:`filtered_syscall_surfaces` 逐條同型（executor 走自己的剖面、非 executor
+    走 `consumed_by` 指到的消費者面），**不另立清單**：改一支程式的內層沙箱形態只改
+    :data:`TOOLCHAIN_PROGRAMS` 上那一列，這裡跟著動。
+    """
+
+    executor_names = {tool.name for tool in EXECUTOR_TOOLS}
+    findings: list[InnerSandboxSurface] = []
+    for tool in TOOLCHAIN_PROGRAMS:
+        spec = tool.inner_sandbox
+        if spec is None:
+            continue
+        surfaces = (
+            (tool.name,) if tool.name in executor_names else tuple(tool.consumed_by)
+        )
+        if not surfaces:
+            findings.append(
+                InnerSandboxSurface(
+                    program=tool.name,
+                    kind=spec.kind,
+                    surface="",
+                    missing_groups=spec.syscall_groups,
+                    detail="未登記 consumed_by，無法判定它跑在哪一份加固面上",
+                )
+            )
+            continue
+        for surface in surfaces:
+            missing, label = _surface_allows_syscall_groups(
+                surface, spec.syscall_groups
+            )
+            findings.append(
+                InnerSandboxSurface(
+                    program=tool.name,
+                    kind=spec.kind,
+                    surface=surface,
+                    missing_groups=missing,
+                    detail=label,
+                )
+            )
+    return tuple(findings)
+
+
+def _validate_inner_sandbox_support() -> None:
+    """import 時強制 #714 的不變式。兩條，缺一即讓 import 炸掉。
+
+    1. 每一個宣告了 `inner_sandbox` 的程式，在它**每一個**執行面上都必須放行該形態
+       宣告的 syscall 群組；
+    2. `INNER_SANDBOX_SYSCALL_KEY` 必須留在 :data:`PROFILE_LOCKED_KEYS` 上——處置是
+       **全域**放行，剖面分岔它就退化成「某一份剖面偷偷多開一支 syscall」，而那正是
+       #673 立那把鎖的理由。
+
+    為什麼在 import 當下而不是一條測試：#714 的破口不是「有人寫錯一行」，是「內層
+    沙箱的執行條件從來不是機器可讀的」——於是它只能在實機上以「模型跑的每一條命令都
+    `exit 1`」的形式出現，而那個症狀離原因四層遠。
+    """
+
+    if INNER_SANDBOX_SYSCALL_KEY not in PROFILE_LOCKED_KEYS:
+        raise ValueError(
+            f"{INNER_SANDBOX_SYSCALL_KEY} 不在 PROFILE_LOCKED_KEYS 上——內層沙箱的"
+            "執行條件是**全域**一次決定（#714/#673），不得由剖面分岔。"
+        )
+    broken = [item for item in inner_sandbox_surfaces() if not item.satisfied]
+    if broken:
+        detail = "；".join(
+            f"{item.program} 的 {item.kind} 內層沙箱在 {item.detail} 少了 "
+            f"{', '.join(item.missing_groups)}"
+            for item in broken
+        )
+        raise ValueError(
+            "#714 不變式失守：下列 executor 自帶的內層沙箱在它實際跑的加固面上**裝不上**"
+            f"⇒ job 內每一條 shell 命令都會失敗（實機症狀是模型回 `needs_human`）：{detail}。"
+            f"處置是把缺的群組加進 `_HARDENING` 的 `{INNER_SANDBOX_SYSCALL_KEY}`（全域，"
+            "一次可稽核的決定），**不是**替某個 executor 生一份放寬的剖面。"
+        )
+
+
+_validate_inner_sandbox_support()
 
 
 @dataclass(frozen=True)
@@ -7836,6 +8106,118 @@ def build_job_git_trust_probe(
         "——這是刻意的分工：#709／#687 記過 `psc_run_under` 複製的是加固面、不是派工"
         "路徑，而本票要驗的東西（spec 的 env）只有派工路徑才會產生。以 `--setenv=` "
         "自己塞那三個變數進去，量到的只會是「我塞的東西生效了」。"
+    )
+    return lines
+
+
+def build_inner_sandbox_probe(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+    executor: str = "codex",
+) -> list[str]:
+    """#714 反向不變式的實機探針（**只回傳字串，不執行**）。
+
+    要證的是**四個方向**，缺一不可——少了任何一個，「內層沙箱還在」就只是一句宣稱：
+
+    1. **缺陷還在**（不帶旗標的負向對照）——executor 的**預設**內層沙箱形態在真實
+       加固面下**必須仍然失敗**，且逐字是 `bwrap: Can't read
+       /proc/sys/kernel/overflowuid`。這一步同時守住兩件事：外層加固面沒有被人「順手
+       放寬 `ProcSubset`」（那會讓這一步變成 rc=0），以及本票選的形態切換**真的是**
+       讓它通的原因。
+    2. **旗標還在**——`inner_sandbox.argv` 不得換來 `Unknown feature flag`。**這是本
+       探針存在的主要理由**：那個旗標名帶 `legacy`，是對 codex 某一版的觀察，不是不
+       變式（PR #713 的教訓方向相反但同一族：那次把某版 git 的行為寫成不變式）。
+    3. **正向**——帶上旗標之後，同一條命令在**同一份**加固面下 rc=0。
+    4. **內層真的在擋**——沙箱不是「裝上了就算」：寫工作區外的檔必須 `Permission
+       denied`、對外查名必須失敗。少了這一半，「旗標吃下去了但沒有沙箱」與「沙箱生效」
+       在輸出上長得一模一樣，而那正是 `accepted_loss` 裡最不能靜默的那一格。
+
+    ## 為什麼這一支走 `psc_run_under`，而不是真實派工
+
+    要驗的東西**住在加固面與 executor argv 上**，兩者都由加固面複本忠實帶到
+    （`unit_replica_properties()` 全量導出，含 `Environment=`）。#709／#687 那條
+    caveat 講的是「spec 的 env 只有派工路徑才會產生」——本票不驗 spec 的 env。
+
+    ⚠️ 但 **#714 的驗收本身仍須走真實派工**：「builder 執行得了命令且產得出非空
+    bundle」那一條要的是端到端結果，不是加固面複本。本探針是**回歸守衛**，不是驗收。
+
+    **本產生器一行 `--property=` 都不自組、一個 `--setenv=` 都不帶**（design D13）。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    spec = executor_inner_sandbox(executor)
+    if spec is None:
+        raise ValueError(
+            f"executor {executor!r} 沒有登記 inner_sandbox——沒有內層沙箱就沒有這條"
+            "反向不變式可驗（#714）。"
+        )
+    profile = executor_hardening_profile(executor)
+    stem = job_unit_stem(layout, Principal.BUILDER, profile)
+    builder_account = scheme.resolve(Principal.BUILDER)
+    binary = f"{layout.toolchain_root}/bin/{executor}"
+    flag = " ".join(spec.argv)
+    groups = " ".join(spec.syscall_groups)
+    lines: list[str] = [
+        "# === #714 反向不變式：executor 的內層沙箱還裝得上、而且真的在擋嗎 ===",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}，executor={executor}）"
+        "——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root inner-sandbox-probe {scheme.scheme_id}",
+        "#",
+    ]
+    lines += _wrap_comment(
+        f"形態：{spec.kind}（argv `{flag}`，需要 `{groups}`）。"
+        f"{spec.note}"
+    )
+    lines += [
+        "#",
+        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
+        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
+        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
+        "  return 1 2>/dev/null || exit 1",
+        "}",
+        "",
+        "#   0) 加固面上真的有那組群組（D13：讀**落檔的** unit，不是讀產生器）。",
+        f"sudo systemctl cat {stem}@.service | grep '^SystemCallFilter='",
+        f"#      期望：值裡含 `{groups}`。沒有 ⇒ 落檔的是舊版產生器的產物，重跑第 5-2",
+        "#      步落檔再回來；**不要**在這裡手動加 property 把它蓋過去。",
+        "",
+        "#   1) **負向對照**：不帶旗標＝executor 的預設內層沙箱形態，必須**仍然失敗**。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox -- /bin/pwd",
+        "#      期望：非零，且 stderr 逐字含 `Can't read /proc/sys/kernel/overflowuid`。",
+        "#      rc=0 ⇒ 有人放寬了 `ProcSubset`（或 executor 換了預設形態）——那會讓本票",
+        "#      的整個論證失效，**停下來查清楚**，不要因為「反正也是綠的」就放過。",
+        "",
+        f"#   2) 旗標還在：`{flag}` 不得換來 `Unknown feature flag`。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/true",
+        "#      期望：rc=0。stderr 出現 `Unknown feature flag` ⇒ **上游把旗標拿掉了**：",
+        "#      內層沙箱從此不存在，而 job 會照跑。處置是回到 permgen 的 "
+        "`EXECUTOR_TOOLS`",
+        "#      那一列重新量一次形態，**不是**把這條探針刪掉。",
+        "",
+        "#   3) 正向：同一份加固面下，帶旗標就通。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/pwd",
+        "#      期望：rc=0，stdout 是 job 的 cwd。",
+        "",
+        "#   4) 內層真的在擋（**這一段不可省略**——裝上了不等於有在擋）。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- \\",
+        f"  /bin/sh -c 'echo x > /var/lib/{builder_account}/psc-714-PWN'",
+        "#      期望：非零，逐字 `Permission denied`（landlock 擋寫）。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- \\",
+        "  /bin/sh -c 'getent hosts api.openai.com'",
+        "#      期望：非零（seccomp 擋網路）。",
+        "#      ⚠️ 這兩條**任一**變成 rc=0 ⇒ 旗標被吃下去了但沙箱沒生效——那是最壞的",
+        "#      狀態（看起來一切正常，實際少一層），比整個起不來還難發現。",
+        "",
+    ]
+    lines += _wrap_comment(
+        "本探針是**回歸守衛**，不是 #714 的驗收。驗收是「builder job 執行得了 shell "
+        "命令**且產得出非空 bundle**」，那一條必須走真實派工（#709 的 caveat："
+        f"`{PATH_PROBE_HELPER}` 複製的是加固面、不是派工路徑），工作區由真實 "
+        "provisioning 產生（#645：手工前置物會把 bug 繞過去）。"
+    )
+    lines += _wrap_comment(
+        "**明載的取捨**（`InnerSandboxSpec.accepted_loss`，本探針量不到）："
+        + "；".join(spec.accepted_loss)
     )
     return lines
 

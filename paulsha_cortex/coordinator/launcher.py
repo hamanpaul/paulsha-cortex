@@ -843,6 +843,7 @@ def build_codex_argv(
     review_only: bool = False,
     commit_required: bool = False,
     verdict_spool_dir: str | None = None,
+    last_message_path: str | None = None,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Codex planning cannot bypass sandbox")
@@ -873,16 +874,50 @@ def build_codex_argv(
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
+    if not allow_unsafe:
+        # #714：codex 的**內層沙箱形態**。預設是 bubblewrap，而 bwrap 在本系統的
+        # 加固面下要付四條放寬（`ProcSubset`／`RestrictNamespaces`／
+        # `RestrictAddressFamilies`／`SystemCallFilter` 加 `@mount`），其中兩條放寬的
+        # 正是 user namespace 與 mount——外層加固面存在的理由本身。改走
+        # landlock ＋ seccomp 之後外層一條都不必動（見 `permgen.CODEX_LEGACY_LANDLOCK`）。
+        #
+        # **形態由登記表導出，不在這裡寫死**：`permgen.EXECUTOR_TOOLS` 那一列同時是
+        # 「需要放行哪些 syscall 群組」的來源，而那條需求在 permgen import 當下被強制
+        # （`_validate_inner_sandbox_support()`）。兩邊各寫一份就會出現「argv 換了形態、
+        # 加固面沒跟上」的靜默組合。
+        #
+        # `allow_unsafe` 那一支刻意不帶：`--dangerously-bypass-approvals-and-sandbox`
+        # 已經整個關掉內層沙箱，再選形態沒有意義。
+        argv += list(_codex_inner_sandbox_argv())
     for spool_dir in _verdict_spool_add_dirs(
         verdict_spool_dir, read_only=read_only, review_only=review_only
     ):
         argv += ["--add-dir", spool_dir]
     if model is not None:
         argv += ["--model", model]
-    argv.extend(["-o", str(Path(log_dir) / "last.json")])
+    # #714 缺陷 2：`-o` 的落點必須是**這個 job 寫得進去、而且帶 job id** 的那一格。
+    # 呼叫端沒給時退回 `<log_dir>/<slice>.last.json`——仍然帶 slice id（共用
+    # `last.json` 會讓並行的兩個 job 互相蓋掉），只是落在 Manager 的 dispatch log
+    # 目錄，那是 direct 模式的既有落點。
+    argv.extend(
+        ["-o", last_message_path or str(Path(log_dir) / f"{slice_id}.last.json")]
+    )
     if worktree is not None:
         argv.extend(["-C", worktree])
     return argv
+
+
+def _codex_inner_sandbox_argv() -> tuple[str, ...]:
+    """codex 的內層沙箱形態 argv（`permgen.EXECUTOR_TOOLS` 是唯一真相，#714）。
+
+    lazy import 與 `planning_job`／`planning_probe_cache` 既有的做法一致：`trust_root`
+    是產生器面，不該進 `coordinator` 的模組載入圖，但**登記表的內容必須只有一份**。
+    """
+
+    from ..trust_root import permgen
+
+    spec = permgen.executor_inner_sandbox("codex")
+    return () if spec is None else tuple(spec.argv)
 
 
 def build_agy_argv(
@@ -1396,6 +1431,23 @@ class SubprocessLauncher:
         # 絕對化後 JSONL / sentinel / 回傳 log_path 皆與 cwd 無關，跨進程 poll 一致。
         log_dir = str(Path(log_dir).resolve())
         Path(log_dir).mkdir(parents=True, exist_ok=True)
+        log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        # #714 缺陷 2：**job 端 log 的落點在這裡就定案**（純路徑推導、零副作用），
+        # 因為 executor 的 argv 在下面幾行就要用到它——`-o` 的落點是「這個 job 自己那
+        # 份 log 的兄弟檔」。真正把那一格建出來的仍是下面 `prepare_job_log_spool()`
+        # 那一步（#708 的順序不變：先備好 log，再寫 spec），且它回傳的路徑會與這裡算
+        # 出來的**逐字比對**——兩處推導漂移時當場 fail-closed，不會出現「argv 指著 A、
+        # shim 開的是 B」這種只在實機上看得見的錯位。
+        job_log_path = log_path
+        if template_plan is not None:
+            job_log_path = str(
+                job_workspace.job_log_spool_dir(
+                    principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
+                    spool_key=slice_id,
+                )
+                / job_workspace.JOB_LOG_FILENAME
+            )
+        last_message_path = str(job_workspace.job_last_message_path(job_log_path))
         builder_kwargs = {
             "prompt": prompt,
             "slice_id": slice_id,
@@ -1428,6 +1480,11 @@ class SubprocessLauncher:
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
         if self._executor == "cg":
             builder_kwargs["effort"] = self._effort
+        # #714 缺陷 2：只有 codex 有 `--output-last-message`。其餘 executor 沒有這個
+        # 落點，傳過去只會是一個沒人接的 kwarg（形狀與既有的 `verdict_spool_dir`／
+        # `effort` 逐條一致：能力有差異就顯式分岔，不塞 None 給接不住的那幾支）。
+        if self._executor == "codex":
+            builder_kwargs["last_message_path"] = last_message_path
         inner_argv = _ARGV_BUILDERS[self._executor](
             **builder_kwargs,
         )
@@ -1478,7 +1535,7 @@ class SubprocessLauncher:
                 env["PSC_RELAY_TARGET"] = self._relay_target
             if self._executor == "copilot":
                 env.update(_copilot_credential_env(env))
-        log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        # （`log_path` 已在 argv 之前算好——#714：`-o` 的落點由它導出。）
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
         # sentinel 路徑亦 shlex.quote。poll_headless_done 讀此 sentinel，不再靠 os.waitpid。
@@ -1567,7 +1624,6 @@ class SubprocessLauncher:
             # 降權模式在這點上比 direct 更緊）。
             popen_kwargs["stdin"] = subprocess.DEVNULL
         log_mode = "wb"
-        job_log_path = log_path
         if template_plan is not None:
             # #708：**先把 job 端的 log 落點準備好，再寫 spec。**
             #
@@ -1589,13 +1645,24 @@ class SubprocessLauncher:
             # 因此也是不同的一條既有輸出通道。對應關係在
             # `job_runner.JobRoleConfig.log_spool_principal`（與
             # `registry.JOB_LOG_SPOOLS` 成對），不在這裡推導。
-            job_log_path = str(
+            prepared_log_path = str(
                 job_workspace.prepare_job_log_spool(
                     principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
                     spool_key=slice_id,
                     manager_log_path=log_path,
                 )
             )
+            # #714：argv 上的 `-o` 是由**上面那個純路徑推導**算出來的，這裡是真的建出
+            # 那一格的那一步。兩者漂移＝「codex 寫到 A、shim 開的是 B」，而那種錯位
+            # 只有在實機上才看得見（一個空的 last message ＋ 一個沒人讀的檔）。
+            # 因此逐字比對，不相等就當場停下來。
+            if prepared_log_path != job_log_path:
+                raise RuntimeError(
+                    "job log 落點推導漂移："
+                    f"argv 用的是 {job_log_path}，實際建出來的是 {prepared_log_path}"
+                    "（#714）"
+                )
+            job_log_path = prepared_log_path
             # #710：**再把工作區的可達性準備好**，同樣在寫 spec 之前。
             #
             # shim 在降權之後、exec 之前 `os.chdir(spec["working_directory"])`——那一步
