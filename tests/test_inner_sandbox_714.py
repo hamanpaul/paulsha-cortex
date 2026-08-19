@@ -491,9 +491,14 @@ class ProbeGeneratorTests(unittest.TestCase):
         self.assertIn(" ".join(spec.argv), self.text)
 
     def test_it_watches_the_upstream_deprecation_notice(self) -> None:
-        """旗標**已被上游宣告要移除**，探針必須把那句話印出來當早期警報。"""
+        """旗標**已被上游宣告要移除**，探針必須把那句話印出來當早期警報。
+
+        而且必須從**真實派工的 job log** 撈——`codex sandbox` 子命令不印那句話（0819
+        實測），對著它 grep 只會得到一個看起來很安心、其實什麼都沒驗到的空結果。
+        """
 
         self.assertIn("deprecat", self.text)
+        self.assertIn("job.jsonl", self.text)
         spec = permgen.executor_inner_sandbox("codex")
         assert spec is not None
         self.assertTrue(

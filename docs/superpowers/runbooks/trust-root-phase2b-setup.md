@@ -2898,6 +2898,10 @@ python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 #     2) **旗標還在**：不得回 `Error: Unknown feature flag: use_legacy_landlock`。
 #        ⚠️ 這條是本探針存在的**主要**理由——旗標名帶 `legacy`，那是對 codex 某一版的
 #        觀察，不是不變式。上游拿掉它時 codex 以非零收場（吵的失敗，不是靜默少一層）。
+#     2b) **早期警報**：到**最近一次真實派工的 job log** 裡 grep 那句 deprecation。
+#        ⚠️ `codex sandbox` 子命令**不印**那句話（0819 實測），只有 `exec --json` 會把它
+#        當一筆 `item.type=error` 放進串流——拿 `sandbox` 的輸出去 grep 只會得到一個
+#        看起來很安心、其實什麼都沒驗到的「沒有 deprecation 訊息」。
 #     3) **正向**：帶旗標 rc=0。
 #     4) **真的在擋**，且**每一條都配一個對照組**：同一格路徑在沒有內層沙箱時
 #        寫得進去（`OUTER_ALLOWS`）、帶了內層沙箱就 `Permission denied`；
