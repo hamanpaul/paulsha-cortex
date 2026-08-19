@@ -2899,10 +2899,14 @@ python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 #        ⚠️ 這條是本探針存在的**主要**理由——旗標名帶 `legacy`，那是對 codex 某一版的
 #        觀察，不是不變式。上游拿掉它時 codex 以非零收場（吵的失敗，不是靜默少一層）。
 #     3) **正向**：帶旗標 rc=0。
-#     4) **真的在擋**：寫工作區外的檔必須 `Permission denied`（landlock）、
-#        `getent hosts` 必須非零（seccomp 擋網路）。
-#        ⚠️ 這兩條任一變成 rc=0 ⇒ **旗標吃下去了但沙箱沒生效**——看起來一切正常、
-#        實際少一層，比整個起不來還難發現。
+#     4) **真的在擋**，且**每一條都配一個對照組**：同一格路徑在沒有內層沙箱時
+#        寫得進去（`OUTER_ALLOWS`）、帶了內層沙箱就 `Permission denied`；
+#        `getent hosts` 在沒有內層沙箱時 rc=0、帶了就非零。
+#        ⚠️ **對照組不可省略。** 0819 第一版探針拿「寫 job 的 HOME 被擋」當證據
+#        ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 先回
+#        `Read-only file system`，那條檢查其實在證明外層，內層裝沒裝上完全看不出來。
+#        ⚠️ 被擋那條變成 rc=0（而對照組正常）⇒ **旗標吃下去了但沙箱沒生效**——
+#        看起來一切正常、實際少一層，比整個起不來還難發現。
 
 # ✅ 驗證 2：真實派工 smoke（**這一條才是驗收**）
 #    #709 的 caveat 逐字適用：`psc_run_under` 複製的是加固面，**不是派工路徑**。
@@ -2922,8 +2926,14 @@ sudo -u cortex-manager ls -l /var/lib/cortex/coordinator/commit-spool/<slice>/
   行程彼此看得見」，那本來就不是隔離邊界。
 - **沒有 mount namespace**。內層因此擋不住「把別的路徑 bind 進工作區」——但那需要
   `mount(2)`，而 `SystemCallFilter` 本來就沒放行 `@mount`（上表第 4 道牆量到的正是它）。
-- **依賴 codex 的 `use_legacy_landlock` 旗標**。這是本節唯一的版本相依，由驗證 1 的
-  第 2 步盯著。
+- **依賴 codex 的 `use_legacy_landlock` 旗標，而上游已宣告它是過渡狀態。** 0819 實機
+  在真實派工的 `--json` 串流裡逐字收到
+  `` `[features].use_legacy_landlock` is deprecated and will be removed soon. ``
+  ——**這是倒數，不是穩態**。旗標被拿掉的那天只剩 bubblewrap，而 bubblewrap 要付的
+  四條放寬正是上表否決的那四條 ⇒ **A／B／C 會整個回到桌上**。由驗證 1 的第 2／2b 步
+  盯著。⚠️ 那句話以 `item.type=error` 進 `--json`，**不影響** terminal 契約
+  （`_extract_terminal_json()` 由尾端往回找 `agent_message`），但看到 job log 開頭有
+  一筆 error 時不要誤判成 job 失敗。
 
 **回滾**：把 `SystemCallFilter` 改回 `@system-service` 並重落八份 unit ＋ 退回上一版
 cortex（argv 就不再帶旗標）。回滾之後 builder 會回到 #714 的原症狀——**每一條 shell

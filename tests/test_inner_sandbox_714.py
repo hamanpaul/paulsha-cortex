@@ -462,6 +462,22 @@ class ProbeGeneratorTests(unittest.TestCase):
         self.assertIn("Permission denied", self.text)
         self.assertIn("getent hosts", self.text)
 
+    def test_the_enforcement_step_carries_paired_controls(self) -> None:
+        """「被擋」必須配一個「沒有內層沙箱時會過」的對照組。
+
+        少了對照組，最容易寫出的那條檢查是**假的**：拿「寫 job 的 HOME 被擋」當證據
+        ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 會先回
+        `Read-only file system`，內層有沒有裝上完全看不出來。0819 第一版探針就是這樣
+        寫的，實跑才發現它在證明外層。
+        """
+
+        self.assertIn("OUTER_ALLOWS", self.text)
+        self.assertIn("INNER_LEAK", self.text)
+        # 被擋的那一格必須落在 job 的可寫面（worktree pool）之內。
+        self.assertIn(f"{permgen.DEFAULT_LAYOUT.worktree_root}/probe", self.text)
+        # 而不是 job 的 HOME——那是外層擋的，不是內層。
+        self.assertNotIn("psc-714-PWN", self.text)
+
     def test_it_never_hand_assembles_the_hardening_surface(self) -> None:
         """D13：加固面只有一份定義，探針一行 `--property=`／`--setenv=` 都不自組。"""
 
@@ -473,6 +489,17 @@ class ProbeGeneratorTests(unittest.TestCase):
         spec = permgen.executor_inner_sandbox("codex")
         assert spec is not None
         self.assertIn(" ".join(spec.argv), self.text)
+
+    def test_it_watches_the_upstream_deprecation_notice(self) -> None:
+        """旗標**已被上游宣告要移除**，探針必須把那句話印出來當早期警報。"""
+
+        self.assertIn("deprecat", self.text)
+        spec = permgen.executor_inner_sandbox("codex")
+        assert spec is not None
+        self.assertTrue(
+            any("deprecated" in item for item in spec.accepted_loss),
+            spec.accepted_loss,
+        )
 
     def test_it_refuses_an_executor_without_a_measured_sandbox(self) -> None:
         with self.assertRaises(ValueError):
@@ -491,7 +518,65 @@ class ProbeGeneratorTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 6. 明確測不到的 OS 層語意（#638／#657 的教訓：不留假綠）
+# 6. deprecation 噪音不得污染 terminal 契約
+# ---------------------------------------------------------------------------
+
+class DeprecationNoiseTests(unittest.TestCase):
+    """codex 對這個旗標的 deprecation 宣告以 `item.type=error` 進 `--json` 串流。
+
+    0819 實機逐字（真實派工的 job log 第一筆）：
+
+        {"type":"item.completed","item":{"id":"item_0","type":"error",
+         "message":"`[features].use_legacy_landlock` is deprecated and will be
+         removed soon. …"}}
+
+    本票因此欠一條斷言：**那筆 error 不得讓 terminal 契約誤判**。它不是理論——
+    `#714` 的原症狀正是「Manager 端看到契約錯誤、病因在四層之下」，再多一個會混淆
+    契約的雜訊等於替下一次同型誤診鋪路。
+    """
+
+    def test_a_leading_error_item_does_not_shadow_the_terminal_payload(self) -> None:
+        import json
+
+        from paulsha_cortex.coordinator import manager as manager_module
+
+        payload = {
+            "kind": "workflow-card",
+            "schema_version": 1,
+            "status": "passed",
+            "candidate": "deadbeef",
+            "outputs": {},
+        }
+        lines = [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_0",
+                        "type": "error",
+                        "message": (
+                            "`[features].use_legacy_landlock` is deprecated and "
+                            "will be removed soon."
+                        ),
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": json.dumps(payload)},
+                }
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "job.jsonl"
+            log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            extracted = manager_module._extract_terminal_json(str(log))
+        self.assertEqual(extracted.get("status"), "passed")
+
+
+# ---------------------------------------------------------------------------
+# 7. 明確測不到的 OS 層語意（#638／#657 的教訓：不留假綠）
 # ---------------------------------------------------------------------------
 
 class OsLevelSemanticsTests(unittest.TestCase):

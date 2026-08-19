@@ -605,10 +605,18 @@ CODEX_LEGACY_LANDLOCK = InnerSandboxSpec(
         "手法——但那需要 `mount(2)`，而 `SystemCallFilter=@system-service` 本來就沒有"
         "放行 `@mount`（#714 第 4 道牆量到的正是它）。外層擋住的東西不因內層換形態"
         "而鬆動。",
-        "**依賴 codex 的 `use_legacy_landlock` 旗標**。旗標名帶 `legacy`，隨時可能被"
-        "上游拿掉；拿掉時 codex 逐字回 `Error: Unknown feature flag: …` 並以非零收場"
-        "（0819 實機驗過），因此失敗是**吵的**、不是靜默退回「沒有內層沙箱但一切看似"
-        "正常」。`trust_root inner-sandbox-probe` 是盯著它的那條反向不變式。",
+        "**依賴 codex 的 `use_legacy_landlock` 旗標，而上游已宣告它是過渡狀態**。"
+        "0819 實機在真實派工的 `--json` 串流裡逐字收到："
+        "`[features].use_legacy_landlock is deprecated and will be removed soon. "
+        "(Remove this setting to stop opting into the legacy Linux sandbox behavior.)`"
+        "——**這是倒數，不是穩態**：上游拿掉它的那天，codex 回 "
+        "`Error: Unknown feature flag: …` 並以非零收場（同日實測），"
+        "屆時只剩 bubblewrap，而 bubblewrap 要付的四條放寬正是本票否決的那四條 ⇒ "
+        "A／B／C 會整個回到桌上。因此 `trust_root inner-sandbox-probe` 不只驗「還能不能"
+        "用」，也把那句 deprecation 印出來當**早期警報**。"
+        "※ 那句話以 `item.completed` ／ `item.type=error` 進 `--json` 串流，"
+        "**不影響 terminal 契約**：`manager._extract_terminal_json()` 由**尾端往回**找 "
+        "`agent_message`，開頭的 error 項會被跳過（0819 實機的 job log 逐字確認）。",
     ),
     note=(
         "0819 實機（codex-cli 0.147.0）：`codex sandbox --enable use_legacy_landlock "
@@ -8153,8 +8161,10 @@ def build_inner_sandbox_probe(
         )
     profile = executor_hardening_profile(executor)
     stem = job_unit_stem(layout, Principal.BUILDER, profile)
-    builder_account = scheme.resolve(Principal.BUILDER)
     binary = f"{layout.toolchain_root}/bin/{executor}"
+    # 第 4 步要「外層允許、內層擋」的那一格：runbook 第 4e 步的共用探針前置已經要求
+    # 建出 `<worktree pool>/probe`（`--instance probe` 的 `ReadWritePaths=%i`）。
+    probe_workspace = f"{layout.worktree_root}/probe"
     flag = " ".join(spec.argv)
     groups = " ".join(spec.syscall_groups)
     lines: list[str] = [
@@ -8194,18 +8204,46 @@ def build_inner_sandbox_probe(
         "`EXECUTOR_TOOLS`",
         "#      那一列重新量一次形態，**不是**把這條探針刪掉。",
         "",
+        "#   2b) **早期警報**：上游對這個旗標的 deprecation 宣告（0819 起就有）。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/true 2>&1 \\",
+        "  | grep -i 'deprecat' || echo '（沒有 deprecation 訊息）'",
+        "#      0819 實機逐字：`[features].use_legacy_landlock is deprecated and will be",
+        "#      removed soon.`——**這是倒數，不是穩態**。它還在印，代表旗標還在；哪天它",
+        "#      不見了要先確認是「上游收回宣告」還是「旗標已經被拿掉」（看第 2 步）。",
+        "#      ⚠️ 這句話會以 `item.type=error` 進 `--json` 串流。它**不影響** terminal",
+        "#      契約（`_extract_terminal_json()` 由尾端往回找 `agent_message`），但看到",
+        "#      job log 開頭有一筆 error 時不要誤判成 job 失敗。",
+        "",
         "#   3) 正向：同一份加固面下，帶旗標就通。",
         f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/pwd",
         "#      期望：rc=0，stdout 是 job 的 cwd。",
         "",
         "#   4) 內層真的在擋（**這一段不可省略**——裝上了不等於有在擋）。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- \\",
-        f"  /bin/sh -c 'echo x > /var/lib/{builder_account}/psc-714-PWN'",
-        "#      期望：非零，逐字 `Permission denied`（landlock 擋寫）。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- \\",
-        "  /bin/sh -c 'getent hosts api.openai.com'",
-        "#      期望：非零（seccomp 擋網路）。",
-        "#      ⚠️ 這兩條**任一**變成 rc=0 ⇒ 旗標被吃下去了但沙箱沒生效——那是最壞的",
+        "#",
+        "#      ⚠️ **每一條都要有成對的對照組。** 拿「寫 job HOME 被擋」當證據是**假的**",
+        "#      ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 會先回",
+        "#      `Read-only file system`，內層有沒有裝上完全看不出來。要證明內層在擋，被",
+        "#      擋的那一格必須是**外層允許**的那一格。",
+        "",
+        f"#      4a) 對照：**沒有**內層沙箱時，外層允許寫 {probe_workspace}",
+        f"{PATH_PROBE_HELPER} {stem} /bin/sh -c \\",
+        f"  'cd {probe_workspace} && : > psc-714-outer && echo OUTER_ALLOWS && "
+        "rm -f psc-714-outer'",
+        "#          期望：`OUTER_ALLOWS`、rc=0。",
+        "#      4b) **同一格**，帶內層沙箱 ⇒ 必須被擋。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/sh -c \\",
+        f"  'cd {probe_workspace} && : > psc-714-inner && echo INNER_LEAK'",
+        "#          期望：非零，逐字 `Permission denied`（landlock 擋寫）。",
+        "#          印出 `INNER_LEAK` ⇒ 旗標吃下去了但沙箱沒生效。",
+        "#      4c) 網路：帶內層沙箱 ⇒ 查不到名。",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/sh -c \\",
+        "  'getent hosts api.openai.com'",
+        "#          期望：非零（seccomp 擋網路）。",
+        "#      4d) 對照：**沒有**內層沙箱時查得到（外層的 RestrictAddressFamilies 放行",
+        "#          AF_INET，所以這一條 rc=0 才代表 4c 的失敗真的來自內層）。",
+        f"{PATH_PROBE_HELPER} {stem} /bin/sh -c 'getent hosts api.openai.com'",
+        "#          期望：rc=0，印出 A 記錄。",
+        "#      ⚠️ 4b／4c **任一**變成 rc=0（而對照組正常）⇒ 內層沒生效——那是最壞的",
         "#      狀態（看起來一切正常，實際少一層），比整個起不來還難發現。",
         "",
     ]
