@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from typing import Callable
 
 from .runtime import resolve_project_config_root, resolve_run_root, resolve_runtime_root
 
@@ -133,58 +134,97 @@ def gate_ledger_spool_root() -> Path:
     return coordinator_root() / GATE_LEDGER_SPOOL_DIRNAME
 
 
-#: `planning_job_log_spool_root()` 在 `review_verdict_spool_root()` 底下的目錄名。
+#: `job_log_spool_root("reviewer")` 在 `review_verdict_spool_root()` 底下的目錄名。
 #: 獨立成常數的理由與 `REVIEW_VERDICT_SPOOL_DIRNAME` 逐字相同（R1 登記表的「重複
 #: 路徑推導」Scenario 要求單一真相）。
 PLANNING_JOB_LOG_SPOOL_DIRNAME = "planning-logs"
 
+#: `job_log_spool_root("builder")` 在 `commit_spool_root()` 底下的目錄名（#708）。
+BUILD_JOB_LOG_SPOOL_DIRNAME = "build-logs"
 
-def planning_job_log_spool_root() -> Path:
-    """#686（#672 票 E）：降權 planning job 的**輸出通道**根。
+#: `job_log_spool_root("gate")` 在 `gate_ledger_spool_root()` 底下的目錄名（#708）。
+GATE_JOB_LOG_SPOOL_DIRNAME = "gate-logs"
 
-    planning 搬上 `cortex-reviewer-job@.service` 之後，模型的 stdout 不再由
-    `subprocess.run(capture_output=True)` 取回——job 跑在另一個 UID、另一個 mount
-    namespace 的加固面下，Manager 唯一拿得到輸出的方式是「job 寫得進、Manager 讀得到」
-    的一格落點（design D-i／D3）。
+#: **降權 job principal → (該 principal 既有的輸出通道, 掛在它底下的目錄名)。**
+#:
+#: 這是 #708 那條規則的 path 側一半：**凡經模板 unit 派出的 job，shim 都會在接管
+#: stdio 之前 `os.open()` 它的 log**（`coordinator/job_shim.py:_take_over_stdio`），
+#: 因此每個降權 principal 都必須有一個它寫得進去的 log 落點——否則那個 job 死在
+#: 「它能記錄失敗之前」，Manager 端只看得到 `78/CONFIG`。
+#:
+#: **每一列的通道都是既有的，不新開。** #686 為 planner 做這件事時的論證逐字適用於
+#: 另外兩個（完整說明見 :func:`job_log_spool_root`）：掛在該 principal
+#: 今天**唯一**既是 Manager-owned、又對它開放寫入的落點底下，於是
+#: `permgen.read_write_paths()` 的 `_minimize()` 把它從模板 unit 的 `ReadWritePaths=`
+#: 吃掉 ⇒ **可寫面逐字不變、default ACL 自動繼承、零部署動作**。
+#:
+#: - `builder` → `commit-spool`（成果 bundle 的 per-job spool，#623／#634）
+#: - `reviewer` → `review-verdict-spool`（#599／#638；planning 的通道，#686）
+#: - `gate` → `gate-ledger-spool`（#629 的 ledger 交付通道）
+#:
+#: **本表與 `trust_root.registry.JOB_LOG_SPOOLS` 是成對契約**（比照
+#: `job_spec_spool_for()` 與 `permgen.PathLayout.job_spec_spool_for()`）：本模組
+#: 刻意不 import `trust_root`（path 契約對治理平面零依賴），因此兩邊各有一份字面量，
+#: 由 `tests/test_job_log_spool_708.py` 逐列釘住相等。
+_JOB_LOG_SPOOL_CHANNELS: dict[str, tuple[Callable[[], Path], str]] = {
+    "builder": (commit_spool_root, BUILD_JOB_LOG_SPOOL_DIRNAME),
+    "reviewer": (review_verdict_spool_root, PLANNING_JOB_LOG_SPOOL_DIRNAME),
+    "gate": (gate_ledger_spool_root, GATE_JOB_LOG_SPOOL_DIRNAME),
+}
 
-    ## 為什麼掛在 `review_verdict_spool_root()` **底下**而不是自己一個根
 
-    design D3 的第一句是「**不新開通道**」，U-3 更把「新開一條 job→Manager 的寫入面」
-    明列為**未決、待 operator 裁決**的事項。`cortex-reviewer-planner` 今天**唯一**
-    既是 Manager-owned、又對它開放寫入的落點就是 review verdict spool
-    （`user:cortex-reviewer-planner:wx`、default ACL 會傳給子項）。掛在它底下因此：
+def job_log_spool_root(principal_id: str) -> Path:
+    """#708：**該降權 principal 專屬**的 job log spool 根。
+
+    `principal_id` 是 `trust_root.registry.Principal` 的 `value`（`builder`／
+    `reviewer`／`gate`），由登記表機械導出；形狀驗證與
+    :func:`job_spec_spool_for` 共用同一條 regex——這兩個值都會被接進絕對路徑，
+    容忍 `..`／`/` 等於把「log 一定落在 Manager-owned 樹裡」交給呼叫端自律。
+
+    表上查無這個 principal 時 **fail-closed**（不猜、不落回預設）：猜出來的路徑
+    會讓 permgen 對一條不存在的 ACL 出命令、而 job 在實機上以 `78/CONFIG` 收場
+    ——那正是 #657 與本票各買過一次的失效模式。
+
+    ## 為什麼掛在既有通道**底下**而不是自己一個根（#686 的原始論證，逐字適用三格）
+
+    #686 design D3 的第一句是「**不新開通道**」，U-3 更把「新開一條 job→Manager 的
+    寫入面」明列為**未決、待 operator 裁決**的事項。每個降權帳號今天**唯一**既是
+    Manager-owned、又對它開放寫入的落點就是它自己那條輸出通道
+    （`user:<帳號>:wx`、default ACL 會傳給子項）。掛在它底下因此：
 
     1. **不新增任何寫入面**——那個帳號本來就寫得進這棵樹，多的只是它自己那一格；
-    2. **不需要任何部署動作**——`read_write_paths()` 的 `_minimize()` 會把被涵蓋的
-       子路徑吃掉，模板 unit 的 `ReadWritePaths=` 逐字不變，default ACL 自動繼承；
-    3. 仍是**登記表資產**（`planning-job-log-spool`）——它有自己的 note、自己的
-       writer／reader 面、自己的 ACL 命令，治理面沒有因為省了一條 RWP 而消失。
+    2. **不需要任何部署動作**——`permgen.read_write_paths()` 的 `_minimize()` 會把被
+       涵蓋的子路徑吃掉，模板 unit 的 `ReadWritePaths=` 逐字不變，default ACL 自動繼承；
+    3. 仍是**登記表資產**——各自有 note、writer／reader 面、ACL 命令，治理面沒有因為
+       省了一條 RWP 而消失。
 
-    真正**不能**沿用的是 launcher 那條 reviewer log 路徑（`<log_dir>/<slice>.jsonl`，
-    實機解到 `/var/lib/cortex/runtime/review/<slice>/`）：它既不在模板 unit 的
-    `ReadWritePaths=` 內，Manager 自己也建不出那層目錄（`/var/lib/cortex/runtime`
-    是 root-owned 0755）。design D3 寫的「reviewer 已在用同一條通道」在本機**不成立**
-    ——實機 `job-specs/reviewer/` 是空的，那條路從未被真正走過（見 #686 PR body）。
+    真正**不能**沿用的是既有的 Manager dispatch log 目錄（builder 是
+    `<coordinator_root>/logs/workflow/`，reviewer 是 `<agents_root>/runtime/review/`）：
+    前者住著 gate ledger 與 exit sentinel（開放它等於把 #604 的作者性保證賣掉），
+    後者 Manager 自己都建不出那層目錄（`/var/lib/cortex/runtime` 是 root-owned 0755）。
 
     ## per-invocation 那一格的形態
 
-    每次呼叫在 `<此根>/<instance>/` 有且只有自己那一格（生命週期走
-    `coordinator/spool_slot.py`，與另外兩個 spool 同一份實作），log 檔由 **Manager
-    預先建立**（mode `0620`），job 只是以 `O_APPEND` 接管它。
-
-    理由是 #638 缺陷 2——job 自己建的檔由 job 擁有、又帶 unit 的 `UMask=0077`，Manager
-    是**目錄**的 owner 但那不給檔案內容的讀取權。verdict／commit 兩個 spool 靠
-    producer 自己 `chmod 0644` 繞過（`spool_slot.publish_file_command`），那需要在模型
-    之後再跑一段 wrapper；而 planning 的 job **刻意只有模型 argv 一段**（design D3：
-    wrapper 自產的任何文字都會污染 `_extract_json` 的輸入），沒有可以掛 publish 的
-    位置。改由 Manager 先建檔就同時解掉兩件事：檔案 owner 恆為 Manager（讀得到），
-    job 只獲得繼承自 default ACL 的 `w`（寫得進、換不掉、刪不掉——它對那一格沒有 `w`）。
-
-    `0620` 不是隨手挑的：POSIX ACL 下新檔的 `mask` 由 open(2) 的 mode 參數之 group 位
-    夾擠。用 `0600` 建檔會把繼承來的 `user:<planner>:-wx` 壓成 `#effective:---`
-    （＝#638 缺陷 1 的同一個機制），job 於是連 append 都不行。
+    每次派工在 `<此根>/<key>/` 有且只有自己那一格（生命週期走
+    `coordinator/spool_slot.py`，與三個 spool 同一份實作），log 檔由 **Manager 預先
+    建立**（mode `0620`，見 `spool_slot.JOB_LOG_FILE_MODE`），job 只是以 `O_APPEND`
+    接管它——理由與那個 mode 的完整論證見該常數。
     """
-    return review_verdict_spool_root() / PLANNING_JOB_LOG_SPOOL_DIRNAME
+
+    name = str(principal_id or "").strip()
+    if not _SPOOL_PRINCIPAL_RE.match(name):
+        raise ValueError(
+            f"principal id 不合法（只允許 ^[a-z][a-z0-9-]*$）: {principal_id!r}"
+        )
+    channel = _JOB_LOG_SPOOL_CHANNELS.get(name)
+    if channel is None:
+        raise ValueError(
+            f"principal {name!r} 沒有登記 job log spool 通道——"
+            "凡經模板 unit 派出的 job 都要寫 log，因此每個降權 principal 都必須在 "
+            "`_JOB_LOG_SPOOL_CHANNELS` 上有一列（#708）。"
+        )
+    channel_root, dirname = channel
+    return channel_root() / dirname
 
 
 #: `planning_scratch_root()` 在 `coordinator_root()` 底下的目錄名（同上，單一真相）。

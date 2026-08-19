@@ -1554,7 +1554,35 @@ class SubprocessLauncher:
             # 降權模式在這點上比 direct 更緊）。
             popen_kwargs["stdin"] = subprocess.DEVNULL
         log_mode = "wb"
+        job_log_path = log_path
         if template_plan is not None:
+            # #708：**先把 job 端的 log 落點準備好，再寫 spec。**
+            #
+            # 在此之前 spec 的 `log_path` 就是 Manager 的 dispatch log 路徑
+            # （`<log_dir>/<slice>.jsonl`），而那個目錄是 `0700 cortex-manager`、
+            # 零具名 ACL ⇒ shim 在**接管 stdio 之前**的 `os.open()` 直接 EACCES，
+            # job 連一行 log 都寫不出來就以 `78/CONFIG` 收場（實機 0819）。
+            # 那一層刻意不開放：gate ledger 與 exit sentinel 住在同一個目錄，開放
+            # 它等於把 #604 的作者性保證賣掉。
+            #
+            # 改成寫進 builder 自己的 log spool（登記表資產 `build-job-log-spool`，
+            # 掛在既有的 `commit-spool` 底下 ⇒ 模板 unit 的 `ReadWritePaths=` 逐字
+            # 不變），Manager 那條路徑則以 **hard link** 指向同一個 inode——
+            # `log_path` 這個字面量、sentinel／gate ledger／spool key 的推導、
+            # harvest 與 usage 抽取因此**一個位元組都沒有變**。
+            #
+            # **落點由角色決定，不是寫死 builder**：launcher 同時派 builder 與
+            # reviewer 兩種 job（`_job_role()`），兩者走不同的模板 unit、不同的帳號，
+            # 因此也是不同的一條既有輸出通道。對應關係在
+            # `job_runner.JobRoleConfig.log_spool_principal`（與
+            # `registry.JOB_LOG_SPOOLS` 成對），不在這裡推導。
+            job_log_path = str(
+                job_workspace.prepare_job_log_spool(
+                    principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
+                    spool_key=slice_id,
+                    manager_log_path=log_path,
+                )
+            )
             # B 案：per-job 參數走 Manager-owned spec 檔（job 帳號唯讀），不走 argv
             # ——模板 unit 的 ExecStart= 是固定的，Manager 給不了命令列。
             # `User=` 刻意**不在** spec 內：身分只有 root-owned unit 檔一個來源。
@@ -1564,7 +1592,7 @@ class SubprocessLauncher:
                 unit=template_plan.unit,
                 command=argv,
                 working_directory=worktree,
-                log_path=log_path,
+                log_path=job_log_path,
                 env=env,
             )
             job_runner.write_job_spec(
@@ -1588,10 +1616,12 @@ class SubprocessLauncher:
             popen_kwargs["cwd"] = None
             popen_kwargs["stdin"] = subprocess.DEVNULL
             # log 由 shim 在降權後以 O_APPEND 接管（unit 沒有 --pipe、也刻意不用
-            # StandardOutput=append:，理由見 job_runner 模組 docstring）。這裡先把
-            # 上一輪殘留截掉，再以 append 開檔——否則 systemctl client 的非 O_APPEND
-            # fd 會在 shim 已經寫了幾 KB 之後從 offset 0 覆蓋回去。
-            Path(log_path).write_bytes(b"")
+            # StandardOutput=append:，理由見 job_runner 模組 docstring）。上一輪的
+            # 殘留已經由 `prepare_job_log_spool()` 整格重建掉（新 inode、新 hard
+            # link），因此這裡不再需要 `write_bytes(b"")`——**而且不能再截一次**：
+            # 那會在 job 端與 Manager 端之間多一個「誰先動 offset」的競態。
+            # 以 append 開檔的理由不變：systemctl client 的非 O_APPEND fd 會在 shim
+            # 已經寫了幾 KB 之後從 offset 0 覆蓋回去。
             log_mode = "ab"
         with open(log_path, log_mode) as logf:
             popen_kwargs["stdout"] = logf
@@ -1605,6 +1635,10 @@ class SubprocessLauncher:
                 unit=template_plan.unit,
                 account=template_plan.account,
                 log_path=log_path,
+                # #708 第 3 項：shim 在**接管 log 之前**的失敗只進 unit journal，
+                # 而 Manager 讀不到那份 journal。它改為在 job 自己的 log spool 那一格
+                # 留一筆機器可讀的紀錄，這裡把它撿回錯誤訊息裡。
+                job_log_path=job_log_path,
                 timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
                 manager_authored_sentinel=True,
             )

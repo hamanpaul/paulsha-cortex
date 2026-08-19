@@ -190,6 +190,7 @@ __all__ = [
     "preflight_systemd_template",
     "prepare_systemd_run",
     "prepare_systemd_template",
+    "read_shim_error",
     "reject_unsafe_env",
     "resolve_hardening_profile",
     "resolve_job_account",
@@ -376,6 +377,15 @@ class JobRoleConfig:
     #: shim 讀端），由 `trust_root.permgen` 機械產出。
     spec_spool_env: str
     default_spec_spool: str
+    #: #708：本角色的 job log 落在哪一個 principal 的 log spool（`config.paths.
+    #: job_log_spool_root()` 的引數，＝`trust_root.registry.Principal` 的 `value`）。
+    #:
+    #: **不是** `role_id`：角色字幹是 `review`，principal 是 `reviewer`——兩者恰好
+    #: 不同，而「恰好不同」正是不能靠字串推導的理由。與
+    #: `registry.JOB_LOG_SPOOLS` 是**成對契約**（本模組刻意不 import `trust_root`，
+    #: 同 `DEFAULT_TEMPLATE_UNIT` 的既有模式），由
+    #: `tests/test_job_log_spool_708.py` 釘住兩邊逐列相等。
+    log_spool_principal: str
     #: 這個角色是誰、為什麼要獨立一份（進錯誤訊息與產物註解）。
     rationale: str
 
@@ -393,6 +403,7 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             default_template=DEFAULT_TEMPLATE_UNIT,
             spec_spool_env=JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_JOB_SPEC_SPOOL,
+            log_spool_principal="builder",
             rationale=(
                 "builder persona——唯一會在自己完全掌控的工作區裡跑 untrusted repo "
                 "code 的角色，攻擊面最大。M1（#603／#584）已落地。"
@@ -407,6 +418,7 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             path_env=REVIEWER_PATH_ENV,
             template_env=REVIEW_TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_REVIEW_TEMPLATE_UNIT,
+            log_spool_principal="reviewer",
             spec_spool_env=REVIEW_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_REVIEW_JOB_SPEC_SPOOL,
             rationale=(
@@ -432,6 +444,7 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             path_env=GATE_PATH_ENV,
             template_env=GATE_TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_GATE_TEMPLATE_UNIT,
+            log_spool_principal="gate",
             spec_spool_env=GATE_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_GATE_JOB_SPEC_SPOOL,
             rationale=(
@@ -2055,6 +2068,7 @@ def confirm_template_instance_started(
     unit: str,
     account: str,
     log_path: str | None = None,
+    job_log_path: str | None = None,
     timeout_ms: int = DEFAULT_START_TIMEOUT_MS,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
@@ -2084,7 +2098,7 @@ def confirm_template_instance_started(
         (
             f"模板實例 {unit} 未能起動（systemctl exit={status}；常見原因：polkit 拒絕、"
             f"模板 unit 未安裝、shim 讀 spec 失敗——後者的逐字原因在 journal："
-            f"`journalctl -u {unit}`）{_log_tail(log_path)}"
+            f"`journalctl -u {unit}`）{read_shim_error(job_log_path)}{_log_tail(log_path)}"
         ),
         source="confirm_template_instance_started",
         unit=unit,
@@ -2126,6 +2140,40 @@ def _unit_is_active(systemctl: str, unit: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return completed.returncode == 0
+
+
+def read_shim_error(job_log_path: str | None, *, limit: int = 400) -> str:
+    """撿回 shim 在**接管 log 之前**留下的那一筆機器可讀失敗紀錄（#708 第 3 項）。
+
+    在此之前，這一族失敗（instance 名非法、spec 缺席／schema 不合、`PATH` 兩層皆缺、
+    **log 開不起來**）的逐字原因只進 unit journal，而 Manager 帳號讀不到那份 journal
+    ——它看得到的只有 `systemctl exit=1`。shim 現在把同一段訊息另外寫進 job 自己那一格
+    log spool（`job_shim.SHIM_ERROR_FILENAME`），本函式把它接回錯誤訊息。
+
+    `job_log_path` 是 **job 端**的 log 路徑（spec 裡那一條），不是 Manager 的 harvest
+    路徑——紀錄落在 job 寫得進去的那一格，而 Manager 恰好也是那一格的 owner。
+
+    讀不到／格式不符一律回空字串：診斷用的補充資訊不該反過來變成新的失敗來源，
+    而且這份紀錄由 job 帳號寫 ⇒ **可被偽造，不進任何採信路徑**，只用來指路。
+    """
+
+    if not job_log_path:
+        return ""
+    from .job_shim import SHIM_ERROR_FILENAME, SHIM_ERROR_SCHEMA
+
+    try:
+        raw = (Path(job_log_path).parent / SHIM_ERROR_FILENAME).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        record = json.loads(raw)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(record, dict) or record.get("schema") != SHIM_ERROR_SCHEMA:
+        return ""
+    detail = str(record.get("error") or "").strip()
+    if not detail:
+        return ""
+    return f"；shim 回報（job 端紀錄，僅供排查）: {detail[:limit]}"
 
 
 def _log_tail(log_path: str | None, *, limit: int = 200) -> str:

@@ -32,6 +32,7 @@ from unittest import mock
 
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.job_shim as job_shim
+import paulsha_cortex.coordinator.job_workspace as job_workspace
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.config import paths as config_paths
 from paulsha_cortex.coordinator.job_runner import JobRunnerError
@@ -831,7 +832,19 @@ class JobSpecContentTests(unittest.TestCase):
         self.assertEqual(spec["spec_version"], job_runner.JOB_SPEC_VERSION)
         self.assertEqual(spec["command"][:2], ["bash", "-c"])
         self.assertEqual(spec["working_directory"], ctx["root"])
-        self.assertEqual(spec["log_path"], ctx["log_path"])
+        # #708：spec 的 `log_path` 不再是 Manager 的 dispatch log 路徑（那個目錄對
+        # builder 連 traverse 都不開放，shim 當場 EACCES），改成 builder 自己那一格
+        # log spool。Manager 端的 `<log_dir>/<slice>.jsonl` 以 hard link 指向同一個
+        # inode，因此 harvest 面逐字不變——由
+        # `HarvestCompatibilityTests.test_log_and_sentinel_paths_are_unchanged` 釘住。
+        self.assertNotEqual(spec["log_path"], ctx["log_path"])
+        self.assertTrue(
+            str(spec["log_path"]).endswith(
+                f"{config_paths.BUILD_JOB_LOG_SPOOL_DIRNAME}/psc-0042-template/"
+                f"{job_workspace.JOB_LOG_FILENAME}"
+            ),
+            spec["log_path"],
+        )
         # #679：spec 的 PATH 來自 `PSC_BUILDER_PATH`，**不是** daemon 的 PATH。
         self.assertEqual(spec["env"]["PATH"], _BASE_ENV["PSC_BUILDER_PATH"])
         self.assertNotEqual(spec["env"]["PATH"], _BASE_ENV["PATH"])
@@ -1061,22 +1074,52 @@ class TemplateFailFastTests(unittest.TestCase):
 
 class HarvestCompatibilityTests(unittest.TestCase):
     def test_log_and_sentinel_paths_are_unchanged(self) -> None:
+        """#708：**Manager 端的 log／sentinel 路徑逐字不變，spec 那一條改指 spool。**
+
+        既有斷言 `spec["log_path"] == <log_dir>/<slice>.jsonl` 在 #708 之後**必須**
+        改：那個目錄是 `0700 cortex-manager`、零具名 ACL，shim 在接管 stdio 之前的
+        `os.open()` 直接 EACCES（實機 `78/CONFIG`），而那一層刻意不開放——gate ledger
+        與 exit sentinel 住在同一個目錄（#604）。
+
+        本測試要守的性質沒有變，只是換成更強的那個寫法：Manager 端的
+        `<log_dir>/<slice>.jsonl` 仍然存在、且與 spec 的 `log_path` 是**同一個
+        inode**（hard link）。harvest／`usage_extractors`／`_log_tail` 因此讀到的是
+        job 真正寫出來的內容，而不是一份要同步的複本。
+        """
+
         popen = _RecordingPopen()
         with tempfile.TemporaryDirectory() as d:
             ctx = _launch_template(SubprocessLauncher("codex"), popen=popen, workdir=d)
             spec = _only_spec(ctx["spool"])
-        # harvest（`dispatcher.poll_headless_done` → `_read_exit_sentinel`）讀的是
-        # `<log_dir>/<slice>.jsonl` 與同名 `.exit`——兩者都必須與 direct 模式一致。
+            manager_log = Path(ctx["log_dir"]) / "psc-0042-template.jsonl"
+            # harvest（`dispatcher.poll_headless_done` → `_read_exit_sentinel`）讀的是
+            # `<log_dir>/<slice>.jsonl` 與同名 `.exit`——兩者都必須與 direct 模式一致。
+            self.assertTrue(manager_log.is_file())
+            job_log = Path(str(spec["log_path"]))
+            self.assertTrue(job_log.is_file())
+            # 同一個 inode：不是複製、不需要同步，也沒有「job 在寫但 Manager 看到舊
+            # 內容」的中間狀態。
+            self.assertEqual(job_log.stat().st_ino, manager_log.stat().st_ino)
+            # job 端那一條落在 builder 自己的 log spool（`build-job-log-spool`）裡，
+            # 而**不是** Manager 的 dispatch log 目錄。
+            self.assertNotEqual(job_log.parent, manager_log.parent)
+            self.assertIn(config_paths.BUILD_JOB_LOG_SPOOL_DIRNAME, str(job_log))
         sentinel = str(Path(ctx["log_dir"]) / "psc-0042-template.exit")
-        self.assertEqual(spec["log_path"], str(Path(ctx["log_dir"]) / "psc-0042-template.jsonl"))
         # #604：**路徑不變，作者改變**。sentinel 現在由 Manager 側的 exit 記帳 shell
         # 寫（`popen` 的 argv），job spec 的 command 內不得再出現它——那個目錄是
         # `0700 cortex-manager`，job 寫進去只會 EROFS，而且那本來就是自報。
         self.assertIn(sentinel, popen.call["argv"][2])
         self.assertNotIn(sentinel, spec["command"][2])
+        # #708：spec 也不得再提到 Manager 的 dispatch log 目錄——那正是原症狀。
+        self.assertNotIn(str(Path(ctx["log_dir"])), str(spec["log_path"]))
 
     def test_log_file_is_truncated_then_appended(self) -> None:
-        """systemctl client 用 append fd，避免蓋掉 shim 已經寫進去的內容。"""
+        """systemctl client 用 append fd，避免蓋掉 shim 已經寫進去的內容。
+
+        #708：上一輪殘留的清除機制換了（不再是對 Manager 那條 `write_bytes(b"")`，
+        而是 `prepare_job_log_spool()` 整格重建 ＋ 重新 hard link 一個新 inode），
+        但**外部可觀察的行為逐字不變**——本測試因此一個字都沒改，它守的正是那件事。
+        """
         with tempfile.TemporaryDirectory() as d:
             log_dir = Path(d) / "logs"
             log_dir.mkdir(parents=True)

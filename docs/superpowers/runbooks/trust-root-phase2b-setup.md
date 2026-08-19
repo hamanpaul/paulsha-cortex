@@ -384,6 +384,18 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   runbook 4e 甚至逐字預言了症狀、版本號都對上了，但那條驗證是 `sudo -u … env PATH=…`
   跑的。這是「綠燈不承載語意」的第五個實例，且是新的一類：複本比 production **多**。
   → **57** 個 sudo 點、**219** 個驗證點。
+- **#708（builder／gate 的 job log 目錄沒有寫入授權）新增**：新增
+  **4e-2d「三個降權 principal 的 job log spool」**（遷移三條容器 ＋ 三條 `getfacl`
+  形狀驗證 ＋ 三份 unit 的 RWP 逐字不變 ＋ **反向不變式** `trust_root job-log-probe`
+  ＋ 真實派工 smoke 的 inode 比對）。**起因**：`job_shim._take_over_stdio()` 在
+  **接管 stdio 之前**就 `os.open(log_path)`，而 builder 的 log 落在 Manager 的
+  dispatch log 目錄（`0700 cortex-manager`、零具名 ACL）⇒ 0819 define 首次收斂、
+  builder job 第一次由 daemon 經正規路徑派出來就當場 `78/CONFIG`，**連一行 log 都
+  寫不出來**。#686（票 E）已為 planner 做過同一件事但只做了那一格；#708 起三格由
+  `registry.JOB_LOG_SPOOLS` 一條規則導出，缺一格模組**載不起來**。
+  M1 的正向驗證之所以沒抓到，是因為當時 operator **手工組 spec、log 路徑自己挑**
+  ——與 #645 逐字同型（本探針因此改由 `spool_slot.prepare_job_log()` 本人建那一格）。
+  → **59** 個 sudo 點、**227** 個驗證點。
 
 ---
 
@@ -2480,6 +2492,105 @@ psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/agy \
 **回滾**：`sudo rm -f /var/lib/cortex-reviewer-planner/.{gemini,claude}` ＋
 `sudo rm -rf /var/lib/cortex-reviewer-planner/cache/{gemini,claude}`。
 （回滾之後降權 planning 與 reviewer job 都會退回「沒有登入態」的狀態，不是壞掉。）
+
+#### 4e-2d. 三個降權 principal 的 **job log spool**（#708）
+
+> **這一步是實機遷移，operator 執行。** 它補的是 `#686` 只做了 planner 那一格所留下
+> 的兩個洞：`builder` 與 `gate`。0819 實機症狀——define 首次收斂、builder job 第一次
+> 由 daemon 經正規路徑派出來，**當場死在 shim 開 log 之前**：
+>
+> ```
+> $ journalctl -u cortex-job-jit@wf-…-worktree-isolation-1-….service
+> cortex-job-shim: 開不了 job log
+>   /var/lib/cortex/coordinator/logs/workflow/wf-….jsonl: [Errno 13] Permission denied
+> ```
+>
+> 根因是 `job_shim._take_over_stdio()` 在**接管 stdio 之前**就 `os.open()`，而那個
+> 目錄是 `0700 cortex-manager`、零具名 ACL ⇒ **失敗發生在它能記錄失敗之前**。
+>
+> **那一層刻意不開放**：gate ledger（`<slice>.gates.json`）與 exit sentinel
+> （`<slice>.exit`）住在同一個目錄，#604 的整個保證就是它們由 Manager 寫、採信端以
+> `foreign_evidence_author()` 檢查擁有者。修法因此是把 **log 搬到該 principal 既有的
+> 輸出通道底下**，Manager 端那條 harvest 路徑以 **hard link** 指向同一個 inode
+> ——`log_path` 的字面量、sentinel／ledger／spool key 的推導**一個位元組都沒有變**。
+
+| principal | 帳號 | 既有輸出通道 | log spool（登記表資產） |
+| --- | --- | --- | --- |
+| `builder` | `cortex-builder` | `commit-spool` | `<coordinator>/commit-spool/build-logs`（`build-job-log-spool`） |
+| `reviewer` | `cortex-reviewer-planner` | `review-verdict-spool` | `<coordinator>/review-verdicts/planning-logs`（`planning-job-log-spool`，#686 已存在，**零遷移**） |
+| `gate` | `cortex-gate` | `gate-ledger-spool` | `<coordinator>/gate-ledger-spool/gate-logs`（`gate-job-log-spool`） |
+
+**遷移命令**（三條容器；per-job 那一格由 Manager 在 dispatch 當下建，不要手工預建）：
+
+```bash
+# 由產生器出，不要手抄——三行 install/chown/chmod ＋ 兩行 setfacl 都是機械導出的
+python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
+  | grep -A4 -E '^# \[TIER_0\] (build|gate)-job-log-spool'
+#   把上面印出來的那幾行以 `sudo sh -e` 執行（與第 2b 步同一套流程）。
+```
+
+⚠️ **0818 踩過的三個陷阱在這一步同樣適用**（逐字重複，因為它們每一次都會再咬一口）：
+
+- `install -d` 對**既有 symlink** 會跟著連結走，把權限套到連結指向的地方。先
+  `ls -ld <目標>` 確認它不是 symlink（本步的三個目標都應該是**不存在**或真目錄）。
+- `cp -a src/. dst/` 會用**來源目錄**的 owner／mode／ACL 蓋掉目的地，而且**不報錯**。
+  本步沒有複製動作；若你為了保留舊 log 而想搬檔，用 `mv` 或逐檔 `cp -p`，
+  **不要** `cp -a` 整棵。
+- `ls -ld` 的 group `rwx` 在有具名 ACL 時顯示的是 **ACL mask**，不是 group 寫入權。
+  **驗證一律用 `getfacl`。**
+
+```bash
+# ✅ 驗證 1：形狀（容器 Manager-owned 0700 ＋ 該帳號一條 `wx` 無 `r` 的具名條目，
+#            **且 default ACL 存在**——per-job 那一格靠它繼承）
+sudo getfacl -p /var/lib/cortex/coordinator/commit-spool/build-logs
+#   期望含：user::rwx / user:cortex-builder:-wx / default:user:cortex-builder:-wx
+sudo getfacl -p /var/lib/cortex/coordinator/gate-ledger-spool/gate-logs
+#   期望含：user::rwx / user:cortex-gate:-wx / default:user:cortex-gate:-wx
+sudo getfacl -p /var/lib/cortex/coordinator/review-verdicts/planning-logs
+#   期望含：user::rwx / user:cortex-reviewer-planner:-wx / default:…（#686 已在）
+
+# ✅ 驗證 2：**零新增可寫面**——三份模板 unit 的 RWP 必須與遷移前逐字相同
+python3 -m paulsha_cortex.trust_root unit four-way --job        | grep '^ReadWritePaths='
+#   期望**恰好五條**（與 #708 issue body 逐字相同）：
+#     ReadWritePaths=/var/lib/cortex-builder/.codex
+#     ReadWritePaths=/var/lib/cortex-builder/cache
+#     ReadWritePaths=/var/lib/cortex/coordinator/commit-spool
+#     ReadWritePaths=/var/lib/cortex/monitor/event-spool
+#     ReadWritePaths=/var/lib/cortex/worktree/%i
+python3 -m paulsha_cortex.trust_root unit four-way --review-job | grep '^ReadWritePaths='
+python3 -m paulsha_cortex.trust_root unit four-way --gate-job   | grep '^ReadWritePaths='
+#   ⛔ 任何一份多出含 `-logs` 的路徑 ⇒ 那一格沒有掛在既有通道底下（`_minimize()` 吃
+#      不掉它）。回去看 `registry.JOB_LOG_SPOOLS`，**不要**就地改 unit。
+#   ⛔ 更不要因為驗證 3 紅了就把 `<coordinator>/logs/workflow` 加進 RWP——那會連
+#      gate ledger 與 exit sentinel 一起開放（#604）。
+
+# ✅ 驗證 3（**反向不變式**，跨 UID、零額外 env、真實加固面）
+#    整段由產生器出，逐字貼上跑；先貼第 4e-2 步的共用探針 psc_run_under。
+python3 -m paulsha_cortex.trust_root job-log-probe four-way
+#   它對每個 principal 出五段：
+#     1) 以 `spool_slot.prepare_job_log()`（**產品程式碼**，不是手工前置物）建一格；
+#     2) 正向：`psc_run_under <stem> … >> <log>` ⇒ rc=0；
+#     3) Manager `cat` 得回來 ⇒ 印出 JOB-LOG-WRITABLE（證明 0620 ＋ mask 的
+#        effective 位真的是 `w`，沒有被壓成 `#effective:---`＝#638 缺陷 1）；
+#     4) **反向**：同一個身分 append `<coordinator>/logs/workflow/…` ⇒ **必須非零**
+#        （`Read-only file system` 或 `Permission denied`）；
+#     5) 收乾淨。
+#   ⚠️ property 清單由 `permgen.unit_replica_properties()` 從**落檔的 unit** 全量導出。
+#      **不得**自行組 `--property=`、**不得**自帶 `--setenv=PATH=`（design D13）。
+
+# ✅ 驗證 4：真實派工 smoke（D13 caveat：psc_run_under 複製的是加固面，不是派工路徑）
+#    起一輪 build，確認 `<coordinator>/logs/workflow/<slice>.jsonl` **有內容**，
+#    且它與 job 那一格是同一個 inode。
+sudo -u cortex-manager stat -c '%i %n' \
+  /var/lib/cortex/coordinator/logs/workflow/<slice>.jsonl \
+  /var/lib/cortex/coordinator/commit-spool/build-logs/<slice>/job.jsonl
+#   期望：**兩行的 inode 號相同**。不同 ⇒ hard link 沒建起來（跨檔案系統？），
+#   而 `prepare_job_log_spool()` 對那個情況是 fail-closed 的，所以你不該看到這一幕。
+```
+
+**回滾**：`sudo rm -rf /var/lib/cortex/coordinator/commit-spool/build-logs
+/var/lib/cortex/coordinator/gate-ledger-spool/gate-logs` ＋ 退回上一版 cortex。
+（回滾之後 builder job 會退回 #708 的原症狀：`78/CONFIG`，job 一行 log 都寫不出來。）
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 
