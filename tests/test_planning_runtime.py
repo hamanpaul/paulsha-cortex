@@ -936,7 +936,17 @@ def test_tree_snapshot_covers_empty_directories_directory_links_and_modes(tmp_pa
     empty.mkdir()
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
 
-    empty.chmod(0o700)
+    # issue #723：這一段要驗的性質是「`_tree_snapshot` 抓得到 mode 變化」，
+    # 不是「0700 這個字面值」。原本寫死 `chmod(0o700)` 隱含「預設 umask 建出來
+    # 的目錄 mode ≠ 0700」——那在 operator 的一般 shell 成立，在任何
+    # `UMask=0077` 的 systemd unit（cortex-gate-job@.service 就是）底下
+    # `mkdir()` 建出來已經是 0700，chmod 因此變成 no-op，兩個雜湊逐字相同。
+    # 改成從實測到的 baseline_mode 翻轉一個位元導出，任何 umask（0077／022／0）
+    # 下都必然與現況不同；翻的是 other-execute，owner rwx 不動，走訪不受影響。
+    mutated_mode = baseline_mode ^ 0o001
+    assert mutated_mode != baseline_mode
+    empty.chmod(mutated_mode)
+    assert empty.lstat().st_mode & 0o7777 == mutated_mode
     assert planning_runtime._tree_snapshot(tmp_path) != baseline
     empty.chmod(baseline_mode)
     assert planning_runtime._tree_snapshot(tmp_path) == baseline
