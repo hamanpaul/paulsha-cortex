@@ -41,7 +41,12 @@ from . import worktree_reclaim
 from .spawn_admission import SpawnAdmissionLimiter, resolve_limiter, resolve_provider
 from .registry import RETRY_CARD_PHASE_PERSONA, slice_repin_eligible
 from ..config.paths import worktree_root_for
-from .claim import AuthorityValidationError, REASON_PROVIDER_RATE_LIMITED_CANONICAL, decomposition_route
+from .claim import (
+    AuthorityValidationError,
+    REASON_PROVIDER_RATE_LIMITED_CANONICAL,
+    decomposition_route,
+    needs_human_next_actions,
+)
 from . import model_resolution
 from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
 from .model_identities import (
@@ -65,10 +70,12 @@ from .planning import (
     run_heterogeneous_brainstorm,
 )
 from .workflow import (
+    BRAINSTORM_AUTHORITY_MISSING,
     WORKFLOW_PHASES,
     GateEvidenceRef,
     PlanningArtifactAuthority,
     WorkflowManifest,
+    brainstorm_authority_bound,
     validate_workflow_phase_transition,
 )
 
@@ -740,13 +747,41 @@ def workflow_status_entry(registry, run) -> dict[str, Any]:
         value = reason_payload.get("reason")
         if isinstance(value, str) and value:
             reason_code = value
-    next_actions: tuple[str, ...] = ()
+    # #728：`next_actions` 過去**只**由 `_phase_recovery_actions` 導出，而它只
+    # 涵蓋 build／verify／review（`registry.RETRY_CARD_PHASE_PERSONA`）；`plan`
+    # phase 的 needs_human run（現場：`planning-authority-reconciliation-failed`）
+    # 因此永遠拿到 `[]`，CLI 面無路可走。基礎集合改由
+    # `claim.needs_human_next_actions` 導出——與 `claim._resume_decision` 是**同一
+    # 個函式**，且它永遠至少含 `abandon`，這就是「不得再出現 next_actions: []」
+    # 的機械保證。`_phase_recovery_actions` 退回它原本的職責：**補**那些要看 job
+    # 層事實才判定得出來的動作（regenerate-gates／retry-card）。
+    hint_classification: str | None = None
+    try:
+        from .work_actions import _planning_failure_hint
+
+        hint = _planning_failure_hint(run)
+        if isinstance(hint, dict):
+            hint_classification = hint.get("classification")
+    except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
+        hint_classification = None
+    # 保底集合不依賴任何 registry／檔案讀取，因此上面的 except 分支也不會讓它變空。
+    next_actions: tuple[str, ...] = needs_human_next_actions(
+        phase=getattr(run, "current_phase", None),
+        planning_failure_classification=hint_classification,
+    )
     try:
         from .work_actions import _phase_recovery_actions
 
-        next_actions = _phase_recovery_actions(run, registry)
+        next_actions = (
+            *next_actions,
+            *(
+                item
+                for item in _phase_recovery_actions(run, registry)
+                if item not in next_actions
+            ),
+        )
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
-        next_actions = ()
+        pass
     return {
         "kind": "workflow_run",
         "run_id": run.run_id,
@@ -2888,8 +2923,13 @@ def _validated_brainstorm_planning_authority(
         else [ref for ref in run.gate_refs if ref.kind == "brainstorm"]
     )
     if not refs:
-        if run.brainstorm_required:
-            raise ValueError("workflow brainstorm evidence missing")
+        # #728：這條前置條件是 recover 與 reconciliation 的**共用**斷言，判準
+        # 只在 `workflow.brainstorm_authority_bound` 導出一次；
+        # `work_actions._recover_planning_action` 讀同一個函式決定它的出口
+        # phase，因此不會再造出一個「phase=plan 但沒有 brainstorm 背書」的
+        # 狀態（那正是本 issue 的死結來源）。
+        if not brainstorm_authority_bound(run):
+            raise ValueError(BRAINSTORM_AUTHORITY_MISSING)
         return run.planning_authority, run.planning_source_revision
     if len(refs) != 1 or refs[0] is None:
         raise ValueError("workflow brainstorm authority must be unique")
@@ -2901,7 +2941,7 @@ def _validated_brainstorm_planning_authority(
         or evidence_path.is_symlink()
         or not evidence_path.is_file()
     ):
-        raise ValueError("workflow brainstorm evidence missing")
+        raise ValueError(BRAINSTORM_AUTHORITY_MISSING)
     resolved_evidence = evidence_path.resolve()
     try:
         resolved_evidence.relative_to(evidence_root)
