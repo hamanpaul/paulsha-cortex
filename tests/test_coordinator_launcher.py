@@ -437,7 +437,8 @@ class ArgvTests(unittest.TestCase):
                 read_only=True,
             )
 
-            self.assertEqual(builder[builder.index("--sandbox") + 1], "workspace-write")
+            # #716 B 後半：寫入卡的 mode 是 danger-full-access（字面值刻意寫死當釘子）。
+            self.assertEqual(builder[builder.index("--sandbox") + 1], "danger-full-access")
             add_dirs = [
                 builder[index + 1]
                 for index, value in enumerate(builder)

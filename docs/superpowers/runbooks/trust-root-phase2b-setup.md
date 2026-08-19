@@ -2913,34 +2913,39 @@ sudo systemctl cat cortex-monitor.service | grep '^SystemCallFilter='
 #   ⛔ 只有一部分帶 ⇒ 落檔漂移（有人只重跑了一部分），回第 5-2 步全部重落。
 #   ⛔ 出現 `@mount`／`pivot_root` ⇒ 有人走了上表的路線 A。停下來——那不是本票的決定。
 
-# ✅ 驗證 1（**反向不變式**，四個方向缺一不可；#716 起改為 **per-mode 矩陣**）
+# ✅ 驗證 1（**反向不變式**，#716 起是 **per-mode 矩陣**；B 後半起分兩族）
 python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 #   ⚠️ **#716：mode 清單由 `registry.emitted_sandbox_modes()` 機械導出**，探針對
-#      `build_codex_argv` 會發出的**每一個** `--sandbox <mode>` 各跑一組 1)／3)。
-#      清單不含 `workspace-write` ⇒ 探針 0b 步當場停（那代表導出規則被改成只剩唯讀族，
-#      也就是 #715 假綠的原症狀）。**詳見 4e-2h。**
-#   ⚠️ **每一條命令都必須帶 `-c sandbox_mode=`**：`codex sandbox` **忽略 `config.toml`
-#      裡的 `sandbox_mode`**，只吃 `-c` 覆寫（0819 實測：config 寫 workspace-write 不帶
-#      `-c` → rc=0 什麼都沒驗到）。把 `-c` 拿掉＝什麼都沒驗。
+#      `build_codex_argv` 會發出的**每一個** `--sandbox <mode>` 各跑一組檢查。
+#      B 後半（4e-2j）起清單是 `read-only`＋`danger-full-access`；清單只剩唯讀族
+#      ⇒ 探針 0b 步當場停（那代表導出規則被改壞，也就是 #715 假綠的原症狀）。
+#      **詳見 4e-2h／4e-2j。**
+#   ⚠️ **凡走 `codex sandbox` 的命令都必須帶 `-c sandbox_mode=`**：`codex sandbox`
+#      **忽略 `config.toml` 裡的 `sandbox_mode`**，只吃 `-c` 覆寫（0819 實測：config
+#      寫 workspace-write 不帶 `-c` → rc=0 什麼都沒驗到）。把 `-c` 拿掉＝什麼都沒驗。
 #   它產生的命令（全部走 `psc_run_under`，一行 `--property=` 都不自組）：
-#     1) **負向對照**（每個 mode 各一條）：不帶旗標時 codex 的預設形態必須**仍然失敗**，
-#        逐字 `Can't read /proc/sys/kernel/overflowuid`。rc=0 ⇒ 有人放寬了 `ProcSubset`，
-#        本票的整個論證失效——**停下來查清楚**，不要因為「反正也是綠的」就放過。
+#     1) **負向對照**（附掛內層的 mode＝read-only 族，各一條）：不帶旗標時 codex 的
+#        預設形態必須**仍然失敗**，逐字 `Can't read /proc/sys/kernel/overflowuid`。
+#        rc=0 ⇒ 有人放寬了 `ProcSubset`，本票的整個論證失效——**停下來查清楚**，
+#        不要因為「反正也是綠的」就放過。
 #     2) **旗標還在**：不得回 `Error: Unknown feature flag: use_legacy_landlock`。
 #        ⚠️ 這條是本探針存在的**主要**理由——旗標名帶 `legacy`，那是對 codex 某一版的
 #        觀察，不是不變式。上游拿掉它時 codex 以非零收場（吵的失敗，不是靜默少一層）。
-#     2b) **早期警報**：到**最近一次真實派工的 job log** 裡 grep 那句 deprecation。
+#     2b) **早期警報**：到**最近一次 read-only 族真實派工的 job log** 裡 grep 那句
+#        deprecation。
 #        ⚠️ `codex sandbox` 子命令**不印**那句話（0819 實測），只有 `exec --json` 會把它
 #        當一筆 `item.type=error` 放進串流——拿 `sandbox` 的輸出去 grep 只會得到一個
 #        看起來很安心、其實什麼都沒驗到的「沒有 deprecation 訊息」。
-#     3) **正向**（每個 mode 各一條）：帶旗標 rc=0。
-#        ⚠️ **`workspace-write` 那一列今天是紅的**（0819 實機、真實加固面複本、42 條
-#        property）：`panic rc=101` ＋ `linux_run_main.rs:318:9` ＋ 逐字
-#        `permission profiles requiring direct runtime enforcement are incompatible
-#        with --use-legacy-landlock`。**那條紅代表 #716 的寫入卡那一半未解**，不是回歸。
-#        **不得**為了讓它變綠而放寬判準（拿掉 `-c` 就會變綠——那正是 #715 的假綠）。
-#     4) **真的在擋**，且**每一條都配一個對照組**：同一格路徑在沒有內層沙箱時
-#        寫得進去（`OUTER_ALLOWS`）、帶了內層沙箱就 `Permission denied`；
+#        ⚠️ **B 後半起寫入卡的 log 不該再有這句**——在寫入卡的 log 看到它是回歸
+#        （旗標漏回了寫入卡的 argv），不是警報。
+#     3) **正向**（read-only 族，各一條）：帶旗標 rc=0。
+#     a/b) **`danger-full-access` 那一列**（B 後半，4e-2j）：**沒有內層沙箱**，不拿
+#        `codex sandbox` 驗它（rc=0 只證明「沒有沙箱」）。改驗 (a) 命令執行得了
+#        （`PSC-716-EXEC-OK`、rc=0）與 (b) **出口管制在**（`/usr/bin/env -u
+#        HTTPS_PROXY … socket.create_connection(("1.1.1.1",443))` 必須 `TimeoutError`）
+#        ——(b) 是該列**僅存**的網路防線，缺了它就是假綠。
+#     4) **真的在擋**（read-only 族），且**每一條都配一個對照組**：同一格路徑在沒有
+#        內層沙箱時寫得進去（`OUTER_ALLOWS`）、帶了內層沙箱就 `Permission denied`；
 #        `getent hosts` 在沒有內層沙箱時 rc=0、帶了就非零。
 #        ⚠️ **對照組不可省略。** 0819 第一版探針拿「寫 job 的 HOME 被擋」當證據
 #        ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 先回
@@ -3040,27 +3045,30 @@ for row in r.SANDBOX_MODE_DERIVATION:
           f"write_grant={row.grants_filesystem_write}")
 print("emitted:", r.emitted_sandbox_modes())
 PY
-#   期望逐字：
-#     unsafe-bypass              None             write_grant=True
-#     planner-read-only          read-only        write_grant=False
-#     reviewer-review-only       read-only        write_grant=False
-#     builder-write-forbidden    read-only        write_grant=False
-#     builder-workspace-write    workspace-write  write_grant=True
-#     emitted: ('read-only', 'workspace-write')
-#   ⛔ `emitted` 少了 `workspace-write` ⇒ 有人把導出規則改成只剩唯讀族，
-#      4e-2g 的探針會退化成 #715 那個假綠。停下來查清楚。
+#   期望逐字（#716 B 後半，見 4e-2j）：
+#     unsafe-bypass              None                write_grant=True
+#     planner-read-only          read-only           write_grant=False
+#     reviewer-review-only       read-only           write_grant=False
+#     builder-write-forbidden    read-only           write_grant=False
+#     builder-workspace-write    danger-full-access  write_grant=True
+#     emitted: ('read-only', 'danger-full-access')
+#   ⛔ `emitted` 只剩唯讀族 ⇒ 有人把導出規則改壞，4e-2g 的探針會退化成 #715 那個
+#      假綠。停下來查清楚。
+#   ⛔ 出現 `workspace-write` ⇒ registry **載不起來**（import 期斷言）：那個 mode
+#      在 legacy landlock 下 100% panic，B 後半已裁決淘汰。
 
 # ✅ 驗證 2：per-mode 矩陣（走 4e-2g 的驗證 1，這裡只記**期望值**）
 python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
-#   0819 實跑（jit 剖面、真 worktree instance、42 條 property）：
-#     1[read-only]        → rc=1  `bwrap: Can't read /proc/sys/kernel/overflowuid`
-#     3[read-only]        → rc=0  （stdout 是 job 的 cwd）
-#     1[workspace-write]  → rc=1  同一句 bwrap
-#     3[workspace-write]  → rc=101 `linux_run_main.rs:318:9` ＋ panic 逐字
-#     2（旗標還在）        → rc=0
-#   ⚠️ **`3[workspace-write]` 這一條紅是誠實狀態，不是回歸**：F 只解得了唯讀卡，
-#      **會寫檔的 build 卡仍然發 `workspace-write`**，#716 的 A／B／E 裁決仍要做。
-#      **不得**為了讓它變綠而放寬判準（把 `-c` 拿掉就會綠——那正是 #715 的假綠）。
+#   0819 實跑（jit 剖面、真 worktree／probe instance、54 條 property）：
+#     1[read-only]              → rc=1  `bwrap: Can't read /proc/sys/kernel/overflowuid`
+#     3[read-only]              → rc=0  （stdout 是 job 的 cwd）
+#     a[danger-full-access]     → rc=0  `PSC-716-EXEC-OK`
+#     b[danger-full-access]     → rc=1  `TimeoutError: timed out`（出口管制在）
+#     2（旗標還在）              → rc=0
+#   ⚠️ **B 後半起本矩陣預期全綠**；歷史上 `3[workspace-write]` 那條 rc=101 的紅
+#      （`linux_run_main.rs:318:9`）就是 4e-2j 修掉的東西。b[danger-full-access]
+#      變成連得出去 ⇒ 出口管制被拆——**當場停**，「不補出口就不要採 B」是該列成立
+#      的硬前置（4e-2i）。
 
 # ✅ 驗證 3：真實派工 smoke（**這一條才是驗收**，走 4e-2g 的驗證 2）
 #    唯讀卡（例如 `worktree-isolation`）應該能跑完並產出 `job.last.json`；
@@ -3070,12 +3078,13 @@ python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 
 **明載的邊界**（不要當成 #716 的完整解）：
 
-- F **只**解得了唯讀卡。同一個 build phase 的**下一張會寫檔的卡**會撞同一面牆。
+- F **只**解得了唯讀卡。同一個 build phase 的**下一張會寫檔的卡**會撞同一面牆
+  ——那一半由 **4e-2j（選項 B 後半）** 接手：寫入卡改發 `-s danger-full-access`。
 - `use_legacy_landlock` 的倒數仍在跑（4e-2g 的 `accepted_loss` 第三條）。旗標消失
-  那天，連 `read-only` 那一半都會回到桌上。
-- **`workspace-write` 模式下內層實際放行哪些格量不到**——它在任何命令執行之前就
-  panic。4e-2g 驗證 1 的第 4 段因此只量得到 `read-only` 那一列，並逐字帶
-  `-c sandbox_mode='"read-only"'`；把它拿掉當成「量了兩種 mode」是**第三種假綠**。
+  那天，`read-only` 那一半會回到桌上（B 後半起旗標只附在 read-only 族上）。
+- **內層「擋什麼」只量得到 `read-only` 那一列**——4e-2g 驗證 1 的第 4 段逐字帶
+  `-c sandbox_mode='"read-only"'`；把它拿掉當成「量了兩種 mode」是**第三種假綠**
+  （B 後半起 `danger-full-access` 那列沒有內層，「擋什麼」對它是空集合）。
 
 **回滾**：退回上一版 cortex（`build_codex_argv` 就回到「builder 一律 `workspace-write`」）。
 加固面無需動——本節從頭到尾沒有落檔變更。
@@ -3084,8 +3093,8 @@ python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 
 > **這一節是 #716 選項 B 的前置條件，必須先落地。** 裁決逐字帶著一句「出口網路不補
 > 就不要採 B」，因此順序是**先補管制、再關內層**——中間不得存在「沒有內層沙箱且出口
-> 全開」的窗口。本節只做前半（出口管制）；argv 那半（`-s danger-full-access`）是另一
-> 張票。
+> 全開」的窗口。本節只做前半（出口管制）；argv 那半（`-s danger-full-access`）在
+> **4e-2j** 落地。
 
 **起因（0819 實機，builder 的真實加固面複本、`unit_replica_properties()` 全量導出）**：
 
@@ -3281,6 +3290,42 @@ sudo systemctl cat cortex-job-jit@.service \
 退回上一版產生器的產物（`git checkout` 舊版 cortex 後重跑第 5-2 步）。
 ⚠️ **回滾順序與部署相反**：先退 job unit（拿掉 `IPAddressDeny`），再停 proxy——
 反過來會留下一段「出口全關、executor 也連不上」的空窗。
+
+#### 4e-2j. 寫入卡的 argv 切換：`-s danger-full-access`（#716 選項 B 的後半）
+
+> **這一節沒有任何落檔／unit 變更**——它改的是 `build_codex_argv` 消費的導出表
+> （`registry.SANDBOX_MODE_DERIVATION`）：`builder-workspace-write` 那一列由
+> `workspace-write`（legacy landlock 下 100% panic rc=101 的必死卡，4e-2h 的
+> 「未解那一半」）改發 **`danger-full-access`**，且**不再附**
+> `--enable use_legacy_landlock`（該 mode 下旗標是無意義殘留，只會在 job log 開頭
+> 多印一筆 deprecation 的 error item）。部署＝更新 cortex 套件，加固面零 diff。
+
+**前置（硬性）**：4e-2i 的出口管制**已部署且驗證通過**。這一列的殘餘防線是
+**systemd 外層 ＋ 出口管制**——出口不在的那一刻，本節的裁決前提就垮了。
+
+**刻意不用 `--dangerously-bypass-approvals-and-sandbox`**：`build_codex_argv` 把它
+與 `--dangerously-bypass-hook-trust` 綁在一起，會連 #698 封住的 hook 信任閘一起
+關掉；`-s danger-full-access` 只關沙箱，核可機制與 hook 信任都不動。
+
+**核可閘已量**（0819，真實加固面複本 54 條 property 全量導出 ＋ 真實 `codex exec`
+一次、`</dev/null`）：headless `-s danger-full-access` **不卡核可閘**——模型自主跑
+兩條命令（`git rev-parse HEAD` 因 dubious ownership exit 128 → 自行改
+`git -c safe.directory="$PWD"` exit 0）、`turn.completed`、rc=0，全程零 approval
+請求，不需要 `--approve-for-me`。
+
+```bash
+# ✅ 驗證 1：導出表與 argv 形狀（純讀，零 sudo）——期望值記在 4e-2h 驗證 1
+# ✅ 驗證 2：per-mode 矩陣（4e-2g 驗證 1 的探針；a/b 兩段涵蓋本列）——期望全綠
+# ✅ 驗證 3：真實派工跑一張**會寫檔的卡**（**這一條才是驗收，本節落地時尚未驗**）
+#    期望：job log 無 sandbox panic、command_execution 有 exit_code=0、
+#          commit-spool 出現非空 bundle。
+```
+
+**三列不變**：planner／reviewer read-only 與 builder write-forbidden 的 argv
+**byte-identical 不變**（`tests/test_write_card_argv_716.py` 的黃金釘子釘住），
+read-only 族**維持** legacy landlock——它今天是好的、真的在擋。
+
+**回滾**：退回上一版 cortex。加固面與 proxy 都不必動（本節零落檔變更）。
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 
