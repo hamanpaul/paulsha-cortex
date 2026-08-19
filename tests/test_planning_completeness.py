@@ -12,11 +12,17 @@ from paulsha_cortex.coordinator.model_identities import (
 )
 from paulsha_cortex.coordinator.planning import (
     PLANNING_KINDS,
+    QUESTION_FIELDS,
+    QUESTION_ID_FIELD,
+    QUESTION_PACK_KEYS,
+    QUESTIONER_INPUT_PACK_KEY,
     PlanningArtifact,
     PlanningScope,
     _REQUIRED_HEADINGS,
     assess_planning_artifact,
     assess_planning_completeness,
+    echoed_identifier_hint,
+    question_pack_echo_hint,
     required_heading_hint,
     run_heterogeneous_brainstorm,
     validate_question_pack,
@@ -123,6 +129,81 @@ def test_required_heading_criterion_is_the_single_source_of_the_prompt_hint() ->
         _artifact("spec", "---\nstatus: accepted\n---\n# T\n\n## Requirements for spec\n\nBody.\n")
     )
     assert "required-section-missing" in rejected.reasons
+
+
+def test_question_pack_echo_criterion_is_the_single_source_of_the_prompt_hint() -> None:
+    """issue #704：questioner 的判準是「逐位元等於輸入裡的 `default_question_pack`」，
+    prompt 卻寫「產出解決本報告**所需的**題目」——創作型動詞。約束句必須比照 #520 由
+    判準機械產生：欄位名全部來自驗證用的常數，且「prompt 禁止的那件事」與「驗證真的
+    會拒的那件事」是同一件。"""
+
+    # 欄位名由型別自身導出，不是 prompt 端另寫的一份字面值。
+    assert QUESTION_PACK_KEYS == ("schema_version", "pack_id", "questions")
+    assert QUESTION_FIELDS == ("question_id", "kind", "prompt", "source_refs")
+    assert QUESTION_ID_FIELD == "question_id"
+
+    hint = question_pack_echo_hint()
+    # 判準比對的每一個鍵／欄位都被點名——漏一個就是留一格沒被禁止的創作空間。
+    for name in (*QUESTION_PACK_KEYS, *QUESTION_FIELDS):
+        assert f"`{name}`" in hint, name
+    # 指路的鍵名與 `run_heterogeneous_brainstorm` 實際組進輸入的鍵名同一份。
+    assert f"`{QUESTIONER_INPUT_PACK_KEY}`" in hint
+    # 動詞面：抄寫在、創作不在。
+    assert "verbatim" in hint
+    assert "byte-for-byte" in hint
+    assert "specialise to this work item" in hint
+    assert "required to resolve" not in hint
+
+    report = assess_planning_completeness([_artifact("plan", ACCEPTED_PLAN)])
+    pack = report.default_question_pack
+    assert pack.questions, "fixture 必須真的產出題目，否則下面兩條斷言是空的"
+
+    # 1) prompt 要模型做的那件事（逐字複製）確實會通過。
+    assert validate_question_pack(pack.to_dict(), report=report).to_dict() == pack.to_dict()
+
+    # 2) prompt 新禁止的那件事（把題目特化到 work item）確實會被拒——這正是實機
+    #    抓到的形狀：`questions[0].prompt` 被追加了 work item 專屬的尾巴。
+    specialised = pack.to_dict()
+    specialised["questions"][0]["prompt"] += " for fixing read-repo tier fail-closed behavior?"
+    with pytest.raises(ValueError) as excinfo:
+        validate_question_pack(specialised, report=report)
+    assert "questions[0].prompt" in str(excinfo.value)
+
+
+def test_echoed_identifier_hint_names_the_fields_the_validators_compare() -> None:
+    """issue #704 的同型掃描：`question_pack_id` 與 `question_id` 在
+    `validate_secondary_evidence()`／`_validate_primary_integration()` 都是逐位元
+    比對的 echo-back 欄位，值也全部已在輸入裡。#516 只補了 integrator 的
+    `question_pack_id`，兩個 adapter 的 `question_id` 從來只被列了欄位名。"""
+
+    hint = echoed_identifier_hint(pack_id_field="question_pack_id")
+    assert "`question_pack_id` must be copied verbatim" in hint
+    assert f"`{QUESTION_ID_FIELD}` must be copied verbatim" in hint
+    assert "never shorten, renumber, re-derive, or invent one" in hint
+
+    # 判準面：抄錯 pack_id 與抄錯 question_id 都真的會被拒（prompt 禁止的與驗證拒的
+    # 是同一件事）。
+    report = assess_planning_completeness([_artifact("plan", ACCEPTED_PLAN)])
+    pack = report.default_question_pack
+    evidence = {
+        "schema_version": 1,
+        "question_pack_id": pack.pack_id,
+        "evidence": [
+            {"question_id": question.question_id, "claims": ["c"], "source_refs": ["docs/plan.md"]}
+            for question in pack.questions
+        ],
+    }
+    validate_secondary_evidence(evidence, question_pack=pack)
+
+    with pytest.raises(ValueError, match="question_pack_id mismatch"):
+        validate_secondary_evidence({**evidence, "question_pack_id": "qp-invented"}, question_pack=pack)
+
+    renumbered = {
+        **evidence,
+        "evidence": [{**row, "question_id": "q-1"} for row in evidence["evidence"]],
+    }
+    with pytest.raises(ValueError, match="not in the question pack"):
+        validate_secondary_evidence(renumbered, question_pack=pack)
 
 
 def test_canonical_accepted_source_spec_and_plan_satisfy_required_sections() -> None:
