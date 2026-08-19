@@ -423,6 +423,17 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   clone，而那份**靜態**檔只出來源樹兩條——**per-job 路徑是動態的，靜態檔裝不下**
   （萬用字元已被實測否決）。修法是逐 job 由 Manager 算出那一格、隨 spec 的 env 下去。
   → **61** 個 sudo 點、**242** 個驗證點。
+- **#714（`ProcSubset=pid` 讓 codex 的 bubblewrap 起不來，builder 一個命令都跑不了）
+  新增**：新增 **4e-2g「executor 的內層沙箱 × 外層加固面」**（四道牆的逐條量測表 ＋
+  **反向不變式** `trust_root inner-sandbox-probe` ＋ 真實派工驗收 ＋ 明載的取捨）。
+  **起因**：#712 修好之後 builder job 跑了 30 分鐘，19 行 log 裡 5 個
+  `command_execution` **全部 failed**，逐字 `bwrap: Can't read
+  /proc/sys/kernel/overflowuid`——Manager 端看到的 `card-terminal-schema-retry-exhausted`
+  是症狀不是病因。**保留 bubblewrap 要付四條放寬**（含 user namespace 與 mount），
+  因此改走 codex 的 landlock ＋ seccomp 形態：外層加固面**一條都不動**，只全域放行
+  `@sandbox`（四支只能讓行程把自己關得更緊的 syscall）。第 5-2 步的八份 unit 需重落
+  （`SystemCallFilter` 那一行多 ` @sandbox`）。
+  → **64** 個 sudo 點、**250** 個驗證點。
 
 ---
 
@@ -2826,6 +2837,111 @@ sudo -u cortex-manager python3 -c "import json,sys;print({k:v for k,v in \
 
 **回滾**：本步沒有部署期動作可回滾。退掉那三個 env 就是退回上一版 cortex（退回之後
 builder job 會回到 #712 的原症狀：ACL 全對、`git bundle create` 仍然失敗）。
+
+#### 4e-2g. executor 的**內層沙箱** × 外層加固面（#714）
+
+> **這一節與前面幾節的層級不同。** 4e-2d/e/f 驗的是「job 進得去、寫得出、git 認得」；
+> 本節驗的是 **executor 自己再開的那一層沙箱**還裝不裝得上。#714 就是它整層沒裝上的
+> 實機證據：builder job 跑了 **30 分鐘**，19 行 job log 裡 **5 個 `command_execution`
+> 全部 `status: failed`**，逐字都是
+> `bwrap: Can't read /proc/sys/kernel/overflowuid: No such file or directory`——
+> 模型於是合理地回 `needs_human`，Manager 端落成 `card-terminal-schema-retry-exhausted`。
+> **症狀離病因四層遠**，這正是本節必須存在的理由。
+
+**0819 逐條量測（其餘 property 固定，每次只加一條；走 `psc_run_under` 全量導出）**：
+保留 codex 預設的 **bubblewrap** 形態要付**四條**放寬——
+
+| # | 加上什麼 | 露出的下一道 |
+| --- | --- | --- |
+| 1 | （jit 剖面原樣） | `bwrap: Can't read /proc/sys/kernel/overflowuid` ← `ProcSubset=pid` |
+| 2 | `ProcSubset=all` | `bwrap: No permissions to create a new namespace` ← `RestrictNamespaces=yes` |
+| 3 | `RestrictNamespaces=no` | `bwrap: loopback: Failed to create NETLINK_ROUTE socket` ← `RestrictAddressFamilies` |
+| 4 | `AF_NETLINK` | `bwrap: Failed to make / slave: Operation not permitted` ← `SystemCallFilter` 擋掉 `mount` |
+| 5 | `SystemCallFilter` 加 `@mount` | rc=0 |
+
+第 2、4 條放寬的正是 **user namespace ＋ mount**——`RestrictNamespaces` 那一列的註解
+逐字寫著「user namespace 是 unprivileged 提權的常見起點」。**因此那條路沒有走。**
+
+**實際採用的形態**：codex 的 **landlock ＋ seccomp** 路徑
+（`--enable use_legacy_landlock`，由 `permgen.EXECUTOR_TOOLS` 的 `inner_sandbox` 機械
+導出，argv 由 `launcher.build_codex_argv` 帶）。外層**一條都沒動**——`ProcSubset=pid`、
+`RestrictNamespaces=yes`、`RestrictAddressFamilies` 逐字還在；唯一的加固面變動是
+`SystemCallFilter=@system-service` **加上 `@sandbox`**，**全域**，八份 unit 一致。
+
+> **為什麼 `@sandbox` 不算放寬**：那組是 `landlock_create_ruleset`／`landlock_add_rule`
+> ／`landlock_restrict_self`／`seccomp` 四支，能力上限是**讓呼叫者把自己關得更緊**
+> ——它們拿不到任何本來拿不到的資源。而「全域一次」正是 `PROFILE_LOCKED_KEYS` 那條
+> 理由要的形態（白名單的變動不得變成某份剖面偷偷多開一支），因此 `SystemCallFilter`
+> 至今仍是鎖定鍵、**沒有任何剖面分岔它**。
+
+**本步沒有部署期動作以外的東西**：重跑第 5-2 步把八份 unit 落檔即可（`SystemCallFilter`
+那一行會多 ` @sandbox`）。
+
+```bash
+# ✅ 驗證 0：落檔的 unit 真的帶了那一組（八份都要）
+for U in cortex-job cortex-job-jit cortex-reviewer-job cortex-reviewer-job-jit \
+         cortex-gate-job cortex-gate-job-jit; do
+  printf '%-28s ' "$U"; sudo systemctl cat "$U@.service" | grep '^SystemCallFilter='
+done
+sudo systemctl cat cortex-manager.service | grep '^SystemCallFilter='
+sudo systemctl cat cortex-monitor.service | grep '^SystemCallFilter='
+#   期望：八行**逐字相同**、皆為 `SystemCallFilter=@system-service @sandbox`。
+#   ⛔ 只有一部分帶 ⇒ 落檔漂移（有人只重跑了一部分），回第 5-2 步全部重落。
+#   ⛔ 出現 `@mount`／`pivot_root` ⇒ 有人走了上表的路線 A。停下來——那不是本票的決定。
+
+# ✅ 驗證 1（**反向不變式**，四個方向缺一不可）
+python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
+#   它產生四段命令（全部走 `psc_run_under`，一行 `--property=` 都不自組）：
+#     1) **負向對照**：不帶旗標時 codex 的預設形態必須**仍然失敗**，逐字
+#        `Can't read /proc/sys/kernel/overflowuid`。rc=0 ⇒ 有人放寬了 `ProcSubset`，
+#        本票的整個論證失效——**停下來查清楚**，不要因為「反正也是綠的」就放過。
+#     2) **旗標還在**：不得回 `Error: Unknown feature flag: use_legacy_landlock`。
+#        ⚠️ 這條是本探針存在的**主要**理由——旗標名帶 `legacy`，那是對 codex 某一版的
+#        觀察，不是不變式。上游拿掉它時 codex 以非零收場（吵的失敗，不是靜默少一層）。
+#     2b) **早期警報**：到**最近一次真實派工的 job log** 裡 grep 那句 deprecation。
+#        ⚠️ `codex sandbox` 子命令**不印**那句話（0819 實測），只有 `exec --json` 會把它
+#        當一筆 `item.type=error` 放進串流——拿 `sandbox` 的輸出去 grep 只會得到一個
+#        看起來很安心、其實什麼都沒驗到的「沒有 deprecation 訊息」。
+#     3) **正向**：帶旗標 rc=0。
+#     4) **真的在擋**，且**每一條都配一個對照組**：同一格路徑在沒有內層沙箱時
+#        寫得進去（`OUTER_ALLOWS`）、帶了內層沙箱就 `Permission denied`；
+#        `getent hosts` 在沒有內層沙箱時 rc=0、帶了就非零。
+#        ⚠️ **對照組不可省略。** 0819 第一版探針拿「寫 job 的 HOME 被擋」當證據
+#        ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 先回
+#        `Read-only file system`，那條檢查其實在證明外層，內層裝沒裝上完全看不出來。
+#        ⚠️ 被擋那條變成 rc=0（而對照組正常）⇒ **旗標吃下去了但沙箱沒生效**——
+#        看起來一切正常、實際少一層，比整個起不來還難發現。
+
+# ✅ 驗證 2：真實派工 smoke（**這一條才是驗收**）
+#    #709 的 caveat 逐字適用：`psc_run_under` 複製的是加固面，**不是派工路徑**。
+#    起一輪真的 build，然後看 job 自己那一格 log：
+sudo -u cortex-manager grep -c '"status":"failed"' \
+  /var/lib/cortex/coordinator/commit-spool/build-logs/<slice>/job.jsonl
+#   期望：0（或至少沒有任何 `command_execution` 是 failed）。
+sudo -u cortex-manager ls -l /var/lib/cortex/coordinator/commit-spool/<slice>/
+#   期望：出現**非空**的 `.bundle`。
+#   ⛔ `fatal: Refusing to create empty bundle.` ⇒ 模型一個命令都沒跑成功，回驗證 1。
+```
+
+**明載的取捨**（`InnerSandboxSpec.accepted_loss`，探針量不到，**不要留成隱性假設**）：
+
+- **沒有 PID namespace**（bubblewrap 的形態有）。跨 UID 那一面由外層的
+  `ProtectProc=invisible` ＋ `ProcSubset=pid` 覆蓋；剩下的差異是「同一個 job 內部的
+  行程彼此看得見」，那本來就不是隔離邊界。
+- **沒有 mount namespace**。內層因此擋不住「把別的路徑 bind 進工作區」——但那需要
+  `mount(2)`，而 `SystemCallFilter` 本來就沒放行 `@mount`（上表第 4 道牆量到的正是它）。
+- **依賴 codex 的 `use_legacy_landlock` 旗標，而上游已宣告它是過渡狀態。** 0819 實機
+  在真實派工的 `--json` 串流裡逐字收到
+  `` `[features].use_legacy_landlock` is deprecated and will be removed soon. ``
+  ——**這是倒數，不是穩態**。旗標被拿掉的那天只剩 bubblewrap，而 bubblewrap 要付的
+  四條放寬正是上表否決的那四條 ⇒ **A／B／C 會整個回到桌上**。由驗證 1 的第 2／2b 步
+  盯著。⚠️ 那句話以 `item.type=error` 進 `--json`，**不影響** terminal 契約
+  （`_extract_terminal_json()` 由尾端往回找 `agent_message`），但看到 job log 開頭有
+  一筆 error 時不要誤判成 job 失敗。
+
+**回滾**：把 `SystemCallFilter` 改回 `@system-service` 並重落八份 unit ＋ 退回上一版
+cortex（argv 就不再帶旗標）。回滾之後 builder 會回到 #714 的原症狀——**每一條 shell
+命令都失敗，而 log 上看起來像模型自己決定放棄**。
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 

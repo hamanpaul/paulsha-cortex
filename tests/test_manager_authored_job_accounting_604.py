@@ -266,10 +266,12 @@ class DegradedWrapperTests(unittest.TestCase):
         self.assertNotIn(paths["ledger"], job_script)
         self.assertNotIn('printf %s "$?"', job_script)
         self.assertNotIn("paulsha_cortex.coordinator.gate_ledger", job_script)
-        # 註：codex 的 `-o <log_dir>/last.json`（`launcher.build_codex_argv`）仍指向
-        # 同一個目錄。它**不是**證據面（沒有任何採信路徑讀它，見 `grep last.json`：
-        # 只有 planning_runtime 的暫存目錄版本被讀），因此不在本票範圍內；但它在
-        # Phase 2b 同樣會 EROFS，屬 executor argv 面的獨立缺口，另票處理。
+        # #714：那條「另票處理」的註記已經結案。codex 的 `-o` 一度指向這個目錄裡的
+        # 共用 `last.json`（實機 0819 逐字 `Permission denied (os error 13)`，且不帶
+        # job id ⇒ 並行的兩個 job 會互相蓋掉）；現在它由 **job 自己那份 log** 導出
+        # （`job_workspace.job_last_message_path()`），因此也一併落在本斷言的守備範圍
+        # 內——下面這一條就是那個回歸守衛。
+        self.assertNotIn(f"{paths['log_dir']}/last.json", job_script)
 
     def test_template_mode_sentinel_is_written_by_the_manager_side_shell(self) -> None:
         popen = _RecordingPopen()
