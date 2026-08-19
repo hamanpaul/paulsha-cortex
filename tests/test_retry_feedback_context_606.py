@@ -470,7 +470,9 @@ def test_status_policy_forbids_inferring_the_full_gate_from_a_focused_subset(
     assert "focused subset" in policy
     # 機械生成：實際會被 manager 重跑的命令逐字出現，不是手寫的泛稱。
     assert "python3 -m pytest -q" in policy
-    assert policy.endswith(gate_ledger.gate_scope_honesty_hint(env))
+    # #721：範圍紀律文字現在依卡片的 test_policy 導出；本卡是 focused（見 `_run`），
+    # 逐字與修改前相同。
+    assert policy.endswith(gate_ledger.gate_scope_honesty_hint(env, test_policy="focused"))
 
 
 def test_status_policy_scope_hint_tracks_the_declaration(tmp_path: Path) -> None:

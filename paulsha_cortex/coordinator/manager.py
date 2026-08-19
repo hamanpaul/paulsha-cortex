@@ -8415,7 +8415,17 @@ def _workflow_job_prompt(
     effective_test_policy = step.test_policy or fallback[3]
     # #540：與 launcher 交給 gate ledger writer 的是同一份 env，因此這裡導出的
     # 名稱就是 ledger 之後會有的名稱。
-    canonical_gate_names = gate_ledger.ledger_gate_names(env)
+    #
+    # #721：**適用範圍**同樣機械導出，不在 prompt 端另寫一份。契約不要求模型交出
+    # gate 結果的卡（`test_policy` 為 `None`／`"none"`）拿到空集合，dispatch 端與
+    # harvest 端因此對「這張卡要模型驗哪些 gate」給出同一個答案——判準是
+    # `terminal_contract.expected_gate_names_for_test_policy`（經
+    # `gate_ledger.card_requires_gate_evidence` 轉呼叫），與 harvest 端
+    # `_assert_terminal_gate_consistency` 用的是同一支函式。
+    card_requires_gate_evidence = gate_ledger.card_requires_gate_evidence(
+        effective_test_policy
+    )
+    card_gate_names = gate_ledger.card_gate_names(env, test_policy=effective_test_policy)
     source_material: list[dict[str, object]] = []
     for row in input_snapshot:
         envelope = _read_workflow_input_content(
@@ -8506,6 +8516,39 @@ def _workflow_job_prompt(
         }
         if not step.outputs:
             fixed_terminal_fields["outputs"] = []
+        # #721：兩段文字的**適用範圍**由 `card_gate_names`（＝上面那支機械導出）決定。
+        # 契約要求模型交出 gate 結果時逐字沿用 #261／#540／#606 的既有文字；不要求時
+        # 連泛用前言都不能沿用——它逐字點名 pytest（"every deterministic gate you ran
+        # (OpenSpec / pytest / policy)"）並宣告「Manager 會重讀 ledger 判你的 passed」，
+        # 讀起來就是「去跑 pytest」，而那正是 job wf-6c37c77ca1-worktree-isolation-8
+        # 在 `-s read-only` 沙箱下撞死、Manager 自動重派、形成確定性迴圈的那句話。
+        if card_requires_gate_evidence:
+            status_policy = (
+                "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
+                "policy) actually passed. Natural-language confidence, an exit code of 0, and "
+                "the absence of an explicit error do NOT authorize passed. If any gate failed, "
+                "report failed; the Manager re-reads the gate ledger and fails closed on any "
+                "contradiction, so a dishonest passed only costs you a retry. "
+                + gate_ledger.gate_scope_honesty_hint(env, test_policy=effective_test_policy)
+            )
+            gate_evidence_description = (
+                "Declare every deterministic gate you actually ran and its real result. "
+                "The Manager independently re-runs the declared gate commands after your "
+                "process exits and compares; claiming a gate you did not run, or claiming "
+                "passed for a gate that failed, fails the card closed. "
+                + gate_ledger.gate_evidence_name_hint(env, test_policy=effective_test_policy)
+            )
+        else:
+            status_policy = (
+                "Report passed only when this card's own action is genuinely complete. "
+                "Natural-language confidence, an exit code of 0, and the absence of an "
+                "explicit error do NOT authorize passed; if the action is not complete, or "
+                "the decision needs a human, report failed or needs_human instead. "
+                + gate_ledger.gate_scope_honesty_hint(env, test_policy=effective_test_policy)
+            )
+            gate_evidence_description = gate_ledger.gate_evidence_name_hint(
+                env, test_policy=effective_test_policy
+            )
         terminal_schema = {
             "kind": "workflow-card",
             # #261 D1：canonical envelope。舊的 schema_version 1 形狀仍可被 harvest
@@ -8524,14 +8567,10 @@ def _workflow_job_prompt(
             # #606：末段的範圍紀律（「focused 綠不得推定宣告的 gate 綠」）與
             # 下面 gate_evidence 的 allowed_names 說明同一條機械生成紀律——具體
             # 的 gate 名稱與命令由 operator 的 PSC_GATE_CMD_* 宣告導出，不手寫。
-            "status_policy": (
-                "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
-                "policy) actually passed. Natural-language confidence, an exit code of 0, and "
-                "the absence of an explicit error do NOT authorize passed. If any gate failed, "
-                "report failed; the Manager re-reads the gate ledger and fails closed on any "
-                "contradiction, so a dishonest passed only costs you a retry. "
-                + gate_ledger.gate_scope_honesty_hint(env)
-            ),
+            #
+            # #721：整段（含泛用前言）在上面依 `card_requires_gate_evidence` 分岔，
+            # 適用範圍與 gate_evidence 那段同源。
+            "status_policy": status_policy,
             "outputs": {
                 "type": "array",
                 "items": "repo-relative artifact path string matching declared_outputs",
@@ -8555,20 +8594,17 @@ def _workflow_job_prompt(
             # 用的是同一條導出路徑），不在此手寫第二份真實來源——舊 prompt 只寫
             # 「gate name」，模型只能自己造名字，採信必然撞
             # `gate-evidence-unknown-gate`。
+            #
+            # #721：名字機械化之後，**適用範圍**也機械化——契約不要求模型交出 gate
+            # 結果的卡，`allowed_names` 為空且說明逐字要求 `gate_evidence: []`。
             "gate_evidence": {
                 "type": "array",
                 "items": {
                     "name": "one of allowed_names below",
                     "status": "passed | failed",
                 },
-                "allowed_names": list(canonical_gate_names),
-                "description": (
-                    "Declare every deterministic gate you actually ran and its real result. "
-                    "The Manager independently re-runs the declared gate commands after your "
-                    "process exits and compares; claiming a gate you did not run, or claiming "
-                    "passed for a gate that failed, fails the card closed. "
-                    + gate_ledger.gate_evidence_name_hint(env)
-                ),
+                "allowed_names": list(card_gate_names),
+                "description": gate_evidence_description,
             },
         }
         if effective_test_policy == "red-required":

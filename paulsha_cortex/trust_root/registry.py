@@ -999,7 +999,11 @@ SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
             "也不宣告任何產出的卡，本來就不該拿到工作區寫入授權。legacy landlock 只是讓"
             "這個既有缺陷從靜默變成 panic。\n"
             "**誠實邊界**：本格**只**解得了唯讀卡。同一個 build phase 的下一張會寫檔的卡"
-            "落在 `builder-workspace-write`，仍會撞同一面牆（#716 的 A／B／E 裁決仍要做）。"
+            "落在 `builder-workspace-write`，仍會撞同一面牆（#716 的 A／B／E 裁決仍要做）。\n"
+            "**隱性邊界（#721）**：`-s read-only` 之下**任何需要暫存檔的命令都會失敗**，"
+            "`/tmp` 也不例外（`tempfile` 建不出檔，實測 `python3 -m pytest -q` 死於 "
+            "`No usable temporary directory available`）——「不寫工作區」不等於「不寫任何"
+            "地方」。落這一格的卡其 action 必須是純檢視。"
         ),
     ),
     SandboxModeDerivation(

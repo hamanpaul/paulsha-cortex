@@ -134,7 +134,51 @@ def ledger_gate_names(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
         return (GATE_SPEC_FAILURE_NAME,)
 
 
-def gate_evidence_name_hint(env: Mapping[str, str] | None = None) -> str:
+def card_requires_gate_evidence(test_policy: str | None) -> bool:
+    """這張卡的契約要不要求**模型自己**交出確定性 gate 結果（#721）。
+
+    判準轉呼叫 harvest 端唯一的權威導出
+    :func:`terminal_contract.expected_gate_names_for_test_policy`——它回空集合就是
+    「這張卡本就不要求測試」（``None``／``"none"``，例如 worktree-isolation 這種
+    不動 candidate 程式碼的卡），回非空就是「這張卡的正確產出需要跑測試」。
+    **dispatch 端不得在 prompt 上另寫第二份判準**：#540 已經把 gate *名稱*從手寫
+    改成機械產生，#721 是同一個錯誤的另一半——名字機械化了，**適用範圍**沒有，
+    於是 ``test_policy="none"`` 的卡仍被 prompt 告知「Manager 會重跑 pytest 並用
+    它判你的 passed」，模型只能去跑 pytest，在 ``-s read-only`` 沙箱下必死。
+
+    **這裡刻意只當布林用，不拿回傳的名稱集合去 ∩ ledger 的 gate 名稱。**
+    ``expected_gate_names_for_test_policy`` 回的是「**測試**這一個訊號」
+    （:data:`terminal_contract.RED_REQUIRED_TEST_GATE_NAME`），不是「這張卡會被
+    判哪些 gate」；拿它截斷 ledger 名稱集合，會讓 prompt 講的範圍比 harvest 真正
+    判的範圍**小**（`authorize_terminal` 對 ledger 裡**任何**非 passed 的 gate 都
+    fail closed，不只應驗的那一個），那正是 #721 的鏡像缺陷。
+    """
+
+    return bool(terminal_contract.expected_gate_names_for_test_policy(test_policy))
+
+
+def card_gate_names(
+    env: Mapping[str, str] | None = None,
+    *,
+    test_policy: str | None,
+) -> tuple[str, ...]:
+    """這張卡在派工 prompt 上該出現的 gate 名稱集合（#721）。
+
+    契約不要求模型交出 gate 結果時是空 tuple——prompt 因此沒有任何 gate 名稱可以
+    宣告，``gate_evidence`` 只能是 ``[]``；其餘一律是 :func:`ledger_gate_names`，
+    也就是 harvest 端真正會拿來對照的那一組，兩端不會各算一份。
+    """
+
+    if not card_requires_gate_evidence(test_policy):
+        return ()
+    return ledger_gate_names(env)
+
+
+def gate_evidence_name_hint(
+    env: Mapping[str, str] | None = None,
+    *,
+    test_policy: str | None,
+) -> str:
     """回傳 dispatch prompt 用的 gate 名稱說明（由 gate 宣告機械產生）。
 
     issue #540（與 #486／#521 同族）：``terminal_contract.authorize_terminal``
@@ -147,8 +191,20 @@ def gate_evidence_name_hint(env: Mapping[str, str] | None = None) -> str:
     就是 operator 的 ``PSC_GATE_CMD_*`` 宣告（:func:`declared_gate_names`），與
     :func:`write_gate_ledger` 產生 ledger 用的是同一條導出路徑，宣告改動會自動
     同步到 prompt。
+
+    #721：``test_policy`` 決定**適用範圍**。契約不要求模型交出 gate 結果的卡
+    （:func:`card_requires_gate_evidence` 為 False）拿到的是專屬文字：沒有任何可
+    宣告的 gate 名稱，``gate_evidence`` 只能是 ``[]``。其餘 ``test_policy`` 的文字
+    逐字不變。
     """
 
+    if not card_requires_gate_evidence(test_policy):
+        return (
+            "This card's test_policy requires no test run from you, so there is no gate name "
+            "for you to claim and gate_evidence must be exactly []. A name of your own "
+            "invention fails the card closed; put whatever you observed into diagnostics "
+            "instead."
+        )
     # 宣告不合法時 ledger 只會有一項 `gate-spec`（見 `main`）；照實告知，不假裝
     # 有一組可用的 gate 名稱。這張卡本來就會 fail closed。
     names = ledger_gate_names(env)
@@ -167,7 +223,46 @@ def gate_evidence_name_hint(env: Mapping[str, str] | None = None) -> str:
     )
 
 
-def gate_scope_honesty_hint(env: Mapping[str, str] | None = None) -> str:
+def _no_gate_evidence_scope_hint(env: Mapping[str, str] | None = None) -> str:
+    """契約不要求模型交出 gate 結果時的範圍紀律文字（#721）。
+
+    兩件事必須同時成立，缺一都是把範圍講錯：
+
+    1. **不要求模型跑任何 gate。** 這是 ``test_policy=none`` 的卡與其他卡唯一的
+       差別，也是 #721 的病灶所在。
+    2. **仍據實揭露 Manager 自己那一次 gate 執行。** 它照樣會發生（見
+       :func:`gate_scope_honesty_hint` 的說明與實機 ledger 證據），也照樣會把
+       ``passed`` 打掉；隱瞞它會讓模型以為這張卡完全不受任何 gate 影響。
+    """
+
+    try:
+        specs = load_gate_specs(env)
+    except GateSpecError:
+        specs = ()
+    if not specs:
+        return (
+            "Scope discipline: this card's test_policy requires no test run from you, and the "
+            "Manager has declared no gate commands either, so no deterministic gate result is "
+            "expected from either side. Report the status you actually observed, keep the "
+            "concrete detail in diagnostics, and leave gate_evidence exactly []."
+        )
+    rendered = "; ".join(f'"{spec.name}" = `{spec.command}`' for spec in specs)
+    return (
+        "Scope discipline: this card's test_policy requires no test run from you. Do not run a "
+        "project test suite for it, and do not treat a command that cannot run inside this "
+        "card's sandbox as this card's own failure: report the status you actually observed "
+        "and keep the concrete detail in diagnostics. Separately from you, the Manager runs "
+        f"its own declared gate commands ({rendered}) after your process exits and still fails "
+        "this card closed on a non-passing result — that run is the Manager's own, you are not "
+        "asked to reproduce it, and gate_evidence must stay exactly []."
+    )
+
+
+def gate_scope_honesty_hint(
+    env: Mapping[str, str] | None = None,
+    *,
+    test_policy: str | None,
+) -> str:
     """回傳 dispatch prompt 用的「gate 範圍紀律」說明（同樣由 gate 宣告機械產生）。
 
     issue #606 的附帶觀察：builder 在兩個 run（``workflow-084f...`` 的 job 488、
@@ -180,8 +275,26 @@ def gate_scope_honesty_hint(env: Mapping[str, str] | None = None) -> str:
     修法與 :func:`gate_evidence_name_hint`（#541／#540）同一條紀律：說明文字裡的
     具體值（gate 名稱與**它真正會被重跑的命令**）由 operator 的 ``PSC_GATE_CMD_*``
     宣告機械導出，與 :func:`write_gate_ledger` 同源，不手寫第二份真實來源。
+
+    #721：``test_policy`` 決定**適用範圍**。契約不要求模型交出 gate 結果的卡拿到
+    專屬文字，且那段文字**不得**出現「Manager 會重跑 X 並用它判你的 passed」——
+    現場（job ``wf-6c37c77ca1-worktree-isolation-8``）就是這句話把模型推去跑
+    ``python3 -m pytest -q``，在 ``-s read-only`` 沙箱下死於
+    ``No usable temporary directory available``，terminal 回 ``failed``，Manager
+    自動重派，形成確定性迴圈。
+
+    但那段文字**仍必須據實揭露** Manager 自己那一次 gate 執行：
+    :func:`gate_runner.ensure_gate_ledger` 只看 phase（``build``）不看
+    ``test_policy``，所以 ``test_policy="none"`` 的 build 卡照樣會被 ``cortex-gate``
+    重跑宣告的 gate 並寫進 ledger（實機證據：
+    ``wf-6c37c77ca1-worktree-isolation-3.gates.json`` 內有一列 ``pytest``），而
+    ``terminal_contract.authorize_terminal`` 的矛盾偵測對 ledger 裡**任何**非
+    passed 的 gate 都 fail closed。只說「這張卡不宣告任何確定性 gate」會把這件事
+    講小；正確的訊息是「**不要你跑**，但 Manager 仍會自己跑並據以判定」。
     """
 
+    if not card_requires_gate_evidence(test_policy):
+        return _no_gate_evidence_scope_hint(env)
     try:
         specs = load_gate_specs(env)
     except GateSpecError:
