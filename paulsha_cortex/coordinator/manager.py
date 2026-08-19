@@ -7890,7 +7890,19 @@ def _specialize_workflow_launcher(launcher, step):
     launcher（進而是相同的 PATH／HOME／sandbox policy）。若 preflight 用未
     specialize 的 launcher，reviewer 的最小 env 就不會被檢查到——那正是
     design D2 說的安慰劑。
+
+    **#716（選項 F）：`commit_policy` 從這裡開始也決定 sandbox mode。** 在此之前它
+    只在 `required` 那一支被消費（`as_commit_required()`），`forbidden` 完全是 prompt
+    契約——於是一張 `commit_policy=forbidden` 且 `declared_outputs` 為空的唯讀 build
+    卡照樣拿到 `--sandbox workspace-write`。判準由
+    `registry.card_contract_forbids_workspace_write()` 機械算出，**不由 persona 一刀
+    切**：builder persona 底下同時有唯讀卡與寫入卡。
     """
+
+    # lazy import 的理由與 `launcher._codex_inner_sandbox_argv()`／`planning_job` 逐字
+    # 相同：`trust_root` 是產生器面，不該進 `coordinator` 的模組載入圖，但**規則的內容
+    # 必須只有一份**。
+    from ..trust_root import registry as trust_registry
 
     if step.persona == "planner":
         read_only_factory = getattr(launcher, "as_read_only", None)
@@ -7917,6 +7929,24 @@ def _specialize_workflow_launcher(launcher, step):
         if not callable(commit_required_factory):
             raise ValueError("builder launcher lacks explicit commit-required capability")
         launcher = commit_required_factory()
+    elif trust_registry.card_contract_forbids_workspace_write(
+        commit_policy=effective_commit_policy,
+        # `getattr` 而不是 `step.outputs`：本函式也被 preflight 那條路以更窄的 step
+        # 形狀呼叫。缺欄回 `None` ⇒ 判準回 `False` ⇒ **維持現狀的 workspace-write**，
+        # 與「契約缺欄不猜」逐字一致（真實 `WorkflowStep` 恆有這一欄）。
+        declared_outputs=getattr(step, "outputs", None),
+    ):
+        # #716：**兩個條件都要明確成立才降**（`commit_policy=forbidden` **且**
+        # `declared_outputs` 為空），其餘一律維持現狀的 `workspace-write`——判準本體與
+        # 「解不出來就不猜」的理由都住在那支函式與 `registry.SANDBOX_MODE_DERIVATION`。
+        #
+        # **capability 缺席時保持現狀（`workspace-write`），不是 fail-open**：那正是
+        # 今天的行為，而本票的保守方向逐字就是「不確定 ⇒ 維持 workspace-write」。
+        # 真實 launcher 一定有這支（`SubprocessLauncher.as_write_forbidden`），
+        # 由 `tests/test_card_contract_sandbox_mode_716.py` 釘住。
+        write_forbidden_factory = getattr(launcher, "as_write_forbidden", None)
+        if callable(write_forbidden_factory):
+            launcher = write_forbidden_factory()
     return launcher
 
 

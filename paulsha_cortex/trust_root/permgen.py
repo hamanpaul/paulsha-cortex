@@ -8123,9 +8123,29 @@ def build_inner_sandbox_probe(
     layout: "PathLayout" = None,  # type: ignore[assignment]
     executor: str = "codex",
 ) -> list[str]:
-    """#714 反向不變式的實機探針（**只回傳字串，不執行**）。
+    """#714／#716 反向不變式的實機探針（**只回傳字串，不執行**）。
 
-    要證的是**四個方向**，缺一不可——少了任何一個，「內層沙箱還在」就只是一句宣稱：
+    ## #716 修掉的假綠：探針驗的形態不是 production 的形態
+
+    #715 的版本跑的是 `codex sandbox -- <cmd>`，**不帶** `-c sandbox_mode=`——而
+    `codex sandbox` 不帶 mode 時導出的是**唯讀族** profile。也就是說它驗到的是
+    planner／reviewer 的形態，**從來沒碰過 builder 的 `workspace-write`**。同一份加固面
+    複本、同一次量測（0819）：
+
+        1) #715 探針形態（不帶 sandbox_mode）  → <worktree pool>   rc=0    ← 綠
+        2) production 形態（workspace-write）  → panic             rc=101  ← 真實回歸
+
+    ⇒ 要驗的不是「`codex sandbox` 跑不跑得起來」，而是「**`build_codex_argv` 會發出的
+    每一個 `--sandbox <mode>`** 在真實加固面下都裝得上內層沙箱」。mode 清單由
+    :func:`registry.emitted_sandbox_modes` **機械導出**——手抄就會再抄成只有 `read-only`
+    那一格，那正是本節開頭那個假綠的原症狀。
+
+    ⚠️ **第二種假綠的陷阱**：`codex sandbox` **忽略 `config.toml` 裡的 `sandbox_mode`**，
+    只吃 `-c` 覆寫。0819 實測——`config.toml` 寫 `workspace-write` 但不帶 `-c` → rc=0
+    （**什麼都沒驗到**）；`config.toml` 空、`-c sandbox_mode='"workspace-write"'` →
+    panic rc=101。**因此本探針的每一條命令都帶 `-c`。**
+
+    ## 要證的方向（每一個 mode 都要，缺一不可）
 
     1. **缺陷還在**（不帶旗標的負向對照）——executor 的**預設**內層沙箱形態在真實
        加固面下**必須仍然失敗**，且逐字是 `bwrap: Can't read
@@ -8139,6 +8159,14 @@ def build_inner_sandbox_probe(
     4. **內層真的在擋**——沙箱不是「裝上了就算」：寫工作區外的檔必須 `Permission
        denied`、對外查名必須失敗。少了這一半，「旗標吃下去了但沒有沙箱」與「沙箱生效」
        在輸出上長得一模一樣，而那正是 `accepted_loss` 裡最不能靜默的那一格。
+
+    ## ⚠️ 落地當下這條探針**預期就是紅的**，那是誠實狀態
+
+    #716 的選項 F（`registry.SANDBOX_MODE_DERIVATION`）把唯讀 build 卡降到
+    `read-only`，但**會寫檔的 build 卡仍然會發 `workspace-write`** ⇒ 第 3 步在
+    `workspace-write` 那一列仍是 `panic rc=101`。**那一條紅逐字代表「#716 的寫入卡那
+    一半未解」**（票上的 A／B／E 裁決仍要做）。**不得**為了讓它變綠而放寬判準——
+    #715 就是這麼綠的。
 
     ## 為什麼這一支走 `psc_run_under`，而不是真實派工
 
@@ -8159,6 +8187,18 @@ def build_inner_sandbox_probe(
             f"executor {executor!r} 沒有登記 inner_sandbox——沒有內層沙箱就沒有這條"
             "反向不變式可驗（#714）。"
         )
+    # #716：mode 清單機械導出，且**產生器自己先斷言它含 `workspace-write`**。
+    # 不含 ⇒ 導出規則被人改成只剩唯讀族，那正是 #715 假綠的形狀 ⇒ 當場停，
+    # 不產生一份「看起來有在驗、其實只驗了唯讀」的探針。
+    sandbox_modes = registry.emitted_sandbox_modes()
+    if registry.SANDBOX_MODE_WORKSPACE_WRITE not in sandbox_modes:
+        raise ValueError(
+            "registry.emitted_sandbox_modes() 不含 "
+            f"{registry.SANDBOX_MODE_WORKSPACE_WRITE!r}（實得 {list(sandbox_modes)}）"
+            "——builder 的寫入卡今天仍然會發它，清單少了它代表導出規則被改成只剩唯讀"
+            "族，本探針會退化成 #715 那個假綠（只驗到 planner／reviewer 的形態）。"
+            "先查清楚導出規則，不要產生一份驗不到 production 形態的探針（#716）。"
+        )
     profile = executor_hardening_profile(executor)
     stem = job_unit_stem(layout, Principal.BUILDER, profile)
     binary = f"{layout.toolchain_root}/bin/{executor}"
@@ -8167,8 +8207,12 @@ def build_inner_sandbox_probe(
     probe_workspace = f"{layout.worktree_root}/probe"
     flag = " ".join(spec.argv)
     groups = " ".join(spec.syscall_groups)
+    # #716：`codex sandbox` **忽略 `config.toml` 的 `sandbox_mode`**，只吃 `-c` 覆寫
+    # ——因此每一條命令都必須帶這個 token（實測見本函式 docstring）。
+    mode_override = "-c sandbox_mode="
     lines: list[str] = [
-        "# === #714 反向不變式：executor 的內層沙箱還裝得上、而且真的在擋嗎 ===",
+        "# === #714／#716 反向不變式：production 會發的**每一個** sandbox mode，",
+        "#     內層沙箱都還裝得上、而且真的在擋嗎 ===",
         f"# 由 permgen 機械產生（scheme={scheme.scheme_id}，executor={executor}）"
         "——勿手改；重跑：",
         f"#   python3 -m paulsha_cortex.trust_root inner-sandbox-probe {scheme.scheme_id}",
@@ -8177,6 +8221,30 @@ def build_inner_sandbox_probe(
     lines += _wrap_comment(
         f"形態：{spec.kind}（argv `{flag}`，需要 `{groups}`）。"
         f"{spec.note}"
+    )
+    lines += _wrap_comment(
+        "**#716：mode 清單由 `registry.emitted_sandbox_modes()` 機械導出，一個字都沒有"
+        f"手抄**（本次導出：{'／'.join(sandbox_modes)}）。#715 的探針跑的是 "
+        f"`{executor} sandbox -- <cmd>` **不帶 mode**，而那時導出的是**唯讀族** profile "
+        "⇒ 它驗到的是 planner／reviewer 的形態，從來沒碰過 builder 的 "
+        f"`{registry.SANDBOX_MODE_WORKSPACE_WRITE}`——同一份複本同一次量測：不帶 mode "
+        "rc=0（綠）、`workspace-write` panic rc=101。手抄清單就會再抄成只有 "
+        f"`{registry.SANDBOX_MODE_READ_ONLY}` 那一格，也就是原症狀本身。"
+    )
+    lines += _wrap_comment(
+        f"⚠️ **第二種假綠的陷阱**：`{executor} sandbox` **忽略 `config.toml` 裡的 "
+        f"`sandbox_mode`**，只吃 `{mode_override}` 覆寫。0819 實測——config 寫 "
+        "`workspace-write` 但不帶 `-c` → rc=0（**什麼都沒驗到**）；config 空、"
+        "`-c sandbox_mode='\"workspace-write\"'` → panic rc=101。"
+        "**因此下面每一條命令都帶 `-c`；把它拿掉就等於什麼都沒驗。**"
+    )
+    lines += _wrap_comment(
+        "⚠️ **落地當下這條探針預期就是紅的。** #716 的選項 F 只把**唯讀 build 卡**降到 "
+        f"`{registry.SANDBOX_MODE_READ_ONLY}`；會寫檔的 build 卡仍然發 "
+        f"`{registry.SANDBOX_MODE_WORKSPACE_WRITE}`，而那一列在 legacy landlock 下 "
+        "100% `panic rc=101`（`linux_run_main.rs:318`）。**那一條紅逐字代表「#716 的寫入"
+        "卡那一半未解」**，票上的 A／B／E 裁決仍要做。**不得**為了讓它變綠而放寬判準"
+        "——#715 就是這麼綠的。"
     )
     lines += [
         "#",
@@ -8191,18 +8259,69 @@ def build_inner_sandbox_probe(
         f"#      期望：值裡含 `{groups}`。沒有 ⇒ 落檔的是舊版產生器的產物，重跑第 5-2",
         "#      步落檔再回來；**不要**在這裡手動加 property 把它蓋過去。",
         "",
-        "#   1) **負向對照**：不帶旗標＝executor 的預設內層沙箱形態，必須**仍然失敗**。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox -- /bin/pwd",
-        "#      期望：非零，且 stderr 逐字含 `Can't read /proc/sys/kernel/overflowuid`。",
-        "#      rc=0 ⇒ 有人放寬了 `ProcSubset`（或 executor 換了預設形態）——那會讓本票",
-        "#      的整個論證失效，**停下來查清楚**，不要因為「反正也是綠的」就放過。",
+        "#   0b) **探針自檢**：導出的 mode 清單必須含 production 的寫入形態。",
+        "#      不含 ⇒ 導出規則被改成只剩唯讀族 ⇒ 本探針退化成 #715 那個假綠，",
+        "#      **當場停**，不要往下跑。",
+        f"PSC_716_MODES=({' '.join(sandbox_modes)})",
+        f"case \" ${{PSC_716_MODES[*]}} \" in",
+        f"  *\" {registry.SANDBOX_MODE_WORKSPACE_WRITE} \"*) ;;",
+        "  *)",
+        f"    echo \"⛔ 導出的 mode 清單 ${{PSC_716_MODES[*]}} 不含 "
+        f"{registry.SANDBOX_MODE_WORKSPACE_WRITE}\" >&2",
+        "    echo \"   理由：builder 的寫入卡今天仍然會發它；少了它代表這份探針只驗得到\" >&2",
+        "    echo \"   planner／reviewer 的形態，也就是 #715 假綠的原症狀。先查導出規則。\" >&2",
+        "    return 1 2>/dev/null || exit 1",
+        "    ;;",
+        "esac",
+        "",
+        f"#   1／3) **per-mode 矩陣**：production 會發的每一個 `--sandbox <mode>`，各配",
+        "#      一組「不帶旗標必須仍然失敗（負向對照）」＋「帶旗標必須 rc=0（正向）」。",
+    ]
+    for mode in sandbox_modes:
+        quoted = f"'\"{mode}\"'"
+        lines += [
+            "",
+            f"#   --- mode: {mode} ---",
+            f"#   1[{mode}]) **負向對照**：不帶旗標＝executor 的預設內層沙箱形態，",
+            "#      必須**仍然失敗**。",
+            f"{PATH_PROBE_HELPER} {stem} {binary} sandbox -c sandbox_mode={quoted} -- /bin/pwd",
+            "#      期望：非零，且 stderr 逐字含 `Can't read /proc/sys/kernel/overflowuid`。",
+            "#      rc=0 ⇒ 外層被放寬了（有人動了 `ProcSubset`）或 executor 換了預設形態",
+            "#      ——那會讓本票的整個論證失效，**當場停下來查清楚**，不要因為「反正也是",
+            "#      綠的」就放過。",
+            f"#   3[{mode}]) 正向：同一份加固面下，帶 `{flag}` 就通。",
+            f"{PATH_PROBE_HELPER} {stem} {binary} sandbox -c sandbox_mode={quoted} {flag} \\",
+            "  -- /bin/pwd",
+        ]
+        if mode == registry.SANDBOX_MODE_WORKSPACE_WRITE:
+            lines += [
+                "#      **期望（今天）：panic rc=101，逐字**",
+                "#        `permission profiles requiring direct runtime enforcement are",
+                "#         incompatible with --use-legacy-landlock`",
+                "#        `linux-sandbox/src/linux_run_main.rs:318:9`",
+                "#      ⇒ **這一條紅代表 #716 的寫入卡那一半未解**（選項 F 只解唯讀卡）。",
+                "#      判準是一條性質：profile 只要攜帶**任何** filesystem 寫入授權就要求",
+                "#      direct runtime enforcement，而 legacy landlock 路徑不實作它",
+                "#      （`-P` 實測：`extends=\":read-only\"` rc=0／`\":none\"` rc=0／",
+                "#      `\":workspace\"` panic／`\":read-only\"` 加一條 filesystem write panic）。",
+                "#      **它變綠**（rc=0）⇒ 上游改了那條 fail-closed 檢查，或有人把導出規則",
+                "#      改成不再發這個 mode——兩者都要回來重看 A／B／E 的裁決，不是「終於好了」。",
+            ]
+        else:
+            lines += [
+                "#      期望：rc=0，stdout 是 job 的 cwd。",
+            ]
+    lines += [
         "",
         f"#   2) 旗標還在：`{flag}` 不得換來 `Unknown feature flag`。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/true",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox "
+        f"-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"' {flag} -- /bin/true",
         "#      期望：rc=0。stderr 出現 `Unknown feature flag` ⇒ **上游把旗標拿掉了**：",
         "#      內層沙箱從此不存在，而 job 會照跑。處置是回到 permgen 的 "
         "`EXECUTOR_TOOLS`",
         "#      那一列重新量一次形態，**不是**把這條探針刪掉。",
+        f"#      刻意固定用 `{registry.SANDBOX_MODE_READ_ONLY}`：要分辨的是「旗標存不存在」，",
+        "#      而 `workspace-write` 那一列在 profile 檢查就先 panic 了，分不出兩者。",
         "",
         "#   2b) **早期警報**：上游對這個旗標的 deprecation 宣告（0819 起就有）。",
         "#",
@@ -8220,16 +8339,18 @@ def build_inner_sandbox_probe(
         "#      ⚠️ 這句話**不影響** terminal 契約（`_extract_terminal_json()` 由尾端往回",
         "#      找 `agent_message`），但看到 job log 開頭有一筆 error 時不要誤判成失敗。",
         "",
-        "#   3) 正向：同一份加固面下，帶旗標就通。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/pwd",
-        "#      期望：rc=0，stdout 是 job 的 cwd。",
-        "",
         "#   4) 內層真的在擋（**這一段不可省略**——裝上了不等於有在擋）。",
         "#",
         "#      ⚠️ **每一條都要有成對的對照組。** 拿「寫 job HOME 被擋」當證據是**假的**",
         "#      ——那一格本來就不在 `ReadWritePaths=` 內，`ProtectSystem=strict` 會先回",
         "#      `Read-only file system`，內層有沒有裝上完全看不出來。要證明內層在擋，被",
         "#      擋的那一格必須是**外層允許**的那一格。",
+        "#",
+        f"#      ⚠️ **這一段只量得到 `{registry.SANDBOX_MODE_READ_ONLY}` 那一列**（#716）：",
+        f"#      `{registry.SANDBOX_MODE_WORKSPACE_WRITE}` 在**任何命令執行之前**就 panic，",
+        "#      「它放行哪些格」結構上量不到。因此以下每一條都逐字帶",
+        f"#      `-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"'`——不要把它拿掉",
+        "#      當成「量了兩種 mode」，那是第三種假綠。",
         "",
         f"#      4a) 對照：**沒有**內層沙箱時，外層允許寫 {probe_workspace}",
         f"{PATH_PROBE_HELPER} {stem} /bin/sh -c \\",
@@ -8237,12 +8358,14 @@ def build_inner_sandbox_probe(
         "rm -f psc-714-outer'",
         "#          期望：`OUTER_ALLOWS`、rc=0。",
         "#      4b) **同一格**，帶內層沙箱 ⇒ 必須被擋。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/sh -c \\",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox "
+        f"-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"' {flag} -- /bin/sh -c \\",
         f"  'cd {probe_workspace} && : > psc-714-inner && echo INNER_LEAK'",
         "#          期望：非零，逐字 `Permission denied`（landlock 擋寫）。",
         "#          印出 `INNER_LEAK` ⇒ 旗標吃下去了但沙箱沒生效。",
         "#      4c) 網路：帶內層沙箱 ⇒ 查不到名。",
-        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox {flag} -- /bin/sh -c \\",
+        f"{PATH_PROBE_HELPER} {stem} {binary} sandbox "
+        f"-c sandbox_mode='\"{registry.SANDBOX_MODE_READ_ONLY}\"' {flag} -- /bin/sh -c \\",
         "  'getent hosts api.openai.com'",
         "#          期望：非零（seccomp 擋網路）。",
         "#      4d) 對照：**沒有**內層沙箱時查得到（外層的 RestrictAddressFamilies 放行",
@@ -8258,6 +8381,15 @@ def build_inner_sandbox_probe(
         "命令**且產得出非空 bundle**」，那一條必須走真實派工（#709 的 caveat："
         f"`{PATH_PROBE_HELPER}` 複製的是加固面、不是派工路徑），工作區由真實 "
         "provisioning 產生（#645：手工前置物會把 bug 繞過去）。"
+    )
+    lines += _wrap_comment(
+        "**本探針量不到的（#716，逐條列出，不要當成已解）**："
+        f"(1) `{registry.SANDBOX_MODE_WORKSPACE_WRITE}` 模式下內層實際放行哪些格"
+        "——它在任何命令執行之前就 panic，結構上量不到；"
+        f"(2) `{binary} sandbox` 與 `{binary} exec --sandbox <mode>` 的等價性"
+        "——兩個端點對得上（`workspace-write` 兩邊同字串同 file:line、`read-only` 兩邊"
+        "皆 rc=0），但**未逐行證明是同一個函式**；"
+        "(3) 真實派工的端到端結果（會燒 token，且 production log 已有逐字證據）。"
     )
     lines += _wrap_comment(
         "**明載的取捨**（`InnerSandboxSpec.accepted_loss`，本探針量不到）："

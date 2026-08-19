@@ -434,6 +434,18 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   `@sandbox`（四支只能讓行程把自己關得更緊的 syscall）。第 5-2 步的八份 unit 需重落
   （`SystemCallFilter` 那一行多 ` @sandbox`）。
   → **64** 個 sudo 點、**250** 個驗證點。
+- **#716（選項 F：sandbox mode 由卡片契約導出；#715 的探針是假綠）新增**：4e-2g 的
+  **驗證 1 改為 per-mode 矩陣**，並新增 **4e-2h「sandbox mode 由卡片契約導出」**。
+  **起因**：#714／PR #715 落地之後 builder 仍然一條命令都跑不了，逐字
+  `permission profiles requiring direct runtime enforcement are incompatible with
+  --use-legacy-landlock`。病因是 argv 上的 **`--sandbox workspace-write`**——#715 的
+  兩條驗收都跑 `codex sandbox`（**不帶** `-c sandbox_mode=`），而那時導出的是**唯讀族**
+  profile ⇒ **它從來沒碰過 builder 的 `workspace-write`**。修法：mode 由
+  `registry.SANDBOX_MODE_DERIVATION` 從卡片契約機械導出（`commit_policy=forbidden`
+  **且** `declared_outputs` 為空 ⇒ `read-only`），探針的 mode 清單由**同一張表**導出。
+  **本步無部署期動作**（加固面 diff 為空，八份 unit 逐字不變）。
+  ⚠️ **落地之後這條探針的 `workspace-write` 那一列仍然是紅的**——那是 #716 未解的
+  另一半，不是回歸。
 
 ---
 
@@ -2889,11 +2901,18 @@ sudo systemctl cat cortex-monitor.service | grep '^SystemCallFilter='
 #   ⛔ 只有一部分帶 ⇒ 落檔漂移（有人只重跑了一部分），回第 5-2 步全部重落。
 #   ⛔ 出現 `@mount`／`pivot_root` ⇒ 有人走了上表的路線 A。停下來——那不是本票的決定。
 
-# ✅ 驗證 1（**反向不變式**，四個方向缺一不可）
+# ✅ 驗證 1（**反向不變式**，四個方向缺一不可；#716 起改為 **per-mode 矩陣**）
 python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
-#   它產生四段命令（全部走 `psc_run_under`，一行 `--property=` 都不自組）：
-#     1) **負向對照**：不帶旗標時 codex 的預設形態必須**仍然失敗**，逐字
-#        `Can't read /proc/sys/kernel/overflowuid`。rc=0 ⇒ 有人放寬了 `ProcSubset`，
+#   ⚠️ **#716：mode 清單由 `registry.emitted_sandbox_modes()` 機械導出**，探針對
+#      `build_codex_argv` 會發出的**每一個** `--sandbox <mode>` 各跑一組 1)／3)。
+#      清單不含 `workspace-write` ⇒ 探針 0b 步當場停（那代表導出規則被改成只剩唯讀族，
+#      也就是 #715 假綠的原症狀）。**詳見 4e-2h。**
+#   ⚠️ **每一條命令都必須帶 `-c sandbox_mode=`**：`codex sandbox` **忽略 `config.toml`
+#      裡的 `sandbox_mode`**，只吃 `-c` 覆寫（0819 實測：config 寫 workspace-write 不帶
+#      `-c` → rc=0 什麼都沒驗到）。把 `-c` 拿掉＝什麼都沒驗。
+#   它產生的命令（全部走 `psc_run_under`，一行 `--property=` 都不自組）：
+#     1) **負向對照**（每個 mode 各一條）：不帶旗標時 codex 的預設形態必須**仍然失敗**，
+#        逐字 `Can't read /proc/sys/kernel/overflowuid`。rc=0 ⇒ 有人放寬了 `ProcSubset`，
 #        本票的整個論證失效——**停下來查清楚**，不要因為「反正也是綠的」就放過。
 #     2) **旗標還在**：不得回 `Error: Unknown feature flag: use_legacy_landlock`。
 #        ⚠️ 這條是本探針存在的**主要**理由——旗標名帶 `legacy`，那是對 codex 某一版的
@@ -2902,7 +2921,12 @@ python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 #        ⚠️ `codex sandbox` 子命令**不印**那句話（0819 實測），只有 `exec --json` 會把它
 #        當一筆 `item.type=error` 放進串流——拿 `sandbox` 的輸出去 grep 只會得到一個
 #        看起來很安心、其實什麼都沒驗到的「沒有 deprecation 訊息」。
-#     3) **正向**：帶旗標 rc=0。
+#     3) **正向**（每個 mode 各一條）：帶旗標 rc=0。
+#        ⚠️ **`workspace-write` 那一列今天是紅的**（0819 實機、真實加固面複本、42 條
+#        property）：`panic rc=101` ＋ `linux_run_main.rs:318:9` ＋ 逐字
+#        `permission profiles requiring direct runtime enforcement are incompatible
+#        with --use-legacy-landlock`。**那條紅代表 #716 的寫入卡那一半未解**，不是回歸。
+#        **不得**為了讓它變綠而放寬判準（拿掉 `-c` 就會變綠——那正是 #715 的假綠）。
 #     4) **真的在擋**，且**每一條都配一個對照組**：同一格路徑在沒有內層沙箱時
 #        寫得進去（`OUTER_ALLOWS`）、帶了內層沙箱就 `Permission denied`；
 #        `getent hosts` 在沒有內層沙箱時 rc=0、帶了就非零。
@@ -2942,6 +2966,107 @@ sudo -u cortex-manager ls -l /var/lib/cortex/coordinator/commit-spool/<slice>/
 **回滾**：把 `SystemCallFilter` 改回 `@system-service` 並重落八份 unit ＋ 退回上一版
 cortex（argv 就不再帶旗標）。回滾之後 builder 會回到 #714 的原症狀——**每一條 shell
 命令都失敗，而 log 上看起來像模型自己決定放棄**。
+
+#### 4e-2h. sandbox mode 由**卡片契約**導出 × 探針的 per-mode 矩陣（#716 選項 F）
+
+> **本節沒有部署期動作。** 加固面 diff 為空——八份 unit 逐字不變，`ReadWritePaths=`／
+> `SystemCallFilter=`／`ProcSubset=` 一個字都沒動。它改的是 **executor argv 上的一個
+> token**，以及 4e-2g 那條探針的判準。
+
+**起因**：4e-2g 落地之後 builder **仍然**一條命令都跑不了。0819 的 build job
+`wf-6c37c77ca1-worktree-isolation-7` 逐字：
+
+```
+"error":"permission profiles requiring direct runtime enforcement are
+         incompatible with --use-legacy-landlock"
+```
+
+病因**不是** git、**不是** `$CODEX_HOME`、**不是** `$TMPDIR`（四條都已逐條否證），
+是 argv 上的 **`--sandbox workspace-write`**：codex 由它導出 `:workspace` 族 permission
+profile，該族要求 direct runtime enforcement，而 legacy landlock 路徑不實作它
+（`linux-sandbox/src/linux_run_main.rs:318` 的 fail-closed 檢查）。
+
+判準是一條**性質**，不是某個具名 profile：**profile 只要攜帶任何 filesystem 寫入授權，
+就要求 direct runtime enforcement**。`-P` 實測：`extends=":read-only"` rc=0／`":none"`
+rc=0／`":workspace"` panic／`":read-only"` **加一條** `filesystem = { "<路徑>" = "write" }`
+**panic**。這是 **session 層級**判定，發生在任何命令執行**之前**——所以模型的唯讀
+`git rev-parse HEAD` 與一條寫入命令 panic 得一模一樣。
+
+**#715 的兩條驗收為什麼沒抓到**：它們跑的是 `codex sandbox -- <cmd>`，**不帶**
+`-c sandbox_mode=`，而那時 codex 導出的是**唯讀族** profile ⇒ 驗到的是 planner／
+reviewer 的形態，**從來沒碰過 builder 的 `workspace-write`**。同一份加固面複本、
+同一次量測（0819，42 條 property，instance 用真 worktree）：
+
+| 形態 | 結果 |
+| --- | --- |
+| `codex sandbox --enable use_legacy_landlock -- /bin/pwd`（#715 的形態） | rc=0 ← **綠** |
+| `… -c sandbox_mode='"read-only"' …` | rc=0 |
+| `… -c sandbox_mode='"workspace-write"' …` | **panic rc=101** ← 真實回歸 |
+| 兩個 mode **不帶**旗標（負向對照） | rc=1，`bwrap: Can't read /proc/sys/kernel/overflowuid` |
+
+> ⚠️ **第二種假綠的陷阱**：`codex sandbox` **忽略 `config.toml` 裡的 `sandbox_mode`**，
+> 只吃 `-c` 覆寫。0819 實測——config 寫 `workspace-write` 但不帶 `-c` → rc=0
+> （**什麼都沒驗到**）；config 空、`-c sandbox_mode='"workspace-write"'` → panic rc=101。
+> **探針的每一條命令都必須帶 `-c`。**
+
+**採用的修法（票上的 F）**：sandbox mode 由 **`registry.SANDBOX_MODE_DERIVATION`** 從
+**卡片契約**機械導出，不由 persona 一刀切——`commit_policy=forbidden` **且**
+`declared_outputs` 為空的 build 卡拿 `read-only`，其餘一律維持 `workspace-write`
+（契約缺欄／解不出來 ⇒ **不猜**）。五種寫入契約在 registry import 當下被全覆蓋斷言
+釘死，「只修一格」結構上做不到（同 #708／#710／#712 的形狀）。
+
+> **這是獨立成立的最小權限缺陷，不是 landlock 的 workaround。** 一張契約上宣告不
+> commit、也不宣告任何產出的卡，本來就不該拿到工作區寫入授權；legacy landlock 只是
+> 讓它從「權限給多了」變成當場 panic。
+
+```bash
+# ✅ 驗證 1：導出規則長什麼樣（純讀，零 sudo）
+python3 - <<'PY'
+from paulsha_cortex.trust_root import registry as r
+for row in r.SANDBOX_MODE_DERIVATION:
+    print(f"{row.contract.value:<26} {str(row.sandbox_mode):<16} "
+          f"write_grant={row.grants_filesystem_write}")
+print("emitted:", r.emitted_sandbox_modes())
+PY
+#   期望逐字：
+#     unsafe-bypass              None             write_grant=True
+#     planner-read-only          read-only        write_grant=False
+#     reviewer-review-only       read-only        write_grant=False
+#     builder-write-forbidden    read-only        write_grant=False
+#     builder-workspace-write    workspace-write  write_grant=True
+#     emitted: ('read-only', 'workspace-write')
+#   ⛔ `emitted` 少了 `workspace-write` ⇒ 有人把導出規則改成只剩唯讀族，
+#      4e-2g 的探針會退化成 #715 那個假綠。停下來查清楚。
+
+# ✅ 驗證 2：per-mode 矩陣（走 4e-2g 的驗證 1，這裡只記**期望值**）
+python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
+#   0819 實跑（jit 剖面、真 worktree instance、42 條 property）：
+#     1[read-only]        → rc=1  `bwrap: Can't read /proc/sys/kernel/overflowuid`
+#     3[read-only]        → rc=0  （stdout 是 job 的 cwd）
+#     1[workspace-write]  → rc=1  同一句 bwrap
+#     3[workspace-write]  → rc=101 `linux_run_main.rs:318:9` ＋ panic 逐字
+#     2（旗標還在）        → rc=0
+#   ⚠️ **`3[workspace-write]` 這一條紅是誠實狀態，不是回歸**：F 只解得了唯讀卡，
+#      **會寫檔的 build 卡仍然發 `workspace-write`**，#716 的 A／B／E 裁決仍要做。
+#      **不得**為了讓它變綠而放寬判準（把 `-c` 拿掉就會綠——那正是 #715 的假綠）。
+
+# ✅ 驗證 3：真實派工 smoke（**這一條才是驗收**，走 4e-2g 的驗證 2）
+#    唯讀卡（例如 `worktree-isolation`）應該能跑完並產出 `job.last.json`；
+#    `-o` 的落點由 codex **進程自己**寫，不經模型沙箱——0819 實測 `-s read-only`
+#    ＋ legacy landlock ＋ `-o <path>` → rc=0、`turn.completed`、檔案有內容。
+```
+
+**明載的邊界**（不要當成 #716 的完整解）：
+
+- F **只**解得了唯讀卡。同一個 build phase 的**下一張會寫檔的卡**會撞同一面牆。
+- `use_legacy_landlock` 的倒數仍在跑（4e-2g 的 `accepted_loss` 第三條）。旗標消失
+  那天，連 `read-only` 那一半都會回到桌上。
+- **`workspace-write` 模式下內層實際放行哪些格量不到**——它在任何命令執行之前就
+  panic。4e-2g 驗證 1 的第 4 段因此只量得到 `read-only` 那一列，並逐字帶
+  `-c sandbox_mode='"read-only"'`；把它拿掉當成「量了兩種 mode」是**第三種假綠**。
+
+**回滾**：退回上一版 cortex（`build_codex_argv` 就回到「builder 一律 `workspace-write`」）。
+加固面無需動——本節從頭到尾沒有落檔變更。
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 
