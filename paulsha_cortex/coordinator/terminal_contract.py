@@ -62,6 +62,38 @@ MAX_SCHEMA_RETRIES = 2
 # 不同，不應共用同一個計數器與門檻。
 MAX_PROVIDER_RETRIES = 2
 
+# #717：`run.attempts` 上兩個 schema mismatch 計數鍵的前綴，收在契約模組裡當單一
+# 真相源——過去這串字面量散在 `manager._schema_retry_attempt_key`、
+# `monitor.providers.SCHEMA_RETRY_ATTEMPT_PREFIX` 兩處，而 registry 的
+# `retry-card` 重置需要第三處，正是漂移的溫床。
+#
+# 兩個鍵刻意分家，因為它們回答的是兩個不同的問題：
+#
+# - `schema-mismatch:<card>`（**本輪**額度）：operator 一次顯式重派（`retry-card`）
+#   之內已經自動回派了幾次。`registry._manager_reset_workflow_for_retry_card`
+#   會把它清掉——operator 的顯式重派語意上就是「重新給一輪額度」。
+# - `schema-mismatch-total:<card>`（**累計**觀測）：這張卡從頭到尾一共撞過幾次
+#   確定性 mismatch，跨 `retry-card` 世代累加、永不清零，供成本診斷與 #555 之後
+#   的 per-card 熔斷有一個既有的機械來源可接。
+#
+# 兩者共用同一個 `(n/N)` 正是 #717 追加觀察裡 operator 被誤導的原因：attention 上
+# 寫「已達上限（2/2）」，實際上這一輪只跑過一次，額度是上一輪燒掉的。
+SCHEMA_RETRY_ATTEMPT_PREFIX = "schema-mismatch:"
+SCHEMA_MISMATCH_TOTAL_PREFIX = "schema-mismatch-total:"
+
+
+def schema_retry_attempt_key(card_id: str) -> str:
+    """本輪 schema mismatch retry 計數在 ``run.attempts`` 上的鍵。"""
+
+    return f"{SCHEMA_RETRY_ATTEMPT_PREFIX}{card_id}"
+
+
+def schema_mismatch_total_key(card_id: str) -> str:
+    """跨 ``retry-card`` 世代的累計 schema mismatch 觀測鍵（永不清零）。"""
+
+    return f"{SCHEMA_MISMATCH_TOTAL_PREFIX}{card_id}"
+
+
 GATE_LEDGER_SCHEMA_VERSION = 1
 GATE_LEDGER_KIND = "workflow-gate-ledger"
 
@@ -236,12 +268,24 @@ class TerminalDiagnostics:
 
     刻意不含任何授權語意的欄位；``observed_head`` 是「觀察到的」而非「已授權的」，
     因此 :meth:`candidate_authority` 永遠回 ``None``。
+
+    #717：新增 ``model_diagnostics``——模型在 envelope 的 ``diagnostics`` 欄位裡
+    逐字寫下的病因。它與其他欄位的性質**不同**：``reason``／``observed_head`` 是
+    manager 自產的觀察，``model_diagnostics`` 是模型講的話。兩者放在同一個 dataclass
+    上是因為 operator 要的是同一份 attention，但語意分離必須維持——模型講的話
+    同樣不構成任何 authority（``authority_granted`` 仍恆為 ``False``），只是讓
+    「workflow terminal payload did not satisfy the result contract」這句廢話旁邊
+    終於有病因。
+
+    以 tuple of pairs 而非 dict 儲存，維持 ``frozen=True`` 的不可變與可雜湊性，
+    順序即模型寫入順序（同一份 log 讀兩次結果逐字相同）。
     """
 
     job_id: str
     observed_head: str | None
     reason: str
     validation_path: str | None = None
+    model_diagnostics: tuple[tuple[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -250,8 +294,17 @@ class TerminalDiagnostics:
             "observed_head": self.observed_head,
             "reason": self.reason,
             "validation_path": self.validation_path,
+            "model_diagnostics": dict(self.model_diagnostics),
             "authority_granted": False,
         }
+
+    def model_diagnostics_text(self) -> str:
+        """把模型 diagnostics 壓成單行文字，供 attention 的 ``detail`` 逐字帶出。
+
+        空集合回空字串——呼叫端據此決定要不要接這一段，不得憑空捏造內容。
+        """
+
+        return "；".join(f"{key}={value}" for key, value in self.model_diagnostics)
 
     def candidate_authority(self) -> None:
         """診斷資訊永遠不構成 candidate authority。"""

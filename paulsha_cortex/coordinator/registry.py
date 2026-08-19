@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from paulsha_cortex.config import paths
-from . import verification
+from . import terminal_contract, verification
 from .claim import claim_key_for_authority_digest
 from .diagnostics import (
     DiagnosticInvariantError,
@@ -2118,13 +2118,34 @@ class JobRegistry:
             else step
             for step in current.steps
         )
+        # #717：operator 的顯式重派＝**重新給一輪 schema retry 額度**。
+        #
+        # 過去只 bump `attempts[phase]`，同一個 dict 上的 `schema-mismatch:<card>`
+        # 原封不動留著。08-19 實機逐字後果：計數在前兩次派工就累到 2 → operator 下
+        # `retry-card` 重派 → 新 job 只產生**一份**不合契約的 terminal 就
+        # `seen >= MAX_SCHEMA_RETRIES` 判 exhausted，這一輪一次自動重試都沒有，
+        # attention 卻寫「已達上限（2/2）」——operator 讀成「它剛剛試了兩次」。
+        #
+        # 本輪額度清零，但**累計觀測不清**：值搬到 `schema-mismatch-total:<card>`
+        # 累加，因此成本診斷與 #555 之後要接的 per-card 熔斷仍有一個單調遞增、
+        # 跨世代的機械來源。這裡不新增熔斷（#555 仍 open）——`retry-card` 本身就
+        # 沒有次數上限，清這個鍵並未移除任何**既有的**熔斷，只是移除了跨世代的
+        # 意外殘留。
+        card_retry_key = terminal_contract.schema_retry_attempt_key(card)
+        card_total_key = terminal_contract.schema_mismatch_total_key(card)
+        attempts = {
+            key: value
+            for key, value in current.attempts.items()
+            if key != card_retry_key
+        }
+        attempts[phase] = current.attempts.get(phase, 0) + 1
+        carried = current.attempts.get(card_retry_key, 0)
+        if carried:
+            attempts[card_total_key] = current.attempts.get(card_total_key, 0) + carried
         updated = replace(
             current,
             steps=steps,
-            attempts={
-                **current.attempts,
-                phase: current.attempts.get(phase, 0) + 1,
-            },
+            attempts=attempts,
             facets=tuple(facet for facet in current.facets if facet != "needs_human"),
             # 診斷 invariant：清掉 needs_human facet 就必須清掉理由——
             # 陳舊理由會讓 operator 讀到上一輪的原因（見 WorkflowRun.__post_init__）。
