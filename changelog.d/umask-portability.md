@@ -20,6 +20,16 @@
   umask 下這條都轉紅——斷言沒有被拿掉，也沒有被放寬成恆真。另補兩條輔助斷言
   （`mutated_mode != baseline_mode`、chmod 後實際 mode 等於 `mutated_mode`），讓將來若
   再退化成 no-op 時失敗訊息直接指到成因，而不是只看到兩個一樣的雜湊。
+- **`#723`(a) 同族掃描的另外兩處：`tests/test_per_job_workspace_acl_710.py` 的
+  `pool.mkdir(mode=0o701)` 同因（`mkdir(2)` 的 `mode` 引數**會**被 umask 遮罩，`chmod` 不會）。**
+  兩處（`:650`／`:720`）都是 per-job ACL 隔離測試的 pool 根。在 `UMask=0077` 底下實際建出來
+  是 `0700`，**pool 根的 other-execute 被靜默拿掉**——而「借來的第二個帳號 traverse 得進
+  pool 才談得上各自進不進得去自己那一格」正是這兩條測試的前提。同檔的 `acl_tree` fixture
+  對自己的 root 用 `os.chmod(root, 0o755)`（umask 免疫）正是同一個理由，pool 漏掉了；`:720`
+  尤其諷刺——它在四行之後才 `os.umask(0o077)` 模擬 gate，但在真的跑在 `UMask=0077` 的 unit
+  裡時，那行 mkdir 在切換**之前**就已經被遮掉了。改成 `mkdir()` ＋ `chmod(0o701)`。
+  **這兩條在 operator 的 umask 下今天是綠的**（`0o701 & ~0o022 == 0o701`），屬**潛伏**而非
+  現行紅燈；修它是因為與 (a) 同因、且症狀是「靜默驗到比預期弱的情境」而不是紅燈。
   ⚠️ **jit 剖面也是 `UMask=0077`**，故本修正與 `#723`(b) 的剖面裁決無關，兩條路都受益。
   `#723`(b)（strict 剖面的 `MemoryDenyWriteExecute` 殺 node，`test_openspec_archive_purpose.py`）
   屬 operator 裁決，本次**不動**。

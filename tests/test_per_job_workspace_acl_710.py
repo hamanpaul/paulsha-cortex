@@ -647,7 +647,13 @@ def test_one_job_cannot_reach_another_jobs_slot(acl_tree: Path) -> None:
         pytest.skip(_NEEDS_SECOND_ACCOUNT)
     first, second = accounts
     pool = acl_tree / "worktree"
-    pool.mkdir(mode=0o701)
+    pool.mkdir()
+    # issue #723 同族：`mkdir(mode=...)` 的 mode **會被 umask 遮罩**，`chmod` 不會。
+    # 在 `UMask=0077` 的 unit（cortex-gate-job@.service）底下 `mkdir(mode=0o701)`
+    # 實際建出來是 `0700`，pool 根的 other-execute（借來的帳號 traverse 得進去的
+    # 那個位元）被靜默拿掉——本測試整個前提就架在它上面。`acl_tree` fixture 對
+    # 自己的 root 用 `os.chmod(root, 0o755)` 正是同一個理由，pool 漏掉了。
+    pool.chmod(0o701)
     slot_a = pool / "job-710-A"
     slot_b = pool / "job-710-B"
     slot_a.mkdir(mode=0o700)
@@ -717,7 +723,12 @@ def test_a_workspace_from_real_provisioning_is_reachable_by_its_job(
     _git(["commit", "-m", "base"], source)
 
     pool = acl_tree / "worktree"
-    pool.mkdir(mode=0o701)
+    pool.mkdir()
+    # issue #723 同族：pool 根的 `0o701` 必須由 `chmod` 下（umask 不遮），不能靠
+    # `mkdir(mode=...)`（會遮）。下面第 731 行才把 umask 切成 `0o077` 模擬 gate，
+    # 但在 `UMask=0077` 的 unit 底下跑整套時，這一行 mkdir 在切換**之前**就已經
+    # 被遮成 `0700` 了——pool 根與 workspace 兩層剛好一起失去 traverse。
+    pool.chmod(0o701)
     creator = seams.ScriptWorktreeCreator(repo=source, wt_root=pool, base="main")
     # Manager unit 的 `UMask=0077` 是這棵樹長什麼樣的一半——沒有它，clone 出來是
     # `0755`，「job 進不去」在本機就**觀察不到**（而那正是本票要驗的那個缺陷）。
