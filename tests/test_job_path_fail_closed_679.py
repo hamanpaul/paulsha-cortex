@@ -82,6 +82,10 @@ def test_build_job_env_fails_closed_when_the_role_path_is_undeclared(role: str) 
             job_id="j",
             slice_id="s",
             repo_root="/r",
+            # #712：`workspace` 是新增的**必填**具名參數。本檔驗的是 `PATH` 的
+            # fail-closed 語意，與工作區無關 ⇒ 一律 `None`（＝「本呼叫端沒有工作區」，
+            # 與 preflight 同一個語意），被驗行為因此逐位元不變。
+            workspace=None,
             role=role,
         )
     diagnostic = excinfo.value.diagnostic
@@ -118,6 +122,7 @@ def test_the_job_path_never_falls_back_to_the_daemon_path(role: str) -> None:
         job_id="j",
         slice_id="s",
         repo_root="/r",
+        workspace=None,  # #712：同上，本檔與工作區無關。
         role=role,
     )
     assert env["PATH"] == declared

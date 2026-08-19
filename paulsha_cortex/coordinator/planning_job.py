@@ -395,11 +395,21 @@ class JobPlanningInvoker:
     ) -> _CompletedJob:
         sentinel = reservation.slot / "client.exit"
         client_log = reservation.slot / "client.log"
+        # #712：spec 的 `working_directory` 與 env 的 git 放行必須是**同一個已解析
+        # 的字串**——git 比對 `safe.directory` 逐字相等，且比的是 `getcwd()` 之後的
+        # physical path。因此在這裡解析一次，兩邊共用。
+        #
+        # planning 的 scratch 裡**沒有 repo**（`_prepare_scratch` 建的是一格空目錄），
+        # 所以這條放行在 define／brainstorm 上是無害的 no-op；形態是 **per-principal**
+        # 的，而 reviewer 帳號的**另一種**工作區（foreign review 的 linked worktree）
+        # 確實跨 owner——見 `registry.JOB_GIT_WORKSPACE_TRUST` 的 reviewer 那一列。
+        workspace = str(Path(reservation.cwd).resolve())
         env = job_runner.build_job_env(
             manager_env=self._env,
             job_id=reservation.job_id,
             slice_id=reservation.job_id,
             repo_root=_job_repo_root(),
+            workspace=workspace,
             role=job_runner.JOB_ROLE_REVIEW,
         )
         # design D3 的第 1 條：planning 的 job **顯式**只有模型 argv 一段。
@@ -412,7 +422,7 @@ class JobPlanningInvoker:
             instance=plan.instance,
             unit=plan.unit,
             command=list(argv),
-            working_directory=str(reservation.cwd),
+            working_directory=workspace,
             log_path=str(log_path),
             env=env,
         )

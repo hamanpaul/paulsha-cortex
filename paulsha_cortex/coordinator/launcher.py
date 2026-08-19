@@ -1319,6 +1319,12 @@ class SubprocessLauncher:
                 job_id=slice_id,
                 slice_id=slice_id,
                 repo_root=str(Path(__file__).resolve().parents[2]),
+                # #712：preflight **沒有工作區**——它報告的是 PATH／HOME／sandbox
+                # 剖面，而那時還沒有任何 job 工作區可言。逐 job 的 git 放行因此在
+                # 這裡是空的，而這不是 fail-open：真實派工那一支（`launch()`）的
+                # `workspace=` 是必填具名參數，且 `build_job_spec()` 另外斷言
+                # 「env 放行的那一格＝spec 的 working_directory」。
+                workspace=None,
                 relay_target=self._relay_target,
                 role=self._job_role(),
             )
@@ -1444,6 +1450,13 @@ class SubprocessLauncher:
                 job_id=slice_id,
                 slice_id=slice_id,
                 repo_root=str(Path(__file__).resolve().parents[2]),
+                # #712：git 的 dubious-ownership 那一層。`worktree` 在上面已經被
+                # `Path(...).resolve(strict=True)` 換成**已解析的**絕對路徑字串，而
+                # 下面 `build_job_spec()` 的 `working_directory=` 用的是**同一個變數**
+                # ——兩者必須逐字相同（git 比對 `safe.directory` 是逐字相等，且比的是
+                # `getcwd()` 之後的 physical path；實測 git 2.43 走 symlink 進去就不算
+                # 同一條）。這條相等性由 `build_job_spec()` 斷言。
+                workspace=worktree,
                 relay_target=self._relay_target,
                 role=job_role,
             )

@@ -3622,6 +3622,125 @@ def _assert_job_workspace_reach_matches_the_plan() -> None:
 _assert_job_workspace_reach_matches_the_plan()
 
 
+#: `_assert_git_workspace_trust_matches_the_gitconfig()` 的探針 layout。
+#:
+#: `DEFAULT_LAYOUT.source_repo_slugs` 刻意留空（來源 repo 是部署決定，猜不到就只能
+#: 猜錯，見 :class:`UnresolvedSourceRepoError`），因此拿它去產 `.gitconfig` 只會
+#: raise，斷言會變成一句空話。改以一個**代表性 slug** 產一份真的檔來驗形狀：要擋的
+#: 漂移（有人往 `[safe]` 塞萬用字元或塞 pool 根）與 slug 叫什麼無關。
+_GIT_TRUST_PROBE_LAYOUT = replace(DEFAULT_LAYOUT, source_repo_slugs=("psc-git-trust-probe",))
+
+
+def _assert_git_workspace_trust_matches_the_gitconfig() -> None:
+    """#712 那條規則的**另一半**，在 import 當下強制。
+
+    registry 那一半管「三個 principal 一格都不能少，且與 `JOB_WORKSPACE_REACH` 對
+    『誰建那一格』的宣告一致」；本函式管**那份靜態 `.gitconfig` 真的沒有涵蓋工作區**
+    ——也就是把「per-job env 是必要的」這句話從論證升級成斷言。
+
+    這正是本票的原始缺陷形狀：`builder-gitconfig` 的 note 宣稱它涵蓋 per-job clone，
+    產生器實際只出來源樹那兩條，而**兩者之間沒有任何東西在比對**。於是那則宣稱活了
+    兩個月，直到 #710 把 ACL 補上、builder job 第一次真的跑起來才炸出來（#696 的同型，
+    本票是第三個實例）。
+
+    逐條驗：
+
+    1. **`[safe]` 一律不得出現萬用字元。** 產生器的註解逐字寫著「字面 `*` 等於對這個
+       帳號整個關掉該保護——那是 opt-out，不是授權」，但那條紀律在本票之前只是註解。
+       這是本票最可能的**壞修法**（「加個 `*` 讓它過」），必須讓模組載不起來。
+    2. **`[safe]` 不得出現任何工作區 pool／per-job 資產的路徑。** 第二個壞修法是
+       「把 pool 根加進靜態檔」——它一來對 per-job 那一格沒有用（git 只認逐字相等的
+       路徑，實測：只給來源樹的兩條時 linked worktree 仍被拒），二來若真的生效就是
+       整個 pool 的放行，per-job 的逐格語意當場歸零。
+    3. **`PER_JOB_ENV` 的工作區路徑必須真的帶動態段**——沒有動態段就代表它其實是個
+       部署期常數，那時「靜態檔裝不下」這個前提不成立，整條規則要重新論證。
+    4. **`OWNED_BY_JOB` 的 pool 根 owner 必須就是該帳號**：那是它「不需要放行」的
+       **唯一**來源。#710 已從可達性的角度驗過同一件事，這裡從 git 信任的角度再驗
+       一次是刻意的——兩條性質在同一個事實上，錯誤訊息卻要各自指向自己的那一票。
+    """
+
+    plan = generate_plan(DEFAULT_SCHEME)
+    paths_by_asset = _GIT_TRUST_PROBE_LAYOUT.asset_paths()
+    workspace_paths: set[str] = set()
+    for reach in registry.JOB_WORKSPACE_REACH:
+        for pool_id in reach.pool_asset_ids:
+            workspace_paths.add(paths_by_asset[pool_id])
+        if reach.per_job_asset_id:
+            workspace_paths.add(paths_by_asset[reach.per_job_asset_id])
+
+    for trust in registry.JOB_GIT_WORKSPACE_TRUST:
+        account = DEFAULT_SCHEME.resolve(trust.persona)
+        if account is None:  # pragma: no cover - DEFAULT_SCHEME 涵蓋三個降權角色
+            raise ValueError(
+                f"{trust.principal.value}：persona {trust.persona.value} 在 "
+                f"{DEFAULT_SCHEME.scheme_id} 下沒有帳號（#712）。"
+            )
+        reach = registry.job_workspace_reach_for(trust.principal)
+        if trust.trust is registry.GitWorkspaceTrust.OWNED_BY_JOB:
+            for pool_id in reach.pool_asset_ids:
+                pool_entry = plan.by_id(pool_id)
+                if pool_entry.owner != account:
+                    raise ValueError(
+                        f"{trust.principal.value}：git 信任宣告 "
+                        f"`{trust.trust.value}`，但 {pool_id} 的 owner 是 "
+                        f"{pool_entry.owner} 而不是 {account}——「job 自己建、自己擁有"
+                        "」就不成立了，git 會開始看到跨 owner，而**執行期零動作**的"
+                        "形態接不住那件事（#712）。"
+                    )
+            continue
+        # --- PER_JOB_ENV ---
+        for pool_id in reach.pool_asset_ids:
+            pool_path = paths_by_asset[pool_id]
+            leaf_path = (
+                paths_by_asset[reach.per_job_asset_id] if reach.per_job_asset_id else None
+            )
+            dynamic = leaf_path if leaf_path is not None else pool_path
+            if leaf_path is None and PER_JOB_SEGMENT not in dynamic:
+                # reviewer 那一列沒有 per-job 資產（那一格不是獨立資產，靠繼承），
+                # 工作區是 pool 底下 Manager 逐次開出來的**一格**——因此「動態」的
+                # 證據是「pool 根本身不是工作區」，而它由下一段的 disjoint 檢查涵蓋。
+                continue
+            if leaf_path is not None and PER_JOB_SEGMENT not in leaf_path:
+                raise ValueError(
+                    f"{trust.principal.value}：per-job 資產 "
+                    f"{reach.per_job_asset_id}（{leaf_path}）不帶 {PER_JOB_SEGMENT!r}"
+                    "——那代表工作區其實是個部署期常數，「靜態 .gitconfig 裝不下它」"
+                    "這個前提不成立，#712 那條規則要重新論證。"
+                )
+        asset_id = ACCOUNT_GITCONFIG_ASSETS.get(trust.persona) or ACCOUNT_GITCONFIG_ASSETS.get(
+            trust.principal
+        )
+        if asset_id is None:
+            # 這個 persona 沒有靜態 `.gitconfig`（今天沒有這種降權角色；gate 的
+            # `gate-gitconfig` 仍是 deferred，而 gate 走的是 OWNED_BY_JOB 那一支）。
+            # 沒有靜態檔就沒有「靜態檔宣稱涵蓋了什麼」的問題，本段無事可驗。
+            continue
+        gitconfig = build_account_gitconfig(
+            DEFAULT_SCHEME, _GIT_TRUST_PROBE_LAYOUT, trust.persona
+        )
+        for entry in gitconfig.safe_directories:
+            if "*" in entry:
+                raise ValueError(
+                    f"⛔ {asset_id} 的 `[safe] directory = {entry}` 帶萬用字元——git 只"
+                    "認逐字相等的路徑或字面 `*`（實測 git 2.43：`<repos>/*` 仍被拒），"
+                    "而字面 `*` 等於對 "
+                    f"{account} 整個關掉 dubious-ownership 保護：**那是 opt-out，不是"
+                    "授權**（#623／#712）。per-job 那一格走 spec 的 env，不走這份檔。"
+                )
+            if entry in workspace_paths:
+                raise ValueError(
+                    f"⛔ {asset_id} 的 `[safe] directory = {entry}` 是一棵**工作區**"
+                    "（pool 根或 per-job 資產）——靜態檔放行工作區有兩個問題：對逐 job "
+                    "的那一格沒有效果（git 只認逐字相等的路徑，per-job 路徑帶動態段），"
+                    "而真的生效的那部分是**整個 pool** 的放行，逐 job 語意當場歸零"
+                    "（#712）。這份檔只放來源樹。"
+                )
+
+
+# 呼叫刻意排在 `build_account_gitconfig()` 之後（本檔尾端的 gitconfig 那一節）——
+# 本函式要拿一份**真的產出來的** `.gitconfig` 去驗，不是驗一組常數。
+
+
 def principal_needs_write(
     asset: TrustRootAsset,
     principals: frozenset[Principal],
@@ -4844,13 +4963,31 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
         "builder-gitconfig", DependencyKind.ACCOUNT_CONFIG,
         (Principal.BUILDER,), (RunStage.MODEL_CALL,),
         covered_by="builder-gitconfig",
-        note="per-job clone 的 `safe.directory`；root-owned（`alias.*` 會執行外部命令）。",
+        note=(
+            "**來源樹**那兩條逐字 `safe.directory`（`<repos>/<slug>` 與其 `.git`，"
+            "#623）；root-owned（`alias.*`／`core.fsmonitor` 會執行外部命令）。"
+            "\n⛔ **不涵蓋 per-job clone**——本項的 note 從 #623 起逐字寫著「per-job "
+            "clone 的 safe.directory」，而產生器實際只出來源樹那兩條：per-job clone 是 "
+            "`<pool>/<job-id>`，路徑動態，靜態檔裝不下（萬用字元已被實測否決，見 "
+            "`build_account_gitconfig`）。那則宣稱**反向說謊了兩個月**，代價是 #712："
+            "ACL 補上之後 builder job 真的跑起來，然後死在 `fatal: detected dubious "
+            "ownership`。per-job 那一格改由 spec 的 env 逐 job 放行（登記表 "
+            "`JOB_GIT_WORKSPACE_TRUST`），**與本項不衝突、也不互相取代**。"
+        ),
     ),
     RunDependency(
         "reviewer-planner-gitconfig", DependencyKind.ACCOUNT_CONFIG,
         (Principal.REVIEWER, Principal.PLANNER), (RunStage.REVIEW,),
         covered_by="reviewer-planner-gitconfig",
-        note="同 `builder-gitconfig`，掛在 reviewer／planner 共用的那個帳號 HOME 下。",
+        note=(
+            "同 `builder-gitconfig` 的**來源樹**那兩條，掛在 reviewer／planner 共用的"
+            "那個帳號 HOME 下。\n⛔ **同樣不涵蓋 review worktree**：那棵樹是 "
+            "`git worktree add --detach` 在 `<repos>/<slug>/.psc-review-worktrees/` 底下"
+            "開的 linked worktree，路徑動態，而且實測 git 2.43 只給來源樹那兩條時，對 "
+            "worktree **自己的路徑**仍是 dubious ownership（git 查的是工作樹的路徑）。"
+            "本項舊 note 只寫「同 `builder-gitconfig`」，於是連同那則錯誤宣稱一起繼承"
+            "了（#712／#696）。"
+        ),
     ),
     # ---- REVIEW：reviewer 在 sandbox 內覆核 --------------------------------
     RunDependency(
@@ -5692,8 +5829,12 @@ def _job_unit_workspace_lines(
             "#   帳號只拿到唯讀 ACL：讀得到、寫不進去，共用 object store 那條「builder 能",
             "#   寫 Manager 的樹」的路因此在 git 這一層就不存在；下方 ReadWritePaths",
             "#   **不含**來源樹。",
-            f"#   跨擁有者 clone 由 {job_layout.gitconfig_of(account)} 的 safe.directory",
-            "#   放行（root-owned、本帳號唯讀；登記表資產，內容同樣由 permgen 產生）。",
+            f"#   **來源樹**那兩條逐字路徑由 {job_layout.gitconfig_of(account)} 的",
+            "#   safe.directory 放行（root-owned、本帳號唯讀；登記表資產，內容由 permgen",
+            "#   產生）。⛔ **那份靜態檔蓋不到上面這一格**——per-job clone 的路徑帶 `%i`，",
+            "#      每個 job 不同，而 git 的 safe.directory 只認逐字相等的路徑（實測 git",
+            "#      2.43：`<repos>/*` 仍被拒；字面 `*` 是 opt-out 不是授權）。這一格走",
+            "#      下面那一節（#712）。",
         ]
     elif reach.reach is registry.WorkspaceReach.INHERITED_DEFAULT_ACL:
         lines += [
@@ -5708,8 +5849,12 @@ def _job_unit_workspace_lines(
             "#   ⛔ 下方 ReadWritePaths **不含**這些樹：本帳號對工作區唯讀是刻意的——交付",
             "#      通道是 review-verdict-spool／dispatch-specs-tree，給工作區寫入權會把",
             "#      #628／#639 關掉的「被驗方在自己的工作區裡產生自己的證據」重新打開。",
-            f"#   跨擁有者的 git 操作由 {job_layout.gitconfig_of(account)} 的 safe.directory",
-            "#   放行（root-owned、本帳號唯讀；登記表資產，內容同樣由 permgen 產生）。",
+            f"#   **來源樹**那兩條逐字路徑由 {job_layout.gitconfig_of(account)} 的",
+            "#   safe.directory 放行（root-owned、本帳號唯讀；登記表資產，內容由 permgen",
+            "#   產生）。⛔ **那份靜態檔蓋不到上面那幾格**——review worktree 的路徑帶動態",
+            "#      段，而且它是一棵 linked worktree：實測 git 2.43，只給來源樹那兩條時",
+            "#      對 worktree 自己的路徑仍是 `fatal: detected dubious ownership`。",
+            "#      這一格走下面那一節（#712）。",
         ]
     else:  # POOL_OWNED_BY_JOB
         lines += [
@@ -5720,6 +5865,54 @@ def _job_unit_workspace_lines(
             "#   被驗的那棵樹（builder 的 clone）另以 `rX` 具名 ACL 授予，與 builder 的",
             "#   可寫面由**同一次** per-job setfacl 一起落地（登記表 repo-worktree 的",
             "#   readers 宣告了本帳號，#629）。",
+        ]
+    lines += _job_unit_git_trust_lines(job_layout, principal, account)
+    return lines
+
+
+def _job_unit_git_trust_lines(
+    job_layout: "PathLayout", principal: Principal, account: str
+) -> list[str]:
+    """模板 unit 的「本 job 怎麼對自己的工作區跑 git」那一段，由
+    :data:`registry.JOB_GIT_WORKSPACE_TRUST` 導出（#712）。
+
+    為什麼要**另外**一段而不是併進工作區那一段：那是**兩層**，而 #712 就是「其中
+    一層通了、另一層沒通」的實機證據——#710 把 ACL 補上、`getfacl` 實機確認
+    `user:cortex-builder:rwx`／`mask::rwx` 之後，builder job 真的跑起來了，然後死在
+    `fatal: detected dubious ownership`。把兩層寫成同一段，下一個讀的人就會以為
+    「權限對了 ⇒ git 就跑得動」，而那正是本票要消滅的推論。
+    """
+
+    trust = registry.job_git_workspace_trust_for(principal)
+    lines = [
+        "",
+        f"# --- 工作區的 git 信任（登記表 JOB_GIT_WORKSPACE_TRUST：{trust.trust.value}，#712）---",
+        "# git 的 dubious-ownership 是 **owner 判準，不是權限判準**：ACL／mask 全部正確",
+        "# 也照樣整個 repo 被拒（#712 實機：ACL 生效之後才露出這一條）。",
+    ]
+    if trust.trust is registry.GitWorkspaceTrust.PER_JOB_ENV:
+        lines += [
+            "#   本帳號的工作區由 **Manager** 建 ⇒ owner 是 Manager、本帳號是另一個 uid",
+            "#   ⇒ git 必然看到跨 owner。放行**逐 job**下：Manager 算出這一格的絕對路徑，",
+            "#   隨 spec 的 env 交給 shim（`GIT_CONFIG_COUNT=1`／",
+            "#   `GIT_CONFIG_KEY_0=safe.directory`／`GIT_CONFIG_VALUE_0=<這一格>`），",
+            "#   `coordinator/job_runner.git_workspace_trust_env()`。",
+            "#   ⛔ 那條 env **只放行 `safe.directory` 一個鍵**（寫端與讀端共用",
+            "#      `job_runner._reject_unsafe_git_config()`）：`GIT_CONFIG_*` 與 `git -c`",
+            "#      同級，`alias.*`／`core.fsmonitor` 經它塞進來會**執行外部命令**——那正是",
+            f"#      {job_layout.gitconfig_of(account)} 必須 root-owned 的理由，本管道不得",
+            "#      成為它的繞法。",
+            "#   ⛔ 也**不得**改成往靜態 .gitconfig 加一條萬用字元：實測 git 2.43,",
+            "#      `<repos>/*` 仍被拒，而字面 `*` 等於對這個帳號整個關掉該保護（opt-out，",
+            "#      不是授權）。",
+        ]
+    else:
+        lines += [
+            "#   per-job 那一格由**本帳號自己**建（目錄樹複製）⇒ 它擁有自己產出的每一個",
+            "#   inode（含 `.git`）⇒ git 看到的 owner 就是當下的 uid ⇒ **零動作、零 env**。",
+            "#   這條靠的是 pool 根的 owner 位；owner 一旦漂走（例如「比照 dispatch pool」",
+            "#   改成 Manager-owned），git 信任會跟著工作區可達性一起塌 —— registry 的",
+            "#   import 期斷言擋的就是那個漂移。",
         ]
     return lines
 
@@ -6161,6 +6354,26 @@ def build_account_gitconfig(
 
     因此來源 repo 清單是**部署決定**，由 `layout.source_repo_slugs` 於產生當下注入
     （比照 #626 的部署決定型 principal），未宣告即 :class:`UnresolvedSourceRepoError`。
+
+    ## ⛔ 這份檔涵蓋的**只有來源樹**（#712 更正）
+
+    本函式的產物是 `<repos>/<slug>` 與 `<repos>/<slug>/.git` 那兩條逐字路徑，如此
+    而已。它**不涵蓋、也裝不下** job 自己的工作區：
+
+    - builder 的 per-job clone 是 `<worktree pool>/<job-id>`；
+    - reviewer 的 review worktree 是 `<repos>/<slug>/.psc-review-worktrees/<…>`
+      （而且是 linked worktree——實測 git 2.43，只給來源樹那兩條時，對 worktree
+      **自己的路徑**仍是 `fatal: detected dubious ownership`）。
+
+    兩者的路徑都帶動態段，而上一節那條「只認逐字相等或字面 `*`」正是它裝不下的
+    理由。`builder-gitconfig`／`reviewer-planner-gitconfig` 兩則 `RunDependency`
+    的 note 曾逐字宣稱涵蓋 per-job clone，而那是假的——代價是 #712（#710 的 ACL
+    補上、builder job 真的跑起來之後，才在 `git bundle create` 上炸出來）。
+
+    per-job 那一格改由**每次派工的 spec env** 逐 job 放行（登記表
+    `registry.JOB_GIT_WORKSPACE_TRUST` ↔
+    `coordinator/job_runner.git_workspace_trust_env()`），與本檔**並存、不互相取代**：
+    來源樹是部署期常數，工作區是逐 job 的。
     """
     account = scheme.resolve(principal)
     if account is None:
@@ -6193,6 +6406,12 @@ def build_account_gitconfig(
         "# 為什麼逐個列出而不是萬用字元：git 的 safe.directory 只認逐字相等的路徑或",
         "# 字面 `*`（實測 git 2.43：`<repos>/*` 仍被拒），而字面 `*` 等於對這個帳號",
         "# 整個關掉該保護——那是 opt-out，不是授權。",
+        "#",
+        "# ⛔ 涵蓋範圍**只有下列來源樹路徑**（#712）：job 自己的工作區（builder 的",
+        "# per-job clone、reviewer 的 review worktree）路徑帶動態段，這份靜態檔按上面",
+        "# 那條規則就裝不下它們。那一格由每次派工的 spec env 逐 job 放行",
+        "# （registry.JOB_GIT_WORKSPACE_TRUST ↔ job_runner.git_workspace_trust_env()），",
+        "# 與本檔並存、不互相取代。",
         "[safe]",
     ]
     body += [f"\tdirectory = {path}" for path in safe_dirs]
@@ -6205,6 +6424,9 @@ def build_account_gitconfig(
         safe_directories=safe_dirs,
         content="\n".join(body) + "\n",
     )
+
+
+_assert_git_workspace_trust_matches_the_gitconfig()
 
 
 # ---------------------------------------------------------------------------
@@ -7443,6 +7665,177 @@ def build_job_workspace_probe(
         "`seams.ScriptWorktreeCreator` 與 `job_runner.ensure_workspace_reachable()` "
         "而不是手工建目錄，就是為了讓被驗的那一格與派工路徑產出的那一格是**同一份**"
         "程式碼的結果。兩維都要有實跑證據。"
+    )
+    return lines
+
+
+#: #712 探針拿來當**兩格** per-job 工作區的 job id（自己那一格 ／ 別人那一格）。
+#: 固定字面量，理由同 :data:`JOB_WORKSPACE_PROBE_JOB_ID`。
+GIT_TRUST_PROBE_JOB_IDS = ("probe-712-self", "probe-712-other")
+
+
+def build_job_git_trust_probe(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+) -> list[str]:
+    """#712 反向不變式的實機探針（**只回傳字串，不執行**）。
+
+    要證的是**三個方向**，缺一不可：
+
+    1. **缺陷還在**（零額外 env 的基線）——builder 身分在自己的工作區裡跑 `git status`
+       **必須失敗**，且逐字是 `fatal: detected dubious ownership`。這一步證明：檔案
+       系統層已經通了（#710 的 ACL），擋住的是 git 自己那一層；同時證明**靜態
+       `.gitconfig` 真的沒有涵蓋這一格**——若哪天有人「順手加一條萬用字元讓它過」，
+       這一步會**變成 rc=0**，探針當場說出真相。
+    2. **正向**——經**真實派工**（`systemctl start --wait <模板實例>`，spec 由
+       `job_runner.build_job_env()`／`build_job_spec()` 產出）之後，同一支 `git status`
+       與 builder 真正會跑的 `git bundle create` **都成功**。
+    3. **反向（放行是 per-job，不是全域）**——**同一個** job、**同一份** env，在
+       **別的 job 的工作區**裡跑 `git status` **必須仍然失敗**。少了這一半，「逐 job
+       放行」就只是一句宣稱：真正要排除的失敗是有人把值換成字面 `*` 或換成 pool 根
+       ——那兩種寫法會讓這一步變成 rc=0。
+
+    ## 為什麼這一支走**真實派工**，而 #710 那一支走 `psc_run_under`
+
+    #709／#687 逐字記過那條 caveat：`psc_run_under` 複製的是**加固面**，不是派工
+    路徑。#710 要驗的是 mount ＋ ACL 兩層的結果，加固面複本就夠；**本票要驗的東西
+    住在 spec 的 env 裡**，而 spec 只有派工路徑才會產生。用 `--setenv=` 自己塞三個
+    變數進去，量到的就只是「我塞的東西生效了」——那不是 `build_job_env()` 會不會替
+    這個 job 算出它們。
+
+    因此：步驟 1 的**基線**走 `psc_run_under`（零額外 env，證明缺陷與加固面同時
+    存在），步驟 2／3 走**真實 unit ＋ 真實 spec**。**本產生器一行 `--property=` 都
+    不自組、一個 `--setenv=` 都不帶**（design D13）。
+
+    ⚠️ **兩格工作區都由真實 provisioning 產生**（`seams.ScriptWorktreeCreator` ＋
+    `job_runner.ensure_workspace_reachable()`），不手工建目錄——`#645` 逐字記錄過
+    手工前置物會剛好把 bug 繞過去，而 `#710`／`#712` 是那一族連續兩個成員。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    manager = scheme.durable_state_owner
+    builder_account = scheme.resolve(Principal.BUILDER)
+    python = f"{layout.deploy_root}/venv/bin/python3"
+    stem = job_unit_stem(layout, Principal.BUILDER, DEFAULT_HARDENING_PROFILE)
+    self_id, other_id = GIT_TRUST_PROBE_JOB_IDS
+    lines: list[str] = [
+        "# === #712 反向不變式：per-job clone 的 safe.directory 逐 job 放行了嗎 ===",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root git-trust-probe {scheme.scheme_id}",
+        "#",
+    ]
+    lines += _wrap_comment(
+        "git 的 dubious-ownership 是 **owner 判準，不是權限判準**：#710 的 ACL 實機生效"
+        "（`getfacl` 逐字 `user:"
+        f"{builder_account}"
+        ":rwx`／`mask::rwx`）之後 builder job 真的跑起來了，然後死在 "
+        "`fatal: detected dubious ownership` ＋ `fatal: Need a repository to create a "
+        "bundle.`。因此本探針與 #710 的 `workspace-probe` **兩支都要跑**，它們量的是"
+        "不同的兩層。"
+    )
+    lines += [
+        "#",
+        "# ⛔ 步驟 3 紅掉時**不要**把值改成字面 `*`、也不要改成 pool 根——前者等於對這個",
+        "#    帳號整個關掉 dubious-ownership 保護（opt-out，不是授權），後者等於整個 pool",
+        "#    的放行。要改的是登記表 JOB_GIT_WORKSPACE_TRUST 那一列與它的執行期實作。",
+        "# ⛔ 也不要往靜態 .gitconfig 加任何一條：那份檔只放來源樹，per-job 那一格路徑",
+        f"#    帶 `<job-id>`，靜態檔按 git 的逐字相等規則就裝不下（permgen 的 import 期",
+        "#    斷言會擋下這兩種改法）。",
+        "#",
+        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
+        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
+        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
+        "  return 1 2>/dev/null || exit 1",
+        "}",
+        "",
+        "#   0) **兩格**工作區都由產品程式碼建並授權（不手工前置，#645／#709）。",
+        f"sudo -u {manager} {python} - <<'PSC_712_EOF'",
+        "import os",
+        "from paulsha_cortex.coordinator import job_runner, seams",
+        "creator = seams.ScriptWorktreeCreator()",
+        f'for job_id in {list(GIT_TRUST_PROBE_JOB_IDS)!r}:',
+        '    workspace = creator.create("feature/probe-712", job_id=job_id)',
+        "    job_runner.ensure_workspace_reachable(",
+        "        os.environ, role=job_runner.JOB_ROLE_BUILDER, workspace=workspace)",
+        "    print(f'{job_id}\\t{workspace}')",
+        "PSC_712_EOF",
+        f"#      期望：兩行 `<job-id>\\t<絕對路徑>`；下面以 $WS_SELF（{self_id}）與",
+        f"#      $WS_OTHER（{other_id}）代稱。",
+        "",
+        "#   1) **基線**：零額外 env、真實加固面下，git 必須**擋住**自己的工作區。",
+        f"{PATH_PROBE_HELPER} {stem} /bin/sh -c 'cd $WS_SELF && git status --porcelain'",
+        "#      期望：**非零**，且 stderr 逐字含 `detected dubious ownership`。",
+        "#      rc=0 ⇒ 有人已經在別處放行了整棵樹（靜態 .gitconfig 的萬用字元？），",
+        "#      而那正是本票否決過的形態——先查 `sudo -u "
+        + f"{builder_account} git config --list --show-origin | grep safe`。",
+        "",
+        "#   2) 正向 ＋ 3) 反向：**同一次真實派工**（spec 由產品程式碼產生，env 因此",
+        "#      是 `build_job_env()` 真的替這個 job 算出來的那一份，不是探針塞的）。",
+        f"sudo -u {manager} {python} - <<'PSC_712_EOF'",
+        "import os",
+        "from paulsha_cortex.coordinator import job_runner, job_workspace",
+        f'job_id = "{self_id}"',
+        "ws_self = os.environ['WS_SELF']",
+        "ws_other = os.environ['WS_OTHER']",
+        "plan = job_runner.prepare_systemd_template(",
+        "    os.environ, job_id=job_id, executor='codex',",
+        "    role=job_runner.JOB_ROLE_BUILDER)",
+        "env = job_runner.build_job_env(",
+        "    manager_env=os.environ, job_id=job_id, slice_id=job_id,",
+        "    repo_root=os.environ.get('PSC_REPO_ROOT', ''), workspace=ws_self,",
+        "    role=job_runner.JOB_ROLE_BUILDER)",
+        "print('SPEC ENV（git 那三條）:', {k: v for k, v in env.items()",
+        "                                if k.startswith('GIT_CONFIG')})",
+        "script = (",
+        "    'set -x; '",
+        "    'git status --porcelain --branch || exit 21; '",
+        "    'git bundle create /tmp/psc-712.bundle --all || exit 22; '",
+        "    'git -C \"$1\" status --porcelain && exit 23; '",
+        "    'echo PSC-712-OK'",
+        ")",
+        "spec = job_runner.build_job_spec(",
+        "    job_id=job_id, instance=plan.instance, unit=plan.unit,",
+        "    command=['/bin/sh', '-c', script, 'psc-712', ws_other],",
+        "    working_directory=ws_self,",
+        "    log_path=str(job_workspace.prepare_job_log_spool(",
+        "        principal_id=job_runner.JOB_ROLE_CONFIG[",
+        "            job_runner.JOB_ROLE_BUILDER].log_spool_principal,",
+        "        spool_key=job_id, manager_log_path=f'/tmp/psc-712-{job_id}.jsonl')),",
+        "    env=env)",
+        "job_runner.write_job_spec(plan.spec_path, spec, account=plan.account)",
+        "print('UNIT', plan.unit)",
+        "print('LOG ', spec['log_path'])",
+        "PSC_712_EOF",
+        "#      期望：印出 `SPEC ENV（git 那三條）`（三個鍵齊全、`GIT_CONFIG_VALUE_0`",
+        "#      逐字等於 $WS_SELF）、`UNIT`、`LOG`。以下用 $PSC_712_UNIT／$PSC_712_LOG。",
+        "",
+        "#      起動：**真實派工路徑**（模板 unit ＋ root-owned shim 讀 spec）。",
+        f"sudo -u {manager} systemctl start --wait $PSC_712_UNIT",
+        "cat $PSC_712_LOG",
+        "#      期望（讀 job 自己那一格 log spool，路徑由上一段印出）：",
+        "#        - `git status` rc=0（**正向**：放行對自己的工作區生效）；",
+        "#        - `git bundle create` rc=0（builder 真正會跑的那一支，#712 的原症狀",
+        "#          逐字是 `fatal: Need a repository to create a bundle.`）；",
+        "#        - 對 $WS_OTHER 的 `git status` **非零**且逐字 `detected dubious",
+        "#          ownership`（**反向**：放行是 per-job，不是全域）；",
+        "#        - 最後一行 `PSC-712-OK`。",
+        "#      exit 21／22 ⇒ 正向那兩條之一沒過；exit 23 ⇒ **反向那條破了**",
+        "#      （別的 job 的工作區也被放行了——立刻查 GIT_CONFIG_VALUE_0 是不是被改成",
+        "#      `*` 或 pool 根）。",
+        "",
+        "#   4) 收乾淨（兩格都要）。",
+        f"sudo -u {manager} {python} -c "
+        "'from paulsha_cortex.coordinator import job_workspace as w; "
+        "import sys; [w.remove_clone(p) for p in sys.argv[1:]]' $WS_SELF $WS_OTHER",
+        "#      ⚠️ builder 在步驟 2 建的檔由 builder 擁有 ⇒ 這一步可能失敗（回收面的",
+        "#      已知邊界，見登記表 repo-worktree 的 note）；失敗時以 `sudo rm -rf` 收尾。",
+        "",
+    ]
+    lines += _wrap_comment(
+        "步驟 1 走 `psc_run_under`（加固面複本、零額外 env），步驟 2／3 走**真實派工**"
+        "——這是刻意的分工：#709／#687 記過 `psc_run_under` 複製的是加固面、不是派工"
+        "路徑，而本票要驗的東西（spec 的 env）只有派工路徑才會產生。以 `--setenv=` "
+        "自己塞那三個變數進去，量到的只會是「我塞的東西生效了」。"
     )
     return lines
 
