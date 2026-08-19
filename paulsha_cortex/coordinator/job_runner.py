@@ -1268,12 +1268,20 @@ def git_workspace_trust_env(*, role: str, workspace: str | Path | None) -> dict[
 
     `git bundle create`（builder 真正會跑的那一支）在同一份 env 下 rc=0。
 
-    ## ⚠️ 值必須是 **physical path**（實測）
+    ## 為什麼值取**已解析（physical）路徑**——這是支配性選擇，不是對 git 的斷言
 
-    git 比對的是 `getcwd()` 之後那個**已解析 symlink** 的路徑。實測：工作區經一條
-    symlink 進入時，`safe.directory=<symlink 路徑>` **仍被拒**，`safe.directory=
-    <真實路徑>` 才過。因此本函式一律 `Path(...).resolve()`，並與 spec 的
-    `working_directory` 綁成同一個字串（由 :func:`build_job_spec` 斷言）。
+    shim 在降權之後做的是 `os.chdir(spec["working_directory"])`，而 git 由 `getcwd()`
+    取得 repo 路徑——`getcwd(2)` 回的**恆是** physical path。因此只要放行值與
+    `working_directory` 取**同一個已解析的字串**，「我們放行的」與「git 問的」在任何
+    git 版本上都是同一條。本函式一律 `Path(...).resolve()`，兩邊相等由
+    :func:`build_job_spec` 斷言。
+
+    ⚠️ **不要把「git 拒絕 symlink 路徑」寫成不變式。** 那是 git 的實作細節，**隨版本
+    而異**：0819 本機 git 2.43.0 上 `safe.directory=<symlink 路徑>`（cwd 走該 symlink）
+    **被拒**，而 PR #713 第一輪 CI 上較新的 git **接受**了同一組輸入——本 repo 曾有一條
+    測試把前者寫成硬斷言，四個 python 版本一起紅。我們控制得了的只有「傳哪一條、
+    `chdir` 到哪一條」；讓兩者都取 physical path 在**兩種 git 下都成立**，因此不必、
+    也不該依賴 git 對 symlink 路徑的處置。
 
     ``workspace=None`` 是給**沒有工作區的呼叫端**用的（`launcher.executor_environment()`
     的 preflight：它報告的是 PATH／HOME／sandbox 剖面，那時還沒有任何 job 工作區）。
@@ -1987,7 +1995,7 @@ def build_job_spec(
     # （`build_job_env(workspace=…)`），spec 的 `working_directory` 是在這裡定的，
     # 兩者一旦指向不同的路徑，放行的就不是這個 job 正要進去的那一格。判準是**逐字
     # 相等**，因為 git 比對 `safe.directory` 也是逐字相等（實測 git 2.43：多一個
-    # 尾斜線就不算數，symlink 路徑與其真實路徑也不算同一條）。
+    # 尾斜線就不算數）。
     #
     # 刻意不在這裡 `resolve()`：本函式的契約是「純資料，無 IO」。解析在
     # `git_workspace_trust_env()` 那一側做，呼叫端把**同一個已解析的字串**同時交給

@@ -21,8 +21,12 @@
   `git config --list --show-scope` 逐字回報 `command	safe.directory=…`；
   `git status` 與 builder 真正會跑的 `git bundle create` 皆 rc=0，而**同一份 env 對別的
   repo 仍是 rc=128 `detected dubious ownership`**。
-  值一律取 **physical path**——實測走 symlink 進去時，`safe.directory=<symlink 路徑>`
-  **仍被拒**（git 比對的是 `getcwd()` 之後的真實路徑）。
+  值一律取**已解析（physical）路徑**，且與 spec 的 `working_directory` 是**同一個字串**
+  ——shim `chdir` 之後 git 由 `getcwd()` 取 repo 路徑，而 `getcwd(2)` 回的恆是 physical
+  path，兩邊因此在任何 git 版本上都對得起來。
+  ⚠️ **這是支配性選擇，不是對 git 的斷言**：「git 會不會拒絕 symlink 路徑」是版本相依的
+  實作細節（0819 本機 git 2.43.0 拒絕；PR #713 第一輪 CI 上較新的 git 接受），本 PR 初版
+  把前者寫成硬斷言、四個 python 版本一起紅——那個反例已寫進測試與 docstring。
 
 ### Changed
 
@@ -90,8 +94,11 @@
 - **單元層的真 git 反向不變式**（`tests/test_per_job_git_safe_directory_712.py`）：以 git
   自己的 `GIT_TEST_ASSUME_DIFFERENT_OWNER=1`（`ensure_valid_ownership()` 的第一個條件）
   在單 UID 的 CI 上複現跨 owner 的**判定路徑**，逐條驗基線失敗／自己的工作區成功／
-  **別的 job 的工作區失敗**／symlink 路徑不算數／linked worktree 蓋不到／alias 真的會
-  執行。真正需要第二個 UID 的那一維留一條**具名 `@pytest.mark.skip`**，理由指向實機探針。
+  **別的 job 的工作區失敗**／linked worktree 蓋不到／alias 真的會執行。
+  真正需要第二個 UID 的那一維留一條**具名 `@pytest.mark.skip`**，理由指向實機探針。
+  ⚠️ 斷言的是**我們的行為**與**我們依賴的 git 契約**，不是 git 的內部正規化細節
+  ——symlink 那一格只驗「呼叫端給 symlink 路徑時，放行值與 cwd 仍收斂成同一條已解析
+  路徑」，**不驗** git 會不會拒絕另一條（見上）。
 - runbook 第 **4e-2f** 步：形狀對照表、靜態檔沒被加寬的檢查、缺陷基線、反向不變式探針、
   真實派工 smoke（含「spec 裡那三個鍵在不在、值等不等於 `working_directory`」），以及
   「gate 那一格真的是空的」——把「不需要」與「忘了做」分開。

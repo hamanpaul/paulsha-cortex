@@ -1453,9 +1453,9 @@ class SubprocessLauncher:
                 # #712：git 的 dubious-ownership 那一層。`worktree` 在上面已經被
                 # `Path(...).resolve(strict=True)` 換成**已解析的**絕對路徑字串，而
                 # 下面 `build_job_spec()` 的 `working_directory=` 用的是**同一個變數**
-                # ——兩者必須逐字相同（git 比對 `safe.directory` 是逐字相等，且比的是
-                # `getcwd()` 之後的 physical path；實測 git 2.43 走 symlink 進去就不算
-                # 同一條）。這條相等性由 `build_job_spec()` 斷言。
+                # ——兩者必須逐字相同（git 比對 `safe.directory` 是逐字相等，而 shim
+                # `chdir` 之後 git 由 `getcwd()` 取路徑，那**恆是** physical path）。
+                # 這條相等性由 `build_job_spec()` 斷言。
                 workspace=worktree,
                 relay_target=self._relay_target,
                 role=job_role,

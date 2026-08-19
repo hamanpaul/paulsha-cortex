@@ -245,10 +245,12 @@ def test_gate_gets_nothing_at_all(tmp_path: Path) -> None:
 
 
 def test_a_symlinked_workspace_is_resolved_to_its_physical_path(tmp_path: Path) -> None:
-    """git 比對的是 `getcwd()` 之後的 **physical path**（0819 實測）。
+    """值一律解析成 physical path。
 
-    工作區經 symlink 進入時，`safe.directory=<symlink 路徑>` **仍被拒**——因此值一律
-    解析。這條的實跑證據在 `test_a_real_repo_behind_a_symlink...`。
+    理由不是「git 會拒絕 symlink 路徑」（那是版本相依的實作細節，見
+    `test_a_workspace_given_as_a_symlink_still_lands_on_one_consistent_string`），
+    而是「shim `chdir` 之後 git 由 `getcwd()` 取路徑，那**恆是** physical path」
+    ——兩邊都取已解析的那一條，在任何 git 版本上都對得起來。
     """
 
     real = tmp_path / "real"
@@ -595,10 +597,29 @@ def test_the_gate_shape_really_is_zero_action(
     assert status.returncode != 0
 
 
-def test_a_real_repo_behind_a_symlink_needs_the_physical_path(tmp_path: Path) -> None:
-    """實測：git 比對的是解析後的路徑，symlink 那條**不算數**。
+def test_a_workspace_given_as_a_symlink_still_lands_on_one_consistent_string(
+    tmp_path: Path,
+) -> None:
+    """呼叫端給的是 symlink 路徑時，**放行值與 cwd 仍是同一條**——而那條是 physical。
 
-    這是 `git_workspace_trust_env()` 一律 `resolve()` 的出處。
+    這條驗的是**我們的行為**，不是 git 的行為，而且它模擬的就是正式派工的形狀：
+    `launcher` 先 `Path(worktree).resolve(strict=True)`，`build_job_env()` 再
+    `resolve()` 一次，shim 則 `os.chdir(spec["working_directory"])`——三者因此恆為
+    同一個已解析字串，而 git 由 `getcwd()` 取路徑（`getcwd(2)` 回的**恆是**
+    physical path）。
+
+    ## ⚠️ 這裡刻意**不**斷言 git 對 symlink 路徑的處置
+
+    那是 git 的實作細節，**隨版本／環境而異**，把它寫成不變式就是拿某一版 git 的行為
+    當契約：
+
+    - 0819 本機 **git 2.43.0**：cwd 走 symlink、`safe.directory=<symlink 路徑>`
+      ⇒ `fatal: detected dubious ownership`（**被拒**）；
+    - PR #713 第一輪 CI（較新的 git）：同一組輸入 ⇒ **rc=0**（被接受）。
+
+    本檔曾有一條測試把前者寫成硬斷言，四個 python 版本一起紅——那個反例就是這段
+    註解的出處。「一律傳 physical path」這個**選擇**不受影響：它在兩種 git 下都成立，
+    是支配性選擇，不需要 git 拒絕另一條來支撐。
     """
 
     real = tmp_path / "real"
@@ -613,18 +634,14 @@ def test_a_real_repo_behind_a_symlink_needs_the_physical_path(tmp_path: Path) ->
     link = tmp_path / "link"
     link.symlink_to(real)
 
-    literal = {
-        **_ASSUME_FOREIGN,
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "safe.directory",
-        "GIT_CONFIG_VALUE_0": str(link),
-    }
-    assert _git(["status", "--porcelain"], cwd=link, env=literal).returncode != 0
+    # 呼叫端給 symlink 路徑 ⇒ 產生器交出的是已解析的那一條。
+    env = _build_env(job_runner.JOB_ROLE_BUILDER, str(link))
+    assert env["GIT_CONFIG_VALUE_0"] == str(real.resolve())
 
-    produced = {**_ASSUME_FOREIGN,
-                **{k: _build_env(job_runner.JOB_ROLE_BUILDER, str(link))[k]
-                   for k in _GIT_ENV_KEYS}}
-    assert _git(["status", "--porcelain"], cwd=link, env=produced).returncode == 0
+    # 而正式派工的 cwd 就是那同一條（shim chdir 的是 spec 的 working_directory）。
+    produced = {**_ASSUME_FOREIGN, **{k: env[k] for k in _GIT_ENV_KEYS}}
+    status = _git(["status", "--porcelain", "--branch"], cwd=real, env=produced)
+    assert status.returncode == 0, status.stderr
 
 
 def test_an_alias_through_this_channel_really_executes(tmp_path: Path) -> None:
@@ -632,6 +649,18 @@ def test_an_alias_through_this_channel_really_executes(tmp_path: Path) -> None:
 
     `GIT_CONFIG_*` 與 `git -c` 同級，因此 `alias.*` 經它進來會執行外部命令——這正是
     三份 `.gitconfig` 必須 root-owned 的那條理由，本管道不得成為它的繞法。
+
+    ## 為什麼這一條可以斷言 git 的行為，而 symlink 那一條不行
+
+    兩者是不同種類的宣稱：
+
+    - 這裡斷言的是 git 的**契約層行為**（command scope 屬 protected configuration、
+      `!` 開頭的 alias 執行 shell）——那是我們的威脅模型**依賴它為真**的東西。它若哪天
+      不成立，我們**想要**當場知道（守衛會從必要變成 defense-in-depth，那是需要有人
+      重新判讀的事實，不是一條該被靜默吸收的差異）。
+    - symlink 那一條斷言的是 git 的**內部路徑正規化細節**，而我們的實作**完全不依賴它**
+      （放行值與 cwd 都由我們取同一條已解析路徑）。把不依賴的細節寫成不變式，只會讓
+      測試在 git 換版時紅——PR #713 第一輪 CI 就是這樣紅的。
     """
 
     subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True,

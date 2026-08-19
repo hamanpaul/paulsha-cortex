@@ -2806,8 +2806,10 @@ sudo -u cortex-manager python3 -c "import json,sys;print({k:v for k,v in \
   json.load(open(sys.argv[1]))['env'].items() if k.startswith('GIT_CONFIG')})" \
   /var/lib/cortex/coordinator/job-spec-spool/builder/<instance>.json
 #   期望：三個鍵齊全，且 `GIT_CONFIG_VALUE_0` **逐字等於** spec 的 `working_directory`
-#   （git 比對是逐字相等，且比的是 `getcwd()` 之後的 physical path——多一個尾斜線、
-#   或走 symlink 進去，都**不算**同一條）。
+#   （git 比對是逐字相等——多一個尾斜線就不算同一條）。兩者都是**已解析**的路徑：
+#   shim `chdir` 之後 git 由 `getcwd()` 取 repo 路徑，那恆是 physical path。
+#   ⚠️ 不要反過來用「git 會拒絕 symlink 路徑」當判準——那隨 git 版本而異（本機 2.43.0
+#      拒絕、較新的 git 接受）。這裡要看的是**兩個字串相不相等**，不是 git 的正規化行為。
 
 # ✅ 驗證 4：gate 那一格**真的什麼都沒有**（「不需要」與「忘了做」要分得開）
 sudo -u cortex-manager python3 -c "import json,sys;print({k:v for k,v in \
