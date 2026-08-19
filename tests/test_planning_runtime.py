@@ -364,6 +364,97 @@ def test_questioner_and_integrator_prompts_include_json_output_contract(
     assert "must equal the union of all artifact_refs" in integrator_prompt
 
 
+def test_questioner_prompt_orders_verbatim_copy_not_authoring(monkeypatch, tmp_path: Path) -> None:
+    """issue #704：`validate_question_pack()` 要的是逐位元等於輸入裡的
+    `default_question_pack`，而舊 prompt 寫「Return only the exact question-pack JSON
+    **required to resolve** this completeness report」——「所需的」是創作型動詞。實機
+    模型因此把模板題目特化到 work item 並追加約 599 字（`questions[0].prompt` 差異），
+    define 卡在 `question-pack-malformed`。prompt 必須改成抄寫型動詞，且約束句由判準
+    機械產生（比照 #520），prompt 端不得持有第二份欄位名真實來源。"""
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary", "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy", "model_id": AGY_MODEL_ID, "independence_domain": "google",
+                "capabilities": ["planning"], "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    prompts: list[str] = []
+
+    def runner(argv, **kwargs):
+        if argv == ["agy", "models"]:
+            return _completed(f"{AGY_MODEL_ID}\n")
+        prompt = argv[argv.index("--print") + 1] if "--print" in argv else argv[2]
+        prompts.append(prompt)
+        return _completed(json.dumps({"schema_version": 1, "pack_id": "qp-x", "questions": []}))
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"), worktree=tmp_path, runner=runner
+    )
+    runtime.primary_questioner(
+        {"complete": False, "missing_kinds": ["spec"], "artifacts": [],
+         planning.QUESTIONER_INPUT_PACK_KEY: {"schema_version": 1, "pack_id": "qp-x", "questions": []}}
+    )
+
+    questioner_prompt = prompts[-1]
+    # 產生 #704 失敗態的那個創作型動詞不得再出現。
+    assert "required to resolve" not in questioner_prompt
+    # 抄寫型動詞、五個欄位逐一點名、以及「改得更好＝失敗」。
+    assert "transcription task, not an authoring task" in questioner_prompt
+    for name in (*planning.QUESTION_PACK_KEYS, *planning.QUESTION_FIELDS):
+        assert f"`{name}`" in questioner_prompt, name
+    assert "byte-for-byte identical" in questioner_prompt
+    assert "rejected reply, not a better one" in questioner_prompt
+    # #520 建議 4 的同一條：這段文字由 `planning` 的判準機械產生，prompt 端不得另寫一份。
+    assert planning.question_pack_echo_hint() in questioner_prompt
+
+
+def test_secondary_prompt_states_echo_back_identifier_sources(monkeypatch, tmp_path: Path) -> None:
+    """issue #704 的同型掃描：`validate_secondary_evidence()` 對 `question_pack_id`
+    是逐位元 `!=` 直接拒、對每列 `question_id` 要求落在 pack 的識別碼集合內，兩者的值
+    都已在輸入裡。#516 為 integrator 補過這層語意，secondary 卻一直只被列了欄位名
+    ——與 questioner 同族的缺陷，只是還沒擲到那一面。"""
+    registry = IdentityRegistry.from_rows(
+        [
+            {
+                "executor": "codex", "model_id": "primary", "independence_domain": "openai",
+                "capabilities": ["planning"],
+            },
+            {
+                "executor": "agy", "model_id": AGY_MODEL_ID, "independence_domain": "google",
+                "capabilities": ["planning"], "live_probe": "agy-plan-sandbox",
+            },
+        ]
+    )
+    monkeypatch.setattr(planning_runtime, "load_model_identities", lambda: registry)
+    prompts: list[str] = []
+
+    def runner(argv, **kwargs):
+        if argv == ["agy", "models"]:
+            return _completed(f"{AGY_MODEL_ID}\n")
+        prompt = argv[argv.index("--print") + 1] if "--print" in argv else argv[2]
+        prompts.append(prompt)
+        return _completed(json.dumps({"schema_version": 1, "question_pack_id": "qp-x"}))
+
+    runtime = planning_runtime.build_production_planning_runtime(
+        primary=("codex", "primary"), worktree=tmp_path, runner=runner
+    )
+    runtime.secondary_planner(
+        {"schema_version": 1, "pack_id": "qp-x", "questions": []},
+        registry.get("agy", AGY_MODEL_ID),
+    )
+
+    secondary_prompt = prompts[-1]
+    assert planning.echoed_identifier_hint(pack_id_field="question_pack_id") in secondary_prompt
+    # `claims`／`source_refs` 仍然是創作型任務——同一支 prompt 不得把它們也改成抄寫。
+    assert "non-empty claims string list" in secondary_prompt
+
+
 def test_integrator_prompt_states_echo_back_field_sources(monkeypatch, tmp_path: Path) -> None:
     """issue #516：`_validate_primary_integration()` 要求 `question_pack_id` 與
     `secondary_evidence_hash` 與輸入完全相符，兩個值都已在模型輸入裡（分別是

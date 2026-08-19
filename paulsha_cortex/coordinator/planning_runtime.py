@@ -28,7 +28,7 @@ from .model_identities import (
     probe_agy_capability,
     stdout_excerpt,
 )
-from .planning import required_heading_hint
+from .planning import echoed_identifier_hint, question_pack_echo_hint, required_heading_hint
 
 
 logger = logging.getLogger(__name__)
@@ -1459,8 +1459,16 @@ def build_production_planning_runtime(
         )
 
     def questioner(report: Mapping[str, object]) -> object:
+        # #704：舊句是「Return only the exact question-pack JSON **required to
+        # resolve** this completeness report.」——「所需的」是創作型動詞，而
+        # `planning.validate_question_pack()` 要的是逐位元等於輸入裡那份
+        # `default_question_pack`。指令要創作、驗證要謄寫，模型於是合理地把模板
+        # 題目特化到 work item 並追加數百字（實機四次全落在創作面）。
+        # 約束句由判準機械產生（比照 #520 的 `required_heading_hint()`）：欄位名與
+        # 輸入鍵名都來自 `planning` 的常數，prompt 端不再持有第二份真實來源。
         return invoke_primary(
-            "Return only the exact question-pack JSON required to resolve this completeness report. "
+            question_pack_echo_hint()
+            + " "
             + _JSON_OUTPUT_CONTRACT
             + " Input: "
             + json.dumps(report, ensure_ascii=False, sort_keys=True),
@@ -1469,13 +1477,20 @@ def build_production_planning_runtime(
 
     def secondary(pack: Mapping[str, object], identity: ModelIdentity) -> object:
         source_material = _planning_source_material(pack, root=root)
+        # #704 的同型掃描：本 prompt 的 `question_pack_id` 與每列的 `question_id`
+        # 都是 echo-back 欄位（`validate_secondary_evidence()` 對前者逐位元 `!=`
+        # 直接拒、對後者要求落在 pack 的識別碼集合內），但修法前兩者都只被列了
+        # **欄位名**——#516 為 integrator 補的那句語意，secondary 從來沒有拿到。
+        # `claims`／`source_refs` 維持創作型動詞：那兩欄本來就該由模型自己寫。
         return _invoke_json(
             identity,
             "Do not call tools, run commands, make decisions, or edit files. Use only the supplied "
             "source material. Return exactly one JSON object with keys schema_version=1, "
             "question_pack_id, and evidence. Evidence must contain every question exactly once; "
             "each row has only question_id, non-empty claims string list, and non-empty source_refs "
-            "string list naming supplied sources. " + _JSON_OUTPUT_CONTRACT + " Input: "
+            "string list naming supplied sources. "
+            + echoed_identifier_hint(pack_id_field="question_pack_id")
+            + " " + _JSON_OUTPUT_CONTRACT + " Input: "
             + json.dumps(
                 {"question_pack": pack, "source_material": source_material},
                 ensure_ascii=False,
@@ -1505,8 +1520,12 @@ def build_production_planning_runtime(
         return invoke_primary(
             "Do not call tools or edit files. Integrate only the supplied evidence. Return exactly one "
             "JSON object with schema_version=1, question_pack_id, secondary_evidence_hash, resolutions, "
-            "and artifacts. question_pack_id must be copied verbatim from the input question_pack.pack_id "
-            "value. secondary_evidence_hash must be copied verbatim from the input "
+            "and artifacts. "
+            # #704：#516 手寫的 `question_pack_id` 逐字複製句改由
+            # `echoed_identifier_hint()` 產生（欄位名來自 `planning` 的常數），同時
+            # 補上它漏掉的 `question_id`——那一欄同樣是 echo-back，同樣只被列了欄位名。
+            + echoed_identifier_hint(pack_id_field="question_pack_id")
+            + " secondary_evidence_hash must be copied verbatim from the input "
             "secondary_evidence.evidence_hash field; do not compute, derive, or invent a hash. "
             "Each resolution has only question_id, decision, artifact_kind, artifact_refs. "
             "Resolve every question exactly once. artifact_kind must equal the question kind without its "

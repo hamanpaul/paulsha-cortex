@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
 
@@ -237,6 +237,91 @@ class QuestionPack:
             "pack_id": self.pack_id,
             "questions": [question.to_dict() for question in self.questions],
         }
+
+
+# --- issue #704：echo 判準與 prompt 動詞的唯一真檔 ---------------------------
+#
+# `validate_question_pack()` 的最後一關是「模型回的 pack 逐位元等於
+# `report.default_question_pack`」，而那份 pack **已經**併在 questioner 的輸入裡
+# （`run_heterogeneous_brainstorm` 以 `QUESTIONER_INPUT_PACK_KEY` 為鍵放進去）。
+# 也就是說 questioner 的任務**只有謄寫**，沒有任何創作空間。
+#
+# 修法前的 prompt 卻寫「Return only the exact question-pack JSON **required to
+# resolve** this completeness report」——「所需的」是創作型動詞，於是模型合理地
+# 把通用模板題目特化到本 work item 並追加數百字（實機 #701／PR #702 的逐欄診斷
+# 落地後第一次跑就抓到；同一 prompt 在外部跑 12 次卻全 MATCH ⇒ 這是**擲骰子**，
+# 不是必然失敗，而 prompt 沒有任何一句禁止創作那一面）。
+#
+# 這是 #406／#516／#520 同一教訓的第四輪，因此比照 #520 的處置：**約束句由判準
+# 機械產生**（`question_pack_echo_hint()`），prompt 端不得再持有第二份真實來源。
+# 下面兩個常數同時是驗證與 prompt 的來源——欄位改名時，驗證與 prompt 一起改。
+
+#: `QuestionPack.to_dict()` 的頂層鍵（＝相等判準真正比對的鍵），由型別自身導出。
+QUESTION_PACK_KEYS: tuple[str, ...] = tuple(QuestionPack(pack_id="", questions=()).to_dict())
+#: 每一題的欄位名，由 `PlanningQuestion` 的 dataclass 欄位機械導出。
+#: `validate_question_pack()` 的 extras 檢查、`describe_question_pack_difference()`
+#: 的掃描順序、`question_pack_echo_hint()` 的約束句三處共用這一份。
+QUESTION_FIELDS: tuple[str, ...] = tuple(item.name for item in fields(PlanningQuestion))
+#: 題目識別欄位名——secondary／integrator 兩個驗證都以它逐位元比對回來的值。
+QUESTION_ID_FIELD: str = QUESTION_FIELDS[0]
+#: questioner 輸入裡放「標準答案」的鍵名。`run_heterogeneous_brainstorm` 組輸入與
+#: `question_pack_echo_hint()` 指路都用它，兩邊不得各寫一份字面值。
+QUESTIONER_INPUT_PACK_KEY = "default_question_pack"
+
+
+def question_pack_echo_hint() -> str:
+    """回傳 questioner prompt 用的「逐字複製」約束句（由 echo 判準機械產生）。
+
+    判準是 `validate_question_pack()` 末尾那一行整份 `to_dict()` 相等，因此本句
+    列出的欄位名全部來自 `QUESTION_PACK_KEYS`／`QUESTION_FIELDS`，指的輸入鍵名
+    來自 `QUESTIONER_INPUT_PACK_KEY`——沒有任何一個字面值只活在 prompt 端。
+
+    句子本身刻意做三件事，缺一都留得下創作的餘地（#704 實機四次全落在創作面）：
+
+    1. **先否定任務**：這份 pack 不是你要寫的，輸入裡那個物件就是唯一正解；
+    2. **逐欄點名**：`pack_id`／`question_id` 是雜湊字串，模型算不出來也不該算，
+       `kind`／`prompt`／`source_refs` 則是最容易被「改寫得更好」的一面；
+    3. **明說「更好＝失敗」**：模型的預設價值觀是把題目寫得更貼近 work item，
+       只禁止「改寫」而不說明後果時，特化仍然是它眼中的正確行為。
+    """
+
+    top_level = ", ".join(f"`{key}`" for key in QUESTION_PACK_KEYS)
+    per_row = ", ".join(f"`{name}`" for name in QUESTION_FIELDS)
+    return (
+        "This is a transcription task, not an authoring task. The input already contains the "
+        f"one correct answer under the key `{QUESTIONER_INPUT_PACK_KEY}`. Copy that object "
+        "verbatim as your reply: reproduce its "
+        f"{top_level} exactly as given, and reproduce every question row with the same "
+        f"{per_row} character for character, in the same order, with the same number of rows. "
+        "Do not rewrite, reword, translate, summarise, expand, specialise to this work item, "
+        "add context or justification, drop a question, or add a question. Treat "
+        f"`{QUESTION_PACK_KEYS[1]}` and every `{QUESTION_ID_FIELD}` as opaque hashes: copy them, "
+        "never recompute or invent them. Your reply is accepted only when it is byte-for-byte "
+        f"identical to the input `{QUESTIONER_INPUT_PACK_KEY}`; a clearer, more specific or "
+        "otherwise improved question is a rejected reply, not a better one."
+    )
+
+
+def echoed_identifier_hint(*, pack_id_field: str) -> str:
+    """回傳 secondary／integrator prompt 用的「識別碼一律照抄」約束句。
+
+    #516 為 integrator 補了 `question_pack_id` 與 `secondary_evidence_hash` 兩個
+    echo-back 欄位的語意，但兩個 adapter 的 **`question_id`** 一直只被列了欄位名；
+    secondary 的 `question_pack_id` 連 #516 那句都沒有。三者的判準都與 #704 的
+    questioner 同族——`validate_secondary_evidence()`／`_validate_primary_integration()`
+    對它們是逐位元 `!=` 直接拒，值也全部已經在輸入裡。本句因此與
+    `question_pack_echo_hint()` 共用同一組欄位名常數。
+
+    `claims`／`decision`／`artifacts[].content` 不在本句範圍內——那些**本來就**該由
+    模型創作，對它們用抄寫型動詞才是新的指令自相矛盾。
+    """
+
+    return (
+        f"`{pack_id_field}` must be copied verbatim from the input question_pack.pack_id value. "
+        f"Every `{QUESTION_ID_FIELD}` must be copied verbatim from the input "
+        f"question_pack.questions[].{QUESTION_ID_FIELD} it corresponds to. Both are opaque "
+        "hashes: copy them exactly, and never shorten, renumber, re-derive, or invent one."
+    )
 
 
 @dataclass(frozen=True)
@@ -1029,7 +1114,7 @@ def describe_question_pack_difference(got: QuestionPack, expected: QuestionPack)
     if got.pack_id != expected.pack_id:
         return _render_difference("pack_id", expected.pack_id, got.pack_id)
     for index, (expected_question, got_question) in enumerate(zip(expected.questions, got.questions)):
-        for name in ("question_id", "kind", "prompt", "source_refs"):
+        for name in QUESTION_FIELDS:
             expected_value = getattr(expected_question, name)
             got_value = getattr(got_question, name)
             if expected_value == got_value:
@@ -1058,7 +1143,7 @@ def validate_question_pack(payload: object, *, report: CompletenessReport) -> Qu
             "question pack must be an object: "
             + _render_difference("type", "dict", type(payload).__name__)
         )
-    extras = set(payload) - {"schema_version", "pack_id", "questions"}
+    extras = set(payload) - set(QUESTION_PACK_KEYS)
     if extras:
         raise ValueError(f"question pack unexpected key: {sorted(extras)[0]} (all={sorted(extras)})")
     if payload.get("schema_version") != QUESTION_PACK_SCHEMA_VERSION:
@@ -1094,7 +1179,7 @@ def validate_question_pack(payload: object, *, report: CompletenessReport) -> Qu
                 f"questions[{index}] must be an object: "
                 + _render_difference("type", "dict", type(row).__name__)
             )
-        extras = set(row) - {"question_id", "kind", "prompt", "source_refs"}
+        extras = set(row) - set(QUESTION_FIELDS)
         if extras:
             raise ValueError(
                 f"questions[{index}] unexpected key: {sorted(extras)[0]} (all={sorted(extras)})"
@@ -1880,8 +1965,10 @@ def run_heterogeneous_brainstorm(
         )
     try:
         questioner_input = {
+            # #704：鍵名同時是 `question_pack_echo_hint()` 指給模型看的那個名字，
+            # 因此只能有一份字面值（見 `QUESTIONER_INPUT_PACK_KEY` 的註解）。
             **report.to_dict(),
-            "default_question_pack": report.default_question_pack.to_dict(),
+            QUESTIONER_INPUT_PACK_KEY: report.default_question_pack.to_dict(),
         }
         pack = validate_question_pack(primary_questioner(questioner_input), report=report)
     except Exception as exc:
