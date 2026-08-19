@@ -842,6 +842,7 @@ def build_codex_argv(
     read_only: bool = False,
     review_only: bool = False,
     commit_required: bool = False,
+    write_forbidden: bool = False,
     verdict_spool_dir: str | None = None,
     last_message_path: str | None = None,
 ) -> list[str]:
@@ -867,10 +868,33 @@ def build_codex_argv(
         # smoke 實證：headless codex exec 帶（未持久信任的）relay hook 時，會卡在 hook
         # 信任閘等待輸入 → timeout。autonomous 派工須一併 bypass hook trust 才不會掛住。
         argv.append("--dangerously-bypass-hook-trust")
-    elif read_only or review_only:
-        argv += ["--sandbox", "read-only", "--skip-git-repo-check"]
     else:
-        argv += ["--sandbox", "workspace-write"]
+        # #716：**sandbox mode 由登記表導出，這裡不做第二次決定。**
+        #
+        # 舊形態是一條 `if/elif/else`，而那條 `else` 對 builder **一律**發
+        # `workspace-write`——`commit_policy` 完全不看，因為 `read_only` 是 launcher
+        # 維度（`as_read_only()`）。於是一張 `commit_policy=forbidden` 且
+        # `declared_outputs` 為空的唯讀 build 卡拿到的是寫入授權，那是**獨立成立的
+        # 最小權限缺陷**（#716 選項 F）；#714 的 legacy landlock 只是讓它從靜默變成
+        # `linux_run_main.rs:318` 的 panic。
+        #
+        # 導出規則與需要哪個 mode 的理由都住在 `registry.SANDBOX_MODE_DERIVATION`，
+        # 在 registry import 當下被全覆蓋斷言強制（缺一格模組載不起來）。lazy import
+        # 的理由與 `_codex_inner_sandbox_argv()` 逐字相同。
+        argv += ["--sandbox", _codex_sandbox_mode(
+            allow_unsafe=allow_unsafe,
+            read_only=read_only,
+            review_only=review_only,
+            commit_required=commit_required,
+            write_forbidden=write_forbidden,
+        )]
+        if read_only or review_only:
+            # planner／reviewer 的既有旗標，**逐字不變**：它們的工作區可能根本不是
+            # repo（reviewer 的 planning scratch 就是空目錄，見
+            # `registry.JOB_GIT_WORKSPACE_TRUST` 的 reviewer 那一列）。
+            # write-forbidden 的 build 卡刻意**不**帶它——那張卡跑在 per-job clone 裡，
+            # 它與今天唯一的差別就是 mode 這一個 token。
+            argv.append("--skip-git-repo-check")
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
@@ -931,6 +955,45 @@ def _codex_inner_sandbox_argv() -> tuple[str, ...]:
 
     spec = permgen.executor_inner_sandbox("codex")
     return () if spec is None else tuple(spec.argv)
+
+
+def _codex_sandbox_mode(
+    *,
+    allow_unsafe: bool,
+    read_only: bool,
+    review_only: bool,
+    commit_required: bool,
+    write_forbidden: bool,
+) -> str:
+    """codex `--sandbox` 的值（`registry.SANDBOX_MODE_DERIVATION` 是唯一真相，#716）。
+
+    lazy import 的理由與 :func:`_codex_inner_sandbox_argv` 逐字相同：`trust_root` 是
+    產生器面，不該進 `coordinator` 的模組載入圖，但**規則的內容必須只有一份**——
+    `permgen.build_inner_sandbox_probe()` 的 per-mode 矩陣、本函式、以及測試裡的窮舉
+    對照都消費同一張表。
+
+    這裡不再有任何 `if <persona> then <mode>`：導出由
+    `registry.derive_job_write_contract()` ＋ `registry.sandbox_mode_for()` 兩步完成，
+    兩者在 registry import 當下被全覆蓋斷言釘死。回傳值恆為字串——`unsafe-bypass`
+    那一格根本進不到這裡（呼叫端在 `allow_unsafe` 分支就走掉了），若真的進來，
+    `sandbox_mode_for()` 回 `None` 會在這裡顯性失敗，而不是靜默發出一個 `None` token。
+    """
+
+    from ..trust_root import registry
+
+    contract = registry.derive_job_write_contract(
+        allow_unsafe=allow_unsafe,
+        read_only=read_only,
+        review_only=review_only,
+        commit_required=commit_required,
+        write_forbidden=write_forbidden,
+    )
+    mode = registry.sandbox_mode_for(contract)
+    if mode is None:
+        raise ValueError(
+            f"寫入契約 {contract.value} 不發 --sandbox，不該走到 argv 的沙箱分支（#716）"
+        )
+    return mode
 
 
 def build_agy_argv(
@@ -1072,6 +1135,7 @@ class SubprocessLauncher:
         read_only: bool = False,
         review_only: bool = False,
         commit_required: bool = False,
+        write_forbidden: bool = False,
         review_terminal_kind: str | None = None,
         effort: str | None = None,
         verdict_spool_dir: str | None = None,
@@ -1095,6 +1159,13 @@ class SubprocessLauncher:
             raise ValueError("read-only launcher cannot enable unsafe mode")
         if commit_required and (read_only or review_only or allow_unsafe):
             raise ValueError("commit-required launcher requires enforced workspace-write")
+        # #716：`write_forbidden` 與 `commit_required` 是同一張卡的 `commit_policy` 的
+        # 兩個互斥值（`forbidden` vs `required`），同時成立代表呼叫端算錯了契約；
+        # 與 `allow_unsafe`（沙箱整個關掉）同時成立同理。**顯性失敗，不靜默選一個。**
+        # 導出規則本身在 `registry.derive_job_write_contract()`，這裡的守衛與它同型、
+        # 同理由——建構期擋掉的東西不必等到 argv 才發現。
+        if write_forbidden and (commit_required or allow_unsafe):
+            raise ValueError("write-forbidden launcher contradicts commit-required/unsafe")
         if review_only and review_terminal_kind not in {
             "workflow-verification-result", "workflow-review-result",
         }:
@@ -1117,6 +1188,11 @@ class SubprocessLauncher:
         self._read_only = read_only
         self._review_only = review_only
         self._commit_required = commit_required
+        # #716：卡片契約明確宣告「不 commit 且無 declared_outputs」⇒ 這張 build 卡依
+        # 契約不寫工作區 ⇒ 不該拿到 `workspace-write`。**它不改變 job 角色**——
+        # `_is_review_persona()` 的三個判準一個都沒動，write-forbidden 的 build 卡仍以
+        # `cortex-builder` 起跑（它就是 builder，只是這一張卡不寫檔）。
+        self._write_forbidden = write_forbidden
         self._review_terminal_kind = review_terminal_kind
         # cg-only：`--effort low|medium|high|xhigh`。其餘 executor 沒有對應概念
         # （不同於 `model`，本 repo 目前沒有既有的「effort 來源」可直接映射），
@@ -1192,6 +1268,7 @@ class SubprocessLauncher:
             read_only=False,
             review_only=False,
             commit_required=self._commit_required,
+            write_forbidden=self._write_forbidden,
             effort=self._effort,
             verdict_spool_dir=spool_dir,
         )
@@ -1201,6 +1278,10 @@ class SubprocessLauncher:
 
         if self._read_only or self._review_only:
             raise ValueError("commit-required launcher requires enforced workspace-write")
+        # #716：`commit_policy` 不可能同時是 `forbidden` 與 `required`；先降級成
+        # write-forbidden 再要求 commit 代表呼叫端算錯了契約，fail-closed。
+        if self._write_forbidden:
+            raise ValueError("write-forbidden launcher cannot become commit-required")
         if self._allow_unsafe or self._commit_required:
             return self
         return SubprocessLauncher(
@@ -1213,6 +1294,47 @@ class SubprocessLauncher:
             review_only=False,
             commit_required=True,
             effort=self._effort,
+        )
+
+    def as_write_forbidden(self) -> "SubprocessLauncher":
+        """Return a launcher whose card contract forbids any workspace write（#716）。
+
+        **判準在卡片契約上，不在 persona 上**：呼叫端（`manager._specialize_workflow_
+        launcher()`）先用 `registry.card_contract_forbids_workspace_write()` 從
+        `commit_policy` ＋ `declared_outputs` 機械算出來，再套用這個特化。builder
+        persona 底下同時有唯讀卡與寫入卡，persona 一刀切正是被否決的形態。
+
+        **read-only 族原樣回傳，不是靜默降級**：planner／reviewer 的契約已經**至少
+        一樣嚴**（`registry.SANDBOX_MODE_DERIVATION` 上兩格都是 `read-only`，且
+        `derive_job_write_contract()` 的優先序刻意讓它們壓過 `write_forbidden`），
+        再包一層只會改變它們其餘的既有旗標。它們今天就是好的，本票一個位元都不動。
+
+        `commit_required` 是**契約矛盾**（同一張卡的 `commit_policy` 不可能同時是
+        `forbidden` 與 `required`），顯性拒絕；`allow_unsafe` 是 operator 的明確
+        opt-in bypass，本票**不觸碰**——那一格連沙箱都沒有，降不降 mode 沒有意義，
+        而把它悄悄改掉會是一個超出本票射程的行為變更。
+        """
+
+        if self._read_only or self._review_only:
+            return self
+        if self._allow_unsafe:
+            return self
+        if self._commit_required:
+            raise ValueError("commit-required launcher cannot become write-forbidden")
+        if self._write_forbidden:
+            return self
+        return SubprocessLauncher(
+            executor=self._executor,
+            relay_target=self._relay_target,
+            codex_remote=self._codex_remote,
+            allow_unsafe=False,
+            model=self._model,
+            read_only=False,
+            review_only=False,
+            commit_required=False,
+            write_forbidden=True,
+            effort=self._effort,
+            verdict_spool_dir=self._verdict_spool_dir,
         )
 
     def _should_run_gates(self, env: Mapping[str, str]) -> bool:
@@ -1396,6 +1518,12 @@ class SubprocessLauncher:
             mode = "review-only"
         elif self._read_only:
             mode = "read-only"
+        elif self._write_forbidden:
+            # #716：preflight 報的必須是**正式 job 會實際看到的**剖面（design D2 的
+            # 「不然只是安慰劑」逐字適用）。這張卡的契約宣告不寫工作區，argv 上發的
+            # 是 `read-only`——名字沿用契約值而不是 mode 值，因為 `read-only` 那個名字
+            # 已經被 planner 佔著，兩者的其餘旗標並不相同（見 `as_write_forbidden`）。
+            mode = "write-forbidden"
         else:
             mode = "workspace-write"
         return ExecutorEnvironment(
@@ -1480,6 +1608,18 @@ class SubprocessLauncher:
         # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
         if self._executor in {"codex", "copilot", "claude", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
+        # #716：只有 codex 的 argv 上有 `--sandbox <mode>` 這個維度可表達。其餘 executor
+        # 沒有對應旗標（`build_claude_argv` 走 `--permission-mode`、`build_copilot_argv`
+        # 走 `--allow-all`／`--deny-tool`、agy／cg 是 plan-only／zero-tool），傳過去只會
+        # 是一個沒人接的 kwarg——形狀與既有的 `verdict_spool_dir`／`effort`／
+        # `last_message_path` 逐條一致：能力有差異就顯式分岔，不塞給接不住的那幾支。
+        #
+        # ⚠️ 這是**範圍**判斷，不是「其餘 executor 的最小權限已經對了」的宣稱。
+        # `claude` 的 `--permission-mode` 有沒有對應的降級形態**沒有量過**（#716 comment
+        # 記過 `EXECUTOR_TOOLS` 的 `inner_sandbox=None` 同時代表「沒有」與「還沒量」，
+        # 那是同一族的錯）。要動那幾支，得先各自量一次。
+        if self._executor == "codex":
+            builder_kwargs["write_forbidden"] = self._write_forbidden
         # trust-root Phase 2a：只有支援 `--add-dir` 的三個 executor 能表達「額外
         # 放行一個目錄」。agy／cg 是 zero-tool／plan-only，本來就寫不了檔，也不會
         # 被指派成 slice-lane reviewer；對它們宣告 spool 放行是設定錯誤，顯性拒絕。

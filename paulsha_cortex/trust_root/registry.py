@@ -847,6 +847,385 @@ def _assert_every_downgraded_principal_has_a_git_workspace_trust() -> None:
 _assert_every_downgraded_principal_has_a_git_workspace_trust()
 
 
+# ---------------------------------------------------------------------------
+# #716：executor 的 sandbox mode 由**卡片契約**機械導出，不由 persona 一刀切
+#
+# ## 這條規則在修什麼
+#
+# `launcher.build_codex_argv()` 過去對 builder **一律**發 `--sandbox workspace-write`
+# ——`commit_policy` 完全不看，因為 `read_only`／`review_only` 是 **launcher 維度**
+# （`as_read_only()`／`as_review_only()`），builder 一律走 `else` 分支。於是一張
+# `commit_policy=forbidden` 且 `declared_outputs` 為空的唯讀 build 卡（例如
+# `worktree-isolation`）拿到的是**寫入授權**。
+#
+# **這是獨立成立的最小權限缺陷**，與 codex 的內層沙箱形態無關。#714／PR #715 把內層
+# 換成 legacy landlock 之後，它從「權限給多了」變成**當場 panic**：
+#
+#     $ codex sandbox -c sandbox_mode='"workspace-write"' --enable use_legacy_landlock -- /bin/pwd
+#     thread 'main' panicked at linux-sandbox/src/linux_run_main.rs:318:9:
+#     permission profiles requiring direct runtime enforcement are incompatible
+#     with --use-legacy-landlock
+#     rc=101
+#
+# 判準不是「哪一個具名 profile」，而是一條**性質**：profile 只要攜帶**任何** filesystem
+# 寫入授權，就要求 direct runtime enforcement（0819 `-P` 實測：`extends=":read-only"`
+# rc=0／`":none"` rc=0／`":workspace"` panic／`":read-only"` **加一條**
+# `filesystem = { "<path>" = "write" }` **panic**）。這是 **session 層級**的判定，發生在
+# 任何命令執行**之前**——所以模型的唯讀 `git rev-parse HEAD` 與一條寫入命令 panic 得
+# 一模一樣。:attr:`SandboxModeDerivation.grants_filesystem_write` 記的就是這條性質。
+#
+# ## 為什麼是一張表，而不是 `build_codex_argv` 裡的一個 `if`
+#
+# 與 #708 的 :data:`JOB_LOG_SPOOLS`、#710 的 :data:`JOB_WORKSPACE_REACH`、#712 的
+# :data:`JOB_GIT_WORKSPACE_TRUST` 同一個理由：那三票的病因都是「同一條性質被在 N 個
+# 地方各自決定，於是其中一格恰好成立、一格從來沒有實作、一格沒有人查過」。sandbox mode
+# 今天有五種 launcher 契約形態，`if` 寫法下「只修 builder 那一格」是**寫得出來的**；
+# 導出成表 ＋ import 期全覆蓋斷言之後，漏一格**模組載不起來**。
+#
+# 這張表同時是**探針的輸入**：`permgen.build_inner_sandbox_probe()` 要驗的是
+# 「`build_codex_argv` 會發出的**每一個** `--sandbox <mode>` 在真實加固面下都裝得上內層
+# 沙箱」，mode 清單由 :func:`emitted_sandbox_modes` 機械導出——手抄就會再抄成只有
+# `read-only` 那一格，而那正是 #715 探針假綠的原症狀（#716 第 4 節）。
+# ---------------------------------------------------------------------------
+
+#: codex `--sandbox` 的兩個受支援值。字面量只在這裡出現一次。
+SANDBOX_MODE_READ_ONLY = "read-only"
+SANDBOX_MODE_WORKSPACE_WRITE = "workspace-write"
+
+#: 卡片契約裡「這張卡不得 commit」的宣告值（`deck.schema` 的
+#: `execution.commit_policy` ∈ {`forbidden`, `optional`, `required`}，
+#: `coordinator.workflow.WorkflowStep` 同集合）。
+COMMIT_POLICY_FORBIDDEN = "forbidden"
+
+
+class JobWriteContract(Enum):
+    """一次派工對工作區的**寫入契約**——:data:`SANDBOX_MODE_DERIVATION` 的定義域。
+
+    這五格窮舉了 `launcher.build_codex_argv()` 今天能處在的全部形態，由
+    :func:`derive_job_write_contract` 從 launcher 的建構契約 ＋ 卡片契約機械導出。
+    """
+
+    #: `allow_unsafe=True`：`--dangerously-bypass-approvals-and-sandbox` 已經整個關掉
+    #: 內層沙箱，`--sandbox` 不發（也不該發）。
+    UNSAFE_BYPASS = "unsafe-bypass"
+
+    #: workflow lane 的 planner 卡（`as_read_only()`）。**今天就是好的，不得改變。**
+    PLANNER_READ_ONLY = "planner-read-only"
+
+    #: workflow lane 的 reviewer 卡（`as_review_only()`）。**今天就是好的，不得改變。**
+    REVIEWER_REVIEW_ONLY = "reviewer-review-only"
+
+    #: **#716 的那一格**：builder persona，但卡片契約**明確**宣告
+    #: `commit_policy=forbidden` 且 `declared_outputs` 為空 ⇒ 這張卡依契約不產生任何
+    #: 工作區寫入，因此不該拿到寫入授權。
+    BUILDER_WRITE_FORBIDDEN = "builder-write-forbidden"
+
+    #: 其餘一律落這一格（含 `commit_policy=required`／`optional`／**契約缺欄或解不出來**）
+    #: ——維持現狀的 `workspace-write`。**保守方向：不猜。**
+    BUILDER_WORKSPACE_WRITE = "builder-workspace-write"
+
+
+@dataclass(frozen=True)
+class SandboxModeDerivation:
+    """一種寫入契約 → executor sandbox mode 的宣告（#716）。"""
+
+    contract: JobWriteContract
+    #: 要發的 `--sandbox <mode>`；`None` ＝ 這一格根本不發 `--sandbox`（bypass）。
+    sandbox_mode: str | None
+    #: 這個 mode 導出的 permission profile 是否攜帶**任何** filesystem 寫入授權。
+    #: 這不是偏好，是 0819 量到的機制事實，也是本表與 codex 的
+    #: `linux_run_main.rs:318` fail-closed 檢查的**唯一**接點（見本節開頭）。
+    grants_filesystem_write: bool
+    note: str
+
+
+#: **#716 那條規則的表**：:class:`JobWriteContract` 五格一格都不能少。
+#:
+#: | 契約 | mode | 帶寫入授權 | legacy landlock 下 |
+#: |---|---|---|---|
+#: | `unsafe-bypass` | （不發） | — | 內層沙箱整個關掉，不適用 |
+#: | `planner-read-only` | `read-only` | 否 | **rc=0**（今天就是好的） |
+#: | `reviewer-review-only` | `read-only` | 否 | **rc=0**（今天就是好的） |
+#: | `builder-write-forbidden` | `read-only` | 否 | **rc=0**（本票修的就是這一格） |
+#: | `builder-workspace-write` | `workspace-write` | **是** | **panic rc=101**（#716 未解的那一半） |
+SANDBOX_MODE_DERIVATION: tuple[SandboxModeDerivation, ...] = (
+    SandboxModeDerivation(
+        contract=JobWriteContract.UNSAFE_BYPASS,
+        sandbox_mode=None,
+        grants_filesystem_write=True,
+        note=(
+            "`--dangerously-bypass-approvals-and-sandbox` 同時關掉核可**與**沙箱，"
+            "再選一個 mode 沒有意義（`build_codex_argv` 的既有註解逐字如此，本表沒有"
+            "改變它）。`grants_filesystem_write=True` 是**誠實標註**：這一格拿到的不是"
+            "「沒有寫入授權」，是「連沙箱都沒有」——把它標成 False 會讓任何"
+            "「哪些形態帶寫入授權」的盤點漏掉最寬的那一格。"
+        ),
+    ),
+    SandboxModeDerivation(
+        contract=JobWriteContract.PLANNER_READ_ONLY,
+        sandbox_mode=SANDBOX_MODE_READ_ONLY,
+        grants_filesystem_write=False,
+        note=(
+            "`as_read_only()`＝workflow lane 的 planner 卡。**本票一個位元都不動它**"
+            "——0819 實機在真實加固面複本下 `-s read-only` ＋ legacy landlock 是 rc=0，"
+            "而且是**模型自己決定命令**的真實 agent loop 量到的"
+            "（`git -c safe.directory=… rev-parse HEAD` → `exit_code: 0`／"
+            "`turn.completed`／`DONE rc=0`）。這一格在本表上的作用是**成為斷言的一部分**："
+            "任何人把 planner 的 mode 改掉，import 期的全覆蓋斷言與其配套測試會擋下來。"
+        ),
+    ),
+    SandboxModeDerivation(
+        contract=JobWriteContract.REVIEWER_REVIEW_ONLY,
+        sandbox_mode=SANDBOX_MODE_READ_ONLY,
+        grants_filesystem_write=False,
+        note=(
+            "`as_review_only()`＝workflow lane 的 reviewer 卡，與 planner 同一個 mode、"
+            "同樣今天就是好的。兩格分開列而不是合併成一個 `read-only-lane`，是因為它們"
+            "在 launcher 上是**兩個不同的建構契約**（`--skip-git-repo-check` 之外還有"
+            "`--tools`／`--settings`／verdict spool 的差異），合併會讓「reviewer 的 mode "
+            "被改掉」與「planner 的 mode 被改掉」在表上長得一樣。"
+        ),
+    ),
+    SandboxModeDerivation(
+        contract=JobWriteContract.BUILDER_WRITE_FORBIDDEN,
+        sandbox_mode=SANDBOX_MODE_READ_ONLY,
+        grants_filesystem_write=False,
+        note=(
+            "**#716 選項 F 的那一格。** 判準是**卡片契約**（`commit_policy=forbidden` "
+            "**且** `declared_outputs` 為空，見 "
+            ":func:`card_contract_forbids_workspace_write`），不是 persona——persona 一刀切"
+            "正是被否決的形態：builder 這個 persona 底下同時有唯讀卡與寫入卡。\n"
+            "**這是最小權限修正，不是 landlock 的 workaround**：一張契約上宣告不 commit、"
+            "也不宣告任何產出的卡，本來就不該拿到工作區寫入授權。legacy landlock 只是讓"
+            "這個既有缺陷從靜默變成 panic。\n"
+            "**誠實邊界**：本格**只**解得了唯讀卡。同一個 build phase 的下一張會寫檔的卡"
+            "落在 `builder-workspace-write`，仍會撞同一面牆（#716 的 A／B／E 裁決仍要做）。"
+        ),
+    ),
+    SandboxModeDerivation(
+        contract=JobWriteContract.BUILDER_WORKSPACE_WRITE,
+        sandbox_mode=SANDBOX_MODE_WORKSPACE_WRITE,
+        grants_filesystem_write=True,
+        note=(
+            "**預設落點，也是保守方向的具體形狀**：`commit_policy=required`／`optional`、"
+            "**以及契約缺欄或解不出來**的一律落這裡＝維持現狀。"
+            "「解不出來就降成 read-only」會把一張真的要寫檔的卡靜默弄壞，而那種壞法"
+            "（模型寫不進去、自己重試、最後回 needs_human）離病因很遠——本 repo 已經為"
+            "同型的遠距症狀付過四次診斷成本（#708／#710／#712／#714）。\n"
+            "**這一格在 legacy landlock 下 100% panic**（`linux_run_main.rs:318`），"
+            "那是 #716 **未解**的那一半，由 `permgen.build_inner_sandbox_probe()` 的"
+            "per-mode 矩陣持續紅著標示，**不得**為了讓探針變綠而放寬判準。"
+        ),
+    ),
+)
+
+
+def sandbox_mode_for(contract: JobWriteContract) -> str | None:
+    """該寫入契約要發的 `--sandbox <mode>`；查無即 fail-closed（#716）。"""
+
+    for row in SANDBOX_MODE_DERIVATION:
+        if row.contract is contract:
+            return row.sandbox_mode
+    raise KeyError(
+        f"{contract} 沒有登記 sandbox mode——每一種 launcher 寫入契約都必須在 "
+        "SANDBOX_MODE_DERIVATION 上有恰好一格，不得在 build_codex_argv 裡另寫一個 "
+        "if（#716）。"
+    )
+
+
+def card_contract_forbids_workspace_write(
+    *, commit_policy: object, declared_outputs: object
+) -> bool:
+    """卡片契約是否**明確**宣告「這張卡不寫工作區」（#716 選項 F 的判準）。
+
+    **保守方向，兩個條件都要明確成立**：
+
+    1. `commit_policy` 逐字是 :data:`COMMIT_POLICY_FORBIDDEN`；
+    2. `declared_outputs` 是一個**空的**序列。
+
+    其餘一律回 `False`＝維持現狀的 `workspace-write`。**缺欄不猜**：`commit_policy`
+    為 `None`（卡片沒宣告、也不在 `manager._LEGACY_CARD_EXECUTION` 的補值表上）、
+    `declared_outputs` 不是序列或非空，都不足以斷言這張卡不寫檔。
+
+    ⚠️ 型別刻意收成 `object`：呼叫端拿到的是**卡片自己宣告的資料**（`WorkflowStep`
+    的欄位由 JSON／YAML 反序列化而來），把「不是我預期的型別」當成 `False` 是這條
+    判準的一部分，不是防禦性程式碼。
+    """
+
+    if commit_policy != COMMIT_POLICY_FORBIDDEN:
+        return False
+    if isinstance(declared_outputs, (str, bytes)):
+        # 字串是序列，但一個字串型的 declared_outputs 代表契約形狀本身就不對
+        # ——那屬於「解不出來」，不是「宣告了空產出」。
+        return False
+    if not isinstance(declared_outputs, (list, tuple, frozenset, set)):
+        return False
+    return len(declared_outputs) == 0
+
+
+def derive_job_write_contract(
+    *,
+    allow_unsafe: bool = False,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    write_forbidden: bool = False,
+) -> JobWriteContract:
+    """launcher 的建構契約 → :class:`JobWriteContract`（#716 的**唯一**導出點）。
+
+    優先序（由寬到嚴，**刻意讓 read-only 族壓過 `write_forbidden`**）：
+
+        allow_unsafe > read_only > review_only > write_forbidden > 其餘
+
+    第 2、3 條排在 `write_forbidden` 之前，是為了讓「planner／reviewer 現行的
+    `read-only` 行為不得改變」成為**結構事實**：不論卡片契約怎麼宣告，那兩格導出的
+    永遠是它們自己那一列。而它們的 mode 本來就是 `read-only`，因此這個優先序不會
+    放寬任何東西——它只是讓兩張表不互相打架。
+
+    **矛盾組合 fail-closed**（與 `SubprocessLauncher.__init__`／`build_codex_argv`
+    既有的守衛同型、同理由）：契約自相矛盾時顯性失敗，不靜默選一個。
+    """
+
+    if read_only and review_only:
+        raise ValueError(
+            "寫入契約不得同時是 planner read-only 與 reviewer review-only（#716）"
+        )
+    if allow_unsafe and (read_only or review_only or commit_required or write_forbidden):
+        raise ValueError(
+            "allow_unsafe 已經整個關掉沙箱，不得同時宣告任何受限寫入契約（#716）"
+        )
+    if commit_required and (read_only or review_only):
+        raise ValueError("commit-required 契約要求 workspace-write（#716）")
+    if commit_required and write_forbidden:
+        raise ValueError(
+            "同一張卡的 commit_policy 不可能同時是 required 與 forbidden（#716）"
+        )
+    if allow_unsafe:
+        return JobWriteContract.UNSAFE_BYPASS
+    if read_only:
+        return JobWriteContract.PLANNER_READ_ONLY
+    if review_only:
+        return JobWriteContract.REVIEWER_REVIEW_ONLY
+    if write_forbidden:
+        return JobWriteContract.BUILDER_WRITE_FORBIDDEN
+    return JobWriteContract.BUILDER_WORKSPACE_WRITE
+
+
+def emitted_sandbox_modes() -> tuple[str, ...]:
+    """`build_codex_argv` 會發出的**每一個** `--sandbox <mode>`（#716）。
+
+    這是 `permgen.build_inner_sandbox_probe()` 的輸入。**探針不得手抄這份清單**
+    ——#715 的探針正是因為只驗到 `codex sandbox` 的預設（唯讀族）profile 而假綠，
+    從來沒碰過 builder 的 `workspace-write`（#716 第 4 節）。
+
+    順序穩定（依 :data:`SANDBOX_MODE_DERIVATION` 的宣告序去重），因此產生器的輸出
+    是確定性的。
+    """
+
+    modes: list[str] = []
+    for row in SANDBOX_MODE_DERIVATION:
+        if row.sandbox_mode is not None and row.sandbox_mode not in modes:
+            modes.append(row.sandbox_mode)
+    return tuple(modes)
+
+
+def _assert_sandbox_mode_derivation_is_total() -> None:
+    """#716 那條規則，在 **import 當下**強制（registry 這一半）。
+
+    **規則**：:class:`JobWriteContract` 上的每一格在 :data:`SANDBOX_MODE_DERIVATION`
+    上必須有**恰好一格**，且 :func:`derive_job_write_contract` 對整個布林定義域的每一個
+    可解組合都必須落在表上。因此「只修 builder 那一格」在結構上做不到：新增一種
+    launcher 寫入契約而漏了這張表，**模組載不起來**。
+
+    另釘住三條性質（它們是本票論證的承重點，不是額外的謹慎）：
+
+    1. `sandbox_mode is None` **當且僅當** 契約是 `unsafe-bypass`；
+    2. `grants_filesystem_write` 與 mode 一致——`workspace-write` ⇒ True、
+       `read-only` ⇒ False。這條就是 codex `linux_run_main.rs:318` 的判準
+       （profile 只要攜帶任何 filesystem 寫入授權就要求 direct runtime enforcement）；
+    3. planner 與 reviewer 兩格恆為 `read-only`——**現行行為不得改變**。
+    """
+
+    declared = [row.contract for row in SANDBOX_MODE_DERIVATION]
+    if len(declared) != len(set(declared)):
+        raise ValueError(f"SANDBOX_MODE_DERIVATION 有重複的契約: {declared}")
+    missing = [c for c in JobWriteContract if c not in declared]
+    if missing:
+        raise ValueError(
+            f"寫入契約 {[c.value for c in missing]} 沒有登記 sandbox mode——"
+            "sandbox mode 是最小權限的直接表達（#716：一張 commit_policy=forbidden 的"
+            "卡拿到 workspace-write，就是把寫入授權給了一個契約上宣告不寫的 job），"
+            "請往 SANDBOX_MODE_DERIVATION 加一列，不要在 build_codex_argv 裡塞一個 if。"
+        )
+    for row in SANDBOX_MODE_DERIVATION:
+        if not row.note:
+            raise ValueError(
+                f"{row.contract.value}：note 為空——「這一格發哪個 mode」是量測結果，"
+                "不是預設值（#716）。"
+            )
+        is_bypass = row.contract is JobWriteContract.UNSAFE_BYPASS
+        if (row.sandbox_mode is None) != is_bypass:
+            raise ValueError(
+                f"{row.contract.value}：只有 unsafe-bypass 那一格不發 --sandbox"
+                "（其餘形態不發等於靜默交出「由 codex 自己決定預設」，#716）。"
+            )
+        if row.sandbox_mode is not None:
+            if row.sandbox_mode not in (
+                SANDBOX_MODE_READ_ONLY, SANDBOX_MODE_WORKSPACE_WRITE
+            ):
+                raise ValueError(
+                    f"{row.contract.value}：未知的 sandbox mode {row.sandbox_mode!r}"
+                    "（#716）。"
+                )
+            expected_write = row.sandbox_mode == SANDBOX_MODE_WORKSPACE_WRITE
+            if row.grants_filesystem_write != expected_write:
+                raise ValueError(
+                    f"{row.contract.value}：grants_filesystem_write="
+                    f"{row.grants_filesystem_write} 與 mode {row.sandbox_mode!r} 矛盾"
+                    "——codex 的判準是「profile 帶不帶 filesystem 寫入授權」"
+                    "（`linux_run_main.rs:318`），這一欄記的就是那條性質（#716）。"
+                )
+    for contract in (
+        JobWriteContract.PLANNER_READ_ONLY, JobWriteContract.REVIEWER_REVIEW_ONLY
+    ):
+        if sandbox_mode_for(contract) != SANDBOX_MODE_READ_ONLY:
+            raise ValueError(
+                f"{contract.value} 的 mode 不是 {SANDBOX_MODE_READ_ONLY!r}——"
+                "planner／reviewer 今天就是好的（0819 實機真實 agent loop rc=0），"
+                "#716 一個位元都不動它們（#716）。"
+            )
+    # 導出函式對整個布林定義域窮舉：可解的組合必須落在表上，不可解的必須顯性 raise。
+    reachable: set[JobWriteContract] = set()
+    for bits in range(32):
+        kwargs = {
+            "allow_unsafe": bool(bits & 1),
+            "read_only": bool(bits & 2),
+            "review_only": bool(bits & 4),
+            "commit_required": bool(bits & 8),
+            "write_forbidden": bool(bits & 16),
+        }
+        try:
+            contract = derive_job_write_contract(**kwargs)
+        except ValueError:
+            continue
+        if contract not in declared:
+            raise ValueError(
+                f"derive_job_write_contract({kwargs}) 導出的 {contract} 不在 "
+                "SANDBOX_MODE_DERIVATION 上（#716）。"
+            )
+        reachable.add(contract)
+    unreachable = [c for c in JobWriteContract if c not in reachable]
+    if unreachable:
+        raise ValueError(
+            f"寫入契約 {[c.value for c in unreachable]} 在表上，但 "
+            "derive_job_write_contract 導不出來——那是一格死碼，比缺一格更難發現"
+            "（#716）。"
+        )
+
+
+_assert_sandbox_mode_derivation_is_total()
+
+
 def job_spec_spool_asset_id(principal: Principal) -> str:
     """該降權 principal 的 per-principal spec spool 資產 id（#657）。
 
