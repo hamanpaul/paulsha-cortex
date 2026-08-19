@@ -73,6 +73,7 @@ def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
         "prompt",
         str(tmp_path / "runtime-output"),
         tmp_path,
+        last_message_path=tmp_path / "runtime-output" / "planning.last.json",
     )
     # issue #404：plan 模式的系統提示與確定性回聲任務衝突，安全層改由
     # no-tools＋disposable sandbox＋樹快照＋hermetic 配置共同承擔。
@@ -217,6 +218,7 @@ def test_planning_argv_claude_branch_omits_permission_mode(tmp_path: Path) -> No
         "prompt",
         str(tmp_path / "runtime-output"),
         tmp_path,
+        last_message_path=tmp_path / "runtime-output" / "planning.last.json",
     )
     assert "--permission-mode" not in argv
     assert "plan" not in argv

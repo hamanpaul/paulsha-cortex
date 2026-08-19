@@ -46,9 +46,20 @@ D-h  `subprocess.run(timeout=)`    Manager 側 `Popen.wait(timeout)` →
                                   `systemctl stop` → 確認離開 active（D4）
 D-i  `capture_output=True`         Manager-owned log ＋ shim 降權後 O_APPEND
                                   接管（`planning-job-log-spool`）
-D-j  codex `-o last.json`          落點在 job 的 `PrivateTmp` ⇒ Manager 讀不到
-                                  ⇒ `_extract_json` 退成單候選（**退步 R-2**）
+D-j  codex `-o last.json`          **#727 起**落點由 `planning_last_message_path()`
+                                  從該 job 那份 log 導出（`<planning-logs>/
+                                  <instance>/planning.last.json`），Manager 預建、
+                                  job 寫得進去、Manager 讀得回來 ⇒ 第二候選回來了
+                                  （退步 R-2 **解除**）
 ===  ===========================  =============================================
+
+⚠️ **R-2 的原始描述（「落點在 job 的 `PrivateTmp` ⇒ Manager 讀不到」）是對現象的
+正確描述，但把它當成結構限制是錯的**：`PrivateTmp` 是 `_planning_argv` 自己組
+`Path(temp_dir)/"last.json"` 造成的，而 `temp_dir` 在 job 模式下被硬填 `"/tmp"`。
+#714 缺陷 2 早就替 builder lane 回答過同一個問題（落點＝該 job 那份 log 的兄弟檔），
+只是 planning 這條路沒被涵蓋——那是**第二份落點決定**，不是不同的約束。代價逐字記在
+#727：codex 是唯一有憑證、剖面也對的 planner 候選，它連續四輪派工只留下 `ValueError`
+五個字，define 至今從未真正收斂過。
 
 ## U-1（scratch 要不要放 repo 複本）：job 模式實作 (b)＝空 scratch
 
@@ -73,8 +84,9 @@ Manager 在 job 側做不到）從「失去行為訊號」變成「結構上不�
 它不出現在任何 job 模板 unit 的 `ReadWritePaths=` ⇒ `ProtectSystem=strict` 讓寫入回
 EROFS。要打破這條性質必須改登記表，而那會在產生器輸出與 unit 檔上留下痕跡。
 
-executor 需要的可寫落點改指向 unit 的 `PrivateTmp=yes` 私有 `/tmp`（codex 的 `-o`、
-agy 的 log／state）：per-invocation、job-owned、unit 結束即消失，且 Manager 看不到。
+executor 需要的可寫落點改指向 unit 的 `PrivateTmp=yes` 私有 `/tmp`（agy 的 log／
+state）：per-invocation、job-owned、unit 結束即消失，且 Manager 看不到。**codex 的
+`-o` #727 起不在此列**——見上面 D-j 那一列與 `job_workspace.job_last_message_path()`。
 
 ## 只支援模板模式（B 案），`systemd-run` 模式 fail-closed
 
@@ -98,7 +110,7 @@ from typing import Callable, Mapping, Sequence
 from uuid import uuid4
 
 from ..config import paths
-from . import job_runner, spool_slot
+from . import job_runner, job_workspace, spool_slot
 from .model_identities import (
     PLANNING_FAILURE_EXECUTOR,
     PLANNING_FAILURE_EXECUTOR_SILENT_EXIT,
@@ -176,12 +188,20 @@ class _CompletedJob:
 
     **stdout 為什麼同時含 stderr**：shim 在降權之後把 fd 1 與 fd 2 **同時** dup 到
     spec 的 `log_path`（`job_shim._take_over_stdio`），Manager 這一側拿到的是一份合併
-    輸出。這是 design 未預期的第五條退步（R-5），已逐字記在本票 PR body。
+    輸出。這是 design 未預期的第五條退步（R-5），已逐字記在票 E 的 PR body。
+
+    `output_text`／`last_message` 是 #727 加的兩格：codex 的 `-o` 落點改掛到該 job
+    自己那份 log 的兄弟檔之後，Manager **讀得回來**（D-j／R-2 在 planning 這條路上
+    解除）；`last_message` 則是那一格的唯讀狀態標記，讓「寫不進去」與「模型沒輸出」
+    在 evidence 上分得開。`ProcessRunner` 那條路（agy 的兩次裸 CLI）不用這兩格，
+    維持預設值。
     """
 
     returncode: int
     stdout: str
     stderr: str = ""
+    output_text: str | None = None
+    last_message: str | None = None
 
 
 def _job_repo_root() -> str:
@@ -242,29 +262,45 @@ class JobPlanningInvoker:
     def run(self, invocation) -> object:
         """跑一次 identity＋prompt 呼叫（`PlanningInvoker.run` 的 job 實作）。"""
 
-        from .planning_runtime import PlanningOutcome, _planning_argv
+        from .planning_runtime import _planning_argv, planning_last_message_path
+        from .planning_runtime import PlanningOutcome
 
         identity = invocation.identity
         scratch_hint = self._reserve(invocation.run_id, invocation.purpose)
-        # `_planning_argv` 的 `temp_dir` 是 executor 的**可寫落點**（codex 的
-        # `-o`、agy 的 log_dir）。U-2 裁決下 scratch 唯讀，因此那些落點指向 unit
-        # 的 `PrivateTmp=yes` 私有 /tmp——per-invocation、job-owned、unit 結束即
-        # 消失，Manager 看不到（這正是 D-j／R-2 退步的來源）。
-        argv = _planning_argv(identity, invocation.prompt, "/tmp", scratch_hint.cwd)
+        # `_planning_argv` 的 `temp_dir` 是 executor 的**其餘**可寫落點（agy 的
+        # log_dir）。U-2 裁決下 scratch 唯讀，因此它指向 unit 的 `PrivateTmp=yes`
+        # 私有 /tmp——per-invocation、job-owned、unit 結束即消失。
+        #
+        # **#727：codex 的 `-o` 不再是它們之一。** 修法前 `-o` 也落在私有 /tmp，
+        # 於是 job 寫得進去、Manager 讀不回來 ⇒ `_extract_json` 退成單候選 ⇒ 那時
+        # 串流備援解不了 codex 的 JSONL ⇒ `ValueError: planning launcher returned
+        # no JSON object`。落點改由 `planning_last_message_path()` 從**該 job 自己
+        # 那份 log** 導出（#714 缺陷 2 的同一條規則）：同一格 log spool、job 已有
+        # `wx`、Manager 是 owner ⇒ 模板 unit 的 `ReadWritePaths=` 逐字不變，而第二
+        # 候選回得來。
+        log_path = self._job_log_path(scratch_hint.instance)
+        last_message_path = planning_last_message_path(log_path)
+        argv = _planning_argv(
+            identity,
+            invocation.prompt,
+            "/tmp",
+            scratch_hint.cwd,
+            last_message_path=last_message_path,
+        )
         completed = self._dispatch(
             argv=argv,
             executor=identity.executor,
             timeout_seconds=invocation.timeout_seconds,
             reservation=scratch_hint,
+            last_message_path=last_message_path,
         )
         return PlanningOutcome(
             returncode=completed.returncode,
             stdout=completed.stdout,
             stderr=completed.stderr,
-            # D-j／R-2：codex 的 `-o last.json` 落在 job 的 PrivateTmp，Manager
-            # 讀不到 ⇒ 第二候選恆為 None，`_extract_json` 退成單候選。
-            output_text=None,
+            output_text=completed.output_text,
             diagnostics=dict(self._diagnostics_cache),
+            last_message=completed.last_message,
         )
 
     def capability_probe_runner(self) -> Callable[..., object]:
@@ -326,6 +362,17 @@ class JobPlanningInvoker:
         slot = self._scratch_root / instance
         return _Reservation(job_id=job_id, instance=instance, slot=slot, cwd=slot / "cwd")
 
+    def _job_log_path(self, instance: str) -> Path:
+        """這一個 instance 的 job log 落點——**本類別唯一的推導點**（#727）。
+
+        `-o` 的落點是它的兄弟檔（`planning_last_message_path()`），而 argv 在
+        `run()` 就要組好、log 一格卻在 `_dispatch()` 才建；兩處各推導一次正是 #714
+        缺陷 2 的形狀。收斂成一支方法之後，兩邊拿到的是同一條路徑，而 `_dispatch()`
+        另外對 `run()` 傳下來的那一份做逐字比對（漂移即 fail-closed）。
+        """
+
+        return self._log_spool_root / instance / job_workspace.PLANNING_JOB_LOG_FILENAME
+
     def _dispatch(
         self,
         *,
@@ -333,8 +380,14 @@ class JobPlanningInvoker:
         executor: str,
         timeout_seconds: int,
         reservation: "_Reservation",
+        last_message_path: Path | None = None,
     ) -> _CompletedJob:
-        """一次呼叫 = 一個模板 unit 實例。**在任何副作用之前先 fail-closed。**"""
+        """一次呼叫 = 一個模板 unit 實例。**在任何副作用之前先 fail-closed。**
+
+        `last_message_path` 由 `run()` 傳下來（`ProcessRunner` 那條路沒有 `-o`，
+        維持 ``None``）。本方法**不重新推導**它，只驗證它與這一個 plan 的 log 兄弟檔
+        逐字相同——比照 `launcher.launch()` 對 `#714` 那一格做的事。
+        """
 
         self._last_diagnostics: dict[str, str] = {}
         try:
@@ -352,11 +405,32 @@ class JobPlanningInvoker:
 
         diagnostics = self._base_diagnostics(plan, executor)
         self._last_diagnostics = dict(diagnostics)
-        log_slot = self._log_spool_root / plan.instance
-        log_path = log_slot / "planning.log"
+        log_path = self._job_log_path(plan.instance)
+        log_slot = log_path.parent
+        if last_message_path is not None:
+            from .planning_runtime import planning_last_message_path
+
+            derived = planning_last_message_path(log_path)
+            if Path(last_message_path) != derived:
+                # #714 的教訓逐字：「argv 指著 A、shim 開的是 B」這種錯位只在實機上
+                # 看得見。兩處推導漂移時當場停，不要派出去。
+                raise PlanningJobError(
+                    PLANNING_FAILURE_JOB_START,
+                    (
+                        "planning last-message 落點漂移："
+                        f"argv={last_message_path} 導出={derived}"
+                    ),
+                    diagnostics=diagnostics,
+                )
         try:
             self._prepare_scratch(reservation)
             self._prepare_log(log_slot, log_path)
+            if last_message_path is not None:
+                # `-o` 那一格**由 Manager 預建**，理由與 log 檔逐字相同（#638 缺陷 2）：
+                # job 自己建的檔帶降權 unit 的 `UMask=0077` ⇒ `0600 <job 帳號>`，
+                # Manager 是目錄的 owner 但那不給檔案內容的讀取權。差別在於這一格
+                # Manager **真的要讀它**，因此讀不回來不是診斷面的損失、是功能面的。
+                spool_slot.preseed_job_writable_file(last_message_path)
         except (OSError, spool_slot.SpoolSlotError) as exc:
             self._cleanup(reservation, log_slot)
             raise PlanningJobError(
@@ -373,6 +447,7 @@ class JobPlanningInvoker:
                 log_path=log_path,
                 timeout_seconds=timeout_seconds,
                 diagnostics=diagnostics,
+                last_message_path=last_message_path,
             )
         finally:
             self._cleanup(reservation, log_slot)
@@ -392,6 +467,7 @@ class JobPlanningInvoker:
         log_path: Path,
         timeout_seconds: int,
         diagnostics: dict[str, str],
+        last_message_path: Path | None = None,
     ) -> _CompletedJob:
         sentinel = reservation.slot / "client.exit"
         client_log = reservation.slot / "client.log"
@@ -496,6 +572,16 @@ class JobPlanningInvoker:
 
         returncode = self._read_sentinel(sentinel, process)
         stdout = self._read_log(log_path)
+        # #727：`-o` 那一格必須在 `_cleanup()` 把 log 一格 rmtree 之前讀出來，而且
+        # **成功與失敗兩條路都要**——失敗路徑上「寫進去了沒」正是四輪派工都問不出來
+        # 的那件事。讀取／標記兩支都在 `planning_runtime`，這裡不另寫一份。
+        output_text: str | None = None
+        last_message: str | None = None
+        if last_message_path is not None:
+            from .planning_runtime import _last_message_marker, _read_last_message
+
+            last_message = _last_message_marker(last_message_path)
+            output_text = _read_last_message(last_message_path)
         if returncode != 0:
             client_tail = self._read_log(client_log)
             silent = not stdout.strip()
@@ -506,6 +592,8 @@ class JobPlanningInvoker:
                 f"version={self._binary_version(executor=plan.executor, plan=plan)} "
                 f"seccomp_filter_fatal={diagnostics.get('seccomp_filter_fatal', '<unknown>')}"
             )
+            if last_message is not None:
+                detail = f"{detail} last_message={last_message}"
             if silent:
                 # spec R6：rc≠0 且完全無輸出是整個家族裡最難查的一種——**連錯誤訊息
                 # 都沒有**，歸因於是會落到模型、prompt、逾時或憑證，而不會落到執行
@@ -521,7 +609,12 @@ class JobPlanningInvoker:
             raise PlanningJobError(
                 PLANNING_FAILURE_EXECUTOR, detail, diagnostics=diagnostics
             )
-        return _CompletedJob(returncode=returncode, stdout=stdout)
+        return _CompletedJob(
+            returncode=returncode,
+            stdout=stdout,
+            output_text=output_text,
+            last_message=last_message,
+        )
 
     # -- 前置物 -------------------------------------------------------------
 

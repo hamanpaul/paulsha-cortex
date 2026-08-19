@@ -245,7 +245,27 @@ def prepare_job_log(slot: str | Path, log_path: str | Path) -> Path:
     slot_path = Path(slot)
     slot_path.parent.mkdir(parents=True, exist_ok=True)
     create_slot(slot_path, reset=True)
-    target = Path(log_path)
+    return preseed_job_writable_file(log_path)
+
+
+def preseed_job_writable_file(path: str | Path) -> Path:
+    """由 **consumer（Manager）預建**、job 寫得進去、consumer 讀得回來的一個空檔。
+
+    這是 :func:`prepare_job_log` 對 log 檔做的那一段，抽出來讓 **codex 的 `-o`
+    落點**（#727）沿用同一份論證與同一個 mode，而不是在呼叫端再寫一次 `os.open`
+    ＋`fchmod`——那就是第二份真相。
+
+    為什麼非預建不可（#638 缺陷 2 的同一個機制）：job 自己建的檔由 job 擁有、又帶
+    降權 unit 的 `UMask=0077` ⇒ `0600 <job 帳號>`，Manager 是**目錄**的 owner 但那
+    不給檔案內容的讀取權。`-o` 那一格與 log 的差別在於 **Manager 真的要讀它**
+    （它是 `_extract_json` 的第二輸出候選），因此「讀不回來」不是診斷面的損失，
+    是功能面的損失。
+
+    mode 見 :data:`JOB_LOG_FILE_MODE`（**不是 0600**：那會把繼承來的具名 ACL 條目
+    壓成 `#effective:---`）。回傳建好的路徑供呼叫端串接。
+    """
+
+    target = Path(path)
     fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, JOB_LOG_FILE_MODE)
     try:
         # umask 會把 open(2) 的 mode 夾掉（Manager unit 帶 `UMask=0077`），因此一定要

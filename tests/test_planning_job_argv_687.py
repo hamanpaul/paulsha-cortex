@@ -101,7 +101,11 @@ class PlanningArgvSurvivesJobSpec(unittest.TestCase):
         ):
             with self.subTest(executor=executor):
                 argv = _planning_argv(
-                    _identity(executor, model_id), "PROMPT", "/tmp", Path("/scratch/cwd")
+                    _identity(executor, model_id),
+                    "PROMPT",
+                    "/tmp",
+                    Path("/scratch/cwd"),
+                    last_message_path=Path("/lg/inst/planning.last.json"),
                 )
                 spec = job_runner.build_job_spec(command=argv, **_SPEC_BASE)
                 self.assertEqual(spec["command"], argv)
@@ -115,7 +119,11 @@ class PlanningArgvSurvivesJobSpec(unittest.TestCase):
         """
 
         argv = _planning_argv(
-            _identity("claude", "claude-opus-5"), "PROMPT", "/tmp", Path("/scratch/cwd")
+            _identity("claude", "claude-opus-5"),
+            "PROMPT",
+            "/tmp",
+            Path("/scratch/cwd"),
+            last_message_path=Path("/lg/inst/planning.last.json"),
         )
         self.assertIn("--tools", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "")

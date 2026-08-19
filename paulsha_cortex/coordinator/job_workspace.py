@@ -672,6 +672,11 @@ def prepare_commit_spool(
 #: :func:`prepare_job_log_spool`），而 harvest 端的 `usage_extractors` 讀的就是 JSONL。
 JOB_LOG_FILENAME = "job.jsonl"
 
+#: 降權 planning job 在自己那一格 log spool 裡的檔名（#686 起的既有字面量，
+#: #727 起收斂到這裡）。理由與 :data:`JOB_LOG_FILENAME` 同一條：`-o` 的落點由
+#: 它機械導出（:func:`job_last_message_path`），檔名散成兩份就會漂移。
+PLANNING_JOB_LOG_FILENAME = "planning.log"
+
 #: executor 的「最後一則訊息」落點副檔名（codex 的 `--output-last-message`／`-o`，#714）。
 JOB_LAST_MESSAGE_SUFFIX = ".last.json"
 
@@ -705,8 +710,28 @@ def job_last_message_path(job_log_path: str | Path) -> Path:
       ——同一個目錄（direct 模式下 Manager 就是寫者），但檔名帶了 slice id，共用路徑
       的並行覆寫一併解掉。
 
+    ## #727：planning probe 這條路徑也回到同一條規則
+
+    #714 只替 **builder** lane 修好（`launcher.launch()` 那一條）。`planning_runtime.
+    _planning_argv()` 當時仍自己組 `Path(temp_dir)/"last.json"`——**第二份落點決定**，
+    於是 planning job 的 `-o` 落在 unit 的 `PrivateTmp=yes` 私有 `/tmp`：job 寫得進去，
+    **Manager 讀不到**（`planning_job` 的 D-j／R-2 退步）。`_extract_json` 因此退成單
+    候選，而它當時解不了 codex 的 `--json` 串流 ⇒ `ValueError: planning launcher
+    returned no JSON object` ⇒ 唯一有憑證、剖面也對的 planner 候選永遠 not-ready。
+
+    #727 起 planning 那一條也由本函式導出：
+
+    - 降權（模板 unit）：`<planning-logs>/<instance>/planning.log`
+      ⇒ `…/<instance>/planning.last.json`——同一格 log spool，job 已有 `wx`，
+      模板 unit 的 `ReadWritePaths=` 逐字不變、零部署動作；且 Manager 是那一格的
+      owner ⇒ 預建（`spool_slot.preseed_job_writable_file`，mode `0620`）之後**讀得回來**；
+    - direct：`<tempdir>/planning.log` ⇒ `<tempdir>/planning.last.json`——同一個
+      一次性 tempdir，行為與修法前等價（只有檔名換了）。
+
     **它不是證據面**：沒有任何採信路徑讀它（`gate_ledger`／exit sentinel／harvest 讀的
     都是別的檔），因此把它放進 job 寫得到的那一格不會動到 #604 的作者性保證。
+    planning 那一條也一樣——`_extract_json` 讀它只是為了拿模型輸出本體，而模型輸出
+    本來就是 job 產的。
     """
 
     log = Path(job_log_path)

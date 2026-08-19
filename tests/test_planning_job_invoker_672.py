@@ -16,7 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator import job_runner, planning_job, planning_runtime
+from paulsha_cortex.coordinator import (
+    job_runner,
+    job_workspace,
+    planning_job,
+    planning_runtime,
+)
 from paulsha_cortex.coordinator.model_identities import (
     ENVIRONMENT_GRADE_PLANNING_FAMILIES,
     PLANNING_FAILURE_EXECUTOR,
@@ -423,21 +428,68 @@ def test_malformed_output_maps_to_output_malformed(tmp_path, monkeypatch) -> Non
     assert PLANNING_FAILURE_OUTPUT not in ENVIRONMENT_GRADE_PLANNING_FAMILIES
 
 
-def test_second_output_candidate_is_none_in_job_mode(tmp_path, monkeypatch) -> None:
-    """D-j／R-2：codex 的 `-o last.json` 落在 job 的 `PrivateTmp`，Manager 讀不到。
+def test_second_output_candidate_comes_back_in_job_mode(tmp_path, monkeypatch) -> None:
+    """**D-j／R-2 在 #727 解除**：`-o` 改落該 job 那份 log 的兄弟檔，Manager 讀得回來。
 
-    退步是**已知且已標註**的，不是被吞掉的：`output_text` 恆為 `None`，
-    `_extract_json` 因此從雙候選退成單候選。argv 仍帶 `-o`——那一份對 job 自己有效
-    （codex 少了它會改變行為），只是第二候選這條路對 Manager 消失了。
+    票 E 當時把 R-2（「落點在 job 的 `PrivateTmp` ⇒ Manager 讀不到 ⇒ `_extract_json`
+    退成單候選」）記成一條已知退步。#727 證明那不是結構限制，而是
+    `_planning_argv()` 自己組了第二份落點字面量（`Path(temp_dir)/"last.json"`，
+    job 模式下 `temp_dir` 被硬填 `"/tmp"`）——#714 缺陷 2 早就替 builder lane 回答過
+    同一個問題。落點回到那條規則之後：
+
+    - argv 的 `-o` **不在** `/tmp` 底下，而是 `<planning-logs>/<instance>/planning.last.json`；
+    - 那一格由 Manager 預建（`0620`）⇒ job 寫得進去、Manager 讀得回來；
+    - `output_text` 因此是真的第二候選，而不是恆 `None`。
     """
 
     harness = _Harness(tmp_path, monkeypatch, log_payload='{"ok":true}')
     invoker = harness.invoker(monkeypatch)
+
     outcome = invoker.run(_invocation(IDENTITY_CODEX))
-    assert outcome.output_text is None
     command = harness.specs[-1]["command"]
     assert "-o" in command
-    assert command[command.index("-o") + 1].startswith("/tmp/")
+    landing = Path(command[command.index("-o") + 1])
+    # 修法前的形態逐字是 `/tmp/last.json`（`temp_dir` 在 job 模式被硬填 `"/tmp"`），
+    # 那一格是 unit 的 `PrivateTmp` ⇒ Manager 看不到。
+    assert landing != Path("/tmp/last.json")
+    assert landing.name == "planning.last.json"
+    assert landing.parent.parent == tmp_path / "planning-logs"
+    # 落點是那個 instance 的 log 的兄弟檔——由同一條規則機械導出，不是巧合。
+    assert landing == job_workspace.job_last_message_path(
+        landing.parent / job_workspace.PLANNING_JOB_LOG_FILENAME
+    )
+    # 這一輪 harness 的 job 沒有寫 `-o`（它只寫 log），因此第二候選是「檔在、零位元組」
+    # ——而那**不是** `<absent>`，兩者在 `last_message` 上逐字可分。
+    assert outcome.output_text is None
+    assert outcome.last_message is not None
+    assert outcome.last_message.endswith("|bytes=0")
+
+
+def test_second_output_candidate_wins_over_the_stream(tmp_path, monkeypatch) -> None:
+    """job 真的寫了 `-o` 時，它是第一候選；串流那條只在它缺席時才發言。"""
+
+    payload = '{"capability":"cortex-planning-json"}'
+    harness = _Harness(
+        tmp_path,
+        monkeypatch,
+        log_payload='{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}',
+    )
+    invoker = harness.invoker(monkeypatch)
+    original_prepare = planning_job.spool_slot.preseed_job_writable_file
+
+    def _prepare_and_fill(path):
+        result = original_prepare(path)
+        Path(result).write_text(payload, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        planning_job.spool_slot, "preseed_job_writable_file", _prepare_and_fill
+    )
+    outcome = invoker.run(_invocation(IDENTITY_CODEX))
+    assert outcome.output_text == payload
+    assert planning_runtime._extract_json_candidates(
+        outcome.stdout, outcome.output_text
+    ) == {"capability": "cortex-planning-json"}
 
 
 # ---------------------------------------------------------------------------

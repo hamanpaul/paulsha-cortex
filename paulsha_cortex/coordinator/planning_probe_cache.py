@@ -171,17 +171,39 @@ def roster_digest(registry: IdentityRegistry) -> str:
 
 
 def _stat_marker(path: str, *, fields: tuple[str, ...]) -> str:
-    """`<path>|k=v,…`；檔案不存在回 `<path>|<absent>`。**不讀任何內容。**
+    """`<path>|k=v,…`；查得動但沒有這個檔回 `<path>|<absent>`，查不動回
+    `<path>|<unresolved:…>`。**不讀任何內容。**
 
     憑證那一格只取 `st_size/st_mtime_ns` 是刻意的（design D5）：讀內容才能算雜湊，
     而那會讓 token 出現在本行程的記憶體與任何中間狀態裡。size＋mtime 已足以偵測
     refresh 與換帳號，而它們**不是**祕密。
+
+    ## #727：`<absent>` 曾經同時代表兩件事
+
+    :data:`FINGERPRINT_ABSENT` 與 :data:`FINGERPRINT_UNRESOLVED_PREFIX` 的分工在本
+    模組開頭寫得很清楚（「查得到答案，答案是沒有這個檔」vs「連查都查不動」），但本
+    函式把**所有** `OSError` 都收成前者。實機 0819 因此逐字量到：
+
+        fp.executor_credential = /var/lib/cortex-reviewer-planner/.claude/.credentials.json|<absent>
+
+    ——**而那個檔已經存在**。`.claude` 是指向 `cache/claude` 的 symlink，`cache/` 是
+    `0700 cortex-reviewer-planner`，由 Manager 身分 stat 會在 traverse 那一步拿到
+    `EACCES`。指紋因此對 operator 說了一句假話（「沒有登入態」），而真正的狀況是
+    「Manager 這個身分看不到那一格」。
+
+    ⚠️ **這只修掉假話，沒有修掉那一格的真正缺陷**：無論落 `<absent>` 還是
+    `<unresolved:PermissionError>`，兩者在同一個部署上都是**恆定**的 ⇒ **憑證輪替
+    仍然不會讓 probe cache 失效**。要修那一條得換一個 Manager 看得見的失效訊號，
+    或讓指紋由看得到那一格的身分算（＝每次算指紋多派一個降權 job，在 planning 的
+    熱路徑上）——兩條都會擴散到部署面，因此 #727 只記錄、不順手做。
     """
 
     try:
         info = os.stat(path)
-    except OSError:
+    except FileNotFoundError:
         return f"{path}|{FINGERPRINT_ABSENT}"
+    except OSError as exc:
+        return f"{path}|{FINGERPRINT_UNRESOLVED_PREFIX}{type(exc).__name__}>"
     parts = [f"{name}={getattr(info, f'st_{name}')}" for name in fields]
     return f"{path}|{','.join(parts)}"
 
