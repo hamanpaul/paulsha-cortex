@@ -82,6 +82,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -151,6 +152,12 @@ _SPOOL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 JOB_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
 
 
+#: per-job 工作區授權用的外部程式（#710）。與
+#: `trust_root.permgen.SYSTEM_PROGRAMS`／`RUN_EXTERNAL_DEPENDENCIES` 是**成對契約**
+#: ——本模組刻意不 import `trust_root`，兩邊由測試釘住登記表真的有這一項。
+SETFACL_PROGRAM = "setfacl"
+
+
 class WorkspaceError(ValueError):
     """工作區 provision／回收的可操作錯誤。"""
 
@@ -210,6 +217,141 @@ def workspace_path(pool_root: str | Path, job_id: str) -> Path:
     """這個 job 的工作區絕對路徑：`<pool_root>/<job_segment(job_id)>`。"""
 
     return Path(pool_root) / job_segment(job_id)
+
+
+# ---------------------------------------------------------------------------
+# per-job 工作區的具名 ACL（#710）
+# ---------------------------------------------------------------------------
+
+#: `setfacl` 的 ACL spec 允許的 perms 形狀。會被逐字接進一條 `setfacl -R -m` 的引數，
+#: 因此在**組命令之前**就驗——與 `job_segment_valid()` 同一條理由。
+_ACL_PERMS_RE = re.compile(r"^[rwxX-]{1,4}$")
+
+#: 帳號名的形狀。`setfacl` 的 spec 以 `:` 分段，帳號裡混進 `:`／`,` 會讓一條授權被
+#: 解析成別的東西（或多出一條沒有人宣告過的）。
+_ACL_ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
+
+#: `setfacl -R` 失敗時保留的 stderr 尾段長度（見 :func:`grant_workspace_acl`）。
+_ACL_ERROR_TAIL = 2000
+
+
+@dataclass(frozen=True)
+class WorkspaceAclGrant:
+    """per-job 工作區上的一條具名授權（#710）。
+
+    形狀的**唯一真相**是 `trust_root.registry.JOB_WORKSPACE_REACH`；本模組刻意不
+    import `trust_root`（與 `job_runner.JobRoleConfig.log_spool_principal` 同一個既有
+    模式：path／派工熱路徑對治理平面零依賴），兩邊是**成對契約**，由
+    `tests/test_per_job_workspace_acl_710.py` 釘住逐列相等。
+    """
+
+    account: str
+    #: `setfacl -m` 的右手邊。大寫 `X`＝只有目錄與**已經可執行**的檔拿到 `x`
+    #: ——遞迴套用時不會把整棵樹的一般檔案變成可執行檔。
+    access_perms: str
+    #: `setfacl -d -m` 的右手邊（default ACL，只對目錄有意義；`setfacl` 對一般檔案
+    #: 的 default 條目會靜默略過）。
+    default_perms: str
+
+    def spec(self) -> str:
+        """本條授權在 `setfacl` ACL spec 裡的兩個片段。"""
+
+        return f"u:{self.account}:{self.access_perms},d:u:{self.account}:{self.default_perms}"
+
+
+def _validate_grants(grants: "tuple[WorkspaceAclGrant, ...]") -> None:
+    if not grants:
+        raise WorkspaceError(
+            "工作區 ACL 授權清單為空——空清單與「這個形態不需要 ACL」在輸出上長得"
+            "一樣，而後者的判準是 reach 形態，不是清單長度（#710）。"
+        )
+    for grant in grants:
+        if _ACL_ACCOUNT_RE.fullmatch(grant.account) is None:
+            raise WorkspaceError(f"工作區 ACL 帳號名不合法: {grant.account!r}（#710）")
+        for perms in (grant.access_perms, grant.default_perms):
+            if _ACL_PERMS_RE.fullmatch(perms) is None:
+                raise WorkspaceError(
+                    f"工作區 ACL perms 不合法: {perms!r}（{grant.account}，#710）"
+                )
+
+
+def grant_workspace_acl(
+    workspace: str | Path, grants: "tuple[WorkspaceAclGrant, ...]"
+) -> str:
+    """對 **per-job 那一格**遞迴套上具名 ACL；回傳實際執行的命令字串（診斷用）。
+
+    ## 為什麼是 ACL 而不是 `chown`
+
+    per-job clone 是 **Manager** 用 `git clone` 建出來的，owner 因此是 Manager。
+    把它交給 job 帳號的直覺作法是 `chown`——但那需要 `CAP_CHOWN`，而 Manager unit 帶
+    `CapabilityBoundingSet=`（空）。#623／#648 的「整個 clone 由本 job 帳號擁有」因此
+    **不是漏寫一行，是方案與降權模型衝突**：它在 unit 註解裡活了兩個月、零程式實作，
+    直到 builder job 第一次由 daemon 經正規路徑派出來，shim 在 `os.chdir()` 當場
+    `[Errno 13] Permission denied`（#710 實機）。
+
+    `setfacl` 由**目錄 owner** 執行，不需要任何 capability ⇒ Manager 做得到。保留
+    owner 另外買到一件事：`gc`／`worktree_reclaim` 仍 `rmtree` 得掉整棵樹（那需要樹
+    **內**的寫入權，交出 owner 等於讓工作區回收不了——#478／#601 的生產事故面）。
+
+    ## 為什麼必須遞迴
+
+    樹裡每個 inode 都由 Manager 以 `UMask=0077` 建立（`0600`／`0700`）。只在樹根下
+    一條 ACL 的話，job `chdir` 得進去，卻讀不到裡面**任何**東西——那是一個比原症狀
+    更難查的形狀（`git status` 空、`ls` 空、沒有錯誤）。
+
+    ## ⚠️ 只能下在 per-job 那一格
+
+    pool 根是 builder／reviewer／planner 三個帳號共用的容器；在它身上下 default ACL
+    會讓**每個** job 帳號進得去**每個** job 的目錄，裁決 10-2 的 per-job 隔離當場
+    歸零。本函式因此**只**接受一個具體的工作區路徑，且由
+    `permgen._assert_job_workspace_reach_matches_the_plan()` 在 import 當下擋掉
+    「把授權宣告到 pool 根」那條路。
+
+    ## ⚠️ mask 陷阱
+
+    `setfacl` 會在每次修改 ACL 時**重算 mask**，因此本函式套完之後具名條目的有效
+    權限就是宣告值；但任何後續的 `chmod` 都會把 mask 重寫回 mode 的 group 位
+    （runbook 4e-2b）。**本函式之後不得再 `chmod`**，驗證也一律看 `getfacl` 的
+    `mask::`／`#effective:`，不是「ACL 行存在」。
+
+    symlink 一律拒絕：`setfacl` 對**命令列上**的 symlink 引數預設跟著走，一條指向
+    別處的 `<pool>/<job-id>` 會讓整棵不相干的樹被授權出去。
+    """
+
+    _validate_grants(grants)
+    target = Path(workspace)
+    if target.is_symlink():
+        raise WorkspaceError(
+            f"工作區是一條 symlink，拒絕套用 ACL: {target}"
+            "（`setfacl` 會跟著命令列上的 symlink 走，#710）"
+        )
+    if not target.is_dir():
+        raise WorkspaceError(f"工作區不存在或不是目錄，無法套用 ACL: {target}（#710）")
+    binary = shutil.which(SETFACL_PROGRAM)
+    if binary is None:
+        raise WorkspaceError(
+            f"{SETFACL_PROGRAM} 不在 Manager 的 PATH 上——per-job 工作區的具名 ACL "
+            "因此套不上去，**每一個** job 都會 `chdir` 不進自己的工作區（#710）。"
+            "它是登記表登記過的執行期相依（`permgen.RUN_EXTERNAL_DEPENDENCIES`／"
+            "`SYSTEM_PROGRAMS`），由發行版的 `acl` 套件提供；0818 的三個部署陷阱之一"
+            "就是這個套件缺席。"
+        )
+    spec = ",".join(grant.spec() for grant in grants)
+    argv = [binary, "-R", "-m", spec, str(target)]
+    rendered = shlex.join(argv)
+    completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        # `setfacl -R` 每個失敗的 inode 各印一行——一棵 35MB 的 clone 可以印出好幾 MB。
+        # 只留尾段：失敗原因對整棵樹一律相同（`Operation not permitted`＝不是 owner、
+        # `No such file or directory`＝樹在中途被回收），而完整清單只會把真正的錯誤
+        # 從 operator 的畫面上推走。
+        detail = (completed.stderr or completed.stdout).strip()
+        if len(detail) > _ACL_ERROR_TAIL:
+            detail = f"…（前 {len(detail) - _ACL_ERROR_TAIL} 字元省略）" + detail[-_ACL_ERROR_TAIL:]
+        raise WorkspaceError(
+            f"per-job 工作區的具名 ACL 套用失敗: {rendered}: {detail}（#710）"
+        )
+    return rendered
 
 
 def legacy_branch_slug(branch: str) -> str:
@@ -943,10 +1085,13 @@ __all__ = [
     "JOB_SEGMENT_RE",
     "MARKER_NAME",
     "MARKER_SCHEMA_VERSION",
+    "SETFACL_PROGRAM",
     "SOURCE_REMOTE",
     "WORKSPACE_MODEL",
+    "WorkspaceAclGrant",
     "WorkspaceError",
     "archive_workspace_head",
+    "grant_workspace_acl",
     "build_bundle_command",
     "commit_bundle_path",
     "commit_bundle_path_for_job",

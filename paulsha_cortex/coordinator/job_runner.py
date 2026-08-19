@@ -108,6 +108,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 
+from paulsha_cortex.config import paths
+
 from . import job_workspace
 from .diagnostics import DiagnosticReason, diagnostic_reason
 
@@ -168,6 +170,12 @@ __all__ = [
     "START_TIMEOUT_ENV",
     "SystemdRunPlan",
     "SystemdTemplatePlan",
+    "WORKSPACE_REACH_INHERITED_DEFAULT_ACL",
+    "WORKSPACE_REACH_PER_JOB_NAMED_ACL",
+    "WORKSPACE_REACH_POOL_OWNED_BY_JOB",
+    "WorkspaceAclSpec",
+    "ensure_workspace_reachable",
+    "workspace_acl_grants",
     "TEMPLATE_UNIT_ENV",
     "TEMPLATE_UNIT_PREFIX",
     "TEMPLATE_UNIT_SUFFIX_BY_PROFILE",
@@ -360,6 +368,34 @@ JOB_ROLE_GATE = "gate"
 JOB_ROLES = (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW, JOB_ROLE_GATE)
 
 
+# ---------------------------------------------------------------------------
+# #710：工作區可達性——三個角色的形態由 `trust_root.registry.JOB_WORKSPACE_REACH`
+# 一張表決定，本模組持有它的**成對契約**（本模組刻意不 import `trust_root`，與
+# `log_spool_principal`／`DEFAULT_TEMPLATE_UNIT` 是同一個既有模式；兩邊逐列相等由
+# `tests/test_per_job_workspace_acl_710.py` 釘住）。
+# ---------------------------------------------------------------------------
+
+#: 可達性由 Manager 在 provision 當下對 per-job 那一格下的**具名 ACL** 供給（builder）。
+WORKSPACE_REACH_PER_JOB_NAMED_ACL = "per-job-named-acl"
+#: 可達性由 pool 根的 **default ACL** 繼承供給（reviewer／planner）。
+WORKSPACE_REACH_INHERITED_DEFAULT_ACL = "inherited-default-acl"
+#: 可達性由 pool 根的 **owner 位**供給，per-job 那一格由 job 自己建（gate）。
+WORKSPACE_REACH_POOL_OWNED_BY_JOB = "pool-owned-by-job"
+
+
+@dataclass(frozen=True)
+class WorkspaceAclSpec:
+    """per-job 工作區上，**某個角色的帳號**拿到什麼（#710）。
+
+    以 `role_id` 而不是帳號名表達，理由與整張 `JOB_ROLE_CONFIG` 相同：帳號是部署
+    決定（env 可覆寫），角色才是這裡講得出來的東西。
+    """
+
+    role_id: str
+    access_perms: str
+    default_perms: str
+
+
 @dataclass(frozen=True)
 class JobRoleConfig:
     """一個降權 job 角色的完整 config 面（env 變數名 ＋ 預設值 ＋ 為什麼）。"""
@@ -386,6 +422,18 @@ class JobRoleConfig:
     #: 同 `DEFAULT_TEMPLATE_UNIT` 的既有模式），由
     #: `tests/test_job_log_spool_708.py` 釘住兩邊逐列相等。
     log_spool_principal: str
+    #: #710：本角色的工作區可達性形態（三個 `WORKSPACE_REACH_*` 之一）。與
+    #: `registry.JOB_WORKSPACE_REACH` 的 `reach.value` 逐字相等。
+    workspace_reach: str
+    #: #710：job 在自己的工作區上**最終必須擁有**的權限位（mask 之後的**有效**權限，
+    #: 由 :func:`effective_perms_for_account` 判定）。三個角色一律非空——不論可達性
+    #: 由 owner 位、繼承或具名 ACL 供給，「進得去」都必須寫得出可驗形式。
+    workspace_required_perms: str
+    #: #710：`WORKSPACE_REACH_PER_JOB_NAMED_ACL` 那一格要下的具名 ACL（含 #629 宣告
+    #: 的 gate 唯讀那條，兩者由**同一次** setfacl 落地）。其餘形態為空 tuple——
+    #: 「執行期零動作」與「忘了實作」在輸出上長得一樣，因此判準是 `workspace_reach`，
+    #: 不是這個 tuple 的長度。
+    workspace_acl: tuple[WorkspaceAclSpec, ...]
     #: 這個角色是誰、為什麼要獨立一份（進錯誤訊息與產物註解）。
     rationale: str
 
@@ -404,6 +452,12 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             spec_spool_env=JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_JOB_SPEC_SPOOL,
             log_spool_principal="builder",
+            workspace_reach=WORKSPACE_REACH_PER_JOB_NAMED_ACL,
+            workspace_required_perms="rwx",
+            workspace_acl=(
+                WorkspaceAclSpec(JOB_ROLE_BUILDER, "rwX", "rwx"),
+                WorkspaceAclSpec(JOB_ROLE_GATE, "rX", "rX"),
+            ),
             rationale=(
                 "builder persona——唯一會在自己完全掌控的工作區裡跑 untrusted repo "
                 "code 的角色，攻擊面最大。M1（#603／#584）已落地。"
@@ -419,6 +473,9 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             template_env=REVIEW_TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_REVIEW_TEMPLATE_UNIT,
             log_spool_principal="reviewer",
+            workspace_reach=WORKSPACE_REACH_INHERITED_DEFAULT_ACL,
+            workspace_required_perms="rx",
+            workspace_acl=(),
             spec_spool_env=REVIEW_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_REVIEW_JOB_SPEC_SPOOL,
             rationale=(
@@ -445,6 +502,9 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             template_env=GATE_TEMPLATE_UNIT_ENV,
             default_template=DEFAULT_GATE_TEMPLATE_UNIT,
             log_spool_principal="gate",
+            workspace_reach=WORKSPACE_REACH_POOL_OWNED_BY_JOB,
+            workspace_required_perms="rwx",
+            workspace_acl=(),
             spec_spool_env=GATE_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_GATE_JOB_SPEC_SPOOL,
             rationale=(
@@ -2514,3 +2574,178 @@ def _spec_readable_by(spec_path: str, account: str) -> tuple[bool, str]:
     if not bits & _PERM_R:
         return False, f"{spec_path}：effective={_perm_str(bits)}（缺 r）"
     return True, ""
+
+
+# ---------------------------------------------------------------------------
+# #710：工作區可達性——三個角色由 `registry.JOB_WORKSPACE_REACH` 一條規則導出
+# ---------------------------------------------------------------------------
+
+_PERM_BIT_BY_LETTER: Mapping[str, int] = MappingProxyType(
+    {"r": _PERM_R, "w": _PERM_W, "x": _PERM_X}
+)
+
+
+def _required_perm_bits(perms: str) -> int:
+    bits = 0
+    for letter in perms.lower():
+        bit = _PERM_BIT_BY_LETTER.get(letter)
+        if bit is None:
+            raise _fail(
+                "job-workspace-required-perms-invalid",
+                f"不認得的權限字母 {letter!r}（{perms!r}）",
+                source="_required_perm_bits",
+            )
+        bits |= bit
+    return bits
+
+
+def workspace_acl_grants(
+    env: Mapping[str, str], *, role: str
+) -> tuple[job_workspace.WorkspaceAclGrant, ...]:
+    """該角色的 per-job 工作區要下哪幾條具名 ACL（#710）。
+
+    帳號**逐條由 `JOB_ROLE_CONFIG` 解**（`resolve_job_account(role=…)`），因此
+    「gate 那條 `rX` 授給誰」與「gate job 以誰的身分執行」永遠是同一個部署決定的同
+    一個值——兩邊各自解析就是 #657 的失效模式（ACL 產在一個帳號上、unit 以另一個
+    帳號執行）。
+    """
+
+    config = resolve_job_role(role)
+    grants: list[job_workspace.WorkspaceAclGrant] = []
+    for spec in config.workspace_acl:
+        grants.append(
+            job_workspace.WorkspaceAclGrant(
+                account=resolve_job_account(env, role=spec.role_id),
+                access_perms=spec.access_perms,
+                default_perms=spec.default_perms,
+            )
+        )
+    return tuple(grants)
+
+
+def _per_job_pool_root() -> Path | None:
+    """本部署宣告的 per-job 工作區 pool 根；解不出來即 `None`（#710）。
+
+    解不出來**不是**錯誤：`paths.worktree_root()` 在未宣告 `PSC_REPO_ROOT` 時
+    fail-closed（#612／#630／#633），而那個情境在派工路徑上早就先炸過了——
+    `seams.ScriptWorktreeCreator` 建 clone 用的是同一支。這裡回 `None` 的意思只有
+    一個：「本呼叫端拿不到 pool 的位置，因此判定不了這一格是不是 pool 底下的 per-job
+    那一格」，處置一律是**不動**（見 :func:`ensure_workspace_reachable`）。
+    """
+
+    try:
+        return paths.worktree_root().resolve()
+    except Exception:  # noqa: BLE001 - 解不出 pool 位置一律退化成「不判定」
+        return None
+
+
+def ensure_workspace_reachable(
+    env: Mapping[str, str], *, role: str, workspace: str | Path
+) -> str | None:
+    """**派工之前**讓（並確認）這個 job 進得去自己的工作區；回傳實際執行的命令或 `None`。
+
+    這是 #710 那條規則的執行期一側，三個角色**共用同一支**——分岔只有一處，而且
+    分岔的依據是 `JOB_ROLE_CONFIG[...].workspace_reach`（＝
+    `registry.JOB_WORKSPACE_REACH` 的成對契約），不是 `if role == …`：
+
+    ``per-job-named-acl``（builder）
+        Manager 對**那一格**遞迴下具名 ACL。`chown` 不是選項——它需要 `CAP_CHOWN`，
+        而 Manager unit 帶 `CapabilityBoundingSet=`（空）。這一段就是 #710 的修法本體。
+
+    ``inherited-default-acl``（reviewer／planner）／``pool-owned-by-job``（gate）
+        **零動作**——可達性分別由 pool 根的 default ACL 與 owner 位供給，兩者都在
+        部署當下就成立。
+
+    三者**都要**通過同一道驗證：job 帳號對工作區的 **effective** 權限（mask 之後）
+    必須涵蓋 `workspace_required_perms`。判準是 `mask::`／`#effective:` 而不是
+    「ACL 行存在」——`setfacl -m u:x:rwX` 之後任何一次 `chmod` 都會把 mask 打成
+    `---`，具名條目於是靜默失效（runbook 4e-2b 的陷阱）。
+
+    **帳號不在 passwd 時整支略過**（回 `None`）：那代表這台機器沒有三分身分（單 UID
+    的 `direct` 模式、開發機、CI），這條性質在那裡沒有可驗的語意。這與
+    `_spec_readable_by()` 的既有處置逐字相同，且**不是** fail-open：真正的降權派工
+    路徑在此之前已經由 `prepare_systemd_template()` 對帳號存在性 fail-closed。
+    """
+
+    config = resolve_job_role(role)
+    if config.workspace_reach != WORKSPACE_REACH_PER_JOB_NAMED_ACL:
+        # 形態說「執行期零動作」就是零動作。可達性在部署當下由 pool 根的 owner 位
+        # （gate）或 default ACL（reviewer／planner）供給，而**那是權限計畫的性質**
+        # ——它由 `permgen._assert_job_workspace_reach_matches_the_plan()` 在 import
+        # 當下、由 `tests/test_per_job_workspace_acl_710.py` 在測試面、由
+        # `trust_root workspace-probe` 在實機面各驗一次。在每一次派工上再驗一次不會
+        # 讓它更真，只會把一個部署性質變成一個逐 job 的失敗面。
+        return None
+    target = str(workspace)
+    resolved = Path(target).resolve()
+    pool = _per_job_pool_root()
+    if pool is not None and resolved == pool:
+        # ⚠️ 本票兩個硬性注意事項的第一個。pool 根是三個 job 帳號共用的容器，把授權
+        # 下在它身上會讓**每個** job 帳號進得去**每個** job 的目錄（裁決 10-2 當場
+        # 歸零）。這是 fail-closed 而不是「往上一層也套一份」。
+        raise _fail(
+            "job-workspace-acl-target-is-the-pool-root",
+            f"{target} 是 per-job 工作區 pool 的**根**，不是某個 job 的那一格——"
+            "在 pool 根上授權會讓每個 job 帳號進得去每個 job 的目錄（#710）。",
+            source="ensure_workspace_reachable",
+            role=role,
+            workspace=target,
+            pool_root=str(pool),
+        )
+    if pool is None or resolved.parent != pool:
+        # 這一格不在本部署宣告的 per-job pool 底下 ⇒ 它不是 `repo-worktree` 那個資產，
+        # 本形態不適用。真實派工路徑上 builder 的工作區恆為
+        # `job_workspace.workspace_path(paths.worktree_root(), job_id)`（`seams` 與
+        # 本函式共用同一支推導），落到這一支的是**別的**東西：workflow lane 的 review
+        # sandbox、注入合成路徑的測試、以及尚未宣告 pool 的部署。對它們套一條遞迴 ACL
+        # 是「對不認識的路徑動手」，比不動危險。
+        return None
+    grants = workspace_acl_grants(env, role=role)
+    account = resolve_job_account(env, role=role)
+    if _account_ids(account) is None:
+        # 本機沒有三分身分（單 UID 的 `direct` 模式、開發機、CI）——這條性質在那裡
+        # 沒有可驗的語意。**不是 fail-open**：真正的降權派工在此之前已由
+        # `prepare_systemd_template()` 對帳號存在性 fail-closed。
+        return None
+    applied: str | None = None
+    try:
+        applied = job_workspace.grant_workspace_acl(target, grants)
+    except job_workspace.WorkspaceError as exc:
+        raise _fail(
+            "job-workspace-acl-grant-failed",
+            str(exc),
+            source="ensure_workspace_reachable",
+            role=role,
+            workspace=target,
+            account=account,
+        ) from exc
+    bits = effective_perms_for_account(target, account)
+    required = _required_perm_bits(config.workspace_required_perms)
+    if bits is None:
+        raise _fail(
+            "job-workspace-unreachable",
+            f"{target}：無法判定 {account} 的 effective 權限（stat 失敗？）",
+            source="ensure_workspace_reachable",
+            role=role,
+            workspace=target,
+            account=account,
+        )
+    if bits & required != required:
+        raise _fail(
+            "job-workspace-unreachable",
+            (
+                f"{target}：{account} 的 effective={_perm_str(bits)}，"
+                f"不足 {config.workspace_required_perms}——shim 在降權之後 "
+                f"`os.chdir()` 會 EACCES，job 死在它能記錄失敗之前（#710）。"
+                f"已套用的 ACL：{applied}。"
+                "ACL 套上去了卻沒有生效，最可能的原因是**之後又 chmod 了一次**——"
+                "那會把 ACL mask 重寫成 mode 的 group 位，具名條目靜默失效"
+                "（runbook 4e-2b）。判準永遠是 `getfacl` 的 `mask::` 與 "
+                "`#effective:`，不是「ACL 行存在」。"
+            ),
+            source="ensure_workspace_reachable",
+            role=role,
+            workspace=target,
+            account=account,
+        )
+    return applied

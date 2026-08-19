@@ -1140,6 +1140,25 @@ SYSTEM_PROGRAMS: tuple[SystemProgram, ...] = (
         ),
     ),
     SystemProgram(
+        "setfacl", "apt: acl", ("manager",),
+        note=(
+            "**per-job 工作區的可達性靠它落地**（#710）。Manager 建完 per-job clone 之後"
+            "對**那一格**下 `setfacl -R -m u:<job 帳號>:rwX` ＋ default ACL——"
+            "`chown` 給另一個使用者需要 `CAP_CHOWN`，而 Manager unit 的 "
+            "`CapabilityBoundingSet=` 是空的；`setfacl` 由**目錄 owner** 執行，"
+            "不需要任何 capability，因此這是 Manager 唯一做得到的授權動作。\n"
+            "**它必須在 Manager 自己的 `PATH` 上**（`coordinator/job_workspace.py` 以 "
+            "`which()` 解），解不到就是「每一個 builder job 都 "
+            "`chdir` 不進自己的工作區」而不是單一 job 失敗——與 `systemctl` 那一列同"
+            "一個等級的失效面。`/usr/bin/setfacl` 落在 Manager unit 的 `PATH` 尾段"
+            "（`/usr/bin`）內。\n"
+            "**0818 的部署陷阱之一就是這個套件缺席**（trust-root Phase 2b M1 的三個"
+            "陷阱：sudoers 萬用 NOPASSWD／缺 `acl`／pipx 殘留）；缺它時整套具名 ACL "
+            "授權——不只本票這一條——全部套不上去。`getfacl` 同套件出，驗證步驟"
+            "（runbook 的 `getfacl` 判準）靠它。"
+        ),
+    ),
+    SystemProgram(
         "systemctl", "apt: systemd", ("manager",),
         note=(
             "**B 案（模板 unit，0816 第三輪定案）的派工 client**（#666）。"
@@ -1489,6 +1508,11 @@ class AclEntry:
     account: str
     perms: str          # "rX"（讀，dir 自動含 traverse）／"rwx"／"wx"
     default: bool = False  # 是否為 default ACL（dir 內新建物件繼承）
+    #: 遞迴套用（`setfacl -R`）。**只給 per-job 工作區那一族**（#710）：那一格是
+    #: Manager 用 `git clone` 建出來的一整棵樹，樹裡每個 inode 都由 Manager 以
+    #: `UMask=0077` 建立 ⇒ 只在樹根下一條 ACL，job 進得去卻讀不到裡面任何東西。
+    #: 其餘資產一律非遞迴（葉檔或空容器，遞迴只會多套到不該套的地方）。
+    recursive: bool = False
 
     @property
     def writable(self) -> bool:
@@ -1496,6 +1520,8 @@ class AclEntry:
 
     def render(self, path: str) -> str:
         flag = "-d -m" if self.default else "-m"
+        if self.recursive:
+            flag = f"-R {flag}"
         return f"setfacl {flag} u:{self.account}:{self.perms} {path}"
 
 
@@ -1565,6 +1591,27 @@ class PermissionEntry:
             "open_points": list(self.open_points),
         }
 
+    def effective_default_acls(self) -> tuple["AclEntry", ...]:
+        """本資產**實際會落到磁碟上**的 default ACL 條目（#710）。
+
+        `acls` 只存宣告面：目錄資產的 default 條目多數是 :meth:`commands` 依「dir 需
+        同時設 access 與 default」那條規則**自動補**出來的，sticky 樹則明示不補。
+        任何「這一項有沒有 default ACL」的判定都必須看這個結果而不是 `acls`——
+        否則會得到與 operator 真的執行的那份 script 相反的答案，而那正是 #641／#710
+        這一族「宣告與實機不一致」的形狀。
+        """
+
+        if self.is_symlink or not self.is_directory or self.sticky:
+            return tuple(acl for acl in self.acls if acl.default)
+        explicit = {acl.account for acl in self.acls if acl.default}
+        derived = [acl for acl in self.acls if acl.default]
+        derived += [
+            AclEntry(acl.account, acl.perms, default=True, recursive=acl.recursive)
+            for acl in self.acls
+            if not acl.default and acl.account not in explicit
+        ]
+        return tuple(derived)
+
     def commands(self, path: str, link_target: str | None = None) -> list[str]:
         """產生本資產的 chown／chmod／setfacl 命令字串（**只回傳字串，不執行**）。
 
@@ -1587,6 +1634,11 @@ class PermissionEntry:
             f"chown {self.owner}:{self.group} {path}",
             f"chmod {self.mode_str} {path}",
         ]
+        # #710：已**明示**宣告 default 條目的帳號不再自動補一條。自動那一條抄的是
+        # access 的 perms，而 per-job 工作區那一族刻意兩者不同（access `rwX`／default
+        # `rwx`——大寫 X 用在遞迴套用的既有檔上，default 沒有「既有檔」可參照）。
+        # 少了這一行會產出兩條互相覆蓋的 default 條目，而**後寫的那條贏**。
+        explicit_defaults = {acl.account for acl in self.acls if acl.default}
         for acl in self.acls:
             cmds.append(acl.render(path))
             # dir 需同時設 access 與 default ACL，讓新建物件繼承。
@@ -1597,8 +1649,17 @@ class PermissionEntry:
             #    宣告「root 放進去的每一個 enforcement 檔都自動交還給 job」，sticky
             #    擋得住 unlink／rename 也沒有用了（job 直接改內容）。
             #    因此這一族**只設 access ACL**。
-            if self.is_directory and not acl.default and not self.sticky:
-                cmds.append(AclEntry(acl.account, acl.perms, default=True).render(path))
+            if (
+                self.is_directory
+                and not acl.default
+                and not self.sticky
+                and acl.account not in explicit_defaults
+            ):
+                cmds.append(
+                    AclEntry(
+                        acl.account, acl.perms, default=True, recursive=acl.recursive
+                    ).render(path)
+                )
         if self.sticky:
             cmds.append(
                 "#   ⛔ 本目錄**刻意不設 default ACL**：它會讓 root 日後放進來的 "
@@ -1910,8 +1971,99 @@ def build_entry(asset: TrustRootAsset, scheme: UidScheme) -> PermissionEntry:
             if a is not None
         )
         trusted_owner = scheme.durable_state_owner
+        workspace_reach = registry.per_job_named_acl_workspace_assets().get(asset.asset_id)
 
-        if asset.ingress_kind is IngressKind.INTERPROCESS:
+        if workspace_reach is not None:
+            # #710：per-job **工作區**那一格。owner 維持 Manager，job 拿具名 ACL。
+            #
+            # 這一支存在的理由是一條**機制事實**，不是政策偏好：per-job 那一格是
+            # Manager 用 `git clone` 建出來的，而把它 `chown` 給 job 帳號需要
+            # `CAP_CHOWN`——Manager unit 的 `CapabilityBoundingSet=` 是空的。#623／#648
+            # 宣稱的「整個 clone 由本 job 帳號擁有」因此不是漏寫一行，是**方案與降權
+            # 模型衝突**；它在模板 unit 的註解裡活了兩個月，代價是 #710（builder job
+            # 第一次由 daemon 經正規路徑派出來就死在 shim 的 `os.chdir()`）。
+            #
+            # `setfacl` 由**目錄 owner** 執行，不需要任何 capability ⇒ Manager 做得到。
+            # 保留 owner 另外買到一件事：`gc`／`worktree_reclaim` 仍 `rmtree` 得掉整棵
+            # 樹（那需要樹**內**的寫入權，交出 owner 等於讓工作區回收不了）。
+            #
+            # **遞迴是必要的**：樹裡每個 inode 都由 Manager 以 `UMask=0077` 建立，只在
+            # 樹根下一條 ACL 的話 job 進得去、卻讀不到裡面任何東西。
+            #
+            # ⚠️ 這條**必須**下在 per-job 那一格。往 pool 根下 default ACL 會讓每個 job
+            # 帳號進得去每個 job 的目錄——由
+            # `_assert_job_workspace_reach_matches_the_plan()` 在 import 當下擋掉。
+            owner = trusted_owner
+            runtime_managed = True
+            mode = _dir_file_mode(is_dir, 0o7 if is_dir else 0o6, 0, 0)
+            workspace_account = scheme.resolve(workspace_reach.persona)
+            if workspace_account is None:
+                raise ValueError(
+                    f"{asset.asset_id}：JOB_WORKSPACE_REACH 宣告的 persona "
+                    f"{workspace_reach.persona.value} 在本方案沒有對應帳號——per-job "
+                    "工作區的具名 ACL 因此產不出來，job 到了實機 `chdir` 不進去（#710）。"
+                )
+            acls.append(
+                AclEntry(workspace_account, workspace_reach.access_perms, recursive=True)
+            )
+            acls.append(
+                AclEntry(
+                    workspace_account,
+                    workspace_reach.default_perms,
+                    default=True,
+                    recursive=True,
+                )
+            )
+            # 額外 reader（#629 的 `GATE` 就是這樣進來的）走**同一次** per-job setfacl
+            # ——它與 builder 那條在本票之前一樣只存在於註解裡。清單由規則表給，而
+            # **必須與登記表的 `readers` 對得上**：兩份各自列舉就是下一個 #641。
+            declared_readers = {
+                acct
+                for acct in (scheme.resolve(r) for r in asset.readers)
+                if acct is not None and acct not in {owner, workspace_account}
+            }
+            ruled_readers: dict[str, str] = {}
+            for reader_principal, reader_perms in workspace_reach.extra_reader_perms:
+                racct = scheme.resolve(reader_principal)
+                if racct is None or racct in {owner, workspace_account}:
+                    continue
+                ruled_readers[racct] = reader_perms
+            if set(ruled_readers) != declared_readers:
+                raise ValueError(
+                    f"{asset.asset_id}：JOB_WORKSPACE_REACH 的 extra_reader_perms "
+                    f"{sorted(ruled_readers)} 與登記表 readers {sorted(declared_readers)} "
+                    "對不上——per-job 那一格的每一條跨帳號授權都要同時在兩邊出現，"
+                    "只有一邊的那條要嘛套不上去、要嘛沒有人宣告過（#641／#710）。"
+                )
+            for racct in sorted(ruled_readers):
+                perms = ruled_readers[racct]
+                acls.append(AclEntry(racct, perms, recursive=True))
+                acls.append(AclEntry(racct, perms, default=True, recursive=True))
+            writer_accounts = frozenset({owner, workspace_account})
+            rationale = (
+                "**per-job 工作區（#710）：owner＝Manager，job 帳號以具名 ACL 取得可寫面。**"
+                "不是「整個 clone 由本 job 帳號擁有」——`chown` 給另一個使用者需要 "
+                "`CAP_CHOWN`，而 Manager unit 帶 `CapabilityBoundingSet=`（空），那個形態"
+                "結構上做不到（#623／#648 的宣稱在 unit 註解裡活了兩個月，零程式實作）。"
+                "`setfacl` 由目錄 owner 執行、不需要任何 capability，且保留 owner 讓 "
+                "`gc`／`worktree_reclaim` 仍 `rmtree` 得掉整棵樹。"
+                "\n**ACL 遞迴套用**：樹由 Manager 以 `UMask=0077` 建出，只在根下一條 ACL "
+                "的話 job 進得去卻讀不到裡面任何東西。access 用大寫 `X`（只有目錄與已可"
+                "執行的檔拿到 `x`），default 用 `rwx`。"
+                "\n⚠️ **只下在 per-job 那一格**：pool 根（`dispatch-worktree-pool`）是三個 "
+                "job 帳號共用的容器，在它身上下 default ACL 會讓每個 job 帳號進得去每個 "
+                "job 的目錄（裁決 10-2 當場歸零）。"
+                "\n**驗證一律 `getfacl`**：`chmod` 會重寫 ACL mask，判準是 `mask::` 與 "
+                "`#effective:`，不是「ACL 行存在」（runbook 4e-2b）。因此本項的命令順序是 "
+                "`chown` → `chmod` → `setfacl`，執行期那一份（`coordinator/job_workspace.py:"
+                "grant_workspace_acl`）在 setfacl 之後**不再 chmod**。"
+            )
+            open_points.append(
+                f"{asset.asset_id}：per-job 那一格的 ACL 由 Manager 在 provision 當下"
+                "套用（`coordinator/job_workspace.grant_workspace_acl`），setup 階段"
+                "只登記形狀——路徑帶 `<job-id>`，部署當下還不存在。"
+            )
+        elif asset.ingress_kind is IngressKind.INTERPROCESS:
             # spool：trusted consumer 擁有並讀＋unlink，untrusted producer 只准 append。
             # Phase 2a 的 review verdict 通道（`review-verdict-spool`）走同一條政策：
             # 容器 owner 是 Manager（durable_state_owner）、mode 0700，reviewer 只拿
@@ -3342,6 +3494,134 @@ def _assert_job_log_spools_hang_off_existing_channels() -> None:
 _assert_job_log_spools_hang_off_existing_channels()
 
 
+def _assert_job_workspace_reach_matches_the_plan() -> None:
+    """#710 那條規則的**另一半**，在 import 當下強制。
+
+    registry 那一半管「三個 principal 一格都不能少、每一列自洽」；本函式管
+    **宣告的機制與權限計畫是不是同一回事**——那才是「每個 job 都進得去自己的工作區」
+    這句話的來源。三種形態各驗各的，逐條：
+
+    ``POOL_OWNED_BY_JOB``（gate）
+        pool 資產的 owner **必須就是**該帳號。owner 位是它唯一的可達性來源，
+        owner 一旦漂走（例如有人把 pool 改成 Manager-owned「比照 dispatch pool」），
+        gate 就再也建不出自己的副本，而症狀是 gate 全部失敗、不是產生器紅字。
+
+    ``INHERITED_DEFAULT_ACL``（reviewer／planner）
+        每一棵 pool 資產都**必須**帶該帳號的 **default** ACL，且 perms 涵蓋宣告值。
+        Manager 在裡面建的每一格靠它繼承；少了它，「reviewer 進得去自己的 review
+        worktree」就退化成一句沒有出處的宣稱。
+
+    ``PER_JOB_NAMED_ACL``（builder）
+        三條一起驗：
+
+        1. per-job 資產真的帶該帳號的具名 **access** ACL（＝執行期那條 setfacl 有
+           出處，不是 coordinator 裡的一個字面量）；
+        2. per-job 資產的路徑**嚴格落在** pool 之內且帶 :data:`PER_JOB_SEGMENT`
+           ——沒有 `<job-id>` 就代表它不是 per-job 的，那條 ACL 會套到整個 pool；
+        3. ⚠️ **pool 根上不得有任何 job 帳號的 default ACL**。這是本票兩個硬性
+           注意事項的第一個：pool 根的 default ACL 會讓**每個** job 帳號進得去
+           **每個** job 的目錄，裁決 10-2 的 per-job 隔離當場歸零。把它放在 import
+           當下而不是一條測試，是因為「順手往 pool 根加一條 default ACL 讓它過」
+           正是這個缺陷最可能的**修法**——那個動作必須讓模組載不起來。
+    """
+
+    index = {a.asset_id: a for a in registry.ASSET_REGISTRY}
+    paths = DEFAULT_LAYOUT.asset_paths()
+    plan = generate_plan(DEFAULT_SCHEME)
+    job_accounts = set(DEFAULT_SCHEME.headless_accounts())
+    for reach in registry.JOB_WORKSPACE_REACH:
+        account = DEFAULT_SCHEME.resolve(reach.persona)
+        if account is None:  # pragma: no cover - DEFAULT_SCHEME 涵蓋三個降權角色
+            raise ValueError(
+                f"{reach.principal.value}：persona {reach.persona.value} 在 "
+                f"{DEFAULT_SCHEME.scheme_id} 下沒有帳號（#710）。"
+            )
+        for pool_id in reach.pool_asset_ids:
+            if pool_id not in index:
+                raise ValueError(
+                    f"{reach.principal.value}：pool 資產 {pool_id!r} 不在登記表上"
+                    "——工作區只能落在**已登記**的樹底下（#710）。"
+                )
+            pool_entry = plan.by_id(pool_id)
+            if reach.reach is registry.WorkspaceReach.POOL_OWNED_BY_JOB:
+                if pool_entry.owner != account:
+                    raise ValueError(
+                        f"{reach.principal.value}：{pool_id} 的 owner 是 "
+                        f"{pool_entry.owner}，不是 {account}——`POOL_OWNED_BY_JOB` 的"
+                        "可達性只來自 owner 位，owner 一漂走 job 就建不出自己那一格"
+                        "（#710）。"
+                    )
+            elif reach.reach is registry.WorkspaceReach.INHERITED_DEFAULT_ACL:
+                inherited = [
+                    acl
+                    for acl in pool_entry.effective_default_acls()
+                    if acl.account == account
+                ]
+                if not inherited:
+                    raise ValueError(
+                        f"{reach.principal.value}：{pool_id} 沒有 {account} 的 "
+                        "**default** ACL——Manager 在裡面建的每一格靠它繼承，少了它 "
+                        "job `chdir` 不進自己的工作區（#710 的原症狀形狀）。"
+                    )
+                missing = set(reach.access_perms) - set(
+                    "".join(acl.perms for acl in inherited)
+                )
+                if missing:
+                    raise ValueError(
+                        f"{reach.principal.value}：{pool_id} 的 default ACL 缺 "
+                        f"{sorted(missing)}（宣告需要 {reach.access_perms!r}）——#710。"
+                    )
+            else:  # PER_JOB_NAMED_ACL
+                leaked = [
+                    acl
+                    for acl in pool_entry.effective_default_acls()
+                    if acl.account in job_accounts
+                ]
+                if leaked:
+                    raise ValueError(
+                        f"⛔ {pool_id}（{reach.principal.value} 的 pool 根）上出現 job "
+                        f"帳號的 default ACL {[(a.account, a.perms) for a in leaked]}"
+                        "——那會讓**每個** job 帳號進得去**每個** job 的目錄，per-job "
+                        "隔離當場歸零（裁決 10-2）。可達性必須下在 per-job 那一格"
+                        f"（{reach.per_job_asset_id}），不是 pool 根（#710）。"
+                    )
+        if reach.reach is not registry.WorkspaceReach.PER_JOB_NAMED_ACL:
+            continue
+        leaf_id = reach.per_job_asset_id or ""
+        if leaf_id not in index:
+            raise ValueError(
+                f"{reach.principal.value}：per-job 資產 {leaf_id!r} 不在登記表上（#710）。"
+            )
+        leaf_entry = plan.by_id(leaf_id)
+        granted = [
+            acl
+            for acl in leaf_entry.acls
+            if not acl.default and acl.account == account and acl.perms == reach.access_perms
+        ]
+        if not granted:
+            raise ValueError(
+                f"{reach.principal.value}：{leaf_id} 沒有 {account} 的具名 access ACL "
+                f"{reach.access_perms!r}——執行期那條 `setfacl` 因此沒有出處（#710）。"
+            )
+        leaf_path = paths[leaf_id]
+        if PER_JOB_SEGMENT not in leaf_path:
+            raise ValueError(
+                f"{reach.principal.value}：{leaf_id} 的路徑 {leaf_path} 不帶 "
+                f"{PER_JOB_SEGMENT!r}——那代表它不是 per-job 的一格，那條遞迴 ACL 會套到"
+                "整個 pool（#710）。"
+            )
+        for pool_id in reach.pool_asset_ids:
+            pool_path = paths[pool_id]
+            if leaf_path == pool_path or not _is_within(leaf_path, pool_path):
+                raise ValueError(
+                    f"{reach.principal.value}：{leaf_id}（{leaf_path}）沒有嚴格落在 "
+                    f"{pool_id}（{pool_path}）之內——#710。"
+                )
+
+
+_assert_job_workspace_reach_matches_the_plan()
+
+
 def principal_needs_write(
     asset: TrustRootAsset,
     principals: frozenset[Principal],
@@ -4411,6 +4691,16 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
         note="B 案的派工 client：`systemctl start --wait <模板實例>`。#666 補進表。",
     ),
     RunDependency(
+        "setfacl", DependencyKind.SYSTEM_PROGRAM,
+        (Principal.MANAGER,), (RunStage.DISPATCH,),
+        covered_by="SYSTEM_PROGRAMS",
+        note=(
+            "#710：per-job 工作區的具名 ACL。Manager 建完 clone 後對**那一格**下 "
+            "`setfacl -R`，job 才 `chdir` 得進自己的工作區——`chown` 需要 `CAP_CHOWN`，"
+            "Manager 沒有。解不到它＝每一個 builder job 都起不來。"
+        ),
+    ),
+    RunDependency(
         "manager-gitconfig", DependencyKind.ACCOUNT_CONFIG,
         (Principal.MANAGER, Principal.MONITOR), (RunStage.DISPATCH, RunStage.SHIP),
         covered_by="manager-gitconfig",
@@ -5357,6 +5647,83 @@ def _job_unit_credential_lines(job_layout: "PathLayout", account: str) -> list[s
     return lines
 
 
+def _job_unit_workspace_lines(
+    job_layout: "PathLayout", principal: Principal, account: str
+) -> list[str]:
+    """模板 unit 的「本 job 的工作區長什麼樣」那一段，由 :data:`registry.JOB_WORKSPACE_REACH` 導出（#710）。
+
+    **這一段在 #710 之前是三份 unit 逐字共用的一塊硬寫死註解**，內容是 builder 的
+    故事（「`git clone` 到 `<pool>/%i`，整個 clone 由本 job 帳號擁有，已在下方 RWP
+    內」）。對 reviewer 與 gate 那兩份 unit，那段話**每一個子句都是假的**：它們的
+    工作區不在 pool 底下、也不在自己的 `ReadWritePaths=` 裡。而對 builder 自己，
+    「由本 job 帳號擁有」同樣不成立——Manager 沒有 `CAP_CHOWN`，那個動作從未發生過。
+
+    陳舊的宣稱會**反向說謊**（#696）：讀到那段話的人會去找一個不存在的 chown 步驟，
+    或者相信一條不存在的可達性。因此這一段改為由規則表逐 principal 產生——三份 unit
+    的內容從此**必然不同**，而且各自等於它那一列宣告的機制。
+    """
+
+    reach = registry.job_workspace_reach_for(principal)
+    lines = [
+        f"# --- 工作區可達性（登記表 JOB_WORKSPACE_REACH：{reach.reach.value}，#710）---",
+        "# shim 在**降權之後**才 `os.chdir(spec['working_directory'])`——那一步走不進去，",
+        "# job 就死在它做任何事之前（#710 實機：`[Errno 13] Permission denied`）。",
+        "# 「進得去」需要 mount 層（下方 ReadWritePaths／ProtectSystem）**與** DAC 層",
+        "# 同時成立；本節講的是 DAC 那一半。",
+    ]
+    if reach.reach is registry.WorkspaceReach.PER_JOB_NAMED_ACL:
+        lines += [
+            f"#   {job_layout.repo_source_root}/<slug> → `git clone --no-hardlinks` 到",
+            f"#   {job_layout.worktree_root}/%i。",
+            f"#   那一格的 owner 是 **Manager**（不是本帳號），本帳號以**具名 ACL** 取得",
+            f"#   `{reach.access_perms}`（＋ default `{reach.default_perms}`），由 Manager 在",
+            "#   provision 當下遞迴套上（`coordinator/job_workspace.grant_workspace_acl`）。",
+            "#   ⛔ **不是**「整個 clone 由本 job 帳號擁有」——那句話從 #623／#648 起寫在",
+            "#      這裡，但沒有任何程式實作它，而且結構上做不到：`chown` 給另一個使用者",
+            "#      需要 `CAP_CHOWN`，本部署的 Manager unit 帶 `CapabilityBoundingSet=`",
+            "#      （空）。代價是 #710（builder job 第一次由 daemon 經正規路徑派出來就",
+            "#      死在 chdir）。`setfacl` 由目錄 owner 執行、不需要任何 capability。",
+            "#   ⚠️ ACL 下在 **per-job 那一格**，不在 pool 根：pool 根是三個 job 帳號共用",
+            "#      的容器（0701），在它身上下 default ACL 會讓每個 job 帳號進得去每個",
+            "#      job 的目錄（裁決 10-2 當場歸零）。",
+            "#   ⚠️ 驗證一律 `getfacl`，判準是 `mask::` 與 `#effective:`——`chmod` 會重寫",
+            "#      ACL mask，「ACL 行存在」證明不了有效權限（runbook 4e-2b）。",
+            "#   來源樹（登記表 repo-source-tree）的 owner 是 Manager（0817 裁決），job",
+            "#   帳號只拿到唯讀 ACL：讀得到、寫不進去，共用 object store 那條「builder 能",
+            "#   寫 Manager 的樹」的路因此在 git 這一層就不存在；下方 ReadWritePaths",
+            "#   **不含**來源樹。",
+            f"#   跨擁有者 clone 由 {job_layout.gitconfig_of(account)} 的 safe.directory",
+            "#   放行（root-owned、本帳號唯讀；登記表資產，內容同樣由 permgen 產生）。",
+        ]
+    elif reach.reach is registry.WorkspaceReach.INHERITED_DEFAULT_ACL:
+        lines += [
+            "#   本帳號的工作區**不在** worktree pool 底下（那是 builder 的），而是由",
+            "#   Manager 在下列既有的樹裡逐次開出來：",
+        ]
+        lines += [f"#     - 登記表 {pool_id}" for pool_id in reach.pool_asset_ids]
+        lines += [
+            f"#   那幾棵樹的**根**已帶本帳號的 default ACL（`{reach.access_perms}`，由登記表的",
+            "#   readers 機械導出），Manager 在裡面建的每一格因此自動繼承 ⇒ 可達性已經成立，",
+            "#   **本節不新增任何 ACL、也沒有任何執行期動作**。",
+            "#   ⛔ 下方 ReadWritePaths **不含**這些樹：本帳號對工作區唯讀是刻意的——交付",
+            "#      通道是 review-verdict-spool／dispatch-specs-tree，給工作區寫入權會把",
+            "#      #628／#639 關掉的「被驗方在自己的工作區裡產生自己的證據」重新打開。",
+            f"#   跨擁有者的 git 操作由 {job_layout.gitconfig_of(account)} 的 safe.directory",
+            "#   放行（root-owned、本帳號唯讀；登記表資產，內容同樣由 permgen 產生）。",
+        ]
+    else:  # POOL_OWNED_BY_JOB
+        lines += [
+            f"#   本帳號的工作區 pool（登記表 {reach.pool_asset_ids[0]}）的 **owner 就是",
+            f"#   {account} 自己**（0700、零 ACL），per-job 那一格由本帳號在執行期自己建",
+            "#   （`gate_ledger.snapshot_worktree()` 的目錄樹複製）⇒ 它天生擁有自己",
+            "#   產出的每一個 inode。可達性在部署當下一次成立，執行期零動作、零 ACL。",
+            "#   被驗的那棵樹（builder 的 clone）另以 `rX` 具名 ACL 授予，與 builder 的",
+            "#   可寫面由**同一次** per-job setfacl 一起落地（登記表 repo-worktree 的",
+            "#   readers 宣告了本帳號，#629）。",
+        ]
+    return lines
+
+
 def build_job_unit(
     scheme: UidScheme,
     layout: PathLayout = DEFAULT_LAYOUT,
@@ -5483,14 +5850,9 @@ def build_job_unit(
         "# 這裡只給恆存在的 pool 根（0701＝可 traverse、不可列目錄），避免 unit 因",
         "# per-job 目錄尚未建立而在 exec 前就失敗（那會讓 log 裡沒有任何線索）。",
         f"WorkingDirectory={job_layout.worktree_root}",
-        "# --- clone 來源（登記表 repo-source-tree，#623）：對 job **唯讀** ---",
-        f"#   {job_layout.repo_source_root}/<slug> → `git clone --no-hardlinks` 到",
-        f"#   {job_layout.worktree_root}/%i（整個 clone 由本 job 帳號擁有，已在下方 RWP 內）。",
-        "# 來源樹的 owner 是 Manager（0817 裁決），job 帳號只拿到唯讀 ACL：讀得到、",
-        "# 寫不進去，共用 object store 那條「builder 能寫 Manager 的樹」的路因此在 git",
-        "# 這一層就不存在；下方 ReadWritePaths **不含**來源樹。",
-        f"# 跨擁有者 clone 由 {job_layout.gitconfig_of(account)} 的 safe.directory 放行",
-        "# （root-owned、本帳號唯讀；登記表資產，內容同樣由 permgen 產生）。",
+    ]
+    body += _job_unit_workspace_lines(job_layout, principal, account)
+    body += [
         "# --- 成果回收（登記表 commit-spool，#623／#634）---",
         f"#   {job_layout.commit_spool_root}/%i/：job 在**自己的** clone `git bundle create`",
         "# 寫進這一格，Manager 再從那個 bundle **檔案** fetch——Manager 全程不碰 job 的樹。",
@@ -6906,6 +7268,181 @@ def build_job_log_probe(
         "本探針量的是 **mount ＋ ACL 兩層的實際結果**，證明不了「Manager 派得出那個 "
         "job」——那一維要走 runbook 的真實 dispatch smoke（#687 的 D13 caveat 逐字適用："
         "psc_run_under 複製的是加固面，不是派工路徑）。兩維都要有實跑證據。"
+    )
+    return lines
+
+
+#: #710 探針拿來當 per-job 工作區的那個 job id。**固定字面量**，理由與
+#: :data:`JOB_LOG_PROBE_KEY` 逐字相同：operator 重跑時同一格整個重建，不會在 pool 裡
+#: 留下一堆 `probe-<timestamp>` 需要人去掃。
+JOB_WORKSPACE_PROBE_JOB_ID = "probe-710"
+
+
+def build_job_workspace_probe(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+) -> list[str]:
+    """#710 反向不變式的實機探針（**只回傳字串，不執行**）。
+
+    要證的是**三個方向**，缺一不可：
+
+    1. **正向**——每個降權 principal 在**零額外 env**、真實模板 unit 的加固面下
+       `cd` 得進自己的工作區，而且該做的事做得到（builder 寫得出檔、reviewer 讀得到、
+       gate 建得出自己那一格）；
+    2. **反向（per-job 隔離）**——builder 的工作區對**別的 job 帳號**仍然進不去。
+       少了這一半，「只下在 per-job 那一格」就只是一句宣稱：真正要排除的失敗是
+       「順手往 pool 根加一條 default ACL 讓它過」，而那會讓每個 job 帳號進得去每個
+       job 的目錄（裁決 10-2 當場歸零）；
+    3. **mask**——判準是 `getfacl` 的 `mask::` 與 `#effective:`，**不是**「ACL 行
+       存在」。任何 `chmod` 都會重寫 mask，具名條目於是靜默失效（runbook 4e-2b）。
+
+    加固面複本一律由 `psc_run_under` → :func:`unit_replica_properties` 從**落檔的
+    unit** 全量導出（design D13）。**本產生器不自組 `--property=`、不帶 `--setenv=`**。
+
+    ⚠️ **工作區由真實 provisioning 產生，不得手工前置**：builder 那一格由
+    `coordinator/seams.ScriptWorktreeCreator` 建 clone、由
+    `coordinator/job_runner.ensure_workspace_reachable()` 授權——`#645` 逐字記錄過
+    「手工前置物剛好把 bug 繞過去」的代價，而本票（#710）正是那一族的下一個成員
+    （M1 當時 operator 手工建了工作區、恰好避開了這個缺陷）。探針因此**呼叫產品
+    程式碼**，不自己建目錄再 `setfacl`。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    manager = scheme.durable_state_owner
+    paths_by_asset = layout.asset_paths()
+    python = f"{layout.deploy_root}/venv/bin/python3"
+    job_segment = f"{JOB_WORKSPACE_PROBE_JOB_ID}-<hash>"
+    lines: list[str] = [
+        "# === #710 反向不變式：三個降權 principal 各自進得去自己的工作區嗎 ===",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root workspace-probe {scheme.scheme_id}",
+        "#",
+    ]
+    lines += _wrap_comment(
+        "本探針**刻意不帶任何 `--setenv=`、也不自組 `--property=`**（design D13）。"
+        "加固面複本由 `unit_replica_properties()` 從落檔的 unit 全量導出，因此它連"
+        "「production 沒有設什麼」也一起複製。"
+    )
+    lines += [
+        "#",
+        "# ⛔ 任何一條紅掉時**不要**往 pool 根加 default ACL 讓它過——那會讓每個 job",
+        "#    帳號進得去每個 job 的目錄，per-job 隔離當場歸零（裁決 10-2）。要改的是",
+        "#    登記表 JOB_WORKSPACE_REACH 那一列，以及它在執行期的那一支實作。",
+        "# ⛔ 也不要在 setfacl 之後補 `chmod`：那會把 ACL mask 重寫成 mode 的 group 位，",
+        "#    具名條目**靜默失效**（runbook 4e-2b）。判準永遠是 getfacl 的 mask::。",
+        "#",
+        f"# 前置：先貼上 runbook 第 4e 步的**共用探針** `{PATH_PROBE_HELPER}`。",
+        f"declare -F {PATH_PROBE_HELPER} >/dev/null || {{",
+        f"  echo \"⛔ 未定義 {PATH_PROBE_HELPER}——先貼上 runbook 第 4e 步的共用探針\" >&2",
+        "  return 1 2>/dev/null || exit 1",
+        "}",
+        "",
+    ]
+    for principal in downgraded_job_principals(scheme):
+        account = scheme.resolve(principal)
+        if account is None:  # pragma: no cover - downgraded_job_principals 已過濾
+            continue
+        reach = registry.job_workspace_reach_for(principal)
+        stem = job_unit_stem(layout, principal, DEFAULT_HARDENING_PROFILE)
+        lines += [
+            f"# --- {principal.value}（{account}／{stem}@／形態 {reach.reach.value}）---",
+        ]
+        if reach.reach is registry.WorkspaceReach.PER_JOB_NAMED_ACL:
+            pool = paths_by_asset[reach.pool_asset_ids[0]]
+            workspace = f"{pool}/{job_segment}"
+            lines += [
+                "#   1) 工作區由**產品程式碼**建並授權，不是 operator 自己建目錄 ＋",
+                "#      setfacl——手工前置物會剛好繞過本票要驗的缺陷（#645／#710）。",
+                f"sudo -u {manager} {python} - <<'PSC_710_EOF'",
+                "from paulsha_cortex.config import paths",
+                "from paulsha_cortex.coordinator import job_runner, job_workspace, seams",
+                f'job_id = "{JOB_WORKSPACE_PROBE_JOB_ID}"',
+                "creator = seams.ScriptWorktreeCreator()",
+                'workspace = creator.create("feature/probe-710", job_id=job_id)',
+                "print(job_runner.ensure_workspace_reachable(",
+                '    __import__("os").environ, role=job_runner.JOB_ROLE_BUILDER,',
+                "    workspace=workspace))",
+                "print(workspace)",
+                "PSC_710_EOF",
+                "#      期望：兩行——第一行是實際執行的 `setfacl -R -m …` 命令，",
+                "#      第二行是工作區絕對路徑（下面以 $WS 代稱）。",
+                "#   2) mask 判準（**不是**「ACL 行存在」）。",
+                f"sudo -u {manager} getfacl -p $WS",
+                f"#      期望逐字含 `user:{account}:rwx` 且 `mask::rwx`；",
+                f"#      看到 `user:{account}:rwx\\t#effective:---` ⇒ 有人在 setfacl 之後",
+                "#      又 chmod 了一次（runbook 4e-2b 的陷阱）。",
+                f"sudo -u {manager} getfacl -p $WS/.git/HEAD",
+                f"#      期望：**樹裡面**也有 `user:{account}` 且 effective 帶 r——",
+                "#      只在樹根下一條 ACL 的話 job 進得去卻讀不到任何東西。",
+                "#   3) 正向：零額外 env、真實加固面下，job 身分進得去且寫得出檔。",
+                f"{PATH_PROBE_HELPER} {stem} /bin/sh -c 'cd $WS && "
+                "printf JOB-WORKSPACE-WRITABLE > .psc-710-probe && cat .psc-710-probe'",
+                "#      期望：rc=0、輸出 `JOB-WORKSPACE-WRITABLE`。",
+                "#      `Permission denied` ⇒ DAC 層（ACL／mask）；",
+                "#      `Read-only file system` ⇒ mount 層（模板 unit 的 ReadWritePaths）。",
+            ]
+            others = [
+                other
+                for other in downgraded_job_principals(scheme)
+                if other is not principal
+            ]
+            for other in others:
+                other_account = scheme.resolve(other)
+                other_stem = job_unit_stem(layout, other, DEFAULT_HARDENING_PROFILE)
+                lines += [
+                    f"#   4) **反向**：{other.value}（{other_account}）不得進得去這一格。",
+                    f"{PATH_PROBE_HELPER} {other_stem} /bin/sh -c 'cd $WS && ls'",
+                    "#      期望：**非零**（`Permission denied`）。rc=0 ⇒ 有人把授權下在",
+                    "#      pool 根上了，per-job 隔離歸零（裁決 10-2）。",
+                ]
+            lines += [
+                "#   5) 收乾淨。",
+                f"sudo -u {manager} {python} -c "
+                "'from paulsha_cortex.coordinator import job_workspace as w; "
+                "import sys; w.remove_clone(sys.argv[1])' $WS",
+                "#      ⚠️ builder 在步驟 3 建的檔由 builder 擁有 ⇒ 這一步可能失敗",
+                "#      （回收面的已知邊界，見登記表 repo-worktree 的 note）；",
+                f"#      失敗時以 `sudo rm -rf $WS` 收尾，並記在 runbook 的觀察欄。",
+                "",
+            ]
+        elif reach.reach is registry.WorkspaceReach.INHERITED_DEFAULT_ACL:
+            for pool_id in reach.pool_asset_ids:
+                pool = paths_by_asset[pool_id]
+                lines += [
+                    f"#   繼承來源：{pool_id} = {pool}",
+                    f"sudo -u {manager} getfacl -p {pool}",
+                    f"#      期望逐字含 `default:user:{account}:{reach.default_perms.lower()}`",
+                    "#      ——Manager 在裡面建的每一格靠它繼承（POSIX：目錄帶 default ACL",
+                    "#      時 umask 不生效，因此 unit 的 UMask=0077 不會壓掉 mask）。",
+                    f"{PATH_PROBE_HELPER} {stem} /bin/sh -c 'cd {pool} && ls >/dev/null'",
+                    "#      期望：rc=0。",
+                ]
+            lines += [
+                "#   ⛔ 反向：本帳號對工作區**唯讀**是刻意的（交付走 spool）。",
+                f"{PATH_PROBE_HELPER} {stem} /bin/sh -c "
+                f"'printf x > {paths_by_asset[reach.pool_asset_ids[0]]}/.psc-710-probe'",
+                "#      期望：**非零**（`Read-only file system` 或 `Permission denied`）。",
+                "",
+            ]
+        else:  # POOL_OWNED_BY_JOB
+            pool = paths_by_asset[reach.pool_asset_ids[0]]
+            lines += [
+                f"#   pool 根：{reach.pool_asset_ids[0]} = {pool}",
+                f"sudo -u {manager} stat -c '%U:%G %a' {pool}",
+                f"#      期望逐字：`{account}:{scheme.group_of(account)} 700`——本形態的",
+                "#      可達性只來自 owner 位，owner 一漂走 gate 就建不出自己的副本。",
+                f"{PATH_PROBE_HELPER} {stem} /bin/sh -c "
+                f"'cd {pool} && : > .psc-710-probe && rm -f .psc-710-probe'",
+                "#      期望：rc=0（gate 的第一個動作就是在這裡複製出一格）。",
+                "",
+            ]
+    lines += _wrap_comment(
+        "本探針量的是 **mount ＋ ACL 兩層的實際結果**，證明不了「Manager 派得出那個 "
+        "job」——那一維要走 runbook 的真實 dispatch smoke（#687／#709 的 D13 caveat "
+        "逐字適用：`psc_run_under` 複製的是加固面，不是派工路徑）。步驟 1 之所以呼叫 "
+        "`seams.ScriptWorktreeCreator` 與 `job_runner.ensure_workspace_reachable()` "
+        "而不是手工建目錄，就是為了讓被驗的那一格與派工路徑產出的那一格是**同一份**"
+        "程式碼的結果。兩維都要有實跑證據。"
     )
     return lines
 

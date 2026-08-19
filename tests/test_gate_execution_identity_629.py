@@ -295,7 +295,26 @@ class GateWriteFaceTests(unittest.TestCase):
                 self.assertFalse(_covers(granted, target), (granted, target))
 
     def test_gate_cannot_write_the_builder_workspace(self) -> None:
-        """gate 讀得到被驗的樹（`rX`），但**寫不進去**——副本才是它的可寫面。"""
+        """gate 讀得到被驗的樹（`rX`），但**寫不進去**——副本才是它的可寫面。
+
+        **#710 修改了本測試的兩條斷言，理由逐條**：
+
+        1. `entry.owner` 從 `BUILDER_ACCOUNT` 改成 `SCHEME.durable_state_owner`。
+           「整個 clone 由 builder 擁有」這個形態**從來沒有被實作，而且 Manager
+           結構上做不到**（`chown` 給另一個使用者要 `CAP_CHOWN`，Manager unit 帶
+           `CapabilityBoundingSet=`）——#710 的實機證據是 `stat` 回
+           `cortex-manager:cortex-manager 700`。owner 因此改為 Manager，builder 的
+           可寫面走具名 ACL。**本測試要守的性質沒有變**：gate 對這棵樹只有讀，
+           而下面那兩條斷言（gate 的 perms 不含 `w`、gate 的可寫面不涵蓋這棵樹）
+           就是那個性質，它們一行未改。
+        2. gate 的 ACL 條目從「恰好一條」改成「access ＋ default 各一條，perms 相同」。
+           #710 讓 per-job 那一格的 ACL **由執行期真的套上去**，而 default ACL 是
+           「builder 在 run 期間新建的檔 gate 也讀得到」的唯一來源（POSIX：目錄帶
+           default ACL 時 umask 不生效，因此不會被 unit 的 `UMask=0077` 壓掉）。
+           在此之前那條 default 是 `PermissionEntry.commands()` 自動補的，同樣存在，
+           只是不在 `entry.acls` 上——因此這不是新增授權，是把同一條授權從隱式改為
+           顯式（`effective_default_acls()` 對修改前後回傳同一組）。
+        """
         for granted in self.granted:
             self.assertFalse(_covers(granted, JOB_LAYOUT.asset_paths()["repo-worktree"]))
             self.assertFalse(_covers(granted, LAYOUT.worktree_root))
@@ -303,11 +322,13 @@ class GateWriteFaceTests(unittest.TestCase):
             e for e in permgen.generate_plan(SCHEME).entries
             if e.asset_id == "repo-worktree"
         )
-        self.assertEqual(entry.owner, BUILDER_ACCOUNT)
+        self.assertEqual(entry.owner, SCHEME.durable_state_owner)
         gate_acls = [a for a in entry.acls if a.account == GATE_ACCOUNT]
-        self.assertEqual(len(gate_acls), 1, entry.acls)
-        self.assertEqual(gate_acls[0].perms, "rX")   # 讀＋traverse，**沒有 w**
-        self.assertNotIn("w", gate_acls[0].perms)
+        self.assertEqual(len(gate_acls), 2, entry.acls)
+        self.assertEqual({a.default for a in gate_acls}, {False, True}, entry.acls)
+        for acl in gate_acls:
+            self.assertEqual(acl.perms, "rX")   # 讀＋traverse，**沒有 w**
+            self.assertNotIn("w", acl.perms)
 
     def test_gate_cannot_touch_the_verdict_spool(self) -> None:
         """#639 剛關掉的通道不得因為多一個帳號而重新打開。"""

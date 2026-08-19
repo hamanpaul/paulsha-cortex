@@ -1583,6 +1583,27 @@ class SubprocessLauncher:
                     manager_log_path=log_path,
                 )
             )
+            # #710：**再把工作區的可達性準備好**，同樣在寫 spec 之前。
+            #
+            # shim 在降權之後、exec 之前 `os.chdir(spec["working_directory"])`——那一步
+            # 走不進去，job 就死在它做任何事之前（實機 `[Errno 13] Permission denied:
+            # '/var/lib/cortex/worktree/wf-…'`）。#708 修好 log 之後露出的就是這一票：
+            # per-job clone 是 Manager 建的、owner 因此是 Manager，而模板 unit 註解裡
+            # 那句「整個 clone 由本 job 帳號擁有」**沒有任何程式實作**，且 Manager
+            # 結構上做不到（`chown` 要 `CAP_CHOWN`，Manager 的 CapabilityBoundingSet
+            # 是空的）。
+            #
+            # **與 log 那一格逐條同型**：形態由角色決定、對應關係在
+            # `job_runner.JobRoleConfig.workspace_reach`（與
+            # `registry.JOB_WORKSPACE_REACH` 成對），不在這裡推導；builder 走具名 ACL，
+            # reviewer／planner 的工作區靠 pool 根的 default ACL 繼承（零動作）。
+            # 三者共用同一支，且**都**在派工前以 mask-aware 的有效權限複驗一次。
+            # env 取 `os.environ`（**Manager 的**環境）而不是上面組給 job 的那一份：
+            # 帳號名來自 `PSC_*_ACCOUNT`，那是 Manager 端 root-owned EnvironmentFile 的
+            # 部署決定；`prepare_systemd_template()` 上一步解身分用的也是同一份。
+            job_runner.ensure_workspace_reachable(
+                os.environ, role=job_role, workspace=worktree
+            )
             # B 案：per-job 參數走 Manager-owned spec 檔（job 帳號唯讀），不走 argv
             # ——模板 unit 的 ExecStart= 是固定的，Manager 給不了命令列。
             # `User=` 刻意**不在** spec 內：身分只有 root-owned unit 檔一個來源。
