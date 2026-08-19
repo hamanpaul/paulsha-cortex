@@ -3682,9 +3682,23 @@ def _schema_retry_attempt_key(card_id: str) -> str:
     """#261 D5：schema mismatch retry 計數在 run.attempts 上的鍵。
 
     刻意與 phase attempts 分開命名，避免和既有的 phase 重試次數混淆。
+
+    #717：字面量收斂到 :func:`terminal_contract.schema_retry_attempt_key`——
+    registry 的 `retry-card` 重置也要認得同一個鍵，而 registry 不 import manager。
+    這裡保留既有名稱給既有呼叫端與測試。
     """
 
-    return f"schema-mismatch:{card_id}"
+    return terminal_contract.schema_retry_attempt_key(card_id)
+
+
+def _schema_mismatch_total_key(card_id: str) -> str:
+    """#717：這張卡跨 `retry-card` 世代的累計 schema mismatch 觀測鍵。
+
+    與 :func:`_schema_retry_attempt_key`（本輪額度，`retry-card` 會清）分家的理由
+    見 :data:`terminal_contract.SCHEMA_MISMATCH_TOTAL_PREFIX` 的註解。
+    """
+
+    return terminal_contract.schema_mismatch_total_key(card_id)
 
 
 def _provider_retry_attempt_key(card_id: str) -> str:
@@ -3769,9 +3783,16 @@ def _provider_failure_reroute(
 def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
     """#261 D1：把 canonical envelope 投影成既有 card 驗證路徑吃得下的形狀。
 
-    canonical envelope 多帶 ``diagnostics``／``gate_evidence`` 兩個欄位，兩者的
-    語意（診斷與 gate 背書）都已經在 :func:`_assert_terminal_gate_consistency`
-    消費完畢；此處只保留 lifecycle 需要的欄位，避免新舊兩種讀法在下游並存。
+    canonical envelope 多帶 ``diagnostics``／``gate_evidence`` 兩個欄位；此處只保
+    留 lifecycle 需要的欄位，避免新舊兩種讀法在下游並存。
+
+    #717 更正：原註解宣稱這兩個欄位的語意「已經在
+    :func:`_assert_terminal_gate_consistency` 消費完畢」——那對 ``gate_evidence``
+    成立，對 ``diagnostics`` **不成立**。malformed／schema-retry 分支根本不會走到
+    那個函式（見 :func:`_malformed_workflow_card_terminal` 的呼叫端），於是模型逐字
+    寫下的病因整段被這個投影丟掉，operator 只看得到「不符契約」。診斷的落地點因此
+    改由 :func:`_terminal_parse_diagnostics` 直接從**原始 envelope** 讀，不經過本
+    投影——投影本身維持原狀（lifecycle 驗證路徑的形狀契約不變）。
     """
 
     projected = {
@@ -3783,6 +3804,59 @@ def _canonicalize_card_terminal(raw: Mapping[str, object]) -> dict[str, object]:
     return projected
 
 
+# #717：模型 ``diagnostics`` 帶進 attention 的字元預算。沿用 #606
+# :data:`RETRY_CONTEXT_EVIDENCE_LIMIT` 的同一個數量級與理由——這段內容**完全來自
+# 模型**，長度不受任何契約約束，一個亂寫的模型可以吐出數萬字把 attention 欄位
+# 與狀態檔一起撐爆。預算是**全體**的（跨所有 key 共用一份），被截的項目以
+# ``…`` 明示，不假裝完整。
+TERMINAL_MODEL_DIAGNOSTICS_LIMIT = 2000
+
+# 單一 diagnostics key 的長度上限；key 同樣是模型寫的，不能無界。
+TERMINAL_MODEL_DIAGNOSTICS_KEY_LIMIT = 64
+
+
+def _model_terminal_diagnostics(
+    raw: Mapping[str, object] | None,
+) -> tuple[tuple[str, str], ...]:
+    """#717：把 envelope 上模型寫的 ``diagnostics`` 壓成有界的 (key, value) 序列。
+
+    只做形狀正規化與截斷，**不做任何採信**：內容原封不動來自模型，呼叫端只把它
+    當敘事帶給 operator，不得據以授權（見
+    :class:`terminal_contract.TerminalDiagnostics` 的 ``authority_granted``）。
+
+    非字串的值以 canonical JSON 落成字串（模型偶爾把 diagnostics 寫成巢狀物件），
+    順序維持模型寫入順序，因此同一份 log 讀兩次結果逐字相同。
+    """
+
+    if not isinstance(raw, Mapping):
+        return ()
+    diagnostics = raw.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return ()
+    rows: list[tuple[str, str]] = []
+    budget = TERMINAL_MODEL_DIAGNOSTICS_LIMIT
+    for key, value in diagnostics.items():
+        if budget <= 0:
+            break
+        if not isinstance(key, str) or not key.strip():
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                continue
+        if not text:
+            continue
+        kept = text[:budget]
+        budget -= len(kept)
+        if len(kept) < len(text):
+            kept = f"{kept}…"
+        rows.append((key.strip()[:TERMINAL_MODEL_DIAGNOSTICS_KEY_LIMIT], kept))
+    return tuple(rows)
+
+
 def _terminal_parse_diagnostics(
     job: Mapping[str, object],
     *,
@@ -3792,16 +3866,25 @@ def _terminal_parse_diagnostics(
 
     ``observed_head`` 取自 job 上「觀察到的」 subject/dispatch HEAD，與
     ``WorkflowRun.candidate_head``（已授權）分離；呼叫端不得用它去 bind。
+
+    #717：另外把 envelope 上模型逐字寫的 ``diagnostics`` 一併帶出。讀的是
+    :func:`_extract_terminal_json` 的**原始**結果，刻意不經
+    :func:`_canonicalize_card_terminal`——那個投影正是把 ``diagnostics`` 丟掉的
+    地方。取不到（log 讀不到、不是物件、模型沒寫）一律回空集合：診斷是加值，
+    不得讓「讀不到診斷」再害死一次已經失敗的採信。
     """
 
     reason = str(error) if error is not None else ""
-    if not reason:
-        try:
-            _extract_terminal_json(job.get("log_path"))
-        except ValueError as exc:
+    raw: Mapping[str, object] | None = None
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except ValueError as exc:
+        if not reason:
             reason = str(exc)
-        else:
-            reason = "workflow terminal payload did not satisfy the result contract"
+    except Exception:  # pragma: no cover - fail-soft：診斷組裝不得炸掉回報路徑
+        raw = None
+    if not reason:
+        reason = "workflow terminal payload did not satisfy the result contract"
     observed = job.get("subject_head")
     if not isinstance(observed, str) or not observed:
         observed = job.get("dispatch_head")
@@ -3810,6 +3893,7 @@ def _terminal_parse_diagnostics(
         observed_head=observed if isinstance(observed, str) and observed else None,
         reason=reason,
         validation_path=getattr(error, "validation_path", "$"),
+        model_diagnostics=_model_terminal_diagnostics(raw),
     )
 
 
@@ -4079,7 +4163,38 @@ def _is_stale_terminalized_failed_job(job: Mapping[str, object]) -> bool:
 
 
 def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
-    """Recognize an immutable, bound card terminal that explicitly requested a stop."""
+    """Recognize an immutable, bound card terminal that explicitly requested a stop.
+
+    #717 裁決 (1a)：非通過狀態（``failed``／``needs_human``）下 ``candidate``
+    **不再**被要求是 40-hex SHA，``null`` 與任何字串都合法。
+
+    理由是結構性的：本函式是「模型明示要求停止」的唯一入口，而過去 build phase 的
+    入場券是「交得出 `git rev-parse HEAD`」。於是**唯一一種本契約無法表達的失敗
+    模式，恰好是最需要被表達的那一種**——「我一條命令都跑不了」（#716）的模型結構
+    上取不到 HEAD，只能填 contract 裡看得到的 64-hex `source_revision`，判準不過
+    ⇒ 掉進 :func:`_malformed_workflow_card_terminal` ⇒ 被當成 schema 壞掉重派，
+    直到 `card-terminal-schema-retry-exhausted`。
+
+    放寬是安全的，因為**非通過狀態下沒有任何下游會讀這個 candidate**（沿用 #261
+    R4／D6 的「唯讀診斷不授予 candidate authority」分離）。回 ``True`` 之後的三個
+    消費點都只把它當布林旗標：
+
+    1. :func:`_discard_failed_planner_sandbox` —— 只當 admission 判準；sandbox 路徑
+       由 ``job`` 欄位與 ``sha256(f"{run_id}:{card}")`` 導出，不讀 terminal。
+    2. :func:`_dispatch_workflow_card` 的 ``retryable_latest`` —— 只決定「不回傳舊
+       job、改派新的」；新 job 的 ``dispatch_head``／``subject_head`` 取自 ``run``。
+    3. :func:`resume_workflow_run` 的 ``retry_failed`` 分支 —— 同 2。
+
+    唯一會把 terminal 的 ``candidate`` 寫進 run state 的是
+    :func:`terminalize_workflow_job`，而它在讀 ``candidate`` **之前**就已經對
+    ``status != "passed"`` 擲 ``ValueError``（見該函式 "did not pass" 那一行）；
+    :func:`_is_exact_legacy_agy_recovery` 同樣要求 ``status == "passed"``。
+    ``passed`` 的 40-hex 判準因此一個位元都沒動。
+
+    plan phase 一併放寬（原本要求 ``candidate is None``）：判準的理由是「非通過狀態
+    下 candidate 沒有授權語意」，與 phase 無關；只放寬 build 會讓 plan 卡踩到同一個
+    catch-22 的另一半（模型多寫一個 candidate 就被判 schema 壞掉）。
+    """
 
     if (
         job.get("workflow_evidence") is not None
@@ -4109,21 +4224,40 @@ def _retryable_nonpassing_workflow_terminal(job: Mapping[str, object]) -> bool:
         and raw.get("status") in {"failed", "needs_human"}
         and raw.get("run_id") == job.get("workflow_run_id")
         and raw.get("card_id") == job.get("workflow_card")
-        and (
-            (phase == "plan" and candidate is None)
-            or (
-                phase == "build"
-                and isinstance(candidate, str)
-                and verification.SAFE_SHA_RE.fullmatch(candidate) is not None
-            )
-        )
+        # #717：型別仍收斂（``None`` 或字串），只是不再驗 40-hex。非字串、非 null
+        # 的值（數字、物件…）仍是真的 schema 壞掉，維持 fail closed。
+        and (candidate is None or isinstance(candidate, str))
+        and phase in {"plan", "build"}
         and isinstance(outputs, list)
         and all(isinstance(ref, str) for ref in outputs)
     )
 
 
+def _declared_card_terminal_status(job: Mapping[str, object]) -> str | None:
+    """#717：讀出 card terminal envelope 上模型自述的 ``status``。
+
+    只在 :func:`_retryable_nonpassing_workflow_terminal` 已經認可的形狀上呼叫，
+    因此這裡不重做形狀驗證；讀不到一律回 ``None``（敘事欄位，不得 fail closed）。
+    """
+
+    try:
+        raw = _extract_terminal_json(job.get("log_path"))
+    except Exception:
+        return None
+    status = raw.get("status")
+    return status if isinstance(status, str) and status else None
+
+
 def _malformed_workflow_card_terminal(job: Mapping[str, object]) -> bool:
-    """Recognize plan/build terminals that cannot be bound as a passed workflow-card."""
+    """Recognize plan/build terminals that cannot be bound as a passed workflow-card.
+
+    #717 迴歸釘住：**合法的明示停止不得被判成 schema mismatch**。這條保證由下面
+    第一行的早退提供——:func:`_retryable_nonpassing_workflow_terminal` 認得的形狀
+    在此一律回 ``False``，因此不消耗 schema retry 額度（那份額度是給「模型寫壞
+    JSON」的，不是給「執行環境壞掉」的）。下面 ``status != "passed"`` 那一行看似
+    「任何非 passed 一律當 schema mismatch」，但它只會看到早退**沒有**接住的殘餘：
+    真的形狀壞掉、或綁定對不上（run_id／card_id 不符）的 payload。
+    """
 
     if _retryable_nonpassing_workflow_terminal(job):
         return False
@@ -9792,21 +9926,69 @@ def resume_workflow_run(
             **status_fields,
             "terminal_diagnostics": diagnostics.as_dict(),
         }
+    if _retryable_nonpassing_workflow_terminal(job):
+        # #717：模型**明示要求停止**（`failed`／`needs_human`），而且 envelope 形狀
+        # 與綁定都合法。這既不是 schema 壞掉，也不是 provider 失敗，因此：
+        #
+        # - 不消耗 schema retry 額度（那份額度是給「模型寫壞 JSON」的）；
+        # - 不自動回派——模型已經講清楚它要人，再派一次只是把同一句話再買一次；
+        # - **模型逐字寫的 `diagnostics` 直接落進 attention 的 detail**。
+        #
+        # 這條分支之前，這一組 job 會一路走到 `terminalize_workflow_job` 才被
+        # "workflow card terminal evidence did not pass" 擋下，operator 收到的是
+        # `terminalize-workflow-job-failed` 這個離病因兩層遠的例外摘要（而且會把
+        # 例外往上擲）。病因就在同一份 envelope 上，沒有理由讓它繞這一圈。
+        diagnostics = _terminal_parse_diagnostics(job)
+        declared_status = _declared_card_terminal_status(job)
+        model_text = diagnostics.model_diagnostics_text()
+        current = registry.get_workflow_run(run.run_id)
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
+            gate_status="running",
+            needs_human_reason=diagnostic_reason(
+                "card-terminal-explicit-stop",
+                f"卡片 terminal 明示要求停止（status={declared_status}）："
+                + (model_text or "模型未在 envelope 的 diagnostics 欄位寫下任何病因"),
+                source="manager._poll_workflow_job:explicit-stop",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                job_id=str(job["job_id"]),
+                card=step.card,
+                declared_status=declared_status,
+            ),
+        )
+        return {
+            "run_id": run.run_id,
+            "current_phase": updated.current_phase,
+            "job_id": job["job_id"],
+            "reason": "card-terminal-explicit-stop",
+            "declared_status": declared_status,
+            # #261 R4／D6：唯讀診斷與授權欄位分離——模型講的話同樣不授權。
+            "terminal_diagnostics": diagnostics.as_dict(),
+        }
     if _malformed_workflow_card_terminal(job):
         # #261 R3／D5：同一個確定性 schema mismatch 不得無限回派模型。計數持久化在
         # run.attempts（既有的可觀測欄位），逾限即停止並讓 operator 接手。
         diagnostics = _terminal_parse_diagnostics(job)
         retry_key = _schema_retry_attempt_key(step.card)
+        total_key = _schema_mismatch_total_key(step.card)
         attempts = dict(run.attempts)
         seen = attempts.get(retry_key, 0)
+        # #717（ii）：`seen` 是**本輪**（上一次 `retry-card` 之後）用掉的額度，
+        # `observed` 是這張卡**累計**撞過幾次。兩者過去共用同一個 `(n/N)`，於是
+        # 「這一輪一次都沒重試就 exhausted」被 operator 讀成「它剛剛試了兩次」。
+        observed = attempts.get(total_key, 0) + seen
         status_fields = {
             "schema_retry_count": seen,
             "schema_retry_limit": terminal_contract.MAX_SCHEMA_RETRIES,
+            "schema_mismatch_observed": observed,
             "last_validation_path": diagnostics.validation_path,
             "last_validation_reason": diagnostics.reason,
         }
         if seen >= terminal_contract.MAX_SCHEMA_RETRIES:
             current = registry.get_workflow_run(run.run_id)
+            model_text = diagnostics.model_diagnostics_text()
             registry._manager_update_workflow_run(
                 run.run_id,
                 facets=tuple(dict.fromkeys((*current.facets, "needs_human"))),
@@ -9814,14 +9996,18 @@ def resume_workflow_run(
                 needs_human_reason=diagnostic_reason(
                     "card-terminal-schema-retry-exhausted",
                     "同一張卡的 terminal envelope 連續 schema mismatch 已達上限"
-                    f"（{seen}/{terminal_contract.MAX_SCHEMA_RETRIES}）："
-                    f"{diagnostics.reason or 'terminal envelope 不符契約'}",
+                    f"（本輪 {seen}/{terminal_contract.MAX_SCHEMA_RETRIES}，"
+                    f"該卡累計 {observed} 次）："
+                    f"{diagnostics.reason or 'terminal envelope 不符契約'}"
+                    # #717：模型若在 envelope 上寫了 diagnostics，逐字帶進 attention。
+                    + (f"；模型 diagnostics：{model_text}" if model_text else ""),
                     source="manager._poll_workflow_job:schema-retry",
                     run_id=run.run_id,
                     work_id=run.work_id,
                     job_id=str(job["job_id"]),
                     card=step.card,
                     validation_path=diagnostics.validation_path,
+                    schema_mismatch_observed=observed,
                 ),
             )
             return {
@@ -9853,7 +10039,11 @@ def resume_workflow_run(
             "current_phase": run.current_phase,
             "job_id": replacement["job_id"],
             "reason": "card-terminal-malformed-retry",
-            **{**status_fields, "schema_retry_count": seen + 1},
+            **{
+                **status_fields,
+                "schema_retry_count": seen + 1,
+                "schema_mismatch_observed": observed + 1,
+            },
             "terminal_diagnostics": diagnostics.as_dict(),
         }
     try:

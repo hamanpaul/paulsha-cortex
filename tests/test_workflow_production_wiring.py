@@ -1711,12 +1711,22 @@ def test_nonpassing_terminal_retry_authority_requires_exact_schema_and_binding(
         ("status", "passed"),
         ("run_id", "other-run"),
         ("card_id", "other-card"),
-        ("candidate", "not-a-sha"),
+        # #717：`candidate` 不再在這一組——非通過狀態下它不是授權欄位，任何字串
+        # （含模型退而求其次填的 64-hex `source_revision`）與 null 都合法。仍在的
+        # 是「型別根本不對」的那一組，見下方。
+        ("candidate", 7),
         ("outputs", "not-a-list"),
     ):
         invalid = {**payload, key: value}
         log.write_text(json.dumps(invalid) + "\n", encoding="utf-8")
         assert manager._retryable_nonpassing_workflow_terminal(job) is False
+
+    # #717 裁決 (1a)：build 卡的明示停止不以「交得出 40-hex candidate」為前提。
+    for candidate in (None, "b" * 64, "a" * 40, "not-a-sha"):
+        log.write_text(
+            json.dumps({**payload, "candidate": candidate}) + "\n", encoding="utf-8"
+        )
+        assert manager._retryable_nonpassing_workflow_terminal(job) is True
 
     log.write_text("not-json\n", encoding="utf-8")
     assert manager._retryable_nonpassing_workflow_terminal(job) is False
@@ -1755,9 +1765,23 @@ def test_malformed_workflow_card_terminal_detects_unterminalizable_card_results(
         log.write_text(json.dumps({**good, "status": status}) + "\n", encoding="utf-8")
         assert manager._malformed_workflow_card_terminal(job) is False
 
+    # #717：本段原本斷言「非通過狀態 + candidate 為 null ⇒ malformed」——那正是本票
+    # 要修的缺陷本身（build 卡要說「我需要人」得先交出 40-hex candidate，而失敗原因
+    # 恰好是「一條命令都跑不了」時結構上交不出來）。裁決 (1a) 之後，非通過狀態下
+    # candidate 不再是授權欄位，null 與任何字串都是**合法的明示停止**，不得再被判成
+    # schema mismatch。
     for status in ("failed", "needs_human"):
+        for candidate in (None, "b" * 64, "a" * 40):
+            log.write_text(
+                json.dumps({**good, "status": status, "candidate": candidate}) + "\n",
+                encoding="utf-8",
+            )
+            assert manager._malformed_workflow_card_terminal(job) is False
+
+    # 型別仍收斂：非字串、非 null 的 candidate 是真的 schema 壞掉。
+    for candidate in (7, {"sha": "a" * 40}, ["a" * 40]):
         log.write_text(
-            json.dumps({**good, "status": status, "candidate": None}) + "\n",
+            json.dumps({**good, "status": "needs_human", "candidate": candidate}) + "\n",
             encoding="utf-8",
         )
         assert manager._malformed_workflow_card_terminal(job) is True
