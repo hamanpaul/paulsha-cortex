@@ -224,6 +224,44 @@ def load_spec(instance: str, spool_root: str) -> dict[str, object]:
     return spec
 
 
+#: 出口 proxy 的環境變數名（#716）。**與 `permgen.EGRESS_PROXY_ENV_NAMES` 是成對契約**
+#: ——permgen 與 coordinator 刻意不互相 import（既有慣例，見 `DEFAULT_TEMPLATE_UNIT`／
+#: `JOB_PATH_ENV_BY_PRINCIPAL`），兩邊由契約測試釘住逐字相等。
+EGRESS_PROXY_ENV_NAMES: tuple[str, ...] = (
+    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+)
+
+
+def _apply_egress_proxy_env(
+    env: "dict[str, str]", environ: Mapping[str, str]
+) -> None:
+    """把模板 unit 上的 proxy 宣告帶進 job 的環境（#716）。
+
+    ## 為什麼非有這一段不可
+
+    shim 以 `os.execvpe(file, args, env)` **整份換掉**環境——unit 的 `Environment=`
+    只到得了 shim，到不了模型。這與 `HOME` 那一條是同一個機制（模板 unit 的註解逐字
+    記著「`Environment=HOME=` 到不了模型」），也與 `PATH` 的第二層同一個理由。
+
+    少了這一段，`#716` 的落地會變成一個**看起來很嚴、實際全開**的形態：unit 上有
+    `IPAddressDeny=any`、有 `Environment=HTTPS_PROXY=`，而 job 拿到的環境裡一個 proxy
+    變數都沒有 ⇒ executor 直連 ⇒ 被核心層擋掉 ⇒ 症狀是「模型 API 逾時」，離原因很遠。
+    這正是本 repo 記過八次以上的那一族。
+
+    ## 判準
+
+    來源是**模板 unit**（root-owned，job 帳號改不了）。spec 已經宣告的不覆蓋——
+    spec 由 Manager 產生，同樣在授權線內側，而且那是唯一能表達 per-job 例外的地方。
+
+    空字串是**有意義的值**（`NO_PROXY=` 明示清空），因此判斷用 `in`，不是 truthiness。
+    """
+    for name in EGRESS_PROXY_ENV_NAMES:
+        if name in env:
+            continue
+        if name in environ:
+            env[name] = environ[name]
+
+
 def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> dict[str, str]:
     """spec 的 `env` → job 的**完整**環境，並補上 `PATH` 這一條的第二層（#679）。
 
@@ -246,6 +284,7 @@ def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> d
     """
 
     env = {str(k): str(v) for k, v in dict(spec["env"]).items()}  # type: ignore[index]
+    _apply_egress_proxy_env(env, environ)
     if (env.get("PATH") or "").strip():
         return env
     inherited = (environ.get("PATH") or "").strip()

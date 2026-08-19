@@ -446,6 +446,18 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   **本步無部署期動作**（加固面 diff 為空，八份 unit 逐字不變）。
   ⚠️ **落地之後這條探針的 `workspace-write` 那一列仍然是紅的**——那是 #716 未解的
   另一半，不是回歸。
+- **#716（選項 B 的前置：出口網路管制）新增**：新增 **4e-2i「出口網路管制」**
+  ＋ **一份新的服務 unit**（`cortex-egress-proxy.service`，`User=cortex-egress`）
+  ＋ **六份 job unit 需重落**（四份加 `IPAddressDeny`／`IPAddressAllow`／六個
+  `Environment=*_PROXY=`；六份都加 `InaccessiblePaths`／`TasksMax`／`MemoryMax`＋
+  `MemorySwapMax`）。**起因**：B 的裁決逐字帶著「出口網路不補就不要採 B」。實測
+  `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` 之下 job 的
+  `CREDS-READABLE / EGRESS-OPEN` ——**模型跑的任意命令可讀出自己的 token 並外傳，
+  一條命令兩步**。形態是 `IPAddressDeny=any` ＋ 專屬 loopback 位址上的 CONNECT proxy
+  （主機名白名單，由 `permgen.EXECUTOR_TOOLS` 的 `api_hosts` 機械導出）。
+  ⚠️ **部署順序**：先起 proxy、再落 job unit；回滾順序相反。
+  ⚠️ **gate 的兩份 unit 明示不受出口管制**（見該節的適用面表）。
+  → **67** 個 sudo 點、**259** 個驗證點。
 
 ---
 
@@ -3067,6 +3079,208 @@ python3 -m paulsha_cortex.trust_root inner-sandbox-probe four-way
 
 **回滾**：退回上一版 cortex（`build_codex_argv` 就回到「builder 一律 `workspace-write`」）。
 加固面無需動——本節從頭到尾沒有落檔變更。
+
+#### 4e-2i. 出口網路管制：`IPAddressDeny=any` ＋ 專屬 loopback 位址上的 proxy（#716 選項 B 的前置）
+
+> **這一節是 #716 選項 B 的前置條件，必須先落地。** 裁決逐字帶著一句「出口網路不補
+> 就不要採 B」，因此順序是**先補管制、再關內層**——中間不得存在「沒有內層沙箱且出口
+> 全開」的窗口。本節只做前半（出口管制）；argv 那半（`-s danger-full-access`）是另一
+> 張票。
+
+**起因（0819 實機，builder 的真實加固面複本、`unit_replica_properties()` 全量導出）**：
+
+```
+TCP 443       → OUTBOUND-OK ('1.1.1.1', 443)
+DNS           → rc=0
+模型 API      → curl https://api.openai.com/v1/models → http=401（＝連得到）
+loopback:22   → 連得上
+busctl --system list → rc=0（列得出整張匯流排）
+```
+
+合併「job 讀得到自己的 `~/.codex/auth.json`」（兩層都不擋，**而且不該擋**——R-6 的取捨
+逐字寫在 `permgen._HARDENING` 與 unit 註解上：token 過期必須 refresh 得回來），
+一次跑完的結論逐字是 `CREDS-READABLE keys=[...] / EGRESS-OPEN`：**模型跑的任意命令可
+讀出自己的 token 並外傳，一條命令兩步。**
+
+**要達成的性質**：**executor 連得到自己的模型 API，模型下的任意命令連不到別處。**
+
+**為什麼不是位址白名單**：`api.openai.com` 解到 Cloudflare（`162.159.140.245`／
+`172.66.0.243`）——CIDR 會漂，而且同一組位址上有無數其他站點。位址白名單**表達不出**
+上面那句話。
+
+**為什麼不用 codex 自帶的 managed proxy**：codex 0.147.0 確實內建整個
+`codex_network_proxy`（MITM、`allowed_domains`／`denied_domains`、
+`/etc/codex/managed_config.toml`），但功能描述逐字是 *“Apply network proxy restrictions
+to **sandboxed sessions** that already have network access.”*——它是套在**內層沙箱**上
+的限制，而 B 的前提就是關掉那一層；`codex features list` 逐字
+`network_proxy  experimental  false`；它的強制手段又是把一長串 `HTTP_PROXY`／
+`NPM_CONFIG_*`／`PIP_PROXY`… **注入子行程環境**，沒有內層沙箱時 `unset` 一下就繞過。
+⇒ **結構上不成立**，必須外掛一支由 systemd 強制到位的 proxy。
+
+**`respect_system_proxy` 不是前提**：`codex features list` 逐字
+`respect_system_proxy  under development  false`，讀起來像「預設不吃系統 proxy」。
+**實測否證**——旗標維持預設 false 時，`HTTPS_PROXY=http://127.0.0.1:<port> codex cloud
+list` 在 proxy log 上留下 `CONNECT chatgpt.com:443`。**三支 executor 都吃 proxy env**：
+
+| executor | proxy log 逐字 | 判定 |
+| --- | --- | --- |
+| `codex` | `CONNECT chatgpt.com:443` ALLOW ×17 | 吃 |
+| `claude` | `CONNECT api.anthropic.com:443` ×8、`CONNECT platform.claude.com:443` ×2 | 吃 |
+| `agy` | `CONNECT play.googleapis.com:443` ×4、`CONNECT antigravity-unleash.goog:443` ×2 | 吃 |
+
+**形態（兩層，缺一即退化）**：
+
+1. **核心層**（job unit）：`IPAddressDeny=any` ＋ `IPAddressAllow=<proxy 位址>/32`；
+2. **可用性層**（job unit）：`Environment=HTTPS_PROXY=`（大小寫兩套 ＋ `NO_PROXY=` 清空）；
+3. **proxy**：`cortex-egress-proxy.service`，`User=cortex-egress`，只放行
+   `permgen.egress_allowlist()` 的主機名（CONNECT exact match、只放 443）。
+
+> **位址為什麼不是 `127.0.0.1`**：`IPAddressAllow=` 沒有埠的概念。0819 實測
+> `IPAddressAllow=127.0.0.1/32` 之下 job 連得到 `REACH-OK docker-tcp-2375`
+> ——**未認證的 docker daemon TCP API ＝ 宿主 root**。改綁專屬位址（`127.0.7.16`）後
+> 同一條變 `REACH-BLOCKED docker-tcp-2375@127.0.0.1 TimeoutError`。
+
+```bash
+# 🔧 sudo（一次性）：proxy 的專屬服務帳號。**不得**是任何 job 帳號、不得是 Manager。
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin cortex-egress
+#   驗：getent passwd cortex-egress
+
+# 🔧 sudo：落 proxy 的 unit（**產生器出，不手寫**）
+python3 -m paulsha_cortex.trust_root unit four-way --egress-proxy \
+  | sudo tee /etc/systemd/system/cortex-egress-proxy.service >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now cortex-egress-proxy.service
+
+# 🔧 sudo：**先起 proxy、再落 job unit**。順序不可顛倒——先落 job unit 會讓
+#    IPAddressDeny=any 在沒有出口的情況下生效，症狀是「模型 API 逾時」。
+python3 -m paulsha_cortex.trust_root unit four-way --job              | sudo tee /etc/systemd/system/cortex-job@.service >/dev/null
+python3 -m paulsha_cortex.trust_root unit four-way --job --profile jit | sudo tee /etc/systemd/system/cortex-job-jit@.service >/dev/null
+python3 -m paulsha_cortex.trust_root unit four-way --review-job              | sudo tee /etc/systemd/system/cortex-reviewer-job@.service >/dev/null
+python3 -m paulsha_cortex.trust_root unit four-way --review-job --profile jit | sudo tee /etc/systemd/system/cortex-reviewer-job-jit@.service >/dev/null
+python3 -m paulsha_cortex.trust_root unit four-way --gate-job              | sudo tee /etc/systemd/system/cortex-gate-job@.service >/dev/null
+python3 -m paulsha_cortex.trust_root unit four-way --gate-job --profile jit | sudo tee /etc/systemd/system/cortex-gate-job-jit@.service >/dev/null
+sudo systemctl daemon-reload
+```
+
+```bash
+# ✅ 驗證 1：proxy 實際生效的設定與白名單（純讀，零 sudo）
+/opt/cortex/venv/bin/cortex egress-proxy --check
+#   期望：bind 與 job unit 的 IPAddressAllow 指到**同一個位址**；白名單逐條列出，
+#         未實機量測的格子帶 `⚠ 未實機量測`。
+python3 -m paulsha_cortex.trust_root egress-allowlist
+#   ⚠️ 兩份輸出必須一致——它們是**同一支函式**（permgen.egress_allowlist()）。
+#      不一致代表部署樹的 cortex 與這裡的 repo 不同版，先對齊再往下。
+
+# ✅ 驗證 2：proxy 起得來、綁在該綁的位址上
+systemctl is-active cortex-egress-proxy.service
+sudo ss -ltnp | grep "$(python3 -c 'from paulsha_cortex.trust_root import permgen as p; print(p.EGRESS_PROXY.bind_address)')"
+#   期望：active；LISTEN 在專屬位址上，**不是** 0.0.0.0、**不是** 127.0.0.1。
+journalctl -u cortex-egress-proxy.service -n 5 --no-pager
+#   期望第一行逐字：egress-proxy listening bind='<位址>:<埠>' hosts=<N>
+
+# ✅ 驗證 3：executor 走得出去（**在真實加固面下**；先貼第 4e-2 步的 psc_run_under）
+psc_run_under cortex-job-jit /usr/bin/curl -sS -o /dev/null \
+  -w 'chatgpt http=%{http_code}\n' --max-time 25 \
+  https://chatgpt.com/backend-api/codex/responses
+#   0819 實跑（產生器產出的 unit、54 條 property、真 worktree instance）：`chatgpt http=405`
+#   ✅ 405 是**成功**：GET 打在只收 POST 的端點上，能拿到 405 就代表 TLS 通到了對端。
+
+# ✅ 驗證 4：白名單外連不出去
+psc_run_under cortex-job-jit /usr/bin/curl -sS -o /dev/null -w 'http=%{http_code}\n' \
+  --max-time 25 https://example.com/
+#   0819 實跑逐字：`curl: (56) CONNECT tunnel failed, response 403`，rc=56
+
+# ✅ 驗證 5（**這一條才是本節的判準**）：模型下的任意命令繞不過去
+psc_run_under cortex-job-jit /usr/bin/env -u HTTPS_PROXY -u HTTP_PROXY \
+  -u https_proxy -u http_proxy /usr/bin/python3 -c '
+import socket
+for h in ["162.159.140.245","172.66.0.243","1.1.1.1","140.82.121.4"]:
+    try:
+        s=socket.create_connection((h,443),timeout=6); print("DIRECT-OK",h); s.close()
+    except Exception as e: print("DIRECT-BLOCKED",h,type(e).__name__,str(e))
+'
+#   0819 實跑：四條全 `DIRECT-BLOCKED … TimeoutError timed out`
+#   ⛔ 任何一條 `DIRECT-OK` ⇒ IPAddressDeny 沒生效，**停下來**——此時 B 的前置不成立。
+
+# ✅ 驗證 6：proxy 自己的拒絕面
+psc_run_under cortex-job-jit /usr/bin/python3 -c '
+import socket
+P=("'"$(python3 -c 'from paulsha_cortex.trust_root import permgen as p; print(p.EGRESS_PROXY.bind_address)')"'",'"$(python3 -c 'from paulsha_cortex.trust_root import permgen as p; print(p.EGRESS_PROXY.port)')"')
+for req,label in [(b"CONNECT chatgpt.com:22 HTTP/1.1\r\n\r\n","白名單主機但非 443"),
+                  (b"GET http://chatgpt.com/ HTTP/1.1\r\n\r\n","明文 forward"),
+                  (b"CONNECT 1.1.1.1:443 HTTP/1.1\r\n\r\n","IP 字面量")]:
+    s=socket.create_connection(P,timeout=8); s.sendall(req)
+    print(label, s.recv(200).split(b"\r\n")[0].decode()); s.close()
+'
+#   0819 實跑逐字：
+#     白名單主機但非 443  HTTP/1.1 403 Forbidden
+#     明文 forward        HTTP/1.1 405 Method Not Allowed
+#     IP 字面量           HTTP/1.1 403 Forbidden
+
+# ✅ 驗證 7：D-Bus／docker.sock（圍堵條款，**全部** job unit 含 gate）
+psc_run_under cortex-job-jit /usr/bin/busctl --system list
+#   期望逐字：`Failed to connect to bus: Permission denied`，rc=1
+#   （不加該條時同一條 rc=0 且列得出 31 列——這是本節之前的現況）
+
+# ✅ 驗證 8：資源天花板**成對**生效
+psc_run_under cortex-job-jit /usr/bin/python3 -c '
+b=bytearray(200*1024*1024)
+for i in range(0,len(b),4096): b[i]=1
+print("ALLOC-OK 200MB")'
+#   ⚠️ 這一條在 MemoryMax=25% 之下**會過**（25% 遠大於 200MB）——它不是驗天花板，
+#      是驗「天花板成對」的**方法**。要驗成對，臨時把兩條壓到 64M 重跑：
+#        只有 MemoryMax=64M          → `ALLOC-OK 200MB`（0819 實測；swap 無上限）
+#        MemoryMax=64M ＋ MemorySwapMax=0 → rc=1（被 OOM 收掉）
+#      落檔的 unit 兩條**必須同時存在**；只有其中一條時天花板形同虛設。
+
+# ✅ 驗證 9：**反向不變式**——半套的出口管制在產生複本的那一刻就要紅
+sudo systemctl cat cortex-job-jit@.service \
+  | grep -v '^Environment=HTTPS_PROXY=' \
+  | python3 -m paulsha_cortex.trust_root unit-replica - --instance probe
+#   期望：**stdout 空、rc≠0**，訊息逐字提到「出口被關掉、卻沒有給 executor 那條合法
+#         的路」。這條是 `psc_run_under` 的入口，因此它同時保護 runbook 之後的每一條驗證。
+```
+
+**適用面（逐份 unit 寫清楚）**：
+
+| unit | 出口管制 | 圍堵條款 | 理由 |
+| --- | --- | --- | --- |
+| `cortex-job@` / `-jit`（builder） | ✅ | ✅ | 跑模型、持 codex 憑證 |
+| `cortex-reviewer-job@` / `-jit`（reviewer／planner） | ✅ | ✅ | 同上；**今天是好的 read-only lane，實測 `chatgpt http=405` 不受影響** |
+| `cortex-gate-job@` / `-jit` | ❌（明示） | ✅ | gate 跑 operator 宣告的命令，可能需要套件來源（PyPI／npm）——**本票一條都沒量**。gate 帳號**不持有任何模型憑證**，出口曝險不同級。收它是另一張票 |
+| `cortex-manager.service` | ❌ | ❌ | Manager 要連 GitHub，且 `systemctl start` 走 **D-Bus**——`InaccessiblePaths=/run/dbus` 會直接切斷派工 |
+| `cortex-monitor.service` | ❌ | ❌ | 同帳號、同一條授權線內側 |
+| `cortex-egress-proxy.service`（新） | n/a（它就是那條出口） | ✅ | 收斂手段是白名單不是位址 |
+
+**已知殘留（逐條，不藏起來；產生器由 `permgen.EGRESS_RESIDUAL_RISK` 印進 unit 註解）**：
+
+1. 綁 `0.0.0.0` 的本機服務仍應答 proxy 位址（`0.0.0.0` 涵蓋整個 127/8）。0819 量到
+   `sshd:22` 與 `:3003`；綁 `127.0.0.1` 的（含 docker TCP `2375`）**被排除**。
+2. 白名單是主機名級 ⇒ 「模型 API 本身」仍是一條外傳通道。這條在任何形態下都存在，
+   本節不宣稱關掉它；本節關掉的是「送去**別的**地方」。
+3. proxy 在 loopback 上 ⇒ 本機任何帳號都連得到它。它不持憑證、不注入 header。
+4. job 端 DNS 在 `IPAddressDeny=any` 下**整個不通**（`PermissionError: [Errno 1]`／
+   `gaierror: [Errno -3]`）。CONNECT proxy 不受影響，但**直接**依賴 DNS 的 job 內命令會失敗。
+
+**未量到／量到不生效（不要當成已解）**：
+
+- `SocketBindDeny=any` — **量到不生效**：systemd 接受（rc=0），但
+  `bind(('0.0.0.0',18081))`／`bind(('127.0.0.1',18082))` 皆逐字 `BIND-OK`，與對照組相同。
+  成因是本機 `systemctl --version` 逐字 `-BPF_FRAMEWORK`。**因此沒有放進 unit**——
+  放進去是安慰劑。目標機若是 `+BPF_FRAMEWORK`，重量之後再加。
+- `RestrictFileSystems=` — **未量到**（不是量到不生效）：同一個 `-BPF_FRAMEWORK` 下
+  unit 仍起得來，「起得來」不承載任何語意。本節不使用它。
+- `auth.openai.com`／`api.github.com`／`api.githubcopilot.com`／`accounts.google.com`
+  四格**未實機看到被請求**（`--check` 會標）。`agy` 的量測走到互動式登入就逾時，
+  **它在已登入狀態下真正的模型 API 主機沒有被量到**——走 agy 之前先重量一次。
+- 真實 `codex exec` 只跑過**一次**（`-s read-only` ＋ legacy landlock，rc=0、
+  10,659 tokens）。`workspace-write` 那一支在 B 的 argv 半落地之前跑不起來（#716 的
+  `linux_run_main.rs:318` panic），因此**沒有**在出口管制下量過 builder 的寫入形態。
+
+**回滾**：`sudo systemctl disable --now cortex-egress-proxy.service`，並把六份 job unit
+退回上一版產生器的產物（`git checkout` 舊版 cortex 後重跑第 5-2 步）。
+⚠️ **回滾順序與部署相反**：先退 job unit（拿掉 `IPAddressDeny`），再停 proxy——
+反過來會留下一段「出口全關、executor 也連不上」的空窗。
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 
