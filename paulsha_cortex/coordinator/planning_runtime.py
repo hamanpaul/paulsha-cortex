@@ -17,15 +17,18 @@ from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 from ..config import paths
-from . import job_runner, planning_probe_cache
+from . import job_runner, job_workspace, planning_probe_cache
 from .launcher import build_agy_argv
 from .model_identities import (
     AGY_MODEL_ID,
+    PLANNING_DIAGNOSTIC_LIMIT,
     CapabilityProbe,
     IdentityRegistry,
     ModelIdentity,
+    attach_probe_diagnostic,
     load_model_identities,
     probe_agy_capability,
+    probe_exception_diagnostic,
     stdout_excerpt,
 )
 from .planning import echoed_identifier_hint, question_pack_echo_hint, required_heading_hint
@@ -43,7 +46,42 @@ class ProductionPlanningRuntime:
     primary_integrator: Callable[[Mapping[str, object], Mapping[str, object]], object]
 
 
-def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree: Path) -> list[str]:
+def planning_last_message_path(log_anchor: str | Path) -> Path:
+    """planning 呼叫的 `--output-last-message` 落點——**全 repo 唯一的推導點**（#727）。
+
+    這一支刻意只是 :func:`job_workspace.job_last_message_path` 的轉呼叫，一個判斷都
+    沒有：規則就是 #714 已經替 builder lane 回答過的那一條（「該 job 自己那份 log 的
+    兄弟檔」），planning 沒有資格有第二條。取一個名字只是為了讓兩個 invoker 的呼叫點
+    在 grep 上是同一個字，並讓「planning 這條路的 log 錨點是誰」有地方寫。
+
+    - job 模式：錨點是 `<planning-logs>/<instance>/planning.log`（`spool_slot` 建的
+      那一格，job 已有 `wx`、Manager 是 owner）；
+    - direct 模式：錨點是 `<一次性 tempdir>/planning.log`。direct 下沒有真的 log 檔
+      ——stdout 由 `capture_output=True` 就地取回——但**落點規則不因此分岔**，
+      分岔正是 #714 缺陷 2 的成因本身。
+    """
+
+    return job_workspace.job_last_message_path(log_anchor)
+
+
+def _planning_argv(
+    identity: ModelIdentity,
+    prompt: str,
+    temp_dir: str,
+    worktree: Path,
+    *,
+    last_message_path: str | Path,
+) -> list[str]:
+    """一次 planning 呼叫的 executor argv。
+
+    `last_message_path` 是**必填的關鍵字參數**，而且本函式不對它做任何推導——#714
+    缺陷 2 的形狀逐字是「codex 的 `-o` 指著一個 job 寫不進去的路徑」，而它之所以
+    在 builder lane 修好之後還能在 planning 這條路重演，正是因為這裡曾經自己組過
+    `Path(temp_dir)/"last.json"`（**第二份落點決定**）。留一個有預設值的參數等於
+    把那份決定藏起來，因此沒有預設值：呼叫端必須經
+    :func:`planning_last_message_path` 交出答案。
+    """
+
     if identity.executor == "agy":
         return build_agy_argv(
             prompt=prompt,
@@ -56,7 +94,7 @@ def _planning_argv(identity: ModelIdentity, prompt: str, temp_dir: str, worktree
     if identity.executor == "codex":
         return [
             "codex", "exec", prompt, "--json", "--sandbox", "read-only",
-            "--model", identity.model_id, "-o", str(Path(temp_dir) / "last.json"),
+            "--model", identity.model_id, "-o", str(last_message_path),
             "-C", str(worktree), "--skip-git-repo-check",
         ]
     if identity.executor == "claude":
@@ -758,19 +796,136 @@ def _find_json_object(text: str, *, allow_partial: bool = False) -> object | Non
     return None
 
 
+#: codex 的 `--json` 串流事件裡，模型輸出本體可能落在哪一格（#727）。
+#:
+#: 判準與 `manager._extract_terminal_json()` 逐字同源——那是本 repo 已經在 build／
+#: review 兩條路上跑了很久的那一份，jsonl 端「由尾端往回找」也是它建立的形態。這裡
+#: 不重寫一份判準，只把「取出哪一個字串欄位」這一步列成表。
+def _stream_event_texts(event: Mapping[str, object]):
+    """一筆串流事件 → 可能承載模型輸出本體的字串欄位（可能零個）。
+
+    **錯誤事件一律零產出。** codex 的錯誤訊息本身常常內嵌 JSON（0819 實機逐字：
+    `unexpected status 400 Bad Request: {"detail":"…"}`），而 `_find_json_object(...,
+    allow_partial=True)` 會很樂意把那個 `{"detail":…}` 抽出來當成「模型輸出本體」
+    ——一次硬失敗於是變成一份看起來像資料的錯誤資料，下游只會報 `identity-mismatch`。
+    這與 `manager._unwrap_structured_output` 拒絕寬鬆解析是同一條理由。
+    """
+
+    kind = event.get("type")
+    if isinstance(kind, str) and "error" in kind:
+        return
+    item = event.get("item")
+    if kind == "item.completed" and isinstance(item, Mapping):
+        if item.get("type") == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str):
+                yield text
+    data = event.get("data")
+    if kind == "assistant.message" and isinstance(data, Mapping):
+        content = data.get("content")
+        if isinstance(content, str):
+            yield content
+    for key in _ENVELOPE_KEYS:
+        value = event.get(key)
+        if isinstance(value, str):
+            yield value
+
+
+def _extract_stream_json(stdout: str) -> object | None:
+    """codex `--json` 的 **JSONL 串流** → 模型輸出本體；解不出回 ``None``（不拋）。
+
+    ## 為什麼非有這條不可（#727）
+
+    `_find_json_object()` 的頂層語意是嚴格的「整串剛好是一個 JSON 物件」（#670 刻意
+    收窄的，見該函式 docstring）。codex 的 `--json` 輸出是**每行一個事件**的 JSONL，
+    因此整串 `json.loads` 必敗 ⇒ 候選迴圈全滅 ⇒ `ValueError: planning launcher
+    returned no JSON object`。**串流備援名義上存在、實際上從來沒有能用過**，於是
+    `-o` 落檔一旦寫不進去（或 Manager 讀不回來），失敗看起來與「模型什麼都沒吐」
+    完全一樣——#727 拖了四輪派工的原因逐字就是這個不可辨識性。
+
+    ## 由尾端往回找
+
+    比照 `manager._extract_terminal_json()`：codex **每次**都會先印一筆
+    `use_legacy_landlock` 的 deprecation `item.type=error`（#714 實跑逐字記過），
+    由頭往下找會先撞到它。由尾端往回找則先看到 `turn.completed`（沒有文字欄位、
+    自然跳過），再看到 `agent_message`。開頭那筆 error item 因此**結構上**不可能
+    遮住輸出本體，而不是靠一條「跳過 error」的特例。
+
+    解析不動的行一律跳過：job 模式下這份 stdout 是 shim 把 fd 1／fd 2 併流之後的
+    產物（`planning_job` 的 R-5），中間夾雜非 JSON 是常態。
+    """
+
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, Mapping):
+            continue
+        for text in _stream_event_texts(event):
+            value = _find_json_object(text, allow_partial=True)
+            if isinstance(value, dict):
+                return value
+    return None
+
+
 def _extract_json(stdout: str, output_path: Path) -> object:
-    """就地讀取第二輸出候選（codex 的 `-o last.json`）後交給共用抽取層。
+    """就地讀取第二輸出候選（codex 的 `-o`）後交給共用抽取層。
 
     issue #683：抽取本身移到 `_extract_json_candidates`，因為降權之後
     「第二候選是哪來的」由 invoker 決定（in-process 是 tempdir 裡的檔案，
     job 模式下 Manager 讀不到 job-owned scratch，只剩 stdout——design D-j 的
     退步）。本函式維持既有簽章，供直接持有 `output_path` 的呼叫端使用。
+
+    #727：落點本身改由 :func:`planning_last_message_path` 導出（job 模式因此
+    **讀得回來**，D-j／R-2 的退步在 planning 這條路上解除），讀不動時退成 ``None``
+    ——那一格的狀態另由 `_last_message_marker()` 進診斷，不會被靜默吸收。
     """
 
-    output_text = (
-        output_path.read_text(encoding="utf-8") if output_path.is_file() else None
-    )
-    return _extract_json_candidates(stdout, output_text)
+    return _extract_json_candidates(stdout, _read_last_message(output_path))
+
+
+def _read_last_message(output_path: Path) -> str | None:
+    """`-o` 那一格的內容；不存在／讀不動／**空檔**一律 ``None``。
+
+    空檔也回 ``None`` 是刻意的：job 模式下那一格由 Manager **預建**（`0620` 空檔，
+    見 `spool_slot.preseed_job_writable_file`），因此「檔案存在」不再蘊含「job 寫過
+    東西」。`output_text` 的語意是「有沒有第二候選」，空字串當候選只會多繞一圈。
+    **可辨識性不因此損失**：`_last_message_marker()` 仍逐字回報 `bytes=0`，而
+    `<absent>`／`bytes=0`／`<unresolved:PermissionError>` 是三件不同的事。
+    """
+
+    try:
+        if not output_path.is_file():
+            return None
+        text = output_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
+
+
+def _last_message_marker(output_path: Path) -> str:
+    """`-o` 落點的**唯讀**狀態標記：``<path>|<state>``（#727 驗收第三條）。
+
+    詞彙沿用 `planning_probe_cache` 的兩個哨兵：`<absent>`＝「查得到答案，答案是
+    沒有這個檔」；`<unresolved:X>`＝「連查都查不動」（EACCES ⇒ 落點在那一格但
+    Manager 沒有讀取權，正是 #638 缺陷 2 的形狀）。有檔時帶 `bytes=N`——0 位元組
+    與「模型真的沒吐」是兩件事，而修法前它們同樣不可分辨。
+
+    **只回答狀態，不改變任何決策**：它進的是 diagnostic 欄，沒有任何 probe 因為
+    這一格而從 not-ready 變成 ready。
+    """
+
+    try:
+        info = output_path.stat()
+    except FileNotFoundError:
+        return f"{output_path}|<absent>"
+    except OSError as exc:
+        return f"{output_path}|<unresolved:{type(exc).__name__}>"
+    return f"{output_path}|bytes={info.st_size}"
 
 
 def _extract_json_candidates(stdout: str, output_text: str | None) -> object:
@@ -779,6 +934,11 @@ def _extract_json_candidates(stdout: str, output_text: str | None) -> object:
     JSON 抽取刻意**留在共用層**、不進 invoker：兩個 invoker 吃同一份
     envelope 處理與 fail-closed 判準（design D1）。本 repo 已經在 #401／#516／
     #520 買過三次「同一件事兩份真相」的單。
+
+    #727 起多了**第三個**候選：stdout 當成 codex 的 `--json` JSONL 串流解
+    （:func:`_extract_stream_json`）。它排在最後，因此「兩者皆有」時第二輸出仍然
+    優先、既有行為逐字不變；它存在的理由是**可辨識性**——沒有它，「落檔那條斷了」
+    與「模型沒輸出」在症狀上是同一個 `ValueError`。
     """
 
     candidates = [stdout.strip()]
@@ -822,6 +982,12 @@ def _extract_json_candidates(stdout: str, output_text: str | None) -> object:
             )
             raise ValueError(f"planning launcher result is not JSON: {detail}")
         return value
+    # #727：兩個「整串就是一個 JSON 物件」的候選都不成立時，最後把 stdout 當成
+    # codex 的 `--json` JSONL 串流解一次。位置刻意在最後：既有的兩個候選一個都沒
+    # 被改動過語意，而串流這條只在它們全滅時才有機會發言。
+    streamed = _extract_stream_json(stdout)
+    if isinstance(streamed, dict):
+        return streamed
     # 2026-08-14 實測：agy 服務暫時性 503 時**印錯誤文字但 exit 0**
     # （`Error: Eligibility check failed: UNAVAILABLE (code 503)`），launcher
     # 因此走到這裡。修法前這行不帶任何 stdout 內容，錯誤文字隨 temp_dir 一起
@@ -924,14 +1090,25 @@ class PlanningInvocation:
 class PlanningOutcome:
     """一次呼叫的原始結果——**不含任何解讀**。
 
-    `output_text` 是 codex `-o last.json` 這個第二輸出候選的內容（無則 ``None``）。
-    它必須在這裡被讀出來，因為 in-process 的落點在 invoker 自己的一次性 tempdir
-    裡，invoker 一返回就消失；job 模式下 Manager 讀不到 job-owned scratch，這一格
-    恆為 ``None``（design D-j 的 R-2 退步）。
+    `output_text` 是 codex `-o` 這個第二輸出候選的內容（無則 ``None``）。它必須在
+    這裡被讀出來，因為 in-process 的落點在 invoker 自己的一次性 tempdir 裡，invoker
+    一返回就消失。
 
-    `diagnostics` 本票不產出任何內容（direct 模式沒有第二個資訊來源）；票 E 的
-    D8 會在這裡放 `unit`／`hardening_profile`／`resolved_binary`，讓
-    `executor-silent-exit` 這種「連錯誤訊息都沒有」的失敗有方向可查。
+    **#727 起 job 模式這一格不再恆為 ``None``。** design 的 D-j／R-2 退步（「落點在
+    job 的 `PrivateTmp` ⇒ Manager 讀不到」）成立的前提是「落點只能選 `PrivateTmp`」
+    ——而那是 `_planning_argv` 自己組第二份字面量造成的，不是結構限制。落點改由
+    :func:`planning_last_message_path` 從該 job 那份 log 導出之後，那一格是 Manager
+    建的、Manager 讀得回來（`spool_slot.preseed_job_writable_file`），R-2 因此在
+    planning 這條路上解除。job 端寫不進去（或 Manager 讀不動）時仍退回 ``None``，
+    而**退回哪一種**由 `last_message` 逐字回答。
+
+    `last_message` 是 `-o` 落點的**唯讀狀態標記**（``<path>|<state>``，見
+    `_last_message_marker()`）。它存在的唯一理由是可辨識性：#727 之前「落檔那條斷了」
+    與「模型沒輸出」在 operator 眼裡是同一個 `ValueError`。
+
+    `diagnostics` 由票 E 的 D8 放 `unit`／`hardening_profile`／`resolved_binary`，讓
+    `executor-silent-exit` 這種「連錯誤訊息都沒有」的失敗有方向可查；direct 模式沒有
+    第二個資訊來源，維持空 dict。
     """
 
     returncode: int | None
@@ -939,6 +1116,7 @@ class PlanningOutcome:
     stderr: str | None = None
     output_text: str | None = None
     diagnostics: Mapping[str, str] = field(default_factory=dict)
+    last_message: str | None = None
 
 
 class PlanningInvoker(Protocol):
@@ -998,8 +1176,19 @@ class InProcessPlanningInvoker:
             _copy_planning_sandbox(worktree, baseline)
             shutil.copytree(baseline, sandbox, symlinks=True)
             sandbox_before = _tree_snapshot(sandbox)
-            output_path = Path(temp_dir) / "last.json"
-            argv = _planning_argv(identity, invocation.prompt, temp_dir, sandbox)
+            # #727：落點只推導一次，argv 與讀回端共用同一個物件——修法前這裡與
+            # `_planning_argv` **各自**組了一份 `Path(temp_dir)/"last.json"`，那是
+            # 「同一件事兩份真相」在 direct 模式的實例（job 模式那一份則直接寫錯了）。
+            output_path = planning_last_message_path(
+                Path(temp_dir) / job_workspace.PLANNING_JOB_LOG_FILENAME
+            )
+            argv = _planning_argv(
+                identity,
+                invocation.prompt,
+                temp_dir,
+                sandbox,
+                last_message_path=output_path,
+            )
             run_kwargs: dict[str, object] = {}
             if identity.executor == "claude":
                 # 僅 claude 路徑帶 env 覆寫；其他 executor（codex/agy）維持不帶，
@@ -1023,19 +1212,24 @@ class InProcessPlanningInvoker:
                 stdout = getattr(raw, "stdout", None)
                 # 第二候選必須在 tempdir 消失之前讀出來（見 `PlanningOutcome`）。
                 # 讀取條件與修法前逐字相同：修法前 `_extract_json` 只在
-                # 「rc==0 且 stdout 是字串」時才被呼叫，因此 `last.json`
+                # 「rc==0 且 stdout 是字串」時才被呼叫，因此 `-o` 那一格
                 # 在失敗路徑上**從不被讀**。無條件讀會讓「檔案存在但讀不出來」
                 # （非 UTF-8、權限）在失敗路徑上換掉例外型別，而例外型別正是
-                # `_probe_identity` 的 `safe-probe-failed` diagnostic 唯一內容、
-                # 也是票 A `classify_probe_failure()` 的分類輸入。
+                # `classify_probe_failure()` 的分類輸入（#727 之後型別名仍然錨在
+                # diagnostic 的第 0 個 token，這條理由因此逐字不變）。
+                #
+                # #727：`_read_last_message()` 把讀取本身收成 fail-soft，落點狀態
+                # 另由 `_last_message_marker()` **無條件**回答——那一格在失敗路徑上
+                # 才最有價值（「寫進去了沒」正是四輪派工都問不出來的那件事）。
                 output_text: str | None = None
-                if returncode == 0 and isinstance(stdout, str) and output_path.is_file():
-                    output_text = output_path.read_text(encoding="utf-8")
+                if returncode == 0 and isinstance(stdout, str):
+                    output_text = _read_last_message(output_path)
                 outcome = PlanningOutcome(
                     returncode=returncode,
                     stdout=stdout,
                     stderr=getattr(raw, "stderr", None),
                     output_text=output_text,
+                    last_message=_last_message_marker(output_path),
                 )
             except BaseException as exc:
                 failure = exc
@@ -1165,6 +1359,7 @@ def _invoke_json(
             run_id=run_id,
         )
     )
+    detail = _outcome_diagnostic(outcome)
     if outcome.returncode != 0 or not isinstance(outcome.stdout, str):
         # issue #701：修法前這句只有 executor/model 兩個常數——rc 是幾、模型／
         # CLI 到底印了什麼，全部隨 invoker 的 tempdir 一起消失。questioner／
@@ -1173,12 +1368,50 @@ def _invoke_json(
         #
         # **只取 stdout，不取 stderr**——這是票 A（PR #688）已寫下、本票沿用的
         # 邊界：stderr 是最容易夾帶路徑、env 與憑證錯誤原文的通道。
-        raise ValueError(
-            f"planning launcher failed: {identity.executor}/{identity.model_id} "
-            f"rc={outcome.returncode} stdout="
-            + (stdout_excerpt(outcome.stdout) if isinstance(outcome.stdout, str) else "<no stdout>")
+        raise attach_probe_diagnostic(
+            ValueError(
+                f"planning launcher failed: {identity.executor}/{identity.model_id} "
+                f"rc={outcome.returncode} stdout="
+                + (
+                    stdout_excerpt(outcome.stdout)
+                    if isinstance(outcome.stdout, str)
+                    else "<no stdout>"
+                )
+            ),
+            detail,
         )
-    return _extract_json_candidates(outcome.stdout, outcome.output_text)
+    try:
+        return _extract_json_candidates(outcome.stdout, outcome.output_text)
+    except Exception as exc:
+        # #727：抽取失敗的例外**原封往上拋**（型別名是 `classify_probe_failure()`
+        # 的分級輸入，換成自訂子類會讓三分整組落 unclassified），只多掛一格唯讀的
+        # 有界上下文。`_probe_identity` 那條路因此不再只留下 `ValueError` 五個字。
+        raise attach_probe_diagnostic(exc, detail) from None
+
+
+def _outcome_diagnostic(outcome: PlanningOutcome) -> str:
+    """一次呼叫的**有界**上下文：`rc=` ／ `stdout=<節錄>` ／ `last_message=<路徑>|<狀態>`。
+
+    三格各自回答四輪派工都問不出來的一個問題：跑起來了嗎（rc）、印了什麼（stdout
+    節錄）、`-o` 那一格到底寫進去了沒（落點狀態）。第三格是 #727 的關鍵——沒有它，
+    「落檔那條斷了」與「模型什麼都沒吐」在 evidence 上是同一句話。
+
+    **stderr 不取**（票 A 的邊界，#727 沒有動它）；stdout 節錄的預算留給整體上限
+    :data:`PLANNING_DIAGNOSTIC_LIMIT`，另外兩格是我們自己算出來的短字串。
+    """
+
+    parts = [f"rc={outcome.returncode}"]
+    stdout = outcome.stdout
+    parts.append(
+        "stdout=" + (stdout_excerpt(stdout) if isinstance(stdout, str) else "<no stdout>")
+    )
+    if outcome.last_message:
+        parts.append(f"last_message={outcome.last_message}")
+    for key in ("unit", "hardening_profile", "resolved_binary"):
+        value = outcome.diagnostics.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    return stdout_excerpt(" ".join(parts), limit=PLANNING_DIAGNOSTIC_LIMIT)
 
 
 def _probe_failure(identity: ModelIdentity, exc: BaseException) -> CapabilityProbe:
@@ -1193,7 +1426,11 @@ def _probe_failure(identity: ModelIdentity, exc: BaseException) -> CapabilityPro
     回族名，這裡讓它原樣通過」），因此這裡把族名放進 `reason`、把 detail 放進
     `diagnostic`，分類器原樣採用，不需要第二張表。
 
-    direct 模式逐字不變——那條路上不會出現 `PlanningJobError`。
+    **#727：`safe-probe-failed` 那一格不再只有型別名。** `model_identities.
+    probe_exception_diagnostic()` 把型別名錨在第 0 個 token（分級輸入逐字不變），
+    後面接 `_invoke_json` 掛上的有界上下文（rc／stdout 節錄／`-o` 落點狀態）。
+    修法前 codex 那一格在四輪派工上留下的全部資訊是 `ValueError` 五個字，而它是
+    唯一有憑證、剖面也正確的 planner 候選。
     """
 
     from .planning_job import PlanningJobError
@@ -1213,7 +1450,7 @@ def _probe_failure(identity: ModelIdentity, exc: BaseException) -> CapabilityPro
         identity.model_id,
         identity.independence_domain,
         "safe-probe-failed",
-        type(exc).__name__,
+        probe_exception_diagnostic(exc),
     )
 
 

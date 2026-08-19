@@ -786,8 +786,15 @@ _PROBE_REASON_FAMILIES: dict[str, str] = {
     PLANNING_FAILURE_OUTPUT: PLANNING_FAILURE_OUTPUT,
 }
 
-#: `_probe_identity` 的 `safe-probe-failed` 只帶例外**型別名**（不帶訊息），
-#: 那個型別名就是唯一能機械分辨「executor 死了」還是「輸出不合約」的線索。
+#: `_probe_identity` 的 `safe-probe-failed` diagnostic 的**第一個 token** 是例外型別名，
+#: 而它就是唯一能機械分辨「executor 死了」還是「輸出不合約」的線索。
+#:
+#: **#727 之前那是 diagnostic 的全部內容**，而代價逐字記在 #727：codex 是唯一有憑證、
+#: 剖面也對的 planner 候選，它連續四輪派工留下的全部資訊是 `ValueError` 五個字，
+#: 定位得靠 `sudo cat planning-probe-cache.json` → 手動重跑 probe → 把串流餵進
+#: `_extract_json`。#727 起型別名後面接一段**有界**上下文（rc、stdout 節錄、`-o`
+#: 落點在不在），型別名本身**錨在第 0 個 token**——分級的輸入因此逐字不變
+#: （票 A 的 `grade=` 錨在開頭是同一條理由）。
 _PROBE_FAILED_REASON = "safe-probe-failed"
 _ENVIRONMENT_EXCEPTION_NAMES = frozenset(
     {
@@ -827,9 +834,12 @@ def classify_probe_failure(reason: str | None, diagnostic: str | None = None) ->
     if not reason:
         return PLANNING_FAILURE_UNCLASSIFIED
     if reason == _PROBE_FAILED_REASON:
-        # diagnostic 是 `type(exc).__name__`，由 `_probe_identity` 產生，
-        # 不含例外訊息，也就不含路徑／env／憑證。
-        name = (diagnostic or "").strip()
+        # diagnostic 由 `probe_exception_diagnostic()` 產生，**第 0 個 token 恆為
+        # `type(exc).__name__`**；#727 起後面可能再接一段有界上下文（rc／stdout 節錄／
+        # `-o` 落點狀態）。分級只看第 0 個 token，因此那段上下文加不加、加多少，
+        # 對三分結果一個位元都不影響——這正是「診斷是唯讀資訊，不得讓任何 probe 從
+        # not-ready 變成 ready」那條保守方向在分類器這一側的落點。
+        name = (diagnostic or "").strip().split(" ", 1)[0]
         if name in _ENVIRONMENT_EXCEPTION_NAMES:
             return PLANNING_FAILURE_EXECUTOR
         if name in _OUTPUT_EXCEPTION_NAMES:
@@ -911,6 +921,62 @@ def stdout_excerpt(text: str, *, limit: int = STDOUT_EXCERPT_LIMIT) -> str:
     return collapsed[:limit] + "…"
 
 
+#: probe 失敗 diagnostic 的**全體**上限（#727）。沿用 repo 既有的 evidence 預算慣例
+#: ——`manager.RETRY_CONTEXT_EVIDENCE_LIMIT` 就是 2000，兩者相等由
+#: `tests/test_planner_probe_diagnostics_727.py` 釘住（本模組不 import `manager`：
+#: `manager` import 本模組，反向會成環）。
+#:
+#: 為什麼是「有界」而不是「完整」：這份字串會一路進 log／evidence／`blocking_reason`，
+#: 而 `CandidateRejection` 的欄位面契約是「沒有任何一個接得到 env、argv、檔案內容或
+#: stderr」。#727 沒有放寬那條——只取 **stdout**（job 模式下它是 shim 合併後的那一份，
+#: R-5 已記）與我們自己算出來的路徑，stderr 一個位元組都不取。
+PLANNING_DIAGNOSTIC_LIMIT = 2000
+
+#: `planning_runtime` 把「這次呼叫的 rc／stdout 節錄／`-o` 落點狀態」掛到即將往上拋的
+#: 例外身上時用的屬性名。
+#:
+#: **為什麼是掛屬性而不是換一個例外型別**：`classify_probe_failure()` 的分級輸入是
+#: `type(exc).__name__`（`ValueError` ⇒ 輸出不合約、`TimeoutExpired` ⇒ 環境）。包一層
+#: 自訂子類會讓型別名變成一個不在兩張表上的新名字 ⇒ 全部落 `unclassified` ⇒ 分級從
+#: `content`／`environment` 掉成 fail-closed 的未分類。診斷面的改善不得改動分級面，
+#: 因此原例外**原封不動**往上拋，只多帶一格唯讀的上下文。
+PROBE_DIAGNOSTIC_ATTR = "cortex_planning_diagnostic"
+
+
+def attach_probe_diagnostic(exc: BaseException, detail: str) -> BaseException:
+    """把有界上下文掛到 `exc` 上並原樣回傳（見 :data:`PROBE_DIAGNOSTIC_ATTR`）。"""
+
+    try:
+        setattr(exc, PROBE_DIAGNOSTIC_ATTR, detail)
+    except (AttributeError, TypeError):  # pragma: no cover - 內建例外都掛得上
+        pass
+    return exc
+
+
+def probe_exception_diagnostic(exc: BaseException) -> str:
+    """一次 probe 失敗的例外 → **有界**診斷字串（#727）。
+
+    形狀恆為 ``<ExcType>[ <bounded context>]``，型別名錨在第 0 個 token
+    （:func:`classify_probe_failure` 只看那一格）。上下文有兩個來源，皆為既有物：
+
+    - `PlanningJobError.detail`（job 模式）——`rc=…`／`unit=…`／`profile=…`／
+      `binary=…`／`version=…`／`seccomp_filter_fatal=…`／`log=<節錄>`。#727 之前
+      `probe_agy_capability` 對它只取 `type(exc).__name__`，於是實機 agy 那一格
+      逐字只剩 `PlanningJobError`——**族名對了、病因全丟**。
+    - :data:`PROBE_DIAGNOSTIC_ATTR`（`planning_runtime._invoke_json` 掛的）——
+      `rc=…`／`stdout=<節錄>`／`last_message=<路徑>|<狀態>`。最後那一格正是 #727
+      的關鍵：「落檔寫不進去／讀不回來」與「模型沒輸出」在症狀上本來完全無法區分。
+    """
+
+    name = type(exc).__name__
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, str) or not detail.strip():
+        detail = getattr(exc, PROBE_DIAGNOSTIC_ATTR, None)
+    if not isinstance(detail, str) or not detail.strip():
+        return name
+    return stdout_excerpt(f"{name} {detail}", limit=PLANNING_DIAGNOSTIC_LIMIT)
+
+
 def _normalize_model_token(value: str) -> str:
     """正規化 model id／顯示名，容忍 `agy models` 輸出格式（顯示名 vs kebab id、
     大小寫、空白/括號等標點差異）未來再次改版。"""
@@ -972,7 +1038,10 @@ def probe_agy_capability(
         listed_raw = process_runner(["agy", "models"], **common)
         listed_rc, listed_stdout, listed_stderr = _process_fields(listed_raw)
     except Exception as exc:
-        return _failed_agy("models-probe-failed", type(exc).__name__)
+        # #727：`type(exc).__name__` 對 job 模式等於把 `PlanningJobError.detail`
+        # （rc／unit／profile／binary／version／seccomp／log 節錄）整段丟掉——實機
+        # 逐字只剩 `PlanningJobError` 六個字。改走共用的有界投影。
+        return _failed_agy("models-probe-failed", probe_exception_diagnostic(exc))
     if listed_rc != 0:
         return _failed_agy(
             "models-probe-failed", _exit_diagnostic(listed_rc, listed_stdout, listed_stderr)
@@ -1009,7 +1078,7 @@ def probe_agy_capability(
         smoke_raw = process_runner(argv, **common)
         smoke_rc, smoke_stdout, smoke_stderr = _process_fields(smoke_raw)
     except Exception as exc:
-        return _failed_agy("smoke-failed", type(exc).__name__)
+        return _failed_agy("smoke-failed", probe_exception_diagnostic(exc))
     if smoke_rc != 0:
         return _failed_agy(
             "smoke-failed", _exit_diagnostic(smoke_rc, smoke_stdout, smoke_stderr)
@@ -1060,9 +1129,12 @@ class CandidateRejection:
 
     - `executor`／`model_id`／`domain`：roster 常數（`model-identities.yaml`）。
     - `reason`：四個 `continue` 之一，見 `REJECTION_REASONS`。
-    - `diagnostic`：probe 側的自由文字。最寬的來源是模型對一段**固定 probe
-      prompt** 的 stdout 節錄（PR #674 的 `stdout_excerpt`）與例外**型別名**
-      （`type(exc).__name__`，不含訊息）。
+    - `diagnostic`：probe 側的自由文字，**全體有界**
+      （:data:`PLANNING_DIAGNOSTIC_LIMIT`，＝`manager.RETRY_CONTEXT_EVIDENCE_LIMIT`）。
+      最寬的來源是模型對一段**固定 probe prompt** 的 stdout 節錄（PR #674 的
+      `stdout_excerpt`）、例外型別名，以及 #727 起接在型別名後面的那段上下文
+      （rc、stdout 節錄、`-o` 落點的路徑與存在狀態）。**stderr 仍然一個位元組都不取**
+      ——那是最容易夾帶路徑、env 與憑證原文的通道，票 A 畫的那條邊界 #727 沒有動。
     - `family`：三分族（`PLANNING_FAILURE_*`）。`same-domain`／`probe-absent`
       這類拓撲拒因為空字串——它們不是「執行失敗」，不該被硬塞進三族之一。
     """
