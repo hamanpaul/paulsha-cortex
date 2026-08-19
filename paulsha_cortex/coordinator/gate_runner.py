@@ -543,6 +543,13 @@ def _run_as_gate_identity(
         job_id=job_id,
         slice_id=str(env.get("PSC_SLICE_ID") or spool_key),
         repo_root=str(env.get("PSC_REPO_ROOT") or "/opt/cortex"),
+        # #712：gate 的形態是 `owned-by-job`——per-job 那一格是它自己 `copytree` 出來
+        # 的，owner 就是 `cortex-gate`，git 的 dubious-ownership 根本不觸發 ⇒ 這個引數
+        # 會被 `git_workspace_trust_env()` 忽略，gate 的 env **一個位元組都不會多**。
+        # 仍然逐字傳進去，是因為三個角色共用同一支：形態的判準在
+        # `JobRoleConfig.git_workspace_trust`（與 `registry.JOB_GIT_WORKSPACE_TRUST`
+        # 成對），不是「gate 這條呼叫剛好沒傳」。
+        workspace=str(paths.gate_worktree_root()),
         role=job_runner.JOB_ROLE_GATE,
     )
     argv = build_gate_argv(

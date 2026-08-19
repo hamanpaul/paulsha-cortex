@@ -269,6 +269,10 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
             job_id="job-1",
             slice_id="slice-1",
             repo_root="/opt/cortex/src",
+            # #712：`workspace` 是新增的**必填**具名參數。本類驗的是 env 白名單
+            # （哪些名字進得來、哪些絕不進來），與工作區無關 ⇒ `None`（＝「本呼叫端
+            # 沒有工作區」）。逐 job 的 git 放行有自己的測試檔。
+            workspace=None,
         )
 
     def test_never_carries_token_shaped_variables(self) -> None:
@@ -327,14 +331,22 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         manager_env = {k: v for k, v in _BASE_ENV.items() if k not in _JOB_PATH_ENV}
         with self.assertRaises(JobRunnerError) as ctx:
             job_runner.build_builder_env(
-                manager_env=manager_env, job_id="j", slice_id="s", repo_root="/r"
+                manager_env=manager_env,
+                job_id="j",
+                slice_id="s",
+                repo_root="/r",
+                workspace=None,  # #712：同上。
             )
         self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-path-undeclared")
 
     def test_relay_target_only_when_configured(self) -> None:
         manager_env = {**_BASE_ENV}
         without = job_runner.build_builder_env(
-            manager_env=manager_env, job_id="j", slice_id="s", repo_root="/r"
+            manager_env=manager_env,
+            job_id="j",
+            slice_id="s",
+            repo_root="/r",
+            workspace=None,  # #712：同上。
         )
         self.assertNotIn("PSC_RELAY_TARGET", without)
         with_relay = job_runner.build_builder_env(
@@ -342,6 +354,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
             job_id="j",
             slice_id="s",
             repo_root="/r",
+            workspace=None,  # #712：同上。
             relay_target="psc",
         )
         self.assertEqual(with_relay["PSC_RELAY_TARGET"], "psc")
@@ -371,6 +384,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
                     job_id="j",
                     slice_id="s",
                     repo_root="/r",
+                    workspace=None,  # #712：同上。
                 )
         self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-credential-env-leak")
 
@@ -385,6 +399,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
                 job_id="j",
                 slice_id="s",
                 repo_root="/r",
+                workspace=None,  # #712：同上。
             )
         self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-env-value-invalid")
 

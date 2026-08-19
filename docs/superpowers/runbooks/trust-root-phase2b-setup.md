@@ -411,6 +411,18 @@ A/B 並列時同一件事要寫兩遍（5-A／5-B、第 8 步兩種起法、附�
   `registry.JOB_WORKSPACE_REACH` 一條規則導出（builder 具名 ACL／reviewer 繼承
   default ACL／gate pool 根 owner），缺一格模組**載不起來**。
   → **60** 個 sudo 點、**235** 個驗證點。
+- **#712（per-job clone 跨 owner，git 的 dubious-ownership 擋死 builder）新增**：新增
+  **4e-2f「per-job 工作區的 git 信任」**（三個 principal 的形狀對照表 ＋ 缺陷基線 ＋
+  **反向不變式** `trust_root git-trust-probe` ＋ 真實派工 smoke）。**起因**：#710 的
+  ACL 補上之後 builder job **真的跑起來了**（`in_flight` 約 12 分鐘），然後死在 git
+  自己那一層——`fatal: detected dubious ownership in repository at
+  '/var/lib/cortex/worktree/wf-…'` ＋ `fatal: Need a repository to create a bundle.`。
+  **檔案系統層是通的**（`getfacl` 實機確認 `user:cortex-builder:rwx`／`mask::rwx`），
+  擋住的是 **owner 判準**：clone 的 owner 必然是 Manager（無 `CAP_CHOWN`，#710 已
+  論證），git 因此必然看到跨 owner。`builder-gitconfig` 的 note 宣稱涵蓋 per-job
+  clone，而那份**靜態**檔只出來源樹兩條——**per-job 路徑是動態的，靜態檔裝不下**
+  （萬用字元已被實測否決）。修法是逐 job 由 Manager 算出那一格、隨 spec 的 env 下去。
+  → **61** 個 sudo 點、**242** 個驗證點。
 
 ---
 
@@ -2724,6 +2736,96 @@ readers 面，#641 收掉了）⇒ `cortex work gc` 的 `rmtree` 走不進 build
 
 **回滾**：本步沒有部署期動作可回滾。要退掉執行期那條授權就是退回上一版 cortex
 （退回之後 builder job 會回到 #710 的原症狀：shim 在 `os.chdir()` 當場 EACCES）。
+
+#### 4e-2f. per-job 工作區的 **git 信任**（#712）
+
+> **這一節與 4e-2e 是兩層，不是同一件事的兩種說法。** 4e-2e 驗的是**檔案系統**
+> （mount ＋ DAC／ACL）；本節驗的是 **git 自己那一層**。#712 就是「其中一層通了、
+> 另一層沒通」的實機證據：`getfacl` 逐字 `user:cortex-builder:rwx`／`mask::rwx`
+> 全部正確，builder job 真的跑起來了，然後死在
+> `fatal: detected dubious ownership in repository at '/var/lib/cortex/worktree/wf-…'`。
+> git 的判準是 **repo 的 owner 是不是當下這個 uid**，權限對不對它不看。
+
+**三個降權 principal 的形狀（查證結果，不是統一過的理想形狀）**：
+
+| principal | 工作區 | 誰建 ⇒ owner | git 要不要放行 |
+| --- | --- | --- | --- |
+| `builder` | `<pool>/<job-id>`（per-job clone，`.git` 是真目錄） | Manager | **要**——本票的原症狀 |
+| `reviewer`／`planner` | `.psc-review-worktrees/<…>`（linked worktree，`.git` 是 gitfile） | Manager | **要**——同樣跨 owner |
+| `reviewer`／`planner` | `planning-scratch/<…>/cwd`（空目錄，沒有 repo） | Manager | 注入是無害的 no-op |
+| `gate` | `<gate-worktree>/<key>`（自己 `copytree` 出來的副本，含 `.git`） | **gate 自己** | **不要**——零動作、零 env |
+
+放行**逐 job**下：Manager 算出這一格的絕對路徑，隨 spec 的 env 交給 shim
+（`GIT_CONFIG_COUNT=1`／`GIT_CONFIG_KEY_0=safe.directory`／`GIT_CONFIG_VALUE_0=<這一格>`）。
+**本步沒有任何部署期動作**——不落檔、不改權限、不改 unit。要驗的是它在實機上真的
+成立，而且**只**對這一格成立。
+
+```bash
+# ✅ 驗證 0：靜態 .gitconfig 沒有被人「順手加寬」
+sudo -u cortex-builder git config --list --show-origin --show-scope | grep safe
+#   期望：只有 `global  <builder HOME>/.gitconfig  safe.directory=/var/lib/cortex/repos/<slug>`
+#   與同一份的 `…/<slug>/.git` 兩條。
+#   ⛔ 出現 `safe.directory=*` ⇒ 有人對這個帳號**整個關掉**了 dubious-ownership 保護
+#      （opt-out，不是授權）。⛔ 出現 `/var/lib/cortex/worktree*` ⇒ 有人把工作區放進
+#      靜態檔（對 per-job 那一格沒效果，真的生效的那部分是整個 pool 的放行）。
+#      這兩種改法在程式面由 permgen 的 import 期斷言擋著（改了 ⇒ 模組載不起來）。
+
+# ✅ 驗證 1：**缺陷基線**——零額外 env 時 git 必須擋住（證明保護是真的、靜態檔沒蓋到）
+#    先照 4e-2e 驗證 5 拿到一個真的工作區（$WS），然後：
+sudo -u cortex-builder git -C $WS status --porcelain
+#   期望：**非零**，逐字 `fatal: detected dubious ownership in repository at '$WS'`。
+#   ⛔ rc=0 ⇒ 回頭看驗證 0：某處已經放行了整棵樹。
+
+# ✅ 驗證 2（**反向不變式**，真實派工 ＋ 真實 unit）
+python3 -m paulsha_cortex.trust_root git-trust-probe four-way
+#   它做三件事：
+#     0) 以 `seams.ScriptWorktreeCreator` ＋ `job_runner.ensure_workspace_reachable()`
+#        （**產品程式碼**）建出**兩格**工作區——自己的與別人的；
+#     1) 基線：`psc_run_under` 在真實加固面、**零額外 env** 下確認 git 擋住；
+#     2/3) 以 `job_runner.build_job_env()`／`build_job_spec()` 產出真的 spec，
+#        `systemctl start --wait` 起真的模板實例，在 job 的 log 裡斷言：
+#          - 自己的工作區 `git status` rc=0；
+#          - `git bundle create` rc=0（#712 的原症狀逐字是
+#            `fatal: Need a repository to create a bundle.`）；
+#          - **別的 job 的工作區 `git status` 仍然失敗**（exit 23 ⇒ 這條破了）。
+#   ⚠️ 步驟 1 的加固面由 `permgen.unit_replica_properties()` 從**落檔的 unit** 全量
+#      導出；**不得**自組 `--property=`、**不得**自帶 `--setenv=PATH=`（design D13）。
+#   ⚠️ 步驟 2／3 刻意**不**走 `psc_run_under`：#709／#687 記過那條 caveat——它複製的是
+#      **加固面**，不是派工路徑，而本票要驗的東西（spec 的 env）只有派工路徑會產生。
+#      用 `--setenv=` 自己塞三個變數進去，量到的只會是「我塞的東西生效了」。
+#   ⚠️ 工作區**不得手工前置**（#645／#709）。
+
+# ✅ 驗證 3：真實派工 smoke——一輪真的 build
+#    起一輪 build，然後看 job 自己那一格 log：
+sudo -u cortex-manager tail -5 \
+  /var/lib/cortex/coordinator/commit-spool/build-logs/<slice>/job.jsonl
+#   期望：**沒有** `detected dubious ownership`、**沒有** `Need a repository to create
+#   a bundle`，且 commit spool 裡真的出現 `.bundle`。
+#   ⛔ 仍看到 dubious ownership ⇒ 先確認該 job 的 spec 帶了那三個鍵：
+sudo -u cortex-manager python3 -c "import json,sys;print({k:v for k,v in \
+  json.load(open(sys.argv[1]))['env'].items() if k.startswith('GIT_CONFIG')})" \
+  /var/lib/cortex/coordinator/job-spec-spool/builder/<instance>.json
+#   期望：三個鍵齊全，且 `GIT_CONFIG_VALUE_0` **逐字等於** spec 的 `working_directory`
+#   （git 比對是逐字相等——多一個尾斜線就不算同一條）。兩者都是**已解析**的路徑：
+#   shim `chdir` 之後 git 由 `getcwd()` 取 repo 路徑，那恆是 physical path。
+#   ⚠️ 不要反過來用「git 會拒絕 symlink 路徑」當判準——那隨 git 版本而異（本機 2.43.0
+#      拒絕、較新的 git 接受）。這裡要看的是**兩個字串相不相等**，不是 git 的正規化行為。
+
+# ✅ 驗證 4：gate 那一格**真的什麼都沒有**（「不需要」與「忘了做」要分得開）
+sudo -u cortex-manager python3 -c "import json,sys;print({k:v for k,v in \
+  json.load(open(sys.argv[1]))['env'].items() if k.startswith('GIT_CONFIG')})" \
+  /var/lib/cortex/coordinator/job-spec-spool/gate/<instance>.json
+#   期望：`{}`。gate 的副本由它自己 copytree 出來，owner 就是 cortex-gate。
+#   ⛔ 非空 ⇒ 有人「順手也給一份」，那份放行沒有出處（registry 的 import 期斷言
+#      本來就擋著這件事，出現它代表有人同時改了兩邊）。
+```
+
+**已知邊界（不是本步沒做完）**：gate 的 `PSC_GATE_CMD_*` 若去碰**來源樹**
+（`git describe`／`setuptools-scm`），那是登記表 deferred 項 `gate-gitconfig` 的事，
+與本節的 per-job 那一格無關——目前 `PSC_GATE_CMD_PYTEST` 沒有這種相依。
+
+**回滾**：本步沒有部署期動作可回滾。退掉那三個 env 就是退回上一版 cortex（退回之後
+builder job 會回到 #712 的原症狀：ACL 全對、`git bundle create` 仍然失敗）。
 
 #### 4e-3. planning 的**唯讀 scratch**（#686／#672 U-2 裁決）
 

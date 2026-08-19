@@ -120,6 +120,7 @@ __all__ = [
     "BUILDER_HOME_ENV",
     "BUILDER_PATH_ENV",
     "BUILDER_SYNTHESIZED_ENV",
+    "ALLOWED_GIT_CONFIG_KEYS",
     "CREDENTIAL_ENV_RE",
     "DEFAULT_BUILDER_ACCOUNT",
     "DEFAULT_GATE_ACCOUNT",
@@ -175,6 +176,8 @@ __all__ = [
     "WORKSPACE_REACH_POOL_OWNED_BY_JOB",
     "WorkspaceAclSpec",
     "ensure_workspace_reachable",
+    "git_config_safe_directories",
+    "git_workspace_trust_env",
     "workspace_acl_grants",
     "TEMPLATE_UNIT_ENV",
     "TEMPLATE_UNIT_PREFIX",
@@ -383,6 +386,45 @@ WORKSPACE_REACH_INHERITED_DEFAULT_ACL = "inherited-default-acl"
 WORKSPACE_REACH_POOL_OWNED_BY_JOB = "pool-owned-by-job"
 
 
+# ---------------------------------------------------------------------------
+# #712：git 工作區信任——三個角色的形態由 `trust_root.registry.
+# JOB_GIT_WORKSPACE_TRUST` 一張表決定，本模組持有它的**成對契約**（同上，本模組刻意
+# 不 import `trust_root`；兩邊逐列相等由 `tests/test_per_job_git_safe_directory_712.py`
+# 釘住）。
+# ---------------------------------------------------------------------------
+
+#: 工作區由 Manager 建（跨 owner）⇒ 逐 job 注入 `safe.directory`（builder／reviewer）。
+GIT_WORKSPACE_TRUST_PER_JOB_ENV = "per-job-env"
+#: per-job 那一格由 job 自己建 ⇒ owner 就是自己 ⇒ **零動作**（gate）。
+GIT_WORKSPACE_TRUST_OWNED_BY_JOB = "owned-by-job"
+
+#: git 的 **command scope** 三件套（`git-config(1)` 的 `GIT_CONFIG_{COUNT,KEY,VALUE}`）。
+GIT_CONFIG_COUNT_ENV = "GIT_CONFIG_COUNT"
+GIT_CONFIG_KEY_ENV_PREFIX = "GIT_CONFIG_KEY_"
+GIT_CONFIG_VALUE_ENV_PREFIX = "GIT_CONFIG_VALUE_"
+
+#: 逐 job 注入時**唯一**放行的 git 設定鍵（#712）。與
+#: `trust_root.registry.GIT_SAFE_DIRECTORY_KEY` 是成對契約。
+#:
+#: **這個白名單就是本票的安全論證本體。** `GIT_CONFIG_*` 是與 `git -c` 同級的
+#: protected configuration，`safe.directory` 只吃這一層——但同一條管道也吃
+#: `alias.*`／`core.fsmonitor`，而那些鍵**會執行外部命令**。0819 實測（git 2.43.0）::
+#:
+#:     $ GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=<repo> \
+#:         GIT_CONFIG_KEY_1=alias.pwn GIT_CONFIG_VALUE_1='!echo PWNED-EXTERNAL-COMMAND' \
+#:         git -C <repo> pwn
+#:     PWNED-EXTERNAL-COMMAND
+#:
+#: 三份 `.gitconfig` 之所以 root-owned、job 唯讀，理由逐字就是這一條。若 job 端能經
+#: 這條管道塞任意 git 設定，那條防線等於從檔案權限旁邊繞過去。因此：**白名單只有一個
+#: 鍵**，且寫端（:func:`build_job_env`／:func:`build_job_spec`）與讀端
+#: （`job_shim.load_spec`）走**同一支** :func:`_reject_unsafe_git_config`。
+ALLOWED_GIT_CONFIG_KEYS = frozenset({"safe.directory"})
+
+#: `GIT_CONFIG_KEY_<i>`／`GIT_CONFIG_VALUE_<i>` 的合法形狀（`<i>` 是十進位、無前導 +/-）。
+_GIT_CONFIG_INDEXED_RE = re.compile(r"^GIT_CONFIG_(KEY|VALUE)_(0|[1-9][0-9]*)$")
+
+
 @dataclass(frozen=True)
 class WorkspaceAclSpec:
     """per-job 工作區上，**某個角色的帳號**拿到什麼（#710）。
@@ -434,6 +476,15 @@ class JobRoleConfig:
     #: 「執行期零動作」與「忘了實作」在輸出上長得一樣，因此判準是 `workspace_reach`，
     #: 不是這個 tuple 的長度。
     workspace_acl: tuple[WorkspaceAclSpec, ...]
+    #: #712：本角色在**自己的工作區**上跑 git 時，dubious-ownership 怎麼過（兩個
+    #: `GIT_WORKSPACE_TRUST_*` 之一）。與 `registry.JOB_GIT_WORKSPACE_TRUST` 的
+    #: `trust.value` 逐字相等。
+    #:
+    #: **它不是 `workspace_reach` 的別名，但由它導出**：git 的判準是「repo 的 owner
+    #: 是不是當下這個 uid」，而「誰建那一格」就寫在 `workspace_reach` 上——
+    #: `pool-owned-by-job` ⇒ job 自己建 ⇒ `owned-by-job`；另外兩種 ⇒ Manager 建 ⇒
+    #: 跨 owner ⇒ `per-job-env`。兩邊矛盾時 `registry` 在 import 當下就載不起來。
+    git_workspace_trust: str
     #: 這個角色是誰、為什麼要獨立一份（進錯誤訊息與產物註解）。
     rationale: str
 
@@ -458,6 +509,7 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
                 WorkspaceAclSpec(JOB_ROLE_BUILDER, "rwX", "rwx"),
                 WorkspaceAclSpec(JOB_ROLE_GATE, "rX", "rX"),
             ),
+            git_workspace_trust=GIT_WORKSPACE_TRUST_PER_JOB_ENV,
             rationale=(
                 "builder persona——唯一會在自己完全掌控的工作區裡跑 untrusted repo "
                 "code 的角色，攻擊面最大。M1（#603／#584）已落地。"
@@ -476,6 +528,7 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             workspace_reach=WORKSPACE_REACH_INHERITED_DEFAULT_ACL,
             workspace_required_perms="rx",
             workspace_acl=(),
+            git_workspace_trust=GIT_WORKSPACE_TRUST_PER_JOB_ENV,
             spec_spool_env=REVIEW_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_REVIEW_JOB_SPEC_SPOOL,
             rationale=(
@@ -505,6 +558,7 @@ JOB_ROLE_CONFIG: Mapping[str, JobRoleConfig] = MappingProxyType(
             workspace_reach=WORKSPACE_REACH_POOL_OWNED_BY_JOB,
             workspace_required_perms="rwx",
             workspace_acl=(),
+            git_workspace_trust=GIT_WORKSPACE_TRUST_OWNED_BY_JOB,
             spec_spool_env=GATE_JOB_SPEC_SPOOL_ENV,
             default_spec_spool=DEFAULT_GATE_JOB_SPEC_SPOOL,
             rationale=(
@@ -666,6 +720,14 @@ CREDENTIAL_ENV_RE = re.compile(
 #:   等於在 `bash -c` 之下重開一個 #588 第 2 點的注入孔。
 #: - `LD_PRELOAD`／`LD_LIBRARY_PATH`／`PYTHONPATH`／`PYTHONSTARTUP`／`NODE_OPTIONS`：
 #:   都能讓呼叫端把程式碼注進 builder 的行程。
+#: - `GIT_CONFIG`／`GIT_CONFIG_GLOBAL`／`GIT_CONFIG_SYSTEM`／`GIT_CONFIG_NOSYSTEM`／
+#:   `GIT_CONFIG_PARAMETERS`（#712）：**同一扇門的另外五個把手**。本票為了 per-job 的
+#:   `safe.directory` 打開了 `GIT_CONFIG_COUNT`／`GIT_CONFIG_KEY_<i>`／
+#:   `GIT_CONFIG_VALUE_<i>`（見 :data:`ALLOWED_GIT_CONFIG_KEYS`，只放行一個鍵），而這
+#:   五個能把整份 git 設定換掉或整批灌進來：`GIT_CONFIG_GLOBAL` 讓 `$HOME/.gitconfig`
+#:   那份 **root-owned** 的檔失效（改指到 job 自己寫得出來的路徑），
+#:   `GIT_CONFIG_PARAMETERS` 是 `git -c` 的序列化管道、**不受本票的單鍵白名單約束**。
+#:   放行了單鍵卻留著這五個，等於白做。
 DENIED_ENV_NAMES = frozenset(
     {
         "BASHOPTS",
@@ -674,6 +736,11 @@ DENIED_ENV_NAMES = frozenset(
         "ENV",
         "GH_CONFIG_DIR",
         "GH_HOST",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
         "LD_LIBRARY_PATH",
         "LD_PRELOAD",
         "NODE_OPTIONS",
@@ -963,6 +1030,139 @@ def _reject_unsafe(env: Mapping[str, str], *, source: str) -> None:
                 source=source,
                 variable=key,
             )
+    _reject_unsafe_git_config(env, source=source)
+
+
+def git_config_safe_directories(env: Mapping[str, str]) -> tuple[str, ...]:
+    """env 裡經 `GIT_CONFIG_*` 放行的工作區路徑（依 `<i>` 排序）。
+
+    只回傳值，不做驗證——形狀的判準在 :func:`_reject_unsafe_git_config`，呼叫本函式
+    之前一定已經先過那一關（`_reject_unsafe()` 是所有寫端與讀端的共同入口）。
+    """
+
+    count = env.get(GIT_CONFIG_COUNT_ENV)
+    if not count:
+        return ()
+    values: list[str] = []
+    for index in range(int(count)):
+        value = env.get(f"{GIT_CONFIG_VALUE_ENV_PREFIX}{index}")
+        if value is not None:
+            values.append(value)
+    return tuple(values)
+
+
+def _reject_unsafe_git_config(env: Mapping[str, str], *, source: str) -> None:
+    """`GIT_CONFIG_*` 這條管道**只准出現 `safe.directory`**（#712）。
+
+    ## 為什麼需要這一支，而不是「Manager 自己不會亂寫」
+
+    `.gitconfig` 之所以 root-owned、job 唯讀，逐字的理由是 `alias.*`／`core.fsmonitor`
+    **會執行外部命令**。而 `GIT_CONFIG_COUNT`／`GIT_CONFIG_KEY_<i>`／
+    `GIT_CONFIG_VALUE_<i>` 是與 `git -c` 同級的 command scope——0819 實測（git 2.43.0）
+    `GIT_CONFIG_KEY_1=alias.pwn` ＋ `GIT_CONFIG_VALUE_1='!echo …'` 之下 `git pwn` 真的
+    執行了那條命令。本票為了 `safe.directory` 打開這條管道，就必須同時把它**收窄到
+    只有那一個鍵**，否則等於在檔案權限旁邊開一扇同樣寬的門。
+
+    ## 為什麼寫端與讀端都要跑
+
+    與 :func:`_reject_unsafe` 的既有理由逐字相同：只在寫端自律，等於相信一個 Manager
+    帳號可寫的檔案（spec spool）沒被動過手腳。`job_shim.load_spec()` 呼叫的
+    :func:`reject_unsafe_env` 會走到這裡，因此「白名單被改壞」在兩邊都會炸。
+
+    ## 判準
+
+    1. `GIT_CONFIG_*` 家族只准出現 `GIT_CONFIG_COUNT`／`GIT_CONFIG_KEY_<i>`／
+       `GIT_CONFIG_VALUE_<i>`（其餘五個名字已在 :data:`DENIED_ENV_NAMES` 上，上一圈
+       就擋掉了；這裡擋的是拼錯／未來新增的變體）；
+    2. `<i>` 必須是 `0..count-1` 的十進位，且 KEY／VALUE **成對齊全**——少一個 git 會
+       整支 `fatal: unable to parse command-line config`（實測），那會讓 job 死在一個
+       與本票無關的訊息上；
+    3. 每個 KEY 的**值**必須在 :data:`ALLOWED_GIT_CONFIG_KEYS` 內（大小寫不敏感，因為
+       git 的 config 鍵本身不區分大小寫——`Safe.Directory` 與 `safe.directory` 是同一個
+       鍵，白名單若區分就等於留一個繞法）；
+    4. `safe.directory` 的值必須是**絕對路徑**，且不得是字面 `*`（那是對整個帳號
+       opt-out，不是逐 job 授權）。
+    """
+
+    raw_count = env.get(GIT_CONFIG_COUNT_ENV)
+    indexed = {
+        name: value
+        for name, value in env.items()
+        if _GIT_CONFIG_INDEXED_RE.fullmatch(name) is not None
+    }
+    stray = sorted(
+        name
+        for name in env
+        if name.startswith("GIT_CONFIG")
+        and name != GIT_CONFIG_COUNT_ENV
+        and name not in indexed
+    )
+    if stray:
+        raise _fail(
+            "job-runner-git-config-env-invalid",
+            f"不認得的 GIT_CONFIG_* 變數 {stray}——這條管道只放行 "
+            f"{GIT_CONFIG_COUNT_ENV}／{GIT_CONFIG_KEY_ENV_PREFIX}<i>／"
+            f"{GIT_CONFIG_VALUE_ENV_PREFIX}<i>（#712）",
+            source=source,
+            variable=stray[0],
+        )
+    if raw_count is None:
+        if indexed:
+            raise _fail(
+                "job-runner-git-config-env-invalid",
+                f"有 {sorted(indexed)} 卻沒有 {GIT_CONFIG_COUNT_ENV}——git 會完全忽略"
+                "它們，而放行看起來像是生效了（#712）",
+                source=source,
+                variable=sorted(indexed)[0],
+            )
+        return
+    if not re.fullmatch(r"0|[1-9][0-9]*", raw_count):
+        raise _fail(
+            "job-runner-git-config-env-invalid",
+            f"{GIT_CONFIG_COUNT_ENV}={raw_count!r} 不是非負十進位整數（#712）",
+            source=source,
+            variable=GIT_CONFIG_COUNT_ENV,
+        )
+    count = int(raw_count)
+    expected = {
+        f"{prefix}{index}"
+        for index in range(count)
+        for prefix in (GIT_CONFIG_KEY_ENV_PREFIX, GIT_CONFIG_VALUE_ENV_PREFIX)
+    }
+    if set(indexed) != expected:
+        raise _fail(
+            "job-runner-git-config-env-invalid",
+            f"{GIT_CONFIG_COUNT_ENV}={count} 與實際的 "
+            f"{sorted(indexed)} 對不上（期望 {sorted(expected)}）——git 對缺項會整支 "
+            "`fatal: unable to parse command-line config`（實測 git 2.43），job 於是死在"
+            "一個與放行無關的訊息上（#712）",
+            source=source,
+            variable=GIT_CONFIG_COUNT_ENV,
+        )
+    for index in range(count):
+        key = indexed[f"{GIT_CONFIG_KEY_ENV_PREFIX}{index}"]
+        value = indexed[f"{GIT_CONFIG_VALUE_ENV_PREFIX}{index}"]
+        if key.lower() not in ALLOWED_GIT_CONFIG_KEYS:
+            raise _fail(
+                "job-runner-git-config-key-not-allowed",
+                f"{GIT_CONFIG_KEY_ENV_PREFIX}{index}={key!r} 不在白名單 "
+                f"{sorted(ALLOWED_GIT_CONFIG_KEYS)} 內——`GIT_CONFIG_*` 是與 `git -c` "
+                "同級的 command scope，`alias.*`／`core.fsmonitor` 這類鍵會**執行外部"
+                "命令**（實測 git 2.43：`alias.pwn=!echo …` 之下 `git pwn` 真的跑了）。"
+                "那正是三份 `.gitconfig` root-owned 的理由，本管道不得成為它的繞法"
+                "（#712）",
+                source=source,
+                variable=f"{GIT_CONFIG_KEY_ENV_PREFIX}{index}",
+            )
+        if value == "*" or not value.startswith("/"):
+            raise _fail(
+                "job-runner-git-config-value-invalid",
+                f"{GIT_CONFIG_VALUE_ENV_PREFIX}{index}={value!r} 必須是絕對路徑，且"
+                "不得是字面 `*`——`*` 等於對這個帳號整個關掉 dubious-ownership 保護，"
+                "**那是 opt-out，不是逐 job 授權**（#712／#623）",
+                source=source,
+                variable=f"{GIT_CONFIG_VALUE_ENV_PREFIX}{index}",
+            )
 
 
 #: `resolve_job_path()` 的錯誤訊息要指出「去哪一份 unit 取正規值」——角色與
@@ -1034,12 +1234,84 @@ def resolve_job_path(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
     return value
 
 
+def git_workspace_trust_env(*, role: str, workspace: str | Path | None) -> dict[str, str]:
+    """該角色對**這一格工作區**的 git 放行 env；不需要就回空 dict（#712）。
+
+    這是 #712 修法的本體，三個角色**共用同一支**——分岔只有一處，而且分岔的依據是
+    `JOB_ROLE_CONFIG[...].git_workspace_trust`（＝`registry.JOB_GIT_WORKSPACE_TRUST`
+    的成對契約），不是 `if role == …`：
+
+    ``per-job-env``（builder／reviewer／planner）
+        工作區由 **Manager** 建 ⇒ owner 是 Manager、job 是另一個 uid ⇒ git 的
+        dubious-ownership 保護擋下**整個 repo**（權限全對也一樣：那是 owner 判準，
+        不是權限判準）。放行走 `GIT_CONFIG_COUNT`／`GIT_CONFIG_KEY_0=safe.directory`
+        ／`GIT_CONFIG_VALUE_0=<這一格的絕對路徑>`。
+
+    ``owned-by-job``（gate）
+        per-job 那一格由 job 自己 `copytree` 出來 ⇒ owner 就是自己 ⇒ **零動作**。
+
+    ## `GIT_CONFIG_*` 真的設得動 `safe.directory` 嗎——0819 實測（git 2.43.0）
+
+    這條必須實測，因為 `safe.directory` 是**受保護的鍵**：它刻意不吃 repo-local
+    config（否則 untrusted repo 可以自我授信）。實測結果是**吃 command scope**——
+    `GIT_CONFIG_*` 與 `git -c` 同屬該 scope，`git config --list --show-scope` 逐字回報
+    `command\tsafe.directory=…`::
+
+        # root-owned repo，以一般使用者執行
+        $ git -C <repo> status
+        fatal: detected dubious ownership in repository at '<repo>'
+        $ GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
+            GIT_CONFIG_VALUE_0=<repo> git -C <repo> status --porcelain --branch
+        ## main                                                    # rc=0
+        $ GIT_CONFIG_COUNT=1 … GIT_CONFIG_VALUE_0=<repoA> git -C <repoB> status
+        fatal: detected dubious ownership in repository at '<repoB>'   # rc=128
+
+    `git bundle create`（builder 真正會跑的那一支）在同一份 env 下 rc=0。
+
+    ## 為什麼值取**已解析（physical）路徑**——這是支配性選擇，不是對 git 的斷言
+
+    shim 在降權之後做的是 `os.chdir(spec["working_directory"])`，而 git 由 `getcwd()`
+    取得 repo 路徑——`getcwd(2)` 回的**恆是** physical path。因此只要放行值與
+    `working_directory` 取**同一個已解析的字串**，「我們放行的」與「git 問的」在任何
+    git 版本上都是同一條。本函式一律 `Path(...).resolve()`，兩邊相等由
+    :func:`build_job_spec` 斷言。
+
+    ⚠️ **不要把「git 拒絕 symlink 路徑」寫成不變式。** 那是 git 的實作細節，**隨版本
+    而異**：0819 本機 git 2.43.0 上 `safe.directory=<symlink 路徑>`（cwd 走該 symlink）
+    **被拒**，而 PR #713 第一輪 CI 上較新的 git **接受**了同一組輸入——本 repo 曾有一條
+    測試把前者寫成硬斷言，四個 python 版本一起紅。我們控制得了的只有「傳哪一條、
+    `chdir` 到哪一條」；讓兩者都取 physical path 在**兩種 git 下都成立**，因此不必、
+    也不該依賴 git 對 symlink 路徑的處置。
+
+    ``workspace=None`` 是給**沒有工作區的呼叫端**用的（`launcher.executor_environment()`
+    的 preflight：它報告的是 PATH／HOME／sandbox 剖面，那時還沒有任何 job 工作區）。
+    真實派工路徑上「忘了傳」不可能發生：本參數在 :func:`build_job_env` 上是**必填**
+    的具名參數，而 :func:`build_job_spec` 另外斷言「env 放行的那一格就是 spec 的
+    `working_directory`」。
+    """
+
+    config = resolve_job_role(role)
+    if config.git_workspace_trust != GIT_WORKSPACE_TRUST_PER_JOB_ENV:
+        # 形態說「零動作」就是零動作——gate 的副本由它自己建，owner 就是自己。
+        # 在這裡「順手也給一份」會讓一個**不成立的**放行看起來像是必要的。
+        return {}
+    if workspace is None:
+        return {}
+    resolved = str(Path(workspace).resolve())
+    return {
+        GIT_CONFIG_COUNT_ENV: "1",
+        f"{GIT_CONFIG_KEY_ENV_PREFIX}0": sorted(ALLOWED_GIT_CONFIG_KEYS)[0],
+        f"{GIT_CONFIG_VALUE_ENV_PREFIX}0": resolved,
+    }
+
+
 def build_job_env(
     *,
     manager_env: Mapping[str, str],
     job_id: str,
     slice_id: str,
     repo_root: str,
+    workspace: str | Path | None,
     relay_target: str | None = None,
     role: str = JOB_ROLE_BUILDER,
 ) -> dict[str, str]:
@@ -1091,6 +1363,10 @@ def build_job_env(
         env["PSC_RELAY_TARGET"] = relay_target
     if config.role_id == JOB_ROLE_GATE:
         env.update(gate_declaration_env(manager_env))
+    # #712：git 的 dubious-ownership 那一層。**值由 Manager 算**——job 拿到的是一份
+    # 它改不動的 spec（#638／#639 的 spool 模型），因此這裡算出來的那一格就是它唯一
+    # 拿得到的放行，改不了成 `*`、也改不了成別人的工作區。
+    env.update(git_workspace_trust_env(role=config.role_id, workspace=workspace))
     _reject_unsafe(env, source="build_job_env")
     return env
 
@@ -1129,6 +1405,7 @@ def build_builder_env(
     job_id: str,
     slice_id: str,
     repo_root: str,
+    workspace: str | Path | None,
     relay_target: str | None = None,
 ) -> dict[str, str]:
     """builder 角色的具名別名（既有呼叫端與測試直接用它）。"""
@@ -1138,6 +1415,7 @@ def build_builder_env(
         job_id=job_id,
         slice_id=slice_id,
         repo_root=repo_root,
+        workspace=workspace,
         relay_target=relay_target,
         role=JOB_ROLE_BUILDER,
     )
@@ -1711,6 +1989,29 @@ def build_job_spec(
             )
     # env 走與 systemd-run 模式**同一條**守衛：模式換了，token 不得出去這件事不換。
     _reject_unsafe(env, source="build_job_spec")
+    # #712：git 放行**必須恰好是這個 job 的那一格**。
+    #
+    # 這條是「per-job 而非全域」的結構性保證，而不只是一句宣稱：env 是在別處算的
+    # （`build_job_env(workspace=…)`），spec 的 `working_directory` 是在這裡定的，
+    # 兩者一旦指向不同的路徑，放行的就不是這個 job 正要進去的那一格。判準是**逐字
+    # 相等**，因為 git 比對 `safe.directory` 也是逐字相等（實測 git 2.43：多一個
+    # 尾斜線就不算數）。
+    #
+    # 刻意不在這裡 `resolve()`：本函式的契約是「純資料，無 IO」。解析在
+    # `git_workspace_trust_env()` 那一側做，呼叫端把**同一個已解析的字串**同時交給
+    # 兩邊（見 `launcher`／`planning_job`／`gate_runner`）。
+    for granted in git_config_safe_directories(env):
+        if granted != str(working_directory):
+            raise _fail(
+                "job-runner-git-config-value-invalid",
+                f"env 放行的 git 工作區 {granted!r} 不是 spec 的 working_directory "
+                f"{str(working_directory)!r}——放行必須**逐 job**，指到別處的那一條"
+                "既救不了這個 job，又擴大了放行面（#712）。"
+                "兩邊必須由呼叫端以同一個**已解析**（physical）路徑字串同時給出：git "
+                "比對的是 `getcwd()` 之後的真實路徑，逐字相等（實測 git 2.43）。",
+                source="build_job_spec",
+                instance=instance,
+            )
     spec: dict[str, object] = {
         "spec_version": JOB_SPEC_VERSION,
         "instance": instance,

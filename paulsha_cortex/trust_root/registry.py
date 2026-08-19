@@ -584,6 +584,269 @@ def _assert_every_downgraded_principal_has_a_workspace_reach() -> None:
 _assert_every_downgraded_principal_has_a_workspace_reach()
 
 
+# ---------------------------------------------------------------------------
+# #712：job 對**自己的工作區**跑 git——dubious-ownership 那一層
+# ---------------------------------------------------------------------------
+
+#: `GIT_CONFIG_*` 逐 job 注入時**唯一**放行的 git 設定鍵（#712）。
+#:
+#: 這個字串是本檔與 `coordinator/job_runner.ALLOWED_GIT_CONFIG_KEYS` 的成對契約
+#: （`job_runner` 刻意不 import `trust_root`，同 `JOB_LOG_SPOOLS`／
+#: :data:`JOB_WORKSPACE_REACH` 的既有模式），由
+#: `tests/test_per_job_git_safe_directory_712.py` 釘住兩邊逐字相等。
+#:
+#: **為什麼是白名單而不是「不要放危險的鍵」**：`GIT_CONFIG_COUNT`／`GIT_CONFIG_KEY_i`
+#: ／`GIT_CONFIG_VALUE_i` 是 git 的 **command scope**，與 `git -c` 同級，屬 git 所謂的
+#: *protected configuration*——`safe.directory` 只吃這一層正是它的用途。但同一條管道
+#: 也吃 `alias.*`／`core.fsmonitor`，而那些鍵**會執行外部命令**。0819 實測（git 2.43.0）::
+#:
+#:     GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_1=alias.pwn \
+#:       GIT_CONFIG_VALUE_1='!echo PWNED-EXTERNAL-COMMAND' git pwn
+#:     PWNED-EXTERNAL-COMMAND
+#:
+#: 三份 `.gitconfig` root-owned 的理由逐字就是這一條（`build_account_gitconfig` 的
+#: 註解）。放開這條管道而不限鍵，等於把那條防線從檔案權限繞過去。
+GIT_SAFE_DIRECTORY_KEY = "safe.directory"
+
+
+class GitWorkspaceTrust(Enum):
+    """job 在自己的工作區上跑 git 時，dubious-ownership 保護怎麼過（#712）。
+
+    git 的判準只有一條：**repo 的 owner 是不是當下這個 uid**。因此本表不是一個新的
+    決定——它是 :data:`JOB_WORKSPACE_REACH` 那一列「誰建那一格」的**直接後果**，由
+    :func:`_assert_every_downgraded_principal_has_a_git_workspace_trust` 在 import
+    當下把兩邊釘死。
+    """
+
+    #: 工作區由 **Manager** 建 ⇒ owner 是 Manager、job 是另一個 uid ⇒ git 必然看到
+    #: 跨 owner。放行只能逐 job 給，值＝**這一個** job 的工作區絕對路徑。
+    #:
+    #: **靜態 `.gitconfig` 裝不下它**：路徑帶動態段（`<pool>/<job-id>`、
+    #: `.psc-review-worktrees/<…>`），而 git 的 `safe.directory` 只認**逐字相等**的
+    #: 路徑或字面 `*`（實測 git 2.43：`<repos>/*` 仍被拒；字面 `*` 是 opt-out，不是
+    #: 授權）。
+    PER_JOB_ENV = "per-job-env"
+
+    #: per-job 那一格由 **job 自己**建 ⇒ 它擁有自己產出的每一個 inode ⇒ git 看到的
+    #: owner 就是當下的 uid ⇒ **零動作**。gate 屬此。
+    OWNED_BY_JOB = "owned-by-job"
+
+
+@dataclass(frozen=True)
+class JobGitWorkspaceTrust:
+    """一個降權 job principal 的 **git 工作區信任**宣告（#712）。
+
+    這條性質與 :data:`JOB_WORKSPACE_REACH` 是**兩層**，而 #712 就是「其中一層通了、
+    另一層沒通」的實機證據：#710／PR #711 把檔案系統層補上之後（`getfacl` 實機確認
+    `user:cortex-builder:rwx`／`mask::rwx`），builder job 真的跑起來了，然後死在::
+
+        fatal: detected dubious ownership in repository at '/var/lib/cortex/worktree/wf-…'
+        fatal: Need a repository to create a bundle.
+
+    ⇒ **凡在 :data:`DOWNGRADED_JOB_PRINCIPALS` 上的 principal，一律要有一格。**
+    """
+
+    #: :data:`DOWNGRADED_JOB_PRINCIPALS` 上的那一格。
+    principal: Principal
+    #: 真正走這條路的 persona（理由與 :class:`JobWorkspaceReach` 的同名欄位逐字相同）。
+    persona: Principal
+    trust: GitWorkspaceTrust
+    #: 該 principal 的工作區裡**實際存在的 git repo 形狀**（查證結果，非假設）。
+    #: 空 tuple＝查證後確定該工作區裡沒有 repo；:attr:`GitWorkspaceTrust.PER_JOB_ENV`
+    #: 仍可能為空（reviewer 的 planning scratch 就是），因為同一個帳號的**另一種**
+    #: 工作區有 repo——形態是 per-principal 的，工作區不是。
+    repo_shapes: tuple[str, ...]
+    note: str
+
+
+#: **#712 那條規則的表**：三個 principal 一格都不能少。
+#:
+#: 每一列都是**現況查證後**的形狀，不是統一過的理想形狀（#712 issue body 逐字要求
+#: 「三者形狀不同，不要假設一致」）。查證結果：
+#:
+#: | principal | 工作區 | 誰建 ⇒ owner | 裡面有 repo 嗎 | git 要不要放行 |
+#: |---|---|---|---|---|
+#: | builder | `<worktree pool>/<job-id>` | Manager | **有**（`git clone --no-hardlinks` 的完整 clone，`.git` 是真目錄） | **要**——本票的原症狀 |
+#: | reviewer | `<repos>/<slug>/.psc-review-worktrees/<…>` | Manager | **有**（`git worktree add --detach` 的 linked worktree，`.git` 是 gitfile） | **要** |
+#: | reviewer | `<planning-scratch>/<…>/cwd` | Manager | **沒有**（空目錄，`_prepare_scratch`） | 注入無害的 no-op（見 note） |
+#: | gate | `<gate-worktree>/<key>` | **gate 自己**（`shutil.copytree`） | 有（連 `.git` 一起複製），但 owner 就是 gate | **不要** |
+#:
+#: **為什麼是一張表而不是三處各自成立**：#623 決定 per-job clone 時，`safe.directory`
+#: 只被寫進一份**靜態** `.gitconfig`（來源樹兩條），而 per-job clone 的路徑是動態的
+#: ——`permgen` 的 `builder-gitconfig` note 卻宣稱它涵蓋了 per-job clone。三個
+#: principal 各自被決定，於是其中一個恰好成立（gate）、一個從來沒有實作（builder）、
+#: 一個與 builder 同型但沒有人查過（reviewer）。導出之後，「只修一格」在**結構上做
+#: 不到**：新增第四個降權角色而漏了這裡，模組**載不起來**。
+#: 前例：#698 的 `EXECUTOR_ENFORCEMENT_LEAVES`、#708 的 :data:`JOB_LOG_SPOOLS`、
+#: #710 的 :data:`JOB_WORKSPACE_REACH`。
+JOB_GIT_WORKSPACE_TRUST: tuple[JobGitWorkspaceTrust, ...] = (
+    JobGitWorkspaceTrust(
+        principal=Principal.BUILDER,
+        persona=Principal.BUILDER,
+        trust=GitWorkspaceTrust.PER_JOB_ENV,
+        repo_shapes=("per-job clone（`git clone --no-hardlinks`，`.git` 是真目錄）",),
+        note=(
+            "**#712 的原症狀就在這一格。** #710／PR #711 把 ACL 補上之後 builder job "
+            "真的跑起來了（`in_flight` 約 12 分鐘），然後死在 git 自己那一層：\n"
+            "  `fatal: detected dubious ownership in repository at "
+            "'/var/lib/cortex/worktree/wf-…-3-f7cef294'`\n"
+            "  `fatal: Need a repository to create a bundle.`\n"
+            "**owner 必然是 Manager**：clone 由 Manager 建，而把它交出去要 `CAP_CHOWN`"
+            "——Manager unit 帶 `CapabilityBoundingSet=`（空），結構上做不到（#710 已"
+            "論證，本票不重做那個診斷）。因此 git 必然看到跨 owner。\n"
+            "**靜態 `.gitconfig` 裝不下**：`build_account_gitconfig()` 出的是**來源樹**"
+            "那兩條逐字路徑，而 per-job clone 是 `<pool>/<job-id>`，每個 job 不同。"
+            "萬用字元已被產生器自己的註解否決（實測 git 2.43：`<repos>/*` 仍被拒；"
+            "字面 `*` 等於對這個帳號整個關掉該保護——**那是 opt-out，不是授權**）。\n"
+            "因此放行逐 job 給，由 **Manager 算**、隨 spec 的 env 一起下去，job 改不了"
+            "自己的 spec（#638／#639 的 spool 模型）。"
+        ),
+    ),
+    JobGitWorkspaceTrust(
+        principal=Principal.REVIEWER,
+        persona=Principal.PLANNER,
+        trust=GitWorkspaceTrust.PER_JOB_ENV,
+        repo_shapes=(
+            "foreign review 的 linked worktree（`git worktree add --detach`，`.git` 是 gitfile）",
+        ),
+        note=(
+            "**查證後確認它與 builder 同型，不是照抄。** reviewer 帳號有兩種工作區，"
+            "本票逐一查過：\n"
+            "  - **foreign review**：`coordinator/review.py:prepare_review_worktree` 以 "
+            "`git worktree add --detach` 在 `<repos>/<slug>/.psc-review-worktrees/` 底下"
+            "開一棵 **linked worktree**——**Manager 建、Manager 擁有**，而 job 跑在 "
+            "`cortex-reviewer-planner` 上 ⇒ **同樣跨 owner**。\n"
+            "  - **planning／define scratch**：`coordinator/planning_job.py:_prepare_scratch` "
+            "建的是一格**空目錄**，裡面沒有 repo。注入的 `safe.directory` 在那裡是"
+            "無害的 no-op（git 只在真的找到 repo 時才查 ownership）。\n"
+            "**形態是 per-principal 的，工作區不是**——同一個帳號的兩種工作區只要有"
+            "一種跨 owner，這一格就必須是 `PER_JOB_ENV`。\n"
+            "⚠️ **靜態檔那兩條蓋不到 linked worktree**：0819 實測（git 2.43.0）"
+            "`safe.directory=<source repo>` ＋ `<source repo>/.git` 之下，對 "
+            "`<source repo>/…/wt` 這棵 linked worktree 跑 `git status` 仍是 "
+            "`fatal: detected dubious ownership in repository at '<…>/wt'`——git 查的是"
+            "**工作樹自己的路徑**。反過來只給 worktree 那一條就過（gitdir 在別人的樹裡"
+            "也一樣），因此逐 job 那一條是充分的。\n"
+            "**唯讀不變**：本項不動任何檔案權限，reviewer 對工作區仍然只有 `rX`"
+            "（#710 那一列的刻意設計，交付通道是 verdict spool）。`safe.directory` 是 "
+            "git 的信任判準，不是權限。"
+        ),
+    ),
+    JobGitWorkspaceTrust(
+        principal=Principal.GATE,
+        persona=Principal.GATE,
+        trust=GitWorkspaceTrust.OWNED_BY_JOB,
+        repo_shapes=("被驗樹的拋棄式副本（`shutil.copytree`，含 `.git`）",),
+        note=(
+            "**查證結論：gate 不需要，一個位元組都不要動。** per-job 那一格是 gate "
+            "**自己**用 `shutil.copytree` 從 builder 的 clone 複製出來的"
+            "（`gate_ledger.snapshot_worktree`）⇒ 副本的每一個 inode（含 `.git`）都由 "
+            "gate 擁有 ⇒ git 看到的 owner 就是當下的 uid，dubious-ownership 根本不觸發。"
+            "這與登記表既有的 deferred 項 `gate-gitconfig` 的 symptom 欄逐字一致"
+            "（「複本由 gate 自己擁有、多數情況不會撞 dubious ownership」），本票把那句"
+            "話從一則 deferred 的觀察升級成**受斷言保護**的宣告。\n"
+            "**它靠的是 pool 根的 owner 位**（`gate-worktree-pool` 的 owner 就是 "
+            "`cortex-gate`，#710 已查證並以 import 期斷言釘住）。owner 一旦漂走"
+            "（例如有人把 pool 改成 Manager-owned「比照 dispatch pool」），gate 不只建"
+            "不出副本，連 git 信任也一起塌——那正是 "
+            ":func:`_assert_every_downgraded_principal_has_a_git_workspace_trust` 要在"
+            "模組載入當下擋掉的漂移。\n"
+            "**仍未涵蓋的那一面不變**：gate 的 `PSC_GATE_CMD_*` 若去碰**來源樹**"
+            "（`git describe`／`setuptools-scm`），那是 `gate-gitconfig` 那個 deferred "
+            "項的事，與本票的 per-job 那一格無關。"
+        ),
+    ),
+)
+
+
+def job_git_workspace_trust_for(principal: Principal) -> JobGitWorkspaceTrust:
+    """該降權 principal 的 git 工作區信任宣告；查無即 fail-closed（#712）。"""
+
+    for trust in JOB_GIT_WORKSPACE_TRUST:
+        if trust.principal is principal:
+            return trust
+    raise KeyError(
+        f"{principal.value} 沒有登記 git 工作區信任——凡經模板 unit 派出的 job 都在"
+        "自己的工作區裡跑 git（bundle／status／模型自己叫的那些），而 git 的 "
+        "dubious-ownership 保護是 owner 判準，不是權限判準（#712）。"
+    )
+
+
+def _assert_every_downgraded_principal_has_a_git_workspace_trust() -> None:
+    """#712 的那條規則，在 **import 當下**強制（registry 這一半）。
+
+    **規則**：`principal` 在 :data:`DOWNGRADED_JOB_PRINCIPALS` 上有一格
+    ⇒ 它在 :data:`JOB_GIT_WORKSPACE_TRUST` 上**必須**也有恰好一格，**且該格與
+    :data:`JOB_WORKSPACE_REACH` 對「誰建那一格」的宣告一致**。
+
+    第二個條件才是這條規則的本體。git 的判準只有一條——**repo 的 owner 是不是當下這個
+    uid**——而「誰建那一格」已經在 #710 的表上寫得清清楚楚：
+
+    - :attr:`WorkspaceReach.POOL_OWNED_BY_JOB` ＝ per-job 那一格由 **job 自己**建
+      ⇒ owner 就是 job ⇒ :attr:`GitWorkspaceTrust.OWNED_BY_JOB`；
+    - 其餘兩種形態（具名 ACL／繼承 default ACL）的共同前提都是「**Manager 建、
+      Manager 擁有**，job 靠 ACL 進得去」⇒ 跨 owner ⇒
+      :attr:`GitWorkspaceTrust.PER_JOB_ENV`。
+
+    因此本表**不是第二個各自為政的決定**，是同一個事實的第二個後果；兩張表一旦說出
+    互相矛盾的話，模組就載不起來。這正是本票要消滅的那一類缺口：#623 決定 per-job
+    clone 之後，「per-job clone 的 safe.directory」只活在一則 note 裡，而產生器實際
+    只出來源樹那兩條——**note 反向說謊了兩個月**（#696 的同型，本票是第三個實例）。
+    """
+
+    declared = [trust.principal for trust in JOB_GIT_WORKSPACE_TRUST]
+    if len(declared) != len(set(declared)):
+        raise ValueError(f"JOB_GIT_WORKSPACE_TRUST 有重複的 principal: {declared}")
+    missing = [p for p in DOWNGRADED_JOB_PRINCIPALS if p not in declared]
+    if missing:
+        raise ValueError(
+            f"降權 principal {[p.value for p in missing]} 沒有 git 工作區信任宣告——"
+            "job 在自己的工作區裡跑 git（builder 的 `git bundle create`、reviewer 的 "
+            "`git status`／`git diff`），而工作區若由 Manager 建，git 的 "
+            "dubious-ownership 保護會在**權限全部正確**的情況下照樣擋死整個 repo"
+            "（#712 實機：`fatal: detected dubious ownership`）。"
+            "請往 JOB_GIT_WORKSPACE_TRUST 加一列，不要在別處手寫一條 safe.directory。"
+        )
+    extra = [p for p in declared if p not in DOWNGRADED_JOB_PRINCIPALS]
+    if extra:
+        raise ValueError(
+            f"JOB_GIT_WORKSPACE_TRUST 宣告了非降權 principal {[p.value for p in extra]}"
+            "——本表的輸入只有 DOWNGRADED_JOB_PRINCIPALS（同 UID 下沒有跨 owner 可言）。"
+        )
+    for trust in JOB_GIT_WORKSPACE_TRUST:
+        if trust.persona not in UNTRUSTED_EXECUTION_PRINCIPALS:
+            raise ValueError(
+                f"{trust.principal.value}：persona {trust.persona.value} 不在 "
+                "UNTRUSTED_EXECUTION_PRINCIPALS 上——那樣它根本不是以另一個 uid 執行的，"
+                "本表沒有可講的東西（#712）。"
+            )
+        if not trust.note:
+            raise ValueError(
+                f"{trust.principal.value}：note 為空——「這一格要不要放行」是查證結果，"
+                "不是預設值；查證過程必須寫得出來（#712）。"
+            )
+        reach = job_workspace_reach_for(trust.principal)
+        owned_by_job = reach.reach is WorkspaceReach.POOL_OWNED_BY_JOB
+        wants_owned = trust.trust is GitWorkspaceTrust.OWNED_BY_JOB
+        if owned_by_job != wants_owned:
+            raise ValueError(
+                f"{trust.principal.value}：git 信任宣告 {trust.trust.value} 與工作區"
+                f"可達性宣告 {reach.reach.value} 互相矛盾——git 的判準只有「repo 的 "
+                "owner 是不是當下這個 uid」，而「誰建那一格」已經在 JOB_WORKSPACE_REACH "
+                "上宣告過了：`pool-owned-by-job` ⇒ job 自己建、自己擁有 ⇒ "
+                f"`{GitWorkspaceTrust.OWNED_BY_JOB.value}`；其餘兩種形態 ⇒ Manager 建、"
+                f"Manager 擁有 ⇒ 跨 owner ⇒ `{GitWorkspaceTrust.PER_JOB_ENV.value}`"
+                "（#712）。"
+            )
+        # `repo_shapes` 刻意**不設限**：`OWNED_BY_JOB` 的工作區裡可以有 repo（gate 的
+        # 副本就有），那正是它不需要放行的原因——**有 repo，但 owner 是自己**；而
+        # `PER_JOB_ENV` 的某一種工作區可以沒有 repo（reviewer 的 planning scratch），
+        # 注入在那裡是無害的 no-op。用 repo 的有無去推放行形態就會兩邊都推錯。
+
+
+_assert_every_downgraded_principal_has_a_git_workspace_trust()
+
+
 def job_spec_spool_asset_id(principal: Principal) -> str:
     """該降權 principal 的 per-principal spec spool 資產 id（#657）。
 
