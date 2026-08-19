@@ -912,6 +912,19 @@ def _codex_inner_sandbox_argv() -> tuple[str, ...]:
 
     lazy import 與 `planning_job`／`planning_probe_cache` 既有的做法一致：`trust_root`
     是產生器面，不該進 `coordinator` 的模組載入圖，但**登記表的內容必須只有一份**。
+
+    ## 涵蓋範圍的邊界（刻意的，不是漏的）
+
+    這一支只餵給 `build_codex_argv`——也就是**經 `SubprocessLauncher` 派出去**的 codex
+    job（builder／reviewer／slice-lane planner 都算）。`planning_runtime._planning_argv`
+    那條路**刻意不動**：它是 Manager 行程內（或 `planning_job` 那一格）的 planning 呼叫，
+    輸出由 `_extract_json()` **從 stdout 直接解 JSON**，而本形態的旗標會讓 codex 在串流
+    最前面多印一筆 deprecation 的 `item.type=error`。jsonl 那一端由尾端往回找
+    `agent_message`，多一筆開頭的雜訊無害；stdout 直接解 JSON 那一端沒有這個保護，
+    為了一個目前跑得通的路徑去冒那個險不划算。
+
+    ⚠️ 這是**範圍**判斷，不是「planning 不需要內層沙箱」的宣稱——planning 真的跑起命令
+    時會撞上與本票逐字相同的牆。要動那一條路，得先量它的 JSON 抽取吃不吃得下那筆 error。
     """
 
     from ..trust_root import permgen
