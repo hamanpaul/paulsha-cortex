@@ -39,9 +39,24 @@
    以及**它不改變 job 角色**（write-forbidden 的 build 卡仍以 builder 起跑）。
 5. `WorkflowSpecializationTests`——`manager._specialize_workflow_launcher()`
    對 `worktree-isolation`（本票的原症狀卡）真的套用降級，對寫入卡不套用。
-6. `ProbeDerivationTests`——探針的 mode 清單由**同一張表**導出、含
-   `workspace-write`、每個 mode 都有負向對照、每一條命令都帶 `-c`
-   （`codex sandbox` 忽略 `config.toml` 的 `sandbox_mode`）。
+6. `ProbeDerivationTests`——探針的 mode 清單由**同一張表**導出、含寫入卡的
+   production mode、附掛內層的 mode 都有負向對照、凡走 `codex sandbox` 的命令
+   都帶 `-c`（`codex sandbox` 忽略 `config.toml` 的 `sandbox_mode`）。
+
+## #716 選項 B 後半（0819 裁決落地）之後本檔的變化
+
+寫入卡（`BUILDER_WORKSPACE_WRITE` 契約）的 mode 由 `workspace-write`（legacy
+landlock 下 100% panic rc=101 的必死卡）改為 `danger-full-access`，且**不附**內層
+sandbox argv（`--enable use_legacy_landlock` 對該 mode 是無意義殘留，只會多印
+deprecation 噪音）。殘餘防線＝systemd 外層＋出口管制（PR #725）。因此：
+
+- 表上多一欄 `attaches_inner_sandbox`（附掛條件跟著契約走，附 ⇔ mode 是
+  `read-only`，import 期釘死）；
+- `workspace-write` **不得**再出現在表上（import 期斷言）；
+- 探針對 `danger-full-access` 的語意是「**這一列沒有內層沙箱**」——不拿
+  `codex sandbox` 驗它（沒東西可驗），改驗 (a) 命令執行得了 (b) 出口管制在；
+- 三列 read-only（planner／reviewer／write-forbidden）的 argv **byte-identical
+  不變**，由 `tests/test_write_card_argv_716.py` 的黃金釘子釘住。
 
 OS 層語意（真的裝一次 landlock、真的 panic 一次）在單 UID／無 systemd 的 CI 上重現
 不了，因此以具名 skip 標出，不留假綠——見 `OsLevelSemanticsTests`。
@@ -84,14 +99,36 @@ class DerivationTableTests(unittest.TestCase):
         self.assertEqual(set(declared), set(JobWriteContract))
 
     def test_write_grant_flag_matches_the_mode(self) -> None:
-        """`grants_filesystem_write` 記的是 codex 的判準，不是偏好。"""
+        """`grants_filesystem_write` 記的是機制事實，不是偏好。
+
+        `read-only` ⇒ False 是 codex `linux_run_main.rs:318` 的判準；
+        `danger-full-access` ⇒ True 是誠實標註（連內層都沒有，#716 B 後半）。
+        """
 
         for row in registry.SANDBOX_MODE_DERIVATION:
             if row.sandbox_mode is None:
                 continue
             self.assertEqual(
                 row.grants_filesystem_write,
-                row.sandbox_mode == registry.SANDBOX_MODE_WORKSPACE_WRITE,
+                row.sandbox_mode == registry.SANDBOX_MODE_DANGER_FULL_ACCESS,
+                row.contract,
+            )
+
+    def test_workspace_write_is_banished_from_the_table(self) -> None:
+        """#716 B 後半的裁決：`workspace-write` 是 100% panic 的必死卡，不得再發。"""
+
+        for row in registry.SANDBOX_MODE_DERIVATION:
+            self.assertNotEqual(
+                row.sandbox_mode, registry.SANDBOX_MODE_WORKSPACE_WRITE, row.contract
+            )
+
+    def test_inner_sandbox_attaches_iff_the_mode_is_read_only(self) -> None:
+        """附掛條件跟著契約走（#716 B 後半）：附 ⇔ mode 是 `read-only`。"""
+
+        for row in registry.SANDBOX_MODE_DERIVATION:
+            self.assertEqual(
+                row.attaches_inner_sandbox,
+                row.sandbox_mode == registry.SANDBOX_MODE_READ_ONLY,
                 row.contract,
             )
 
@@ -115,12 +152,18 @@ class DerivationTableTests(unittest.TestCase):
         self.assertEqual(row.sandbox_mode, registry.SANDBOX_MODE_READ_ONLY)
         self.assertFalse(row.grants_filesystem_write)
 
-    def test_write_cards_still_get_workspace_write(self) -> None:
-        """**誠實邊界**：F 只解唯讀卡，寫入卡那一半未解（#716 仍 open）。"""
+    def test_write_cards_get_danger_full_access(self) -> None:
+        """#716 B 後半：寫入卡改發 `danger-full-access`，不再是必死的 workspace-write。
+
+        **誠實邊界**：這裡釘的是導出表；端到端（真實派工跑會寫檔的卡）尚未驗。
+        """
 
         self.assertEqual(
             registry.sandbox_mode_for(JobWriteContract.BUILDER_WORKSPACE_WRITE),
-            registry.SANDBOX_MODE_WORKSPACE_WRITE,
+            registry.SANDBOX_MODE_DANGER_FULL_ACCESS,
+        )
+        self.assertFalse(
+            registry.inner_sandbox_attached_for(JobWriteContract.BUILDER_WORKSPACE_WRITE)
         )
 
     def test_unknown_contract_fails_closed(self) -> None:
@@ -215,24 +258,38 @@ class CodexArgvTests(unittest.TestCase):
             registry.SANDBOX_MODE_READ_ONLY,
         )
 
-    def test_the_only_difference_from_today_is_the_mode_token(self) -> None:
-        """**降級只動 mode 一個 token。**
+    def test_the_write_forbidden_downgrade_shape_is_pinned(self) -> None:
+        """降級（write-forbidden）與寫入卡的差異形狀逐 token 釘住。
 
-        寫成斷言而不是註解，是因為「順手也把 `--skip-git-repo-check` 加上去」這種
-        擴散最容易在 review 時被當成無害——而那張卡跑在 per-job clone 裡，加上去等於
-        把一個真的該擋的檢查關掉。
+        #716 B 後半之前兩者只差 mode 一個 token；之後寫入卡**多**了「不附內層
+        argv」這一格差異——差異集合必須恰好是這兩處，順手擴散（例如把
+        `--skip-git-repo-check` 也加上去）在這裡當場紅：那張卡跑在 per-job clone
+        裡，加上去等於把一個真的該擋的檢查關掉。
         """
 
-        before = _argv(worktree=None)
-        after = _argv(worktree=None, write_forbidden=True)
-        self.assertEqual(len(before), len(after))
-        diff = [
-            (a, b) for a, b in zip(before, after) if a != b
-        ]
+        spec = permgen.executor_inner_sandbox("codex")
+        assert spec is not None
+        builder = _argv(worktree=None)
+        wforbid = _argv(worktree=None, write_forbidden=True)
+        # 差異一：mode token。
         self.assertEqual(
-            diff,
-            [(registry.SANDBOX_MODE_WORKSPACE_WRITE, registry.SANDBOX_MODE_READ_ONLY)],
+            _sandbox_value(builder), registry.SANDBOX_MODE_DANGER_FULL_ACCESS
         )
+        self.assertEqual(_sandbox_value(wforbid), registry.SANDBOX_MODE_READ_ONLY)
+        # 差異二：內層 argv 只附在 read-only 那一列。
+        self.assertNotIn(spec.argv[0], builder)
+        self.assertIn(" ".join(spec.argv), " ".join(wforbid))
+        # 除了這兩處，一個 token 都不准多、不准少。
+        def _without_inner(argv: list[str]) -> list[str]:
+            joined = list(argv)
+            idx = joined.index(spec.argv[0])
+            return joined[:idx] + joined[idx + len(spec.argv):]
+
+        normalized = _without_inner(wforbid)
+        normalized[normalized.index(registry.SANDBOX_MODE_READ_ONLY)] = (
+            registry.SANDBOX_MODE_DANGER_FULL_ACCESS
+        )
+        self.assertEqual(normalized, builder)
 
     def test_planner_and_reviewer_argv_are_byte_identical(self) -> None:
         """本票對 planner／reviewer **一個位元都不動**。"""
@@ -246,13 +303,13 @@ class CodexArgvTests(unittest.TestCase):
             # write_forbidden 一併宣告時仍逐字相同（優先序刻意如此）。
             self.assertEqual(argv, _argv(write_forbidden=True, **kwargs), kwargs)
 
-    def test_commit_required_and_default_builders_keep_workspace_write(self) -> None:
-        """#716 未解的那一半：會寫檔的卡仍然發 `workspace-write`。"""
+    def test_commit_required_and_default_builders_get_danger_full_access(self) -> None:
+        """#716 B 後半：會寫檔的卡發 `danger-full-access`（外層＋出口管制當防線）。"""
 
         for kwargs in ({}, {"commit_required": True}):
             self.assertEqual(
                 _sandbox_value(_argv(**kwargs)),
-                registry.SANDBOX_MODE_WORKSPACE_WRITE,
+                registry.SANDBOX_MODE_DANGER_FULL_ACCESS,
                 kwargs,
             )
 
@@ -462,29 +519,50 @@ class WorkflowSpecializationTests(unittest.TestCase):
 class ProbeDerivationTests(unittest.TestCase):
 
     def setUp(self) -> None:
-        self.text = "\n".join(
-            permgen.build_inner_sandbox_probe(permgen.SCHEMES["four-way"])
+        self.lines = permgen.build_inner_sandbox_probe(permgen.SCHEMES["four-way"])
+        self.text = "\n".join(self.lines)
+        # 探針「做了什麼」只看可執行行；註解行是「講了什麼」，兩者的斷言方向相反
+        # （負向斷言若把註解一起算，光是**警告不要做某事**的那句話就會讓它紅）。
+        self.executable = "\n".join(
+            line for line in self.lines
+            if line.strip() and not line.strip().startswith("#")
         )
 
-    def test_every_emitted_mode_is_probed(self) -> None:
+    def test_every_attached_mode_is_probed_with_codex_sandbox(self) -> None:
+        """附掛內層的 mode 才有東西可用 `codex sandbox` 驗。"""
+
         for mode in registry.emitted_sandbox_modes():
-            self.assertIn(f"sandbox_mode='\"{mode}\"'", self.text, mode)
+            token = f"sandbox_mode='\"{mode}\"'"
+            if registry.sandbox_mode_attaches_inner_sandbox(mode):
+                self.assertIn(token, self.executable, mode)
+            else:
+                # **沒有內層沙箱的列不拿 codex sandbox 驗**——rc=0 只證明「沒有
+                # 沙箱」，那個綠會被誤讀成「有防線」（#716 B 後半）。
+                self.assertNotIn(token, self.executable, mode)
 
     def test_it_probes_the_production_write_mode(self) -> None:
-        """#715 假綠的核心：探針從沒碰過 builder 的 `workspace-write`。"""
+        """#715 假綠的核心教訓不變：探針必須涵蓋 production 寫入卡的形態。
 
-        self.assertIn(
-            f"sandbox_mode='\"{registry.SANDBOX_MODE_WORKSPACE_WRITE}\"'", self.text
-        )
+        B 後半起那個形態是 `danger-full-access`，語意是「這一列沒有內層沙箱」：
+        (a) 命令執行得了（外層沒把它弄死），(b) 出口管制在（該列僅存的網路防線，
+        缺了它就是假綠）。
+        """
+
+        write_mode = registry.sandbox_mode_for(JobWriteContract.BUILDER_WORKSPACE_WRITE)
+        self.assertIn(f"a[{write_mode}])", self.text)
+        self.assertIn(f"b[{write_mode}])", self.text)
+        self.assertIn("PSC-716-EXEC-OK", self.executable)
+        self.assertIn("socket.create_connection", self.executable)
+        self.assertIn("TimeoutError", self.text)
+        self.assertIn("僅存", self.text)
 
     def test_it_carries_a_self_check_on_the_derived_list(self) -> None:
         """清單不含寫入形態 ⇒ 探針**當場停並印出理由**。"""
 
+        write_mode = registry.sandbox_mode_for(JobWriteContract.BUILDER_WORKSPACE_WRITE)
         self.assertIn("PSC_716_MODES=(", self.text)
-        self.assertIn(
-            f'*" {registry.SANDBOX_MODE_WORKSPACE_WRITE} "*', self.text
-        )
-        self.assertIn("不含 workspace-write", self.text)
+        self.assertIn(f'*" {write_mode} "*', self.text)
+        self.assertIn(f"不含 {write_mode}", self.text)
 
     def test_the_generator_refuses_a_read_only_only_derivation(self) -> None:
         """手抄成只剩唯讀族時，產生器自己就 fail-closed。"""
@@ -493,19 +571,23 @@ class ProbeDerivationTests(unittest.TestCase):
         try:
             registry.SANDBOX_MODE_DERIVATION = tuple(
                 row for row in original
-                if row.sandbox_mode != registry.SANDBOX_MODE_WORKSPACE_WRITE
+                if row.sandbox_mode in (registry.SANDBOX_MODE_READ_ONLY, None)
             )
             with self.assertRaises(ValueError):
                 permgen.build_inner_sandbox_probe(permgen.SCHEMES["four-way"])
         finally:
             registry.SANDBOX_MODE_DERIVATION = original
 
-    def test_each_mode_has_a_negative_control(self) -> None:
-        """每個 mode 都要有「不帶旗標必須**仍然**失敗」那一半。"""
+    def test_each_attached_mode_has_a_negative_control(self) -> None:
+        """附掛內層的每個 mode 都要有「不帶旗標必須**仍然**失敗」那一半。"""
 
         for mode in registry.emitted_sandbox_modes():
-            self.assertIn(f"1[{mode}])", self.text, mode)
-            self.assertIn(f"3[{mode}])", self.text, mode)
+            if registry.sandbox_mode_attaches_inner_sandbox(mode):
+                self.assertIn(f"1[{mode}])", self.text, mode)
+                self.assertIn(f"3[{mode}])", self.text, mode)
+            else:
+                self.assertNotIn(f"1[{mode}])", self.text, mode)
+                self.assertNotIn(f"3[{mode}])", self.text, mode)
         self.assertIn("Can't read /proc/sys/kernel/overflowuid", self.text)
 
     def test_the_config_toml_false_green_trap_is_documented(self) -> None:
@@ -514,12 +596,18 @@ class ProbeDerivationTests(unittest.TestCase):
         self.assertIn("config.toml", self.text)
         self.assertIn("-c sandbox_mode=", self.text)
 
-    def test_the_expected_red_is_spelled_out(self) -> None:
-        """落地後仍是紅的——那是誠實狀態，逐字寫在探針裡。"""
+    def test_the_honest_boundaries_are_spelled_out(self) -> None:
+        """B 後半之後探針預期全綠，但「綠不等於端到端已驗」必須逐字在探針裡。
 
+        另一條反向警報也要在：builder 寫入卡的 log 再出現 deprecation ⇒ 旗標漏回
+        了寫入卡的 argv。
+        """
+
+        self.assertIn("預期全綠", self.text)
+        self.assertIn("端到端", self.text)
+        self.assertIn("漏回", self.text)
         self.assertIn("rc=101", self.text)
         self.assertIn("linux_run_main.rs:318", self.text)
-        self.assertIn("寫入卡那一半未解", self.text)
 
     def test_it_never_hand_assembles_the_hardening_surface(self) -> None:
         """D13：探針一行 `--property=`／`--setenv=` 都不自組。"""
@@ -527,6 +615,7 @@ class ProbeDerivationTests(unittest.TestCase):
         self.assertNotIn("--property=", self.text)
         self.assertNotIn("--setenv=", self.text)
         self.assertIn(permgen.PATH_PROBE_HELPER, self.text)
+        self.assertEqual(permgen.path_probe_env_injections(self.lines), ())
 
 
 # ---------------------------------------------------------------------------

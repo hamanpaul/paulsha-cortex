@@ -7932,16 +7932,19 @@ def _specialize_workflow_launcher(launcher, step):
     elif trust_registry.card_contract_forbids_workspace_write(
         commit_policy=effective_commit_policy,
         # `getattr` 而不是 `step.outputs`：本函式也被 preflight 那條路以更窄的 step
-        # 形狀呼叫。缺欄回 `None` ⇒ 判準回 `False` ⇒ **維持現狀的 workspace-write**，
-        # 與「契約缺欄不猜」逐字一致（真實 `WorkflowStep` 恆有這一欄）。
+        # 形狀呼叫。缺欄回 `None` ⇒ 判準回 `False` ⇒ **維持寫入卡契約**
+        # （`BUILDER_WORKSPACE_WRITE`；argv 上發什麼 mode 由
+        # `registry.SANDBOX_MODE_DERIVATION` 那一列決定，#716 B 後半起是
+        # `danger-full-access`），與「契約缺欄不猜」逐字一致（真實 `WorkflowStep`
+        # 恆有這一欄）。
         declared_outputs=getattr(step, "outputs", None),
     ):
         # #716：**兩個條件都要明確成立才降**（`commit_policy=forbidden` **且**
-        # `declared_outputs` 為空），其餘一律維持現狀的 `workspace-write`——判準本體與
+        # `declared_outputs` 為空），其餘一律維持寫入卡契約——判準本體與
         # 「解不出來就不猜」的理由都住在那支函式與 `registry.SANDBOX_MODE_DERIVATION`。
         #
-        # **capability 缺席時保持現狀（`workspace-write`），不是 fail-open**：那正是
-        # 今天的行為，而本票的保守方向逐字就是「不確定 ⇒ 維持 workspace-write」。
+        # **capability 缺席時保持寫入卡契約，不是 fail-open**：那正是
+        # 今天的行為，而本票的保守方向逐字就是「不確定 ⇒ 維持寫入卡契約」。
         # 真實 launcher 一定有這支（`SubprocessLauncher.as_write_forbidden`），
         # 由 `tests/test_card_contract_sandbox_mode_716.py` 釘住。
         write_forbidden_factory = getattr(launcher, "as_write_forbidden", None)

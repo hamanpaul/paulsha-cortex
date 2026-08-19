@@ -898,21 +898,29 @@ def build_codex_argv(
         if commit_required:
             for git_write_dir in _linked_worktree_git_write_dirs(worktree):
                 argv += ["--add-dir", git_write_dir]
-    if not allow_unsafe:
-        # #714：codex 的**內層沙箱形態**。預設是 bubblewrap，而 bwrap 在本系統的
-        # 加固面下要付四條放寬（`ProcSubset`／`RestrictNamespaces`／
-        # `RestrictAddressFamilies`／`SystemCallFilter` 加 `@mount`），其中兩條放寬的
-        # 正是 user namespace 與 mount——外層加固面存在的理由本身。改走
-        # landlock ＋ seccomp 之後外層一條都不必動（見 `permgen.CODEX_LEGACY_LANDLOCK`）。
-        #
-        # **形態由登記表導出，不在這裡寫死**：`permgen.EXECUTOR_TOOLS` 那一列同時是
-        # 「需要放行哪些 syscall 群組」的來源，而那條需求在 permgen import 當下被強制
-        # （`_validate_inner_sandbox_support()`）。兩邊各寫一份就會出現「argv 換了形態、
-        # 加固面沒跟上」的靜默組合。
-        #
-        # `allow_unsafe` 那一支刻意不帶：`--dangerously-bypass-approvals-and-sandbox`
-        # 已經整個關掉內層沙箱，再選形態沒有意義。
-        argv += list(_codex_inner_sandbox_argv())
+    # #714／#716 B 後半：codex 的**內層沙箱形態**。預設是 bubblewrap，而 bwrap 在本
+    # 系統的加固面下要付四條放寬（`ProcSubset`／`RestrictNamespaces`／
+    # `RestrictAddressFamilies`／`SystemCallFilter` 加 `@mount`），其中兩條放寬的
+    # 正是 user namespace 與 mount——外層加固面存在的理由本身。改走
+    # landlock ＋ seccomp 之後外層一條都不必動（見 `permgen.CODEX_LEGACY_LANDLOCK`）。
+    #
+    # **形態由登記表導出，附掛條件由寫入契約導出，兩者都不在這裡寫死**：
+    # `permgen.EXECUTOR_TOOLS` 那一列同時是「需要放行哪些 syscall 群組」的來源
+    # （permgen import 當下由 `_validate_inner_sandbox_support()` 強制）；「這張卡
+    # 附不附」住在 `registry.SANDBOX_MODE_DERIVATION` 的 `attaches_inner_sandbox`
+    # 欄（registry import 當下與 mode 的一致性被釘死）——read-only 族附（landlock
+    # 今天是好的、真的在擋），`danger-full-access` 那列不附（沒有內層可附，帶著
+    # 旗標只會在 job log 開頭多印 deprecation 噪音），`allow_unsafe` 那列不附
+    # （`--dangerously-bypass-approvals-and-sandbox` 已整個關掉，再選形態沒有意義）。
+    argv += list(
+        _codex_inner_sandbox_argv(
+            allow_unsafe=allow_unsafe,
+            read_only=read_only,
+            review_only=review_only,
+            commit_required=commit_required,
+            write_forbidden=write_forbidden,
+        )
+    )
     for spool_dir in _verdict_spool_add_dirs(
         verdict_spool_dir, read_only=read_only, review_only=review_only
     ):
@@ -931,8 +939,21 @@ def build_codex_argv(
     return argv
 
 
-def _codex_inner_sandbox_argv() -> tuple[str, ...]:
-    """codex 的內層沙箱形態 argv（`permgen.EXECUTOR_TOOLS` 是唯一真相，#714）。
+def _codex_inner_sandbox_argv(
+    *,
+    allow_unsafe: bool = False,
+    read_only: bool = False,
+    review_only: bool = False,
+    commit_required: bool = False,
+    write_forbidden: bool = False,
+) -> tuple[str, ...]:
+    """codex 的內層沙箱形態 argv（#714），依寫入契約決定附不附（#716 B 後半）。
+
+    **兩張登記表各管一半，這裡都不寫死**：形態本身（哪個旗標、需要哪些 syscall
+    群組）在 `permgen.EXECUTOR_TOOLS`；「這張卡附不附」在
+    `registry.SANDBOX_MODE_DERIVATION` 的 `attaches_inner_sandbox` 欄——與 mode 的
+    一致性在 registry import 當下被釘死（附 ⇔ mode 是 `read-only`）。不附的契約
+    （`danger-full-access` 的寫入卡、`allow_unsafe` 的 bypass）回空 tuple。
 
     lazy import 與 `planning_job`／`planning_probe_cache` 既有的做法一致：`trust_root`
     是產生器面，不該進 `coordinator` 的模組載入圖，但**登記表的內容必須只有一份**。
@@ -951,8 +972,17 @@ def _codex_inner_sandbox_argv() -> tuple[str, ...]:
     時會撞上與本票逐字相同的牆。要動那一條路，得先量它的 JSON 抽取吃不吃得下那筆 error。
     """
 
-    from ..trust_root import permgen
+    from ..trust_root import permgen, registry
 
+    contract = registry.derive_job_write_contract(
+        allow_unsafe=allow_unsafe,
+        read_only=read_only,
+        review_only=review_only,
+        commit_required=commit_required,
+        write_forbidden=write_forbidden,
+    )
+    if not registry.inner_sandbox_attached_for(contract):
+        return ()
     spec = permgen.executor_inner_sandbox("codex")
     return () if spec is None else tuple(spec.argv)
 

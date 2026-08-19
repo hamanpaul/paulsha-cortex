@@ -244,12 +244,21 @@ class CodexArgvTests(unittest.TestCase):
     def _argv(self, **kwargs) -> list[str]:
         return build_codex_argv(prompt="P", slice_id="wf-1", log_dir="/lg", **kwargs)
 
-    def test_builder_argv_carries_the_registry_flag_verbatim(self) -> None:
+    def test_the_flag_rides_exactly_on_the_contracts_that_attach_it(self) -> None:
+        """#716 B 後半：附掛條件跟著契約走，旗標逐字只上 read-only 族的 argv。
+
+        寫入卡（預設 builder 與 commit-required）**不帶**——`danger-full-access`
+        那一列沒有內層沙箱，旗標對它是無意義殘留，只會在 job log 開頭多印一筆
+        deprecation 的 error item；write-forbidden 的 build 卡（builder persona、
+        read-only mode）**照帶**，它的 landlock 今天是好的、真的在擋。
+        """
+
         spec = permgen.executor_inner_sandbox("codex")
         assert spec is not None
-        argv = self._argv(commit_required=True)
-        joined = " ".join(argv)
-        self.assertIn(" ".join(spec.argv), joined)
+        flag = " ".join(spec.argv)
+        for kwargs in ({}, {"commit_required": True}):
+            self.assertNotIn(flag, " ".join(self._argv(**kwargs)), kwargs)
+        self.assertIn(flag, " ".join(self._argv(write_forbidden=True)))
 
     def test_read_only_and_review_only_carry_it_too(self) -> None:
         """**不以「這個 lane 會不會跑命令」當判準。**
@@ -437,8 +446,19 @@ class DegradedLaunchTests(unittest.TestCase):
         self.assertNotIn(target_b, " ".join(command_a))
 
     def test_the_job_command_still_picks_the_registry_sandbox_shape(self) -> None:
+        """派工出去的 job command 消費的是同一張導出表（#716 B 後半）。
+
+        `_launch()` 走的是預設 builder＝寫入卡契約：mode 是 `danger-full-access`、
+        **不帶** legacy landlock 旗標、也**不帶** `--dangerously-bypass-*`（那會連
+        #698 封住的 hook 信任閘一起關掉）。
+        """
+
         command, _job_log, _log_dir = self._launch()
-        self.assertIn("use_legacy_landlock", " ".join(command))
+        joined = " ".join(command)
+        self.assertIn("danger-full-access", joined)
+        self.assertNotIn("use_legacy_landlock", joined)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", joined)
+        self.assertNotIn("--dangerously-bypass-hook-trust", joined)
 
 
 # ---------------------------------------------------------------------------
