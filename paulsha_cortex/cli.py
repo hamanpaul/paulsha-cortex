@@ -26,6 +26,7 @@ setup and workflow commands:
   deck             預覽或產生 dispatch:hold 的 slice specs
   skill            skill usage ledger 檢視與 park/janitor 操作（inspect/park/restore/...）
   monitor          掃描專案文件並輸出 Project Monitor 狀態
+  egress-proxy     出口 proxy 服務（#716；--check 只印生效設定與白名單）
   list             列出統一 Work Item read model
   work show        顯示單一 Work Item 與可解釋關聯
   doctor           檢查 gh、preflight、model identity、agy 與 service paths
@@ -148,6 +149,12 @@ def main(argv: Sequence[str] | None = None, *, work_client=None) -> int:
         from paulsha_cortex.monitor.__main__ import main as monitor_main
 
         return int(monitor_main(args[1:]) or 0)
+    if args[0] == "egress-proxy":
+        # #716：出口 proxy 服務的進入點（`cortex-egress-proxy.service` 的 ExecStart=）。
+        # 形態與 `cortex monitor` 一致：部署 venv 的 console script ＋ 一個 CLI verb。
+        from paulsha_cortex.trust_root.egress_proxy import main as egress_proxy_main
+
+        return int(egress_proxy_main(args[1:]) or 0)
     if args[0] == "list":
         return _work_read_main(args, work_client=work_client)
     if args[0] == "work":

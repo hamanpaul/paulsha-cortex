@@ -631,6 +631,36 @@ CODEX_LEGACY_LANDLOCK = InnerSandboxSpec(
 
 
 @dataclass(frozen=True)
+class EgressHost:
+    """一支 executor **自己**要連得到的網路主機（#716 出口白名單的一格）。
+
+    白名單是**主機名**級而不是位址級，理由是 0819 實測到的一條事實：
+    `api.openai.com` 解到 Cloudflare（`162.159.140.245`／`172.66.0.243`），CIDR 會漂，
+    而且同一組位址上有無數其他站點——**位址白名單表達不出「只連得到模型 API」**。
+    `IPAddressAllow=` 只負責把出口收斂到一個固定的 loopback 位址（proxy），
+    「哪些主機放行」由 proxy 依這張表判定。
+    """
+
+    host: str
+    #: 逐字量測證據（命令＋輸出片段）。空字串代表本格未量測，此時 `measured` 必須為 False。
+    evidence: str
+    #: 是否有實機量測背書。`False` ＝ 由 binary strings／文件推得，尚未實機看到它被請求。
+    measured: bool = True
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", self.host):
+            # 主機名會被逐字拿去做 exact match，形狀必須受限（不接受 wildcard：
+            # `*.chatgpt.com` 之類的萬用字元會把 `ab.chatgpt.com` 這種遙測端點一起放進來，
+            # 而 0819 實測 codex 在該端點被拒之後照常完成一次 turn）。
+            raise ValueError(f"EgressHost.host 形狀不合法: {self.host!r}")
+        if self.measured and not self.evidence.strip():
+            raise ValueError(
+                f"EgressHost({self.host!r}) 宣告 measured=True 卻沒有 evidence——"
+                "「量過」與「沒量過」必須是兩個看得出來的值（#714／#716 的原型錯誤）。"
+            )
+
+
+@dataclass(frozen=True)
 class ToolchainProgram:
     """一支落進部署樹 toolchain 的外部程式的搬移契約。"""
 
@@ -669,6 +699,16 @@ class ToolchainProgram:
     #: 的 syscall ＋ executor argv 上的一個形態選擇」。三個處置方向兩兩不同，因此是
     #: 三個欄位而不是一個（#673 立的規矩，本票是第二個實例）。
     inner_sandbox: "InnerSandboxSpec | None" = None
+    #: 這支程式**自己**要連得到的網路主機（#716）。出口白名單由這一欄機械導出——
+    #: :func:`egress_allowlist` 是唯一的匯總點，proxy 執行期讀的也是同一支函式。
+    #:
+    #: **與其他三個加固欄位一樣是量出來的，不是查文件來的**：每一格都帶
+    #: :class:`EgressHost.evidence`（逐字量測輸出）與 `measured` 旗標。`measured=False`
+    #: 的格子**仍然會進白名單**——出口管制的 fail-closed 方向是「沒被宣告的主機連不到」，
+    #: 不是「沒被量到的主機不准連」；後者會在 operator 沒看到任何證據的情況下把一個
+    #: executor 靜默弄壞，那正是 #679／#714 那一族的形狀。未量到的格子由
+    #: :func:`unmeasured_egress_hosts` 逐條列出來，runbook 與測試都看得到。
+    api_hosts: "tuple[EgressHost, ...]" = ()
 
 
 #: #640 的名字，保留為別名：那時表上只有 executor，型別名跟著語意走；#661 把非
@@ -690,6 +730,39 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
         "codex", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
         filtered_syscalls=("pkey_alloc",),
         inner_sandbox=CODEX_LEGACY_LANDLOCK,
+        api_hosts=(
+            EgressHost(
+                "chatgpt.com",
+                evidence=(
+                    "0819 實機（builder 真實加固面 ＋ IPAddressDeny=any ＋ "
+                    "IPAddressAllow=<proxy>/32 ＋ Environment=HTTPS_PROXY=）："
+                    "`codex exec 'Reply with exactly: PSC716-EGRESS-OK'` rc=0、"
+                    "模型逐字回 `PSC716-EGRESS-OK`、tokens used 10,659；"
+                    "proxy log 逐字 `CONNECT chatgpt.com:443` → ALLOW ×17。"
+                    "`auth.json` 的 `auth_mode` 是 `chatgpt`，因此這是**主要**端點。"
+                ),
+            ),
+            EgressHost(
+                "auth.openai.com",
+                evidence=(
+                    "binary strings 逐字 `https://auth.openai.com/oauth/token`（token "
+                    "refresh）與 `https://auth.openai.com/api/accounts`。0819 那次 exec "
+                    "沒有觸發 refresh（token 未過期）⇒ **本格的實機證據只到「binary 會用它」**，"
+                    "沒有量到一次真的 refresh。放行它是 R-6 取捨的延伸："
+                    "token 過期必須 refresh 得回來，擋掉它等於讓 job 在 token 到期那天全滅。"
+                ),
+                measured=False,
+            ),
+            EgressHost(
+                "api.openai.com",
+                evidence=(
+                    "0819 實機（同一份加固面複本）：`curl https://api.openai.com/v1/models` "
+                    "經 proxy 得 `http=401`（＝連得到）。API-key 認證模式（`OPENAI_API_KEY`）"
+                    "走這一個端點；本部署目前是 chatgpt 模式，兩種都放行才不會在切換認證"
+                    "模式的那天靜默斷線。"
+                ),
+            ),
+        ),
         note=(
             "唯一硬需要 node 的：本體是 JS，進入點的 shebang 是 `#!/usr/bin/env node`。"
             "單搬那支 `.js` 會缺 `node_modules`，必須整包搬 npm 套件樹。"
@@ -699,11 +772,50 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ),
     ExecutorTool(
         "claude", ExecutorShape.NATIVE_ELF, needs_node=False, copy_tree=False,
+        api_hosts=(
+            EgressHost(
+                "api.anthropic.com",
+                evidence=(
+                    "0819 實機（reviewer 真實加固面 ＋ IPAddressDeny=any ＋ 只放行 proxy）："
+                    "`claude -p 'reply OK'` 之下 proxy log 逐字 "
+                    "`CONNECT api.anthropic.com:443` ×8（該次白名單刻意不含它 ⇒ DENY，"
+                    "claude 印 `Failed to authenticate. API Error: 403 status code`）"
+                    "——DENY 的那一行正是「claude 確實吃 HTTPS_PROXY」的證據。"
+                ),
+            ),
+            EgressHost(
+                "platform.claude.com",
+                evidence=(
+                    "0819 同一次量測，proxy log 逐字 `CONNECT platform.claude.com:443` ×2。"
+                    "與 `api.anthropic.com` 交錯出現，未逐項確認它是必要還是可選。"
+                ),
+            ),
+        ),
         note="自帶原生執行檔，**不因 node 版本而行為改變**——node 的版本風險不涵蓋它。",
     ),
     ExecutorTool(
         "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=False,
         filtered_syscalls=("pkey_alloc",),
+        api_hosts=(
+            EgressHost(
+                "api.githubcopilot.com",
+                evidence=(
+                    "**未實機量測**：本部署沒有 copilot 的登入態，量不到它真的請求哪些主機。"
+                    "來源是 codex binary 內逐字可見的 `https://api.githubcopilot.com`"
+                    "與 copilot CLI 的公開端點。要走 copilot 之前必須先照 runbook 的"
+                    "出口探針量一次，把這一格補成 measured。"
+                ),
+                measured=False,
+            ),
+            EgressHost(
+                "api.github.com",
+                evidence=(
+                    "**未實機量測**：同上。copilot 的認證與模型端點分屬兩個主機，"
+                    "只放行其一會得到一個很難查的半通狀態。"
+                ),
+                measured=False,
+            ),
+        ),
         note=(
             "shell script，但**內部再 exec node**（#643 實機量測確認：完整加固面下 "
             "`--version` 空輸出，單獨拿掉 `MemoryDenyWriteExecute` 即正常，與 codex "
@@ -714,6 +826,33 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
     ),
     ExecutorTool(
         "agy", ExecutorShape.NATIVE_ELF, needs_node=False, copy_tree=False,
+        api_hosts=(
+            EgressHost(
+                "play.googleapis.com",
+                evidence=(
+                    "0819 實機（reviewer 真實加固面 ＋ 只放行 proxy）：`agy -p 'reply OK'` "
+                    "之下 proxy log 逐字 `CONNECT play.googleapis.com:443` ×4（該次白名單"
+                    "不含它 ⇒ DENY）——證明 agy 也吃 HTTPS_PROXY。"
+                ),
+            ),
+            EgressHost(
+                "antigravity-unleash.goog",
+                evidence=(
+                    "0819 同一次量測，proxy log 逐字 `CONNECT antigravity-unleash.goog:443` ×2。"
+                ),
+            ),
+            EgressHost(
+                "accounts.google.com",
+                evidence=(
+                    "**未實機量測到它被請求**：該次量測在該帳號上走到互動式登入流程"
+                    "（stderr 逐字 `Authentication required. Please visit the URL to log in: "
+                    "https://accounts.google.com/o/oauth2/auth?...`）就逾時了，因此"
+                    "**agy 在已登入狀態下真正的模型 API 主機沒有被量到**。"
+                    "走 agy 之前必須照 runbook 的出口探針重量一次。"
+                ),
+                measured=False,
+            ),
+        ),
         note="自帶原生執行檔，同 `claude`：不受系統層 node 版本影響。",
     ),
 )
@@ -2966,6 +3105,16 @@ class PathLayout:
         return f"{self.venv_root}/bin/cortex monitor"
 
     @property
+    def egress_proxy_exec_start(self) -> str:
+        """出口 proxy 的 `ExecStart=`（#716）。
+
+        與 Manager／monitor 同一種形態：部署 venv 的 `cortex` console script ＋ 一個
+        CLI verb。白名單**不在這條命令列上**——它由 `permgen.egress_allowlist()` 在
+        執行期導出，因此「unit 上寫的」與「proxy 實際放行的」不可能漂移。
+        """
+        return f"{self.venv_root}/bin/cortex egress-proxy"
+
+    @property
     def env_file(self) -> str:
         return f"{self.deploy_root}/etc/{self.instance}-manager.env"
 
@@ -4936,6 +5085,414 @@ def _validate_inner_sandbox_support() -> None:
 _validate_inner_sandbox_support()
 
 
+# ---------------------------------------------------------------------------
+# 出口網路管制（#716 選項 B 的前置條件）
+#
+# ## 要達成的性質
+#
+#   **codex／claude 連得到自己的模型 API，模型下的任意命令連不到別處。**
+#
+# ## 為什麼不是位址白名單
+#
+# `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` 放行 IPv4/IPv6，實測（0819，
+# builder 的真實加固面複本、42 條 `--property=` 全量導出）：
+#
+#     TCP 443       → OUTBOUND-OK ('1.1.1.1', 443)
+#     DNS UDP       → rc=0
+#     模型 API      → curl https://api.openai.com/v1/models → http=401（＝連得到）
+#     loopback:22   → 連得上
+#
+# 合併「job 讀得到自己的 `auth.json`」（兩層都不擋，而且**不該**擋——見 R-6 取捨），
+# 一次跑完的實測結論逐字是 `CREDS-READABLE / EGRESS-OPEN`：**模型跑的任意命令可讀出
+# 自己的 token 並外傳，一條命令兩步。**
+#
+# `IPAddressDeny=any` 實測**生效**（同一條 connect 由 `OUTBOUND-OK` 變 `TimeoutError`），
+# 但它是**位址**級的，而 `api.openai.com` 解到 Cloudflare（`162.159.140.245`／
+# `172.66.0.243`）——CIDR 會漂，同一組位址上還有無數其他站點。⇒ 位址白名單**表達不出**
+# 上面那句性質。
+#
+# ## 形態：`IPAddressDeny=any` ＋ 專屬 loopback 位址上的 forward proxy
+#
+#   1. job unit：`IPAddressDeny=any` ＋ `IPAddressAllow=<proxy 位址>/32`
+#      ⇒ 核心層擋住**任意命令**的直連（實測：`env -u HTTPS_PROXY … python3 -c` 開 socket
+#      對 Cloudflare／1.1.1.1／GitHub 四個位址全 `TimeoutError`）；
+#   2. job unit：`Environment=HTTPS_PROXY=`（root-owned，job 改不了那份宣告）
+#      ⇒ executor 自己走得出去（實測 codex／claude／agy **三支都吃** proxy env）；
+#   3. proxy：只放行 :func:`egress_allowlist` 的主機名（CONNECT exact match）。
+#
+# **第 1 條與第 2 條的關係是關鍵**：模型的任意命令當然可以 `env -u HTTPS_PROXY`，
+# 但那只會讓它掉回第 1 條——位址級的 `IPAddressDeny` 是核心強制的，不由行程環境決定。
+#
+# ## 為什麼不用 codex 自帶的 managed proxy
+#
+# codex 0.147.0 確實內建一整個 `codex_network_proxy`（MITM、`network_policy.rs`、
+# `allowed_domains`／`denied_domains`、`/etc/codex/managed_config.toml`），但：
+#
+#   - 它的功能描述逐字是 **“Apply network proxy restrictions to sandboxed sessions
+#     that already have network access.”**——它是**套在內層沙箱上**的限制，而選項 B
+#     的整個前提就是關掉那一層；
+#   - `codex features list` 逐字：`network_proxy  experimental  false`；
+#   - 它的強制手段是把一長串 `HTTP_PROXY`／`NPM_CONFIG_*`／`PIP_PROXY`… **注入子行程的
+#     環境**（binary strings 逐字可見那張清單）。沒有內層沙箱時，模型的命令 `unset`
+#     一下就繞過了。
+#
+# ⇒ codex 自帶機制**在 B 的世界裡結構上不成立**，必須外掛一支由 systemd 強制到位的
+# proxy。這不是「沒查」的結論，是查完之後的結論。
+#
+# ## `respect_system_proxy` 這個旗標不是前提
+#
+# `codex features list` 逐字 `respect_system_proxy  under development  false`，
+# 讀起來像是「預設不吃系統 proxy」。**實測否證**：旗標維持預設 false 時，
+# `HTTPS_PROXY=http://127.0.0.1:<port> codex cloud list` 在 proxy log 上留下
+# `CONNECT chatgpt.com:443`。⇒ codex 的 HTTP client **預設就吃** proxy env，
+# 本形態不需要任何 argv／feature flag 變更（argv 那半屬 #716 的另一張票）。
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EgressProxy:
+    """出口 proxy 的部署契約（位址、埠、執行帳號、unit 名）。
+
+    **位址刻意不是 `127.0.0.1`。** `IPAddressAllow=` 沒有埠的概念，放行一個位址就是放行
+    該位址上的**每一個**監聽埠。0819 實測 `IPAddressAllow=127.0.0.1/32` 之下 job 連得到：
+
+        REACH-OK docker-tcp-2375     ← **未認證的 docker daemon TCP API ＝ 宿主 root**
+        REACH-OK sshd-22
+        REACH-OK 8080
+        REACH-OK 3003
+
+    改用專屬 loopback 位址（同一次量測，`IPAddressAllow=127.0.7.16/32`）：
+
+        REACH-BLOCKED docker-tcp-2375@127.0.0.1   TimeoutError
+        REACH-BLOCKED 8080@127.0.0.1              TimeoutError
+        REACH-OK      sshd-22@127.0.7.16
+        REACH-OK      3003@127.0.7.16
+
+    ⇒ 綁 `127.0.0.1` 的服務**被排除**，綁 `0.0.0.0` 的服務仍然應答（`0.0.0.0` 涵蓋整個
+    127/8）。這是本形態**已知且未消除**的殘留：見 :data:`EGRESS_RESIDUAL_RISK`。
+    `SocketBindDeny=` 本可壓縮這一面，但這台機器上量到它**不生效**
+    （見 :data:`HARDENING_DEFERRED`）。
+    """
+
+    #: proxy 服務的專屬 OS 帳號。**不得**是任何 cortex job 帳號，也不得是 Manager
+    #: ——它是唯一一個「持有到外網的路」的行程，與「跑不受信任程式碼」和「持 spawn
+    #: 授權」兩條線都必須分開。
+    account: str = "cortex-egress"
+    #: 綁定位址。127/8 內的專屬位址，理由見 class docstring。
+    bind_address: str = "127.0.7.16"
+    port: int = 18080
+    #: systemd unit 名（非模板：proxy 是長駐服務，不是 per-job 的）。
+    unit_stem: str = "cortex-egress-proxy"
+
+    def __post_init__(self) -> None:
+        _validate_account_name(self.account)
+        if not re.fullmatch(r"127\.\d{1,3}\.\d{1,3}\.\d{1,3}", self.bind_address):
+            raise ValueError(
+                f"EgressProxy.bind_address 必須是 127/8 內的位址: {self.bind_address!r}"
+                "——非 loopback 位址會讓這支 proxy 從網路上可達，而它是本部署裡唯一"
+                "一條通到外網的路。"
+            )
+        if self.bind_address == "127.0.0.1":
+            raise ValueError(
+                "EgressProxy.bind_address 不得是 127.0.0.1：`IPAddressAllow=127.0.0.1/32` "
+                "會連帶放行綁在該位址上的每一個服務（0819 實測含未認證的 docker daemon "
+                "TCP API，等於把宿主 root 送給 job）。用一個專屬位址。"
+            )
+        if not 1024 <= self.port <= 65535:
+            raise ValueError(f"EgressProxy.port 需為非特權埠: {self.port}")
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.bind_address}:{self.port}"
+
+    @property
+    def ip_address_allow(self) -> str:
+        """job unit 上 `IPAddressAllow=` 的值——**單一位址**，不是網段。"""
+        return f"{self.bind_address}/32"
+
+    @property
+    def unit_name(self) -> str:
+        return f"{self.unit_stem}.service"
+
+    def job_env(self) -> "dict[str, str]":
+        """job unit 上要宣告的 proxy 環境變數（大小寫兩套 ＋ 清空的 `NO_PROXY`）。
+
+        **大小寫都要**：三支 executor 的 HTTP client 各自來自不同語言生態
+        （rust/reqwest、node/undici、go），對大小寫的取用習慣不一致；只宣告一套就等於
+        賭其中一支的實作細節。0819 的實測是兩套一起給的，因此**兩套一起**才是被量過的
+        那個形態。
+
+        `NO_PROXY=` 明示清空：許多 client 對未設的 `NO_PROXY` 會套用內建的 localhost
+        例外，而本形態的 proxy **就在 loopback 上**——留白會讓「連 proxy 也不走 proxy」
+        這種內建預設有機會把請求打回直連（然後被 `IPAddressDeny` 靜默吞掉，症狀是逾時）。
+        """
+        return {
+            "HTTPS_PROXY": self.url,
+            "HTTP_PROXY": self.url,
+            "https_proxy": self.url,
+            "http_proxy": self.url,
+            "NO_PROXY": "",
+            "no_proxy": "",
+        }
+
+
+#: 本部署的出口 proxy。改位址／埠只改這裡，unit、shim、proxy 本體與 runbook 全部跟著動。
+EGRESS_PROXY = EgressProxy()
+
+#: job unit 上 proxy 環境變數的名字集合。`job_shim.resolve_job_env()` 用它把 root-owned
+#: unit 上的宣告帶進 job 的環境——與 `PATH` 同一個理由、同一個機制（#679）：shim 以
+#: `os.execvpe(file, args, env)` **整份換掉**環境，unit 的 `Environment=` 預設到不了模型。
+EGRESS_PROXY_ENV_NAMES: tuple[str, ...] = tuple(sorted(EGRESS_PROXY.job_env()))
+
+
+def egress_allowlist(
+    tools: "tuple[ToolchainProgram, ...] | None" = None,
+) -> tuple[EgressHost, ...]:
+    """出口白名單——由 :data:`EXECUTOR_TOOLS` 的 `api_hosts` 機械導出。
+
+    **這是唯一的匯總點。** proxy 執行期呼叫的是這一支、unit 註解印的是這一支、
+    runbook 的驗證步驟比對的也是這一支；沒有第二份清單可以漂移。
+
+    同一個主機被兩個 executor 宣告時只留一格（evidence 併起來），排序決定性。
+    """
+    tools = EXECUTOR_TOOLS if tools is None else tools
+    merged: dict[str, EgressHost] = {}
+    for tool in tools:
+        for entry in tool.api_hosts:
+            existing = merged.get(entry.host)
+            if existing is None:
+                merged[entry.host] = replace(
+                    entry, evidence=f"[{tool.name}] {entry.evidence}"
+                )
+                continue
+            merged[entry.host] = replace(
+                existing,
+                evidence=f"{existing.evidence}\n[{tool.name}] {entry.evidence}",
+                measured=existing.measured or entry.measured,
+            )
+    return tuple(merged[host] for host in sorted(merged))
+
+
+def egress_allowed_hosts() -> tuple[str, ...]:
+    """白名單的主機名（proxy 比對用的那份純資料）。"""
+    return tuple(entry.host for entry in egress_allowlist())
+
+
+def unmeasured_egress_hosts() -> tuple[EgressHost, ...]:
+    """白名單裡**沒有實機量測背書**的格子。
+
+    它們**在**白名單上（fail-closed 的方向是「沒宣告的連不到」，不是「沒量到的不准連」），
+    但必須是看得見的一份清單：runbook 走到那個 executor 之前要先把它量成 measured。
+    """
+    return tuple(entry for entry in egress_allowlist() if not entry.measured)
+
+
+#: 本形態**已知且未消除**的殘留曝險。逐條寫出來，不藏在 docstring 裡：登記表、unit 註解
+#: 與 runbook 都引用它。
+EGRESS_RESIDUAL_RISK: tuple[str, ...] = (
+    "綁 `0.0.0.0` 的本機服務仍然應答 proxy 位址（`0.0.0.0` 涵蓋整個 127/8）。0819 實機"
+    "量到的是 `sshd:22` 與 `:3003`；綁 `127.0.0.1` 的服務（含未認證的 docker daemon "
+    "TCP `127.0.0.1:2375`）則**被排除**。壓縮這一面的工具是 `SocketBindDeny=`／"
+    "per-port 的位址過濾，但前者在本環境量到不生效（見 HARDENING_DEFERRED）。",
+    "白名單是**主機名**級，因此「模型 API 本身」仍是一條可用的外傳通道——job 可以把資料"
+    "寫進送往模型的 prompt。這條在任何形態下都存在（executor 本來就要送資料給模型），"
+    "本票不宣稱關掉它；本票關掉的是「送去**別的**地方」。",
+    "proxy 監聽在 loopback 上，因此**本機任何帳號**都連得到它並經它連到白名單主機。"
+    "它不持有任何憑證、也不注入任何 header，所以拿到的只是一條到公開端點的路；"
+    "但它確實不是只有 job 用得到。",
+    "DNS 由 proxy 端解析。job 端的 DNS 在 `IPAddressDeny=any` 下**整個不通**"
+    "（實測 `PermissionError: [Errno 1]`／`gaierror: [Errno -3]`）——這對 CONNECT proxy "
+    "無妨（client 送主機名、proxy 負責解析），但任何**直接**依賴 DNS 的 job 內命令會失敗。",
+)
+
+#: 量過、但在**本環境**未生效的加固鍵。**不靜默放進 unit 當安慰劑**——放進去會讓讀 unit
+#: 的人以為那一面已經關上。這張表是「量過而且量到不生效」的紀錄，與「還沒量」嚴格區分。
+HARDENING_DEFERRED: tuple[tuple[str, str, str], ...] = (
+    (
+        "SocketBindDeny",
+        "any",
+        "0819 實機**未量到生效**：systemd 接受該屬性（unit 起得來、rc=0），但同一次"
+        "`bind(('0.0.0.0',18081))` 與 `bind(('127.0.0.1',18082))` 皆逐字 `BIND-OK`，"
+        "與不帶該屬性的對照組完全相同。成因：本機 `systemctl --version` 逐字 "
+        "`-BPF_FRAMEWORK`，而 `SocketBindAllow/Deny` 依賴 cgroup BPF 的 bind hook。"
+        "同一台機器上 `IPAddressDeny=any` **有**生效（它走的是不需要 libbpf 的那條路徑），"
+        "因此這不是「BPF 全掛」，是這一項專屬的缺口。目標機若是 `+BPF_FRAMEWORK`，"
+        "重量之後再加。",
+    ),
+    (
+        "RestrictFileSystems",
+        "",
+        "**未量到**（不是量到不生效）：同一個 `-BPF_FRAMEWORK` 的成因下 unit 仍然起得來，"
+        "因此「起得來」不承載任何語意。沒有量測就不當籌碼——本票不使用它。",
+    ),
+)
+
+
+#: **哪幾個 job principal 受出口管制**。寫成顯式決定而不是「全部」：gate 跑的是 operator
+#: 宣告的命令（`pytest`／`npm test`），那條路上有沒有套件來源需求**本票沒有量**，
+#: 硬套等於拿一個沒量過的假設去換一個今天是好的 lane。
+EGRESS_CONTROLLED_JOB_PRINCIPALS: frozenset[Principal] = frozenset(
+    {Principal.BUILDER, Principal.REVIEWER}
+)
+
+#: 明示**不**受出口管制的 job principal ＋ 逐字理由。與上面那張表聯集必須涵蓋
+#: :data:`DOWNGRADED_JOB_PRINCIPALS`，import 時強制——新增一個 job principal 時
+#: 「要不要管出口」是一個必須打出來的決定，不會靜默落到任一邊。
+EGRESS_UNCONTROLLED_JOB_PRINCIPALS: Mapping[Principal, str] = MappingProxyType({
+    Principal.GATE: (
+        "gate 跑的是 operator 宣告的命令（`pytest`／`npm test`），它可能需要套件來源"
+        "（PyPI／npm registry）——而那組主機**本票一條都沒量**。把出口收掉等於用一個"
+        "沒量過的假設去換一個今天是好的執行面（#716 的教訓正是「驗收路徑與生產形態不同」）。"
+        "gate 帳號**不持有任何模型憑證**，因此它的出口曝險與 builder／reviewer 不同級。"
+        "它仍然拿到本節其餘三項圍堵（`InaccessiblePaths`／`TasksMax`／`MemoryMax`+"
+        "`MemorySwapMax`）。收掉 gate 的出口是另一張票，前置是把 gate 命令的相依主機量出來。"
+    ),
+})
+
+
+def _validate_egress_coverage() -> None:
+    """每一個 job principal 都必須落在受管制／明示不管制其中一邊。"""
+    covered = EGRESS_CONTROLLED_JOB_PRINCIPALS | set(EGRESS_UNCONTROLLED_JOB_PRINCIPALS)
+    missing = sorted(
+        p.value for p in DOWNGRADED_JOB_PRINCIPALS if p not in covered
+    )
+    if missing:
+        raise ValueError(
+            f"job principal {missing} 沒有出口管制決定——`EGRESS_CONTROLLED_JOB_PRINCIPALS` "
+            "與 `EGRESS_UNCONTROLLED_JOB_PRINCIPALS` 必須涵蓋 DOWNGRADED_JOB_PRINCIPALS 的"
+            "每一項。靜默落到任一邊都不可接受：落到「不管制」是無聲的缺口，落到「管制」"
+            "是無聲地弄壞一條 lane。"
+        )
+    overlap = sorted(
+        p.value
+        for p in EGRESS_CONTROLLED_JOB_PRINCIPALS
+        if p in EGRESS_UNCONTROLLED_JOB_PRINCIPALS
+    )
+    if overlap:
+        raise ValueError(f"job principal {overlap} 同時被宣告為受管制與不受管制")
+
+
+#: **全部 job unit**（含 gate）都套用的圍堵條款——與出口管制正交，因此是另一張表。
+#:
+#: 判準：這幾項的代價與「跑什麼」無關（不像出口白名單那樣依賴 executor 的端點清單），
+#: 因此不需要 per-principal 的決定。
+_JOB_CONTAINMENT: tuple[tuple[str, str, str], ...] = (
+    (
+        "InaccessiblePaths",
+        "-/run/dbus -/run/docker.sock",
+        "封掉系統匯流排與 docker socket。**已量到生效**（0819）：不加時 "
+        "`busctl --system list` rc=0 且列得出整張匯流排（31 列）；加上之後逐字 "
+        "`Failed to connect to bus: Permission denied`、`connect('/run/docker.sock')` "
+        "得 `PermissionError: [Errno 13]`。"
+        "※ D-Bus 上的提權那一步**目前是 polkit 擋住的**，不是加固面擋的——這一行把那一格"
+        "從「唯一一道防線在 polkit 規則上」變成兩道。"
+        "※ `-` 前綴＝目標不存在時不讓 unit 起不來（沒有 docker 的機器上 "
+        "`/run/docker.sock` 本來就不該存在；那不是缺陷，是沒有那個東西要擋）。"
+        "**這與 ReadWritePaths 的 fail-closed 立場不衝突**：那邊「目標不存在」代表"
+        "job 寫不出成果，這邊代表「沒有這個要封的東西」。",
+    ),
+    (
+        "TasksMax",
+        "512",
+        "行程數天花板。**已量到生效**（0819）：`TasksMax=32` 之下 fork 壓力逐字停在 "
+        "`FORK-STOP at 31 BlockingIOError [Errno 11]`；不加時 `fork 200` 全成功。"
+        "512 是留給 node ＋ 子行程樹的寬鬆值，不是壓到剛好——目的是擋 fork bomb，"
+        "不是精算工作負載。",
+    ),
+    (
+        "MemoryMax",
+        "25%",
+        "記憶體天花板。**必須與下一行成對**：0819 實測只設 `MemoryMax=64M` 時 200MB "
+        "配置仍逐字 `ALLOC-OK 200MB`（cgroup 已落 `memory.max`，但 swap 無上限，"
+        "配置整個溢到 swap 去）；補上 `MemorySwapMax=0` 之後同一條 rc=1（被 OOM 收掉）。"
+        "用百分比而不是絕對值：這一項要的是「一個 job 吃不掉整台機器」，"
+        "而那句話在不同規格的機器上對應到不同的絕對值。",
+    ),
+    (
+        "MemorySwapMax",
+        "0",
+        "**上一行的另一半，不是獨立的一項**。單獨的 `MemoryMax=` 在有 swap 的機器上"
+        "只是把配置趕進 swap，天花板形同虛設（實測見上一行）。兩行一起才是一個天花板。",
+    ),
+)
+
+
+def containment_lines(header: Sequence[str]) -> list[str]:
+    """`_JOB_CONTAINMENT` → unit 行（含逐條理由註解）。
+
+    `header` 之外的內容對每一份 unit 逐字相同——這幾項的定義只有一份，
+    「job unit 有、proxy unit 忘了加」不可能發生。
+    """
+    lines = list(header)
+    for key, value, why in _JOB_CONTAINMENT:
+        lines += _wrap_comment(why)
+        lines.append(f"{key}={value}")
+    for key, value, why in HARDENING_DEFERRED:
+        lines += _wrap_comment(
+            f"※ **未加入** `{key}={value}`（不是遺漏，是量測結論）：{why}"
+        )
+    return lines
+
+
+def job_containment_lines() -> list[str]:
+    """job 模板 unit 的圍堵段。"""
+    return containment_lines([
+        "# --- 圍堵條款（#716；**全部 job unit** 共用，含 gate）---",
+        "# 與下方的出口管制正交：這幾項的代價與 job 跑什麼無關，"
+        "因此不需要 per-principal 的決定。",
+    ])
+
+
+def job_egress_lines(principal: Principal, proxy: EgressProxy = EGRESS_PROXY) -> list[str]:
+    """`principal` 的出口管制 unit 行（受管制）或逐字理由（不受管制）。"""
+    if principal not in EGRESS_CONTROLLED_JOB_PRINCIPALS:
+        reason = EGRESS_UNCONTROLLED_JOB_PRINCIPALS[principal]
+        return [
+            "# --- 出口網路：**本 principal 不受管制**（#716，顯式決定）---",
+        ] + _wrap_comment(reason)
+
+    allowlist = egress_allowlist()
+    lines = [
+        "# --- 出口網路管制（#716 選項 B 的前置條件）---",
+        "# 要達成的性質：**executor 連得到自己的模型 API，模型下的任意命令連不到別處。**",
+        "# 兩層，缺一即退化：",
+        "#   1. 下面的 IPAddressDeny/Allow——**核心層**，位址級，不由行程環境決定。"
+        " 模型的命令",
+        "#      `env -u HTTPS_PROXY` 繞得過第 2 層，繞不過這一層（0819 實測：直連 "
+        "Cloudflare／",
+        "#      1.1.1.1／GitHub 四個位址全 TimeoutError）。",
+        "#   2. 下面的 Environment=*_PROXY——**可用性**那一半，讓 executor 自己走得出去。",
+        "# 位址級白名單為什麼不夠：api.openai.com 解到 Cloudflare（162.159.140.245／",
+        "# 172.66.0.243），CIDR 會漂，而且同一組位址上有無數其他站點。",
+    ]
+    lines += _wrap_comment(
+        f"proxy 綁在專屬 loopback 位址 {proxy.bind_address}（**不是** 127.0.0.1）："
+        "IPAddressAllow= 沒有埠的概念，放行 127.0.0.1 就等於放行綁在它上面的每一個服務"
+        "——0819 實測那組裡有未認證的 docker daemon TCP API（127.0.0.1:2375），"
+        "＝把宿主 root 送給 job。"
+    )
+    lines += [
+        "IPAddressDeny=any",
+        f"IPAddressAllow={proxy.ip_address_allow}",
+        f"# proxy 服務：{proxy.unit_name}（User={proxy.account}，非任何 job 帳號、無 root）。",
+        "# 它掛了 ⇒ job 連不到模型 API ⇒ job 失敗。**這是刻意的 fail-closed**：",
+        "# 「proxy 沒起來」與「出口全開」之間不存在中間狀態。",
+        f"# 白名單（由 permgen.egress_allowlist() 機械導出，共 {len(allowlist)} 條）：",
+    ]
+    for entry in allowlist:
+        mark = "" if entry.measured else "   ⚠ 未實機量測"
+        lines.append(f"#   - {entry.host}{mark}")
+    lines += [
+        "# --- proxy 環境變數 ---",
+        "# ⚠️ **這幾行 unit 上有還不夠**：shim 以 os.execvpe 整份換掉環境，unit 的",
+        "#    Environment= 預設到不了模型（與 #679 的 PATH 同一個機制）。第二層在",
+        "#    `job_shim.resolve_job_env()`——它從本 unit 提供的環境把這幾個名字帶進 job 的",
+        "#    env。兩層都成立這一段才有意義；只改一層＝一個看起來很嚴、實際全開的 unit。",
+    ]
+    for name, value in sorted(proxy.job_env().items()):
+        lines.append(f"Environment={name}={value}")
+    return lines
+
+
 @dataclass(frozen=True)
 class NodeExecutionSurface:
     """一支 `needs_node` 的**非 executor** 程式 × 它實際跑在哪個加固面上（#661）。"""
@@ -5563,6 +6120,11 @@ def deferred_run_dependencies() -> tuple[DeferredDependency, ...]:
 #: 回來。搬過去之後兩邊仍是**同一個 tuple 物件**，不是兩份會漂移的清單。
 DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = registry.DOWNGRADED_JOB_PRINCIPALS
 
+# #716：出口管制的涵蓋面檢查放在這裡（而不是宣告處），因為它要比對的
+# `DOWNGRADED_JOB_PRINCIPALS` 到這一行才存在。新增 job principal 而沒有為它做出
+# 「要不要管出口」的決定時，這個模組**載不起來**。
+_validate_egress_coverage()
+
 #: 每個 job 角色的 `PATH` 覆寫變數名。與 `coordinator/job_runner.JOB_ROLE_CONFIG`
 #: 的 `path_env` 是**成對契約**（同 `DEFAULT_TEMPLATE_UNIT` 的既有模式：permgen 與
 #: job_runner 刻意不互相 import，改由契約測試釘住兩邊逐字相等）。產生的 unit 內註解
@@ -6001,6 +6563,129 @@ def build_monitor_unit(
     )
 
 
+def build_egress_proxy_unit(
+    scheme: UidScheme,
+    layout: PathLayout = DEFAULT_LAYOUT,
+    proxy: EgressProxy = EGRESS_PROXY,
+) -> SystemdUnit:
+    """出口 proxy 的 system-level unit（#716）。
+
+    ## 它為什麼必須是**自己的**帳號
+
+    這支行程是本部署裡唯一一條通到外網的路。三條線都必須與它分開：
+
+      - **不得是任何 job 帳號**：job 跑不受信任的程式碼；若 proxy 與 job 同 UID，
+        job 就能 `kill`／`ptrace` 它、或搶先 `bind` 到那個位址（`RemoveIPC`／
+        `ProtectProc=invisible` 擋得住跨 UID，擋不住同 UID）。那等於讓被管制的一方
+        自己決定管制內容。
+      - **不得是 Manager 帳號**：Manager 持 spawn 授權，而 proxy 處理的是外部回應——
+        `injection 可達的任何進程都不得持有 spawn 授權` 這條裁決逐字適用。
+      - **不得有 root**：與整套信任根同一條裁決（`CapabilityBoundingSet=` 清空、
+        `NoNewPrivileges=yes`，兩者由共用的 `_HARDENING` 表帶進來）。
+
+    ## 它為什麼沒有任何 `ReadWritePaths=`
+
+    proxy 不落任何檔：白名單來自 `permgen.egress_allowlist()`（部署樹裡的程式碼，
+    root-owned、對它唯讀），log 走 journal。`ProtectSystem=strict` ＋ 零 RWP ⇒
+    整個檔案系統對它唯讀。**這一格空著是結論，不是還沒填**。
+
+    ## 白名單為什麼不在命令列上
+
+    寫進 `ExecStart=` 會立刻產生第二份真相（unit 上一份、`EXECUTOR_TOOLS` 上一份），
+    而兩份清單漂移之後的症狀是「某個 executor 某天突然連不上」——離原因很遠。
+    proxy 在執行期呼叫 :func:`egress_allowlist`，因此 unit 上只印得出**註解**。
+    """
+    account = proxy.account
+    group = scheme.group_of(account)
+    allowlist = egress_allowlist()
+    unresolved = unmeasured_egress_hosts()
+
+    body = [
+        f"# {'/etc/systemd/system/' + proxy.unit_name}",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root unit {scheme.scheme_id} --egress-proxy",
+        "#",
+        "# #716：出口網路管制的第二半。第一半在四份 job 模板 unit 上",
+        "# （IPAddressDeny=any ＋ IPAddressAllow=<本服務的位址>/32 ＋ Environment=*_PROXY=）。",
+        "# 兩半缺一即退化：只有 IPAddressDeny ⇒ executor 也連不到模型；",
+        "# 只有 proxy ⇒ 模型的任意命令直連繞過它。",
+        "#",
+    ]
+    body += _wrap_comment(
+        f"執行帳號 {account}：**不是**任何 job 帳號、不是 Manager、無 root。"
+        "理由見本函式 docstring（同 UID 的 job 可以 kill／ptrace 它或搶先 bind）。"
+    )
+    body += ["#"]
+    for risk in EGRESS_RESIDUAL_RISK:
+        body += _wrap_comment(f"⚠ 已知殘留：{risk}")
+    body += [
+        "",
+        "[Unit]",
+        "Description=cortex egress proxy (trust-root #716, host allowlist)",
+        "Documentation=file://docs/superpowers/runbooks/trust-root-phase2b-setup.md",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "# 專屬服務帳號（見檔頭）。",
+        f"User={account}",
+        f"Group={group}",
+        "",
+        "# 與 Manager／monitor 同形態的進入點：部署 venv 的 console script ＋ CLI verb。",
+        "# 白名單**不在這一行上**——它由 permgen.egress_allowlist() 在執行期導出，",
+        "# 因此「unit 上寫的」與「proxy 實際放行的」結構上不可能漂移。",
+        f"ExecStart={layout.egress_proxy_exec_start}",
+        "# 落在必然存在、且對本服務唯讀的部署樹根。",
+        f"WorkingDirectory={layout.deploy_root}",
+        "",
+        f"# --- 白名單（permgen.egress_allowlist()，共 {len(allowlist)} 條）---",
+    ]
+    for entry in allowlist:
+        mark = "   ⚠ 未實機量測" if not entry.measured else ""
+        body.append(f"#   - {entry.host}{mark}")
+    if unresolved:
+        body += _wrap_comment(
+            "⚠ 上面標記的格子由 binary strings／文件推得，**沒有實機看到它被請求**。"
+            "它們仍在白名單上（fail-closed 的方向是「沒宣告的連不到」，不是「沒量到的"
+            "不准連」——後者會在沒有任何證據的情況下靜默弄壞一個 executor）。"
+            "走到那個 executor 之前先照 runbook 的出口探針量一次。"
+        )
+    body += [
+        "",
+        "# --- 加固（與 Manager／monitor／job unit 逐項同一份 _HARDENING 表）---",
+    ]
+    body += _hardening_lines()
+    body += [""]
+    body += containment_lines([
+        "# --- 圍堵條款（#716；與 job unit 共用同一張表）---",
+        "# proxy 本身也是一個會處理外部輸入的行程，沒有理由比 job 寬。",
+    ])
+    body += [
+        "",
+        "# --- ReadWritePaths：**一條都沒有**（這是結論，不是還沒填）---",
+        "# proxy 不落任何檔：白名單來自部署樹裡的程式碼（root-owned、對它唯讀），",
+        "# log 走 journal。ProtectSystem=strict ＋ 零 RWP ⇒ 整個檔案系統對它唯讀。",
+        "",
+        "# **刻意不加 IPAddressDeny/Allow**：它就是那條出口。收斂的手段是白名單，不是位址。",
+        "",
+        "Restart=on-failure",
+        "RestartSec=5s",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+    ]
+    return SystemdUnit(
+        unit_name=proxy.unit_name,
+        install_path=f"/etc/systemd/system/{proxy.unit_name}",
+        account=account,
+        exec_start=layout.egress_proxy_exec_start,
+        environment_file=None,
+        read_write_paths=(),
+        content="\n".join(body) + "\n",
+    )
+
+
 def _job_unit_credential_lines(job_layout: "PathLayout", account: str) -> list[str]:
     """模板 unit 裡「本帳號有哪幾份登入態、各是什麼形狀」那一段（#685）。
 
@@ -6391,6 +7076,10 @@ def build_job_unit(
         "# 日後往表裡加一項，兩份 unit 會自動同時拿到。",
     ]
     body += _hardening_lines(profile)
+    body += [""]
+    body += job_containment_lines()
+    body += [""]
+    body += job_egress_lines(principal)
     body += [""]
     read_only = enforcement_read_only_paths(job_layout, account, tuple(owners.keys()))
     body += _rwp_lines(owners, read_only)
@@ -7474,7 +8163,34 @@ def unit_replica_properties(
                 "#673 同一族事故）。先重跑產生器落檔："
                 "`python3 -m paulsha_cortex.trust_root unit …`。"
             )
+        _assert_egress_pair_intact(props)
     return tuple(props)
+
+
+def _assert_egress_pair_intact(props: Sequence[str]) -> None:
+    """出口管制的兩層必須在**同一份落檔的 unit** 上同時存在（#716）。
+
+    半套的失敗模式是最貴的那一種：只有 `IPAddressDeny=any` 而沒有 proxy 宣告 ⇒
+    executor 連不到模型 API ⇒ 症狀是逾時；只有 proxy 宣告而沒有 `IPAddressDeny` ⇒
+    出口其實全開，而 unit 讀起來像是關上的。兩者都不該靜默存在，因此在**產生複本的
+    那一刻**就擋下來——這一支正是 runbook 每一條驗證的入口。
+    """
+    joined = "\n".join(props)
+    has_deny = "--property=IPAddressDeny=any" in props
+    has_proxy = "--property=Environment=HTTPS_PROXY=" in joined
+    if has_deny and not has_proxy:
+        raise UnitReplicaDriftError(
+            "落檔的 unit 有 `IPAddressDeny=any` 但沒有 `Environment=HTTPS_PROXY=`"
+            "——出口被關掉、卻沒有給 executor 那條合法的路，症狀會是「模型 API 逾時」"
+            "而不是任何看得懂的錯誤（#716）。重跑產生器落檔。"
+        )
+    if has_proxy and not has_deny:
+        raise UnitReplicaDriftError(
+            "落檔的 unit 有 `Environment=HTTPS_PROXY=` 但沒有 `IPAddressDeny=any`"
+            "——proxy 只是**可用性**那一半，強制那一半在 IPAddressDeny 上。少了它，"
+            "模型的任意命令 `env -u HTTPS_PROXY` 就直接出去了，而 unit 讀起來像是關上的"
+            "（#716）。重跑產生器落檔。"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,8 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                         [--external-reader-account <帳號名|none>]
                                                     # Phase 2a 權限計畫（JSON 或命令序列）
     python -m paulsha_cortex.trust_root unit [four-way|three-way|two-way]
-                                        [--manager|--monitor|--job|--review-job|--gate-job
+                                        [--manager|--monitor|--egress-proxy
+                                         |--job|--review-job|--gate-job
                                          |--job-properties]
                                         [--profile strict|jit]
                                                     # Phase 2b systemd unit 內容
@@ -21,6 +22,10 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     #   unit：與 manager 同帳號、同加固段，
                                                     #   但 ReadWritePaths 只由 monitor
                                                     #   persona 的登記表面導出，嚴格更窄；
+                                                    #   --egress-proxy＝#716 的出口 proxy
+                                                    #   服務 unit（User=cortex-egress，
+                                                    #   非任何 job 帳號、無 root、零
+                                                    #   ReadWritePaths）；
                                                     #   --job＝builder 的模板 unit；
                                                     #   --review-job＝#615 M2 的 reviewer
                                                     #   ＋planner 模板 unit（同帳號，
@@ -130,6 +135,10 @@ Phase 1 不改 `cortex` CLI（避免動到 R-16 help 對齊面）；operator／C
                                                     # addRule、單一 return YES
     python -m paulsha_cortex.trust_root scaffold [four-way|three-way|two-way]
                                                     # Phase 2b 骨架目錄的 install -d 命令
+    python -m paulsha_cortex.trust_root egress-allowlist
+                                                    # #716：出口白名單（唯一來源＝
+                                                    # permgen.EXECUTOR_TOOLS 的 api_hosts）。
+                                                    # proxy 執行期讀的是同一支函式。
 
 UID 方案未指定時一律用 **`four-way`**（#629 的定案：`cortex-manager`／
 `cortex-reviewer-planner`／`cortex-builder`／**`cortex-gate`**）。`three-way`
@@ -388,6 +397,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 which = "manager"
             elif token == "--monitor":
                 which = "monitor"
+            elif token == "--egress-proxy":
+                which = "egress-proxy"
             elif token == "--job":
                 which = "job"
             elif token == "--review-job":
@@ -461,8 +472,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         builders = {
             "manager": permgen.build_manager_unit,
             "monitor": permgen.build_monitor_unit,
+            "egress-proxy": permgen.build_egress_proxy_unit,
         }
         print(builders[which](scheme).content, end="")
+        return 0
+    if command == "egress-allowlist":
+        # 出口白名單的唯一來源（permgen.egress_allowlist()）。runbook 的驗證步驟
+        # 與 proxy 執行期讀的是同一支函式，因此這裡印出來的就是實際放行的那一份。
+        print("# 出口白名單（#716）——由 permgen.EXECUTOR_TOOLS 的 api_hosts 機械導出。")
+        print(f"# proxy: {permgen.EGRESS_PROXY.url}"
+              f"（unit {permgen.EGRESS_PROXY.unit_name}, User={permgen.EGRESS_PROXY.account}）")
+        print(f"# job unit: IPAddressDeny=any + IPAddressAllow="
+              f"{permgen.EGRESS_PROXY.ip_address_allow}")
+        for entry in permgen.egress_allowlist():
+            mark = "" if entry.measured else "   # ⚠ 未實機量測"
+            print(f"{entry.host}{mark}")
         return 0
     if command == "unit-replica":
         rest = args[1:]
