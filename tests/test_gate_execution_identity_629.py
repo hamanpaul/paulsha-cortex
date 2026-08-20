@@ -892,6 +892,49 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse((dst / "escape").joinpath("secret").is_file()
                              and not (dst / "escape").is_symlink())
 
+    def test_unreadable_regenerable_caches_are_skipped_by_name(self) -> None:
+        """#736：builder 在 `UMask=0077` 下產生的 `.pytest_cache` mode 0700 ⇒ ACL
+        mask `---` ⇒ gate 讀不到；而它是可再生快取、不是候選樹內容，snapshot 依名
+        跳過而不是整格死。"""
+        with tempfile.TemporaryDirectory() as root:
+            src = Path(root) / "src"
+            (src / "tests").mkdir(parents=True)
+            (src / "tests" / "test_red.py").write_text("def test(): ...\n", encoding="utf-8")
+            unreadable = src / ".pytest_cache"
+            unreadable.mkdir()
+            (unreadable / "CACHEDIR.TAG").write_text("Signature", encoding="utf-8")
+            nested = src / "tests" / "__pycache__"
+            nested.mkdir()
+            os.chmod(unreadable, 0)
+            os.chmod(nested, 0)
+            try:
+                dst = Path(root) / "snap"
+                gate_ledger.snapshot_worktree(src, dst)
+                self.assertTrue((dst / "tests" / "test_red.py").is_file())
+                # 跳過＝不進副本，任意深度皆然。
+                self.assertFalse((dst / ".pytest_cache").exists())
+                self.assertFalse((dst / "tests" / "__pycache__").exists())
+            finally:
+                os.chmod(unreadable, 0o700)
+                os.chmod(nested, 0o700)
+
+    def test_an_unreadable_non_cache_entry_still_fails_closed(self) -> None:
+        """清單外的不可讀項目照樣 `SnapshotError`——「跳過讀不到的東西」是禁手：
+        候選內容讀不到時靜默跳過會讓 gate 在殘缺的樹上判出假 verdict。"""
+        if os.geteuid() == 0:  # pragma: no cover - root 不受 mode 0 限制
+            self.skipTest("mode 0 對 root 不生效")
+        with tempfile.TemporaryDirectory() as root:
+            src = Path(root) / "src"
+            src.mkdir()
+            candidate = src / "tests"
+            candidate.mkdir()
+            os.chmod(candidate, 0)
+            try:
+                with self.assertRaises(gate_ledger.SnapshotError):
+                    gate_ledger.snapshot_worktree(src, Path(root) / "snap")
+            finally:
+                os.chmod(candidate, 0o700)
+
     def test_a_stale_snapshot_is_rebuilt_not_merged(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             src = Path(root) / "src"
