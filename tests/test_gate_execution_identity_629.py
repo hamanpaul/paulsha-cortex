@@ -1078,7 +1078,7 @@ class RegenerateGatesConvergenceTests(unittest.TestCase):
         from paulsha_cortex.coordinator import manager
 
         source = inspect.getsource(manager.terminalize_workflow_job)
-        run_at = source.index("_run_gate_execution_identity(job)")
+        run_at = source.index("_run_gate_execution_identity(job, registry=registry)")
         read_at = source.index("_assert_terminal_gate_consistency(raw")
         self.assertLess(run_at, read_at)
 

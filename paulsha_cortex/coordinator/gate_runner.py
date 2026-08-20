@@ -708,6 +708,7 @@ def ensure_gate_ledger(
     env: Mapping[str, str] | None = None,
     coordinator_root: str | Path | None = None,
     runner: Any | None = None,
+    ancestry_baseline: str | None = None,
 ) -> dict[str, Any] | None:
     """降權模式下，在採信之前把缺席的 gate ledger 補上；回傳 payload 或 `None`。
 
@@ -745,16 +746,24 @@ def ensure_gate_ledger(
     if not isinstance(worktree, str) or not Path(worktree).is_dir():
         return None
     job_id = str(job.get("job_id") or spool_key)
-    # #738：ancestry baseline ＝ 這張卡 provision 時的 dispatch_head（Manager 寫進
-    # job 記錄的值，不是 job 的可變輸入）。缺席／非 sha 時不傳——ledger 的
-    # ancestry_ok 維持 None，採信端自然退回既有路徑。
-    dispatch_head = job.get("dispatch_head")
-    baseline = (
-        dispatch_head.lower()
-        if isinstance(dispatch_head, str)
-        and gate_ledger._SHA_RE.fullmatch(dispatch_head.lower()) is not None
-        else None
-    )
+    # #743：baseline 以**呼叫端（採信端同一條導出）**為準——`dispatch_head` 是 run
+    # 層級、claim 時凍結的值（後續 build 卡逐字繼承第一張卡的），不是這張卡 clone
+    # 的 handoff base；只有首張卡兩者碰巧同值。呼叫端未給時退回 job 導出（#738 的
+    # 既有行為），缺席／非 sha 一律不傳——ledger 的 ancestry_ok 維持 None，採信端
+    # 自然退回既有路徑。
+    baseline = ancestry_baseline
+    if baseline is None:
+        dispatch_head = job.get("dispatch_head")
+        baseline = (
+            dispatch_head.lower()
+            if isinstance(dispatch_head, str)
+            and gate_ledger._SHA_RE.fullmatch(dispatch_head.lower()) is not None
+            else None
+        )
+    elif gate_ledger._SHA_RE.fullmatch(baseline.lower()) is None:
+        baseline = None
+    else:
+        baseline = baseline.lower()
     return run_declared_gates(
         job_id=job_id,
         spool_key=spool_key,
