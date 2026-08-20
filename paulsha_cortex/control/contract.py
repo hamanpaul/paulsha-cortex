@@ -18,7 +18,8 @@ WORK_ACTIONS = frozenset(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
-        "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
+        "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "intake",
     }
 )
 WORK_SOURCE_KINDS = frozenset({"github_issue", "github_pr", "openspec", "path"})
@@ -183,6 +184,35 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
             ):
                 raise ValueError("work-action retry-card requires exact card id")
         if action in {"abandon", "retire-delivered"}:
+            expected_run_id = args.get("expected_run_id")
+            actor = args.get("actor")
+            reason = args.get("reason")
+            if (
+                not isinstance(expected_run_id, str)
+                or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+            ):
+                raise ValueError(f"work-action {action} requires exact expected_run_id")
+            if (
+                not isinstance(actor, str)
+                or actor != actor.strip()
+                or not 1 <= len(actor) <= 128
+                or not actor.isprintable()
+            ):
+                raise ValueError(f"work-action {action} requires bounded actor")
+            if (
+                not isinstance(reason, str)
+                or reason != reason.strip()
+                or not 1 <= len(reason) <= 500
+                or not reason.isprintable()
+            ):
+                raise ValueError(f"work-action {action} requires bounded reason")
+        if action == "refreeze-base":
+            # issue #731 (A)：明示把候選 git base 重新凍結到目前的 `origin/main`。
+            # 界限刻意與 abandon／retire-delivered／reset-reclaim-budget 同一族
+            # （同樣是「一個人明示把一個已凍結的事實推到新值」）：bounded actor ＋
+            # bounded reason。與 reclaim-reset 的差別是這裡**要** expected_run_id
+            # ——重新凍結的對象就是一個具體的、還活著的 WorkflowRun，少了 exact
+            # CAS 就可能動到 operator 心裡想的那個 run 之外的 run。
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")
             reason = args.get("reason")

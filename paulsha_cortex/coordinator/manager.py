@@ -3329,6 +3329,28 @@ def _verify_build_candidate_transition(
     return candidate
 
 
+def workflow_build_branch(run) -> str:
+    """run 的 canonical build branch 名——**唯一**一條推導。
+
+    #731：`_dispatch_workflow_card` 原本就地算這個名字（primary issue ＝ 最小的
+    已授權 issue number，接 `run.work_id`）。`work refreeze-base` 必須在**改動
+    候選基底之前**先問「這條 branch 現在在哪裡、會不會撞 #613 的
+    `existing worktree branch has commits outside requested base`」，而那個問題
+    只有拿到同一個 branch 名才問得準。抬成單一導出點，避免第二份會漂移的推導。
+    """
+
+    issue_numbers = [
+        int(match.group(1))
+        for ref in run.issue_refs
+        if (match := re.fullmatch(rf"{re.escape(run.repo)}#([1-9][0-9]*)", ref))
+    ]
+    primary_issue = min(issue_numbers) if issue_numbers else None
+    builder_work_id = (
+        f"{primary_issue}-{run.work_id}" if primary_issue is not None else run.work_id
+    )
+    return f"feature/{builder_work_id}"
+
+
 def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     """#648：中段／後續 build 卡的 clone base——**卡與卡交接的顯式通道**。
 
@@ -9236,16 +9258,9 @@ def _dispatch_workflow_card(
                 )
             except BaseException as exc:
                 raise ValueError("workflow builder worktree creator unavailable") from exc
-        issue_numbers = [
-            int(match.group(1))
-            for ref in run.issue_refs
-            if (match := re.fullmatch(rf"{re.escape(run.repo)}#([1-9][0-9]*)", ref))
-        ]
-        primary_issue = min(issue_numbers) if issue_numbers else None
-        builder_work_id = (
-            f"{primary_issue}-{run.work_id}" if primary_issue is not None else run.work_id
-        )
-        builder_branch = f"feature/{builder_work_id}"
+        # #731：branch 名的推導抬成 `workflow_build_branch()`（模組級單一導出點），
+        # 讓 `work refreeze-base` 的 #613 前置檢查問到的是**同一條** branch。
+        builder_branch = workflow_build_branch(run)
         # #648：canonical lane 的工作區改為 **per-job**——每一張 build 卡自己 clone
         # 一份，目錄名 ＝ 這張卡的 job_id 經 `job_workspace.job_segment()` 導出的
         # 片段，也就是 `job_runner.template_instance_id()` 算出來的 instance 名。
