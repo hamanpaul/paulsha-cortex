@@ -24,7 +24,7 @@ class ClaimEraAdvanceTests(unittest.TestCase):
         anchor = source.index("job = jobs[-1] if jobs else dispatch_or_stop")
         selection = source[:anchor]
         selection = selection[selection.rindex("jobs = ["):]
-        self.assertIn('job.get("workflow_claim_key") == run.claim_key', selection)
+        self.assertIn('job.get("workflow_claim_key") in (None, run.claim_key)', selection)
 
     def test_dispatch_matching_stays_era_agnostic(self) -> None:
         """派工端 matching（instance 編號＋retry-context）維持全 era。"""
@@ -33,6 +33,33 @@ class ClaimEraAdvanceTests(unittest.TestCase):
         anchor = source.index("matching = [")
         block = source[anchor : anchor + 600]
         self.assertNotIn("workflow_claim_key", block)
+
+class RetryCardEraTests(unittest.TestCase):
+    def test_retry_card_target_jobs_filter_by_claim_era(self) -> None:
+        from paulsha_cortex.coordinator import work_actions
+
+        class _Run:
+            run_id = "workflow-" + "a" * 20
+            current_phase = "verify"
+            candidate_head = "c" * 40
+            claim_key = "claim:v1:" + "1" * 64
+
+        def job(claim, evidence=None):
+            return {
+                "workflow_run_id": _Run.run_id,
+                "workflow_phase": "verify",
+                "workflow_card": "verification",
+                "subject_head": _Run.candidate_head,
+                "workflow_claim_key": claim,
+                "workflow_evidence": evidence,
+            }
+
+        old_era = job("claim:v1:" + "0" * 64, evidence={"bound": True})
+        current = job(_Run.claim_key)
+        rows = work_actions._retry_card_target_jobs(
+            _Run(), [old_era, current], card="verification"
+        )
+        self.assertEqual(rows, [current])
 
 
 if __name__ == "__main__":  # pragma: no cover

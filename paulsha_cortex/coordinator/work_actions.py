@@ -2344,6 +2344,12 @@ def _retry_card_target_jobs(run, jobs, *, card: str) -> list[dict[str, Any]]:
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_phase") == run.current_phase
         and job.get("workflow_card") == card
+        # #765：與 advance 選擇同一條 era 判準——authority restart（#373）後，
+        # 前代 era 的 job（含其綁定 evidence）是歷史稽核列：拿它們當「已採信不可
+        # 重派」的拒絕理由，會讓新 era 的重派無解（實機：verification-38 的舊 era
+        # evidence 擋死 retry-card，run 卡在 verify 永不推進）。
+        # 缺欄位視為未 pin（legacy／測試 fixture，#379 同型容忍）；帶欄位者必須同 era。
+        and job.get("workflow_claim_key") in (None, run.claim_key)
         and (
             run.current_phase == "build"
             or job.get("subject_head") == run.candidate_head
