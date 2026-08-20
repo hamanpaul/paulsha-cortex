@@ -6,6 +6,12 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#738：candidate 驗證下放 gate ledger，三分部署下帶 candidate 的 build 卡終於
+  可被採信。** gate 身分在快照副本上收集 `worktree_state`（head／dirty／
+  ancestry），Manager 只消費權威 ledger、不再以自己的身分 `git -C <builder 樹>`
+  （#641 收掉唯讀 ACL 後那條路結構上必死）。baseline 經封閉 argv
+  `--assert-ancestor` 由 job 記錄導出；ledger 缺席時逐字退回既有路徑（direct
+  模式零回歸）。#629 後半／#641 預留的那張票。
 - **#736：gate snapshot 依名跳過可再生快取目錄（`__pycache__`／`.pytest_cache`／
   `.mypy_cache`／`.ruff_cache`），寫入卡不再結構性必死。** builder unit 的
   `UMask=0077` 讓 pytest 產生的 `.pytest_cache/` 以 group bits 0 落地 ⇒ ACL

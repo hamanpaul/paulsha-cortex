@@ -3264,6 +3264,32 @@ def _raise_if_worktree_read_blocked(result: object, *, what: str) -> None:
     )
 
 
+def _job_gate_worktree_state(job: Mapping[str, object]) -> Mapping[str, object] | None:
+    """這個 job 的權威 gate ledger 裡的 `worktree_state`（#738），讀不到即 None。
+
+    權威 ledger（`<log>.gates.json`）由 Manager 自己落地（#628 的
+    `foreign_evidence_author()` 檢查的就是它），內容則是 gate 執行身分在快照副本上
+    收集的——這是 #629／#641 裁定的「第三執行身分在受控 checkout 執行」的落點。
+    `probe != "ok"` 視同缺席：消費端一律退回既有 fail-closed 路徑，不對半套狀態
+    做任何推論。
+    """
+
+    log_path = job.get("log_path")
+    if not isinstance(log_path, str) or not log_path:
+        return None
+    path = terminal_contract.gate_ledger_path(log_path)
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    state = payload.get(gate_ledger.WORKTREE_STATE_KEY)
+    if not isinstance(state, Mapping) or state.get("probe") != "ok":
+        return None
+    return state
+
+
 def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> str:
     candidate = job.get("subject_head")
     # reviewer 走 `workflow_repo_root`，不讀 reviewer 的工作樹（那是 sandbox）。
@@ -3281,6 +3307,21 @@ def _verify_exact_candidate(job: Mapping[str, object], *, git_runner=None) -> st
         or not isinstance(worktree, str)
     ):
         raise ValueError("workflow job candidate/worktree missing")
+
+    if job.get("persona") != "reviewer":
+        # #738：builder 樹那條先消費 gate ledger 的 worktree_state——三分部署下
+        # Manager 讀不進 builder 的樹（#641），HEAD == candidate 由 gate 執行身分
+        # 在快照副本上量測。state 缺席／probe 非 ok 時退回下面的既有 git 路徑：
+        # direct 模式（同 UID）照走、三分模式維持 #629 的 fail-closed。
+        state = _job_gate_worktree_state(job)
+        if state is not None:
+            head = state.get("head")
+            if not isinstance(head, str) or head != candidate.lower():
+                raise ValueError(
+                    "workflow candidate is not exact worktree HEAD "
+                    f"(gate ledger head={head!r})"
+                )
+            return candidate
 
     def run_git(argv: list[str]):
         if git_runner is None:
@@ -3330,6 +3371,17 @@ def _verify_build_candidate_transition(
         raise ValueError("workflow build candidate baseline missing")
     if baseline == candidate:
         return candidate
+
+    # #738：ancestry 同樣先消費 gate ledger。ledger 記錄的 baseline 必須恰等於
+    # Manager 當下算出的 baseline——不等（refreeze／換代造成的陳舊 ledger）視同
+    # 缺席，退回既有路徑，不採信一份針對別的基線量出來的答案。
+    state = _job_gate_worktree_state(job)
+    if state is not None and state.get("ancestry_baseline") == baseline:
+        ancestry_ok = state.get("ancestry_ok")
+        if ancestry_ok is True:
+            return candidate
+        if ancestry_ok is False:
+            raise ValueError("workflow build candidate is not a descendant")
 
     argv = ["git", "-C", worktree, "merge-base", "--is-ancestor", baseline, candidate]
     if git_runner is None:
