@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#765 補遺：delivery journal rebase 連 claim_key 一起帶**（era 雙店面不一致修復）。
 - **#765 補遺：binding mismatch 錯誤帶 job_id 與兩側值。**
 - **#765 補遺：retry-card 的 target-jobs 亦以 claim era 過濾**（舊 era evidence
   不再擋死新 era 重派）。
