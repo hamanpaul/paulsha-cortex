@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#752 補遺：retry-card 的 adjudication evidence 改接 `resolved_state_path`**
+  （原始參數在 daemon 路徑恆為 None，人裁通道上線即不可用）。
 - **#752：verify 階段的人裁通道。** `retry-card --reason` → Manager-owned
   immutable evidence（`cortex-operator-adjudication/v1`）→ retry_context 的
   `operator_adjudications` 鍵（builder 與 reviewer 卡都吃）。design/todo 矛盾
