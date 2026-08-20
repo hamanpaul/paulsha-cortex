@@ -10306,6 +10306,14 @@ def resume_workflow_run(
         if job.get("workflow_run_id") == run.run_id
         and job.get("workflow_card") == step.card
         and job.get("workflow_phase") == step.phase
+        # #765：advance 只認**本 claim era** 的 terminal job。authority restart
+        # （#373：operator link／PR 建立等 authority 前進）會重算 claim_key 並把
+        # verify/review 打回 pending——設計語意是「在新 era 下重驗」；前代 era 的
+        # terminal job 若仍被撿起，`_job_for_workflow_card` 的 claim_key 綁定必炸，
+        # 而且每 tick 重炸（#373 docstring 記載的那個永動迴圈的另一半）。era 不符
+        # 的 job 是前代稽核列，不是本 era 的候選——跳過之後 `dispatch_or_stop`
+        # 會為新 era 重新派工。
+        and job.get("workflow_claim_key") == run.claim_key
         and (
             step.phase not in {"verify", "review"}
             or job.get("subject_head") == run.candidate_head
