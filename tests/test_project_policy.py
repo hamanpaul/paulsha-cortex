@@ -223,6 +223,37 @@ def test_valid_tier_preflight_does_not_create_needs_human_candidate_state(
     assert updates == []
 
 
+def test_workflow_tier_preflight_names_absent_repo_root() -> None:
+    updates: list[dict[str, object]] = []
+
+    class Registry:
+        def _manager_update_workflow_run(self, run_id: str, **kwargs: object) -> object:
+            updates.append({"run_id": run_id, **kwargs})
+            return SimpleNamespace(run_id=run_id, current_phase="build")
+
+    dispatcher = SimpleNamespace(_registry=Registry())
+    run = SimpleNamespace(
+        run_id="run-492-no-root",
+        work_id="work-492",
+        workspace_root=None,
+        facets=(),
+    )
+    step = SimpleNamespace(phase="build")
+
+    result = manager._validate_foreign_review_policy_before_build(
+        dispatcher,
+        run=run,
+        step=step,
+    )
+
+    assert result == {
+        "run_id": "run-492-no-root",
+        "current_phase": "build",
+        "reason": "repo-root-unresolved",
+    }
+    assert updates[0]["needs_human_reason"].reason == "repo-root-unresolved"
+
+
 @pytest.mark.parametrize("manifest_name", [CANONICAL_NAME, LEGACY_NAME])
 def test_symlinked_manifest_is_rejected_fail_closed(
     tmp_path: Path,

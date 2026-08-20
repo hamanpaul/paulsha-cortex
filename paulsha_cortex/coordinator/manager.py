@@ -3433,8 +3433,28 @@ def _validate_foreign_review_policy_before_build(dispatcher, *, run, step) -> di
 
     if step.phase != "build":
         return None
+    workspace_root = getattr(run, "workspace_root", None)
+    if not isinstance(workspace_root, (str, Path)) or not str(workspace_root):
+        registry = dispatcher._registry
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+            needs_human_reason=diagnostic_reason(
+                "repo-root-unresolved",
+                "foreign review tier preflight skipped: workflow repo_root is absent",
+                source="manager._dispatch_workflow_card:foreign-review-config",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                phase=step.phase,
+            ),
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "repo-root-unresolved",
+        }
     try:
-        foreign_review.read_repo_tier(run.workspace_root)
+        foreign_review.read_repo_tier(workspace_root)
     except ValueError as exc:
         registry = dispatcher._registry
         updated = registry._manager_update_workflow_run(

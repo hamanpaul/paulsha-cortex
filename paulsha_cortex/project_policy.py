@@ -76,14 +76,12 @@ def resolve_project_policy(repo_root: str | Path) -> ProjectPolicyResolution:
     )
 
 
-def read_repo_tier(repo_root: str | Path, *, require_manifest: bool = False) -> str:
-    """Resolve the repository tier at the earliest authoritative boundary.
+def read_repo_tier(repo_root: str | Path) -> str:
+    """Resolve the repository tier, failing closed for malformed manifests.
 
-    A missing manifest retains the historical ``shareable`` default for
-    discovery-only callers.  Authoritative foreign-review checkpoints pass
-    ``require_manifest=True`` and therefore fail closed when no policy exists.
-    Once either policy manifest exists, ``tier`` is always an explicit
-    contract and malformed values fail closed with operator-facing context.
+    A missing manifest resolves to the historical ``shareable`` default.
+    Once either policy manifest exists, ``tier`` is an explicit contract and
+    missing or malformed values fail closed with operator-facing context.
     """
 
     root = Path(repo_root)
@@ -92,12 +90,6 @@ def read_repo_tier(repo_root: str | Path, *, require_manifest: bool = False) -> 
     except ProjectPolicyError:
         raise
     if resolution.payload is None:
-        if require_manifest:
-            allowed = ", ".join(ALLOWED_TIERS)
-            raise ProjectPolicyError(
-                f"project policy manifest required at {root / CANONICAL_NAME}; "
-                f"allowed values for tier: {allowed}; create the manifest and set tier explicitly"
-            )
         return "shareable"
     tier = resolution.payload.get("tier")
     manifest = resolution.path or (root / CANONICAL_NAME)
