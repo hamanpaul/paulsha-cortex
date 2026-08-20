@@ -259,10 +259,14 @@ def test_profile_comes_only_from_executor(tmp_path, monkeypatch) -> None:
 def test_planning_wrapper_has_no_gate_bundle_verdict_sentinel(tmp_path, monkeypatch) -> None:
     """spec 的 `command` **就是**模型 argv，不是任何一種 wrapper script。
 
-    不靠「既有旗標碰巧為 None」：這裡釘的是 command[0] 是 executor 本身、整條 argv 裡
+    不靠「既有旗標碰巧為 None」：這裡釘的是 command[0] 是 executor 本身、argv 裡
     沒有 shell、沒有 gate、沒有 bundle、沒有 verdict、沒有 sentinel。理由不只是潔癖
     ——wrapper 自產的任何一個位元組都會進同一份 log，而那份 log 就是 `_extract_json`
     的輸入。
+
+    斷言逐 token 依語意判定，不對整串 argv 做 substring 搜尋——路徑「值」裡有什麼字
+    不是被測物的性質：gate 執行帳號叫 `cortex-gate`，pytest 以帳號名組 tmp 根目錄，
+    `-o` 的落點因此天然含 `gate` 字樣（#734，與 #723 記的環境可攜性同族）。
     """
 
     harness = _Harness(tmp_path, monkeypatch, log_payload='{"ok":true}')
@@ -271,9 +275,23 @@ def test_planning_wrapper_has_no_gate_bundle_verdict_sentinel(tmp_path, monkeypa
 
     command = harness.specs[-1]["command"]
     assert command[0] == "codex"
-    joined = " ".join(command)
-    for banned in ("bash", "sh -c", "git bundle", "verdict", ".exit", "gate"):
-        assert banned not in joined
+    assert command[1] == "exec"
+    shell_or_vcs = {"bash", "sh", "zsh", "dash", "ksh", "git"}
+    for index, token in enumerate(command):
+        # wrapper 若引入另一層可執行程式（shell／git），該 token 的 basename 就是程式名。
+        assert Path(token).name not in shell_or_vcs, (index, token)
+        # wrapper 自產的 sentinel 檔一律以 `.exit` 結尾；合法的 argv 值沒有這種結尾。
+        assert not token.endswith(".exit"), (index, token)
+        if token.startswith("-"):
+            # 旗標「名」不得是 gate／bundle／verdict／sentinel 機制的入口。只比對
+            # 旗標名本身（`=` 前、去前導 `-`），`--skip-git-repo-check` 這類合法旗標
+            # 與路徑值都不在比對範圍。
+            flag_name = token.lstrip("-").split("=", 1)[0]
+            for marker in ("gate", "bundle", "verdict", "sentinel", "exit"):
+                assert marker not in flag_name, (index, token, marker)
+        elif "/" not in token:
+            # 裸字 token（子命令位置）不得是 wrapper 詞彙；含路徑分隔符的值不在此列。
+            assert token not in {"gate", "bundle", "verdict", "sentinel"}, (index, token)
     # working_directory 是 scratch，不是 operator 樹。
     assert harness.specs[-1]["working_directory"].startswith(
         str(tmp_path / "planning-scratch")
