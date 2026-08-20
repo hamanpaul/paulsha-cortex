@@ -3372,6 +3372,41 @@ def workflow_build_branch(run) -> str:
     return f"feature/{builder_work_id}"
 
 
+def _validate_foreign_review_policy_before_build(dispatcher, *, run, step) -> dict[str, object] | None:
+    """Reject an unusable repo tier before a builder job or worktree exists.
+
+    Foreign review is a downstream required gate for the canonical workflow.  Its
+    repo policy therefore belongs to the same cheap, pre-spawn validation layer as
+    runtime preflight; otherwise a missing ``tier`` burns a complete build before
+    failing in ``_launch_foreign_review``.
+    """
+
+    if step.phase != "build":
+        return None
+    try:
+        foreign_review.read_repo_tier(run.workspace_root)
+    except ValueError as exc:
+        registry = dispatcher._registry
+        updated = registry._manager_update_workflow_run(
+            run.run_id,
+            facets=tuple(dict.fromkeys((*run.facets, "needs_human"))),
+            needs_human_reason=diagnostic_reason(
+                "foreign-review-config",
+                f"foreign review required 的 repo tier 前置驗證失敗：{exc}",
+                source="manager._dispatch_workflow_card:foreign-review-config",
+                run_id=run.run_id,
+                work_id=run.work_id,
+                phase=step.phase,
+            ),
+        )
+        return {
+            "run_id": updated.run_id,
+            "current_phase": updated.current_phase,
+            "reason": "foreign-review-config",
+        }
+    return None
+
+
 def _workflow_build_handoff_base(run, *, builder_jobs, card: str) -> str:
     """#648：中段／後續 build 卡的 clone base——**卡與卡交接的顯式通道**。
 
@@ -9138,6 +9173,11 @@ def _dispatch_workflow_card(
                     publication.rollback()
                 raise
             return None
+    tier_preflight = _validate_foreign_review_policy_before_build(
+        dispatcher, run=run, step=step
+    )
+    if tier_preflight is not None:
+        return tier_preflight
     # #262 runtime preflight gate：在建立 worktree／sandbox／job row／model session
     # 之前，於實際將被使用的 executor 環境驗證 card 宣告的 capability 與 provider
     # 新鮮度。未宣告 capability 的 card 完全走原路徑（gate 為 no-op）。

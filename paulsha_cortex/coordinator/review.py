@@ -115,8 +115,18 @@ def read_repo_tier(repo_root: str | Path | None = None) -> str:
     if resolution.payload is None:
         return "shareable"
     tier = resolution.payload.get("tier")
+    manifest = resolution.path or (root / ".project-policy.yml")
+    allowed = "shareable, work, personal"
+    if tier is None:
+        raise ValueError(
+            f"project policy tier is required in {manifest}; "
+            f"allowed values: {allowed}; set tier explicitly"
+        )
     if tier not in {"shareable", "work", "personal"}:
-        raise ValueError(f"unsupported project tier: {tier!r}")
+        raise ValueError(
+            f"unsupported project tier: {tier!r} in {manifest}; "
+            f"allowed values: {allowed}"
+        )
     return str(tier)
 
 

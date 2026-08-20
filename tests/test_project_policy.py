@@ -111,6 +111,31 @@ def test_canonical_manifest_without_tier_reports_actionable_review_diagnostic(
     assert "personal" in diagnostic
 
 
+@pytest.mark.parametrize("tier", ["unknown", "", "null"])
+def test_invalid_tier_reports_manifest_and_allowed_values(tmp_path: Path, tier: str) -> None:
+    (tmp_path / ".project-policy.yml").write_text(
+        f"policy_profile: flat\npolicy_version: 1.0.17\ntier: {tier}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        read_repo_tier(tmp_path)
+
+    diagnostic = str(exc_info.value)
+    assert ".project-policy.yml" in diagnostic
+    assert "allowed" in diagnostic
+    assert all(value in diagnostic for value in ("shareable", "work", "personal"))
+
+
+def test_missing_manifest_keeps_shareable_default(tmp_path: Path) -> None:
+    assert read_repo_tier(tmp_path) == "shareable"
+
+
+def test_explicit_shareable_tier_is_accepted(tmp_path: Path) -> None:
+    _write(tmp_path / ".project-policy.yml", tier="shareable")
+    assert read_repo_tier(tmp_path) == "shareable"
+
+
 @pytest.mark.parametrize("manifest_name", [CANONICAL_NAME, LEGACY_NAME])
 def test_symlinked_manifest_is_rejected_fail_closed(
     tmp_path: Path,
