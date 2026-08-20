@@ -9265,31 +9265,42 @@ def _dispatch_workflow_card(
             or job.get("subject_head") == run.candidate_head
         )
     ]
+    # #765：reuse／retry 判定只認**本 claim era** 的 job（None 容忍比照 #766/#768）。
+    # `matching` 本身維持全 era——retry-context 與 sandbox 清理需要完整歷史；但
+    # 「這張卡已有 job、直接回傳供 harvest」的 reuse 決策若拿到前代 era 的
+    # terminal（authority restart 之後），advance 的 binding 對現 era 必炸且每
+    # tick 重炸（實機：verification-38 經此路徑被無限重放，era 過濾了 resume 與
+    # retry-card 兩處後仍炸的最後出口）。
+    reusable = [
+        job
+        for job in matching
+        if job.get("workflow_claim_key") in (None, run.claim_key)
+    ]
     retryable_latest = bool(
-        matching
+        reusable
         and (
             (
                 retry_failed
                 and (
-                    _is_stale_terminalized_failed_job(matching[-1])
-                    or _retryable_nonpassing_workflow_terminal(matching[-1])
-                    or _malformed_workflow_card_terminal(matching[-1])
+                    _is_stale_terminalized_failed_job(reusable[-1])
+                    or _retryable_nonpassing_workflow_terminal(reusable[-1])
+                    or _malformed_workflow_card_terminal(reusable[-1])
                     or _is_rejected_workflow_review_evidence(
-                        matching[-1],
+                        reusable[-1],
                         run=run,
                         coordinator_root=coordinator_root,
                     )
                 )
             )
             or (
-                operator_recovery_job_id == matching[-1].get("job_id")
+                operator_recovery_job_id == reusable[-1].get("job_id")
                 and (
                     _is_exact_legacy_agy_recovery(
-                        matching[-1], run=run, step=step, identities=identities
+                        reusable[-1], run=run, step=step, identities=identities
                     )
                     or _is_exact_reviewer_terminal_recovery(
                         registry,
-                        matching[-1],
+                        reusable[-1],
                         run=run,
                         step=step,
                         identities=identities,
@@ -9297,11 +9308,11 @@ def _dispatch_workflow_card(
                     )
                 )
             )
-            or (force_new_card and matching[-1].get("status") in TERMINAL_STATUSES)
+            or (force_new_card and reusable[-1].get("status") in TERMINAL_STATUSES)
         )
     )
-    if matching and not retryable_latest:
-        return matching[-1]
+    if reusable and not retryable_latest:
+        return reusable[-1]
     # #569：reviewer 卡的強制重派要先回收被取代 job 的 sandbox。sandbox 目錄名是
     # `sha256(run_id:card:candidate)`（見 `_create_reviewer_sandbox`），重派同一
     # 張卡＋同一個 candidate 必然撞上「stale reviewer sandbox requires
