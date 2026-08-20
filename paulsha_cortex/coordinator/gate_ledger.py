@@ -307,12 +307,24 @@ def gate_scope_honesty_hint(
             "own choosing never authorizes claiming the declared gate is green."
         )
     rendered = "; ".join(f'"{spec.name}" = `{spec.command}`' for spec in specs)
+    # #740：environment honesty——判準來自 Manager 在**它自己的 gate 環境**的重跑，
+    # 不是模型 sandbox 裡的那一次。builder unit 刻意更嚴（IPAddressDeny、加固剖面），
+    # 與變更無關的測試可能只在 sandbox 紅；#606 的誠實紀律少了這一維，誠實的模型
+    # 跑全套→看到環境紅→依指示自報 failed，形成 explicit-stop 確定性迴圈（實機
+    # jobs -15／-16）。省略沒忠實跑的 gate 本就是 `authorize_terminal` 允許的形狀
+    # （ledger 綠即授權），這裡只是把它講出來；宣稱該 gate 綠仍然禁止。
     return (
         "Scope discipline: after your process exits the Manager re-runs exactly these commands "
         f"({rendered}), and a passed status is judged against those real results. Running a "
         "focused subset first is fine, but then report only the scope you actually ran: a green "
         "focused subset is NOT evidence that the declared gate is green, and inferring the full "
-        "gate from it fails the card closed."
+        "gate from it fails the card closed. Environment honesty: those judged results come "
+        "from the Manager's re-run in its own gate environment, not from your sandbox — your "
+        "sandbox is deliberately more restricted (no general network, hardened unit), so tests "
+        "untouched by your change can fail there and nowhere else. Such sandbox-only failures "
+        "do not make this card failed: leave that gate out of gate_evidence, record what you "
+        "observed in diagnostics, and still deliver the candidate; claiming the gate green "
+        "stays forbidden — the Manager's ledger supplies the judged result."
     )
 
 

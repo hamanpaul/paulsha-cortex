@@ -48,20 +48,29 @@ MULTI_GATE_ENV = {
 }
 
 # --------------------------------------------------------------------------
-# 修改前的原文複本（逐字釘住；本票**不得**動到這兩段）
+# 有宣告 gate 時的原文複本（逐字釘住；#740 補上 environment honesty 一維——
+# 判準來自 Manager 在 gate 環境的重跑，sandbox-only 失敗省略該 gate 而非自報 failed）
 # --------------------------------------------------------------------------
 
 _FOCUSED_STATUS_POLICY = (
     "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
     "policy) actually passed. Natural-language confidence, an exit code of 0, and "
-    "the absence of an explicit error do NOT authorize passed. If any gate failed, "
-    "report failed; the Manager re-reads the gate ledger and fails closed on any "
-    "contradiction, so a dishonest passed only costs you a retry. "
+    "the absence of an explicit error do NOT authorize passed. If a gate failed "
+    "because of your change, report failed; the Manager re-reads the gate ledger "
+    "and fails closed on any contradiction, so a dishonest passed only costs you "
+    "a retry. "
     "Scope discipline: after your process exits the Manager re-runs exactly these commands "
     '("pytest" = `python3 -m pytest -q`), and a passed status is judged against those real '
     "results. Running a focused subset first is fine, but then report only the scope you "
     "actually ran: a green focused subset is NOT evidence that the declared gate is green, "
-    "and inferring the full gate from it fails the card closed."
+    "and inferring the full gate from it fails the card closed. Environment honesty: those "
+    "judged results come from the Manager's re-run in its own gate environment, not from "
+    "your sandbox — your sandbox is deliberately more restricted (no general network, "
+    "hardened unit), so tests untouched by your change can fail there and nowhere else. "
+    "Such sandbox-only failures do not make this card failed: leave that gate out of "
+    "gate_evidence, record what you observed in diagnostics, and still deliver the "
+    "candidate; claiming the gate green stays forbidden — the Manager's ledger supplies "
+    "the judged result."
 )
 
 _FOCUSED_GATE_EVIDENCE_DESCRIPTION = (

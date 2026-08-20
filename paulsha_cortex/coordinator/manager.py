@@ -8664,9 +8664,10 @@ def _workflow_job_prompt(
             status_policy = (
                 "Report passed only when every deterministic gate you ran (OpenSpec / pytest / "
                 "policy) actually passed. Natural-language confidence, an exit code of 0, and "
-                "the absence of an explicit error do NOT authorize passed. If any gate failed, "
-                "report failed; the Manager re-reads the gate ledger and fails closed on any "
-                "contradiction, so a dishonest passed only costs you a retry. "
+                "the absence of an explicit error do NOT authorize passed. If a gate failed "
+                "because of your change, report failed; the Manager re-reads the gate ledger "
+                "and fails closed on any contradiction, so a dishonest passed only costs you "
+                "a retry. "
                 + gate_ledger.gate_scope_honesty_hint(env, test_policy=effective_test_policy)
             )
             gate_evidence_description = (
