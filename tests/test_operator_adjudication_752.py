@@ -111,3 +111,30 @@ class RetryCardReasonValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+class RetryBuildReasonValidationTests(unittest.TestCase):
+    """#755：--reason 擴到 retry-build，驗證與 retry-card 同一支前置檢查。"""
+
+    def _call(self, reason, state_path=None):
+        args = {
+            "action": "retry-build",
+            "repo": "o/r",
+            "work_id": "w",
+            "expected_candidate": "a" * 40,
+            "reason": reason,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            work_actions._retry_build_action(
+                args=args, authority=None, workflow_registry=None, state_path=state_path
+            )
+        return str(ctx.exception)
+
+    def test_empty_reason_is_rejected(self) -> None:
+        self.assertIn("reason", self._call("  "))
+
+    def test_reason_without_state_path_is_rejected(self) -> None:
+        self.assertIn("durable state path", self._call("fix the residuals"))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

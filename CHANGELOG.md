@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#755：`--reason` 擴到 `retry-build`（共用 #752 的 adjudication evidence 落地），
+  operator 對 repair 回合的指示有通道；retry-card 收斂到同一支 helper。**
 - **#752 補遺：retry-card 的 adjudication evidence 改接 `resolved_state_path`**
   （原始參數在 daemon 路徑恆為 None，人裁通道上線即不可用）。
 - **#752：verify 階段的人裁通道。** `retry-card --reason` → Manager-owned
