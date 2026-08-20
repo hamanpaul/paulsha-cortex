@@ -8638,11 +8638,61 @@ def _prior_review_rejection(run, registry) -> dict[str, object] | None:
     return context
 
 
+def _operator_adjudications(
+    run, coordinator_root: str | Path | None
+) -> list[dict[str, object]] | None:
+    """#752：本 run 的 operator 裁決紀錄（`cortex-operator-adjudication/v1`）。
+
+    verify 階段的人裁通道：design/todo 矛盾這類「reviewer 只能 needs_human」的判定，
+    operator 經 `retry-card --reason` 落成 Manager-owned immutable evidence，這裡讀回
+    最近 ≤3 筆（reason 有界）進 retry_context——builder 與 reviewer 卡都吃。內容經
+    bounded CLI＋Manager 落地，不是 builder 可偽造的 candidate 內容（#540／#628 的
+    作者歸屬不變）。取不到一律回 None。
+    """
+
+    if coordinator_root is None:
+        return None
+    root = Path(coordinator_root) / "evidence" / "operator-adjudication"
+    try:
+        # 檔名是 content-addressed（run_id-digest），不含時序——以 mtime 排序。
+        entries = sorted(
+            root.glob(f"{run.run_id}-*.json"), key=lambda item: item.stat().st_mtime
+        )
+    except Exception:
+        return None
+    rows: list[dict[str, object]] = []
+    for path in entries:
+        if path.is_symlink():
+            continue
+        try:
+            body = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(body, Mapping) or body.get("run_id") != run.run_id:
+            continue
+        reason = body.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            continue
+        rows.append(
+            {
+                "source": "operator-adjudication",
+                "actor": str(body.get("actor") or "operator"),
+                "card": str(body.get("card") or ""),
+                "created_at": str(body.get("created_at") or ""),
+                "reason": reason[:RETRY_CONTEXT_EVIDENCE_LIMIT],
+            }
+        )
+    if not rows:
+        return None
+    return rows[-3:]
+
+
 def _workflow_retry_context(
     prior_jobs: Sequence[Mapping[str, object]],
     *,
     registry=None,
     review_rejection: Mapping[str, object] | None = None,
+    operator_adjudications: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object] | None:
     """#606：重派這張卡時要機械附進 prompt 的「前次採信失敗證據」。
 
@@ -8686,6 +8736,10 @@ def _workflow_retry_context(
     if review_rejection is not None:
         # #750：repair 回合的跨卡回饋。鍵名明示它是「打回 candidate 的那份判定」。
         context["review_rejection"] = dict(review_rejection)
+    if operator_adjudications:
+        # #752：operator 的人裁紀錄——needs_human 判定的權威答覆，優先於文件間的
+        # 表面矛盾（例：design 與 todo 不一致時，以裁決指定的那一邊為準）。
+        context["operator_adjudications"] = [dict(row) for row in operator_adjudications]
     return context
 
 
@@ -9741,6 +9795,11 @@ def _dispatch_workflow_card(
                         _prior_review_rejection(run, registry)
                         if step.phase == "build" and step.persona == "builder"
                         else None
+                    ),
+                    # #752：operator 裁決對修復與複驗同樣有效——builder 與
+                    # reviewer 卡都帶。
+                    operator_adjudications=_operator_adjudications(
+                        run, coordinator_root
                     ),
                 ),
             ),

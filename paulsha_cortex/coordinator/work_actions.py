@@ -2279,7 +2279,7 @@ def _retry_card_target_jobs(run, jobs, *, card: str) -> list[dict[str, Any]]:
     ]
 
 
-def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """#545／#569：以現行 prompt 重派「當前 phase 內最早一張尚未採信的卡」。
 
     現場一（#545，run ``workflow-084f75e2178cf7547476`` build phase）：builder
@@ -2329,9 +2329,25 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry) ->
 
     extras = set(args) - {
         "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
+        "reason",
     }
     if extras:
         raise ValueError(f"retry-card rejects caller evidence/input: {sorted(extras)[0]}")
+    # #752：選填的 operator 裁決文字。驗在最前面——裁決寫不進去就不該動 run。
+    adjudication = args.get("reason")
+    if adjudication is not None:
+        if (
+            not isinstance(adjudication, str)
+            or not adjudication.strip()
+            or len(adjudication) > OPERATOR_ADJUDICATION_REASON_LIMIT
+        ):
+            raise ValueError(
+                "retry-card reason must be a non-empty string within "
+                f"{OPERATOR_ADJUDICATION_REASON_LIMIT} characters"
+            )
+        if state_path is None:
+            raise ValueError("retry-card reason requires a durable state path")
+        adjudication = adjudication.strip()
     expected_run_id = args.get("expected_run_id")
     if (
         not isinstance(expected_run_id, str)
@@ -2398,8 +2414,39 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry) ->
         retry_classification=retry_classification.value,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
+    adjudication_evidence = None
+    if adjudication is not None:
+        # #752：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
+        # `manager._operator_adjudications()` 讀回、進 retry_context 的
+        # `operator_adjudications` 鍵。這是 verify 階段唯一可信的人裁通道：
+        # 內容經 bounded CLI、Manager-owned 檔案，不是 builder 可偽造的 candidate 內容。
+        actor_value = args.get("actor")
+        adjudication_evidence = _write_supersede_evidence(
+            {
+                "schema": OPERATOR_ADJUDICATION_SCHEMA,
+                "repo": run.repo,
+                "work_id": run.work_id,
+                "run_id": run.run_id,
+                "card": card,
+                "actor": (
+                    actor_value if isinstance(actor_value, str) and actor_value.strip() else "operator"
+                ),
+                "reason": adjudication,
+                "phase": run.current_phase,
+                "created_at": (
+                    datetime.fromtimestamp(float(now_epoch), tz=timezone.utc).isoformat()
+                    if isinstance(now_epoch, (int, float)) and not isinstance(now_epoch, bool)
+                    else ""
+                ),
+            },
+            state_path=state_path,
+            subdir="operator-adjudication",
+            label="operator-adjudication",
+            max_size=16384,
+        )
     return {
         "action": "retry-card",
+        "adjudication_evidence": adjudication_evidence,
         "reason": f"{expected_persona}-card-redispatched",
         "expected_run_id": expected_run_id,
         "run_id": run.run_id,
@@ -3600,6 +3647,10 @@ def _reset_reclaim_budget_action(
 # 真實來源；而且順帶把 run 從「隱式跟著本地 main 漂」升級成「明示 pin 在一個
 # SHA」，hermetic pinning 只有更強、沒有放寬。
 CANDIDATE_BASE_REFREEZE_SCHEMA = "cortex-work-candidate-base-refreeze/v1"
+
+#: #752：operator 對 needs_human 判定的裁決紀錄——verify 階段唯一的可信人裁通道。
+OPERATOR_ADJUDICATION_SCHEMA = "cortex-operator-adjudication/v1"
+OPERATOR_ADJUDICATION_REASON_LIMIT = 4000
 
 #: 沒有前次凍結集（production 的常態）時寫進 `frozen_readiness` 的形狀。**刻意
 #: 不用** `pre-claim-readiness-frozen-set/v1`：那個 schema 的語意是「六道
@@ -5787,6 +5838,8 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
+            state_path=state_path,
+            now_epoch=now_epoch,
         )
     elif action == "retry-verify":
         result = _retry_verify_action(
