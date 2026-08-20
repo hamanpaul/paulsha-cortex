@@ -3229,7 +3229,12 @@ def _job_for_workflow_card(
     }
     for field, value in expected.items():
         if job.get(field) != value:
-            raise ValueError(f"workflow job binding mismatch: {field}")
+            # #765 補遺：帶上 job 與兩側值——「只有欄位名」的版本讓 era 失配只能
+            # 實機逐層猜（0820-21 實測兩小時）。值皆為系統雜湊／識別碼，非敏感內容。
+            raise ValueError(
+                f"workflow job binding mismatch: {field} "
+                f"(job={job.get('job_id')!r} expected={value!r} actual={job.get(field)!r})"
+            )
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         raise ValueError("workflow job has no successful terminal result")
     executor = job.get("executor")
