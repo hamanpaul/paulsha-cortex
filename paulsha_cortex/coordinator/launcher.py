@@ -399,7 +399,11 @@ def _claude_review_settings(worktree: str) -> str:
     if job_runner.resolve_runner_mode(os.environ) != job_runner.RUNNER_DIRECT:
         return json.dumps(
             {
-                "permissions": {"deny": read_denials},
+                # #748：`dontAsk` 下 Bash 需要 allow 規則才會自動放行（僅內建安全
+                # 命令例外——實機：`python3 --version` 過、`pytest` 不過）。原本由
+                # `autoAllowBashIfSandboxed` 供給的放行隨 #746 關內層而消失，這裡
+                # 補等價 allow；deny 規則優先於 allow，憑證／HOME 讀取拒絕不受影響。
+                "permissions": {"allow": ["Bash"], "deny": read_denials},
                 # 內層 bwrap 在加固 unit 下起不來（bwrap: Can't read
                 # /proc/sys/kernel/overflowuid），且 `failIfUnavailable` 讓 8/8 命令
                 # 全滅——刻意關閉，不是放寬外層（#746）。

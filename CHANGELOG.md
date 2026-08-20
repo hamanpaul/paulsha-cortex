@@ -6,6 +6,9 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#748：三分模式 reviewer settings 補 `allow: ["Bash"]`。** #746 關內層後
+  `autoAllowBashIfSandboxed` 的放行消失，`dontAsk` 下 pytest 全拒、零 gate 可跑；
+  deny 優先於 allow、憑證拒絕不變、direct 模式不變。
 - **#746：claude reviewer 內層 sandbox 依 runner mode 分岔（#714 的 reviewer lane
   版）。** bubblewrap 與加固剖面硬性互斥；三分模式關內層、外層＋採信端完整性
   檢查為邊界，direct 模式逐字不變；`permissions.deny` 兩模式相同。

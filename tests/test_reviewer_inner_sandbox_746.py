@@ -31,10 +31,22 @@ class ReviewerInnerSandboxTests(unittest.TestCase):
         settings = _settings("systemd-template")
         self.assertEqual(settings["sandbox"], {"enabled": False})
 
+    def test_systemd_mode_allows_bash_explicitly(self) -> None:
+        """#748：關內層後 `autoAllowBashIfSandboxed` 消失，dontAsk 下 Bash 需要
+        顯式 allow；deny 優先於 allow，憑證拒絕不受影響。"""
+
+        settings = _settings("systemd-template")
+        self.assertEqual(settings["permissions"]["allow"], ["Bash"])
+        self.assertTrue(settings["permissions"]["deny"])
+
+    def test_direct_mode_has_no_allow_entry(self) -> None:
+        settings = _settings(job_runner.RUNNER_DIRECT)
+        self.assertNotIn("allow", settings["permissions"])
+
     def test_permission_denials_are_identical_across_modes(self) -> None:
         direct = _settings(job_runner.RUNNER_DIRECT)
         hardened = _settings("systemd-template")
-        self.assertEqual(direct["permissions"], hardened["permissions"])
+        self.assertEqual(direct["permissions"]["deny"], hardened["permissions"]["deny"])
         # 憑證讀取拒絕真的在裡面，不是空清單。
         joined = json.dumps(hardened["permissions"])
         self.assertIn(".claude", joined)
