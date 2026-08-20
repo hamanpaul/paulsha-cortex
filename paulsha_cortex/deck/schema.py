@@ -7,6 +7,8 @@ from typing import Mapping
 
 import yaml
 
+from ..project_policy import ProjectPolicyError, read_repo_tier
+
 SCHEMA_VERSION = 0
 # runtime 契約真相源：coordinator/autonomy.py::parse_spec_frontmatter（勿發明多餘欄位）
 EMITTED_FRONTMATTER_FIELDS = (
@@ -66,6 +68,14 @@ DEFAULT_COMBOS_DIR = Path(__file__).with_name("data") / "combos"
 
 class DeckSchemaError(ValueError):
     """deck 資料載入／驗證錯誤（fail-closed：任一錯即整批拒載）。"""
+
+
+def validate_foreign_review_tier(repo_root: str | Path) -> str:
+    """Deck dispatch's authoritative repository-tier validation surface."""
+    try:
+        return read_repo_tier(repo_root)
+    except ProjectPolicyError as exc:
+        raise DeckSchemaError(f"foreign-review tier validation failed: {exc}") from exc
 
 
 def instance_combos_dir() -> Path:

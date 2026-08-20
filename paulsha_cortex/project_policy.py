@@ -9,6 +9,7 @@ import yaml
 CANONICAL_NAME = ".project-policy.yml"
 LEGACY_NAME = ".paul-project.yml"
 POLICY_NAMES = (CANONICAL_NAME, LEGACY_NAME)
+ALLOWED_TIERS = ("shareable", "work", "personal")
 
 
 class ProjectPolicyError(ValueError):
@@ -73,3 +74,36 @@ def resolve_project_policy(repo_root: str | Path) -> ProjectPolicyResolution:
         legacy_only=path.name == LEGACY_NAME,
         dual_identical=len(present) == 2,
     )
+
+
+def read_repo_tier(repo_root: str | Path) -> str:
+    """Resolve the repository tier at the earliest authoritative boundary.
+
+    A missing manifest deliberately retains the historical ``shareable``
+    default.  Once either policy manifest exists, however, ``tier`` is an
+    explicit contract and malformed values fail closed with operator-facing
+    context.  Keeping this in the policy module lets deck, readiness, doctor,
+    preflight, and foreign review use exactly the same rule.
+    """
+
+    root = Path(repo_root)
+    try:
+        resolution = resolve_project_policy(root)
+    except ProjectPolicyError:
+        raise
+    if resolution.payload is None:
+        return "shareable"
+    tier = resolution.payload.get("tier")
+    manifest = resolution.path or (root / CANONICAL_NAME)
+    allowed = ", ".join(ALLOWED_TIERS)
+    if tier is None:
+        raise ProjectPolicyError(
+            f"project policy tier is required in {manifest}; "
+            f"allowed values: {allowed}; set tier explicitly"
+        )
+    if tier not in ALLOWED_TIERS:
+        raise ProjectPolicyError(
+            f"unsupported project tier: {tier!r} in {manifest}; "
+            f"allowed values: {allowed}"
+        )
+    return str(tier)

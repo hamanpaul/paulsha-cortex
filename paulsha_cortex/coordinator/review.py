@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping, Sequence
 from paulsha_cortex.config import paths
 
 from ..persona import render
-from ..project_policy import ProjectPolicyError, resolve_project_policy
+from ..project_policy import ProjectPolicyError, read_repo_tier as _read_repo_tier
 from . import model_identities, spool_slot, verification
 
 MODEL_IDENTITY_SCHEMA_VERSION = model_identities.MODEL_IDENTITY_SCHEMA_VERSION
@@ -109,25 +109,9 @@ def load_model_identity_registry(config_root: str | Path | None = None) -> dict[
 def read_repo_tier(repo_root: str | Path | None = None) -> str:
     root = Path(repo_root) if repo_root is not None else paths.repo_root()
     try:
-        resolution = resolve_project_policy(root)
+        return _read_repo_tier(root)
     except ProjectPolicyError as exc:
         raise ValueError(str(exc)) from exc
-    if resolution.payload is None:
-        return "shareable"
-    tier = resolution.payload.get("tier")
-    manifest = resolution.path or (root / ".project-policy.yml")
-    allowed = "shareable, work, personal"
-    if tier is None:
-        raise ValueError(
-            f"project policy tier is required in {manifest}; "
-            f"allowed values: {allowed}; set tier explicitly"
-        )
-    if tier not in {"shareable", "work", "personal"}:
-        raise ValueError(
-            f"unsupported project tier: {tier!r} in {manifest}; "
-            f"allowed values: {allowed}"
-        )
-    return str(tier)
 
 
 def select_foreign_reviewer(

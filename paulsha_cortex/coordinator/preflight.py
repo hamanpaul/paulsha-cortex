@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.project_policy import ProjectPolicyError, read_repo_tier
 
 from . import verification
 
@@ -141,6 +142,10 @@ def write_full_suite_evidence_after_run(
 ) -> FullSuiteEvidence:
     _validate_typed_command(command)
     root = Path(repo_root).resolve()
+    try:
+        read_repo_tier(root)
+    except ProjectPolicyError as exc:
+        raise ValueError(f"preflight foreign-review tier validation failed: {exc}") from exc
     head, tree_hash = _read_clean_identity(root=root, runner=runner)
     result = _run(argv=command, cwd=root, runner=runner)
     final_head, final_tree = _read_clean_identity(root=root, runner=runner)

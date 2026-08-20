@@ -17,6 +17,7 @@ from paulsha_cortex.project_policy import (
     resolve_project_policy,
 )
 from paulsha_cortex.coordinator import manager
+from paulsha_cortex.deck.schema import DeckSchemaError, validate_foreign_review_tier
 
 
 def _write(path: Path, *, tier: str = "shareable") -> None:
@@ -136,6 +137,14 @@ def test_missing_manifest_keeps_shareable_default(tmp_path: Path) -> None:
 def test_explicit_shareable_tier_is_accepted(tmp_path: Path) -> None:
     _write(tmp_path / ".project-policy.yml", tier="shareable")
     assert read_repo_tier(tmp_path) == "shareable"
+
+
+def test_deck_tier_surface_uses_same_fail_closed_contract(tmp_path: Path) -> None:
+    (tmp_path / ".project-policy.yml").write_text(
+        "policy_profile: flat\npolicy_version: 1.0.17\n", encoding="utf-8"
+    )
+    with pytest.raises(DeckSchemaError, match=r"\.project-policy\.yml"):
+        validate_foreign_review_tier(tmp_path)
 
 
 def test_slice_tick_rejects_missing_tier_before_dispatch(

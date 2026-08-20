@@ -51,6 +51,7 @@ from typing import Callable, Mapping
 
 from . import verification
 from .claim import WorkAuthority, work_authority_digest
+from ..project_policy import ProjectPolicyError, read_repo_tier
 
 FROZEN_READINESS_SET_SCHEMA = "pre-claim-readiness-frozen-set/v1"
 LIVE_PROBE_DEFAULT_TTL_SECONDS = 300.0
@@ -309,6 +310,7 @@ def evaluate_pre_claim_readiness(
 
 def local_scope_probe(
     *,
+    repo_root: str | Path | None = None,
     heading_ok: bool = True,
     openspec_strict_ok: bool = True,
     changelog_required: bool = True,
@@ -322,6 +324,11 @@ def local_scope_probe(
     """
 
     def _probe(context: ReadinessContext) -> ReadinessCheckResult:
+        if repo_root is not None:
+            try:
+                read_repo_tier(repo_root)
+            except ProjectPolicyError as exc:
+                return _failed("local_scope", f"foreign-review-tier:{exc}")
         if not heading_ok:
             return _failed("local_scope", "heading-gap")
         if not openspec_strict_ok:

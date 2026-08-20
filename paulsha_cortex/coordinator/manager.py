@@ -3465,13 +3465,10 @@ def _validate_foreign_review_policy_before_slice_dispatch(
         repo_root = autonomy._infer_repo_root(Path(spec_path))
         foreign_review.read_repo_tier(repo_root)
     except Exception as exc:
-        slice_id = meta.get("slice_id")
-        registry = getattr(dispatcher, "_registry", None)
-        if isinstance(slice_id, str) and registry is not None:
-            try:
-                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
-            except Exception:
-                pass
+        # The caller owns the transition/reporting boundary.  This validator is
+        # deliberately observational: mutating a never-dispatched pending slice
+        # here made a transient pre-dispatch diagnostic sticky, and swallowing a
+        # registry failure hid the real state-transition error.
         return str(exc)
     return None
 

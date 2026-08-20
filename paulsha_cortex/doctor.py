@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from .github_rate_limit import is_rate_limit_signal
 from .monitor.socket_path import socket_path_fits, socket_path_limit_detail
+from .project_policy import ProjectPolicyError, read_repo_tier
 
 DOCTOR_SCHEMA = "cortex-doctor/v1"
 AUTO_LABEL = "cortex:auto-on-going"
@@ -270,6 +271,18 @@ def _identity_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
         f"runtime-validated schema v{schema_version} with canonical agy identity",
         True,
     )
+
+
+def _repo_tier_probe(env: Mapping[str, str]) -> ProbeResult:
+    """Validate the foreign-review tier before doctor reports readiness."""
+    root_value = env.get("PSC_REPO_ROOT")
+    if not root_value:
+        return ProbeResult("repo-tier", "warn", "repository root unavailable; local tier probe skipped", False)
+    try:
+        tier = read_repo_tier(Path(root_value))
+    except ProjectPolicyError as exc:
+        return ProbeResult("repo-tier", "fail", str(exc), True)
+    return ProbeResult("repo-tier", "pass", f"foreign-review tier={tier}", True)
 
 
 def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeResult:
@@ -1122,6 +1135,7 @@ def run_doctor(
         )
     probes: list[ProbeResult] = [
         _preflight_probe(effective),
+        _repo_tier_probe(effective),
         _gate_declaration_probe(effective),
         _identity_probe(effective, agents_root),
         _model_resolution_probe(effective, agents_root),

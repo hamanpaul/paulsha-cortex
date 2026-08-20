@@ -7,3 +7,4 @@
 - [x] 測試涵蓋無 manifest、canonical 缺 `tier`、非法 `tier`、合法 `shareable`。
 - [x] 文件化 canonical manifest 缺 `tier` 的 fail-closed 語意。
 - [x] slice lane（`run_tick`／`retry-build`）在 builder dispatch 前共用 tier 前置驗證，避免晚期 foreign review 設定錯誤。
+- [x] deck、doctor、delivery preflight 與 claim readiness 共用同一個 tier resolver，於各自權威前置面 fail-closed。
