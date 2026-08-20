@@ -6,6 +6,10 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#742：reviewer sandbox 交接（#710 的 reviewer lane 版），三分部署下 verify／
+  review 卡派得出去。** 容器收斂 0701；per-job sandbox 由 owner 顯式
+  `setfacl -R u:<reviewer>:rwX`（default ACL 繼承在 `UMask=0077` 下會被 mask
+  歸零，#736 同族）。帳號單一導出、direct 模式零回歸、回收不受影響。
 - **#740：誠實紀律補環境維度，builder sandbox 的環境紅不再使 focused 寫入卡確定性
   自報 failed。** 判準來自 Manager 在 gate 環境的重跑；sandbox-only、與變更無關的
   失敗改為「省略該 gate＋diagnostics 記錄＋照常交付 candidate」，宣稱綠仍禁止、

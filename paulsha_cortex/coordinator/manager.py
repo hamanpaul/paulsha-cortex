@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -5871,6 +5872,47 @@ def _prepare_claude_review_sandbox(sandbox: Path) -> None:
                 os.fsync(handle.fileno())
 
 
+def _prepare_reviewer_sandbox_container(parent: Path) -> None:
+    """建（並收斂）reviewer sandbox 的容器目錄（#742）。
+
+    `0701`＝job 帳號可 traverse、不可列目錄——`dispatch-worktree-pool` 的既有先例
+    （#641 記載）。容器上**只有** traverse：具名 rwX 一律落在 per-job 那一格
+    （:func:`_grant_reviewer_sandbox_access`），#710 的 per-job 隔離裁決不變。
+    """
+
+    parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(parent, 0o701)
+
+
+def _grant_reviewer_sandbox_access(sandbox: Path) -> str | None:
+    """把建好的 per-job sandbox 交給 reviewer 執行帳號（#742；#710 的 reviewer 版）。
+
+    sandbox 整棵由 Manager 以 `UMask=0077` 建立（clone、bind 目標、input seed），
+    reviewer principal 一個 inode 都讀不到——`inherited-default-acl` 的 reach 模型
+    對這個 pool 不成立：它不在部署清單上（verify 首走才被 mkdir 出來），且 default
+    ACL 的繼承會被 Manager 的 umask 把 mask 歸零（#736 在 gate 快照上的同一個交互）。
+    修法比照 #710：owner（Manager）以 `setfacl -R` 顯式授 per-job 那一格，mask 由
+    setfacl 重算。帳號由 `resolve_job_account(role=review)` 解（#657 的單一導出）；
+    **不在 passwd 時整支略過**——direct／單 UID 模式同 UID 本就可達，且與
+    `ensure_workspace_reachable` 的既有處置一致，不是 fail-open（降權派工路徑在
+    `prepare_systemd_template()` 對帳號存在性 fail-closed）。
+    """
+
+    account = job_runner.resolve_job_account(os.environ, role=job_runner.JOB_ROLE_REVIEW)
+    try:
+        pwd.getpwnam(account)
+    except KeyError:
+        return None
+    return job_workspace.grant_workspace_acl(
+        sandbox,
+        (
+            job_workspace.WorkspaceAclGrant(
+                account=account, access_perms="rwX", default_perms="rwX"
+            ),
+        ),
+    )
+
+
 def _create_reviewer_sandbox(
     *,
     run,
@@ -5887,7 +5929,7 @@ def _create_reviewer_sandbox(
         coordinator_root=coordinator_root,
         candidate_root=candidate_root,
     )
-    parent.mkdir(parents=True, exist_ok=True)
+    _prepare_reviewer_sandbox_container(parent)
     name = hashlib.sha256(f"{run.run_id}:{step.card}:{candidate}".encode()).hexdigest()[:32]
     sandbox = parent / name
     if sandbox.exists() or sandbox.is_symlink():
@@ -5971,6 +6013,11 @@ def _create_reviewer_sandbox(
                     0o600,
                     expect_absent=True,
                 )
+    except BaseException:
+        shutil.rmtree(sandbox, ignore_errors=True)
+        raise
+    try:
+        _grant_reviewer_sandbox_access(sandbox)
     except BaseException:
         shutil.rmtree(sandbox, ignore_errors=True)
         raise
