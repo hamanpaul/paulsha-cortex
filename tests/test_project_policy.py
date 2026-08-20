@@ -92,6 +92,25 @@ def test_malformed_canonical_manifest_fails_closed(tmp_path: Path) -> None:
         resolve_project_policy(tmp_path)
 
 
+def test_canonical_manifest_without_tier_reports_actionable_review_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """#492：缺 tier 要在 foreign review 前以可操作訊息 fail closed。"""
+    (tmp_path / ".project-policy.yml").write_text(
+        "policy_profile: flat\npolicy_version: 1.0.17\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        read_repo_tier(tmp_path)
+
+    diagnostic = str(exc_info.value)
+    assert ".project-policy.yml" in diagnostic
+    assert "shareable" in diagnostic
+    assert "work" in diagnostic
+    assert "personal" in diagnostic
+
+
 @pytest.mark.parametrize("manifest_name", [CANONICAL_NAME, LEGACY_NAME])
 def test_symlinked_manifest_is_rejected_fail_closed(
     tmp_path: Path,
