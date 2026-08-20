@@ -8561,8 +8561,88 @@ def _prior_card_failed_gates(job: Mapping[str, object]) -> list[dict[str, object
     return rows
 
 
+def _prior_review_rejection(run, registry) -> dict[str, object] | None:
+    """#750：repair 回合的跨卡回饋——本 run 最近一顆 verify／review 非通過 terminal。
+
+    #606 的 retry_context 只看**同一張卡**的前次 job；把 candidate 打回來的那份
+    verification 判定在另一張卡上、且因 harvest fail-closed（verify terminal 只認
+    verified/passed）沒有綁進 run——`retry-build` 的 repair 文案要求 builder
+    「fix only real Candidate failures identified by the current verification/review
+    evidence」，卻沒有任何通道把那份 evidence 交到它手上，盲修不收斂是確定性的
+    （實機：verification-22 failed → repair -23 加了測試 → verification-24 同因再
+    failed）。這裡經 harvest 同一支 :func:`_extract_terminal_json` 讀回判定，
+    **誠實標注 `source: "reviewer-terminal"`**——它是 reviewer 產物，不是
+    manager-independent；它只進 prompt 供 repair 消費，不進任何採信路徑。
+    取不到一律回 ``None``（證據是加值，不得害死一次合法重派）。
+    """
+
+    if registry is None:
+        return None
+    try:
+        jobs = registry.list_jobs()
+    except Exception:
+        return None
+    rejected: tuple[Mapping[str, object], Mapping[str, object]] | None = None
+    for job in jobs:
+        if job.get("workflow_run_id") != getattr(run, "run_id", None):
+            continue
+        if job.get("workflow_phase") not in {"verify", "review"}:
+            continue
+        if job.get("status") != "exited":
+            continue
+        log_path = job.get("log_path")
+        if not isinstance(log_path, str) or not log_path:
+            continue
+        try:
+            raw = _extract_terminal_json(log_path)
+        except Exception:
+            continue
+        if raw.get("status") not in terminal_contract.NON_PASSING_STATUSES:
+            continue
+        rejected = (job, raw)
+    if rejected is None:
+        return None
+    job, raw = rejected
+    details = raw.get("details") if isinstance(raw.get("details"), Mapping) else {}
+    budget = RETRY_CONTEXT_EVIDENCE_LIMIT
+    context: dict[str, object] = {
+        "source": "reviewer-terminal",
+        "phase": str(job.get("workflow_phase")),
+        "job_id": str(job.get("job_id")),
+        "status": str(raw.get("status")),
+        "summary": str(raw.get("summary") or "")[:budget],
+    }
+    findings = details.get("findings")
+    if isinstance(findings, list) and findings:
+        rows: list[str] = []
+        remaining = budget
+        for item in findings[:8]:
+            text = (
+                json.dumps(item, ensure_ascii=False)
+                if isinstance(item, (dict, list))
+                else str(item)
+            )
+            kept = text[: max(0, remaining)]
+            if not kept:
+                break
+            remaining -= len(kept)
+            rows.append(kept)
+        if rows:
+            context["findings"] = rows
+    conformance = details.get("conformance")
+    if isinstance(conformance, Mapping) and conformance:
+        context["conformance"] = {
+            str(key): str(value)[:300]
+            for key, value in list(conformance.items())[:12]
+        }
+    return context
+
+
 def _workflow_retry_context(
-    prior_jobs: Sequence[Mapping[str, object]], *, registry=None
+    prior_jobs: Sequence[Mapping[str, object]],
+    *,
+    registry=None,
+    review_rejection: Mapping[str, object] | None = None,
 ) -> dict[str, object] | None:
     """#606：重派這張卡時要機械附進 prompt 的「前次採信失敗證據」。
 
@@ -8585,6 +8665,8 @@ def _workflow_retry_context(
     """
 
     if not prior_jobs:
+        # #750：理論上 rejection 只出現在 repair 回合（該卡必有前次 job）；防禦性
+        # 地維持「首派 prompt 逐字不變」的 #606 要求。
         return None
     latest = prior_jobs[-1]
     context: dict[str, object] = {
@@ -8601,6 +8683,9 @@ def _workflow_retry_context(
     error = _prior_card_acceptance_error(latest, registry=registry)
     if error is not None:
         context["acceptance_error"] = error
+    if review_rejection is not None:
+        # #750：repair 回合的跨卡回饋。鍵名明示它是「打回 candidate 的那份判定」。
+        context["review_rejection"] = dict(review_rejection)
     return context
 
 
@@ -9646,7 +9731,18 @@ def _dispatch_workflow_card(
                 # retry_context 為 None → prompt 逐字不變）。retry-card 的重派與
                 # daemon 的 forced retry 都走這唯一一條組裝路徑，因此兩者同時
                 # 拿到回饋，不需要第二份實作。
-                retry_context=_workflow_retry_context(matching, registry=registry),
+                retry_context=_workflow_retry_context(
+                    matching,
+                    registry=registry,
+                    # #750：只有 builder 的 build 卡吃跨卡回饋——repair 回合的
+                    # 消費者。reviewer 卡維持既有語意（它自己的前次失敗已由
+                    # #606 覆蓋）。
+                    review_rejection=(
+                        _prior_review_rejection(run, registry)
+                        if step.phase == "build" and step.persona == "builder"
+                        else None
+                    ),
+                ),
             ),
             worktree=worktree,
             log_dir=str(Path(coordinator_root).resolve() / "logs" / "workflow"),

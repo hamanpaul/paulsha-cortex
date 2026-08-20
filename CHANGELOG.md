@@ -6,6 +6,9 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#750：repair 回合帶上打回它的 verification 判定（`retry_context.review_rejection`），
+  盲修不收斂的迴圈關掉。** 跨卡回饋機械組裝、有界、標注 reviewer-terminal 來源；
+  首派 prompt 不變、採信端零改動。
 - **#748：三分模式 reviewer settings 補 `allow: ["Bash"]`。** #746 關內層後
   `autoAllowBashIfSandboxed` 的放行消失，`dontAsk` 下 pytest 全拒、零 gate 可跑；
   deny 優先於 allow、憑證拒絕不變、direct 模式不變。
