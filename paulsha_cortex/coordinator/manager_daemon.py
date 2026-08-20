@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import sys
+import traceback
 import tempfile
 import time
 from collections import OrderedDict
@@ -1636,6 +1637,15 @@ def _log_error(exc: Exception, *, context: dict[str, Any] | None = None) -> None
             _LOG_ERROR_DEDUP_STATE.popitem(last=False)  # 淘汰最久未用的 slot
         _LOG_ERROR_DEDUP_STATE[signature] = {"repeat_count": 0}
         print(f"{timestamp} manager_daemon error: {signature}", file=sys.stderr)
+        # #765 補遺（#511 家族）：signature 首次出現時附完整 traceback——「只有
+        # str(exc)」讓每一個新失敗面都要靠實機逐層猜（0820 實測 claim_key 綁定
+        # 失配追了一小時仍不知 raiser 路徑）。重複出現維持既有抑制，不重印。
+        print(
+            "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ).rstrip(),
+            file=sys.stderr,
+        )
         return
 
     _LOG_ERROR_DEDUP_STATE.move_to_end(signature)  # 標記為最近使用，維持 LRU 順序
