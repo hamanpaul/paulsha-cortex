@@ -648,6 +648,13 @@ def dispatch_ready(
         job: dict | None = None
         pinned_inputs: dict | None = None
         try:
+            # Deck dispatch is an authoritative pre-spawn checkpoint.  Keep
+            # this beside input pinning so direct callers cannot bypass the
+            # manager tick's equivalent guard.
+            if isinstance(m.get("path"), str) and m["path"]:
+                from ..deck.schema import validate_foreign_review_tier
+
+                validate_foreign_review_tier(_infer_repo_root(Path(m["path"])))
             prompt = build_dispatch_prompt(persona, task=slice_id, plan_path=m["plan"])
             pinned_inputs = pin_dispatch_inputs(m)
             # best-effort baseline（reviewer #333-1）：identity/launcher_factory 檢查

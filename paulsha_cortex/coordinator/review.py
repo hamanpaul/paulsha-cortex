@@ -106,10 +106,12 @@ def load_model_identity_registry(config_root: str | Path | None = None) -> dict[
     return model_identities.load_model_identities(config_root).legacy_mapping()
 
 
-def read_repo_tier(repo_root: str | Path | None = None) -> str:
+def read_repo_tier(
+    repo_root: str | Path | None = None, *, require_manifest: bool = False
+) -> str:
     root = Path(repo_root) if repo_root is not None else paths.repo_root()
     try:
-        return _read_repo_tier(root)
+        return _read_repo_tier(root, require_manifest=require_manifest)
     except ProjectPolicyError as exc:
         raise ValueError(str(exc)) from exc
 

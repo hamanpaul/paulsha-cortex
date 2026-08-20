@@ -1662,8 +1662,8 @@ def _claim_action(
     issue = args.get("issue") if args.get("issue") is not None else (
         authority.mapped_issues[0] if authority.mapped_issues else None
     )
+    issue_ref = f"{authority.repo}#{issue}" if issue is not None else None
     if readiness_checker is not None:
-        issue_ref = f"{authority.repo}#{issue}" if issue is not None else None
         readiness = readiness_checker(authority, issue_ref)
         if not readiness.ready:
             return {
@@ -1672,6 +1672,42 @@ def _claim_action(
                 "run": None,
                 "readiness_failed_check": readiness.failed_check,
             }
+    else:
+        # Production claim path: instantiate the same local-scope probe used
+        # by the readiness transaction, with the concrete trusted repository
+        # root.  This prevents a claim from creating a workflow while the
+        # later foreign-review gate is already known to be unconfigured.
+        from . import claim_readiness
+
+        try:
+            repo_root = _canonical_repo_root(args.get("repo_root"), repo=authority.repo)
+        except (ValueError, OSError):
+            repo_root = None
+        # Legacy repositories without either manifest retain the documented
+        # shareable default; when a policy is present, the production claim
+        # path executes the same local-scope/tier probe as readiness callers.
+        if repo_root is not None and any(
+            (repo_root / name).is_file() for name in (".project-policy.yml", ".paul-project.yml")
+        ):
+            local_result = claim_readiness.local_scope_probe(
+                repo_root=repo_root,
+                heading_ok=True,
+                openspec_strict_ok=True,
+                changelog_required=False,
+            )(
+                claim_readiness.ReadinessContext(
+                    authority=authority,
+                    executor_identity="cortex-manager",
+                    issue_ref=issue_ref,
+                )
+            )
+            if not local_result.passed:
+                return {
+                    "action": "needs_human" if local_result.terminal else "blocked",
+                    "reason": local_result.reason,
+                    "run": None,
+                    "readiness_failed_check": local_result.name,
+                }
     planning_failure_hint = (
         _planning_failure_hint(canonical_run) if canonical_run is not None else None
     )

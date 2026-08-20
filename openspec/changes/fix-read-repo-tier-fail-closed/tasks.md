@@ -8,3 +8,5 @@
 - [x] 文件化 canonical manifest 缺 `tier` 的 fail-closed 語意。
 - [x] slice lane（`run_tick`／`retry-build`）在 builder dispatch 前共用 tier 前置驗證，避免晚期 foreign review 設定錯誤。
 - [x] deck、doctor、delivery preflight 與 claim readiness 共用同一個 tier resolver，於各自權威前置面 fail-closed。
+- [x] production claim、direct slice dispatch 與 workflow preflight 均實際接入 tier/readiness checkpoint；repo-root resolution error 保留原分類。
+- [x] 文件同步涵蓋 canonical 與 legacy manifest 的缺 tier 語意；所有變更仍限於 archive 前置範圍。

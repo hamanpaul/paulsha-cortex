@@ -2596,9 +2596,22 @@ def run_tick(
     )
     tier_valid_metas: list[dict] = []
     for meta in fanout_metas:
-        tier_error = _validate_foreign_review_policy_before_slice_dispatch(
-            dispatcher, meta=meta
-        )
+        try:
+            tier_error = _validate_foreign_review_policy_before_slice_dispatch(
+                dispatcher, meta=meta
+            )
+        except autonomy.RepoRootResolutionError as exc:
+            slice_id = meta.get("slice_id")
+            reason = f"repo-root-unresolved:{exc}"
+            needs_human.append({"slice_id": slice_id, "gate_reason": reason})
+            errors.append(
+                {
+                    "stage": "repo-root-preflight",
+                    "slice_id": slice_id,
+                    "error": str(exc),
+                }
+            )
+            continue
         if tier_error is None:
             tier_valid_metas.append(meta)
             continue
@@ -3464,7 +3477,9 @@ def _validate_foreign_review_policy_before_slice_dispatch(
     try:
         repo_root = autonomy._infer_repo_root(Path(spec_path))
         foreign_review.read_repo_tier(repo_root)
-    except Exception as exc:
+    except autonomy.RepoRootResolutionError:
+        raise
+    except ValueError as exc:
         # The caller owns the transition/reporting boundary.  This validator is
         # deliberately observational: mutating a never-dispatched pending slice
         # here made a transient pre-dispatch diagnostic sticky, and swallowing a

@@ -377,6 +377,10 @@ def run_preflight(
     evidence_state_root: str | Path | None = None,
 ) -> PreflightResult:
     root = Path(repo_root).resolve()
+    try:
+        read_repo_tier(root)
+    except ProjectPolicyError as exc:
+        raise ValueError(f"preflight foreign-review tier validation failed: {exc}") from exc
     head, tree_hash = _read_clean_identity(root=root, runner=runner)
     if request.tree_hash is not None and (
         not _is_sha(request.tree_hash) or request.tree_hash.lower() != tree_hash
