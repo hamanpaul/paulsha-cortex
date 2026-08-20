@@ -54,6 +54,7 @@ from .github_delivery import (
     GitHubDeliveryClient,
     evaluate_delivery_gate,
 )
+from . import candidate_base
 from . import engineering_outcome
 from . import not_claimable
 from . import verification
@@ -3847,15 +3848,14 @@ def _refreeze_base_action(
     if not workspace_root.is_absolute() or not workspace_root.is_dir():
         raise RuntimeError("refreeze-base requires the run workspace root to exist")
 
-    previous_base_sha = (
-        run.frozen_readiness.get("base_sha")
-        if isinstance(run.frozen_readiness, dict)
-        else None
-    )
-    if not isinstance(previous_base_sha, str) or (
-        verification.SAFE_SHA_RE.fullmatch(previous_base_sha) is None
-    ):
-        previous_base_sha = None
+    # #731：凍結集的讀取走 `candidate_base.frozen_base_sha()`——與 (C) 的曝光面
+    # （`cortex status`／`work show` 的 `candidate_git_base`）是**同一支函式**。
+    # 「這條 run 現在凍結在哪個 base」是同一個事實，寫入端與讀取端各寫一份正規化
+    # ／驗證只會漂移（#727 的第二份 `-o` 落點、#728 的兩份 `next_actions` 導出都
+    # 是這個形狀）。下面 `None` 時退回本地 `main` 的處置仍屬本動作特有——那回答
+    # 的是「下一張卡**會**用什麼基底」，與 (C) 回答的「候選**已經**坐在哪」是同
+    # 一條時間軸的前後兩點，理由見該函式 docstring。
+    previous_base_sha = candidate_base.frozen_base_sha(run.frozen_readiness)
     previous_base_source = "frozen-readiness" if previous_base_sha else "unresolved"
 
     # 已記錄基準：新基底必須是它們全部的後代。順序是稽核順序，不是判定順序

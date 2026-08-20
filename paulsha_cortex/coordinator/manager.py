@@ -24,6 +24,7 @@ from .._yaml import YAMLError, safe_load
 from ..lib import idle
 from ..persona import gate, handoff
 from . import autonomy
+from . import candidate_base
 from . import completion
 from . import coverage
 from . import gate_ledger
@@ -726,7 +727,9 @@ def slice_status_entry(registry, slice_row: dict, *, handoff_dir: str, git_runne
     }
 
 
-def workflow_status_entry(registry, run) -> dict[str, Any]:
+def workflow_status_entry(
+    registry, run, *, candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None
+) -> dict[str, Any]:
     """#527：把 `needs_human` 的 workflow run 投影成 attention 條目。
 
     現場（run ``workflow-6607ac1307feb02ffe06``）：run 停在 build 階段掛著
@@ -739,6 +742,14 @@ def workflow_status_entry(registry, run) -> dict[str, Any]:
     欄位刻意沿用 slice 條目既有的詞彙（`slice_state`／`reason`／`next_actions`
     ／`blocking_reason`），不另立一套平行欄位體系：既有的文字模式渲染與
     `entry.get("slice_state") == "needs_human"` 這類過濾器因此原樣可用。
+
+    #731 (C) 追加 ``candidate_git_base``：這條 run 的候選 git base（真的那個
+    40-hex commit SHA）與它落後 mirror 上 ``origin/main`` 幾個 commit。過去這個
+    事實只存在於候選 worktree 的 `.git` 裡，attention 上唯一像版本的欄位是
+    ``source_revision``（64-hex authority digest，**與 git base 無關**），
+    operator 因此無從判斷「已 merge 的修法進不進得來」。``candidate_base_probe``
+    由呼叫端傳入以共用同一次快照的 git 讀取（見 `manager_daemon`）；不傳時各自
+    建一個唯讀 probe。**本路徑不 fetch、不寫任何 git 物件。**
     """
 
     reason_payload = getattr(run, "needs_human_reason", None)
@@ -782,6 +793,12 @@ def workflow_status_entry(registry, run) -> dict[str, Any]:
         )
     except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
         pass
+    try:
+        candidate_git_base = candidate_base.candidate_git_base_for_run(
+            run, registry, probe=candidate_base_probe
+        ).to_dict()
+    except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
+        candidate_git_base = None
     return {
         "kind": "workflow_run",
         "run_id": run.run_id,
@@ -791,6 +808,10 @@ def workflow_status_entry(registry, run) -> dict[str, Any]:
         "slice_state": "needs_human",
         "gate_state": run.gate_status,
         "reason": reason_code,
+        # #731 (C)：候選 git base（40-hex commit SHA）與落後 mirror 上
+        # origin/main 的 commit 數。與 `source_revision`（64-hex authority
+        # digest）是**兩件事**，欄位名刻意寫死 `git_base` 以免再被混淆。
+        "candidate_git_base": candidate_git_base,
         # 結構化理由整份帶出去（機器可讀 reason ＋ 人可讀 detail ＋ 來源位置
         # ＋ evidence 位置）。欄位名沿用 `claim.ClaimDecision.blocking_reason`
         # ——那是全庫既有的「為什麼卡住」欄位，不另發明。

@@ -125,6 +125,30 @@ def _print_status(status: dict[str, Any]) -> None:
         )
         for ref in blocking.get("evidence_refs") or []:
             sys.stdout.write(f"    evidence: {ref}\n")
+    # #731 (C)：候選 git base 與它落後 mirror 上 origin/main 幾個 commit。過去
+    # 這個事實只在候選 worktree 的 `.git` 裡，而 attention 上唯一像版本的欄位
+    # `source_revision` 是 64-hex 的 authority digest、答非所問——operator 因此
+    # 無從判斷「已 merge 的 test-only 修法進不進得來」。格式比照上面兩段摘要行。
+    for entry in list(status.get("attention", []) or []) + list(
+        status.get("in_flight", []) or []
+    ):
+        if not isinstance(entry, dict):
+            continue
+        git_base = entry.get("candidate_git_base")
+        if not isinstance(git_base, dict) or not git_base.get("sha"):
+            continue
+        subject = entry.get("run_id") or entry.get("job_id") or entry.get("slice_id") or "-"
+        sys.stdout.write(
+            f"  candidate_git_base[{subject}]: {git_base.get('sha')} "
+            f"(behind {git_base.get('measured_against', 'origin/main')}="
+            f"{git_base.get('behind_origin_main')}, source={git_base.get('sha_source')}, "
+            f"fetched={str(bool(git_base.get('fetched'))).lower()})\n"
+        )
+        if git_base.get("reason"):
+            sys.stdout.write(
+                f"    reason: {git_base.get('reason')} "
+                f"(threshold={git_base.get('threshold_commits')})\n"
+            )
     # #669：claim 判定 `missing_issue` 時不再建立 run（那會把「workstream 本來就
     # 不對應單一 issue」這個**預期狀態**物化成永遠不會推進的 needs_human 殭屍，
     # 實機一次產出 24 個、把 attention 信噪比壓成 1:24）。但只是不建 run 等於把

@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import yaml
 
 from paulsha_cortex.config import paths
+from paulsha_cortex.coordinator import candidate_base
 from paulsha_cortex.github_rate_limit import is_auth_signal, is_rate_limit_signal
 
 from .git_mirror import (
@@ -263,7 +264,13 @@ class RepoWorkProvider:
 class WorkflowRegistryProvider:
     """Read repo-scoped WorkflowRun v2 records without adopting legacy slices."""
 
-    def __init__(self, repo: str, *, state_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        repo: str,
+        *,
+        state_path: str | Path | None = None,
+        candidate_base_probe: "candidate_base.MirrorDistanceProbe | None" = None,
+    ) -> None:
         self.repo = repo
         self.provider_id = f"workflow:{repo}"
         self.state_path = (
@@ -271,6 +278,11 @@ class WorkflowRegistryProvider:
             if state_path is not None
             else paths.coordinator_root() / "jobs.json"
         )
+        # #731 (C)：候選 git base 的距離量測。**唯讀**（`rev-parse` ／
+        # `rev-list --count`，絕不 fetch）——Monitor 是讀模型，跟著 fetch 會讓
+        # 「看一眼 work item」變成會改變 mirror 的動作。注入點留給測試；
+        # production 每次 scan 重建一個，才不會把上一輪的 main 位置快取成永久值。
+        self._candidate_base_probe = candidate_base_probe
 
     def scan(self) -> ProviderSnapshot:
         attempted_at = _utcnow()
@@ -308,10 +320,24 @@ class WorkflowRegistryProvider:
             else:
                 _validate_workflow_v2_root(payload)
                 rows = payload["workflow_runs"]
+            # #731 (C)：候選基底的第二來源是 job 的 `dispatch_head`（實機 0820
+            # 逐字：29 個 run 的 `frozen_readiness` 全為 null，唯一記著基底的是
+            # 這裡）。同一份 payload 已經含 `jobs`，不必另開檔案讀取。
+            job_rows = payload.get("jobs")
+            if not isinstance(job_rows, list):
+                job_rows = []
+            candidate_base_probe = (
+                self._candidate_base_probe
+                if self._candidate_base_probe is not None
+                else candidate_base.MirrorDistanceProbe(
+                    mirror_root=candidate_base.default_mirror_root()
+                )
+            )
             sources: list[WorkSource] = []
             links: dict[str, str] = {}
             schema_retry: dict[str, dict[str, int]] = {}
             needs_human_reasons: dict[str, dict[str, object]] = {}
+            candidate_git_bases: dict[str, dict[str, object]] = {}
             diagnostics: list[str] = []
             validated_completions: dict[str, list[dict[str, object]]] = {}
             for row in rows:
@@ -358,6 +384,25 @@ class WorkflowRegistryProvider:
                 blocking = _needs_human_reason_row(row)
                 if blocking is not None:
                     needs_human_reasons[work_id] = {"run_id": run_id, **blocking}
+                # #731 (C)：候選 git base（真的那個 40-hex commit SHA）與落後
+                # mirror 上 origin/main 的距離。同樣走 observations 通道，理由
+                # 與上面兩段一致（新增 row 欄位會讓整份 projection degraded）。
+                # 只投影仍 ongoing 的 run：已 done／superseded 的 run 的舊基底
+                # 出現在 `work show` 上只會誤導（比照 `_needs_human_reason_row`）。
+                if row.get("status", "ongoing") == "ongoing":
+                    git_base = candidate_base.resolve_candidate_git_base(
+                        frozen_readiness=row.get("frozen_readiness"),
+                        build_dispatch_heads=(
+                            candidate_base.build_dispatch_heads_from_jobs(
+                                job_rows, run_id=run_id
+                            )
+                        ),
+                        probe=candidate_base_probe,
+                    )
+                    candidate_git_bases[work_id] = {
+                        "run_id": run_id,
+                        **git_base.to_dict(),
+                    }
                 if status != "superseded":
                     for ref in row.get("issue_refs", []):
                         _add_workflow_link(links, f"github_issue:{ref}", work_id)
@@ -396,6 +441,7 @@ class WorkflowRegistryProvider:
                 "validated_completions": validated_completions,
                 "schema_retry": schema_retry,
                 "needs_human_reasons": needs_human_reasons,
+                "candidate_git_bases": candidate_git_bases,
             },
         )
 

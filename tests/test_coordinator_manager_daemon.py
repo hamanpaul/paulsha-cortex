@@ -27,6 +27,20 @@ from paulsha_cortex.coordinator.registry import JobRegistry
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _assert_in_flight_shape(rows: list[dict]) -> None:
+    """in_flight 條目的既有三欄逐字不變，外加 #731 (C) 的 `candidate_git_base`。
+
+    本檔的 fake job 沒有 `dispatch_head`，因此候選基底解析成具名的
+    `candidate-git-base-absent`——欄位存在且說得出原因，不靜默消失。
+    """
+
+    assert [
+        {key: row[key] for key in ("job_id", "slice_id", "state")} for row in rows
+    ] == [{"job_id": "job-1", "slice_id": "slice-b", "state": "running"}]
+    assert rows[0]["candidate_git_base"]["sha"] is None
+    assert rows[0]["candidate_git_base"]["reason"] == "candidate-git-base-absent"
+
+
 class FakeRegistry:
     def __init__(self, jobs: list[dict] | None = None) -> None:
         self._jobs = list(jobs or [])
@@ -563,7 +577,7 @@ def test_run_loop_drains_tick_request_writes_done_and_updates_status(monkeypatch
     assert done["status"] == "ok"
     assert done["result"]["dispatched"] == ["slice-a"]
     assert status["ready"] == ["slice-a"]
-    assert status["in_flight"] == [{"job_id": "job-1", "slice_id": "slice-b", "state": "running"}]
+    _assert_in_flight_shape(status["in_flight"])
     assert status["recent_done"][0]["slice_id"] == "slice-z"
     assert status["daemon"]["pid"] == 4321
     assert status["daemon"]["last_tick_at"] == "2026-07-03T09:05:00+00:00"
@@ -652,7 +666,7 @@ def test_built_executor_and_status_provider_use_injected_dispatcher_and_registry
     assert callable(calls[0]["predicate"])
     assert done["status"] == "ok"
     assert done["result"]["dispatched"] == ["slice-a"]
-    assert status["in_flight"] == [{"job_id": "job-1", "slice_id": "slice-b", "state": "running"}]
+    _assert_in_flight_shape(status["in_flight"])
 
 
 def test_periodic_tick_runner_does_not_wire_reaper_and_uses_default_executor(monkeypatch, tmp_path):
@@ -1128,7 +1142,15 @@ def test_runtime_status_provider_lists_recent_done_by_completion_time(monkeypatc
     status = provider()
 
     assert status["ready"] == ["slice-ready"]
-    assert status["in_flight"] == [{"job_id": "job-1", "slice_id": "slice-x", "state": "running"}]
+    # #731 (C)：既有三欄逐字不變，外加 `candidate_git_base`（此 fake job 沒有
+    # `dispatch_head`，故落具名的 `candidate-git-base-absent`）。
+    assert [
+        {key: row[key] for key in ("job_id", "slice_id", "state")}
+        for row in status["in_flight"]
+    ] == [{"job_id": "job-1", "slice_id": "slice-x", "state": "running"}]
+    assert status["in_flight"][0]["candidate_git_base"]["reason"] == (
+        "candidate-git-base-absent"
+    )
     assert [entry["slice_id"] for entry in status["recent_done"]] == ["slice-b", "slice-a"]
 
 

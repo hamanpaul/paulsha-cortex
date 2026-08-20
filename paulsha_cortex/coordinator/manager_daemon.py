@@ -19,7 +19,7 @@ from typing import Any, Callable
 from paulsha_cortex.config import paths
 from ..control import constants, contract
 from ..trust_root import selfcheck as trust_root_selfcheck
-from . import autonomy, backoff, manager, not_claimable, planning_runtime
+from . import autonomy, backoff, candidate_base, manager, not_claimable, planning_runtime
 from .cli import _refuse_unsafe_fanout, _resolve_launcher
 from .diagnostics import diagnostic_reason, summarize_exception
 from .dispatcher import Dispatcher
@@ -236,17 +236,48 @@ def _safe_tick_error_summary(exc: Exception) -> dict[str, str]:
     return {"type": type(exc).__name__, "reason": reason}
 
 
-def _in_flight_status(registry) -> list[dict[str, Any]]:
+def _in_flight_status(
+    registry, *, candidate_base_probe: candidate_base.MirrorDistanceProbe | None = None
+) -> list[dict[str, Any]]:
+    """在跑的卡。
+
+    #731 (C)：每一條 in_flight 條目補上 ``candidate_git_base``——這張卡實際被
+    provision 在哪個 commit 上（``job["dispatch_head"]``，也就是候選 worktree
+    `git rev-parse HEAD` 會給的那個值），以及它落後 mirror 上 ``origin/main``
+    幾個 commit。0819 現場 operator 只能 `sudo git -C <候選 worktree> rev-parse
+    HEAD` 才問得到這件事，而 status 上唯一像版本的 ``source_revision`` 是
+    authority digest、答非所問。
+
+    ``candidate_base_probe`` 由呼叫端共用（同一次快照裡多張卡常共用同一個
+    base），不傳時本函式自建一個唯讀 probe。**唯讀：不 fetch、不寫。**
+    """
+
+    probe = (
+        candidate_base_probe
+        if candidate_base_probe is not None
+        else candidate_base.MirrorDistanceProbe(
+            mirror_root=candidate_base.default_mirror_root()
+        )
+    )
     in_flight = []
     for job in registry.list_jobs():
         status = job.get("status")
         if status not in manager.IN_FLIGHT_STATUSES:
             continue
+        try:
+            git_base = candidate_base.resolve_candidate_git_base(
+                frozen_readiness=None,
+                build_dispatch_heads=(job.get("dispatch_head"),),
+                probe=probe,
+            ).to_dict()
+        except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
+            git_base = None
         in_flight.append(
             {
                 "job_id": job.get("job_id"),
                 "slice_id": job.get("task"),
                 "state": status,
+                "candidate_git_base": git_base,
             }
         )
     return in_flight
@@ -346,9 +377,13 @@ def build_status_provider(
     recent_done_provider: Callable[[], list[dict[str, Any]]],
 ) -> Callable[[], dict[str, Any]]:
     def provider() -> dict[str, Any]:
+        # #731 (C)：整份快照共用一個唯讀 probe，同一個 base 只問 git 一次。
+        probe = candidate_base.MirrorDistanceProbe(
+            mirror_root=candidate_base.default_mirror_root()
+        )
         return {
             "ready": list(ready_provider()),
-            "in_flight": _in_flight_status(registry),
+            "in_flight": _in_flight_status(registry, candidate_base_probe=probe),
             "recent_done": list(recent_done_provider()),
         }
 
@@ -407,6 +442,12 @@ def build_runtime_status_provider(
         return [item[1] for item in manifests[:recent_done_limit]]
 
     def provider() -> dict[str, Any]:
+        # #731 (C)：整份快照共用一個唯讀 probe（同一個 base 只問 git 一次，
+        # 且 `mirror_origin_main` 在一份快照內必然一致）。
+        candidate_base_probe = candidate_base.MirrorDistanceProbe(
+            mirror_root=candidate_base.default_mirror_root(),
+            git_runner=git_runner,
+        )
         metas = scan_specs_fn(specs_dir)
         predicate = lambda slice_id: autonomy.default_is_satisfied(
             slice_id,
@@ -470,11 +511,17 @@ def build_runtime_status_provider(
                     or "needs_human" not in getattr(run, "facets", ())
                 ):
                     continue
-                attention.append(manager.workflow_status_entry(registry, run))
+                attention.append(
+                    manager.workflow_status_entry(
+                        registry, run, candidate_base_probe=candidate_base_probe
+                    )
+                )
         return {
             "ready": ready,
             "held": held,
-            "in_flight": _in_flight_status(registry),
+            "in_flight": _in_flight_status(
+                registry, candidate_base_probe=candidate_base_probe
+            ),
             "recent_done": recent_done_provider(),
             "slices": slices,
             "attention": attention,

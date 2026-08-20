@@ -212,6 +212,44 @@ def _build_work_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _format_candidate_git_base(payload: object) -> list[str]:
+    """`cortex work show` 的候選 git base 區塊（#731 (C)）。
+
+    純函式（不 print、不做 I/O），好讓測試直接對輸出逐字斷言。缺欄位／
+    legacy Monitor 回傳沒有這一欄時回空清單，維持舊行為。
+    """
+
+    if not isinstance(payload, dict) or not payload:
+        return []
+    sha = payload.get("sha")
+    behind = payload.get("behind_origin_main")
+    lines = [f"candidate_git_base: {sha or '-'}"]
+    if payload.get("sha_source"):
+        lines.append(f"  source: {payload.get('sha_source')}")
+    if payload.get("run_id"):
+        lines.append(f"  run_id: {payload.get('run_id')}")
+    if behind is not None:
+        # 誠實標示比較基準：距離是相對 **mirror 上次 fetch 到的 main**，
+        # 不是相對 GitHub 此刻的 main——本路徑唯讀，不 fetch。
+        lines.append(
+            f"  behind {payload.get('measured_against', 'origin/main')}: {behind}"
+            f" (mirror main={payload.get('mirror_origin_main') or '-'},"
+            f" fetched={str(bool(payload.get('fetched'))).lower()})"
+        )
+    if payload.get("reason"):
+        lines.append(
+            f"  reason: {payload.get('reason')}"
+            f" (threshold={payload.get('threshold_commits')})"
+        )
+    # `source_revision` 的誤導本身就是缺陷的一部分（#731）：只要印了 git base，
+    # 就一併點明另一欄是什麼，讓兩者不會再被讀成同一件事。
+    lines.append(
+        "  註：`source_revision` 是 work item 來源材料的 sha256"
+        "（authority digest，64-hex），與 git base 無關。"
+    )
+    return lines
+
+
 def _work_read_main(args: list[str], *, work_client=None) -> int:
     from paulsha_cortex.monitor.work_api import MonitorSocketClient
 
@@ -277,6 +315,12 @@ def _work_read_main(args: list[str], *, work_client=None) -> int:
                 print(f"  run_id: {blocking.get('run_id')}")
             for ref in blocking.get("evidence_refs") or []:
                 print(f"  evidence: {ref}")
+        # #731 (C)：候選 git base。過去這個事實只存在於候選 worktree 的 `.git`
+        # 裡，`work show` 上唯一像版本的欄位是 `source_revision`——那是 work item
+        # 來源材料的 sha256（authority digest，64-hex），**與 git base 無關**，
+        # 於是 0819 現場它把診斷帶偏了兩次。這裡逐行寫明兩者的分工。
+        for line in _format_candidate_git_base(data.get("candidate_git_base")):
+            print(line)
         if parsed.explain:
             print(json.dumps(data.get("explanation", {}), ensure_ascii=False, indent=2))
     return 0

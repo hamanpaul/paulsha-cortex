@@ -127,6 +127,15 @@ def semantic_source_revision(
     make a Manager-authored archive/PR refresh look like a second claim. A
     changed target is still security relevant because it changes the stable
     source key/ref set and therefore the authority digest.
+
+    **這不是 git base**（#731）。這裡算出來的值一路寫進
+    ``WorkflowRun.source_revision`` / ``job["source_revision"]``，它是 work item
+    **來源材料**的 sha256（64-hex authority digest），與 run 的候選 git base
+    （40-hex commit SHA）沒有任何關係，也不隨 ``origin/main`` 前進而改變。
+    0819 現場逐字：``source_revision: 22b88b01e9b2…`` 是 run 上唯一顯眼的「版本」
+    欄位，operator 因此把「基底過舊」的診斷掛在它身上，連續誤判兩次。候選 git
+    base 的曝光面在 `coordinator/candidate_base.py`（``candidate_git_base``），
+    命名刻意不與本欄位共用任何詞彙。
     """
 
     if kind in DERIVED_AUTHORITY_KINDS:
