@@ -243,7 +243,8 @@ def test_log_error_deduplicates_repeated_signature_with_periodic_summary(capsys)
     output_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
 
     interval = manager_daemon.LOG_ERROR_SUMMARY_INTERVAL
-    expected_lines = 1 + (total_calls - 1) // interval
+    # #765 補遺：首次出現另附 traceback（未 raise 的例外＝1 行例外文字）。
+    expected_lines = 2 + (total_calls - 1) // interval
     assert len(output_lines) == expected_lines
     assert len(output_lines) < total_calls
     # First occurrence is always printed in full, never suppressed.
@@ -290,7 +291,8 @@ def test_log_error_deduplicates_interleaved_signatures_independently(capsys):
     assert len(output_lines) < total_calls
 
     interval = manager_daemon.LOG_ERROR_SUMMARY_INTERVAL
-    expected_lines_per_signature = 1 + (calls_per_signature - 1) // interval
+    # #765 補遺：首次出現另附 traceback 1 行。
+    expected_lines_per_signature = 2 + (calls_per_signature - 1) // interval
     for exc in signatures:
         marker = str(exc)
         sig_lines = [line for line in output_lines if marker in line]
