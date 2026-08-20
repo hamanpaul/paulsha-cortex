@@ -6,6 +6,10 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#740：誠實紀律補環境維度，builder sandbox 的環境紅不再使 focused 寫入卡確定性
+  自報 failed。** 判準來自 Manager 在 gate 環境的重跑；sandbox-only、與變更無關的
+  失敗改為「省略該 gate＋diagnostics 記錄＋照常交付 candidate」，宣稱綠仍禁止、
+  ledger 紅照樣 fail-closed。`status_policy` 失敗條款改為「because of your change」。
 - **#738：candidate 驗證下放 gate ledger，三分部署下帶 candidate 的 build 卡終於
   可被採信。** gate 身分在快照副本上收集 `worktree_state`（head／dirty／
   ancestry），Manager 只消費權威 ledger、不再以自己的身分 `git -C <builder 樹>`
