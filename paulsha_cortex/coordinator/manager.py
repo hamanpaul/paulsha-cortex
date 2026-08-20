@@ -10059,6 +10059,11 @@ def resume_workflow_run(
                 if job.get("workflow_run_id") == run.run_id
                 and job.get("workflow_card") == recovery_step.card
                 and job.get("workflow_phase") == recovery_step.phase
+                # #765：recovery 同樣只認本 claim era（None 容忍比照 #766/#768）。
+                # 這是最後一個 era-blind 選擇器：operator_resume 的 recovery 分支
+                # 會把前代 era 的已綁 evidence job 抓回重放，advance 的 binding
+                # 對現 era 必炸（實機：verification-38 每次 resume 被重放）。
+                and job.get("workflow_claim_key") in (None, run.claim_key)
             ]
             latest_recovery = recovery_jobs[-1] if recovery_jobs else None
             if (

@@ -61,6 +61,13 @@ class RetryCardEraTests(unittest.TestCase):
         )
         self.assertEqual(rows, [current])
 
+class RecoveryEraTests(unittest.TestCase):
+    def test_recovery_selection_filters_by_claim_era(self) -> None:
+        source = inspect.getsource(manager.resume_workflow_run)
+        anchor = source.index("recovery_jobs = [")
+        block = source[anchor : anchor + 900]
+        self.assertIn('job.get("workflow_claim_key") in (None, run.claim_key)', block)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
