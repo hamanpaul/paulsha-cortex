@@ -6,6 +6,10 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#752：verify 階段的人裁通道。** `retry-card --reason` → Manager-owned
+  immutable evidence（`cortex-operator-adjudication/v1`）→ retry_context 的
+  `operator_adjudications` 鍵（builder 與 reviewer 卡都吃）。design/todo 矛盾
+  這類 needs_human 判定，operator 裁決終於有可信路徑進 prompt。
 - **#750：repair 回合帶上打回它的 verification 判定（`retry_context.review_rejection`），
   盲修不收斂的迴圈關掉。** 跨卡回饋機械組裝、有界、標注 reviewer-terminal 來源；
   首派 prompt 不變、採信端零改動。
