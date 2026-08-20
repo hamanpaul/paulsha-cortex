@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#759：pr-preflight evidence 補 backend stdout/stderr 有界尾段**——失敗原因
+  進 evidence，不再只靠實機重現定位。
 - **#760：`--skip-tests` 的 FullSuiteEvidence 契約接上 production**——gate 綠的
   build 候選在採信點落 tree-hash 定址 evidence，delivery preflight 消費之；
   manager 環境不再第三跑全套。tdd-red 的 RED 天然排除、記錄失敗不影響採信。

@@ -667,6 +667,11 @@ def _preflight_result_evidence(
         "policy": {
             "argv": list(preflight.policy.argv),
             "returncode": preflight.policy.returncode,
+            # #759：失敗的逐字原因必須在 evidence 裡——「只記 returncode」讓每一次
+            # preflight 失敗都要靠實機重現才能定位（本日三環皆如此）。有界尾段，
+            # short summary 在尾巴（與 gate ledger detail 同向）。
+            "stdout_tail": str(preflight.policy.stdout or "")[-2000:],
+            "stderr_tail": str(preflight.policy.stderr or "")[-2000:],
         },
         "ci_parity": (
             None
@@ -674,6 +679,8 @@ def _preflight_result_evidence(
             else {
                 "argv": list(preflight.ci_parity.argv),
                 "returncode": preflight.ci_parity.returncode,
+                "stdout_tail": str(preflight.ci_parity.stdout or "")[-2000:],
+                "stderr_tail": str(preflight.ci_parity.stderr or "")[-2000:],
             }
         ),
     }
