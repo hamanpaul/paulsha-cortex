@@ -5838,7 +5838,9 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
-            state_path=state_path,
+            # #752 補遺：帶 reason 時要寫 evidence，必須用**解析後**的 state path
+            # ——原始參數在 production（daemon 請求）恆為 None。
+            state_path=resolved_state_path,
             now_epoch=now_epoch,
         )
     elif action == "retry-verify":
