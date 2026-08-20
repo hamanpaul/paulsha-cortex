@@ -2104,6 +2104,10 @@ class JobRegistry:
             # 的是「這張卡對**現在這個 candidate** 已經有被採信的結論」，而不是
             # 上一代 candidate 留下的歷史紀錄——後者拒絕等於再造一次 catch-22。
             and (phase == "build" or job.get("subject_head") == current.candidate_head)
+            # #765：與 candidate 定錨同一個道理再加一層——claim era 定錨（None
+            # 容忍比照 #766/#768/#772）。authority restart 後前代 era 的已綁
+            # evidence 是歷史稽核列；拿它拒絕新 era 的重派＝同一個 catch-22。
+            and job.get("workflow_claim_key") in (None, current.claim_key)
             and job.get("workflow_evidence") is not None
             for job in self._jobs
         ):
