@@ -138,6 +138,50 @@ def test_explicit_shareable_tier_is_accepted(tmp_path: Path) -> None:
     assert read_repo_tier(tmp_path) == "shareable"
 
 
+def test_slice_tick_rejects_missing_tier_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slice lane must fail closed before autonomy records a builder job."""
+    (tmp_path / ".project-policy.yml").write_text(
+        "policy_profile: flat\npolicy_version: 1.0.17\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(manager.autonomy, "_infer_repo_root", lambda _path: tmp_path)
+    dispatched = False
+
+    def unexpected_dispatch(*_args, **_kwargs):
+        nonlocal dispatched
+        dispatched = True
+        raise AssertionError("builder dispatch must not be reached")
+
+    monkeypatch.setattr(manager.autonomy, "dispatch_ready", unexpected_dispatch)
+
+    class Registry:
+        def list_jobs(self):
+            return []
+
+        def list_slices(self):
+            return []
+
+        def update_slice(self, slice_id, **kwargs):
+            assert slice_id == "slice-492"
+            assert kwargs == {"state": "needs_human", "gate_state": "needs_human"}
+
+    dispatcher = SimpleNamespace(_registry=Registry(), _git_runner=None)
+    result = manager.run_tick(
+        dispatcher,
+        metas=[{"slice_id": "slice-492", "path": str(tmp_path / "spec.md"), "dispatch": "auto", "plan": "plan.md", "depends_on": []}],
+        launcher=object(),
+        is_satisfied=lambda _slice_id: True,
+        handoff_dir=str(tmp_path / "handoff"),
+    )
+
+    assert dispatched is False
+    assert result["dispatched"] == []
+    assert result["needs_human"][0]["slice_id"] == "slice-492"
+    assert "allowed values" in result["needs_human"][0]["gate_reason"]
+
+
 def test_valid_tier_preflight_does_not_create_needs_human_candidate_state(
     tmp_path: Path,
 ) -> None:

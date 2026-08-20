@@ -1812,6 +1812,19 @@ def apply_slice_action(
             raise ValueError(f"invalid-spec:{target['parse_error'].get('field')}")
         if not (isinstance(target.get("plan"), str) and target["plan"]):
             raise ValueError("no-plan")
+        tier_error = _validate_foreign_review_policy_before_slice_dispatch(
+            dispatcher, meta=target
+        )
+        if tier_error is not None:
+            latest = registry.get_slice(slice_id)
+            return {
+                "slice_id": slice_id,
+                "action": action,
+                "slice_state": latest.get("state"),
+                "gate_state": latest.get("gate_state"),
+                "result": "needs_human",
+                "gate_reason": f"foreign-review-config-error:{tier_error}",
+            }
         dispatched = dispatch_ready_fn(
             [{**target, "dispatch": "auto"}],
             lambda sid: autonomy.default_is_satisfied(
@@ -2581,6 +2594,29 @@ def run_tick(
     fanout_metas, already_terminal, needs_human = dispatch_gate_scan(
         metas, handoff_dir=handoff_dir, registry=registry
     )
+    tier_valid_metas: list[dict] = []
+    for meta in fanout_metas:
+        tier_error = _validate_foreign_review_policy_before_slice_dispatch(
+            dispatcher, meta=meta
+        )
+        if tier_error is None:
+            tier_valid_metas.append(meta)
+            continue
+        slice_id = meta.get("slice_id")
+        needs_human.append(
+            {
+                "slice_id": slice_id,
+                "gate_reason": f"foreign-review-config-error:{tier_error}",
+            }
+        )
+        errors.append(
+            {
+                "stage": "foreign-review-tier-preflight",
+                "slice_id": slice_id,
+                "error": tier_error,
+            }
+        )
+    fanout_metas = tier_valid_metas
     # idle gate 只擋「派工側（新工作，會啟 agent，昂貴）」；完成側（poll→manifest，便宜的
     # 回收/記帳）一律跑，否則高負載時 job 完成/失敗狀態與下游釋放會被埋住（review F-C）。
     if require_idle and not idle.is_idle(max_load=max_load, probe=idle_probe):
@@ -2588,18 +2624,19 @@ def run_tick(
     else:
         dispatch_skipped = False
         try:
-            dispatched = autonomy.dispatch_ready(
-                fanout_metas,
-                satisfied,
-                dispatcher,
-                persona=persona,
-                launcher=launcher,
-                git_runner=getattr(dispatcher, "_git_runner", None),
-                handoff_dir=handoff_dir,
-                identity_registry=identity_registry,
-                launcher_factory=launcher_factory,
-                spawn_admission=spawn_admission,
-            )
+            if fanout_metas:
+                dispatched = autonomy.dispatch_ready(
+                    fanout_metas,
+                    satisfied,
+                    dispatcher,
+                    persona=persona,
+                    launcher=launcher,
+                    git_runner=getattr(dispatcher, "_git_runner", None),
+                    handoff_dir=handoff_dir,
+                    identity_registry=identity_registry,
+                    launcher_factory=launcher_factory,
+                    spawn_admission=spawn_admission,
+                )
         except autonomy.DispatchReadyError as exc:
             dispatched = list(exc.jobs)
             errors.extend(
@@ -3404,6 +3441,38 @@ def _validate_foreign_review_policy_before_build(dispatcher, *, run, step) -> di
             "current_phase": updated.current_phase,
             "reason": "foreign-review-config",
         }
+    return None
+
+
+def _validate_foreign_review_policy_before_slice_dispatch(
+    dispatcher, *, meta: Mapping[str, object]
+) -> str | None:
+    """Validate the slice lane's repo tier before it records or launches a job.
+
+    The workflow lane has its own dispatch gate, but slice work is spawned by
+    ``autonomy.dispatch_ready`` and otherwise reaches ``_launch_foreign_review``
+    only after a builder has already run.  Keep the same ``read_repo_tier``
+    authority and make this entrance fail closed as well.
+    """
+
+    spec_path = meta.get("path")
+    if not isinstance(spec_path, str) or not spec_path:
+        # Hand-built legacy metas used by callers/tests predate the normalized
+        # scan contract.  They have no trustworthy repo root to inspect; leave
+        # them to the existing dispatch validation rather than inventing one.
+        return None
+    try:
+        repo_root = autonomy._infer_repo_root(Path(spec_path))
+        foreign_review.read_repo_tier(repo_root)
+    except Exception as exc:
+        slice_id = meta.get("slice_id")
+        registry = getattr(dispatcher, "_registry", None)
+        if isinstance(slice_id, str) and registry is not None:
+            try:
+                registry.update_slice(slice_id, state="needs_human", gate_state="needs_human")
+            except Exception:
+                pass
+        return str(exc)
     return None
 
 

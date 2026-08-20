@@ -6,7 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
-- **#492：repo policy 的 `tier` 缺失或非法時，在 builder dispatch 前以指出 manifest 路徑與允許值的診斷 fail-closed。** 未有 manifest 的 repo 維持 `shareable` 預設；canonical manifest 存在時 `tier` 必填。
+- **#492：repo policy 的 `tier` 缺失或非法時，在 workflow 與 slice builder dispatch 前以指出 manifest 路徑與允許值的診斷 fail-closed。** 未有 manifest 的 repo 維持 `shareable` 預設；canonical manifest 存在時 `tier` 必填。
 - **#734：wrapper 斷言改為逐 token 語意判定，不再對整串 argv 做 substring 搜尋。**
   gate 執行帳號名（`cortex-gate`）出現在 pytest tmp 路徑裡，讓
   `test_planning_wrapper_has_no_gate_bundle_verdict_sentinel` 的 `"gate" not in joined`
