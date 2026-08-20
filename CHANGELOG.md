@@ -6,6 +6,10 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#743：auto 路徑的 ancestry baseline 與採信端同一條導出（`run.candidate_head or
+  dispatch_head`），中段 build 卡不再每張都要人工 `regenerate-gates`。**
+  `dispatch_head` 是 run 層級凍結值、後續卡逐字繼承首張卡的，#738 首版拿它當
+  基線使中段卡的 ledger 被「baseline 不符視同缺席」守衛正確拒絕。
 - **#742：reviewer sandbox 交接（#710 的 reviewer lane 版），三分部署下 verify／
   review 卡派得出去。** 容器收斂 0701；per-job sandbox 由 owner 顯式
   `setfacl -R u:<reviewer>:rwX`（default ACL 繼承在 `UMask=0077` 下會被 mask

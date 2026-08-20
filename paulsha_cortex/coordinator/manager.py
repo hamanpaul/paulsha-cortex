@@ -4110,7 +4110,33 @@ def _workflow_acceptance_definition_drifted(
     return pinned != fresh_test_policy
 
 
-def _run_gate_execution_identity(job: Mapping[str, object]) -> None:
+def _gate_ancestry_baseline(registry, job: Mapping[str, object]) -> str | None:
+    """auto 路徑 gate 量測 ancestry 的 baseline——**與採信端同一條導出**（#743）。
+
+    採信端（`_verify_build_candidate_transition`）的 baseline 是
+    `previous_candidate（run.candidate_head） or job["dispatch_head"]`；auto 路徑的
+    gate 若各算一份（#738 首版直接拿 `dispatch_head`），中段 build 卡的 ledger 就會
+    量在錯的基線上、被「baseline 不符視同缺席」的守衛正確拒絕，每張卡都得人工
+    `regenerate-gates`。這裡回 run 的 `candidate_head`（合法 sha 時），否則 None
+    ——`ensure_gate_ledger` 會退回 `dispatch_head`，首張卡兩者本就同值。
+    """
+
+    if registry is None:
+        return None
+    run_id = job.get("workflow_run_id")
+    if not isinstance(run_id, str):
+        return None
+    try:
+        run = registry.get_workflow_run(run_id)
+    except Exception:
+        return None
+    candidate = getattr(run, "candidate_head", None)
+    if isinstance(candidate, str) and verification.SAFE_SHA_RE.fullmatch(candidate):
+        return candidate.lower()
+    return None
+
+
+def _run_gate_execution_identity(job: Mapping[str, object], *, registry=None) -> None:
     """#629：降權模式下補上缺席的 gate ledger（`direct` 模式為 no-op）。
 
     **失敗一律翻成 `TerminalContractError` 並 fail closed**，不吞、不降級。gate 跑
@@ -4124,7 +4150,11 @@ def _run_gate_execution_identity(job: Mapping[str, object]) -> None:
     from . import gate_runner
 
     try:
-        gate_runner.ensure_gate_ledger(job, phases=GATE_EXECUTION_PHASES)
+        gate_runner.ensure_gate_ledger(
+            job,
+            phases=GATE_EXECUTION_PHASES,
+            ancestry_baseline=_gate_ancestry_baseline(registry, job),
+        )
     except (gate_runner.GateRunnerError, job_runner.JobRunnerError) as exc:
         reason = getattr(exc, "reason", None) or "gate-execution-failed"
         raise terminal_contract.TerminalContractError(
@@ -6153,7 +6183,7 @@ def terminalize_workflow_job(
     #
     # 位置在 `_assert_terminal_gate_consistency` **正前方**：那裡是唯一會讀 ledger
     # 的採信點，證據必須在被讀之前就已經落地，且**不得**在採信開始之後才產生。
-    _run_gate_execution_identity(job)
+    _run_gate_execution_identity(job, registry=registry)
     # #261 R2／D3：矛盾偵測排在任何狀態採信之前。放在 per-phase schema 驗證之前，
     # 是為了避免「先按 passed 走一段流程、後面才發現不對」造成的部分副作用。
     # #307：帶入 registry 讓 red-required 卡的測試 gate 語意反轉生效。
