@@ -2098,14 +2098,78 @@ def _recompute_and_persist_sizing(workflow_registry, run):
     )
 
 
-def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -> dict[str, Any]:
+def _record_operator_adjudication(
+    *,
+    run,
+    card: str,
+    args: dict[str, Any],
+    state_path: Path | None,
+    now_epoch: float | None,
+) -> dict[str, str] | None:
+    """#755：`reason` → operator-adjudication evidence 的共用落地（retry-card／retry-build）。
+
+    驗證在呼叫端已完成（非空、有界、state_path 存在）；這裡只負責一致的 body 形狀
+    與 content-addressed 寫入。
+    """
+
+    adjudication = args.get("reason")
+    if adjudication is None:
+        return None
+    actor_value = args.get("actor")
+    return _write_supersede_evidence(
+        {
+            "schema": OPERATOR_ADJUDICATION_SCHEMA,
+            "repo": run.repo,
+            "work_id": run.work_id,
+            "run_id": run.run_id,
+            "card": card,
+            "actor": (
+                actor_value if isinstance(actor_value, str) and actor_value.strip() else "operator"
+            ),
+            "reason": adjudication.strip(),
+            "phase": run.current_phase,
+            "created_at": (
+                datetime.fromtimestamp(float(now_epoch), tz=timezone.utc).isoformat()
+                if isinstance(now_epoch, (int, float)) and not isinstance(now_epoch, bool)
+                else ""
+            ),
+        },
+        state_path=state_path,
+        subdir="operator-adjudication",
+        label="operator-adjudication",
+        max_size=16384,
+    )
+
+
+def _validate_operator_adjudication_args(
+    args: dict[str, Any], *, state_path: Path | None, action: str
+) -> None:
+    adjudication = args.get("reason")
+    if adjudication is None:
+        return
+    if (
+        not isinstance(adjudication, str)
+        or not adjudication.strip()
+        or len(adjudication) > OPERATOR_ADJUDICATION_REASON_LIMIT
+    ):
+        raise ValueError(
+            f"{action} reason must be a non-empty string within "
+            f"{OPERATOR_ADJUDICATION_REASON_LIMIT} characters"
+        )
+    if state_path is None:
+        raise ValueError(f"{action} reason requires a durable state path")
+
+
+def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
     extras = set(args) - {
-        "action", "repo", "work_id", "issue", "actor", "expected_candidate",
+        "action", "repo", "work_id", "issue", "actor", "expected_candidate", "reason",
     }
     if extras:
         raise ValueError(f"retry-build rejects caller evidence/input: {sorted(extras)[0]}")
+    # #755：選填 operator 指示——repair 回合過去只有 stale 的跨卡回饋可看。
+    _validate_operator_adjudication_args(args, state_path=state_path, action="retry-build")
     expected_candidate = args.get("expected_candidate")
     if (
         not isinstance(expected_candidate, str)
@@ -2174,8 +2238,16 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry) -
         retry_classification=retry_classification.value,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card="subagent-build",
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     return {
         "action": "retry-build",
+        "adjudication_evidence": adjudication_evidence,
         "reason": "candidate-repair-dispatched",
         "expected_candidate": expected_candidate.lower(),
         "run": updated.to_dict(),
@@ -2334,20 +2406,7 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     if extras:
         raise ValueError(f"retry-card rejects caller evidence/input: {sorted(extras)[0]}")
     # #752：選填的 operator 裁決文字。驗在最前面——裁決寫不進去就不該動 run。
-    adjudication = args.get("reason")
-    if adjudication is not None:
-        if (
-            not isinstance(adjudication, str)
-            or not adjudication.strip()
-            or len(adjudication) > OPERATOR_ADJUDICATION_REASON_LIMIT
-        ):
-            raise ValueError(
-                "retry-card reason must be a non-empty string within "
-                f"{OPERATOR_ADJUDICATION_REASON_LIMIT} characters"
-            )
-        if state_path is None:
-            raise ValueError("retry-card reason requires a durable state path")
-        adjudication = adjudication.strip()
+    _validate_operator_adjudication_args(args, state_path=state_path, action="retry-card")
     expected_run_id = args.get("expected_run_id")
     if (
         not isinstance(expected_run_id, str)
@@ -2414,36 +2473,16 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         retry_classification=retry_classification.value,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
-    adjudication_evidence = None
-    if adjudication is not None:
-        # #752：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
-        # `manager._operator_adjudications()` 讀回、進 retry_context 的
-        # `operator_adjudications` 鍵。這是 verify 階段唯一可信的人裁通道：
-        # 內容經 bounded CLI、Manager-owned 檔案，不是 builder 可偽造的 candidate 內容。
-        actor_value = args.get("actor")
-        adjudication_evidence = _write_supersede_evidence(
-            {
-                "schema": OPERATOR_ADJUDICATION_SCHEMA,
-                "repo": run.repo,
-                "work_id": run.work_id,
-                "run_id": run.run_id,
-                "card": card,
-                "actor": (
-                    actor_value if isinstance(actor_value, str) and actor_value.strip() else "operator"
-                ),
-                "reason": adjudication,
-                "phase": run.current_phase,
-                "created_at": (
-                    datetime.fromtimestamp(float(now_epoch), tz=timezone.utc).isoformat()
-                    if isinstance(now_epoch, (int, float)) and not isinstance(now_epoch, bool)
-                    else ""
-                ),
-            },
-            state_path=state_path,
-            subdir="operator-adjudication",
-            label="operator-adjudication",
-            max_size=16384,
-        )
+    # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由
+    # `manager._operator_adjudications()` 讀回、進 retry_context 的
+    # `operator_adjudications` 鍵（bounded CLI、Manager-owned，非 candidate 內容）。
+    adjudication_evidence = _record_operator_adjudication(
+        run=run,
+        card=card,
+        args=args,
+        state_path=state_path,
+        now_epoch=now_epoch,
+    )
     return {
         "action": "retry-card",
         "adjudication_evidence": adjudication_evidence,
@@ -5832,6 +5871,8 @@ def execute_work_action(
             args=args,
             authority=authority,
             workflow_registry=workflow_registry,
+            state_path=resolved_state_path,
+            now_epoch=now_epoch,
         )
     elif action == "retry-card":
         result = _retry_card_action(
