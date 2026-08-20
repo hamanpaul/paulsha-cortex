@@ -1518,6 +1518,42 @@ def _workflow_evidence_payload(
     return payload, job
 
 
+def _candidate_skip_tests_request(
+    *, worktree: Path, candidate: str, now
+) -> bool:
+    """#760：candidate 的全套綠已由 gate 環境獨立驗過時，delivery 請求 --skip-tests。
+
+    manager 環境是第三個 env-red 執行面（#723 第五例），在此第三跑全套是把已驗訊號
+    變成結構性 block。這裡只做預判（tree-hash 定址＋age）；最終驗證由
+    `preflight.build_preflight_argv` 的既有 `--skip-tests` 契約把關。任何讀取失敗
+    一律 False——行為退回「老老實實再跑一次」。
+    """
+
+    try:
+        tree = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", f"{candidate}^{{tree}}"],
+            shell=False,
+            capture_output=True,
+            text=True,
+        )
+        tree_hash = tree.stdout.strip().lower()
+        if tree.returncode != 0:
+            return False
+        now_epoch = now()
+        evidence = load_fresh_full_suite_evidence(
+            tree_hash=tree_hash, now_epoch=float(now_epoch)
+        )
+        return evidence is not None
+    except Exception:
+        return False
+
+
+def load_fresh_full_suite_evidence(*, tree_hash: str, now_epoch: float):
+    from .preflight import fresh_full_suite_evidence
+
+    return fresh_full_suite_evidence(tree_hash=tree_hash, now_epoch=now_epoch)
+
+
 def _run_exact_candidate_preflight(
     *,
     worktree: Path,
@@ -1892,7 +1928,13 @@ def build_production_ship_validator(
                 branch=branch,
                 candidate=candidate,
                 command=load_preflight_command(),
-                request=PreflightRequest(metadata_path=str(metadata_path)),
+                request=PreflightRequest(
+                    metadata_path=str(metadata_path),
+                    # #760：gate 已於自己的環境獨立跑過全套且綠時請求 --skip-tests。
+                    skip_tests=_candidate_skip_tests_request(
+                        worktree=worktree, candidate=candidate, now=now
+                    ),
+                ),
                 runner=runner,
                 now=now,
             )
@@ -1975,7 +2017,12 @@ def build_production_ship_validator(
             branch=branch,
             candidate=candidate,
             command=load_preflight_command(),
-            request=PreflightRequest(pr_number=number),
+            request=PreflightRequest(
+                pr_number=number,
+                skip_tests=_candidate_skip_tests_request(
+                    worktree=worktree, candidate=candidate, now=now
+                ),
+            ),
             runner=runner,
             now=now,
         )

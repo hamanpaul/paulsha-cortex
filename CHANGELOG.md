@@ -6,6 +6,9 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#760：`--skip-tests` 的 FullSuiteEvidence 契約接上 production**——gate 綠的
+  build 候選在採信點落 tree-hash 定址 evidence，delivery preflight 消費之；
+  manager 環境不再第三跑全套。tdd-red 的 RED 天然排除、記錄失敗不影響採信。
 - **#757：operator 裁決改為 run 級獨立 prompt 區塊**（verify/review 的 matching 以
   candidate 定錨，掛在 retry_context 下會在 candidate 換新時整組消失）。
 - **#755：`--reason` 擴到 `retry-build`（共用 #752 的 adjudication evidence 落地），

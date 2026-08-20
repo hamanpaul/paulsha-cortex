@@ -149,16 +149,42 @@ def write_full_suite_evidence_after_run(
     if final_head != head or final_tree != tree_hash:
         raise RuntimeError("full-suite tree changed during execution")
     completed = now()
+    return record_external_full_suite_evidence(
+        tree_hash=tree_hash,
+        command=command,
+        completed_at_epoch=completed,
+        state_root=state_root,
+    )
+
+
+def record_external_full_suite_evidence(
+    *,
+    tree_hash: str,
+    command: Sequence[str],
+    completed_at_epoch: float,
+    state_root: str | Path | None = None,
+) -> FullSuiteEvidence:
+    """把一次**已在別處完成**的全套綠落成 canonical FullSuiteEvidence（#760）。
+
+    producer 是 build 候選的採信點：權威 gate ledger 的 pytest 實際 passed（未反轉
+    語意——tdd-red 的 RED 天然排除）時，Manager 以 candidate 的 git tree hash 記錄。
+    檔案格式與 :func:`load_full_suite_evidence` 完全相同；content-addressed、
+    immutable、重複寫入以逐位元組相等視為冪等。
+    """
+
+    _validate_typed_command(command)
+    if not _is_sha(tree_hash):
+        raise ValueError("full-suite evidence tree_hash invalid")
     if (
-        not isinstance(completed, (int, float))
-        or isinstance(completed, bool)
-        or not math.isfinite(float(completed))
+        not isinstance(completed_at_epoch, (int, float))
+        or isinstance(completed_at_epoch, bool)
+        or not math.isfinite(float(completed_at_epoch))
     ):
         raise ValueError("full-suite completion timestamp must be finite")
     body = {
         "schema": FULL_SUITE_EVIDENCE_SCHEMA,
-        "tree_hash": tree_hash,
-        "completed_at_epoch": float(completed),
+        "tree_hash": tree_hash.lower(),
+        "completed_at_epoch": float(completed_at_epoch),
         "command": list(command),
     }
     envelope = {"payload": body, "payload_hash": verification.canonical_json_hash(body)}
@@ -177,6 +203,28 @@ def write_full_suite_evidence_after_run(
             raise RuntimeError("conflicting immutable full-suite evidence")
         return existing
     return load_full_suite_evidence(tree_hash=tree_hash, state_root=state_root)
+
+
+def fresh_full_suite_evidence(
+    *,
+    tree_hash: str,
+    now_epoch: float,
+    state_root: str | Path | None = None,
+) -> FullSuiteEvidence | None:
+    """有效（存在＋未過期）的 full-suite evidence，否則 None（#760 consumer 端）。
+
+    只做「要不要請求 --skip-tests」的預判；最終驗證仍由
+    :func:`build_preflight_argv`／:func:`_validate_skip_tests` 的既有契約把關。
+    """
+
+    try:
+        evidence = load_full_suite_evidence(tree_hash=tree_hash, state_root=state_root)
+    except ValueError:
+        return None
+    age = float(now_epoch) - float(evidence.completed_at_epoch)
+    if age < 0 or age > DEFAULT_FULL_SUITE_MAX_AGE_SECONDS:
+        return None
+    return evidence
 
 
 def load_preflight_command(
