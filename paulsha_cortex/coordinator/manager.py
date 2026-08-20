@@ -10313,7 +10313,8 @@ def resume_workflow_run(
         # 而且每 tick 重炸（#373 docstring 記載的那個永動迴圈的另一半）。era 不符
         # 的 job 是前代稽核列，不是本 era 的候選——跳過之後 `dispatch_or_stop`
         # 會為新 era 重新派工。
-        and job.get("workflow_claim_key") == run.claim_key
+        # 缺欄位視為未 pin（legacy／測試 fixture，#379 同型容忍）；帶欄位者必須同 era。
+        and job.get("workflow_claim_key") in (None, run.claim_key)
         and (
             step.phase not in {"verify", "review"}
             or job.get("subject_head") == run.candidate_head

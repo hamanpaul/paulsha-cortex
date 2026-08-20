@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#765 補遺：retry-card 的 target-jobs 亦以 claim era 過濾**（舊 era evidence
+  不再擋死新 era 重派）。
 - **#765 補遺：daemon `_log_error` 首次出現附完整 traceback**（重複維持抑制）。
 - **#765（部分）：advance 的 terminal-job 選擇以 claim era 過濾**——authority
   restart 後前代 job 不再造成每 tick 綁定炸裂，新 era 正常重新派工。
