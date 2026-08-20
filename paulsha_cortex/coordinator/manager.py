@@ -8753,6 +8753,7 @@ def _workflow_job_prompt(
     candidate_checkout: str | None = None,
     env: Mapping[str, str] | None = None,
     retry_context: Mapping[str, object] | None = None,
+    operator_adjudications: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     """組出單張 workflow card 的派工 prompt。
 
@@ -8998,6 +8999,13 @@ def _workflow_job_prompt(
     if retry_context is not None:
         # #606：首派沒有這個鍵，prompt 因此逐字不變（見 `_workflow_retry_context`）。
         contract["retry_context"] = dict(retry_context)
+    if operator_adjudications:
+        # #757：operator 裁決是 **run 級**的權威答覆，不是某卡的重試歷史——一旦
+        # 存在就隨每一次派工出現（builder／reviewer 皆然），不因 candidate 換新、
+        # 卡片首派而消失。無裁決時本鍵缺席，prompt 逐字不變。
+        contract["operator_adjudications"] = [
+            dict(row) for row in operator_adjudications
+        ]
     effective_commit_policy = step.commit_policy or fallback[2]
     tasks_path = (
         f"openspec/changes/{contract['openspec_ref']}/tasks.md"
@@ -9796,12 +9804,10 @@ def _dispatch_workflow_card(
                         if step.phase == "build" and step.persona == "builder"
                         else None
                     ),
-                    # #752：operator 裁決對修復與複驗同樣有效——builder 與
-                    # reviewer 卡都帶。
-                    operator_adjudications=_operator_adjudications(
-                        run, coordinator_root
-                    ),
                 ),
+                # #757：run 級裁決獨立於 retry_context——verify/review 的 matching
+                # 以 candidate 定錨，candidate 換新即空，掛在底下會讓裁決消失。
+                operator_adjudications=_operator_adjudications(run, coordinator_root),
             ),
             worktree=worktree,
             log_dir=str(Path(coordinator_root).resolve() / "logs" / "workflow"),

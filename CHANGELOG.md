@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#757：operator 裁決改為 run 級獨立 prompt 區塊**（verify/review 的 matching 以
+  candidate 定錨，掛在 retry_context 下會在 candidate 換新時整組消失）。
 - **#755：`--reason` 擴到 `retry-build`（共用 #752 的 adjudication evidence 落地），
   operator 對 repair 回合的指示有通道；retry-card 收斂到同一支 helper。**
 - **#752 補遺：retry-card 的 adjudication evidence 改接 `resolved_state_path`**
