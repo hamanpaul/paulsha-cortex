@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,7 @@ from paulsha_cortex.project_policy import (
     ProjectPolicyError,
     resolve_project_policy,
 )
+from paulsha_cortex.coordinator import manager
 
 
 def _write(path: Path, *, tier: str = "shareable") -> None:
@@ -134,6 +136,38 @@ def test_missing_manifest_keeps_shareable_default(tmp_path: Path) -> None:
 def test_explicit_shareable_tier_is_accepted(tmp_path: Path) -> None:
     _write(tmp_path / ".project-policy.yml", tier="shareable")
     assert read_repo_tier(tmp_path) == "shareable"
+
+
+def test_valid_tier_preflight_does_not_create_needs_human_candidate_state(
+    tmp_path: Path,
+) -> None:
+    """A passing pre-build check must leave candidate dispatch untouched."""
+    _write(tmp_path / ".project-policy.yml", tier="shareable")
+    updates: list[dict[str, object]] = []
+
+    class Registry:
+        def _manager_update_workflow_run(self, run_id: str, **kwargs: object) -> object:
+            updates.append({"run_id": run_id, **kwargs})
+            return SimpleNamespace(
+                run_id=run_id,
+                current_phase="build",
+            )
+
+    dispatcher = SimpleNamespace(_registry=Registry())
+    run = SimpleNamespace(
+        run_id="run-492",
+        work_id="work-492",
+        workspace_root=str(tmp_path),
+        facets=(),
+    )
+    step = SimpleNamespace(phase="build")
+
+    assert manager._validate_foreign_review_policy_before_build(
+        dispatcher,
+        run=run,
+        step=step,
+    ) is None
+    assert updates == []
 
 
 @pytest.mark.parametrize("manifest_name", [CANONICAL_NAME, LEGACY_NAME])
