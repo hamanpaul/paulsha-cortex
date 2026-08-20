@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#765 補遺：review 對 builder job 的綁定改跨 era（#216 AC5 落實）**——build 產物不再因 authority 前進成孤兒。
 - **#765 補遺：registry reset evidence 守衛以 claim era 定錨。**
 - **#765 補遺：dispatch reuse／retry 判定走同 era `reusable` 子集**（第五個出口，binding 必炸的真正回傳點）。
 - **#765 補遺：recovery 選擇器（最後一個 era-blind）以 claim era 過濾。**

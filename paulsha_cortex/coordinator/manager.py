@@ -3793,9 +3793,7 @@ def _review_builder_job_binding(
     )
     expected = {
         "workflow_run_id": run.run_id,
-        "workflow_claim_key": run.claim_key,
         "workflow_repo": run.repo,
-        "source_revision": run.source_revision,
         "subject_head": candidate,
         "status": "exited",
         "exit_code": 0,
@@ -3808,7 +3806,17 @@ def _review_builder_job_binding(
     )
     for field, value in expected.items():
         if builder.get(field) != value:
-            raise ValueError(f"review evaluation builder binding mismatch: {field}")
+            raise ValueError(
+                f"review evaluation builder binding mismatch: {field} "
+                f"(job={builder.get('job_id')!r} expected={value!r} actual={builder.get(field)!r})"
+            )
+    # #765：builder 引用**刻意不驗 claim era／source_revision 等值**——#216 AC5
+    # 明言 authority restart 只 invalidate verify/review、build 產物的 Candidate
+    # 跨 era 保留；builder job 因此**合法地**屬於較早的 era。真正把 builder 綁進
+    # 本 run 的是 run_id＋repo＋`subject_head == candidate`（candidate 本身由
+    # harvest 的 fast-forward 與 gate ledger 錨定）。era 等值檢查在此只會讓每一次
+    # authority 前進（PR 建立、openspec link）把已採信的 build 產物變成孤兒。
+
     card = builder.get("workflow_card")
     if not isinstance(card, str) or not any(
         step.card == card
