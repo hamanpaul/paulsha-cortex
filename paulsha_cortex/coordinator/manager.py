@@ -29,6 +29,7 @@ from . import candidate_base
 from . import completion
 from . import coverage
 from . import gate_ledger
+from . import preflight
 from . import job_runner
 from . import job_workspace
 from . import planning_runtime
@@ -3263,6 +3264,62 @@ def _raise_if_worktree_read_blocked(result: object, *, what: str) -> None:
         f"blocked on {verification.WORKTREE_READ_BLOCKED_ISSUE}: "
         f"{verification.WORKTREE_READ_BLOCKED_DETAIL}"
     )
+
+
+def _record_candidate_full_suite_evidence(
+    job: Mapping[str, object], *, run, candidate: str
+) -> None:
+    """#760：權威 gate 的全套綠 → tree-hash 定址的 FullSuiteEvidence。
+
+    delivery 的 pr-preflight 用它請求 `--skip-tests`：manager 環境是第三個
+    env-red 執行面（#723 第五例），在那裡第三跑全套只會把已由 gate 環境獨立驗過、
+    CI 又會在 PR 上重驗的訊號變成結構性 block。判準取**未反轉**的 ledger outcome
+    （`_ledger_outcomes`）——tdd-red 的 RED（pytest failed＝達成）因此天然排除，
+    只有真正全綠的候選會留下 evidence。best-effort：記不下來不影響採信（fail-open
+    僅及於「delivery 屆時老老實實再跑一次」）。
+    """
+
+    try:
+        log_path = job.get("log_path")
+        if not isinstance(log_path, str) or not log_path:
+            return
+        found = terminal_contract.read_gate_ledger(
+            terminal_contract.gate_ledger_path(log_path)
+        )
+        if found is None:
+            return
+        outcomes = terminal_contract._ledger_outcomes(found[0])
+        pytest_outcome = outcomes.get(terminal_contract.RED_REQUIRED_TEST_GATE_NAME)
+        if not isinstance(pytest_outcome, Mapping) or pytest_outcome.get("status") != "passed":
+            return
+        workspace_root = getattr(run, "workspace_root", None)
+        if not isinstance(workspace_root, str) or not workspace_root:
+            return
+        tree = subprocess.run(
+            ["git", "-C", workspace_root, "rev-parse", f"{candidate}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        tree_hash = tree.stdout.strip().lower()
+        if tree.returncode != 0 or verification.SAFE_SHA_RE.fullmatch(tree_hash) is None:
+            return
+        specs = gate_ledger.load_gate_specs(os.environ)
+        command: tuple[str, ...] = ()
+        for spec in specs:
+            if spec.name == terminal_contract.RED_REQUIRED_TEST_GATE_NAME:
+                command = spec.argv
+                break
+        if not command:
+            return
+        preflight.record_external_full_suite_evidence(
+            tree_hash=tree_hash,
+            command=command,
+            completed_at_epoch=time.time(),
+        )
+    except Exception:
+        # 證據是加值：記錄失敗不得影響採信本身。
+        return
 
 
 def _job_gate_worktree_state(job: Mapping[str, object]) -> Mapping[str, object] | None:
@@ -10966,6 +11023,9 @@ def apply_workflow_action(
             )
             _harvest_build_candidate(
                 job, run=current, candidate=candidate, coordinator_root=coordinator_root
+            )
+            _record_candidate_full_suite_evidence(
+                job, run=current, candidate=candidate
             )
         elif current.current_phase in {"verify", "review"}:
             job_candidate = _verify_exact_candidate(job, git_runner=git_runner)
