@@ -3856,7 +3856,7 @@ def _refreeze_base_action(
         verification.SAFE_SHA_RE.fullmatch(previous_base_sha) is None
     ):
         previous_base_sha = None
-    previous_base_source = "frozen-readiness" if previous_base_sha else "local-main"
+    previous_base_source = "frozen-readiness" if previous_base_sha else "unresolved"
 
     # 已記錄基準：新基底必須是它們全部的後代。順序是稽核順序，不是判定順序
     # （全部都要成立）。
@@ -3866,11 +3866,13 @@ def _refreeze_base_action(
     else:
         # 沒有凍結值時，實際生效的基底是 `ScriptWorktreeCreator(base="main")` 解析
         # 到的來源樹本地 `main`。解析不出來（例如 detached / 無 main）就沒有這條
-        # 基準可比——不編造，也不因此放行其他基準。
+        # 基準可比——**不編造**（`previous_base_source` 誠實留在 `unresolved`），
+        # 也不因此放行其他基準。
         local_main = _refreeze_rev(workspace_root, "main")
         if local_main is not None:
             baselines.append({"source": "local-main", "sha": local_main})
             previous_base_sha = local_main
+            previous_base_source = "local-main"
     for job in jobs:
         head = job.get("dispatch_head")
         if isinstance(head, str) and verification.SAFE_SHA_RE.fullmatch(head) is not None:

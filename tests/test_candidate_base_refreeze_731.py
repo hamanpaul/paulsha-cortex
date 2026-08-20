@@ -422,6 +422,9 @@ def test_refreeze_writes_immutable_evidence_carrying_both_bases_and_operator_inp
     assert body["run_id"] == run.run_id
     assert body["actor"] == _ACTOR and body["reason"] == _REASON
     assert body["previous_base_sha"] == stale_base
+    # 未凍結的 run，實際生效的基底是來源樹的本地 `main`——evidence 必須誠實記下
+    # 舊基底**是從哪裡讀來的**，而不是含糊帶過。
+    assert body["previous_base_source"] == "local-main"
     assert body["base_sha"] == advanced
     assert body["remote_fetch"] == {
         "probe": "claim_readiness.base_sha_probe",
