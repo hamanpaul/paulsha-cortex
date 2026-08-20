@@ -345,7 +345,18 @@ def _srt_runtime_root() -> Path | None:
 
 
 def _claude_review_settings(worktree: str) -> str:
-    """Build a CLI-only sandbox policy for a headless Claude reviewer."""
+    """Build a CLI-only sandbox policy for a headless Claude reviewer.
+
+    #746（#714 的 reviewer lane 版）：claude 的 Bash 工具內層 sandbox 是
+    **bubblewrap**，與模板 unit 的加固剖面（`ProcSubset=pid` 等）硬性互斥——
+    permgen 已量過保留 bwrap 要付四條放寬，其中兩條正是外層加固面存在的理由，
+    0819 對 codex 的裁決因此是「換一個不需要 bwrap 的執行形態」（#716 B）。這裡
+    依 runner mode 分岔：**direct（單 UID）逐字維持現行內層 sandbox**（它是唯一
+    邊界）；**systemd 模板（三分）關內層**，邊界由既有機制承擔——外層 unit 剖面
+    ＋ egress 白名單（#725）、candidate 竄改於採信端 fail-closed（#650 的
+    `require_candidate_unchanged`）、reviewer 對來源樹零可達（#641）。
+    `permissions.deny` 的憑證／HOME 讀取拒絕兩個模式**逐字相同**。
+    """
 
     candidate = (Path(worktree).resolve() / "candidate").resolve()
     home = Path.home().resolve()
@@ -385,6 +396,19 @@ def _claude_review_settings(worktree: str) -> str:
         f"Read(/{path.as_posix()}{'/**' if path.suffix == '' else ''})"
         for path in credential_paths
     ]
+    if job_runner.resolve_runner_mode(os.environ) != job_runner.RUNNER_DIRECT:
+        return json.dumps(
+            {
+                "permissions": {"deny": read_denials},
+                # 內層 bwrap 在加固 unit 下起不來（bwrap: Can't read
+                # /proc/sys/kernel/overflowuid），且 `failIfUnavailable` 讓 8/8 命令
+                # 全滅——刻意關閉，不是放寬外層（#746）。
+                "sandbox": {"enabled": False},
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     settings = {
         "permissions": {"deny": read_denials},
         "sandbox": {

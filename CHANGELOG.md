@@ -6,6 +6,9 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#746：claude reviewer 內層 sandbox 依 runner mode 分岔（#714 的 reviewer lane
+  版）。** bubblewrap 與加固剖面硬性互斥；三分模式關內層、外層＋採信端完整性
+  檢查為邊界，direct 模式逐字不變；`permissions.deny` 兩模式相同。
 - **#743：auto 路徑的 ancestry baseline 與採信端同一條導出（`run.candidate_head or
   dispatch_head`），中段 build 卡不再每張都要人工 `regenerate-gates`。**
   `dispatch_head` 是 run 層級凍結值、後續卡逐字繼承首張卡的，#738 首版拿它當
