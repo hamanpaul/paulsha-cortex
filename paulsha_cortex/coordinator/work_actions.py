@@ -77,7 +77,9 @@ _RETIREMENT_ACTIONS = frozenset({"abandon", "retire-delivered"})
 # #519：`reset-reclaim-budget` 與 retirement family 同屬「只動本機 coordinator
 # 狀態、不依賴 issue 當下 open/closed 的解卡動作」，適用同一條 rate-limit 容忍
 # 理由——系統被限流的當下，正是卡死的 work item 最需要被解開的時候。
-_LOCAL_UNBLOCK_ACTIONS = _RETIREMENT_ACTIONS | {"reset-reclaim-budget"}
+# #731：`refreeze-base` 同理——它只讀 run 自身狀態與來源樹的 git ref，一個位元組
+# 都不取自 issue 的當下 open/closed。
+_LOCAL_UNBLOCK_ACTIONS = _RETIREMENT_ACTIONS | {"reset-reclaim-budget", "refreeze-base"}
 
 
 def _positive_int(value: object, *, field: str) -> int:
@@ -3569,6 +3571,442 @@ def _reset_reclaim_budget_action(
     }
 
 
+# --------------------------------------------------------------------------
+# #731 (A)：候選 git base 的**重新凍結**入口（`work refreeze-base`）
+# --------------------------------------------------------------------------
+#
+# 凍結本身是對的（hermetic pinning，#211／#208 A.2）：`claim_readiness.
+# base_sha_probe` 逐字「Fetch remote main once and freeze it as base_sha」，且對
+# 不一致的 `local_known_base_sha` 給 `stale-base`。缺的是**重新凍結**——`work
+# start` 對還有 active workflow 的 work item 回 `action=resume /
+# reason=active-workflow`，不走新 claim，因此基底原封不動；連續三次「換代」
+# （abandon → reset-reclaim-budget → start）一次都沒換掉候選樹的 HEAD。
+#
+# 候選基底的**權威來源**（查證結果，非推測）：
+#
+#   1. `WorkflowRun.frozen_readiness["base_sha"]` —— `manager._dispatch_workflow_card`
+#      的**首張 build 卡**分支唯一讀的欄位（該檔 `build_base_sha = ...
+#      run.frozen_readiness.get("base_sha")`），一路傳進
+#      `seams.ScriptWorktreeCreator.create(..., base_sha=...)`。
+#   2. 該欄位為 `None` 時，`create()` 退回 `self._base`，而 dispatch 建 creator 時
+#      傳的是字面 `base="main"` ⇒ 實際基底是**來源樹的 `refs/heads/main`**。
+#      `readiness_checker` 在 production 從未被接線（`execute_work_action` 的預設
+#      值是 `None`，manager daemon 也沒有傳），所以實機 run 的 `frozen_readiness`
+#      恆為 `None`，基底就是那條**沒有人推進過**的本地 `main`——這正是「mirror
+#      已經是 7eb707b、候選樹仍是 59a7a9b」的機制。
+#
+# 因此本動作把新基底寫進 (1)：那是 dispatch 真的會讀的那一格，不是新造的第二份
+# 真實來源；而且順帶把 run 從「隱式跟著本地 main 漂」升級成「明示 pin 在一個
+# SHA」，hermetic pinning 只有更強、沒有放寬。
+CANDIDATE_BASE_REFREEZE_SCHEMA = "cortex-work-candidate-base-refreeze/v1"
+
+#: 沒有前次凍結集（production 的常態）時寫進 `frozen_readiness` 的形狀。**刻意
+#: 不用** `pre-claim-readiness-frozen-set/v1`：那個 schema 的語意是「六道
+#: readiness 關卡都通過了」，而本動作只重新凍結 base 一格，寫成前者等於謊稱做過
+#: 六道檢查。消費端（`_dispatch_workflow_card`）只讀 `base_sha`，兩種 schema 都
+#: 讀得到；有前次凍結集時則**逐欄保留**、只換 `base_sha`（其餘凍結事實不是這次
+#: 重新驗證出來的，不得順手覆寫）。
+CANDIDATE_BASE_FREEZE_SCHEMA = "cortex-candidate-base-freeze/v1"
+
+#: 允許重新凍結的 phase。基底只在 build 卡 provisioning 時被消費，而 `verify`
+#: 之後必然已有被採信的 candidate（那時基底已經改由 `_workflow_build_handoff_base`
+#: 決定，重新凍結會是靜默 no-op），因此上界收在 `build`。
+REFREEZE_ALLOWED_PHASES = ("claim", "define", "plan", "build")
+
+
+def _validate_refreeze_operator_inputs(args: dict[str, Any]) -> tuple[str, str, str]:
+    """#731：`refreeze-base` 的 expected_run_id／actor／reason 入場驗證。
+
+    界限與 `_validate_retirement_operator_inputs`／
+    `_validate_reclaim_reset_operator_inputs` 逐字相同——同一族「一個人明示解除
+    ／推動一道凍結」的稽核欄位規格沒有理由分歧。`control/contract.py` 已對這族
+    action 強制同一組界限；這裡是縱深防禦（work action 也可能被直接呼叫）。
+    """
+
+    expected_run_id = args.get("expected_run_id")
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("refreeze-base requires exact expected_run_id")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("refreeze-base requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("refreeze-base requires bounded reason")
+    return expected_run_id, actor, reason
+
+
+def _refreeze_rev(repo_root: Path, revision: str) -> str | None:
+    """解析 `revision` 為 exact commit SHA；不存在／不可讀一律回 `None`。"""
+
+    result = verification._run_git(
+        ["-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
+        None,
+    )
+    value = str(result.get("stdout", "")).strip().lower()
+    if result.get("status") != "ok" or verification.SAFE_SHA_RE.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _refreeze_is_ancestor(repo_root: Path, *, ancestor: str, descendant: str) -> bool:
+    """`merge-base --is-ancestor` 的三值收斂：0＝是、1＝否、其餘＝拒絕作答。
+
+    判準刻意與 `seams.ScriptWorktreeCreator.create()` 的既有守衛同一個
+    git 述詞——重新凍結的入場檢查若用另一套判準，就會出現「refreeze 說可以、
+    下一拍 provision 說不行」的兩份真話。
+    """
+
+    result = verification._run_git(
+        ["-C", str(repo_root), "merge-base", "--is-ancestor", ancestor, descendant],
+        None,
+    )
+    returncode = result.get("returncode")
+    if returncode == 0:
+        return True
+    if returncode == 1:
+        return False
+    raise RuntimeError(
+        "refreeze-base ancestry check failed: "
+        f"{str(result.get('stderr', '')).strip()[:200] or result.get('status')}"
+    )
+
+
+def _refreeze_base_body(
+    *,
+    run,
+    actor: str,
+    reason: str,
+    previous_base_sha: str | None,
+    previous_base_source: str,
+    base_sha: str,
+    baselines: list[dict[str, str]],
+    build_branch: str,
+    build_branch_sha: str | None,
+    created_at: str,
+) -> dict[str, Any]:
+    """#731：`cortex-work-candidate-base-refreeze/v1` 的 canonical evidence body。
+
+    形狀比照 `cortex-work-reclaim-reset/v1`／`cortex-work-planning-recovery/v1`：
+    內容即稽核事實——誰、為什麼、在哪個 run 上、把候選基底從哪裡推到哪裡、
+    mirror 的 fetch 結果是什麼、以及當下每一條「已記錄基準」的位置。
+    """
+
+    return {
+        "schema": CANDIDATE_BASE_REFREEZE_SCHEMA,
+        "repo": run.repo,
+        "work_id": run.work_id,
+        "run_id": run.run_id,
+        "actor": actor,
+        "reason": reason,
+        "previous_base_sha": previous_base_sha,
+        "previous_base_source": previous_base_source,
+        "base_sha": base_sha,
+        # mirror 的 fetch 結果——走的是 claim 用的**同一支** probe，
+        # 不是另外寫一次 fetch。
+        "remote_fetch": {
+            "probe": "claim_readiness.base_sha_probe",
+            "remote": "origin",
+            "branch": "main",
+            "ref": "refs/remotes/origin/main",
+            "status": "ok",
+            "sha": base_sha,
+        },
+        "fast_forward_baselines": baselines,
+        "build_branch": build_branch,
+        "build_branch_sha": build_branch_sha,
+        "previous_phase": run.current_phase,
+        "previous_facets": sorted(run.facets),
+        "workspace_root": str(run.workspace_root),
+        "created_at": created_at,
+    }
+
+
+def _refreeze_base_record(body: dict[str, Any], *, state_path: Path) -> dict[str, str]:
+    return _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-candidate-base-refreeze",
+        label="candidate-base-refreeze",
+        # body 欄位固定，但含 ≤500 字 reason、≤128 字 actor 與兩條絕對路徑／branch
+        # 名，4096 對長路徑部署偏緊；放寬到 16KiB 仍是「小文件」的防禦性上界，
+        # 真正的正確性判準是 `st_size != len(content)` 與逐位元組比對。
+        max_size=16384,
+    )
+
+
+def _refreeze_base_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    now_epoch: float,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """#731 (A)：把還活著的 run 的候選 git base 重新凍結到目前的 `origin/main`。
+
+    **入場條件全部 fail-closed，寧可拒絕也不做半套**（逐條理由）：
+
+    1. exact `expected_run_id` CAS ＋ 單一 `ongoing` canonical run——重新凍結的
+       對象是一個具體的 run，不是「這個 work item 最近那個」。
+    2. `current_phase ∈ REFREEZE_ALLOWED_PHASES`——基底只在 build 卡 provisioning
+       時被消費。
+    3. `candidate_head`／`verified_head` 皆為 `None`——一旦有被採信的 build 成果，
+       下一張卡的 base 改由 `_workflow_build_handoff_base()`（＝`candidate_head`）
+       決定，寫進 `frozen_readiness` 的新基底**根本不會被讀**。那會是「回報成功
+       但什麼都沒發生」的靜默半套，因此拒絕。
+    4. 沒有 in-flight job（`dispatched`／`running`）——在跑著的 job 腳下抽換基底
+       等於製造 split-brain。
+    5. 沒有已發佈的交付物（`pr_refs`／`pr_candidate`／`merge_revision`）——那代表
+       run 已經走出管線，重新凍結沒有語意。
+    6. **fast-forward only**：新基底必須是**每一條已記錄基準**的後代（或相等）。
+       基準集合＝目前的凍結值（沒有凍結值時取來源樹的 `refs/heads/main`，那正是
+       `ScriptWorktreeCreator(base="main")` 實際會解析到的東西）∪ 本 run 每個 job
+       的 `dispatch_head` ∪ build branch 現在的位置。任何一條不是祖先就拒絕——
+       那不是「重新凍結」而是把 run 的既有基準往回倒。
+    7. **#613**：build branch 若存在且**不是**新基底的祖先，下一拍 provision 必定
+       撞 `existing worktree branch has commits outside requested base`。判準與
+       `create()` 的守衛是同一個 git 述詞（見 `_refreeze_is_ancestor`），在**改
+       任何狀態之前**就先問，因此不會出現「refreeze 成功、下一拍才炸」。
+
+    **出口狀態 == 入口狀態（#728 紀律）**：本動作不動 `current_phase`、不動
+    `facets`、不動 `candidate_head`、不動任何 step 的 `gate_result`。唯一的狀態
+    變更是 `frozen_readiness["base_sha"]` 與 append 一筆 evidence ref。因此
+    「重新凍結後的 run 狀態是不是後續每一拍的合法入口狀態」在結構上不可能為否
+    ——它就是重新凍結**之前**那個狀態。後續怎麼推進（`retry-card`／`resume`／
+    `regenerate-gates`）完全沿用既有出口，本動作不代勞、也不製造新狀態。
+    """
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "issue", "actor", "reason", "expected_run_id",
+    }
+    if extras:
+        raise ValueError(
+            f"refreeze-base rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    expected_run_id, actor, reason = _validate_refreeze_operator_inputs(args)
+    issue = args.get("issue")
+    if issue is not None and issue not in authority.mapped_issues:
+        raise RuntimeError("refreeze-base issue is not authorized by WorkAuthority")
+
+    from . import claim_readiness
+    from .manager import workflow_build_branch
+    from .registry import ACTIVE_JOB_STATUSES
+
+    expected_issues = tuple(
+        f"{authority.repo}#{number}" for number in authority.mapped_issues
+    )
+    active = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo
+        and run.work_id == authority.work_id
+        and run.status == "ongoing"
+        and run.issue_refs == expected_issues
+        and run.openspec_refs == authority.mapped_openspec
+    ]
+    if len(active) != 1:
+        raise RuntimeError("refreeze-base requires one active canonical WorkflowRun")
+    run = active[0]
+    if run.run_id != expected_run_id:
+        raise RuntimeError("refreeze-base expected WorkflowRun CAS mismatch")
+    if run.current_phase not in REFREEZE_ALLOWED_PHASES:
+        raise RuntimeError(
+            "refreeze-base requires a pre-verify workflow phase "
+            f"(allowed: {'/'.join(REFREEZE_ALLOWED_PHASES)}; got: {run.current_phase})"
+        )
+    if run.candidate_head is not None or run.verified_head is not None:
+        raise RuntimeError(
+            "refreeze-base requires a run with no accepted build candidate"
+        )
+    if run.pr_refs or run.pr_candidate is not None or run.merge_revision is not None:
+        raise RuntimeError(
+            "refreeze-base requires a run with no published delivery artifact"
+        )
+    jobs = [
+        job
+        for job in workflow_registry.list_jobs()
+        if job.get("workflow_run_id") == run.run_id
+    ]
+    if any(job.get("status") in ACTIVE_JOB_STATUSES for job in jobs):
+        raise RuntimeError("refreeze-base requires no in-flight job for the run")
+
+    workspace_root = Path(run.workspace_root)
+    if not workspace_root.is_absolute() or not workspace_root.is_dir():
+        raise RuntimeError("refreeze-base requires the run workspace root to exist")
+
+    previous_base_sha = (
+        run.frozen_readiness.get("base_sha")
+        if isinstance(run.frozen_readiness, dict)
+        else None
+    )
+    if not isinstance(previous_base_sha, str) or (
+        verification.SAFE_SHA_RE.fullmatch(previous_base_sha) is None
+    ):
+        previous_base_sha = None
+    previous_base_source = "frozen-readiness" if previous_base_sha else "local-main"
+
+    # 已記錄基準：新基底必須是它們全部的後代。順序是稽核順序，不是判定順序
+    # （全部都要成立）。
+    baselines: list[dict[str, str]] = []
+    if previous_base_sha is not None:
+        baselines.append({"source": "frozen-readiness", "sha": previous_base_sha})
+    else:
+        # 沒有凍結值時，實際生效的基底是 `ScriptWorktreeCreator(base="main")` 解析
+        # 到的來源樹本地 `main`。解析不出來（例如 detached / 無 main）就沒有這條
+        # 基準可比——不編造，也不因此放行其他基準。
+        local_main = _refreeze_rev(workspace_root, "main")
+        if local_main is not None:
+            baselines.append({"source": "local-main", "sha": local_main})
+            previous_base_sha = local_main
+    for job in jobs:
+        head = job.get("dispatch_head")
+        if isinstance(head, str) and verification.SAFE_SHA_RE.fullmatch(head) is not None:
+            baselines.append(
+                {"source": f"dispatch-head:{job.get('job_id')}", "sha": head.lower()}
+            )
+    build_branch = workflow_build_branch(run)
+    build_branch_sha = _refreeze_rev(workspace_root, f"refs/heads/{build_branch}")
+    if build_branch_sha is not None:
+        baselines.append({"source": "build-branch", "sha": build_branch_sha})
+
+    # mirror fetch：走 claim 用的**同一支** probe（`local_known_base_sha=None`，
+    # 因此它只 fetch 一次並回報 `origin/main` 現值，不做 stale-base 判定——
+    # stale 正是我們要修的那件事）。
+    probe = claim_readiness.base_sha_probe(repo_root=workspace_root)
+    probe_result = probe(
+        claim_readiness.ReadinessContext(
+            authority=authority,
+            executor_identity="cortex-manager",
+            issue_ref=(
+                f"{authority.repo}#{authority.mapped_issues[0]}"
+                if authority.mapped_issues
+                else None
+            ),
+        )
+    )
+    if not probe_result.passed:
+        raise RuntimeError(f"refreeze-base remote base probe failed: {probe_result.reason}")
+    base_sha = str(probe_result.observation["base_sha"]).lower()
+
+    if isinstance(run.frozen_readiness, dict) and previous_base_sha == base_sha:
+        # 已經凍結在同一個值：重送同一請求（含 crash window 重試）不寫第二筆
+        # evidence，也不動 registry——真正冪等。刻意要求「已有凍結集」才短路：
+        # 未凍結的 run 即使本地 `main` 恰好等於 `origin/main`，把隱式基底轉成
+        # 明示 pin 仍是一次真實的狀態變更。
+        return {
+            "action": "refreeze-base",
+            "reason": "candidate-base-already-current",
+            "already_current": True,
+            "actor": actor,
+            "operator_reason": reason,
+            "expected_run_id": expected_run_id,
+            "previous_base_sha": previous_base_sha,
+            "base_sha": base_sha,
+            "build_branch": build_branch,
+            "build_branch_sha": build_branch_sha,
+            "run": run.to_dict(),
+        }
+
+    for baseline in baselines:
+        if baseline["sha"] == base_sha:
+            continue
+        if _refreeze_is_ancestor(
+            workspace_root, ancestor=baseline["sha"], descendant=base_sha
+        ):
+            continue
+        if baseline["source"] == "build-branch":
+            # #613 的形狀：前一世代 abandon 沒有回收 build branch，branch 上還有
+            # base 以外的 commit。下一拍 provision 必定撞
+            # `existing worktree branch has commits outside requested base`，
+            # 因此在這裡就拒絕——refreeze 成功但 run 依然 provision 不了，是最糟
+            # 的半套。
+            raise RuntimeError(
+                "refreeze-base rejects a build branch carrying commits outside the new base "
+                f"(branch={build_branch} sha={baseline['sha']}; 見 #613：abandon 不回收 "
+                "build branch。請先回收該 branch 再重新凍結)"
+            )
+        raise RuntimeError(
+            "refreeze-base rejects a non-fast-forward base "
+            f"(baseline={baseline['source']} sha={baseline['sha']} → {base_sha})"
+        )
+
+    if isinstance(run.frozen_readiness, dict):
+        # 有前次凍結集：**逐欄保留**，只換 base_sha。其餘欄位（planning authority
+        # digest、monitor snapshot revision、live probe 快取旗標…）是當初那次
+        # readiness transaction 的產物，這次沒有重跑，不得順手覆寫成現值。
+        frozen = dict(run.frozen_readiness)
+        frozen["base_sha"] = base_sha
+    else:
+        frozen = {
+            "schema": CANDIDATE_BASE_FREEZE_SCHEMA,
+            "repo": run.repo,
+            "work_id": run.work_id,
+            "base_sha": base_sha,
+            "frozen_at_epoch": float(now_epoch),
+            "frozen_by": "work-refreeze-base",
+        }
+
+    body = _refreeze_base_body(
+        run=run,
+        actor=actor,
+        reason=reason,
+        previous_base_sha=previous_base_sha,
+        previous_base_source=previous_base_source,
+        base_sha=base_sha,
+        baselines=baselines,
+        build_branch=build_branch,
+        build_branch_sha=build_branch_sha,
+        created_at=datetime.fromtimestamp(now_epoch, tz=timezone.utc).isoformat(),
+    )
+    # #275 的順序慣例：先把稽核事實寫成 durable evidence，再改狀態。兩步之間
+    # crash 時最壞只留下一份未被引用的 evidence 檔，不會出現「基底已經換掉但查
+    # 無授權依據」。
+    record = _refreeze_base_record(body, state_path=state_path)
+    evidence_refs = run.evidence_refs
+    if record["ref"] not in evidence_refs:
+        evidence_refs = (*evidence_refs, record["ref"])
+    updated = workflow_registry._manager_update_workflow_run(
+        run.run_id,
+        frozen_readiness=frozen,
+        evidence_refs=evidence_refs,
+    )
+    payload: dict[str, Any] = {
+        "action": "refreeze-base",
+        "reason": "candidate-base-refrozen",
+        "already_current": False,
+        "actor": actor,
+        # `reason` 這個 key 在本檔的回傳慣例裡是**機器可讀的結果理由**，operator
+        # 打的那句話另掛 `operator_reason`，不互相覆蓋。
+        "operator_reason": reason,
+        "expected_run_id": expected_run_id,
+        "previous_base_sha": previous_base_sha,
+        "previous_base_source": previous_base_source,
+        "base_sha": base_sha,
+        "build_branch": build_branch,
+        "build_branch_sha": build_branch_sha,
+        "fast_forward_baselines": baselines,
+        "evidence": record,
+        "run": updated.to_dict(),
+    }
+    next_actions = _phase_recovery_actions(updated, workflow_registry)
+    if next_actions:
+        payload["next_actions"] = list(next_actions)
+    return payload
+
+
 def _regenerate_gates_action(
     *,
     args: dict[str, Any],
@@ -5265,7 +5703,8 @@ def execute_work_action(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
-        "reset-reclaim-budget", "auto", "ship", "review-attest", "intake",
+        "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
+        "intake",
     }:
         raise ValueError("unsupported work action")
     repo = _repo_identity(repo)
@@ -5394,6 +5833,14 @@ def execute_work_action(
         )
     elif action == "reset-reclaim-budget":
         result = _reset_reclaim_budget_action(
+            args=args,
+            authority=authority,
+            now_epoch=now_epoch,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "refreeze-base":
+        result = _refreeze_base_action(
             args=args,
             authority=authority,
             now_epoch=now_epoch,

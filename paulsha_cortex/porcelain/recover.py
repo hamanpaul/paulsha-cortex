@@ -61,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=(
             "retry-build", "retry-card", "resume", "recover-pre-candidate",
             "recover-repair-commit", "regenerate-gates", "abandon",
-            "retire-delivered", "reset-reclaim-budget",
+            "retire-delivered", "reset-reclaim-budget", "refreeze-base",
         ),
     )
     work.add_argument("--repo", required=True)
