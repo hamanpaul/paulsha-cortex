@@ -383,6 +383,13 @@ class WorkflowRun:
     work_id: str
     repo: str
     claim_key: str
+    # #731：**這不是 git base。** `source_revision` 是 work item 來源材料的
+    # sha256（64-hex authority digest，由 `claim.semantic_source_revision` 導出），
+    # 與 run 的候選 git base（40-hex commit SHA）無關，也不隨 `origin/main` 前進
+    # 而改變。0819 現場它是 run 上唯一顯眼的「版本」欄位，operator 因此把「基底
+    # 過舊」的診斷掛在它身上、連續誤判兩次——那個誤導本身就是 #731 的缺陷之一。
+    # 候選 git base 請看 `candidate_base.py` 投影出來的 `candidate_git_base`
+    # （凍結集 `frozen_readiness["base_sha"]` 或第一張 build 卡的 `dispatch_head`）。
     source_revision: str
     workspace_root: str
     combo: str

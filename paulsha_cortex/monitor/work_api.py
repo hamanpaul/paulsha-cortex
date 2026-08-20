@@ -262,7 +262,32 @@ class WorkReadModelStore:
             blocking = self._needs_human_reason(item.repo, item.work_id)
             if blocking:
                 envelope["blocking_reason"] = blocking
+            # #731 (C)：候選 git base（真的那個 40-hex commit SHA）＋ 落後 mirror
+            # 上 origin/main 的 commit 數 ＋ 過舊時的具名 reason。資料源與上面兩
+            # 段完全相同（workflow provider 的 observations）。
+            #
+            # 這一欄與 `item["source_revision"]` 是**兩件事**：後者是 work item
+            # 來源材料的 sha256（authority digest，64-hex），與 git 無關；本欄位
+            # 是 git commit SHA（40-hex）。#731 現場正是把兩者混為一談而誤判。
+            git_base = self._candidate_git_base(item.repo, item.work_id)
+            if git_base:
+                envelope["candidate_git_base"] = git_base
             return envelope
+
+    def _candidate_git_base(self, repo: str, work_id: str) -> dict:
+        for provider_id, provider in self._snapshot.providers.items():
+            if not provider_id.startswith("workflow:"):
+                continue
+            observations = provider.observations
+            if not isinstance(observations, Mapping):
+                continue
+            rows = observations.get("candidate_git_bases", {})
+            if not isinstance(rows, Mapping):
+                continue
+            found = rows.get(work_id)
+            if isinstance(found, Mapping) and found:
+                return dict(found)
+        return {}
 
     def _needs_human_reason(self, repo: str, work_id: str) -> dict:
         for provider_id, provider in self._snapshot.providers.items():

@@ -384,9 +384,14 @@ systemctl --user status cortex-manager.service cortex-monitor.service
 
 - `ready`：已滿足派工條件。
 - `held`：尚未可派工，並列出 `no-plan`、`dispatch-hold` 或未滿足的 dependency。
-- `in_flight`：正在執行的 Job。
+- `in_flight`：正在執行的 Job，含 `candidate_git_base`（見下）。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
-- `attention`：全部 `needs_human` 項目，包含 reason 與當下合法的 `next_actions`。
+- `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及 `candidate_git_base`。
+- `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。
+  - **與 `source_revision` 是兩件事**：`source_revision` 是 work item 來源材料的 sha256（authority digest，64-hex），與 git 無關、也不隨 `origin/main` 前進而改變。過去候選基底只存在於候選 worktree 的 `.git` 裡，operator 只能 `git -C <候選 worktree> rev-parse HEAD` 才問得到，於是把診斷掛在 `source_revision` 上而誤判。
+  - 落後達 `threshold_commits`（預設 10，可用 `PSC_CANDIDATE_BASE_STALE_THRESHOLD_COMMITS` 覆寫）時，`reason` 為具名診斷 `candidate-git-base-stale`——代表「這條 run 的基底過舊、已 merge 的 test-only 修復進不去」。
+  - 距離是相對 **mirror 上次 fetch 到的 `refs/remotes/origin/main`** 算的，不是相對 GitHub 此刻的 main：status 是唯讀路徑，`fetched` 恆為 `false`（fetch 是 claim 的職責）。讀不到 mirror／算不出距離時，`behind_origin_main` 落 `<unresolved:MirrorRootUnset>`／`<unresolved:MirrorMainUnreadable>`／`<unresolved:BaseNotInMirror>`，`reason` 為 `candidate-git-base-distance-unresolved`；run 還沒有基底（define／plan 階段）時 `reason` 為 `candidate-git-base-absent`。
+  - 同一份資料也出現在 `cortex work show <work_id>`（文字模式與 `--json` 皆有）。
 - `not_claimable`（#669）：claim 判定**現在不可 claim、且刻意不建立 run** 的 work item。最典型的是 `docs/superpowers/workstreams/*`——那類 work item 設計上就不對應單一 issue，`missing_issue` 是**預期狀態而非異常**，過去卻被物化成停在 `current_phase: claim`、永遠不會推進的 `needs_human` run（實測一次產出 24 個，把 `attention` 信噪比壓成 1:24）。現在改記在耐久的 `<coordinator_root>/not-claimable.json`（schema `cortex-not-claimable/v1`），欄位含 `reason`、`detail`、`first_observed_at`／`last_observed_at`／`observations`（卡多久了）與 `next_step_hint`（照抄即可執行的下一步）。work item 一旦變成可 claim，該筆紀錄於下一次判定時自動消失。`attention` 因此只留可行動的項目，被跳過的項目也不會變成盲區。
 - `recent_done`：最近完成或進入 terminal gate 的 slice 摘要，含 `slice_id`、`gate_status`、`at`、`gate_reason`、`job_id`、`branch`、明確的 `repo` project 歸屬（manifest 缺該欄時為 `null`）。`attention`／`slices` 也只接受明確的 slice 或 workflow job repo；不從 branch、worktree 或 path 猜測 project。只回溯 `--recent-done-window-seconds`（預設 86400 秒／24 小時，可用 `PSC_MANAGER_RECENT_DONE_WINDOW_SECONDS` 覆寫）內完成的 handoff manifest；window 內沒有資料時回空陣列，不會回退撈更舊的紀錄，過期 manifest 檔案本身的清理屬於 #178 program teardown GC 的範圍，不在 `recent_done` provider 職責內。
 
