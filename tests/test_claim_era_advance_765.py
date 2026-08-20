@@ -27,12 +27,18 @@ class ClaimEraAdvanceTests(unittest.TestCase):
         self.assertIn('job.get("workflow_claim_key") in (None, run.claim_key)', selection)
 
     def test_dispatch_matching_stays_era_agnostic(self) -> None:
-        """派工端 matching（instance 編號＋retry-context）維持全 era。"""
+        """派工端 matching 本身維持全 era（retry-context／sandbox 清理需要完整歷史），
+        但 reuse／retry 判定走同 era 的 `reusable` 子集（#765 第五出口）。"""
 
         source = inspect.getsource(manager._dispatch_workflow_card)
         anchor = source.index("matching = [")
-        block = source[anchor : anchor + 600]
-        self.assertNotIn("workflow_claim_key", block)
+        list_block = source[anchor : source.index("]", anchor) + 1]
+        self.assertNotIn("workflow_claim_key", list_block)
+        reuse_anchor = source.index("reusable = [")
+        reuse_block = source[reuse_anchor : source.index("]", reuse_anchor) + 1]
+        self.assertIn('workflow_claim_key") in (None, run.claim_key)', reuse_block)
+        self.assertIn("if reusable and not retryable_latest:", source)
+        self.assertIn("return reusable[-1]", source)
 
 class RetryCardEraTests(unittest.TestCase):
     def test_retry_card_target_jobs_filter_by_claim_era(self) -> None:
