@@ -272,6 +272,7 @@ def build_gate_argv(
     ledger_out: str | Path,
     snapshot: str | Path,
     source_worktree: str | Path,
+    ancestry_baseline: str | None = None,
 ) -> list[str]:
     """gate unit 實際執行的 argv。**封閉：沒有任何來自 job 的可變輸入。**
 
@@ -285,7 +286,7 @@ def build_gate_argv(
     Manager 是**目錄**的 owner 但那不給檔案內容的讀取權（#638 缺陷 2）。
     """
 
-    return [
+    argv = [
         str(python),
         "-m",
         "paulsha_cortex.coordinator.gate_ledger",
@@ -297,6 +298,11 @@ def build_gate_argv(
         str(source_worktree),
         "--publish",
     ]
+    if ancestry_baseline is not None:
+        # #738：baseline 來自 Manager 的 run／job 記錄（dispatch_head 或已採信的
+        # candidate），不是 job 的可變輸入——argv 的封閉性不變。
+        argv.extend(["--assert-ancestor", str(ancestry_baseline)])
+    return argv
 
 
 def prepare_gate_spool(
@@ -342,6 +348,80 @@ def seal_gate_spool(ledger_file: str | Path) -> None:
     """
 
     spool_slot.seal_slot(Path(ledger_file).parent)
+
+
+def _normalize_worktree_state(
+    payload: Mapping[str, Any], *, path: Path
+) -> dict[str, Any] | None:
+    """spool ledger 的 `worktree_state` 逐項驗形狀（#738）。
+
+    寫這份檔的 gate 身分正在執行 builder 交出來的程式碼，可能被攻陷：這裡擋的是
+    **形狀**（發明的鍵、無界字串、非 sha 的 head），不是內容真偽——那是圍堵買不到
+    的東西，與 gates rows 的誠實邊界一致。缺席回 None（老 ledger／direct 路徑產物），
+    形狀非法一律 `gate-spool-invalid` fail-closed。
+    """
+
+    raw = payload.get(gate_ledger.WORKTREE_STATE_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise GateRunnerError(
+            "gate-spool-invalid", "worktree_state 必須為物件", path=str(path)
+        )
+    sha_re = gate_ledger._SHA_RE
+    head = raw.get("head")
+    if head is not None and (not isinstance(head, str) or sha_re.fullmatch(head) is None):
+        raise GateRunnerError(
+            "gate-spool-invalid", f"worktree_state.head 非法: {head!r}", path=str(path)
+        )
+    baseline = raw.get("ancestry_baseline")
+    if baseline is not None and (
+        not isinstance(baseline, str) or sha_re.fullmatch(baseline) is None
+    ):
+        raise GateRunnerError(
+            "gate-spool-invalid",
+            f"worktree_state.ancestry_baseline 非法: {baseline!r}",
+            path=str(path),
+        )
+    ancestry_ok = raw.get("ancestry_ok")
+    if ancestry_ok is not None and not isinstance(ancestry_ok, bool):
+        raise GateRunnerError(
+            "gate-spool-invalid",
+            f"worktree_state.ancestry_ok 非法: {ancestry_ok!r}",
+            path=str(path),
+        )
+    dirty_total = raw.get("dirty_total")
+    if type(dirty_total) is not int or dirty_total < 0:
+        raise GateRunnerError(
+            "gate-spool-invalid",
+            f"worktree_state.dirty_total 非法: {dirty_total!r}",
+            path=str(path),
+        )
+    dirty_raw = raw.get("dirty")
+    if not isinstance(dirty_raw, list) or len(dirty_raw) > gate_ledger.MAX_DIRTY_PATHS:
+        raise GateRunnerError(
+            "gate-spool-invalid", "worktree_state.dirty 必須為有界清單", path=str(path)
+        )
+    dirty = []
+    for item in dirty_raw:
+        if not isinstance(item, str):
+            raise GateRunnerError(
+                "gate-spool-invalid", "worktree_state.dirty 項目必須為字串", path=str(path)
+            )
+        dirty.append(item[:MAX_DETAIL_CHARS])
+    probe = raw.get("probe")
+    if not isinstance(probe, str):
+        raise GateRunnerError(
+            "gate-spool-invalid", f"worktree_state.probe 非法: {probe!r}", path=str(path)
+        )
+    return {
+        "head": head,
+        "dirty": dirty,
+        "dirty_total": dirty_total,
+        "probe": probe[:MAX_DETAIL_CHARS],
+        "ancestry_baseline": baseline,
+        "ancestry_ok": ancestry_ok,
+    }
 
 
 def read_gate_spool(ledger_file: str | Path, *, env: Mapping[str, str]) -> dict[str, Any]:
@@ -432,7 +512,11 @@ def read_gate_spool(ledger_file: str | Path, *, env: Mapping[str, str]) -> dict[
                 "detail": (detail if isinstance(detail, str) else "")[-MAX_DETAIL_CHARS:],
             }
         )
-    return gate_ledger.build_ledger(normalized, slice_id=str(env.get("PSC_SLICE_ID", "")))
+    return gate_ledger.build_ledger(
+        normalized,
+        slice_id=str(env.get("PSC_SLICE_ID", "")),
+        worktree_state=_normalize_worktree_state(payload, path=path),
+    )
 
 
 def run_declared_gates(
@@ -444,6 +528,7 @@ def run_declared_gates(
     env: Mapping[str, str] | None = None,
     coordinator_root: str | Path | None = None,
     runner: Any | None = None,
+    ancestry_baseline: str | None = None,
 ) -> dict[str, Any]:
     """執行 operator 宣告的 gate 並讓 **Manager** 落地權威 ledger，回傳 payload。
 
@@ -464,7 +549,10 @@ def run_declared_gates(
     mode = job_runner.resolve_runner_mode(source)
     if mode == job_runner.RUNNER_DIRECT:
         return gate_ledger.write_gate_ledger(
-            ledger_path=ledger_path, worktree=worktree, env=source
+            ledger_path=ledger_path,
+            worktree=worktree,
+            env=source,
+            ancestry_baseline=ancestry_baseline,
         )
     return _run_as_gate_identity(
         job_id=job_id,
@@ -474,6 +562,7 @@ def run_declared_gates(
         env=source,
         coordinator_root=coordinator_root,
         runner=runner,
+        ancestry_baseline=ancestry_baseline,
     )
 
 
@@ -502,6 +591,7 @@ def _run_as_gate_identity(
     env: Mapping[str, str],
     coordinator_root: str | Path | None,
     runner: Any | None,
+    ancestry_baseline: str | None = None,
 ) -> dict[str, Any]:
     """降權模式的實作：起 `cortex-gate-job@<instance>.service`，消費 spool，落地。"""
 
@@ -557,6 +647,7 @@ def _run_as_gate_identity(
         ledger_out=spool_ledger,
         snapshot=snapshot,
         source_worktree=resolved_worktree,
+        ancestry_baseline=ancestry_baseline,
     )
     spec = job_runner.build_job_spec(
         job_id=job_id,
@@ -654,6 +745,16 @@ def ensure_gate_ledger(
     if not isinstance(worktree, str) or not Path(worktree).is_dir():
         return None
     job_id = str(job.get("job_id") or spool_key)
+    # #738：ancestry baseline ＝ 這張卡 provision 時的 dispatch_head（Manager 寫進
+    # job 記錄的值，不是 job 的可變輸入）。缺席／非 sha 時不傳——ledger 的
+    # ancestry_ok 維持 None，採信端自然退回既有路徑。
+    dispatch_head = job.get("dispatch_head")
+    baseline = (
+        dispatch_head.lower()
+        if isinstance(dispatch_head, str)
+        and gate_ledger._SHA_RE.fullmatch(dispatch_head.lower()) is not None
+        else None
+    )
     return run_declared_gates(
         job_id=job_id,
         spool_key=spool_key,
@@ -662,6 +763,7 @@ def ensure_gate_ledger(
         env=source,
         coordinator_root=coordinator_root,
         runner=runner,
+        ancestry_baseline=baseline,
     )
 
 

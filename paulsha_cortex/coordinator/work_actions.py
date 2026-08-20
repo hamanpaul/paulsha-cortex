@@ -4108,12 +4108,24 @@ def _regenerate_gates_action(
     spool_key = gate_runner.spool_key_for_job(job)
     if spool_key is None:
         raise RuntimeError("regenerate-gates requires a resolvable gate spool key")
+    # #738：ancestry baseline 與採信端 `_verify_build_candidate_transition` 同一條
+    # 導出（已採信的 candidate，否則這張卡 provision 時的 dispatch_head）。缺席／
+    # 非 sha 時不傳，ledger 的 ancestry_ok 維持 None，採信端自然退回既有路徑。
+    baseline = None
+    for value in (getattr(run, "candidate_head", None), job.get("dispatch_head")):
+        if (
+            isinstance(value, str)
+            and gate_ledger._SHA_RE.fullmatch(value.lower()) is not None
+        ):
+            baseline = value.lower()
+            break
     try:
         payload = gate_runner.run_declared_gates(
             job_id=str(job.get("job_id") or spool_key),
             spool_key=spool_key,
             ledger_path=ledger_path,
             worktree=worktree,
+            ancestry_baseline=baseline,
         )
     except gate_ledger.GateSpecError as exc:
         # operator 宣告仍不合法：不寫出任何東西，把設定錯誤原樣回報。

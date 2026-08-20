@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -395,6 +396,97 @@ def _snapshot_ignore_caches(directory: str, names: list[str]) -> set[str]:
     return {name for name in names if name in SNAPSHOT_REGENERABLE_CACHE_DIRS}
 
 
+# ---------------------------------------------------------------------------
+# candidate 驗證所需的 worktree 狀態（#738；#629 後半／#641 預留的那張票）
+# ---------------------------------------------------------------------------
+
+#: ledger 內 worktree 狀態的鍵名。作者與 gates rows 同為 gate 執行身分——
+#: 三分部署下 Manager 讀不進 builder 樹（#641 收掉唯讀 ACL），candidate 驗證
+#: （HEAD == candidate、ancestry）因此在**受控 checkout**（快照副本）上由本模組
+#: 收集，Manager 只消費 ledger，不再以自己的身分伸手進 job 樹。
+WORKTREE_STATE_KEY = "worktree_state"
+
+#: `dirty` 清單的筆數上限（有界診斷；總數另記在 `dirty_total`）。
+MAX_DIRTY_PATHS = 40
+
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def collect_worktree_state(
+    worktree: str | Path,
+    *,
+    ancestry_baseline: str | None = None,
+) -> dict[str, object]:
+    """在受控 checkout 上收集 candidate 驗證所需的 git 狀態。
+
+    量測時點在**跑任何宣告 gate 之前**——gate 命令（pytest 等）會往樹裡寫，
+    state 必須反映快照當下、也就是被驗 candidate 的那一瞬。三種欄位：
+
+    - ``head``：`rev-parse HEAD`（小寫 40-hex；取不到時為 None 且 ``probe`` 記原因）
+    - ``dirty``／``dirty_total``：`status --porcelain --untracked-files=all` 的
+      有界前綴與總數。**本票只記錄不強制**（Manager 現行 git 路徑本就不驗乾淨度，
+      採信語意維持 parity）；升級為 FAIL gate 是另一個裁決。
+    - ``ancestry_baseline``／``ancestry_ok``：`merge-base --is-ancestor <baseline>
+      HEAD`。baseline 由 Manager 經封閉 argv 提供（`--assert-ancestor`），不是
+      job 的可變輸入。它補的是 `harvest_branch` fast-forward 守衛蓋不到的那一格
+      （新 branch 首張卡：fetch 建新 ref 時沒有 FF 檢查）。
+
+    任何 git 呼叫失敗都記進 ``probe`` 並提前回傳——消費端（manager）把
+    ``probe != "ok"`` 視同 state 缺席，退回既有 fail-closed 路徑，不猜。
+    """
+
+    def _run(argv: list[str]):
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, cwd=str(worktree)
+        )
+
+    state: dict[str, object] = {
+        "head": None,
+        "dirty": [],
+        "dirty_total": 0,
+        "probe": "ok",
+        "ancestry_baseline": ancestry_baseline,
+        "ancestry_ok": None,
+    }
+    head = _run(["git", "rev-parse", "HEAD"])
+    if head.returncode != 0:
+        state["probe"] = (
+            "error: rev-parse HEAD: " + (head.stderr or head.stdout).strip()[:400]
+        )
+        return state
+    sha = head.stdout.strip().lower()
+    if _SHA_RE.fullmatch(sha) is None:
+        state["probe"] = f"error: rev-parse HEAD returned non-sha: {sha[:80]!r}"
+        return state
+    state["head"] = sha
+    status = _run(["git", "status", "--porcelain", "--untracked-files=all"])
+    if status.returncode != 0:
+        state["probe"] = (
+            "error: status --porcelain: " + (status.stderr or status.stdout).strip()[:400]
+        )
+        return state
+    lines = [line for line in status.stdout.splitlines() if line.strip()]
+    state["dirty_total"] = len(lines)
+    state["dirty"] = [line[:200] for line in lines[:MAX_DIRTY_PATHS]]
+    if ancestry_baseline is not None:
+        if _SHA_RE.fullmatch(ancestry_baseline) is None:
+            state["probe"] = (
+                f"error: ancestry baseline is not a sha: {ancestry_baseline[:80]!r}"
+            )
+            return state
+        ancestry = _run(["git", "merge-base", "--is-ancestor", ancestry_baseline, "HEAD"])
+        if ancestry.returncode == 0:
+            state["ancestry_ok"] = True
+        elif ancestry.returncode == 1:
+            state["ancestry_ok"] = False
+        else:
+            state["probe"] = (
+                "error: merge-base --is-ancestor: "
+                + (ancestry.stderr or ancestry.stdout).strip()[:400]
+            )
+    return state
+
+
 def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
     """把被驗的工作樹複製成一份**拋棄式副本**，回傳副本路徑（#629）。
 
@@ -456,13 +548,17 @@ def build_ledger(
     gates: Sequence[Mapping[str, object]],
     *,
     slice_id: str | None = None,
+    worktree_state: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
         "kind": terminal_contract.GATE_LEDGER_KIND,
         "slice_id": slice_id or "",
         "gates": [dict(row) for row in gates],
     }
+    if worktree_state is not None:
+        payload[WORKTREE_STATE_KEY] = dict(worktree_state)
+    return payload
 
 
 def write_gate_ledger(
@@ -471,6 +567,7 @@ def write_gate_ledger(
     worktree: str | Path,
     env: Mapping[str, str] | None = None,
     runner: Runner | None = None,
+    ancestry_baseline: str | None = None,
 ) -> dict[str, object]:
     """執行宣告的 gate 並原子寫出 ledger；回傳寫出的 payload。
 
@@ -481,13 +578,22 @@ def write_gate_ledger(
 
     source = os.environ if env is None else env
     specs = load_gate_specs(source)
+    # worktree 狀態在**跑任何 gate 之前**收集（#738）：gate 命令會往樹裡寫，
+    # state 必須反映被驗 candidate 的那一瞬。
+    worktree_state = collect_worktree_state(
+        worktree, ancestry_baseline=ancestry_baseline
+    )
     gates = run_gates(
         specs,
         worktree=worktree,
         timeout=_gate_timeout(source),
         runner=runner,
     )
-    payload = build_ledger(gates, slice_id=source.get("PSC_SLICE_ID"))
+    payload = build_ledger(
+        gates,
+        slice_id=source.get("PSC_SLICE_ID"),
+        worktree_state=worktree_state,
+    )
     write_ledger_payload(ledger_path, payload)
     return payload
 
@@ -530,6 +636,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--assert-ancestor",
+        default=None,
+        help=(
+            "#738：要求 worktree HEAD 是這個 40-hex baseline 的 descendant，結果記進 "
+            "ledger 的 worktree_state.ancestry_ok。由 Manager 的封閉 argv 提供，"
+            "不是 job 的可變輸入。"
+        ),
+    )
+    parser.add_argument(
         "--publish",
         action="store_true",
         help=(
@@ -548,7 +663,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 74
     try:
-        write_gate_ledger(ledger_path=args.out, worktree=args.worktree)
+        write_gate_ledger(
+            ledger_path=args.out,
+            worktree=args.worktree,
+            ancestry_baseline=args.assert_ancestor,
+        )
         if args.publish:
             spool_slot.publish_file(args.out)
     except GateSpecError:
