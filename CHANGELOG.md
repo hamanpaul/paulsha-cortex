@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#765（部分）：advance 的 terminal-job 選擇以 claim era 過濾**——authority
+  restart 後前代 job 不再造成每 tick 綁定炸裂，新 era 正常重新派工。
 - **#759：pr-preflight evidence 補 backend stdout/stderr 有界尾段**——失敗原因
   進 evidence，不再只靠實機重現定位。
 - **#760：`--skip-tests` 的 FullSuiteEvidence 契約接上 production**——gate 綠的
