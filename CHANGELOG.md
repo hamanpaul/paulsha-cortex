@@ -6,6 +6,12 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#736：gate snapshot 依名跳過可再生快取目錄（`__pycache__`／`.pytest_cache`／
+  `.mypy_cache`／`.ruff_cache`），寫入卡不再結構性必死。** builder unit 的
+  `UMask=0077` 讓 pytest 產生的 `.pytest_cache/` 以 group bits 0 落地 ⇒ ACL
+  `mask::---` ⇒ gate 帳號讀不到 ⇒ `snapshot_worktree` 整格 `SnapshotError` ⇒
+  `gate-spool-empty` crashloop（exit 74）。快取不是候選樹內容（.gitignore 排除、
+  gate 的 pytest 會自行重建）；清單外的不可讀項目維持 fail-closed。#723 一族第三例。
 - **#734：wrapper 斷言改為逐 token 語意判定，不再對整串 argv 做 substring 搜尋。**
   gate 執行帳號名（`cortex-gate`）出現在 pytest tmp 路徑裡，讓
   `test_planning_wrapper_has_no_gate_bundle_verdict_sentinel` 的 `"gate" not in joined`

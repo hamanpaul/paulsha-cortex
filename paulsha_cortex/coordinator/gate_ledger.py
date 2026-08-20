@@ -381,6 +381,20 @@ class SnapshotError(OSError):
     """拋棄式副本無法建立（#629）。**不寫 ledger**，讓採信端照 `require_ledger` 拒。"""
 
 
+# 可再生的直譯器／測試快取（#736）：不是候選樹的一部分（.gitignore 排除、gate 的
+# pytest 會在副本裡重建自己的 cache），且 builder 在 `UMask=0077` 下產生它們時
+# POSIX ACL mask 會被 create mode 的 group bits 歸零——default ACL 給 gate 的
+# `r-x` 繼承了條目、繼承不到權限，gate 因此讀不到。依名跳過是語意判準（「這個
+# 名字的目錄是快取」），不是「跳過讀不到的東西」——後者是禁手，見 docstring。
+SNAPSHOT_REGENERABLE_CACHE_DIRS = frozenset(
+    {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+)
+
+
+def _snapshot_ignore_caches(directory: str, names: list[str]) -> set[str]:
+    return {name for name in names if name in SNAPSHOT_REGENERABLE_CACHE_DIRS}
+
+
 def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
     """把被驗的工作樹複製成一份**拋棄式副本**，回傳副本路徑（#629）。
 
@@ -404,6 +418,13 @@ def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
     目的地**先整個移除再重建**：留下上一輪的殘留等於讓前一次 gate 的產物（甚至前一
     次被攻陷的 gate 留下的東西）參與這一次的判定。與 `spool_slot.create_slot(
     reset=True)` 同一條理由——重建比「就地清理」少一個要窮舉的清單。
+
+    `SNAPSHOT_REGENERABLE_CACHE_DIRS` **依名跳過、任意深度**（#736）：builder 在
+    `UMask=0077` 的 unit 下跑 pytest 產生的 `.pytest_cache/` mode 0700 ⇒ ACL mask
+    `---` ⇒ gate 讀不到，而它根本不是候選樹的內容。**只跳這份具名清單**——「跳過
+    任何讀不到的東西」是禁手：若候選內容本身讀不到（例如 RED 測試檔），靜默跳過
+    會讓 gate 在殘缺的樹上判出假 verdict，正是「不把沒驗到偽裝成驗過沒過」要擋的
+    ——清單外的不可讀項目照樣 `SnapshotError` fail-closed。
     """
 
     src = Path(source)
@@ -419,7 +440,13 @@ def snapshot_worktree(source: str | Path, destination: str | Path) -> Path:
         elif dst.is_dir():
             shutil.rmtree(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst, symlinks=True, ignore_dangling_symlinks=True)
+        shutil.copytree(
+            src,
+            dst,
+            symlinks=True,
+            ignore_dangling_symlinks=True,
+            ignore=_snapshot_ignore_caches,
+        )
     except OSError as exc:
         raise SnapshotError(f"gate snapshot failed: {src} -> {dst}: {exc}") from exc
     return dst
