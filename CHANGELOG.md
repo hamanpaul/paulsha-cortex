@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#765 補遺：binding mismatch 錯誤帶 job_id 與兩側值。**
 - **#765 補遺：retry-card 的 target-jobs 亦以 claim era 過濾**（舊 era evidence
   不再擋死新 era 重派）。
 - **#765 補遺：daemon `_log_error` 首次出現附完整 traceback**（重複維持抑制）。
