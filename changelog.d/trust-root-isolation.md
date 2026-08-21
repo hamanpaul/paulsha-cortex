@@ -20,3 +20,5 @@
 - Made Codex control-file scaffold installation create-only and content-preserving;
   repeated installs no longer truncate deployed `config.toml` or `hooks.json`.
 # Repair: register canonical Codex control/credential authorities as deployment assets, migrate both roles' existing bytes without stubs, and harvest refreshes after builder and reviewer terminal paths.
+
+# Repair: whitelist the four canonical control leaves during atomic migration, normalize root-owned readable modes, reject symlink/special descendants, and publish atomic builder/reviewer auth refreshes through a named Manager ACL after unit termination.

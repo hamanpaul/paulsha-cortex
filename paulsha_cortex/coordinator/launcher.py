@@ -1820,9 +1820,9 @@ class SubprocessLauncher:
             # credential file's ACL mask after Codex exits; the Manager-owned
             # slot remains non-traversable to every foreign principal.
             terminal = f'; exit "${_RC_VAR}"'
-            publish = (
-                'if [ -f "$CODEX_HOME/auth.json" ]; then '
-                'chmod 0640 "$CODEX_HOME/auth.json" || exit 78; fi'
+            from ..trust_root.permgen import FOUR_WAY_SCHEME
+            publish = spool_slot.publish_runtime_credential_command(
+                manager_account=FOUR_WAY_SCHEME.durable_state_owner
             )
             if script.endswith(terminal):
                 script = script[: -len(terminal)] + f"; {publish}" + terminal

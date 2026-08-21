@@ -310,3 +310,35 @@ def test_auth_refresh_is_committed_as_next_job_seed(tmp_path, monkeypatch) -> No
     )[0]
     assert (second / "auth.json").read_text() == '{"refresh":"new"}\n'
     assert (second / "config.toml").read_bytes() == (first / "config.toml").read_bytes()
+
+
+def test_authority_migration_whitelists_controls_and_normalizes_live_modes() -> None:
+    commands = "\n".join(
+        permgen.DEFAULT_LAYOUT.codex_authority_seed_commands(permgen.FOUR_WAY_SCHEME)
+    )
+    assert "cp -a /var/lib/cortex-builder/.codex " not in commands
+    for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
+        assert f"/.codex/{leaf}" in commands
+    for runtime_leaf in ("sessions", "memories", "installation_id", "auth.json"):
+        assert f'cp -a /var/lib/cortex-builder/.codex/{runtime_leaf}' not in commands
+    assert '! -type d ! -type f' in commands
+    assert 'find "$tmp" -type d -exec chmod 0755' in commands
+    assert 'find "$tmp" -type f -exec chmod 0644' in commands
+    assert "mktemp -d" in commands
+
+
+@pytest.mark.parametrize("principal", (permgen.Principal.BUILDER, permgen.Principal.REVIEWER))
+def test_generated_unit_publishes_auth_to_manager_after_process_stops(principal) -> None:
+    unit = permgen.build_job_unit(permgen.FOUR_WAY_SCHEME, principal=principal)
+    text = unit.content
+    assert "ExecStopPost=" in text
+    assert "setfacl -m u:cortex-manager:r--,m::r--" in text
+    assert '$${CODEX_HOME}/auth.json' in text
+
+
+def test_auth_publish_command_uses_named_manager_acl_not_shared_group() -> None:
+    command = spool_slot.publish_runtime_credential_command(
+        manager_account=permgen.FOUR_WAY_SCHEME.durable_state_owner
+    )
+    assert "chmod 0640" in command
+    assert "setfacl -m u:cortex-manager:r--,m::r--" in command

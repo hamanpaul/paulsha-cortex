@@ -3714,6 +3714,11 @@ class PathLayout:
             controls = f"{self.codex_control_root}/{principal.value}"
             credential = f"{self.codex_credential_root}/{principal.value}/auth.json"
             qsrc, qctl, qcred = map(shlex.quote, (source, controls, credential))
+            # Copy the four control leaves explicitly.  A deployed ~/.codex also
+            # contains sessions, sqlite databases, memories and installation ids;
+            # none of those are policy inputs and none may become job-readable.
+            # mktemp + rename makes an interrupted first install retryable without
+            # leaving a fixed ``.new`` tree that a later run could accidentally use.
             rows.append(
                 f"if [ ! -e {qctl} ]; then "
                 f"test ! -L {qsrc} && test -d {qsrc} && "
@@ -3721,9 +3726,18 @@ class PathLayout:
                 f"test -d {qsrc}/plugins && test ! -L {qsrc}/plugins && "
                 f"test -d {qsrc}/skills && test ! -L {qsrc}/skills && "
                 f"test -f {qsrc}/hooks.json && test ! -L {qsrc}/hooks.json && "
-                f"cp -a {qsrc} {qctl}.new && rm -f {qctl}.new/auth.json && "
-                f"chown -R {root}:{scheme.group_of(root)} {qctl}.new && "
-                f"chmod -R a-w {qctl}.new && mv {qctl}.new {qctl}; fi"
+                f"test -z \"$(find {qsrc}/plugins {qsrc}/skills "
+                f"! -type d ! -type f -print -quit)\" && "
+                f"tmp=$(mktemp -d {qctl}.tmp.XXXXXX) && "
+                f"trap 'rm -rf -- \"$tmp\"' EXIT HUP INT TERM && "
+                f"install -m 0644 {qsrc}/config.toml \"$tmp/config.toml\" && "
+                f"install -m 0644 {qsrc}/hooks.json \"$tmp/hooks.json\" && "
+                f"cp -a {qsrc}/plugins \"$tmp/plugins\" && "
+                f"cp -a {qsrc}/skills \"$tmp/skills\" && "
+                f"chown -R {root}:{scheme.group_of(root)} \"$tmp\" && "
+                f"find \"$tmp\" -type d -exec chmod 0755 {{}} + && "
+                f"find \"$tmp\" -type f -exec chmod 0644 {{}} + && "
+                f"mv \"$tmp\" {qctl} && trap - EXIT HUP INT TERM; fi"
             )
             rows.append(
                 f"if [ ! -e {qcred} ]; then test -f {qsrc}/auth.json && "
@@ -7155,6 +7169,17 @@ def build_job_unit(
         "# 必須是這份 root-owned unit 上可逐字稽核的一行，不是一組共用目錄的 ACL 交集。",
         "# job 因此無法改寫自己的命令列，也無法為下一個 job 埋伏。",
         f"ExecStart={job_layout.job_shim} %i",
+        *(
+            [
+                "# Publish an atomic auth refresh after every terminal path. The named",
+                "# Manager ACL is required because job and Manager have no shared group.",
+                "ExecStopPost=/bin/sh -c 'if test -f \"$${CODEX_HOME}/auth.json\"; then "
+                f"chmod 0640 \"$${{CODEX_HOME}}/auth.json\" && setfacl -m "
+                f"u:{scheme.durable_state_owner}:r--,m::r-- \"$${{CODEX_HOME}}/auth.json\"; fi'",
+            ]
+            if principal in (Principal.BUILDER, Principal.REVIEWER)
+            else []
+        ),
         "# 工作目錄：shim 會依 spec 的 working_directory 再 chdir 到該 job 的 worktree；",
         "# 這裡只給恆存在的 pool 根（0701＝可 traverse、不可列目錄），避免 unit 因",
         "# per-job 目錄尚未建立而在 exec 前就失敗（那會讓 log 裡沒有任何線索）。",

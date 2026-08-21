@@ -176,6 +176,26 @@ def commit_runtime_credential(*, principal: str, job_id: str) -> Path:
     return authority
 
 
+def publish_runtime_credential_command(
+    *, codex_home: str = "$CODEX_HOME", manager_account: str
+) -> str:
+    """Producer-side auth publish contract for atomic rename under UMask=0077.
+
+    The named Manager ACL is necessary because the split identities do not share
+    a group.  ``chmod 0640`` alone therefore does not make a builder/reviewer
+    owned refresh readable by Manager.  The slot directory still denies every
+    foreign principal traversal.
+    """
+    if not manager_account or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", manager_account):
+        raise ValueError(f"unsafe manager account: {manager_account!r}")
+    auth = f'{codex_home}/auth.json' if codex_home == "$CODEX_HOME" else str(Path(codex_home) / "auth.json")
+    quoted = '"$CODEX_HOME/auth.json"' if codex_home == "$CODEX_HOME" else shlex.quote(auth)
+    return (
+        f"test -f {quoted} && chmod 0640 {quoted} && "
+        f"setfacl -m u:{manager_account}:r--,m::r-- {quoted}"
+    )
+
+
 def _apply_slot_acl(path: Path, *, account: str, writable: bool) -> None:
     """Apply ACL without the launcher's mocked ``subprocess.Popen`` surface."""
     binary = shutil.which("setfacl")
