@@ -81,68 +81,7 @@ from pathlib import Path
 from . import registry
 
 
-@dataclass(frozen=True)
-class PerJobWritableSurface:
-    """The single source projected by deployment, provisioning, runtime and probes."""
-
-    surface_id: str
-    slot_template: str
-    writable_root: str
-    provisioner: str
-    consumer: str
-    probe: str
-
-
-def _per_job_surface_rows() -> tuple[PerJobWritableSurface, ...]:
-    from ..config import paths
-
-    rows = (
-        ("commit-spool", paths.commit_spool_root()),
-        ("monitor-event-spool", paths.monitor_event_spool_root()),
-        ("review-verdict-spool", paths.review_verdict_spool_root()),
-        ("gate-ledger-spool", paths.gate_ledger_spool_root()),
-        ("gate-worktree", paths.gate_worktree_root()),
-    )
-    return tuple(
-        PerJobWritableSurface(
-            surface_id=surface_id,
-            slot_template=f"{root}/%i",
-            writable_root=str(root),
-            provisioner="coordinator.spool_slot.canonical_job_slot",
-            consumer={
-                "commit-spool": "coordinator.job_workspace.commit_bundle_path",
-                "monitor-event-spool": "monitor.event_spool.EventSpool.scan",
-                "review-verdict-spool": "coordinator.review.review_verdict_spool_path",
-                "gate-ledger-spool": "coordinator.gate_runner.gate_spool_ledger_path",
-                "gate-worktree": "coordinator.gate_runner.gate_worktree_dir",
-            }[surface_id],
-            probe="trust_root.permgen.render_job_writable_properties",
-        )
-        for surface_id, root in rows
-    )
-
-
-PER_JOB_WRITABLE_SURFACES = _per_job_surface_rows()
-
-
-def _surface_ids() -> tuple[str, ...]:
-    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES)
-
-
-def generated_writable_surface_ids() -> tuple[str, ...]:
-    return _surface_ids()
-
-
-def provisioned_writable_surface_ids() -> tuple[str, ...]:
-    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES if row.provisioner)
-
-
-def run_under_writable_surface_ids() -> tuple[str, ...]:
-    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES if row.slot_template)
-
-
-def probe_writable_surface_ids() -> tuple[str, ...]:
-    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES if row.probe)
+from ..coordinator.spool_slot import PER_JOB_WRITABLE_SURFACES, PerJobWritableSurface
 
 
 def render_job_writable_properties(*, instance: str) -> tuple[str, ...]:
@@ -3727,6 +3666,7 @@ class PathLayout:
                 (str(codex / "plugins"), root, group, 0o755, True),
                 (str(codex / "skills"), root, group, 0o755, True),
                 (str(codex / "config.toml"), root, group, 0o644, False),
+                (str(codex / "hooks.json"), root, group, 0o644, False),
             ))
         return tuple(rows)
 

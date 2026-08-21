@@ -325,7 +325,7 @@ class EventSpool:
         # The monitor consumes the shared root; a job producer must be explicitly
         # bound to the Manager-selected slot and can never write the shared root.
         self.root = (
-            canonical_job_slot("monitor-event-spool", job_id, coordinator_root=base)
+            canonical_job_slot("monitor-event-spool", job_id, writable_root=base)
             if job_id is not None
             else base
         )

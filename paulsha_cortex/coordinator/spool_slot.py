@@ -51,6 +51,7 @@ import re
 import shlex
 import shutil
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 #: `review-verdict-spool` 那一格裡的成果檔名（目錄本身以 reviewer job id 定址）。
@@ -91,21 +92,45 @@ SEALED_SLOT_MODE = 0o500
 #: 不是「群組的實際權限」。
 ACCESS_ACL_XATTR = "system.posix_acl_access"
 
-_CANONICAL_SURFACE_ROOTS = {
-    "commit-spool": "commit_spool_root",
-    "monitor-event-spool": "monitor_event_spool_root",
-    "review-verdict-spool": "review_verdict_spool_root",
-    "gate-ledger-spool": "gate_ledger_spool_root",
-    "gate-worktree": "gate_worktree_root",
-}
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
-_SURFACE_DIRNAMES = {
-    "commit-spool": "commit-spool",
-    "monitor-event-spool": "monitor/event-spool",
-    "review-verdict-spool": "review-verdicts",
-    "gate-ledger-spool": "gate-ledger-spool",
-}
+
+@dataclass(frozen=True)
+class PerJobWritableSurface:
+    """One row wired into path lookup, unit generation and runtime consumers."""
+
+    surface_id: str
+    path_accessor: str
+    coordinator_relative: str
+    provisioner: str
+    consumer: str
+    probe: str
+
+    @property
+    def writable_root(self) -> str:
+        from ..config import paths
+
+        return str(getattr(paths, self.path_accessor)())
+
+    @property
+    def slot_template(self) -> str:
+        return f"{self.writable_root}/%i"
+
+
+PER_JOB_WRITABLE_SURFACES: tuple[PerJobWritableSurface, ...] = (
+    PerJobWritableSurface("commit-spool", "commit_spool_root", "commit-spool", "create_slot", "commit_bundle_path", "render_job_writable_properties"),
+    PerJobWritableSurface("monitor-event-spool", "monitor_event_spool_root", "monitor/event-spool", "create_slot", "EventSpool", "render_job_writable_properties"),
+    PerJobWritableSurface("review-verdict-spool", "review_verdict_spool_root", "review-verdicts", "create_slot", "review_verdict_spool_path", "render_job_writable_properties"),
+    PerJobWritableSurface("gate-ledger-spool", "gate_ledger_spool_root", "gate-ledger-spool", "create_slot", "gate_spool_ledger_path", "render_job_writable_properties"),
+    PerJobWritableSurface("gate-worktree", "gate_worktree_root", "gate-worktree", "create_slot", "gate_worktree_dir", "render_job_writable_properties"),
+)
+
+
+def writable_surface(surface_id: str) -> PerJobWritableSurface:
+    try:
+        return next(row for row in PER_JOB_WRITABLE_SURFACES if row.surface_id == surface_id)
+    except StopIteration as exc:
+        raise ValueError(f"unknown writable surface: {surface_id!r}") from exc
 
 
 def _lexical_root(path: str | Path) -> Path:
@@ -122,28 +147,36 @@ def _lexical_root(path: str | Path) -> Path:
 
 
 def canonical_job_slot(
-    surface_id: str, job_id: str, *, coordinator_root: str | Path | None = None
+    surface_id: str,
+    job_id: str,
+    *,
+    coordinator_root: str | Path | None = None,
+    writable_root: str | Path | None = None,
 ) -> Path:
     """Return the Manager-selected instance slot for one registered surface.
 
     This is deliberately the only generic path join for per-job writable roots;
     callers must provide the registry identity, never payload text.
     """
-    if surface_id not in _CANONICAL_SURFACE_ROOTS:
-        raise ValueError(f"unknown writable surface: {surface_id!r}")
+    surface = writable_surface(surface_id)
+    if coordinator_root is not None and writable_root is not None:
+        raise ValueError("coordinator_root and writable_root are mutually exclusive")
     if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
         raise ValueError(f"unsafe job identity: {job_id!r}")
     from ..config import paths
+    from .job_workspace import job_segment
 
-    if surface_id == "gate-worktree":
-        root = paths.gate_worktree_root() if coordinator_root is None else Path(coordinator_root)
+    instance = job_segment(job_id)
+
+    if writable_root is not None:
+        root = Path(writable_root)
+    elif coordinator_root is None:
+        root = getattr(paths, surface.path_accessor)()
+    elif surface_id == "gate-worktree":
+        root = Path(coordinator_root)
     else:
-        root = (
-            getattr(paths, _CANONICAL_SURFACE_ROOTS[surface_id])()
-            if coordinator_root is None
-            else Path(coordinator_root) / _SURFACE_DIRNAMES[surface_id]
-        )
-    return _lexical_root(root) / job_id
+        root = Path(coordinator_root) / surface.coordinator_relative
+    return _lexical_root(root) / instance
 
 
 def validate_job_slot_shape(slot: str | Path, *, allow_symlink: bool = False) -> Path:

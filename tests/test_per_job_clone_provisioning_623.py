@@ -74,7 +74,7 @@ def _builder_commit(workspace: Path, name: str = "builder.txt") -> str:
     return _git(workspace, "rev-parse", "HEAD")
 
 
-def _produce_bundle(workspace: Path, spool_root: Path, *, key: str = "job-1") -> Path:
+def _produce_bundle(workspace: Path, spool_root: Path, *, key: str = _JOB_ID) -> Path:
     """以 **builder 身分**跑 production wrapper 裡那一段 bundle 命令，回傳落地的 bundle。
 
     刻意不在測試裡自己組 `git bundle create`——另寫一份只會驗到測試自己。
@@ -557,6 +557,7 @@ def test_workflow_lane_harvests_the_candidate_when_the_card_is_accepted(
     coordinator_root = tmp_path / "coordinator"
     bundle = _produce_bundle(workspace, coordinator_root)
     job = {
+        "job_id": _JOB_ID,
         "worktree": str(workspace),
         "branch": _BRANCH,
         "log_path": str(tmp_path / "logs" / f"{bundle.parent.name}.jsonl"),
@@ -605,6 +606,7 @@ def test_workflow_lane_harvest_fails_closed_when_the_head_does_not_match(
     coordinator_root = tmp_path / "coordinator"
     bundle = _produce_bundle(workspace, coordinator_root)
     job = {
+        "job_id": _JOB_ID,
         "worktree": str(workspace),
         "branch": _BRANCH,
         "log_path": str(tmp_path / "logs" / f"{bundle.parent.name}.jsonl"),
@@ -651,8 +653,9 @@ def test_slice_lane_verification_harvests_before_reading_the_branch(
             "dispatch_base": base,
             "verification": {"contract": contract},
         },
-        job={
-            "task": "clone-623",
+            job={
+                "job_id": _JOB_ID,
+                "task": "clone-623",
             "branch": _BRANCH,
             "worktree": str(workspace),
             "log_path": str(tmp_path / "logs" / f"{bundle.parent.name}.jsonl"),

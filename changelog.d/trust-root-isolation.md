@@ -8,4 +8,6 @@
   identity golden tests.
 - Routed commit, review, gate, and event slot paths through the canonical lexical
   slot helper; redirected roots and symlinked parents now fail closed. The scaffold
-  command also creates root-owned Codex config/plugins/skills control inputs.
+  command also creates root-owned Codex config/plugins/skills/hooks control inputs.
+- Bound every slot basename to the same digest-bearing instance key used by systemd
+  `%i`; harvest now selects the slot only from Manager registry `job_id`.

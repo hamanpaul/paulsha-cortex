@@ -447,7 +447,10 @@ class PreSeedGuardTests(unittest.TestCase):
         gate 這格建不起來的錯位。"""
         from paulsha_cortex.coordinator import job_workspace
 
-        job = {"log_path": "/var/lib/cortex/runtime/dispatch/psc-0629-build.jsonl"}
+        job = {
+            "job_id": "psc-0629-build",
+            "log_path": "/var/lib/cortex/runtime/dispatch/psc-0629-build.jsonl",
+        }
         self.assertEqual(
             gate_runner.spool_key_for_job(job), job_workspace.spool_key_for_job(job)
         )
@@ -722,7 +725,10 @@ class GateExecutionTests(unittest.TestCase):
             self.assertNotEqual(source, snapshot)
             # 副本落在 gate 自己的 pool，不在被驗的樹裡面。
             self.assertIn("/gate-worktree/", snapshot)
-            self.assertTrue(snapshot.endswith("/psc-0629-build"), snapshot)
+            self.assertTrue(
+                snapshot.endswith("/" + job_runner.template_instance_id("psc-0629-build")),
+                snapshot,
+            )
             self.assertFalse(snapshot.startswith(source))
 
     def test_the_gate_env_carries_the_declaration_but_not_the_identity_config(self) -> None:

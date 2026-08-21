@@ -590,11 +590,9 @@ def commit_bundle_path(
 def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     """從 job 記錄推導出這個 job 在 dispatch 當下用的 spool key。
 
-    **推導規則只有一條**：`Path(job["log_path"]).stem`。理由是那正是
-    `launcher.launch()` 收到的 `slice_id`——它同時決定了 exit sentinel
-    （`<log_dir>/<slice_id>.exit`）與 gate ledger（`terminal_contract.
-    gate_ledger_path(log_path)`）的落點，本模組沿用同一條規則，spool 就不會與
-    那兩者漂移。
+    **推導規則只有一條**：Manager registry 的 ``job_id``。log path、payload text
+    與 caller 自述都不是 slot authority；它們可能仍使用舊的 raw launch key，不能
+    反向決定 systemd ``%i`` 所指的 owned slot。
 
     這件事必須是**單一規則**：canonical lane 的 launch key 是 job_id，slice lane
     的是 slice_id，兩條 lane 若各自在回收端「猜」自己的 key，任何一邊改名都會退化成
@@ -602,16 +600,15 @@ def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     lane 共用同一個推導，且該欄位由 `registry.attach_launch_handle` 在 launch 當下
     寫入，與 spool 的建立點同源。
 
-    job 還沒 launch（沒有 `log_path`）時回 None——沒有 spool，也沒有東西可回收。
+    job 還沒取得 registry identity 時回 None——沒有可採信的 spool authority。
     """
 
-    log_path = job.get("log_path")
-    if not isinstance(log_path, str) or not log_path.strip():
+    job_id = job.get("job_id")
+    if not isinstance(job_id, str) or not job_id.strip():
         return None
-    stem = Path(log_path).stem
-    if _SPOOL_KEY_RE.fullmatch(stem) is None:
+    if _SPOOL_KEY_RE.fullmatch(job_id) is None:
         return None
-    return stem
+    return job_id
 
 
 def commit_bundle_path_for_job(

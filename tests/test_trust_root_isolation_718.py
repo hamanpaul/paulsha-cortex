@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from paulsha_cortex.coordinator import spool_slot
+from paulsha_cortex.coordinator import job_runner
 from paulsha_cortex.trust_root import permgen
 
 
@@ -43,12 +44,11 @@ def test_one_canonical_table_covers_every_declared_writable_surface() -> None:
 
 def test_all_consumers_are_derived_from_the_same_surface_rows() -> None:
     rows = _surfaces()
-    row_ids = {row.surface_id for row in rows}
-
-    assert set(permgen.generated_writable_surface_ids()) == row_ids
-    assert set(permgen.provisioned_writable_surface_ids()) == row_ids
-    assert set(permgen.run_under_writable_surface_ids()) == row_ids
-    assert set(permgen.probe_writable_surface_ids()) == row_ids
+    rendered = permgen.render_job_writable_properties(instance="job-a")
+    assert rendered == tuple(
+        f"ReadWritePaths={spool_slot.canonical_job_slot(row.surface_id, 'job-a')}"
+        for row in rows
+    )
 
 
 @pytest.mark.parametrize("surface_id", EXPECTED_SURFACES)
@@ -56,8 +56,8 @@ def test_canonical_slot_is_instance_scoped_and_rejects_unsafe_identity(surface_i
     own = spool_slot.canonical_job_slot(surface_id, "job-a")
     foreign = spool_slot.canonical_job_slot(surface_id, "job-b")
     assert own != foreign
-    assert own.name == "job-a"
-    assert foreign.name == "job-b"
+    assert own.name == job_runner.template_instance_id("job-a")
+    assert foreign.name == job_runner.template_instance_id("job-b")
     assert own.parent == foreign.parent
 
     for unsafe in ("", ".", "..", "job/a", "job\\a", "job\x00a", "job a"):
@@ -68,11 +68,29 @@ def test_canonical_slot_is_instance_scoped_and_rejects_unsafe_identity(surface_i
 def test_slot_template_contains_concrete_instance_and_never_the_writable_root() -> None:
     rows = _surfaces()
     for row in rows:
-        rendered = row.slot_template.replace("%i", "job-a")
+        rendered = row.slot_template.replace("%i", job_runner.template_instance_id("job-a"))
         assert "%i" not in rendered
-        assert rendered.endswith("/job-a")
+        assert rendered.endswith("/" + job_runner.template_instance_id("job-a"))
         assert rendered != row.writable_root
         assert not rendered.startswith(row.writable_root + "/job-a/job-a")
+
+
+@pytest.mark.parametrize("surface_id", EXPECTED_SURFACES)
+def test_every_surface_slot_matches_the_systemd_instance(surface_id: str) -> None:
+    raw_job_id = "wf-32bb2160d8-subagent-build-69"
+    slot = spool_slot.canonical_job_slot(surface_id, raw_job_id)
+    assert slot.name == job_runner.template_instance_id(raw_job_id)
+
+
+def test_event_producer_uses_explicit_surface_root_once(tmp_path) -> None:
+    from paulsha_cortex.monitor.event_spool import EventSpool
+
+    root = tmp_path / "event-spool"
+    spool = EventSpool(root, job_id="wf-32bb2160d8-subagent-build-69")
+    assert spool.root.parent == root
+    assert spool.root.name == job_runner.template_instance_id(
+        "wf-32bb2160d8-subagent-build-69"
+    )
 
 
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
