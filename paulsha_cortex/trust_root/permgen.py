@@ -823,6 +823,23 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
         filtered_syscalls=("pkey_alloc",),
         api_hosts=(
             EgressHost(
+                "api.individual.githubcopilot.com",
+                evidence=(
+                    "2026-08-21/22 實機（Copilot CLI 1.0.80 authenticated "
+                    "`gpt-5.4/xhigh` controlled-egress run）：proxy log 逐字 "
+                    "`CONNECT api.individual.githubcopilot.com:443`（當時 canonical "
+                    "白名單不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "telemetry.individual.githubcopilot.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT telemetry.individual.githubcopilot.com:443`（當時 "
+                    "canonical 白名單不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
                 "api.githubcopilot.com",
                 evidence=(
                     "**未實機量測**：本部署沒有 copilot 的登入態，量不到它真的請求哪些主機。"
@@ -869,6 +886,46 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
                 "antigravity-unleash.goog",
                 evidence=(
                     "0819 同一次量測，proxy log 逐字 `CONNECT antigravity-unleash.goog:443` ×2。"
+                ),
+            ),
+            EgressHost(
+                "oauth2.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 實機（agy authenticated Gemini review path）：proxy log "
+                    "逐字 `CONNECT oauth2.googleapis.com:443`（當時 canonical 白名單不含"
+                    "它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "daily-cloudcode-pa.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT daily-cloudcode-pa.googleapis.com:443`（當時 "
+                    "canonical 白名單不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "cloudcode-pa.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT cloudcode-pa.googleapis.com:443`（當時 canonical 白名單"
+                    "不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "www.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT www.googleapis.com:443`（當時 canonical 白名單不含它 ⇒ "
+                    "DENY）。"
+                ),
+            ),
+            EgressHost(
+                "lh3.googleusercontent.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT lh3.googleusercontent.com:443`（當時 canonical 白名單不含"
+                    "它 ⇒ DENY）。"
                 ),
             ),
             EgressHost(
