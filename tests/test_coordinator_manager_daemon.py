@@ -109,6 +109,7 @@ class FakeRegistry:
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
+        template_instance: str | None = None,
     ) -> dict:
         for job in self._jobs:
             if job["job_id"] == job_id:
@@ -118,6 +119,7 @@ class FakeRegistry:
                 job["session_name"] = session_name
                 job["pid"] = pid
                 job["log_path"] = log_path
+                job["template_instance"] = template_instance
                 return dict(job)
         raise KeyError(job_id)
 

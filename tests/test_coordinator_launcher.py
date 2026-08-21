@@ -1629,6 +1629,7 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(spec["instance"], instance)
         self.assertTrue(spec["unit"].endswith(f"@{instance}.service"))
         self.assertEqual(spec["log_path"], handle.log_path)
+        self.assertEqual(handle.template_instance, instance)
         self.assertEqual(handle.control_log_path, expected_control_log)
         self.assertEqual(confirmed["log_path"], expected_control_log)
         self.assertEqual(confirmed["job_log_path"], handle.log_path)

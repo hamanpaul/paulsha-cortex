@@ -574,6 +574,7 @@ class JobRegistry:
             "review_verdict_channel",
             "runtime_principal", "runtime_mode", "runtime_surface",
             "prompt_path",
+            "template_instance",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
@@ -627,6 +628,17 @@ class JobRegistry:
             raise ValueError(
                 f"coordinator 狀態檔 prompt_path 格式錯誤（fail-closed）: {self._state_path}"
             )
+        template_instance = job.get("template_instance")
+        if template_instance is not None:
+            from . import job_workspace
+
+            if (
+                not isinstance(template_instance, str)
+                or not job_workspace.job_segment_valid(template_instance)
+            ):
+                raise ValueError(
+                    f"coordinator 狀態檔 template_instance 格式錯誤（fail-closed）: {self._state_path}"
+                )
         runtime_diagnostic = job.get("runtime_diagnostic")
         if runtime_diagnostic is not None and (
             not isinstance(runtime_diagnostic, dict)
@@ -1012,6 +1024,9 @@ class JobRegistry:
             "session_name": session_name,
             "pid": pid,
             "log_path": log_path,
+            # Template launches persist the exact Manager-issued `%i` here so
+            # harvest never has to guess from job_id/session/log payload text.
+            "template_instance": None,
             # Template launches persist a separate Manager-only completion
             # anchor because their canonical JSONL log lives in a job-writable
             # spool.  Legacy/direct rows leave this unset and use log_path.
@@ -1199,6 +1214,7 @@ class JobRegistry:
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
+        template_instance: str | None = None,
         runtime_principal: str | None = None,
         runtime_mode: str | None = None,
         runtime_surface: str | None = None,
@@ -1215,6 +1231,7 @@ class JobRegistry:
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path
+        job["template_instance"] = template_instance
         job["runtime_principal"] = runtime_principal
         job["runtime_mode"] = runtime_mode
         job["runtime_surface"] = runtime_surface

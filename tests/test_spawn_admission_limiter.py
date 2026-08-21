@@ -357,7 +357,7 @@ class _FakeRegistry:
         return dict(job)
 
     def attach_launch_handle(self, job_id, *, executor=None, model_id=None, session_name=None,
-                              pid=None, log_path=None) -> dict:
+                              pid=None, log_path=None, template_instance=None) -> dict:
         for job in self._jobs:
             if job["job_id"] == job_id:
                 job["executor"] = executor
@@ -366,6 +366,7 @@ class _FakeRegistry:
                 job["session_name"] = session_name
                 job["pid"] = pid
                 job["log_path"] = log_path
+                job["template_instance"] = template_instance
                 return dict(job)
         raise KeyError(job_id)
 

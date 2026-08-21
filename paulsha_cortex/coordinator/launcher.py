@@ -621,6 +621,9 @@ class LaunchHandle:
     session_name: str
     pid: int
     log_path: str
+    #: Exact Manager-issued template instance used as spool authority.
+    #: ``None`` is valid for non-template launches.
+    template_instance: str | None = None
     #: Typed runtime identity used by the Manager harvest path.  ``None`` is
     #: intentional for direct/non-Codex jobs; they must never be guessed from
     #: workflow kind or persona text.
@@ -2212,6 +2215,7 @@ class SubprocessLauncher:
             session_name=slice_id,
             pid=proc.pid,
             log_path=log_path,
+            template_instance=template_plan.instance if template_plan is not None else None,
             runtime_principal=runtime_principal if degraded else None,
             runtime_mode=runner_mode,
             runtime_surface=(

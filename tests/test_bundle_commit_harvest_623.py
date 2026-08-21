@@ -457,7 +457,7 @@ def test_spool_key_rejects_a_path_traversing_identifier(tmp_path: Path) -> None:
 def test_spool_key_is_derived_from_the_same_identifier_launch_used(
     tmp_path: Path,
 ) -> None:
-    """launch 端與回收端**同一條**推導規則：`Path(log_path).stem`。
+    """launch 端與回收端**同一條**推導規則：template lane 用持久化 authority。
 
     canonical lane 的 launch key 是 job_id、slice lane 的是 slice_id；兩條 lane 若
     各自在回收端猜自己的 key，任何一邊改名都會退化成「找不到 spool → 靜默不回收」。
