@@ -819,7 +819,7 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
         note="自帶原生執行檔，**不因 node 版本而行為改變**——node 的版本風險不涵蓋它。",
     ),
     ExecutorTool(
-        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=False,
+        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=True,
         filtered_syscalls=("pkey_alloc",),
         api_hosts=(
             EgressHost(
@@ -845,8 +845,13 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
             "shell script，但**內部再 exec node**（#643 實機量測確認：完整加固面下 "
             "`--version` 空輸出，單獨拿掉 `MemoryDenyWriteExecute` 即正常，與 codex "
             "的症狀逐字相同）。因此它同樣吃系統層 node 的版本風險，加固剖面也與 "
-            "`codex` 同一份。安裝時仍應 `head -n 20` 查一次它實際 exec 什麼——它可能"
-            "再叫別的程式，該相依同樣要在 job 的 PATH 上或一併搬進 toolchain。"
+            "`codex` 同一份。\n"
+            "部署樹**不能只搬這層 shell wrapper**：那樣 wrapper 內部仍可能再解一次 "
+            "`copilot`／`node`，靜默跌回 PATH 上別的版本。必須沿 operator 實際在用的 "
+            "入口往上解到**含 `package.json` 的 npm 套件根**，整包複製後再以 "
+            "root-owned wrapper 直接 exec 部署時驗過的**系統層絕對 node 路徑**；"
+            "wrapper 本身不得再帶 `/usr/bin/env node`、`toolchain/bin/node`、"
+            "`--jitless` 或 `NODE_OPTIONS`。"
         ),
     ),
     ExecutorTool(
@@ -7806,19 +7811,47 @@ def build_toolchain_plan(
             "# operator 實際在用的那一份",
         ]
         if tool.copy_tree:
-            lines += [
-                "#   整包搬（單搬進入點會缺 node_modules）：先找出套件根，再整棵複製——",
-                f'#     PKG="$(cd "$(dirname "$SRC")/.." && pwd)"',
-                f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
-                f"#     ln -sfn {layout.toolchain_lib}/{tool.name}/<套件內的進入點>"
-                f" {layout.toolchain_bin}/{tool.name}",
-                "#   落定後確認進入點的 shebang 解得開：`head -n 1` 應為 "
-                "`#!/usr/bin/env node`，且 `command -v node` 落在系統層。",
-                f"#   ⚠️ `{layout.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 "
-                "symlink**，不是把進入點複製出來的單檔（#661 實測）：ESM 的相對 "
-                "import、以及「從 `which()` 往上找 `package.json`」這類套件根解析，"
-                "靠的都是 `readlink -f` 之後落在套件樹裡的那條路徑。",
-            ]
+            if tool.name == "copilot":
+                lines += [
+                    "#   Copilot 的 operator 入口本身是 shell wrapper；部署樹不直接搬那支",
+                    "#   wrapper，而是沿著已選入口往上解到**含 package.json 的套件根**，",
+                    "#   整包複製後再產一支 root-owned wrapper，直接 exec 部署時驗過的",
+                    "#   **系統層絕對 node 路徑**（不是 `env node`、不是 toolchain shadow）。",
+                    '#     PKG="$SRC"',
+                    '#     while [ "$PKG" != "/" ] && [ ! -f "$PKG/package.json" ]; do PKG="$(dirname "$PKG")"; done',
+                    '#     test -f "$PKG/package.json"',
+                    '#     ENTRY_REL="${SRC#"$PKG"/}"',
+                    '#     test "$ENTRY_REL" != "$SRC"',
+                    '#     NODE_ABS="$(readlink -f "$(command -v node)")"',
+                    '#     test -n "$NODE_ABS" && test "${NODE_ABS#/}" != "$NODE_ABS"',
+                    f'#     case "$NODE_ABS" in {layout.toolchain_root}/*) echo "node must stay system-level" >&2; exit 1 ;; esac',
+                    f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                    f'#     test -f {layout.toolchain_lib}/{tool.name}/"$ENTRY_REL"',
+                    f"#     cat > {layout.toolchain_bin}/{tool.name} <<EOF",
+                    "#     #!/bin/sh",
+                    f'#     exec $NODE_ABS "{layout.toolchain_lib}/{tool.name}/$ENTRY_REL" "\\$@"',
+                    "#     EOF",
+                    f"#     chmod 0755 {layout.toolchain_bin}/{tool.name}",
+                    f"#   fail-closed probes：`test -x {layout.toolchain_bin}/{tool.name}`、"
+                    f"`! grep -Eq '/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|"
+                    f"/usr/bin/copilot|command -v copilot' {layout.toolchain_bin}/{tool.name}`、"
+                    f"`{layout.toolchain_bin}/{tool.name} --version`、"
+                    "`$NODE_ABS -e 'new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))'`。",
+                ]
+            else:
+                lines += [
+                    "#   整包搬（單搬進入點會缺 node_modules）：先找出套件根，再整棵複製——",
+                    f'#     PKG="$(cd "$(dirname "$SRC")/.." && pwd)"',
+                    f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                    f"#     ln -sfn {layout.toolchain_lib}/{tool.name}/<套件內的進入點>"
+                    f" {layout.toolchain_bin}/{tool.name}",
+                    "#   落定後確認進入點的 shebang 解得開：`head -n 1` 應為 "
+                    "`#!/usr/bin/env node`，且 `command -v node` 落在系統層。",
+                    f"#   ⚠️ `{layout.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 "
+                    "symlink**，不是把進入點複製出來的單檔（#661 實測）：ESM 的相對 "
+                    "import、以及「從 `which()` 往上找 `package.json`」這類套件根解析，"
+                    "靠的都是 `readlink -f` 之後落在套件樹裡的那條路徑。",
+                ]
         else:
             lines += [
                 f'#     cp -a "$SRC" {layout.toolchain_bin}/{tool.name}',
@@ -8678,8 +8711,15 @@ def build_path_resolution_probe(
             f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c '{case.executor} --version'",
             f"{case.version_reference} --version",
             "#   期望：**兩行逐字相同**（PATH 解出來的那支 == 登記表登記的那支）。",
-            "",
         ]
+        if case.executor == "copilot":
+            lines += [
+                "#   Copilot 額外不變式：wrapper 內的 node 必須是**絕對系統層路徑**，",
+                "#   不得含 env-node / toolchain shadow / --jitless / NODE_OPTIONS / PATH fallback，",
+                "#   且同一支 node 必須跑得起最小 WebAssembly 模組。",
+                f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'NODE_ABS=\"$(awk \"/^exec /{{print \\$2; exit}}\" {case.expected_binary})\"; test -n \"$NODE_ABS\"; test -x \"$NODE_ABS\"; case \"$NODE_ABS\" in /*) ;; *) exit 1 ;; esac; case \"$NODE_ABS\" in {layout.toolchain_root}/*) exit 1 ;; esac; ! grep -Eq \"/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|/usr/bin/copilot|command -v copilot\" {case.expected_binary}; PATH_VERSION=\"$({case.executor} --version)\"; test -n \"$PATH_VERSION\"; REF_VERSION=\"$({case.expected_binary} --version)\"; test -n \"$REF_VERSION\"; [ \"$PATH_VERSION\" = \"$REF_VERSION\" ]; \"$NODE_ABS\" -e \"new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))\"'",
+            ]
+        lines.append("")
     lines += _wrap_comment(
         "gate 角色同樣在矩陣內，而且不是湊數：gate 宣告的 "
         "`PSC_GATE_CMD_PYTEST=\"python3 -m pytest -q\"` 是相對名，同樣走 PATH 解析"

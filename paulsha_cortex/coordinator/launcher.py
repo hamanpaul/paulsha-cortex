@@ -750,6 +750,19 @@ def _verdict_spool_add_dirs(
     return (str(path.resolve()),)
 
 
+_VALID_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_COPILOT_DEFAULT_EFFORT = "xhigh"
+
+
+def _resolve_reasoning_effort(*, executor: str, effort: str | None, default: str) -> str:
+    resolved = effort or default
+    if resolved not in _VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"{executor} executor effort must be one of {sorted(_VALID_REASONING_EFFORTS)}, got {resolved!r}"
+        )
+    return resolved
+
+
 def build_copilot_argv(
     *,
     prompt: str,
@@ -763,6 +776,7 @@ def build_copilot_argv(
     review_only: bool = False,
     commit_required: bool = False,
     verdict_spool_dir: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required Copilot builder requires enforced workspace-write")
@@ -772,6 +786,11 @@ def build_copilot_argv(
         if worktree is None:
             raise ValueError("commit-required Copilot builder requires a worktree")
         worktree = str(Path(worktree).resolve())
+    resolved_effort = _resolve_reasoning_effort(
+        executor="copilot",
+        effort=effort,
+        default=_COPILOT_DEFAULT_EFFORT,
+    )
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
     argv = [
@@ -788,6 +807,7 @@ def build_copilot_argv(
     ]
     if model is not None:
         argv += ["--model", model]
+    argv += ["--effort", resolved_effort]
     if commit_required:
         argv.append("--allow-all-tools")
         argv += ["--add-dir", worktree]
@@ -1142,7 +1162,7 @@ def build_agy_argv(
 # llm-share env（含 `COPILOT_MODEL=glm-5.2`），這裡的常數只是 argv 沒收到明確
 # `model` 時的落地預設，實際身分仍由 operator 的 env file 決定。
 _CG_DEFAULT_MODEL = "glm-5.2"
-_CG_VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CG_VALID_EFFORTS = _VALID_REASONING_EFFORTS
 _CG_DEFAULT_EFFORT = "medium"
 
 
@@ -1184,11 +1204,11 @@ def build_cg_argv(
         raise ValueError("cg executor is zero-tool and cannot commit")
     if not (read_only or review_only):
         raise ValueError("cg executor requires read-only or review-only mode")
-    resolved_effort = effort or _CG_DEFAULT_EFFORT
-    if resolved_effort not in _CG_VALID_EFFORTS:
-        raise ValueError(
-            f"cg executor effort must be one of {sorted(_CG_VALID_EFFORTS)}, got {resolved_effort!r}"
-        )
+    resolved_effort = _resolve_reasoning_effort(
+        executor="cg",
+        effort=effort,
+        default=_CG_DEFAULT_EFFORT,
+    )
     return [
         "cg",
         "--model",
@@ -1308,10 +1328,9 @@ class SubprocessLauncher:
         # `cortex-builder` 起跑（它就是 builder，只是這一張卡不寫檔）。
         self._write_forbidden = write_forbidden
         self._review_terminal_kind = review_terminal_kind
-        # cg-only：`--effort low|medium|high|xhigh`。其餘 executor 沒有對應概念
-        # （不同於 `model`，本 repo 目前沒有既有的「effort 來源」可直接映射），
-        # 存下不驗證——合法值集合在 `build_cg_argv` 驗證，未指定時落地預設
-        # `_CG_DEFAULT_EFFORT`；非 cg 的 executor 忽略此欄位。
+        # copilot/cg 共用：兩者都接受 `--effort low|medium|high|xhigh`，但預設不同
+        # （copilot = xhigh；cg = medium）。其餘 executor 沒有對應旗標，因此這裡只
+        # 保留原值，實際合法值與預設都交給各自的 argv builder 驗證。
         self._effort = effort
         # trust-root Phase 2a：本 job 專屬的 verdict spool 目錄（唯一額外放行的
         # 寫入路徑）。None ＝ 不放行任何 worktree 之外的寫入（既有行為）。
@@ -1792,7 +1811,7 @@ class SubprocessLauncher:
             # Claude's complete workflow envelope can exceed Linux's per-argv
             # limit.  The wrapper receives it over stdin instead.
             builder_kwargs["prompt_via_stdin"] = True
-        if self._executor == "cg":
+        if self._executor in {"copilot", "cg"}:
             builder_kwargs["effort"] = self._effort
         # #714 缺陷 2：只有 codex 有 `--output-last-message`。其餘 executor 沒有這個
         # 落點，傳過去只會是一個沒人接的 kwarg（形狀與既有的 `verdict_spool_dir`／

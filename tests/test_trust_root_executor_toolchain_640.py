@@ -33,6 +33,7 @@ from __future__ import annotations
 import inspect
 import os
 import stat
+import unittest
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,7 @@ from paulsha_cortex.trust_root.permgen import (
     build_job_unit,
     build_manager_unit,
     build_monitor_unit,
+    build_path_resolution_probe,
     build_toolchain_plan,
     generate_plan,
     unreachable_hops,
@@ -455,6 +457,7 @@ def test_only_the_node_script_executor_depends_on_the_system_runtime() -> None:
     assert by_name["claude"].shape is ExecutorShape.NATIVE_ELF
     assert by_name["agy"].shape is ExecutorShape.NATIVE_ELF
     assert by_name["copilot"].shape is ExecutorShape.SHELL_SCRIPT
+    assert by_name["copilot"].copy_tree, "copilot 的 wrapper 不得再跌回 PATH 上別的套件樹"
 
 
 def test_job_path_puts_the_toolchain_first() -> None:
@@ -531,6 +534,57 @@ def test_toolchain_plan_names_every_executor_and_the_version_pitfall() -> None:
     assert "command -v" in text
     assert "npm install -g" in text, "「不要另裝一份」這句必須寫在產物裡"
     assert DEFAULT_LAYOUT.job_path_value() in text
+
+
+class CopilotToolchainPlanTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.plan_text = "\n".join(build_toolchain_plan(THREE_WAY_SCHEME, DEFAULT_LAYOUT))
+        cls.path_probe_text = "\n".join(
+            build_path_resolution_probe(THREE_WAY_SCHEME, DEFAULT_LAYOUT)
+        )
+        cls.by_name = {tool.name: tool for tool in EXECUTOR_TOOLS}
+
+    def test_copilot_is_copied_as_a_package_tree(self) -> None:
+        copilot = self.by_name["copilot"]
+        self.assertEqual(copilot.shape, ExecutorShape.SHELL_SCRIPT)
+        self.assertTrue(copilot.copy_tree)
+
+    def test_copilot_plan_freezes_package_root_and_absolute_node_wrapper(self) -> None:
+        self.assertIn(
+            'while [ "$PKG" != "/" ] && [ ! -f "$PKG/package.json" ]',
+            self.plan_text,
+        )
+        self.assertIn('ENTRY_REL="${SRC#"$PKG"/}"', self.plan_text)
+        self.assertIn('NODE_ABS="$(readlink -f "$(command -v node)")"', self.plan_text)
+        self.assertIn(
+            f"#     cat > {DEFAULT_LAYOUT.toolchain_bin}/copilot <<EOF",
+            self.plan_text,
+        )
+        self.assertIn(
+            f'#     exec $NODE_ABS "{DEFAULT_LAYOUT.toolchain_lib}/copilot/$ENTRY_REL" "\\$@"',
+            self.plan_text,
+        )
+        self.assertIn(
+            "/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|"
+            "/usr/bin/copilot|command -v copilot",
+            self.plan_text,
+        )
+
+    def test_copilot_probe_uses_the_wrapper_node_for_webassembly(self) -> None:
+        self.assertIn('awk "/^exec /{print \\$2; exit}"', self.path_probe_text)
+        self.assertIn(
+            'case "$NODE_ABS" in /*) ;; *) exit 1 ;; esac',
+            self.path_probe_text,
+        )
+        self.assertIn(
+            f'case "$NODE_ABS" in {DEFAULT_LAYOUT.toolchain_root}/*) exit 1 ;; esac',
+            self.path_probe_text,
+        )
+        self.assertIn(
+            "new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))",
+            self.path_probe_text,
+        )
 
 
 def test_toolchain_cli_verb_prints_the_plan(capsys) -> None:

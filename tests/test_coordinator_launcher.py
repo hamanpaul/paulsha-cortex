@@ -30,6 +30,8 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("slice-a", argv)
         self.assertIn("--output-format", argv)
         self.assertIn("json", argv)
+        self.assertEqual(argv.count("--effort"), 1)
+        self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
 
     def test_copilot_builder_commit_required_scopes_tool_and_git_write_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -1377,10 +1379,25 @@ class ArgvTests(unittest.TestCase):
             launcher_module._ARGV_BUILDERS.update(orig_builders)
 
 
-    def test_copilot_argv_model(self) -> None:
-        argv = build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", model="claude-haiku-4.5")
+    def test_copilot_argv_model_and_default_effort(self) -> None:
+        argv = build_copilot_argv(prompt="P", slice_id="s", log_dir="/lg", model="gpt-5.4")
         self.assertIn("--model", argv)
-        self.assertEqual(argv[argv.index("--model") + 1], "claude-haiku-4.5")
+        self.assertEqual(argv[argv.index("--model") + 1], "gpt-5.4")
+        self.assertEqual(argv.count("--effort"), 1)
+        self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+        self.assertLess(argv.index("--model"), argv.index("--effort"))
+
+    def test_copilot_argv_explicit_effort(self) -> None:
+        argv = build_copilot_argv(
+            prompt="P", slice_id="s", log_dir="/lg", model="gpt-5.4", effort="high",
+        )
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
+
+    def test_copilot_argv_rejects_invalid_effort(self) -> None:
+        with self.assertRaisesRegex(ValueError, "effort must be one of"):
+            build_copilot_argv(
+                prompt="P", slice_id="s", log_dir="/lg", effort="ultra",
+            )
 
     def test_argv_no_model_when_unset(self) -> None:
         for build in (build_copilot_argv, build_claude_argv, build_codex_argv):
@@ -1434,13 +1451,47 @@ class ArgvTests(unittest.TestCase):
         launcher_module.subprocess.Popen = _fake_popen
         try:
             with tempfile.TemporaryDirectory() as d:
-                SubprocessLauncher("copilot", model="claude-haiku-4.5").launch(
-                    slice_id="s", prompt="P", worktree=d, log_dir=d
-                )
+                with mock.patch.object(
+                    launcher_module.job_workspace,
+                    "prepare_commit_spool",
+                    return_value=Path(d) / "bundle",
+                ):
+                    SubprocessLauncher("copilot", model="gpt-5.4").launch(
+                        slice_id="s", prompt="P", worktree=d, log_dir=d
+                    )
         finally:
             launcher_module.subprocess.Popen = original
         script = captured["argv"][2]
-        self.assertIn("--model claude-haiku-4.5", script)
+        self.assertIn("--model gpt-5.4", script)
+        self.assertIn("--effort xhigh", script)
+        self.assertEqual(script.count("--effort"), 1)
+
+    def test_subprocess_launcher_passes_effort_to_copilot_argv(self) -> None:
+        captured = {}
+
+        class _FakeProc:
+            pid = 4322
+
+        def _fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                with mock.patch.object(
+                    launcher_module.job_workspace,
+                    "prepare_commit_spool",
+                    return_value=Path(d) / "bundle",
+                ):
+                    SubprocessLauncher("copilot", effort="high").launch(
+                        slice_id="s", prompt="P", worktree=d, log_dir=d
+                    )
+        finally:
+            launcher_module.subprocess.Popen = original
+        script = captured["argv"][2]
+        self.assertIn("--effort high", script)
 
     def _seed_template_builder_runtime(self, root: Path) -> None:
         canonical = root / "codex-controls" / "builder"
