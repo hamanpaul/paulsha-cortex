@@ -18,6 +18,7 @@ WORK_ACTIONS = frozenset(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+        "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
         "intake",
     }
@@ -183,7 +184,7 @@ def validate_request(payload: dict[str, Any]) -> dict[str, Any]:
                 or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", card) is None
             ):
                 raise ValueError("work-action retry-card requires exact card id")
-        if action in {"abandon", "retire-delivered"}:
+        if action in {"abandon", "retire-delivered", "recover-superseded"}:
             expected_run_id = args.get("expected_run_id")
             actor = args.get("actor")
             reason = args.get("reason")

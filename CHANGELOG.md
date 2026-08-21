@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#776 補遺：`recover-superseded` 補進 control contract 白名單**（驗證分支與 porcelain choices 同步）。
 - **#776（#765 第八處）：resume 穩定識別容忍 run 自產 openspec 落地 authority**——不再 supersede 已驗證 run；新增 `work recover-superseded` 撿回被誤作廢的 run（official authority-restart 語意）。
 - **#765（intake 回寫）：`fix-read-repo-tier-fail-closed` openspec change 回寫 main**——monitor 只掃 main，change 僅在 candidate 導致 `mapped_openspec` 恆空、ship 卡 target 計數；檔案與 PR #764 byte-identical。
 - **#765 補遺：review 對 builder job 的綁定改跨 era（#216 AC5 落實）**——build 產物不再因 authority 前進成孤兒。
