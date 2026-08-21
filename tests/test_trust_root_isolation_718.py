@@ -8,6 +8,7 @@ They must remain failing until that table and its consumers are implemented.
 from __future__ import annotations
 
 import pytest
+import os
 import subprocess
 import sys
 
@@ -180,6 +181,151 @@ def test_claude_workflow_prompt_is_not_an_argv_element() -> None:
     )
     assert "cat | claude -p" in script
     assert prompt not in script
+
+
+def test_private_prompt_file_survives_real_oversized_launch(tmp_path) -> None:
+    """The >MAX_ARG_STRLEN path reaches a child byte-for-byte without argv/stdin."""
+    from paulsha_cortex.coordinator.launcher import build_wrapper_script
+
+    prompt = "workflow-sentinel-" + ("x" * 140_000)
+    prompt_file = tmp_path / ".prompt-job-a"
+    output_file = tmp_path / "child-bytes"
+    sentinel = tmp_path / "job.exit"
+    prompt_file.write_bytes(prompt.encode())
+    child = [
+        sys.executable,
+        "-c",
+        (
+            "import pathlib,sys; "
+            f"pathlib.Path({str(output_file)!r}).write_bytes(sys.stdin.buffer.read())"
+        ),
+    ]
+    script = build_wrapper_script(
+        inner_argv=child,
+        prompt_file=str(prompt_file),
+        sentinel=str(sentinel),
+        ledger=str(tmp_path / "ledger"),
+        worktree=str(tmp_path),
+        repo_root=None,
+        run_gates=False,
+    )
+    assert prompt not in script
+    subprocess.run(["bash", "-c", script], check=True)
+    assert output_file.read_bytes() == prompt.encode()
+    assert sentinel.read_text() == "0"
+
+
+def test_private_prompt_bound_fails_closed_before_publish(tmp_path) -> None:
+    path = tmp_path / ".prompt-job-a"
+    with pytest.raises(job_runner.JobRunnerError) as excinfo:
+        job_runner.write_job_prompt(
+            str(path), "too-large", max_bytes=1
+        )
+    assert excinfo.value.diagnostic.reason == "job-runner-prompt-too-large"
+    assert not path.exists()
+
+
+def test_manager_exit_recorder_removes_private_prompt_after_termination(tmp_path) -> None:
+    prompt = tmp_path / ".prompt-job-a"
+    prompt.write_text("small\n")
+    sentinel = tmp_path / "exit"
+    argv = job_runner.build_manager_exit_recorder_argv(
+        client_argv=["bash", "-c", "exit 0"],
+        sentinel=str(sentinel),
+        cleanup_path=str(prompt),
+    )
+    subprocess.run(argv, check=True)
+    assert not prompt.exists()
+    assert sentinel.read_text() == "0"
+
+
+def test_codex_reasoning_effort_is_explicit_for_pinned_models() -> None:
+    from paulsha_cortex.coordinator.launcher import build_codex_argv
+
+    luna = build_codex_argv(
+        prompt="PROMPT", slice_id="job-a", log_dir="/tmp", model="gpt-5.6-luna"
+    )
+    spark = build_codex_argv(
+        prompt="PROMPT",
+        slice_id="job-b",
+        log_dir="/tmp",
+        model="gpt-5.3-codex-spark",
+    )
+    assert 'model_reasoning_effort="max"' in luna
+    assert 'model_reasoning_effort="xhigh"' in spark
+
+
+@pytest.mark.parametrize(
+    ("principal", "account"),
+    (("builder", "cortex-builder"), ("reviewer", "cortex-reviewer-planner")),
+)
+def test_owner_aware_publisher_real_uid_arms(principal, account, tmp_path) -> None:
+    """Exercise unchanged Manager seed and job-owned atomic refresh as real UIDs."""
+    import shutil
+
+    if os.geteuid() != 0 or shutil.which("runuser") is None or shutil.which("setfacl") is None:
+        pytest.skip("requires root plus deployed builder/reviewer/runuser/setfacl accounts")
+    try:
+        import pwd
+
+        manager_uid = pwd.getpwnam("cortex-manager").pw_uid
+        job_uid = pwd.getpwnam(account).pw_uid
+        foreign = "cortex-reviewer-planner" if account == "cortex-builder" else "cortex-builder"
+        pwd.getpwnam(foreign)
+    except KeyError:
+        pytest.skip("deployed split-UID accounts are unavailable")
+
+    command = spool_slot.publish_runtime_credential_command(
+        manager_account="cortex-manager"
+    )
+    manager_seed_home = tmp_path / f"{principal}-manager-seed"
+    manager_seed_home.mkdir()
+    seed = manager_seed_home / "auth.json"
+    seed.write_bytes(b'{"seed":"manager"}\n')
+    os.chown(manager_seed_home, manager_uid, manager_uid)
+    os.chown(seed, manager_uid, manager_uid)
+    os.chmod(manager_seed_home, 0o711)
+    os.chmod(seed, 0o600)
+    unchanged = subprocess.run(
+        ["runuser", "-u", account, "--", "env", f"CODEX_HOME={manager_seed_home}", "bash", "-c", command],
+        check=False,
+    )
+    assert unchanged.returncode == 0
+    assert seed.read_bytes() == b'{"seed":"manager"}\n'
+    assert subprocess.run(
+        ["runuser", "-u", "cortex-manager", "--", "cat", str(seed)],
+        check=False,
+        capture_output=True,
+    ).stdout == b'{"seed":"manager"}\n'
+
+    job_home = tmp_path / f"{principal}-atomic-refresh"
+    job_home.mkdir()
+    refreshed = job_home / "auth.json"
+    refreshed.write_bytes(b'{"seed":"job-refresh"}\n')
+    os.chown(job_home, job_uid, job_uid)
+    os.chown(refreshed, job_uid, job_uid)
+    os.chmod(job_home, 0o700)
+    os.chmod(refreshed, 0o600)
+    subprocess.run(
+        ["setfacl", "-m", "u:cortex-manager:--x", str(job_home)],
+        check=True,
+    )
+    refreshed_run = subprocess.run(
+        ["runuser", "-u", account, "--", "env", f"CODEX_HOME={job_home}", "bash", "-c", command],
+        check=False,
+    )
+    assert refreshed_run.returncode == 0
+    assert subprocess.run(
+        ["runuser", "-u", "cortex-manager", "--", "cat", str(refreshed)],
+        check=False,
+        capture_output=True,
+    ).stdout == b'{"seed":"job-refresh"}\n'
+    denied = subprocess.run(
+        ["runuser", "-u", foreign, "--", "cat", str(refreshed)],
+        check=False,
+        capture_output=True,
+    )
+    assert denied.returncode != 0
 
 
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
@@ -382,3 +528,54 @@ def test_template_uses_the_canonical_owner_aware_auth_publisher() -> None:
         permgen.FOUR_WAY_SCHEME, principal=permgen.Principal.BUILDER
     )
     assert f"ExecStopPost=/bin/sh -c '{command}'" in unit.content
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        {
+            "credential_publish": True,
+            "runtime_principal": "builder",
+            "runtime_surface": "builder-codex-home",
+        },
+        {"credential_publish": False},
+    ),
+)
+def test_isolated_codex_finalize_fails_closed_with_durable_runtime_diagnostic(
+    tmp_path, monkeypatch, metadata
+) -> None:
+    from paulsha_cortex.coordinator.dispatcher import Dispatcher
+
+    class Registry:
+        def __init__(self) -> None:
+            self.job = {
+                "job_id": "job-a",
+                "executor": "codex",
+                "runtime_mode": "systemd-template",
+                **metadata,
+            }
+            self.updated = None
+
+        def get_job(self, job_id):
+            assert job_id == "job-a"
+            return dict(self.job)
+
+        def update_headless_result(self, job_id, **kwargs):
+            assert job_id == "job-a"
+            self.updated = kwargs
+            return {**self.job, **kwargs}
+
+    monkeypatch.setenv("PSC_COORDINATOR_ROOT", str(tmp_path / "coordinator"))
+    log_path = tmp_path / "job.jsonl"
+    log_path.write_text("")
+    registry = Registry()
+    result = Dispatcher(registry, None, None)._finalize_headless(
+        "job-a", exit_code=0, log_path=str(log_path)
+    )
+    assert result["runtime_diagnostic"]["source"] == "dispatcher._finalize_headless"
+    assert registry.updated["provider_outcome"] is None
+    assert registry.updated["status"] == "failed"
+    assert registry.updated["runtime_diagnostic"]["reason"] in {
+        "runtime-credential-harvest-failed",
+        "runtime-publisher-missing",
+    }

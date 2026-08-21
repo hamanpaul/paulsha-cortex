@@ -196,21 +196,29 @@ def publish_runtime_credential_command(
     # it with a job-owned inode, for which the producer is the only authority
     # permitted to widen the ACL mask for Manager harvest.
     return (
-        f"if test -f {quoted} && test -O {quoted}; then "
+        f"if test -f {quoted} && test ! -L {quoted} && test -O {quoted}; then "
         f"chmod 0640 {quoted} && "
         f"setfacl -m u:{manager_account}:r--,m::r-- {quoted}; fi"
     )
 
 
-def _apply_slot_acl(path: Path, *, account: str, writable: bool) -> None:
+def _apply_slot_acl(
+    path: Path,
+    *,
+    account: str,
+    writable: bool,
+    surface: "PerJobWritableSurface",
+) -> None:
     """Apply ACL without the launcher's mocked ``subprocess.Popen`` surface."""
     binary = shutil.which("setfacl")
     if binary is None or Path(binary).name != "setfacl":
         binary = "/usr/bin/setfacl" if Path("/usr/bin/setfacl").is_file() else None
     if binary is None:
         raise SpoolSlotError("acl", "setfacl is required for per-job runtime projection")
-    perms = "rwX" if writable else "r-X"
-    spec = f"u:{account}:{perms},d:u:{account}:{perms}"
+    perms = surface.acl_perms(writable=writable)
+    spec = f"u:{account}:{perms}"
+    if path.is_dir():
+        spec += f",d:u:{account}:{perms}"
     argv = (binary, "-R", "-m", spec, str(path))
     if os.spawnv(os.P_WAIT, binary, argv) != 0:
         raise SpoolSlotError("acl", f"failed to apply per-job ACL: {path}")
@@ -228,6 +236,13 @@ class PerJobWritableSurface:
     probe: str
     principals: tuple[str, ...]
     asset_id: str
+    # ACL recipes are part of the same typed row as the path and consumer.
+    # Runtime code must not invent a second ``rwX``/``r-X`` table.
+    slot_access_perms: str = "rwX"
+    slot_read_perms: str = "r-X"
+
+    def acl_perms(self, *, writable: bool) -> str:
+        return self.slot_access_perms if writable else self.slot_read_perms
 
     @property
     def writable_root(self) -> str:
@@ -270,6 +285,104 @@ def writable_surface(surface_id: str) -> PerJobWritableSurface:
         raise ValueError(f"unknown writable surface: {surface_id!r}") from exc
 
 
+def _copy_regular_tree(source: Path, destination: Path) -> None:
+    """Copy control bytes into a fresh tree without metadata relationships.
+
+    ``copytree``/``cp -a`` are deliberately not used here: ACLs, xattrs,
+    hardlink identity, symlinks, and special files are all outside the four
+    control inputs.  The destination is built privately, normalized to 0755
+    directories/0644 files, then atomically renamed into the job slot.
+    """
+
+    if source.is_symlink() or not source.is_dir():
+        raise SpoolSlotError("shape", f"control source is not a regular directory: {source}")
+    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise SpoolSlotError("shape", f"control copy temporary path already exists: {temporary}")
+    try:
+        temporary.mkdir(mode=0o755)
+        for entry in sorted(source.rglob("*")):
+            relative = entry.relative_to(source)
+            target = temporary / relative
+            info = entry.lstat()
+            if stat.S_ISLNK(info.st_mode) or not (
+                stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+            ):
+                raise SpoolSlotError("shape", f"control source contains unsupported entry: {entry}")
+            if stat.S_ISDIR(info.st_mode):
+                target.mkdir(mode=0o755)
+                os.chmod(target, 0o755)
+                continue
+            target.parent.mkdir(mode=0o755, exist_ok=True)
+            fd = os.open(str(entry), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                out = os.open(
+                    str(target),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                )
+                try:
+                    with os.fdopen(fd, "rb") as source_file, os.fdopen(out, "wb") as target_file:
+                        shutil.copyfileobj(source_file, target_file)
+                        target_file.flush()
+                        os.fsync(target_file.fileno())
+                    fd = -1
+                    out = -1
+                finally:
+                    if out != -1:
+                        os.close(out)
+            finally:
+                if fd != -1:
+                    os.close(fd)
+            os.chmod(target, 0o644)
+        os.chmod(temporary, 0o755)
+        if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+            raise SpoolSlotError("shape", f"control destination is malformed: {destination}")
+        if destination.exists():
+            shutil.rmtree(destination)
+        # ``rename`` is atomic on the same filesystem and keeps the runtime
+        # projection independent from the job-spec writer's os.replace seam.
+        os.rename(temporary, destination)
+    except BaseException:
+        if temporary.exists() and not temporary.is_symlink():
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def _copy_control_file(source: Path, destination: Path) -> None:
+    """Atomically copy one regular control file with no source metadata."""
+
+    if source.is_symlink() or not source.is_file():
+        raise SpoolSlotError("shape", f"control source is malformed: {source}")
+    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise SpoolSlotError("shape", f"control copy temporary path already exists: {temporary}")
+    try:
+        fd = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            out = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                with os.fdopen(fd, "rb") as source_file, os.fdopen(out, "wb") as target_file:
+                    shutil.copyfileobj(source_file, target_file)
+                    target_file.flush()
+                    os.fsync(target_file.fileno())
+                fd = -1
+                out = -1
+            finally:
+                if out != -1:
+                    os.close(out)
+        finally:
+            if fd != -1:
+                os.close(fd)
+        os.chmod(temporary, 0o644)
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise SpoolSlotError("shape", f"control destination is malformed: {destination}")
+        os.rename(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def provision_runtime_surfaces(
     *, principal: str, job_id: str, canonical_codex_home: str | Path | None = None,
     account: str | None = None,
@@ -295,48 +408,41 @@ def provision_runtime_surfaces(
         if row.surface_id.endswith("-codex-home"):
             source = readable_codex_home(canonical_codex_home, require_auth=False)
             for dirname in ("plugins", "skills"):
-                control_dir = slot / dirname
-                control_dir.mkdir(exist_ok=True)
                 desired_dir = source / dirname
-                if desired_dir.exists():
-                    if desired_dir.is_symlink() or not desired_dir.is_dir():
-                        raise SpoolSlotError("shape", f"canonical control is malformed: {desired_dir}")
-                    for item in desired_dir.rglob("*"):
-                        if item.is_symlink():
-                            raise SpoolSlotError("symlink", f"canonical control contains symlink: {item}")
-                    shutil.copytree(desired_dir, control_dir, dirs_exist_ok=True)
-                for item in sorted(control_dir.rglob("*"), reverse=True):
-                    item.chmod(0o555 if item.is_dir() else 0o444)
-                control_dir.chmod(0o555)
-            for filename, fallback in (
-                ("config.toml", "# deployment-owned Codex configuration\n"),
-                ("hooks.json", "{}\n"),
-            ):
-                control = slot / filename
-                desired = source / filename
-                content = desired.read_bytes()
-                if control.exists() and control.read_bytes() != content:
-                    control.chmod(0o600)
-                    control.write_bytes(content)
-                elif not control.exists():
-                    control.write_bytes(content)
-                control.chmod(0o444)
+                _copy_regular_tree(desired_dir, slot / dirname)
+            for filename in ("config.toml", "hooks.json"):
+                _copy_control_file(source / filename, slot / filename)
+                os.chmod(slot / filename, 0o644 if account is not None else 0o444)
+            if account is None:
+                # Direct unit tests and pre-ACL development projections have
+                # no named job principal yet; retain the old fail-closed
+                # read-only mode until the permission plan is applied.
+                for control in (slot / "plugins", slot / "skills"):
+                    for item in control.rglob("*"):
+                        os.chmod(item, 0o555 if item.is_dir() else 0o444)
+                    os.chmod(control, 0o555)
             auth = slot / "auth.json"
+            if auth.is_symlink() or (auth.exists() and not auth.is_file()):
+                raise SpoolSlotError("shape", f"runtime credential is malformed: {auth}")
             if not auth.exists():
                 desired_auth = credential_authority(principal)
                 if desired_auth.is_symlink() or not desired_auth.is_file():
                     raise SpoolSlotError("credential", f"credential authority is unavailable: {desired_auth}")
-                auth.write_bytes(desired_auth.read_bytes())
+                temporary = auth.with_name(f".{auth.name}.seed.{os.getpid()}")
+                temporary.write_bytes(desired_auth.read_bytes())
+                os.replace(temporary, auth)
                 # Preserve the inherited named-user ACL mask. 0600 would mask
                 # the job principal out before Codex can refresh credentials.
                 auth.chmod(0o660)
         if account is not None:
             # The container remains Manager-only. Grant the resolved job account
             # recursively on this concrete slot, never as a default ACL on root.
-            _apply_slot_acl(slot, account=account, writable=True)
+            _apply_slot_acl(slot, account=account, writable=True, surface=row)
             if row.surface_id.endswith("-codex-home"):
                 for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
-                    _apply_slot_acl(slot / leaf, account=account, writable=False)
+                    _apply_slot_acl(
+                        slot / leaf, account=account, writable=False, surface=row
+                    )
         provisioned.append(slot)
     return tuple(provisioned)
 

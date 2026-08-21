@@ -3660,10 +3660,9 @@ class PathLayout:
             (f"{self.agents_root}/config", root, g(root), 0o755),
             (f"{self.agents_root}/run", root, g(root), 0o755),
             (f"{self.agents_root}/runtime", root, g(root), 0o755),
-            # Canonical Codex authorities are real deployment surfaces.  Their
-            # principal leaves are populated by the installer, never by jobs.
-            (self.codex_control_root, root, g(root), 0o755),
-            (self.codex_credential_root, svc, g(svc), 0o700),
+            # Canonical Codex authority roots are registry assets.  They are
+            # intentionally absent here; emitting them again would give the
+            # scaffold and permission plan two executable ownership truths.
             # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
             (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
             (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
@@ -3721,8 +3720,20 @@ class PathLayout:
             # mktemp + rename makes an interrupted first install retryable without
             # leaving a fixed ``.new`` tree that a later run could accidentally use.
             rows.append(
+                f"test ! -L {qctl} && "
                 f"if [ ! -e {qctl} ]; then "
-                f"test ! -L {qsrc} && test -d {qsrc} && "
+                # A legacy ~/.codex symlink is accepted only after the link
+                # itself and its resolved target are proven deployment-owned.
+                # The subsequent qsrc/* reads therefore never follow an
+                # untrusted link.  Root-owned live installs are migrated
+                # atomically instead of being rejected as malformed.
+                f"if test -L {qsrc}; then "
+                f"test \"$(find {qsrc} -maxdepth 0 -type l -user root -print -quit)\" = {qsrc} && "
+                f"resolved=$(readlink -e -- {qsrc}) && test -d \"$resolved\" && "
+                f"test \"$(stat -c %u -- \"$resolved\")\" = 0 && "
+                f"test -z \"$(find \"$resolved\" -maxdepth 0 ! -user root -print -quit)\"; "
+                f"fi && "
+                f"test -d {qsrc} && "
                 f"test -f {qsrc}/config.toml && test ! -L {qsrc}/config.toml && "
                 f"test -d {qsrc}/plugins && test ! -L {qsrc}/plugins && "
                 f"test -d {qsrc}/skills && test ! -L {qsrc}/skills && "

@@ -100,6 +100,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -155,6 +156,7 @@ __all__ = [
     "POSIX_ACL_ACCESS_XATTR",
     "POSIX_ACL_DEFAULT_XATTR",
     "JOB_SPEC_VERSION",
+    "MAX_JOB_PROMPT_BYTES",
     "JobRoleConfig",
     "JobRunnerError",
     "REVIEWER_ACCOUNT_ENV",
@@ -197,6 +199,7 @@ __all__ = [
     "inherited_perms_for_account",
     "instance_name_valid",
     "job_spec_path",
+    "job_prompt_path",
     "preflight_systemd_run",
     "preflight_systemd_template",
     "prepare_systemd_run",
@@ -214,6 +217,8 @@ __all__ = [
     "template_unit_name",
     "transient_unit_name",
     "write_job_spec",
+    "write_job_prompt",
+    "prepare_private_prompt_spool",
 ]
 
 
@@ -342,6 +347,13 @@ REVIEW_JOB_SPEC_SPOOL_ENV = "PSC_REVIEW_JOB_SPEC_SPOOL"
 DEFAULT_REVIEW_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs/reviewer"
 GATE_JOB_SPEC_SPOOL_ENV = "PSC_GATE_JOB_SPEC_SPOOL"
 DEFAULT_GATE_JOB_SPEC_SPOOL = "/var/lib/cortex/coordinator/job-specs/gate"
+
+# Linux rejects an individual argv element at MAX_ARG_STRLEN (normally 131072
+# bytes).  Prompts are Manager-authored input, so the bounded file channel is
+# deliberately larger than that limit but still finite.  The bound is checked
+# before creating a file; an oversized prompt therefore fails closed rather
+# than falling back to argv or an ambient stdin.
+MAX_JOB_PROMPT_BYTES = 4 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1892,6 +1904,232 @@ def job_spec_path(spool_dir: str, instance: str) -> str:
     return f"{spool_dir.rstrip('/')}/{instance}.json"
 
 
+def job_prompt_path(spool_dir: str, instance: str) -> str:
+    """Return the private per-job prompt path next to the job's log spool.
+
+    The launcher passes this path, never prompt bytes, through a template or
+    transient job command.  Keeping it in the already-authorized job log slot
+    avoids widening the spec spool's file enumeration and gives the job only
+    the named read ACL installed by :func:`write_job_prompt`.
+    """
+
+    if not isinstance(spool_dir, str) or not spool_dir.startswith("/"):
+        raise _fail(
+            "job-runner-prompt-path-invalid",
+            f"prompt spool 必須是絕對路徑: {spool_dir!r}",
+            source="job_prompt_path",
+        )
+    if not isinstance(instance, str) or not instance_name_valid(instance):
+        raise _fail(
+            "job-runner-prompt-path-invalid",
+            f"prompt instance 不合法: {instance!r}",
+            source="job_prompt_path",
+        )
+    # The caller supplies the concrete job-log spool directory, not a shared
+    # root.  A hidden basename keeps the prompt out of the spec spool's normal
+    # ``*.json`` inventory while remaining easy to clean deterministically.
+    return f"{spool_dir.rstrip('/')}/.prompt-{instance}"
+
+
+def _prompt_acl_binary() -> str | None:
+    binary = shutil.which("setfacl")
+    if binary is None or Path(binary).name != "setfacl":
+        fallback = "/usr/bin/setfacl"
+        binary = fallback if Path(fallback).is_file() else None
+    return binary
+
+
+def prepare_private_prompt_spool(
+    directory: str, *, account: str | None = None
+) -> str:
+    """Create/validate a Manager-owned sticky prompt directory.
+
+    The surrounding job-log slot is writable by the job for JSONL output.
+    Prompts therefore live in a Manager-owned sticky child: the job can
+    traverse/read its own file but cannot unlink or replace Manager-owned
+    prompt files.
+    """
+
+    target = Path(directory)
+    if not target.is_absolute():
+        raise _fail(
+            "job-runner-prompt-spool-invalid",
+            f"private prompt spool 必須是絕對路徑: {directory!r}",
+            source="prepare_private_prompt_spool",
+        )
+    current = target
+    while current != current.parent:
+        if current.is_symlink():
+            raise _fail(
+                "job-runner-prompt-spool-invalid",
+                f"private prompt spool path contains symlink: {current}",
+                source="prepare_private_prompt_spool",
+            )
+        current = current.parent
+    try:
+        if target.exists():
+            if target.is_symlink() or not target.is_dir():
+                raise _fail(
+                    "job-runner-prompt-spool-invalid",
+                    f"private prompt spool is malformed: {target}",
+                    source="prepare_private_prompt_spool",
+                )
+            mode = stat.S_IMODE(target.stat().st_mode)
+            if target.stat().st_uid != os.geteuid() or not mode & stat.S_ISVTX:
+                raise _fail(
+                    "job-runner-prompt-spool-invalid",
+                    f"private prompt spool is not Manager-owned sticky directory: {target}",
+                    source="prepare_private_prompt_spool",
+                )
+        else:
+            target.mkdir(mode=0o1710)
+            os.chmod(target, 0o1710)
+    except OSError as exc:
+        raise _fail(
+            "job-runner-prompt-spool-write-failed",
+            f"cannot prepare private prompt spool {target}: {exc}",
+            source="prepare_private_prompt_spool",
+        ) from exc
+    if account and _account_ids(account) is not None:
+        binary = _prompt_acl_binary()
+        if binary is None:
+            raise _fail(
+                "job-runner-prompt-acl-unavailable",
+                f"找不到 setfacl，無法讓 {account} traverse private prompt spool",
+                source="prepare_private_prompt_spool",
+                account=account,
+            )
+        acl = f"u:{account}:r-x,m::r-x"
+        argv = (binary, "-m", acl, str(target))
+        if os.spawnv(os.P_WAIT, binary, argv) != 0:
+            raise _fail(
+                "job-runner-prompt-acl-failed",
+                f"無法讓 {account} traverse private prompt spool: {target}",
+                source="prepare_private_prompt_spool",
+                account=account,
+            )
+    return str(target)
+
+
+def write_job_prompt(
+    prompt_path: str,
+    prompt: str,
+    *,
+    account: str | None = None,
+    max_bytes: int = MAX_JOB_PROMPT_BYTES,
+) -> str:
+    """Atomically publish a bounded, Manager-owned prompt file.
+
+    A template unit has stdin connected to ``/dev/null`` by design.  Passing a
+    long workflow envelope as a shell/CLI argument consequently fails twice:
+    Linux rejects oversized argv elements, and a stdin workaround receives EOF.
+    This channel is the single production path for isolated Claude/CG jobs.
+    """
+
+    if not isinstance(prompt_path, str) or not prompt_path.startswith("/"):
+        raise _fail(
+            "job-runner-prompt-path-invalid",
+            f"private prompt path 必須是絕對路徑: {prompt_path!r}",
+            source="write_job_prompt",
+        )
+    if not isinstance(prompt, str):
+        raise _fail(
+            "job-runner-prompt-invalid",
+            "private prompt 必須是字串",
+            source="write_job_prompt",
+        )
+    payload = prompt.encode("utf-8")
+    if max_bytes <= 0 or len(payload) > max_bytes:
+        raise _fail(
+            "job-runner-prompt-too-large",
+            f"private prompt 超過 {max_bytes} bytes bound（收到 {len(payload)}）",
+            source="write_job_prompt",
+            prompt_path=prompt_path,
+            prompt_bytes=len(payload),
+            max_bytes=max_bytes,
+        )
+    target = Path(prompt_path)
+    if target.is_symlink():
+        raise _fail(
+            "job-runner-prompt-shape-invalid",
+            f"private prompt 不得是 symlink: {target}",
+            source="write_job_prompt",
+        )
+    directory = target.parent
+    current = directory
+    while current != current.parent:
+        if current.is_symlink():
+            raise _fail(
+                "job-runner-prompt-spool-invalid",
+                f"private prompt spool path contains symlink: {current}",
+                source="write_job_prompt",
+            )
+        current = current.parent
+    if not directory.is_dir() or directory.is_symlink():
+        raise _fail(
+            "job-runner-prompt-spool-invalid",
+            f"private prompt spool 不存在或是 symlink: {directory}",
+            source="write_job_prompt",
+        )
+    tmp_path: str | None = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".prompt-", suffix=".tmp", dir=str(directory))
+        with os.fdopen(fd, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, target)
+        tmp_path = None
+        os.chmod(target, 0o600)
+    except OSError as exc:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise _fail(
+            "job-runner-prompt-write-failed",
+            f"寫不進 private prompt {target}: {exc}",
+            source="write_job_prompt",
+            prompt_path=str(target),
+        ) from exc
+
+    if account and _account_ids(account) is not None:
+        binary = _prompt_acl_binary()
+        if binary is None:
+            target.unlink(missing_ok=True)
+            raise _fail(
+                "job-runner-prompt-acl-unavailable",
+                f"找不到 setfacl，無法把 private prompt 唯讀交給 {account}",
+                source="write_job_prompt",
+                prompt_path=str(target),
+                account=account,
+            )
+        acl = f"u:{account}:r--,m::r--"
+        argv = (binary, "-m", acl, str(target))
+        if os.spawnv(os.P_WAIT, binary, argv) != 0:
+            target.unlink(missing_ok=True)
+            raise _fail(
+                "job-runner-prompt-acl-failed",
+                f"無法把 private prompt 唯讀交給 {account}: {target}",
+                source="write_job_prompt",
+                prompt_path=str(target),
+                account=account,
+            )
+        ok, why = _spec_readable_by(str(target), account)
+        if not ok:
+            target.unlink(missing_ok=True)
+            raise _fail(
+                "job-runner-prompt-unreadable-by-job",
+                f"private prompt 落地但 {account} 讀不到: {why}",
+                source="write_job_prompt",
+                prompt_path=str(target),
+                account=account,
+            )
+    return str(target)
+
+
 def forbidden_spec_keys(spec: Mapping[str, object]) -> list[str]:
     """spec 內出現的 :data:`SPEC_FORBIDDEN_KEYS`（排序後）。空 list＝乾淨。
 
@@ -2127,7 +2365,7 @@ def build_systemctl_start_argv(*, systemctl: str, unit: str) -> list[str]:
 
 
 def build_manager_exit_recorder_argv(
-    *, client_argv: Sequence[str], sentinel: str
+    *, client_argv: Sequence[str], sentinel: str, cleanup_path: str | None = None
 ) -> list[str]:
     """把降權啟動器的 client argv 包進一層 **Manager 身分**的 exit 記帳 shell。
 
@@ -2168,8 +2406,20 @@ def build_manager_exit_recorder_argv(
             source="build_manager_exit_recorder_argv",
             sentinel=sentinel,
         )
+    if cleanup_path is not None and not cleanup_path.startswith("/"):
+        raise _fail(
+            "job-runner-exit-recorder-invalid",
+            f"cleanup path 必須是絕對路徑: {cleanup_path!r}",
+            source="build_manager_exit_recorder_argv",
+            cleanup_path=cleanup_path,
+        )
+    cleanup = ""
+    if cleanup_path is not None:
+        # The Manager shell owns this cleanup.  The job only receives read ACL
+        # on the prompt and cannot remove or replace the Manager inode.
+        cleanup = f"; rm -f -- {shlex.quote(cleanup_path)} 2>/dev/null || :"
     script = (
-        f"{shlex.join(list(client_argv))}; rc=$?; "
+        f"{shlex.join(list(client_argv))}; rc=$?{cleanup}; "
         f"printf %s \"$rc\" > {shlex.quote(sentinel)}; exit \"$rc\""
     )
     # `-c` 而非 `-lc`：這層 shell 是 Manager 的一部分，不該重新 source ~/.profile。

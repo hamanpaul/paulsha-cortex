@@ -1328,6 +1328,11 @@ def _launch_foreign_review(
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
+            runtime_principal=handle.runtime_principal,
+            runtime_mode=handle.runtime_mode,
+            runtime_surface=handle.runtime_surface,
+            credential_publish=handle.credential_publish,
+            prompt_path=handle.prompt_path,
         )
         registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
         registry.record_action(
@@ -9900,6 +9905,11 @@ def _dispatch_workflow_card(
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
+            runtime_principal=handle.runtime_principal,
+            runtime_mode=handle.runtime_mode,
+            runtime_surface=handle.runtime_surface,
+            credential_publish=handle.credential_publish,
+            prompt_path=handle.prompt_path,
         )
     except BaseException as launch_exc:
         registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)
@@ -10370,6 +10380,9 @@ def resume_workflow_run(
         return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
+        runtime_diagnostic = job.get("runtime_diagnostic")
+        if isinstance(runtime_diagnostic, dict):
+            failure_reason = "runtime-contract-failed"
         sandbox_ok = True
         try:
             _discard_reviewer_sandbox(
@@ -10391,6 +10404,11 @@ def resume_workflow_run(
         classification = (
             provider_outcome.classification_from_job(job) if sandbox_ok else None
         )
+        if isinstance(runtime_diagnostic, dict):
+            # A runtime contract failure is already a durable Manager-side
+            # diagnosis.  It must not be reclassified as a retryable provider
+            # outage or fed back into provider routing.
+            classification = None
         status_fields: dict[str, object] = {}
         if classification is not None:
             status_fields["provider_outcome"] = classification.outcome.value
@@ -10440,9 +10458,18 @@ def resume_workflow_run(
             gate_status="running",
             needs_human_reason=diagnostic_reason(
                 failure_reason,
-                "builder/reviewer job 以 provider 層失敗終局，"
-                f"bounded retry 已耗盡或不可重試：{diagnostics.reason or failure_reason}",
-                source="manager._poll_workflow_job:provider-failure",
+                (
+                    "isolated runtime contract failed: "
+                    f"{runtime_diagnostic.get('detail', failure_reason)}"
+                    if isinstance(runtime_diagnostic, dict)
+                    else "builder/reviewer job 以 provider 層失敗終局，"
+                    f"bounded retry 已耗盡或不可重試：{diagnostics.reason or failure_reason}"
+                ),
+                source=(
+                    "manager._poll_workflow_job:runtime-contract"
+                    if isinstance(runtime_diagnostic, dict)
+                    else "manager._poll_workflow_job:provider-failure"
+                ),
                 run_id=run.run_id,
                 work_id=run.work_id,
                 job_id=str(job["job_id"]),

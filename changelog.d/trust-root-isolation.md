@@ -22,3 +22,5 @@
 # Repair: register canonical Codex control/credential authorities as deployment assets, migrate both roles' existing bytes without stubs, and harvest refreshes after builder and reviewer terminal paths.
 
 # Repair: whitelist the four canonical control leaves during atomic migration, normalize root-owned readable modes, reject symlink/special descendants, and publish atomic builder/reviewer auth refreshes through a named Manager ACL after unit termination.
+
+# Repair: route isolated Claude/CG workflow prompts through bounded Manager-created per-job files (with Manager-side termination cleanup), derive Codex credential harvest from typed runtime surfaces with durable fail-closed diagnostics, and pin Codex reasoning effort for the two deployed model identities.

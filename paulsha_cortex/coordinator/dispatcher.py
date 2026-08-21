@@ -236,22 +236,118 @@ class Dispatcher:
     ) -> dict[str, object]:
         job = self._registry.get_job(job_id)
         # A downgraded Codex job publishes auth.json with a readable ACL/mode
-        # before its Manager-authored exit sentinel.  Harvest on every terminal
-        # outcome (including provider failure), so refresh is never silently
-        # discarded. Direct-mode jobs have no isolated runtime slot.
-        from . import spool_slot
-        principal = "reviewer" if job.get("kind") == "review" else "builder"
-        runtime_slot = spool_slot.canonical_job_slot(
-            f"{principal}-codex-home", job_id
-        )
-        if runtime_slot.exists():
+        # before its Manager-authored exit sentinel.  The launcher records a
+        # typed runtime surface; never infer a principal from workflow kind.
+        # Missing runtime metadata/slot/authority is a durable runtime failure,
+        # not a provider failure and never a silently skipped harvest.
+        from . import job_runner, job_workspace, spool_slot
+        runtime_diagnostic: dict[str, str] | None = None
+        runtime_mode = job.get("runtime_mode")
+        runtime_principal = job.get("runtime_principal")
+        prompt_path = job.get("prompt_path")
+        if prompt_path is not None:
+            prompt = Path(prompt_path) if isinstance(prompt_path, str) else Path(".")
+            expected_prompt: Path | None = None
             try:
-                spool_slot.commit_runtime_credential(
-                    principal=principal, job_id=job_id
-                )
-            except (OSError, spool_slot.SpoolSlotError) as exc:
-                exit_code = 1
-                log_path = log_path
+                if (
+                    runtime_mode in {"systemd-run", "systemd-template"}
+                    and runtime_principal in {"builder", "reviewer"}
+                ):
+                    prompt_spool = job_workspace.job_log_spool_dir(
+                        principal_id=str(runtime_principal), spool_key=job_id
+                    ) / ".prompts"
+                    expected_prompt = prompt_spool / (
+                        ".prompt-" + job_runner.template_instance_id(job_id)
+                    )
+            except (TypeError, ValueError):
+                expected_prompt = None
+            if (
+                not isinstance(prompt_path, str)
+                or not prompt.is_absolute()
+                or not prompt.name.startswith(".prompt-")
+                or expected_prompt is None
+                or prompt != expected_prompt
+                or prompt.is_symlink()
+            ):
+                runtime_diagnostic = {
+                    "reason": "runtime-prompt-cleanup-invalid",
+                    "detail": (
+                        f"private prompt path is malformed or outside its typed slot: "
+                        f"{prompt_path!r}"
+                    ),
+                    "source": "dispatcher._finalize_headless",
+                    "job_id": str(job_id),
+                }
+            else:
+                try:
+                    prompt.unlink(missing_ok=True)
+                except OSError as exc:
+                    runtime_diagnostic = {
+                        "reason": "runtime-prompt-cleanup-failed",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "source": "dispatcher._finalize_headless",
+                        "job_id": str(job_id),
+                    }
+        isolated_codex = (
+            job.get("executor") == "codex"
+            and runtime_mode in {"systemd-run", "systemd-template"}
+        )
+        if isolated_codex and not job.get("credential_publish"):
+            runtime_diagnostic = runtime_diagnostic or {
+                "reason": "runtime-publisher-missing",
+                "detail": "isolated Codex job has no credential publisher metadata",
+                "source": "dispatcher._finalize_headless",
+                "job_id": str(job_id),
+            }
+        elif job.get("credential_publish") and not isolated_codex:
+            runtime_diagnostic = runtime_diagnostic or {
+                "reason": "runtime-lane-invalid",
+                "detail": "credential publisher is set outside an isolated Codex lane",
+                "source": "dispatcher._finalize_headless",
+                "job_id": str(job_id),
+            }
+        if job.get("credential_publish") and isolated_codex:
+            principal = job.get("runtime_principal")
+            surface_id = job.get("runtime_surface")
+            expected_surface = {
+                "builder-codex-home": "builder",
+                "reviewer-codex-home": "reviewer",
+            }.get(str(surface_id))
+            if principal != expected_surface or not isinstance(principal, str):
+                runtime_diagnostic = {
+                    "reason": "runtime-identity-missing",
+                    "detail": (
+                        f"credential publish metadata is inconsistent: "
+                        f"principal={principal!r}, surface={surface_id!r}"
+                    ),
+                    "source": "dispatcher._finalize_headless",
+                    "job_id": str(job_id),
+                }
+            else:
+                try:
+                    runtime_slot = spool_slot.canonical_job_slot(str(surface_id), job_id)
+                    authority = spool_slot.credential_authority(principal)
+                    spool_slot.validate_job_slot_shape(runtime_slot)
+                    if (
+                        authority.is_symlink()
+                        or authority.parent.is_symlink()
+                        or not authority.is_file()
+                    ):
+                        raise spool_slot.SpoolSlotError(
+                            "authority", f"credential authority is unavailable: {authority}"
+                        )
+                    spool_slot.commit_runtime_credential(
+                        principal=principal, job_id=job_id
+                    )
+                except (OSError, spool_slot.SpoolSlotError, ValueError) as exc:
+                    runtime_diagnostic = {
+                        "reason": "runtime-credential-harvest-failed",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "source": "dispatcher._finalize_headless",
+                        "job_id": str(job_id),
+                    }
+        if runtime_diagnostic is not None:
+            exit_code = 1
         last_jsonl_line = _last_nonempty_line(log_path)
         status = classify_completion(exit_code=exit_code, last_jsonl_line=last_jsonl_line)
         # #384：只在真的失敗時才分類——分類器本身也會拒絕 exit_code == 0
@@ -259,12 +355,16 @@ class Dispatcher:
         # classify_completion 的 failed 分支」這種邊界情況也排除掉，避免對
         # 明明成功的 job 做無意義的 log 讀取與分類。
         provider_outcome = None
-        if status == "failed":
+        if status == "failed" and runtime_diagnostic is None:
             output = read_log_tail(log_path)
             provider_outcome = classify_provider_failure(exit_code=exit_code, output=output).to_dict()
-        return self._registry.update_headless_result(
-            job_id,
-            status=status,
-            exit_code=exit_code,
-            provider_outcome=provider_outcome,
-        )
+        result_kwargs = {
+            "status": status,
+            "exit_code": exit_code,
+            "provider_outcome": provider_outcome,
+        }
+        # Keep the legacy registry seam usable for pre-migration callers while
+        # passing the durable runtime field whenever a real failure exists.
+        if runtime_diagnostic is not None:
+            result_kwargs["runtime_diagnostic"] = runtime_diagnostic
+        return self._registry.update_headless_result(job_id, **result_kwargs)

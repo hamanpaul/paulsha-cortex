@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -37,6 +38,7 @@ from unittest import mock
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator import spool_slot
+from paulsha_cortex.coordinator import job_workspace
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 from paulsha_cortex.trust_root import permgen, registry
 from paulsha_cortex.trust_root.registry import Principal
@@ -259,6 +261,50 @@ class LaunchIdentityTests(unittest.TestCase):
         # claude＝原生 ELF ⇒ strict 剖面 ⇒ 無 `-jit` 後綴。
         self.assertTrue(out["spec"]["unit"].startswith("cortex-reviewer-job@"))
         self.assertIn(out["spec"]["unit"], out["call"]["argv"][-1])
+
+    def test_template_prompt_uses_manager_private_spool_without_argv_bytes(self) -> None:
+        """The real template launch keeps an oversized prompt out of argv/status."""
+        popen = _RecordingPopen()
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = popen
+        slice_id = "psc-0615-large-prompt"
+        prompt = "workflow-sentinel-" + ("x" * 140_000)
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                spool_dir = str(Path(root) / "job-specs")
+                Path(spool_dir).mkdir(parents=True)
+                env = _template_env(spool_dir)
+                with mock.patch.dict(os.environ, env, clear=True), _nested(
+                    _preflight_patches()
+                ):
+                    _reviewer().launch(
+                        slice_id=slice_id,
+                        prompt=prompt,
+                        worktree=root,
+                        log_dir=str(Path(root) / "logs"),
+                    )
+                    slot = job_workspace.job_log_spool_dir(
+                        principal_id=job_runner.JOB_ROLE_CONFIG[
+                            job_runner.JOB_ROLE_REVIEW
+                        ].log_spool_principal,
+                        spool_key=slice_id,
+                    )
+                prompt_dir = slot / ".prompts"
+                prompt_path = prompt_dir / (
+                    ".prompt-" + job_runner.template_instance_id(slice_id)
+                )
+                self.assertTrue(prompt_path.is_file())
+                self.assertEqual(prompt_path.read_bytes(), prompt.encode())
+                self.assertNotEqual(
+                    prompt_dir.stat().st_mode & stat.S_ISVTX, 0
+                )
+                spec = json.loads(next(Path(spool_dir).iterdir()).read_text())
+                self.assertIn(str(prompt_path), json.dumps(spec))
+                self.assertNotIn(prompt, json.dumps(spec))
+                self.assertNotIn(prompt, json.dumps(popen.call["argv"]))
+                shutil.rmtree(slot, ignore_errors=True)
+        finally:
+            launcher_module.subprocess.Popen = original
 
     def test_planner_shares_the_reviewer_template(self) -> None:
         """planner 與 reviewer 同帳號 ⇒ 同一份模板，不是第三份。"""

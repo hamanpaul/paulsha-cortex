@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -952,15 +953,41 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
             "session_name": handle.session_name,
             "pid": handle.pid,
             "log_path": handle.log_path,
+            "runtime_principal": handle.runtime_principal,
+            "runtime_mode": handle.runtime_mode,
+            "runtime_surface": handle.runtime_surface,
+            "credential_publish": handle.credential_publish,
+            "prompt_path": handle.prompt_path,
         }
-    return registry.attach_launch_handle(
-        job["job_id"],
-        executor=handle.executor,
-        model_id=handle.model_id,
-        session_name=handle.session_name,
-        pid=handle.pid,
-        log_path=handle.log_path,
-    )
+    kwargs = {
+        "executor": handle.executor,
+        "model_id": handle.model_id,
+        "session_name": handle.session_name,
+        "pid": handle.pid,
+        "log_path": handle.log_path,
+        "runtime_principal": handle.runtime_principal,
+        "runtime_mode": handle.runtime_mode,
+        "runtime_surface": handle.runtime_surface,
+        "credential_publish": handle.credential_publish,
+        "prompt_path": handle.prompt_path,
+    }
+    # External callers and older test registries may still expose the pre-
+    # runtime metadata signature.  Filter only at this duck-typed seam; the
+    # production JobRegistry accepts and persists every typed field above.
+    try:
+        signature = inspect.signature(registry.attach_launch_handle)
+        if not any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        ):
+            kwargs = {
+                name: value
+                for name, value in kwargs.items()
+                if name in signature.parameters
+            }
+    except (TypeError, ValueError):
+        pass
+    return registry.attach_launch_handle(job["job_id"], **kwargs)
 
 
 def _fail_launching_job(dispatcher, job: dict) -> None:
