@@ -1,0 +1,1 @@
+- **#718（RED）：新增 per-job trust-root writable-surface isolation regression contract tests**，鎖定 canonical surface table、instance-scoped slot、foreign-slot boundary 與 fail-closed slot shape。
