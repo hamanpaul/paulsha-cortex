@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#776 補遺：archive 前補齊舊 manifest 世代的 openspec change scaffold**（canonical-specs-invalid 修復）。
 - **#776 補遺：ship adapter refs 守衛改走 openspec 相容判定**（helper 下沉 claim.py；refs-differ 誤擋修復）。
 - **#776 補遺：舊 manifest 的 openspec-propose 卡視慣例名 change 為 run 自產**（85114100 二度被誤殺的根因）。
 - **#776 補遺：`recover-superseded` 補進 control contract 白名單**（驗證分支與 porcelain choices 同步）。

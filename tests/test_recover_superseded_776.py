@@ -349,3 +349,65 @@ class ShipAdapterRefsCompatTests(unittest.TestCase):
             work_actions._planning_declared_openspec_changes,
             claim.planning_declared_openspec_changes,
         )
+
+class ArchiveScaffoldTests(unittest.TestCase):
+    """#776 補遺：archive 前補齊舊 manifest 世代缺失的 change 結構。
+
+    舊 planning 只把 tasks.md 寫進 candidate，`openspec validate --strict`
+    以 Unknown item 結構性失敗。Manager 在 ship workspace gate 前補指標式
+    scaffold；已有 proposal／delta 一字不動。
+    """
+
+    def _tree(self, tmp, *, with_proposal=False, with_delta=False):
+        root = Path(tmp)
+        change = root / "openspec" / "changes" / "fix-demo"
+        change.mkdir(parents=True)
+        (change / "tasks.md").write_text("# Tasks\n\n- [x] done\n", encoding="utf-8")
+        if with_proposal:
+            (change / "proposal.md").write_text("original\n", encoding="utf-8")
+        if with_delta:
+            delta = change / "specs" / "existing"
+            delta.mkdir(parents=True)
+            (delta / "spec.md").write_text("## ADDED Requirements\n", encoding="utf-8")
+        return root, change
+
+    def test_scaffold_fills_missing_proposal_and_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, change = self._tree(tmp)
+            work_actions._ensure_openspec_change_scaffold(
+                repo_root=root, change="fix-demo"
+            )
+            proposal = (change / "proposal.md").read_text(encoding="utf-8")
+            self.assertIn("work_item: fix-demo", proposal)
+            self.assertIn("docs/superpowers/specs/fix-demo-spec.md", proposal)
+            delta = (change / "specs" / "fix-demo" / "spec.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("## ADDED Requirements", delta)
+            self.assertIn("#### Scenario:", delta)
+
+    def test_existing_content_is_left_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, change = self._tree(tmp, with_proposal=True, with_delta=True)
+            work_actions._ensure_openspec_change_scaffold(
+                repo_root=root, change="fix-demo"
+            )
+            self.assertEqual(
+                (change / "proposal.md").read_text(encoding="utf-8"), "original\n"
+            )
+            self.assertFalse((change / "specs" / "fix-demo").exists())
+
+    def test_absent_change_dir_is_a_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            work_actions._ensure_openspec_change_scaffold(
+                repo_root=Path(tmp), change="fix-demo"
+            )
+            self.assertFalse((Path(tmp) / "openspec").exists())
+
+    def test_ship_adapter_scaffolds_before_gate(self) -> None:
+        from paulsha_cortex.coordinator import work_bridge
+
+        source = inspect.getsource(work_bridge)
+        scaffold = source.index("_ensure_openspec_change_scaffold")
+        gate = source.index("_validate_local_archive_inputs")
+        self.assertLess(scaffold, gate)

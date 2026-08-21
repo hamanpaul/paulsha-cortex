@@ -1884,6 +1884,13 @@ def build_production_ship_validator(
             from . import work_actions
 
             validate_ship_stage_transition("local-closeout", "pr-preflight")
+            # #776：舊 manifest 世代的 change 只有 tasks.md——archive gate 的
+            # strict validate 會以 Unknown item 結構性失敗；gate 前補齊指標式
+            # scaffold（隨 archive commit 收進並經 re-verification 檢視）。
+            work_actions._ensure_openspec_change_scaffold(
+                repo_root=worktree,
+                change=str(change),
+            )
             work_actions._validate_local_archive_inputs(
                 repo_root=worktree,
                 change=str(change),

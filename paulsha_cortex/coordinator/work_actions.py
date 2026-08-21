@@ -132,6 +132,71 @@ def _pr_metadata(args: dict[str, Any], *, required_issues: tuple[int, ...]) -> P
     return metadata
 
 
+def _ensure_openspec_change_scaffold(*, repo_root: Path, change: str) -> None:
+    """#776：archive 前補齊舊 manifest 世代缺失的 openspec change 結構。
+
+    舊版 combo manifest 的 planning 只把 ``tasks.md`` 寫進 candidate（實機
+    workflow-85114100），archive gate 的 ``openspec validate --strict`` 因缺
+    ``proposal.md``／specs delta 而結構性失敗（``Unknown item``）。Manager 在
+    自己的 ship workspace 於 gate 之前補齊 scaffold——內容為指標式：canonical
+    規格仍是 ``docs/superpowers/specs/`` 的 spec/design（與 repo 既有 proposal
+    的 Capabilities 段慣例一致），delta 以單一 Requirement 錨定「以 canonical
+    規格驗收」。scaffold 隨 archive commit 一起收進、candidate 前進並經
+    re-verification 檢視（#653 設計本有的重驗步驟）。已有 proposal／delta 的
+    change 一字不動；產出 deterministic（無時間戳）。
+    """
+
+    change_dir = repo_root / "openspec" / "changes" / change
+    if not change_dir.is_dir():
+        return
+    spec_ref = f"docs/superpowers/specs/{change}-spec.md"
+    design_ref = f"docs/superpowers/specs/{change}-design.md"
+    proposal = change_dir / "proposal.md"
+    if not proposal.is_file():
+        proposal.write_text(
+            "---\n"
+            "status: accepted\n"
+            f"work_item: {change}\n"
+            "---\n"
+            "\n"
+            "## Goals\n"
+            "\n"
+            f"本 change 的 canonical 目標與需求載於 `{spec_ref}`。\n"
+            "\n"
+            "## Why\n"
+            "\n"
+            f"設計取捨與動機載於 `{design_ref}`。\n"
+            "\n"
+            "## What Changes\n"
+            "\n"
+            f"- 依 `{spec_ref}` 的 Requirements 實作並驗收（本 proposal 由 Manager 於 archive 前補齊結構，canonical 規格不在此重複）。\n"
+            "\n"
+            "## Capabilities\n"
+            "\n"
+            "### Modified Capabilities\n"
+            f"- 詳見 `{spec_ref}` 與 `{design_ref}`。\n",
+            encoding="utf-8",
+        )
+    specs_dir = change_dir / "specs"
+    has_delta = specs_dir.is_dir() and any(specs_dir.rglob("*.md"))
+    if not has_delta:
+        delta_dir = specs_dir / change
+        delta_dir.mkdir(parents=True, exist_ok=True)
+        (delta_dir / "spec.md").write_text(
+            "## ADDED Requirements\n"
+            "\n"
+            f"### Requirement: 依 canonical superpowers 規格驗收\n"
+            "\n"
+            f"本 change 的 canonical Requirements 載於 `{spec_ref}`；candidate MUST 滿足該規格的全部驗收條件，且 verify／review 以該規格為唯一需求來源。\n"
+            "\n"
+            "#### Scenario: canonical 規格驗收\n"
+            "\n"
+            f"- **WHEN** 依 `{spec_ref}` 的 Requirements 對 candidate 驗收\n"
+            "- **THEN** 全部驗收條件成立\n",
+            encoding="utf-8",
+        )
+
+
 def _validate_local_archive_inputs(
     *,
     repo_root: Path,

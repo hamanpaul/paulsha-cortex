@@ -1,0 +1,1 @@
+#776 補遺：archive gate 前由 Manager 於 ship workspace 補齊舊 manifest 世代缺失的 openspec change 結構（指標式 proposal.md＋canonical 驗收 delta；隨 archive commit 收進並經 re-verification 檢視）——只有 tasks.md 的 change 先前在 `openspec validate --strict` 以 Unknown item 結構性失敗（實機 `archive gate blocked: canonical-specs-invalid`）。
