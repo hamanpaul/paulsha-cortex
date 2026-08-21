@@ -3714,6 +3714,11 @@ class PathLayout:
             return "# deployment-owned Codex configuration\n"
         raise ValueError(f"not a Codex control file: {path}")
 
+    @staticmethod
+    def _codex_seed_guard(check: str, *, message: str) -> str:
+        quoted = shlex.quote(message)
+        return f"{check} || {{ printf '%s\\n' {quoted} >&2; exit 1; }}"
+
     def codex_authority_seed_commands(self, scheme: UidScheme) -> tuple[str, ...]:
         """Idempotently migrate deployed Codex controls and credentials.
 
@@ -3722,6 +3727,8 @@ class PathLayout:
         """
         root = scheme.deploy_account
         manager = scheme.durable_state_owner
+        root_group = scheme.group_of(root)
+        qcontrols_parent = shlex.quote(self.codex_control_root)
         rows: list[str] = []
         for principal in (Principal.BUILDER, Principal.REVIEWER):
             account = scheme.resolve(principal)
@@ -3731,51 +3738,146 @@ class PathLayout:
             controls = f"{self.codex_control_root}/{principal.value}"
             credential = f"{self.codex_credential_root}/{principal.value}/auth.json"
             qsrc, qctl, qcred = map(shlex.quote, (source, controls, credential))
+            config = f"{source}/config.toml"
+            hooks = f"{source}/hooks.json"
+            plugins = f"{source}/plugins"
+            skills = f"{source}/skills"
+            qconfig, qhooks, qplugins, qskills = map(
+                shlex.quote, (config, hooks, plugins, skills)
+            )
+
+            def detail(text: str) -> str:
+                return f"Codex control seed ({principal.value}): {text}"
+
+            resolved_message = shlex.quote(
+                detail(f"legacy Codex symlink {source} must resolve to a directory")
+            )
             # Copy the four control leaves explicitly.  A deployed ~/.codex also
             # contains sessions, sqlite databases, memories and installation ids;
             # none of those are policy inputs and none may become job-readable.
             # mktemp + rename makes an interrupted first install retryable without
             # leaving a fixed ``.new`` tree that a later run could accidentally use.
+            control_steps = [
+                f"install -d -o {root} -g {root_group} -m 0755 {qcontrols_parent}",
+                (
+                    f"if test -L {qsrc}; then "
+                    + " && ".join(
+                        (
+                            self._codex_seed_guard(
+                                f"test \"$(find {qsrc} -maxdepth 0 -type l -user root -print -quit)\" = {qsrc}",
+                                message=detail(
+                                    f"legacy Codex symlink {source} must be owned by root"
+                                ),
+                            ),
+                            f"resolved=$(readlink -e -- {qsrc}) || {{ printf '%s\\n' {resolved_message} >&2; exit 1; }}",
+                            self._codex_seed_guard(
+                                'test -d "$resolved"',
+                                message=detail(
+                                    f"legacy Codex symlink {source} must resolve to a directory"
+                                ),
+                            ),
+                            self._codex_seed_guard(
+                                'test "$(stat -c %u -- "$resolved")" = 0',
+                                message=detail(
+                                    f"resolved legacy Codex directory for {source} must be root-owned"
+                                ),
+                            ),
+                            self._codex_seed_guard(
+                                'test -z "$(find "$resolved" -maxdepth 0 ! -user root -print -quit)"',
+                                message=detail(
+                                    f"resolved legacy Codex directory for {source} must not contain non-root ownership"
+                                ),
+                            ),
+                        )
+                    )
+                    + "; fi"
+                ),
+                self._codex_seed_guard(
+                    f"test -d {qsrc}",
+                    message=detail(f"missing legacy Codex directory {source}"),
+                ),
+                self._codex_seed_guard(
+                    f"test -f {qconfig}",
+                    message=detail(f"missing required file {config}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qconfig}",
+                    message=detail(f"required file {config} must not be a symlink"),
+                ),
+                self._codex_seed_guard(
+                    f"test -d {qplugins}",
+                    message=detail(f"missing required directory {plugins}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qplugins}",
+                    message=detail(
+                        f"required directory {plugins} must not be a symlink"
+                    ),
+                ),
+                self._codex_seed_guard(
+                    f"test -d {qskills}",
+                    message=detail(f"missing required directory {skills}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qskills}",
+                    message=detail(
+                        f"required directory {skills} must not be a symlink"
+                    ),
+                ),
+                self._codex_seed_guard(
+                    f"test -f {qhooks}",
+                    message=detail(f"missing required file {hooks}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qhooks}",
+                    message=detail(f"required file {hooks} must not be a symlink"),
+                ),
+                self._codex_seed_guard(
+                    f"test -z \"$(find {qplugins} {qskills} ! -type d ! -type f -print -quit)\"",
+                    message=detail(
+                        f"{plugins} and {skills} may contain only regular files and directories"
+                    ),
+                ),
+                self._codex_seed_guard(
+                    f"test -z \"$(find {qplugins} {qskills} -type f -links +1 -print -quit)\"",
+                    message=detail(
+                        f"{plugins} and {skills} must not contain hard-linked regular files"
+                    ),
+                ),
+                f"tmp=$(mktemp -d {qctl}.tmp.XXXXXX)",
+                f"trap 'rm -rf -- \"$tmp\"' EXIT HUP INT TERM",
+                f"install -m 0644 {qconfig} \"$tmp/config.toml\"",
+                f"install -m 0644 {qhooks} \"$tmp/hooks.json\"",
+                f"cp -R --no-preserve=all {qplugins} \"$tmp/plugins\"",
+                f"cp -R --no-preserve=all {qskills} \"$tmp/skills\"",
+                self._codex_seed_guard(
+                    "test -z \"$(find \"$tmp/plugins\" \"$tmp/skills\" "
+                    "\\( -type l -o \\( ! -type d ! -type f \\) -o "
+                    "\\( -type f -links +1 \\) \\) -print -quit)\"",
+                    message=detail(
+                        "copied plugin/skill tree contains a symlink, special file, or hard-linked regular file"
+                    ),
+                ),
+                (
+                    "if command -v getfattr >/dev/null 2>&1; then "
+                    + self._codex_seed_guard(
+                        "test -z \"$(getfattr -R -d --absolute-names \"$tmp/plugins\" \"$tmp/skills\" "
+                        "2>/dev/null | sed '/^# file:/d;/^$/d')\"",
+                        message=detail(
+                            "copied plugin/skill tree preserved extended attributes"
+                        ),
+                    )
+                    + "; fi"
+                ),
+                f"chown -R {root}:{root_group} \"$tmp\"",
+                f"find \"$tmp\" -type d -exec chmod 0755 {{}} +",
+                f"find \"$tmp\" -type f -exec chmod 0644 {{}} +",
+                f"mv \"$tmp\" {qctl}",
+                "trap - EXIT HUP INT TERM",
+            ]
             rows.append(
                 f"test ! -L {qctl} && "
-                f"if [ ! -e {qctl} ]; then "
-                # A legacy ~/.codex symlink is accepted only after the link
-                # itself and its resolved target are proven deployment-owned.
-                # The subsequent qsrc/* reads therefore never follow an
-                # untrusted link.  Root-owned live installs are migrated
-                # atomically instead of being rejected as malformed.
-                f"if test -L {qsrc}; then "
-                f"test \"$(find {qsrc} -maxdepth 0 -type l -user root -print -quit)\" = {qsrc} && "
-                f"resolved=$(readlink -e -- {qsrc}) && test -d \"$resolved\" && "
-                f"test \"$(stat -c %u -- \"$resolved\")\" = 0 && "
-                f"test -z \"$(find \"$resolved\" -maxdepth 0 ! -user root -print -quit)\"; "
-                f"fi && "
-                f"test -d {qsrc} && "
-                f"test -f {qsrc}/config.toml && test ! -L {qsrc}/config.toml && "
-                f"test -d {qsrc}/plugins && test ! -L {qsrc}/plugins && "
-                f"test -d {qsrc}/skills && test ! -L {qsrc}/skills && "
-                f"test -f {qsrc}/hooks.json && test ! -L {qsrc}/hooks.json && "
-                f"test -z \"$(find {qsrc}/plugins {qsrc}/skills "
-                f"! -type d ! -type f -print -quit)\" && "
-                f"tmp=$(mktemp -d {qctl}.tmp.XXXXXX) && "
-                f"trap 'rm -rf -- \"$tmp\"' EXIT HUP INT TERM && "
-                f"install -m 0644 {qsrc}/config.toml \"$tmp/config.toml\" && "
-                f"install -m 0644 {qsrc}/hooks.json \"$tmp/hooks.json\" && "
-                f"cp -R --no-preserve=all {qsrc}/plugins \"$tmp/plugins\" && "
-                f"cp -R --no-preserve=all {qsrc}/skills \"$tmp/skills\" && "
-                # ``--no-preserve=all`` must be backed by a post-copy shape
-                # check: no symlink/special node, no inherited hardlink
-                # identity, and (where available) no copied xattr.
-                f"test -z \"$(find \"$tmp/plugins\" \"$tmp/skills\" "
-                f"\\( -type l -o \\( ! -type d ! -type f \\) -o -links +1 "
-                f"\\) -print -quit)\" && "
-                f"if command -v getfattr >/dev/null 2>&1; then "
-                f"test -z \"$(getfattr -R -d --absolute-names \"$tmp/plugins\" \"$tmp/skills\" "
-                f"2>/dev/null | sed '/^# file:/d;/^$/d')\"; fi && "
-                f"chown -R {root}:{scheme.group_of(root)} \"$tmp\" && "
-                f"find \"$tmp\" -type d -exec chmod 0755 {{}} + && "
-                f"find \"$tmp\" -type f -exec chmod 0644 {{}} + && "
-                f"mv \"$tmp\" {qctl} && trap - EXIT HUP INT TERM; fi"
+                f"if [ ! -e {qctl} ]; then {' && '.join(control_steps)}; fi"
             )
             rows.append(
                 f"if [ ! -e {qcred} ]; then test -f {qsrc}/auth.json && "

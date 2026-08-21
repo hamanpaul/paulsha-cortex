@@ -7,11 +7,16 @@ They must remain failing until that table and its consumers are implemented.
 
 from __future__ import annotations
 
-import pytest
+import grp
 import os
+import pwd
+import pytest
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+import unittest
 from pathlib import Path
 
 from paulsha_cortex.coordinator import spool_slot
@@ -41,6 +46,169 @@ def _surfaces():
     table = getattr(permgen, "PER_JOB_WRITABLE_SURFACES", None)
     assert table is not None, "permgen must expose the canonical per-job surface table"
     return table
+
+
+class _LocalCodexSeedScheme:
+    def __init__(
+        self,
+        *,
+        deploy_account: str,
+        durable_state_owner: str,
+        groups: dict[str, str],
+        accounts: dict[permgen.Principal, str | None],
+    ) -> None:
+        self.deploy_account = deploy_account
+        self.durable_state_owner = durable_state_owner
+        self._groups = groups
+        self._accounts = accounts
+
+    def resolve(self, principal: permgen.Principal) -> str | None:
+        return self._accounts.get(principal)
+
+    def group_of(self, account: str) -> str:
+        return self._groups[account]
+
+
+def _local_codex_seed_layout(tmp_path: Path):
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    scheme = _LocalCodexSeedScheme(
+        deploy_account=account,
+        durable_state_owner=account,
+        groups={account: group},
+        accounts={permgen.Principal.BUILDER: account},
+    )
+    layout = permgen.PathLayout(
+        agents_root=str(tmp_path / "agents"),
+        home_root=str(tmp_path / "home"),
+        deploy_root=str(tmp_path / "deploy"),
+    )
+    source = Path(layout.home_of(account)) / ".codex"
+    controls = Path(layout.codex_control_root) / "builder"
+    credential = Path(layout.codex_credential_root) / "builder" / "auth.json"
+    return layout, scheme, source, controls, credential
+
+
+def _populate_legacy_codex(source: Path) -> None:
+    (source / "plugins" / "nested").mkdir(parents=True)
+    (source / "skills" / "nested" / "deep").mkdir(parents=True)
+    (source / "plugins" / "nested" / "plugin.json").write_text('{"plugin":true}\n')
+    (source / "skills" / "nested" / "deep" / "policy.md").write_text("policy\n")
+    (source / "config.toml").write_text("model = 'deployed'\n")
+    (source / "hooks.json").write_text("{}\n")
+    (source / "auth.json").write_text('{"seed":true}\n')
+
+
+def _run_shell(command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["bash", "-eu", "-c", command], capture_output=True, text=True)
+
+
+def _builder_control_command(layout, scheme) -> str:
+    expected = f"{layout.codex_control_root}/builder"
+    for command in layout.codex_authority_seed_commands(scheme):
+        if expected in command and "mktemp -d" in command:
+            return command
+    raise AssertionError("builder control seed command missing")
+
+
+def _assert_generated_migration_creates_parent_accepts_nested_controls_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    layout, scheme, source, controls, credential = _local_codex_seed_layout(tmp_path)
+    _populate_legacy_codex(source)
+
+    commands = layout.codex_authority_seed_commands(scheme)
+    assert not Path(layout.codex_control_root).exists()
+    assert not credential.parent.exists()
+
+    for command in commands:
+        completed = _run_shell(command)
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stderr == ""
+
+    assert Path(layout.codex_control_root).is_dir()
+    assert controls.is_dir()
+    assert (controls / "plugins" / "nested" / "plugin.json").read_text() == '{"plugin":true}\n'
+    assert (controls / "skills" / "nested" / "deep" / "policy.md").read_text() == "policy\n"
+    assert credential.read_text() == '{"seed":true}\n'
+
+    baseline = {
+        path.relative_to(controls): path.read_bytes()
+        for path in controls.rglob("*")
+        if path.is_file()
+    }
+    source.joinpath("config.toml").write_text("model = 'mutated'\n")
+
+    for command in commands:
+        completed = _run_shell(command)
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stderr == ""
+
+    assert (controls / "config.toml").read_text() == "model = 'deployed'\n"
+    assert baseline == {
+        path.relative_to(controls): path.read_bytes()
+        for path in controls.rglob("*")
+        if path.is_file()
+    }
+    assert credential.read_text() == '{"seed":true}\n'
+
+
+def _assert_generated_migration_rejects_missing_required_control_input(
+    tmp_path: Path, missing_relpath: str
+) -> None:
+    layout, scheme, source, controls, _ = _local_codex_seed_layout(tmp_path)
+    _populate_legacy_codex(source)
+
+    target = source / missing_relpath
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+
+    completed = _run_shell(_builder_control_command(layout, scheme))
+    assert completed.returncode != 0
+    assert "Codex control seed (builder):" in completed.stderr
+    assert missing_relpath in completed.stderr
+    assert not controls.exists()
+
+
+def _assert_generated_migration_rejects_hard_linked_regular_files(tmp_path: Path) -> None:
+    layout, scheme, source, controls, _ = _local_codex_seed_layout(tmp_path)
+    _populate_legacy_codex(source)
+
+    original = source / "plugins" / "nested" / "plugin.json"
+    linked = source / "plugins" / "nested" / "linked-plugin.json"
+    os.link(original, linked)
+
+    completed = _run_shell(_builder_control_command(layout, scheme))
+    assert completed.returncode != 0
+    assert "hard-linked regular file" in completed.stderr
+    assert not controls.exists()
+
+
+class CodexAuthoritySeedCommandTests(unittest.TestCase):
+    def test_whitelists_controls_and_normalizes_live_modes(self) -> None:
+        test_authority_migration_whitelists_controls_and_normalizes_live_modes()
+
+    def test_generated_migration_creates_parent_accepts_nested_controls_and_is_idempotent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            _assert_generated_migration_creates_parent_accepts_nested_controls_and_is_idempotent(
+                Path(d)
+            )
+
+    def test_generated_migration_rejects_each_missing_required_control_input(self) -> None:
+        for missing_relpath in ("config.toml", "hooks.json", "plugins", "skills"):
+            with self.subTest(missing_relpath=missing_relpath):
+                with tempfile.TemporaryDirectory() as d:
+                    _assert_generated_migration_rejects_missing_required_control_input(
+                        Path(d), missing_relpath
+                    )
+
+    def test_generated_migration_rejects_hard_linked_regular_files(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            _assert_generated_migration_rejects_hard_linked_regular_files(Path(d))
 
 
 def test_one_canonical_table_covers_every_declared_writable_surface() -> None:
@@ -653,11 +821,16 @@ def test_authority_migration_whitelists_controls_and_normalizes_live_modes() -> 
         permgen.DEFAULT_LAYOUT.codex_authority_seed_commands(permgen.FOUR_WAY_SCHEME)
     )
     assert "cp -a /var/lib/cortex-builder/.codex " not in commands
+    assert (
+        f"install -d -o root -g root -m 0755 {shlex.quote(permgen.DEFAULT_LAYOUT.codex_control_root)}"
+        in commands
+    )
     for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
         assert f"/.codex/{leaf}" in commands
     for runtime_leaf in ("sessions", "memories", "installation_id", "auth.json"):
         assert f'cp -a /var/lib/cortex-builder/.codex/{runtime_leaf}' not in commands
     assert '! -type d ! -type f' in commands
+    assert "-type f -links +1" in commands
     assert 'find "$tmp" -type d -exec chmod 0755' in commands
     assert 'find "$tmp" -type f -exec chmod 0644' in commands
     assert "mktemp -d" in commands
@@ -665,9 +838,6 @@ def test_authority_migration_whitelists_controls_and_normalizes_live_modes() -> 
 
 def test_generated_migration_accepts_only_root_owned_legacy_codex_symlink(tmp_path) -> None:
     """Run the generated migration against a real legacy symlink when root is available."""
-    import pwd
-    import shutil
-
     if os.geteuid() != 0 or shutil.which("bash") is None:
         pytest.skip("requires root for generated ownership migration")
     try:
@@ -681,33 +851,55 @@ def test_generated_migration_accepts_only_root_owned_legacy_codex_symlink(tmp_pa
         deploy_root=str(tmp_path / "deploy"),
     )
     source_target = tmp_path / "legacy-codex"
-    (source_target / "plugins").mkdir(parents=True)
-    (source_target / "skills").mkdir()
-    (source_target / "plugins" / "plugin.json").write_text('{"plugin":true}\n')
-    (source_target / "skills" / "policy.md").write_text("policy\n")
+    (source_target / "plugins" / "nested").mkdir(parents=True)
+    (source_target / "skills" / "nested" / "deep").mkdir(parents=True)
+    (source_target / "plugins" / "nested" / "plugin.json").write_text('{"plugin":true}\n')
+    (source_target / "skills" / "nested" / "deep" / "policy.md").write_text("policy\n")
     (source_target / "config.toml").write_text("model = 'deployed'\n")
     (source_target / "hooks.json").write_text("{}\n")
     (source_target / "auth.json").write_text('{"seed":true}\n')
     legacy = Path(layout.home_of("cortex-builder")) / ".codex"
     legacy.parent.mkdir(parents=True)
     legacy.symlink_to(source_target, target_is_directory=True)
-    controls_parent = Path(layout.codex_control_root)
-    controls_parent.mkdir(parents=True)
-    credential_parent = Path(layout.codex_credential_root) / "builder"
-    credential_parent.mkdir(parents=True)
-
-    commands = layout.codex_authority_seed_commands(permgen.FOUR_WAY_SCHEME)
+    commands = [
+        command
+        for command in layout.codex_authority_seed_commands(permgen.FOUR_WAY_SCHEME)
+        if "/builder" in command
+    ]
     for command in commands:
         completed = subprocess.run(["bash", "-eu", "-c", command], capture_output=True)
         assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    controls_parent = Path(layout.codex_control_root)
+    assert controls_parent.is_dir()
     migrated = Path(layout.codex_control_root) / "builder"
     assert migrated.is_dir() and not migrated.is_symlink()
     assert (migrated / "config.toml").read_text() == "model = 'deployed'\n"
-    assert (migrated / "plugins" / "plugin.json").read_text() == '{"plugin":true}\n'
-    assert (migrated / "skills" / "policy.md").read_text() == "policy\n"
+    assert (migrated / "plugins" / "nested" / "plugin.json").read_text() == '{"plugin":true}\n'
+    assert (migrated / "skills" / "nested" / "deep" / "policy.md").read_text() == "policy\n"
     assert (migrated / "config.toml").stat().st_mode & 0o777 == 0o644
     assert (migrated / "plugins").stat().st_mode & 0o777 == 0o755
     assert (Path(layout.codex_credential_root) / "builder" / "auth.json").read_text() == '{"seed":true}\n'
+
+
+def test_generated_migration_creates_parent_accepts_nested_controls_and_is_idempotent(
+    tmp_path,
+) -> None:
+    _assert_generated_migration_creates_parent_accepts_nested_controls_and_is_idempotent(
+        tmp_path
+    )
+
+
+@pytest.mark.parametrize("missing_relpath", ("config.toml", "hooks.json", "plugins", "skills"))
+def test_generated_migration_rejects_each_missing_required_control_input(
+    tmp_path, missing_relpath
+) -> None:
+    _assert_generated_migration_rejects_missing_required_control_input(
+        tmp_path, missing_relpath
+    )
+
+
+def test_generated_migration_rejects_hard_linked_regular_files(tmp_path) -> None:
+    _assert_generated_migration_rejects_hard_linked_regular_files(tmp_path)
 
 
 @pytest.mark.parametrize("principal", (permgen.Principal.BUILDER, permgen.Principal.REVIEWER))
