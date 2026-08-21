@@ -537,14 +537,16 @@ def validate_envelope(payload: object) -> TerminalEnvelope:
 
 
 def gate_ledger_path(log_path: str | Path) -> Path:
-    """由 job 的 ``log_path`` 推導 gate ledger 路徑（``<...>.jsonl`` → ``<...>.gates.json``）。
+    """由 canonical job log 推導 Manager-only gate ledger 路徑。
 
     刻意與 :func:`paulsha_cortex.coordinator.dispatcher.exit_sentinel_path` 同一套
     推導方式：ledger 由 manager 掌控的 wrapper script 寫在 manager 自己的 log_dir，
     模型的 cwd 是 worktree、也拿不到這個路徑，因此 ledger 不是模型能產生或改寫的。
     """
 
-    path = Path(log_path)
+    from .job_workspace import manager_control_log_path
+
+    path = manager_control_log_path(log_path)
     return path.with_name(path.stem + ".gates.json")
 
 

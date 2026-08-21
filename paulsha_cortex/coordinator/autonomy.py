@@ -958,6 +958,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
             "runtime_surface": handle.runtime_surface,
             "credential_publish": handle.credential_publish,
             "prompt_path": handle.prompt_path,
+            "control_log_path": handle.control_log_path,
         }
     kwargs = {
         "executor": handle.executor,
@@ -970,6 +971,7 @@ def _attach_launch_handle(*, dispatcher, job: dict, handle: LaunchHandle) -> dic
         "runtime_surface": handle.runtime_surface,
         "credential_publish": handle.credential_publish,
         "prompt_path": handle.prompt_path,
+        "control_log_path": handle.control_log_path,
     }
     # External callers and older test registries may still expose the pre-
     # runtime metadata signature.  Filter only at this duck-typed seam; the

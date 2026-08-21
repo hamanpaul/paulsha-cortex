@@ -1012,6 +1012,10 @@ class JobRegistry:
             "session_name": session_name,
             "pid": pid,
             "log_path": log_path,
+            # Template launches persist a separate Manager-only completion
+            # anchor because their canonical JSONL log lives in a job-writable
+            # spool.  Legacy/direct rows leave this unset and use log_path.
+            "control_log_path": None,
             "exit_code": exit_code,
             "subject_head": subject_head,
             "spec_hash": spec_hash,
@@ -1200,6 +1204,7 @@ class JobRegistry:
         runtime_surface: str | None = None,
         credential_publish: bool = False,
         prompt_path: str | None = None,
+        control_log_path: str | None = None,
     ) -> dict[str, Any]:
         job = self._find_job(job_id)
         if job["status"] not in ACTIVE_JOB_STATUSES:
@@ -1215,6 +1220,7 @@ class JobRegistry:
         job["runtime_surface"] = runtime_surface
         job["credential_publish"] = credential_publish
         job["prompt_path"] = prompt_path
+        job["control_log_path"] = control_log_path
         job["started_at"] = _now_iso()
         self._persist()
         return _deepcopy_json(job)

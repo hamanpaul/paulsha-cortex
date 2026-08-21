@@ -27,6 +27,7 @@ skip。結構性的那一組（effective 權限）在任何支援 ACL 的環境�
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import stat
 import struct
@@ -484,6 +485,37 @@ def test_wrapper_verdict_segment_is_silent_when_the_reviewer_wrote_nothing(
     assert proc.returncode == 9
     assert proc.stderr == ""
     assert not verdict.exists()
+
+
+def test_wrapper_publishes_atomic_last_message_before_manager_control(
+    tmp_path: Path,
+) -> None:
+    """Codex temp+rename output is readable before Manager records completion."""
+
+    last_message = tmp_path / "job.last.json"
+    temporary = tmp_path / "job.last.json.tmp"
+    sentinel = tmp_path / "job.exit"
+    script = launcher.build_wrapper_script(
+        inner_argv=[
+            "bash",
+            "-c",
+            f"umask 0077; printf '{{\"ok\":true}}' > {temporary}; mv -f {temporary} {last_message}; exit 5",
+        ],
+        sentinel=str(sentinel),
+        ledger=str(tmp_path / "job.gates.json"),
+        worktree=str(tmp_path),
+        repo_root=None,
+        run_gates=False,
+        last_message_path=str(last_message),
+    )
+
+    assert script.index("job.last.json") < script.index("job.exit")
+    proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+    assert proc.returncode == 5
+    assert json.loads(last_message.read_text(encoding="utf-8")) == {"ok": True}
+    assert stat.S_IMODE(last_message.stat().st_mode) == spool_slot.PUBLISHED_FILE_MODE
+    assert sentinel.read_text(encoding="utf-8") == "5"
 
 
 def test_wrapper_is_byte_identical_when_neither_spool_is_in_play(tmp_path: Path) -> None:

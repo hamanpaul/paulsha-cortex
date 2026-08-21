@@ -14,6 +14,11 @@
 - **#718 repair:** headless hook event writes now use the authoritative per-job
   slot (including `--spool-root`), monitor harvest covers isolated child slots,
   and repeated Codex control scaffold installs preserve deployed policy content.
+- **#718 repair:** template jobs no longer bridge the job-writable log spool to
+  Manager controls with a cross-mount hard link; Manager reads the preseeded
+  canonical log, completion controls use an explicit Manager-only anchor, and
+  Codex last-message output is published readable before Manager completion
+  accounting without becoming terminal evidence.
 - **#718：建立五面向 per-job writable surface 單一真相與 instance-scoped slot helper；Codex `exec` 固定帶 `--ignore-user-config`，並同步更新 argv golden pins。**
 - **#718（RED）：新增 per-job trust-root writable-surface isolation regression contract tests**，鎖定 canonical surface table、instance-scoped slot、foreign-slot boundary 與 fail-closed slot shape。
 - **#776 補遺：archive 前補齊舊 manifest 世代的 openspec change scaffold**（canonical-specs-invalid 修復）。

@@ -1333,6 +1333,7 @@ def _launch_foreign_review(
             runtime_surface=handle.runtime_surface,
             credential_publish=handle.credential_publish,
             prompt_path=handle.prompt_path,
+            control_log_path=handle.control_log_path,
         )
         registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
         registry.record_action(
@@ -3276,6 +3277,13 @@ def _raise_if_worktree_read_blocked(result: object, *, what: str) -> None:
     )
 
 
+def _job_control_log_path(job: Mapping[str, object], log_path: str) -> str:
+    """Return the persisted Manager-only completion anchor for a job."""
+
+    control = job.get("control_log_path")
+    return control if isinstance(control, str) and control else log_path
+
+
 def _record_candidate_full_suite_evidence(
     job: Mapping[str, object], *, run, candidate: str
 ) -> None:
@@ -3294,7 +3302,7 @@ def _record_candidate_full_suite_evidence(
         if not isinstance(log_path, str) or not log_path:
             return
         found = terminal_contract.read_gate_ledger(
-            terminal_contract.gate_ledger_path(log_path)
+            terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path))
         )
         if found is None:
             return
@@ -3345,7 +3353,7 @@ def _job_gate_worktree_state(job: Mapping[str, object]) -> Mapping[str, object] 
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return None
-    path = terminal_contract.gate_ledger_path(log_path)
+    path = terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path))
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -4296,7 +4304,7 @@ def _assert_terminal_gate_consistency(
         )
     terminal_contract.authorize_terminal(
         envelope,
-        ledger_path=terminal_contract.gate_ledger_path(log_path),
+        ledger_path=terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path)),
         require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
         test_policy=test_policy,
         expected_gate_names=_expected_gate_names_for_test_policy(test_policy),
@@ -8608,7 +8616,7 @@ def _prior_card_failed_gates(job: Mapping[str, object]) -> list[dict[str, object
         return []
     try:
         found = terminal_contract.read_gate_ledger(
-            terminal_contract.gate_ledger_path(log_path)
+            terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path))
         )
         if found is None:
             return []
@@ -9910,6 +9918,7 @@ def _dispatch_workflow_card(
             runtime_surface=handle.runtime_surface,
             credential_publish=handle.credential_publish,
             prompt_path=handle.prompt_path,
+            control_log_path=handle.control_log_path,
         )
     except BaseException as launch_exc:
         registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)

@@ -11,6 +11,7 @@
 
 - [x] Extend the single structured trust-root surface table with real R1 runtime-root assets and derive production template-unit, permission-plan, replica/run-under, canonical path, provisioning ACL, and probe output from it.
 - [x] Update commit, event, verdict, ledger, and gate-worktree producers/consumers to use the digest-bearing systemd instance slot selected from Manager job identity.
+- [x] Replace the cross-`ReadWritePaths` job-log hard link with the Manager-preseeded canonical job-log surface plus an explicit Manager-only completion-control anchor; keep the generated unit contract and service-namespace `EXDEV` regression probe aligned.
 - [ ] Deploy generated units and run two-principal own/foreign byte-identity probes; this remains Manager/operator work and is not source-test evidence.
 
 ## Task 3: Make Codex control inputs immutable without breaking refresh
@@ -20,6 +21,7 @@
 - [x] Pass `--ignore-user-config` on every `codex exec` lane and update the byte-pinned argv regression tests.
 - [x] Route oversized Claude/CG workflow prompts through a bounded Manager-created per-job prompt file; isolated template/transient launch paths keep prompt bytes out of argv, env, and status, use a Manager-owned non-renameable sibling of the spec spool, track prelaunch slots for janitor cleanup, and have Manager exit accounting clean the file after termination.
 - [x] Keep the auth publisher owner-aware for unchanged Manager-owned seeds and atomic job-owned refreshes, and add source/regression coverage for the split-UID protocol without changing the live deployment claim.
+- [x] Pre-seed Codex last-message slots and publish temp+rename output as Manager-readable before Manager completion accounting; last-message bytes remain diagnostic/model output and are never terminal evidence.
 - [x] Add explicit Codex reasoning-effort argv pins for `gpt-5.6-luna` (`max`) and `gpt-5.3-codex-spark` (`xhigh`).
 - [x] Exercise the prompt byte channel and auth publisher with real split-UID arms when the deployed accounts are available; retain the tests as skipped-only deployment probes when this checkout lacks those accounts.
 

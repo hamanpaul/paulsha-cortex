@@ -185,10 +185,11 @@ JOB_LOG_SPOOLS: tuple[JobLogSpool, ...] = (
             "sentinel（`<slice>.exit`）住在同一層，而 #604 的整個保證就是「它們由 "
             "Manager 寫、採信端以 `foreign_evidence_author()` 檢查擁有者」。給 builder "
             "一條進得去那一層的 RWP，等於把剛關上的門重新打開——因此 log 改掛在 "
-            "`commit-spool` 底下，Manager 端那條 harvest 路徑則以 **hard link** 對上"
-            "同一個 inode（見 `coordinator/job_workspace.py:prepare_job_log_spool`）："
-            "`log_path` 的字面量、exit sentinel、gate ledger、spool key 的推導"
-            "**一個位元組都沒有變**。"
+            "`commit-spool` 底下，該格由 Manager 預建並直接作為 canonical readable"
+            " log surface（見 `coordinator/job_workspace.py:prepare_job_log_spool`）。"
+            "completion 的 exit sentinel／gate ledger 不再從 job-writable log 名稱直接"
+            "落地，而是經 Manager-only control anchor 投影；因此 `ProtectSystem=strict`"
+            "下兩個 `ReadWritePaths` mount 不需要 hard link，且 job 仍碰不到 control files。"
         ),
     ),
     JobLogSpool(

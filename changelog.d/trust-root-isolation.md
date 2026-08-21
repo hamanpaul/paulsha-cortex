@@ -26,3 +26,5 @@
 # Repair: route isolated Claude/CG workflow prompts through bounded Manager-created per-job files (with Manager-side termination cleanup), derive Codex credential harvest from typed runtime surfaces with durable fail-closed diagnostics, and pin Codex reasoning effort for the two deployed model identities.
 
 # Repair: place prompt files under Manager-owned non-renameable per-principal roots, retain durable orphan diagnostics, and verify split-UID atomic auth refreshes plus source metadata stripping.
+
+# Repair: remove the cross-mount job-log hard link; Manager now reads the preseeded canonical per-job log surface while exit/ledger controls stay on an explicit Manager-only anchor, and Codex last-message temp+rename output is published readable before completion accounting without entering the evidence path.

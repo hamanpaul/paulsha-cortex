@@ -742,7 +742,10 @@ def ensure_gate_ledger(
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return None
-    ledger_path = terminal_contract.gate_ledger_path(log_path)
+    control_log_path = job.get("control_log_path")
+    ledger_path = terminal_contract.gate_ledger_path(
+        control_log_path if isinstance(control_log_path, str) and control_log_path else log_path
+    )
     if Path(ledger_path).exists():
         return None
     spool_key = spool_key_for_job(job)

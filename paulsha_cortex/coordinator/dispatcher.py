@@ -43,16 +43,19 @@ def _branch_for_task(task: str) -> str:
 
 
 def exit_sentinel_path(log_path: str) -> Path:
-    """由 job 的 log_path 推導 exit sentinel 檔路徑（<...>.jsonl → <...>.exit）。
+    """由 canonical job log 推導 Manager-only exit sentinel 路徑。
 
     SubprocessLauncher 在子進程結束時把 `$?` 寫入此檔；poll_headless_done 跨進程讀回，
     故完成判定不再依賴 os.waitpid（只有 spawn 子進程的進程能 reap）。確定性、零 I/O。
 
     #604：降權模式下寫者已改為 Manager 側的 exit 記帳 shell（見
-    `job_runner.build_manager_exit_recorder_argv`），**路徑推導完全不變**——變的
-    只有「誰是寫者」，因此 harvest 端與所有既有呼叫端零改動。
+    `job_runner.build_manager_exit_recorder_argv`）。#708 repair 之後 job log
+    本身位於 per-principal writable spool；先投影回 Manager-only control-log
+    anchor，避免把 sentinel 放進 job 可 rename 的目錄。
     """
-    return Path(log_path).with_suffix(".exit")
+    from .job_workspace import manager_control_log_path
+
+    return manager_control_log_path(log_path).with_suffix(".exit")
 
 
 def _read_exit_sentinel(log_path: str | None) -> int | None:
@@ -209,6 +212,11 @@ class Dispatcher:
         job = self._registry.get_job(job_id)
         pid = job.get("pid")
         log_path = job.get("log_path") if isinstance(job.get("log_path"), str) else None
+        control_log_path = (
+            job.get("control_log_path")
+            if isinstance(job.get("control_log_path"), str)
+            else log_path
+        )
         if not isinstance(pid, int) or not log_path:
             return self._finalize_headless(job_id, exit_code=1, log_path=log_path)
 
@@ -220,7 +228,7 @@ class Dispatcher:
             return self._finalize_headless(job_id, exit_code, log_path)
 
         # 預設：跨進程 durable 機制。
-        exit_code = _read_exit_sentinel(log_path)
+        exit_code = _read_exit_sentinel(control_log_path)
         if exit_code is not None:
             return self._finalize_headless(job_id, exit_code, log_path)
 

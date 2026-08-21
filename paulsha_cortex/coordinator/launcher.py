@@ -163,6 +163,7 @@ def build_wrapper_script(
     write_sentinel: bool = True,
     commit_bundle: str | None = None,
     verdict_file: str | None = None,
+    last_message_path: str | None = None,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -195,8 +196,14 @@ def build_wrapper_script(
     自己 chmod，所以那一步必須由 wrapper 在它結束後補上。段序同樣排在 sentinel
     **之前**，理由與 bundle 一致。
 
-    ``commit_bundle`` 與 ``verdict_file`` 皆為 None 時（planner，以及所有既有測試
-    路徑）script **逐字**與改動前相同。
+    ``last_message_path``（#714 repair）：Codex 的 ``-o`` 可能以 temp+rename
+    發表，最後的檔案因此由 job UID 擁有、`UMask=0077` 下 Manager 讀不到。wrapper
+    在模型結束後只對這個模型輸出做 best-effort mode publication，並把 sentinel
+    放在 publication 之後；它不是 gate/evidence，Manager 不以其 owner 或內容作為
+    completion authority。檔案不存在時 publication 是靜默 no-op。
+
+    三個 publication 參數皆為 None 時（planner，以及所有既有測試路徑）script
+    **逐字**與改動前相同。
 
     ``write_sentinel=False`` / ``run_gates=False``（#604，降權模式）：這支 script
     在降權模式下是以 **job 帳號**（`cortex-builder`）執行的，而 sentinel 與 ledger
@@ -247,7 +254,11 @@ def build_wrapper_script(
         # Do not interpolate it into ``bash -c``: that still makes the prompt
         # an argv element of the shell and fails at Linux's ARG_MAX_STRLEN.
         command = f"cat | {shlex.join(inner_argv)} 2>/dev/null"
-    if commit_bundle is not None or verdict_file is not None:
+    if (
+        commit_bundle is not None
+        or verdict_file is not None
+        or last_message_path is not None
+    ):
         return _publishing_wrapper_script(
             command=command,
             sentinel=sentinel,
@@ -258,6 +269,7 @@ def build_wrapper_script(
             write_sentinel=write_sentinel,
             commit_bundle=commit_bundle,
             verdict_file=verdict_file,
+            last_message_path=last_message_path,
         )
     if write_sentinel:
         script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
@@ -312,11 +324,12 @@ def _publishing_wrapper_script(
     write_sentinel: bool,
     commit_bundle: str | None,
     verdict_file: str | None,
+    last_message_path: str | None,
 ) -> str:
     """帶「成果發表」段的 wrapper。
 
-    段序＝模型 → 存 `$?` → bundle（#623）→ verdict 放寬（#638）→ sentinel →
-    gate → 還原 `$?`。
+    段序＝模型 → 存 `$?` → bundle（#623）→ verdict 放寬（#638）→ last-message
+    publication（#714）→ sentinel → gate → 還原 `$?`。
 
     兩個發表段都排在 sentinel **之前**：sentinel 一出現，Manager 隨時可能在下一個
     tick 判定完成並開始收割，成果必須先落地且已經是 consumer 讀得到的形狀。
@@ -335,6 +348,8 @@ def _publishing_wrapper_script(
         )
     if verdict_file is not None:
         segments.append(spool_slot.publish_file_command(verdict_file))
+    if last_message_path is not None:
+        segments.append(spool_slot.publish_file_command(last_message_path))
     if write_sentinel:
         segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
     if run_gates and repo_root:
@@ -614,6 +629,10 @@ class LaunchHandle:
     runtime_surface: str | None = None
     credential_publish: bool = False
     prompt_path: str | None = None
+    #: Manager-only completion-control anchor.  Template jobs expose a
+    #: canonical log in their writable spool, so the sentinel/ledger cannot
+    #: be reconstructed from ``log_path`` alone.
+    control_log_path: str | None = None
 
 
 def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
@@ -1667,7 +1686,11 @@ class SubprocessLauncher:
         # 絕對化後 JSONL / sentinel / 回傳 log_path 皆與 cwd 無關，跨進程 poll 一致。
         log_dir = str(Path(log_dir).resolve())
         Path(log_dir).mkdir(parents=True, exist_ok=True)
-        log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        # ``manager_log_path`` is the stable Manager-only control anchor.  In
+        # template mode the readable JSONL surface moves into the principal's
+        # preseeded job spool; completion controls keep using this anchor.
+        manager_log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        log_path = manager_log_path
         # #714 缺陷 2：**job 端 log 的落點在這裡就定案**（純路徑推導、零副作用），
         # 因為 executor 的 argv 在下面幾行就要用到它——`-o` 的落點是「這個 job 自己那
         # 份 log 的兄弟檔」。真正把那一格建出來的仍是下面 `prepare_job_log_spool()`
@@ -1841,14 +1864,18 @@ class SubprocessLauncher:
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
         # sentinel 路徑亦 shlex.quote。poll_headless_done 讀此 sentinel，不再靠 os.waitpid。
-        sentinel = str(Path(log_dir) / f"{slice_id}.exit")
+        sentinel = str(Path(manager_log_path).with_suffix(".exit"))
         # 重跑同一 slice_id 前先清掉上一輪殘留：移除舊 exit sentinel、log 以 wb 截斷。
         # 否則 poll_headless_done 會讀到上一輪的 sentinel / 末筆 JSONL，
         # 誤判「還沒開始就已完成」（fail-closed：每輪從乾淨狀態起跑）。
         Path(sentinel).unlink(missing_ok=True)
         # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
-        ledger = terminal_contract.gate_ledger_path(log_path)
+        ledger = terminal_contract.gate_ledger_path(manager_log_path)
         Path(ledger).unlink(missing_ok=True)
+        # The dispatch path is now only the Manager-owned control anchor.  Do
+        # remove an exact stale legacy log name before preparing the canonical
+        # spool, but never scan or mutate a sibling/prefix path.
+        Path(manager_log_path).unlink(missing_ok=True)
         # #623：成果 bundle 的 per-job spool。`prepare_commit_spool()` 同樣負責清掉
         # 上一輪殘留（與 sentinel／ledger 逐條一致），並把上一輪 harvest 之後的封存
         # 解開。判準是 **persona**，不是 `PSC_JOB_RUNNER`：reviewer／planner 不產生
@@ -1894,6 +1921,9 @@ class SubprocessLauncher:
             write_sentinel=not degraded,
             commit_bundle=commit_bundle,
             verdict_file=verdict_file,
+            # The wrapper publishes the final Codex output after temp+rename
+            # and before the Manager-authored completion control is written.
+            last_message_path=last_message_path if self._executor == "codex" else None,
         )
         if runner_plan is not None and self._executor == "codex":
             # Transient units have no generated ExecStopPost. Codex refreshes
@@ -1961,9 +1991,10 @@ class SubprocessLauncher:
             #
             # 改成寫進 builder 自己的 log spool（登記表資產 `build-job-log-spool`，
             # 掛在既有的 `commit-spool` 底下 ⇒ 模板 unit 的 `ReadWritePaths=` 逐字
-            # 不變），Manager 那條路徑則以 **hard link** 指向同一個 inode——
-            # `log_path` 這個字面量、sentinel／gate ledger／spool key 的推導、
-            # harvest 與 usage 抽取因此**一個位元組都沒有變**。
+            # 不變）。那一格由 Manager 預建，因此同一個 canonical 檔案同時是
+            # Manager-readable log surface；不再把兩個獨立 systemd bind mount
+            # 以 hard link 接起來（live namespace 會回 EXDEV）。sentinel／ledger
+            # 留在上面已算出的 Manager-only control surface。
             #
             # **落點由角色決定，不是寫死 builder**：launcher 同時派 builder 與
             # reviewer 兩種 job（`_job_role()`），兩者走不同的模板 unit、不同的帳號，
@@ -1974,7 +2005,7 @@ class SubprocessLauncher:
                 job_workspace.prepare_job_log_spool(
                     principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
                     spool_key=slice_id,
-                    manager_log_path=log_path,
+                    manager_log_path=manager_log_path,
                 )
             )
             # #714：argv 上的 `-o` 是由**上面那個純路徑推導**算出來的，這裡是真的建出
@@ -1988,6 +2019,18 @@ class SubprocessLauncher:
                     "（#714）"
                 )
             job_log_path = prepared_log_path
+            # Codex may publish ``-o`` with temp+rename.  Pre-seed the named
+            # output as a Manager-owned readable slot before the job starts;
+            # the wrapper's post-model publication widens a replacement to
+            # 0644 before the Manager-owned completion sentinel is written.
+            # The output is diagnostic/model data, never terminal evidence.
+            if self._executor == "codex":
+                spool_slot.preseed_job_writable_file(last_message_path)
+            # From this point on the registry and all log consumers use the
+            # canonical Manager-readable spool file.  ``sentinel`` and
+            # ``ledger`` were already derived from ``manager_log_path`` above
+            # and remain outside the job-writable directory.
+            log_path = prepared_log_path
             if self._executor in {"claude", "cg"}:
                 expected_prompt_spool = job_runner.job_prompt_spool_dir(
                     template_plan.spool_dir,
@@ -2097,7 +2140,10 @@ class SubprocessLauncher:
                     sentinel=sentinel,
                     unit=template_plan.unit,
                     account=template_plan.account,
-                    log_path=log_path,
+                    # Start failures are diagnosed from the Manager control
+                    # surface; the canonical JSONL itself is the separate
+                    # job-log spool passed below.
+                    log_path=manager_log_path,
                     # #708 第 3 項：shim 在**接管 log 之前**的失敗只進 unit journal，
                     # 而 Manager 讀不到那份 journal。它改為在 job 自己的 log spool 那一格
                     # 留一筆機器可讀的紀錄，這裡把它撿回錯誤訊息裡。
@@ -2136,4 +2182,5 @@ class SubprocessLauncher:
             ),
             credential_publish=bool(degraded and self._executor == "codex"),
             prompt_path=prompt_file,
+            control_log_path=manager_log_path if degraded else None,
         )

@@ -82,7 +82,9 @@ stderr 併進 JSONL log（`stderr=STDOUT`）。不加 `--quiet` 就等於在 ter
 - log：`systemctl` **沒有** `--pipe`，且 unit 的 `StandardOutput=append:` 會由
   **root 在降權前**開檔（Manager 可寫的路徑上放 symlink 即成提權面），因此改由
   shim 在**已降權之後**依 spec 的 `log_path` 以 `O_NOFOLLOW` 接管 stdout/stderr。
-  **harvest 讀的 log 路徑因此逐字不變**（`<log_dir>/<slice_id>.jsonl`）。
+  template harvest 直接讀 spec 指向的 canonical per-job log spool；Manager-only
+  exit/ledger controls 由 persisted control anchor 定址，direct/systemd-run 的
+  legacy `<log_dir>/<slice_id>.jsonl` 形狀維持不變。
 
 fail-fast 三案（任一命中即 `DiagnosticReason` fail-closed，**絕不**退回其他模式）：
 模板 unit／shim 未安裝、同名 instance 已在跑、spec 寫入失敗。
