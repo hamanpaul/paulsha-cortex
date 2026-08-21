@@ -11,6 +11,7 @@ runbook，不得靜默通過——#638／#657 的教訓逐字如此：單 UID �
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -97,6 +98,15 @@ class _Harness:
 
     def __init__(self, tmp_path: Path, monkeypatch, *, log_payload: str = "{}", rc: int = 0,
                  hang: bool = False) -> None:
+        agents = Path(os.environ["PSC_AGENTS_ROOT"])
+        controls = agents / "config/codex-controls/reviewer"
+        (controls / "plugins").mkdir(parents=True)
+        (controls / "skills").mkdir()
+        (controls / "config.toml").write_text("# test deployment policy\n")
+        (controls / "hooks.json").write_text("{}\n")
+        auth = agents / "config/codex-credentials/reviewer/auth.json"
+        auth.parent.mkdir(parents=True)
+        auth.write_text("{}\n")
         self.tmp_path = tmp_path
         self.spool = tmp_path / "job-specs" / "reviewer"
         self.spool.mkdir(parents=True)

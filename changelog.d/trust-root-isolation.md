@@ -1,6 +1,6 @@
 # #718 trust-root isolation
 
-- Register builder/reviewer per-job Codex-home and runtime-cache roots as real permission-plan assets; project deployment controls and existing auth into concrete Manager-provisioned slots with own-account ACLs only.
+- Register builder/reviewer per-job Codex-home and runtime-cache roots as real permission-plan assets; fail closed without deployment-owned canonical controls and credential authority, then project immutable controls and atomic auth seeds into concrete Manager-provisioned slots with own-account ACLs only.
 
 - Repair Codex-capable jobs to use canonical per-job `CODEX_HOME` and cache slots, remove reviewer access to the builder-only event spool, and provision immutable control leaves without truncating refreshable `auth.json` state.
 

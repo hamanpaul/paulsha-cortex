@@ -482,9 +482,8 @@ class JobPlanningInvoker:
         workspace = str(Path(reservation.cwd).resolve())
         spool_slot.provision_runtime_surfaces(
             principal="reviewer", job_id=reservation.job_id,
-            canonical_codex_home=spool_slot.readable_codex_home(
-                Path(self._env[job_runner.REVIEWER_HOME_ENV]) / ".codex"
-                if self._env.get(job_runner.REVIEWER_HOME_ENV) else None
+            canonical_codex_home=spool_slot.canonical_codex_controls(
+                "reviewer", manager_env=self._env
             ),
             account=(
                 job_runner.resolve_job_account(self._env, role=job_runner.JOB_ROLE_REVIEW)
@@ -595,6 +594,12 @@ class JobPlanningInvoker:
 
             last_message = _last_message_marker(last_message_path)
             output_text = _read_last_message(last_message_path)
+        # The per-job auth leaf is writable so Codex can perform an atomic
+        # refresh. Harvest it only after the unit has stopped, then seed the
+        # following job from this Manager-owned authority.
+        spool_slot.commit_runtime_credential(
+            principal="reviewer", job_id=reservation.job_id
+        )
         if returncode != 0:
             client_tail = self._read_log(client_log)
             silent = not stdout.strip()

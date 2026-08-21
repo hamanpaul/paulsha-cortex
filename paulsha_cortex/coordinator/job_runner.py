@@ -1359,18 +1359,13 @@ def build_job_env(
     if home:
         env["HOME"] = home
     if config.role_id in (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW):
-        from ..config import paths
-        from .spool_slot import canonical_job_slot
+        from .spool_slot import canonical_job_slot, writable_surface
 
         principal_id = "reviewer" if config.role_id == JOB_ROLE_REVIEW else "builder"
-        env["CODEX_HOME"] = str(canonical_job_slot(
-            f"{principal_id}-codex-home", job_id,
-            writable_root=paths.agents_root() / "runtime" / "codex-home" / principal_id,
-        ))
-        env["XDG_CACHE_HOME"] = str(canonical_job_slot(
-            f"{principal_id}-runtime-cache", job_id,
-            writable_root=paths.agents_root() / "runtime" / "job-cache" / principal_id,
-        ))
+        codex_row = writable_surface(f"{principal_id}-codex-home")
+        cache_row = writable_surface(f"{principal_id}-runtime-cache")
+        env["CODEX_HOME"] = str(canonical_job_slot(codex_row.surface_id, job_id))
+        env["XDG_CACHE_HOME"] = str(canonical_job_slot(cache_row.surface_id, job_id))
     env["PSC_SLICE_ID"] = slice_id
     env["PSC_JOB_ID"] = job_id
     env["PSC_REPO_ROOT"] = repo_root

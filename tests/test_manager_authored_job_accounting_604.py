@@ -50,6 +50,14 @@ from paulsha_cortex.trust_root import permgen
 from paulsha_cortex.trust_root.registry import Principal, asset_by_id
 
 _ISOLATED_AGENTS_ROOT = tempfile.mkdtemp(prefix="psc-agents-root-")
+_CODEX_CONTROLS = Path(_ISOLATED_AGENTS_ROOT) / "config/codex-controls/builder"
+(_CODEX_CONTROLS / "plugins").mkdir(parents=True)
+(_CODEX_CONTROLS / "skills").mkdir()
+(_CODEX_CONTROLS / "config.toml").write_text("# test deployment policy\n")
+(_CODEX_CONTROLS / "hooks.json").write_text("{}\n")
+_CODEX_AUTH = Path(_ISOLATED_AGENTS_ROOT) / "config/codex-credentials/builder/auth.json"
+_CODEX_AUTH.parent.mkdir(parents=True)
+_CODEX_AUTH.write_text("{}\n")
 
 _BASE_ENV = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",

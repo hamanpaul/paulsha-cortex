@@ -198,14 +198,28 @@ def test_registry_provisioner_preserves_controls_and_isolates_foreign_slot(
     from paulsha_cortex.config import paths
 
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(tmp_path))
-    own = spool_slot.provision_runtime_surfaces(principal="builder", job_id="job-a")
-    foreign = spool_slot.provision_runtime_surfaces(principal="builder", job_id="job-b")
+    canonical = tmp_path / "config" / "codex-controls" / "builder"
+    (canonical / "plugins").mkdir(parents=True)
+    (canonical / "skills").mkdir()
+    (canonical / "config.toml").write_text("model = 'deployed'\n")
+    (canonical / "hooks.json").write_text("{}\n")
+    authority = spool_slot.credential_authority("builder")
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    authority.write_text('{"seed":true}\n')
+    own = spool_slot.provision_runtime_surfaces(
+        principal="builder", job_id="job-a", canonical_codex_home=canonical
+    )
+    foreign = spool_slot.provision_runtime_surfaces(
+        principal="builder", job_id="job-b", canonical_codex_home=canonical
+    )
     assert len(own) == len(foreign) == 2
     codex_a = next(path for path in own if "codex-home" in str(path))
     codex_b = next(path for path in foreign if "codex-home" in str(path))
     before = (codex_b / "hooks.json").read_bytes()
     (codex_a / "auth.json").write_text('{"refresh":true}\n', encoding="utf-8")
-    spool_slot.provision_runtime_surfaces(principal="builder", job_id="job-a")
+    spool_slot.provision_runtime_surfaces(
+        principal="builder", job_id="job-a", canonical_codex_home=canonical
+    )
     assert (codex_a / "auth.json").read_text(encoding="utf-8") == '{"refresh":true}\n'
     assert (codex_b / "hooks.json").read_bytes() == before
     for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
@@ -234,6 +248,9 @@ def test_provision_projects_canonical_controls_and_auth(tmp_path, monkeypatch) -
     (canonical / "hooks.json").write_text('{"hooks":["deployed"]}\n')
     (canonical / "auth.json").write_text('{"token":"existing"}\n')
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(runtime))
+    authority = spool_slot.credential_authority("builder")
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    authority.write_bytes((canonical / "auth.json").read_bytes())
 
     slots = spool_slot.provision_runtime_surfaces(
         principal="builder", job_id="job-a", canonical_codex_home=canonical
@@ -243,3 +260,41 @@ def test_provision_projects_canonical_controls_and_auth(tmp_path, monkeypatch) -
     assert (codex / "plugins/vendor/plugin.json").read_bytes() == (canonical / "plugins/vendor/plugin.json").read_bytes()
     assert (codex / "auth.json").read_bytes() == (canonical / "auth.json").read_bytes()
     assert (codex / "auth.json").stat().st_mode & 0o060 == 0o060
+
+
+def test_manager_unreadable_legacy_home_never_degrades_to_stub_controls(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(tmp_path / "runtime"))
+    legacy = tmp_path / "legacy" / ".codex"
+    target = tmp_path / "legacy-target"
+    target.mkdir()
+    legacy.parent.mkdir(parents=True)
+    legacy.symlink_to(target, target_is_directory=True)
+    with pytest.raises(spool_slot.SpoolSlotError):
+        spool_slot.readable_codex_home(legacy, require_auth=False)
+    monkeypatch.setenv("PSC_CODEX_CONTROL_ROOT", str(tmp_path / "missing-controls"))
+    with pytest.raises(spool_slot.SpoolSlotError):
+        spool_slot.canonical_codex_controls("builder")
+
+
+def test_auth_refresh_is_committed_as_next_job_seed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(tmp_path))
+    controls = tmp_path / "config" / "codex-controls" / "builder"
+    (controls / "plugins").mkdir(parents=True)
+    (controls / "skills").mkdir()
+    (controls / "config.toml").write_text("model = 'deployed'\n")
+    (controls / "hooks.json").write_text("{}\n")
+    authority = spool_slot.credential_authority("builder")
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    authority.write_text('{"refresh":"old"}\n')
+    first = spool_slot.provision_runtime_surfaces(
+        principal="builder", job_id="job-a", canonical_codex_home=controls
+    )[0]
+    (first / "auth.json").write_text('{"refresh":"new"}\n')
+    spool_slot.commit_runtime_credential(principal="builder", job_id="job-a")
+    second = spool_slot.provision_runtime_surfaces(
+        principal="builder", job_id="job-b", canonical_codex_home=controls
+    )[0]
+    assert (second / "auth.json").read_text() == '{"refresh":"new"}\n'
+    assert (second / "config.toml").read_bytes() == (first / "config.toml").read_bytes()

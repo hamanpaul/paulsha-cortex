@@ -126,6 +126,27 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PSC_REPO_ROOT", str(unset_root / "repo"))
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
+    # Degraded-launch tests exercise production provisioning. Give them a real
+    # deployment-owned control/credential authority rather than permitting the
+    # old silent fallback to role HOME or generated stubs.
+    roots: set[Path] = set()
+    import sys
+    for module in tuple(sys.modules.values()):
+        isolated = getattr(module, "_ISOLATED_AGENTS_ROOT", None)
+        if isolated:
+            roots.add(Path(isolated).resolve())
+    for agents in roots:
+        for principal in ("builder", "reviewer"):
+            for controls in (agents / "config" / "codex-controls" / principal,):
+                (controls / "plugins").mkdir(parents=True, exist_ok=True)
+                (controls / "skills").mkdir(exist_ok=True)
+                (controls / "config.toml").write_text("# hermetic deployment policy\n")
+                (controls / "hooks.json").write_text("{}\n")
+            for credential in (
+                agents / "config" / "codex-credentials" / principal / "auth.json",
+            ):
+                credential.parent.mkdir(parents=True, exist_ok=True)
+                credential.write_text("{}\n")
     # #506：auto-claim scan 的 GitHub 節流在生產預設 1000ms／請求。測試不打真的
     # GitHub，也不該為了節流而真的 sleep——預設關閉，需要驗證節流行為的測試自行
     # setenv 覆寫並注入 sleeper。

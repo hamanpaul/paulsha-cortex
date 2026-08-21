@@ -1717,10 +1717,9 @@ class SubprocessLauncher:
             spool_slot.provision_runtime_surfaces(
                 principal=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
                 job_id=slice_id,
-                canonical_codex_home=spool_slot.readable_codex_home(
-                    Path(os.environ[job_runner.JOB_ROLE_CONFIG[job_role].home_env]) / ".codex"
-                    if os.environ.get(job_runner.JOB_ROLE_CONFIG[job_role].home_env)
-                    else None
+                canonical_codex_home=spool_slot.canonical_codex_controls(
+                    job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
+                    manager_env=os.environ,
                 ),
                 account=(
                     job_runner.resolve_job_account(os.environ, role=job_role)

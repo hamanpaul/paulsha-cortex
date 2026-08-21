@@ -104,25 +104,74 @@ def system_account_exists(account: str) -> bool:
     return True
 
 
-def readable_codex_home(path: str | Path | None) -> Path | None:
-    """Return a projection source only when Manager can enumerate it now."""
+def canonical_codex_controls(
+    principal: str, *, manager_env: dict[str, str] | os._Environ[str] | None = None
+) -> Path:
+    """Return the deployment-owned control authority, or fail closed.
+
+    Role HOME is deliberately not consulted: those trees are job-writable and,
+    in the deployed split-UID layout, are not readable by Manager anyway.
+    """
+    env = os.environ if manager_env is None else manager_env
+    configured = str(env.get("PSC_CODEX_CONTROL_ROOT", "")).strip()
+    root = Path(configured) if configured else Path(os.environ.get(
+        "PSC_AGENTS_ROOT", "/var/lib/cortex"
+    )) / "config" / "codex-controls"
+    candidate = root / principal
+    readable_codex_home(candidate, require_auth=False)
+    return candidate
+
+
+def readable_codex_home(
+    path: str | Path | None, *, require_auth: bool = True
+) -> Path:
+    """Validate a canonical projection source; never silently manufacture one."""
     if path is None:
-        return None
+        raise SpoolSlotError("control", "canonical Codex control source is required")
     candidate = Path(path)
     try:
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise SpoolSlotError("shape", f"canonical control is malformed: {candidate}")
         next(os.scandir(candidate), None)
         for dirname in ("plugins", "skills"):
             child = candidate / dirname
-            if child.exists():
-                next(os.scandir(child), None)
-        for filename in ("config.toml", "hooks.json", "auth.json"):
+            if child.is_symlink() or not child.is_dir():
+                raise SpoolSlotError("shape", f"canonical control is malformed: {child}")
+            next(os.scandir(child), None)
+        filenames = ["config.toml", "hooks.json"]
+        if require_auth:
+            filenames.append("auth.json")
+        for filename in filenames:
             child = candidate / filename
-            if child.exists():
-                with child.open("rb") as stream:
-                    stream.read(1)
+            if child.is_symlink() or not child.is_file():
+                raise SpoolSlotError("shape", f"canonical control is malformed: {child}")
+            with child.open("rb") as stream:
+                stream.read(1)
     except (FileNotFoundError, NotADirectoryError, PermissionError):
-        return None
+        raise SpoolSlotError("control", f"canonical Codex controls are unreadable: {candidate}")
     return candidate
+
+
+def credential_authority(principal: str) -> Path:
+    from ..config import paths
+    configured = os.environ.get("PSC_CODEX_CREDENTIAL_ROOT", "").strip()
+    root = Path(configured) if configured else paths.agents_root() / "config" / "codex-credentials"
+    return root / principal / "auth.json"
+
+
+def commit_runtime_credential(*, principal: str, job_id: str) -> Path:
+    """Atomically harvest a completed job's refresh for the next job seed."""
+    slot = canonical_job_slot(f"{principal}-codex-home", job_id)
+    source = slot / "auth.json"
+    if source.is_symlink() or not source.is_file():
+        raise SpoolSlotError("shape", f"runtime credential is malformed: {source}")
+    authority = credential_authority(principal)
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    temporary = authority.with_name(f".{authority.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(source.read_bytes())
+    temporary.chmod(0o600)
+    os.replace(temporary, authority)
+    return authority
 
 
 def _apply_slot_acl(path: Path, *, account: str, writable: bool) -> None:
@@ -216,12 +265,12 @@ def provision_runtime_surfaces(
         else:
             create_slot(slot, reset=False)
         if row.surface_id.endswith("-codex-home"):
-            source = Path(canonical_codex_home) if canonical_codex_home else None
+            source = readable_codex_home(canonical_codex_home, require_auth=False)
             for dirname in ("plugins", "skills"):
                 control_dir = slot / dirname
                 control_dir.mkdir(exist_ok=True)
-                desired_dir = source / dirname if source else None
-                if desired_dir and desired_dir.exists():
+                desired_dir = source / dirname
+                if desired_dir.exists():
                     if desired_dir.is_symlink() or not desired_dir.is_dir():
                         raise SpoolSlotError("shape", f"canonical control is malformed: {desired_dir}")
                     for item in desired_dir.rglob("*"):
@@ -236,8 +285,8 @@ def provision_runtime_surfaces(
                 ("hooks.json", "{}\n"),
             ):
                 control = slot / filename
-                desired = source / filename if source else None
-                content = desired.read_bytes() if desired and desired.is_file() else fallback.encode()
+                desired = source / filename
+                content = desired.read_bytes()
                 if control.exists() and control.read_bytes() != content:
                     control.chmod(0o600)
                     control.write_bytes(content)
@@ -246,11 +295,10 @@ def provision_runtime_surfaces(
                 control.chmod(0o444)
             auth = slot / "auth.json"
             if not auth.exists():
-                desired_auth = source / "auth.json" if source else None
-                if desired_auth and desired_auth.is_file():
-                    auth.write_bytes(desired_auth.read_bytes())
-                else:
-                    auth.touch()
+                desired_auth = credential_authority(principal)
+                if desired_auth.is_symlink() or not desired_auth.is_file():
+                    raise SpoolSlotError("credential", f"credential authority is unavailable: {desired_auth}")
+                auth.write_bytes(desired_auth.read_bytes())
                 # Preserve the inherited named-user ACL mask. 0600 would mask
                 # the job principal out before Codex can refresh credentials.
                 auth.chmod(0o660)

@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#718 repair:** Codex-capable units now derive isolated per-job homes and caches from real R1 writable-surface assets, Manager provisions only concrete slots with per-account ACLs, and canonical controls plus existing auth state are projected into each slot; reviewer units no longer receive the builder-only monitor event slot.
+- **#718 repair:** Codex-capable units derive isolated per-job homes and caches from real R1 writable-surface assets; Manager now fails closed unless deployment-owned canonical controls and credential authority exist, projects immutable controls byte-for-byte, and uses an atomic auth seed/commit lifecycle; reviewer units no longer receive the builder-only monitor event slot.
 - **#718 repair:** headless hook event writes now use the authoritative per-job
   slot (including `--spool-root`), monitor harvest covers isolated child slots,
   and repeated Codex control scaffold installs preserve deployed policy content.
