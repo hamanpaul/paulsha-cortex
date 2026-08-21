@@ -9,13 +9,13 @@
 
 ## Task 2: Implement canonical slot derivation and provisioning
 
-- [x] Extend the single structured trust-root surface table and derive production template-unit, replica/run-under, canonical path, and probe output from it.
+- [x] Extend the single structured trust-root surface table with real R1 runtime-root assets and derive production template-unit, permission-plan, replica/run-under, canonical path, provisioning ACL, and probe output from it.
 - [x] Update commit, event, verdict, ledger, and gate-worktree producers/consumers to use the digest-bearing systemd instance slot selected from Manager job identity.
 - [ ] Deploy generated units and run two-principal own/foreign byte-identity probes; this remains Manager/operator work and is not source-test evidence.
 
 ## Task 3: Make Codex control inputs immutable without breaking refresh
 
-- [x] Add source-level immutable-control smoke coverage for config, plugins, skills, and hooks while preserving auth refresh; deployed Codex smoke remains below.
+- [x] Add source-level immutable-control smoke coverage and canonical deployment projection for config, plugins, skills, hooks, and existing auth state while preserving per-job auth refresh; deployed Codex smoke remains below.
 - [x] Generate root-owned, idempotent scaffold assets for config, plugins, skills, and hooks without truncating deployed desired content on rerun.
 - [x] Pass `--ignore-user-config` on every `codex exec` lane and update the byte-pinned argv regression tests.
 

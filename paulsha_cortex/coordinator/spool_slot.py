@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import re
+import pwd
 import shlex
 import shutil
 import stat
@@ -95,6 +96,49 @@ ACCESS_ACL_XATTR = "system.posix_acl_access"
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
+def system_account_exists(account: str) -> bool:
+    try:
+        pwd.getpwnam(account)
+    except KeyError:
+        return False
+    return True
+
+
+def readable_codex_home(path: str | Path | None) -> Path | None:
+    """Return a projection source only when Manager can enumerate it now."""
+    if path is None:
+        return None
+    candidate = Path(path)
+    try:
+        next(os.scandir(candidate), None)
+        for dirname in ("plugins", "skills"):
+            child = candidate / dirname
+            if child.exists():
+                next(os.scandir(child), None)
+        for filename in ("config.toml", "hooks.json", "auth.json"):
+            child = candidate / filename
+            if child.exists():
+                with child.open("rb") as stream:
+                    stream.read(1)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return None
+    return candidate
+
+
+def _apply_slot_acl(path: Path, *, account: str, writable: bool) -> None:
+    """Apply ACL without the launcher's mocked ``subprocess.Popen`` surface."""
+    binary = shutil.which("setfacl")
+    if binary is None or Path(binary).name != "setfacl":
+        binary = "/usr/bin/setfacl" if Path("/usr/bin/setfacl").is_file() else None
+    if binary is None:
+        raise SpoolSlotError("acl", "setfacl is required for per-job runtime projection")
+    perms = "rwX" if writable else "r-X"
+    spec = f"u:{account}:{perms},d:u:{account}:{perms}"
+    argv = (binary, "-R", "-m", spec, str(path))
+    if os.spawnv(os.P_WAIT, binary, argv) != 0:
+        raise SpoolSlotError("acl", f"failed to apply per-job ACL: {path}")
+
+
 @dataclass(frozen=True)
 class PerJobWritableSurface:
     """One row wired into path lookup, unit generation and runtime consumers."""
@@ -135,10 +179,10 @@ PER_JOB_WRITABLE_SURFACES: tuple[PerJobWritableSurface, ...] = (
     PerJobWritableSurface("builder-job-log", "job_log_spool_root", "commit-spool/build-logs", "prepare_job_log", "prepare_job_log_spool", "build_job_log_probe", ("builder",), "build-job-log-spool"),
     PerJobWritableSurface("reviewer-job-log", "job_log_spool_root", "review-verdicts/planning-logs", "prepare_job_log", "PlanningJobInvoker", "build_job_log_probe", ("reviewer",), "planning-job-log-spool"),
     PerJobWritableSurface("gate-job-log", "job_log_spool_root", "gate-ledger-spool/gate-logs", "prepare_job_log", "prepare_gate_job_log", "build_job_log_probe", ("gate",), "gate-job-log-spool"),
-    PerJobWritableSurface("builder-codex-home", "agents_root", "runtime/codex-home/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "job-codex-home"),
-    PerJobWritableSurface("reviewer-codex-home", "agents_root", "runtime/codex-home/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "job-codex-home"),
-    PerJobWritableSurface("builder-runtime-cache", "agents_root", "runtime/job-cache/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "job-runtime-cache"),
-    PerJobWritableSurface("reviewer-runtime-cache", "agents_root", "runtime/job-cache/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "job-runtime-cache"),
+    PerJobWritableSurface("builder-codex-home", "builder_job_codex_home_root", "runtime/codex-home/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "builder-job-codex-home-root"),
+    PerJobWritableSurface("reviewer-codex-home", "reviewer_job_codex_home_root", "runtime/codex-home/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "reviewer-job-codex-home-root"),
+    PerJobWritableSurface("builder-runtime-cache", "builder_job_cache_root", "runtime/job-cache/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "builder-job-cache-root"),
+    PerJobWritableSurface("reviewer-runtime-cache", "reviewer_job_cache_root", "runtime/job-cache/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "reviewer-job-cache-root"),
 )
 
 
@@ -149,7 +193,10 @@ def writable_surface(surface_id: str) -> PerJobWritableSurface:
         raise ValueError(f"unknown writable surface: {surface_id!r}") from exc
 
 
-def provision_runtime_surfaces(*, principal: str, job_id: str) -> tuple[Path, ...]:
+def provision_runtime_surfaces(
+    *, principal: str, job_id: str, canonical_codex_home: str | Path | None = None,
+    account: str | None = None,
+) -> tuple[Path, ...]:
     """Provision runtime rows by enumerating the canonical registry.
 
     Parent default ACLs installed by permgen grant only the row principal access.
@@ -169,21 +216,51 @@ def provision_runtime_surfaces(*, principal: str, job_id: str) -> tuple[Path, ..
         else:
             create_slot(slot, reset=False)
         if row.surface_id.endswith("-codex-home"):
+            source = Path(canonical_codex_home) if canonical_codex_home else None
             for dirname in ("plugins", "skills"):
                 control_dir = slot / dirname
                 control_dir.mkdir(exist_ok=True)
+                desired_dir = source / dirname if source else None
+                if desired_dir and desired_dir.exists():
+                    if desired_dir.is_symlink() or not desired_dir.is_dir():
+                        raise SpoolSlotError("shape", f"canonical control is malformed: {desired_dir}")
+                    for item in desired_dir.rglob("*"):
+                        if item.is_symlink():
+                            raise SpoolSlotError("symlink", f"canonical control contains symlink: {item}")
+                    shutil.copytree(desired_dir, control_dir, dirs_exist_ok=True)
+                for item in sorted(control_dir.rglob("*"), reverse=True):
+                    item.chmod(0o555 if item.is_dir() else 0o444)
                 control_dir.chmod(0o555)
-            for filename, content in (
+            for filename, fallback in (
                 ("config.toml", "# deployment-owned Codex configuration\n"),
                 ("hooks.json", "{}\n"),
             ):
                 control = slot / filename
-                if not control.exists():
-                    control.write_text(content, encoding="utf-8")
+                desired = source / filename if source else None
+                content = desired.read_bytes() if desired and desired.is_file() else fallback.encode()
+                if control.exists() and control.read_bytes() != content:
+                    control.chmod(0o600)
+                    control.write_bytes(content)
+                elif not control.exists():
+                    control.write_bytes(content)
                 control.chmod(0o444)
             auth = slot / "auth.json"
             if not auth.exists():
-                auth.touch(mode=0o600)
+                desired_auth = source / "auth.json" if source else None
+                if desired_auth and desired_auth.is_file():
+                    auth.write_bytes(desired_auth.read_bytes())
+                else:
+                    auth.touch()
+                # Preserve the inherited named-user ACL mask. 0600 would mask
+                # the job principal out before Codex can refresh credentials.
+                auth.chmod(0o660)
+        if account is not None:
+            # The container remains Manager-only. Grant the resolved job account
+            # recursively on this concrete slot, never as a default ACL on root.
+            _apply_slot_acl(slot, account=account, writable=True)
+            if row.surface_id.endswith("-codex-home"):
+                for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
+                    _apply_slot_acl(slot / leaf, account=account, writable=False)
         provisioned.append(slot)
     return tuple(provisioned)
 

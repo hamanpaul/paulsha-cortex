@@ -481,7 +481,17 @@ class JobPlanningInvoker:
         # 確實跨 owner——見 `registry.JOB_GIT_WORKSPACE_TRUST` 的 reviewer 那一列。
         workspace = str(Path(reservation.cwd).resolve())
         spool_slot.provision_runtime_surfaces(
-            principal="reviewer", job_id=reservation.job_id
+            principal="reviewer", job_id=reservation.job_id,
+            canonical_codex_home=spool_slot.readable_codex_home(
+                Path(self._env[job_runner.REVIEWER_HOME_ENV]) / ".codex"
+                if self._env.get(job_runner.REVIEWER_HOME_ENV) else None
+            ),
+            account=(
+                job_runner.resolve_job_account(self._env, role=job_runner.JOB_ROLE_REVIEW)
+                if spool_slot.system_account_exists(job_runner.resolve_job_account(
+                    self._env, role=job_runner.JOB_ROLE_REVIEW
+                )) else None
+            ),
         )
         env = job_runner.build_job_env(
             manager_env=self._env,

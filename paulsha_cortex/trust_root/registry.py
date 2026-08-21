@@ -1570,6 +1570,30 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note="socket／lock run dir；monitor socket 已 0600、run dir 0700（正面前例）。",
     ),
     TrustRootAsset(
+        "builder-job-codex-home-root", _T0, _MO,
+        "paulsha_cortex.config.paths:builder_job_codex_home_root",
+        (Principal.MANAGER,), (Principal.BUILDER,), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job CODEX_HOME container; builder receives only its slot.",
+    ),
+    TrustRootAsset(
+        "reviewer-job-codex-home-root", _T0, _MO,
+        "paulsha_cortex.config.paths:reviewer_job_codex_home_root",
+        (Principal.MANAGER,), (Principal.REVIEWER, Principal.PLANNER), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job CODEX_HOME container; reviewer receives only its slot.",
+    ),
+    TrustRootAsset(
+        "builder-job-cache-root", _T1, _MO,
+        "paulsha_cortex.config.paths:builder_job_cache_root",
+        (Principal.MANAGER,), (Principal.BUILDER,), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job runtime cache container for builder jobs.",
+    ),
+    TrustRootAsset(
+        "reviewer-job-cache-root", _T1, _MO,
+        "paulsha_cortex.config.paths:reviewer_job_cache_root",
+        (Principal.MANAGER,), (Principal.REVIEWER, Principal.PLANNER), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job runtime cache container for reviewer/planner jobs.",
+    ),
+    TrustRootAsset(
         "project-config-tree", _T0, _MO, "paulsha_cortex.config.paths:project_config_root",
         (Principal.OPERATOR, Principal.ANY_SAME_UID),
         (Principal.MANAGER,),

@@ -24,6 +24,22 @@ def agents_root() -> Path:
     return resolve_runtime_root("PSC_AGENTS_ROOT")
 
 
+def builder_job_codex_home_root() -> Path:
+    return agents_root() / "runtime" / "codex-home" / "builder"
+
+
+def reviewer_job_codex_home_root() -> Path:
+    return agents_root() / "runtime" / "codex-home" / "reviewer"
+
+
+def builder_job_cache_root() -> Path:
+    return agents_root() / "runtime" / "job-cache" / "builder"
+
+
+def reviewer_job_cache_root() -> Path:
+    return agents_root() / "runtime" / "job-cache" / "reviewer"
+
+
 def control_root() -> Path:
     return resolve_runtime_root("PSC_CONTROL_ROOT")
 

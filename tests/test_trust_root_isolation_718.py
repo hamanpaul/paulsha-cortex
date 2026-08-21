@@ -211,3 +211,35 @@ def test_registry_provisioner_preserves_controls_and_isolates_foreign_slot(
     for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
         assert (codex_a / leaf).stat().st_mode & 0o222 == 0
     assert paths.agents_root() == tmp_path
+
+
+def test_runtime_surface_asset_ids_are_real_and_match_layout() -> None:
+    from paulsha_cortex.trust_root.registry import ASSET_REGISTRY
+
+    registered = {asset.asset_id for asset in ASSET_REGISTRY}
+    layout_paths = permgen.DEFAULT_LAYOUT.asset_paths()
+    for row in _surfaces()[-4:]:
+        assert row.asset_id in registered
+        assert layout_paths[row.asset_id] == permgen._surface_root(row, permgen.DEFAULT_LAYOUT)
+
+
+def test_provision_projects_canonical_controls_and_auth(tmp_path, monkeypatch) -> None:
+    runtime = tmp_path / "runtime-root"
+    canonical = tmp_path / "account-home" / ".codex"
+    (canonical / "plugins" / "vendor").mkdir(parents=True)
+    (canonical / "skills").mkdir()
+    (canonical / "plugins" / "vendor" / "plugin.json").write_text('{"real":true}\n')
+    (canonical / "skills" / "policy.md").write_text("deployed\n")
+    (canonical / "config.toml").write_text("model = 'deployed'\n")
+    (canonical / "hooks.json").write_text('{"hooks":["deployed"]}\n')
+    (canonical / "auth.json").write_text('{"token":"existing"}\n')
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(runtime))
+
+    slots = spool_slot.provision_runtime_surfaces(
+        principal="builder", job_id="job-a", canonical_codex_home=canonical
+    )
+    codex = next(path for path in slots if "codex-home" in str(path))
+    assert (codex / "config.toml").read_bytes() == (canonical / "config.toml").read_bytes()
+    assert (codex / "plugins/vendor/plugin.json").read_bytes() == (canonical / "plugins/vendor/plugin.json").read_bytes()
+    assert (codex / "auth.json").read_bytes() == (canonical / "auth.json").read_bytes()
+    assert (codex / "auth.json").stat().st_mode & 0o060 == 0o060
