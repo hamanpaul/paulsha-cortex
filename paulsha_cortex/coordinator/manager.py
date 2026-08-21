@@ -1328,6 +1328,12 @@ def _launch_foreign_review(
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
+            runtime_principal=handle.runtime_principal,
+            runtime_mode=handle.runtime_mode,
+            runtime_surface=handle.runtime_surface,
+            credential_publish=handle.credential_publish,
+            prompt_path=handle.prompt_path,
+            control_log_path=handle.control_log_path,
         )
         registry.update_slice(slice_id, reviewer_job_id=reviewer_job["job_id"], candidate=candidate)
         registry.record_action(
@@ -3271,6 +3277,13 @@ def _raise_if_worktree_read_blocked(result: object, *, what: str) -> None:
     )
 
 
+def _job_control_log_path(job: Mapping[str, object], log_path: str) -> str:
+    """Return the persisted Manager-only completion anchor for a job."""
+
+    control = job.get("control_log_path")
+    return control if isinstance(control, str) and control else log_path
+
+
 def _record_candidate_full_suite_evidence(
     job: Mapping[str, object], *, run, candidate: str
 ) -> None:
@@ -3289,7 +3302,7 @@ def _record_candidate_full_suite_evidence(
         if not isinstance(log_path, str) or not log_path:
             return
         found = terminal_contract.read_gate_ledger(
-            terminal_contract.gate_ledger_path(log_path)
+            terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path))
         )
         if found is None:
             return
@@ -3340,7 +3353,7 @@ def _job_gate_worktree_state(job: Mapping[str, object]) -> Mapping[str, object] 
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return None
-    path = terminal_contract.gate_ledger_path(log_path)
+    path = terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path))
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -4291,7 +4304,7 @@ def _assert_terminal_gate_consistency(
         )
     terminal_contract.authorize_terminal(
         envelope,
-        ledger_path=terminal_contract.gate_ledger_path(log_path),
+        ledger_path=terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path)),
         require_ledger=job.get("workflow_phase") in GATE_LEDGER_REQUIRED_PHASES,
         test_policy=test_policy,
         expected_gate_names=_expected_gate_names_for_test_policy(test_policy),
@@ -8603,7 +8616,7 @@ def _prior_card_failed_gates(job: Mapping[str, object]) -> list[dict[str, object
         return []
     try:
         found = terminal_contract.read_gate_ledger(
-            terminal_contract.gate_ledger_path(log_path)
+            terminal_contract.gate_ledger_path(_job_control_log_path(job, log_path))
         )
         if found is None:
             return []
@@ -9900,6 +9913,12 @@ def _dispatch_workflow_card(
             session_name=handle.session_name,
             pid=handle.pid,
             log_path=handle.log_path,
+            runtime_principal=handle.runtime_principal,
+            runtime_mode=handle.runtime_mode,
+            runtime_surface=handle.runtime_surface,
+            credential_publish=handle.credential_publish,
+            prompt_path=handle.prompt_path,
+            control_log_path=handle.control_log_path,
         )
     except BaseException as launch_exc:
         registry.update_headless_result(str(job["job_id"]), status="failed", exit_code=1)
@@ -10370,6 +10389,9 @@ def resume_workflow_run(
         return {"run_id": run.run_id, "current_phase": run.current_phase, "job_id": job["job_id"], "reason": "in-flight"}
     if job.get("status") != "exited" or job.get("exit_code") != 0:
         failure_reason = "job-failed"
+        runtime_diagnostic = job.get("runtime_diagnostic")
+        if isinstance(runtime_diagnostic, dict):
+            failure_reason = "runtime-contract-failed"
         sandbox_ok = True
         try:
             _discard_reviewer_sandbox(
@@ -10391,6 +10413,11 @@ def resume_workflow_run(
         classification = (
             provider_outcome.classification_from_job(job) if sandbox_ok else None
         )
+        if isinstance(runtime_diagnostic, dict):
+            # A runtime contract failure is already a durable Manager-side
+            # diagnosis.  It must not be reclassified as a retryable provider
+            # outage or fed back into provider routing.
+            classification = None
         status_fields: dict[str, object] = {}
         if classification is not None:
             status_fields["provider_outcome"] = classification.outcome.value
@@ -10440,9 +10467,18 @@ def resume_workflow_run(
             gate_status="running",
             needs_human_reason=diagnostic_reason(
                 failure_reason,
-                "builder/reviewer job 以 provider 層失敗終局，"
-                f"bounded retry 已耗盡或不可重試：{diagnostics.reason or failure_reason}",
-                source="manager._poll_workflow_job:provider-failure",
+                (
+                    "isolated runtime contract failed: "
+                    f"{runtime_diagnostic.get('detail', failure_reason)}"
+                    if isinstance(runtime_diagnostic, dict)
+                    else "builder/reviewer job 以 provider 層失敗終局，"
+                    f"bounded retry 已耗盡或不可重試：{diagnostics.reason or failure_reason}"
+                ),
+                source=(
+                    "manager._poll_workflow_job:runtime-contract"
+                    if isinstance(runtime_diagnostic, dict)
+                    else "manager._poll_workflow_job:provider-failure"
+                ),
                 run_id=run.run_id,
                 work_id=run.work_id,
                 job_id=str(job["job_id"]),

@@ -43,16 +43,19 @@ def _branch_for_task(task: str) -> str:
 
 
 def exit_sentinel_path(log_path: str) -> Path:
-    """由 job 的 log_path 推導 exit sentinel 檔路徑（<...>.jsonl → <...>.exit）。
+    """由 canonical job log 推導 Manager-only exit sentinel 路徑。
 
     SubprocessLauncher 在子進程結束時把 `$?` 寫入此檔；poll_headless_done 跨進程讀回，
     故完成判定不再依賴 os.waitpid（只有 spawn 子進程的進程能 reap）。確定性、零 I/O。
 
     #604：降權模式下寫者已改為 Manager 側的 exit 記帳 shell（見
-    `job_runner.build_manager_exit_recorder_argv`），**路徑推導完全不變**——變的
-    只有「誰是寫者」，因此 harvest 端與所有既有呼叫端零改動。
+    `job_runner.build_manager_exit_recorder_argv`）。#708 repair 之後 job log
+    本身位於 per-principal writable spool；先投影回 Manager-only control-log
+    anchor，避免把 sentinel 放進 job 可 rename 的目錄。
     """
-    return Path(log_path).with_suffix(".exit")
+    from .job_workspace import manager_control_log_path
+
+    return manager_control_log_path(log_path).with_suffix(".exit")
 
 
 def _read_exit_sentinel(log_path: str | None) -> int | None:
@@ -209,6 +212,11 @@ class Dispatcher:
         job = self._registry.get_job(job_id)
         pid = job.get("pid")
         log_path = job.get("log_path") if isinstance(job.get("log_path"), str) else None
+        control_log_path = (
+            job.get("control_log_path")
+            if isinstance(job.get("control_log_path"), str)
+            else log_path
+        )
         if not isinstance(pid, int) or not log_path:
             return self._finalize_headless(job_id, exit_code=1, log_path=log_path)
 
@@ -220,7 +228,7 @@ class Dispatcher:
             return self._finalize_headless(job_id, exit_code, log_path)
 
         # 預設：跨進程 durable 機制。
-        exit_code = _read_exit_sentinel(log_path)
+        exit_code = _read_exit_sentinel(control_log_path)
         if exit_code is not None:
             return self._finalize_headless(job_id, exit_code, log_path)
 
@@ -234,6 +242,174 @@ class Dispatcher:
     def _finalize_headless(
         self, job_id: str, exit_code: int, log_path: str | None
     ) -> dict[str, object]:
+        job = self._registry.get_job(job_id)
+        # A downgraded Codex job publishes auth.json with a readable ACL/mode
+        # before its Manager-authored exit sentinel.  The launcher records a
+        # typed runtime surface; never infer a principal from workflow kind.
+        # Missing runtime metadata/slot/authority is a durable runtime failure,
+        # not a provider failure and never a silently skipped harvest.
+        from . import job_runner, spool_slot
+        runtime_diagnostic: dict[str, str] | None = None
+        runtime_mode = job.get("runtime_mode")
+        runtime_principal = job.get("runtime_principal")
+        prompt_path = job.get("prompt_path")
+        if prompt_path is not None:
+            prompt = Path(prompt_path) if isinstance(prompt_path, str) else Path(".")
+            expected_prompt: Path | None = None
+            expected_prompt_dir: Path | None = None
+            try:
+                prompt_roles = {
+                    config.log_spool_principal: role
+                    for role, config in job_runner.JOB_ROLE_CONFIG.items()
+                }
+                prompt_role = prompt_roles.get(str(runtime_principal))
+                if runtime_mode in {"systemd-run", "systemd-template"} and prompt_role in {
+                    job_runner.JOB_ROLE_BUILDER,
+                    job_runner.JOB_ROLE_REVIEW,
+                }:
+                    spec_spool = job_runner.resolve_prompt_spec_spool(
+                        os.environ, role=prompt_role
+                    )
+                    expected_prompt_dir = Path(
+                        job_runner.job_prompt_spool_path(
+                            spec_spool,
+                            principal=str(runtime_principal),
+                            instance=job_runner.template_instance_id(job_id),
+                        )
+                    )
+                    expected_prompt = expected_prompt_dir / (
+                        ".prompt-" + job_runner.template_instance_id(job_id)
+                    )
+            except (TypeError, ValueError):
+                expected_prompt = None
+                expected_prompt_dir = None
+            if (
+                not isinstance(prompt_path, str)
+                or not prompt.is_absolute()
+                or not prompt.name.startswith(".prompt-")
+                or expected_prompt is None
+                or prompt != expected_prompt
+                or prompt.is_symlink()
+            ):
+                runtime_diagnostic = {
+                    "reason": "runtime-prompt-cleanup-invalid",
+                    "detail": (
+                        f"private prompt path is malformed or outside its typed slot: "
+                        f"{prompt_path!r}"
+                    ),
+                    "source": "dispatcher._finalize_headless",
+                    "job_id": str(job_id),
+                }
+            else:
+                try:
+                    if expected_prompt_dir is None or not expected_prompt_dir.is_dir():
+                        raise RuntimeError(
+                            "private prompt parent is missing or not a directory"
+                        )
+                    if expected_prompt_dir.is_symlink():
+                        raise RuntimeError("private prompt parent is a symlink")
+                    if prompt.exists():
+                        prompt.unlink()
+                    leftovers: list[str] = []
+                    for entry in expected_prompt_dir.iterdir():
+                        try:
+                            info = entry.lstat()
+                        except OSError:
+                            leftovers.append(str(entry))
+                            continue
+                        leftovers.append(str(entry))
+                        # The parent is Manager-owned and non-writable by the
+                        # job.  Remove only leaf/symlink leftovers; retain an
+                        # unexpected directory or special node for an explicit
+                        # durable diagnostic rather than following it.
+                        if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                            entry.unlink()
+                    try:
+                        expected_prompt_dir.rmdir()
+                    except OSError as exc:
+                        if not leftovers:
+                            raise RuntimeError(
+                                "private prompt parent could not be removed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ) from exc
+                    if leftovers:
+                        raise RuntimeError(
+                            "private prompt directory leaked entries: "
+                            + ", ".join(leftovers)
+                        )
+                except OSError as exc:
+                    runtime_diagnostic = runtime_diagnostic or {
+                        "reason": "runtime-prompt-cleanup-failed",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "source": "dispatcher._finalize_headless",
+                        "job_id": str(job_id),
+                    }
+                except RuntimeError as exc:
+                    runtime_diagnostic = runtime_diagnostic or {
+                        "reason": "runtime-prompt-leaked",
+                        "detail": str(exc),
+                        "source": "dispatcher._finalize_headless",
+                        "job_id": str(job_id),
+                    }
+        isolated_codex = (
+            job.get("executor") == "codex"
+            and runtime_mode in {"systemd-run", "systemd-template"}
+        )
+        if isolated_codex and not job.get("credential_publish"):
+            runtime_diagnostic = runtime_diagnostic or {
+                "reason": "runtime-publisher-missing",
+                "detail": "isolated Codex job has no credential publisher metadata",
+                "source": "dispatcher._finalize_headless",
+                "job_id": str(job_id),
+            }
+        elif job.get("credential_publish") and not isolated_codex:
+            runtime_diagnostic = runtime_diagnostic or {
+                "reason": "runtime-lane-invalid",
+                "detail": "credential publisher is set outside an isolated Codex lane",
+                "source": "dispatcher._finalize_headless",
+                "job_id": str(job_id),
+            }
+        if job.get("credential_publish") and isolated_codex:
+            principal = job.get("runtime_principal")
+            surface_id = job.get("runtime_surface")
+            if not isinstance(principal, str) or not isinstance(surface_id, str):
+                runtime_diagnostic = runtime_diagnostic or {
+                    "reason": "runtime-identity-missing",
+                    "detail": (
+                        f"credential publish metadata is inconsistent: "
+                        f"principal={principal!r}, surface={surface_id!r}"
+                    ),
+                    "source": "dispatcher._finalize_headless",
+                    "job_id": str(job_id),
+                }
+            else:
+                try:
+                    surface = spool_slot.codex_runtime_surface(
+                        principal=principal, surface_id=surface_id
+                    )
+                    runtime_slot = spool_slot.canonical_job_slot(surface.surface_id, job_id)
+                    authority = spool_slot.credential_authority(principal)
+                    spool_slot.validate_job_slot_shape(runtime_slot)
+                    if (
+                        authority.is_symlink()
+                        or authority.parent.is_symlink()
+                        or not authority.is_file()
+                    ):
+                        raise spool_slot.SpoolSlotError(
+                            "authority", f"credential authority is unavailable: {authority}"
+                        )
+                    spool_slot.commit_runtime_credential(
+                        principal=principal, job_id=job_id
+                    )
+                except Exception as exc:
+                    runtime_diagnostic = runtime_diagnostic or {
+                        "reason": "runtime-credential-harvest-failed",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "source": "dispatcher._finalize_headless",
+                        "job_id": str(job_id),
+                    }
+        if runtime_diagnostic is not None:
+            exit_code = 1
         last_jsonl_line = _last_nonempty_line(log_path)
         status = classify_completion(exit_code=exit_code, last_jsonl_line=last_jsonl_line)
         # #384：只在真的失敗時才分類——分類器本身也會拒絕 exit_code == 0
@@ -241,12 +417,16 @@ class Dispatcher:
         # classify_completion 的 failed 分支」這種邊界情況也排除掉，避免對
         # 明明成功的 job 做無意義的 log 讀取與分類。
         provider_outcome = None
-        if status == "failed":
+        if status == "failed" and runtime_diagnostic is None:
             output = read_log_tail(log_path)
             provider_outcome = classify_provider_failure(exit_code=exit_code, output=output).to_dict()
-        return self._registry.update_headless_result(
-            job_id,
-            status=status,
-            exit_code=exit_code,
-            provider_outcome=provider_outcome,
-        )
+        result_kwargs = {
+            "status": status,
+            "exit_code": exit_code,
+            "provider_outcome": provider_outcome,
+        }
+        # Keep the legacy registry seam usable for pre-migration callers while
+        # passing the durable runtime field whenever a real failure exists.
+        if runtime_diagnostic is not None:
+            result_kwargs["runtime_diagnostic"] = runtime_diagnostic
+        return self._registry.update_headless_result(job_id, **result_kwargs)

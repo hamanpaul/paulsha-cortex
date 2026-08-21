@@ -369,7 +369,7 @@ class UnitReplicaTests(unittest.TestCase):
         self.assertIn("--property=WorkingDirectory=", joined)
         self.assertIn("--property=Environment=HOME=", joined)
         for rwp in self.unit.read_write_paths:
-            self.assertIn(f"--property=ReadWritePaths={rwp}", props)
+            self.assertIn(f"--property=ReadWritePaths={rwp.replace('%i', 'probe')}", props)
 
     def test_replica_drops_only_the_execution_face(self) -> None:
         props = permgen.unit_replica_properties(self.unit.content, instance="probe")

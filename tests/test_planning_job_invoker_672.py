@@ -11,6 +11,7 @@ runbook，不得靜默通過——#638／#657 的教訓逐字如此：單 UID �
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -97,6 +98,15 @@ class _Harness:
 
     def __init__(self, tmp_path: Path, monkeypatch, *, log_payload: str = "{}", rc: int = 0,
                  hang: bool = False) -> None:
+        agents = Path(os.environ["PSC_AGENTS_ROOT"])
+        controls = agents / "config/codex-controls/reviewer"
+        (controls / "plugins").mkdir(parents=True)
+        (controls / "skills").mkdir()
+        (controls / "config.toml").write_text("# test deployment policy\n")
+        (controls / "hooks.json").write_text("{}\n")
+        auth = agents / "config/codex-credentials/reviewer/auth.json"
+        auth.parent.mkdir(parents=True)
+        auth.write_text("{}\n")
         self.tmp_path = tmp_path
         self.spool = tmp_path / "job-specs" / "reviewer"
         self.spool.mkdir(parents=True)
@@ -562,14 +572,12 @@ def test_planning_log_spool_needs_no_new_write_surface() -> None:
         layout.review_verdict_spool_root + "/"
     )
     unit = permgen.build_job_unit(permgen.THREE_WAY_SCHEME, principal=Principal.REVIEWER)
-    assert sorted(unit.read_write_paths) == [
-        # #698：codex 的狀態樹從 `cache/codex` 搬成 HOME 底下的 root-owned sticky 真
-        # 目錄，因此多這一條。**這不是本票（票 D／planning log）開的通道**——同一棵樹
-        # 換位置，換到的是「目錄由 root 擁有」（`hooks.json` 守得住的前提，#698）。
-        permgen.asset_paths(layout)["reviewer-planner-codex-state"],
-        layout.cache_of(layout.reviewer_planner_account),
-        layout.review_verdict_spool_root,
-    ]
+    assert sorted(unit.read_write_paths) == sorted([
+        layout.review_verdict_spool_root + "/%i",
+        layout.planning_job_log_spool_root + "/%i",
+        f"{layout.agents_root}/runtime/codex-home/reviewer/%i",
+        f"{layout.agents_root}/runtime/job-cache/reviewer/%i",
+    ])
 
 
 def test_probe_cache_asset_still_absent_from_job_rwp() -> None:

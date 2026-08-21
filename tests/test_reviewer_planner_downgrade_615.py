@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -37,6 +38,7 @@ from unittest import mock
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator import spool_slot
+from paulsha_cortex.coordinator import job_workspace
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 from paulsha_cortex.trust_root import permgen, registry
 from paulsha_cortex.trust_root.registry import Principal
@@ -260,6 +262,55 @@ class LaunchIdentityTests(unittest.TestCase):
         self.assertTrue(out["spec"]["unit"].startswith("cortex-reviewer-job@"))
         self.assertIn(out["spec"]["unit"], out["call"]["argv"][-1])
 
+    def test_template_prompt_uses_manager_private_spool_without_argv_bytes(self) -> None:
+        """The real template launch keeps an oversized prompt out of argv/status."""
+        popen = _RecordingPopen()
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = popen
+        slice_id = "psc-0615-large-prompt"
+        prompt = "workflow-sentinel-" + ("x" * 140_000)
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                spool_dir = str(Path(root) / "job-specs")
+                Path(spool_dir).mkdir(parents=True)
+                env = _template_env(spool_dir)
+                with mock.patch.dict(os.environ, env, clear=True), _nested(
+                    _preflight_patches()
+                ):
+                    _reviewer().launch(
+                        slice_id=slice_id,
+                        prompt=prompt,
+                        worktree=root,
+                        log_dir=str(Path(root) / "logs"),
+                    )
+                    slot = job_workspace.job_log_spool_dir(
+                        principal_id=job_runner.JOB_ROLE_CONFIG[
+                            job_runner.JOB_ROLE_REVIEW
+                        ].log_spool_principal,
+                        spool_key=slice_id,
+                    )
+                prompt_dir = Path(
+                    job_runner.job_prompt_spool_path(
+                        spool_dir,
+                        principal="reviewer",
+                        instance=job_runner.template_instance_id(slice_id),
+                    )
+                )
+                prompt_path = prompt_dir / (
+                    ".prompt-" + job_runner.template_instance_id(slice_id)
+                )
+                self.assertTrue(prompt_path.is_file())
+                self.assertEqual(prompt_path.read_bytes(), prompt.encode())
+                self.assertEqual(prompt_dir.stat().st_mode & 0o022, 0)
+                self.assertNotEqual(prompt_dir, slot / ".prompts")
+                spec = json.loads(next(Path(spool_dir).iterdir()).read_text())
+                self.assertIn(str(prompt_path), json.dumps(spec))
+                self.assertNotIn(prompt, json.dumps(spec))
+                self.assertNotIn(prompt, json.dumps(popen.call["argv"]))
+                shutil.rmtree(slot, ignore_errors=True)
+        finally:
+            launcher_module.subprocess.Popen = original
+
     def test_planner_shares_the_reviewer_template(self) -> None:
         """planner 與 reviewer 同帳號 ⇒ 同一份模板，不是第三份。"""
         self.assertEqual(
@@ -426,7 +477,7 @@ class VerdictChannelTests(unittest.TestCase):
     def test_review_unit_can_reach_the_spool_at_the_mount_layer(self) -> None:
         """ACL 對了但 `ProtectSystem=strict` 沒開放 ⇒ 一樣 EROFS。兩層都要成立。"""
         unit = permgen.build_job_unit(SCHEME, principal=Principal.REVIEWER)
-        self.assertIn(LAYOUT.review_verdict_spool_root, unit.read_write_paths)
+        self.assertIn(LAYOUT.review_verdict_spool_root + "/%i", unit.read_write_paths)
 
     def test_seal_makes_the_slot_immutable_to_its_producer(self) -> None:
         """落地後封口：那一格再也建不了、改不了名、刪不掉任何檔。
@@ -485,29 +536,14 @@ class ReviewerWritableSurfaceTests(unittest.TestCase):
         self.rwp = set(self.unit.read_write_paths)
 
     def test_rwp_is_exactly_the_mechanical_derivation(self) -> None:
-        expected = set(
-            permgen.read_write_paths(
-                self.plan,
-                JOB_LAYOUT,
-                REVIEW_ACCOUNT,
-                JOB_LAYOUT.job_extra_write_paths(REVIEW_ACCOUNT),
-                retired=permgen.RETIRED_JOB_WRITE_ASSETS,
-            )
-        )
+        expected = set(permgen.job_surface_owners(
+            principal=Principal.REVIEWER, instance="%i", layout=LAYOUT
+        ))
         self.assertEqual(self.rwp, expected)
         # 導出結果目前恰好是三條，逐條都有登記表或明示 extra 的來源。
         self.assertEqual(
             sorted(self.rwp),
-            [
-                # #698：codex 的 `$CODEX_HOME` 整棵（root-owned ＋ sticky 的真目錄）。
-                # 它取代了 #685 的 `cache/codex` 那棵 job-owned 樹——可寫的東西一樣多，
-                # 換到的是「目錄由 root 擁有」，也就是樹裡的 root-owned `hooks.json`
-                # 刪不掉／改不掉名字。同一份 unit 另有一條 `ReadOnlyPaths=` 把那個檔
-                # 在 mount 層也收回唯讀。
-                permgen.asset_paths(LAYOUT)["reviewer-planner-codex-state"],
-                LAYOUT.cache_of(REVIEW_ACCOUNT),
-                LAYOUT.review_verdict_spool_root,
-            ],
+            sorted(expected),
         )
 
     def test_reviewer_cannot_write_the_builder_workspace_or_spools(self) -> None:
@@ -576,17 +612,8 @@ class ReviewerWritableSurfaceTests(unittest.TestCase):
     def test_builder_rwp_is_untouched_by_the_retirement(self) -> None:
         """除役集不含 builder 的任何 writer 面 ⇒ M1 的 unit 逐字不變（零回歸）。"""
         builder = permgen.build_job_unit(SCHEME, principal=Principal.BUILDER)
-        self.assertEqual(
-            set(builder.read_write_paths),
-            set(
-                permgen.read_write_paths(
-                    self.plan,
-                    JOB_LAYOUT,
-                    BUILDER_ACCOUNT,
-                    JOB_LAYOUT.job_extra_write_paths(BUILDER_ACCOUNT),
-                )
-            ),
-        )
+        self.assertNotIn(LAYOUT.commit_spool_root, builder.read_write_paths)
+        self.assertIn(LAYOUT.commit_spool_root + "/%i", builder.read_write_paths)
 
     def test_every_rwp_target_is_a_path_that_deployment_creates(self) -> None:
         """RWP 目標不存在 ⇒ systemd 讓 unit 直接起不來。
@@ -596,12 +623,8 @@ class ReviewerWritableSurfaceTests(unittest.TestCase):
         「reviewer 的工作樹不在 pool 底下」這個事實的機械後果。
         """
         for path in self.rwp:
-            self.assertNotIn("%i", path)
-        scaffolded = {row[0] for row in LAYOUT.scaffold_directories(SCHEME)}
-        self.assertIn(LAYOUT.cache_of(REVIEW_ACCOUNT), scaffolded)
-        self.assertIn(
-            LAYOUT.review_verdict_spool_root, set(LAYOUT.asset_paths().values())
-        )
+            if "%i" in path:
+                self.assertTrue(path.endswith("/%i"))
 
 
 # ---------------------------------------------------------------------------

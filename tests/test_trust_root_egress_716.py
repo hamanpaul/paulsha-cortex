@@ -28,6 +28,12 @@ from paulsha_cortex.trust_root.registry import Principal
 class EgressAllowlistTests(unittest.TestCase):
     """白名單是**由 `EXECUTOR_TOOLS` 機械導出的單一來源**。"""
 
+    def _executor_hosts(self, name: str) -> set[str]:
+        for tool in permgen.EXECUTOR_TOOLS:
+            if tool.name == name:
+                return {entry.host for entry in tool.api_hosts}
+        raise AssertionError(f"executor {name} 不存在於 EXECUTOR_TOOLS")
+
     def test_allowlist_is_derived_from_executor_tools(self) -> None:
         declared = {
             entry.host for tool in permgen.EXECUTOR_TOOLS for entry in tool.api_hosts
@@ -48,6 +54,39 @@ class EgressAllowlistTests(unittest.TestCase):
                 self.assertTrue(
                     tool.api_hosts, f"executor {tool.name} 沒有宣告任何 api_hosts"
                 )
+
+    def test_copilot_live_observation_hosts_are_declared(self) -> None:
+        expected = {
+            "api.individual.githubcopilot.com",
+            "telemetry.individual.githubcopilot.com",
+        }
+        actual = self._executor_hosts("copilot")
+        self.assertFalse(
+            expected - actual,
+            f"copilot 缺少 live-observed api_hosts: {sorted(expected - actual)}",
+        )
+
+    def test_agy_live_observation_hosts_are_declared(self) -> None:
+        expected = {
+            "oauth2.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            "www.googleapis.com",
+            "lh3.googleusercontent.com",
+        }
+        actual = self._executor_hosts("agy")
+        self.assertFalse(
+            expected - actual,
+            f"agy 缺少 live-observed api_hosts: {sorted(expected - actual)}",
+        )
+
+    def test_declared_hosts_are_exact_hostnames_not_wildcards(self) -> None:
+        for tool in permgen.EXECUTOR_TOOLS:
+            for entry in tool.api_hosts:
+                with self.subTest(tool=tool.name, host=entry.host):
+                    self.assertNotIn("*", entry.host)
+                    self.assertFalse(entry.host.startswith("."))
+                    self.assertFalse(entry.host.endswith("."))
 
     def test_unmeasured_hosts_are_listed_not_hidden(self) -> None:
         unmeasured = permgen.unmeasured_egress_hosts()

@@ -555,7 +555,9 @@ def commit_spool_root(coordinator_root: str | Path | None = None) -> Path:
 
     if coordinator_root is None:
         return paths.commit_spool_root()
-    return Path(coordinator_root) / paths.COMMIT_SPOOL_DIRNAME
+    return spool_slot.canonical_job_slot(
+        "commit-spool", "placeholder", coordinator_root=coordinator_root
+    ).parent
 
 
 def commit_spool_dir(
@@ -567,7 +569,9 @@ def commit_spool_dir(
 
     if not isinstance(spool_key, str) or _SPOOL_KEY_RE.fullmatch(spool_key) is None:
         raise WorkspaceError(f"unsafe commit spool key: {spool_key!r}")
-    return commit_spool_root(coordinator_root).resolve() / spool_key
+    return spool_slot.canonical_job_slot(
+        "commit-spool", spool_key, coordinator_root=coordinator_root
+    )
 
 
 def commit_bundle_path(
@@ -586,11 +590,9 @@ def commit_bundle_path(
 def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     """從 job 記錄推導出這個 job 在 dispatch 當下用的 spool key。
 
-    **推導規則只有一條**：`Path(job["log_path"]).stem`。理由是那正是
-    `launcher.launch()` 收到的 `slice_id`——它同時決定了 exit sentinel
-    （`<log_dir>/<slice_id>.exit`）與 gate ledger（`terminal_contract.
-    gate_ledger_path(log_path)`）的落點，本模組沿用同一條規則，spool 就不會與
-    那兩者漂移。
+    **推導規則只有一條**：Manager registry 的 ``job_id``。log path、payload text
+    與 caller 自述都不是 slot authority；它們可能仍使用舊的 raw launch key，不能
+    反向決定 systemd ``%i`` 所指的 owned slot。
 
     這件事必須是**單一規則**：canonical lane 的 launch key 是 job_id，slice lane
     的是 slice_id，兩條 lane 若各自在回收端「猜」自己的 key，任何一邊改名都會退化成
@@ -598,16 +600,15 @@ def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     lane 共用同一個推導，且該欄位由 `registry.attach_launch_handle` 在 launch 當下
     寫入，與 spool 的建立點同源。
 
-    job 還沒 launch（沒有 `log_path`）時回 None——沒有 spool，也沒有東西可回收。
+    job 還沒取得 registry identity 時回 None——沒有可採信的 spool authority。
     """
 
-    log_path = job.get("log_path")
-    if not isinstance(log_path, str) or not log_path.strip():
+    job_id = job.get("job_id")
+    if not isinstance(job_id, str) or not job_id.strip():
         return None
-    stem = Path(log_path).stem
-    if _SPOOL_KEY_RE.fullmatch(stem) is None:
+    if _SPOOL_KEY_RE.fullmatch(job_id) is None:
         return None
-    return stem
+    return job_id
 
 
 def commit_bundle_path_for_job(
@@ -668,8 +669,8 @@ def prepare_commit_spool(
 
 
 #: launcher 派出的 job 在自己那一格 log spool 裡的檔名。副檔名刻意仍是 `.jsonl`
-#: ——它與 Manager 那條 harvest 路徑是**同一個 inode**（見
-#: :func:`prepare_job_log_spool`），而 harvest 端的 `usage_extractors` 讀的就是 JSONL。
+#: ——Manager 直接讀這個 canonical surface（見 :func:`prepare_job_log_spool`），而
+#: harvest 端的 `usage_extractors` 讀的就是 JSONL。
 JOB_LOG_FILENAME = "job.jsonl"
 
 #: 降權 planning job 在自己那一格 log spool 裡的檔名（#686 起的既有字面量，
@@ -679,6 +680,26 @@ PLANNING_JOB_LOG_FILENAME = "planning.log"
 
 #: executor 的「最後一則訊息」落點副檔名（codex 的 `--output-last-message`／`-o`，#714）。
 JOB_LAST_MESSAGE_SUFFIX = ".last.json"
+
+# A template job writes its canonical log below one of the per-principal
+# writable spools.  Manager-owned completion controls deliberately stay in the
+# dispatch log directory: the job must be able to append its log, but it must
+# never be able to create or replace the exit sentinel or gate ledger.
+_ISOLATED_JOB_LOG_LAYOUTS = frozenset(
+    {
+        (paths.COMMIT_SPOOL_DIRNAME, paths.BUILD_JOB_LOG_SPOOL_DIRNAME, JOB_LOG_FILENAME),
+        (
+            paths.REVIEW_VERDICT_SPOOL_DIRNAME,
+            paths.PLANNING_JOB_LOG_SPOOL_DIRNAME,
+            PLANNING_JOB_LOG_FILENAME,
+        ),
+        (
+            paths.GATE_LEDGER_SPOOL_DIRNAME,
+            paths.GATE_JOB_LOG_SPOOL_DIRNAME,
+            "gate.log",
+        ),
+    }
+)
 
 
 def job_last_message_path(job_log_path: str | Path) -> Path:
@@ -738,6 +759,44 @@ def job_last_message_path(job_log_path: str | Path) -> Path:
     return log.with_name(log.stem + JOB_LAST_MESSAGE_SUFFIX)
 
 
+def manager_control_log_path(job_log_path: str | Path) -> Path:
+    """Return the Manager-only control-log anchor for a canonical job log.
+
+    The JSONL log itself is intentionally Manager-readable and job-writable,
+    so it lives in the job's existing writable spool.  Completion controls are
+    different: ``.exit`` and ``.gates.json`` are Manager-authored and must stay
+    outside that directory.  The old implementation used a hard link between
+    these two surfaces.  ``ProtectSystem=strict`` gives separate
+    ``ReadWritePaths`` bind mounts separate mount identities, so that design
+    fails with ``EXDEV`` in the live Manager namespace.
+
+    New template launches persist the raw Manager control anchor separately
+    (`LaunchHandle.control_log_path` / registry `control_log_path`) because the
+    canonical job-writable slot now follows systemd `%i`.  Callers that care
+    about Manager-authored completion controls must consume that explicit field
+    rather than try to reconstruct it from the canonical spool path.  This
+    helper therefore keeps the historical projection for the registered legacy
+    layouts while arbitrary direct / already-explicit paths retain their
+    sibling behavior.
+    """
+
+    path = Path(job_log_path)
+    layout = (path.parents[2].name, path.parents[1].name, path.name) if len(path.parents) >= 3 else None
+    if layout not in _ISOLATED_JOB_LOG_LAYOUTS:
+        return path
+    key = path.parent.name
+    if _SPOOL_KEY_RE.fullmatch(key) is None:
+        return path
+    # parents[3] is the shared ``coordinator`` root for all three registered
+    # layouts.  Do not resolve or follow anything here: this is compatibility
+    # projection only, and the actual Manager-authored controls still undergo
+    # their existing regular-file/owner checks.  New template launches persist
+    # the raw Manager control anchor explicitly because `%i` may be a hashed
+    # instance name and cannot be reversed to the original slice id here.
+    coordinator_root = path.parents[3]
+    return coordinator_root.parent / "runtime" / "dispatch" / f"{key}.jsonl"
+
+
 def job_log_spool_dir(*, principal_id: str, spool_key: str) -> Path:
     """該 principal 那一格 job log spool 目錄（唯一定址點，#708）。
 
@@ -745,9 +804,11 @@ def job_log_spool_dir(*, principal_id: str, spool_key: str) -> Path:
     log_spool_principal`），不是這裡猜的：launcher 同時派 builder 與 reviewer 兩種
     job，兩者走的是不同的模板 unit、不同的帳號，因此也是不同的一條既有輸出通道。
 
-    key 與 commit spool 共用同一個字串（`Path(log_path).stem` ＝ `slice_id`），理由
-    與 `gate_runner._validate_spool_key` 逐字相同：兩邊用不同的判準就會出現「這一格
-    建得起來、那一格建不起來」的錯位。
+    `spool_key` 是呼叫端已經決定好的 slot 名：模板 job 傳進來的是 unit `%i`
+    （`template_plan.instance`），而 raw `slice_id` 留在另外那條 explicit
+    `manager_log_path` / `control_log_path`。這裡唯一承重的是「key 的形狀守衛與
+    `gate_runner._validate_spool_key` 同一條」——兩邊用不同判準就會出現「這一格建得
+    起來、那一格建不起來」的錯位。
     """
 
     if not isinstance(spool_key, str) or _SPOOL_KEY_RE.fullmatch(spool_key) is None:
@@ -765,42 +826,44 @@ def prepare_job_log_spool(
     spool_key: str,
     manager_log_path: str | Path,
 ) -> Path:
-    """建出該 job 的 log 一格，並把 Manager 那條 harvest 路徑 **hard link** 上去。
+    """建出該 job 的 Manager-readable canonical log 一格。
 
     回傳的是 **job 端**的路徑——它就是要寫進 spec `log_path` 的那一個值，shim 在降權
     之後以 `O_NOFOLLOW` 開的也是它。
 
-    ## 為什麼是 hard link，而不是「把 log_dir 整個搬進 spool」
+    ## 為什麼不再建立 Manager 端 hard link
 
-    `<log_dir>/<slice>.jsonl` 不只是一個 log：**exit sentinel（`<slice>.exit`）、gate
-    ledger（`<slice>.gates.json`）與 spool key 全部由它逐字推導**
-    （`dispatcher.exit_sentinel_path`／`terminal_contract.gate_ledger_path`／
-    :func:`spool_key_for_job`）。把它搬進一棵 builder 寫得進去的樹，等於把 #604 剛
-    關上的門重新打開——那兩個檔的全部保證就是「由 Manager 寫、採信端以
-    `foreign_evidence_author()` 檢查擁有者」。
+    `<log_dir>/<slice>.jsonl` 不只是一個 log：舊實作還把 **exit sentinel
+    （`<slice>.exit`）、gate ledger（`<slice>.gates.json`）與 spool key 全部由它
+    逐字推導**（`dispatcher.exit_sentinel_path`／
+    `terminal_contract.gate_ledger_path`／:func:`spool_key_for_job`）。現在只有
+    control paths 經 :func:`manager_control_log_path` 投影；兩個檔的全部保證仍是
+    「由 Manager 寫、採信端以 `foreign_evidence_author()` 檢查擁有者」。
 
     反過來把 builder 加進 Manager 的 dispatch log 目錄也不行，理由同一個：那一層
     住著 gate ledger 與 sentinel。
 
-    hard link 讓兩件事同時成立：
+    先前以 hard link 讓兩件事同時成立，但 live `ProtectSystem=strict` namespace
+    會把兩個 `ReadWritePaths` 做成不同 mount identity，故不能再依賴這個橋：
 
     - **job 側**只看得到自己 spool 裡的那一格（`ProtectSystem=strict` ＋ 登記表 ACL
       導出的可寫面，Manager 的 log 目錄它連 traverse 都進不去）；
-    - **Manager 側**的 `log_path` 字面量、sentinel／ledger 的推導、`_log_tail()`、
-      `usage_extractors` 逐字不變——同一個 inode，不是複製、不需要同步、也沒有
-      「job 還在跑但 Manager 只看得到舊內容」的中間狀態。
+    - **Manager 側**直接讀 job spool 的 canonical `log_path`；沒有複本，也沒有
+      「job 還在跑但 Manager 只看得到舊內容」的同步競態。sentinel／ledger 另走
+      Manager-only control surface。
 
     ## 為什麼不是 symlink
 
     shim 一律以 `O_NOFOLLOW` 開 log（那是它對「spool 目錄被埋 symlink」的既有防線），
-    symlink 會讓它當場失敗。而且 symlink 是**由名字解析**的：job 對自己那一格有 `w`
-    ⇒ 它換得掉連結指向；hard link 綁的是 inode，換不掉——Manager 那一頭永遠指著
-    shim 一開始就打開的那個檔。
+    symlink 會讓它當場失敗。job 若替換自己的 log 名稱，只能造成 Manager 看到缺失
+    或不完整的診斷；它不能替換 Manager-only 的 completion controls。
 
-    **job 仍能 unlink 自己那一格裡的檔名**（default ACL 給的是 `wx`），但那只換掉
-    「名字」：shim 在 exec **之前**就已經把 fd 綁在 inode 上，job 自己的 stdout 改不了
-    方向，Manager 那條 hard link 也還在同一個 inode 上。它能達成的上限是「之後再新建
-    一個同名檔，寫給沒有人看的地方」——自傷，不是提權，也不是隱藏已寫出的內容。
+    現在不再跨 mount 建 link。`job.jsonl` 是 Manager 預建的 regular file（mode
+    `0620`），所以 Manager 可以直接讀同一個 canonical surface，而 job 只能以
+    `O_APPEND` 寫入它；sentinel／ledger 不由這條路徑推導，仍由
+    :func:`manager_control_log_path` 投影到 Manager-only control surface。若 job
+    unlink／replace 自己的 log 名稱，Manager 只會得到缺失或不完整的診斷，不能因此
+    產生一份可採信的 completion control。
 
     ## 誠實邊界：本函式**不**封口，另外兩個 spool 會
 
@@ -816,7 +879,11 @@ def prepare_job_log_spool(
     """
 
     slot = job_log_spool_dir(principal_id=principal_id, spool_key=spool_key)
-    manager_path = Path(manager_log_path)
+    # ``manager_log_path`` remains an input for source/API compatibility and
+    # for callers' explicit control-surface bookkeeping.  It is intentionally
+    # not opened or linked here: the two paths may be different systemd bind
+    # mounts even when they share a host filesystem device.
+    _ = Path(manager_log_path)
     try:
         job_log = spool_slot.prepare_job_log(slot, slot / JOB_LOG_FILENAME)
     except spool_slot.SpoolSlotError as exc:
@@ -825,20 +892,6 @@ def prepare_job_log_spool(
         raise WorkspaceError(f"job log spool directory unavailable: {slot}: {exc}") from exc
     except OSError as exc:
         raise WorkspaceError(f"job log spool unavailable: {slot}: {exc}") from exc
-    try:
-        manager_path.parent.mkdir(parents=True, exist_ok=True)
-        manager_path.unlink(missing_ok=True)
-        os.link(job_log, manager_path)
-    except OSError as exc:
-        # **fail-closed，不退回「Manager 自己開一個獨立的檔」**：那樣 job 寫得出 log、
-        # Manager 卻讀不到它，而 harvest／usage 抽取／失敗診斷全部讀 Manager 那一條
-        # ⇒ 症狀是「job 跑了但沒有輸出」，正是 #643／#673 記錄過最難查的那一種。
-        # 跨檔案系統（EXDEV）也走這條：兩者都在 `coordinator_root` 底下，真的跨了
-        # 就代表部署 layout 已經不是產生器假設的那一棵，該當場停下來。
-        raise WorkspaceError(
-            f"job log 的 Manager 端 hard link 建不起來: {manager_path} -> {job_log}: "
-            f"{exc}（兩者必須在同一個檔案系統上；#708）"
-        ) from exc
     return job_log
 
 
@@ -1176,6 +1229,7 @@ __all__ = [
     "reclaim_candidate_paths",
     "remove_clone",
     "job_log_spool_dir",
+    "manager_control_log_path",
     "prepare_job_log_spool",
     "seal_commit_spool",
     "source_branch_head",

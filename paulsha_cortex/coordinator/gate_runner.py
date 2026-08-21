@@ -131,7 +131,9 @@ def gate_ledger_spool_root(coordinator_root: str | Path | None = None) -> Path:
 
     if coordinator_root is None:
         return paths.gate_ledger_spool_root()
-    return Path(coordinator_root) / paths.GATE_LEDGER_SPOOL_DIRNAME
+    return spool_slot.canonical_job_slot(
+        "gate-ledger-spool", "placeholder", coordinator_root=coordinator_root
+    ).parent
 
 
 def gate_ledger_spool_dir(
@@ -140,7 +142,9 @@ def gate_ledger_spool_dir(
     """單一 job 的 gate spool 目錄（唯一定址點）。"""
 
     _validate_spool_key(spool_key)
-    return gate_ledger_spool_root(coordinator_root).resolve() / spool_key
+    return spool_slot.canonical_job_slot(
+        "gate-ledger-spool", spool_key, coordinator_root=coordinator_root
+    )
 
 
 def gate_spool_ledger_path(
@@ -214,7 +218,9 @@ def gate_worktree_dir(
         if gate_worktree_root is None
         else Path(gate_worktree_root)
     )
-    return root / spool_key
+    return spool_slot.canonical_job_slot(
+        "gate-worktree", spool_key, coordinator_root=gate_worktree_root
+    )
 
 
 def _validate_spool_key(spool_key: str) -> None:
@@ -736,7 +742,10 @@ def ensure_gate_ledger(
     log_path = job.get("log_path")
     if not isinstance(log_path, str) or not log_path:
         return None
-    ledger_path = terminal_contract.gate_ledger_path(log_path)
+    control_log_path = job.get("control_log_path")
+    ledger_path = terminal_contract.gate_ledger_path(
+        control_log_path if isinstance(control_log_path, str) and control_log_path else log_path
+    )
     if Path(ledger_path).exists():
         return None
     spool_key = spool_key_for_job(job)

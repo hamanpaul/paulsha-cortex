@@ -115,6 +115,15 @@ DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (
     Principal.GATE,
 )
 
+# Only model lanes consume workflow prompts.  GATE has a spec spool but no
+# executor prompt channel; deriving this tuple from the one launch-principal
+# table keeps the prompt ACL surface from silently widening to operator code.
+PROMPT_JOB_PRINCIPALS: tuple[Principal, ...] = tuple(
+    principal
+    for principal in DOWNGRADED_JOB_PRINCIPALS
+    if principal in (Principal.BUILDER, Principal.REVIEWER)
+)
+
 
 @dataclass(frozen=True)
 class JobLogSpool:
@@ -176,10 +185,11 @@ JOB_LOG_SPOOLS: tuple[JobLogSpool, ...] = (
             "sentinel（`<slice>.exit`）住在同一層，而 #604 的整個保證就是「它們由 "
             "Manager 寫、採信端以 `foreign_evidence_author()` 檢查擁有者」。給 builder "
             "一條進得去那一層的 RWP，等於把剛關上的門重新打開——因此 log 改掛在 "
-            "`commit-spool` 底下，Manager 端那條 harvest 路徑則以 **hard link** 對上"
-            "同一個 inode（見 `coordinator/job_workspace.py:prepare_job_log_spool`）："
-            "`log_path` 的字面量、exit sentinel、gate ledger、spool key 的推導"
-            "**一個位元組都沒有變**。"
+            "`commit-spool` 底下，該格由 Manager 預建並直接作為 canonical readable"
+            " log surface（見 `coordinator/job_workspace.py:prepare_job_log_spool`）。"
+            "completion 的 exit sentinel／gate ledger 不再從 job-writable log 名稱直接"
+            "落地，而是經 Manager-only control anchor 投影；因此 `ProtectSystem=strict`"
+            "下兩個 `ReadWritePaths` mount 不需要 hard link，且 job 仍碰不到 control files。"
         ),
     ),
     JobLogSpool(
@@ -1373,6 +1383,14 @@ def job_spec_spool_asset_id(principal: Principal) -> str:
     return f"job-spec-spool-{principal.value}"
 
 
+def job_prompt_root_asset_id(principal: Principal) -> str:
+    """Manager-owned prompt root asset for one model principal."""
+
+    if principal not in PROMPT_JOB_PRINCIPALS:
+        raise ValueError(f"prompt root is not applicable to {principal.value}")
+    return f"job-prompt-root-{principal.value}"
+
+
 class IngressKind(Enum):
     """spec §C mutation ingress 盤點的種類。"""
 
@@ -1532,6 +1550,35 @@ def _job_spec_spool_assets() -> tuple[TrustRootAsset, ...]:
     )
 
 
+def _job_prompt_root_assets() -> tuple[TrustRootAsset, ...]:
+    """Dedicated Manager-owned prompt roots, derived from model principals."""
+
+    return tuple(
+        TrustRootAsset(
+            job_prompt_root_asset_id(principal), _T0, _MO,
+            "paulsha_cortex.config.paths:job_prompt_root_for",
+            (Principal.MANAGER,), (Principal.MANAGER, principal),
+            IngressKind.MANAGER_INTERNAL,
+            path_resolver_args=(principal.value,),
+            derived_in=(
+                "config/paths.py:job_prompt_root_for",
+                "trust_root/registry.py:PROMPT_JOB_PRINCIPALS",
+                "coordinator/job_runner.py:job_prompt_spool_path",
+                "coordinator/job_runner.py:write_job_prompt",
+                "coordinator/dispatcher.py:_finalize_headless",
+            ),
+            note=(
+                f"Manager-owned prompt root for the {principal.value} model lane. "
+                "It is a sibling of the per-principal spec spool, never a child of "
+                "the job-log slot (whose parent grants job wx). Manager creates one "
+                "non-writable per-job directory and the job receives only r-x on the "
+                "directory and r-- on the prompt inode."
+            ),
+        )
+        for principal in PROMPT_JOB_PRINCIPALS
+    )
+
+
 ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
     # ---- resolver-backed 容器樹 --------------------------------------------
     TrustRootAsset(
@@ -1568,6 +1615,46 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         (Principal.MANAGER, Principal.OPERATOR),
         IngressKind.MANAGER_INTERNAL,
         note="socket／lock run dir；monitor socket 已 0600、run dir 0700（正面前例）。",
+    ),
+    TrustRootAsset(
+        "builder-job-codex-home-root", _T0, _MO,
+        "paulsha_cortex.config.paths:builder_job_codex_home_root",
+        (Principal.MANAGER,), (Principal.BUILDER,), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job CODEX_HOME container; builder receives only its slot.",
+    ),
+    TrustRootAsset(
+        "reviewer-job-codex-home-root", _T0, _MO,
+        "paulsha_cortex.config.paths:reviewer_job_codex_home_root",
+        (Principal.MANAGER,), (Principal.REVIEWER, Principal.PLANNER), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job CODEX_HOME container; reviewer receives only its slot.",
+    ),
+    TrustRootAsset(
+        "builder-job-cache-root", _T1, _MO,
+        "paulsha_cortex.config.paths:builder_job_cache_root",
+        (Principal.MANAGER,), (Principal.BUILDER,), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job runtime cache container for builder jobs.",
+    ),
+    TrustRootAsset(
+        "reviewer-job-cache-root", _T1, _MO,
+        "paulsha_cortex.config.paths:reviewer_job_cache_root",
+        (Principal.MANAGER,), (Principal.REVIEWER, Principal.PLANNER), IngressKind.MANAGER_INTERNAL,
+        note="Manager-provisioned per-job runtime cache container for reviewer/planner jobs.",
+    ),
+    TrustRootAsset(
+        "codex-control-root", _T0, _MO,
+        "paulsha_cortex.config.paths:codex_control_root",
+        (Principal.INSTALLER,),
+        (Principal.MANAGER, Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.MANAGER_INTERNAL,
+        note="Deployment-owned canonical config/plugins/skills/hooks projection; jobs cannot mutate it.",
+    ),
+    TrustRootAsset(
+        "codex-credential-root", _T0, _MO,
+        "paulsha_cortex.config.paths:codex_credential_root",
+        (Principal.MANAGER,),
+        (Principal.MANAGER,),
+        IngressKind.MANAGER_INTERNAL,
+        note="Manager-owned auth seed/harvest authority; credentials are never exposed by setup output.",
     ),
     TrustRootAsset(
         "project-config-tree", _T0, _MO, "paulsha_cortex.config.paths:project_config_root",
@@ -2267,6 +2354,7 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
     ),
     *_job_spec_spool_assets(),
+    *_job_prompt_root_assets(),
     TrustRootAsset(
         "verification-evidence", _T0, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,

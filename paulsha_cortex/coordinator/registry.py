@@ -572,10 +572,74 @@ class JobRegistry:
             "workflow_sandbox_hash", "workflow_builder_job_id", "workflow_stage_execution_key",
             "workflow_test_policy", "usage_reason", "started_at", "exited_at",
             "review_verdict_channel",
+            "runtime_principal", "runtime_mode", "runtime_surface",
+            "prompt_path",
         ):
             value = job.get(field)
             if value is not None and not isinstance(value, str):
                 raise ValueError(f"coordinator 狀態檔 {field} 格式錯誤（fail-closed）: {self._state_path}")
+        runtime_principal = job.get("runtime_principal")
+        if runtime_principal is not None and runtime_principal not in {
+            "builder", "reviewer", "gate"
+        }:
+            raise ValueError(
+                f"coordinator 狀態檔 runtime_principal 非法（fail-closed）: {self._state_path}"
+            )
+        runtime_mode = job.get("runtime_mode")
+        if runtime_mode is not None and runtime_mode not in {
+            "direct", "systemd-run", "systemd-template"
+        }:
+            raise ValueError(
+                f"coordinator 狀態檔 runtime_mode 非法（fail-closed）: {self._state_path}"
+            )
+        runtime_surface = job.get("runtime_surface")
+        if runtime_surface is not None and runtime_surface not in {
+            "builder-codex-home", "reviewer-codex-home"
+        }:
+            raise ValueError(
+                f"coordinator 狀態檔 runtime_surface 非法（fail-closed）: {self._state_path}"
+            )
+        credential_publish = job.get("credential_publish", False)
+        if not isinstance(credential_publish, bool):
+            raise ValueError(
+                f"coordinator 狀態檔 credential_publish 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        if credential_publish:
+            expected_principal = {
+                "builder-codex-home": "builder",
+                "reviewer-codex-home": "reviewer",
+            }.get(runtime_surface)
+            if (
+                job.get("executor") != "codex"
+                or runtime_mode not in {"systemd-run", "systemd-template"}
+                or expected_principal is None
+                or runtime_principal != expected_principal
+            ):
+                raise ValueError(
+                    f"coordinator 狀態檔 credential publisher lane 不一致（fail-closed）: {self._state_path}"
+                )
+        prompt_path = job.get("prompt_path")
+        if prompt_path is not None and (
+            not isinstance(prompt_path, str)
+            or not prompt_path.startswith("/")
+            or not Path(prompt_path).name.startswith(".prompt-")
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 prompt_path 格式錯誤（fail-closed）: {self._state_path}"
+            )
+        runtime_diagnostic = job.get("runtime_diagnostic")
+        if runtime_diagnostic is not None and (
+            not isinstance(runtime_diagnostic, dict)
+            or set(runtime_diagnostic) != {"reason", "detail", "source", "job_id"}
+            or any(
+                not isinstance(runtime_diagnostic.get(key), str)
+                or not runtime_diagnostic[key]
+                for key in runtime_diagnostic
+            )
+        ):
+            raise ValueError(
+                f"coordinator 狀態檔 runtime_diagnostic 格式錯誤（fail-closed）: {self._state_path}"
+            )
         # trust-root Phase 2a：通道標記只有一個合法字面值。任何其他值都可能是被
         # 改過的狀態檔（想把新 job 偽裝成 legacy 以打開 worktree fallback）→ fail-closed。
         verdict_channel = job.get("review_verdict_channel")
@@ -903,6 +967,11 @@ class JobRegistry:
         workflow_stage_execution_key: str | None = None,
         workflow_test_policy: str | None = None,
         review_verdict_channel: str | None = None,
+        runtime_principal: str | None = None,
+        runtime_mode: str | None = None,
+        runtime_surface: str | None = None,
+        credential_publish: bool = False,
+        prompt_path: str | None = None,
     ) -> dict[str, Any]:
         if persona == "builder" and any(
             job.get("task") == task
@@ -943,6 +1012,10 @@ class JobRegistry:
             "session_name": session_name,
             "pid": pid,
             "log_path": log_path,
+            # Template launches persist a separate Manager-only completion
+            # anchor because their canonical JSONL log lives in a job-writable
+            # spool.  Legacy/direct rows leave this unset and use log_path.
+            "control_log_path": None,
             "exit_code": exit_code,
             "subject_head": subject_head,
             "spec_hash": spec_hash,
@@ -974,6 +1047,12 @@ class JobRegistry:
             # worktree 內的 legacy verdict（並記 WARN）。舊狀態檔沒有這個欄位，
             # 因此 legacy 判定天然正確，不需要遷移。
             "review_verdict_channel": review_verdict_channel,
+            "runtime_principal": runtime_principal,
+            "runtime_mode": runtime_mode,
+            "runtime_surface": runtime_surface,
+            "credential_publish": credential_publish,
+            "prompt_path": prompt_path,
+            "runtime_diagnostic": None,
             "workflow_evidence": None,
             # #384：executor 失敗的 typed 分類（見 provider_outcome.py），只在
             # `update_headless_result` 收到失敗結果且能分類時才會被寫入。
@@ -1120,6 +1199,12 @@ class JobRegistry:
         session_name: str | None = None,
         pid: int | None = None,
         log_path: str | None = None,
+        runtime_principal: str | None = None,
+        runtime_mode: str | None = None,
+        runtime_surface: str | None = None,
+        credential_publish: bool = False,
+        prompt_path: str | None = None,
+        control_log_path: str | None = None,
     ) -> dict[str, Any]:
         job = self._find_job(job_id)
         if job["status"] not in ACTIVE_JOB_STATUSES:
@@ -1130,6 +1215,12 @@ class JobRegistry:
         job["session_name"] = session_name
         job["pid"] = pid
         job["log_path"] = log_path
+        job["runtime_principal"] = runtime_principal
+        job["runtime_mode"] = runtime_mode
+        job["runtime_surface"] = runtime_surface
+        job["credential_publish"] = credential_publish
+        job["prompt_path"] = prompt_path
+        job["control_log_path"] = control_log_path
         job["started_at"] = _now_iso()
         self._persist()
         return _deepcopy_json(job)
@@ -1141,6 +1232,7 @@ class JobRegistry:
         status: str,
         exit_code: int,
         provider_outcome: Mapping[str, Any] | None = None,
+        runtime_diagnostic: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if status not in TERMINAL_JOB_STATUSES:
             raise ValueError(
@@ -1153,6 +1245,16 @@ class JobRegistry:
             or set(provider_outcome) - {"outcome", "authority", "reason", "retryable", "reset_at"}
         ):
             raise ValueError("provider_outcome 格式錯誤（fail-closed）")
+        if runtime_diagnostic is not None and (
+            not isinstance(runtime_diagnostic, Mapping)
+            or set(runtime_diagnostic) != {"reason", "detail", "source", "job_id"}
+            or any(
+                not isinstance(runtime_diagnostic.get(key), str)
+                or not runtime_diagnostic[key]
+                for key in runtime_diagnostic
+            )
+        ):
+            raise ValueError("runtime_diagnostic 格式錯誤（fail-closed）")
         job = self._find_job(job_id)
         _validate_transition(
             field="job status",
@@ -1167,6 +1269,9 @@ class JobRegistry:
         # 傳入時才寫入——`status == "exited"` 或呼叫端未提供分類（例如 launch
         # 本身失敗、根本沒有 executor 輸出可分類）時保持 None，不偽造分類。
         job["provider_outcome"] = dict(provider_outcome) if provider_outcome is not None else None
+        job["runtime_diagnostic"] = (
+            dict(runtime_diagnostic) if runtime_diagnostic is not None else None
+        )
         # #325：usage 抽取是盡力而為的附加資訊，任何失敗都不得影響上面已判定
         # 好的 status/exit_code/exited_at——extract_usage 本身已 fail-soft，
         # 這裡再包一層防禦性雙保險。

@@ -262,8 +262,11 @@ def test_branch_naming_and_harvest_surface_are_unchanged(tmp_path: Path) -> None
     # 3. 標記檔記的 branch 不變
     marker = job_workspace.read_marker(workspace) or {}
     assert marker.get("branch") == branch
-    # 4. spool key 仍由 log_path 推導，與目錄名無關（#637）
-    job = {"log_path": f"/var/log/cortex/{slice_id}.jsonl"}
+    # 4. spool key 由 Manager registry job_id 決定，與目錄名及 log payload 無關。
+    job = {
+        "job_id": slice_id,
+        "log_path": "/var/log/cortex/untrusted-payload-name.jsonl",
+    }
     assert job_workspace.spool_key_for_job(job) == slice_id
 
 

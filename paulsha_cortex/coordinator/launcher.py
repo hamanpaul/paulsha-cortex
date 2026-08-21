@@ -158,9 +158,12 @@ def build_wrapper_script(
     repo_root: str | None,
     run_gates: bool,
     stdin_prompt: str | None = None,
+    prompt_via_stdin: bool = False,
+    prompt_file: str | None = None,
     write_sentinel: bool = True,
     commit_bundle: str | None = None,
     verdict_file: str | None = None,
+    last_message_path: str | None = None,
 ) -> str:
     """組出 headless wrapper script（#261：模型結束後由 manager 產生 gate ledger）。
 
@@ -193,8 +196,14 @@ def build_wrapper_script(
     自己 chmod，所以那一步必須由 wrapper 在它結束後補上。段序同樣排在 sentinel
     **之前**，理由與 bundle 一致。
 
-    ``commit_bundle`` 與 ``verdict_file`` 皆為 None 時（planner，以及所有既有測試
-    路徑）script **逐字**與改動前相同。
+    ``last_message_path``（#714 repair）：Codex 的 ``-o`` 可能以 temp+rename
+    發表，最後的檔案因此由 job UID 擁有、`UMask=0077` 下 Manager 讀不到。wrapper
+    在模型結束後只對這個模型輸出做 best-effort mode publication，並把 sentinel
+    放在 publication 之後；它不是 gate/evidence，Manager 不以其 owner 或內容作為
+    completion authority。檔案不存在時 publication 是靜默 no-op。
+
+    三個 publication 參數皆為 None 時（planner，以及所有既有測試路徑）script
+    **逐字**與改動前相同。
 
     ``write_sentinel=False`` / ``run_gates=False``（#604，降權模式）：這支 script
     在降權模式下是以 **job 帳號**（`cortex-builder`）執行的，而 sentinel 與 ledger
@@ -222,13 +231,34 @@ def build_wrapper_script(
     `_extract_terminal_json` 只能安全解析乾淨 stdout）。
     """
 
-    if stdin_prompt is None:
+    if stdin_prompt is not None and prompt_file is not None:
+        raise ValueError("prompt cannot be supplied through both stdin and a private file")
+    if prompt_file is not None:
+        if not prompt_file.startswith("/"):
+            raise ValueError("private prompt file must be an absolute path")
+        # Only the bounded Manager-created path enters the command string.
+        # The prompt bytes never enter argv, env, or systemd's displayed unit
+        # command, and template units deliberately keep stdin on /dev/null.
+        # Shell input redirection makes an unreadable/missing file fail before
+        # the inner process starts; a pipeline would otherwise let the child
+        # run on EOF after `cat` failed.
+        command = f"{shlex.join(inner_argv)} < {shlex.quote(prompt_file)} 2>/dev/null"
+    elif stdin_prompt is None:
         command = shlex.join(inner_argv)
+    elif not prompt_via_stdin:
+        # Legacy cg contract: its prompt is piped by the shell because the
+        # caller does not own a persistent stdin stream.
+        command = f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
     else:
-        command = (
-            f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
-        )
-    if commit_bundle is not None or verdict_file is not None:
+        # The prompt is supplied through the wrapper's stdin by the caller.
+        # Do not interpolate it into ``bash -c``: that still makes the prompt
+        # an argv element of the shell and fails at Linux's ARG_MAX_STRLEN.
+        command = f"cat | {shlex.join(inner_argv)} 2>/dev/null"
+    if (
+        commit_bundle is not None
+        or verdict_file is not None
+        or last_message_path is not None
+    ):
         return _publishing_wrapper_script(
             command=command,
             sentinel=sentinel,
@@ -239,6 +269,7 @@ def build_wrapper_script(
             write_sentinel=write_sentinel,
             commit_bundle=commit_bundle,
             verdict_file=verdict_file,
+            last_message_path=last_message_path,
         )
     if write_sentinel:
         script = f'{command}; printf %s "$?" > {shlex.quote(sentinel)}'
@@ -293,11 +324,12 @@ def _publishing_wrapper_script(
     write_sentinel: bool,
     commit_bundle: str | None,
     verdict_file: str | None,
+    last_message_path: str | None,
 ) -> str:
     """帶「成果發表」段的 wrapper。
 
-    段序＝模型 → 存 `$?` → bundle（#623）→ verdict 放寬（#638）→ sentinel →
-    gate → 還原 `$?`。
+    段序＝模型 → 存 `$?` → bundle（#623）→ verdict 放寬（#638）→ last-message
+    publication（#714）→ sentinel → gate → 還原 `$?`。
 
     兩個發表段都排在 sentinel **之前**：sentinel 一出現，Manager 隨時可能在下一個
     tick 判定完成並開始收割，成果必須先落地且已經是 consumer 讀得到的形狀。
@@ -316,6 +348,8 @@ def _publishing_wrapper_script(
         )
     if verdict_file is not None:
         segments.append(spool_slot.publish_file_command(verdict_file))
+    if last_message_path is not None:
+        segments.append(spool_slot.publish_file_command(last_message_path))
     if write_sentinel:
         segments.append(f'printf %s "${_RC_VAR}" > {shlex.quote(sentinel)}')
     if run_gates and repo_root:
@@ -587,6 +621,18 @@ class LaunchHandle:
     session_name: str
     pid: int
     log_path: str
+    #: Typed runtime identity used by the Manager harvest path.  ``None`` is
+    #: intentional for direct/non-Codex jobs; they must never be guessed from
+    #: workflow kind or persona text.
+    runtime_principal: str | None = None
+    runtime_mode: str | None = None
+    runtime_surface: str | None = None
+    credential_publish: bool = False
+    prompt_path: str | None = None
+    #: Manager-only completion-control anchor.  Template jobs expose a
+    #: canonical log in their writable spool, so the sentinel/ledger cannot
+    #: be reconstructed from ``log_path`` alone.
+    control_log_path: str | None = None
 
 
 def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
@@ -704,6 +750,19 @@ def _verdict_spool_add_dirs(
     return (str(path.resolve()),)
 
 
+_VALID_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_COPILOT_DEFAULT_EFFORT = "xhigh"
+
+
+def _resolve_reasoning_effort(*, executor: str, effort: str | None, default: str) -> str:
+    resolved = effort or default
+    if resolved not in _VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"{executor} executor effort must be one of {sorted(_VALID_REASONING_EFFORTS)}, got {resolved!r}"
+        )
+    return resolved
+
+
 def build_copilot_argv(
     *,
     prompt: str,
@@ -717,6 +776,7 @@ def build_copilot_argv(
     review_only: bool = False,
     commit_required: bool = False,
     verdict_spool_dir: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required Copilot builder requires enforced workspace-write")
@@ -726,6 +786,11 @@ def build_copilot_argv(
         if worktree is None:
             raise ValueError("commit-required Copilot builder requires a worktree")
         worktree = str(Path(worktree).resolve())
+    resolved_effort = _resolve_reasoning_effort(
+        executor="copilot",
+        effort=effort,
+        default=_COPILOT_DEFAULT_EFFORT,
+    )
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
     argv = [
@@ -742,6 +807,7 @@ def build_copilot_argv(
     ]
     if model is not None:
         argv += ["--model", model]
+    argv += ["--effort", resolved_effort]
     if commit_required:
         argv.append("--allow-all-tools")
         argv += ["--add-dir", worktree]
@@ -770,6 +836,7 @@ def build_claude_argv(
     review_terminal_kind: str | None = None,
     commit_required: bool = False,
     verdict_spool_dir: str | None = None,
+    prompt_via_stdin: bool = False,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
@@ -787,10 +854,10 @@ def build_claude_argv(
         review_schema = None
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
-    argv = [
-        "claude",
-        "-p",
-        prompt,
+    argv = ["claude", "-p"]
+    if not prompt_via_stdin:
+        argv.append(prompt)
+    argv += [
         "--output-format",
         "stream-json",
         "--verbose",  # smoke 實證：claude -p + --output-format stream-json 必須帶 --verbose
@@ -885,6 +952,7 @@ def build_codex_argv(
     argv = [
         "codex",
         "exec",
+        "--ignore-user-config",
         prompt,
         "--json",
     ]
@@ -955,6 +1023,14 @@ def build_codex_argv(
         argv += ["--add-dir", spool_dir]
     if model is not None:
         argv += ["--model", model]
+        reasoning_effort = {
+            "gpt-5.6-luna": "max",
+            "gpt-5.3-codex-spark": "xhigh",
+        }.get(model)
+        if reasoning_effort is not None:
+            # Codex reads this as a CLI config override, so an ambient
+            # ~/.codex/config.toml cannot silently choose a different effort.
+            argv += ["-c", f'model_reasoning_effort="{reasoning_effort}"']
     # #714 缺陷 2：`-o` 的落點必須是**這個 job 寫得進去、而且帶 job id** 的那一格。
     # 呼叫端沒給時退回 `<log_dir>/<slice>.last.json`——仍然帶 slice id（共用
     # `last.json` 會讓並行的兩個 job 互相蓋掉），只是落在 Manager 的 dispatch log
@@ -1086,7 +1162,7 @@ def build_agy_argv(
 # llm-share env（含 `COPILOT_MODEL=glm-5.2`），這裡的常數只是 argv 沒收到明確
 # `model` 時的落地預設，實際身分仍由 operator 的 env file 決定。
 _CG_DEFAULT_MODEL = "glm-5.2"
-_CG_VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_CG_VALID_EFFORTS = _VALID_REASONING_EFFORTS
 _CG_DEFAULT_EFFORT = "medium"
 
 
@@ -1128,11 +1204,11 @@ def build_cg_argv(
         raise ValueError("cg executor is zero-tool and cannot commit")
     if not (read_only or review_only):
         raise ValueError("cg executor requires read-only or review-only mode")
-    resolved_effort = effort or _CG_DEFAULT_EFFORT
-    if resolved_effort not in _CG_VALID_EFFORTS:
-        raise ValueError(
-            f"cg executor effort must be one of {sorted(_CG_VALID_EFFORTS)}, got {resolved_effort!r}"
-        )
+    resolved_effort = _resolve_reasoning_effort(
+        executor="cg",
+        effort=effort,
+        default=_CG_DEFAULT_EFFORT,
+    )
     return [
         "cg",
         "--model",
@@ -1252,10 +1328,9 @@ class SubprocessLauncher:
         # `cortex-builder` 起跑（它就是 builder，只是這一張卡不寫檔）。
         self._write_forbidden = write_forbidden
         self._review_terminal_kind = review_terminal_kind
-        # cg-only：`--effort low|medium|high|xhigh`。其餘 executor 沒有對應概念
-        # （不同於 `model`，本 repo 目前沒有既有的「effort 來源」可直接映射），
-        # 存下不驗證——合法值集合在 `build_cg_argv` 驗證，未指定時落地預設
-        # `_CG_DEFAULT_EFFORT`；非 cg 的 executor 忽略此欄位。
+        # copilot/cg 共用：兩者都接受 `--effort low|medium|high|xhigh`，但預設不同
+        # （copilot = xhigh；cg = medium）。其餘 executor 沒有對應旗標，因此這裡只
+        # 保留原值，實際合法值與預設都交給各自的 argv builder 驗證。
         self._effort = effort
         # trust-root Phase 2a：本 job 專屬的 verdict spool 目錄（唯一額外放行的
         # 寫入路徑）。None ＝ 不放行任何 worktree 之外的寫入（既有行為）。
@@ -1630,7 +1705,11 @@ class SubprocessLauncher:
         # 絕對化後 JSONL / sentinel / 回傳 log_path 皆與 cwd 無關，跨進程 poll 一致。
         log_dir = str(Path(log_dir).resolve())
         Path(log_dir).mkdir(parents=True, exist_ok=True)
-        log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        # ``manager_log_path`` is the stable Manager-only control anchor.  In
+        # template mode the readable JSONL surface moves into the principal's
+        # preseeded job spool; completion controls keep using this anchor.
+        manager_log_path = str(Path(log_dir) / f"{slice_id}.jsonl")
+        log_path = manager_log_path
         # #714 缺陷 2：**job 端 log 的落點在這裡就定案**（純路徑推導、零副作用），
         # 因為 executor 的 argv 在下面幾行就要用到它——`-o` 的落點是「這個 job 自己那
         # 份 log 的兄弟檔」。真正把那一格建出來的仍是下面 `prepare_job_log_spool()`
@@ -1639,14 +1718,54 @@ class SubprocessLauncher:
         # shim 開的是 B」這種只在實機上看得見的錯位。
         job_log_path = log_path
         if template_plan is not None:
+            # #718：模板 job 的 canonical log slot 必須逐字跟 unit 的 `%i`
+            # (`template_plan.instance`) 相同；raw `slice_id` 留給上面的 explicit
+            # Manager control anchor。
             job_log_path = str(
                 job_workspace.job_log_spool_dir(
                     principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
-                    spool_key=slice_id,
+                    spool_key=template_plan.instance,
                 )
                 / job_workspace.JOB_LOG_FILENAME
             )
         last_message_path = str(job_workspace.job_last_message_path(job_log_path))
+        runtime_principal = job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal
+        prompt_file: str | None = None
+        if degraded and self._executor in {"claude", "cg"}:
+            # A degraded unit has stdin=/dev/null, so its prompt travels via a
+            # Manager-created file.  The prompt root is derived from the
+            # role's spec spool, but is its sibling: the spec/log slots have
+            # different ACL directions and neither job may rename this root.
+            prompt_spec_spool = (
+                template_plan.spool_dir
+                if template_plan is not None
+                else job_runner.resolve_prompt_spec_spool(os.environ, role=job_role)
+            )
+            if (
+                runner_plan is not None
+                and not os.environ.get(job_runner.JOB_ROLE_CONFIG[job_role].spec_spool_env)
+                and not Path(prompt_spec_spool).exists()
+            ):
+                # Transient mode has no spec file, but its prompt root still
+                # uses the same Manager-owned coordinator namespace.  A
+                # caller-provided isolated agents root may be an empty test or
+                # first-boot tree; create only this non-job-writable spool
+                # anchor, never a deployment path selected by payload text.
+                Path(prompt_spec_spool).mkdir(parents=True, mode=0o700)
+                os.chmod(prompt_spec_spool, 0o700)
+            prompt_spool = job_runner.job_prompt_spool_dir(
+                prompt_spec_spool,
+                principal=runtime_principal,
+                instance=job_runner.template_instance_id(slice_id),
+                account=(
+                    template_plan.account
+                    if template_plan is not None
+                    else runner_plan.account
+                ),
+            )
+            prompt_file = job_runner.job_prompt_path(
+                prompt_spool, job_runner.template_instance_id(slice_id)
+            )
         builder_kwargs = {
             "prompt": prompt,
             "slice_id": slice_id,
@@ -1689,7 +1808,10 @@ class SubprocessLauncher:
             builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
-        if self._executor == "cg":
+            # Claude's complete workflow envelope can exceed Linux's per-argv
+            # limit.  The wrapper receives it over stdin instead.
+            builder_kwargs["prompt_via_stdin"] = True
+        if self._executor in {"copilot", "cg"}:
             builder_kwargs["effort"] = self._effort
         # #714 缺陷 2：只有 codex 有 `--output-last-message`。其餘 executor 沒有這個
         # 落點，傳過去只會是一個沒人接的 kwarg（形狀與既有的 `verdict_spool_dir`／
@@ -1708,11 +1830,35 @@ class SubprocessLauncher:
         # 繼續用它只會把 daemon 的 HOME／PATH／VIRTUAL_ENV 硬塞進一個跑在別的 UID
         # 上、根本進不去那些路徑的行程。
         if degraded:
+            runtime_account_name = job_runner.resolve_job_account(os.environ, role=job_role)
+            runtime_account = (
+                runtime_account_name
+                if spool_slot.system_account_exists(runtime_account_name)
+                else None
+            )
             # #588 第 1 點的結構性解法：降權 unit **不繼承呼叫端的 environ**，
             # 因此 job 的環境就是這份白名單本身（不是「daemon environ 減去黑名單」）。
             # gh token、daemon 的 CLAUDE_CONFIG_DIR 都不在白名單上，因此不會出現在
             # job 裡——包括 `_copilot_credential_env()` 也因此自然回傳空 dict（它讀的是
             # 這份 env，裡面沒有任何 token 候選），不必為降權模式另設特例。
+            spool_slot.provision_runtime_surfaces(
+                principal=runtime_principal,
+                job_id=slice_id,
+                canonical_codex_home=spool_slot.canonical_codex_controls(
+                    runtime_principal,
+                    manager_env=os.environ,
+                ),
+                account=runtime_account,
+            )
+            copilot_home: Path | None = None
+            if self._executor == "copilot":
+                authority = spool_slot.copilot_oauth_authority(manager_env=os.environ)
+                copilot_home = spool_slot.provision_copilot_home(
+                    principal=runtime_principal,
+                    job_id=slice_id,
+                    authority=authority,
+                    account=runtime_account,
+                )
             env = job_runner.build_job_env(
                 manager_env=os.environ,
                 job_id=slice_id,
@@ -1728,6 +1874,13 @@ class SubprocessLauncher:
                 relay_target=self._relay_target,
                 role=job_role,
             )
+            if self._executor == "copilot":
+                if copilot_home is None:
+                    raise AssertionError("downgraded Copilot home must be provisioned")
+                env["COPILOT_HOME"] = str(copilot_home)
+                env["COPILOT_AUTO_UPDATE"] = "false"
+                for token_name in _COPILOT_TOKEN_ENV_VARS:
+                    env.pop(token_name, None)
         elif self._review_only:
             env = _review_scope_env()
         else:
@@ -1750,14 +1903,18 @@ class SubprocessLauncher:
         # 跨進程 durable 完成判定：以 bash -lc 包裝，子進程結束時把 $? 寫入 exit sentinel。
         # 用 shlex.join 安全嵌入內層 argv（prompt 含換行/空白仍為單一 token），
         # sentinel 路徑亦 shlex.quote。poll_headless_done 讀此 sentinel，不再靠 os.waitpid。
-        sentinel = str(Path(log_dir) / f"{slice_id}.exit")
+        sentinel = str(Path(manager_log_path).with_suffix(".exit"))
         # 重跑同一 slice_id 前先清掉上一輪殘留：移除舊 exit sentinel、log 以 wb 截斷。
         # 否則 poll_headless_done 會讀到上一輪的 sentinel / 末筆 JSONL，
         # 誤判「還沒開始就已完成」（fail-closed：每輪從乾淨狀態起跑）。
         Path(sentinel).unlink(missing_ok=True)
         # #261：同理清掉上一輪的 gate ledger，避免 harvest 讀到前一次的 gate 結果。
-        ledger = terminal_contract.gate_ledger_path(log_path)
+        ledger = terminal_contract.gate_ledger_path(manager_log_path)
         Path(ledger).unlink(missing_ok=True)
+        # The dispatch path is now only the Manager-owned control anchor.  Do
+        # remove an exact stale legacy log name before preparing the canonical
+        # spool, but never scan or mutate a sibling/prefix path.
+        Path(manager_log_path).unlink(missing_ok=True)
         # #623：成果 bundle 的 per-job spool。`prepare_commit_spool()` 同樣負責清掉
         # 上一輪殘留（與 sentinel／ledger 逐條一致），並把上一輪 harvest 之後的封存
         # 解開。判準是 **persona**，不是 `PSC_JOB_RUNNER`：reviewer／planner 不產生
@@ -1782,10 +1939,12 @@ class SubprocessLauncher:
             verdict_file = str(
                 Path(self._verdict_spool_dir) / spool_slot.REVIEW_VERDICT_FILENAME
             )
-        # cg（issue #442）走 stdin 傳 prompt，不是 argv 參數（見 build_cg_argv）：
-        # 其餘 executor 維持既有「prompt 為 argv 一個元素」路徑，stdin_prompt=None
-        # 時 build_wrapper_script 的行為與改動前逐字相同（零影響）。
-        stdin_prompt = prompt if self._executor == "cg" else None
+        # Direct Claude/CG retain their historical stdin contract.  Isolated
+        # lanes use the Manager-created bounded file because their template and
+        # transient clients intentionally set stdin to DEVNULL.
+        stdin_prompt = (
+            prompt if self._executor in {"claude", "cg"} and not degraded else None
+        )
         script = build_wrapper_script(
             inner_argv=inner_argv,
             sentinel=sentinel,
@@ -1794,12 +1953,34 @@ class SubprocessLauncher:
             repo_root=env.get("PSC_REPO_ROOT"),
             run_gates=self._should_run_gates(env),
             stdin_prompt=stdin_prompt,
+            prompt_via_stdin=self._executor == "claude",
+            prompt_file=prompt_file,
             # #604：降權模式下 sentinel 改由 Manager 側的 exit 記帳 shell 寫；
             # job wrapper 內不得再出現任何指向 Manager log 目錄的寫入。
             write_sentinel=not degraded,
             commit_bundle=commit_bundle,
             verdict_file=verdict_file,
+            # The wrapper publishes the final Codex output after temp+rename
+            # and before the Manager-authored completion control is written.
+            last_message_path=last_message_path if self._executor == "codex" else None,
         )
+        if runner_plan is not None and self._executor == "codex":
+            # Transient units have no generated ExecStopPost. Codex refreshes
+            # by temp+rename under UMask=0077, so run the same canonical
+            # publisher used by template units. Template mode must not run a
+            # second publisher in this wrapper.
+            # Widen only the
+            # credential file's ACL mask after Codex exits; the Manager-owned
+            # slot remains non-traversable to every foreign principal.
+            terminal = f'; exit "${_RC_VAR}"'
+            from ..trust_root.permgen import FOUR_WAY_SCHEME
+            publish = spool_slot.publish_runtime_credential_command(
+                manager_account=FOUR_WAY_SCHEME.durable_state_owner
+            )
+            if script.endswith(terminal):
+                script = script[: -len(terminal)] + f"; {publish}" + terminal
+            else:
+                script = f'{script}; {_RC_VAR}=$?; {publish}' + terminal
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         # 降權模式的 builder 同理（#588 第 2 點）：login shell 會在 transient unit 的
         # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
@@ -1810,6 +1991,8 @@ class SubprocessLauncher:
             "env": env,
             "stderr": subprocess.STDOUT,
         }
+        if self._executor == "claude":
+            popen_kwargs["stdin"] = subprocess.PIPE
         if runner_plan is not None:
             argv = job_runner.build_systemd_run_argv(
                 systemd_run=runner_plan.binary,
@@ -1822,7 +2005,7 @@ class SubprocessLauncher:
             )
             # #604：client 跑在 Manager 這一側且存活到 unit 結束，由它記 exit code。
             argv = job_runner.build_manager_exit_recorder_argv(
-                client_argv=argv, sentinel=sentinel
+                client_argv=argv, sentinel=sentinel, cleanup_path=prompt_file
             )
             # systemd-run **client 自己**的環境。它不會流進 transient unit——unit 的
             # 環境只有 PID 1 的 manager environment 加上 `--setenv` 白名單（這正是
@@ -1847,9 +2030,10 @@ class SubprocessLauncher:
             #
             # 改成寫進 builder 自己的 log spool（登記表資產 `build-job-log-spool`，
             # 掛在既有的 `commit-spool` 底下 ⇒ 模板 unit 的 `ReadWritePaths=` 逐字
-            # 不變），Manager 那條路徑則以 **hard link** 指向同一個 inode——
-            # `log_path` 這個字面量、sentinel／gate ledger／spool key 的推導、
-            # harvest 與 usage 抽取因此**一個位元組都沒有變**。
+            # 不變）。那一格由 Manager 預建，因此同一個 canonical 檔案同時是
+            # Manager-readable log surface；不再把兩個獨立 systemd bind mount
+            # 以 hard link 接起來（live namespace 會回 EXDEV）。sentinel／ledger
+            # 留在上面已算出的 Manager-only control surface。
             #
             # **落點由角色決定，不是寫死 builder**：launcher 同時派 builder 與
             # reviewer 兩種 job（`_job_role()`），兩者走不同的模板 unit、不同的帳號，
@@ -1859,8 +2043,8 @@ class SubprocessLauncher:
             prepared_log_path = str(
                 job_workspace.prepare_job_log_spool(
                     principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
-                    spool_key=slice_id,
-                    manager_log_path=log_path,
+                    spool_key=template_plan.instance,
+                    manager_log_path=manager_log_path,
                 )
             )
             # #714：argv 上的 `-o` 是由**上面那個純路徑推導**算出來的，這裡是真的建出
@@ -1874,6 +2058,33 @@ class SubprocessLauncher:
                     "（#714）"
                 )
             job_log_path = prepared_log_path
+            # Codex may publish ``-o`` with temp+rename.  Pre-seed the named
+            # output as a Manager-owned readable slot before the job starts;
+            # the wrapper's post-model publication widens a replacement to
+            # 0644 before the Manager-owned completion sentinel is written.
+            # The output is diagnostic/model data, never terminal evidence.
+            if self._executor == "codex":
+                spool_slot.preseed_job_writable_file(last_message_path)
+            # From this point on the registry and all log consumers use the
+            # canonical Manager-readable spool file.  ``sentinel`` and
+            # ``ledger`` were already derived from ``manager_log_path`` above
+            # and remain outside the job-writable directory.
+            log_path = prepared_log_path
+            if self._executor in {"claude", "cg"}:
+                expected_prompt_spool = job_runner.job_prompt_spool_dir(
+                    template_plan.spool_dir,
+                    principal=runtime_principal,
+                    instance=job_runner.template_instance_id(slice_id),
+                    account=template_plan.account,
+                )
+                expected_prompt_file = job_runner.job_prompt_path(
+                    expected_prompt_spool, job_runner.template_instance_id(slice_id)
+                )
+                if prompt_file != expected_prompt_file:
+                    raise RuntimeError(
+                        "private prompt 落點推導漂移："
+                        f"argv 用的是 {prompt_file!r}，template 用的是 {expected_prompt_file!r}"
+                    )
             # #710：**再把工作區的可達性準備好**，同樣在寫 spec 之前。
             #
             # shim 在降權之後、exec 之前 `os.chdir(spec["working_directory"])`——那一步
@@ -1915,7 +2126,7 @@ class SubprocessLauncher:
             )
             # #604：同 A 案——sentinel 由 Manager 側這層 shell 寫，job 不參與。
             argv = job_runner.build_manager_exit_recorder_argv(
-                client_argv=argv, sentinel=sentinel
+                client_argv=argv, sentinel=sentinel, cleanup_path=prompt_file
             )
             # systemctl **client 自己**的環境（同 A 案的理由：polkit 授權可能要查
             # 呼叫端 session）。它不會流進 unit——unit 的環境來自 root-owned 模板檔，
@@ -1935,41 +2146,80 @@ class SubprocessLauncher:
             # 以 append 開檔的理由不變：systemctl client 的非 O_APPEND fd 會在 shim
             # 已經寫了幾 KB 之後從 offset 0 覆蓋回去。
             log_mode = "ab"
-        with open(log_path, log_mode) as logf:
-            popen_kwargs["stdout"] = logf
-            proc = subprocess.Popen(argv, **popen_kwargs)
-        if template_plan is not None:
-            # polkit 拒絕／模板未安裝／shim 讀 spec 失敗只在起動當下才知道；
-            # 確認不到就 fail-closed，**絕不**退回其他模式。
-            job_runner.confirm_template_instance_started(
-                process=proc,
-                sentinel=sentinel,
-                unit=template_plan.unit,
-                account=template_plan.account,
-                log_path=log_path,
-                # #708 第 3 項：shim 在**接管 log 之前**的失敗只進 unit journal，
-                # 而 Manager 讀不到那份 journal。它改為在 job 自己的 log spool 那一格
-                # 留一筆機器可讀的紀錄，這裡把它撿回錯誤訊息裡。
-                job_log_path=job_log_path,
-                timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
-                manager_authored_sentinel=True,
+        if prompt_file is not None:
+            prompt_account = (
+                runner_plan.account if runner_plan is not None else template_plan.account
             )
-        if runner_plan is not None:
-            # polkit 拒絕／unit 名衝突只在起動當下才知道；確認不到就 fail-closed，
-            # **絕不**退回 direct（見 job_runner.confirm_transient_unit_started）。
-            job_runner.confirm_transient_unit_started(
-                process=proc,
-                sentinel=sentinel,
-                unit=runner_plan.unit,
-                account=runner_plan.account,
-                log_path=log_path,
-                timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
-                manager_authored_sentinel=True,
+            job_runner.write_job_prompt(
+                prompt_file, prompt, account=prompt_account
             )
+        try:
+            with open(log_path, log_mode) as logf:
+                popen_kwargs["stdout"] = logf
+                try:
+                    proc = subprocess.Popen(argv, **popen_kwargs)
+                except TypeError as exc:
+                    if "stdin" not in str(exc):
+                        raise
+                    popen_kwargs.pop("stdin", None)
+                    proc = subprocess.Popen(argv, **popen_kwargs)
+        except BaseException:
+            if prompt_file is not None:
+                Path(prompt_file).unlink(missing_ok=True)
+            raise
+        if self._executor == "claude" and stdin_prompt is not None and getattr(proc, "stdin", None) is not None:
+            proc.stdin.write(stdin_prompt.encode("utf-8"))
+            proc.stdin.close()
+        try:
+            if template_plan is not None:
+                # polkit 拒絕／模板未安裝／shim 讀 spec 失敗只在起動當下才知道；
+                # 確認不到就 fail-closed，**絕不**退回其他模式。
+                job_runner.confirm_template_instance_started(
+                    process=proc,
+                    sentinel=sentinel,
+                    unit=template_plan.unit,
+                    account=template_plan.account,
+                    # Start failures are diagnosed from the Manager control
+                    # surface; the canonical JSONL itself is the separate
+                    # job-log spool passed below.
+                    log_path=manager_log_path,
+                    # #708 第 3 項：shim 在**接管 log 之前**的失敗只進 unit journal，
+                    # 而 Manager 讀不到那份 journal。它改為在 job 自己的 log spool 那一格
+                    # 留一筆機器可讀的紀錄，這裡把它撿回錯誤訊息裡。
+                    job_log_path=job_log_path,
+                    timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
+                    manager_authored_sentinel=True,
+                )
+            if runner_plan is not None:
+                # polkit 拒絕／unit 名衝突只在起動當下才知道；確認不到就 fail-closed，
+                # **絕不**退回 direct（見 job_runner.confirm_transient_unit_started）。
+                job_runner.confirm_transient_unit_started(
+                    process=proc,
+                    sentinel=sentinel,
+                    unit=runner_plan.unit,
+                    account=runner_plan.account,
+                    log_path=log_path,
+                    timeout_ms=job_runner.resolve_start_timeout_ms(os.environ),
+                    manager_authored_sentinel=True,
+                )
+        except BaseException:
+            if prompt_file is not None:
+                Path(prompt_file).unlink(missing_ok=True)
+            raise
         return LaunchHandle(
             executor=self._executor,
             model_id=self._model,
             session_name=slice_id,
             pid=proc.pid,
             log_path=log_path,
+            runtime_principal=runtime_principal if degraded else None,
+            runtime_mode=runner_mode,
+            runtime_surface=(
+                f"{runtime_principal}-codex-home"
+                if degraded and self._executor == "codex"
+                else None
+            ),
+            credential_publish=bool(degraded and self._executor == "codex"),
+            prompt_path=prompt_file,
+            control_log_path=manager_log_path if degraded else None,
         )

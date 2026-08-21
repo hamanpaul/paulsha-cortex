@@ -47,10 +47,20 @@ producer 具名條目的 `x`（traverse）一併失效，連既有的檔都再�
 from __future__ import annotations
 
 import os
+import re
+import pwd
 import shlex
 import shutil
 import stat
 from pathlib import Path
+
+from ..trust_root.surfaces import (
+    PER_JOB_WRITABLE_SURFACES,
+    PerJobWritableSurface,
+    codex_runtime_surface,
+    credential_publisher_command,
+    writable_surface,
+)
 
 #: `review-verdict-spool` 那一格裡的成果檔名（目錄本身以 reviewer job id 定址）。
 #: 定義放在共用層是為了讓 `launcher` 組 wrapper 的發表段時不必回頭 import
@@ -89,6 +99,444 @@ SEALED_SLOT_MODE = 0o500
 #: POSIX ACL 的 access ACL 落在這個 xattr。存在 ⇒ 這一項的 group 位是 **mask**，
 #: 不是「群組的實際權限」。
 ACCESS_ACL_XATTR = "system.posix_acl_access"
+
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_COPILOT_OAUTH_CONFIG_ENV = "PSC_COPILOT_OAUTH_CONFIG"
+_COPILOT_HOME_DIRNAME = "copilot"
+_COPILOT_CONFIG_FILENAME = "config.json"
+
+
+def system_account_exists(account: str) -> bool:
+    try:
+        pwd.getpwnam(account)
+    except KeyError:
+        return False
+    return True
+
+
+def canonical_codex_controls(
+    principal: str, *, manager_env: dict[str, str] | os._Environ[str] | None = None
+) -> Path:
+    """Return the deployment-owned control authority, or fail closed.
+
+    Role HOME is deliberately not consulted: those trees are job-writable and,
+    in the deployed split-UID layout, are not readable by Manager anyway.
+    """
+    env = os.environ if manager_env is None else manager_env
+    configured = str(env.get("PSC_CODEX_CONTROL_ROOT", "")).strip()
+    if configured:
+        root = Path(configured)
+    else:
+        from ..config import paths
+        root = paths.codex_control_root()
+    candidate = root / principal
+    readable_codex_home(candidate, require_auth=False)
+    return candidate
+
+
+def readable_codex_home(
+    path: str | Path | None, *, require_auth: bool = True
+) -> Path:
+    """Validate a canonical projection source; never silently manufacture one."""
+    if path is None:
+        raise SpoolSlotError("control", "canonical Codex control source is required")
+    candidate = Path(path)
+    try:
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise SpoolSlotError("shape", f"canonical control is malformed: {candidate}")
+        with os.scandir(candidate) as entries:
+            next(entries, None)
+        for dirname in ("plugins", "skills"):
+            child = candidate / dirname
+            if child.is_symlink() or not child.is_dir():
+                raise SpoolSlotError("shape", f"canonical control is malformed: {child}")
+            with os.scandir(child) as entries:
+                next(entries, None)
+        filenames = ["config.toml", "hooks.json"]
+        if require_auth:
+            filenames.append("auth.json")
+        for filename in filenames:
+            child = candidate / filename
+            if child.is_symlink() or not child.is_file():
+                raise SpoolSlotError("shape", f"canonical control is malformed: {child}")
+            with child.open("rb") as stream:
+                stream.read(1)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        raise SpoolSlotError("control", f"canonical Codex controls are unreadable: {candidate}")
+    return candidate
+
+
+def copilot_oauth_authority(
+    *, manager_env: dict[str, str] | os._Environ[str] | None = None
+) -> Path:
+    """Validate the Manager-selected Copilot OAuth authority file."""
+
+    env = os.environ if manager_env is None else manager_env
+    configured = str(env.get(_COPILOT_OAUTH_CONFIG_ENV, "")).strip()
+    if not configured:
+        raise SpoolSlotError(
+            "credential",
+            f"{_COPILOT_OAUTH_CONFIG_ENV} must name the canonical Copilot OAuth authority",
+        )
+    candidate = Path(configured)
+    if not candidate.is_absolute():
+        raise SpoolSlotError(
+            "shape", f"canonical Copilot OAuth authority must be absolute: {candidate}"
+        )
+    fd = -1
+    try:
+        fd = os.open(str(candidate), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SpoolSlotError("shape", f"canonical Copilot OAuth authority is malformed: {candidate}")
+        if info.st_uid not in {0, os.getuid()}:
+            raise SpoolSlotError(
+                "permission", f"canonical Copilot OAuth authority has unexpected owner: {candidate}"
+            )
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise SpoolSlotError(
+                "permission",
+                f"canonical Copilot OAuth authority must not be group/other writable: {candidate}",
+            )
+        os.read(fd, 1)
+    except FileNotFoundError as exc:
+        raise SpoolSlotError(
+            "credential", f"canonical Copilot OAuth authority is unavailable: {candidate}"
+        ) from exc
+    except PermissionError as exc:
+        raise SpoolSlotError(
+            "credential", f"canonical Copilot OAuth authority is unreadable: {candidate}"
+        ) from exc
+    except OSError as exc:
+        if candidate.is_symlink():
+            raise SpoolSlotError(
+                "shape", f"canonical Copilot OAuth authority is malformed: {candidate}"
+            ) from exc
+        raise SpoolSlotError(
+            "credential", f"canonical Copilot OAuth authority is unavailable: {candidate}"
+        ) from exc
+    finally:
+        if fd != -1:
+            os.close(fd)
+    return candidate
+
+
+def credential_authority(principal: str) -> Path:
+    from ..config import paths
+    configured = os.environ.get("PSC_CODEX_CREDENTIAL_ROOT", "").strip()
+    root = Path(configured) if configured else paths.codex_credential_root()
+    return root / principal / "auth.json"
+
+
+def commit_runtime_credential(*, principal: str, job_id: str) -> Path:
+    """Atomically harvest a completed job's refresh for the next job seed."""
+    slot = canonical_job_slot(f"{principal}-codex-home", job_id)
+    source = slot / "auth.json"
+    if source.is_symlink() or not source.is_file():
+        raise SpoolSlotError("shape", f"runtime credential is malformed: {source}")
+    authority = credential_authority(principal)
+    authority.parent.mkdir(parents=True, exist_ok=True)
+    temporary = authority.with_name(f".{authority.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(source.read_bytes())
+    temporary.chmod(0o600)
+    os.replace(temporary, authority)
+    return authority
+
+
+def publish_runtime_credential_command(
+    *, codex_home: str = "$CODEX_HOME", manager_account: str
+) -> str:
+    """Producer-side auth publish contract for atomic rename under UMask=0077.
+
+    The named Manager ACL is necessary because the split identities do not share
+    a group.  ``chmod 0640`` alone therefore does not make a builder/reviewer
+    owned refresh readable by Manager.  The slot directory still denies every
+    foreign principal traversal.
+    """
+    # The executable recipe is owned by the typed Codex rows.  This wrapper
+    # preserves the historical public helper without keeping a second ACL
+    # truth in the spool implementation.
+    return credential_publisher_command(
+        manager_account=manager_account, codex_home=codex_home
+    )
+
+
+def _apply_slot_acl(
+    path: Path,
+    *,
+    account: str,
+    writable: bool,
+    surface: "PerJobWritableSurface",
+) -> None:
+    """Apply ACL without the launcher's mocked ``subprocess.Popen`` surface."""
+    binary = shutil.which("setfacl")
+    if binary is None or Path(binary).name != "setfacl":
+        binary = "/usr/bin/setfacl" if Path("/usr/bin/setfacl").is_file() else None
+    if binary is None:
+        raise SpoolSlotError("acl", "setfacl is required for per-job runtime projection")
+    spec = surface.acl_argument(
+        account=account, writable=writable, directory=path.is_dir()
+    )
+    argv = (binary, "-R", "-m", spec, str(path))
+    if os.spawnv(os.P_WAIT, binary, argv) != 0:
+        raise SpoolSlotError("acl", f"failed to apply per-job ACL: {path}")
+
+
+def _copy_regular_tree(source: Path, destination: Path) -> None:
+    """Copy control bytes into a fresh tree without metadata relationships.
+
+    ``copytree``/``cp -a`` are deliberately not used here: ACLs, xattrs,
+    hardlink identity, symlinks, and special files are all outside the four
+    control inputs.  The destination is built privately, normalized to 0755
+    directories/0644 files, then atomically renamed into the job slot.
+    """
+
+    if source.is_symlink() or not source.is_dir():
+        raise SpoolSlotError("shape", f"control source is not a regular directory: {source}")
+    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise SpoolSlotError("shape", f"control copy temporary path already exists: {temporary}")
+    try:
+        temporary.mkdir(mode=0o755)
+        for entry in sorted(source.rglob("*")):
+            relative = entry.relative_to(source)
+            target = temporary / relative
+            info = entry.lstat()
+            if stat.S_ISLNK(info.st_mode) or not (
+                stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+            ):
+                raise SpoolSlotError("shape", f"control source contains unsupported entry: {entry}")
+            if stat.S_ISDIR(info.st_mode):
+                target.mkdir(mode=0o755)
+                os.chmod(target, 0o755)
+                continue
+            target.parent.mkdir(mode=0o755, exist_ok=True)
+            fd = os.open(str(entry), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                out = os.open(
+                    str(target),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                )
+                try:
+                    with os.fdopen(fd, "rb") as source_file, os.fdopen(out, "wb") as target_file:
+                        shutil.copyfileobj(source_file, target_file)
+                        target_file.flush()
+                        os.fsync(target_file.fileno())
+                    fd = -1
+                    out = -1
+                finally:
+                    if out != -1:
+                        os.close(out)
+            finally:
+                if fd != -1:
+                    os.close(fd)
+            os.chmod(target, 0o644)
+        os.chmod(temporary, 0o755)
+        if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+            raise SpoolSlotError("shape", f"control destination is malformed: {destination}")
+        if destination.exists():
+            shutil.rmtree(destination)
+        # ``rename`` is atomic on the same filesystem and keeps the runtime
+        # projection independent from the job-spec writer's os.replace seam.
+        os.rename(temporary, destination)
+    except BaseException:
+        if temporary.exists() and not temporary.is_symlink():
+            shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def _copy_control_file(source: Path, destination: Path, *, mode: int = 0o644) -> None:
+    """Atomically copy one regular control file with no source metadata."""
+
+    if source.is_symlink() or not source.is_file():
+        raise SpoolSlotError("shape", f"control source is malformed: {source}")
+    temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        raise SpoolSlotError("shape", f"control copy temporary path already exists: {temporary}")
+    try:
+        fd = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            out = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            try:
+                with os.fdopen(fd, "rb") as source_file, os.fdopen(out, "wb") as target_file:
+                    shutil.copyfileobj(source_file, target_file)
+                    target_file.flush()
+                    os.fsync(target_file.fileno())
+                fd = -1
+                out = -1
+            finally:
+                if out != -1:
+                    os.close(out)
+        finally:
+            if fd != -1:
+                os.close(fd)
+        os.chmod(temporary, mode)
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise SpoolSlotError("shape", f"control destination is malformed: {destination}")
+        os.rename(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def provision_copilot_home(
+    *,
+    principal: str,
+    job_id: str,
+    authority: str | Path,
+    account: str | None = None,
+) -> Path:
+    """Seed one private per-job Copilot home inside the runtime-cache slot."""
+
+    cache_row = writable_surface(f"{principal}-runtime-cache")
+    slot = validate_job_slot_shape(canonical_job_slot(cache_row.surface_id, job_id))
+    home = slot / _COPILOT_HOME_DIRNAME
+    if home.is_symlink() or (home.exists() and not home.is_dir()):
+        raise SpoolSlotError("shape", f"copilot home is malformed: {home}")
+    if not home.exists():
+        home.mkdir()
+    narrow_inherited_mode(home)
+    config = home / _COPILOT_CONFIG_FILENAME
+    if config.is_symlink() or (config.exists() and not config.is_file()):
+        raise SpoolSlotError("shape", f"copilot config destination is malformed: {config}")
+    _copy_control_file(Path(authority), config, mode=0o600)
+    os.chmod(config, 0o400)
+    if account is not None:
+        _apply_slot_acl(config, account=account, writable=False, surface=cache_row)
+    return home
+
+
+def provision_runtime_surfaces(
+    *, principal: str, job_id: str, canonical_codex_home: str | Path | None = None,
+    account: str | None = None,
+) -> tuple[Path, ...]:
+    """Provision runtime rows by enumerating the canonical registry.
+
+    Parent default ACLs installed by permgen grant only the row principal access.
+    Codex rows also need an explicit readable+writable runtime projection; the
+    remaining write-only rows intentionally keep their deployment-installed ACLs
+    until their specialized consumer resets or pre-seeds payloads.
+    Control leaves are created before the unit starts and are additionally bind
+    mounted read-only by the generated unit; auth.json intentionally remains a
+    writable runtime leaf.
+    """
+    provisioned: list[Path] = []
+    for row in PER_JOB_WRITABLE_SURFACES:
+        if principal not in row.principals:
+            continue
+        slot = canonical_job_slot(row.surface_id, job_id)
+        try:
+            if slot.exists():
+                validate_job_slot_shape(slot)
+            else:
+                create_slot(slot, reset=False)
+            if row.surface_id.endswith("-codex-home"):
+                source = readable_codex_home(canonical_codex_home, require_auth=False)
+                for dirname in ("plugins", "skills"):
+                    desired_dir = source / dirname
+                    _copy_regular_tree(desired_dir, slot / dirname)
+                for filename in ("config.toml", "hooks.json"):
+                    _copy_control_file(source / filename, slot / filename)
+                    os.chmod(slot / filename, 0o644 if account is not None else 0o444)
+                if account is None:
+                    # Direct unit tests and pre-ACL development projections have
+                    # no named job principal yet; retain the old fail-closed
+                    # read-only mode until the permission plan is applied.
+                    for control in (slot / "plugins", slot / "skills"):
+                        for item in control.rglob("*"):
+                            os.chmod(item, 0o555 if item.is_dir() else 0o444)
+                        os.chmod(control, 0o555)
+                auth = slot / "auth.json"
+                if auth.is_symlink() or (auth.exists() and not auth.is_file()):
+                    raise SpoolSlotError("shape", f"runtime credential is malformed: {auth}")
+                if not auth.exists():
+                    desired_auth = credential_authority(principal)
+                    if desired_auth.is_symlink() or not desired_auth.is_file():
+                        raise SpoolSlotError("credential", f"credential authority is unavailable: {desired_auth}")
+                    temporary = auth.with_name(f".{auth.name}.seed.{os.getpid()}")
+                    temporary.write_bytes(desired_auth.read_bytes())
+                    os.replace(temporary, auth)
+                    # Preserve the inherited named-user ACL mask. 0600 would mask
+                    # the job principal out before Codex can refresh credentials.
+                    auth.chmod(0o660)
+            if account is not None and row.surface_id.endswith(
+                ("-codex-home", "-runtime-cache")
+            ):
+                # The container remains Manager-only. Grant the resolved job
+                # account recursively on the explicit runtime projection only;
+                # write-only rows keep the deployment ACL already installed on
+                # their typed root.
+                _apply_slot_acl(slot, account=account, writable=True, surface=row)
+                if row.surface_id.endswith("-codex-home"):
+                    for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
+                        _apply_slot_acl(
+                            slot / leaf, account=account, writable=False, surface=row
+                        )
+        except SpoolSlotError as exc:
+            raise SpoolSlotError(
+                exc.kind, f"writable surface {row.surface_id}: {slot}: {exc}"
+            ) from exc
+        provisioned.append(slot)
+    return tuple(provisioned)
+
+
+def _lexical_root(path: str | Path) -> Path:
+    """Return an absolute path without following a deployment symlink."""
+    root = Path(path).absolute()
+    # A redirected coordinator root is an input boundary, not a convenience path.
+    # Resolving it here would make a symlink appear to be an owned slot later.
+    current = root
+    while current != current.parent:
+        if current.is_symlink():
+            raise SpoolSlotError("symlink", f"writable surface parent is a symlink: {current}")
+        current = current.parent
+    return root
+
+
+def canonical_job_slot(
+    surface_id: str,
+    job_id: str,
+    *,
+    coordinator_root: str | Path | None = None,
+    writable_root: str | Path | None = None,
+) -> Path:
+    """Return the Manager-selected instance slot for one registered surface.
+
+    This is deliberately the only generic path join for per-job writable roots;
+    callers must provide the registry identity, never payload text.
+    """
+    surface = writable_surface(surface_id)
+    if coordinator_root is not None and writable_root is not None:
+        raise ValueError("coordinator_root and writable_root are mutually exclusive")
+    if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
+        raise ValueError(f"unsafe job identity: {job_id!r}")
+    from ..config import paths
+    from .job_workspace import job_segment
+
+    instance = job_segment(job_id)
+
+    if writable_root is not None:
+        root = Path(writable_root)
+    elif coordinator_root is None:
+        root = Path(surface.writable_root)
+    elif surface_id == "gate-worktree":
+        root = Path(coordinator_root)
+    else:
+        root = Path(coordinator_root) / surface.coordinator_relative
+    return _lexical_root(root) / instance
+
+
+def validate_job_slot_shape(slot: str | Path, *, allow_symlink: bool = False) -> Path:
+    """Fail closed unless *slot* is an ordinary directory in its parent."""
+    path = Path(slot)
+    if path.is_symlink() and not allow_symlink:
+        raise SpoolSlotError("symlink", f"job slot is a symlink: {path}")
+    if not path.exists() or not path.is_dir():
+        raise SpoolSlotError("shape", f"job slot is not a directory: {path}")
+    if path.name in {"", ".", ".."} or _JOB_ID_RE.fullmatch(path.name) is None:
+        raise SpoolSlotError("shape", f"unsafe job slot name: {path.name!r}")
+    return path
 
 
 class SpoolSlotError(Exception):

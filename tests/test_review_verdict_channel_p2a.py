@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 from paulsha_cortex.config import paths
-from paulsha_cortex.coordinator import manager
+from paulsha_cortex.coordinator import job_runner, manager
 from paulsha_cortex.coordinator import review as foreign_review
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -207,7 +207,12 @@ def test_spool_path_is_job_addressed_under_coordinator_root(tmp_path: Path) -> N
     path = foreign_review.review_verdict_spool_path(
         reviewer_job_id="slice-x-7", coordinator_root=coordinator_root
     )
-    assert path == coordinator_root.resolve() / "review-verdicts" / "slice-x-7" / "verdict.json"
+    assert path == (
+        coordinator_root.resolve()
+        / "review-verdicts"
+        / job_runner.template_instance_id("slice-x-7")
+        / "verdict.json"
+    )
     # 不同 job 落在不同格（job-addressed）。
     other = foreign_review.review_verdict_spool_path(
         reviewer_job_id="slice-x-8", coordinator_root=coordinator_root

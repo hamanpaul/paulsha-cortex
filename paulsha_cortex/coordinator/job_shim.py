@@ -45,8 +45,9 @@ Manager 帳號可寫的段落，把它交給 root 開啟等於允許 Manager 用
 （`0700 cortex-manager`、零具名 ACL），於是**每一個** builder job 都死在上面那個
 `os.open()`——連一行 log 都寫不出來，**失敗發生在它能記錄失敗之前**。修法在派工端：
 三個降權 principal 各有一格由登記表導出的 log spool（`registry.JOB_LOG_SPOOLS`），
-Manager 端的 harvest 路徑則以 hard link 指向同一個 inode，因此 harvest 讀的 log 路徑
-**逐字不變**（見 `coordinator/job_workspace.py:prepare_job_log_spool`）。
+Manager 端直接讀這個由 Manager 預建的 canonical job-log surface；exit sentinel／gate
+ledger 則留在獨立的 Manager-only control anchor（見
+`coordinator/job_workspace.py:prepare_job_log_spool`）。
 
 錯誤處理分兩段（這是刻意的可觀測性設計）：
 

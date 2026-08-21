@@ -71,13 +71,38 @@ principal 時再犯同一個錯」——新 principal 只要沒進對應表，�
 from __future__ import annotations
 
 import re
+import shlex
 import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
+from pathlib import Path
+
+from paulsha_cortex.config import paths
 
 from . import registry
+
+
+from .surfaces import (
+    PER_JOB_WRITABLE_SURFACES,
+    PerJobWritableSurface,
+    writable_surface,
+)
+
+
+def render_job_writable_properties(
+    *, instance: str, principal: "Principal | None" = None,
+    layout: "PathLayout | None" = None,
+) -> tuple[str, ...]:
+    if not isinstance(instance, str) or not instance:
+        raise ValueError("job instance is required")
+    rows = PER_JOB_WRITABLE_SURFACES
+    if principal is not None:
+        rows = tuple(row for row in rows if principal.value in row.principals)
+    return tuple(
+        f"ReadWritePaths={_surface_slot(row, instance, layout=layout)}" for row in rows
+    )
 from .registry import (
     HEADLESS_PERSONAS,
     UNTRUSTED_EXECUTION_PRINCIPALS,
@@ -794,9 +819,26 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
         note="自帶原生執行檔，**不因 node 版本而行為改變**——node 的版本風險不涵蓋它。",
     ),
     ExecutorTool(
-        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=False,
+        "copilot", ExecutorShape.SHELL_SCRIPT, needs_node=True, copy_tree=True,
         filtered_syscalls=("pkey_alloc",),
         api_hosts=(
+            EgressHost(
+                "api.individual.githubcopilot.com",
+                evidence=(
+                    "2026-08-21/22 實機（Copilot CLI 1.0.80 authenticated "
+                    "`gpt-5.4/xhigh` controlled-egress run）：proxy log 逐字 "
+                    "`CONNECT api.individual.githubcopilot.com:443`（當時 canonical "
+                    "白名單不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "telemetry.individual.githubcopilot.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT telemetry.individual.githubcopilot.com:443`（當時 "
+                    "canonical 白名單不含它 ⇒ DENY）。"
+                ),
+            ),
             EgressHost(
                 "api.githubcopilot.com",
                 evidence=(
@@ -820,8 +862,13 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
             "shell script，但**內部再 exec node**（#643 實機量測確認：完整加固面下 "
             "`--version` 空輸出，單獨拿掉 `MemoryDenyWriteExecute` 即正常，與 codex "
             "的症狀逐字相同）。因此它同樣吃系統層 node 的版本風險，加固剖面也與 "
-            "`codex` 同一份。安裝時仍應 `head -n 20` 查一次它實際 exec 什麼——它可能"
-            "再叫別的程式，該相依同樣要在 job 的 PATH 上或一併搬進 toolchain。"
+            "`codex` 同一份。\n"
+            "部署樹**不能只搬這層 shell wrapper**：那樣 wrapper 內部仍可能再解一次 "
+            "`copilot`／`node`，靜默跌回 PATH 上別的版本。必須沿 operator 實際在用的 "
+            "入口往上解到**含 `package.json` 的 npm 套件根**，整包複製後再以 "
+            "root-owned wrapper 直接 exec 部署時驗過的**系統層絕對 node 路徑**；"
+            "wrapper 本身不得再帶 `/usr/bin/env node`、`toolchain/bin/node`、"
+            "`--jitless` 或 `NODE_OPTIONS`。"
         ),
     ),
     ExecutorTool(
@@ -839,6 +886,46 @@ EXECUTOR_TOOLS: tuple[ExecutorTool, ...] = (
                 "antigravity-unleash.goog",
                 evidence=(
                     "0819 同一次量測，proxy log 逐字 `CONNECT antigravity-unleash.goog:443` ×2。"
+                ),
+            ),
+            EgressHost(
+                "oauth2.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 實機（agy authenticated Gemini review path）：proxy log "
+                    "逐字 `CONNECT oauth2.googleapis.com:443`（當時 canonical 白名單不含"
+                    "它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "daily-cloudcode-pa.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT daily-cloudcode-pa.googleapis.com:443`（當時 "
+                    "canonical 白名單不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "cloudcode-pa.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT cloudcode-pa.googleapis.com:443`（當時 canonical 白名單"
+                    "不含它 ⇒ DENY）。"
+                ),
+            ),
+            EgressHost(
+                "www.googleapis.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT www.googleapis.com:443`（當時 canonical 白名單不含它 ⇒ "
+                    "DENY）。"
+                ),
+            ),
+            EgressHost(
+                "lh3.googleusercontent.com",
+                evidence=(
+                    "2026-08-21/22 同一次量測，proxy log 逐字 "
+                    "`CONNECT lh3.googleusercontent.com:443`（當時 canonical 白名單不含"
+                    "它 ⇒ DENY）。"
                 ),
             ),
             EgressHost(
@@ -2824,6 +2911,14 @@ class PathLayout:
         return f"{self.agents_root}/config/paulsha"
 
     @property
+    def codex_control_root(self) -> str:
+        return f"{self.agents_root}/config/codex-controls"
+
+    @property
+    def codex_credential_root(self) -> str:
+        return f"{self.agents_root}/config/codex-credentials"
+
+    @property
     def skill_registry_root(self) -> str:
         return f"{self.agents_root}/registry"
 
@@ -2979,6 +3074,13 @@ class PathLayout:
         因此是 root-owned unit 檔上可逐字稽核的一行。
         """
         return f"{self.job_spec_spool_root}/{principal.value}"
+
+    def job_prompt_root_for(self, principal: Principal) -> str:
+        """Dedicated Manager-owned prompt root for one model principal."""
+
+        if principal not in registry.PROMPT_JOB_PRINCIPALS:
+            raise ValueError(f"prompt root is not applicable to {principal.value}")
+        return f"{self.coordinator_root}/{paths.JOB_PROMPT_ROOT_DIRNAME}/{principal.value}"
 
     @property
     def bin_root(self) -> str:
@@ -3418,6 +3520,12 @@ class PathLayout:
             "coordinator-root-tree": c,
             "dispatch-specs-tree": self.specs_root,
             "runtime-run-tree": self.run_root,
+            "builder-job-codex-home-root": f"{a}/runtime/codex-home/builder",
+            "reviewer-job-codex-home-root": f"{a}/runtime/codex-home/reviewer",
+            "builder-job-cache-root": f"{a}/runtime/job-cache/builder",
+            "reviewer-job-cache-root": f"{a}/runtime/job-cache/reviewer",
+            "codex-control-root": self.codex_control_root,
+            "codex-credential-root": self.codex_credential_root,
             "project-config-tree": self.project_config_root,
             "coverage-shadow-telemetry": f"{c}/coverage-shadow",
             "monitor-state-tree": mon,
@@ -3475,6 +3583,15 @@ class PathLayout:
                     principal
                 )
                 for principal in registry.DOWNGRADED_JOB_PRINCIPALS
+            },
+            # Dedicated prompt roots are Manager-owned siblings of the spec
+            # spools.  The permission plan, not scaffold code, owns their
+            # install and ACL recipe.
+            **{
+                registry.job_prompt_root_asset_id(principal): self.job_prompt_root_for(
+                    principal
+                )
+                for principal in registry.PROMPT_JOB_PRINCIPALS
             },
             # #629 gate 執行身分：拋棄式工作區 pool ＋ ledger 單向 spool。
             # 工作區 pool 登記的是**容器**（不帶 per-job segment）：它只有一個 writer
@@ -3622,6 +3739,9 @@ class PathLayout:
             (f"{self.agents_root}/config", root, g(root), 0o755),
             (f"{self.agents_root}/run", root, g(root), 0o755),
             (f"{self.agents_root}/runtime", root, g(root), 0o755),
+            # Canonical Codex authority roots are registry assets.  They are
+            # intentionally absent here; emitting them again would give the
+            # scaffold and permission plan two executable ownership truths.
             # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
             (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
             (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
@@ -3632,6 +3752,201 @@ class PathLayout:
             # cache 子目錄。清單由 scheme 導出，見上方 `account_dirs`。
             *account_dirs,
         ))
+
+    def codex_control_scaffold(
+        self, scheme: UidScheme
+    ) -> tuple[tuple[str, str, str, int, bool], ...]:
+        """Deployment-owned Codex control leaves and containers.
+
+        These are intentionally separate from writable state assets: a Codex job
+        may refresh ``auth.json`` and runtime state, but must not create or alter
+        the control inputs that affect the next invocation.
+        """
+        # Legacy account HOME is an input to the one-time migration below, not
+        # an authority to manufacture. Creating empty/stub policy here would
+        # make a missing deployment look valid and silently discard controls.
+        return ()
+
+    @staticmethod
+    def codex_control_initial_content(path: str) -> str:
+        """Valid first-install content; existing deployed policy is never replaced."""
+        if path.endswith("/hooks.json"):
+            return "{}\n"
+        if path.endswith("/config.toml"):
+            return "# deployment-owned Codex configuration\n"
+        raise ValueError(f"not a Codex control file: {path}")
+
+    @staticmethod
+    def _codex_seed_guard(check: str, *, message: str) -> str:
+        quoted = shlex.quote(message)
+        return f"{check} || {{ printf '%s\\n' {quoted} >&2; exit 1; }}"
+
+    def codex_authority_seed_commands(self, scheme: UidScheme) -> tuple[str, ...]:
+        """Idempotently migrate deployed Codex controls and credentials.
+
+        The command stream validates the legacy source before copying it and
+        never prints credential bytes. Existing authorities are preserved.
+        """
+        root = scheme.deploy_account
+        manager = scheme.durable_state_owner
+        root_group = scheme.group_of(root)
+        qcontrols_parent = shlex.quote(self.codex_control_root)
+        rows: list[str] = []
+        for principal in (Principal.BUILDER, Principal.REVIEWER):
+            account = scheme.resolve(principal)
+            if account is None:
+                continue
+            source = f"{self.home_of(account)}/.codex"
+            controls = f"{self.codex_control_root}/{principal.value}"
+            credential = f"{self.codex_credential_root}/{principal.value}/auth.json"
+            qsrc, qctl, qcred = map(shlex.quote, (source, controls, credential))
+            config = f"{source}/config.toml"
+            hooks = f"{source}/hooks.json"
+            plugins = f"{source}/plugins"
+            skills = f"{source}/skills"
+            qconfig, qhooks, qplugins, qskills = map(
+                shlex.quote, (config, hooks, plugins, skills)
+            )
+
+            def detail(text: str) -> str:
+                return f"Codex control seed ({principal.value}): {text}"
+
+            resolved_message = shlex.quote(
+                detail(f"legacy Codex symlink {source} must resolve to a directory")
+            )
+            # Copy the four control leaves explicitly.  A deployed ~/.codex also
+            # contains sessions, sqlite databases, memories and installation ids;
+            # none of those are policy inputs and none may become job-readable.
+            # mktemp + rename makes an interrupted first install retryable without
+            # leaving a fixed ``.new`` tree that a later run could accidentally use.
+            control_steps = [
+                f"install -d -o {root} -g {root_group} -m 0755 {qcontrols_parent}",
+                (
+                    f"if test -L {qsrc}; then "
+                    + " && ".join(
+                        (
+                            self._codex_seed_guard(
+                                f"test \"$(find {qsrc} -maxdepth 0 -type l -user root -print -quit)\" = {qsrc}",
+                                message=detail(
+                                    f"legacy Codex symlink {source} must be owned by root"
+                                ),
+                            ),
+                            f"resolved=$(readlink -e -- {qsrc}) || {{ printf '%s\\n' {resolved_message} >&2; exit 1; }}",
+                            self._codex_seed_guard(
+                                'test -d "$resolved"',
+                                message=detail(
+                                    f"legacy Codex symlink {source} must resolve to a directory"
+                                ),
+                            ),
+                            self._codex_seed_guard(
+                                'test "$(stat -c %u -- "$resolved")" = 0',
+                                message=detail(
+                                    f"resolved legacy Codex directory for {source} must be root-owned"
+                                ),
+                            ),
+                            self._codex_seed_guard(
+                                'test -z "$(find "$resolved" -maxdepth 0 ! -user root -print -quit)"',
+                                message=detail(
+                                    f"resolved legacy Codex directory for {source} must not contain non-root ownership"
+                                ),
+                            ),
+                        )
+                    )
+                    + "; fi"
+                ),
+                self._codex_seed_guard(
+                    f"test -d {qsrc}",
+                    message=detail(f"missing legacy Codex directory {source}"),
+                ),
+                self._codex_seed_guard(
+                    f"test -f {qconfig}",
+                    message=detail(f"missing required file {config}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qconfig}",
+                    message=detail(f"required file {config} must not be a symlink"),
+                ),
+                self._codex_seed_guard(
+                    f"test -d {qplugins}",
+                    message=detail(f"missing required directory {plugins}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qplugins}",
+                    message=detail(
+                        f"required directory {plugins} must not be a symlink"
+                    ),
+                ),
+                self._codex_seed_guard(
+                    f"test -d {qskills}",
+                    message=detail(f"missing required directory {skills}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qskills}",
+                    message=detail(
+                        f"required directory {skills} must not be a symlink"
+                    ),
+                ),
+                self._codex_seed_guard(
+                    f"test -f {qhooks}",
+                    message=detail(f"missing required file {hooks}"),
+                ),
+                self._codex_seed_guard(
+                    f"test ! -L {qhooks}",
+                    message=detail(f"required file {hooks} must not be a symlink"),
+                ),
+                self._codex_seed_guard(
+                    f"test -z \"$(find {qplugins} {qskills} ! -type d ! -type f -print -quit)\"",
+                    message=detail(
+                        f"{plugins} and {skills} may contain only regular files and directories"
+                    ),
+                ),
+                self._codex_seed_guard(
+                    f"test -z \"$(find {qplugins} {qskills} -type f -links +1 -print -quit)\"",
+                    message=detail(
+                        f"{plugins} and {skills} must not contain hard-linked regular files"
+                    ),
+                ),
+                f"tmp=$(mktemp -d {qctl}.tmp.XXXXXX)",
+                f"trap 'rm -rf -- \"$tmp\"' EXIT HUP INT TERM",
+                f"install -m 0644 {qconfig} \"$tmp/config.toml\"",
+                f"install -m 0644 {qhooks} \"$tmp/hooks.json\"",
+                f"cp -R --no-preserve=all {qplugins} \"$tmp/plugins\"",
+                f"cp -R --no-preserve=all {qskills} \"$tmp/skills\"",
+                self._codex_seed_guard(
+                    "test -z \"$(find \"$tmp/plugins\" \"$tmp/skills\" "
+                    "\\( -type l -o \\( ! -type d ! -type f \\) -o "
+                    "\\( -type f -links +1 \\) \\) -print -quit)\"",
+                    message=detail(
+                        "copied plugin/skill tree contains a symlink, special file, or hard-linked regular file"
+                    ),
+                ),
+                (
+                    "if command -v getfattr >/dev/null 2>&1; then "
+                    + self._codex_seed_guard(
+                        "test -z \"$(getfattr -R -d --absolute-names \"$tmp/plugins\" \"$tmp/skills\" "
+                        "2>/dev/null | sed '/^# file:/d;/^$/d')\"",
+                        message=detail(
+                            "copied plugin/skill tree preserved extended attributes"
+                        ),
+                    )
+                    + "; fi"
+                ),
+                f"chown -R {root}:{root_group} \"$tmp\"",
+                f"find \"$tmp\" -type d -exec chmod 0755 {{}} +",
+                f"find \"$tmp\" -type f -exec chmod 0644 {{}} +",
+                f"mv \"$tmp\" {qctl}",
+                "trap - EXIT HUP INT TERM",
+            ]
+            rows.append(
+                f"test ! -L {qctl} && "
+                f"if [ ! -e {qctl} ]; then {' && '.join(control_steps)}; fi"
+            )
+            rows.append(
+                f"if [ ! -e {qcred} ]; then test -f {qsrc}/auth.json && "
+                f"test ! -L {qsrc}/auth.json && install -D -o {manager} "
+                f"-g {scheme.group_of(manager)} -m 0600 {qsrc}/auth.json {qcred}; fi"
+            )
+        return tuple(rows)
 
     # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
     def manager_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
@@ -3669,6 +3984,35 @@ class PathLayout:
 
 
 DEFAULT_LAYOUT = PathLayout()
+
+
+def _surface_root(row: PerJobWritableSurface, layout: PathLayout) -> str:
+    """Resolve a table row against the deployment layout used by the unit."""
+    return row.root_for(layout)
+
+
+def _surface_slot(
+    row: PerJobWritableSurface,
+    instance: str,
+    *,
+    layout: PathLayout | None = None,
+) -> str:
+    from ..coordinator.job_workspace import job_segment
+
+    segment = "%i" if instance == "%i" else job_segment(instance)
+    root = row.writable_root if layout is None else _surface_root(row, layout)
+    return f"{root}/{segment}"
+
+
+def job_surface_owners(
+    *, principal: Principal, instance: str, layout: PathLayout
+) -> dict[str, tuple[str, ...]]:
+    """Production projection of the canonical surface table for one unit."""
+    return {
+        _surface_slot(row, instance, layout=layout): (row.asset_id,)
+        for row in PER_JOB_WRITABLE_SURFACES
+        if principal.value in row.principals
+    }
 
 
 def asset_paths(layout: PathLayout = DEFAULT_LAYOUT) -> dict[str, str]:
@@ -6930,6 +7274,19 @@ def build_job_unit(
     owners = read_write_path_owners(
         plan, job_layout, account, extras, retired=RETIRED_JOB_WRITE_ASSETS
     )
+    # Shared output-channel and persona roots are never writable in a job unit.
+    # Preserve independently isolated workspaces, then project every spool/log
+    # slot from the executable table above.  This is the production consumer;
+    # render/probe helpers are intentionally not a parallel policy map.
+    shared_roots = {
+        _surface_root(row, layout) for row in PER_JOB_WRITABLE_SURFACES
+    }
+    owners = {
+        path: covered
+        for path, covered in owners.items()
+        if "%i" in path and not any(path == root for root in shared_roots)
+    }
+    owners.update(job_surface_owners(principal=principal, instance="%i", layout=layout))
     stem = job_unit_stem(layout, principal, profile)
     unit_name = f"{stem}@.service"
     profile_users = sorted(
@@ -6940,6 +7297,10 @@ def build_job_unit(
     # 產生本檔的旗標必須跟著角色走：註解裡寫著「重跑用 --job」卻產出 reviewer／gate
     # 的 unit，會讓 operator 照抄之後拿到**另一份** unit 覆蓋掉這一份。
     unit_flag = JOB_UNIT_CLI_FLAG[principal]
+    # Lazy import avoids a package-init cycle: coordinator.spool_slot consumes
+    # the typed surface rows while this generator only needs the publisher
+    # command text at unit-render time.
+    from ..coordinator.spool_slot import publish_runtime_credential_command
 
     body = [
         f"# {'/etc/systemd/system/' + unit_name}",
@@ -7002,6 +7363,19 @@ def build_job_unit(
         "# 必須是這份 root-owned unit 上可逐字稽核的一行，不是一組共用目錄的 ACL 交集。",
         "# job 因此無法改寫自己的命令列，也無法為下一個 job 埋伏。",
         f"ExecStart={job_layout.job_shim} %i",
+        *(
+            [
+                "# Publish an atomic auth refresh after every terminal path. The named",
+                "# Manager ACL is required because job and Manager have no shared group.",
+                "ExecStopPost=/bin/sh -c '"
+                + publish_runtime_credential_command(
+                    manager_account=scheme.durable_state_owner
+                ).replace('"$CODEX_HOME/auth.json"', '"$${CODEX_HOME}/auth.json"')
+                + "'",
+            ]
+            if principal in (Principal.BUILDER, Principal.REVIEWER)
+            else []
+        ),
         "# 工作目錄：shim 會依 spec 的 working_directory 再 chdir 到該 job 的 worktree；",
         "# 這裡只給恆存在的 pool 根（0701＝可 traverse、不可列目錄），避免 unit 因",
         "# per-job 目錄尚未建立而在 exec 前就失敗（那會讓 log 裡沒有任何線索）。",
@@ -7069,7 +7443,8 @@ def build_job_unit(
         "Environment=GH_TOKEN=",
         "Environment=GITHUB_TOKEN=",
         f"Environment=HOME={job_layout.home_of(account)}",
-        f"Environment=XDG_CACHE_HOME={job_layout.cache_of(account)}",
+        f"Environment=CODEX_HOME={_surface_slot(writable_surface(f'{principal.value}-codex-home'), '%i', layout=layout) if principal in (Principal.BUILDER, Principal.REVIEWER) else job_layout.home_of(account) + '/.codex'}",
+        f"Environment=XDG_CACHE_HOME={_surface_slot(writable_surface(f'{principal.value}-runtime-cache'), '%i', layout=layout) if principal in (Principal.BUILDER, Principal.REVIEWER) else job_layout.cache_of(account)}",
         "",
         f"# --- 加固（與 Manager 同一張 _HARDENING 表；剖面={profile.profile_id}）---",
         "# 兩份 job unit 共用這張表，只在下方以 ※ 標出的那一項分岔；",
@@ -7082,6 +7457,14 @@ def build_job_unit(
     body += job_egress_lines(principal)
     body += [""]
     read_only = enforcement_read_only_paths(job_layout, account, tuple(owners.keys()))
+    if principal in (Principal.BUILDER, Principal.REVIEWER):
+        codex_home = _surface_slot(
+            writable_surface(f"{principal.value}-codex-home"), "%i", layout=layout
+        )
+        read_only = tuple(
+            f"{codex_home}/{leaf}"
+            for leaf in ("plugins", "skills", "config.toml", "hooks.json")
+        )
     body += _rwp_lines(owners, read_only)
     body += [
         "",
@@ -7485,19 +7868,47 @@ def build_toolchain_plan(
             "# operator 實際在用的那一份",
         ]
         if tool.copy_tree:
-            lines += [
-                "#   整包搬（單搬進入點會缺 node_modules）：先找出套件根，再整棵複製——",
-                f'#     PKG="$(cd "$(dirname "$SRC")/.." && pwd)"',
-                f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
-                f"#     ln -sfn {layout.toolchain_lib}/{tool.name}/<套件內的進入點>"
-                f" {layout.toolchain_bin}/{tool.name}",
-                "#   落定後確認進入點的 shebang 解得開：`head -n 1` 應為 "
-                "`#!/usr/bin/env node`，且 `command -v node` 落在系統層。",
-                f"#   ⚠️ `{layout.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 "
-                "symlink**，不是把進入點複製出來的單檔（#661 實測）：ESM 的相對 "
-                "import、以及「從 `which()` 往上找 `package.json`」這類套件根解析，"
-                "靠的都是 `readlink -f` 之後落在套件樹裡的那條路徑。",
-            ]
+            if tool.name == "copilot":
+                lines += [
+                    "#   Copilot 的 operator 入口本身是 shell wrapper；部署樹不直接搬那支",
+                    "#   wrapper，而是沿著已選入口往上解到**含 package.json 的套件根**，",
+                    "#   整包複製後再產一支 root-owned wrapper，直接 exec 部署時驗過的",
+                    "#   **系統層絕對 node 路徑**（不是 `env node`、不是 toolchain shadow）。",
+                    '#     PKG="$SRC"',
+                    '#     while [ "$PKG" != "/" ] && [ ! -f "$PKG/package.json" ]; do PKG="$(dirname "$PKG")"; done',
+                    '#     test -f "$PKG/package.json"',
+                    '#     ENTRY_REL="${SRC#"$PKG"/}"',
+                    '#     test "$ENTRY_REL" != "$SRC"',
+                    '#     NODE_ABS="$(readlink -f "$(command -v node)")"',
+                    '#     test -n "$NODE_ABS" && test "${NODE_ABS#/}" != "$NODE_ABS"',
+                    f'#     case "$NODE_ABS" in {layout.toolchain_root}/*) echo "node must stay system-level" >&2; exit 1 ;; esac',
+                    f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                    f'#     test -f {layout.toolchain_lib}/{tool.name}/"$ENTRY_REL"',
+                    f"#     cat > {layout.toolchain_bin}/{tool.name} <<EOF",
+                    "#     #!/bin/sh",
+                    f'#     exec $NODE_ABS "{layout.toolchain_lib}/{tool.name}/$ENTRY_REL" "\\$@"',
+                    "#     EOF",
+                    f"#     chmod 0755 {layout.toolchain_bin}/{tool.name}",
+                    f"#   fail-closed probes：`test -x {layout.toolchain_bin}/{tool.name}`、"
+                    f"`! grep -Eq '/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|"
+                    f"/usr/bin/copilot|command -v copilot' {layout.toolchain_bin}/{tool.name}`、"
+                    f"`{layout.toolchain_bin}/{tool.name} --version`、"
+                    "`$NODE_ABS -e 'new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))'`。",
+                ]
+            else:
+                lines += [
+                    "#   整包搬（單搬進入點會缺 node_modules）：先找出套件根，再整棵複製——",
+                    f'#     PKG="$(cd "$(dirname "$SRC")/.." && pwd)"',
+                    f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                    f"#     ln -sfn {layout.toolchain_lib}/{tool.name}/<套件內的進入點>"
+                    f" {layout.toolchain_bin}/{tool.name}",
+                    "#   落定後確認進入點的 shebang 解得開：`head -n 1` 應為 "
+                    "`#!/usr/bin/env node`，且 `command -v node` 落在系統層。",
+                    f"#   ⚠️ `{layout.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 "
+                    "symlink**，不是把進入點複製出來的單檔（#661 實測）：ESM 的相對 "
+                    "import、以及「從 `which()` 往上找 `package.json`」這類套件根解析，"
+                    "靠的都是 `readlink -f` 之後落在套件樹裡的那條路徑。",
+                ]
         else:
             lines += [
                 f'#     cp -a "$SRC" {layout.toolchain_bin}/{tool.name}',
@@ -8020,23 +8431,10 @@ def transient_unit_properties(
     導出的 ReadWritePaths** 展開成 `systemd-run --property=` 形式，供 operator 在
     A 方案下逐條加固，或作為「A 與 B 的加固面是否等價」的對照表。
     """
-    layout = layout if layout is not None else DEFAULT_LAYOUT
-    plan = plan or generate_plan(scheme)
-    account = scheme.resolve(principal)
-    if account is None:
-        raise ValueError(f"principal 未映射到帳號: {principal}")
-    job_layout = layout.with_job_segment("%i")
-    effective = profile.effective()
-    props = [f"--property={key}={effective[key]}" for key, _value, _why in _HARDENING]
-    for rwp in read_write_paths(
-        plan,
-        job_layout,
-        account,
-        job_layout.job_extra_write_paths(account),
-        retired=RETIRED_JOB_WRITE_ASSETS,
-    ):
-        props.append(f"--property=ReadWritePaths={rwp}")
-    return tuple(props)
+    unit = build_job_unit(
+        scheme, layout or DEFAULT_LAYOUT, principal=principal, plan=plan, profile=profile
+    )
+    return unit_replica_properties(unit.content, instance="%i")
 
 
 # ---------------------------------------------------------------------------
@@ -8144,7 +8542,7 @@ def unit_replica_properties(
         expanded = value.replace("%%", sentinel).replace("%i", instance)
         # 未知 specifier 的檢查必須在**還原跳脫之前**：還原後的字面 `%i` 長得跟
         # specifier 一模一樣，先還原會把合法的 `%%i` 誤判成展不開的 specifier。
-        leftover = re.search(r"%[a-zA-Z]", expanded)
+        leftover = None if instance == "%i" else re.search(r"%[a-zA-Z]", expanded)
         expanded = expanded.replace(sentinel, "%")
         if leftover is not None:
             raise UnitReplicaDriftError(
@@ -8370,8 +8768,15 @@ def build_path_resolution_probe(
             f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c '{case.executor} --version'",
             f"{case.version_reference} --version",
             "#   期望：**兩行逐字相同**（PATH 解出來的那支 == 登記表登記的那支）。",
-            "",
         ]
+        if case.executor == "copilot":
+            lines += [
+                "#   Copilot 額外不變式：wrapper 內的 node 必須是**絕對系統層路徑**，",
+                "#   不得含 env-node / toolchain shadow / --jitless / NODE_OPTIONS / PATH fallback，",
+                "#   且同一支 node 必須跑得起最小 WebAssembly 模組。",
+                f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'NODE_ABS=\"$(awk \"/^exec /{{print \\$2; exit}}\" {case.expected_binary})\"; test -n \"$NODE_ABS\"; test -x \"$NODE_ABS\"; case \"$NODE_ABS\" in /*) ;; *) exit 1 ;; esac; case \"$NODE_ABS\" in {layout.toolchain_root}/*) exit 1 ;; esac; ! grep -Eq \"/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|/usr/bin/copilot|command -v copilot\" {case.expected_binary}; PATH_VERSION=\"$({case.executor} --version)\"; test -n \"$PATH_VERSION\"; REF_VERSION=\"$({case.expected_binary} --version)\"; test -n \"$REF_VERSION\"; [ \"$PATH_VERSION\" = \"$REF_VERSION\" ]; \"$NODE_ABS\" -e \"new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))\"'",
+            ]
+        lines.append("")
     lines += _wrap_comment(
         "gate 角色同樣在矩陣內，而且不是湊數：gate 宣告的 "
         "`PSC_GATE_CMD_PYTEST=\"python3 -m pytest -q\"` 是相對名，同樣走 PATH 解析"

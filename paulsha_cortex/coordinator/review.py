@@ -252,8 +252,10 @@ def review_verdict_spool_dir(
 
     if not isinstance(reviewer_job_id, str) or SAFE_SPOOL_KEY_RE.fullmatch(reviewer_job_id) is None:
         raise ValueError(f"unsafe reviewer_job_id: {reviewer_job_id!r}")
-    root = Path(coordinator_root) if coordinator_root is not None else paths.coordinator_root()
-    return root.resolve() / paths.REVIEW_VERDICT_SPOOL_DIRNAME / reviewer_job_id
+    return spool_slot.canonical_job_slot(
+        "review-verdict-spool", reviewer_job_id,
+        coordinator_root=coordinator_root,
+    )
 
 
 def review_verdict_spool_path(

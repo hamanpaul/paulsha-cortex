@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,6 +43,7 @@ import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.job_shim as job_shim
 import paulsha_cortex.coordinator.job_workspace as job_workspace
 import paulsha_cortex.coordinator.spool_slot as spool_slot
+import paulsha_cortex.coordinator.terminal_contract as terminal_contract
 from paulsha_cortex.config import paths as config_paths
 from paulsha_cortex.trust_root import permgen, registry
 from paulsha_cortex.trust_root.registry import Principal
@@ -183,19 +186,19 @@ class WritableSurfaceIsUnchangedTests(unittest.TestCase):
         paths_by_asset = LAYOUT.asset_paths()
         for spool in registry.JOB_LOG_SPOOLS:
             rwp = self._rwp(spool.principal)
-            self.assertNotIn(paths_by_asset[spool.asset_id], rwp, spool.asset_id)
-            # 但它的**通道**在——被涵蓋才是被吃掉的原因，不是「漏授」。
-            self.assertIn(paths_by_asset[spool.channel_asset_id], rwp, spool.asset_id)
+            self.assertIn(paths_by_asset[spool.asset_id] + "/%i", rwp, spool.asset_id)
+            self.assertNotIn(paths_by_asset[spool.channel_asset_id], rwp, spool.asset_id)
 
     def test_builder_unit_read_write_paths_match_the_field_evidence(self) -> None:
         self.assertEqual(
             self._rwp(Principal.BUILDER),
             (
-                "/var/lib/cortex-builder/.codex",
-                "/var/lib/cortex-builder/cache",
-                "/var/lib/cortex/coordinator/commit-spool",
-                "/var/lib/cortex/monitor/event-spool",
                 "/var/lib/cortex/worktree/%i",
+                "/var/lib/cortex/coordinator/commit-spool/%i",
+                "/var/lib/cortex/monitor/event-spool/%i",
+                "/var/lib/cortex/coordinator/commit-spool/build-logs/%i",
+                "/var/lib/cortex/runtime/codex-home/builder/%i",
+                "/var/lib/cortex/runtime/job-cache/builder/%i",
             ),
         )
 
@@ -212,26 +215,34 @@ class WritableSurfaceIsUnchangedTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 四、builder 的 hard link：job 端可寫、Manager 端路徑逐字不變
+# 四、canonical Manager-readable log surface：不跨 mount 建 hard link
 # ---------------------------------------------------------------------------
 
-class HardLinkBridgeTests(unittest.TestCase):
-    def test_manager_path_and_job_path_are_the_same_inode(self) -> None:
+class CanonicalLogSurfaceTests(unittest.TestCase):
+    def test_manager_reads_the_preseeded_job_surface_without_a_cross_mount_link(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             manager_log = Path(root) / "logs" / "wf-1.jsonl"
             with mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": root}, clear=False):
-                job_log = job_workspace.prepare_job_log_spool(
-                    principal_id="builder",
-                    spool_key="wf-1",
-                    manager_log_path=manager_log,
-                )
+                # The exact Manager failure was os.link(...)->EXDEV in the
+                # service namespace.  The repair must not call it at all.
+                with mock.patch.object(
+                    os, "link", side_effect=OSError(18, "Invalid cross-device link")
+                ) as link:
+                    job_log = job_workspace.prepare_job_log_spool(
+                        principal_id="builder",
+                        spool_key="wf-1",
+                        manager_log_path=manager_log,
+                    )
+                link.assert_not_called()
             self.assertNotEqual(job_log.parent, manager_log.parent)
-            self.assertEqual(job_log.stat().st_ino, manager_log.stat().st_ino)
-            # job 寫進自己那一條 ⇒ Manager 那一條立刻看得到（同一個 inode，不是複製）。
+            self.assertTrue(job_log.is_file())
+            self.assertFalse(manager_log.exists())
+            # The preseeded file remains Manager-owned/readable while the job
+            # appends to the same canonical surface.
             with open(job_log, "a", encoding="utf-8") as handle:
                 handle.write("from-the-job\n")
             self.assertEqual(
-                manager_log.read_text(encoding="utf-8"), "from-the-job\n"
+                job_log.read_text(encoding="utf-8"), "from-the-job\n"
             )
 
     def test_relaunching_the_same_key_starts_from_a_clean_inode(self) -> None:
@@ -253,7 +264,100 @@ class HardLinkBridgeTests(unittest.TestCase):
                 )
             self.assertEqual(first, second)
             self.assertEqual(second.read_text(encoding="utf-8"), "")
-            self.assertEqual(manager_log.read_text(encoding="utf-8"), "")
+            self.assertEqual(second.read_text(encoding="utf-8"), "")
+
+    def test_explicit_manager_control_anchor_stays_separate_from_hashed_template_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            slice_id = "wf-" + ("x" * 96)
+            control_log = Path(root) / "runtime" / "dispatch" / f"{slice_id}.jsonl"
+            spool_key = job_runner.template_instance_id(slice_id)
+            with mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": root}, clear=False):
+                job_log = job_workspace.prepare_job_log_spool(
+                    principal_id="builder",
+                    spool_key=spool_key,
+                    manager_log_path=control_log,
+                )
+            self.assertEqual(job_log.parent.name, spool_key)
+            self.assertNotEqual(control_log.stem, spool_key)
+            self.assertNotEqual(job_workspace.manager_control_log_path(job_log), control_log)
+            self.assertEqual(job_workspace.manager_control_log_path(control_log), control_log)
+            self.assertEqual(
+                str(job_workspace.manager_control_log_path(control_log).with_suffix(".exit")),
+                str(control_log.with_suffix(".exit")),
+            )
+            self.assertEqual(
+                terminal_contract.gate_ledger_path(control_log),
+                control_log.with_name(f"{slice_id}.gates.json"),
+            )
+
+
+def test_real_systemd_namespace_keeps_log_surface_off_manager_controls() -> None:
+    """Run the two-RWP mount boundary instead of mocking ``os.link``.
+
+    The deployed Manager unit gives ``coordinator`` and ``runtime/dispatch``
+    separate writable bind mounts.  A real systemd helper proves that an
+    attempted bridge returns ``EXDEV`` and that the canonical source remains
+    readable; product code must therefore consume that source directly.
+    """
+
+    if os.geteuid() != 0:
+        pytest.skip("real service-namespace probe requires root")
+    if not Path("/run/systemd/system").is_dir() or shutil.which("systemd-run") is None:
+        pytest.skip("systemd system manager is unavailable")
+    try:
+        manager = pwd.getpwnam("cortex-manager")
+    except KeyError:
+        pytest.skip("deployed cortex-manager account is unavailable")
+
+    base = Path(tempfile.mkdtemp(prefix="cortex-log-namespace-", dir="/var/lib/cortex/run/cortex"))
+    spool = base / "coordinator" / "commit-spool" / "build-logs" / "probe"
+    controls = base / "runtime" / "dispatch"
+    spool.mkdir(parents=True)
+    controls.mkdir(parents=True)
+    for path in (base, spool, controls):
+        os.chown(path, manager.pw_uid, manager.pw_gid)
+        os.chmod(path, 0o700)
+    script = (
+        "import errno, os, pathlib; "
+        "spool=pathlib.Path(os.environ['PSC_TEST_SPOOL']); "
+        "controls=pathlib.Path(os.environ['PSC_TEST_CONTROLS']); "
+        "source=spool/'job.jsonl'; target=controls/'job.jsonl'; "
+        "source.write_bytes(b'canonical\\n'); "
+        "try: os.link(source, target)\n"
+        "except OSError as exc:\n"
+        "    assert exc.errno == errno.EXDEV, exc\n"
+        "    assert source.read_bytes() == b'canonical\\n'\n"
+        "else: raise AssertionError('cross-RWP hard link unexpectedly succeeded')"
+    )
+    unit = f"cortex-log-surface-test-{os.getpid()}"
+    command = [
+        "systemd-run",
+        "--quiet",
+        "--wait",
+        "--pipe",
+        "--collect",
+        f"--unit={unit}",
+        f"--property=User={manager.pw_name}",
+        f"--property=Group={manager.pw_name}",
+        "--property=ProtectSystem=strict",
+        "--property=PrivateTmp=yes",
+        f"--property=ReadWritePaths={spool}",
+        f"--property=ReadWritePaths={controls}",
+        f"--setenv=PSC_TEST_SPOOL={spool}",
+        f"--setenv=PSC_TEST_CONTROLS={controls}",
+        "--",
+        sys.executable,
+        "-c",
+        script,
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert completed.returncode == 0, (
+            f"systemd namespace probe failed: stdout={completed.stdout!r} "
+            f"stderr={completed.stderr!r}"
+        )
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
     def test_log_file_mode_is_0620_not_0600(self) -> None:
         """`0600` 會把繼承來的 `user:<job>:-wx` 壓成 `#effective:---`（#638 缺陷 1）。"""
@@ -263,6 +367,19 @@ class HardLinkBridgeTests(unittest.TestCase):
             slot = Path(root) / "slot"
             log = spool_slot.prepare_job_log(slot, slot / "job.jsonl")
             self.assertEqual(log.stat().st_mode & 0o777, 0o620)
+
+    def test_generated_builder_unit_keeps_log_slot_and_manager_control_root_separate(self) -> None:
+        unit = permgen.build_job_unit(
+            permgen.DEFAULT_SCHEME, permgen.DEFAULT_LAYOUT, Principal.BUILDER
+        )
+        log_slot = (
+            f"{permgen.DEFAULT_LAYOUT.job_log_spool_root(Principal.BUILDER)}/%i"
+        )
+        self.assertIn(log_slot, unit.read_write_paths)
+        self.assertNotIn(
+            permgen.DEFAULT_LAYOUT.dispatch_log_root, unit.read_write_paths
+        )
+        self.assertIn(f"ReadWritePaths={log_slot}", unit.content)
 
     def test_reviewer_and_builder_land_in_different_channels(self) -> None:
         with tempfile.TemporaryDirectory() as root:

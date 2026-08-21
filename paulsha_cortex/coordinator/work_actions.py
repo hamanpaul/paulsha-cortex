@@ -4383,7 +4383,12 @@ def _regenerate_gates_action(
     if not isinstance(worktree, str) or not Path(worktree).is_dir():
         raise RuntimeError("regenerate-gates requires the builder worktree to still exist")
 
-    ledger_path = terminal_contract.gate_ledger_path(job["log_path"])
+    control_log_path = job.get("control_log_path")
+    ledger_path = terminal_contract.gate_ledger_path(
+        control_log_path
+        if isinstance(control_log_path, str) and control_log_path
+        else job["log_path"]
+    )
     spool_key = gate_runner.spool_key_for_job(job)
     if spool_key is None:
         raise RuntimeError("regenerate-gates requires a resolvable gate spool key")

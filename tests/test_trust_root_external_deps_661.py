@@ -188,6 +188,22 @@ def test_toolchain_plan_demands_a_symlink_for_every_copy_tree_program() -> None:
     for tool in TOOLCHAIN_PROGRAMS:
         if not tool.copy_tree:
             continue
+        if tool.name == "copilot":
+            assert f'#     cp -a "$PKG" {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}' in text
+            assert f'#     test -f {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/"$ENTRY_REL"' in text
+            assert f"#     cat > {DEFAULT_LAYOUT.toolchain_bin}/{tool.name} <<EOF" in text
+            assert '#     NODE_ABS="$(readlink -f "$(command -v node)")"' in text
+            assert (
+                f'#     case "$NODE_ABS" in {DEFAULT_LAYOUT.toolchain_root}/*) '
+                'echo "node must stay system-level" >&2; exit 1 ;; esac'
+            ) in text
+            assert (
+                f'#     exec $NODE_ABS "{DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/$ENTRY_REL" '
+                '"\\$@"'
+            ) in text
+            assert f"#     chmod 0755 {DEFAULT_LAYOUT.toolchain_bin}/{tool.name}" in text
+            assert f"ln -sfn {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/" not in text
+            continue
         assert f"ln -sfn {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/" in text, tool.name
         assert f"`{DEFAULT_LAYOUT.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 " in text
 

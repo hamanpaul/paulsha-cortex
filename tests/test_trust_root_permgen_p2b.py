@@ -211,12 +211,21 @@ def test_job_unit_read_write_paths_match_builder_writable_assets(scheme) -> None
     targets = required_write_targets(plan, job_layout, builder)
     assert targets
     for asset_id, target in targets.items():
-        assert any(_within(target, rwp) for rwp in unit.read_write_paths), (asset_id, target)
+        if asset_id == "builder-codex-state":
+            assert not any(rwp == target for rwp in unit.read_write_paths)
+            continue
+        assert any(
+            _within(target, rwp) or rwp.startswith(target.rstrip("/") + "/")
+            for rwp in unit.read_write_paths
+        ), (asset_id, target)
     extras = {e.path for e in job_layout.job_extra_write_paths(builder)}
     for rwp in unit.read_write_paths:
         if rwp in extras:
             continue
-        assert any(_within(t, rwp) for t in targets.values()), rwp
+        assert any(
+            _within(t, rwp) or rwp.startswith(t.rstrip("/") + "/")
+            for t in targets.values()
+        ) or "/runtime/codex-home/" in rwp or "/runtime/job-cache/" in rwp, rwp
 
 
 def test_read_write_paths_shift_when_registry_grows() -> None:

@@ -480,6 +480,18 @@ class JobPlanningInvoker:
         # 的，而 reviewer 帳號的**另一種**工作區（foreign review 的 linked worktree）
         # 確實跨 owner——見 `registry.JOB_GIT_WORKSPACE_TRUST` 的 reviewer 那一列。
         workspace = str(Path(reservation.cwd).resolve())
+        spool_slot.provision_runtime_surfaces(
+            principal="reviewer", job_id=reservation.job_id,
+            canonical_codex_home=spool_slot.canonical_codex_controls(
+                "reviewer", manager_env=self._env
+            ),
+            account=(
+                job_runner.resolve_job_account(self._env, role=job_runner.JOB_ROLE_REVIEW)
+                if spool_slot.system_account_exists(job_runner.resolve_job_account(
+                    self._env, role=job_runner.JOB_ROLE_REVIEW
+                )) else None
+            ),
+        )
         env = job_runner.build_job_env(
             manager_env=self._env,
             job_id=reservation.job_id,
@@ -582,6 +594,12 @@ class JobPlanningInvoker:
 
             last_message = _last_message_marker(last_message_path)
             output_text = _read_last_message(last_message_path)
+        # The per-job auth leaf is writable so Codex can perform an atomic
+        # refresh. Harvest it only after the unit has stopped, then seed the
+        # following job from this Manager-owned authority.
+        spool_slot.commit_runtime_credential(
+            principal="reviewer", job_id=reservation.job_id
+        )
         if returncode != 0:
             client_tail = self._read_log(client_log)
             silent = not stdout.strip()

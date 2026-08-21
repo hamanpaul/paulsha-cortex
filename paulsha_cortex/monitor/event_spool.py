@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from paulsha_cortex.config.paths import monitor_event_spool_root
+from paulsha_cortex.coordinator.spool_slot import canonical_job_slot
 
 
 logger = logging.getLogger(__name__)
@@ -317,9 +318,17 @@ class EventSpool:
         self,
         root: str | Path | None = None,
         *,
+        job_id: str | None = None,
         ttl_seconds: float = DEFAULT_EVENT_TTL_SECONDS,
     ) -> None:
-        self.root = Path(root) if root is not None else monitor_event_spool_root()
+        base = Path(root) if root is not None else monitor_event_spool_root()
+        # The monitor consumes the shared root; a job producer must be explicitly
+        # bound to the Manager-selected slot and can never write the shared root.
+        self.root = (
+            canonical_job_slot("monitor-event-spool", job_id, writable_root=base)
+            if job_id is not None
+            else base
+        )
         self.ttl_seconds = float(ttl_seconds)
 
     @property
@@ -413,11 +422,22 @@ class EventSpool:
         """
 
         try:
-            names = sorted(
-                entry.name
-                for entry in os.scandir(self.root)
-                if entry.is_file(follow_symlinks=False) and not entry.name.startswith(".")
-            )
+            paths: list[Path] = []
+            for entry in os.scandir(self.root):
+                if entry.name.startswith(".") or entry.name == QUARANTINE_DIRNAME:
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    # Backward-compatible harvest of pre-isolation events.
+                    paths.append(self.root / entry.name)
+                    continue
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                # Job slots are exactly one level below the shared root.  Never
+                # follow a slot or child symlink and never recurse by prefix.
+                for child in os.scandir(entry.path):
+                    if child.is_file(follow_symlinks=False) and not child.name.startswith("."):
+                        paths.append(Path(entry.path) / child.name)
+            paths.sort(key=lambda path: str(path.relative_to(self.root)))
         except FileNotFoundError:
             return SpoolScan()
         except OSError as error:
@@ -429,8 +449,7 @@ class EventSpool:
         quarantined: list[str] = []
         foreign = 0
         horizon = parse_event_timestamp(now) if now else datetime.now(timezone.utc)
-        for name in names:
-            path = self.root / name
+        for path in paths:
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
             except FileNotFoundError:

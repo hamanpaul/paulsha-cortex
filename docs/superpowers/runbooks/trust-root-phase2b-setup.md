@@ -2573,8 +2573,9 @@ psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/agy \
 > **那一層刻意不開放**：gate ledger（`<slice>.gates.json`）與 exit sentinel
 > （`<slice>.exit`）住在同一個目錄，#604 的整個保證就是它們由 Manager 寫、採信端以
 > `foreign_evidence_author()` 檢查擁有者。修法因此是把 **log 搬到該 principal 既有的
-> 輸出通道底下**，Manager 端那條 harvest 路徑以 **hard link** 指向同一個 inode
-> ——`log_path` 的字面量、sentinel／ledger／spool key 的推導**一個位元組都沒有變**。
+> 輸出通道底下**，由 Manager 預建的 job log 檔直接作為 canonical readable surface。
+> sentinel／ledger 經獨立的 Manager-only control anchor 投影，**不再以 hard link
+> 跨兩條 `ReadWritePaths` mount**（live `ProtectSystem=strict` namespace 會回 `EXDEV`）。
 
 | principal | 帳號 | 既有輸出通道 | log spool（登記表資產） |
 | --- | --- | --- | --- |
@@ -2641,13 +2642,16 @@ python3 -m paulsha_cortex.trust_root job-log-probe four-way
 #      **不得**自行組 `--property=`、**不得**自帶 `--setenv=PATH=`（design D13）。
 
 # ✅ 驗證 4：真實派工 smoke（D13 caveat：psc_run_under 複製的是加固面，不是派工路徑）
-#    起一輪 build，確認 `<coordinator>/logs/workflow/<slice>.jsonl` **有內容**，
-#    且它與 job 那一格是同一個 inode。
+#    起一輪 build，確認 canonical job log **有內容**，且 Manager 可直接讀回；
+#    completion controls 仍只出現在 Manager dispatch root。
 sudo -u cortex-manager stat -c '%i %n' \
-  /var/lib/cortex/coordinator/logs/workflow/<slice>.jsonl \
   /var/lib/cortex/coordinator/commit-spool/build-logs/<slice>/job.jsonl
-#   期望：**兩行的 inode 號相同**。不同 ⇒ hard link 沒建起來（跨檔案系統？），
-#   而 `prepare_job_log_spool()` 對那個情況是 fail-closed 的，所以你不該看到這一幕。
+#   期望：job log 是 Manager 預建的 canonical regular file；不要期待另一個
+#   `/logs/workflow` hard-link 路徑。檢查 completion controls 仍由 Manager 擁有：
+sudo stat -c '%U:%G %a %n' \
+  /var/lib/cortex/runtime/dispatch/<slice>.exit \
+  /var/lib/cortex/runtime/dispatch/<slice>.gates.json
+#   任何 job-writable spool 內出現 `.exit`／`.gates.json` 都是 FAIL。
 ```
 
 **回滾**：`sudo rm -rf /var/lib/cortex/coordinator/commit-spool/build-logs
@@ -6485,3 +6489,18 @@ PY
 | `PSC_JOB_RUNNER=systemd-run` | `PSC_JOB_RUNNER=systemd-template`（`systemd-run` 僅備援用） |
 | R9 四族，subject 為 `cortex-builder` | R9 **五族**，subject 為 builder ＋ reviewer-planner，新增族 5 privilege-boundary |
 | 殘餘風險：授權帳號可起任意 UID | 殘餘風險：**僅剩 `cortex-manager` 的 supply-chain 類**（見 5-8） |
+# #718 per-job writable surface isolation
+
+The five job-writable surfaces are derived from `permgen.PER_JOB_WRITABLE_SURFACES`:
+`commit-spool`, `monitor-event-spool`, `review-verdict-spool`, `gate-ledger-spool`,
+and `gate-worktree`. Provisioning and probes must use the same canonical job identity
+and render `<root>/<job-id>`; a missing, malformed, symlinked, or non-directory slot
+fails closed. Verify the generated paths with:
+
+```bash
+python3 -c 'from paulsha_cortex.trust_root import permgen; print(*permgen.render_job_writable_properties(instance="probe"), sep="\n")'
+```
+
+The result must contain concrete `probe` slots and no writable root by itself. Codex
+jobs also receive `--ignore-user-config`; `auth.json` refresh remains a separate
+deployment concern and is not made immutable by this change.

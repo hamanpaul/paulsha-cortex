@@ -6,6 +6,36 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+
+- **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
+- **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.
+- **#718 repair:** isolated Claude/CG workflow prompts now use bounded Manager-created per-job files rather than argv or template stdin; Manager exit accounting cleans them after termination, Codex credential harvest is typed and durably fail-closed, and `gpt-5.6-luna`/`gpt-5.3-codex-spark` carry explicit `model_reasoning_effort` argv pins.
+- **#718 repair:** Codex-capable units derive isolated per-job homes and caches from real R1 writable-surface assets; canonical control and credential authorities are now registered deployment assets seeded byte-for-byte from both deployed roles without stubs, and builder/reviewer terminal paths publish and harvest refreshes; reviewer units no longer receive the builder-only monitor event slot.
+- **#718 repair:** headless hook event writes now use the authoritative per-job
+  slot (including `--spool-root`), monitor harvest covers isolated child slots,
+  and repeated Codex control scaffold installs preserve deployed policy content.
+- **#718 repair:** template jobs no longer bridge the job-writable log spool to
+  Manager controls with a cross-mount hard link; Manager reads the preseeded
+  canonical log, completion controls use an explicit Manager-only anchor, and
+  Codex last-message output is published readable before Manager completion
+  accounting without becoming terminal evidence.
+- **#718 repair:** template job log slots now reuse the exact systemd-safe `%i`
+  / spec `instance` while the raw dispatch log name stays an explicit
+  Manager-only control anchor, so long slice ids no longer desynchronize the
+  mounted log slot from completion controls.
+- **#718 repair:** systemd-template launch now pre-provisions every typed
+  builder/reviewer writable slot before start, surfaces malformed rows with
+  the surface id and exact slot path, and keeps write-only rows on their
+  deployment ACL instead of the runtime-cache ACL widening path.
+- **#718 repair:** Copilot/Agy 的 controlled-egress canonical allowlist 現在補上
+  2026-08-21/22 live proxy observation 量到的 exact hosts，並由 trust-root
+  regression test 釘住 per-executor membership 與 no-wildcard rows。
+- **#718 repair:** downgraded Copilot template jobs now require a
+  Manager-selected canonical OAuth `config.json`, seed a private per-job
+  `COPILOT_HOME` under the runtime-cache slot, disable auto-update in the
+  spec, and refuse broad GitHub token env passthrough.
+- **#718：建立五面向 per-job writable surface 單一真相與 instance-scoped slot helper；Codex `exec` 固定帶 `--ignore-user-config`，並同步更新 argv golden pins。**
+- **#718（RED）：新增 per-job trust-root writable-surface isolation regression contract tests**，鎖定 canonical surface table、instance-scoped slot、foreign-slot boundary 與 fail-closed slot shape。
 - **#776 補遺：archive 前補齊舊 manifest 世代的 openspec change scaffold**（canonical-specs-invalid 修復）。
 - **#776 補遺：ship adapter refs 守衛改走 openspec 相容判定**（helper 下沉 claim.py；refs-differ 誤擋修復）。
 - **#776 補遺：舊 manifest 的 openspec-propose 卡視慣例名 change 為 run 自產**（85114100 二度被誤殺的根因）。

@@ -102,7 +102,7 @@ def _job(bundle: Path, *, branch: str = _BRANCH, workspace: Path | None = None) 
     """一筆已 launch 的 job 記錄——spool key 由 `log_path` 的 stem 推導。"""
 
     return {
-        "job_id": bundle.parent.name,
+        "job_id": _KEY,
         "branch": branch,
         "worktree": str(workspace) if workspace is not None else "",
         "log_path": f"/logs/workflow/{bundle.parent.name}.jsonl",
@@ -466,9 +466,9 @@ def test_spool_key_is_derived_from_the_same_identifier_launch_used(
     log_dir = tmp_path / "logs"
     for launch_key in ("job-abc123", "slice-2026-08-17-01"):
         log_path = str(log_dir / f"{launch_key}.jsonl")
-        assert job_workspace.spool_key_for_job({"log_path": log_path}) == launch_key
+        assert job_workspace.spool_key_for_job({"job_id": launch_key, "log_path": log_path}) == launch_key
     assert job_workspace.spool_key_for_job({}) is None
-    assert job_workspace.spool_key_for_job({"log_path": ""}) is None
+    assert job_workspace.spool_key_for_job({"job_id": "", "log_path": ""}) is None
 
 
 def test_harvest_is_a_noop_for_a_job_without_a_spool_grant(tmp_path: Path) -> None:
@@ -766,6 +766,7 @@ def test_slice_lane_verification_harvests_from_the_bundle_before_reading_the_bra
             },
         },
         job={
+            "job_id": _KEY,
             "task": "bundle-623",
             "branch": _BRANCH,
             "worktree": str(workspace),
@@ -808,6 +809,7 @@ def test_slice_lane_reports_candidate_harvest_failed_with_an_actionable_detail(
             },
         },
         job={
+            "job_id": _KEY,
             "task": "bundle-623",
             "branch": _BRANCH,
             "worktree": str(workspace),
