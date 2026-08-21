@@ -89,6 +89,7 @@ class PerJobWritableSurface:
     slot_template: str
     writable_root: str
     provisioner: str
+    consumer: str
     probe: str
 
 
@@ -108,6 +109,13 @@ def _per_job_surface_rows() -> tuple[PerJobWritableSurface, ...]:
             slot_template=f"{root}/%i",
             writable_root=str(root),
             provisioner="coordinator.spool_slot.canonical_job_slot",
+            consumer={
+                "commit-spool": "coordinator.job_workspace.commit_bundle_path",
+                "monitor-event-spool": "monitor.event_spool.EventSpool.scan",
+                "review-verdict-spool": "coordinator.review.review_verdict_spool_path",
+                "gate-ledger-spool": "coordinator.gate_runner.gate_spool_ledger_path",
+                "gate-worktree": "coordinator.gate_runner.gate_worktree_dir",
+            }[surface_id],
             probe="trust_root.permgen.render_job_writable_properties",
         )
         for surface_id, root in rows
@@ -126,15 +134,15 @@ def generated_writable_surface_ids() -> tuple[str, ...]:
 
 
 def provisioned_writable_surface_ids() -> tuple[str, ...]:
-    return _surface_ids()
+    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES if row.provisioner)
 
 
 def run_under_writable_surface_ids() -> tuple[str, ...]:
-    return _surface_ids()
+    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES if row.slot_template)
 
 
 def probe_writable_surface_ids() -> tuple[str, ...]:
-    return _surface_ids()
+    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES if row.probe)
 
 
 def render_job_writable_properties(*, instance: str) -> tuple[str, ...]:
@@ -3700,6 +3708,27 @@ class PathLayout:
             # cache 子目錄。清單由 scheme 導出，見上方 `account_dirs`。
             *account_dirs,
         ))
+
+    def codex_control_scaffold(
+        self, scheme: UidScheme
+    ) -> tuple[tuple[str, str, str, int, bool], ...]:
+        """Deployment-owned Codex control leaves and containers.
+
+        These are intentionally separate from writable state assets: a Codex job
+        may refresh ``auth.json`` and runtime state, but must not create or alter
+        the control inputs that affect the next invocation.
+        """
+        root = scheme.deploy_account
+        group = scheme.group_of(root)
+        rows: list[tuple[str, str, str, int, bool]] = []
+        for account in sorted(scheme.model_job_accounts()):
+            codex = Path(self.home_of(account)) / ".codex"
+            rows.extend((
+                (str(codex / "plugins"), root, group, 0o755, True),
+                (str(codex / "skills"), root, group, 0o755, True),
+                (str(codex / "config.toml"), root, group, 0o644, False),
+            ))
+        return tuple(rows)
 
     # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
     def manager_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:

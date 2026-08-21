@@ -6,3 +6,6 @@
   commit and gate worktree routed through the canonical helper.
 - Added `--ignore-user-config` to every Codex exec argv and updated the #716 byte
   identity golden tests.
+- Routed commit, review, gate, and event slot paths through the canonical lexical
+  slot helper; redirected roots and symlinked parents now fail closed. The scaffold
+  command also creates root-owned Codex config/plugins/skills control inputs.

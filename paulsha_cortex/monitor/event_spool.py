@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from paulsha_cortex.config.paths import monitor_event_spool_root
+from paulsha_cortex.coordinator.spool_slot import canonical_job_slot
 
 
 logger = logging.getLogger(__name__)
@@ -317,9 +318,17 @@ class EventSpool:
         self,
         root: str | Path | None = None,
         *,
+        job_id: str | None = None,
         ttl_seconds: float = DEFAULT_EVENT_TTL_SECONDS,
     ) -> None:
-        self.root = Path(root) if root is not None else monitor_event_spool_root()
+        base = Path(root) if root is not None else monitor_event_spool_root()
+        # The monitor consumes the shared root; a job producer must be explicitly
+        # bound to the Manager-selected slot and can never write the shared root.
+        self.root = (
+            canonical_job_slot("monitor-event-spool", job_id, coordinator_root=base)
+            if job_id is not None
+            else base
+        )
         self.ttl_seconds = float(ttl_seconds)
 
     @property

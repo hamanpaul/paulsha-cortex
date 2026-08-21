@@ -142,7 +142,9 @@ def gate_ledger_spool_dir(
     """單一 job 的 gate spool 目錄（唯一定址點）。"""
 
     _validate_spool_key(spool_key)
-    return gate_ledger_spool_root(coordinator_root).resolve() / spool_key
+    return spool_slot.canonical_job_slot(
+        "gate-ledger-spool", spool_key, coordinator_root=coordinator_root
+    )
 
 
 def gate_spool_ledger_path(

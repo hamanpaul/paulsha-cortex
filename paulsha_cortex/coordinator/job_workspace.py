@@ -569,7 +569,9 @@ def commit_spool_dir(
 
     if not isinstance(spool_key, str) or _SPOOL_KEY_RE.fullmatch(spool_key) is None:
         raise WorkspaceError(f"unsafe commit spool key: {spool_key!r}")
-    return commit_spool_root(coordinator_root).resolve() / spool_key
+    return spool_slot.canonical_job_slot(
+        "commit-spool", spool_key, coordinator_root=coordinator_root
+    )
 
 
 def commit_bundle_path(

@@ -695,6 +695,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"# scheme={scheme_id}；operator review 後手動 sudo 執行。")
         for path, owner, group, mode in permgen.DEFAULT_LAYOUT.scaffold_directories(scheme):
             print(f"install -d -o {owner} -g {group} -m {format(mode, '04o')} {path}")
+        for path, owner, group, mode, is_directory in permgen.DEFAULT_LAYOUT.codex_control_scaffold(scheme):
+            if is_directory:
+                print(f"install -d -o {owner} -g {group} -m {format(mode, '04o')} {path}")
+            else:
+                print(f"install -D -o {owner} -g {group} -m {format(mode, '04o')} /dev/null {path}")
         return 0
 
     print(f"unknown command: {command}", file=sys.stderr)

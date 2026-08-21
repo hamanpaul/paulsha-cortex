@@ -100,6 +100,26 @@ _CANONICAL_SURFACE_ROOTS = {
 }
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
+_SURFACE_DIRNAMES = {
+    "commit-spool": "commit-spool",
+    "monitor-event-spool": "monitor/event-spool",
+    "review-verdict-spool": "review-verdicts",
+    "gate-ledger-spool": "gate-ledger-spool",
+}
+
+
+def _lexical_root(path: str | Path) -> Path:
+    """Return an absolute path without following a deployment symlink."""
+    root = Path(path).absolute()
+    # A redirected coordinator root is an input boundary, not a convenience path.
+    # Resolving it here would make a symlink appear to be an owned slot later.
+    current = root
+    while current != current.parent:
+        if current.is_symlink():
+            raise SpoolSlotError("symlink", f"writable surface parent is a symlink: {current}")
+        current = current.parent
+    return root
+
 
 def canonical_job_slot(
     surface_id: str, job_id: str, *, coordinator_root: str | Path | None = None
@@ -121,14 +141,9 @@ def canonical_job_slot(
         root = (
             getattr(paths, _CANONICAL_SURFACE_ROOTS[surface_id])()
             if coordinator_root is None
-            else Path(coordinator_root) / {
-                "commit-spool": paths.COMMIT_SPOOL_DIRNAME,
-                "monitor-event-spool": "monitor/event-spool",
-                "review-verdict-spool": paths.REVIEW_VERDICT_SPOOL_DIRNAME,
-                "gate-ledger-spool": paths.GATE_LEDGER_SPOOL_DIRNAME,
-            }[surface_id]
+            else Path(coordinator_root) / _SURFACE_DIRNAMES[surface_id]
         )
-    return Path(root).resolve() / job_id
+    return _lexical_root(root) / job_id
 
 
 def validate_job_slot_shape(slot: str | Path, *, allow_symlink: bool = False) -> Path:
