@@ -1,0 +1,1 @@
+#776（#765 第八處）：resume 穩定識別的 openspec 比對改為相容判定——authority 多出的 refs 皆為 run 的 define/plan 卡 outputs 宣告過的 change 時視為同一份工作，交由 #216 AC5 authority-restart 收尾，不再 supersede 已驗證 run；並新增 bounded verb `work recover-superseded`（exact CAS＋actor/reason 落 evidence），把被識別失誤作廢、candidate 與 PR 俱在的 run 以 official authority-restart 撿回。

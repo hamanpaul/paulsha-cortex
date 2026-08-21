@@ -205,6 +205,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "link", "unlink", "start", "resume", "retry-build", "retry-card",
             "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
             "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+            "recover-superseded",
             "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
             "intake",
         ],
@@ -220,8 +221,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "--expected-run-id",
         help=(
-            "abandon／retire-delivered／regenerate-gates／retry-card／refreeze-base "
-            "使用的 exact WorkflowRun CAS"
+            "abandon／retire-delivered／recover-superseded／regenerate-gates／"
+            "retry-card／refreeze-base 使用的 exact WorkflowRun CAS"
         ),
     )
     p_work.add_argument(
@@ -231,8 +232,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_work.add_argument(
         "--reason",
         help=(
-            "abandon／retire-delivered／reset-reclaim-budget／refreeze-base "
-            "的單行審計理由（最多 500 字）"
+            "abandon／retire-delivered／recover-superseded／reset-reclaim-budget／"
+            "refreeze-base 的單行審計理由（最多 500 字）"
         ),
     )
     p_work.add_argument(
