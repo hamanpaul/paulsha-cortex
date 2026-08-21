@@ -144,6 +144,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 #: spool 的 per-job 目錄名（與 `coordinator/review.py` 的 `SAFE_SPOOL_KEY_RE` 同形）。
 #: 這個字串會成為 Manager-owned 樹裡的一個目錄名，形狀守衛不得放寬。
 _SPOOL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_TEMPLATE_INSTANCE_UNSET = object()
 
 
 #: per-job **具名片段**允許的字元。systemd unit 的 instance 名本身還允許更多
@@ -590,25 +591,45 @@ def commit_bundle_path(
 def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     """從 job 記錄推導出這個 job 在 dispatch 當下用的 spool key。
 
-    **推導規則只有一條**：Manager registry 的 ``job_id``。log path、payload text
-    與 caller 自述都不是 slot authority；它們可能仍使用舊的 raw launch key，不能
-    反向決定 systemd ``%i`` 所指的 owned slot。
+    **推導規則只有一條**：優先使用 launch 當下持久化的 ``template_instance``；
+    只有 genuinely legacy/direct rows 才回退到 Manager registry 的 ``job_id``。
+    log path、session name、worktree 名、payload text 與 caller 自述都不是 slot
+    authority，不能反向決定 systemd ``%i`` 所指的 owned slot。
 
-    這件事必須是**單一規則**：canonical lane 的 launch key 是 job_id，slice lane
-    的是 slice_id，兩條 lane 若各自在回收端「猜」自己的 key，任何一邊改名都會退化成
-    「spool 找不到 → 靜默不回收」——那是最壞的失敗形態。改讀 `log_path` 之後兩條
-    lane 共用同一個推導，且該欄位由 `registry.attach_launch_handle` 在 launch 當下
-    寫入，與 spool 的建立點同源。
+    這件事必須是**單一規則**：template lane 若把 authority 掉了，就寧可 fail
+    closed，也不能再去猜別的 sibling/foreign slot；direct 與舊 state rows 才
+    允許沿用 ``job_id`` fallback。
 
     job 還沒取得 registry identity 時回 None——沒有可採信的 spool authority。
     """
 
+    template_instance = _template_instance_for_job(job)
+    if template_instance is _TEMPLATE_INSTANCE_UNSET:
+        pass
+    elif template_instance is None:
+        return None
+    else:
+        return template_instance
+
     job_id = job.get("job_id")
     if not isinstance(job_id, str) or not job_id.strip():
         return None
-    if _SPOOL_KEY_RE.fullmatch(job_id) is None:
+    if not job_segment_valid(job_id):
         return None
     return job_id
+
+
+def _template_instance_for_job(job: Mapping[str, object]) -> str | None | object:
+    if "template_instance" not in job:
+        return _TEMPLATE_INSTANCE_UNSET
+    template_instance = job.get("template_instance")
+    if template_instance is None:
+        if job.get("runtime_mode") == "systemd-template":
+            return None
+        return _TEMPLATE_INSTANCE_UNSET
+    if isinstance(template_instance, str) and job_segment_valid(template_instance):
+        return template_instance
+    return None
 
 
 def commit_bundle_path_for_job(
@@ -618,6 +639,18 @@ def commit_bundle_path_for_job(
 ) -> Path | None:
     """該 job 的 bundle 路徑；推導不出 spool key 時回 None。"""
 
+    template_instance = _template_instance_for_job(job)
+    if template_instance is _TEMPLATE_INSTANCE_UNSET:
+        pass
+    elif template_instance is None:
+        return None
+    else:
+        return (
+            spool_slot.exact_job_slot(
+                "commit-spool", template_instance, coordinator_root=coordinator_root
+            )
+            / COMMIT_BUNDLE_FILENAME
+        )
     key = spool_key_for_job(job)
     if key is None:
         return None

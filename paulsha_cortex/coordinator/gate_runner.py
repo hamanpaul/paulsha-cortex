@@ -142,7 +142,7 @@ def gate_ledger_spool_dir(
     """單一 job 的 gate spool 目錄（唯一定址點）。"""
 
     _validate_spool_key(spool_key)
-    return spool_slot.canonical_job_slot(
+    return spool_slot.exact_job_slot(
         "gate-ledger-spool", spool_key, coordinator_root=coordinator_root
     )
 
@@ -213,12 +213,7 @@ def gate_worktree_dir(
     """gate 的拋棄式副本落點（登記表資產 `gate-worktree-pool` 底下一格）。"""
 
     _validate_spool_key(spool_key)
-    root = (
-        paths.gate_worktree_root()
-        if gate_worktree_root is None
-        else Path(gate_worktree_root)
-    )
-    return spool_slot.canonical_job_slot(
+    return spool_slot.exact_job_slot(
         "gate-worktree", spool_key, coordinator_root=gate_worktree_root
     )
 
@@ -227,7 +222,7 @@ def _validate_spool_key(spool_key: str) -> None:
     """key 會被接成絕對路徑並嵌進 spec，形狀在**組路徑之前**就驗。
 
     判準刻意複用 `job_workspace.job_segment_valid()`：gate 的 spool key 與 builder
-    的 spool key／worktree 目錄名是**同一個字串**（`Path(log_path).stem`），兩邊用
+    的 spool key／worktree 目錄名共用同一個 systemd-safe instance 形狀，兩邊用
     不同的判準就會出現「builder 那格建得起來、gate 這格建不起來」的錯位。
     """
 
@@ -244,9 +239,9 @@ def _validate_spool_key(spool_key: str) -> None:
 def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     """該 job 的 gate spool key。**推導規則只有一條**，且與 commit spool 共用。
 
-    `job_workspace.spool_key_for_job()` 是那一條規則的唯一實作（`Path(log_path).stem`
-    ＝ `launcher.launch()` 收到的 `slice_id`，也就是 exit sentinel 與 gate ledger 的
-    定址基準）。這裡直接委派而不是重寫，理由與該函式 docstring 的「必須是單一規則」
+    `job_workspace.spool_key_for_job()` 是那一條規則的唯一實作（template lane 讀
+    持久化的 `template_instance`，legacy/direct lane 才回退 `job_id`）。這裡直接
+    委派而不是重寫，理由與該函式 docstring 的「必須是單一規則」
     逐字相同——各自猜 key 的失敗形態是「找不到 → 靜默不回收」。
     """
 

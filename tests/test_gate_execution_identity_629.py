@@ -649,13 +649,24 @@ class GateHardeningParityTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class GateExecutionTests(unittest.TestCase):
-    def _run(self, *, root: str, payload: object, returncode: int = 0, env_extra=None):
+    def _run(
+        self,
+        *,
+        root: str,
+        payload: object,
+        returncode: int = 0,
+        env_extra=None,
+        job_id: str = "psc-0629-build",
+        spool_key: str | None = None,
+    ):
         spool_dir = str(Path(root) / "job-specs")
         Path(spool_dir).mkdir(parents=True)
         coordinator_root = str(Path(root) / "coordinator")
         worktree = Path(root) / "worktree"
         worktree.mkdir()
-        ledger_path = Path(root) / "dispatch" / "psc-0629-build.gates.json"
+        if spool_key is None:
+            spool_key = job_runner.template_instance_id(job_id)
+        ledger_path = Path(root) / "dispatch" / f"{job_id}.gates.json"
         env = {
             **_BASE_ENV,
             job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE,
@@ -668,13 +679,13 @@ class GateExecutionTests(unittest.TestCase):
         runner = _RecordingRunner(returncode=returncode, payload=payload)
         runner.expect_output(
             gate_runner.gate_spool_ledger_path(
-                spool_key="psc-0629-build", coordinator_root=coordinator_root
+                spool_key=spool_key, coordinator_root=coordinator_root
             )
         )
         with mock.patch.dict(os.environ, env, clear=True), _nested(_preflight_patches()):
             result = gate_runner.run_declared_gates(
-                job_id="psc-0629-build",
-                spool_key="psc-0629-build",
+                job_id=job_id,
+                spool_key=spool_key,
                 ledger_path=ledger_path,
                 worktree=worktree,
                 coordinator_root=coordinator_root,
@@ -705,6 +716,35 @@ class GateExecutionTests(unittest.TestCase):
                     expected_unit,
                 ],
             )
+
+    def test_template_spool_keys_are_joined_without_a_second_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            raw_slice_id = "phase2-plan-manager-gitconfig-763"
+            job_id = f"{raw_slice_id}-132"
+            spool_key = job_runner.template_instance_id(raw_slice_id)
+            self.assertEqual(spool_key, "phase2-plan-manager-gitconfig-763-50f62414")
+
+            out = self._run(
+                root=root,
+                payload=_ok_payload(slice_id=raw_slice_id),
+                job_id=job_id,
+                spool_key=spool_key,
+            )
+
+            coordinator_root = Path(root) / "coordinator"
+            spool_ledger = gate_runner.gate_spool_ledger_path(
+                spool_key=spool_key, coordinator_root=coordinator_root
+            )
+            self.assertTrue(spool_ledger.is_file())
+            self.assertEqual(spool_ledger.parent.name, spool_key)
+            self.assertFalse(
+                (spool_ledger.parent.parent / job_runner.template_instance_id(spool_key)).exists()
+            )
+
+            argv = out["spec"]["command"]
+            snapshot = Path(argv[argv.index("--worktree") + 1])
+            self.assertEqual(snapshot.name, spool_key)
+            self.assertFalse((snapshot.parent / job_runner.template_instance_id(spool_key)).exists())
 
     def test_the_spec_carries_no_identity_or_profile_field(self) -> None:
         """身分只由 root-owned unit 的 `User=` 決定（#643／0816 裁決 B 的核心）。"""
