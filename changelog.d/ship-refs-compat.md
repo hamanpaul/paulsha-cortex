@@ -1,0 +1,1 @@
+#776 補遺：ship adapter 的 refs 守衛改走 openspec 相容判定（helper 下沉 claim.py 供 work_bridge 共用）——run.openspec_refs 是 claim 時快照、authority-restart 不回寫，authority 因 run 自產 change 落地而多出 ref 時全等比對把合法 ship 擋成 `WorkflowRun refs differ`（實機 workflow-advance-failed）。

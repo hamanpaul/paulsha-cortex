@@ -1141,6 +1141,55 @@ def _validate_candidate(candidate: ClaimCandidate) -> None:
             raise ValueError("active workflow pre-freeze identity digest missing")
 
 
+def planning_declared_openspec_changes(run) -> set[str]:
+    """run 的 define/plan 卡 outputs 宣告過的 openspec change 名（#776）。
+
+    planning 卡把 ``openspec/changes/<name>/...`` 列在 outputs 裡即代表該
+    change 是 run 自己的 planning 產物——它日後落地 authority checkout 屬於
+    「run 自產成果回寫」，不是外部 authority 變更。舊版 combo manifest 的
+    openspec-propose 卡 outputs 未列 openspec 路徑（實機 workflow-85114100：
+    outputs 只有 spec/design）；有這張卡即代表 run 的 planning 會產出慣例名
+    （= work_id）的 change，一樣屬 run 自產。
+    """
+
+    declared: set[str] = set()
+    has_openspec_propose = False
+    for step in getattr(run, "steps", ()):
+        if getattr(step, "phase", None) not in {"define", "plan"}:
+            continue
+        if getattr(step, "card", None) == "openspec-propose":
+            has_openspec_propose = True
+        for output in getattr(step, "outputs", ()):
+            parts = str(output).split("/")
+            if len(parts) >= 3 and parts[0] == "openspec" and parts[1] == "changes":
+                declared.add(parts[2])
+    if has_openspec_propose:
+        work_id = getattr(run, "work_id", None)
+        if isinstance(work_id, str) and work_id:
+            declared.add(work_id)
+    return declared
+
+
+def openspec_refs_compatible(run, authority) -> bool:
+    """#776：run 身分與 authority 的 openspec 比對（resume 識別／ship 守衛共用）。
+
+    全等視為相同 work（原行為）。authority 只「多出」refs 且多出的每一個都是
+    run 自產 planning 產物時，視為 run 自產 openspec change 落地 authority——
+    run 沒有被外部重新定義，仍是同一份工作。authority 少了 run 已宣告的 ref、
+    或多出非 run 自產的 change，仍屬真正的 authority 變更。
+    """
+
+    run_refs = tuple(getattr(run, "openspec_refs", ()) or ())
+    mapped = tuple(getattr(authority, "mapped_openspec", ()) or ())
+    if run_refs == mapped:
+        return True
+    run_set = set(run_refs)
+    mapped_set = set(mapped)
+    if not run_set <= mapped_set:
+        return False
+    return (mapped_set - run_set) <= planning_declared_openspec_changes(run)
+
+
 def claim_key_for_authority_digest(*, repo: str, work_id: str, authority_digest: str) -> str:
     """Deterministic ``claim:v1:...`` key for an exact (repo, work_id,
     authority_digest) triple.

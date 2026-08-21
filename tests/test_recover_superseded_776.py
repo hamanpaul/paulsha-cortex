@@ -320,3 +320,32 @@ class LegacyManifestOpenspecDeclarationTests(unittest.TestCase):
         self.assertNotIn(
             "fix-demo", work_actions._planning_declared_openspec_changes(run)
         )
+
+class ShipAdapterRefsCompatTests(unittest.TestCase):
+    """#776 補遺：ship adapter 的 refs 守衛改走相容判定。
+
+    run.openspec_refs 是 claim 時快照、authority-restart 不回寫；authority 因
+    run 自產 change 落地而多出 ref 時，全等比對把合法 ship 擋成
+    `WorkflowRun refs differ`（實機 workflow-advance-failed）。helper 下沉
+    claim.py 供 work_bridge 使用（不得反向 import work_actions）。
+    """
+
+    def test_ship_validate_uses_compatible_predicate(self) -> None:
+        from paulsha_cortex.coordinator import work_bridge
+
+        source = inspect.getsource(work_bridge)
+        anchor = source.index("WorkflowRun refs differ from current WorkAuthority")
+        window = source[max(0, anchor - 600) : anchor]
+        self.assertIn("openspec_refs_compatible(run, authority)", window)
+        self.assertNotIn("run.openspec_refs != authority.mapped_openspec", window)
+
+    def test_helpers_live_in_claim_and_alias_in_work_actions(self) -> None:
+        from paulsha_cortex.coordinator import claim
+
+        self.assertIs(
+            work_actions._openspec_refs_compatible, claim.openspec_refs_compatible
+        )
+        self.assertIs(
+            work_actions._planning_declared_openspec_changes,
+            claim.planning_declared_openspec_changes,
+        )
