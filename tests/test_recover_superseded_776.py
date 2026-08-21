@@ -243,3 +243,40 @@ class RecoverSupersededActionTests(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+class ControlContractWhitelistTests(unittest.TestCase):
+    """#776 補遺：control contract 的 verb 白名單與 CAS/actor/reason 驗證分支。
+
+    漏接 contract 白名單時 CLI submit 直接 `work-action action invalid`——
+    verb 在 coordinator 端存在但 control 通道進不去。
+    """
+
+    def test_recover_superseded_is_a_valid_work_action(self) -> None:
+        from paulsha_cortex.control import contract
+
+        self.assertIn("recover-superseded", contract.WORK_ACTIONS)
+
+    def test_contract_enforces_cas_actor_reason(self) -> None:
+        from paulsha_cortex.control import contract
+
+        base = {
+            "schema_version": 1,
+            "type": "work-action",
+            "req_id": "r" * 20,
+            "requested_by": "coordinator-cli",
+            "created_at": contract.utcnow(),
+            "args": {
+                "action": "recover-superseded",
+                "repo": _REPO,
+                "work_id": _WORK_ID,
+                "actor": "operator",
+                "reason": "recover verified run",
+                "expected_run_id": "workflow-" + "a" * 20,
+            },
+        }
+        validated = contract.validate_request(dict(base))
+        self.assertEqual(validated["args"]["action"], "recover-superseded")
+        broken = dict(base)
+        broken["args"] = {**base["args"], "expected_run_id": "workflow-zzz"}
+        with self.assertRaisesRegex(ValueError, "expected_run_id"):
+            contract.validate_request(broken)
