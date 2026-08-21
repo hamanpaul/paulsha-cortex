@@ -64,7 +64,7 @@ class GoldenArgvPins(unittest.TestCase):
         self.assertEqual(
             _argv(read_only=True),
             [
-                "codex", "exec", "P", "--json",
+                "codex", "exec", "--ignore-user-config", "P", "--json",
                 "--sandbox", "read-only",
                 "--skip-git-repo-check",
                 "--enable", "use_legacy_landlock",
@@ -76,7 +76,7 @@ class GoldenArgvPins(unittest.TestCase):
         self.assertEqual(
             _argv(review_only=True),
             [
-                "codex", "exec", "P", "--json",
+                "codex", "exec", "--ignore-user-config", "P", "--json",
                 "--sandbox", "read-only",
                 "--skip-git-repo-check",
                 "--enable", "use_legacy_landlock",
@@ -88,7 +88,7 @@ class GoldenArgvPins(unittest.TestCase):
         self.assertEqual(
             _argv(write_forbidden=True),
             [
-                "codex", "exec", "P", "--json",
+                "codex", "exec", "--ignore-user-config", "P", "--json",
                 "--sandbox", "read-only",
                 "--enable", "use_legacy_landlock",
                 "-o", "/lg/wf-716.last.json",
@@ -101,7 +101,7 @@ class GoldenArgvPins(unittest.TestCase):
         self.assertEqual(
             _argv(allow_unsafe=True),
             [
-                "codex", "exec", "P", "--json",
+                "codex", "exec", "--ignore-user-config", "P", "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--dangerously-bypass-hook-trust",
                 "-o", "/lg/wf-716.last.json",
@@ -121,7 +121,7 @@ class WriteCardArgvShapeTests(unittest.TestCase):
         self.assertEqual(
             _argv(),
             [
-                "codex", "exec", "P", "--json",
+                "codex", "exec", "--ignore-user-config", "P", "--json",
                 "--sandbox", "danger-full-access",
                 "-o", "/lg/wf-716.last.json",
             ],

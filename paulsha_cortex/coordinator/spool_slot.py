@@ -47,6 +47,7 @@ producer 具名條目的 `x`（traverse）一併失效，連既有的檔都再�
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -89,6 +90,57 @@ SEALED_SLOT_MODE = 0o500
 #: POSIX ACL 的 access ACL 落在這個 xattr。存在 ⇒ 這一項的 group 位是 **mask**，
 #: 不是「群組的實際權限」。
 ACCESS_ACL_XATTR = "system.posix_acl_access"
+
+_CANONICAL_SURFACE_ROOTS = {
+    "commit-spool": "commit_spool_root",
+    "monitor-event-spool": "monitor_event_spool_root",
+    "review-verdict-spool": "review_verdict_spool_root",
+    "gate-ledger-spool": "gate_ledger_spool_root",
+    "gate-worktree": "gate_worktree_root",
+}
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def canonical_job_slot(
+    surface_id: str, job_id: str, *, coordinator_root: str | Path | None = None
+) -> Path:
+    """Return the Manager-selected instance slot for one registered surface.
+
+    This is deliberately the only generic path join for per-job writable roots;
+    callers must provide the registry identity, never payload text.
+    """
+    if surface_id not in _CANONICAL_SURFACE_ROOTS:
+        raise ValueError(f"unknown writable surface: {surface_id!r}")
+    if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
+        raise ValueError(f"unsafe job identity: {job_id!r}")
+    from ..config import paths
+
+    if surface_id == "gate-worktree":
+        root = paths.gate_worktree_root() if coordinator_root is None else Path(coordinator_root)
+    else:
+        root = (
+            getattr(paths, _CANONICAL_SURFACE_ROOTS[surface_id])()
+            if coordinator_root is None
+            else Path(coordinator_root) / {
+                "commit-spool": paths.COMMIT_SPOOL_DIRNAME,
+                "monitor-event-spool": "monitor/event-spool",
+                "review-verdict-spool": paths.REVIEW_VERDICT_SPOOL_DIRNAME,
+                "gate-ledger-spool": paths.GATE_LEDGER_SPOOL_DIRNAME,
+            }[surface_id]
+        )
+    return Path(root).resolve() / job_id
+
+
+def validate_job_slot_shape(slot: str | Path, *, allow_symlink: bool = False) -> Path:
+    """Fail closed unless *slot* is an ordinary directory in its parent."""
+    path = Path(slot)
+    if path.is_symlink() and not allow_symlink:
+        raise SpoolSlotError("symlink", f"job slot is a symlink: {path}")
+    if not path.exists() or not path.is_dir():
+        raise SpoolSlotError("shape", f"job slot is not a directory: {path}")
+    if path.name in {"", ".", ".."} or _JOB_ID_RE.fullmatch(path.name) is None:
+        raise SpoolSlotError("shape", f"unsafe job slot name: {path.name!r}")
+    return path
 
 
 class SpoolSlotError(Exception):

@@ -131,7 +131,9 @@ def gate_ledger_spool_root(coordinator_root: str | Path | None = None) -> Path:
 
     if coordinator_root is None:
         return paths.gate_ledger_spool_root()
-    return Path(coordinator_root) / paths.GATE_LEDGER_SPOOL_DIRNAME
+    return spool_slot.canonical_job_slot(
+        "gate-ledger-spool", "placeholder", coordinator_root=coordinator_root
+    ).parent
 
 
 def gate_ledger_spool_dir(
@@ -214,7 +216,9 @@ def gate_worktree_dir(
         if gate_worktree_root is None
         else Path(gate_worktree_root)
     )
-    return root / spool_key
+    return spool_slot.canonical_job_slot(
+        "gate-worktree", spool_key, coordinator_root=gate_worktree_root
+    )
 
 
 def _validate_spool_key(spool_key: str) -> None:

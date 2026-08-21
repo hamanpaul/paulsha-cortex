@@ -9,5 +9,10 @@
 
 ## Task 2: Implement canonical slot derivation and provisioning
 
-- [ ] Extend the trust-root surface table and derive deployment, provisioning, run-under, and probe output.
-- [ ] Update producers/consumers and cleanup behavior to use the canonical owned slot.
+- [x] Extend the trust-root surface table and derive deployment, provisioning, run-under, and probe output.
+- [x] Update producers/consumers and cleanup behavior to use the canonical owned slot.
+
+## Task 3: Make Codex control inputs immutable without breaking refresh
+
+- [ ] Add immutable-control smoke coverage for config, plugins, skills, and hooks while preserving auth refresh.
+- [x] Pass `--ignore-user-config` on every `codex exec` lane and update the byte-pinned argv regression tests.

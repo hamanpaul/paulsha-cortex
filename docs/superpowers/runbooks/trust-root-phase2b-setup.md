@@ -6485,3 +6485,18 @@ PY
 | `PSC_JOB_RUNNER=systemd-run` | `PSC_JOB_RUNNER=systemd-template`（`systemd-run` 僅備援用） |
 | R9 四族，subject 為 `cortex-builder` | R9 **五族**，subject 為 builder ＋ reviewer-planner，新增族 5 privilege-boundary |
 | 殘餘風險：授權帳號可起任意 UID | 殘餘風險：**僅剩 `cortex-manager` 的 supply-chain 類**（見 5-8） |
+# #718 per-job writable surface isolation
+
+The five job-writable surfaces are derived from `permgen.PER_JOB_WRITABLE_SURFACES`:
+`commit-spool`, `monitor-event-spool`, `review-verdict-spool`, `gate-ledger-spool`,
+and `gate-worktree`. Provisioning and probes must use the same canonical job identity
+and render `<root>/<job-id>`; a missing, malformed, symlinked, or non-directory slot
+fails closed. Verify the generated paths with:
+
+```bash
+python3 -c 'from paulsha_cortex.trust_root import permgen; print(*permgen.render_job_writable_properties(instance="probe"), sep="\n")'
+```
+
+The result must contain concrete `probe` slots and no writable root by itself. Codex
+jobs also receive `--ignore-user-config`; `auth.json` refresh remains a separate
+deployment concern and is not made immutable by this change.

@@ -555,7 +555,9 @@ def commit_spool_root(coordinator_root: str | Path | None = None) -> Path:
 
     if coordinator_root is None:
         return paths.commit_spool_root()
-    return Path(coordinator_root) / paths.COMMIT_SPOOL_DIRNAME
+    return spool_slot.canonical_job_slot(
+        "commit-spool", "placeholder", coordinator_root=coordinator_root
+    ).parent
 
 
 def commit_spool_dir(

@@ -76,8 +76,76 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
+from pathlib import Path
 
 from . import registry
+
+
+@dataclass(frozen=True)
+class PerJobWritableSurface:
+    """The single source projected by deployment, provisioning, runtime and probes."""
+
+    surface_id: str
+    slot_template: str
+    writable_root: str
+    provisioner: str
+    probe: str
+
+
+def _per_job_surface_rows() -> tuple[PerJobWritableSurface, ...]:
+    from ..config import paths
+
+    rows = (
+        ("commit-spool", paths.commit_spool_root()),
+        ("monitor-event-spool", paths.monitor_event_spool_root()),
+        ("review-verdict-spool", paths.review_verdict_spool_root()),
+        ("gate-ledger-spool", paths.gate_ledger_spool_root()),
+        ("gate-worktree", paths.gate_worktree_root()),
+    )
+    return tuple(
+        PerJobWritableSurface(
+            surface_id=surface_id,
+            slot_template=f"{root}/%i",
+            writable_root=str(root),
+            provisioner="coordinator.spool_slot.canonical_job_slot",
+            probe="trust_root.permgen.render_job_writable_properties",
+        )
+        for surface_id, root in rows
+    )
+
+
+PER_JOB_WRITABLE_SURFACES = _per_job_surface_rows()
+
+
+def _surface_ids() -> tuple[str, ...]:
+    return tuple(row.surface_id for row in PER_JOB_WRITABLE_SURFACES)
+
+
+def generated_writable_surface_ids() -> tuple[str, ...]:
+    return _surface_ids()
+
+
+def provisioned_writable_surface_ids() -> tuple[str, ...]:
+    return _surface_ids()
+
+
+def run_under_writable_surface_ids() -> tuple[str, ...]:
+    return _surface_ids()
+
+
+def probe_writable_surface_ids() -> tuple[str, ...]:
+    return _surface_ids()
+
+
+def render_job_writable_properties(*, instance: str) -> tuple[str, ...]:
+    if not isinstance(instance, str) or not instance:
+        raise ValueError("job instance is required")
+    from ..coordinator.spool_slot import canonical_job_slot
+
+    return tuple(
+        f"ReadWritePaths={canonical_job_slot(row.surface_id, instance)}"
+        for row in PER_JOB_WRITABLE_SURFACES
+    )
 from .registry import (
     HEADLESS_PERSONAS,
     UNTRUSTED_EXECUTION_PRINCIPALS,

@@ -885,6 +885,7 @@ def build_codex_argv(
     argv = [
         "codex",
         "exec",
+        "--ignore-user-config",
         prompt,
         "--json",
     ]
