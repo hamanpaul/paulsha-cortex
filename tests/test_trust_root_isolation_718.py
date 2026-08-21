@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from paulsha_cortex.coordinator import spool_slot
@@ -273,8 +274,11 @@ class RuntimeSurfaceProvisionTests(unittest.TestCase):
     def test_write_only_rows_skip_runtime_projection_acl(self) -> None:
         applied: list[tuple[str, bool]] = []
 
-        def _record_acl(path: Path, *, account: str, writable: bool, surface) -> None:
+        def _record_acl(
+            path: Path, *, account: str, writable: bool, surface, recursive: bool = True
+        ) -> None:
             del path, account
+            assert recursive is True
             applied.append((surface.surface_id, writable))
 
         with tempfile.TemporaryDirectory() as d:
@@ -294,6 +298,86 @@ class RuntimeSurfaceProvisionTests(unittest.TestCase):
             {surface_id for surface_id, _writable in applied},
             {"builder-codex-home", "builder-runtime-cache"},
         )
+
+    def test_reused_runtime_slots_refresh_root_acl_without_recursive_walk(self) -> None:
+        applied: list[tuple[Path, str, bool, str, bool]] = []
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with unittest.mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": str(root)}, clear=False):
+                canonical = self._seed_builder_projection(root)
+                spool_slot.provision_runtime_surfaces(
+                    principal="builder", job_id="job-a", canonical_codex_home=canonical
+                )
+                codex = spool_slot.canonical_job_slot("builder-codex-home", "job-a")
+                cache = spool_slot.canonical_job_slot("builder-runtime-cache", "job-a")
+                (codex / "sessions").mkdir()
+                (codex / "sessions" / "state.json").write_text('{"live":true}\n')
+                (cache / "copilot").mkdir()
+                (cache / "copilot" / "state.sqlite").write_text("keep\n")
+
+                def _record_acl(
+                    path: Path,
+                    *,
+                    account: str,
+                    writable: bool,
+                    surface,
+                    recursive: bool = True,
+                ) -> None:
+                    target = Path(path)
+                    if target in {codex, cache} and recursive:
+                        raise AssertionError("reused runtime slot root must not recurse")
+                    applied.append((target, account, writable, surface.surface_id, recursive))
+
+                with unittest.mock.patch.object(
+                    spool_slot, "_apply_slot_acl", side_effect=_record_acl
+                ):
+                    spool_slot.provision_runtime_surfaces(
+                        principal="builder",
+                        job_id="job-a",
+                        canonical_codex_home=canonical,
+                        account="cortex-builder",
+                    )
+
+        assert (codex, "cortex-builder", True, "builder-codex-home", False) in applied
+        assert (cache, "cortex-builder", True, "builder-runtime-cache", False) in applied
+        readonly_controls = {
+            (codex / "config.toml", "cortex-builder", False, "builder-codex-home"),
+            (codex / "hooks.json", "cortex-builder", False, "builder-codex-home"),
+            (codex / "plugins", "cortex-builder", False, "builder-codex-home"),
+            (codex / "skills", "cortex-builder", False, "builder-codex-home"),
+        }
+        assert readonly_controls <= {
+            (path, account, writable, surface_id)
+            for path, account, writable, surface_id, _recursive in applied
+        }
+
+    def test_fresh_runtime_slots_seed_recursive_acl(self) -> None:
+        applied: list[tuple[Path, str, bool, str, bool]] = []
+
+        def _record_acl(
+            path: Path, *, account: str, writable: bool, surface, recursive: bool = True
+        ) -> None:
+            applied.append((Path(path), account, writable, surface.surface_id, recursive))
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with unittest.mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": str(root)}, clear=False):
+                canonical = self._seed_builder_projection(root)
+                codex = spool_slot.canonical_job_slot("builder-codex-home", "job-a")
+                cache = spool_slot.canonical_job_slot("builder-runtime-cache", "job-a")
+                with unittest.mock.patch.object(
+                    spool_slot, "_apply_slot_acl", side_effect=_record_acl
+                ):
+                    spool_slot.provision_runtime_surfaces(
+                        principal="builder",
+                        job_id="job-a",
+                        canonical_codex_home=canonical,
+                        account="cortex-builder",
+                    )
+
+        assert (codex, "cortex-builder", True, "builder-codex-home", True) in applied
+        assert (cache, "cortex-builder", True, "builder-runtime-cache", True) in applied
 
     def test_copilot_authority_requires_absolute_locked_manager_owned_file(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -341,7 +425,10 @@ class RuntimeSurfaceProvisionTests(unittest.TestCase):
     def test_provision_copilot_home_copies_authority_and_preserves_job_cache(self) -> None:
         applied: list[tuple[Path, str, bool, str]] = []
 
-        def _record_acl(path: Path, *, account: str, writable: bool, surface) -> None:
+        def _record_acl(
+            path: Path, *, account: str, writable: bool, surface, recursive: bool = True
+        ) -> None:
+            assert recursive is True
             applied.append((Path(path), account, writable, surface.surface_id))
 
         with tempfile.TemporaryDirectory() as d:

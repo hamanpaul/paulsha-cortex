@@ -267,6 +267,7 @@ def _apply_slot_acl(
     account: str,
     writable: bool,
     surface: "PerJobWritableSurface",
+    recursive: bool = True,
 ) -> None:
     """Apply ACL without the launcher's mocked ``subprocess.Popen`` surface."""
     binary = shutil.which("setfacl")
@@ -277,8 +278,11 @@ def _apply_slot_acl(
     spec = surface.acl_argument(
         account=account, writable=writable, directory=path.is_dir()
     )
-    argv = (binary, "-R", "-m", spec, str(path))
-    if os.spawnv(os.P_WAIT, binary, argv) != 0:
+    argv = [binary]
+    if recursive:
+        argv.append("-R")
+    argv.extend(("-m", spec, str(path)))
+    if os.spawnv(os.P_WAIT, binary, tuple(argv)) != 0:
         raise SpoolSlotError("acl", f"failed to apply per-job ACL: {path}")
 
 
@@ -426,11 +430,15 @@ def provision_runtime_surfaces(
         if principal not in row.principals:
             continue
         slot = canonical_job_slot(row.surface_id, job_id)
+        fresh_slot = False
+        auth: Path | None = None
+        auth_seeded = False
         try:
             if slot.exists():
                 validate_job_slot_shape(slot)
             else:
                 create_slot(slot, reset=False)
+                fresh_slot = True
             if row.surface_id.endswith("-codex-home"):
                 source = readable_codex_home(canonical_codex_home, require_auth=False)
                 for dirname in ("plugins", "skills"):
@@ -460,15 +468,31 @@ def provision_runtime_surfaces(
                     # Preserve the inherited named-user ACL mask. 0600 would mask
                     # the job principal out before Codex can refresh credentials.
                     auth.chmod(0o660)
+                    auth_seeded = True
             if account is not None and row.surface_id.endswith(
                 ("-codex-home", "-runtime-cache")
             ):
-                # The container remains Manager-only. Grant the resolved job
-                # account recursively on the explicit runtime projection only;
-                # write-only rows keep the deployment ACL already installed on
-                # their typed root.
-                _apply_slot_acl(slot, account=account, writable=True, surface=row)
+                # Fresh slots are still entirely Manager-owned, so the runtime
+                # projection may be seeded recursively. Reused slots can already
+                # contain job-owned runtime state; refresh only the slot root's
+                # access/default ACL and then re-lock the Manager-owned control
+                # leaves that were just copied back in place.
+                _apply_slot_acl(
+                    slot,
+                    account=account,
+                    writable=True,
+                    surface=row,
+                    recursive=fresh_slot,
+                )
                 if row.surface_id.endswith("-codex-home"):
+                    if auth_seeded and not fresh_slot and auth is not None:
+                        _apply_slot_acl(
+                            auth,
+                            account=account,
+                            writable=True,
+                            surface=row,
+                            recursive=False,
+                        )
                     for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
                         _apply_slot_acl(
                             slot / leaf, account=account, writable=False, surface=row
