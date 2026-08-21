@@ -37,6 +37,7 @@ from .claim import (
     WorkAuthority,
     load_work_authority,
     mapped_issue_titles,
+    openspec_refs_compatible,
     sizing_band,
     work_authority_digest,
 )
@@ -1855,7 +1856,11 @@ def build_production_ship_validator(
             snapshot_path=snapshot_path,
         )
         expected_issues = tuple(f"{run.repo}#{number}" for number in authority.mapped_issues)
-        if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
+        # #776：openspec 比對走相容判定——authority 多出的 refs 若皆為 run 自產
+        # planning 產物（含舊 manifest 的 openspec-propose 慣例名授與），run 身分
+        # 未被外部重新定義；run.openspec_refs 是 claim 時快照，authority-restart
+        # 不回寫它，全等比對會把合法 ship 擋成 refs-differ。
+        if run.issue_refs != expected_issues or not openspec_refs_compatible(run, authority):
             raise RuntimeError("WorkflowRun refs differ from current WorkAuthority")
         branch = _builder_binding(
             registry,
