@@ -770,9 +770,14 @@ def manager_control_log_path(job_log_path: str | Path) -> Path:
     ``ReadWritePaths`` bind mounts separate mount identities, so that design
     fails with ``EXDEV`` in the live Manager namespace.
 
-    Only the three generated job-log layouts are projected.  Arbitrary test or
-    legacy paths retain their historical sibling behavior, which keeps the
-    helper safe for direct jobs and old registry rows.
+    New template launches persist the raw Manager control anchor separately
+    (`LaunchHandle.control_log_path` / registry `control_log_path`) because the
+    canonical job-writable slot now follows systemd `%i`.  Callers that care
+    about Manager-authored completion controls must consume that explicit field
+    rather than try to reconstruct it from the canonical spool path.  This
+    helper therefore keeps the historical projection for the registered legacy
+    layouts while arbitrary direct / already-explicit paths retain their
+    sibling behavior.
     """
 
     path = Path(job_log_path)
@@ -783,9 +788,11 @@ def manager_control_log_path(job_log_path: str | Path) -> Path:
     if _SPOOL_KEY_RE.fullmatch(key) is None:
         return path
     # parents[3] is the shared ``coordinator`` root for all three registered
-    # layouts.  Do not resolve or follow anything here: this is path
+    # layouts.  Do not resolve or follow anything here: this is compatibility
     # projection only, and the actual Manager-authored controls still undergo
-    # their existing regular-file/owner checks.
+    # their existing regular-file/owner checks.  New template launches persist
+    # the raw Manager control anchor explicitly because `%i` may be a hashed
+    # instance name and cannot be reversed to the original slice id here.
     coordinator_root = path.parents[3]
     return coordinator_root.parent / "runtime" / "dispatch" / f"{key}.jsonl"
 
@@ -797,9 +804,11 @@ def job_log_spool_dir(*, principal_id: str, spool_key: str) -> Path:
     log_spool_principal`），不是這裡猜的：launcher 同時派 builder 與 reviewer 兩種
     job，兩者走的是不同的模板 unit、不同的帳號，因此也是不同的一條既有輸出通道。
 
-    key 與 commit spool 共用同一個字串（`Path(log_path).stem` ＝ `slice_id`），理由
-    與 `gate_runner._validate_spool_key` 逐字相同：兩邊用不同的判準就會出現「這一格
-    建得起來、那一格建不起來」的錯位。
+    `spool_key` 是呼叫端已經決定好的 slot 名：模板 job 傳進來的是 unit `%i`
+    （`template_plan.instance`），而 raw `slice_id` 留在另外那條 explicit
+    `manager_log_path` / `control_log_path`。這裡唯一承重的是「key 的形狀守衛與
+    `gate_runner._validate_spool_key` 同一條」——兩邊用不同判準就會出現「這一格建得
+    起來、那一格建不起來」的錯位。
     """
 
     if not isinstance(spool_key, str) or _SPOOL_KEY_RE.fullmatch(spool_key) is None:

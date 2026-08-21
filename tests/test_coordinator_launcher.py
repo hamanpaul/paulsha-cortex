@@ -1442,6 +1442,121 @@ class ArgvTests(unittest.TestCase):
         script = captured["argv"][2]
         self.assertIn("--model claude-haiku-4.5", script)
 
+    def test_template_launch_uses_instance_named_log_slot_and_explicit_control_anchor(self) -> None:
+        captured: dict[str, object] = {}
+
+        class _FakeProc:
+            pid = 7777
+
+        def _fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["popen_kwargs"] = kwargs
+            return _FakeProc()
+
+        original = launcher_module.subprocess.Popen
+        launcher_module.subprocess.Popen = _fake_popen
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                slice_id = "wf-" + ("x" * 96)
+                instance = launcher_module.job_runner.template_instance_id(slice_id)
+                expected_control_log = str(root / "runtime" / "dispatch" / f"{slice_id}.jsonl")
+                plan = launcher_module.job_runner.SystemdTemplatePlan(
+                    binary="systemctl",
+                    template_unit="cortex-builder-job@.service",
+                    instance=instance,
+                    unit=f"cortex-builder-job@{instance}.service",
+                    account="cortex-builder",
+                    group="cortex-builder",
+                    shim="/usr/bin/psc-job-shim",
+                    spool_dir=str(root / "job-specs"),
+                    spec_path=str(root / "job-specs" / f"{instance}.json"),
+                    hardening_profile="strict",
+                    executor="copilot",
+                    base_template_unit="cortex-builder-job@.service",
+                    role=launcher_module.job_runner.JOB_ROLE_BUILDER,
+                )
+
+                def _fake_build_job_env(**_kwargs):
+                    return {
+                        "PATH": os.environ.get("PATH", ""),
+                        "HOME": str(root),
+                        "PSC_JOB_ID": slice_id,
+                        "PSC_SLICE_ID": slice_id,
+                        "PSC_REPO_ROOT": str(root),
+                    }
+
+                def _fake_build_job_spec(**kwargs):
+                    captured["spec"] = kwargs
+                    return {
+                        "instance": kwargs["instance"],
+                        "unit": kwargs["unit"],
+                        "log_path": kwargs["log_path"],
+                    }
+
+                def _fake_confirm_template_instance_started(**kwargs):
+                    captured["confirmed"] = kwargs
+
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "PSC_JOB_RUNNER": launcher_module.job_runner.RUNNER_SYSTEMD_TEMPLATE,
+                        "PSC_AGENTS_ROOT": str(root),
+                    },
+                    clear=False,
+                ), mock.patch.object(
+                    launcher_module.job_runner, "prepare_systemd_template", return_value=plan
+                ), mock.patch.object(
+                    launcher_module.job_runner, "build_job_env", side_effect=_fake_build_job_env
+                ), mock.patch.object(
+                    launcher_module.job_runner, "build_job_spec", side_effect=_fake_build_job_spec
+                ), mock.patch.object(
+                    launcher_module.job_runner, "write_job_spec"
+                ), mock.patch.object(
+                    launcher_module.job_runner,
+                    "build_systemctl_start_argv",
+                    return_value=["systemctl", "start", plan.unit],
+                ), mock.patch.object(
+                    launcher_module.job_runner,
+                    "build_manager_exit_recorder_argv",
+                    side_effect=lambda *, client_argv, sentinel, cleanup_path: list(client_argv),
+                ), mock.patch.object(
+                    launcher_module.spool_slot,
+                    "canonical_codex_controls",
+                    return_value=str(root / "codex-home"),
+                ), mock.patch.object(
+                    launcher_module.spool_slot, "system_account_exists", return_value=False
+                ), mock.patch.object(
+                    launcher_module.spool_slot, "provision_runtime_surfaces"
+                ), mock.patch.object(
+                    launcher_module.job_runner, "ensure_workspace_reachable"
+                ), mock.patch.object(
+                    launcher_module.job_runner,
+                    "confirm_template_instance_started",
+                    side_effect=_fake_confirm_template_instance_started,
+                ):
+                    handle = SubprocessLauncher("copilot").launch(
+                        slice_id=slice_id,
+                        prompt="PROMPT",
+                        worktree=str(root),
+                        log_dir=str(root / "runtime" / "dispatch"),
+                    )
+        finally:
+            launcher_module.subprocess.Popen = original
+
+        spec = captured["spec"]
+        confirmed = captured["confirmed"]
+        self.assertNotEqual(instance, slice_id)
+        self.assertEqual(Path(handle.log_path).parent.name, instance)
+        self.assertEqual(Path(spec["log_path"]).parent.name, instance)
+        self.assertEqual(spec["instance"], instance)
+        self.assertTrue(spec["unit"].endswith(f"@{instance}.service"))
+        self.assertEqual(spec["log_path"], handle.log_path)
+        self.assertEqual(handle.control_log_path, expected_control_log)
+        self.assertEqual(confirmed["log_path"], expected_control_log)
+        self.assertEqual(confirmed["job_log_path"], handle.log_path)
+        self.assertEqual(Path(handle.control_log_path).stem, slice_id)
+
     def test_launch_sentinel_is_absolute_cwd_independent(self) -> None:
         # bug：相對 log_dir + 子進程 cwd=worktree → sentinel 寫到 worktree（poller 找不到）。
         # 修：launch 把 log_dir resolve 成絕對 → script 內 sentinel 與回傳 log_path 皆絕對。

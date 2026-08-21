@@ -266,23 +266,28 @@ class CanonicalLogSurfaceTests(unittest.TestCase):
             self.assertEqual(second.read_text(encoding="utf-8"), "")
             self.assertEqual(second.read_text(encoding="utf-8"), "")
 
-    def test_isolated_log_projects_completion_controls_to_manager_dispatch_root(self) -> None:
+    def test_explicit_manager_control_anchor_stays_separate_from_hashed_template_slot(self) -> None:
         with tempfile.TemporaryDirectory() as root:
+            slice_id = "wf-" + ("x" * 96)
+            control_log = Path(root) / "runtime" / "dispatch" / f"{slice_id}.jsonl"
+            spool_key = job_runner.template_instance_id(slice_id)
             with mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": root}, clear=False):
                 job_log = job_workspace.prepare_job_log_spool(
                     principal_id="builder",
-                    spool_key="wf-1",
-                    manager_log_path=Path(root) / "runtime" / "dispatch" / "wf-1.jsonl",
+                    spool_key=spool_key,
+                    manager_log_path=control_log,
                 )
-            expected = Path(root) / "runtime" / "dispatch" / "wf-1.jsonl"
-            self.assertEqual(job_workspace.manager_control_log_path(job_log), expected)
+            self.assertEqual(job_log.parent.name, spool_key)
+            self.assertNotEqual(control_log.stem, spool_key)
+            self.assertNotEqual(job_workspace.manager_control_log_path(job_log), control_log)
+            self.assertEqual(job_workspace.manager_control_log_path(control_log), control_log)
             self.assertEqual(
-                str(job_workspace.manager_control_log_path(job_log).with_suffix(".exit")),
-                str(expected.with_suffix(".exit")),
+                str(job_workspace.manager_control_log_path(control_log).with_suffix(".exit")),
+                str(control_log.with_suffix(".exit")),
             )
             self.assertEqual(
-                terminal_contract.gate_ledger_path(job_log),
-                expected.with_name("wf-1.gates.json"),
+                terminal_contract.gate_ledger_path(control_log),
+                control_log.with_name(f"{slice_id}.gates.json"),
             )
 
 

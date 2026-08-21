@@ -1699,10 +1699,13 @@ class SubprocessLauncher:
         # shim 開的是 B」這種只在實機上看得見的錯位。
         job_log_path = log_path
         if template_plan is not None:
+            # #718：模板 job 的 canonical log slot 必須逐字跟 unit 的 `%i`
+            # (`template_plan.instance`) 相同；raw `slice_id` 留給上面的 explicit
+            # Manager control anchor。
             job_log_path = str(
                 job_workspace.job_log_spool_dir(
                     principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
-                    spool_key=slice_id,
+                    spool_key=template_plan.instance,
                 )
                 / job_workspace.JOB_LOG_FILENAME
             )
@@ -2004,7 +2007,7 @@ class SubprocessLauncher:
             prepared_log_path = str(
                 job_workspace.prepare_job_log_spool(
                     principal_id=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
-                    spool_key=slice_id,
+                    spool_key=template_plan.instance,
                     manager_log_path=manager_log_path,
                 )
             )
