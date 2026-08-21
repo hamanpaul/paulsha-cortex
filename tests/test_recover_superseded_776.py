@@ -280,3 +280,43 @@ class ControlContractWhitelistTests(unittest.TestCase):
         broken["args"] = {**base["args"], "expected_run_id": "workflow-zzz"}
         with self.assertRaisesRegex(ValueError, "expected_run_id"):
             contract.validate_request(broken)
+
+class LegacyManifestOpenspecDeclarationTests(unittest.TestCase):
+    """#776 補遺：舊版 combo manifest 的 openspec-propose 卡 outputs 未列
+    openspec 路徑（實機 workflow-85114100 只列 spec/design）——有這張卡即視
+    慣例名（= work_id）的 change 為 run 自產，識別不得再 miss。"""
+
+    def _legacy_run(self, work_id="fix-demo"):
+        propose = _step("openspec-propose", phase="define", gate_result="passed",
+                        outputs=("docs/superpowers/specs/x-design.md",))
+        return SimpleNamespace(
+            work_id=work_id,
+            openspec_refs=(),
+            steps=(propose, _step("subagent-build", phase="build", gate_result="passed")),
+        )
+
+    def test_openspec_propose_card_declares_conventional_change_name(self) -> None:
+        declared = work_actions._planning_declared_openspec_changes(self._legacy_run())
+        self.assertIn("fix-demo", declared)
+
+    def test_legacy_run_stays_compatible_when_its_change_lands(self) -> None:
+        authority = SimpleNamespace(mapped_openspec=("fix-demo",))
+        self.assertTrue(
+            work_actions._openspec_refs_compatible(self._legacy_run(), authority)
+        )
+
+    def test_foreign_change_is_still_incompatible_for_legacy_run(self) -> None:
+        authority = SimpleNamespace(mapped_openspec=("other-change",))
+        self.assertFalse(
+            work_actions._openspec_refs_compatible(self._legacy_run(), authority)
+        )
+
+    def test_run_without_openspec_propose_gets_no_conventional_grant(self) -> None:
+        run = SimpleNamespace(
+            work_id="fix-demo",
+            openspec_refs=(),
+            steps=(_step("brainstorming", phase="define", gate_result="passed"),),
+        )
+        self.assertNotIn(
+            "fix-demo", work_actions._planning_declared_openspec_changes(run)
+        )

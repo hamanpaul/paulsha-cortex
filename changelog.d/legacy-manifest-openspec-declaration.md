@@ -1,0 +1,1 @@
+#776 補遺：舊版 combo manifest 的 openspec-propose 卡 outputs 未列 openspec 路徑，`_planning_declared_openspec_changes` 對有這張卡的 run 視慣例名（= work_id）change 為 run 自產——實機 workflow-85114100 復活後 resume 仍被識別 miss 再度 supersede 的根因。
