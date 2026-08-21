@@ -23,6 +23,10 @@
   / spec `instance` while the raw dispatch log name stays an explicit
   Manager-only control anchor, so long slice ids no longer desynchronize the
   mounted log slot from completion controls.
+- **#718 repair:** systemd-template launch now pre-provisions every typed
+  builder/reviewer writable slot before start, surfaces malformed rows with
+  the surface id and exact slot path, and keeps write-only rows on their
+  deployment ACL instead of the runtime-cache ACL widening path.
 - **#718：建立五面向 per-job writable surface 單一真相與 instance-scoped slot helper；Codex `exec` 固定帶 `--ignore-user-config`，並同步更新 argv golden pins。**
 - **#718（RED）：新增 per-job trust-root writable-surface isolation regression contract tests**，鎖定 canonical surface table、instance-scoped slot、foreign-slot boundary 與 fail-closed slot shape。
 - **#776 補遺：archive 前補齊舊 manifest 世代的 openspec change scaffold**（canonical-specs-invalid 修復）。

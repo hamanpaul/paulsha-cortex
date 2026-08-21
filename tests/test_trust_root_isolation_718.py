@@ -48,6 +48,10 @@ def _surfaces():
     return table
 
 
+def _surface_ids_for(principal: str) -> tuple[str, ...]:
+    return tuple(row.surface_id for row in _surfaces() if principal in row.principals)
+
+
 class _LocalCodexSeedScheme:
     def __init__(
         self,
@@ -212,6 +216,77 @@ class CodexAuthoritySeedCommandTests(unittest.TestCase):
 
     def test_scaffold_rerun_never_truncates_deployed_codex_policy(self) -> None:
         _assert_scaffold_rerun_never_truncates_deployed_codex_policy()
+
+
+class RuntimeSurfaceProvisionTests(unittest.TestCase):
+    def _seed_builder_projection(self, tmp_path: Path) -> Path:
+        canonical = tmp_path / "config" / "codex-controls" / "builder"
+        (canonical / "plugins").mkdir(parents=True)
+        (canonical / "skills").mkdir()
+        (canonical / "config.toml").write_text("model = 'deployed'\n")
+        (canonical / "hooks.json").write_text("{}\n")
+        authority = spool_slot.credential_authority("builder")
+        authority.parent.mkdir(parents=True, exist_ok=True)
+        authority.write_text('{"seed":true}\n')
+        return canonical
+
+    def test_builder_provisioning_enumerates_every_typed_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with unittest.mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": str(root)}, clear=False):
+                canonical = self._seed_builder_projection(root)
+                slots = spool_slot.provision_runtime_surfaces(
+                    principal="builder", job_id="job-a", canonical_codex_home=canonical
+                )
+                expected = {
+                    spool_slot.canonical_job_slot(surface_id, "job-a")
+                    for surface_id in _surface_ids_for("builder")
+                }
+                self.assertEqual(set(slots), expected)
+                for slot in expected:
+                    self.assertTrue(slot.is_dir(), str(slot))
+
+    def test_malformed_event_slot_reports_surface_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with unittest.mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": str(root)}, clear=False):
+                canonical = self._seed_builder_projection(root)
+                slot = spool_slot.canonical_job_slot("monitor-event-spool", "job-a")
+                slot.parent.mkdir(parents=True, exist_ok=True)
+                target = root / "foreign-slot"
+                target.mkdir()
+                slot.symlink_to(target, target_is_directory=True)
+                with self.assertRaises(spool_slot.SpoolSlotError) as raised:
+                    spool_slot.provision_runtime_surfaces(
+                        principal="builder", job_id="job-a", canonical_codex_home=canonical
+                    )
+                self.assertIn("monitor-event-spool", str(raised.exception))
+                self.assertIn(str(slot), str(raised.exception))
+
+    def test_write_only_rows_skip_runtime_projection_acl(self) -> None:
+        applied: list[tuple[str, bool]] = []
+
+        def _record_acl(path: Path, *, account: str, writable: bool, surface) -> None:
+            del path, account
+            applied.append((surface.surface_id, writable))
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with unittest.mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": str(root)}, clear=False):
+                canonical = self._seed_builder_projection(root)
+                with unittest.mock.patch.object(
+                    spool_slot, "_apply_slot_acl", side_effect=_record_acl
+                ):
+                    spool_slot.provision_runtime_surfaces(
+                        principal="builder",
+                        job_id="job-a",
+                        canonical_codex_home=canonical,
+                        account="cortex-builder",
+                    )
+        self.assertEqual(
+            {surface_id for surface_id, _writable in applied},
+            {"builder-codex-home", "builder-runtime-cache"},
+        )
 
 
 def test_one_canonical_table_covers_every_declared_writable_surface() -> None:
@@ -713,7 +788,15 @@ def test_registry_provisioner_preserves_controls_and_isolates_foreign_slot(
     foreign = spool_slot.provision_runtime_surfaces(
         principal="builder", job_id="job-b", canonical_codex_home=canonical
     )
-    assert len(own) == len(foreign) == 2
+    assert len(own) == len(foreign) == len(_surface_ids_for("builder"))
+    assert set(own) == {
+        spool_slot.canonical_job_slot(surface_id, "job-a")
+        for surface_id in _surface_ids_for("builder")
+    }
+    assert set(foreign) == {
+        spool_slot.canonical_job_slot(surface_id, "job-b")
+        for surface_id in _surface_ids_for("builder")
+    }
     codex_a = next(path for path in own if "codex-home" in str(path))
     codex_b = next(path for path in foreign if "codex-home" in str(path))
     before = (codex_b / "hooks.json").read_bytes()
@@ -825,14 +908,22 @@ def test_auth_refresh_is_committed_as_next_job_seed(tmp_path, monkeypatch) -> No
     authority = spool_slot.credential_authority("builder")
     authority.parent.mkdir(parents=True, exist_ok=True)
     authority.write_text('{"refresh":"old"}\n')
-    first = spool_slot.provision_runtime_surfaces(
-        principal="builder", job_id="job-a", canonical_codex_home=controls
-    )[0]
+    first = next(
+        path
+        for path in spool_slot.provision_runtime_surfaces(
+            principal="builder", job_id="job-a", canonical_codex_home=controls
+        )
+        if "codex-home" in str(path)
+    )
     (first / "auth.json").write_text('{"refresh":"new"}\n')
     spool_slot.commit_runtime_credential(principal="builder", job_id="job-a")
-    second = spool_slot.provision_runtime_surfaces(
-        principal="builder", job_id="job-b", canonical_codex_home=controls
-    )[0]
+    second = next(
+        path
+        for path in spool_slot.provision_runtime_surfaces(
+            principal="builder", job_id="job-b", canonical_codex_home=controls
+        )
+        if "codex-home" in str(path)
+    )
     assert (second / "auth.json").read_text() == '{"refresh":"new"}\n'
     assert (second / "config.toml").read_bytes() == (first / "config.toml").read_bytes()
 

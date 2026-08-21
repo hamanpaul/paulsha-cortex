@@ -141,12 +141,14 @@ def readable_codex_home(
     try:
         if candidate.is_symlink() or not candidate.is_dir():
             raise SpoolSlotError("shape", f"canonical control is malformed: {candidate}")
-        next(os.scandir(candidate), None)
+        with os.scandir(candidate) as entries:
+            next(entries, None)
         for dirname in ("plugins", "skills"):
             child = candidate / dirname
             if child.is_symlink() or not child.is_dir():
                 raise SpoolSlotError("shape", f"canonical control is malformed: {child}")
-            next(os.scandir(child), None)
+            with os.scandir(child) as entries:
+                next(entries, None)
         filenames = ["config.toml", "hooks.json"]
         if require_auth:
             filenames.append("auth.json")
@@ -327,59 +329,69 @@ def provision_runtime_surfaces(
     """Provision runtime rows by enumerating the canonical registry.
 
     Parent default ACLs installed by permgen grant only the row principal access.
+    Codex rows also need an explicit readable+writable runtime projection; the
+    remaining write-only rows intentionally keep their deployment-installed ACLs
+    until their specialized consumer resets or pre-seeds payloads.
     Control leaves are created before the unit starts and are additionally bind
     mounted read-only by the generated unit; auth.json intentionally remains a
     writable runtime leaf.
     """
     provisioned: list[Path] = []
     for row in PER_JOB_WRITABLE_SURFACES:
-        if principal not in row.principals or not row.surface_id.endswith(
-            ("-codex-home", "-runtime-cache")
-        ):
+        if principal not in row.principals:
             continue
         slot = canonical_job_slot(row.surface_id, job_id)
-        if slot.exists():
-            validate_job_slot_shape(slot)
-        else:
-            create_slot(slot, reset=False)
-        if row.surface_id.endswith("-codex-home"):
-            source = readable_codex_home(canonical_codex_home, require_auth=False)
-            for dirname in ("plugins", "skills"):
-                desired_dir = source / dirname
-                _copy_regular_tree(desired_dir, slot / dirname)
-            for filename in ("config.toml", "hooks.json"):
-                _copy_control_file(source / filename, slot / filename)
-                os.chmod(slot / filename, 0o644 if account is not None else 0o444)
-            if account is None:
-                # Direct unit tests and pre-ACL development projections have
-                # no named job principal yet; retain the old fail-closed
-                # read-only mode until the permission plan is applied.
-                for control in (slot / "plugins", slot / "skills"):
-                    for item in control.rglob("*"):
-                        os.chmod(item, 0o555 if item.is_dir() else 0o444)
-                    os.chmod(control, 0o555)
-            auth = slot / "auth.json"
-            if auth.is_symlink() or (auth.exists() and not auth.is_file()):
-                raise SpoolSlotError("shape", f"runtime credential is malformed: {auth}")
-            if not auth.exists():
-                desired_auth = credential_authority(principal)
-                if desired_auth.is_symlink() or not desired_auth.is_file():
-                    raise SpoolSlotError("credential", f"credential authority is unavailable: {desired_auth}")
-                temporary = auth.with_name(f".{auth.name}.seed.{os.getpid()}")
-                temporary.write_bytes(desired_auth.read_bytes())
-                os.replace(temporary, auth)
-                # Preserve the inherited named-user ACL mask. 0600 would mask
-                # the job principal out before Codex can refresh credentials.
-                auth.chmod(0o660)
-        if account is not None:
-            # The container remains Manager-only. Grant the resolved job account
-            # recursively on this concrete slot, never as a default ACL on root.
-            _apply_slot_acl(slot, account=account, writable=True, surface=row)
+        try:
+            if slot.exists():
+                validate_job_slot_shape(slot)
+            else:
+                create_slot(slot, reset=False)
             if row.surface_id.endswith("-codex-home"):
-                for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
-                    _apply_slot_acl(
-                        slot / leaf, account=account, writable=False, surface=row
-                    )
+                source = readable_codex_home(canonical_codex_home, require_auth=False)
+                for dirname in ("plugins", "skills"):
+                    desired_dir = source / dirname
+                    _copy_regular_tree(desired_dir, slot / dirname)
+                for filename in ("config.toml", "hooks.json"):
+                    _copy_control_file(source / filename, slot / filename)
+                    os.chmod(slot / filename, 0o644 if account is not None else 0o444)
+                if account is None:
+                    # Direct unit tests and pre-ACL development projections have
+                    # no named job principal yet; retain the old fail-closed
+                    # read-only mode until the permission plan is applied.
+                    for control in (slot / "plugins", slot / "skills"):
+                        for item in control.rglob("*"):
+                            os.chmod(item, 0o555 if item.is_dir() else 0o444)
+                        os.chmod(control, 0o555)
+                auth = slot / "auth.json"
+                if auth.is_symlink() or (auth.exists() and not auth.is_file()):
+                    raise SpoolSlotError("shape", f"runtime credential is malformed: {auth}")
+                if not auth.exists():
+                    desired_auth = credential_authority(principal)
+                    if desired_auth.is_symlink() or not desired_auth.is_file():
+                        raise SpoolSlotError("credential", f"credential authority is unavailable: {desired_auth}")
+                    temporary = auth.with_name(f".{auth.name}.seed.{os.getpid()}")
+                    temporary.write_bytes(desired_auth.read_bytes())
+                    os.replace(temporary, auth)
+                    # Preserve the inherited named-user ACL mask. 0600 would mask
+                    # the job principal out before Codex can refresh credentials.
+                    auth.chmod(0o660)
+            if account is not None and row.surface_id.endswith(
+                ("-codex-home", "-runtime-cache")
+            ):
+                # The container remains Manager-only. Grant the resolved job
+                # account recursively on the explicit runtime projection only;
+                # write-only rows keep the deployment ACL already installed on
+                # their typed root.
+                _apply_slot_acl(slot, account=account, writable=True, surface=row)
+                if row.surface_id.endswith("-codex-home"):
+                    for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
+                        _apply_slot_acl(
+                            slot / leaf, account=account, writable=False, surface=row
+                        )
+        except SpoolSlotError as exc:
+            raise SpoolSlotError(
+                exc.kind, f"writable surface {row.surface_id}: {slot}: {exc}"
+            ) from exc
         provisioned.append(slot)
     return tuple(provisioned)
 
