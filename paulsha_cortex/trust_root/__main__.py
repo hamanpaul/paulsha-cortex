@@ -180,6 +180,8 @@ env 只在本 CLI 這一層讀取——`permgen` 維持純函式（不讀 env、
 """
 from __future__ import annotations
 
+import shlex
+
 import json
 import os
 import sys
@@ -699,7 +701,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if is_directory:
                 print(f"install -d -o {owner} -g {group} -m {format(mode, '04o')} {path}")
             else:
-                print(f"install -D -o {owner} -g {group} -m {format(mode, '04o')} /dev/null {path}")
+                # First install creates a syntactically valid deployment asset;
+                # reruns preserve the operator's desired policy byte-for-byte.
+                content = permgen.DEFAULT_LAYOUT.codex_control_initial_content(path).rstrip("\n")
+                qpath = shlex.quote(path)
+                print(
+                    f"if [ ! -e {qpath} ]; then printf '%s\\n' {shlex.quote(content)} | "
+                    f"install -D -o {owner} -g {group} -m {format(mode, '04o')} "
+                    f"/dev/stdin {qpath}; fi"
+                )
+                print(f"chown {owner}:{group} {qpath}")
+                print(f"chmod {format(mode, '04o')} {qpath}")
         return 0
 
     print(f"unknown command: {command}", file=sys.stderr)

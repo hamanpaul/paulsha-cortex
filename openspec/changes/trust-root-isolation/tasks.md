@@ -16,5 +16,10 @@
 ## Task 3: Make Codex control inputs immutable without breaking refresh
 
 - [ ] Add immutable-control smoke coverage for config, plugins, skills, and hooks while preserving auth refresh.
-- [x] Generate root-owned scaffold entries for config, plugins, skills, and hooks for every Codex-capable job account.
+- [x] Generate root-owned, idempotent scaffold assets for config, plugins, skills, and hooks without truncating deployed desired content on rerun.
 - [x] Pass `--ignore-user-config` on every `codex exec` lane and update the byte-pinned argv regression tests.
+
+## Task 4: Bind event production to isolated slots
+
+- [x] Bind the production hook default and `--spool-root` CLI path to authoritative `PSC_JOB_ID`, and make the monitor harvest one-level job slots without following symlinks.
+- [ ] Run the live two-job persistence, normal Codex start, auth-refresh write, and generated-vs-installed probes under deployed hardening.

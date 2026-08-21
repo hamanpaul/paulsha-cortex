@@ -53,7 +53,7 @@ def _events(root: Path) -> list[dict[str, object]]:
         return []
     return [
         json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(root.glob("*.json"))
+        for path in sorted(root.rglob("*.json"))
     ]
 
 
@@ -728,9 +728,12 @@ def test_end_to_end_from_launcher_injection_to_a_consumable_event(
         [*shlex.split(hook_command.split("||")[0])[2:], "--spool-root", str(root)]
     ) == 0
 
+    owned = EventSpool(root, job_id="job-e2e")
     scan = EventSpool(root).scan()
     assert [(hint.repo, hint.kind, hint.number) for hint in scan.hints] == [
         ("acme/demo", "github_issue", 314)
     ]
     assert scan.hints[0].event.job_id == "job-e2e"
+    assert scan.hints[0].path.parent == owned.root
+    assert not tuple(root.glob("*.json"))
     assert scan.quarantined == ()

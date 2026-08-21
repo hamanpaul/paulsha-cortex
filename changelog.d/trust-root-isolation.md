@@ -11,3 +11,7 @@
   command also creates root-owned Codex config/plugins/skills/hooks control inputs.
 - Bound every slot basename to the same digest-bearing instance key used by systemd
   `%i`; harvest now selects the slot only from Manager registry `job_id`.
+- Bound the real headless-hook call-site and its CLI override to that authoritative
+  event slot, while the monitor safely harvests the one-level slot layout.
+- Made Codex control-file scaffold installation create-only and content-preserving;
+  repeated installs no longer truncate deployed `config.toml` or `hooks.json`.

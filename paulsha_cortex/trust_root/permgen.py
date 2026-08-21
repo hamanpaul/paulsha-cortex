@@ -3670,6 +3670,15 @@ class PathLayout:
             ))
         return tuple(rows)
 
+    @staticmethod
+    def codex_control_initial_content(path: str) -> str:
+        """Valid first-install content; existing deployed policy is never replaced."""
+        if path.endswith("/hooks.json"):
+            return "{}\n"
+        if path.endswith("/config.toml"):
+            return "# deployment-owned Codex configuration\n"
+        raise ValueError(f"not a Codex control file: {path}")
+
     # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
     def manager_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:
         # 註：job spec spool 曾經是這裡的一條 extra（`<agents_root>/jobs/<id>/run.sh`）。

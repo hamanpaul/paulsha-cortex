@@ -484,7 +484,10 @@ def emit_for_tool_use(
         if not refs:
             return ()
         fallback_repo: object = _UNRESOLVED
-        target = spool if spool is not None else EventSpool()
+        # The hook is a job-side producer.  Bind its default writer to the same
+        # Manager-authored identity that is carried in the event envelope; the
+        # unbound EventSpool is reserved for the monitor's shared-root reader.
+        target = spool if spool is not None else EventSpool(job_id=job_id)
         emitted: list[str] = []
         for ref in refs:
             repo = ref.repo
@@ -552,7 +555,12 @@ def main(argv: Sequence[str]) -> int:
         return 2
 
     payload = _read_stdin_payload(sys.stdin)
-    spool = EventSpool(args.spool_root) if args.spool_root else None
+    job_id = headless_job_id(os.environ)
+    spool = (
+        EventSpool(args.spool_root, job_id=job_id)
+        if args.spool_root and job_id is not None
+        else None
+    )
     emit_for_tool_use(payload, spool=spool)
     # stdout 一律空、exit code 一律 0：PostToolUse 的非零 exit 會讓 Claude Code
     # 把 stderr 回報成 hook 失敗（甚至回饋給模型），而這個 hook 對 job 本體

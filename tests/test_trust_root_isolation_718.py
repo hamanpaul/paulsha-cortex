@@ -8,6 +8,8 @@ They must remain failing until that table and its consumers are implemented.
 from __future__ import annotations
 
 import pytest
+import subprocess
+import sys
 
 from paulsha_cortex.coordinator import spool_slot
 from paulsha_cortex.coordinator import job_runner
@@ -91,6 +93,45 @@ def test_event_producer_uses_explicit_surface_root_once(tmp_path) -> None:
     assert spool.root.name == job_runner.template_instance_id(
         "wf-32bb2160d8-subagent-build-69"
     )
+
+
+def test_headless_hook_default_writer_uses_authoritative_job_slot(
+    tmp_path, monkeypatch
+) -> None:
+    from paulsha_cortex.monitor import event_spool
+    from paulsha_cortex.porcelain import headless_hook
+
+    root = tmp_path / "event-spool"
+    monkeypatch.setattr(event_spool, "monitor_event_spool_root", lambda: root)
+    job_id = "wf-32bb2160d8-subagent-build-69"
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": "gh issue comment 718 -R hamanpaul/paulsha-cortex"},
+    }
+    assert headless_hook.emit_for_tool_use(
+        payload, env={"PSC_JOB_ID": job_id}
+    ) == ("hamanpaul/paulsha-cortex#718",)
+    owned = spool_slot.canonical_job_slot(
+        "monitor-event-spool", job_id, writable_root=root
+    )
+    assert len(tuple(owned.glob("*.json"))) == 1
+    assert tuple(root.glob("*.json")) == ()
+
+
+def test_scaffold_rerun_never_truncates_deployed_codex_policy(tmp_path) -> None:
+    """The emitted installer must preserve desired config/hooks on every rerun."""
+    completed = subprocess.run(
+        [sys.executable, "-m", "paulsha_cortex.trust_root", "scaffold", "four-way"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    lines = completed.stdout.splitlines()
+    file_lines = [line for line in lines if "config.toml" in line or "hooks.json" in line]
+    assert file_lines
+    assert all("/dev/null" not in line for line in file_lines)
+    assert all("if [ ! -e " in line or line.startswith(("chown ", "chmod ")) for line in file_lines)
+    assert any("{}" in line and "hooks.json" in line for line in file_lines)
 
 
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
