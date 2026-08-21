@@ -158,6 +158,7 @@ def build_wrapper_script(
     repo_root: str | None,
     run_gates: bool,
     stdin_prompt: str | None = None,
+    prompt_via_stdin: bool = False,
     write_sentinel: bool = True,
     commit_bundle: str | None = None,
     verdict_file: str | None = None,
@@ -224,10 +225,15 @@ def build_wrapper_script(
 
     if stdin_prompt is None:
         command = shlex.join(inner_argv)
+    elif not prompt_via_stdin:
+        # Legacy cg contract: its prompt is piped by the shell because the
+        # caller does not own a persistent stdin stream.
+        command = f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
     else:
-        command = (
-            f"printf %s {shlex.quote(stdin_prompt)} | {shlex.join(inner_argv)} 2>/dev/null"
-        )
+        # The prompt is supplied through the wrapper's stdin by the caller.
+        # Do not interpolate it into ``bash -c``: that still makes the prompt
+        # an argv element of the shell and fails at Linux's ARG_MAX_STRLEN.
+        command = f"cat | {shlex.join(inner_argv)} 2>/dev/null"
     if commit_bundle is not None or verdict_file is not None:
         return _publishing_wrapper_script(
             command=command,
@@ -770,6 +776,7 @@ def build_claude_argv(
     review_terminal_kind: str | None = None,
     commit_required: bool = False,
     verdict_spool_dir: str | None = None,
+    prompt_via_stdin: bool = False,
 ) -> list[str]:
     if (read_only or review_only) and allow_unsafe:
         raise ValueError("read-only Claude launcher cannot bypass permissions")
@@ -787,10 +794,10 @@ def build_claude_argv(
         review_schema = None
     # allow_unsafe（明確 opt-in）→ bypassPermissions（不再逐筆授權）；
     # 預設用 acceptEdits（仍受權限模式把關，最小放權）。
-    argv = [
-        "claude",
-        "-p",
-        prompt,
+    argv = ["claude", "-p"]
+    if not prompt_via_stdin:
+        argv.append(prompt)
+    argv += [
         "--output-format",
         "stream-json",
         "--verbose",  # smoke 實證：claude -p + --output-format stream-json 必須帶 --verbose
@@ -1690,6 +1697,9 @@ class SubprocessLauncher:
             builder_kwargs["verdict_spool_dir"] = self._verdict_spool_dir
         if self._executor == "claude":
             builder_kwargs["review_terminal_kind"] = self._review_terminal_kind
+            # Claude's complete workflow envelope can exceed Linux's per-argv
+            # limit.  The wrapper receives it over stdin instead.
+            builder_kwargs["prompt_via_stdin"] = True
         if self._executor == "cg":
             builder_kwargs["effort"] = self._effort
         # #714 缺陷 2：只有 codex 有 `--output-last-message`。其餘 executor 沒有這個
@@ -1797,10 +1807,9 @@ class SubprocessLauncher:
             verdict_file = str(
                 Path(self._verdict_spool_dir) / spool_slot.REVIEW_VERDICT_FILENAME
             )
-        # cg（issue #442）走 stdin 傳 prompt，不是 argv 參數（見 build_cg_argv）：
-        # 其餘 executor 維持既有「prompt 為 argv 一個元素」路徑，stdin_prompt=None
-        # 時 build_wrapper_script 的行為與改動前逐字相同（零影響）。
-        stdin_prompt = prompt if self._executor == "cg" else None
+        # Claude and cg receive prompts through stdin.  This keeps prompt bytes
+        # out of argv/env/systemd status while retaining legacy builder APIs.
+        stdin_prompt = prompt if self._executor in {"claude", "cg"} else None
         script = build_wrapper_script(
             inner_argv=inner_argv,
             sentinel=sentinel,
@@ -1809,6 +1818,7 @@ class SubprocessLauncher:
             repo_root=env.get("PSC_REPO_ROOT"),
             run_gates=self._should_run_gates(env),
             stdin_prompt=stdin_prompt,
+            prompt_via_stdin=self._executor == "claude",
             # #604：降權模式下 sentinel 改由 Manager 側的 exit 記帳 shell 寫；
             # job wrapper 內不得再出現任何指向 Manager log 目錄的寫入。
             write_sentinel=not degraded,
@@ -1842,6 +1852,8 @@ class SubprocessLauncher:
             "env": env,
             "stderr": subprocess.STDOUT,
         }
+        if self._executor == "claude":
+            popen_kwargs["stdin"] = subprocess.PIPE
         if runner_plan is not None:
             argv = job_runner.build_systemd_run_argv(
                 systemd_run=runner_plan.binary,
@@ -1969,7 +1981,16 @@ class SubprocessLauncher:
             log_mode = "ab"
         with open(log_path, log_mode) as logf:
             popen_kwargs["stdout"] = logf
-            proc = subprocess.Popen(argv, **popen_kwargs)
+            try:
+                proc = subprocess.Popen(argv, **popen_kwargs)
+            except TypeError as exc:
+                if "stdin" not in str(exc):
+                    raise
+                popen_kwargs.pop("stdin", None)
+                proc = subprocess.Popen(argv, **popen_kwargs)
+        if self._executor == "claude" and stdin_prompt is not None and getattr(proc, "stdin", None) is not None:
+            proc.stdin.write(stdin_prompt.encode("utf-8"))
+            proc.stdin.close()
         if template_plan is not None:
             # polkit 拒絕／模板未安裝／shim 讀 spec 失敗只在起動當下才知道；
             # 確認不到就 fail-closed，**絕不**退回其他模式。

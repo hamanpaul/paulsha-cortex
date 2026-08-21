@@ -156,6 +156,32 @@ def test_canonical_authorities_are_registry_backed_deployment_assets() -> None:
     assert {"codex-control-root", "codex-credential-root"} <= registered
 
 
+def test_claude_workflow_prompt_is_not_an_argv_element() -> None:
+    """A real oversized workflow envelope must cross the launcher via stdin."""
+    from paulsha_cortex.coordinator.launcher import build_claude_argv, build_wrapper_script
+
+    prompt = "sentinel-prompt-" + ("x" * 140_000)
+    inner = build_claude_argv(
+        prompt=prompt,
+        prompt_via_stdin=True,
+        slice_id="job-a",
+        log_dir="/tmp/log",
+    )
+    assert prompt not in inner
+    script = build_wrapper_script(
+        inner_argv=inner,
+        stdin_prompt=prompt,
+        prompt_via_stdin=True,
+        sentinel="/tmp/exit",
+        ledger="/tmp/ledger",
+        worktree="/tmp/worktree",
+        repo_root=None,
+        run_gates=False,
+    )
+    assert "cat | claude -p" in script
+    assert prompt not in script
+
+
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
     with pytest.raises((ValueError, KeyError)):
         permgen.render_job_writable_properties(instance=None)  # type: ignore[arg-type]
