@@ -1584,7 +1584,7 @@ def _claim_action(
                     f"{authority.repo}#{number}"
                     for number in authority.mapped_issues
                 )
-                and run.openspec_refs == authority.mapped_openspec
+                and _openspec_refs_compatible(run, authority)
             ]
             if len(active) > 1:
                 raise RuntimeError("active workflow identity is ambiguous")
@@ -2656,6 +2656,46 @@ def _validate_abandon_evidence_target(
         raise RuntimeError(f"workflow {label} evidence conflict")
 
 
+def _planning_declared_openspec_changes(run) -> set[str]:
+    """run 的 define/plan 卡 outputs 宣告過的 openspec change 名。
+
+    #776：planning 卡把 ``openspec/changes/<name>/...`` 列在 outputs 裡即代表
+    該 change 是 run 自己的 planning 產物——它日後落地 authority checkout 屬於
+    「run 自產成果回寫」，不是外部 authority 變更。
+    """
+
+    declared: set[str] = set()
+    for step in getattr(run, "steps", ()):
+        if getattr(step, "phase", None) not in {"define", "plan"}:
+            continue
+        for output in getattr(step, "outputs", ()):
+            parts = str(output).split("/")
+            if len(parts) >= 3 and parts[0] == "openspec" and parts[1] == "changes":
+                declared.add(parts[2])
+    return declared
+
+
+def _openspec_refs_compatible(run, authority) -> bool:
+    """#776：resume 穩定識別的 openspec 比對。
+
+    全等視為相同 work（原行為）。authority 只「多出」refs 且多出的每一個都在
+    run 的 planning 卡 outputs 宣告過時，視為 run 自產 openspec change 落地
+    authority——run 沒有被外部重新定義，仍是同一份工作，交由 #216 AC5 分支以
+    authority-restart 收尾。authority 少了 run 已宣告的 ref、或多出非 run 自產
+    的 change，仍屬真正的 authority 變更，維持開新世代。
+    """
+
+    run_refs = tuple(getattr(run, "openspec_refs", ()) or ())
+    mapped = tuple(getattr(authority, "mapped_openspec", ()) or ())
+    if run_refs == mapped:
+        return True
+    run_set = set(run_refs)
+    mapped_set = set(mapped)
+    if not run_set <= mapped_set:
+        return False
+    return (mapped_set - run_set) <= _planning_declared_openspec_changes(run)
+
+
 def _write_supersede_evidence(
     body: dict[str, Any],
     *,
@@ -3100,6 +3140,116 @@ def _superseded_abandon_body(
     if raw != content or target.name != f"{run.run_id}-{digest}.json":
         raise RuntimeError("WorkflowRun was superseded by different authority")
     return body
+
+
+def _recover_superseded_action(
+    *,
+    args: dict[str, Any],
+    authority,
+    state_path: Path,
+    workflow_registry,
+) -> dict[str, Any]:
+    """#776：把被 resume 識別失誤 supersede 的已驗證 run 撿回。
+
+    只受理「有 candidate_head、pr_refs 非空、phase 停在 verify/review、同
+    (repo, work_id) 無 ongoing run、無 active job」的 superseded run——即
+    build 成果與 PR 都在、只是識別鏈斷裂被錯誤作廢的那種。動作＝status 復歸
+    ongoing 後立即走 official ``_manager_reset_workflow_for_authority_restart``
+    （#216 AC5 語意：verify/review 打回 pending、claim_key/source_revision 對齊
+    現 authority、build/candidate/PR 保留），不發明第三種恢復語意。
+    """
+
+    from .registry import ACTIVE_JOB_STATUSES
+
+    extras = set(args) - {
+        "action", "repo", "work_id", "actor", "expected_run_id", "reason",
+    }
+    if extras:
+        raise ValueError(
+            f"recover-superseded rejects caller evidence/input: {sorted(extras)[0]}"
+        )
+    expected_run_id = args.get("expected_run_id")
+    actor = args.get("actor")
+    reason = args.get("reason")
+    if (
+        not isinstance(expected_run_id, str)
+        or re.fullmatch(r"workflow-[0-9a-f]{20}", expected_run_id) is None
+    ):
+        raise ValueError("recover-superseded requires exact expected_run_id")
+    if (
+        not isinstance(actor, str)
+        or actor != actor.strip()
+        or not 1 <= len(actor) <= 128
+        or not actor.isprintable()
+    ):
+        raise ValueError("recover-superseded requires bounded actor")
+    if (
+        not isinstance(reason, str)
+        or reason != reason.strip()
+        or not 1 <= len(reason) <= 500
+        or not reason.isprintable()
+    ):
+        raise ValueError("recover-superseded requires bounded reason")
+    related = [
+        run
+        for run in workflow_registry.list_workflow_runs()
+        if run.repo == authority.repo and run.work_id == authority.work_id
+    ]
+    exact = [run for run in related if run.run_id == expected_run_id]
+    if len(exact) != 1:
+        raise RuntimeError("recover-superseded expected WorkflowRun CAS mismatch")
+    run = exact[0]
+    if run.status != "superseded":
+        raise RuntimeError("recover-superseded requires superseded run")
+    if not run.candidate_head or not run.pr_refs:
+        raise RuntimeError(
+            "recover-superseded requires delivered candidate (candidate_head + pr_refs)"
+        )
+    if run.current_phase not in {"verify", "review"}:
+        raise RuntimeError("recover-superseded requires verify/review phase run")
+    if any(item.status == "ongoing" for item in related):
+        raise RuntimeError("recover-superseded refuses while another run is ongoing")
+    if any(
+        job.get("workflow_run_id") == run.run_id
+        and job.get("status") in ACTIVE_JOB_STATUSES
+        for job in workflow_registry.list_jobs()
+    ):
+        raise RuntimeError("recover-superseded refuses active workflow job")
+    body = {
+        "schema": "cortex-work-recover-superseded/v1",
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "run_id": run.run_id,
+        "authority_digest": work_authority_digest(authority),
+        "actor": actor,
+        "reason": reason,
+    }
+    record = _write_supersede_evidence(
+        body,
+        state_path=state_path,
+        subdir="work-recover-superseded",
+        label="recover-superseded",
+    )
+    # 兩步走：先復歸 ongoing 並剝掉 supersede 迴圈附加的 blocked facet（保留
+    # needs_human facet＋理由，維持 `_resolve_needs_human_reason` 的 facet⟷理由
+    # invariant），再交給 official restart 一步清 needs_human 並打回 verify。
+    workflow_registry._manager_update_workflow_run(
+        run.run_id,
+        status="ongoing",
+        facets=tuple(facet for facet in run.facets if facet != "blocked"),
+    )
+    updated = workflow_registry._manager_reset_workflow_for_authority_restart(
+        run.run_id,
+        authority_digest=work_authority_digest(authority),
+    )
+    return {
+        "action": "recovered-superseded",
+        "actor": actor,
+        "reason": reason,
+        "expected_run_id": expected_run_id,
+        "evidence": record,
+        "run": updated.to_dict(),
+    }
 
 
 def _abandon_action(
@@ -5813,6 +5963,7 @@ def execute_work_action(
         "link", "unlink", "start", "resume", "retry-build", "retry-card",
         "retry-verify", "retry-review", "recover-planning", "recover-pre-candidate",
         "recover-repair-commit", "regenerate-gates", "abandon", "retire-delivered",
+        "recover-superseded",
         "reset-reclaim-budget", "refreeze-base", "auto", "ship", "review-attest",
         "intake",
     }:
@@ -5934,6 +6085,13 @@ def execute_work_action(
         )
     elif action == "abandon":
         result = _abandon_action(
+            args=args,
+            authority=authority,
+            state_path=resolved_state_path,
+            workflow_registry=workflow_registry,
+        )
+    elif action == "recover-superseded":
+        result = _recover_superseded_action(
             args=args,
             authority=authority,
             state_path=resolved_state_path,
