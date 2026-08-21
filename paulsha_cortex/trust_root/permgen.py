@@ -71,6 +71,7 @@ principal 時再犯同一個錯」——新 principal 只要沒進對應表，�
 from __future__ import annotations
 
 import re
+import shlex
 import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -2846,6 +2847,14 @@ class PathLayout:
         return f"{self.agents_root}/config/paulsha"
 
     @property
+    def codex_control_root(self) -> str:
+        return f"{self.agents_root}/config/codex-controls"
+
+    @property
+    def codex_credential_root(self) -> str:
+        return f"{self.agents_root}/config/codex-credentials"
+
+    @property
     def skill_registry_root(self) -> str:
         return f"{self.agents_root}/registry"
 
@@ -3444,6 +3453,8 @@ class PathLayout:
             "reviewer-job-codex-home-root": f"{a}/runtime/codex-home/reviewer",
             "builder-job-cache-root": f"{a}/runtime/job-cache/builder",
             "reviewer-job-cache-root": f"{a}/runtime/job-cache/reviewer",
+            "codex-control-root": self.codex_control_root,
+            "codex-credential-root": self.codex_credential_root,
             "project-config-tree": self.project_config_root,
             "coverage-shadow-telemetry": f"{c}/coverage-shadow",
             "monitor-state-tree": mon,
@@ -3648,6 +3659,10 @@ class PathLayout:
             (f"{self.agents_root}/config", root, g(root), 0o755),
             (f"{self.agents_root}/run", root, g(root), 0o755),
             (f"{self.agents_root}/runtime", root, g(root), 0o755),
+            # Canonical Codex authorities are real deployment surfaces.  Their
+            # principal leaves are populated by the installer, never by jobs.
+            (self.codex_control_root, root, g(root), 0o755),
+            (self.codex_credential_root, svc, g(svc), 0o700),
             # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
             (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
             (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
@@ -3668,18 +3683,10 @@ class PathLayout:
         may refresh ``auth.json`` and runtime state, but must not create or alter
         the control inputs that affect the next invocation.
         """
-        root = scheme.deploy_account
-        group = scheme.group_of(root)
-        rows: list[tuple[str, str, str, int, bool]] = []
-        for account in sorted(scheme.model_job_accounts()):
-            codex = Path(self.home_of(account)) / ".codex"
-            rows.extend((
-                (str(codex / "plugins"), root, group, 0o755, True),
-                (str(codex / "skills"), root, group, 0o755, True),
-                (str(codex / "config.toml"), root, group, 0o644, False),
-                (str(codex / "hooks.json"), root, group, 0o644, False),
-            ))
-        return tuple(rows)
+        # Legacy account HOME is an input to the one-time migration below, not
+        # an authority to manufacture. Creating empty/stub policy here would
+        # make a missing deployment look valid and silently discard controls.
+        return ()
 
     @staticmethod
     def codex_control_initial_content(path: str) -> str:
@@ -3689,6 +3696,41 @@ class PathLayout:
         if path.endswith("/config.toml"):
             return "# deployment-owned Codex configuration\n"
         raise ValueError(f"not a Codex control file: {path}")
+
+    def codex_authority_seed_commands(self, scheme: UidScheme) -> tuple[str, ...]:
+        """Idempotently migrate deployed Codex controls and credentials.
+
+        The command stream validates the legacy source before copying it and
+        never prints credential bytes. Existing authorities are preserved.
+        """
+        root = scheme.deploy_account
+        manager = scheme.durable_state_owner
+        rows: list[str] = []
+        for principal in (Principal.BUILDER, Principal.REVIEWER):
+            account = scheme.resolve(principal)
+            if account is None:
+                continue
+            source = f"{self.home_of(account)}/.codex"
+            controls = f"{self.codex_control_root}/{principal.value}"
+            credential = f"{self.codex_credential_root}/{principal.value}/auth.json"
+            qsrc, qctl, qcred = map(shlex.quote, (source, controls, credential))
+            rows.append(
+                f"if [ ! -e {qctl} ]; then "
+                f"test ! -L {qsrc} && test -d {qsrc} && "
+                f"test -f {qsrc}/config.toml && test ! -L {qsrc}/config.toml && "
+                f"test -d {qsrc}/plugins && test ! -L {qsrc}/plugins && "
+                f"test -d {qsrc}/skills && test ! -L {qsrc}/skills && "
+                f"test -f {qsrc}/hooks.json && test ! -L {qsrc}/hooks.json && "
+                f"cp -a {qsrc} {qctl}.new && rm -f {qctl}.new/auth.json && "
+                f"chown -R {root}:{scheme.group_of(root)} {qctl}.new && "
+                f"chmod -R a-w {qctl}.new && mv {qctl}.new {qctl}; fi"
+            )
+            rows.append(
+                f"if [ ! -e {qcred} ]; then test -f {qsrc}/auth.json && "
+                f"test ! -L {qsrc}/auth.json && install -D -o {manager} "
+                f"-g {scheme.group_of(manager)} -m 0600 {qsrc}/auth.json {qcred}; fi"
+            )
+        return tuple(rows)
 
     # -- 額外可寫路徑（非登記表資產，須附理由）------------------------------
     def manager_extra_write_paths(self, account: str) -> tuple[ExtraWritePath, ...]:

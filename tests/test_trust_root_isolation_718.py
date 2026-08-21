@@ -126,7 +126,7 @@ def test_headless_hook_default_writer_uses_authoritative_job_slot(
 
 
 def test_scaffold_rerun_never_truncates_deployed_codex_policy(tmp_path) -> None:
-    """The emitted installer must preserve desired config/hooks on every rerun."""
+    """Installer migrates real deployed bytes and never emits policy stubs."""
     completed = subprocess.run(
         [sys.executable, "-m", "paulsha_cortex.trust_root", "scaffold", "four-way"],
         check=True,
@@ -134,11 +134,23 @@ def test_scaffold_rerun_never_truncates_deployed_codex_policy(tmp_path) -> None:
         text=True,
     )
     lines = completed.stdout.splitlines()
-    file_lines = [line for line in lines if "config.toml" in line or "hooks.json" in line]
+    file_lines = [line for line in lines if "codex-controls" in line]
     assert file_lines
-    assert all("/dev/null" not in line for line in file_lines)
-    assert all("if [ ! -e " in line or line.startswith(("chown ", "chmod ")) for line in file_lines)
-    assert any("{}" in line and "hooks.json" in line for line in file_lines)
+    assert all("if [ ! -e " in line or line.startswith("install -d ") for line in file_lines)
+    assert not any("deployment-owned Codex configuration" in line for line in lines)
+    assert not any("printf" in line and "hooks.json" in line for line in lines)
+    assert any("cp -a" in line and "/.codex" in line for line in file_lines)
+    assert any("auth.json" in line and "install -D" in line for line in lines)
+
+
+def test_canonical_authorities_are_registry_backed_deployment_assets() -> None:
+    from paulsha_cortex.trust_root.registry import ASSET_REGISTRY
+
+    registered = {asset.asset_id for asset in ASSET_REGISTRY}
+    paths = permgen.DEFAULT_LAYOUT.asset_paths()
+    assert paths["codex-control-root"] == permgen.DEFAULT_LAYOUT.codex_control_root
+    assert paths["codex-credential-root"] == permgen.DEFAULT_LAYOUT.codex_credential_root
+    assert {"codex-control-root", "codex-credential-root"} <= registered
 
 
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:

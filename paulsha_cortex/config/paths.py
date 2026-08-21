@@ -40,6 +40,16 @@ def reviewer_job_cache_root() -> Path:
     return agents_root() / "runtime" / "job-cache" / "reviewer"
 
 
+def codex_control_root() -> Path:
+    """Deployment-owned canonical Codex policy projections."""
+    return agents_root() / "config" / "codex-controls"
+
+
+def codex_credential_root() -> Path:
+    """Manager-owned durable credential handoff authority."""
+    return agents_root() / "config" / "codex-credentials"
+
+
 def control_root() -> Path:
     return resolve_runtime_root("PSC_CONTROL_ROOT")
 

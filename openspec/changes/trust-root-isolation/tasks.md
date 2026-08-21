@@ -16,7 +16,7 @@
 ## Task 3: Make Codex control inputs immutable without breaking refresh
 
 - [x] Add source-level immutable-control and fail-closed canonical projection coverage for config, plugins, skills, and hooks; add the Manager-owned auth seed/atomic-commit contract for sequential jobs.
-- [x] Generate root-owned, idempotent scaffold assets for config, plugins, skills, and hooks without truncating deployed desired content on rerun.
+- [x] Register deployment-owned control and Manager-owned credential authorities, migrate both roles' deployed bytes without stubs or overwrite on rerun, and harvest builder/reviewer refreshes on terminal paths.
 - [x] Pass `--ignore-user-config` on every `codex exec` lane and update the byte-pinned argv regression tests.
 
 ## Task 4: Bind event production to isolated slots

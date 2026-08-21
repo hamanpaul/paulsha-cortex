@@ -114,9 +114,11 @@ def canonical_codex_controls(
     """
     env = os.environ if manager_env is None else manager_env
     configured = str(env.get("PSC_CODEX_CONTROL_ROOT", "")).strip()
-    root = Path(configured) if configured else Path(os.environ.get(
-        "PSC_AGENTS_ROOT", "/var/lib/cortex"
-    )) / "config" / "codex-controls"
+    if configured:
+        root = Path(configured)
+    else:
+        from ..config import paths
+        root = paths.codex_control_root()
     candidate = root / principal
     readable_codex_home(candidate, require_auth=False)
     return candidate
@@ -155,7 +157,7 @@ def readable_codex_home(
 def credential_authority(principal: str) -> Path:
     from ..config import paths
     configured = os.environ.get("PSC_CODEX_CREDENTIAL_ROOT", "").strip()
-    root = Path(configured) if configured else paths.agents_root() / "config" / "codex-credentials"
+    root = Path(configured) if configured else paths.codex_credential_root()
     return root / principal / "auth.json"
 
 

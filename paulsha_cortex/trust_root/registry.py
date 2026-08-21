@@ -1594,6 +1594,22 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         note="Manager-provisioned per-job runtime cache container for reviewer/planner jobs.",
     ),
     TrustRootAsset(
+        "codex-control-root", _T0, _MO,
+        "paulsha_cortex.config.paths:codex_control_root",
+        (Principal.INSTALLER,),
+        (Principal.MANAGER, Principal.BUILDER, Principal.REVIEWER, Principal.PLANNER),
+        IngressKind.MANAGER_INTERNAL,
+        note="Deployment-owned canonical config/plugins/skills/hooks projection; jobs cannot mutate it.",
+    ),
+    TrustRootAsset(
+        "codex-credential-root", _T0, _MO,
+        "paulsha_cortex.config.paths:codex_credential_root",
+        (Principal.MANAGER,),
+        (Principal.MANAGER,),
+        IngressKind.MANAGER_INTERNAL,
+        note="Manager-owned auth seed/harvest authority; credentials are never exposed by setup output.",
+    ),
+    TrustRootAsset(
         "project-config-tree", _T0, _MO, "paulsha_cortex.config.paths:project_config_root",
         (Principal.OPERATOR, Principal.ANY_SAME_UID),
         (Principal.MANAGER,),

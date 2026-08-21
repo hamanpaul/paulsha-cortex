@@ -19,3 +19,4 @@
   event slot, while the monitor safely harvests the one-level slot layout.
 - Made Codex control-file scaffold installation create-only and content-preserving;
   repeated installs no longer truncate deployed `config.toml` or `hooks.json`.
+# Repair: register canonical Codex control/credential authorities as deployment assets, migrate both roles' existing bytes without stubs, and harvest refreshes after builder and reviewer terminal paths.

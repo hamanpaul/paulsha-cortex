@@ -712,6 +712,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 print(f"chown {owner}:{group} {qpath}")
                 print(f"chmod {format(mode, '04o')} {qpath}")
+        for line in permgen.DEFAULT_LAYOUT.codex_authority_seed_commands(scheme):
+            print(line)
         return 0
 
     print(f"unknown command: {command}", file=sys.stderr)

@@ -234,6 +234,24 @@ class Dispatcher:
     def _finalize_headless(
         self, job_id: str, exit_code: int, log_path: str | None
     ) -> dict[str, object]:
+        job = self._registry.get_job(job_id)
+        # A downgraded Codex job publishes auth.json with a readable ACL/mode
+        # before its Manager-authored exit sentinel.  Harvest on every terminal
+        # outcome (including provider failure), so refresh is never silently
+        # discarded. Direct-mode jobs have no isolated runtime slot.
+        from . import spool_slot
+        principal = "reviewer" if job.get("kind") == "review" else "builder"
+        runtime_slot = spool_slot.canonical_job_slot(
+            f"{principal}-codex-home", job_id
+        )
+        if runtime_slot.exists():
+            try:
+                spool_slot.commit_runtime_credential(
+                    principal=principal, job_id=job_id
+                )
+            except (OSError, spool_slot.SpoolSlotError) as exc:
+                exit_code = 1
+                log_path = log_path
         last_jsonl_line = _last_nonempty_line(log_path)
         status = classify_completion(exit_code=exit_code, last_jsonl_line=last_jsonl_line)
         # #384：只在真的失敗時才分類——分類器本身也會拒絕 exit_code == 0

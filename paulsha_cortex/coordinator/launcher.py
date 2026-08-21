@@ -1815,6 +1815,19 @@ class SubprocessLauncher:
             commit_bundle=commit_bundle,
             verdict_file=verdict_file,
         )
+        if degraded and self._executor == "codex":
+            # Codex refreshes by temp+rename under UMask=0077.  Widen only the
+            # credential file's ACL mask after Codex exits; the Manager-owned
+            # slot remains non-traversable to every foreign principal.
+            terminal = f'; exit "${_RC_VAR}"'
+            publish = (
+                'if [ -f "$CODEX_HOME/auth.json" ]; then '
+                'chmod 0640 "$CODEX_HOME/auth.json" || exit 78; fi'
+            )
+            if script.endswith(terminal):
+                script = script[: -len(terminal)] + f"; {publish}" + terminal
+            else:
+                script = f'{script}; {_RC_VAR}=$?; {publish}' + terminal
         # Reviewer 不使用 login shell，避免 ~/.profile 等在最小 env 建立後重新匯入 secrets。
         # 降權模式的 builder 同理（#588 第 2 點）：login shell 會在 transient unit 的
         # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
