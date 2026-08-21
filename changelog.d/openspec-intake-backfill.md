@@ -1,0 +1,1 @@
+回寫 `fix-read-repo-tier-fail-closed` 的 openspec change 至 main（#765 intake 側缺口的 operator 回寫）：monitor 只掃 main 樹，change 僅存在 candidate 分支導致 authority `mapped_openspec` 恆空、ship 卡 `multiple-delivery-targets-unsupported`。檔案與 candidate（PR #764）byte-identical，merge 不衝突。

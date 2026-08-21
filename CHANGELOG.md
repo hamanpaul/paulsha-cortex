@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#765（intake 回寫）：`fix-read-repo-tier-fail-closed` openspec change 回寫 main**——monitor 只掃 main，change 僅在 candidate 導致 `mapped_openspec` 恆空、ship 卡 target 計數；檔案與 PR #764 byte-identical。
 - **#765 補遺：review 對 builder job 的綁定改跨 era（#216 AC5 落實）**——build 產物不再因 authority 前進成孤兒。
 - **#765 補遺：registry reset evidence 守衛以 claim era 定錨。**
 - **#765 補遺：dispatch reuse／retry 判定走同 era `reusable` 子集**（第五個出口，binding 必炸的真正回傳點）。
