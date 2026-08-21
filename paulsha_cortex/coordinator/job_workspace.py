@@ -144,6 +144,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 #: spool 的 per-job 目錄名（與 `coordinator/review.py` 的 `SAFE_SPOOL_KEY_RE` 同形）。
 #: 這個字串會成為 Manager-owned 樹裡的一個目錄名，形狀守衛不得放寬。
 _SPOOL_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_TEMPLATE_INSTANCE_UNSET = object()
 
 
 #: per-job **具名片段**允許的字元。systemd unit 的 instance 名本身還允許更多
@@ -602,15 +603,13 @@ def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     job 還沒取得 registry identity 時回 None——沒有可採信的 spool authority。
     """
 
-    if "template_instance" in job:
-        template_instance = job.get("template_instance")
-        if template_instance is None:
-            if job.get("runtime_mode") == "systemd-template":
-                return None
-        elif isinstance(template_instance, str) and job_segment_valid(template_instance):
-            return template_instance
-        else:
-            return None
+    template_instance = _template_instance_for_job(job)
+    if template_instance is _TEMPLATE_INSTANCE_UNSET:
+        pass
+    elif template_instance is None:
+        return None
+    else:
+        return template_instance
 
     job_id = job.get("job_id")
     if not isinstance(job_id, str) or not job_id.strip():
@@ -620,6 +619,19 @@ def spool_key_for_job(job: Mapping[str, object]) -> str | None:
     return job_id
 
 
+def _template_instance_for_job(job: Mapping[str, object]) -> str | None | object:
+    if "template_instance" not in job:
+        return _TEMPLATE_INSTANCE_UNSET
+    template_instance = job.get("template_instance")
+    if template_instance is None:
+        if job.get("runtime_mode") == "systemd-template":
+            return None
+        return _TEMPLATE_INSTANCE_UNSET
+    if isinstance(template_instance, str) and job_segment_valid(template_instance):
+        return template_instance
+    return None
+
+
 def commit_bundle_path_for_job(
     job: Mapping[str, object],
     *,
@@ -627,6 +639,18 @@ def commit_bundle_path_for_job(
 ) -> Path | None:
     """該 job 的 bundle 路徑；推導不出 spool key 時回 None。"""
 
+    template_instance = _template_instance_for_job(job)
+    if template_instance is _TEMPLATE_INSTANCE_UNSET:
+        pass
+    elif template_instance is None:
+        return None
+    else:
+        return (
+            spool_slot.exact_job_slot(
+                "commit-spool", template_instance, coordinator_root=coordinator_root
+            )
+            / COMMIT_BUNDLE_FILENAME
+        )
     key = spool_key_for_job(job)
     if key is None:
         return None

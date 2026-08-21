@@ -154,27 +154,53 @@ class RuntimeInstanceAuthorityTests(unittest.TestCase):
             raw_slice_id = "phase2-plan-manager-gitconfig-763"
             job_id = f"{raw_slice_id}-132"
             instance = job_runner.template_instance_id(raw_slice_id)
-            foreign_instance = job_runner.template_instance_id(f"{raw_slice_id}-foreign")
+            self.assertEqual(instance, "phase2-plan-manager-gitconfig-763-50f62414")
 
             repo = _source_repo(tmp_path)
             base = _git(repo, "rev-parse", "main")
             workspace = _workspace(repo, tmp_path / "pool")
             coordinator_root = tmp_path / "coordinator"
+            job = {
+                "job_id": job_id,
+                "task": "bundle-623",
+                "branch": _BRANCH,
+                "worktree": str(tmp_path / "pool" / job_id),
+                "session_name": raw_slice_id,
+                "log_path": str(tmp_path / "logs" / f"{job_id}.jsonl"),
+                "runtime_mode": "systemd-template",
+                "template_instance": instance,
+            }
 
             bundle = job_workspace.prepare_commit_spool(
-                spool_key=instance, coordinator_root=coordinator_root
+                spool_key=raw_slice_id, coordinator_root=coordinator_root
             )
+            expected_bundle = job_workspace.commit_bundle_path_for_job(
+                job, coordinator_root=coordinator_root
+            )
+            self.assertEqual(expected_bundle, bundle)
             candidate = _builder_commit(workspace)
             bundle_result = _run_bundle_step(workspace, bundle)
             self.assertEqual(bundle_result.returncode, 0, bundle_result.stderr)
 
-            foreign_bundle = job_workspace.prepare_commit_spool(
-                spool_key=foreign_instance, coordinator_root=coordinator_root
+            sibling_bundle = job_workspace.prepare_commit_spool(
+                spool_key=instance, coordinator_root=coordinator_root
+            )
+            self.assertEqual(
+                sibling_bundle.parent.name,
+                "phase2-plan-manager-gitconfig-763-50f62414-61200d73",
             )
             foreign_candidate = _builder_commit(workspace, name="foreign.txt")
-            foreign_result = _run_bundle_step(workspace, foreign_bundle)
+            foreign_result = _run_bundle_step(workspace, sibling_bundle)
             self.assertEqual(foreign_result.returncode, 0, foreign_result.stderr)
             self.assertNotEqual(candidate, foreign_candidate)
+            self.assertFalse(sibling_bundle.parent.samefile(bundle.parent))
+            self.assertNotEqual(bundle, sibling_bundle)
+            self.assertEqual(bundle.parent.name, instance)
+            self.assertFalse(
+                job_workspace.commit_bundle_path(
+                    spool_key=job_id, coordinator_root=coordinator_root
+                ).exists()
+            )
 
             result = verification.run_result_verification(
                 slice_row={
@@ -182,16 +208,7 @@ class RuntimeInstanceAuthorityTests(unittest.TestCase):
                     "dispatch_base": base,
                     "verification": {"contract": _trivial_contract()},
                 },
-                job={
-                    "job_id": job_id,
-                    "task": "bundle-623",
-                    "branch": _BRANCH,
-                    "worktree": str(tmp_path / "pool" / job_id),
-                    "session_name": raw_slice_id,
-                    "log_path": str(tmp_path / "logs" / f"{job_id}.jsonl"),
-                    "runtime_mode": "systemd-template",
-                    "template_instance": instance,
-                },
+                job=job,
                 repo_root=repo,
                 coordinator_root=coordinator_root,
             )
@@ -201,3 +218,8 @@ class RuntimeInstanceAuthorityTests(unittest.TestCase):
             harvested = _git(repo, "rev-parse", f"refs/heads/{_BRANCH}")
             self.assertEqual(harvested, candidate)
             self.assertNotEqual(harvested, foreign_candidate)
+            self.assertFalse(
+                job_workspace.commit_bundle_path(
+                    spool_key=instance, coordinator_root=coordinator_root
+                ).samefile(bundle)
+            )

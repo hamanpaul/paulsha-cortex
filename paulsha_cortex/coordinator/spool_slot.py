@@ -518,28 +518,15 @@ def _lexical_root(path: str | Path) -> Path:
     return root
 
 
-def canonical_job_slot(
+def _surface_root(
     surface_id: str,
-    job_id: str,
     *,
     coordinator_root: str | Path | None = None,
     writable_root: str | Path | None = None,
 ) -> Path:
-    """Return the Manager-selected instance slot for one registered surface.
-
-    This is deliberately the only generic path join for per-job writable roots;
-    callers must provide the registry identity, never payload text.
-    """
     surface = writable_surface(surface_id)
     if coordinator_root is not None and writable_root is not None:
         raise ValueError("coordinator_root and writable_root are mutually exclusive")
-    if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
-        raise ValueError(f"unsafe job identity: {job_id!r}")
-    from ..config import paths
-    from .job_workspace import job_segment
-
-    instance = job_segment(job_id)
-
     if writable_root is not None:
         root = Path(writable_root)
     elif coordinator_root is None:
@@ -548,7 +535,50 @@ def canonical_job_slot(
         root = Path(coordinator_root)
     else:
         root = Path(coordinator_root) / surface.coordinator_relative
-    return _lexical_root(root) / instance
+    return _lexical_root(root)
+
+
+def exact_job_slot(
+    surface_id: str,
+    instance: str,
+    *,
+    coordinator_root: str | Path | None = None,
+    writable_root: str | Path | None = None,
+) -> Path:
+    """Join one registered surface to an already-issued systemd template instance."""
+
+    from .job_workspace import job_segment_valid
+
+    if not isinstance(instance, str) or not job_segment_valid(instance):
+        raise ValueError(f"unsafe template instance: {instance!r}")
+    return _surface_root(
+        surface_id, coordinator_root=coordinator_root, writable_root=writable_root
+    ) / instance
+
+
+def canonical_job_slot(
+    surface_id: str,
+    job_id: str,
+    *,
+    coordinator_root: str | Path | None = None,
+    writable_root: str | Path | None = None,
+) -> Path:
+    """Derive the Manager-selected instance slot from a raw registry identity.
+
+    This is deliberately the only generic path join for per-job writable roots;
+    callers must provide the registry identity, never payload text.
+    """
+    if not isinstance(job_id, str) or _JOB_ID_RE.fullmatch(job_id) is None:
+        raise ValueError(f"unsafe job identity: {job_id!r}")
+    from .job_workspace import job_segment
+
+    instance = job_segment(job_id)
+    return exact_job_slot(
+        surface_id,
+        instance,
+        coordinator_root=coordinator_root,
+        writable_root=writable_root,
+    )
 
 
 def validate_job_slot_shape(slot: str | Path, *, allow_symlink: bool = False) -> Path:
@@ -813,6 +843,7 @@ def _chmod_regular_file(path: str | Path, mode: int) -> bool:
 __all__ = [
     "ACCESS_ACL_XATTR",
     "COMMIT_BUNDLE_FILENAME",
+    "exact_job_slot",
     "JOB_LOG_FILE_MODE",
     "PUBLISHED_FILE_MODE",
     "REVIEW_VERDICT_FILENAME",

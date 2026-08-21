@@ -142,7 +142,7 @@ def gate_ledger_spool_dir(
     """單一 job 的 gate spool 目錄（唯一定址點）。"""
 
     _validate_spool_key(spool_key)
-    return spool_slot.canonical_job_slot(
+    return spool_slot.exact_job_slot(
         "gate-ledger-spool", spool_key, coordinator_root=coordinator_root
     )
 
@@ -213,12 +213,7 @@ def gate_worktree_dir(
     """gate 的拋棄式副本落點（登記表資產 `gate-worktree-pool` 底下一格）。"""
 
     _validate_spool_key(spool_key)
-    root = (
-        paths.gate_worktree_root()
-        if gate_worktree_root is None
-        else Path(gate_worktree_root)
-    )
-    return spool_slot.canonical_job_slot(
+    return spool_slot.exact_job_slot(
         "gate-worktree", spool_key, coordinator_root=gate_worktree_root
     )
 
