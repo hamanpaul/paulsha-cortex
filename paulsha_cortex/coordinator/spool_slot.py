@@ -190,9 +190,15 @@ def publish_runtime_credential_command(
         raise ValueError(f"unsafe manager account: {manager_account!r}")
     auth = f'{codex_home}/auth.json' if codex_home == "$CODEX_HOME" else str(Path(codex_home) / "auth.json")
     quoted = '"$CODEX_HOME/auth.json"' if codex_home == "$CODEX_HOME" else shlex.quote(auth)
+    # A seed copied in by Manager is deliberately left untouched: the job UID
+    # cannot chmod/setfacl that inode and an unchanged login must not turn a
+    # successful unit into an ExecStopPost failure.  An atomic refresh replaces
+    # it with a job-owned inode, for which the producer is the only authority
+    # permitted to widen the ACL mask for Manager harvest.
     return (
-        f"test -f {quoted} && chmod 0640 {quoted} && "
-        f"setfacl -m u:{manager_account}:r--,m::r-- {quoted}"
+        f"if test -f {quoted} && test -O {quoted}; then "
+        f"chmod 0640 {quoted} && "
+        f"setfacl -m u:{manager_account}:r--,m::r-- {quoted}; fi"
     )
 
 

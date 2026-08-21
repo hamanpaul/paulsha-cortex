@@ -85,6 +85,7 @@ from . import registry
 from ..coordinator.spool_slot import (
     PER_JOB_WRITABLE_SURFACES,
     PerJobWritableSurface,
+    publish_runtime_credential_command,
     writable_surface,
 )
 
@@ -3732,8 +3733,8 @@ class PathLayout:
                 f"trap 'rm -rf -- \"$tmp\"' EXIT HUP INT TERM && "
                 f"install -m 0644 {qsrc}/config.toml \"$tmp/config.toml\" && "
                 f"install -m 0644 {qsrc}/hooks.json \"$tmp/hooks.json\" && "
-                f"cp -a {qsrc}/plugins \"$tmp/plugins\" && "
-                f"cp -a {qsrc}/skills \"$tmp/skills\" && "
+                f"cp -R --no-preserve=all {qsrc}/plugins \"$tmp/plugins\" && "
+                f"cp -R --no-preserve=all {qsrc}/skills \"$tmp/skills\" && "
                 f"chown -R {root}:{scheme.group_of(root)} \"$tmp\" && "
                 f"find \"$tmp\" -type d -exec chmod 0755 {{}} + && "
                 f"find \"$tmp\" -type f -exec chmod 0644 {{}} + && "
@@ -7173,9 +7174,11 @@ def build_job_unit(
             [
                 "# Publish an atomic auth refresh after every terminal path. The named",
                 "# Manager ACL is required because job and Manager have no shared group.",
-                "ExecStopPost=/bin/sh -c 'if test -f \"$${CODEX_HOME}/auth.json\"; then "
-                f"chmod 0640 \"$${{CODEX_HOME}}/auth.json\" && setfacl -m "
-                f"u:{scheme.durable_state_owner}:r--,m::r-- \"$${{CODEX_HOME}}/auth.json\"; fi'",
+                "ExecStopPost=/bin/sh -c '"
+                + publish_runtime_credential_command(
+                    manager_account=scheme.durable_state_owner
+                ).replace('"$CODEX_HOME/auth.json"', '"$${CODEX_HOME}/auth.json"')
+                + "'",
             ]
             if principal in (Principal.BUILDER, Principal.REVIEWER)
             else []

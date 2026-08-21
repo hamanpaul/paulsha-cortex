@@ -1815,8 +1815,12 @@ class SubprocessLauncher:
             commit_bundle=commit_bundle,
             verdict_file=verdict_file,
         )
-        if degraded and self._executor == "codex":
-            # Codex refreshes by temp+rename under UMask=0077.  Widen only the
+        if runner_plan is not None and self._executor == "codex":
+            # Transient units have no generated ExecStopPost. Codex refreshes
+            # by temp+rename under UMask=0077, so run the same canonical
+            # publisher used by template units. Template mode must not run a
+            # second publisher in this wrapper.
+            # Widen only the
             # credential file's ACL mask after Codex exits; the Manager-owned
             # slot remains non-traversable to every foreign principal.
             terminal = f'; exit "${_RC_VAR}"'

@@ -139,7 +139,10 @@ def test_scaffold_rerun_never_truncates_deployed_codex_policy(tmp_path) -> None:
     assert all("if [ ! -e " in line or line.startswith("install -d ") for line in file_lines)
     assert not any("deployment-owned Codex configuration" in line for line in lines)
     assert not any("printf" in line and "hooks.json" in line for line in lines)
-    assert any("cp -a" in line and "/.codex" in line for line in file_lines)
+    assert any(
+        "cp -R --no-preserve=all" in line and "/.codex" in line
+        for line in file_lines
+    )
     assert any("auth.json" in line and "install -D" in line for line in lines)
 
 
@@ -342,3 +345,14 @@ def test_auth_publish_command_uses_named_manager_acl_not_shared_group() -> None:
     )
     assert "chmod 0640" in command
     assert "setfacl -m u:cortex-manager:r--,m::r--" in command
+    assert "test -O" in command
+
+
+def test_template_uses_the_canonical_owner_aware_auth_publisher() -> None:
+    command = spool_slot.publish_runtime_credential_command(
+        manager_account=permgen.FOUR_WAY_SCHEME.durable_state_owner
+    ).replace('"$CODEX_HOME/auth.json"', '"$${CODEX_HOME}/auth.json"')
+    unit = permgen.build_job_unit(
+        permgen.FOUR_WAY_SCHEME, principal=permgen.Principal.BUILDER
+    )
+    assert f"ExecStopPost=/bin/sh -c '{command}'" in unit.content
