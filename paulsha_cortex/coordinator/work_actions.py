@@ -2665,13 +2665,23 @@ def _planning_declared_openspec_changes(run) -> set[str]:
     """
 
     declared: set[str] = set()
+    has_openspec_propose = False
     for step in getattr(run, "steps", ()):
         if getattr(step, "phase", None) not in {"define", "plan"}:
             continue
+        if getattr(step, "card", None) == "openspec-propose":
+            has_openspec_propose = True
         for output in getattr(step, "outputs", ()):
             parts = str(output).split("/")
             if len(parts) >= 3 and parts[0] == "openspec" and parts[1] == "changes":
                 declared.add(parts[2])
+    # 舊版 combo manifest 的 openspec-propose 卡 outputs 未列 openspec 路徑
+    # （實機 workflow-85114100：outputs 只有 spec/design）；有這張卡即代表 run
+    # 的 planning 會產出慣例名（= work_id）的 change，一樣屬 run 自產。
+    if has_openspec_propose:
+        work_id = getattr(run, "work_id", None)
+        if isinstance(work_id, str) and work_id:
+            declared.add(work_id)
     return declared
 
 

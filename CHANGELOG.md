@@ -6,6 +6,7 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+- **#776 補遺：舊 manifest 的 openspec-propose 卡視慣例名 change 為 run 自產**（85114100 二度被誤殺的根因）。
 - **#776 補遺：`recover-superseded` 補進 control contract 白名單**（驗證分支與 porcelain choices 同步）。
 - **#776（#765 第八處）：resume 穩定識別容忍 run 自產 openspec 落地 authority**——不再 supersede 已驗證 run；新增 `work recover-superseded` 撿回被誤作廢的 run（official authority-restart 語意）。
 - **#765（intake 回寫）：`fix-read-repo-tier-fail-closed` openspec change 回寫 main**——monitor 只掃 main，change 僅在 candidate 導致 `mapped_openspec` 恆空、ship 卡 target 計數；檔案與 PR #764 byte-identical。
