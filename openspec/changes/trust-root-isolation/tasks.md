@@ -15,7 +15,7 @@
 
 ## Task 3: Make Codex control inputs immutable without breaking refresh
 
-- [ ] Add immutable-control smoke coverage for config, plugins, skills, and hooks while preserving auth refresh.
+- [x] Add source-level immutable-control smoke coverage for config, plugins, skills, and hooks while preserving auth refresh; deployed Codex smoke remains below.
 - [x] Generate root-owned, idempotent scaffold assets for config, plugins, skills, and hooks without truncating deployed desired content on rerun.
 - [x] Pass `--ignore-user-config` on every `codex exec` lane and update the byte-pinned argv regression tests.
 

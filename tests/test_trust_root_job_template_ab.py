@@ -404,7 +404,7 @@ class SchemeDerivedHomeTests(unittest.TestCase):
         unit = permgen.build_job_unit(permgen.THREE_WAY_SCHEME, layout)
         self.assertIn("Environment=HOME=/var/lib/cortex-builder\n", unit.content)
         self.assertIn(
-            "Environment=XDG_CACHE_HOME=/var/lib/cortex-builder/cache\n", unit.content
+            "Environment=XDG_CACHE_HOME=/var/lib/cortex/runtime/job-cache/builder/%i\n", unit.content
         )
 
     def test_scaffold_covers_every_account_the_scheme_resolves(self) -> None:

@@ -211,6 +211,9 @@ def test_job_unit_read_write_paths_match_builder_writable_assets(scheme) -> None
     targets = required_write_targets(plan, job_layout, builder)
     assert targets
     for asset_id, target in targets.items():
+        if asset_id == "builder-codex-state":
+            assert not any(rwp == target for rwp in unit.read_write_paths)
+            continue
         assert any(
             _within(target, rwp) or rwp.startswith(target.rstrip("/") + "/")
             for rwp in unit.read_write_paths
@@ -222,7 +225,7 @@ def test_job_unit_read_write_paths_match_builder_writable_assets(scheme) -> None
         assert any(
             _within(t, rwp) or rwp.startswith(t.rstrip("/") + "/")
             for t in targets.values()
-        ) or rwp.endswith("/.codex/auth.json"), rwp
+        ) or "/runtime/codex-home/" in rwp or "/runtime/job-cache/" in rwp, rwp
 
 
 def test_read_write_paths_shift_when_registry_grows() -> None:

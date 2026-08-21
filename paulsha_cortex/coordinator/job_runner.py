@@ -954,12 +954,14 @@ BUILDER_FORWARDED_ENV: tuple[ForwardedEnvVar, ...] = (
 #:   `HOME`／`VIRTUAL_ENV`（早就在排除表上）是同一類錯誤：daemon 的 `PATH` 還帶著
 #:   `<deploy_root>/venv/bin`，等於把 job 的 `python3` 綁回 Manager 的 venv。
 BUILDER_SYNTHESIZED_ENV = (
+    "CODEX_HOME",
     "HOME",
     "PATH",
     "PSC_JOB_ID",
     "PSC_RELAY_TARGET",
     "PSC_REPO_ROOT",
     "PSC_SLICE_ID",
+    "XDG_CACHE_HOME",
 )
 
 #: 刻意**不**轉發、且值得記錄理由的項目（本身不是憑證，但轉發會出錯或擴大信任面）：
@@ -1356,6 +1358,19 @@ def build_job_env(
     home = (manager_env.get(config.home_env) or "").strip()
     if home:
         env["HOME"] = home
+    if config.role_id in (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW):
+        from ..config import paths
+        from .spool_slot import canonical_job_slot
+
+        principal_id = "reviewer" if config.role_id == JOB_ROLE_REVIEW else "builder"
+        env["CODEX_HOME"] = str(canonical_job_slot(
+            f"{principal_id}-codex-home", job_id,
+            writable_root=paths.agents_root() / "runtime" / "codex-home" / principal_id,
+        ))
+        env["XDG_CACHE_HOME"] = str(canonical_job_slot(
+            f"{principal_id}-runtime-cache", job_id,
+            writable_root=paths.agents_root() / "runtime" / "job-cache" / principal_id,
+        ))
     env["PSC_SLICE_ID"] = slice_id
     env["PSC_JOB_ID"] = job_id
     env["PSC_REPO_ROOT"] = repo_root

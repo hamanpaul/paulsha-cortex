@@ -302,7 +302,7 @@ def test_home_redirect_adds_no_writable_surface_to_the_reviewer_unit() -> None:
     unit = build_job_unit(FOUR_WAY_SCHEME, principal=Principal.REVIEWER)
     assert set(unit.read_write_paths) == set(permgen.job_surface_owners(
         principal=Principal.REVIEWER, instance="%i", layout=DEFAULT_LAYOUT
-    )) | {DEFAULT_LAYOUT.credential_token_path_of(PLANNER_ACCOUNT, "codex")}
+    ))
     for asset_id in PLANNER_SYMLINK_ASSETS:
         link = DEFAULT_LAYOUT.asset_paths()[asset_id]
         target = DEFAULT_LAYOUT.symlink_targets()[asset_id]
@@ -367,8 +367,9 @@ def test_the_builder_credential_now_shares_the_planner_shape() -> None:
         hooks = paths[f"{prefix}-codex-hooks"]
         assert tree == f"{DEFAULT_LAYOUT.home_of(account)}/.codex"
         assert tree not in unit.read_write_paths, (prefix, unit.read_write_paths)
-        assert DEFAULT_LAYOUT.credential_token_path_of(account, "codex") in unit.read_write_paths
-        assert hooks in unit.read_only_paths, (prefix, unit.read_only_paths)
+        codex_home = f"{DEFAULT_LAYOUT.agents_root}/runtime/codex-home/{principal.value}/%i"
+        assert codex_home in unit.read_write_paths
+        assert f"{codex_home}/hooks.json" in unit.read_only_paths, (prefix, unit.read_only_paths)
     # `IN_PLACE_CONTENT_WRITE_ASSETS` 的憑證那一半因此導出為空集（見該常數的說明）。
     assert not (set(permgen.credential_asset_ids()) & set(IN_PLACE_CONTENT_WRITE_ASSETS))
 
@@ -478,7 +479,7 @@ def test_the_u9_entry_is_closed_by_the_shape_change_not_by_deletion() -> None:
     assert "builder-codex-hooks" in asset_ids
     # 而且它真的進了那個帳號 unit 的 ReadOnlyPaths（不是只在登記表上好看）。
     unit = build_job_unit(FOUR_WAY_SCHEME, principal=Principal.REVIEWER)
-    assert DEFAULT_LAYOUT.asset_paths()["reviewer-planner-codex-hooks"] in unit.read_only_paths
+    assert f"{DEFAULT_LAYOUT.agents_root}/runtime/codex-home/reviewer/%i/hooks.json" in unit.read_only_paths
 
 
 def test_the_manager_credential_entry_disappeared_by_switching() -> None:

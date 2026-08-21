@@ -6,6 +6,8 @@
 本專案遵循 hamanpaul project policy v1.0.17。
 
 ## [Unreleased]
+
+- **#718 repair:** Codex-capable units now derive isolated per-job homes and caches from the writable-surface registry; reviewer units no longer receive the builder-only monitor event slot.
 - **#718 repair:** headless hook event writes now use the authoritative per-job
   slot (including `--spool-root`), monitor harvest covers isolated child slots,
   and repeated Codex control scaffold installs preserve deployed policy content.

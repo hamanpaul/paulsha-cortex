@@ -355,9 +355,9 @@ def test_job_template_unit_excludes_the_source_tree_but_keeps_its_own_clone(sche
     # #698：`~/.codex` 那一層**改由 DAC 守**（root-owned ＋ sticky），整棵必須進 RWP
     # 才能讓 codex 起得來。mount 層守的改成樹裡那個 enforcement 檔本身——它必須
     # 逐字出現在 `ReadOnlyPaths=` 上，否則本形狀比 #640 淨退一層。
-    hooks = job_layout.asset_paths()[f"{_prefix_of(unit.account)}-codex-hooks"]
+    hooks = f"{job_layout.agents_root}/runtime/codex-home/builder/%i/hooks.json"
     assert hooks in unit.read_only_paths, (hooks, unit.read_only_paths)
-    assert not any(_within(hooks, rwp) for rwp in unit.read_write_paths)
+    assert any(_within(hooks, rwp) for rwp in unit.read_write_paths)
 
 
 # ---------------------------------------------------------------------------

@@ -487,7 +487,7 @@ class ReviewerWritableSurfaceTests(unittest.TestCase):
     def test_rwp_is_exactly_the_mechanical_derivation(self) -> None:
         expected = set(permgen.job_surface_owners(
             principal=Principal.REVIEWER, instance="%i", layout=LAYOUT
-        )) | {LAYOUT.credential_token_path_of(REVIEW_ACCOUNT, "codex")}
+        ))
         self.assertEqual(self.rwp, expected)
         # 導出結果目前恰好是三條，逐條都有登記表或明示 extra 的來源。
         self.assertEqual(

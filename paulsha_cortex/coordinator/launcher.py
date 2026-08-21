@@ -1714,6 +1714,10 @@ class SubprocessLauncher:
             # gh token、daemon 的 CLAUDE_CONFIG_DIR 都不在白名單上，因此不會出現在
             # job 裡——包括 `_copilot_credential_env()` 也因此自然回傳空 dict（它讀的是
             # 這份 env，裡面沒有任何 token 候選），不必為降權模式另設特例。
+            spool_slot.provision_runtime_surfaces(
+                principal=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
+                job_id=slice_id,
+            )
             env = job_runner.build_job_env(
                 manager_env=os.environ,
                 job_id=slice_id,

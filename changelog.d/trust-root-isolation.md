@@ -1,5 +1,7 @@
 # #718 trust-root isolation
 
+- Repair Codex-capable jobs to use canonical per-job `CODEX_HOME` and cache slots, remove reviewer access to the builder-only event spool, and provision immutable control leaves without truncating refreshable `auth.json` state.
+
 - Added one canonical five-row per-job writable-surface table and projected it into
   slot derivation, rendered writable properties, and probe coverage.
 - Added fail-closed job identity and slot-shape validation, with producer paths for

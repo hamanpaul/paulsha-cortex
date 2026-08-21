@@ -81,7 +81,11 @@ from pathlib import Path
 from . import registry
 
 
-from ..coordinator.spool_slot import PER_JOB_WRITABLE_SURFACES, PerJobWritableSurface
+from ..coordinator.spool_slot import (
+    PER_JOB_WRITABLE_SURFACES,
+    PerJobWritableSurface,
+    writable_surface,
+)
 
 
 def render_job_writable_properties(
@@ -3727,6 +3731,10 @@ def _surface_root(row: PerJobWritableSurface, layout: PathLayout) -> str:
     if row.surface_id.endswith("-job-log"):
         principal = row.principals[0]
         return layout.job_log_spool_root(Principal(principal))
+    if row.surface_id.endswith("-codex-home"):
+        return f"{layout.agents_root}/runtime/codex-home/{row.principals[0]}"
+    if row.surface_id.endswith("-runtime-cache"):
+        return f"{layout.agents_root}/runtime/job-cache/{row.principals[0]}"
     accessor = getattr(layout, row.path_accessor, None)
     if accessor is None:
         raise ValueError(f"surface {row.surface_id!r} has no layout accessor")
@@ -7029,9 +7037,6 @@ def build_job_unit(
         if "%i" in path and not any(path == root for root in shared_roots)
     }
     owners.update(job_surface_owners(principal=principal, instance="%i", layout=layout))
-    if principal in (Principal.BUILDER, Principal.REVIEWER):
-        auth_path = job_layout.credential_token_path_of(account, "codex")
-        owners[auth_path] = ("codex-auth-refresh",)
     stem = job_unit_stem(layout, principal, profile)
     unit_name = f"{stem}@.service"
     profile_users = sorted(
@@ -7171,7 +7176,8 @@ def build_job_unit(
         "Environment=GH_TOKEN=",
         "Environment=GITHUB_TOKEN=",
         f"Environment=HOME={job_layout.home_of(account)}",
-        f"Environment=XDG_CACHE_HOME={job_layout.cache_of(account)}",
+        f"Environment=CODEX_HOME={_surface_slot(writable_surface(f'{principal.value}-codex-home'), '%i', layout=layout) if principal in (Principal.BUILDER, Principal.REVIEWER) else job_layout.home_of(account) + '/.codex'}",
+        f"Environment=XDG_CACHE_HOME={_surface_slot(writable_surface(f'{principal.value}-runtime-cache'), '%i', layout=layout) if principal in (Principal.BUILDER, Principal.REVIEWER) else job_layout.cache_of(account)}",
         "",
         f"# --- 加固（與 Manager 同一張 _HARDENING 表；剖面={profile.profile_id}）---",
         "# 兩份 job unit 共用這張表，只在下方以 ※ 標出的那一項分岔；",
@@ -7185,11 +7191,12 @@ def build_job_unit(
     body += [""]
     read_only = enforcement_read_only_paths(job_layout, account, tuple(owners.keys()))
     if principal in (Principal.BUILDER, Principal.REVIEWER):
+        codex_home = _surface_slot(
+            writable_surface(f"{principal.value}-codex-home"), "%i", layout=layout
+        )
         read_only = tuple(
-            path
-            for path, _owner, _group, _mode, _is_dir
-            in job_layout.codex_control_scaffold(scheme)
-            if path.startswith(job_layout.home_of(account).rstrip("/") + "/")
+            f"{codex_home}/{leaf}"
+            for leaf in ("plugins", "skills", "config.toml", "hooks.json")
         )
     body += _rwp_lines(owners, read_only)
     body += [

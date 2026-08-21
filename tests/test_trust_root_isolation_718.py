@@ -25,6 +25,10 @@ EXPECTED_SURFACES = (
     "builder-job-log",
     "reviewer-job-log",
     "gate-job-log",
+    "builder-codex-home",
+    "reviewer-codex-home",
+    "builder-runtime-cache",
+    "reviewer-runtime-cache",
 )
 
 
@@ -165,3 +169,45 @@ def test_production_job_unit_consumes_only_applicable_table_slots(principal) -> 
         assert row.writable_root not in unit.read_write_paths
     assert not any(path.endswith("/cache") for path in unit.read_write_paths)
     assert not any(path.endswith("/.codex") for path in unit.read_write_paths)
+
+
+def test_reviewer_never_receives_builder_event_producer_slot() -> None:
+    reviewer = permgen.build_job_unit(
+        permgen.FOUR_WAY_SCHEME, principal=permgen.Principal.REVIEWER
+    )
+    event = spool_slot.writable_surface("monitor-event-spool")
+    assert event.principals == ("builder",)
+    assert permgen._surface_root(event, permgen.DEFAULT_LAYOUT) + "/%i" not in reviewer.read_write_paths
+
+
+@pytest.mark.parametrize("role", (job_runner.JOB_ROLE_BUILDER, job_runner.JOB_ROLE_REVIEW))
+def test_job_env_uses_authoritative_per_job_codex_and_cache_slots(role: str) -> None:
+    env = job_runner.build_job_env(
+        manager_env={job_runner.resolve_job_role(role).path_env: "/usr/bin"},
+        job_id="job-a", slice_id="slice", repo_root="/repo", workspace=None, role=role,
+    )
+    instance = job_runner.template_instance_id("job-a")
+    principal = "reviewer" if role == job_runner.JOB_ROLE_REVIEW else "builder"
+    assert env["CODEX_HOME"].endswith(f"/runtime/codex-home/{principal}/{instance}")
+    assert env["XDG_CACHE_HOME"].endswith(f"/runtime/job-cache/{principal}/{instance}")
+
+
+def test_registry_provisioner_preserves_controls_and_isolates_foreign_slot(
+    tmp_path, monkeypatch
+) -> None:
+    from paulsha_cortex.config import paths
+
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(tmp_path))
+    own = spool_slot.provision_runtime_surfaces(principal="builder", job_id="job-a")
+    foreign = spool_slot.provision_runtime_surfaces(principal="builder", job_id="job-b")
+    assert len(own) == len(foreign) == 2
+    codex_a = next(path for path in own if "codex-home" in str(path))
+    codex_b = next(path for path in foreign if "codex-home" in str(path))
+    before = (codex_b / "hooks.json").read_bytes()
+    (codex_a / "auth.json").write_text('{"refresh":true}\n', encoding="utf-8")
+    spool_slot.provision_runtime_surfaces(principal="builder", job_id="job-a")
+    assert (codex_a / "auth.json").read_text(encoding="utf-8") == '{"refresh":true}\n'
+    assert (codex_b / "hooks.json").read_bytes() == before
+    for leaf in ("config.toml", "hooks.json", "plugins", "skills"):
+        assert (codex_a / leaf).stat().st_mode & 0o222 == 0
+    assert paths.agents_root() == tmp_path

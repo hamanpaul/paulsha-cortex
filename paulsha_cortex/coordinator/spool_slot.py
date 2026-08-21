@@ -112,8 +112,12 @@ class PerJobWritableSurface:
     def writable_root(self) -> str:
         from ..config import paths
 
+        if self.surface_id.endswith("-codex-home"):
+            return str(paths.agents_root() / "runtime" / "codex-home" / self.principals[0])
+        if self.surface_id.endswith("-runtime-cache"):
+            return str(paths.agents_root() / "runtime" / "job-cache" / self.principals[0])
         accessor = getattr(paths, self.path_accessor)
-        if self.surface_id.endswith("-job-log"):
+        if self.surface_id.endswith(("-job-log", "-codex-home", "-runtime-cache")):
             return str(accessor(self.principals[0]))
         return str(accessor())
 
@@ -124,13 +128,17 @@ class PerJobWritableSurface:
 
 PER_JOB_WRITABLE_SURFACES: tuple[PerJobWritableSurface, ...] = (
     PerJobWritableSurface("commit-spool", "commit_spool_root", "commit-spool", "create_slot", "commit_bundle_path", "render_job_writable_properties", ("builder",), "commit-spool"),
-    PerJobWritableSurface("monitor-event-spool", "monitor_event_spool_root", "monitor/event-spool", "create_slot", "EventSpool", "render_job_writable_properties", ("builder", "reviewer"), "monitor-event-spool"),
+    PerJobWritableSurface("monitor-event-spool", "monitor_event_spool_root", "monitor/event-spool", "create_slot", "EventSpool", "render_job_writable_properties", ("builder",), "monitor-event-spool"),
     PerJobWritableSurface("review-verdict-spool", "review_verdict_spool_root", "review-verdicts", "create_slot", "review_verdict_spool_path", "render_job_writable_properties", ("reviewer",), "review-verdict-spool"),
     PerJobWritableSurface("gate-ledger-spool", "gate_ledger_spool_root", "gate-ledger-spool", "create_slot", "gate_spool_ledger_path", "render_job_writable_properties", ("gate",), "gate-ledger-spool"),
     PerJobWritableSurface("gate-worktree", "gate_worktree_root", "gate-worktree", "create_slot", "gate_worktree_dir", "render_job_writable_properties", ("gate",), "gate-worktree-pool"),
     PerJobWritableSurface("builder-job-log", "job_log_spool_root", "commit-spool/build-logs", "prepare_job_log", "prepare_job_log_spool", "build_job_log_probe", ("builder",), "build-job-log-spool"),
     PerJobWritableSurface("reviewer-job-log", "job_log_spool_root", "review-verdicts/planning-logs", "prepare_job_log", "PlanningJobInvoker", "build_job_log_probe", ("reviewer",), "planning-job-log-spool"),
     PerJobWritableSurface("gate-job-log", "job_log_spool_root", "gate-ledger-spool/gate-logs", "prepare_job_log", "prepare_gate_job_log", "build_job_log_probe", ("gate",), "gate-job-log-spool"),
+    PerJobWritableSurface("builder-codex-home", "agents_root", "runtime/codex-home/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "job-codex-home"),
+    PerJobWritableSurface("reviewer-codex-home", "agents_root", "runtime/codex-home/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "job-codex-home"),
+    PerJobWritableSurface("builder-runtime-cache", "agents_root", "runtime/job-cache/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "job-runtime-cache"),
+    PerJobWritableSurface("reviewer-runtime-cache", "agents_root", "runtime/job-cache/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "job-runtime-cache"),
 )
 
 
@@ -139,6 +147,45 @@ def writable_surface(surface_id: str) -> PerJobWritableSurface:
         return next(row for row in PER_JOB_WRITABLE_SURFACES if row.surface_id == surface_id)
     except StopIteration as exc:
         raise ValueError(f"unknown writable surface: {surface_id!r}") from exc
+
+
+def provision_runtime_surfaces(*, principal: str, job_id: str) -> tuple[Path, ...]:
+    """Provision runtime rows by enumerating the canonical registry.
+
+    Parent default ACLs installed by permgen grant only the row principal access.
+    Control leaves are created before the unit starts and are additionally bind
+    mounted read-only by the generated unit; auth.json intentionally remains a
+    writable runtime leaf.
+    """
+    provisioned: list[Path] = []
+    for row in PER_JOB_WRITABLE_SURFACES:
+        if principal not in row.principals or not row.surface_id.endswith(
+            ("-codex-home", "-runtime-cache")
+        ):
+            continue
+        slot = canonical_job_slot(row.surface_id, job_id)
+        if slot.exists():
+            validate_job_slot_shape(slot)
+        else:
+            create_slot(slot, reset=False)
+        if row.surface_id.endswith("-codex-home"):
+            for dirname in ("plugins", "skills"):
+                control_dir = slot / dirname
+                control_dir.mkdir(exist_ok=True)
+                control_dir.chmod(0o555)
+            for filename, content in (
+                ("config.toml", "# deployment-owned Codex configuration\n"),
+                ("hooks.json", "{}\n"),
+            ):
+                control = slot / filename
+                if not control.exists():
+                    control.write_text(content, encoding="utf-8")
+                control.chmod(0o444)
+            auth = slot / "auth.json"
+            if not auth.exists():
+                auth.touch(mode=0o600)
+        provisioned.append(slot)
+    return tuple(provisioned)
 
 
 def _lexical_root(path: str | Path) -> Path:
@@ -179,7 +226,7 @@ def canonical_job_slot(
     if writable_root is not None:
         root = Path(writable_root)
     elif coordinator_root is None:
-        root = getattr(paths, surface.path_accessor)()
+        root = Path(surface.writable_root)
     elif surface_id == "gate-worktree":
         root = Path(coordinator_root)
     else:

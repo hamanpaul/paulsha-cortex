@@ -194,7 +194,8 @@ class WritableSurfaceIsUnchangedTests(unittest.TestCase):
                 "/var/lib/cortex/coordinator/commit-spool/%i",
                 "/var/lib/cortex/monitor/event-spool/%i",
                 "/var/lib/cortex/coordinator/commit-spool/build-logs/%i",
-                "/var/lib/cortex-builder/.codex/auth.json",
+                "/var/lib/cortex/runtime/codex-home/builder/%i",
+                "/var/lib/cortex/runtime/job-cache/builder/%i",
             ),
         )
 

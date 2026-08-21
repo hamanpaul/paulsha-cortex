@@ -563,10 +563,10 @@ def test_planning_log_spool_needs_no_new_write_surface() -> None:
     )
     unit = permgen.build_job_unit(permgen.THREE_WAY_SCHEME, principal=Principal.REVIEWER)
     assert sorted(unit.read_write_paths) == sorted([
-        layout.credential_token_path_of(layout.reviewer_planner_account, "codex"),
-        f"{layout.agents_root}/monitor/event-spool/%i",
         layout.review_verdict_spool_root + "/%i",
         layout.planning_job_log_spool_root + "/%i",
+        f"{layout.agents_root}/runtime/codex-home/reviewer/%i",
+        f"{layout.agents_root}/runtime/job-cache/reviewer/%i",
     ])
 
 

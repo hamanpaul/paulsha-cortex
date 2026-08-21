@@ -480,6 +480,9 @@ class JobPlanningInvoker:
         # 的，而 reviewer 帳號的**另一種**工作區（foreign review 的 linked worktree）
         # 確實跨 owner——見 `registry.JOB_GIT_WORKSPACE_TRUST` 的 reviewer 那一列。
         workspace = str(Path(reservation.cwd).resolve())
+        spool_slot.provision_runtime_surfaces(
+            principal="reviewer", job_id=reservation.job_id
+        )
         env = job_runner.build_job_env(
             manager_env=self._env,
             job_id=reservation.job_id,
