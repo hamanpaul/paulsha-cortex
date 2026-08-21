@@ -1504,7 +1504,9 @@ class ArgvTests(unittest.TestCase):
         (credentials / "auth.json").write_text('{"refresh":"seed"}\n')
         copilot = root / "copilot-authority"
         copilot.mkdir(parents=True, exist_ok=True)
-        (copilot / "config.json").write_text('{"oauth":"seed"}\n')
+        authority = copilot / "config.json"
+        authority.write_text('{"oauth":"seed"}\n')
+        authority.chmod(0o600)
 
     def test_template_launch_uses_instance_named_log_slot_and_explicit_control_anchor(self) -> None:
         captured: dict[str, object] = {}

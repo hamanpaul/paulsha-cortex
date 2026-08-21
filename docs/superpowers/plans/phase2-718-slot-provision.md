@@ -47,3 +47,13 @@ Repair exactly:
 Add tests for exact per-job isolation, source ownership/mode/symlink rejection,
 pre-start failure ordering, and token absence. Run the trust-root and launcher
 tests, commit all changes including this plan, and leave the worktree clean.
+
+## Follow-up gate evidence
+
+Independent pytest after commit `7a1acf2` has exactly two failures. Both use the
+shared OAuth authority fixture, whose `config.json` is left group-writable by
+the test process umask. The product correctly rejects it at the
+`no group/other write bits` guard. Lock the valid fixture to mode `0600` (or an
+equally strict explicit mode) and keep the negative mode test group-writable on
+purpose. Do not weaken `copilot_oauth_authority()`. Re-run both focused test
+files, commit the follow-up, and leave the worktree clean.

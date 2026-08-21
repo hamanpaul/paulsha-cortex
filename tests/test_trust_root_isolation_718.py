@@ -234,6 +234,7 @@ class RuntimeSurfaceProvisionTests(unittest.TestCase):
         authority = tmp_path / "copilot-authority" / "config.json"
         authority.parent.mkdir(parents=True, exist_ok=True)
         authority.write_text('{"oauth":"seed"}\n')
+        authority.chmod(0o600)
         return authority
 
     def test_builder_provisioning_enumerates_every_typed_slot(self) -> None:
