@@ -115,6 +115,15 @@ DOWNGRADED_JOB_PRINCIPALS: tuple[Principal, ...] = (
     Principal.GATE,
 )
 
+# Only model lanes consume workflow prompts.  GATE has a spec spool but no
+# executor prompt channel; deriving this tuple from the one launch-principal
+# table keeps the prompt ACL surface from silently widening to operator code.
+PROMPT_JOB_PRINCIPALS: tuple[Principal, ...] = tuple(
+    principal
+    for principal in DOWNGRADED_JOB_PRINCIPALS
+    if principal in (Principal.BUILDER, Principal.REVIEWER)
+)
+
 
 @dataclass(frozen=True)
 class JobLogSpool:
@@ -1373,6 +1382,14 @@ def job_spec_spool_asset_id(principal: Principal) -> str:
     return f"job-spec-spool-{principal.value}"
 
 
+def job_prompt_root_asset_id(principal: Principal) -> str:
+    """Manager-owned prompt root asset for one model principal."""
+
+    if principal not in PROMPT_JOB_PRINCIPALS:
+        raise ValueError(f"prompt root is not applicable to {principal.value}")
+    return f"job-prompt-root-{principal.value}"
+
+
 class IngressKind(Enum):
     """spec §C mutation ingress 盤點的種類。"""
 
@@ -1529,6 +1546,35 @@ def _job_spec_spool_assets() -> tuple[TrustRootAsset, ...]:
             ),
         )
         for principal in DOWNGRADED_JOB_PRINCIPALS
+    )
+
+
+def _job_prompt_root_assets() -> tuple[TrustRootAsset, ...]:
+    """Dedicated Manager-owned prompt roots, derived from model principals."""
+
+    return tuple(
+        TrustRootAsset(
+            job_prompt_root_asset_id(principal), _T0, _MO,
+            "paulsha_cortex.config.paths:job_prompt_root_for",
+            (Principal.MANAGER,), (Principal.MANAGER, principal),
+            IngressKind.MANAGER_INTERNAL,
+            path_resolver_args=(principal.value,),
+            derived_in=(
+                "config/paths.py:job_prompt_root_for",
+                "trust_root/registry.py:PROMPT_JOB_PRINCIPALS",
+                "coordinator/job_runner.py:job_prompt_spool_path",
+                "coordinator/job_runner.py:write_job_prompt",
+                "coordinator/dispatcher.py:_finalize_headless",
+            ),
+            note=(
+                f"Manager-owned prompt root for the {principal.value} model lane. "
+                "It is a sibling of the per-principal spec spool, never a child of "
+                "the job-log slot (whose parent grants job wx). Manager creates one "
+                "non-writable per-job directory and the job receives only r-x on the "
+                "directory and r-- on the prompt inode."
+            ),
+        )
+        for principal in PROMPT_JOB_PRINCIPALS
     )
 
 
@@ -2307,6 +2353,7 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
     ),
     *_job_spec_spool_assets(),
+    *_job_prompt_root_assets(),
     TrustRootAsset(
         "verification-evidence", _T0, _MO, None,
         (Principal.MANAGER,), (Principal.MANAGER,), IngressKind.MANAGER_INTERNAL,

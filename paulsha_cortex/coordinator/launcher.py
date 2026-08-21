@@ -1687,30 +1687,40 @@ class SubprocessLauncher:
         runtime_principal = job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal
         prompt_file: str | None = None
         if degraded and self._executor in {"claude", "cg"}:
-            # A transient unit has no spec file, but it still needs the same
-            # per-job read-only prompt channel as a template unit.  Reuse the
-            # registered job-log surface so no ad-hoc writable root is added.
-            if runner_plan is not None:
-                prompt_log = job_workspace.prepare_job_log_spool(
-                    principal_id=runtime_principal,
-                    spool_key=slice_id,
-                    manager_log_path=log_path,
-                )
-                prompt_spool = job_runner.prepare_private_prompt_spool(
-                    str(prompt_log.parent / ".prompts"), account=runner_plan.account
-                )
-                prompt_file = job_runner.job_prompt_path(
-                    prompt_spool, job_runner.template_instance_id(slice_id)
-                )
-            else:
-                # The template log slot is prepared below, after the fixed
-                # ExecStart/spec has been assembled.  Its concrete path is
-                # nevertheless known now, so the fixed spec can carry the
-                # bounded filename without carrying prompt bytes.
-                prompt_file = job_runner.job_prompt_path(
-                    str(Path(job_log_path).parent / ".prompts"),
-                    job_runner.template_instance_id(slice_id),
-                )
+            # A degraded unit has stdin=/dev/null, so its prompt travels via a
+            # Manager-created file.  The prompt root is derived from the
+            # role's spec spool, but is its sibling: the spec/log slots have
+            # different ACL directions and neither job may rename this root.
+            prompt_spec_spool = (
+                template_plan.spool_dir
+                if template_plan is not None
+                else job_runner.resolve_prompt_spec_spool(os.environ, role=job_role)
+            )
+            if (
+                runner_plan is not None
+                and not os.environ.get(job_runner.JOB_ROLE_CONFIG[job_role].spec_spool_env)
+                and not Path(prompt_spec_spool).exists()
+            ):
+                # Transient mode has no spec file, but its prompt root still
+                # uses the same Manager-owned coordinator namespace.  A
+                # caller-provided isolated agents root may be an empty test or
+                # first-boot tree; create only this non-job-writable spool
+                # anchor, never a deployment path selected by payload text.
+                Path(prompt_spec_spool).mkdir(parents=True, mode=0o700)
+                os.chmod(prompt_spec_spool, 0o700)
+            prompt_spool = job_runner.job_prompt_spool_dir(
+                prompt_spec_spool,
+                principal=runtime_principal,
+                instance=job_runner.template_instance_id(slice_id),
+                account=(
+                    template_plan.account
+                    if template_plan is not None
+                    else runner_plan.account
+                ),
+            )
+            prompt_file = job_runner.job_prompt_path(
+                prompt_spool, job_runner.template_instance_id(slice_id)
+            )
         builder_kwargs = {
             "prompt": prompt,
             "slice_id": slice_id,
@@ -1926,7 +1936,7 @@ class SubprocessLauncher:
             )
             # #604：client 跑在 Manager 這一側且存活到 unit 結束，由它記 exit code。
             argv = job_runner.build_manager_exit_recorder_argv(
-                client_argv=argv, sentinel=sentinel
+                client_argv=argv, sentinel=sentinel, cleanup_path=prompt_file
             )
             # systemd-run **client 自己**的環境。它不會流進 transient unit——unit 的
             # 環境只有 PID 1 的 manager environment 加上 `--setenv` 白名單（這正是
@@ -1979,13 +1989,20 @@ class SubprocessLauncher:
                 )
             job_log_path = prepared_log_path
             if self._executor in {"claude", "cg"}:
-                prompt_spool = job_runner.prepare_private_prompt_spool(
-                    str(Path(job_log_path).parent / ".prompts"),
+                expected_prompt_spool = job_runner.job_prompt_spool_dir(
+                    template_plan.spool_dir,
+                    principal=runtime_principal,
+                    instance=job_runner.template_instance_id(slice_id),
                     account=template_plan.account,
                 )
-                prompt_file = job_runner.job_prompt_path(
-                    prompt_spool, job_runner.template_instance_id(slice_id)
+                expected_prompt_file = job_runner.job_prompt_path(
+                    expected_prompt_spool, job_runner.template_instance_id(slice_id)
                 )
+                if prompt_file != expected_prompt_file:
+                    raise RuntimeError(
+                        "private prompt 落點推導漂移："
+                        f"argv 用的是 {prompt_file!r}，template 用的是 {expected_prompt_file!r}"
+                    )
             # #710：**再把工作區的可達性準備好**，同樣在寫 spec 之前。
             #
             # shim 在降權之後、exec 之前 `os.chdir(spec["working_directory"])`——那一步
@@ -2027,7 +2044,7 @@ class SubprocessLauncher:
             )
             # #604：同 A 案——sentinel 由 Manager 側這層 shell 寫，job 不參與。
             argv = job_runner.build_manager_exit_recorder_argv(
-                client_argv=argv, sentinel=sentinel
+                client_argv=argv, sentinel=sentinel, cleanup_path=prompt_file
             )
             # systemctl **client 自己**的環境（同 A 案的理由：polkit 授權可能要查
             # 呼叫端 session）。它不會流進 unit——unit 的環境來自 root-owned 模板檔，

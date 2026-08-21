@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import pytest
 import os
+import shlex
 import subprocess
 import sys
+from pathlib import Path
 
 from paulsha_cortex.coordinator import spool_slot
 from paulsha_cortex.coordinator import job_runner
@@ -157,6 +159,23 @@ def test_canonical_authorities_are_registry_backed_deployment_assets() -> None:
     assert {"codex-control-root", "codex-credential-root"} <= registered
 
 
+def test_prompt_roots_are_registry_assets_and_sibling_to_spec_spools() -> None:
+    from paulsha_cortex.trust_root import registry
+
+    registered = {asset.asset_id for asset in registry.ASSET_REGISTRY}
+    for principal in registry.PROMPT_JOB_PRINCIPALS:
+        asset_id = registry.job_prompt_root_asset_id(principal)
+        prompt_root = permgen.DEFAULT_LAYOUT.job_prompt_root_for(principal)
+        spec_root = permgen.DEFAULT_LAYOUT.job_spec_spool_for(principal)
+        assert asset_id in registered
+        assert prompt_root == str(Path(spec_root).parent.parent / "job-prompts" / principal.value)
+        assert Path(prompt_root).parent == Path(spec_root).parent.parent / "job-prompts"
+        assert prompt_root not in {
+            permgen._surface_root(row, permgen.DEFAULT_LAYOUT)
+            for row in permgen.PER_JOB_WRITABLE_SURFACES
+        }
+
+
 def test_claude_workflow_prompt_is_not_an_argv_element() -> None:
     """A real oversized workflow envelope must cross the launcher via stdin."""
     from paulsha_cortex.coordinator.launcher import build_claude_argv, build_wrapper_script
@@ -215,6 +234,79 @@ def test_private_prompt_file_survives_real_oversized_launch(tmp_path) -> None:
     assert sentinel.read_text() == "0"
 
 
+def test_template_prompt_channel_is_byte_exact_and_not_renameable_by_real_job_uid(
+    tmp_path,
+) -> None:
+    """Exercise the template-shaped wrapper with real split UIDs when deployed."""
+    import shutil
+
+    if os.geteuid() != 0 or shutil.which("runuser") is None or shutil.which("setfacl") is None:
+        pytest.skip("requires root plus deployed split-UID accounts")
+    try:
+        import pwd
+
+        manager_uid = pwd.getpwnam("cortex-manager").pw_uid
+        job_account = "cortex-builder"
+        pwd.getpwnam(job_account)
+        foreign = "cortex-reviewer-planner"
+        pwd.getpwnam(foreign)
+    except KeyError:
+        pytest.skip("deployed split-UID accounts are unavailable")
+
+    spec_spool = tmp_path / "job-specs" / "builder"
+    spec_spool.mkdir(parents=True)
+    os.chown(spec_spool.parent, manager_uid, manager_uid)
+    os.chown(spec_spool, manager_uid, manager_uid)
+    os.chmod(spec_spool.parent, 0o700)
+    os.chmod(spec_spool, 0o700)
+    subprocess.run(["setfacl", "-m", f"u:{job_account}:--x", str(tmp_path)], check=True)
+    instance = job_runner.template_instance_id("real-template-prompt")
+    prompt_dir = Path(
+        job_runner.job_prompt_spool_dir(
+            str(spec_spool), principal="builder", instance=instance, account=job_account
+        )
+    )
+    prompt_path = Path(job_runner.job_prompt_path(str(prompt_dir), instance))
+    prompt = ("template-sentinel-" + ("x" * 140_000)).encode()
+    job_runner.write_job_prompt(str(prompt_path), prompt.decode(), account=job_account)
+    from paulsha_cortex.coordinator.launcher import build_wrapper_script
+
+    script = build_wrapper_script(
+        inner_argv=[
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ],
+        prompt_file=str(prompt_path),
+        sentinel=str(tmp_path / "unused.exit"),
+        ledger=str(tmp_path / "ledger"),
+        worktree=str(tmp_path),
+        repo_root=None,
+        run_gates=False,
+        write_sentinel=False,
+    )
+    completed = subprocess.run(
+        ["runuser", "-u", job_account, "--", "bash", "-c", script],
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert completed.stdout == prompt
+    assert subprocess.run(
+        ["runuser", "-u", job_account, "--", "mv", str(prompt_dir), str(prompt_dir) + ".moved"],
+        check=False,
+        capture_output=True,
+    ).returncode != 0
+    assert subprocess.run(
+        ["runuser", "-u", foreign, "--", "cat", str(prompt_path)],
+        check=False,
+        capture_output=True,
+    ).returncode != 0
+    assert job_runner.reap_orphaned_prompt_slots(
+        str(spec_spool), principal="builder"
+    ) == ()
+
+
 def test_private_prompt_bound_fails_closed_before_publish(tmp_path) -> None:
     path = tmp_path / ".prompt-job-a"
     with pytest.raises(job_runner.JobRunnerError) as excinfo:
@@ -261,6 +353,7 @@ def test_codex_reasoning_effort_is_explicit_for_pinned_models() -> None:
 )
 def test_owner_aware_publisher_real_uid_arms(principal, account, tmp_path) -> None:
     """Exercise unchanged Manager seed and job-owned atomic refresh as real UIDs."""
+    import hashlib
     import shutil
 
     if os.geteuid() != 0 or shutil.which("runuser") is None or shutil.which("setfacl") is None:
@@ -301,17 +394,21 @@ def test_owner_aware_publisher_real_uid_arms(principal, account, tmp_path) -> No
     job_home = tmp_path / f"{principal}-atomic-refresh"
     job_home.mkdir()
     refreshed = job_home / "auth.json"
-    refreshed.write_bytes(b'{"seed":"job-refresh"}\n')
     os.chown(job_home, job_uid, job_uid)
-    os.chown(refreshed, job_uid, job_uid)
     os.chmod(job_home, 0o700)
-    os.chmod(refreshed, 0o600)
     subprocess.run(
         ["setfacl", "-m", "u:cortex-manager:--x", str(job_home)],
         check=True,
     )
+    # Model the real Codex refresh: UMask=0077, a private temporary inode, and
+    # an atomic rename before the owner-aware publisher runs.
+    refresh_script = (
+        f"umask 0077; tmp={shlex.quote(str(job_home / '.auth.tmp'))}; "
+        f"printf '%s\\n' '{{\"seed\":\"job-refresh\"}}' > \"$tmp\"; "
+        f"mv -- \"$tmp\" {shlex.quote(str(refreshed))}; {command}"
+    )
     refreshed_run = subprocess.run(
-        ["runuser", "-u", account, "--", "env", f"CODEX_HOME={job_home}", "bash", "-c", command],
+        ["runuser", "-u", account, "--", "env", f"CODEX_HOME={job_home}", "bash", "-c", refresh_script],
         check=False,
     )
     assert refreshed_run.returncode == 0
@@ -326,6 +423,34 @@ def test_owner_aware_publisher_real_uid_arms(principal, account, tmp_path) -> No
         capture_output=True,
     )
     assert denied.returncode != 0
+    foreign_write = subprocess.run(
+        ["runuser", "-u", foreign, "--", "bash", "-c", f"printf x >> {refreshed!s}"],
+        check=False,
+        capture_output=True,
+    )
+    assert foreign_write.returncode != 0
+
+    next_home = tmp_path / f"{principal}-next-seed"
+    next_home.mkdir()
+    next_seed = next_home / "auth.json"
+    next_seed.write_bytes(refreshed.read_bytes())
+    os.chown(next_home, manager_uid, manager_uid)
+    os.chown(next_seed, manager_uid, manager_uid)
+    os.chmod(next_home, 0o711)
+    os.chmod(next_seed, 0o600)
+    subprocess.run(
+        ["setfacl", "-m", f"u:{account}:r--,m::r--", str(next_seed)],
+        check=True,
+    )
+    next_read = subprocess.run(
+        ["runuser", "-u", account, "--", "cat", str(next_seed)],
+        check=False,
+        capture_output=True,
+    )
+    assert next_read.returncode == 0
+    assert hashlib.sha256(next_read.stdout).hexdigest() == hashlib.sha256(
+        b'{"seed":"job-refresh"}\n'
+    ).hexdigest()
 
 
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
@@ -449,6 +574,42 @@ def test_provision_projects_canonical_controls_and_auth(tmp_path, monkeypatch) -
     assert (codex / "auth.json").stat().st_mode & 0o060 == 0o060
 
 
+def test_control_tree_copy_strips_xattrs_hardlinks_and_rejects_special_entries(tmp_path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    (source / "plugins").mkdir(parents=True)
+    (source / "plugins" / "plugin.json").write_bytes(b"plugin\n")
+    os.link(source / "plugins" / "plugin.json", source / "plugins" / "alias.json")
+    xattr_supported = True
+    try:
+        os.setxattr(source / "plugins" / "plugin.json", b"user.test", b"source-only")
+    except OSError:
+        xattr_supported = False
+    spool_slot._copy_regular_tree(source, destination)
+    copied = destination / "plugins"
+    assert (copied / "plugin.json").read_bytes() == b"plugin\n"
+    assert (copied / "alias.json").read_bytes() == b"plugin\n"
+    assert (copied / "plugin.json").stat().st_nlink == 1
+    assert (copied / "alias.json").stat().st_nlink == 1
+    assert (copied.stat().st_mode & 0o777) == 0o755
+    assert (copied / "plugin.json").stat().st_mode & 0o777 == 0o644
+    if xattr_supported:
+        assert b"user.test" not in os.listxattr(copied / "plugin.json")
+
+    symlink_source = tmp_path / "symlink-source"
+    symlink_source.mkdir()
+    (symlink_source / "plugins").mkdir()
+    (symlink_source / "plugins" / "link").symlink_to(source / "plugins" / "plugin.json")
+    with pytest.raises(spool_slot.SpoolSlotError):
+        spool_slot._copy_regular_tree(symlink_source / "plugins", tmp_path / "symlink-dest")
+
+    special_source = tmp_path / "special-source"
+    special_source.mkdir()
+    os.mkfifo(special_source / "fifo")
+    with pytest.raises(spool_slot.SpoolSlotError):
+        spool_slot._copy_regular_tree(special_source, tmp_path / "special-dest")
+
+
 def test_manager_unreadable_legacy_home_never_degrades_to_stub_controls(
     tmp_path, monkeypatch
 ) -> None:
@@ -502,6 +663,53 @@ def test_authority_migration_whitelists_controls_and_normalizes_live_modes() -> 
     assert "mktemp -d" in commands
 
 
+def test_generated_migration_accepts_only_root_owned_legacy_codex_symlink(tmp_path) -> None:
+    """Run the generated migration against a real legacy symlink when root is available."""
+    import pwd
+    import shutil
+
+    if os.geteuid() != 0 or shutil.which("bash") is None:
+        pytest.skip("requires root for generated ownership migration")
+    try:
+        pwd.getpwnam("cortex-manager")
+    except KeyError:
+        pytest.skip("cortex-manager is unavailable")
+
+    layout = permgen.PathLayout(
+        agents_root=str(tmp_path / "agents"),
+        home_root=str(tmp_path / "home"),
+        deploy_root=str(tmp_path / "deploy"),
+    )
+    source_target = tmp_path / "legacy-codex"
+    (source_target / "plugins").mkdir(parents=True)
+    (source_target / "skills").mkdir()
+    (source_target / "plugins" / "plugin.json").write_text('{"plugin":true}\n')
+    (source_target / "skills" / "policy.md").write_text("policy\n")
+    (source_target / "config.toml").write_text("model = 'deployed'\n")
+    (source_target / "hooks.json").write_text("{}\n")
+    (source_target / "auth.json").write_text('{"seed":true}\n')
+    legacy = Path(layout.home_of("cortex-builder")) / ".codex"
+    legacy.parent.mkdir(parents=True)
+    legacy.symlink_to(source_target, target_is_directory=True)
+    controls_parent = Path(layout.codex_control_root)
+    controls_parent.mkdir(parents=True)
+    credential_parent = Path(layout.codex_credential_root) / "builder"
+    credential_parent.mkdir(parents=True)
+
+    commands = layout.codex_authority_seed_commands(permgen.FOUR_WAY_SCHEME)
+    for command in commands:
+        completed = subprocess.run(["bash", "-eu", "-c", command], capture_output=True)
+        assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    migrated = Path(layout.codex_control_root) / "builder"
+    assert migrated.is_dir() and not migrated.is_symlink()
+    assert (migrated / "config.toml").read_text() == "model = 'deployed'\n"
+    assert (migrated / "plugins" / "plugin.json").read_text() == '{"plugin":true}\n'
+    assert (migrated / "skills" / "policy.md").read_text() == "policy\n"
+    assert (migrated / "config.toml").stat().st_mode & 0o777 == 0o644
+    assert (migrated / "plugins").stat().st_mode & 0o777 == 0o755
+    assert (Path(layout.codex_credential_root) / "builder" / "auth.json").read_text() == '{"seed":true}\n'
+
+
 @pytest.mark.parametrize("principal", (permgen.Principal.BUILDER, permgen.Principal.REVIEWER))
 def test_generated_unit_publishes_auth_to_manager_after_process_stops(principal) -> None:
     unit = permgen.build_job_unit(permgen.FOUR_WAY_SCHEME, principal=principal)
@@ -528,6 +736,54 @@ def test_template_uses_the_canonical_owner_aware_auth_publisher() -> None:
         permgen.FOUR_WAY_SCHEME, principal=permgen.Principal.BUILDER
     )
     assert f"ExecStopPost=/bin/sh -c '{command}'" in unit.content
+
+
+@pytest.mark.parametrize(
+    ("principal", "executor", "runtime_mode", "exit_code", "expected_status"),
+    (
+        ("builder", "claude", "direct", 0, "exited"),
+        ("reviewer", "claude", "direct", 1, "failed"),
+        ("builder", "claude", "systemd-template", 0, "exited"),
+        ("reviewer", "copilot", "systemd-template", 1, "failed"),
+    ),
+)
+def test_headless_finalize_uses_typed_lane_not_workflow_kind(
+    tmp_path, principal, executor, runtime_mode, exit_code, expected_status
+) -> None:
+    """Builder/reviewer and direct/isolated non-Codex lanes never harvest Codex state."""
+    from paulsha_cortex.coordinator.dispatcher import Dispatcher
+
+    class Registry:
+        def __init__(self) -> None:
+            self.job = {
+                "job_id": "job-a",
+                "executor": executor,
+                "runtime_mode": runtime_mode,
+                "runtime_principal": principal,
+            }
+            self.updated = None
+
+        def get_job(self, job_id):
+            assert job_id == "job-a"
+            return dict(self.job)
+
+        def update_headless_result(self, job_id, **kwargs):
+            assert job_id == "job-a"
+            self.updated = kwargs
+            return {**self.job, **kwargs}
+
+    log_path = tmp_path / f"{principal}-{executor}.jsonl"
+    log_path.write_text("")
+    registry = Registry()
+    result = Dispatcher(registry, None, None)._finalize_headless(
+        "job-a", exit_code=exit_code, log_path=str(log_path)
+    )
+    assert result["status"] == expected_status
+    assert result.get("runtime_diagnostic") is None
+    if exit_code == 0:
+        assert registry.updated["provider_outcome"] is None
+    else:
+        assert registry.updated["provider_outcome"] is not None
 
 
 @pytest.mark.parametrize(

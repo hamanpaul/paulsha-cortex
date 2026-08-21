@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.
 - **#718 repair:** isolated Claude/CG workflow prompts now use bounded Manager-created per-job files rather than argv or template stdin; Manager exit accounting cleans them after termination, Codex credential harvest is typed and durably fail-closed, and `gpt-5.6-luna`/`gpt-5.3-codex-spark` carry explicit `model_reasoning_effort` argv pins.
 - **#718 repair:** Codex-capable units derive isolated per-job homes and caches from real R1 writable-surface assets; canonical control and credential authorities are now registered deployment assets seeded byte-for-byte from both deployed roles without stubs, and builder/reviewer terminal paths publish and harvest refreshes; reviewer units no longer receive the builder-only monitor event slot.

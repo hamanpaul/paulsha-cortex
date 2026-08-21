@@ -240,7 +240,7 @@ class Dispatcher:
         # typed runtime surface; never infer a principal from workflow kind.
         # Missing runtime metadata/slot/authority is a durable runtime failure,
         # not a provider failure and never a silently skipped harvest.
-        from . import job_runner, job_workspace, spool_slot
+        from . import job_runner, spool_slot
         runtime_diagnostic: dict[str, str] | None = None
         runtime_mode = job.get("runtime_mode")
         runtime_principal = job.get("runtime_principal")
@@ -248,19 +248,33 @@ class Dispatcher:
         if prompt_path is not None:
             prompt = Path(prompt_path) if isinstance(prompt_path, str) else Path(".")
             expected_prompt: Path | None = None
+            expected_prompt_dir: Path | None = None
             try:
-                if (
-                    runtime_mode in {"systemd-run", "systemd-template"}
-                    and runtime_principal in {"builder", "reviewer"}
-                ):
-                    prompt_spool = job_workspace.job_log_spool_dir(
-                        principal_id=str(runtime_principal), spool_key=job_id
-                    ) / ".prompts"
-                    expected_prompt = prompt_spool / (
+                prompt_roles = {
+                    config.log_spool_principal: role
+                    for role, config in job_runner.JOB_ROLE_CONFIG.items()
+                }
+                prompt_role = prompt_roles.get(str(runtime_principal))
+                if runtime_mode in {"systemd-run", "systemd-template"} and prompt_role in {
+                    job_runner.JOB_ROLE_BUILDER,
+                    job_runner.JOB_ROLE_REVIEW,
+                }:
+                    spec_spool = job_runner.resolve_prompt_spec_spool(
+                        os.environ, role=prompt_role
+                    )
+                    expected_prompt_dir = Path(
+                        job_runner.job_prompt_spool_path(
+                            spec_spool,
+                            principal=str(runtime_principal),
+                            instance=job_runner.template_instance_id(job_id),
+                        )
+                    )
+                    expected_prompt = expected_prompt_dir / (
                         ".prompt-" + job_runner.template_instance_id(job_id)
                     )
             except (TypeError, ValueError):
                 expected_prompt = None
+                expected_prompt_dir = None
             if (
                 not isinstance(prompt_path, str)
                 or not prompt.is_absolute()
@@ -280,11 +294,52 @@ class Dispatcher:
                 }
             else:
                 try:
-                    prompt.unlink(missing_ok=True)
+                    if expected_prompt_dir is None or not expected_prompt_dir.is_dir():
+                        raise RuntimeError(
+                            "private prompt parent is missing or not a directory"
+                        )
+                    if expected_prompt_dir.is_symlink():
+                        raise RuntimeError("private prompt parent is a symlink")
+                    if prompt.exists():
+                        prompt.unlink()
+                    leftovers: list[str] = []
+                    for entry in expected_prompt_dir.iterdir():
+                        try:
+                            info = entry.lstat()
+                        except OSError:
+                            leftovers.append(str(entry))
+                            continue
+                        leftovers.append(str(entry))
+                        # The parent is Manager-owned and non-writable by the
+                        # job.  Remove only leaf/symlink leftovers; retain an
+                        # unexpected directory or special node for an explicit
+                        # durable diagnostic rather than following it.
+                        if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                            entry.unlink()
+                    try:
+                        expected_prompt_dir.rmdir()
+                    except OSError as exc:
+                        if not leftovers:
+                            raise RuntimeError(
+                                "private prompt parent could not be removed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ) from exc
+                    if leftovers:
+                        raise RuntimeError(
+                            "private prompt directory leaked entries: "
+                            + ", ".join(leftovers)
+                        )
                 except OSError as exc:
-                    runtime_diagnostic = {
+                    runtime_diagnostic = runtime_diagnostic or {
                         "reason": "runtime-prompt-cleanup-failed",
                         "detail": f"{type(exc).__name__}: {exc}",
+                        "source": "dispatcher._finalize_headless",
+                        "job_id": str(job_id),
+                    }
+                except RuntimeError as exc:
+                    runtime_diagnostic = runtime_diagnostic or {
+                        "reason": "runtime-prompt-leaked",
+                        "detail": str(exc),
                         "source": "dispatcher._finalize_headless",
                         "job_id": str(job_id),
                     }
@@ -309,12 +364,8 @@ class Dispatcher:
         if job.get("credential_publish") and isolated_codex:
             principal = job.get("runtime_principal")
             surface_id = job.get("runtime_surface")
-            expected_surface = {
-                "builder-codex-home": "builder",
-                "reviewer-codex-home": "reviewer",
-            }.get(str(surface_id))
-            if principal != expected_surface or not isinstance(principal, str):
-                runtime_diagnostic = {
+            if not isinstance(principal, str) or not isinstance(surface_id, str):
+                runtime_diagnostic = runtime_diagnostic or {
                     "reason": "runtime-identity-missing",
                     "detail": (
                         f"credential publish metadata is inconsistent: "
@@ -325,7 +376,10 @@ class Dispatcher:
                 }
             else:
                 try:
-                    runtime_slot = spool_slot.canonical_job_slot(str(surface_id), job_id)
+                    surface = spool_slot.codex_runtime_surface(
+                        principal=principal, surface_id=surface_id
+                    )
+                    runtime_slot = spool_slot.canonical_job_slot(surface.surface_id, job_id)
                     authority = spool_slot.credential_authority(principal)
                     spool_slot.validate_job_slot_shape(runtime_slot)
                     if (
@@ -339,8 +393,8 @@ class Dispatcher:
                     spool_slot.commit_runtime_credential(
                         principal=principal, job_id=job_id
                     )
-                except (OSError, spool_slot.SpoolSlotError, ValueError) as exc:
-                    runtime_diagnostic = {
+                except Exception as exc:
+                    runtime_diagnostic = runtime_diagnostic or {
                         "reason": "runtime-credential-harvest-failed",
                         "detail": f"{type(exc).__name__}: {exc}",
                         "source": "dispatcher._finalize_headless",

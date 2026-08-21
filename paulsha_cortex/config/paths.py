@@ -298,6 +298,7 @@ def gate_worktree_root() -> Path:
 #: `coordinator/job_runner.py` 的 per-job 定址、`trust_root/permgen.py` 的 layout 與本
 #: resolver 共用同一個字面量（R1 登記表的「重複路徑推導」Scenario 要求單一真相）。
 JOB_SPEC_SPOOL_DIRNAME = "job-specs"
+JOB_PROMPT_ROOT_DIRNAME = "job-prompts"
 
 
 def job_spec_spool_root() -> Path:
@@ -355,6 +356,22 @@ def job_spec_spool_for(principal_id: str) -> Path:
             f"principal id 不合法（只允許 ^[a-z][a-z0-9-]*$）: {principal_id!r}"
         )
     return job_spec_spool_root() / name
+
+
+def job_prompt_root_for(principal_id: str) -> Path:
+    """Manager-owned prompt root paired with one per-principal spec spool.
+
+    Prompt files are not placed in the spec directory itself: keeping the
+    root as a sibling preserves the spec spool's one-file inventory and gives
+    the Manager a separate, non-job-writable parent for prompt cleanup.
+    """
+
+    name = str(principal_id or "").strip()
+    if not _SPOOL_PRINCIPAL_RE.match(name):
+        raise ValueError(
+            f"principal id 不合法（只允許 ^[a-z][a-z0-9-]*$）: {principal_id!r}"
+        )
+    return coordinator_root() / JOB_PROMPT_ROOT_DIRNAME / name
 
 
 def specs_root() -> Path:

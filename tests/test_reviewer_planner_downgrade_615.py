@@ -289,15 +289,20 @@ class LaunchIdentityTests(unittest.TestCase):
                         ].log_spool_principal,
                         spool_key=slice_id,
                     )
-                prompt_dir = slot / ".prompts"
+                prompt_dir = Path(
+                    job_runner.job_prompt_spool_path(
+                        spool_dir,
+                        principal="reviewer",
+                        instance=job_runner.template_instance_id(slice_id),
+                    )
+                )
                 prompt_path = prompt_dir / (
                     ".prompt-" + job_runner.template_instance_id(slice_id)
                 )
                 self.assertTrue(prompt_path.is_file())
                 self.assertEqual(prompt_path.read_bytes(), prompt.encode())
-                self.assertNotEqual(
-                    prompt_dir.stat().st_mode & stat.S_ISVTX, 0
-                )
+                self.assertEqual(prompt_dir.stat().st_mode & 0o022, 0)
+                self.assertNotEqual(prompt_dir, slot / ".prompts")
                 spec = json.loads(next(Path(spool_dir).iterdir()).read_text())
                 self.assertIn(str(prompt_path), json.dumps(spec))
                 self.assertNotIn(prompt, json.dumps(spec))

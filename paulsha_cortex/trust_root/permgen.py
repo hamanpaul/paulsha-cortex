@@ -79,13 +79,14 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
 from pathlib import Path
 
+from paulsha_cortex.config import paths
+
 from . import registry
 
 
-from ..coordinator.spool_slot import (
+from .surfaces import (
     PER_JOB_WRITABLE_SURFACES,
     PerJobWritableSurface,
-    publish_runtime_credential_command,
     writable_surface,
 )
 
@@ -3012,6 +3013,13 @@ class PathLayout:
         """
         return f"{self.job_spec_spool_root}/{principal.value}"
 
+    def job_prompt_root_for(self, principal: Principal) -> str:
+        """Dedicated Manager-owned prompt root for one model principal."""
+
+        if principal not in registry.PROMPT_JOB_PRINCIPALS:
+            raise ValueError(f"prompt root is not applicable to {principal.value}")
+        return f"{self.coordinator_root}/{paths.JOB_PROMPT_ROOT_DIRNAME}/{principal.value}"
+
     @property
     def bin_root(self) -> str:
         """部署樹的可執行檔目錄（root-owned）——降權 shim 住這裡。"""
@@ -3514,6 +3522,15 @@ class PathLayout:
                 )
                 for principal in registry.DOWNGRADED_JOB_PRINCIPALS
             },
+            # Dedicated prompt roots are Manager-owned siblings of the spec
+            # spools.  The permission plan, not scaffold code, owns their
+            # install and ACL recipe.
+            **{
+                registry.job_prompt_root_asset_id(principal): self.job_prompt_root_for(
+                    principal
+                )
+                for principal in registry.PROMPT_JOB_PRINCIPALS
+            },
             # #629 gate 執行身分：拋棄式工作區 pool ＋ ledger 單向 spool。
             # 工作區 pool 登記的是**容器**（不帶 per-job segment）：它只有一個 writer
             # ＝`cortex-gate`，因此容器本身就 owner-only 0700，per-job 那一格由 gate
@@ -3746,6 +3763,15 @@ class PathLayout:
                 f"install -m 0644 {qsrc}/hooks.json \"$tmp/hooks.json\" && "
                 f"cp -R --no-preserve=all {qsrc}/plugins \"$tmp/plugins\" && "
                 f"cp -R --no-preserve=all {qsrc}/skills \"$tmp/skills\" && "
+                # ``--no-preserve=all`` must be backed by a post-copy shape
+                # check: no symlink/special node, no inherited hardlink
+                # identity, and (where available) no copied xattr.
+                f"test -z \"$(find \"$tmp/plugins\" \"$tmp/skills\" "
+                f"\\( -type l -o \\( ! -type d ! -type f \\) -o -links +1 "
+                f"\\) -print -quit)\" && "
+                f"if command -v getfattr >/dev/null 2>&1; then "
+                f"test -z \"$(getfattr -R -d --absolute-names \"$tmp/plugins\" \"$tmp/skills\" "
+                f"2>/dev/null | sed '/^# file:/d;/^$/d')\"; fi && "
                 f"chown -R {root}:{scheme.group_of(root)} \"$tmp\" && "
                 f"find \"$tmp\" -type d -exec chmod 0755 {{}} + && "
                 f"find \"$tmp\" -type f -exec chmod 0644 {{}} + && "
@@ -3798,19 +3824,7 @@ DEFAULT_LAYOUT = PathLayout()
 
 def _surface_root(row: PerJobWritableSurface, layout: PathLayout) -> str:
     """Resolve a table row against the deployment layout used by the unit."""
-    if row.surface_id == "monitor-event-spool":
-        return f"{layout.agents_root}/monitor/event-spool"
-    if row.surface_id.endswith("-job-log"):
-        principal = row.principals[0]
-        return layout.job_log_spool_root(Principal(principal))
-    if row.surface_id.endswith("-codex-home"):
-        return f"{layout.agents_root}/runtime/codex-home/{row.principals[0]}"
-    if row.surface_id.endswith("-runtime-cache"):
-        return f"{layout.agents_root}/runtime/job-cache/{row.principals[0]}"
-    accessor = getattr(layout, row.path_accessor, None)
-    if accessor is None:
-        raise ValueError(f"surface {row.surface_id!r} has no layout accessor")
-    return str(accessor() if callable(accessor) else accessor)
+    return row.root_for(layout)
 
 
 def _surface_slot(
@@ -7119,6 +7133,10 @@ def build_job_unit(
     # 產生本檔的旗標必須跟著角色走：註解裡寫著「重跑用 --job」卻產出 reviewer／gate
     # 的 unit，會讓 operator 照抄之後拿到**另一份** unit 覆蓋掉這一份。
     unit_flag = JOB_UNIT_CLI_FLAG[principal]
+    # Lazy import avoids a package-init cycle: coordinator.spool_slot consumes
+    # the typed surface rows while this generator only needs the publisher
+    # command text at unit-render time.
+    from ..coordinator.spool_slot import publish_runtime_credential_command
 
     body = [
         f"# {'/etc/systemd/system/' + unit_name}",

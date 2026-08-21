@@ -24,3 +24,5 @@
 # Repair: whitelist the four canonical control leaves during atomic migration, normalize root-owned readable modes, reject symlink/special descendants, and publish atomic builder/reviewer auth refreshes through a named Manager ACL after unit termination.
 
 # Repair: route isolated Claude/CG workflow prompts through bounded Manager-created per-job files (with Manager-side termination cleanup), derive Codex credential harvest from typed runtime surfaces with durable fail-closed diagnostics, and pin Codex reasoning effort for the two deployed model identities.
+
+# Repair: place prompt files under Manager-owned non-renameable per-principal roots, retain durable orphan diagnostics, and verify split-UID atomic auth refreshes plus source metadata stripping.

@@ -52,8 +52,15 @@ import pwd
 import shlex
 import shutil
 import stat
-from dataclasses import dataclass
 from pathlib import Path
+
+from ..trust_root.surfaces import (
+    PER_JOB_WRITABLE_SURFACES,
+    PerJobWritableSurface,
+    codex_runtime_surface,
+    credential_publisher_command,
+    writable_surface,
+)
 
 #: `review-verdict-spool` 那一格裡的成果檔名（目錄本身以 reviewer job id 定址）。
 #: 定義放在共用層是為了讓 `launcher` 組 wrapper 的發表段時不必回頭 import
@@ -186,19 +193,11 @@ def publish_runtime_credential_command(
     owned refresh readable by Manager.  The slot directory still denies every
     foreign principal traversal.
     """
-    if not manager_account or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", manager_account):
-        raise ValueError(f"unsafe manager account: {manager_account!r}")
-    auth = f'{codex_home}/auth.json' if codex_home == "$CODEX_HOME" else str(Path(codex_home) / "auth.json")
-    quoted = '"$CODEX_HOME/auth.json"' if codex_home == "$CODEX_HOME" else shlex.quote(auth)
-    # A seed copied in by Manager is deliberately left untouched: the job UID
-    # cannot chmod/setfacl that inode and an unchanged login must not turn a
-    # successful unit into an ExecStopPost failure.  An atomic refresh replaces
-    # it with a job-owned inode, for which the producer is the only authority
-    # permitted to widen the ACL mask for Manager harvest.
-    return (
-        f"if test -f {quoted} && test ! -L {quoted} && test -O {quoted}; then "
-        f"chmod 0640 {quoted} && "
-        f"setfacl -m u:{manager_account}:r--,m::r-- {quoted}; fi"
+    # The executable recipe is owned by the typed Codex rows.  This wrapper
+    # preserves the historical public helper without keeping a second ACL
+    # truth in the spool implementation.
+    return credential_publisher_command(
+        manager_account=manager_account, codex_home=codex_home
     )
 
 
@@ -215,74 +214,12 @@ def _apply_slot_acl(
         binary = "/usr/bin/setfacl" if Path("/usr/bin/setfacl").is_file() else None
     if binary is None:
         raise SpoolSlotError("acl", "setfacl is required for per-job runtime projection")
-    perms = surface.acl_perms(writable=writable)
-    spec = f"u:{account}:{perms}"
-    if path.is_dir():
-        spec += f",d:u:{account}:{perms}"
+    spec = surface.acl_argument(
+        account=account, writable=writable, directory=path.is_dir()
+    )
     argv = (binary, "-R", "-m", spec, str(path))
     if os.spawnv(os.P_WAIT, binary, argv) != 0:
         raise SpoolSlotError("acl", f"failed to apply per-job ACL: {path}")
-
-
-@dataclass(frozen=True)
-class PerJobWritableSurface:
-    """One row wired into path lookup, unit generation and runtime consumers."""
-
-    surface_id: str
-    path_accessor: str
-    coordinator_relative: str
-    provisioner: str
-    consumer: str
-    probe: str
-    principals: tuple[str, ...]
-    asset_id: str
-    # ACL recipes are part of the same typed row as the path and consumer.
-    # Runtime code must not invent a second ``rwX``/``r-X`` table.
-    slot_access_perms: str = "rwX"
-    slot_read_perms: str = "r-X"
-
-    def acl_perms(self, *, writable: bool) -> str:
-        return self.slot_access_perms if writable else self.slot_read_perms
-
-    @property
-    def writable_root(self) -> str:
-        from ..config import paths
-
-        if self.surface_id.endswith("-codex-home"):
-            return str(paths.agents_root() / "runtime" / "codex-home" / self.principals[0])
-        if self.surface_id.endswith("-runtime-cache"):
-            return str(paths.agents_root() / "runtime" / "job-cache" / self.principals[0])
-        accessor = getattr(paths, self.path_accessor)
-        if self.surface_id.endswith(("-job-log", "-codex-home", "-runtime-cache")):
-            return str(accessor(self.principals[0]))
-        return str(accessor())
-
-    @property
-    def slot_template(self) -> str:
-        return f"{self.writable_root}/%i"
-
-
-PER_JOB_WRITABLE_SURFACES: tuple[PerJobWritableSurface, ...] = (
-    PerJobWritableSurface("commit-spool", "commit_spool_root", "commit-spool", "create_slot", "commit_bundle_path", "render_job_writable_properties", ("builder",), "commit-spool"),
-    PerJobWritableSurface("monitor-event-spool", "monitor_event_spool_root", "monitor/event-spool", "create_slot", "EventSpool", "render_job_writable_properties", ("builder",), "monitor-event-spool"),
-    PerJobWritableSurface("review-verdict-spool", "review_verdict_spool_root", "review-verdicts", "create_slot", "review_verdict_spool_path", "render_job_writable_properties", ("reviewer",), "review-verdict-spool"),
-    PerJobWritableSurface("gate-ledger-spool", "gate_ledger_spool_root", "gate-ledger-spool", "create_slot", "gate_spool_ledger_path", "render_job_writable_properties", ("gate",), "gate-ledger-spool"),
-    PerJobWritableSurface("gate-worktree", "gate_worktree_root", "gate-worktree", "create_slot", "gate_worktree_dir", "render_job_writable_properties", ("gate",), "gate-worktree-pool"),
-    PerJobWritableSurface("builder-job-log", "job_log_spool_root", "commit-spool/build-logs", "prepare_job_log", "prepare_job_log_spool", "build_job_log_probe", ("builder",), "build-job-log-spool"),
-    PerJobWritableSurface("reviewer-job-log", "job_log_spool_root", "review-verdicts/planning-logs", "prepare_job_log", "PlanningJobInvoker", "build_job_log_probe", ("reviewer",), "planning-job-log-spool"),
-    PerJobWritableSurface("gate-job-log", "job_log_spool_root", "gate-ledger-spool/gate-logs", "prepare_job_log", "prepare_gate_job_log", "build_job_log_probe", ("gate",), "gate-job-log-spool"),
-    PerJobWritableSurface("builder-codex-home", "builder_job_codex_home_root", "runtime/codex-home/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "builder-job-codex-home-root"),
-    PerJobWritableSurface("reviewer-codex-home", "reviewer_job_codex_home_root", "runtime/codex-home/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "reviewer-job-codex-home-root"),
-    PerJobWritableSurface("builder-runtime-cache", "builder_job_cache_root", "runtime/job-cache/builder", "create_slot", "build_job_env", "codex_runtime_probe", ("builder",), "builder-job-cache-root"),
-    PerJobWritableSurface("reviewer-runtime-cache", "reviewer_job_cache_root", "runtime/job-cache/reviewer", "create_slot", "build_job_env", "codex_runtime_probe", ("reviewer",), "reviewer-job-cache-root"),
-)
-
-
-def writable_surface(surface_id: str) -> PerJobWritableSurface:
-    try:
-        return next(row for row in PER_JOB_WRITABLE_SURFACES if row.surface_id == surface_id)
-    except StopIteration as exc:
-        raise ValueError(f"unknown writable surface: {surface_id!r}") from exc
 
 
 def _copy_regular_tree(source: Path, destination: Path) -> None:
