@@ -230,6 +230,12 @@ class RuntimeSurfaceProvisionTests(unittest.TestCase):
         authority.write_text('{"seed":true}\n')
         return canonical
 
+    def _seed_copilot_authority(self, tmp_path: Path) -> Path:
+        authority = tmp_path / "copilot-authority" / "config.json"
+        authority.parent.mkdir(parents=True, exist_ok=True)
+        authority.write_text('{"oauth":"seed"}\n')
+        return authority
+
     def test_builder_provisioning_enumerates_every_typed_slot(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
@@ -287,6 +293,92 @@ class RuntimeSurfaceProvisionTests(unittest.TestCase):
             {surface_id for surface_id, _writable in applied},
             {"builder-codex-home", "builder-runtime-cache"},
         )
+
+    def test_copilot_authority_requires_absolute_locked_manager_owned_file(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            authority = self._seed_copilot_authority(root)
+            with unittest.mock.patch.dict(
+                os.environ, {"PSC_COPILOT_OAUTH_CONFIG": str(authority)}, clear=False
+            ):
+                self.assertEqual(spool_slot.copilot_oauth_authority(), authority)
+            with unittest.mock.patch.dict(
+                os.environ, {"PSC_COPILOT_OAUTH_CONFIG": "relative/config.json"}, clear=False
+            ):
+                with self.assertRaises(spool_slot.SpoolSlotError):
+                    spool_slot.copilot_oauth_authority()
+            linked = root / "copilot-authority-link.json"
+            linked.symlink_to(authority)
+            with unittest.mock.patch.dict(
+                os.environ, {"PSC_COPILOT_OAUTH_CONFIG": str(linked)}, clear=False
+            ):
+                with self.assertRaises(spool_slot.SpoolSlotError):
+                    spool_slot.copilot_oauth_authority()
+            authority.chmod(0o662)
+            with unittest.mock.patch.dict(
+                os.environ, {"PSC_COPILOT_OAUTH_CONFIG": str(authority)}, clear=False
+            ):
+                with self.assertRaises(spool_slot.SpoolSlotError):
+                    spool_slot.copilot_oauth_authority()
+
+    def test_copilot_authority_rejects_foreign_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            authority = self._seed_copilot_authority(root)
+            foreign_manager_uid = os.getuid() + 1
+            if os.getuid() == 0:
+                os.chown(authority, 1, authority.stat().st_gid)
+                foreign_manager_uid = 2
+            with unittest.mock.patch.object(
+                spool_slot.os, "getuid", return_value=foreign_manager_uid
+            ), unittest.mock.patch.dict(
+                os.environ, {"PSC_COPILOT_OAUTH_CONFIG": str(authority)}, clear=False
+            ):
+                with self.assertRaises(spool_slot.SpoolSlotError):
+                    spool_slot.copilot_oauth_authority()
+
+    def test_provision_copilot_home_copies_authority_and_preserves_job_cache(self) -> None:
+        applied: list[tuple[Path, str, bool, str]] = []
+
+        def _record_acl(path: Path, *, account: str, writable: bool, surface) -> None:
+            applied.append((Path(path), account, writable, surface.surface_id))
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with unittest.mock.patch.dict(os.environ, {"PSC_AGENTS_ROOT": str(root)}, clear=False):
+                canonical = self._seed_builder_projection(root)
+                authority = self._seed_copilot_authority(root)
+                spool_slot.provision_runtime_surfaces(
+                    principal="builder", job_id="job-a", canonical_codex_home=canonical
+                )
+                home = spool_slot.provision_copilot_home(
+                    principal="builder", job_id="job-a", authority=authority
+                )
+                self.assertEqual(
+                    home,
+                    spool_slot.canonical_job_slot("builder-runtime-cache", "job-a") / "copilot",
+                )
+                self.assertEqual((home / "config.json").read_text(), '{"oauth":"seed"}\n')
+                self.assertEqual((home / "config.json").stat().st_mode & 0o222, 0)
+                session_state = home / "state.sqlite"
+                session_state.write_text("keep\n")
+                authority.write_text('{"oauth":"rotated"}\n')
+                with unittest.mock.patch.object(
+                    spool_slot, "_apply_slot_acl", side_effect=_record_acl
+                ):
+                    reprovisioned = spool_slot.provision_copilot_home(
+                        principal="builder",
+                        job_id="job-a",
+                        authority=authority,
+                        account="cortex-builder",
+                    )
+                self.assertEqual(reprovisioned, home)
+                self.assertEqual((home / "config.json").read_text(), '{"oauth":"rotated"}\n')
+                self.assertEqual(session_state.read_text(), "keep\n")
+                self.assertIn(
+                    (home / "config.json", "cortex-builder", False, "builder-runtime-cache"),
+                    applied,
+                )
 
 
 def test_one_canonical_table_covers_every_declared_writable_surface() -> None:

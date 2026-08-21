@@ -27,6 +27,10 @@
   builder/reviewer writable slot before start, surfaces malformed rows with
   the surface id and exact slot path, and keeps write-only rows on their
   deployment ACL instead of the runtime-cache ACL widening path.
+- **#718 repair:** downgraded Copilot template jobs now require a
+  Manager-selected canonical OAuth `config.json`, seed a private per-job
+  `COPILOT_HOME` under the runtime-cache slot, disable auto-update in the
+  spec, and refuse broad GitHub token env passthrough.
 - **#718：建立五面向 per-job writable surface 單一真相與 instance-scoped slot helper；Codex `exec` 固定帶 `--ignore-user-config`，並同步更新 argv golden pins。**
 - **#718（RED）：新增 per-job trust-root writable-surface isolation regression contract tests**，鎖定 canonical surface table、instance-scoped slot、foreign-slot boundary 與 fail-closed slot shape。
 - **#776 補遺：archive 前補齊舊 manifest 世代的 openspec change scaffold**（canonical-specs-invalid 修復）。

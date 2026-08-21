@@ -3,48 +3,47 @@ status: accepted
 work_item: trust-root-isolation
 issue: 718
 scope_excludes:
-  - copilot-oauth-home
+  - executor-toolchain
   - egress-allowlist
   - phase-3-signing
 ---
 
-# #718 frozen Copilot toolchain and xhigh argv
+# #718 per-job Copilot OAuth home
 
-The live `c4d5a6d` candidate still needs an operator wrapper. Generated
-toolchain metadata treats Copilot as a single forwarding shell file, so the
-job can fall through to `/usr/bin/copilot` 0.0.330 instead of the operator's
-Copilot CLI 1.0.80. Its PATH can also resolve a stale
-`/opt/cortex/toolchain/bin/node --jitless` wrapper; Copilot uses WebAssembly and
-must run under the JIT profile with the real system Node. The requested builder
-shape is model `gpt-5.4`, effort `xhigh`.
+The downgraded live Copilot CLI 1.0.80 is already authenticated through the
+operator's OAuth config, but the template job's `HOME=/var/lib/cortex-builder`
+is root-owned and not writable. With no per-job `COPILOT_HOME`, the job cannot
+read the operator login or create its session database. Broad `GH_TOKEN` /
+`GITHUB_TOKEN` injection is not acceptable for the downgraded trust boundary.
 
 Make one minimal Conventional Commit referencing `#718`. Change only:
 
-- `paulsha_cortex/trust_root/permgen.py`
+- `paulsha_cortex/coordinator/spool_slot.py`
 - `paulsha_cortex/coordinator/launcher.py`
-- `tests/test_trust_root_executor_toolchain_640.py`
+- `tests/test_trust_root_isolation_718.py`
 - `tests/test_coordinator_launcher.py`
 
 Repair exactly:
 
-1. Model Copilot as a Node package that must be frozen as one complete package
-   tree under the root-owned toolchain. Resolve the operator-selected entrypoint
-   to its actual package root (the directory containing that package's
-   `package.json`), copy that tree, and generate a root-owned toolchain wrapper
-   that invokes the copied local entrypoint. It must never forward or fall back
-   to `/usr/bin/copilot` or another PATH-selected Copilot.
-2. The generated wrapper must invoke the deployment-validated absolute system
-   Node binary directly, not `env node` and not any `toolchain/bin/node`
-   shadow. Do not add `--jitless` or `NODE_OPTIONS`; the existing Copilot JIT
-   hardening profile is authoritative. Add a probe that proves a minimal
-   WebAssembly module works with that same Node execution path.
-3. The deployment plan/probes must fail closed if the package root, copied
-   entrypoint, absolute Node runtime, version output, or no-fallback invariant
-   is missing. Preserve root ownership and read/execute-only job access.
-4. Extend Copilot argv with a validated effort (`low|medium|high|xhigh`) and use
-   `xhigh` by default. `SubprocessLauncher` must pass an explicit effort through
-   to Copilot as it already does for `cg`; model `gpt-5.4` plus default effort
-   must produce `--model gpt-5.4 --effort xhigh` exactly once.
+1. Add one Manager-selected environment setting naming the canonical Copilot
+   OAuth `config.json` authority. For a downgraded Copilot launch, require an
+   absolute, readable, non-symlink regular file owned by root or the Manager
+   identity, with no group/other write bits. Missing/malformed authority must
+   fail before spec write / `systemctl start`, without printing credential
+   bytes.
+2. Inside the already-canonical per-job builder runtime-cache slot, create a
+   private `copilot` home, atomically copy the authority to `config.json`, and
+   grant only that job account the access needed to read the copy and write its
+   own session/cache files. Do not make the canonical authority job-writable and
+   do not share a writable home between jobs.
+3. Put exact `COPILOT_HOME=<per-job-cache>/copilot` and
+   `COPILOT_AUTO_UPDATE=false` in the Manager-owned job spec. Assert that
+   `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, and `GITHUB_TOKEN` are absent from a
+   downgraded Copilot job even when present in the Manager process environment.
+4. Preserve the existing direct-mode token normalization for backward
+   compatibility; the no-broad-token rule applies to downgraded template jobs.
+   Do not log, checksum, or snapshot OAuth bytes.
 
-Add focused generator/argv tests, run the toolchain and launcher test files,
-commit all changes including this plan, and leave the worktree clean.
+Add tests for exact per-job isolation, source ownership/mode/symlink rejection,
+pre-start failure ordering, and token absence. Run the trust-root and launcher
+tests, commit all changes including this plan, and leave the worktree clean.

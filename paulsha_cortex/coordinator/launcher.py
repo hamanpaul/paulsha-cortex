@@ -1830,25 +1830,35 @@ class SubprocessLauncher:
         # 繼續用它只會把 daemon 的 HOME／PATH／VIRTUAL_ENV 硬塞進一個跑在別的 UID
         # 上、根本進不去那些路徑的行程。
         if degraded:
+            runtime_account_name = job_runner.resolve_job_account(os.environ, role=job_role)
+            runtime_account = (
+                runtime_account_name
+                if spool_slot.system_account_exists(runtime_account_name)
+                else None
+            )
             # #588 第 1 點的結構性解法：降權 unit **不繼承呼叫端的 environ**，
             # 因此 job 的環境就是這份白名單本身（不是「daemon environ 減去黑名單」）。
             # gh token、daemon 的 CLAUDE_CONFIG_DIR 都不在白名單上，因此不會出現在
             # job 裡——包括 `_copilot_credential_env()` 也因此自然回傳空 dict（它讀的是
             # 這份 env，裡面沒有任何 token 候選），不必為降權模式另設特例。
             spool_slot.provision_runtime_surfaces(
-                principal=job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
+                principal=runtime_principal,
                 job_id=slice_id,
                 canonical_codex_home=spool_slot.canonical_codex_controls(
-                    job_runner.JOB_ROLE_CONFIG[job_role].log_spool_principal,
+                    runtime_principal,
                     manager_env=os.environ,
                 ),
-                account=(
-                    job_runner.resolve_job_account(os.environ, role=job_role)
-                    if spool_slot.system_account_exists(
-                        job_runner.resolve_job_account(os.environ, role=job_role)
-                    ) else None
-                ),
+                account=runtime_account,
             )
+            copilot_home: Path | None = None
+            if self._executor == "copilot":
+                authority = spool_slot.copilot_oauth_authority(manager_env=os.environ)
+                copilot_home = spool_slot.provision_copilot_home(
+                    principal=runtime_principal,
+                    job_id=slice_id,
+                    authority=authority,
+                    account=runtime_account,
+                )
             env = job_runner.build_job_env(
                 manager_env=os.environ,
                 job_id=slice_id,
@@ -1864,6 +1874,13 @@ class SubprocessLauncher:
                 relay_target=self._relay_target,
                 role=job_role,
             )
+            if self._executor == "copilot":
+                if copilot_home is None:
+                    raise AssertionError("downgraded Copilot home must be provisioned")
+                env["COPILOT_HOME"] = str(copilot_home)
+                env["COPILOT_AUTO_UPDATE"] = "false"
+                for token_name in _COPILOT_TOKEN_ENV_VARS:
+                    env.pop(token_name, None)
         elif self._review_only:
             env = _review_scope_env()
         else:

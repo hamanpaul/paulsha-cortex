@@ -1502,6 +1502,9 @@ class ArgvTests(unittest.TestCase):
         credentials = root / "credentials" / "builder"
         credentials.mkdir(parents=True, exist_ok=True)
         (credentials / "auth.json").write_text('{"refresh":"seed"}\n')
+        copilot = root / "copilot-authority"
+        copilot.mkdir(parents=True, exist_ok=True)
+        (copilot / "config.json").write_text('{"oauth":"seed"}\n')
 
     def test_template_launch_uses_instance_named_log_slot_and_explicit_control_anchor(self) -> None:
         captured: dict[str, object] = {}
@@ -1542,6 +1545,9 @@ class ArgvTests(unittest.TestCase):
                     return {
                         "PATH": os.environ.get("PATH", ""),
                         "HOME": str(root),
+                        "COPILOT_GITHUB_TOKEN": "copilot-token",
+                        "GH_TOKEN": "gh-token",
+                        "GITHUB_TOKEN": "github-token",
                         "PSC_JOB_ID": slice_id,
                         "PSC_SLICE_ID": slice_id,
                         "PSC_REPO_ROOT": str(root),
@@ -1590,6 +1596,14 @@ class ArgvTests(unittest.TestCase):
                 ), mock.patch.object(
                     launcher_module.spool_slot, "provision_runtime_surfaces"
                 ), mock.patch.object(
+                    launcher_module.spool_slot,
+                    "copilot_oauth_authority",
+                    return_value=root / "copilot-authority" / "config.json",
+                ), mock.patch.object(
+                    launcher_module.spool_slot,
+                    "provision_copilot_home",
+                    return_value=root / "runtime" / "job-cache" / "builder" / instance / "copilot",
+                ), mock.patch.object(
                     launcher_module.job_runner, "ensure_workspace_reachable"
                 ), mock.patch.object(
                     launcher_module.job_runner,
@@ -1617,6 +1631,13 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(confirmed["log_path"], expected_control_log)
         self.assertEqual(confirmed["job_log_path"], handle.log_path)
         self.assertEqual(Path(handle.control_log_path).stem, slice_id)
+        self.assertEqual(
+            spec["env"]["COPILOT_HOME"],
+            str(Path(expected_control_log).parent.parent / "job-cache" / "builder" / instance / "copilot"),
+        )
+        self.assertEqual(spec["env"]["COPILOT_AUTO_UPDATE"], "false")
+        for token_name in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            self.assertNotIn(token_name, spec["env"])
 
     def test_template_launch_provisions_all_builder_surfaces_before_systemctl_start(self) -> None:
         captured: dict[str, object] = {}
@@ -1637,7 +1658,18 @@ class ArgvTests(unittest.TestCase):
                     slot.is_dir(),
                     f"{surface_id} missing before systemctl start: {slot}",
                 )
+            copilot_home = expected_slots["builder-runtime-cache"] / "copilot"
+            self.assertTrue(
+                copilot_home.is_dir(),
+                f"copilot home missing before systemctl start: {copilot_home}",
+            )
+            self.assertTrue((copilot_home / "config.json").is_file())
             self.assertTrue(Path(captured["spec"]["log_path"]).exists())
+            self.assertEqual(captured["spec"]["env"]["COPILOT_HOME"], str(copilot_home))
+            self.assertEqual(captured["spec"]["env"]["COPILOT_AUTO_UPDATE"], "false")
+            self.assertNotIn("COPILOT_GITHUB_TOKEN", captured["spec"]["env"])
+            self.assertNotIn("GH_TOKEN", captured["spec"]["env"])
+            self.assertNotIn("GITHUB_TOKEN", captured["spec"]["env"])
             captured["argv"] = argv
             captured["popen_kwargs"] = kwargs
             return _FakeProc()
@@ -1670,6 +1702,8 @@ class ArgvTests(unittest.TestCase):
                     return {
                         "PATH": os.environ.get("PATH", ""),
                         "HOME": str(root),
+                        "GH_TOKEN": "gh-token",
+                        "GITHUB_TOKEN": "github-token",
                         "PSC_JOB_ID": slice_id,
                         "PSC_SLICE_ID": slice_id,
                         "PSC_REPO_ROOT": str(root),
@@ -1690,6 +1724,7 @@ class ArgvTests(unittest.TestCase):
                         "PSC_AGENTS_ROOT": str(root),
                         "PSC_CODEX_CONTROL_ROOT": str(root / "codex-controls"),
                         "PSC_CODEX_CREDENTIAL_ROOT": str(root / "credentials"),
+                        "PSC_COPILOT_OAUTH_CONFIG": str(root / "copilot-authority" / "config.json"),
                     },
                     clear=False,
                 ), mock.patch.object(
@@ -1754,6 +1789,7 @@ class ArgvTests(unittest.TestCase):
                     "PSC_AGENTS_ROOT": str(root),
                     "PSC_CODEX_CONTROL_ROOT": str(root / "codex-controls"),
                     "PSC_CODEX_CREDENTIAL_ROOT": str(root / "credentials"),
+                    "PSC_COPILOT_OAUTH_CONFIG": str(root / "copilot-authority" / "config.json"),
                 },
                 clear=False,
             ):
@@ -1786,6 +1822,79 @@ class ArgvTests(unittest.TestCase):
                         )
                 self.assertIn("monitor-event-spool", str(raised.exception))
                 self.assertIn(str(event_slot), str(raised.exception))
+
+    def test_template_launch_rejects_invalid_copilot_authority_before_spec_write(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            slice_id = "wf-" + ("q" * 96)
+            instance = launcher_module.job_runner.template_instance_id(slice_id)
+            plan = launcher_module.job_runner.SystemdTemplatePlan(
+                binary="systemctl",
+                template_unit="cortex-builder-job@.service",
+                instance=instance,
+                unit=f"cortex-builder-job@{instance}.service",
+                account="cortex-builder",
+                group="cortex-builder",
+                shim="/usr/bin/psc-job-shim",
+                spool_dir=str(root / "job-specs"),
+                spec_path=str(root / "job-specs" / f"{instance}.json"),
+                hardening_profile="strict",
+                executor="copilot",
+                base_template_unit="cortex-builder-job@.service",
+                role=launcher_module.job_runner.JOB_ROLE_BUILDER,
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PSC_JOB_RUNNER": launcher_module.job_runner.RUNNER_SYSTEMD_TEMPLATE,
+                    "PSC_AGENTS_ROOT": str(root),
+                },
+                clear=False,
+            ), mock.patch.object(
+                launcher_module.job_runner, "prepare_systemd_template", return_value=plan
+            ), mock.patch.object(
+                launcher_module.spool_slot, "system_account_exists", return_value=False
+            ), mock.patch.object(
+                launcher_module.spool_slot,
+                "canonical_codex_controls",
+                return_value=str(root / "codex-controls" / "builder"),
+            ), mock.patch.object(
+                launcher_module.spool_slot, "provision_runtime_surfaces"
+            ), mock.patch.object(
+                launcher_module.spool_slot,
+                "copilot_oauth_authority",
+                side_effect=launcher_module.spool_slot.SpoolSlotError(
+                    "credential", "canonical Copilot OAuth authority is unavailable"
+                ),
+            ), mock.patch.object(
+                launcher_module.job_runner,
+                "build_job_env",
+                side_effect=AssertionError("build_job_env must not run"),
+            ), mock.patch.object(
+                launcher_module.job_runner,
+                "build_job_spec",
+                side_effect=AssertionError("build_job_spec must not run"),
+            ), mock.patch.object(
+                launcher_module.job_runner,
+                "write_job_spec",
+                side_effect=AssertionError("write_job_spec must not run"),
+            ), mock.patch.object(
+                launcher_module.job_runner,
+                "build_systemctl_start_argv",
+                side_effect=AssertionError("systemctl start argv must not run"),
+            ), mock.patch.object(
+                launcher_module.subprocess,
+                "Popen",
+                side_effect=AssertionError("systemctl start must not run"),
+            ):
+                with self.assertRaises(launcher_module.spool_slot.SpoolSlotError) as raised:
+                    SubprocessLauncher("copilot").launch(
+                        slice_id=slice_id,
+                        prompt="PROMPT",
+                        worktree=str(root),
+                        log_dir=str(root / "runtime" / "dispatch"),
+                    )
+            self.assertIn("Copilot OAuth authority", str(raised.exception))
 
     def test_launch_sentinel_is_absolute_cwd_independent(self) -> None:
         # bug：相對 log_dir + 子進程 cwd=worktree → sentinel 寫到 worktree（poller 找不到）。

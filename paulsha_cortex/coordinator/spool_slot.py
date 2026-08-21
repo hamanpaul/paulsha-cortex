@@ -101,6 +101,9 @@ SEALED_SLOT_MODE = 0o500
 ACCESS_ACL_XATTR = "system.posix_acl_access"
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_COPILOT_OAUTH_CONFIG_ENV = "PSC_COPILOT_OAUTH_CONFIG"
+_COPILOT_HOME_DIRNAME = "copilot"
+_COPILOT_CONFIG_FILENAME = "config.json"
 
 
 def system_account_exists(account: str) -> bool:
@@ -160,6 +163,61 @@ def readable_codex_home(
                 stream.read(1)
     except (FileNotFoundError, NotADirectoryError, PermissionError):
         raise SpoolSlotError("control", f"canonical Codex controls are unreadable: {candidate}")
+    return candidate
+
+
+def copilot_oauth_authority(
+    *, manager_env: dict[str, str] | os._Environ[str] | None = None
+) -> Path:
+    """Validate the Manager-selected Copilot OAuth authority file."""
+
+    env = os.environ if manager_env is None else manager_env
+    configured = str(env.get(_COPILOT_OAUTH_CONFIG_ENV, "")).strip()
+    if not configured:
+        raise SpoolSlotError(
+            "credential",
+            f"{_COPILOT_OAUTH_CONFIG_ENV} must name the canonical Copilot OAuth authority",
+        )
+    candidate = Path(configured)
+    if not candidate.is_absolute():
+        raise SpoolSlotError(
+            "shape", f"canonical Copilot OAuth authority must be absolute: {candidate}"
+        )
+    fd = -1
+    try:
+        fd = os.open(str(candidate), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SpoolSlotError("shape", f"canonical Copilot OAuth authority is malformed: {candidate}")
+        if info.st_uid not in {0, os.getuid()}:
+            raise SpoolSlotError(
+                "permission", f"canonical Copilot OAuth authority has unexpected owner: {candidate}"
+            )
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise SpoolSlotError(
+                "permission",
+                f"canonical Copilot OAuth authority must not be group/other writable: {candidate}",
+            )
+        os.read(fd, 1)
+    except FileNotFoundError as exc:
+        raise SpoolSlotError(
+            "credential", f"canonical Copilot OAuth authority is unavailable: {candidate}"
+        ) from exc
+    except PermissionError as exc:
+        raise SpoolSlotError(
+            "credential", f"canonical Copilot OAuth authority is unreadable: {candidate}"
+        ) from exc
+    except OSError as exc:
+        if candidate.is_symlink():
+            raise SpoolSlotError(
+                "shape", f"canonical Copilot OAuth authority is malformed: {candidate}"
+            ) from exc
+        raise SpoolSlotError(
+            "credential", f"canonical Copilot OAuth authority is unavailable: {candidate}"
+        ) from exc
+    finally:
+        if fd != -1:
+            os.close(fd)
     return candidate
 
 
@@ -288,7 +346,7 @@ def _copy_regular_tree(source: Path, destination: Path) -> None:
         raise
 
 
-def _copy_control_file(source: Path, destination: Path) -> None:
+def _copy_control_file(source: Path, destination: Path, *, mode: int = 0o644) -> None:
     """Atomically copy one regular control file with no source metadata."""
 
     if source.is_symlink() or not source.is_file():
@@ -299,7 +357,7 @@ def _copy_control_file(source: Path, destination: Path) -> None:
     try:
         fd = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            out = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            out = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
             try:
                 with os.fdopen(fd, "rb") as source_file, os.fdopen(out, "wb") as target_file:
                     shutil.copyfileobj(source_file, target_file)
@@ -313,13 +371,40 @@ def _copy_control_file(source: Path, destination: Path) -> None:
         finally:
             if fd != -1:
                 os.close(fd)
-        os.chmod(temporary, 0o644)
+        os.chmod(temporary, mode)
         if destination.is_symlink() or (destination.exists() and not destination.is_file()):
             raise SpoolSlotError("shape", f"control destination is malformed: {destination}")
         os.rename(temporary, destination)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def provision_copilot_home(
+    *,
+    principal: str,
+    job_id: str,
+    authority: str | Path,
+    account: str | None = None,
+) -> Path:
+    """Seed one private per-job Copilot home inside the runtime-cache slot."""
+
+    cache_row = writable_surface(f"{principal}-runtime-cache")
+    slot = validate_job_slot_shape(canonical_job_slot(cache_row.surface_id, job_id))
+    home = slot / _COPILOT_HOME_DIRNAME
+    if home.is_symlink() or (home.exists() and not home.is_dir()):
+        raise SpoolSlotError("shape", f"copilot home is malformed: {home}")
+    if not home.exists():
+        home.mkdir()
+    narrow_inherited_mode(home)
+    config = home / _COPILOT_CONFIG_FILENAME
+    if config.is_symlink() or (config.exists() and not config.is_file()):
+        raise SpoolSlotError("shape", f"copilot config destination is malformed: {config}")
+    _copy_control_file(Path(authority), config, mode=0o600)
+    os.chmod(config, 0o400)
+    if account is not None:
+        _apply_slot_acl(config, account=account, writable=False, surface=cache_row)
+    return home
 
 
 def provision_runtime_surfaces(
