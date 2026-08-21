@@ -357,7 +357,7 @@ def test_job_template_unit_excludes_the_source_tree_but_keeps_its_own_clone(sche
     # 逐字出現在 `ReadOnlyPaths=` 上，否則本形狀比 #640 淨退一層。
     hooks = job_layout.asset_paths()[f"{_prefix_of(unit.account)}-codex-hooks"]
     assert hooks in unit.read_only_paths, (hooks, unit.read_only_paths)
-    assert any(_within(hooks, rwp) for rwp in unit.read_write_paths), "巢狀關係是前提"
+    assert not any(_within(hooks, rwp) for rwp in unit.read_write_paths)
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +415,7 @@ def test_builder_job_unit_can_write_the_commit_spool(scheme) -> None:
     """回收通道要成立，builder 的模板 unit 必須寫得進 spool（RWP 機械導出）。"""
     unit = build_job_unit(scheme, DEFAULT_LAYOUT)
     spool = DEFAULT_LAYOUT.asset_paths()["commit-spool"]
-    assert any(_within(spool, rwp) for rwp in unit.read_write_paths), (
+    assert spool + "/%i" in unit.read_write_paths, (
         scheme.scheme_id, unit.read_write_paths,
     )
     assert spool in unit.content

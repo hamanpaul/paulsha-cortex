@@ -183,19 +183,18 @@ class WritableSurfaceIsUnchangedTests(unittest.TestCase):
         paths_by_asset = LAYOUT.asset_paths()
         for spool in registry.JOB_LOG_SPOOLS:
             rwp = self._rwp(spool.principal)
-            self.assertNotIn(paths_by_asset[spool.asset_id], rwp, spool.asset_id)
-            # 但它的**通道**在——被涵蓋才是被吃掉的原因，不是「漏授」。
-            self.assertIn(paths_by_asset[spool.channel_asset_id], rwp, spool.asset_id)
+            self.assertIn(paths_by_asset[spool.asset_id] + "/%i", rwp, spool.asset_id)
+            self.assertNotIn(paths_by_asset[spool.channel_asset_id], rwp, spool.asset_id)
 
     def test_builder_unit_read_write_paths_match_the_field_evidence(self) -> None:
         self.assertEqual(
             self._rwp(Principal.BUILDER),
             (
-                "/var/lib/cortex-builder/.codex",
-                "/var/lib/cortex-builder/cache",
-                "/var/lib/cortex/coordinator/commit-spool",
-                "/var/lib/cortex/monitor/event-spool",
                 "/var/lib/cortex/worktree/%i",
+                "/var/lib/cortex/coordinator/commit-spool/%i",
+                "/var/lib/cortex/monitor/event-spool/%i",
+                "/var/lib/cortex/coordinator/commit-spool/build-logs/%i",
+                "/var/lib/cortex-builder/.codex/auth.json",
             ),
         )
 

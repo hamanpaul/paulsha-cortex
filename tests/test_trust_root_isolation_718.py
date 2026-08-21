@@ -22,6 +22,9 @@ EXPECTED_SURFACES = (
     "review-verdict-spool",
     "gate-ledger-spool",
     "gate-worktree",
+    "builder-job-log",
+    "reviewer-job-log",
+    "gate-job-log",
 )
 
 
@@ -48,12 +51,12 @@ def test_all_consumers_are_derived_from_the_same_surface_rows() -> None:
     rows = _surfaces()
     rendered = permgen.render_job_writable_properties(instance="job-a")
     assert rendered == tuple(
-        f"ReadWritePaths={spool_slot.canonical_job_slot(row.surface_id, 'job-a')}"
+        f"ReadWritePaths={row.writable_root}/{job_runner.template_instance_id('job-a')}"
         for row in rows
     )
 
 
-@pytest.mark.parametrize("surface_id", EXPECTED_SURFACES)
+@pytest.mark.parametrize("surface_id", EXPECTED_SURFACES[:5])
 def test_canonical_slot_is_instance_scoped_and_rejects_unsafe_identity(surface_id: str) -> None:
     own = spool_slot.canonical_job_slot(surface_id, "job-a")
     foreign = spool_slot.canonical_job_slot(surface_id, "job-b")
@@ -77,7 +80,7 @@ def test_slot_template_contains_concrete_instance_and_never_the_writable_root() 
         assert not rendered.startswith(row.writable_root + "/job-a/job-a")
 
 
-@pytest.mark.parametrize("surface_id", EXPECTED_SURFACES)
+@pytest.mark.parametrize("surface_id", EXPECTED_SURFACES[:5])
 def test_every_surface_slot_matches_the_systemd_instance(surface_id: str) -> None:
     raw_job_id = "wf-32bb2160d8-subagent-build-69"
     slot = spool_slot.canonical_job_slot(surface_id, raw_job_id)
@@ -142,3 +145,23 @@ def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
 def test_slot_shape_rejects_symlink_and_non_directory() -> None:
     with pytest.raises((ValueError, spool_slot.SpoolSlotError, NotImplementedError)):
         spool_slot.validate_job_slot_shape("/tmp/not-a-slot", allow_symlink=False)
+
+
+@pytest.mark.parametrize("principal", (
+    permgen.Principal.BUILDER,
+    permgen.Principal.REVIEWER,
+    permgen.Principal.GATE,
+))
+def test_production_job_unit_consumes_only_applicable_table_slots(principal) -> None:
+    unit = permgen.build_job_unit(permgen.FOUR_WAY_SCHEME, principal=principal)
+    applicable = tuple(
+        row for row in _surfaces() if principal.value in row.principals
+    )
+    for row in applicable:
+        expected = f"{permgen._surface_root(row, permgen.DEFAULT_LAYOUT)}/%i"
+        assert expected in unit.read_write_paths
+        assert row.writable_root not in unit.read_write_paths
+    for row in _surfaces():
+        assert row.writable_root not in unit.read_write_paths
+    assert not any(path.endswith("/cache") for path in unit.read_write_paths)
+    assert not any(path.endswith("/.codex") for path in unit.read_write_paths)

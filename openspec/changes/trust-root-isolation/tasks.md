@@ -9,7 +9,7 @@
 
 ## Task 2: Implement canonical slot derivation and provisioning
 
-- [x] Extend the single structured trust-root surface table and derive canonical paths and probe output from it.
+- [x] Extend the single structured trust-root surface table and derive production template-unit, replica/run-under, canonical path, and probe output from it.
 - [x] Update commit, event, verdict, ledger, and gate-worktree producers/consumers to use the digest-bearing systemd instance slot selected from Manager job identity.
 - [ ] Deploy generated units and run two-principal own/foreign byte-identity probes; this remains Manager/operator work and is not source-test evidence.
 

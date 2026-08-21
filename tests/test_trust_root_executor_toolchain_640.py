@@ -275,10 +275,13 @@ def test_the_state_tree_is_writable_but_the_hooks_file_is_mount_read_only(scheme
     unit = build_job_unit(scheme, DEFAULT_LAYOUT)
     tree = DEFAULT_LAYOUT.asset_paths()[CREDENTIAL]
     hooks = DEFAULT_LAYOUT.asset_paths()[HOOKS]
-    assert tree in unit.read_write_paths, unit.read_write_paths
+    assert tree not in unit.read_write_paths, unit.read_write_paths
+    assert DEFAULT_LAYOUT.credential_token_path_of(
+        DEFAULT_LAYOUT.builder_account, "codex"
+    ) in unit.read_write_paths
     assert hooks in unit.read_only_paths, unit.read_only_paths
     # 巢狀關係是前提：ReadOnlyPaths 要覆蓋掉的就是外層那條 RWP。
-    assert any(_within(hooks, rwp) for rwp in unit.read_write_paths)
+    assert not any(_within(hooks, rwp) for rwp in unit.read_write_paths)
     # HOME 那一層仍然不在 RWP 內（換不掉整棵樹）。
     home = DEFAULT_LAYOUT.home_of(DEFAULT_LAYOUT.builder_account)
     assert not any(_within(home, rwp) for rwp in unit.read_write_paths)

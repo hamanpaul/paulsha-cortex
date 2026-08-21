@@ -84,14 +84,17 @@ from . import registry
 from ..coordinator.spool_slot import PER_JOB_WRITABLE_SURFACES, PerJobWritableSurface
 
 
-def render_job_writable_properties(*, instance: str) -> tuple[str, ...]:
+def render_job_writable_properties(
+    *, instance: str, principal: "Principal | None" = None,
+    layout: "PathLayout | None" = None,
+) -> tuple[str, ...]:
     if not isinstance(instance, str) or not instance:
         raise ValueError("job instance is required")
-    from ..coordinator.spool_slot import canonical_job_slot
-
+    rows = PER_JOB_WRITABLE_SURFACES
+    if principal is not None:
+        rows = tuple(row for row in rows if principal.value in row.principals)
     return tuple(
-        f"ReadWritePaths={canonical_job_slot(row.surface_id, instance)}"
-        for row in PER_JOB_WRITABLE_SURFACES
+        f"ReadWritePaths={_surface_slot(row, instance, layout=layout)}" for row in rows
     )
 from .registry import (
     HEADLESS_PERSONAS,
@@ -3717,6 +3720,43 @@ class PathLayout:
 DEFAULT_LAYOUT = PathLayout()
 
 
+def _surface_root(row: PerJobWritableSurface, layout: PathLayout) -> str:
+    """Resolve a table row against the deployment layout used by the unit."""
+    if row.surface_id == "monitor-event-spool":
+        return f"{layout.agents_root}/monitor/event-spool"
+    if row.surface_id.endswith("-job-log"):
+        principal = row.principals[0]
+        return layout.job_log_spool_root(Principal(principal))
+    accessor = getattr(layout, row.path_accessor, None)
+    if accessor is None:
+        raise ValueError(f"surface {row.surface_id!r} has no layout accessor")
+    return str(accessor() if callable(accessor) else accessor)
+
+
+def _surface_slot(
+    row: PerJobWritableSurface,
+    instance: str,
+    *,
+    layout: PathLayout | None = None,
+) -> str:
+    from ..coordinator.job_workspace import job_segment
+
+    segment = "%i" if instance == "%i" else job_segment(instance)
+    root = row.writable_root if layout is None else _surface_root(row, layout)
+    return f"{root}/{segment}"
+
+
+def job_surface_owners(
+    *, principal: Principal, instance: str, layout: PathLayout
+) -> dict[str, tuple[str, ...]]:
+    """Production projection of the canonical surface table for one unit."""
+    return {
+        _surface_slot(row, instance, layout=layout): (row.asset_id,)
+        for row in PER_JOB_WRITABLE_SURFACES
+        if principal.value in row.principals
+    }
+
+
 def asset_paths(layout: PathLayout = DEFAULT_LAYOUT) -> dict[str, str]:
     """模組層便利函式（CLI 與 runbook 引用）。"""
     return layout.asset_paths()
@@ -6976,6 +7016,22 @@ def build_job_unit(
     owners = read_write_path_owners(
         plan, job_layout, account, extras, retired=RETIRED_JOB_WRITE_ASSETS
     )
+    # Shared output-channel and persona roots are never writable in a job unit.
+    # Preserve independently isolated workspaces, then project every spool/log
+    # slot from the executable table above.  This is the production consumer;
+    # render/probe helpers are intentionally not a parallel policy map.
+    shared_roots = {
+        _surface_root(row, layout) for row in PER_JOB_WRITABLE_SURFACES
+    }
+    owners = {
+        path: covered
+        for path, covered in owners.items()
+        if "%i" in path and not any(path == root for root in shared_roots)
+    }
+    owners.update(job_surface_owners(principal=principal, instance="%i", layout=layout))
+    if principal in (Principal.BUILDER, Principal.REVIEWER):
+        auth_path = job_layout.credential_token_path_of(account, "codex")
+        owners[auth_path] = ("codex-auth-refresh",)
     stem = job_unit_stem(layout, principal, profile)
     unit_name = f"{stem}@.service"
     profile_users = sorted(
@@ -7128,6 +7184,13 @@ def build_job_unit(
     body += job_egress_lines(principal)
     body += [""]
     read_only = enforcement_read_only_paths(job_layout, account, tuple(owners.keys()))
+    if principal in (Principal.BUILDER, Principal.REVIEWER):
+        read_only = tuple(
+            path
+            for path, _owner, _group, _mode, _is_dir
+            in job_layout.codex_control_scaffold(scheme)
+            if path.startswith(job_layout.home_of(account).rstrip("/") + "/")
+        )
     body += _rwp_lines(owners, read_only)
     body += [
         "",
@@ -8066,23 +8129,10 @@ def transient_unit_properties(
     導出的 ReadWritePaths** 展開成 `systemd-run --property=` 形式，供 operator 在
     A 方案下逐條加固，或作為「A 與 B 的加固面是否等價」的對照表。
     """
-    layout = layout if layout is not None else DEFAULT_LAYOUT
-    plan = plan or generate_plan(scheme)
-    account = scheme.resolve(principal)
-    if account is None:
-        raise ValueError(f"principal 未映射到帳號: {principal}")
-    job_layout = layout.with_job_segment("%i")
-    effective = profile.effective()
-    props = [f"--property={key}={effective[key]}" for key, _value, _why in _HARDENING]
-    for rwp in read_write_paths(
-        plan,
-        job_layout,
-        account,
-        job_layout.job_extra_write_paths(account),
-        retired=RETIRED_JOB_WRITE_ASSETS,
-    ):
-        props.append(f"--property=ReadWritePaths={rwp}")
-    return tuple(props)
+    unit = build_job_unit(
+        scheme, layout or DEFAULT_LAYOUT, principal=principal, plan=plan, profile=profile
+    )
+    return unit_replica_properties(unit.content, instance="%i")
 
 
 # ---------------------------------------------------------------------------
@@ -8190,7 +8240,7 @@ def unit_replica_properties(
         expanded = value.replace("%%", sentinel).replace("%i", instance)
         # 未知 specifier 的檢查必須在**還原跳脫之前**：還原後的字面 `%i` 長得跟
         # specifier 一模一樣，先還原會把合法的 `%%i` 誤判成展不開的 specifier。
-        leftover = re.search(r"%[a-zA-Z]", expanded)
+        leftover = None if instance == "%i" else re.search(r"%[a-zA-Z]", expanded)
         expanded = expanded.replace(sentinel, "%")
         if leftover is not None:
             raise UnitReplicaDriftError(

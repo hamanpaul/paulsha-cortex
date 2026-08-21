@@ -105,12 +105,17 @@ class PerJobWritableSurface:
     provisioner: str
     consumer: str
     probe: str
+    principals: tuple[str, ...]
+    asset_id: str
 
     @property
     def writable_root(self) -> str:
         from ..config import paths
 
-        return str(getattr(paths, self.path_accessor)())
+        accessor = getattr(paths, self.path_accessor)
+        if self.surface_id.endswith("-job-log"):
+            return str(accessor(self.principals[0]))
+        return str(accessor())
 
     @property
     def slot_template(self) -> str:
@@ -118,11 +123,14 @@ class PerJobWritableSurface:
 
 
 PER_JOB_WRITABLE_SURFACES: tuple[PerJobWritableSurface, ...] = (
-    PerJobWritableSurface("commit-spool", "commit_spool_root", "commit-spool", "create_slot", "commit_bundle_path", "render_job_writable_properties"),
-    PerJobWritableSurface("monitor-event-spool", "monitor_event_spool_root", "monitor/event-spool", "create_slot", "EventSpool", "render_job_writable_properties"),
-    PerJobWritableSurface("review-verdict-spool", "review_verdict_spool_root", "review-verdicts", "create_slot", "review_verdict_spool_path", "render_job_writable_properties"),
-    PerJobWritableSurface("gate-ledger-spool", "gate_ledger_spool_root", "gate-ledger-spool", "create_slot", "gate_spool_ledger_path", "render_job_writable_properties"),
-    PerJobWritableSurface("gate-worktree", "gate_worktree_root", "gate-worktree", "create_slot", "gate_worktree_dir", "render_job_writable_properties"),
+    PerJobWritableSurface("commit-spool", "commit_spool_root", "commit-spool", "create_slot", "commit_bundle_path", "render_job_writable_properties", ("builder",), "commit-spool"),
+    PerJobWritableSurface("monitor-event-spool", "monitor_event_spool_root", "monitor/event-spool", "create_slot", "EventSpool", "render_job_writable_properties", ("builder", "reviewer"), "monitor-event-spool"),
+    PerJobWritableSurface("review-verdict-spool", "review_verdict_spool_root", "review-verdicts", "create_slot", "review_verdict_spool_path", "render_job_writable_properties", ("reviewer",), "review-verdict-spool"),
+    PerJobWritableSurface("gate-ledger-spool", "gate_ledger_spool_root", "gate-ledger-spool", "create_slot", "gate_spool_ledger_path", "render_job_writable_properties", ("gate",), "gate-ledger-spool"),
+    PerJobWritableSurface("gate-worktree", "gate_worktree_root", "gate-worktree", "create_slot", "gate_worktree_dir", "render_job_writable_properties", ("gate",), "gate-worktree-pool"),
+    PerJobWritableSurface("builder-job-log", "job_log_spool_root", "commit-spool/build-logs", "prepare_job_log", "prepare_job_log_spool", "build_job_log_probe", ("builder",), "build-job-log-spool"),
+    PerJobWritableSurface("reviewer-job-log", "job_log_spool_root", "review-verdicts/planning-logs", "prepare_job_log", "PlanningJobInvoker", "build_job_log_probe", ("reviewer",), "planning-job-log-spool"),
+    PerJobWritableSurface("gate-job-log", "job_log_spool_root", "gate-ledger-spool/gate-logs", "prepare_job_log", "prepare_gate_job_log", "build_job_log_probe", ("gate",), "gate-job-log-spool"),
 )
 
 

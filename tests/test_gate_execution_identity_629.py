@@ -271,13 +271,13 @@ class GateWriteFaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.granted = _write_face(Principal.GATE)
 
-    def test_gate_can_write_exactly_its_own_two_trees_plus_cache(self) -> None:
+    def test_gate_can_write_exactly_its_own_slots(self) -> None:
         self.assertEqual(
             set(self.granted),
             {
-                LAYOUT.cache_of(GATE_ACCOUNT),
-                JOB_LAYOUT.gate_ledger_spool_root,
-                JOB_LAYOUT.gate_worktree_root,
+                JOB_LAYOUT.gate_ledger_spool_root + "/%i",
+                JOB_LAYOUT.gate_worktree_root + "/%i",
+                JOB_LAYOUT.job_log_spool_root(Principal.GATE) + "/%i",
             },
         )
 

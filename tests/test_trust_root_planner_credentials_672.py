@@ -300,12 +300,9 @@ def test_home_redirect_adds_no_writable_surface_to_the_reviewer_unit() -> None:
     自己（見下一條）。
     """
     unit = build_job_unit(FOUR_WAY_SCHEME, principal=Principal.REVIEWER)
-    codex_tree = DEFAULT_LAYOUT.asset_paths()["reviewer-planner-codex-state"]
-    assert set(unit.read_write_paths) == {
-        DEFAULT_LAYOUT.cache_of(PLANNER_ACCOUNT),
-        DEFAULT_LAYOUT.review_verdict_spool_root,
-        codex_tree,
-    }, unit.read_write_paths
+    assert set(unit.read_write_paths) == set(permgen.job_surface_owners(
+        principal=Principal.REVIEWER, instance="%i", layout=DEFAULT_LAYOUT
+    )) | {DEFAULT_LAYOUT.credential_token_path_of(PLANNER_ACCOUNT, "codex")}
     for asset_id in PLANNER_SYMLINK_ASSETS:
         link = DEFAULT_LAYOUT.asset_paths()[asset_id]
         target = DEFAULT_LAYOUT.symlink_targets()[asset_id]
@@ -369,7 +366,8 @@ def test_the_builder_credential_now_shares_the_planner_shape() -> None:
         tree = paths[f"{prefix}-codex-state"]
         hooks = paths[f"{prefix}-codex-hooks"]
         assert tree == f"{DEFAULT_LAYOUT.home_of(account)}/.codex"
-        assert tree in unit.read_write_paths, (prefix, unit.read_write_paths)
+        assert tree not in unit.read_write_paths, (prefix, unit.read_write_paths)
+        assert DEFAULT_LAYOUT.credential_token_path_of(account, "codex") in unit.read_write_paths
         assert hooks in unit.read_only_paths, (prefix, unit.read_only_paths)
     # `IN_PLACE_CONTENT_WRITE_ASSETS` 的憑證那一半因此導出為空集（見該常數的說明）。
     assert not (set(permgen.credential_asset_ids()) & set(IN_PLACE_CONTENT_WRITE_ASSETS))
