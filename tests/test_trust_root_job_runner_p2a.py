@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,7 @@ import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator.diagnostics import DiagnosticReason
 from paulsha_cortex.coordinator.job_runner import JobRunnerError
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher
+from test_trust_root_job_template_ab import _copilot_oauth_authority_env
 
 
 # 每一輪 launch 測試都在乾淨的 env 上疊加，避免 operator 自己的 shell 汙染判定。
@@ -125,9 +127,16 @@ def _launch(
             mock.patch.object(job_runner, "_account_exists", return_value=True),
             mock.patch.object(job_runner, "_group_exists", return_value=True),
         ]
+    oauth_context = nullcontext({})
+    if (
+        launcher._executor == "copilot"
+        and env.get(job_runner.JOB_RUNNER_ENV) == job_runner.RUNNER_SYSTEMD_RUN
+        and "PSC_COPILOT_OAUTH_CONFIG" not in env
+    ):
+        oauth_context = _copilot_oauth_authority_env()
     try:
-        with tempfile.TemporaryDirectory() as d, mock.patch.dict(
-            os.environ, env, clear=True
+        with oauth_context as oauth_env, tempfile.TemporaryDirectory() as d, mock.patch.dict(
+            os.environ, {**oauth_env, **env}, clear=True
         ):
             with _nested(patches):
                 launcher.launch(
@@ -748,8 +757,20 @@ class DegradedLaunchTests(unittest.TestCase):
     def test_copilot_token_normalization_is_inert_under_degraded_runner(self) -> None:
         # direct 模式會把 GH_TOKEN 正規化成 COPILOT_GITHUB_TOKEN 送進 job；
         # 降權模式下 env 白名單裡沒有任何 token 候選，因此那條路徑自然變成 no-op。
-        argv = self._client_argv(executor="copilot")
-        self.assertNotIn("COPILOT_GITHUB_TOKEN", _setenv_map(argv))
+        with _copilot_oauth_authority_env() as oauth_env:
+            authority = oauth_env["PSC_COPILOT_OAUTH_CONFIG"]
+            argv = self._client_argv(env=_degraded_env(**oauth_env), executor="copilot")
+        unit_env = _setenv_map(argv)
+        self.assertEqual(
+            {name for name in unit_env if name.startswith("COPILOT_")},
+            {"COPILOT_AUTO_UPDATE", "COPILOT_HOME"},
+        )
+        self.assertEqual(unit_env["COPILOT_AUTO_UPDATE"], "false")
+        self.assertTrue(Path(unit_env["COPILOT_HOME"]).is_absolute())
+        self.assertTrue(unit_env["COPILOT_HOME"].endswith("/copilot"), unit_env["COPILOT_HOME"])
+        self.assertNotIn("COPILOT_GITHUB_TOKEN", unit_env)
+        self.assertNotIn("PSC_COPILOT_OAUTH_CONFIG", unit_env)
+        self.assertNotIn(authority, "\x00".join(argv))
 
     def test_unit_env_carries_job_markers(self) -> None:
         unit_env = _setenv_map(self._client_argv())

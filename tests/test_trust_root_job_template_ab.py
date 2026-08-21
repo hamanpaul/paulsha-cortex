@@ -27,6 +27,8 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -73,6 +75,18 @@ _SECRET_ENV = {
     "NODE_OPTIONS": "--require /tmp/inject.js",
     "PGPASSWORD": "postgres-secret",
 }
+
+
+@contextmanager
+def _copilot_oauth_authority_env() -> Iterator[dict[str, str]]:
+    with tempfile.TemporaryDirectory(prefix="psc-copilot-oauth-") as d:
+        authority = Path(d) / "copilot-oauth.json"
+        authority.write_text(
+            json.dumps({"github.com": {"oauth_token": "copilot-oauth"}}) + "\n",
+            encoding="utf-8",
+        )
+        authority.chmod(0o600)
+        yield {spool_slot._COPILOT_OAUTH_CONFIG_ENV: str(authority)}
 
 
 class _FakeProc:
@@ -177,22 +191,32 @@ def _launch_template(
     try:
         spool_dir = spool if spool is not None else str(Path(root) / "job-specs")
         Path(spool_dir).mkdir(parents=True, exist_ok=True)
-        env = _template_env(spool_dir, **(env_overrides or {}))
         log_dir = str(Path(root) / "logs")
-        with mock.patch.dict(os.environ, env, clear=True):
-            with _nested(_preflight_patches() if patches is None else patches):
-                launcher.launch(
-                    slice_id=slice_id,
-                    prompt="PROMPT",
-                    worktree=root,
-                    log_dir=log_dir,
-                )
-        return {
-            "root": root,
-            "spool": spool_dir,
-            "log_dir": log_dir,
-            "log_path": str(Path(log_dir) / f"{slice_id}.jsonl"),
-        }
+        oauth_context = nullcontext({})
+        if launcher._executor == "copilot" and (
+            env_overrides is None
+            or spool_slot._COPILOT_OAUTH_CONFIG_ENV not in env_overrides
+        ):
+            oauth_context = _copilot_oauth_authority_env()
+        with oauth_context as oauth_env:
+            env = _template_env(spool_dir, **oauth_env, **(env_overrides or {}))
+            with mock.patch.dict(os.environ, env, clear=True):
+                with _nested(_preflight_patches() if patches is None else patches):
+                    launcher.launch(
+                        slice_id=slice_id,
+                        prompt="PROMPT",
+                        worktree=root,
+                        log_dir=log_dir,
+                    )
+            return {
+                "root": root,
+                "spool": spool_dir,
+                "log_dir": log_dir,
+                "log_path": str(Path(log_dir) / f"{slice_id}.jsonl"),
+                "copilot_oauth_authority": oauth_env.get(
+                    spool_slot._COPILOT_OAUTH_CONFIG_ENV, ""
+                ),
+            }
     finally:
         launcher_module.subprocess.Popen = original
         if created is not None:
@@ -815,12 +839,25 @@ class JobSpecContentTests(unittest.TestCase):
 
     def test_spec_env_has_no_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as d:
-            _launch_template(SubprocessLauncher("copilot"), popen=_RecordingPopen(), workdir=d)
+            ctx = _launch_template(
+                SubprocessLauncher("copilot"), popen=_RecordingPopen(), workdir=d
+            )
             spec = _only_spec(str(Path(d) / "job-specs"))
         env = spec["env"]
+        self.assertEqual(
+            {name for name in env if name.startswith("COPILOT_")},
+            {"COPILOT_AUTO_UPDATE", "COPILOT_HOME"},
+        )
+        self.assertEqual(env["COPILOT_AUTO_UPDATE"], "false")
+        self.assertTrue(Path(env["COPILOT_HOME"]).is_absolute())
+        self.assertTrue(str(env["COPILOT_HOME"]).endswith("/copilot"), env["COPILOT_HOME"])
+        self.assertNotIn(spool_slot._COPILOT_OAUTH_CONFIG_ENV, env)
         for name in _SECRET_ENV:
             self.assertNotIn(name, env, name)
         blob = json.dumps(spec, ensure_ascii=False)
+        authority = ctx["copilot_oauth_authority"]
+        self.assertTrue(authority)
+        self.assertNotIn(authority, blob)
         for value in _SECRET_ENV.values():
             self.assertNotIn(value, blob, value)
 
@@ -839,9 +876,10 @@ class JobSpecContentTests(unittest.TestCase):
         # 仍獨立留在 Manager-only dispatch root，因此不需要跨 mount hard link——由
         # `HarvestCompatibilityTests.test_log_and_sentinel_paths_are_unchanged` 釘住。
         self.assertNotEqual(spec["log_path"], ctx["log_path"])
+        self.assertTrue(spec["instance"].startswith("psc-0042-template-"), spec["instance"])
         self.assertTrue(
             str(spec["log_path"]).endswith(
-                f"{config_paths.BUILD_JOB_LOG_SPOOL_DIRNAME}/psc-0042-template/"
+                f"{config_paths.BUILD_JOB_LOG_SPOOL_DIRNAME}/{spec['instance']}/"
                 f"{job_workspace.JOB_LOG_FILENAME}"
             ),
             spec["log_path"],
