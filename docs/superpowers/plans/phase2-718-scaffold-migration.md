@@ -39,3 +39,15 @@ layout and prove: valid nested plugin/skill directories succeed; each missing
 required input fails; a hard-linked regular file fails; a second valid run is
 idempotent. Run policy plus the two focused test files, commit all changes, and
 report the SHA and exact test evidence.
+
+## Follow-up gate evidence
+
+Independent pytest after commit `9e6dc45` reports exactly one failure:
+
+`test_scaffold_rerun_never_truncates_deployed_codex_policy` rejects any command
+line containing both `printf` and `hooks.json`. The new fail-closed stderr
+diagnostic legitimately has that shape, while the test's real invariant is that
+the scaffold must never generate or truncate a `hooks.json` policy stub. Refine
+the test to mechanically reject writes/redirections or generated stub content,
+without rejecting diagnostics and without weakening the no-stub invariant.
+Re-run the focused test file and commit the follow-up; leave the worktree clean.

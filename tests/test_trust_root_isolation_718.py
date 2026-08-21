@@ -210,6 +210,9 @@ class CodexAuthoritySeedCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _assert_generated_migration_rejects_hard_linked_regular_files(Path(d))
 
+    def test_scaffold_rerun_never_truncates_deployed_codex_policy(self) -> None:
+        _assert_scaffold_rerun_never_truncates_deployed_codex_policy()
+
 
 def test_one_canonical_table_covers_every_declared_writable_surface() -> None:
     rows = _surfaces()
@@ -296,7 +299,21 @@ def test_headless_hook_default_writer_uses_authoritative_job_slot(
     assert tuple(root.glob("*.json")) == ()
 
 
-def test_scaffold_rerun_never_truncates_deployed_codex_policy(tmp_path) -> None:
+def _shell_redirects_to_hooks_json(line: str) -> bool:
+    redirect_tokens = (">", "1>", "2>", ">>", "1>>", "2>>", "&>", "&>>", ">|", "1>|", "2>|", "<>")
+    redirect_token_set = set(redirect_tokens)
+    tokens = shlex.split(line, posix=True)
+    for index, token in enumerate(tokens):
+        if "hooks.json" not in token:
+            continue
+        if token.startswith(redirect_tokens):
+            return True
+        if index and tokens[index - 1] in redirect_token_set:
+            return True
+    return False
+
+
+def _assert_scaffold_rerun_never_truncates_deployed_codex_policy() -> None:
     """Installer migrates real deployed bytes and never emits policy stubs."""
     completed = subprocess.run(
         [sys.executable, "-m", "paulsha_cortex.trust_root", "scaffold", "four-way"],
@@ -309,12 +326,16 @@ def test_scaffold_rerun_never_truncates_deployed_codex_policy(tmp_path) -> None:
     assert file_lines
     assert all("if [ ! -e " in line or line.startswith("install -d ") for line in file_lines)
     assert not any("deployment-owned Codex configuration" in line for line in lines)
-    assert not any("printf" in line and "hooks.json" in line for line in lines)
+    assert not any(_shell_redirects_to_hooks_json(line) for line in lines)
     assert any(
         "cp -R --no-preserve=all" in line and "/.codex" in line
         for line in file_lines
     )
     assert any("auth.json" in line and "install -D" in line for line in lines)
+
+
+def test_scaffold_rerun_never_truncates_deployed_codex_policy() -> None:
+    _assert_scaffold_rerun_never_truncates_deployed_codex_policy()
 
 
 def test_canonical_authorities_are_registry_backed_deployment_assets() -> None:
