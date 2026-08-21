@@ -44,3 +44,40 @@ python3 -m policy_check --repo .
 
 Commit all intended changes with a Conventional Commit and leave the worktree
 clean. Do not widen ACLs and do not touch installed runtime state.
+
+## Review adjudication: first candidate rejected
+
+Candidate `25f6db48a68e9af3219c8319d84bb5087888ab60` is rejected. It persists the
+correct concrete instance, but then passes that value back through
+`canonical_job_slot()`, whose `template_instance_id()` transformation is not
+idempotent. Production creates:
+
+```text
+raw phase2-plan-manager-gitconfig-763
+  -> phase2-plan-manager-gitconfig-763-50f62414
+```
+
+The rejected consumer resolves:
+
+```text
+phase2-plan-manager-gitconfig-763-50f62414
+  -> phase2-plan-manager-gitconfig-763-50f62414-61200d73
+```
+
+Therefore producer and consumer still differ. The new test hid the defect by
+creating its fixture with the already-normalized instance, so both fixture and
+consumer double-normalized it.
+
+Repair requirements:
+
+1. Keep raw job-id-to-instance derivation and exact-instance path resolution as
+   separate, explicitly named APIs. Never make normalization heuristically
+   idempotent; a raw id that happens to look hashed must remain unambiguous.
+2. A persisted `template_instance` must be joined to the registered writable
+   root byte-for-byte after canonical instance validation, with no second hash.
+3. Production-shape tests must create the producer slot from the raw slice id,
+   then consume it from the persisted concrete instance and assert the absolute
+   paths are exactly equal. Also assert the double-hashed sibling is absent and
+   untouched.
+4. Audit both commit-bundle and gate spool consumers for this distinction.
+5. Remove or fix any first-candidate test that proves only double-hash parity.
