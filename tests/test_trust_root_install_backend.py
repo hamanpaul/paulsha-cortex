@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import grp
 import hashlib
+import json
 import os
 import pwd
 import shutil
@@ -14,14 +15,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.trust_root.install import InstallDriftError
+from paulsha_cortex.trust_root.install import InstallDriftError, UnsafeInstallPathError
 from paulsha_cortex.trust_root.install import backend as backend_module
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 from paulsha_cortex.trust_root.install.backend import _mode
 from paulsha_cortex.trust_root.install.core import (
+    InstallReceipt,
     InstallPlanError,
     _account_digest,
     _desired_digest,
+    rollback_receipt,
+    validate_preflight,
 )
 
 
@@ -479,3 +483,152 @@ def test_directory_acl_attestation_ignores_semantically_irrelevant_order(
     state = LocalInstallBackend(require_root=False).inspect_step(step)
 
     assert state["installed_sha256"] == step["desired_sha256"]
+
+
+def test_directory_acl_apply_keeps_external_target_safe_during_symlink_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    managed = tmp_path / "managed"
+    displaced = tmp_path / "displaced-managed"
+    external = tmp_path / "external"
+    external.mkdir(mode=0o755)
+    external_mode = stat.S_IMODE(external.stat().st_mode)
+    calls: list[tuple[str, ...]] = []
+
+    real_chmod = os.chmod
+    real_fchmod = os.fchmod
+    swapped = False
+
+    def swap_leaf() -> None:
+        nonlocal swapped
+        if not swapped:
+            managed.rename(displaced)
+            managed.symlink_to(external, target_is_directory=True)
+            swapped = True
+
+    def chmod_and_swap(path: os.PathLike[str] | str, mode: int, **kwargs) -> None:
+        real_chmod(path, mode, **kwargs)
+        swap_leaf()
+
+    def fchmod_and_swap(descriptor: int, mode: int) -> None:
+        real_fchmod(descriptor, mode)
+        swap_leaf()
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        if command[1] == "-m":
+            # Model setfacl's target-following behavior with an observable mode
+            # write. A pathname race would change ``external``; the held fd
+            # changes only the displaced managed directory.
+            real_chmod(command[-1], 0o711)
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    monkeypatch.setattr(backend_module.os, "chmod", chmod_and_swap)
+    monkeypatch.setattr(backend_module.os, "fchmod", fchmod_and_swap)
+    step = {
+        "step_id": "asset:managed",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(managed),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [{"account": account, "perms": "rX", "default": False}],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+
+    with pytest.raises(UnsafeInstallPathError, match="must not be a symlink"):
+        LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert stat.S_IMODE(external.stat().st_mode) == external_mode
+    assert not any(external.iterdir())
+    assert calls
+    assert all(command[-1].startswith("/proc/self/fd/") for command in calls)
+
+
+def test_preflight_counts_active_jobs_from_plan_bound_durable_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / "planned-state"
+    registry = state_root / "coordinator/jobs.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "jobs": [
+                    {"job_id": "job-dispatched", "status": "dispatched"},
+                    {"job_id": "job-running", "status": "running"},
+                    {"job_id": "job-exited", "status": "exited"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(backend_module, "_in_flight_process_count", lambda _rows: 0)
+    monkeypatch.setattr(backend_module, "_run", lambda argv, **_kwargs: _completed(argv))
+    plan = {
+        "roots": {
+            "state": str(state_root),
+            "deploy": str(tmp_path / "deploy"),
+        },
+        "accounts": [],
+        "service_accounts": [],
+        "apply_order": [
+            {
+                "step_id": "asset:coordinator-root-tree",
+                "kind": "asset",
+                "asset_type": "directory",
+                "path": str(registry.parent),
+            }
+        ],
+        "minimum_disk_free_bytes": 0,
+    }
+
+    facts = LocalInstallBackend(require_root=False).preflight_facts(plan)
+    report = validate_preflight(plan, facts)
+
+    assert facts["in_flight_jobs"] == 2
+    assert any(row["code"] == "in_flight_jobs" for row in report.failures)
+
+
+def test_rollback_reports_unknown_child_of_adopted_managed_directory(
+    tmp_path: Path,
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    managed = tmp_path / "adopted"
+    managed.mkdir(mode=0o700)
+    managed.chmod(0o700)
+    step = {
+        "step_id": "asset:adopted",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(managed),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+    applied = backend.apply_step(step)
+    entry = {"step": step, "prior": applied["prior"]}
+    unknown = managed / "created-after-install"
+    unknown.write_text("durable\n", encoding="utf-8")
+
+    receipt = InstallReceipt(
+        {
+            "state": "applied",
+            "journal": [entry],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert str(unknown) in report.retained_unknown

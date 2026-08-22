@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import grp
 import hashlib
+import json
 import os
 import pwd
 import re
@@ -28,7 +29,13 @@ from .core import (
 )
 
 
-def _run(argv: Sequence[str], *, check: bool = False, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: Sequence[str],
+    *,
+    check: bool = False,
+    input_text: str | None = None,
+    pass_fds: Sequence[int] = (),
+) -> subprocess.CompletedProcess[str]:
     """Run one typed argv.  Shell text is never accepted by this backend."""
 
     if not argv or not all(isinstance(part, str) and part for part in argv):
@@ -39,6 +46,7 @@ def _run(argv: Sequence[str], *, check: bool = False, input_text: str | None = N
         capture_output=True,
         text=True,
         input=input_text,
+        pass_fds=tuple(pass_fds),
     )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "command failed").strip()
@@ -302,11 +310,44 @@ def _snapshot(path: Path) -> dict[str, object]:
         "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
         "acl": _read_acl(path),
     }
+    if stat.S_ISDIR(observed.st_mode):
+        snapshot["children"] = _directory_inventory(path)
     if stat.S_ISREG(observed.st_mode):
         content = path.read_bytes()
         snapshot["content_base64"] = base64.b64encode(content).decode("ascii")
         snapshot["installed_sha256"] = hashlib.sha256(content).hexdigest()
     return snapshot
+
+
+def _directory_inventory(path: Path) -> list[str]:
+    """Record direct children from a stable no-follow directory descriptor."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise InstallDriftError(f"cannot inventory managed directory {path}: {exc}") from exc
+    try:
+        before = os.fstat(descriptor)
+        with os.scandir(descriptor) as entries:
+            rows = sorted(entry.name for entry in entries)
+        after = os.fstat(descriptor)
+        observed = path.lstat()
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or (before.st_dev, before.st_ino) != (observed.st_dev, observed.st_ino)
+        ):
+            raise InstallDriftError(f"managed directory changed during inventory: {path}")
+        return rows
+    except OSError as exc:
+        raise InstallDriftError(f"cannot inventory managed directory {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
 
 
 def _symlink_state(step: Mapping[str, object]) -> dict[str, object]:
@@ -649,6 +690,96 @@ def _in_flight_process_count(accounts: Sequence[Mapping[str, object]]) -> int:
     return count
 
 
+def _durable_jobs_path(plan: Mapping[str, object]) -> Path:
+    """Resolve the coordinator registry from the immutable plan inventory."""
+
+    coordinator_roots = {
+        str(step.get("path"))
+        for step in plan.get("apply_order", [])
+        if isinstance(step, Mapping)
+        and step.get("step_id") == "asset:coordinator-root-tree"
+        and isinstance(step.get("path"), str)
+    }
+    if len(coordinator_roots) > 1:
+        raise InstallPlanError("plan declares multiple coordinator root assets")
+    if coordinator_roots:
+        coordinator_root = Path(next(iter(coordinator_roots)))
+    else:
+        roots = plan.get("roots")
+        state = roots.get("state") if isinstance(roots, Mapping) else None
+        if not isinstance(state, str) or not state:
+            raise InstallPlanError("plan does not declare the durable state root")
+        coordinator_root = Path(state) / "coordinator"
+    jobs_path = coordinator_root / "jobs.json"
+    if not jobs_path.is_absolute() or ".." in jobs_path.parts:
+        raise UnsafeInstallPathError(
+            f"durable jobs registry path is unsafe: {jobs_path}"
+        )
+    return jobs_path
+
+
+def _durable_in_flight_job_count(plan: Mapping[str, object]) -> int:
+    """Read the persisted registry without mutating or migrating it."""
+
+    path = _durable_jobs_path(plan)
+    _reject_symlink_ancestors(path, label="durable jobs registry", include_leaf=False)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise UnsafeInstallPathError(
+            f"cannot safely open durable jobs registry {path}: {exc}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise UnsafeInstallPathError(
+                f"durable jobs registry must be a single-link regular file: {path}"
+            )
+        try:
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
+                payload = json.load(stream)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise InstallDriftError(
+                f"durable jobs registry cannot be decoded: {path}: {exc}"
+            ) from exc
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise InstallDriftError(
+                f"durable jobs registry changed during preflight: {path}"
+            )
+    finally:
+        os.close(descriptor)
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("jobs"), list):
+        raise InstallDriftError(f"durable jobs registry has an invalid shape: {path}")
+    valid_statuses = {"dispatched", "running", "exited", "failed"}
+    active = 0
+    for row in payload["jobs"]:
+        if (
+            not isinstance(row, Mapping)
+            or not isinstance(row.get("status"), str)
+            or row["status"] not in valid_statuses
+        ):
+            raise InstallDriftError(f"durable jobs registry has an invalid job row: {path}")
+        if row["status"] in {"dispatched", "running"}:
+            active += 1
+    return active
+
+
 def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
     return bool(
         state.get("exists")
@@ -779,7 +910,8 @@ class LocalInstallBackend:
             "acl": shutil.which("getfacl") is not None and shutil.which("setfacl") is not None,
             "disk_free_bytes": disk_free,
             "universal_nopasswd": _universal_nopasswd(),
-            "in_flight_jobs": _in_flight_process_count(desired_accounts),
+            "in_flight_jobs": _in_flight_process_count(desired_accounts)
+            + _durable_in_flight_job_count(plan),
             "services": services,
             "accounts": accounts,
             "account_uids": account_uids,
@@ -1225,24 +1357,72 @@ class LocalInstallBackend:
         # New files and directories can inherit named/default ACLs from their
         # parent. Clear that inherited state before applying the plan's exact
         # ACL set. This is safe only because ``prior`` proved the leaf absent.
-        _run(("setfacl", "-b", str(path)), check=True)
-        if asset_type == "directory":
-            _run(("setfacl", "-k", str(path)), check=True)
-        os.chown(path, _resolve_uid(step.get("owner")), _resolve_gid(step.get("group")), follow_symlinks=False)
-        os.chmod(path, _mode(step.get("mode")), follow_symlinks=False)
-        for acl in step.get("acls", []):
-            if not isinstance(acl, Mapping):
-                raise InstallPlanError("ACL entries must be objects")
-            account = acl.get("account")
-            perms = acl.get("perms")
-            if not isinstance(account, str) or not isinstance(perms, str):
-                raise InstallPlanError("ACL entries require account and perms")
-            prefix = "d:u" if acl.get("default") else "u"
-            effective_perms = perms.replace("X", "x")
+        directory_fd: int | None = None
+        acl_target = str(path)
+        inherited_fds: tuple[int, ...] = ()
+        try:
+            if asset_type == "directory":
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                try:
+                    directory_fd = os.open(path, flags)
+                except OSError as exc:
+                    raise UnsafeInstallPathError(
+                        f"cannot safely open managed directory {path}: {exc}"
+                    ) from exc
+                opened = os.fstat(directory_fd)
+                observed = path.lstat()
+                if not stat.S_ISDIR(opened.st_mode) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (observed.st_dev, observed.st_ino):
+                    raise UnsafeInstallPathError(
+                        f"managed directory changed before metadata apply: {path}"
+                    )
+                if not Path("/proc/self/fd").is_dir():
+                    raise InstallError("/proc/self/fd is required for safe ACL apply")
+                acl_target = f"/proc/self/fd/{directory_fd}"
+                inherited_fds = (directory_fd,)
             _run(
-                ("setfacl", "-m", f"{prefix}:{account}:{effective_perms}", str(path)),
+                ("setfacl", "-b", acl_target),
                 check=True,
+                pass_fds=inherited_fds,
             )
+            if asset_type == "directory":
+                _run(
+                    ("setfacl", "-k", acl_target),
+                    check=True,
+                    pass_fds=inherited_fds,
+                )
+            uid = _resolve_uid(step.get("owner"))
+            gid = _resolve_gid(step.get("group"))
+            desired_mode = _mode(step.get("mode"))
+            if directory_fd is not None:
+                os.fchown(directory_fd, uid, gid)
+                os.fchmod(directory_fd, desired_mode)
+            else:
+                os.chown(path, uid, gid, follow_symlinks=False)
+                os.chmod(path, desired_mode, follow_symlinks=False)
+            for acl in step.get("acls", []):
+                if not isinstance(acl, Mapping):
+                    raise InstallPlanError("ACL entries must be objects")
+                account = acl.get("account")
+                perms = acl.get("perms")
+                if not isinstance(account, str) or not isinstance(perms, str):
+                    raise InstallPlanError("ACL entries require account and perms")
+                prefix = "d:u" if acl.get("default") else "u"
+                effective_perms = perms.replace("X", "x")
+                _run(
+                    ("setfacl", "-m", f"{prefix}:{account}:{effective_perms}", acl_target),
+                    check=True,
+                    pass_fds=inherited_fds,
+                )
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
         installed = dict(self.inspect_step(step))
         if installed.get("installed_sha256") != step.get("desired_sha256"):
             raise InstallDriftError(f"installed asset does not match desired state: {step.get('step_id')}")
@@ -1320,7 +1500,17 @@ class LocalInstallBackend:
     def list_unknown_state(self, receipt: InstallReceipt) -> Sequence[str]:
         retained: list[str] = []
         journal = receipt.to_dict().get("journal", [])
-        for entry in journal if isinstance(journal, list) else []:
+        journal_rows = journal if isinstance(journal, list) else []
+        managed_paths: set[Path] = set()
+        for entry in journal_rows:
+            step = entry.get("step") if isinstance(entry, Mapping) else None
+            if (
+                isinstance(step, Mapping)
+                and step.get("kind") == "asset"
+                and isinstance(step.get("path"), str)
+            ):
+                managed_paths.add(Path(str(step["path"])))
+        for entry in journal_rows:
             if not isinstance(entry, Mapping):
                 continue
             step = entry.get("step")
@@ -1330,13 +1520,31 @@ class LocalInstallBackend:
                 and step.get("kind") == "asset"
                 and step.get("asset_type") == "directory"
                 and isinstance(prior, Mapping)
-                and not prior.get("exists")
             ):
                 path = Path(str(step.get("path", "")))
                 try:
-                    if path.is_dir() and any(path.iterdir()):
-                        retained.append(str(path))
-                except OSError:
+                    if not prior.get("exists"):
+                        if path.is_dir() and any(path.iterdir()):
+                            retained.append(str(path))
+                        continue
+                    baseline = prior.get("children")
+                    if not isinstance(baseline, list) or not all(
+                        isinstance(row, str) for row in baseline
+                    ):
+                        if path.is_dir() and any(path.iterdir()):
+                            retained.append(str(path))
+                        continue
+                    current = set(_directory_inventory(path))
+                    for relative in sorted(current - set(baseline)):
+                        candidate = path / relative
+                        if any(
+                            managed != path
+                            and (candidate == managed or managed in candidate.parents)
+                            for managed in managed_paths
+                        ):
+                            continue
+                        retained.append(str(candidate))
+                except (InstallError, OSError):
                     retained.append(str(path))
         return tuple(sorted(set(retained)))
 
