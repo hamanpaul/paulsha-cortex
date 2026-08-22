@@ -1,0 +1,153 @@
+name: RC qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment: rc-qualification
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Build exact wheel, wheelhouse, and bundle
+        id: candidate
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build twine
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$CANDIDATE_SHA")"
+          python -m build --wheel
+          python -m twine check --strict dist/*.whl
+
+          mkdir -p qualification-input/dist qualification-input/wheelhouse
+          cp dist/*.whl qualification-input/dist/
+          python -m pip download --only-binary=:all: --dest qualification-input/wheelhouse dist/*.whl
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("qualification-input")
+          wheels = sorted((root / "dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit("exactly one candidate wheel must be built")
+
+          def entry(path: Path) -> dict[str, str]:
+              return {
+                  "path": path.relative_to(root).as_posix(),
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+              }
+
+          payload = {
+              "schema_version": 1,
+              "candidate_sha": os.environ["CANDIDATE_SHA"],
+              "wheel": entry(wheels[0]),
+              "wheelhouse": [entry(path) for path in sorted((root / "wheelhouse").iterdir())],
+              "generated_artifacts": [],
+          }
+          (root / "bundle.json").write_text(
+              json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          cat > qualification-input/install-config.yaml <<EOF
+          schema_version: 1
+          scheme: four-way
+          instance: cortex
+          repo_identity:
+            remote: https://github.com/hamanpaul/paulsha-cortex.git
+            commit: ${CANDIDATE_SHA}
+          operator_account: root
+          external_reader_account: null
+          accounts:
+            cortex-manager:
+              uid: 991
+              gid: 991
+              home: /var/lib/cortex/manager
+              shell: /usr/sbin/nologin
+            cortex-reviewer-planner:
+              uid: 992
+              gid: 992
+              home: /var/lib/cortex/reviewer-planner
+              shell: /usr/sbin/nologin
+            cortex-builder:
+              uid: 993
+              gid: 993
+              home: /var/lib/cortex/builder
+              shell: /usr/sbin/nologin
+            cortex-gate:
+              uid: 994
+              gid: 994
+              home: /var/lib/cortex/gate
+              shell: /usr/sbin/nologin
+          roots:
+            deploy: /opt/cortex
+            state: /var/lib/cortex
+            systemd: /etc/systemd/system
+            polkit: /etc/polkit-1/rules.d
+          source_repositories:
+            - paulsha-cortex
+          legacy_policy: quarantine
+          providers:
+            builder: [codex]
+            reviewer-planner: [agy, copilot]
+            manager: [github]
+          toolchain: {}
+          EOF
+
+          wheel_sha=$(sha256sum qualification-input/dist/*.whl | awk '{print $1}')
+          bundle_sha=$(sha256sum qualification-input/bundle.json | awk '{print $1}')
+          echo "wheel_sha256=$wheel_sha" >> "$GITHUB_OUTPUT"
+          echo "bundle_sha256=$bundle_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Run privileged systemd qualification
+        env:
+          CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
+          CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
+          CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
+        run: |
+          set -euo pipefail
+          qualification/run.sh \
+            --artifacts qualification-input \
+            --candidate-sha "${{ github.sha }}" \
+            --wheel-sha256 "${{ steps.candidate.outputs.wheel_sha256 }}" \
+            --bundle-sha256 "${{ steps.candidate.outputs.bundle_sha256 }}" \
+            --output qualification-output
+          test -s qualification-output/qualification.json
+
+      - name: Fail closed on credential material in evidence
+        env:
+          CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
+          CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
+          CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
+        run: python qualification/redaction_scan.py qualification-output
+
+      - name: Upload exact candidate and redacted evidence
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: rc-qualification-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            qualification-input/bundle.json
+            qualification-input/dist/*.whl
+            qualification-input/wheelhouse/*
+            qualification-output/qualification.json
+            qualification-output/evidence/**

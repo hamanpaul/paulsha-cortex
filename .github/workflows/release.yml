@@ -6,13 +6,14 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout release commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
       - name: Setup Python
@@ -20,39 +21,156 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Verify tag matches VERSION
+      - name: Verify tag and reproduce candidate wheel
         run: |
+          set -euo pipefail
           tag_ref="${GITHUB_REF#refs/tags/v}"
-          version_file="$(cat VERSION | tr -d '[:space:]')"
-          if [ "$tag_ref" != "$version_file" ]; then
+          version_file="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$tag_ref" != "$version_file" ]]; then
             echo "::error::tag v$tag_ref does not match VERSION file ($version_file)"
             exit 1
           fi
-          echo "tag v$tag_ref matches VERSION ($version_file)"
-
-      - name: Build distributions
-        run: |
           python -m pip install --upgrade pip build twine
-          python -m build
-          python -m twine check --strict dist/*
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          python -m build --wheel
+          python -m twine check --strict dist/*.whl
 
-      - name: Upload distributions
+      - name: Upload reproduced wheel for gate comparison
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         with:
-          name: python-dist
-          path: dist/*
+          name: reproduced-dist
+          path: dist/*.whl
 
-  release:
+  qualification-gate:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - name: Download distributions
+      - name: Checkout release validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Download reproduced wheel
         uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
         with:
-          name: python-dist
+          name: reproduced-dist
+          path: reproduced-dist
+
+      - name: Find recent successful RC qualification for exact head_sha
+        id: rc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_json=$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-qualification.yml/runs" \
+            -f event=workflow_dispatch \
+            -f per_page=100)
+          run_id=$(jq -r --arg sha "$GITHUB_SHA" '
+            [.workflow_runs[]
+              | select(.head_sha == $sha and .conclusion == "success")]
+            | sort_by(.created_at)
+            | last
+            | .id // empty
+          ' <<<"$run_json")
+          created_at=$(jq -r --arg sha "$GITHUB_SHA" '
+            [.workflow_runs[]
+              | select(.head_sha == $sha and .conclusion == "success")]
+            | sort_by(.created_at)
+            | last
+            | .created_at // empty
+          ' <<<"$run_json")
+          [[ -n "$run_id" && -n "$created_at" ]] || {
+            echo "::error::no successful rc-qualification.yml run has head_sha=$GITHUB_SHA"
+            exit 1
+          }
+          created_epoch=$(date --date="$created_at" +%s)
+          now_epoch=$(date +%s)
+          (( now_epoch - created_epoch <= 3 * 24 * 60 * 60 )) || {
+            echo "::error::the exact-SHA RC qualification is older than 3 days"
+            exit 1
+          }
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact RC qualification artifact
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.rc.outputs.run_id }}
+          name: rc-qualification-${{ github.sha }}
+          path: rc-candidate
+
+      - name: Verify exact wheel hash and qualification binding
+        run: |
+          set -euo pipefail
+          mapfile -t rebuilt_wheels < <(find reproduced-dist -maxdepth 1 -type f -name '*.whl' -print)
+          mapfile -t qualified_wheels < <(find rc-candidate/qualification-input/dist -maxdepth 1 -type f -name '*.whl' -print)
+          ((${#rebuilt_wheels[@]} == 1 && ${#qualified_wheels[@]} == 1)) || {
+            echo "::error::expected exactly one reproduced and one qualified wheel"
+            exit 1
+          }
+          rebuilt_sha=$(sha256sum "${rebuilt_wheels[0]}" | awk '{print $1}')
+          qualified_sha=$(sha256sum "${qualified_wheels[0]}" | awk '{print $1}')
+          [[ "$rebuilt_sha" == "$qualified_sha" ]] || {
+            echo "::error::release build does not reproduce the RC-qualified wheel"
+            exit 1
+          }
+          bundle_path=rc-candidate/qualification-input/bundle.json
+          qualification_path=rc-candidate/qualification-output/qualification.json
+          bundle_sha=$(sha256sum "$bundle_path" | awk '{print $1}')
+          evidence_bundle_sha=$(jq -er '.bundle.sha256' "$qualification_path")
+          [[ "$bundle_sha" == "$evidence_bundle_sha" ]] || {
+            echo "::error::qualification evidence is bound to another bundle"
+            exit 1
+          }
+          manifest_candidate_sha=$(jq -er '.candidate_sha' "$bundle_path")
+          manifest_wheel_path=$(jq -er '.wheel.path' "$bundle_path")
+          manifest_wheel_sha=$(jq -er '.wheel.sha256' "$bundle_path")
+          [[ "$manifest_candidate_sha" == "$GITHUB_SHA" ]] || {
+            echo "::error::bundle candidate SHA does not match release commit"
+            exit 1
+          }
+          [[ "$manifest_wheel_path" != /* && "$manifest_wheel_path" != *../* ]] || {
+            echo "::error::bundle wheel path is unsafe"
+            exit 1
+          }
+          [[ "rc-candidate/qualification-input/$manifest_wheel_path" == "${qualified_wheels[0]}" ]] || {
+            echo "::error::bundle wheel path does not identify the RC wheel"
+            exit 1
+          }
+          [[ "$manifest_wheel_sha" == "$qualified_sha" ]] || {
+            echo "::error::bundle wheel hash does not match the RC wheel"
+            exit 1
+          }
+          python qualification/validate.py \
+            --qualification "$qualification_path" \
+            --candidate-sha "$GITHUB_SHA" \
+            --wheel-sha256 "$qualified_sha" \
+            --bundle-sha256 "$bundle_sha" \
+            --evidence-root rc-candidate/qualification-output \
+            --require-full-suite
+
+      - name: Stage the same wheel used by RC
+        run: |
+          mkdir qualified-dist
+          cp rc-candidate/qualification-input/dist/*.whl qualified-dist/
+
+      - name: Upload release-authoritative wheel
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: qualified-dist
+          path: qualified-dist/*.whl
+
+  release:
+    runs-on: ubuntu-latest
+    needs: qualification-gate
+    steps:
+      - name: Download release-authoritative wheel
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
+        with:
+          name: qualified-dist
           path: dist
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
         with:
-          files: dist/*
+          files: dist/*.whl
