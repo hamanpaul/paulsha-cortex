@@ -88,3 +88,30 @@ closed。D6 不接受 residual-risk waiver。
 2. 由手動 RC workflow 對 exact candidate 執行 qualification。
 3. 只有 OpenSpec archive、雙向 review、preflight、對抗審查、全部 CI 與 RC qualification 均綠，
    才建立 `v0.2.0` GitHub Release；PyPI 保持禁用。
+
+## Qualification blocker observed on 2026-08-22
+
+The disposable Docker run for candidate
+`f884cd37aed3968460490892a757b633a0c47ec6` passed exact artifact verification,
+fresh apply, idempotent apply, functional-drift rejection, rollback/reinstall,
+credential import, activation, generated-installed attestation, service identity,
+and the capability probes. It then stopped before every provider smoke with:
+
+```text
+durable-state/repo-worktree:delete did not return an allowed denial as cortex-builder: rc=0
+```
+
+This is a release blocker, not a residual-risk waiver. The generated four-way
+plan marks `repo-worktree` as Tier-1 and deliberately grants
+`cortex-builder:rwX` on that per-job workspace, while R9 T2 currently requires
+all six mutations on every Tier-0/Tier-1 asset to be rejected by the OS or an
+implemented signature-verifying consumer. The Phase 3 signature route is not
+implemented for this staging asset. Qualification now creates the disposable
+slot through the installed production `grant_workspace_acl` helper and attacks
+the resulting filesystem independently, so skipping the runtime-managed asset
+or treating its absence as coverage is not permitted.
+
+Release remains blocked until the authority model and R9 contract are made
+consistent and a new exact-SHA run passes. Provider, Manager GitHub, full
+dispatch, archive, tag, GitHub Release, and PyPI publication MUST NOT proceed
+from this failed run.

@@ -40,6 +40,9 @@ work_item: phase2-install-docker-qualification
 
 ## 5. Verification and closeout
 
+- [ ] BLOCKER：R9 T2 要求每個 T0/T1 資產的六種 mutation 都被拒，與 `repo-worktree`
+  對 Builder 的合法 `rwX` 寫入面衝突；須收斂 authority/consumer 契約並重跑 exact-SHA
+  qualification，D6 不接受 waiver。
 - [ ] focused tests、full pytest、build/twine/clean-wheel smoke 與 repo preflight 全綠。
 - [ ] 每條 review finding 獨立驗證並分類修/駁/接受列管；修後重審。
 - [ ] 對抗審查只列 BLOCKER/MAJOR；未處置缺陷為 FAIL，明文有界殘餘風險本身不構成 FAIL（D6 不可 waiver）。
