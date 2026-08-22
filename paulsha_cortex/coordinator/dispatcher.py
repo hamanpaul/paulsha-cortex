@@ -248,10 +248,15 @@ class Dispatcher:
         # typed runtime surface; never infer a principal from workflow kind.
         # Missing runtime metadata/slot/authority is a durable runtime failure,
         # not a provider failure and never a silently skipped harvest.
-        from . import job_runner, spool_slot
+        from . import job_runner, job_workspace, spool_slot
         runtime_diagnostic: dict[str, str] | None = None
         runtime_mode = job.get("runtime_mode")
         runtime_principal = job.get("runtime_principal")
+        runtime_instance: str | None = None
+        if runtime_mode == "systemd-template":
+            runtime_instance = job_workspace.spool_key_for_job(job)
+        elif runtime_mode == "systemd-run":
+            runtime_instance = job_runner.template_instance_id(job_id)
         prompt_path = job.get("prompt_path")
         if prompt_path is not None:
             prompt = Path(prompt_path) if isinstance(prompt_path, str) else Path(".")
@@ -274,11 +279,11 @@ class Dispatcher:
                         job_runner.job_prompt_spool_path(
                             spec_spool,
                             principal=str(runtime_principal),
-                            instance=job_runner.template_instance_id(job_id),
+                            instance=runtime_instance,
                         )
                     )
                     expected_prompt = expected_prompt_dir / (
-                        ".prompt-" + job_runner.template_instance_id(job_id)
+                        ".prompt-" + runtime_instance
                     )
             except (TypeError, ValueError):
                 expected_prompt = None
@@ -387,9 +392,7 @@ class Dispatcher:
                     surface = spool_slot.codex_runtime_surface(
                         principal=principal, surface_id=surface_id
                     )
-                    runtime_slot = spool_slot.canonical_job_slot(surface.surface_id, job_id)
                     authority = spool_slot.credential_authority(principal)
-                    spool_slot.validate_job_slot_shape(runtime_slot)
                     if (
                         authority.is_symlink()
                         or authority.parent.is_symlink()
@@ -398,9 +401,21 @@ class Dispatcher:
                         raise spool_slot.SpoolSlotError(
                             "authority", f"credential authority is unavailable: {authority}"
                         )
-                    spool_slot.commit_runtime_credential(
-                        principal=principal, job_id=job_id
-                    )
+                    if runtime_mode == "systemd-template":
+                        if runtime_instance is None:
+                            raise spool_slot.SpoolSlotError(
+                                "authority",
+                                "persisted template instance is missing or malformed",
+                            )
+                        spool_slot.commit_runtime_credential_for_instance(
+                            principal=principal,
+                            instance=runtime_instance,
+                            surface_id=surface.surface_id,
+                        )
+                    else:
+                        spool_slot.commit_runtime_credential(
+                            principal=principal, job_id=job_id
+                        )
                 except Exception as exc:
                     runtime_diagnostic = runtime_diagnostic or {
                         "reason": "runtime-credential-harvest-failed",

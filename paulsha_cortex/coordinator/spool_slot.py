@@ -229,8 +229,35 @@ def credential_authority(principal: str) -> Path:
 
 
 def commit_runtime_credential(*, principal: str, job_id: str) -> Path:
-    """Atomically harvest a completed job's refresh for the next job seed."""
+    """Atomically harvest a raw job-id slot for the next job seed.
+
+    This is deliberately the legacy/direct API: ``job_id`` is normalized by
+    :func:`canonical_job_slot`.  Template callers with an already-issued
+    systemd instance must use :func:`commit_runtime_credential_for_instance`
+    instead; template instance normalization is not idempotent.
+    """
     slot = canonical_job_slot(f"{principal}-codex-home", job_id)
+    return _commit_runtime_credential_from_slot(principal=principal, slot=slot)
+
+
+def commit_runtime_credential_for_instance(
+    *, principal: str, instance: str, surface_id: str | None = None
+) -> Path:
+    """Atomically harvest an already-issued template instance.
+
+    ``instance`` is validated and joined byte-for-byte.  It is never passed
+    through the raw job-id hash helper, because the value came from the
+    Manager's persisted ``LaunchHandle.template_instance`` authority.
+    """
+    slot = exact_job_slot(
+        surface_id or f"{principal}-codex-home",
+        instance,
+    )
+    slot = validate_job_slot_shape(slot)
+    return _commit_runtime_credential_from_slot(principal=principal, slot=slot)
+
+
+def _commit_runtime_credential_from_slot(*, principal: str, slot: Path) -> Path:
     source = slot / "auth.json"
     if source.is_symlink() or not source.is_file():
         raise SpoolSlotError("shape", f"runtime credential is malformed: {source}")
@@ -843,6 +870,8 @@ def _chmod_regular_file(path: str | Path, mode: int) -> bool:
 __all__ = [
     "ACCESS_ACL_XATTR",
     "COMMIT_BUNDLE_FILENAME",
+    "commit_runtime_credential",
+    "commit_runtime_credential_for_instance",
     "exact_job_slot",
     "JOB_LOG_FILE_MODE",
     "PUBLISHED_FILE_MODE",

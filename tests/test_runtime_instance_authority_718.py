@@ -4,8 +4,10 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from paulsha_cortex.coordinator import job_runner, job_workspace, verification
+from paulsha_cortex.coordinator import job_runner, job_workspace, spool_slot, verification
+from paulsha_cortex.coordinator.dispatcher import Dispatcher
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.seams import ScriptWorktreeCreator
 
@@ -111,6 +113,11 @@ class RuntimeInstanceAuthorityTests(unittest.TestCase):
         )
         self.assertIsNone(
             job_workspace.spool_key_for_job(
+                {"job_id": job_id, "runtime_mode": "systemd-template"}
+            )
+        )
+        self.assertIsNone(
+            job_workspace.spool_key_for_job(
                 {
                     "job_id": job_id,
                     "runtime_mode": "systemd-template",
@@ -147,6 +154,171 @@ class RuntimeInstanceAuthorityTests(unittest.TestCase):
                 JobRegistry(state_path=state).get_job(created["job_id"])["template_instance"],
                 instance,
             )
+
+    def test_template_credential_harvest_uses_concrete_instance_only(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            raw_slice_id = "phase2-plan-manager-gitconfig-763"
+            job_id = f"{raw_slice_id}-132"
+            instance = job_runner.template_instance_id(raw_slice_id)
+            surface_id = "builder-codex-home"
+
+            class Registry:
+                def __init__(self) -> None:
+                    self.job = {
+                        "job_id": job_id,
+                        "executor": "codex",
+                        "runtime_mode": "systemd-template",
+                        "template_instance": instance,
+                        "runtime_principal": "builder",
+                        "runtime_surface": surface_id,
+                        "credential_publish": True,
+                    }
+                    self.updated: dict[str, object] | None = None
+
+                def get_job(self, requested_job_id: str) -> dict[str, object]:
+                    self.assert_job_id(requested_job_id)
+                    return dict(self.job)
+
+                def assert_job_id(self, requested_job_id: str) -> None:
+                    if requested_job_id != job_id:
+                        raise AssertionError(requested_job_id)
+
+                def update_headless_result(
+                    self, requested_job_id: str, **kwargs: object
+                ) -> dict[str, object]:
+                    self.assert_job_id(requested_job_id)
+                    self.updated = kwargs
+                    return {**self.job, **kwargs}
+
+            with mock.patch.dict(
+                "os.environ", {"PSC_AGENTS_ROOT": str(root)}, clear=False
+            ):
+                authority = spool_slot.credential_authority("builder")
+                authority.parent.mkdir(parents=True)
+                authority.write_text("old\n", encoding="utf-8")
+
+                producer_slot = spool_slot.canonical_job_slot(surface_id, raw_slice_id)
+                exact_slot = spool_slot.exact_job_slot(surface_id, instance)
+                self.assertEqual(producer_slot, exact_slot)
+                producer_slot.mkdir(parents=True)
+                (producer_slot / "auth.json").write_text(
+                    '{"refresh":"exact"}\n', encoding="utf-8"
+                )
+
+                double_hashed_slot = spool_slot.canonical_job_slot(surface_id, instance)
+                self.assertNotEqual(double_hashed_slot, producer_slot)
+                double_hashed_slot.mkdir(parents=True)
+                (double_hashed_slot / "auth.json").write_text(
+                    '{"refresh":"sibling"}\n', encoding="utf-8"
+                )
+
+                log_path = root / "job.jsonl"
+                log_path.write_text("", encoding="utf-8")
+                registry = Registry()
+                result = Dispatcher(registry, None, None)._finalize_headless(
+                    job_id, exit_code=0, log_path=str(log_path)
+                )
+
+                self.assertEqual(result["status"], "exited")
+                self.assertIsNone(result.get("runtime_diagnostic"))
+                self.assertEqual(authority.read_text(encoding="utf-8"), '{"refresh":"exact"}\n')
+                self.assertEqual(
+                    (double_hashed_slot / "auth.json").read_text(encoding="utf-8"),
+                    '{"refresh":"sibling"}\n',
+                )
+
+    def test_template_credential_authority_missing_or_malformed_fails_closed(self) -> None:
+        for template_instance in (None, "../foreign-slot"):
+            with self.subTest(template_instance=template_instance):
+                with tempfile.TemporaryDirectory() as d:
+                    root = Path(d)
+                    job_id = "phase2-plan-manager-gitconfig-763-132"
+                    job = {
+                        "job_id": job_id,
+                        "executor": "codex",
+                        "runtime_mode": "systemd-template",
+                        "runtime_principal": "builder",
+                        "runtime_surface": "builder-codex-home",
+                        "credential_publish": True,
+                    }
+                    if template_instance is not None:
+                        job["template_instance"] = template_instance
+
+                    class Registry:
+                        def __init__(self) -> None:
+                            self.updated: dict[str, object] | None = None
+
+                        def get_job(self, requested_job_id: str) -> dict[str, object]:
+                            if requested_job_id != job_id:
+                                raise AssertionError(requested_job_id)
+                            return dict(job)
+
+                        def update_headless_result(
+                            self, requested_job_id: str, **kwargs: object
+                        ) -> dict[str, object]:
+                            if requested_job_id != job_id:
+                                raise AssertionError(requested_job_id)
+                            self.updated = kwargs
+                            return {**job, **kwargs}
+
+                    with mock.patch.dict(
+                        "os.environ", {"PSC_AGENTS_ROOT": str(root)}, clear=False
+                    ):
+                        authority = spool_slot.credential_authority("builder")
+                        authority.parent.mkdir(parents=True)
+                        authority.write_text("old\n", encoding="utf-8")
+
+                        # Populate the raw-id fallback sibling. A template row must
+                        # never consult it when its exact authority is absent/bad.
+                        fallback = spool_slot.canonical_job_slot(
+                            "builder-codex-home", job_id
+                        )
+                        fallback.mkdir(parents=True)
+                        (fallback / "auth.json").write_text(
+                            '{"refresh":"fallback"}\n', encoding="utf-8"
+                        )
+                        log_path = root / "job.jsonl"
+                        log_path.write_text("", encoding="utf-8")
+                        registry = Registry()
+                        result = Dispatcher(registry, None, None)._finalize_headless(
+                            job_id, exit_code=0, log_path=str(log_path)
+                        )
+
+                        self.assertEqual(result["status"], "failed")
+                        self.assertEqual(
+                            registry.updated["runtime_diagnostic"]["reason"],
+                            "runtime-credential-harvest-failed",
+                        )
+                        self.assertEqual(authority.read_text(encoding="utf-8"), "old\n")
+
+    def test_raw_runtime_credential_api_remains_job_id_based(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            with mock.patch.dict(
+                "os.environ", {"PSC_AGENTS_ROOT": str(root)}, clear=False
+            ):
+                authority = spool_slot.credential_authority("builder")
+                authority.parent.mkdir(parents=True)
+                authority.write_text("old\n", encoding="utf-8")
+                raw_job_id = "legacy-job"
+                raw_slot = spool_slot.canonical_job_slot(
+                    "builder-codex-home", raw_job_id
+                )
+                raw_slot.mkdir(parents=True)
+                (raw_slot / "auth.json").write_text(
+                    '{"refresh":"legacy"}\n', encoding="utf-8"
+                )
+
+                self.assertEqual(
+                    spool_slot.commit_runtime_credential(
+                        principal="builder", job_id=raw_job_id
+                    ),
+                    authority,
+                )
+                self.assertEqual(
+                    authority.read_text(encoding="utf-8"), '{"refresh":"legacy"}\n'
+                )
 
     def test_verification_harvest_uses_persisted_template_instance_slot_only(self) -> None:
         with tempfile.TemporaryDirectory() as d:
