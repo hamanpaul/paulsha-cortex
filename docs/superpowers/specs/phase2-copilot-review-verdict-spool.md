@@ -9,13 +9,24 @@ repo: hamanpaul/paulsha-cortex
 verification:
   docs_class: code
   required_artifacts:
-    - paulsha_cortex/coordinator/launcher.py
-    - tests/test_coordinator_launcher.py
+    - path: paulsha_cortex/coordinator/launcher.py
+      must_change: true
+    - path: tests/test_coordinator_launcher.py
+      must_change: true
   checks:
-    - persona-scope
-    - command name policy argv [python3,-m,policy_check,--repo,.] timeout 180
+    - kind: persona-scope
+    - kind: command
+      name: policy
+      argv: [python3, -m, policy_check, --repo, .]
+      cwd: .
+      timeout_seconds: 180
   tests:
-    - PYTHONPATH=tests python3 -m unittest tests.test_coordinator_launcher tests.test_review_verdict_channel_p2a
+    - argv: [python3, -m, unittest, tests.test_coordinator_launcher, tests.test_review_verdict_channel_p2a]
+      cwd: .
+      timeout_seconds: 300
   full_suite:
-    policy: python3 -m policy_check --repo .
+    argv: [python3, -m, policy_check, --repo, .]
+    cwd: .
     timeout_seconds: 600
+    baseline: no-regression
+---
