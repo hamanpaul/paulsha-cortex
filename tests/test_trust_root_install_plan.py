@@ -22,6 +22,7 @@ from paulsha_cortex.trust_root.install import (
     plan_sha256,
 )
 from paulsha_cortex.trust_root.install import cli as install_cli
+from paulsha_cortex.trust_root.install import core as install_core
 
 
 def _sha256(path: Path) -> str:
@@ -191,16 +192,59 @@ def test_every_managed_directory_is_applied_before_its_managed_descendants(
 ) -> None:
     plan, _doc = _plan_document(tmp_path)
     directories = [
-        step
-        for step in plan["apply_order"]
+        (index, step)
+        for index, step in enumerate(plan["apply_order"])
         if step.get("kind") == "asset" and step.get("asset_type") == "directory"
     ]
-    positions = {step["path"]: index for index, step in enumerate(directories)}
+    positions = {step["path"]: index for index, step in directories}
+
+    deploy = plan["roots"]["deploy"]
+    state = plan["roots"]["state"]
+    assert {
+        f"{deploy}/venvs",
+        f"{deploy}/toolchain/bin",
+        f"{deploy}/toolchain/lib",
+        f"{state}/runtime/codex-home",
+        f"{state}/runtime/job-cache",
+        f"{state}/coordinator/job-prompts",
+    } <= set(positions)
 
     for child, child_position in positions.items():
         for parent, parent_position in positions.items():
             if child != parent and Path(child).is_relative_to(Path(parent)):
                 assert parent_position < child_position, (parent, child)
+
+    allowed_external_parents = {
+        Path(plan["roots"]["deploy"]).parent,
+        Path(plan["roots"]["state"]).parent,
+        Path(plan["roots"]["systemd"]),
+        Path(plan["roots"]["polkit"]),
+        *(
+            Path(row["home"]).parent
+            for row in (*plan["accounts"], *plan["service_accounts"])
+        ),
+    }
+    for index, step in enumerate(plan["apply_order"]):
+        if step.get("kind") not in {"asset", "repository", "toolchain", "venv"}:
+            continue
+        parent = Path(step["path"]).parent
+        assert (
+            parent in allowed_external_parents
+            or positions.get(parent.as_posix(), index) < index
+        )
+
+
+def test_plan_topology_guard_rejects_an_unmanaged_intermediate_parent(
+    tmp_path: Path,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    missing = f"{plan['roots']['state']}/runtime/codex-home"
+    plan["apply_order"] = [
+        step for step in plan["apply_order"] if step.get("path") != missing
+    ]
+
+    with pytest.raises(InstallPlanError, match="unmanaged immediate parent"):
+        install_core._assert_managed_parent_topology(plan)
 
 
 def test_bundle_binding_preserves_repo_container_and_installs_named_leaf(

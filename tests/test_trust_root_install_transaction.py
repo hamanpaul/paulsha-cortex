@@ -534,6 +534,8 @@ def test_first_install_adopts_exact_empty_managed_state_mount(tmp_path: Path) ->
         "mode": step["mode"],
         "acl": deepcopy(step["acls"]),
         "is_mountpoint": True,
+        "device": 8,
+        "inode": 42,
         "children": [],
     }
     receipt = new_install_receipt(plan)
@@ -546,7 +548,10 @@ def test_first_install_adopts_exact_empty_managed_state_mount(tmp_path: Path) ->
     )
 
     assert backend.applied == [step["step_id"]]
-    assert receipt.to_dict()["journal"][0]["adopted_mount_root"] is True
+    assert receipt.to_dict()["journal"][0]["adopted_mount_root"] == {
+        "device": 8,
+        "inode": 42,
+    }
 
     rollback_receipt(receipt, backend=backend)
     retained = deepcopy(backend.states[step["step_id"]])
@@ -591,6 +596,8 @@ def test_first_install_refuses_unqualified_managed_state_root_adoption(
         "mode": step["mode"],
         "acl": deepcopy(step["acls"]),
         "is_mountpoint": is_mountpoint,
+        "device": 8,
+        "inode": 42,
         "children": children,
     }
     receipt = new_install_receipt(plan)
@@ -604,6 +611,106 @@ def test_first_install_refuses_unqualified_managed_state_root_adoption(
         )
 
     assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
+def test_default_receipt_bootstrap_is_the_only_allowed_nonempty_mount(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    plan["roots"] = {"state": step["path"]}
+    plan["apply_order"] = [step]
+    receipt_path = Path(str(step["path"])) / "install-receipts/install.json"
+    plan["receipt_path"] = str(receipt_path)
+    receipt = InstallReceipt(new_install_receipt(plan).to_dict(), path=receipt_path)
+    installed = {
+        "is_mountpoint": True,
+        "device": 8,
+        "inode": 42,
+        "children": ["install-receipts", "install-receipts/install.json"],
+    }
+
+    assert install_core._explicit_empty_managed_mount_is_adoptable(
+        plan=plan,
+        step=step,
+        installed=installed,
+        receipt=receipt,
+    )
+    installed["children"].append("foreign-state")
+    assert not install_core._explicit_empty_managed_mount_is_adoptable(
+        plan=plan,
+        step=step,
+        installed=installed,
+        receipt=receipt,
+    )
+
+
+@pytest.mark.parametrize("is_mountpoint", [False, True])
+def test_mount_adoption_provenance_rejects_replaced_root(
+    tmp_path: Path, is_mountpoint: bool
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    plan["roots"] = {"state": step["path"]}
+    plan["apply_order"] = [step]
+    backend = RecordingBackend(plan)
+    backend.states[step["step_id"]] = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+        "is_mountpoint": True,
+        "device": 8,
+        "inode": 42,
+        "children": [],
+    }
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    rollback_receipt(receipt, backend=backend)
+    backend.states[step["step_id"]] = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+        "is_mountpoint": is_mountpoint,
+        "device": 9,
+        "inode": 84,
+        "children": ["foreign-state"],
+    }
+
+    with pytest.raises(InstallDriftError, match="receipt|provenance"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == [step["step_id"]]
     assert receipt.to_dict()["journal"] == []
 
 

@@ -567,6 +567,15 @@ def test_scaffold_directories_are_command_strings_only() -> None:
     assert f"{DEFAULT_LAYOUT.builder_home}/.codex" not in by_path
     assert by_path[DEFAULT_LAYOUT.home_of(TWO_WAY_SCHEME.durable_state_owner)][0] == "root"
     assert by_path[DEFAULT_LAYOUT.deploy_root][0] == "root"
+    for protected_parent in (
+        f"{DEFAULT_LAYOUT.deploy_root}/venvs",
+        DEFAULT_LAYOUT.toolchain_bin,
+        DEFAULT_LAYOUT.toolchain_lib,
+        f"{DEFAULT_LAYOUT.agents_root}/runtime/codex-home",
+        f"{DEFAULT_LAYOUT.agents_root}/runtime/job-cache",
+        f"{DEFAULT_LAYOUT.coordinator_root}/job-prompts",
+    ):
+        assert by_path[protected_parent] == ("root", 0o755)
 
 
 def test_commands_with_real_layout_have_no_placeholder_left() -> None:

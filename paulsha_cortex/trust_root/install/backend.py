@@ -364,6 +364,8 @@ def _snapshot(path: Path) -> dict[str, object]:
         "acl": _read_acl(path),
     }
     if stat.S_ISDIR(observed.st_mode):
+        snapshot["device"] = observed.st_dev
+        snapshot["inode"] = observed.st_ino
         snapshot["children"] = _directory_inventory(path)
         try:
             snapshot["is_mountpoint"] = path.is_mount()

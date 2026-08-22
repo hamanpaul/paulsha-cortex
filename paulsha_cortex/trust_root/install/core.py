@@ -942,6 +942,70 @@ def _apply_steps(
     return steps
 
 
+def _assert_managed_parent_topology(plan: Mapping[str, object]) -> None:
+    """Reject plans that would make the backend invent an unmanaged parent."""
+
+    steps = plan.get("apply_order")
+    roots = plan.get("roots")
+    if not isinstance(steps, list) or not isinstance(roots, Mapping):
+        raise InstallPlanError("plan path topology is invalid")
+    directory_positions = {
+        Path(str(step["path"])): index
+        for index, step in enumerate(steps)
+        if isinstance(step, Mapping)
+        and step.get("kind") == "asset"
+        and step.get("asset_type") == "directory"
+        and isinstance(step.get("path"), str)
+    }
+    allowed_external_parents: set[Path] = set()
+    for name in ("deploy", "state"):
+        value = roots.get(name)
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise InstallPlanError(f"plan root {name} is invalid")
+        allowed_external_parents.add(Path(value).parent)
+    for name in ("systemd", "polkit"):
+        value = roots.get(name)
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise InstallPlanError(f"plan root {name} is invalid")
+        allowed_external_parents.add(Path(value))
+    for field in ("accounts", "service_accounts"):
+        rows = plan.get(field, [])
+        if not isinstance(rows, list):
+            raise InstallPlanError(f"plan {field} is invalid")
+        for row in rows:
+            home = row.get("home") if isinstance(row, Mapping) else None
+            if not isinstance(home, str) or not Path(home).is_absolute():
+                raise InstallPlanError(f"plan {field} home is invalid")
+            allowed_external_parents.add(Path(home).parent)
+
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping) or step.get("kind") not in {
+            "asset",
+            "repository",
+            "toolchain",
+            "venv",
+        }:
+            continue
+        raw_path = step.get("path")
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise InstallPlanError(
+                f"managed step has invalid absolute path: {step.get('step_id')}"
+            )
+        parent = Path(raw_path).parent
+        parent_position = directory_positions.get(parent)
+        if parent_position is None:
+            if parent not in allowed_external_parents:
+                raise InstallPlanError(
+                    "managed step has an unmanaged immediate parent: "
+                    f"{step.get('step_id')} -> {parent}"
+                )
+        elif parent_position >= index:
+            raise InstallPlanError(
+                "managed parent must precede its child: "
+                f"{step.get('step_id')} -> {parent}"
+            )
+
+
 def build_install_plan(
     *, config: Mapping[str, object], candidate_wheel: Path, bundle: Path
 ) -> dict[str, object]:
@@ -1137,6 +1201,7 @@ def build_install_plan(
     plan["receipt_path"] = str(
         state_root / "install-receipts" / f"{commit.lower()}-{wheel_prefix}.json"
     )
+    _assert_managed_parent_topology(plan)
     return plan
 
 
@@ -1406,6 +1471,7 @@ def bind_bundle_artifacts(
         *tool_steps,
         *order[insertion:],
     ]
+    _assert_managed_parent_topology(bound)
     return bound
 
 
@@ -1567,19 +1633,48 @@ def _step_has_receipt_provenance(
                 and isinstance(prior, Mapping)
                 and (
                     prior.get("exists") is False
-                    or entry.get("adopted_from_receipt") is True
                     or (
-                        entry.get("adopted_mount_root") is True
-                        and _explicit_empty_managed_mount_is_adoptable(
-                            plan=plan,
-                            step=step,
-                            installed=prior,
-                        )
+                        entry.get("adopted_from_receipt") is True
+                        and entry.get("adopted_mount_root") is None
                     )
                 )
             ):
                 return True
     return False
+
+
+def _mount_adoption_authority_from_receipt(
+    *,
+    plan: Mapping[str, object],
+    step: Mapping[str, object],
+    receipt: "InstallReceipt",
+    installed: Mapping[str, object],
+) -> dict[str, int] | None:
+    """Carry a mount adoption forward only while its inode is still mounted."""
+
+    current = _observed_mount_authority(installed)
+    if current is None:
+        return None
+    document = receipt.to_dict()
+    if document.get("plan_sha256") != plan_sha256(plan):
+        return None
+    for field in ("journal", "rollback_journal"):
+        entries = document.get(field, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if (
+                isinstance(entry, Mapping)
+                and entry.get("step_id") == step.get("step_id")
+                and entry.get("step") == step
+                and entry.get("status") in {"prepared", "completed"}
+                and _valid_mount_adoption_authority(
+                    entry.get("adopted_mount_root"), step=step
+                )
+                and dict(entry["adopted_mount_root"]) == current
+            ):
+                return current
+    return None
 
 
 def validate_preflight(
@@ -1863,6 +1958,7 @@ class InstallReceipt:
             if entry.get("status", "completed") not in {"prepared", "completed"}:
                 raise InstallError(f"receipt journal status is invalid: {path}")
             authority = entry.get("creation_authority")
+            mount_authority = entry.get("adopted_mount_root")
             prior = entry.get("prior")
             planned_step = planned_steps.get(step_id)
             if authority is not None and (
@@ -1876,6 +1972,12 @@ class InstallReceipt:
             ):
                 raise InstallError(
                     f"receipt journal creation authority is invalid: {path}"
+                )
+            if mount_authority is not None and not _valid_mount_adoption_authority(
+                mount_authority, step=planned_step
+            ):
+                raise InstallError(
+                    f"receipt journal mount authority is invalid: {path}"
                 )
             seen.add(step_id)
         rollback_journal = payload.get("rollback_journal", [])
@@ -1896,6 +1998,7 @@ class InstallReceipt:
                     f"receipt rollback journal is not bound to its plan: {path}"
                 )
             authority = entry.get("creation_authority")
+            mount_authority = entry.get("adopted_mount_root")
             prior = entry.get("prior")
             planned_step = planned_steps.get(step_id)
             if authority is not None and (
@@ -1909,6 +2012,12 @@ class InstallReceipt:
             ):
                 raise InstallError(
                     f"receipt rollback creation authority is invalid: {path}"
+                )
+            if mount_authority is not None and not _valid_mount_adoption_authority(
+                mount_authority, step=planned_step
+            ):
+                raise InstallError(
+                    f"receipt rollback mount authority is invalid: {path}"
                 )
             rollback_seen.add(step_id)
         credentials = payload.get("credentials")
@@ -2282,21 +2391,90 @@ def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> b
     return True
 
 
+def _observed_mount_authority(
+    installed: Mapping[str, object],
+) -> dict[str, int] | None:
+    device = installed.get("device")
+    inode = installed.get("inode")
+    if (
+        installed.get("is_mountpoint") is not True
+        or not isinstance(device, int)
+        or isinstance(device, bool)
+        or device < 0
+        or not isinstance(inode, int)
+        or isinstance(inode, bool)
+        or inode <= 0
+    ):
+        return None
+    return {"device": device, "inode": inode}
+
+
+def _valid_mount_adoption_authority(
+    authority: object, *, step: object
+) -> bool:
+    return bool(
+        isinstance(step, Mapping)
+        and step.get("kind") == "asset"
+        and step.get("asset_type") == "directory"
+        and step.get("durable") is True
+        and step.get("adoption_policy") == "empty-managed-root-mount"
+        and isinstance(authority, Mapping)
+        and set(authority) == {"device", "inode"}
+        and _observed_mount_authority(
+            {"is_mountpoint": True, **dict(authority)}
+        )
+        is not None
+    )
+
+
+def _receipt_bootstrap_children(
+    *, plan: Mapping[str, object], receipt: "InstallReceipt | None"
+) -> list[str] | None:
+    """Return the exact state-root children created by the default receipt."""
+
+    roots = plan.get("roots")
+    configured = plan.get("receipt_path")
+    if (
+        receipt is None
+        or receipt.path is None
+        or not isinstance(roots, Mapping)
+        or not isinstance(roots.get("state"), str)
+        or not isinstance(configured, str)
+        or receipt.path != Path(configured)
+    ):
+        return None
+    state_root = Path(roots["state"])
+    try:
+        relative = receipt.path.relative_to(state_root)
+    except ValueError:
+        return None
+    if len(relative.parts) != 2 or relative.parts[0] != "install-receipts":
+        return None
+    return [relative.parts[0], relative.as_posix()]
+
+
 def _explicit_empty_managed_mount_is_adoptable(
     *,
     plan: Mapping[str, object],
     step: Mapping[str, object],
     installed: Mapping[str, object],
+    receipt: "InstallReceipt | None" = None,
 ) -> bool:
     """Recognize the one first-install directory created by a volume mount.
 
     A Docker named volume necessarily materializes its mountpoint before Cortex
     can create it.  Adoption is therefore limited to the exact managed state
-    root, only while it is an empty mountpoint and already matches the complete
-    desired owner/mode/ACL state checked by the caller.
+    root, only while it is empty apart from the default receipt bootstrap and
+    already matches the complete desired owner/mode/ACL state checked by the
+    caller.
     """
 
     roots = plan.get("roots")
+    children = installed.get("children")
+    receipt_children = _receipt_bootstrap_children(plan=plan, receipt=receipt)
+    allowed_children = children == [] or (
+        receipt_children is not None and children == receipt_children
+    )
     return bool(
         isinstance(roots, Mapping)
         and isinstance(roots.get("state"), str)
@@ -2305,8 +2483,8 @@ def _explicit_empty_managed_mount_is_adoptable(
         and step.get("durable") is True
         and step.get("path") == roots["state"]
         and step.get("adoption_policy") == "empty-managed-root-mount"
-        and installed.get("is_mountpoint") is True
-        and installed.get("children") == []
+        and _observed_mount_authority(installed) is not None
+        and allowed_children
     )
 
 
@@ -2636,7 +2814,8 @@ def apply_plan(
         else:
             prior = dict(backend.inspect_step(step))
             adopted_from_receipt = False
-            adopted_mount_root = False
+            adopted_mount_root: dict[str, int] | None = None
+            replayed_mount_root = False
             if (
                 step.get("kind") in {"asset", "repository"}
                 and _state_matches(step, prior)
@@ -2644,11 +2823,20 @@ def apply_plan(
                 adopted_from_receipt = _step_has_receipt_provenance(
                     plan=plan, step=step, receipt=receipt
                 )
-                adopted_mount_root = _explicit_empty_managed_mount_is_adoptable(
-                    plan=plan,
-                    step=step,
-                    installed=prior,
+                adopted_mount_root = _mount_adoption_authority_from_receipt(
+                    plan=plan, step=step, receipt=receipt, installed=prior
                 )
+                replayed_mount_root = adopted_mount_root is not None
+                if (
+                    adopted_mount_root is None
+                    and _explicit_empty_managed_mount_is_adoptable(
+                        plan=plan,
+                        step=step,
+                        installed=prior,
+                        receipt=receipt,
+                    )
+                ):
+                    adopted_mount_root = _observed_mount_authority(prior)
                 if not (adopted_from_receipt or adopted_mount_root):
                     raise InstallDriftError(
                         f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
@@ -2661,8 +2849,10 @@ def apply_plan(
             }
             if adopted_from_receipt:
                 entry["adopted_from_receipt"] = True
-            if adopted_mount_root:
-                entry["adopted_mount_root"] = True
+            if adopted_mount_root is not None:
+                entry["adopted_mount_root"] = adopted_mount_root
+                if replayed_mount_root:
+                    entry["adopted_from_receipt"] = True
             journal.append(entry)
             completed[step_id] = entry
             receipt._persist()

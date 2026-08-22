@@ -3735,16 +3735,27 @@ class PathLayout:
             # 指向這裡，因此持 spawn 授權的帳號也改不了 job 實際執行的第一支程式。
             (self.bin_root, root, g(root), 0o755),
             (self.venv_root, root, g(root), 0o755),
+            (f"{self.deploy_root}/venvs", root, g(root), 0o755),
+            (self.toolchain_bin, root, g(root), 0o755),
+            (self.toolchain_lib, root, g(root), 0o755),
             # durable state 樹的 root-owned 骨架（svc 不得 relink 這幾層）。
             (f"{self.agents_root}/config", root, g(root), 0o755),
             (f"{self.agents_root}/run", root, g(root), 0o755),
             (f"{self.agents_root}/runtime", root, g(root), 0o755),
+            (f"{self.agents_root}/runtime/codex-home", root, g(root), 0o755),
+            (f"{self.agents_root}/runtime/job-cache", root, g(root), 0o755),
             # Canonical Codex authority roots are registry assets.  They are
             # intentionally absent here; emitting them again would give the
             # scaffold and permission plan two executable ownership truths.
             # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
             (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
             (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
+            (
+                f"{self.coordinator_root}/{paths.JOB_PROMPT_ROOT_DIRNAME}",
+                root,
+                g(root),
+                0o755,
+            ),
             # job spec spool 不在此列：它已是登記表資產（`job-spec-spool`），權限由
             # `plan_to_commands()` 依登記表機械產出（owner-only ＋ job 帳號唯讀 ACL），
             # 在骨架再寫一次會變成第二份真相。
