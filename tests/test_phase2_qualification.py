@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -19,6 +20,15 @@ RUNNER = QUALIFICATION / "run.sh"
 SCHEMA = QUALIFICATION / "qualification.schema.json"
 VALIDATOR = QUALIFICATION / "validate.py"
 DRIVER = QUALIFICATION / "driver.py"
+
+
+def _load_driver_module():
+    spec = importlib.util.spec_from_file_location("cortex_qualification_driver", DRIVER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _required_text(path: Path) -> str:
@@ -648,3 +658,37 @@ def test_qualification_driver_and_runner_are_fail_closed_on_live_inputs() -> Non
         "CORTEX_RC_PROBE_ISSUE",
     ):
         assert variable in runner
+
+
+def test_account_runtime_env_uses_installed_psc_roots_without_manager_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver_module()
+    monkeypatch.setattr(
+        driver,
+        "_account_env",
+        lambda account: {
+            "HOME": f"/home/{account}",
+            "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+            "CI": "true",
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "_installed_runtime_env",
+        lambda: {
+            "HOME": "/root",
+            "PATH": "/opt/cortex/venv/bin:/usr/bin:/bin",
+            "PSC_CONTROL_ROOT": "/var/lib/cortex/control",
+            "PSC_COORDINATOR_ROOT": "/var/lib/cortex/coordinator",
+            "UNRELATED_MANAGER_VALUE": "must-not-leak",
+        },
+    )
+
+    env = driver._account_runtime_env("cortex-builder")
+
+    assert env["HOME"] == "/home/cortex-builder"
+    assert env["PATH"] == "/opt/cortex/toolchain/bin:/usr/bin:/bin"
+    assert env["PSC_CONTROL_ROOT"] == "/var/lib/cortex/control"
+    assert env["PSC_COORDINATOR_ROOT"] == "/var/lib/cortex/coordinator"
+    assert "UNRELATED_MANAGER_VALUE" not in env

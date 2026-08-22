@@ -170,6 +170,20 @@ def _installed_runtime_env() -> dict[str, str]:
     return env
 
 
+def _account_runtime_env(account: str) -> dict[str, str]:
+    """Project installed runtime roots without changing the probed identity."""
+
+    env = _account_env(account)
+    env.update(
+        {
+            key: value
+            for key, value in _installed_runtime_env().items()
+            if key.startswith("PSC_")
+        }
+    )
+    return env
+
+
 def _service_rows() -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for name in SERVICES:
@@ -402,7 +416,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                 "invalid/qualification",
             ),
             user=principal,
-            env=_account_env(principal),
+            env=_account_runtime_env(principal),
             timeout=30,
         )
         cli_text = (cli.stdout + cli.stderr).lower()
