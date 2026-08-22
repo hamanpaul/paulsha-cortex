@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -969,6 +970,67 @@ def _apply_steps(
     return steps
 
 
+def _finalized_asset_steps(
+    *,
+    scaffolds: Sequence[Mapping[str, object]],
+    assets: Sequence[Mapping[str, object]],
+    generated: Mapping[str, Mapping[str, Mapping[str, str]]],
+    state_root: str,
+) -> list[dict[str, object]]:
+    steps = _apply_steps(
+        scaffolds=scaffolds,
+        assets=assets,
+        generated=generated,
+    )
+    state_steps = [
+        step
+        for step in steps
+        if step.get("kind") == "asset"
+        and step.get("asset_type") == "directory"
+        and step.get("path") == state_root
+    ]
+    if len(state_steps) != 1:
+        raise InstallPlanError(
+            "managed state root must map to exactly one directory step"
+        )
+    state_steps[0]["durable"] = True
+    state_steps[0]["adoption_policy"] = "empty-managed-root-mount"
+    state_steps[0]["desired_sha256"] = _desired_digest(state_steps[0])
+    return steps
+
+
+def _systemctl_steps() -> list[dict[str, object]]:
+    steps: list[dict[str, object]] = [
+        {
+            "step_id": "systemd:daemon-reload",
+            "kind": "systemctl",
+            "action": "daemon-reload",
+            "operations": ["daemon-reload"],
+            "desired_sha256": hashlib.sha256(
+                b"systemctl:daemon-reload\n"
+            ).hexdigest(),
+        }
+    ]
+    for unit in (
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+        "cortex-monitor.service",
+    ):
+        steps.append(
+            {
+                "step_id": f"systemd:enable:{unit}",
+                "kind": "systemctl",
+                "action": "enable",
+                "unit": unit,
+                "operations": ["enable"],
+                "desired_sha256": hashlib.sha256(
+                    f"systemctl:enable:{unit}\n".encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    return steps
+
+
 def _assert_managed_parent_topology(plan: Mapping[str, object]) -> None:
     """Reject plans that would make the backend invent an unmanaged parent."""
 
@@ -1037,15 +1099,7 @@ def canonical_receipt_path(plan: Mapping[str, object]) -> Path:
     """Derive the default receipt authority from immutable plan identity."""
 
     roots = plan.get("roots")
-    repo_identity = plan.get("repo_identity")
-    candidate = plan.get("candidate")
     state = roots.get("state") if isinstance(roots, Mapping) else None
-    commit = (
-        repo_identity.get("commit") if isinstance(repo_identity, Mapping) else None
-    )
-    wheel_sha256 = (
-        candidate.get("wheel_sha256") if isinstance(candidate, Mapping) else None
-    )
     if (
         not isinstance(state, str)
         or not state
@@ -1054,19 +1108,14 @@ def canonical_receipt_path(plan: Mapping[str, object]) -> Path:
         or not Path(state).name
     ):
         raise InstallPlanError("plan state root cannot derive receipt authority")
-    if (
-        not isinstance(commit, str)
-        or len(commit) != 40
-        or any(char not in "0123456789abcdefABCDEF" for char in commit)
-    ):
-        raise InstallPlanError("plan repository commit cannot derive receipt authority")
-    if not _valid_sha256(wheel_sha256):
-        raise InstallPlanError("candidate wheel cannot derive receipt authority")
+    authority = _as_plan_dict(plan)
+    authority.pop("receipt_path", None)
+    identity = plan_sha256(authority)
     state_root = Path(state)
     return (
         state_root.parent
         / f"{state_root.name}-install-receipts"
-        / f"{commit.lower()}-{wheel_sha256}.json"
+        / f"{identity}.json"
     )
 
 
@@ -1149,23 +1198,12 @@ def build_install_plan(
         char not in "0123456789abcdefABCDEF" for char in commit
     ):
         raise InstallPlanError("repo_identity.commit must be a 40-hex SHA")
-    install_steps = _apply_steps(
+    install_steps = _finalized_asset_steps(
         scaffolds=scaffolds,
         assets=assets,
         generated=generated,
+        state_root=str(roots["state"]),
     )
-    state_root_steps = [
-        step
-        for step in install_steps
-        if step.get("kind") == "asset"
-        and step.get("asset_type") == "directory"
-        and step.get("path") == roots["state"]
-    ]
-    if len(state_root_steps) != 1:
-        raise InstallPlanError("managed state root must map to exactly one directory step")
-    state_root_steps[0]["durable"] = True
-    state_root_steps[0]["adoption_policy"] = "empty-managed-root-mount"
-    state_root_steps[0]["desired_sha256"] = _desired_digest(state_root_steps[0])
     plan: dict[str, object] = {
         "schema_version": 1,
         "scheme": "four-way",
@@ -1231,32 +1269,7 @@ def build_install_plan(
                 "desired_sha256": _sha256_file(wheel_path),
                 "rollback_policy": "restore-link-retain-slot",
             },
-            {
-                "step_id": "systemd:daemon-reload",
-                "kind": "systemctl",
-                "action": "daemon-reload",
-                "operations": ["daemon-reload"],
-                "desired_sha256": hashlib.sha256(
-                    b"systemctl:daemon-reload\n"
-                ).hexdigest(),
-            },
-            *(
-                {
-                    "step_id": f"systemd:enable:{unit}",
-                    "kind": "systemctl",
-                    "action": "enable",
-                    "unit": unit,
-                    "operations": ["enable"],
-                    "desired_sha256": hashlib.sha256(
-                        f"systemctl:enable:{unit}\n".encode("utf-8")
-                    ).hexdigest(),
-                }
-                for unit in (
-                    "cortex-egress-proxy.service",
-                    "cortex-manager.service",
-                    "cortex-monitor.service",
-                )
-            ),
+            *_systemctl_steps(),
         ],
         "activation_order": [
             "cortex-egress-proxy.service",
@@ -1415,6 +1428,69 @@ def validate_bundle_manifest(bundle_path: Path) -> dict[str, object]:
     }
 
 
+_FINAL_TOOLCHAIN_KEYS = frozenset(
+    {
+        "name",
+        "version",
+        "shape",
+        "entrypoint",
+        "source",
+        "source_sha256",
+        "installed_sha256",
+        "path",
+        "owner",
+        "group",
+        "mode",
+        "operations",
+        "desired_sha256",
+    }
+)
+
+
+def _final_toolchain_manifest_row(
+    *,
+    name: str,
+    configured: Mapping[str, object],
+    bundled: Mapping[str, object],
+    deploy_root: str,
+) -> dict[str, object]:
+    if (
+        configured.get("version") != bundled.get("version")
+        or configured.get("sha256") != bundled.get("sha256")
+        or configured.get("shape", "file") != bundled.get("shape")
+        or configured.get("entrypoint") != bundled.get("entrypoint")
+    ):
+        raise InstallPlanError(f"config toolchain pin does not match bundle: {name}")
+    installed_sha256 = bundled.get("installed_sha256", bundled.get("sha256"))
+    return {
+        "name": name,
+        "version": bundled.get("version"),
+        "shape": bundled.get("shape"),
+        "entrypoint": bundled.get("entrypoint"),
+        "source": bundled.get("resolved_path"),
+        "source_sha256": bundled.get("sha256"),
+        "installed_sha256": installed_sha256,
+        "path": f"{deploy_root}/toolchain/lib/{name}",
+        "owner": "root",
+        "group": "root",
+        "mode": "0755",
+        "operations": ["snapshot", "copy-locked", "chown", "chmod"],
+        "desired_sha256": installed_sha256,
+    }
+
+
+def _toolchain_step(row: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "step_id": f"toolchain:{row['name']}",
+        "kind": "toolchain",
+        **{
+            key: deepcopy(value)
+            for key, value in row.items()
+            if key != "installed_sha256"
+        },
+    }
+
+
 def bind_bundle_artifacts(
     plan: Mapping[str, object], manifest: Mapping[str, object]
 ) -> dict[str, object]:
@@ -1428,41 +1504,27 @@ def bind_bundle_artifacts(
     by_name = {
         str(row.get("name")): row for row in tools if isinstance(row, Mapping)
     }
-    if set(configured_tools) != set(by_name):
+    if len(by_name) != len(tools) or set(configured_tools) != set(by_name):
         raise InstallPlanError("config toolchain names must exactly match the bundle")
     roots = bound.get("roots")
     if not isinstance(roots, Mapping) or not isinstance(roots.get("deploy"), str):
         raise InstallPlanError("plan roots are invalid")
+    finalized_tools: dict[str, dict[str, object]] = {}
     tool_steps: list[dict[str, object]] = []
     for name in sorted(by_name):
         configured = configured_tools[name]
         bundled = by_name[name]
-        if (
-            not isinstance(configured, Mapping)
-            or configured.get("version") != bundled.get("version")
-            or configured.get("sha256") != bundled.get("sha256")
-            or configured.get("shape", "file") != bundled.get("shape")
-            or configured.get("entrypoint") != bundled.get("entrypoint")
-        ):
-            raise InstallPlanError(f"config toolchain pin does not match bundle: {name}")
-        tool_steps.append(
-            {
-                "step_id": f"toolchain:{name}",
-                "kind": "toolchain",
-                "name": name,
-                "version": bundled["version"],
-                "shape": bundled["shape"],
-                "entrypoint": bundled.get("entrypoint"),
-                "source": bundled["resolved_path"],
-                "source_sha256": bundled["sha256"],
-                "path": f"{roots['deploy']}/toolchain/lib/{name}",
-                "owner": "root",
-                "group": "root",
-                "mode": "0755",
-                "desired_sha256": bundled.get("installed_sha256", bundled["sha256"]),
-                "operations": ["snapshot", "copy-locked", "chown", "chmod"],
-            }
+        if not isinstance(configured, Mapping) or not isinstance(bundled, Mapping):
+            raise InstallPlanError(f"toolchain authority is invalid: {name}")
+        finalized = _final_toolchain_manifest_row(
+            name=name,
+            configured=configured,
+            bundled=bundled,
+            deploy_root=str(roots["deploy"]),
         )
+        finalized_tools[name] = finalized
+        tool_steps.append(_toolchain_step(finalized))
+    bound["toolchain_manifest"] = finalized_tools
 
     repositories = manifest.get("source_repositories")
     configured_assets = bound.get("assets", [])
@@ -1536,6 +1598,7 @@ def bind_bundle_artifacts(
         *tool_steps,
         *order[insertion:],
     ]
+    bound["receipt_path"] = str(canonical_receipt_path(bound))
     _assert_managed_parent_topology(bound)
     return bound
 
@@ -2328,15 +2391,64 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def _open_receipt_lock(parent_fd: int, path: Path, leaf: str) -> int:
+    """Open and exclusively lock the persistent authority for one receipt leaf."""
+
+    lock_name = f".{leaf}.lock"
+    if len(os.fsencode(lock_name)) > 255:
+        raise UnsafeInstallPathError(f"receipt lock authority name is too long: {path}")
+    lock_path = path.with_name(lock_name)
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    created = False
+    try:
+        try:
+            descriptor = os.open(lock_name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    lock_name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(lock_name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise UnsafeInstallPathError(
+            f"cannot safely open receipt lock authority: {path}"
+        ) from exc
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(parent_fd)
+        _validate_receipt_file(os.fstat(descriptor), lock_path)
+        _assert_fd_path_binding(lock_path, descriptor, directory=False)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _validate_receipt_file(os.fstat(descriptor), lock_path)
+        _assert_fd_path_binding(lock_path, descriptor, directory=False)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _create_receipt_json_exclusive(path: Path, value: object) -> str:
     """Create the initial receipt without adopting or replacing an existing leaf."""
 
     parent_fd: int | None = None
+    lock_fd: int | None = None
     receipt_fd: int | None = None
     created = False
     payload = _canonical_bytes(value)
     try:
         parent_fd, leaf = _open_receipt_parent_directory(path, create=True)
+        lock_fd = _open_receipt_lock(parent_fd, path, leaf)
         try:
             receipt_fd = os.open(
                 leaf,
@@ -2374,6 +2486,8 @@ def _create_receipt_json_exclusive(path: Path, value: object) -> str:
     finally:
         if receipt_fd is not None:
             os.close(receipt_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
         if parent_fd is not None:
             os.close(parent_fd)
 
@@ -2384,12 +2498,14 @@ def _atomic_write_receipt_json(
     """Publish a checkpoint only over the receipt version held by the caller."""
 
     parent_fd: int | None = None
+    lock_fd: int | None = None
     existing_fd: int | None = None
     temporary_fd: int | None = None
     temporary_name: str | None = None
     payload = _canonical_bytes(value)
     try:
         parent_fd, leaf = _open_receipt_parent_directory(path)
+        lock_fd = _open_receipt_lock(parent_fd, path, leaf)
         try:
             existing_fd = os.open(
                 leaf,
@@ -2452,6 +2568,8 @@ def _atomic_write_receipt_json(
             os.close(temporary_fd)
         if existing_fd is not None:
             os.close(existing_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
         if parent_fd is not None:
             os.close(parent_fd)
 
@@ -2771,6 +2889,122 @@ def _validate_repository_step_bijection(
         raise InstallPlanError("source repositories and apply steps are not a bijection")
 
 
+def _validate_asset_step_bijection(
+    plan: Mapping[str, object], steps: Sequence[Mapping[str, object]]
+) -> None:
+    scaffolds = plan.get("scaffolds")
+    assets = plan.get("assets")
+    generated = plan.get("generated")
+    roots = plan.get("roots")
+    state_root = roots.get("state") if isinstance(roots, Mapping) else None
+    if (
+        type(scaffolds) is not list
+        or type(assets) is not list
+        or not isinstance(generated, Mapping)
+        or not _is_safe_absolute_plan_path(state_root)
+    ):
+        raise InstallPlanError("plan asset inventories are invalid")
+    try:
+        expected = _finalized_asset_steps(
+            scaffolds=scaffolds,
+            assets=assets,
+            generated=generated,
+            state_root=str(state_root),
+        )
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise InstallPlanError("plan asset inventories are invalid") from exc
+    observed = [deepcopy(dict(step)) for step in steps if step.get("kind") == "asset"]
+    if observed != expected:
+        raise InstallPlanError("asset inventory and apply steps are not an exact bijection")
+
+
+def _validate_systemctl_steps(steps: Sequence[Mapping[str, object]]) -> None:
+    expected = _systemctl_steps()
+    observed = [
+        deepcopy(dict(step)) for step in steps if step.get("kind") == "systemctl"
+    ]
+    if observed != expected or list(steps[-len(expected) :]) != expected:
+        raise InstallPlanError("systemctl apply steps are not the canonical final sequence")
+
+
+def _validate_toolchain_step_bijection(
+    plan: Mapping[str, object], steps: Sequence[Mapping[str, object]]
+) -> None:
+    manifest = plan.get("toolchain_manifest")
+    roots = plan.get("roots")
+    deploy = roots.get("deploy") if isinstance(roots, Mapping) else None
+    if not isinstance(manifest, Mapping) or not manifest or not _is_safe_absolute_plan_path(
+        deploy
+    ):
+        raise InstallPlanError("finalized toolchain manifest is invalid")
+    expected: list[dict[str, object]] = []
+    for raw_name in sorted(manifest):
+        name = raw_name if type(raw_name) is str else None
+        raw = manifest[raw_name]
+        if (
+            name is None
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or not isinstance(raw, Mapping)
+            or set(raw) != _FINAL_TOOLCHAIN_KEYS
+        ):
+            raise InstallPlanError("finalized toolchain manifest row is invalid")
+        row = dict(raw)
+        shape = row.get("shape")
+        entrypoint = row.get("entrypoint")
+        relative_entrypoint = (
+            PurePosixPath(entrypoint) if isinstance(entrypoint, str) else None
+        )
+        if (
+            row.get("name") != name
+            or type(row.get("version")) is not str
+            or not row.get("version")
+            or shape not in {"file", "tree"}
+            or (
+                shape == "file"
+                and entrypoint is not None
+            )
+            or (
+                shape == "tree"
+                and (
+                    relative_entrypoint is None
+                    or relative_entrypoint.is_absolute()
+                    or ".." in relative_entrypoint.parts
+                    or not relative_entrypoint.parts
+                )
+            )
+            or not _is_safe_absolute_plan_path(row.get("source"))
+            or not _valid_sha256(row.get("source_sha256"))
+            or not _valid_sha256(row.get("installed_sha256"))
+            or row.get("path") != str(Path(str(deploy)) / "toolchain/lib" / name)
+            or row.get("owner") != "root"
+            or row.get("group") != "root"
+            or row.get("mode") != "0755"
+            or row.get("operations")
+            != ["snapshot", "copy-locked", "chown", "chmod"]
+            or row.get("desired_sha256") != row.get("installed_sha256")
+            or (shape == "file" and row.get("desired_sha256") != row.get("source_sha256"))
+        ):
+            raise InstallPlanError("finalized toolchain manifest row is invalid")
+        expected.append(_toolchain_step(row))
+    observed = [
+        deepcopy(dict(step)) for step in steps if step.get("kind") == "toolchain"
+    ]
+    if observed != expected:
+        raise InstallPlanError(
+            "toolchain manifest and apply steps are not an exact bijection"
+        )
+
+
+def _validate_finalized_apply_surfaces(
+    plan: Mapping[str, object], steps: Sequence[Mapping[str, object]]
+) -> None:
+    _validate_asset_step_bijection(plan, steps)
+    _validate_toolchain_step_bijection(plan, steps)
+    _validate_systemctl_steps(steps)
+
+
 def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str, object]]:
     """Revalidate serialized plan authority immediately before mutation."""
 
@@ -2783,7 +3017,6 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
         for field in ("wheel_sha256", "bundle_sha256")
     ):
         raise InstallPlanError("plan candidate identity is invalid")
-    _validate_canonical_receipt_path(plan)
     account_inventory = _validate_apply_account_inventories(plan)
     _validate_required_credentials(plan)
     steps = plan.get("apply_order")
@@ -2817,6 +3050,8 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
     _validate_account_step_bijection(account_inventory, typed_steps)
     _validate_repository_step_bijection(plan, typed_steps, repo_identity)
     _assert_managed_parent_topology(plan)
+    _validate_finalized_apply_surfaces(plan, typed_steps)
+    _validate_canonical_receipt_path(plan)
     return typed_steps
 
 

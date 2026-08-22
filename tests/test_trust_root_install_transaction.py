@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,11 @@ def _synthetic_transaction_plans_skip_complete_authority_envelope(
     )
     monkeypatch.setattr(
         install_core, "_validate_canonical_receipt_path", lambda _plan: None
+    )
+    monkeypatch.setattr(
+        install_core,
+        "_validate_finalized_apply_surfaces",
+        lambda _plan, _steps: None,
     )
 
 
@@ -1431,6 +1437,100 @@ def test_checkpoint_refuses_replaced_private_leaf_without_changing_its_bytes(
         receipt._persist()
 
     assert path.read_bytes() == replacement
+
+
+def test_concurrent_receipt_checkpoints_serialize_and_reject_the_stale_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    plan = _plan(tmp_path)
+    new_install_receipt(plan, path=path)
+    first = InstallReceipt.load(path, expected_plan=plan)
+    second = InstallReceipt.load(path, expected_plan=plan)
+    first._document["state"] = "applying"
+    second._document["state"] = "rolled-back"
+    real_replace = install_core.os.replace
+    first_replace_entered = threading.Event()
+    second_replace_entered = threading.Event()
+    release_first = threading.Event()
+    replace_lock = threading.Lock()
+    replace_calls = 0
+
+    def delay_first_replace(source, destination, *args, **kwargs):
+        nonlocal replace_calls
+        if destination == path.name:
+            with replace_lock:
+                replace_calls += 1
+                call = replace_calls
+            if call == 1:
+                first_replace_entered.set()
+                assert release_first.wait(timeout=2)
+            elif call == 2:
+                second_replace_entered.set()
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(install_core.os, "replace", delay_first_replace)
+    outcomes: list[str] = []
+
+    def checkpoint(receipt: InstallReceipt) -> None:
+        try:
+            receipt._persist()
+            outcomes.append("success")
+        except InstallError:
+            outcomes.append("stale")
+
+    first_thread = threading.Thread(target=checkpoint, args=(first,))
+    second_thread = threading.Thread(target=checkpoint, args=(second,))
+    first_thread.start()
+    assert first_replace_entered.wait(timeout=2)
+    second_thread.start()
+    raced = second_replace_entered.wait(timeout=0.2)
+    release_first.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert not raced
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert sorted(outcomes) == ["stale", "success"]
+    assert replace_calls == 1
+    assert InstallReceipt.load(path, expected_plan=plan).to_dict()["state"] == "applying"
+
+
+def test_receipt_lock_is_persistent_private_and_nofollow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "authority" / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    new_install_receipt(_plan(tmp_path), path=path)
+
+    lock_path = path.parent / f".{path.name}.lock"
+    assert lock_path.is_file()
+    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+    path.unlink()
+    lock_path.unlink()
+    external = tmp_path / "external"
+    external.write_bytes(b"DO-NOT-LOCK\n")
+    path.parent.mkdir(exist_ok=True)
+    lock_path.symlink_to(external)
+
+    with pytest.raises(UnsafeInstallPathError, match="lock|authority|safe"):
+        new_install_receipt(_plan(tmp_path), path=path)
+
+    assert external.read_bytes() == b"DO-NOT-LOCK\n"
+    assert not path.exists()
 
 
 def _root_owned_stat(observed: os.stat_result) -> os.stat_result:

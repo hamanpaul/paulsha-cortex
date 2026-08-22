@@ -50,6 +50,11 @@ def _synthetic_verify_plans_skip_complete_authority_envelope(
     monkeypatch.setattr(
         install_core, "_validate_canonical_receipt_path", lambda _plan: None
     )
+    monkeypatch.setattr(
+        install_core,
+        "_validate_finalized_apply_surfaces",
+        lambda _plan, _steps: None,
+    )
 
 
 def _artifact(content: str, *, owner: str = "root", mode: str = "0644"):

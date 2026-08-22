@@ -355,22 +355,28 @@ def test_canonical_receipt_path_binds_full_plan_identity(tmp_path: Path) -> None
     plan, _doc = _plan_document(tmp_path)
 
     receipt_path = install_core.canonical_receipt_path(plan)
+    identity = deepcopy(plan)
+    identity.pop("receipt_path")
 
     assert plan["receipt_path"] == str(receipt_path)
     assert receipt_path.parent == Path(plan["roots"]["state"]).parent / (
         f"{Path(plan['roots']['state']).name}-install-receipts"
     )
-    assert receipt_path.name == (
-        f"{'a' * 40}-{plan['candidate']['wheel_sha256']}.json"
-    )
-    for field in ("state", "commit", "wheel"):
+    assert receipt_path.name == f"{plan_sha256(identity)}.json"
+    for field in ("state", "commit", "wheel", "bundle", "provider", "account"):
         changed = deepcopy(plan)
         if field == "state":
             changed["roots"]["state"] = f"{plan['roots']['state']}-other"
         elif field == "commit":
             changed["repo_identity"]["commit"] = "b" * 40
-        else:
+        elif field == "wheel":
             changed["candidate"]["wheel_sha256"] = "d" * 64
+        elif field == "bundle":
+            changed["candidate"]["bundle_sha256"] = "e" * 64
+        elif field == "provider":
+            changed["provider_manifest"]["builder"] = []
+        else:
+            changed["accounts"][0]["uid"] += 1000
         assert install_core.canonical_receipt_path(changed) != receipt_path
 
 
@@ -396,6 +402,12 @@ def test_apply_cli_rejects_noncanonical_plan_receipt_before_override_collision(
 
     monkeypatch.setattr(install_cli, "_require_root", lambda: None)
     monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
 
     assert install_cli.main(
         [
@@ -454,6 +466,202 @@ def test_apply_cli_refuses_same_path_receipt_for_a_different_valid_plan(
     ) == 1
     assert override.read_bytes() == before
     assert MutationSentinelBackend.preflight_calls == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "asset-extra",
+        "asset-missing",
+        "asset-drift",
+        "state-authority-drift",
+        "systemctl-extra",
+        "systemctl-missing",
+        "systemctl-order",
+        "systemctl-action",
+        "tool-manifest-missing",
+        "tool-manifest-extra",
+        "tool-step-missing",
+        "tool-step-extra",
+        "tool-step-field",
+    ],
+)
+def test_apply_cli_rejects_nonbijective_finalized_surfaces_before_receipt_or_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    asset_steps = [step for step in plan["apply_order"] if step["kind"] == "asset"]
+    systemctl_steps = [
+        step for step in plan["apply_order"] if step["kind"] == "systemctl"
+    ]
+    tool_steps = [
+        step for step in plan["apply_order"] if step["kind"] == "toolchain"
+    ]
+    if case == "asset-extra":
+        extra = deepcopy(asset_steps[-1])
+        extra["step_id"] = "generated:environment/unauthorized"
+        plan["apply_order"].append(extra)
+    elif case == "asset-missing":
+        plan["apply_order"].remove(asset_steps[-1])
+    elif case == "asset-drift":
+        asset_steps[-1]["content"] += "# unauthorized\n"
+        asset_steps[-1]["desired_sha256"] = install_core._desired_digest(
+            asset_steps[-1]
+        )
+    elif case == "state-authority-drift":
+        state = next(
+            step
+            for step in asset_steps
+            if step.get("path") == plan["roots"]["state"]
+        )
+        state["durable"] = False
+        state.pop("adoption_policy")
+        state["desired_sha256"] = install_core._desired_digest(state)
+    elif case == "systemctl-extra":
+        extra = deepcopy(systemctl_steps[-1])
+        extra["step_id"] = "systemd:enable:unauthorized.service"
+        extra["unit"] = "unauthorized.service"
+        extra["desired_sha256"] = "d" * 64
+        plan["apply_order"].append(extra)
+    elif case == "systemctl-missing":
+        plan["apply_order"].remove(systemctl_steps[-1])
+    elif case == "systemctl-order":
+        first = plan["apply_order"].index(systemctl_steps[0])
+        second = plan["apply_order"].index(systemctl_steps[1])
+        plan["apply_order"][first], plan["apply_order"][second] = (
+            plan["apply_order"][second],
+            plan["apply_order"][first],
+        )
+    elif case == "systemctl-action":
+        systemctl_steps[-1]["action"] = "disable"
+        systemctl_steps[-1]["operations"] = ["disable"]
+        systemctl_steps[-1]["desired_sha256"] = "d" * 64
+    elif case == "tool-manifest-missing":
+        plan["toolchain_manifest"].pop(next(iter(plan["toolchain_manifest"])))
+    elif case == "tool-manifest-extra":
+        extra = deepcopy(next(iter(plan["toolchain_manifest"].values())))
+        extra["name"] = "unauthorized"
+        extra["path"] = f"{plan['roots']['deploy']}/toolchain/lib/unauthorized"
+        plan["toolchain_manifest"]["unauthorized"] = extra
+    elif case == "tool-step-missing":
+        plan["apply_order"].remove(tool_steps[-1])
+    elif case == "tool-step-extra":
+        extra = deepcopy(tool_steps[-1])
+        extra["step_id"] = "toolchain:unauthorized"
+        extra["name"] = "unauthorized"
+        extra["path"] = f"{plan['roots']['deploy']}/toolchain/lib/unauthorized"
+        plan["apply_order"].append(extra)
+    else:
+        tool_steps[-1]["owner"] = "cortex-manager"
+
+    plan["receipt_path"] = str(install_core.canonical_receipt_path(plan))
+    plan_path = tmp_path / f"finalized-{case}.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = tmp_path / f"finalized-{case}" / "receipt.json"
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+        apply_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("nonbijective plan reached backend preflight")
+
+        def apply_step(self, _step):
+            type(self).apply_calls += 1
+            raise AssertionError("nonbijective plan reached backend mutation")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(receipt_path),
+        ]
+    ) == 1
+    assert not receipt_path.parent.exists()
+    assert MutationSentinelBackend.preflight_calls == 0
+    assert MutationSentinelBackend.apply_calls == 0
+
+
+def test_bundle_binding_persists_complete_tree_toolchain_authority(
+    tmp_path: Path,
+) -> None:
+    config = _safe_config(tmp_path)
+    config["toolchain"]["codex"].update(
+        {"shape": "tree", "entrypoint": "bin/codex.js"}
+    )
+    plan, _doc = _plan_document(tmp_path, config)
+    tools = []
+    for name, configured in plan["toolchain_manifest"].items():
+        row = {
+            "name": name,
+            "version": configured["version"],
+            "shape": configured.get("shape", "file"),
+            "entrypoint": configured.get("entrypoint"),
+            "resolved_path": str(tmp_path / f"{name}.locked"),
+            "sha256": configured["sha256"],
+        }
+        if row["shape"] == "tree":
+            row["installed_sha256"] = "f" * 64
+        tools.append(row)
+    repository = tmp_path / "paulsha-cortex.bundle"
+    repository.write_bytes(b"exact source bundle\n")
+    bound = bind_bundle_artifacts(
+        plan,
+        {
+            "toolchain": tools,
+            "source_repositories": [
+                {
+                    "slug": "paulsha-cortex",
+                    "commit": "a" * 40,
+                    "remote": "https://github.com/hamanpaul/paulsha-cortex.git",
+                    "resolved_path": str(repository),
+                    "sha256": _sha256(repository),
+                }
+            ],
+        },
+    )
+    manifest = bound["toolchain_manifest"]["codex"]
+    step = next(
+        row for row in bound["apply_order"] if row["step_id"] == "toolchain:codex"
+    )
+
+    assert manifest == {
+        "name": "codex",
+        "version": "0.150.0",
+        "shape": "tree",
+        "entrypoint": "bin/codex.js",
+        "source": str(tmp_path / "codex.locked"),
+        "source_sha256": "1" * 64,
+        "installed_sha256": "f" * 64,
+        "path": f"{plan['roots']['deploy']}/toolchain/lib/codex",
+        "owner": "root",
+        "group": "root",
+        "mode": "0755",
+        "operations": ["snapshot", "copy-locked", "chown", "chmod"],
+        "desired_sha256": "f" * 64,
+    }
+    assert step == {
+        "step_id": "toolchain:codex",
+        "kind": "toolchain",
+        **{key: value for key, value in manifest.items() if key != "installed_sha256"},
+    }
+    validate_apply_plan(bound, confirm_sha256=plan_sha256(bound))
 
 
 @pytest.mark.parametrize(
@@ -1182,6 +1390,7 @@ def test_plan_cli_persists_plan_with_private_mode(
         "schema_version": 1,
         "candidate": {},
         "apply_order": [{"kind": "venv"}],
+        "roots": {"state": str(tmp_path / "state")},
     }
     captured: dict[str, object] = {}
 
@@ -1220,6 +1429,9 @@ def test_plan_cli_persists_plan_with_private_mode(
     ) == 0
     assert captured["path"] == output.absolute()
     assert captured["mode"] == 0o600
+    assert captured["value"]["receipt_path"] == str(
+        install_core.canonical_receipt_path(captured["value"])
+    )
 
 
 def test_plan_document_never_contains_secret_bytes_or_operator_home(

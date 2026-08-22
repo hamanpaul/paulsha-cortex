@@ -21,6 +21,7 @@ from .core import (
     atomic_write_json,
     bind_bundle_artifacts,
     build_install_plan,
+    canonical_receipt_path,
     import_credential,
     new_install_receipt,
     plan_sha256,
@@ -163,6 +164,7 @@ def _plan_command(args: argparse.Namespace) -> int:
         row["sha256"] == wheel["sha256"] for row in venv_step["wheelhouse"]
     ):
         raise InstallPlanError("bundle wheelhouse must include the exact candidate wheel")
+    plan["receipt_path"] = str(canonical_receipt_path(plan))
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o600)
     _emit({"output": str(output), "plan_sha256": plan_sha256(plan)})
