@@ -40,6 +40,43 @@ SERVICES = (
 )
 
 
+@dataclass(frozen=True)
+class ProviderPreflightAdapter:
+    version: str | None
+    version_command: tuple[str, ...]
+    status_command: tuple[str, ...] | None
+
+
+PROVIDER_PREFLIGHTS = {
+    # agy 1.1.18 has no status/login/quota subcommand.  In particular, passing
+    # the word "status" starts print mode with that word as a prompt.
+    "agy": ProviderPreflightAdapter(
+        version="1.1.18",
+        version_command=("/opt/cortex/toolchain/bin/agy", "--version"),
+        status_command=None,
+    ),
+    # The staged Copilot CLI likewise has no qualification-approved structured
+    # login/quota status interface.  Keep this fail-closed rather than guessing
+    # from human-readable output.
+    "copilot": ProviderPreflightAdapter(
+        version=None,
+        version_command=("/opt/cortex/toolchain/bin/copilot", "--version"),
+        status_command=None,
+    ),
+    # doctor --json is supported by Codex 0.149.0.  Its schema is inspected
+    # below; this pinned version does not expose live login or quota fields.
+    "codex": ProviderPreflightAdapter(
+        version="0.149.0",
+        version_command=("/opt/cortex/toolchain/bin/codex", "--version"),
+        status_command=(
+            "/opt/cortex/toolchain/bin/codex",
+            "doctor",
+            "--json",
+        ),
+    ),
+}
+
+
 class QualificationFailure(RuntimeError):
     pass
 
@@ -1146,33 +1183,77 @@ def _json_records(output: str) -> list[object]:
     return records
 
 
-def _provider_preflight(
-    provider: str, account: str, command: Sequence[str]
-) -> dict[str, object]:
-    result = _run(command, user=account, env=_account_env(account), timeout=45)
-    records = _json_records(result.stdout)
-    payload = records[0] if len(records) == 1 else None
-    if (
-        result.returncode != 0
-        or not isinstance(payload, Mapping)
-        or payload.get("provider") != provider
-        or payload.get("status") not in {"ready", "passed", "authenticated"}
-        or payload.get("authenticated") is not True
-        or payload.get("quota") != "available"
-        or payload.get("fallback") is not False
-        or payload.get("skipped") is not False
+def _provider_preflight(provider: str, account: str) -> dict[str, object]:
+    adapter = PROVIDER_PREFLIGHTS[provider]
+    version = _run(
+        adapter.version_command,
+        user=account,
+        env=_account_env(account),
+        timeout=15,
+    )
+    if version.returncode != 0:
+        raise QualificationFailure(
+            f"provider {provider} pinned binary version probe failed"
+        )
+    if adapter.version is not None and adapter.version not in (
+        version.stdout + version.stderr
     ):
         raise QualificationFailure(
-            f"provider {provider} live login/quota preflight did not pass"
+            f"provider {provider} pinned binary version did not match "
+            f"{adapter.version}"
         )
-    return {
-        "returncode": result.returncode,
-        "status": str(payload["status"]),
-        "authenticated": True,
-        "quota": str(payload["quota"]),
-        "fallback": False,
-        "skipped": False,
-    }
+    if adapter.status_command is None:
+        version_label = adapter.version or "staged version"
+        raise QualificationFailure(
+            f"provider {provider} {version_label} exposes no structured live "
+            "login/quota status; qualification fails closed"
+        )
+
+    status = _run(
+        adapter.status_command,
+        user=account,
+        env=_account_env(account),
+        timeout=45,
+    )
+    records = _json_records(status.stdout)
+    payload = records[0] if len(records) == 1 else None
+    if status.returncode != 0 or not isinstance(payload, Mapping):
+        raise QualificationFailure(
+            f"provider {provider} structured status probe did not return one "
+            "successful JSON object"
+        )
+
+    # Codex 0.149.0 doctor JSON contains local runtime, configuration, network,
+    # and filesystem checks, but no structured live login or quota result.  Do
+    # not infer either from overallStatus or synthesize an "available" value.
+    raise QualificationFailure(
+        f"provider {provider} {adapter.version} structured status lacks live "
+        "login/quota fields; qualification fails closed"
+    )
+
+
+def _has_exact_final_assistant_response(records: Sequence[object]) -> bool:
+    final_contents: list[str] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if (
+            record.get("role") == "assistant"
+            and record.get("type") in {"final", "result"}
+            and isinstance(record.get("content"), str)
+        ):
+            final_contents.append(str(record["content"]))
+            continue
+        if record.get("type") != "item.completed":
+            continue
+        item = record.get("item")
+        if (
+            isinstance(item, Mapping)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            final_contents.append(str(item["text"]))
+    return final_contents == ["QUALIFICATION_OK"]
 
 
 def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
@@ -1224,31 +1305,11 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             prompt,
         ),
     }
-    preflight_commands = {
-        "agy": (
-            "/opt/cortex/toolchain/bin/agy",
-            "status",
-            "--output-format",
-            "json",
-        ),
-        "copilot": (
-            "/opt/cortex/toolchain/bin/copilot",
-            "status",
-            "--output-format",
-            "json",
-        ),
-        "codex": (
-            "/opt/cortex/toolchain/bin/codex",
-            "login",
-            "status",
-            "--json",
-        ),
-    }
     verdicts: list[dict[str, object]] = []
     raw_evidence: dict[str, object] = {"schema_version": 1, "providers": {}}
     for provider, command in commands.items():
         model, effort, account = PROVIDERS[provider]
-        preflight = _provider_preflight(provider, account, preflight_commands[provider])
+        preflight = _provider_preflight(provider, account)
         result = _run(command, user=account, env=_account_env(account), timeout=300)
         records = _json_records(result.stdout)
         models = (
@@ -1288,9 +1349,7 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             if records
             else set()
         )
-        response_token = any(
-            "QUALIFICATION_OK" in json.dumps(row, sort_keys=True) for row in records
-        )
+        response_token = _has_exact_final_assistant_response(records)
         fallback_values = _walk_scalars(
             records, {"fallback", "fallbackmodel", "fallbackused"}
         )

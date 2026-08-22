@@ -35,9 +35,8 @@ def _provider_name(argv) -> str:
     return {"agy": "agy", "copilot": "copilot", "codex": "codex"}[executable]
 
 
-def _preflight(provider: str, **overrides) -> str:
-    payload = {
-        "provider": provider,
+def _preflight(**overrides) -> dict[str, object]:
+    payload: dict[str, object] = {
         "status": "ready",
         "authenticated": True,
         "quota": "available",
@@ -45,7 +44,7 @@ def _preflight(provider: str, **overrides) -> str:
         "skipped": False,
     }
     payload.update(overrides)
-    return json.dumps(payload) + "\n"
+    return payload
 
 
 def _smoke(provider: str, *, extra_model: str | None = None) -> str:
@@ -56,7 +55,9 @@ def _smoke(provider: str, *, extra_model: str | None = None) -> str:
             "provider": provider,
             "runtime_model": models[provider],
             "runtime_effort": efforts[provider],
-            "response": "QUALIFICATION_OK",
+            "type": "final",
+            "role": "assistant",
+            "content": "QUALIFICATION_OK",
         }
     ]
     if extra_model is not None:
@@ -79,12 +80,13 @@ def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
 
     def fake_run(argv, **_kwargs):
         provider = _provider_name(argv)
-        kind = "preflight" if "status" in argv else "smoke"
-        calls.append((kind, tuple(argv)))
-        output = _preflight(provider) if kind == "preflight" else _smoke(provider)
-        return _result(driver, argv, stdout=output)
+        calls.append(("smoke", tuple(argv)))
+        return _result(driver, argv, stdout=_smoke(provider))
 
     monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver, "_provider_preflight", lambda _provider, _account: _preflight()
+    )
     verdicts = driver._provider_smokes(tmp_path)
     assert [
         (row["provider"], row["runtime_model"], row["runtime_effort"])
@@ -95,11 +97,8 @@ def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
         ("codex", "gpt-5", "normal"),
     ]
     assert [kind for kind, _argv in calls] == [
-        "preflight",
         "smoke",
-        "preflight",
         "smoke",
-        "preflight",
         "smoke",
     ]
     evidence = json.loads((tmp_path / "provider-capabilities.json").read_text())
@@ -119,45 +118,119 @@ def test_provider_smokes_reject_requested_plus_fallback_metadata(
 
     def fake_run(argv, **_kwargs):
         provider = _provider_name(argv)
-        output = (
-            _preflight(provider)
-            if "status" in argv
-            else _smoke(provider, extra_model="fallback-model")
+        return _result(
+            driver, argv, stdout=_smoke(provider, extra_model="fallback-model")
         )
-        return _result(driver, argv, stdout=output)
 
     monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver, "_provider_preflight", lambda _provider, _account: _preflight()
+    )
     with pytest.raises(driver.QualificationFailure, match="unique exact"):
         driver._provider_smokes(tmp_path)
     assert not (tmp_path / "provider-capabilities.json").exists()
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"status": None},
-        {"quota": "exhausted"},
-        {"fallback": True},
-        {"skipped": True, "status": "skipped"},
-        {"authenticated": False},
-    ],
-)
-def test_provider_preflight_fails_closed_without_retry_or_smoke(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict
+def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
+    driver = _load_driver()
+    adapters = driver.PROVIDER_PREFLIGHTS
+
+    assert adapters["agy"].version == "1.1.18"
+    assert adapters["agy"].version_command[-1] == "--version"
+    assert adapters["agy"].status_command is None
+    assert adapters["codex"].version == "0.149.0"
+    assert adapters["codex"].status_command[-2:] == ("doctor", "--json")
+    serialized = repr(adapters)
+    assert "status --output-format json" not in serialized
+    assert "login status --json" not in serialized
+
+
+def test_agy_preflight_fails_closed_without_prompt_or_retry(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     driver = _load_driver()
     calls: list[tuple[str, ...]] = []
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
-        return _result(driver, argv, stdout=_preflight("agy", **overrides))
+        return _result(driver, argv, stdout="agy version 1.1.18\n")
 
     monkeypatch.setattr(driver, "_run", fake_run)
-    with pytest.raises(driver.QualificationFailure, match="preflight"):
-        driver._provider_smokes(tmp_path)
+    with pytest.raises(driver.QualificationFailure, match="no structured live"):
+        driver._provider_preflight("agy", "cortex-reviewer-planner")
     assert len(calls) == 1
-    assert "status" in calls[0]
-    assert not (tmp_path / "provider-capabilities.json").exists()
+    assert calls[0][-1] == "--version"
+    assert "status" not in calls[0]
+
+
+def test_codex_doctor_schema_without_login_or_quota_fails_closed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    calls: list[tuple[str, ...]] = []
+    doctor = {
+        "schemaVersion": 1,
+        "overallStatus": "ok",
+        "codexVersion": "0.149.0",
+        "checks": {
+            "runtime.provenance": {"status": "pass"},
+            "network.provider_reachability": {"status": "pass"},
+        },
+    }
+
+    def fake_run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if argv[-1] == "--version":
+            return _result(driver, argv, stdout="codex-cli 0.149.0\n")
+        return _result(driver, argv, stdout=json.dumps(doctor))
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="login/quota"):
+        driver._provider_preflight("codex", "cortex-builder")
+    assert calls == [
+        ("/opt/cortex/toolchain/bin/codex", "--version"),
+        ("/opt/cortex/toolchain/bin/codex", "doctor", "--json"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("records", "expected"),
+    [
+        (
+            [{"type": "final", "role": "assistant", "content": "QUALIFICATION_OK"}],
+            True,
+        ),
+        (
+            [
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "QUALIFICATION_OK"},
+                }
+            ],
+            True,
+        ),
+        ([{"type": "user", "content": "Return QUALIFICATION_OK"}], False),
+        (
+            [
+                {
+                    "type": "final",
+                    "role": "assistant",
+                    "content": "I refuse. QUALIFICATION_OK",
+                }
+            ],
+            False,
+        ),
+        (
+            [{"type": "final", "role": "assistant", "content": "QUALIFICATION_OK\n"}],
+            False,
+        ),
+    ],
+)
+def test_final_assistant_response_must_be_exact(
+    records: list[object], expected: bool
+) -> None:
+    driver = _load_driver()
+    assert driver._has_exact_final_assistant_response(records) is expected
 
 
 def test_manager_github_probe_uses_only_installed_manager_helper(
