@@ -404,8 +404,11 @@ class JobRegistry:
             legacy_records = {
                 "source_schema_version": 1,
                 "seq": seq,
-                "jobs": jobs,
-                "slices": slices,
+                # Validation may normalize fields used by the live v2 model.
+                # The quarantined v1 records are immutable migration evidence,
+                # so preserve the validated source rows byte-for-byte in shape.
+                "jobs": _deepcopy_json(payload["jobs"]),
+                "slices": _deepcopy_json(payload["slices"]),
             }
             migrated = {
                 "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
