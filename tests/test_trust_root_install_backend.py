@@ -485,6 +485,30 @@ def test_directory_acl_attestation_ignores_semantically_irrelevant_order(
     assert state["installed_sha256"] == step["desired_sha256"]
 
 
+def test_service_identity_includes_live_systemd_active_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "User=cortex-manager\nExecStart={ path=/usr/bin/true ; argv[]=/usr/bin/true ; }\nActiveState=active\n",
+            "",
+        )
+
+    monkeypatch.setattr(backend_module, "_run", run)
+
+    identities = LocalInstallBackend(require_root=False).service_identities()
+
+    assert identities
+    assert all(row["active_state"] == "active" for row in identities.values())
+    assert all("--property=ActiveState" in command for command in calls)
+
+
 def test_directory_acl_apply_keeps_external_target_safe_during_symlink_swap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

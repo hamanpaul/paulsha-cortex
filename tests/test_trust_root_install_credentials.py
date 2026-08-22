@@ -21,6 +21,7 @@ from paulsha_cortex.trust_root.install import (
 )
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
+from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 
 
 def _plan(*, required_credentials=None) -> dict[str, object]:
@@ -390,7 +391,10 @@ def test_manager_start_failure_reverse_stops_egress_and_never_starts_monitor(
         "cortex-egress-proxy.service",
         "cortex-manager.service",
     ]
-    assert backend.stopped == ["cortex-egress-proxy.service"]
+    assert backend.stopped == [
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
     doc = receipt.to_dict()
     assert doc["activated"] is False
     assert doc["qualified"] is False
@@ -410,13 +414,79 @@ def test_activation_surfaces_reverse_stop_failure_and_records_remaining_service(
         "cortex-egress-proxy.service",
         "cortex-manager.service",
     ]
-    assert backend.stopped == ["cortex-egress-proxy.service"]
+    assert backend.stopped == [
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
     document = receipt.to_dict()
     assert document["services_started"] is True
     assert document["running_services"] == ["cortex-egress-proxy.service"]
     assert document["activation_failure"]["compensation_failures"] == [
         "cortex-egress-proxy.service"
     ]
+
+
+def test_rollback_removes_hash_bound_prepared_credential(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    home = tmp_path / "cortex-builder"
+    destination = home / ".codex/auth.json"
+    destination.parent.mkdir(parents=True)
+    destination.write_text('{"token":"test-secret"}', encoding="utf-8")
+    destination.chmod(0o600)
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    receipt._document["plan"]["accounts"] = [  # type: ignore[index]
+        {
+            "name": "cortex-builder",
+            "home": str(home),
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+        }
+    ]
+    receipt._document["credential_journal"] = [
+        {
+            "principal": "builder",
+            "provider": "codex",
+            "mode": "0600",
+            "sha256": digest,
+            "status": "prepared",
+        }
+    ]
+
+    report = rollback_receipt(
+        receipt, backend=LocalInstallBackend(require_root=False)
+    )
+
+    assert report.retained_drift == ()
+    assert not destination.exists()
+    assert receipt.to_dict()["credential_journal"] == []
+
+
+def test_live_credential_validation_redacts_destination_path(tmp_path: Path) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    private_home = tmp_path / "private-destination-name"
+    receipt._document["plan"]["accounts"] = [  # type: ignore[index]
+        {
+            "name": "cortex-builder",
+            "home": str(private_home),
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+        }
+    ]
+    receipt._document["credentials"] = [
+        {
+            "principal": "builder",
+            "provider": "codex",
+            "mode": "0600",
+            "sha256": "0" * 64,
+        }
+    ]
+
+    failures = LocalInstallBackend(require_root=False).validate_credentials(receipt)
+
+    assert failures == ("builder/codex unavailable",)
+    assert str(private_home) not in " ".join(failures)
 
 
 def test_successful_start_order_is_still_unverified_not_qualified() -> None:

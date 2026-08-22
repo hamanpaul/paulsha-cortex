@@ -1571,18 +1571,35 @@ class LocalInstallBackend:
                     or _sha256_file(destination) != row.get("sha256")
                 ):
                     failures.append(f"{principal}/{provider} metadata or hash mismatch")
-            except (InstallError, OSError) as exc:
-                failures.append(f"{principal}/{provider} unavailable: {exc}")
+            except (InstallError, OSError):
+                failures.append(f"{principal}/{provider} unavailable")
         return tuple(failures)
 
     def rollback_credentials(self, receipt: InstallReceipt) -> Sequence[dict[str, object]]:
         retained: list[dict[str, object]] = []
-        rows = receipt.to_dict().get("credentials", [])
-        for row in rows if isinstance(rows, list) else []:
+        document = receipt.to_dict()
+        completed = document.get("credentials", [])
+        prepared = document.get("credential_journal", [])
+        rows = [
+            *(completed if isinstance(completed, list) else []),
+            *(prepared if isinstance(prepared, list) else []),
+        ]
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
             if not isinstance(row, Mapping):
                 continue
             principal = str(row.get("principal", ""))
             provider = str(row.get("provider", ""))
+            identity = (principal, provider)
+            if identity in seen:
+                retained.append(
+                    {
+                        "credential": f"{principal}/{provider}",
+                        "reason": "duplicate credential receipt authority",
+                    }
+                )
+                continue
+            seen.add(identity)
             try:
                 destination, uid, gid = credential_destination(
                     receipt, principal=principal, provider=provider
@@ -1590,9 +1607,12 @@ class LocalInstallBackend:
                 observed = destination.lstat()
             except FileNotFoundError:
                 continue
-            except (InstallError, OSError) as exc:
+            except (InstallError, OSError):
                 retained.append(
-                    {"credential": f"{principal}/{provider}", "reason": str(exc)}
+                    {
+                        "credential": f"{principal}/{provider}",
+                        "reason": "credential rollback inspection failed",
+                    }
                 )
                 continue
             if (
@@ -1687,7 +1707,15 @@ class LocalInstallBackend:
             "cortex-monitor.service",
         ):
             result = _run(
-                ("systemctl", "show", name, "--property=User", "--property=ExecStart", "--no-pager")
+                (
+                    "systemctl",
+                    "show",
+                    name,
+                    "--property=User",
+                    "--property=ExecStart",
+                    "--property=ActiveState",
+                    "--no-pager",
+                )
             )
             values: dict[str, str] = {}
             for line in result.stdout.splitlines():
@@ -1705,6 +1733,7 @@ class LocalInstallBackend:
             identities[name] = {
                 "user": values.get("User", ""),
                 "exec_path": exec_path,
+                "active_state": values.get("ActiveState", ""),
                 "exec_sha256": (
                     _sha256_file(executable.resolve(strict=True))
                     if exec_path

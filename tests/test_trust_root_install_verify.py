@@ -372,3 +372,44 @@ def test_verify_fails_closed_when_live_active_state_is_missing(tmp_path: Path) -
         and row["artifact"] == "cortex-manager.service"
         for row in result.report.to_dict()["failures"]
     )
+
+
+def test_verify_failure_records_service_that_could_not_be_stopped(
+    tmp_path: Path,
+) -> None:
+    plan, receipt = _activated_receipt()
+    observed = _service_identities()
+    observed["cortex-manager.service"]["active_state"] = "inactive"
+
+    class StopController:
+        def __init__(self) -> None:
+            self.stopped: list[str] = []
+
+        def stop_service(self, service: str) -> None:
+            self.stopped.append(service)
+            if service == "cortex-manager.service":
+                raise RuntimeError("injected stop failure")
+
+    controller = StopController()
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=observed,
+        evidence_path=tmp_path / "stop-failure.json",
+        service_controller=controller,
+    )
+
+    assert not result.ok
+    assert controller.stopped == [
+        "cortex-monitor.service",
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
+    document = receipt.to_dict()
+    assert document["services_started"] is True
+    assert document["running_services"] == ["cortex-manager.service"]
+    assert document["verification_stop_failures"] == [
+        "cortex-manager.service"
+    ]

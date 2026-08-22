@@ -1398,6 +1398,19 @@ class InstallReceipt:
             for row in credential_journal
         ):
             raise InstallError(f"receipt credential journal is invalid: {path}")
+        completed_identities = [
+            (str(row["principal"]), str(row["provider"])) for row in credentials
+        ]
+        prepared_identities = [
+            (str(row["principal"]), str(row["provider"]))
+            for row in credential_journal
+        ]
+        if (
+            len(completed_identities) != len(set(completed_identities))
+            or len(prepared_identities) != len(set(prepared_identities))
+            or set(completed_identities) & set(prepared_identities)
+        ):
+            raise InstallError(f"receipt credential authority is duplicated: {path}")
         expected_executables = payload.get("expected_service_executables")
         if expected_executables is not None and (
             not isinstance(expected_executables, Mapping)
@@ -1698,11 +1711,13 @@ def rollback_receipt(
         raise InstallError("receipt journal is invalid")
     retained_drift: list[dict[str, object]] = []
     retained_entries: list[object] = []
+    service_stop_failures: list[str] = []
     if receipt._document.get("services_started"):
         for service in reversed(_SERVICE_ORDER):
             try:
                 backend.stop_service(service)
             except Exception as exc:
+                service_stop_failures.append(service)
                 retained_drift.append(
                     {
                         "step_id": f"service:{service}",
@@ -1767,11 +1782,17 @@ def rollback_receipt(
     receipt._document["state"] = "rolled-back"
     receipt._document["activated"] = False
     receipt._document["qualified"] = False
-    receipt._document["services_started"] = False
-    receipt._document["credentials"] = [] if not any(
+    receipt._document["running_services"] = list(
+        reversed(service_stop_failures)
+    )
+    receipt._document["services_started"] = bool(service_stop_failures)
+    credentials_retained = any(
         str(row.get("step_id", "")).startswith("credential:")
         for row in retained_drift
-    ) else receipt._document.get("credentials", [])
+    )
+    if not credentials_retained:
+        receipt._document["credentials"] = []
+        receipt._document["credential_journal"] = []
     receipt._document["rollback"] = {
         "retained_unknown": list(unknown),
         "retained_drift": retained_drift,
@@ -2137,8 +2158,15 @@ def activate_receipt(
     started: list[str] = []
     try:
         for service in _SERVICE_ORDER:
-            backend.start_service(service)
-            started.append(service)
+            try:
+                backend.start_service(service)
+            except Exception:
+                # A failed systemctl start can still leave a partially-active
+                # unit. Include the attempted service in reverse compensation.
+                started.append(service)
+                raise
+            else:
+                started.append(service)
     except Exception as exc:
         compensation_failures: list[str] = []
         for service in reversed(started):
@@ -2152,11 +2180,7 @@ def activate_receipt(
         receipt._document["services_started"] = bool(compensation_failures)
         receipt._document["activated"] = False
         receipt._document["qualified"] = False
-        failed_service = (
-            _SERVICE_ORDER[len(started)]
-            if len(started) < len(_SERVICE_ORDER)
-            else "service"
-        )
+        failed_service = started[-1] if started else "service"
         receipt._document["activation_failure"] = {
             "failed_service": failed_service,
             "compensation_failures": list(reversed(compensation_failures)),
@@ -2427,12 +2451,20 @@ def verify_receipt(
     receipt._document["activated"] = report.ok
     receipt._document["qualified"] = report.ok
     if not report.ok and service_controller is not None:
+        stop_failures: list[str] = []
         for service in reversed(_SERVICE_ORDER):
             try:
                 service_controller.stop_service(service)
             except Exception:
-                pass
-        receipt._document["services_started"] = False
+                stop_failures.append(service)
+        receipt._document["running_services"] = list(reversed(stop_failures))
+        receipt._document["services_started"] = bool(stop_failures)
+        if stop_failures:
+            receipt._document["verification_stop_failures"] = list(
+                reversed(stop_failures)
+            )
+        else:
+            receipt._document.pop("verification_stop_failures", None)
     receipt._document["verification_evidence"] = {
         "sha256": _sha256_file(evidence_path),
         "result": evidence["result"],
