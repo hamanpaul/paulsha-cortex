@@ -646,6 +646,10 @@ def build_install_plan(
         if entry.is_symlink:
             row["symlink_target"] = layout.symlink_targets().get(entry.asset_id)
         assets.append(row)
+    # The transaction's typed venv step owns this path as the atomic active
+    # symlink.  The legacy permgen scaffold describes it as a directory; do not
+    # execute two incompatible desired states for the same path.
+    active_venv_link = f"{roots['deploy']}/venv"
     scaffolds = [
         {
             "path": path,
@@ -654,6 +658,7 @@ def build_install_plan(
             "mode": format(mode, "04o"),
         }
         for path, owner, group, mode in layout.scaffold_directories(scheme)
+        if path != active_venv_link
     ]
     generated = _generated_inventory(
         scheme,
@@ -734,7 +739,7 @@ def build_install_plan(
                 "path": (
                     f"{roots['deploy']}/venvs/{_sha256_file(wheel_path)}"
                 ),
-                "active_link": f"{roots['deploy']}/venv",
+                "active_link": active_venv_link,
                 "wheel_source": str(wheel_path),
                 "wheel_sha256": _sha256_file(wheel_path),
                 "wheelhouse": [

@@ -243,6 +243,7 @@ def test_plan_orders_accounts_and_content_addressed_venv_before_assets(
     assert venv["kind"] == "venv"
     assert venv["path"].endswith(f"/venvs/{wheel_sha}")
     assert venv["active_link"].endswith("/opt/cortex/venv")
+    assert venv["active_link"] not in {row["path"] for row in plan["scaffolds"]}
     assert venv["wheel_source"] == str(wheel.absolute())
     assert venv["wheelhouse"] == [
         {"source": str(wheel.absolute()), "sha256": wheel_sha}
