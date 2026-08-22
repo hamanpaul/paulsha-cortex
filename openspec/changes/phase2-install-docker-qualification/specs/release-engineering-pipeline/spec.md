@@ -19,4 +19,3 @@ MUST only be available through a protected RC environment.
 
 - **WHEN** any required provider stage is `SKIP`, quota-rejected, fallback-executed or reports a different runtime model
 - **THEN** qualification is unsuccessful and cannot unlock release
-

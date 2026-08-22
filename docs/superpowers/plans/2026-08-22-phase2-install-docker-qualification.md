@@ -32,4 +32,3 @@ Authority: `openspec/changes/phase2-install-docker-qualification/`.
 - `docker-ci`: `.github/workflows/`, `qualification/`, and its dedicated tests only.
 - `installer-core`: `paulsha_cortex/trust_root/install/` plus minimal CLI wiring after tests exist.
 - Review agents are read-only and cannot approve their own changes.
-

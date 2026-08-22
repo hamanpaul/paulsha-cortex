@@ -53,4 +53,3 @@ support 宣告；在 exact-SHA qualification 全綠前不得建立 tag 或 GitHu
   qualification freshness。
 - 正常化合入 runtime credential harvest (`c35516e`) 與 verification/Copilot verdict
   (`98978b6`) 的最小 prerequisite commits；不整包採用 live-closeout branches。
-

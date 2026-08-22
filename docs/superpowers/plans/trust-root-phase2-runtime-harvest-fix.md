@@ -62,4 +62,3 @@ intended changes with a Conventional Commit, include the changelog fragment,
 and leave the builder worktree clean. Do not claim the live Phase 2 task from
 the builder; the Manager must deploy the candidate and re-run the final
 normal-Codex slice before checking it.
-

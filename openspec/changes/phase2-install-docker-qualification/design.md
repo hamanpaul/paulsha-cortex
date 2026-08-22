@@ -88,4 +88,3 @@ closed。D6 不接受 residual-risk waiver。
 2. 由手動 RC workflow 對 exact candidate 執行 qualification。
 3. 只有 OpenSpec archive、雙向 review、preflight、對抗審查、全部 CI 與 RC qualification 均綠，
    才建立 `v0.2.0` GitHub Release；PyPI 保持禁用。
-

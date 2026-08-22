@@ -51,4 +51,3 @@ This change is expected to close the source gaps for `#695` and the gitconfig po
 `#763`. `#623`/`#716` require exact-candidate qualification. `#665` and `#692` remain
 independent release blockers unless separately resolved and requalified. No OPEN issue is
 treated as closed merely because a unit test passes.
-
