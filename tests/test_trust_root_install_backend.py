@@ -39,6 +39,30 @@ def _completed(argv) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(list(argv), 0, "", "")
 
 
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (0, "active\n", "active"),
+        (3, "inactive\n", "inactive"),
+        (3, "failed\n", "failed"),
+        (4, "unknown\n", "not-found"),
+        (1, "", "error"),
+        (0, "inactive\n", "error"),
+    ],
+)
+def test_systemctl_is_active_state_requires_matching_returncode_and_stdout(
+    returncode: int, stdout: str, expected: str
+) -> None:
+    result = subprocess.CompletedProcess(
+        ["systemctl", "is-active", "cortex-manager.service"],
+        returncode,
+        stdout,
+        "Failed to connect to bus" if returncode == 1 else "",
+    )
+
+    assert backend_module._classify_systemctl_is_active(result) == expected
+
+
 def test_mode_parser_accepts_registry_sticky_mode_and_rejects_invalid_values() -> None:
     assert _mode("1755") == 0o1755
     assert _mode("0700") == 0o700
@@ -155,6 +179,95 @@ def test_repository_attestation_rejects_noncanonical_fsmonitor_without_execution
     assert state["installed_sha256"] is None
     assert state["config_safe"] is False
     assert not marker.exists(), "repository inspection must not execute local fsmonitor"
+
+
+def test_repository_install_isolates_every_root_git_call_from_host_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fixture_git(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            argv,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=backend_module._REPOSITORY_GIT_ENV,
+        )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    fixture_git("git", "init", "--quiet", str(source))
+    fixture_git("git", "-C", str(source), "config", "user.name", "Cortex Test")
+    fixture_git(
+        "git",
+        "-C",
+        str(source),
+        "config",
+        "user.email",
+        "cortex@example.invalid",
+    )
+    (source / "README.md").write_text("locked\n", encoding="utf-8")
+    fixture_git("git", "-C", str(source), "add", "README.md")
+    fixture_git("git", "-C", str(source), "commit", "--quiet", "-m", "fixture")
+    commit = fixture_git("git", "-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    bundle = tmp_path / "source.bundle"
+    fixture_git("git", "-C", str(source), "bundle", "create", str(bundle), "HEAD")
+
+    marker = tmp_path / "host-hook-executed"
+    hooks = tmp_path / "host-hooks"
+    hooks.mkdir()
+    post_checkout = hooks / "post-checkout"
+    post_checkout.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    post_checkout.chmod(0o755)
+    hostile_global = tmp_path / "hostile-global-config"
+    hostile_global.write_text(
+        f"[core]\n\thooksPath = {hooks}\n\tfsmonitor = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile_global))
+
+    owner = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    destination = tmp_path / "installed"
+    remote = "https://github.com/hamanpaul/paulsha-cortex.git"
+    step = {
+        "step_id": "repository:paulsha-cortex",
+        "kind": "repository",
+        "slug": "paulsha-cortex",
+        "source": str(bundle),
+        "source_sha256": backend_module._sha256_file(bundle),
+        "path": str(destination),
+        "owner": owner,
+        "group": group,
+        "mode": "0755",
+        "commit": commit,
+        "remote": remote,
+        "desired_sha256": "d" * 64,
+    }
+    original_run = backend_module._run
+    git_calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+    def spy_run(argv, **kwargs):
+        if argv[0] == "git":
+            git_calls.append((tuple(argv), dict(kwargs)))
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(backend_module, "_run", spy_run)
+
+    result = LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert result["installed_sha256"] == step["desired_sha256"]
+    assert len(git_calls) == 7
+    for argv, kwargs in git_calls:
+        assert argv[:6] == (
+            "git",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        )
+        assert kwargs["env"] == backend_module._REPOSITORY_GIT_ENV
+    assert not marker.exists(), "host global hooksPath must never execute"
 
 
 def test_account_step_creates_exact_group_and_user_through_typed_argv(

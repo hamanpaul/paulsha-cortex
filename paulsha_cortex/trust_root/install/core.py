@@ -1603,7 +1603,7 @@ def validate_preflight(
         active = sorted(
             str(name)
             for name, state in services.items()
-            if state not in {None, "inactive", "failed", "unknown"}
+            if state == "active"
         )
         if active:
             failures.append(
@@ -1611,6 +1611,19 @@ def validate_preflight(
                     "code": "services_active",
                     "detail": "services must be stopped before apply: "
                     + ", ".join(active),
+                }
+            )
+        unproven = sorted(
+            str(name)
+            for name, state in services.items()
+            if state not in {"active", "inactive", "failed", "not-found"}
+        )
+        if unproven:
+            failures.append(
+                {
+                    "code": "service_state_unproven",
+                    "detail": "service status could not be proven: "
+                    + ", ".join(unproven),
                 }
             )
 

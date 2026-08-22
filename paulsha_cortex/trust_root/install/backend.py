@@ -623,6 +623,14 @@ _REPOSITORY_GIT_ENV = {
     "LC_ALL": "C",
     "PATH": os.defpath,
 }
+_REPOSITORY_GIT_PREFIX = (
+    "git",
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+)
 
 
 def _repository_config_is_canonical(
@@ -910,12 +918,7 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
     # host/user config.  Command-scope overrides are defense in depth against
     # executable fsmonitor/hooks settings and optional index writes.
     prefix = (
-        "git",
-        "--no-optional-locks",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=/dev/null",
+        *_REPOSITORY_GIT_PREFIX,
         "-c",
         f"safe.directory={path}",
         "-C",
@@ -1325,6 +1328,21 @@ def _password_locked(name: str) -> bool | None:
     return None
 
 
+def _classify_systemctl_is_active(
+    result: subprocess.CompletedProcess[str],
+) -> str:
+    """Classify only documented, internally consistent `is-active` results."""
+
+    state = result.stdout.strip()
+    if result.returncode == 0 and state == "active":
+        return "active"
+    if result.returncode == 3 and state in {"inactive", "failed"}:
+        return state
+    if result.returncode == 4 and state == "unknown":
+        return "not-found"
+    return "error"
+
+
 class LocalInstallBackend:
     """Real Linux implementation; construction itself enforces the root boundary."""
 
@@ -1349,9 +1367,15 @@ class LocalInstallBackend:
             "cortex-manager.service",
             "cortex-monitor.service",
         ):
-            result = _run(("systemctl", "is-active", name)) if shutil.which("systemctl") else None
+            result = (
+                _run(("systemctl", "is-active", name))
+                if shutil.which("systemctl")
+                else None
+            )
             services[name] = (
-                result.stdout.strip() if result is not None and result.stdout.strip() else "inactive"
+                _classify_systemctl_is_active(result)
+                if result is not None
+                else "error"
             )
         accounts: dict[str, dict[str, object]] = {}
         for row in desired_accounts:
@@ -1782,9 +1806,42 @@ class LocalInstallBackend:
             locked_bundle = transaction_dir / "source.bundle"
             try:
                 _copy_verified_file(source, locked_bundle, source_sha)
-                _run(("git", "clone", "--no-checkout", str(locked_bundle), str(checkout)), check=True)
-                _run(("git", "-C", str(checkout), "checkout", "--detach", commit), check=True)
-                _run(("git", "-C", str(checkout), "remote", "set-url", "origin", remote), check=True)
+                _run(
+                    (
+                        *_REPOSITORY_GIT_PREFIX,
+                        "clone",
+                        "--no-checkout",
+                        str(locked_bundle),
+                        str(checkout),
+                    ),
+                    check=True,
+                    env=_REPOSITORY_GIT_ENV,
+                )
+                _run(
+                    (
+                        *_REPOSITORY_GIT_PREFIX,
+                        "-C",
+                        str(checkout),
+                        "checkout",
+                        "--detach",
+                        commit,
+                    ),
+                    check=True,
+                    env=_REPOSITORY_GIT_ENV,
+                )
+                _run(
+                    (
+                        *_REPOSITORY_GIT_PREFIX,
+                        "-C",
+                        str(checkout),
+                        "remote",
+                        "set-url",
+                        "origin",
+                        remote,
+                    ),
+                    check=True,
+                    env=_REPOSITORY_GIT_ENV,
+                )
                 uid = _resolve_uid(step.get("owner"))
                 gid = _resolve_gid(step.get("group"))
                 _chown_tree(checkout, uid, gid)

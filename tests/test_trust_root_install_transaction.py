@@ -10,11 +10,13 @@ from copy import deepcopy
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from paulsha_cortex.trust_root.install import core as install_core
+from paulsha_cortex.trust_root.install import backend as install_backend
 from paulsha_cortex.trust_root.install import (
     AccountCollisionError,
     InstallDriftError,
@@ -196,6 +198,33 @@ def test_preflight_uses_explicit_backend_facts_not_the_host(tmp_path: Path) -> N
 
     assert report.ok
     assert report.failures == ()
+
+
+def test_systemctl_transport_failure_blocks_before_first_apply_step(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    result = subprocess.CompletedProcess(
+        ["systemctl", "is-active", "cortex-manager.service"],
+        1,
+        stdout="",
+        stderr="Failed to connect to bus",
+    )
+    backend.facts["services"]["cortex-manager.service"] = (
+        install_backend._classify_systemctl_is_active(result)
+    )
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallError, match="service status could not be proven"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
 
 
 def test_existing_account_collision_fails_before_any_mutation(tmp_path: Path) -> None:
