@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -193,6 +195,15 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "merge_commit_sha" in preflight_runs
     assert 'state == "APPROVED"' in preflight_runs
     assert "check-runs" in preflight_runs
+    assert "check-runs?per_page=100" in preflight_runs
+    assert "--paginate" in preflight_runs
+    assert "jq -sc" in preflight_runs
+    assert "openspec validate --specs --no-interactive" in preflight_runs
+    assert (
+        "openspec validate phase2-install-docker-qualification" in preflight_runs
+        and "--strict --no-interactive" in preflight_runs
+    )
+    assert "archived Phase 2 tasks are incomplete" in preflight_runs
     assert "rc-qualification.yml" in preflight_runs
     assert "head_sha" in preflight_runs
     assert "matching-refs/tags" in preflight_runs
@@ -249,6 +260,11 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "gh release create" in release_runs
     assert "--verify-tag" in release_runs
     assert "--method DELETE" in release_runs
+    assert "--draft" in release_runs
+    assert "draft: false" in release_runs
+    assert "release_transaction_marker" in release_runs
+    assert "repos/${GITHUB_REPOSITORY}/releases/$release_id" in release_runs
+    assert "release cleanup ownership mismatch" in release_runs
     for job_name, job in jobs.items():
         if job_name == "release" or not isinstance(job, dict):
             continue
@@ -258,3 +274,117 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert (
         "qualification/validate.py" not in release_runs
     ), "evidence validation belongs in the required predecessor gate, never after publication"
+
+
+def test_release_asset_failure_removes_owned_release_before_tag(tmp_path: Path) -> None:
+    payload = _load_workflow("release.yml")
+    release = payload["jobs"]["release"]
+    release_runs = _job_step_runs(release)
+    fake_bin = tmp_path / "bin"
+    state = tmp_path / "state"
+    dist = tmp_path / "dist"
+    fake_bin.mkdir()
+    state.mkdir()
+    dist.mkdir()
+    (dist / "candidate.whl").write_bytes(b"qualified wheel")
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+state = Path(os.environ["FAKE_GH_STATE"])
+events = state / "events"
+
+def record(value):
+    with events.open("a", encoding="utf-8") as stream:
+        stream.write(value + "\\n")
+
+if args[:2] == ["api", "repos/example/cortex"]:
+    print("main")
+elif args[:2] == ["api", "repos/example/cortex/git/ref/heads/main"]:
+    print(os.environ["RELEASE_SHA"])
+elif "matching-refs/tags" in " ".join(args):
+    print("[]")
+elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/tags"):
+    sys.stdin.read()
+    print(json.dumps({"sha": "b" * 40}))
+elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/refs"):
+    sys.stdin.read()
+    (state / "tag").write_text("b" * 40, encoding="utf-8")
+elif args[:2] == ["api", "repos/example/cortex/git/ref/tags/v1.2.3"]:
+    if not (state / "tag").exists():
+        raise SystemExit(1)
+    if "--jq" in args:
+        print("b" * 40)
+    else:
+        print(json.dumps({
+            "ref": "refs/tags/v1.2.3",
+            "object": {"type": "tag", "sha": "b" * 40},
+        }))
+elif args[:2] == ["api", "repos/example/cortex/git/tags/" + "b" * 40]:
+    print(json.dumps({
+        "tag": "v1.2.3",
+        "object": {"type": "commit", "sha": os.environ["RELEASE_SHA"]},
+    }))
+elif args[:2] == ["release", "create"]:
+    marker = args[args.index("--notes") + 1]
+    (state / "release.json").write_text(json.dumps({
+        "id": 17,
+        "tag_name": "v1.2.3",
+        "body": marker,
+        "draft": True,
+        "assets": [],
+    }), encoding="utf-8")
+    record("partial-release-created")
+    raise SystemExit(23)
+elif "releases?per_page=100" in " ".join(args):
+    release_path = state / "release.json"
+    print("[" + release_path.read_text(encoding="utf-8") + "]" if release_path.exists() else "[]")
+elif args[:3] == ["api", "--method", "DELETE"] and args[3].endswith("/releases/17"):
+    (state / "release.json").unlink()
+    record("release-deleted")
+elif args[:2] == ["api", "repos/example/cortex/releases/17"]:
+    raise SystemExit(1)
+elif args[:3] == ["api", "--method", "DELETE"] and args[3].endswith("/git/refs/tags/v1.2.3"):
+    (state / "tag").unlink()
+    record("tag-deleted")
+else:
+    print("unexpected fake gh argv: " + repr(args), file=sys.stderr)
+    raise SystemExit(97)
+""",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    release_sha = "a" * 40
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "FAKE_GH_STATE": str(state),
+        "GITHUB_REPOSITORY": "example/cortex",
+        "GITHUB_RUN_ID": "1234",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "RELEASE_SHA": release_sha,
+        "TAG_NAME": "v1.2.3",
+    }
+
+    result = subprocess.run(
+        ["bash", "-c", release_runs],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 23, result.stderr
+    assert not (state / "release.json").exists()
+    assert not (state / "tag").exists()
+    assert (state / "events").read_text(encoding="utf-8").splitlines() == [
+        "partial-release-created",
+        "release-deleted",
+        "tag-deleted",
+    ]

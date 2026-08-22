@@ -107,6 +107,48 @@ jobs:
             echo "::error::expected exactly one official Phase 2 OpenSpec archive"
             exit 1
           }
+          phase2_archive=${phase2_archives[0]}
+          test -s "$phase2_archive/tasks.md" || {
+            echo "::error::archived Phase 2 tasks are absent"
+            exit 1
+          }
+          if grep -Eq '^[[:space:]]*-[[:space:]]+\[[[:space:]]\]' \
+            "$phase2_archive/tasks.md"; then
+            echo "::error::archived Phase 2 tasks are incomplete"
+            exit 1
+          fi
+
+          openspec_stage=$RUNNER_TEMP/release-openspec
+          mkdir -p "$openspec_stage/package" "$openspec_stage/runtime"
+          openspec_metadata=$(npm pack '@fission-ai/openspec@1.10.0' \
+            --json --pack-destination "$openspec_stage/package")
+          openspec_integrity=$(jq -er '.[0].integrity' <<<"$openspec_metadata")
+          openspec_filename=$(jq -er '.[0].filename' <<<"$openspec_metadata")
+          [[ "$openspec_integrity" == \
+            'sha512-fuL3Rz7Jv+NnHeUM1XkbaXFo4bUdPttOWOC66/6SyfJr9rPOvGE47oBp+8XdDtPiiWZawa0Z9RDzGasetFu2eQ==' ]] || {
+            echo "::error::OpenSpec package integrity mismatch"
+            exit 1
+          }
+          npm install --ignore-scripts --omit=dev --no-audit --no-fund \
+            --prefix "$openspec_stage/runtime" \
+            "$openspec_stage/package/$openspec_filename"
+          openspec_cli="$openspec_stage/runtime/node_modules/@fission-ai/openspec/bin/openspec.js"
+          openspec() { node "$openspec_cli" "$@"; }
+          openspec validate --specs --no-interactive
+
+          openspec_replay=$RUNNER_TEMP/phase2-openspec-replay
+          mkdir -p "$openspec_replay/openspec/changes"
+          cp -a openspec/specs "$openspec_replay/openspec/"
+          if [[ -f openspec/config.yaml ]]; then
+            cp -a openspec/config.yaml "$openspec_replay/openspec/"
+          fi
+          cp -a "$phase2_archive" \
+            "$openspec_replay/openspec/changes/phase2-install-docker-qualification"
+          (
+            cd "$openspec_replay"
+            openspec validate phase2-install-docker-qualification \
+              --strict --no-interactive
+          )
 
           associated=$(gh api \
             -H 'Accept: application/vnd.github+json' \
@@ -127,7 +169,9 @@ jobs:
             echo "::error::merged PR lacks an approval bound to its final head"
             exit 1
           }
-          checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$pr_head/check-runs?per_page=100")
+          check_pages=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/commits/$pr_head/check-runs?per_page=100")
+          checks=$(jq -sc '{check_runs: [.[].check_runs[]]}' <<<"$check_pages")
           jq -e '
             (.check_runs | length) > 0 and
             all(.check_runs[]; .status == "completed" and .conclusion == "success")
@@ -357,19 +401,75 @@ jobs:
 
           tag_created=false
           tag_object_sha=
-          cleanup_tag() {
-            if [[ "$tag_created" == true && -n "$tag_object_sha" ]]; then
-              current_sha=$(gh api \
-                "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag_name" \
-                --jq .object.sha 2>/dev/null || true)
-              if [[ "$current_sha" == "$tag_object_sha" ]]; then
-                gh api --method DELETE \
-                  "repos/${GITHUB_REPOSITORY}/git/refs/tags/$tag_name" >/dev/null || \
-                  echo "::warning::failed to roll back release tag ref"
+          release_id=
+          release_transaction_marker=
+
+          find_owned_release() {
+            local pages
+            pages=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100") || return 1
+            jq -sc \
+              --arg tag "$tag_name" \
+              --arg marker "$release_transaction_marker" '
+              [.[][]
+                | select(.tag_name == $tag)
+                | select((.body // "") | contains($marker))]
+              | if length == 0 then null
+                elif length == 1 then .[0]
+                else error("duplicate owned release transactions") end
+            ' <<<"$pages"
+          }
+
+          cleanup_release_transaction() {
+            original_status=$?
+            trap - ERR
+            set +e
+            if [[ "$tag_created" != true || -z "$tag_object_sha" ]]; then
+              exit "$original_status"
+            fi
+
+            current_sha=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag_name" \
+              --jq .object.sha 2>/dev/null)
+            if [[ "$current_sha" != "$tag_object_sha" ]]; then
+              echo "::warning::release cleanup ownership mismatch for tag ref"
+              exit "$original_status"
+            fi
+
+            owned_release=$(find_owned_release 2>/dev/null)
+            if [[ $? -ne 0 ]]; then
+              echo "::warning::release cleanup ownership lookup failed; retaining tag"
+              exit "$original_status"
+            fi
+            if [[ "$owned_release" != null ]]; then
+              owned_release_id=$(jq -er .id <<<"$owned_release")
+              owned_tag=$(jq -er .tag_name <<<"$owned_release")
+              owned_body=$(jq -er '.body // ""' <<<"$owned_release")
+              if [[ "$owned_tag" != "$tag_name" || \
+                    "$owned_body" != *"$release_transaction_marker"* ]]; then
+                echo "::warning::release cleanup ownership mismatch; retaining release and tag"
+                exit "$original_status"
+              fi
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/$owned_release_id" >/dev/null
+              if [[ $? -ne 0 ]]; then
+                echo "::warning::failed to roll back owned GitHub Release; retaining tag"
+                exit "$original_status"
+              fi
+              if gh api \
+                "repos/${GITHUB_REPOSITORY}/releases/$owned_release_id" \
+                >/dev/null 2>&1; then
+                echo "::warning::owned GitHub Release still exists; retaining tag"
+                exit "$original_status"
               fi
             fi
+
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/$tag_name" >/dev/null || \
+              echo "::warning::failed to roll back release tag ref"
+            exit "$original_status"
           }
-          trap cleanup_tag ERR
+          trap cleanup_release_transaction ERR
 
           tag_object=$(jq -n \
             --arg tag "$tag_name" \
@@ -384,6 +484,7 @@ jobs:
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/git/refs" --input - >/dev/null
           tag_created=true
+          release_transaction_marker="cortex-release-transaction:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${release_sha}:${tag_object_sha}"
 
           created_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag_name")
           created_tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$tag_object_sha")
@@ -405,9 +506,50 @@ jobs:
             }
 
           gh release create "$tag_name" "${wheels[0]}" \
+            --draft \
             --verify-tag \
             --target "$release_sha" \
             --title "$tag_name" \
+            --notes "<!-- $release_transaction_marker -->" \
             --generate-notes
+
+          owned_release=$(find_owned_release)
+          [[ "$owned_release" != null ]] || {
+            echo "::error::draft release is not bound to this release transaction"
+            false
+          }
+          release_id=$(jq -er .id <<<"$owned_release")
+          wheel_name=$(basename "${wheels[0]}")
+          wheel_size=$(stat --format=%s "${wheels[0]}")
+          jq -e \
+            --arg tag "$tag_name" \
+            --arg marker "$release_transaction_marker" \
+            --arg wheel "$wheel_name" \
+            --argjson size "$wheel_size" '
+            .tag_name == $tag and
+            .draft == true and
+            ((.body // "") | contains($marker)) and
+            (.assets | length) == 1 and
+            (.assets[0].name == $wheel) and
+            (.assets[0].size == $size) and
+            (.assets[0].state == "uploaded")
+          ' <<<"$owned_release" >/dev/null || {
+            echo "::error::draft release asset or ownership verification failed"
+            false
+          }
+
+          published_release=$(jq -n '{draft: false}' | \
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/$release_id" --input -)
+          jq -e \
+            --argjson id "$release_id" \
+            --arg tag "$tag_name" \
+            --arg marker "$release_transaction_marker" '
+            .id == $id and .tag_name == $tag and .draft == false and
+            ((.body // "") | contains($marker))
+          ' <<<"$published_release" >/dev/null || {
+            echo "::error::published release failed transaction verification"
+            false
+          }
           tag_created=false
           trap - ERR
