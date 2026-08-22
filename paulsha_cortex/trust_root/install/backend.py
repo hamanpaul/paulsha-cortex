@@ -186,7 +186,10 @@ def _read_acl(path: Path) -> list[dict[str, object]]:
                 "default": default,
             }
         )
-    return rows
+    return sorted(
+        rows,
+        key=lambda row: (bool(row["default"]), str(row["account"]), str(row["perms"])),
+    )
 
 
 def _snapshot(path: Path) -> dict[str, object]:
@@ -233,7 +236,7 @@ def _expected_acl_mode(step: Mapping[str, object]) -> str:
 
 
 def _expected_acls(step: Mapping[str, object]) -> list[dict[str, object]]:
-    return [
+    rows = [
         {
             "account": row.get("account"),
             "perms": str(row.get("perms", "")).replace("X", "x").replace("-", ""),
@@ -242,6 +245,10 @@ def _expected_acls(step: Mapping[str, object]) -> list[dict[str, object]]:
         for row in step.get("acls", [])
         if isinstance(row, Mapping)
     ]
+    return sorted(
+        rows,
+        key=lambda row: (bool(row["default"]), str(row["account"]), str(row["perms"])),
+    )
 
 
 def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object]) -> bool:

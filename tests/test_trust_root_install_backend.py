@@ -308,3 +308,43 @@ def test_existing_directory_drift_is_not_overwritten(tmp_path: Path) -> None:
         LocalInstallBackend(require_root=False).apply_step(step)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
+
+
+def test_directory_acl_attestation_ignores_semantically_irrelevant_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    step = {
+        "step_id": "asset:repo-source-tree",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(tmp_path / "repos"),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [
+            {"account": "z-reader", "perms": "rX", "default": False},
+            {"account": "a-reader", "perms": "rX", "default": False},
+        ],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    monkeypatch.setattr(
+        backend_module,
+        "_snapshot",
+        lambda _path: {
+            "exists": True,
+            "is_directory": True,
+            "owner": account,
+            "group": group,
+            "mode": "0750",
+            "acl": [
+                {"account": "a-reader", "perms": "rx", "default": False},
+                {"account": "z-reader", "perms": "rx", "default": False},
+            ],
+        },
+    )
+
+    state = LocalInstallBackend(require_root=False).inspect_step(step)
+
+    assert state["installed_sha256"] == step["desired_sha256"]
