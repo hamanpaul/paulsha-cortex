@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import configparser
 import grp
 import hashlib
 import json
@@ -39,11 +40,26 @@ def _run(
     check: bool = False,
     input_text: str | None = None,
     pass_fds: Sequence[int] = (),
+    env: Mapping[str, str] | None = None,
+    uid: int | None = None,
+    gid: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one typed argv.  Shell text is never accepted by this backend."""
 
     if not argv or not all(isinstance(part, str) and part for part in argv):
         raise InstallPlanError(f"invalid argv: {argv!r}")
+    identity: dict[str, object] = {}
+    if uid is not None or gid is not None:
+        target_uid = os.geteuid() if uid is None else uid
+        target_gid = os.getegid() if gid is None else gid
+        if os.geteuid() == 0:
+            identity = {
+                "user": target_uid,
+                "group": target_gid,
+                "extra_groups": (),
+            }
+        elif target_uid != os.geteuid() or target_gid != os.getegid():
+            raise PermissionError("cannot run command as the requested repository owner")
     result = subprocess.run(
         list(argv),
         check=False,
@@ -51,6 +67,8 @@ def _run(
         text=True,
         input=input_text,
         pass_fds=tuple(pass_fds),
+        env=None if env is None else dict(env),
+        **identity,
     )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "command failed").strip()
@@ -217,25 +235,43 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
     expected = step.get("wheel_sha256")
     if not slot.is_absolute() or not active.is_absolute() or not isinstance(expected, str):
         raise InstallPlanError("venv step requires absolute slot/link and wheel hash")
-    marker = slot / ".cortex-wheel.sha256"
-    if not _venv_slot_matches(slot, expected):
+    try:
+        observed = slot.lstat()
+    except FileNotFoundError:
         return {"exists": False}
-    marker_value = marker.read_text(encoding="ascii").strip()
+    if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        return {"exists": True, "installed_sha256": None, "path": str(slot)}
+    tree_sha256 = _tree_sha256(slot)
+    slot_matches = _venv_slot_matches(slot, expected, tree_sha256=tree_sha256)
     try:
         link_target = active.readlink()
     except (OSError, ValueError):
-        return {"exists": True, "installed_sha256": None}
+        return {
+            "exists": True,
+            "installed_sha256": None,
+            "path": str(slot),
+            "tree_sha256": tree_sha256,
+        }
     resolved_target = (active.parent / link_target).resolve(strict=False)
-    if marker_value != expected or resolved_target != slot.resolve(strict=False):
-        return {"exists": True, "installed_sha256": None}
+    if not slot_matches or resolved_target != slot.resolve(strict=False):
+        return {
+            "exists": True,
+            "installed_sha256": None,
+            "path": str(slot),
+            "tree_sha256": tree_sha256,
+        }
     return {
         "exists": True,
         "installed_sha256": expected,
+        "path": str(slot),
+        "tree_sha256": tree_sha256,
         "link_target": str(link_target),
     }
 
 
-def _venv_slot_matches(slot: Path, expected: str) -> bool:
+def _venv_slot_matches(
+    slot: Path, expected: str, *, tree_sha256: str | None = None
+) -> bool:
     marker = slot / ".cortex-wheel.sha256"
     tree_marker = slot / ".cortex-tree.sha256"
     try:
@@ -247,7 +283,8 @@ def _venv_slot_matches(slot: Path, expected: str) -> bool:
             and marker.read_text(encoding="ascii").strip() == expected
             and tree_marker.is_file()
             and not tree_marker.is_symlink()
-            and tree_marker.read_text(encoding="ascii").strip() == _tree_sha256(slot)
+            and tree_marker.read_text(encoding="ascii").strip()
+            == (tree_sha256 if tree_sha256 is not None else _tree_sha256(slot))
             and (slot / "bin/python").is_file()
         )
     except OSError:
@@ -465,6 +502,72 @@ def _extract_locked_tree(archive: Path, destination: Path) -> None:
             path.symlink_to(member.linkname)
 
 
+_REPOSITORY_GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "HOME": "/nonexistent",
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": os.defpath,
+}
+
+
+def _repository_config_is_canonical(
+    path: Path, *, remote: object, uid: int, gid: int
+) -> bool:
+    """Accept only the detached clone config emitted by the installer."""
+
+    git_dir = path / ".git"
+    config_path = git_dir / "config"
+    try:
+        git_state = git_dir.lstat()
+        config_state = config_path.lstat()
+    except OSError:
+        return False
+    if (
+        not stat.S_ISDIR(git_state.st_mode)
+        or stat.S_ISLNK(git_state.st_mode)
+        or git_state.st_uid != uid
+        or git_state.st_gid != gid
+        or not stat.S_ISREG(config_state.st_mode)
+        or stat.S_ISLNK(config_state.st_mode)
+        or config_state.st_nlink != 1
+        or config_state.st_uid != uid
+        or config_state.st_gid != gid
+        or not isinstance(remote, str)
+    ):
+        return False
+    parser = configparser.RawConfigParser(
+        strict=True,
+        interpolation=None,
+        delimiters=("=",),
+        comment_prefixes=("#", ";"),
+        inline_comment_prefixes=None,
+    )
+    try:
+        with config_path.open("r", encoding="utf-8") as stream:
+            parser.read_file(stream)
+    except (OSError, UnicodeError, configparser.Error):
+        return False
+    expected = {
+        "core": {
+            "repositoryformatversion": "0",
+            "filemode": "true",
+            "bare": "false",
+            "logallrefupdates": "true",
+        },
+        'remote "origin"': {
+            "url": remote,
+            "fetch": "+refs/heads/*:refs/remotes/origin/*",
+        },
+    }
+    return parser.sections() == list(expected) and all(
+        dict(parser.items(section, raw=True)) == values
+        for section, values in expected.items()
+    )
+
+
 def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
     path = Path(str(step.get("path", "")))
     try:
@@ -473,21 +576,6 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         return {"exists": False}
     if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
         return {"exists": True, "installed_sha256": None}
-    # Inspection must not refresh the index as the root installer.  Such an
-    # optional write would change .git/index ownership after the tree was
-    # handed to the Manager account and make attestation cause its own drift.
-    prefix = (
-        "git",
-        "--no-optional-locks",
-        "-c",
-        f"safe.directory={path}",
-        "-C",
-        str(path),
-    )
-    head = _run((*prefix, "rev-parse", "HEAD"))
-    remote = _run((*prefix, "remote", "get-url", "origin"))
-    clean = _run((*prefix, "status", "--porcelain=v1", "--untracked-files=all"))
-    integrity = _run((*prefix, "fsck", "--strict", "--no-dangling"))
     expected_uid = _resolve_uid(step.get("owner"))
     expected_gid = _resolve_gid(step.get("group"))
     tree_safe = True
@@ -519,6 +607,49 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
                     break
         if not tree_safe:
             break
+    config_safe = tree_safe and _repository_config_is_canonical(
+        path,
+        remote=step.get("remote"),
+        uid=expected_uid,
+        gid=expected_gid,
+    )
+    # Inspect only a canonical tree, as its owning account, and without any
+    # host/user config.  Command-scope overrides are defense in depth against
+    # executable fsmonitor/hooks settings and optional index writes.
+    prefix = (
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        f"safe.directory={path}",
+        "-C",
+        str(path),
+    )
+    commands: list[subprocess.CompletedProcess[str]] = []
+    if config_safe:
+        for suffix in (
+            ("rev-parse", "HEAD"),
+            ("remote", "get-url", "origin"),
+            ("status", "--porcelain=v1", "--untracked-files=all"),
+            ("fsck", "--strict", "--no-dangling"),
+        ):
+            commands.append(
+                _run(
+                    (*prefix, *suffix),
+                    env=_REPOSITORY_GIT_ENV,
+                    uid=expected_uid,
+                    gid=expected_gid,
+                )
+            )
+    if commands:
+        head, remote, clean, integrity = commands
+    else:
+        head = remote = clean = integrity = subprocess.CompletedProcess(
+            list(prefix), 1, "", "repository config is not canonical"
+        )
     matches = (
         head.returncode == 0
         and head.stdout.strip() == step.get("commit")
@@ -528,6 +659,7 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         and not clean.stdout.strip()
         and integrity.returncode == 0
         and tree_safe
+        and config_safe
         and _account_name(observed.st_uid) == step.get("owner")
         and _group_name(observed.st_gid) == step.get("group")
         and format(stat.S_IMODE(observed.st_mode), "04o") == step.get("mode")
@@ -542,6 +674,7 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         "clean": clean.returncode == 0 and not clean.stdout.strip(),
         "integrity": integrity.returncode == 0,
         "tree_safe": tree_safe,
+        "config_safe": config_safe,
         "installed_sha256": step.get("desired_sha256") if matches else None,
     }
 

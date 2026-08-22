@@ -6,7 +6,10 @@ import json
 from copy import deepcopy
 from pathlib import Path
 
+import pytest
+
 from paulsha_cortex.trust_root.install import (
+    ActivationError,
     activate_receipt,
     apply_plan,
     attest_generated_inventory,
@@ -14,6 +17,7 @@ from paulsha_cortex.trust_root.install import (
     plan_sha256,
     verify_receipt,
 )
+from paulsha_cortex.trust_root.install import backend as backend_module
 
 
 def _artifact(content: str, *, owner: str = "root", mode: str = "0644"):
@@ -185,6 +189,28 @@ class VerifyBackend:
         return _service_identities()
 
 
+class CandidateVenvBackend(VerifyBackend):
+    def __init__(self, slot: Path) -> None:
+        super().__init__()
+        self.slot = slot
+        self.stopped: list[str] = []
+
+    def inspect_step(self, step):
+        assert step["kind"] == "venv"
+        return {
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+            "path": str(self.slot),
+            "tree_sha256": backend_module._tree_sha256(self.slot),
+        }
+
+    def apply_step(self, step):
+        return {"prior": {"exists": False}, **self.inspect_step(step)}
+
+    def stop_service(self, name: str) -> None:
+        self.stopped.append(name)
+
+
 def _service_identities(
     *, executable_hash: str = "d" * 64, active_state: str = "active"
 ) -> dict[str, dict[str, str]]:
@@ -237,6 +263,106 @@ def _activated_receipt():
     )
     activate_receipt(receipt, backend=backend)
     return plan, receipt
+
+
+def _candidate_venv_receipt(tmp_path: Path):
+    slot = tmp_path / "opt/cortex/venvs/candidate"
+    package = slot / "lib/python3.12/site-packages/paulsha_cortex/__init__.py"
+    package.parent.mkdir(parents=True)
+    package.write_text('__version__ = "0.2.0"\n', encoding="utf-8")
+    executable = slot / "bin/cortex"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    wheel_sha256 = "b" * 64
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(slot),
+        "active_link": str(tmp_path / "opt/cortex/venv"),
+        "wheel_sha256": wheel_sha256,
+        "desired_sha256": wheel_sha256,
+        "operations": [],
+    }
+    plan = {
+        "schema_version": 1,
+        "scheme": "four-way",
+        "repo_identity": {
+            "remote": "https://github.com/hamanpaul/paulsha-cortex.git",
+            "commit": "a" * 40,
+        },
+        "candidate": {
+            "wheel_sha256": wheel_sha256,
+            "bundle_sha256": "c" * 64,
+        },
+        "accounts": [],
+        "required_credentials": [],
+        "apply_order": [step],
+        "generated": _inventory(),
+    }
+    backend = CandidateVenvBackend(slot)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    return plan, receipt, backend, package, executable
+
+
+def test_activation_recomputes_candidate_venv_tree_before_starting_services(
+    tmp_path: Path,
+) -> None:
+    _plan, receipt, backend, package, executable = _candidate_venv_receipt(tmp_path)
+    binding = receipt.to_dict()["candidate_venv"]
+    assert binding == {
+        "path": str(backend.slot),
+        "tree_sha256": backend_module._tree_sha256(backend.slot),
+    }
+    executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
+    package.write_text('__version__ = "tampered"\n', encoding="utf-8")
+    assert hashlib.sha256(executable.read_bytes()).hexdigest() == executable_sha256
+
+    with pytest.raises(ActivationError, match="candidate venv tree drift"):
+        activate_receipt(receipt, backend=backend)
+
+    assert backend.started == []
+
+
+def test_verify_recomputes_and_evidences_candidate_venv_tree(
+    tmp_path: Path,
+) -> None:
+    plan, receipt, backend, package, executable = _candidate_venv_receipt(tmp_path)
+    expected_tree = receipt.to_dict()["candidate_venv"]["tree_sha256"]
+    activate_receipt(receipt, backend=backend)
+    executable_sha256 = hashlib.sha256(executable.read_bytes()).hexdigest()
+    package.write_text('__version__ = "tampered-after-start"\n', encoding="utf-8")
+    assert hashlib.sha256(executable.read_bytes()).hexdigest() == executable_sha256
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=_service_identities(),
+        evidence_path=tmp_path / "candidate-venv-drift.json",
+        service_controller=backend,
+    )
+
+    assert not result.ok
+    finding = next(
+        row
+        for row in result.report.to_dict()["failures"]
+        if row["code"] == "candidate_venv_tree_drift"
+    )
+    assert finding["expected"] == expected_tree
+    assert finding["installed"] == backend_module._tree_sha256(backend.slot)
+    assert result.evidence["candidate_venv"] == {
+        "path": str(backend.slot),
+        "tree_sha256": expected_tree,
+        "observed_tree_sha256": finding["installed"],
+    }
 
 
 def test_verify_writes_hash_bound_evidence_and_only_then_marks_activation(

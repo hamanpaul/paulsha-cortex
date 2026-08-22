@@ -56,11 +56,24 @@ def test_repository_attestation_disables_root_owned_optional_index_writes(
     group = grp.getgrgid(os.getgid()).gr_name
     commit = "a" * 40
     remote = "https://github.com/hamanpaul/paulsha-cortex.git"
-    calls: list[tuple[str, ...]] = []
+    git_dir = repository / ".git"
+    git_dir.mkdir()
+    (git_dir / "config").write_text(
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        "\tfilemode = true\n"
+        "\tbare = false\n"
+        "\tlogallrefupdates = true\n"
+        '[remote "origin"]\n'
+        f"\turl = {remote}\n"
+        "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        encoding="utf-8",
+    )
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
 
-    def run(argv, **_kwargs):
+    def run(argv, **kwargs):
         command = tuple(argv)
-        calls.append(command)
+        calls.append((command, kwargs))
         if command[-2:] == ("rev-parse", "HEAD"):
             return subprocess.CompletedProcess(command, 0, f"{commit}\n", "")
         if command[-3:] == ("remote", "get-url", "origin"):
@@ -82,7 +95,64 @@ def test_repository_attestation_disables_root_owned_optional_index_writes(
 
     assert state["installed_sha256"] == step["desired_sha256"]
     assert calls
-    assert all(command[:2] == ("git", "--no-optional-locks") for command in calls)
+    for command, kwargs in calls:
+        assert command[:2] == ("git", "--no-optional-locks")
+        assert ("-c", "core.fsmonitor=false") == command[2:4]
+        assert ("-c", "core.hooksPath=/dev/null") == command[4:6]
+        assert kwargs["uid"] == os.getuid()
+        assert kwargs["gid"] == os.getgid()
+        assert kwargs["env"] == {
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": "/nonexistent",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": os.defpath,
+        }
+
+
+def test_repository_attestation_rejects_noncanonical_fsmonitor_without_execution(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    git_dir = repository / ".git"
+    git_dir.mkdir(parents=True)
+    marker = tmp_path / "fsmonitor-executed"
+    probe = tmp_path / "malicious-fsmonitor"
+    probe.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    probe.chmod(0o755)
+    remote = "https://github.com/hamanpaul/paulsha-cortex.git"
+    (git_dir / "config").write_text(
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        "\tfilemode = true\n"
+        "\tbare = false\n"
+        "\tlogallrefupdates = true\n"
+        f"\tfsmonitor = {probe}\n"
+        '[remote "origin"]\n'
+        f"\turl = {remote}\n"
+        "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        encoding="utf-8",
+    )
+    owner = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+
+    state = backend_module._repository_state(
+        {
+            "path": str(repository),
+            "owner": owner,
+            "group": group,
+            "mode": "0755",
+            "commit": "a" * 40,
+            "remote": remote,
+            "desired_sha256": "d" * 64,
+        }
+    )
+
+    assert state["installed_sha256"] is None
+    assert state["config_safe"] is False
+    assert not marker.exists(), "repository inspection must not execute local fsmonitor"
 
 
 def test_account_step_creates_exact_group_and_user_through_typed_argv(
@@ -209,6 +279,7 @@ def test_venv_step_verifies_locked_wheels_and_atomically_switches_link(
     result = backend.apply_step(step)
 
     assert result["installed_sha256"] == wheel_sha
+    assert result["tree_sha256"] == backend_module._tree_sha256(Path(step["path"]))
     assert active.resolve() == Path(step["path"])
     assert (Path(step["path"]) / ".cortex-wheel.sha256").read_text().strip() == wheel_sha
     assert (Path(step["path"]) / "bin/cortex").read_text().splitlines()[0] == (

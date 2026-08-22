@@ -1740,6 +1740,34 @@ class InstallReceipt:
             )
         ):
             raise InstallError(f"receipt service executable binding is invalid: {path}")
+        venv_steps = [
+            step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, Mapping) and step.get("kind") == "venv"
+        ]
+        candidate_venv = payload.get("candidate_venv")
+        if len(venv_steps) > 1 or (
+            candidate_venv is not None
+            and (
+                len(venv_steps) != 1
+                or not isinstance(candidate_venv, Mapping)
+                or set(candidate_venv) != {"path", "tree_sha256"}
+                or candidate_venv.get("path") != venv_steps[0].get("path")
+                or not isinstance(candidate_venv.get("path"), str)
+                or not Path(str(candidate_venv.get("path"))).is_absolute()
+                or not isinstance(candidate_venv.get("tree_sha256"), str)
+                or len(str(candidate_venv.get("tree_sha256"))) != 64
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in str(candidate_venv.get("tree_sha256"))
+                )
+            )
+        ) or (
+            venv_steps
+            and payload.get("state") == "applied"
+            and candidate_venv is None
+        ):
+            raise InstallError(f"receipt candidate venv binding is invalid: {path}")
         return cls(payload, path=path)
 
 
@@ -1851,6 +1879,116 @@ def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> b
     if desired_acl is not None and state.get("acl", []) != desired_acl:
         return False
     return True
+
+
+def _candidate_venv_step(
+    plan: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    steps = plan.get("apply_order", [])
+    if not isinstance(steps, list):
+        raise InstallPlanError("apply_order must be a list")
+    candidates = [
+        step
+        for step in steps
+        if isinstance(step, Mapping) and step.get("kind") == "venv"
+    ]
+    if len(candidates) > 1:
+        raise InstallPlanError("apply_order must contain at most one candidate venv")
+    return candidates[0] if candidates else None
+
+
+def _valid_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _bind_candidate_venv(
+    *,
+    plan: Mapping[str, object],
+    receipt: InstallReceipt,
+    backend: InstallBackend,
+) -> None:
+    step = _candidate_venv_step(plan)
+    if step is None:
+        return
+    observed = backend.inspect_step(step)
+    tree_sha256 = observed.get("tree_sha256")
+    path = step.get("path")
+    if (
+        not isinstance(path, str)
+        or not Path(path).is_absolute()
+        or observed.get("path") != path
+        or observed.get("installed_sha256") != step.get("desired_sha256")
+        or not _valid_sha256(tree_sha256)
+    ):
+        raise InstallDriftError("installed candidate venv tree is not attestable")
+    receipt._document["candidate_venv"] = {
+        "path": path,
+        "tree_sha256": tree_sha256,
+    }
+    receipt._persist()
+
+
+def _attest_candidate_venv(
+    *,
+    plan: Mapping[str, object],
+    receipt: InstallReceipt,
+    backend: object,
+) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+    step = _candidate_venv_step(plan)
+    if step is None:
+        return None, None
+    binding = receipt._document.get("candidate_venv")
+    expected_path = binding.get("path") if isinstance(binding, Mapping) else None
+    expected_tree = (
+        binding.get("tree_sha256") if isinstance(binding, Mapping) else None
+    )
+    evidence = {
+        "path": expected_path,
+        "tree_sha256": expected_tree,
+        "observed_tree_sha256": None,
+    }
+    inspector = getattr(backend, "inspect_step", None)
+    if not callable(inspector):
+        return evidence, {
+            "code": "candidate_venv_tree_drift",
+            "artifact": "candidate-venv",
+            "expected": expected_tree,
+            "installed": None,
+        }
+    try:
+        observed = inspector(step)
+    except Exception as exc:
+        return evidence, {
+            "code": "candidate_venv_tree_drift",
+            "artifact": "candidate-venv",
+            "expected": expected_tree,
+            "installed": None,
+            "inspection_error": type(exc).__name__,
+        }
+    actual_tree = observed.get("tree_sha256") if isinstance(observed, Mapping) else None
+    evidence["observed_tree_sha256"] = actual_tree
+    matches = (
+        isinstance(observed, Mapping)
+        and isinstance(binding, Mapping)
+        and set(binding) == {"path", "tree_sha256"}
+        and expected_path == step.get("path")
+        and observed.get("path") == expected_path
+        and observed.get("installed_sha256") == step.get("desired_sha256")
+        and _valid_sha256(expected_tree)
+        and actual_tree == expected_tree
+    )
+    if matches:
+        return evidence, None
+    return evidence, {
+        "code": "candidate_venv_tree_drift",
+        "artifact": "candidate-venv",
+        "expected": expected_tree,
+        "installed": actual_tree,
+    }
 
 
 def _planned_service_exec_paths(
@@ -2008,6 +2146,7 @@ def apply_plan(
         entry.update({key: value for key, value in outcome.items() if key != "prior"})
         entry["status"] = "completed"
         receipt._persist()
+    _bind_candidate_venv(plan=plan, receipt=receipt, backend=backend)
     identity_reader = getattr(backend, "service_identities", None)
     if callable(identity_reader):
         identities = identity_reader()
@@ -2636,6 +2775,15 @@ def activate_receipt(
     if receipt._document.get("state") != "applied":
         raise ActivationError("receipt must be fully applied before activation")
     plan = receipt._document.get("plan", {})
+    if not isinstance(plan, Mapping):
+        raise ActivationError("receipt plan is invalid")
+    _candidate_evidence, candidate_failure = _attest_candidate_venv(
+        plan=plan,
+        receipt=receipt,
+        backend=backend,
+    )
+    if candidate_failure is not None:
+        raise ActivationError("candidate venv tree drift")
     required = plan.get("required_credentials", []) if isinstance(plan, Mapping) else []
     imported = {
         (row.get("principal"), row.get("provider"))
@@ -2838,6 +2986,15 @@ def verify_receipt(
     report = attest_generated_inventory(
         expected=expected_inventory, installed=installed_inventory
     )
+    candidate_venv, candidate_failure = _attest_candidate_venv(
+        plan=plan,
+        receipt=receipt,
+        backend=service_controller,
+    )
+    if candidate_failure is not None:
+        report = AttestationReport(
+            report.warnings, (*report.failures, candidate_failure)
+        )
     identity_failures: list[dict[str, object]] = []
     expected_users: dict[str, str] = {}
     expected_exec_paths: dict[str, str] = {}
@@ -2952,6 +3109,8 @@ def verify_receipt(
         "artifact_hashes": artifact_hashes,
         "attestation": report.to_dict(),
     }
+    if candidate_venv is not None:
+        evidence["candidate_venv"] = candidate_venv
     atomic_write_json(evidence_path.absolute(), evidence, mode=0o600)
     receipt._document["activated"] = report.ok
     receipt._document["qualified"] = report.ok
