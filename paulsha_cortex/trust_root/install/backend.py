@@ -1458,6 +1458,7 @@ def _password_locked(name: str) -> bool | None:
 
 def _classify_systemctl_is_active(
     result: subprocess.CompletedProcess[str],
+    load_state: subprocess.CompletedProcess[str] | None = None,
 ) -> str:
     """Classify only documented, internally consistent `is-active` results."""
 
@@ -1466,8 +1467,9 @@ def _classify_systemctl_is_active(
         return "active"
     if result.returncode == 3 and state in {"inactive", "failed"}:
         return state
-    if result.returncode == 4 and state == "unknown":
-        return "not-found"
+    if result.returncode == 4 and load_state is not None:
+        if load_state.returncode == 0 and load_state.stdout.strip() == "not-found":
+            return "not-found"
     return "error"
 
 
@@ -1500,8 +1502,21 @@ class LocalInstallBackend:
                 if shutil.which("systemctl")
                 else None
             )
+            load_state = (
+                _run(
+                    (
+                        "systemctl",
+                        "show",
+                        "--property=LoadState",
+                        "--value",
+                        name,
+                    )
+                )
+                if result is not None and result.returncode == 4
+                else None
+            )
             services[name] = (
-                _classify_systemctl_is_active(result)
+                _classify_systemctl_is_active(result, load_state)
                 if result is not None
                 else "error"
             )

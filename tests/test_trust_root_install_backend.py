@@ -40,18 +40,25 @@ def _completed(argv) -> subprocess.CompletedProcess[str]:
 
 
 @pytest.mark.parametrize(
-    ("returncode", "stdout", "expected"),
+    ("returncode", "stdout", "load_returncode", "load_stdout", "expected"),
     [
-        (0, "active\n", "active"),
-        (3, "inactive\n", "inactive"),
-        (3, "failed\n", "failed"),
-        (4, "unknown\n", "not-found"),
-        (1, "", "error"),
-        (0, "inactive\n", "error"),
+        (0, "active\n", None, None, "active"),
+        (3, "inactive\n", None, None, "inactive"),
+        (3, "failed\n", None, None, "failed"),
+        (4, "inactive\n", 0, "not-found\n", "not-found"),
+        (4, "unknown\n", 0, "not-found\n", "not-found"),
+        (4, "inactive\n", 1, "", "error"),
+        (4, "inactive\n", 0, "loaded\n", "error"),
+        (1, "", None, None, "error"),
+        (0, "inactive\n", None, None, "error"),
     ],
 )
 def test_systemctl_is_active_state_requires_matching_returncode_and_stdout(
-    returncode: int, stdout: str, expected: str
+    returncode: int,
+    stdout: str,
+    load_returncode: int | None,
+    load_stdout: str | None,
+    expected: str,
 ) -> None:
     result = subprocess.CompletedProcess(
         ["systemctl", "is-active", "cortex-manager.service"],
@@ -59,8 +66,18 @@ def test_systemctl_is_active_state_requires_matching_returncode_and_stdout(
         stdout,
         "Failed to connect to bus" if returncode == 1 else "",
     )
+    load_state = (
+        subprocess.CompletedProcess(
+            ["systemctl", "show", "--property=LoadState", "--value"],
+            load_returncode,
+            load_stdout,
+            "Failed to connect to bus" if load_returncode else "",
+        )
+        if load_returncode is not None and load_stdout is not None
+        else None
+    )
 
-    assert backend_module._classify_systemctl_is_active(result) == expected
+    assert backend_module._classify_systemctl_is_active(result, load_state) == expected
 
 
 def test_mode_parser_accepts_registry_sticky_mode_and_rejects_invalid_values() -> None:
