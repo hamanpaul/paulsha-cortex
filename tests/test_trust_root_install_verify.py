@@ -47,6 +47,9 @@ def _synthetic_verify_plans_skip_complete_authority_envelope(
         "_validate_repository_step_bijection",
         lambda _plan, _steps, _identity: None,
     )
+    monkeypatch.setattr(
+        install_core, "_validate_canonical_receipt_path", lambda _plan: None
+    )
 
 
 def _artifact(content: str, *, owner: str = "root", mode: str = "0644"):

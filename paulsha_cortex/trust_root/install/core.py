@@ -1033,6 +1033,48 @@ def _assert_managed_parent_topology(plan: Mapping[str, object]) -> None:
             )
 
 
+def canonical_receipt_path(plan: Mapping[str, object]) -> Path:
+    """Derive the default receipt authority from immutable plan identity."""
+
+    roots = plan.get("roots")
+    repo_identity = plan.get("repo_identity")
+    candidate = plan.get("candidate")
+    state = roots.get("state") if isinstance(roots, Mapping) else None
+    commit = (
+        repo_identity.get("commit") if isinstance(repo_identity, Mapping) else None
+    )
+    wheel_sha256 = (
+        candidate.get("wheel_sha256") if isinstance(candidate, Mapping) else None
+    )
+    if (
+        not isinstance(state, str)
+        or not state
+        or not Path(state).is_absolute()
+        or ".." in Path(state).parts
+        or not Path(state).name
+    ):
+        raise InstallPlanError("plan state root cannot derive receipt authority")
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in commit)
+    ):
+        raise InstallPlanError("plan repository commit cannot derive receipt authority")
+    if not _valid_sha256(wheel_sha256):
+        raise InstallPlanError("candidate wheel cannot derive receipt authority")
+    state_root = Path(state)
+    return (
+        state_root.parent
+        / f"{state_root.name}-install-receipts"
+        / f"{commit.lower()}-{wheel_sha256}.json"
+    )
+
+
+def _validate_canonical_receipt_path(plan: Mapping[str, object]) -> None:
+    if plan.get("receipt_path") != str(canonical_receipt_path(plan)):
+        raise InstallPlanError("plan receipt_path is not canonical")
+
+
 def build_install_plan(
     *, config: Mapping[str, object], candidate_wheel: Path, bundle: Path
 ) -> dict[str, object]:
@@ -1223,13 +1265,7 @@ def build_install_plan(
         ],
         "minimum_disk_free_bytes": 1024 * 1024 * 1024,
     }
-    state_root = Path(roots["state"])
-    wheel_prefix = str(plan["candidate"]["wheel_sha256"])[:12]  # type: ignore[index]
-    plan["receipt_path"] = str(
-        state_root.parent
-        / f"{state_root.name}-install-receipts"
-        / f"{commit.lower()}-{wheel_prefix}.json"
-    )
+    plan["receipt_path"] = str(canonical_receipt_path(plan))
     _assert_managed_parent_topology(plan)
     return plan
 
@@ -1906,19 +1942,42 @@ class InstallBackend(Protocol):
 class InstallReceipt:
     """Mutable transaction state with optional atomic on-disk persistence."""
 
-    def __init__(self, document: Mapping[str, object], *, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        document: Mapping[str, object],
+        *,
+        path: Path | None = None,
+        checkpoint_sha256: str | None = None,
+    ) -> None:
         self._document: dict[str, object] = deepcopy(dict(document))
         self.path = path
+        self._checkpoint_sha256 = checkpoint_sha256
 
     def to_dict(self) -> dict[str, object]:
         return deepcopy(self._document)
 
     def _persist(self) -> None:
         if self.path is not None:
-            _atomic_write_receipt_json(self.path, self._document)
+            if self._document.get("effective_receipt_path") != str(self.path):
+                raise InstallError("receipt effective path binding is invalid")
+            if self._checkpoint_sha256 is None:
+                self._checkpoint_sha256 = _create_receipt_json_exclusive(
+                    self.path, self._document
+                )
+            else:
+                self._checkpoint_sha256 = _atomic_write_receipt_json(
+                    self.path,
+                    self._document,
+                    expected_sha256=self._checkpoint_sha256,
+                )
 
     @classmethod
-    def load(cls, path: Path) -> "InstallReceipt":
+    def load(
+        cls,
+        path: Path,
+        *,
+        expected_plan: Mapping[str, object] | None = None,
+    ) -> "InstallReceipt":
         if not path.is_absolute() or ".." in path.parts:
             raise UnsafeInstallPathError(f"receipt path must be safe and absolute: {path}")
         parent_fd: int | None = None
@@ -1934,7 +1993,8 @@ class InstallReceipt:
             )
             before = os.fstat(receipt_fd)
             _validate_receipt_file(before, path)
-            payload = json.loads(_read_fd_bytes(receipt_fd).decode("utf-8"))
+            receipt_bytes = _read_fd_bytes(receipt_fd)
+            payload = json.loads(receipt_bytes.decode("utf-8"))
             after = os.fstat(receipt_fd)
             if (
                 before.st_dev,
@@ -1965,6 +2025,12 @@ class InstallReceipt:
         plan = payload.get("plan")
         if not isinstance(plan, Mapping) or payload.get("plan_sha256") != plan_sha256(plan):
             raise InstallError(f"receipt embedded plan hash is invalid: {path}")
+        if payload.get("effective_receipt_path") != str(path):
+            raise InstallError(f"receipt effective path binding is invalid: {path}")
+        if expected_plan is not None and canonical_plan_bytes(plan) != canonical_plan_bytes(
+            expected_plan
+        ):
+            raise InstallError(f"receipt does not contain the same plan: {path}")
         if payload.get("repo_identity") != plan.get("repo_identity") or payload.get(
             "candidate"
         ) != plan.get("candidate"):
@@ -2168,7 +2234,11 @@ class InstallReceipt:
             and candidate_venv is None
         ):
             raise InstallError(f"receipt candidate venv binding is invalid: {path}")
-        return cls(payload, path=path)
+        return cls(
+            payload,
+            path=path,
+            checkpoint_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
+        )
 
 
 def _validate_receipt_parent(observed: os.stat_result, path: Path) -> None:
@@ -2258,15 +2328,68 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _atomic_write_receipt_json(path: Path, value: object) -> None:
-    """Publish one receipt checkpoint beneath a held, trusted parent fd."""
+def _create_receipt_json_exclusive(path: Path, value: object) -> str:
+    """Create the initial receipt without adopting or replacing an existing leaf."""
+
+    parent_fd: int | None = None
+    receipt_fd: int | None = None
+    created = False
+    payload = _canonical_bytes(value)
+    try:
+        parent_fd, leaf = _open_receipt_parent_directory(path, create=True)
+        try:
+            receipt_fd = os.open(
+                leaf,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            created = True
+        except FileExistsError as exc:
+            raise InstallError(f"receipt authority already exists: {path}") from exc
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"cannot exclusively create receipt authority: {path}"
+            ) from exc
+        os.fchmod(receipt_fd, 0o600)
+        _validate_receipt_file(os.fstat(receipt_fd), path)
+        _write_all(receipt_fd, payload)
+        os.fsync(receipt_fd)
+        _assert_fd_path_binding(path, receipt_fd, directory=False)
+        os.fsync(parent_fd)
+        return hashlib.sha256(payload).hexdigest()
+    except BaseException:
+        if created and receipt_fd is not None and parent_fd is not None:
+            try:
+                _assert_fd_path_binding(path, receipt_fd, directory=False)
+                os.unlink(path.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except (OSError, InstallError):
+                pass
+        raise
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _atomic_write_receipt_json(
+    path: Path, value: object, *, expected_sha256: str
+) -> str:
+    """Publish a checkpoint only over the receipt version held by the caller."""
 
     parent_fd: int | None = None
     existing_fd: int | None = None
     temporary_fd: int | None = None
     temporary_name: str | None = None
+    payload = _canonical_bytes(value)
     try:
-        parent_fd, leaf = _open_receipt_parent_directory(path, create=True)
+        parent_fd, leaf = _open_receipt_parent_directory(path)
         try:
             existing_fd = os.open(
                 leaf,
@@ -2275,15 +2398,17 @@ def _atomic_write_receipt_json(path: Path, value: object) -> None:
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=parent_fd,
             )
-        except FileNotFoundError:
-            existing_fd = None
+        except FileNotFoundError as exc:
+            raise InstallError(f"receipt checkpoint authority is missing: {path}") from exc
         except OSError as exc:
             raise UnsafeInstallPathError(
                 f"cannot safely open existing receipt authority: {path}"
             ) from exc
-        if existing_fd is not None:
-            _validate_receipt_file(os.fstat(existing_fd), path)
-            _assert_fd_path_binding(path, existing_fd, directory=False)
+        _validate_receipt_file(os.fstat(existing_fd), path)
+        existing_bytes = _read_fd_bytes(existing_fd)
+        _assert_fd_path_binding(path, existing_fd, directory=False)
+        if hashlib.sha256(existing_bytes).hexdigest() != expected_sha256:
+            raise InstallError(f"receipt checkpoint authority changed: {path}")
 
         for _attempt in range(32):
             temporary_name = f".{leaf}.{uuid.uuid4().hex}.tmp"
@@ -2305,8 +2430,9 @@ def _atomic_write_receipt_json(path: Path, value: object) -> None:
             raise InstallError("cannot allocate a receipt checkpoint file")
         os.fchmod(temporary_fd, 0o600)
         _validate_receipt_file(os.fstat(temporary_fd), path)
-        _write_all(temporary_fd, _canonical_bytes(value))
+        _write_all(temporary_fd, payload)
         os.fsync(temporary_fd)
+        _assert_fd_path_binding(path, existing_fd, directory=False)
         os.replace(
             temporary_name,
             leaf,
@@ -2315,6 +2441,7 @@ def _atomic_write_receipt_json(path: Path, value: object) -> None:
         )
         os.fsync(parent_fd)
         _assert_fd_path_binding(path, temporary_fd, directory=False)
+        return hashlib.sha256(payload).hexdigest()
     finally:
         if temporary_name is not None and parent_fd is not None:
             try:
@@ -2363,10 +2490,12 @@ def atomic_write_json(path: Path, value: object, *, mode: int = 0o600) -> None:
 def new_install_receipt(
     plan: Mapping[str, object], *, path: Path | None = None
 ) -> InstallReceipt:
+    effective_path = path if path is not None else canonical_receipt_path(plan)
     receipt = InstallReceipt(
         {
             "schema_version": 1,
             "receipt_id": str(uuid.uuid4()),
+            "effective_receipt_path": str(effective_path),
             "plan_sha256": plan_sha256(plan),
             "plan": _as_plan_dict(plan),
             "repo_identity": deepcopy(plan.get("repo_identity", {})),
@@ -2654,6 +2783,7 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
         for field in ("wheel_sha256", "bundle_sha256")
     ):
         raise InstallPlanError("plan candidate identity is invalid")
+    _validate_canonical_receipt_path(plan)
     account_inventory = _validate_apply_account_inventories(plan)
     _validate_required_credentials(plan)
     steps = plan.get("apply_order")

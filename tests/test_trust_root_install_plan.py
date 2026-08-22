@@ -351,6 +351,111 @@ def test_public_apply_validation_is_pure_for_a_valid_plan(tmp_path: Path) -> Non
     assert canonical_plan_bytes(plan) == before
 
 
+def test_canonical_receipt_path_binds_full_plan_identity(tmp_path: Path) -> None:
+    plan, _doc = _plan_document(tmp_path)
+
+    receipt_path = install_core.canonical_receipt_path(plan)
+
+    assert plan["receipt_path"] == str(receipt_path)
+    assert receipt_path.parent == Path(plan["roots"]["state"]).parent / (
+        f"{Path(plan['roots']['state']).name}-install-receipts"
+    )
+    assert receipt_path.name == (
+        f"{'a' * 40}-{plan['candidate']['wheel_sha256']}.json"
+    )
+    for field in ("state", "commit", "wheel"):
+        changed = deepcopy(plan)
+        if field == "state":
+            changed["roots"]["state"] = f"{plan['roots']['state']}-other"
+        elif field == "commit":
+            changed["repo_identity"]["commit"] = "b" * 40
+        else:
+            changed["candidate"]["wheel_sha256"] = "d" * 64
+        assert install_core.canonical_receipt_path(changed) != receipt_path
+
+
+def test_apply_cli_rejects_noncanonical_plan_receipt_before_override_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    plan["receipt_path"] = str(tmp_path / "attacker-selected.json")
+    plan_path = tmp_path / "noncanonical-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    override = tmp_path / "existing" / "receipt.json"
+    override.parent.mkdir()
+    original = b"DO-NOT-REPLACE-EXISTING-RECEIPT\n"
+    override.write_bytes(original)
+    override.chmod(0o600)
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("noncanonical receipt path reached backend")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(override),
+        ]
+    ) == 1
+    assert override.read_bytes() == original
+    assert MutationSentinelBackend.preflight_calls == 0
+
+
+def test_apply_cli_refuses_same_path_receipt_for_a_different_valid_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    other = deepcopy(plan)
+    other["candidate"]["wheel_sha256"] = "d" * 64
+    other["receipt_path"] = str(install_core.canonical_receipt_path(other))
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    override = (tmp_path / "override" / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    new_install_receipt(other, path=override)
+    before = override.read_bytes()
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("different-plan receipt reached backend")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(override),
+        ]
+    ) == 1
+    assert override.read_bytes() == before
+    assert MutationSentinelBackend.preflight_calls == 0
+
+
 @pytest.mark.parametrize(
     "case",
     [

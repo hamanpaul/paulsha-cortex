@@ -20,6 +20,7 @@ from .core import (
     attest_generated_inventory,
     bind_bundle_artifacts,
     build_install_plan,
+    canonical_receipt_path,
     canonical_plan_bytes,
     import_credential,
     new_install_receipt,

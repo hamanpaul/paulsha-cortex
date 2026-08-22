@@ -183,7 +183,7 @@ def _apply_command(args: argparse.Namespace) -> int:
             f"receipt path must be absolute and contain no '..': {receipt_path}"
         )
     receipt = (
-        InstallReceipt.load(receipt_path)
+        InstallReceipt.load(receipt_path, expected_plan=plan)
         if receipt_path.exists()
         else new_install_receipt(plan, path=receipt_path)
     )

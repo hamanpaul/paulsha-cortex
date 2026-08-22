@@ -51,6 +51,9 @@ def _synthetic_credential_plans_skip_complete_authority_envelope(
         "_validate_repository_step_bijection",
         lambda _plan, _steps, _identity: None,
     )
+    monkeypatch.setattr(
+        install_core, "_validate_canonical_receipt_path", lambda _plan: None
+    )
 
 
 def _plan(*, required_credentials=None) -> dict[str, object]:

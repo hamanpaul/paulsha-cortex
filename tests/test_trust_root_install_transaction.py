@@ -58,6 +58,9 @@ def _synthetic_transaction_plans_skip_complete_authority_envelope(
         "_validate_repository_step_bijection",
         lambda _plan, _steps, _identity: None,
     )
+    monkeypatch.setattr(
+        install_core, "_validate_canonical_receipt_path", lambda _plan: None
+    )
 
 
 def _accounts(tmp_path: Path) -> list[dict[str, object]]:
@@ -1357,6 +1360,77 @@ def test_receipt_load_rejects_non_root_or_non_private_authority_file(
 
     with pytest.raises(Exception, match="root-owned|0600"):
         InstallReceipt.load(path)
+
+
+def test_new_receipt_exclusively_refuses_an_existing_private_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    original = b"ROOT-OWNED-PRIVATE-BUT-NOT-A-RECEIPT\n"
+    path.write_bytes(original)
+    path.chmod(0o600)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    with pytest.raises(InstallError, match="exist|exclusive|collision"):
+        new_install_receipt(_plan(tmp_path), path=path)
+
+    assert path.read_bytes() == original
+
+
+def test_loaded_receipt_binds_actual_path_and_expected_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = (tmp_path / "first.json").absolute()
+    second = (tmp_path / "second.json").absolute()
+    plan = _plan(tmp_path)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    receipt = new_install_receipt(plan, path=first)
+
+    loaded = InstallReceipt.load(first, expected_plan=plan)
+
+    assert loaded.to_dict()["effective_receipt_path"] == str(first)
+    second.write_bytes(first.read_bytes())
+    second.chmod(0o600)
+    with pytest.raises(InstallError, match="effective.*path|path.*binding"):
+        InstallReceipt.load(second, expected_plan=plan)
+
+    changed = deepcopy(plan)
+    changed["candidate"]["wheel_sha256"] = "d" * 64
+    with pytest.raises(InstallError, match="same plan|plan.*match"):
+        InstallReceipt.load(first, expected_plan=changed)
+    assert receipt.to_dict()["effective_receipt_path"] == str(first)
+
+
+def test_checkpoint_refuses_replaced_private_leaf_without_changing_its_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    receipt = new_install_receipt(_plan(tmp_path), path=path)
+    replacement = b"UNRELATED-ROOT-OWNED-PRIVATE-FILE\n"
+    path.write_bytes(replacement)
+    path.chmod(0o600)
+    receipt._document["state"] = "applying"
+
+    with pytest.raises(InstallError, match="checkpoint|changed|authority"):
+        receipt._persist()
+
+    assert path.read_bytes() == replacement
 
 
 def _root_owned_stat(observed: os.stat_result) -> os.stat_result:
