@@ -105,10 +105,11 @@ docker exec "$container_name" /usr/local/libexec/cortex-qualification-verify-bun
 docker exec "$container_name" sh -eu -c \
     'python3 -m pip install --break-system-packages --no-index --no-deps /artifacts/wheelhouse/*.whl'
 
-plan_path=/var/lib/cortex/qualification/install-plan.json
-receipt_path=/var/lib/cortex/qualification/install-receipt.json
+plan_path=/run/cortex-install/install-plan.json
+receipt_path=/run/cortex-install/install-receipt.json
 qualification_path=/var/lib/cortex/qualification/qualification.json
 
+docker exec "$container_name" install -d -o root -g root -m 0700 /run/cortex-install
 docker exec "$container_name" cortex install trust-root plan \
     --config /artifacts/install-config.yaml \
     --bundle /artifacts/bundle.json \
