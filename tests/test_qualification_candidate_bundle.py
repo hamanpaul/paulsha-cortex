@@ -182,7 +182,8 @@ def test_repository_bundle_installs_exact_clean_commit_and_detects_drift(
     _git("config", "user.email", "qualification@example.invalid", cwd=source)
     _git("config", "user.name", "Qualification", cwd=source)
     (source / "README.md").write_text("exact source\n", encoding="utf-8")
-    _git("add", "README.md", cwd=source)
+    (source / "CURRENT.md").symlink_to("README.md")
+    _git("add", "README.md", "CURRENT.md", cwd=source)
     _git("commit", "-qm", "fixture", cwd=source)
     commit = _git("rev-parse", "HEAD", cwd=source)
     bundle = tmp_path / "source.bundle"
@@ -210,6 +211,7 @@ def test_repository_bundle_installs_exact_clean_commit_and_detects_drift(
     assert outcome["clean"] is True
     assert outcome["integrity"] is True
     assert outcome["tree_safe"] is True
+    assert (installed / "CURRENT.md").readlink() == Path("README.md")
 
     (installed / "README.md").write_text("drift\n", encoding="utf-8")
     assert backend.inspect_step(step)["installed_sha256"] is None

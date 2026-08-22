@@ -423,7 +423,10 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
             if (
                 candidate_state.st_uid != expected_uid
                 or candidate_state.st_gid != expected_gid
-                or stat.S_IMODE(candidate_state.st_mode) & 0o002
+                or (
+                    not stat.S_ISLNK(candidate_state.st_mode)
+                    and stat.S_IMODE(candidate_state.st_mode) & 0o002
+                )
             ):
                 tree_safe = False
                 break
