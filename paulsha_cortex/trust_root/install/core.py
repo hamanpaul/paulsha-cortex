@@ -298,6 +298,11 @@ _REPO_IDENTITY_KEYS = frozenset({"remote", "commit"})
 _ACCOUNT_CONFIG_KEYS = frozenset({"uid", "gid", "home", "shell"})
 _ROOT_CONFIG_KEYS = frozenset({"deploy", "state", "systemd", "polkit"})
 _PROVIDER_KEYS = frozenset({"builder", "reviewer-planner", "manager"})
+_PROVIDER_ALLOWLIST = {
+    "builder": frozenset({"codex"}),
+    "reviewer-planner": frozenset({"codex", "agy", "copilot"}),
+    "manager": frozenset({"github"}),
+}
 
 
 def _require_exact_keys(
@@ -381,11 +386,29 @@ def _validate_install_config_schema(config: Mapping[str, object]) -> None:
     _require_exact_keys(
         config.get("roots"), label="roots", required=_ROOT_CONFIG_KEYS
     )
-    _require_exact_keys(
+    providers = _require_exact_keys(
         config.get("providers"),
         label="providers",
         required=_PROVIDER_KEYS,
     )
+    for principal in sorted(_PROVIDER_KEYS):
+        configured = providers[principal]
+        if type(configured) is not list:
+            raise InstallPlanError(f"providers.{principal} must be a list")
+        if not configured:
+            raise InstallPlanError(f"providers.{principal} must not be empty")
+        if any(type(provider) is not str for provider in configured):
+            raise InstallPlanError(
+                f"providers.{principal} entries must be strings"
+            )
+        if len(configured) != len(set(configured)):
+            raise InstallPlanError(
+                f"providers.{principal} contains a duplicate"
+            )
+        if any(provider not in _PROVIDER_ALLOWLIST[principal] for provider in configured):
+            raise InstallPlanError(
+                f"provider is not allowed for {principal}"
+            )
 
     toolchain = config.get("toolchain")
     if not isinstance(toolchain, Mapping) or not toolchain:
@@ -1666,7 +1689,7 @@ class InstallReceipt:
 
     def _persist(self) -> None:
         if self.path is not None:
-            atomic_write_json(self.path, self._document, mode=0o600)
+            _atomic_write_receipt_json(self.path, self._document)
 
     @classmethod
     def load(cls, path: Path) -> "InstallReceipt":
@@ -1675,8 +1698,7 @@ class InstallReceipt:
         parent_fd: int | None = None
         receipt_fd: int | None = None
         try:
-            parent_fd, leaf = _open_parent_directory(path)
-            _validate_receipt_parent(os.fstat(parent_fd), path.parent)
+            parent_fd, leaf = _open_receipt_parent_directory(path)
             receipt_fd = os.open(
                 leaf,
                 os.O_RDONLY
@@ -1886,7 +1908,8 @@ def _validate_receipt_parent(observed: os.stat_result, path: Path) -> None:
         or stat.S_IMODE(observed.st_mode) & 0o022
     ):
         raise InstallError(
-            f"receipt parent must be canonical, root-owned, and non-writable: {path}"
+            "receipt parent/ancestor must be canonical, root-owned, and "
+            f"non-writable: {path}"
         )
 
 
@@ -1897,6 +1920,143 @@ def _validate_receipt_file(observed: os.stat_result, path: Path) -> None:
         )
     if observed.st_uid != 0 or stat.S_IMODE(observed.st_mode) != 0o600:
         raise InstallError(f"receipt must be root-owned mode 0600: {path}")
+
+
+def _open_receipt_parent_directory(
+    path: Path, *, create: bool = False
+) -> tuple[int, str]:
+    """Open receipt authority while validating every pathname component.
+
+    A trusted direct parent is insufficient when an attacker-writable ancestor
+    can replace it.  Each component is therefore opened relative to the held
+    predecessor, checked before traversal continues, and the final descriptor
+    is rebound to the canonical pathname before it is returned.
+    """
+
+    if not path.is_absolute() or ".." in path.parts or not path.name:
+        raise UnsafeInstallPathError(f"unsafe receipt authority path: {path}")
+    descriptor = os.open("/", _DIRECTORY_OPEN_FLAGS)
+    current = Path("/")
+    try:
+        _validate_receipt_parent(os.fstat(descriptor), current)
+        for component in path.parent.parts[1:]:
+            current /= component
+            try:
+                next_descriptor = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                try:
+                    next_descriptor = os.open(
+                        component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                    )
+                except OSError as exc:
+                    raise UnsafeInstallPathError(
+                        f"receipt authority contains an unsafe component: {current}"
+                    ) from exc
+            except OSError as exc:
+                raise UnsafeInstallPathError(
+                    f"receipt authority contains an unsafe component: {current}"
+                ) from exc
+            try:
+                _validate_receipt_parent(os.fstat(next_descriptor), current)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+        if path.parent != Path("/"):
+            _assert_fd_path_binding(path.parent, descriptor, directory=True)
+        return descriptor, path.name
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise InstallError("receipt checkpoint write made no progress")
+        view = view[written:]
+
+
+def _atomic_write_receipt_json(path: Path, value: object) -> None:
+    """Publish one receipt checkpoint beneath a held, trusted parent fd."""
+
+    parent_fd: int | None = None
+    existing_fd: int | None = None
+    temporary_fd: int | None = None
+    temporary_name: str | None = None
+    try:
+        parent_fd, leaf = _open_receipt_parent_directory(path, create=True)
+        try:
+            existing_fd = os.open(
+                leaf,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError:
+            existing_fd = None
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"cannot safely open existing receipt authority: {path}"
+            ) from exc
+        if existing_fd is not None:
+            _validate_receipt_file(os.fstat(existing_fd), path)
+            _assert_fd_path_binding(path, existing_fd, directory=False)
+
+        for _attempt in range(32):
+            temporary_name = f".{leaf}.{uuid.uuid4().hex}.tmp"
+            try:
+                temporary_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if temporary_fd is None or temporary_name is None:
+            raise InstallError("cannot allocate a receipt checkpoint file")
+        os.fchmod(temporary_fd, 0o600)
+        _validate_receipt_file(os.fstat(temporary_fd), path)
+        _write_all(temporary_fd, _canonical_bytes(value))
+        os.fsync(temporary_fd)
+        os.replace(
+            temporary_name,
+            leaf,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        _assert_fd_path_binding(path, temporary_fd, directory=False)
+    finally:
+        if temporary_name is not None and parent_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if existing_fd is not None:
+            os.close(existing_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def atomic_write_json(path: Path, value: object, *, mode: int = 0o600) -> None:

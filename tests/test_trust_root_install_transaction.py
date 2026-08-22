@@ -627,6 +627,12 @@ def test_rollback_persists_each_reversed_entry_and_recovers_after_persist_crash(
     plan = _plan(tmp_path)
     backend = RecordingBackend(plan)
     receipt_path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
     receipt = new_install_receipt(plan, path=receipt_path)
     apply_plan(
         plan,
@@ -650,12 +656,6 @@ def test_rollback_persists_each_reversed_entry_and_recovers_after_persist_crash(
         rollback_receipt(receipt, backend=backend)
 
     assert backend.rolled_back == ["manager-unit"]
-    monkeypatch.setattr(
-        install_core, "_validate_receipt_parent", lambda _observed, _path: None
-    )
-    monkeypatch.setattr(
-        install_core, "_validate_receipt_file", lambda _observed, _path: None
-    )
     recovered = InstallReceipt.load(receipt_path)
     assert [row["step_id"] for row in recovered.to_dict()["journal"]] == [
         "state-root",
@@ -823,10 +823,17 @@ def test_rollback_does_not_overwrite_post_install_drift(tmp_path: Path) -> None:
 
 
 def test_receipt_load_rejects_non_root_or_non_private_authority_file(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = (tmp_path / "receipt.json").absolute()
-    new_install_receipt(_plan(tmp_path), path=path)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    with monkeypatch.context() as create_authority:
+        create_authority.setattr(
+            install_core, "_validate_receipt_file", lambda _observed, _path: None
+        )
+        new_install_receipt(_plan(tmp_path), path=path)
     path.chmod(0o666)
 
     with pytest.raises(Exception, match="root-owned|0600"):
@@ -839,11 +846,116 @@ def _root_owned_stat(observed: os.stat_result) -> os.stat_result:
     return os.stat_result(values)
 
 
+def test_new_receipt_rejects_an_attacker_writable_parent_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = tmp_path / "attacker-writable"
+    authority.mkdir(mode=0o777)
+    authority.chmod(0o777)
+    path = (authority / "receipt.json").absolute()
+    real_validate = install_core._validate_receipt_parent
+
+    def validate_target_parent(observed: os.stat_result, candidate: Path) -> None:
+        if candidate == authority:
+            real_validate(observed, candidate)
+
+    # The pytest root is intentionally user-writable.  Bypass only those test
+    # harness ancestors so this case specifically exercises the target parent.
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", validate_target_parent
+    )
+
+    with pytest.raises(InstallError, match="root-owned.*non-writable"):
+        new_install_receipt(_plan(tmp_path), path=path)
+
+    assert not path.exists()
+
+
+def test_new_receipt_validates_the_complete_ancestor_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writable_ancestor = tmp_path / "attacker-writable"
+    authority = writable_ancestor / "root-owned-child"
+    authority.mkdir(parents=True, mode=0o700)
+    writable_ancestor.chmod(0o777)
+    checked: list[Path] = []
+
+    def reject_writable_ancestor(_observed: os.stat_result, path: Path) -> None:
+        checked.append(path)
+        if path == writable_ancestor:
+            raise InstallError(
+                f"receipt authority must be root-owned and non-writable: {path}"
+            )
+
+    monkeypatch.setattr(
+        install_core,
+        "_validate_receipt_parent",
+        reject_writable_ancestor,
+        raising=False,
+    )
+
+    with pytest.raises(InstallError, match="root-owned.*non-writable"):
+        new_install_receipt(_plan(tmp_path), path=(authority / "receipt.json").absolute())
+
+    assert writable_ancestor in checked
+
+
+def test_every_receipt_checkpoint_fails_closed_on_parent_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = tmp_path / "authority"
+    authority.mkdir(mode=0o700)
+    receipt_path = (authority / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None,
+        raising=False,
+    )
+    receipt = new_install_receipt(_plan(tmp_path), path=receipt_path)
+    displaced = tmp_path / "displaced-authority"
+    external = tmp_path / "external"
+    external.mkdir()
+    real_replace = os.replace
+    swapped = False
+
+    def replace_after_parent_swap(source, destination, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            authority.rename(displaced)
+            authority.symlink_to(external, target_is_directory=True)
+            if kwargs.get("src_dir_fd") is None:
+                # Reproduce the pathname writer vulnerability: an attacker can
+                # supply the same temporary leaf after replacing an ancestor.
+                old_source = displaced / Path(source).name
+                (external / Path(source).name).write_bytes(old_source.read_bytes())
+            swapped = True
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(install_core.os, "replace", replace_after_parent_swap)
+    receipt._document["state"] = "applying"
+
+    with pytest.raises(UnsafeInstallPathError, match="changed|replaced|unsafe"):
+        receipt._persist()
+
+    assert swapped
+    assert not (external / receipt_path.name).exists()
+
+
 def test_receipt_load_rejects_non_root_owned_parent_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = (tmp_path / "receipt.json").absolute()
-    new_install_receipt(_plan(tmp_path), path=path)
+    with monkeypatch.context() as create_authority:
+        create_authority.setattr(
+            install_core, "_validate_receipt_parent", lambda _observed, _path: None
+        )
+        create_authority.setattr(
+            install_core, "_validate_receipt_file", lambda _observed, _path: None
+        )
+        new_install_receipt(_plan(tmp_path), path=path)
     real_lstat = Path.lstat
 
     def root_owned_leaf(candidate: Path):
@@ -864,6 +976,14 @@ def test_receipt_load_fails_closed_when_leaf_is_replaced_after_fd_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None,
+        raising=False,
+    )
     new_install_receipt(_plan(tmp_path), path=path)
     displaced = tmp_path / "displaced-receipt.json"
     external = tmp_path / "external-receipt.json"
@@ -886,15 +1006,6 @@ def test_receipt_load_fails_closed_when_leaf_is_replaced_after_fd_read(
 
     monkeypatch.setattr(Path, "lstat", root_owned_leaf)
     monkeypatch.setattr(install_core.json, "loads", loads_and_swap)
-    monkeypatch.setattr(
-        install_core, "_validate_receipt_parent", lambda _observed, _path: None,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        install_core, "_validate_receipt_file", lambda _observed, _path: None,
-        raising=False,
-    )
-
     with pytest.raises(UnsafeInstallPathError, match="changed|replaced|symlink"):
         InstallReceipt.load(path)
 

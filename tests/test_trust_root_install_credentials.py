@@ -617,6 +617,12 @@ def test_loaded_prepared_activation_rolls_back_attempted_service_after_crash(
     plan = _plan()
     backend = CredentialBackend()
     receipt_path = (tmp_path / "activation-receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
     receipt = new_install_receipt(plan, path=receipt_path)
     apply_plan(
         plan,
@@ -638,12 +644,6 @@ def test_loaded_prepared_activation_rolls_back_attempted_service_after_crash(
         activate_receipt(receipt, backend=backend)
 
     assert backend.started == ["cortex-egress-proxy.service"]
-    monkeypatch.setattr(
-        install_core, "_validate_receipt_parent", lambda _observed, _path: None
-    )
-    monkeypatch.setattr(
-        install_core, "_validate_receipt_file", lambda _observed, _path: None
-    )
     recovered = InstallReceipt.load(receipt_path)
     assert recovered.to_dict()["activation_journal"] == [
         {"service": "cortex-egress-proxy.service", "status": "prepared"}

@@ -305,6 +305,65 @@ def test_new_install_rejects_every_non_four_way_scheme(
 
 
 @pytest.mark.parametrize(
+    ("providers", "message"),
+    [
+        ([], "providers must be an object"),
+        (
+            {"builder": "codex", "reviewer-planner": ["agy"], "manager": ["github"]},
+            "providers.builder must be a list",
+        ),
+        (
+            {"builder": ["codex", 7], "reviewer-planner": ["agy"], "manager": ["github"]},
+            "providers.builder entries must be strings",
+        ),
+        (
+            {"builder": ["github"], "reviewer-planner": ["agy"], "manager": ["github"]},
+            "provider is not allowed for builder",
+        ),
+        (
+            {"builder": ["codex"], "reviewer-planner": ["agy", "agy"], "manager": ["github"]},
+            "providers.reviewer-planner contains a duplicate",
+        ),
+        (
+            {"builder": ["codex"], "reviewer-planner": ["agy"], "manager": []},
+            "providers.manager must not be empty",
+        ),
+    ],
+)
+def test_plan_rejects_malformed_or_unauthorized_provider_manifests(
+    tmp_path: Path, providers: object, message: str
+) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    config = _safe_config(tmp_path)
+    config["providers"] = deepcopy(providers)
+
+    with pytest.raises(InstallPlanError, match=message):
+        build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
+
+
+def test_plan_provider_manifest_accepts_only_allowlisted_four_way_pairs(
+    tmp_path: Path,
+) -> None:
+    config = _safe_config(tmp_path)
+    config["providers"] = {
+        "builder": ["codex"],
+        "reviewer-planner": ["codex", "agy", "copilot"],
+        "manager": ["github"],
+    }
+
+    plan, document = _plan_document(tmp_path, config)
+
+    assert document["provider_manifest"] == config["providers"]
+    assert plan["required_credentials"] == [
+        {"principal": "builder", "provider": "codex"},
+        {"principal": "manager", "provider": "github"},
+        {"principal": "reviewer-planner", "provider": "codex"},
+        {"principal": "reviewer-planner", "provider": "agy"},
+        {"principal": "reviewer-planner", "provider": "copilot"},
+    ]
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("github_token", "test-secret-value"),
