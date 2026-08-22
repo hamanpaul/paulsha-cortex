@@ -1199,7 +1199,9 @@ def build_install_plan(
     state_root = Path(roots["state"])
     wheel_prefix = str(plan["candidate"]["wheel_sha256"])[:12]  # type: ignore[index]
     plan["receipt_path"] = str(
-        state_root / "install-receipts" / f"{commit.lower()}-{wheel_prefix}.json"
+        state_root.parent
+        / f"{state_root.name}-install-receipts"
+        / f"{commit.lower()}-{wheel_prefix}.json"
     )
     _assert_managed_parent_topology(plan)
     return plan
@@ -2372,6 +2374,62 @@ def _validate_operations(step: Mapping[str, object]) -> None:
             raise InstallPlanError("ACL must be applied after chown and chmod")
 
 
+def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str, object]]:
+    """Revalidate serialized plan authority immediately before mutation."""
+
+    if plan.get("schema_version") != 1 or plan.get("scheme") != "four-way":
+        raise InstallPlanError("apply requires a schema_version=1 four-way plan")
+    repo_identity = plan.get("repo_identity")
+    commit = repo_identity.get("commit") if isinstance(repo_identity, Mapping) else None
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in commit)
+    ):
+        raise InstallPlanError("plan repo identity is invalid")
+    candidate = plan.get("candidate")
+    if not isinstance(candidate, Mapping) or any(
+        not _valid_sha256(candidate.get(field))
+        for field in ("wheel_sha256", "bundle_sha256")
+    ):
+        raise InstallPlanError("plan candidate identity is invalid")
+    for field in ("accounts", "required_credentials"):
+        if not isinstance(plan.get(field), list):
+            raise InstallPlanError(f"plan {field} must be a list")
+    service_accounts = plan.get("service_accounts", [])
+    if not isinstance(service_accounts, list):
+        raise InstallPlanError("plan service_accounts must be a list")
+    steps = plan.get("apply_order")
+    if not isinstance(steps, list):
+        raise InstallPlanError("apply_order must be a list")
+    typed_steps: list[Mapping[str, object]] = []
+    seen_step_ids: set[str] = set()
+    for step in steps:
+        if not isinstance(step, Mapping) or step.get("kind") not in {
+            "account",
+            "asset",
+            "systemctl",
+            "venv",
+            "toolchain",
+            "repository",
+        }:
+            raise InstallPlanError(f"unknown or untyped apply step kind: {step!r}")
+        step_id = step.get("step_id")
+        if (
+            not isinstance(step_id, str)
+            or not step_id
+            or step_id in seen_step_ids
+        ):
+            raise InstallPlanError("apply steps require unique non-empty step_id values")
+        if not _valid_sha256(step.get("desired_sha256")):
+            raise InstallPlanError(f"apply step desired hash is invalid: {step_id}")
+        seen_step_ids.add(step_id)
+        _validate_operations(step)
+        typed_steps.append(step)
+    _assert_managed_parent_topology(plan)
+    return typed_steps
+
+
 def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
     if not state.get("exists"):
         return False
@@ -2407,6 +2465,24 @@ def _observed_mount_authority(
     ):
         return None
     return {"device": device, "inode": inode}
+
+
+def _assert_journal_mount_authority(
+    *,
+    entry: Mapping[str, object],
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> None:
+    authority = entry.get("adopted_mount_root")
+    if authority is None:
+        return
+    if (
+        not _valid_mount_adoption_authority(authority, step=step)
+        or _observed_mount_authority(installed) != dict(authority)
+    ):
+        raise InstallDriftError(
+            f"adopted mount authority drifted: {step.get('step_id')}"
+        )
 
 
 def _valid_mount_adoption_authority(
@@ -2741,20 +2817,7 @@ def apply_plan(
     expected_hash = plan_sha256(plan)
     if confirm_sha256 != expected_hash or receipt._document.get("plan_sha256") != expected_hash:
         raise InstallPlanError("confirm-sha256 does not match the canonical plan sha256")
-    steps = plan.get("apply_order", [])
-    if not isinstance(steps, list):
-        raise InstallPlanError("apply_order must be a list")
-    for step in steps:
-        if not isinstance(step, Mapping) or step.get("kind") not in {
-            "account",
-            "asset",
-            "systemctl",
-            "venv",
-            "toolchain",
-            "repository",
-        }:
-            raise InstallPlanError(f"unknown or untyped apply step kind: {step!r}")
-        _validate_operations(step)
+    steps = _validate_apply_plan_schema(plan)
     facts = backend.preflight_facts(plan)
     report = validate_preflight(plan, facts, receipt=receipt)
     if not report.ok:
@@ -2772,6 +2835,9 @@ def apply_plan(
         if step_id in completed:
             entry = completed[step_id]
             installed = backend.inspect_step(step)
+            _assert_journal_mount_authority(
+                entry=entry, step=step, installed=installed
+            )
             if _state_matches(step, installed) and not (
                 entry.get("status") == "prepared"
                 and _prepared_step_requires_replay(step)

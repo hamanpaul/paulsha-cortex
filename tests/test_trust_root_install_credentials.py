@@ -35,6 +35,12 @@ def _plan(*, required_credentials=None) -> dict[str, object]:
             "bundle_sha256": "c" * 64,
         },
         "accounts": [],
+        "roots": {
+            "deploy": "/opt/cortex",
+            "state": "/var/lib/cortex",
+            "systemd": "/etc/systemd/system",
+            "polkit": "/etc/polkit-1/rules.d",
+        },
         "apply_order": [],
         "required_credentials": required_credentials or [],
     }

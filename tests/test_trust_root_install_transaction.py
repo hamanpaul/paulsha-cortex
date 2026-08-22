@@ -82,6 +82,7 @@ def _step(tmp_path: Path, step_id: str, digest: str) -> dict[str, object]:
 
 
 def _plan(tmp_path: Path) -> dict[str, object]:
+    target = tmp_path / "target"
     return {
         "schema_version": 1,
         "scheme": "four-way",
@@ -91,6 +92,12 @@ def _plan(tmp_path: Path) -> dict[str, object]:
             "bundle_sha256": "c" * 64,
         },
         "accounts": _accounts(tmp_path),
+        "roots": {
+            "deploy": str(target / "deploy"),
+            "state": str(target / "state-root"),
+            "systemd": str(target / "systemd"),
+            "polkit": str(target / "polkit"),
+        },
         "required_credentials": [],
         "apply_order": [
             _step(tmp_path, "state-root", "1" * 64),
@@ -523,7 +530,7 @@ def test_first_install_adopts_exact_empty_managed_state_mount(tmp_path: Path) ->
             "durable": True,
         }
     )
-    plan["roots"] = {"state": step["path"]}
+    plan["roots"]["state"] = step["path"]
     plan["apply_order"] = [step]
     backend = RecordingBackend(plan)
     backend.states[step["step_id"]] = {
@@ -585,7 +592,7 @@ def test_first_install_refuses_unqualified_managed_state_root_adoption(
             "durable": True,
         }
     )
-    plan["roots"] = {"state": step["path"]}
+    plan["roots"]["state"] = step["path"]
     plan["apply_order"] = [step]
     backend = RecordingBackend(plan)
     backend.states[step["step_id"]] = {
@@ -626,7 +633,7 @@ def test_default_receipt_bootstrap_is_the_only_allowed_nonempty_mount(
             "durable": True,
         }
     )
-    plan["roots"] = {"state": step["path"]}
+    plan["roots"]["state"] = step["path"]
     plan["apply_order"] = [step]
     receipt_path = Path(str(step["path"])) / "install-receipts/install.json"
     plan["receipt_path"] = str(receipt_path)
@@ -666,7 +673,7 @@ def test_mount_adoption_provenance_rejects_replaced_root(
             "durable": True,
         }
     )
-    plan["roots"] = {"state": step["path"]}
+    plan["roots"]["state"] = step["path"]
     plan["apply_order"] = [step]
     backend = RecordingBackend(plan)
     backend.states[step["step_id"]] = {
@@ -712,6 +719,62 @@ def test_mount_adoption_provenance_rejects_replaced_root(
 
     assert backend.applied == [step["step_id"]]
     assert receipt.to_dict()["journal"] == []
+
+
+@pytest.mark.parametrize("status", ["prepared", "completed"])
+@pytest.mark.parametrize("is_mountpoint", [False, True])
+def test_mount_adoption_journal_revalidates_inode_before_short_circuit(
+    tmp_path: Path, status: str, is_mountpoint: bool
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    plan["roots"]["state"] = step["path"]
+    plan["apply_order"] = [step]
+    backend = RecordingBackend(plan)
+    exact_state = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+        "is_mountpoint": True,
+        "device": 8,
+        "inode": 42,
+        "children": [],
+    }
+    backend.states[step["step_id"]] = deepcopy(exact_state)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    receipt._document["journal"][0]["status"] = status
+    backend.states[step["step_id"]] = {
+        **exact_state,
+        "is_mountpoint": is_mountpoint,
+        "device": 9,
+        "inode": 84,
+    }
+
+    with pytest.raises(InstallDriftError, match="mount.*authority|adopted.*mount"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == [step["step_id"]]
 
 
 @pytest.mark.parametrize("kind", ["asset", "repository"])
@@ -986,6 +1049,7 @@ def test_prepared_prior_absent_does_not_delete_third_party_leaf_without_authorit
         step["content"] = "planned\n"
     plan = _plan(tmp_path)
     plan["accounts"] = []
+    plan["roots"]["deploy"] = str(tmp_path / "deploy")
     plan["apply_order"] = [step]
     receipt = new_install_receipt(plan)
     receipt._document["state"] = "applying"

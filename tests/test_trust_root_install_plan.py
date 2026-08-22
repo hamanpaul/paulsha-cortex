@@ -16,9 +16,11 @@ import pytest
 from paulsha_cortex.trust_root.install import (
     InstallPlanError,
     UnsafeInstallPathError,
+    apply_plan,
     bind_bundle_artifacts,
     build_install_plan,
     canonical_plan_bytes,
+    new_install_receipt,
     plan_sha256,
 )
 from paulsha_cortex.trust_root.install import cli as install_cli
@@ -245,6 +247,103 @@ def test_plan_topology_guard_rejects_an_unmanaged_intermediate_parent(
 
     with pytest.raises(InstallPlanError, match="unmanaged immediate parent"):
         install_core._assert_managed_parent_topology(plan)
+
+
+def test_apply_revalidates_serialized_plan_topology_before_backend_mutation(
+    tmp_path: Path,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    serialized = json.loads(canonical_plan_bytes(plan))
+    missing = f"{serialized['roots']['state']}/runtime/codex-home"
+    serialized["apply_order"] = [
+        step for step in serialized["apply_order"] if step.get("path") != missing
+    ]
+
+    class MutationSentinelBackend:
+        def __init__(self) -> None:
+            self.applied: list[str] = []
+
+        def preflight_facts(self, candidate):
+            return {
+                "systemd": True,
+                "polkit": True,
+                "cgroup_v2": True,
+                "acl": True,
+                "disk_free_bytes": 2 * 1024 * 1024 * 1024,
+                "universal_nopasswd": False,
+                "in_flight_jobs": 0,
+                "services": {
+                    "cortex-egress-proxy.service": "inactive",
+                    "cortex-manager.service": "inactive",
+                    "cortex-monitor.service": "inactive",
+                },
+                "accounts": {},
+                "paths": {
+                    step["path"]: {"exists": False, "is_symlink": False}
+                    for step in candidate["apply_order"]
+                    if "path" in step
+                },
+            }
+
+        def inspect_step(self, _step):
+            return {"exists": False}
+
+        def apply_step(self, step):
+            self.applied.append(str(step["step_id"]))
+            raise AssertionError("schema guard ran after privileged mutation")
+
+    backend = MutationSentinelBackend()
+    receipt = new_install_receipt(serialized)
+
+    with pytest.raises(InstallPlanError, match="unmanaged immediate parent"):
+        apply_plan(
+            serialized,
+            confirm_sha256=plan_sha256(serialized),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+
+
+@pytest.mark.parametrize("mounted", [False, True])
+def test_default_receipt_does_not_populate_the_managed_state_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mounted: bool
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    state_root = Path(plan["roots"]["state"])
+    if mounted:
+        state_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    receipt_path = Path(plan["receipt_path"])
+    receipt = new_install_receipt(plan, path=receipt_path)
+
+    assert receipt_path.is_file()
+    assert not receipt_path.is_relative_to(state_root)
+    if mounted:
+        assert list(state_root.iterdir()) == []
+        state_step = next(
+            step for step in plan["apply_order"] if step.get("path") == str(state_root)
+        )
+        assert install_core._explicit_empty_managed_mount_is_adoptable(
+            plan=plan,
+            step=state_step,
+            installed={
+                "is_mountpoint": True,
+                "device": 8,
+                "inode": 42,
+                "children": [],
+            },
+            receipt=receipt,
+        )
+    else:
+        assert not state_root.exists()
 
 
 def test_bundle_binding_preserves_repo_container_and_installs_named_leaf(
