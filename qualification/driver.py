@@ -56,6 +56,11 @@ def _canonical_bytes(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def _canonical_json_hash(value: object) -> str:
+    content = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(content).hexdigest()
+
+
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -1257,8 +1262,58 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
     return verdicts
 
 
+def _require_installed_manager_gitconfig(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise QualificationFailure("installed Manager gitconfig is absent or a symlink")
+    metadata = path.stat()
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise QualificationFailure("installed Manager gitconfig is not root-controlled")
+
+
+def _parse_remote_refs(output: str) -> list[tuple[str, str]]:
+    refs: list[tuple[str, str]] = []
+    for raw in output.splitlines():
+        sha, separator, ref = raw.partition("\t")
+        if not separator or SHA40.fullmatch(sha) is None or not ref.startswith("refs/"):
+            raise QualificationFailure("Manager probe returned malformed remote refs")
+        refs.append((ref, sha))
+    if not refs or len({ref for ref, _sha in refs}) != len(refs):
+        raise QualificationFailure(
+            "Manager probe returned empty or duplicate remote refs"
+        )
+    return sorted(refs)
+
+
+_CREDENTIAL_FILL_PROBE = r"""
+import subprocess
+import sys
+
+result = subprocess.run(
+    ["/usr/bin/git", "credential", "fill"],
+    input="protocol=https\nhost=github.com\n\n",
+    text=True,
+    capture_output=True,
+    check=False,
+)
+if result.returncode != 0:
+    raise SystemExit(2)
+fields = {}
+for line in result.stdout.splitlines():
+    key, separator, value = line.partition("=")
+    if separator:
+        fields[key] = value
+if not fields.get("username") or not fields.get("password"):
+    raise SystemExit(3)
+sys.stdout.write("credential-ok\n")
+""".strip()
+
+
 def _manager_github_probe(
-    repository: str, candidate_sha: str, evidence_dir: Path
+    repository: str,
+    candidate_sha: str,
+    evidence_dir: Path,
+    *,
+    source_repo: Path = Path("/var/lib/cortex/repos/paulsha-cortex"),
 ) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise QualificationFailure(
@@ -1266,20 +1321,55 @@ def _manager_github_probe(
         )
     account = "cortex-manager"
     env = _account_env(account)
+    gitconfig = Path(env["HOME"]) / ".gitconfig"
+    _require_installed_manager_gitconfig(gitconfig)
+    helper = _run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(source_repo),
+            "config",
+            "--show-origin",
+            "--show-scope",
+            "--get-all",
+            "credential.helper",
+        ),
+        user=account,
+        env=env,
+        timeout=30,
+    )
+    _require_success(helper, "Manager installed credential helper inventory")
+    helper_rows = [line.split("\t", 2) for line in helper.stdout.splitlines()]
+    expected_origin = f"file:{gitconfig}"
+    if helper_rows != [["global", expected_origin, "!/usr/bin/gh auth git-credential"]]:
+        raise QualificationFailure(
+            "Manager effective credential helper is not the unique installed helper"
+        )
     auth = _run(("/usr/bin/gh", "auth", "status"), user=account, env=env, timeout=45)
     _require_success(auth, "Manager gh auth status")
+    credential = _run(
+        ("/usr/bin/python3", "-c", _CREDENTIAL_FILL_PROBE),
+        user=account,
+        env=env,
+        timeout=45,
+    )
+    if (
+        credential.returncode != 0
+        or credential.stdout != "credential-ok\n"
+        or credential.stderr
+    ):
+        raise QualificationFailure("Manager secret-safe credential probe failed")
     remote = f"https://github.com/{repository}.git"
     before = _run(
         ("/usr/bin/git", "ls-remote", remote), user=account, env=env, timeout=60
     )
     _require_success(before, "Manager probe repo ls-remote before")
+    before_refs = _parse_remote_refs(before.stdout)
     dry_run = _run(
         (
             "/usr/bin/git",
-            "-c",
-            "credential.helper=!/usr/bin/gh auth git-credential",
             "-C",
-            "/var/lib/cortex/repos/paulsha-cortex",
+            str(source_repo),
             "push",
             "--dry-run",
             remote,
@@ -1294,8 +1384,11 @@ def _manager_github_probe(
         ("/usr/bin/git", "ls-remote", remote), user=account, env=env, timeout=60
     )
     _require_success(after, "Manager probe repo ls-remote after")
-    if before.stdout != after.stdout:
+    after_refs = _parse_remote_refs(after.stdout)
+    if before_refs != after_refs:
         raise QualificationFailure("Manager dry-run push changed remote refs")
+    before_bytes = _canonical_bytes(before_refs)
+    after_bytes = _canonical_bytes(after_refs)
     _write_json(
         evidence_dir / "manager-github-auth.json",
         {
@@ -1305,9 +1398,402 @@ def _manager_github_probe(
             "authenticated": True,
             "dry_run": True,
             "remote_refs_unchanged": True,
-            "before_sha256": hashlib.sha256(before.stdout.encode()).hexdigest(),
-            "after_sha256": hashlib.sha256(after.stdout.encode()).hexdigest(),
+            "before_sha256": hashlib.sha256(before_bytes).hexdigest(),
+            "after_sha256": hashlib.sha256(after_bytes).hexdigest(),
         },
+    )
+
+
+def _manager_uid() -> int:
+    try:
+        return pwd.getpwnam("cortex-manager").pw_uid
+    except KeyError as exc:
+        raise QualificationFailure("Manager service account is absent") from exc
+
+
+def _manager_file(path: Path, *, label: str, root: Path | None = None) -> bytes:
+    if root is not None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise QualificationFailure(f"{label} escapes Manager state root") from exc
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise QualificationFailure(f"{label} contains a symlink")
+    if path.is_symlink() or not path.is_file():
+        raise QualificationFailure(f"{label} is absent or not a regular file")
+    metadata = path.stat()
+    if metadata.st_uid != _manager_uid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise QualificationFailure(f"{label} is not Manager-controlled")
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise QualificationFailure(f"{label} is unreadable") from exc
+
+
+def _json_object(content: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QualificationFailure(f"{label} is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise QualificationFailure(f"{label} must be a JSON object")
+    return payload
+
+
+def _bound_relative_json(
+    root: Path, locator: object, *, label: str
+) -> tuple[dict[str, Any], Path, str]:
+    if not isinstance(locator, dict) or set(locator) != {"kind", "path", "hash"}:
+        raise QualificationFailure(f"{label} locator is malformed")
+    relative = Path(str(locator["path"]))
+    digest = locator.get("hash")
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.parts[:2] != ("evidence", "workflow")
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+    ):
+        raise QualificationFailure(f"{label} locator is unsafe")
+    path = root / relative
+    content = _manager_file(path, label=label, root=root)
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != digest:
+        raise QualificationFailure(f"{label} hash mismatch")
+    return _json_object(content, label=label), path, actual
+
+
+def _artifact_row(path: Path, *, state_root: Path) -> dict[str, str]:
+    try:
+        relative = path.relative_to(state_root).as_posix()
+    except ValueError as exc:
+        raise QualificationFailure(
+            "dispatch artifact escapes Cortex state root"
+        ) from exc
+    return {"path": relative, "sha256": _sha256(path)}
+
+
+def _terminal_named_values(value: object, name: str) -> set[str]:
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == name and isinstance(item, str):
+                found.add(item)
+            found.update(_terminal_named_values(item, name))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_terminal_named_values(item, name))
+    return found
+
+
+def _validate_dispatch_closeout(
+    *,
+    repository: str,
+    work_id: str,
+    issue: int,
+    terminal: object,
+    coordinator_root: Path,
+) -> tuple[list[str], list[dict[str, str]], dict[str, Any]]:
+    root = coordinator_root.resolve()
+    state_root = root.parent
+    registry_path = root / "jobs.json"
+    registry_content = _manager_file(
+        registry_path, label="coordinator registry", root=root
+    )
+    registry = _json_object(registry_content, label="coordinator registry")
+    if registry.get("schema_version") != 2:
+        raise QualificationFailure("coordinator registry schema is not v2")
+    jobs = registry.get("jobs")
+    workflows = registry.get("workflows")
+    if not isinstance(jobs, list) or not isinstance(workflows, list):
+        raise QualificationFailure("coordinator registry collections are malformed")
+    matches = [
+        row
+        for row in workflows
+        if isinstance(row, dict)
+        and row.get("work_id") == work_id
+        and row.get("repo") == repository
+    ]
+    if len(matches) != 1:
+        raise QualificationFailure("coordinator registry has no unique bound workflow")
+    workflow = matches[0]
+    run_id = workflow.get("run_id")
+    candidate = workflow.get("candidate_head")
+    required_phases = ("claim", "define", "plan", "build", "verify", "review", "ship")
+    steps = workflow.get("steps")
+    phase_chain = (
+        [row.get("phase") for row in steps]
+        if isinstance(steps, list) and all(isinstance(row, dict) for row in steps)
+        else []
+    )
+    indexes = [
+        required_phases.index(phase)
+        for phase in phase_chain
+        if phase in required_phases
+    ]
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or SHA40.fullmatch(str(candidate)) is None
+        or workflow.get("verified_head") != candidate
+        or workflow.get("current_phase") != "ship"
+        or workflow.get("status") != "done"
+        or workflow.get("gate_status") != "passed"
+        or workflow.get("facets") not in ([], ())
+        or not isinstance(steps, list)
+        or not all(phase in phase_chain for phase in required_phases)
+        or indexes != sorted(indexes)
+        or any(
+            row.get("gate_result") != "passed" for row in steps if isinstance(row, dict)
+        )
+        or not isinstance(workflow.get("issue_refs"), list)
+        or f"{repository}#{issue}" not in workflow["issue_refs"]
+    ):
+        raise QualificationFailure(
+            "workflow terminal phase chain or candidate binding is invalid"
+        )
+    if _terminal_named_values(terminal, "run_id") not in (
+        {run_id},
+        set(),
+    ) or _terminal_named_values(terminal, "work_id") != {work_id}:
+        raise QualificationFailure(
+            "CLI terminal is not bound to the completed workflow"
+        )
+
+    repo_root = Path(str(workflow.get("workspace_root", "")))
+    candidate_check = _run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(repo_root),
+            "cat-file",
+            "-e",
+            f"{candidate}^{{commit}}",
+        ),
+        user="cortex-manager",
+        env=_account_env("cortex-manager"),
+        timeout=30,
+    )
+    _require_success(candidate_check, "completed workflow candidate object")
+
+    bound_jobs = [
+        row
+        for row in jobs
+        if isinstance(row, dict) and row.get("workflow_run_id") == run_id
+    ]
+    job_phases = {str(row.get("workflow_phase")) for row in bound_jobs}
+    if not {"plan", "build", "verify", "review", "ship"} <= job_phases:
+        raise QualificationFailure("workflow job phase chain is incomplete")
+
+    artifact_paths: list[Path] = [registry_path]
+    verdict_seen = False
+    ledgers_seen = 0
+    for job in bound_jobs:
+        phase = job.get("workflow_phase")
+        if (
+            job.get("workflow_repo") != repository
+            or job.get("status") != "exited"
+            or job.get("exit_code") != 0
+            or phase not in {"plan", "build", "verify", "review", "ship"}
+        ):
+            raise QualificationFailure("workflow job authority binding is invalid")
+        envelope, evidence_path, _digest = _bound_relative_json(
+            root, job.get("workflow_evidence"), label="workflow canonical evidence"
+        )
+        binding = envelope.get("job")
+        if (
+            envelope.get("schema_version") != 1
+            or envelope.get("kind") != phase
+            or not isinstance(binding, dict)
+            or binding.get("job_id") != job.get("job_id")
+            or binding.get("run_id") != run_id
+            or binding.get("claim_key") != job.get("workflow_claim_key")
+            or binding.get("repo") != repository
+            or binding.get("source_revision") != job.get("source_revision")
+            or binding.get("card_id") != job.get("workflow_card")
+            or binding.get("phase") != phase
+        ):
+            raise QualificationFailure("workflow canonical evidence authority mismatch")
+        payload = envelope.get("payload")
+        if not isinstance(payload, dict):
+            raise QualificationFailure(
+                "workflow canonical evidence payload is malformed"
+            )
+        payload_candidate = payload.get("candidate")
+        expected_evidence_candidate = (
+            job.get("subject_head") if phase in {"build", "ship"} else candidate
+        )
+        if phase in {"build", "verify", "review", "ship"} and (
+            SHA40.fullmatch(str(expected_evidence_candidate)) is None
+            or payload_candidate != expected_evidence_candidate
+        ):
+            raise QualificationFailure("workflow evidence candidate mismatch")
+        if phase == "review":
+            if (
+                payload.get("state") != "passed"
+                or payload.get("reviewer_job_id") != job.get("job_id")
+                or not isinstance(payload.get("builder_job_id"), str)
+            ):
+                raise QualificationFailure("workflow review verdict authority mismatch")
+            verdict_seen = True
+        rows = envelope.get("artifacts")
+        if not isinstance(rows, list):
+            raise QualificationFailure(
+                "workflow canonical artifact inventory is malformed"
+            )
+        job_repo_root = Path(str(job.get("workflow_repo_root", ""))).resolve()
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                "path",
+                "sha256",
+                "baseline_sha256",
+            }:
+                raise QualificationFailure(
+                    "workflow canonical artifact locator is malformed"
+                )
+            relative = Path(str(row["path"]))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise QualificationFailure("workflow canonical artifact path is unsafe")
+            output = job_repo_root / relative
+            if (
+                output.is_symlink()
+                or not output.is_file()
+                or _sha256(output) != row.get("sha256")
+            ):
+                raise QualificationFailure(
+                    "workflow canonical artifact is absent or drifted"
+                )
+            artifact_paths.append(output)
+        artifact_paths.append(evidence_path)
+        if phase != "ship":
+            control_value = job.get("control_log_path") or job.get("log_path")
+            if not isinstance(control_value, str) or not control_value:
+                raise QualificationFailure(
+                    "workflow Manager control log binding is absent"
+                )
+            control = Path(control_value)
+            ledger_path = control.with_name(f"{control.stem}.gates.json")
+            ledger = _json_object(
+                _manager_file(ledger_path, label="workflow gate ledger", root=root),
+                label="workflow gate ledger",
+            )
+            if (
+                ledger.get("schema_version") != 1
+                or ledger.get("kind") != "workflow-gate-ledger"
+                or not isinstance(ledger.get("slice_id"), str)
+                or not isinstance(ledger.get("gates"), list)
+            ):
+                raise QualificationFailure("workflow gate ledger schema is invalid")
+            ledgers_seen += 1
+            artifact_paths.append(ledger_path)
+    if not verdict_seen or ledgers_seen == 0:
+        raise QualificationFailure("workflow verdict or Manager gate ledger is absent")
+
+    bundle_seen = False
+    build_jobs = [job for job in bound_jobs if job.get("workflow_phase") == "build"]
+    for job in build_jobs:
+        slot = job.get("template_instance") or job.get("job_id")
+        if (
+            not isinstance(slot, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", slot) is None
+        ):
+            raise QualificationFailure("build commit spool authority is invalid")
+        bundle = root / "commit-spool" / slot / "commits.bundle"
+        if not bundle.exists():
+            continue
+        if bundle.is_symlink() or bundle.parent.is_symlink() or not bundle.is_file():
+            raise QualificationFailure(
+                "build commit bundle is not a regular sealed artifact"
+            )
+        parent_metadata = bundle.parent.stat()
+        if (
+            parent_metadata.st_uid != _manager_uid()
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o222
+        ):
+            raise QualificationFailure("build commit bundle slot is not Manager-sealed")
+        verify = _run(
+            ("/usr/bin/git", "-C", str(repo_root), "bundle", "verify", str(bundle))
+        )
+        _require_success(verify, "build commit bundle verification")
+        heads = _run(("/usr/bin/git", "bundle", "list-heads", str(bundle)))
+        _require_success(heads, "build commit bundle heads")
+        if not any(
+            line.split(maxsplit=1)[0] == job.get("subject_head")
+            for line in heads.stdout.splitlines()
+        ):
+            raise QualificationFailure(
+                "build commit bundle does not carry its job candidate"
+            )
+        bundle_seen = True
+        artifact_paths.append(bundle)
+    if not bundle_seen:
+        raise QualificationFailure("workflow has no verified commit bundle artifact")
+
+    completion_value = workflow.get("completion_record_path")
+    if not isinstance(completion_value, str):
+        raise QualificationFailure("workflow completion record binding is absent")
+    completion_path = Path(completion_value)
+    completion_content = _manager_file(
+        completion_path, label="workflow completion", root=root
+    )
+    completion = _json_object(completion_content, label="workflow completion")
+    completion_hash = _canonical_json_hash(completion)
+    authority = completion.get("work_authority")
+    if (
+        completion_hash != workflow.get("completion_record_hash")
+        or completion.get("candidate") != candidate
+        or workflow.get("completion_record_revision") != candidate
+        or workflow.get("pr_candidate") != candidate
+        or not isinstance(authority, dict)
+        or authority.get("repo") != repository
+        or authority.get("work_id") != work_id
+        or authority.get("run_id") != run_id
+        or issue not in authority.get("mapped_issues", [])
+        or authority.get("merge_commit") != workflow.get("merge_revision")
+    ):
+        raise QualificationFailure(
+            "workflow completion authority/hash binding is invalid"
+        )
+    artifact_paths.append(completion_path)
+
+    worktrees = _run(
+        ("/usr/bin/git", "-C", str(repo_root), "worktree", "list", "--porcelain")
+    )
+    _require_success(worktrees, "source repository worktree inventory")
+    registered = {
+        line.removeprefix("worktree ")
+        for line in worktrees.stdout.splitlines()
+        if line.startswith("worktree ")
+    }
+    for job in build_jobs:
+        path_value = job.get("worktree")
+        if not isinstance(path_value, str) or not path_value:
+            raise QualificationFailure("build worktree binding is absent")
+        worktree = Path(path_value)
+        if worktree.exists() or worktree.is_symlink() or str(worktree) in registered:
+            raise QualificationFailure("build worktree reclaim is incomplete")
+
+    gate_kinds = {
+        row.get("kind")
+        for row in workflow.get("gate_refs", [])
+        if isinstance(row, dict) and SHA256.fullmatch(str(row.get("sha256", "")))
+    }
+    if (
+        "foreign-review" not in gate_kinds
+        or len(gate_kinds & {"copilot", "maintainer-review"}) != 1
+    ):
+        raise QualificationFailure(
+            "workflow independent/delivery gate authority is incomplete"
+        )
+    markers = ["bundle", "candidate", "completion", "evidence", "ledger", "verdict"]
+    unique_paths = sorted(set(artifact_paths))
+    return (
+        markers,
+        [_artifact_row(path, state_root=state_root) for path in unique_paths],
+        workflow,
     )
 
 
@@ -1372,40 +1858,13 @@ def _full_dispatch(
         raise QualificationFailure(
             "full dispatch did not reach terminal closeout before timeout"
         )
-    artifact_rows: list[dict[str, str]] = []
-    markers: set[str] = set()
-    for path in Path("/var/lib/cortex").rglob("*"):
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or path.stat().st_size > 16 * 1024 * 1024
-        ):
-            continue
-        try:
-            content = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if work_id not in content:
-            continue
-        relative = path.relative_to("/var/lib/cortex").as_posix()
-        artifact_rows.append({"path": relative, "sha256": _sha256(path)})
-        lowered = relative.lower()
-        for marker in (
-            "candidate",
-            "bundle",
-            "verdict",
-            "ledger",
-            "evidence",
-            "completion",
-        ):
-            if marker in lowered or marker in content.lower():
-                markers.add(marker)
-    required = {"candidate", "bundle", "verdict", "ledger", "evidence", "completion"}
-    if not required <= markers:
-        raise QualificationFailure(
-            "full dispatch closeout artifact inventory is incomplete: "
-            + ", ".join(sorted(required - markers))
-        )
+    markers, artifact_rows, _workflow = _validate_dispatch_closeout(
+        repository=repository,
+        work_id=work_id,
+        issue=issue,
+        terminal=terminal,
+        coordinator_root=Path(runtime_env["PSC_COORDINATOR_ROOT"]),
+    )
     _write_json(
         evidence_dir / "dispatch-closeout.json",
         {
@@ -1415,7 +1874,7 @@ def _full_dispatch(
             "work_id": work_id,
             "issue": issue,
             "terminal": terminal,
-            "required_markers": sorted(markers),
+            "required_markers": markers,
             "artifacts": artifact_rows,
         },
     )
