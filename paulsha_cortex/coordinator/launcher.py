@@ -725,32 +725,48 @@ def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(path.resolve()) for path in required))
 
 
-def _verdict_spool_add_dirs(
+def _validated_verdict_spool_dir(
     verdict_spool_dir: str | None,
     *,
     read_only: bool,
     review_only: bool,
-) -> tuple[str, ...]:
+) -> Path | None:
     """trust-root Phase 2a：validate the reviewer verdict spool slot.
 
     verdict 落點搬出 worktree 之後（spec §R2），executor 自己的 sandbox 會把
     `<coordinator_root>/review-verdicts/<job_id>/` 擋在工作區之外——codex
     `--sandbox workspace-write` 只放行 cwd、claude `acceptEdits` 只覆蓋工作目錄。
     Codex／Claude 的 caller 會把回傳的 per-job 目錄交給既有 `--add-dir`；Copilot
-    只消費這裡的解析結果，另以 `_copilot_verdict_spool_tools()` 轉成單檔工具權限。
+    只消費這裡的正規化結果，另以 `_copilot_verdict_spool_tools()` 轉成單檔工具權限。
 
     read-only／review-only 契約下不放行任何寫入路徑：那些 persona 依契約不寫檔，
     verdict 走終局 JSON 契約（workflow lane），不需要也不該開這個洞。
     """
 
     if verdict_spool_dir is None:
-        return ()
+        return None
     if read_only or review_only:
         raise ValueError("read-only launcher cannot be granted a verdict spool write path")
     path = Path(verdict_spool_dir)
     if not path.is_absolute() or path.is_symlink():
         raise ValueError("verdict spool directory must be an absolute non-symlink path")
-    return (str(path.resolve()),)
+    return path.resolve()
+
+
+def _verdict_spool_add_dirs(
+    verdict_spool_dir: str | None,
+    *,
+    read_only: bool,
+    review_only: bool,
+) -> tuple[str, ...]:
+    """Return the validated spool directory for directory-based executors."""
+
+    path = _validated_verdict_spool_dir(
+        verdict_spool_dir, read_only=read_only, review_only=review_only
+    )
+    if path is None:
+        return ()
+    return (str(path),)
 
 
 def _copilot_verdict_spool_tools(
@@ -767,12 +783,12 @@ def _copilot_verdict_spool_tools(
     commands named by the foreign-review prompt.
     """
 
-    spool_dirs = _verdict_spool_add_dirs(
+    spool_dir = _validated_verdict_spool_dir(
         verdict_spool_dir, read_only=read_only, review_only=review_only
     )
-    if not spool_dirs:
+    if spool_dir is None:
         return ()
-    verdict_file = Path(spool_dirs[0]) / spool_slot.REVIEW_VERDICT_FILENAME
+    verdict_file = spool_dir / spool_slot.REVIEW_VERDICT_FILENAME
     return (
         f"write({verdict_file})",
         "shell(rg:*)",

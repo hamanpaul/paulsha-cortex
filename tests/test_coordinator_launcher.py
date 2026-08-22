@@ -67,6 +67,23 @@ class ArgvTests(unittest.TestCase):
                 self.assertNotIn(broad_flag, argv)
             self.assertNotIn(f"write({candidate.resolve()})", grants)
 
+            baseline = build_copilot_argv(
+                prompt="P",
+                slice_id="reviewer-job",
+                log_dir=str(root / "logs"),
+                worktree=str(candidate),
+                model="gpt-5.4",
+            )
+            without_grants: list[str] = []
+            index = 0
+            while index < len(argv):
+                if argv[index] == "--allow-tool":
+                    index += 2
+                    continue
+                without_grants.append(argv[index])
+                index += 1
+            self.assertEqual(without_grants, baseline)
+
     def test_copilot_verdict_spool_rejects_broad_permission_modes(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             spool = Path(d) / "spool"
