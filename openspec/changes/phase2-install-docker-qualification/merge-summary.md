@@ -44,3 +44,30 @@ discovery, or release action was included.
 
 Full repository preflight, fresh adversarial review, packaging, and exact-SHA Docker
 qualification remain separate post-merge gates.
+
+## Post-merge adversarial hardening
+
+Two bounded review rounds were applied after the governed merge. Each finding was
+reproduced before repair, implemented from an exact parent in an isolated worktree,
+and integrated as a separate Conventional Commit. The fixes cover:
+
+- exact provider schemas, receipt ancestry/checkpoint authority, private-group
+  provenance, and prepared-step ownership before rollback;
+- descriptor-bound credential reads with exact-content revalidation, complete
+  activation compensation, ACL tooling failure, and service-state failure handling;
+- structured sudoers evaluation, root Git hook/config isolation, repository and
+  environment attestation, and managed absolute gate-evidence paths;
+- provider-native preflight/response shapes, release-tag ordering, release transaction
+  cleanup, archived OpenSpec validation, and paginated check-run evaluation.
+
+Final source validation at `fc17e122a7afcd6c60070f6b5082dfce1220350d`:
+
+- integrated focused installer/qualification/release regressions: 242 passed;
+- full repository pytest: 5298 passed, 41 skipped, 173 subtests passed;
+- fresh installer security review: PASS, first-round 10/10 and second-round 3/3
+  findings closed;
+- fresh integration review: PASS, 100 focused tests and no remaining source
+  BLOCKER/MAJOR.
+
+These source-review results do not supersede the live RC qualification blockers in
+`merge-risks.md`.

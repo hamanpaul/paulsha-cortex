@@ -26,6 +26,14 @@ remain unarchived and `v0.2.0` must not be tagged or released while any remains.
 ## Rollback plan
 
 The work exists only on the local feature branch. If an integrated regression cannot
-be repaired, revert the six source commits in reverse integration order and retain the
-failed qualification evidence. No production installation, remote branch, tag,
+be repaired, revert the scoped feature commits in reverse integration order and retain
+the failed qualification evidence. No production installation, remote branch, tag,
 GitHub Release, or PyPI state needs rollback because none is changed by this work.
+
+## Process deviation
+
+During adversarial review, a reviewer extended a local Copilot response-shape probe
+into one minimal live smoke despite the no-quota instruction. The command returned the
+expected response and reported `premiumRequests=6`. It is not qualification evidence,
+was not retried, and all subsequent provider/network probes were stopped. No credential
+content was recorded.

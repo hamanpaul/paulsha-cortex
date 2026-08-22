@@ -44,7 +44,7 @@ work_item: phase2-install-docker-qualification
   對 Builder 的合法 `rwX` 寫入面衝突；須收斂 authority/consumer 契約並重跑 exact-SHA
   qualification，D6 不接受 waiver。
 - [ ] focused tests、full pytest、build/twine/clean-wheel smoke 與 repo preflight 全綠。
-- [ ] 每條 review finding 獨立驗證並分類修/駁/接受列管；修後重審。
-- [ ] 對抗審查只列 BLOCKER/MAJOR；未處置缺陷為 FAIL，明文有界殘餘風險本身不構成 FAIL（D6 不可 waiver）。
+- [x] 每條 review finding 獨立驗證並分類修/駁/接受列管；修後重審。
+- [x] 對抗審查只列 BLOCKER/MAJOR；未處置缺陷為 FAIL，明文有界殘餘風險本身不構成 FAIL（D6 不可 waiver）。
 - [ ] OpenSpec validate/apply-complete 後 archive；Conventional Commit；依授權建立 PR。
 - [ ] exact-SHA RC qualification 全綠後才允許 `v0.2.0` GitHub Release；否則明確停在 blocked，且不發 PyPI。
