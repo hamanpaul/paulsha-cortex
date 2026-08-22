@@ -441,7 +441,7 @@ def _apply_verification_result(registry, slice_id: str, evidence: dict) -> None:
     )
     registry.update_slice(
         slice_id,
-        verification_hash=evidence["hash"],
+        current_verification_evidence_hash=evidence["hash"],
         current_evidence_refs=refs,
         candidate=payload["candidate"],
     )
@@ -487,7 +487,16 @@ def _current_verification_ref(slice_row: dict | None) -> tuple[str | None, str |
         normalized = verification.validate_verification_evidence(payload)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return path, None
-    return path, verification.canonical_json_hash(normalized)
+    computed_hash = verification.canonical_json_hash(normalized)
+    stored_hash = slice_row.get("current_verification_evidence_hash")
+    if stored_hash is None:
+        # Additive migration compatibility for callers holding an old detached
+        # row: the registry writer will populate the durable field on the next
+        # result application, while a valid legacy evidence ref remains usable.
+        return path, computed_hash
+    if not isinstance(stored_hash, str) or stored_hash != computed_hash:
+        return path, None
+    return path, stored_hash
 
 
 def _current_review_ref(slice_row: dict | None) -> tuple[str | None, str | None, dict | None]:
