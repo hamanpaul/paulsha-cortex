@@ -722,3 +722,57 @@ def test_filesystem_denial_accepts_sticky_directory_eperm(
             "returncode": 1,
         }
     ]
+
+
+def test_runtime_workspace_provisioning_uses_the_registry_acl_contract() -> None:
+    driver = _load_driver_module()
+    assets = [
+        {
+            "asset_id": "repo-worktree",
+            "tier": "TIER_1",
+            "runtime_managed": True,
+            "is_directory": True,
+            "path": "/var/lib/cortex/worktree/<job-id>",
+            "acls": [
+                {"account": "cortex-builder", "default": False, "perms": "rwX"},
+                {"account": "cortex-builder", "default": True, "perms": "rwx"},
+                {"account": "cortex-gate", "default": False, "perms": "rX"},
+                {"account": "cortex-gate", "default": True, "perms": "rX"},
+            ],
+        },
+        {
+            "asset_id": "work-items-yaml",
+            "tier": "TIER_1",
+            "runtime_managed": False,
+            "is_directory": False,
+            "path": "/var/lib/cortex/worktree/<job-id>/.cortex/work-items.yaml",
+            "acls": [],
+        },
+    ]
+
+    workspace, grants = driver._runtime_workspace_provisioning_spec(assets)
+
+    assert workspace == Path("/var/lib/cortex/worktree/qualification-probe")
+    assert grants == (
+        ("cortex-builder", "rwX", "rwx"),
+        ("cortex-gate", "rX", "rX"),
+    )
+
+
+def test_runtime_workspace_provisioning_rejects_an_incomplete_acl_pair() -> None:
+    driver = _load_driver_module()
+    assets = [
+        {
+            "asset_id": "repo-worktree",
+            "tier": "TIER_1",
+            "runtime_managed": True,
+            "is_directory": True,
+            "path": "/var/lib/cortex/worktree/<job-id>",
+            "acls": [
+                {"account": "cortex-builder", "default": False, "perms": "rwX"},
+            ],
+        }
+    ]
+
+    with pytest.raises(driver.QualificationFailure, match="access/default ACL pair"):
+        driver._runtime_workspace_provisioning_spec(assets)

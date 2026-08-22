@@ -385,6 +385,124 @@ def _passed_case(
     _require_success(result, f"{family}/{case_id}")
 
 
+def _runtime_workspace_provisioning_spec(
+    assets: Sequence[object],
+) -> tuple[Path, tuple[tuple[str, str, str], ...]]:
+    """Derive the synthetic per-job workspace from the installed plan.
+
+    The installer intentionally creates only the shared pool.  Qualification
+    therefore provisions one disposable per-job slot before probing assets
+    whose paths contain ``<job-id>``.  The ACL contract must come from the
+    plan's ``repo-worktree`` row; duplicating it in this trusted driver would
+    let qualification silently drift from production provisioning.
+    """
+
+    matches = [
+        asset
+        for asset in assets
+        if isinstance(asset, Mapping) and asset.get("asset_id") == "repo-worktree"
+    ]
+    if len(matches) != 1:
+        raise QualificationFailure(
+            "plan must contain exactly one repo-worktree runtime asset"
+        )
+    asset = matches[0]
+    raw_path = asset.get("path")
+    if (
+        asset.get("tier") not in {"TIER_0", "TIER_1"}
+        or asset.get("runtime_managed") is not True
+        or asset.get("is_directory") is not True
+        or not isinstance(raw_path, str)
+        or raw_path.count("<job-id>") != 1
+        or not raw_path.startswith("/")
+    ):
+        raise QualificationFailure("repo-worktree runtime asset shape is invalid")
+    workspace = Path(raw_path.replace("<job-id>", "qualification-probe"))
+    if workspace.name != "qualification-probe":
+        raise QualificationFailure(
+            "repo-worktree placeholder is not the final path segment"
+        )
+
+    raw_acls = asset.get("acls")
+    if not isinstance(raw_acls, list) or not raw_acls:
+        raise QualificationFailure("repo-worktree has no runtime ACL contract")
+    paired: dict[str, dict[bool, str]] = {}
+    for row in raw_acls:
+        if not isinstance(row, Mapping):
+            raise QualificationFailure("repo-worktree ACL row is invalid")
+        account = row.get("account")
+        perms = row.get("perms")
+        default = row.get("default")
+        if (
+            not isinstance(account, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}", account) is None
+            or not isinstance(perms, str)
+            or re.fullmatch(r"[rwxX-]{1,4}", perms) is None
+            or not isinstance(default, bool)
+        ):
+            raise QualificationFailure("repo-worktree ACL row is invalid")
+        by_kind = paired.setdefault(account, {})
+        if default in by_kind:
+            raise QualificationFailure("repo-worktree duplicates an ACL kind")
+        by_kind[default] = perms
+    if any(set(by_kind) != {False, True} for by_kind in paired.values()):
+        raise QualificationFailure(
+            "repo-worktree must provide an access/default ACL pair per account"
+        )
+    grants = tuple(
+        (account, by_kind[False], by_kind[True])
+        for account, by_kind in sorted(paired.items())
+    )
+    return workspace, grants
+
+
+def _provision_runtime_workspace(assets: Sequence[object]) -> Path:
+    """Create one disposable slot via the installed production ACL helper."""
+
+    workspace, grants = _runtime_workspace_provisioning_spec(assets)
+    pool = workspace.parent
+    if not pool.is_dir() or pool.is_symlink() or pool.resolve() != pool:
+        raise QualificationFailure("runtime workspace pool is absent or unsafe")
+    if workspace.exists() or workspace.is_symlink():
+        raise QualificationFailure("runtime qualification workspace already exists")
+
+    workspace.mkdir(mode=0o700)
+    cortex_dir = workspace / ".cortex"
+    cortex_dir.mkdir(mode=0o700)
+    seed = workspace / ".qualification-seed"
+    seed.write_bytes(b"runtime workspace ACL seed\n")
+    manager = pwd.getpwnam("cortex-manager")
+    for path, mode in ((workspace, 0o700), (cortex_dir, 0o700), (seed, 0o600)):
+        os.chown(path, manager.pw_uid, manager.pw_gid)
+        os.chmod(path, mode)
+
+    # Keep the candidate import outside this trusted process.  The driver then
+    # independently attacks the resulting filesystem shape, so candidate code
+    # cannot self-attest the verdict.
+    code = (
+        "import json,sys\n"
+        "from paulsha_cortex.coordinator.job_workspace import "
+        "WorkspaceAclGrant,grant_workspace_acl\n"
+        "rows=json.loads(sys.argv[2])\n"
+        "grants=tuple(WorkspaceAclGrant(*row) for row in rows)\n"
+        "grant_workspace_acl(sys.argv[1],grants)\n"
+    )
+    result = _run(
+        (
+            "/opt/cortex/venv/bin/python",
+            "-c",
+            code,
+            str(workspace),
+            json.dumps(grants, separators=(",", ":")),
+        ),
+        user="cortex-manager",
+        env=_installed_runtime_env(),
+        timeout=60,
+    )
+    _require_success(result, "runtime workspace production ACL provisioning")
+    return workspace
+
+
 def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) -> None:
     plan = receipt.get("plan")
     if not isinstance(plan, Mapping):
@@ -481,6 +599,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     assets = plan.get("assets")
     if not isinstance(assets, list):
         raise QualificationFailure("plan asset inventory is missing")
+    _provision_runtime_workspace(assets)
     operations = {
         "modify": "p.open('ab').write(b'x')",
         "truncate": "p.open('wb').close()",
