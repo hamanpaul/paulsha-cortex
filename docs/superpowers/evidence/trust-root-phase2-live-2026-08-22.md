@@ -79,3 +79,15 @@ parts are recorded above.
 The stale pre-merge Cortex workflow `workflow-16f4188674d36ab8809a` was retired
 through the supported `retire-delivered` action after PR #783 was confirmed
 merged. No workflow JSON or service state was edited by hand.
+
+## Final normal-Codex Cortex slice candidate
+
+- `PSC_SLICE_ID`: `phase2-final-live-codex-v6`
+- Declared executor/model: `codex/gpt-5.6-luna`
+- Declared reasoning effort: `reasoning_effort: `max``
+- Status: `manager-terminal-verification-pending`
+
+This is a candidate observation only. The Manager must independently bind it to
+a successful terminal job record before the final conjunctive task may be
+checked. This section does not check the open task or claim a successful
+normal-Codex start from inside the builder.
