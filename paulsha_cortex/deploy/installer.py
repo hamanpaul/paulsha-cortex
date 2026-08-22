@@ -481,9 +481,16 @@ def install_service(instance: str, interval: int, repo_root: Path, *, rebind: bo
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    raw_args = list(argv) if argv is not None else list(sys.argv[1:])
+    if raw_args and raw_args[0] == "trust-root":
+        from paulsha_cortex.trust_root.install.cli import main as trust_root_main
+
+        return int(trust_root_main(raw_args[1:]) or 0)
     parser = argparse.ArgumentParser(
         prog="cortex install",
-        description="安裝 paulsha-cortex systemd --user units；只落檔/enable，不會 start service。",
+        description=(
+            "安裝 Phase 1 systemd --user units，或使用可回滾的 Phase 2 trust-root installer。"
+        ),
     )
     sub = parser.add_subparsers(dest="target", required=True)
     svc = sub.add_parser("service", help="安裝 manager service/timer 與 monitor service")
@@ -500,7 +507,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--rebind", action="store_true",
         help="既有 instance 記錄的 repo 身分與 --repo-root 不符時，明確放行本次搬遷",
     )
-    args = parser.parse_args(argv)
+    sub.add_parser(
+        "trust-root",
+        help="Phase 2: plan/apply/credentials/activate/verify/rollback",
+        add_help=False,
+    )
+    args = parser.parse_args(raw_args)
     try:
         instance = _validate_instance(args.instance)
         interval = _validate_interval(args.interval)

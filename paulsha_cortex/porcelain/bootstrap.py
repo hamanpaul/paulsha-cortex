@@ -340,6 +340,47 @@ def _next_steps(*, instance: str, start: bool) -> list[str]:
     ]
 
 
+def _trust_root_status() -> dict[str, object]:
+    """Read-only Phase 2 detection.
+
+    Bootstrap remains a Phase 1 convenience command: it never invokes sudo and
+    never discovers or copies credentials.  It only tells the operator whether a
+    verified root-owned receipt can be observed at the documented location.
+    """
+
+    receipt_root = Path("/var/lib/cortex/install-receipts")
+    qualified: list[str] = []
+    try:
+        if receipt_root.is_symlink() or not receipt_root.is_dir():
+            candidates: list[Path] = []
+        else:
+            candidates = sorted(receipt_root.glob("*.json"))
+    except OSError:
+        candidates = []
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(document, dict) and document.get("qualified") is True:
+            receipt_id = document.get("receipt_id")
+            if isinstance(receipt_id, str):
+                qualified.append(receipt_id)
+    detected = bool(qualified)
+    return {
+        "detected": detected,
+        "qualified_receipt_ids": qualified,
+        "advisory": (
+            "verified trust-root receipt detected"
+            if detected
+            else "Phase 2 trust root not detected; run `cortex install trust-root plan --help`. "
+            "Bootstrap will not sudo or import credentials."
+        ),
+    }
+
+
 def _print_preflight_failure(preflight: dict[str, Any]) -> None:
     sys.stderr.write("bootstrap preflight 未通過；exit code 4。\n")
     for check in preflight.get("checks", []):
@@ -365,6 +406,9 @@ def _print_human_summary(payload: dict[str, Any]) -> None:
             sys.stdout.write("start: ok\n")
     elif payload.get("start_skipped"):
         sys.stdout.write("start: skipped (--no-start)\n")
+    trust_root = payload.get("trust_root")
+    if isinstance(trust_root, dict):
+        sys.stdout.write(f"trust-root: {trust_root.get('advisory')}\n")
     status = payload.get("status")
     if isinstance(status, dict):
         sys.stdout.write(
@@ -445,6 +489,7 @@ def main(argv: Sequence[str]) -> int:
             change=args.change,
         ),
         next_steps=_next_steps(instance=args.instance, start=args.start),
+        trust_root=_trust_root_status(),
     )
     if not preflight["ok"]:
         if args.json:
