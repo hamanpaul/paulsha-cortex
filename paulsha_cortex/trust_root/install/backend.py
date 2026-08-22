@@ -211,6 +211,27 @@ def _snapshot(path: Path) -> dict[str, object]:
     return snapshot
 
 
+def _expected_acl_mode(step: Mapping[str, object]) -> str:
+    """Return the stat mode after setfacl has recalculated the access mask.
+
+    POSIX ACLs expose their mask through the traditional group mode bits.  The
+    plan's ``mode`` is the base owner/group/other mode applied *before* named
+    ACLs; comparing it directly with ``lstat`` therefore reports false drift
+    whenever a named access entry expands the mask.
+    """
+
+    base = _mode(step.get("mode"))
+    mask = (base >> 3) & 0o7
+    for row in step.get("acls", []):
+        if not isinstance(row, Mapping) or row.get("default"):
+            continue
+        perms = str(row.get("perms", "")).replace("X", "x")
+        mask |= (0o4 if "r" in perms else 0) | (0o2 if "w" in perms else 0) | (
+            0o1 if "x" in perms else 0
+        )
+    return format((base & ~0o070) | (mask << 3), "04o")
+
+
 def _universal_nopasswd() -> bool:
     pattern = re.compile(r"\bALL\s*=\s*\([^)]*\)\s*NOPASSWD\s*:\s*ALL\b")
     candidates = [Path("/etc/sudoers")]
@@ -344,15 +365,27 @@ class LocalInstallBackend:
         if not observed.get("exists"):
             return observed
         if step.get("asset_type") == "directory":
-            semantic = {
-                "path": str(path),
-                "owner": observed.get("owner"),
-                "group": observed.get("group"),
-                "mode": observed.get("mode"),
-                "acls": observed.get("acl", []),
-                "asset_type": "directory",
-            }
-            observed["installed_sha256"] = _desired_digest(semantic)
+            expected_acls = [
+                {
+                    "account": row.get("account"),
+                    "perms": str(row.get("perms", ""))
+                    .replace("X", "x")
+                    .replace("-", ""),
+                    "default": bool(row.get("default", False)),
+                }
+                for row in step.get("acls", [])
+                if isinstance(row, Mapping)
+            ]
+            matches = (
+                observed.get("is_directory") is True
+                and observed.get("owner") == step.get("owner")
+                and observed.get("group") == step.get("group")
+                and observed.get("mode") == _expected_acl_mode(step)
+                and observed.get("acl", []) == expected_acls
+            )
+            observed["installed_sha256"] = (
+                step.get("desired_sha256") if matches else None
+            )
         return observed
 
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:

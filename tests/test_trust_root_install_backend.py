@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import grp
 import hashlib
+import os
+import pwd
+import shutil
+import stat
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +17,7 @@ import pytest
 from paulsha_cortex.trust_root.install import InstallDriftError
 from paulsha_cortex.trust_root.install import backend as backend_module
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
-from paulsha_cortex.trust_root.install.core import _account_digest
+from paulsha_cortex.trust_root.install.core import _account_digest, _desired_digest
 
 
 def _completed(argv) -> subprocess.CompletedProcess[str]:
@@ -212,3 +217,34 @@ def test_venv_step_replays_after_slot_rename_before_link_cutover(
     assert result["installed_sha256"] == wheel_sha
     assert active.resolve() == slot
     assert calls == [], "a verified interrupted slot is adopted without reinstall"
+
+
+def test_directory_acl_attestation_accounts_for_posix_mask(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / "control"
+    step = {
+        "step_id": "asset:control-root-tree",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(path),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [
+            {"account": "root", "perms": "rX", "default": False},
+            {"account": "root", "perms": "rX", "default": True},
+        ],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+
+    result = backend.apply_step(step)
+
+    assert result["installed_sha256"] == step["desired_sha256"]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o750
+    assert backend.inspect_step(step)["installed_sha256"] == step["desired_sha256"]
