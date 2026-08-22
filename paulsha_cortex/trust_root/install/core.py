@@ -806,6 +806,7 @@ def _desired_digest(step: Mapping[str, object]) -> str:
         "remote": step.get("remote"),
         "source_sha256": step.get("source_sha256"),
         "adoption_policy": step.get("adoption_policy"),
+        "durable": step.get("durable"),
     }
     return hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
 
@@ -1029,6 +1030,7 @@ def build_install_plan(
     ]
     if len(state_root_steps) != 1:
         raise InstallPlanError("managed state root must map to exactly one directory step")
+    state_root_steps[0]["durable"] = True
     state_root_steps[0]["adoption_policy"] = "empty-managed-root-mount"
     state_root_steps[0]["desired_sha256"] = _desired_digest(state_root_steps[0])
     plan: dict[str, object] = {
