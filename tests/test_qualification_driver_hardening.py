@@ -209,6 +209,55 @@ def test_codex_doctor_schema_without_login_or_quota_fails_closed_once(
             ],
             True,
         ),
+        (
+            [
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "QUALIFICATION_OK"},
+                }
+            ],
+            True,
+        ),
+        (
+            [
+                {
+                    "type": "user.message",
+                    "data": {"content": "Return exactly QUALIFICATION_OK"},
+                }
+            ],
+            False,
+        ),
+        (
+            [
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "I refuse. QUALIFICATION_OK"},
+                }
+            ],
+            False,
+        ),
+        (
+            [
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "QUALIFICATION_OK extra"},
+                }
+            ],
+            False,
+        ),
+        (
+            [
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "QUALIFICATION_OK"},
+                },
+                {
+                    "type": "assistant.message",
+                    "data": {"content": "QUALIFICATION_OK"},
+                },
+            ],
+            False,
+        ),
         ([{"type": "user", "content": "Return QUALIFICATION_OK"}], False),
         (
             [

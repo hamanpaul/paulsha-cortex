@@ -1244,6 +1244,11 @@ def _has_exact_final_assistant_response(records: Sequence[object]) -> bool:
         ):
             final_contents.append(str(record["content"]))
             continue
+        if record.get("type") == "assistant.message":
+            data = record.get("data")
+            if isinstance(data, Mapping) and isinstance(data.get("content"), str):
+                final_contents.append(str(data["content"]))
+            continue
         if record.get("type") != "item.completed":
             continue
         item = record.get("item")
