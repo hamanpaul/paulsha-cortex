@@ -200,6 +200,48 @@ def test_credential_adapter_rejects_a_symlink_before_reading_content(
     assert not (tmp_path / "installed").exists()
 
 
+def test_credential_import_rejects_source_ancestor_rename_with_same_leaf_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source_parent = tmp_path / "operator-source"
+    source_parent.mkdir()
+    source = source_parent / "auth.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    displaced = tmp_path / "displaced-operator-source"
+    destination_root = tmp_path / "installed"
+    original_fdopen = os.fdopen
+    swapped = False
+
+    def rename_ancestor_once() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        source_parent.rename(displaced)
+        source_parent.mkdir()
+        (displaced / source.name).rename(source)
+        swapped = True
+
+    def fdopen_and_rename_ancestor(*args, **kwargs):
+        stream = original_fdopen(*args, **kwargs)
+        rename_ancestor_once()
+        return stream
+
+    monkeypatch.setattr(install_core.os, "fdopen", fdopen_and_rename_ancestor)
+
+    with pytest.raises(CredentialImportError, match="source.*changed"):
+        import_credential(
+            receipt,
+            principal="builder",
+            provider="codex",
+            source=source,
+            destination_root=destination_root,
+        )
+
+    assert swapped
+    assert not destination_root.exists()
+
+
 def test_provider_principal_pair_is_fail_closed(tmp_path: Path) -> None:
     _plan_doc, receipt, _backend = _applied_receipt()
     source = tmp_path / "hosts.yml"

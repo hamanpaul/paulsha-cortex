@@ -122,13 +122,21 @@ _DIRECTORY_OPEN_FLAGS = (
 
 
 def _open_directory_chain(
-    path: Path, *, create: bool = False, create_mode: int = 0o700
+    path: Path,
+    *,
+    create: bool = False,
+    create_mode: int = 0o700,
+    authority: list[tuple[int, int]] | None = None,
 ) -> int:
-    """Open an absolute directory one no-follow component at a time."""
+    """Open an absolute directory component-wise and optionally record authority."""
 
     if not path.is_absolute() or ".." in path.parts:
         raise UnsafeInstallPathError(f"unsafe directory authority path: {path}")
     descriptor = os.open("/", _DIRECTORY_OPEN_FLAGS)
+    if authority is not None:
+        authority.clear()
+        root = os.fstat(descriptor)
+        authority.append((root.st_dev, root.st_ino))
     try:
         for component in path.parts[1:]:
             try:
@@ -151,6 +159,9 @@ def _open_directory_chain(
                 ) from exc
             os.close(descriptor)
             descriptor = next_descriptor
+            if authority is not None:
+                observed = os.fstat(descriptor)
+                authority.append((observed.st_dev, observed.st_ino))
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -158,24 +169,52 @@ def _open_directory_chain(
 
 
 def _open_parent_directory(
-    path: Path, *, create: bool = False, create_mode: int = 0o700
+    path: Path,
+    *,
+    create: bool = False,
+    create_mode: int = 0o700,
+    authority: list[tuple[int, int]] | None = None,
 ) -> tuple[int, str]:
     if not path.is_absolute() or ".." in path.parts or not path.name:
         raise UnsafeInstallPathError(f"unsafe authority leaf path: {path}")
     return (
-        _open_directory_chain(path.parent, create=create, create_mode=create_mode),
+        _open_directory_chain(
+            path.parent,
+            create=create,
+            create_mode=create_mode,
+            authority=authority,
+        ),
         path.name,
     )
 
 
-def _assert_fd_path_binding(path: Path, descriptor: int, *, directory: bool) -> None:
+def _assert_fd_path_binding(
+    path: Path,
+    descriptor: int,
+    *,
+    directory: bool,
+    parent_authority: Sequence[tuple[int, int]] | None = None,
+) -> None:
     """Fail if the canonical pathname no longer names the held inode."""
 
-    parent_fd, leaf = _open_parent_directory(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    current_authority: list[tuple[int, int]] | None = (
+        [] if parent_authority is not None else None
+    )
+    parent_fd, leaf = _open_parent_directory(path, authority=current_authority)
+    flags = (
+        getattr(os, "O_PATH", os.O_RDONLY)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     if directory:
         flags |= getattr(os, "O_DIRECTORY", 0)
     try:
+        if parent_authority is not None and tuple(current_authority or ()) != tuple(
+            parent_authority
+        ):
+            raise UnsafeInstallPathError(
+                f"authority path was replaced while held: {path}"
+            )
         try:
             current_fd = os.open(leaf, flags, dir_fd=parent_fd)
         except OSError as exc:
@@ -2619,52 +2658,89 @@ def import_credential(
         raise CredentialImportError(
             f"{provider} source filename is outside the allowlist; expected {allowed_name}"
         )
+    source = source.expanduser().absolute()
+    source_authority: list[tuple[int, int]] = []
     try:
-        mode = source.lstat().st_mode
-    except OSError as exc:
-        raise CredentialImportError("credential source is not readable") from exc
-    if stat.S_ISLNK(mode):
-        raise CredentialImportError("credential source must not be a symlink")
-    if not stat.S_ISREG(mode):
-        raise CredentialImportError("credential source must be a regular file")
-    try:
-        _reject_symlink_ancestors(
-            source, label="credential source", include_leaf=False
+        source_parent_fd, source_name = _open_parent_directory(
+            source, authority=source_authority
         )
     except UnsafeInstallPathError as exc:
         raise CredentialImportError(
             "credential source path contains a symlink"
         ) from exc
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        source_fd = os.open(source, flags)
     except OSError as exc:
+        raise CredentialImportError("credential source is not readable") from exc
+    source_authority_fd = -1
+    source_fd = -1
+    try:
+        # O_PATH binds the leaf inode without reading a FIFO/device; the content
+        # descriptor is then reopened from this trusted kernel-held authority.
+        source_authority_fd = os.open(
+            source_name,
+            getattr(os, "O_PATH", os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=source_parent_fd,
+        )
+    except OSError as exc:
+        os.close(source_parent_fd)
+        if exc.errno == errno.ELOOP:
+            raise CredentialImportError(
+                "credential source must not be a symlink"
+            ) from exc
+        if exc.errno in {errno.ENOENT, errno.ENOTDIR}:
+            raise CredentialImportError("credential source is not readable") from exc
         raise CredentialImportError(
             "credential source changed or cannot be opened safely"
         ) from exc
     try:
-        opened = os.fstat(source_fd)
-        try:
-            current = source.lstat()
-        except OSError as exc:
+        initial = os.fstat(source_authority_fd)
+        if stat.S_ISLNK(initial.st_mode):
+            raise CredentialImportError("credential source must not be a symlink")
+        if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
             raise CredentialImportError(
-                "credential source changed during validation"
-            ) from exc
-        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-            current.st_dev,
-            current.st_ino,
+                "credential source must be a single-link regular file"
+            )
+        try:
+            source_fd = os.open(
+                f"/proc/self/fd/{source_authority_fd}",
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+            opened = os.fstat(source_fd)
+            if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+                raise CredentialImportError(
+                    "credential source changed during validation"
+                )
+            content = _read_fd_bytes(source_fd)
+        except OSError as exc:
+            raise CredentialImportError("credential source read failed") from exc
+        final = os.fstat(source_fd)
+        final_authority = os.fstat(source_authority_fd)
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_nlink != 1
+            or (initial.st_dev, initial.st_ino, initial.st_size)
+            != (final.st_dev, final.st_ino, final.st_size)
+            or (initial.st_dev, initial.st_ino)
+            != (final_authority.st_dev, final_authority.st_ino)
         ):
             raise CredentialImportError("credential source changed during validation")
         try:
-            stream = os.fdopen(source_fd, "rb")
-            source_fd = -1
-            with stream:
-                content = stream.read()
-        except OSError as exc:
-            raise CredentialImportError("credential source read failed") from exc
+            _assert_fd_path_binding(
+                source,
+                source_authority_fd,
+                directory=False,
+                parent_authority=source_authority,
+            )
+        except UnsafeInstallPathError as exc:
+            raise CredentialImportError(
+                "credential source changed during validation"
+            ) from exc
     finally:
         if source_fd >= 0:
             os.close(source_fd)
+        os.close(source_authority_fd)
+        os.close(source_parent_fd)
     digest = hashlib.sha256(content).hexdigest()
     destination = destination_root.joinpath(*destination_parts)
     if destination_uid is not None or destination_gid is not None:
