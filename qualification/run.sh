@@ -107,9 +107,11 @@ docker exec "$container_name" sh -eu -c \
 
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
-qualification_path=/var/lib/cortex/qualification/qualification.json
+qualification_root=/run/cortex-qualification
+qualification_path=$qualification_root/qualification.json
 
 docker exec "$container_name" install -d -o root -g root -m 0700 /run/cortex-install
+docker exec "$container_name" install -d -o root -g root -m 0700 "$qualification_root"
 docker exec "$container_name" cortex install trust-root plan \
     --config /artifacts/install-config.yaml \
     --bundle /artifacts/bundle.json \
@@ -177,7 +179,7 @@ import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
 import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
 
 docker exec "$container_name" cortex install trust-root activate --receipt "$receipt_path"
-install_evidence_path=/var/lib/cortex/qualification/install-verification.json
+install_evidence_path=$qualification_root/install-verification.json
 docker exec \
     --env "CORTEX_QUALIFICATION_CANDIDATE_SHA=$candidate_sha" \
     --env "CORTEX_QUALIFICATION_WHEEL_SHA256=$expected_wheel_sha" \
@@ -208,20 +210,20 @@ docker exec "$container_name" "$qualification_driver" \
     --probe-work-id "$CORTEX_RC_PROBE_WORK_ID" \
     --probe-issue "$CORTEX_RC_PROBE_ISSUE" \
     --output "$qualification_path" \
-    --evidence-dir /var/lib/cortex/qualification/evidence
+    --evidence-dir "$qualification_root/evidence"
 
 docker exec "$container_name" /usr/local/libexec/cortex-qualification-validate \
     --qualification "$qualification_path" \
     --candidate-sha "$candidate_sha" \
     --wheel-sha256 "$expected_wheel_sha" \
     --bundle-sha256 "$expected_bundle_sha" \
-    --evidence-root /var/lib/cortex/qualification \
+    --evidence-root "$qualification_root" \
     --require-full-suite
 
 # docker cp is used instead of binding a host output directory. The only host
 # input bind is the read-only artifact directory above.
 docker cp "$container_name:$qualification_path" "$output_dir/qualification.json"
-docker cp "$container_name:/var/lib/cortex/qualification/evidence" "$output_dir/evidence"
+docker cp "$container_name:$qualification_root/evidence" "$output_dir/evidence"
 
 # The evidence must remain valid after crossing the container boundary.
 python3 "$script_dir/validate.py" \

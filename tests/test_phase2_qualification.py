@@ -427,10 +427,14 @@ def test_runner_uses_exact_artifacts_and_never_an_editable_checkout() -> None:
 
 def test_runner_keeps_preinstall_control_files_outside_managed_state() -> None:
     raw = _required_text(RUNNER)
+    dockerfile = _required_text(DOCKERFILE)
 
     assert "plan_path=/run/cortex-install/install-plan.json" in raw
     assert "receipt_path=/run/cortex-install/install-receipt.json" in raw
     assert "install -d -o root -g root -m 0700 /run/cortex-install" in raw
+    assert "qualification_root=/run/cortex-qualification" in raw
+    assert "/var/lib/cortex/qualification" not in raw
+    assert "/var/lib/cortex/qualification" not in dockerfile
     assert "plan_path=/var/lib/cortex" not in raw
     assert "receipt_path=/var/lib/cortex" not in raw
 

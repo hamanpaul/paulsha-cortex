@@ -38,8 +38,7 @@ COPY qualification.schema.json /usr/local/share/cortex/qualification.schema.json
 RUN chmod 0755 \
         /usr/local/libexec/cortex-qualification-validate \
         /usr/local/libexec/cortex-qualification-verify-bundle \
-        /usr/local/libexec/cortex-release-qualification \
-    && mkdir -p /var/lib/cortex/qualification
+        /usr/local/libexec/cortex-release-qualification
 
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/sbin/init"]
