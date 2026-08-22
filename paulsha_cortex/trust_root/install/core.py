@@ -520,6 +520,8 @@ def _apply_steps(
     generated: Mapping[str, Mapping[str, Mapping[str, str]]],
 ) -> list[dict[str, object]]:
     steps: list[dict[str, object]] = []
+    directory_steps: list[dict[str, object]] = []
+    symlink_steps: list[dict[str, object]] = []
     for scaffold in scaffolds:
         step: dict[str, object] = {
             "step_id": f"scaffold:{scaffold['path']}",
@@ -534,7 +536,7 @@ def _apply_steps(
             "durable": False,
         }
         step["desired_sha256"] = _desired_digest(step)
-        steps.append(step)
+        directory_steps.append(step)
     for asset in assets:
         path = asset.get("path")
         if not isinstance(path, str) or "<job-id>" in path:
@@ -555,7 +557,7 @@ def _apply_steps(
                 "durable": False,
             }
             step["desired_sha256"] = _desired_digest(step)
-            steps.append(step)
+            symlink_steps.append(step)
             continue
         if not bool(asset.get("is_directory")):
             continue
@@ -586,7 +588,21 @@ def _apply_steps(
             "durable": asset.get("tree") == "durable-state",
         }
         step["desired_sha256"] = _desired_digest(step)
-        steps.append(step)
+        directory_steps.append(step)
+    # A child mkdir(parents=True) must never manufacture a later-controlled
+    # ancestor with ambient root ownership.  Apply all managed directories in
+    # path topology order, then create symlinks only after their targets exist.
+    steps.extend(
+        sorted(
+            directory_steps,
+            key=lambda row: (
+                len(PurePosixPath(str(row["path"])).parts),
+                str(row["path"]),
+                str(row["step_id"]),
+            ),
+        )
+    )
+    steps.extend(symlink_steps)
     for category in (
         "units",
         "shim",

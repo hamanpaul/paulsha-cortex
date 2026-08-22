@@ -177,6 +177,23 @@ def test_scaffold_targets_are_applied_before_home_redirect_symlinks(
         assert step_ids.index(target_step) < step_ids.index(f"asset:{asset_id}")
 
 
+def test_every_managed_directory_is_applied_before_its_managed_descendants(
+    tmp_path: Path,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    directories = [
+        step
+        for step in plan["apply_order"]
+        if step.get("kind") == "asset" and step.get("asset_type") == "directory"
+    ]
+    positions = {step["path"]: index for index, step in enumerate(directories)}
+
+    for child, child_position in positions.items():
+        for parent, parent_position in positions.items():
+            if child != parent and Path(child).is_relative_to(Path(parent)):
+                assert parent_position < child_position, (parent, child)
+
+
 def test_bundle_binding_preserves_repo_container_and_installs_named_leaf(
     tmp_path: Path,
 ) -> None:
