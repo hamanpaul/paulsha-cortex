@@ -293,7 +293,7 @@ def _venv_slot_matches(
 
 def _read_acl(path: Path) -> list[dict[str, object]]:
     if shutil.which("getfacl") is None:
-        return []
+        raise InstallDriftError("getfacl is unavailable; ACL state is untrusted")
     result = _run(("getfacl", "-cp", str(path)))
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "command failed").strip()

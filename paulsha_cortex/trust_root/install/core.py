@@ -2981,6 +2981,7 @@ def activate_receipt(
             "receipt has unfinished activation authority; roll it back first"
         )
     failed_service = "service"
+    failure_phase = "start"
     try:
         for service in _SERVICE_ORDER:
             failed_service = service
@@ -2991,7 +2992,9 @@ def activate_receipt(
             activation_journal.append(entry)
             # The prepared entry is durable before systemctl can mutate the
             # unit.  It remains conservative authority if this persist fails.
+            failure_phase = "prepared activation checkpoint"
             receipt._persist()
+            failure_phase = "start"
             try:
                 backend.start_service(service)
             except Exception:
@@ -3000,14 +3003,23 @@ def activate_receipt(
                 raise
             entry["status"] = "completed"
             try:
+                failure_phase = "completed activation checkpoint"
                 receipt._persist()
             except BaseException:
                 # The last durable state is prepared.  Preserve the same state
                 # in memory so compensation/recovery never trusts completion.
                 entry["status"] = "prepared"
                 raise
+        receipt._document.pop("activation_failure", None)
+        _sync_activation_state(receipt)
+        # Activation is intentionally provisional until verify emits passing evidence.
+        receipt._document["activated"] = False
+        receipt._document["qualified"] = False
+        failure_phase = "final activation checkpoint"
+        receipt._persist()
     except Exception as exc:
         compensation_failures: list[str] = []
+        compensation_persistence_failures: list[str] = []
         for entry in reversed(list(activation_journal)):
             service = str(entry["service"])
             try:
@@ -3015,27 +3027,48 @@ def activate_receipt(
             except Exception:
                 compensation_failures.append(service)
             else:
-                _forget_activation_entry(receipt, entry)
+                try:
+                    _forget_activation_entry(receipt, entry)
+                except Exception:
+                    # The helper restores the entry on checkpoint failure.  It
+                    # remains replay authority while compensation continues
+                    # with every earlier service.
+                    compensation_persistence_failures.append(service)
         _sync_activation_state(receipt)
         receipt._document["activated"] = False
         receipt._document["qualified"] = False
         receipt._document["activation_failure"] = {
+            "phase": failure_phase,
             "failed_service": failed_service,
             "compensation_failures": list(reversed(compensation_failures)),
+            "compensation_persistence_failures": list(
+                compensation_persistence_failures
+            ),
         }
-        receipt._persist()
-        detail = f"failed to start {failed_service}: {exc}"
+        failure_record_persisted = True
+        try:
+            receipt._persist()
+        except Exception:
+            # The per-service activation entries were already durable before
+            # every start.  Preserve and report that replay boundary even if
+            # the aggregate failure record cannot be checkpointed.
+            failure_record_persisted = False
+        detail = (
+            f"failed to start {failed_service}: {exc}"
+            if failure_phase == "start"
+            else f"failed {failure_phase} for {failed_service}: {exc}"
+        )
         if compensation_failures:
             detail += "; failed to stop " + ", ".join(
                 reversed(compensation_failures)
             )
+        if compensation_persistence_failures:
+            detail += "; failed to persist compensation for " + ", ".join(
+                compensation_persistence_failures
+            )
+        if not failure_record_persisted:
+            detail += "; failed to persist aggregate activation failure"
         raise ActivationError(detail) from exc
-    receipt._document.pop("activation_failure", None)
-    _sync_activation_state(receipt)
-    # Activation is intentionally provisional until verify emits passing evidence.
-    receipt._document["activated"] = False
-    receipt._document["qualified"] = False
-    receipt._persist()
     return receipt
 
 

@@ -437,6 +437,96 @@ def test_activation_surfaces_reverse_stop_failure_and_records_remaining_service(
     ]
 
 
+def test_activation_compensation_continues_when_every_forget_persist_fails() -> None:
+    _plan_doc, receipt, backend = _applied_receipt()
+    backend.fail_start = "cortex-manager.service"
+    durable: dict[str, object] = {}
+
+    def fail_compensation_persist() -> None:
+        if backend.stopped:
+            raise OSError("injected compensation receipt failure")
+        durable.clear()
+        durable.update(receipt.to_dict())
+
+    receipt._persist = fail_compensation_persist  # type: ignore[method-assign]
+
+    with pytest.raises(ActivationError, match="persist.*manager.*egress"):
+        activate_receipt(receipt, backend=backend)
+
+    assert backend.stopped == [
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
+    assert [row["service"] for row in receipt.to_dict()["activation_journal"]] == [
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+    ]
+    assert durable["activation_journal"] == receipt.to_dict()["activation_journal"]
+
+    recovery_backend = CredentialBackend()
+    recovered = InstallReceipt(durable)
+    report = rollback_receipt(recovered, backend=recovery_backend)
+
+    assert report.retained_drift == ()
+    assert recovery_backend.stopped == [
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
+
+
+def test_final_activation_checkpoint_failure_compensates_all_services_and_replays() -> None:
+    _plan_doc, receipt, backend = _applied_receipt()
+    durable: dict[str, object] = {}
+    final_failure_started = False
+
+    def fail_final_and_compensation_persists() -> None:
+        nonlocal final_failure_started
+        document = receipt.to_dict()
+        journal = document.get("activation_journal", [])
+        if final_failure_started or (
+            document.get("services_started") is True
+            and len(journal) == 3
+            and all(row.get("status") == "completed" for row in journal)
+        ):
+            final_failure_started = True
+            raise OSError("injected final activation checkpoint failure")
+        durable.clear()
+        durable.update(document)
+
+    receipt._persist = fail_final_and_compensation_persists  # type: ignore[method-assign]
+
+    with pytest.raises(ActivationError, match="final.*checkpoint|checkpoint.*final"):
+        activate_receipt(receipt, backend=backend)
+
+    assert backend.started == [
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+        "cortex-monitor.service",
+    ]
+    assert backend.stopped == [
+        "cortex-monitor.service",
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
+    assert [row["service"] for row in receipt.to_dict()["activation_journal"]] == [
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+        "cortex-monitor.service",
+    ]
+    assert durable["activation_journal"] == receipt.to_dict()["activation_journal"]
+
+    recovery_backend = CredentialBackend()
+    recovered = InstallReceipt(durable)
+    report = rollback_receipt(recovered, backend=recovery_backend)
+
+    assert report.retained_drift == ()
+    assert recovery_backend.stopped == [
+        "cortex-monitor.service",
+        "cortex-manager.service",
+        "cortex-egress-proxy.service",
+    ]
+
+
 def test_activation_persists_prepared_and_completed_entry_around_each_start(
     tmp_path: Path,
 ) -> None:

@@ -1168,6 +1168,23 @@ def test_getfacl_failure_is_not_reported_as_an_empty_acl(
         backend_module._read_acl(tmp_path)
 
 
+def test_missing_getfacl_binary_is_not_reported_as_an_empty_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(backend_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        backend_module,
+        "_run",
+        lambda argv, **_kwargs: calls.append(tuple(argv)) or _completed(argv),
+    )
+
+    with pytest.raises(InstallDriftError, match="getfacl|ACL|unavailable"):
+        backend_module._read_acl(tmp_path)
+
+    assert calls == []
+
+
 def test_sudoers_parser_resolves_universal_command_alias_across_continuations() -> None:
     policy = """
 Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true
