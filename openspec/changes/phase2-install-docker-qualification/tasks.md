@@ -7,9 +7,9 @@ work_item: phase2-install-docker-qualification
 
 ## 1. Baseline and prerequisites
 
-- [ ] 記錄 origin/main exact SHA、dirty/untracked preservation 與獨立 worktree boundary。
-- [ ] 逐 commit 重驗並最小納入 `c35516e`、`98978b6`，不整包採用 live-closeout branches。
-- [ ] 以 code/test/live issue evidence 重新裁決 #623/#665/#681/#692/#695/#716/#763；未證實者保持 release blocker。
+- [x] 記錄 origin/main exact SHA、dirty/untracked preservation 與獨立 worktree boundary。
+- [x] 逐 commit 重驗並最小納入 `c35516e`、`98978b6`，不整包採用 live-closeout branches。
+- [x] 以 code/test/live issue evidence 重新裁決 #623/#665/#681/#692/#695/#716/#763；未證實者保持 release blocker。
 
 ## 2. Trust-root install flow (TDD)
 
@@ -45,4 +45,3 @@ work_item: phase2-install-docker-qualification
 - [ ] 對抗審查只列 BLOCKER/MAJOR；未處置缺陷為 FAIL，明文有界殘餘風險本身不構成 FAIL（D6 不可 waiver）。
 - [ ] OpenSpec validate/apply-complete 後 archive；Conventional Commit；依授權建立 PR。
 - [ ] exact-SHA RC qualification 全綠後才允許 `v0.2.0` GitHub Release；否則明確停在 blocked，且不發 PyPI。
-

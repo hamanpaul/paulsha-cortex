@@ -69,7 +69,7 @@ def _step(tmp_path: Path, step_id: str, digest: str) -> dict[str, object]:
         # chmod must precede all ACL writes: chmod after setfacl rewrites the mask.
         "operations": ["snapshot", "chown", "chmod", "set_acl"],
         "desired_sha256": digest,
-        "durable": False,
+        "durable": step_id == "state-root",
     }
 
 
