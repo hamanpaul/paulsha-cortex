@@ -90,6 +90,8 @@ def validate_bundle(
         actual_wheelhouse.add(path.relative_to(root).as_posix())
     if declared_wheelhouse != actual_wheelhouse:
         raise ValueError("wheelhouse inventory is incomplete or contains an undeclared file")
+    if not any(raw.get("sha256") == wheel_sha256 for raw in wheelhouse):
+        raise ValueError("wheelhouse does not contain the exact candidate wheel")
 
     generated = payload["generated_artifacts"]
     if not isinstance(generated, list):

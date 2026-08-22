@@ -17,6 +17,22 @@ from pathlib import Path, PurePosixPath
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
 
+def _relative_symlink_stays_inside(relative: PurePosixPath, target: PurePosixPath) -> bool:
+    if target.is_absolute():
+        return False
+    depth = 0
+    for component in (*relative.parent.parts, *target.parts):
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        else:
+            depth += 1
+    return True
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -35,7 +51,7 @@ def tree_sha256(root: Path) -> str:
         if stat.S_ISLNK(observed.st_mode):
             target = os.readlink(path)
             pure_target = PurePosixPath(target)
-            if pure_target.is_absolute() or ".." in (PurePosixPath(relative).parent / pure_target).parts:
+            if not _relative_symlink_stays_inside(PurePosixPath(relative), pure_target):
                 raise ValueError(f"tree symlink escapes its root: {relative} -> {target}")
             digest.update(b"L\0" + target.encode("utf-8") + b"\0")
         elif stat.S_ISREG(observed.st_mode):
@@ -145,6 +161,7 @@ def build(args: argparse.Namespace) -> dict[str, object]:
         name, version, raw_path, entrypoint = _parse(raw, 4, label="--tool-tree")
         if name in names or "/" in name:
             raise ValueError(f"invalid or duplicate tool name: {name}")
+        names.add(name)
         relative_entrypoint = PurePosixPath(entrypoint)
         if relative_entrypoint.is_absolute() or ".." in relative_entrypoint.parts:
             raise ValueError(f"unsafe tool entrypoint: {name}")

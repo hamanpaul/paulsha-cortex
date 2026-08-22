@@ -361,7 +361,19 @@ def _extract_locked_tree(archive: Path, destination: Path) -> None:
                 raise InstallDriftError(f"toolchain archive has unsupported member: {member.name}")
             if member.issym():
                 target = Path(member.linkname)
-                if target.is_absolute() or ".." in (relative.parent / target).parts:
+                depth = 0
+                safe_target = not target.is_absolute()
+                for component in (*relative.parent.parts, *target.parts):
+                    if component in {"", "."}:
+                        continue
+                    if component == "..":
+                        if depth == 0:
+                            safe_target = False
+                            break
+                        depth -= 1
+                    else:
+                        depth += 1
+                if not safe_target:
                     raise InstallDriftError(f"toolchain archive symlink escapes: {member.name}")
         for member in sorted((row for row in members if row.isdir()), key=lambda row: row.name):
             path = destination / member.name

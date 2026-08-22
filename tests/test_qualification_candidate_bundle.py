@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend, _tree_sha256
 from paulsha_cortex.trust_root.install.core import _desired_digest
-from qualification.prepare_candidate import _inside, _write_tree_archive
+from qualification.prepare_candidate import _inside, _write_tree_archive, build
+from qualification.verify_bundle import validate_bundle
 
 
 def _identity() -> tuple[str, str]:
@@ -41,6 +44,8 @@ def test_tree_archive_is_byte_reproducible_and_matches_installed_tree_hash(
     entrypoint.write_text("#!/usr/bin/node\n", encoding="utf-8")
     entrypoint.chmod(0o755)
     (source / "current").symlink_to("lib")
+    (source / "bin").mkdir()
+    (source / "bin/cli").symlink_to("../lib/cli.js")
 
     first = tmp_path / "first.tar.gz"
     second = tmp_path / "second.tar.gz"
@@ -70,6 +75,68 @@ def test_tree_archive_is_byte_reproducible_and_matches_installed_tree_hash(
     assert outcome["installed_sha256"] == expected
     assert _tree_sha256(installed) == expected
     assert (installed / "current").readlink() == Path("lib")
+    assert (installed / "bin/cli").readlink() == Path("../lib/cli.js")
+
+
+def test_candidate_builder_emits_and_verifies_the_exact_six_tool_roster(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "candidate"
+    (root / "dist").mkdir(parents=True)
+    (root / "wheelhouse").mkdir()
+    (root / "toolchain").mkdir()
+    (root / "source").mkdir()
+    wheel = root / "dist/candidate.whl"
+    wheel.write_bytes(b"wheel")
+    (root / "wheelhouse/candidate.whl").write_bytes(wheel.read_bytes())
+    file_specs: list[str] = []
+    for name in ("codex", "claude", "copilot", "agy"):
+        tool = root / f"toolchain/{name}"
+        tool.write_bytes(name.encode("ascii"))
+        tool.chmod(0o755)
+        file_specs.append(f"{name},1.0,{tool}")
+    tree_specs: list[str] = []
+    for name in ("srt", "openspec"):
+        tree = tmp_path / f"{name}-tree"
+        (tree / "bin").mkdir(parents=True)
+        entrypoint = tree / "bin/cli.js"
+        entrypoint.write_text("#!/usr/bin/node\n", encoding="utf-8")
+        entrypoint.chmod(0o755)
+        tree_specs.append(f"{name},1.0,{tree},bin/cli.js")
+    source_bundle = root / "source/paulsha-cortex.bundle"
+    source_bundle.write_bytes(b"source")
+    candidate_sha = "a" * 40
+
+    payload = build(
+        SimpleNamespace(
+            root=root,
+            candidate_sha=candidate_sha,
+            wheel=wheel,
+            tool_file=file_specs,
+            tool_tree=tree_specs,
+            repository=[
+                "paulsha-cortex,"
+                f"{candidate_sha},https://github.com/hamanpaul/paulsha-cortex.git,"
+                f"{source_bundle}"
+            ],
+        )
+    )
+    bundle = root / "bundle.json"
+    bundle.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert {row["name"] for row in payload["toolchain"]} == {
+        "codex",
+        "claude",
+        "copilot",
+        "agy",
+        "srt",
+        "openspec",
+    }
+    validate_bundle(
+        bundle,
+        candidate_sha=candidate_sha,
+        wheel_sha256=_sha256(wheel),
+    )
 
 
 def test_candidate_member_rejects_an_in_root_symlink_ancestor(tmp_path: Path) -> None:
