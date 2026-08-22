@@ -671,6 +671,7 @@ def build_install_plan(
         "accounts": accounts,
         "service_accounts": service_accounts,
         "roots": roots,
+        "source_repositories": list(layout.source_repo_slugs),
         "assets": assets,
         "generated": generated,
         "provider_manifest": deepcopy(config.get("providers", {})),
@@ -962,14 +963,24 @@ def bind_bundle_artifacts(
         for row in configured_assets
         if isinstance(row, Mapping) and row.get("asset_id") == "repo-source-tree"
     ] if isinstance(configured_assets, list) else []
-    source_slugs = {Path(str(row.get("path", ""))).name for row in source_assets}
+    configured_slugs = bound.get("source_repositories")
     bundled_slugs = {
         str(row.get("slug"))
         for row in repositories
         if isinstance(row, Mapping)
     } if isinstance(repositories, list) else set()
-    if not isinstance(repositories, list) or bundled_slugs != source_slugs:
+    if (
+        not isinstance(repositories, list)
+        or not isinstance(configured_slugs, list)
+        or not all(isinstance(slug, str) and slug for slug in configured_slugs)
+        or bundled_slugs != set(configured_slugs)
+        or len(source_assets) != 1
+    ):
         raise InstallPlanError("source repository bundle does not match the plan")
+    source_container = source_assets[0]
+    source_root = source_container.get("path")
+    if not isinstance(source_root, str) or not source_root.startswith("/"):
+        raise InstallPlanError("source repository container path is invalid")
     repo_steps: list[dict[str, object]] = []
     repo_identity = bound.get("repo_identity")
     for row in repositories:
@@ -978,11 +989,6 @@ def bind_bundle_artifacts(
             row.get(key) != repo_identity.get(key) for key in ("commit", "remote")
         ):
             raise InstallPlanError("source repository identity does not match repo_identity")
-        asset = next(
-            item
-            for item in source_assets
-            if Path(str(item.get("path", ""))).name == row.get("slug")
-        )
         repo_step = {
             "step_id": f"repository:{row['slug']}",
             "kind": "repository",
@@ -991,10 +997,10 @@ def bind_bundle_artifacts(
             "source_sha256": row["sha256"],
             "commit": row["commit"],
             "remote": row["remote"],
-            "path": asset["path"],
-            "owner": asset["owner"],
-            "group": asset["group"],
-            "mode": asset["mode"],
+            "path": f"{source_root.rstrip('/')}/{row['slug']}",
+            "owner": source_container["owner"],
+            "group": source_container["group"],
+            "mode": source_container["mode"],
             "durable": True,
             "operations": ["snapshot", "clone-bundle", "checkout", "chown"],
         }
@@ -1004,23 +1010,18 @@ def bind_bundle_artifacts(
     order = bound.get("apply_order")
     if not isinstance(order, list):
         raise InstallPlanError("plan apply_order is invalid")
-    order = [
-        step
-        for step in order
-        if not (
-            isinstance(step, Mapping)
-            and step.get("step_id") == "asset:repo-source-tree"
-        )
-    ]
-    insertion = next(
+    container_index = next(
         (
             index
             for index, step in enumerate(order)
             if isinstance(step, Mapping)
-            and str(step.get("step_id", "")).startswith("generated:")
+            and step.get("step_id") == "asset:repo-source-tree"
         ),
-        max(0, len(order) - 4),
+        None,
     )
+    if container_index is None:
+        raise InstallPlanError("source repository container apply step is missing")
+    insertion = container_index + 1
     bound["apply_order"] = [
         *order[:insertion],
         *repo_steps,

@@ -15,6 +15,7 @@ import pytest
 from paulsha_cortex.trust_root.install import (
     InstallPlanError,
     UnsafeInstallPathError,
+    bind_bundle_artifacts,
     build_install_plan,
     canonical_plan_bytes,
     plan_sha256,
@@ -137,6 +138,7 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
     assert doc["schema_version"] == 1
     assert doc["scheme"] == "four-way"
     assert doc["repo_identity"]["commit"] == "a" * 40
+    assert doc["source_repositories"] == ["paulsha-cortex"]
     assert doc["candidate"]["wheel_sha256"] == _sha256(wheel)
     assert doc["candidate"]["bundle_sha256"] == _sha256(bundle)
     assert {row["name"] for row in doc["accounts"]} == {
@@ -155,6 +157,50 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
         "gitconfigs",
         "toolchain_wrappers",
     }
+
+
+def test_bundle_binding_preserves_repo_container_and_installs_named_leaf(
+    tmp_path: Path,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    tools = [
+        {
+            "name": name,
+            "version": configured["version"],
+            "shape": "file",
+            "resolved_path": str(tmp_path / f"{name}.locked"),
+            "sha256": configured["sha256"],
+        }
+        for name, configured in plan["toolchain_manifest"].items()
+    ]
+    repository = tmp_path / "paulsha-cortex.bundle"
+    repository.write_bytes(b"exact source bundle\n")
+    repositories = [{
+        "slug": "paulsha-cortex",
+        "commit": "a" * 40,
+        "remote": "https://github.com/hamanpaul/paulsha-cortex.git",
+        "resolved_path": str(repository),
+        "sha256": _sha256(repository),
+    }]
+
+    bound = bind_bundle_artifacts(
+        plan, {"toolchain": tools, "source_repositories": repositories}
+    )
+    step_ids = [step["step_id"] for step in bound["apply_order"]]
+    container_index = step_ids.index("asset:repo-source-tree")
+    repository_index = step_ids.index("repository:paulsha-cortex")
+    repository_step = bound["apply_order"][repository_index]
+
+    assert repository_index == container_index + 1
+    assert repository_step["path"] == f"{plan['roots']['state']}/repos/paulsha-cortex"
+    assert repository_step["owner"] == "cortex-manager"
+    assert repository_step["group"] == "cortex-manager"
+
+    plan["source_repositories"] = ["different-repository"]
+    with pytest.raises(InstallPlanError, match="does not match the plan"):
+        bind_bundle_artifacts(
+            plan, {"toolchain": tools, "source_repositories": repositories}
+        )
 
 
 def test_plan_orders_accounts_and_content_addressed_venv_before_assets(
