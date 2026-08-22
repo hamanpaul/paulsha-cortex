@@ -40,11 +40,13 @@ def test_tree_archive_is_byte_reproducible_and_matches_installed_tree_hash(
 ) -> None:
     source = tmp_path / "source"
     (source / "lib").mkdir(parents=True)
+    (source / "lib").chmod(0o755)
     entrypoint = source / "lib/cli.js"
     entrypoint.write_text("#!/usr/bin/node\n", encoding="utf-8")
     entrypoint.chmod(0o755)
     (source / "current").symlink_to("lib")
     (source / "bin").mkdir()
+    (source / "bin").chmod(0o755)
     (source / "bin/cli").symlink_to("../lib/cli.js")
 
     first = tmp_path / "first.tar.gz"
