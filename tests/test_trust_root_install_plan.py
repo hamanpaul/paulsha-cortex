@@ -148,6 +148,7 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
         "cortex-gate",
     }
     assert doc["assets"], "registry/permgen inventory must not be replaced by prose"
+    assert doc["scaffolds"], "permgen scaffold inventory must be part of the transaction"
     assert doc["apply_order"], "apply must consume typed ordered steps"
     assert all("shell" not in step and "command" not in step for step in doc["apply_order"])
     assert set(doc["generated"]) >= {
@@ -157,6 +158,23 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
         "gitconfigs",
         "toolchain_wrappers",
     }
+
+
+def test_scaffold_targets_are_applied_before_home_redirect_symlinks(
+    tmp_path: Path,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    steps = plan["apply_order"]
+    step_ids = [step["step_id"] for step in steps]
+
+    for asset_id in (
+        "reviewer-planner-agy-state",
+        "reviewer-planner-claude-state",
+    ):
+        symlink = next(asset for asset in plan["assets"] if asset["asset_id"] == asset_id)
+        target_step = f"scaffold:{symlink['symlink_target']}"
+        assert target_step in step_ids
+        assert step_ids.index(target_step) < step_ids.index(f"asset:{asset_id}")
 
 
 def test_bundle_binding_preserves_repo_container_and_installs_named_leaf(

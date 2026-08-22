@@ -514,9 +514,27 @@ def _account_digest(account: Mapping[str, object]) -> str:
 
 
 def _apply_steps(
-    *, assets: Sequence[Mapping[str, object]], generated: Mapping[str, Mapping[str, Mapping[str, str]]]
+    *,
+    scaffolds: Sequence[Mapping[str, object]],
+    assets: Sequence[Mapping[str, object]],
+    generated: Mapping[str, Mapping[str, Mapping[str, str]]],
 ) -> list[dict[str, object]]:
     steps: list[dict[str, object]] = []
+    for scaffold in scaffolds:
+        step: dict[str, object] = {
+            "step_id": f"scaffold:{scaffold['path']}",
+            "kind": "asset",
+            "asset_type": "directory",
+            "path": scaffold["path"],
+            "owner": scaffold["owner"],
+            "group": scaffold["group"],
+            "mode": scaffold["mode"],
+            "acls": [],
+            "operations": ["snapshot", "chown", "chmod", "set_acl"],
+            "durable": False,
+        }
+        step["desired_sha256"] = _desired_digest(step)
+        steps.append(step)
     for asset in assets:
         path = asset.get("path")
         if not isinstance(path, str) or "<job-id>" in path:
@@ -628,6 +646,15 @@ def build_install_plan(
         if entry.is_symlink:
             row["symlink_target"] = layout.symlink_targets().get(entry.asset_id)
         assets.append(row)
+    scaffolds = [
+        {
+            "path": path,
+            "owner": owner,
+            "group": group,
+            "mode": format(mode, "04o"),
+        }
+        for path, owner, group, mode in layout.scaffold_directories(scheme)
+    ]
     generated = _generated_inventory(
         scheme,
         layout,
@@ -672,6 +699,7 @@ def build_install_plan(
         "service_accounts": service_accounts,
         "roots": roots,
         "source_repositories": list(layout.source_repo_slugs),
+        "scaffolds": scaffolds,
         "assets": assets,
         "generated": generated,
         "provider_manifest": deepcopy(config.get("providers", {})),
@@ -719,7 +747,7 @@ def build_install_plan(
                 "desired_sha256": _sha256_file(wheel_path),
                 "rollback_policy": "restore-link-retain-slot",
             },
-            *_apply_steps(assets=assets, generated=generated),
+            *_apply_steps(scaffolds=scaffolds, assets=assets, generated=generated),
             {
                 "step_id": "systemd:daemon-reload",
                 "kind": "systemctl",
