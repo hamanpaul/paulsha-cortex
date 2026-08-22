@@ -21,7 +21,7 @@ verification:
       cwd: .
       timeout_seconds: 180
   tests:
-    - argv: [python3, -m, unittest, tests.test_coordinator_launcher, tests.test_review_verdict_channel_p2a]
+    - argv: [python3, -m, unittest, tests.test_coordinator_launcher.ArgvTests.test_copilot_verdict_spool_grants_exact_file_and_read_only_checks, tests.test_coordinator_launcher.ArgvTests.test_copilot_verdict_spool_rejects_broad_permission_modes, tests.test_coordinator_launcher.ArgvTests.test_copilot_argv, tests.test_coordinator_launcher.ArgvTests.test_copilot_builder_commit_required_scopes_tool_and_git_write_dirs, tests.test_coordinator_launcher.ArgvTests.test_copilot_builder_commit_required_false_preserves_existing_argv]
       cwd: .
       timeout_seconds: 300
   full_suite:
