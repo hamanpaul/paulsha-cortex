@@ -103,15 +103,20 @@ def test_tests_workflow_matches_release_pipeline_contract() -> None:
     _assert_all_uses_have_version_comments("tests.yml")
 
 
-def test_release_workflow_is_tag_only_no_pypi_and_sha_pinned() -> None:
+def test_release_workflow_is_manual_no_pypi_and_sha_pinned() -> None:
     payload = _load_workflow("release.yml")
     on_block = _workflow_on(payload)
-    push = on_block.get("push")
-    assert isinstance(push, dict), "release.yml must trigger from push"
-    assert push.get("tags") == ["v*"]
-    assert (
-        "pull_request" not in on_block
-    ), "release.yml must not trigger from pull_request"
+    assert set(on_block) == {
+        "workflow_dispatch"
+    }, "release.yml must validate an untagged exact SHA before publishing"
+    dispatch = on_block["workflow_dispatch"]
+    assert isinstance(dispatch, dict)
+    inputs = dispatch.get("inputs")
+    assert isinstance(inputs, dict)
+    version = inputs.get("version")
+    assert isinstance(version, dict)
+    assert version.get("required") is True
+    assert version.get("type") == "string"
 
     raw = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     assert "policy_version" not in raw
@@ -173,46 +178,83 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     payload = _load_workflow("release.yml")
     jobs = payload.get("jobs", {})
     assert isinstance(jobs, dict)
+
+    preflight = jobs.get("release-preflight")
+    assert isinstance(preflight, dict), "release.yml must define an untagged preflight"
+    preflight_runs = _job_step_runs(preflight)
+    assert "default-branch head" in preflight_runs
+    assert "release dispatch ref is not the default branch" in preflight_runs
+    assert "actions/workflows/tests.yml/runs" in preflight_runs
+    assert "openspec/changes/phase2-install-docker-qualification" in preflight_runs
+    assert (
+        "phase2-install-docker-qualification" in preflight_runs
+        and "archive" in preflight_runs
+    )
+    assert "merge_commit_sha" in preflight_runs
+    assert 'state == "APPROVED"' in preflight_runs
+    assert "check-runs" in preflight_runs
+    assert "rc-qualification.yml" in preflight_runs
+    assert "head_sha" in preflight_runs
+    assert "matching-refs/tags" in preflight_runs
+    assert "tag target mismatch" in preflight_runs
+    assert "tag already exists" in preflight_runs
+    outputs = preflight.get("outputs")
+    assert isinstance(outputs, dict)
+    assert {"release_sha", "tag_name", "rc_run_id"} <= set(outputs)
+    permissions = payload.get("permissions")
+    assert isinstance(permissions, dict)
+    assert permissions.get("contents") == "read"
+
+    build = jobs.get("build")
+    assert isinstance(build, dict)
+    assert "release-preflight" in _job_needs(build)
+    assert "needs['release-preflight'].outputs.release_sha" in repr(build)
+
     gate = jobs.get("qualification-gate")
     assert isinstance(gate, dict), "release.yml must define qualification-gate"
-    assert "build" in _job_needs(
-        gate
-    ), "the gate must validate the wheel produced by the build job"
+    assert {"release-preflight", "build"} <= _job_needs(gate)
 
     gate_runs = _job_step_runs(gate)
     gate_text = repr(gate)
     gate_lower = gate_runs.lower()
-    assert "rc-qualification.yml" in gate_text.lower()
     assert "qualification.json" in gate_text
     assert "qualification/validate.py" in gate_runs
     assert "--candidate-sha" in gate_runs
     assert "--wheel-sha256" in gate_runs
     assert "sha256sum" in gate_lower
-    assert "head_sha" in gate_text or "head-sha" in gate_text.lower()
-    assert (
-        "success" in gate_text.lower()
-    ), "the selected RC qualification run must have succeeded"
-    assert "actions/workflows/tests.yml/runs" in gate_runs
-    assert "openspec/changes/phase2-install-docker-qualification" in gate_runs
-    assert "phase2-install-docker-qualification" in gate_runs and "archive" in gate_runs
-    assert "merge_commit_sha" in gate_runs
-    assert 'state == "APPROVED"' in gate_runs
-    assert "check-runs" in gate_runs
-    assert "default-branch head" in gate_runs
+    assert "needs['release-preflight'].outputs.release_sha" in gate_text
+    assert "needs['release-preflight'].outputs.rc_run_id" in gate_text
 
     release = jobs.get("release")
     assert isinstance(release, dict)
-    assert "qualification-gate" in _job_needs(
-        release
-    ), "GitHub Release publication must depend on exact-SHA qualification validation"
+    assert {"release-preflight", "qualification-gate"} <= _job_needs(release)
+    release_permissions = release.get("permissions")
+    assert isinstance(release_permissions, dict)
+    assert release_permissions.get("contents") == "write"
 
-    release_runs = _job_step_runs(release).lower()
+    release_runs = _job_step_runs(release)
     release_uses = "\n".join(
         str(step.get("uses", ""))
         for step in release.get("steps", [])
         if isinstance(step, dict)
     ).lower()
-    assert "action-gh-release" in release_uses
+    assert "action-gh-release" not in release_uses
+    assert "default-branch head changed" in release_runs
+    assert "matching-refs/tags" in release_runs
+    assert "tag target mismatch" in release_runs
+    assert "tag already exists" in release_runs
+    assert "repos/${GITHUB_REPOSITORY}/git/tags" in release_runs
+    assert "repos/${GITHUB_REPOSITORY}/git/refs" in release_runs
+    assert "refs/tags/$tag_name" in release_runs
+    assert "gh release create" in release_runs
+    assert "--verify-tag" in release_runs
+    assert "--method DELETE" in release_runs
+    for job_name, job in jobs.items():
+        if job_name == "release" or not isinstance(job, dict):
+            continue
+        non_release_runs = _job_step_runs(job)
+        assert "--method POST" not in non_release_runs
+        assert "gh release create" not in non_release_runs
     assert (
         "qualification/validate.py" not in release_runs
     ), "evidence validation belongs in the required predecessor gate, never after publication"

@@ -1,75 +1,93 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact VERSION value to release (without the v prefix)
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  release-preflight:
     runs-on: ubuntu-latest
+    outputs:
+      release_sha: ${{ steps.preflight.outputs.release_sha }}
+      tag_name: ${{ steps.preflight.outputs.tag_name }}
+      rc_run_id: ${{ steps.preflight.outputs.rc_run_id }}
     steps:
-      - name: Checkout release commit
+      - name: Checkout untagged release candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
-      - name: Setup Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
-        with:
-          python-version: "3.13"
-
-      - name: Verify tag and reproduce candidate wheel
-        run: |
-          set -euo pipefail
-          tag_ref="${GITHUB_REF#refs/tags/v}"
-          version_file="$(tr -d '[:space:]' < VERSION)"
-          if [[ "$tag_ref" != "$version_file" ]]; then
-            echo "::error::tag v$tag_ref does not match VERSION file ($version_file)"
-            exit 1
-          fi
-          python -m pip install --upgrade pip build twine
-          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
-          python -m build --wheel
-          python -m twine check --strict dist/*.whl
-
-      - name: Upload reproduced wheel for gate comparison
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
-        with:
-          name: reproduced-dist
-          path: dist/*.whl
-
-  qualification-gate:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout release validator
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-
-      - name: Download reproduced wheel
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
-        with:
-          name: reproduced-dist
-          path: reproduced-dist
-
-      - name: Verify exact source CI, archive, PR review, and default-branch gates
+      - name: Verify untagged exact source and governance gates
+        id: preflight
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([+-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || {
+            echo "::error::release version is not valid SemVer"
+            exit 1
+          }
+          version_file=$(tr -d '[:space:]' < VERSION)
+          [[ "$RELEASE_VERSION" == "$version_file" ]] || {
+            echo "::error::requested version does not match VERSION file ($version_file)"
+            exit 1
+          }
+          release_sha=$GITHUB_SHA
+          tag_name="v$RELEASE_VERSION"
+
           default_branch=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)
           default_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/$default_branch" --jq .object.sha)
-          [[ "$default_sha" == "$GITHUB_SHA" ]] || {
+          [[ "$GITHUB_REF" == "refs/heads/$default_branch" ]] || {
+            echo "::error::release dispatch ref is not the default branch"
+            exit 1
+          }
+          [[ "$default_sha" == "$release_sha" ]] || {
             echo "::error::release commit is not the exact current default-branch head"
             exit 1
           }
 
+          tag_refs=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/$tag_name")
+          existing=$(jq -sc --arg ref "refs/tags/$tag_name" '
+            [.[][] | select(.ref == $ref)]
+            | if length == 0 then null
+              elif length == 1 then .[0]
+              else error("duplicate exact tag refs") end
+          ' <<<"$tag_refs")
+          if [[ "$existing" != null ]]; then
+            ref_type=$(jq -r .object.type <<<"$existing")
+            ref_sha=$(jq -r .object.sha <<<"$existing")
+            if [[ "$ref_type" == tag ]]; then
+              tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$ref_sha")
+              target_type=$(jq -r .object.type <<<"$tag_object")
+              target_sha=$(jq -r .object.sha <<<"$tag_object")
+            else
+              target_type=$ref_type
+              target_sha=$ref_sha
+            fi
+            if [[ "$target_type" != commit || "$target_sha" != "$release_sha" ]]; then
+              echo "::error::tag target mismatch for $tag_name"
+            else
+              echo "::error::tag already exists for $tag_name"
+            fi
+            exit 1
+          fi
+
           tests_runs=$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/tests.yml/runs" \
-            -f head_sha="$GITHUB_SHA" -f event=push -f per_page=20)
-          jq -e --arg sha "$GITHUB_SHA" '
+            -f head_sha="$release_sha" -f event=push -f per_page=20)
+          jq -e --arg sha "$release_sha" '
             any(.workflow_runs[];
               .head_sha == $sha and .status == "completed" and .conclusion == "success")
           ' <<<"$tests_runs" >/dev/null || {
@@ -92,8 +110,8 @@ jobs:
 
           associated=$(gh api \
             -H 'Accept: application/vnd.github+json' \
-            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")
-          pr_number=$(jq -er --arg sha "$GITHUB_SHA" '
+            "repos/${GITHUB_REPOSITORY}/commits/${release_sha}/pulls")
+          pr_number=$(jq -er --arg sha "$release_sha" '
             [.[] | select(.merged_at != null and .merge_commit_sha == $sha)]
             | if length == 1 then .[0].number else empty end
           ' <<<"$associated") || {
@@ -118,54 +136,105 @@ jobs:
             exit 1
           }
 
-      - name: Find recent successful RC qualification for exact head_sha
-        id: rc
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
           run_json=$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-qualification.yml/runs" \
-            -f event=workflow_dispatch \
-            -f per_page=100)
-          run_id=$(jq -r --arg sha "$GITHUB_SHA" '
+            -f event=workflow_dispatch -f per_page=100)
+          rc_run=$(jq -c --arg sha "$release_sha" '
             [.workflow_runs[]
-              | select(.head_sha == $sha and .conclusion == "success")]
+              | select(.head_sha == $sha and .status == "completed" and .conclusion == "success")]
             | sort_by(.created_at)
-            | last
-            | .id // empty
+            | last // null
           ' <<<"$run_json")
-          created_at=$(jq -r --arg sha "$GITHUB_SHA" '
-            [.workflow_runs[]
-              | select(.head_sha == $sha and .conclusion == "success")]
-            | sort_by(.created_at)
-            | last
-            | .created_at // empty
-          ' <<<"$run_json")
-          [[ -n "$run_id" && -n "$created_at" ]] || {
-            echo "::error::no successful rc-qualification.yml run has head_sha=$GITHUB_SHA"
+          [[ "$rc_run" != null ]] || {
+            echo "::error::no successful rc-qualification.yml run has head_sha=$release_sha"
             exit 1
           }
+          rc_run_id=$(jq -er .id <<<"$rc_run")
+          created_at=$(jq -er .created_at <<<"$rc_run")
           created_epoch=$(date --date="$created_at" +%s)
           now_epoch=$(date +%s)
-          (( now_epoch - created_epoch <= 3 * 24 * 60 * 60 )) || {
-            echo "::error::the exact-SHA RC qualification is older than 3 days"
+          (( created_epoch <= now_epoch && now_epoch - created_epoch <= 3 * 24 * 60 * 60 )) || {
+            echo "::error::the exact-SHA RC qualification is older than 3 days or future-dated"
             exit 1
           }
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$tag_name" >> "$GITHUB_OUTPUT"
+          echo "rc_run_id=$rc_run_id" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: release-preflight
+    steps:
+      - name: Checkout exact untagged release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs['release-preflight'].outputs.release_sha }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Reproduce candidate wheel
+        env:
+          RELEASE_SHA: ${{ needs['release-preflight'].outputs.release_sha }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$RELEASE_SHA" ]] || {
+            echo "::error::build checkout does not match the preflight release SHA"
+            exit 1
+          }
+          version_file=$(tr -d '[:space:]' < VERSION)
+          [[ "$RELEASE_VERSION" == "$version_file" ]] || {
+            echo "::error::requested version no longer matches VERSION"
+            exit 1
+          }
+          python -m pip install --upgrade pip build twine
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$RELEASE_SHA")"
+          python -m build --wheel
+          python -m twine check --strict dist/*.whl
+
+      - name: Upload reproduced wheel for gate comparison
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: reproduced-dist
+          path: dist/*.whl
+
+  qualification-gate:
+    runs-on: ubuntu-latest
+    needs: [release-preflight, build]
+    steps:
+      - name: Checkout exact release validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          ref: ${{ needs['release-preflight'].outputs.release_sha }}
+
+      - name: Download reproduced wheel
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
+        with:
+          name: reproduced-dist
+          path: reproduced-dist
 
       - name: Download exact RC qualification artifact
         uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
         with:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
-          run-id: ${{ steps.rc.outputs.run_id }}
-          name: rc-qualification-${{ github.sha }}
+          run-id: ${{ needs['release-preflight'].outputs.rc_run_id }}
+          name: rc-qualification-${{ needs['release-preflight'].outputs.release_sha }}
           path: rc-candidate
 
       - name: Verify exact wheel hash and qualification binding
+        env:
+          RELEASE_SHA: ${{ needs['release-preflight'].outputs.release_sha }}
         run: |
           set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$RELEASE_SHA" ]] || {
+            echo "::error::validator checkout does not match the preflight release SHA"
+            exit 1
+          }
           mapfile -t rebuilt_wheels < <(find reproduced-dist -maxdepth 1 -type f -name '*.whl' -print)
           mapfile -t qualified_wheels < <(find rc-candidate/qualification-input/dist -maxdepth 1 -type f -name '*.whl' -print)
           ((${#rebuilt_wheels[@]} == 1 && ${#qualified_wheels[@]} == 1)) || {
@@ -189,7 +258,7 @@ jobs:
           manifest_candidate_sha=$(jq -er '.candidate_sha' "$bundle_path")
           manifest_wheel_path=$(jq -er '.wheel.path' "$bundle_path")
           manifest_wheel_sha=$(jq -er '.wheel.sha256' "$bundle_path")
-          [[ "$manifest_candidate_sha" == "$GITHUB_SHA" ]] || {
+          [[ "$manifest_candidate_sha" == "$RELEASE_SHA" ]] || {
             echo "::error::bundle candidate SHA does not match release commit"
             exit 1
           }
@@ -207,7 +276,7 @@ jobs:
           }
           python qualification/validate.py \
             --qualification "$qualification_path" \
-            --candidate-sha "$GITHUB_SHA" \
+            --candidate-sha "$RELEASE_SHA" \
             --wheel-sha256 "$qualified_sha" \
             --bundle-sha256 "$bundle_sha" \
             --evidence-root rc-candidate/qualification-output \
@@ -226,7 +295,10 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: qualification-gate
+    needs: [release-preflight, qualification-gate]
+    permissions:
+      actions: read
+      contents: write
     steps:
       - name: Download release-authoritative wheel
         uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
@@ -234,7 +306,108 @@ jobs:
           name: qualified-dist
           path: dist
 
-      - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2.6.2
-        with:
-          files: dist/*.whl
+      - name: Create verified annotated tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs['release-preflight'].outputs.release_sha }}
+          TAG_NAME: ${{ needs['release-preflight'].outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          release_sha=$RELEASE_SHA
+          tag_name=$TAG_NAME
+          default_branch=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)
+          default_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/$default_branch" --jq .object.sha)
+          [[ "$default_sha" == "$release_sha" ]] || {
+            echo "::error::default-branch head changed after release preflight"
+            exit 1
+          }
+
+          tag_refs=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/$tag_name")
+          existing=$(jq -sc --arg ref "refs/tags/$tag_name" '
+            [.[][] | select(.ref == $ref)]
+            | if length == 0 then null
+              elif length == 1 then .[0]
+              else error("duplicate exact tag refs") end
+          ' <<<"$tag_refs")
+          if [[ "$existing" != null ]]; then
+            ref_type=$(jq -r .object.type <<<"$existing")
+            ref_sha=$(jq -r .object.sha <<<"$existing")
+            if [[ "$ref_type" == tag ]]; then
+              tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$ref_sha")
+              target_type=$(jq -r .object.type <<<"$tag_object")
+              target_sha=$(jq -r .object.sha <<<"$tag_object")
+            else
+              target_type=$ref_type
+              target_sha=$ref_sha
+            fi
+            if [[ "$target_type" != commit || "$target_sha" != "$release_sha" ]]; then
+              echo "::error::tag target mismatch for $tag_name"
+            else
+              echo "::error::tag already exists for $tag_name"
+            fi
+            exit 1
+          fi
+
+          mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print)
+          ((${#wheels[@]} == 1)) || {
+            echo "::error::expected exactly one release-authoritative wheel"
+            exit 1
+          }
+
+          tag_created=false
+          tag_object_sha=
+          cleanup_tag() {
+            if [[ "$tag_created" == true && -n "$tag_object_sha" ]]; then
+              current_sha=$(gh api \
+                "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag_name" \
+                --jq .object.sha 2>/dev/null || true)
+              if [[ "$current_sha" == "$tag_object_sha" ]]; then
+                gh api --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/git/refs/tags/$tag_name" >/dev/null || \
+                  echo "::warning::failed to roll back release tag ref"
+              fi
+            fi
+          }
+          trap cleanup_tag ERR
+
+          tag_object=$(jq -n \
+            --arg tag "$tag_name" \
+            --arg message "Release $tag_name" \
+            --arg object "$release_sha" \
+            '{tag: $tag, message: $message, object: $object, type: "commit"}' | \
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/tags" --input -)
+          tag_object_sha=$(jq -er .sha <<<"$tag_object")
+          jq -n --arg ref "refs/tags/$tag_name" --arg sha "$tag_object_sha" \
+            '{ref: $ref, sha: $sha}' | \
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" --input - >/dev/null
+          tag_created=true
+
+          created_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag_name")
+          created_tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$tag_object_sha")
+          jq -e \
+            --arg ref "refs/tags/$tag_name" \
+            --arg sha "$tag_object_sha" \
+            '.ref == $ref and .object.type == "tag" and .object.sha == $sha' \
+            <<<"$created_ref" >/dev/null || {
+              echo "::error::created annotated tag ref failed verification"
+              false
+            }
+          jq -e \
+            --arg tag "$tag_name" \
+            --arg sha "$release_sha" \
+            '.tag == $tag and .object.type == "commit" and .object.sha == $sha' \
+            <<<"$created_tag" >/dev/null || {
+              echo "::error::created annotated tag target failed verification"
+              false
+            }
+
+          gh release create "$tag_name" "${wheels[0]}" \
+            --verify-tag \
+            --target "$release_sha" \
+            --title "$tag_name" \
+            --generate-notes
+          tag_created=false
+          trap - ERR
