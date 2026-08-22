@@ -17,11 +17,24 @@ import pytest
 from paulsha_cortex.trust_root.install import InstallDriftError
 from paulsha_cortex.trust_root.install import backend as backend_module
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
-from paulsha_cortex.trust_root.install.core import _account_digest, _desired_digest
+from paulsha_cortex.trust_root.install.backend import _mode
+from paulsha_cortex.trust_root.install.core import (
+    InstallPlanError,
+    _account_digest,
+    _desired_digest,
+)
 
 
 def _completed(argv) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+
+def test_mode_parser_accepts_registry_sticky_mode_and_rejects_invalid_values() -> None:
+    assert _mode("1755") == 0o1755
+    assert _mode("0700") == 0o700
+    for invalid in ("755", "01755", "0788", "-700"):
+        with pytest.raises(InstallPlanError, match="invalid mode"):
+            _mode(invalid)
 
 
 def test_account_step_creates_exact_group_and_user_through_typed_argv(

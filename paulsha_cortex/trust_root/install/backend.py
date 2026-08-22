@@ -83,7 +83,7 @@ def _resolve_gid(value: object) -> int:
 def _mode(value: object) -> int:
     if isinstance(value, int):
         return value
-    if not isinstance(value, str) or not re.fullmatch(r"0[0-7]{3,4}", value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-7]{4}", value):
         raise InstallPlanError(f"invalid mode: {value!r}")
     return int(value, 8)
 
