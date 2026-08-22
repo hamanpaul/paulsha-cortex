@@ -141,6 +141,25 @@ def _plan_command(args: argparse.Namespace) -> int:
             ],
         }
     )
+    venv_step = next(
+        (
+            step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, dict) and step.get("kind") == "venv"
+        ),
+        None,
+    )
+    if not isinstance(venv_step, dict):
+        raise InstallPlanError("generated plan lacks the candidate venv step")
+    venv_step["wheel_source"] = wheel["resolved_path"]
+    venv_step["wheelhouse"] = [
+        {"source": row["resolved_path"], "sha256": row["sha256"]}
+        for row in manifest["wheelhouse"]
+    ]
+    if not any(
+        row["sha256"] == wheel["sha256"] for row in venv_step["wheelhouse"]
+    ):
+        raise InstallPlanError("bundle wheelhouse must include the exact candidate wheel")
     output = Path(args.output).expanduser().absolute()
     atomic_write_json(output, plan, mode=0o644)
     _emit({"output": str(output), "plan_sha256": plan_sha256(plan)})
@@ -198,7 +217,12 @@ def _credential_command(args: argparse.Namespace) -> int:
         ),
         None,
     )
-    if not isinstance(account, Mapping) or not isinstance(account.get("home"), str):
+    if (
+        not isinstance(account, Mapping)
+        or not isinstance(account.get("home"), str)
+        or not isinstance(account.get("uid"), int)
+        or not isinstance(account.get("gid"), int)
+    ):
         raise InstallPlanError(
             f"receipt plan lacks the home for principal {args.principal}"
         )
@@ -208,6 +232,8 @@ def _credential_command(args: argparse.Namespace) -> int:
         provider=args.provider,
         source=Path(args.source),
         destination_root=Path(str(account["home"])),
+        destination_uid=account["uid"],
+        destination_gid=account["gid"],
     )
     _emit(metadata.to_dict())
     return 0

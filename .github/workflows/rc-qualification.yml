@@ -73,27 +73,33 @@ jobs:
             remote: https://github.com/hamanpaul/paulsha-cortex.git
             commit: ${CANDIDATE_SHA}
           operator_account: root
-          external_reader_account: null
+          external_reader_account: "<absent>"
           accounts:
             cortex-manager:
               uid: 991
               gid: 991
-              home: /var/lib/cortex/manager
+              home: /var/lib/cortex-manager
               shell: /usr/sbin/nologin
             cortex-reviewer-planner:
               uid: 992
               gid: 992
-              home: /var/lib/cortex/reviewer-planner
+              home: /var/lib/cortex-reviewer-planner
               shell: /usr/sbin/nologin
             cortex-builder:
               uid: 993
               gid: 993
-              home: /var/lib/cortex/builder
+              home: /var/lib/cortex-builder
               shell: /usr/sbin/nologin
             cortex-gate:
               uid: 994
               gid: 994
-              home: /var/lib/cortex/gate
+              home: /var/lib/cortex-gate
+              shell: /usr/sbin/nologin
+          service_accounts:
+            cortex-egress:
+              uid: 995
+              gid: 995
+              home: /var/lib/cortex-egress
               shell: /usr/sbin/nologin
           roots:
             deploy: /opt/cortex

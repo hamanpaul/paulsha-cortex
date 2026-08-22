@@ -71,6 +71,14 @@ def _safe_config(tmp_path: Path) -> dict[str, object]:
                 "shell": "/usr/sbin/nologin",
             },
         },
+        "service_accounts": {
+            "cortex-egress": {
+                "uid": 995,
+                "gid": 995,
+                "home": str(roots / "var/lib/cortex-egress"),
+                "shell": "/usr/sbin/nologin",
+            }
+        },
         "roots": {
             "deploy": str(roots / "opt/cortex"),
             "state": str(roots / "var/lib/cortex"),
@@ -147,6 +155,41 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
         "gitconfigs",
         "toolchain_wrappers",
     }
+
+
+def test_plan_orders_accounts_and_content_addressed_venv_before_assets(
+    tmp_path: Path,
+) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    plan = build_install_plan(
+        config=_safe_config(tmp_path), candidate_wheel=wheel, bundle=bundle
+    )
+    steps = plan["apply_order"]
+
+    assert [step["kind"] for step in steps[:5]] == ["account"] * 5
+    assert {step["name"] for step in steps[:5]} == {
+        "cortex-manager",
+        "cortex-reviewer-planner",
+        "cortex-builder",
+        "cortex-gate",
+        "cortex-egress",
+    }
+    venv = steps[5]
+    wheel_sha = _sha256(wheel)
+    assert venv["kind"] == "venv"
+    assert venv["path"].endswith(f"/venvs/{wheel_sha}")
+    assert venv["active_link"].endswith("/opt/cortex/venv")
+    assert venv["wheel_source"] == str(wheel.absolute())
+    assert venv["wheelhouse"] == [
+        {"source": str(wheel.absolute()), "sha256": wheel_sha}
+    ]
+    assert next(index for index, step in enumerate(steps) if step["kind"] == "asset") > 5
+    assert steps[-4]["action"] == "daemon-reload"
+    assert [step["unit"] for step in steps[-3:]] == [
+        "cortex-egress-proxy.service",
+        "cortex-manager.service",
+        "cortex-monitor.service",
+    ]
 
 
 def test_manager_gitconfig_in_plan_delivers_the_gh_credential_helper_763(

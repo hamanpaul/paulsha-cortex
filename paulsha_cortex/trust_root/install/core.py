@@ -208,6 +208,31 @@ def _account_rows(config: Mapping[str, object], scheme: permgen.UidScheme) -> li
     return rows
 
 
+def _service_account_rows(config: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_accounts = config.get("service_accounts")
+    if not isinstance(raw_accounts, Mapping) or set(raw_accounts) != {
+        permgen.EGRESS_PROXY.account
+    }:
+        raise InstallPlanError(
+            "service_accounts must declare exactly the dedicated cortex-egress account"
+        )
+    name = permgen.EGRESS_PROXY.account
+    raw = raw_accounts[name]
+    if not isinstance(raw, Mapping):
+        raise InstallPlanError(f"service account {name} must be an object")
+    uid = raw.get("uid")
+    gid = raw.get("gid")
+    shell = raw.get("shell")
+    if not isinstance(uid, int) or uid <= 0:
+        raise InstallPlanError(f"service account {name} has an invalid uid")
+    if not isinstance(gid, int) or gid <= 0:
+        raise InstallPlanError(f"service account {name} has an invalid gid")
+    if not isinstance(shell, str) or not shell.startswith("/"):
+        raise InstallPlanError(f"service account {name} shell must be absolute")
+    home = _validate_absolute_path(raw.get("home"), label=f"service_accounts.{name}.home")
+    return [{"name": name, "uid": uid, "gid": gid, "home": home, "shell": shell}]
+
+
 def _layout_from_config(config: Mapping[str, object], accounts: Sequence[Mapping[str, object]]) -> tuple[permgen.PathLayout, dict[str, str]]:
     raw_roots = config.get("roots")
     if not isinstance(raw_roots, Mapping):
@@ -235,7 +260,71 @@ def _layout_from_config(config: Mapping[str, object], accounts: Sequence[Mapping
         home_root=home_root,
         source_repo_slugs=tuple(source_repos),
     )
+    mismatched_homes = [
+        str(row["name"])
+        for row in accounts
+        if layout.home_of(str(row["name"])) != str(row["home"])
+    ]
+    if mismatched_homes:
+        raise InstallPlanError(
+            "account homes must equal the PathLayout-derived paths: "
+            + ", ".join(sorted(mismatched_homes))
+        )
     return layout, roots
+
+
+def _manager_environment(
+    *,
+    config: Mapping[str, object],
+    scheme: permgen.UidScheme,
+    layout: permgen.PathLayout,
+) -> str:
+    remote = config.get("repo_identity", {}).get("remote") if isinstance(
+        config.get("repo_identity"), Mapping
+    ) else None
+    if not isinstance(remote, str) or not remote:
+        raise InstallPlanError("repo_identity.remote is required")
+    identity = remote.removesuffix(".git").rstrip("/").rsplit("/", 2)
+    if len(identity) < 2:
+        raise InstallPlanError("repo_identity.remote cannot be converted to owner/repo")
+    repo_slug = layout.source_repo_slugs[0]
+    values = {
+        "PSC_INSTANCE": layout.instance,
+        "PSC_AGENTS_ROOT": layout.agents_root,
+        "PSC_PROJECT_CONFIG_ROOT": layout.project_config_root,
+        "PSC_WORKTREE_ROOT": layout.worktree_root,
+        "PSC_DEGRADED_OPERATION": "per-case-approval",
+        "PSC_REPO_ROOT": layout.source_repo_paths()[0],
+        "PSC_REPO_IDENTITY": "/".join(identity[-2:]),
+        "PSC_MANAGER_EXECUTOR": "codex",
+        "PSC_MANAGER_INTERVAL_SECONDS": "60",
+        "PSC_MANAGER_GITHUB_INTERVAL_MS": "600000",
+        "PSC_GATE_CMD_PYTEST": "python3 -m pytest -q",
+        "PSC_GATE_TIMEOUT": "900",
+        "PSC_PREFLIGHT_CMD": layout.preflight_command_value(),
+        "PSC_JOB_RUNNER": "systemd-template",
+        "PSC_BUILDER_ACCOUNT": str(scheme.resolve(registry.Principal.BUILDER)),
+        "PSC_BUILDER_HOME": layout.home_of(
+            str(scheme.resolve(registry.Principal.BUILDER))
+        ),
+        "PSC_BUILDER_PATH": layout.job_path_value(),
+        "PSC_REVIEWER_ACCOUNT": str(scheme.resolve(registry.Principal.REVIEWER)),
+        "PSC_REVIEWER_HOME": layout.home_of(
+            str(scheme.resolve(registry.Principal.REVIEWER))
+        ),
+        "PSC_REVIEWER_PATH": layout.job_path_value(),
+        "PSC_GATE_ACCOUNT": str(scheme.resolve(registry.Principal.GATE)),
+        "PSC_GATE_HOME": layout.home_of(str(scheme.resolve(registry.Principal.GATE))),
+        "PSC_GATE_PATH": layout.job_path_value(),
+        "PSC_GATE_PYTHON": f"{layout.venv_root}/bin/python3",
+        "PSC_GATE_HARDENING_PROFILE": "strict",
+    }
+    if not repo_slug:
+        raise InstallPlanError("at least one source repository is required")
+    return "".join(
+        f'{key}={json.dumps(value, ensure_ascii=False)}\n'
+        for key, value in values.items()
+    )
 
 
 def _artifact_dict(
@@ -256,6 +345,7 @@ def _generated_inventory(
     roots: Mapping[str, str],
     permission_plan: permgen.PermissionPlan,
     toolchain: object,
+    config: Mapping[str, object],
 ) -> dict[str, dict[str, dict[str, str]]]:
     units = [
         permgen.build_egress_proxy_unit(scheme, layout),
@@ -320,12 +410,19 @@ def _generated_inventory(
             wrappers[name] = _artifact_dict(
                 content=content, path=wrapper_path, mode="0755"
             )
+    environment = {
+        Path(layout.env_file).name: _artifact_dict(
+            content=_manager_environment(config=config, scheme=scheme, layout=layout),
+            path=layout.env_file,
+        )
+    }
     return {
         "units": unit_inventory,
         "shim": shim_inventory,
         "polkit": polkit_inventory,
         "gitconfigs": gitconfigs,
         "toolchain_wrappers": wrappers,
+        "environment": environment,
     }
 
 
@@ -352,6 +449,19 @@ def _desired_digest(step: Mapping[str, object]) -> str:
         "asset_type": step.get("asset_type"),
     }
     return hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
+
+
+def _account_digest(account: Mapping[str, object]) -> str:
+    """Hash the complete immutable service-account identity."""
+
+    return hashlib.sha256(
+        _canonical_bytes(
+            {
+                key: account.get(key)
+                for key in ("name", "uid", "gid", "home", "login_program")
+            }
+        )
+    ).hexdigest()
 
 
 def _apply_steps(
@@ -392,7 +502,14 @@ def _apply_steps(
         }
         step["desired_sha256"] = _desired_digest(step)
         steps.append(step)
-    for category in ("units", "shim", "polkit", "gitconfigs", "toolchain_wrappers"):
+    for category in (
+        "units",
+        "shim",
+        "polkit",
+        "gitconfigs",
+        "toolchain_wrappers",
+        "environment",
+    ):
         for name, artifact in sorted(generated.get(category, {}).items()):
             step = {
                 "step_id": f"generated:{category}/{name}",
@@ -424,6 +541,14 @@ def build_install_plan(
     bundle_path = _validate_regular_file(Path(bundle), label="bundle")
     scheme = _configured_scheme(config)
     accounts = _account_rows(config, scheme)
+    service_accounts = _service_account_rows(config)
+    principal_uids = {int(row["uid"]) for row in accounts}
+    principal_gids = {int(row["gid"]) for row in accounts}
+    for row in service_accounts:
+        if int(row["uid"]) in principal_uids or int(row["gid"]) in principal_gids:
+            raise InstallPlanError(
+                f"service account {row['name']} must use a dedicated uid and gid"
+            )
     layout, roots = _layout_from_config(config, accounts)
     permission_plan = permgen.generate_plan(scheme)
     permgen.assert_principals_resolved(permission_plan, scheme)
@@ -434,7 +559,12 @@ def build_install_plan(
         row["path"] = asset_paths.get(entry.asset_id)
         assets.append(row)
     generated = _generated_inventory(
-        scheme, layout, roots, permission_plan, config.get("toolchain", {})
+        scheme,
+        layout,
+        roots,
+        permission_plan,
+        config.get("toolchain", {}),
+        config,
     )
     required_credentials = [
         {"principal": str(principal), "provider": str(provider)}
@@ -469,17 +599,13 @@ def build_install_plan(
         "external_reader_account": config["external_reader_account"],
         "legacy_policy": legacy_policy,
         "accounts": accounts,
+        "service_accounts": service_accounts,
         "roots": roots,
         "assets": assets,
         "generated": generated,
         "provider_manifest": deepcopy(config.get("providers", {})),
         "toolchain_manifest": deepcopy(config.get("toolchain", {})),
         "required_credentials": required_credentials,
-        # Account adoption/creation and the hash-locked venv cutover are
-        # deliberately first.  The initial production backend supports typed
-        # file assets and systemctl only, so it rejects these known-but-
-        # unsupported steps before mutating the filesystem rather than ever
-        # claiming a partial installation is "applied".
         "apply_order": [
             *(
                 {
@@ -490,17 +616,65 @@ def build_install_plan(
                     "gid": row["gid"],
                     "home": row["home"],
                     "login_program": row["shell"],
+                    "desired_sha256": _account_digest(
+                        {
+                            "name": row["name"],
+                            "uid": row["uid"],
+                            "gid": row["gid"],
+                            "home": row["home"],
+                            "login_program": row["shell"],
+                        }
+                    ),
+                    "rollback_policy": "retain",
                 }
-                for row in accounts
+                for row in (*accounts, *service_accounts)
             ),
             {
                 "step_id": "candidate-venv",
                 "kind": "venv",
-                "path": f"{roots['deploy']}/venv.new",
+                "path": (
+                    f"{roots['deploy']}/venvs/{_sha256_file(wheel_path)}"
+                ),
+                "active_link": f"{roots['deploy']}/venv",
+                "wheel_source": str(wheel_path),
                 "wheel_sha256": _sha256_file(wheel_path),
+                "wheelhouse": [
+                    {
+                        "source": str(wheel_path),
+                        "sha256": _sha256_file(wheel_path),
+                    }
+                ],
                 "wheelhouse_locked": True,
+                "desired_sha256": _sha256_file(wheel_path),
+                "rollback_policy": "restore-link-retain-slot",
             },
             *_apply_steps(assets=assets, generated=generated),
+            {
+                "step_id": "systemd:daemon-reload",
+                "kind": "systemctl",
+                "action": "daemon-reload",
+                "operations": ["daemon-reload"],
+                "desired_sha256": hashlib.sha256(
+                    b"systemctl:daemon-reload\n"
+                ).hexdigest(),
+            },
+            *(
+                {
+                    "step_id": f"systemd:enable:{unit}",
+                    "kind": "systemctl",
+                    "action": "enable",
+                    "unit": unit,
+                    "operations": ["enable"],
+                    "desired_sha256": hashlib.sha256(
+                        f"systemctl:enable:{unit}\n".encode("utf-8")
+                    ).hexdigest(),
+                }
+                for unit in (
+                    "cortex-egress-proxy.service",
+                    "cortex-manager.service",
+                    "cortex-monitor.service",
+                )
+            ),
         ],
         "activation_order": [
             "cortex-egress-proxy.service",
@@ -613,17 +787,63 @@ def validate_preflight(
     observed_accounts = facts.get("accounts", {})
     if not isinstance(observed_accounts, Mapping):
         observed_accounts = {}
-    for desired in plan.get("accounts", []):
+    observed_uids = facts.get("account_uids", {})
+    if not isinstance(observed_uids, Mapping):
+        observed_uids = {}
+    observed_gids = facts.get("group_gids", {})
+    if not isinstance(observed_gids, Mapping):
+        observed_gids = {}
+    observed_groups = facts.get("groups", {})
+    if not isinstance(observed_groups, Mapping):
+        observed_groups = {}
+    desired_accounts = [
+        row
+        for key in ("accounts", "service_accounts")
+        for row in plan.get(key, [])
+    ]
+    for desired in desired_accounts:
         if not isinstance(desired, Mapping) or not isinstance(desired.get("name"), str):
             raise InstallPlanError("plan account entries must be typed objects")
         name = str(desired["name"])
         observed = observed_accounts.get(name)
+        uid_owner = observed_uids.get(desired.get("uid"))
+        if uid_owner is not None and uid_owner != name:
+            raise AccountCollisionError(
+                f"desired uid {desired.get('uid')} is already owned by {uid_owner}"
+            )
+        gid_owner = observed_gids.get(desired.get("gid"))
+        if gid_owner is not None and gid_owner != name:
+            raise AccountCollisionError(
+                f"desired gid {desired.get('gid')} is already owned by {gid_owner}"
+            )
+        observed_group = observed_groups.get(name)
+        if observed_group is not None and (
+            not isinstance(observed_group, Mapping)
+            or observed_group.get("gid") != desired.get("gid")
+        ):
+            raise AccountCollisionError(f"existing group {name} does not match the plan")
         if observed is None:
             continue
         if not isinstance(observed, Mapping) or any(
             observed.get(key) != desired.get(key) for key in ("uid", "gid", "home", "shell")
         ):
             raise AccountCollisionError(f"existing account {name} does not match the plan")
+
+    services = facts.get("services", {})
+    if isinstance(services, Mapping):
+        active = sorted(
+            str(name)
+            for name, state in services.items()
+            if state not in {None, "inactive", "failed", "unknown"}
+        )
+        if active:
+            failures.append(
+                {
+                    "code": "services_active",
+                    "detail": "services must be stopped before apply: "
+                    + ", ".join(active),
+                }
+            )
 
     observed_paths = facts.get("paths", {})
     if not isinstance(observed_paths, Mapping):
@@ -909,6 +1129,8 @@ def import_credential(
     provider: str,
     source: Path,
     destination_root: Path,
+    destination_uid: int | None = None,
+    destination_gid: int | None = None,
 ) -> CredentialMetadata:
     if receipt._document.get("state") != "applied":
         raise CredentialImportError("credentials may only be imported into an applied receipt")
@@ -963,6 +1185,17 @@ def import_credential(
     temporary_path = Path(temporary)
     try:
         os.fchmod(descriptor, 0o600)
+        if destination_uid is not None or destination_gid is not None:
+            if (
+                not isinstance(destination_uid, int)
+                or destination_uid < 0
+                or not isinstance(destination_gid, int)
+                or destination_gid < 0
+            ):
+                raise CredentialImportError(
+                    "credential destination uid/gid must be non-negative integers"
+                )
+            os.fchown(descriptor, destination_uid, destination_gid)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
             stream.flush()

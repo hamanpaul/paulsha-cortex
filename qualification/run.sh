@@ -174,10 +174,10 @@ import_secret() {
     unset "$variable_name"
 }
 
-import_secret CORTEX_RC_CODEX_AUTH cortex-builder codex /run/auth.json
-import_secret CORTEX_RC_AGY_AUTH cortex-reviewer-planner agy /run/oauth_creds.json
-import_secret CORTEX_RC_COPILOT_AUTH cortex-reviewer-planner copilot /run/hosts.json
-import_secret CORTEX_RC_MANAGER_GITHUB_AUTH cortex-manager github /run/hosts.yml
+import_secret CORTEX_RC_CODEX_AUTH builder codex /run/auth.json
+import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy /run/oauth_creds.json
+import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
+import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
 
 docker exec "$container_name" cortex install trust-root activate --receipt "$receipt_path"
 install_evidence_path=/var/lib/cortex/qualification/install-verification.json

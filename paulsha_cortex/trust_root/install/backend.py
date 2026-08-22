@@ -20,6 +20,7 @@ from .core import (
     InstallPlanError,
     InstallReceipt,
     UnsafeInstallPathError,
+    _account_digest,
     _desired_digest,
     _reject_symlink_ancestors,
 )
@@ -85,6 +86,81 @@ def _mode(value: object) -> int:
     if not isinstance(value, str) or not re.fullmatch(r"0[0-7]{3,4}", value):
         raise InstallPlanError(f"invalid mode: {value!r}")
     return int(value, 8)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _account_state(step: Mapping[str, object]) -> dict[str, object]:
+    name = step.get("name")
+    if not isinstance(name, str) or not name:
+        raise InstallPlanError("account step requires a name")
+    try:
+        account = pwd.getpwnam(name)
+    except KeyError:
+        return {"exists": False}
+    try:
+        group = grp.getgrnam(name)
+    except KeyError:
+        return {"exists": True, "installed_sha256": None}
+    observed = {
+        "name": name,
+        "uid": account.pw_uid,
+        "gid": account.pw_gid,
+        "home": account.pw_dir,
+        "login_program": account.pw_shell,
+    }
+    if group.gr_gid != account.pw_gid:
+        return {"exists": True, **observed, "installed_sha256": None}
+    return {
+        "exists": True,
+        **observed,
+        "installed_sha256": _account_digest(observed),
+    }
+
+
+def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
+    slot = Path(str(step.get("path", "")))
+    active = Path(str(step.get("active_link", "")))
+    expected = step.get("wheel_sha256")
+    if not slot.is_absolute() or not active.is_absolute() or not isinstance(expected, str):
+        raise InstallPlanError("venv step requires absolute slot/link and wheel hash")
+    marker = slot / ".cortex-wheel.sha256"
+    if not _venv_slot_matches(slot, expected):
+        return {"exists": False}
+    marker_value = marker.read_text(encoding="ascii").strip()
+    try:
+        link_target = active.readlink()
+    except (OSError, ValueError):
+        return {"exists": True, "installed_sha256": None}
+    resolved_target = (active.parent / link_target).resolve(strict=False)
+    if marker_value != expected or resolved_target != slot.resolve(strict=False):
+        return {"exists": True, "installed_sha256": None}
+    return {
+        "exists": True,
+        "installed_sha256": expected,
+        "link_target": str(link_target),
+    }
+
+
+def _venv_slot_matches(slot: Path, expected: str) -> bool:
+    marker = slot / ".cortex-wheel.sha256"
+    try:
+        return (
+            slot.is_dir()
+            and not slot.is_symlink()
+            and marker.is_file()
+            and not marker.is_symlink()
+            and marker.read_text(encoding="ascii").strip() == expected
+            and (slot / "bin/python").is_file()
+        )
+    except OSError:
+        return False
 
 
 def _read_acl(path: Path) -> list[dict[str, object]]:
@@ -166,6 +242,12 @@ class LocalInstallBackend:
     def preflight_facts(self, plan: Mapping[str, object]) -> Mapping[str, object]:
         roots = plan.get("roots", {})
         deploy = Path(str(roots.get("deploy", "/opt/cortex"))) if isinstance(roots, Mapping) else Path("/opt/cortex")
+        desired_accounts = [
+            row
+            for key in ("accounts", "service_accounts")
+            for row in plan.get(key, [])
+            if isinstance(row, Mapping)
+        ]
         services: dict[str, str] = {}
         for name in (
             "cortex-egress-proxy.service",
@@ -177,7 +259,7 @@ class LocalInstallBackend:
                 result.stdout.strip() if result is not None and result.stdout.strip() else "inactive"
             )
         accounts: dict[str, dict[str, object]] = {}
-        for row in plan.get("accounts", []):
+        for row in desired_accounts:
             if not isinstance(row, Mapping) or not isinstance(row.get("name"), str):
                 continue
             name = str(row["name"])
@@ -192,6 +274,16 @@ class LocalInstallBackend:
                 "home": record.pw_dir,
                 "shell": record.pw_shell,
             }
+        account_uids = {record.pw_uid: record.pw_name for record in pwd.getpwall()}
+        all_groups = {record.gr_name: record for record in grp.getgrall()}
+        group_gids = {record.gr_gid: record.gr_name for record in all_groups.values()}
+        groups = {
+            name: {"name": name, "gid": all_groups[name].gr_gid}
+            for row in desired_accounts
+            if isinstance(row, Mapping) and isinstance(row.get("name"), str)
+            for name in (str(row["name"]),)
+            if name in all_groups
+        }
         paths: dict[str, dict[str, object]] = {}
         for step in plan.get("apply_order", []):
             if not isinstance(step, Mapping) or not isinstance(step.get("path"), str):
@@ -221,11 +313,23 @@ class LocalInstallBackend:
             "in_flight_jobs": 0,
             "services": services,
             "accounts": accounts,
+            "account_uids": account_uids,
+            "group_gids": group_gids,
+            "groups": groups,
             "paths": paths,
         }
 
     def inspect_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        if step.get("kind") == "account":
+            return _account_state(step)
+        if step.get("kind") == "venv":
+            return _venv_state(step)
         if step.get("kind") == "systemctl":
+            if step.get("action") == "daemon-reload":
+                return {
+                    "exists": True,
+                    "installed_sha256": step.get("desired_sha256"),
+                }
             name = str(step.get("unit", ""))
             result = _run(("systemctl", "is-enabled", name))
             enabled = result.returncode == 0
@@ -253,6 +357,160 @@ class LocalInstallBackend:
 
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
         kind = step.get("kind")
+        if kind == "account":
+            prior = _account_state(step)
+            if prior.get("exists"):
+                if prior.get("installed_sha256") != step.get("desired_sha256"):
+                    raise InstallDriftError(
+                        f"existing account does not match desired identity: {step.get('name')}"
+                    )
+                return {"prior": prior, **prior}
+            name = str(step.get("name", ""))
+            uid = step.get("uid")
+            gid = step.get("gid")
+            home = step.get("home")
+            login_program = step.get("login_program")
+            if (
+                not name
+                or not isinstance(uid, int)
+                or not isinstance(gid, int)
+                or not isinstance(home, str)
+                or not Path(home).is_absolute()
+                or not isinstance(login_program, str)
+                or not Path(login_program).is_absolute()
+            ):
+                raise InstallPlanError(f"invalid account step: {step!r}")
+            try:
+                existing_group = grp.getgrnam(name)
+            except KeyError:
+                _run(("groupadd", "--gid", str(gid), "--system", name), check=True)
+            else:
+                if existing_group.gr_gid != gid:
+                    raise InstallDriftError(
+                        f"existing group does not match desired gid: {name}"
+                    )
+            _run(
+                (
+                    "useradd",
+                    "--uid",
+                    str(uid),
+                    "--gid",
+                    str(gid),
+                    "--home-dir",
+                    home,
+                    "--shell",
+                    login_program,
+                    "--no-create-home",
+                    "--system",
+                    name,
+                ),
+                check=True,
+            )
+            installed = _account_state(step)
+            if installed.get("installed_sha256") != step.get("desired_sha256"):
+                raise InstallDriftError(f"created account does not match plan: {name}")
+            return {"prior": prior, **installed}
+        if kind == "venv":
+            prior = self.inspect_step(step)
+            if prior.get("installed_sha256") == step.get("desired_sha256"):
+                return {"prior": prior, **prior}
+            slot = Path(str(step.get("path", "")))
+            active = Path(str(step.get("active_link", "")))
+            wheel = Path(str(step.get("wheel_source", "")))
+            expected = step.get("wheel_sha256")
+            wheelhouse = step.get("wheelhouse")
+            if (
+                not slot.is_absolute()
+                or not active.is_absolute()
+                or not wheel.is_absolute()
+                or not isinstance(expected, str)
+                or not isinstance(wheelhouse, list)
+                or not wheelhouse
+            ):
+                raise InstallPlanError("venv step is not fully hash-bound")
+            for label, candidate, digest in (
+                ("candidate wheel", wheel, expected),
+                *(
+                    (
+                        f"wheelhouse[{index}]",
+                        Path(str(row.get("source", ""))),
+                        row.get("sha256"),
+                    )
+                    for index, row in enumerate(wheelhouse)
+                    if isinstance(row, Mapping)
+                ),
+            ):
+                if (
+                    not candidate.is_absolute()
+                    or candidate.is_symlink()
+                    or not candidate.is_file()
+                    or not isinstance(digest, str)
+                    or _sha256_file(candidate) != digest
+                ):
+                    raise InstallDriftError(f"{label} is missing, unsafe, or hash-mismatched")
+                _reject_symlink_ancestors(candidate, label=label, include_leaf=False)
+            if len(wheelhouse) != sum(isinstance(row, Mapping) for row in wheelhouse):
+                raise InstallPlanError("wheelhouse entries must be typed objects")
+            if not any(
+                isinstance(row, Mapping) and row.get("sha256") == expected
+                for row in wheelhouse
+            ):
+                raise InstallPlanError("wheelhouse does not contain the candidate wheel")
+            slot_ready = _venv_slot_matches(slot, expected)
+            if (slot.exists() or slot.is_symlink()) and not slot_ready:
+                raise InstallDriftError(f"existing candidate slot is not attestable: {slot}")
+            if active.exists() and not active.is_symlink():
+                raise InstallDriftError(f"active venv path is not a managed symlink: {active}")
+            prior_link: dict[str, object] = {"exists": active.is_symlink()}
+            if active.is_symlink():
+                prior_link["link_target"] = str(active.readlink())
+            if not slot_ready:
+                slot.parent.mkdir(parents=True, exist_ok=True)
+                _reject_symlink_ancestors(slot, label="candidate venv")
+                temporary = Path(tempfile.mkdtemp(prefix=f".{slot.name}.", dir=slot.parent))
+                try:
+                    _run(("python3", "-m", "venv", str(temporary)), check=True)
+                    link_dirs = sorted(
+                        {
+                            str(Path(str(row["source"])).parent)
+                            for row in wheelhouse
+                            if isinstance(row, Mapping)
+                        }
+                    )
+                    argv = [str(temporary / "bin/python"), "-m", "pip", "install", "--no-index"]
+                    for directory in link_dirs:
+                        argv.extend(("--find-links", directory))
+                    argv.append(str(wheel))
+                    _run(tuple(argv), check=True)
+                    _run(
+                        (
+                            str(temporary / "bin/python"),
+                            "-c",
+                            "import paulsha_cortex; from paulsha_cortex.cli import main",
+                        ),
+                        check=True,
+                    )
+                    (temporary / ".cortex-wheel.sha256").write_text(
+                        expected + "\n", encoding="ascii"
+                    )
+                    os.rename(temporary, slot)
+                except BaseException:
+                    shutil.rmtree(temporary, ignore_errors=True)
+                    raise
+            active.parent.mkdir(parents=True, exist_ok=True)
+            temporary_link = active.parent / f".{active.name}.{os.getpid()}.tmp"
+            try:
+                temporary_link.symlink_to(os.path.relpath(slot, active.parent))
+                os.replace(temporary_link, active)
+            finally:
+                try:
+                    temporary_link.unlink()
+                except FileNotFoundError:
+                    pass
+            installed = self.inspect_step(step)
+            if installed.get("installed_sha256") != expected:
+                raise InstallDriftError("candidate venv cutover did not match the plan")
+            return {"prior": prior_link, **installed}
         if kind == "systemctl":
             action = step.get("action")
             unit = step.get("unit")
@@ -263,8 +521,9 @@ class LocalInstallBackend:
                 if not isinstance(unit, str) or not unit:
                     raise InstallPlanError("systemctl step requires a unit")
                 argv.append(unit)
+            prior = self.inspect_step(step)
             _run(argv, check=True)
-            return {"prior": {"exists": False}, **self.inspect_step(step)}
+            return {"prior": prior, **self.inspect_step(step)}
         if kind != "asset":
             raise InstallPlanError(f"unsupported step kind: {kind}")
         path = Path(str(step.get("path")))
@@ -326,10 +585,37 @@ class LocalInstallBackend:
         prior = entry.get("prior", {})
         if not isinstance(step, Mapping) or not isinstance(prior, Mapping):
             raise InstallError("invalid rollback journal entry")
+        if step.get("kind") == "account":
+            # Service accounts are intentionally retained. Deleting an account
+            # safely requires a host-wide owned-file/process proof that the
+            # install receipt cannot provide.
+            return
+        if step.get("kind") == "venv":
+            active = Path(str(step.get("active_link", "")))
+            if not active.is_symlink():
+                raise InstallDriftError(f"active venv link drifted: {active}")
+            prior = entry.get("prior", {})
+            if not isinstance(prior, Mapping):
+                raise InstallError("venv rollback entry lacks prior state")
+            if prior.get("exists"):
+                target = prior.get("link_target")
+                if not isinstance(target, str) or not target:
+                    raise InstallError("venv rollback entry lacks prior link target")
+                temporary_link = active.parent / f".{active.name}.{os.getpid()}.rollback"
+                temporary_link.symlink_to(target)
+                os.replace(temporary_link, active)
+            else:
+                active.unlink()
+            # Content-addressed slots are retained as the previous-version and
+            # forensic boundary; rollback never recursively removes them.
+            return
         if step.get("kind") != "asset":
             if step.get("kind") == "systemctl":
                 unit = step.get("unit")
-                if isinstance(unit, str):
+                prior = entry.get("prior", {})
+                if isinstance(unit, str) and not (
+                    isinstance(prior, Mapping) and prior.get("exists")
+                ):
                     _run(("systemctl", "disable", unit), check=True)
                 return
             raise InstallPlanError(f"unsupported rollback kind: {step.get('kind')}")
