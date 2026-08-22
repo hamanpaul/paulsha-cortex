@@ -332,6 +332,34 @@ def _require_exact_keys(
     return value
 
 
+def _validate_provider_mapping(
+    value: object, *, label: str, subject: str = "configuration"
+) -> tuple[tuple[str, str], ...]:
+    providers = _require_exact_keys(
+        value,
+        label=label,
+        required=_PROVIDER_KEYS,
+        subject=subject,
+    )
+    pairs: list[tuple[str, str]] = []
+    for principal in sorted(_PROVIDER_KEYS):
+        configured = providers[principal]
+        if type(configured) is not list:
+            raise InstallPlanError(f"{label}.{principal} must be a list")
+        if not configured:
+            raise InstallPlanError(f"{label}.{principal} must not be empty")
+        if any(type(provider) is not str for provider in configured):
+            raise InstallPlanError(f"{label}.{principal} entries must be strings")
+        if any(not provider for provider in configured):
+            raise InstallPlanError(f"{label}.{principal} entries must not be empty")
+        if len(configured) != len(set(configured)):
+            raise InstallPlanError(f"{label}.{principal} contains a duplicate")
+        if any(provider not in _PROVIDER_ALLOWLIST[principal] for provider in configured):
+            raise InstallPlanError(f"provider is not allowed for {principal}")
+        pairs.extend((principal, provider) for provider in configured)
+    return tuple(pairs)
+
+
 def _validate_repository_remote(value: object) -> str:
     if not isinstance(value, str) or not value:
         raise InstallPlanError("repo_identity.remote is required")
@@ -387,29 +415,7 @@ def _validate_install_config_schema(config: Mapping[str, object]) -> None:
     _require_exact_keys(
         config.get("roots"), label="roots", required=_ROOT_CONFIG_KEYS
     )
-    providers = _require_exact_keys(
-        config.get("providers"),
-        label="providers",
-        required=_PROVIDER_KEYS,
-    )
-    for principal in sorted(_PROVIDER_KEYS):
-        configured = providers[principal]
-        if type(configured) is not list:
-            raise InstallPlanError(f"providers.{principal} must be a list")
-        if not configured:
-            raise InstallPlanError(f"providers.{principal} must not be empty")
-        if any(type(provider) is not str for provider in configured):
-            raise InstallPlanError(
-                f"providers.{principal} entries must be strings"
-            )
-        if len(configured) != len(set(configured)):
-            raise InstallPlanError(
-                f"providers.{principal} contains a duplicate"
-            )
-        if any(provider not in _PROVIDER_ALLOWLIST[principal] for provider in configured):
-            raise InstallPlanError(
-                f"provider is not allowed for {principal}"
-            )
+    _validate_provider_mapping(config.get("providers"), label="providers")
 
     toolchain = config.get("toolchain")
     if not isinstance(toolchain, Mapping) or not toolchain:
@@ -2408,7 +2414,9 @@ def _is_safe_absolute_plan_path(value: object) -> bool:
     )
 
 
-def _validate_apply_account_inventories(plan: Mapping[str, object]) -> None:
+def _validate_apply_account_inventories(
+    plan: Mapping[str, object],
+) -> dict[str, Mapping[str, object]]:
     expected_accounts = frozenset(
         account
         for principal in (
@@ -2425,10 +2433,11 @@ def _validate_apply_account_inventories(plan: Mapping[str, object]) -> None:
     }
     seen_uids: set[int] = set()
     seen_gids: set[int] = set()
+    inventory: dict[str, Mapping[str, object]] = {}
     for field, expected_names in expected_by_field.items():
-        rows = plan.get(field) if field == "accounts" else plan.get(field, [])
-        if type(rows) is not list:
-            raise InstallPlanError(f"plan {field} must be a list")
+        rows = plan.get(field)
+        if type(rows) is not list or not rows:
+            raise InstallPlanError(f"plan {field} must be a non-empty list")
         seen_names: set[str] = set()
         for index, raw in enumerate(rows):
             row = _require_exact_keys(
@@ -2457,13 +2466,52 @@ def _validate_apply_account_inventories(plan: Mapping[str, object]) -> None:
             seen_names.add(name)
             seen_uids.add(uid)
             seen_gids.add(gid)
+            inventory[name] = row
+        if seen_names != expected_names:
+            raise InstallPlanError(f"plan {field} does not match the four-way inventory")
+    return inventory
+
+
+def _validate_account_step_bijection(
+    inventory: Mapping[str, Mapping[str, object]],
+    steps: Sequence[Mapping[str, object]],
+) -> None:
+    account_steps = [step for step in steps if step.get("kind") == "account"]
+    by_name: dict[str, Mapping[str, object]] = {}
+    for step in account_steps:
+        name = step.get("name")
+        if type(name) is not str or not name or name in by_name:
+            raise InstallPlanError("account apply steps require unique inventory names")
+        desired = inventory.get(name)
+        if desired is None:
+            raise InstallPlanError("account apply step is not declared in the inventory")
+        if (
+            step.get("step_id") != f"account:{name}"
+            or type(step.get("uid")) is not int
+            or step.get("uid") != desired.get("uid")
+            or type(step.get("gid")) is not int
+            or step.get("gid") != desired.get("gid")
+            or step.get("home") != desired.get("home")
+            or step.get("login_program") != desired.get("shell")
+            or step.get("desired_sha256") != _account_digest(step)
+        ):
+            raise InstallPlanError("account apply step does not match its inventory row")
+        by_name[name] = step
+    if set(by_name) != set(inventory):
+        raise InstallPlanError("account inventory and apply steps are not a bijection")
 
 
 def _validate_required_credentials(plan: Mapping[str, object]) -> None:
+    expected = _validate_provider_mapping(
+        plan.get("provider_manifest"),
+        label="provider_manifest",
+        subject="plan",
+    )
     rows = plan.get("required_credentials")
     if type(rows) is not list:
         raise InstallPlanError("plan required_credentials must be a list")
     seen: set[tuple[str, str]] = set()
+    ordered: list[tuple[str, str]] = []
     for index, raw in enumerate(rows):
         row = _require_exact_keys(
             raw,
@@ -2485,6 +2533,113 @@ def _validate_required_credentials(plan: Mapping[str, object]) -> None:
         if pair in seen:
             raise InstallPlanError("required credentials contain a duplicate pair")
         seen.add(pair)
+        ordered.append(pair)
+    if tuple(ordered) != expected:
+        raise InstallPlanError("required credentials do not match the provider manifest")
+
+
+def _validate_candidate_venv(
+    plan: Mapping[str, object], steps: Sequence[Mapping[str, object]]
+) -> None:
+    candidate = plan.get("candidate")
+    roots = plan.get("roots")
+    wheel_sha = candidate.get("wheel_sha256") if isinstance(candidate, Mapping) else None
+    deploy = roots.get("deploy") if isinstance(roots, Mapping) else None
+    if not _valid_sha256(wheel_sha) or not _is_safe_absolute_plan_path(deploy):
+        raise InstallPlanError("candidate venv authority is invalid")
+    venv_steps = [step for step in steps if step.get("kind") == "venv"]
+    if len(venv_steps) != 1:
+        raise InstallPlanError("apply_order requires exactly one candidate venv")
+    step = venv_steps[0]
+    deploy_path = Path(str(deploy))
+    if (
+        step.get("step_id") != "candidate-venv"
+        or step.get("path") != str(deploy_path / "venvs" / str(wheel_sha))
+        or step.get("active_link") != str(deploy_path / "venv")
+        or step.get("wheel_sha256") != wheel_sha
+        or step.get("desired_sha256") != wheel_sha
+        or step.get("wheelhouse_locked") is not True
+    ):
+        raise InstallPlanError("candidate venv does not match candidate and deploy authority")
+
+
+def _validate_repo_identity(plan: Mapping[str, object]) -> Mapping[str, object]:
+    identity = _require_exact_keys(
+        plan.get("repo_identity"),
+        label="repo_identity",
+        required=_REPO_IDENTITY_KEYS,
+        subject="plan",
+    )
+    commit = identity.get("commit")
+    if (
+        type(commit) is not str
+        or len(commit) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in commit)
+    ):
+        raise InstallPlanError("plan repo identity commit is invalid")
+    _validate_repository_remote(identity.get("remote"))
+    return identity
+
+
+def _validate_repository_step_bijection(
+    plan: Mapping[str, object],
+    steps: Sequence[Mapping[str, object]],
+    repo_identity: Mapping[str, object],
+) -> None:
+    slugs = plan.get("source_repositories")
+    if (
+        type(slugs) is not list
+        or not slugs
+        or any(
+            type(slug) is not str
+            or not slug
+            or slug in {".", ".."}
+            or "/" in slug
+            for slug in slugs
+        )
+        or len(slugs) != len(set(slugs))
+    ):
+        raise InstallPlanError("source_repositories must contain unique safe slugs")
+    roots = plan.get("roots")
+    state_root = roots.get("state") if isinstance(roots, Mapping) else None
+    if not _is_safe_absolute_plan_path(state_root):
+        raise InstallPlanError("plan state root is invalid")
+    containers = [
+        step for step in steps if step.get("step_id") == "asset:repo-source-tree"
+    ]
+    if len(containers) != 1:
+        raise InstallPlanError("plan requires exactly one managed source container")
+    container = containers[0]
+    source_root = str(Path(str(state_root)) / "repos")
+    if (
+        container.get("kind") != "asset"
+        or container.get("asset_type") != "directory"
+        or container.get("path") != source_root
+    ):
+        raise InstallPlanError("managed source container is not canonical")
+    repository_steps = [step for step in steps if step.get("kind") == "repository"]
+    by_slug: dict[str, Mapping[str, object]] = {}
+    for step in repository_steps:
+        slug = step.get("slug")
+        if type(slug) is not str or slug not in slugs or slug in by_slug:
+            raise InstallPlanError("repository apply step has an undeclared or duplicate slug")
+        if (
+            step.get("step_id") != f"repository:{slug}"
+            or step.get("path") != str(Path(source_root) / slug)
+            or step.get("commit") != repo_identity.get("commit")
+            or step.get("remote") != repo_identity.get("remote")
+            or not _is_safe_absolute_plan_path(step.get("source"))
+            or not _valid_sha256(step.get("source_sha256"))
+            or step.get("owner") != container.get("owner")
+            or step.get("group") != container.get("group")
+            or step.get("mode") != container.get("mode")
+            or step.get("durable") is not True
+            or step.get("desired_sha256") != _desired_digest(step)
+        ):
+            raise InstallPlanError("repository apply step is not bound to plan authority")
+        by_slug[slug] = step
+    if set(by_slug) != set(slugs):
+        raise InstallPlanError("source repositories and apply steps are not a bijection")
 
 
 def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str, object]]:
@@ -2492,21 +2647,14 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
 
     if plan.get("schema_version") != 1 or plan.get("scheme") != "four-way":
         raise InstallPlanError("apply requires a schema_version=1 four-way plan")
-    repo_identity = plan.get("repo_identity")
-    commit = repo_identity.get("commit") if isinstance(repo_identity, Mapping) else None
-    if (
-        not isinstance(commit, str)
-        or len(commit) != 40
-        or any(char not in "0123456789abcdefABCDEF" for char in commit)
-    ):
-        raise InstallPlanError("plan repo identity is invalid")
+    repo_identity = _validate_repo_identity(plan)
     candidate = plan.get("candidate")
     if not isinstance(candidate, Mapping) or any(
         not _valid_sha256(candidate.get(field))
         for field in ("wheel_sha256", "bundle_sha256")
     ):
         raise InstallPlanError("plan candidate identity is invalid")
-    _validate_apply_account_inventories(plan)
+    account_inventory = _validate_apply_account_inventories(plan)
     _validate_required_credentials(plan)
     steps = plan.get("apply_order")
     if not isinstance(steps, list):
@@ -2535,6 +2683,9 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
         seen_step_ids.add(step_id)
         _validate_operations(step)
         typed_steps.append(step)
+    _validate_candidate_venv(plan, typed_steps)
+    _validate_account_step_bijection(account_inventory, typed_steps)
+    _validate_repository_step_bijection(plan, typed_steps, repo_identity)
     _assert_managed_parent_topology(plan)
     return typed_steps
 

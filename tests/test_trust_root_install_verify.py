@@ -18,6 +18,35 @@ from paulsha_cortex.trust_root.install import (
     verify_receipt,
 )
 from paulsha_cortex.trust_root.install import backend as backend_module
+from paulsha_cortex.trust_root.install import core as install_core
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_verify_plans_skip_complete_authority_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verification seam tests omit unrelated installer authority steps."""
+
+    monkeypatch.setattr(
+        install_core, "_validate_repo_identity", lambda plan: plan["repo_identity"]
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_apply_account_inventories", lambda _plan: {}
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_required_credentials", lambda _plan: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_candidate_venv", lambda _plan, _steps: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_account_step_bijection", lambda _rows, _steps: None
+    )
+    monkeypatch.setattr(
+        install_core,
+        "_validate_repository_step_bijection",
+        lambda _plan, _steps, _identity: None,
+    )
 
 
 def _artifact(content: str, *, owner: str = "root", mode: str = "0644"):

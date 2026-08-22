@@ -32,6 +32,34 @@ from paulsha_cortex.trust_root.install import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_transaction_plans_skip_complete_authority_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These seam tests intentionally isolate selected steps from a full plan."""
+
+    monkeypatch.setattr(
+        install_core, "_validate_repo_identity", lambda plan: plan["repo_identity"]
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_apply_account_inventories", lambda _plan: {}
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_required_credentials", lambda _plan: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_candidate_venv", lambda _plan, _steps: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_account_step_bijection", lambda _rows, _steps: None
+    )
+    monkeypatch.setattr(
+        install_core,
+        "_validate_repository_step_bijection",
+        lambda _plan, _steps, _identity: None,
+    )
+
+
 def _accounts(tmp_path: Path) -> list[dict[str, object]]:
     return [
         {

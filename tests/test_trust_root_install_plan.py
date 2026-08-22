@@ -117,6 +117,38 @@ def _plan_document(tmp_path: Path, config: dict[str, object] | None = None):
     return plan, json.loads(canonical_plan_bytes(plan))
 
 
+def _bound_plan_document(tmp_path: Path, config: dict[str, object] | None = None):
+    plan, _document = _plan_document(tmp_path, config)
+    tools = [
+        {
+            "name": name,
+            "version": configured["version"],
+            "shape": "file",
+            "resolved_path": str(tmp_path / f"{name}.locked"),
+            "sha256": configured["sha256"],
+        }
+        for name, configured in plan["toolchain_manifest"].items()
+    ]
+    repository = tmp_path / "paulsha-cortex.bundle"
+    repository.write_bytes(b"exact source bundle\n")
+    bound = bind_bundle_artifacts(
+        plan,
+        {
+            "toolchain": tools,
+            "source_repositories": [
+                {
+                    "slug": "paulsha-cortex",
+                    "commit": "a" * 40,
+                    "remote": "https://github.com/hamanpaul/paulsha-cortex.git",
+                    "resolved_path": str(repository),
+                    "sha256": _sha256(repository),
+                }
+            ],
+        },
+    )
+    return bound, json.loads(canonical_plan_bytes(bound))
+
+
 def test_same_inputs_produce_byte_identical_canonical_plan_and_hash(tmp_path: Path) -> None:
     wheel, bundle = _artifacts(tmp_path)
     config = _safe_config(tmp_path)
@@ -253,7 +285,7 @@ def test_plan_topology_guard_rejects_an_unmanaged_intermediate_parent(
 def test_apply_revalidates_serialized_plan_topology_before_backend_mutation(
     tmp_path: Path,
 ) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     serialized = json.loads(canonical_plan_bytes(plan))
     missing = f"{serialized['roots']['state']}/runtime/codex-home"
     serialized["apply_order"] = [
@@ -308,7 +340,7 @@ def test_apply_revalidates_serialized_plan_topology_before_backend_mutation(
 
 
 def test_public_apply_validation_is_pure_for_a_valid_plan(tmp_path: Path) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     before = canonical_plan_bytes(plan)
 
     steps = validate_apply_plan(plan, confirm_sha256=plan_sha256(plan))
@@ -317,6 +349,136 @@ def test_public_apply_validation_is_pure_for_a_valid_plan(tmp_path: Path) -> Non
         step["step_id"] for step in plan["apply_order"]
     ]
     assert canonical_plan_bytes(plan) == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "candidate-missing",
+        "candidate-extra",
+        "candidate-step-id",
+        "candidate-path",
+        "candidate-active-link",
+        "candidate-wheel-sha",
+        "candidate-desired-sha",
+        "candidate-unlocked",
+        "accounts-empty",
+        "account-step-missing",
+        "account-step-mismatch",
+        "repo-identity-extra",
+        "repo-identity-query",
+        "source-repository-unsafe",
+        "source-repository-duplicate",
+        "repository-step-missing",
+        "repository-step-mismatch",
+        "repository-step-extra",
+        "provider-manifest-invalid",
+        "credential-manifest-mismatch",
+        "credential-manifest-order",
+    ],
+)
+def test_apply_cli_rejects_cross_field_authority_drift_before_receipt_or_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    candidate = next(step for step in plan["apply_order"] if step["kind"] == "venv")
+    repository = next(
+        step for step in plan["apply_order"] if step["kind"] == "repository"
+    )
+    if case == "candidate-missing":
+        plan["apply_order"].remove(candidate)
+    elif case == "candidate-extra":
+        shadow = deepcopy(candidate)
+        shadow["step_id"] = "candidate-venv-shadow"
+        shadow["path"] = f"{candidate['path']}-shadow"
+        plan["apply_order"].append(shadow)
+    elif case == "candidate-step-id":
+        candidate["step_id"] = "candidate-venv-renamed"
+    elif case == "candidate-path":
+        candidate["path"] = f"{candidate['path']}-other"
+    elif case == "candidate-active-link":
+        candidate["active_link"] = f"{plan['roots']['deploy']}/other-venv"
+    elif case == "candidate-wheel-sha":
+        candidate["wheel_sha256"] = "d" * 64
+    elif case == "candidate-desired-sha":
+        candidate["desired_sha256"] = "d" * 64
+    elif case == "candidate-unlocked":
+        candidate["wheelhouse_locked"] = False
+    elif case == "accounts-empty":
+        plan["accounts"] = []
+    elif case == "account-step-missing":
+        account = next(step for step in plan["apply_order"] if step["kind"] == "account")
+        plan["apply_order"].remove(account)
+    elif case == "account-step-mismatch":
+        account = next(step for step in plan["apply_order"] if step["kind"] == "account")
+        account["uid"] += 1000
+    elif case == "repo-identity-extra":
+        plan["repo_identity"]["note"] = "INNOCUOUS-UNTRUSTED-METADATA"
+    elif case == "repo-identity-query":
+        plan["repo_identity"]["remote"] += "?ref=main"
+    elif case == "source-repository-unsafe":
+        plan["source_repositories"] = ["../escape"]
+    elif case == "source-repository-duplicate":
+        plan["source_repositories"].append(plan["source_repositories"][0])
+    elif case == "repository-step-missing":
+        plan["apply_order"].remove(repository)
+    elif case == "repository-step-mismatch":
+        repository["commit"] = "b" * 40
+    elif case == "repository-step-extra":
+        shadow = deepcopy(repository)
+        shadow["step_id"] = "repository:shadow"
+        shadow["slug"] = "shadow"
+        shadow["path"] = f"{Path(repository['path']).parent}/shadow"
+        shadow["desired_sha256"] = install_core._desired_digest(shadow)
+        plan["apply_order"].append(shadow)
+    elif case == "provider-manifest-invalid":
+        plan["provider_manifest"]["builder"] = ["agy"]
+    elif case == "credential-manifest-mismatch":
+        plan["required_credentials"] = plan["required_credentials"][:-1]
+    else:
+        plan["required_credentials"].reverse()
+
+    plan_path = tmp_path / f"cross-field-{case}.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = tmp_path / f"cross-field-{case}" / "receipt.json"
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+        apply_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("cross-field drift reached backend preflight")
+
+        def apply_step(self, _step):
+            type(self).apply_calls += 1
+            raise AssertionError("cross-field drift reached backend mutation")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(receipt_path),
+        ]
+    ) == 1
+    assert not receipt_path.parent.exists()
+    assert MutationSentinelBackend.preflight_calls == 0
+    assert MutationSentinelBackend.apply_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -337,7 +499,7 @@ def test_apply_cli_rejects_invalid_required_credentials_before_receipt_or_backen
     capsys: pytest.CaptureFixture[str],
     case: str,
 ) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     sentinel = "PLAINTEXT-CREDENTIAL-SENTINEL"
     if case == "scalar-row":
         plan["required_credentials"] = ["builder/codex"]
@@ -407,7 +569,7 @@ def test_apply_cli_rejects_invalid_required_credentials_before_receipt_or_backen
 def test_apply_validation_rejects_malformed_account_inventory_rows(
     tmp_path: Path, inventory: str, mutation: str
 ) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     rows = plan[inventory]
     if mutation == "extra-key":
         rows[0]["note"] = "INNOCUOUS-UNTRUSTED-METADATA"
@@ -426,7 +588,7 @@ def test_apply_cli_rejects_before_creating_any_receipt_authority(
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
 ) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     if failure == "topology":
         missing = f"{plan['roots']['state']}/runtime/codex-home"
         plan["apply_order"] = [
@@ -495,7 +657,7 @@ def test_apply_cli_rejects_nested_secrets_before_receipt_or_backend(
     nested_key: str,
     nested_value: str,
 ) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     unit = next(iter(plan["generated"]["units"].values()))
     unit["untrusted_extension"] = {nested_key: nested_value}
     plan_path = tmp_path / f"secret-{nested_key}.json"
@@ -545,7 +707,7 @@ def test_apply_cli_rejects_nested_secrets_before_receipt_or_backend(
 def test_apply_plan_secret_defense_runs_before_receipt_checkpoint_or_preflight(
     tmp_path: Path,
 ) -> None:
-    plan, _doc = _plan_document(tmp_path)
+    plan, _doc = _bound_plan_document(tmp_path)
     receipt = new_install_receipt(plan)
     unit = next(iter(plan["generated"]["units"].values()))
     unit["untrusted_extension"] = {

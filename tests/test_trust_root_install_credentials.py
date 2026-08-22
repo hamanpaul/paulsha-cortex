@@ -25,6 +25,34 @@ from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_credential_plans_skip_complete_authority_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential seam tests use an empty typed apply order by design."""
+
+    monkeypatch.setattr(
+        install_core, "_validate_repo_identity", lambda plan: plan["repo_identity"]
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_apply_account_inventories", lambda _plan: {}
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_required_credentials", lambda _plan: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_candidate_venv", lambda _plan, _steps: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_account_step_bijection", lambda _rows, _steps: None
+    )
+    monkeypatch.setattr(
+        install_core,
+        "_validate_repository_step_bijection",
+        lambda _plan, _steps, _identity: None,
+    )
+
+
 def _plan(*, required_credentials=None) -> dict[str, object]:
     return {
         "schema_version": 1,
