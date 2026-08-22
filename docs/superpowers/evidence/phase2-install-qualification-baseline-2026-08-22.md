@@ -4,8 +4,8 @@
 
 - Baseline: `origin/main@1015f6db6686463d35796303db1d55cdbd5740ef` after
   `git pull --ff-only`.
-- Integration worktree:
-  `/home/paul_chen/prj_pri/paulsha-cortex-worktrees/phase2-install-qualification`.
+- Integration worktree: sibling worktree
+  `paulsha-cortex-worktrees/phase2-install-qualification`.
 - Integration branch: `feature/phase2-install-docker-qualification`.
 - The primary checkout's pre-existing untracked plans, specs, workstreams and `error.log`
   were inventoried before the fast-forward and left in place. They are not present in or

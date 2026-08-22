@@ -4,7 +4,7 @@ Authority: `openspec/changes/phase2-install-docker-qualification/`.
 
 ## Boundaries
 
-- Main integration worktree: `/home/paul_chen/prj_pri/paulsha-cortex-worktrees/phase2-install-qualification`
+- Main integration worktree: sibling worktree `paulsha-cortex-worktrees/phase2-install-qualification`
 - Branch: `feature/phase2-install-docker-qualification`
 - Production code owner: root agent; subagents may only edit files explicitly assigned to their task.
 - Existing deployment, system services, credentials and production repo checkout are out of mutation scope.
