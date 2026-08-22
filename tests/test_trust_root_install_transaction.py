@@ -296,6 +296,113 @@ def test_existing_account_without_prior_receipt_provenance_is_rejected(
         validate_preflight(plan, facts)
 
 
+def test_exact_orphan_group_without_receipt_provenance_is_rejected(
+    tmp_path: Path,
+) -> None:
+    plan, facts, _receipt = _account_adoption_case(tmp_path)
+    desired = plan["accounts"][0]
+    name = desired["name"]
+    gid = desired["gid"]
+    facts["accounts"] = {}
+    facts["account_uids"] = {}
+    facts["group_gids"] = {gid: name}
+    facts["groups"] = {name: {"name": name, "gid": gid, "members": []}}
+    facts["primary_gid_users"] = {gid: []}
+    facts["group_names_by_gid"] = {gid: [name]}
+
+    with pytest.raises(AccountCollisionError, match="group.*receipt|provenance"):
+        validate_preflight(plan, facts)
+
+
+def test_same_receipt_replays_account_after_groupadd_crash(tmp_path: Path) -> None:
+    plan, base_facts, _receipt = _account_adoption_case(tmp_path)
+    desired = plan["accounts"][0]
+    step = plan["apply_order"][0]
+    name = desired["name"]
+    gid = desired["gid"]
+
+    class GroupAddCrashBackend:
+        def __init__(self) -> None:
+            self.group_exists = False
+            self.account_exists = False
+            self.apply_attempts = 0
+            self.rollback_attempts = 0
+
+        def preflight_facts(self, _plan):
+            facts = deepcopy(base_facts)
+            facts["accounts"] = {}
+            facts["account_uids"] = {}
+            facts["group_gids"] = {gid: name} if self.group_exists else {}
+            facts["groups"] = (
+                {name: {"name": name, "gid": gid, "members": []}}
+                if self.group_exists
+                else {}
+            )
+            facts["primary_gid_users"] = {gid: [name]} if self.account_exists else {}
+            facts["group_names_by_gid"] = {gid: [name]} if self.group_exists else {}
+            if self.account_exists:
+                facts["accounts"][name] = {
+                    **desired,
+                    "supplementary_groups": [],
+                    "password_locked": True,
+                }
+                facts["account_uids"][desired["uid"]] = name
+            return facts
+
+        def inspect_step(self, _step):
+            if self.account_exists:
+                return {
+                    "exists": True,
+                    "installed_sha256": step["desired_sha256"],
+                }
+            return {
+                "exists": False,
+                "group_exists": self.group_exists,
+                **({"group_gid": gid, "group_members": []} if self.group_exists else {}),
+            }
+
+        def apply_step(self, _step):
+            self.apply_attempts += 1
+            prior = self.inspect_step(_step)
+            if not self.group_exists:
+                self.group_exists = True
+                raise RuntimeError("injected crash after groupadd")
+            self.account_exists = True
+            return {"prior": prior, **self.inspect_step(_step)}
+
+        def rollback_step(self, _entry):
+            self.rollback_attempts += 1
+
+        def list_unknown_state(self, _receipt):
+            return ()
+
+    backend = GroupAddCrashBackend()
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(RuntimeError, match="groupadd"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    prepared = receipt.to_dict()["journal"][0]
+    assert prepared["status"] == "prepared"
+    assert prepared["prior"] == {"exists": False, "group_exists": False}
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.apply_attempts == 2
+    assert backend.rollback_attempts == 0
+    assert receipt.to_dict()["state"] == "applied"
+
+
 def test_existing_account_with_matching_prior_receipt_provenance_is_adoptable(
     tmp_path: Path,
 ) -> None:

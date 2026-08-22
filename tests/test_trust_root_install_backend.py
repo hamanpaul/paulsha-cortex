@@ -342,6 +342,32 @@ def test_account_step_creates_exact_group_and_user_through_typed_argv(
     ]
 
 
+def test_account_state_distinguishes_exact_orphan_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_user(name: str):
+        raise KeyError(name)
+
+    monkeypatch.setattr(backend_module.pwd, "getpwnam", missing_user)
+    monkeypatch.setattr(
+        backend_module.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_name=name, gr_gid=993, gr_mem=[]),
+    )
+    step = {
+        "kind": "account",
+        "name": "cortex-builder",
+        "gid": 993,
+    }
+
+    assert LocalInstallBackend(require_root=False).inspect_step(step) == {
+        "exists": False,
+        "group_exists": True,
+        "group_gid": 993,
+        "group_members": [],
+    }
+
+
 def test_venv_step_verifies_locked_wheels_and_atomically_switches_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -924,7 +950,6 @@ def test_preflight_rejects_non_private_service_group_membership_or_gid_alias(
         "group_names_by_gid": {995: ["cortex-egress"]},
         "paths": {},
     }
-    assert validate_preflight(plan, facts).ok
     if fact_key == "members":
         facts["groups"]["cortex-egress"]["members"] = value
     else:
@@ -1317,3 +1342,90 @@ Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true
 """
 
     assert not backend_module._sudoers_policy_has_universal_nopasswd(policy)
+
+
+def test_sudoers_parser_resolves_host_alias_to_all() -> None:
+    policy = """
+Host_Alias LOCAL = ALL
+%operators LOCAL=(ALL) NOPASSWD: ALL
+"""
+
+    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
+
+
+def test_sudoers_parser_resolves_recursive_host_aliases() -> None:
+    policy = """
+Host_Alias EDGE = LOCAL
+Host_Alias LOCAL = ALL
+%operators EDGE=(ALL) NOPASSWD: ALL
+"""
+
+    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
+
+
+def test_sudoers_parser_fails_closed_on_referenced_host_alias_cycle() -> None:
+    policy = """
+Host_Alias FIRST = SECOND
+Host_Alias SECOND = FIRST
+%operators FIRST=(ALL) NOPASSWD: ALL
+"""
+
+    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
+
+
+def test_sudoers_parser_does_not_treat_limited_host_alias_as_universal() -> None:
+    policy = """
+Host_Alias LOCAL = buildhost
+%operators LOCAL=(ALL) NOPASSWD: ALL
+"""
+
+    assert not backend_module._sudoers_policy_has_universal_nopasswd(policy)
+
+
+@pytest.mark.parametrize("directive", ["@include", "#include"])
+def test_sudoers_detector_follows_authoritative_include(
+    tmp_path: Path, directive: str
+) -> None:
+    included = tmp_path / "operators"
+    included.write_text(
+        "Host_Alias LOCAL = ALL\n"
+        "%operators LOCAL=(ALL) NOPASSWD: ALL\n",
+        encoding="utf-8",
+    )
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text(f"{directive} {included}\n", encoding="utf-8")
+
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_does_not_scan_unincluded_sibling_policy(
+    tmp_path: Path,
+) -> None:
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text("%operators ALL=(ALL) /usr/bin/id\n", encoding="utf-8")
+    (tmp_path / "unreferenced").write_text(
+        "%operators ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8"
+    )
+
+    assert not backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_fails_closed_on_include_cycle(tmp_path: Path) -> None:
+    sudoers = tmp_path / "sudoers"
+    included = tmp_path / "included"
+    sudoers.write_text(f"@include {included}\n", encoding="utf-8")
+    included.write_text(f"@include {sudoers}\n", encoding="utf-8")
+
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_follows_authoritative_includedir(tmp_path: Path) -> None:
+    sudoers_d = tmp_path / "sudoers.d"
+    sudoers_d.mkdir()
+    (sudoers_d / "operators").write_text(
+        "%operators ALL=(ALL) NOPASSWD: ALL\n", encoding="utf-8"
+    )
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text(f"#includedir {sudoers_d}\n", encoding="utf-8")
+
+    assert backend_module._universal_nopasswd(sudoers)

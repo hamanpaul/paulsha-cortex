@@ -208,7 +208,16 @@ def _account_state(step: Mapping[str, object]) -> dict[str, object]:
     try:
         account = pwd.getpwnam(name)
     except KeyError:
-        return {"exists": False}
+        try:
+            group = grp.getgrnam(name)
+        except KeyError:
+            return {"exists": False, "group_exists": False}
+        return {
+            "exists": False,
+            "group_exists": True,
+            "group_gid": group.gr_gid,
+            "group_members": sorted(set(getattr(group, "gr_mem", ()))),
+        }
     try:
         group = grp.getgrnam(name)
     except KeyError:
@@ -1228,7 +1237,11 @@ def _sudoers_logical_lines(policy: str) -> tuple[str, ...]:
     lines: list[str] = []
     pending = ""
     for physical in policy.splitlines():
-        line = physical.split("#", 1)[0].strip()
+        stripped = physical.strip()
+        if re.match(r"^#include(?:dir)?\s+", stripped):
+            line = stripped
+        else:
+            line = physical.split("#", 1)[0].strip()
         if not line and not pending:
             continue
         continued = line.endswith("\\")
@@ -1243,38 +1256,68 @@ def _sudoers_logical_lines(policy: str) -> tuple[str, ...]:
 
 
 def _sudoers_policies_have_universal_nopasswd(policies: Sequence[str]) -> bool:
-    """Evaluate direct/aliased ALL grants without joining file continuations."""
+    """Evaluate direct/aliased host and command ALL grants."""
 
     lines = tuple(
         line for policy in policies for line in _sudoers_logical_lines(policy)
     )
-    aliases: dict[str, str] = {}
+    command_aliases: dict[str, str] = {}
+    host_aliases: dict[str, str] = {}
     for line in lines:
-        match = re.match(r"^Cmnd_Alias\s+([A-Z][A-Z0-9_]*)\s*=\s*(.+)$", line)
+        match = re.match(
+            r"^(Cmnd|Host)_Alias\s+([A-Z][A-Z0-9_]*)\s*=\s*(.+)$", line
+        )
         if match:
-            aliases[match.group(1)] = match.group(2).strip()
+            aliases = command_aliases if match.group(1) == "Cmnd" else host_aliases
+            name = match.group(2)
+            if name in aliases:
+                return True
+            aliases[name] = match.group(3).strip()
 
-    def universal(expression: str, resolving: frozenset[str] = frozenset()) -> bool:
+    def scope(
+        expression: str,
+        aliases: Mapping[str, str],
+        resolving: frozenset[str] = frozenset(),
+    ) -> str:
         tokens = [token.strip() for token in expression.split(",") if token.strip()]
-        if not tokens or any(token.startswith("!") for token in tokens):
-            return False
-        for token in tokens:
-            command = token.split(maxsplit=1)[0]
-            if command == "ALL":
-                return True
-            if command in aliases and command not in resolving and universal(
-                aliases[command], resolving | {command}
-            ):
-                return True
-        return False
+        if not tokens:
+            return "limited"
+        has_exclusion = False
+        has_all = False
+        for raw_token in tokens:
+            has_exclusion = has_exclusion or raw_token.startswith("!")
+            token = raw_token.lstrip("!").strip().split(maxsplit=1)[0]
+            if token == "ALL":
+                has_all = True
+                continue
+            if token not in aliases:
+                continue
+            if token in resolving:
+                return "unsafe"
+            resolved = scope(aliases[token], aliases, resolving | {token})
+            if resolved == "unsafe":
+                return "unsafe"
+            has_all = has_all or resolved == "all"
+        if has_exclusion:
+            return "limited"
+        return "all" if has_all else "limited"
 
     for line in lines:
-        if line.startswith("Cmnd_Alias"):
+        if re.match(r"^(?:Cmnd|Host)_Alias\b", line) or line.startswith(
+            ("Defaults", "@include", "#include")
+        ):
             continue
-        assignment = re.match(r"^.+?\s+ALL\s*=\s*(?:\([^)]*\)\s*)?(.+)$", line)
-        if not assignment:
+        left, separator, right = line.partition("=")
+        if not separator:
             continue
-        command_spec = assignment.group(1)
+        left = re.sub(r"\s*,\s*", ",", left.strip())
+        subjects = left.rsplit(maxsplit=1)
+        if len(subjects) != 2:
+            continue
+        host_scope = scope(subjects[1], host_aliases)
+        if host_scope == "limited":
+            continue
+        command_spec = re.sub(r"^\([^)]*\)\s*", "", right.strip())
         tags = list(re.finditer(r"\b(?:NO)?PASSWD\s*:\s*", command_spec))
         for index, tag in enumerate(tags):
             if not tag.group(0).lstrip().startswith("NOPASSWD"):
@@ -1285,7 +1328,10 @@ def _sudoers_policies_have_universal_nopasswd(policies: Sequence[str]) -> bool:
                 for later in tags[index + 1 :]
             ):
                 continue
-            if universal(command_spec[tag.end() : end]):
+            if scope(command_spec[tag.end() : end], command_aliases) in {
+                "all",
+                "unsafe",
+            }:
                 return True
     return False
 
@@ -1294,23 +1340,60 @@ def _sudoers_policy_has_universal_nopasswd(policy: str) -> bool:
     return _sudoers_policies_have_universal_nopasswd((policy,))
 
 
-def _universal_nopasswd() -> bool:
-    candidates = [Path("/etc/sudoers")]
-    sudoers_d = Path("/etc/sudoers.d")
-    try:
-        candidates.extend(
-            row for row in sudoers_d.iterdir() if row.is_file() and not row.is_symlink()
-        )
-    except OSError:
-        pass
+def _authoritative_sudoers_policies(sudoers: Path) -> tuple[str, ...]:
     policies: list[str] = []
-    for candidate in candidates:
+    visited: set[Path] = set()
+    active: set[Path] = set()
+
+    def visit(candidate: Path) -> None:
+        canonical = Path(os.path.abspath(candidate))
+        if canonical in active:
+            raise InstallDriftError("sudoers include cycle")
+        if canonical in visited:
+            return
+        observed = canonical.lstat()
+        if canonical.is_symlink() or not stat.S_ISREG(observed.st_mode):
+            raise InstallDriftError("sudoers include is not a regular file")
+        policy = canonical.read_text(encoding="utf-8", errors="replace")
+        active.add(canonical)
         try:
-            if candidate.is_symlink():
-                continue
-            policies.append(candidate.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
+            for line in _sudoers_logical_lines(policy):
+                match = re.match(r"^(?:#|@)include(dir)?\s+(.+?)\s*$", line)
+                if not match:
+                    continue
+                target = Path(match.group(2))
+                if not target.is_absolute():
+                    raise InstallDriftError("sudoers include path is not absolute")
+                if match.group(1) != "dir":
+                    visit(target)
+                    continue
+                directory_state = target.lstat()
+                if target.is_symlink() or not stat.S_ISDIR(directory_state.st_mode):
+                    raise InstallDriftError("sudoers includedir is not a directory")
+                for child in sorted(target.iterdir(), key=lambda row: row.name):
+                    if "." in child.name or child.name.endswith("~"):
+                        continue
+                    child_state = child.lstat()
+                    if child.is_symlink() or not stat.S_ISREG(child_state.st_mode):
+                        raise InstallDriftError(
+                            "sudoers includedir entry is not a regular file"
+                        )
+                    visit(child)
+        finally:
+            active.remove(canonical)
+        visited.add(canonical)
+        policies.append(policy)
+
+    visit(sudoers)
+    return tuple(policies)
+
+
+def _universal_nopasswd(sudoers: Path = Path("/etc/sudoers")) -> bool:
+    policies: list[str] = []
+    try:
+        policies.extend(_authoritative_sudoers_policies(sudoers))
+    except (OSError, InstallDriftError):
+        return True
     return _sudoers_policies_have_universal_nopasswd(policies)
 
 

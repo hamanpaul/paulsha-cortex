@@ -1454,6 +1454,67 @@ def _account_has_receipt_provenance(
     return False
 
 
+def _account_group_has_receipt_provenance(
+    *,
+    plan: Mapping[str, object],
+    desired: Mapping[str, object],
+    receipt: "InstallReceipt | None",
+) -> bool:
+    """Prove an orphan group was created by this exact account transaction."""
+
+    if receipt is None:
+        return False
+    document = receipt.to_dict()
+    if document.get("plan_sha256") != plan_sha256(plan):
+        return False
+    planned_step = next(
+        (
+            step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, Mapping)
+            and step.get("kind") == "account"
+            and step.get("name") == desired.get("name")
+        ),
+        None,
+    )
+    if not isinstance(planned_step, Mapping):
+        return False
+    entries = document.get("journal", [])
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        prior = entry.get("prior") if isinstance(entry, Mapping) else None
+        if (
+            isinstance(entry, Mapping)
+            and entry.get("step_id") == planned_step.get("step_id")
+            and entry.get("step") == planned_step
+            and entry.get("status") == "prepared"
+            and isinstance(prior, Mapping)
+            and prior.get("exists") is False
+            and prior.get("group_exists") is False
+        ):
+            return True
+    return False
+
+
+def _prepared_account_group_is_replayable(
+    step: Mapping[str, object],
+    prior: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> bool:
+    """Recognize the exact groupadd-only state owned by a prepared journal."""
+
+    return bool(
+        step.get("kind") == "account"
+        and prior.get("exists") is False
+        and prior.get("group_exists") is False
+        and installed.get("exists") is False
+        and installed.get("group_exists") is True
+        and installed.get("group_gid") == step.get("gid")
+        and installed.get("group_members") == []
+    )
+
+
 def _step_has_receipt_provenance(
     *,
     plan: Mapping[str, object],
@@ -1601,6 +1662,12 @@ def validate_preflight(
                     + ", ".join(foreign_supplementary_members)
                 )
         if observed is None:
+            if observed_group is not None and not _account_group_has_receipt_provenance(
+                plan=plan, desired=desired, receipt=receipt
+            ):
+                raise AccountCollisionError(
+                    f"existing group {name} lacks trusted receipt provenance"
+                )
             continue
         if not isinstance(observed, Mapping) or any(
             observed.get(key) != desired.get(key) for key in ("uid", "gid", "home", "shell")
@@ -2395,12 +2462,13 @@ def apply_plan(
                 # A crash may happen after only part of a backend step mutated
                 # the host.  The prepared journal is already the rollback
                 # authority, so restore its exact prior state before replay.
-                backend.rollback_step(entry)
-                restored = backend.inspect_step(step)
-                if dict(restored) != dict(prior):
-                    raise InstallDriftError(
-                        f"prepared install step could not restore prior state: {step_id}"
-                    )
+                if not _prepared_account_group_is_replayable(step, prior, installed):
+                    backend.rollback_step(entry)
+                    restored = backend.inspect_step(step)
+                    if dict(restored) != dict(prior):
+                        raise InstallDriftError(
+                            f"prepared install step could not restore prior state: {step_id}"
+                        )
         else:
             prior = dict(backend.inspect_step(step))
             adopted_from_receipt = False
