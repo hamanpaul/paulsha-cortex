@@ -140,6 +140,31 @@ def test_credential_adapter_rejects_a_non_allowlisted_source_name(tmp_path: Path
     assert not (tmp_path / "installed").exists()
 
 
+def test_agy_import_writes_physical_cache_target_without_following_home_symlink(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "oauth_creds.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    home = tmp_path / "cortex-reviewer-planner"
+    target = home / "cache/gemini"
+    target.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (home / ".gemini").symlink_to(outside, target_is_directory=True)
+
+    import_credential(
+        receipt,
+        principal="reviewer-planner",
+        provider="agy",
+        source=source,
+        destination_root=home,
+    )
+
+    assert (target / "oauth_creds.json").read_bytes() == source.read_bytes()
+    assert not (outside / "oauth_creds.json").exists()
+
+
 def test_credential_adapter_rejects_a_symlink_before_reading_content(
     tmp_path: Path,
 ) -> None:

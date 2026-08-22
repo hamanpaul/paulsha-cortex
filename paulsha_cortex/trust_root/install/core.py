@@ -1542,7 +1542,7 @@ _CREDENTIAL_ADAPTERS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
     ),
     ("reviewer-planner", "agy"): (
         "oauth_creds.json",
-        (".gemini", "oauth_creds.json"),
+        ("cache", "gemini", "oauth_creds.json"),
     ),
     ("reviewer-planner", "copilot"): (
         "hosts.json",
