@@ -30,6 +30,136 @@ def _result(driver, argv, *, stdout="", stderr="", returncode=0):
     return driver.CommandResult(tuple(argv), returncode, stdout, stderr)
 
 
+def _provider_name(argv) -> str:
+    executable = Path(argv[0]).name
+    return {"agy": "agy", "copilot": "copilot", "codex": "codex"}[executable]
+
+
+def _preflight(provider: str, **overrides) -> str:
+    payload = {
+        "provider": provider,
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+        "skipped": False,
+    }
+    payload.update(overrides)
+    return json.dumps(payload) + "\n"
+
+
+def _smoke(provider: str, *, extra_model: str | None = None) -> str:
+    models = {"agy": "gemini-3.7-flash", "copilot": "gpt-5.4", "codex": "gpt-5"}
+    efforts = {"agy": "high", "copilot": "xhigh", "codex": "normal"}
+    rows = [
+        {
+            "provider": provider,
+            "runtime_model": models[provider],
+            "runtime_effort": efforts[provider],
+            "response": "QUALIFICATION_OK",
+        }
+    ]
+    if extra_model is not None:
+        rows.append(
+            {
+                "provider": provider,
+                "runtime_model": extra_model,
+                "runtime_effort": efforts[provider],
+                "fallback": True,
+            }
+        )
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+def test_provider_smokes_use_live_preflight_and_unique_runtime_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def fake_run(argv, **_kwargs):
+        provider = _provider_name(argv)
+        kind = "preflight" if "status" in argv else "smoke"
+        calls.append((kind, tuple(argv)))
+        output = _preflight(provider) if kind == "preflight" else _smoke(provider)
+        return _result(driver, argv, stdout=output)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    verdicts = driver._provider_smokes(tmp_path)
+    assert [
+        (row["provider"], row["runtime_model"], row["runtime_effort"])
+        for row in verdicts
+    ] == [
+        ("agy", "gemini-3.7-flash", "high"),
+        ("copilot", "gpt-5.4", "xhigh"),
+        ("codex", "gpt-5", "normal"),
+    ]
+    assert [kind for kind, _argv in calls] == [
+        "preflight",
+        "smoke",
+        "preflight",
+        "smoke",
+        "preflight",
+        "smoke",
+    ]
+    evidence = json.loads((tmp_path / "provider-capabilities.json").read_text())
+    assert all(
+        row["preflight"]["quota"] == "available"
+        for row in evidence["providers"].values()
+    )
+    assert all(
+        row["preflight"]["fallback"] is False for row in evidence["providers"].values()
+    )
+
+
+def test_provider_smokes_reject_requested_plus_fallback_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+
+    def fake_run(argv, **_kwargs):
+        provider = _provider_name(argv)
+        output = (
+            _preflight(provider)
+            if "status" in argv
+            else _smoke(provider, extra_model="fallback-model")
+        )
+        return _result(driver, argv, stdout=output)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="unique exact"):
+        driver._provider_smokes(tmp_path)
+    assert not (tmp_path / "provider-capabilities.json").exists()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"status": None},
+        {"quota": "exhausted"},
+        {"fallback": True},
+        {"skipped": True, "status": "skipped"},
+        {"authenticated": False},
+    ],
+)
+def test_provider_preflight_fails_closed_without_retry_or_smoke(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict
+) -> None:
+    driver = _load_driver()
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        return _result(driver, argv, stdout=_preflight("agy", **overrides))
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="preflight"):
+        driver._provider_smokes(tmp_path)
+    assert len(calls) == 1
+    assert "status" in calls[0]
+    assert not (tmp_path / "provider-capabilities.json").exists()
+
+
 def test_manager_github_probe_uses_only_installed_manager_helper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -290,6 +420,28 @@ def _dispatch_fixture(tmp_path: Path, driver):
         json.dumps(completion, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     artifacts.append(completion_path)
+    gate_refs = []
+    for kind in ("foreign-review", "copilot"):
+        gate_path = coordinator / "evidence" / "delivery-gates" / f"{kind}.json"
+        gate_hash = _write_json(
+            gate_path,
+            {
+                "schema_version": 1,
+                "kind": kind,
+                "run_id": run_id,
+                "work_id": work_id,
+                "candidate": candidate,
+                "status": "passed",
+            },
+        )
+        artifacts.append(gate_path)
+        gate_refs.append(
+            {
+                "kind": kind,
+                "ref": gate_path.relative_to(coordinator).as_posix(),
+                "sha256": gate_hash,
+            }
+        )
     workflow = {
         "run_id": run_id,
         "work_id": work_id,
@@ -302,10 +454,7 @@ def _dispatch_fixture(tmp_path: Path, driver):
             str((coordinator / "evidence" / "workflow" / f"{phase}-job.json"))
             for phase in ("plan", "build", "verify", "review", "ship")
         ],
-        "gate_refs": [
-            {"kind": "foreign-review", "ref": "review", "sha256": "3" * 64},
-            {"kind": "copilot", "ref": "delivery", "sha256": "4" * 64},
-        ],
+        "gate_refs": gate_refs,
         "candidate_head": candidate,
         "verified_head": candidate,
         "facets": [],
@@ -444,6 +593,55 @@ def test_dispatch_closeout_fails_closed_on_binding_or_reclaim_drift(
 
     monkeypatch.setattr(driver, "_run", fake_run)
     with pytest.raises(driver.QualificationFailure):
+        driver._validate_dispatch_closeout(
+            repository=fixture["repository"],
+            work_id=fixture["work_id"],
+            issue=fixture["issue"],
+            terminal={
+                "status": "done",
+                "run_id": fixture["run_id"],
+                "work_id": fixture["work_id"],
+            },
+            coordinator_root=fixture["coordinator"],
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "hash", "symlink", "duplicate"])
+def test_dispatch_closeout_resolves_every_delivery_gate_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    refs = payload["workflows"][0]["gate_refs"]
+    first = fixture["coordinator"] / refs[0]["ref"]
+    if mutation == "missing":
+        first.unlink()
+    elif mutation == "hash":
+        refs[0]["sha256"] = "0" * 64
+    elif mutation == "symlink":
+        target = first.with_name("target.json")
+        first.rename(target)
+        first.symlink_to(target)
+    else:
+        refs[1]["ref"] = refs[0]["ref"]
+        refs[1]["sha256"] = refs[0]["sha256"]
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+
+    def fake_run(argv, **_kwargs):
+        if "cat-file" in argv or ("bundle" in argv and "verify" in argv):
+            return _result(driver, argv)
+        if "worktree" in argv:
+            return _result(driver, argv, stdout=f"worktree {fixture['repo']}\n")
+        if "bundle" in argv and "list-heads" in argv:
+            return _result(
+                driver, argv, stdout=f"{fixture['candidate']} refs/heads/work\n"
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="delivery gate"):
         driver._validate_dispatch_closeout(
             repository=fixture["repository"],
             work_id=fixture["work_id"],

@@ -323,21 +323,51 @@ def _validate_full_suite_artifacts(
         row = _mapping(
             raw,
             f"provider-capabilities.providers.{name}",
-            {"returncode", "models", "efforts", "native_metadata", "response_token"},
+            {
+                "preflight",
+                "returncode",
+                "models",
+                "efforts",
+                "native_metadata",
+                "response_token",
+            },
         )
         expected = qualification_providers[name]
+        preflight = _mapping(
+            row["preflight"],
+            f"provider-capabilities.providers.{name}.preflight",
+            {
+                "returncode",
+                "status",
+                "authenticated",
+                "quota",
+                "fallback",
+                "skipped",
+            },
+        )
         if (
             row["returncode"] != 0
             or row["native_metadata"] is not True
             or row["response_token"] is not True
+            or preflight["returncode"] != 0
+            or preflight["status"] not in {"ready", "passed", "authenticated"}
+            or preflight["authenticated"] is not True
+            or preflight["quota"] != "available"
+            or preflight["fallback"] is not False
+            or preflight["skipped"] is not False
         ):
             _fail(
                 f"provider {name} did not return successful native metadata and response token"
             )
-        if expected["runtime_model"] not in row["models"]:
-            _fail(f"provider {name} native evidence lacks the runtime model")
-        if expected["runtime_effort"] not in row["efforts"]:
-            _fail(f"provider {name} native evidence lacks the runtime effort")
+        if row["models"] != [expected["runtime_model"]]:
+            _fail(f"provider {name} native evidence must name one exact runtime model")
+        if row["efforts"] != [expected["runtime_effort"]]:
+            _fail(f"provider {name} native evidence must name one exact runtime effort")
+        if (
+            expected["quota"] != preflight["quota"]
+            or expected["fallback"] != preflight["fallback"]
+        ):
+            _fail(f"provider {name} verdict is not bound to native preflight")
 
     dispatch = _mapping(
         _artifact_json(evidence_root, "evidence/dispatch-closeout.json"),

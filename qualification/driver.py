@@ -1117,6 +1117,20 @@ def _walk_values(value: object, keys: set[str]) -> set[str]:
     return found
 
 
+def _walk_scalars(value: object, keys: set[str]) -> list[object]:
+    found: list[object] = []
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized in keys and isinstance(child, (str, bool, int, float)):
+                found.append(child)
+            found.extend(_walk_scalars(child, keys))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_walk_scalars(child, keys))
+    return found
+
+
 def _json_records(output: str) -> list[object]:
     records: list[object] = []
     for line in output.splitlines():
@@ -1130,6 +1144,35 @@ def _json_records(output: str) -> list[object]:
         except json.JSONDecodeError:
             pass
     return records
+
+
+def _provider_preflight(
+    provider: str, account: str, command: Sequence[str]
+) -> dict[str, object]:
+    result = _run(command, user=account, env=_account_env(account), timeout=45)
+    records = _json_records(result.stdout)
+    payload = records[0] if len(records) == 1 else None
+    if (
+        result.returncode != 0
+        or not isinstance(payload, Mapping)
+        or payload.get("provider") != provider
+        or payload.get("status") not in {"ready", "passed", "authenticated"}
+        or payload.get("authenticated") is not True
+        or payload.get("quota") != "available"
+        or payload.get("fallback") is not False
+        or payload.get("skipped") is not False
+    ):
+        raise QualificationFailure(
+            f"provider {provider} live login/quota preflight did not pass"
+        )
+    return {
+        "returncode": result.returncode,
+        "status": str(payload["status"]),
+        "authenticated": True,
+        "quota": str(payload["quota"]),
+        "fallback": False,
+        "skipped": False,
+    }
 
 
 def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
@@ -1181,10 +1224,31 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             prompt,
         ),
     }
+    preflight_commands = {
+        "agy": (
+            "/opt/cortex/toolchain/bin/agy",
+            "status",
+            "--output-format",
+            "json",
+        ),
+        "copilot": (
+            "/opt/cortex/toolchain/bin/copilot",
+            "status",
+            "--output-format",
+            "json",
+        ),
+        "codex": (
+            "/opt/cortex/toolchain/bin/codex",
+            "login",
+            "status",
+            "--json",
+        ),
+    }
     verdicts: list[dict[str, object]] = []
     raw_evidence: dict[str, object] = {"schema_version": 1, "providers": {}}
     for provider, command in commands.items():
         model, effort, account = PROVIDERS[provider]
+        preflight = _provider_preflight(provider, account, preflight_commands[provider])
         result = _run(command, user=account, env=_account_env(account), timeout=300)
         records = _json_records(result.stdout)
         models = (
@@ -1227,13 +1291,22 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
         response_token = any(
             "QUALIFICATION_OK" in json.dumps(row, sort_keys=True) for row in records
         )
+        fallback_values = _walk_scalars(
+            records, {"fallback", "fallbackmodel", "fallbackused"}
+        )
+        fallback_observed = any(
+            value not in {False, 0, "false", "none", "not-used"}
+            for value in fallback_values
+        )
         passed = (
             result.returncode == 0
-            and model in models
-            and effort in efforts
+            and models == {model}
+            and efforts == {effort}
             and response_token
+            and not fallback_observed
         )
         raw_evidence["providers"][provider] = {
+            "preflight": preflight,
             "returncode": result.returncode,
             "models": sorted(models),
             "efforts": sorted(efforts),
@@ -1242,7 +1315,7 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
         }
         if not passed:
             raise QualificationFailure(
-                f"provider {provider} lacked successful native model/effort metadata "
+                f"provider {provider} lacked unique exact native model/effort metadata "
                 f"(rc={result.returncode}, models={sorted(models)}, efforts={sorted(efforts)}, "
                 f"response_token={response_token})"
             )
@@ -1250,12 +1323,12 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             {
                 "provider": provider,
                 "requested_model": model,
-                "runtime_model": model,
+                "runtime_model": next(iter(models)),
                 "requested_effort": effort,
-                "runtime_effort": effort,
+                "runtime_effort": next(iter(efforts)),
                 "status": "passed",
-                "quota": "available",
-                "fallback": False,
+                "quota": preflight["quota"],
+                "fallback": preflight["fallback"],
             }
         )
     _write_json(evidence_dir / "provider-capabilities.json", raw_evidence)
@@ -1776,11 +1849,45 @@ def _validate_dispatch_closeout(
         if worktree.exists() or worktree.is_symlink() or str(worktree) in registered:
             raise QualificationFailure("build worktree reclaim is incomplete")
 
-    gate_kinds = {
-        row.get("kind")
-        for row in workflow.get("gate_refs", [])
-        if isinstance(row, dict) and SHA256.fullmatch(str(row.get("sha256", "")))
-    }
+    gate_refs = workflow.get("gate_refs")
+    if not isinstance(gate_refs, list) or not gate_refs:
+        raise QualificationFailure("workflow delivery gate refs are absent")
+    gate_kinds: set[object] = set()
+    gate_paths: set[Path] = set()
+    gate_inodes: set[tuple[int, int]] = set()
+    evidence_root = root / "evidence"
+    if evidence_root.is_symlink() or not evidence_root.is_dir():
+        raise QualificationFailure("workflow delivery gate evidence root is unsafe")
+    for row in gate_refs:
+        if not isinstance(row, dict) or set(row) != {"kind", "ref", "sha256"}:
+            raise QualificationFailure("workflow delivery gate locator is malformed")
+        relative = Path(str(row["ref"]))
+        expected_hash = row.get("sha256")
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:1] != ("evidence",)
+            or relative.as_posix() != row["ref"]
+            or not isinstance(expected_hash, str)
+            or SHA256.fullmatch(expected_hash) is None
+        ):
+            raise QualificationFailure("workflow delivery gate locator is unsafe")
+        path = root / relative
+        content = _manager_file(
+            path, label="workflow delivery gate", root=evidence_root
+        )
+        metadata = path.stat()
+        inode = (metadata.st_dev, metadata.st_ino)
+        if (
+            hashlib.sha256(content).hexdigest() != expected_hash
+            or path in gate_paths
+            or inode in gate_inodes
+        ):
+            raise QualificationFailure("workflow delivery gate hash/path is not unique")
+        gate_paths.add(path)
+        gate_inodes.add(inode)
+        gate_kinds.add(row["kind"])
+        artifact_paths.append(path)
     if (
         "foreign-review" not in gate_kinds
         or len(gate_kinds & {"copilot", "maintainer-review"}) != 1

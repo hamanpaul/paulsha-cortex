@@ -244,6 +244,14 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
         "schema_version": 1,
         "providers": {
             row["provider"]: {
+                "preflight": {
+                    "returncode": 0,
+                    "status": "ready",
+                    "authenticated": True,
+                    "quota": row["quota"],
+                    "fallback": row["fallback"],
+                    "skipped": False,
+                },
                 "returncode": 0,
                 "models": [row["runtime_model"]],
                 "efforts": [row["runtime_effort"]],
@@ -629,6 +637,27 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
         path = evidence / "manager-github-auth.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["after_sha256"] = "4" * 64
+    _write_json(path, document)
+    _refresh_full_hashes(tmp_path, payload)
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("mutation", ["mixed-model", "quota-denied", "fallback"])
+def test_full_suite_validator_binds_native_provider_preflight_and_identity(
+    tmp_path: Path, mutation: str
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    path = tmp_path / "evidence" / "provider-capabilities.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    provider = document["providers"]["codex"]
+    if mutation == "mixed-model":
+        provider["models"].append("fallback-model")
+    elif mutation == "quota-denied":
+        provider["preflight"]["quota"] = "exhausted"
+    else:
+        provider["preflight"]["fallback"] = True
     _write_json(path, document)
     _refresh_full_hashes(tmp_path, payload)
 
