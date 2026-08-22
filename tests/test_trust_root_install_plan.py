@@ -22,6 +22,7 @@ from paulsha_cortex.trust_root.install import (
     canonical_plan_bytes,
     new_install_receipt,
     plan_sha256,
+    validate_apply_plan,
 )
 from paulsha_cortex.trust_root.install import cli as install_cli
 from paulsha_cortex.trust_root.install import core as install_core
@@ -304,6 +305,180 @@ def test_apply_revalidates_serialized_plan_topology_before_backend_mutation(
         )
 
     assert backend.applied == []
+
+
+def test_public_apply_validation_is_pure_for_a_valid_plan(tmp_path: Path) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    before = canonical_plan_bytes(plan)
+
+    steps = validate_apply_plan(plan, confirm_sha256=plan_sha256(plan))
+
+    assert [step["step_id"] for step in steps] == [
+        step["step_id"] for step in plan["apply_order"]
+    ]
+    assert canonical_plan_bytes(plan) == before
+
+
+@pytest.mark.parametrize("failure", ["unconfirmed", "topology"])
+def test_apply_cli_rejects_before_creating_any_receipt_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    if failure == "topology":
+        missing = f"{plan['roots']['state']}/runtime/codex-home"
+        plan["apply_order"] = [
+            step for step in plan["apply_order"] if step.get("path") != missing
+        ]
+    plan_path = tmp_path / f"{failure}-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = tmp_path / f"{failure}-receipt" / "receipt.json"
+    confirm = "0" * 64 if failure == "unconfirmed" else plan_sha256(plan)
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+        apply_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("invalid plan reached backend preflight")
+
+        def apply_step(self, _step):
+            type(self).apply_calls += 1
+            raise AssertionError("invalid plan reached backend mutation")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+    # Permit the old implementation to demonstrate its premature creation in
+    # this rootless test.  The fixed CLI never reaches receipt persistence.
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            confirm,
+            "--receipt",
+            str(receipt_path),
+        ]
+    ) == 1
+
+    assert not receipt_path.parent.exists()
+    assert MutationSentinelBackend.preflight_calls == 0
+    assert MutationSentinelBackend.apply_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("nested_key", "nested_value"),
+    [
+        ("api_token", "PLAINTEXT-SECRET-SENTINEL"),
+        ("required_credentials", "PLAINTEXT-SECRET-SENTINEL"),
+        (
+            "mirror_url",
+            "https://example.invalid/tool?access_token=PLAINTEXT-SECRET-SENTINEL",
+        ),
+    ],
+)
+def test_apply_cli_rejects_nested_secrets_before_receipt_or_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    nested_key: str,
+    nested_value: str,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    unit = next(iter(plan["generated"]["units"].values()))
+    unit["untrusted_extension"] = {nested_key: nested_value}
+    plan_path = tmp_path / f"secret-{nested_key}.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = tmp_path / f"secret-{nested_key}" / "receipt.json"
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+        apply_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("secret-bearing plan reached backend preflight")
+
+        def apply_step(self, _step):
+            type(self).apply_calls += 1
+            raise AssertionError("secret-bearing plan reached backend mutation")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(receipt_path),
+        ]
+    ) == 1
+
+    error = capsys.readouterr().err
+    assert "PLAINTEXT-SECRET-SENTINEL" not in error
+    assert not receipt_path.parent.exists()
+    assert MutationSentinelBackend.preflight_calls == 0
+    assert MutationSentinelBackend.apply_calls == 0
+
+
+def test_apply_plan_secret_defense_runs_before_receipt_checkpoint_or_preflight(
+    tmp_path: Path,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    receipt = new_install_receipt(plan)
+    unit = next(iter(plan["generated"]["units"].values()))
+    unit["untrusted_extension"] = {
+        "nested_password": "PLAINTEXT-SECRET-SENTINEL"
+    }
+    receipt._document["plan_sha256"] = plan_sha256(plan)
+    persist_calls = 0
+
+    def record_persist() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+
+    receipt._persist = record_persist  # type: ignore[method-assign]
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("secret-bearing plan reached backend preflight")
+
+    backend = MutationSentinelBackend()
+
+    with pytest.raises(InstallPlanError, match="nested_password") as exc:
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert "PLAINTEXT-SECRET-SENTINEL" not in str(exc.value)
+    assert persist_calls == 0
+    assert backend.preflight_calls == 0
 
 
 @pytest.mark.parametrize("mounted", [False, True])

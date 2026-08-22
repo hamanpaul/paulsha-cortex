@@ -25,6 +25,7 @@ from .core import (
     new_install_receipt,
     plan_sha256,
     rollback_receipt,
+    validate_apply_plan,
     validate_bundle_manifest,
     validate_preflight,
     verify_receipt,

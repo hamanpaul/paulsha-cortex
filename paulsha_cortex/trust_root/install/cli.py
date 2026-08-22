@@ -25,6 +25,7 @@ from .core import (
     new_install_receipt,
     plan_sha256,
     rollback_receipt,
+    validate_apply_plan,
     validate_bundle_manifest,
     verify_receipt,
 )
@@ -171,6 +172,7 @@ def _plan_command(args: argparse.Namespace) -> int:
 def _apply_command(args: argparse.Namespace) -> int:
     _require_root()
     plan = _load_plan(Path(args.plan))
+    validate_apply_plan(plan, confirm_sha256=args.confirm_sha256)
     receipt_path = (
         Path(args.receipt).expanduser()
         if args.receipt is not None

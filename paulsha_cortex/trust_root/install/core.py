@@ -447,29 +447,49 @@ def _credential_bearing_url(value: str) -> bool:
     )
 
 
-def _reject_sensitive_config(value: object, *, path: tuple[str, ...] = ()) -> None:
+def _reject_sensitive_config(
+    value: object,
+    *,
+    path: tuple[str, ...] = (),
+    allowed_field_paths: frozenset[tuple[str, ...]] = frozenset(),
+    subject: str = "configuration",
+) -> None:
     if isinstance(value, Mapping):
         for raw_key, child in value.items():
             key = str(raw_key)
             normalized = key.casefold()
             if (
-                normalized in _FORBIDDEN_CONFIG_FIELDS
-                or any(fragment in normalized for fragment in _FORBIDDEN_CONFIG_FIELD_FRAGMENTS)
-                or normalized.endswith(
-                ("_password", "_secret", "_token")
+                (*path, normalized) not in allowed_field_paths
+                and (
+                    normalized in _FORBIDDEN_CONFIG_FIELDS
+                    or any(
+                        fragment in normalized
+                        for fragment in _FORBIDDEN_CONFIG_FIELD_FRAGMENTS
+                    )
+                    or normalized.endswith(("_password", "_secret", "_token"))
                 )
             ):
                 raise InstallPlanError(
-                    f"configuration field {'.'.join((*path, key))} is forbidden"
+                    f"{subject} field {'.'.join((*path, key))} is forbidden"
                 )
-            _reject_sensitive_config(child, path=(*path, key))
+            _reject_sensitive_config(
+                child,
+                path=(*path, key),
+                allowed_field_paths=allowed_field_paths,
+                subject=subject,
+            )
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
-            _reject_sensitive_config(child, path=(*path, str(index)))
+            _reject_sensitive_config(
+                child,
+                path=(*path, str(index)),
+                allowed_field_paths=allowed_field_paths,
+                subject=subject,
+            )
     elif isinstance(value, str) and _credential_bearing_url(value):
         label = ".".join(path) or "<root>"
         raise InstallPlanError(
-            f"configuration field {label} contains a credential-bearing URL"
+            f"{subject} field {label} contains a credential-bearing URL"
         )
 
 
@@ -2430,6 +2450,23 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
     return typed_steps
 
 
+def validate_apply_plan(
+    plan: Mapping[str, object], *, confirm_sha256: str
+) -> tuple[Mapping[str, object], ...]:
+    """Purely validate confirmed serialized plan authority before side effects."""
+
+    if confirm_sha256 != plan_sha256(plan):
+        raise InstallPlanError(
+            "confirm-sha256 does not match the canonical plan sha256"
+        )
+    _reject_sensitive_config(
+        plan,
+        allowed_field_paths=frozenset({("required_credentials",)}),
+        subject="plan",
+    )
+    return tuple(_validate_apply_plan_schema(plan))
+
+
 def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
     if not state.get("exists"):
         return False
@@ -2815,9 +2852,9 @@ def apply_plan(
     backend: InstallBackend,
 ) -> InstallReceipt:
     expected_hash = plan_sha256(plan)
-    if confirm_sha256 != expected_hash or receipt._document.get("plan_sha256") != expected_hash:
+    steps = validate_apply_plan(plan, confirm_sha256=confirm_sha256)
+    if receipt._document.get("plan_sha256") != expected_hash:
         raise InstallPlanError("confirm-sha256 does not match the canonical plan sha256")
-    steps = _validate_apply_plan_schema(plan)
     facts = backend.preflight_facts(plan)
     report = validate_preflight(plan, facts, receipt=receipt)
     if not report.ok:
