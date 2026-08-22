@@ -111,3 +111,79 @@ def test_release_workflow_is_tag_only_no_pypi_and_sha_pinned() -> None:
     assert isinstance(jobs, dict) and jobs, "release.yml must define jobs"
     _assert_all_uses_are_sha_pinned(payload, relpath=".github/workflows/release.yml")
     _assert_all_uses_have_version_comments("release.yml")
+
+
+def _job_needs(job: dict) -> set[str]:
+    needs = job.get("needs", [])
+    if isinstance(needs, str):
+        return {needs}
+    assert isinstance(needs, list), "job needs must be a string or list"
+    return set(needs)
+
+
+def test_rc_qualification_is_manual_protected_and_sha_pinned() -> None:
+    payload = _load_workflow("rc-qualification.yml")
+    on_block = _workflow_on(payload)
+    assert set(on_block) == {"workflow_dispatch"}, (
+        "RC qualification is privileged and must never run on push, pull_request, or schedule"
+    )
+
+    jobs = payload.get("jobs", {})
+    assert isinstance(jobs, dict) and jobs
+    qualification_jobs = [
+        job
+        for job in jobs.values()
+        if isinstance(job, dict) and "qualification/run.sh" in _job_step_runs(job)
+    ]
+    assert qualification_jobs, "RC workflow must execute qualification/run.sh"
+    assert all(job.get("environment") == "rc-qualification" for job in qualification_jobs), (
+        "every job running privileged qualification must use the protected rc-qualification environment"
+    )
+
+    raw = (WORKFLOWS / "rc-qualification.yml").read_text(encoding="utf-8")
+    lowered = raw.lower()
+    assert "python -m build" in lowered
+    assert "qualification/run.sh" in raw
+    assert "qualification.json" in raw
+    assert "upload-artifact" in lowered
+    assert "github.sha" in lowered or "github.event.inputs" in lowered
+    assert "timeout-minutes" in lowered
+
+    _assert_all_uses_are_sha_pinned(payload, relpath=".github/workflows/rc-qualification.yml")
+    _assert_all_uses_have_version_comments("rc-qualification.yml")
+
+
+def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish() -> None:
+    payload = _load_workflow("release.yml")
+    jobs = payload.get("jobs", {})
+    assert isinstance(jobs, dict)
+    gate = jobs.get("qualification-gate")
+    assert isinstance(gate, dict), "release.yml must define qualification-gate"
+    assert "build" in _job_needs(gate), "the gate must validate the wheel produced by the build job"
+
+    gate_runs = _job_step_runs(gate)
+    gate_text = repr(gate)
+    gate_lower = gate_runs.lower()
+    assert "rc-qualification.yml" in gate_text.lower()
+    assert "qualification.json" in gate_text
+    assert "qualification/validate.py" in gate_runs
+    assert "--candidate-sha" in gate_runs
+    assert "--wheel-sha256" in gate_runs
+    assert "sha256sum" in gate_lower
+    assert "head_sha" in gate_text or "head-sha" in gate_text.lower()
+    assert "success" in gate_text.lower(), "the selected RC qualification run must have succeeded"
+
+    release = jobs.get("release")
+    assert isinstance(release, dict)
+    assert "qualification-gate" in _job_needs(release), (
+        "GitHub Release publication must depend on exact-SHA qualification validation"
+    )
+
+    release_runs = _job_step_runs(release).lower()
+    release_uses = "\n".join(
+        str(step.get("uses", "")) for step in release.get("steps", []) if isinstance(step, dict)
+    ).lower()
+    assert "action-gh-release" in release_uses
+    assert "qualification/validate.py" not in release_runs, (
+        "evidence validation belongs in the required predecessor gate, never after publication"
+    )
