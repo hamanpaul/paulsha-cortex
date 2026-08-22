@@ -232,6 +232,29 @@ def _expected_acl_mode(step: Mapping[str, object]) -> str:
     return format((base & ~0o070) | (mask << 3), "04o")
 
 
+def _expected_acls(step: Mapping[str, object]) -> list[dict[str, object]]:
+    return [
+        {
+            "account": row.get("account"),
+            "perms": str(row.get("perms", "")).replace("X", "x").replace("-", ""),
+            "default": bool(row.get("default", False)),
+        }
+        for row in step.get("acls", [])
+        if isinstance(row, Mapping)
+    ]
+
+
+def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
+    return bool(
+        state.get("exists")
+        and state.get("installed_sha256") == step.get("desired_sha256")
+        and state.get("owner") == step.get("owner")
+        and state.get("group") == step.get("group")
+        and state.get("mode") == step.get("mode")
+        and state.get("acl", []) == step.get("acls", [])
+    )
+
+
 def _universal_nopasswd() -> bool:
     pattern = re.compile(r"\bALL\s*=\s*\([^)]*\)\s*NOPASSWD\s*:\s*ALL\b")
     candidates = [Path("/etc/sudoers")]
@@ -365,27 +388,26 @@ class LocalInstallBackend:
         if not observed.get("exists"):
             return observed
         if step.get("asset_type") == "directory":
-            expected_acls = [
-                {
-                    "account": row.get("account"),
-                    "perms": str(row.get("perms", ""))
-                    .replace("X", "x")
-                    .replace("-", ""),
-                    "default": bool(row.get("default", False)),
-                }
-                for row in step.get("acls", [])
-                if isinstance(row, Mapping)
-            ]
+            actual_mode = observed.get("mode")
+            actual_acls = observed.get("acl", [])
             matches = (
                 observed.get("is_directory") is True
                 and observed.get("owner") == step.get("owner")
                 and observed.get("group") == step.get("group")
-                and observed.get("mode") == _expected_acl_mode(step)
-                and observed.get("acl", []) == expected_acls
+                and actual_mode == _expected_acl_mode(step)
+                and actual_acls == _expected_acls(step)
             )
+            observed["observed_mode"] = actual_mode
+            observed["observed_acl"] = actual_acls
             observed["installed_sha256"] = (
                 step.get("desired_sha256") if matches else None
             )
+            if matches:
+                # The transaction layer compares the plan's base mode and ACL
+                # spelling. Preserve the kernel-observed values above while
+                # reporting the matching desired-state semantics here.
+                observed["mode"] = step.get("mode")
+                observed["acl"] = list(step.get("acls", []))
         return observed
 
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
@@ -563,7 +585,13 @@ class LocalInstallBackend:
         if not path.is_absolute() or ".." in path.parts:
             raise UnsafeInstallPathError(f"unsafe asset path: {path}")
         _reject_symlink_ancestors(path, label="asset")
-        prior = _snapshot(path)
+        prior = dict(self.inspect_step(step))
+        if prior.get("exists"):
+            if not _state_matches_step(step, prior):
+                raise InstallDriftError(
+                    f"existing asset does not match desired state: {step.get('step_id')}"
+                )
+            return {"prior": prior, **prior}
         asset_type = step.get("asset_type", "file")
         if asset_type == "directory":
             path.mkdir(parents=True, exist_ok=True)
@@ -593,6 +621,12 @@ class LocalInstallBackend:
                 raise
         else:
             raise InstallPlanError(f"unsupported asset_type: {asset_type}")
+        # New files and directories can inherit named/default ACLs from their
+        # parent. Clear that inherited state before applying the plan's exact
+        # ACL set. This is safe only because ``prior`` proved the leaf absent.
+        _run(("setfacl", "-b", str(path)), check=True)
+        if asset_type == "directory":
+            _run(("setfacl", "-k", str(path)), check=True)
         os.chown(path, _resolve_uid(step.get("owner")), _resolve_gid(step.get("group")), follow_symlinks=False)
         os.chmod(path, _mode(step.get("mode")), follow_symlinks=False)
         for acl in step.get("acls", []):

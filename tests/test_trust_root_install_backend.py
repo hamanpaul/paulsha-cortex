@@ -248,3 +248,63 @@ def test_directory_acl_attestation_accounts_for_posix_mask(
     assert result["installed_sha256"] == step["desired_sha256"]
     assert stat.S_IMODE(path.stat().st_mode) == 0o750
     assert backend.inspect_step(step)["installed_sha256"] == step["desired_sha256"]
+    assert backend.apply_step(step)["installed_sha256"] == step["desired_sha256"]
+
+
+def test_new_directory_drops_inherited_acl_not_declared_by_plan(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    parent = tmp_path / "control"
+    parent.mkdir()
+    subprocess.run(
+        ("setfacl", "-m", "d:u:root:rx", str(parent)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    path = parent / "requests"
+    step = {
+        "step_id": "asset:control-request-queue",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(path),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+
+    result = backend.apply_step(step)
+
+    assert result["installed_sha256"] == step["desired_sha256"]
+    assert backend.inspect_step(step)["observed_acl"] == []
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+
+
+def test_existing_directory_drift_is_not_overwritten(tmp_path: Path) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / "existing"
+    path.mkdir(mode=0o755)
+    step = {
+        "step_id": "asset:existing",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(path),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+
+    with pytest.raises(InstallDriftError, match="existing asset"):
+        LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o755
