@@ -160,6 +160,12 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
         "gitconfigs",
         "toolchain_wrappers",
     }
+    state_root = next(
+        step
+        for step in doc["apply_order"]
+        if step.get("path") == doc["roots"]["state"]
+    )
+    assert state_root["adoption_policy"] == "empty-managed-root-mount"
 
 
 def test_scaffold_targets_are_applied_before_home_redirect_symlinks(

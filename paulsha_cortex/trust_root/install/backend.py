@@ -365,6 +365,12 @@ def _snapshot(path: Path) -> dict[str, object]:
     }
     if stat.S_ISDIR(observed.st_mode):
         snapshot["children"] = _directory_inventory(path)
+        try:
+            snapshot["is_mountpoint"] = path.is_mount()
+        except OSError as exc:
+            raise InstallDriftError(
+                f"cannot determine managed directory mount status {path}: {exc}"
+            ) from exc
     if stat.S_ISREG(observed.st_mode):
         content = path.read_bytes()
         snapshot["content_base64"] = base64.b64encode(content).decode("ascii")

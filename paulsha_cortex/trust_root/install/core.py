@@ -805,6 +805,7 @@ def _desired_digest(step: Mapping[str, object]) -> str:
         "commit": step.get("commit"),
         "remote": step.get("remote"),
         "source_sha256": step.get("source_sha256"),
+        "adoption_policy": step.get("adoption_policy"),
     }
     return hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
 
@@ -1014,6 +1015,22 @@ def build_install_plan(
         char not in "0123456789abcdefABCDEF" for char in commit
     ):
         raise InstallPlanError("repo_identity.commit must be a 40-hex SHA")
+    install_steps = _apply_steps(
+        scaffolds=scaffolds,
+        assets=assets,
+        generated=generated,
+    )
+    state_root_steps = [
+        step
+        for step in install_steps
+        if step.get("kind") == "asset"
+        and step.get("asset_type") == "directory"
+        and step.get("path") == roots["state"]
+    ]
+    if len(state_root_steps) != 1:
+        raise InstallPlanError("managed state root must map to exactly one directory step")
+    state_root_steps[0]["adoption_policy"] = "empty-managed-root-mount"
+    state_root_steps[0]["desired_sha256"] = _desired_digest(state_root_steps[0])
     plan: dict[str, object] = {
         "schema_version": 1,
         "scheme": "four-way",
@@ -1059,7 +1076,7 @@ def build_install_plan(
                 }
                 for row in (*accounts, *service_accounts)
             ),
-            *_apply_steps(scaffolds=scaffolds, assets=assets, generated=generated),
+            *install_steps,
             {
                 "step_id": "candidate-venv",
                 "kind": "venv",
@@ -2255,6 +2272,34 @@ def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> b
     return True
 
 
+def _explicit_empty_managed_mount_is_adoptable(
+    *,
+    plan: Mapping[str, object],
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> bool:
+    """Recognize the one first-install directory created by a volume mount.
+
+    A Docker named volume necessarily materializes its mountpoint before Cortex
+    can create it.  Adoption is therefore limited to the exact managed state
+    root, only while it is an empty mountpoint and already matches the complete
+    desired owner/mode/ACL state checked by the caller.
+    """
+
+    roots = plan.get("roots")
+    return bool(
+        isinstance(roots, Mapping)
+        and isinstance(roots.get("state"), str)
+        and step.get("kind") == "asset"
+        and step.get("asset_type") == "directory"
+        and step.get("durable") is True
+        and step.get("path") == roots["state"]
+        and step.get("adoption_policy") == "empty-managed-root-mount"
+        and installed.get("is_mountpoint") is True
+        and installed.get("children") == []
+    )
+
+
 def _valid_creation_authority(
     authority: object, *, file_type: object | None = None
 ) -> bool:
@@ -2581,17 +2626,23 @@ def apply_plan(
         else:
             prior = dict(backend.inspect_step(step))
             adopted_from_receipt = False
+            adopted_mount_root = False
             if (
                 step.get("kind") in {"asset", "repository"}
                 and _state_matches(step, prior)
             ):
-                if not _step_has_receipt_provenance(
+                adopted_from_receipt = _step_has_receipt_provenance(
                     plan=plan, step=step, receipt=receipt
-                ):
+                )
+                adopted_mount_root = _explicit_empty_managed_mount_is_adoptable(
+                    plan=plan,
+                    step=step,
+                    installed=prior,
+                )
+                if not (adopted_from_receipt or adopted_mount_root):
                     raise InstallDriftError(
                         f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
                     )
-                adopted_from_receipt = True
             entry = {
                 "step_id": step_id,
                 "step": deepcopy(dict(step)),
@@ -2600,6 +2651,8 @@ def apply_plan(
             }
             if adopted_from_receipt:
                 entry["adopted_from_receipt"] = True
+            if adopted_mount_root:
+                entry["adopted_mount_root"] = True
             journal.append(entry)
             completed[step_id] = entry
             receipt._persist()

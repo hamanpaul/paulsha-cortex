@@ -513,6 +513,85 @@ def test_first_install_refuses_exact_preexisting_state_without_receipt_provenanc
     assert receipt.to_dict()["journal"] == []
 
 
+def test_first_install_adopts_exact_empty_managed_state_mount(tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    plan["roots"] = {"state": step["path"]}
+    plan["apply_order"] = [step]
+    backend = RecordingBackend(plan)
+    backend.states[step["step_id"]] = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+        "is_mountpoint": True,
+        "children": [],
+    }
+    receipt = new_install_receipt(plan)
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.applied == [step["step_id"]]
+    assert receipt.to_dict()["journal"][0]["adopted_mount_root"] is True
+
+
+@pytest.mark.parametrize(
+    ("is_mountpoint", "children"),
+    [(False, []), (True, ["foreign-state"])],
+)
+def test_first_install_refuses_unqualified_managed_state_root_adoption(
+    tmp_path: Path, is_mountpoint: bool, children: list[str]
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    plan["roots"] = {"state": step["path"]}
+    plan["apply_order"] = [step]
+    backend = RecordingBackend(plan)
+    backend.states[step["step_id"]] = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+        "is_mountpoint": is_mountpoint,
+        "children": children,
+    }
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallDriftError, match="receipt|provenance"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
 @pytest.mark.parametrize("kind", ["asset", "repository"])
 def test_exact_retained_state_with_plan_bound_rollback_provenance_is_adoptable(
     tmp_path: Path, kind: str
