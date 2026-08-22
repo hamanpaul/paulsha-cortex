@@ -132,6 +132,9 @@ class RecordingBackend:
         self.fail_on: str | None = None
         self.fail_after_mutation: str | None = None
         self.fail_with_partial_mutation: str | None = None
+        self.fail_stop: str | None = None
+        self.stopped: list[str] = []
+        self.credential_rollbacks = 0
 
     def preflight_facts(self, _plan) -> dict[str, object]:
         return deepcopy(self.facts)
@@ -174,6 +177,15 @@ class RecordingBackend:
 
     def list_unknown_state(self, _receipt) -> tuple[str, ...]:
         return tuple(sorted(self.unknown))
+
+    def stop_service(self, name: str) -> None:
+        self.stopped.append(name)
+        if self.fail_stop == name:
+            raise RuntimeError(f"injected stop failure: {name}")
+
+    def rollback_credentials(self, _receipt):
+        self.credential_rollbacks += 1
+        return ()
 
 
 def test_preflight_uses_explicit_backend_facts_not_the_host(tmp_path: Path) -> None:
@@ -578,6 +590,141 @@ def test_partial_mid_step_mutation_can_be_explicitly_rolled_back(
     assert backend.rolled_back == ["state-root"]
     assert "state-root" not in backend.states
     assert report.retained_drift == ()
+
+
+def test_rollback_persists_each_reversed_entry_and_recovers_after_persist_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    receipt_path = (tmp_path / "receipt.json").absolute()
+    receipt = new_install_receipt(plan, path=receipt_path)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    original_persist = receipt._persist
+    persist_calls = 0
+
+    def crash_on_first_entry_checkpoint() -> None:
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 2:
+            raise SystemExit("simulated rollback checkpoint crash")
+        original_persist()
+
+    receipt._persist = crash_on_first_entry_checkpoint  # type: ignore[method-assign]
+
+    with pytest.raises(SystemExit, match="checkpoint"):
+        rollback_receipt(receipt, backend=backend)
+
+    assert backend.rolled_back == ["manager-unit"]
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    recovered = InstallReceipt.load(receipt_path)
+    assert [row["step_id"] for row in recovered.to_dict()["journal"]] == [
+        "state-root",
+        "manager-unit",
+    ]
+
+    report = rollback_receipt(recovered, backend=backend)
+
+    assert report.retained_drift == ()
+    assert backend.rolled_back == ["manager-unit", "state-root"]
+    assert backend.states == {}
+    assert recovered.to_dict()["journal"] == []
+
+
+def test_service_stop_failure_blocks_credential_and_runtime_rollback(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    receipt._document["activation_journal"] = [
+        {"service": service, "status": "completed"}
+        for service in (
+            "cortex-egress-proxy.service",
+            "cortex-manager.service",
+            "cortex-monitor.service",
+        )
+    ]
+    receipt._document["services_started"] = True
+    backend.fail_stop = "cortex-manager.service"
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert any(
+        row["step_id"] == "service:cortex-manager.service"
+        for row in report.to_dict()["retained_drift"]
+    )
+    assert backend.credential_rollbacks == 0
+    assert backend.rolled_back == []
+    assert set(backend.states) == {"state-root", "manager-unit"}
+    assert receipt.to_dict()["state"] == "rollback-blocked"
+
+
+def test_prepared_daemon_reload_is_replayed_not_promoted_from_synthetic_state(
+    tmp_path: Path,
+) -> None:
+    step = {
+        "step_id": "systemd:daemon-reload",
+        "kind": "systemctl",
+        "action": "daemon-reload",
+        "operations": ["daemon-reload"],
+        "desired_sha256": "d" * 64,
+    }
+    plan = _plan(tmp_path)
+    plan["accounts"] = []
+    plan["apply_order"] = [step]
+
+    class DaemonReloadBackend:
+        def __init__(self) -> None:
+            self.applied = 0
+
+        def preflight_facts(self, _plan):
+            return _safe_facts(plan)
+
+        def inspect_step(self, _step):
+            return {"exists": True, "installed_sha256": "d" * 64}
+
+        def apply_step(self, _step):
+            self.applied += 1
+            return {"exists": True, "installed_sha256": "d" * 64}
+
+    receipt = new_install_receipt(plan)
+    receipt._document["state"] = "applying"
+    receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "prepared",
+            "prior": {"exists": True, "installed_sha256": "d" * 64},
+        }
+    ]
+    backend = DaemonReloadBackend()
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.applied == 1
+    assert receipt.to_dict()["journal"][0]["status"] == "completed"
 
 
 def test_replay_stops_when_a_completed_asset_no_longer_matches(tmp_path: Path) -> None:

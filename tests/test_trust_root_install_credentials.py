@@ -45,6 +45,7 @@ class CredentialBackend:
         self.stopped: list[str] = []
         self.fail_start: str | None = None
         self.fail_stop: str | None = None
+        self.credential_rollbacks = 0
 
     def preflight_facts(self, _plan):
         return {
@@ -79,6 +80,13 @@ class CredentialBackend:
         self.stopped.append(name)
         if self.fail_stop == name:
             raise RuntimeError(f"injected stop failure: {name}")
+
+    def rollback_credentials(self, _receipt):
+        self.credential_rollbacks += 1
+        return ()
+
+    def list_unknown_state(self, _receipt):
+        return ()
 
 
 def _applied_receipt(*, required_credentials=None):
@@ -427,6 +435,93 @@ def test_activation_surfaces_reverse_stop_failure_and_records_remaining_service(
     assert document["activation_failure"]["compensation_failures"] == [
         "cortex-egress-proxy.service"
     ]
+
+
+def test_activation_persists_prepared_and_completed_entry_around_each_start(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, backend = _applied_receipt()
+    snapshots: list[list[dict[str, object]]] = []
+    original_persist = receipt._persist
+
+    def capture_persist() -> None:
+        snapshots.append(
+            list(receipt.to_dict().get("activation_journal", []))
+        )
+        original_persist()
+
+    receipt._persist = capture_persist  # type: ignore[method-assign]
+
+    activate_receipt(receipt, backend=backend)
+
+    transitions = [snapshot for snapshot in snapshots if snapshot]
+    assert transitions[:6] == [
+        [{"service": "cortex-egress-proxy.service", "status": "prepared"}],
+        [{"service": "cortex-egress-proxy.service", "status": "completed"}],
+        [
+            {"service": "cortex-egress-proxy.service", "status": "completed"},
+            {"service": "cortex-manager.service", "status": "prepared"},
+        ],
+        [
+            {"service": "cortex-egress-proxy.service", "status": "completed"},
+            {"service": "cortex-manager.service", "status": "completed"},
+        ],
+        [
+            {"service": "cortex-egress-proxy.service", "status": "completed"},
+            {"service": "cortex-manager.service", "status": "completed"},
+            {"service": "cortex-monitor.service", "status": "prepared"},
+        ],
+        [
+            {"service": "cortex-egress-proxy.service", "status": "completed"},
+            {"service": "cortex-manager.service", "status": "completed"},
+            {"service": "cortex-monitor.service", "status": "completed"},
+        ],
+    ]
+
+
+def test_loaded_prepared_activation_rolls_back_attempted_service_after_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = _plan()
+    backend = CredentialBackend()
+    receipt_path = (tmp_path / "activation-receipt.json").absolute()
+    receipt = new_install_receipt(plan, path=receipt_path)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    original_persist = receipt._persist
+
+    def crash_after_start_before_completed_persist() -> None:
+        journal = receipt.to_dict().get("activation_journal", [])
+        if journal and journal[-1].get("status") == "completed":
+            raise SystemExit("simulated SIGKILL persistence boundary")
+        original_persist()
+
+    receipt._persist = crash_after_start_before_completed_persist  # type: ignore[method-assign]
+
+    with pytest.raises(SystemExit, match="SIGKILL"):
+        activate_receipt(receipt, backend=backend)
+
+    assert backend.started == ["cortex-egress-proxy.service"]
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    recovered = InstallReceipt.load(receipt_path)
+    assert recovered.to_dict()["activation_journal"] == [
+        {"service": "cortex-egress-proxy.service", "status": "prepared"}
+    ]
+
+    report = rollback_receipt(recovered, backend=backend)
+
+    assert report.retained_drift == ()
+    assert backend.stopped == ["cortex-egress-proxy.service"]
+    assert recovered.to_dict()["activation_journal"] == []
 
 
 def test_rollback_removes_hash_bound_prepared_credential(

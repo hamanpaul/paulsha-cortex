@@ -1761,6 +1761,22 @@ class InstallReceipt:
             or set(completed_identities) & set(prepared_identities)
         ):
             raise InstallError(f"receipt credential authority is duplicated: {path}")
+        activation_journal = payload.get("activation_journal", [])
+        if not isinstance(activation_journal, list) or any(
+            not isinstance(row, Mapping)
+            or set(row) != {"service", "status"}
+            or row.get("service") not in _SERVICE_ORDER
+            or row.get("status") not in {"prepared", "completed"}
+            for row in activation_journal
+        ):
+            raise InstallError(f"receipt activation journal is invalid: {path}")
+        activation_services = [str(row["service"]) for row in activation_journal]
+        if (
+            len(activation_services) != len(set(activation_services))
+            or activation_services
+            != sorted(activation_services, key=_SERVICE_ORDER.index)
+        ):
+            raise InstallError(f"receipt activation authority is invalid: {path}")
         expected_executables = payload.get("expected_service_executables")
         if expected_executables is not None and (
             not isinstance(expected_executables, Mapping)
@@ -1877,6 +1893,7 @@ def new_install_receipt(
             "journal": [],
             "credentials": [],
             "credential_journal": [],
+            "activation_journal": [],
             "services_started": False,
             "activated": False,
             "qualified": False,
@@ -2031,6 +2048,15 @@ def _attest_candidate_venv(
     }
 
 
+def _prepared_step_requires_replay(step: Mapping[str, object]) -> bool:
+    """Return whether a prepared step has no inspectable completion evidence."""
+
+    return (
+        step.get("kind") == "systemctl"
+        and step.get("action") == "daemon-reload"
+    )
+
+
 def _planned_service_exec_paths(
     plan: Mapping[str, object],
 ) -> dict[str, str]:
@@ -2137,7 +2163,10 @@ def apply_plan(
         if step_id in completed:
             entry = completed[step_id]
             installed = backend.inspect_step(step)
-            if _state_matches(step, installed):
+            if _state_matches(step, installed) and not (
+                entry.get("status") == "prepared"
+                and _prepared_step_requires_replay(step)
+            ):
                 if entry.get("status") == "prepared":
                     entry["status"] = "completed"
                     entry.update(installed)
@@ -2226,6 +2255,45 @@ class RollbackReport:
         }
 
 
+def _activation_entries(receipt: InstallReceipt) -> list[dict[str, object]]:
+    journal = receipt._document.setdefault("activation_journal", [])
+    if not isinstance(journal, list) or any(
+        not isinstance(entry, dict)
+        or set(entry) != {"service", "status"}
+        or entry.get("service") not in _SERVICE_ORDER
+        or entry.get("status") not in {"prepared", "completed"}
+        for entry in journal
+    ):
+        raise InstallError("receipt activation journal is invalid")
+    services = [str(entry["service"]) for entry in journal]
+    if len(services) != len(set(services)) or services != sorted(
+        services, key=_SERVICE_ORDER.index
+    ):
+        raise InstallError("receipt activation authority is invalid")
+    return journal
+
+
+def _sync_activation_state(receipt: InstallReceipt) -> None:
+    services = [str(entry["service"]) for entry in _activation_entries(receipt)]
+    receipt._document["running_services"] = services
+    receipt._document["services_started"] = bool(services)
+
+
+def _forget_activation_entry(
+    receipt: InstallReceipt, entry: dict[str, object]
+) -> None:
+    journal = _activation_entries(receipt)
+    index = journal.index(entry)
+    journal.pop(index)
+    _sync_activation_state(receipt)
+    try:
+        receipt._persist()
+    except BaseException:
+        journal.insert(index, entry)
+        _sync_activation_state(receipt)
+        raise
+
+
 def rollback_receipt(
     receipt: InstallReceipt, *, backend: InstallBackend
 ) -> RollbackReport:
@@ -2233,20 +2301,58 @@ def rollback_receipt(
     if not isinstance(journal, list):
         raise InstallError("receipt journal is invalid")
     retained_drift: list[dict[str, object]] = []
-    retained_entries: list[object] = []
     service_stop_failures: list[str] = []
-    if receipt._document.get("services_started"):
-        for service in reversed(_SERVICE_ORDER):
-            try:
-                backend.stop_service(service)
-            except Exception as exc:
-                service_stop_failures.append(service)
-                retained_drift.append(
-                    {
-                        "step_id": f"service:{service}",
-                        "observed": {"error": str(exc)},
-                    }
-                )
+    activation_journal = _activation_entries(receipt)
+    if not activation_journal and receipt._document.get("services_started"):
+        raw_running = receipt._document.get("running_services")
+        running = (
+            [service for service in _SERVICE_ORDER if service in raw_running]
+            if isinstance(raw_running, list) and raw_running
+            else list(_SERVICE_ORDER)
+        )
+        activation_journal.extend(
+            {"service": service, "status": "completed"} for service in running
+        )
+        _sync_activation_state(receipt)
+        receipt._persist()
+    for activation_entry in reversed(list(activation_journal)):
+        service = str(activation_entry["service"])
+        try:
+            backend.stop_service(service)
+        except Exception as exc:
+            service_stop_failures.append(service)
+            retained_drift.append(
+                {
+                    "step_id": f"service:{service}",
+                    "observed": {"error": str(exc)},
+                }
+            )
+        else:
+            _forget_activation_entry(receipt, activation_entry)
+    if service_stop_failures:
+        receipt._document["state"] = "rollback-blocked"
+        receipt._document["activated"] = False
+        receipt._document["qualified"] = False
+        _sync_activation_state(receipt)
+        receipt._document["rollback"] = {
+            "retained_unknown": [],
+            "retained_drift": retained_drift,
+        }
+        receipt._persist()
+        return RollbackReport((), tuple(retained_drift))
+
+    if journal and receipt._document.get("state") != "rolling-back":
+        # Archive the full authority before removing entries one by one.  A
+        # crash can then resume from the remaining live journal without losing
+        # retained-account provenance.
+        receipt._document["state"] = "rolling-back"
+        receipt._document["rollback_journal"] = deepcopy(journal)
+        receipt._persist()
+    elif journal:
+        archived = receipt._document.get("rollback_journal")
+        if not isinstance(archived, list) or not archived:
+            raise InstallError("resumed rollback lacks archived journal authority")
+
     credential_rollback = getattr(backend, "rollback_credentials", None)
     if callable(credential_rollback):
         retained_drift.extend(
@@ -2257,20 +2363,34 @@ def rollback_receipt(
             for row in credential_rollback(receipt)
             if isinstance(row, Mapping)
         )
-    for entry in reversed(journal):
+    def forget_install_entry(entry: Mapping[str, object]) -> None:
+        index = journal.index(entry)
+        removed = journal.pop(index)
+        try:
+            receipt._persist()
+        except BaseException:
+            journal.insert(index, removed)
+            raise
+
+    for entry in reversed(list(journal)):
         if not isinstance(entry, Mapping):
             continue
         step = entry.get("step", entry)
         if not isinstance(step, Mapping):
             continue
         installed = backend.inspect_step(step)
+        prior = entry.get("prior")
+        if isinstance(prior, Mapping) and dict(installed) == dict(prior):
+            # The prior rollback may have completed its mutation just before a
+            # receipt checkpoint failed.  This entry is already restored, not
+            # post-install drift.
+            forget_install_entry(entry)
+            continue
         if entry.get("status") == "prepared":
-            prior = entry.get("prior")
             if not isinstance(prior, Mapping):
                 retained_drift.append(
                     {"step_id": entry.get("step_id"), "observed": dict(installed)}
                 )
-                retained_entries.append(entry)
                 continue
             try:
                 if dict(installed) != dict(prior):
@@ -2283,7 +2403,6 @@ def rollback_receipt(
                         "observed": {"error": str(exc)},
                     }
                 )
-                retained_entries.append(entry)
                 continue
             if (
                 dict(restored) != dict(prior)
@@ -2292,23 +2411,21 @@ def rollback_receipt(
                 retained_drift.append(
                     {"step_id": entry.get("step_id"), "observed": dict(restored)}
                 )
-                retained_entries.append(entry)
+                continue
+            forget_install_entry(entry)
             continue
         if not _state_matches(step, installed):
             retained_drift.append(
                 {"step_id": entry.get("step_id"), "observed": dict(installed)}
             )
-            retained_entries.append(entry)
             continue
         backend.rollback_step(entry)
+        forget_install_entry(entry)
     unknown = tuple(backend.list_unknown_state(receipt))
     receipt._document["state"] = "rolled-back"
     receipt._document["activated"] = False
     receipt._document["qualified"] = False
-    receipt._document["running_services"] = list(
-        reversed(service_stop_failures)
-    )
-    receipt._document["services_started"] = bool(service_stop_failures)
+    _sync_activation_state(receipt)
     credentials_retained = any(
         str(row.get("step_id", "")).startswith("credential:")
         for row in retained_drift
@@ -2320,10 +2437,6 @@ def rollback_receipt(
         "retained_unknown": list(unknown),
         "retained_drift": retained_drift,
     }
-    # A clean rollback is a supported reinstall boundary.  Preserve the old
-    # journal as audit data while making apply_order replayable from step zero.
-    receipt._document["rollback_journal"] = deepcopy(journal)
-    receipt._document["journal"] = list(reversed(retained_entries))
     receipt._persist()
     return RollbackReport(unknown, tuple(retained_drift))
 
@@ -2862,32 +2975,50 @@ def activate_receipt(
             raise ActivationError(
                 "imported credential validation failed: " + "; ".join(failures)
             )
-    started: list[str] = []
+    activation_journal = _activation_entries(receipt)
+    if activation_journal:
+        raise ActivationError(
+            "receipt has unfinished activation authority; roll it back first"
+        )
+    failed_service = "service"
     try:
         for service in _SERVICE_ORDER:
+            failed_service = service
+            entry: dict[str, object] = {
+                "service": service,
+                "status": "prepared",
+            }
+            activation_journal.append(entry)
+            # The prepared entry is durable before systemctl can mutate the
+            # unit.  It remains conservative authority if this persist fails.
+            receipt._persist()
             try:
                 backend.start_service(service)
             except Exception:
                 # A failed systemctl start can still leave a partially-active
                 # unit. Include the attempted service in reverse compensation.
-                started.append(service)
                 raise
-            else:
-                started.append(service)
+            entry["status"] = "completed"
+            try:
+                receipt._persist()
+            except BaseException:
+                # The last durable state is prepared.  Preserve the same state
+                # in memory so compensation/recovery never trusts completion.
+                entry["status"] = "prepared"
+                raise
     except Exception as exc:
         compensation_failures: list[str] = []
-        for service in reversed(started):
+        for entry in reversed(list(activation_journal)):
+            service = str(entry["service"])
             try:
                 backend.stop_service(service)
             except Exception:
                 compensation_failures.append(service)
-        receipt._document["running_services"] = list(
-            reversed(compensation_failures)
-        )
-        receipt._document["services_started"] = bool(compensation_failures)
+            else:
+                _forget_activation_entry(receipt, entry)
+        _sync_activation_state(receipt)
         receipt._document["activated"] = False
         receipt._document["qualified"] = False
-        failed_service = started[-1] if started else "service"
         receipt._document["activation_failure"] = {
             "failed_service": failed_service,
             "compensation_failures": list(reversed(compensation_failures)),
@@ -2900,8 +3031,7 @@ def activate_receipt(
             )
         raise ActivationError(detail) from exc
     receipt._document.pop("activation_failure", None)
-    receipt._document["running_services"] = list(_SERVICE_ORDER)
-    receipt._document["services_started"] = True
+    _sync_activation_state(receipt)
     # Activation is intentionally provisional until verify emits passing evidence.
     receipt._document["activated"] = False
     receipt._document["qualified"] = False

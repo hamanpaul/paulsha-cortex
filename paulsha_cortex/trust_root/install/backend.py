@@ -2007,8 +2007,17 @@ class LocalInstallBackend:
 
     def list_unknown_state(self, receipt: InstallReceipt) -> Sequence[str]:
         retained: list[str] = []
-        journal = receipt.to_dict().get("journal", [])
-        journal_rows = journal if isinstance(journal, list) else []
+        document = receipt.to_dict()
+        journal = document.get("journal", [])
+        archived = document.get("rollback_journal", [])
+        # Core checkpoints removal of each live journal entry.  The archive is
+        # the full rollback-bound inventory needed to identify unknown children
+        # after those entries have already been restored and removed.
+        journal_rows = (
+            archived
+            if isinstance(archived, list) and archived
+            else journal if isinstance(journal, list) else []
+        )
         managed_paths: set[Path] = set()
         for entry in journal_rows:
             step = entry.get("step") if isinstance(entry, Mapping) else None
