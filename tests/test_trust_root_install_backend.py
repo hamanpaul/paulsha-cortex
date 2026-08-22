@@ -37,6 +37,46 @@ def test_mode_parser_accepts_registry_sticky_mode_and_rejects_invalid_values() -
             _mode(invalid)
 
 
+def test_repository_attestation_disables_root_owned_optional_index_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir(mode=0o755)
+    (repository / "README.md").write_text("exact\n", encoding="utf-8")
+    (repository / "CURRENT.md").symlink_to("README.md")
+    owner = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    commit = "a" * 40
+    remote = "https://github.com/hamanpaul/paulsha-cortex.git"
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        calls.append(command)
+        if command[-2:] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(command, 0, f"{commit}\n", "")
+        if command[-3:] == ("remote", "get-url", "origin"):
+            return subprocess.CompletedProcess(command, 0, f"{remote}\n", "")
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    step = {
+        "path": str(repository),
+        "owner": owner,
+        "group": group,
+        "mode": "0755",
+        "commit": commit,
+        "remote": remote,
+        "desired_sha256": "d" * 64,
+    }
+
+    state = backend_module._repository_state(step)
+
+    assert state["installed_sha256"] == step["desired_sha256"]
+    assert calls
+    assert all(command[:2] == ("git", "--no-optional-locks") for command in calls)
+
+
 def test_account_step_creates_exact_group_and_user_through_typed_argv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

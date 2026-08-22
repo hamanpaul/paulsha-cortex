@@ -404,7 +404,17 @@ def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
         return {"exists": False}
     if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
         return {"exists": True, "installed_sha256": None}
-    prefix = ("git", "-c", f"safe.directory={path}", "-C", str(path))
+    # Inspection must not refresh the index as the root installer.  Such an
+    # optional write would change .git/index ownership after the tree was
+    # handed to the Manager account and make attestation cause its own drift.
+    prefix = (
+        "git",
+        "--no-optional-locks",
+        "-c",
+        f"safe.directory={path}",
+        "-C",
+        str(path),
+    )
     head = _run((*prefix, "rev-parse", "HEAD"))
     remote = _run((*prefix, "remote", "get-url", "origin"))
     clean = _run((*prefix, "status", "--porcelain=v1", "--untracked-files=all"))
