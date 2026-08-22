@@ -238,6 +238,127 @@ _FORBIDDEN_CONFIG_FIELD_FRAGMENTS = (
     "token",
 )
 
+_INSTALL_CONFIG_KEYS = frozenset(
+    {
+        "schema_version",
+        "scheme",
+        "instance",
+        "repo_identity",
+        "operator_account",
+        "external_reader_account",
+        "accounts",
+        "service_accounts",
+        "roots",
+        "source_repositories",
+        "legacy_policy",
+        "providers",
+        "toolchain",
+    }
+)
+_REPO_IDENTITY_KEYS = frozenset({"remote", "commit"})
+_ACCOUNT_CONFIG_KEYS = frozenset({"uid", "gid", "home", "shell"})
+_ROOT_CONFIG_KEYS = frozenset({"deploy", "state", "systemd", "polkit"})
+_PROVIDER_KEYS = frozenset({"builder", "reviewer-planner", "manager"})
+
+
+def _require_exact_keys(
+    value: object,
+    *,
+    label: str,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise InstallPlanError(f"configuration {label} must be an object")
+    if not all(isinstance(key, str) for key in value):
+        raise InstallPlanError(f"configuration {label} keys must be strings")
+    actual = set(value)
+    unknown = sorted(actual - required - optional)
+    missing = sorted(required - actual)
+    if unknown or missing:
+        details: list[str] = []
+        if unknown:
+            details.append("unknown=" + ",".join(unknown))
+        if missing:
+            details.append("missing=" + ",".join(missing))
+        raise InstallPlanError(
+            f"configuration {label} keys must match the schema: " + "; ".join(details)
+        )
+    return value
+
+
+def _validate_repository_remote(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise InstallPlanError("repo_identity.remote is required")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise InstallPlanError("repo_identity.remote is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "?" in value
+        or "#" in value
+    ):
+        raise InstallPlanError(
+            "repo_identity.remote must be an HTTPS URL without userinfo, query, or fragment"
+        )
+    return value
+
+
+def _validate_install_config_schema(config: Mapping[str, object]) -> None:
+    _require_exact_keys(config, label="top-level", required=_INSTALL_CONFIG_KEYS)
+    repo = _require_exact_keys(
+        config.get("repo_identity"),
+        label="repo_identity",
+        required=_REPO_IDENTITY_KEYS,
+    )
+    _validate_repository_remote(repo.get("remote"))
+
+    accounts = config.get("accounts")
+    if not isinstance(accounts, Mapping):
+        raise InstallPlanError("configuration accounts must be an object")
+    for name, row in accounts.items():
+        _require_exact_keys(
+            row,
+            label=f"accounts.{name}",
+            required=_ACCOUNT_CONFIG_KEYS,
+        )
+
+    service_accounts = config.get("service_accounts")
+    if not isinstance(service_accounts, Mapping):
+        raise InstallPlanError("configuration service_accounts must be an object")
+    for name, row in service_accounts.items():
+        _require_exact_keys(
+            row,
+            label=f"service_accounts.{name}",
+            required=_ACCOUNT_CONFIG_KEYS,
+        )
+
+    _require_exact_keys(
+        config.get("roots"), label="roots", required=_ROOT_CONFIG_KEYS
+    )
+    _require_exact_keys(
+        config.get("providers"),
+        label="providers",
+        required=_PROVIDER_KEYS,
+    )
+
+    toolchain = config.get("toolchain")
+    if not isinstance(toolchain, Mapping) or not toolchain:
+        raise InstallPlanError("configuration toolchain must be a non-empty object")
+    for name, raw in toolchain.items():
+        _require_exact_keys(
+            raw,
+            label=f"toolchain.{name}",
+            required=frozenset({"version", "sha256"}),
+            optional=frozenset({"shape", "entrypoint"}),
+        )
+
 
 def _credential_bearing_url(value: str) -> bool:
     """Return whether an HTTP(S) URL carries userinfo or secret-like parameters."""
@@ -762,6 +883,7 @@ def build_install_plan(
 ) -> dict[str, object]:
     """Build a pure, exact-artifact-bound four-way desired-state plan."""
 
+    _validate_install_config_schema(config)
     if config.get("schema_version") != 1:
         raise InstallPlanError("config schema_version must be 1")
     _reject_sensitive_config(config)
@@ -1301,6 +1423,12 @@ def validate_preflight(
     observed_groups = facts.get("groups", {})
     if not isinstance(observed_groups, Mapping):
         observed_groups = {}
+    observed_primary_gid_users = facts.get("primary_gid_users", {})
+    if not isinstance(observed_primary_gid_users, Mapping):
+        observed_primary_gid_users = {}
+    observed_group_names_by_gid = facts.get("group_names_by_gid", {})
+    if not isinstance(observed_group_names_by_gid, Mapping):
+        observed_group_names_by_gid = {}
     desired_accounts = [
         row
         for key in ("accounts", "service_accounts")
@@ -1316,17 +1444,60 @@ def validate_preflight(
             raise AccountCollisionError(
                 f"desired uid {desired.get('uid')} is already owned by {uid_owner}"
             )
-        gid_owner = observed_gids.get(desired.get("gid"))
-        if gid_owner is not None and gid_owner != name:
+        desired_gid = desired.get("gid")
+        group_names = observed_group_names_by_gid.get(desired_gid, [])
+        if not isinstance(group_names, list) or not all(
+            isinstance(group_name, str) for group_name in group_names
+        ):
             raise AccountCollisionError(
-                f"desired gid {desired.get('gid')} is already owned by {gid_owner}"
+                f"desired gid {desired_gid} group names are not proven"
+            )
+        foreign_group_names = sorted(set(group_names) - {name})
+        if foreign_group_names:
+            raise AccountCollisionError(
+                f"desired gid {desired_gid} is a shared gid with group names: "
+                + ", ".join(foreign_group_names)
+            )
+        gid_owner = observed_gids.get(desired_gid)
+        if not group_names and gid_owner is not None and gid_owner != name:
+            raise AccountCollisionError(
+                f"desired gid {desired_gid} is already owned by {gid_owner}"
+            )
+        primary_members = observed_primary_gid_users.get(desired_gid, [])
+        if not isinstance(primary_members, list) or not all(
+            isinstance(member, str) for member in primary_members
+        ):
+            raise AccountCollisionError(
+                f"desired gid {desired_gid} primary members are not proven"
+            )
+        foreign_primary_members = sorted(set(primary_members) - {name})
+        if foreign_primary_members:
+            raise AccountCollisionError(
+                f"desired gid {desired_gid} has foreign primary members: "
+                + ", ".join(foreign_primary_members)
             )
         observed_group = observed_groups.get(name)
         if observed_group is not None and (
             not isinstance(observed_group, Mapping)
-            or observed_group.get("gid") != desired.get("gid")
+            or observed_group.get("gid") != desired_gid
         ):
             raise AccountCollisionError(f"existing group {name} does not match the plan")
+        if isinstance(observed_group, Mapping):
+            supplementary_members = observed_group.get("members")
+            if not isinstance(supplementary_members, list) or not all(
+                isinstance(member, str) for member in supplementary_members
+            ):
+                raise AccountCollisionError(
+                    f"existing group {name} members are not proven"
+                )
+            foreign_supplementary_members = sorted(
+                set(supplementary_members) - {name}
+            )
+            if foreign_supplementary_members:
+                raise AccountCollisionError(
+                    f"existing group {name} has foreign supplementary members: "
+                    + ", ".join(foreign_supplementary_members)
+                )
         if observed is None:
             continue
         if not isinstance(observed, Mapping) or any(

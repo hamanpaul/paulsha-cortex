@@ -343,11 +343,56 @@ def test_plan_rejects_unknown_nested_secret_like_field(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("layer", "unknown_key", "sentinel"),
+    [
+        ("top-level", "deployment_note", "INNOCUOUS-TOP-LEVEL-SENTINEL"),
+        ("repo", "license", "LICENSE-SENTINEL-MUST-STAY-REDACTED"),
+        ("accounts", "description", "INNOCUOUS-ACCOUNT-SENTINEL"),
+        (
+            "service_accounts",
+            "access_code",
+            "ACCESS-CODE-SENTINEL-MUST-STAY-REDACTED",
+        ),
+        ("roots", "backup", "INNOCUOUS-ROOT-SENTINEL"),
+        ("providers", "manager_note", "INNOCUOUS-PROVIDER-SENTINEL"),
+        ("toolchain", "sig", "SIG-SENTINEL-MUST-STAY-REDACTED"),
+    ],
+)
+def test_plan_rejects_unknown_keys_at_every_config_layer_without_value_disclosure(
+    tmp_path: Path, layer: str, unknown_key: str, sentinel: str
+) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    config = _safe_config(tmp_path)
+    if layer == "top-level":
+        target = config
+    elif layer == "repo":
+        target = config["repo_identity"]
+    elif layer == "accounts":
+        target = config["accounts"]["cortex-manager"]
+    elif layer == "service_accounts":
+        target = config["service_accounts"]["cortex-egress"]
+    elif layer == "roots":
+        target = config["roots"]
+    elif layer == "providers":
+        target = config["providers"]
+    else:
+        target = config["toolchain"]["codex"]
+    target[unknown_key] = sentinel
+
+    with pytest.raises(InstallPlanError, match=unknown_key) as exc:
+        build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
+
+    assert sentinel not in str(exc.value)
+
+
+@pytest.mark.parametrize(
     "remote",
     [
         "https://oauth-user:plaintext-credential@example.invalid/repo.git",
         "https://example.invalid/repo.git?access_token=plaintext-credential",
         "https://example.invalid/repo.git#access_token=plaintext-credential",
+        "https://example.invalid/repo.git?ref=main",
+        "https://example.invalid/repo.git#readme",
     ],
 )
 def test_plan_rejects_credential_bearing_repository_url(

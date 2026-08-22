@@ -15,7 +15,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from paulsha_cortex.trust_root.install import InstallDriftError, UnsafeInstallPathError
+from paulsha_cortex.trust_root.install import (
+    AccountCollisionError,
+    InstallDriftError,
+    UnsafeInstallPathError,
+)
 from paulsha_cortex.trust_root.install import backend as backend_module
 from paulsha_cortex.trust_root.install.backend import LocalInstallBackend
 from paulsha_cortex.trust_root.install.backend import _mode
@@ -618,6 +622,130 @@ def test_preflight_counts_active_jobs_from_plan_bound_durable_registry(
 
     assert facts["in_flight_jobs"] == 2
     assert any(row["code"] == "in_flight_jobs" for row in report.failures)
+
+
+def test_preflight_facts_capture_private_group_members_primary_users_and_gid_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planned = SimpleNamespace(
+        pw_name="cortex-egress",
+        pw_uid=995,
+        pw_gid=995,
+        pw_dir=str(tmp_path / "var/lib/cortex-egress"),
+        pw_shell="/usr/sbin/nologin",
+    )
+    foreign = SimpleNamespace(
+        pw_name="foreign-primary",
+        pw_uid=1995,
+        pw_gid=995,
+        pw_dir=str(tmp_path / "var/lib/foreign-primary"),
+        pw_shell="/usr/sbin/nologin",
+    )
+    private_group = SimpleNamespace(
+        gr_name="cortex-egress",
+        gr_gid=995,
+        gr_mem=["foreign-supplementary"],
+    )
+    alias_group = SimpleNamespace(gr_name="legacy-alias", gr_gid=995, gr_mem=[])
+    monkeypatch.setattr(backend_module.pwd, "getpwall", lambda: [planned, foreign])
+    monkeypatch.setattr(backend_module.pwd, "getpwnam", lambda _name: planned)
+    monkeypatch.setattr(
+        backend_module.grp, "getgrall", lambda: [private_group, alias_group]
+    )
+    monkeypatch.setattr(backend_module, "_password_locked", lambda _name: True)
+    monkeypatch.setattr(
+        backend_module, "_in_flight_process_count", lambda _rows: 0
+    )
+    monkeypatch.setattr(backend_module, "_run", lambda argv, **_kwargs: _completed(argv))
+    plan = {
+        "roots": {
+            "state": str(tmp_path / "state"),
+            "deploy": str(tmp_path / "deploy"),
+        },
+        "accounts": [],
+        "service_accounts": [
+            {
+                "name": "cortex-egress",
+                "uid": 995,
+                "gid": 995,
+                "home": planned.pw_dir,
+                "shell": planned.pw_shell,
+            }
+        ],
+        "apply_order": [],
+        "minimum_disk_free_bytes": 0,
+    }
+
+    facts = LocalInstallBackend(require_root=False).preflight_facts(plan)
+
+    assert facts["groups"]["cortex-egress"]["members"] == [
+        "foreign-supplementary"
+    ]
+    assert facts["primary_gid_users"][995] == [
+        "cortex-egress",
+        "foreign-primary",
+    ]
+    assert facts["group_names_by_gid"][995] == [
+        "cortex-egress",
+        "legacy-alias",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("fact_key", "value", "match"),
+    [
+        ("members", ["foreign-supplementary"], "member"),
+        ("primary_gid_users", ["cortex-egress", "foreign-primary"], "primary"),
+        ("group_names_by_gid", ["cortex-egress", "legacy-alias"], "shared gid"),
+    ],
+)
+def test_preflight_rejects_non_private_service_group_membership_or_gid_alias(
+    tmp_path: Path, fact_key: str, value: list[str], match: str
+) -> None:
+    desired = {
+        "name": "cortex-egress",
+        "uid": 995,
+        "gid": 995,
+        "home": str(tmp_path / "var/lib/cortex-egress"),
+        "shell": "/usr/sbin/nologin",
+    }
+    plan = {
+        "accounts": [],
+        "service_accounts": [desired],
+        "apply_order": [],
+        "minimum_disk_free_bytes": 0,
+    }
+    facts: dict[str, object] = {
+        "systemd": True,
+        "polkit": True,
+        "cgroup_v2": True,
+        "acl": True,
+        "disk_free_bytes": 1,
+        "universal_nopasswd": False,
+        "in_flight_jobs": 0,
+        "services": {},
+        "accounts": {},
+        "account_uids": {},
+        "group_gids": {995: "cortex-egress"},
+        "groups": {
+            "cortex-egress": {
+                "name": "cortex-egress",
+                "gid": 995,
+                "members": [],
+            }
+        },
+        "primary_gid_users": {995: ["cortex-egress"]},
+        "group_names_by_gid": {995: ["cortex-egress"]},
+        "paths": {},
+    }
+    assert validate_preflight(plan, facts).ok
+    if fact_key == "members":
+        facts["groups"]["cortex-egress"]["members"] = value
+    else:
+        facts[fact_key][995] = value
+
+    with pytest.raises(AccountCollisionError, match=match):
+        validate_preflight(plan, facts)
 
 
 def test_rollback_reports_unknown_child_of_adopted_managed_directory(

@@ -846,6 +846,8 @@ class LocalInstallBackend:
             for row in plan.get(key, [])
             if isinstance(row, Mapping)
         ]
+        passwd_records = list(pwd.getpwall())
+        group_records = list(grp.getgrall())
         services: dict[str, str] = {}
         for name in (
             "cortex-egress-proxy.service",
@@ -873,16 +875,32 @@ class LocalInstallBackend:
                 "shell": record.pw_shell,
                 "supplementary_groups": sorted(
                     group.gr_name
-                    for group in grp.getgrall()
+                    for group in group_records
                     if name in group.gr_mem
                 ),
                 "password_locked": _password_locked(name),
             }
-        account_uids = {record.pw_uid: record.pw_name for record in pwd.getpwall()}
-        all_groups = {record.gr_name: record for record in grp.getgrall()}
+        account_uids = {record.pw_uid: record.pw_name for record in passwd_records}
+        all_groups = {record.gr_name: record for record in group_records}
         group_gids = {record.gr_gid: record.gr_name for record in all_groups.values()}
+        primary_gid_users: dict[int, list[str]] = {}
+        for record in passwd_records:
+            primary_gid_users.setdefault(record.pw_gid, []).append(record.pw_name)
+        primary_gid_users = {
+            gid: sorted(set(names)) for gid, names in primary_gid_users.items()
+        }
+        group_names_by_gid: dict[int, list[str]] = {}
+        for record in group_records:
+            group_names_by_gid.setdefault(record.gr_gid, []).append(record.gr_name)
+        group_names_by_gid = {
+            gid: sorted(set(names)) for gid, names in group_names_by_gid.items()
+        }
         groups = {
-            name: {"name": name, "gid": all_groups[name].gr_gid}
+            name: {
+                "name": name,
+                "gid": all_groups[name].gr_gid,
+                "members": sorted(set(all_groups[name].gr_mem)),
+            }
             for row in desired_accounts
             if isinstance(row, Mapping) and isinstance(row.get("name"), str)
             for name in (str(row["name"]),)
@@ -921,6 +939,8 @@ class LocalInstallBackend:
             "account_uids": account_uids,
             "group_gids": group_gids,
             "groups": groups,
+            "primary_gid_users": primary_gid_users,
+            "group_names_by_gid": group_names_by_gid,
             "paths": paths,
         }
 
