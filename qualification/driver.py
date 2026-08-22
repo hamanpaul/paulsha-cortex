@@ -10,6 +10,7 @@ repository is a hard failure.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -300,7 +301,8 @@ def _denied(
     )
     if not passed:
         raise QualificationFailure(
-            f"{family}/{case_id} unexpectedly succeeded as {user}"
+            f"{family}/{case_id} did not return an allowed denial as {user}: "
+            f"rc={result.returncode}"
         )
 
 
@@ -333,7 +335,9 @@ def _fs_denied(
         case_id=case_id,
         user=user,
         argv=_fs_probe(expression),
-        expected_returncodes={13, 30},  # EACCES/EROFS only; ENOENT is a false green.
+        # Sticky-directory ownership checks return EPERM; ordinary DAC and
+        # systemd read-only mounts return EACCES/EROFS. ENOENT is a false green.
+        expected_returncodes={errno.EACCES, errno.EPERM, errno.EROFS},
     )
 
 

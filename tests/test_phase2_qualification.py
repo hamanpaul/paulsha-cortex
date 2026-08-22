@@ -692,3 +692,33 @@ def test_account_runtime_env_uses_installed_psc_roots_without_manager_identity(
     assert env["PSC_CONTROL_ROOT"] == "/var/lib/cortex/control"
     assert env["PSC_COORDINATOR_ROOT"] == "/var/lib/cortex/coordinator"
     assert "UNRELATED_MANAGER_VALUE" not in env
+
+
+def test_filesystem_denial_accepts_sticky_directory_eperm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver_module()
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: driver.CommandResult(tuple(argv), 1, "", ""),
+    )
+    cases: list[dict[str, object]] = []
+
+    driver._fs_denied(
+        cases,
+        family="durable-state",
+        case_id="sticky-delete",
+        user="cortex-builder",
+        expression="Path('/protected/probe').unlink()",
+    )
+
+    assert cases == [
+        {
+            "family": "durable-state",
+            "case": "sticky-delete",
+            "principal": "cortex-builder",
+            "status": "passed",
+            "returncode": 1,
+        }
+    ]
