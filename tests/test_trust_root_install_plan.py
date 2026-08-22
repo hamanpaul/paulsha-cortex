@@ -240,7 +240,7 @@ def test_bundle_binding_preserves_repo_container_and_installs_named_leaf(
         )
 
 
-def test_plan_orders_accounts_and_content_addressed_venv_before_assets(
+def test_plan_orders_managed_deploy_root_before_content_addressed_venv(
     tmp_path: Path,
 ) -> None:
     wheel, bundle = _artifacts(tmp_path)
@@ -257,8 +257,17 @@ def test_plan_orders_accounts_and_content_addressed_venv_before_assets(
         "cortex-gate",
         "cortex-egress",
     }
-    venv = steps[5]
+    venv_index = next(
+        index for index, step in enumerate(steps) if step["step_id"] == "candidate-venv"
+    )
+    deploy_root_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step["step_id"] == f"scaffold:{plan['roots']['deploy']}"
+    )
+    venv = steps[venv_index]
     wheel_sha = _sha256(wheel)
+    assert deploy_root_index < venv_index
     assert venv["kind"] == "venv"
     assert venv["path"].endswith(f"/venvs/{wheel_sha}")
     assert venv["active_link"].endswith("/opt/cortex/venv")
@@ -267,7 +276,9 @@ def test_plan_orders_accounts_and_content_addressed_venv_before_assets(
     assert venv["wheelhouse"] == [
         {"source": str(wheel.absolute()), "sha256": wheel_sha}
     ]
-    assert next(index for index, step in enumerate(steps) if step["kind"] == "asset") > 5
+    assert venv_index < next(
+        index for index, step in enumerate(steps) if step.get("action") == "daemon-reload"
+    )
     assert steps[-4]["action"] == "daemon-reload"
     assert [step["unit"] for step in steps[-3:]] == [
         "cortex-egress-proxy.service",

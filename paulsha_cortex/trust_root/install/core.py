@@ -1059,6 +1059,7 @@ def build_install_plan(
                 }
                 for row in (*accounts, *service_accounts)
             ),
+            *_apply_steps(scaffolds=scaffolds, assets=assets, generated=generated),
             {
                 "step_id": "candidate-venv",
                 "kind": "venv",
@@ -1078,7 +1079,6 @@ def build_install_plan(
                 "desired_sha256": _sha256_file(wheel_path),
                 "rollback_policy": "restore-link-retain-slot",
             },
-            *_apply_steps(scaffolds=scaffolds, assets=assets, generated=generated),
             {
                 "step_id": "systemd:daemon-reload",
                 "kind": "systemctl",
