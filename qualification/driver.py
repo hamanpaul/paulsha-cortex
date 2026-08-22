@@ -436,8 +436,10 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             }
         )
         if not cli_denied:
+            detail = (cli.stderr or cli.stdout).strip().replace("\n", " ")[:500]
             raise QualificationFailure(
-                f"capability/T1.3 did not fail for a capability reason as {principal}"
+                "capability/T1.3 did not fail for a capability reason as "
+                f"{principal}: rc={cli.returncode} output={detail!r}"
             )
         _fs_denied(
             cases,

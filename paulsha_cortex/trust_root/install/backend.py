@@ -147,6 +147,30 @@ def _copy_verified_file(source: Path, destination: Path, expected: str) -> None:
         os.close(source_fd)
 
 
+def _relocate_venv_shebangs(temporary: Path, slot: Path) -> None:
+    """Retarget console scripts before the hidden venv is atomically renamed."""
+
+    source_prefix = os.fsencode(f"#!{temporary}/")
+    destination_prefix = os.fsencode(f"#!{slot}/")
+    for path in sorted((temporary / "bin").iterdir(), key=lambda row: row.name):
+        observed = path.lstat()
+        if stat.S_ISLNK(observed.st_mode):
+            continue
+        if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+            raise InstallDriftError(f"venv bin contains an unsafe object: {path}")
+        with path.open("rb") as stream:
+            prefix = stream.read(len(source_prefix))
+        if prefix != source_prefix:
+            continue
+        payload = path.read_bytes()
+        with path.open("r+b") as stream:
+            stream.write(destination_prefix)
+            stream.write(payload[len(source_prefix) :])
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
 def _account_state(step: Mapping[str, object]) -> dict[str, object]:
     name = step.get("name")
     if not isinstance(name, str) or not name:
@@ -976,6 +1000,7 @@ class LocalInstallBackend:
                         str(requirements),
                     ]
                     _run(tuple(argv), check=True)
+                    _relocate_venv_shebangs(temporary, slot)
                     _run(
                         (
                             str(temporary / "bin/python"),

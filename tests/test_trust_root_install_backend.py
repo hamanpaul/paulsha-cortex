@@ -171,9 +171,13 @@ def test_venv_step_verifies_locked_wheels_and_atomically_switches_link(
         command = tuple(argv)
         calls.append(command)
         if command[:3] == ("python3", "-m", "venv"):
-            (Path(command[3]) / "bin").mkdir(parents=True)
-            (Path(command[3]) / "bin/python").write_text(
+            temporary = Path(command[3])
+            (temporary / "bin").mkdir(parents=True)
+            (temporary / "bin/python").write_text(
                 "verified interpreter", encoding="utf-8"
+            )
+            (temporary / "bin/cortex").write_text(
+                f"#!{temporary}/bin/python\nprint('cortex')\n", encoding="utf-8"
             )
         return _completed(command)
 
@@ -199,6 +203,9 @@ def test_venv_step_verifies_locked_wheels_and_atomically_switches_link(
     assert result["installed_sha256"] == wheel_sha
     assert active.resolve() == Path(step["path"])
     assert (Path(step["path"]) / ".cortex-wheel.sha256").read_text().strip() == wheel_sha
+    assert (Path(step["path"]) / "bin/cortex").read_text().splitlines()[0] == (
+        f"#!{step['path']}/bin/python"
+    )
     assert any("--no-index" in call for call in calls)
     first_call_count = len(calls)
     backend.apply_step(step)
