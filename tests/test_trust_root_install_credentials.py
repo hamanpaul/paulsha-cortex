@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,6 +240,77 @@ def test_credential_import_rejects_source_ancestor_rename_with_same_leaf_inode(
         )
 
     assert swapped
+    assert not destination_root.exists()
+
+
+def test_credential_import_rejects_same_inode_same_size_source_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "auth.json"
+    original = b'{"token":"AAAA"}'
+    rewritten = b'{"token":"BBBB"}'
+    assert len(original) == len(rewritten)
+    source.write_bytes(original)
+    initial = source.stat()
+    destination_root = tmp_path / "installed"
+    original_read = install_core._read_fd_bytes
+    original_fstat = install_core.os.fstat
+    mutated = False
+
+    def fstat_with_forged_times(descriptor: int):
+        observed = original_fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) != (initial.st_dev, initial.st_ino):
+            return observed
+        return SimpleNamespace(
+            st_dev=observed.st_dev,
+            st_ino=observed.st_ino,
+            st_mode=observed.st_mode,
+            st_nlink=observed.st_nlink,
+            st_uid=observed.st_uid,
+            st_gid=observed.st_gid,
+            st_size=observed.st_size,
+            st_mtime_ns=initial.st_mtime_ns,
+            st_ctime_ns=initial.st_ctime_ns,
+        )
+
+    def read_then_rewrite(descriptor: int) -> bytes:
+        nonlocal mutated
+        content = original_read(descriptor)
+        if not mutated:
+            with source.open("r+b") as stream:
+                stream.write(rewritten)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.utime(
+                source,
+                ns=(initial.st_atime_ns, initial.st_mtime_ns),
+                follow_symlinks=False,
+            )
+            mutated = True
+        return content
+
+    monkeypatch.setattr(install_core, "_read_fd_bytes", read_then_rewrite)
+    monkeypatch.setattr(install_core.os, "fstat", fstat_with_forged_times)
+
+    with pytest.raises(CredentialImportError, match="source.*changed"):
+        import_credential(
+            receipt,
+            principal="builder",
+            provider="codex",
+            source=source,
+            destination_root=destination_root,
+        )
+
+    final = source.stat()
+    assert mutated
+    assert (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) == (
+        initial.st_dev,
+        initial.st_ino,
+        initial.st_size,
+        initial.st_mtime_ns,
+    )
+    assert source.read_bytes() == rewritten
     assert not destination_root.exists()
 
 

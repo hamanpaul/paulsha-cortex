@@ -2877,6 +2877,89 @@ def _open_regular_at(parent_fd: int, name: str) -> int:
     return descriptor
 
 
+def _credential_source_metadata(observed: os.stat_result) -> tuple[int, ...]:
+    """Return identity/shape authority fields; content is checked separately."""
+
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_mode,
+        observed.st_nlink,
+        observed.st_uid,
+        observed.st_gid,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+def _assert_credential_source_unchanged(
+    path: Path,
+    *,
+    parent_authority: Sequence[tuple[int, int]],
+    metadata: tuple[int, ...],
+    content: bytes,
+    digest: bytes,
+) -> None:
+    """Reopen source authority and prove both metadata and bytes are unchanged."""
+
+    current_authority: list[tuple[int, int]] = []
+    parent_fd = authority_fd = content_fd = -1
+    try:
+        parent_fd, source_name = _open_parent_directory(
+            path, authority=current_authority
+        )
+        if tuple(current_authority) != tuple(parent_authority):
+            raise CredentialImportError(
+                "credential source changed during validation"
+            )
+        authority_fd = os.open(
+            source_name,
+            getattr(os, "O_PATH", os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        if _credential_source_metadata(os.fstat(authority_fd)) != metadata:
+            raise CredentialImportError(
+                "credential source changed during validation"
+            )
+        content_fd = os.open(
+            f"/proc/self/fd/{authority_fd}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        if _credential_source_metadata(os.fstat(content_fd)) != metadata:
+            raise CredentialImportError(
+                "credential source changed during validation"
+            )
+        observed_content = _read_fd_bytes(content_fd)
+        if (
+            hashlib.sha256(observed_content).digest() != digest
+            or observed_content != content
+            or _credential_source_metadata(os.fstat(content_fd)) != metadata
+            or _credential_source_metadata(os.fstat(authority_fd)) != metadata
+        ):
+            raise CredentialImportError(
+                "credential source changed during validation"
+            )
+        _assert_fd_path_binding(
+            path,
+            authority_fd,
+            directory=False,
+            parent_authority=parent_authority,
+        )
+    except CredentialImportError:
+        raise
+    except (OSError, UnsafeInstallPathError) as exc:
+        raise CredentialImportError(
+            "credential source changed during validation"
+        ) from exc
+    finally:
+        for descriptor in (content_fd, authority_fd, parent_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+
+
 def import_credential(
     receipt: InstallReceipt,
     *,
@@ -2942,6 +3025,7 @@ def import_credential(
             raise CredentialImportError(
                 "credential source must be a single-link regular file"
             )
+        source_metadata = _credential_source_metadata(initial)
         try:
             source_fd = os.open(
                 f"/proc/self/fd/{source_authority_fd}",
@@ -2960,10 +3044,8 @@ def import_credential(
         if (
             not stat.S_ISREG(final.st_mode)
             or final.st_nlink != 1
-            or (initial.st_dev, initial.st_ino, initial.st_size)
-            != (final.st_dev, final.st_ino, final.st_size)
-            or (initial.st_dev, initial.st_ino)
-            != (final_authority.st_dev, final_authority.st_ino)
+            or _credential_source_metadata(final) != source_metadata
+            or _credential_source_metadata(final_authority) != source_metadata
         ):
             raise CredentialImportError("credential source changed during validation")
         try:
@@ -2982,7 +3064,19 @@ def import_credential(
             os.close(source_fd)
         os.close(source_authority_fd)
         os.close(source_parent_fd)
-    digest = hashlib.sha256(content).hexdigest()
+    source_digest = hashlib.sha256(content).digest()
+
+    def assert_source_unchanged() -> None:
+        _assert_credential_source_unchanged(
+            source,
+            parent_authority=source_authority,
+            metadata=source_metadata,
+            content=content,
+            digest=source_digest,
+        )
+
+    assert_source_unchanged()
+    digest = source_digest.hex()
     destination = destination_root.joinpath(*destination_parts)
     if destination_uid is not None or destination_gid is not None:
         if (
@@ -3064,6 +3158,21 @@ def import_credential(
         raise CredentialImportError("credential destination preparation failed") from exc
     descriptor: int | None = None
     published = False
+
+    def remove_published_destination() -> None:
+        if not published or descriptor is None:
+            return
+        try:
+            current = os.stat(
+                destination_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            held = os.fstat(descriptor)
+            if (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+                os.unlink(destination_name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+        except OSError:
+            pass
+
     try:
         try:
             installed_fd = _open_regular_at(parent_fd, destination_name)
@@ -3095,6 +3204,7 @@ def import_credential(
                 and authority.get("sha256") == digest
                 and installed_digest == digest
             ):
+                assert_source_unchanged()
                 if pending is not None:
                     persist_completion(pending)
                 return metadata
@@ -3158,6 +3268,7 @@ def import_credential(
                         raise CredentialImportError(
                             "credential fallback temp does not match journal authority"
                         )
+                    assert_source_unchanged()
                     os.replace(
                         temp_name,
                         destination_name,
@@ -3166,6 +3277,7 @@ def import_credential(
                     )
                     published = True
                     os.fsync(parent_fd)
+                    assert_source_unchanged()
                     _assert_fd_path_binding(
                         destination, descriptor, directory=False
                     )
@@ -3208,6 +3320,7 @@ def import_credential(
             os.fchown(descriptor, destination_uid, destination_gid)
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
+        assert_source_unchanged()
         if named_fallback:
             assert isinstance(temp_name, str)
             os.replace(
@@ -3220,19 +3333,13 @@ def import_credential(
             _publish_credential_tmpfile(descriptor, parent_fd, destination_name)
         published = True
         os.fsync(parent_fd)
+        assert_source_unchanged()
         _assert_fd_path_binding(destination, descriptor, directory=False)
+    except CredentialImportError:
+        remove_published_destination()
+        raise
     except UnsafeInstallPathError as exc:
-        if published and descriptor is not None:
-            try:
-                current = os.stat(
-                    destination_name, dir_fd=parent_fd, follow_symlinks=False
-                )
-                held = os.fstat(descriptor)
-                if (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
-                    os.unlink(destination_name, dir_fd=parent_fd)
-                    os.fsync(parent_fd)
-            except OSError:
-                pass
+        remove_published_destination()
         raise CredentialImportError(
             "credential destination changed during write"
         ) from exc
