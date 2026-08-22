@@ -319,6 +319,107 @@ def test_public_apply_validation_is_pure_for_a_valid_plan(tmp_path: Path) -> Non
     assert canonical_plan_bytes(plan) == before
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "scalar-row",
+        "empty-principal",
+        "unknown-principal",
+        "unknown-provider",
+        "duplicate",
+        "extra-plaintext",
+        "nested-secret",
+    ],
+)
+def test_apply_cli_rejects_invalid_required_credentials_before_receipt_or_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    sentinel = "PLAINTEXT-CREDENTIAL-SENTINEL"
+    if case == "scalar-row":
+        plan["required_credentials"] = ["builder/codex"]
+    elif case == "empty-principal":
+        plan["required_credentials"][0]["principal"] = ""
+    elif case == "unknown-principal":
+        plan["required_credentials"][0]["principal"] = "gate"
+    elif case == "unknown-provider":
+        plan["required_credentials"][0]["provider"] = "github"
+    elif case == "duplicate":
+        plan["required_credentials"].append(deepcopy(plan["required_credentials"][0]))
+    elif case == "extra-plaintext":
+        plan["required_credentials"][0]["note"] = sentinel
+    elif case == "nested-secret":
+        plan["required_credentials"][0]["metadata"] = {"api_token": sentinel}
+    plan_path = tmp_path / f"credentials-{case}.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = tmp_path / f"credentials-{case}" / "receipt.json"
+
+    class MutationSentinelBackend:
+        preflight_calls = 0
+        apply_calls = 0
+
+        def preflight_facts(self, _plan):
+            type(self).preflight_calls += 1
+            raise AssertionError("invalid credentials reached backend preflight")
+
+        def apply_step(self, _step):
+            type(self).apply_calls += 1
+            raise AssertionError("invalid credentials reached backend mutation")
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", MutationSentinelBackend)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(receipt_path),
+        ]
+    ) == 1
+
+    assert sentinel not in capsys.readouterr().err
+    assert not receipt_path.parent.exists()
+    assert MutationSentinelBackend.preflight_calls == 0
+    assert MutationSentinelBackend.apply_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("inventory", "mutation"),
+    [
+        ("accounts", "extra-key"),
+        ("accounts", "duplicate-name"),
+        ("service_accounts", "boolean-uid"),
+    ],
+)
+def test_apply_validation_rejects_malformed_account_inventory_rows(
+    tmp_path: Path, inventory: str, mutation: str
+) -> None:
+    plan, _doc = _plan_document(tmp_path)
+    rows = plan[inventory]
+    if mutation == "extra-key":
+        rows[0]["note"] = "INNOCUOUS-UNTRUSTED-METADATA"
+    elif mutation == "duplicate-name":
+        rows[-1]["name"] = rows[0]["name"]
+    else:
+        rows[0]["uid"] = True
+
+    with pytest.raises(InstallPlanError):
+        validate_apply_plan(plan, confirm_sha256=plan_sha256(plan))
+
+
 @pytest.mark.parametrize("failure", ["unconfirmed", "topology"])
 def test_apply_cli_rejects_before_creating_any_receipt_authority(
     tmp_path: Path,

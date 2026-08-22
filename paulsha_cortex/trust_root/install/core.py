@@ -311,11 +311,12 @@ def _require_exact_keys(
     label: str,
     required: frozenset[str],
     optional: frozenset[str] = frozenset(),
+    subject: str = "configuration",
 ) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
-        raise InstallPlanError(f"configuration {label} must be an object")
+        raise InstallPlanError(f"{subject} {label} must be an object")
     if not all(isinstance(key, str) for key in value):
-        raise InstallPlanError(f"configuration {label} keys must be strings")
+        raise InstallPlanError(f"{subject} {label} keys must be strings")
     actual = set(value)
     unknown = sorted(actual - required - optional)
     missing = sorted(required - actual)
@@ -326,7 +327,7 @@ def _require_exact_keys(
         if missing:
             details.append("missing=" + ",".join(missing))
         raise InstallPlanError(
-            f"configuration {label} keys must match the schema: " + "; ".join(details)
+            f"{subject} {label} keys must match the schema: " + "; ".join(details)
         )
     return value
 
@@ -2394,6 +2395,98 @@ def _validate_operations(step: Mapping[str, object]) -> None:
             raise InstallPlanError("ACL must be applied after chown and chmod")
 
 
+_PLAN_ACCOUNT_KEYS = frozenset({"name", "uid", "gid", "home", "shell"})
+_REQUIRED_CREDENTIAL_KEYS = frozenset({"principal", "provider"})
+
+
+def _is_safe_absolute_plan_path(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and Path(value).is_absolute()
+        and ".." not in Path(value).parts
+    )
+
+
+def _validate_apply_account_inventories(plan: Mapping[str, object]) -> None:
+    expected_accounts = frozenset(
+        account
+        for principal in (
+            registry.Principal.MANAGER,
+            registry.Principal.REVIEWER,
+            registry.Principal.BUILDER,
+            registry.Principal.GATE,
+        )
+        if (account := permgen.FOUR_WAY_SCHEME.resolve(principal)) is not None
+    )
+    expected_by_field = {
+        "accounts": expected_accounts,
+        "service_accounts": frozenset({permgen.EGRESS_PROXY.account}),
+    }
+    seen_uids: set[int] = set()
+    seen_gids: set[int] = set()
+    for field, expected_names in expected_by_field.items():
+        rows = plan.get(field) if field == "accounts" else plan.get(field, [])
+        if type(rows) is not list:
+            raise InstallPlanError(f"plan {field} must be a list")
+        seen_names: set[str] = set()
+        for index, raw in enumerate(rows):
+            row = _require_exact_keys(
+                raw,
+                label=f"{field}[{index}]",
+                required=_PLAN_ACCOUNT_KEYS,
+                subject="plan",
+            )
+            name = row.get("name")
+            uid = row.get("uid")
+            gid = row.get("gid")
+            home = row.get("home")
+            shell = row.get("shell")
+            if type(name) is not str or not name or name in seen_names:
+                raise InstallPlanError(f"plan {field} names must be unique strings")
+            if type(uid) is not int or uid <= 0 or uid in seen_uids:
+                raise InstallPlanError(f"plan {field} uid values must be unique positive integers")
+            if type(gid) is not int or gid <= 0 or gid in seen_gids:
+                raise InstallPlanError(f"plan {field} gid values must be unique positive integers")
+            if not _is_safe_absolute_plan_path(home):
+                raise InstallPlanError(f"plan {field} home must be a safe absolute path")
+            if not _is_safe_absolute_plan_path(shell):
+                raise InstallPlanError(f"plan {field} shell must be a safe absolute path")
+            if name not in expected_names:
+                raise InstallPlanError(f"plan {field} contains an unknown account")
+            seen_names.add(name)
+            seen_uids.add(uid)
+            seen_gids.add(gid)
+
+
+def _validate_required_credentials(plan: Mapping[str, object]) -> None:
+    rows = plan.get("required_credentials")
+    if type(rows) is not list:
+        raise InstallPlanError("plan required_credentials must be a list")
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(rows):
+        row = _require_exact_keys(
+            raw,
+            label=f"required_credentials[{index}]",
+            required=_REQUIRED_CREDENTIAL_KEYS,
+            subject="plan",
+        )
+        principal = row.get("principal")
+        provider = row.get("provider")
+        if type(principal) is not str or not principal or principal not in _PROVIDER_KEYS:
+            raise InstallPlanError("required credential principal is invalid")
+        if (
+            type(provider) is not str
+            or not provider
+            or provider not in _PROVIDER_ALLOWLIST[principal]
+        ):
+            raise InstallPlanError(f"required credential provider is not allowed for {principal}")
+        pair = (principal, provider)
+        if pair in seen:
+            raise InstallPlanError("required credentials contain a duplicate pair")
+        seen.add(pair)
+
+
 def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str, object]]:
     """Revalidate serialized plan authority immediately before mutation."""
 
@@ -2413,12 +2506,8 @@ def _validate_apply_plan_schema(plan: Mapping[str, object]) -> list[Mapping[str,
         for field in ("wheel_sha256", "bundle_sha256")
     ):
         raise InstallPlanError("plan candidate identity is invalid")
-    for field in ("accounts", "required_credentials"):
-        if not isinstance(plan.get(field), list):
-            raise InstallPlanError(f"plan {field} must be a list")
-    service_accounts = plan.get("service_accounts", [])
-    if not isinstance(service_accounts, list):
-        raise InstallPlanError("plan service_accounts must be a list")
+    _validate_apply_account_inventories(plan)
+    _validate_required_credentials(plan)
     steps = plan.get("apply_order")
     if not isinstance(steps, list):
         raise InstallPlanError("apply_order must be a list")
