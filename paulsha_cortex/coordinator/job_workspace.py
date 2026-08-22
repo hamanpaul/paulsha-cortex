@@ -621,6 +621,8 @@ def spool_key_for_job(job: Mapping[str, object]) -> str | None:
 
 def _template_instance_for_job(job: Mapping[str, object]) -> str | None | object:
     if "template_instance" not in job:
+        if job.get("runtime_mode") == "systemd-template":
+            return None
         return _TEMPLATE_INSTANCE_UNSET
     template_instance = job.get("template_instance")
     if template_instance is None:

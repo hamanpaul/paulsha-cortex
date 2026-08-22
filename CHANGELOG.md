@@ -8,7 +8,8 @@
 ## [Unreleased]
 
 - Preserve exact template-instance authority during isolated Codex credential
-  harvest in the Trust-root Phase 2 runtime path.
+  harvest in the Trust-root Phase 2 runtime path, joining persisted instances
+  byte-for-byte while keeping raw job-id fallback separate for legacy callers.
 
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
