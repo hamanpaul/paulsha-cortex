@@ -2407,7 +2407,13 @@ class LocalInstallBackend:
                 }
         # Enumerate unexpected Cortex authority files as well as desired paths;
         # otherwise the attestor could only prove presence, never exclusivity.
-        for category in ("units", "polkit", "shim", "toolchain_wrappers"):
+        for category in (
+            "units",
+            "polkit",
+            "shim",
+            "toolchain_wrappers",
+            "environment",
+        ):
             expected_rows = generated.get(category, {})
             if not isinstance(expected_rows, Mapping) or not expected_rows:
                 continue
@@ -2426,6 +2432,7 @@ class LocalInstallBackend:
                         continue
                     authority_bearing = (
                         category == "toolchain_wrappers"
+                        or (category == "environment" and path.suffix == ".env")
                         or path.name.startswith("cortex")
                         or (category == "polkit" and "cortex" in path.name)
                     )

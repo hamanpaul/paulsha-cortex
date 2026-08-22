@@ -3344,6 +3344,7 @@ _INVENTORY_CATEGORIES = (
     "polkit",
     "gitconfigs",
     "toolchain_wrappers",
+    "environment",
     "enforcement",
 )
 

@@ -72,6 +72,12 @@ def _inventory() -> dict[str, dict[str, dict[str, str]]]:
             ),
             "agy": _artifact("#!/bin/sh\nexec /opt/cortex/toolchain/lib/agy \"$@\"\n", mode="0755"),
         },
+        "environment": {
+            "cortex-manager.env": _artifact(
+                'PSC_INSTANCE="cortex"\n'
+                'PSC_MANAGER_INTERVAL_SECONDS="60"\n'
+            )
+        },
         "enforcement": {},
     }
 
@@ -149,6 +155,105 @@ def test_manager_git_credential_helper_removal_is_functional_drift_763() -> None
         "/usr/bin/gh auth git-credential" in line
         for line in finding["missing_functional_lines"]
     )
+
+
+def test_manager_environment_value_drift_fails_attestation_and_verify(
+    tmp_path: Path,
+) -> None:
+    plan, receipt = _activated_receipt()
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["environment"]["cortex-manager.env"]["content"] = (
+        installed["environment"]["cortex-manager.env"]["content"].replace(
+            'PSC_MANAGER_INTERVAL_SECONDS="60"',
+            'PSC_MANAGER_INTERVAL_SECONDS="61"',
+        )
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=expected,
+        installed_inventory=installed,
+        service_identities=_service_identities(),
+        evidence_path=tmp_path / "manager-environment-drift.json",
+    )
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "environment/cortex-manager.env"
+        for row in report.to_dict()["failures"]
+    )
+    assert not result.ok
+    assert result.evidence["result"] == "fail"
+    assert receipt.to_dict()["qualified"] is False
+
+
+def test_manager_environment_comment_only_drift_warns() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["environment"]["cortex-manager.env"]["content"] = (
+        "# locally documented\n"
+        + installed["environment"]["cortex-manager.env"]["content"]
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert report.ok
+    assert {
+        (row["code"], row["artifact"]) for row in report.to_dict()["warnings"]
+    } == {("comment_only_drift", "environment/cortex-manager.env")}
+
+
+def test_unexpected_manager_environment_artifact_fails_attestation() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["environment"]["cortex-shadow.env"] = _artifact(
+        'PSC_INSTANCE="shadow"\n'
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row == {
+            "code": "unexpected_authority_artifact",
+            "artifact": "environment/cortex-shadow.env",
+        }
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_installed_inventory_enumerates_unexpected_manager_environment(
+    tmp_path: Path,
+) -> None:
+    environment_root = tmp_path / "opt/cortex/etc"
+    environment_root.mkdir(parents=True)
+    manager_environment = environment_root / "cortex-manager.env"
+    shadow_environment = environment_root / "cortex-shadow.env"
+    manager_environment.write_text('PSC_INSTANCE="cortex"\n', encoding="utf-8")
+    shadow_environment.write_text('PSC_INSTANCE="shadow"\n', encoding="utf-8")
+    plan = {
+        "generated": {
+            "environment": {
+                manager_environment.name: {
+                    **_artifact(manager_environment.read_text(encoding="utf-8")),
+                    "path": str(manager_environment),
+                }
+            }
+        }
+    }
+
+    installed = backend_module.LocalInstallBackend(
+        require_root=False
+    ).installed_inventory(plan)
+
+    assert set(installed["environment"]) == {
+        "cortex-manager.env",
+        "cortex-shadow.env",
+    }
 
 
 class VerifyBackend:
