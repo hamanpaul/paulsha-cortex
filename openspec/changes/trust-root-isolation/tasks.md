@@ -30,9 +30,16 @@
 - [x] Bind the production hook default and `--spool-root` CLI path to authoritative `PSC_JOB_ID`, and make the monitor harvest one-level job slots without following symlinks.
 - [x] Derive isolated Codex credential harvest from typed launch/runtime surface metadata; missing slot, authority, identity, or harvest now persists a runtime diagnostic and cannot be classified as provider failure, while builder/reviewer direct, isolated, success, failure, and non-Codex lanes remain free of Codex harvest.
 - [x] Use the canonical surface row ACL recipe for runtime slot/control projection and copy only regular files/directories with normalized modes and atomic publication; mechanically reject source symlink/special/xattr/hardlink carry-over and retain live own/foreign probes as pending.
-- [ ] Run the live two-job persistence, normal Codex start, auth-refresh write, and generated-vs-installed probes under deployed hardening.
+- [x] Run the live two-job persistence, normal Codex start, auth-refresh write, and generated-vs-installed probes under deployed hardening.
 
 > Operator evidence on 2026-08-22 records the persistence, auth-refresh, and
-> generated-vs-installed probes as passing. A normal Codex turn was not retried
-> after the provider usage-limit response, so this conjunctive task remains
-> intentionally open.
+> generated-vs-installed probes as passing, and the Manager terminal completion
+> and verification records confirm the normal-Codex probe. See
+> `docs/superpowers/evidence/trust-root-phase2-live-2026-08-22.md`, completion
+> record
+> `/var/lib/cortex/coordinator/evidence/completion/phase2-final-live-codex-v6-f4fedef6c7e48e1b9ef57f020be1b24c4cd51945.json`,
+> and verification record
+> `/var/lib/cortex/coordinator/evidence/verification/phase2-final-live-codex-v6-f4fedef6c7e48e1b9ef57f020be1b24c4cd51945.json`
+> (`status: verified`). The completion record reports `gate_state: passed`,
+> `slice_state: completed`, and target ref
+> `f4fedef6c7e48e1b9ef57f020be1b24c4cd51945`.

@@ -65,29 +65,35 @@ installed polkit rule also matched (SHA-256
 `c8fd053183d93df55ea0bc7934d09e28a8222a2ba80a60f02c7da087dae98f9a`), verified
 as root because the policy file is root-readable only.
 
-## Codex quota boundary and remaining task
-
-Historical Cortex builder cards used `codex/gpt-5.6-luna` and completed with
-recorded usage. A fresh normal-Codex recovery dispatch reached the provider but
-was rejected by the provider usage limit (reported reset: 2026-08-27 11:36).
-Per operator instruction, no retry was made and no successful normal-Codex turn
-under this final deployment is claimed. Consequently the conjunctive live task
-for “persistence, normal Codex start, auth-refresh, and generated-vs-installed”
-remains unchecked until a later quota window; the other three live evidence
-parts are recorded above.
+## Workflow retirement
 
 The stale pre-merge Cortex workflow `workflow-16f4188674d36ab8809a` was retired
 through the supported `retire-delivered` action after PR #783 was confirmed
 merged. No workflow JSON or service state was edited by hand.
 
-## Final normal-Codex Cortex slice candidate
+## Final normal-Codex Cortex closure
 
-- `PSC_SLICE_ID`: `phase2-final-live-codex-v6`
-- Declared executor/model: `codex/gpt-5.6-luna`
-- Declared reasoning effort: `reasoning_effort: `max``
-- Status: `manager-terminal-verification-pending`
+Manager terminal records independently verify the normal-Codex probe under the
+final deployed hardening:
 
-This is a candidate observation only. The Manager must independently bind it to
-a successful terminal job record before the final conjunctive task may be
-checked. This section does not check the open task or claim a successful
-normal-Codex start from inside the builder.
+- Job `phase2-final-live-codex-v6-156` ran as executor `codex` with model
+  `gpt-5.6-luna` and `reasoning_effort: max`.
+- It ran in `systemd-template` mode as runtime principal `builder` on runtime
+  surface `builder-codex-home`, using template instance
+  `phase2-final-live-codex-v6-c7ca9bc0`.
+- The job exited with code `0`; `credential_publish: true`,
+  `runtime_diagnostic: null`, and `provider_outcome: null`.
+- Manager completion was `gate_state: passed`, `slice_state: completed`, reason
+  `completion-recorded`, at target commit
+  `f4fedef6c7e48e1b9ef57f020be1b24c4cd51945`.
+
+The completion record is
+`/var/lib/cortex/coordinator/evidence/completion/phase2-final-live-codex-v6-f4fedef6c7e48e1b9ef57f020be1b24c4cd51945.json`;
+Manager verification is
+`/var/lib/cortex/coordinator/evidence/verification/phase2-final-live-codex-v6-f4fedef6c7e48e1b9ef57f020be1b24c4cd51945.json`
+with status `verified`.
+
+Together with the three live-probe results recorded above—persistence and
+own/foreign isolation, auth-refresh publication, and generated-vs-installed
+identity—these records close the normal-Codex leg of the final live gate. No
+credential payloads or tokens are recorded here.
