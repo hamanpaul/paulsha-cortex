@@ -16,6 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, MutableMapping, Protocol, Sequence
+from urllib.parse import parse_qsl, urlsplit
 
 from .. import permgen, registry
 
@@ -135,12 +136,43 @@ _FORBIDDEN_CONFIG_FIELDS = frozenset(
 _FORBIDDEN_CONFIG_FIELD_FRAGMENTS = (
     "api_key",
     "apikey",
+    "assertion",
     "auth",
+    "bearer",
+    "cookie",
     "credential",
     "password",
+    "passphrase",
+    "private",
     "secret",
+    "session",
     "token",
 )
+
+
+def _credential_bearing_url(value: str) -> bool:
+    """Return whether an HTTP(S) URL carries userinfo or secret-like parameters."""
+
+    if "://" not in value:
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        # A malformed URL-shaped value is not safe configuration material.
+        return True
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return True
+    sensitive = _FORBIDDEN_CONFIG_FIELD_FRAGMENTS
+    parameters = (
+        *parse_qsl(parsed.query, keep_blank_values=True),
+        *parse_qsl(parsed.fragment, keep_blank_values=True),
+    )
+    return any(
+        any(fragment in key.casefold() for fragment in sensitive)
+        for key, _unused in parameters
+    )
 
 
 def _reject_sensitive_config(value: object, *, path: tuple[str, ...] = ()) -> None:
@@ -162,6 +194,11 @@ def _reject_sensitive_config(value: object, *, path: tuple[str, ...] = ()) -> No
     elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             _reject_sensitive_config(child, path=(*path, str(index)))
+    elif isinstance(value, str) and _credential_bearing_url(value):
+        label = ".".join(path) or "<root>"
+        raise InstallPlanError(
+            f"configuration field {label} contains a credential-bearing URL"
+        )
 
 
 def _configured_scheme(config: Mapping[str, object]) -> permgen.UidScheme:
@@ -1092,8 +1129,63 @@ class PreflightReport:
         return {"ok": self.ok, "failures": [dict(row) for row in self.failures]}
 
 
+def _account_has_receipt_provenance(
+    *,
+    plan: Mapping[str, object],
+    desired: Mapping[str, object],
+    receipt: "InstallReceipt | None",
+) -> bool:
+    """Require a plan-bound journal proving this transaction created the account.
+
+    Exact passwd fields are necessary but not sufficient for adoption: an unrelated
+    pre-existing account can be made to look identical.  A prepared/completed entry
+    whose durable prior state was absent is the narrow provenance this installer owns.
+    Clean rollback retains service accounts, so the archived rollback journal is also
+    an admissible source for a later replay of the same exact plan.
+    """
+
+    if receipt is None:
+        return False
+    document = receipt.to_dict()
+    if document.get("plan_sha256") != plan_sha256(plan):
+        return False
+    name = desired.get("name")
+    planned_step = next(
+        (
+            step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, Mapping)
+            and step.get("kind") == "account"
+            and step.get("name") == name
+        ),
+        None,
+    )
+    if not isinstance(planned_step, Mapping):
+        return False
+    for field in ("journal", "rollback_journal"):
+        entries = document.get(field, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            prior = entry.get("prior")
+            if (
+                entry.get("step_id") == planned_step.get("step_id")
+                and entry.get("step") == planned_step
+                and entry.get("status") in {"prepared", "completed"}
+                and isinstance(prior, Mapping)
+                and prior.get("exists") is False
+            ):
+                return True
+    return False
+
+
 def validate_preflight(
-    plan: Mapping[str, object], facts: Mapping[str, object]
+    plan: Mapping[str, object],
+    facts: Mapping[str, object],
+    *,
+    receipt: "InstallReceipt | None" = None,
 ) -> PreflightReport:
     failures: list[dict[str, str]] = []
     for name in ("systemd", "polkit", "cgroup_v2", "acl"):
@@ -1152,12 +1244,20 @@ def validate_preflight(
             observed.get(key) != desired.get(key) for key in ("uid", "gid", "home", "shell")
         ):
             raise AccountCollisionError(f"existing account {name} does not match the plan")
-        if observed.get("supplementary_groups") not in (None, []):
+        if observed.get("supplementary_groups") != []:
             raise AccountCollisionError(
-                f"existing account {name} has supplementary group authority"
+                f"existing account {name} supplementary groups are not proven empty"
             )
-        if observed.get("password_locked") is False:
-            raise AccountCollisionError(f"existing account {name} password is not locked")
+        if observed.get("password_locked") is not True:
+            raise AccountCollisionError(
+                f"existing account {name} password lock state is not proven locked"
+            )
+        if not _account_has_receipt_provenance(
+            plan=plan, desired=desired, receipt=receipt
+        ):
+            raise AccountCollisionError(
+                f"existing account {name} lacks trusted prior receipt provenance"
+            )
 
     services = facts.get("services", {})
     if isinstance(services, Mapping):
@@ -1257,6 +1357,24 @@ class InstallReceipt:
             if entry.get("status", "completed") not in {"prepared", "completed"}:
                 raise InstallError(f"receipt journal status is invalid: {path}")
             seen.add(step_id)
+        rollback_journal = payload.get("rollback_journal", [])
+        if not isinstance(rollback_journal, list):
+            raise InstallError(f"receipt rollback journal is invalid: {path}")
+        rollback_seen: set[str] = set()
+        for entry in rollback_journal:
+            if not isinstance(entry, Mapping):
+                raise InstallError(f"receipt rollback journal entry is invalid: {path}")
+            step_id = str(entry.get("step_id"))
+            if (
+                step_id in rollback_seen
+                or entry.get("step") != planned_steps.get(step_id)
+                or entry.get("status", "completed")
+                not in {"prepared", "completed"}
+            ):
+                raise InstallError(
+                    f"receipt rollback journal is not bound to its plan: {path}"
+                )
+            rollback_seen.add(step_id)
         credentials = payload.get("credentials")
         if not isinstance(credentials, list) or any(
             not isinstance(row, Mapping)
@@ -1267,6 +1385,38 @@ class InstallReceipt:
             for row in credentials
         ):
             raise InstallError(f"receipt credential metadata is invalid: {path}")
+        credential_journal = payload.get("credential_journal", [])
+        if not isinstance(credential_journal, list) or any(
+            not isinstance(row, Mapping)
+            or set(row)
+            != {"principal", "provider", "mode", "sha256", "status"}
+            or row.get("mode") != "0600"
+            or row.get("status") != "prepared"
+            or not isinstance(row.get("sha256"), str)
+            or len(str(row.get("sha256"))) != 64
+            or any(char not in "0123456789abcdef" for char in str(row["sha256"]))
+            for row in credential_journal
+        ):
+            raise InstallError(f"receipt credential journal is invalid: {path}")
+        expected_executables = payload.get("expected_service_executables")
+        if expected_executables is not None and (
+            not isinstance(expected_executables, Mapping)
+            or set(expected_executables) != set(_SERVICE_ORDER)
+            or any(
+                not isinstance(row, Mapping)
+                or set(row) != {"exec_path", "sha256"}
+                or not isinstance(row.get("exec_path"), str)
+                or not str(row.get("exec_path")).startswith("/")
+                or not isinstance(row.get("sha256"), str)
+                or len(str(row.get("sha256"))) != 64
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in str(row.get("sha256"))
+                )
+                for row in expected_executables.values()
+            )
+        ):
+            raise InstallError(f"receipt service executable binding is invalid: {path}")
         return cls(payload, path=path)
 
 
@@ -1315,6 +1465,7 @@ def new_install_receipt(
             "state": "planned",
             "journal": [],
             "credentials": [],
+            "credential_journal": [],
             "services_started": False,
             "activated": False,
             "qualified": False,
@@ -1359,6 +1510,71 @@ def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> b
     return True
 
 
+def _planned_service_exec_paths(
+    plan: Mapping[str, object],
+) -> dict[str, str]:
+    generated = plan.get("generated")
+    units = generated.get("units") if isinstance(generated, Mapping) else None
+    if not isinstance(units, Mapping):
+        raise InstallPlanError("plan generated service units are invalid")
+    paths: dict[str, str] = {}
+    for service in _SERVICE_ORDER:
+        row = units.get(service)
+        content = row.get("content") if isinstance(row, Mapping) else None
+        if not isinstance(content, str):
+            raise InstallPlanError(f"plan service unit is missing: {service}")
+        executable = next(
+            (
+                line.partition("=")[2].split()[0]
+                for line in _functional_lines(content)
+                if line.startswith("ExecStart=") and line.partition("=")[2].split()
+            ),
+            None,
+        )
+        if not isinstance(executable, str) or not executable.startswith("/"):
+            raise InstallPlanError(
+                f"plan service unit lacks an absolute ExecStart: {service}"
+            )
+        paths[service] = executable
+    return paths
+
+
+def _bind_expected_service_executables(
+    *,
+    plan: Mapping[str, object],
+    receipt: InstallReceipt,
+    identities: Mapping[str, object],
+) -> None:
+    planned_paths = _planned_service_exec_paths(plan)
+    bindings: dict[str, dict[str, str]] = {}
+    for service, planned_path in planned_paths.items():
+        identity = identities.get(service)
+        if not isinstance(identity, Mapping):
+            raise InstallDriftError(
+                f"installed service executable identity is missing: {service}"
+            )
+        actual_path = identity.get("exec_path")
+        executable_hash = identity.get("exec_sha256")
+        if actual_path != planned_path:
+            raise InstallDriftError(
+                f"installed service executable path does not match plan: {service}"
+            )
+        if (
+            not isinstance(executable_hash, str)
+            or len(executable_hash) != 64
+            or any(char not in "0123456789abcdef" for char in executable_hash)
+        ):
+            raise InstallDriftError(
+                f"installed service executable hash is invalid: {service}"
+            )
+        bindings[service] = {
+            "exec_path": planned_path,
+            "sha256": executable_hash,
+        }
+    receipt._document["expected_service_executables"] = bindings
+    receipt._persist()
+
+
 def apply_plan(
     plan: Mapping[str, object],
     *,
@@ -1384,7 +1600,7 @@ def apply_plan(
             raise InstallPlanError(f"unknown or untyped apply step kind: {step!r}")
         _validate_operations(step)
     facts = backend.preflight_facts(plan)
-    report = validate_preflight(plan, facts)
+    report = validate_preflight(plan, facts, receipt=receipt)
     if not report.ok:
         details = "; ".join(row["detail"] for row in report.failures)
         raise InstallError(f"preflight failed: {details}")
@@ -1409,8 +1625,20 @@ def apply_plan(
             if entry.get("status") != "prepared":
                 raise InstallDriftError(f"completed install step drifted: {step_id}")
             prior = entry.get("prior")
-            if not isinstance(prior, Mapping) or dict(installed) != dict(prior):
-                raise InstallDriftError(f"prepared install step drifted: {step_id}")
+            if not isinstance(prior, Mapping):
+                raise InstallDriftError(
+                    f"prepared install step lacks prior state: {step_id}"
+                )
+            if dict(installed) != dict(prior):
+                # A crash may happen after only part of a backend step mutated
+                # the host.  The prepared journal is already the rollback
+                # authority, so restore its exact prior state before replay.
+                backend.rollback_step(entry)
+                restored = backend.inspect_step(step)
+                if dict(restored) != dict(prior):
+                    raise InstallDriftError(
+                        f"prepared install step could not restore prior state: {step_id}"
+                    )
         else:
             prior = dict(backend.inspect_step(step))
             entry = {
@@ -1437,6 +1665,14 @@ def apply_plan(
         entry.update({key: value for key, value in outcome.items() if key != "prior"})
         entry["status"] = "completed"
         receipt._persist()
+    identity_reader = getattr(backend, "service_identities", None)
+    if callable(identity_reader):
+        identities = identity_reader()
+        if not isinstance(identities, Mapping):
+            raise InstallDriftError("installed service identities are invalid")
+        _bind_expected_service_executables(
+            plan=plan, receipt=receipt, identities=identities
+        )
     receipt._document["state"] = "applied"
     receipt._persist()
     return receipt
@@ -1490,6 +1726,36 @@ def rollback_receipt(
         if not isinstance(step, Mapping):
             continue
         installed = backend.inspect_step(step)
+        if entry.get("status") == "prepared":
+            prior = entry.get("prior")
+            if not isinstance(prior, Mapping):
+                retained_drift.append(
+                    {"step_id": entry.get("step_id"), "observed": dict(installed)}
+                )
+                retained_entries.append(entry)
+                continue
+            try:
+                if dict(installed) != dict(prior):
+                    backend.rollback_step(entry)
+                restored = backend.inspect_step(step)
+            except Exception as exc:
+                retained_drift.append(
+                    {
+                        "step_id": entry.get("step_id"),
+                        "observed": {"error": str(exc)},
+                    }
+                )
+                retained_entries.append(entry)
+                continue
+            if (
+                dict(restored) != dict(prior)
+                and step.get("rollback_policy") != "retain"
+            ):
+                retained_drift.append(
+                    {"step_id": entry.get("step_id"), "observed": dict(restored)}
+                )
+                retained_entries.append(entry)
+            continue
         if not _state_matches(step, installed):
             retained_drift.append(
                 {"step_id": entry.get("step_id"), "observed": dict(installed)}
@@ -1618,29 +1884,46 @@ def import_credential(
     try:
         mode = source.lstat().st_mode
     except OSError as exc:
-        raise CredentialImportError(f"credential source is not readable: {exc}") from exc
+        raise CredentialImportError("credential source is not readable") from exc
     if stat.S_ISLNK(mode):
         raise CredentialImportError("credential source must not be a symlink")
     if not stat.S_ISREG(mode):
         raise CredentialImportError("credential source must be a regular file")
-    _reject_symlink_ancestors(source, label="credential source", include_leaf=False)
+    try:
+        _reject_symlink_ancestors(
+            source, label="credential source", include_leaf=False
+        )
+    except UnsafeInstallPathError as exc:
+        raise CredentialImportError(
+            "credential source path contains a symlink"
+        ) from exc
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         source_fd = os.open(source, flags)
     except OSError as exc:
         raise CredentialImportError(
-            f"credential source changed or cannot be opened safely: {exc}"
+            "credential source changed or cannot be opened safely"
         ) from exc
     try:
         opened = os.fstat(source_fd)
-        if not stat.S_ISREG(opened.st_mode) or (
-            opened.st_dev,
-            opened.st_ino,
-        ) != (source.lstat().st_dev, source.lstat().st_ino):
+        try:
+            current = source.lstat()
+        except OSError as exc:
+            raise CredentialImportError(
+                "credential source changed during validation"
+            ) from exc
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            current.st_dev,
+            current.st_ino,
+        ):
             raise CredentialImportError("credential source changed during validation")
-        with os.fdopen(source_fd, "rb") as stream:
-            content = stream.read()
-        source_fd = -1
+        try:
+            stream = os.fdopen(source_fd, "rb")
+            source_fd = -1
+            with stream:
+                content = stream.read()
+        except OSError as exc:
+            raise CredentialImportError("credential source read failed") from exc
     finally:
         if source_fd >= 0:
             os.close(source_fd)
@@ -1648,10 +1931,20 @@ def import_credential(
     destination = destination_root.joinpath(*destination_parts)
     if destination.is_symlink():
         raise CredentialImportError("credential destination must not be a symlink")
-    _reject_symlink_ancestors(destination, label="credential destination")
+    try:
+        _reject_symlink_ancestors(destination, label="credential destination")
+    except UnsafeInstallPathError as exc:
+        raise CredentialImportError(
+            "credential destination path contains a symlink"
+        ) from exc
     credentials = receipt._document.setdefault("credentials", [])
     if not isinstance(credentials, list):
         raise CredentialImportError("receipt credentials field is invalid")
+    credential_journal = receipt._document.setdefault("credential_journal", [])
+    if not isinstance(credential_journal, list):
+        raise CredentialImportError("receipt credential journal is invalid")
+    metadata = CredentialMetadata(principal, provider, "0600", digest)
+    metadata_row = metadata.to_dict()
     previous = next(
         (
             row
@@ -1662,28 +1955,100 @@ def import_credential(
         ),
         None,
     )
-    if destination.exists():
-        observed = destination.lstat()
+    pending = next(
+        (
+            row
+            for row in credential_journal
+            if isinstance(row, Mapping)
+            and row.get("principal") == principal
+            and row.get("provider") == provider
+        ),
+        None,
+    )
+    if pending is not None and any(
+        pending.get(key) != value for key, value in metadata_row.items()
+    ):
+        raise CredentialImportError(
+            f"credential import has conflicting prepared authority: {principal}/{provider}"
+        )
+
+    def persist_completion(prepared: Mapping[str, object]) -> None:
+        prior_credentials = deepcopy(credentials)
+        prior_journal = deepcopy(credential_journal)
+        credentials[:] = [
+            row
+            for row in credentials
+            if not (
+                isinstance(row, Mapping)
+                and row.get("principal") == principal
+                and row.get("provider") == provider
+            )
+        ]
+        credentials.append(metadata_row)
+        credential_journal.remove(prepared)
+        try:
+            receipt._persist()
+        except OSError as exc:
+            credentials[:] = prior_credentials
+            credential_journal[:] = prior_journal
+            raise CredentialImportError(
+                "credential receipt persistence failed"
+            ) from exc
+        except BaseException:
+            credentials[:] = prior_credentials
+            credential_journal[:] = prior_journal
+            raise
+
+    try:
+        destination_exists = destination.exists()
+    except OSError as exc:
+        raise CredentialImportError("credential destination inspection failed") from exc
+    if destination_exists:
+        try:
+            observed = destination.lstat()
+            installed_digest = _sha256_file(destination)
+        except OSError as exc:
+            raise CredentialImportError(
+                "credential destination inspection failed"
+            ) from exc
         owner_ok = destination_uid is None or observed.st_uid == destination_uid
         group_ok = destination_gid is None or observed.st_gid == destination_gid
+        authority = pending if pending is not None else previous
         if (
             stat.S_ISREG(observed.st_mode)
             and observed.st_nlink == 1
             and stat.S_IMODE(observed.st_mode) == 0o600
             and owner_ok
             and group_ok
-            and previous is not None
-            and previous.get("sha256") == digest
-            and _sha256_file(destination) == digest
+            and authority is not None
+            and authority.get("sha256") == digest
+            and installed_digest == digest
         ):
-            return CredentialMetadata(principal, provider, "0600", digest)
+            if pending is not None:
+                persist_completion(pending)
+            return metadata
         raise CredentialImportError(
-            f"credential destination already exists without matching receipt authority: {principal}/{provider}"
+            "credential destination already exists without matching receipt "
+            f"authority: {principal}/{provider}"
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=f".{destination.name}.", dir=destination.parent
-    )
+    if pending is None:
+        pending = {**metadata_row, "status": "prepared"}
+        credential_journal.append(pending)
+    # Persist prepared authority on every attempt before creating the file.  A
+    # failed persist therefore cannot leave a receipt-unaware credential.
+    try:
+        receipt._persist()
+    except OSError as exc:
+        raise CredentialImportError(
+            "credential receipt persistence failed"
+        ) from exc
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", dir=destination.parent
+        )
+    except OSError as exc:
+        raise CredentialImportError("credential destination preparation failed") from exc
     temporary_path = Path(temporary)
     try:
         os.fchmod(descriptor, 0o600)
@@ -1703,6 +2068,21 @@ def import_credential(
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_path, destination)
+        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except OSError as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            temporary_path.unlink()
+        except OSError:
+            pass
+        raise CredentialImportError("credential destination write failed") from exc
     except BaseException:
         try:
             os.close(descriptor)
@@ -1713,18 +2093,7 @@ def import_credential(
         except FileNotFoundError:
             pass
         raise
-    metadata = CredentialMetadata(principal, provider, "0600", digest)
-    credentials[:] = [
-        row
-        for row in credentials
-        if not (
-            isinstance(row, Mapping)
-            and row.get("principal") == principal
-            and row.get("provider") == provider
-        )
-    ]
-    credentials.append(metadata.to_dict())
-    receipt._persist()
+    persist_completion(pending)
     return metadata
 
 
@@ -1771,17 +2140,36 @@ def activate_receipt(
             backend.start_service(service)
             started.append(service)
     except Exception as exc:
+        compensation_failures: list[str] = []
         for service in reversed(started):
             try:
                 backend.stop_service(service)
             except Exception:
-                pass
-        receipt._document["services_started"] = False
+                compensation_failures.append(service)
+        receipt._document["running_services"] = list(
+            reversed(compensation_failures)
+        )
+        receipt._document["services_started"] = bool(compensation_failures)
         receipt._document["activated"] = False
         receipt._document["qualified"] = False
+        failed_service = (
+            _SERVICE_ORDER[len(started)]
+            if len(started) < len(_SERVICE_ORDER)
+            else "service"
+        )
+        receipt._document["activation_failure"] = {
+            "failed_service": failed_service,
+            "compensation_failures": list(reversed(compensation_failures)),
+        }
         receipt._persist()
-        service = _SERVICE_ORDER[len(started)] if len(started) < len(_SERVICE_ORDER) else "service"
-        raise ActivationError(f"failed to start {service}: {exc}") from exc
+        detail = f"failed to start {failed_service}: {exc}"
+        if compensation_failures:
+            detail += "; failed to stop " + ", ".join(
+                reversed(compensation_failures)
+            )
+        raise ActivationError(detail) from exc
+    receipt._document.pop("activation_failure", None)
+    receipt._document["running_services"] = list(_SERVICE_ORDER)
     receipt._document["services_started"] = True
     # Activation is intentionally provisional until verify emits passing evidence.
     receipt._document["activated"] = False
@@ -1924,6 +2312,7 @@ def verify_receipt(
     identity_failures: list[dict[str, object]] = []
     expected_users: dict[str, str] = {}
     expected_exec_paths: dict[str, str] = {}
+    expected_executables = receipt._document.get("expected_service_executables")
     unit_rows = expected_inventory.get("units", {})
     if isinstance(unit_rows, Mapping):
         for service in _SERVICE_ORDER:
@@ -1956,6 +2345,27 @@ def verify_receipt(
                 }
             )
         expected_exec_path = expected_exec_paths.get(service)
+        binding = (
+            expected_executables.get(service)
+            if isinstance(expected_executables, Mapping)
+            else None
+        )
+        if not isinstance(binding, Mapping):
+            identity_failures.append(
+                {
+                    "code": "missing_expected_service_executable",
+                    "artifact": service,
+                }
+            )
+        elif expected_exec_path and binding.get("exec_path") != expected_exec_path:
+            identity_failures.append(
+                {
+                    "code": "service_exec_binding_drift",
+                    "artifact": service,
+                    "expected": expected_exec_path,
+                    "installed": binding.get("exec_path"),
+                }
+            )
         if expected_exec_path and identity.get("exec_path") != expected_exec_path:
             identity_failures.append(
                 {
@@ -1966,9 +2376,30 @@ def verify_receipt(
                 }
             )
         executable_hash = identity.get("exec_sha256")
-        if not isinstance(executable_hash, str) or len(executable_hash) != 64:
+        if (
+            not isinstance(executable_hash, str)
+            or len(executable_hash) != 64
+            or any(char not in "0123456789abcdef" for char in executable_hash)
+        ):
             identity_failures.append(
                 {"code": "missing_service_exec_hash", "artifact": service}
+            )
+        elif isinstance(binding, Mapping) and executable_hash != binding.get("sha256"):
+            identity_failures.append(
+                {
+                    "code": "service_exec_hash_drift",
+                    "artifact": service,
+                    "expected": binding.get("sha256"),
+                    "installed": executable_hash,
+                }
+            )
+        if identity.get("active_state") != "active":
+            identity_failures.append(
+                {
+                    "code": "service_not_active",
+                    "artifact": service,
+                    "installed": identity.get("active_state"),
+                }
             )
     if identity_failures:
         report = AttestationReport(

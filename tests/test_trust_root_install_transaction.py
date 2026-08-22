@@ -106,10 +106,11 @@ def _safe_facts(plan: dict[str, object]) -> dict[str, object]:
             "cortex-manager.service": "inactive",
             "cortex-monitor.service": "inactive",
         },
-        "accounts": {row["name"]: dict(row) for row in plan["accounts"]},
+        "accounts": {},
         "paths": {
             step["path"]: {"exists": False, "is_symlink": False}
             for step in plan["apply_order"]
+            if "path" in step
         },
     }
 
@@ -125,6 +126,7 @@ class RecordingBackend:
         self.unknown: set[str] = set()
         self.fail_on: str | None = None
         self.fail_after_mutation: str | None = None
+        self.fail_with_partial_mutation: str | None = None
 
     def preflight_facts(self, _plan) -> dict[str, object]:
         return deepcopy(self.facts)
@@ -148,6 +150,10 @@ class RecordingBackend:
         }
         self.states[step_id] = state
         self.applied.append(step_id)
+        if self.fail_with_partial_mutation == step_id:
+            self.fail_with_partial_mutation = None
+            self.states[step_id]["installed_sha256"] = "partial"
+            raise RuntimeError(f"injected partial-mutation interruption at {step_id}")
         if self.fail_after_mutation == step_id:
             self.fail_after_mutation = None
             raise RuntimeError(f"injected post-mutation interruption at {step_id}")
@@ -178,12 +184,129 @@ def test_preflight_uses_explicit_backend_facts_not_the_host(tmp_path: Path) -> N
 def test_existing_account_collision_fails_before_any_mutation(tmp_path: Path) -> None:
     plan = _plan(tmp_path)
     facts = _safe_facts(plan)
-    manager = dict(facts["accounts"]["cortex-manager"])
+    manager = dict(plan["accounts"][0])
     manager["uid"] = 65530
     facts["accounts"]["cortex-manager"] = manager
 
     with pytest.raises(AccountCollisionError, match="cortex-manager"):
         validate_preflight(plan, facts)
+
+
+def _account_adoption_case(tmp_path: Path):
+    desired = dict(_accounts(tmp_path)[0])
+    step = {
+        "step_id": f"account:{desired['name']}",
+        "kind": "account",
+        "name": desired["name"],
+        "uid": desired["uid"],
+        "gid": desired["gid"],
+        "home": desired["home"],
+        "login_program": desired["shell"],
+        "desired_sha256": "9" * 64,
+    }
+    plan = _plan(tmp_path)
+    plan["accounts"] = [desired]
+    plan["apply_order"] = [step]
+    facts = _safe_facts(plan)
+    facts["accounts"] = {
+        desired["name"]: {
+            **desired,
+            "supplementary_groups": [],
+            "password_locked": True,
+        }
+    }
+    receipt = new_install_receipt(plan)
+    document = receipt.to_dict()
+    document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+        }
+    ]
+    trusted_receipt = InstallReceipt(document)
+    return plan, facts, trusted_receipt
+
+
+def test_existing_account_with_unknown_password_lock_state_is_rejected(
+    tmp_path: Path,
+) -> None:
+    plan, facts, receipt = _account_adoption_case(tmp_path)
+    facts["accounts"]["cortex-manager"]["password_locked"] = None
+
+    with pytest.raises(AccountCollisionError, match="password.*locked"):
+        validate_preflight(plan, facts, receipt=receipt)
+
+
+def test_existing_account_without_prior_receipt_provenance_is_rejected(
+    tmp_path: Path,
+) -> None:
+    plan, facts, _receipt = _account_adoption_case(tmp_path)
+
+    with pytest.raises(AccountCollisionError, match="receipt|provenance"):
+        validate_preflight(plan, facts)
+
+
+def test_existing_account_with_matching_prior_receipt_provenance_is_adoptable(
+    tmp_path: Path,
+) -> None:
+    plan, facts, receipt = _account_adoption_case(tmp_path)
+
+    assert validate_preflight(plan, facts, receipt=receipt).ok
+
+
+def test_retained_account_from_plan_bound_rollback_journal_can_be_reinstalled(
+    tmp_path: Path,
+) -> None:
+    plan, facts, receipt = _account_adoption_case(tmp_path)
+    step = plan["apply_order"][0]
+
+    class RetainedAccountBackend:
+        def __init__(self) -> None:
+            self.applied = 0
+            self.rolled_back = 0
+            self.state = {
+                "exists": True,
+                "installed_sha256": step["desired_sha256"],
+            }
+
+        def preflight_facts(self, _plan):
+            return deepcopy(facts)
+
+        def inspect_step(self, _step):
+            return deepcopy(self.state)
+
+        def apply_step(self, _step):
+            self.applied += 1
+            return {"prior": deepcopy(self.state), **deepcopy(self.state)}
+
+        def rollback_step(self, _entry):
+            # Account rollback is deliberately receipt-bounded retain/no-op.
+            self.rolled_back += 1
+
+        def list_unknown_state(self, _receipt):
+            return ()
+
+    backend = RetainedAccountBackend()
+
+    rollback_receipt(receipt, backend=backend)
+    rolled_back = receipt.to_dict()
+    assert rolled_back["journal"] == []
+    assert rolled_back["rollback_journal"][0]["step_id"] == step["step_id"]
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.rolled_back == 1
+    assert backend.applied == 1
+    assert receipt.to_dict()["state"] == "applied"
 
 
 def test_apply_time_symlink_drift_fails_before_any_mutation(tmp_path: Path) -> None:
@@ -315,6 +438,58 @@ def test_post_mutation_crash_replays_from_prejournal_and_rollback_removes_create
     )
     rollback_receipt(receipt, backend=backend)
     assert "state-root" not in backend.states
+
+
+def test_partial_mid_step_mutation_is_rolled_back_then_replayed(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    backend.fail_with_partial_mutation = "state-root"
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(RuntimeError, match="partial-mutation"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+    assert receipt.to_dict()["journal"][0]["status"] == "prepared"
+    assert backend.states["state-root"]["installed_sha256"] == "partial"
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.rolled_back == ["state-root"]
+    assert backend.states["state-root"]["installed_sha256"] == "1" * 64
+    assert receipt.to_dict()["journal"][0]["status"] == "completed"
+
+
+def test_partial_mid_step_mutation_can_be_explicitly_rolled_back(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    backend.fail_with_partial_mutation = "state-root"
+    receipt = new_install_receipt(plan)
+    with pytest.raises(RuntimeError, match="partial-mutation"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert backend.rolled_back == ["state-root"]
+    assert "state-root" not in backend.states
+    assert report.retained_drift == ()
 
 
 def test_replay_stops_when_a_completed_asset_no_longer_matches(tmp_path: Path) -> None:

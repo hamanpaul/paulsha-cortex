@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from paulsha_cortex.trust_root.install import (
     canonical_plan_bytes,
     plan_sha256,
 )
+from paulsha_cortex.trust_root.install import cli as install_cli
 
 
 def _sha256(path: Path) -> str:
@@ -329,6 +331,87 @@ def test_plan_rejects_nested_api_key_even_under_a_toolchain_entry(tmp_path: Path
 
     with pytest.raises(InstallPlanError, match="api_key"):
         build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
+
+
+def test_plan_rejects_unknown_nested_secret_like_field(tmp_path: Path) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    config = _safe_config(tmp_path)
+    config["toolchain"]["codex"]["session_cookie"] = "PLAINTEXT-CREDENTIAL"
+
+    with pytest.raises(InstallPlanError, match="session_cookie"):
+        build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://oauth-user:plaintext-credential@example.invalid/repo.git",
+        "https://example.invalid/repo.git?access_token=plaintext-credential",
+        "https://example.invalid/repo.git#access_token=plaintext-credential",
+    ],
+)
+def test_plan_rejects_credential_bearing_repository_url(
+    tmp_path: Path, remote: str
+) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    config = _safe_config(tmp_path)
+    config["repo_identity"]["remote"] = remote
+
+    with pytest.raises(InstallPlanError, match="repo_identity.remote") as exc:
+        build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
+    assert "plaintext-credential" not in str(exc.value)
+
+
+def test_plan_cli_persists_plan_with_private_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    output = tmp_path / "install-plan.json"
+    candidate_sha = "a" * 40
+    wheel_sha = _sha256(wheel)
+    config = {"repo_identity": {"commit": candidate_sha}}
+    plan = {
+        "schema_version": 1,
+        "candidate": {},
+        "apply_order": [{"kind": "venv"}],
+    }
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(install_cli, "_load_mapping", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(
+        install_cli,
+        "validate_bundle_manifest",
+        lambda _path: {
+            "candidate_sha": candidate_sha,
+            "manifest_path": str(bundle),
+            "wheel": {
+                "path": wheel.name,
+                "resolved_path": str(wheel),
+                "sha256": wheel_sha,
+            },
+            "wheelhouse": [
+                {
+                    "path": wheel.name,
+                    "resolved_path": str(wheel),
+                    "sha256": wheel_sha,
+                }
+            ],
+            "generated_artifacts": [],
+        },
+    )
+    monkeypatch.setattr(install_cli, "build_install_plan", lambda **_kwargs: deepcopy(plan))
+    monkeypatch.setattr(install_cli, "bind_bundle_artifacts", lambda value, _manifest: value)
+
+    def capture(path, value, *, mode):
+        captured.update({"path": path, "value": value, "mode": mode})
+
+    monkeypatch.setattr(install_cli, "atomic_write_json", capture)
+
+    assert install_cli.main(
+        ["plan", "--config", "config.yml", "--bundle", str(bundle), "--output", str(output)]
+    ) == 0
+    assert captured["path"] == output.absolute()
+    assert captured["mode"] == 0o600
 
 
 def test_plan_document_never_contains_secret_bytes_or_operator_home(

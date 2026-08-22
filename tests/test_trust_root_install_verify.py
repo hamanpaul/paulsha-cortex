@@ -24,14 +24,18 @@ def _inventory() -> dict[str, dict[str, dict[str, str]]]:
     return {
         "units": {
             "cortex-egress-proxy.service": _artifact(
-                "# generated\n[Service]\nUser=cortex-egress-proxy\nProtectSystem=strict\n"
+                "# generated\n[Service]\nUser=cortex-egress-proxy\n"
+                "ExecStart=/opt/cortex/venv/bin/cortex egress-proxy\n"
+                "ProtectSystem=strict\n"
             ),
             "cortex-manager.service": _artifact(
                 "# generated\n[Service]\nUser=cortex-manager\n"
+                "ExecStart=/opt/cortex/venv/bin/cortex service run\n"
                 "ReadWritePaths=/var/lib/cortex\n"
             ),
             "cortex-monitor.service": _artifact(
                 "# generated\n[Service]\nUser=cortex-manager\n"
+                "ExecStart=/opt/cortex/venv/bin/cortex monitor\n"
                 "ReadWritePaths=/var/lib/cortex/monitor\n"
             ),
         },
@@ -77,7 +81,9 @@ def test_comment_only_drift_warns_but_does_not_fail() -> None:
     installed = deepcopy(expected)
     installed["units"]["cortex-manager.service"]["content"] = (
         "# local explanatory comment\n"
-        "[Service]\nUser=cortex-manager\nReadWritePaths=/var/lib/cortex\n"
+        "[Service]\nUser=cortex-manager\n"
+        "ExecStart=/opt/cortex/venv/bin/cortex service run\n"
+        "ReadWritePaths=/var/lib/cortex\n"
     )
 
     report = attest_generated_inventory(expected=expected, installed=installed)
@@ -175,6 +181,34 @@ class VerifyBackend:
     def stop_service(self, _name: str) -> None:  # pragma: no cover - success path
         raise AssertionError
 
+    def service_identities(self):
+        return _service_identities()
+
+
+def _service_identities(
+    *, executable_hash: str = "d" * 64, active_state: str = "active"
+) -> dict[str, dict[str, str]]:
+    return {
+        "cortex-egress-proxy.service": {
+            "user": "cortex-egress-proxy",
+            "exec_path": "/opt/cortex/venv/bin/cortex",
+            "exec_sha256": executable_hash,
+            "active_state": active_state,
+        },
+        "cortex-manager.service": {
+            "user": "cortex-manager",
+            "exec_path": "/opt/cortex/venv/bin/cortex",
+            "exec_sha256": executable_hash,
+            "active_state": active_state,
+        },
+        "cortex-monitor.service": {
+            "user": "cortex-manager",
+            "exec_path": "/opt/cortex/venv/bin/cortex",
+            "exec_sha256": executable_hash,
+            "active_state": active_state,
+        },
+    }
+
 
 def _activated_receipt():
     plan = {
@@ -191,6 +225,7 @@ def _activated_receipt():
         "accounts": [],
         "required_credentials": [],
         "apply_order": [],
+        "generated": _inventory(),
     }
     backend = VerifyBackend()
     receipt = new_install_receipt(plan)
@@ -211,20 +246,7 @@ def test_verify_writes_hash_bound_evidence_and_only_then_marks_activation(
     expected = _inventory()
     installed = deepcopy(expected)
     evidence_path = tmp_path / "evidence" / "trust-root-install.json"
-    service_identities = {
-        "cortex-egress-proxy.service": {
-            "user": "cortex-egress-proxy",
-            "exec_sha256": "d" * 64,
-        },
-        "cortex-manager.service": {
-            "user": "cortex-manager",
-            "exec_sha256": "e" * 64,
-        },
-        "cortex-monitor.service": {
-            "user": "cortex-manager",
-            "exec_sha256": "f" * 64,
-        },
-    }
+    service_identities = _service_identities()
 
     result = verify_receipt(
         receipt,
@@ -243,9 +265,110 @@ def test_verify_writes_hash_bound_evidence_and_only_then_marks_activation(
     assert evidence["receipt_id"] == receipt.to_dict()["receipt_id"]
     assert evidence["candidate"] == plan["candidate"]
     assert evidence["service_identities"] == service_identities
+    assert receipt.to_dict()["expected_service_executables"] == {
+        service: {
+            "exec_path": identity["exec_path"],
+            "sha256": identity["exec_sha256"],
+        }
+        for service, identity in service_identities.items()
+    }
     manager_content = installed["units"]["cortex-manager.service"]["content"].encode()
     assert evidence["artifact_hashes"]["units/cortex-manager.service"] == hashlib.sha256(
         manager_content
     ).hexdigest()
     assert receipt.to_dict()["activated"] is True
     assert receipt.to_dict()["qualified"] is True
+
+
+def test_verify_rejects_a_different_well_formed_service_executable_hash(
+    tmp_path: Path,
+) -> None:
+    plan, receipt = _activated_receipt()
+    observed = _service_identities()
+    observed["cortex-manager.service"]["exec_sha256"] = "e" * 64
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=observed,
+        evidence_path=tmp_path / "hash-drift.json",
+    )
+
+    assert not result.ok
+    failures = result.report.to_dict()["failures"]
+    assert any(
+        row["code"] == "service_exec_hash_drift"
+        and row["artifact"] == "cortex-manager.service"
+        for row in failures
+    )
+
+
+def test_verify_fails_closed_without_apply_time_executable_binding(
+    tmp_path: Path,
+) -> None:
+    plan, receipt = _activated_receipt()
+    del receipt._document["expected_service_executables"]
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=_service_identities(),
+        evidence_path=tmp_path / "missing-executable-binding.json",
+    )
+
+    assert not result.ok
+    assert any(
+        row["code"] == "missing_expected_service_executable"
+        for row in result.report.to_dict()["failures"]
+    )
+
+
+def test_verify_fails_when_live_service_is_inactive_despite_receipt_flag(
+    tmp_path: Path,
+) -> None:
+    plan, receipt = _activated_receipt()
+    observed = _service_identities()
+    observed["cortex-manager.service"]["active_state"] = "inactive"
+    assert receipt.to_dict()["services_started"] is True
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=observed,
+        evidence_path=tmp_path / "inactive.json",
+    )
+
+    assert not result.ok
+    assert any(
+        row["code"] == "service_not_active"
+        and row["artifact"] == "cortex-manager.service"
+        for row in result.report.to_dict()["failures"]
+    )
+
+
+def test_verify_fails_closed_when_live_active_state_is_missing(tmp_path: Path) -> None:
+    plan, receipt = _activated_receipt()
+    observed = _service_identities()
+    del observed["cortex-manager.service"]["active_state"]
+
+    result = verify_receipt(
+        receipt,
+        plan=plan,
+        expected_inventory=_inventory(),
+        installed_inventory=_inventory(),
+        service_identities=observed,
+        evidence_path=tmp_path / "missing-active-state.json",
+    )
+
+    assert not result.ok
+    assert any(
+        row["code"] == "service_not_active"
+        and row["artifact"] == "cortex-manager.service"
+        for row in result.report.to_dict()["failures"]
+    )

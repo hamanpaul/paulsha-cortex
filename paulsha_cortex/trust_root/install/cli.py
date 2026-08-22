@@ -163,7 +163,7 @@ def _plan_command(args: argparse.Namespace) -> int:
     ):
         raise InstallPlanError("bundle wheelhouse must include the exact candidate wheel")
     output = Path(args.output).expanduser().absolute()
-    atomic_write_json(output, plan, mode=0o644)
+    atomic_write_json(output, plan, mode=0o600)
     _emit({"output": str(output), "plan_sha256": plan_sha256(plan)})
     return 0
 
