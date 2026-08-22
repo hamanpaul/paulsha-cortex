@@ -9,6 +9,7 @@ RUN apt-get update \
         bubblewrap \
         ca-certificates \
         curl \
+        gh \
         git \
         jq \
         nodejs \
@@ -31,11 +32,13 @@ RUN apt-get update \
 
 COPY validate.py /usr/local/libexec/cortex-qualification-validate
 COPY verify_bundle.py /usr/local/libexec/cortex-qualification-verify-bundle
+COPY driver.py /usr/local/libexec/cortex-release-qualification
 COPY qualification.schema.json /usr/local/share/cortex/qualification.schema.json
 
 RUN chmod 0755 \
         /usr/local/libexec/cortex-qualification-validate \
         /usr/local/libexec/cortex-qualification-verify-bundle \
+        /usr/local/libexec/cortex-release-qualification \
     && mkdir -p /var/lib/cortex/qualification
 
 STOPSIGNAL SIGRTMIN+3

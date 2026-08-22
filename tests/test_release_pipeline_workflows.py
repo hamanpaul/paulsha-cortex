@@ -17,7 +17,9 @@ def _load_workflow(name: str) -> dict:
     path = WORKFLOWS / name
     assert path.is_file(), f"{path.relative_to(REPO_ROOT)} must exist"
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert isinstance(payload, dict), f"{path.relative_to(REPO_ROOT)} must parse to a mapping"
+    assert isinstance(
+        payload, dict
+    ), f"{path.relative_to(REPO_ROOT)} must parse to a mapping"
     return payload
 
 
@@ -43,22 +45,30 @@ def _assert_all_uses_are_sha_pinned(payload: dict, *, relpath: str) -> None:
             if not isinstance(step, dict) or "uses" not in step:
                 continue
             uses = step["uses"]
-            assert isinstance(uses, str), f"{relpath}:{job_name} step uses must be a string"
-            assert SHA_PIN_RE.match(uses), f"{relpath}:{job_name} step `{uses}` must use a 40-hex SHA pin"
+            assert isinstance(
+                uses, str
+            ), f"{relpath}:{job_name} step uses must be a string"
+            assert SHA_PIN_RE.match(
+                uses
+            ), f"{relpath}:{job_name} step `{uses}` must use a 40-hex SHA pin"
 
 
 def _assert_all_uses_have_version_comments(name: str) -> None:
     path = WORKFLOWS / name
     uses_lines = [
         (line_no, line)
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        for line_no, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        )
         if re.match(r"^\s*uses:\s+", line)
     ]
-    assert uses_lines, f"{path.relative_to(REPO_ROOT)} must contain at least one uses step"
+    assert (
+        uses_lines
+    ), f"{path.relative_to(REPO_ROOT)} must contain at least one uses step"
     for line_no, line in uses_lines:
-        assert USES_WITH_VERSION_COMMENT_RE.match(line), (
-            f"{path.relative_to(REPO_ROOT)}:{line_no} uses line must keep a 40-hex SHA pin and `# vX.Y.Z` comment"
-        )
+        assert USES_WITH_VERSION_COMMENT_RE.match(
+            line
+        ), f"{path.relative_to(REPO_ROOT)}:{line_no} uses line must keep a 40-hex SHA pin and `# vX.Y.Z` comment"
 
 
 def test_tests_workflow_matches_release_pipeline_contract() -> None:
@@ -99,7 +109,9 @@ def test_release_workflow_is_tag_only_no_pypi_and_sha_pinned() -> None:
     push = on_block.get("push")
     assert isinstance(push, dict), "release.yml must trigger from push"
     assert push.get("tags") == ["v*"]
-    assert "pull_request" not in on_block, "release.yml must not trigger from pull_request"
+    assert (
+        "pull_request" not in on_block
+    ), "release.yml must not trigger from pull_request"
 
     raw = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     assert "policy_version" not in raw
@@ -124,9 +136,9 @@ def _job_needs(job: dict) -> set[str]:
 def test_rc_qualification_is_manual_protected_and_sha_pinned() -> None:
     payload = _load_workflow("rc-qualification.yml")
     on_block = _workflow_on(payload)
-    assert set(on_block) == {"workflow_dispatch"}, (
-        "RC qualification is privileged and must never run on push, pull_request, or schedule"
-    )
+    assert set(on_block) == {
+        "workflow_dispatch"
+    }, "RC qualification is privileged and must never run on push, pull_request, or schedule"
 
     jobs = payload.get("jobs", {})
     assert isinstance(jobs, dict) and jobs
@@ -136,9 +148,9 @@ def test_rc_qualification_is_manual_protected_and_sha_pinned() -> None:
         if isinstance(job, dict) and "qualification/run.sh" in _job_step_runs(job)
     ]
     assert qualification_jobs, "RC workflow must execute qualification/run.sh"
-    assert all(job.get("environment") == "rc-qualification" for job in qualification_jobs), (
-        "every job running privileged qualification must use the protected rc-qualification environment"
-    )
+    assert all(
+        job.get("environment") == "rc-qualification" for job in qualification_jobs
+    ), "every job running privileged qualification must use the protected rc-qualification environment"
 
     raw = (WORKFLOWS / "rc-qualification.yml").read_text(encoding="utf-8")
     lowered = raw.lower()
@@ -149,17 +161,23 @@ def test_rc_qualification_is_manual_protected_and_sha_pinned() -> None:
     assert "github.sha" in lowered or "github.event.inputs" in lowered
     assert "timeout-minutes" in lowered
 
-    _assert_all_uses_are_sha_pinned(payload, relpath=".github/workflows/rc-qualification.yml")
+    _assert_all_uses_are_sha_pinned(
+        payload, relpath=".github/workflows/rc-qualification.yml"
+    )
     _assert_all_uses_have_version_comments("rc-qualification.yml")
 
 
-def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish() -> None:
+def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish() -> (
+    None
+):
     payload = _load_workflow("release.yml")
     jobs = payload.get("jobs", {})
     assert isinstance(jobs, dict)
     gate = jobs.get("qualification-gate")
     assert isinstance(gate, dict), "release.yml must define qualification-gate"
-    assert "build" in _job_needs(gate), "the gate must validate the wheel produced by the build job"
+    assert "build" in _job_needs(
+        gate
+    ), "the gate must validate the wheel produced by the build job"
 
     gate_runs = _job_step_runs(gate)
     gate_text = repr(gate)
@@ -171,19 +189,30 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "--wheel-sha256" in gate_runs
     assert "sha256sum" in gate_lower
     assert "head_sha" in gate_text or "head-sha" in gate_text.lower()
-    assert "success" in gate_text.lower(), "the selected RC qualification run must have succeeded"
+    assert (
+        "success" in gate_text.lower()
+    ), "the selected RC qualification run must have succeeded"
+    assert "actions/workflows/tests.yml/runs" in gate_runs
+    assert "openspec/changes/phase2-install-docker-qualification" in gate_runs
+    assert "phase2-install-docker-qualification" in gate_runs and "archive" in gate_runs
+    assert "merge_commit_sha" in gate_runs
+    assert 'state == "APPROVED"' in gate_runs
+    assert "check-runs" in gate_runs
+    assert "default-branch head" in gate_runs
 
     release = jobs.get("release")
     assert isinstance(release, dict)
-    assert "qualification-gate" in _job_needs(release), (
-        "GitHub Release publication must depend on exact-SHA qualification validation"
-    )
+    assert "qualification-gate" in _job_needs(
+        release
+    ), "GitHub Release publication must depend on exact-SHA qualification validation"
 
     release_runs = _job_step_runs(release).lower()
     release_uses = "\n".join(
-        str(step.get("uses", "")) for step in release.get("steps", []) if isinstance(step, dict)
+        str(step.get("uses", ""))
+        for step in release.get("steps", [])
+        if isinstance(step, dict)
     ).lower()
     assert "action-gh-release" in release_uses
-    assert "qualification/validate.py" not in release_runs, (
-        "evidence validation belongs in the required predecessor gate, never after publication"
-    )
+    assert (
+        "qualification/validate.py" not in release_runs
+    ), "evidence validation belongs in the required predecessor gate, never after publication"

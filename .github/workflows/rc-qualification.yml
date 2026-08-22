@@ -38,7 +38,14 @@ jobs:
             qualification-input/wheelhouse \
             qualification-staging
           cp dist/*.whl qualification-input/dist/
-          python -m pip download --only-binary=:all: --dest qualification-input/wheelhouse dist/*.whl
+          python -m pip download \
+            --only-binary=:all: \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --abi cp312 \
+            --dest qualification-input/wheelhouse \
+            dist/*.whl
 
           [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]] || {
             echo "::error::checkout HEAD does not match the workflow candidate SHA"
@@ -143,6 +150,9 @@ jobs:
           CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
           CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
           CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
+          CORTEX_RC_PROBE_REPOSITORY: ${{ vars.CORTEX_RC_PROBE_REPOSITORY }}
+          CORTEX_RC_PROBE_WORK_ID: ${{ vars.CORTEX_RC_PROBE_WORK_ID }}
+          CORTEX_RC_PROBE_ISSUE: ${{ vars.CORTEX_RC_PROBE_ISSUE }}
         run: |
           set -euo pipefail
           qualification/run.sh \

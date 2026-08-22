@@ -54,6 +54,70 @@ jobs:
           name: reproduced-dist
           path: reproduced-dist
 
+      - name: Verify exact source CI, archive, PR review, and default-branch gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)
+          default_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/$default_branch" --jq .object.sha)
+          [[ "$default_sha" == "$GITHUB_SHA" ]] || {
+            echo "::error::release commit is not the exact current default-branch head"
+            exit 1
+          }
+
+          tests_runs=$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/tests.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f per_page=20)
+          jq -e --arg sha "$GITHUB_SHA" '
+            any(.workflow_runs[];
+              .head_sha == $sha and .status == "completed" and .conclusion == "success")
+          ' <<<"$tests_runs" >/dev/null || {
+            echo "::error::Tests workflow is not green for the exact release commit"
+            exit 1
+          }
+
+          test ! -e openspec/changes/phase2-install-docker-qualification || {
+            echo "::error::Phase 2 OpenSpec change is still active"
+            exit 1
+          }
+          mapfile -t phase2_archives < <(
+            find openspec/changes/archive -mindepth 1 -maxdepth 1 -type d \
+              -name '*-phase2-install-docker-qualification' -print
+          )
+          ((${#phase2_archives[@]} == 1)) || {
+            echo "::error::expected exactly one official Phase 2 OpenSpec archive"
+            exit 1
+          }
+
+          associated=$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")
+          pr_number=$(jq -er --arg sha "$GITHUB_SHA" '
+            [.[] | select(.merged_at != null and .merge_commit_sha == $sha)]
+            | if length == 1 then .[0].number else empty end
+          ' <<<"$associated") || {
+            echo "::error::release commit must be the unique merge commit of a reviewed PR"
+            exit 1
+          }
+          pr=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$pr_number")
+          pr_head=$(jq -er .head.sha <<<"$pr")
+          reviews=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$pr_number/reviews?per_page=100")
+          jq -e --arg head "$pr_head" '
+            any(.[]; .state == "APPROVED" and .commit_id == $head)
+          ' <<<"$reviews" >/dev/null || {
+            echo "::error::merged PR lacks an approval bound to its final head"
+            exit 1
+          }
+          checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$pr_head/check-runs?per_page=100")
+          jq -e '
+            (.check_runs | length) > 0 and
+            all(.check_runs[]; .status == "completed" and .conclusion == "success")
+          ' <<<"$checks" >/dev/null || {
+            echo "::error::the merged PR final head has missing or non-green checks"
+            exit 1
+          }
+
       - name: Find recent successful RC qualification for exact head_sha
         id: rc
         env:

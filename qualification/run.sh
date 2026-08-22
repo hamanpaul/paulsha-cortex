@@ -102,11 +102,8 @@ docker exec "$container_name" /usr/local/libexec/cortex-qualification-verify-bun
     --bundle /artifacts/bundle.json \
     --candidate-sha "$candidate_sha" \
     --wheel-sha256 "$expected_wheel_sha"
-docker exec "$container_name" python3 -m pip install \
-    --break-system-packages \
-    --no-index \
-    --find-links /artifacts/wheelhouse \
-    "/artifacts/$wheel_name"
+docker exec "$container_name" sh -eu -c \
+    'python3 -m pip install --break-system-packages --no-index --no-deps /artifacts/wheelhouse/*.whl'
 
 plan_path=/var/lib/cortex/qualification/install-plan.json
 receipt_path=/var/lib/cortex/qualification/install-receipt.json
@@ -147,12 +144,11 @@ docker exec "$container_name" cortex install trust-root rollback --receipt "$rec
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$plan_path" --confirm-sha256 "$plan_sha" --receipt "$receipt_path"
 
-# The reference image deliberately does not fetch mutable toolchains from the
-# network. The exact install bundle must deliver all three provider executables.
-# Until it does, RC qualification is intentionally impossible to pass.
-for provider_tool in codex agy copilot; do
+# The reference image never fetches mutable runtime tools.  Every executor and
+# qualification helper must resolve through the root-owned installed wrappers.
+for provider_tool in codex claude copilot agy srt openspec; do
     docker exec "$container_name" sh -eu -c \
-        'command -v "$1" >/dev/null || { echo "missing hash-locked provider tool: $1" >&2; exit 1; }' \
+        'test -x "/opt/cortex/toolchain/bin/$1" || { echo "missing hash-locked tool: $1" >&2; exit 1; }' \
         sh "$provider_tool"
 done
 
@@ -192,11 +188,13 @@ docker exec \
 # Provider smokes, runtime-model metadata, all five attack families (including
 # negative controls), Manager auth dry-run, and full intake-to-closeout must be
 # run by a fixed harness installed in the reference image, not by candidate JSON.
-# That driver is intentionally absent until those executable probes land; this
-# guard makes the current workflow fail closed and therefore unable to bless an RC.
+# Protected repository identity is deployment input; it is never inferred from
+# a mounted HOME or from an untrusted candidate-produced evidence document.
 qualification_driver=/usr/local/libexec/cortex-release-qualification
-docker exec "$container_name" test -x "$qualification_driver" || \
-    die "trusted provider/attack/full-dispatch qualification driver is not implemented"
+[[ -n ${CORTEX_RC_PROBE_REPOSITORY:-} ]] || die "protected probe repository is unavailable"
+[[ -n ${CORTEX_RC_PROBE_WORK_ID:-} ]] || die "protected probe work id is unavailable"
+[[ ${CORTEX_RC_PROBE_ISSUE:-} =~ ^[1-9][0-9]*$ ]] || die "protected probe issue is unavailable"
+wheel_filename=$(basename "$wheel_path")
 docker exec "$container_name" "$qualification_driver" \
     --receipt "$receipt_path" \
     --install-evidence "$install_evidence_path" \
@@ -204,6 +202,10 @@ docker exec "$container_name" "$qualification_driver" \
     --wheel-sha256 "$expected_wheel_sha" \
     --bundle-sha256 "$expected_bundle_sha" \
     --image-digest "$image_digest" \
+    --wheel-filename "$wheel_filename" \
+    --probe-repository "$CORTEX_RC_PROBE_REPOSITORY" \
+    --probe-work-id "$CORTEX_RC_PROBE_WORK_ID" \
+    --probe-issue "$CORTEX_RC_PROBE_ISSUE" \
     --output "$qualification_path" \
     --evidence-dir /var/lib/cortex/qualification/evidence
 
