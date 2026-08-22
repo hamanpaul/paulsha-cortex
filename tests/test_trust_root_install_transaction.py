@@ -7,13 +7,18 @@ typed steps through the same seam.
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
 
+from paulsha_cortex.trust_root.install import core as install_core
 from paulsha_cortex.trust_root.install import (
     AccountCollisionError,
     InstallDriftError,
+    InstallError,
     InstallPlanError,
     InstallReceipt,
     UnsafeInstallPathError,
@@ -567,3 +572,71 @@ def test_receipt_load_rejects_non_root_or_non_private_authority_file(
 
     with pytest.raises(Exception, match="root-owned|0600"):
         InstallReceipt.load(path)
+
+
+def _root_owned_stat(observed: os.stat_result) -> os.stat_result:
+    values = list(observed)
+    values[stat.ST_UID] = 0
+    return os.stat_result(values)
+
+
+def test_receipt_load_rejects_non_root_owned_parent_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    new_install_receipt(_plan(tmp_path), path=path)
+    real_lstat = Path.lstat
+
+    def root_owned_leaf(candidate: Path):
+        observed = real_lstat(candidate)
+        return _root_owned_stat(observed) if candidate == path else observed
+
+    monkeypatch.setattr(Path, "lstat", root_owned_leaf)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None,
+        raising=False,
+    )
+
+    with pytest.raises(InstallError, match="parent.*root-owned|root-owned.*parent"):
+        InstallReceipt.load(path)
+
+
+def test_receipt_load_fails_closed_when_leaf_is_replaced_after_fd_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    new_install_receipt(_plan(tmp_path), path=path)
+    displaced = tmp_path / "displaced-receipt.json"
+    external = tmp_path / "external-receipt.json"
+    external.write_bytes(path.read_bytes())
+    real_lstat = Path.lstat
+    real_loads = json.loads
+    swapped = False
+
+    def root_owned_leaf(candidate: Path):
+        observed = real_lstat(candidate)
+        return _root_owned_stat(observed) if candidate == path else observed
+
+    def loads_and_swap(payload, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            path.rename(displaced)
+            path.symlink_to(external)
+            swapped = True
+        return real_loads(payload, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", root_owned_leaf)
+    monkeypatch.setattr(install_core.json, "loads", loads_and_swap)
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None,
+        raising=False,
+    )
+
+    with pytest.raises(UnsafeInstallPathError, match="changed|replaced|symlink"):
+        InstallReceipt.load(path)
+
+    assert swapped

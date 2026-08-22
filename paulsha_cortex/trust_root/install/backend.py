@@ -23,7 +23,11 @@ from .core import (
     InstallReceipt,
     UnsafeInstallPathError,
     _account_digest,
+    _assert_fd_path_binding,
     _desired_digest,
+    _open_directory_chain,
+    _open_parent_directory,
+    _read_fd_bytes,
     _reject_symlink_ancestors,
     credential_destination,
 )
@@ -1326,9 +1330,7 @@ class LocalInstallBackend:
             if installed.get("installed_sha256") != step.get("desired_sha256"):
                 raise InstallDriftError(f"installed symlink does not match desired state: {step.get('step_id')}")
             return {"prior": prior, **installed}
-        if asset_type == "directory":
-            path.mkdir(parents=True, exist_ok=True)
-        elif asset_type == "file":
+        if asset_type == "file":
             content = step.get("content")
             if not isinstance(content, str):
                 raise InstallPlanError(f"file step lacks content: {step.get('step_id')}")
@@ -1352,7 +1354,7 @@ class LocalInstallBackend:
                 except FileNotFoundError:
                     pass
                 raise
-        else:
+        elif asset_type != "directory":
             raise InstallPlanError(f"unsupported asset_type: {asset_type}")
         # New files and directories can inherit named/default ACLs from their
         # parent. Clear that inherited state before applying the plan's exact
@@ -1362,26 +1364,12 @@ class LocalInstallBackend:
         inherited_fds: tuple[int, ...] = ()
         try:
             if asset_type == "directory":
-                flags = (
-                    os.O_RDONLY
-                    | getattr(os, "O_DIRECTORY", 0)
-                    | getattr(os, "O_NOFOLLOW", 0)
-                )
                 try:
-                    directory_fd = os.open(path, flags)
-                except OSError as exc:
+                    directory_fd = _open_directory_chain(path, create=True)
+                except (OSError, UnsafeInstallPathError) as exc:
                     raise UnsafeInstallPathError(
                         f"cannot safely open managed directory {path}: {exc}"
                     ) from exc
-                opened = os.fstat(directory_fd)
-                observed = path.lstat()
-                if not stat.S_ISDIR(opened.st_mode) or (
-                    opened.st_dev,
-                    opened.st_ino,
-                ) != (observed.st_dev, observed.st_ino):
-                    raise UnsafeInstallPathError(
-                        f"managed directory changed before metadata apply: {path}"
-                    )
                 if not Path("/proc/self/fd").is_dir():
                     raise InstallError("/proc/self/fd is required for safe ACL apply")
                 acl_target = f"/proc/self/fd/{directory_fd}"
@@ -1420,6 +1408,8 @@ class LocalInstallBackend:
                     check=True,
                     pass_fds=inherited_fds,
                 )
+            if directory_fd is not None:
+                _assert_fd_path_binding(path, directory_fd, directory=True)
         finally:
             if directory_fd is not None:
                 os.close(directory_fd)
@@ -1561,16 +1551,34 @@ class LocalInstallBackend:
                 destination, uid, gid = credential_destination(
                     receipt, principal=principal, provider=provider
                 )
-                observed = destination.lstat()
-                if (
-                    not stat.S_ISREG(observed.st_mode)
-                    or observed.st_nlink != 1
-                    or observed.st_uid != uid
-                    or observed.st_gid != gid
-                    or stat.S_IMODE(observed.st_mode) != 0o600
-                    or _sha256_file(destination) != row.get("sha256")
-                ):
-                    failures.append(f"{principal}/{provider} metadata or hash mismatch")
+                parent_fd, leaf = _open_parent_directory(destination)
+                descriptor: int | None = None
+                try:
+                    descriptor = os.open(
+                        leaf,
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=parent_fd,
+                    )
+                    observed = os.fstat(descriptor)
+                    digest = hashlib.sha256(_read_fd_bytes(descriptor)).hexdigest()
+                    _assert_fd_path_binding(destination, descriptor, directory=False)
+                    if (
+                        not stat.S_ISREG(observed.st_mode)
+                        or observed.st_nlink != 1
+                        or observed.st_uid != uid
+                        or observed.st_gid != gid
+                        or stat.S_IMODE(observed.st_mode) != 0o600
+                        or digest != row.get("sha256")
+                    ):
+                        failures.append(
+                            f"{principal}/{provider} metadata or hash mismatch"
+                        )
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                    os.close(parent_fd)
             except (InstallError, OSError):
                 failures.append(f"{principal}/{provider} unavailable")
         return tuple(failures)
@@ -1604,7 +1612,7 @@ class LocalInstallBackend:
                 destination, uid, gid = credential_destination(
                     receipt, principal=principal, provider=provider
                 )
-                observed = destination.lstat()
+                parent_fd, leaf = _open_parent_directory(destination)
             except FileNotFoundError:
                 continue
             except (InstallError, OSError):
@@ -1615,22 +1623,114 @@ class LocalInstallBackend:
                     }
                 )
                 continue
-            if (
-                stat.S_ISREG(observed.st_mode)
-                and observed.st_nlink == 1
-                and observed.st_uid == uid
-                and observed.st_gid == gid
-                and stat.S_IMODE(observed.st_mode) == 0o600
-                and _sha256_file(destination) == row.get("sha256")
-            ):
-                destination.unlink()
-            else:
+            try:
+                descriptor: int | None = None
+                try:
+                    descriptor = os.open(
+                        leaf,
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=parent_fd,
+                    )
+                except FileNotFoundError:
+                    pass
+                if descriptor is not None:
+                    observed = os.fstat(descriptor)
+                    digest = hashlib.sha256(_read_fd_bytes(descriptor)).hexdigest()
+                    _assert_fd_path_binding(destination, descriptor, directory=False)
+                    if (
+                        stat.S_ISREG(observed.st_mode)
+                        and observed.st_nlink == 1
+                        and observed.st_uid == uid
+                        and observed.st_gid == gid
+                        and stat.S_IMODE(observed.st_mode) == 0o600
+                        and digest == row.get("sha256")
+                    ):
+                        os.unlink(leaf, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                    else:
+                        retained.append(
+                            {
+                                "credential": f"{principal}/{provider}",
+                                "reason": "credential drifted after import",
+                            }
+                        )
+                    os.close(descriptor)
+                    descriptor = None
+                temp_name = row.get("temp_name")
+                if temp_name is not None:
+                    if (
+                        not isinstance(temp_name, str)
+                        or Path(temp_name).name != temp_name
+                        or not temp_name.startswith(".")
+                        or temp_name in {".", ".."}
+                    ):
+                        retained.append(
+                            {
+                                "credential": f"{principal}/{provider}",
+                                "reason": "credential fallback journal is invalid",
+                            }
+                        )
+                        continue
+                    try:
+                        temp_observed = os.stat(
+                            temp_name, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if (
+                            stat.S_ISREG(temp_observed.st_mode)
+                            and temp_observed.st_nlink == 1
+                            and stat.S_IMODE(temp_observed.st_mode) == 0
+                        ):
+                            os.unlink(temp_name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                            continue
+                        temp_fd = os.open(
+                            temp_name,
+                            os.O_RDONLY
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_CLOEXEC", 0),
+                            dir_fd=parent_fd,
+                        )
+                        try:
+                            observed = os.fstat(temp_fd)
+                            digest = hashlib.sha256(
+                                _read_fd_bytes(temp_fd)
+                            ).hexdigest()
+                            removable = (
+                                stat.S_ISREG(observed.st_mode)
+                                and observed.st_nlink == 1
+                                and observed.st_uid == uid
+                                and observed.st_gid == gid
+                                and stat.S_IMODE(observed.st_mode) == 0o600
+                                and digest == row.get("sha256")
+                            )
+                        finally:
+                            os.close(temp_fd)
+                        if removable:
+                            os.unlink(temp_name, dir_fd=parent_fd)
+                            os.fsync(parent_fd)
+                        else:
+                            retained.append(
+                                {
+                                    "credential": f"{principal}/{provider}",
+                                    "reason": "credential fallback temp drifted",
+                                }
+                            )
+            except (InstallError, OSError):
                 retained.append(
                     {
                         "credential": f"{principal}/{provider}",
-                        "reason": "credential drifted after import",
+                        "reason": "credential rollback inspection failed",
                     }
                 )
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                os.close(parent_fd)
         return tuple(retained)
 
     def start_service(self, name: str) -> None:

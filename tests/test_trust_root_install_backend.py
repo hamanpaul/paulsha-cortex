@@ -565,7 +565,7 @@ def test_directory_acl_apply_keeps_external_target_safe_during_symlink_swap(
     }
     step["desired_sha256"] = _desired_digest(step)
 
-    with pytest.raises(UnsafeInstallPathError, match="must not be a symlink"):
+    with pytest.raises(UnsafeInstallPathError, match="symlink|changed"):
         LocalInstallBackend(require_root=False).apply_step(step)
 
     assert stat.S_IMODE(external.stat().st_mode) == external_mode
@@ -656,3 +656,56 @@ def test_rollback_reports_unknown_child_of_adopted_managed_directory(
     report = rollback_receipt(receipt, backend=backend)
 
     assert str(unknown) in report.retained_unknown
+
+
+def test_directory_acl_apply_does_not_follow_swapped_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    authority = tmp_path / "authority"
+    authority.mkdir()
+    displaced = tmp_path / "displaced-authority"
+    managed = authority / "managed"
+    external_root = tmp_path / "external"
+    external = external_root / "managed"
+    external.mkdir(parents=True, mode=0o755)
+    external_mode = stat.S_IMODE(external.stat().st_mode)
+    real_open = os.open
+    real_chmod = os.chmod
+    swapped = False
+
+    def open_after_ancestor_swap(path, flags, *args, **kwargs):
+        nonlocal swapped
+        candidate = os.fspath(path)
+        if not swapped and (candidate == str(managed) or candidate == managed.name):
+            authority.rename(displaced)
+            authority.symlink_to(external_root, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        if command[1] == "-m":
+            real_chmod(command[-1], 0o711)
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module.os, "open", open_after_ancestor_swap)
+    monkeypatch.setattr(backend_module, "_run", run)
+    step = {
+        "step_id": "asset:managed-ancestor-race",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(managed),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [{"account": account, "perms": "rX", "default": False}],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+
+    with pytest.raises((UnsafeInstallPathError, InstallDriftError)):
+        LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert swapped
+    assert stat.S_IMODE(external.stat().st_mode) == external_mode

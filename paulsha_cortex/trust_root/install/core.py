@@ -6,6 +6,8 @@ be exercised without inspecting or changing the host.
 """
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -109,6 +111,93 @@ def _reject_symlink_ancestors(
             raise UnsafeInstallPathError(
                 f"{label} path contains a symlink component: {candidate}"
             )
+
+
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _open_directory_chain(
+    path: Path, *, create: bool = False, create_mode: int = 0o700
+) -> int:
+    """Open an absolute directory one no-follow component at a time."""
+
+    if not path.is_absolute() or ".." in path.parts:
+        raise UnsafeInstallPathError(f"unsafe directory authority path: {path}")
+    descriptor = os.open("/", _DIRECTORY_OPEN_FLAGS)
+    try:
+        for component in path.parts[1:]:
+            try:
+                next_descriptor = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, create_mode, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(
+                    component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor
+                )
+            except OSError as exc:
+                raise UnsafeInstallPathError(
+                    f"directory authority contains an unsafe component: {path}"
+                ) from exc
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_parent_directory(
+    path: Path, *, create: bool = False, create_mode: int = 0o700
+) -> tuple[int, str]:
+    if not path.is_absolute() or ".." in path.parts or not path.name:
+        raise UnsafeInstallPathError(f"unsafe authority leaf path: {path}")
+    return (
+        _open_directory_chain(path.parent, create=create, create_mode=create_mode),
+        path.name,
+    )
+
+
+def _assert_fd_path_binding(path: Path, descriptor: int, *, directory: bool) -> None:
+    """Fail if the canonical pathname no longer names the held inode."""
+
+    parent_fd, leaf = _open_parent_directory(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    if directory:
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        try:
+            current_fd = os.open(leaf, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"authority path changed while held: {path}"
+            ) from exc
+        try:
+            held = os.fstat(descriptor)
+            current = os.fstat(current_fd)
+            if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+                raise UnsafeInstallPathError(
+                    f"authority path was replaced while held: {path}"
+                )
+        finally:
+            os.close(current_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _read_fd_bytes(descriptor: int) -> bytes:
+    with os.fdopen(os.dup(descriptor), "rb") as stream:
+        return stream.read()
 
 
 def _validate_absolute_path(value: object, *, label: str) -> str:
@@ -1320,16 +1409,46 @@ class InstallReceipt:
     def load(cls, path: Path) -> "InstallReceipt":
         if not path.is_absolute() or ".." in path.parts:
             raise UnsafeInstallPathError(f"receipt path must be safe and absolute: {path}")
-        _reject_symlink_ancestors(path, label="receipt")
+        parent_fd: int | None = None
+        receipt_fd: int | None = None
         try:
-            observed = path.lstat()
-            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
-                raise UnsafeInstallPathError(f"receipt must be a single-link regular file: {path}")
-            if observed.st_uid != 0 or stat.S_IMODE(observed.st_mode) != 0o600:
-                raise InstallError(f"receipt must be root-owned mode 0600: {path}")
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            parent_fd, leaf = _open_parent_directory(path)
+            _validate_receipt_parent(os.fstat(parent_fd), path.parent)
+            receipt_fd = os.open(
+                leaf,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            before = os.fstat(receipt_fd)
+            _validate_receipt_file(before, path)
+            payload = json.loads(_read_fd_bytes(receipt_fd).decode("utf-8"))
+            after = os.fstat(receipt_fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ):
+                raise UnsafeInstallPathError(
+                    f"receipt changed while being read: {path}"
+                )
+            _assert_fd_path_binding(path, receipt_fd, directory=False)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise InstallError(f"cannot load receipt {path}: {exc}") from exc
+        finally:
+            if receipt_fd is not None:
+                os.close(receipt_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             raise InstallError(f"invalid receipt schema: {path}")
         plan = payload.get("plan")
@@ -1389,12 +1508,32 @@ class InstallReceipt:
         if not isinstance(credential_journal, list) or any(
             not isinstance(row, Mapping)
             or set(row)
-            != {"principal", "provider", "mode", "sha256", "status"}
+            not in (
+                {"principal", "provider", "mode", "sha256", "status"},
+                {
+                    "principal",
+                    "provider",
+                    "mode",
+                    "sha256",
+                    "status",
+                    "temp_name",
+                },
+            )
             or row.get("mode") != "0600"
             or row.get("status") != "prepared"
             or not isinstance(row.get("sha256"), str)
             or len(str(row.get("sha256"))) != 64
             or any(char not in "0123456789abcdef" for char in str(row["sha256"]))
+            or (
+                "temp_name" in row
+                and (
+                    not isinstance(row.get("temp_name"), str)
+                    or not str(row["temp_name"]).startswith(".")
+                    or row["temp_name"] in {".", ".."}
+                    or Path(str(row["temp_name"])).name != row["temp_name"]
+                    or len(str(row["temp_name"])) > 255
+                )
+            )
             for row in credential_journal
         ):
             raise InstallError(f"receipt credential journal is invalid: {path}")
@@ -1431,6 +1570,26 @@ class InstallReceipt:
         ):
             raise InstallError(f"receipt service executable binding is invalid: {path}")
         return cls(payload, path=path)
+
+
+def _validate_receipt_parent(observed: os.stat_result, path: Path) -> None:
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or observed.st_uid != 0
+        or stat.S_IMODE(observed.st_mode) & 0o022
+    ):
+        raise InstallError(
+            f"receipt parent must be canonical, root-owned, and non-writable: {path}"
+        )
+
+
+def _validate_receipt_file(observed: os.stat_result, path: Path) -> None:
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise UnsafeInstallPathError(
+            f"receipt must be a single-link regular file: {path}"
+        )
+    if observed.st_uid != 0 or stat.S_IMODE(observed.st_mode) != 0o600:
+        raise InstallError(f"receipt must be root-owned mode 0600: {path}")
 
 
 def atomic_write_json(path: Path, value: object, *, mode: int = 0o600) -> None:
@@ -1880,6 +2039,87 @@ def credential_destination(
     )
 
 
+def _open_unnamed_credential_tmpfile(parent_fd: int) -> int | None:
+    """Prefer Linux O_TMPFILE; return None for a journaled named fallback."""
+
+    flag = getattr(os, "O_TMPFILE", 0)
+    try:
+        linkat = getattr(ctypes.CDLL(None), "linkat")
+    except (AttributeError, OSError):
+        return None
+    if not flag or linkat is None or not Path("/proc/self/fd").is_dir():
+        return None
+    try:
+        return os.open(
+            ".",
+            os.O_RDWR | flag | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        if exc.errno in {
+            errno.EINVAL,
+            errno.EISDIR,
+            errno.ENOSYS,
+            errno.EOPNOTSUPP,
+        }:
+            return None
+        raise
+
+
+def _publish_credential_tmpfile(
+    descriptor: int, parent_fd: int, destination_name: str
+) -> None:
+    """Atomically link an O_TMPFILE inode at its final name."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(
+        descriptor,
+        ctypes.c_char_p(b""),
+        parent_fd,
+        ctypes.c_char_p(os.fsencode(destination_name)),
+        0x1000,  # AT_EMPTY_PATH
+    ) != 0:
+        error = ctypes.get_errno()
+        if error not in {errno.ENOENT, errno.EPERM}:
+            raise OSError(error, os.strerror(error))
+        os.link(
+            f"/proc/self/fd/{descriptor}",
+            destination_name,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=True,
+        )
+
+
+def _credential_temp_name(destination_name: str, digest: str) -> str:
+    prefix = destination_name[:96]
+    return f".{prefix}.cortex-pending-{digest[:24]}"
+
+
+def _open_regular_at(parent_fd: int, name: str) -> int:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    observed = os.fstat(descriptor)
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        os.close(descriptor)
+        raise CredentialImportError("credential destination is not a safe regular file")
+    return descriptor
+
+
 def import_credential(
     receipt: InstallReceipt,
     *,
@@ -1950,14 +2190,16 @@ def import_credential(
             os.close(source_fd)
     digest = hashlib.sha256(content).hexdigest()
     destination = destination_root.joinpath(*destination_parts)
-    if destination.is_symlink():
-        raise CredentialImportError("credential destination must not be a symlink")
-    try:
-        _reject_symlink_ancestors(destination, label="credential destination")
-    except UnsafeInstallPathError as exc:
-        raise CredentialImportError(
-            "credential destination path contains a symlink"
-        ) from exc
+    if destination_uid is not None or destination_gid is not None:
+        if (
+            not isinstance(destination_uid, int)
+            or destination_uid < 0
+            or not isinstance(destination_gid, int)
+            or destination_gid < 0
+        ):
+            raise CredentialImportError(
+                "credential destination uid/gid must be non-negative integers"
+            )
     credentials = receipt._document.setdefault("credentials", [])
     if not isinstance(credentials, list):
         raise CredentialImportError("receipt credentials field is invalid")
@@ -2021,99 +2263,191 @@ def import_credential(
             raise
 
     try:
-        destination_exists = destination.exists()
-    except OSError as exc:
-        raise CredentialImportError("credential destination inspection failed") from exc
-    if destination_exists:
+        parent_fd, destination_name = _open_parent_directory(
+            destination, create=True, create_mode=0o700
+        )
+    except (OSError, UnsafeInstallPathError) as exc:
+        raise CredentialImportError("credential destination preparation failed") from exc
+    descriptor: int | None = None
+    published = False
+    try:
         try:
-            observed = destination.lstat()
-            installed_digest = _sha256_file(destination)
+            installed_fd = _open_regular_at(parent_fd, destination_name)
+        except FileNotFoundError:
+            installed_fd = None
         except OSError as exc:
             raise CredentialImportError(
                 "credential destination inspection failed"
             ) from exc
-        owner_ok = destination_uid is None or observed.st_uid == destination_uid
-        group_ok = destination_gid is None or observed.st_gid == destination_gid
-        authority = pending if pending is not None else previous
-        if (
-            stat.S_ISREG(observed.st_mode)
-            and observed.st_nlink == 1
-            and stat.S_IMODE(observed.st_mode) == 0o600
-            and owner_ok
-            and group_ok
-            and authority is not None
-            and authority.get("sha256") == digest
-            and installed_digest == digest
-        ):
-            if pending is not None:
-                persist_completion(pending)
-            return metadata
-        raise CredentialImportError(
-            "credential destination already exists without matching receipt "
-            f"authority: {principal}/{provider}"
-        )
-    if pending is None:
-        pending = {**metadata_row, "status": "prepared"}
-        credential_journal.append(pending)
-    # Persist prepared authority on every attempt before creating the file.  A
-    # failed persist therefore cannot leave a receipt-unaware credential.
-    try:
-        receipt._persist()
-    except OSError as exc:
-        raise CredentialImportError(
-            "credential receipt persistence failed"
-        ) from exc
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{destination.name}.", dir=destination.parent
-        )
-    except OSError as exc:
-        raise CredentialImportError("credential destination preparation failed") from exc
-    temporary_path = Path(temporary)
-    try:
-        os.fchmod(descriptor, 0o600)
-        if destination_uid is not None or destination_gid is not None:
-            if (
-                not isinstance(destination_uid, int)
-                or destination_uid < 0
-                or not isinstance(destination_gid, int)
-                or destination_gid < 0
-            ):
-                raise CredentialImportError(
-                    "credential destination uid/gid must be non-negative integers"
+        if installed_fd is not None:
+            try:
+                observed = os.fstat(installed_fd)
+                installed_digest = hashlib.sha256(
+                    _read_fd_bytes(installed_fd)
+                ).hexdigest()
+                _assert_fd_path_binding(
+                    destination, installed_fd, directory=False
                 )
-            os.fchown(descriptor, destination_uid, destination_gid)
-        with os.fdopen(descriptor, "wb") as stream:
+            finally:
+                os.close(installed_fd)
+            owner_ok = destination_uid is None or observed.st_uid == destination_uid
+            group_ok = destination_gid is None or observed.st_gid == destination_gid
+            authority = pending if pending is not None else previous
+            if (
+                stat.S_IMODE(observed.st_mode) == 0o600
+                and owner_ok
+                and group_ok
+                and authority is not None
+                and authority.get("sha256") == digest
+                and installed_digest == digest
+            ):
+                if pending is not None:
+                    persist_completion(pending)
+                return metadata
+            raise CredentialImportError(
+                "credential destination already exists without matching receipt "
+                f"authority: {principal}/{provider}"
+            )
+        if pending is None:
+            pending = {**metadata_row, "status": "prepared"}
+            credential_journal.append(pending)
+        try:
+            receipt._persist()
+        except OSError as exc:
+            raise CredentialImportError(
+                "credential receipt persistence failed"
+            ) from exc
+
+        temp_name = pending.get("temp_name")
+        if temp_name is not None:
+            if (
+                not isinstance(temp_name, str)
+                or Path(temp_name).name != temp_name
+                or not temp_name.startswith(".")
+                or temp_name in {".", ".."}
+            ):
+                raise CredentialImportError("credential fallback journal is invalid")
+            try:
+                temp_observed = os.stat(
+                    temp_name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                temp_observed = None
+            if temp_observed is not None:
+                if (
+                    stat.S_ISREG(temp_observed.st_mode)
+                    and temp_observed.st_nlink == 1
+                    and stat.S_IMODE(temp_observed.st_mode) == 0
+                ):
+                    os.unlink(temp_name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                else:
+                    descriptor = _open_regular_at(parent_fd, temp_name)
+                    temp_observed = os.fstat(descriptor)
+                    temp_digest = hashlib.sha256(
+                        _read_fd_bytes(descriptor)
+                    ).hexdigest()
+                    owner_ok = (
+                        destination_uid is None
+                        or temp_observed.st_uid == destination_uid
+                    )
+                    group_ok = (
+                        destination_gid is None
+                        or temp_observed.st_gid == destination_gid
+                    )
+                    if (
+                        stat.S_IMODE(temp_observed.st_mode) != 0o600
+                        or not owner_ok
+                        or not group_ok
+                        or temp_digest != digest
+                    ):
+                        raise CredentialImportError(
+                            "credential fallback temp does not match journal authority"
+                        )
+                    os.replace(
+                        temp_name,
+                        destination_name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    published = True
+                    os.fsync(parent_fd)
+                    _assert_fd_path_binding(
+                        destination, descriptor, directory=False
+                    )
+                    os.close(descriptor)
+                    descriptor = None
+                    persist_completion(pending)
+                    return metadata
+
+        named_fallback = temp_name is not None
+        if not named_fallback:
+            descriptor = _open_unnamed_credential_tmpfile(parent_fd)
+            named_fallback = descriptor is None
+        if named_fallback:
+            if temp_name is None:
+                temp_name = _credential_temp_name(destination_name, digest)
+                assert isinstance(pending, MutableMapping)
+                pending["temp_name"] = temp_name
+                try:
+                    receipt._persist()
+                except OSError as exc:
+                    raise CredentialImportError(
+                        "credential receipt persistence failed"
+                    ) from exc
+            descriptor = os.open(
+                temp_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0,
+                dir_fd=parent_fd,
+            )
+        assert descriptor is not None
+        with os.fdopen(os.dup(descriptor), "wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, destination)
-        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        if destination_uid is not None and destination_gid is not None:
+            os.fchown(descriptor, destination_uid, destination_gid)
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        if named_fallback:
+            assert isinstance(temp_name, str)
+            os.replace(
+                temp_name,
+                destination_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        else:
+            _publish_credential_tmpfile(descriptor, parent_fd, destination_name)
+        published = True
+        os.fsync(parent_fd)
+        _assert_fd_path_binding(destination, descriptor, directory=False)
+    except UnsafeInstallPathError as exc:
+        if published and descriptor is not None:
+            try:
+                current = os.stat(
+                    destination_name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                held = os.fstat(descriptor)
+                if (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino):
+                    os.unlink(destination_name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            except OSError:
+                pass
+        raise CredentialImportError(
+            "credential destination changed during write"
+        ) from exc
     except OSError as exc:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        try:
-            temporary_path.unlink()
-        except OSError:
-            pass
         raise CredentialImportError("credential destination write failed") from exc
-    except BaseException:
-        try:
+    finally:
+        if descriptor is not None:
             os.close(descriptor)
-        except OSError:
-            pass
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+        os.close(parent_fd)
     persist_completion(pending)
     return metadata
 

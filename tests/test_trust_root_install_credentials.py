@@ -335,9 +335,12 @@ def test_credential_destination_os_error_uses_fixed_redacted_category(
     source.write_text('{"token":"test-secret"}', encoding="utf-8")
     destination_root = tmp_path / "private-destination-name"
 
-    def fail_replace(_source, destination):
+    def fail_replace(_source, destination, **_kwargs):
         raise OSError(f"cannot replace private path {destination}")
 
+    monkeypatch.setattr(
+        install_core, "_open_unnamed_credential_tmpfile", lambda _parent_fd: None
+    )
     monkeypatch.setattr(install_core.os, "replace", fail_replace)
 
     with pytest.raises(CredentialImportError) as exc:
@@ -487,6 +490,185 @@ def test_live_credential_validation_redacts_destination_path(tmp_path: Path) -> 
 
     assert failures == ("builder/codex unavailable",)
     assert str(private_home) not in " ".join(failures)
+
+
+def test_credential_import_does_not_follow_swapped_destination_ancestor(
+    tmp_path: Path,
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "auth.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    destination_root = tmp_path / "credential-home"
+    destination_root.mkdir()
+    displaced = tmp_path / "displaced-credential-home"
+    external_root = tmp_path / "external-home"
+    external_root.mkdir()
+    original_persist = receipt._persist
+    swapped = False
+
+    def persist_and_swap() -> None:
+        nonlocal swapped
+        original_persist()
+        if not swapped:
+            destination_root.rename(displaced)
+            destination_root.symlink_to(external_root, target_is_directory=True)
+            swapped = True
+
+    receipt._persist = persist_and_swap  # type: ignore[method-assign]
+
+    with pytest.raises(CredentialImportError, match="changed|destination"):
+        import_credential(
+            receipt,
+            principal="builder",
+            provider="codex",
+            source=source,
+            destination_root=destination_root,
+        )
+
+    assert swapped
+    assert list(external_root.rglob("*")) == []
+    assert not (displaced / ".codex/auth.json").exists()
+
+
+def test_credential_unnamed_tmpfile_crash_leaves_no_readable_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "auth.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    destination_root = tmp_path / "installed"
+
+    def crash_before_publish(*_args, **_kwargs):
+        raise KeyboardInterrupt("simulated SIGKILL boundary")
+
+    monkeypatch.setattr(
+        install_core,
+        "_publish_credential_tmpfile",
+        crash_before_publish,
+        raising=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="SIGKILL"):
+        import_credential(
+            receipt,
+            principal="builder",
+            provider="codex",
+            source=source,
+            destination_root=destination_root,
+        )
+
+    credential_parent = destination_root / ".codex"
+    assert credential_parent.is_dir()
+    assert list(credential_parent.iterdir()) == []
+    pending = receipt.to_dict()["credential_journal"]
+    assert len(pending) == 1
+    assert "temp_name" not in pending[0]
+
+
+def test_credential_named_temp_fallback_is_journaled_and_replayable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "auth.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    destination_root = tmp_path / "installed"
+    real_replace = os.replace
+    publish_calls = 0
+
+    monkeypatch.setattr(
+        install_core,
+        "_open_unnamed_credential_tmpfile",
+        lambda _parent_fd: None,
+        raising=False,
+    )
+
+    def crash_first_publish(source_name, destination_name, *args, **kwargs):
+        nonlocal publish_calls
+        publish_calls += 1
+        if publish_calls == 1:
+            raise KeyboardInterrupt("simulated fallback publish crash")
+        return real_replace(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(install_core.os, "replace", crash_first_publish)
+
+    with pytest.raises(KeyboardInterrupt, match="fallback publish crash"):
+        import_credential(
+            receipt,
+            principal="builder",
+            provider="codex",
+            source=source,
+            destination_root=destination_root,
+        )
+
+    pending = receipt.to_dict()["credential_journal"]
+    assert len(pending) == 1
+    temp_name = pending[0]["temp_name"]
+    assert isinstance(temp_name, str)
+    assert (destination_root / ".codex" / temp_name).is_file()
+
+    metadata = import_credential(
+        receipt,
+        principal="builder",
+        provider="codex",
+        source=source,
+        destination_root=destination_root,
+    )
+
+    assert receipt.to_dict()["credentials"] == [metadata.to_dict()]
+    assert receipt.to_dict()["credential_journal"] == []
+    assert not (destination_root / ".codex" / temp_name).exists()
+
+
+def test_rollback_cleans_hash_bound_named_credential_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt()
+    source = tmp_path / "auth.json"
+    source.write_text('{"token":"test-secret"}', encoding="utf-8")
+    destination_root = tmp_path / "cortex-builder"
+    receipt._document["plan"]["accounts"] = [  # type: ignore[index]
+        {
+            "name": "cortex-builder",
+            "home": str(destination_root),
+            "uid": os.getuid(),
+            "gid": os.getgid(),
+        }
+    ]
+    monkeypatch.setattr(
+        install_core,
+        "_open_unnamed_credential_tmpfile",
+        lambda _parent_fd: None,
+    )
+    monkeypatch.setattr(
+        install_core.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("simulated fallback publish crash")
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="fallback publish crash"):
+        import_credential(
+            receipt,
+            principal="builder",
+            provider="codex",
+            source=source,
+            destination_root=destination_root,
+            destination_uid=os.getuid(),
+            destination_gid=os.getgid(),
+        )
+
+    temp_name = receipt.to_dict()["credential_journal"][0]["temp_name"]
+    temp_path = destination_root / ".codex" / temp_name
+    assert temp_path.is_file()
+
+    report = rollback_receipt(
+        receipt, backend=LocalInstallBackend(require_root=False)
+    )
+
+    assert report.retained_drift == ()
+    assert not temp_path.exists()
+    assert receipt.to_dict()["credential_journal"] == []
 
 
 def test_successful_start_order_is_still_unverified_not_qualified() -> None:
