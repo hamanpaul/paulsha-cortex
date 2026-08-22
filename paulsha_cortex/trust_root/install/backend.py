@@ -1233,168 +1233,160 @@ def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object])
     )
 
 
-def _sudoers_logical_lines(policy: str) -> tuple[str, ...]:
-    lines: list[str] = []
-    pending = ""
-    for physical in policy.splitlines():
-        stripped = physical.strip()
-        if re.match(r"^#include(?:dir)?\s+", stripped):
-            line = stripped
-        else:
-            line = physical.split("#", 1)[0].strip()
-        if not line and not pending:
+def _sudoers_authenticate_setting(
+    row: Mapping[str, object],
+) -> tuple[bool, bool | None]:
+    options = row.get("Options", [])
+    if not isinstance(options, list):
+        return False, None
+    setting: bool | None = None
+    for option in options:
+        if not isinstance(option, Mapping):
+            return False, None
+        if "authenticate" not in option:
             continue
-        continued = line.endswith("\\")
-        fragment = line[:-1].rstrip() if continued else line
-        pending = f"{pending} {fragment}".strip()
-        if not continued and pending:
-            lines.append(pending)
-            pending = ""
-    if pending:
-        lines.append(pending)
-    return tuple(lines)
+        value = option.get("authenticate")
+        if not isinstance(value, bool):
+            return False, None
+        setting = value
+    return True, setting
 
 
-def _sudoers_policies_have_universal_nopasswd(policies: Sequence[str]) -> bool:
-    """Evaluate direct/aliased host and command ALL grants."""
+def _sudoers_host_list_is_universal(hosts: object) -> tuple[bool, bool]:
+    if not isinstance(hosts, list) or not hosts:
+        return False, False
+    universal = False
+    for host in hosts:
+        if not isinstance(host, Mapping):
+            return False, False
+        negated = host.get("negated", False)
+        if not isinstance(negated, bool):
+            return False, False
+        if negated:
+            return True, False
+        hostname = host.get("hostname")
+        if isinstance(hostname, str):
+            universal = universal or hostname == "ALL" or not hostname.strip("*?")
+            continue
+        network = host.get("networkaddr")
+        if isinstance(network, str):
+            universal = universal or network.endswith("/0")
+            continue
+        netgroup = host.get("netgroup")
+        if isinstance(netgroup, str):
+            continue
+        return False, False
+    return True, universal
 
-    lines = tuple(
-        line for policy in policies for line in _sudoers_logical_lines(policy)
-    )
-    command_aliases: dict[str, str] = {}
-    host_aliases: dict[str, str] = {}
-    for line in lines:
-        match = re.match(
-            r"^(Cmnd|Host)_Alias\s+([A-Z][A-Z0-9_]*)\s*=\s*(.+)$", line
+
+def _sudoers_commands_are_universal(commands: object) -> tuple[bool, bool]:
+    if not isinstance(commands, list) or not commands:
+        return False, False
+    universal = False
+    for command in commands:
+        if not isinstance(command, Mapping):
+            return False, False
+        negated = command.get("negated", False)
+        if not isinstance(negated, bool):
+            return False, False
+        if negated:
+            return True, False
+        value = command.get("command")
+        if not isinstance(value, str):
+            return False, False
+        universal = universal or value == "ALL"
+    return True, universal
+
+
+def _sudoers_document_has_universal_noauth(document: object) -> bool:
+    """Evaluate only validated, alias-expanded cvtsudoers JSON."""
+
+    if not isinstance(document, Mapping):
+        return True
+    defaults = document.get("Defaults", [])
+    specs = document.get("User_Specs", [])
+    if not isinstance(defaults, list) or not isinstance(specs, list):
+        return True
+
+    default_noauth = False
+    for default in defaults:
+        if not isinstance(default, Mapping):
+            return True
+        valid, authenticate = _sudoers_authenticate_setting(default)
+        if not valid:
+            return True
+        if default.get("Binding") is None and authenticate is not None:
+            default_noauth = not authenticate
+        elif authenticate is False:
+            # Scoped Defaults are conservatively relevant unless an explicit
+            # PASSWD tag on the command spec proves otherwise.
+            default_noauth = True
+
+    for spec in specs:
+        if not isinstance(spec, Mapping):
+            return True
+        valid_hosts, universal_hosts = _sudoers_host_list_is_universal(
+            spec.get("Host_List")
         )
-        if match:
-            aliases = command_aliases if match.group(1) == "Cmnd" else host_aliases
-            name = match.group(2)
-            if name in aliases:
+        command_specs = spec.get("Cmnd_Specs")
+        if not valid_hosts or not isinstance(command_specs, list):
+            return True
+        if not universal_hosts:
+            continue
+        for command_spec in command_specs:
+            if not isinstance(command_spec, Mapping):
                 return True
-            aliases[name] = match.group(3).strip()
-
-    def scope(
-        expression: str,
-        aliases: Mapping[str, str],
-        resolving: frozenset[str] = frozenset(),
-    ) -> str:
-        tokens = [token.strip() for token in expression.split(",") if token.strip()]
-        if not tokens:
-            return "limited"
-        has_exclusion = False
-        has_all = False
-        for raw_token in tokens:
-            has_exclusion = has_exclusion or raw_token.startswith("!")
-            token = raw_token.lstrip("!").strip().split(maxsplit=1)[0]
-            if token == "ALL":
-                has_all = True
-                continue
-            if token not in aliases:
-                continue
-            if token in resolving:
-                return "unsafe"
-            resolved = scope(aliases[token], aliases, resolving | {token})
-            if resolved == "unsafe":
-                return "unsafe"
-            has_all = has_all or resolved == "all"
-        if has_exclusion:
-            return "limited"
-        return "all" if has_all else "limited"
-
-    for line in lines:
-        if re.match(r"^(?:Cmnd|Host)_Alias\b", line) or line.startswith(
-            ("Defaults", "@include", "#include")
-        ):
-            continue
-        left, separator, right = line.partition("=")
-        if not separator:
-            continue
-        left = re.sub(r"\s*,\s*", ",", left.strip())
-        subjects = left.rsplit(maxsplit=1)
-        if len(subjects) != 2:
-            continue
-        host_scope = scope(subjects[1], host_aliases)
-        if host_scope == "limited":
-            continue
-        command_spec = re.sub(r"^\([^)]*\)\s*", "", right.strip())
-        tags = list(re.finditer(r"\b(?:NO)?PASSWD\s*:\s*", command_spec))
-        for index, tag in enumerate(tags):
-            if not tag.group(0).lstrip().startswith("NOPASSWD"):
-                continue
-            end = tags[index + 1].start() if index + 1 < len(tags) else len(command_spec)
-            if any(
-                not later.group(0).lstrip().startswith("NOPASSWD")
-                for later in tags[index + 1 :]
+            valid_commands, universal_commands = _sudoers_commands_are_universal(
+                command_spec.get("Commands")
+            )
+            valid_auth, authenticate = _sudoers_authenticate_setting(command_spec)
+            if not valid_commands or not valid_auth:
+                return True
+            if universal_commands and (
+                authenticate is False
+                or (authenticate is None and default_noauth)
             ):
-                continue
-            if scope(command_spec[tag.end() : end], command_aliases) in {
-                "all",
-                "unsafe",
-            }:
                 return True
     return False
 
 
-def _sudoers_policy_has_universal_nopasswd(policy: str) -> bool:
-    return _sudoers_policies_have_universal_nopasswd((policy,))
-
-
-def _authoritative_sudoers_policies(sudoers: Path) -> tuple[str, ...]:
-    policies: list[str] = []
-    visited: set[Path] = set()
-    active: set[Path] = set()
-
-    def visit(candidate: Path) -> None:
-        canonical = Path(os.path.abspath(candidate))
-        if canonical in active:
-            raise InstallDriftError("sudoers include cycle")
-        if canonical in visited:
-            return
-        observed = canonical.lstat()
-        if canonical.is_symlink() or not stat.S_ISREG(observed.st_mode):
-            raise InstallDriftError("sudoers include is not a regular file")
-        policy = canonical.read_text(encoding="utf-8", errors="replace")
-        active.add(canonical)
-        try:
-            for line in _sudoers_logical_lines(policy):
-                match = re.match(r"^(?:#|@)include(dir)?\s+(.+?)\s*$", line)
-                if not match:
-                    continue
-                target = Path(match.group(2))
-                if not target.is_absolute():
-                    raise InstallDriftError("sudoers include path is not absolute")
-                if match.group(1) != "dir":
-                    visit(target)
-                    continue
-                directory_state = target.lstat()
-                if target.is_symlink() or not stat.S_ISDIR(directory_state.st_mode):
-                    raise InstallDriftError("sudoers includedir is not a directory")
-                for child in sorted(target.iterdir(), key=lambda row: row.name):
-                    if "." in child.name or child.name.endswith("~"):
-                        continue
-                    child_state = child.lstat()
-                    if child.is_symlink() or not stat.S_ISREG(child_state.st_mode):
-                        raise InstallDriftError(
-                            "sudoers includedir entry is not a regular file"
-                        )
-                    visit(child)
-        finally:
-            active.remove(canonical)
-        visited.add(canonical)
-        policies.append(policy)
-
-    visit(sudoers)
-    return tuple(policies)
-
-
 def _universal_nopasswd(sudoers: Path = Path("/etc/sudoers")) -> bool:
-    policies: list[str] = []
     try:
-        policies.extend(_authoritative_sudoers_policies(sudoers))
-    except (OSError, InstallDriftError):
+        observed = sudoers.lstat()
+    except OSError:
         return True
-    return _sudoers_policies_have_universal_nopasswd(policies)
+    if sudoers.is_symlink() or not sudoers.is_absolute() or not stat.S_ISREG(
+        observed.st_mode
+    ):
+        return True
+    visudo = shutil.which("visudo")
+    converter = shutil.which("cvtsudoers")
+    if visudo is None or converter is None:
+        return True
+    environment = {"LANG": "C", "LC_ALL": "C", "PATH": os.defpath}
+    try:
+        validated = _run(
+            (visudo, "-c", "-f", str(sudoers)),
+            env=environment,
+        )
+    except OSError:
+        return True
+    if validated.returncode != 0:
+        return True
+    try:
+        converted = _run(
+            (converter, "-f", "json", "-e", str(sudoers)),
+            env=environment,
+        )
+    except OSError:
+        return True
+    if converted.returncode != 0:
+        return True
+    try:
+        document = json.loads(converted.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return True
+    return _sudoers_document_has_universal_noauth(document)
 
 
 def _password_locked(name: str) -> bool | None:

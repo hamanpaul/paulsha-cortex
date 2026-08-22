@@ -1323,63 +1323,141 @@ def test_missing_getfacl_binary_is_not_reported_as_an_empty_acl(
     assert calls == []
 
 
-def test_sudoers_parser_resolves_universal_command_alias_across_continuations() -> None:
-    policy = """
-Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true
-Cmnd_Alias ROOT_COMMANDS = \\
-    LIMITED, \\
-    ALL
-%operators ALL=(ALL:ALL) NOPASSWD: ROOT_COMMANDS
-"""
-
-    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
-
-
-def test_sudoers_parser_does_not_treat_limited_alias_as_universal() -> None:
-    policy = """
-Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true
-%operators ALL=(ALL:ALL) NOPASSWD: LIMITED
-"""
-
-    assert not backend_module._sudoers_policy_has_universal_nopasswd(policy)
+def _write_visudo_valid_fixture(tmp_path: Path, policy: str) -> Path:
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text(policy, encoding="utf-8")
+    visudo = shutil.which("visudo")
+    assert visudo is not None, "sudo package must provide visudo"
+    validated = subprocess.run(
+        (visudo, "-c", "-f", str(sudoers)),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validated.returncode == 0, validated.stderr or validated.stdout
+    return sudoers
 
 
-def test_sudoers_parser_resolves_host_alias_to_all() -> None:
-    policy = """
-Host_Alias LOCAL = ALL
-%operators LOCAL=(ALL) NOPASSWD: ALL
-"""
+def test_sudoers_detector_catches_blanket_noauth_in_colon_host_spec(
+    tmp_path: Path,
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "%operators buildhost=(ALL) /usr/bin/id : "
+        "ALL=(ALL) NOPASSWD: ALL\n",
+    )
 
-    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
-
-
-def test_sudoers_parser_resolves_recursive_host_aliases() -> None:
-    policy = """
-Host_Alias EDGE = LOCAL
-Host_Alias LOCAL = ALL
-%operators EDGE=(ALL) NOPASSWD: ALL
-"""
-
-    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
+    assert backend_module._universal_nopasswd(sudoers)
 
 
-def test_sudoers_parser_fails_closed_on_referenced_host_alias_cycle() -> None:
-    policy = """
-Host_Alias FIRST = SECOND
-Host_Alias SECOND = FIRST
-%operators FIRST=(ALL) NOPASSWD: ALL
-"""
+def test_sudoers_detector_catches_defaults_noauth_for_blanket_authority(
+    tmp_path: Path,
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Defaults !authenticate\n"
+        "%operators ALL=(ALL) ALL\n",
+    )
 
-    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
+    assert backend_module._universal_nopasswd(sudoers)
 
 
-def test_sudoers_parser_does_not_treat_limited_host_alias_as_universal() -> None:
-    policy = """
-Host_Alias LOCAL = buildhost
-%operators LOCAL=(ALL) NOPASSWD: ALL
-"""
+@pytest.mark.parametrize("host", ["*", "0.0.0.0/0", "::/0"])
+def test_sudoers_detector_catches_blanket_noauth_on_universal_host_expression(
+    tmp_path: Path, host: str
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        f"%operators {host}=(ALL) NOPASSWD: ALL\n",
+    )
 
-    assert not backend_module._sudoers_policy_has_universal_nopasswd(policy)
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_honors_explicit_passwd_override(
+    tmp_path: Path,
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Defaults !authenticate\n"
+        "%operators ALL=(ALL) PASSWD: ALL\n",
+    )
+
+    assert not backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_resolves_universal_command_alias_across_continuations(
+    tmp_path: Path,
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true\n"
+        "Cmnd_Alias ROOT_COMMANDS = \\\n"
+        "    LIMITED, \\\n"
+        "    ALL\n"
+        "%operators ALL=(ALL:ALL) NOPASSWD: ROOT_COMMANDS\n",
+    )
+
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_does_not_treat_limited_alias_as_universal(
+    tmp_path: Path,
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true\n"
+        "%operators ALL=(ALL:ALL) NOPASSWD: LIMITED\n",
+    )
+
+    assert not backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_resolves_host_alias_to_all(tmp_path: Path) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Host_Alias LOCAL = ALL\n"
+        "%operators LOCAL=(ALL) NOPASSWD: ALL\n",
+    )
+
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_resolves_recursive_host_aliases(tmp_path: Path) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Host_Alias LOCAL = ALL\n"
+        "Host_Alias EDGE = LOCAL\n"
+        "%operators EDGE=(ALL) NOPASSWD: ALL\n",
+    )
+
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_fails_closed_on_referenced_host_alias_cycle(
+    tmp_path: Path,
+) -> None:
+    sudoers = tmp_path / "sudoers"
+    sudoers.write_text(
+        "Host_Alias FIRST = SECOND\n"
+        "Host_Alias SECOND = FIRST\n"
+        "%operators FIRST=(ALL) NOPASSWD: ALL\n",
+        encoding="utf-8",
+    )
+
+    assert backend_module._universal_nopasswd(sudoers)
+
+
+def test_sudoers_detector_does_not_treat_limited_host_alias_as_universal(
+    tmp_path: Path,
+) -> None:
+    sudoers = _write_visudo_valid_fixture(
+        tmp_path,
+        "Host_Alias LOCAL = buildhost\n"
+        "%operators LOCAL=(ALL) NOPASSWD: ALL\n",
+    )
+
+    assert not backend_module._universal_nopasswd(sudoers)
 
 
 @pytest.mark.parametrize("directive", ["@include", "#include"])
