@@ -548,6 +548,21 @@ def test_first_install_adopts_exact_empty_managed_state_mount(tmp_path: Path) ->
     assert backend.applied == [step["step_id"]]
     assert receipt.to_dict()["journal"][0]["adopted_mount_root"] is True
 
+    rollback_receipt(receipt, backend=backend)
+    retained = deepcopy(backend.states[step["step_id"]])
+    retained["children"] = ["durable-child"]
+    backend.states[step["step_id"]] = retained
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.applied == [step["step_id"], step["step_id"]]
+    assert receipt.to_dict()["journal"][0]["adopted_from_receipt"] is True
+
 
 @pytest.mark.parametrize(
     ("is_mountpoint", "children"),

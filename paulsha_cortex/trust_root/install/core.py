@@ -1568,6 +1568,14 @@ def _step_has_receipt_provenance(
                 and (
                     prior.get("exists") is False
                     or entry.get("adopted_from_receipt") is True
+                    or (
+                        entry.get("adopted_mount_root") is True
+                        and _explicit_empty_managed_mount_is_adoptable(
+                            plan=plan,
+                            step=step,
+                            installed=prior,
+                        )
+                    )
                 )
             ):
                 return True
