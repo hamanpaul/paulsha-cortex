@@ -889,7 +889,7 @@ class CompleteTickVerificationTests(unittest.TestCase):
             worktree = root / "candidate"
             worktree.mkdir()
             job = _make_job(reg, "slice-f", worktree=str(worktree))
-            _create_slice(reg, root, job, docs_class="code")
+            contract_hash = _create_slice(reg, root, job, docs_class="code")["verification"]["hash"]
             disp = FakeDispatcher(reg, poll_map={job["job_id"]: "exited"})
             hdir = root / "handoff"
 
@@ -903,9 +903,46 @@ class CompleteTickVerificationTests(unittest.TestCase):
                 verification_runner=boom,
             )
             manifest = json.loads((hdir / "slice-f.json").read_text(encoding="utf-8"))
+            slice_row = reg.get_slice("slice-f")
             self.assertEqual(manifest["gate_status"], "needs_human")
             self.assertEqual(manifest["gate_reason"], "verification-runner-error")
+            self.assertEqual(slice_row["verification"]["hash"], contract_hash)
+            self.assertEqual(
+                slice_row["current_verification_evidence_hash"],
+                manifest["verification_evidence_hash"],
+            )
             self.assertFalse(manager.autonomy.default_is_satisfied("slice-f", handoff_dir=str(hdir)))
+
+    def test_verification_result_keeps_contract_hash_separate_from_evidence_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = _reg(d)
+            root = Path(d)
+            worktree = root / "candidate"
+            worktree.mkdir()
+            job = _make_job(reg, "slice-contract-evidence", worktree=str(worktree))
+            slice_row = _create_slice(reg, root, job, docs_class="code")
+            contract_hash = slice_row["verification"]["hash"]
+            evidence = manager.verification.write_verification_evidence(
+                {
+                    "schema_version": 1,
+                    "slice_id": "slice-contract-evidence",
+                    "candidate": "b" * 40,
+                    "status": "reviewing",
+                    "summary": "verification-succeeded",
+                    "details": {"ok": True},
+                },
+                coordinator_root=root,
+            )
+
+            manager._apply_verification_result(reg, "slice-contract-evidence", evidence)
+
+            updated = reg.get_slice("slice-contract-evidence")
+            self.assertEqual(updated["verification"]["hash"], contract_hash)
+            self.assertEqual(updated["current_verification_evidence_hash"], evidence["hash"])
+            self.assertEqual(
+                manager._current_verification_ref(updated),
+                (evidence["path"], evidence["hash"]),
+            )
 
     def test_invalid_runner_candidate_payload_marks_needs_human(self) -> None:
         with tempfile.TemporaryDirectory() as d:

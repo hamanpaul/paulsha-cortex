@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **#501 修復 verification contract hash 被 evidence hash 覆寫**：slice registry 將 pinned
+  contract hash 與 current verification evidence hash 分欄保存；verification/status evidence
+  不再污染 pinned contract，既有被覆寫的 state row 會在載入時可判定地復原。
+
 - Preserve exact template-instance authority during isolated Codex credential
   harvest in the Trust-root Phase 2 runtime path, joining persisted instances
   byte-for-byte while keeping raw job-id fallback separate for legacy callers.
