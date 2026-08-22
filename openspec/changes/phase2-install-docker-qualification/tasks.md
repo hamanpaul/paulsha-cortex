@@ -13,30 +13,30 @@ work_item: phase2-install-docker-qualification
 
 ## 2. Trust-root install flow (TDD)
 
-- [ ] [RED] plan schema/canonical hash、secret/path rejection、four-way config、bundle/wheel identity tests。
-- [ ] [GREEN] `cortex install trust-root plan` 與 canonical desired-state model。
-- [ ] [RED] preflight、account collision、symlink escape、ACL order、partial replay、idempotency tests。
-- [ ] [GREEN] root-gated apply transaction、receipt journal、atomic venv slots、safe adoption。
-- [ ] [RED] credential whitelist/redaction/atomic import 與 activation guard tests。
-- [ ] [GREEN] provider adapters、credential receipt metadata、egress→Manager→Monitor activation/compensation。
-- [ ] [RED] generated-installed functional/comment drift、verify evidence、safe rollback tests。
-- [ ] [GREEN] inventory attestation、verify JSON/evidence 與 receipt-bounded rollback。
-- [ ] 保留 `cortex install service`；bootstrap 僅提示 trust-root，不 sudo、不搬憑證。
+- [x] [RED] plan schema/canonical hash、secret/path rejection、four-way config、bundle/wheel identity tests。
+- [x] [GREEN] `cortex install trust-root plan` 與 canonical desired-state model。
+- [x] [RED] preflight、account collision、symlink escape、ACL order、partial replay、idempotency tests。
+- [x] [GREEN] root-gated apply transaction、receipt journal、atomic venv slots、safe adoption。
+- [x] [RED] credential whitelist/redaction/atomic import 與 activation guard tests。
+- [x] [GREEN] provider adapters、credential receipt metadata、egress→Manager→Monitor activation/compensation。
+- [x] [RED] generated-installed functional/comment drift、verify evidence、safe rollback tests。
+- [x] [GREEN] inventory attestation、verify JSON/evidence 與 receipt-bounded rollback。
+- [x] 保留 `cortex install service`；bootstrap 僅提示 trust-root，不 sudo、不搬憑證。
 
 ## 3. Docker qualification (TDD)
 
-- [ ] [RED] image/harness contract tests：Ubuntu 24.04、systemd PID 1、cgroup/tmpfs、禁止敏感 mounts、artifact-only install。
-- [ ] [GREEN] reference Dockerfile、entrypoint/local harness、fresh/idempotent/drift/rollback/reinstall stages。
-- [ ] [GREEN] selfcheck、registry equation、attestation、identity/hardening、R9 五族 attack/negative-control stages。
-- [ ] [GREEN] provider/model preflight、單次 Codex smoke、agy Gemini 3.7 Flash high、Copilot GPT-5.4 xhigh 與 terminal E2E hooks。
-- [ ] [GREEN] Manager GitHub credential-helper auth/dry-run push probe（不得改 remote ref）。
-- [ ] [GREEN] canonical `qualification.json`、redacted logs、artifact/service/provider hashes。
+- [x] [RED] image/harness contract tests：Ubuntu 24.04、systemd PID 1、cgroup/tmpfs、禁止敏感 mounts、artifact-only install。
+- [x] [GREEN] reference Dockerfile、entrypoint/local harness、fresh/idempotent/drift/rollback/reinstall stages。
+- [x] [GREEN] selfcheck、registry equation、attestation、identity/hardening、R9 五族 attack/negative-control stages。
+- [x] [GREEN] provider/model preflight、單次 Codex smoke、agy Gemini 3.7 Flash high、Copilot GPT-5.4 xhigh 與 terminal E2E hooks。
+- [x] [GREEN] Manager GitHub credential-helper auth/dry-run push probe（不得改 remote ref）。
+- [x] [GREEN] canonical `qualification.json`、redacted logs、artifact/service/provider hashes。
 
 ## 4. CI and release gates
 
-- [ ] 新增只允許 `workflow_dispatch` 的 RC qualification workflow，RC secrets 僅掛 protected environment。
-- [ ] 修改 release workflow：建立 Release 前下載、驗證同 commit qualification evidence 與 wheel hash；缺失/過期/不一致失敗。
-- [ ] 新增/修改 workflows 的 `uses:` 全部 40-hex pin；保留 Python 3.10–3.13、full pytest、build、twine、clean-wheel smoke。
+- [x] 新增只允許 `workflow_dispatch` 的 RC qualification workflow，RC secrets 僅掛 protected environment。
+- [x] 修改 release workflow：建立 Release 前下載、驗證同 commit qualification evidence 與 wheel hash；缺失/過期/不一致失敗。
+- [x] 新增/修改 workflows 的 `uses:` 全部 40-hex pin；保留 Python 3.10–3.13、full pytest、build、twine、clean-wheel smoke。
 
 ## 5. Verification and closeout
 

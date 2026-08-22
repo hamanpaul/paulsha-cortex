@@ -92,10 +92,10 @@ closed。D6 不接受 residual-risk waiver。
 ## Qualification blocker observed on 2026-08-22
 
 The disposable Docker run for candidate
-`f884cd37aed3968460490892a757b633a0c47ec6` passed exact artifact verification,
+`e052c76d825480226ab868c5c055527cba113640` passed exact artifact verification,
 fresh apply, idempotent apply, functional-drift rejection, rollback/reinstall,
 credential import, activation, generated-installed attestation, service identity,
-and the capability probes. It then stopped before every provider smoke with:
+and the Tier-1 capability probe. It then stopped before every provider smoke with:
 
 ```text
 durable-state/repo-worktree:delete did not return an allowed denial as cortex-builder: rc=0
