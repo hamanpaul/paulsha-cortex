@@ -65,29 +65,39 @@ installed polkit rule also matched (SHA-256
 `c8fd053183d93df55ea0bc7934d09e28a8222a2ba80a60f02c7da087dae98f9a`), verified
 as root because the policy file is root-readable only.
 
-## Codex quota boundary and remaining task
+## Historical provider-quota boundary
 
-Historical Cortex builder cards used `codex/gpt-5.6-luna` and completed with
-recorded usage. A fresh normal-Codex recovery dispatch reached the provider but
-was rejected by the provider usage limit (reported reset: 2026-08-27 11:36).
-Per operator instruction, no retry was made and no successful normal-Codex turn
-under this final deployment is claimed. Consequently the conjunctive live task
-for “persistence, normal Codex start, auth-refresh, and generated-vs-installed”
-remains unchecked until a later quota window; the other three live evidence
-parts are recorded above.
+Before the Manager verification below, a fresh normal-Codex recovery dispatch
+reached the provider but was rejected by the provider usage limit (reported
+reset: 2026-08-27 11:36). That historical observation is superseded by the
+successful Manager terminal record below. The stale pre-merge Cortex workflow
+`workflow-16f4188674d36ab8809a` was retired through the supported
+`retire-delivered` action after PR #783 was confirmed merged. No workflow JSON
+or service state was edited by hand.
 
-The stale pre-merge Cortex workflow `workflow-16f4188674d36ab8809a` was retired
-through the supported `retire-delivered` action after PR #783 was confirmed
-merged. No workflow JSON or service state was edited by hand.
+## Manager-verified final normal-Codex closure
 
-## Final normal-Codex Cortex slice candidate
+The Manager independently verified the final normal-Codex terminal slice through
+its lifecycle:
 
-- `PSC_SLICE_ID`: `phase2-final-live-codex-v6`
-- Declared executor/model: `codex/gpt-5.6-luna`
-- Declared reasoning effort: `reasoning_effort: `max``
-- Status: `manager-terminal-verification-pending`
+- Job: `phase2-final-live-codex-v6-156`
+- Candidate target commit: `f4fedef6c7e48e1b9ef57f020be1b24c4cd51945`
+- Executor/model: `codex/gpt-5.6-luna`
+- `reasoning_effort`: `max`
+- Runtime mode: `systemd-template`
+- Runtime principal/surface: `builder` / `builder-codex-home`
+- Template instance: `phase2-final-live-codex-v6-c7ca9bc0`
+- Terminal exit code: `0`
+- `credential_publish`: `true`
+- `runtime_diagnostic`: `null`
+- `provider_outcome`: `null`
+- Manager slice/gate state: `completed` / `passed`
+- Manager completion reason: `completion-recorded`
+- Verification status: `verified` (`verification-succeeded`)
 
-This is a candidate observation only. The Manager must independently bind it to
-a successful terminal job record before the final conjunctive task may be
-checked. This section does not check the open task or claim a successful
-normal-Codex start from inside the builder.
+The authoritative Manager records are the completion record at
+`/var/lib/cortex/coordinator/evidence/completion/phase2-final-live-codex-v6-f4fedef6c7e48e1b9ef57f020be1b24c4cd51945.json`
+and the verification record at
+`/var/lib/cortex/coordinator/evidence/verification/phase2-final-live-codex-v6-f4fedef6c7e48e1b9ef57f020be1b24c4cd51945.json`.
+Together with the three live probe results above, these records close the
+conjunctive Phase 2 live gate.
