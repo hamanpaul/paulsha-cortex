@@ -12,7 +12,7 @@
 - [x] Extend the single structured trust-root surface table with real R1 runtime-root assets and derive production template-unit, permission-plan, replica/run-under, canonical path, provisioning ACL, and probe output from it.
 - [x] Update commit, event, verdict, ledger, and gate-worktree producers/consumers to use the digest-bearing systemd instance slot selected from Manager job identity.
 - [x] Replace the cross-`ReadWritePaths` job-log hard link with the Manager-preseeded canonical job-log surface plus an explicit Manager-only completion-control anchor; keep the generated unit contract and service-namespace `EXDEV` regression probe aligned.
-- [ ] Deploy generated units and run two-principal own/foreign byte-identity probes; this remains Manager/operator work and is not source-test evidence.
+- [x] Deploy generated units and run two-principal own/foreign byte-identity probes; this remains Manager/operator work and is not source-test evidence.
 
 ## Task 3: Make Codex control inputs immutable without breaking refresh
 
@@ -31,3 +31,8 @@
 - [x] Derive isolated Codex credential harvest from typed launch/runtime surface metadata; missing slot, authority, identity, or harvest now persists a runtime diagnostic and cannot be classified as provider failure, while builder/reviewer direct, isolated, success, failure, and non-Codex lanes remain free of Codex harvest.
 - [x] Use the canonical surface row ACL recipe for runtime slot/control projection and copy only regular files/directories with normalized modes and atomic publication; mechanically reject source symlink/special/xattr/hardlink carry-over and retain live own/foreign probes as pending.
 - [ ] Run the live two-job persistence, normal Codex start, auth-refresh write, and generated-vs-installed probes under deployed hardening.
+
+> Operator evidence on 2026-08-22 records the persistence, auth-refresh, and
+> generated-vs-installed probes as passing. A normal Codex turn was not retried
+> after the provider usage-limit response, so this conjunctive task remains
+> intentionally open.
