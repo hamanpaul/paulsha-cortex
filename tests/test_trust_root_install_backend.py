@@ -536,6 +536,54 @@ def test_directory_acl_attestation_accounts_for_posix_mask(
     assert backend.apply_step(step)["installed_sha256"] == step["desired_sha256"]
 
 
+@pytest.mark.parametrize("asset_type", ["file", "directory"])
+def test_new_asset_checkpoints_exact_inode_before_followup_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    asset_type: str,
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / f"managed-{asset_type}"
+    step = {
+        "step_id": f"asset:{asset_type}",
+        "kind": "asset",
+        "asset_type": asset_type,
+        "path": str(path),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [],
+    }
+    if asset_type == "file":
+        step["content"] = "managed\n"
+    step["desired_sha256"] = _desired_digest(step)
+    checkpoints: list[dict[str, object]] = []
+
+    def checkpoint(authority) -> None:
+        observed = path.lstat()
+        assert authority == {
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+            "file_type": asset_type,
+        }
+        checkpoints.append(dict(authority))
+
+    def run(argv, **_kwargs):
+        assert checkpoints, "inode authority must be durable before ACL mutation"
+        return _completed(argv)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
+    backend = LocalInstallBackend(require_root=False)
+
+    outcome = backend.apply_step_checkpointed(step, checkpoint)
+
+    assert checkpoints == [outcome["creation_authority"]]
+    assert outcome["installed_sha256"] == step["desired_sha256"]
+    assert backend.creation_authority_matches(step, checkpoints[0])
+
+
 def test_directory_acl_attestation_rejects_an_undeclared_named_group(
     tmp_path: Path,
 ) -> None:

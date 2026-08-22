@@ -17,7 +17,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, MutableMapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, MutableMapping, Protocol, Sequence
 from urllib.parse import parse_qsl, urlsplit
 
 from .. import permgen, registry
@@ -1738,6 +1738,14 @@ class InstallBackend(Protocol):
     def preflight_facts(self, plan: Mapping[str, object]) -> Mapping[str, object]: ...
     def inspect_step(self, step: Mapping[str, object]) -> Mapping[str, object]: ...
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]: ...
+    def apply_step_checkpointed(
+        self,
+        step: Mapping[str, object],
+        creation_checkpoint: Callable[[Mapping[str, object]], None],
+    ) -> Mapping[str, object]: ...
+    def creation_authority_matches(
+        self, step: Mapping[str, object], authority: Mapping[str, object]
+    ) -> bool: ...
     def rollback_step(self, entry: Mapping[str, object]) -> None: ...
     def list_unknown_state(self, receipt: "InstallReceipt") -> Sequence[str]: ...
     def start_service(self, name: str) -> None: ...
@@ -1827,6 +1835,21 @@ class InstallReceipt:
                 raise InstallError(f"receipt journal is not bound to its plan: {path}")
             if entry.get("status", "completed") not in {"prepared", "completed"}:
                 raise InstallError(f"receipt journal status is invalid: {path}")
+            authority = entry.get("creation_authority")
+            prior = entry.get("prior")
+            planned_step = planned_steps.get(step_id)
+            if authority is not None and (
+                not isinstance(planned_step, Mapping)
+                or not isinstance(prior, Mapping)
+                or not _prepared_prior_absent_leaf(planned_step, prior)
+                or not _valid_creation_authority(
+                    authority,
+                    file_type=planned_step.get("asset_type", "file"),
+                )
+            ):
+                raise InstallError(
+                    f"receipt journal creation authority is invalid: {path}"
+                )
             seen.add(step_id)
         rollback_journal = payload.get("rollback_journal", [])
         if not isinstance(rollback_journal, list):
@@ -1844,6 +1867,21 @@ class InstallReceipt:
             ):
                 raise InstallError(
                     f"receipt rollback journal is not bound to its plan: {path}"
+                )
+            authority = entry.get("creation_authority")
+            prior = entry.get("prior")
+            planned_step = planned_steps.get(step_id)
+            if authority is not None and (
+                not isinstance(planned_step, Mapping)
+                or not isinstance(prior, Mapping)
+                or not _prepared_prior_absent_leaf(planned_step, prior)
+                or not _valid_creation_authority(
+                    authority,
+                    file_type=planned_step.get("asset_type", "file"),
+                )
+            ):
+                raise InstallError(
+                    f"receipt rollback creation authority is invalid: {path}"
                 )
             rollback_seen.add(step_id)
         credentials = payload.get("credentials")
@@ -2217,6 +2255,65 @@ def _state_matches(step: Mapping[str, object], state: Mapping[str, object]) -> b
     return True
 
 
+def _valid_creation_authority(
+    authority: object, *, file_type: object | None = None
+) -> bool:
+    if not isinstance(authority, Mapping) or set(authority) != {
+        "device",
+        "inode",
+        "file_type",
+    }:
+        return False
+    device = authority.get("device")
+    inode = authority.get("inode")
+    observed_type = authority.get("file_type")
+    return bool(
+        isinstance(device, int)
+        and not isinstance(device, bool)
+        and device >= 0
+        and isinstance(inode, int)
+        and not isinstance(inode, bool)
+        and inode > 0
+        and observed_type in {"file", "directory"}
+        and (file_type is None or observed_type == file_type)
+    )
+
+
+def _prepared_prior_absent_leaf(
+    step: Mapping[str, object], prior: Mapping[str, object]
+) -> bool:
+    return bool(
+        step.get("kind") == "asset"
+        and step.get("asset_type", "file") in {"file", "directory"}
+        and not prior.get("exists")
+    )
+
+
+def _prepared_leaf_has_rollback_authority(
+    *,
+    backend: InstallBackend,
+    step: Mapping[str, object],
+    entry: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> bool:
+    prior = entry.get("prior")
+    if not isinstance(prior, Mapping) or not _prepared_prior_absent_leaf(step, prior):
+        return True
+    if _state_matches(step, installed):
+        return True
+    authority = entry.get("creation_authority")
+    file_type = step.get("asset_type", "file")
+    if not _valid_creation_authority(authority, file_type=file_type):
+        return False
+    matcher = getattr(backend, "creation_authority_matches", None)
+    if not callable(matcher):
+        return False
+    try:
+        return bool(matcher(step, authority))
+    except Exception:
+        return False
+
+
 def _candidate_venv_step(
     plan: Mapping[str, object],
 ) -> Mapping[str, object] | None:
@@ -2461,8 +2558,20 @@ def apply_plan(
             if dict(installed) != dict(prior):
                 # A crash may happen after only part of a backend step mutated
                 # the host.  The prepared journal is already the rollback
-                # authority, so restore its exact prior state before replay.
+                # authority only after the backend durably binds a newly
+                # created leaf's inode.  A prepared intent alone must never
+                # delete a third-party object created before our mutation.
                 if not _prepared_account_group_is_replayable(step, prior, installed):
+                    if not _prepared_leaf_has_rollback_authority(
+                        backend=backend,
+                        step=step,
+                        entry=entry,
+                        installed=installed,
+                    ):
+                        raise InstallDriftError(
+                            "prepared install step lacks matching creation "
+                            f"authority: {step_id}"
+                        )
                     backend.rollback_step(entry)
                     restored = backend.inspect_step(step)
                     if dict(restored) != dict(prior):
@@ -2494,8 +2603,51 @@ def apply_plan(
             journal.append(entry)
             completed[step_id] = entry
             receipt._persist()
+        def checkpoint_creation(authority: Mapping[str, object]) -> None:
+            file_type = step.get("asset_type", "file")
+            prior = entry.get("prior")
+            if (
+                not isinstance(prior, Mapping)
+                or not _prepared_prior_absent_leaf(step, prior)
+                or not _valid_creation_authority(authority, file_type=file_type)
+            ):
+                raise InstallError(
+                    f"backend returned invalid creation authority: {step_id}"
+                )
+            previous = entry.get("creation_authority")
+            if previous is not None and previous != authority:
+                raise InstallDriftError(
+                    f"backend changed creation authority: {step_id}"
+                )
+            entry["creation_authority"] = deepcopy(dict(authority))
+            try:
+                receipt._persist()
+            except BaseException:
+                if previous is None:
+                    entry.pop("creation_authority", None)
+                else:
+                    entry["creation_authority"] = previous
+                raise
+
         try:
-            outcome = dict(backend.apply_step(step))
+            checkpointed_apply = getattr(backend, "apply_step_checkpointed", None)
+            outcome = dict(
+                checkpointed_apply(step, checkpoint_creation)
+                if callable(checkpointed_apply)
+                else backend.apply_step(step)
+            )
+            outcome_authority = outcome.get("creation_authority")
+            if outcome_authority is not None:
+                if not _valid_creation_authority(
+                    outcome_authority,
+                    file_type=step.get("asset_type", "file"),
+                ) or (
+                    entry.get("creation_authority") is not None
+                    and entry.get("creation_authority") != outcome_authority
+                ):
+                    raise InstallDriftError(
+                        f"backend returned conflicting creation authority: {step_id}"
+                    )
         except BaseException:
             # If the backend demonstrably made no mutation, keep the receipt as
             # compact as the pre-two-phase format. If state changed, the durable
@@ -2668,6 +2820,19 @@ def rollback_receipt(
             continue
         if entry.get("status") == "prepared":
             if not isinstance(prior, Mapping):
+                retained_drift.append(
+                    {"step_id": entry.get("step_id"), "observed": dict(installed)}
+                )
+                continue
+            if (
+                dict(installed) != dict(prior)
+                and not _prepared_leaf_has_rollback_authority(
+                    backend=backend,
+                    step=step,
+                    entry=entry,
+                    installed=installed,
+                )
+            ):
                 retained_drift.append(
                     {"step_id": entry.get("step_id"), "observed": dict(installed)}
                 )

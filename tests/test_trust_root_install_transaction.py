@@ -137,6 +137,7 @@ class RecordingBackend:
         self.fail_stop: str | None = None
         self.stopped: list[str] = []
         self.credential_rollbacks = 0
+        self.creation_identities: dict[str, dict[str, object]] = {}
 
     def preflight_facts(self, _plan) -> dict[str, object]:
         return deepcopy(self.facts)
@@ -144,7 +145,7 @@ class RecordingBackend:
     def inspect_step(self, step) -> dict[str, object]:
         return deepcopy(self.states.get(step["step_id"], {"exists": False}))
 
-    def apply_step(self, step) -> dict[str, object]:
+    def _apply_step(self, step, creation_checkpoint=None) -> dict[str, object]:
         step_id = step["step_id"]
         if self.fail_on == step_id:
             self.fail_on = None
@@ -159,6 +160,15 @@ class RecordingBackend:
             "acl": deepcopy(step["acls"]),
         }
         self.states[step_id] = state
+        if not prior.get("exists") and step.get("kind") == "asset":
+            authority = {
+                "device": 1,
+                "inode": len(self.creation_identities) + 100,
+                "file_type": step.get("asset_type", "file"),
+            }
+            self.creation_identities[step_id] = authority
+            if creation_checkpoint is not None:
+                creation_checkpoint(authority)
         self.applied.append(step_id)
         if self.fail_with_partial_mutation == step_id:
             self.fail_with_partial_mutation = None
@@ -169,6 +179,15 @@ class RecordingBackend:
             raise RuntimeError(f"injected post-mutation interruption at {step_id}")
         return {"prior": prior, **state}
 
+    def apply_step(self, step) -> dict[str, object]:
+        return self._apply_step(step)
+
+    def apply_step_checkpointed(self, step, creation_checkpoint):
+        return self._apply_step(step, creation_checkpoint)
+
+    def creation_authority_matches(self, step, authority) -> bool:
+        return authority == self.creation_identities.get(step["step_id"])
+
     def rollback_step(self, entry) -> None:
         self.rolled_back.append(entry["step_id"])
         prior = deepcopy(entry["prior"])
@@ -176,6 +195,7 @@ class RecordingBackend:
             self.states[entry["step_id"]] = prior
         else:
             self.states.pop(entry["step_id"], None)
+            self.creation_identities.pop(entry["step_id"], None)
 
     def list_unknown_state(self, _receipt) -> tuple[str, ...]:
         return tuple(sorted(self.unknown))
@@ -646,12 +666,19 @@ def test_second_complete_apply_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_post_mutation_crash_replays_from_prejournal_and_rollback_removes_created_asset(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan = _plan(tmp_path)
     backend = RecordingBackend(plan)
     backend.fail_after_mutation = "state-root"
-    receipt = new_install_receipt(plan)
+    receipt_path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    receipt = new_install_receipt(plan, path=receipt_path)
 
     with pytest.raises(RuntimeError, match="post-mutation"):
         apply_plan(
@@ -665,6 +692,14 @@ def test_post_mutation_crash_replays_from_prejournal_and_rollback_removes_create
     assert journal[0]["step_id"] == "state-root"
     assert journal[0]["status"] == "prepared"
     assert journal[0]["prior"] == {"exists": False}
+    assert journal[0]["creation_authority"] == {
+        "device": 1,
+        "inode": 100,
+        "file_type": "file",
+    }
+    assert InstallReceipt.load(receipt_path).to_dict()["journal"][0][
+        "creation_authority"
+    ] == journal[0]["creation_authority"]
 
     apply_plan(
         plan,
@@ -726,6 +761,90 @@ def test_partial_mid_step_mutation_can_be_explicitly_rolled_back(
     assert backend.rolled_back == ["state-root"]
     assert "state-root" not in backend.states
     assert report.retained_drift == ()
+
+
+@pytest.mark.parametrize("asset_type", ["file", "directory"])
+@pytest.mark.parametrize("action", ["resume", "rollback"])
+def test_prepared_prior_absent_does_not_delete_third_party_leaf_without_authority(
+    tmp_path: Path, asset_type: str, action: str
+) -> None:
+    target = tmp_path / f"third-party-{asset_type}"
+    step = {
+        "step_id": f"asset:{asset_type}",
+        "kind": "asset",
+        "asset_type": asset_type,
+        "path": str(target),
+        "owner": "root",
+        "group": "root",
+        "mode": "0700",
+        "acls": [],
+        "operations": ["snapshot", "chown", "chmod"],
+        "desired_sha256": "d" * 64,
+    }
+    if asset_type == "file":
+        step["content"] = "planned\n"
+    plan = _plan(tmp_path)
+    plan["accounts"] = []
+    plan["apply_order"] = [step]
+    receipt = new_install_receipt(plan)
+    receipt._document["state"] = "applying"
+    receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "prepared",
+            "prior": {"exists": False},
+        }
+    ]
+    if asset_type == "file":
+        target.write_text("operator-owned\n", encoding="utf-8")
+    else:
+        target.mkdir()
+
+    class CrashBeforeMutationBackend:
+        def __init__(self) -> None:
+            self.rollback_calls = 0
+            self.apply_calls = 0
+
+        def preflight_facts(self, _plan):
+            return _safe_facts(plan)
+
+        def inspect_step(self, _step):
+            if not target.exists():
+                return {"exists": False}
+            return {
+                "exists": True,
+                "installed_sha256": "third-party",
+            }
+
+        def apply_step(self, _step):
+            self.apply_calls += 1
+            raise AssertionError("unowned third-party state must fail before apply")
+
+        def rollback_step(self, _entry):
+            self.rollback_calls += 1
+            target.unlink() if target.is_file() else target.rmdir()
+
+        def list_unknown_state(self, _receipt):
+            return ()
+
+    backend = CrashBeforeMutationBackend()
+
+    if action == "resume":
+        with pytest.raises(InstallDriftError, match="creation authority"):
+            apply_plan(
+                plan,
+                confirm_sha256=plan_sha256(plan),
+                receipt=receipt,
+                backend=backend,
+            )
+    else:
+        report = rollback_receipt(receipt, backend=backend)
+        assert report.retained_drift[0]["step_id"] == step["step_id"]
+
+    assert target.exists()
+    assert backend.rollback_calls == 0
+    assert backend.apply_calls == 0
 
 
 def test_rollback_persists_each_reversed_entry_and_recovers_after_persist_crash(

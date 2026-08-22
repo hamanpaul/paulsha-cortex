@@ -15,7 +15,7 @@ import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .core import (
     InstallDriftError,
@@ -1233,6 +1233,59 @@ def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object])
     )
 
 
+def _creation_authority(
+    observed: os.stat_result, *, file_type: str
+) -> dict[str, object]:
+    matches_type = (
+        stat.S_ISREG(observed.st_mode)
+        if file_type == "file"
+        else stat.S_ISDIR(observed.st_mode)
+        if file_type == "directory"
+        else False
+    )
+    if not matches_type or (file_type == "file" and observed.st_nlink != 1):
+        raise InstallDriftError("created asset inode has an unsafe type or link count")
+    return {
+        "device": observed.st_dev,
+        "inode": observed.st_ino,
+        "file_type": file_type,
+    }
+
+
+def _path_matches_creation_authority(
+    path: Path, authority: Mapping[str, object]
+) -> bool:
+    if set(authority) != {"device", "inode", "file_type"}:
+        return False
+    device = authority.get("device")
+    inode = authority.get("inode")
+    file_type = authority.get("file_type")
+    if (
+        not isinstance(device, int)
+        or isinstance(device, bool)
+        or device < 0
+        or not isinstance(inode, int)
+        or isinstance(inode, bool)
+        or inode <= 0
+        or file_type not in {"file", "directory"}
+    ):
+        return False
+    try:
+        observed = path.lstat()
+    except OSError:
+        return False
+    matches_type = (
+        stat.S_ISREG(observed.st_mode)
+        if file_type == "file"
+        else stat.S_ISDIR(observed.st_mode)
+    )
+    return bool(
+        matches_type
+        and (file_type != "file" or observed.st_nlink == 1)
+        and (observed.st_dev, observed.st_ino) == (device, inode)
+    )
+
+
 def _sudoers_authenticate_setting(
     row: Mapping[str, object],
 ) -> tuple[bool, bool | None]:
@@ -1599,7 +1652,33 @@ class LocalInstallBackend:
                 observed["acl"] = list(step.get("acls", []))
         return observed
 
+    def creation_authority_matches(
+        self, step: Mapping[str, object], authority: Mapping[str, object]
+    ) -> bool:
+        if step.get("kind") != "asset" or step.get(
+            "asset_type", "file"
+        ) not in {"file", "directory"}:
+            return False
+        return _path_matches_creation_authority(
+            Path(str(step.get("path", ""))), authority
+        )
+
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
+        return self._apply_step(step, creation_checkpoint=None)
+
+    def apply_step_checkpointed(
+        self,
+        step: Mapping[str, object],
+        creation_checkpoint: Callable[[Mapping[str, object]], None],
+    ) -> Mapping[str, object]:
+        return self._apply_step(step, creation_checkpoint=creation_checkpoint)
+
+    def _apply_step(
+        self,
+        step: Mapping[str, object],
+        *,
+        creation_checkpoint: Callable[[Mapping[str, object]], None] | None,
+    ) -> Mapping[str, object]:
         kind = step.get("kind")
         if kind == "account":
             prior = _account_state(step)
@@ -1977,50 +2056,59 @@ class LocalInstallBackend:
             if installed.get("installed_sha256") != step.get("desired_sha256"):
                 raise InstallDriftError(f"installed symlink does not match desired state: {step.get('step_id')}")
             return {"prior": prior, **installed}
-        if asset_type == "file":
-            content = step.get("content")
-            if not isinstance(content, str):
-                raise InstallPlanError(f"file step lacks content: {step.get('step_id')}")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _reject_symlink_ancestors(path, label="asset")
-            descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-            temporary_path = Path(temporary)
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(content.encode("utf-8"))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary_path, path)
-            except BaseException:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-                try:
-                    temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
-                raise
-        elif asset_type != "directory":
+        if asset_type not in {"file", "directory"}:
             raise InstallPlanError(f"unsupported asset_type: {asset_type}")
         # New files and directories can inherit named/default ACLs from their
         # parent. Clear that inherited state before applying the plan's exact
         # ACL set. This is safe only because ``prior`` proved the leaf absent.
-        directory_fd: int | None = None
-        acl_target = str(path)
-        inherited_fds: tuple[int, ...] = ()
+        if asset_type == "file" and not isinstance(step.get("content"), str):
+            raise InstallPlanError(f"file step lacks content: {step.get('step_id')}")
+        created_fd: int | None = None
+        parent_authority: list[tuple[int, int]] = []
+        authority: dict[str, object] | None = None
         try:
-            if asset_type == "directory":
+            parent_fd, leaf = _open_parent_directory(
+                path, create=True, authority=parent_authority
+            )
+            try:
                 try:
-                    directory_fd = _open_directory_chain(path, create=True)
-                except (OSError, UnsafeInstallPathError) as exc:
-                    raise UnsafeInstallPathError(
-                        f"cannot safely open managed directory {path}: {exc}"
+                    if asset_type == "directory":
+                        os.mkdir(leaf, 0o700, dir_fd=parent_fd)
+                        flags = (
+                            os.O_RDONLY
+                            | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_CLOEXEC", 0)
+                        )
+                    else:
+                        flags = (
+                            os.O_RDWR
+                            | os.O_CREAT
+                            | os.O_EXCL
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_CLOEXEC", 0)
+                        )
+                    created_fd = os.open(leaf, flags, 0o600, dir_fd=parent_fd)
+                except FileExistsError as exc:
+                    raise InstallDriftError(
+                        f"asset appeared before exclusive creation: {step.get('step_id')}"
                     ) from exc
-                if not Path("/proc/self/fd").is_dir():
-                    raise InstallError("/proc/self/fd is required for safe ACL apply")
-                acl_target = f"/proc/self/fd/{directory_fd}"
-                inherited_fds = (directory_fd,)
+            finally:
+                os.close(parent_fd)
+            authority = _creation_authority(
+                os.fstat(created_fd), file_type=str(asset_type)
+            )
+            if creation_checkpoint is not None:
+                creation_checkpoint(authority)
+            if asset_type == "file":
+                with os.fdopen(os.dup(created_fd), "wb") as stream:
+                    stream.write(str(step["content"]).encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            if not Path("/proc/self/fd").is_dir():
+                raise InstallError("/proc/self/fd is required for safe ACL apply")
+            acl_target = f"/proc/self/fd/{created_fd}"
+            inherited_fds = (created_fd,)
             _run(
                 ("setfacl", "-b", acl_target),
                 check=True,
@@ -2035,12 +2123,8 @@ class LocalInstallBackend:
             uid = _resolve_uid(step.get("owner"))
             gid = _resolve_gid(step.get("group"))
             desired_mode = _mode(step.get("mode"))
-            if directory_fd is not None:
-                os.fchown(directory_fd, uid, gid)
-                os.fchmod(directory_fd, desired_mode)
-            else:
-                os.chown(path, uid, gid, follow_symlinks=False)
-                os.chmod(path, desired_mode, follow_symlinks=False)
+            os.fchown(created_fd, uid, gid)
+            os.fchmod(created_fd, desired_mode)
             for acl in step.get("acls", []):
                 if not isinstance(acl, Mapping):
                     raise InstallPlanError("ACL entries must be objects")
@@ -2055,15 +2139,19 @@ class LocalInstallBackend:
                     check=True,
                     pass_fds=inherited_fds,
                 )
-            if directory_fd is not None:
-                _assert_fd_path_binding(path, directory_fd, directory=True)
+            _assert_fd_path_binding(
+                path,
+                created_fd,
+                directory=asset_type == "directory",
+                parent_authority=parent_authority,
+            )
         finally:
-            if directory_fd is not None:
-                os.close(directory_fd)
+            if created_fd is not None:
+                os.close(created_fd)
         installed = dict(self.inspect_step(step))
         if installed.get("installed_sha256") != step.get("desired_sha256"):
             raise InstallDriftError(f"installed asset does not match desired state: {step.get('step_id')}")
-        return {"prior": prior, **installed}
+        return {"prior": prior, "creation_authority": authority, **installed}
 
     def rollback_step(self, entry: Mapping[str, object]) -> None:
         step = entry.get("step")
@@ -2120,6 +2208,22 @@ class LocalInstallBackend:
                 return
             raise InstallPlanError(f"unsupported rollback kind: {step.get('kind')}")
         path = Path(str(step.get("path")))
+        if (
+            entry.get("status") == "prepared"
+            and not prior.get("exists")
+            and step.get("asset_type", "file") in {"file", "directory"}
+        ):
+            installed = self.inspect_step(step)
+            authority = entry.get("creation_authority")
+            has_authority = bool(
+                isinstance(authority, Mapping)
+                and self.creation_authority_matches(step, authority)
+            )
+            if not _state_matches_step(step, installed) and not has_authority:
+                raise InstallDriftError(
+                    "prepared asset lacks matching creation authority: "
+                    f"{step.get('step_id')}"
+                )
         if step.get("asset_type") == "symlink":
             if not prior.get("exists"):
                 if path.is_symlink():
