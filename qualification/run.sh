@@ -80,7 +80,7 @@ docker run --detach \
     --tmpfs /run:rw,nosuid,nodev,mode=755 \
     --tmpfs /run/lock:rw,nosuid,nodev,noexec,mode=755 \
     --mount "type=bind,source=$artifact_dir,target=/artifacts,readonly" \
-    --mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,rw" \
+    --volume "/sys/fs/cgroup:/sys/fs/cgroup:rw" \
     --mount "type=volume,source=$volume_name,target=/var/lib/cortex" \
     "$image_tag" >/dev/null
 
