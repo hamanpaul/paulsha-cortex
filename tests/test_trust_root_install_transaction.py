@@ -15,6 +15,7 @@ from paulsha_cortex.trust_root.install import (
     AccountCollisionError,
     InstallDriftError,
     InstallPlanError,
+    InstallReceipt,
     UnsafeInstallPathError,
     apply_plan,
     new_install_receipt,
@@ -123,6 +124,7 @@ class RecordingBackend:
         self.rolled_back: list[str] = []
         self.unknown: set[str] = set()
         self.fail_on: str | None = None
+        self.fail_after_mutation: str | None = None
 
     def preflight_facts(self, _plan) -> dict[str, object]:
         return deepcopy(self.facts)
@@ -146,6 +148,9 @@ class RecordingBackend:
         }
         self.states[step_id] = state
         self.applied.append(step_id)
+        if self.fail_after_mutation == step_id:
+            self.fail_after_mutation = None
+            raise RuntimeError(f"injected post-mutation interruption at {step_id}")
         return {"prior": prior, **state}
 
     def rollback_step(self, entry) -> None:
@@ -281,6 +286,37 @@ def test_second_complete_apply_is_idempotent(tmp_path: Path) -> None:
     assert len(receipt.to_dict()["journal"]) == len(plan["apply_order"])
 
 
+def test_post_mutation_crash_replays_from_prejournal_and_rollback_removes_created_asset(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    backend = RecordingBackend(plan)
+    backend.fail_after_mutation = "state-root"
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(RuntimeError, match="post-mutation"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    journal = receipt.to_dict()["journal"]
+    assert journal[0]["step_id"] == "state-root"
+    assert journal[0]["status"] == "prepared"
+    assert journal[0]["prior"] == {"exists": False}
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    rollback_receipt(receipt, backend=backend)
+    assert "state-root" not in backend.states
+
+
 def test_replay_stops_when_a_completed_asset_no_longer_matches(tmp_path: Path) -> None:
     plan = _plan(tmp_path)
     backend = RecordingBackend(plan)
@@ -345,3 +381,14 @@ def test_rollback_does_not_overwrite_post_install_drift(tmp_path: Path) -> None:
     assert "manager-unit" not in backend.rolled_back
     assert backend.states["manager-unit"]["installed_sha256"] == "e" * 64
     assert report.to_dict()["retained_drift"][0]["step_id"] == "manager-unit"
+
+
+def test_receipt_load_rejects_non_root_or_non_private_authority_file(
+    tmp_path: Path,
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    new_install_receipt(_plan(tmp_path), path=path)
+    path.chmod(0o666)
+
+    with pytest.raises(Exception, match="root-owned|0600"):
+        InstallReceipt.load(path)

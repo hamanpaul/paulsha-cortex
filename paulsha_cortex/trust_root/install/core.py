@@ -132,6 +132,15 @@ _FORBIDDEN_CONFIG_FIELDS = frozenset(
         "token",
     }
 )
+_FORBIDDEN_CONFIG_FIELD_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "auth",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 
 def _reject_sensitive_config(value: object, *, path: tuple[str, ...] = ()) -> None:
@@ -139,8 +148,12 @@ def _reject_sensitive_config(value: object, *, path: tuple[str, ...] = ()) -> No
         for raw_key, child in value.items():
             key = str(raw_key)
             normalized = key.casefold()
-            if normalized in _FORBIDDEN_CONFIG_FIELDS or normalized.endswith(
+            if (
+                normalized in _FORBIDDEN_CONFIG_FIELDS
+                or any(fragment in normalized for fragment in _FORBIDDEN_CONFIG_FIELD_FRAGMENTS)
+                or normalized.endswith(
                 ("_password", "_secret", "_token")
+                )
             ):
                 raise InstallPlanError(
                     f"configuration field {'.'.join((*path, key))} is forbidden"
@@ -397,6 +410,19 @@ def _generated_inventory(
             group=generated.group,
             mode=generated.mode_str,
         )
+    gitconfigs["manager-gh-config"] = _artifact_dict(
+        content="git_protocol: https\nprompt: disabled\n",
+        path=layout.gh_settings_of(layout.manager_account),
+    )
+
+    resolved_asset_paths = layout.asset_paths()
+    enforcement = {
+        asset_id: _artifact_dict(
+            content=permgen.CODEX_HOOKS_SEED_CONTENT + "\n",
+            path=resolved_asset_paths[asset_id],
+        )
+        for asset_id in sorted(permgen.ENFORCEMENT_LEAF_ASSETS)
+    }
 
     wrappers: dict[str, dict[str, str]] = {}
     if isinstance(toolchain, Mapping):
@@ -406,7 +432,25 @@ def _generated_inventory(
                 raise InstallPlanError(f"unsafe toolchain program name: {name!r}")
             wrapper_path = f"{layout.toolchain_bin}/{name}"
             executable = f"{layout.toolchain_lib}/{name}"
-            content = f'#!/bin/sh\nexec "{executable}" "$@"\n'
+            tool = toolchain[raw_name]
+            if not isinstance(tool, Mapping):
+                raise InstallPlanError(f"toolchain entry must be an object: {name}")
+            shape = tool.get("shape", "file")
+            if shape == "file":
+                content = f'#!/bin/sh\nexec "{executable}" "$@"\n'
+            elif shape == "tree":
+                entrypoint = tool.get("entrypoint")
+                if not isinstance(entrypoint, str):
+                    raise InstallPlanError(f"tree toolchain entrypoint is required: {name}")
+                relative = PurePosixPath(entrypoint)
+                if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                    raise InstallPlanError(f"unsafe tree toolchain entrypoint: {name}")
+                content = (
+                    "#!/bin/sh\n"
+                    f'exec /usr/bin/node "{executable}/{relative.as_posix()}" "$@"\n'
+                )
+            else:
+                raise InstallPlanError(f"unsupported toolchain shape for {name}: {shape}")
             wrappers[name] = _artifact_dict(
                 content=content, path=wrapper_path, mode="0755"
             )
@@ -423,6 +467,7 @@ def _generated_inventory(
         "gitconfigs": gitconfigs,
         "toolchain_wrappers": wrappers,
         "environment": environment,
+        "enforcement": enforcement,
     }
 
 
@@ -447,6 +492,10 @@ def _desired_digest(step: Mapping[str, object]) -> str:
         "mode": step.get("mode"),
         "acls": normalized_acls,
         "asset_type": step.get("asset_type"),
+        "target": step.get("target"),
+        "commit": step.get("commit"),
+        "remote": step.get("remote"),
+        "source_sha256": step.get("source_sha256"),
     }
     return hashlib.sha256(_canonical_bytes(semantic)).hexdigest()
 
@@ -471,6 +520,24 @@ def _apply_steps(
     for asset in assets:
         path = asset.get("path")
         if not isinstance(path, str) or "<job-id>" in path:
+            continue
+        if bool(asset.get("is_symlink")):
+            target = asset.get("symlink_target")
+            if not isinstance(target, str):
+                raise InstallPlanError(f"symlink asset lacks target: {asset.get('asset_id')}")
+            step = {
+                "step_id": f"asset:{asset['asset_id']}",
+                "kind": "asset",
+                "asset_type": "symlink",
+                "path": path,
+                "target": target,
+                "owner": asset["owner"],
+                "group": asset["group"],
+                "operations": ["snapshot", "symlink", "lchown"],
+                "durable": False,
+            }
+            step["desired_sha256"] = _desired_digest(step)
+            steps.append(step)
             continue
         if not bool(asset.get("is_directory")):
             continue
@@ -509,6 +576,7 @@ def _apply_steps(
         "gitconfigs",
         "toolchain_wrappers",
         "environment",
+        "enforcement",
     ):
         for name, artifact in sorted(generated.get(category, {}).items()):
             step = {
@@ -557,6 +625,8 @@ def build_install_plan(
     for entry in permission_plan.entries:
         row = entry.to_dict()
         row["path"] = asset_paths.get(entry.asset_id)
+        if entry.is_symlink:
+            row["symlink_target"] = layout.symlink_targets().get(entry.asset_id)
         assets.append(row)
     generated = _generated_inventory(
         scheme,
@@ -745,15 +815,219 @@ def validate_bundle_manifest(bundle_path: Path) -> dict[str, object]:
         member(row, label=f"generated_artifacts[{index}]")
         for index, row in enumerate(generated_rows)
     ]
+    raw_toolchain = payload.get("toolchain")
+    if not isinstance(raw_toolchain, list) or not raw_toolchain:
+        raise InstallPlanError("bundle toolchain must be a non-empty list")
+    toolchain: list[dict[str, str]] = []
+    seen_tools: set[str] = set()
+    for index, raw in enumerate(raw_toolchain):
+        if not isinstance(raw, Mapping):
+            raise InstallPlanError(f"bundle toolchain[{index}] must be an object")
+        name = raw.get("name")
+        version = raw.get("version")
+        shape = raw.get("shape")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or name in seen_tools
+            or not isinstance(version, str)
+            or not version
+            or shape not in {"file", "tree"}
+        ):
+            raise InstallPlanError(f"bundle toolchain[{index}] identity is invalid")
+        seen_tools.add(name)
+        validated_tool = {
+            "name": name,
+            "version": version,
+            "shape": str(shape),
+            **member(raw, label=f"toolchain[{index}]"),
+        }
+        if shape == "tree":
+            entrypoint = raw.get("entrypoint")
+            installed_sha256 = raw.get("installed_sha256")
+            relative = PurePosixPath(str(entrypoint))
+            if (
+                not isinstance(entrypoint, str)
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or not relative.parts
+                or not isinstance(installed_sha256, str)
+                or len(installed_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in installed_sha256)
+            ):
+                raise InstallPlanError(f"bundle tree toolchain[{index}] metadata is invalid")
+            validated_tool["entrypoint"] = entrypoint
+            validated_tool["installed_sha256"] = installed_sha256
+        toolchain.append(validated_tool)
+    raw_repositories = payload.get("source_repositories")
+    if not isinstance(raw_repositories, list) or not raw_repositories:
+        raise InstallPlanError("bundle source_repositories must be a non-empty list")
+    source_repositories: list[dict[str, str]] = []
+    seen_repos: set[str] = set()
+    for index, raw in enumerate(raw_repositories):
+        if not isinstance(raw, Mapping):
+            raise InstallPlanError(f"bundle source_repositories[{index}] must be an object")
+        slug = raw.get("slug")
+        commit = raw.get("commit")
+        remote = raw.get("remote")
+        if (
+            not isinstance(slug, str)
+            or not slug
+            or slug in seen_repos
+            or "/" in slug
+            or not isinstance(commit, str)
+            or len(commit) != 40
+            or any(char not in "0123456789abcdef" for char in commit)
+            or not isinstance(remote, str)
+            or not remote.startswith("https://")
+        ):
+            raise InstallPlanError(f"bundle source_repositories[{index}] identity is invalid")
+        seen_repos.add(slug)
+        source_repositories.append(
+            {
+                "slug": slug,
+                "commit": commit,
+                "remote": remote,
+                **member(raw, label=f"source_repositories[{index}]"),
+            }
+        )
     return {
         "schema_version": 1,
         "candidate_sha": candidate_sha,
         "wheel": wheel,
         "wheelhouse": wheelhouse,
         "generated_artifacts": generated,
+        "toolchain": toolchain,
+        "source_repositories": source_repositories,
         "manifest_path": str(manifest_path),
         "manifest_sha256": _sha256_file(manifest_path),
     }
+
+
+def bind_bundle_artifacts(
+    plan: Mapping[str, object], manifest: Mapping[str, object]
+) -> dict[str, object]:
+    """Bind validated tool binaries and source bundles into typed apply steps."""
+
+    bound = deepcopy(dict(plan))
+    configured_tools = bound.get("toolchain_manifest")
+    tools = manifest.get("toolchain")
+    if not isinstance(configured_tools, Mapping) or not isinstance(tools, list):
+        raise InstallPlanError("toolchain configuration and bundle inventory are required")
+    by_name = {
+        str(row.get("name")): row for row in tools if isinstance(row, Mapping)
+    }
+    if set(configured_tools) != set(by_name):
+        raise InstallPlanError("config toolchain names must exactly match the bundle")
+    roots = bound.get("roots")
+    if not isinstance(roots, Mapping) or not isinstance(roots.get("deploy"), str):
+        raise InstallPlanError("plan roots are invalid")
+    tool_steps: list[dict[str, object]] = []
+    for name in sorted(by_name):
+        configured = configured_tools[name]
+        bundled = by_name[name]
+        if (
+            not isinstance(configured, Mapping)
+            or configured.get("version") != bundled.get("version")
+            or configured.get("sha256") != bundled.get("sha256")
+            or configured.get("shape", "file") != bundled.get("shape")
+            or configured.get("entrypoint") != bundled.get("entrypoint")
+        ):
+            raise InstallPlanError(f"config toolchain pin does not match bundle: {name}")
+        tool_steps.append(
+            {
+                "step_id": f"toolchain:{name}",
+                "kind": "toolchain",
+                "name": name,
+                "version": bundled["version"],
+                "shape": bundled["shape"],
+                "entrypoint": bundled.get("entrypoint"),
+                "source": bundled["resolved_path"],
+                "source_sha256": bundled["sha256"],
+                "path": f"{roots['deploy']}/toolchain/lib/{name}",
+                "owner": "root",
+                "group": "root",
+                "mode": "0755",
+                "desired_sha256": bundled.get("installed_sha256", bundled["sha256"]),
+                "operations": ["snapshot", "copy-locked", "chown", "chmod"],
+            }
+        )
+
+    repositories = manifest.get("source_repositories")
+    configured_assets = bound.get("assets", [])
+    source_assets = [
+        row
+        for row in configured_assets
+        if isinstance(row, Mapping) and row.get("asset_id") == "repo-source-tree"
+    ] if isinstance(configured_assets, list) else []
+    source_slugs = {Path(str(row.get("path", ""))).name for row in source_assets}
+    bundled_slugs = {
+        str(row.get("slug"))
+        for row in repositories
+        if isinstance(row, Mapping)
+    } if isinstance(repositories, list) else set()
+    if not isinstance(repositories, list) or bundled_slugs != source_slugs:
+        raise InstallPlanError("source repository bundle does not match the plan")
+    repo_steps: list[dict[str, object]] = []
+    repo_identity = bound.get("repo_identity")
+    for row in repositories:
+        assert isinstance(row, Mapping)
+        if not isinstance(repo_identity, Mapping) or any(
+            row.get(key) != repo_identity.get(key) for key in ("commit", "remote")
+        ):
+            raise InstallPlanError("source repository identity does not match repo_identity")
+        asset = next(
+            item
+            for item in source_assets
+            if Path(str(item.get("path", ""))).name == row.get("slug")
+        )
+        repo_step = {
+            "step_id": f"repository:{row['slug']}",
+            "kind": "repository",
+            "slug": row["slug"],
+            "source": row["resolved_path"],
+            "source_sha256": row["sha256"],
+            "commit": row["commit"],
+            "remote": row["remote"],
+            "path": asset["path"],
+            "owner": asset["owner"],
+            "group": asset["group"],
+            "mode": asset["mode"],
+            "durable": True,
+            "operations": ["snapshot", "clone-bundle", "checkout", "chown"],
+        }
+        repo_step["desired_sha256"] = _desired_digest(repo_step)
+        repo_steps.append(repo_step)
+
+    order = bound.get("apply_order")
+    if not isinstance(order, list):
+        raise InstallPlanError("plan apply_order is invalid")
+    order = [
+        step
+        for step in order
+        if not (
+            isinstance(step, Mapping)
+            and step.get("step_id") == "asset:repo-source-tree"
+        )
+    ]
+    insertion = next(
+        (
+            index
+            for index, step in enumerate(order)
+            if isinstance(step, Mapping)
+            and str(step.get("step_id", "")).startswith("generated:")
+        ),
+        max(0, len(order) - 4),
+    )
+    bound["apply_order"] = [
+        *order[:insertion],
+        *repo_steps,
+        *tool_steps,
+        *order[insertion:],
+    ]
+    return bound
 
 
 @dataclass(frozen=True)
@@ -828,6 +1102,12 @@ def validate_preflight(
             observed.get(key) != desired.get(key) for key in ("uid", "gid", "home", "shell")
         ):
             raise AccountCollisionError(f"existing account {name} does not match the plan")
+        if observed.get("supplementary_groups") not in (None, []):
+            raise AccountCollisionError(
+                f"existing account {name} has supplementary group authority"
+            )
+        if observed.get("password_locked") is False:
+            raise AccountCollisionError(f"existing account {name} password is not locked")
 
     services = facts.get("services", {})
     if isinstance(services, Mapping):
@@ -853,7 +1133,11 @@ def validate_preflight(
             raise InstallPlanError("apply_order entries must be typed objects")
         path = step.get("path")
         observed = observed_paths.get(path, {})
-        if isinstance(observed, Mapping) and observed.get("is_symlink"):
+        if (
+            isinstance(observed, Mapping)
+            and observed.get("is_symlink")
+            and step.get("asset_type") != "symlink"
+        ):
             raise UnsafeInstallPathError(f"apply path became a symlink: {path}")
     return PreflightReport(tuple(failures))
 
@@ -884,15 +1168,55 @@ class InstallReceipt:
 
     @classmethod
     def load(cls, path: Path) -> "InstallReceipt":
+        if not path.is_absolute() or ".." in path.parts:
+            raise UnsafeInstallPathError(f"receipt path must be safe and absolute: {path}")
         _reject_symlink_ancestors(path, label="receipt")
         try:
-            if path.is_symlink():
-                raise UnsafeInstallPathError(f"receipt must not be a symlink: {path}")
+            observed = path.lstat()
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+                raise UnsafeInstallPathError(f"receipt must be a single-link regular file: {path}")
+            if observed.st_uid != 0 or stat.S_IMODE(observed.st_mode) != 0o600:
+                raise InstallError(f"receipt must be root-owned mode 0600: {path}")
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise InstallError(f"cannot load receipt {path}: {exc}") from exc
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             raise InstallError(f"invalid receipt schema: {path}")
+        plan = payload.get("plan")
+        if not isinstance(plan, Mapping) or payload.get("plan_sha256") != plan_sha256(plan):
+            raise InstallError(f"receipt embedded plan hash is invalid: {path}")
+        if payload.get("repo_identity") != plan.get("repo_identity") or payload.get(
+            "candidate"
+        ) != plan.get("candidate"):
+            raise InstallError(f"receipt identity fields are inconsistent: {path}")
+        journal = payload.get("journal")
+        planned_steps = {
+            str(step.get("step_id")): step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, Mapping)
+        }
+        if not isinstance(journal, list):
+            raise InstallError(f"receipt journal is invalid: {path}")
+        seen: set[str] = set()
+        for entry in journal:
+            if not isinstance(entry, Mapping):
+                raise InstallError(f"receipt journal entry is invalid: {path}")
+            step_id = str(entry.get("step_id"))
+            if step_id in seen or entry.get("step") != planned_steps.get(step_id):
+                raise InstallError(f"receipt journal is not bound to its plan: {path}")
+            if entry.get("status", "completed") not in {"prepared", "completed"}:
+                raise InstallError(f"receipt journal status is invalid: {path}")
+            seen.add(step_id)
+        credentials = payload.get("credentials")
+        if not isinstance(credentials, list) or any(
+            not isinstance(row, Mapping)
+            or set(row) != {"principal", "provider", "mode", "sha256"}
+            or row.get("mode") != "0600"
+            or not isinstance(row.get("sha256"), str)
+            or len(str(row.get("sha256"))) != 64
+            for row in credentials
+        ):
+            raise InstallError(f"receipt credential metadata is invalid: {path}")
         return cls(payload, path=path)
 
 
@@ -1004,6 +1328,8 @@ def apply_plan(
             "asset",
             "systemctl",
             "venv",
+            "toolchain",
+            "repository",
         }:
             raise InstallPlanError(f"unknown or untyped apply step kind: {step!r}")
         _validate_operations(step)
@@ -1022,13 +1348,44 @@ def apply_plan(
     for step in steps:
         step_id = str(step.get("step_id"))
         if step_id in completed:
+            entry = completed[step_id]
             installed = backend.inspect_step(step)
-            if not _state_matches(step, installed):
+            if _state_matches(step, installed):
+                if entry.get("status") == "prepared":
+                    entry["status"] = "completed"
+                    entry.update(installed)
+                    receipt._persist()
+                continue
+            if entry.get("status") != "prepared":
                 raise InstallDriftError(f"completed install step drifted: {step_id}")
-            continue
-        outcome = dict(backend.apply_step(step))
-        entry = {"step_id": step_id, "step": deepcopy(dict(step)), **outcome}
-        journal.append(entry)
+            prior = entry.get("prior")
+            if not isinstance(prior, Mapping) or dict(installed) != dict(prior):
+                raise InstallDriftError(f"prepared install step drifted: {step_id}")
+        else:
+            prior = dict(backend.inspect_step(step))
+            entry = {
+                "step_id": step_id,
+                "step": deepcopy(dict(step)),
+                "status": "prepared",
+                "prior": prior,
+            }
+            journal.append(entry)
+            completed[step_id] = entry
+            receipt._persist()
+        try:
+            outcome = dict(backend.apply_step(step))
+        except BaseException:
+            # If the backend demonstrably made no mutation, keep the receipt as
+            # compact as the pre-two-phase format. If state changed, the durable
+            # prepared entry is the replay/rollback authority.
+            observed = backend.inspect_step(step)
+            if dict(observed) == dict(entry.get("prior", {})):
+                journal.remove(entry)
+                completed.pop(step_id, None)
+                receipt._persist()
+            raise
+        entry.update({key: value for key, value in outcome.items() if key != "prior"})
+        entry["status"] = "completed"
         receipt._persist()
     receipt._document["state"] = "applied"
     receipt._persist()
@@ -1055,6 +1412,27 @@ def rollback_receipt(
         raise InstallError("receipt journal is invalid")
     retained_drift: list[dict[str, object]] = []
     retained_entries: list[object] = []
+    if receipt._document.get("services_started"):
+        for service in reversed(_SERVICE_ORDER):
+            try:
+                backend.stop_service(service)
+            except Exception as exc:
+                retained_drift.append(
+                    {
+                        "step_id": f"service:{service}",
+                        "observed": {"error": str(exc)},
+                    }
+                )
+    credential_rollback = getattr(backend, "rollback_credentials", None)
+    if callable(credential_rollback):
+        retained_drift.extend(
+            {
+                "step_id": f"credential:{row.get('credential', 'unknown')}",
+                "observed": dict(row),
+            }
+            for row in credential_rollback(receipt)
+            if isinstance(row, Mapping)
+        )
     for entry in reversed(journal):
         if not isinstance(entry, Mapping):
             continue
@@ -1073,6 +1451,11 @@ def rollback_receipt(
     receipt._document["state"] = "rolled-back"
     receipt._document["activated"] = False
     receipt._document["qualified"] = False
+    receipt._document["services_started"] = False
+    receipt._document["credentials"] = [] if not any(
+        str(row.get("step_id", "")).startswith("credential:")
+        for row in retained_drift
+    ) else receipt._document.get("credentials", [])
     receipt._document["rollback"] = {
         "retained_unknown": list(unknown),
         "retained_drift": retained_drift,
@@ -1120,6 +1503,44 @@ _CREDENTIAL_ADAPTERS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
         (".config", "gh", "hosts.yml"),
     ),
 }
+
+_PRINCIPAL_ACCOUNTS = {
+    "builder": "cortex-builder",
+    "reviewer-planner": "cortex-reviewer-planner",
+    "manager": "cortex-manager",
+}
+
+
+def credential_destination(
+    receipt: InstallReceipt, *, principal: str, provider: str
+) -> tuple[Path, int, int]:
+    adapter = _CREDENTIAL_ADAPTERS.get((principal, provider))
+    if adapter is None:
+        raise CredentialImportError(
+            f"provider/principal pair is not allowed: {principal}/{provider}"
+        )
+    account_name = _PRINCIPAL_ACCOUNTS.get(principal)
+    plan = receipt._document.get("plan")
+    accounts = plan.get("accounts", []) if isinstance(plan, Mapping) else []
+    account = next(
+        (
+            row
+            for row in accounts
+            if isinstance(row, Mapping) and row.get("name") == account_name
+        ),
+        None,
+    )
+    if not isinstance(account, Mapping) or not all(
+        isinstance(account.get(key), expected)
+        for key, expected in (("home", str), ("uid", int), ("gid", int))
+    ):
+        raise CredentialImportError(f"receipt lacks account identity for {principal}")
+    _name, destination_parts = adapter
+    return (
+        Path(str(account["home"])).joinpath(*destination_parts),
+        int(account["uid"]),
+        int(account["gid"]),
+    )
 
 
 def import_credential(
@@ -1178,6 +1599,37 @@ def import_credential(
     if destination.is_symlink():
         raise CredentialImportError("credential destination must not be a symlink")
     _reject_symlink_ancestors(destination, label="credential destination")
+    credentials = receipt._document.setdefault("credentials", [])
+    if not isinstance(credentials, list):
+        raise CredentialImportError("receipt credentials field is invalid")
+    previous = next(
+        (
+            row
+            for row in credentials
+            if isinstance(row, Mapping)
+            and row.get("principal") == principal
+            and row.get("provider") == provider
+        ),
+        None,
+    )
+    if destination.exists():
+        observed = destination.lstat()
+        owner_ok = destination_uid is None or observed.st_uid == destination_uid
+        group_ok = destination_gid is None or observed.st_gid == destination_gid
+        if (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_nlink == 1
+            and stat.S_IMODE(observed.st_mode) == 0o600
+            and owner_ok
+            and group_ok
+            and previous is not None
+            and previous.get("sha256") == digest
+            and _sha256_file(destination) == digest
+        ):
+            return CredentialMetadata(principal, provider, "0600", digest)
+        raise CredentialImportError(
+            f"credential destination already exists without matching receipt authority: {principal}/{provider}"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
         prefix=f".{destination.name}.", dir=destination.parent
@@ -1212,9 +1664,6 @@ def import_credential(
             pass
         raise
     metadata = CredentialMetadata(principal, provider, "0600", digest)
-    credentials = receipt._document.setdefault("credentials", [])
-    if not isinstance(credentials, list):
-        raise CredentialImportError("receipt credentials field is invalid")
     credentials[:] = [
         row
         for row in credentials
@@ -1259,6 +1708,13 @@ def activate_receipt(
             f"{row.get('principal')}/{row.get('provider')}" for row in missing
         )
         raise ActivationError(f"missing required credential: {rendered}")
+    validator = getattr(backend, "validate_credentials", None)
+    if callable(validator):
+        failures = tuple(str(row) for row in validator(receipt))
+        if failures:
+            raise ActivationError(
+                "imported credential validation failed: " + "; ".join(failures)
+            )
     started: list[str] = []
     try:
         for service in _SERVICE_ORDER:
@@ -1307,6 +1763,7 @@ _INVENTORY_CATEGORIES = (
     "polkit",
     "gitconfigs",
     "toolchain_wrappers",
+    "enforcement",
 )
 
 
@@ -1336,6 +1793,13 @@ def attest_generated_inventory(
                 }
             )
             continue
+        for unexpected in sorted(set(installed_rows) - set(expected_rows)):
+            failures.append(
+                {
+                    "code": "unexpected_authority_artifact",
+                    "artifact": f"{category}/{unexpected}",
+                }
+            )
         for name, expected_row in expected_rows.items():
             artifact = f"{category}/{name}"
             actual_row = installed_rows.get(name)
@@ -1398,6 +1862,7 @@ def verify_receipt(
     installed_inventory: Mapping[str, Mapping[str, Mapping[str, str]]],
     service_identities: Mapping[str, Mapping[str, str]],
     evidence_path: Path,
+    service_controller: object | None = None,
 ) -> VerificationResult:
     if not receipt._document.get("services_started"):
         raise ActivationError("services must be started before verify")
@@ -1408,6 +1873,7 @@ def verify_receipt(
     )
     identity_failures: list[dict[str, object]] = []
     expected_users: dict[str, str] = {}
+    expected_exec_paths: dict[str, str] = {}
     unit_rows = expected_inventory.get("units", {})
     if isinstance(unit_rows, Mapping):
         for service in _SERVICE_ORDER:
@@ -1420,7 +1886,8 @@ def verify_receipt(
             for line in _functional_lines(str(row.get("content", ""))):
                 if line.startswith("User="):
                     expected_users[service] = line.partition("=")[2]
-                    break
+                elif line.startswith("ExecStart="):
+                    expected_exec_paths[service] = line.partition("=")[2].split()[0]
     for service in _SERVICE_ORDER:
         identity = service_identities.get(service)
         if not isinstance(identity, Mapping):
@@ -1436,6 +1903,16 @@ def verify_receipt(
                     "artifact": service,
                     "expected": expected_user,
                     "installed": identity.get("user"),
+                }
+            )
+        expected_exec_path = expected_exec_paths.get(service)
+        if expected_exec_path and identity.get("exec_path") != expected_exec_path:
+            identity_failures.append(
+                {
+                    "code": "service_exec_path_drift",
+                    "artifact": service,
+                    "expected": expected_exec_path,
+                    "installed": identity.get("exec_path"),
                 }
             )
         executable_hash = identity.get("exec_sha256")
@@ -1468,6 +1945,13 @@ def verify_receipt(
     atomic_write_json(evidence_path.absolute(), evidence, mode=0o600)
     receipt._document["activated"] = report.ok
     receipt._document["qualified"] = report.ok
+    if not report.ok and service_controller is not None:
+        for service in reversed(_SERVICE_ORDER):
+            try:
+                service_controller.stop_service(service)
+            except Exception:
+                pass
+        receipt._document["services_started"] = False
     receipt._document["verification_evidence"] = {
         "sha256": _sha256_file(evidence_path),
         "result": evidence["result"],

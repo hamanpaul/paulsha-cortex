@@ -64,6 +64,7 @@ def _inventory() -> dict[str, dict[str, dict[str, str]]]:
             ),
             "agy": _artifact("#!/bin/sh\nexec /opt/cortex/toolchain/lib/agy \"$@\"\n", mode="0755"),
         },
+        "enforcement": {},
     }
 
 

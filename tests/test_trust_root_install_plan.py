@@ -240,6 +240,15 @@ def test_plan_rejects_secret_like_or_home_discovery_fields(
         build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
 
 
+def test_plan_rejects_nested_api_key_even_under_a_toolchain_entry(tmp_path: Path) -> None:
+    wheel, bundle = _artifacts(tmp_path)
+    config = _safe_config(tmp_path)
+    config["toolchain"]["codex"]["api_key"] = "PLAINTEXT-CREDENTIAL"
+
+    with pytest.raises(InstallPlanError, match="api_key"):
+        build_install_plan(config=config, candidate_wheel=wheel, bundle=bundle)
+
+
 def test_plan_document_never_contains_secret_bytes_or_operator_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

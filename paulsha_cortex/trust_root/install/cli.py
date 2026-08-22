@@ -19,6 +19,7 @@ from .core import (
     activate_receipt,
     apply_plan,
     atomic_write_json,
+    bind_bundle_artifacts,
     build_install_plan,
     import_credential,
     new_install_receipt,
@@ -121,6 +122,7 @@ def _plan_command(args: argparse.Namespace) -> int:
         candidate_wheel=Path(str(wheel["resolved_path"])),
         bundle=Path(str(manifest["manifest_path"])),
     )
+    plan = bind_bundle_artifacts(plan, manifest)
     candidate = plan.get("candidate")
     if not isinstance(candidate, dict):
         raise InstallPlanError("generated plan candidate is invalid")
@@ -271,6 +273,7 @@ def _verify_command(args: argparse.Namespace) -> int:
         installed_inventory=backend.installed_inventory(plan),
         service_identities=backend.service_identities(),
         evidence_path=Path(args.evidence).expanduser().absolute(),
+        service_controller=backend,
     )
     if args.json_output:
         _emit(result.to_dict())

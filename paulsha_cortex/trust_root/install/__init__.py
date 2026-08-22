@@ -18,6 +18,7 @@ from .core import (
     apply_plan,
     atomic_write_json,
     attest_generated_inventory,
+    bind_bundle_artifacts,
     build_install_plan,
     canonical_plan_bytes,
     import_credential,

@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -23,6 +24,7 @@ from .core import (
     _account_digest,
     _desired_digest,
     _reject_symlink_ancestors,
+    credential_destination,
 )
 
 
@@ -96,6 +98,55 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _tree_sha256(root: Path) -> str:
+    """Hash every installed venv leaf, including relative names and symlinks."""
+
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda row: row.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if relative == ".cortex-tree.sha256":
+            continue
+        observed = path.lstat()
+        digest.update(relative.encode("utf-8") + b"\0")
+        digest.update(format(stat.S_IMODE(observed.st_mode), "04o").encode("ascii") + b"\0")
+        if stat.S_ISLNK(observed.st_mode):
+            digest.update(b"L\0" + os.readlink(path).encode("utf-8") + b"\0")
+        elif stat.S_ISREG(observed.st_mode):
+            digest.update(b"F\0" + _sha256_file(path).encode("ascii") + b"\0")
+        elif stat.S_ISDIR(observed.st_mode):
+            digest.update(b"D\0")
+        else:
+            raise InstallDriftError(f"venv contains unsupported filesystem object: {path}")
+    return digest.hexdigest()
+
+
+def _copy_verified_file(source: Path, destination: Path, expected: str) -> None:
+    """Copy one locked artifact from a no-follow descriptor and verify in-flight."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(source, flags)
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise InstallDriftError(f"locked artifact is not a single-link regular file: {source}")
+        digest = hashlib.sha256()
+        with os.fdopen(source_fd, "rb", closefd=False) as input_stream, destination.open("xb") as output_stream:
+            for chunk in iter(lambda: input_stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                output_stream.write(chunk)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        after = os.fstat(source_fd)
+        if (before.st_dev, before.st_ino, before.st_size) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+        ) or digest.hexdigest() != expected:
+            raise InstallDriftError(f"locked artifact changed while being copied: {source}")
+    finally:
+        os.close(source_fd)
+
+
 def _account_state(step: Mapping[str, object]) -> dict[str, object]:
     name = step.get("name")
     if not isinstance(name, str) or not name:
@@ -150,6 +201,7 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
 
 def _venv_slot_matches(slot: Path, expected: str) -> bool:
     marker = slot / ".cortex-wheel.sha256"
+    tree_marker = slot / ".cortex-tree.sha256"
     try:
         return (
             slot.is_dir()
@@ -157,6 +209,9 @@ def _venv_slot_matches(slot: Path, expected: str) -> bool:
             and marker.is_file()
             and not marker.is_symlink()
             and marker.read_text(encoding="ascii").strip() == expected
+            and tree_marker.is_file()
+            and not tree_marker.is_symlink()
+            and tree_marker.read_text(encoding="ascii").strip() == _tree_sha256(slot)
             and (slot / "bin/python").is_file()
         )
     except OSError:
@@ -171,24 +226,40 @@ def _read_acl(path: Path) -> list[dict[str, object]]:
         return []
     rows: list[dict[str, object]] = []
     for raw in result.stdout.splitlines():
-        default = raw.startswith("default:user:")
-        prefix = "default:user:" if default else "user:"
-        if not raw.startswith(prefix):
+        default = raw.startswith("default:")
+        body = raw.removeprefix("default:")
+        entry_type, separator, remainder = body.partition(":")
+        if not separator or entry_type not in {"user", "group", "mask", "other"}:
             continue
-        body = raw[len(prefix) :]
-        account, separator, perms = body.partition(":")
-        if not separator or not account:
+        account, separator, perms = remainder.partition(":")
+        if not separator:
             continue
-        rows.append(
-            {
-                "account": account,
-                "perms": perms.replace("-", ""),
-                "default": default,
-            }
-        )
+        if not account and not default and entry_type in {"user", "other"}:
+            continue
+        if not account and entry_type == "group" and not (
+            default or any(
+                candidate.startswith(("user:", "group:"))
+                and candidate.split(":", 2)[1]
+                for candidate in result.stdout.splitlines()
+            )
+        ):
+            continue
+        row: dict[str, object] = {
+            "account": account,
+            "perms": perms.replace("-", ""),
+            "default": default,
+        }
+        if entry_type != "user" or not account:
+            row["entry_type"] = entry_type
+        rows.append(row)
     return sorted(
         rows,
-        key=lambda row: (bool(row["default"]), str(row["account"]), str(row["perms"])),
+        key=lambda row: (
+            bool(row["default"]),
+            str(row.get("entry_type", "user")),
+            str(row["account"]),
+            str(row["perms"]),
+        ),
     )
 
 
@@ -212,6 +283,190 @@ def _snapshot(path: Path) -> dict[str, object]:
         snapshot["content_base64"] = base64.b64encode(content).decode("ascii")
         snapshot["installed_sha256"] = hashlib.sha256(content).hexdigest()
     return snapshot
+
+
+def _symlink_state(step: Mapping[str, object]) -> dict[str, object]:
+    path = Path(str(step.get("path", "")))
+    target = Path(str(step.get("target", "")))
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    if not stat.S_ISLNK(observed.st_mode):
+        return {"exists": True, "installed_sha256": None}
+    link_target = Path(os.readlink(path))
+    resolved = (path.parent / link_target).resolve(strict=False)
+    matches = (
+        target.is_absolute()
+        and resolved == target.resolve(strict=False)
+        and _account_name(observed.st_uid) == step.get("owner")
+        and _group_name(observed.st_gid) == step.get("group")
+    )
+    return {
+        "exists": True,
+        "owner": _account_name(observed.st_uid),
+        "group": _group_name(observed.st_gid),
+        "target": str(link_target),
+        "installed_sha256": step.get("desired_sha256") if matches else None,
+    }
+
+
+def _toolchain_state(step: Mapping[str, object]) -> dict[str, object]:
+    path = Path(str(step.get("path", "")))
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    shape = step.get("shape", "file")
+    if shape == "tree":
+        entrypoint = path / str(step.get("entrypoint", ""))
+        content_matches = (
+            stat.S_ISDIR(observed.st_mode)
+            and not stat.S_ISLNK(observed.st_mode)
+            and entrypoint.is_file()
+            and not entrypoint.is_symlink()
+            and _tree_sha256(path) == step.get("desired_sha256")
+        )
+    else:
+        content_matches = (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_nlink == 1
+            and _sha256_file(path) == step.get("desired_sha256")
+        )
+    matches = (
+        content_matches
+        and _account_name(observed.st_uid) == step.get("owner")
+        and _group_name(observed.st_gid) == step.get("group")
+        and format(stat.S_IMODE(observed.st_mode), "04o") == step.get("mode")
+    )
+    return {
+        "exists": True,
+        "owner": _account_name(observed.st_uid),
+        "group": _group_name(observed.st_gid),
+        "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
+        "installed_sha256": step.get("desired_sha256") if matches else None,
+    }
+
+
+def _extract_locked_tree(archive: Path, destination: Path) -> None:
+    """Extract only regular files, directories, and in-tree relative symlinks."""
+
+    with tarfile.open(archive, mode="r:*") as bundle:
+        members = bundle.getmembers()
+        for member in members:
+            relative = Path(member.name)
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                raise InstallDriftError(f"toolchain archive has unsafe member: {member.name}")
+            if not (member.isdir() or member.isfile() or member.issym()):
+                raise InstallDriftError(f"toolchain archive has unsupported member: {member.name}")
+            if member.issym():
+                target = Path(member.linkname)
+                if target.is_absolute() or ".." in (relative.parent / target).parts:
+                    raise InstallDriftError(f"toolchain archive symlink escapes: {member.name}")
+        for member in sorted((row for row in members if row.isdir()), key=lambda row: row.name):
+            path = destination / member.name
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, member.mode & 0o777)
+        for member in sorted((row for row in members if row.isfile()), key=lambda row: row.name):
+            path = destination / member.name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise InstallDriftError(f"toolchain archive member is unreadable: {member.name}")
+            with source, path.open("xb") as stream:
+                shutil.copyfileobj(source, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(path, member.mode & 0o777)
+        for member in sorted((row for row in members if row.issym()), key=lambda row: row.name):
+            path = destination / member.name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(member.linkname)
+
+
+def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
+    path = Path(str(step.get("path", "")))
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        return {"exists": True, "installed_sha256": None}
+    prefix = ("git", "-c", f"safe.directory={path}", "-C", str(path))
+    head = _run((*prefix, "rev-parse", "HEAD"))
+    remote = _run((*prefix, "remote", "get-url", "origin"))
+    clean = _run((*prefix, "status", "--porcelain=v1", "--untracked-files=all"))
+    integrity = _run((*prefix, "fsck", "--strict", "--no-dangling"))
+    expected_uid = _resolve_uid(step.get("owner"))
+    expected_gid = _resolve_gid(step.get("group"))
+    tree_safe = True
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        for name in (".", *directories, *files):
+            candidate = Path(root) if name == "." else Path(root) / name
+            try:
+                candidate_state = candidate.lstat()
+            except OSError:
+                tree_safe = False
+                break
+            if (
+                candidate_state.st_uid != expected_uid
+                or candidate_state.st_gid != expected_gid
+                or stat.S_IMODE(candidate_state.st_mode) & 0o002
+            ):
+                tree_safe = False
+                break
+            if stat.S_ISLNK(candidate_state.st_mode):
+                target = Path(os.readlink(candidate))
+                resolved = (candidate.parent / target).resolve(strict=False)
+                try:
+                    resolved.relative_to(path.resolve(strict=True))
+                except ValueError:
+                    tree_safe = False
+                    break
+        if not tree_safe:
+            break
+    matches = (
+        head.returncode == 0
+        and head.stdout.strip() == step.get("commit")
+        and remote.returncode == 0
+        and remote.stdout.strip() == step.get("remote")
+        and clean.returncode == 0
+        and not clean.stdout.strip()
+        and integrity.returncode == 0
+        and tree_safe
+        and _account_name(observed.st_uid) == step.get("owner")
+        and _group_name(observed.st_gid) == step.get("group")
+        and format(stat.S_IMODE(observed.st_mode), "04o") == step.get("mode")
+    )
+    return {
+        "exists": True,
+        "owner": _account_name(observed.st_uid),
+        "group": _group_name(observed.st_gid),
+        "mode": format(stat.S_IMODE(observed.st_mode), "04o"),
+        "commit": head.stdout.strip() if head.returncode == 0 else "",
+        "remote": remote.stdout.strip() if remote.returncode == 0 else "",
+        "clean": clean.returncode == 0 and not clean.stdout.strip(),
+        "integrity": integrity.returncode == 0,
+        "tree_safe": tree_safe,
+        "installed_sha256": step.get("desired_sha256") if matches else None,
+    }
+
+
+def _chown_tree(path: Path, uid: int, gid: int) -> None:
+    os.chown(path, uid, gid, follow_symlinks=False)
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        for name in (*directories, *files):
+            os.chown(Path(root) / name, uid, gid, follow_symlinks=False)
+
+
+def _remove_group_other_write(path: Path) -> None:
+    """Make a freshly cloned tree non-writable outside its owning account."""
+
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        for candidate in (Path(root), *(Path(root) / name for name in (*directories, *files))):
+            observed = candidate.lstat()
+            if not stat.S_ISLNK(observed.st_mode):
+                os.chmod(candidate, stat.S_IMODE(observed.st_mode) & ~0o022)
 
 
 def _expected_acl_mode(step: Mapping[str, object]) -> str:
@@ -245,10 +500,104 @@ def _expected_acls(step: Mapping[str, object]) -> list[dict[str, object]]:
         for row in step.get("acls", [])
         if isinstance(row, Mapping)
     ]
+    base = _mode(step.get("mode"))
+
+    def rendered(bits: int) -> str:
+        return "".join(
+            char for bit, char in ((0o4, "r"), (0o2, "w"), (0o1, "x")) if bits & bit
+        )
+
+    access_rows = [row for row in rows if not row["default"]]
+    if access_rows:
+        access_mask = (base >> 3) & 0o7
+        for row in access_rows:
+            perms = str(row["perms"])
+            access_mask |= (0o4 if "r" in perms else 0) | (0o2 if "w" in perms else 0) | (
+                0o1 if "x" in perms else 0
+            )
+        rows += [
+            {
+                "account": "",
+                "perms": rendered((base >> 3) & 0o7),
+                "default": False,
+                "entry_type": "group",
+            },
+            {
+                "account": "",
+                "perms": rendered(access_mask),
+                "default": False,
+                "entry_type": "mask",
+            },
+        ]
+    default_rows = [row for row in rows if row["default"]]
+    if default_rows:
+        default_mask = (base >> 3) & 0o7
+        for row in default_rows:
+            perms = str(row["perms"])
+            default_mask |= (0o4 if "r" in perms else 0) | (0o2 if "w" in perms else 0) | (
+                0o1 if "x" in perms else 0
+            )
+        rows += [
+            {
+                "account": "",
+                "perms": rendered((base >> 6) & 0o7),
+                "default": True,
+                "entry_type": "user",
+            },
+            {
+                "account": "",
+                "perms": rendered((base >> 3) & 0o7),
+                "default": True,
+                "entry_type": "group",
+            },
+            {
+                "account": "",
+                "perms": rendered(default_mask),
+                "default": True,
+                "entry_type": "mask",
+            },
+            {
+                "account": "",
+                "perms": rendered(base & 0o7),
+                "default": True,
+                "entry_type": "other",
+            },
+        ]
     return sorted(
         rows,
-        key=lambda row: (bool(row["default"]), str(row["account"]), str(row["perms"])),
+        key=lambda row: (
+            bool(row["default"]),
+            str(row.get("entry_type", "user")),
+            str(row["account"]),
+            str(row["perms"]),
+        ),
     )
+
+
+def _in_flight_process_count(accounts: Sequence[Mapping[str, object]]) -> int:
+    job_uids = {
+        int(row["uid"])
+        for row in accounts
+        if row.get("name") in {
+            "cortex-builder",
+            "cortex-reviewer-planner",
+            "cortex-gate",
+        }
+        and isinstance(row.get("uid"), int)
+    }
+    count = 0
+    for status_path in Path("/proc").glob("[0-9]*/status"):
+        try:
+            uid_line = next(
+                line for line in status_path.read_text(encoding="ascii").splitlines()
+                if line.startswith("Uid:")
+            )
+            real_uid = int(uid_line.split()[1])
+        except (OSError, StopIteration, ValueError, IndexError):
+            continue
+        if real_uid in job_uids:
+            count += 1
+    return count
 
 
 def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object]) -> bool:
@@ -281,6 +630,20 @@ def _universal_nopasswd() -> bool:
         except OSError:
             continue
     return False
+
+
+def _password_locked(name: str) -> bool | None:
+    try:
+        for line in Path("/etc/shadow").read_text(
+            encoding="utf-8", errors="strict"
+        ).splitlines():
+            account, separator, remainder = line.partition(":")
+            if separator and account == name:
+                password = remainder.partition(":")[0]
+                return password.startswith(("!", "*"))
+    except OSError:
+        return None
+    return None
 
 
 class LocalInstallBackend:
@@ -324,6 +687,12 @@ class LocalInstallBackend:
                 "gid": record.pw_gid,
                 "home": record.pw_dir,
                 "shell": record.pw_shell,
+                "supplementary_groups": sorted(
+                    group.gr_name
+                    for group in grp.getgrall()
+                    if name in group.gr_mem
+                ),
+                "password_locked": _password_locked(name),
             }
         account_uids = {record.pw_uid: record.pw_name for record in pwd.getpwall()}
         all_groups = {record.gr_name: record for record in grp.getgrall()}
@@ -361,7 +730,7 @@ class LocalInstallBackend:
             "acl": shutil.which("getfacl") is not None and shutil.which("setfacl") is not None,
             "disk_free_bytes": disk_free,
             "universal_nopasswd": _universal_nopasswd(),
-            "in_flight_jobs": 0,
+            "in_flight_jobs": _in_flight_process_count(desired_accounts),
             "services": services,
             "accounts": accounts,
             "account_uids": account_uids,
@@ -375,6 +744,10 @@ class LocalInstallBackend:
             return _account_state(step)
         if step.get("kind") == "venv":
             return _venv_state(step)
+        if step.get("kind") == "toolchain":
+            return _toolchain_state(step)
+        if step.get("kind") == "repository":
+            return _repository_state(step)
         if step.get("kind") == "systemctl":
             if step.get("action") == "daemon-reload":
                 return {
@@ -390,13 +763,23 @@ class LocalInstallBackend:
             }
         if step.get("kind") != "asset":
             raise InstallPlanError(f"unsupported step kind: {step.get('kind')}")
+        if step.get("asset_type") == "symlink":
+            return _symlink_state(step)
         path = Path(str(step.get("path")))
         observed = _snapshot(path)
         if not observed.get("exists"):
             return observed
         if step.get("asset_type") == "directory":
             actual_mode = observed.get("mode")
-            actual_acls = observed.get("acl", [])
+            actual_acls = sorted(
+                observed.get("acl", []),
+                key=lambda row: (
+                    bool(row.get("default")),
+                    str(row.get("entry_type", "user")),
+                    str(row.get("account")),
+                    str(row.get("perms")),
+                ),
+            )
             matches = (
                 observed.get("is_directory") is True
                 and observed.get("owner") == step.get("owner")
@@ -481,6 +864,8 @@ class LocalInstallBackend:
             wheel = Path(str(step.get("wheel_source", "")))
             expected = step.get("wheel_sha256")
             wheelhouse = step.get("wheelhouse")
+            if step.get("wheelhouse_locked") is not True:
+                raise InstallPlanError("venv wheelhouse must be explicitly locked")
             if (
                 not slot.is_absolute()
                 or not active.is_absolute()
@@ -532,17 +917,39 @@ class LocalInstallBackend:
                 temporary = Path(tempfile.mkdtemp(prefix=f".{slot.name}.", dir=slot.parent))
                 try:
                     _run(("python3", "-m", "venv", str(temporary)), check=True)
-                    link_dirs = sorted(
-                        {
-                            str(Path(str(row["source"])).parent)
-                            for row in wheelhouse
-                            if isinstance(row, Mapping)
-                        }
+                    locked_dir = temporary / ".cortex-wheelhouse"
+                    locked_dir.mkdir(mode=0o700)
+                    locked_paths: list[tuple[Path, str]] = []
+                    seen_names: set[str] = set()
+                    for row in wheelhouse:
+                        assert isinstance(row, Mapping)
+                        source = Path(str(row["source"]))
+                        digest = str(row["sha256"])
+                        if source.name in seen_names or not source.name.endswith(".whl"):
+                            raise InstallPlanError("locked wheelhouse names must be unique wheels")
+                        seen_names.add(source.name)
+                        copied = locked_dir / source.name
+                        _copy_verified_file(source, copied, digest)
+                        locked_paths.append((copied, digest))
+                    requirements = locked_dir / "requirements.lock"
+                    requirements.write_text(
+                        "".join(
+                            f"{path.as_uri()} --hash=sha256:{digest}\n"
+                            for path, digest in locked_paths
+                        ),
+                        encoding="utf-8",
                     )
-                    argv = [str(temporary / "bin/python"), "-m", "pip", "install", "--no-index"]
-                    for directory in link_dirs:
-                        argv.extend(("--find-links", directory))
-                    argv.append(str(wheel))
+                    argv = [
+                        str(temporary / "bin/python"),
+                        "-m",
+                        "pip",
+                        "install",
+                        "--no-index",
+                        "--no-deps",
+                        "--require-hashes",
+                        "--requirement",
+                        str(requirements),
+                    ]
                     _run(tuple(argv), check=True)
                     _run(
                         (
@@ -554,6 +961,10 @@ class LocalInstallBackend:
                     )
                     (temporary / ".cortex-wheel.sha256").write_text(
                         expected + "\n", encoding="ascii"
+                    )
+                    os.chmod(temporary, 0o755)
+                    (temporary / ".cortex-tree.sha256").write_text(
+                        _tree_sha256(temporary) + "\n", encoding="ascii"
                     )
                     os.rename(temporary, slot)
                 except BaseException:
@@ -573,6 +984,118 @@ class LocalInstallBackend:
             if installed.get("installed_sha256") != expected:
                 raise InstallDriftError("candidate venv cutover did not match the plan")
             return {"prior": prior_link, **installed}
+        if kind == "toolchain":
+            prior = dict(self.inspect_step(step))
+            if prior.get("exists"):
+                if prior.get("installed_sha256") != step.get("desired_sha256"):
+                    raise InstallDriftError(f"existing toolchain binary drifted: {step.get('name')}")
+                return {"prior": prior, **prior}
+            source = Path(str(step.get("source", "")))
+            path = Path(str(step.get("path", "")))
+            expected = step.get("desired_sha256")
+            source_sha = step.get("source_sha256")
+            shape = step.get("shape", "file")
+            if (
+                not source.is_absolute()
+                or not path.is_absolute()
+                or not isinstance(expected, str)
+                or not isinstance(source_sha, str)
+                or source.is_symlink()
+                or not source.is_file()
+                or source.lstat().st_nlink != 1
+                or _sha256_file(source) != source_sha
+                or shape not in {"file", "tree"}
+            ):
+                raise InstallPlanError("toolchain step is not fully hash-bound")
+            _reject_symlink_ancestors(source, label="toolchain source", include_leaf=False)
+            _reject_symlink_ancestors(path, label="toolchain", include_leaf=False)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if shape == "file":
+                descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+                os.close(descriptor)
+                temporary_path = Path(temporary)
+                temporary_path.unlink()
+                try:
+                    _copy_verified_file(source, temporary_path, source_sha)
+                    os.chown(temporary_path, _resolve_uid(step.get("owner")), _resolve_gid(step.get("group")))
+                    os.chmod(temporary_path, _mode(step.get("mode")))
+                    os.rename(temporary_path, path)
+                finally:
+                    try:
+                        temporary_path.unlink()
+                    except FileNotFoundError:
+                        pass
+            else:
+                temporary_path = Path(tempfile.mkdtemp(prefix=f".{path.name}.", dir=path.parent))
+                locked_archive = temporary_path.parent / f".{path.name}.{os.getpid()}.tar"
+                try:
+                    _copy_verified_file(source, locked_archive, source_sha)
+                    _extract_locked_tree(locked_archive, temporary_path)
+                    if _tree_sha256(temporary_path) != expected:
+                        raise InstallDriftError(f"extracted toolchain tree hash mismatch: {step.get('name')}")
+                    _chown_tree(
+                        temporary_path,
+                        _resolve_uid(step.get("owner")),
+                        _resolve_gid(step.get("group")),
+                    )
+                    os.chmod(temporary_path, _mode(step.get("mode")))
+                    os.rename(temporary_path, path)
+                finally:
+                    shutil.rmtree(temporary_path, ignore_errors=True)
+                    try:
+                        locked_archive.unlink()
+                    except FileNotFoundError:
+                        pass
+            installed = dict(self.inspect_step(step))
+            if installed.get("installed_sha256") != expected:
+                raise InstallDriftError(f"installed toolchain binary drifted: {step.get('name')}")
+            return {"prior": prior, **installed}
+        if kind == "repository":
+            prior = dict(self.inspect_step(step))
+            if prior.get("exists"):
+                if prior.get("installed_sha256") != step.get("desired_sha256"):
+                    raise InstallDriftError(f"existing repository drifted: {step.get('slug')}")
+                return {"prior": prior, **prior}
+            source = Path(str(step.get("source", "")))
+            path = Path(str(step.get("path", "")))
+            source_sha = step.get("source_sha256")
+            commit = step.get("commit")
+            remote = step.get("remote")
+            if (
+                not source.is_absolute()
+                or not path.is_absolute()
+                or not isinstance(source_sha, str)
+                or not isinstance(commit, str)
+                or not isinstance(remote, str)
+                or source.is_symlink()
+                or not source.is_file()
+                or source.lstat().st_nlink != 1
+                or _sha256_file(source) != source_sha
+            ):
+                raise InstallDriftError("repository source bundle is missing or hash-mismatched")
+            _reject_symlink_ancestors(source, label="repository bundle", include_leaf=False)
+            _reject_symlink_ancestors(path, label="repository", include_leaf=False)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            transaction_dir = Path(tempfile.mkdtemp(prefix=f".{path.name}.", dir=path.parent))
+            checkout = transaction_dir / "checkout"
+            locked_bundle = transaction_dir / "source.bundle"
+            try:
+                _copy_verified_file(source, locked_bundle, source_sha)
+                _run(("git", "clone", "--no-checkout", str(locked_bundle), str(checkout)), check=True)
+                _run(("git", "-C", str(checkout), "checkout", "--detach", commit), check=True)
+                _run(("git", "-C", str(checkout), "remote", "set-url", "origin", remote), check=True)
+                uid = _resolve_uid(step.get("owner"))
+                gid = _resolve_gid(step.get("group"))
+                _chown_tree(checkout, uid, gid)
+                _remove_group_other_write(checkout)
+                os.chmod(checkout, _mode(step.get("mode")))
+                os.rename(checkout, path)
+            finally:
+                shutil.rmtree(transaction_dir, ignore_errors=True)
+            installed = dict(self.inspect_step(step))
+            if installed.get("installed_sha256") != step.get("desired_sha256"):
+                raise InstallDriftError(f"installed repository drifted: {step.get('slug')}")
+            return {"prior": prior, **installed}
         if kind == "systemctl":
             action = step.get("action")
             unit = step.get("unit")
@@ -591,7 +1114,7 @@ class LocalInstallBackend:
         path = Path(str(step.get("path")))
         if not path.is_absolute() or ".." in path.parts:
             raise UnsafeInstallPathError(f"unsafe asset path: {path}")
-        _reject_symlink_ancestors(path, label="asset")
+        _reject_symlink_ancestors(path, label="asset", include_leaf=False)
         prior = dict(self.inspect_step(step))
         if prior.get("exists"):
             if not _state_matches_step(step, prior):
@@ -600,6 +1123,27 @@ class LocalInstallBackend:
                 )
             return {"prior": prior, **prior}
         asset_type = step.get("asset_type", "file")
+        if asset_type == "symlink":
+            target = Path(str(step.get("target", "")))
+            if not target.is_absolute() or ".." in target.parts:
+                raise UnsafeInstallPathError(f"unsafe symlink target: {target}")
+            if not target.is_dir() or target.is_symlink():
+                raise InstallDriftError(f"symlink target is not an exact directory: {target}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
+            try:
+                temporary.symlink_to(os.path.relpath(target, path.parent))
+                os.lchown(temporary, _resolve_uid(step.get("owner")), _resolve_gid(step.get("group")))
+                os.rename(temporary, path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+            installed = dict(self.inspect_step(step))
+            if installed.get("installed_sha256") != step.get("desired_sha256"):
+                raise InstallDriftError(f"installed symlink does not match desired state: {step.get('step_id')}")
+            return {"prior": prior, **installed}
         if asset_type == "directory":
             path.mkdir(parents=True, exist_ok=True)
         elif asset_type == "file":
@@ -664,6 +1208,18 @@ class LocalInstallBackend:
             # safely requires a host-wide owned-file/process proof that the
             # install receipt cannot provide.
             return
+        if step.get("kind") == "toolchain":
+            path = Path(str(step.get("path", "")))
+            if not prior.get("exists") and not path.is_symlink():
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path)
+            return
+        if step.get("kind") == "repository":
+            # Repositories are durable state. Even a receipt-created checkout is
+            # retained and may only be adopted again at the exact commit/remote.
+            return
         if step.get("kind") == "venv":
             active = Path(str(step.get("active_link", "")))
             if not active.is_symlink():
@@ -694,6 +1250,11 @@ class LocalInstallBackend:
                 return
             raise InstallPlanError(f"unsupported rollback kind: {step.get('kind')}")
         path = Path(str(step.get("path")))
+        if step.get("asset_type") == "symlink":
+            if not prior.get("exists"):
+                if path.is_symlink():
+                    path.unlink()
+            return
         if not prior.get("exists"):
             if path.is_file() and not path.is_symlink():
                 path.unlink()
@@ -707,10 +1268,92 @@ class LocalInstallBackend:
         os.chmod(path, _mode(prior.get("mode")), follow_symlinks=False)
 
     def list_unknown_state(self, receipt: InstallReceipt) -> Sequence[str]:
-        # Unknown children are never recursively removed; rollback_step already
-        # refuses to remove a non-empty directory.  Their names are intentionally
-        # not guessed here because a receipt cannot claim ownership of them.
-        return ()
+        retained: list[str] = []
+        journal = receipt.to_dict().get("journal", [])
+        for entry in journal if isinstance(journal, list) else []:
+            if not isinstance(entry, Mapping):
+                continue
+            step = entry.get("step")
+            prior = entry.get("prior")
+            if (
+                isinstance(step, Mapping)
+                and step.get("kind") == "asset"
+                and step.get("asset_type") == "directory"
+                and isinstance(prior, Mapping)
+                and not prior.get("exists")
+            ):
+                path = Path(str(step.get("path", "")))
+                try:
+                    if path.is_dir() and any(path.iterdir()):
+                        retained.append(str(path))
+                except OSError:
+                    retained.append(str(path))
+        return tuple(sorted(set(retained)))
+
+    def validate_credentials(self, receipt: InstallReceipt) -> Sequence[str]:
+        failures: list[str] = []
+        rows = receipt.to_dict().get("credentials", [])
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, Mapping):
+                failures.append("invalid credential metadata")
+                continue
+            principal = str(row.get("principal", ""))
+            provider = str(row.get("provider", ""))
+            try:
+                destination, uid, gid = credential_destination(
+                    receipt, principal=principal, provider=provider
+                )
+                observed = destination.lstat()
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or observed.st_nlink != 1
+                    or observed.st_uid != uid
+                    or observed.st_gid != gid
+                    or stat.S_IMODE(observed.st_mode) != 0o600
+                    or _sha256_file(destination) != row.get("sha256")
+                ):
+                    failures.append(f"{principal}/{provider} metadata or hash mismatch")
+            except (InstallError, OSError) as exc:
+                failures.append(f"{principal}/{provider} unavailable: {exc}")
+        return tuple(failures)
+
+    def rollback_credentials(self, receipt: InstallReceipt) -> Sequence[dict[str, object]]:
+        retained: list[dict[str, object]] = []
+        rows = receipt.to_dict().get("credentials", [])
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, Mapping):
+                continue
+            principal = str(row.get("principal", ""))
+            provider = str(row.get("provider", ""))
+            try:
+                destination, uid, gid = credential_destination(
+                    receipt, principal=principal, provider=provider
+                )
+                observed = destination.lstat()
+            except FileNotFoundError:
+                continue
+            except (InstallError, OSError) as exc:
+                retained.append(
+                    {"credential": f"{principal}/{provider}", "reason": str(exc)}
+                )
+                continue
+            if (
+                stat.S_ISREG(observed.st_mode)
+                and observed.st_nlink == 1
+                and observed.st_uid == uid
+                and observed.st_gid == gid
+                and stat.S_IMODE(observed.st_mode) == 0o600
+                and _sha256_file(destination) == row.get("sha256")
+            ):
+                destination.unlink()
+            else:
+                retained.append(
+                    {
+                        "credential": f"{principal}/{provider}",
+                        "reason": "credential drifted after import",
+                    }
+                )
+        return tuple(retained)
 
     def start_service(self, name: str) -> None:
         _run(("systemctl", "start", name), check=True)
@@ -741,6 +1384,41 @@ class LocalInstallBackend:
                     "group": str(snapshot.get("group", "")),
                     "mode": str(snapshot.get("mode", "")),
                 }
+        # Enumerate unexpected Cortex authority files as well as desired paths;
+        # otherwise the attestor could only prove presence, never exclusivity.
+        for category in ("units", "polkit", "shim", "toolchain_wrappers"):
+            expected_rows = generated.get(category, {})
+            if not isinstance(expected_rows, Mapping) or not expected_rows:
+                continue
+            parents = {
+                Path(str(row.get("path", ""))).parent
+                for row in expected_rows.values()
+                if isinstance(row, Mapping)
+            }
+            for parent in parents:
+                try:
+                    candidates = list(parent.iterdir())
+                except OSError:
+                    continue
+                for path in candidates:
+                    if path.name in expected_rows:
+                        continue
+                    authority_bearing = (
+                        category == "toolchain_wrappers"
+                        or path.name.startswith("cortex")
+                        or (category == "polkit" and "cortex" in path.name)
+                    )
+                    if not authority_bearing:
+                        continue
+                    content = ""
+                    if path.is_file() and not path.is_symlink():
+                        content = path.read_text(encoding="utf-8", errors="replace")
+                    installed.setdefault(category, {})[path.name] = {
+                        "content": content,
+                        "owner": "",
+                        "group": "",
+                        "mode": "",
+                    }
         return installed
 
     def service_identities(self) -> dict[str, dict[str, str]]:
@@ -759,10 +1437,24 @@ class LocalInstallBackend:
                 if separator:
                     values[key] = value
             exec_value = values.get("ExecStart", "")
+            match = re.search(r"(?:path=|argv\[\]=)(/[^ ;]+)", exec_value)
+            exec_path = match.group(1) if match else ""
+            executable = Path(exec_path)
+            try:
+                executable_state = executable.resolve(strict=True).lstat()
+            except OSError:
+                executable_state = None
             identities[name] = {
                 "user": values.get("User", ""),
+                "exec_path": exec_path,
                 "exec_sha256": (
-                    hashlib.sha256(exec_value.encode()).hexdigest() if exec_value else ""
+                    _sha256_file(executable.resolve(strict=True))
+                    if exec_path
+                    and executable_state is not None
+                    and stat.S_ISREG(executable_state.st_mode)
+                    and executable_state.st_nlink == 1
+                    and not stat.S_IMODE(executable_state.st_mode) & 0o022
+                    else ""
                 ),
             }
         return identities

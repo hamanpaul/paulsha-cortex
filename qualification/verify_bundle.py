@@ -20,6 +20,8 @@ ROOT_KEYS = {
     "wheel",
     "wheelhouse",
     "generated_artifacts",
+    "toolchain",
+    "source_repositories",
 }
 
 
@@ -98,6 +100,98 @@ def validate_bundle(
     }
     if len(generated_paths) != len(generated):
         raise ValueError("bundle contains duplicate generated artifact paths")
+
+    tools = payload["toolchain"]
+    if not isinstance(tools, list) or not tools:
+        raise ValueError("toolchain must be a non-empty array")
+    tool_names: set[str] = set()
+    tool_paths: set[str] = set()
+    for index, raw in enumerate(tools):
+        if not isinstance(raw, dict):
+            raise ValueError(f"toolchain[{index}] must be an object")
+        required = {"name", "version", "shape", "path", "sha256"}
+        if raw.get("shape") == "tree":
+            required |= {"entrypoint", "installed_sha256"}
+        if set(raw) != required:
+            raise ValueError(f"toolchain[{index}] has missing or unknown fields")
+        name = raw.get("name")
+        version = raw.get("version")
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or name in tool_names
+            or not isinstance(version, str)
+            or not version
+            or raw.get("shape") not in {"file", "tree"}
+        ):
+            raise ValueError(f"toolchain[{index}] identity is invalid")
+        if raw.get("shape") == "tree":
+            entrypoint = raw.get("entrypoint")
+            pure_entrypoint = PurePosixPath(str(entrypoint))
+            if (
+                not isinstance(entrypoint, str)
+                or pure_entrypoint.is_absolute()
+                or ".." in pure_entrypoint.parts
+                or not isinstance(raw.get("installed_sha256"), str)
+                or SHA256.fullmatch(raw["installed_sha256"]) is None
+            ):
+                raise ValueError(f"toolchain[{index}] tree metadata is invalid")
+        tool_names.add(name)
+        tool_paths.add(
+            _entry(
+                {"path": raw["path"], "sha256": raw["sha256"]},
+                root=root,
+                label=f"toolchain[{index}]",
+            )
+        )
+    if tool_names != {"codex", "claude", "copilot", "agy", "srt", "openspec"}:
+        raise ValueError("toolchain inventory is incomplete")
+    actual_tool_paths = {
+        path.relative_to(root).as_posix()
+        for path in (root / "toolchain").iterdir()
+        if path.is_file() and not path.is_symlink()
+    }
+    if tool_paths != actual_tool_paths:
+        raise ValueError("toolchain directory has undeclared or missing artifacts")
+
+    repositories = payload["source_repositories"]
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("source_repositories must be a non-empty array")
+    repository_paths: set[str] = set()
+    slugs: set[str] = set()
+    for index, raw in enumerate(repositories):
+        if not isinstance(raw, dict) or set(raw) != {
+            "slug", "commit", "remote", "path", "sha256"
+        }:
+            raise ValueError(f"source_repositories[{index}] fields are invalid")
+        slug = raw.get("slug")
+        if (
+            not isinstance(slug, str)
+            or not slug
+            or "/" in slug
+            or slug in slugs
+            or not isinstance(raw.get("commit"), str)
+            or SHA40.fullmatch(raw["commit"]) is None
+            or not isinstance(raw.get("remote"), str)
+            or not raw["remote"].startswith("https://")
+        ):
+            raise ValueError(f"source_repositories[{index}] identity is invalid")
+        slugs.add(slug)
+        repository_paths.add(
+            _entry(
+                {"path": raw["path"], "sha256": raw["sha256"]},
+                root=root,
+                label=f"source_repositories[{index}]",
+            )
+        )
+    actual_repository_paths = {
+        path.relative_to(root).as_posix()
+        for path in (root / "source").iterdir()
+        if path.is_file() and not path.is_symlink()
+    }
+    if repository_paths != actual_repository_paths:
+        raise ValueError("source directory has undeclared or missing artifacts")
 
 
 def main() -> int:

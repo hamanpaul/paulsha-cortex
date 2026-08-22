@@ -16,6 +16,7 @@ from paulsha_cortex.trust_root.install import (
     import_credential,
     new_install_receipt,
     plan_sha256,
+    rollback_receipt,
 )
 
 
@@ -231,3 +232,30 @@ def test_successful_start_order_is_still_unverified_not_qualified() -> None:
     assert doc["activated"] is False
     assert doc["qualified"] is False
     assert doc["services_started"] is True
+
+
+def test_activation_revalidates_imported_credential_bytes(tmp_path: Path) -> None:
+    _plan_doc, receipt, _backend = _applied_receipt(
+        required_credentials=[{"principal": "builder", "provider": "codex"}]
+    )
+    source = tmp_path / "auth.json"
+    source.write_text('{"token":"original"}', encoding="utf-8")
+    home = tmp_path / "cortex-builder"
+    import_credential(
+        receipt,
+        principal="builder",
+        provider="codex",
+        source=source,
+        destination_root=home,
+    )
+    installed = home / ".codex/auth.json"
+    installed.write_text('{"token":"tampered"}', encoding="utf-8")
+
+    class ValidatingBackend(CredentialBackend):
+        def validate_credentials(self, _receipt):
+            return ("builder/codex hash mismatch",)
+
+    backend = ValidatingBackend()
+    with pytest.raises(ActivationError, match="hash mismatch"):
+        activate_receipt(receipt, backend=backend)
+    assert backend.started == []

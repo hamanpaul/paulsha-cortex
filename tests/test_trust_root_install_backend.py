@@ -189,6 +189,7 @@ def test_venv_step_rejects_a_wheelhouse_hash_mismatch_before_running_commands(
         "wheel_source": str(wheel),
         "wheel_sha256": wheel_sha,
         "wheelhouse": [{"source": str(wheel), "sha256": "0" * 64}],
+        "wheelhouse_locked": True,
         "desired_sha256": wheel_sha,
     }
 
@@ -207,6 +208,9 @@ def test_venv_step_replays_after_slot_rename_before_link_cutover(
     (slot / "bin").mkdir(parents=True)
     (slot / "bin/python").write_text("verified interpreter", encoding="utf-8")
     (slot / ".cortex-wheel.sha256").write_text(wheel_sha + "\n", encoding="ascii")
+    (slot / ".cortex-tree.sha256").write_text(
+        backend_module._tree_sha256(slot) + "\n", encoding="ascii"
+    )
     active = tmp_path / "opt/cortex/venv"
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(
@@ -222,6 +226,7 @@ def test_venv_step_replays_after_slot_rename_before_link_cutover(
         "wheel_source": str(wheel),
         "wheel_sha256": wheel_sha,
         "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": True,
         "desired_sha256": wheel_sha,
     }
 
@@ -262,6 +267,75 @@ def test_directory_acl_attestation_accounts_for_posix_mask(
     assert stat.S_IMODE(path.stat().st_mode) == 0o750
     assert backend.inspect_step(step)["installed_sha256"] == step["desired_sha256"]
     assert backend.apply_step(step)["installed_sha256"] == step["desired_sha256"]
+
+
+def test_directory_acl_attestation_rejects_an_undeclared_named_group(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / "control"
+    step = {
+        "step_id": "asset:control-root-tree",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(path),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+    backend.apply_step(step)
+    subprocess.run(
+        ("setfacl", "-m", f"g:{group}:rwx", str(path)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert backend.inspect_step(step).get("installed_sha256") is None
+
+
+def test_venv_requires_locked_manifest_and_installed_tree_integrity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = tmp_path / "candidate.whl"
+    wheel.write_bytes(b"candidate")
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    deploy = tmp_path / "opt/cortex"
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        if command[:3] == ("python3", "-m", "venv"):
+            (Path(command[3]) / "bin").mkdir(parents=True)
+            (Path(command[3]) / "bin/python").write_text("python", encoding="utf-8")
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(deploy / "venvs" / wheel_sha),
+        "active_link": str(deploy / "venv"),
+        "wheel_source": str(wheel),
+        "wheel_sha256": wheel_sha,
+        "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": False,
+        "desired_sha256": wheel_sha,
+    }
+    backend = LocalInstallBackend(require_root=False)
+    with pytest.raises(InstallPlanError, match="locked"):
+        backend.apply_step(step)
+
+    step["wheelhouse_locked"] = True
+    backend.apply_step(step)
+    assert stat.S_IMODE(Path(step["path"]).stat().st_mode) == 0o755
+    (Path(step["path"]) / "bin/python").write_text("tampered", encoding="utf-8")
+    assert backend.inspect_step(step).get("installed_sha256") is None
 
 
 def test_new_directory_drops_inherited_acl_not_declared_by_plan(
@@ -351,10 +425,7 @@ def test_directory_acl_attestation_ignores_semantically_irrelevant_order(
             "owner": account,
             "group": group,
             "mode": "0750",
-            "acl": [
-                {"account": "a-reader", "perms": "rx", "default": False},
-                {"account": "z-reader", "perms": "rx", "default": False},
-            ],
+            "acl": list(reversed(backend_module._expected_acls(step))),
         },
     )
 
