@@ -296,7 +296,10 @@ def _read_acl(path: Path) -> list[dict[str, object]]:
         return []
     result = _run(("getfacl", "-cp", str(path)))
     if result.returncode != 0:
-        return []
+        detail = (result.stderr or result.stdout or "command failed").strip()
+        raise InstallDriftError(
+            f"getfacl failed while inspecting ACL for {path} ({result.returncode}): {detail}"
+        )
     rows: list[dict[str, object]] = []
     for raw in result.stdout.splitlines():
         default = raw.startswith("default:")
@@ -361,7 +364,7 @@ def _snapshot(path: Path) -> dict[str, object]:
 
 
 def _directory_inventory(path: Path) -> list[str]:
-    """Record direct children from a stable no-follow directory descriptor."""
+    """Record every descendant through stable, no-follow directory descriptors."""
 
     flags = (
         os.O_RDONLY
@@ -372,10 +375,63 @@ def _directory_inventory(path: Path) -> list[str]:
         descriptor = os.open(path, flags)
     except OSError as exc:
         raise InstallDriftError(f"cannot inventory managed directory {path}: {exc}") from exc
+
+    def walk(current_fd: int, prefix: str) -> list[str]:
+        before = os.fstat(current_fd)
+        if not stat.S_ISDIR(before.st_mode):
+            raise InstallDriftError(f"inventory member is not a directory: {path / prefix}")
+        with os.scandir(current_fd) as entries:
+            children = sorted(
+                (
+                    entry.name,
+                    entry.stat(follow_symlinks=False),
+                )
+                for entry in entries
+            )
+        rows: list[str] = []
+        for name, child_state in children:
+            relative = f"{prefix}/{name}" if prefix else name
+            rows.append(relative)
+            if not stat.S_ISDIR(child_state.st_mode):
+                continue
+            try:
+                child_fd = os.open(name, flags, dir_fd=current_fd)
+            except OSError as exc:
+                raise InstallDriftError(
+                    f"cannot inventory managed directory {path / relative}: {exc}"
+                ) from exc
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (
+                    child_state.st_dev,
+                    child_state.st_ino,
+                ):
+                    raise InstallDriftError(
+                        f"managed directory changed during inventory: {path / relative}"
+                    )
+                rows.extend(walk(child_fd, relative))
+            finally:
+                os.close(child_fd)
+        after = os.fstat(current_fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise InstallDriftError(
+                f"managed directory changed during inventory: {path / prefix}"
+            )
+        return rows
+
     try:
         before = os.fstat(descriptor)
-        with os.scandir(descriptor) as entries:
-            rows = sorted(entry.name for entry in entries)
+        rows = walk(descriptor, "")
         after = os.fstat(descriptor)
         observed = path.lstat()
         if (
@@ -384,7 +440,7 @@ def _directory_inventory(path: Path) -> list[str]:
             or (before.st_dev, before.st_ino) != (observed.st_dev, observed.st_ino)
         ):
             raise InstallDriftError(f"managed directory changed during inventory: {path}")
-        return rows
+        return sorted(rows)
     except OSError as exc:
         raise InstallDriftError(f"cannot inventory managed directory {path}: {exc}") from exc
     finally:
@@ -426,12 +482,15 @@ def _toolchain_state(step: Mapping[str, object]) -> dict[str, object]:
     shape = step.get("shape", "file")
     if shape == "tree":
         entrypoint = path / str(step.get("entrypoint", ""))
+        expected_uid = _resolve_uid(step.get("owner"))
+        expected_gid = _resolve_gid(step.get("group"))
         content_matches = (
             stat.S_ISDIR(observed.st_mode)
             and not stat.S_ISLNK(observed.st_mode)
             and entrypoint.is_file()
             and not entrypoint.is_symlink()
             and _tree_sha256(path) == step.get("desired_sha256")
+            and _tree_owned_and_nonwritable(path, expected_uid, expected_gid)
         )
     else:
         content_matches = (
@@ -454,17 +513,31 @@ def _toolchain_state(step: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _extract_locked_tree(archive: Path, destination: Path) -> None:
-    """Extract only regular files, directories, and in-tree relative symlinks."""
+def _locked_tree_manifest(archive: Path) -> dict[str, dict[str, object]]:
+    """Validate and describe receipt-owned archive leaves without extracting."""
 
     with tarfile.open(archive, mode="r:*") as bundle:
         members = bundle.getmembers()
+        manifest: dict[str, dict[str, object]] = {}
         for member in members:
             relative = Path(member.name)
             if relative.is_absolute() or ".." in relative.parts or not relative.parts:
                 raise InstallDriftError(f"toolchain archive has unsafe member: {member.name}")
             if not (member.isdir() or member.isfile() or member.issym()):
                 raise InstallDriftError(f"toolchain archive has unsupported member: {member.name}")
+            normalized = relative.as_posix().rstrip("/")
+            if not normalized or normalized in manifest:
+                raise InstallDriftError(
+                    f"toolchain archive has duplicate or empty member: {member.name}"
+                )
+            if (member.isdir() or member.isfile()) and member.mode & 0o022:
+                raise InstallDriftError(
+                    f"toolchain archive member is group/other-writable: {member.name}"
+                )
+            row: dict[str, object] = {
+                "kind": "directory" if member.isdir() else "file",
+                "mode": member.mode & 0o777,
+            }
             if member.issym():
                 target = Path(member.linkname)
                 depth = 0
@@ -481,6 +554,45 @@ def _extract_locked_tree(archive: Path, destination: Path) -> None:
                         depth += 1
                 if not safe_target:
                     raise InstallDriftError(f"toolchain archive symlink escapes: {member.name}")
+                row = {"kind": "symlink", "target": member.linkname}
+            elif member.isfile():
+                source = bundle.extractfile(member)
+                if source is None:
+                    raise InstallDriftError(
+                        f"toolchain archive member is unreadable: {member.name}"
+                    )
+                digest = hashlib.sha256()
+                with source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                row["sha256"] = digest.hexdigest()
+            manifest[normalized] = row
+        symlinks = {
+            relative for relative, row in manifest.items() if row["kind"] == "symlink"
+        }
+        for relative in manifest:
+            parents = Path(relative).parents
+            if any(parent.as_posix() in symlinks for parent in parents if parent.as_posix() != "."):
+                raise InstallDriftError(
+                    f"toolchain archive member is nested below a symlink: {relative}"
+                )
+        for relative in tuple(manifest):
+            for parent in Path(relative).parents:
+                normalized = parent.as_posix()
+                if normalized == ".":
+                    break
+                manifest.setdefault(
+                    normalized, {"kind": "directory", "mode": None}
+                )
+        return manifest
+
+
+def _extract_locked_tree(archive: Path, destination: Path) -> None:
+    """Extract only validated regular files, directories, and in-tree symlinks."""
+
+    _locked_tree_manifest(archive)
+    with tarfile.open(archive, mode="r:*") as bundle:
+        members = bundle.getmembers()
         for member in sorted((row for row in members if row.isdir()), key=lambda row: row.name):
             path = destination / member.name
             path.mkdir(parents=True, exist_ok=True)
@@ -566,6 +678,187 @@ def _repository_config_is_canonical(
         dict(parser.items(section, raw=True)) == values
         for section, values in expected.items()
     )
+def _tree_owned_and_nonwritable(path: Path, uid: int, gid: int) -> bool:
+    """Attest owner/group and the write boundary for every no-follow tree member."""
+
+    for root, directories, files in os.walk(path, topdown=True, followlinks=False):
+        for candidate in (
+            Path(root),
+            *(Path(root) / name for name in (*directories, *files)),
+        ):
+            try:
+                observed = candidate.lstat()
+            except OSError:
+                return False
+            if observed.st_uid != uid or observed.st_gid != gid:
+                return False
+            if (
+                not stat.S_ISLNK(observed.st_mode)
+                and stat.S_IMODE(observed.st_mode) & 0o022
+            ):
+                return False
+    return True
+
+
+def _open_relative_directory(root_fd: int, parts: Sequence[str]) -> int:
+    """Open a descendant directory one no-follow component at a time."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    current = os.dup(root_fd)
+    try:
+        for component in parts:
+            following = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = following
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _sha256_file_at(parent_fd: int, name: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise InstallDriftError(f"toolchain member is not a safe regular file: {name}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise InstallDriftError(f"toolchain member changed during rollback: {name}")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _toolchain_member_matches_at(
+    parent_fd: int,
+    name: str,
+    row: Mapping[str, object],
+    *,
+    uid: int,
+    gid: int,
+) -> bool:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if observed.st_uid != uid or observed.st_gid != gid:
+        return False
+    kind = row.get("kind")
+    if kind == "symlink":
+        try:
+            target = os.readlink(name, dir_fd=parent_fd)
+        except OSError:
+            return False
+        return stat.S_ISLNK(observed.st_mode) and target == row.get("target")
+    expected_mode = row.get("mode")
+    if expected_mode is not None and stat.S_IMODE(observed.st_mode) != expected_mode:
+        return False
+    if stat.S_IMODE(observed.st_mode) & 0o022:
+        return False
+    if kind == "directory":
+        return stat.S_ISDIR(observed.st_mode)
+    if kind != "file" or not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        return False
+    try:
+        digest = _sha256_file_at(parent_fd, name)
+    except (InstallError, OSError):
+        return False
+    return digest == row.get("sha256")
+
+
+def _rollback_prepared_toolchain(step: Mapping[str, object], path: Path) -> None:
+    """Remove only archive-proven leaves; unknown or drifted content is retained."""
+
+    source = Path(str(step.get("source", "")))
+    source_sha = step.get("source_sha256")
+    if (
+        not source.is_absolute()
+        or source.is_symlink()
+        or not source.is_file()
+        or source.lstat().st_nlink != 1
+        or not isinstance(source_sha, str)
+        or _sha256_file(source) != source_sha
+    ):
+        raise InstallDriftError("prepared toolchain rollback lacks its locked source archive")
+    manifest = _locked_tree_manifest(source)
+    uid = _resolve_uid(step.get("owner"))
+    gid = _resolve_gid(step.get("group"))
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_fd = os.open(path, flags)
+    except OSError as exc:
+        raise UnsafeInstallPathError(
+            f"cannot safely open prepared toolchain root {path}: {exc}"
+        ) from exc
+    try:
+        root_state = os.fstat(root_fd)
+        for relative, row in sorted(
+            manifest.items(),
+            key=lambda item: (len(Path(item[0]).parts), item[0]),
+            reverse=True,
+        ):
+            parts = Path(relative).parts
+            try:
+                parent_fd = _open_relative_directory(root_fd, parts[:-1])
+            except OSError:
+                continue
+            try:
+                if not _toolchain_member_matches_at(
+                    parent_fd, parts[-1], row, uid=uid, gid=gid
+                ):
+                    continue
+                try:
+                    if row.get("kind") == "directory":
+                        os.rmdir(parts[-1], dir_fd=parent_fd)
+                    else:
+                        os.unlink(parts[-1], dir_fd=parent_fd)
+                except OSError:
+                    pass
+            finally:
+                os.close(parent_fd)
+        observed = path.lstat()
+        if (
+            stat.S_ISDIR(observed.st_mode)
+            and (observed.st_dev, observed.st_ino)
+            == (root_state.st_dev, root_state.st_ino)
+            and observed.st_uid == uid
+            and observed.st_gid == gid
+            and stat.S_IMODE(observed.st_mode) == _mode(step.get("mode"))
+        ):
+            with os.scandir(root_fd) as entries:
+                empty = next(entries, None) is None
+            if empty:
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+    finally:
+        os.close(root_fd)
 
 
 def _repository_state(step: Mapping[str, object]) -> dict[str, object]:
@@ -928,8 +1221,77 @@ def _state_matches_step(step: Mapping[str, object], state: Mapping[str, object])
     )
 
 
+def _sudoers_logical_lines(policy: str) -> tuple[str, ...]:
+    lines: list[str] = []
+    pending = ""
+    for physical in policy.splitlines():
+        line = physical.split("#", 1)[0].strip()
+        if not line and not pending:
+            continue
+        continued = line.endswith("\\")
+        fragment = line[:-1].rstrip() if continued else line
+        pending = f"{pending} {fragment}".strip()
+        if not continued and pending:
+            lines.append(pending)
+            pending = ""
+    if pending:
+        lines.append(pending)
+    return tuple(lines)
+
+
+def _sudoers_policies_have_universal_nopasswd(policies: Sequence[str]) -> bool:
+    """Evaluate direct/aliased ALL grants without joining file continuations."""
+
+    lines = tuple(
+        line for policy in policies for line in _sudoers_logical_lines(policy)
+    )
+    aliases: dict[str, str] = {}
+    for line in lines:
+        match = re.match(r"^Cmnd_Alias\s+([A-Z][A-Z0-9_]*)\s*=\s*(.+)$", line)
+        if match:
+            aliases[match.group(1)] = match.group(2).strip()
+
+    def universal(expression: str, resolving: frozenset[str] = frozenset()) -> bool:
+        tokens = [token.strip() for token in expression.split(",") if token.strip()]
+        if not tokens or any(token.startswith("!") for token in tokens):
+            return False
+        for token in tokens:
+            command = token.split(maxsplit=1)[0]
+            if command == "ALL":
+                return True
+            if command in aliases and command not in resolving and universal(
+                aliases[command], resolving | {command}
+            ):
+                return True
+        return False
+
+    for line in lines:
+        if line.startswith("Cmnd_Alias"):
+            continue
+        assignment = re.match(r"^.+?\s+ALL\s*=\s*(?:\([^)]*\)\s*)?(.+)$", line)
+        if not assignment:
+            continue
+        command_spec = assignment.group(1)
+        tags = list(re.finditer(r"\b(?:NO)?PASSWD\s*:\s*", command_spec))
+        for index, tag in enumerate(tags):
+            if not tag.group(0).lstrip().startswith("NOPASSWD"):
+                continue
+            end = tags[index + 1].start() if index + 1 < len(tags) else len(command_spec)
+            if any(
+                not later.group(0).lstrip().startswith("NOPASSWD")
+                for later in tags[index + 1 :]
+            ):
+                continue
+            if universal(command_spec[tag.end() : end]):
+                return True
+    return False
+
+
+def _sudoers_policy_has_universal_nopasswd(policy: str) -> bool:
+    return _sudoers_policies_have_universal_nopasswd((policy,))
+
+
 def _universal_nopasswd() -> bool:
-    pattern = re.compile(r"\bALL\s*=\s*\([^)]*\)\s*NOPASSWD\s*:\s*ALL\b")
     candidates = [Path("/etc/sudoers")]
     sudoers_d = Path("/etc/sudoers.d")
     try:
@@ -938,15 +1300,15 @@ def _universal_nopasswd() -> bool:
         )
     except OSError:
         pass
+    policies: list[str] = []
     for candidate in candidates:
         try:
             if candidate.is_symlink():
                 continue
-            if pattern.search(candidate.read_text(encoding="utf-8", errors="replace")):
-                return True
+            policies.append(candidate.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-    return False
+    return _sudoers_policies_have_universal_nopasswd(policies)
 
 
 def _password_locked(name: str) -> bool | None:
@@ -1587,7 +1949,10 @@ class LocalInstallBackend:
                 if path.is_file():
                     path.unlink()
                 elif path.is_dir():
-                    shutil.rmtree(path)
+                    if entry.get("status") == "prepared" and step.get("shape") == "tree":
+                        _rollback_prepared_toolchain(step, path)
+                    else:
+                        shutil.rmtree(path)
             return
         if step.get("kind") == "repository":
             # Repositories are durable state. Even a receipt-created checkout is
@@ -1689,6 +2054,65 @@ class LocalInstallBackend:
                         retained.append(str(candidate))
                 except (InstallError, OSError):
                     retained.append(str(path))
+            elif (
+                isinstance(step, Mapping)
+                and step.get("kind") == "toolchain"
+                and step.get("shape") == "tree"
+                and isinstance(prior, Mapping)
+                and prior.get("exists") is False
+            ):
+                path = Path(str(step.get("path", "")))
+                try:
+                    source = Path(str(step.get("source", "")))
+                    source_sha = step.get("source_sha256")
+                    if (
+                        not source.is_absolute()
+                        or source.is_symlink()
+                        or not source.is_file()
+                        or source.lstat().st_nlink != 1
+                        or not isinstance(source_sha, str)
+                        or _sha256_file(source) != source_sha
+                    ):
+                        raise InstallDriftError("toolchain source cannot be attested")
+                    manifest = _locked_tree_manifest(source)
+                    owned = set(manifest)
+                    current = set(_directory_inventory(path)) if path.is_dir() else set()
+                    retained.extend(str(path / relative) for relative in sorted(current - owned))
+                    uid = _resolve_uid(step.get("owner"))
+                    gid = _resolve_gid(step.get("group"))
+                    flags = (
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    root_fd = os.open(path, flags)
+                    try:
+                        for relative in sorted(current & owned):
+                            parts = Path(relative).parts
+                            candidate = path / relative
+                            try:
+                                parent_fd = _open_relative_directory(
+                                    root_fd, parts[:-1]
+                                )
+                            except OSError:
+                                retained.append(str(candidate))
+                                continue
+                            try:
+                                if not _toolchain_member_matches_at(
+                                    parent_fd,
+                                    parts[-1],
+                                    manifest[relative],
+                                    uid=uid,
+                                    gid=gid,
+                                ):
+                                    retained.append(str(candidate))
+                            finally:
+                                os.close(parent_fd)
+                    finally:
+                        os.close(root_fd)
+                except (InstallError, OSError, tarfile.TarError):
+                    if path.exists() or path.is_symlink():
+                        retained.append(str(path))
         return tuple(sorted(set(retained)))
 
     def validate_credentials(self, receipt: InstallReceipt) -> Sequence[str]:

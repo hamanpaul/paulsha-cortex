@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import grp
 import hashlib
+import io
 import json
 import os
 import pwd
 import shutil
 import stat
 import subprocess
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -908,3 +910,280 @@ def test_directory_acl_apply_does_not_follow_swapped_ancestor(
 
     assert swapped
     assert stat.S_IMODE(external.stat().st_mode) == external_mode
+
+
+def test_rollback_reports_nested_unknown_child_from_recursive_no_follow_snapshot(
+    tmp_path: Path,
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    managed = tmp_path / "adopted"
+    baseline = managed / "known"
+    baseline.mkdir(parents=True)
+    (baseline / "existing.txt").write_text("existing\n", encoding="utf-8")
+    managed.chmod(0o700)
+    step = {
+        "step_id": "asset:adopted-recursive",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(managed),
+        "owner": account,
+        "group": group,
+        "mode": "0700",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+    applied = backend.apply_step(step)
+    unknown = baseline / "nested" / "created-after-install.txt"
+    unknown.parent.mkdir()
+    unknown.write_text("durable\n", encoding="utf-8")
+    receipt = InstallReceipt(
+        {
+            "state": "applied",
+            "journal": [{"step": step, "prior": applied["prior"]}],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert unknown.read_text(encoding="utf-8") == "durable\n"
+    assert str(unknown) in report.retained_unknown
+
+
+def test_recursive_directory_inventory_never_descends_through_symlinks(
+    tmp_path: Path,
+) -> None:
+    managed = tmp_path / "managed"
+    external = tmp_path / "external"
+    (managed / "real").mkdir(parents=True)
+    external.mkdir()
+    (managed / "real/inside.txt").write_text("inside\n", encoding="utf-8")
+    (external / "outside.txt").write_text("outside\n", encoding="utf-8")
+    (managed / "escape").symlink_to(external, target_is_directory=True)
+
+    inventory = backend_module._directory_inventory(managed)
+
+    assert inventory == ["escape", "real", "real/inside.txt"]
+    assert "escape/outside.txt" not in inventory
+
+
+def _write_toolchain_archive(path: Path, *, tool_mode: int = 0o755) -> None:
+    payload = b"#!/bin/sh\nexit 0\n"
+    with tarfile.open(path, mode="w") as archive:
+        directory = tarfile.TarInfo("bin")
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o755
+        archive.addfile(directory)
+        tool = tarfile.TarInfo("bin/tool")
+        tool.mode = tool_mode
+        tool.size = len(payload)
+        archive.addfile(tool, io.BytesIO(payload))
+
+
+def _toolchain_tree_step(tmp_path: Path, archive: Path) -> dict[str, object]:
+    reference = tmp_path / "reference"
+    (reference / "bin").mkdir(parents=True)
+    (reference / "bin").chmod(0o755)
+    (reference / "bin/tool").write_bytes(b"#!/bin/sh\nexit 0\n")
+    (reference / "bin/tool").chmod(0o755)
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    return {
+        "step_id": "toolchain:demo",
+        "kind": "toolchain",
+        "shape": "tree",
+        "name": "demo",
+        "path": str(tmp_path / "installed/demo"),
+        "source": str(archive),
+        "source_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "desired_sha256": backend_module._tree_sha256(reference),
+        "entrypoint": "bin/tool",
+        "owner": account,
+        "group": group,
+        "mode": "0755",
+    }
+
+
+def test_toolchain_archive_rejects_nested_group_writable_member(tmp_path: Path) -> None:
+    archive = tmp_path / "toolchain.tar"
+    _write_toolchain_archive(archive, tool_mode=0o775)
+    step = _toolchain_tree_step(tmp_path, archive)
+
+    with pytest.raises(InstallDriftError, match="group|other|writ"):
+        LocalInstallBackend(require_root=False).apply_step(step)
+
+    assert not Path(step["path"]).exists()
+
+
+def test_toolchain_tree_attests_nested_owner_recursively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "toolchain.tar"
+    _write_toolchain_archive(archive)
+    step = _toolchain_tree_step(tmp_path, archive)
+    backend = LocalInstallBackend(require_root=False)
+    backend.apply_step(step)
+    tool = Path(step["path"]) / "bin/tool"
+    real_lstat = Path.lstat
+
+    def nested_owner_drift(path: Path):
+        observed = real_lstat(path)
+        if path == tool:
+            return SimpleNamespace(
+                st_mode=observed.st_mode,
+                st_uid=observed.st_uid + 1,
+                st_gid=observed.st_gid,
+                st_nlink=observed.st_nlink,
+            )
+        return observed
+
+    monkeypatch.setattr(Path, "lstat", nested_owner_drift)
+
+    assert backend.inspect_step(step)["installed_sha256"] is None
+
+
+def test_prepared_toolchain_rollback_removes_only_owned_leaves_and_retains_unknown(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "toolchain.tar"
+    _write_toolchain_archive(archive)
+    step = _toolchain_tree_step(tmp_path, archive)
+    backend = LocalInstallBackend(require_root=False)
+    backend.apply_step(step)
+    installed = Path(step["path"])
+    owned = installed / "bin/tool"
+    unknown = installed / "operator/nested/keep.txt"
+    unknown.parent.mkdir(parents=True)
+    unknown.write_text("keep\n", encoding="utf-8")
+    receipt = InstallReceipt(
+        {
+            "state": "applying",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": step,
+                    "status": "prepared",
+                    "prior": {"exists": False},
+                }
+            ],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert not owned.exists()
+    assert unknown.read_text(encoding="utf-8") == "keep\n"
+    assert str(unknown) in report.retained_unknown
+
+
+def test_prepared_toolchain_rollback_retains_and_reports_modified_owned_leaf(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "toolchain.tar"
+    _write_toolchain_archive(archive)
+    step = _toolchain_tree_step(tmp_path, archive)
+    backend = LocalInstallBackend(require_root=False)
+    backend.apply_step(step)
+    modified = Path(step["path"]) / "bin/tool"
+    modified.write_bytes(b"operator replacement\n")
+    modified.chmod(0o755)
+    receipt = InstallReceipt(
+        {
+            "state": "applying",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": step,
+                    "status": "prepared",
+                    "prior": {"exists": False},
+                }
+            ],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert modified.read_bytes() == b"operator replacement\n"
+    assert str(modified) in report.retained_unknown
+
+
+def test_prepared_toolchain_rollback_never_follows_replaced_member_directory(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "toolchain.tar"
+    _write_toolchain_archive(archive)
+    step = _toolchain_tree_step(tmp_path, archive)
+    backend = LocalInstallBackend(require_root=False)
+    backend.apply_step(step)
+    installed = Path(step["path"])
+    displaced = tmp_path / "displaced-bin"
+    (installed / "bin").rename(displaced)
+    external = tmp_path / "external"
+    external.mkdir()
+    external_tool = external / "tool"
+    external_tool.write_bytes(b"#!/bin/sh\nexit 0\n")
+    external_tool.chmod(0o755)
+    (installed / "bin").symlink_to(external, target_is_directory=True)
+    receipt = InstallReceipt(
+        {
+            "state": "applying",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": step,
+                    "status": "prepared",
+                    "prior": {"exists": False},
+                }
+            ],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert external_tool.read_bytes() == b"#!/bin/sh\nexit 0\n"
+    assert (installed / "bin").is_symlink()
+    assert str(installed / "bin") in report.retained_unknown
+
+
+def test_getfacl_failure_is_not_reported_as_an_empty_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(backend_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        backend_module,
+        "_run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(list(argv), 1, "", "denied"),
+    )
+
+    with pytest.raises(InstallDriftError, match="getfacl|ACL"):
+        backend_module._read_acl(tmp_path)
+
+
+def test_sudoers_parser_resolves_universal_command_alias_across_continuations() -> None:
+    policy = """
+Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true
+Cmnd_Alias ROOT_COMMANDS = \\
+    LIMITED, \\
+    ALL
+%operators ALL=(ALL:ALL) NOPASSWD: ROOT_COMMANDS
+"""
+
+    assert backend_module._sudoers_policy_has_universal_nopasswd(policy)
+
+
+def test_sudoers_parser_does_not_treat_limited_alias_as_universal() -> None:
+    policy = """
+Cmnd_Alias LIMITED = /usr/bin/id, /usr/bin/true
+%operators ALL=(ALL:ALL) NOPASSWD: LIMITED
+"""
+
+    assert not backend_module._sudoers_policy_has_universal_nopasswd(policy)

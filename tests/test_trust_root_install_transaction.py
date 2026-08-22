@@ -314,6 +314,89 @@ def test_retained_account_from_plan_bound_rollback_journal_can_be_reinstalled(
     assert receipt.to_dict()["state"] == "applied"
 
 
+@pytest.mark.parametrize("kind", ["asset", "repository"])
+def test_first_install_refuses_exact_preexisting_state_without_receipt_provenance(
+    tmp_path: Path, kind: str
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step["kind"] = kind
+    plan["apply_order"] = [step]
+    backend = RecordingBackend(plan)
+    backend.states[step["step_id"]] = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+    }
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallDriftError, match="receipt|provenance"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
+@pytest.mark.parametrize("kind", ["asset", "repository"])
+def test_exact_retained_state_with_plan_bound_rollback_provenance_is_adoptable(
+    tmp_path: Path, kind: str
+) -> None:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step["kind"] = kind
+    plan["apply_order"] = [step]
+    state = {
+        "exists": True,
+        "installed_sha256": step["desired_sha256"],
+        "owner": step["owner"],
+        "group": step["group"],
+        "mode": step["mode"],
+        "acl": deepcopy(step["acls"]),
+    }
+    backend = RecordingBackend(plan)
+    backend.states[step["step_id"]] = deepcopy(state)
+    document = new_install_receipt(plan).to_dict()
+    document["rollback_journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            **state,
+        }
+    ]
+    receipt = InstallReceipt(document)
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.applied == [step["step_id"]]
+    assert receipt.to_dict()["state"] == "applied"
+
+    rollback_receipt(receipt, backend=backend)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    assert backend.applied == [step["step_id"], step["step_id"]]
+    assert receipt.to_dict()["journal"][0]["adopted_from_receipt"] is True
+
+
 def test_apply_time_symlink_drift_fails_before_any_mutation(tmp_path: Path) -> None:
     plan = _plan(tmp_path)
     backend = RecordingBackend(plan)

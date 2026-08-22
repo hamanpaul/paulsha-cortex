@@ -1392,6 +1392,46 @@ def _account_has_receipt_provenance(
     return False
 
 
+def _step_has_receipt_provenance(
+    *,
+    plan: Mapping[str, object],
+    step: Mapping[str, object],
+    receipt: "InstallReceipt",
+) -> bool:
+    """Prove an exact existing asset came from this plan-bound transaction.
+
+    An exact filesystem shape is not ownership provenance.  First install may
+    therefore not adopt an unrelated asset or repository merely because it
+    happens to match.  A prior prepared/completed entry whose original state
+    was absent proves creation by this receipt.  Later reinstall cycles carry
+    that proof forward with ``adopted_from_receipt``.
+    """
+
+    document = receipt.to_dict()
+    if document.get("plan_sha256") != plan_sha256(plan):
+        return False
+    for field in ("journal", "rollback_journal"):
+        entries = document.get(field, [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            prior = entry.get("prior")
+            if (
+                entry.get("step_id") == step.get("step_id")
+                and entry.get("step") == step
+                and entry.get("status") in {"prepared", "completed"}
+                and isinstance(prior, Mapping)
+                and (
+                    prior.get("exists") is False
+                    or entry.get("adopted_from_receipt") is True
+                )
+            ):
+                return True
+    return False
+
+
 def validate_preflight(
     plan: Mapping[str, object],
     facts: Mapping[str, object],
@@ -2122,12 +2162,26 @@ def apply_plan(
                     )
         else:
             prior = dict(backend.inspect_step(step))
+            adopted_from_receipt = False
+            if (
+                step.get("kind") in {"asset", "repository"}
+                and _state_matches(step, prior)
+            ):
+                if not _step_has_receipt_provenance(
+                    plan=plan, step=step, receipt=receipt
+                ):
+                    raise InstallDriftError(
+                        f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
+                    )
+                adopted_from_receipt = True
             entry = {
                 "step_id": step_id,
                 "step": deepcopy(dict(step)),
                 "status": "prepared",
                 "prior": prior,
             }
+            if adopted_from_receipt:
+                entry["adopted_from_receipt"] = True
             journal.append(entry)
             completed[step_id] = entry
             receipt._persist()
