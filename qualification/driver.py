@@ -1598,6 +1598,27 @@ def _bound_relative_json(
     return _json_object(content, label=label), path, actual
 
 
+def _bound_gate_evidence_path(root: Path, reference: object) -> Path:
+    """Canonicalize a gate ref within the installed coordinator evidence root."""
+
+    if not isinstance(reference, str) or not reference or "\x00" in reference:
+        raise QualificationFailure("workflow delivery gate locator is unsafe")
+    locator = Path(reference)
+    if ".." in locator.parts or locator.as_posix() != reference:
+        raise QualificationFailure("workflow delivery gate locator is unsafe")
+    evidence_root = root / "evidence"
+    path = locator if locator.is_absolute() else root / locator
+    try:
+        relative = path.relative_to(evidence_root)
+    except ValueError as exc:
+        raise QualificationFailure(
+            "workflow delivery gate locator is unsafe"
+        ) from exc
+    if not relative.parts:
+        raise QualificationFailure("workflow delivery gate locator is unsafe")
+    return evidence_root.joinpath(*relative.parts)
+
+
 def _artifact_row(path: Path, *, state_root: Path) -> dict[str, str]:
     try:
         relative = path.relative_to(state_root).as_posix()
@@ -1920,18 +1941,13 @@ def _validate_dispatch_closeout(
     for row in gate_refs:
         if not isinstance(row, dict) or set(row) != {"kind", "ref", "sha256"}:
             raise QualificationFailure("workflow delivery gate locator is malformed")
-        relative = Path(str(row["ref"]))
         expected_hash = row.get("sha256")
         if (
-            relative.is_absolute()
-            or ".." in relative.parts
-            or relative.parts[:1] != ("evidence",)
-            or relative.as_posix() != row["ref"]
-            or not isinstance(expected_hash, str)
+            not isinstance(expected_hash, str)
             or SHA256.fullmatch(expected_hash) is None
         ):
             raise QualificationFailure("workflow delivery gate locator is unsafe")
-        path = root / relative
+        path = _bound_gate_evidence_path(root, row["ref"])
         content = _manager_file(
             path, label="workflow delivery gate", root=evidence_root
         )

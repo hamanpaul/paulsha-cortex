@@ -388,6 +388,7 @@ def _dispatch_fixture(tmp_path: Path, driver):
     ]
     jobs = []
     artifacts: list[Path] = []
+    workflow_evidence: dict[str, tuple[Path, str]] = {}
     for phase in ("plan", "build", "verify", "review", "ship"):
         job_id = f"{phase}-job"
         job = {
@@ -447,6 +448,7 @@ def _dispatch_fixture(tmp_path: Path, driver):
         }
         evidence_path = coordinator / "evidence" / "workflow" / f"{job_id}.json"
         evidence_hash = _write_json(evidence_path, envelope)
+        workflow_evidence[phase] = (evidence_path, evidence_hash)
         artifacts.append(evidence_path)
         job["workflow_evidence"] = {
             "kind": phase,
@@ -493,28 +495,50 @@ def _dispatch_fixture(tmp_path: Path, driver):
         json.dumps(completion, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     artifacts.append(completion_path)
-    gate_refs = []
-    for kind in ("foreign-review", "copilot"):
-        gate_path = coordinator / "evidence" / "delivery-gates" / f"{kind}.json"
-        gate_hash = _write_json(
-            gate_path,
-            {
-                "schema_version": 1,
-                "kind": kind,
-                "run_id": run_id,
-                "work_id": work_id,
-                "candidate": candidate,
-                "status": "passed",
-            },
-        )
-        artifacts.append(gate_path)
-        gate_refs.append(
-            {
-                "kind": kind,
-                "ref": gate_path.relative_to(coordinator).as_posix(),
-                "sha256": gate_hash,
-            }
-        )
+    brainstorm_path = (
+        coordinator / "evidence" / "planning" / f"brainstorm-{run_id}.json"
+    )
+    brainstorm_hash = _write_json(
+        brainstorm_path,
+        {
+            "schema_version": 1,
+            "kind": "brainstorm-peer",
+            "run_id": run_id,
+            "work_id": work_id,
+        },
+    )
+    artifacts.append(brainstorm_path)
+    review_path, review_hash = workflow_evidence["review"]
+    copilot_path = coordinator / "evidence" / "delivery-adapter" / "copilot.json"
+    copilot_hash = _write_json(
+        copilot_path,
+        {
+            "schema_version": 1,
+            "kind": "copilot",
+            "run_id": run_id,
+            "work_id": work_id,
+            "candidate": candidate,
+            "status": "passed",
+        },
+    )
+    artifacts.append(copilot_path)
+    gate_refs = [
+        {
+            "kind": "brainstorm",
+            "ref": str(brainstorm_path),
+            "sha256": brainstorm_hash,
+        },
+        {
+            "kind": "foreign-review",
+            "ref": str(review_path),
+            "sha256": review_hash,
+        },
+        {
+            "kind": "copilot",
+            "ref": str(copilot_path),
+            "sha256": copilot_hash,
+        },
+    ]
     workflow = {
         "run_id": run_id,
         "work_id": work_id,
@@ -594,6 +618,13 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
 ) -> None:
     driver = _load_driver()
     fixture = _dispatch_fixture(tmp_path, driver)
+    registry = json.loads(fixture["registry"].read_text(encoding="utf-8"))
+    gate_refs = {row["kind"]: row for row in registry["workflows"][0]["gate_refs"]}
+    assert Path(gate_refs["brainstorm"]["ref"]).is_absolute()
+    assert Path(gate_refs["brainstorm"]["ref"]).parent.name == "planning"
+    assert gate_refs["foreign-review"]["ref"] == str(
+        fixture["coordinator"] / "evidence" / "workflow" / "review-job.json"
+    )
     monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
 
     def fake_run(argv, **_kwargs):
@@ -679,7 +710,18 @@ def test_dispatch_closeout_fails_closed_on_binding_or_reclaim_drift(
         )
 
 
-@pytest.mark.parametrize("mutation", ["missing", "hash", "symlink", "duplicate"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "hash",
+        "symlink",
+        "symlink-ancestor",
+        "absolute-escape",
+        "lexical-escape",
+        "duplicate",
+    ],
+)
 def test_dispatch_closeout_resolves_every_delivery_gate_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
@@ -687,7 +729,7 @@ def test_dispatch_closeout_resolves_every_delivery_gate_ref(
     fixture = _dispatch_fixture(tmp_path, driver)
     payload = json.loads(fixture["registry"].read_text())
     refs = payload["workflows"][0]["gate_refs"]
-    first = fixture["coordinator"] / refs[0]["ref"]
+    first = Path(refs[0]["ref"])
     if mutation == "missing":
         first.unlink()
     elif mutation == "hash":
@@ -696,6 +738,20 @@ def test_dispatch_closeout_resolves_every_delivery_gate_ref(
         target = first.with_name("target.json")
         first.rename(target)
         first.symlink_to(target)
+    elif mutation == "symlink-ancestor":
+        target = first.parent.with_name("planning-target")
+        first.parent.rename(target)
+        first.parent.symlink_to(target, target_is_directory=True)
+    elif mutation == "absolute-escape":
+        outside = tmp_path / "outside-gate.json"
+        refs[0]["sha256"] = _write_json(outside, {"status": "passed"})
+        refs[0]["ref"] = str(outside)
+    elif mutation == "lexical-escape":
+        outside = fixture["coordinator"] / "outside-gate.json"
+        refs[0]["sha256"] = _write_json(outside, {"status": "passed"})
+        refs[0]["ref"] = str(
+            fixture["coordinator"] / "evidence" / ".." / outside.name
+        )
     else:
         refs[1]["ref"] = refs[0]["ref"]
         refs[1]["sha256"] = refs[0]["sha256"]
