@@ -70,14 +70,15 @@ principal 時再犯同一個錯」——新 principal 只要沒進對應表，�
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Sequence
-from pathlib import Path
 
 from paulsha_cortex.config import paths
 
@@ -8416,6 +8417,222 @@ polkit.addRule(function(action, subject) {{
         content=content,
         residual_risks=residual,
     )
+
+
+@dataclass(frozen=True)
+class AttestationInventoryRecord:
+    """Machine-readable generated-asset inventory row for #695.
+
+    Generated text assets keep both their exact bytes (for deterministic hashing) and the
+    install metadata that the runtime should expose. Sensitive runtime-provided credential
+    surfaces intentionally omit raw content: printing Manager GitHub credential bytes would
+    itself violate the trust-root boundary this inventory is meant to attest.
+    """
+
+    install_path: str
+    owner: str
+    group: str
+    mode: int
+    sha256: str | None
+    content: str | None = None
+    kind: str = "generated-file"
+    asset_id: str | None = None
+
+    @property
+    def mode_str(self) -> str:
+        return format(self.mode, "04o")
+
+    def to_dict(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "install_path": self.install_path,
+            "owner": self.owner,
+            "group": self.group,
+            "mode": self.mode_str,
+            "kind": self.kind,
+            "sha256": self.sha256,
+        }
+        if self.asset_id is not None:
+            data["asset_id"] = self.asset_id
+        if self.content is not None:
+            data["content"] = self.content
+        return data
+
+
+_ATTESTATION_TEXT_FILE_MODE = 0o644
+
+
+def _attestation_sha256(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _generated_text_attestation(
+    *,
+    install_path: str,
+    owner: str,
+    group: str,
+    mode: int,
+    content: str,
+    kind: str,
+    asset_id: str | None = None,
+) -> AttestationInventoryRecord:
+    return AttestationInventoryRecord(
+        asset_id=asset_id,
+        kind=kind,
+        install_path=install_path,
+        owner=owner,
+        group=group,
+        mode=mode,
+        sha256=_attestation_sha256(content),
+        content=content,
+    )
+
+
+def _plan_entry_attestation(
+    entry: PermissionEntry,
+    *,
+    install_path: str,
+    kind: str,
+) -> AttestationInventoryRecord:
+    return AttestationInventoryRecord(
+        asset_id=entry.asset_id,
+        kind=kind,
+        install_path=install_path,
+        owner=entry.owner,
+        group=entry.group,
+        mode=entry.mode,
+        sha256=None,
+        content=None,
+    )
+
+
+def build_attestation_inventory(
+    *,
+    scheme: UidScheme = DEFAULT_SCHEME,
+    layout: PathLayout = DEFAULT_LAYOUT,
+    plan: PermissionPlan | None = None,
+) -> tuple[AttestationInventoryRecord, ...]:
+    """Build the generated-asset attestation inventory for trust-root deployment artifacts.
+
+    The inventory is deterministic and pure: it derives expected deployment files from the
+    same generators that produce the units / shim / polkit rule / gitconfigs themselves,
+    and pairs them with the permission plan metadata for runtime-provided GitHub surfaces.
+    `layout` must carry concrete source repo slugs so the three root-owned gitconfig rows
+    remain complete rather than silently omitting `safe.directory` coverage.
+    """
+
+    plan = plan or generate_plan(scheme)
+    deploy_owner = scheme.deploy_account
+    deploy_group = scheme.group_of(deploy_owner)
+    records: list[AttestationInventoryRecord] = []
+
+    manager_unit = build_manager_unit(scheme, layout, plan)
+    records.append(
+        _generated_text_attestation(
+            asset_id="manager-systemd-unit",
+            kind="systemd-unit",
+            install_path=manager_unit.install_path,
+            owner=deploy_owner,
+            group=deploy_group,
+            mode=_ATTESTATION_TEXT_FILE_MODE,
+            content=manager_unit.content,
+        )
+    )
+
+    monitor_unit = build_monitor_unit(scheme, layout, plan)
+    records.append(
+        _generated_text_attestation(
+            asset_id="monitor-systemd-unit",
+            kind="systemd-unit",
+            install_path=monitor_unit.install_path,
+            owner=deploy_owner,
+            group=deploy_group,
+            mode=_ATTESTATION_TEXT_FILE_MODE,
+            content=monitor_unit.content,
+        )
+    )
+
+    egress_proxy_unit = build_egress_proxy_unit(scheme, layout)
+    records.append(
+        _generated_text_attestation(
+            asset_id="egress-proxy-systemd-unit",
+            kind="systemd-unit",
+            install_path=egress_proxy_unit.install_path,
+            owner=deploy_owner,
+            group=deploy_group,
+            mode=_ATTESTATION_TEXT_FILE_MODE,
+            content=egress_proxy_unit.content,
+        )
+    )
+
+    for principal in downgraded_job_principals(scheme):
+        for profile in HARDENING_PROFILES:
+            unit = build_job_unit(
+                scheme, layout, principal=principal, plan=plan, profile=profile
+            )
+            records.append(
+                _generated_text_attestation(
+                    asset_id=f"{principal.value}-job-unit-{profile.profile_id}",
+                    kind="systemd-unit",
+                    install_path=unit.install_path,
+                    owner=deploy_owner,
+                    group=deploy_group,
+                    mode=_ATTESTATION_TEXT_FILE_MODE,
+                    content=unit.content,
+                )
+            )
+
+    shim = build_job_shim(scheme, layout)
+    records.append(
+        _generated_text_attestation(
+            asset_id="job-shim",
+            kind="shim",
+            install_path=shim.install_path,
+            owner=shim.owner,
+            group=shim.group,
+            mode=shim.mode,
+            content=shim.content,
+        )
+    )
+
+    rule = build_polkit_rule(scheme, layout, plan=PolkitPlan.TEMPLATE)
+    records.append(
+        _generated_text_attestation(
+            asset_id="job-polkit-rule",
+            kind="polkit-rule",
+            install_path=rule.install_path,
+            owner=deploy_owner,
+            group=deploy_group,
+            mode=_ATTESTATION_TEXT_FILE_MODE,
+            content=rule.content,
+        )
+    )
+
+    for principal, asset_id in ACCOUNT_GITCONFIG_ASSETS.items():
+        if scheme.resolve(principal) is None:
+            continue
+        gitconfig = build_account_gitconfig(scheme, layout, principal)
+        records.append(
+            _generated_text_attestation(
+                asset_id=asset_id,
+                kind="gitconfig",
+                install_path=gitconfig.install_path,
+                owner=gitconfig.owner,
+                group=gitconfig.group,
+                mode=gitconfig.mode,
+                content=gitconfig.content,
+            )
+        )
+
+    asset_paths = layout.asset_paths()
+    for asset_id in ("manager-gh-credential", "manager-gh-config"):
+        records.append(
+            _plan_entry_attestation(
+                plan.by_id(asset_id),
+                install_path=asset_paths[asset_id],
+                kind="runtime-surface",
+            )
+        )
+    return tuple(records)
 
 
 def transient_unit_properties(

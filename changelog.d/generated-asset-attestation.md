@@ -1,1 +1,1 @@
-- **#695（RED）：新增 generated asset attestation regression tests**，要求 attestation inventory 納入 Manager／Monitor unit hash、four-way gate template unit，以及 Manager 的 GitHub credential surfaces，且不得輸出 credential content。
+- **#695：新增 generated asset attestation inventory**，輸出 Manager／Monitor／job unit、shim、polkit rule、gitconfig 的 deterministic hash 與安裝 metadata，並納入 Manager GitHub credential surfaces 且不揭露 credential content。
