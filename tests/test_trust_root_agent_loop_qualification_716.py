@@ -28,11 +28,16 @@ def test_the_probe_uses_real_dispatch_and_fail_closed_qualification_contract() -
     text = "\n".join(lines)
     for token in (
         "build_codex_argv",
+        "build_wrapper_script",
         "prepare_systemd_template",
         "build_job_env",
         "build_job_spec",
         "write_job_spec",
         "systemctl start --wait",
+        "SubprocessLauncher.launch()",
+        "unit_replica_properties()",
+        "IPAddressDeny=any",
+        "Environment=HTTPS_PROXY=",
         "repository command",
         "child process",
         "forbidden path",
@@ -75,7 +80,9 @@ def test_the_probe_runner_executes_the_generated_harness() -> None:
     script = captured["argv"][2]
     assert script.startswith("set -euo pipefail\n# === #716 real agent-loop qualification")
     assert "build_codex_argv" in script
+    assert "SubprocessLauncher.launch()" in script
     assert "systemctl start --wait" in script
+    assert "unit_replica_properties()" in script
     kwargs = captured["kwargs"]
     assert kwargs["shell"] is False
     assert kwargs["stdin"] is subprocess.DEVNULL

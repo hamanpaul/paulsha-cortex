@@ -13,13 +13,16 @@ work_item: trust-root-agent-loop-qualification
 
 ## 2. Qualification harness
 
-- [x] 2.1 在 `paulsha_cortex/trust_root/permgen.py` 產生 `agent-loop-probe`，重用
-      `build_codex_argv`、`prepare_systemd_template`、`build_job_env`、
+- [x] 2.1 在 `paulsha_cortex/trust_root/permgen.py` 產生 `agent-loop-probe`，改由
+      `SubprocessLauncher.launch()` 重走 `build_codex_argv`、
+      `build_wrapper_script`、`prepare_systemd_template`、`build_job_env`、
       `build_job_spec`、`write_job_spec` 與 `systemctl start --wait` 的真實派工接縫。
 - [x] 2.2 讓 probe 記錄 exact unit / profile / child tree / exit reason，並綁定
       executor/model、unit hash、candidate SHA 與 artifact hash。
 - [x] 2.3 讓 probe 對 repository command、child process、forbidden path、
-      forbidden host、no-unsafe-fallback 五面向各有正反判準，不允許 scripted
+      forbidden host、no-unsafe-fallback 五面向各有正反判準，並先對落檔 unit 執行
+      `unit_replica_properties()` 的 `IPAddressDeny=any` +
+      `Environment=HTTPS_PROXY=` egress pair fail-closed guard，不允許 scripted
       sandbox bypass。
 
 ## 3. Closeout

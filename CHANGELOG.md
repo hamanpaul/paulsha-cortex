@@ -7,14 +7,13 @@
 
 ## [Unreleased]
 
-- **#716：新增會實際執行的 `agent-loop-probe` qualification harness 與 CLI**，重用真實
-  `codex exec` template dispatch seam（`build_codex_argv` /
-  `prepare_systemd_template` / `build_job_env` / `build_job_spec` /
-  `write_job_spec` / `systemctl start --wait`），並把 repository command /
-  child process / forbidden path / forbidden host / no-unsafe-fallback 與
+- **#716：`agent-loop-probe` qualification harness 現在走 `SubprocessLauncher.launch()` 的
+  真實 template-dispatch path**，以 `bash -c <wrapper>` job spec 啟動 `codex exec`，
+  並在讀取落檔 unit 時先用 `unit_replica_properties()` fail-closed 驗證
+  `IPAddressDeny=any` + `Environment=HTTPS_PROXY=` 的 egress pair，再把 repository
+  command / child process / forbidden path / forbidden host / no-unsafe-fallback 與
   executor/model、unit hash、candidate SHA、artifact hash、child tree、
-  exit reason、SKIP／fallback／quota／model mismatch fail-closed evidence
-  釘進 probe contract。
+  exit reason、SKIP／fallback／quota／model mismatch evidence 綁進 probe contract。
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.
