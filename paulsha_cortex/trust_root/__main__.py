@@ -166,11 +166,14 @@ UID 方案未指定時一律用 **`four-way`**（#629 的定案：`cortex-manage
 gate 的 unit／ACL／polkit 字幹，降權模式下 build 卡照 `require_ledger` fail closed
 （＝#629 之前的現況）。
 
-`permissions`／`unit`／`shim`／`gitconfig`／`toolchain`／`polkit`／`scaffold`／`path-probe`／`job-log-probe`／`workspace-probe`／`git-trust-probe`／`inner-sandbox-probe`／`agent-loop-probe`
+`permissions`／`unit`／`shim`／`gitconfig`／`toolchain`／`polkit`／`scaffold`／`path-probe`／`job-log-probe`／`workspace-probe`／`git-trust-probe`／`inner-sandbox-probe`
 只**產生**計畫與內容字串，
 **絕不執行**任何 root 操作、不寫任何系統路徑——命令供 operator 在 Phase 2b runbook
 中手動 sudo 執行。`--paths` 讓 `--commands` 以 `permgen.DEFAULT_LAYOUT` 的真實絕對
 路徑輸出（0816 裁決：/var/lib/cortex ＋ /opt/cortex），不再帶 placeholder。
+
+`agent-loop-probe` 是唯一例外：#716 的目標就是量真實 template-dispatch seam，因此它會
+執行 `permgen.build_agent_loop_probe()` 產出的 harness，而不是只把字串印出來。
 
 ## 部署決定型 principal 的對應（#626）
 
@@ -208,6 +211,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import permgen, registry, selfcheck
+from .agent_loop_probe import run_agent_loop_probe
 from .registry import Principal
 
 
@@ -638,9 +642,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"unknown agent-loop-probe arg: {token}", file=sys.stderr)
                 return 2
-        for line in permgen.build_agent_loop_probe(permgen.SCHEMES[scheme_id]):
-            print(line)
-        return 0
+        return run_agent_loop_probe(permgen.SCHEMES[scheme_id])
     if command == "shim":
         rest = args[1:]
         scheme_id = permgen.DEFAULT_SCHEME_ID

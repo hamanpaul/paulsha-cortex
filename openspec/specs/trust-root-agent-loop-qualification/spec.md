@@ -1,7 +1,9 @@
 # trust-root-agent-loop-qualification Specification
 
 ## Purpose
-TBD - created by archiving change trust-root-agent-loop-qualification. Update Purpose after archive.
+
+Qualify the trust-root real agent loop against the production-shaped `codex exec`
+template-dispatch seam without relaxing the outer hardening or egress controls.
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 
@@ -11,4 +13,3 @@ TBD - created by archiving change trust-root-agent-loop-qualification. Update Pu
 
 - **WHEN** 依 `docs/superpowers/specs/trust-root-agent-loop-qualification-spec.md` 的 Requirements 對 candidate 驗收
 - **THEN** 全部驗收條件成立
-

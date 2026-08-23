@@ -26,4 +26,6 @@ work_item: trust-root-agent-loop-qualification
 
 - [x] 3.1 跑 focused qualification tests 與 `python3 -m pytest -q`，留下 RED→GREEN
       gate evidence。
-- [x] 3.2 交付 changelog entry 與最終 closeout。
+- [x] 3.2 交付 changelog entry，並把 task 文案收斂到此卡已完成的 pre-archive
+      qualification work；archive／review／delivery／CI／issue closure 仍由
+      Manager 後續流程負責。

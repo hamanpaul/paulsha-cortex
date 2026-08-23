@@ -1,4 +1,4 @@
-- **#716：新增 `agent-loop-probe` qualification harness 與 CLI**，重用真實
+- **#716：新增會實際執行的 `agent-loop-probe` qualification harness 與 CLI**，重用真實
   `codex exec` template dispatch seam（`build_codex_argv` /
   `prepare_systemd_template` / `build_job_env` / `build_job_spec` /
   `write_job_spec` / `systemctl start --wait`），並把 repository command /
