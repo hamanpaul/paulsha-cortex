@@ -189,8 +189,10 @@ def test_toolchain_plan_demands_a_symlink_for_every_copy_tree_program() -> None:
         if not tool.copy_tree:
             continue
         if tool.name == "copilot":
-            assert f'#     cp -a "$PKG" {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}' in text
+            assert f'#     cp -a "$PKG" "$tmp/{tool.name}"' in text
+            assert f'#     cp -a "$PKG" {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}' not in text
             assert f'#     test -f {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/"$ENTRY_REL"' in text
+            assert f'#     mv -T "$tmp/{tool.name}" {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}' in text
             assert f"#     cat > {DEFAULT_LAYOUT.toolchain_bin}/{tool.name} <<EOF" in text
             assert '#     NODE_ABS="$(readlink -f "$(command -v node)")"' in text
             assert (

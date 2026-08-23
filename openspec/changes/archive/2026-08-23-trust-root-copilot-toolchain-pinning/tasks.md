@@ -13,9 +13,12 @@ work_item: trust-root-copilot-toolchain-pinning
       descendant candidate（僅涵蓋 pre-archive builder repair）。
 
       Pre-archive status for this card: active OpenSpec tasks now stop before
-      archive. The configured authoritative metadata preflight is unavailable
-      in this sandbox because `$PSC_PREFLIGHT_CMD` points at a missing backend
-      and direct `policy-preflight` falls back to `/usr/bin/python3 -m
-      policy_check`, which is not installed here. Independent review,
+      archive. This repair reran the focused trust-root regression subset, full
+      `python3 -m pytest -q`, and authoritative
+      `python3 -m paulsha_cortex.preflight_ci --metadata <temp>`. In this
+      sandbox the adapter, openspec, and tests pass, but the backend policy
+      step still sanitizes to `/usr/bin/python3 -m policy_check`, which is not
+      installed on that interpreter, so the remaining preflight failure is
+      environment-bound rather than candidate-bound. Independent review,
       delivery, CI, archive, merge, issue closure, and done remain Manager
       actions.

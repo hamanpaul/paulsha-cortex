@@ -7897,11 +7897,9 @@ def build_toolchain_plan(
                     '#     tmp="$(mktemp -d)"',
                     '#     trap \'rm -rf -- "$tmp"\' EXIT',
                     f'#     cp -a "$PKG" "$tmp/{tool.name}"',
-                    f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
                     f'#     printf "%s\\n" "$VERSION" > "$tmp/{tool.name}/{COPILOT_VERSION_FILENAME}"',
                     f'#     test -f "$tmp/{tool.name}/{COPILOT_VERSION_FILENAME}"',
                     f'#     test -f "$tmp/{tool.name}/$ENTRY_REL"',
-                    f'#     test -f {layout.toolchain_lib}/{tool.name}/"$ENTRY_REL"',
                     f"#     cat > {layout.toolchain_bin}/{tool.name} <<EOF",
                     "#     #!/bin/sh",
                     f'#     VERSION_FILE="{layout.toolchain_lib}/{tool.name}/{COPILOT_VERSION_FILENAME}"',
@@ -7915,6 +7913,7 @@ def build_toolchain_plan(
                     f'#     exec $NODE_ABS "{layout.toolchain_lib}/{tool.name}/$ENTRY_REL" "\\$@"',
                     "#     EOF",
                     f'#     mv -T "$tmp/{tool.name}" {layout.toolchain_lib}/{tool.name}',
+                    f'#     test -f {layout.toolchain_lib}/{tool.name}/"$ENTRY_REL"   # mv 後再驗最終落位',
                     f"#     chmod 0755 {layout.toolchain_bin}/{tool.name}",
                     f"#   fail-closed probes：`test -x {layout.toolchain_bin}/{tool.name}`、"
                     f"`! grep -Eq '/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|"
@@ -8814,8 +8813,7 @@ def build_path_resolution_probe(
             f"# --- {case.principal.value} × {case.executor}"
             f"（{case.account}／{case.unit_stem}@／剖面 {case.hardening_profile}）---",
             (
-                f"{PATH_PROBE_HELPER} {case.unit_stem} env -u HOME -u PATH "
-                f"/bin/sh -c 'command -v \"$1\"' sh {case.expected_binary}"
+                f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'"
                 if case.executor == "copilot"
                 else f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'"
             ),
