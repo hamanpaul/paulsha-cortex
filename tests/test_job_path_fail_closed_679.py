@@ -395,16 +395,18 @@ def test_the_matrix_is_every_role_times_every_executor() -> None:
 
 
 def test_every_case_expects_the_toolchain_copy() -> None:
-    """斷言的對象是「解到 `<toolchain>/bin/<cli>`」，而版本比對的對象是同一支檔案。
+    """斷言的對象是 `<toolchain>/bin/<cli>`，版本權威則走同一支導出函式。
 
-    版本不另立一份手抄清單：登記表把 toolchain 落點登記成 `<toolchain>/bin/<cli>`，
-    因此「PATH 解出來的那支」與「絕對路徑那支」印出同一個版本字串，就是「job 跑的
-    是登記表登記的那一份」的直接證據。第二份清單只會變成下一個會漂移的真相。
+    多數 executor 直接以絕對路徑為版本基準；Copilot 例外，版本權威是部署樹內的
+    metadata 檔，避免 wrapper 再把自己當權威跑一遍。兩者都由同一個 helper 導出，
+    不手抄第二份規則。
     """
 
     for case in permgen.path_resolution_cases(FOUR_WAY_SCHEME, DEFAULT_LAYOUT):
-        assert case.expected_binary == f"{DEFAULT_LAYOUT.toolchain_bin}/{case.executor}"
-        assert case.version_reference == case.expected_binary
+        assert case.expected_binary == permgen.toolchain_binary_path(case.executor, DEFAULT_LAYOUT)
+        assert case.version_reference == permgen.toolchain_version_reference(
+            case.executor, DEFAULT_LAYOUT
+        )
 
 
 def test_each_case_points_at_the_unit_that_executor_actually_starts() -> None:

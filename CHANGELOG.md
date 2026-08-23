@@ -7,6 +7,7 @@
 
 ## [Unreleased]
 
+- **#681：Copilot builder 現在固定走 pinned toolchain wrapper，toolchain plan/probe 會清掉外層 PATH/HOME、拒絕 symlink/traversal，並以部署樹 version metadata 對帳。**
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.

@@ -781,6 +781,8 @@ def build_copilot_argv(
     verdict_spool_dir: str | None = None,
     effort: str | None = None,
 ) -> list[str]:
+    from paulsha_cortex.trust_root.permgen import toolchain_binary_path
+
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required Copilot builder requires enforced workspace-write")
     if read_only or review_only:
@@ -797,7 +799,7 @@ def build_copilot_argv(
     # allow_unsafe（明確 opt-in）才放開 copilot 的全自動授權 --allow-all；
     # 預設關閉 → 由 executor 自身的互動授權把關（manager 自主派工請設 allow_unsafe=True）。
     argv = [
-        "copilot",
+        toolchain_binary_path("copilot"),
         "-p",
         prompt,
         "--remote",

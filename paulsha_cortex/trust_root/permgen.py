@@ -7874,24 +7874,52 @@ def build_toolchain_plan(
                     "#   wrapper，而是沿著已選入口往上解到**含 package.json 的套件根**，",
                     "#   整包複製後再產一支 root-owned wrapper，直接 exec 部署時驗過的",
                     "#   **系統層絕對 node 路徑**（不是 `env node`、不是 toolchain shadow）。",
+                    '#     test ! -L "$SRC"',
                     '#     PKG="$SRC"',
-                    '#     while [ "$PKG" != "/" ] && [ ! -f "$PKG/package.json" ]; do PKG="$(dirname "$PKG")"; done',
+                    '#     while [ "$PKG" != "/" ] && [ ! -f "$PKG/package.json" ]; do',
+                    '#         test ! -L "$PKG"',
+                    '#         PKG="$(dirname "$PKG")"',
+                    '#     done',
+                    '#     test ! -L "$PKG"',
                     '#     test -f "$PKG/package.json"',
+                    '#     find "$PKG" -type l -print -quit | grep -q . && { echo "copilot package tree contains symlinks" >&2; exit 1; }',
                     '#     ENTRY_REL="${SRC#"$PKG"/}"',
                     '#     test "$ENTRY_REL" != "$SRC"',
+                    '#     ENTRY_REL="$(realpath --relative-to="$PKG" "$SRC")"',
+                    '#     case "$ENTRY_REL" in ../*|*/../*|..) echo "copilot entry escaped package root" >&2; exit 1 ;; esac',
+                    '#     test "${ENTRY_REL#../}" = "$ENTRY_REL"',
+                    '#     test -n "$ENTRY_REL"',
                     '#     NODE_ABS="$(readlink -f "$(command -v node)")"',
                     '#     test -n "$NODE_ABS" && test "${NODE_ABS#/}" != "$NODE_ABS"',
                     f'#     case "$NODE_ABS" in {layout.toolchain_root}/*) echo "node must stay system-level" >&2; exit 1 ;; esac',
+                    '#     VERSION="$("$NODE_ABS" "$PKG/$ENTRY_REL" --version)"',
+                    '#     test -n "$VERSION"',
+                    '#     tmp="$(mktemp -d)"',
+                    '#     trap \'rm -rf -- "$tmp"\' EXIT',
+                    f'#     cp -a "$PKG" "$tmp/{tool.name}"',
                     f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                    f'#     printf "%s\\n" "$VERSION" > "$tmp/{tool.name}/{COPILOT_VERSION_FILENAME}"',
+                    f'#     test -f "$tmp/{tool.name}/{COPILOT_VERSION_FILENAME}"',
+                    f'#     test -f "$tmp/{tool.name}/$ENTRY_REL"',
                     f'#     test -f {layout.toolchain_lib}/{tool.name}/"$ENTRY_REL"',
                     f"#     cat > {layout.toolchain_bin}/{tool.name} <<EOF",
                     "#     #!/bin/sh",
+                    f'#     VERSION_FILE="{layout.toolchain_lib}/{tool.name}/{COPILOT_VERSION_FILENAME}"',
+                    f'#     ENTRY_ABS="{layout.toolchain_lib}/{tool.name}/$ENTRY_REL"',
+                    '#     test -f "$VERSION_FILE" && test -f "$ENTRY_ABS"',
+                    '#     EXPECTED_VERSION="$(cat "$VERSION_FILE")"',
+                    '#     test -n "$EXPECTED_VERSION"',
+                    '#     ACTUAL_VERSION="$($NODE_ABS "$ENTRY_ABS" --version)"',
+                    '#     test -n "$ACTUAL_VERSION"',
+                    '#     [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ]',
                     f'#     exec $NODE_ABS "{layout.toolchain_lib}/{tool.name}/$ENTRY_REL" "\\$@"',
                     "#     EOF",
+                    f'#     mv -T "$tmp/{tool.name}" {layout.toolchain_lib}/{tool.name}',
                     f"#     chmod 0755 {layout.toolchain_bin}/{tool.name}",
                     f"#   fail-closed probes：`test -x {layout.toolchain_bin}/{tool.name}`、"
                     f"`! grep -Eq '/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|"
                     f"/usr/bin/copilot|command -v copilot' {layout.toolchain_bin}/{tool.name}`、"
+                    f"`cat {toolchain_version_reference(tool.name, layout)}`、"
                     f"`{layout.toolchain_bin}/{tool.name} --version`、"
                     "`$NODE_ABS -e 'new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))'`。",
                 ]
@@ -8663,11 +8691,36 @@ class PathResolutionCase:
     hardening_profile: str
     #: 這一列要斷言的解析結果：`<toolchain>/bin/<executor>`。
     expected_binary: str
-    #: 版本的比對對象＝**同一支檔案的絕對路徑**。登記表把 toolchain 落點登記成
-    #: `<toolchain>/bin/<cli>`，因此「PATH 解出來的那支」與「絕對路徑那支」印出同一
-    #: 個版本字串，就是「job 跑的是登記表登記的那一份」的直接證據——不需要第二份
-    #: 手抄的版本清單（那會立刻變成下一個會漂移的真相）。
+    #: 版本的比對對象。多數 executor 直接用 `<toolchain>/bin/<cli>`；
+    #: Copilot 例外：版本權威是部署樹內的 metadata 檔，而不是 wrapper 再把自己當
+    #: 權威跑一遍。這樣「PATH 解出來的那支」對到的是**固定 metadata**，不是另一層
+    #: 仍可能被 mutable wrapper 影響的命令執行。
     version_reference: str
+
+
+COPILOT_VERSION_FILENAME = ".cortex-version"
+
+
+def toolchain_binary_path(
+    executor: str,
+    layout: "PathLayout | None" = None,
+) -> str:
+    """`<toolchain>/bin/<executor>` 的單一導出點。"""
+
+    resolved = layout if layout is not None else DEFAULT_LAYOUT
+    return f"{resolved.toolchain_bin}/{executor}"
+
+
+def toolchain_version_reference(
+    executor: str,
+    layout: "PathLayout | None" = None,
+) -> str:
+    """該 executor 的版本權威。Copilot 走部署樹 metadata，其餘直接比對絕對路徑。"""
+
+    resolved = layout if layout is not None else DEFAULT_LAYOUT
+    if executor != "copilot":
+        return toolchain_binary_path(executor, resolved)
+    return f"{resolved.toolchain_lib}/copilot/{COPILOT_VERSION_FILENAME}"
 
 
 def path_resolution_cases(
@@ -8687,7 +8740,7 @@ def path_resolution_cases(
             continue
         for tool in EXECUTOR_TOOLS:
             profile = executor_hardening_profile(tool.name)
-            binary = f"{layout.toolchain_bin}/{tool.name}"
+            binary = toolchain_binary_path(tool.name, layout)
             cases.append(
                 PathResolutionCase(
                     principal=principal,
@@ -8696,7 +8749,7 @@ def path_resolution_cases(
                     unit_stem=job_unit_stem(layout, principal, profile),
                     hardening_profile=profile.profile_id,
                     expected_binary=binary,
-                    version_reference=binary,
+                    version_reference=toolchain_version_reference(tool.name, layout),
                 )
             )
     return tuple(cases)
@@ -8760,21 +8813,53 @@ def build_path_resolution_probe(
         lines += [
             f"# --- {case.principal.value} × {case.executor}"
             f"（{case.account}／{case.unit_stem}@／剖面 {case.hardening_profile}）---",
-            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'",
+            (
+                f"{PATH_PROBE_HELPER} {case.unit_stem} env -u HOME -u PATH "
+                f"/bin/sh -c 'command -v \"$1\"' sh {case.expected_binary}"
+                if case.executor == "copilot"
+                else f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'"
+            ),
             f"#   期望逐字：{case.expected_binary}",
             f"#   ⛔ 空輸出 ⇒ job 沒有 PATH（或 toolchain 不在上面）；",
             f"#      /usr/bin/{case.executor} ⇒ **本票的原症狀**：解到系統層那一份，",
             "#      不報錯、只是產出來自一支沒人判讀過的 CLI。",
-            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c '{case.executor} --version'",
-            f"{case.version_reference} --version",
-            "#   期望：**兩行逐字相同**（PATH 解出來的那支 == 登記表登記的那支）。",
+            (
+                f"{PATH_PROBE_HELPER} {case.unit_stem} env -u PATH -u HOME "
+                f"/bin/sh -c 'PATH_VERSION=\"$(\"$1\" --version)\"; test -n \"$PATH_VERSION\"; "
+                f"test -f \"$2\"; REF_VERSION=\"$(cat \"$2\")\"; test -n \"$REF_VERSION\"; "
+                "[ \"$PATH_VERSION\" = \"$REF_VERSION\" ]' "
+                f"sh {case.expected_binary} {case.version_reference}"
+                if case.executor == "copilot"
+                else (
+                    f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c "
+                    f"'PATH_VERSION=\"$({case.executor} --version)\"; test -n \"$PATH_VERSION\"; "
+                    f"REF_VERSION=\"$({case.version_reference} --version)\"; test -n \"$REF_VERSION\"; "
+                    "[ \"$PATH_VERSION\" = \"$REF_VERSION\" ]'"
+                )
+            ),
+            (
+                "#   期望：去掉 ambient PATH/HOME 後，pinned wrapper 的版本 == 部署樹 metadata。"
+                if case.executor == "copilot"
+                else "#   期望：**兩行逐字相同**（PATH 解出來的那支 == 登記表登記的那支）。"
+            ),
         ]
         if case.executor == "copilot":
             lines += [
-                "#   Copilot 額外不變式：wrapper 內的 node 必須是**絕對系統層路徑**，",
+                "#   Copilot 額外不變式：版本權威來自部署樹 metadata；wrapper 內的 node",
+                "#   必須是**絕對系統層路徑**，",
                 "#   不得含 env-node / toolchain shadow / --jitless / NODE_OPTIONS / PATH fallback，",
                 "#   且同一支 node 必須跑得起最小 WebAssembly 模組。",
-                f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'NODE_ABS=\"$(awk \"/^exec /{{print \\$2; exit}}\" {case.expected_binary})\"; test -n \"$NODE_ABS\"; test -x \"$NODE_ABS\"; case \"$NODE_ABS\" in /*) ;; *) exit 1 ;; esac; case \"$NODE_ABS\" in {layout.toolchain_root}/*) exit 1 ;; esac; ! grep -Eq \"/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|/usr/bin/copilot|command -v copilot\" {case.expected_binary}; PATH_VERSION=\"$({case.executor} --version)\"; test -n \"$PATH_VERSION\"; REF_VERSION=\"$({case.expected_binary} --version)\"; test -n \"$REF_VERSION\"; [ \"$PATH_VERSION\" = \"$REF_VERSION\" ]; \"$NODE_ABS\" -e \"new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))\"'",
+                f"{PATH_PROBE_HELPER} {case.unit_stem} env -u PATH -u HOME "
+                f"/bin/sh -c 'NODE_ABS=\"$(awk \"/^exec /{{print \\$2; exit}}\" \"$1\")\"; "
+                "test -n \"$NODE_ABS\"; test -x \"$NODE_ABS\"; "
+                "case \"$NODE_ABS\" in /*) ;; *) exit 1 ;; esac; "
+                f"case \"$NODE_ABS\" in {layout.toolchain_root}/*) exit 1 ;; esac; "
+                "! grep -Eq \"/usr/bin/env node|toolchain/bin/node|--jitless|NODE_OPTIONS|/usr/bin/copilot|command -v copilot\" \"$1\"; "
+                "test -f \"$2\"; PATH_VERSION=\"$(\"$1\" --version)\"; test -n \"$PATH_VERSION\"; "
+                "REF_VERSION=\"$(cat \"$2\")\"; test -n \"$REF_VERSION\"; "
+                "[ \"$PATH_VERSION\" = \"$REF_VERSION\" ]; "
+                "\"$NODE_ABS\" -e \"new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))\"' "
+                f"sh {case.expected_binary} {case.version_reference}",
             ]
         lines.append("")
     lines += _wrap_comment(

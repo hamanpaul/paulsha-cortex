@@ -17,12 +17,13 @@ from paulsha_cortex.coordinator.launcher import (
     build_codex_argv,
     build_cg_argv,
 )
+from paulsha_cortex.trust_root.permgen import toolchain_binary_path
 
 
 class ArgvTests(unittest.TestCase):
     def test_copilot_argv(self) -> None:
         argv = build_copilot_argv(prompt="PROMPT", slice_id="slice-a", log_dir="/lg")
-        self.assertEqual(argv[0], "copilot")
+        self.assertEqual(argv[0], toolchain_binary_path("copilot"))
         self.assertIn("-p", argv)
         self.assertIn("PROMPT", argv)                 # prompt 為單一元素
         self.assertIn("--remote", argv)
