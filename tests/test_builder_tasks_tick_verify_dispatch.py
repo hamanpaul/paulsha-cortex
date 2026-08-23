@@ -32,6 +32,8 @@ fidelity and close out #296 with confirming, not merely inherited, coverage.
 from __future__ import annotations
 
 import hashlib
+import os
+import pwd
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -177,6 +179,36 @@ def test_checkbox_only_tick_clears_verify_dispatch_end_to_end(tmp_path: Path) ->
         rows = {row["path"]: row for row in input_snapshot}
         assert rows[TASKS_REF]["sha256"] == hashlib.sha256(ticked.encode()).hexdigest()
         assert rows[PROPOSAL_REF]["sha256"] == hashlib.sha256(PROPOSAL_BASELINE.encode()).hexdigest()
+    finally:
+        import shutil
+
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def test_checkbox_only_tick_clears_verify_dispatch_when_reviewer_account_matches_manager_uid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """direct／同 UID 模式：reviewer sandbox 不得為了冗餘 ACL 交接把 verify dispatch 弄紅。"""
+
+    operator_root = _operator_root(tmp_path)
+    repo = tmp_path / "repo"
+    _init_candidate_repo(repo)
+    ticked = TASKS_BASELINE.replace("- [ ] 1.1", "- [x] 1.1").replace("- [ ] 1.2", "- [X] 1.2")
+    candidate = _commit_build(repo, tasks_text=ticked)
+    reviewer_account = pwd.getpwuid(os.geteuid()).pw_name
+    monkeypatch.setenv(manager.job_runner.REVIEWER_ACCOUNT_ENV, reviewer_account)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("same-uid reviewer sandbox should not request ACL handover")
+
+    monkeypatch.setattr(manager.job_workspace, "grant_workspace_acl", fail_if_called)
+
+    sandbox, checkout, _input_snapshot = _dispatch_reviewer_like(
+        operator_root=operator_root, repo=repo, candidate=candidate,
+        coordinator_root=tmp_path / "coordinator",
+    )
+    try:
+        assert (checkout / TASKS_REF).read_text(encoding="utf-8") == ticked
     finally:
         import shutil
 

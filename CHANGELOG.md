@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#695：新增 generated asset attestation inventory 與 installed-runtime drift compare**，輸出 Manager／Monitor／job unit、shim、polkit rule、gitconfig、Copilot toolchain wrapper 與 Manager GitHub credential surfaces 的 deterministic hash / 安裝 metadata；JSON 投影固定 redacted、不輸出 asset 內容，comment-only text drift 降為 warning。
+- **#695：新增 generated asset attestation inventory 與 installed-runtime drift compare**，輸出 Manager／Monitor／job unit、shim、polkit rule、gitconfig、Copilot toolchain wrapper 與 Manager GitHub credential surfaces 的 deterministic hash / 安裝 metadata；JSON 投影固定 redacted、不輸出 asset 內容，comment-only text drift 降為 warning，且 verify-dispatch 的 reviewer sandbox 在同 UID/direct 模式下不再冗餘要求 `setfacl`。
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.

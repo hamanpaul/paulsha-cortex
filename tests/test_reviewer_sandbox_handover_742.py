@@ -13,6 +13,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from paulsha_cortex.coordinator import job_workspace, manager
@@ -51,7 +52,7 @@ class GrantTests(unittest.TestCase):
             with mock.patch.object(
                 manager.job_runner, "resolve_job_account", return_value="cortex-reviewer-planner"
             ), mock.patch.object(
-                manager.pwd, "getpwnam", return_value=object()
+                manager.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=4241)
             ), mock.patch.object(
                 manager.job_workspace, "grant_workspace_acl", side_effect=fake_grant
             ):
@@ -73,6 +74,25 @@ class GrantTests(unittest.TestCase):
                 manager.job_runner, "resolve_job_account", return_value="cortex-reviewer-planner"
             ), mock.patch.object(
                 manager.pwd, "getpwnam", side_effect=KeyError("absent")
+            ), mock.patch.object(
+                manager.job_workspace, "grant_workspace_acl"
+            ) as grant:
+                result = manager._grant_reviewer_sandbox_access(sandbox)
+            self.assertIsNone(result)
+            grant.assert_not_called()
+
+    def test_same_uid_account_is_a_named_no_op(self) -> None:
+        """direct／同 UID 模式：reviewer 就是 Manager 自己 ⇒ 不應冗餘 setfacl。"""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sandbox = Path(tmp) / "s"
+            sandbox.mkdir()
+            with mock.patch.object(
+                manager.job_runner, "resolve_job_account", return_value="local-reviewer"
+            ), mock.patch.object(
+                manager.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=4242)
+            ), mock.patch.object(
+                manager.os, "geteuid", return_value=4242
             ), mock.patch.object(
                 manager.job_workspace, "grant_workspace_acl"
             ) as grant:

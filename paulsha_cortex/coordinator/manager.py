@@ -6007,15 +6007,17 @@ def _grant_reviewer_sandbox_access(sandbox: Path) -> str | None:
     ACL 的繼承會被 Manager 的 umask 把 mask 歸零（#736 在 gate 快照上的同一個交互）。
     修法比照 #710：owner（Manager）以 `setfacl -R` 顯式授 per-job 那一格，mask 由
     setfacl 重算。帳號由 `resolve_job_account(role=review)` 解（#657 的單一導出）；
-    **不在 passwd 時整支略過**——direct／單 UID 模式同 UID 本就可達，且與
-    `ensure_workspace_reachable` 的既有處置一致，不是 fail-open（降權派工路徑在
-    `prepare_systemd_template()` 對帳號存在性 fail-closed）。
+    **不在 passwd、或其 uid 就是 Manager 當前 euid 時整支略過**——direct／單 UID
+    模式同 UID 本就可達，且與 `ensure_workspace_reachable` 的既有處置一致，不是
+    fail-open（降權派工路徑在 `prepare_systemd_template()` 對帳號存在性 fail-closed）。
     """
 
     account = job_runner.resolve_job_account(os.environ, role=job_runner.JOB_ROLE_REVIEW)
     try:
-        pwd.getpwnam(account)
+        entry = pwd.getpwnam(account)
     except KeyError:
+        return None
+    if entry.pw_uid == os.geteuid():
         return None
     return job_workspace.grant_workspace_acl(
         sandbox,
