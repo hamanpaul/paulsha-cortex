@@ -14,9 +14,9 @@
 - [x] Keep lifecycle visibility observable after install and restart without
       inferring paths from the operator HOME.
 
-## Task 3: Fail-closed coverage and delivery
+## Task 3: Fail-closed coverage and pre-archive verification
 
 - [x] Add fail-closed coverage for missing, mismatched, or unverifiable
       installed state without leaking credentials.
-- [ ] Run focused/full gates, policy/preflight, independent review, delivery,
-      CI, and issue closure through Cortex.
+- [x] Run focused/full pytest, PR-context policy, and authoritative preflight
+      for the candidate before handoff to Manager.
