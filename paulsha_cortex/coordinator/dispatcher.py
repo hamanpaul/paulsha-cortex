@@ -230,6 +230,16 @@ class Dispatcher:
         # 預設：跨進程 durable 機制。
         exit_code = _read_exit_sentinel(control_log_path)
         if exit_code is not None:
+            # The wrapper publishes the model exit sentinel before running the
+            # Manager-authored gate ledger.  Do not let a fast daemon tick
+            # terminalize that job in the small window between those two
+            # writes: the process is still alive and the authoritative ledger
+            # is not available yet.  Once the process is gone, the existing
+            # terminalization path remains fail-closed if the ledger is still
+            # missing.
+            ledger_path = terminal_contract.gate_ledger_path(control_log_path)
+            if not ledger_path.is_file() and (pid_alive or _default_pid_alive)(pid):
+                return job
             return self._finalize_headless(job_id, exit_code, log_path)
 
         alive = (pid_alive or _default_pid_alive)(pid)

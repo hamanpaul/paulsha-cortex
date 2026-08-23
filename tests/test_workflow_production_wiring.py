@@ -5252,9 +5252,9 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
         branch="feature/14-production-wiring",
         pane="",
         worktree=str(sandbox),
-        executor="claude",
-        model_id="sonnet",
-        independence_domain="anthropic",
+        executor="agy",
+        model_id="gemini-3.1-pro-high",
+        independence_domain="google",
         subject_head=candidate,
         workflow_run_id=run.run_id,
         workflow_claim_key=run.claim_key,
@@ -5284,8 +5284,8 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     )
     registry.attach_launch_handle(
         legacy["job_id"],
-        executor="claude",
-        model_id="sonnet",
+        executor="agy",
+        model_id="gemini-3.1-pro-high",
         session_name=legacy["job_id"],
         log_path=str(log),
     )
@@ -5299,9 +5299,9 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
                 "capabilities": ["build"],
             },
             {
-                "executor": "claude",
-                "model_id": "sonnet",
-                "independence_domain": "anthropic",
+                "executor": "agy",
+                "model_id": "gemini-3.1-pro-high",
+                "independence_domain": "google",
                 "capabilities": ["review"],
             },
         ]
@@ -5358,8 +5358,8 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
         def launch(self, *, slice_id, prompt, worktree, log_dir):
             launched.append((slice_id, prompt, worktree))
             return LaunchHandle(
-                executor="claude",
-                model_id="sonnet",
+                executor="agy",
+                model_id="gemini-3.1-pro-high",
                 session_name=slice_id,
                 pid=100,
                 log_path=str(Path(log_dir) / f"{slice_id}.jsonl"),
@@ -5393,12 +5393,12 @@ def test_operator_resume_replaces_exact_bound_reviewer_without_terminal_json(
     assert resumed["reason"] == "in-flight"
     assert resumed["job_id"] != legacy["job_id"]
     assert [row[0] for row in launched] == [resumed["job_id"]]
-    assert '"candidate_checkout": "candidate"' in launched[0][1]
+    assert '"candidate_checkout": "."' in launched[0][1]
     assert launched[0][2] == str(sandbox)
     replacement = registry.get_job(resumed["job_id"])
     assert Path(replacement["worktree"]) == sandbox
-    assert Path(replacement["workflow_input_root"]) == sandbox / "candidate"
-    assert (sandbox / "candidate").is_dir()
+    assert Path(replacement["workflow_input_root"]) == sandbox
+    assert sandbox.is_dir()
     assert registry.get_job(legacy["job_id"])["workflow_evidence"] is None
 
 
@@ -5456,6 +5456,55 @@ def test_review_terminal_rejects_non_builder_job_binding_before_publication(
             registry, job_id=review_job["job_id"], coordinator_root=coordinator
         )
     assert not (tmp_path / report_ref).exists()
+
+
+def test_review_binding_accepts_manager_archive_without_combo_ship_step() -> None:
+    """Post-archive review binds the canonical Manager ship evidence.
+
+    ``fix-standard`` has no ship cards in its workflow step list; the
+    production bridge records ``openspec-archive`` as a Manager-owned job and
+    advances the candidate before the review card is dispatched.  That job's
+    typed ship evidence is the binding authority for the review.
+    """
+
+    candidate = "a" * 40
+    run = type(
+        "Run",
+        (),
+        {
+            "run_id": "run-archive-review",
+            "repo": "owner/repo",
+            "steps": (),
+        },
+    )()
+    archive_job = {
+        "job_id": "archive-job",
+        "workflow_run_id": run.run_id,
+        "workflow_repo": run.repo,
+        "subject_head": candidate,
+        "status": "exited",
+        "exit_code": 0,
+        "workflow_phase": "ship",
+        "workflow_card": "openspec-archive",
+        "persona": "manager",
+        "workflow_evidence": {
+            "kind": "ship",
+            "path": "evidence/workflow/archive.json",
+            "hash": "b" * 64,
+        },
+    }
+
+    class Registry:
+        def get_job(self, job_id: str) -> dict:
+            assert job_id == archive_job["job_id"]
+            return dict(archive_job)
+
+    bound, archive_author = manager._review_builder_job_binding(
+        Registry(), run=run, builder_job_id=archive_job["job_id"], candidate=candidate
+    )
+
+    assert bound["job_id"] == archive_job["job_id"]
+    assert archive_author is True
 
 
 def test_planning_replacement_requires_persisted_authority_not_caller_hash(

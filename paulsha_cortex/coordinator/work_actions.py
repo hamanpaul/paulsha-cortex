@@ -648,15 +648,27 @@ def _canonical_workflow_run(*, workflow_registry, authority):
         and run.source_revision == digest
         and run.issue_refs
         == tuple(f"{authority.repo}#{number}" for number in authority.mapped_issues)
-        and run.openspec_refs == authority.mapped_openspec
+        # A workflow's planning cards may create the active OpenSpec change
+        # after the claim was persisted.  In that case the run legitimately
+        # carries no OpenSpec ref yet, while the current authority does.  Use
+        # the same compatibility rule as resume/claim so delivery and recovery
+        # bind that run instead of treating its own planning output as a new
+        # identity.
+        and _openspec_refs_compatible(run, authority)
         and run.pr_refs
         == tuple(f"{authority.repo}#{number}" for number in authority.mapped_prs)
     ]
-    if len(matches) != 1:
+    # A re-claimed work item legitimately leaves superseded historical runs
+    # with the same authority refs.  Delivery must bind to the one live run;
+    # counting those audit records as competing canonical runs deadlocks ship
+    # as soon as a retry/reclaim has occurred.  Multiple live runs remain a
+    # hard failure rather than an arbitrary choice.
+    active = [run for run in matches if run.status == "ongoing"]
+    if len(active) != 1:
         raise RuntimeError(
             "delivery WorkflowRun does not match current WorkAuthority"
         )
-    return matches[0]
+    return active[0]
 
 
 def _delivery_journal_row(run, authority) -> dict[str, Any]:
@@ -2256,7 +2268,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         and run.work_id == authority.work_id
         and run.status == "ongoing"
         and run.issue_refs == expected_issues
-        and run.openspec_refs == authority.mapped_openspec
+        and _openspec_refs_compatible(run, authority)
     ]
     if len(active) != 1:
         raise RuntimeError("retry-build requires one active canonical WorkflowRun")
@@ -2505,7 +2517,7 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         and run.work_id == authority.work_id
         and run.status == "ongoing"
         and run.issue_refs == expected_issues
-        and run.openspec_refs == authority.mapped_openspec
+        and _openspec_refs_compatible(run, authority)
     ]
     if len(active) != 1:
         raise RuntimeError("retry-card requires one active canonical WorkflowRun")
@@ -2525,11 +2537,33 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     card_jobs = _retry_card_target_jobs(
         run, workflow_registry.list_jobs(), card=card
     )
-    if any(job.get("workflow_evidence") is not None for job in card_jobs):
+    latest_card_job = card_jobs[-1] if card_jobs else None
+    accepted_evidence = any(
+        job.get("workflow_evidence") is not None for job in card_jobs
+    )
+    # A builder repair can be dispatched after a previously accepted attempt
+    # when an operator adjudication identifies a real defect.  If that newer
+    # attempt then dies before producing an envelope (provider failure, for
+    # example), the old evidence is immutable history, not evidence for the
+    # current pending attempt.  Permit exactly this narrow recovery shape:
+    # build phase, latest job terminal and non-zero/failed, no evidence on the
+    # latest job.  Reviewer cards and accepted latest attempts remain blocked.
+    superseded_by_failed_builder = bool(
+        run.current_phase == "build"
+        and latest_card_job is not None
+        and latest_card_job.get("workflow_evidence") is None
+        and latest_card_job.get("status") in TERMINAL_JOB_STATUSES
+        and (
+            latest_card_job.get("status") == "failed"
+            or latest_card_job.get("exit_code") not in (None, 0)
+        )
+    )
+    if accepted_evidence and not superseded_by_failed_builder:
         # 已採信的 evidence 不可重寫，也不得以「重派」名義繞過——那張卡已經有
-        # 被系統採信的結論了。
+        # 被系統採信的結論了。只有上面明確限定的 newer failed builder attempt
+        # 能把舊 evidence 留在稽核歷史、重新開放當前 pending attempt。
         raise RuntimeError("retry-card refuses a card with accepted evidence")
-    if not card_jobs or card_jobs[-1].get("status") not in TERMINAL_JOB_STATUSES:
+    if not card_jobs or latest_card_job.get("status") not in TERMINAL_JOB_STATUSES:
         raise RuntimeError("retry-card requires a terminal job for the card")
     # candidate 完全沒變的 reviewer 重派不是模型修復，比照 `retry-verify`／
     # `retry-review` 的既有分類（#208 根因3：不得計入 model failure 指標，也不得
@@ -2601,7 +2635,7 @@ def _retry_verify_action(*, args: dict[str, Any], authority, workflow_registry) 
         and run.work_id == authority.work_id
         and run.status == "ongoing"
         and run.issue_refs == expected_issues
-        and run.openspec_refs == authority.mapped_openspec
+        and _openspec_refs_compatible(run, authority)
     ]
     if len(active) != 1:
         raise RuntimeError("retry-verify requires one active canonical WorkflowRun")
@@ -2663,7 +2697,7 @@ def _retry_review_action(*, args: dict[str, Any], authority, workflow_registry) 
         and run.work_id == authority.work_id
         and run.status == "ongoing"
         and run.issue_refs == expected_issues
-        and run.openspec_refs == authority.mapped_openspec
+        and _openspec_refs_compatible(run, authority)
     ]
     if len(active) != 1:
         raise RuntimeError("retry-review requires one active canonical WorkflowRun")
@@ -3385,7 +3419,7 @@ def _abandon_action(
     expected_issues = tuple(
         f"{authority.repo}#{number}" for number in authority.mapped_issues
     )
-    if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
+    if run.issue_refs != expected_issues or not _openspec_refs_compatible(run, authority):
         # #410（孤兒救援，建議 2 的窄放行）：work item 改名／重識別後，舊識別的
         # authority 會失去 issue/openspec 映射（例如 tombstone row 只剩 path 錨點、
         # 或 collision 使 correlation 不再把 issue 分派給本 work_id），此時 run 的
@@ -4095,7 +4129,7 @@ def _refreeze_base_action(
         and run.work_id == authority.work_id
         and run.status == "ongoing"
         and run.issue_refs == expected_issues
-        and run.openspec_refs == authority.mapped_openspec
+        and _openspec_refs_compatible(run, authority)
     ]
     if len(active) != 1:
         raise RuntimeError("refreeze-base requires one active canonical WorkflowRun")
@@ -4356,7 +4390,7 @@ def _regenerate_gates_action(
         and run.work_id == authority.work_id
         and run.status == "ongoing"
         and run.issue_refs == expected_issues
-        and run.openspec_refs == authority.mapped_openspec
+        and _openspec_refs_compatible(run, authority)
     ]
     if len(active) != 1:
         raise RuntimeError("regenerate-gates requires one active canonical WorkflowRun")
@@ -4892,7 +4926,7 @@ def _recover_repair_commit_action(
     if len(exact) != 1:
         raise RuntimeError("recover-repair-commit expected WorkflowRun CAS mismatch")
     run = exact[0]
-    if run.issue_refs != expected_issues or run.openspec_refs != authority.mapped_openspec:
+    if run.issue_refs != expected_issues or not _openspec_refs_compatible(run, authority):
         raise RuntimeError(
             "recover-repair-commit WorkflowRun refs differ from current WorkAuthority"
         )

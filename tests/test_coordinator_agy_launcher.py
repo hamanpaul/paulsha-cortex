@@ -26,6 +26,27 @@ def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
     assert "--dangerously-skip-permissions" not in argv
 
 
+def test_agy_reviewer_argv_grants_only_the_disposable_checkout() -> None:
+    argv = build_agy_argv(
+        prompt="inspect",
+        slice_id="verify-demo",
+        log_dir="/tmp/logs",
+        worktree="/tmp/reviewer-checkout",
+        review_only=True,
+    )
+
+    assert argv[0:6] == [
+        "agy",
+        "--print",
+        "inspect",
+        "--mode",
+        "plan",
+        "--sandbox",
+    ]
+    assert argv[6:8] == ["--add-dir", "/tmp/reviewer-checkout"]
+    assert "--dangerously-skip-permissions" not in argv
+
+
 def test_agy_launcher_refuses_unsafe_mode_instead_of_silently_bypassing() -> None:
     with pytest.raises(ValueError, match="agy.*unsafe"):
         build_agy_argv(

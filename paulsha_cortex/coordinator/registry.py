@@ -2217,22 +2217,34 @@ class JobRegistry:
             )
         if pending[0].persona != expected_persona:
             raise ValueError(f"retry-card reset requires a {expected_persona} card")
-        if any(
-            job.get("workflow_run_id") == current.run_id
+        # Keep the registry-side atomic guard aligned with work_actions: an
+        # accepted earlier builder attempt may be followed by a newer terminal
+        # provider failure before any envelope is bound.  That failure
+        # supersedes only the current attempt; it never mutates old evidence.
+        matching_card_jobs = [
+            job
+            for job in self._jobs
+            if job.get("workflow_run_id") == current.run_id
             and job.get("workflow_phase") == phase
             and job.get("workflow_card") == card
-            # verify／review 的 job 以 candidate 定錨（與
-            # `manager._dispatch_workflow_card` 的 matching 同一組判準）：要拒絕
-            # 的是「這張卡對**現在這個 candidate** 已經有被採信的結論」，而不是
-            # 上一代 candidate 留下的歷史紀錄——後者拒絕等於再造一次 catch-22。
             and (phase == "build" or job.get("subject_head") == current.candidate_head)
-            # #765：與 candidate 定錨同一個道理再加一層——claim era 定錨（None
-            # 容忍比照 #766/#768/#772）。authority restart 後前代 era 的已綁
-            # evidence 是歷史稽核列；拿它拒絕新 era 的重派＝同一個 catch-22。
             and job.get("workflow_claim_key") in (None, current.claim_key)
-            and job.get("workflow_evidence") is not None
-            for job in self._jobs
-        ):
+        ]
+        latest_card_job = matching_card_jobs[-1] if matching_card_jobs else None
+        accepted_evidence = any(
+            job.get("workflow_evidence") is not None for job in matching_card_jobs
+        )
+        superseded_by_failed_builder = bool(
+            phase == "build"
+            and latest_card_job is not None
+            and latest_card_job.get("workflow_evidence") is None
+            and latest_card_job.get("status") in TERMINAL_JOB_STATUSES
+            and (
+                latest_card_job.get("status") == "failed"
+                or latest_card_job.get("exit_code") not in (None, 0)
+            )
+        )
+        if accepted_evidence and not superseded_by_failed_builder:
             raise ValueError("retry-card reset refuses a card with accepted evidence")
         steps = tuple(
             # 只清掉「上一次是誰跑的」這類解析結果，讓下一次 dispatch 重新解析

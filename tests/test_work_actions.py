@@ -31,6 +31,61 @@ HEAD = "a" * 40
 TREE = "b" * 40
 
 
+def test_canonical_workflow_run_ignores_superseded_history(tmp_path: Path) -> None:
+    """Delivery binds the sole live run, not identical historical refs."""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    refs = {
+        "repo": authority.repo,
+        "work_id": authority.work_id,
+        "source_revision": work_actions.work_authority_digest(authority),
+        "issue_refs": tuple(f"{authority.repo}#{n}" for n in authority.mapped_issues),
+        "openspec_refs": authority.mapped_openspec,
+        "pr_refs": tuple(f"{authority.repo}#{n}" for n in authority.mapped_prs),
+    }
+    historical = SimpleNamespace(**refs, status="superseded")
+    active = SimpleNamespace(**refs, status="ongoing")
+    registry = SimpleNamespace(list_workflow_runs=lambda: [historical, active])
+
+    assert work_actions._canonical_workflow_run(
+        workflow_registry=registry, authority=authority
+    ) is active
+
+
+def test_canonical_workflow_run_accepts_run_owned_openspec_overlay(
+    tmp_path: Path,
+) -> None:
+    """Planning-created OpenSpec refs must not orphan the live workflow."""
+
+    snapshot = _snapshot(tmp_path / "snapshot.json")
+    authority = work_actions.load_work_authority(
+        repo="acme/demo", work_id="demo", snapshot_path=snapshot
+    )
+    step = SimpleNamespace(
+        phase="define",
+        card="openspec-propose",
+        outputs=("openspec/changes/demo/proposal.md",),
+    )
+    active = SimpleNamespace(
+        repo=authority.repo,
+        work_id=authority.work_id,
+        source_revision=work_actions.work_authority_digest(authority),
+        issue_refs=tuple(f"{authority.repo}#{n}" for n in authority.mapped_issues),
+        openspec_refs=(),
+        pr_refs=tuple(f"{authority.repo}#{n}" for n in authority.mapped_prs),
+        steps=(step,),
+        status="ongoing",
+    )
+    registry = SimpleNamespace(list_workflow_runs=lambda: [active])
+
+    assert work_actions._canonical_workflow_run(
+        workflow_registry=registry, authority=authority
+    ) is active
+
+
 def _only_journal_row(state: Path) -> dict:
     payload = json.loads(state.read_text(encoding="utf-8"))
     assert payload["schema"] == "cortex-delivery-journal/v1"

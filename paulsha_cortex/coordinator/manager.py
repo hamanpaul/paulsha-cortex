@@ -13,6 +13,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -3830,6 +3831,19 @@ def _review_builder_job_binding(
     # 本 run 的是 run_id＋repo＋`subject_head == candidate`（candidate 本身由
     # harvest 的 fast-forward 與 gate ledger 錨定）。era 等值檢查在此只會讓每一次
     # authority 前進（PR 建立、openspec link）把已採信的 build 產物變成孤兒。
+
+    # ``fix-standard`` deliberately omits the Manager-only ship cards from
+    # ``run.steps``.  The archive job is still the authoritative builder for a
+    # post-archive review, and its canonical ship evidence is what proves that
+    # Manager completed that card.  Requiring a matching step here therefore
+    # rejects valid archive -> review handoffs (for example after an OpenSpec
+    # archive advances the candidate).  Keep the normal build-card check
+    # unchanged; only the typed, successful archive job gets this exception.
+    if archive_author:
+        evidence = builder.get("workflow_evidence")
+        if not isinstance(evidence, dict) or evidence.get("kind") != "ship":
+            raise ValueError("review evaluation archive evidence is not passed")
+        return builder, archive_author
 
     card = builder.get("workflow_card")
     if not isinstance(card, str) or not any(
@@ -9882,6 +9896,8 @@ def _dispatch_workflow_card(
                 candidate_checkout=(
                     "candidate"
                     if step.persona == "reviewer" and identity.executor == "claude"
+                    else "."
+                    if step.persona == "reviewer"
                     else None
                 ),
                 # #606：`matching` 就是這張卡先前燒掉的 job（首派為空 →
@@ -11238,8 +11254,25 @@ def apply_workflow_action(
                     card=card_id,
                 )
             else:
+                # The review evidence is staged in ``by_kind`` above but is
+                # not persisted until the phase transition succeeds.  The
+                # production ship validator nevertheless needs to inspect the
+                # canonical foreign-review ref while deciding whether the
+                # transition is admissible.  Give it the exact prospective
+                # run view; keep the durable update below atomic and manager-
+                # owned.
+                validation_run = replace(
+                    current,
+                    gate_refs=tuple(
+                        by_kind[kind]
+                        for kind in (
+                            "brainstorm", "foreign-review", "copilot", "maintainer-review"
+                        )
+                        if kind in by_kind
+                    ),
+                )
                 status, trusted = validate_ship_result(
-                    ship_validator(run=current, candidate=candidate),
+                    ship_validator(run=validation_run, candidate=candidate),
                     candidate=candidate,
                 )
                 if status in {"pending", "needs_human"}:
