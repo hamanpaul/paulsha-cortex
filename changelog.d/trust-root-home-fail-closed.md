@@ -1,3 +1,3 @@
 # trust-root-home-fail-closed
 
-- **#692（RED）：新增 downgraded job HOME fail-closed regression tests**，鎖定 missing/blank/wrong HOME、PATH+HOME 雙缺、shim 不得繼承 unit HOME、pre-launch `$HOME` failure 與診斷 redaction。
+- **#692：downgraded job 的 HOME 契約改為 fail-closed**——launch 前拒絕 missing/blank/relative/symlink/wrong-owner HOME，PATH+HOME 雙缺會一併點名，shim 也不再回退到 unit/daemon HOME。

@@ -27,6 +27,8 @@ import pytest
 
 from paulsha_cortex.coordinator import job_runner, job_shim
 from paulsha_cortex.coordinator.job_runner import JobRunnerError
+from paulsha_cortex.trust_root import permgen
+from paulsha_cortex.trust_root.registry import Principal
 
 _ROLE_HOME_ENV = {
     role: job_runner.resolve_job_role(role).home_env
@@ -171,6 +173,28 @@ def test_build_job_env_rejects_home_owned_by_someone_else(tmp_path: Path) -> Non
 
     assert excinfo.value.diagnostic.reason == "job-runner-home-owner-mismatch"
     assert "owner" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("role", "principal"),
+    (
+        (job_runner.JOB_ROLE_BUILDER, Principal.BUILDER),
+        (job_runner.JOB_ROLE_REVIEW, Principal.REVIEWER),
+        (job_runner.JOB_ROLE_GATE, Principal.GATE),
+    ),
+)
+def test_generated_unit_home_contract_matches_runtime_env(role: str, principal: Principal) -> None:
+    account = job_runner.resolve_job_account({}, role=role)
+    declared_home = permgen.DEFAULT_LAYOUT.home_of(account)
+    with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        env = _build_env(
+            role=role, manager_env=_manager_env(**{_ROLE_HOME_ENV[role]: declared_home})
+        )
+    unit = permgen.build_job_unit(permgen.FOUR_WAY_SCHEME, principal=principal)
+
+    assert env["HOME"] == declared_home
+    assert f"#      {_ROLE_HOME_ENV[role]}={declared_home}" in unit.content
+    assert f"Environment=HOME={declared_home}" in unit.content
 
 
 def test_shim_refuses_to_inherit_home_from_the_unit_layer() -> None:

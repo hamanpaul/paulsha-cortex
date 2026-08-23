@@ -65,6 +65,9 @@ _BASE_ENV = {
     "PSC_BUILDER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
     "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+    "PSC_BUILDER_HOME": "/__psc_test_home__/builder-home",
+    "PSC_REVIEWER_HOME": "/__psc_test_home__/review-home",
+    "PSC_GATE_HOME": "/__psc_test_home__/gate-home",
     "HOME": "/var/lib/cortex-manager",
     # #708：reviewer job 現在也有一格由登記表導出的 log spool（掛在
     # `review-verdict-spool` 底下），因此 `launcher.launch()` 會在 coordinator 樹底下
@@ -372,8 +375,9 @@ class LaunchIdentityTests(unittest.TestCase):
         for leaked in _SECRET_ENV:
             self.assertNotIn(leaked, env, leaked)
         self.assertNotIn("VIRTUAL_ENV", env)
-        # daemon 的 HOME 絕不轉發；未設 PSC_REVIEWER_HOME 時交給 systemd 依 passwd 填。
-        self.assertNotIn("HOME", env)
+        # daemon 的 HOME 絕不轉發；reviewer 只能拿到自己那條 PSC_REVIEWER_HOME。
+        self.assertEqual(env["HOME"], _BASE_ENV["PSC_REVIEWER_HOME"])
+        self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
         self.assertEqual(env["PSC_JOB_ID"], "psc-0615-review")
 
     def test_reviewer_path_override_is_its_own_variable(self) -> None:

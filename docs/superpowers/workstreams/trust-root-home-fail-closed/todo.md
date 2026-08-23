@@ -17,7 +17,7 @@ fail-closed behavior and do not copy credentials from the operator account.
 
 - [x] Reproduce a job with zero extra environment and capture the exact
       pre-launch diagnostic for missing HOME.
-- [ ] Validate and export an approved per-principal HOME before executor
+- [x] Validate and export an approved per-principal HOME before executor
       launch; reject unset, empty, relative, symlinked, or wrong-owner paths.
 - [x] Add tests for missing/empty/wrong HOME, PATH+HOME together, child
       environment inheritance, model `$HOME` failures, and secret redaction.

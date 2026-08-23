@@ -68,6 +68,9 @@ _BASE_ENV = {
     # `PSC_GATE_PATH` 決定，未宣告即 fail-closed。
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
+    job_runner.BUILDER_HOME_ENV: "/__psc_test_home__/builder-home",
+    job_runner.REVIEWER_HOME_ENV: "/__psc_test_home__/review-home",
+    job_runner.GATE_HOME_ENV: "/__psc_test_home__/gate-home",
     "HOME": "/var/lib/cortex-manager",
     "LANG": "en_US.UTF-8",
     "PSC_REPO_ROOT": "/opt/cortex",

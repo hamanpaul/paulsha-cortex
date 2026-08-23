@@ -50,12 +50,18 @@ _JOB_PATH_ENV = {
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
 }
 
+_JOB_HOME_ENV = {
+    "PSC_BUILDER_HOME": "/__psc_test_home__/builder-home",
+    "PSC_REVIEWER_HOME": "/__psc_test_home__/review-home",
+    "PSC_GATE_HOME": "/__psc_test_home__/gate-home",
+}
+
 _GIT_ENV_KEYS = ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
 
 
 def _build_env(role: str, workspace: str | None) -> dict[str, str]:
     return job_runner.build_job_env(
-        manager_env=dict(_JOB_PATH_ENV),
+        manager_env={**_JOB_PATH_ENV, **_JOB_HOME_ENV},
         job_id="job-712",
         slice_id="slice-712",
         repo_root="/opt/cortex",
@@ -277,6 +283,7 @@ def test_the_manager_environment_can_never_supply_these(tmp_path: Path) -> None:
 
     poisoned = {
         **_JOB_PATH_ENV,
+        **_JOB_HOME_ENV,
         "GIT_CONFIG_COUNT": "9",
         "GIT_CONFIG_KEY_0": "alias.pwn",
         "GIT_CONFIG_VALUE_0": "/evil",

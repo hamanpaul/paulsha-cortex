@@ -368,7 +368,7 @@ class ShimEgressEnvContractTests(unittest.TestCase):
         )
 
     def test_unit_declaration_reaches_the_job_env(self) -> None:
-        spec = {"env": {"PATH": "/opt/cortex/toolchain/bin"}}
+        spec = {"env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/opt/cortex/toolchain/bin"}}
         environ = dict(permgen.EGRESS_PROXY.job_env())
         environ["PATH"] = "/unit/path"
         resolved = job_shim.resolve_job_env(spec, environ)
@@ -378,22 +378,28 @@ class ShimEgressEnvContractTests(unittest.TestCase):
 
     def test_empty_no_proxy_is_carried_not_dropped(self) -> None:
         # 空字串是**有意義的值**（明示清空）；用 truthiness 判斷會把它吃掉。
-        spec = {"env": {"PATH": "/p"}}
+        spec = {"env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/p"}}
         resolved = job_shim.resolve_job_env(spec, {"NO_PROXY": "", "PATH": "/p"})
         self.assertIn("NO_PROXY", resolved)
         self.assertEqual(resolved["NO_PROXY"], "")
 
     def test_spec_wins_over_unit(self) -> None:
-        spec = {"env": {"PATH": "/p", "HTTPS_PROXY": "http://spec.example:1"}}
+        spec = {
+            "env": {
+                "HOME": "/__psc_test_home__/builder-home",
+                "PATH": "/p",
+                "HTTPS_PROXY": "http://spec.example:1",
+            }
+        }
         resolved = job_shim.resolve_job_env(
             spec, {"HTTPS_PROXY": "http://unit.example:2", "PATH": "/p"}
         )
         self.assertEqual(resolved["HTTPS_PROXY"], "http://spec.example:1")
 
     def test_absent_declaration_adds_nothing(self) -> None:
-        spec = {"env": {"PATH": "/p"}}
+        spec = {"env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/p"}}
         resolved = job_shim.resolve_job_env(spec, {"PATH": "/p"})
-        self.assertEqual(set(resolved), {"PATH"})
+        self.assertEqual(set(resolved), {"HOME", "PATH"})
 
 
 class ProxyRequestParsingTests(unittest.TestCase):
