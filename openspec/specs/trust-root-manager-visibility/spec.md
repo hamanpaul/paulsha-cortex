@@ -1,7 +1,8 @@
 # trust-root-manager-visibility Specification
 
 ## Purpose
-TBD - created by archiving change trust-root-manager-visibility. Update Purpose after archive.
+讓 Manager 能以不暴露憑證的受保護安裝證據，驗證 trust-root 服務的身分、unit 清單、receipt hash 與生命週期狀態。
+
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 
@@ -11,4 +12,3 @@ TBD - created by archiving change trust-root-manager-visibility. Update Purpose 
 
 - **WHEN** 依 `docs/superpowers/specs/trust-root-manager-visibility-spec.md` 的 Requirements 對 candidate 驗收
 - **THEN** 全部驗收條件成立
-

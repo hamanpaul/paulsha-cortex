@@ -13,8 +13,8 @@ work_item: trust-root-manager-visibility
 
 ## Tasks
 
-- [ ] Make Manager-visible units, identity, and lifecycle state derive from
+- [x] Make Manager-visible units, identity, and lifecycle state derive from
       trust-root desired state and remain observable after install/restart.
-- [ ] Add regression coverage for Manager discovery, service identity, and
+- [x] Add regression coverage for Manager discovery, service identity, and
       fail-closed behavior when installed state is missing or mismatched.
-- [ ] Run focused/full gates and record candidate evidence through Cortex.
+- [x] Run focused/full gates and record candidate evidence through Cortex.
