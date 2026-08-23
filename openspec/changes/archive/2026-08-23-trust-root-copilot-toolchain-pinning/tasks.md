@@ -35,3 +35,10 @@ work_item: trust-root-copilot-toolchain-pinning
       其中 preflight 仍只在 backend policy step 因 `/usr/bin/python3` 缺
       `policy_check` 而 fail，屬 sandbox 環境差異；此卡僅描述 repair 前的
       實作與驗證，不主張 archive／merge／issue closure／done。
+- [x] 1.6 Post-archive repair：將 split-UID trust-root ACL 實測改為先挑出支援
+      POSIX ACL 的暫存根（優先 `/var/tmp`、`/tmp`，最後才吃 `TMPDIR`），讓 gate
+      環境遇到 noacl 的 `tmp_path`／`TMPDIR` 時以具名 skip 收斂 `setfacl -m …`
+      `Invalid argument` 誤紅；`python3 -m pytest -q` 全綠，authoritative
+      `python3 -m paulsha_cortex.preflight_ci --metadata <temp>` 仍只在 backend
+      policy step 因 `/usr/bin/python3` 缺 `policy_check` 而 fail，屬 sandbox
+      環境差異，不主張 archive／merge／issue closure／done。

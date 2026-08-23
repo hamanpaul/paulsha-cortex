@@ -108,6 +108,57 @@ def _run_shell(command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["bash", "-eu", "-c", command], capture_output=True, text=True)
 
 
+def _acl_capable_temp_root(*accounts: str) -> Path:
+    """Pick a real temp root whose filesystem accepts POSIX ACLs for split UIDs.
+
+    Some gate environments point ``TMPDIR`` at mounts where ``setfacl`` returns
+    ``Invalid argument``.  The real-UID trust-root probes should then skip
+    honestly instead of failing for an unrelated temp-root choice.
+    """
+
+    bases: list[str] = []
+    for raw in ("/var/tmp", "/tmp", tempfile.gettempdir()):
+        base = str(raw).strip()
+        if not base or base in bases or not Path(base).is_dir():
+            continue
+        bases.append(base)
+    for base in bases:
+        root = Path(tempfile.mkdtemp(prefix="psc-718-acl-", dir=base))
+        os.chmod(root, 0o711)
+        probe_dir = root / ".acl-probe-dir"
+        probe_file = root / ".acl-probe-file"
+        try:
+            probe_dir.mkdir(mode=0o700)
+            probe_file.write_text("probe\n")
+            supported = True
+            for account in accounts:
+                for spec, target in (
+                    (f"u:{account}:--x", probe_dir),
+                    (f"u:{account}:r--,m::r--", probe_file),
+                ):
+                    completed = subprocess.run(
+                        ["setfacl", "-m", spec, str(target)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if completed.returncode != 0:
+                        supported = False
+                        break
+                if not supported:
+                    break
+            if supported:
+                return root
+        finally:
+            shutil.rmtree(probe_dir, ignore_errors=True)
+            probe_file.unlink(missing_ok=True)
+        shutil.rmtree(root, ignore_errors=True)
+    pytest.skip(
+        "split-UID ACL integration tests require a temp root on a POSIX ACL filesystem; "
+        "gate TMPDIR mounts may reject `setfacl -m ...` with `Invalid argument`"
+    )
+
+
 def _builder_control_command(layout, scheme) -> str:
     expected = f"{layout.codex_control_root}/builder"
     for command in layout.codex_authority_seed_commands(scheme):
@@ -678,9 +729,7 @@ def test_private_prompt_file_survives_real_oversized_launch(tmp_path) -> None:
     assert sentinel.read_text() == "0"
 
 
-def test_template_prompt_channel_is_byte_exact_and_not_renameable_by_real_job_uid(
-    tmp_path,
-) -> None:
+def test_template_prompt_channel_is_byte_exact_and_not_renameable_by_real_job_uid() -> None:
     """Exercise the template-shaped wrapper with real split UIDs when deployed."""
     import shutil
 
@@ -697,58 +746,62 @@ def test_template_prompt_channel_is_byte_exact_and_not_renameable_by_real_job_ui
     except KeyError:
         pytest.skip("deployed split-UID accounts are unavailable")
 
-    spec_spool = tmp_path / "job-specs" / "builder"
-    spec_spool.mkdir(parents=True)
-    os.chown(spec_spool.parent, manager_uid, manager_uid)
-    os.chown(spec_spool, manager_uid, manager_uid)
-    os.chmod(spec_spool.parent, 0o700)
-    os.chmod(spec_spool, 0o700)
-    subprocess.run(["setfacl", "-m", f"u:{job_account}:--x", str(tmp_path)], check=True)
-    instance = job_runner.template_instance_id("real-template-prompt")
-    prompt_dir = Path(
-        job_runner.job_prompt_spool_dir(
-            str(spec_spool), principal="builder", instance=instance, account=job_account
+    root = _acl_capable_temp_root(job_account, foreign)
+    try:
+        spec_spool = root / "job-specs" / "builder"
+        spec_spool.mkdir(parents=True)
+        os.chown(spec_spool.parent, manager_uid, manager_uid)
+        os.chown(spec_spool, manager_uid, manager_uid)
+        os.chmod(spec_spool.parent, 0o700)
+        os.chmod(spec_spool, 0o700)
+        subprocess.run(["setfacl", "-m", f"u:{job_account}:--x", str(root)], check=True)
+        instance = job_runner.template_instance_id("real-template-prompt")
+        prompt_dir = Path(
+            job_runner.job_prompt_spool_dir(
+                str(spec_spool), principal="builder", instance=instance, account=job_account
+            )
         )
-    )
-    prompt_path = Path(job_runner.job_prompt_path(str(prompt_dir), instance))
-    prompt = ("template-sentinel-" + ("x" * 140_000)).encode()
-    job_runner.write_job_prompt(str(prompt_path), prompt.decode(), account=job_account)
-    from paulsha_cortex.coordinator.launcher import build_wrapper_script
+        prompt_path = Path(job_runner.job_prompt_path(str(prompt_dir), instance))
+        prompt = ("template-sentinel-" + ("x" * 140_000)).encode()
+        job_runner.write_job_prompt(str(prompt_path), prompt.decode(), account=job_account)
+        from paulsha_cortex.coordinator.launcher import build_wrapper_script
 
-    script = build_wrapper_script(
-        inner_argv=[
-            sys.executable,
-            "-c",
-            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
-        ],
-        prompt_file=str(prompt_path),
-        sentinel=str(tmp_path / "unused.exit"),
-        ledger=str(tmp_path / "ledger"),
-        worktree=str(tmp_path),
-        repo_root=None,
-        run_gates=False,
-        write_sentinel=False,
-    )
-    completed = subprocess.run(
-        ["runuser", "-u", job_account, "--", "bash", "-c", script],
-        check=False,
-        capture_output=True,
-    )
-    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
-    assert completed.stdout == prompt
-    assert subprocess.run(
-        ["runuser", "-u", job_account, "--", "mv", str(prompt_dir), str(prompt_dir) + ".moved"],
-        check=False,
-        capture_output=True,
-    ).returncode != 0
-    assert subprocess.run(
-        ["runuser", "-u", foreign, "--", "cat", str(prompt_path)],
-        check=False,
-        capture_output=True,
-    ).returncode != 0
-    assert job_runner.reap_orphaned_prompt_slots(
-        str(spec_spool), principal="builder"
-    ) == ()
+        script = build_wrapper_script(
+            inner_argv=[
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+            ],
+            prompt_file=str(prompt_path),
+            sentinel=str(root / "unused.exit"),
+            ledger=str(root / "ledger"),
+            worktree=str(root),
+            repo_root=None,
+            run_gates=False,
+            write_sentinel=False,
+        )
+        completed = subprocess.run(
+            ["runuser", "-u", job_account, "--", "bash", "-c", script],
+            check=False,
+            capture_output=True,
+        )
+        assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+        assert completed.stdout == prompt
+        assert subprocess.run(
+            ["runuser", "-u", job_account, "--", "mv", str(prompt_dir), str(prompt_dir) + ".moved"],
+            check=False,
+            capture_output=True,
+        ).returncode != 0
+        assert subprocess.run(
+            ["runuser", "-u", foreign, "--", "cat", str(prompt_path)],
+            check=False,
+            capture_output=True,
+        ).returncode != 0
+        assert job_runner.reap_orphaned_prompt_slots(
+            str(spec_spool), principal="builder"
+        ) == ()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_private_prompt_bound_fails_closed_before_publish(tmp_path) -> None:
@@ -795,7 +848,7 @@ def test_codex_reasoning_effort_is_explicit_for_pinned_models() -> None:
     ("principal", "account"),
     (("builder", "cortex-builder"), ("reviewer", "cortex-reviewer-planner")),
 )
-def test_owner_aware_publisher_real_uid_arms(principal, account, tmp_path) -> None:
+def test_owner_aware_publisher_real_uid_arms(principal, account) -> None:
     """Exercise unchanged Manager seed and job-owned atomic refresh as real UIDs."""
     import hashlib
     import shutil
@@ -812,89 +865,93 @@ def test_owner_aware_publisher_real_uid_arms(principal, account, tmp_path) -> No
     except KeyError:
         pytest.skip("deployed split-UID accounts are unavailable")
 
-    command = spool_slot.publish_runtime_credential_command(
-        manager_account="cortex-manager"
-    )
-    manager_seed_home = tmp_path / f"{principal}-manager-seed"
-    manager_seed_home.mkdir()
-    seed = manager_seed_home / "auth.json"
-    seed.write_bytes(b'{"seed":"manager"}\n')
-    os.chown(manager_seed_home, manager_uid, manager_uid)
-    os.chown(seed, manager_uid, manager_uid)
-    os.chmod(manager_seed_home, 0o711)
-    os.chmod(seed, 0o600)
-    unchanged = subprocess.run(
-        ["runuser", "-u", account, "--", "env", f"CODEX_HOME={manager_seed_home}", "bash", "-c", command],
-        check=False,
-    )
-    assert unchanged.returncode == 0
-    assert seed.read_bytes() == b'{"seed":"manager"}\n'
-    assert subprocess.run(
-        ["runuser", "-u", "cortex-manager", "--", "cat", str(seed)],
-        check=False,
-        capture_output=True,
-    ).stdout == b'{"seed":"manager"}\n'
+    root = _acl_capable_temp_root(account, "cortex-manager", foreign)
+    try:
+        command = spool_slot.publish_runtime_credential_command(
+            manager_account="cortex-manager"
+        )
+        manager_seed_home = root / f"{principal}-manager-seed"
+        manager_seed_home.mkdir()
+        seed = manager_seed_home / "auth.json"
+        seed.write_bytes(b'{"seed":"manager"}\n')
+        os.chown(manager_seed_home, manager_uid, manager_uid)
+        os.chown(seed, manager_uid, manager_uid)
+        os.chmod(manager_seed_home, 0o711)
+        os.chmod(seed, 0o600)
+        unchanged = subprocess.run(
+            ["runuser", "-u", account, "--", "env", f"CODEX_HOME={manager_seed_home}", "bash", "-c", command],
+            check=False,
+        )
+        assert unchanged.returncode == 0
+        assert seed.read_bytes() == b'{"seed":"manager"}\n'
+        assert subprocess.run(
+            ["runuser", "-u", "cortex-manager", "--", "cat", str(seed)],
+            check=False,
+            capture_output=True,
+        ).stdout == b'{"seed":"manager"}\n'
 
-    job_home = tmp_path / f"{principal}-atomic-refresh"
-    job_home.mkdir()
-    refreshed = job_home / "auth.json"
-    os.chown(job_home, job_uid, job_uid)
-    os.chmod(job_home, 0o700)
-    subprocess.run(
-        ["setfacl", "-m", "u:cortex-manager:--x", str(job_home)],
-        check=True,
-    )
-    # Model the real Codex refresh: UMask=0077, a private temporary inode, and
-    # an atomic rename before the owner-aware publisher runs.
-    refresh_script = (
-        f"umask 0077; tmp={shlex.quote(str(job_home / '.auth.tmp'))}; "
-        f"printf '%s\\n' '{{\"seed\":\"job-refresh\"}}' > \"$tmp\"; "
-        f"mv -- \"$tmp\" {shlex.quote(str(refreshed))}; {command}"
-    )
-    refreshed_run = subprocess.run(
-        ["runuser", "-u", account, "--", "env", f"CODEX_HOME={job_home}", "bash", "-c", refresh_script],
-        check=False,
-    )
-    assert refreshed_run.returncode == 0
-    assert subprocess.run(
-        ["runuser", "-u", "cortex-manager", "--", "cat", str(refreshed)],
-        check=False,
-        capture_output=True,
-    ).stdout == b'{"seed":"job-refresh"}\n'
-    denied = subprocess.run(
-        ["runuser", "-u", foreign, "--", "cat", str(refreshed)],
-        check=False,
-        capture_output=True,
-    )
-    assert denied.returncode != 0
-    foreign_write = subprocess.run(
-        ["runuser", "-u", foreign, "--", "bash", "-c", f"printf x >> {refreshed!s}"],
-        check=False,
-        capture_output=True,
-    )
-    assert foreign_write.returncode != 0
+        job_home = root / f"{principal}-atomic-refresh"
+        job_home.mkdir()
+        refreshed = job_home / "auth.json"
+        os.chown(job_home, job_uid, job_uid)
+        os.chmod(job_home, 0o700)
+        subprocess.run(
+            ["setfacl", "-m", "u:cortex-manager:--x", str(job_home)],
+            check=True,
+        )
+        # Model the real Codex refresh: UMask=0077, a private temporary inode, and
+        # an atomic rename before the owner-aware publisher runs.
+        refresh_script = (
+            f"umask 0077; tmp={shlex.quote(str(job_home / '.auth.tmp'))}; "
+            f"printf '%s\\n' '{{\"seed\":\"job-refresh\"}}' > \"$tmp\"; "
+            f"mv -- \"$tmp\" {shlex.quote(str(refreshed))}; {command}"
+        )
+        refreshed_run = subprocess.run(
+            ["runuser", "-u", account, "--", "env", f"CODEX_HOME={job_home}", "bash", "-c", refresh_script],
+            check=False,
+        )
+        assert refreshed_run.returncode == 0
+        assert subprocess.run(
+            ["runuser", "-u", "cortex-manager", "--", "cat", str(refreshed)],
+            check=False,
+            capture_output=True,
+        ).stdout == b'{"seed":"job-refresh"}\n'
+        denied = subprocess.run(
+            ["runuser", "-u", foreign, "--", "cat", str(refreshed)],
+            check=False,
+            capture_output=True,
+        )
+        assert denied.returncode != 0
+        foreign_write = subprocess.run(
+            ["runuser", "-u", foreign, "--", "bash", "-c", f"printf x >> {refreshed!s}"],
+            check=False,
+            capture_output=True,
+        )
+        assert foreign_write.returncode != 0
 
-    next_home = tmp_path / f"{principal}-next-seed"
-    next_home.mkdir()
-    next_seed = next_home / "auth.json"
-    next_seed.write_bytes(refreshed.read_bytes())
-    os.chown(next_home, manager_uid, manager_uid)
-    os.chown(next_seed, manager_uid, manager_uid)
-    os.chmod(next_home, 0o711)
-    os.chmod(next_seed, 0o600)
-    subprocess.run(
-        ["setfacl", "-m", f"u:{account}:r--,m::r--", str(next_seed)],
-        check=True,
-    )
-    next_read = subprocess.run(
-        ["runuser", "-u", account, "--", "cat", str(next_seed)],
-        check=False,
-        capture_output=True,
-    )
-    assert next_read.returncode == 0
-    assert hashlib.sha256(next_read.stdout).hexdigest() == hashlib.sha256(
-        b'{"seed":"job-refresh"}\n'
-    ).hexdigest()
+        next_home = root / f"{principal}-next-seed"
+        next_home.mkdir()
+        next_seed = next_home / "auth.json"
+        next_seed.write_bytes(refreshed.read_bytes())
+        os.chown(next_home, manager_uid, manager_uid)
+        os.chown(next_seed, manager_uid, manager_uid)
+        os.chmod(next_home, 0o711)
+        os.chmod(next_seed, 0o600)
+        subprocess.run(
+            ["setfacl", "-m", f"u:{account}:r--,m::r--", str(next_seed)],
+            check=True,
+        )
+        next_read = subprocess.run(
+            ["runuser", "-u", account, "--", "cat", str(next_seed)],
+            check=False,
+            capture_output=True,
+        )
+        assert next_read.returncode == 0
+        assert hashlib.sha256(next_read.stdout).hexdigest() == hashlib.sha256(
+            b'{"seed":"job-refresh"}\n'
+        ).hexdigest()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_missing_instance_is_fail_closed_before_rendering_properties() -> None:
