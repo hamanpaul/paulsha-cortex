@@ -8427,8 +8427,9 @@ class AttestationInventoryRecord:
 
     Generated text assets keep both their exact bytes (for deterministic hashing) and the
     install metadata that the runtime should expose. Sensitive runtime-provided credential
-    surfaces intentionally omit raw content: printing Manager GitHub credential bytes would
-    itself violate the trust-root boundary this inventory is meant to attest.
+    surfaces intentionally omit raw content, and JSON projections redact every asset body:
+    printing generated units/shims or Manager GitHub credential bytes would itself violate
+    the trust-root boundary this inventory is meant to attest.
     """
 
     install_path: str
@@ -8455,8 +8456,6 @@ class AttestationInventoryRecord:
         }
         if self.asset_id is not None:
             data["asset_id"] = self.asset_id
-        if self.content is not None:
-            data["content"] = self.content
         return data
 
 
@@ -8819,10 +8818,12 @@ def compare_attestation_runtime(
 
         actual_hash = hashlib.sha256(payload).hexdigest()
         actual_text: str | None = None
+        decode_failed = False
         if expected.content is not None:
             try:
                 actual_text = payload.decode("utf-8")
             except UnicodeDecodeError as exc:
+                decode_failed = True
                 errors.append(
                     AttestationRuntimeIssue(
                         install_path=expected.install_path,
@@ -8875,6 +8876,8 @@ def compare_attestation_runtime(
                 )
             )
         if expected.sha256 is not None and actual_hash != expected.sha256:
+            if decode_failed:
+                continue
             if (
                 expected.content is not None
                 and actual_text is not None

@@ -164,6 +164,19 @@ def test_attestation_inventory_lists_manager_github_surfaces_without_emitting_ra
         assert _field(record, "content") in (None, ""), asset_id
 
 
+def test_attestation_inventory_json_projection_redacts_generated_asset_content() -> None:
+    """#695：inventory JSON 只能保留 metadata / mode / hash，不能帶 generated 內容。"""
+
+    inventory = _attestation_inventory(FOUR_WAY_SCHEME)
+    manager_unit = build_manager_unit(FOUR_WAY_SCHEME, SOURCE_LAYOUT)
+    record = inventory[manager_unit.install_path]
+
+    assert _field(record, "content") == manager_unit.content
+    rendered = record.to_dict()
+    assert rendered["sha256"] == _sha256(manager_unit.content)
+    assert "content" not in rendered
+
+
 def test_attestation_runtime_compare_passes_and_keeps_runtime_surfaces_redacted(
     tmp_path: Path,
 ) -> None:
@@ -220,3 +233,31 @@ def test_attestation_runtime_compare_fails_closed_when_manager_gh_surface_missin
         and issue.install_path == layout.asset_paths()["manager-gh-credential"]
         for issue in result.errors
     )
+
+
+def test_attestation_runtime_compare_stops_at_decode_failed_but_keeps_observed_hash(
+    tmp_path: Path,
+) -> None:
+    inventory, _ = _local_inventory(tmp_path)
+    install_root = tmp_path / "runtime"
+    _materialize_runtime(inventory, install_root=install_root)
+    generated_record = next(record for record in inventory if _field(record, "content") is not None)
+    install_path = str(_field(generated_record, "install_path"))
+    target = install_root / Path(install_path).relative_to("/")
+    payload = b"\xff\xfe\xfdnot-utf8"
+    target.write_bytes(payload)
+
+    result = permgen.compare_attestation_runtime(inventory, install_root=install_root)
+
+    assert not result.passed
+    assert any(
+        issue.kind == "decode-failed" and issue.install_path == install_path
+        for issue in result.errors
+    )
+    assert not any(
+        issue.kind == "content-mismatch" and issue.install_path == install_path
+        for issue in result.errors
+    )
+    observed = {record.install_path: record for record in result.observed}[install_path]
+    assert _field(observed, "sha256") == hashlib.sha256(payload).hexdigest()
+    assert _field(observed, "content") in (None, "")

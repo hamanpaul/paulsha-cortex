@@ -739,6 +739,8 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#681'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/trust-root-copilot-toolchain-pinning/todo.md'
     excludes: []
   trust-root-home-fail-closed:
     title: 'trust-root-home-fail-closed'

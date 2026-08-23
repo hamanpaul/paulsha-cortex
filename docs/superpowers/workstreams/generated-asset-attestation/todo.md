@@ -3,24 +3,19 @@ status: accepted
 work_item: generated-asset-attestation
 ---
 
-# Generated Asset Attestation Todo
+# generated-asset-attestation
 
-## Boundary
+- [x] Generate a machine-readable attestation inventory for the generated
+  Manager／Monitor／job units, root-owned shim, template polkit rule,
+  gitconfigs, and Manager GitHub credential surfaces without exposing
+  credential content.
+- [x] Compare the generated inventory with the installed runtime, fail on
+  functional drift, and demote comment-only text drift to warnings.
+- [x] Add regression coverage for the three-way-to-four-way trust-root,
+  redacted Manager GitHub credential surfaces, comment-only runtime drift, and
+  missing GitHub credential surfaces.
+- [x] Run the generated-asset attestation pytest coverage and the authoritative
+  local archive gate for the active change.
 
-- Issue: `hamanpaul/paulsha-cortex#695`.
-- Scope is limited to proving generated-vs-installed equivalence for Manager
-  and Monitor units, trust-root credential surfaces, and the related RWP/UID
-  attestation gap.
-- Do not change provider credentials, production deployment state, or unrelated
-  job sandbox policy in this work item.
-
-## Tasks
-
-- [ ] Generate a complete inventory for every unit, shim, polkit rule,
-  gitconfig, and toolchain wrapper, with exact content hashes and ownership.
-- [ ] Compare generated inventory with the installed runtime and fail on
-  functional drift while allowing comment-only warnings.
-- [ ] Add regression coverage for the three-way-to-four-way trust-root and
-  missing GitHub credential surfaces without printing credential contents.
-- [ ] Run focused/full gates, Docker qualification, exact-candidate review,
-  delivery, required CI, merge, and issue closure through Cortex.
+Delivery, required CI, merge, issue closure, and done remain Manager-owned
+completion actions.
