@@ -1,0 +1,1 @@
+- **#763（RED）：新增 Manager gitconfig delivery 回歸測試**，要求 trust-root 產生的 Manager `.gitconfig` 宣告 `credential.https://github.com.helper`，且 Git 對 `https://github.com` 的 helper lookup 有精確 scope。
