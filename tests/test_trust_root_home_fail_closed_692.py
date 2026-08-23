@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pwd
@@ -122,6 +123,19 @@ def test_build_job_env_rejects_relative_home_paths() -> None:
     assert "absolute" in str(excinfo.value)
 
 
+def test_build_job_env_rejects_missing_home_directory(tmp_path: Path) -> None:
+    env = _manager_env()
+    env[job_runner.BUILDER_HOME_ENV] = str(tmp_path / "missing-builder-home")
+
+    with pytest.raises(JobRunnerError) as excinfo:
+        _build_env(role=job_runner.JOB_ROLE_BUILDER, manager_env=env)
+
+    message = str(excinfo.value)
+    assert excinfo.value.diagnostic.reason == "job-runner-home-missing"
+    assert job_runner.BUILDER_HOME_ENV in message
+    assert str(tmp_path / "missing-builder-home") not in message
+
+
 def test_build_job_env_rejects_symlink_home_without_echoing_operator_secrets(
     tmp_path: Path,
 ) -> None:
@@ -210,6 +224,32 @@ def test_shim_refuses_to_inherit_home_from_the_unit_layer() -> None:
     assert "HOME" in str(excinfo.value)
 
 
+def test_shim_redacts_home_lstat_failures(tmp_path: Path) -> None:
+    secret_home = tmp_path / "operator-secret-home"
+    spec = {
+        "env": {
+            "HOME": str(secret_home),
+            "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+        }
+    }
+
+    with mock.patch.object(
+        job_shim.os,
+        "lstat",
+        side_effect=PermissionError(errno.EACCES, "Permission denied", str(secret_home)),
+    ):
+        with pytest.raises(job_shim.ShimError) as excinfo:
+            job_shim.resolve_job_env(
+                spec,
+                {"PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin"},
+            )
+
+    message = str(excinfo.value)
+    assert "HOME" in message
+    assert "Permission denied" not in message
+    assert str(secret_home) not in message
+
+
 def test_shim_main_reports_missing_home_before_taking_over_the_log(tmp_path: Path) -> None:
     spool = tmp_path / "job-specs"
     spool.mkdir()
@@ -238,3 +278,43 @@ def test_shim_main_reports_missing_home_before_taking_over_the_log(tmp_path: Pat
     record = json.loads(shim_error.read_text(encoding="utf-8"))
     assert record["instance"] == "demo"
     assert "HOME" in record["error"]
+
+
+def test_shim_main_redacts_home_lstat_failures_before_taking_over_the_log(tmp_path: Path) -> None:
+    spool = tmp_path / "job-specs"
+    spool.mkdir()
+    secret_home = tmp_path / "operator-secret-home"
+    spec = _shim_spec(
+        root=tmp_path,
+        env={
+            "HOME": str(secret_home),
+            "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+        },
+    )
+    (spool / "demo.json").write_text(json.dumps(spec), encoding="utf-8")
+
+    with mock.patch.object(
+        job_shim.os,
+        "lstat",
+        side_effect=PermissionError(errno.EACCES, "Permission denied", str(secret_home)),
+    ), mock.patch.object(
+        job_shim,
+        "_take_over_stdio",
+        side_effect=AssertionError("HOME lstat failures must stop before log takeover"),
+    ):
+        rc = job_shim.main(
+            ["demo"],
+            {
+                job_runner.JOB_SPEC_SPOOL_ENV: str(spool),
+                "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+                "HOME": "/var/lib/cortex-builder",
+            },
+        )
+
+    assert rc == job_shim.EXIT_SPEC_ERROR
+    assert not Path(spec["log_path"]).exists()
+    record = json.loads((tmp_path / job_shim.SHIM_ERROR_FILENAME).read_text(encoding="utf-8"))
+    assert record["instance"] == "demo"
+    assert "HOME" in record["error"]
+    assert "Permission denied" not in record["error"]
+    assert str(secret_home) not in record["error"]

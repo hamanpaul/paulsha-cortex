@@ -3,7 +3,7 @@ status: accepted
 work_item: trust-root-agent-loop-qualification
 ---
 
-# Trust-root real agent-loop qualification Todo
+# Trust-root real agent-loop qualification Plan
 
 Issue: `hamanpaul/paulsha-cortex#716`.
 

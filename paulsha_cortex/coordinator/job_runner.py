@@ -1308,7 +1308,7 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
     problem = _assess_home_path(
         value,
         expected_uid=account_ids[0] if account_ids is not None else None,
-        require_existing=False,
+        require_existing=True,
     )
     if problem is None:
         return value

@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _home_paths import REVIEWER_HOME
 
 from paulsha_cortex.coordinator import (
     job_runner,
@@ -120,8 +121,9 @@ class _Harness:
         self.env = {
             job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE,
             "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
-            "PSC_REVIEWER_HOME": "/__psc_test_home__/review-home",
+            "PSC_REVIEWER_HOME": REVIEWER_HOME,
         }
+        monkeypatch.setattr(job_runner, "_account_ids", lambda _account: None)
         real_prepare = job_runner.prepare_systemd_template
 
         def fake_prepare(env, *, job_id, executor, role=job_runner.JOB_ROLE_BUILDER,

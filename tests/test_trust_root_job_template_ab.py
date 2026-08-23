@@ -32,6 +32,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.job_shim as job_shim
 import paulsha_cortex.coordinator.job_workspace as job_workspace
@@ -52,9 +53,9 @@ _BASE_ENV = {
     "PSC_BUILDER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
     "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
-    "PSC_BUILDER_HOME": "/__psc_test_home__/builder-home",
-    "PSC_REVIEWER_HOME": "/__psc_test_home__/review-home",
-    "PSC_GATE_HOME": "/__psc_test_home__/gate-home",
+    "PSC_BUILDER_HOME": BUILDER_HOME,
+    "PSC_REVIEWER_HOME": REVIEWER_HOME,
+    "PSC_GATE_HOME": GATE_HOME,
     "HOME": "/var/lib/cortex-manager",
     # conftest 的 `_clear_runtime_env` 把 PSC_AGENTS_ROOT 指向 per-test 暫存目錄，
     # 但本檔的 launch 測試以 `clear=True` 重建整份 environ（要驗的就是白名單本身），
@@ -153,6 +154,7 @@ def _preflight_patches(*, unit_active: bool = False, **overrides):
         "booted": mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         "account": mock.patch.object(job_runner, "_account_exists", return_value=True),
         "group": mock.patch.object(job_runner, "_group_exists", return_value=True),
+        "account_ids": mock.patch.object(job_runner, "_account_ids", return_value=None),
         "unit_file": mock.patch.object(
             job_runner, "_unit_file_installed", return_value=True
         ),
@@ -946,7 +948,7 @@ class JobSpecContentTests(unittest.TestCase):
             "command": ["bash", "-c", "true"],
             "working_directory": "/wt",
             "log_path": "/logs/j.jsonl",
-            "env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
+            "env": {"HOME": BUILDER_HOME, "PATH": "/usr/bin"},
         }
         for override in (
             {"command": []},
@@ -1233,6 +1235,7 @@ class NoRegressionTests(unittest.TestCase):
             mock.patch.object(job_runner, "_systemd_booted", return_value=True),
             mock.patch.object(job_runner, "_account_exists", return_value=True),
             mock.patch.object(job_runner, "_group_exists", return_value=True),
+            mock.patch.object(job_runner, "_account_ids", return_value=None),
         ]
         try:
             with tempfile.TemporaryDirectory() as d, mock.patch.dict(
@@ -1361,7 +1364,7 @@ class ShimLogicTests(unittest.TestCase):
             "command": ["/bin/true"],
             "working_directory": str(root),
             "log_path": str(root / "job.jsonl"),
-            "env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
+            "env": {"HOME": BUILDER_HOME, "PATH": "/usr/bin"},
         }
         spec.update(overrides)
         return spec
@@ -1498,7 +1501,7 @@ class ShimLogicTests(unittest.TestCase):
             self.assertEqual(recorded["argv"], ["/bin/true"])
             self.assertEqual(
                 recorded["env"],
-                {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
+                {"HOME": BUILDER_HOME, "PATH": "/usr/bin"},
             )
             self.assertEqual(Path(recorded["cwd"]).resolve(), root.resolve())
             contents = log.read_text(encoding="utf-8")

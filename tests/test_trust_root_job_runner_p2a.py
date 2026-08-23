@@ -33,6 +33,7 @@ from test_trust_root_job_template_ab import _copilot_oauth_authority_env
 
 # 每一輪 launch 測試都在乾淨的 env 上疊加，避免 operator 自己的 shell 汙染判定。
 _ISOLATED_AGENTS_ROOT = tempfile.mkdtemp(prefix="psc-agents-root-")
+_ISOLATED_HOMES_ROOT = Path(tempfile.mkdtemp(prefix="psc-job-homes-"))
 
 #: #679：job 的 PATH 只由**本角色的** `PSC_*_PATH` 決定，未宣告即 fail-closed。
 #: 三個角色各給一份可辨識的值，測試才驗得到「角色不會互相污染」。
@@ -43,10 +44,13 @@ _JOB_PATH_ENV = {
 }
 
 _JOB_HOME_ENV = {
-    job_runner.BUILDER_HOME_ENV: "/__psc_test_home__/builder-home",
-    job_runner.REVIEWER_HOME_ENV: "/__psc_test_home__/review-home",
-    job_runner.GATE_HOME_ENV: "/__psc_test_home__/gate-home",
+    job_runner.BUILDER_HOME_ENV: str(_ISOLATED_HOMES_ROOT / "builder-home"),
+    job_runner.REVIEWER_HOME_ENV: str(_ISOLATED_HOMES_ROOT / "review-home"),
+    job_runner.GATE_HOME_ENV: str(_ISOLATED_HOMES_ROOT / "gate-home"),
 }
+
+for _home in _JOB_HOME_ENV.values():
+    Path(_home).mkdir(parents=True, exist_ok=True)
 
 _BASE_ENV = {
     # daemon 自己的 PATH。**#679 起它不再被轉發**——留在這裡正是為了驗那件事：
@@ -126,9 +130,9 @@ def _launch(
 
     original = launcher_module.subprocess.Popen
     launcher_module.subprocess.Popen = popen
-    patches = []
+    patches = [mock.patch.object(job_runner, "_account_ids", return_value=None)]
     if preflight_ok:
-        patches = [
+        patches += [
             mock.patch.object(job_runner.shutil, "which", return_value="/usr/bin/systemd-run"),
             mock.patch.object(job_runner, "_systemd_booted", return_value=True),
             mock.patch.object(job_runner, "_account_exists", return_value=True),
@@ -280,16 +284,17 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
     def _build(self, **overrides) -> dict[str, str]:
         manager_env = {**_BASE_ENV, **_SECRET_ENV}
         manager_env.update(overrides)
-        return job_runner.build_builder_env(
-            manager_env=manager_env,
-            job_id="job-1",
-            slice_id="slice-1",
-            repo_root="/opt/cortex/src",
-            # #712：`workspace` 是新增的**必填**具名參數。本類驗的是 env 白名單
-            # （哪些名字進得來、哪些絕不進來），與工作區無關 ⇒ `None`（＝「本呼叫端
-            # 沒有工作區」）。逐 job 的 git 放行有自己的測試檔。
-            workspace=None,
-        )
+        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+            return job_runner.build_builder_env(
+                manager_env=manager_env,
+                job_id="job-1",
+                slice_id="slice-1",
+                repo_root="/opt/cortex/src",
+                # #712：`workspace` 是新增的**必填**具名參數。本類驗的是 env 白名單
+                # （哪些名字進得來、哪些絕不進來），與工作區無關 ⇒ `None`（＝「本呼叫端
+                # 沒有工作區」）。逐 job 的 git 放行有自己的測試檔。
+                workspace=None,
+            )
 
     def test_never_carries_token_shaped_variables(self) -> None:
         env = self._build()
@@ -325,8 +330,10 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
 
     def test_builder_home_override_is_used(self) -> None:
-        env = self._build(**{job_runner.BUILDER_HOME_ENV: "/custom/cortex-builder"})
-        self.assertEqual(env["HOME"], "/custom/cortex-builder")
+        custom_home = _ISOLATED_HOMES_ROOT / "custom-cortex-builder"
+        custom_home.mkdir(exist_ok=True)
+        env = self._build(**{job_runner.BUILDER_HOME_ENV: str(custom_home)})
+        self.assertEqual(env["HOME"], str(custom_home))
         self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
 
     def test_path_comes_from_the_role_variable_and_never_from_the_daemon(self) -> None:
@@ -358,22 +365,24 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
 
     def test_relay_target_only_when_configured(self) -> None:
         manager_env = {**_BASE_ENV}
-        without = job_runner.build_builder_env(
-            manager_env=manager_env,
-            job_id="j",
-            slice_id="s",
-            repo_root="/r",
-            workspace=None,  # #712：同上。
-        )
+        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+            without = job_runner.build_builder_env(
+                manager_env=manager_env,
+                job_id="j",
+                slice_id="s",
+                repo_root="/r",
+                workspace=None,  # #712：同上。
+            )
         self.assertNotIn("PSC_RELAY_TARGET", without)
-        with_relay = job_runner.build_builder_env(
-            manager_env=manager_env,
-            job_id="j",
-            slice_id="s",
-            repo_root="/r",
-            workspace=None,  # #712：同上。
-            relay_target="psc",
-        )
+        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+            with_relay = job_runner.build_builder_env(
+                manager_env=manager_env,
+                job_id="j",
+                slice_id="s",
+                repo_root="/r",
+                workspace=None,  # #712：同上。
+                relay_target="psc",
+            )
         self.assertEqual(with_relay["PSC_RELAY_TARGET"], "psc")
 
     def test_git_repository_selectors_are_not_forwarded(self) -> None:
@@ -395,30 +404,32 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
             job_runner.ForwardedEnvVar("SOME_API_KEY", "刻意注入的壞白名單"),
         )
         with mock.patch.object(job_runner, "BUILDER_FORWARDED_ENV", poisoned):
-            with self.assertRaises(JobRunnerError) as ctx:
-                job_runner.build_builder_env(
-                    manager_env={"SOME_API_KEY": "leaked", **_JOB_PATH_ENV, **_JOB_HOME_ENV},
-                    job_id="j",
-                    slice_id="s",
-                    repo_root="/r",
-                    workspace=None,  # #712：同上。
-                )
+            with mock.patch.object(job_runner, "_account_ids", return_value=None):
+                with self.assertRaises(JobRunnerError) as ctx:
+                    job_runner.build_builder_env(
+                        manager_env={"SOME_API_KEY": "leaked", **_JOB_PATH_ENV, **_JOB_HOME_ENV},
+                        job_id="j",
+                        slice_id="s",
+                        repo_root="/r",
+                        workspace=None,  # #712：同上。
+                    )
         self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-credential-env-leak")
 
     def test_newline_in_value_is_rejected(self) -> None:
         # #679：注入點跟著 PATH 的來源走——現在是 `PSC_BUILDER_PATH`，不是 daemon 的
         # `PATH`（後者已不再轉發）。守衛必須仍然攔得到。
-        with self.assertRaises(JobRunnerError) as ctx:
-            job_runner.build_builder_env(
-                manager_env={
-                    job_runner.BUILDER_PATH_ENV: "/usr/bin\n--property=User=root",
-                    job_runner.BUILDER_HOME_ENV: _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV],
-                },
-                job_id="j",
-                slice_id="s",
-                repo_root="/r",
-                workspace=None,  # #712：同上。
-            )
+        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+            with self.assertRaises(JobRunnerError) as ctx:
+                job_runner.build_builder_env(
+                    manager_env={
+                        job_runner.BUILDER_PATH_ENV: "/usr/bin\n--property=User=root",
+                        job_runner.BUILDER_HOME_ENV: _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV],
+                    },
+                    job_id="j",
+                    slice_id="s",
+                    repo_root="/r",
+                    workspace=None,  # #712：同上。
+                )
         self.assertEqual(ctx.exception.diagnostic.reason, "job-runner-env-value-invalid")
 
 
@@ -901,11 +912,11 @@ class DegradedLaunchTests(unittest.TestCase):
         # #262 D2：preflight 必須回報 job 真的會看到的環境，否則只是安慰劑。
         with mock.patch.dict(
             os.environ,
-            _degraded_env(**{job_runner.BUILDER_HOME_ENV: "/__psc_test_home__/builder-home"}),
+            _degraded_env(**{job_runner.BUILDER_HOME_ENV: _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV]}),
             clear=True,
-        ):
+        ), mock.patch.object(job_runner, "_account_ids", return_value=None):
             reported = SubprocessLauncher("codex").executor_environment()
-        self.assertEqual(reported.home, "/__psc_test_home__/builder-home")
+        self.assertEqual(reported.home, _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV])
         # #679：preflight 報的 PATH 也必須是 job 真的會拿到的那一份。
         self.assertEqual(reported.path, _JOB_PATH_ENV[job_runner.BUILDER_PATH_ENV])
 
