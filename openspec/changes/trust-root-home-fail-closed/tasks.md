@@ -17,5 +17,5 @@ work_item: trust-root-home-fail-closed
       specs validation passes, and the offline delivery preflight only stops at
       this sandbox's missing installed `policy_check` module rather than a
       Candidate-local failure.
-- [ ] Manager-owned closeout remains pending: official OpenSpec archive/commit,
-      exact-PR-head delivery and CI evidence, merge, issue closure, and done.
+> Manager-owned closeout remains pending: official OpenSpec archive/commit,
+> exact-PR-head delivery and CI evidence, merge, issue closure, and done.
