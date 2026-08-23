@@ -1,1 +1,1 @@
-- **#763（RED）：新增 Manager gitconfig delivery 回歸測試**，要求 trust-root 產生的 Manager `.gitconfig` 宣告 `credential.https://github.com.helper`，且 Git 對 `https://github.com` 的 helper lookup 有精確 scope。
+- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 改走 gate ledger handoff 採納 builder-owned HEAD evidence。

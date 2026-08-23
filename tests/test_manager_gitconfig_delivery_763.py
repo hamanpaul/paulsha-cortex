@@ -77,14 +77,16 @@ def test_manager_gitconfig_dry_runs_https_credential_lookup_via_generated_helper
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    fake_gh = tmp_path / "fake-gh"
-    helper_log = tmp_path / "helper.log"
+    helper_dir = tmp_path / "helper space"
+    helper_dir.mkdir()
+    fake_gh = helper_dir / "fake gh"
+    helper_log = helper_dir / "helper.log"
     fake_gh.write_text(
         "\n".join(
             (
                 "#!/bin/sh",
-                f'printf %s \"$*\" > {helper_log}',
-                "printf 'username=x-access-token\\npassword=pw\\n'",
+                f'printf %s "$*" > "{helper_log}"',
+                "printf 'username=x-access-token\\npassword=******\\n'",
             )
         )
         + "\n",
@@ -93,7 +95,36 @@ def test_manager_gitconfig_dry_runs_https_credential_lookup_via_generated_helper
     fake_gh.chmod(0o755)
     monkeypatch.setattr(permgen, "SYSTEM_GH_EXECUTABLE", str(fake_gh))
 
-    home = tmp_path / "home"
+    ambient_helper = tmp_path / "ambient-helper"
+    ambient_log = tmp_path / "ambient.log"
+    ambient_helper.write_text(
+        "\n".join(
+            (
+                "#!/bin/sh",
+                f'printf %s "$*" > "{ambient_log}"',
+                "printf 'username=ambient\\npassword=ambient\\n'",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ambient_helper.chmod(0o755)
+    ambient_config = tmp_path / "ambient.gitconfig"
+    ambient_config.write_text(
+        "\n".join(
+            (
+                f'[credential "{permgen.GITHUB_HTTPS_CREDENTIAL_URL}"]',
+                "\thelper =",
+                f"\thelper = {permgen.durable_owner_git_credential_helper(str(ambient_helper))}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(ambient_config))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ambient-xdg"))
+
+    home = tmp_path / "home with spaces"
     home.mkdir()
     config_path = home / ".gitconfig"
     _write_manager_gitconfig(config_path)
@@ -104,10 +135,16 @@ def test_manager_gitconfig_dry_runs_https_credential_lookup_via_generated_helper
         check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"},
+        env={
+            "GIT_CONFIG_GLOBAL": str(config_path),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "HOME": str(home),
+            "PATH": os.defpath,
+        },
     )
 
     assert result.returncode == 0, result.stderr
     assert "username=x-access-token" in result.stdout
-    assert "password=pw" in result.stdout
+    assert "******" in result.stdout
+    assert not ambient_log.exists()
     assert helper_log.read_text(encoding="utf-8") == "auth git-credential get"
