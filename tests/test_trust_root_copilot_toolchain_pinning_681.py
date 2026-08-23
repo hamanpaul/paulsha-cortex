@@ -98,3 +98,17 @@ def test_copilot_toolchain_plan_reinstalls_through_tempdir_and_rename() -> None:
     assert final_copy not in plan_text
     assert plan_lines.index(tmp_copy) < plan_lines.index(mv_line) < plan_lines.index(final_entry)
     assert "只先複製到 `$tmp`；最終" in plan_text
+
+
+def test_copilot_toolchain_wrapper_version_guards_fail_closed_before_exec() -> None:
+    plan_text = "\n".join(build_toolchain_plan(THREE_WAY_SCHEME, DEFAULT_LAYOUT))
+    for guard in (
+        '#     test -f "$VERSION_FILE" || exit 1',
+        '#     test -f "$ENTRY_ABS" || exit 1',
+        '#     EXPECTED_VERSION="$(cat "$VERSION_FILE")" || exit 1',
+        '#     test -n "$EXPECTED_VERSION" || exit 1',
+        '#     ACTUAL_VERSION="$($NODE_ABS "$ENTRY_ABS" --version)" || exit 1',
+        '#     test -n "$ACTUAL_VERSION" || exit 1',
+        '#     [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] || exit 1',
+    ):
+        assert guard in plan_text

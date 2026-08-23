@@ -1,7 +1,11 @@
 # trust-root-copilot-toolchain-pinning Specification
 
 ## Purpose
-TBD - created by archiving change trust-root-copilot-toolchain-pinning. Update Purpose after archive.
+
+Ensure every Copilot job executes the exact registered Copilot binary and
+version from the root-owned deployment tree, and fail closed on PATH/HOME
+drift, symlink or path escape, or version metadata mismatch.
+
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 
@@ -11,4 +15,3 @@ TBD - created by archiving change trust-root-copilot-toolchain-pinning. Update P
 
 - **WHEN** 依 `docs/superpowers/specs/trust-root-copilot-toolchain-pinning-spec.md` 的 Requirements 對 candidate 驗收
 - **THEN** 全部驗收條件成立
-

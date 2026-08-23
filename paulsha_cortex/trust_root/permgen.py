@@ -7906,12 +7906,13 @@ def build_toolchain_plan(
                     "#     #!/bin/sh",
                     f'#     VERSION_FILE="{layout.toolchain_lib}/{tool.name}/{COPILOT_VERSION_FILENAME}"',
                     f'#     ENTRY_ABS="{layout.toolchain_lib}/{tool.name}/$ENTRY_REL"',
-                    '#     test -f "$VERSION_FILE" && test -f "$ENTRY_ABS"',
-                    '#     EXPECTED_VERSION="$(cat "$VERSION_FILE")"',
-                    '#     test -n "$EXPECTED_VERSION"',
-                    '#     ACTUAL_VERSION="$($NODE_ABS "$ENTRY_ABS" --version)"',
-                    '#     test -n "$ACTUAL_VERSION"',
-                    '#     [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ]',
+                    '#     test -f "$VERSION_FILE" || exit 1',
+                    '#     test -f "$ENTRY_ABS" || exit 1',
+                    '#     EXPECTED_VERSION="$(cat "$VERSION_FILE")" || exit 1',
+                    '#     test -n "$EXPECTED_VERSION" || exit 1',
+                    '#     ACTUAL_VERSION="$($NODE_ABS "$ENTRY_ABS" --version)" || exit 1',
+                    '#     test -n "$ACTUAL_VERSION" || exit 1',
+                    '#     [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] || exit 1',
                     f'#     exec $NODE_ABS "{layout.toolchain_lib}/{tool.name}/$ENTRY_REL" "\\$@"',
                     "#     EOF",
                     f'#     mv -T "$tmp/{tool.name}" {layout.toolchain_lib}/{tool.name}',
@@ -8814,11 +8815,7 @@ def build_path_resolution_probe(
         lines += [
             f"# --- {case.principal.value} × {case.executor}"
             f"（{case.account}／{case.unit_stem}@／剖面 {case.hardening_profile}）---",
-            (
-                f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'"
-                if case.executor == "copilot"
-                else f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'"
-            ),
+            f"{PATH_PROBE_HELPER} {case.unit_stem} /bin/sh -c 'command -v {case.executor}'",
             f"#   期望逐字：{case.expected_binary}",
             f"#   ⛔ 空輸出 ⇒ job 沒有 PATH（或 toolchain 不在上面）；",
             f"#      /usr/bin/{case.executor} ⇒ **本票的原症狀**：解到系統層那一份，",
