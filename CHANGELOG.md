@@ -7,11 +7,14 @@
 
 ## [Unreleased]
 
-- **#716（RED）：新增 real agent-loop qualification contract tests**，要求新的
-  `agent-loop-probe` 走真實 `codex exec` template dispatch、覆蓋 repository
-  command / child process / forbidden path / forbidden host /
-  no-unsafe-fallback，並把 SKIP／fallback／quota／model mismatch 鎖成
-  fail-closed。
+- **#716：新增 `agent-loop-probe` qualification harness 與 CLI**，重用真實
+  `codex exec` template dispatch seam（`build_codex_argv` /
+  `prepare_systemd_template` / `build_job_env` / `build_job_spec` /
+  `write_job_spec` / `systemctl start --wait`），並把 repository command /
+  child process / forbidden path / forbidden host / no-unsafe-fallback 與
+  executor/model、unit hash、candidate SHA、artifact hash、child tree、
+  exit reason、SKIP／fallback／quota／model mismatch fail-closed evidence
+  釘進 probe contract。
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.

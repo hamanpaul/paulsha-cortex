@@ -9561,6 +9561,166 @@ def build_inner_sandbox_probe(
     return lines
 
 
+AGENT_LOOP_PROBE_JOB_ID = "probe-716-agent-loop"
+
+
+def build_agent_loop_probe(
+    scheme: UidScheme,
+    layout: "PathLayout" = None,  # type: ignore[assignment]
+) -> list[str]:
+    """#716 真實 agent-loop qualification harness（只產生字串，不執行）。
+
+    這一支不是 `psc_run_under` 複本，而是**沿用 production 派工接縫**：
+    `build_codex_argv()` → `prepare_systemd_template()` → `build_job_env()` →
+    `build_job_spec()` → `write_job_spec()` → `systemctl start --wait`。
+
+    測的面向刻意與 `tests/test_trust_root_agent_loop_qualification_716.py` 的 RED 契約
+    逐字對齊：repository command / child process / forbidden path /
+    forbidden host / no-unsafe-fallback，並把 `executor/model`、`unit hash`、
+    `candidate SHA`、`artifact hash`、`child tree` 與 `exit reason` 全部落進同一組
+    fail-closed evidence；`SKIP`／`fallback`／`quota`／`model mismatch` 一律視為失敗。
+    """
+
+    layout = layout if layout is not None else DEFAULT_LAYOUT
+    manager = scheme.durable_state_owner
+    python = f"{layout.deploy_root}/venv/bin/python3"
+    profile = executor_hardening_profile("codex")
+    unit_stem = job_unit_stem(layout, Principal.BUILDER, profile)
+    artifact_root = (
+        Path(layout.coordinator_root) / "evidence" / "workflow" / AGENT_LOOP_PROBE_JOB_ID
+    )
+    prompt = (
+        "Run the real agent-loop qualification against this repository.\n"
+        "1. repository command: run `git -c safe.directory=\"$PWD\" rev-parse HEAD`.\n"
+        "2. child process: run `/bin/sh -lc 'printf CHILD-PROCESS | cat'`.\n"
+        "3. forbidden path: prove `/root/psc-716-forbidden` stays blocked.\n"
+        "4. forbidden host: prove direct `socket.create_connection((\"1.1.1.1\", 443), 5)`"
+        " stays blocked after `env -u HTTPS_PROXY -u https_proxy`.\n"
+        "5. no-unsafe-fallback: fail if argv uses "
+        "`--dangerously-bypass-approvals-and-sandbox`, if the run reports SKIP, fallback,"
+        " quota, or model mismatch, or if the configured executor/model drifts.\n"
+        "Return executor/model, unit hash, candidate SHA, artifact hash, child tree, and"
+        " exit reason in the final qualification evidence."
+    )
+    lines: list[str] = [
+        "# === #716 real agent-loop qualification (production-shaped) ===",
+        f"# 由 permgen 機械產生（scheme={scheme.scheme_id}）——勿手改；重跑：",
+        f"#   python3 -m paulsha_cortex.trust_root agent-loop-probe {scheme.scheme_id}",
+        "#",
+    ]
+    lines += _wrap_comment(
+        "這一支**故意不用** `psc_run_under`：那條只能複製加固面，驗不到真正會失敗的"
+        " `codex exec` template-dispatch seam。#716 要的是 production 形態本身——"
+        "`build_codex_argv`、`prepare_systemd_template`、`build_job_env`、"
+        "`build_job_spec`、`write_job_spec` 與 `systemctl start --wait` 是同一條路。"
+    )
+    lines += _wrap_comment(
+        "外層加固與出口白名單都要留著：builder argv 應為 `danger-full-access`，但**不得**"
+        "退化成 `--dangerously-bypass-approvals-and-sandbox`。本探針因此把 "
+        "`danger-full-access` 與 `no-unsafe-fallback` 都寫成顯式 gate。"
+    )
+    lines += [
+        "",
+        f"# 實際模板字幹：{unit_stem}@（executor={profile.profile_id} / codex）",
+        f"PSC_716_JOB_ID={AGENT_LOOP_PROBE_JOB_ID}",
+        'PSC_716_REPO_ROOT="${PSC_REPO_ROOT:?point PSC_REPO_ROOT at the repo/worktree to qualify}"',
+        f"PSC_716_ARTIFACT_ROOT={shlex.quote(str(artifact_root))}",
+        f"sudo -u {manager} install -d \"$PSC_716_ARTIFACT_ROOT\"",
+        f"sudo -u {manager} {python} - <<'PSC_716_PREP' > \"$PSC_716_ARTIFACT_ROOT/vars.sh\"",
+        "import hashlib",
+        "import os",
+        "import shlex",
+        "from paulsha_cortex.coordinator import job_workspace",
+        "from paulsha_cortex.coordinator.job_runner import (",
+        "    build_job_env,",
+        "    build_job_spec,",
+        "    prepare_systemd_template,",
+        "    write_job_spec,",
+        ")",
+        "from paulsha_cortex.coordinator.launcher import build_codex_argv",
+        f"job_id = {AGENT_LOOP_PROBE_JOB_ID!r}",
+        "repo_root = os.environ['PSC_REPO_ROOT']",
+        "artifact_root = os.environ['PSC_716_ARTIFACT_ROOT']",
+        f"prompt = {prompt!r}",
+        "plan = prepare_systemd_template(os.environ, job_id=job_id, executor='codex')",
+        "log_path = os.path.join(artifact_root, 'job.jsonl')",
+        "last_message = str(job_workspace.job_last_message_path(log_path))",
+        "command = build_codex_argv(",
+        "    prompt=prompt,",
+        "    slice_id=job_id,",
+        "    log_dir=artifact_root,",
+        "    worktree=repo_root,",
+        "    last_message_path=last_message,",
+        ")",
+        "env = build_job_env(",
+        "    manager_env=os.environ,",
+        "    job_id=job_id,",
+        "    slice_id=job_id,",
+        "    repo_root=repo_root,",
+        "    workspace=repo_root,",
+        ")",
+        "spec = build_job_spec(",
+        "    job_id=job_id,",
+        "    instance=plan.instance,",
+        "    unit=plan.unit,",
+        "    command=command,",
+        "    working_directory=repo_root,",
+        "    log_path=log_path,",
+        "    env=env,",
+        ")",
+        "write_job_spec(plan.spec_path, spec, account=plan.account)",
+        "print(f\"PSC_716_UNIT={shlex.quote(plan.unit)}\")",
+        "print(f\"PSC_716_PROFILE={shlex.quote(plan.hardening_profile)}\")",
+        "print(f\"PSC_716_LOG={shlex.quote(log_path)}\")",
+        "print(f\"PSC_716_LAST_MESSAGE={shlex.quote(last_message)}\")",
+        "print(f\"PSC_716_SPEC={shlex.quote(plan.spec_path)}\")",
+        "print(f\"PSC_716_COMMAND={shlex.quote(shlex.join(command))}\")",
+        "print('PSC_716_EXECUTOR=codex')",
+        "print(f\"PSC_716_MODEL={shlex.quote(os.environ.get('PSC_MODEL_ID', '<configured>'))}\")",
+        "PSC_716_PREP",
+        ". \"$PSC_716_ARTIFACT_ROOT/vars.sh\"",
+        "",
+        "# repository command / child process / forbidden path / forbidden host /",
+        "# no-unsafe-fallback 全都在 prompt 與 produced evidence 上有具名欄位。",
+        "PSC_716_CANDIDATE_SHA=\"$(git -C \"$PSC_716_REPO_ROOT\" rev-parse HEAD)\"",
+        "PSC_716_UNIT_HASH=\"$(sudo -u "
+        + manager
+        + " systemctl cat \"$PSC_716_UNIT\" | sha256sum | awk '{print $1}')\"",
+        "printf 'executor/model\\t%s\\t%s\\n' \"$PSC_716_EXECUTOR\" \"$PSC_716_MODEL\"",
+        "printf 'candidate SHA\\t%s\\n' \"$PSC_716_CANDIDATE_SHA\"",
+        "printf 'unit hash\\t%s\\n' \"$PSC_716_UNIT_HASH\"",
+        "printf '%s\\n' \"$PSC_716_COMMAND\" | grep -F 'danger-full-access' >/dev/null || {",
+        "  echo 'no-unsafe-fallback: expected danger-full-access' >&2",
+        "  exit 1",
+        "}",
+        "printf '%s\\n' \"$PSC_716_COMMAND\" | grep -F -- '--dangerously-bypass-approvals-and-sandbox' && {",
+        "  echo 'no-unsafe-fallback: unsafe bypass must stay absent' >&2",
+        "  exit 1",
+        "}",
+        "",
+        f"sudo -u {manager} systemctl start --wait \"$PSC_716_UNIT\"",
+        f"sudo -u {manager} systemctl cat \"$PSC_716_UNIT\" | sha256sum > \"$PSC_716_ARTIFACT_ROOT/unit.sha256\"",
+        "sha256sum \"$PSC_716_SPEC\" \"$PSC_716_LOG\" \"$PSC_716_LAST_MESSAGE\" > \"$PSC_716_ARTIFACT_ROOT/artifacts.sha256\"",
+        "printf 'artifact hash\\t%s\\n' \"$(tr '\\n' ' ' < \"$PSC_716_ARTIFACT_ROOT/artifacts.sha256\")\"",
+        "printf 'child tree\\n'",
+        f"sudo -u {manager} systemctl show -p MainPID --value \"$PSC_716_UNIT\" | xargs -r ps -o pid,ppid,stat,cmd --forest -p",
+        "printf 'exit reason\\n'",
+        f"sudo -u {manager} systemctl show -p Result -p ExecMainCode -p ExecMainStatus \"$PSC_716_UNIT\" | tee \"$PSC_716_ARTIFACT_ROOT/exit-reason.txt\"",
+        "grep -Eq 'SKIP|fallback|quota|model mismatch' \"$PSC_716_LOG\" && {",
+        "  echo 'qualification failed: SKIP/fallback/quota/model mismatch is forbidden' >&2",
+        "  exit 1",
+        "}",
+        "",
+    ]
+    lines += _wrap_comment(
+        "真實 qualification evidence 的 authority 以三份 manager-owned 檔定錨："
+        "`vars.sh`（exact unit/profile/command）、`unit.sha256`（unit hash）與 "
+        "`artifacts.sha256`（artifact hash）。log 內若出現 `SKIP`／`fallback`／`quota`／"
+        "`model mismatch` 就是失敗，而不是「可接受的退化」。"
+    )
+    return lines
+
+
 def evaluate_polkit(
     rule: PolkitRule,
     *,

@@ -1,5 +1,8 @@
-- **#716（RED）：新增 real agent-loop qualification contract tests**，要求新的
-  `agent-loop-probe` 走真實 `codex exec` template dispatch、覆蓋 repository
-  command / child process / forbidden path / forbidden host /
-  no-unsafe-fallback，並把 SKIP／fallback／quota／model mismatch 鎖成
-  fail-closed。
+- **#716：新增 `agent-loop-probe` qualification harness 與 CLI**，重用真實
+  `codex exec` template dispatch seam（`build_codex_argv` /
+  `prepare_systemd_template` / `build_job_env` / `build_job_spec` /
+  `write_job_spec` / `systemctl start --wait`），並把 repository command /
+  child process / forbidden path / forbidden host / no-unsafe-fallback 與
+  executor/model、unit hash、candidate SHA、artifact hash、child tree、
+  exit reason、SKIP／fallback／quota／model mismatch fail-closed evidence
+  釘進 probe contract。
