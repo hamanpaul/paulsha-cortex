@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#763（RED）：新增 Manager gitconfig delivery 回歸測試**，要求 trust-root 產生的 Manager `.gitconfig` 宣告 `credential.https://github.com.helper`，且 Git 對 `https://github.com` 的 helper lookup 有精確 scope。
+- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 改走 gate ledger handoff 採納 builder-owned HEAD evidence。
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.
