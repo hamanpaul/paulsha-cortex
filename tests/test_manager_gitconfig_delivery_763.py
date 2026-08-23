@@ -12,6 +12,7 @@ accepted plan 要求兩件事先被鎖成可重現的缺口：
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -71,3 +72,42 @@ def test_manager_gitconfig_scopes_credential_helper_to_github_https_only(
     assert other_host.returncode == 1
     assert other_host.stdout == ""
 
+
+def test_manager_gitconfig_dry_runs_https_credential_lookup_via_generated_helper(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_gh = tmp_path / "fake-gh"
+    helper_log = tmp_path / "helper.log"
+    fake_gh.write_text(
+        "\n".join(
+            (
+                "#!/bin/sh",
+                f'printf %s \"$*\" > {helper_log}',
+                "printf 'username=x-access-token\\npassword=pw\\n'",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o755)
+    monkeypatch.setattr(permgen, "SYSTEM_GH_EXECUTABLE", str(fake_gh))
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / ".gitconfig"
+    _write_manager_gitconfig(config_path)
+
+    result = subprocess.run(
+        ["git", "credential", "fill"],
+        input="protocol=https\nhost=github.com\n\n",
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(home), "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "username=x-access-token" in result.stdout
+    assert "password=pw" in result.stdout
+    assert helper_log.read_text(encoding="utf-8") == "auth git-credential get"

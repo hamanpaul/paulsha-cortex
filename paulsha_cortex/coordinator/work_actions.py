@@ -5066,32 +5066,68 @@ def _recover_repair_commit_action(
     worktree = failed_job.get("worktree")
     if not isinstance(worktree, str) or not worktree.strip():
         raise RuntimeError("recover-repair-commit requires a known builder worktree")
-    head_result = verification._run_git(["-C", worktree, "rev-parse", "HEAD"], None)
-    head_value = str(head_result.get("stdout", "")).strip().lower()
-    if (
-        head_result.get("status") != "ok"
-        or verification.SAFE_SHA_RE.fullmatch(head_value) is None
-    ):
-        raise RuntimeError("recover-repair-commit could not read worktree HEAD")
-    if head_value != expected_candidate:
-        raise RuntimeError(
-            "recover-repair-commit expected_candidate CAS mismatch against worktree HEAD"
+    from .manager import _job_gate_worktree_state
+
+    state = _job_gate_worktree_state(failed_job)
+    head_verified = False
+    clean_verified = False
+    ancestry_verified = False
+    if state is not None:
+        # #763：build gate ledger 的 worktree_state 已由授權通道交回 Manager，
+        # recover-repair-commit 應沿用它，而不是再直接讀 builder 樹。
+        head_value = state.get("head")
+        if (
+            not isinstance(head_value, str)
+            or verification.SAFE_SHA_RE.fullmatch(head_value) is None
+        ):
+            raise RuntimeError("recover-repair-commit gate ledger HEAD invalid")
+        if head_value != expected_candidate:
+            raise RuntimeError(
+                "recover-repair-commit expected_candidate CAS mismatch against gate ledger HEAD"
+            )
+        head_verified = True
+        dirty_total = state.get("dirty_total")
+        if type(dirty_total) is not int or dirty_total < 0:
+            raise RuntimeError("recover-repair-commit gate ledger dirty state invalid")
+        if dirty_total != 0:
+            raise RuntimeError("recover-repair-commit requires a clean worktree")
+        clean_verified = True
+        if state.get("ancestry_baseline") == original_candidate:
+            ancestry_ok = state.get("ancestry_ok")
+            if ancestry_ok is False:
+                raise RuntimeError("recover-repair-commit requires a descendant candidate")
+            if ancestry_ok is not True:
+                raise RuntimeError("recover-repair-commit candidate ancestry unavailable")
+            ancestry_verified = True
+    if not head_verified:
+        head_result = verification._run_git(["-C", worktree, "rev-parse", "HEAD"], None)
+        head_value = str(head_result.get("stdout", "")).strip().lower()
+        if (
+            head_result.get("status") != "ok"
+            or verification.SAFE_SHA_RE.fullmatch(head_value) is None
+        ):
+            raise RuntimeError("recover-repair-commit could not read worktree HEAD")
+        if head_value != expected_candidate:
+            raise RuntimeError(
+                "recover-repair-commit expected_candidate CAS mismatch against worktree HEAD"
+            )
+    if not clean_verified:
+        status_result = verification._run_git(
+            ["-C", worktree, "status", "--porcelain", "--untracked-files=all"], None
         )
-    status_result = verification._run_git(
-        ["-C", worktree, "status", "--porcelain", "--untracked-files=all"], None
-    )
-    if status_result.get("status") != "ok":
-        raise RuntimeError("recover-repair-commit could not read worktree status")
-    if str(status_result.get("stdout", "")).strip():
-        raise RuntimeError("recover-repair-commit requires a clean worktree")
-    ancestry_result = verification._run_git(
-        ["-C", worktree, "merge-base", "--is-ancestor", original_candidate, expected_candidate],
-        None,
-    )
-    if ancestry_result.get("status") == "non-zero" and ancestry_result.get("returncode") == 1:
-        raise RuntimeError("recover-repair-commit requires a descendant candidate")
-    if ancestry_result.get("status") != "ok":
-        raise RuntimeError("recover-repair-commit candidate ancestry unavailable")
+        if status_result.get("status") != "ok":
+            raise RuntimeError("recover-repair-commit could not read worktree status")
+        if str(status_result.get("stdout", "")).strip():
+            raise RuntimeError("recover-repair-commit requires a clean worktree")
+    if not ancestry_verified:
+        ancestry_result = verification._run_git(
+            ["-C", worktree, "merge-base", "--is-ancestor", original_candidate, expected_candidate],
+            None,
+        )
+        if ancestry_result.get("status") == "non-zero" and ancestry_result.get("returncode") == 1:
+            raise RuntimeError("recover-repair-commit requires a descendant candidate")
+        if ancestry_result.get("status") != "ok":
+            raise RuntimeError("recover-repair-commit candidate ancestry unavailable")
 
     record = _repair_adoption_record(
         run=run,
