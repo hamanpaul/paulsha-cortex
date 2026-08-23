@@ -8539,9 +8539,10 @@ def _copilot_toolchain_wrapper_content(
     entry_rel: str,
     system_node_path: str,
 ) -> str:
+    target_path = f"{layout.toolchain_lib}/copilot/{entry_rel}"
     return (
         "#!/bin/sh\n"
-        f'exec {shlex.quote(system_node_path)} "{layout.toolchain_lib}/copilot/{entry_rel}" "$@"\n'
+        f'exec {shlex.quote(system_node_path)} {shlex.quote(target_path)} "$@"\n'
     )
 
 
@@ -8553,9 +8554,18 @@ def _copilot_toolchain_wrapper_attestation(
     copilot_wrapper_entry_rel: str | None,
     system_node_path: str | None,
 ) -> AttestationInventoryRecord:
-    if system_node_path is None or not system_node_path.strip():
+    if system_node_path is None:
         raise ValueError(
             "attestation inventory requires a system-level node path for the Copilot wrapper"
+        )
+    normalized_system_node_path = system_node_path.strip()
+    if not normalized_system_node_path:
+        raise ValueError(
+            "attestation inventory requires a system-level node path for the Copilot wrapper"
+        )
+    if not Path(normalized_system_node_path).is_absolute():
+        raise ValueError(
+            "attestation inventory requires an absolute system-level node path for the Copilot wrapper"
         )
     entry_rel = _attestation_entry_rel(
         copilot_wrapper_entry_rel or "", tool_name="copilot"
@@ -8570,7 +8580,7 @@ def _copilot_toolchain_wrapper_attestation(
         content=_copilot_toolchain_wrapper_content(
             layout=layout,
             entry_rel=entry_rel,
-            system_node_path=system_node_path,
+            system_node_path=normalized_system_node_path,
         ),
     )
 
@@ -8946,37 +8956,36 @@ def compare_attestation_runtime(
                     actual=format(mode, "04o"),
                 )
             )
-        if expected.sha256 is not None and actual_hash != expected.sha256:
-            if decode_failed:
-                continue
-            if (
-                expected.content is not None
-                and actual_text is not None
-                and _is_comment_only_attestation_drift(
-                    expected=expected.content,
-                    actual=actual_text,
-                    kind=expected.kind,
+        if expected.sha256 is None or actual_hash == expected.sha256 or decode_failed:
+            continue
+        if (
+            expected.content is not None
+            and actual_text is not None
+            and _is_comment_only_attestation_drift(
+                expected=expected.content,
+                actual=actual_text,
+                kind=expected.kind,
+            )
+        ):
+            warnings.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="comment-only-drift",
+                    detail="installed generated asset only drifted in comment/blank lines",
+                    expected=expected.sha256,
+                    actual=actual_hash,
                 )
-            ):
-                warnings.append(
-                    AttestationRuntimeIssue(
-                        install_path=expected.install_path,
-                        kind="comment-only-drift",
-                        detail="installed generated asset only drifted in comment/blank lines",
-                        expected=expected.sha256,
-                        actual=actual_hash,
-                    )
+            )
+        else:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="content-mismatch",
+                    detail="installed generated asset content drifted",
+                    expected=expected.sha256,
+                    actual=actual_hash,
                 )
-            else:
-                errors.append(
-                    AttestationRuntimeIssue(
-                        install_path=expected.install_path,
-                        kind="content-mismatch",
-                        detail="installed generated asset content drifted",
-                        expected=expected.sha256,
-                        actual=actual_hash,
-                    )
-                )
+            )
 
     return AttestationRuntimeComparison(
         observed=tuple(observed),

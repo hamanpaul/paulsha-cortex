@@ -6,7 +6,10 @@ import hashlib
 import grp
 import os
 import pwd
+import shlex
 from pathlib import Path
+
+import pytest
 
 from paulsha_cortex.trust_root import permgen
 from paulsha_cortex.trust_root.permgen import (
@@ -208,10 +211,49 @@ def test_attestation_inventory_includes_the_copilot_toolchain_wrapper(
     assert _field(record, "owner") == FOUR_WAY_SCHEME.deploy_account
     assert _mode_text(_field(record, "mode")) == "0755"
     content = str(_field(record, "content"))
-    assert content.startswith("#!/bin/sh\n")
-    assert f'exec {system_node_path} "' in content
-    assert f'{SOURCE_LAYOUT.toolchain_lib}/copilot/dist/cli.js" "$@"' in content
+    assert content == (
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(system_node_path)} "
+        f"{shlex.quote(f'{SOURCE_LAYOUT.toolchain_lib}/copilot/{copilot_wrapper_entry_rel}')} "
+        '"$@"\n'
+    )
     assert _field(record, "sha256") == _sha256(content)
+
+
+def test_attestation_inventory_quotes_copilot_wrapper_target_path_as_one_argument() -> None:
+    """#695：wrapper target 整段必須做 shell quoting，不能靠手寫雙引號拼接。"""
+
+    entry_rel = 'dist/cli.js"; printf pwned >&2 #'
+    system_node_path = "/usr/bin/node"
+    inventory = {
+        record.install_path: record
+        for record in permgen.build_attestation_inventory(
+            scheme=FOUR_WAY_SCHEME,
+            layout=SOURCE_LAYOUT,
+            copilot_wrapper_entry_rel=entry_rel,
+            system_node_path=system_node_path,
+        )
+    }
+
+    content = str(_field(inventory[f"{SOURCE_LAYOUT.toolchain_bin}/copilot"], "content"))
+    assert content == (
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(system_node_path)} "
+        f"{shlex.quote(f'{SOURCE_LAYOUT.toolchain_lib}/copilot/{entry_rel}')} "
+        '"$@"\n'
+    )
+
+
+def test_attestation_inventory_requires_absolute_system_node_path() -> None:
+    """#695：Copilot wrapper 的 system node path 必須 pin 到絕對系統 binary。"""
+
+    with pytest.raises(ValueError, match="absolute system-level node path"):
+        permgen.build_attestation_inventory(
+            scheme=FOUR_WAY_SCHEME,
+            layout=SOURCE_LAYOUT,
+            copilot_wrapper_entry_rel="dist/cli.js",
+            system_node_path="node",
+        )
 
 
 def test_attestation_inventory_json_projection_redacts_generated_asset_content(
