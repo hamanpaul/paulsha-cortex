@@ -40,7 +40,7 @@
    manager/monitor units 所宣告的受保護 deploy `EnvironmentFile`，維持 repo/runtime
    identity 可見，並對缺失、分歧或不可驗證的安裝狀態維持 fail-closed。
  - **#692 repair:** per-job workspace ACL provisioning now applies access and default ACLs as separate recursive commands, matching the generated permgen order and avoiding `setfacl` portability failures.
-- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 改走 gate ledger handoff 採納 builder-owned HEAD evidence。
+- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 只採信授權 gate ledger handoff 的完整 `worktree_state`，缺席或半套 state 一律 fail-closed。
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.

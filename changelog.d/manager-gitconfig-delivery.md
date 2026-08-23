@@ -1,1 +1,1 @@
-- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 改走 gate ledger handoff 採納 builder-owned HEAD evidence。
+- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 只採信授權 gate ledger handoff 的完整 `worktree_state`，缺席或半套 state 一律 fail-closed。
