@@ -483,6 +483,59 @@ def test_recover_repair_commit_uses_gate_ledger_worktree_state_without_reading_b
     assert result["result"]["reason"] == "repair-commit-adopted"
 
 
+def test_recover_repair_commit_normalizes_uppercase_gate_ledger_head_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head.upper(),
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
+    )
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    result = _run_action(
+        snapshot=snapshot,
+        state=tmp_path / "runs.json",
+        registry=registry,
+        expected_run_id=run.run_id,
+        expected_candidate=repaired_head,
+    )
+
+    assert result["result"]["reason"] == "repair-commit-adopted"
+
+
 def test_recover_repair_commit_rejects_dirty_gate_ledger_state_without_reading_builder_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

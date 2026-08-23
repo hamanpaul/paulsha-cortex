@@ -3,7 +3,7 @@ status: accepted
 work_item: trust-root-copilot-toolchain-pinning
 ---
 
-# Trust-root Copilot toolchain pinning Todo
+# Trust-root Copilot toolchain pinning Plan
 
 Issue: `hamanpaul/paulsha-cortex#681`.
 

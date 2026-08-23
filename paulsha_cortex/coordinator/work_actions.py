@@ -4987,6 +4987,7 @@ def _recover_repair_commit_action(
             or verification.SAFE_SHA_RE.fullmatch(head_value) is None
         ):
             raise RuntimeError("recover-repair-commit gate ledger HEAD invalid")
+        head_value = head_value.lower()
         if head_value != expected_candidate:
             raise RuntimeError(
                 "recover-repair-commit expected_candidate CAS mismatch against gate ledger HEAD"
