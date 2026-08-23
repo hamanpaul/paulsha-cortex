@@ -50,6 +50,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from posix_acl_temp_root import dir_acl_probe, pick_posix_acl_temp_root
 
 from paulsha_cortex.coordinator import job_runner, job_workspace, seams
 from paulsha_cortex.trust_root import permgen, registry
@@ -84,24 +85,6 @@ def _probe_accounts(count: int) -> list[str] | None:
         if len(found) == count:
             return found
     return None
-
-
-def _acl_capable(root: Path) -> bool:
-    """這個檔案系統吃不吃 POSIX ACL（且 `setfacl`／`getfacl` 在不在）。"""
-
-    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
-        return False
-    accounts = _probe_accounts(1)
-    if accounts is None:
-        return False
-    probe = root / ".acl-probe"
-    probe.mkdir()
-    completed = subprocess.run(
-        ["setfacl", "-m", f"u:{accounts[0]}:rx", str(probe)],
-        check=False,
-        capture_output=True,
-    )
-    return completed.returncode == 0
 
 
 _NEEDS_SECOND_ACCOUNT = (
@@ -565,13 +548,18 @@ def test_grant_validates_the_acl_spec_before_building_the_command(
 
 @pytest.fixture()
 def acl_tree():
-    """一棵真的、由 `tempfile.mkdtemp()` 建的樹（借來的帳號要 traverse 得進來）。"""
+    """一棵真的 ACL 樹；`TMPDIR` 無 ACL 時改挑可用根，避免 `setfacl` 假紅。"""
 
-    root = Path(tempfile.mkdtemp(prefix="psc-710-"))
-    os.chmod(root, 0o755)
+    accounts = _probe_accounts(1)
+    if accounts is None:
+        pytest.skip(_NEEDS_SECOND_ACCOUNT)
+    root = pick_posix_acl_temp_root(
+        prefix="psc-710-",
+        root_mode=0o755,
+        probes=(dir_acl_probe("-m", f"u:{accounts[0]}:rx"),),
+        skip_reason=_NEEDS_SECOND_ACCOUNT,
+    )
     try:
-        if not _acl_capable(root):
-            pytest.skip(_NEEDS_SECOND_ACCOUNT)
         yield root
     finally:
         shutil.rmtree(root, ignore_errors=True)

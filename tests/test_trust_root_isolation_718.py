@@ -20,6 +20,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+from posix_acl_temp_root import dir_acl_probe, file_acl_probe, pick_posix_acl_temp_root
+
 from paulsha_cortex.coordinator import spool_slot
 from paulsha_cortex.coordinator import job_runner
 from paulsha_cortex.trust_root import permgen
@@ -109,53 +111,22 @@ def _run_shell(command: str) -> subprocess.CompletedProcess[str]:
 
 
 def _acl_capable_temp_root(*accounts: str) -> Path:
-    """Pick a real temp root whose filesystem accepts POSIX ACLs for split UIDs.
-
-    Some gate environments point ``TMPDIR`` at mounts where ``setfacl`` returns
-    ``Invalid argument``.  The real-UID trust-root probes should then skip
-    honestly instead of failing for an unrelated temp-root choice.
-    """
-
-    bases: list[str] = []
-    for raw in ("/var/tmp", "/tmp", tempfile.gettempdir()):
-        base = str(raw).strip()
-        if not base or base in bases or not Path(base).is_dir():
-            continue
-        bases.append(base)
-    for base in bases:
-        root = Path(tempfile.mkdtemp(prefix="psc-718-acl-", dir=base))
-        os.chmod(root, 0o711)
-        probe_dir = root / ".acl-probe-dir"
-        probe_file = root / ".acl-probe-file"
-        try:
-            probe_dir.mkdir(mode=0o700)
-            probe_file.write_text("probe\n")
-            supported = True
-            for account in accounts:
-                for spec, target in (
-                    (f"u:{account}:--x", probe_dir),
-                    (f"u:{account}:r--,m::r--", probe_file),
-                ):
-                    completed = subprocess.run(
-                        ["setfacl", "-m", spec, str(target)],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if completed.returncode != 0:
-                        supported = False
-                        break
-                if not supported:
-                    break
-            if supported:
-                return root
-        finally:
-            shutil.rmtree(probe_dir, ignore_errors=True)
-            probe_file.unlink(missing_ok=True)
-        shutil.rmtree(root, ignore_errors=True)
-    pytest.skip(
-        "split-UID ACL integration tests require a temp root on a POSIX ACL filesystem; "
-        "gate TMPDIR mounts may reject `setfacl -m ...` with `Invalid argument`"
+    probes = []
+    for account in accounts:
+        probes.extend(
+            (
+                dir_acl_probe("-m", f"u:{account}:--x"),
+                file_acl_probe("-m", f"u:{account}:r--,m::r--"),
+            )
+        )
+    return pick_posix_acl_temp_root(
+        prefix="psc-718-acl-",
+        root_mode=0o711,
+        probes=tuple(probes),
+        skip_reason=(
+            "split-UID ACL integration tests require a temp root on a POSIX ACL filesystem; "
+            "gate TMPDIR mounts may reject `setfacl -m ...` with `Invalid argument`"
+        ),
     )
 
 

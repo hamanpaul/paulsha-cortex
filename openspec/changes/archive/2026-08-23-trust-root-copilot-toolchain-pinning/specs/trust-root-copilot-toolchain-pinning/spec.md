@@ -1,3 +1,9 @@
+## Purpose
+
+Ensure every Copilot job executes the exact registered Copilot binary and
+version from the root-owned deployment tree, and fail closed on PATH/HOME
+drift, symlink or path escape, or version metadata mismatch.
+
 ## ADDED Requirements
 
 ### Requirement: 依 canonical superpowers 規格驗收

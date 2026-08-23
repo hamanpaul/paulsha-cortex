@@ -15,30 +15,6 @@ work_item: trust-root-copilot-toolchain-pinning
       Pre-archive status for this card: active OpenSpec tasks now stop before
       archive. This repair reran the focused trust-root regression subset, full
       `python3 -m pytest -q`, and authoritative
-      `python3 -m paulsha_cortex.preflight_ci --metadata <temp>`. In this
-      sandbox the adapter, openspec, and tests pass, but the backend policy
-      step still sanitizes to `/usr/bin/python3 -m policy_check`, which is not
-      installed on that interpreter, so the remaining preflight failure is
-      environment-bound rather than candidate-bound. Independent review,
-      delivery, CI, archive, merge, issue closure, and done remain Manager
-      actions.
-- [x] 1.4 Post-archive repair：維持 official archive，不回填 active change；補強
-      reviewer 指到的三個 `permgen.py` 缺口（只經 `$tmp` + `mv -T` 落位、先保留
-      unit PATH 驗 `command -v copilot`、最終 entry 檢查留在 `mv -T` 之後），並
-      以 `python3 -m pytest -q` 驗證 descendant candidate。
-- [x] 1.5 Post-archive repair：將 Copilot wrapper 的 version/file guards 全部改成
-      失敗即 `exit 1` 的 fail-closed 形式、移除 `build_path_resolution_probe()`
-      內相同內容的冗餘條件分支，並補上 archived OpenSpec Purpose 與
-      `.cortex/work-items.yaml` 的 trust-root workstream todo 連結；focused
-      trust-root regressions、`python3 -m pytest -q` 與 authoritative
-      `python3 -m paulsha_cortex.preflight_ci --metadata <temp>` 已重跑，
-      其中 preflight 仍只在 backend policy step 因 `/usr/bin/python3` 缺
-      `policy_check` 而 fail，屬 sandbox 環境差異；此卡僅描述 repair 前的
-      實作與驗證，不主張 archive／merge／issue closure／done。
-- [x] 1.6 Post-archive repair：將 split-UID trust-root ACL 實測改為先挑出支援
-      POSIX ACL 的暫存根（優先 `/var/tmp`、`/tmp`，最後才吃 `TMPDIR`），讓 gate
-      環境遇到 noacl 的 `tmp_path`／`TMPDIR` 時以具名 skip 收斂 `setfacl -m …`
-      `Invalid argument` 誤紅；`python3 -m pytest -q` 全綠，authoritative
-      `python3 -m paulsha_cortex.preflight_ci --metadata <temp>` 仍只在 backend
-      policy step 因 `/usr/bin/python3` 缺 `policy_check` 而 fail，屬 sandbox
-      環境差異，不主張 archive／merge／issue closure／done。
+      `python3 -m paulsha_cortex.preflight_ci --metadata <temp>` against the
+      pre-archive candidate boundary. Independent review, delivery, CI,
+      archive, merge, issue closure, and done remain Manager actions.

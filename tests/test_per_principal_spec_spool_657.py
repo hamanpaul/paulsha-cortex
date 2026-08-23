@@ -34,6 +34,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from posix_acl_temp_root import dir_acl_probe, pick_posix_acl_temp_root
 
 from paulsha_cortex.config import paths as config_paths
 from paulsha_cortex.coordinator import job_runner
@@ -259,23 +260,6 @@ def _second_accounts(limit: int = 2) -> list[str]:
     return found
 
 
-def _acl_supported(directory: Path, account: str) -> bool:
-    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
-        return False
-    probe = directory / ".acl-probe"
-    probe.mkdir()
-    rc = subprocess.run(
-        ["setfacl", "-m", f"u:{account}:rx", str(probe)],
-        capture_output=True,
-        text=True,
-    )
-    ok = rc.returncode == 0 and bool(
-        job_runner._read_acl(str(probe), job_runner.POSIX_ACL_ACCESS_XATTR)
-    )
-    shutil.rmtree(probe)
-    return ok
-
-
 def _getfacl_effective(path: Path, account: str) -> str | None:
     """`getfacl` 眼中該具名帳號的 **effective** 權限（`"r-x"`），無此條目即 None。
 
@@ -320,15 +304,20 @@ def acl_tree():
             "真實帳號才建得出來（`setfacl -m u:<名>:…` 在產生的當下就要解析得到 uid）。"
             "刻意 skip 而非以自己的 uid 假裝：那樣測到的是 owner 位，不是具名 ACL。"
         )
-    root = Path(tempfile.mkdtemp(prefix="psc-657-"))
+    root = pick_posix_acl_temp_root(
+        prefix="psc-657-",
+        root_mode=0o711,
+        probes=(
+            dir_acl_probe("-m", f"u:{accounts[0]}:rX"),
+            dir_acl_probe("-d", "-m", f"u:{accounts[0]}:rX"),
+        ),
+        skip_reason=(
+            "本機的暫存檔系統不支援 POSIX ACL（或缺 setfacl／getfacl）——"
+            "本檔的每一條斷言都建立在真實 ACL 上，沒有它就不是在測 #657 的語意。"
+            "刻意 skip 而非退回 mode 位模擬。"
+        ),
+    )
     try:
-        os.chmod(root, 0o711)
-        if not _acl_supported(root, accounts[0]):
-            pytest.skip(
-                "本機的暫存檔系統不支援 POSIX ACL（或缺 setfacl／getfacl）——"
-                "本檔的每一條斷言都建立在真實 ACL 上，沒有它就不是在測 #657 的語意。"
-                "刻意 skip 而非退回 mode 位模擬。"
-            )
         container = root / "job-specs"
         container.mkdir()
         os.chmod(container, 0o700)
