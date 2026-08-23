@@ -6,7 +6,7 @@ work_item: manager-gitconfig-delivery
 # Tasks
 
 - [x] 1.1 RED：依 `docs/superpowers/plans/manager-gitconfig-delivery.md` 新增可重現 regression coverage，先鎖住 Manager `credential.https://github.com.helper` 缺口與 Git 對 GitHub HTTPS helper 的解析缺口，確認失敗。
-- [ ] 1.2 實作至 GREEN：由 trust-root authority 產生 Manager helper 設定並完成 dry-run credential lookup；`recover-repair-commit` 改經授權 ledger/handoff 取得 builder-owned HEAD evidence，而非由 Manager 讀 builder worktree。
+- [x] 1.2 實作至 GREEN：由 trust-root authority 產生 Manager helper 設定並完成 dry-run credential lookup；`recover-repair-commit` 改經授權 ledger/handoff 取得 builder-owned HEAD evidence，而非由 Manager 讀 builder worktree。
 - [x] 1.3 `changelog.d/manager-gitconfig-delivery.md` fragment 與 `CHANGELOG.md [Unreleased]` entry（#763）。
 - [ ] 1.4 依 accepted plan 完成 focused/full gates、generator/install equivalence、exact-HEAD review、delivery、required CI、merge、issue closure。
 

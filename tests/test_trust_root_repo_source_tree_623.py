@@ -639,6 +639,19 @@ def test_two_way_scheme_moves_the_gitconfig_off_the_registry_path() -> None:
         assert two_way.install_path != LAYOUT.asset_paths()[asset_id]
 
 
+def test_two_way_shared_service_account_keeps_one_github_helper_shape() -> None:
+    reviewer = build_account_gitconfig(TWO_WAY_SCHEME, LAYOUT, Principal.REVIEWER)
+    manager_blob = build_account_gitconfig(TWO_WAY_SCHEME, LAYOUT, Principal.MANAGER)
+
+    assert reviewer.install_path == manager_blob.install_path
+    assert 'credential "https://github.com"' in reviewer.content
+    assert reviewer.content.count('credential "https://github.com"') == 1
+    assert reviewer.content.count("helper = !/usr/bin/gh auth git-credential") == 1
+    assert reviewer.content.count("helper = !/usr/bin/gh auth git-credential") == (
+        manager_blob.content.count("helper = !/usr/bin/gh auth git-credential")
+    )
+
+
 def test_generators_still_touch_no_filesystem() -> None:
     """靜態保證：新增的 gitconfig 產生器仍不含任何 IO 或執行面。"""
     src = inspect.getsource(permgen)

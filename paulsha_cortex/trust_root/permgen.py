@@ -7605,6 +7605,17 @@ ACCOUNT_GITCONFIG_FLAGS: Mapping[Principal, str] = {
 #: `.gitconfig` 的 mode。**0644 而非 0600**：檔案 root 擁有、讀取的帳號要讀得到，
 #: 與 `*-codex-hooks`（同樣 root-owned、同樣落在帳號 HOME 下）逐位元相同。
 ACCOUNT_GITCONFIG_MODE = 0o644
+GITHUB_HTTPS_CREDENTIAL_URL = "https://github.com"
+SYSTEM_GH_EXECUTABLE = "/usr/bin/gh"
+
+
+def durable_owner_git_credential_helper(gh_executable: str | None = None) -> str:
+    """durable-state owner 那份 `.gitconfig` 裡的 GitHub HTTPS helper。"""
+
+    executable = SYSTEM_GH_EXECUTABLE if gh_executable is None else gh_executable
+    return "!" + " ".join(
+        shlex.quote(part) for part in (executable, "auth", "git-credential")
+    )
 
 
 class UnresolvedSourceRepoError(ValueError):
@@ -7762,6 +7773,18 @@ def build_account_gitconfig(
         "# 那條規則就裝不下它們。那一格由每次派工的 spec env 逐 job 放行",
         "# （registry.JOB_GIT_WORKSPACE_TRUST ↔ job_runner.git_workspace_trust_env()），",
         "# 與本檔並存、不互相取代。",
+    ]
+    if account == scheme.durable_state_owner:
+        helper = durable_owner_git_credential_helper()
+        body += [
+            "#",
+            "# GitHub HTTPS transport 只掛在 durable-state owner 的 root-owned 設定裡：",
+            "# reset 先清空任何上層繼承的 helper，再只對 https://github.com 委派給 gh。",
+            f'[credential "{GITHUB_HTTPS_CREDENTIAL_URL}"]',
+            "\thelper =",
+            f"\thelper = {helper}",
+        ]
+    body += [
         "[safe]",
     ]
     body += [f"\tdirectory = {path}" for path in safe_dirs]
