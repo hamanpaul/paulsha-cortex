@@ -15,11 +15,11 @@ fail-closed behavior and do not copy credentials from the operator account.
 
 ## Tasks
 
-- [ ] Reproduce a job with zero extra environment and capture the exact
+- [x] Reproduce a job with zero extra environment and capture the exact
       pre-launch diagnostic for missing HOME.
 - [ ] Validate and export an approved per-principal HOME before executor
       launch; reject unset, empty, relative, symlinked, or wrong-owner paths.
-- [ ] Add tests for missing/empty/wrong HOME, PATH+HOME together, child
+- [x] Add tests for missing/empty/wrong HOME, PATH+HOME together, child
       environment inheritance, model `$HOME` failures, and secret redaction.
 - [ ] Verify the generated unit, shim, and runtime environment all use the
       same HOME contract and remain idempotent across reinstall/rollback.
