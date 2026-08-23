@@ -35,6 +35,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
 
 from paulsha_cortex.coordinator import job_runner, job_shim
 from paulsha_cortex.coordinator.job_runner import JobRunnerError
@@ -57,9 +58,9 @@ _ROLE_PATH_ENV = {
 }
 
 _ROLE_HOME = {
-    job_runner.JOB_ROLE_BUILDER: "/__psc_test_home__/builder-home",
-    job_runner.JOB_ROLE_REVIEW: "/__psc_test_home__/review-home",
-    job_runner.JOB_ROLE_GATE: "/__psc_test_home__/gate-home",
+    job_runner.JOB_ROLE_BUILDER: BUILDER_HOME,
+    job_runner.JOB_ROLE_REVIEW: REVIEWER_HOME,
+    job_runner.JOB_ROLE_GATE: GATE_HOME,
 }
 
 
@@ -77,6 +78,19 @@ def _manager_env(**overrides: str) -> dict[str, str]:
     return env
 
 
+def _build_job_env(*, role: str, manager_env: dict[str, str]) -> dict[str, str]:
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(job_runner, "_account_ids", lambda _account: None)
+        return job_runner.build_job_env(
+            manager_env=manager_env,
+            job_id="j",
+            slice_id="s",
+            repo_root="/r",
+            workspace=None,
+            role=role,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. `build_job_env()` fail-closed（#679 修法 1，裁決 (a)）
 # ---------------------------------------------------------------------------
@@ -86,17 +100,7 @@ def test_build_job_env_fails_closed_when_the_role_path_is_undeclared(role: str) 
     """三個角色各自缺席時都必須 raise，**不得**靜默省略 PATH。"""
 
     with pytest.raises(JobRunnerError) as excinfo:
-        job_runner.build_job_env(
-            manager_env=_manager_env(),
-            job_id="j",
-            slice_id="s",
-            repo_root="/r",
-            # #712：`workspace` 是新增的**必填**具名參數。本檔驗的是 `PATH` 的
-            # fail-closed 語意，與工作區無關 ⇒ 一律 `None`（＝「本呼叫端沒有工作區」，
-            # 與 preflight 同一個語意），被驗行為因此逐位元不變。
-            workspace=None,
-            role=role,
-        )
+        _build_job_env(role=role, manager_env=_manager_env())
     diagnostic = excinfo.value.diagnostic
     assert diagnostic.reason == "job-runner-path-undeclared"
     # 訊息必須帶得出「哪個變數」與「去哪裡取正規值」——operator 讀到它就該能修。
@@ -126,13 +130,9 @@ def test_the_job_path_never_falls_back_to_the_daemon_path(role: str) -> None:
     """
 
     declared = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
-    env = job_runner.build_job_env(
-        manager_env=_manager_env(**{_ROLE_PATH_ENV[role]: declared}),
-        job_id="j",
-        slice_id="s",
-        repo_root="/r",
-        workspace=None,  # #712：同上，本檔與工作區無關。
+    env = _build_job_env(
         role=role,
+        manager_env=_manager_env(**{_ROLE_PATH_ENV[role]: declared}),
     )
     assert env["PATH"] == declared
     assert env["PATH"] != _manager_env()["PATH"]

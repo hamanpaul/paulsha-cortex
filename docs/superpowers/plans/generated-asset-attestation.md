@@ -3,7 +3,7 @@ status: accepted
 work_item: generated-asset-attestation
 ---
 
-# Generated Asset Attestation Todo
+# Generated Asset Attestation Plan
 
 ## Boundary
 

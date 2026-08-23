@@ -3,7 +3,7 @@ status: accepted
 work_item: manager-gitconfig-delivery
 ---
 
-# Manager Git Credential Delivery Todo
+# Manager Git Credential Delivery Plan
 
 ## Boundary
 
@@ -25,4 +25,3 @@ work_item: manager-gitconfig-delivery
 - [ ] Run focused and full repository gates, generator/install equivalence,
   exact-HEAD review, delivery, required CI, merge, and issue closure through
   Cortex.
-
