@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#692：downgraded job 的 HOME 契約改為 fail-closed**：launch 前拒絕 missing/blank/relative/symlink/wrong-owner HOME，PATH+HOME 雙缺會一併點名，shim 也不再回退到 unit/daemon HOME。
+- **#692：downgraded job 的 HOME 契約改為 fail-closed**：launch 前拒絕 missing/blank/relative/symlink/wrong-owner HOME，PATH+HOME 雙缺會一併點名，shim 也不再回退到 unit/daemon HOME；HOME `lstat` 診斷不以 chained traceback 洩漏路徑。
 - **Phase 2 Docker RC credential projection**：protected Codex credential import 後再次執行 production `trust_root scaffold`，以短暫非機密 reviewer optional fixture 維持 scaffold contract，並把新憑證投影到 Manager-owned canonical authority，讓後續 legal builder runtime provisioning 使用實際部署 authority。
 - **Phase 2 Docker RC legal-job identity**：qualification harness now derives the systemd template instance from the raw job identity through the production helper, keeping `%i` and every per-job writable surface byte-for-byte aligned.
 - **Phase 2 Docker RC AGY preflight**：AGY 1.1.18 now uses its machine-readable `/quota` response for live quota validation instead of rejecting the supported slash-command path as an unknown status subcommand.

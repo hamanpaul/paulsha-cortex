@@ -21,6 +21,7 @@ import errno
 import json
 import os
 import pwd
+import traceback
 from pathlib import Path
 from unittest import mock
 
@@ -248,6 +249,14 @@ def test_shim_redacts_home_lstat_failures(tmp_path: Path) -> None:
     assert "HOME" in message
     assert "Permission denied" not in message
     assert str(secret_home) not in message
+    assert excinfo.value.__cause__ is None
+    formatted = "".join(
+        traceback.format_exception(
+            type(excinfo.value), excinfo.value, excinfo.value.__traceback__
+        )
+    )
+    assert "Permission denied" not in formatted
+    assert str(secret_home) not in formatted
 
 
 def test_shim_main_reports_missing_home_before_taking_over_the_log(tmp_path: Path) -> None:
