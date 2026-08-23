@@ -16,14 +16,11 @@ work_item: generated-asset-attestation
 
 ## Tasks
 
-- [x] Generate a complete inventory for every unit, shim, polkit rule,
+- [ ] Generate a complete inventory for every unit, shim, polkit rule,
   gitconfig, and toolchain wrapper, with exact content hashes and ownership.
-- [x] Compare generated inventory with the installed runtime and fail on
+- [ ] Compare generated inventory with the installed runtime and fail on
   functional drift while allowing comment-only warnings.
-- [x] Add regression coverage for the three-way-to-four-way trust-root and
+- [ ] Add regression coverage for the three-way-to-four-way trust-root and
   missing GitHub credential surfaces without printing credential contents.
-- [x] Run the generated-asset attestation focused/full pytest coverage and the
-  authoritative local preflight for the active change.
-
-Delivery, required CI, merge, issue closure, archive, and done remain
-Manager-owned post-build actions.
+- [ ] Run focused/full gates, Docker qualification, exact-candidate review,
+  delivery, required CI, merge, and issue closure through Cortex.
