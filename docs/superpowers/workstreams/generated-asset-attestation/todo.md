@@ -22,5 +22,8 @@ work_item: generated-asset-attestation
   functional drift while allowing comment-only warnings.
 - [x] Add regression coverage for the three-way-to-four-way trust-root and
   missing GitHub credential surfaces without printing credential contents.
-- [ ] Run focused/full gates, Docker qualification, exact-candidate review,
-  delivery, required CI, merge, and issue closure through Cortex.
+- [x] Run the generated-asset attestation focused/full pytest coverage and the
+  authoritative local preflight for the active change.
+
+Delivery, required CI, merge, issue closure, archive, and done remain
+Manager-owned post-build actions.
