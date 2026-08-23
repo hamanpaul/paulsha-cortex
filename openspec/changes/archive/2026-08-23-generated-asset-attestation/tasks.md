@@ -12,5 +12,5 @@
 - [x] Run the generated-asset attestation pytest coverage and the authoritative
   local archive gate for the active change.
 
-Delivery, required CI, merge, issue closure, and done remain Manager-owned
-completion actions.
+Delivery, required CI, merge, issue closure, archive, and done remain
+Manager-owned post-archive actions.

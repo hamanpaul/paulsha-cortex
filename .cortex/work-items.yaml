@@ -753,6 +753,8 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#695'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/generated-asset-attestation/todo.md'
     excludes: []
   trust-root-agent-loop-qualification:
     title: 'trust-root-agent-loop-qualification'
