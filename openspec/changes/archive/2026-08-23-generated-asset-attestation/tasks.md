@@ -2,8 +2,8 @@
 
 - [x] Generate a machine-readable attestation inventory for the generated
   Manager／Monitor／job units, root-owned shim, template polkit rule,
-  gitconfigs, and Manager GitHub credential surfaces without exposing
-  credential content.
+  gitconfigs, Copilot toolchain wrapper, and Manager GitHub credential
+  surfaces without exposing credential content.
 - [x] Compare the generated inventory with the installed runtime, fail on
   functional drift, and demote comment-only text drift to warnings.
 - [x] Add regression coverage for the three-way-to-four-way trust-root,

@@ -8510,12 +8510,69 @@ _ATTESTATION_COMMENT_PREFIXES: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "shim": ("#",),
         "polkit-rule": ("//", "/*", "*/", "*"),
         "gitconfig": ("#", ";"),
+        "toolchain-wrapper": ("#",),
     }
 )
 
 
 def _attestation_sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _attestation_entry_rel(entry_rel: str, *, tool_name: str) -> str:
+    value = entry_rel.strip()
+    if not value:
+        raise ValueError(
+            f"attestation inventory requires a non-empty {tool_name!r} wrapper entry_rel"
+        )
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            f"attestation inventory wrapper entry_rel must stay relative: {tool_name} -> {value}"
+        )
+    return value
+
+
+def _copilot_toolchain_wrapper_content(
+    *,
+    layout: PathLayout,
+    entry_rel: str,
+    system_node_path: str,
+) -> str:
+    return (
+        "#!/bin/sh\n"
+        f'exec {shlex.quote(system_node_path)} "{layout.toolchain_lib}/copilot/{entry_rel}" "$@"\n'
+    )
+
+
+def _copilot_toolchain_wrapper_attestation(
+    *,
+    layout: PathLayout,
+    owner: str,
+    group: str,
+    copilot_wrapper_entry_rel: str | None,
+    system_node_path: str | None,
+) -> AttestationInventoryRecord:
+    if system_node_path is None or not system_node_path.strip():
+        raise ValueError(
+            "attestation inventory requires a system-level node path for the Copilot wrapper"
+        )
+    entry_rel = _attestation_entry_rel(
+        copilot_wrapper_entry_rel or "", tool_name="copilot"
+    )
+    return _generated_text_attestation(
+        asset_id="copilot-toolchain-wrapper",
+        kind="toolchain-wrapper",
+        install_path=f"{layout.toolchain_bin}/copilot",
+        owner=owner,
+        group=group,
+        mode=0o755,
+        content=_copilot_toolchain_wrapper_content(
+            layout=layout,
+            entry_rel=entry_rel,
+            system_node_path=system_node_path,
+        ),
+    )
 
 
 def _generated_text_attestation(
@@ -8563,14 +8620,18 @@ def build_attestation_inventory(
     scheme: UidScheme = DEFAULT_SCHEME,
     layout: PathLayout = DEFAULT_LAYOUT,
     plan: PermissionPlan | None = None,
+    copilot_wrapper_entry_rel: str | None = None,
+    system_node_path: str | None = None,
 ) -> tuple[AttestationInventoryRecord, ...]:
     """Build the generated-asset attestation inventory for trust-root deployment artifacts.
 
-    The inventory is deterministic and pure: it derives expected deployment files from the
-    same generators that produce the units / shim / polkit rule / gitconfigs themselves,
-    and pairs them with the permission plan metadata for runtime-provided GitHub surfaces.
-    `layout` must carry concrete source repo slugs so the three root-owned gitconfig rows
-    remain complete rather than silently omitting `safe.directory` coverage.
+    The inventory derives expected deployment files from the same generators that produce
+    the units / shim / polkit rule / gitconfigs themselves, and pairs them with the
+    permission plan metadata for runtime-provided GitHub surfaces. The Copilot toolchain
+    wrapper is derived from the pinned package entry path plus the system-level node path;
+    callers must pass those explicitly so the generator stays pure and hermetic. `layout`
+    must carry concrete source repo slugs so the three root-owned gitconfig rows remain
+    complete rather than silently omitting `safe.directory` coverage.
     """
 
     plan = plan or generate_plan(scheme)
@@ -8675,6 +8736,16 @@ def build_attestation_inventory(
                 content=gitconfig.content,
             )
         )
+
+    records.append(
+        _copilot_toolchain_wrapper_attestation(
+            layout=layout,
+            owner=deploy_owner,
+            group=deploy_group,
+            copilot_wrapper_entry_rel=copilot_wrapper_entry_rel,
+            system_node_path=system_node_path,
+        )
+    )
 
     asset_paths = layout.asset_paths()
     for asset_id in ("manager-gh-credential", "manager-gh-config"):

@@ -76,21 +76,31 @@ def _mode_text(value: object) -> str | None:
         return format(value, "04o")
     return str(value)
 
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-def _attestation_inventory(scheme) -> dict[str, object]:
+
+def _copilot_toolchain_inputs(tmp_path: Path) -> tuple[str, str]:
+    _ = tmp_path  # keep the call shape parallel to other helpers in this module
+    return "dist/cli.js", "/usr/bin/node"
+
+
+def _attestation_inventory(scheme, *, tmp_path: Path) -> dict[str, object]:
     builder = getattr(permgen, "build_attestation_inventory", None)
     assert builder is not None, (
         "missing build_attestation_inventory(): generated asset attestation has no "
         "machine-readable inventory for Manager/Monitor units, four-way gate "
         "templates, or Manager GitHub credential surfaces"
     )
-    records = builder(scheme=scheme, layout=SOURCE_LAYOUT)
+    copilot_wrapper_entry_rel, system_node_path = _copilot_toolchain_inputs(tmp_path)
+    records = builder(
+        scheme=scheme,
+        layout=SOURCE_LAYOUT,
+        copilot_wrapper_entry_rel=copilot_wrapper_entry_rel,
+        system_node_path=system_node_path,
+    )
     assert records, "attestation inventory must not be empty"
     return {_field(record, "install_path"): record for record in records}
-
-
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _local_inventory(tmp_path: Path) -> tuple[tuple[object, ...], permgen.PathLayout]:
@@ -102,9 +112,15 @@ def _local_inventory(tmp_path: Path) -> tuple[tuple[object, ...], permgen.PathLa
         home_root=str(tmp_path / "home"),
         deploy_root=str(tmp_path / "deploy"),
     ).with_source_repo_slugs(("paulsha-cortex",))
+    copilot_wrapper_entry_rel, system_node_path = _copilot_toolchain_inputs(tmp_path)
     deduped_by_path = {
         record.install_path: record
-        for record in permgen.build_attestation_inventory(scheme=scheme, layout=layout)
+        for record in permgen.build_attestation_inventory(
+            scheme=scheme,
+            layout=layout,
+            copilot_wrapper_entry_rel=copilot_wrapper_entry_rel,
+            system_node_path=system_node_path,
+        )
     }
     return tuple(deduped_by_path.values()), layout
 
@@ -121,11 +137,13 @@ def _materialize_runtime(records: tuple[object, ...], *, install_root: Path) -> 
         os.chmod(path, int(str(mode), 8) if not isinstance(mode, int) else mode)
 
 
-def test_attestation_inventory_promotes_four_way_gate_units_but_keeps_three_way_gate_free() -> None:
+def test_attestation_inventory_promotes_four_way_gate_units_but_keeps_three_way_gate_free(
+    tmp_path: Path,
+) -> None:
     """#695：由三分升到四分後，attestation inventory 不能再少 gate 那兩份模板 unit。"""
 
-    four_way = _attestation_inventory(FOUR_WAY_SCHEME)
-    three_way = _attestation_inventory(THREE_WAY_SCHEME)
+    four_way = _attestation_inventory(FOUR_WAY_SCHEME, tmp_path=tmp_path)
+    three_way = _attestation_inventory(THREE_WAY_SCHEME, tmp_path=tmp_path)
     expected_units = (
         build_manager_unit(FOUR_WAY_SCHEME, SOURCE_LAYOUT),
         build_monitor_unit(FOUR_WAY_SCHEME, SOURCE_LAYOUT),
@@ -145,10 +163,12 @@ def test_attestation_inventory_promotes_four_way_gate_units_but_keeps_three_way_
     assert gate_paths.isdisjoint(three_way), "three-way inventory must stay gate-free"
 
 
-def test_attestation_inventory_lists_manager_github_surfaces_without_emitting_raw_content() -> None:
+def test_attestation_inventory_lists_manager_github_surfaces_without_emitting_raw_content(
+    tmp_path: Path,
+) -> None:
     """#695：gh 兩個面都要進 inventory，但只准出 metadata / hash，不准出內容。"""
 
-    inventory = _attestation_inventory(FOUR_WAY_SCHEME)
+    inventory = _attestation_inventory(FOUR_WAY_SCHEME, tmp_path=tmp_path)
     plan = generate_plan(FOUR_WAY_SCHEME)
     expected = {
         "manager-gh-credential": SOURCE_LAYOUT.gh_credential_of(SOURCE_LAYOUT.manager_account),
@@ -164,10 +184,42 @@ def test_attestation_inventory_lists_manager_github_surfaces_without_emitting_ra
         assert _field(record, "content") in (None, ""), asset_id
 
 
-def test_attestation_inventory_json_projection_redacts_generated_asset_content() -> None:
+def test_attestation_inventory_includes_the_copilot_toolchain_wrapper(
+    tmp_path: Path,
+) -> None:
+    """#695：toolchain wrapper 也要進 inventory，避免 canonical spec 對實作過度承諾。"""
+
+    copilot_wrapper_entry_rel, system_node_path = _copilot_toolchain_inputs(tmp_path)
+    inventory = {
+        record.install_path: record
+        for record in permgen.build_attestation_inventory(
+            scheme=FOUR_WAY_SCHEME,
+            layout=SOURCE_LAYOUT,
+            copilot_wrapper_entry_rel=copilot_wrapper_entry_rel,
+            system_node_path=system_node_path,
+        )
+    }
+    wrapper_path = f"{SOURCE_LAYOUT.toolchain_bin}/copilot"
+    record = inventory.get(wrapper_path)
+
+    assert record is not None, wrapper_path
+    assert _field(record, "asset_id") == "copilot-toolchain-wrapper"
+    assert _field(record, "kind") == "toolchain-wrapper"
+    assert _field(record, "owner") == FOUR_WAY_SCHEME.deploy_account
+    assert _mode_text(_field(record, "mode")) == "0755"
+    content = str(_field(record, "content"))
+    assert content.startswith("#!/bin/sh\n")
+    assert f'exec {system_node_path} "' in content
+    assert f'{SOURCE_LAYOUT.toolchain_lib}/copilot/dist/cli.js" "$@"' in content
+    assert _field(record, "sha256") == _sha256(content)
+
+
+def test_attestation_inventory_json_projection_redacts_generated_asset_content(
+    tmp_path: Path,
+) -> None:
     """#695：inventory JSON 只能保留 metadata / mode / hash，不能帶 generated 內容。"""
 
-    inventory = _attestation_inventory(FOUR_WAY_SCHEME)
+    inventory = _attestation_inventory(FOUR_WAY_SCHEME, tmp_path=tmp_path)
     manager_unit = build_manager_unit(FOUR_WAY_SCHEME, SOURCE_LAYOUT)
     record = inventory[manager_unit.install_path]
 
