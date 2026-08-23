@@ -45,6 +45,13 @@ def test_copilot_path_probe_resolves_via_path_before_sanitized_invariants() -> N
     followup_commands = [line for line in copilot_commands if line not in resolution_commands]
     assert any("-u HOME" in line for line in followup_commands)
     assert any("-u PATH" in line for line in followup_commands)
+    for index, line in enumerate(copilot_commands):
+        if line not in resolution_commands:
+            continue
+        assert index + 1 < len(copilot_commands)
+        next_line = copilot_commands[index + 1]
+        assert "env -u PATH -u HOME" in next_line
+        assert 'PATH_VERSION="$("$1" --version)"' in next_line
 
 
 def test_copilot_version_checks_use_dedicated_metadata_not_the_wrapper_path() -> None:
@@ -90,3 +97,4 @@ def test_copilot_toolchain_plan_reinstalls_through_tempdir_and_rename() -> None:
     mv_line = f'#     mv -T "$tmp/copilot" {DEFAULT_LAYOUT.toolchain_lib}/copilot'
     assert final_copy not in plan_text
     assert plan_lines.index(tmp_copy) < plan_lines.index(mv_line) < plan_lines.index(final_entry)
+    assert "只先複製到 `$tmp`；最終" in plan_text

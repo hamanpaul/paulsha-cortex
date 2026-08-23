@@ -7894,6 +7894,8 @@ def build_toolchain_plan(
                     f'#     case "$NODE_ABS" in {layout.toolchain_root}/*) echo "node must stay system-level" >&2; exit 1 ;; esac',
                     '#     VERSION="$("$NODE_ABS" "$PKG/$ENTRY_REL" --version)"',
                     '#     test -n "$VERSION"',
+                    f"#   只先複製到 `$tmp`；最終 `{layout.toolchain_lib}/{tool.name}` 只能靠 "
+                    "`mv -T` 一次落位，避免半套樹進正式位置。",
                     '#     tmp="$(mktemp -d)"',
                     '#     trap \'rm -rf -- "$tmp"\' EXIT',
                     f'#     cp -a "$PKG" "$tmp/{tool.name}"',
@@ -8821,6 +8823,12 @@ def build_path_resolution_probe(
             f"#   ⛔ 空輸出 ⇒ job 沒有 PATH（或 toolchain 不在上面）；",
             f"#      /usr/bin/{case.executor} ⇒ **本票的原症狀**：解到系統層那一份，",
             "#      不報錯、只是產出來自一支沒人判讀過的 CLI。",
+            (
+                "#   Copilot：這一行故意保留 unit PATH，只驗 `command -v copilot` 的"
+                "解析結果；去掉 ambient PATH/HOME 的版本對帳放在下一行。"
+                if case.executor == "copilot"
+                else "#   這一行只驗 PATH 解析結果；版本對帳留在下一行。"
+            ),
             (
                 f"{PATH_PROBE_HELPER} {case.unit_stem} env -u PATH -u HOME "
                 f"/bin/sh -c 'PATH_VERSION=\"$(\"$1\" --version)\"; test -n \"$PATH_VERSION\"; "

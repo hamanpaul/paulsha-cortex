@@ -22,3 +22,7 @@ work_item: trust-root-copilot-toolchain-pinning
       environment-bound rather than candidate-bound. Independent review,
       delivery, CI, archive, merge, issue closure, and done remain Manager
       actions.
+- [x] 1.4 Post-archive repair：維持 official archive，不回填 active change；補強
+      reviewer 指到的三個 `permgen.py` 缺口（只經 `$tmp` + `mv -T` 落位、先保留
+      unit PATH 驗 `command -v copilot`、最終 entry 檢查留在 `mv -T` 之後），並
+      以 `python3 -m pytest -q` 驗證 descendant candidate。
