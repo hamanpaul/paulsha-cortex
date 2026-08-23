@@ -7,10 +7,9 @@ work_item: generated-asset-attestation
 
 ## Requirements
 
-- The installer MUST emit a hash-bound inventory covering all generated
-  service units, shims, polkit rules, gitconfig files, the Copilot toolchain
-  wrapper, and the Manager GitHub credential surfaces needed for runtime
-  attestation.
+- The installer MUST emit a hash-bound inventory covering all generated and
+  installed service units, shims, polkit rules, gitconfig files, and toolchain
+  wrappers.
 - Functional generated-vs-installed drift MUST fail verification; comment-only
   drift MAY be reported as a warning.
 - Attestation and regression tests MUST prove the four-way trust-root and
