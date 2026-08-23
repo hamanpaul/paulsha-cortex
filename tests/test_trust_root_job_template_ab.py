@@ -191,6 +191,9 @@ def _launch_template(
     try:
         spool_dir = spool if spool is not None else str(Path(root) / "job-specs")
         Path(spool_dir).mkdir(parents=True, exist_ok=True)
+        # Match the root-owned, non-writable-by-other Manager spool regardless
+        # of the process umask used by the test runner.
+        Path(spool_dir).chmod(0o700)
         log_dir = str(Path(root) / "logs")
         oauth_context = nullcontext({})
         if launcher._executor == "copilot" and (
