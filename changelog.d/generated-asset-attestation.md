@@ -1,1 +1,1 @@
-- **#695：新增 generated asset attestation inventory**，輸出 Manager／Monitor／job unit、shim、polkit rule、gitconfig 的 deterministic hash 與安裝 metadata，並納入 Manager GitHub credential surfaces 且不揭露 credential content。
+- **#695：新增 generated asset attestation inventory 與 installed-runtime drift compare**，輸出 Manager／Monitor／job unit、shim、polkit rule、gitconfig 的 deterministic hash 與安裝 metadata，納入 Manager GitHub credential surfaces，並把 comment-only text drift 降為 warning。

@@ -71,8 +71,10 @@ principal 時再犯同一個錯」——新 principal 只要沒進對應表，�
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
+import stat
 import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -8458,7 +8460,59 @@ class AttestationInventoryRecord:
         return data
 
 
+@dataclass(frozen=True)
+class AttestationRuntimeIssue:
+    """One attestation drift observation for the installed runtime."""
+
+    install_path: str
+    kind: str
+    detail: str
+    expected: str | None = None
+    actual: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        data: dict[str, object] = {
+            "install_path": self.install_path,
+            "kind": self.kind,
+            "detail": self.detail,
+        }
+        if self.expected is not None:
+            data["expected"] = self.expected
+        if self.actual is not None:
+            data["actual"] = self.actual
+        return data
+
+
+@dataclass(frozen=True)
+class AttestationRuntimeComparison:
+    """Generated-vs-installed attestation verdict for one runtime snapshot."""
+
+    observed: tuple[AttestationInventoryRecord, ...]
+    errors: tuple[AttestationRuntimeIssue, ...]
+    warnings: tuple[AttestationRuntimeIssue, ...]
+
+    @property
+    def passed(self) -> bool:
+        return not self.errors
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "passed": self.passed,
+            "observed": [record.to_dict() for record in self.observed],
+            "errors": [issue.to_dict() for issue in self.errors],
+            "warnings": [issue.to_dict() for issue in self.warnings],
+        }
+
+
 _ATTESTATION_TEXT_FILE_MODE = 0o644
+_ATTESTATION_COMMENT_PREFIXES: Mapping[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "systemd-unit": ("#", ";"),
+        "shim": ("#",),
+        "polkit-rule": ("//", "/*", "*/", "*"),
+        "gitconfig": ("#", ";"),
+    }
+)
 
 
 def _attestation_sha256(content: str) -> str:
@@ -8633,6 +8687,228 @@ def build_attestation_inventory(
             )
         )
     return tuple(records)
+
+
+def _attestation_owner_name(uid: int) -> str:
+    try:
+        import pwd
+
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError, OSError):
+        return str(uid)
+
+
+def _attestation_group_name(gid: int) -> str:
+    try:
+        import grp
+
+        return grp.getgrgid(gid).gr_name
+    except (ImportError, KeyError, OSError):
+        return str(gid)
+
+
+def _attestation_significant_lines(content: str, *, kind: str) -> tuple[str, ...]:
+    prefixes = _ATTESTATION_COMMENT_PREFIXES.get(kind, ())
+    lines: list[str] = []
+    for raw in content.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(prefix) for prefix in prefixes):
+            continue
+        lines.append(raw.rstrip())
+    return tuple(lines)
+
+
+def _is_comment_only_attestation_drift(
+    *,
+    expected: str,
+    actual: str,
+    kind: str,
+) -> bool:
+    return _attestation_significant_lines(
+        expected, kind=kind
+    ) == _attestation_significant_lines(actual, kind=kind)
+
+
+def _attestation_runtime_path(
+    install_path: str,
+    *,
+    install_root: str | Path | None,
+) -> Path:
+    path = Path(install_path)
+    if install_root is None:
+        return path
+    root = Path(install_root)
+    if path.is_absolute():
+        return root / path.relative_to(path.anchor)
+    return root / path
+
+
+def compare_attestation_runtime(
+    inventory: Sequence[AttestationInventoryRecord],
+    *,
+    install_root: str | Path | None = None,
+) -> AttestationRuntimeComparison:
+    """Compare generated attestation inventory against installed runtime files.
+
+    Generated text assets fail closed on missing files, metadata drift, or content drift.
+    If the only difference is comment/blank-line text, the row stays accepted but emits a
+    warning. Runtime-provided credential/config surfaces deliberately record only metadata
+    plus the observed hash, never raw content.
+    """
+
+    observed: list[AttestationInventoryRecord] = []
+    errors: list[AttestationRuntimeIssue] = []
+    warnings: list[AttestationRuntimeIssue] = []
+
+    for expected in inventory:
+        path = _attestation_runtime_path(
+            expected.install_path, install_root=install_root
+        )
+        try:
+            metadata = os.lstat(path)
+        except FileNotFoundError:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="missing-file",
+                    detail="installed attestation asset is missing",
+                    expected="regular file",
+                    actual="missing",
+                )
+            )
+            continue
+        except OSError as exc:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="stat-failed",
+                    detail=f"unable to stat installed asset: {exc}",
+                )
+            )
+            continue
+
+        if not stat.S_ISREG(metadata.st_mode):
+            actual_type = "symlink" if stat.S_ISLNK(metadata.st_mode) else "non-regular"
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="unexpected-file-type",
+                    detail="installed attestation asset must be a regular file",
+                    expected="regular file",
+                    actual=actual_type,
+                )
+            )
+            continue
+
+        owner = _attestation_owner_name(metadata.st_uid)
+        group = _attestation_group_name(metadata.st_gid)
+        mode = stat.S_IMODE(metadata.st_mode)
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="read-failed",
+                    detail=f"unable to read installed asset: {exc}",
+                )
+            )
+            continue
+
+        actual_hash = hashlib.sha256(payload).hexdigest()
+        actual_text: str | None = None
+        if expected.content is not None:
+            try:
+                actual_text = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                errors.append(
+                    AttestationRuntimeIssue(
+                        install_path=expected.install_path,
+                        kind="decode-failed",
+                        detail=f"installed generated asset is not valid UTF-8: {exc}",
+                    )
+                )
+
+        observed.append(
+            AttestationInventoryRecord(
+                asset_id=expected.asset_id,
+                kind=expected.kind,
+                install_path=expected.install_path,
+                owner=owner,
+                group=group,
+                mode=mode,
+                sha256=actual_hash,
+                content=actual_text if expected.content is not None else None,
+            )
+        )
+
+        if owner != expected.owner:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="owner-mismatch",
+                    detail="installed asset owner drifted",
+                    expected=expected.owner,
+                    actual=owner,
+                )
+            )
+        if group != expected.group:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="group-mismatch",
+                    detail="installed asset group drifted",
+                    expected=expected.group,
+                    actual=group,
+                )
+            )
+        if mode != expected.mode:
+            errors.append(
+                AttestationRuntimeIssue(
+                    install_path=expected.install_path,
+                    kind="mode-mismatch",
+                    detail="installed asset mode drifted",
+                    expected=expected.mode_str,
+                    actual=format(mode, "04o"),
+                )
+            )
+        if expected.sha256 is not None and actual_hash != expected.sha256:
+            if (
+                expected.content is not None
+                and actual_text is not None
+                and _is_comment_only_attestation_drift(
+                    expected=expected.content,
+                    actual=actual_text,
+                    kind=expected.kind,
+                )
+            ):
+                warnings.append(
+                    AttestationRuntimeIssue(
+                        install_path=expected.install_path,
+                        kind="comment-only-drift",
+                        detail="installed generated asset only drifted in comment/blank lines",
+                        expected=expected.sha256,
+                        actual=actual_hash,
+                    )
+                )
+            else:
+                errors.append(
+                    AttestationRuntimeIssue(
+                        install_path=expected.install_path,
+                        kind="content-mismatch",
+                        detail="installed generated asset content drifted",
+                        expected=expected.sha256,
+                        actual=actual_hash,
+                    )
+                )
+
+    return AttestationRuntimeComparison(
+        observed=tuple(observed),
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+    )
 
 
 def transient_unit_properties(
