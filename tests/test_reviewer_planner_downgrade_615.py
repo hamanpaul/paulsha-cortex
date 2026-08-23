@@ -173,6 +173,10 @@ def _launch_template(
         with tempfile.TemporaryDirectory() as root:
             spool_dir = str(Path(root) / "job-specs")
             Path(spool_dir).mkdir(parents=True)
+            # The production spool is Manager-owned and non-writable by other
+            # principals.  Do not let the host umask (some runners use 002)
+            # make this fixture fail the same invariant before launch starts.
+            Path(spool_dir).chmod(0o700)
             log_dir = str(Path(root) / "logs")
             env = _template_env(spool_dir, **(env_overrides or {}))
             with mock.patch.dict(os.environ, env, clear=True), _nested(
@@ -273,6 +277,7 @@ class LaunchIdentityTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as root:
                 spool_dir = str(Path(root) / "job-specs")
                 Path(spool_dir).mkdir(parents=True)
+                Path(spool_dir).chmod(0o700)
                 env = _template_env(spool_dir)
                 with mock.patch.dict(os.environ, env, clear=True), _nested(
                     _preflight_patches()
@@ -337,6 +342,7 @@ class LaunchIdentityTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as root:
                 spool_dir = str(Path(root) / "job-specs")
                 Path(spool_dir).mkdir(parents=True)
+                Path(spool_dir).chmod(0o700)
                 # job 側能碰到的兩個面：prompt 與 worktree 內容。
                 Path(root, "conftest.py").write_text("role = 'builder'\n", encoding="utf-8")
                 with mock.patch.dict(
