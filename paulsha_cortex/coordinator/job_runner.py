@@ -1270,6 +1270,13 @@ def _home_contract_hint(config: JobRoleConfig) -> str:
 
 
 def _assess_home_path(value: str) -> tuple[str | None, os.stat_result | None]:
+    """Validate HOME shape and return its lstat result for owner checking.
+
+    ``missing`` is deliberately returned for an absolute path that does not
+    exist.  ``resolve_job_home`` must keep that result fail-closed instead of
+    treating a missing directory as an owner-check bypass.
+    """
+
     if not value:
         return "undeclared", None
     if not value.startswith("/"):

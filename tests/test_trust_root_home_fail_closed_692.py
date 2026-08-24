@@ -137,6 +137,17 @@ def test_build_job_env_rejects_missing_home_directory(tmp_path: Path) -> None:
     assert str(tmp_path / "missing-builder-home") not in message
 
 
+def test_home_path_assessment_keeps_missing_directory_rejection_reachable(
+    tmp_path: Path,
+) -> None:
+    problem, stat_result = job_runner._assess_home_path(
+        str(tmp_path / "missing-builder-home")
+    )
+
+    assert problem == "missing"
+    assert stat_result is None
+
+
 def test_build_job_env_rejects_symlink_home_without_echoing_operator_secrets(
     tmp_path: Path,
 ) -> None:

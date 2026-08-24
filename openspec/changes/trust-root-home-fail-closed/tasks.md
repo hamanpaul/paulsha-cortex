@@ -22,5 +22,9 @@ work_item: trust-root-home-fail-closed
       findings and confirm the typed OpenSpec/policy gates on its descendant;
       keep the pinned source plan unchanged and make no archive, merge, or
       issue-closure claim in this active change.
+- [x] Recheck the repair regressions: missing HOME remains a reachable
+      fail-closed status, unresolved account ownership is rejected, the shim
+      rejects missing directories, and shared test homes are owned by a
+      `TemporaryDirectory`; keep the pinned source plan unchanged.
 > Manager-owned closeout remains pending: official OpenSpec archive/commit,
 > exact-PR-head delivery and CI evidence, merge, issue closure, and done.
