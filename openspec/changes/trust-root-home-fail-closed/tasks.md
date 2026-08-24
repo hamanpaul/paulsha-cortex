@@ -14,9 +14,13 @@ work_item: trust-root-home-fail-closed
       diagnostics, including the unresolved-account and missing-directory
       regressions from this repair.
 - [x] Run focused HOME regressions, full `python3 -m pytest -q`, and the
-      authoritative archive gate inputs on this descendant Candidate
+      authoritative pre-archive gate inputs on this descendant Candidate
       (`openspec validate <change> --type change --strict` plus policy check);
       preserve any sandbox-only backend dependency misses separately from
       Candidate-local failures.
+- [x] Revalidate the exact Candidate against the independent HOME review
+      findings and confirm the typed OpenSpec/policy gates on its descendant;
+      keep the pinned source plan unchanged and make no archive, merge, or
+      issue-closure claim in this active change.
 > Manager-owned closeout remains pending: official OpenSpec archive/commit,
 > exact-PR-head delivery and CI evidence, merge, issue closure, and done.
