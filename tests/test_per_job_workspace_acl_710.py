@@ -97,6 +97,24 @@ _NEEDS_SECOND_ACCOUNT = (
 )
 
 
+def _supports_recursive_workspace_acl(root: Path, *, account: str) -> bool:
+    probe_root = root / ".workspace-acl-probe"
+    workspace = probe_root / "job-710-probe"
+    (workspace / "deep" / "nested").mkdir(parents=True)
+    (workspace / "deep" / "nested" / "object").write_text("x", encoding="utf-8")
+    spec = f"u:{account}:rwX,d:u:{account}:rwx"
+    try:
+        completed = subprocess.run(
+            ["setfacl", "-R", "-m", spec, str(workspace)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode == 0
+    finally:
+        shutil.rmtree(probe_root, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # 1. 一條規則覆蓋三個 principal（結構性——任何環境都跑）
 # ---------------------------------------------------------------------------
@@ -558,6 +576,7 @@ def acl_tree():
         root_mode=0o755,
         probes=(dir_acl_probe("-m", f"u:{accounts[0]}:rx"),),
         skip_reason=_NEEDS_SECOND_ACCOUNT,
+        validator=lambda root: _supports_recursive_workspace_acl(root, account=accounts[0]),
     )
     try:
         yield root

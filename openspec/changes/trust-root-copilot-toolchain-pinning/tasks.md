@@ -12,9 +12,13 @@ work_item: trust-root-copilot-toolchain-pinning
       上下文的 `policy-check`，並以 conventional commit 提交 tested
       descendant candidate（僅涵蓋 pre-archive builder repair）。
 
-      Pre-archive status for this card: active OpenSpec tasks now stop before
-      archive. This repair reran the focused trust-root ACL/toolchain
-      regression subset, full `python3 -m pytest -q`, and authoritative
+      Pre-archive status for this card: this change stays active under
+      `openspec/changes/trust-root-copilot-toolchain-pinning/` until Manager
+      archives it. This repair tightened the ACL-capability probe to exercise
+      the same recursive combined per-job workspace `setfacl -R -m
+      u:<job>:rwX,d:u:<job>:rwx` recipe that the gate environment previously
+      rejected, reran the focused trust-root ACL/toolchain regression subset,
+      full `python3 -m pytest -q`, and authoritative
       `python3 -m paulsha_cortex.preflight_ci --pr 789` against the current
       candidate boundary. Independent review, delivery, CI, archive, merge,
       issue closure, and done remain Manager actions.

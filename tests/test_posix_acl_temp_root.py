@@ -73,3 +73,44 @@ def test_pick_posix_acl_temp_root_skips_when_all_bases_fail(
                 "gate TMPDIR mounts may reject `setfacl -m ...` with `Invalid argument`"
             ),
         )
+
+
+def test_pick_posix_acl_temp_root_validator_can_reject_a_base_after_acl_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.setattr(
+        posix_acl_temp_root,
+        "_candidate_temp_bases",
+        lambda: (str(first), str(second)),
+    )
+    monkeypatch.setattr(posix_acl_temp_root.shutil, "which", lambda _name: "/usr/bin/tool")
+    monkeypatch.setattr(
+        posix_acl_temp_root.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0),
+    )
+    visited: list[Path] = []
+
+    def _validator(root: Path) -> bool:
+        visited.append(root.parent)
+        (root / "validator-artifact").write_text("x", encoding="utf-8")
+        return root.parent == second
+
+    root = pick_posix_acl_temp_root(
+        prefix="psc-acl-root-",
+        root_mode=0o711,
+        probes=(dir_acl_probe("-m", "u:daemon:--x"),),
+        skip_reason="unused",
+        validator=_validator,
+    )
+    try:
+        assert root.parent == second
+        assert visited == [first, second]
+        assert list(first.iterdir()) == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

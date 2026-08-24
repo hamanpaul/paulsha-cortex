@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Callable, Literal, Sequence
 
 import pytest
 
@@ -25,6 +25,9 @@ def file_acl_probe(*args: str) -> AclProbe:
     return AclProbe("file", tuple(args))
 
 
+AclRootValidator = Callable[[Path], bool]
+
+
 def _candidate_temp_bases() -> tuple[str, ...]:
     bases: list[str] = []
     for raw in ("/var/tmp", "/tmp", tempfile.gettempdir()):
@@ -41,6 +44,7 @@ def pick_posix_acl_temp_root(
     root_mode: int,
     probes: Sequence[AclProbe],
     skip_reason: str,
+    validator: AclRootValidator | None = None,
 ) -> Path:
     if not probes:
         raise ValueError("at least one ACL probe is required")
@@ -66,6 +70,8 @@ def pick_posix_acl_temp_root(
                 if completed.returncode != 0:
                     supported = False
                     break
+            if supported and validator is not None:
+                supported = validator(root)
             if supported:
                 return root
         finally:
