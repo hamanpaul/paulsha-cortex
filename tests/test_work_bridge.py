@@ -37,6 +37,9 @@ from paulsha_cortex.coordinator.workflow import (
 from git_fixtures import make_job_clone
 
 
+ARCHIVE_PREFIX = work_actions.build_openspec_archive_argv("placeholder")[:-1]
+
+
 def _repo(root: Path) -> tuple[Path, str]:
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -1054,7 +1057,7 @@ identities:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if argv[:3] == ["python3", "-m", "policy_check"]:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if argv[:2] == ["openspec", "archive"]:
+        if len(argv) == len(ARCHIVE_PREFIX) + 1 and argv[:-1] == ARCHIVE_PREFIX:
             # #649：archive 落在**呼叫端指定的工作區**，不是來源樹——真正的
             # `openspec archive` 也是以 `cwd` 為準。
             cwd = Path(kwargs["cwd"])

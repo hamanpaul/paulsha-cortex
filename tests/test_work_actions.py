@@ -2784,7 +2784,7 @@ def test_ship_runs_official_archive_before_preflight(tmp_path: Path) -> None:
         runner=runner,
     )
     assert result["result"]["action"] == "archive-applied-needs-commit"
-    assert calls[-1][0] == ["openspec", "archive", "-y", "demo"]
+    assert calls[-1][0] == work_actions.build_openspec_archive_argv("demo")
     assert calls[0][0] == ["openspec", "validate", "demo", "--strict"]
 
 
@@ -3548,7 +3548,7 @@ def test_archive_and_pr_metadata_fail_closed_before_mutation(
             now=lambda: 200,
             runner=runner,
         )
-    assert ["openspec", "archive", "-y", "demo"] not in calls
+    assert work_actions.build_openspec_archive_argv("demo") not in calls
 
 
 def test_archive_requires_change_specific_changelog(tmp_path: Path) -> None:
@@ -3638,7 +3638,7 @@ def test_archive_allows_advisory_r22_doc_reference_warning(tmp_path: Path) -> No
     )
 
     assert result["result"]["action"] == "archive-applied-needs-commit"
-    assert calls[-1] == ["openspec", "archive", "-y", "demo"]
+    assert calls[-1] == work_actions.build_openspec_archive_argv("demo")
 
 
 def test_archive_blocks_nonzero_policy_check_with_doc_reference_invalid(

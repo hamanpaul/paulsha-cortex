@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,9 @@ def test_archive_gate_requires_tasks_specs_docs_and_changelog() -> None:
 
 def test_official_openspec_archive_argv_is_non_interactive_and_typed() -> None:
     assert build_openspec_archive_argv("unified-work-lifecycle") == [
-        "openspec",
+        sys.executable,
+        "-m",
+        "paulsha_cortex.openspec_archive",
         "archive",
         "-y",
         "unified-work-lifecycle",

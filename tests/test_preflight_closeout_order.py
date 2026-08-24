@@ -30,6 +30,9 @@ from paulsha_cortex.coordinator.workflow import (
 from git_fixtures import make_job_clone
 
 
+ARCHIVE_PREFIX = work_actions.build_openspec_archive_argv("placeholder")[:-1]
+
+
 @dataclass
 class CallOutcome:
     result: object | None
@@ -84,7 +87,7 @@ class SpyRunner:
             return RunnerResult(0)
         if command[:2] == ["openspec", "validate"]:
             return RunnerResult(0)
-        if command[:2] == ["openspec", "archive"]:
+        if len(command) == len(ARCHIVE_PREFIX) + 1 and command[:-1] == ARCHIVE_PREFIX:
             #: #653：archive 的效果落在**呼叫端指定的 `cwd`** 上，不是 fixture 記
             #: 住的某一棵樹。ship 段搬進 Manager-owned 工作區之後，那個 cwd 才是
             #: 真的會被 commit 的樹；假 runner 若仍寫死一棵樹，測到的是 fixture
@@ -682,9 +685,10 @@ def test_stage_order_closeout_then_preflight_then_ship(
         active_change=True,
         archived_change=False,
     )
-
     outcome = _capture(harness.validator, run=harness.run, candidate=harness.candidate)
-    archive_index = harness.runner.first_index(lambda call: call[:2] == ["openspec", "archive"])
+    archive_index = harness.runner.first_index(
+        lambda call: len(call) == len(ARCHIVE_PREFIX) + 1 and call[:-1] == ARCHIVE_PREFIX
+    )
     preflight_index = harness.runner.first_index(lambda call: call and call[0] == "preflight")
     mutation_index = harness.runner.first_index(
         lambda call: (call and call[0] == "gh") or "push" in call

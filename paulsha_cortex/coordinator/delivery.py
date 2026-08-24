@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping
@@ -84,7 +85,16 @@ class ArchiveGateFacts:
 def build_openspec_archive_argv(change: str) -> list[str]:
     if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", change) is None:
         raise ValueError("OpenSpec change must be a safe slug")
-    return ["openspec", "archive", "-y", change]
+    # Route archive through the local wrapper so archived canonical specs receive
+    # the same post-processing purpose backfill regardless of PATH ordering.
+    return [
+        sys.executable,
+        "-m",
+        "paulsha_cortex.openspec_archive",
+        "archive",
+        "-y",
+        change,
+    ]
 
 
 def validate_archive_gate(facts: ArchiveGateFacts) -> GateResult:
