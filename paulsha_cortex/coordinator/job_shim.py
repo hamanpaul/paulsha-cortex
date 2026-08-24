@@ -298,14 +298,13 @@ def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> d
     try:
         stat_result = os.lstat(home)
     except FileNotFoundError:
-        stat_result = None
+        raise ShimError("job spec 的 env 裡的 HOME 目錄不存在") from None
     except OSError:
         raise ShimError("job spec 的 env 裡的 HOME 目前無法判定型態或存取性") from None
-    if stat_result is not None:
-        if stat.S_ISLNK(stat_result.st_mode):
-            raise ShimError("job spec 的 env 裡的 HOME 不得是 symlink")
-        if not stat.S_ISDIR(stat_result.st_mode):
-            raise ShimError("job spec 的 env 裡的 HOME 必須指向目錄")
+    if stat.S_ISLNK(stat_result.st_mode):
+        raise ShimError("job spec 的 env 裡的 HOME 不得是 symlink")
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise ShimError("job spec 的 env 裡的 HOME 必須指向目錄")
     env["HOME"] = home
     _apply_egress_proxy_env(env, environ)
     if (env.get("PATH") or "").strip():

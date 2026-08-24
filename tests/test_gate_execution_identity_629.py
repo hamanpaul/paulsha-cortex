@@ -40,7 +40,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator import (
     gate_ledger,
@@ -150,7 +150,7 @@ def _preflight_patches(binary: str = "/usr/bin/systemctl"):
         mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         mock.patch.object(job_runner, "_account_exists", return_value=True),
         mock.patch.object(job_runner, "_group_exists", return_value=True),
-        mock.patch.object(job_runner, "_account_ids", return_value=None),
+        mock.patch.object(job_runner, "_account_ids", side_effect=fake_account_ids),
         mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
         mock.patch.object(job_runner, "_is_executable", return_value=True),
         mock.patch.object(job_runner, "_unit_is_active", return_value=False),

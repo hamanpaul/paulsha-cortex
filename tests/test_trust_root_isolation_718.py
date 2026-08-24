@@ -20,7 +20,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from _home_paths import BUILDER_HOME, REVIEWER_HOME
+from _home_paths import BUILDER_HOME, REVIEWER_HOME, fake_account_ids
 from paulsha_cortex.coordinator import spool_slot
 from paulsha_cortex.coordinator import job_runner
 from paulsha_cortex.trust_root import permgen
@@ -939,7 +939,9 @@ def test_reviewer_never_receives_builder_event_producer_slot() -> None:
 
 @pytest.mark.parametrize("role", (job_runner.JOB_ROLE_BUILDER, job_runner.JOB_ROLE_REVIEW))
 def test_job_env_uses_authoritative_per_job_codex_and_cache_slots(role: str) -> None:
-    with unittest.mock.patch.object(job_runner, "_account_ids", return_value=None):
+    with unittest.mock.patch.object(
+        job_runner, "_account_ids", side_effect=fake_account_ids
+    ):
         env = job_runner.build_job_env(
             manager_env={
                 job_runner.resolve_job_role(role).path_env: "/usr/bin",

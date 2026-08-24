@@ -52,6 +52,13 @@ _JOB_HOME_ENV = {
 for _home in _JOB_HOME_ENV.values():
     Path(_home).mkdir(parents=True, exist_ok=True)
 
+_HOME_STAT = Path(next(iter(_JOB_HOME_ENV.values()))).stat()
+_FAKE_ACCOUNT_IDS = (_HOME_STAT.st_uid, frozenset({_HOME_STAT.st_gid}))
+
+
+def _fake_account_ids(_account: str) -> tuple[int, frozenset[int]]:
+    return _FAKE_ACCOUNT_IDS
+
 _BASE_ENV = {
     # daemon 自己的 PATH。**#679 起它不再被轉發**——留在這裡正是為了驗那件事：
     # job 的 PATH 不得等於 daemon 的 PATH。
@@ -130,7 +137,7 @@ def _launch(
 
     original = launcher_module.subprocess.Popen
     launcher_module.subprocess.Popen = popen
-    patches = [mock.patch.object(job_runner, "_account_ids", return_value=None)]
+    patches = [mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids)]
     if preflight_ok:
         patches += [
             mock.patch.object(job_runner.shutil, "which", return_value="/usr/bin/systemd-run"),
@@ -284,7 +291,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
     def _build(self, **overrides) -> dict[str, str]:
         manager_env = {**_BASE_ENV, **_SECRET_ENV}
         manager_env.update(overrides)
-        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        with mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids):
             return job_runner.build_builder_env(
                 manager_env=manager_env,
                 job_id="job-1",
@@ -365,7 +372,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
 
     def test_relay_target_only_when_configured(self) -> None:
         manager_env = {**_BASE_ENV}
-        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        with mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids):
             without = job_runner.build_builder_env(
                 manager_env=manager_env,
                 job_id="j",
@@ -374,7 +381,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
                 workspace=None,  # #712：同上。
             )
         self.assertNotIn("PSC_RELAY_TARGET", without)
-        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        with mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids):
             with_relay = job_runner.build_builder_env(
                 manager_env=manager_env,
                 job_id="j",
@@ -404,7 +411,9 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
             job_runner.ForwardedEnvVar("SOME_API_KEY", "刻意注入的壞白名單"),
         )
         with mock.patch.object(job_runner, "BUILDER_FORWARDED_ENV", poisoned):
-            with mock.patch.object(job_runner, "_account_ids", return_value=None):
+            with mock.patch.object(
+                job_runner, "_account_ids", side_effect=_fake_account_ids
+            ):
                 with self.assertRaises(JobRunnerError) as ctx:
                     job_runner.build_builder_env(
                         manager_env={"SOME_API_KEY": "leaked", **_JOB_PATH_ENV, **_JOB_HOME_ENV},
@@ -418,7 +427,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
     def test_newline_in_value_is_rejected(self) -> None:
         # #679：注入點跟著 PATH 的來源走——現在是 `PSC_BUILDER_PATH`，不是 daemon 的
         # `PATH`（後者已不再轉發）。守衛必須仍然攔得到。
-        with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        with mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids):
             with self.assertRaises(JobRunnerError) as ctx:
                 job_runner.build_builder_env(
                     manager_env={
@@ -914,7 +923,7 @@ class DegradedLaunchTests(unittest.TestCase):
             os.environ,
             _degraded_env(**{job_runner.BUILDER_HOME_ENV: _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV]}),
             clear=True,
-        ), mock.patch.object(job_runner, "_account_ids", return_value=None):
+        ), mock.patch.object(job_runner, "_account_ids", side_effect=_fake_account_ids):
             reported = SubprocessLauncher("codex").executor_environment()
         self.assertEqual(reported.home, _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV])
         # #679：preflight 報的 PATH 也必須是 job 真的會拿到的那一份。

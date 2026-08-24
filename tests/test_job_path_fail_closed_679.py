@@ -35,7 +35,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 
 from paulsha_cortex.coordinator import job_runner, job_shim
 from paulsha_cortex.coordinator.job_runner import JobRunnerError
@@ -80,7 +80,7 @@ def _manager_env(**overrides: str) -> dict[str, str]:
 
 def _build_job_env(*, role: str, manager_env: dict[str, str]) -> dict[str, str]:
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(job_runner, "_account_ids", lambda _account: None)
+        monkeypatch.setattr(job_runner, "_account_ids", fake_account_ids)
         return job_runner.build_job_env(
             manager_env=manager_env,
             job_id="j",

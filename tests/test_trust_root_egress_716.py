@@ -20,6 +20,7 @@ import socket
 import threading
 import unittest
 
+from _home_paths import BUILDER_HOME
 from paulsha_cortex.coordinator import job_shim
 from paulsha_cortex.trust_root import egress_proxy, permgen
 from paulsha_cortex.trust_root.registry import Principal
@@ -368,7 +369,7 @@ class ShimEgressEnvContractTests(unittest.TestCase):
         )
 
     def test_unit_declaration_reaches_the_job_env(self) -> None:
-        spec = {"env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/opt/cortex/toolchain/bin"}}
+        spec = {"env": {"HOME": BUILDER_HOME, "PATH": "/opt/cortex/toolchain/bin"}}
         environ = dict(permgen.EGRESS_PROXY.job_env())
         environ["PATH"] = "/unit/path"
         resolved = job_shim.resolve_job_env(spec, environ)
@@ -378,7 +379,7 @@ class ShimEgressEnvContractTests(unittest.TestCase):
 
     def test_empty_no_proxy_is_carried_not_dropped(self) -> None:
         # 空字串是**有意義的值**（明示清空）；用 truthiness 判斷會把它吃掉。
-        spec = {"env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/p"}}
+        spec = {"env": {"HOME": BUILDER_HOME, "PATH": "/p"}}
         resolved = job_shim.resolve_job_env(spec, {"NO_PROXY": "", "PATH": "/p"})
         self.assertIn("NO_PROXY", resolved)
         self.assertEqual(resolved["NO_PROXY"], "")
@@ -386,7 +387,7 @@ class ShimEgressEnvContractTests(unittest.TestCase):
     def test_spec_wins_over_unit(self) -> None:
         spec = {
             "env": {
-                "HOME": "/__psc_test_home__/builder-home",
+                "HOME": BUILDER_HOME,
                 "PATH": "/p",
                 "HTTPS_PROXY": "http://spec.example:1",
             }
@@ -397,7 +398,7 @@ class ShimEgressEnvContractTests(unittest.TestCase):
         self.assertEqual(resolved["HTTPS_PROXY"], "http://spec.example:1")
 
     def test_absent_declaration_adds_nothing(self) -> None:
-        spec = {"env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/p"}}
+        spec = {"env": {"HOME": BUILDER_HOME, "PATH": "/p"}}
         resolved = job_shim.resolve_job_env(spec, {"PATH": "/p"})
         self.assertEqual(set(resolved), {"HOME", "PATH"})
 

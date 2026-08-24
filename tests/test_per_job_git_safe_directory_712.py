@@ -39,7 +39,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 
 from paulsha_cortex.coordinator import job_runner, job_shim
 from paulsha_cortex.trust_root import permgen, registry
@@ -62,7 +62,7 @@ _GIT_ENV_KEYS = ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
 
 def _build_env(role: str, workspace: str | None) -> dict[str, str]:
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(job_runner, "_account_ids", lambda _account: None)
+        monkeypatch.setattr(job_runner, "_account_ids", fake_account_ids)
         return job_runner.build_job_env(
             manager_env={**_JOB_PATH_ENV, **_JOB_HOME_ENV},
             job_id="job-712",
@@ -292,7 +292,7 @@ def test_the_manager_environment_can_never_supply_these(tmp_path: Path) -> None:
         "GIT_CONFIG_VALUE_0": "/evil",
     }
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(job_runner, "_account_ids", lambda _account: None)
+        monkeypatch.setattr(job_runner, "_account_ids", fake_account_ids)
         env = job_runner.build_job_env(
             manager_env=poisoned,
             job_id="j",
