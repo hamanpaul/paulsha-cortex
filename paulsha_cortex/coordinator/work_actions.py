@@ -45,6 +45,7 @@ from .delivery import (
     ReviewLoop,
     ShipOrchestrator,
     build_openspec_archive_argv,
+    build_openspec_validate_change_argv,
     repair_budget_for_band,
     validate_archive_gate,
     validate_pr_metadata,
@@ -136,7 +137,8 @@ def _ensure_openspec_change_scaffold(*, repo_root: Path, change: str) -> None:
     """#776：archive 前補齊舊 manifest 世代缺失的 openspec change 結構。
 
     舊版 combo manifest 的 planning 只把 ``tasks.md`` 寫進 candidate（實機
-    workflow-85114100），archive gate 的 ``openspec validate --strict`` 因缺
+    workflow-85114100），archive gate 的 ``openspec validate <change> --type
+    change --strict`` 因缺
     ``proposal.md``／specs delta 而結構性失敗（``Unknown item``）。Manager 在
     自己的 ship workspace 於 gate 之前補齊 scaffold——內容為指標式：canonical
     規格仍是 ``docs/superpowers/specs/`` 的 spec/design（與 repo 既有 proposal
@@ -210,7 +212,7 @@ def _validate_local_archive_inputs(
         raise RuntimeError("OpenSpec tasks unavailable") from exc
     task_states = re.findall(r"(?m)^\s*[-*]\s+\[([ xX])\]\s+", tasks_text)
     canonical = runner(
-        ["openspec", "validate", change, "--strict"],
+        build_openspec_validate_change_argv(change),
         cwd=str(repo_root),
         shell=False,
         capture_output=True,

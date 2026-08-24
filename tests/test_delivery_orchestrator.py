@@ -15,6 +15,7 @@ from paulsha_cortex.coordinator.delivery import (
     ForeignReviewEvidence,
     ShipOrchestrator,
     build_openspec_archive_argv,
+    build_openspec_validate_change_argv,
     repair_budget_for_band,
     validate_archive_gate,
     validate_pr_metadata,
@@ -92,6 +93,19 @@ def test_official_openspec_archive_argv_is_non_interactive_and_typed() -> None:
     ]
     with pytest.raises(ValueError, match="safe slug"):
         build_openspec_archive_argv("../escape")
+
+
+def test_official_openspec_validate_change_argv_is_explicitly_typed() -> None:
+    assert build_openspec_validate_change_argv("unified-work-lifecycle") == [
+        "openspec",
+        "validate",
+        "unified-work-lifecycle",
+        "--type",
+        "change",
+        "--strict",
+    ]
+    with pytest.raises(ValueError, match="safe slug"):
+        build_openspec_validate_change_argv("../escape")
 
 
 def test_pr_metadata_requires_zh_tw_conventional_title_and_closing_keywords() -> None:
