@@ -2034,8 +2034,15 @@ class JobRegistry:
         expected_candidate: str,
         repair_action: str,
         retry_classification: str | None = None,
+        model_chain_override: dict[str, dict[str, str]] | None = None,
     ) -> WorkflowRun:
-        """Atomically reopen only the final builder card after an explicit human stop."""
+        """Atomically reopen only the final builder card after an explicit human stop.
+
+        ``model_chain_override`` is an optional, explicit recovery-time refinement.
+        It is merged onto the run-scoped claim override (rather than replacing the
+        planner/reviewer entries), and the selected identity is still validated by
+        the normal dispatch path before a job is created.
+        """
 
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -2121,6 +2128,12 @@ class JobRegistry:
             else step
             for step in current.steps
         )
+        effective_model_chain_override = current.model_chain_override
+        if model_chain_override is not None:
+            effective_model_chain_override = {
+                **dict(current.model_chain_override or {}),
+                **{persona: dict(row) for persona, row in model_chain_override.items()},
+            }
         updated = replace(
             current,
             current_phase="build",
@@ -2143,6 +2156,7 @@ class JobRegistry:
                 if retry_classification is None
                 else retry_classification
             ),
+            model_chain_override=effective_model_chain_override,
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

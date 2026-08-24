@@ -521,6 +521,8 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
             "issue": 12,
             "actor": "operator",
             "expected_candidate": HEAD,
+            "builder_executor": "codex",
+            "builder_model": "gpt-5.6-luna",
         },
         requested_by="operator",
         snapshot_path=snapshot,
@@ -531,6 +533,9 @@ def test_retry_build_preserves_only_manager_owned_archive_authority(
     reset = registry.get_workflow_run(initial.run_id)
     assert result["result"]["action"] == "retry-build"
     assert reset.current_phase == "build"
+    assert reset.model_chain_override == {
+        "builder": {"executor": "codex", "model_id": "gpt-5.6-luna"}
+    }
     assert reset.facets == ("degraded",)
     assert reset.gate_refs == ()
     archive = next(step for step in reset.steps if step.card == "openspec-archive")

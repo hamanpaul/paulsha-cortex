@@ -62,7 +62,12 @@ from . import not_claimable
 from . import verification
 from . import worktree_reclaim
 from .preflight import PreflightRequest, load_preflight_command, run_preflight
-from .work_bridge import current_sizing_snapshot, resolve_trusted_repo_root, workflow_status
+from .work_bridge import (
+    current_sizing_snapshot,
+    extract_model_chain_override,
+    resolve_trusted_repo_root,
+    workflow_status,
+)
 from .workflow import GateEvidenceRef, brainstorm_authority_bound
 
 
@@ -2239,16 +2244,38 @@ def _validate_operator_adjudication_args(
         raise ValueError(f"{action} reason requires a durable state path")
 
 
+def _retry_build_model_chain_override(
+    args: dict[str, Any],
+) -> dict[str, dict[str, str]] | None:
+    """#205：明示的 retry-build 只允許切換 builder lane。
+
+    planner／reviewer 是既有 run 的凍結身分；讓 recovery request 任意改寫它們
+    會繞過原本的 claim-time independence contract。builder 需要換 provider 時，
+    由這條窄入口把 override 帶到 registry，後續 dispatch 仍走同一套 identity
+    capability／domain fail-closed 驗證。
+    """
+
+    override = extract_model_chain_override(args)
+    if override is None:
+        return None
+    if set(override) != {"builder"}:
+        raise ValueError("retry-build only permits a builder model-chain override")
+    return override
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
     extras = set(args) - {
         "action", "repo", "work_id", "issue", "actor", "expected_candidate", "reason",
+        "planner_executor", "planner_model", "builder_executor", "builder_model",
+        "reviewer_executor", "reviewer_model",
     }
     if extras:
         raise ValueError(f"retry-build rejects caller evidence/input: {sorted(extras)[0]}")
     # #755：選填 operator 指示——repair 回合過去只有 stale 的跨卡回饋可看。
     _validate_operator_adjudication_args(args, state_path=state_path, action="retry-build")
+    model_chain_override = _retry_build_model_chain_override(args)
     expected_candidate = args.get("expected_candidate")
     if (
         not isinstance(expected_candidate, str)
@@ -2315,6 +2342,7 @@ def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, s
         expected_candidate=expected_candidate.lower(),
         repair_action=repair_action,
         retry_classification=retry_classification.value,
+        model_chain_override=model_chain_override,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     adjudication_evidence = _record_operator_adjudication(
