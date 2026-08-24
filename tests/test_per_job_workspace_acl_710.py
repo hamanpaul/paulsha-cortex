@@ -557,6 +557,51 @@ def test_grant_validates_the_acl_spec_before_building_the_command(
         )
 
 
+def test_runtime_acl_provisioning_splits_access_and_default_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """access/default ACL 不混在同一個遞迴 `-m`，對齊 permgen 的命令順序。"""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(job_workspace.shutil, "which", lambda _name: "/usr/bin/setfacl")
+    monkeypatch.setattr(job_workspace.subprocess, "run", fake_run)
+
+    rendered = job_workspace.grant_workspace_acl(
+        workspace,
+        (
+            job_workspace.WorkspaceAclGrant("daemon", "rwX", "rwx"),
+            job_workspace.WorkspaceAclGrant("nobody", "rX", "rX"),
+        ),
+    )
+
+    assert calls == [
+        [
+            "/usr/bin/setfacl",
+            "-R",
+            "-m",
+            "u:daemon:rwX,u:nobody:rX",
+            str(workspace),
+        ],
+        [
+            "/usr/bin/setfacl",
+            "-R",
+            "-d",
+            "-m",
+            "u:daemon:rwx,u:nobody:rX",
+            str(workspace),
+        ],
+    ]
+    assert rendered.startswith("/usr/bin/setfacl -R -m ")
+    assert " && /usr/bin/setfacl -R -d -m " in rendered
+
+
 # ---------------------------------------------------------------------------
 # 6. OS 層語意：真的 ACL 樹、mask 判準、per-job 隔離
 #

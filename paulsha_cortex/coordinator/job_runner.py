@@ -1305,16 +1305,20 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
     value = (manager_env.get(config.home_env) or "").strip()
     account = resolve_job_account(manager_env, role=config.role_id)
     account_ids = _account_ids(account)
-    problem, stat_result = _assess_home_path(value)
-    if problem is None and account_ids is None:
+    if account_ids is None:
+        # `_account_ids()` 的 None 不是「沒有 expected uid，跳過 owner check」；
+        # 它是無法驗證 trust root 的 fail-closed 結果。先收斂成問題，再評估
+        # 路徑，避免任何 HOME 形狀把 owner 驗證繞過。
         problem = "account-unresolved"
-    elif (
-        problem is None
-        and stat_result is not None
-        and account_ids is not None
-        and stat_result.st_uid != account_ids[0]
-    ):
-        problem = "owner-mismatch"
+        stat_result = None
+    else:
+        problem, stat_result = _assess_home_path(value)
+        if (
+            problem is None
+            and stat_result is not None
+            and stat_result.st_uid != account_ids[0]
+        ):
+            problem = "owner-mismatch"
     if problem is None:
         return value
     hint = _home_contract_hint(config)

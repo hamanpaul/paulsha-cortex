@@ -298,6 +298,8 @@ def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> d
     try:
         stat_result = os.lstat(home)
     except FileNotFoundError:
+        # 不把缺少的 HOME 留給 child process；這裡是 shim 已經在做型態／
+        # 存取性驗證的最後一道邊界。訊息刻意不含未驗證的路徑。
         raise ShimError("job spec 的 env 裡的 HOME 目錄不存在") from None
     except OSError:
         raise ShimError("job spec 的 env 裡的 HOME 目前無法判定型態或存取性") from None

@@ -3,8 +3,10 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-_ROOT_DIR = tempfile.TemporaryDirectory(prefix="psc-test-homes-")
-_ROOT = Path(_ROOT_DIR.name)
+# Keep the TemporaryDirectory object alive for the whole test process so its
+# finalizer removes the shared fixture tree instead of leaking /tmp entries.
+_ROOT_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory(prefix="psc-test-homes-")
+_ROOT = Path(_ROOT_TEMPORARY_DIRECTORY.name)
 
 BUILDER_HOME = str(_ROOT / "builder-home")
 REVIEWER_HOME = str(_ROOT / "review-home")
