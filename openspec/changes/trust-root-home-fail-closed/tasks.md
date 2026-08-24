@@ -31,5 +31,8 @@ work_item: trust-root-home-fail-closed
       portable, and HOME account resolution cannot bypass owner validation;
       keep the source plan pinned and leave Manager-owned archive/merge/issue
       closeout actions pending.
+- [x] Remove the redundant generated main-spec shadow and lock both legacy and
+      explicit change-scoped strict OpenSpec validation to the active change;
+      keep archive, merge, issue closure, and done claims Manager-owned.
 > Manager-owned closeout remains pending: official OpenSpec archive/commit,
 > exact-PR-head delivery and CI evidence, merge, issue closure, and done.
