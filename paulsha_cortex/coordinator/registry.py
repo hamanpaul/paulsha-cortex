@@ -2170,6 +2170,7 @@ class JobRegistry:
         expected_run_id: str,
         card: str,
         retry_classification: str | None = None,
+        model_chain_override: dict[str, dict[str, str]] | None = None,
     ) -> WorkflowRun:
         """#545／#569：原子重開「當前 phase 內最早一張尚未採信的卡」。
 
@@ -2294,6 +2295,12 @@ class JobRegistry:
         carried = current.attempts.get(card_retry_key, 0)
         if carried:
             attempts[card_total_key] = current.attempts.get(card_total_key, 0) + carried
+        effective_model_chain_override = current.model_chain_override
+        if model_chain_override is not None:
+            effective_model_chain_override = {
+                **dict(current.model_chain_override or {}),
+                **{persona: dict(row) for persona, row in model_chain_override.items()},
+            }
         updated = replace(
             current,
             steps=steps,
@@ -2308,6 +2315,7 @@ class JobRegistry:
                 if retry_classification is None
                 else retry_classification
             ),
+            model_chain_override=effective_model_chain_override,
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

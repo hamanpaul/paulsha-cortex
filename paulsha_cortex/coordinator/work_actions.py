@@ -2263,6 +2263,30 @@ def _retry_build_model_chain_override(
     return override
 
 
+def _retry_card_model_chain_override(
+    args: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, dict[str, str]] | None:
+    """Allow an explicit lane replacement for the card being retried.
+
+    A reviewer recovery must not silently rewrite the frozen builder or planner
+    identities (and vice versa for the mid-build card).  The normal dispatch
+    identity registry still performs capability and independence-domain checks;
+    this helper only narrows which persona the operator may name.
+    """
+
+    override = extract_model_chain_override(args)
+    if override is None:
+        return None
+    expected_persona = "builder" if phase == "build" else "reviewer"
+    if set(override) != {expected_persona}:
+        raise ValueError(
+            f"retry-card only permits a {expected_persona} model-chain override"
+        )
+    return override
+
+
 def _retry_build_action(*, args: dict[str, Any], authority, workflow_registry, state_path: Path | None = None, now_epoch: float | None = None) -> dict[str, Any]:
     """Reopen the final builder card with exact-Candidate CAS after a human stop."""
 
@@ -2515,6 +2539,8 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
     extras = set(args) - {
         "action", "repo", "work_id", "issue", "actor", "expected_run_id", "card",
         "reason",
+        "planner_executor", "planner_model", "builder_executor", "builder_model",
+        "reviewer_executor", "reviewer_model",
     }
     if extras:
         raise ValueError(f"retry-card rejects caller evidence/input: {sorted(extras)[0]}")
@@ -2556,6 +2582,9 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         raise RuntimeError("retry-card requires needs_human workflow")
     if run.current_phase not in RETRY_CARD_PHASE_PERSONA:
         raise RuntimeError("retry-card requires build/verify/review-phase workflow")
+    model_chain_override = _retry_card_model_chain_override(
+        args, phase=run.current_phase
+    )
     expected_persona = RETRY_CARD_PHASE_PERSONA[run.current_phase]
     target = _current_workflow_step(run)
     if target is None or target.persona != expected_persona:
@@ -2606,6 +2635,7 @@ def _retry_card_action(*, args: dict[str, Any], authority, workflow_registry, st
         expected_run_id=expected_run_id,
         card=card,
         retry_classification=retry_classification.value,
+        model_chain_override=model_chain_override,
     )
     updated = _recompute_and_persist_sizing(workflow_registry, updated)
     # #752／#755：operator 裁決經 Manager 落地為 immutable evidence——dispatch 端由

@@ -177,6 +177,7 @@ def _stuck_reviewer_run(
     phase: str = "verify",
     reviewer_executor: str = "agy",
     reviewer_model: str = "gemini-3.7-flash-high",
+    model_chain_override: dict | None = None,
     with_git: bool = False,
 ):
     """重建現場：needs_human 的 reviewer phase run，停在一張 reviewer 卡，該卡
@@ -221,6 +222,7 @@ def _stuck_reviewer_run(
         ),
         gate_status="failed",
         planning_authority=_planning_authority(),
+        model_chain_override=model_chain_override,
     )
     # builder 的 candidate 產出：reviewer dispatch 以它的 worktree 為 candidate root。
     builder = registry.create_job(
@@ -332,6 +334,54 @@ def test_retry_card_reopens_the_stuck_verification_card(tmp_path: Path) -> None:
     assert registry.get_job(job_id) == before
     # candidate 不變的 reviewer 重跑不是模型修復。
     assert persisted.retry_classification == "orchestrator_retry"
+
+
+def test_retry_card_can_pin_reviewer_without_changing_luna_builder(
+    tmp_path: Path,
+) -> None:
+    """Recovery may replace the failed reviewer lane while preserving Luna builder."""
+
+    original_override = {
+        "builder": {"executor": "codex", "model_id": "gpt-5.6-luna"},
+        "reviewer": {"executor": "agy", "model_id": "gemini-3.7-flash-high"},
+    }
+    snapshot, registry, run, _job_id = _stuck_reviewer_run(
+        tmp_path, model_chain_override=original_override
+    )
+
+    _retry_card(
+        tmp_path,
+        snapshot,
+        registry,
+        expected_run_id=run.run_id,
+        card="verification",
+        reviewer_executor="claude",
+        reviewer_model="claude-opus-5",
+    )
+
+    persisted = registry.get_workflow_run(run.run_id)
+    assert persisted.model_chain_override == {
+        "builder": {"executor": "codex", "model_id": "gpt-5.6-luna"},
+        "reviewer": {"executor": "claude", "model_id": "claude-opus-5"},
+    }
+
+
+def test_retry_card_rejects_a_builder_override_for_reviewer_phase(
+    tmp_path: Path,
+) -> None:
+    snapshot, registry, run, _job_id = _stuck_reviewer_run(tmp_path)
+
+    with pytest.raises(ValueError, match="retry-card only permits a reviewer"):
+        _retry_card(
+            tmp_path,
+            snapshot,
+            registry,
+            expected_run_id=run.run_id,
+            card="verification",
+            builder_executor="codex",
+            builder_model="gpt-5.6-luna",
+        )
+    assert registry.get_workflow_run(run.run_id).model_chain_override is None
 
 
 def test_retry_card_preserves_the_reviewer_card_contract(tmp_path: Path) -> None:
