@@ -1310,6 +1310,8 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
         expected_uid=account_ids[0] if account_ids is not None else None,
         require_existing=True,
     )
+    if problem is None and account_ids is None:
+        problem = "account-unresolved"
     if problem is None:
         return value
     hint = _home_contract_hint(config)
@@ -1335,6 +1337,13 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
             f"{hint}"
         )
         reason = "job-runner-home-missing"
+    elif problem == "account-unresolved":
+        detail = (
+            f"{config.home_env} 的 owner 無法驗證——帳號 {account} 不在 passwd，"
+            f"在能逐字確認這格 HOME 屬於 {account} 之前，{config.role_id} job 不得起跑。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-account-unresolved"
     elif problem == "unstatable":
         detail = (
             f"{config.home_env} 指向的 HOME 目前無法判定型態或 owner；在沒有這個判準前 "

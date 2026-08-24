@@ -41,7 +41,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator import dispatcher, terminal_contract
@@ -193,7 +193,7 @@ def _seams(*, template: bool):
         mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         mock.patch.object(job_runner, "_account_exists", return_value=True),
         mock.patch.object(job_runner, "_group_exists", return_value=True),
-        mock.patch.object(job_runner, "_account_ids", return_value=None),
+        mock.patch.object(job_runner, "_account_ids", side_effect=fake_account_ids),
     ]
     if template:
         patches += [

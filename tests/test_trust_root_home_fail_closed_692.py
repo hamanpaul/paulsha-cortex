@@ -190,6 +190,24 @@ def test_build_job_env_rejects_home_owned_by_someone_else(tmp_path: Path) -> Non
     assert "owner" in str(excinfo.value)
 
 
+def test_build_job_env_rejects_home_when_account_owner_cannot_be_verified(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "builder-home"
+    home.mkdir()
+    env = _manager_env()
+    env[job_runner.BUILDER_HOME_ENV] = str(home)
+
+    with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        with pytest.raises(JobRunnerError) as excinfo:
+            _build_env(role=job_runner.JOB_ROLE_BUILDER, manager_env=env)
+
+    message = str(excinfo.value)
+    assert excinfo.value.diagnostic.reason == "job-runner-home-account-unresolved"
+    assert "cortex-builder" in message
+    assert str(home) not in message
+
+
 @pytest.mark.parametrize(
     ("role", "principal"),
     (
@@ -198,14 +216,23 @@ def test_build_job_env_rejects_home_owned_by_someone_else(tmp_path: Path) -> Non
         (job_runner.JOB_ROLE_GATE, Principal.GATE),
     ),
 )
-def test_generated_unit_home_contract_matches_runtime_env(role: str, principal: Principal) -> None:
+def test_generated_unit_home_contract_matches_runtime_env(
+    role: str, principal: Principal, tmp_path: Path
+) -> None:
     account = job_runner.resolve_job_account({}, role=role)
-    declared_home = permgen.DEFAULT_LAYOUT.home_of(account)
-    with mock.patch.object(job_runner, "_account_ids", return_value=None):
+    layout = permgen.PathLayout(home_root=str(tmp_path))
+    declared_home = layout.home_of(account)
+    Path(declared_home).mkdir(parents=True)
+    stat_result = Path(declared_home).stat()
+    with mock.patch.object(
+        job_runner,
+        "_account_ids",
+        return_value=(stat_result.st_uid, frozenset({stat_result.st_gid})),
+    ):
         env = _build_env(
             role=role, manager_env=_manager_env(**{_ROLE_HOME_ENV[role]: declared_home})
         )
-    unit = permgen.build_job_unit(permgen.FOUR_WAY_SCHEME, principal=principal)
+    unit = permgen.build_job_unit(permgen.FOUR_WAY_SCHEME, layout, principal=principal)
 
     assert env["HOME"] == declared_home
     assert f"#      {_ROLE_HOME_ENV[role]}={declared_home}" in unit.content
@@ -223,6 +250,26 @@ def test_shim_refuses_to_inherit_home_from_the_unit_layer() -> None:
         )
 
     assert "HOME" in str(excinfo.value)
+
+
+def test_shim_rejects_missing_home_directory_without_echoing_path(tmp_path: Path) -> None:
+    missing_home = tmp_path / "missing-home"
+
+    with pytest.raises(job_shim.ShimError) as excinfo:
+        job_shim.resolve_job_env(
+            {
+                "env": {
+                    "HOME": str(missing_home),
+                    "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+                }
+            },
+            {"PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin"},
+        )
+
+    message = str(excinfo.value)
+    assert "HOME" in message
+    assert "不存在" in message
+    assert str(missing_home) not in message
 
 
 def test_shim_redacts_home_lstat_failures(tmp_path: Path) -> None:
@@ -287,6 +334,43 @@ def test_shim_main_reports_missing_home_before_taking_over_the_log(tmp_path: Pat
     record = json.loads(shim_error.read_text(encoding="utf-8"))
     assert record["instance"] == "demo"
     assert "HOME" in record["error"]
+
+
+def test_shim_main_reports_missing_home_directory_before_taking_over_the_log(
+    tmp_path: Path,
+) -> None:
+    spool = tmp_path / "job-specs"
+    spool.mkdir()
+    missing_home = tmp_path / "missing-home"
+    spec = _shim_spec(
+        root=tmp_path,
+        env={
+            "HOME": str(missing_home),
+            "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+        },
+    )
+    (spool / "demo.json").write_text(json.dumps(spec), encoding="utf-8")
+
+    with mock.patch.object(
+        job_shim,
+        "_take_over_stdio",
+        side_effect=AssertionError("missing HOME directory must fail before log takeover"),
+    ):
+        rc = job_shim.main(
+            ["demo"],
+            {
+                job_runner.JOB_SPEC_SPOOL_ENV: str(spool),
+                "PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+                "HOME": "/var/lib/cortex-builder",
+            },
+        )
+
+    assert rc == job_shim.EXIT_SPEC_ERROR
+    assert not Path(spec["log_path"]).exists()
+    record = json.loads((tmp_path / job_shim.SHIM_ERROR_FILENAME).read_text(encoding="utf-8"))
+    assert record["instance"] == "demo"
+    assert "HOME" in record["error"]
+    assert str(missing_home) not in record["error"]
 
 
 def test_shim_main_redacts_home_lstat_failures_before_taking_over_the_log(tmp_path: Path) -> None:

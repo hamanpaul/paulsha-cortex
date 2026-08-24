@@ -32,7 +32,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
-from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.job_shim as job_shim
 import paulsha_cortex.coordinator.job_workspace as job_workspace
@@ -154,7 +154,9 @@ def _preflight_patches(*, unit_active: bool = False, **overrides):
         "booted": mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         "account": mock.patch.object(job_runner, "_account_exists", return_value=True),
         "group": mock.patch.object(job_runner, "_group_exists", return_value=True),
-        "account_ids": mock.patch.object(job_runner, "_account_ids", return_value=None),
+        "account_ids": mock.patch.object(
+            job_runner, "_account_ids", side_effect=fake_account_ids
+        ),
         "unit_file": mock.patch.object(
             job_runner, "_unit_file_installed", return_value=True
         ),
@@ -1235,7 +1237,7 @@ class NoRegressionTests(unittest.TestCase):
             mock.patch.object(job_runner, "_systemd_booted", return_value=True),
             mock.patch.object(job_runner, "_account_exists", return_value=True),
             mock.patch.object(job_runner, "_group_exists", return_value=True),
-            mock.patch.object(job_runner, "_account_ids", return_value=None),
+            mock.patch.object(job_runner, "_account_ids", side_effect=fake_account_ids),
         ]
         try:
             with tempfile.TemporaryDirectory() as d, mock.patch.dict(

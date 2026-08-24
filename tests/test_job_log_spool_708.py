@@ -37,6 +37,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from _home_paths import BUILDER_HOME
 
 import paulsha_cortex.coordinator.gate_runner as gate_runner
 import paulsha_cortex.coordinator.job_runner as job_runner
@@ -513,7 +514,7 @@ class ShimFailureRecordTests(unittest.TestCase):
                 "command": ["/bin/true"],
                 "working_directory": root,
                 "log_path": str(log_path),
-                "env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
+                "env": {"HOME": BUILDER_HOME, "PATH": "/usr/bin"},
             }
             (spool / "wf-1.json").write_text(json.dumps(spec), encoding="utf-8")
             with mock.patch.object(
