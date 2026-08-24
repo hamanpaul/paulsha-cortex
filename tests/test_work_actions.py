@@ -2845,7 +2845,7 @@ def test_ship_runs_official_archive_before_preflight(tmp_path: Path) -> None:
     )
     assert result["result"]["action"] == "archive-applied-needs-commit"
     assert calls[-1][0] == ["openspec", "archive", "-y", "demo"]
-    assert calls[0][0] == ["openspec", "validate", "demo", "--strict"]
+    assert calls[0][0] == ["openspec", "validate", "demo", "--type", "change", "--strict"]
 
 
 def _drive_repair_budget_cycle(

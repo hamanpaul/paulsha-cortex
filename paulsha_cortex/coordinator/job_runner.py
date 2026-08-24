@@ -1269,33 +1269,26 @@ def _home_contract_hint(config: JobRoleConfig) -> str:
     )
 
 
-def _assess_home_path(
-    value: str,
-    *,
-    expected_uid: int | None,
-    require_existing: bool,
-) -> str | None:
+def _assess_home_path(value: str) -> tuple[str | None, os.stat_result | None]:
     if not value:
-        return "undeclared"
+        return "undeclared", None
     if not value.startswith("/"):
-        return "not-absolute"
+        return "not-absolute", None
     try:
         exists = os.path.lexists(value)
     except OSError:
-        return "unstatable"
+        return "unstatable", None
     if not exists:
-        return "missing" if require_existing else None
+        return "missing", None
     try:
         stat_result = os.lstat(value)
     except OSError:
-        return "unstatable"
+        return "unstatable", None
     if stat.S_ISLNK(stat_result.st_mode):
-        return "symlink"
+        return "symlink", None
     if not stat.S_ISDIR(stat_result.st_mode):
-        return "not-directory"
-    if expected_uid is not None and stat_result.st_uid != expected_uid:
-        return "owner-mismatch"
-    return None
+        return "not-directory", None
+    return None, stat_result
 
 
 def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
@@ -1305,13 +1298,16 @@ def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
     value = (manager_env.get(config.home_env) or "").strip()
     account = resolve_job_account(manager_env, role=config.role_id)
     account_ids = _account_ids(account)
-    problem = _assess_home_path(
-        value,
-        expected_uid=account_ids[0] if account_ids is not None else None,
-        require_existing=True,
-    )
+    problem, stat_result = _assess_home_path(value)
     if problem is None and account_ids is None:
         problem = "account-unresolved"
+    elif (
+        problem is None
+        and stat_result is not None
+        and account_ids is not None
+        and stat_result.st_uid != account_ids[0]
+    ):
+        problem = "owner-mismatch"
     if problem is None:
         return value
     hint = _home_contract_hint(config)
