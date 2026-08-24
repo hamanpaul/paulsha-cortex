@@ -299,24 +299,10 @@ def test_shim_rejects_missing_home_directory_without_echoing_path(tmp_path: Path
     assert str(missing_home) not in message
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        ("openspec", "validate", "trust-root-home-fail-closed", "--strict"),
-        (
-            "openspec",
-            "change",
-            "validate",
-            "trust-root-home-fail-closed",
-            "--strict",
-        ),
-    ],
-    ids=["legacy-validate", "explicit-change-validate"],
-)
-def test_trust_root_home_change_has_unambiguous_strict_validation(
-    command: tuple[str, ...],
-) -> None:
-    """The archived spec must not shadow the active change for either CLI form."""
+def test_archived_trust_root_home_spec_has_strict_validation() -> None:
+    """The archived change's canonical spec remains strictly valid after archive."""
+
+    command = ("openspec", "validate", "trust-root-home-fail-closed", "--strict")
 
     executable = shutil.which(command[0])
     assert executable is not None, "openspec CLI is required for this repository gate"
