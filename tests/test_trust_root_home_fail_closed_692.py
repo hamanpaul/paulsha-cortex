@@ -219,6 +219,20 @@ def test_build_job_env_rejects_home_when_account_owner_cannot_be_verified(
     assert str(home) not in message
 
 
+def test_unresolved_home_account_is_checked_before_home_shape(
+    tmp_path: Path,
+) -> None:
+    env = _manager_env()
+    env[job_runner.BUILDER_HOME_ENV] = str(tmp_path / "missing-builder-home")
+
+    with mock.patch.object(job_runner, "_account_ids", return_value=None):
+        with pytest.raises(JobRunnerError) as excinfo:
+            _build_env(role=job_runner.JOB_ROLE_BUILDER, manager_env=env)
+
+    assert excinfo.value.diagnostic.reason == "job-runner-home-account-unresolved"
+    assert str(tmp_path / "missing-builder-home") not in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     ("role", "principal"),
     (

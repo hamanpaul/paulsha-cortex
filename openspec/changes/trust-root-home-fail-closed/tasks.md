@@ -26,5 +26,10 @@ work_item: trust-root-home-fail-closed
       fail-closed status, unresolved account ownership is rejected, the shim
       rejects missing directories, and shared test homes are owned by a
       `TemporaryDirectory`; keep the pinned source plan unchanged.
+- [x] Repair the pre-archive ACL provisioning regression: access and default
+      ACLs are applied in the permgen order so recursive provisioning remains
+      portable, and HOME account resolution cannot bypass owner validation;
+      keep the source plan pinned and leave Manager-owned archive/merge/issue
+      closeout actions pending.
 > Manager-owned closeout remains pending: official OpenSpec archive/commit,
 > exact-PR-head delivery and CI evidence, merge, issue closure, and done.
