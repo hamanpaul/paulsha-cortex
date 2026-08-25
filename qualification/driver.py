@@ -705,6 +705,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     covered_assets = 0
     registry_asset_ids: list[str] = []
     authorized_mutations: list[dict[str, str]] = []
+    deny_only_assets: list[str] = []
     for asset in assets:
         if not isinstance(asset, Mapping) or asset.get("tier") not in {
             "TIER_0",
@@ -715,6 +716,13 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         if not isinstance(asset_id, str) or not asset_id:
             raise QualificationFailure("Tier-0/Tier-1 asset has no asset_id")
         registry_asset_ids.append(asset_id)
+        deny_only = asset_id in {"review-verdict"}
+        if deny_only:
+            # Phase 2a's worktree-local verdict file remains registered as a
+            # compatibility asset, but Phase 2b authority is the dedicated
+            # review-verdict-spool.  Do not grant a reviewer write path into
+            # the builder pool merely to make the legacy row appear writable.
+            deny_only_assets.append(asset_id)
         writer_accounts = asset.get("writer_accounts")
         if not isinstance(writer_accounts, list) or any(
             not isinstance(account, str) or not account for account in writer_accounts
@@ -736,7 +744,12 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             raise QualificationFailure(f"durable asset container is absent: {asset_id}")
         suffix = hashlib.sha256(asset_id.encode()).hexdigest()[:16]
         target = container / f".cortex-r9-{suffix}"
-        target.write_bytes(b"current-valid-content")
+        try:
+            target.write_bytes(b"current-valid-content")
+        except OSError as exc:
+            raise QualificationFailure(
+                f"durable-state probe setup failed for {asset_id}: {target}: {exc}"
+            ) from exc
         owner_name = asset.get("owner")
         if not isinstance(owner_name, str) or not owner_name:
             raise QualificationFailure(f"durable asset has no owner: {asset_id}")
@@ -747,10 +760,15 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         # a denial.  Runtime-managed worktrees are the exception: their
         # production helper deliberately keeps the Manager as inode owner and
         # grants the job account a named ACL recursively.
-        target_owner_name = owner_name
+        # A deny-only legacy asset is intentionally protected from both
+        # headless accounts.  Keep the synthetic probe root-owned so restore
+        # remains possible in the rootless Docker fixture without inventing a
+        # writer account or a cross-worktree ACL.
+        target_owner_name = "root" if deny_only else owner_name
         if (
             asset.get("is_directory") is True
             and asset.get("runtime_managed") is not True
+            and not deny_only
         ):
             target_owner_name = next(
                 (
@@ -790,7 +808,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         for principal in principals:
             for operation, expression in operations.items():
                 case_id = f"{asset_id}:{operation}"
-                if principal in writer_accounts:
+                if principal in writer_accounts and not deny_only:
                     _fs_allowed(
                         cases,
                         family="durable-state",
@@ -814,24 +832,55 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                         expression=f"p=Path({str(target)!r})\n{expression}",
                     )
                 replacement = target.with_name(target.name + ".replacement")
-                replacement.unlink(missing_ok=True)
-                if target.is_symlink():
-                    target.unlink()
-                if not target.is_file():
-                    target.write_bytes(b"current-valid-content")
-                target.write_bytes(b"current-valid-content")
-                os.chown(target, owner.pw_uid, owner.pw_gid)
-                os.chmod(target, int(raw_mode, 8) & 0o777)
-                for row in raw_acls:
-                    if not isinstance(row, Mapping) or row.get("default") is True:
-                        continue
-                    account = row.get("account")
-                    perms = row.get("perms")
-                    if isinstance(account, str) and isinstance(perms, str):
-                        _require_success(
-                            _run(("setfacl", "-m", f"u:{account}:{perms}", str(target))),
-                            f"R9 ACL proxy restore for {asset_id}/{account}",
-                        )
+                try:
+                    replacement.unlink(missing_ok=True)
+                    if target.is_symlink():
+                        target.unlink()
+                    restore_lines = [f"p=Path({str(target)!r})"]
+                    if asset.get("is_directory") is True:
+                        # Directory assets model a producer-created child;
+                        # their parent grants the owner create/unlink rights.
+                        restore_lines.append("p.unlink(missing_ok=True)")
+                    restore_lines.append("p.write_bytes(b'current-valid-content')")
+                    restore = _run(
+                        _fs_probe("\n".join(restore_lines)),
+                        user=target_owner_name,
+                        env=_account_env(target_owner_name),
+                        timeout=30,
+                    )
+                    _require_success(
+                        restore,
+                        f"R9 owner restore for {asset_id}/{target_owner_name}",
+                    )
+                    os.chown(target, owner.pw_uid, owner.pw_gid)
+                    os.chmod(target, int(raw_mode, 8) & 0o777)
+                    for row in raw_acls:
+                        if not isinstance(row, Mapping) or row.get("default") is True:
+                            continue
+                        account = row.get("account")
+                        perms = row.get("perms")
+                        if isinstance(account, str) and isinstance(perms, str):
+                            _require_success(
+                                _run(("setfacl", "-m", f"u:{account}:{perms}", str(target))),
+                                f"R9 ACL proxy restore for {asset_id}/{account}",
+                            )
+                except OSError as exc:
+                    diagnostics: list[str] = []
+                    for argv in (
+                        ("id",),
+                        ("sh", "-c", "grep '^CapEff:' /proc/self/status"),
+                        ("stat", "-c", "%F %u:%g %a", str(target)),
+                        ("getfacl", "-p", str(target)),
+                        ("findmnt", "-T", str(target), "-o", "TARGET,FSTYPE,OPTIONS"),
+                    ):
+                        probe = _run(argv)
+                        text = (probe.stdout or probe.stderr).strip().replace("\n", " ")
+                        if text:
+                            diagnostics.append(text[:500])
+                    raise QualificationFailure(
+                        f"durable-state probe restore failed for {asset_id}/{operation}/"
+                        f"{principal}: {target}: {exc} {' | '.join(diagnostics)}"
+                    ) from exc
                 if (
                     not target.is_file()
                     or target.is_symlink()
@@ -841,6 +890,19 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                         f"durable-state probe changed authority proxy: {asset_id}"
                     )
         if "cortex-manager" in writer_accounts:
+            manager_target = target
+            manager_created = False
+            if target_owner_name != "cortex-manager":
+                # A spool producer owns its child inode; Manager's positive
+                # control is therefore a separate Manager-created child.  It
+                # proves the directory owner can create/write its own state
+                # without pretending it may rewrite a producer's payload.
+                manager_target = container / f"{target.name}.manager"
+                manager_target.write_bytes(b"manager-valid-content")
+                manager_owner = pwd.getpwnam("cortex-manager")
+                os.chown(manager_target, manager_owner.pw_uid, manager_owner.pw_gid)
+                os.chmod(manager_target, 0o600)
+                manager_created = True
             _positive(
                 controls,
                 family="durable-state",
@@ -849,9 +911,11 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                 argv=(
                     "/usr/bin/python3",
                     "-c",
-                    f"from pathlib import Path; Path({str(target)!r}).write_bytes(b'current-valid-content')",
+                    f"from pathlib import Path; Path({str(manager_target)!r}).write_bytes(b'current-valid-content')",
                 ),
             )
+            if manager_created:
+                manager_target.unlink(missing_ok=True)
         target.unlink(missing_ok=True)
     if covered_assets == 0:
         raise QualificationFailure(
@@ -1275,6 +1339,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             "cases": cases,
             "negative_controls": controls,
             "authorized_mutations": authorized_mutations,
+            "deny_only_assets": sorted(deny_only_assets),
             "covered_assets": covered_assets,
             "registry_asset_ids": sorted(registry_asset_ids),
         },

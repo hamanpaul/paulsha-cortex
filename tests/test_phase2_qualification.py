@@ -238,6 +238,7 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
             )
         ],
         "authorized_mutations": [],
+        "deny_only_assets": [],
         "covered_assets": 1,
         "registry_asset_ids": ["jobs-registry"],
     }
@@ -670,6 +671,49 @@ def test_full_suite_validator_binds_authorized_workspace_mutations(
     _write_json(attack_path, attack)
     _refresh_full_hashes(tmp_path, payload)
 
+    rejected = _run_full_validator(tmp_path, payload)
+    assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+
+
+def test_full_suite_validator_binds_legacy_deny_only_asset(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    attack_path = tmp_path / "evidence" / "attack-matrix.json"
+    attack = json.loads(attack_path.read_text(encoding="utf-8"))
+    operations = ("modify", "truncate", "delete", "replace", "symlink-swap", "rollback")
+    for operation in operations:
+        case = f"review-verdict:{operation}"
+        attack["cases"].extend(
+            [
+                {
+                    "family": "durable-state",
+                    "case": case,
+                    "principal": "cortex-builder",
+                    "status": "passed",
+                    "returncode": 13,
+                },
+                {
+                    "family": "durable-state",
+                    "case": case,
+                    "principal": "cortex-reviewer-planner",
+                    "status": "passed",
+                    "returncode": 13,
+                },
+            ]
+        )
+    attack["covered_assets"] = 2
+    attack["registry_asset_ids"].append("review-verdict")
+    attack["deny_only_assets"].append("review-verdict")
+    _write_json(attack_path, attack)
+    _refresh_full_hashes(tmp_path, payload)
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    attack["deny_only_assets"] = []
+    _write_json(attack_path, attack)
+    _refresh_full_hashes(tmp_path, payload)
     rejected = _run_full_validator(tmp_path, payload)
     assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 

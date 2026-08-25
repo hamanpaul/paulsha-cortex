@@ -73,6 +73,7 @@ REQUIRED_RELEASE_TESTS = {
     "manager-github-dry-run-push",
 }
 R9_HEADLESS_PRINCIPALS = {"cortex-builder", "cortex-reviewer-planner"}
+R9_DENY_ONLY_ASSET_IDS = {"review-verdict"}
 R9_MUTATIONS = {
     "modify",
     "truncate",
@@ -235,6 +236,7 @@ def _validate_full_suite_artifacts(
             "cases",
             "negative_controls",
             "authorized_mutations",
+            "deny_only_assets",
             "covered_assets",
             "registry_asset_ids",
         },
@@ -287,6 +289,22 @@ def _validate_full_suite_artifacts(
         asset_ids
     ):
         _fail("attack-matrix durable registry coverage is inconsistent")
+    deny_only_raw = attack["deny_only_assets"]
+    if not isinstance(deny_only_raw, list):
+        _fail("attack-matrix.deny_only_assets must be an array")
+    deny_only_assets = deny_only_raw
+    if len(deny_only_assets) != len(set(deny_only_assets)):
+        _fail("attack-matrix.deny_only_assets contains duplicates")
+    for asset_id in deny_only_assets:
+        _nonempty_string(asset_id, "attack-matrix.deny_only_assets[]")
+        if asset_id not in asset_ids:
+            _fail(f"deny-only asset is not in registry coverage: {asset_id}")
+    expected_deny_only = sorted(R9_DENY_ONLY_ASSET_IDS.intersection(asset_ids))
+    if deny_only_assets != expected_deny_only:
+        _fail(
+            "attack-matrix.deny_only_assets does not match the declared legacy "
+            f"boundary: expected {expected_deny_only}, got {deny_only_assets}"
+        )
     for asset_id in asset_ids:
         _nonempty_string(asset_id, "attack-matrix.registry_asset_ids[]")
         for operation in R9_MUTATIONS:

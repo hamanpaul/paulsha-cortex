@@ -1,1 +1,1 @@
-修正 Phase 2 Docker RC qualification：R9 攻擊矩陣依 trust-root `writer_accounts` 驗證合法 producer 寫入，並把 registry 推導的父層 traverse ACL 納入 transactional install plan；新增 exact-plan 與授權 mutation regression tests。
+修正 Phase 2 Docker RC qualification：R9 攻擊矩陣依 trust-root `writer_accounts` 驗證合法 producer 寫入，並把 registry 推導的父層 traverse ACL 納入 transactional install plan；`review-verdict` 明確列為 Phase 2a legacy deny-only asset，權威通道維持 `review-verdict-spool`；rootless Docker probe restore 採合成 owner 還原；新增 exact-plan、授權 mutation 與 legacy 邊界 regression tests。
