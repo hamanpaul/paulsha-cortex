@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from paulsha_cortex.coordinator import job_runner
+
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -1231,7 +1233,11 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         user="cortex-gate",
         argv=("/usr/bin/systemctl", "start", "cortex-job@r9.service"),
     )
-    legal_instance = "qualification-negctl"
+    # Production keeps the raw registry identity separate from the systemd
+    # template instance. Derive `%i` through the same helper so every mounted
+    # per-job surface uses the exact instance string.
+    legal_job_id = "qualification-negctl"
+    legal_instance = job_runner.template_instance_id(legal_job_id)
     legal_workspace = Path(f"/var/lib/cortex/worktree/{legal_instance}")
     legal_log = Path(
         f"/var/lib/cortex/coordinator/commit-spool/build-logs/{legal_instance}/job.jsonl"
@@ -1247,10 +1253,11 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     # spec rather than the deployed builder contract.
     prepare_runtime_code = (
         "from paulsha_cortex.coordinator import spool_slot, job_workspace\n"
+        f"job_id={legal_job_id!r}\n"
         f"instance={legal_instance!r}\n"
         "job_workspace.prepare_commit_spool(spool_key=instance)\n"
         "spool_slot.provision_runtime_surfaces(\n"
-        "    principal='builder', job_id=instance,\n"
+        "    principal='builder', job_id=job_id,\n"
         "    canonical_codex_home=spool_slot.canonical_codex_controls(\n"
         "        'builder', manager_env=__import__('os').environ),\n"
         "    account='cortex-builder')\n"
@@ -1266,13 +1273,14 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     spec_code = (
         "from paulsha_cortex.coordinator import job_runner\n"
         "from paulsha_cortex.coordinator.job_workspace import prepare_job_log_spool\n"
+        f"job_id={legal_job_id!r}\n"
         f"instance={legal_instance!r}\n"
         f"workspace={str(legal_workspace)!r}\n"
         "canonical_log=prepare_job_log_spool("
         "principal_id='builder', spool_key=instance, manager_log_path="
         f"{str(legal_log)!r})\n"
         "spec=job_runner.build_job_spec("
-        "job_id=instance, instance=instance, unit=f'cortex-job@{instance}.service',"
+        "job_id=job_id, instance=instance, unit=f'cortex-job@{instance}.service',"
         "command=['/usr/bin/id'], working_directory=workspace,"
         "log_path=str(canonical_log), env={'HOME':'/var/lib/cortex-builder','PATH':'/usr/bin:/bin'})\n"
         "job_runner.write_job_spec(job_runner.job_spec_path(job_runner.DEFAULT_JOB_SPEC_SPOOL, instance), spec, account='cortex-builder')\n"

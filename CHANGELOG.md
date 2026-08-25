@@ -8,6 +8,7 @@
 ## [Unreleased]
 
 - **Phase 2 Docker RC credential projection**：protected Codex credential import 後再次執行 production `trust_root scaffold`，以短暫非機密 reviewer optional fixture 維持 scaffold contract，並把新憑證投影到 Manager-owned canonical authority，讓後續 legal builder runtime provisioning 使用實際部署 authority。
+- **Phase 2 Docker RC legal-job identity**：qualification harness now derives the systemd template instance from the raw job identity through the production helper, keeping `%i` and every per-job writable surface byte-for-byte aligned.
 
 - **Phase 2 Docker RC qualification 修正**：R9 現在依 trust-root `writer_accounts` 驗證合法 producer mutation，transactional install plan 同步套用 registry 推導的父層 traverse ACL，避免合法 spool／worktree 寫入被 0700 parent 錯誤阻擋。
 
