@@ -131,7 +131,7 @@ docker exec "$container_name" sh -eu -c '
     for account in cortex-builder cortex-reviewer-planner; do
         install -d -o root -g root -m 0755 "/var/lib/$account/.codex/plugins" "/var/lib/$account/.codex/skills"
         printf "%s\n" "# qualification control fixture" > "/var/lib/$account/.codex/config.toml"
-        printf "%s\n" "{}" > "/var/lib/$account/.codex/hooks.json"
+        test -f "/var/lib/$account/.codex/hooks.json"
     done
     python3 -m paulsha_cortex.trust_root scaffold | sh -eu
 '
