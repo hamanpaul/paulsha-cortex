@@ -1233,17 +1233,23 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     )
     legal_instance = "qualification-negctl"
     legal_workspace = Path(f"/var/lib/cortex/worktree/{legal_instance}")
-    legal_log = legal_workspace / "identity.log"
+    legal_log = Path(
+        f"/var/lib/cortex/coordinator/commit-spool/build-logs/{legal_instance}/job.jsonl"
+    )
     legal_workspace.mkdir(mode=0o700, exist_ok=False)
     os.chown(legal_workspace, builder.pw_uid, builder.pw_gid)
     spec_code = (
         "from paulsha_cortex.coordinator import job_runner\n"
+        "from paulsha_cortex.coordinator.job_workspace import prepare_job_log_spool\n"
         f"instance={legal_instance!r}\n"
         f"workspace={str(legal_workspace)!r}\n"
+        "canonical_log=prepare_job_log_spool("
+        "principal_id='builder', spool_key=instance, manager_log_path="
+        f"{str(legal_log)!r})\n"
         "spec=job_runner.build_job_spec("
         "job_id=instance, instance=instance, unit=f'cortex-job@{instance}.service',"
         "command=['/usr/bin/id'], working_directory=workspace,"
-        f"log_path={str(legal_log)!r}, env={{'HOME':'/var/lib/cortex-builder','PATH':'/usr/bin:/bin'}})\n"
+        "log_path=str(canonical_log), env={'HOME':'/var/lib/cortex-builder','PATH':'/usr/bin:/bin'})\n"
         "job_runner.write_job_spec(job_runner.job_spec_path(job_runner.DEFAULT_JOB_SPEC_SPOOL, instance), spec, account='cortex-builder')\n"
     )
     manager_runtime_env = _installed_runtime_env()
@@ -1287,6 +1293,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         missing_ok=True
     )
     legal_log.unlink(missing_ok=True)
+    legal_log.parent.rmdir()
     legal_workspace.rmdir()
     for case_id, root in (
         ("T5.7-no-gate-files-in-source-worktree", Path("/var/lib/cortex/worktree")),
