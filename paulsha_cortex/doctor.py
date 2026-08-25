@@ -666,6 +666,22 @@ def _unit_environment_files(path: Path, *, home: Path) -> tuple[tuple[Path, bool
     return tuple(files)
 
 
+def _authoritative_bootstrap_env(
+    env_files: tuple[tuple[Path, bool], ...],
+    *,
+    home: Path,
+    instance: str,
+) -> Path:
+    legacy = home / ".agents" / "core" / "runtime" / f"{instance}-manager.env"
+    declared = {path for path, _optional in env_files}
+    if legacy in declared:
+        return legacy
+    required = [path for path, optional in env_files if not optional]
+    if len(required) != 1:
+        raise ValueError("managed bootstrap EnvironmentFile missing")
+    return required[0]
+
+
 def _parse_environment_file(path: Path) -> dict[str, str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -726,10 +742,9 @@ def _load_bootstrap_environment(
     )
     if manager_files != monitor_files:
         raise ValueError("manager/monitor EnvironmentFile order differs")
-    bootstrap_env = home / ".agents" / "core" / "runtime" / f"{instance}-manager.env"
-    if bootstrap_env not in {path for path, _optional in manager_files} or not bootstrap_env.is_file():
-        raise ValueError("managed bootstrap EnvironmentFile missing")
+    bootstrap_env = _authoritative_bootstrap_env(manager_files, home=home, instance=instance)
     effective = dict(base_env)
+    loaded_files: set[Path] = set()
     for env_path, optional in manager_files:
         if not env_path.exists():
             if optional:
@@ -738,6 +753,9 @@ def _load_bootstrap_environment(
         if env_path.is_symlink() or not env_path.is_file():
             raise ValueError("EnvironmentFile must be a regular non-symlink file")
         effective.update(_parse_environment_file(env_path))
+        loaded_files.add(env_path)
+    if bootstrap_env not in loaded_files:
+        raise ValueError("managed bootstrap EnvironmentFile missing")
     effective = _runtime_defaults(effective, home=home, instance=instance)
     roots = ("PSC_AGENTS_ROOT", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT", "PSC_PROJECT_CONFIG_ROOT")
     if any(not Path(effective[name]).expanduser().is_absolute() for name in roots):
