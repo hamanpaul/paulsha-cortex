@@ -739,7 +739,21 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             "*", "qualification-probe"
         )
         authority = Path(concrete)
-        container = authority if asset.get("is_directory") else authority.parent
+        if deny_only:
+            # The legacy verdict row points at a job-visible file shape whose
+            # placeholder is shared with the builder worktree in the static
+            # registry.  Its Phase 2b authority is intentionally absent; use a
+            # reviewer-owned disposable parent so the R9 probe cannot inherit
+            # the builder ACL from the runtime worktree fixture.
+            container = Path(
+                "/var/lib/cortex-reviewer-planner/.cortex-r9-review-verdict"
+            )
+            container.mkdir(mode=0o700, exist_ok=True)
+            reviewer = pwd.getpwnam("cortex-reviewer-planner")
+            os.chown(container, reviewer.pw_uid, reviewer.pw_gid)
+            os.chmod(container, 0o700)
+        else:
+            container = authority if asset.get("is_directory") else authority.parent
         if not container.is_dir() or container.is_symlink():
             raise QualificationFailure(f"durable asset container is absent: {asset_id}")
         suffix = hashlib.sha256(asset_id.encode()).hexdigest()[:16]
@@ -784,15 +798,15 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             raise QualificationFailure(
                 f"durable asset probe owner is not an installed account: {asset_id}"
             ) from exc
-        os.chown(target, owner.pw_uid, owner.pw_gid)
+        os.chown(target, owner.pw_uid if not deny_only else 0, owner.pw_gid if not deny_only else 0)
         raw_mode = asset.get("mode")
         if not isinstance(raw_mode, str) or re.fullmatch(r"[0-7]{4,5}", raw_mode) is None:
             raise QualificationFailure(f"durable asset mode is invalid: {asset_id}")
-        os.chmod(target, int(raw_mode, 8) & 0o777)
+        os.chmod(target, 0o600 if deny_only else int(raw_mode, 8) & 0o777)
         raw_acls = asset.get("acls", [])
         if not isinstance(raw_acls, list):
             raise QualificationFailure(f"durable asset ACL inventory is invalid: {asset_id}")
-        for row in raw_acls:
+        for row in (() if deny_only else raw_acls):
             if not isinstance(row, Mapping) or row.get("default") is True:
                 continue
             account = row.get("account")
@@ -852,9 +866,13 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                         restore,
                         f"R9 owner restore for {asset_id}/{target_owner_name}",
                     )
-                    os.chown(target, owner.pw_uid, owner.pw_gid)
-                    os.chmod(target, int(raw_mode, 8) & 0o777)
-                    for row in raw_acls:
+                    os.chown(
+                        target,
+                        owner.pw_uid if not deny_only else 0,
+                        owner.pw_gid if not deny_only else 0,
+                    )
+                    os.chmod(target, 0o600 if deny_only else int(raw_mode, 8) & 0o777)
+                    for row in (() if deny_only else raw_acls):
                         if not isinstance(row, Mapping) or row.get("default") is True:
                             continue
                         account = row.get("account")
