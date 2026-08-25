@@ -743,14 +743,14 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             # The legacy verdict row points at a job-visible file shape whose
             # placeholder is shared with the builder worktree in the static
             # registry.  Its Phase 2b authority is intentionally absent; use a
-            # reviewer-owned disposable parent so the R9 probe cannot inherit
-            # the builder ACL from the runtime worktree fixture.
+            # root-owned protected parent so the R9 probe cannot inherit the
+            # builder ACL from the runtime worktree fixture or give the
+            # reviewer a directory-level delete capability.
             container = Path(
                 "/var/lib/cortex-reviewer-planner/.cortex-r9-review-verdict"
             )
             container.mkdir(mode=0o700, exist_ok=True)
-            reviewer = pwd.getpwnam("cortex-reviewer-planner")
-            os.chown(container, reviewer.pw_uid, reviewer.pw_gid)
+            os.chown(container, 0, 0)
             os.chmod(container, 0o700)
         else:
             container = authority if asset.get("is_directory") else authority.parent
