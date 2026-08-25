@@ -196,6 +196,15 @@ import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy /run/oauth_creds.json
 import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
 import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
 
+# The protected Codex import lands in the account's legacy ``~/.codex`` path.
+# Run the same production scaffold once more so that this newly supplied
+# credential is projected into the Manager-owned canonical authority consumed
+# by ``spool_slot.provision_runtime_surfaces``. Existing control trees and
+# generated hooks are already present, so the scaffold is idempotent here and
+# does not replace them.
+docker exec "$container_name" sh -eu -c \
+    'python3 -m paulsha_cortex.trust_root scaffold | sh -eu'
+
 docker exec "$container_name" cortex install trust-root activate --receipt "$receipt_path"
 install_evidence_path=$qualification_root/install-verification.json
 docker exec \

@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **Phase 2 Docker RC credential projection**：protected Codex credential import 後再次執行 production `trust_root scaffold`，把新憑證投影到 Manager-owned canonical authority，讓後續 legal builder runtime provisioning 使用實際部署 authority。
+
 - **Phase 2 Docker RC qualification 修正**：R9 現在依 trust-root `writer_accounts` 驗證合法 producer mutation，transactional install plan 同步套用 registry 推導的父層 traverse ACL，避免合法 spool／worktree 寫入被 0700 parent 錯誤阻擋。
 
 - **Phase 2 Docker RC qualification 邊界固化**：`review-verdict` 僅保留為 Phase 2a legacy fallback，R9 將其列為 deny-only asset，權威寫入路徑固定為 `review-verdict-spool`；job-visible 的 manager-only `handoff-manifest` 與 legacy verdict probe 各自使用隔離 parent，避免 builder worktree default ACL 汙染測試；rootless Docker fixture 的 restore 也改由合成 owner 還原，不放寬 production ACL。
