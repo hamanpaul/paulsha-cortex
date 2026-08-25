@@ -20,6 +20,25 @@ from paulsha_cortex.coordinator.launcher import (
 
 
 class ArgvTests(unittest.TestCase):
+    def test_srt_runtime_root_resolves_regular_jitless_toolchain_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "toolchain"
+            wrapper = root / "bin" / "srt"
+            package = root / "lib" / "srt"
+            wrapper.parent.mkdir(parents=True)
+            package.mkdir(parents=True)
+            wrapper.write_text(
+                '#!/bin/sh\nexec /usr/bin/node --jitless "..." "$@"\n',
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            (package / "package.json").write_text(
+                json.dumps({"name": "@anthropic-ai/sandbox-runtime"}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"PATH": str(wrapper.parent)}, clear=False):
+                self.assertEqual(launcher_module._srt_runtime_root(), package)
+
     def test_copilot_argv(self) -> None:
         argv = build_copilot_argv(prompt="PROMPT", slice_id="slice-a", log_dir="/lg")
         self.assertEqual(argv[0], "copilot")
@@ -32,6 +51,72 @@ class ArgvTests(unittest.TestCase):
         self.assertIn("json", argv)
         self.assertEqual(argv.count("--effort"), 1)
         self.assertEqual(argv[argv.index("--effort") + 1], "xhigh")
+
+    def test_copilot_verdict_spool_grants_exact_file_and_read_only_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            candidate = root / "candidate"
+            spool = root / "review-verdicts" / "reviewer-job"
+            spool.mkdir(parents=True)
+
+            argv = build_copilot_argv(
+                prompt="P",
+                slice_id="reviewer-job",
+                log_dir=str(root / "logs"),
+                worktree=str(candidate),
+                model="gpt-5.4",
+                verdict_spool_dir=str(spool),
+            )
+
+            grants = [
+                argv[index + 1]
+                for index, value in enumerate(argv)
+                if value == "--allow-tool"
+            ]
+            self.assertEqual(
+                grants,
+                [
+                    f"write({spool.resolve() / 'verdict.json'})",
+                    "shell(rg:*)",
+                    "shell(python3:*)",
+                ],
+            )
+            self.assertNotIn("--add-dir", argv)
+            for broad_flag in ("--allow-all", "--allow-all-tools", "--allow-all-paths"):
+                self.assertNotIn(broad_flag, argv)
+            self.assertNotIn(f"write({candidate.resolve()})", grants)
+
+            baseline = build_copilot_argv(
+                prompt="P",
+                slice_id="reviewer-job",
+                log_dir=str(root / "logs"),
+                worktree=str(candidate),
+                model="gpt-5.4",
+            )
+            without_grants: list[str] = []
+            index = 0
+            while index < len(argv):
+                if argv[index] == "--allow-tool":
+                    index += 2
+                    continue
+                without_grants.append(argv[index])
+                index += 1
+            self.assertEqual(without_grants, baseline)
+
+    def test_copilot_verdict_spool_rejects_broad_permission_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            spool = Path(d) / "spool"
+            spool.mkdir()
+            for kwargs in ({"allow_unsafe": True}, {"commit_required": True}):
+                with self.assertRaisesRegex(ValueError, "broad workspace permissions"):
+                    build_copilot_argv(
+                        prompt="P",
+                        slice_id="reviewer-job",
+                        log_dir=str(Path(d) / "logs"),
+                        worktree=str(Path(d) / "candidate"),
+                        verdict_spool_dir=str(spool),
+                        **kwargs,
+                    )
 
     def test_copilot_builder_commit_required_scopes_tool_and_git_write_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as d:

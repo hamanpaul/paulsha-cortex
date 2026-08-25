@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hamanpaul/paulsha-cortex/qualification/qualification.schema.json",
+  "title": "Cortex Phase 2 release qualification evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "candidate_sha",
+    "wheel",
+    "bundle",
+    "image",
+    "services",
+    "providers",
+    "tests",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"enum": ["passed", "failed", "skipped"]},
+    "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "wheel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.+-]+\\.whl$"
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest"],
+      "properties": {
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "services": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "uid", "gid", "active"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "uid": {"type": "integer", "minimum": 0},
+          "gid": {"type": "integer", "minimum": 0},
+          "active": {"type": "boolean"}
+        }
+      }
+    },
+    "providers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provider",
+          "requested_model",
+          "runtime_model",
+          "requested_effort",
+          "runtime_effort",
+          "status",
+          "quota",
+          "fallback"
+        ],
+        "properties": {
+          "provider": {"type": "string", "minLength": 1},
+          "requested_model": {"type": "string", "minLength": 1},
+          "runtime_model": {"type": "string", "minLength": 1},
+          "requested_effort": {"type": "string", "minLength": 1},
+          "runtime_effort": {"type": "string", "minLength": 1},
+          "status": {"enum": ["passed", "failed", "skipped"]},
+          "quota": {"enum": ["available", "unavailable", "exhausted", "unknown"]},
+          "fallback": {"type": "boolean"}
+        }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "status": {"enum": ["passed", "failed", "skipped"]}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+$"
+          },
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

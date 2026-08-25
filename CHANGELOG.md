@@ -7,9 +7,52 @@
 
 ## [Unreleased]
 
+- **Foreign-review verdict spool path hardening**：launcher 現在要求 verdict spool 是已存在的
+  實體目錄，並拒絕 symlink ancestor，避免 sandbox grant 被父層 redirect 導出
+  Manager-owned spool；relative、leaf symlink 與 review-only grant 仍維持 fail-closed。
+- **CI trust-root OS fixtures**：Tests workflow 的每個 Python matrix job 現在先安裝
+  `acl`，建立 `cortex-builder`、`cortex-reviewer-planner`、`cortex-manager`、
+  `cortex-gate` system accounts 與 account-owned、runner 可解析的 `0755` HOME，讓
+  `setfacl`／`pwd` 的 CI 前提與部署 qualification 一致；production trust-root HOME
+  仍維持 `0700`，避免環境缺口造成假紅。
+- **#665 trust-root service runtime hardening**：`srt` 與 `openspec` 的 root-owned toolchain
+  wrapper 固定使用 `/usr/bin/node --jitless`，保留 reviewer／Manager 的
+  `MemoryDenyWriteExecute=yes`，並以 registry 機械標記該兩個 service surface 已收斂；
+  protected RC 仍須在真實 systemd unit 驗證。
+- **#692：downgraded job 的 HOME 契約改為 fail-closed**：launch 前拒絕 missing/blank/relative/symlink/wrong-owner HOME，PATH+HOME 雙缺會一併點名，shim 也不再回退到 unit/daemon HOME；HOME `lstat` 診斷不以 chained traceback 洩漏路徑。
+- **Phase 2 Docker RC credential projection**：protected Codex credential import 後再次執行 production `trust_root scaffold`，以短暫非機密 reviewer optional fixture 維持 scaffold contract，並把新憑證投影到 Manager-owned canonical authority，讓後續 legal builder runtime provisioning 使用實際部署 authority。
+- **Phase 2 Docker RC legal-job identity**：qualification harness now derives the systemd template instance from the raw job identity through the production helper, keeping `%i` and every per-job writable surface byte-for-byte aligned.
+- **Phase 2 Docker RC AGY preflight**：AGY 1.1.18 now uses its machine-readable `/quota` response for live quota validation instead of rejecting the supported slash-command path as an unknown status subcommand.
+- **Phase 2 Docker RC Codex preflight**：Codex 0.149.0 now uses the pinned app-server JSON-RPC `account/read` and `account/rateLimits/read` contract, validating authenticated account and usable rate-limit windows without inferring quota from `doctor --json`.
+- **Phase 2 Docker RC Copilot preflight**：Copilot 1.0.80 now uses its pinned headless SDK server JSON-RPC `account.getCurrentAuth` and `account.getQuota` contract, rejecting absent or exhausted snapshots without relying on interactive output.
+
+- **Phase 2 Docker RC qualification 修正**：R9 現在依 trust-root `writer_accounts` 驗證合法 producer mutation，transactional install plan 同步套用 registry 推導的父層 traverse ACL，避免合法 spool／worktree 寫入被 0700 parent 錯誤阻擋。
+
+- **Phase 2 Docker RC qualification 邊界固化**：`review-verdict` 僅保留為 Phase 2a legacy fallback，R9 將其列為 deny-only asset，權威寫入路徑固定為 `review-verdict-spool`；job-visible 的 manager-only `handoff-manifest` 與 legacy verdict probe 各自使用隔離 parent，避免 builder worktree default ACL 汙染測試；rootless Docker fixture 的 restore 也改由合成 owner 還原，不放寬 production ACL。
+
+- **Phase 2 Docker RC qualification systemd 穩定性**：T3 每次 enforcement probe restart 前重置 Manager 的 start-rate counter，避免連續合法 restart 觸發 `StartLimitBurst` 造成 harness 假紅。
+
+- **Phase 2 Docker RC qualification legal-job probe**：gate Manager negative control 改用 production `prepare_job_log_spool()` 預建 canonical `job.jsonl`，讓 namespace probe 與實際 builder template contract 一致。
+- **Phase 2 Docker RC qualification legal-job surfaces**：legal builder control 啟動前改用 production `prepare_commit_spool()` 與 `provision_runtime_surfaces()` 建立 commit、monitor event、Codex home/cache 與 job-log per-job surfaces，確保實際 systemd template namespace 完整。
+- **Phase 2 Docker RC qualification Codex controls**：reference container 在首次 installer apply 建立帳號後，以非機密 root-owned legacy fixture（保留 installer 產生的 enforcement `hooks.json`，並在 scaffold 後清除 canonical 與 legacy placeholder credential authority）執行 production `trust_root scaffold`，讓 real template 的 Codex read-only bindings 有完整 deployment input；真正 credential 仍只走 protected stdin import。
+
+- **Copilot foreign-review verdict spool permissions are now file-scoped**：headless
+  reviewer argv 只授予 exact `verdict.json`、`rg` 與 `python3` checks，不再以整個
+  spool directory 或 broad bypass flags 放行。
+
+- **#501 修復 verification contract hash 被 evidence hash 覆寫**：slice registry 將 pinned
+  contract hash 與 current verification evidence hash 分欄保存；verification/status evidence
+  不再污染 pinned contract，既有被覆寫的 state row 會在載入時可判定地復原。
+
+- Preserve exact template-instance authority during isolated Codex credential
+  harvest in the Trust-root Phase 2 runtime path, joining persisted instances
+  byte-for-byte while keeping raw job-id fallback separate for legacy callers.
+
 - **#623:** doctor 的 service-path discovery 現在接受 generated trust-root
-  manager/monitor units 所宣告的受保護 deploy `EnvironmentFile`，維持 repo/runtime
-  identity 可見，並對缺失、分歧或不可驗證的安裝狀態維持 fail-closed。
+   manager/monitor units 所宣告的受保護 deploy `EnvironmentFile`，維持 repo/runtime
+   identity 可見，並對缺失、分歧或不可驗證的安裝狀態維持 fail-closed。
+ - **#692 repair:** per-job workspace ACL provisioning now applies access and default ACLs as separate recursive commands, matching the generated permgen order and avoiding `setfacl` portability failures.
+- **#763 repair:** trust-root 現在會為 Manager 產生 GitHub HTTPS credential helper，hermetic regression coverage 會驗證 `https://github.com` 的精確 lookup scope，且 `recover-repair-commit` 只採信授權 gate ledger handoff 的完整 `worktree_state`，缺席或半套 state 一律 fail-closed。
 - **#718 repair:** prompt slots now live below a Manager-owned, non-renameable per-principal root with durable prelaunch cleanup tracking; typed runtime metadata governs Codex harvest and direct/non-Codex lanes cannot enter it.
 - **#718 repair:** template-job harvest now persists the exact Manager-issued runtime instance as durable spool authority, consumes only that validated slot byte-for-byte, and fails closed instead of re-deriving from internal job ids or sibling paths.
 - **#718 repair:** canonical Codex migration now copies only `config.toml`, `hooks.json`, `plugins/`, and `skills/`, rejects symlink/special descendants, atomically installs normalized root-owned 0644/0755 controls, and generated builder/reviewer units publish atomic `auth.json` refreshes with a named Manager read ACL before harvest.

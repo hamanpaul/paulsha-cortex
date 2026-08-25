@@ -214,6 +214,7 @@ __all__ = [
     "resolve_hardening_profile",
     "resolve_job_account",
     "resolve_job_group",
+    "resolve_job_home",
     "resolve_job_path",
     "resolve_prompt_spec_spool",
     "resolve_job_spec_spool",
@@ -963,8 +964,9 @@ BUILDER_FORWARDED_ENV: tuple[ForwardedEnvVar, ...] = (
 #: - `PSC_REPO_ROOT`：relay hook 的 script 解析點，以及 wrapper 內 gate ledger writer
 #:   的 `PYTHONPATH`。Phase 2b 之後它指向 root-owned 部署樹，builder 唯讀。
 #: - `PSC_RELAY_TARGET`：僅在 launcher 有設定時才出現（與 direct 模式同條件）。
-#: - `HOME`：僅在 `PSC_BUILDER_HOME` 明示時才設；未設時交給 systemd 依 passwd 填入
-#:   builder 帳號自己的 HOME。**任何情況下都不會是 daemon 的 HOME。**
+#: - `HOME`：由本角色的 `PSC_*_HOME` 宣告，#692 起與 `PATH` 同樣 fail-closed；
+#:   模板模式下 shim 以 `execvpe(..., env)` 整份換掉環境，unit 的 `Environment=HOME=`
+#:   到不了模型。**任何情況下都不會是 daemon 的 HOME。**
 #: - `PATH`：#679 起由 :func:`resolve_job_path` 從**本角色的** `PSC_*_PATH` 算出，
 #:   未宣告即 fail-closed。**它以前在轉發類白名單上，那是本票真正的 fail-open**：
 #:   未宣告時 job 靜默拿到 **Manager daemon 的** `PATH`——一個沒有人為「job 該解到
@@ -997,7 +999,10 @@ BUILDER_SYNTHESIZED_ENV = (
 #: - `VIRTUAL_ENV`／`PYTHONHOME`：指向 Manager 的部署 venv；builder 的 python 應由
 #:   PATH 決定，不該被綁進 Manager 的 venv。
 EXCLUDED_ENV_RATIONALE: Mapping[str, str] = {
-    "HOME": "systemd 依 passwd 填入 builder 自己的 HOME；daemon 的 HOME 絕不轉發",
+    "HOME": (
+        "daemon 的 HOME 絕不轉發；job 的 HOME 只能由本角色的 PSC_*_HOME 宣告，再由 "
+        "spec 的 env 帶進模型（unit 的 Environment=HOME= 到不了模型）"
+    ),
     "PATH": (
         "#679：daemon 的 PATH 絕不轉發——它帶著 <deploy_root>/venv/bin，且是否含 "
         "toolchain 全看那台機器被手動加過什麼。job 的 PATH 只由本角色的 "
@@ -1255,6 +1260,134 @@ def resolve_job_path(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUI
     return value
 
 
+def _home_contract_hint(config: JobRoleConfig) -> str:
+    flag = _UNIT_FLAG_HINT.get(config.role_id, "--job")
+    return (
+        "請在 Manager 的 root-owned EnvironmentFile 宣告（值由產生器導出，不要手打）："
+        f"`python3 -m paulsha_cortex.trust_root unit four-way {flag} | grep "
+        f"'^#      {config.home_env}='`；同一份 unit 的 `Environment=HOME=` 也必須逐字對齊"
+    )
+
+
+def _assess_home_path(value: str) -> tuple[str | None, os.stat_result | None]:
+    """Validate HOME shape and return its lstat result for owner checking.
+
+    ``missing`` is deliberately returned for an absolute path that does not
+    exist.  ``resolve_job_home`` must keep that result fail-closed instead of
+    treating a missing directory as an owner-check bypass.
+    """
+
+    if not value:
+        return "undeclared", None
+    if not value.startswith("/"):
+        return "not-absolute", None
+    try:
+        exists = os.path.lexists(value)
+    except OSError:
+        return "unstatable", None
+    if not exists:
+        return "missing", None
+    try:
+        stat_result = os.lstat(value)
+    except OSError:
+        return "unstatable", None
+    if stat.S_ISLNK(stat_result.st_mode):
+        return "symlink", None
+    if not stat.S_ISDIR(stat_result.st_mode):
+        return "not-directory", None
+    return None, stat_result
+
+
+def resolve_job_home(manager_env: Mapping[str, str], *, role: str = JOB_ROLE_BUILDER) -> str:
+    """解析本角色的 job `HOME`。#692 起與 `PATH` 同樣 fail-closed。"""
+
+    config = resolve_job_role(role)
+    value = (manager_env.get(config.home_env) or "").strip()
+    account = resolve_job_account(manager_env, role=config.role_id)
+    account_ids = _account_ids(account)
+    if account_ids is None:
+        # `_account_ids()` 的 None 不是「沒有 expected uid，跳過 owner check」；
+        # 它是無法驗證 trust root 的 fail-closed 結果。先收斂成問題，再評估
+        # 路徑，避免任何 HOME 形狀把 owner 驗證繞過。
+        problem = "account-unresolved"
+        stat_result = None
+    else:
+        problem, stat_result = _assess_home_path(value)
+        if (
+            problem is None
+            and stat_result is not None
+            and stat_result.st_uid != account_ids[0]
+        ):
+            problem = "owner-mismatch"
+    if problem is None:
+        return value
+    hint = _home_contract_hint(config)
+    if problem == "undeclared":
+        detail = (
+            f"{config.home_env} 未宣告——{config.role_id} job 會拿不到 HOME。job spec 的 env "
+            "就是 job 的完整環境（shim 以 execvpe 整份換掉），少了 HOME 時模型會在更深處以 "
+            "`$HOME is not defined`／`Not logged in` 收場。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-undeclared"
+    elif problem == "not-absolute":
+        detail = (
+            f"{config.home_env} 必須是絕對路徑的 per-principal HOME；relative path 會讓 job "
+            "state 落到不可稽核的位置。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-not-absolute"
+    elif problem == "missing":
+        detail = (
+            f"{config.home_env} 指向的 HOME 目錄不存在——這代表 root-owned "
+            "EnvironmentFile 與部署樹不同步。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-missing"
+    elif problem == "account-unresolved":
+        detail = (
+            f"{config.home_env} 的 owner 無法驗證——帳號 {account} 不在 passwd，"
+            f"在能逐字確認這格 HOME 屬於 {account} 之前，{config.role_id} job 不得起跑。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-account-unresolved"
+    elif problem == "unstatable":
+        detail = (
+            f"{config.home_env} 指向的 HOME 目前無法判定型態或 owner；在沒有這個判準前 "
+            "job 不得起跑。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-unstatable"
+    elif problem == "symlink":
+        detail = (
+            f"{config.home_env} 不得是 symlink；job 的 `$HOME` 必須直指 principal 自己的 "
+            "真實目錄，不能外包到別的樹。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-symlink"
+    elif problem == "not-directory":
+        detail = (
+            f"{config.home_env} 必須指向目錄，不得是普通檔或特殊檔。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-not-directory"
+    else:
+        detail = (
+            f"{config.home_env} 的 owner 必須是 {account}；這一格 HOME 若屬於別人，job 的 "
+            "state / credentials 就會落在錯帳號的樹。"
+            f"{hint}"
+        )
+        reason = "job-runner-home-owner-mismatch"
+    raise _fail(
+        reason,
+        detail,
+        source="resolve_job_home",
+        role=config.role_id,
+        variable=config.home_env,
+        account=account,
+    )
+
+
 def git_workspace_trust_env(*, role: str, workspace: str | Path | None) -> dict[str, str]:
     """該角色對**這一格工作區**的 git 放行 env；不需要就回空 dict（#712）。
 
@@ -1350,33 +1483,42 @@ def build_job_env(
     **`PATH` 是必要鍵，不是選配**（#679）：未宣告 `PSC_*_PATH` 時
     :func:`resolve_job_path` 直接 raise。
 
-    **`HOME` 目前仍是選配，但它的舊理由在模板模式下是錯的（#686 實機更正）。**
-    本段原文寫著「`HOME` 未給時 systemd 依 passwd 填入該帳號自己的正確值（而且模板
-    unit 另有一行 `Environment=HOME=`）」——後半句對**模板模式**不成立：`cortex-job-shim`
-    以 `os.execvpe(command[0], command, job_env)` 把環境**整份換掉**
-    （`job_shim.resolve_job_env`），unit 的 `Environment=HOME=` 因此到不了模型行程。
-    0818 實機複驗：`PSC_REVIEWER_HOME` 未宣告 ⇒ 降權 planning job 的 agy 死在
-    `resolving log directory: getting home directory: $HOME is not defined`；補上該變數
-    之後同一條呼叫 rc=0。`PSC_BUILDER_HOME` 在實機**有**宣告，`PSC_REVIEWER_HOME`／
-    `PSC_GATE_HOME` 沒有——與 #679 的 PATH 是**同一個形狀**（builder 那一份被宣告過，
-    另外兩個角色沒有）。
-
-    為什麼本票不順手把它也改成 fail-closed：那會讓**所有角色**的既有派工在
-    EnvironmentFile 補齊之前當場失敗（gate 今天也沒有 `PSC_GATE_HOME`），屬於
-    #679 那種需要獨立票 ＋ runbook 升級程序的改動。本票只把事實記正確，並在
-    runbook 第 5-5c 步補上宣告步驟。
+    **`HOME` 現在與 `PATH` 同樣 fail-closed（#692）。** 模板模式下 `cortex-job-shim`
+    以 `os.execvpe(command[0], command, job_env)` 把環境**整份換掉**，unit 的
+    `Environment=HOME=` 因此到不了模型行程；`HOME` 只能來自 spec 的 env，而那份 env
+    只能由 Manager 端的 `PSC_*_HOME` 產生。0818 實機複驗：`PSC_REVIEWER_HOME`
+    未宣告 ⇒ 降權 planning job 的 agy 死在 `getting home directory: $HOME is not
+    defined`；補上該變數之後同一條呼叫 rc=0。#692 把它收成與 PATH 對稱：少了、空了、
+    相對路徑、symlink、或 owner 不符，一律在起跑前 fail-closed。
     """
 
     config = resolve_job_role(role)
+    path_declared = (manager_env.get(config.path_env) or "").strip()
+    home_declared = (manager_env.get(config.home_env) or "").strip()
+    if not path_declared and not home_declared:
+        raise _fail(
+            "job-runner-path-home-undeclared",
+            (
+                f"{config.path_env} 與 {config.home_env} 未宣告——{config.role_id} job 會同時拿不到 "
+                "PATH 與 HOME。PATH 少了時 execvpe 會退回 os.defpath（:/bin:/usr/bin）；"
+                "HOME 少了時模型會在更深處以 `$HOME is not defined`／`Not logged in` "
+                "收場。請在 Manager 的 root-owned EnvironmentFile 同時宣告這兩條（值由產生器"
+                "導出，不要手打）：`python3 -m paulsha_cortex.trust_root unit four-way "
+                f"{_UNIT_FLAG_HINT.get(config.role_id, '--job')} | grep '^Environment=PATH='`；"
+                f"`{config.home_env}=...` 必須與同一份 unit 的 `Environment=HOME=` 逐字對齊"
+            ),
+            source="build_job_env",
+            role=config.role_id,
+            path_variable=config.path_env,
+            home_variable=config.home_env,
+        )
     env: dict[str, str] = {}
     for forwarded in BUILDER_FORWARDED_ENV:
         value = manager_env.get(forwarded.name)
         if value:
             env[forwarded.name] = value
     env["PATH"] = resolve_job_path(manager_env, role=config.role_id)
-    home = (manager_env.get(config.home_env) or "").strip()
-    if home:
-        env["HOME"] = home
+    env["HOME"] = resolve_job_home(manager_env, role=config.role_id)
     if config.role_id in (JOB_ROLE_BUILDER, JOB_ROLE_REVIEW):
         from .spool_slot import canonical_job_slot, writable_surface
 

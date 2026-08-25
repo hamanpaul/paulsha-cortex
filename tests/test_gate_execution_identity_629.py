@@ -40,6 +40,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 from paulsha_cortex.config import paths
 from paulsha_cortex.coordinator import (
     gate_ledger,
@@ -68,6 +69,9 @@ _BASE_ENV = {
     # `PSC_GATE_PATH` 決定，未宣告即 fail-closed。
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
+    job_runner.BUILDER_HOME_ENV: BUILDER_HOME,
+    job_runner.REVIEWER_HOME_ENV: REVIEWER_HOME,
+    job_runner.GATE_HOME_ENV: GATE_HOME,
     "HOME": "/var/lib/cortex-manager",
     "LANG": "en_US.UTF-8",
     "PSC_REPO_ROOT": "/opt/cortex",
@@ -146,6 +150,7 @@ def _preflight_patches(binary: str = "/usr/bin/systemctl"):
         mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         mock.patch.object(job_runner, "_account_exists", return_value=True),
         mock.patch.object(job_runner, "_group_exists", return_value=True),
+        mock.patch.object(job_runner, "_account_ids", side_effect=fake_account_ids),
         mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
         mock.patch.object(job_runner, "_is_executable", return_value=True),
         mock.patch.object(job_runner, "_unit_is_active", return_value=False),

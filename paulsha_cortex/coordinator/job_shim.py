@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from typing import Mapping, Sequence
 
@@ -285,6 +286,28 @@ def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> d
     """
 
     env = {str(k): str(v) for k, v in dict(spec["env"]).items()}  # type: ignore[index]
+    home = (env.get("HOME") or "").strip()
+    if not home:
+        raise ShimError(
+            "job spec 的 env 沒有 HOME——模板 unit 的 `Environment=HOME=` 到不了模型，"
+            "也不得回退到 unit/daemon 的 HOME。請確認 Manager 端已宣告 "
+            "PSC_BUILDER_HOME／PSC_REVIEWER_HOME／PSC_GATE_HOME。"
+        )
+    if not home.startswith("/"):
+        raise ShimError("job spec 的 env 裡的 HOME 必須是絕對路徑")
+    try:
+        stat_result = os.lstat(home)
+    except FileNotFoundError:
+        # 不把缺少的 HOME 留給 child process；這裡是 shim 已經在做型態／
+        # 存取性驗證的最後一道邊界。訊息刻意不含未驗證的路徑。
+        raise ShimError("job spec 的 env 裡的 HOME 目錄不存在") from None
+    except OSError:
+        raise ShimError("job spec 的 env 裡的 HOME 目前無法判定型態或存取性") from None
+    if stat.S_ISLNK(stat_result.st_mode):
+        raise ShimError("job spec 的 env 裡的 HOME 不得是 symlink")
+    if not stat.S_ISDIR(stat_result.st_mode):
+        raise ShimError("job spec 的 env 裡的 HOME 必須指向目錄")
+    env["HOME"] = home
     _apply_egress_proxy_env(env, environ)
     if (env.get("PATH") or "").strip():
         return env

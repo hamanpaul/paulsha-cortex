@@ -1,0 +1,185 @@
+name: RC qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment: rc-qualification
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+
+      - name: Build exact wheel, wheelhouse, and bundle
+        id: candidate
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip build twine
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$CANDIDATE_SHA")"
+          python -m build --wheel
+          python -m twine check --strict dist/*.whl
+
+          mkdir -p \
+            qualification-input/dist \
+            qualification-input/source \
+            qualification-input/toolchain \
+            qualification-input/wheelhouse \
+            qualification-staging
+          cp dist/*.whl qualification-input/dist/
+          python -m pip download \
+            --only-binary=:all: \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --abi cp312 \
+            --dest qualification-input/wheelhouse \
+            dist/*.whl
+
+          [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]] || {
+            echo "::error::checkout HEAD does not match the workflow candidate SHA"
+            exit 1
+          }
+          git bundle create qualification-input/source/paulsha-cortex.bundle HEAD
+          git bundle verify qualification-input/source/paulsha-cortex.bundle
+
+          pack_npm() {
+            local package_spec=$1 expected_integrity=$2 destination=$3
+            local metadata observed_integrity filename
+            metadata=$(npm pack "$package_spec" --json --pack-destination qualification-staging)
+            observed_integrity=$(jq -er '.[0].integrity' <<<"$metadata")
+            filename=$(jq -er '.[0].filename' <<<"$metadata")
+            [[ "$observed_integrity" == "$expected_integrity" ]] || {
+              echo "::error::npm integrity mismatch for $package_spec"
+              exit 1
+            }
+            printf '%s\n' "qualification-staging/$filename" > "$destination"
+          }
+
+          pack_npm \
+            '@openai/codex@0.149.0-linux-x64' \
+            'sha512-uZXaN9JPxu0/jjnqqJeTd4kRYPnjVZK3MiVndfG1mHhEaoDKL7ScWHfPqvAEOjwsSDEmQSlMfUkmvYp/CHciYw==' \
+            qualification-staging/codex.path
+          pack_npm \
+            '@anthropic-ai/claude-code-linux-x64@2.1.239' \
+            'sha512-glj5zramK4ebmNa0EVx1iAtBfWHKnZ1q0Ti+1veMR4GHR9ttSranQoMIsLIuJUdRX/hErJnArjwe9hanuxE+dg==' \
+            qualification-staging/claude.path
+          pack_npm \
+            '@github/copilot-linux-x64@1.0.80' \
+            'sha512-qv1ytVNwA3IDK7kcQow+fAikD67t42+AQ8X42bK/7oudNiv4frVZMO0yh1DYIebVRcmEhmPvbVPY/ptVUK3cbA==' \
+            qualification-staging/copilot.path
+          pack_npm \
+            '@anthropic-ai/sandbox-runtime@0.0.73' \
+            'sha512-F608iUirrCqwvInZYGRRgJWDQj0tt6fNVE9aPagpotLJ5LhC4JbrMFIIZww5MFjb+HRCkpE0+xdI79c30tdVYg==' \
+            qualification-staging/srt.path
+          pack_npm \
+            '@fission-ai/openspec@1.10.0' \
+            'sha512-fuL3Rz7Jv+NnHeUM1XkbaXFo4bUdPttOWOC66/6SyfJr9rPOvGE47oBp+8XdDtPiiWZawa0Z9RDzGasetFu2eQ==' \
+            qualification-staging/openspec.path
+
+          tar -xzf "$(<qualification-staging/codex.path)" \
+            -O package/vendor/x86_64-unknown-linux-musl/bin/codex \
+            > qualification-input/toolchain/codex
+          tar -xzf "$(<qualification-staging/claude.path)" \
+            -O package/claude > qualification-input/toolchain/claude
+          tar -xzf "$(<qualification-staging/copilot.path)" \
+            -O package/copilot > qualification-input/toolchain/copilot
+          chmod 0755 qualification-input/toolchain/codex \
+            qualification-input/toolchain/claude qualification-input/toolchain/copilot
+
+          curl --fail --location --silent --show-error \
+            --output qualification-staging/agy.tar.gz \
+            https://github.com/google-antigravity/antigravity-cli/releases/download/1.1.18/agy_cli_linux_x64.tar.gz
+          printf '%s  %s\n' \
+            '1aa7e3c1f5ba02372d24ba2f99ed015c7135016becc7dcbb18bf8332f513a818' \
+            qualification-staging/agy.tar.gz | sha256sum --check --strict -
+          tar -xzf qualification-staging/agy.tar.gz -O antigravity \
+            > qualification-input/toolchain/agy
+          chmod 0755 qualification-input/toolchain/agy
+
+          npm install --ignore-scripts --omit=dev --no-audit --no-fund \
+            --prefix qualification-staging/srt \
+            "$(realpath "$(<qualification-staging/srt.path)")"
+          npm install --ignore-scripts --omit=dev --no-audit --no-fund \
+            --prefix qualification-staging/openspec \
+            "$(realpath "$(<qualification-staging/openspec.path)")"
+
+          mapfile -t candidate_wheels < <(find qualification-input/dist -maxdepth 1 -type f -name '*.whl' -print)
+          ((${#candidate_wheels[@]} == 1)) || {
+            echo "::error::exactly one candidate wheel must be built"
+            exit 1
+          }
+          python qualification/prepare_candidate.py \
+            --root qualification-input \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --wheel "${candidate_wheels[0]}" \
+            --tool-file codex,0.149.0,qualification-input/toolchain/codex \
+            --tool-file claude,2.1.239,qualification-input/toolchain/claude \
+            --tool-file copilot,1.0.80,qualification-input/toolchain/copilot \
+            --tool-file agy,1.1.18,qualification-input/toolchain/agy \
+            --tool-tree srt,0.0.73,qualification-staging/srt,node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js \
+            --tool-tree openspec,1.10.0,qualification-staging/openspec,node_modules/@fission-ai/openspec/bin/openspec.js \
+            --repository paulsha-cortex,"$CANDIDATE_SHA",https://github.com/hamanpaul/paulsha-cortex.git,qualification-input/source/paulsha-cortex.bundle
+          python qualification/write_install_config.py \
+            --bundle qualification-input/bundle.json \
+            --output qualification-input/install-config.yaml
+          python qualification/verify_bundle.py \
+            --bundle qualification-input/bundle.json \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --wheel-sha256 "$(sha256sum "${candidate_wheels[0]}" | awk '{print $1}')"
+
+          wheel_sha=$(sha256sum qualification-input/dist/*.whl | awk '{print $1}')
+          bundle_sha=$(sha256sum qualification-input/bundle.json | awk '{print $1}')
+          echo "wheel_sha256=$wheel_sha" >> "$GITHUB_OUTPUT"
+          echo "bundle_sha256=$bundle_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Run privileged systemd qualification
+        env:
+          CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
+          CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
+          CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
+          CORTEX_RC_PROBE_REPOSITORY: ${{ vars.CORTEX_RC_PROBE_REPOSITORY }}
+          CORTEX_RC_PROBE_WORK_ID: ${{ vars.CORTEX_RC_PROBE_WORK_ID }}
+          CORTEX_RC_PROBE_ISSUE: ${{ vars.CORTEX_RC_PROBE_ISSUE }}
+        run: |
+          set -euo pipefail
+          qualification/run.sh \
+            --artifacts qualification-input \
+            --candidate-sha "${{ github.sha }}" \
+            --wheel-sha256 "${{ steps.candidate.outputs.wheel_sha256 }}" \
+            --bundle-sha256 "${{ steps.candidate.outputs.bundle_sha256 }}" \
+            --output qualification-output
+          test -s qualification-output/qualification.json
+
+      - name: Fail closed on credential material in evidence
+        env:
+          CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
+          CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
+          CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
+        run: python qualification/redaction_scan.py qualification-output
+
+      - name: Upload exact candidate and redacted evidence
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: rc-qualification-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 3
+          path: |
+            qualification-input/bundle.json
+            qualification-input/dist/*.whl
+            qualification-input/wheelhouse/*
+            qualification-output/qualification.json
+            qualification-output/evidence/**

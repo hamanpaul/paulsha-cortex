@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from paulsha_cortex.coordinator import manager, work_actions
+from paulsha_cortex.coordinator import gate_ledger, manager, terminal_contract, work_actions
 from paulsha_cortex.coordinator.model_identities import IdentityRegistry
 from paulsha_cortex.coordinator.registry import JobRegistry
 from paulsha_cortex.coordinator.workflow import WorkflowStep
@@ -181,6 +181,8 @@ def _seed_failed_builder_job(
     base_head: str,
     status: str = "exited",
     exit_code: int = 1,
+    log_path: Path | None = None,
+    control_log_path: Path | None = None,
 ) -> dict:
     job = registry.create_job(
         task=f"seed-{run.run_id}",
@@ -201,6 +203,22 @@ def _seed_failed_builder_job(
         workflow_input_root=str(worktree),
         source_revision=run.source_revision,
     )
+    if log_path is not None or control_log_path is not None:
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("", encoding="utf-8")
+        if control_log_path is not None:
+            control_log_path.parent.mkdir(parents=True, exist_ok=True)
+            control_log_path.write_text("", encoding="utf-8")
+        job = registry.attach_launch_handle(
+            job["job_id"],
+            executor=str(job.get("executor") or ""),
+            model_id=str(job.get("model_id") or ""),
+            log_path=str(log_path) if log_path is not None else None,
+            control_log_path=(
+                str(control_log_path) if control_log_path is not None else None
+            ),
+        )
     registry.update_headless_result(job["job_id"], status=status, exit_code=exit_code)
     return registry.get_job(job["job_id"])
 
@@ -234,18 +252,46 @@ def _run_action(
     )
 
 
+def _write_gate_worktree_state(
+    job: dict,
+    *,
+    head: str,
+    dirty_total: int = 0,
+    dirty=(),
+    ancestry_baseline: str | None = None,
+    ancestry_ok: bool | None = None,
+) -> None:
+    ledger_path = terminal_contract.gate_ledger_path(str(job["log_path"]))
+    payload = {
+        "schema_version": terminal_contract.GATE_LEDGER_SCHEMA_VERSION,
+        "kind": terminal_contract.GATE_LEDGER_KIND,
+        "slice_id": "s",
+        "gates": [],
+        gate_ledger.WORKTREE_STATE_KEY: {
+            "head": head,
+            "dirty": list(dirty),
+            "dirty_total": dirty_total,
+            "probe": "ok",
+            "ancestry_baseline": ancestry_baseline,
+            "ancestry_ok": ancestry_ok,
+        },
+    }
+    Path(ledger_path).write_text(json.dumps(payload), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # recover-repair-commit
 # ---------------------------------------------------------------------------
 
 
-def test_recover_repair_commit_adopts_descendant_head_without_terminal_evidence(
+def test_recover_repair_commit_adopts_descendant_head_from_gate_ledger_without_terminal_evidence(
     tmp_path: Path,
 ) -> None:
     authority, snapshot = _authority(tmp_path)
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     claim_key = work_actions._expected_claim_key(authority)
     worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
     base_head = _init_repair_worktree(worktree)
     repaired_head = _commit_repair(worktree)
 
@@ -259,7 +305,17 @@ def test_recover_repair_commit_adopts_descendant_head_without_terminal_evidence(
         facets=("needs_human",),
     )
     failed_job = _seed_failed_builder_job(
-        registry, run=run, worktree=worktree, base_head=base_head
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head,
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
     )
 
     result = _run_action(
@@ -314,6 +370,7 @@ def test_recover_repair_commit_rejects_non_descendant_head(tmp_path: Path) -> No
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     claim_key = work_actions._expected_claim_key(authority)
     worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
     base_head = _init_repair_worktree(worktree)
     # 產生與 base_head 無共同祖先的 unrelated history。
     _git(["checkout", "-q", "--orphan", "unrelated"], worktree)
@@ -331,7 +388,19 @@ def test_recover_repair_commit_rejects_non_descendant_head(tmp_path: Path) -> No
         candidate_head=base_head,
         facets=("needs_human",),
     )
-    _seed_failed_builder_job(registry, run=run, worktree=worktree, base_head=base_head)
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=unrelated_head,
+        ancestry_baseline=base_head,
+        ancestry_ok=False,
+    )
 
     with pytest.raises(RuntimeError, match="descendant"):
         _run_action(
@@ -354,6 +423,7 @@ def test_recover_repair_commit_rejects_dirty_worktree(tmp_path: Path) -> None:
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     claim_key = work_actions._expected_claim_key(authority)
     worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
     base_head = _init_repair_worktree(worktree)
     repaired_head = _commit_repair(worktree)
     # worktree 有未 commit 的變更。
@@ -368,7 +438,21 @@ def test_recover_repair_commit_rejects_dirty_worktree(tmp_path: Path) -> None:
         candidate_head=base_head,
         facets=("needs_human",),
     )
-    _seed_failed_builder_job(registry, run=run, worktree=worktree, base_head=base_head)
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head,
+        dirty_total=1,
+        dirty=(" M fix.txt",),
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
+    )
 
     with pytest.raises(RuntimeError, match="clean worktree"):
         _run_action(
@@ -383,6 +467,311 @@ def test_recover_repair_commit_rejects_dirty_worktree(tmp_path: Path) -> None:
     assert unchanged.candidate_head == base_head
     assert unchanged.current_phase == "build"
     assert len(registry.list_jobs()) == 1
+
+
+def test_recover_repair_commit_uses_gate_ledger_worktree_state_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head,
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
+    )
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    result = _run_action(
+        snapshot=snapshot,
+        state=tmp_path / "runs.json",
+        registry=registry,
+        expected_run_id=run.run_id,
+        expected_candidate=repaired_head,
+    )
+
+    assert result["result"]["reason"] == "repair-commit-adopted"
+
+
+def test_recover_repair_commit_rejects_missing_gate_ledger_state_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="gate ledger worktree_state unavailable"):
+        _run_action(
+            snapshot=snapshot,
+            state=tmp_path / "runs.json",
+            registry=registry,
+            expected_run_id=run.run_id,
+            expected_candidate=repaired_head,
+        )
+
+
+def test_recover_repair_commit_normalizes_uppercase_gate_ledger_head_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head.upper(),
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
+    )
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    result = _run_action(
+        snapshot=snapshot,
+        state=tmp_path / "runs.json",
+        registry=registry,
+        expected_run_id=run.run_id,
+        expected_candidate=repaired_head,
+    )
+
+    assert result["result"]["reason"] == "repair-commit-adopted"
+
+
+def test_recover_repair_commit_rejects_incomplete_gate_ledger_state_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(failed_job, head=repaired_head)
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="candidate ancestry unavailable"):
+        _run_action(
+            snapshot=snapshot,
+            state=tmp_path / "runs.json",
+            registry=registry,
+            expected_run_id=run.run_id,
+            expected_candidate=repaired_head,
+        )
+
+
+def test_recover_repair_commit_rejects_dirty_gate_ledger_state_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head,
+        dirty_total=1,
+        dirty=("?? stray.txt",),
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
+    )
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="clean worktree"):
+        _run_action(
+            snapshot=snapshot,
+            state=tmp_path / "runs.json",
+            registry=registry,
+            expected_run_id=run.run_id,
+            expected_candidate=repaired_head,
+        )
+
+
+def test_recover_repair_commit_rejects_non_descendant_gate_ledger_state_without_reading_builder_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority, snapshot = _authority(tmp_path)
+    registry = JobRegistry(state_path=tmp_path / "jobs.json")
+    claim_key = work_actions._expected_claim_key(authority)
+    worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
+    base_head = _init_repair_worktree(worktree)
+    repaired_head = _commit_repair(worktree)
+
+    run = _make_run(
+        registry,
+        authority=authority,
+        claim_key=claim_key,
+        current_phase="build",
+        steps=_repair_steps(),
+        candidate_head=base_head,
+        facets=("needs_human",),
+    )
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head,
+        ancestry_baseline=base_head,
+        ancestry_ok=False,
+    )
+    monkeypatch.setattr(
+        work_actions.verification,
+        "_run_git",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("recover action must not read the builder tree")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="descendant"):
+        _run_action(
+            snapshot=snapshot,
+            state=tmp_path / "runs.json",
+            registry=registry,
+            expected_run_id=run.run_id,
+            expected_candidate=repaired_head,
+        )
 
 
 def test_recover_repair_commit_fail_closed_when_terminal_evidence_bound(
@@ -440,6 +829,7 @@ def test_recover_repair_commit_replay_already_recovered_no_new_job(
     registry = JobRegistry(state_path=tmp_path / "jobs.json")
     claim_key = work_actions._expected_claim_key(authority)
     worktree = tmp_path / "wt"
+    log_path = tmp_path / "logs" / "builder.jsonl"
     base_head = _init_repair_worktree(worktree)
     repaired_head = _commit_repair(worktree)
 
@@ -452,7 +842,19 @@ def test_recover_repair_commit_replay_already_recovered_no_new_job(
         candidate_head=base_head,
         facets=("needs_human",),
     )
-    _seed_failed_builder_job(registry, run=run, worktree=worktree, base_head=base_head)
+    failed_job = _seed_failed_builder_job(
+        registry,
+        run=run,
+        worktree=worktree,
+        base_head=base_head,
+        log_path=log_path,
+    )
+    _write_gate_worktree_state(
+        failed_job,
+        head=repaired_head,
+        ancestry_baseline=base_head,
+        ancestry_ok=True,
+    )
 
     first = _run_action(
         snapshot=snapshot,

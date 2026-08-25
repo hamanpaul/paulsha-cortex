@@ -87,6 +87,12 @@ def build_openspec_archive_argv(change: str) -> list[str]:
     return ["openspec", "archive", "-y", change]
 
 
+def build_openspec_validate_change_argv(change: str) -> list[str]:
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", change) is None:
+        raise ValueError("OpenSpec change must be a safe slug")
+    return ["openspec", "validate", change, "--type", "change", "--strict"]
+
+
 def validate_archive_gate(facts: ArchiveGateFacts) -> GateResult:
     reasons: list[str] = []
     if not facts.tasks_complete:

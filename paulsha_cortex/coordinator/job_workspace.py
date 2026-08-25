@@ -232,7 +232,7 @@ _ACL_PERMS_RE = re.compile(r"^[rwxX-]{1,4}$")
 #: 解析成別的東西（或多出一條沒有人宣告過的）。
 _ACL_ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 
-#: `setfacl -R` 失敗時保留的 stderr 尾段長度（見 :func:`grant_workspace_acl`）。
+#: `setfacl` 失敗時保留的 stderr 尾段長度（見 :func:`grant_workspace_acl`）。
 _ACL_ERROR_TAIL = 2000
 
 
@@ -337,11 +337,25 @@ def grant_workspace_acl(
             "`SYSTEM_PROGRAMS`），由發行版的 `acl` 套件提供；0818 的三個部署陷阱之一"
             "就是這個套件缺席。"
         )
-    spec = ",".join(grant.spec() for grant in grants)
-    argv = [binary, "-R", "-m", spec, str(target)]
-    rendered = shlex.join(argv)
-    completed = subprocess.run(argv, check=False, capture_output=True, text=True)
-    if completed.returncode != 0:
+    # Access ACL 與 default ACL 分兩次遞迴套用。把 `u:...` 與 `d:u:...` 混在
+    # 同一個 `setfacl -R -m` 裡，在部分 acl 版本／檔案系統組合會把 default
+    # 條目送到 regular inode，回 `Invalid argument`；permgen 本來就以兩條
+    # 命令產生這個順序。`-d` 這一趟只處理目錄，並保留對既有子目錄的繼承契約。
+    access_spec = ",".join(
+        f"u:{grant.account}:{grant.access_perms}" for grant in grants
+    )
+    default_spec = ",".join(
+        f"u:{grant.account}:{grant.default_perms}" for grant in grants
+    )
+    commands = (
+        [binary, "-R", "-m", access_spec, str(target)],
+        [binary, "-R", "-d", "-m", default_spec, str(target)],
+    )
+    rendered = " && ".join(shlex.join(command) for command in commands)
+    for argv in commands:
+        completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+        if completed.returncode == 0:
+            continue
         # `setfacl -R` 每個失敗的 inode 各印一行——一棵 35MB 的 clone 可以印出好幾 MB。
         # 只留尾段：失敗原因對整棵樹一律相同（`Operation not permitted`＝不是 owner、
         # `No such file or directory`＝樹在中途被回收），而完整清單只會把真正的錯誤
@@ -350,7 +364,7 @@ def grant_workspace_acl(
         if len(detail) > _ACL_ERROR_TAIL:
             detail = f"…（前 {len(detail) - _ACL_ERROR_TAIL} 字元省略）" + detail[-_ACL_ERROR_TAIL:]
         raise WorkspaceError(
-            f"per-job 工作區的具名 ACL 套用失敗: {rendered}: {detail}（#710）"
+            f"per-job 工作區的具名 ACL 套用失敗: {shlex.join(argv)}: {detail}（#710）"
         )
     return rendered
 
@@ -621,6 +635,8 @@ def spool_key_for_job(job: Mapping[str, object]) -> str | None:
 
 def _template_instance_for_job(job: Mapping[str, object]) -> str | None | object:
     if "template_instance" not in job:
+        if job.get("runtime_mode") == "systemd-template":
+            return None
         return _TEMPLATE_INSTANCE_UNSET
     template_instance = job.get("template_instance")
     if template_instance is None:

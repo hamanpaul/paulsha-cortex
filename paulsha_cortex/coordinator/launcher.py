@@ -365,7 +365,18 @@ def _srt_runtime_root() -> Path | None:
     if executable is None:
         return None
     resolved = Path(executable).resolve()
-    for parent in resolved.parents:
+    candidates = list(resolved.parents)
+    # Phase 2 trust-root installs a regular root-owned wrapper so it can pin
+    # `/usr/bin/node --jitless` under MDWE.  Preserve the package-root contract
+    # that the historical symlink entrypoint provided by deriving the sibling
+    # toolchain package only from the canonical `toolchain/bin/<name>` shape.
+    if resolved.parent.name == "bin" and resolved.parent.parent.name == "toolchain":
+        candidates.append(resolved.parent.parent / "lib" / resolved.name)
+    seen: set[Path] = set()
+    for parent in candidates:
+        if parent in seen:
+            continue
+        seen.add(parent)
         metadata = parent / "package.json"
         if not metadata.is_file() or metadata.is_symlink():
             continue
@@ -725,32 +736,82 @@ def _linked_worktree_git_write_dirs(worktree: str | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(path.resolve()) for path in required))
 
 
-def _verdict_spool_add_dirs(
+def _validated_verdict_spool_dir(
     verdict_spool_dir: str | None,
     *,
     read_only: bool,
     review_only: bool,
-) -> tuple[str, ...]:
-    """trust-root Phase 2a：reviewer 專屬 verdict spool 的 `--add-dir` 放行清單。
+) -> Path | None:
+    """trust-root Phase 2a：validate the reviewer verdict spool slot.
 
     verdict 落點搬出 worktree 之後（spec §R2），executor 自己的 sandbox 會把
     `<coordinator_root>/review-verdicts/<job_id>/` 擋在工作區之外——codex
     `--sandbox workspace-write` 只放行 cwd、claude `acceptEdits` 只覆蓋工作目錄。
-    這裡沿用既有的 `--add-dir` 機制**只**放行那一個 per-job 目錄（不是整棵
-    coordinator 樹），與 `_linked_worktree_git_write_dirs()` 的窄放行同一個模式。
+    Codex／Claude 的 caller 會把回傳的 per-job 目錄交給既有 `--add-dir`；Copilot
+    只消費這裡的正規化結果，另以 `_copilot_verdict_spool_tools()` 轉成單檔工具權限。
 
     read-only／review-only 契約下不放行任何寫入路徑：那些 persona 依契約不寫檔，
     verdict 走終局 JSON 契約（workflow lane），不需要也不該開這個洞。
     """
 
     if verdict_spool_dir is None:
-        return ()
+        return None
     if read_only or review_only:
         raise ValueError("read-only launcher cannot be granted a verdict spool write path")
     path = Path(verdict_spool_dir)
     if not path.is_absolute() or path.is_symlink():
         raise ValueError("verdict spool directory must be an absolute non-symlink path")
-    return (str(path.resolve()),)
+    if not path.exists() or not path.is_dir():
+        raise ValueError("verdict spool directory must be an existing directory")
+    # A non-symlink leaf can still have a symlinked ancestor.  Resolve only
+    # after rejecting that shape so an injected spool cannot escape the
+    # Manager-owned tree through a parent redirect.
+    if path.absolute() != path.resolve():
+        raise ValueError("verdict spool directory has a symlinked ancestor")
+    return path.resolve()
+
+
+def _verdict_spool_add_dirs(
+    verdict_spool_dir: str | None,
+    *,
+    read_only: bool,
+    review_only: bool,
+) -> tuple[str, ...]:
+    """Return the validated spool directory for directory-based executors."""
+
+    path = _validated_verdict_spool_dir(
+        verdict_spool_dir, read_only=read_only, review_only=review_only
+    )
+    if path is None:
+        return ()
+    return (str(path),)
+
+
+def _copilot_verdict_spool_tools(
+    verdict_spool_dir: str | None,
+    *,
+    read_only: bool,
+    review_only: bool,
+) -> tuple[str, ...]:
+    """Return the narrowly-scoped Copilot tools for a foreign-review spool.
+
+    Copilot's ``--add-dir`` grants the whole spool directory, which is wider
+    than the one-file contract.  Keep the shared path validation, but express
+    the Copilot grant as the exact verdict file plus the two read-only check
+    commands named by the foreign-review prompt.
+    """
+
+    spool_dir = _validated_verdict_spool_dir(
+        verdict_spool_dir, read_only=read_only, review_only=review_only
+    )
+    if spool_dir is None:
+        return ()
+    verdict_file = spool_dir / spool_slot.REVIEW_VERDICT_FILENAME
+    return (
+        f"write({verdict_file})",
+        "shell(rg:*)",
+        "shell(python3:*)",
+    )
 
 
 _VALID_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
@@ -781,6 +842,8 @@ def build_copilot_argv(
     verdict_spool_dir: str | None = None,
     effort: str | None = None,
 ) -> list[str]:
+    if verdict_spool_dir is not None and (allow_unsafe or commit_required):
+        raise ValueError("Copilot verdict spool cannot use broad workspace permissions")
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required Copilot builder requires enforced workspace-write")
     if read_only or review_only:
@@ -818,10 +881,10 @@ def build_copilot_argv(
             argv += ["--add-dir", git_write_dir]
     elif allow_unsafe:
         argv.append("--allow-all")
-    for spool_dir in _verdict_spool_add_dirs(
+    for tool in _copilot_verdict_spool_tools(
         verdict_spool_dir, read_only=read_only, review_only=review_only
     ):
-        argv += ["--add-dir", spool_dir]
+        argv += ["--allow-tool", tool]
     return argv
 
 
@@ -1155,6 +1218,13 @@ def build_agy_argv(
     if allow_unsafe:
         raise ValueError("agy executor does not support unsafe mode")
     argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
+    # Antigravity's plan sandbox otherwise runs in an isolated workspace and
+    # cannot inspect a reviewer checkout at all.  Planner cards receive their
+    # source material through Manager-owned input envelopes and stay zero-tool;
+    # reviewer cards need the explicitly provisioned disposable checkout so
+    # their read-only inspection is about the exact Candidate.
+    if review_only and worktree is not None:
+        argv.extend(["--add-dir", str(Path(worktree).resolve())])
     if model is not None:
         argv.extend(["--model", model])
     return argv
@@ -1387,23 +1457,27 @@ class SubprocessLauncher:
         `<coordinator_root>/review-verdicts/<reviewer_job_id>/`，不再是 reviewer
         worktree 內的檔案。executor 的 sandbox 預設把那裡視為工作區之外，因此
         Manager 在派工當下用這個特化把**該 job 的那一格**（不是整棵 coordinator
-        樹）加進放行清單；其餘契約（allow_unsafe／model／commit_required）一律
-        原封不動。
+        樹）加進放行清單；verdict writer 一律清除 broad `allow_unsafe`／
+        `commit_required` 契約，避免全域 review 設定擴大這一格的寫入面。
         """
 
         if self._read_only or self._review_only:
             raise ValueError("read-only launcher cannot be granted a verdict spool write path")
-        if self._verdict_spool_dir == spool_dir:
+        if (
+            self._verdict_spool_dir == spool_dir
+            and not self._allow_unsafe
+            and not self._commit_required
+        ):
             return self
         return SubprocessLauncher(
             executor=self._executor,
             relay_target=self._relay_target,
             codex_remote=self._codex_remote,
-            allow_unsafe=self._allow_unsafe,
+            allow_unsafe=False,
             model=self._model,
             read_only=False,
             review_only=False,
-            commit_required=self._commit_required,
+            commit_required=False,
             write_forbidden=self._write_forbidden,
             effort=self._effort,
             verdict_spool_dir=spool_dir,
@@ -1800,9 +1874,10 @@ class SubprocessLauncher:
         # 那是同一族的錯）。要動那幾支，得先各自量一次。
         if self._executor == "codex":
             builder_kwargs["write_forbidden"] = self._write_forbidden
-        # trust-root Phase 2a：只有支援 `--add-dir` 的三個 executor 能表達「額外
-        # 放行一個目錄」。agy／cg 是 zero-tool／plan-only，本來就寫不了檔，也不會
-        # 被指派成 slice-lane reviewer；對它們宣告 spool 放行是設定錯誤，顯性拒絕。
+        # trust-root Phase 2a：Codex／Claude express the spool grant with
+        # `--add-dir`; Copilot uses exact `--allow-tool` entries instead. agy／cg
+        # are zero-tool／plan-only and cannot be assigned a slice-lane reviewer
+        # spool, so reject a spool grant for them explicitly.
         if self._verdict_spool_dir is not None:
             if self._executor not in {"codex", "copilot", "claude"}:
                 raise ValueError(

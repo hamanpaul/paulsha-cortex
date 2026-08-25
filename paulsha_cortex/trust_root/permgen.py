@@ -700,6 +700,10 @@ class ToolchainProgram:
     #: 必須連同整包目錄複製（npm 套件樹），而不是單一檔案。
     copy_tree: bool
     note: str
+    #: 以系統層 node 的 jitless 模式執行，讓這支服務程式在
+    #: `MemoryDenyWriteExecute=yes` 下不需要 W+X。這不是 executor 的剖面切換；
+    #: 只適用於已量測、且由 root-owned wrapper 固定 argv 的非 executor 服務程式。
+    jitless: bool = False
     #: **誰在執行期 exec 它**（#661）。executor 是被 dispatch 直接執行的，因此留空；
     #: 非 executor 一定經由某個消費者被 exec，而**消費者所在的 unit 決定它實際跑在哪
     #: 一份加固面下**——這正是 #643 的剖面推導（只看 executor 名）看不到的那一格。
@@ -958,6 +962,7 @@ SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
     ToolchainProgram(
         "srt", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
         filtered_syscalls=("pkey_alloc",),
+        jitless=True,
         note=(
             "`@anthropic-ai/sandbox-runtime` 的進入點（npm bin `srt` → `dist/cli.js`），"
             "**Claude review sandbox 的強制面**：doctor 的 `review-sandbox` probe 與 "
@@ -974,15 +979,20 @@ SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
             "`which(\"srt\")` 往上找 `package.json` 且 `name == @anthropic-ai/"
             "sandbox-runtime` 來解出套件根，再把它加進 reviewer sandbox 政策的 "
             "`allowRead`。單檔形態下它解出 `None`——沙箱政策少一條放行且**不報錯**。"
-            "因此 `bin/srt` 必須是指進 `lib/` 套件樹的 symlink（與 `codex` 同形），"
-            "`resolve()` 之後才找得到那個 `package.json`。\n"
-            "**版本是部署決定**：它決定 sandbox 政策**怎麼被套用**，與模型 CLI 同級。"
+            "因此部署入口必須保留套件根可解析性：`bin/srt` 的 wrapper 固定指向"
+            "`lib/srt` 的驗證過 entrypoint，launcher 依 canonical `toolchain/bin` 形狀"
+            "解析旁邊的 `package.json`，不會因為 wrapper 是 regular file 而丟失 `allowRead`。\n"
+            "**版本是部署決定**：它決定 sandbox 政策**怎麼被套用**，與模型 CLI 同級。\n"
+            "**#665 裁決**：部署 wrapper 固定以 `/usr/bin/node --jitless` 啟動；"
+            "reviewer strict unit 維持 `MemoryDenyWriteExecute=yes`，不把 Claude 整個"
+            "切到 jit 剖面。"
         ),
         consumed_by=("claude",),
     ),
     ToolchainProgram(
         "openspec", ExecutorShape.NODE_SCRIPT, needs_node=True, copy_tree=True,
         filtered_syscalls=("pkey_alloc",),
+        jitless=True,
         note=(
             "`@fission-ai/openspec` 的進入點（`bin/openspec.js`）。ship 段的 "
             "`openspec archive -y` 與 preflight 的 `openspec validate` 都是**採信判準**"
@@ -990,7 +1000,10 @@ SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
             "**#661 實機盤點**：它和四個 executor 一樣住在 operator 的 nvm 樹底下"
             "（`~/.nvm/.../lib/node_modules/@fission-ai/openspec`），`ProtectHome=yes` "
             "之後同樣不可達——這是 #640 那一族**第三個**沒被盤到的成員。node script ＋ "
-            "npm 套件樹，搬法與 `codex`／`srt` 逐字相同。"
+            "npm 套件樹，搬法與 `codex`／`srt` 逐字相同。\n"
+            "**#665 裁決**：部署 wrapper 固定以 `/usr/bin/node --jitless` 啟動；"
+            "Manager unit 維持 `MemoryDenyWriteExecute=yes`，不為 `openspec archive`"
+            "放寬 Tier-0 的記憶體防護。"
         ),
         consumed_by=(MANAGER_SURFACE,),
     ),
@@ -999,6 +1012,17 @@ SERVICE_TOOLS: tuple[ToolchainProgram, ...] = (
 #: 部署樹 toolchain 的**完整**盤點（executor ∪ 非 executor）。落位計畫由它導出；
 #: `executor_hardening_profile()` 刻意只看 `EXECUTOR_TOOLS`。
 TOOLCHAIN_PROGRAMS: tuple[ToolchainProgram, ...] = EXECUTOR_TOOLS + SERVICE_TOOLS
+
+
+def toolchain_requires_jitless(name: str) -> bool:
+    """Return the immutable wrapper mode for a known toolchain program.
+
+    The roster is the authority: callers never accept a user-provided argv flag.
+    Unknown names deliberately return ``False`` here and are rejected by the exact
+    candidate/bundle roster gates before an install can be applied.
+    """
+
+    return any(tool.name == name and tool.jitless for tool in TOOLCHAIN_PROGRAMS)
 
 
 # ---------------------------------------------------------------------------
@@ -3136,8 +3160,8 @@ class PathLayout:
         `$HOME is not defined`）與「憑證沒放好」長得一模一樣。產生器出這個值，是為了讓
         operator 落進 root-owned EnvironmentFile 的那一行有**單一來源**，不必手抄。
 
-        本函式只**出值**，不改 `job_runner` 的 fail-open/closed 語意——那屬於獨立票
-        （#686 已把理由寫進 `build_job_env()` 的 docstring）。
+        本函式只**出值**；#692 起 `job_runner.resolve_job_home()` 會把這份值當作
+        fail-closed 的唯一合法來源之一（與 unit 上的 `Environment=HOME=` 對齊）。
         """
         return self.home_of(account)
 
@@ -3735,16 +3759,27 @@ class PathLayout:
             # 指向這裡，因此持 spawn 授權的帳號也改不了 job 實際執行的第一支程式。
             (self.bin_root, root, g(root), 0o755),
             (self.venv_root, root, g(root), 0o755),
+            (f"{self.deploy_root}/venvs", root, g(root), 0o755),
+            (self.toolchain_bin, root, g(root), 0o755),
+            (self.toolchain_lib, root, g(root), 0o755),
             # durable state 樹的 root-owned 骨架（svc 不得 relink 這幾層）。
             (f"{self.agents_root}/config", root, g(root), 0o755),
             (f"{self.agents_root}/run", root, g(root), 0o755),
             (f"{self.agents_root}/runtime", root, g(root), 0o755),
+            (f"{self.agents_root}/runtime/codex-home", root, g(root), 0o755),
+            (f"{self.agents_root}/runtime/job-cache", root, g(root), 0o755),
             # Canonical Codex authority roots are registry assets.  They are
             # intentionally absent here; emitting them again would give the
             # scaffold and permission plan two executable ownership truths.
             # svc 自己建得出來、但先建好可讓權限一次到位的中間層。
             (f"{self.coordinator_root}/evidence", svc, g(svc), 0o700),
             (f"{self.coordinator_root}/digest", svc, g(svc), 0o700),
+            (
+                f"{self.coordinator_root}/{paths.JOB_PROMPT_ROOT_DIRNAME}",
+                root,
+                g(root),
+                0o755,
+            ),
             # job spec spool 不在此列：它已是登記表資產（`job-spec-spool`），權限由
             # `plan_to_commands()` 依登記表機械產出（owner-only ＋ job 帳號唯讀 ACL），
             # 在骨架再寫一次會變成第二份真相。
@@ -5844,7 +5879,8 @@ class NodeExecutionSurface:
     program: str
     #: executor 名，或 :data:`MANAGER_SURFACE`。
     surface: str
-    #: 執行它的 unit 目前是否允許 W+X 記憶體（＝`MemoryDenyWriteExecute` 不是 `yes`）。
+    #: 這個程式的固定 wrapper 是否已滿足其 Node 執行需求。unit 仍可保持
+    #: `MemoryDenyWriteExecute=yes`；`jitless` service 以不需要 W+X 的方式滿足它。
     allows_wx: bool
     detail: str
 
@@ -5870,17 +5906,16 @@ def node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
     **這是 #643 的剖面推導看不到的那一格。** #643 把「哪個 job 要放寬 W+X」由
     `EXECUTOR_TOOLS.needs_node` 機械導出，而那條推導的唯一輸入是 **executor 名**——
     它涵蓋「被 dispatch 直接執行的那一支是不是 node」，**不涵蓋**「那一支在執行途中
-    再 exec 出來的 node 程式」。#661 的完整盤點正好撞出兩個這種格子：
+    再 exec 出來的 node 程式」。#661 的完整盤點撞出兩個這種格子；#665 現在以固定
+    `--jitless` wrapper 收斂它們，而不是放寬任何既有 unit：
 
     - `srt`：由 `claude`（原生 ELF ⇒ **strict** 剖面）在 review 時 exec；
     - `openspec`：由 **Manager 的 system unit** 在 ship 時 exec。
 
-    兩者所在的 unit 目前都是 `MemoryDenyWriteExecute=yes`，而 #643 已在實機量到 V8
-    的 `Runtime_CompileLazy` 在該項下直接崩。因此這兩格**預期會失敗**——但這是
-    **OS 層語意**，本 repo 的測試環境沒有那個加固面，不得在這裡宣稱已驗證。本函式
-    只負責讓它們**可列舉、不會靜默消失**；實機量測步驟在 runbook 第 4e 步，裁決
-    （放寬哪一面、放寬到什麼程度）屬 operator，見 #643 的先例：量到才改，且不得
-    就地放寬。
+    兩者所在的 unit 仍是 `MemoryDenyWriteExecute=yes`，而 #643 已在實機量到 V8
+    的 `Runtime_CompileLazy` 在該項下直接崩。固定 wrapper 改由 `/usr/bin/node --jitless`
+    執行，保留 unit 的 strict 設定；本 repo 的測試環境仍不宣稱已重現 systemd 的
+    MDWE 語意，受保護 RC 必須在實際 unit 上驗證 `--version` 與代表性命令。
     """
 
     surfaces: list[NodeExecutionSurface] = []
@@ -5889,6 +5924,12 @@ def node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
             continue
         for consumer in tool.consumed_by:
             allows, detail = _surface_allows_wx(consumer)
+            if tool.jitless:
+                allows = True
+                detail = (
+                    f"{detail}；root-owned wrapper 使用 `/usr/bin/node --jitless`"
+                    "（不需要 W+X，unit 維持 strict）"
+                )
             surfaces.append(
                 NodeExecutionSurface(tool.name, consumer, allows, detail)
             )
@@ -5896,7 +5937,7 @@ def node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
 
 
 def unresolved_node_execution_surfaces() -> tuple[NodeExecutionSurface, ...]:
-    """`node_execution_surfaces()` 裡**執行面仍禁 W+X** 的那些（＝已知會失敗的組合）。"""
+    """Return service/node surfaces with no validated strict-compatible execution mode."""
 
     return tuple(surface for surface in node_execution_surfaces() if not surface.allows_wx)
 
@@ -6174,8 +6215,9 @@ RUN_EXTERNAL_DEPENDENCIES: tuple[RunDependency, ...] = (
         (Principal.REVIEWER,), (RunStage.REVIEW,),
         covered_by="SERVICE_TOOLS",
         note=(
-            "Claude review sandbox 的強制面（#661）。由 `claude` 在執行途中 exec ⇒ "
-            "跑在 `strict` 剖面上，那一格仍未決，見 `unresolved_node_execution_surfaces()`。"
+            "Claude review sandbox 的強制面（#661）。由 `claude` 在執行途中 exec；"
+            "#665 的 root-owned wrapper 固定 `/usr/bin/node --jitless`，因此 strict unit"
+            "保留 `MemoryDenyWriteExecute=yes` 而不再形成未決面。"
         ),
     ),
     RunDependency(
@@ -7605,6 +7647,17 @@ ACCOUNT_GITCONFIG_FLAGS: Mapping[Principal, str] = {
 #: `.gitconfig` 的 mode。**0644 而非 0600**：檔案 root 擁有、讀取的帳號要讀得到，
 #: 與 `*-codex-hooks`（同樣 root-owned、同樣落在帳號 HOME 下）逐位元相同。
 ACCOUNT_GITCONFIG_MODE = 0o644
+GITHUB_HTTPS_CREDENTIAL_URL = "https://github.com"
+SYSTEM_GH_EXECUTABLE = "/usr/bin/gh"
+
+
+def durable_owner_git_credential_helper(gh_executable: str | None = None) -> str:
+    """durable-state owner 那份 `.gitconfig` 裡的 GitHub HTTPS helper。"""
+
+    executable = SYSTEM_GH_EXECUTABLE if gh_executable is None else gh_executable
+    return "!" + " ".join(
+        shlex.quote(part) for part in (executable, "auth", "git-credential")
+    )
 
 
 class UnresolvedSourceRepoError(ValueError):
@@ -7762,6 +7815,18 @@ def build_account_gitconfig(
         "# 那條規則就裝不下它們。那一格由每次派工的 spec env 逐 job 放行",
         "# （registry.JOB_GIT_WORKSPACE_TRUST ↔ job_runner.git_workspace_trust_env()），",
         "# 與本檔並存、不互相取代。",
+    ]
+    if account == scheme.durable_state_owner:
+        helper = durable_owner_git_credential_helper()
+        body += [
+            "#",
+            "# GitHub HTTPS transport 只掛在 durable-state owner 的 root-owned 設定裡：",
+            "# reset 先清空任何上層繼承的 helper，再只對 https://github.com 委派給 gh。",
+            f'[credential "{GITHUB_HTTPS_CREDENTIAL_URL}"]',
+            "\thelper =",
+            f"\thelper = {helper}",
+        ]
+    body += [
         "[safe]",
     ]
     body += [f"\tdirectory = {path}" for path in safe_dirs]
@@ -7852,7 +7917,12 @@ def build_toolchain_plan(
         ]
         if tool.consumed_by:
             for consumer in tool.consumed_by:
-                _, detail = _surface_allows_wx(consumer)
+                surface = next(
+                    row
+                    for row in node_execution_surfaces()
+                    if row.program == tool.name and row.surface == consumer
+                )
+                detail = surface.detail
                 lines.append(f"#   執行面：{detail}")
         else:
             profile = executor_hardening_profile(tool.name)
@@ -7894,6 +7964,21 @@ def build_toolchain_plan(
                     f"/usr/bin/copilot|command -v copilot' {layout.toolchain_bin}/{tool.name}`、"
                     f"`{layout.toolchain_bin}/{tool.name} --version`、"
                     "`$NODE_ABS -e 'new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]))'`。",
+                ]
+            elif tool.jitless:
+                lines += [
+                    "#   整包搬（單搬進入點會缺 node_modules）：先找出套件根，再整棵複製——",
+                    f'#     PKG="$(cd "$(dirname "$SRC")/.." && pwd)"',
+                    f'#     cp -a "$PKG" {layout.toolchain_lib}/{tool.name}',
+                    f'#     cat > {layout.toolchain_bin}/{tool.name} <<EOF',
+                    "#     #!/bin/sh",
+                    f'#     exec /usr/bin/node --jitless "{layout.toolchain_lib}/{tool.name}/<entrypoint>" "\\$@"',
+                    "#     EOF",
+                    f"#     chmod 0755 {layout.toolchain_bin}/{tool.name}",
+                    "#   wrapper 的 `--jitless` 是固定部署契約，不得由環境變數、PATH 或",
+                    "#   呼叫端覆蓋；unit 保持 `MemoryDenyWriteExecute=yes`，不建立 jit 剖面。",
+                    f"#   fail-closed probe：`{layout.toolchain_bin}/{tool.name} --version` 必須在",
+                    "#   受保護 RC 的實際 unit 上印出版本；若退出非零，停止安裝。",
                 ]
             else:
                 lines += [

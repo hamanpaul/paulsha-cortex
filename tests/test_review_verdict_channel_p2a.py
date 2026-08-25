@@ -850,6 +850,27 @@ def test_spool_grant_rejects_relative_and_symlink_paths(tmp_path: Path) -> None:
             prompt="p", slice_id="s", log_dir=str(tmp_path), verdict_spool_dir=str(link)
         )
 
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    (real_parent / "spool").mkdir()
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlinked ancestor"):
+        build_codex_argv(
+            prompt="p",
+            slice_id="s",
+            log_dir=str(tmp_path),
+            verdict_spool_dir=str(parent_link / "spool"),
+        )
+
+    with pytest.raises(ValueError, match="existing directory"):
+        build_codex_argv(
+            prompt="p",
+            slice_id="s",
+            log_dir=str(tmp_path),
+            verdict_spool_dir=str(tmp_path / "not-created"),
+        )
+
 
 def test_manager_specialization_is_optional_for_injected_launchers(tmp_path: Path) -> None:
     """測試／其他實作注入的 fake launcher 沒有這個特化時照原樣用。"""

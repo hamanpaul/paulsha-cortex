@@ -39,6 +39,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 
 from paulsha_cortex.coordinator import job_runner, job_shim
 from paulsha_cortex.trust_root import permgen, registry
@@ -50,18 +51,26 @@ _JOB_PATH_ENV = {
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
 }
 
+_JOB_HOME_ENV = {
+    "PSC_BUILDER_HOME": BUILDER_HOME,
+    "PSC_REVIEWER_HOME": REVIEWER_HOME,
+    "PSC_GATE_HOME": GATE_HOME,
+}
+
 _GIT_ENV_KEYS = ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
 
 
 def _build_env(role: str, workspace: str | None) -> dict[str, str]:
-    return job_runner.build_job_env(
-        manager_env=dict(_JOB_PATH_ENV),
-        job_id="job-712",
-        slice_id="slice-712",
-        repo_root="/opt/cortex",
-        workspace=workspace,
-        role=role,
-    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(job_runner, "_account_ids", fake_account_ids)
+        return job_runner.build_job_env(
+            manager_env={**_JOB_PATH_ENV, **_JOB_HOME_ENV},
+            job_id="job-712",
+            slice_id="slice-712",
+            repo_root="/opt/cortex",
+            workspace=workspace,
+            role=role,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -277,18 +286,21 @@ def test_the_manager_environment_can_never_supply_these(tmp_path: Path) -> None:
 
     poisoned = {
         **_JOB_PATH_ENV,
+        **_JOB_HOME_ENV,
         "GIT_CONFIG_COUNT": "9",
         "GIT_CONFIG_KEY_0": "alias.pwn",
         "GIT_CONFIG_VALUE_0": "/evil",
     }
-    env = job_runner.build_job_env(
-        manager_env=poisoned,
-        job_id="j",
-        slice_id="s",
-        repo_root="/opt/cortex",
-        workspace=str(tmp_path),
-        role=job_runner.JOB_ROLE_BUILDER,
-    )
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(job_runner, "_account_ids", fake_account_ids)
+        env = job_runner.build_job_env(
+            manager_env=poisoned,
+            job_id="j",
+            slice_id="s",
+            repo_root="/opt/cortex",
+            workspace=str(tmp_path),
+            role=job_runner.JOB_ROLE_BUILDER,
+        )
     assert env["GIT_CONFIG_COUNT"] == "1"
     assert env["GIT_CONFIG_KEY_0"] == "safe.directory"
     assert env["GIT_CONFIG_VALUE_0"] == str(tmp_path.resolve())

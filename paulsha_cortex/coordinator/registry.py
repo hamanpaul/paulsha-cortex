@@ -218,6 +218,84 @@ def _empty_legacy_records() -> dict[str, Any]:
     return {"source_schema_version": 1, "seq": 0, "jobs": [], "slices": []}
 
 
+_CURRENT_VERIFICATION_EVIDENCE_HASH = "current_verification_evidence_hash"
+
+
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value.lower())
+    )
+
+
+def _read_current_verification_evidence_hash(slice_row: Mapping[str, Any]) -> str | None:
+    refs = slice_row.get("current_evidence_refs")
+    if not isinstance(refs, list) or not refs or not isinstance(refs[0], str):
+        return None
+    try:
+        payload = json.loads(Path(refs[0]).read_text(encoding="utf-8"))
+        normalized = verification.validate_verification_evidence(payload)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return verification.canonical_json_hash(normalized)
+
+
+def _normalize_loaded_slice_verification(slice_row: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the additive evidence-hash field and repair #501 legacy rows.
+
+    Before #501, ``verification.hash`` was overwritten with the hash of the
+    current evidence payload. A pre-fix row has no
+    ``current_verification_evidence_hash`` field, but its persisted contract is
+    enough to distinguish that shape: when the old value is a SHA-256 digest
+    different from the canonical contract hash, it is the legacy evidence
+    hash. Preserve arbitrary/non-digest test and operator values rather than
+    guessing across an otherwise unclassifiable row.
+    """
+
+    normalized = dict(slice_row)
+    verification_meta = dict(slice_row["verification"])
+    field_present = _CURRENT_VERIFICATION_EVIDENCE_HASH in slice_row
+    evidence_hash = slice_row.get(_CURRENT_VERIFICATION_EVIDENCE_HASH)
+    if evidence_hash is not None and (
+        not isinstance(evidence_hash, str) or not evidence_hash
+    ):
+        raise ValueError("coordinator 狀態檔 current verification evidence hash 格式錯誤（fail-closed）")
+
+    contract = verification_meta.get("contract")
+    stored_hash = verification_meta["hash"]
+    contract_hash = (
+        verification.canonical_json_hash(contract) if isinstance(contract, dict) else None
+    )
+    derived_evidence_hash = (
+        _read_current_verification_evidence_hash(slice_row)
+        if evidence_hash is None
+        else None
+    )
+    if evidence_hash is None and derived_evidence_hash is not None:
+        evidence_hash = derived_evidence_hash
+
+    # Only rows written before the additive field existed are eligible for the
+    # deterministic repair. A present field belongs to the new schema and a
+    # mismatching contract hash must remain fail-closed for operator recovery.
+    if (
+        not field_present
+        and isinstance(contract_hash, str)
+        and _is_sha256_digest(stored_hash)
+        and stored_hash != contract_hash
+    ):
+        verification_meta["hash"] = contract_hash
+        if evidence_hash is None:
+            # The old writer stored the evidence hash exactly here. Keeping it
+            # in the new field makes the current evidence independently
+            # addressable even if the evidence file is no longer readable.
+            evidence_hash = stored_hash
+
+    normalized["verification"] = verification_meta
+    normalized[_CURRENT_VERIFICATION_EVIDENCE_HASH] = evidence_hash
+    return normalized
+
+
 # #519：semantic-reclaim 世代熔斷（work_actions.SEMANTIC_RECLAIM_LIMIT）的重置
 # 水位欄位集合。水位是 append-only 的「赦免名單」——記錄某次 operator 明示重置
 # 當下已存在的 superseded run_id，之後熔斷只計不在任何赦免名單裡的世代。刻意
@@ -326,8 +404,11 @@ class JobRegistry:
             legacy_records = {
                 "source_schema_version": 1,
                 "seq": seq,
-                "jobs": jobs,
-                "slices": slices,
+                # Validation may normalize fields used by the live v2 model.
+                # The quarantined v1 records are immutable migration evidence,
+                # so preserve the validated source rows byte-for-byte in shape.
+                "jobs": _deepcopy_json(payload["jobs"]),
+                "slices": _deepcopy_json(payload["slices"]),
             }
             migrated = {
                 "schema_version": COORDINATOR_STATE_SCHEMA_VERSION,
@@ -394,7 +475,13 @@ class JobRegistry:
         self._legacy_records = _deepcopy_json(legacy_records)
         self._reclaim_resets = reclaim_resets
         self._seq = max(seq, self._seq)
-        self._record_state_file_metadata()
+        if slices != payload["slices"]:
+            # #501：the additive evidence-hash field and deterministic repair
+            # must survive a restart, otherwise the same legacy row would be
+            # reclassified on every load.
+            self._persist()
+        else:
+            self._record_state_file_metadata()
 
     def _validate_reclaim_resets(self, value: object) -> list[dict[str, Any]]:
         """#519：semantic-reclaim 重置水位的載入驗證（malformed 一律 fail-closed）。"""
@@ -859,11 +946,12 @@ class JobRegistry:
                 isinstance(item, dict) for item in slice_row[key]
             ):
                 raise ValueError(f"coordinator 狀態檔格式錯誤（fail-closed）: {self._state_path}")
+        normalized_slice = _normalize_loaded_slice_verification(slice_row)
         return {
-            **dict(slice_row),
+            **normalized_slice,
             "spec": dict(slice_row["spec"]),
             "plan": dict(slice_row["plan"]),
-            "verification": dict(slice_row["verification"]),
+            "verification": dict(normalized_slice["verification"]),
             "current_evidence_refs": list(slice_row["current_evidence_refs"]),
             "current_evaluation_refs": list(slice_row["current_evaluation_refs"]),
             "evidence_history": _copy_json_list(slice_row["evidence_history"]),
@@ -1342,6 +1430,7 @@ class JobRegistry:
             "candidate": candidate,
             "state": "pending",
             "gate_state": "pending",
+            _CURRENT_VERIFICATION_EVIDENCE_HASH: None,
             "current_evidence_refs": [],
             "current_evaluation_refs": [],
             "evidence_history": [],
@@ -1393,6 +1482,7 @@ class JobRegistry:
         slice_row["reviewer_job_id"] = None
         slice_row["candidate"] = None
         slice_row["gate_state"] = "pending"
+        slice_row[_CURRENT_VERIFICATION_EVIDENCE_HASH] = None
         slice_row["current_evidence_refs"] = []
         slice_row["current_evaluation_refs"] = []
         slice_row["updated_at"] = _now_iso()
@@ -1420,7 +1510,7 @@ class JobRegistry:
         candidate: str | None = None,
         dispatch_base: str | None = None,
         target_remote: str | None = None,
-        verification_hash: str | None = None,
+        current_verification_evidence_hash: str | None = None,
     ) -> dict[str, Any]:
         slice_row = self._find_slice(slice_id)
 
@@ -1445,6 +1535,11 @@ class JobRegistry:
             if not _is_ref_list(current_evaluation_refs):
                 raise ValueError("current_evaluation_refs 必須為字串陣列")
             new_current_evaluation_refs = _copy_ref_list(current_evaluation_refs)
+        if current_verification_evidence_hash is not None and (
+            not isinstance(current_verification_evidence_hash, str)
+            or not current_verification_evidence_hash
+        ):
+            raise ValueError("current_verification_evidence_hash 必須為非空字串")
         if state is not None:
             if state not in VALID_SLICE_STATES:
                 raise ValueError(f"非法 slice state: {state!r}")
@@ -1487,8 +1582,8 @@ class JobRegistry:
             slice_row["dispatch_base"] = dispatch_base
         if target_remote is not None:
             slice_row["target_remote"] = target_remote
-        if verification_hash is not None:
-            slice_row["verification"]["hash"] = verification_hash
+        if current_verification_evidence_hash is not None:
+            slice_row[_CURRENT_VERIFICATION_EVIDENCE_HASH] = current_verification_evidence_hash
         slice_row["updated_at"] = _now_iso()
         self._persist()
         return self._copy_slice(slice_row)
@@ -2034,8 +2129,15 @@ class JobRegistry:
         expected_candidate: str,
         repair_action: str,
         retry_classification: str | None = None,
+        model_chain_override: dict[str, dict[str, str]] | None = None,
     ) -> WorkflowRun:
-        """Atomically reopen only the final builder card after an explicit human stop."""
+        """Atomically reopen only the final builder card after an explicit human stop.
+
+        ``model_chain_override`` is an optional, explicit recovery-time refinement.
+        It is merged onto the run-scoped claim override (rather than replacing the
+        planner/reviewer entries), and the selected identity is still validated by
+        the normal dispatch path before a job is created.
+        """
 
         index = self._find_workflow_run_index(run_id)
         current = self._workflows[index]
@@ -2121,6 +2223,12 @@ class JobRegistry:
             else step
             for step in current.steps
         )
+        effective_model_chain_override = current.model_chain_override
+        if model_chain_override is not None:
+            effective_model_chain_override = {
+                **dict(current.model_chain_override or {}),
+                **{persona: dict(row) for persona, row in model_chain_override.items()},
+            }
         updated = replace(
             current,
             current_phase="build",
@@ -2143,6 +2251,7 @@ class JobRegistry:
                 if retry_classification is None
                 else retry_classification
             ),
+            model_chain_override=effective_model_chain_override,
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated
@@ -2156,6 +2265,7 @@ class JobRegistry:
         expected_run_id: str,
         card: str,
         retry_classification: str | None = None,
+        model_chain_override: dict[str, dict[str, str]] | None = None,
     ) -> WorkflowRun:
         """#545／#569：原子重開「當前 phase 內最早一張尚未採信的卡」。
 
@@ -2217,22 +2327,34 @@ class JobRegistry:
             )
         if pending[0].persona != expected_persona:
             raise ValueError(f"retry-card reset requires a {expected_persona} card")
-        if any(
-            job.get("workflow_run_id") == current.run_id
+        # Keep the registry-side atomic guard aligned with work_actions: an
+        # accepted earlier builder attempt may be followed by a newer terminal
+        # provider failure before any envelope is bound.  That failure
+        # supersedes only the current attempt; it never mutates old evidence.
+        matching_card_jobs = [
+            job
+            for job in self._jobs
+            if job.get("workflow_run_id") == current.run_id
             and job.get("workflow_phase") == phase
             and job.get("workflow_card") == card
-            # verify／review 的 job 以 candidate 定錨（與
-            # `manager._dispatch_workflow_card` 的 matching 同一組判準）：要拒絕
-            # 的是「這張卡對**現在這個 candidate** 已經有被採信的結論」，而不是
-            # 上一代 candidate 留下的歷史紀錄——後者拒絕等於再造一次 catch-22。
             and (phase == "build" or job.get("subject_head") == current.candidate_head)
-            # #765：與 candidate 定錨同一個道理再加一層——claim era 定錨（None
-            # 容忍比照 #766/#768/#772）。authority restart 後前代 era 的已綁
-            # evidence 是歷史稽核列；拿它拒絕新 era 的重派＝同一個 catch-22。
             and job.get("workflow_claim_key") in (None, current.claim_key)
-            and job.get("workflow_evidence") is not None
-            for job in self._jobs
-        ):
+        ]
+        latest_card_job = matching_card_jobs[-1] if matching_card_jobs else None
+        accepted_evidence = any(
+            job.get("workflow_evidence") is not None for job in matching_card_jobs
+        )
+        superseded_by_failed_builder = bool(
+            phase == "build"
+            and latest_card_job is not None
+            and latest_card_job.get("workflow_evidence") is None
+            and latest_card_job.get("status") in TERMINAL_JOB_STATUSES
+            and (
+                latest_card_job.get("status") == "failed"
+                or latest_card_job.get("exit_code") not in (None, 0)
+            )
+        )
+        if accepted_evidence and not superseded_by_failed_builder:
             raise ValueError("retry-card reset refuses a card with accepted evidence")
         steps = tuple(
             # 只清掉「上一次是誰跑的」這類解析結果，讓下一次 dispatch 重新解析
@@ -2268,6 +2390,12 @@ class JobRegistry:
         carried = current.attempts.get(card_retry_key, 0)
         if carried:
             attempts[card_total_key] = current.attempts.get(card_total_key, 0) + carried
+        effective_model_chain_override = current.model_chain_override
+        if model_chain_override is not None:
+            effective_model_chain_override = {
+                **dict(current.model_chain_override or {}),
+                **{persona: dict(row) for persona, row in model_chain_override.items()},
+            }
         updated = replace(
             current,
             steps=steps,
@@ -2282,6 +2410,7 @@ class JobRegistry:
                 if retry_classification is None
                 else retry_classification
             ),
+            model_chain_override=effective_model_chain_override,
             updated_at=_now_iso(),
         )
         self._workflows[index] = updated

@@ -8,6 +8,7 @@ from unittest import mock
 
 from paulsha_cortex.coordinator.completion import classify_completion
 from paulsha_cortex.coordinator.dispatcher import Dispatcher
+from paulsha_cortex.coordinator import verification
 from paulsha_cortex.coordinator.registry import (
     COORDINATOR_STATE_SCHEMA_VERSION,
     JobRegistry,
@@ -228,6 +229,7 @@ class SliceRecordTests(unittest.TestCase):
             self.assertEqual(created["plan"]["hash"], "plan-sha")
             self.assertEqual(created["state"], "pending")
             self.assertEqual(created["gate_state"], "pending")
+            self.assertIsNone(created["current_verification_evidence_hash"])
 
             reg.update_slice(
                 "slice-a",
@@ -235,6 +237,7 @@ class SliceRecordTests(unittest.TestCase):
                 gate_state="failed",
                 current_evidence_refs=["evidence-1"],
                 current_evaluation_refs=["gate-1"],
+                current_verification_evidence_hash="evidence-hash-1",
             )
             reg.record_action(
                 "slice-a",
@@ -244,6 +247,7 @@ class SliceRecordTests(unittest.TestCase):
                 evidence_refs=["evidence-2"],
                 evaluation_refs=["gate-2"],
             )
+            reg.update_slice("slice-a", current_verification_evidence_hash="evidence-hash-2")
 
             reloaded = JobRegistry(state_path=state)
             stored = reloaded.get_slice("slice-a")
@@ -259,6 +263,7 @@ class SliceRecordTests(unittest.TestCase):
             self.assertEqual(stored["gate_state"], "failed")
             self.assertEqual(stored["current_evidence_refs"], ["evidence-2"])
             self.assertEqual(stored["current_evaluation_refs"], ["gate-2"])
+            self.assertEqual(stored["current_verification_evidence_hash"], "evidence-hash-2")
             self.assertEqual([entry["refs"] for entry in stored["evidence_history"]], [["evidence-2"]])
             self.assertEqual([entry["refs"] for entry in stored["evaluation_history"]], [["gate-2"]])
             self.assertEqual([entry["action"] for entry in stored["actions"]], ["builder-exited"])
@@ -320,6 +325,7 @@ class SliceRecordTests(unittest.TestCase):
                 candidate=None,
             )
             reg.update_slice("slice-a", state="needs_human", gate_state="needs_human")
+            reg.update_slice("slice-a", current_verification_evidence_hash="old-evidence-hash")
 
             repinned = reg.repin_slice(
                 "slice-a",
@@ -336,6 +342,76 @@ class SliceRecordTests(unittest.TestCase):
 
             self.assertEqual(repinned["state"], "needs_human")
             self.assertEqual(repinned["gate_state"], "pending")
+            self.assertEqual(repinned["verification"]["hash"], "verification-sha-2")
+            self.assertIsNone(repinned["current_verification_evidence_hash"])
+
+    def test_update_slice_cannot_write_pinned_verification_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            reg = JobRegistry(state_path=Path(d) / "jobs.json")
+            contract_hash = "contract-hash"
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="main",
+                verification_hash=contract_hash,
+                verification={"docs_class": "code"},
+                dispatch_base="base-sha",
+            )
+
+            updated = reg.update_slice(
+                "slice-a",
+                current_evidence_refs=["evidence.json"],
+                current_verification_evidence_hash="evidence-hash",
+            )
+
+            self.assertEqual(updated["verification"]["hash"], contract_hash)
+            self.assertEqual(updated["current_verification_evidence_hash"], "evidence-hash")
+            with self.assertRaises(TypeError):
+                reg.update_slice("slice-a", verification_hash="must-not-be-accepted")
+
+    def test_legacy_overwritten_verification_hash_is_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            reg = JobRegistry(state_path=state)
+            contract = {"docs_class": "code", "review_policy": "required"}
+            contract_hash = verification.canonical_json_hash(contract)
+            reg.create_slice(
+                slice_id="slice-a",
+                spec_path="specs/slice-a.md",
+                spec_hash="spec-sha",
+                plan_path="plans/slice-a.md",
+                plan_hash="plan-sha",
+                target_branch="main",
+                verification_hash=contract_hash,
+                verification=contract,
+                dispatch_base="base-sha",
+            )
+
+            payload = json.loads(state.read_text(encoding="utf-8"))
+            row = payload["slices"][0]
+            legacy_evidence_hash = "e" * 64
+            row["verification"]["hash"] = legacy_evidence_hash
+            row["current_evidence_refs"] = ["legacy-evidence.json"]
+            row.pop("current_verification_evidence_hash")
+            state.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            migrated = JobRegistry(state_path=state)
+            stored = migrated.get_slice("slice-a")
+            self.assertEqual(stored["verification"]["hash"], contract_hash)
+            self.assertEqual(stored["current_verification_evidence_hash"], legacy_evidence_hash)
+
+            persisted = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(
+                persisted["slices"][0]["verification"]["hash"],
+                contract_hash,
+            )
+            self.assertEqual(
+                persisted["slices"][0]["current_verification_evidence_hash"],
+                legacy_evidence_hash,
+            )
 
     def test_repin_slice_recovers_failed_state_by_resetting_gate_only(self) -> None:
         """#382: `failed` 曾經是永久不可 repin 的死角——slice state 可以

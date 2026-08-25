@@ -137,21 +137,17 @@ def test_node_execution_surfaces_enumerate_every_needs_node_service_tool() -> No
     assert expected, "至少要有一列，否則這個機制形同不存在"
 
 
-def test_known_wx_conflicts_cannot_disappear_silently() -> None:
-    """`srt`／`openspec` 目前都跑在禁 W+X 的面上——這是**未決點**，不是已修好。
-
-    釘住它的理由：這兩格如果哪天靜默變空（例如有人把 `consumed_by` 清掉、或把
-    `MemoryDenyWriteExecute` 全域拿掉），那不是「問題解決了」而是「問題不見了」。
-    真正解決的樣子是 operator 裁決後**剖面改變**，那時本測試會紅，改的人必須連同
-    理由一起更新它。
-    """
-    unresolved = {s.program: s for s in unresolved_node_execution_surfaces()}
-    assert set(unresolved) == {"srt", "openspec"}
-    assert unresolved["srt"].surface == "claude"
-    assert unresolved["openspec"].surface == MANAGER_SURFACE
-    for surface in unresolved.values():
+def test_known_wx_conflicts_are_closed_by_fixed_jitless_wrappers() -> None:
+    """#665：service tools keep strict units and use a fixed jitless wrapper."""
+    surfaces = {s.program: s for s in node_execution_surfaces()}
+    assert set(surfaces) == {"srt", "openspec"}
+    assert surfaces["srt"].surface == "claude"
+    assert surfaces["openspec"].surface == MANAGER_SURFACE
+    for surface in surfaces.values():
         assert "MemoryDenyWriteExecute=yes" in surface.detail
-        assert surface.allows_wx is False
+        assert "/usr/bin/node --jitless" in surface.detail
+        assert surface.allows_wx is True
+    assert unresolved_node_execution_surfaces() == ()
 
 
 @pytest.mark.skip(
@@ -160,8 +156,8 @@ def test_known_wx_conflicts_cannot_disappear_silently() -> None:
         "層語意**，這個測試環境沒有那個加固面（也沒有第二個 UID 與 systemd-run 授權），"
         "重現不了。在這裡跑 `srt --version` 只會證明「沒有加固面時它跑得起來」，"
         "那與待驗的命題無關，卻會讓人以為已經驗過。實機量測步驟在 runbook 第 4e 步"
-        "（systemd-run 帶該 unit 的關鍵 property），結果回報 #661 的 follow-up 由 "
-        "operator 裁決。"
+        "（systemd-run 帶該 unit 的關鍵 property），受保護 RC 必須確認固定 `--jitless` "
+        "wrapper 在 strict unit 下仍能完成代表性命令；本 rootless suite 不偽造該證據。"
     )
 )
 def test_srt_runs_under_the_reviewer_hardening_surface() -> None:  # pragma: no cover
@@ -204,6 +200,14 @@ def test_toolchain_plan_demands_a_symlink_for_every_copy_tree_program() -> None:
             assert f"#     chmod 0755 {DEFAULT_LAYOUT.toolchain_bin}/{tool.name}" in text
             assert f"ln -sfn {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/" not in text
             continue
+        if tool.jitless:
+            assert f"#     cat > {DEFAULT_LAYOUT.toolchain_bin}/{tool.name} <<EOF" in text
+            assert (
+                f'#     exec /usr/bin/node --jitless "{DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/<entrypoint>" '
+                '"\\$@"'
+            ) in text
+            assert f"ln -sfn {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/" not in text
+            continue
         assert f"ln -sfn {DEFAULT_LAYOUT.toolchain_lib}/{tool.name}/" in text, tool.name
         assert f"`{DEFAULT_LAYOUT.toolchain_bin}/{tool.name}` **必須是指進 lib/ 的 " in text
 
@@ -219,11 +223,11 @@ def test_toolchain_plan_lines_are_comments_or_the_three_allowed_commands() -> No
             assert stripped.startswith(allowed), (scheme.scheme_id, stripped)
 
 
-def test_toolchain_plan_surfaces_the_unresolved_wx_conflicts() -> None:
+def test_toolchain_plan_surfaces_the_strict_jitless_wx_decision() -> None:
     text = "\n".join(build_toolchain_plan(FOUR_WAY_SCHEME, DEFAULT_LAYOUT))
-    for surface in unresolved_node_execution_surfaces():
-        assert f"{surface.program} ← {surface.detail}" in text
-    assert "不得就地放寬" in text
+    assert not unresolved_node_execution_surfaces()
+    assert "/usr/bin/node --jitless" in text
+    assert "unit 保持 `MemoryDenyWriteExecute=yes`" in text
 
 
 def test_toolchain_plan_is_deterministic() -> None:

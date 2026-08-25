@@ -602,18 +602,19 @@ sandbox 的執行面 `srt`（`@anthropic-ai/sandbox-runtime`）從未進過名�
   後者同時是 §R8 dispatch 的 executor 名字判準（`executor_hardening_profile()` 對表外的
   名字 fail-closed），併進去等於讓 `executor: srt` 這種派工變成合法。兩張名冊、同一個
   形狀、同一棵樹、同一份權限。
-- npm 套件型的程式（`codex`／`srt`／`openspec`）SHALL **整包**搬套件樹，且
-  `<toolchain>/bin/<name>` SHALL 是指進 `lib/` 的 symlink。單檔複製有兩個後果，其中
+- npm 套件型的程式（`codex`／`srt`／`openspec`）SHALL **整包**搬套件樹；`codex` 的
+  入口 SHALL 是指進 `lib/` 的 symlink，而 `srt`／`openspec` SHALL 由 root-owned wrapper
+  以系統層絕對路徑 `/usr/bin/node --jitless` 啟動。單檔複製有兩個後果，其中
   第二個是**無聲**的：(i) ESM 的相對 import 解到 `bin/` 底下 ⇒ `ERR_MODULE_NOT_FOUND`；
   (ii) 「從 `which()` 往上找 `package.json`」這類套件根解析（`launcher._srt_runtime_root()`）
   解出 `None`，於是 reviewer sandbox 政策少一條 `allowRead` 而**不報錯**。
-- **已知未決點（#661 盤點結果，尚待裁決）**：`needs_node` 的非 executor 程式跑在**消費者
-  的**加固面上，而 §R3 的剖面推導（下方）唯一的輸入是 executor 名——它涵蓋不了「executor
-  在執行途中再 exec 出來的 node 程式」。目前有兩格落在這個盲區：`srt` 由 `claude`
-  （`strict` 剖面）exec、`openspec` 由 Manager 的 system unit exec，兩者皆
-  `MemoryDenyWriteExecute=yes`。可列舉形式為
-  `permgen.unresolved_node_execution_surfaces()`；實機量測步驟在 runbook 第 4e 步。
-  **MUST NOT** 在未量測的情況下放寬任何一面。
+- **#665 已收斂盲區**：`needs_node` 的非 executor 程式仍跑在**消費者的**加固面上，
+  但 `srt`（由 `claude` strict exec）與 `openspec`（由 Manager exec）不再需要放寬
+  `MemoryDenyWriteExecute`。部署產生器只對這兩支 service tool 產生 root-owned
+  `/usr/bin/node --jitless` wrapper；reviewer 與 Manager unit 維持
+  `MemoryDenyWriteExecute=yes`。`permgen.unresolved_node_execution_surfaces()` 因而必須
+  為空；受保護 RC 仍 SHALL 在實際 systemd unit 上驗證 wrapper 的 `--version` 與代表性
+  命令，不能以 rootless 測試冒充該 OS 語意。
 
 ##### (a3) delivery preflight 的落點與形態（#661）
 
@@ -836,11 +837,11 @@ Manager／reviewer／planner 併進 `cortex-svc`，同一條路徑在二分部�
 | `codex` | node script | ⛔ 空輸出 | `jit` | `cortex-job-jit@.service` |
 | `copilot` | shell → node | ⛔ 空輸出 | `jit` | `cortex-job-jit@.service` |
 
-> **#661：這條推導有一個已知的盲區。** 它的唯一輸入是 **executor 名**，因此涵蓋不了
-> 「executor 在執行途中再 exec 出來的 node 程式」，也涵蓋不了 Manager 的 system unit。
-> `srt`（由 `claude` exec、`strict` 剖面）與 `openspec`（由 Manager exec）目前都落在
-> 這個盲區裡。列舉形式見 §R1 (a2) 與 `permgen.unresolved_node_execution_surfaces()`；
-> 處置與 #643 同一條規矩：**量到才改，且改的是一份具名剖面，不是全域放寬**。
+> **#665：這條推導的盲區已由固定 wrapper 收斂。** `srt`（由 `claude` exec）與
+> `openspec`（由 Manager exec）都維持在 `MemoryDenyWriteExecute=yes` 的 strict unit，
+> 但部署入口固定為 `/usr/bin/node --jitless`，不建立新的 jit unit，也不把任何既有
+> unit 全域放寬。`permgen.unresolved_node_execution_surfaces()` 必須為空；受保護 RC
+> 仍需在實際 unit 逐支驗證。
 
 **規範**：
 
@@ -890,9 +891,10 @@ executor），build 域只剩 `claude`／`agy`，§R5／§R8 的 `independence_d
 少的那一項是 `MemoryDenyWriteExecute`。** 任何引用本 spec 的稽核、報告或 PR 描述
 SHALL 用這句話，MUST NOT 簡化成「job 已完整加固」。
 
-**未來選項（不在本票範圍）**：若某天 node 型 executor 有辦法在無 W+X 下執行
-（V8 的 jitless 模式、或 CLI 改為原生編譯），`jit` 剖面 SHALL 被移除而不是長期保留；
-移除的判準就是上表「完整加固面」欄全部變 ✅。
+**服務程式的例外已落地**：`srt`／`openspec` 以固定 V8 jitless wrapper 在無 W+X
+下執行；這不改變 `codex`／`copilot` 兩個 node 型 executor 仍需 `jit` 剖面的事實。
+未來若 node 型 executor 本身也能在無 W+X 下執行，`jit` 剖面 SHALL 再依同一判準移除，
+而不是永久保留。
 
 ##### 誠實的取捨：gate 執行身分買到的是圍堵，不是不可偽造（`#629`）
 

@@ -35,6 +35,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator import spool_slot
@@ -65,6 +66,9 @@ _BASE_ENV = {
     "PSC_BUILDER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
     "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+    "PSC_BUILDER_HOME": BUILDER_HOME,
+    "PSC_REVIEWER_HOME": REVIEWER_HOME,
+    "PSC_GATE_HOME": GATE_HOME,
     "HOME": "/var/lib/cortex-manager",
     # #708：reviewer job 現在也有一格由登記表導出的 log spool（掛在
     # `review-verdict-spool` 底下），因此 `launcher.launch()` 會在 coordinator 樹底下
@@ -131,6 +135,7 @@ def _preflight_patches(binary: str = "/usr/bin/systemctl"):
         mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         mock.patch.object(job_runner, "_account_exists", return_value=True),
         mock.patch.object(job_runner, "_group_exists", return_value=True),
+        mock.patch.object(job_runner, "_account_ids", side_effect=fake_account_ids),
         mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
         mock.patch.object(job_runner, "_is_executable", return_value=True),
         mock.patch.object(job_runner, "_unit_is_active", return_value=False),
@@ -173,9 +178,9 @@ def _launch_template(
         with tempfile.TemporaryDirectory() as root:
             spool_dir = str(Path(root) / "job-specs")
             Path(spool_dir).mkdir(parents=True)
-            # The production spool is Manager-owned and non-writable by other
-            # principals.  Do not let the host umask (some runners use 002)
-            # make this fixture fail the same invariant before launch starts.
+             # The production spool is Manager-owned and non-writable by other
+             # principals.  Do not let the host umask (some runners use 002)
+             # make this fixture fail the same invariant before launch starts.
             Path(spool_dir).chmod(0o700)
             log_dir = str(Path(root) / "logs")
             env = _template_env(spool_dir, **(env_overrides or {}))
@@ -372,8 +377,9 @@ class LaunchIdentityTests(unittest.TestCase):
         for leaked in _SECRET_ENV:
             self.assertNotIn(leaked, env, leaked)
         self.assertNotIn("VIRTUAL_ENV", env)
-        # daemon 的 HOME 絕不轉發；未設 PSC_REVIEWER_HOME 時交給 systemd 依 passwd 填。
-        self.assertNotIn("HOME", env)
+        # daemon 的 HOME 絕不轉發；reviewer 只能拿到自己那條 PSC_REVIEWER_HOME。
+        self.assertEqual(env["HOME"], _BASE_ENV["PSC_REVIEWER_HOME"])
+        self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
         self.assertEqual(env["PSC_JOB_ID"], "psc-0615-review")
 
     def test_reviewer_path_override_is_its_own_variable(self) -> None:

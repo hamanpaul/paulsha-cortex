@@ -297,7 +297,7 @@ def test_candidate_worktree_dirty_reevaluation_on_tick(tmp_path: Path, monkeypat
         "slice-3b",
         state="needs_human",
         gate_state="needs_human",
-        verification_hash=dirty_evidence["hash"],
+        current_verification_evidence_hash=dirty_evidence["hash"],
         current_evidence_refs=[dirty_evidence["path"]],
     )
 

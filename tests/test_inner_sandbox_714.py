@@ -47,6 +47,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _home_paths import BUILDER_HOME, GATE_HOME, REVIEWER_HOME, fake_account_ids
 import paulsha_cortex.coordinator.job_runner as job_runner
 import paulsha_cortex.coordinator.launcher as launcher_module
 from paulsha_cortex.coordinator import job_workspace
@@ -74,6 +75,9 @@ _BASE_ENV = {
     "PSC_BUILDER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
     "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+    "PSC_BUILDER_HOME": BUILDER_HOME,
+    "PSC_REVIEWER_HOME": REVIEWER_HOME,
+    "PSC_GATE_HOME": GATE_HOME,
     "HOME": "/var/lib/cortex-manager",
     "PSC_AGENTS_ROOT": _ISOLATED_AGENTS_ROOT,
     "LANG": "en_US.UTF-8",
@@ -376,6 +380,7 @@ def _template_seams():
         mock.patch.object(job_runner, "_systemd_booted", return_value=True),
         mock.patch.object(job_runner, "_account_exists", return_value=True),
         mock.patch.object(job_runner, "_group_exists", return_value=True),
+        mock.patch.object(job_runner, "_account_ids", side_effect=fake_account_ids),
         mock.patch.object(job_runner, "_unit_file_installed", return_value=True),
         mock.patch.object(job_runner, "_is_executable", return_value=True),
         mock.patch.object(job_runner, "_unit_is_active", return_value=False),

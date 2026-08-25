@@ -3,7 +3,7 @@ status: accepted
 work_item: trust-root-home-fail-closed
 ---
 
-# Trust-root HOME fail-closed Todo
+# Trust-root HOME fail-closed Plan
 
 Issue: `hamanpaul/paulsha-cortex#692`.
 
