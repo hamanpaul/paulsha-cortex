@@ -41,9 +41,6 @@ work_item: phase2-install-docker-qualification
 
 ## 5. Verification and closeout
 
-- [ ] BLOCKER：以 latest candidate 重跑 protected exact-SHA qualification，並保留 R9 T2
-  的六種 mutation denial 與合法 `repo-worktree` producer write evidence；本地 dummy
-  credential run 已通過 R9，尚不能替代 protected provider/live evidence。
 - [x] focused tests、full pytest、build/twine/clean-wheel smoke 與 repo preflight 全綠。
 - [x] #665 以 strict-compatible `/usr/bin/node --jitless` service wrappers 收斂
   `srt`／`openspec` W+X 缺口；#692 HOME 與 #763 Manager Git/recovery regression 已通過
@@ -56,6 +53,7 @@ work_item: phase2-install-docker-qualification
 會在最終 default-branch SHA 上重新驗證它們，避免 archive commit 與 exact-SHA RC 形成循環：
 
 - protected exact-SHA RC qualification 必須全綠，且 evidence 必須保留 R9 T2 的六種
-  mutation denial 與合法 `repo-worktree` producer write evidence。
+  mutation denial 與合法 `repo-worktree` producer write evidence；目前本地 dummy
+  credential run 已通過 R9，但尚不能替代 protected provider/live evidence。
 - exact-SHA RC、review、CI、OpenSpec archive 與版本政策全部通過後，才允許 `v0.2.0`
   GitHub Release；否則維持 blocked，且不發 PyPI。
