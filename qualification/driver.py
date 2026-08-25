@@ -1238,6 +1238,31 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     )
     legal_workspace.mkdir(mode=0o700, exist_ok=False)
     os.chown(legal_workspace, builder.pw_uid, builder.pw_gid)
+    manager_runtime_env = _installed_runtime_env()
+    manager_runtime_env["HOME"] = "/var/lib/cortex-manager"
+    # Start the real template unit only after provisioning every registered
+    # per-job surface through the same helpers as ``launcher.launch()``.
+    # Otherwise systemd namespace setup fails before the builder process runs,
+    # and this negative control would merely exercise an incomplete synthetic
+    # spec rather than the deployed builder contract.
+    prepare_runtime_code = (
+        "from paulsha_cortex.coordinator import spool_slot, job_workspace\n"
+        f"instance={legal_instance!r}\n"
+        "job_workspace.prepare_commit_spool(spool_key=instance)\n"
+        "spool_slot.provision_runtime_surfaces(\n"
+        "    principal='builder', job_id=instance,\n"
+        "    canonical_codex_home=spool_slot.canonical_codex_controls(\n"
+        "        'builder', manager_env=__import__('os').environ),\n"
+        "    account='cortex-builder')\n"
+    )
+    _require_success(
+        _run(
+            ("/opt/cortex/venv/bin/python", "-c", prepare_runtime_code),
+            user="cortex-manager",
+            env=manager_runtime_env,
+        ),
+        "gate Manager legal-job runtime-surface provisioning",
+    )
     spec_code = (
         "from paulsha_cortex.coordinator import job_runner\n"
         "from paulsha_cortex.coordinator.job_workspace import prepare_job_log_spool\n"
@@ -1252,8 +1277,6 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         "log_path=str(canonical_log), env={'HOME':'/var/lib/cortex-builder','PATH':'/usr/bin:/bin'})\n"
         "job_runner.write_job_spec(job_runner.job_spec_path(job_runner.DEFAULT_JOB_SPEC_SPOOL, instance), spec, account='cortex-builder')\n"
     )
-    manager_runtime_env = _installed_runtime_env()
-    manager_runtime_env["HOME"] = "/var/lib/cortex-manager"
     _require_success(
         _run(
             ("/opt/cortex/venv/bin/python", "-c", spec_code),

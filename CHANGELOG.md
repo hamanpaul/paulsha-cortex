@@ -14,6 +14,7 @@
 - **Phase 2 Docker RC qualification systemd 穩定性**：T3 每次 enforcement probe restart 前重置 Manager 的 start-rate counter，避免連續合法 restart 觸發 `StartLimitBurst` 造成 harness 假紅。
 
 - **Phase 2 Docker RC qualification legal-job probe**：gate Manager negative control 改用 production `prepare_job_log_spool()` 預建 canonical `job.jsonl`，讓 namespace probe 與實際 builder template contract 一致。
+- **Phase 2 Docker RC qualification legal-job surfaces**：legal builder control 啟動前改用 production `prepare_commit_spool()` 與 `provision_runtime_surfaces()` 建立 commit、monitor event、Codex home/cache 與 job-log per-job surfaces，確保實際 systemd template namespace 完整。
 
 - **Copilot foreign-review verdict spool permissions are now file-scoped**：headless
   reviewer argv 只授予 exact `verdict.json`、`rg` 與 `python3` checks，不再以整個
