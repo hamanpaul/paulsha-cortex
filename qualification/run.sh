@@ -203,7 +203,10 @@ import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
 # generated hooks are already present, so the scaffold is idempotent here and
 # does not replace them.
 docker exec "$container_name" sh -eu -c \
-    'python3 -m paulsha_cortex.trust_root scaffold | sh -eu'
+    'printf "%s\n" "{}" > /var/lib/cortex-reviewer-planner/.codex/auth.json
+     python3 -m paulsha_cortex.trust_root scaffold | sh -eu
+     rm -f /var/lib/cortex/config/codex-credentials/reviewer/auth.json
+     rm -f /var/lib/cortex-reviewer-planner/.codex/auth.json'
 
 docker exec "$container_name" cortex install trust-root activate --receipt "$receipt_path"
 install_evidence_path=$qualification_root/install-verification.json
