@@ -138,6 +138,7 @@ docker exec "$container_name" sh -eu -c '
     for principal in builder reviewer; do
         rm -f "/var/lib/cortex/config/codex-credentials/$principal/auth.json"
     done
+    rm -f /var/lib/cortex-builder/.codex/auth.json /var/lib/cortex-reviewer-planner/.codex/auth.json
 '
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$plan_path" --confirm-sha256 "$plan_sha" --receipt "$receipt_path"
