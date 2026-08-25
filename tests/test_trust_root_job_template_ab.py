@@ -52,6 +52,9 @@ _BASE_ENV = {
     "PSC_BUILDER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin:/bin",
     "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/local/bin:/usr/bin",
     "PSC_GATE_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
+    "PSC_BUILDER_HOME": "/__psc_test_home__/builder-home",
+    "PSC_REVIEWER_HOME": "/__psc_test_home__/review-home",
+    "PSC_GATE_HOME": "/__psc_test_home__/gate-home",
     "HOME": "/var/lib/cortex-manager",
     # conftest 的 `_clear_runtime_env` 把 PSC_AGENTS_ROOT 指向 per-test 暫存目錄，
     # 但本檔的 launch 測試以 `clear=True` 重建整份 environ（要驗的就是白名單本身），
@@ -943,7 +946,7 @@ class JobSpecContentTests(unittest.TestCase):
             "command": ["bash", "-c", "true"],
             "working_directory": "/wt",
             "log_path": "/logs/j.jsonl",
-            "env": {"PATH": "/usr/bin"},
+            "env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
         }
         for override in (
             {"command": []},
@@ -1358,7 +1361,7 @@ class ShimLogicTests(unittest.TestCase):
             "command": ["/bin/true"],
             "working_directory": str(root),
             "log_path": str(root / "job.jsonl"),
-            "env": {"PATH": "/usr/bin"},
+            "env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
         }
         spec.update(overrides)
         return spec
@@ -1493,7 +1496,10 @@ class ShimLogicTests(unittest.TestCase):
             self.assertEqual(rc, job_shim.EXIT_SPEC_ERROR)
             self.assertEqual(recorded["file"], "/bin/true")
             self.assertEqual(recorded["argv"], ["/bin/true"])
-            self.assertEqual(recorded["env"], {"PATH": "/usr/bin"})
+            self.assertEqual(
+                recorded["env"],
+                {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
+            )
             self.assertEqual(Path(recorded["cwd"]).resolve(), root.resolve())
             contents = log.read_text(encoding="utf-8")
             self.assertIn("MANAGER PREAMBLE", contents, "append，不得截掉 Manager 的前導輸出")

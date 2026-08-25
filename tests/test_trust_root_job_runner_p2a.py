@@ -42,12 +42,19 @@ _JOB_PATH_ENV = {
     job_runner.GATE_PATH_ENV: "/opt/cortex/toolchain/bin:/usr/bin:/bin",
 }
 
+_JOB_HOME_ENV = {
+    job_runner.BUILDER_HOME_ENV: "/__psc_test_home__/builder-home",
+    job_runner.REVIEWER_HOME_ENV: "/__psc_test_home__/review-home",
+    job_runner.GATE_HOME_ENV: "/__psc_test_home__/gate-home",
+}
+
 _BASE_ENV = {
     # daemon 自己的 PATH。**#679 起它不再被轉發**——留在這裡正是為了驗那件事：
     # job 的 PATH 不得等於 daemon 的 PATH。
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "HOME": "/var/lib/cortex-svc",
     **_JOB_PATH_ENV,
+    **_JOB_HOME_ENV,
     # conftest 的 `_clear_runtime_env` 把 PSC_AGENTS_ROOT 指向 per-test 暫存目錄，
     # 但本檔的 launch 測試以 `clear=True` 重建整份 environ（要驗的就是白名單本身），
     # 那層保護因此被清掉。顯式帶上一個 per-process 暫存根：`launcher.launch()` 會在
@@ -311,14 +318,15 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         self.assertEqual(env["PSC_REPO_ROOT"], "/opt/cortex/src")
 
     def test_daemon_home_is_never_forwarded(self) -> None:
-        # #588 第 1 點：daemon 的 HOME 是 cortex-svc 的樹；未設 PSC_BUILDER_HOME 時
-        # 交給 systemd 依 passwd 填 builder 自己的 HOME，launcher 一律不轉發。
+        # #588 第 1 點：daemon 的 HOME 是 cortex-svc 的樹；builder 只能拿到自己那條
+        # PSC_BUILDER_HOME，launcher 一律不轉發 daemon HOME。
         env = self._build()
-        self.assertNotIn("HOME", env)
+        self.assertEqual(env["HOME"], _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV])
+        self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
 
     def test_builder_home_override_is_used(self) -> None:
-        env = self._build(**{job_runner.BUILDER_HOME_ENV: "/var/lib/cortex-builder"})
-        self.assertEqual(env["HOME"], "/var/lib/cortex-builder")
+        env = self._build(**{job_runner.BUILDER_HOME_ENV: "/custom/cortex-builder"})
+        self.assertEqual(env["HOME"], "/custom/cortex-builder")
         self.assertNotEqual(env["HOME"], _BASE_ENV["HOME"])
 
     def test_path_comes_from_the_role_variable_and_never_from_the_daemon(self) -> None:
@@ -389,7 +397,7 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         with mock.patch.object(job_runner, "BUILDER_FORWARDED_ENV", poisoned):
             with self.assertRaises(JobRunnerError) as ctx:
                 job_runner.build_builder_env(
-                    manager_env={"SOME_API_KEY": "leaked", **_JOB_PATH_ENV},
+                    manager_env={"SOME_API_KEY": "leaked", **_JOB_PATH_ENV, **_JOB_HOME_ENV},
                     job_id="j",
                     slice_id="s",
                     repo_root="/r",
@@ -403,7 +411,8 @@ class BuilderEnvAllowlistTests(unittest.TestCase):
         with self.assertRaises(JobRunnerError) as ctx:
             job_runner.build_builder_env(
                 manager_env={
-                    job_runner.BUILDER_PATH_ENV: "/usr/bin\n--property=User=root"
+                    job_runner.BUILDER_PATH_ENV: "/usr/bin\n--property=User=root",
+                    job_runner.BUILDER_HOME_ENV: _JOB_HOME_ENV[job_runner.BUILDER_HOME_ENV],
                 },
                 job_id="j",
                 slice_id="s",
@@ -892,11 +901,11 @@ class DegradedLaunchTests(unittest.TestCase):
         # #262 D2：preflight 必須回報 job 真的會看到的環境，否則只是安慰劑。
         with mock.patch.dict(
             os.environ,
-            _degraded_env(**{job_runner.BUILDER_HOME_ENV: "/var/lib/cortex-builder"}),
+            _degraded_env(**{job_runner.BUILDER_HOME_ENV: "/__psc_test_home__/builder-home"}),
             clear=True,
         ):
             reported = SubprocessLauncher("codex").executor_environment()
-        self.assertEqual(reported.home, "/var/lib/cortex-builder")
+        self.assertEqual(reported.home, "/__psc_test_home__/builder-home")
         # #679：preflight 報的 PATH 也必須是 job 真的會拿到的那一份。
         self.assertEqual(reported.path, _JOB_PATH_ENV[job_runner.BUILDER_PATH_ENV])
 

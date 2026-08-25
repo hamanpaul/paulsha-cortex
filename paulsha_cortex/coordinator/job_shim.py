@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from typing import Mapping, Sequence
 
@@ -285,6 +286,22 @@ def resolve_job_env(spec: Mapping[str, object], environ: Mapping[str, str]) -> d
     """
 
     env = {str(k): str(v) for k, v in dict(spec["env"]).items()}  # type: ignore[index]
+    home = (env.get("HOME") or "").strip()
+    if not home:
+        raise ShimError(
+            "job spec 的 env 沒有 HOME——模板 unit 的 `Environment=HOME=` 到不了模型，"
+            "也不得回退到 unit/daemon 的 HOME。請確認 Manager 端已宣告 "
+            "PSC_BUILDER_HOME／PSC_REVIEWER_HOME／PSC_GATE_HOME。"
+        )
+    if not home.startswith("/"):
+        raise ShimError("job spec 的 env 裡的 HOME 必須是絕對路徑")
+    if os.path.lexists(home):
+        stat_result = os.lstat(home)
+        if stat.S_ISLNK(stat_result.st_mode):
+            raise ShimError("job spec 的 env 裡的 HOME 不得是 symlink")
+        if not stat.S_ISDIR(stat_result.st_mode):
+            raise ShimError("job spec 的 env 裡的 HOME 必須指向目錄")
+    env["HOME"] = home
     _apply_egress_proxy_env(env, environ)
     if (env.get("PATH") or "").strip():
         return env

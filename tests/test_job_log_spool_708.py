@@ -513,7 +513,7 @@ class ShimFailureRecordTests(unittest.TestCase):
                 "command": ["/bin/true"],
                 "working_directory": root,
                 "log_path": str(log_path),
-                "env": {"PATH": "/usr/bin"},
+                "env": {"HOME": "/__psc_test_home__/builder-home", "PATH": "/usr/bin"},
             }
             (spool / "wf-1.json").write_text(json.dumps(spec), encoding="utf-8")
             with mock.patch.object(

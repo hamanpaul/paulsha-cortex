@@ -939,7 +939,14 @@ def test_reviewer_never_receives_builder_event_producer_slot() -> None:
 @pytest.mark.parametrize("role", (job_runner.JOB_ROLE_BUILDER, job_runner.JOB_ROLE_REVIEW))
 def test_job_env_uses_authoritative_per_job_codex_and_cache_slots(role: str) -> None:
     env = job_runner.build_job_env(
-        manager_env={job_runner.resolve_job_role(role).path_env: "/usr/bin"},
+        manager_env={
+            job_runner.resolve_job_role(role).path_env: "/usr/bin",
+            job_runner.resolve_job_role(role).home_env: (
+                "/__psc_test_home__/review-home"
+                if role == job_runner.JOB_ROLE_REVIEW
+                else "/__psc_test_home__/builder-home"
+            ),
+        },
         job_id="job-a", slice_id="slice", repo_root="/repo", workspace=None, role=role,
     )
     instance = job_runner.template_instance_id("job-a")

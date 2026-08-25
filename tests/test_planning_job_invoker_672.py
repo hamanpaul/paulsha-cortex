@@ -120,7 +120,7 @@ class _Harness:
         self.env = {
             job_runner.JOB_RUNNER_ENV: job_runner.RUNNER_SYSTEMD_TEMPLATE,
             "PSC_REVIEWER_PATH": "/opt/cortex/toolchain/bin:/usr/bin:/bin",
-            "PSC_REVIEWER_HOME": "/var/lib/cortex-reviewer-planner",
+            "PSC_REVIEWER_HOME": "/__psc_test_home__/review-home",
         }
         real_prepare = job_runner.prepare_systemd_template
 

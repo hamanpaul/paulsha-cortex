@@ -3136,8 +3136,8 @@ class PathLayout:
         `$HOME is not defined`）與「憑證沒放好」長得一模一樣。產生器出這個值，是為了讓
         operator 落進 root-owned EnvironmentFile 的那一行有**單一來源**，不必手抄。
 
-        本函式只**出值**，不改 `job_runner` 的 fail-open/closed 語意——那屬於獨立票
-        （#686 已把理由寫進 `build_job_env()` 的 docstring）。
+        本函式只**出值**；#692 起 `job_runner.resolve_job_home()` 會把這份值當作
+        fail-closed 的唯一合法來源之一（與 unit 上的 `Environment=HOME=` 對齊）。
         """
         return self.home_of(account)
 

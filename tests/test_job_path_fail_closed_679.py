@@ -56,6 +56,12 @@ _ROLE_PATH_ENV = {
     job_runner.JOB_ROLE_GATE: job_runner.GATE_PATH_ENV,
 }
 
+_ROLE_HOME = {
+    job_runner.JOB_ROLE_BUILDER: "/__psc_test_home__/builder-home",
+    job_runner.JOB_ROLE_REVIEW: "/__psc_test_home__/review-home",
+    job_runner.JOB_ROLE_GATE: "/__psc_test_home__/gate-home",
+}
+
 
 def _manager_env(**overrides: str) -> dict[str, str]:
     """一份「Manager daemon 有自己的 PATH」的環境——本票的關鍵前提。"""
@@ -63,6 +69,9 @@ def _manager_env(**overrides: str) -> dict[str, str]:
     env = {
         "PATH": "/opt/cortex/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin",
         "LANG": "en_US.UTF-8",
+        job_runner.BUILDER_HOME_ENV: _ROLE_HOME[job_runner.JOB_ROLE_BUILDER],
+        job_runner.REVIEWER_HOME_ENV: _ROLE_HOME[job_runner.JOB_ROLE_REVIEW],
+        job_runner.GATE_HOME_ENV: _ROLE_HOME[job_runner.JOB_ROLE_GATE],
     }
     env.update(overrides)
     return env
@@ -240,7 +249,7 @@ def _spec(env: dict[str, str]) -> dict[str, object]:
         "command": ["bash", "-c", "true"],
         "working_directory": "/var/lib/cortex/worktree/demo",
         "log_path": "/var/lib/cortex/worktree/demo/demo.log",
-        "env": env,
+        "env": {"HOME": _ROLE_HOME[job_runner.JOB_ROLE_BUILDER], **env},
     }
 
 
