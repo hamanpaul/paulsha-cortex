@@ -29,6 +29,24 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Prepare trust-root OS fixtures
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends acl
+          for account in cortex-builder cortex-reviewer-planner cortex-manager cortex-gate; do
+            home="/var/lib/$account"
+            if ! getent passwd "$account" >/dev/null; then
+              sudo useradd --system --user-group --create-home \
+                --home-dir "$home" --shell /usr/sbin/nologin "$account"
+            fi
+            sudo install -d -o "$account" -g "$account" -m 0700 "$home"
+          done
+          command -v setfacl >/dev/null
+          for account in cortex-builder cortex-reviewer-planner cortex-manager cortex-gate; do
+            getent passwd "$account" >/dev/null
+          done
+
       - name: Install project and test dependencies
         run: |
           python -m pip install --upgrade pip

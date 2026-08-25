@@ -86,6 +86,17 @@ def test_tests_workflow_matches_release_pipeline_contract() -> None:
     matrix = strategy.get("matrix")
     assert isinstance(matrix, dict), "pytest job matrix must be a mapping"
     assert matrix.get("python-version") == ["3.10", "3.11", "3.12", "3.13"]
+    pytest_runs = _job_step_runs(pytest_job)
+    assert "sudo apt-get install --yes --no-install-recommends acl" in pytest_runs
+    assert "sudo useradd --system --user-group --create-home" in pytest_runs
+    for account in (
+        "cortex-builder",
+        "cortex-reviewer-planner",
+        "cortex-manager",
+        "cortex-gate",
+    ):
+        assert account in pytest_runs
+    assert "command -v setfacl" in pytest_runs
 
     build_job = jobs.get("build")
     assert isinstance(build_job, dict), "tests.yml must add a build job"
