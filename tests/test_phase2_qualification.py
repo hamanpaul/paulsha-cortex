@@ -237,6 +237,7 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
                 "gate",
             )
         ],
+        "authorized_mutations": [],
         "covered_assets": 1,
         "registry_asset_ids": ["jobs-registry"],
     }
@@ -611,6 +612,66 @@ def test_full_suite_validator_checks_evidence_semantics(tmp_path: Path) -> None:
     payload = _valid_full_qualification(tmp_path)
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def _add_authorized_repo_worktree_to_attack_matrix(tmp_path: Path) -> None:
+    attack_path = tmp_path / "evidence" / "attack-matrix.json"
+    attack = json.loads(attack_path.read_text(encoding="utf-8"))
+    operations = ("modify", "truncate", "delete", "replace", "symlink-swap", "rollback")
+    for operation in operations:
+        case = f"repo-worktree:{operation}"
+        attack["cases"].extend(
+            [
+                {
+                    "family": "durable-state",
+                    "case": case,
+                    "principal": "cortex-builder",
+                    "status": "passed",
+                    "returncode": 0,
+                },
+                {
+                    "family": "durable-state",
+                    "case": case,
+                    "principal": "cortex-reviewer-planner",
+                    "status": "passed",
+                    "returncode": 13,
+                },
+            ]
+        )
+        attack["authorized_mutations"].append(
+            {
+                "asset_id": "repo-worktree",
+                "principal": "cortex-builder",
+                "operation": operation,
+            }
+        )
+    attack["covered_assets"] = 2
+    attack["registry_asset_ids"].append("repo-worktree")
+    _write_json(attack_path, attack)
+
+
+def test_full_suite_validator_binds_authorized_workspace_mutations(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    _add_authorized_repo_worktree_to_attack_matrix(tmp_path)
+    _refresh_full_hashes(tmp_path, payload)
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    attack_path = tmp_path / "evidence" / "attack-matrix.json"
+    attack = json.loads(attack_path.read_text(encoding="utf-8"))
+    next(
+        row
+        for row in attack["cases"]
+        if row["case"] == "repo-worktree:delete" and row["principal"] == "cortex-builder"
+    )["returncode"] = 13
+    _write_json(attack_path, attack)
+    _refresh_full_hashes(tmp_path, payload)
+
+    rejected = _run_full_validator(tmp_path, payload)
+    assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
 @pytest.mark.parametrize(

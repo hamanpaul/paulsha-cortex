@@ -205,6 +205,36 @@ def test_plan_is_exact_artifact_bound_four_way_structured_desired_state(
     assert state_root["adoption_policy"] == "empty-managed-root-mount"
 
 
+def test_install_plan_binds_derived_traverse_acl_to_parent_directory(
+    tmp_path: Path,
+) -> None:
+    """A leaf ACL is not enough when its Manager-owned parent is 0700."""
+
+    plan = build_install_plan(
+        config=_safe_config(tmp_path),
+        candidate_wheel=_artifacts(tmp_path)[0],
+        bundle=_artifacts(tmp_path)[1],
+    )
+    monitor_root = str(tmp_path / "target/var/lib/cortex/monitor")
+    monitor_step = next(
+        step
+        for step in plan["apply_order"]
+        if step.get("path") == monitor_root and step.get("asset_type") == "directory"
+    )
+    assert {
+        (row["account"], row["perms"], row["default"])
+        for row in monitor_step["acls"]
+    } >= {("cortex-builder", "--x", False)}
+
+    spool = next(
+        asset for asset in plan["assets"] if asset["asset_id"] == "monitor-event-spool"
+    )
+    assert {
+        (row["account"], row["perms"], row["default"])
+        for row in spool["acls"]
+    } >= {("cortex-builder", "wx", False)}
+
+
 def test_scaffold_targets_are_applied_before_home_redirect_symlinks(
     tmp_path: Path,
 ) -> None:

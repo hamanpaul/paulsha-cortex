@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **Phase 2 Docker RC qualification 修正**：R9 現在依 trust-root `writer_accounts` 驗證合法 producer mutation，transactional install plan 同步套用 registry 推導的父層 traverse ACL，避免合法 spool／worktree 寫入被 0700 parent 錯誤阻擋。
+
 - **Copilot foreign-review verdict spool permissions are now file-scoped**：headless
   reviewer argv 只授予 exact `verdict.json`、`rg` 與 `python3` checks，不再以整個
   spool directory 或 broad bypass flags 放行。

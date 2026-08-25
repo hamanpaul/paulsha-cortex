@@ -976,12 +976,66 @@ def _finalized_asset_steps(
     assets: Sequence[Mapping[str, object]],
     generated: Mapping[str, Mapping[str, Mapping[str, str]]],
     state_root: str,
+    traverse_grants: Sequence[permgen.TraverseGrant] = (),
 ) -> list[dict[str, object]]:
     steps = _apply_steps(
         scaffolds=scaffolds,
         assets=assets,
         generated=generated,
     )
+    # The registry/permgen path contract includes the parent search ACLs needed
+    # to reach a cross-account leaf.  The runbook generator already emits these
+    # grants, but the transactional installer must carry the same contract in
+    # its typed desired state; otherwise a fresh container installs the leaf
+    # ACL and still leaves its 0700 parent impassable.
+    grants_by_path: dict[str, list[dict[str, object]]] = {}
+    for grant in traverse_grants:
+        grants_by_path.setdefault(grant.path, []).append(
+            {
+                "account": grant.account,
+                "perms": grant.acl.perms,
+                "default": False,
+            }
+        )
+    seen_grant_paths: set[str] = set()
+    for step in steps:
+        if (
+            step.get("kind") != "asset"
+            or step.get("asset_type") != "directory"
+            or not isinstance(step.get("path"), str)
+        ):
+            continue
+        path = str(step["path"])
+        rows = grants_by_path.get(path)
+        if not rows:
+            continue
+        existing = {
+            (row.get("account"), bool(row.get("default"))): row
+            for row in step.get("acls", [])
+            if isinstance(row, Mapping)
+        }
+        acl_rows = list(step.get("acls", []))
+        for row in rows:
+            key = (row["account"], False)
+            prior = existing.get(key)
+            if prior is not None:
+                perms = str(prior.get("perms", ""))
+                if "x" not in perms and "X" not in perms:
+                    raise InstallPlanError(
+                        f"traverse grant conflicts with existing ACL at {path}"
+                    )
+                continue
+            acl_rows.append(row)
+            existing[key] = row
+        step["acls"] = acl_rows
+        step["desired_sha256"] = _desired_digest(step)
+        seen_grant_paths.add(path)
+    missing_paths = sorted(set(grants_by_path) - seen_grant_paths)
+    if missing_paths:
+        raise InstallPlanError(
+            "derived traverse grant has no managed directory step: "
+            + ", ".join(missing_paths)
+        )
     state_steps = [
         step
         for step in steps
@@ -997,6 +1051,41 @@ def _finalized_asset_steps(
     state_steps[0]["adoption_policy"] = "empty-managed-root-mount"
     state_steps[0]["desired_sha256"] = _desired_digest(state_steps[0])
     return steps
+
+
+def _plan_traverse_grants(plan: Mapping[str, object]) -> tuple[permgen.TraverseGrant, ...]:
+    """Re-derive parent search ACLs while validating a serialized plan.
+
+    The grants are policy, not caller-supplied plan data.  Reconstruct the
+    configured layout and four-way scheme from the plan's already-validated
+    identity fields so a caller cannot make the apply validator accept a leaf
+    ACL without its required parent traverse chain.
+    """
+
+    accounts = plan.get("accounts")
+    roots = plan.get("roots")
+    source_repositories = plan.get("source_repositories")
+    if not isinstance(accounts, list) or not isinstance(roots, Mapping):
+        raise InstallPlanError("plan account/layout inventory is invalid")
+    if not isinstance(source_repositories, list):
+        raise InstallPlanError("plan source repository inventory is invalid")
+    config = {
+        "scheme": "four-way",
+        "instance": plan.get("instance", "cortex"),
+        "operator_account": plan.get("operator_account"),
+        "external_reader_account": plan.get("external_reader_account"),
+        "roots": dict(roots),
+        "source_repositories": list(source_repositories),
+    }
+    scheme = _configured_scheme(config)
+    layout, _ = _layout_from_config(config, accounts)
+    permission_plan = permgen.generate_plan(scheme)
+    return permgen.derive_traverse_grants(
+        permission_plan,
+        layout=layout,
+        scheme=scheme,
+        path_of=layout.asset_paths(),
+    )
 
 
 def _systemctl_steps() -> list[dict[str, object]]:
@@ -1203,6 +1292,12 @@ def build_install_plan(
         assets=assets,
         generated=generated,
         state_root=str(roots["state"]),
+        traverse_grants=permgen.derive_traverse_grants(
+            permission_plan,
+            layout=layout,
+            scheme=scheme,
+            path_of=asset_paths,
+        ),
     )
     plan: dict[str, object] = {
         "schema_version": 1,
@@ -2910,6 +3005,7 @@ def _validate_asset_step_bijection(
             assets=assets,
             generated=generated,
             state_root=str(state_root),
+            traverse_grants=_plan_traverse_grants(plan),
         )
     except (KeyError, TypeError, AttributeError) as exc:
         raise InstallPlanError("plan asset inventories are invalid") from exc

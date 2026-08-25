@@ -72,6 +72,16 @@ REQUIRED_RELEASE_TESTS = {
     "full-dispatch-closeout",
     "manager-github-dry-run-push",
 }
+R9_HEADLESS_PRINCIPALS = {"cortex-builder", "cortex-reviewer-planner"}
+R9_MUTATIONS = {
+    "modify",
+    "truncate",
+    "delete",
+    "replace",
+    "symlink-swap",
+    "rollback",
+}
+R9_DENIAL_RETURNCODES = {1, 13, 30}  # EPERM, EACCES, EROFS
 
 
 class ValidationError(ValueError):
@@ -224,6 +234,7 @@ def _validate_full_suite_artifacts(
             "families",
             "cases",
             "negative_controls",
+            "authorized_mutations",
             "covered_assets",
             "registry_asset_ids",
         },
@@ -242,6 +253,7 @@ def _validate_full_suite_artifacts(
     cases = _list(attack["cases"], "attack-matrix.cases")
     seen_case_ids: dict[str, set[str]] = {family: set() for family in required_families}
     durable_counts: dict[str, int] = {}
+    durable_rows: dict[str, list[dict[str, Any]]] = {}
     for index, raw in enumerate(cases):
         row = _mapping(
             raw,
@@ -255,6 +267,7 @@ def _validate_full_suite_artifacts(
         seen_case_ids[family].add(case_id)
         if family == "durable-state":
             durable_counts[case_id] = durable_counts.get(case_id, 0) + 1
+            durable_rows.setdefault(case_id, []).append(row)
     required_prefixes = {
         "capability": {"T1.1", "T1.2", "T1.3", "T1.4"},
         "enforcement-plane": {f"T3.{index}" for index in range(1, 11)},
@@ -276,19 +289,59 @@ def _validate_full_suite_artifacts(
         _fail("attack-matrix durable registry coverage is inconsistent")
     for asset_id in asset_ids:
         _nonempty_string(asset_id, "attack-matrix.registry_asset_ids[]")
-        for operation in (
-            "modify",
-            "truncate",
-            "delete",
-            "replace",
-            "symlink-swap",
-            "rollback",
-        ):
+        for operation in R9_MUTATIONS:
             case_id = f"{asset_id}:{operation}"
             if durable_counts.get(case_id) != 2:
                 _fail(
                     f"durable-state matrix must test {case_id} for both headless accounts"
                 )
+
+    authorized_raw = attack["authorized_mutations"]
+    if not isinstance(authorized_raw, list):
+        _fail("attack-matrix.authorized_mutations must be an array")
+    authorized: set[tuple[str, str, str]] = set()
+    for index, raw in enumerate(authorized_raw):
+        row = _mapping(
+            raw,
+            f"attack-matrix.authorized_mutations[{index}]",
+            {"asset_id", "principal", "operation"},
+        )
+        asset_id = _nonempty_string(
+            row["asset_id"], f"attack-matrix.authorized_mutations[{index}].asset_id"
+        )
+        principal = _nonempty_string(
+            row["principal"], f"attack-matrix.authorized_mutations[{index}].principal"
+        )
+        operation = _nonempty_string(
+            row["operation"], f"attack-matrix.authorized_mutations[{index}].operation"
+        )
+        if asset_id not in asset_ids:
+            _fail(f"authorized mutation names an uncovered asset: {asset_id}")
+        if principal not in R9_HEADLESS_PRINCIPALS:
+            _fail(f"authorized mutation names an unsupported headless principal: {principal}")
+        if operation not in R9_MUTATIONS:
+            _fail(f"authorized mutation names an unsupported operation: {operation}")
+        key = (asset_id, principal, operation)
+        if key in authorized:
+            _fail(f"duplicate authorized mutation: {asset_id}:{operation}:{principal}")
+        authorized.add(key)
+
+    for asset_id in asset_ids:
+        for operation in R9_MUTATIONS:
+            case_id = f"{asset_id}:{operation}"
+            rows = durable_rows[case_id]
+            if {str(row["principal"]) for row in rows} != R9_HEADLESS_PRINCIPALS:
+                _fail(f"durable-state matrix must cover both declared headless principals: {case_id}")
+            for row in rows:
+                key = (asset_id, str(row["principal"]), operation)
+                returncode = row["returncode"]
+                if not isinstance(returncode, int):
+                    _fail(f"durable-state returncode is not an integer: {case_id}")
+                if key in authorized:
+                    if returncode != 0:
+                        _fail(f"authorized durable mutation did not succeed: {case_id}")
+                elif returncode not in R9_DENIAL_RETURNCODES:
+                    _fail(f"unauthorized durable mutation was not denied: {case_id}")
     controls = _list(attack["negative_controls"], "attack-matrix.negative_controls")
     control_families: set[str] = set()
     for index, raw in enumerate(controls):

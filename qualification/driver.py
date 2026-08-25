@@ -383,6 +383,58 @@ def _fs_denied(
     )
 
 
+def _fs_allowed(
+    cases: list[dict[str, object]],
+    *,
+    family: str,
+    case_id: str,
+    user: str,
+    expression: str,
+) -> None:
+    """Run a filesystem mutation that the installed plan explicitly allows.
+
+    R9 is authority-aware: a job-visible staging asset may be writable by its
+    declared producer, while the same operation must be denied to every other
+    headless principal.  Recording the successful operation in the attack
+    matrix prevents a missing ACL from being mistaken for a protected asset.
+    """
+
+    result = _run(_fs_probe(expression), user=user, env=_account_env(user), timeout=30)
+    cases.append(
+        {
+            "family": family,
+            "case": case_id,
+            "principal": user,
+            "status": "passed" if result.returncode == 0 else "failed",
+            "returncode": result.returncode,
+        }
+    )
+    if result.returncode != 0:
+        # Keep a failed authority probe actionable: an ACL failure is otherwise
+        # reported only as errno 13 and the disposable host is gone before an
+        # operator can inspect the parent traverse contract.
+        detail = (result.stderr or result.stdout).strip().replace("\n", " ")[:200]
+        match = re.search(r"Path\((['\"])(/[^'\"]+)\1\)", expression)
+        if match:
+            target = match.group(2)
+            diagnostics: list[str] = []
+            for argv in (
+                ("namei", "-l", target),
+                ("getfacl", "-p", str(Path(target).parent)),
+                ("getfacl", "-p", target),
+            ):
+                probe = _run(argv)
+                text = (probe.stdout or probe.stderr).strip().replace("\n", " ")
+                if text:
+                    diagnostics.append(text[:500])
+            if diagnostics:
+                detail = f"{detail} {' | '.join(diagnostics)}".strip()
+        raise QualificationFailure(
+            f"{family}/{case_id} authorized as {user} failed "
+            f"rc={result.returncode}: {detail}"
+        )
+
+
 def _positive(
     controls: list[dict[str, object]],
     *,
@@ -652,6 +704,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
     }
     covered_assets = 0
     registry_asset_ids: list[str] = []
+    authorized_mutations: list[dict[str, str]] = []
     for asset in assets:
         if not isinstance(asset, Mapping) or asset.get("tier") not in {
             "TIER_0",
@@ -662,6 +715,13 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         if not isinstance(asset_id, str) or not asset_id:
             raise QualificationFailure("Tier-0/Tier-1 asset has no asset_id")
         registry_asset_ids.append(asset_id)
+        writer_accounts = asset.get("writer_accounts")
+        if not isinstance(writer_accounts, list) or any(
+            not isinstance(account, str) or not account for account in writer_accounts
+        ):
+            raise QualificationFailure(
+                f"Tier-0/Tier-1 asset has no canonical writer_accounts: {asset_id}"
+            )
         raw_path = asset.get("path")
         if not isinstance(raw_path, str) or not raw_path.startswith("/"):
             raise QualificationFailure(
@@ -677,22 +737,101 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
         suffix = hashlib.sha256(asset_id.encode()).hexdigest()[:16]
         target = container / f".cortex-r9-{suffix}"
         target.write_bytes(b"current-valid-content")
-        manager = pwd.getpwnam("cortex-manager")
-        os.chown(target, manager.pw_uid, manager.pw_gid)
-        os.chmod(target, 0o600)
+        owner_name = asset.get("owner")
+        if not isinstance(owner_name, str) or not owner_name:
+            raise QualificationFailure(f"durable asset has no owner: {asset_id}")
+        # A job-visible spool grants its producer ``wx`` on the directory.  The
+        # producer creates the child inode, so the probe must model that
+        # ownership before checking content mutations.  Starting with a
+        # Manager-owned child would make a valid write-only spool ACL look like
+        # a denial.  Runtime-managed worktrees are the exception: their
+        # production helper deliberately keeps the Manager as inode owner and
+        # grants the job account a named ACL recursively.
+        target_owner_name = owner_name
+        if (
+            asset.get("is_directory") is True
+            and asset.get("runtime_managed") is not True
+        ):
+            target_owner_name = next(
+                (
+                    principal
+                    for principal in principals
+                    if principal in writer_accounts
+                ),
+                owner_name,
+            )
+        try:
+            owner = pwd.getpwnam(target_owner_name)
+        except KeyError as exc:
+            raise QualificationFailure(
+                f"durable asset probe owner is not an installed account: {asset_id}"
+            ) from exc
+        os.chown(target, owner.pw_uid, owner.pw_gid)
+        raw_mode = asset.get("mode")
+        if not isinstance(raw_mode, str) or re.fullmatch(r"[0-7]{4,5}", raw_mode) is None:
+            raise QualificationFailure(f"durable asset mode is invalid: {asset_id}")
+        os.chmod(target, int(raw_mode, 8) & 0o777)
+        raw_acls = asset.get("acls", [])
+        if not isinstance(raw_acls, list):
+            raise QualificationFailure(f"durable asset ACL inventory is invalid: {asset_id}")
+        for row in raw_acls:
+            if not isinstance(row, Mapping) or row.get("default") is True:
+                continue
+            account = row.get("account")
+            perms = row.get("perms")
+            if not isinstance(account, str) or not isinstance(perms, str):
+                raise QualificationFailure(f"durable asset ACL row is invalid: {asset_id}")
+            _require_success(
+                _run(("setfacl", "-m", f"u:{account}:{perms}", str(target))),
+                f"R9 ACL proxy setup for {asset_id}/{account}",
+            )
         baseline = target.read_bytes()
         covered_assets += 1
         for principal in principals:
             for operation, expression in operations.items():
-                _fs_denied(
-                    cases,
-                    family="durable-state",
-                    case_id=f"{asset_id}:{operation}",
-                    user=principal,
-                    expression=f"p=Path({str(target)!r})\n{expression}",
-                )
+                case_id = f"{asset_id}:{operation}"
+                if principal in writer_accounts:
+                    _fs_allowed(
+                        cases,
+                        family="durable-state",
+                        case_id=case_id,
+                        user=principal,
+                        expression=f"p=Path({str(target)!r})\n{expression}",
+                    )
+                    authorized_mutations.append(
+                        {
+                            "asset_id": asset_id,
+                            "principal": principal,
+                            "operation": operation,
+                        }
+                    )
+                else:
+                    _fs_denied(
+                        cases,
+                        family="durable-state",
+                        case_id=case_id,
+                        user=principal,
+                        expression=f"p=Path({str(target)!r})\n{expression}",
+                    )
                 replacement = target.with_name(target.name + ".replacement")
                 replacement.unlink(missing_ok=True)
+                if target.is_symlink():
+                    target.unlink()
+                if not target.is_file():
+                    target.write_bytes(b"current-valid-content")
+                target.write_bytes(b"current-valid-content")
+                os.chown(target, owner.pw_uid, owner.pw_gid)
+                os.chmod(target, int(raw_mode, 8) & 0o777)
+                for row in raw_acls:
+                    if not isinstance(row, Mapping) or row.get("default") is True:
+                        continue
+                    account = row.get("account")
+                    perms = row.get("perms")
+                    if isinstance(account, str) and isinstance(perms, str):
+                        _require_success(
+                            _run(("setfacl", "-m", f"u:{account}:{perms}", str(target))),
+                            f"R9 ACL proxy restore for {asset_id}/{account}",
+                        )
                 if (
                     not target.is_file()
                     or target.is_symlink()
@@ -701,17 +840,18 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                     raise QualificationFailure(
                         f"durable-state probe changed authority proxy: {asset_id}"
                     )
-        _positive(
-            controls,
-            family="durable-state",
-            case_id=f"durable-manager-write:{asset_id}",
-            user="cortex-manager",
-            argv=(
-                "/usr/bin/python3",
-                "-c",
-                f"from pathlib import Path; Path({str(target)!r}).write_bytes(b'current-valid-content')",
-            ),
-        )
+        if "cortex-manager" in writer_accounts:
+            _positive(
+                controls,
+                family="durable-state",
+                case_id=f"durable-manager-write:{asset_id}",
+                user="cortex-manager",
+                argv=(
+                    "/usr/bin/python3",
+                    "-c",
+                    f"from pathlib import Path; Path({str(target)!r}).write_bytes(b'current-valid-content')",
+                ),
+            )
         target.unlink(missing_ok=True)
     if covered_assets == 0:
         raise QualificationFailure(
@@ -1134,6 +1274,7 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             "families": sorted(families),
             "cases": cases,
             "negative_controls": controls,
+            "authorized_mutations": authorized_mutations,
             "covered_assets": covered_assets,
             "registry_asset_ids": sorted(registry_asset_ids),
         },
