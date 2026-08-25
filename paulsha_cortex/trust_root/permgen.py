@@ -7799,15 +7799,6 @@ def build_account_gitconfig(
         "[safe]",
     ]
     body += [f"\tdirectory = {path}" for path in safe_dirs]
-    # #763: Git transport is a Manager responsibility.  Deliver the gh helper
-    # only to the root-owned Manager config; model jobs must never inherit the
-    # Manager's GitHub credential path.
-    if principal is Principal.MANAGER:
-        body += [
-            "",
-            '[credential "https://github.com"]',
-            "\thelper = !/usr/bin/gh auth git-credential",
-        ]
     return GitConfigFile(
         install_path=install_path,
         account=account,
