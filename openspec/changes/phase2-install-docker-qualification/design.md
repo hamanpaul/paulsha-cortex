@@ -67,6 +67,12 @@ wheelhouse 安裝，禁止 editable install 或 `PYTHONPATH` 偷讀 checkout。
 provider/model metadata、service identity 與 artifact hashes。quota/login/model mismatch/fallback/
 SKIP 皆為失敗且不自動 retry。
 
+Provider preflight 必須走釘選 CLI 的 machine-readable contract：AGY 1.1.18 使用 `/quota` 的
+JSON payload；Codex 0.149.0 使用 app-server `account/read` 與 `account/rateLimits/read`；
+Copilot 1.0.80 使用 headless SDK server 的 `account.getCurrentAuth` 與 `account.getQuota`。
+`doctor --json`、互動式 slash command、session usage 或人類可讀輸出都不視為 login/quota
+證據；任何 protocol error、缺欄位或 exhausted snapshot 都在 provider smoke 前 fail closed。
+
 ### 7. Release exact-SHA join gate
 
 release workflow 在建立 tag 對應的 GitHub Release 前，下載由 RC workflow 產出的 evidence，驗：

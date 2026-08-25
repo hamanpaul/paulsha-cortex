@@ -143,11 +143,21 @@ def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
         "--output-format",
         "json",
     )
+    assert adapters["copilot"].version is None
+    assert adapters["copilot"].status_command[-4:] == (
+        "--headless",
+        "--no-auto-update",
+        "--stdio",
+        "--no-auto-login",
+    )
+    assert adapters["copilot"].status_kind == "copilot-app-server"
     assert adapters["codex"].version == "0.149.0"
-    assert adapters["codex"].status_command[-2:] == ("doctor", "--json")
+    assert adapters["codex"].status_command[-2:] == ("app-server", "--stdio")
+    assert adapters["codex"].status_kind == "codex-app-server"
     serialized = repr(adapters)
     assert "status --output-format json" not in serialized
     assert "login status --json" not in serialized
+    assert "doctor" not in serialized
 
 
 def test_agy_preflight_accepts_machine_readable_quota_without_prompt_or_retry(
@@ -212,34 +222,164 @@ def test_agy_preflight_rejects_exhausted_machine_readable_quota(
         driver._provider_preflight("agy", "cortex-reviewer-planner")
 
 
-def test_codex_doctor_schema_without_login_or_quota_fails_closed_once(
+def test_copilot_app_server_accepts_authenticated_quota_snapshots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
     calls: list[tuple[str, ...]] = []
-    doctor = {
-        "schemaVersion": 1,
-        "overallStatus": "ok",
-        "codexVersion": "0.149.0",
-        "checks": {
-            "runtime.provenance": {"status": "pass"},
-            "network.provider_reachability": {"status": "pass"},
-        },
-    }
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
-        if argv[-1] == "--version":
-            return _result(driver, argv, stdout="codex-cli 0.149.0\n")
-        return _result(driver, argv, stdout=json.dumps(doctor))
+        return _result(driver, argv, stdout="Copilot CLI 1.0.80\n")
 
     monkeypatch.setattr(driver, "_run", fake_run)
-    with pytest.raises(driver.QualificationFailure, match="login/quota"):
+    monkeypatch.setattr(
+        driver,
+        "_copilot_app_server_exchange",
+        lambda _command, **_kwargs: (
+            {
+                "id": 2,
+                "result": {
+                    "authInfo": {"type": "user", "login": "redacted-user"}
+                },
+            },
+            {
+                "id": 3,
+                "result": {
+                    "quotaSnapshots": {
+                        "premium_interactions": {
+                            "remainingPercentage": 65,
+                            "entitlementRequests": 100,
+                            "usedRequests": 35,
+                        },
+                        "chat": {"isUnlimitedEntitlement": True},
+                    }
+                },
+            },
+        ),
+    )
+
+    assert driver._provider_preflight("copilot", "cortex-reviewer-planner") == {
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+    }
+    assert calls == [("/opt/cortex/toolchain/bin/copilot", "--version")]
+
+
+def test_copilot_app_server_without_auth_or_quota_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda argv, **_kwargs: _result(driver, argv, stdout="Copilot CLI 1.0.80\n"),
+    )
+    monkeypatch.setattr(
+        driver,
+        "_copilot_app_server_exchange",
+        lambda _command, **_kwargs: (
+            {"id": 2, "result": {}},
+            {
+                "id": 3,
+                "error": {
+                    "code": -32603,
+                    "message": "Not authenticated",
+                },
+            },
+        ),
+    )
+    with pytest.raises(driver.QualificationFailure, match="authenticated account"):
+        driver._provider_preflight("copilot", "cortex-reviewer-planner")
+
+
+def test_codex_app_server_accepts_authenticated_rate_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        return _result(driver, argv, stdout="codex-cli 0.149.0\n")
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver,
+        "_codex_app_server_exchange",
+        lambda command, **_kwargs: (
+            {
+                "id": 2,
+                "result": {
+                    "account": {
+                        "type": "chatgpt",
+                        "email": "redacted@example.invalid",
+                        "planType": "pro",
+                    },
+                    "requiresOpenaiAuth": False,
+                },
+            },
+            {
+                "id": 3,
+                "result": {
+                    "rateLimits": {
+                        "primary": {
+                            "usedPercent": 25,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1_900_000_000,
+                        },
+                        "secondary": None,
+                        "rateLimitReachedType": None,
+                        "spendControlReached": None,
+                    }
+                },
+            },
+        ),
+    )
+
+    assert driver._provider_preflight("codex", "cortex-builder") == {
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+    }
+    assert calls == [("/opt/cortex/toolchain/bin/codex", "--version")]
+
+
+def test_codex_app_server_without_live_account_or_rate_limits_fails_closed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+    monkeypatch.setattr(driver, "_account_env", lambda _account: {})
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        return _result(driver, argv, stdout="codex-cli 0.149.0\n")
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver,
+        "_codex_app_server_exchange",
+        lambda _command, **_kwargs: (
+            {"id": 2, "result": {"account": None, "requiresOpenaiAuth": True}},
+            {
+                "id": 3,
+                "error": {
+                    "code": -32600,
+                    "message": "codex account authentication required",
+                },
+            },
+        ),
+    )
+    with pytest.raises(driver.QualificationFailure, match="authenticated account"):
         driver._provider_preflight("codex", "cortex-builder")
-    assert calls == [
-        ("/opt/cortex/toolchain/bin/codex", "--version"),
-        ("/opt/cortex/toolchain/bin/codex", "doctor", "--json"),
-    ]
+    assert calls == [("/opt/cortex/toolchain/bin/codex", "--version")]
 
 
 @pytest.mark.parametrize(

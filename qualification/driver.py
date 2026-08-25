@@ -16,6 +16,7 @@ import json
 import os
 import pwd
 import re
+import select
 import shutil
 import signal
 import stat
@@ -65,25 +66,32 @@ PROVIDER_PREFLIGHTS = {
         ),
         status_kind="agy-quota",
     ),
-    # The staged Copilot CLI likewise has no qualification-approved structured
-    # login/quota status interface.  Keep this fail-closed rather than guessing
-    # from human-readable output.
+    # Copilot's pinned headless SDK server exposes structured auth/quota RPCs;
+    # do not infer either from the interactive /user or /usage commands.
     "copilot": ProviderPreflightAdapter(
         version=None,
         version_command=("/opt/cortex/toolchain/bin/copilot", "--version"),
-        status_command=None,
+        status_command=(
+            "/opt/cortex/toolchain/bin/copilot",
+            "--headless",
+            "--no-auto-update",
+            "--stdio",
+            "--no-auto-login",
+        ),
+        status_kind="copilot-app-server",
     ),
-    # doctor --json is supported by Codex 0.149.0.  Its schema is inspected
-    # below; this pinned version does not expose live login or quota fields.
+    # Codex app-server is the pinned CLI's structured account/rate-limit
+    # protocol.  ``doctor --json`` only reports local health and is not a
+    # provider capability proof.
     "codex": ProviderPreflightAdapter(
         version="0.149.0",
         version_command=("/opt/cortex/toolchain/bin/codex", "--version"),
         status_command=(
             "/opt/cortex/toolchain/bin/codex",
-            "doctor",
-            "--json",
+            "app-server",
+            "--stdio",
         ),
-        status_kind="codex-doctor",
+        status_kind="codex-app-server",
     ),
 }
 
@@ -1473,6 +1481,435 @@ def _json_records(output: str) -> list[object]:
     return records
 
 
+def _codex_app_server_exchange(
+    command: Sequence[str],
+    *,
+    user: str,
+    env: Mapping[str, str],
+    timeout: int = 45,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Read Codex account and rate-limit state through its JSON-RPC server.
+
+    The app-server protocol is line-delimited JSON.  The process is always
+    short-lived and its output stays in memory; account identifiers and token
+    material must never reach qualification logs or error text.
+    """
+
+    argv = list(command)
+    if user:
+        argv = ["/usr/sbin/runuser", "-u", user, "--", *argv]
+    process_env = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+    process_env.update(env)
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=process_env,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+
+    def send(message: Mapping[str, object]) -> None:
+        if process.stdin is None:
+            raise QualificationFailure("Codex app-server stdin is unavailable")
+        process.stdin.write(
+            json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n"
+        )
+        process.stdin.flush()
+
+    def receive(request_id: int) -> Mapping[str, object]:
+        if process.stdout is None:
+            raise QualificationFailure("Codex app-server stdout is unavailable")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QualificationFailure("Codex app-server status probe timed out")
+            ready, _unused_write, _unused_error = select.select(
+                [process.stdout], [], [], remaining
+            )
+            if not ready:
+                raise QualificationFailure("Codex app-server status probe timed out")
+            line = process.stdout.readline()
+            if line == "":
+                raise QualificationFailure("Codex app-server closed before status response")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise QualificationFailure(
+                    "Codex app-server emitted a non-JSON status record"
+                ) from exc
+            if not isinstance(record, Mapping):
+                raise QualificationFailure("Codex app-server status record is not an object")
+            # Notifications, including remote-control status updates, have no
+            # request id and are ignored while waiting for our response.
+            if record.get("id") != request_id:
+                continue
+            return record
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "cortex_rc",
+                        "title": "Cortex RC qualification",
+                        "version": "0.1.0",
+                    }
+                },
+            }
+        )
+        initialize = receive(1)
+        if "error" in initialize or not isinstance(initialize.get("result"), Mapping):
+            raise QualificationFailure("Codex app-server initialize failed")
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "initialized",
+                "params": {},
+            }
+        )
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account/read",
+                "params": {"refreshToken": False},
+            }
+        )
+        account = receive(2)
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "account/rateLimits/read",
+                "params": None,
+            }
+        )
+        rate_limits = receive(3)
+        return account, rate_limits
+    except (BrokenPipeError, OSError, subprocess.SubprocessError) as exc:
+        raise QualificationFailure("Codex app-server status probe failed") from exc
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                process.wait()
+
+
+def _codex_preflight_from_responses(
+    account_response: Mapping[str, object],
+    rate_limits_response: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the stable account/rate-limit fields without recording PII."""
+
+    account_result = account_response.get("result")
+    account = account_result.get("account") if isinstance(account_result, Mapping) else None
+    account_type = account.get("type") if isinstance(account, Mapping) else None
+    if account_type not in {"apiKey", "chatgpt"}:
+        raise QualificationFailure(
+            "provider codex app-server did not report an authenticated account"
+        )
+
+    rate_result = rate_limits_response.get("result")
+    if not isinstance(rate_result, Mapping):
+        raise QualificationFailure(
+            "provider codex app-server did not report structured rate limits"
+        )
+    snapshots: list[Mapping[str, object]] = []
+    by_limit = rate_result.get("rateLimitsByLimitId")
+    if isinstance(by_limit, Mapping):
+        snapshots.extend(value for value in by_limit.values() if isinstance(value, Mapping))
+    single = rate_result.get("rateLimits")
+    if isinstance(single, Mapping):
+        snapshots.append(single)
+    if not snapshots:
+        raise QualificationFailure(
+            "provider codex app-server returned no rate-limit buckets"
+        )
+
+    observed_window = False
+    for snapshot in snapshots:
+        if snapshot.get("rateLimitReachedType") is not None:
+            raise QualificationFailure(
+                "provider codex app-server reports exhausted rate limits"
+            )
+        if snapshot.get("spendControlReached") is True:
+            raise QualificationFailure(
+                "provider codex app-server reports spend control reached"
+            )
+        credits = snapshot.get("credits")
+        if isinstance(credits, Mapping):
+            if credits.get("hasCredits") is not True and credits.get("unlimited") is not True:
+                raise QualificationFailure(
+                    "provider codex app-server reports no remaining credits"
+                )
+        for window_name in ("primary", "secondary"):
+            window = snapshot.get(window_name)
+            if window is None:
+                continue
+            if not isinstance(window, Mapping):
+                raise QualificationFailure(
+                    "provider codex app-server returned an invalid rate-limit window"
+                )
+            used = window.get("usedPercent")
+            if not isinstance(used, int) or isinstance(used, bool) or not 0 <= used <= 100:
+                raise QualificationFailure(
+                    "provider codex app-server returned an invalid usage percentage"
+                )
+            duration = window.get("windowDurationMins")
+            if duration is not None and (
+                not isinstance(duration, int) or isinstance(duration, bool) or duration <= 0
+            ):
+                raise QualificationFailure(
+                    "provider codex app-server returned an invalid rate-limit duration"
+                )
+            resets_at = window.get("resetsAt")
+            if resets_at is not None and (
+                not isinstance(resets_at, int) or isinstance(resets_at, bool) or resets_at <= 0
+            ):
+                raise QualificationFailure(
+                    "provider codex app-server returned an invalid rate-limit reset"
+                )
+            observed_window = True
+            if used >= 100:
+                raise QualificationFailure(
+                    "provider codex app-server reports no remaining rate-limit capacity"
+                )
+    if not observed_window:
+        raise QualificationFailure(
+            "provider codex app-server returned no usable rate-limit window"
+        )
+    return {
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+    }
+
+
+def _copilot_app_server_exchange(
+    command: Sequence[str],
+    *,
+    user: str,
+    env: Mapping[str, str],
+    timeout: int = 45,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Read Copilot auth and quota through its headless SDK JSON-RPC server."""
+
+    argv = list(command)
+    if user:
+        argv = ["/usr/sbin/runuser", "-u", user, "--", *argv]
+    process_env = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+    process_env.update(env)
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=process_env,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    buffer = b""
+
+    def send(message: Mapping[str, object]) -> None:
+        if process.stdin is None:
+            raise QualificationFailure("Copilot app-server stdin is unavailable")
+        body = json.dumps(message, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        process.stdin.write(
+            b"Content-Length: "
+            + str(len(body)).encode("ascii")
+            + b"\r\n\r\n"
+            + body
+        )
+        process.stdin.flush()
+
+    def receive(request_id: int) -> Mapping[str, object]:
+        nonlocal buffer
+        if process.stdout is None:
+            raise QualificationFailure("Copilot app-server stdout is unavailable")
+        while True:
+            while b"\r\n\r\n" in buffer:
+                header, body = buffer.split(b"\r\n\r\n", 1)
+                fields: dict[bytes, bytes] = {}
+                for line in header.split(b"\r\n"):
+                    key, separator, value = line.partition(b":")
+                    if separator:
+                        fields[key.strip().lower()] = value.strip()
+                length = fields.get(b"content-length")
+                if length is None:
+                    raise QualificationFailure(
+                        "Copilot app-server response has no content length"
+                    )
+                try:
+                    body_length = int(length)
+                except ValueError as exc:
+                    raise QualificationFailure(
+                        "Copilot app-server response has an invalid content length"
+                    ) from exc
+                if body_length < 0:
+                    raise QualificationFailure(
+                        "Copilot app-server response has an invalid content length"
+                    )
+                if len(body) < body_length:
+                    break
+                payload = body[:body_length]
+                buffer = body[body_length:]
+                try:
+                    record = json.loads(payload)
+                except json.JSONDecodeError as exc:
+                    raise QualificationFailure(
+                        "Copilot app-server emitted a non-JSON status record"
+                    ) from exc
+                if not isinstance(record, Mapping):
+                    raise QualificationFailure(
+                        "Copilot app-server status record is not an object"
+                    )
+                if record.get("id") == request_id:
+                    return record
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QualificationFailure("Copilot app-server status probe timed out")
+            ready, _unused_write, _unused_error = select.select(
+                [process.stdout], [], [], remaining
+            )
+            if not ready:
+                raise QualificationFailure("Copilot app-server status probe timed out")
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                raise QualificationFailure(
+                    "Copilot app-server closed before status response"
+                )
+            buffer += chunk
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "connect", "params": {}})
+        connected = receive(1)
+        if "error" in connected or not isinstance(connected.get("result"), Mapping):
+            raise QualificationFailure("Copilot app-server connect failed")
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "account.getCurrentAuth",
+                "params": {},
+            }
+        )
+        auth = receive(2)
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "account.getQuota",
+                "params": {},
+            }
+        )
+        quota = receive(3)
+        return auth, quota
+    except (BrokenPipeError, OSError, subprocess.SubprocessError) as exc:
+        raise QualificationFailure("Copilot app-server status probe failed") from exc
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                process.wait()
+
+
+def _copilot_preflight_from_responses(
+    auth_response: Mapping[str, object],
+    quota_response: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate Copilot's provider-native auth and quota snapshots."""
+
+    auth_result = auth_response.get("result")
+    auth_info = auth_result.get("authInfo") if isinstance(auth_result, Mapping) else None
+    if not isinstance(auth_info, Mapping) or not auth_info:
+        raise QualificationFailure(
+            "provider copilot app-server did not report an authenticated account"
+        )
+    quota_result = quota_response.get("result")
+    snapshots = (
+        quota_result.get("quotaSnapshots")
+        if isinstance(quota_result, Mapping)
+        else None
+    )
+    if not isinstance(snapshots, Mapping) or not snapshots:
+        raise QualificationFailure(
+            "provider copilot app-server did not report structured quota snapshots"
+        )
+    observed = False
+    for snapshot in snapshots.values():
+        if not isinstance(snapshot, Mapping):
+            raise QualificationFailure(
+                "provider copilot app-server returned an invalid quota snapshot"
+            )
+        if snapshot.get("isUnlimitedEntitlement") is True:
+            observed = True
+            continue
+        remaining = snapshot.get("remainingPercentage")
+        if (
+            not isinstance(remaining, (int, float))
+            or isinstance(remaining, bool)
+            or not 0 <= float(remaining) <= 100
+        ):
+            raise QualificationFailure(
+                "provider copilot app-server returned an invalid remaining percentage"
+            )
+        observed = True
+        if float(remaining) <= 0:
+            raise QualificationFailure(
+                "provider copilot app-server reports no remaining quota"
+            )
+        has_quota = snapshot.get("hasQuota")
+        if has_quota is False:
+            raise QualificationFailure(
+                "provider copilot app-server reports no remaining quota"
+            )
+    if not observed:
+        raise QualificationFailure(
+            "provider copilot app-server returned no usable quota snapshot"
+        )
+    return {
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+    }
+
+
 def _provider_preflight(provider: str, account: str) -> dict[str, object]:
     adapter = PROVIDER_PREFLIGHTS[provider]
     version = _run(
@@ -1499,10 +1936,28 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
             "login/quota status; qualification fails closed"
         )
 
+    account_env = _account_env(account)
+    if adapter.status_kind == "codex-app-server":
+        account_response, rate_limits_response = _codex_app_server_exchange(
+            adapter.status_command,
+            user=account,
+            env=account_env,
+            timeout=45,
+        )
+        return _codex_preflight_from_responses(account_response, rate_limits_response)
+    if adapter.status_kind == "copilot-app-server":
+        auth_response, quota_response = _copilot_app_server_exchange(
+            adapter.status_command,
+            user=account,
+            env=account_env,
+            timeout=45,
+        )
+        return _copilot_preflight_from_responses(auth_response, quota_response)
+
     status = _run(
         adapter.status_command,
         user=account,
-        env=_account_env(account),
+        env=account_env,
         timeout=45,
     )
     records = _json_records(status.stdout)
@@ -1557,9 +2012,6 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
             "fallback": False,
         }
 
-    # Codex 0.149.0 doctor JSON contains local runtime, configuration, network,
-    # and filesystem checks, but no structured live login or quota result.  Do
-    # not infer either from overallStatus or synthesize an "available" value.
     raise QualificationFailure(
         f"provider {provider} {adapter.version} structured status lacks live "
         "login/quota fields; qualification fails closed"
