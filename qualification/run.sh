@@ -132,8 +132,12 @@ docker exec "$container_name" sh -eu -c '
         install -d -o root -g root -m 0755 "/var/lib/$account/.codex/plugins" "/var/lib/$account/.codex/skills"
         printf "%s\n" "# qualification control fixture" > "/var/lib/$account/.codex/config.toml"
         test -f "/var/lib/$account/.codex/hooks.json"
+        printf "%s\n" "{}" > "/var/lib/$account/.codex/auth.json"
     done
     python3 -m paulsha_cortex.trust_root scaffold | sh -eu
+    for principal in builder reviewer; do
+        rm -f "/var/lib/cortex/config/codex-credentials/$principal/auth.json"
+    done
 '
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$plan_path" --confirm-sha256 "$plan_sha" --receipt "$receipt_path"
