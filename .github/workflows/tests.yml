@@ -40,7 +40,10 @@ jobs:
               sudo useradd --system --user-group --create-home \
                 --home-dir "$home" --shell /usr/sbin/nologin "$account"
             fi
-            sudo install -d -o "$account" -g "$account" -m 0700 "$home"
+            # The test process is the unprivileged GitHub runner.  Keep the
+            # fixture account-owned, but let it stat the production fallback
+            # path; the deployed trust-root homes remain 0700.
+            sudo install -d -o "$account" -g "$account" -m 0755 "$home"
           done
           command -v setfacl >/dev/null
           for account in cortex-builder cortex-reviewer-planner cortex-manager cortex-gate; do

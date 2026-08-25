@@ -9,8 +9,9 @@
 
 - **CI trust-root OS fixtures**：Tests workflow 的每個 Python matrix job 現在先安裝
   `acl`，建立 `cortex-builder`、`cortex-reviewer-planner`、`cortex-manager`、
-  `cortex-gate` system accounts 與 root-owned HOME，讓 `setfacl`／`pwd` 的 CI 前提
-  與部署 qualification 一致，避免環境缺口造成假紅。
+  `cortex-gate` system accounts 與 account-owned、runner 可解析的 `0755` HOME，讓
+  `setfacl`／`pwd` 的 CI 前提與部署 qualification 一致；production trust-root HOME
+  仍維持 `0700`，避免環境缺口造成假紅。
 - **#665 trust-root service runtime hardening**：`srt` 與 `openspec` 的 root-owned toolchain
   wrapper 固定使用 `/usr/bin/node --jitless`，保留 reviewer／Manager 的
   `MemoryDenyWriteExecute=yes`，並以 registry 機械標記該兩個 service surface 已收斂；

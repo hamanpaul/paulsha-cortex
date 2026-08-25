@@ -1,4 +1,4 @@
-修正 Tests workflow 的 OS fixture：每個 Python matrix job 先安裝 `acl`，並建立 trust-root 四個 system accounts 與其 root-owned HOME；因此 CI 與實機 deployment 的 `setfacl`／`pwd` 前提一致，不再以缺少帳號造成大量假紅。
+修正 Tests workflow 的 OS fixture：每個 Python matrix job 先安裝 `acl`，並建立 trust-root 四個 system accounts 與其 account-owned、runner 可解析的 `0755` HOME；因此 CI 與實機 deployment 的 `setfacl`／`pwd` 前提一致，不再以缺少帳號造成大量假紅（production trust-root HOME 仍為 `0700`）。
 
 `#665` 的 srt/openspec service tool wrapper 現在固定使用 `/usr/bin/node --jitless`，維持 reviewer 與 Manager unit 的 `MemoryDenyWriteExecute=yes`；rootless regression 驗證 `unresolved_node_execution_surfaces()` 為空，受保護 RC 仍需在實際 systemd unit 驗證。
 
