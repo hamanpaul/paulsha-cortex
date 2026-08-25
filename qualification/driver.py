@@ -752,6 +752,18 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
             container.mkdir(mode=0o700, exist_ok=True)
             os.chown(container, 0, 0)
             os.chmod(container, 0o700)
+        elif asset_id == "handoff-manifest":
+            # This manager-only child shares the static job placeholder with
+            # the runtime worktree.  Give the probe its own Manager-owned
+            # parent so headless accounts cannot inherit builder ACLs while
+            # the Manager positive control remains meaningful.
+            container = Path(
+                "/var/lib/cortex-manager/.cortex-r9-handoff-manifest"
+            )
+            container.mkdir(mode=0o700, exist_ok=True)
+            manager = pwd.getpwnam("cortex-manager")
+            os.chown(container, manager.pw_uid, manager.pw_gid)
+            os.chmod(container, 0o700)
         else:
             container = authority if asset.get("is_directory") else authority.parent
         if not container.is_dir() or container.is_symlink():
