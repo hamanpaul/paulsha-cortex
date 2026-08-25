@@ -1035,6 +1035,13 @@ def _permission_attack_matrix(receipt: Mapping[str, Any], evidence_dir: Path) ->
                 expression=expression,
             )
         (path.with_name(path.name + ".older")).unlink(missing_ok=True)
+        # The matrix deliberately restarts the same unit after every probe.
+        # Reset systemd's start-rate counter first, otherwise the harness
+        # itself trips StartLimitBurst before the later denial cases run.
+        _require_success(
+            _run(("systemctl", "reset-failed", "cortex-manager.service")),
+            f"reset Manager start counter after {case_id}",
+        )
         _require_success(
             _run(("systemctl", "daemon-reload")), f"daemon-reload after {case_id}"
         )

@@ -11,6 +11,8 @@
 
 - **Phase 2 Docker RC qualification 邊界固化**：`review-verdict` 僅保留為 Phase 2a legacy fallback，R9 將其列為 deny-only asset，權威寫入路徑固定為 `review-verdict-spool`；job-visible 的 manager-only `handoff-manifest` 與 legacy verdict probe 各自使用隔離 parent，避免 builder worktree default ACL 汙染測試；rootless Docker fixture 的 restore 也改由合成 owner 還原，不放寬 production ACL。
 
+- **Phase 2 Docker RC qualification systemd 穩定性**：T3 每次 enforcement probe restart 前重置 Manager 的 start-rate counter，避免連續合法 restart 觸發 `StartLimitBurst` 造成 harness 假紅。
+
 - **Copilot foreign-review verdict spool permissions are now file-scoped**：headless
   reviewer argv 只授予 exact `verdict.json`、`rg` 與 `python3` checks，不再以整個
   spool directory 或 broad bypass flags 放行。
