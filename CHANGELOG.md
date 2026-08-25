@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **Foreign-review verdict spool path hardening**：launcher 現在要求 verdict spool 是已存在的
+  實體目錄，並拒絕 symlink ancestor，避免 sandbox grant 被父層 redirect 導出
+  Manager-owned spool；relative、leaf symlink 與 review-only grant 仍維持 fail-closed。
 - **CI trust-root OS fixtures**：Tests workflow 的每個 Python matrix job 現在先安裝
   `acl`，建立 `cortex-builder`、`cortex-reviewer-planner`、`cortex-manager`、
   `cortex-gate` system accounts 與 account-owned、runner 可解析的 `0755` HOME，讓

@@ -761,6 +761,13 @@ def _validated_verdict_spool_dir(
     path = Path(verdict_spool_dir)
     if not path.is_absolute() or path.is_symlink():
         raise ValueError("verdict spool directory must be an absolute non-symlink path")
+    if not path.exists() or not path.is_dir():
+        raise ValueError("verdict spool directory must be an existing directory")
+    # A non-symlink leaf can still have a symlinked ancestor.  Resolve only
+    # after rejecting that shape so an injected spool cannot escape the
+    # Manager-owned tree through a parent redirect.
+    if path.absolute() != path.resolve():
+        raise ValueError("verdict spool directory has a symlinked ancestor")
     return path.resolve()
 
 
