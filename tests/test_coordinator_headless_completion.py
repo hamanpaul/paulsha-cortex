@@ -45,6 +45,24 @@ class CrossProcessCompletionTests(unittest.TestCase):
             self.assertEqual(updated["exit_code"], 0)
             self.assertEqual(JobRegistry(state_path=state).get_job("slice-a-1")["status"], "exited")
 
+    def test_sentinel_waits_for_gate_ledger_while_wrapper_is_still_alive(self) -> None:
+        """The model sentinel precedes the slower Manager-authored ledger."""
+        import os
+
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "jobs.json"
+            log_path = Path(d) / "slice-a.jsonl"
+            log_path.write_text('{"type":"result","ok":true}\n', encoding="utf-8")
+            _seed_job(state, log_path=str(log_path), pid=os.getpid())
+            exit_sentinel_path(str(log_path)).write_text("0", encoding="utf-8")
+
+            fresh_reg = JobRegistry(state_path=state)
+            disp = Dispatcher(fresh_reg, pane_sender=None, worktree_creator=None)
+            updated = disp.poll_headless_done("slice-a-1")
+
+            self.assertEqual(updated["status"], "dispatched")
+            self.assertIsNone(updated["exit_code"])
+
     def test_sentinel_nonzero_marks_failed_from_fresh_process(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             state = Path(d) / "jobs.json"

@@ -313,6 +313,46 @@ def test_retry_card_refuses_a_card_with_accepted_evidence(tmp_path: Path) -> Non
     assert registry.get_job(job_id)["workflow_evidence"]["hash"] == "e" * 64
 
 
+def test_retry_card_reopens_after_a_newer_failed_builder_attempt(
+    tmp_path: Path,
+) -> None:
+    """舊 evidence 留存，但最新修復派工失敗時可再開同一張 builder card。
+
+    這是 provider 在 repair 回合於 envelope 前失敗的窄化 recovery；不是把已
+    採信的 attempt 覆寫，也不適用 reviewer card 或最新 attempt 已採信的情況。
+    """
+
+    snapshot, registry, run, job_id = _stuck_run(tmp_path)
+    registry.bind_workflow_evidence(
+        job_id,
+        locator={
+            "kind": "workflow-build-result",
+            "path": "evidence/accepted.json",
+            "hash": "e" * 64,
+        },
+        subject_head=HEAD,
+    )
+    failed = registry.create_job(
+        task="wf-tdd-red-repair-provider-failure",
+        persona="builder",
+        branch="feature/12-demo",
+        pane="",
+        worktree=str(tmp_path),
+        workflow_run_id=run.run_id,
+        workflow_card="tdd-red",
+        workflow_phase="build",
+    )
+    registry.update_headless_result(failed["job_id"], status="failed", exit_code=1)
+
+    result = _retry_card(
+        tmp_path, snapshot, registry, expected_run_id=run.run_id, card="tdd-red"
+    )["result"]
+
+    assert result["reason"] == "builder-card-redispatched"
+    assert registry.get_job(job_id)["workflow_evidence"]["hash"] == "e" * 64
+    assert registry.get_job(failed["job_id"])["workflow_evidence"] is None
+
+
 def test_retry_card_requires_exact_run_cas(tmp_path: Path) -> None:
     snapshot, registry, run, _job_id = _stuck_run(tmp_path)
     before = registry.get_workflow_run(run.run_id).to_dict()

@@ -725,6 +725,10 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#623'
       - kind: path
         ref: 'docs/superpowers/workstreams/trust-root-manager-visibility/todo.md'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#788'
+      - kind: openspec
+        ref: 'trust-root-manager-visibility'
     excludes: []
   trust-root-executor-hardening:
     title: 'trust-root-executor-hardening'
@@ -739,28 +743,46 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#681'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#789'
+      - kind: openspec
+        ref: 'trust-root-copilot-toolchain-pinning'
     excludes: []
   trust-root-home-fail-closed:
     title: 'trust-root-home-fail-closed'
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#692'
+      - kind: openspec
+        ref: 'trust-root-home-fail-closed'
     excludes: []
   generated-asset-attestation:
     title: 'generated-asset-attestation'
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#695'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#790'
+      - kind: openspec
+        ref: 'generated-asset-attestation'
     excludes: []
   trust-root-agent-loop-qualification:
     title: 'trust-root-agent-loop-qualification'
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#716'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#791'
+      - kind: openspec
+        ref: 'trust-root-agent-loop-qualification'
     excludes: []
   manager-gitconfig-delivery:
     title: 'manager-gitconfig-delivery'
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#763'
+      - kind: github_pr
+        ref: 'hamanpaul/paulsha-cortex#792'
+      - kind: openspec
+        ref: 'manager-gitconfig-delivery'
     excludes: []

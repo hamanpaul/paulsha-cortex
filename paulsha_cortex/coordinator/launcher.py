@@ -1200,6 +1200,13 @@ def build_agy_argv(
     if allow_unsafe:
         raise ValueError("agy executor does not support unsafe mode")
     argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
+    # Antigravity's plan sandbox otherwise runs in an isolated workspace and
+    # cannot inspect a reviewer checkout at all.  Planner cards receive their
+    # source material through Manager-owned input envelopes and stay zero-tool;
+    # reviewer cards need the explicitly provisioned disposable checkout so
+    # their read-only inspection is about the exact Candidate.
+    if review_only and worktree is not None:
+        argv.extend(["--add-dir", str(Path(worktree).resolve())])
     if model is not None:
         argv.extend(["--model", model])
     return argv
