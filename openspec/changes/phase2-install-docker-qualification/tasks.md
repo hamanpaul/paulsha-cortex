@@ -44,11 +44,18 @@ work_item: phase2-install-docker-qualification
 - [ ] BLOCKER：以 latest candidate 重跑 protected exact-SHA qualification，並保留 R9 T2
   的六種 mutation denial 與合法 `repo-worktree` producer write evidence；本地 dummy
   credential run 已通過 R9，尚不能替代 protected provider/live evidence。
-- [ ] focused tests、full pytest、build/twine/clean-wheel smoke 與 repo preflight 全綠。
+- [x] focused tests、full pytest、build/twine/clean-wheel smoke 與 repo preflight 全綠。
 - [x] #665 以 strict-compatible `/usr/bin/node --jitless` service wrappers 收斂
   `srt`／`openspec` W+X 缺口；#692 HOME 與 #763 Manager Git/recovery regression 已通過
   focused suite。
 - [x] 每條 review finding 獨立驗證並分類修/駁/接受列管；修後重審。
 - [x] 對抗審查只列 BLOCKER/MAJOR；未處置缺陷為 FAIL，明文有界殘餘風險本身不構成 FAIL（D6 不可 waiver）。
-- [ ] OpenSpec validate/apply-complete 後 archive；Conventional Commit；依授權建立 PR。
-- [ ] exact-SHA RC qualification 全綠後才允許 `v0.2.0` GitHub Release；否則明確停在 blocked，且不發 PyPI。
+## External release gates (enforced outside the OpenSpec task checklist)
+
+以下不是可在 archive 前預先勾選的 implementation task；`.github/workflows/release.yml`
+會在最終 default-branch SHA 上重新驗證它們，避免 archive commit 與 exact-SHA RC 形成循環：
+
+- protected exact-SHA RC qualification 必須全綠，且 evidence 必須保留 R9 T2 的六種
+  mutation denial 與合法 `repo-worktree` producer write evidence。
+- exact-SHA RC、review、CI、OpenSpec archive 與版本政策全部通過後，才允許 `v0.2.0`
+  GitHub Release；否則維持 blocked，且不發 PyPI。

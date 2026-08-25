@@ -27,8 +27,11 @@
 - PR review/merge, CI check runs, OpenSpec archive, and the exact-SHA RC evidence have
   not yet been produced on the default branch.
 
-These are release blockers, not accepted release residuals. The OpenSpec change must
-remain unarchived and `v0.2.0` must not be tagged or released while any remains.
+These are release blockers, not accepted release residuals. Source closeout may archive
+the OpenSpec change once its implementation checklist and repository gates are complete,
+but the release workflow must still reject the final default-branch SHA until the protected
+exact-SHA RC evidence, review/merge, and version policy are all satisfied. `v0.2.0` must
+not be tagged or released while any blocker remains.
 
 ## Rollback plan
 
