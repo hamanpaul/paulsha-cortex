@@ -137,7 +137,12 @@ def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
 
     assert adapters["agy"].version == "1.1.18"
     assert adapters["agy"].version_command[-1] == "--version"
-    assert adapters["agy"].status_command is None
+    assert adapters["agy"].status_command[-4:] == (
+        "-p",
+        "/quota",
+        "--output-format",
+        "json",
+    )
     assert adapters["codex"].version == "0.149.0"
     assert adapters["codex"].status_command[-2:] == ("doctor", "--json")
     serialized = repr(adapters)
@@ -145,22 +150,66 @@ def test_provider_preflight_uses_only_supported_pinned_argv() -> None:
     assert "login status --json" not in serialized
 
 
-def test_agy_preflight_fails_closed_without_prompt_or_retry(
+def test_agy_preflight_accepts_machine_readable_quota_without_prompt_or_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     driver = _load_driver()
     calls: list[tuple[str, ...]] = []
+    quota = {
+        "status": "SUCCESS",
+        "command": {
+            "name": "usage",
+            "data": {
+                "groups": [
+                    {"buckets": [{"remaining_fraction": 0.5}]},
+                ]
+            },
+        },
+    }
 
     def fake_run(argv, **_kwargs):
         calls.append(tuple(argv))
-        return _result(driver, argv, stdout="agy version 1.1.18\n")
+        if argv[-1] == "--version":
+            return _result(driver, argv, stdout="agy version 1.1.18\n")
+        return _result(driver, argv, stdout=json.dumps(quota))
 
     monkeypatch.setattr(driver, "_run", fake_run)
-    with pytest.raises(driver.QualificationFailure, match="no structured live"):
-        driver._provider_preflight("agy", "cortex-reviewer-planner")
-    assert len(calls) == 1
+    assert driver._provider_preflight("agy", "cortex-reviewer-planner") == {
+        "status": "ready",
+        "authenticated": True,
+        "quota": "available",
+        "fallback": False,
+    }
+    assert len(calls) == 2
     assert calls[0][-1] == "--version"
-    assert "status" not in calls[0]
+    assert calls[1][-4:] == ("-p", "/quota", "--output-format", "json")
+
+
+def test_agy_preflight_rejects_exhausted_machine_readable_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _load_driver()
+
+    def fake_run(argv, **_kwargs):
+        if argv[-1] == "--version":
+            return _result(driver, argv, stdout="agy version 1.1.18\n")
+        return _result(
+            driver,
+            argv,
+            stdout=json.dumps(
+                {
+                    "status": "SUCCESS",
+                    "command": {
+                        "name": "usage",
+                        "data": {"groups": [{"buckets": [{"remaining_fraction": 0}]}]},
+                    },
+                }
+            ),
+        )
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="no remaining capacity"):
+        driver._provider_preflight("agy", "cortex-reviewer-planner")
 
 
 def test_codex_doctor_schema_without_login_or_quota_fails_closed_once(

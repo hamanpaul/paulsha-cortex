@@ -47,15 +47,23 @@ class ProviderPreflightAdapter:
     version: str | None
     version_command: tuple[str, ...]
     status_command: tuple[str, ...] | None
+    status_kind: str | None = None
 
 
 PROVIDER_PREFLIGHTS = {
-    # agy 1.1.18 has no status/login/quota subcommand.  In particular, passing
-    # the word "status" starts print mode with that word as a prompt.
+    # agy 1.1.18 exposes the read-only /quota slash command as a structured
+    # print-mode response; do not pass a made-up "status" subcommand.
     "agy": ProviderPreflightAdapter(
         version="1.1.18",
         version_command=("/opt/cortex/toolchain/bin/agy", "--version"),
-        status_command=None,
+        status_command=(
+            "/opt/cortex/toolchain/bin/agy",
+            "-p",
+            "/quota",
+            "--output-format",
+            "json",
+        ),
+        status_kind="agy-quota",
     ),
     # The staged Copilot CLI likewise has no qualification-approved structured
     # login/quota status interface.  Keep this fail-closed rather than guessing
@@ -75,6 +83,7 @@ PROVIDER_PREFLIGHTS = {
             "doctor",
             "--json",
         ),
+        status_kind="codex-doctor",
     ),
 }
 
@@ -1503,6 +1512,50 @@ def _provider_preflight(provider: str, account: str) -> dict[str, object]:
             f"provider {provider} structured status probe did not return one "
             "successful JSON object"
         )
+
+    if adapter.status_kind == "agy-quota":
+        command = payload.get("command")
+        data = command.get("data") if isinstance(command, Mapping) else None
+        groups = data.get("groups") if isinstance(data, Mapping) else None
+        if (
+            payload.get("status") != "SUCCESS"
+            or not isinstance(command, Mapping)
+            or command.get("name") != "usage"
+            or not isinstance(groups, list)
+            or not groups
+        ):
+            raise QualificationFailure(
+                f"provider {provider} structured quota probe lacks a successful "
+                "usage payload"
+            )
+        remaining: list[float] = []
+        for group in groups:
+            buckets = group.get("buckets") if isinstance(group, Mapping) else None
+            if not isinstance(buckets, list) or not buckets:
+                raise QualificationFailure(
+                    f"provider {provider} structured quota payload has no buckets"
+                )
+            for bucket in buckets:
+                fraction = bucket.get("remaining_fraction") if isinstance(bucket, Mapping) else None
+                if not isinstance(fraction, (int, float)) or isinstance(fraction, bool):
+                    raise QualificationFailure(
+                        f"provider {provider} structured quota payload has an invalid remaining fraction"
+                    )
+                if not 0 <= float(fraction) <= 1:
+                    raise QualificationFailure(
+                        f"provider {provider} structured quota payload has an out-of-range remaining fraction"
+                    )
+                remaining.append(float(fraction))
+        if not remaining or min(remaining) <= 0:
+            raise QualificationFailure(
+                f"provider {provider} structured quota reports no remaining capacity"
+            )
+        return {
+            "status": "ready",
+            "authenticated": True,
+            "quota": "available",
+            "fallback": False,
+        }
 
     # Codex 0.149.0 doctor JSON contains local runtime, configuration, network,
     # and filesystem checks, but no structured live login or quota result.  Do
