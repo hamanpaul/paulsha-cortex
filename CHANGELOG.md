@@ -15,6 +15,7 @@
 
 - **Phase 2 Docker RC qualification legal-job probe**：gate Manager negative control 改用 production `prepare_job_log_spool()` 預建 canonical `job.jsonl`，讓 namespace probe 與實際 builder template contract 一致。
 - **Phase 2 Docker RC qualification legal-job surfaces**：legal builder control 啟動前改用 production `prepare_commit_spool()` 與 `provision_runtime_surfaces()` 建立 commit、monitor event、Codex home/cache 與 job-log per-job surfaces，確保實際 systemd template namespace 完整。
+- **Phase 2 Docker RC qualification Codex controls**：reference container 在首次 installer apply 建立帳號後，以非機密 root-owned legacy fixture 執行 production `trust_root scaffold`，讓 real template 的 Codex read-only bindings 有完整 deployment input；credential 仍只走 protected stdin import。
 
 - **Copilot foreign-review verdict spool permissions are now file-scoped**：headless
   reviewer argv 只授予 exact `verdict.json`、`rg` 與 `python3` checks，不再以整個

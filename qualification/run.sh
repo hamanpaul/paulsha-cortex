@@ -122,6 +122,19 @@ plan_sha=$(docker exec "$container_name" sha256sum "$plan_path" | awk '{print $1
 # installer owns receipt replay; the harness never translates its plan to shell.
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$plan_path" --confirm-sha256 "$plan_sha" --receipt "$receipt_path"
+# The real template unit has read-only bindings for the deployment-owned Codex
+# controls. A clean reference image has no operator HOME, so seed only a
+# non-secret, root-owned legacy control fixture after the installer creates the
+# four accounts, then execute the production scaffold helper. Credentials are
+# still imported exclusively through the protected stdin path below.
+docker exec "$container_name" sh -eu -c '
+    for account in cortex-builder cortex-reviewer-planner; do
+        install -d -o root -g root -m 0755 "/var/lib/$account/.codex/plugins" "/var/lib/$account/.codex/skills"
+        printf "%s\n" "# qualification control fixture" > "/var/lib/$account/.codex/config.toml"
+        printf "%s\n" "{}" > "/var/lib/$account/.codex/hooks.json"
+    done
+    python3 -m paulsha_cortex.trust_root scaffold | sh -eu
+'
 docker exec "$container_name" cortex install trust-root apply \
     --plan "$plan_path" --confirm-sha256 "$plan_sha" --receipt "$receipt_path"
 
