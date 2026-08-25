@@ -782,9 +782,10 @@ def _generated_inventory(
                 relative = PurePosixPath(entrypoint)
                 if relative.is_absolute() or ".." in relative.parts or not relative.parts:
                     raise InstallPlanError(f"unsafe tree toolchain entrypoint: {name}")
+                node_mode = "--jitless " if permgen.toolchain_requires_jitless(name) else ""
                 content = (
                     "#!/bin/sh\n"
-                    f'exec /usr/bin/node "{executable}/{relative.as_posix()}" "$@"\n'
+                    f'exec /usr/bin/node {node_mode}"{executable}/{relative.as_posix()}" "$@"\n'
                 )
             else:
                 raise InstallPlanError(f"unsupported toolchain shape for {name}: {shape}")

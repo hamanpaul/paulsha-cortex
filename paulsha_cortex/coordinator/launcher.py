@@ -365,7 +365,18 @@ def _srt_runtime_root() -> Path | None:
     if executable is None:
         return None
     resolved = Path(executable).resolve()
-    for parent in resolved.parents:
+    candidates = list(resolved.parents)
+    # Phase 2 trust-root installs a regular root-owned wrapper so it can pin
+    # `/usr/bin/node --jitless` under MDWE.  Preserve the package-root contract
+    # that the historical symlink entrypoint provided by deriving the sibling
+    # toolchain package only from the canonical `toolchain/bin/<name>` shape.
+    if resolved.parent.name == "bin" and resolved.parent.parent.name == "toolchain":
+        candidates.append(resolved.parent.parent / "lib" / resolved.name)
+    seen: set[Path] = set()
+    for parent in candidates:
+        if parent in seen:
+            continue
+        seen.add(parent)
         metadata = parent / "package.json"
         if not metadata.is_file() or metadata.is_symlink():
             continue

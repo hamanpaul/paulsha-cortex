@@ -9,7 +9,8 @@ work_item: phase2-install-docker-qualification
 
 - [x] 記錄 origin/main exact SHA、dirty/untracked preservation 與獨立 worktree boundary。
 - [x] 逐 commit 重驗並最小納入 `c35516e`、`98978b6`，不整包採用 live-closeout branches。
-- [x] 以 code/test/live issue evidence 重新裁決 #623/#665/#681/#692/#695/#716/#763；未證實者保持 release blocker。
+- [x] 以 code/test/live issue evidence 重新裁決 #623/#665/#681/#692/#695/#716/#763；
+  #665/#692/#763 的 source fixes 已整合，仍需 protected exact-SHA RC 證實部署面。
 
 ## 2. Trust-root install flow (TDD)
 
@@ -40,10 +41,13 @@ work_item: phase2-install-docker-qualification
 
 ## 5. Verification and closeout
 
-- [ ] BLOCKER：R9 T2 要求每個 T0/T1 資產的六種 mutation 都被拒，與 `repo-worktree`
-  對 Builder 的合法 `rwX` 寫入面衝突；須收斂 authority/consumer 契約並重跑 exact-SHA
-  qualification，D6 不接受 waiver。
+- [ ] BLOCKER：以 latest candidate 重跑 protected exact-SHA qualification，並保留 R9 T2
+  的六種 mutation denial 與合法 `repo-worktree` producer write evidence；本地 dummy
+  credential run 已通過 R9，尚不能替代 protected provider/live evidence。
 - [ ] focused tests、full pytest、build/twine/clean-wheel smoke 與 repo preflight 全綠。
+- [x] #665 以 strict-compatible `/usr/bin/node --jitless` service wrappers 收斂
+  `srt`／`openspec` W+X 缺口；#692 HOME 與 #763 Manager Git/recovery regression 已通過
+  focused suite。
 - [x] 每條 review finding 獨立驗證並分類修/駁/接受列管；修後重審。
 - [x] 對抗審查只列 BLOCKER/MAJOR；未處置缺陷為 FAIL，明文有界殘餘風險本身不構成 FAIL（D6 不可 waiver）。
 - [ ] OpenSpec validate/apply-complete 後 archive；Conventional Commit；依授權建立 PR。

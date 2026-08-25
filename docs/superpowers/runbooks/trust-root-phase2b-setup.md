@@ -1890,15 +1890,15 @@ job／服務帳號唯讀＋可執行）。理由是「job 跑的是哪個版本�
 > 2. `coordinator/launcher.py` 的 `_srt_runtime_root()` 是從 `which("srt")` 往上找
 >    `package.json` 且 `name == "@anthropic-ai/sandbox-runtime"` 來解出套件根，再把它
 >    加進 reviewer sandbox 政策的 `allowRead`。單檔形態下它解出 `None`——沙箱政策少一
->    條放行，**而且不報錯**。symlink 形態下 `readlink -f` 落在套件樹內，才解得到。
+>    條放行，**而且不報錯**。Phase 2 的 regular wrapper 固定指向 `lib/srt` 的驗證過
+>    entrypoint；launcher 依 canonical `toolchain/bin` 形狀解析旁邊的 `package.json`，
+>    因此仍能得到套件根。
 
-> ⚠️ **`srt` 與 `openspec` 的加固面是一個已知的未決點（#661 盤點結果）**：兩者都是
-> node（V8 的 JIT 需要 W→X），但執行它們的 unit 目前都是 `MemoryDenyWriteExecute=yes`
-> ——`srt` 由 `claude`（`strict` 剖面）exec、`openspec` 由 Manager 的 system unit exec。
-> #643 的剖面推導看不到這一格：它的唯一輸入是 **executor 名**，涵蓋不了「executor
-> 在執行途中再 exec 出來的 node 程式」。下方有專門的量測步驟；**量到才改，不得就地
-> 放寬**——回報 issue 由 operator 裁決（#643 的先例）。可列舉的形式：
-> `python3 -c "from paulsha_cortex.trust_root import permgen; print(permgen.unresolved_node_execution_surfaces())"`
+> ✅ **#665 已收斂 `srt`／`openspec` 的加固面盲區**：兩者仍由 `claude` strict／Manager
+> unit 執行，unit 保持 `MemoryDenyWriteExecute=yes`；部署產生器對這兩支 service tool
+> 固定產生 root-owned `/usr/bin/node --jitless` wrapper，不切換 reviewer 或 Manager
+> 到 jit 剖面。`permgen.unresolved_node_execution_surfaces()` 應為空。受保護 RC 仍要
+> 在真實 unit 上驗證 wrapper 的版本與代表性命令，rootless 測試不代替這項證據。
 
 > `claude`／`agy` 自帶原生執行檔，**不會因為 node 版本而行為改變**——因此系統層 node
 > 的版本風險只涵蓋 `codex`／`copilot` 兩個。
@@ -2124,11 +2124,8 @@ psc_run_under cortex-job /opt/cortex/toolchain/bin/codex --version
 ```
 
 ```bash
-# ✅ 量測（#661 的未決點，**只量不改**）：非 executor 的 node 程式跑在誰的加固面上
-#    先列出待量的組合（由登記表機械導出，不要手抄）
-python3 -c "from paulsha_cortex.trust_root import permgen
-for s in permgen.unresolved_node_execution_surfaces(): print(s.program, '←', s.detail)"
-#   目前預期兩列：srt ← executor claude ⇒ strict；openspec ← manager-unit。
+# ✅ #665 受保護 RC：wrapper 已固定 --jitless，unit 不得改成 jit profile。
+python3 -c "from paulsha_cortex.trust_root import permgen; assert not permgen.unresolved_node_execution_surfaces()"
 
 # (1) srt 在 reviewer job 的 strict 剖面下（＝ claude 實際 exec 它的那個加固面）
 psc_run_under cortex-reviewer-job /opt/cortex/toolchain/bin/srt --version
@@ -2143,25 +2140,9 @@ sudo systemd-run --pipe --wait --collect --quiet --service-type=exec \
   "${mprops[@]}" \
   /opt/cortex/toolchain/bin/openspec --version
 
-#   ⚠️ 兩條**預期都失敗（stdout 空、rc=1）**，症狀與 #643 的 codex／copilot 逐字
-#      相同——#673 已在完整加固面下複驗，兩條的 stderr 都是同一段 V8 stack trace：
-#          # Check failed: 12 == (*__errno_location ()).
-#          … v8::internal::Runtime_CompileLazy …
-#      `MemoryDenyWriteExecute=yes` 與 V8 的 JIT 天生互斥（V8 期待 mmap 回
-#      ENOMEM(12)，被 MDWE 擋成 EPERM(1)，於是那個 CHECK 炸掉）。
-#   ✅ 確認阻斷點是 MDWE 而非別的：改跑 `psc_run_under cortex-reviewer-job-jit
-#      /opt/cortex/toolchain/bin/srt --version`（jit 剖面，與 strict 只差 MDWE 一項）
-#      ——#673 實機為 `1.0.0`、rc=0。openspec 沒有對應的 jit Manager unit，
-#      因此 (2) 目前**無解**，維持 #661 的未決狀態。
-#   ⚠️ **注意 stderr 不是空的**。#673 的原始回報寫「stdout 與 stderr 皆空」，那是
-#      因為它的手抄複本漏掉 `SystemCallErrorNumber=EPERM`，行程被 SIGSYS 當場殺掉、
-#      連 V8 的錯誤都來不及印。在**真實**加固面下這一族失敗是有 stack trace 的
-#      ——看到空 stderr 就代表你的複本不等於 production，回去查複本。
-#   ⛔ **不要就地把 unit 的 MDWE 改掉**。#643 的先例是「量到才改，而且改的是一份具名
-#      剖面，不是全域放寬」——reviewer 要不要走 jit 剖面、Manager 這一面要不要動，
-#      是 operator 的裁決。把兩條的實際輸出貼回 #661 的 follow-up issue。
-#   （這也是本 repo 測試裡**明確 skip** 的那一族：單 UID／無 systemd 加固面的環境
-#     重現不了這個語意，不得靜默宣稱已驗證——見 #638／#657 的教訓。）
+#   期望：兩條都印出 pinned 版本、rc=0；wrapper 內容含 `/usr/bin/node --jitless`，
+#   Manager 與 reviewer unit 的 `MemoryDenyWriteExecute=yes` 仍在。任一條失敗即停止
+#   RC，不可藉由把 unit 改成 `MemoryDenyWriteExecute=no` 讓它變綠。
 ```
 
 **per-account 憑證（0817 裁決 (b)）**：憑證**檔**由 job 帳號擁有（才 refresh 得了

@@ -235,6 +235,45 @@ def test_install_plan_binds_derived_traverse_acl_to_parent_directory(
     } >= {("cortex-builder", "wx", False)}
 
 
+def test_service_tool_wrappers_pin_jitless_without_weakening_units(tmp_path: Path) -> None:
+    config = _safe_config(tmp_path)
+    config["toolchain"].update(
+        {
+            "srt": {
+                "version": "1.0.0",
+                "sha256": "4" * 64,
+                "shape": "tree",
+                "entrypoint": "dist/cli.js",
+            },
+            "openspec": {
+                "version": "1.10.0",
+                "sha256": "5" * 64,
+                "shape": "tree",
+                "entrypoint": "bin/openspec.js",
+            },
+        }
+    )
+    plan = build_install_plan(
+        config=config,
+        candidate_wheel=_artifacts(tmp_path)[0],
+        bundle=_artifacts(tmp_path)[1],
+    )
+    wrappers = plan["generated"]["toolchain_wrappers"]
+    for name in ("srt", "openspec"):
+        content = wrappers[name]["content"]
+        assert content == (
+            "#!/bin/sh\n"
+            f'exec /usr/bin/node --jitless "{plan["roots"]["deploy"]}/toolchain/lib/{name}/'
+            f'{config["toolchain"][name]["entrypoint"]}" "$@"\n'
+        )
+    assert "MemoryDenyWriteExecute=yes" in plan["generated"]["units"][
+        "cortex-manager.service"
+    ]["content"]
+    assert "MemoryDenyWriteExecute=yes" in plan["generated"]["units"][
+        "cortex-reviewer-job@.service"
+    ]["content"]
+
+
 def test_scaffold_targets_are_applied_before_home_redirect_symlinks(
     tmp_path: Path,
 ) -> None:

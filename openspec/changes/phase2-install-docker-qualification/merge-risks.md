@@ -13,12 +13,19 @@
 
 ## Known release blockers
 
-- R9 still rejects the current contract because Builder can legally delete within the
-  Tier-1 `repo-worktree`; D6 does not allow a waiver.
-- #665 still lacks a successful real-systemd W+X qualification.
-- #692 still leaves runtime `HOME` fail-open.
-- A successful exact-SHA provider, Manager Git, and full dispatch qualification has
-  not been produced.
+- A fresh **protected exact-SHA** qualification is still required. The latest local
+  dummy-credential run passed installer, R9, attestation, and service gates, then
+  stopped at the expected provider-auth boundary; it is not provider/live-release
+  evidence.
+- #665 is source-resolved by the strict-compatible `/usr/bin/node --jitless` wrappers
+  for `srt` and `openspec`; the protected RC must still prove both wrappers in their
+  real systemd units while retaining `MemoryDenyWriteExecute=yes`.
+- #692 is source-resolved: job and shim HOME validation now fail closed for missing,
+  relative, symlinked, wrong-owner, and unresolved-account paths.
+- #763 is source-resolved: Manager receives exactly one GitHub HTTPS credential helper,
+  and repair recovery rejects absent or incomplete gate-ledger worktree state.
+- PR review/merge, CI check runs, OpenSpec archive, and the exact-SHA RC evidence have
+  not yet been produced on the default branch.
 
 These are release blockers, not accepted release residuals. The OpenSpec change must
 remain unarchived and `v0.2.0` must not be tagged or released while any remains.

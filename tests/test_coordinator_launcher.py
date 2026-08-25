@@ -20,6 +20,25 @@ from paulsha_cortex.coordinator.launcher import (
 
 
 class ArgvTests(unittest.TestCase):
+    def test_srt_runtime_root_resolves_regular_jitless_toolchain_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "toolchain"
+            wrapper = root / "bin" / "srt"
+            package = root / "lib" / "srt"
+            wrapper.parent.mkdir(parents=True)
+            package.mkdir(parents=True)
+            wrapper.write_text(
+                '#!/bin/sh\nexec /usr/bin/node --jitless "..." "$@"\n',
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            (package / "package.json").write_text(
+                json.dumps({"name": "@anthropic-ai/sandbox-runtime"}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"PATH": str(wrapper.parent)}, clear=False):
+                self.assertEqual(launcher_module._srt_runtime_root(), package)
+
     def test_copilot_argv(self) -> None:
         argv = build_copilot_argv(prompt="PROMPT", slice_id="slice-a", log_dir="/lg")
         self.assertEqual(argv[0], "copilot")

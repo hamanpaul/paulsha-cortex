@@ -97,6 +97,8 @@ closed。D6 不接受 residual-risk waiver。
 
 ## Qualification blocker observed on 2026-08-22
 
+> Historical baseline (superseded by the current qualification driver):
+
 The disposable Docker run for candidate
 `e052c76d825480226ab868c5c055527cba113640` passed exact artifact verification,
 fresh apply, idempotent apply, functional-drift rejection, rollback/reinstall,
@@ -107,8 +109,8 @@ and the Tier-1 capability probe. It then stopped before every provider smoke wit
 durable-state/repo-worktree:delete did not return an allowed denial as cortex-builder: rc=0
 ```
 
-This is a release blocker, not a residual-risk waiver. The generated four-way
-plan marks `repo-worktree` as Tier-1 and deliberately grants
+At that time this was a release blocker, not a residual-risk waiver. The generated four-way
+plan marked `repo-worktree` as Tier-1 and deliberately granted
 `cortex-builder:rwX` on that per-job workspace, while R9 T2 currently requires
 all six mutations on every Tier-0/Tier-1 asset to be rejected by the OS or an
 implemented signature-verifying consumer. The Phase 3 signature route is not
@@ -117,7 +119,9 @@ slot through the installed production `grant_workspace_acl` helper and attacks
 the resulting filesystem independently, so skipping the runtime-managed asset
 or treating its absence as coverage is not permitted.
 
-Release remains blocked until the authority model and R9 contract are made
-consistent and a new exact-SHA run passes. Provider, Manager GitHub, full
-dispatch, archive, tag, GitHub Release, and PyPI publication MUST NOT proceed
-from this failed run.
+The current driver now creates the disposable slot through the installed
+production `grant_workspace_acl` helper and applies the authority-aware R9
+contract; a fresh dummy-credential run passed the R9 stages. A protected
+exact-SHA run is still required before provider/live release claims. Provider,
+Manager GitHub, full dispatch, archive, tag, GitHub Release, and PyPI publication
+MUST NOT proceed from this historical failed run.
