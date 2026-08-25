@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Phase 2 部署與 Docker RC qualification release batch**：將已合併的 trust-root
+  deployment hardening、exact-SHA qualification bundle 與 protected RC/release
+  gate 收口為下一個 patch release，並保留 final-head review、CI、OpenSpec archive
+  與 RC evidence 的逐項驗證要求。
+
 - **Foreign-review verdict spool path hardening**：launcher 現在要求 verdict spool 是已存在的
   實體目錄，並拒絕 symlink ancestor，避免 sandbox grant 被父層 redirect 導出
   Manager-owned spool；relative、leaf symlink 與 review-only grant 仍維持 fail-closed。
