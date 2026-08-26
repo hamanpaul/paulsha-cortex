@@ -9160,13 +9160,14 @@ def _workflow_job_prompt(
         if retry_context is not None
         else ""
     )
-    return (
+    generic_preamble = (
         "Execute exactly one workflow card. End with one JSON object only; do not supply an evidence "
         "path or hash because Manager will canonicalize it. For workflow-card outputs, return only "
         "repo-relative artifact path strings matching declared_outputs; when declared_outputs is "
         "empty, outputs must be exactly []. Never put action, summary, or other descriptive objects "
         "in outputs. For build cards, candidate must be the full 40-hex commit SHA of the worktree "
-        "HEAD after the card completes (use `git rev-parse HEAD`); commit-forbidden cards must "
+        "HEAD after the card completes (use `/usr/bin/git rev-parse HEAD` as one command, with "
+        "no pipe, boolean fallback, redirection, or suffix); commit-forbidden cards must "
         "report the current HEAD, build candidates must never be null, and plan candidates must be "
         "null."
         + planner_contract
@@ -9174,8 +9175,18 @@ def _workflow_job_prompt(
         + commit_required_contract
         + repair_findings_contract
         + retry_context_contract
-        + " Contract: "
-        + json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    )
+    preamble = (
+        job_runner.WORKTREE_ISOLATION_AUTONOMOUS_PREAMBLE
+        if step.phase == "build"
+        and step.card == "worktree-isolation"
+        and step.persona == "builder"
+        and retry_context is None
+        and not operator_adjudications
+        else generic_preamble
+    )
+    return preamble + " Contract: " + json.dumps(
+        contract, ensure_ascii=False, sort_keys=True
     )
 
 

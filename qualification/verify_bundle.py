@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -23,6 +24,26 @@ ROOT_KEYS = {
     "toolchain",
     "source_repositories",
 }
+INPUT_ROOT_ENTRIES = {
+    "bundle.json",
+    "install-config.yaml",
+    "dist",
+    "wheelhouse",
+    "toolchain",
+    "source",
+}
+
+
+def _single_link_regular(path: Path, *, label: str) -> None:
+    observed = path.lstat()
+    if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise ValueError(f"{label} must be a single-link regular file")
+
+
+def _plain_directory(path: Path, *, label: str) -> None:
+    observed = path.lstat()
+    if not stat.S_ISDIR(observed.st_mode):
+        raise ValueError(f"{label} must be a real directory")
 
 
 def _entry(raw: Any, *, root: Path, label: str) -> str:
@@ -38,8 +59,7 @@ def _entry(raw: Any, *, root: Path, label: str) -> str:
     if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
         raise ValueError(f"{label}.sha256 is invalid")
     path = root / pure
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"{label}.path is not a regular file")
+    _single_link_regular(path, label=f"{label}.path")
     actual = hashlib.sha256(path.read_bytes()).hexdigest()
     if actual != expected:
         raise ValueError(f"{label}.sha256 does not match {relative}")
@@ -52,9 +72,15 @@ def validate_bundle(
     candidate_sha: str,
     wheel_sha256: str,
 ) -> None:
-    if bundle.is_symlink() or not bundle.is_file():
-        raise ValueError("bundle must be a regular file")
+    _single_link_regular(bundle, label="bundle")
     root = bundle.parent
+    _plain_directory(root, label="qualification input root")
+    actual_root_entries = {path.name for path in root.iterdir()}
+    if actual_root_entries != INPUT_ROOT_ENTRIES:
+        raise ValueError("qualification input root inventory is not exact")
+    _single_link_regular(root / "install-config.yaml", label="install config")
+    for directory in ("dist", "wheelhouse", "toolchain", "source"):
+        _plain_directory(root / directory, label=f"{directory} root")
     payload = json.loads(bundle.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or set(payload) != ROOT_KEYS:
         raise ValueError("bundle has missing or unknown root fields")
@@ -67,6 +93,12 @@ def validate_bundle(
         raise ValueError("bundle wheel sha256 does not match the selected candidate")
     if not wheel_path.startswith("dist/"):
         raise ValueError("bundle wheel must be under dist/")
+    actual_dist = {
+        path.relative_to(root).as_posix() for path in (root / "dist").iterdir()
+    }
+    if actual_dist != {wheel_path}:
+        raise ValueError("dist inventory must contain only the declared candidate wheel")
+    _single_link_regular(root / wheel_path, label="candidate wheel")
 
     wheelhouse = payload["wheelhouse"]
     if not isinstance(wheelhouse, list) or not wheelhouse:
@@ -85,8 +117,7 @@ def validate_bundle(
     wheelhouse_root = root / "wheelhouse"
     actual_wheelhouse: set[str] = set()
     for path in wheelhouse_root.iterdir():
-        if path.is_symlink() or not path.is_file():
-            raise ValueError("wheelhouse contains a symlink or non-file entry")
+        _single_link_regular(path, label="wheelhouse entry")
         actual_wheelhouse.add(path.relative_to(root).as_posix())
     if declared_wheelhouse != actual_wheelhouse:
         raise ValueError("wheelhouse inventory is incomplete or contains an undeclared file")
@@ -149,11 +180,10 @@ def validate_bundle(
         )
     if tool_names != {"codex", "claude", "copilot", "agy", "srt", "openspec"}:
         raise ValueError("toolchain inventory is incomplete")
-    actual_tool_paths = {
-        path.relative_to(root).as_posix()
-        for path in (root / "toolchain").iterdir()
-        if path.is_file() and not path.is_symlink()
-    }
+    actual_tool_paths: set[str] = set()
+    for path in (root / "toolchain").iterdir():
+        _single_link_regular(path, label="toolchain entry")
+        actual_tool_paths.add(path.relative_to(root).as_posix())
     if tool_paths != actual_tool_paths:
         raise ValueError("toolchain directory has undeclared or missing artifacts")
 
@@ -187,11 +217,10 @@ def validate_bundle(
                 label=f"source_repositories[{index}]",
             )
         )
-    actual_repository_paths = {
-        path.relative_to(root).as_posix()
-        for path in (root / "source").iterdir()
-        if path.is_file() and not path.is_symlink()
-    }
+    actual_repository_paths: set[str] = set()
+    for path in (root / "source").iterdir():
+        _single_link_regular(path, label="source entry")
+        actual_repository_paths.add(path.relative_to(root).as_posix())
     if repository_paths != actual_repository_paths:
         raise ValueError("source directory has undeclared or missing artifacts")
 

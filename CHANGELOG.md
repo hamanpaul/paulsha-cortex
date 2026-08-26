@@ -8,12 +8,39 @@
 ## [Unreleased]
 
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
-  現在把 shim／toolchain wrapper 的 shebang 視為功能內容，並正確忽略 polkit 的獨立
-  JavaScript 註解，同時拒絕未閉合 block 與 `;`-prefixed rule；deployment canary 固定
-  `codex/gpt-5.3-codex-spark` builder，綁定 Manager-owned job spec，只接受唯一
-  `worktree-isolation` 的成功 command event 並輸出 hash-only observation。#681/#695
-  改指向現行 transactional installer 與 exact-SHA RC；#716 在成功 live canary 前保持
-  open，但不阻擋 package release。舊手工 Phase 2b runbook 已標為不可執行。
+  依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
+  block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同
+  roots/repository、已 applied/qualified 的上一版 receipt 逐 step 交接 provenance，並在
+  mutation 前掃完 asset／repository／toolchain／venv slot 與 active link；exact-looking foreign
+  toolchain／self-marked venv 也不得取代 receipt provenance。host-global transaction lock 不受
+  roots/plan/receipt override 影響，並涵蓋 apply／credential／activate／verify／rollback；
+  runbook 另持有跨 service snapshot、stop、apply、verify 與 restore 的 maintenance lease，
+  以 reviewed-plan token admission 擋下 lease 外 mutation；每次建立 canonical parent 下唯一
+  effective receipt，並在停服務前將它與 service pre-state 落盤至跨 reboot 的 root-private
+  snapshot。abort full rollback 只處理本次 receipt；helper 單獨失效仍只接受原 token，整個
+  shell hard-crash 則從停服務前原子封存的 root-only reviewed plan 在 fresh shell 做 explicit
+  exact-plan recovery，不重建 immutable input／venv；maintenance snapshot 也採
+  complete-before-publish，且 rollback 安全後才能 restore；同一路徑
+  toolchain 換 bytes 會在 mutation 前拒絕，須改用 versioned path。
+  runbook 另要求 manifest=actual wheelhouse、hash-required/no-deps bootstrap，
+  並處理 venv canonical `lib64 -> lib`、non-root read/traverse、trusted plan-review binaries 與
+  stop 後 EXIT/INT/TERM service recovery。venv slot 以 `planned → building → ready` 的
+  inode/tree authority 在 rename 前 checkpoint，跨 metadata-only upgrade 也延續原 mount inode
+  authority。Deployment canary byte-compare
+  完整 Codex wrapper，要求 exact Bash envelope 內的 absolute Git HEAD output，將 probe
+  subject/workflow final/Cortex release SHA 分開綁定，且用 exact per-job `CODEX_HOME`、PATH、
+  Git selector denylist／safe.directory 與 app-server persisted thread 驗實際
+  Spark/xhigh/provider/cwd；validator 從 workflow 外部綁定 repo/work/issue、唯一 probe log、
+  128 字元 ID 上限、驗證前後穩定的 bundle digest 與已驗 bytes digest。
+  RC artifact 現在保留完整 qualification input，release gate 重驗 exact inventory、
+  全部 hash 與 canonical install config，並同時發佈 qualified wheel、deterministic
+  install-input archive 與永久 qualification manifest；逐 asset 核對 GitHub REST digest，
+  INT/TERM/一般失敗都回收本次 draft release 與 tag；annotated tag durable marker 讓後續 run
+  只 reconcile 同 workflow 留下的 exact-SHA draft/tag，不刪 foreign 或 non-draft release。
+  `worktree-isolation` 首張 builder card 使用不指定命令的 autonomous preamble，qualification
+  逐 byte 重建並驗證完整 canonical prompt／terminal schema。
+  #681/#695 改指向現行 authority；#716 在對應 build 的 live canary 成功前保持 open，且
+  不阻擋 package release。
 
 - **Release publication repo context 修正**：不含 checkout 的 publication job 現在明確把
   `GITHUB_REPOSITORY` 傳給 `gh release create --repo`，避免 gh 嘗試從不存在的 `.git`

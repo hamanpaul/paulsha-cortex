@@ -27,19 +27,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from paulsha_cortex.coordinator import job_runner
+from paulsha_cortex.coordinator import job_runner, spool_slot
+from paulsha_cortex.trust_root.surfaces import writable_surface
 
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+WORK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 DEPLOYMENT_CANARY_BUILDER_EXECUTOR = "codex"
 DEPLOYMENT_CANARY_BUILDER_MODEL = "gpt-5.3-codex-spark"
 DEPLOYMENT_CANARY_PROBE_CARD = "worktree-isolation"
+DEPLOYMENT_CANARY_BUILDER_PATH = "/opt/cortex/toolchain/bin:/usr/bin:/bin"
 MAX_AGENT_LOOP_LOG_BYTES = 128 * 1024 * 1024
+MAX_AGENT_LOOP_COMMANDS = 128
+MAX_DISPATCH_ARTIFACTS = 128
+MAX_DISPATCH_ARTIFACT_PATH_CHARS = 128
 PROVIDERS = {
     "agy": ("gemini-3.7-flash", "high", "cortex-reviewer-planner"),
     "copilot": ("gpt-5.4", "xhigh", "cortex-reviewer-planner"),
-    "codex": ("gpt-5", "normal", "cortex-builder"),
+    "codex": ("gpt-5.3-codex-spark", "xhigh", "cortex-builder"),
 }
 SERVICES = (
     "cortex-egress-proxy.service",
@@ -1620,6 +1626,208 @@ def _codex_app_server_exchange(
                 process.wait()
 
 
+def _codex_thread_resume_exchange(
+    command: Sequence[str],
+    *,
+    thread_id: str,
+    user: str,
+    env: Mapping[str, str],
+    timeout: int = 45,
+) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """Read then resume one completed Codex thread without starting a turn."""
+
+    argv = list(command)
+    if user:
+        argv = ["/usr/sbin/runuser", "-u", user, "--", *argv]
+    process_env = {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"}
+    process_env.update(env)
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=process_env,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+
+    def send(message: Mapping[str, object]) -> None:
+        if process.stdin is None:
+            raise QualificationFailure("Codex app-server stdin is unavailable")
+        process.stdin.write(
+            json.dumps(message, separators=(",", ":"), sort_keys=True) + "\n"
+        )
+        process.stdin.flush()
+
+    def receive(request_id: int) -> Mapping[str, object]:
+        if process.stdout is None:
+            raise QualificationFailure("Codex app-server stdout is unavailable")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise QualificationFailure(
+                    "Codex app-server thread identity probe timed out"
+                )
+            ready, _unused_write, _unused_error = select.select(
+                [process.stdout], [], [], remaining
+            )
+            if not ready:
+                raise QualificationFailure(
+                    "Codex app-server thread identity probe timed out"
+                )
+            line = process.stdout.readline()
+            if line == "":
+                raise QualificationFailure(
+                    "Codex app-server closed before thread identity response"
+                )
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise QualificationFailure(
+                    "Codex app-server emitted a non-JSON thread identity record"
+                ) from exc
+            if not isinstance(record, Mapping):
+                raise QualificationFailure(
+                    "Codex app-server thread identity record is not an object"
+                )
+            if record.get("id") == request_id:
+                return record
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "cortex_rc",
+                        "title": "Cortex RC qualification",
+                        "version": "0.1.0",
+                    }
+                },
+            }
+        )
+        initialize = receive(1)
+        if "error" in initialize or not isinstance(initialize.get("result"), Mapping):
+            raise QualificationFailure("Codex app-server initialize failed")
+        send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "thread/read",
+                "params": {"threadId": thread_id, "includeTurns": False},
+            }
+        )
+        persisted = receive(2)
+        resume_cwd = env.get("HOME")
+        if not isinstance(resume_cwd, str) or not Path(resume_cwd).is_absolute():
+            raise QualificationFailure("Codex app-server resume cwd is unavailable")
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "thread/resume",
+                "params": {
+                    "threadId": thread_id,
+                    "excludeTurns": True,
+                    "cwd": resume_cwd,
+                },
+            }
+        )
+        return persisted, receive(3)
+    except (BrokenPipeError, OSError, subprocess.SubprocessError) as exc:
+        raise QualificationFailure(
+            "Codex app-server thread identity probe failed"
+        ) from exc
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                process.wait()
+
+
+def _codex_provider_thread_result(
+    thread_id: str, *, codex_home: Path | None = None
+) -> Mapping[str, object]:
+    """Load provider-persisted metadata for one exact Codex thread."""
+
+    adapter = PROVIDER_PREFLIGHTS["codex"]
+    if adapter.status_command is None:
+        raise QualificationFailure("Codex app-server command is unavailable")
+    account_env = _account_env("cortex-builder")
+    if codex_home is not None:
+        account_env["CODEX_HOME"] = str(codex_home)
+    persisted_response, response = _codex_thread_resume_exchange(
+        adapter.status_command,
+        thread_id=thread_id,
+        user="cortex-builder",
+        env=account_env,
+    )
+    persisted_result = persisted_response.get("result")
+    persisted_thread = (
+        persisted_result.get("thread")
+        if isinstance(persisted_result, Mapping)
+        else None
+    )
+    result = response.get("result")
+    thread = result.get("thread") if isinstance(result, Mapping) else None
+    if (
+        "error" in persisted_response
+        or "error" in response
+        or not isinstance(persisted_thread, Mapping)
+        or persisted_thread.get("id") != thread_id
+        or not isinstance(result, Mapping)
+        or not isinstance(thread, Mapping)
+        or thread.get("id") != thread_id
+    ):
+        raise QualificationFailure("Codex provider thread identity is unavailable")
+    combined = dict(result)
+    combined["persistedCwd"] = persisted_thread.get("cwd")
+    combined["persistedModelProvider"] = persisted_thread.get("modelProvider")
+    return combined
+
+
+def _codex_thread_runtime_identity(
+    thread_id: str, *, expected_worktree: str, codex_home: Path
+) -> dict[str, str]:
+    """Bind requested builder settings to provider-persisted thread metadata."""
+
+    result = _codex_provider_thread_result(thread_id, codex_home=codex_home)
+    if (
+        result.get("model") != DEPLOYMENT_CANARY_BUILDER_MODEL
+        or result.get("reasoningEffort") != "xhigh"
+        or result.get("modelProvider") != "openai"
+        or result.get("persistedModelProvider") != "openai"
+        or result.get("persistedCwd") != expected_worktree
+    ):
+        raise QualificationFailure(
+            "Codex agent-loop provider thread identity does not match the bound job"
+        )
+    return {
+        "runtime_model": DEPLOYMENT_CANARY_BUILDER_MODEL,
+        "runtime_effort": "xhigh",
+        "model_provider": "openai",
+        "thread_sha256": hashlib.sha256(thread_id.encode()).hexdigest(),
+    }
+
+
 def _codex_preflight_from_responses(
     account_response: Mapping[str, object],
     rate_limits_response: Mapping[str, object],
@@ -2091,14 +2299,17 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
             "/opt/cortex/toolchain/bin/codex",
             "exec",
             "--ignore-user-config",
-            "--model",
-            "gpt-5",
+            prompt,
+            "--json",
             "--sandbox",
             "read-only",
-            "--ephemeral",
+            "--enable",
+            "use_legacy_landlock",
+            "--model",
+            "gpt-5.3-codex-spark",
+            "-c",
+            'model_reasoning_effort="xhigh"',
             "--skip-git-repo-check",
-            "--json",
-            prompt,
         ),
     }
     verdicts: list[dict[str, object]] = []
@@ -2108,43 +2319,74 @@ def _provider_smokes(evidence_dir: Path) -> list[dict[str, object]]:
         preflight = _provider_preflight(provider, account)
         result = _run(command, user=account, env=_account_env(account), timeout=300)
         records = _json_records(result.stdout)
-        models = (
-            set().union(
-                *(
-                    _walk_values(
-                        row,
-                        {
-                            "model",
-                            "modelid",
-                            "modelname",
-                            "runtimemodel",
-                            "selectedmodel",
-                        },
-                    )
-                    for row in records
+        if provider == "codex":
+            thread_ids = {
+                str(row["thread_id"])
+                for row in records
+                if isinstance(row, Mapping)
+                and row.get("type") == "thread.started"
+                and isinstance(row.get("thread_id"), str)
+                and re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", str(row["thread_id"])
                 )
-            )
-            if records
-            else set()
-        )
-        efforts = (
-            set().union(
-                *(
-                    _walk_values(
-                        row,
-                        {
-                            "effort",
-                            "reasoningeffort",
-                            "runtimeeffort",
-                            "selectedeffort",
-                        },
-                    )
-                    for row in records
+            }
+            if len(thread_ids) != 1:
+                raise QualificationFailure(
+                    "provider codex returned no unique persisted thread identity"
                 )
+            persisted = _codex_provider_thread_result(next(iter(thread_ids)))
+            if persisted.get("modelProvider") != "openai":
+                raise QualificationFailure(
+                    "provider codex persisted thread used an unexpected provider"
+                )
+            models = {
+                str(persisted["model"])
+                if isinstance(persisted.get("model"), str)
+                else ""
+            }
+            efforts = {
+                str(persisted["reasoningEffort"])
+                if isinstance(persisted.get("reasoningEffort"), str)
+                else ""
+            }
+        else:
+            models = (
+                set().union(
+                    *(
+                        _walk_values(
+                            row,
+                            {
+                                "model",
+                                "modelid",
+                                "modelname",
+                                "runtimemodel",
+                                "selectedmodel",
+                            },
+                        )
+                        for row in records
+                    )
+                )
+                if records
+                else set()
             )
-            if records
-            else set()
-        )
+            efforts = (
+                set().union(
+                    *(
+                        _walk_values(
+                            row,
+                            {
+                                "effort",
+                                "reasoningeffort",
+                                "runtimeeffort",
+                                "selectedeffort",
+                            },
+                        )
+                        for row in records
+                    )
+                )
+                if records
+                else set()
+            )
         response_token = _has_exact_final_assistant_response(records)
         fallback_values = _walk_scalars(
             records, {"fallback", "fallbackmodel", "fallbackused"}
@@ -2415,14 +2657,18 @@ def _bound_gate_evidence_path(root: Path, reference: object) -> Path:
     return evidence_root.joinpath(*relative.parts)
 
 
-def _artifact_row(path: Path, *, state_root: Path) -> dict[str, str]:
+def _artifact_row(
+    path: Path, *, state_root: Path, observed_sha256: str
+) -> dict[str, str]:
     try:
         relative = path.relative_to(state_root).as_posix()
     except ValueError as exc:
         raise QualificationFailure(
             "dispatch artifact escapes Cortex state root"
         ) from exc
-    return {"path": relative, "sha256": _sha256(path)}
+    if SHA256.fullmatch(observed_sha256) is None:
+        raise QualificationFailure("dispatch artifact observation hash is invalid")
+    return {"path": relative, "sha256": observed_sha256}
 
 
 def _terminal_named_values(value: object, name: str) -> set[str]:
@@ -2438,8 +2684,105 @@ def _terminal_named_values(value: object, name: str) -> set[str]:
     return found
 
 
+def _shell_segments(command: str) -> list[list[str]]:
+    """Return simple command segments, recursively unwrapping a shell -c."""
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise QualificationFailure("Codex agent-loop command is malformed") from exc
+    if (
+        len(tokens) == 3
+        and Path(tokens[0]).name in {"bash", "sh"}
+        and tokens[1] in {"-c", "-lc"}
+    ):
+        return _shell_segments(tokens[2])
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in {";", "&&", "||", "|"}:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _is_expected_head_probe(
+    command: str, *, expected_worktree: str
+) -> bool:
+    """Accept only one exact Git invocation, optionally in Codex's shell envelope.
+
+    The job spec already fixes ``working_directory`` and Codex ``-C`` to the
+    Manager-owned worktree. Requiring the absolute system Git path prevents a
+    repository-local ``./git`` or PATH substitution, while exact argv equality
+    rejects pipes, boolean fallbacks, redirections, aliases, and suffixes. Codex
+    0.149 serializes shell-tool executions as a three-argument Bash ``-c``/``-lc``
+    argv; only that exact outer shape is unwrapped once.
+    """
+
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    expected = (
+        ["/usr/bin/git", "rev-parse", "HEAD"],
+        ["/usr/bin/git", "-C", expected_worktree, "rev-parse", "HEAD"],
+    )
+    if argv in expected:
+        return True
+    if (
+        len(argv) != 3
+        or argv[0] not in {"/bin/bash", "/usr/bin/bash"}
+        or argv[1] not in {"-c", "-lc"}
+    ):
+        return False
+    try:
+        inner_argv = shlex.split(argv[2], posix=True)
+    except ValueError:
+        return False
+    return inner_argv in expected
+
+
+def _codex_agent_loop_thread_id(
+    logs: Sequence[tuple[str, bytes]],
+) -> str:
+    thread_ids: set[str] = set()
+    for _job_id, content in logs:
+        try:
+            lines = content.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise QualificationFailure("Codex agent-loop log is not UTF-8") from exc
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            thread_id = event.get("thread_id") if isinstance(event, dict) else None
+            if (
+                isinstance(event, dict)
+                and event.get("type") == "thread.started"
+                and isinstance(thread_id, str)
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", thread_id)
+            ):
+                thread_ids.add(thread_id)
+    if len(thread_ids) != 1:
+        raise QualificationFailure(
+            "Codex agent-loop has no unique provider thread identity"
+        )
+    return next(iter(thread_ids))
+
+
 def _codex_agent_loop_observation(
     logs: Sequence[tuple[str, bytes]],
+    *,
+    expected_head: str,
+    expected_worktree: str,
 ) -> dict[str, object]:
     """Derive non-secret live evidence from Codex JSONL command events.
 
@@ -2448,17 +2791,17 @@ def _codex_agent_loop_observation(
     workflow identity and records only hashes/booleans in uploaded evidence.
     """
 
+    if len(logs) != 1 or SHA40.fullmatch(expected_head) is None:
+        raise QualificationFailure("Codex agent-loop log/head binding is not unique")
     commands: list[str] = []
     outputs: list[str] = []
-    log_rows: list[dict[str, str]] = []
     builder_job_ids: list[str] = []
+    raw_log_sha256 = ""
     for job_id, content in logs:
         if not isinstance(job_id, str) or not job_id or not isinstance(content, bytes):
             raise QualificationFailure("Codex agent-loop log binding is malformed")
         builder_job_ids.append(job_id)
-        log_rows.append(
-            {"job_id": job_id, "sha256": hashlib.sha256(content).hexdigest()}
-        )
+        raw_log_sha256 = hashlib.sha256(content).hexdigest()
         try:
             lines = content.decode("utf-8").splitlines()
         except UnicodeDecodeError as exc:
@@ -2482,12 +2825,26 @@ def _codex_agent_loop_observation(
                 or not item["aggregated_output"].strip()
             ):
                 continue
+            output_lines = [
+                line.strip()
+                for line in item["aggregated_output"].splitlines()
+                if line.strip()
+            ]
+            if not _is_expected_head_probe(
+                item["command"], expected_worktree=expected_worktree
+            ) or output_lines != [expected_head]:
+                continue
             commands.append(item["command"])
             outputs.append(item["aggregated_output"])
+            if len(commands) > MAX_AGENT_LOOP_COMMANDS:
+                raise QualificationFailure(
+                    "Codex agent-loop command observation exceeds the evidence bound"
+                )
     if not commands:
         raise QualificationFailure(
-            "Codex agent-loop has no completed self-chosen command with non-empty output"
+            "Codex agent-loop has no completed git HEAD proof for the bound worktree"
         )
+    thread_id = _codex_agent_loop_thread_id(logs)
     return {
         "schema_version": 1,
         "executor": DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
@@ -2498,7 +2855,8 @@ def _codex_agent_loop_observation(
         "all_outputs_nonempty": True,
         "command_sha256": hashlib.sha256(_canonical_bytes(commands)).hexdigest(),
         "output_sha256": hashlib.sha256(_canonical_bytes(outputs)).hexdigest(),
-        "log_sha256": hashlib.sha256(_canonical_bytes(log_rows)).hexdigest(),
+        "log_sha256": raw_log_sha256,
+        "thread_sha256": hashlib.sha256(thread_id.encode()).hexdigest(),
     }
 
 
@@ -2538,7 +2896,11 @@ def _bound_codex_builder_log(
         raise QualificationFailure("Codex agent-loop log is unreadable") from exc
 
 
-def _bound_codex_builder_spec(root: Path, job: Mapping[str, object]) -> Path:
+def _bound_codex_builder_spec(
+    root: Path,
+    job: Mapping[str, object],
+    workflow: Mapping[str, object],
+) -> tuple[Path, Path, str]:
     """Validate the Manager-authored launch contract for the observed job."""
 
     slot = job.get("template_instance")
@@ -2551,10 +2913,12 @@ def _bound_codex_builder_spec(root: Path, job: Mapping[str, object]) -> Path:
     ):
         raise QualificationFailure("Codex agent-loop job spec binding is invalid")
     path = root / "job-specs" / "builder" / f"{slot}.json"
+    content = _manager_file(path, label="Codex agent-loop job spec", root=root)
     spec = _json_object(
-        _manager_file(path, label="Codex agent-loop job spec", root=root),
+        content,
         label="Codex agent-loop job spec",
     )
+    spec_env = spec.get("env")
     command = spec.get("command")
     worktree = job.get("worktree")
     repo_root = job.get("workflow_repo_root")
@@ -2575,44 +2939,225 @@ def _bound_codex_builder_spec(root: Path, job: Mapping[str, object]) -> Path:
         or repo_root != worktree
         or spec.get("working_directory") != worktree
         or spec.get("log_path") != log_path
-        or not isinstance(spec.get("env"), dict)
+        or not isinstance(spec_env, dict)
         or not isinstance(command, list)
         or len(command) != 3
         or command[:2] != ["bash", "-c"]
         or not isinstance(command[2], str)
     ):
         raise QualificationFailure("Codex agent-loop job spec authority mismatch")
+    surface = writable_surface("builder-codex-home")
+    expected_codex_home = spool_slot.exact_job_slot(
+        surface.surface_id,
+        slot,
+        writable_root=root.parent / surface.coordinator_relative,
+    )
     try:
-        lexer = shlex.shlex(command[2], posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        tokens = list(lexer)
+        relative_codex_home = expected_codex_home.relative_to(root.parent)
     except ValueError as exc:
-        raise QualificationFailure("Codex agent-loop job command is malformed") from exc
-    try:
-        first_separator = next(
-            index for index, token in enumerate(tokens) if token in {";", "&&", "||", "|"}
-        )
-    except StopIteration:
-        first_separator = len(tokens)
-    argv = tokens[:first_separator]
-    model_indexes = [index for index, token in enumerate(argv) if token == "--model"]
-    sandbox_indexes = [
-        index for index, token in enumerate(argv) if token == "--sandbox"
-    ]
+        raise QualificationFailure("Codex agent-loop runtime home escapes state root") from exc
+    cursor = root.parent
+    for part in relative_codex_home.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise QualificationFailure("Codex agent-loop runtime home contains a symlink")
     if (
-        argv[:3] != ["codex", "exec", "--ignore-user-config"]
-        or "--json" not in argv
-        or len(model_indexes) != 1
-        or model_indexes[0] + 1 >= len(argv)
-        or argv[model_indexes[0] + 1] != DEPLOYMENT_CANARY_BUILDER_MODEL
-        or len(sandbox_indexes) != 1
-        or sandbox_indexes[0] + 1 >= len(argv)
-        or argv[sandbox_indexes[0] + 1] != "read-only"
-        or "--dangerously-bypass-approvals-and-sandbox" in argv
-        or "--dangerously-bypass-hook-trust" in argv
+        spec_env.get("CODEX_HOME") != str(expected_codex_home)
+        or spec_env.get("PATH") != DEPLOYMENT_CANARY_BUILDER_PATH
+        or expected_codex_home.is_symlink()
+        or not expected_codex_home.is_dir()
+        or expected_codex_home.stat().st_uid != _manager_uid()
     ):
+        raise QualificationFailure(
+            "Codex agent-loop runtime home is not the exact Manager-owned job slot"
+        )
+    try:
+        job_runner.reject_unsafe_env(
+            spec_env, source="qualification._bound_codex_builder_spec"
+        )
+    except job_runner.JobRunnerError as exc:
+        raise QualificationFailure(
+            "Codex agent-loop job environment is unsafe"
+        ) from exc
+    if job_runner.git_config_safe_directories(spec_env) != (worktree,):
+        raise QualificationFailure(
+            "Codex agent-loop git safe.directory is not the exact bound worktree"
+        )
+    segments = _shell_segments(command[2])
+    if not segments or len(segments[0]) != 17:
         raise QualificationFailure("Codex agent-loop job command identity is invalid")
-    return path
+    prompt = segments[0][3]
+    if prompt != _expected_worktree_isolation_prompt(job, workflow):
+        raise QualificationFailure("Codex agent-loop job prompt is invalid")
+    expected_last_message = Path(log_path).with_name(
+        f"{Path(log_path).stem}.last.json"
+    )
+    expected_argv = [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        prompt,
+        "--json",
+        "--sandbox",
+        "read-only",
+        "--enable",
+        "use_legacy_landlock",
+        "--model",
+        DEPLOYMENT_CANARY_BUILDER_MODEL,
+        "-c",
+        'model_reasoning_effort="xhigh"',
+        "-o",
+        str(expected_last_message),
+        "-C",
+        worktree,
+    ]
+    bundle = root / "commit-spool" / slot / "commits.bundle"
+    part = Path(f"{bundle}.part")
+    quoted_worktree = shlex.quote(worktree)
+    quoted_bundle = shlex.quote(str(bundle))
+    quoted_part = shlex.quote(str(part))
+    bundle_segment = (
+        f"git -C {quoted_worktree} bundle create {quoted_part} "
+        f'"$(git -C {quoted_worktree} symbolic-ref HEAD)" ^refs/cortex/base '
+        f"&& chmod 0644 {quoted_part} && mv -f {quoted_part} {quoted_bundle}"
+    )
+    quoted_last = shlex.quote(str(expected_last_message))
+    publish_last = (
+        f"{{ [ -f {quoted_last} ] && chmod 0644 {quoted_last}; }} "
+        "2>/dev/null || :"
+    )
+    expected_script = "; ".join(
+        (
+            shlex.join(expected_argv),
+            "__psc_rc=$?",
+            bundle_segment,
+            publish_last,
+            'exit "$__psc_rc"',
+        )
+    )
+    if command[2] != expected_script:
+        raise QualificationFailure("Codex agent-loop job command identity is invalid")
+    return path, expected_codex_home, hashlib.sha256(content).hexdigest()
+
+
+def _worktree_isolation_terminal_schema(run_id: str) -> dict[str, object]:
+    """Exact command-free terminal contract accepted by the live probe."""
+
+    return {
+        "kind": "workflow-card",
+        "schema_version": 2,
+        "required": [
+            "schema_version",
+            "kind",
+            "status",
+            "run_id",
+            "card_id",
+            "candidate",
+            "outputs",
+            "diagnostics",
+            "gate_evidence",
+        ],
+        "fixed": {
+            "schema_version": 2,
+            "kind": "workflow-card",
+            "run_id": run_id,
+            "card_id": DEPLOYMENT_CANARY_PROBE_CARD,
+            "outputs": [],
+        },
+        "status": ["passed", "failed", "needs_human"],
+        "status_policy": (
+            "Report passed only when this card's own action is genuinely complete. "
+            "Natural-language confidence, an exit code of 0, and the absence of an "
+            "explicit error do NOT authorize passed; if the action is not complete, or "
+            "the decision needs a human, report failed or needs_human instead. Scope "
+            "discipline: this card's test_policy requires no test run from you, and the "
+            "Manager has declared no gate commands either, so no deterministic gate "
+            "result is expected from either side. Report the status you actually "
+            "observed, keep the concrete detail in diagnostics, and leave gate_evidence "
+            "exactly []."
+        ),
+        "outputs": {
+            "type": "array",
+            "items": "repo-relative artifact path string matching declared_outputs",
+            "must_match_every_declared_output": True,
+            "descriptive_objects_forbidden": True,
+        },
+        "diagnostics": {
+            "type": "object",
+            "description": (
+                "Structured, machine-readable context for this terminal. Required for "
+                "every status; put the concrete failure detail here when reporting "
+                "failed or needs_human instead of burying it in prose."
+            ),
+        },
+        "gate_evidence": {
+            "type": "array",
+            "items": {
+                "name": "one of allowed_names below",
+                "status": "passed | failed",
+            },
+            "allowed_names": [],
+            "description": (
+                "This card's test_policy requires no test run from you, so there is no "
+                "gate name for you to claim and gate_evidence must be exactly []. A name "
+                "of your own invention fails the card closed; put whatever you observed "
+                "into diagnostics instead."
+            ),
+        },
+    }
+
+
+def _expected_worktree_isolation_prompt(
+    job: Mapping[str, object], workflow: Mapping[str, object]
+) -> str:
+    """Reconstruct the only Manager prompt that qualifies as autonomous."""
+
+    run_id = workflow.get("run_id")
+    work_id = workflow.get("work_id")
+    repository = workflow.get("repo")
+    source_revision = job.get("source_revision")
+    if not all(
+        isinstance(value, str) and value
+        for value in (run_id, work_id, repository, source_revision)
+    ):
+        raise QualificationFailure("Codex agent-loop prompt authority is incomplete")
+    contract: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "workflow-card-prompt",
+        "run_id": run_id,
+        "work_id": work_id,
+        "repo": repository,
+        "source_revision": source_revision,
+        "phase": "build",
+        "card_id": DEPLOYMENT_CANARY_PROBE_CARD,
+        "persona": "builder",
+        "inputs": [],
+        "source_material": [],
+        "declared_outputs": [],
+        "candidate": None,
+        "skill_ref": "superpowers:using-git-worktrees",
+        "action": (
+            "Confirm the Manager-provisioned worktree; do not create a second worktree."
+        ),
+        "commit_policy": "forbidden",
+        "test_policy": "none",
+        "terminal_schema": _worktree_isolation_terminal_schema(run_id),
+    }
+    refs = workflow.get("openspec_refs", [])
+    if refs not in (None, [], ()):
+        if (
+            not isinstance(refs, (list, tuple))
+            or not refs
+            or not isinstance(refs[0], str)
+            or not refs[0]
+        ):
+            raise QualificationFailure("Codex agent-loop OpenSpec authority is invalid")
+        contract["openspec_ref"] = refs[0]
+    return (
+        job_runner.WORKTREE_ISOLATION_AUTONOMOUS_PREAMBLE
+        + " Contract: "
+        + json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    )
 
 
 def _validate_dispatch_closeout(
@@ -2663,7 +3208,8 @@ def _validate_dispatch_closeout(
     if (
         not isinstance(run_id, str)
         or not run_id
-        or SHA40.fullmatch(str(candidate)) is None
+        or not isinstance(candidate, str)
+        or SHA40.fullmatch(candidate) is None
         or workflow.get("verified_head") != candidate
         or workflow.get("current_phase") != "ship"
         or workflow.get("status") != "done"
@@ -2714,7 +3260,19 @@ def _validate_dispatch_closeout(
     if not {"plan", "build", "verify", "review", "ship"} <= job_phases:
         raise QualificationFailure("workflow job phase chain is incomplete")
 
-    artifact_paths: list[Path] = [registry_path]
+    artifact_digests: dict[Path, str] = {}
+
+    def remember_artifact(path: Path, digest: str) -> None:
+        if SHA256.fullmatch(digest) is None:
+            raise QualificationFailure("dispatch artifact observation hash is invalid")
+        previous = artifact_digests.get(path)
+        if previous is not None and previous != digest:
+            raise QualificationFailure(
+                "dispatch artifact changed between authority observations"
+            )
+        artifact_digests[path] = digest
+
+    remember_artifact(registry_path, hashlib.sha256(registry_content).hexdigest())
     verdict_seen = False
     ledgers_seen = 0
     for job in bound_jobs:
@@ -2726,7 +3284,7 @@ def _validate_dispatch_closeout(
             or phase not in {"plan", "build", "verify", "review", "ship"}
         ):
             raise QualificationFailure("workflow job authority binding is invalid")
-        envelope, evidence_path, _digest = _bound_relative_json(
+        envelope, evidence_path, evidence_digest = _bound_relative_json(
             root, job.get("workflow_evidence"), label="workflow canonical evidence"
         )
         binding = envelope.get("job")
@@ -2784,16 +3342,17 @@ def _validate_dispatch_closeout(
             if relative.is_absolute() or ".." in relative.parts:
                 raise QualificationFailure("workflow canonical artifact path is unsafe")
             output = job_repo_root / relative
+            output_digest = _sha256(output) if output.is_file() else ""
             if (
                 output.is_symlink()
                 or not output.is_file()
-                or _sha256(output) != row.get("sha256")
+                or output_digest != row.get("sha256")
             ):
                 raise QualificationFailure(
                     "workflow canonical artifact is absent or drifted"
                 )
-            artifact_paths.append(output)
-        artifact_paths.append(evidence_path)
+            remember_artifact(output, output_digest)
+        remember_artifact(evidence_path, evidence_digest)
         if phase != "ship":
             control_value = job.get("control_log_path") or job.get("log_path")
             if not isinstance(control_value, str) or not control_value:
@@ -2802,8 +3361,11 @@ def _validate_dispatch_closeout(
                 )
             control = Path(control_value)
             ledger_path = control.with_name(f"{control.stem}.gates.json")
+            ledger_content = _manager_file(
+                ledger_path, label="workflow gate ledger", root=root
+            )
             ledger = _json_object(
-                _manager_file(ledger_path, label="workflow gate ledger", root=root),
+                ledger_content,
                 label="workflow gate ledger",
             )
             if (
@@ -2814,7 +3376,9 @@ def _validate_dispatch_closeout(
             ):
                 raise QualificationFailure("workflow gate ledger schema is invalid")
             ledgers_seen += 1
-            artifact_paths.append(ledger_path)
+            remember_artifact(
+                ledger_path, hashlib.sha256(ledger_content).hexdigest()
+            )
     if not verdict_seen or ledgers_seen == 0:
         raise QualificationFailure("workflow verdict or Manager gate ledger is absent")
 
@@ -2864,13 +3428,36 @@ def _validate_dispatch_closeout(
             "Codex agent-loop has no unique worktree-isolation job binding"
         )
     bound_logs: list[tuple[str, bytes]] = []
+    probe_codex_homes: list[Path] = []
     for job in probe_jobs:
-        spec_path = _bound_codex_builder_spec(root, job)
+        spec_path, codex_home, spec_digest = _bound_codex_builder_spec(
+            root, job, workflow
+        )
         log_path, log_content = _bound_codex_builder_log(root, job)
-        artifact_paths.append(spec_path)
-        artifact_paths.append(log_path)
+        remember_artifact(spec_path, spec_digest)
+        remember_artifact(log_path, hashlib.sha256(log_content).hexdigest())
         bound_logs.append((str(job["job_id"]), log_content))
-    agent_loop_probe = _codex_agent_loop_observation(bound_logs)
+        probe_codex_homes.append(codex_home)
+    probe_job = probe_jobs[0]
+    probe_worktree = str(probe_job["worktree"])
+    probe_candidate = probe_job.get("subject_head")
+    if not isinstance(probe_candidate, str) or SHA40.fullmatch(probe_candidate) is None:
+        raise QualificationFailure(
+            "Codex agent-loop probe candidate binding is invalid"
+        )
+    agent_loop_probe = _codex_agent_loop_observation(
+        bound_logs,
+        expected_head=probe_candidate,
+        expected_worktree=probe_worktree,
+    )
+    agent_loop_probe["probe_candidate_sha"] = probe_candidate
+    agent_loop_probe.update(
+        _codex_thread_runtime_identity(
+            _codex_agent_loop_thread_id(bound_logs),
+            expected_worktree=probe_worktree,
+            codex_home=probe_codex_homes[0],
+        )
+    )
     for job in build_jobs:
         slot = job.get("template_instance") or job.get("job_id")
         if (
@@ -2891,6 +3478,7 @@ def _validate_dispatch_closeout(
             or stat.S_IMODE(parent_metadata.st_mode) & 0o222
         ):
             raise QualificationFailure("build commit bundle slot is not Manager-sealed")
+        bundle_digest_before = _sha256(bundle)
         verify = _run(
             ("/usr/bin/git", "-C", str(repo_root), "bundle", "verify", str(bundle))
         )
@@ -2904,8 +3492,13 @@ def _validate_dispatch_closeout(
             raise QualificationFailure(
                 "build commit bundle does not carry its job candidate"
             )
+        bundle_digest_after = _sha256(bundle)
+        if bundle_digest_after != bundle_digest_before:
+            raise QualificationFailure(
+                "build commit bundle changed while it was being validated"
+            )
         bundle_seen = True
-        artifact_paths.append(bundle)
+        remember_artifact(bundle, bundle_digest_before)
     if not bundle_seen:
         raise QualificationFailure("workflow has no verified commit bundle artifact")
 
@@ -2934,7 +3527,9 @@ def _validate_dispatch_closeout(
         raise QualificationFailure(
             "workflow completion authority/hash binding is invalid"
         )
-    artifact_paths.append(completion_path)
+    remember_artifact(
+        completion_path, hashlib.sha256(completion_content).hexdigest()
+    )
 
     worktrees = _run(
         ("/usr/bin/git", "-C", str(repo_root), "worktree", "list", "--porcelain")
@@ -2986,7 +3581,7 @@ def _validate_dispatch_closeout(
         gate_paths.add(path)
         gate_inodes.add(inode)
         gate_kinds.add(row["kind"])
-        artifact_paths.append(path)
+        remember_artifact(path, expected_hash)
     if (
         "foreign-review" not in gate_kinds
         or len(gate_kinds & {"copilot", "maintainer-review"}) != 1
@@ -3003,19 +3598,41 @@ def _validate_dispatch_closeout(
         "ledger",
         "verdict",
     ]
-    unique_paths = sorted(set(artifact_paths))
+    artifact_rows = [
+        _artifact_row(
+            path,
+            state_root=state_root,
+            observed_sha256=artifact_digests[path],
+        )
+        for path in sorted(artifact_digests)
+    ]
+    if len(artifact_rows) > MAX_DISPATCH_ARTIFACTS or any(
+        len(row["path"]) > MAX_DISPATCH_ARTIFACT_PATH_CHARS
+        for row in artifact_rows
+    ):
+        raise QualificationFailure("dispatch artifact inventory exceeds the evidence bound")
     return (
         markers,
-        [_artifact_row(path, state_root=state_root) for path in unique_paths],
+        artifact_rows,
         workflow,
         agent_loop_probe,
     )
 
 
 def _full_dispatch(
-    *, repository: str, work_id: str, issue: int, timeout: int, evidence_dir: Path
+    *,
+    repository: str,
+    work_id: str,
+    issue: int,
+    release_candidate_sha: str,
+    timeout: int,
+    evidence_dir: Path,
 ) -> None:
-    if not work_id or issue <= 0:
+    if (
+        WORK_ID.fullmatch(work_id) is None
+        or issue <= 0
+        or SHA40.fullmatch(release_candidate_sha) is None
+    ):
         raise QualificationFailure("protected full-dispatch work identity is missing")
     runtime_env = _installed_runtime_env()
     intake = _run(
@@ -3035,9 +3652,13 @@ def _full_dispatch(
             DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
             "--builder-model",
             DEPLOYMENT_CANARY_BUILDER_MODEL,
+            "--wait",
+            "--timeout",
+            "60",
+            "--json",
         ),
         env=runtime_env,
-        timeout=60,
+        timeout=90,
     )
     _require_success(intake, "full-dispatch intake")
     deadline = time.monotonic() + timeout
@@ -3078,13 +3699,25 @@ def _full_dispatch(
         raise QualificationFailure(
             "full dispatch did not reach terminal closeout before timeout"
         )
-    markers, artifact_rows, _workflow, agent_loop_probe = _validate_dispatch_closeout(
+    markers, artifact_rows, workflow, agent_loop_probe = _validate_dispatch_closeout(
         repository=repository,
         work_id=work_id,
         issue=issue,
         terminal=terminal,
         coordinator_root=Path(runtime_env["PSC_COORDINATOR_ROOT"]),
     )
+    run_id = workflow.get("run_id")
+    workflow_candidate = workflow.get("candidate_head")
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(workflow_candidate, str)
+        or SHA40.fullmatch(workflow_candidate) is None
+    ):
+        raise QualificationFailure("full-dispatch workflow run identity is unavailable")
+    agent_loop_probe["artifact_set_sha256"] = hashlib.sha256(
+        _canonical_bytes(artifact_rows)
+    ).hexdigest()
     _write_json(
         evidence_dir / "dispatch-closeout.json",
         {
@@ -3093,7 +3726,13 @@ def _full_dispatch(
             "repository": repository,
             "work_id": work_id,
             "issue": issue,
-            "terminal": terminal,
+            "release_candidate_sha": release_candidate_sha,
+            "workflow_candidate_sha": workflow_candidate,
+            "terminal": {
+                "state": "done",
+                "work_id": work_id,
+                "run_id": run_id,
+            },
             "required_markers": markers,
             "agent_loop_probe": agent_loop_probe,
             "artifacts": artifact_rows,
@@ -3187,6 +3826,7 @@ def main() -> int:
                 repository=args.probe_repository,
                 work_id=args.probe_work_id,
                 issue=args.probe_issue,
+                release_candidate_sha=args.candidate_sha,
                 timeout=args.dispatch_timeout,
                 evidence_dir=args.evidence_dir,
             )

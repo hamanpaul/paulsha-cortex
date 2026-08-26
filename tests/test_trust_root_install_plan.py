@@ -7,13 +7,19 @@ operator's HOME or execute generated shell text.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import subprocess
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from paulsha_cortex.trust_root.install import (
+    InstallError,
     InstallPlanError,
     UnsafeInstallPathError,
     apply_plan,
@@ -263,7 +269,8 @@ def test_service_tool_wrappers_pin_jitless_without_weakening_units(tmp_path: Pat
         content = wrappers[name]["content"]
         assert content == (
             "#!/bin/sh\n"
-            f'exec /usr/bin/node --jitless "{plan["roots"]["deploy"]}/toolchain/lib/{name}/'
+            f'exec /usr/bin/node --jitless "{plan["roots"]["deploy"]}/toolchain/lib/'
+            f'{name}-{config["toolchain"][name]["version"]}/'
             f'{config["toolchain"][name]["entrypoint"]}" "$@"\n'
         )
     assert "MemoryDenyWriteExecute=yes" in plan["generated"]["units"][
@@ -557,10 +564,27 @@ def test_apply_cli_loads_explicit_prior_receipt_for_upgrade(
     )
     prior = new_install_receipt(prior_plan, path=prior_path)
     prior._document["state"] = "applied"
+    prior._document["qualified"] = True
+    prior_venv = next(
+        step for step in prior_plan["apply_order"] if step["kind"] == "venv"
+    )
+    prior._document["candidate_venv"] = {
+        "path": prior_venv["path"],
+        "tree_sha256": "e" * 64,
+    }
     prior._persist()
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
     monkeypatch.setattr(install_cli, "LocalInstallBackend", lambda: object())
 
     def capture_apply(value, **kwargs):
@@ -586,6 +610,424 @@ def test_apply_cli_loads_explicit_prior_receipt_for_upgrade(
     assert captured["prior_receipt"].to_dict()["plan_sha256"] == plan_sha256(
         prior_plan
     )
+
+
+def test_install_transaction_lock_is_host_global_across_different_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+
+    with install_cli._install_transaction_lock(plan):
+        with pytest.raises(InstallError, match="already running"):
+            changed_candidate = deepcopy(plan)
+            changed_candidate["candidate"]["candidate_sha"] = "b" * 40
+            changed_candidate["repo_identity"]["commit"] = "b" * 40
+            changed_candidate["roots"] = {
+                key: f"{value}-second-install"
+                for key, value in changed_candidate["roots"].items()
+            }
+            changed_candidate["receipt_path"] = str(
+                install_core.canonical_receipt_path(changed_candidate)
+            )
+            with install_cli._install_transaction_lock(changed_candidate):
+                raise AssertionError("concurrent installer acquired the shared lock")
+
+
+def test_maintenance_lease_rejects_a_second_service_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+
+    plan, _document = _bound_plan_document(tmp_path)
+
+    with install_cli._maintenance_lease(plan):
+        with pytest.raises(InstallError, match="maintenance window"):
+            with install_cli._maintenance_lease(plan):
+                raise AssertionError("concurrent maintenance window acquired the lease")
+
+
+def test_maintenance_lease_blocks_direct_transactions_and_admits_its_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _document = _bound_plan_document(tmp_path)
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+
+    with install_cli._maintenance_lease(plan) as token:
+        lock_payload = (
+            tmp_path / "host-locks" / "maintenance.lock"
+        ).read_text(encoding="ascii")
+        assert token not in lock_payload
+        with pytest.raises(InstallError, match="maintenance window"):
+            with install_cli._install_transaction_lock(plan):
+                raise AssertionError("direct transaction bypassed the active lease")
+        with pytest.raises(InstallError, match="does not authorize"):
+            with install_cli._install_transaction_lock(
+                plan, maintenance_token="0" * 64
+            ):
+                raise AssertionError("wrong token entered the maintenance window")
+        with install_cli._install_transaction_lock(
+            plan, maintenance_token=token
+        ):
+            pass
+        changed_plan = deepcopy(plan)
+        changed_plan["repo_identity"]["commit"] = "b" * 40
+        changed_plan["candidate"]["candidate_sha"] = "b" * 40
+        with pytest.raises(InstallError, match="does not authorize"):
+            with install_cli._install_transaction_lock(
+                changed_plan, maintenance_token=token
+            ):
+                raise AssertionError("lease token authorized a different plan")
+
+    with pytest.raises(InstallError, match="does not name an active lease"):
+        with install_cli._install_transaction_lock(plan, maintenance_token=token):
+            raise AssertionError("expired lease token entered a transaction")
+
+
+def test_dead_maintenance_helper_leaves_exact_token_recovery_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _document = _bound_plan_document(tmp_path)
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    token = "a" * 64
+    with install_cli._host_lock(
+        leaf="maintenance.lock", conflict="unexpected conflict"
+    ) as lock_fd:
+        install_cli._write_lock_payload(
+            lock_fd,
+            {
+                "plan_sha256": plan_sha256(plan),
+                "token_sha256": install_cli._sha256_text(token),
+            },
+        )
+
+    with pytest.raises(InstallError, match="stale trust-root maintenance"):
+        with install_cli._install_transaction_lock(plan):
+            raise AssertionError("tokenless mutation bypassed a stale lease marker")
+    with pytest.raises(InstallError, match="stale trust-root maintenance"):
+        with install_cli._maintenance_lease(plan):
+            raise AssertionError("new maintenance window replaced a stale marker")
+    with pytest.raises(InstallError, match="does not authorize"):
+        with install_cli._install_transaction_lock(
+            plan, maintenance_token="b" * 64
+        ):
+            raise AssertionError("wrong token recovered a stale lease marker")
+
+    with install_cli._install_transaction_lock(plan, maintenance_token=token):
+        pass
+
+    with pytest.raises(InstallError, match="does not authorize"):
+        install_cli._release_maintenance_marker(
+            plan, maintenance_token="b" * 64
+        )
+    assert install_cli._release_maintenance_marker(
+        plan, maintenance_token=token
+    ) is True
+    assert install_cli._release_maintenance_marker(
+        plan, maintenance_token=token
+    ) is False
+    with install_cli._install_transaction_lock(plan):
+        pass
+
+
+def test_interrupted_lease_snapshot_is_recovered_with_exact_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _document = _bound_plan_document(tmp_path)
+    plan_path = tmp_path / "install-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = tmp_path / "receipts" / "attempt.json"
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(
+        install_cli,
+        "_service_snapshot",
+        lambda: (
+            ["cortex-manager.service", "cortex-monitor.service"],
+            ["cortex-manager.service"],
+        ),
+    )
+    monkeypatch.setattr(
+        install_cli.sys,
+        "stdin",
+        io.TextIOWrapper(io.BytesIO(b""), encoding="utf-8"),
+    )
+    lease_args = SimpleNamespace(
+        plan=str(plan_path),
+        confirm_sha256=plan_sha256(plan),
+        receipt=str(receipt_path),
+    )
+
+    assert install_cli._lease_command(lease_args) == 1
+    snapshot = install_cli._read_maintenance_snapshot()
+    assert snapshot is not None
+    assert snapshot["receipt_path"] == str(receipt_path)
+    # Simulate reboot: /run loses the marker, while /var/lib retains the
+    # maintenance snapshot. Direct tokenless mutation must still fail closed.
+    (tmp_path / "host-locks" / "maintenance.lock").write_bytes(b"")
+    with pytest.raises(InstallError, match="unfinished maintenance snapshot"):
+        with install_cli._install_transaction_lock(plan):
+            raise AssertionError("tokenless mutation bypassed reboot-persistent state")
+    with pytest.raises(InstallError, match="unfinished maintenance snapshot"):
+        with install_cli._maintenance_lease(plan):
+            raise AssertionError("normal lease replaced an interrupted lifecycle")
+
+    systemctl_calls: list[tuple[str, ...]] = []
+
+    def fake_systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+        systemctl_calls.append(args)
+        if args[0] == "show":
+            output = (
+                "not-found\n"
+                if args[-1] == "cortex-egress-proxy.service"
+                else "loaded\n"
+            )
+            return subprocess.CompletedProcess(args, 0, output, "")
+        assert args[0] in {"start", "stop"}
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(install_cli, "_systemctl", fake_systemctl)
+    recover_args = SimpleNamespace(
+        plan=str(plan_path),
+        confirm_sha256=plan_sha256(plan),
+    )
+    assert install_cli._recover_command(recover_args) == 0
+    assert [call for call in systemctl_calls if call[0] == "stop"] == [
+        ("stop", "cortex-manager.service"),
+        ("stop", "cortex-monitor.service"),
+    ]
+    assert [call for call in systemctl_calls if call[0] == "start"] == [
+        ("start", "cortex-manager.service")
+    ]
+    assert install_cli._read_maintenance_snapshot() is None
+    with install_cli._install_transaction_lock(plan):
+        pass
+
+
+def test_maintenance_snapshot_is_complete_before_atomic_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _document = _bound_plan_document(tmp_path)
+    maintenance_root = tmp_path / "maintenance-state"
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", maintenance_root
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    real_write_all = install_cli._write_all
+
+    def interrupted_write(descriptor: int, payload: bytes) -> None:
+        os.write(descriptor, payload[: max(1, len(payload) // 2)])
+        raise SystemExit("simulated hard interruption before publication")
+
+    monkeypatch.setattr(install_cli, "_write_all", interrupted_write)
+    payload = {
+        "schema_version": 1,
+        "plan_sha256": plan_sha256(plan),
+        "receipt_path": str(tmp_path / "receipt.json"),
+        "present_services": ["cortex-manager.service"],
+        "previously_active": ["cortex-manager.service"],
+    }
+
+    with pytest.raises(SystemExit, match="before publication"):
+        install_cli._write_maintenance_snapshot(payload)
+
+    assert not install_cli._maintenance_snapshot_path().exists()
+    assert list(maintenance_root.glob(".maintenance-snapshot.json.*.tmp")) == []
+    monkeypatch.setattr(install_cli, "_write_all", real_write_all)
+    install_cli._write_maintenance_snapshot(payload)
+    assert install_cli._read_maintenance_snapshot() == payload
+
+
+def test_restore_snapshot_services_compensates_partial_start_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def fake_systemctl(*args: str) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        returncode = 1 if args == ("start", "cortex-monitor.service") else 0
+        return subprocess.CompletedProcess(args, returncode, "", "")
+
+    monkeypatch.setattr(install_cli, "_systemctl", fake_systemctl)
+
+    with pytest.raises(InstallError, match="cannot restore previously active"):
+        install_cli._restore_snapshot_services(
+            ["cortex-manager.service", "cortex-monitor.service"]
+        )
+
+    assert calls == [
+        ("start", "cortex-manager.service"),
+        ("start", "cortex-monitor.service"),
+        ("stop", "cortex-monitor.service"),
+        ("stop", "cortex-manager.service"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {
+            "state": "rolled-back",
+            "journal": [],
+            "activation_journal": [],
+            "credential_journal": [],
+            "services_started": False,
+            "credentials": [],
+            "rollback": {
+                "retained_unknown": ["/var/lib/cortex/foreign"],
+                "retained_drift": [],
+            },
+        },
+        {
+            "state": "rolled-back",
+            "journal": [],
+            "activation_journal": [],
+            "credential_journal": [],
+            "services_started": False,
+            "credentials": [],
+            "rollback": {
+                "retained_unknown": [],
+                "retained_drift": [{"step_id": "asset:unit"}],
+            },
+        },
+        {
+            "state": "rolled-back",
+            "journal": [{"step_id": "asset:unit"}],
+            "activation_journal": [],
+            "credential_journal": [],
+            "services_started": False,
+            "credentials": [],
+            "rollback": {"retained_unknown": [], "retained_drift": []},
+        },
+    ],
+)
+def test_restore_safe_rejects_unknown_drift_or_live_authority(
+    document: dict[str, object],
+) -> None:
+    assert install_cli._receipt_restore_safe(document) is False
+
+
+def test_rollback_uses_the_same_install_root_transaction_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_LOCK_ROOT", tmp_path / "host-locks"
+    )
+    monkeypatch.setattr(
+        install_cli, "_TRUST_ROOT_MAINTENANCE_ROOT", tmp_path / "maintenance-state"
+    )
+    receipt_path = (tmp_path / "operator-selected" / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    receipt = new_install_receipt(plan, path=receipt_path)
+    receipt._document["state"] = "applied"
+    receipt._document["qualified"] = True
+    receipt._document["candidate_venv"] = {
+        "path": next(
+            step["path"] for step in plan["apply_order"] if step["kind"] == "venv"
+        ),
+        "tree_sha256": "e" * 64,
+    }
+    receipt._persist()
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+
+    with install_cli._install_transaction_lock(plan):
+        assert install_cli.main(["rollback", "--receipt", str(receipt_path)]) == 1
+
+
+def test_abort_rollback_skips_an_already_applied_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    receipt = new_install_receipt(plan)
+    receipt._document["state"] = "applied"
+    receipt._document["candidate_venv"] = {
+        "path": next(
+            step["path"] for step in plan["apply_order"] if step["kind"] == "venv"
+        ),
+        "tree_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(
+        install_cli.InstallReceipt,
+        "load",
+        classmethod(lambda _cls, _path, **_kwargs: receipt),
+    )
+    monkeypatch.setattr(
+        install_cli,
+        "_install_transaction_lock",
+        lambda _plan, **_kwargs: nullcontext(),
+    )
+
+    def unexpected_backend():
+        raise AssertionError("completed receipt must not enter rollback")
+
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", unexpected_backend)
+
+    assert install_cli.main(
+        [
+            "rollback",
+            "--receipt",
+            str(tmp_path / "receipt.json"),
+            "--only-incomplete",
+        ]
+    ) == 0
+    assert receipt.to_dict()["state"] == "applied"
 
 
 @pytest.mark.parametrize(
@@ -769,7 +1211,7 @@ def test_bundle_binding_persists_complete_tree_toolchain_authority(
         "source": str(tmp_path / "codex.locked"),
         "source_sha256": "1" * 64,
         "installed_sha256": "f" * 64,
-        "path": f"{plan['roots']['deploy']}/toolchain/lib/codex",
+        "path": f"{plan['roots']['deploy']}/toolchain/lib/codex-0.150.0",
         "owner": "root",
         "group": "root",
         "mode": "0755",

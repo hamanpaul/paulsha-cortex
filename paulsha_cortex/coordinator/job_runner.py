@@ -143,6 +143,7 @@ __all__ = [
     "GATE_HOME_ENV",
     "GATE_PATH_ENV",
     "GATE_TEMPLATE_UNIT_ENV",
+    "GIT_REPOSITORY_ENV_KEYS",
     "HARDENING_PROFILE_JIT",
     "HARDENING_PROFILE_STRICT",
     "JOB_ROLES",
@@ -177,6 +178,7 @@ __all__ = [
     "SystemdTemplatePlan",
     "WORKSPACE_REACH_INHERITED_DEFAULT_ACL",
     "WORKSPACE_REACH_PER_JOB_NAMED_ACL",
+    "WORKTREE_ISOLATION_AUTONOMOUS_PREAMBLE",
     "WORKSPACE_REACH_POOL_OWNED_BY_JOB",
     "WorkspaceAclSpec",
     "ensure_workspace_reachable",
@@ -363,6 +365,24 @@ PRIVATE_PROMPT_ROOT_DIRNAME = paths.JOB_PROMPT_ROOT_DIRNAME
 # than falling back to argv or an ambient stdin.
 MAX_JOB_PROMPT_BYTES = 4 * 1024 * 1024
 
+# Release qualification treats the first worktree-isolation card as a live
+# agent-loop probe.  The model must choose the repository inspection itself;
+# spelling a command out here would only prove prompt following.  Keep this
+# preamble shared with the trusted qualification parser so any wording drift
+# fails closed instead of silently weakening that claim.
+WORKTREE_ISOLATION_AUTONOMOUS_PREAMBLE = (
+    "Execute exactly one workflow card. Independently choose and execute at least one "
+    "useful read-only repository inspection in the Manager-provisioned worktree; this "
+    "prompt prescribes no repository command or command text. End with one JSON object "
+    "only; do not supply an evidence path or hash because Manager will canonicalize it. "
+    "For workflow-card outputs, return only repo-relative artifact path strings matching "
+    "declared_outputs; because declared_outputs is empty, outputs must be exactly []. "
+    "Never put action, summary, or other descriptive objects in outputs. Report candidate "
+    "as the full 40-hex commit SHA you independently observe for the current worktree HEAD. "
+    "Do not mutate the repository, create a commit, or create a second worktree; if the "
+    "inspection cannot be completed, report failed or needs_human instead of guessing."
+)
+
 
 # ---------------------------------------------------------------------------
 # job 角色（#615 M2：reviewer／planner 啟動面降權）
@@ -440,6 +460,32 @@ GIT_CONFIG_VALUE_ENV_PREFIX = "GIT_CONFIG_VALUE_"
 #: 鍵**，且寫端（:func:`build_job_env`／:func:`build_job_spec`）與讀端
 #: （`job_shim.load_spec`）走**同一支** :func:`_reject_unsafe_git_config`。
 ALLOWED_GIT_CONFIG_KEYS = frozenset({"safe.directory"})
+
+#: Git repository-selection variables are stronger than ``-C``/cwd: any one
+#: of them can redirect an otherwise exact ``git rev-parse HEAD`` proof to a
+#: different object database or work tree.  Keep the set public so the normal
+#: launcher and release qualification validate the same fail-closed boundary.
+GIT_REPOSITORY_ENV_KEYS = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_DIR",
+        "GIT_GRAFT_FILE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_NAMESPACE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_PREFIX",
+        "GIT_QUARANTINE_PATH",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_SHALLOW_FILE",
+        "GIT_WORK_TREE",
+    }
+)
 
 #: `GIT_CONFIG_KEY_<i>`／`GIT_CONFIG_VALUE_<i>` 的合法形狀（`<i>` 是十進位、無前導 +/-）。
 _GIT_CONFIG_INDEXED_RE = re.compile(r"^GIT_CONFIG_(KEY|VALUE)_(0|[1-9][0-9]*)$")
@@ -768,7 +814,7 @@ DENIED_ENV_NAMES = frozenset(
         "PYTHONSTARTUP",
         "SHELLOPTS",
     }
-)
+) | GIT_REPOSITORY_ENV_KEYS
 
 
 class JobRunnerError(ValueError):

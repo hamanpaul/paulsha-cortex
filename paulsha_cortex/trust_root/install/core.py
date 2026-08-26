@@ -428,6 +428,18 @@ def _validate_install_config_schema(config: Mapping[str, object]) -> None:
             required=frozenset({"version", "sha256"}),
             optional=frozenset({"shape", "entrypoint"}),
         )
+        version = raw.get("version") if isinstance(raw, Mapping) else None
+        if (
+            not isinstance(name, str)
+            or not name
+            or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in name)
+            or not isinstance(version, str)
+            or not version
+            or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-" for character in version)
+        ):
+            raise InstallPlanError(
+                f"toolchain name/version cannot form a safe install leaf: {name}"
+            )
 
 
 def _credential_bearing_url(value: str) -> bool:
@@ -768,10 +780,13 @@ def _generated_inventory(
             if not name or name in {".", ".."} or "/" in name:
                 raise InstallPlanError(f"unsafe toolchain program name: {name!r}")
             wrapper_path = f"{layout.toolchain_bin}/{name}"
-            executable = f"{layout.toolchain_lib}/{name}"
             tool = toolchain[raw_name]
             if not isinstance(tool, Mapping):
                 raise InstallPlanError(f"toolchain entry must be an object: {name}")
+            version = tool.get("version")
+            if not isinstance(version, str) or not version:
+                raise InstallPlanError(f"toolchain version is required: {name}")
+            executable = f"{layout.toolchain_lib}/{name}-{version}"
             shape = tool.get("shape", "file")
             if shape == "file":
                 content = f'#!/bin/sh\nexec "{executable}" "$@"\n'
@@ -1566,7 +1581,7 @@ def _final_toolchain_manifest_row(
         "source": bundled.get("resolved_path"),
         "source_sha256": bundled.get("sha256"),
         "installed_sha256": installed_sha256,
-        "path": f"{deploy_root}/toolchain/lib/{name}",
+        "path": f"{deploy_root}/toolchain/lib/{name}-{bundled.get('version')}",
         "owner": "root",
         "group": "root",
         "mode": "0755",
@@ -1757,7 +1772,10 @@ def _account_has_receipt_provenance(
                 and entry.get("step") == planned_step
                 and entry.get("status") in {"prepared", "completed"}
                 and isinstance(prior, Mapping)
-                and prior.get("exists") is False
+                and (
+                    prior.get("exists") is False
+                    or entry.get("adopted_from_receipt") is True
+                )
             ):
                 return True
     return False
@@ -1799,11 +1817,152 @@ def _account_group_has_receipt_provenance(
             and entry.get("step") == planned_step
             and entry.get("status") == "prepared"
             and isinstance(prior, Mapping)
-            and prior.get("exists") is False
-            and prior.get("group_exists") is False
+            and (
+                (
+                    prior.get("exists") is False
+                    and prior.get("group_exists") is False
+                )
+                or entry.get("adopted_from_receipt") is True
+            )
         ):
             return True
     return False
+
+
+def validate_prior_receipt_handoff(
+    plan: Mapping[str, object],
+    prior_receipt: "InstallReceipt",
+) -> Mapping[str, object]:
+    """Validate the explicit, qualified authority handed to an upgrade.
+
+    A prior receipt is never discovered implicitly.  It may authorize only a
+    different candidate for the same installation topology and repository.
+    Per-step helpers below still require exact prior journal provenance before
+    any existing host object is adopted.
+    """
+
+    document = prior_receipt.to_dict()
+    prior_plan = document.get("plan")
+    if not isinstance(prior_plan, Mapping):
+        raise InstallPlanError("prior receipt has no embedded install plan")
+    if document.get("plan_sha256") != plan_sha256(prior_plan):
+        raise InstallPlanError("prior receipt embedded plan hash is invalid")
+    if document.get("state") != "applied" or document.get("qualified") is not True:
+        raise InstallPlanError(
+            "prior receipt must be applied and qualified before upgrade handoff"
+        )
+    if document.get("plan_sha256") == plan_sha256(plan):
+        raise InstallPlanError(
+            "prior receipt must identify a different plan; replay the current receipt instead"
+        )
+    for field in ("scheme", "instance", "roots"):
+        if prior_plan.get(field) != plan.get(field):
+            label = "install root" if field == "roots" else field
+            raise InstallPlanError(
+                f"prior receipt {label} does not match the upgrade plan"
+            )
+    current_identity = plan.get("repo_identity")
+    prior_identity = prior_plan.get("repo_identity")
+    if not isinstance(current_identity, Mapping) or not isinstance(
+        prior_identity, Mapping
+    ):
+        raise InstallPlanError("prior receipt repository identity is invalid")
+    if prior_identity.get("remote") != current_identity.get("remote"):
+        raise InstallPlanError(
+            "prior receipt repository remote does not match the upgrade plan"
+        )
+    return prior_plan
+
+
+def _plan_step(
+    plan: Mapping[str, object], step_id: object
+) -> Mapping[str, object] | None:
+    return next(
+        (
+            step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, Mapping) and step.get("step_id") == step_id
+        ),
+        None,
+    )
+
+
+def _prior_account_provenance(
+    *,
+    plan: Mapping[str, object],
+    desired: Mapping[str, object],
+    prior_receipt: "InstallReceipt | None",
+    group_only: bool = False,
+) -> bool:
+    if prior_receipt is None:
+        return False
+    prior_plan = validate_prior_receipt_handoff(plan, prior_receipt)
+    current_step = next(
+        (
+            step
+            for step in plan.get("apply_order", [])
+            if isinstance(step, Mapping)
+            and step.get("kind") == "account"
+            and step.get("name") == desired.get("name")
+        ),
+        None,
+    )
+    prior_step = (
+        _plan_step(prior_plan, current_step.get("step_id"))
+        if isinstance(current_step, Mapping)
+        else None
+    )
+    if not isinstance(prior_step, Mapping) or dict(prior_step) != dict(current_step):
+        return False
+    checker = (
+        _account_group_has_receipt_provenance
+        if group_only
+        else _account_has_receipt_provenance
+    )
+    return checker(plan=prior_plan, desired=desired, receipt=prior_receipt)
+
+
+def _prior_step_provenance(
+    *,
+    plan: Mapping[str, object],
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+    prior_receipt: "InstallReceipt | None",
+    backend: InstallBackend,
+) -> tuple[bool, Mapping[str, object] | None]:
+    """Bind an existing object to the exact prior step and journal proof."""
+
+    if prior_receipt is None:
+        return False, None
+    prior_plan = validate_prior_receipt_handoff(plan, prior_receipt)
+    prior_step = _plan_step(prior_plan, step.get("step_id"))
+    if (
+        not isinstance(prior_step, Mapping)
+        or prior_step.get("kind") != step.get("kind")
+        or prior_step.get("path") != step.get("path")
+    ):
+        return False, prior_step
+    # Inspect through the exact prior step. Directory/repository inspectors
+    # intentionally emit their semantic digest only for the requested desired
+    # state, so inspecting old bytes through the new step cannot prove them.
+    prior_installed = dict(backend.inspect_step(prior_step))
+    if not _state_matches(prior_step, prior_installed):
+        return False, prior_step
+    has_file_provenance = _step_has_receipt_provenance(
+        plan=prior_plan, step=prior_step, receipt=prior_receipt
+    )
+    has_mount_provenance = (
+        _mount_adoption_authority_from_receipt(
+            plan=prior_plan,
+            step=prior_step,
+            receipt=prior_receipt,
+            installed=prior_installed,
+        )
+        is not None
+    )
+    if not (has_file_provenance or has_mount_provenance):
+        return False, prior_step
+    return True, prior_step
 
 
 def _prepared_account_group_is_replayable(
@@ -1906,7 +2065,10 @@ def validate_preflight(
     facts: Mapping[str, object],
     *,
     receipt: "InstallReceipt | None" = None,
+    prior_receipt: "InstallReceipt | None" = None,
 ) -> PreflightReport:
+    if prior_receipt is not None:
+        validate_prior_receipt_handoff(plan, prior_receipt)
     failures: list[dict[str, str]] = []
     for name in ("systemd", "polkit", "cgroup_v2", "acl"):
         if facts.get(name) is not True:
@@ -2008,9 +2170,15 @@ def validate_preflight(
                     + ", ".join(foreign_supplementary_members)
                 )
         if observed is None:
-            if observed_group is not None and not _account_group_has_receipt_provenance(
+            group_provenance = _account_group_has_receipt_provenance(
                 plan=plan, desired=desired, receipt=receipt
-            ):
+            ) or _prior_account_provenance(
+                plan=plan,
+                desired=desired,
+                prior_receipt=prior_receipt,
+                group_only=True,
+            )
+            if observed_group is not None and not group_provenance:
                 raise AccountCollisionError(
                     f"existing group {name} lacks trusted receipt provenance"
                 )
@@ -2027,9 +2195,14 @@ def validate_preflight(
             raise AccountCollisionError(
                 f"existing account {name} password lock state is not proven locked"
             )
-        if not _account_has_receipt_provenance(
+        account_provenance = _account_has_receipt_provenance(
             plan=plan, desired=desired, receipt=receipt
-        ):
+        ) or _prior_account_provenance(
+            plan=plan,
+            desired=desired,
+            prior_receipt=prior_receipt,
+        )
+        if not account_provenance:
             raise AccountCollisionError(
                 f"existing account {name} lacks trusted prior receipt provenance"
             )
@@ -2083,15 +2256,28 @@ def validate_preflight(
 class InstallBackend(Protocol):
     def preflight_facts(self, plan: Mapping[str, object]) -> Mapping[str, object]: ...
     def inspect_step(self, step: Mapping[str, object]) -> Mapping[str, object]: ...
+    def inspect_venv_activation(
+        self, step: Mapping[str, object]
+    ) -> Mapping[str, object]: ...
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]: ...
     def apply_step_checkpointed(
         self,
         step: Mapping[str, object],
+        expected_prior: Mapping[str, object],
         creation_checkpoint: Callable[[Mapping[str, object]], None],
+    ) -> Mapping[str, object]: ...
+    def replace_step_checkpointed(
+        self,
+        step: Mapping[str, object],
+        expected_prior: Mapping[str, object],
+        replacement_checkpoint: Callable[[Mapping[str, object]], None],
     ) -> Mapping[str, object]: ...
     def creation_authority_matches(
         self, step: Mapping[str, object], authority: Mapping[str, object]
     ) -> bool: ...
+    def cleanup_prepared_replacement(
+        self, entry: Mapping[str, object]
+    ) -> None: ...
     def rollback_step(self, entry: Mapping[str, object]) -> None: ...
     def list_unknown_state(self, receipt: "InstallReceipt") -> Sequence[str]: ...
     def start_service(self, name: str) -> None: ...
@@ -2233,6 +2419,16 @@ class InstallReceipt:
                 raise InstallError(
                     f"receipt journal mount authority is invalid: {path}"
                 )
+            venv_authority = entry.get("venv_slot_authority")
+            if venv_authority is not None and (
+                not isinstance(planned_step, Mapping)
+                or not _valid_venv_slot_authority(
+                    venv_authority, step=planned_step
+                )
+            ):
+                raise InstallError(
+                    f"receipt journal venv authority is invalid: {path}"
+                )
             seen.add(step_id)
         rollback_journal = payload.get("rollback_journal", [])
         if not isinstance(rollback_journal, list):
@@ -2272,6 +2468,16 @@ class InstallReceipt:
             ):
                 raise InstallError(
                     f"receipt rollback mount authority is invalid: {path}"
+                )
+            venv_authority = entry.get("venv_slot_authority")
+            if venv_authority is not None and (
+                not isinstance(planned_step, Mapping)
+                or not _valid_venv_slot_authority(
+                    venv_authority, step=planned_step
+                )
+            ):
+                raise InstallError(
+                    f"receipt rollback venv authority is invalid: {path}"
                 )
             rollback_seen.add(step_id)
         credentials = payload.get("credentials")
@@ -2447,8 +2653,10 @@ def _open_receipt_parent_directory(
             except FileNotFoundError:
                 if not create:
                     raise
+                created_component = False
                 try:
                     os.mkdir(component, 0o700, dir_fd=descriptor)
+                    created_component = True
                 except FileExistsError:
                     pass
                 try:
@@ -2459,6 +2667,8 @@ def _open_receipt_parent_directory(
                     raise UnsafeInstallPathError(
                         f"receipt authority contains an unsafe component: {current}"
                     ) from exc
+                if created_component:
+                    os.fsync(descriptor)
             except OSError as exc:
                 raise UnsafeInstallPathError(
                     f"receipt authority contains an unsafe component: {current}"
@@ -2485,6 +2695,35 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         if written <= 0:
             raise InstallError("receipt checkpoint write made no progress")
         view = view[written:]
+
+
+def _rename_noreplace_at(parent_fd: int, source: str, destination: str) -> None:
+    """Atomically publish a Linux authority leaf without replacing a peer."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable") from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        parent_fd,
+        ctypes.c_char_p(os.fsencode(source)),
+        parent_fd,
+        ctypes.c_char_p(os.fsencode(destination)),
+        1,  # RENAME_NOREPLACE
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), destination)
 
 
 def _open_receipt_lock(parent_fd: int, path: Path, leaf: str) -> int:
@@ -2535,51 +2774,56 @@ def _open_receipt_lock(parent_fd: int, path: Path, leaf: str) -> int:
 
 
 def _create_receipt_json_exclusive(path: Path, value: object) -> str:
-    """Create the initial receipt without adopting or replacing an existing leaf."""
+    """Atomically publish an initial receipt without replacing an existing leaf."""
 
     parent_fd: int | None = None
     lock_fd: int | None = None
     receipt_fd: int | None = None
-    created = False
+    temporary_name: str | None = None
     payload = _canonical_bytes(value)
     try:
         parent_fd, leaf = _open_receipt_parent_directory(path, create=True)
         lock_fd = _open_receipt_lock(parent_fd, path, leaf)
-        try:
-            receipt_fd = os.open(
-                leaf,
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-                dir_fd=parent_fd,
-            )
-            created = True
-        except FileExistsError as exc:
-            raise InstallError(f"receipt authority already exists: {path}") from exc
-        except OSError as exc:
-            raise UnsafeInstallPathError(
-                f"cannot exclusively create receipt authority: {path}"
-            ) from exc
+        for _attempt in range(32):
+            temporary_name = f".{leaf}.{uuid.uuid4().hex}.tmp"
+            try:
+                receipt_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if receipt_fd is None or temporary_name is None:
+            raise InstallError("cannot allocate an initial receipt staging file")
         os.fchmod(receipt_fd, 0o600)
         _validate_receipt_file(os.fstat(receipt_fd), path)
         _write_all(receipt_fd, payload)
         os.fsync(receipt_fd)
+        try:
+            _rename_noreplace_at(parent_fd, temporary_name, leaf)
+        except FileExistsError as exc:
+            raise InstallError(f"receipt authority already exists: {path}") from exc
+        except OSError as exc:
+            raise UnsafeInstallPathError(
+                f"cannot atomically create receipt authority: {path}"
+            ) from exc
+        temporary_name = None
         _assert_fd_path_binding(path, receipt_fd, directory=False)
         os.fsync(parent_fd)
         return hashlib.sha256(payload).hexdigest()
-    except BaseException:
-        if created and receipt_fd is not None and parent_fd is not None:
-            try:
-                _assert_fd_path_binding(path, receipt_fd, directory=False)
-                os.unlink(path.name, dir_fd=parent_fd)
-                os.fsync(parent_fd)
-            except (OSError, InstallError):
-                pass
-        raise
     finally:
+        if temporary_name is not None and parent_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
         if receipt_fd is not None:
             os.close(receipt_fd)
         if lock_fd is not None:
@@ -3074,7 +3318,12 @@ def _validate_toolchain_step_bijection(
             or not _is_safe_absolute_plan_path(row.get("source"))
             or not _valid_sha256(row.get("source_sha256"))
             or not _valid_sha256(row.get("installed_sha256"))
-            or row.get("path") != str(Path(str(deploy)) / "toolchain/lib" / name)
+            or row.get("path")
+            != str(
+                Path(str(deploy))
+                / "toolchain/lib"
+                / f"{name}-{row.get('version')}"
+            )
             or row.get("owner") != "root"
             or row.get("group") != "root"
             or row.get("mode") != "0755"
@@ -3322,7 +3571,7 @@ def _valid_creation_authority(
         and isinstance(inode, int)
         and not isinstance(inode, bool)
         and inode > 0
-        and observed_type in {"file", "directory"}
+        and observed_type in {"file", "directory", "symlink"}
         and (file_type is None or observed_type == file_type)
     )
 
@@ -3345,7 +3594,35 @@ def _prepared_leaf_has_rollback_authority(
     installed: Mapping[str, object],
 ) -> bool:
     prior = entry.get("prior")
-    if not isinstance(prior, Mapping) or not _prepared_prior_absent_leaf(step, prior):
+    if not isinstance(prior, Mapping):
+        return False
+    if (
+        prior.get("exists") is True
+        and entry.get("adopted_from_receipt") is True
+        and step.get("kind") in {"asset", "repository"}
+    ):
+        # Atomic file/symlink replacement binds the old inode before mutation.
+        # After the rename, the exact desired state is sufficient evidence that
+        # the prepared operation reached its intended atomic outcome; a partial
+        # in-place directory/repository mutation must still match the old inode.
+        if _state_matches(step, installed):
+            return True
+        authority = entry.get("replacement_authority")
+        file_type = (
+            "directory"
+            if step.get("kind") == "repository"
+            else step.get("asset_type", "file")
+        )
+        if not _valid_creation_authority(authority, file_type=file_type):
+            return False
+        matcher = getattr(backend, "creation_authority_matches", None)
+        if not callable(matcher):
+            return False
+        try:
+            return bool(matcher(step, authority))
+        except Exception:
+            return False
+    if not _prepared_prior_absent_leaf(step, prior):
         return True
     if _state_matches(step, installed):
         return True
@@ -3383,6 +3660,78 @@ def _valid_sha256(value: object) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _venv_staging_path(step: Mapping[str, object]) -> str | None:
+    value = step.get("path")
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        return None
+    slot = Path(value)
+    return str(slot.with_name(f".{slot.name}.cortex-staging"))
+
+
+def _valid_venv_slot_authority(
+    authority: object, *, step: Mapping[str, object]
+) -> bool:
+    """Validate the durable pre-publish authority for one venv slot."""
+
+    if not isinstance(authority, Mapping) or step.get("kind") != "venv":
+        return False
+    # Compatibility with receipts emitted before the staged-publish protocol.
+    if set(authority) == {"path", "tree_sha256"}:
+        return bool(
+            authority.get("path") == step.get("path")
+            and _valid_sha256(authority.get("tree_sha256"))
+        )
+    state = authority.get("state")
+    expected_keys = {
+        "planned": {"state", "path", "staging_path"},
+        "building": {"state", "path", "staging_path", "device", "inode"},
+        "ready": {
+            "state",
+            "path",
+            "staging_path",
+            "device",
+            "inode",
+            "tree_sha256",
+        },
+    }
+    if state not in expected_keys or set(authority) != expected_keys[state]:
+        return False
+    if (
+        authority.get("path") != step.get("path")
+        or authority.get("staging_path") != _venv_staging_path(step)
+    ):
+        return False
+    if state in {"building", "ready"} and (
+        not isinstance(authority.get("device"), int)
+        or isinstance(authority.get("device"), bool)
+        or int(authority["device"]) < 0
+        or not isinstance(authority.get("inode"), int)
+        or isinstance(authority.get("inode"), bool)
+        or int(authority["inode"]) <= 0
+    ):
+        return False
+    return state != "ready" or _valid_sha256(authority.get("tree_sha256"))
+
+
+def _venv_ready_authority_matches(
+    authority: object,
+    *,
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> bool:
+    if not _valid_venv_slot_authority(authority, step=step):
+        return False
+    assert isinstance(authority, Mapping)
+    if authority.get("state") not in {None, "ready"}:
+        return False
+    return bool(
+        authority.get("path") == installed.get("path") == step.get("path")
+        and authority.get("tree_sha256") == installed.get("tree_sha256")
+        and installed.get("exists") is True
+        and installed.get("slot_sha256") == step.get("desired_sha256")
     )
 
 
@@ -3546,22 +3895,578 @@ def _bind_expected_service_executables(
     receipt._persist()
 
 
+def _inspect_venv_activation(
+    *, backend: InstallBackend, step: Mapping[str, object]
+) -> dict[str, object]:
+    reader = getattr(backend, "inspect_venv_activation", None)
+    if not callable(reader):
+        raise InstallDriftError(
+            "backend cannot attest the active venv link before cutover"
+        )
+    observed = dict(reader(step))
+    if observed == {"exists": False}:
+        return observed
+    if (
+        set(observed) == {"exists", "is_symlink"}
+        and observed.get("exists") is True
+        and observed.get("is_symlink") is False
+    ):
+        return observed
+    if (
+        set(observed) == {"exists", "is_symlink", "link_target"}
+        and observed.get("exists") is True
+        and observed.get("is_symlink") is True
+        and isinstance(observed.get("link_target"), str)
+        and bool(observed["link_target"])
+        and "\x00" not in str(observed["link_target"])
+    ):
+        return observed
+    raise InstallDriftError("backend returned an invalid active venv link snapshot")
+
+
+def _prior_venv_provenance(
+    *,
+    plan: Mapping[str, object],
+    step: Mapping[str, object],
+    prior_receipt: InstallReceipt | None,
+    backend: InstallBackend,
+) -> tuple[bool, Mapping[str, object] | None]:
+    if prior_receipt is None:
+        return False, None
+    prior_plan = validate_prior_receipt_handoff(plan, prior_receipt)
+    prior_step = _plan_step(prior_plan, step.get("step_id"))
+    if (
+        not isinstance(prior_step, Mapping)
+        or prior_step.get("kind") != "venv"
+        or prior_step.get("active_link") != step.get("active_link")
+    ):
+        return False, prior_step
+    document = prior_receipt.to_dict()
+    binding = document.get("candidate_venv")
+    installed = dict(backend.inspect_step(prior_step))
+    return (
+        bool(
+            isinstance(binding, Mapping)
+            and set(binding) == {"path", "tree_sha256"}
+            and binding.get("path") == prior_step.get("path")
+            and installed.get("path") == binding.get("path")
+            and _valid_sha256(binding.get("tree_sha256"))
+            and installed.get("tree_sha256") == binding.get("tree_sha256")
+            and _state_matches(prior_step, installed)
+            and _step_has_receipt_provenance(
+                plan=prior_plan,
+                step=prior_step,
+                receipt=prior_receipt,
+            )
+        ),
+        prior_step,
+    )
+
+
+def _current_venv_entry_has_provenance(
+    *,
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+    activation: Mapping[str, object],
+    entry: Mapping[str, object] | None,
+    candidate_binding: Mapping[str, object] | None = None,
+    archived: bool = False,
+) -> bool:
+    """Bind an existing candidate slot/link to this receipt's venv intent."""
+
+    if (
+        not isinstance(entry, Mapping)
+        or entry.get("step") != step
+        or entry.get("status") not in {"prepared", "completed"}
+        or not isinstance(entry.get("prior"), Mapping)
+        or not _state_matches(step, installed)
+        or not _valid_sha256(installed.get("tree_sha256"))
+    ):
+        return False
+    prior = entry["prior"]
+    provenance = prior.get("exists") is False or entry.get(
+        "adopted_from_receipt"
+    ) is True
+    if not provenance:
+        return False
+    if entry.get("status") == "completed":
+        tree_matches = entry.get("tree_sha256") == installed.get("tree_sha256")
+        if not archived:
+            return tree_matches
+        return bool(
+            tree_matches
+            and isinstance(candidate_binding, Mapping)
+            and set(candidate_binding) == {"path", "tree_sha256"}
+            and candidate_binding.get("path") == step.get("path")
+            and candidate_binding.get("tree_sha256")
+            == installed.get("tree_sha256")
+        )
+    inspection_prior = entry.get("inspection_prior")
+    return bool(
+        isinstance(inspection_prior, Mapping)
+        and (
+            inspection_prior.get("exists") is False
+            or entry.get("adopted_from_receipt") is True
+        )
+        and (
+            (
+                activation == prior
+                and _venv_ready_authority_matches(
+                    entry.get("venv_slot_authority"),
+                    step=step,
+                    installed=installed,
+                )
+            )
+            or (
+                activation.get("exists") is True
+                and activation.get("is_symlink") is True
+                and isinstance(installed.get("link_target"), str)
+                and activation.get("link_target") == installed.get("link_target")
+                and _venv_ready_authority_matches(
+                    entry.get("venv_slot_authority"),
+                    step=step,
+                    installed=installed,
+                )
+            )
+        )
+    )
+
+
+def _receipt_venv_entry(
+    *, receipt: InstallReceipt, step: Mapping[str, object]
+) -> tuple[Mapping[str, object] | None, bool, Mapping[str, object] | None]:
+    document = receipt.to_dict()
+    for field, archived in (("journal", False), ("rollback_journal", True)):
+        entries = document.get(field, [])
+        if not isinstance(entries, list):
+            continue
+        entry = next(
+            (
+                row
+                for row in entries
+                if isinstance(row, Mapping)
+                and row.get("step_id") == step.get("step_id")
+                and row.get("step") == step
+            ),
+            None,
+        )
+        if entry is not None:
+            binding = document.get("candidate_venv")
+            return (
+                entry,
+                archived,
+                binding if isinstance(binding, Mapping) else None,
+            )
+    return None, False, None
+
+
+def _archived_venv_authorizes_retained_slot(
+    *,
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+    activation: Mapping[str, object],
+    entry: Mapping[str, object] | None,
+    candidate_binding: Mapping[str, object] | None,
+    archived: bool,
+) -> bool:
+    if (
+        not archived
+        or not isinstance(entry, Mapping)
+        or entry.get("step") != step
+        or entry.get("status") != "completed"
+        or not isinstance(entry.get("prior"), Mapping)
+        or activation != entry.get("prior")
+        or not (
+            entry["prior"].get("exists") is False
+            or entry.get("adopted_from_receipt") is True
+        )
+        or installed.get("exists") is not True
+        or installed.get("installed_sha256") is not None
+        or installed.get("slot_sha256") != step.get("desired_sha256")
+        or not _valid_sha256(installed.get("tree_sha256"))
+        or entry.get("tree_sha256") != installed.get("tree_sha256")
+        or not isinstance(candidate_binding, Mapping)
+        or set(candidate_binding) != {"path", "tree_sha256"}
+        or candidate_binding.get("path") != step.get("path")
+        or candidate_binding.get("tree_sha256") != installed.get("tree_sha256")
+    ):
+        return False
+    return True
+
+
+def _prepared_venv_authorizes_replay(
+    *,
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+    activation: Mapping[str, object],
+    entry: Mapping[str, object] | None,
+) -> bool:
+    if (
+        not isinstance(entry, Mapping)
+        or entry.get("step") != step
+        or entry.get("status") != "prepared"
+        or not isinstance(entry.get("prior"), Mapping)
+        or not isinstance(entry.get("inspection_prior"), Mapping)
+        or activation != entry.get("prior")
+    ):
+        return False
+    inspection_prior = entry["inspection_prior"]
+    if dict(installed) == dict(inspection_prior):
+        authority = entry.get("venv_slot_authority")
+        return bool(
+            inspection_prior.get("exists") is False
+            and (
+                authority is None
+                or (
+                    _valid_venv_slot_authority(authority, step=step)
+                    and isinstance(authority, Mapping)
+                    and authority.get("state") in {"planned", "building"}
+                )
+            )
+        )
+    return _venv_ready_authority_matches(
+        entry.get("venv_slot_authority"), step=step, installed=installed
+    )
+
+
+def _validate_venv_cutover_authority(
+    *,
+    plan: Mapping[str, object],
+    step: Mapping[str, object],
+    installed: Mapping[str, object],
+    receipt_entry: Mapping[str, object] | None,
+    receipt_entry_archived: bool = False,
+    candidate_binding: Mapping[str, object] | None = None,
+    prior_receipt: InstallReceipt | None,
+    backend: InstallBackend,
+) -> tuple[bool, dict[str, object] | None]:
+    """Validate a venv link replacement before any earlier step can mutate."""
+
+    activation = _inspect_venv_activation(backend=backend, step=step)
+    prior_provenance, _prior_step = _prior_venv_provenance(
+        plan=plan,
+        step=step,
+        prior_receipt=prior_receipt,
+        backend=backend,
+    )
+    current_provenance = _current_venv_entry_has_provenance(
+        step=step,
+        installed=installed,
+        activation=activation,
+        entry=receipt_entry,
+        candidate_binding=candidate_binding,
+        archived=receipt_entry_archived,
+    )
+    if _state_matches(step, installed):
+        if current_provenance:
+            return bool(receipt_entry.get("adopted_from_receipt")), activation
+        if prior_provenance:
+            return True, activation
+        raise InstallDriftError(
+            "existing candidate venv lacks trusted receipt provenance"
+        )
+    if (
+        installed.get("exists") is True
+        and installed.get("slot_sha256") != step.get("desired_sha256")
+    ):
+        raise InstallDriftError(
+            "existing candidate venv slot is not the exact attested candidate"
+        )
+    if installed.get("exists") is True:
+        if _archived_venv_authorizes_retained_slot(
+            step=step,
+            installed=installed,
+            activation=activation,
+            entry=receipt_entry,
+            candidate_binding=candidate_binding,
+            archived=receipt_entry_archived,
+        ):
+            return True, activation
+        if _prepared_venv_authorizes_replay(
+            step=step,
+            installed=installed,
+            activation=activation,
+            entry=receipt_entry,
+        ):
+            return bool(receipt_entry.get("adopted_from_receipt")), activation
+        raise InstallDriftError(
+            "existing candidate venv slot lacks trusted receipt provenance"
+        )
+    if activation.get("exists") is not True:
+        if prior_receipt is not None:
+            raise InstallDriftError(
+                "active venv link no longer matches the qualified prior receipt"
+            )
+        if _prepared_venv_authorizes_replay(
+            step=step,
+            installed=installed,
+            activation=activation,
+            entry=receipt_entry,
+        ):
+            return bool(receipt_entry.get("adopted_from_receipt")), activation
+        return False, activation
+    if activation.get("is_symlink") is not True:
+        raise InstallDriftError("active venv path is not a managed symlink")
+    if _prepared_venv_authorizes_replay(
+        step=step,
+        installed=installed,
+        activation=activation,
+        entry=receipt_entry,
+    ):
+        return bool(receipt_entry.get("adopted_from_receipt")), activation
+    if not prior_provenance:
+        raise InstallDriftError(
+            "active venv link lacks exact qualified prior receipt provenance"
+        )
+    return True, activation
+
+
+def _prepared_venv_is_replayable(
+    *,
+    backend: InstallBackend,
+    step: Mapping[str, object],
+    entry: Mapping[str, object],
+    installed: Mapping[str, object],
+) -> bool:
+    """Allow replay only while the old link and verified new slot stay bound."""
+
+    if step.get("kind") != "venv" or entry.get("status") != "prepared":
+        return False
+    prior = entry.get("prior")
+    inspected_prior = entry.get("inspection_prior")
+    if not isinstance(prior, Mapping) or not isinstance(inspected_prior, Mapping):
+        return False
+    try:
+        activation = _inspect_venv_activation(backend=backend, step=step)
+    except InstallError:
+        return False
+    if activation != prior:
+        return False
+    if dict(installed) == dict(inspected_prior):
+        return True
+    return _venv_ready_authority_matches(
+        entry.get("venv_slot_authority"), step=step, installed=installed
+    )
+
+
+def _validate_managed_step_provenance_before_apply(
+    *,
+    plan: Mapping[str, object],
+    steps: Sequence[Mapping[str, object]],
+    receipt: InstallReceipt,
+    prior_receipt: InstallReceipt | None,
+    backend: InstallBackend,
+) -> None:
+    """Reject late managed-filesystem drift before the transaction mutates.
+
+    Upgrade authority is step-scoped.  Checking it only while walking the
+    apply order can mutate an earlier step before discovering that a later
+    existing object is foreign.  Sweep assets, repositories, toolchains, and
+    the venv cutover first; the apply loop still re-inspects each step
+    immediately before use.
+    """
+
+    prior_plan = (
+        validate_prior_receipt_handoff(plan, prior_receipt)
+        if prior_receipt is not None
+        else None
+    )
+    for step in steps:
+        kind = step.get("kind")
+        if kind not in {"account", "asset", "repository", "toolchain", "venv"}:
+            continue
+        installed = dict(backend.inspect_step(step))
+        if kind == "account":
+            if installed.get("exists") is not True and installed.get(
+                "group_exists"
+            ) is not True:
+                continue
+            desired = next(
+                (
+                    row
+                    for field in ("accounts", "service_accounts")
+                    for row in plan.get(field, [])
+                    if isinstance(row, Mapping)
+                    and row.get("name") == step.get("name")
+                ),
+                None,
+            )
+            if not isinstance(desired, Mapping):
+                raise AccountCollisionError(
+                    f"account step lacks desired identity: {step.get('name')}"
+                )
+            group_only = installed.get("exists") is not True
+            current_provenance = (
+                _account_group_has_receipt_provenance(
+                    plan=plan, desired=desired, receipt=receipt
+                )
+                if group_only
+                else _account_has_receipt_provenance(
+                    plan=plan, desired=desired, receipt=receipt
+                )
+            )
+            prior_provenance = _prior_account_provenance(
+                plan=plan,
+                desired=desired,
+                prior_receipt=prior_receipt,
+                group_only=group_only,
+            )
+            if not (current_provenance or prior_provenance):
+                label = "group" if group_only else "account"
+                raise AccountCollisionError(
+                    f"existing {label} lacks trusted prior receipt provenance: "
+                    f"{step.get('name')}"
+                )
+            continue
+        if kind == "venv":
+            receipt_entry, archived, binding = _receipt_venv_entry(
+                receipt=receipt, step=step
+            )
+            _validate_venv_cutover_authority(
+                plan=plan,
+                step=step,
+                installed=installed,
+                receipt_entry=receipt_entry,
+                receipt_entry_archived=archived,
+                candidate_binding=binding,
+                prior_receipt=prior_receipt,
+                backend=backend,
+            )
+            continue
+        if installed.get("exists") is not True:
+            continue
+        journal = receipt._document.get("journal", [])
+        current_entry = next(
+            (
+                entry
+                for entry in journal
+                if isinstance(entry, Mapping)
+                and entry.get("step_id") == step.get("step_id")
+            ),
+            None,
+        ) if isinstance(journal, list) else None
+        if current_entry is not None:
+            _assert_journal_mount_authority(
+                entry=current_entry,
+                step=step,
+                installed=installed,
+            )
+            if (
+                current_entry.get("status") == "prepared"
+                and _prepared_leaf_has_rollback_authority(
+                    backend=backend,
+                    step=step,
+                    entry=current_entry,
+                    installed=installed,
+                )
+            ):
+                continue
+        current_matches = _state_matches(step, installed)
+        current_provenance = bool(
+            current_matches
+            and _step_has_receipt_provenance(
+                plan=plan,
+                step=step,
+                receipt=receipt,
+            )
+        )
+        current_mount = (
+            _mount_adoption_authority_from_receipt(
+                plan=plan,
+                step=step,
+                receipt=receipt,
+                installed=installed,
+            )
+            if current_matches and kind in {"asset", "repository"}
+            else None
+        )
+        empty_mount = bool(
+            kind in {"asset", "repository"}
+            and current_matches
+            and current_mount is None
+            and _explicit_empty_managed_mount_is_adoptable(
+                plan=plan,
+                step=step,
+                installed=installed,
+                receipt=receipt,
+            )
+        )
+        prior_provenance, _prior_step = _prior_step_provenance(
+            plan=plan,
+            step=step,
+            installed=installed,
+            prior_receipt=prior_receipt,
+            backend=backend,
+        )
+        if kind == "toolchain" and not current_matches:
+            # The production backend never overwrites an existing toolchain
+            # leaf in place.  Even receipt-proven prior bytes therefore cannot
+            # authorize an update that would fail only after earlier steps had
+            # mutated; toolchain upgrades must use a new/versioned path.
+            raise InstallDriftError(
+                "existing toolchain cannot be upgraded in place before "
+                f"transaction mutation: {step.get('step_id')}"
+            )
+        if current_matches and (
+            current_provenance
+            or current_mount is not None
+            or empty_mount
+            or prior_provenance
+        ):
+            continue
+        if not current_matches and prior_provenance:
+            if kind in {"asset", "repository"} and not callable(
+                getattr(backend, "replace_step_checkpointed", None)
+            ):
+                raise InstallDriftError(
+                    "backend cannot replace a receipt-proven managed object "
+                    f"before transaction mutation: {step.get('step_id')}"
+                )
+            continue
+        step_id = str(step.get("step_id"))
+        if prior_plan is not None:
+            raise InstallDriftError(
+                "existing managed object does not match prior receipt "
+                f"provenance: {step_id}"
+            )
+        raise InstallDriftError(
+            "existing managed object lacks trusted receipt provenance: "
+            f"{step_id}"
+        )
+
+
 def apply_plan(
     plan: Mapping[str, object],
     *,
     confirm_sha256: str,
     receipt: InstallReceipt,
+    prior_receipt: InstallReceipt | None = None,
     backend: InstallBackend,
 ) -> InstallReceipt:
     expected_hash = plan_sha256(plan)
     steps = validate_apply_plan(plan, confirm_sha256=confirm_sha256)
     if receipt._document.get("plan_sha256") != expected_hash:
         raise InstallPlanError("confirm-sha256 does not match the canonical plan sha256")
+    if prior_receipt is not None:
+        validate_prior_receipt_handoff(plan, prior_receipt)
     facts = backend.preflight_facts(plan)
-    report = validate_preflight(plan, facts, receipt=receipt)
+    report = validate_preflight(
+        plan,
+        facts,
+        receipt=receipt,
+        prior_receipt=prior_receipt,
+    )
     if not report.ok:
         details = "; ".join(row["detail"] for row in report.failures)
         raise InstallError(f"preflight failed: {details}")
+
+    _validate_managed_step_provenance_before_apply(
+        plan=plan,
+        steps=steps,
+        receipt=receipt,
+        prior_receipt=prior_receipt,
+        backend=backend,
+    )
 
     receipt._document["state"] = "applying"
     receipt._persist()
@@ -3582,6 +4487,23 @@ def apply_plan(
                 and _prepared_step_requires_replay(step)
             ):
                 if entry.get("status") == "prepared":
+                    prior = entry.get("prior")
+                    if (
+                        isinstance(prior, Mapping)
+                        and prior.get("exists") is True
+                        and entry.get("adopted_from_receipt") is True
+                        and step.get("kind") in {"asset", "repository"}
+                        and not _prepared_leaf_has_rollback_authority(
+                            backend=backend,
+                            step=step,
+                            entry=entry,
+                            installed=installed,
+                        )
+                    ):
+                        raise InstallDriftError(
+                            "prepared replacement lacks matching authority: "
+                            f"{step_id}"
+                        )
                     entry["status"] = "completed"
                     entry.update(installed)
                     receipt._persist()
@@ -3593,13 +4515,25 @@ def apply_plan(
                 raise InstallDriftError(
                     f"prepared install step lacks prior state: {step_id}"
                 )
-            if dict(installed) != dict(prior):
+            inspection_prior = entry.get("inspection_prior", prior)
+            if not isinstance(inspection_prior, Mapping):
+                raise InstallDriftError(
+                    f"prepared install step lacks inspection state: {step_id}"
+                )
+            if dict(installed) != dict(inspection_prior):
                 # A crash may happen after only part of a backend step mutated
                 # the host.  The prepared journal is already the rollback
                 # authority only after the backend durably binds a newly
                 # created leaf's inode.  A prepared intent alone must never
                 # delete a third-party object created before our mutation.
-                if not _prepared_account_group_is_replayable(step, prior, installed):
+                if not _prepared_account_group_is_replayable(
+                    step, inspection_prior, installed
+                ) and not _prepared_venv_is_replayable(
+                    backend=backend,
+                    step=step,
+                    entry=entry,
+                    installed=installed,
+                ):
                     if not _prepared_leaf_has_rollback_authority(
                         backend=backend,
                         step=step,
@@ -3618,31 +4552,185 @@ def apply_plan(
                         )
         else:
             prior = dict(backend.inspect_step(step))
+            rollback_prior = prior
             adopted_from_receipt = False
             adopted_mount_root: dict[str, int] | None = None
             replayed_mount_root = False
-            if (
-                step.get("kind") in {"asset", "repository"}
-                and _state_matches(step, prior)
-            ):
-                adopted_from_receipt = _step_has_receipt_provenance(
-                    plan=plan, step=step, receipt=receipt
+            prior_step: Mapping[str, object] | None = None
+            if step.get("kind") == "venv":
+                receipt_entry, archived, binding = _receipt_venv_entry(
+                    receipt=receipt, step=step
                 )
-                adopted_mount_root = _mount_adoption_authority_from_receipt(
-                    plan=plan, step=step, receipt=receipt, installed=prior
-                )
-                replayed_mount_root = adopted_mount_root is not None
-                if (
-                    adopted_mount_root is None
-                    and _explicit_empty_managed_mount_is_adoptable(
+                adopted_from_receipt, activation_prior = (
+                    _validate_venv_cutover_authority(
                         plan=plan,
                         step=step,
                         installed=prior,
-                        receipt=receipt,
+                        receipt_entry=receipt_entry,
+                        receipt_entry_archived=archived,
+                        candidate_binding=binding,
+                        prior_receipt=prior_receipt,
+                        backend=backend,
                     )
+                )
+                if activation_prior is None:
+                    raise InstallDriftError(
+                        "active venv rollback authority is unavailable"
+                    )
+                rollback_prior = activation_prior
+            if step.get("kind") == "account" and prior.get("exists") is True:
+                desired = next(
+                    (
+                        row
+                        for key in ("accounts", "service_accounts")
+                        for row in plan.get(key, [])
+                        if isinstance(row, Mapping)
+                        and row.get("name") == step.get("name")
+                    ),
+                    None,
+                )
+                if isinstance(desired, Mapping):
+                    adopted_from_receipt = bool(
+                        _account_has_receipt_provenance(
+                            plan=plan,
+                            desired=desired,
+                            receipt=receipt,
+                        )
+                        or _prior_account_provenance(
+                            plan=plan,
+                            desired=desired,
+                            prior_receipt=prior_receipt,
+                        )
+                    )
+                if not adopted_from_receipt:
+                    raise AccountCollisionError(
+                        "existing account lacks trusted prior receipt "
+                        f"provenance: {step.get('name')}"
+                    )
+            elif (
+                step.get("kind") == "account"
+                and prior.get("exists") is False
+                and prior.get("group_exists") is True
+            ):
+                desired = next(
+                    (
+                        row
+                        for key in ("accounts", "service_accounts")
+                        for row in plan.get(key, [])
+                        if isinstance(row, Mapping)
+                        and row.get("name") == step.get("name")
+                    ),
+                    None,
+                )
+                adopted_from_receipt = bool(
+                    isinstance(desired, Mapping)
+                    and (
+                        _account_group_has_receipt_provenance(
+                            plan=plan,
+                            desired=desired,
+                            receipt=receipt,
+                        )
+                        or _prior_account_provenance(
+                            plan=plan,
+                            desired=desired,
+                            prior_receipt=prior_receipt,
+                            group_only=True,
+                        )
+                    )
+                )
+                if not adopted_from_receipt:
+                    raise AccountCollisionError(
+                        "existing group lacks trusted prior receipt "
+                        f"provenance: {step.get('name')}"
+                    )
+            if (
+                step.get("kind") in {"asset", "repository", "toolchain"}
+                and prior.get("exists") is True
+            ):
+                current_receipt_provenance = (
+                    _state_matches(step, prior)
+                    and _step_has_receipt_provenance(
+                        plan=plan, step=step, receipt=receipt
+                    )
+                )
+                prior_receipt_provenance, prior_step = _prior_step_provenance(
+                    plan=plan,
+                    step=step,
+                    installed=prior,
+                    prior_receipt=prior_receipt,
+                    backend=backend,
+                )
+                adopted_from_receipt = bool(
+                    current_receipt_provenance or prior_receipt_provenance
+                )
+                # A metadata-changing upgrade does not match the *new* step,
+                # but it can still be the exact durable mount authorized by
+                # the prior receipt.  Carry that inode authority into the new
+                # journal before replacement; otherwise the next upgrade would
+                # degrade to generic receipt provenance and accept an
+                # exact-looking foreign mount.
+                if (
+                    step.get("kind") in {"asset", "repository"}
+                    and prior_receipt_provenance
+                    and isinstance(prior_step, Mapping)
+                    and prior_receipt is not None
                 ):
-                    adopted_mount_root = _observed_mount_authority(prior)
-                if not (adopted_from_receipt or adopted_mount_root):
+                    prior_plan = prior_receipt.to_dict()["plan"]
+                    if isinstance(prior_plan, Mapping):
+                        adopted_mount_root = _mount_adoption_authority_from_receipt(
+                            plan=prior_plan,
+                            step=prior_step,
+                            receipt=prior_receipt,
+                            installed=prior,
+                        )
+                if _state_matches(step, prior):
+                    if adopted_mount_root is None:
+                        adopted_mount_root = (
+                            _mount_adoption_authority_from_receipt(
+                                plan=plan,
+                                step=step,
+                                receipt=receipt,
+                                installed=prior,
+                            )
+                            if step.get("kind") in {"asset", "repository"}
+                            else None
+                        )
+                    if (
+                        step.get("kind") in {"asset", "repository"}
+                        and adopted_mount_root is None
+                        and prior_receipt_provenance
+                        and isinstance(prior_step, Mapping)
+                        and prior_receipt is not None
+                    ):
+                        prior_plan = prior_receipt.to_dict()["plan"]
+                        if isinstance(prior_plan, Mapping):
+                            adopted_mount_root = _mount_adoption_authority_from_receipt(
+                                plan=prior_plan,
+                                step=prior_step,
+                                receipt=prior_receipt,
+                                installed=prior,
+                            )
+                    replayed_mount_root = adopted_mount_root is not None
+                    if (
+                        step.get("kind") in {"asset", "repository"}
+                        and adopted_mount_root is None
+                        and _explicit_empty_managed_mount_is_adoptable(
+                            plan=plan,
+                            step=step,
+                            installed=prior,
+                            receipt=receipt,
+                        )
+                    ):
+                        adopted_mount_root = _observed_mount_authority(prior)
+                    if not (adopted_from_receipt or adopted_mount_root):
+                        raise InstallDriftError(
+                            f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
+                        )
+                elif prior_receipt is not None and not prior_receipt_provenance:
+                    raise InstallDriftError(
+                        f"existing {step.get('kind')} does not match prior receipt provenance: {step_id}"
+                    )
+                elif not prior_receipt_provenance:
                     raise InstallDriftError(
                         f"existing {step.get('kind')} lacks trusted receipt provenance: {step_id}"
                     )
@@ -3650,8 +4738,10 @@ def apply_plan(
                 "step_id": step_id,
                 "step": deepcopy(dict(step)),
                 "status": "prepared",
-                "prior": prior,
+                "prior": rollback_prior,
             }
+            if step.get("kind") == "venv" and rollback_prior is not prior:
+                entry["inspection_prior"] = prior
             if adopted_from_receipt:
                 entry["adopted_from_receipt"] = True
             if adopted_mount_root is not None:
@@ -3662,6 +4752,38 @@ def apply_plan(
             completed[step_id] = entry
             receipt._persist()
         def checkpoint_creation(authority: Mapping[str, object]) -> None:
+            if step.get("kind") == "venv":
+                if not _valid_venv_slot_authority(authority, step=step):
+                    raise InstallError(
+                        f"backend returned invalid venv slot authority: {step_id}"
+                    )
+                previous = entry.get("venv_slot_authority")
+                previous_state = (
+                    previous.get("state")
+                    if isinstance(previous, Mapping)
+                    else "legacy" if previous is not None else None
+                )
+                next_state = authority.get("state", "legacy")
+                allowed_transition = bool(
+                    previous == authority
+                    or (previous_state is None and next_state in {"planned", "ready", "legacy"})
+                    or (previous_state == "planned" and next_state == "building")
+                    or (previous_state == "building" and next_state == "ready")
+                )
+                if not allowed_transition:
+                    raise InstallDriftError(
+                        f"backend changed venv slot authority out of order: {step_id}"
+                    )
+                entry["venv_slot_authority"] = deepcopy(dict(authority))
+                try:
+                    receipt._persist()
+                except BaseException:
+                    if previous is None:
+                        entry.pop("venv_slot_authority", None)
+                    else:
+                        entry["venv_slot_authority"] = previous
+                    raise
+                return
             file_type = step.get("asset_type", "file")
             prior = entry.get("prior")
             if (
@@ -3687,13 +4809,95 @@ def apply_plan(
                     entry["creation_authority"] = previous
                 raise
 
-        try:
-            checkpointed_apply = getattr(backend, "apply_step_checkpointed", None)
-            outcome = dict(
-                checkpointed_apply(step, checkpoint_creation)
-                if callable(checkpointed_apply)
-                else backend.apply_step(step)
+        def checkpoint_replacement(authority: Mapping[str, object]) -> None:
+            file_type = (
+                "directory"
+                if step.get("kind") == "repository"
+                else step.get("asset_type", "file")
             )
+            inspection_prior = entry.get("inspection_prior", entry.get("prior"))
+            if (
+                step.get("kind") not in {"asset", "repository"}
+                or entry.get("adopted_from_receipt") is not True
+                or not isinstance(inspection_prior, Mapping)
+                or inspection_prior.get("exists") is not True
+                or not _valid_creation_authority(authority, file_type=file_type)
+            ):
+                raise InstallError(
+                    f"backend returned invalid replacement authority: {step_id}"
+                )
+            previous = entry.get("replacement_authority")
+            if previous is not None and previous != authority:
+                raise InstallDriftError(
+                    f"backend changed replacement authority: {step_id}"
+                )
+            entry["replacement_authority"] = deepcopy(dict(authority))
+            try:
+                receipt._persist()
+            except BaseException:
+                if previous is None:
+                    entry.pop("replacement_authority", None)
+                else:
+                    entry["replacement_authority"] = previous
+                raise
+
+        try:
+            inspection_prior = entry.get("inspection_prior", entry.get("prior"))
+            current_before_apply = dict(backend.inspect_step(step))
+            if (
+                not isinstance(inspection_prior, Mapping)
+                or (
+                    dict(current_before_apply) != dict(inspection_prior)
+                    and not _prepared_account_group_is_replayable(
+                        step, inspection_prior, current_before_apply
+                    )
+                    and not _prepared_venv_is_replayable(
+                        backend=backend,
+                        step=step,
+                        entry=entry,
+                        installed=current_before_apply,
+                    )
+                )
+            ):
+                raise InstallDriftError(
+                    f"install step changed after durable inspection: {step_id}"
+                )
+            replacing = bool(
+                entry.get("adopted_from_receipt") is True
+                and step.get("kind") in {"asset", "repository"}
+                and isinstance(inspection_prior, Mapping)
+                and inspection_prior.get("exists") is True
+                and dict(current_before_apply) == dict(inspection_prior)
+                and not _state_matches(step, current_before_apply)
+            )
+            if replacing:
+                replacement_apply = getattr(
+                    backend, "replace_step_checkpointed", None
+                )
+                if not callable(replacement_apply):
+                    raise InstallDriftError(
+                        f"backend cannot replace receipt-proven state: {step_id}"
+                    )
+                outcome = dict(
+                    replacement_apply(
+                        step,
+                        inspection_prior,
+                        checkpoint_replacement,
+                    )
+                )
+            else:
+                checkpointed_apply = getattr(
+                    backend, "apply_step_checkpointed", None
+                )
+                outcome = dict(
+                    checkpointed_apply(
+                        step,
+                        inspection_prior,
+                        checkpoint_creation,
+                    )
+                    if callable(checkpointed_apply)
+                    else backend.apply_step(step)
+                )
             outcome_authority = outcome.get("creation_authority")
             if outcome_authority is not None:
                 if not _valid_creation_authority(
@@ -3706,12 +4910,37 @@ def apply_plan(
                     raise InstallDriftError(
                         f"backend returned conflicting creation authority: {step_id}"
                     )
+            outcome_replacement = outcome.get("replacement_authority")
+            if outcome_replacement is not None and (
+                not _valid_creation_authority(
+                    outcome_replacement,
+                    file_type=(
+                        "directory"
+                        if step.get("kind") == "repository"
+                        else step.get("asset_type", "file")
+                    ),
+                )
+                or (
+                    entry.get("replacement_authority") is not None
+                    and entry.get("replacement_authority") != outcome_replacement
+                )
+            ):
+                raise InstallDriftError(
+                    f"backend returned conflicting replacement authority: {step_id}"
+                )
         except BaseException:
             # If the backend demonstrably made no mutation, keep the receipt as
             # compact as the pre-two-phase format. If state changed, the durable
             # prepared entry is the replay/rollback authority.
             observed = backend.inspect_step(step)
-            if dict(observed) == dict(entry.get("prior", {})):
+            comparison_prior = entry.get(
+                "inspection_prior", entry.get("prior", {})
+            )
+            if isinstance(comparison_prior, Mapping) and dict(observed) == dict(
+                comparison_prior
+            ) and entry.get("replacement_authority") is None and entry.get(
+                "venv_slot_authority"
+            ) is None:
                 journal.remove(entry)
                 completed.pop(step_id, None)
                 receipt._persist()
@@ -3862,6 +5091,36 @@ def rollback_receipt(
             journal.insert(index, removed)
             raise
 
+    def restored_venv_slot_is_receipt_bound(
+        entry: Mapping[str, object],
+        step: Mapping[str, object],
+        installed: Mapping[str, object],
+    ) -> bool:
+        inspection_prior = entry.get("inspection_prior")
+        if isinstance(inspection_prior, Mapping) and dict(installed) == dict(
+            inspection_prior
+        ):
+            return True
+        if entry.get("status") != "completed":
+            authority = entry.get("venv_slot_authority")
+            return _venv_ready_authority_matches(
+                authority,
+                step=step,
+                installed=installed,
+            )
+        binding = receipt._document.get("candidate_venv")
+        return bool(
+            installed.get("exists") is True
+            and installed.get("slot_sha256") == step.get("desired_sha256")
+            and installed.get("path") == step.get("path")
+            and _valid_sha256(installed.get("tree_sha256"))
+            and entry.get("tree_sha256") == installed.get("tree_sha256")
+            and isinstance(binding, Mapping)
+            and set(binding) == {"path", "tree_sha256"}
+            and binding.get("path") == step.get("path")
+            and binding.get("tree_sha256") == installed.get("tree_sha256")
+        )
+
     for entry in reversed(list(journal)):
         if not isinstance(entry, Mapping):
             continue
@@ -3870,10 +5129,106 @@ def rollback_receipt(
             continue
         installed = backend.inspect_step(step)
         prior = entry.get("prior")
+        if step.get("kind") == "venv" and isinstance(prior, Mapping):
+            try:
+                activation = _inspect_venv_activation(backend=backend, step=step)
+            except Exception as exc:
+                retained_drift.append(
+                    {
+                        "step_id": entry.get("step_id"),
+                        "observed": {"error": str(exc)},
+                    }
+                )
+                continue
+            # Never mutate the active link until the retained candidate slot
+            # is still byte-bound to this receipt.  Checking only the active
+            # target lets a tampered slot be hidden by an otherwise valid
+            # rollback of the link.
+            if not restored_venv_slot_is_receipt_bound(entry, step, installed):
+                retained_drift.append(
+                    {
+                        "step_id": entry.get("step_id"),
+                        "observed": dict(installed),
+                    }
+                )
+                continue
+            if activation == prior:
+                # Content-addressed candidate slots are retained by design;
+                # their bytes still have to remain bound to the completed
+                # receipt.  An unknown/tampered retained slot is reported and
+                # keeps live rollback authority instead of becoming a false
+                # successful cleanup.
+                if entry.get("venv_slot_authority") is not None:
+                    try:
+                        backend.rollback_step(entry)
+                    except Exception as exc:
+                        retained_drift.append(
+                            {
+                                "step_id": entry.get("step_id"),
+                                "observed": {"error": str(exc)},
+                            }
+                        )
+                        continue
+                forget_install_entry(entry)
+                continue
+            if not _state_matches(step, installed):
+                retained_drift.append(
+                    {"step_id": entry.get("step_id"), "observed": dict(installed)}
+                )
+                continue
+            try:
+                backend.rollback_step(entry)
+                restored_activation = _inspect_venv_activation(
+                    backend=backend, step=step
+                )
+            except Exception as exc:
+                retained_drift.append(
+                    {
+                        "step_id": entry.get("step_id"),
+                        "observed": {"error": str(exc)},
+                    }
+                )
+                continue
+            if restored_activation != prior:
+                retained_drift.append(
+                    {
+                        "step_id": entry.get("step_id"),
+                        "observed": dict(restored_activation),
+                    }
+                )
+                continue
+            forget_install_entry(entry)
+            continue
         if isinstance(prior, Mapping) and dict(installed) == dict(prior):
             # The prior rollback may have completed its mutation just before a
             # receipt checkpoint failed.  This entry is already restored, not
             # post-install drift.
+            if (
+                entry.get("status") == "prepared"
+                and entry.get("adopted_from_receipt") is True
+                and entry.get("replacement_authority") is not None
+            ):
+                cleanup = getattr(backend, "cleanup_prepared_replacement", None)
+                if not callable(cleanup):
+                    retained_drift.append(
+                        {
+                            "step_id": entry.get("step_id"),
+                            "observed": {
+                                "error": "backend cannot inspect replacement staging"
+                            },
+                        }
+                    )
+                    continue
+                try:
+                    cleanup(entry)
+                except Exception as exc:
+                    retained_drift.append(
+                        {
+                            "step_id": entry.get("step_id"),
+                            "observed": {"error": str(exc)},
+                        }
+                    )
+                    continue
             forget_install_entry(entry)
             continue
         if entry.get("status") == "prepared":
@@ -3925,7 +5280,9 @@ def rollback_receipt(
         backend.rollback_step(entry)
         forget_install_entry(entry)
     unknown = tuple(backend.list_unknown_state(receipt))
-    receipt._document["state"] = "rolled-back"
+    receipt._document["state"] = (
+        "rollback-blocked" if unknown or retained_drift else "rolled-back"
+    )
     receipt._document["activated"] = False
     receipt._document["qualified"] = False
     _sync_activation_state(receipt)
@@ -4754,6 +6111,12 @@ def _functional_lines(
 ) -> list[str]:
     """Normalize content without hiding category-specific functional lines."""
 
+    # Linux includes a trailing CR in the interpreter path of a CRLF shebang
+    # (for example ``/bin/sh\r``).  Treat every CR as malformed authority
+    # content before any whitespace/comment normalization can erase it.
+    if "\r" in content:
+        raise ValueError("carriage-return line endings are not executable authority")
+
     functional: list[str] = []
     in_polkit_block_comment = False
     for raw_line in content.splitlines():
@@ -4786,10 +6149,12 @@ def _functional_lines(
             if not line:
                 continue
 
-        if category != "polkit" and line.startswith(";"):
+        if category in {"units", "gitconfigs", "environment"} and line.startswith(
+            ("#", ";")
+        ):
             continue
-        if line.startswith("#"):
-            if category in {"shim", "toolchain_wrappers"} and line.startswith("#!"):
+        if category in {"shim", "toolchain_wrappers"} and line.startswith("#"):
+            if line.startswith("#!"):
                 functional.append(line)
             continue
         functional.append(line)

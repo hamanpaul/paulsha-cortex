@@ -23,10 +23,32 @@ The dirty root checkout was excluded. All writes occur on
 ## Selected delta
 
 - Preserve `#!` as functional content for `shim` and `toolchain_wrappers` inventory rows.
-- Ignore only standalone JavaScript `//` and `/* ... */` comments for `polkit`; preserve
-  inline rule content; reject unclosed blocks and semicolon-prefixed rules.
-- Pin canary builder identity, bind its Manager-authored launch spec and validate exact-card Codex
-  command events without uploading raw commands or outputs.
+- Ignore only category-native comments; preserve shell shebang/semicolon and polkit hash/semicolon
+  content, and reject unclosed JavaScript blocks.
+- Pin canary builder identity, byte-compare its complete Manager-authored wrapper, require an exact
+  bound-worktree Git HEAD proof, and verify Spark/xhigh/provider/cwd from the persisted Codex thread.
+- Bind independent canary validation to external repo/work/issue plus unique log/artifact-set hashes.
+- Add explicit qualified prior-receipt handoff and route plan/apply through one offline root-owned,
+  tree-hash-sealed candidate CLI built from an exact hash-locked wheelhouse in a closed environment;
+  pre-sweep every managed filesystem kind, reject marker-only provenance, preserve exact venv-link
+  rollback authority, serialize all receipt operations host-globally, hold a full-lifecycle
+  maintenance lease, admit lifecycle mutations only with its plan-bound token, allocate and prove
+  absent a unique effective receipt, and persist its plan/service pre-state before stop. A dead
+  helper leaves only its exact token authorized; a whole-shell crash requires explicit exact-plan
+  recovery from an atomically published root-only reviewed plan plus durable root-private snapshot,
+  with service restore only after safe rollback; recovery never recreates immutable ingress/venv.
+  Venv construction checkpoints planned/building/ready inode/tree authority before final rename,
+  and mount adoption carries its original inode authority across metadata-only upgrades.
+- Preserve the complete qualification input as RC authority, rerun exact topology/hash/config
+  verification in the release gate, and publish its deterministic install-input archive and passed
+  qualification manifest beside the exact qualified wheel with REST digest checks for all assets.
+- Persist release transaction ownership in the annotated tag so a later run can reconcile only an
+  exact-SHA owned stale draft/tag after hard kill while retaining foreign or published releases.
+- Keep the first worktree-isolation builder prompt autonomous and have qualification reconstruct and
+  byte-compare its canonical prompt/terminal contract rather than trusting fixture-authored text.
+- Bind the canary job environment to exact PATH/safe.directory with Git selector variables denied,
+  bound every work ID to 128 characters, and publish a bundle digest only when it remains stable
+  across Git verification.
 - Replace stale work-item, Todo and Phase 2b upgrade authority with current installer／RC／canary paths.
 - Keep deterministic release and credentialed deployment canary as distinct evidence profiles.
 

@@ -14,6 +14,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -125,6 +126,33 @@ def _sha256_file(path: Path) -> str:
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_open_file(descriptor: int) -> str:
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise InstallDriftError("opened source is not a single-link regular file")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    after = os.fstat(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise InstallDriftError("opened source changed during hashing")
     return digest.hexdigest()
 
 
@@ -258,6 +286,7 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
         return {
             "exists": True,
             "installed_sha256": None,
+            "slot_sha256": expected if slot_matches else None,
             "path": str(slot),
             "tree_sha256": tree_sha256,
         }
@@ -266,16 +295,37 @@ def _venv_state(step: Mapping[str, object]) -> dict[str, object]:
         return {
             "exists": True,
             "installed_sha256": None,
+            "slot_sha256": expected if slot_matches else None,
             "path": str(slot),
             "tree_sha256": tree_sha256,
         }
     return {
         "exists": True,
         "installed_sha256": expected,
+        "slot_sha256": expected,
         "path": str(slot),
         "tree_sha256": tree_sha256,
         "link_target": str(link_target),
     }
+
+
+def _venv_activation_state(step: Mapping[str, object]) -> dict[str, object]:
+    """Snapshot the rollback-relevant active-link state without following it."""
+
+    active = Path(str(step.get("active_link", "")))
+    if not active.is_absolute():
+        raise InstallPlanError("venv step requires an absolute active link")
+    try:
+        observed = active.lstat()
+    except FileNotFoundError:
+        return {"exists": False}
+    if not stat.S_ISLNK(observed.st_mode):
+        return {"exists": True, "is_symlink": False}
+    try:
+        target = os.readlink(active)
+    except OSError as exc:
+        raise InstallDriftError(f"active venv link cannot be inspected: {active}") from exc
+    return {"exists": True, "is_symlink": True, "link_target": target}
 
 
 def _venv_slot_matches(
@@ -298,6 +348,75 @@ def _venv_slot_matches(
         )
     except OSError:
         return False
+
+
+def _venv_staging_path(slot: Path) -> Path:
+    return slot.with_name(f".{slot.name}.cortex-staging")
+
+
+def _venv_staging_authority(
+    slot: Path,
+    staging: Path,
+    *,
+    state: str,
+    tree_sha256: str | None = None,
+) -> dict[str, object]:
+    authority: dict[str, object] = {
+        "state": state,
+        "path": str(slot),
+        "staging_path": str(staging),
+    }
+    if state in {"building", "ready"}:
+        observed = (staging if staging.exists() else slot).lstat()
+        authority.update({"device": observed.st_dev, "inode": observed.st_ino})
+    if state == "ready":
+        if not isinstance(tree_sha256, str):
+            raise InstallError("ready venv authority requires a tree hash")
+        authority["tree_sha256"] = tree_sha256
+    return authority
+
+
+def _cleanup_bound_venv_staging(
+    step: Mapping[str, object], authority: object
+) -> None:
+    """Remove only the exact receipt-bound unpublished staging directory."""
+
+    if not isinstance(authority, Mapping) or "state" not in authority:
+        return
+    slot = Path(str(step.get("path", "")))
+    staging = _venv_staging_path(slot)
+    if (
+        authority.get("path") != str(slot)
+        or authority.get("staging_path") != str(staging)
+    ):
+        raise InstallDriftError("venv staging authority path drifted")
+    try:
+        observed = staging.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_uid != os.geteuid()
+        or stat.S_IMODE(observed.st_mode) & 0o022
+    ):
+        raise InstallDriftError("venv staging authority is unsafe")
+    state = authority.get("state")
+    if state in {"building", "ready"} and (
+        authority.get("device") != observed.st_dev
+        or authority.get("inode") != observed.st_ino
+    ):
+        raise InstallDriftError("venv staging inode authority drifted")
+    if state == "ready" and authority.get("tree_sha256") != _tree_sha256(staging):
+        raise InstallDriftError("venv staging tree authority drifted")
+    if state not in {"planned", "building", "ready"}:
+        raise InstallDriftError("venv staging authority state is invalid")
+    shutil.rmtree(staging)
+    parent_fd = os.open(staging.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _read_acl(path: Path) -> list[dict[str, object]]:
@@ -1249,6 +1368,8 @@ def _creation_authority(
         if file_type == "file"
         else stat.S_ISDIR(observed.st_mode)
         if file_type == "directory"
+        else stat.S_ISLNK(observed.st_mode)
+        if file_type == "symlink"
         else False
     )
     if not matches_type or (file_type == "file" and observed.st_nlink != 1):
@@ -1275,7 +1396,7 @@ def _path_matches_creation_authority(
         or not isinstance(inode, int)
         or isinstance(inode, bool)
         or inode <= 0
-        or file_type not in {"file", "directory"}
+        or file_type not in {"file", "directory", "symlink"}
     ):
         return False
     try:
@@ -1286,6 +1407,8 @@ def _path_matches_creation_authority(
         stat.S_ISREG(observed.st_mode)
         if file_type == "file"
         else stat.S_ISDIR(observed.st_mode)
+        if file_type == "directory"
+        else stat.S_ISLNK(observed.st_mode)
     )
     return bool(
         matches_type
@@ -1481,6 +1604,92 @@ def _classify_systemctl_is_active(
     return "error"
 
 
+def _acl_argument(row: Mapping[str, object]) -> str:
+    """Render one inspected or planned ACL row without changing its type."""
+
+    entry_type = row.get("entry_type", "user")
+    account = row.get("account")
+    perms = row.get("perms")
+    if (
+        entry_type not in {"user", "group", "mask", "other"}
+        or not isinstance(account, str)
+        or not isinstance(perms, str)
+    ):
+        raise InstallPlanError("ACL entries require a valid type, account, and perms")
+    prefix = "d:" if row.get("default") else ""
+    short = {"user": "u", "group": "g", "mask": "m", "other": "o"}[
+        str(entry_type)
+    ]
+    if entry_type in {"mask", "other"}:
+        if account:
+            raise InstallPlanError("mask/other ACL entries must not name an account")
+        return f"{prefix}{short}::{perms.replace('X', 'x')}"
+    return f"{prefix}{short}:{account}:{perms.replace('X', 'x')}"
+
+
+def _apply_fd_asset_state(
+    descriptor: int,
+    *,
+    owner: object,
+    group: object,
+    mode: object,
+    acls: object,
+    directory: bool,
+) -> None:
+    """Apply exact metadata to a held no-follow inode."""
+
+    if not isinstance(acls, list) or any(
+        not isinstance(row, Mapping) for row in acls
+    ):
+        raise InstallPlanError("ACL state must be an array of objects")
+    if not Path("/proc/self/fd").is_dir():
+        raise InstallError("/proc/self/fd is required for safe ACL apply")
+    target = f"/proc/self/fd/{descriptor}"
+    inherited_fds = (descriptor,)
+    _run(("setfacl", "-b", target), check=True, pass_fds=inherited_fds)
+    if directory:
+        _run(("setfacl", "-k", target), check=True, pass_fds=inherited_fds)
+    os.fchown(descriptor, _resolve_uid(owner), _resolve_gid(group))
+    os.fchmod(descriptor, _mode(mode))
+    for row in acls:
+        assert isinstance(row, Mapping)
+        _run(
+            ("setfacl", "-m", _acl_argument(row), target),
+            check=True,
+            pass_fds=inherited_fds,
+        )
+
+
+def _snapshot_authority(
+    observed: os.stat_result, *, file_type: str
+) -> dict[str, object]:
+    return _creation_authority(observed, file_type=file_type)
+
+
+def _replacement_staging_path(step: Mapping[str, object]) -> Path:
+    path = Path(str(step.get("path", "")))
+    return path.with_name(f".{path.name}.cortex-replacement")
+
+
+def _replacement_staging_step(step: Mapping[str, object]) -> dict[str, object]:
+    staged = dict(step)
+    staged["path"] = str(_replacement_staging_path(step))
+    return staged
+
+
+def _replacement_staging_matches(
+    step: Mapping[str, object], state: Mapping[str, object]
+) -> bool:
+    if step.get("asset_type") == "symlink":
+        return bool(
+            state.get("exists") is True
+            and state.get("installed_sha256") == step.get("desired_sha256")
+            and state.get("owner") == step.get("owner")
+            and state.get("group") == step.get("group")
+        )
+    return _state_matches_step(step, state)
+
+
 class LocalInstallBackend:
     """Real Linux implementation; construction itself enforces the root boundary."""
 
@@ -1614,6 +1823,13 @@ class LocalInstallBackend:
             "paths": paths,
         }
 
+    def inspect_venv_activation(
+        self, step: Mapping[str, object]
+    ) -> Mapping[str, object]:
+        if step.get("kind") != "venv":
+            raise InstallPlanError("venv activation inspection requires a venv step")
+        return _venv_activation_state(step)
+
     def inspect_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
         if step.get("kind") == "account":
             return _account_state(step)
@@ -1678,33 +1894,417 @@ class LocalInstallBackend:
     def creation_authority_matches(
         self, step: Mapping[str, object], authority: Mapping[str, object]
     ) -> bool:
-        if step.get("kind") != "asset" or step.get(
+        if step.get("kind") == "repository":
+            pass
+        elif step.get("kind") != "asset" or step.get(
             "asset_type", "file"
-        ) not in {"file", "directory"}:
+        ) not in {"file", "directory", "symlink"}:
             return False
         return _path_matches_creation_authority(
             Path(str(step.get("path", ""))), authority
         )
 
     def apply_step(self, step: Mapping[str, object]) -> Mapping[str, object]:
-        return self._apply_step(step, creation_checkpoint=None)
+        return self._apply_step(
+            step,
+            expected_prior=None,
+            creation_checkpoint=None,
+        )
 
     def apply_step_checkpointed(
         self,
         step: Mapping[str, object],
+        expected_prior: Mapping[str, object],
         creation_checkpoint: Callable[[Mapping[str, object]], None],
     ) -> Mapping[str, object]:
-        return self._apply_step(step, creation_checkpoint=creation_checkpoint)
+        return self._apply_step(
+            step,
+            expected_prior=expected_prior,
+            creation_checkpoint=creation_checkpoint,
+        )
+
+    def replace_step_checkpointed(
+        self,
+        step: Mapping[str, object],
+        expected_prior: Mapping[str, object],
+        replacement_checkpoint: Callable[[Mapping[str, object]], None],
+    ) -> Mapping[str, object]:
+        """Replace only an exact receipt-proven leaf with durable authority."""
+
+        if dict(self.inspect_step(step)) != dict(expected_prior):
+            raise InstallDriftError(
+                f"replacement prior drifted: {step.get('step_id')}"
+            )
+        if step.get("kind") == "repository":
+            return self._replace_repository_step(
+                step, expected_prior, replacement_checkpoint
+            )
+        if step.get("kind") != "asset":
+            raise InstallPlanError(
+                f"unsupported receipt-proven replacement: {step.get('kind')}"
+            )
+        return self._replace_asset_step(
+            step, expected_prior, replacement_checkpoint
+        )
+
+    def cleanup_prepared_replacement(
+        self, entry: Mapping[str, object]
+    ) -> None:
+        """Remove only an exact deterministic staging leaf after a crash.
+
+        The prior-inode checkpoint is persisted before this name can be
+        created.  An incomplete or foreign-looking staging leaf is retained
+        and turns rollback into ``rollback-blocked`` instead of a false clean
+        result.
+        """
+
+        step = entry.get("step")
+        if (
+            not isinstance(step, Mapping)
+            or step.get("kind") != "asset"
+            or step.get("asset_type", "file") not in {"file", "symlink"}
+        ):
+            return
+        staging = _replacement_staging_path(step)
+        if not (staging.exists() or staging.is_symlink()):
+            return
+        staged_step = _replacement_staging_step(step)
+        installed = dict(self.inspect_step(staged_step))
+        if not _replacement_staging_matches(staged_step, installed):
+            raise InstallDriftError(
+                f"prepared replacement staging is not receipt-bound: {staging}"
+            )
+        staging.unlink()
+        parent_fd = os.open(
+            staging.parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def _replace_asset_step(
+        self,
+        step: Mapping[str, object],
+        expected_prior: Mapping[str, object],
+        replacement_checkpoint: Callable[[Mapping[str, object]], None],
+    ) -> Mapping[str, object]:
+        path = Path(str(step.get("path", "")))
+        if not path.is_absolute() or ".." in path.parts:
+            raise UnsafeInstallPathError(f"unsafe asset path: {path}")
+        _reject_symlink_ancestors(path, label="asset", include_leaf=False)
+        asset_type = step.get("asset_type", "file")
+        if asset_type not in {"file", "directory", "symlink"}:
+            raise InstallPlanError(f"unsupported asset_type: {asset_type}")
+
+        parent_fd, leaf = _open_parent_directory(path)
+        temporary_name: str | None = None
+        descriptor: int | None = None
+        prior_descriptor: int | None = None
+        try:
+            if asset_type == "directory":
+                descriptor = os.open(
+                    leaf,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+                authority = _snapshot_authority(
+                    os.fstat(descriptor), file_type="directory"
+                )
+                replacement_checkpoint(authority)
+                if dict(self.inspect_step(step)) != dict(expected_prior):
+                    raise InstallDriftError(
+                        f"replacement prior changed: {step.get('step_id')}"
+                    )
+                _assert_fd_path_binding(path, descriptor, directory=True)
+                _apply_fd_asset_state(
+                    descriptor,
+                    owner=step.get("owner"),
+                    group=step.get("group"),
+                    mode=step.get("mode"),
+                    acls=step.get("acls", []),
+                    directory=True,
+                )
+                os.fsync(descriptor)
+            elif asset_type == "file":
+                content = step.get("content")
+                if not isinstance(content, str):
+                    raise InstallPlanError(
+                        f"file step lacks content: {step.get('step_id')}"
+                    )
+                prior_descriptor = os.open(
+                    leaf,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+                authority = _snapshot_authority(
+                    os.fstat(prior_descriptor), file_type="file"
+                )
+                replacement_checkpoint(authority)
+                if dict(self.inspect_step(step)) != dict(expected_prior):
+                    raise InstallDriftError(
+                        f"replacement prior changed: {step.get('step_id')}"
+                    )
+                _assert_fd_path_binding(path, prior_descriptor, directory=False)
+                self.cleanup_prepared_replacement({"step": step})
+                temporary_name = _replacement_staging_path(step).name
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                with os.fdopen(os.dup(descriptor), "wb") as stream:
+                    stream.write(content.encode("utf-8"))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                _apply_fd_asset_state(
+                    descriptor,
+                    owner=step.get("owner"),
+                    group=step.get("group"),
+                    mode=step.get("mode"),
+                    acls=step.get("acls", []),
+                    directory=False,
+                )
+                os.replace(
+                    temporary_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                temporary_name = None
+                os.fsync(parent_fd)
+                _assert_fd_path_binding(path, descriptor, directory=False)
+            else:
+                target = Path(str(step.get("target", "")))
+                if (
+                    not target.is_absolute()
+                    or ".." in target.parts
+                    or not target.is_dir()
+                    or target.is_symlink()
+                ):
+                    raise InstallDriftError(
+                        f"symlink target is not an exact directory: {target}"
+                    )
+                prior_state = os.stat(
+                    leaf,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                authority = _snapshot_authority(
+                    prior_state, file_type="symlink"
+                )
+                replacement_checkpoint(authority)
+                if (
+                    dict(self.inspect_step(step)) != dict(expected_prior)
+                    or not _path_matches_creation_authority(path, authority)
+                ):
+                    raise InstallDriftError(
+                        f"replacement prior changed: {step.get('step_id')}"
+                    )
+                self.cleanup_prepared_replacement({"step": step})
+                temporary_name = _replacement_staging_path(step).name
+                os.symlink(
+                    os.path.relpath(target, path.parent),
+                    temporary_name,
+                    dir_fd=parent_fd,
+                )
+                os.chown(
+                    temporary_name,
+                    _resolve_uid(step.get("owner")),
+                    _resolve_gid(step.get("group")),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                os.replace(
+                    temporary_name,
+                    leaf,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                temporary_name = None
+                os.fsync(parent_fd)
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            if descriptor is not None:
+                os.close(descriptor)
+            if prior_descriptor is not None:
+                os.close(prior_descriptor)
+            os.close(parent_fd)
+        installed = dict(self.inspect_step(step))
+        if installed.get("installed_sha256") != step.get("desired_sha256"):
+            raise InstallDriftError(
+                f"asset replacement did not reach desired state: {step.get('step_id')}"
+            )
+        return {
+            "prior": dict(expected_prior),
+            "replacement_authority": authority,
+            **installed,
+        }
+
+    def _replace_repository_step(
+        self,
+        step: Mapping[str, object],
+        expected_prior: Mapping[str, object],
+        replacement_checkpoint: Callable[[Mapping[str, object]], None],
+    ) -> Mapping[str, object]:
+        source = Path(str(step.get("source", "")))
+        path = Path(str(step.get("path", "")))
+        source_sha = step.get("source_sha256")
+        commit = step.get("commit")
+        if (
+            not source.is_absolute()
+            or not path.is_absolute()
+            or not isinstance(source_sha, str)
+            or not isinstance(commit, str)
+            or source.is_symlink()
+            or not source.is_file()
+            or source.lstat().st_nlink != 1
+        ):
+            raise InstallDriftError(
+                "repository replacement source is missing or hash-mismatched"
+            )
+        _reject_symlink_ancestors(source, label="repository bundle", include_leaf=False)
+        _reject_symlink_ancestors(path, label="repository", include_leaf=False)
+        uid = _resolve_uid(step.get("owner"))
+        gid = _resolve_gid(step.get("group"))
+        descriptor: int | None = None
+        source_descriptor: int | None = None
+        try:
+            source_descriptor = os.open(
+                source,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            if _sha256_open_file(source_descriptor) != source_sha:
+                raise InstallDriftError(
+                    "repository replacement source hash changed"
+                )
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            authority = _snapshot_authority(
+                os.fstat(descriptor), file_type="directory"
+            )
+            replacement_checkpoint(authority)
+            if dict(self.inspect_step(step)) != dict(expected_prior):
+                raise InstallDriftError(
+                    f"repository replacement prior changed: {step.get('slug')}"
+                )
+            _assert_fd_path_binding(path, descriptor, directory=True)
+            prefix = (
+                *_REPOSITORY_GIT_PREFIX,
+                "-c",
+                f"safe.directory={path}",
+                "-C",
+                str(path),
+            )
+            _run(
+                (
+                    *prefix,
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    f"/proc/self/fd/{source_descriptor}",
+                    commit,
+                ),
+                check=True,
+                env=_REPOSITORY_GIT_ENV,
+                uid=uid,
+                gid=gid,
+                pass_fds=(source_descriptor,),
+            )
+            _run(
+                (*prefix, "checkout", "--detach", "--force", commit),
+                check=True,
+                env=_REPOSITORY_GIT_ENV,
+                uid=uid,
+                gid=gid,
+            )
+            _remove_group_other_write(path)
+            os.chmod(path, _mode(step.get("mode")))
+            _assert_fd_path_binding(path, descriptor, directory=True)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if source_descriptor is not None:
+                os.close(source_descriptor)
+        installed = dict(self.inspect_step(step))
+        if installed.get("installed_sha256") != step.get("desired_sha256"):
+            raise InstallDriftError(
+                f"repository replacement drifted: {step.get('slug')}"
+            )
+        return {
+            "prior": dict(expected_prior),
+            "replacement_authority": authority,
+            **installed,
+        }
 
     def _apply_step(
         self,
         step: Mapping[str, object],
         *,
+        expected_prior: Mapping[str, object] | None,
         creation_checkpoint: Callable[[Mapping[str, object]], None] | None,
     ) -> Mapping[str, object]:
         kind = step.get("kind")
+        inspected_prior = dict(self.inspect_step(step))
+        if expected_prior is not None and inspected_prior != dict(expected_prior):
+            if (
+                kind == "venv"
+                and creation_checkpoint is not None
+                and isinstance(step.get("wheel_sha256"), str)
+            ):
+                replay_slot = Path(str(step.get("path", "")))
+                replay_staging = _venv_staging_path(replay_slot)
+                replay_tree = inspected_prior.get("tree_sha256")
+                if (
+                    not isinstance(replay_tree, str)
+                    or not _venv_slot_matches(
+                        replay_slot,
+                        str(step["wheel_sha256"]),
+                        tree_sha256=replay_tree,
+                    )
+                ):
+                    raise InstallDriftError(
+                        f"install step changed at backend boundary: {step.get('step_id')}"
+                    )
+                creation_checkpoint(
+                    _venv_staging_authority(
+                        replay_slot,
+                        replay_staging,
+                        state="ready",
+                        tree_sha256=replay_tree,
+                    )
+                )
+            else:
+                raise InstallDriftError(
+                    f"install step changed at backend boundary: {step.get('step_id')}"
+                )
         if kind == "account":
-            prior = _account_state(step)
+            prior = inspected_prior
             if prior.get("exists"):
                 if prior.get("installed_sha256") != step.get("desired_sha256"):
                     raise InstallDriftError(
@@ -1757,7 +2357,7 @@ class LocalInstallBackend:
                 raise InstallDriftError(f"created account does not match plan: {name}")
             return {"prior": prior, **installed}
         if kind == "venv":
-            prior = self.inspect_step(step)
+            prior = inspected_prior
             if prior.get("installed_sha256") == step.get("desired_sha256"):
                 return {"prior": prior, **prior}
             slot = Path(str(step.get("path", "")))
@@ -1815,8 +2415,36 @@ class LocalInstallBackend:
             if not slot_ready:
                 slot.parent.mkdir(parents=True, exist_ok=True)
                 _reject_symlink_ancestors(slot, label="candidate venv")
-                temporary = Path(tempfile.mkdtemp(prefix=f".{slot.name}.", dir=slot.parent))
+                temporary = _venv_staging_path(slot)
+                if temporary.exists() or temporary.is_symlink():
+                    raise InstallDriftError(
+                        f"candidate venv staging path already exists: {temporary}"
+                    )
+                if creation_checkpoint is not None:
+                    # Publish the exact staging intent before creating the
+                    # directory. A crash in the mkdir-to-inode-checkpoint
+                    # window is then still recoverable without a pathname
+                    # guess.
+                    creation_checkpoint(
+                        _venv_staging_authority(
+                            slot, temporary, state="planned"
+                        )
+                    )
+                temporary_created = False
                 try:
+                    temporary.mkdir(mode=0o700)
+                    temporary_created = True
+                    parent_fd = os.open(slot.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(parent_fd)
+                    if creation_checkpoint is not None:
+                        creation_checkpoint(
+                            _venv_staging_authority(
+                                slot, temporary, state="building"
+                            )
+                        )
                     _run(("python3", "-m", "venv", str(temporary)), check=True)
                     locked_dir = temporary / ".cortex-wheelhouse"
                     locked_dir.mkdir(mode=0o700)
@@ -1868,10 +2496,49 @@ class LocalInstallBackend:
                     (temporary / ".cortex-tree.sha256").write_text(
                         _tree_sha256(temporary) + "\n", encoding="ascii"
                     )
+                    slot_tree = _tree_sha256(temporary)
+                    if creation_checkpoint is not None:
+                        # The complete tree and its inode are durable receipt
+                        # authority before the atomic final-name publication.
+                        creation_checkpoint(
+                            _venv_staging_authority(
+                                slot,
+                                temporary,
+                                state="ready",
+                                tree_sha256=slot_tree,
+                            )
+                        )
                     os.rename(temporary, slot)
+                    parent_fd = os.open(slot.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(parent_fd)
+                    finally:
+                        os.close(parent_fd)
                 except BaseException:
-                    shutil.rmtree(temporary, ignore_errors=True)
+                    if temporary_created:
+                        shutil.rmtree(temporary, ignore_errors=True)
                     raise
+            slot_state = _venv_state(step)
+            slot_tree = slot_state.get("tree_sha256")
+            if (
+                slot_state.get("exists") is not True
+                or slot_state.get("slot_sha256") != expected
+                or not isinstance(slot_tree, str)
+                or len(slot_tree) != 64
+            ):
+                raise InstallDriftError("candidate venv slot is not attestable")
+            if creation_checkpoint is not None:
+                # Persist the exact retained slot before the active-link
+                # cutover. A crash after os.replace can then safely restore
+                # the prior link without trusting an unbound directory.
+                creation_checkpoint(
+                    _venv_staging_authority(
+                        slot,
+                        _venv_staging_path(slot),
+                        state="ready",
+                        tree_sha256=slot_tree,
+                    )
+                )
             active.parent.mkdir(parents=True, exist_ok=True)
             temporary_link = active.parent / f".{active.name}.{os.getpid()}.tmp"
             try:
@@ -1887,7 +2554,7 @@ class LocalInstallBackend:
                 raise InstallDriftError("candidate venv cutover did not match the plan")
             return {"prior": prior_link, **installed}
         if kind == "toolchain":
-            prior = dict(self.inspect_step(step))
+            prior = inspected_prior
             if prior.get("exists"):
                 if prior.get("installed_sha256") != step.get("desired_sha256"):
                     raise InstallDriftError(f"existing toolchain binary drifted: {step.get('name')}")
@@ -1953,7 +2620,7 @@ class LocalInstallBackend:
                 raise InstallDriftError(f"installed toolchain binary drifted: {step.get('name')}")
             return {"prior": prior, **installed}
         if kind == "repository":
-            prior = dict(self.inspect_step(step))
+            prior = inspected_prior
             if prior.get("exists"):
                 if prior.get("installed_sha256") != step.get("desired_sha256"):
                     raise InstallDriftError(f"existing repository drifted: {step.get('slug')}")
@@ -2041,7 +2708,7 @@ class LocalInstallBackend:
                 if not isinstance(unit, str) or not unit:
                     raise InstallPlanError("systemctl step requires a unit")
                 argv.append(unit)
-            prior = self.inspect_step(step)
+            prior = inspected_prior
             _run(argv, check=True)
             return {"prior": prior, **self.inspect_step(step)}
         if kind != "asset":
@@ -2050,7 +2717,7 @@ class LocalInstallBackend:
         if not path.is_absolute() or ".." in path.parts:
             raise UnsafeInstallPathError(f"unsafe asset path: {path}")
         _reject_symlink_ancestors(path, label="asset", include_leaf=False)
-        prior = dict(self.inspect_step(step))
+        prior = inspected_prior
         if prior.get("exists"):
             if not _state_matches_step(step, prior):
                 raise InstallDriftError(
@@ -2198,16 +2865,60 @@ class LocalInstallBackend:
                         shutil.rmtree(path)
             return
         if step.get("kind") == "repository":
-            # Repositories are durable state. Even a receipt-created checkout is
-            # retained and may only be adopted again at the exact commit/remote.
+            # Fresh checkouts are durable retained state. An in-place upgrade,
+            # however, has an exact prior commit in its journal and must restore
+            # that checkout before the old services may be restarted.
+            if prior.get("exists"):
+                commit = prior.get("commit")
+                remote = prior.get("remote")
+                if (
+                    not isinstance(commit, str)
+                    or len(commit) != 40
+                    or not isinstance(remote, str)
+                ):
+                    raise InstallError(
+                        "repository rollback lacks exact prior identity"
+                    )
+                path = Path(str(step.get("path", "")))
+                uid = _resolve_uid(prior.get("owner"))
+                gid = _resolve_gid(prior.get("group"))
+                prefix = (
+                    *_REPOSITORY_GIT_PREFIX,
+                    "-c",
+                    f"safe.directory={path}",
+                    "-C",
+                    str(path),
+                )
+                _run(
+                    (*prefix, "checkout", "--detach", "--force", commit),
+                    check=True,
+                    env=_REPOSITORY_GIT_ENV,
+                    uid=uid,
+                    gid=gid,
+                )
+                _run(
+                    (*prefix, "remote", "set-url", "origin", remote),
+                    check=True,
+                    env=_REPOSITORY_GIT_ENV,
+                    uid=uid,
+                    gid=gid,
+                )
+                _remove_group_other_write(path)
+                os.chmod(path, _mode(prior.get("mode")))
             return
         if step.get("kind") == "venv":
+            _cleanup_bound_venv_staging(
+                step, entry.get("venv_slot_authority")
+            )
             active = Path(str(step.get("active_link", "")))
-            if not active.is_symlink():
-                raise InstallDriftError(f"active venv link drifted: {active}")
             prior = entry.get("prior", {})
             if not isinstance(prior, Mapping):
                 raise InstallError("venv rollback entry lacks prior state")
+            current_activation = _venv_activation_state(step)
+            if current_activation == dict(prior):
+                return
+            if not active.is_symlink():
+                raise InstallDriftError(f"active venv link drifted: {active}")
             if prior.get("exists"):
                 target = prior.get("link_target")
                 if not isinstance(target, str) or not target:
@@ -2217,8 +2928,9 @@ class LocalInstallBackend:
                 os.replace(temporary_link, active)
             else:
                 active.unlink()
-            # Content-addressed slots are retained as the previous-version and
-            # forensic boundary; rollback never recursively removes them.
+            # Published content-addressed slots are retained as the
+            # previous-version and forensic boundary. Only an unpublished,
+            # receipt-bound staging directory above is removed.
             return
         if step.get("kind") != "asset":
             if step.get("kind") == "systemctl":
@@ -2248,9 +2960,38 @@ class LocalInstallBackend:
                     f"{step.get('step_id')}"
                 )
         if step.get("asset_type") == "symlink":
-            if not prior.get("exists"):
-                if path.is_symlink():
-                    path.unlink()
+            if prior.get("exists"):
+                target = prior.get("target")
+                if not isinstance(target, str) or not target or "\x00" in target:
+                    raise InstallError("symlink rollback lacks exact prior target")
+                parent_fd, leaf = _open_parent_directory(path)
+                temporary_name = f".{leaf}.{uuid.uuid4().hex}.rollback"
+                try:
+                    os.symlink(target, temporary_name, dir_fd=parent_fd)
+                    os.chown(
+                        temporary_name,
+                        _resolve_uid(prior.get("owner")),
+                        _resolve_gid(prior.get("group")),
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    os.replace(
+                        temporary_name,
+                        leaf,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    temporary_name = ""
+                    os.fsync(parent_fd)
+                finally:
+                    if temporary_name:
+                        try:
+                            os.unlink(temporary_name, dir_fd=parent_fd)
+                        except FileNotFoundError:
+                            pass
+                    os.close(parent_fd)
+            elif path.is_symlink():
+                path.unlink()
             return
         if not prior.get("exists"):
             if path.is_file() and not path.is_symlink():
@@ -2258,11 +2999,78 @@ class LocalInstallBackend:
             elif path.is_dir() and not any(path.iterdir()):
                 path.rmdir()
             return
+        if step.get("asset_type", "file") == "directory":
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                _apply_fd_asset_state(
+                    descriptor,
+                    owner=prior.get("owner"),
+                    group=prior.get("group"),
+                    mode=prior.get("mode"),
+                    acls=prior.get("acl", []),
+                    directory=True,
+                )
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return
         encoded = prior.get("content_base64")
-        if isinstance(encoded, str):
-            path.write_bytes(base64.b64decode(encoded.encode("ascii")))
-        os.chown(path, _resolve_uid(prior.get("owner")), _resolve_gid(prior.get("group")), follow_symlinks=False)
-        os.chmod(path, _mode(prior.get("mode")), follow_symlinks=False)
+        if not isinstance(encoded, str):
+            raise InstallError("file rollback lacks prior content")
+        try:
+            payload = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except (ValueError, UnicodeError) as exc:
+            raise InstallError("file rollback prior content is invalid") from exc
+        parent_fd, leaf = _open_parent_directory(path)
+        temporary_name = f".{leaf}.{uuid.uuid4().hex}.rollback"
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                temporary_name,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            with os.fdopen(os.dup(descriptor), "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _apply_fd_asset_state(
+                descriptor,
+                owner=prior.get("owner"),
+                group=prior.get("group"),
+                mode=prior.get("mode"),
+                acls=prior.get("acl", []),
+                directory=False,
+            )
+            os.replace(
+                temporary_name,
+                leaf,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary_name = ""
+            os.fsync(parent_fd)
+            _assert_fd_path_binding(path, descriptor, directory=False)
+        finally:
+            if temporary_name:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_fd)
 
     def list_unknown_state(self, receipt: InstallReceipt) -> Sequence[str]:
         retained: list[str] = []
@@ -2282,7 +3090,7 @@ class LocalInstallBackend:
             step = entry.get("step") if isinstance(entry, Mapping) else None
             if (
                 isinstance(step, Mapping)
-                and step.get("kind") == "asset"
+                and step.get("kind") in {"asset", "venv"}
                 and isinstance(step.get("path"), str)
             ):
                 managed_paths.add(Path(str(step["path"])))
@@ -2600,7 +3408,10 @@ class LocalInstallBackend:
                 snapshot = _snapshot(path)
                 content = ""
                 if snapshot.get("exists") and path.is_file():
-                    content = path.read_text(encoding="utf-8", errors="replace")
+                    # Path.read_text() enables universal-newline translation and
+                    # would turn an unexecutable CRLF shebang into an apparently
+                    # valid LF shebang before attestation sees it.
+                    content = path.read_bytes().decode("utf-8", errors="replace")
                 installed[str(category)][str(name)] = {
                     "content": content,
                     "owner": str(snapshot.get("owner", "")),
@@ -2642,7 +3453,7 @@ class LocalInstallBackend:
                         continue
                     content = ""
                     if path.is_file() and not path.is_symlink():
-                        content = path.read_text(encoding="utf-8", errors="replace")
+                        content = path.read_bytes().decode("utf-8", errors="replace")
                     installed.setdefault(category, {})[path.name] = {
                         "content": content,
                         "owner": "",

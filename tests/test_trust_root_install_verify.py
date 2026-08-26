@@ -183,6 +183,24 @@ def test_toolchain_wrapper_shebang_drift_is_functional_drift() -> None:
     )
 
 
+def test_crlf_toolchain_wrapper_is_malformed_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["toolchain_wrappers"]["codex"]["content"] = (
+        installed["toolchain_wrappers"]["codex"]["content"].replace("\n", "\r\n")
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "toolchain_wrappers/codex"
+        and "carriage-return" in row["malformed_content"]
+        for row in report.to_dict()["failures"]
+    )
+
+
 def test_polkit_standalone_comment_drift_warns_but_does_not_fail() -> None:
     expected = _inventory()
     installed = deepcopy(expected)
@@ -487,8 +505,17 @@ class CandidateVenvBackend(VerifyBackend):
         return {
             "exists": True,
             "installed_sha256": step["desired_sha256"],
+            "slot_sha256": step["desired_sha256"],
             "path": str(self.slot),
             "tree_sha256": backend_module._tree_sha256(self.slot),
+            "link_target": "venvs/candidate",
+        }
+
+    def inspect_venv_activation(self, _step):
+        return {
+            "exists": True,
+            "is_symlink": True,
+            "link_target": "venvs/candidate",
         }
 
     def apply_step(self, step):
@@ -601,6 +628,16 @@ def _candidate_venv_receipt(tmp_path: Path):
     }
     backend = CandidateVenvBackend(slot)
     receipt = new_install_receipt(plan)
+    installed = backend.inspect_step(step)
+    receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": step,
+            "status": "completed",
+            "prior": {"exists": False},
+            **installed,
+        }
+    ]
     apply_plan(
         plan,
         confirm_sha256=plan_sha256(plan),

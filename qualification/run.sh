@@ -269,6 +269,11 @@ if [[ "$profile" == deployment-canary ]]; then
         --probe-issue "$CORTEX_RC_PROBE_ISSUE"
     )
     validator_profile_args=(--require-canary-profile)
+    validator_profile_args+=(
+        --canary-repository "$CORTEX_RC_PROBE_REPOSITORY"
+        --canary-work-id "$CORTEX_RC_PROBE_WORK_ID"
+        --canary-issue "$CORTEX_RC_PROBE_ISSUE"
+    )
 fi
 wheel_filename=$(basename "$wheel_path")
 docker exec "$container_name" "$qualification_driver" \

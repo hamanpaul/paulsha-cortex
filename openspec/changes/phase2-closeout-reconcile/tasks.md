@@ -22,16 +22,25 @@ work_item: phase2-closeout-reconcile
 
 ## 3. Verification and delivery
 
-- [ ] focused tests、cross-feature trust-root tests、完整 pytest、canonical OpenSpec、
-      build/twine/clean-wheel smoke 與 actual PR-context preflight 全綠。
-- [ ] 每條 standard/adversarial review finding 獨立驗證並修/駁/列管；修後重審。
-- [ ] archive 本 change，提交 changelog fragment 與 `CHANGELOG.md [Unreleased]`。
-- [ ] push PR、exact-head approval、CI、unresolved-thread audit 與 merge全部完成。
+- [x] focused tests、cross-feature trust-root tests、完整 pytest、canonical OpenSpec 與
+      build/twine/clean-wheel smoke 全綠。
+- [x] 每條 standard/adversarial review finding 已獨立驗證並修/駁/列管；修後回歸全綠。
+- [ ] 以官方 OpenSpec CLI archive 本 change，並提交 changelog fragment 與
+      `CHANGELOG.md [Unreleased]`。
+- [ ] 建立 zh-TW PR、套用 release label，並以該 PR 的 actual metadata 跑 policy preflight。
 
-## 4. Release and authority closeout
+## 4. Release-ready implementation
 
-- [ ] 將 `VERSION` 升至 `0.1.10`，final-main exact-SHA RC qualification 通過後發布
-      annotated tag、non-draft GitHub Release 與 hash-matching single wheel。
-- [ ] 依 shipped evidence 關閉 #681/#695；將 #716 明確改列為 deployment-canary
-      follow-up；修正 #789–#791 的 superseded 語意。
-- [ ] 驗證 repo work-item/Todo、GitHub issue、release 與 `main` 對 Phase 2 狀態一致。
+- [x] 將 `VERSION` 升至 `0.1.10`；release workflow 只接受 final-main exact-SHA RC，並發布
+      annotated tag、non-draft GitHub Release、hash-matching single wheel、完整
+      install-input archive 與 permanent qualification manifest，逐 asset 核對 REST digest。
+- [x] 固化 authority closeout 邊界：#681/#695 只在 shipped evidence 後關閉；#716 明確保留為
+      deployment-canary follow-up；#789–#791 不再作為平行 implementation authority。
+
+## Post-merge operational closeout
+
+下列動作依本 change 已驗證的 workflow 執行，屬 merge 後外部狀態，不作為「先 archive 才能
+建立 PR」的循環 task gate：等待 final-head CI／review、merge；對 final-main SHA 跑 RC 並發布
+0.1.10；核對三份 release asset REST digest；依 shipped evidence 關閉 #681/#695、保留 #716，
+最後對帳 repo work-item／GitHub issue／release／`main`。其證據留在 PR、Actions、Release 與
+issue timeline，不預先勾成已完成。

@@ -1,6 +1,7 @@
 """Phase 2 trust-root installer RED contract: credentials and activation."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -468,7 +469,12 @@ def test_credential_cli_stderr_redacts_source_path(
     monkeypatch.setattr(
         install_cli.InstallReceipt,
         "load",
-        classmethod(lambda _cls, _path: receipt),
+        classmethod(lambda _cls, _path, **_kwargs: receipt),
+    )
+    monkeypatch.setattr(
+        install_cli,
+        "_install_transaction_lock",
+        lambda _plan, **_kwargs: nullcontext(),
     )
 
     assert install_cli.main(

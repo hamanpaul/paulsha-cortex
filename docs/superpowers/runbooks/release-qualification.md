@@ -15,11 +15,24 @@
    `schema_version: 2`、`profile: release`、`providers: []`。
 4. 手動執行 `Release`，輸入與 `VERSION` 完全相同的版本。release workflow 會重新 build wheel、
    比對 wheel/bundle hashes，並以 `--require-release-profile` 驗證 evidence。
-5. 驗證 annotated tag、non-draft GitHub Release 與唯一 wheel asset 都指向同一 main SHA。
+5. 驗證 annotated tag、non-draft GitHub Release 與恰好三份資產都指向同一 main SHA：唯一
+   wheel、完整 install-input archive、passed release qualification manifest。三份資產的
+   GitHub REST `digest` 都必須等於 publication job 的本機 SHA-256。
 
 publication job 刻意不 checkout source tree；所有 repository-aware `gh` 操作都必須由
 `GITHUB_REPOSITORY` 明確指定目標。尤其 `gh release create` 必須帶 `--repo`，不可依賴本地
 `.git` context。
+
+publication 是一筆可回滾 transaction：tag ref 建立前就先 armed ownership marker；draft
+upload、asset digest 驗證或 publish 任一步驟遇到一般 failure、`INT`、`TERM`，都只刪除帶本次
+marker 且 tag object 相符的 release/tag。三份資產全數驗證且 non-draft response 綁定同一
+transaction 後才 disarm。
+
+若 runner 被 SIGKILL，trap 可能來不及執行。ownership marker 因此也會寫進 annotated tag
+message（run／attempt／release SHA）；下一次 workflow 只在 tag 為 annotated、target 等於 exact
+release SHA、marker shape 正確，且同 tag release 仍是帶相同 marker 的 draft 時，才刪除該
+draft/tag 後重試。lightweight／foreign／wrong-target tag 或已發布的 non-draft release 一律保留
+並 fail closed，不以「清殘留」名義改寫正式 release。
 
 這條路徑不需要設定 GitHub environment secrets 或 variables；若 `RC qualification` 要求它們，
 代表 workflow contract 已退化，應先修復而不是補值。

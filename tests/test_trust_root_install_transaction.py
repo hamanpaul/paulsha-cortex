@@ -182,12 +182,16 @@ class RecordingBackend:
         self.stopped: list[str] = []
         self.credential_rollbacks = 0
         self.creation_identities: dict[str, dict[str, object]] = {}
+        self.venv_activation: dict[str, object] = {"exists": False}
 
     def preflight_facts(self, _plan) -> dict[str, object]:
         return deepcopy(self.facts)
 
     def inspect_step(self, step) -> dict[str, object]:
         return deepcopy(self.states.get(step["step_id"], {"exists": False}))
+
+    def inspect_venv_activation(self, _step) -> dict[str, object]:
+        return deepcopy(self.venv_activation)
 
     def _apply_step(self, step, creation_checkpoint=None) -> dict[str, object]:
         step_id = step["step_id"]
@@ -226,11 +230,34 @@ class RecordingBackend:
     def apply_step(self, step) -> dict[str, object]:
         return self._apply_step(step)
 
-    def apply_step_checkpointed(self, step, creation_checkpoint):
+    def apply_step_checkpointed(self, step, expected_prior, creation_checkpoint):
+        assert self.inspect_step(step) == expected_prior
         return self._apply_step(step, creation_checkpoint)
+
+    def replace_step_checkpointed(
+        self, step, expected_prior, replacement_checkpoint
+    ):
+        assert self.inspect_step(step) == expected_prior
+        file_type = (
+            "directory"
+            if step.get("kind") == "repository"
+            else step.get("asset_type", "file")
+        )
+        authority = {
+            "device": 1,
+            "inode": len(self.creation_identities) + 1000,
+            "file_type": file_type,
+        }
+        self.creation_identities[step["step_id"]] = authority
+        replacement_checkpoint(authority)
+        outcome = self._apply_step(step)
+        return {"replacement_authority": authority, **outcome}
 
     def creation_authority_matches(self, step, authority) -> bool:
         return authority == self.creation_identities.get(step["step_id"])
+
+    def cleanup_prepared_replacement(self, _entry) -> None:
+        return None
 
     def rollback_step(self, entry) -> None:
         self.rolled_back.append(entry["step_id"])
@@ -252,6 +279,93 @@ class RecordingBackend:
     def rollback_credentials(self, _receipt):
         self.credential_rollbacks += 1
         return ()
+
+
+class VenvTransactionBackend(RecordingBackend):
+    """Model the retained content-addressed slot and mutable active link."""
+
+    def __init__(self, plan: dict[str, object]) -> None:
+        super().__init__(plan)
+        self.slot_exists = False
+        self.tree_sha256 = "e" * 64
+
+    def inspect_step(self, step) -> dict[str, object]:
+        if step.get("kind") != "venv":
+            return super().inspect_step(step)
+        if not self.slot_exists:
+            return {"exists": False}
+        state = {
+            "exists": True,
+            "installed_sha256": None,
+            "slot_sha256": step["desired_sha256"],
+            "path": step["path"],
+            "tree_sha256": self.tree_sha256,
+        }
+        if self.venv_activation == {
+            "exists": True,
+            "is_symlink": True,
+            "link_target": "venvs/candidate",
+        }:
+            state.update(
+                {
+                    "installed_sha256": step["desired_sha256"],
+                    "link_target": "venvs/candidate",
+                }
+            )
+        return state
+
+    def apply_step(self, step) -> dict[str, object]:
+        prior = self.inspect_step(step)
+        self.slot_exists = True
+        self.venv_activation = {
+            "exists": True,
+            "is_symlink": True,
+            "link_target": "venvs/candidate",
+        }
+        self.applied.append(step["step_id"])
+        return {"prior": prior, **self.inspect_step(step)}
+
+    def apply_step_checkpointed(self, step, expected_prior, _creation_checkpoint):
+        assert self.inspect_step(step) == expected_prior
+        prior = self.inspect_step(step)
+        self.slot_exists = True
+        _creation_checkpoint(
+            {"path": step["path"], "tree_sha256": self.tree_sha256}
+        )
+        self.venv_activation = {
+            "exists": True,
+            "is_symlink": True,
+            "link_target": "venvs/candidate",
+        }
+        self.applied.append(step["step_id"])
+        return {"prior": prior, **self.inspect_step(step)}
+
+    def rollback_step(self, entry) -> None:
+        self.rolled_back.append(entry["step_id"])
+        self.venv_activation = deepcopy(entry["prior"])
+
+
+def _venv_plan(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    plan = _plan(tmp_path)
+    step = plan["apply_order"][0]
+    step.clear()
+    step.update(
+        {
+            "step_id": "candidate-venv",
+            "kind": "venv",
+            "path": str(tmp_path / "target/candidate-venv"),
+            "active_link": str(tmp_path / "target/venv"),
+            "wheel_sha256": "1" * 64,
+            "wheel_source": str(tmp_path / "candidate.whl"),
+            "wheelhouse": [],
+            "wheelhouse_locked": True,
+            "operations": [],
+            "desired_sha256": "1" * 64,
+        }
+    )
+    plan["accounts"] = []
+    plan["apply_order"] = [step]
+    return plan, step
 
 
 def test_preflight_uses_explicit_backend_facts_not_the_host(tmp_path: Path) -> None:
@@ -480,6 +594,7 @@ def test_exact_prior_plan_receipt_can_handoff_account_provenance(
 ) -> None:
     prior_plan, facts, prior_receipt = _account_adoption_case(tmp_path)
     prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
     next_plan = deepcopy(prior_plan)
     next_plan["repo_identity"]["commit"] = "b" * 40
     next_plan["candidate"]["wheel_sha256"] = "d" * 64
@@ -500,6 +615,7 @@ def test_prior_receipt_cannot_handoff_changed_account_identity(
 ) -> None:
     prior_plan, facts, prior_receipt = _account_adoption_case(tmp_path)
     prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
     next_plan = deepcopy(prior_plan)
     next_plan["repo_identity"]["commit"] = "b" * 40
     next_plan["candidate"]["wheel_sha256"] = "d" * 64
@@ -522,6 +638,7 @@ def test_prior_receipt_handoff_adopts_unchanged_asset_and_updates_changed_asset(
     prior_plan = _plan(tmp_path)
     prior_receipt = new_install_receipt(prior_plan)
     prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
     prior_receipt._document["journal"] = [
         {
             "step_id": step["step_id"],
@@ -570,6 +687,7 @@ def test_prior_receipt_handoff_rejects_another_install_root_before_mutation(
     prior_plan = _plan(tmp_path)
     prior_receipt = new_install_receipt(prior_plan)
     prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
     next_plan = deepcopy(prior_plan)
     next_plan["roots"]["state"] += "-other"
     next_receipt = new_install_receipt(next_plan)
@@ -585,6 +703,416 @@ def test_prior_receipt_handoff_rejects_another_install_root_before_mutation(
         )
 
     assert backend.applied == []
+
+
+def test_prior_receipt_handoff_rejects_late_foreign_asset_before_mutation(
+    tmp_path: Path,
+) -> None:
+    prior_plan = _plan(tmp_path)
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
+    prior_receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+        }
+        for step in prior_plan["apply_order"]
+    ]
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_plan["apply_order"][1]["desired_sha256"] = "3" * 64
+    next_receipt = new_install_receipt(next_plan)
+    backend = RecordingBackend(next_plan)
+    for step in prior_plan["apply_order"]:
+        backend.states[step["step_id"]] = {
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+            "owner": step["owner"],
+            "group": step["group"],
+            "mode": step["mode"],
+            "acl": deepcopy(step["acls"]),
+        }
+    backend.states["manager-unit"]["installed_sha256"] = "9" * 64
+
+    with pytest.raises(InstallDriftError, match="prior receipt provenance"):
+        apply_plan(
+            next_plan,
+            confirm_sha256=plan_sha256(next_plan),
+            receipt=next_receipt,
+            prior_receipt=prior_receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert next_receipt.to_dict()["state"] == "planned"
+    assert next_receipt.to_dict()["journal"] == []
+
+
+def test_late_toolchain_drift_is_rejected_before_an_earlier_step_mutates(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    toolchain = plan["apply_order"][1]
+    toolchain.update(
+        {
+            "kind": "toolchain",
+            "name": "codex",
+            "shape": "file",
+            "source": str(tmp_path / "codex.source"),
+            "source_sha256": "2" * 64,
+        }
+    )
+    backend = RecordingBackend(plan)
+    backend.states[toolchain["step_id"]] = {
+        "exists": True,
+        "installed_sha256": "9" * 64,
+        "owner": toolchain["owner"],
+        "group": toolchain["group"],
+        "mode": toolchain["mode"],
+    }
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallDriftError, match="cannot be upgraded in place"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["state"] == "planned"
+
+
+def test_changed_receipt_proven_toolchain_is_rejected_before_earlier_mutation(
+    tmp_path: Path,
+) -> None:
+    prior_plan = _plan(tmp_path)
+    toolchain = prior_plan["apply_order"][1]
+    toolchain.update(
+        {
+            "kind": "toolchain",
+            "name": "codex",
+            "shape": "file",
+            "source": str(tmp_path / "codex-old.source"),
+            "source_sha256": toolchain["desired_sha256"],
+        }
+    )
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
+    prior_receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+            "owner": step["owner"],
+            "group": step["group"],
+            "mode": step["mode"],
+            "acl": deepcopy(step["acls"]),
+        }
+        for step in prior_plan["apply_order"]
+    ]
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_plan["apply_order"][0]["desired_sha256"] = "3" * 64
+    next_toolchain = next_plan["apply_order"][1]
+    next_toolchain["desired_sha256"] = "4" * 64
+    next_toolchain["source_sha256"] = "4" * 64
+    next_toolchain["source"] = str(tmp_path / "codex-new.source")
+    receipt = new_install_receipt(next_plan)
+    backend = RecordingBackend(next_plan)
+    for step in prior_plan["apply_order"]:
+        backend.states[step["step_id"]] = {
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+            "owner": step["owner"],
+            "group": step["group"],
+            "mode": step["mode"],
+            "acl": deepcopy(step["acls"]),
+        }
+
+    with pytest.raises(InstallDriftError, match="cannot be upgraded in place"):
+        apply_plan(
+            next_plan,
+            confirm_sha256=plan_sha256(next_plan),
+            receipt=receipt,
+            prior_receipt=prior_receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["state"] == "planned"
+    assert receipt.to_dict()["journal"] == []
+
+
+def test_first_install_refuses_exact_preexisting_toolchain_without_provenance(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    toolchain = plan["apply_order"][0]
+    toolchain.update(
+        {
+            "kind": "toolchain",
+            "name": "codex",
+            "shape": "file",
+            "source": str(tmp_path / "codex.source"),
+            "source_sha256": toolchain["desired_sha256"],
+        }
+    )
+    plan["accounts"] = []
+    plan["apply_order"] = [toolchain]
+    backend = RecordingBackend(plan)
+    backend.states[toolchain["step_id"]] = {
+        "exists": True,
+        "installed_sha256": toolchain["desired_sha256"],
+        "owner": toolchain["owner"],
+        "group": toolchain["group"],
+        "mode": toolchain["mode"],
+        "acl": deepcopy(toolchain["acls"]),
+    }
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallDriftError, match="trusted receipt provenance"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["state"] == "planned"
+
+
+def test_foreign_active_venv_is_rejected_before_an_earlier_step_mutates(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path)
+    venv = plan["apply_order"][1]
+    venv.update(
+        {
+            "kind": "venv",
+            "active_link": str(tmp_path / "target" / "venv"),
+            "wheel_sha256": venv["desired_sha256"],
+            "wheel_source": str(tmp_path / "candidate.whl"),
+            "wheelhouse": [],
+            "wheelhouse_locked": True,
+        }
+    )
+    backend = RecordingBackend(plan)
+    backend.venv_activation = {
+        "exists": True,
+        "is_symlink": True,
+        "link_target": "venvs/foreign",
+    }
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallDriftError, match="prior receipt provenance"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["state"] == "planned"
+
+
+def test_first_install_refuses_a_preexisting_candidate_venv_slot(
+    tmp_path: Path,
+) -> None:
+    plan, _step = _venv_plan(tmp_path)
+    backend = VenvTransactionBackend(plan)
+    backend.slot_exists = True
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(InstallDriftError, match="slot lacks trusted receipt"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+    assert receipt.to_dict()["journal"] == []
+
+
+def test_prior_venv_provenance_binds_the_observed_tree_to_candidate_receipt(
+    tmp_path: Path,
+) -> None:
+    prior_plan, step = _venv_plan(tmp_path)
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document["state"] = "applied"
+    prior_receipt._document["qualified"] = True
+    prior_receipt._document["candidate_venv"] = {
+        "path": step["path"],
+        "tree_sha256": "d" * 64,
+    }
+    prior_receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+            "path": step["path"],
+            "tree_sha256": "d" * 64,
+        }
+    ]
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "2" * 64
+
+    class DriftedPriorTreeBackend:
+        def inspect_step(self, _step):
+            return {
+                "exists": True,
+                "installed_sha256": step["desired_sha256"],
+                "path": step["path"],
+                "tree_sha256": "f" * 64,
+            }
+
+    provenance, _prior_step = install_core._prior_venv_provenance(
+        plan=next_plan,
+        step=next_plan["apply_order"][0],
+        prior_receipt=prior_receipt,
+        backend=DriftedPriorTreeBackend(),
+    )
+
+    assert provenance is False
+
+
+def test_venv_rollback_forgets_journal_after_restoring_link_and_retaining_slot(
+    tmp_path: Path,
+) -> None:
+    plan, _step = _venv_plan(tmp_path)
+    backend = VenvTransactionBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert report.retained_drift == ()
+    assert backend.slot_exists is True
+    assert backend.venv_activation == {"exists": False}
+    assert receipt.to_dict()["journal"] == []
+    assert receipt.to_dict()["state"] == "rolled-back"
+
+
+def test_venv_post_cutover_crash_rolls_back_with_durable_slot_authority(
+    tmp_path: Path,
+) -> None:
+    plan, step = _venv_plan(tmp_path)
+
+    class PostCutoverCrashBackend(VenvTransactionBackend):
+        def apply_step_checkpointed(
+            self, candidate, expected_prior, creation_checkpoint
+        ):
+            assert self.inspect_step(candidate) == expected_prior
+            self.slot_exists = True
+            creation_checkpoint(
+                {"path": candidate["path"], "tree_sha256": self.tree_sha256}
+            )
+            self.venv_activation = {
+                "exists": True,
+                "is_symlink": True,
+                "link_target": "venvs/candidate",
+            }
+            raise SystemExit("simulated crash after active-link cutover")
+
+    backend = PostCutoverCrashBackend(plan)
+    receipt = new_install_receipt(plan)
+
+    with pytest.raises(SystemExit, match="active-link cutover"):
+        apply_plan(
+            plan,
+            confirm_sha256=plan_sha256(plan),
+            receipt=receipt,
+            backend=backend,
+        )
+
+    prepared = receipt.to_dict()["journal"][0]
+    assert prepared["status"] == "prepared"
+    assert prepared["venv_slot_authority"] == {
+        "path": step["path"],
+        "tree_sha256": backend.tree_sha256,
+    }
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert report.retained_drift == ()
+    assert backend.venv_activation == {"exists": False}
+    assert backend.slot_exists is True
+    assert receipt.to_dict()["journal"] == []
+    assert receipt.to_dict()["state"] == "rolled-back"
+
+
+def test_venv_reapply_uses_receipt_bound_retained_slot_after_rollback(
+    tmp_path: Path,
+) -> None:
+    plan, _step = _venv_plan(tmp_path)
+    backend = VenvTransactionBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    rollback_receipt(receipt, backend=backend)
+
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+
+    document = receipt.to_dict()
+    assert document["state"] == "applied"
+    assert document["journal"][0]["adopted_from_receipt"] is True
+    assert backend.venv_activation["link_target"] == "venvs/candidate"
+
+
+def test_venv_rollback_reports_a_tampered_retained_slot_even_if_link_is_restored(
+    tmp_path: Path,
+) -> None:
+    plan, _step = _venv_plan(tmp_path)
+    backend = VenvTransactionBackend(plan)
+    receipt = new_install_receipt(plan)
+    apply_plan(
+        plan,
+        confirm_sha256=plan_sha256(plan),
+        receipt=receipt,
+        backend=backend,
+    )
+    backend.venv_activation = {"exists": False}
+    backend.tree_sha256 = "f" * 64
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert report.retained_drift[0]["step_id"] == "candidate-venv"
+    assert receipt.to_dict()["journal"][0]["step_id"] == "candidate-venv"
+    assert receipt.to_dict()["state"] == "rollback-blocked"
 
 
 def test_retained_account_from_plan_bound_rollback_journal_can_be_reinstalled(
@@ -723,6 +1251,101 @@ def test_first_install_adopts_exact_empty_managed_state_mount(tmp_path: Path) ->
 
     assert backend.applied == [step["step_id"], step["step_id"]]
     assert receipt.to_dict()["journal"][0]["adopted_from_receipt"] is True
+
+
+def test_metadata_upgrade_carries_mount_inode_authority_to_next_upgrade(
+    tmp_path: Path,
+) -> None:
+    prior_plan = _plan(tmp_path)
+    prior_step = prior_plan["apply_order"][0]
+    prior_step.update(
+        {
+            "asset_type": "directory",
+            "adoption_policy": "empty-managed-root-mount",
+            "durable": True,
+        }
+    )
+    prior_plan["roots"]["state"] = prior_step["path"]
+    prior_plan["apply_order"] = [prior_step]
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document.update({"state": "applied", "qualified": True})
+    prior_receipt._document["journal"] = [
+        {
+            "step_id": prior_step["step_id"],
+            "step": deepcopy(prior_step),
+            "status": "completed",
+            "prior": {"exists": True},
+            "adopted_mount_root": {"device": 8, "inode": 42},
+            "exists": True,
+            "installed_sha256": prior_step["desired_sha256"],
+        }
+    ]
+
+    class MountBackend(RecordingBackend):
+        def _apply_step(self, step, creation_checkpoint=None):
+            identity = {
+                key: self.states[step["step_id"]][key]
+                for key in ("is_mountpoint", "device", "inode", "children")
+            }
+            outcome = super()._apply_step(step, creation_checkpoint)
+            self.states[step["step_id"]].update(identity)
+            return {**outcome, **identity}
+
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_step = next_plan["apply_order"][0]
+    next_step["mode"] = "0700"
+    next_step["desired_sha256"] = "3" * 64
+    backend = MountBackend(next_plan)
+    backend.states[next_step["step_id"]] = {
+        "exists": True,
+        "installed_sha256": prior_step["desired_sha256"],
+        "owner": prior_step["owner"],
+        "group": prior_step["group"],
+        "mode": prior_step["mode"],
+        "acl": deepcopy(prior_step["acls"]),
+        "is_mountpoint": True,
+        "device": 8,
+        "inode": 42,
+        "children": [],
+    }
+    next_receipt = new_install_receipt(next_plan)
+
+    apply_plan(
+        next_plan,
+        confirm_sha256=plan_sha256(next_plan),
+        receipt=next_receipt,
+        prior_receipt=prior_receipt,
+        backend=backend,
+    )
+
+    assert next_receipt.to_dict()["journal"][0]["adopted_mount_root"] == {
+        "device": 8,
+        "inode": 42,
+    }
+    next_receipt._document.update({"state": "applied", "qualified": True})
+
+    third_plan = deepcopy(next_plan)
+    third_plan["repo_identity"]["commit"] = "c" * 40
+    third_plan["candidate"]["wheel_sha256"] = "e" * 64
+    third_plan["apply_order"][0]["mode"] = "0750"
+    third_plan["apply_order"][0]["desired_sha256"] = "4" * 64
+    third_receipt = new_install_receipt(third_plan)
+    foreign = deepcopy(backend.states[next_step["step_id"]])
+    foreign.update({"device": 9, "inode": 84})
+    backend.states[next_step["step_id"]] = foreign
+
+    with pytest.raises(InstallDriftError, match="prior receipt provenance"):
+        apply_plan(
+            third_plan,
+            confirm_sha256=plan_sha256(third_plan),
+            receipt=third_receipt,
+            prior_receipt=next_receipt,
+            backend=backend,
+        )
+
+    assert third_receipt.to_dict()["journal"] == []
 
 
 @pytest.mark.parametrize(
@@ -1245,7 +1868,7 @@ def test_prepared_prior_absent_does_not_delete_third_party_leaf_without_authorit
     backend = CrashBeforeMutationBackend()
 
     if action == "resume":
-        with pytest.raises(InstallDriftError, match="creation authority"):
+        with pytest.raises(InstallDriftError, match="provenance|creation authority"):
             apply_plan(
                 plan,
                 confirm_sha256=plan_sha256(plan),
@@ -1498,6 +2121,63 @@ def test_new_receipt_exclusively_refuses_an_existing_private_regular_file(
         new_install_receipt(_plan(tmp_path), path=path)
 
     assert path.read_bytes() == original
+
+
+def test_new_receipt_is_complete_before_atomic_noreplace_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    real_publish = install_core._rename_noreplace_at
+    observed: dict[str, object] = {}
+
+    def inspect_publish(parent_fd: int, source: str, destination: str) -> None:
+        assert destination == path.name
+        assert not path.exists()
+        staged_fd = os.open(source, os.O_RDONLY, dir_fd=parent_fd)
+        try:
+            staged = json.loads(install_core._read_fd_bytes(staged_fd))
+        finally:
+            os.close(staged_fd)
+        observed.update(staged)
+        real_publish(parent_fd, source, destination)
+
+    monkeypatch.setattr(install_core, "_rename_noreplace_at", inspect_publish)
+
+    receipt = new_install_receipt(_plan(tmp_path), path=path)
+
+    assert observed["state"] == "planned"
+    assert observed["effective_receipt_path"] == str(path)
+    assert InstallReceipt.load(path).to_dict() == receipt.to_dict()
+    assert not list(tmp_path.glob(".receipt.json.*.tmp"))
+
+
+def test_failed_initial_receipt_publish_leaves_no_partial_final_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = (tmp_path / "receipt.json").absolute()
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core,
+        "_rename_noreplace_at",
+        lambda *_args: (_ for _ in ()).throw(OSError("injected publish failure")),
+    )
+
+    with pytest.raises(UnsafeInstallPathError, match="atomically create"):
+        new_install_receipt(_plan(tmp_path), path=path)
+
+    assert not path.exists()
+    assert not list(tmp_path.glob(".receipt.json.*.tmp"))
 
 
 def test_loaded_receipt_binds_actual_path_and_expected_plan(
