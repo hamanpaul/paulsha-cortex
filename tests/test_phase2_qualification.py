@@ -20,10 +20,22 @@ RUNNER = QUALIFICATION / "run.sh"
 SCHEMA = QUALIFICATION / "qualification.schema.json"
 VALIDATOR = QUALIFICATION / "validate.py"
 DRIVER = QUALIFICATION / "driver.py"
+REDACTION = QUALIFICATION / "redaction_scan.py"
 
 
 def _load_driver_module():
     spec = importlib.util.spec_from_file_location("cortex_qualification_driver", DRIVER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_redaction_module():
+    spec = importlib.util.spec_from_file_location(
+        "cortex_qualification_redaction", REDACTION
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -38,7 +50,8 @@ def _required_text(path: Path) -> str:
 
 def _valid_qualification() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "profile": "deployment-canary",
         "status": "passed",
         "candidate_sha": "a" * 40,
         "wheel": {
@@ -318,6 +331,46 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
     return payload
 
 
+def _valid_release_qualification(tmp_path: Path) -> dict:
+    payload = _valid_full_qualification(tmp_path)
+    payload["profile"] = "release"
+    payload["providers"] = []
+    canary_tests = {
+        "provider-capability-smoke",
+        "full-dispatch-closeout",
+        "manager-github-dry-run-push",
+    }
+    payload["tests"] = [
+        row for row in payload["tests"] if row["name"] not in canary_tests
+    ]
+
+    evidence = tmp_path / "evidence"
+    for name in (
+        "provider-capabilities.json",
+        "dispatch-closeout.json",
+        "manager-github-auth.json",
+    ):
+        (evidence / name).unlink()
+    documents = sorted(
+        path for path in evidence.iterdir() if path.name != "artifact-inventory.json"
+    )
+    inventory_rows = [
+        {"path": f"evidence/{path.name}", "sha256": _sha256(path)} for path in documents
+    ]
+    inventory_path = evidence / "artifact-inventory.json"
+    _write_json(
+        inventory_path,
+        {"schema_version": 1, "status": "passed", "artifacts": inventory_rows},
+    )
+    payload["artifacts"] = inventory_rows + [
+        {
+            "path": "evidence/artifact-inventory.json",
+            "sha256": _sha256(inventory_path),
+        }
+    ]
+    return payload
+
+
 def _refresh_full_hashes(tmp_path: Path, payload: dict) -> None:
     evidence = tmp_path / "evidence"
     inventory_path = evidence / "artifact-inventory.json"
@@ -350,7 +403,7 @@ def _run_full_validator(
             "c" * 64,
             "--evidence-root",
             str(tmp_path),
-            "--require-full-suite",
+            "--require-canary-profile",
         ],
         cwd=REPO_ROOT,
         text=True,
@@ -434,7 +487,12 @@ def test_runner_keeps_preinstall_control_files_outside_managed_state() -> None:
     assert "plan_path=/run/cortex-install/install-plan.json" in raw
     assert "receipt_path=/run/cortex-install/install-receipt.json" in raw
     assert "install -d -o root -g root -m 0700 /run/cortex-install" in raw
-    assert "qualification_root=/run/cortex-qualification" in raw
+    assert "qualification_root=/qualification-output" in raw
+    assert "output_volume_name=" in raw
+    assert 'docker volume create "$output_volume_name"' in raw
+    assert "target=/qualification-output" in raw
+    assert 'docker volume rm "$output_volume_name"' in raw
+    assert "qualification_root=/run/cortex-qualification" not in raw
     assert "/var/lib/cortex/qualification" not in raw
     assert "/var/lib/cortex/qualification" not in dockerfile
     assert "plan_path=/var/lib/cortex" not in raw
@@ -468,6 +526,7 @@ def test_runner_declares_disposable_systemd_container_boundaries() -> None:
         assert (
             target == "/artifacts"
             or target == "/sys/fs/cgroup"
+            or target == "/qualification-output"
             or target.startswith("/var/lib/cortex")
         ), f"unexpected host bind/volume target: {target}"
 
@@ -484,6 +543,7 @@ def test_qualification_schema_binds_release_evidence_and_runtime_identity() -> N
     required = set(payload.get("required", []))
     assert {
         "schema_version",
+        "profile",
         "status",
         "candidate_sha",
         "wheel",
@@ -494,6 +554,12 @@ def test_qualification_schema_binds_release_evidence_and_runtime_identity() -> N
         "tests",
         "artifacts",
     } <= required
+    assert payload["properties"]["schema_version"] == {"const": 2}
+    assert set(payload["properties"]["profile"]["enum"]) == {
+        "release",
+        "deployment-canary",
+    }
+    assert payload["properties"]["providers"]["minItems"] == 0
 
     normalized = json.dumps(payload, sort_keys=True).lower()
     for field in (
@@ -613,6 +679,82 @@ def test_full_suite_validator_checks_evidence_semantics(tmp_path: Path) -> None:
     payload = _valid_full_qualification(tmp_path)
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_full_suite_validator_rejects_unlisted_evidence_files(tmp_path: Path) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    _write_json(tmp_path / "evidence" / "unlisted.json", {"status": "passed"})
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "unlisted evidence files" in completed.stderr
+
+
+def test_release_profile_validator_accepts_deterministic_evidence_without_providers(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_release_qualification(tmp_path)
+    qualification = tmp_path / "qualification.json"
+    _write_json(qualification, payload)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--qualification",
+            str(qualification),
+            "--candidate-sha",
+            "a" * 40,
+            "--wheel-sha256",
+            "b" * 64,
+            "--bundle-sha256",
+            "c" * 64,
+            "--evidence-root",
+            str(tmp_path),
+            "--require-release-profile",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("payload_factory", "required_profile"),
+    [
+        (_valid_release_qualification, "--require-canary-profile"),
+        (_valid_full_qualification, "--require-release-profile"),
+    ],
+)
+def test_qualification_profiles_cannot_unlock_each_other(
+    tmp_path: Path, payload_factory, required_profile: str
+) -> None:
+    payload = payload_factory(tmp_path)
+    qualification = tmp_path / "qualification.json"
+    _write_json(qualification, payload)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--qualification",
+            str(qualification),
+            "--candidate-sha",
+            "a" * 40,
+            "--wheel-sha256",
+            "b" * 64,
+            "--bundle-sha256",
+            "c" * 64,
+            "--evidence-root",
+            str(tmp_path),
+            required_profile,
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
 def _add_authorized_repo_worktree_to_attack_matrix(tmp_path: Path) -> None:
@@ -795,7 +937,10 @@ def test_qualification_driver_and_runner_are_fail_closed_on_live_inputs() -> Non
         assert f"T5.{index}" in driver
     assert "registry_asset_ids" in driver
     assert "native_metadata" in driver and "QUALIFICATION_OK" in driver
-    assert "--require-full-suite" in runner
+    assert "--profile" in runner
+    assert "--require-release-profile" in runner
+    assert "--require-canary-profile" in runner
+    assert "network_args=(--network none)" in runner
     for variable in (
         "CORTEX_RC_CODEX_AUTH",
         "CORTEX_RC_AGY_AUTH",
@@ -806,6 +951,108 @@ def test_qualification_driver_and_runner_are_fail_closed_on_live_inputs() -> Non
         "CORTEX_RC_PROBE_ISSUE",
     ):
         assert variable in runner
+
+
+def test_release_driver_never_calls_live_provider_or_repository_functions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver_module()
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text("{}", encoding="utf-8")
+    output = tmp_path / "qualification.json"
+    evidence_dir = tmp_path / "evidence"
+
+    monkeypatch.setattr(
+        driver,
+        "_installed_checks",
+        lambda **_kwargs: [
+            {"name": "selfcheck", "status": "passed"},
+            {"name": "registry-equation", "status": "passed"},
+            {"name": "generated-installed-attestation", "status": "passed"},
+            {"name": "service-identity-hardening", "status": "passed"},
+        ],
+    )
+    monkeypatch.setattr(driver, "_permission_attack_matrix", lambda *_args: None)
+    monkeypatch.setattr(
+        driver,
+        "_service_rows",
+        lambda: [
+            {"name": "cortex-manager.service", "uid": 991, "gid": 991, "active": True}
+        ],
+    )
+    monkeypatch.setattr(
+        driver,
+        "_artifact_inventory",
+        lambda _path: [{"path": "evidence/local.json", "sha256": "e" * 64}],
+    )
+
+    def unexpected_live_call(*_args, **_kwargs):
+        raise AssertionError("release profile called a live canary function")
+
+    monkeypatch.setattr(driver, "_provider_smokes", unexpected_live_call)
+    monkeypatch.setattr(driver, "_manager_github_probe", unexpected_live_call)
+    monkeypatch.setattr(driver, "_full_dispatch", unexpected_live_call)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(DRIVER),
+            "--receipt",
+            str(receipt),
+            "--install-evidence",
+            str(tmp_path / "install.json"),
+            "--candidate-sha",
+            "a" * 40,
+            "--wheel-sha256",
+            "b" * 64,
+            "--bundle-sha256",
+            "c" * 64,
+            "--image-digest",
+            "sha256:" + "d" * 64,
+            "--wheel-filename",
+            "paulsha_cortex-0.1.9-py3-none-any.whl",
+            "--profile",
+            "release",
+            "--output",
+            str(output),
+            "--evidence-dir",
+            str(evidence_dir),
+        ],
+    )
+
+    assert driver.main() == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["profile"] == "release"
+    assert payload["providers"] == []
+    assert not {
+        "provider-capability-smoke",
+        "manager-github-dry-run-push",
+        "full-dispatch-closeout",
+    } & {row["name"] for row in payload["tests"]}
+
+
+def test_release_redaction_profile_does_not_require_live_secret_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    redaction = _load_redaction_module()
+    for name in redaction.SECRET_ENV:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "qualification.json").write_text("{}", encoding="utf-8")
+
+    redaction.scan(tmp_path, profile="release")
+
+
+def test_canary_redaction_profile_requires_every_live_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    redaction = _load_redaction_module()
+    for name in redaction.SECRET_ENV:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "qualification.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="protected secret"):
+        redaction.scan(tmp_path, profile="deployment-canary")
 
 
 def test_account_runtime_env_uses_installed_psc_roots_without_manager_identity(

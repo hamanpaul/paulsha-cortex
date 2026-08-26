@@ -23,7 +23,11 @@ TOKEN_PATTERNS = (
 )
 
 
-def _needles() -> tuple[bytes, ...]:
+def _needles(profile: str) -> tuple[bytes, ...]:
+    if profile == "release":
+        return ()
+    if profile != "deployment-canary":
+        raise ValueError("profile must be release or deployment-canary")
     values: set[bytes] = set()
     for name in SECRET_ENV:
         raw = os.environ.get(name)
@@ -40,10 +44,10 @@ def _needles() -> tuple[bytes, ...]:
     return tuple(sorted(values, key=len, reverse=True))
 
 
-def scan(root: Path) -> None:
+def scan(root: Path, *, profile: str) -> None:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("upload root must be a regular directory")
-    needles = _needles()
+    needles = _needles(profile)
     for path in root.rglob("*"):
         if path.is_symlink():
             raise ValueError(f"upload candidate contains a symlink: {path}")
@@ -59,9 +63,12 @@ def scan(root: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
+    parser.add_argument(
+        "--profile", required=True, choices=("release", "deployment-canary")
+    )
     args = parser.parse_args()
     try:
-        scan(args.root)
+        scan(args.root, profile=args.profile)
     except (OSError, ValueError) as exc:
         print(f"redaction scan failed: {exc}", file=sys.stderr)
         return 1

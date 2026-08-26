@@ -3,7 +3,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --artifacts DIR --candidate-sha SHA --wheel-sha256 SHA --bundle-sha256 SHA --output DIR" >&2
+    echo "usage: $0 --profile {release|deployment-canary} --artifacts DIR --candidate-sha SHA --wheel-sha256 SHA --bundle-sha256 SHA --output DIR" >&2
     exit 2
 }
 
@@ -17,9 +17,11 @@ candidate_sha=""
 expected_wheel_sha=""
 expected_bundle_sha=""
 output_dir=""
+profile=""
 
 while (($#)); do
     case "$1" in
+        --profile) profile=${2-}; shift 2 ;;
         --artifacts) artifact_dir=${2-}; shift 2 ;;
         --candidate-sha) candidate_sha=${2-}; shift 2 ;;
         --wheel-sha256) expected_wheel_sha=${2-}; shift 2 ;;
@@ -30,6 +32,7 @@ while (($#)); do
 done
 
 [[ -d "$artifact_dir" && -n "$output_dir" ]] || usage
+[[ "$profile" == release || "$profile" == deployment-canary ]] || usage
 [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]] || die "candidate SHA must be 40 lowercase hex characters"
 [[ "$expected_wheel_sha" =~ ^[0-9a-f]{64}$ ]] || die "wheel SHA-256 must be 64 lowercase hex characters"
 [[ "$expected_bundle_sha" =~ ^[0-9a-f]{64}$ ]] || die "bundle SHA-256 must be 64 lowercase hex characters"
@@ -60,10 +63,12 @@ python3 "$script_dir/verify_bundle.py" \
 image_tag="cortex-qualification:${candidate_sha}"
 container_name="cortex-qualification-${candidate_sha:0:12}-$$"
 volume_name="cortex-qualification-data-${candidate_sha:0:12}-$$"
+output_volume_name="cortex-qualification-output-${candidate_sha:0:12}-$$"
 
 cleanup() {
     docker rm --force "$container_name" >/dev/null 2>&1 || true
     docker volume rm "$volume_name" >/dev/null 2>&1 || true
+    docker volume rm "$output_volume_name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -72,6 +77,13 @@ image_digest=$(docker image inspect --format '{{.Id}}' "$image_tag")
 [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Docker image has no content digest"
 
 docker volume create "$volume_name" >/dev/null
+docker volume create "$output_volume_name" >/dev/null
+network_args=()
+if [[ "$profile" == release ]]; then
+    # The release profile must be incapable of contacting providers or remotes,
+    # even if an installed service unexpectedly attempts a network operation.
+    network_args=(--network none)
+fi
 docker run --detach \
     --name "$container_name" \
     --hostname cortex-qualification \
@@ -82,6 +94,8 @@ docker run --detach \
     --mount "type=bind,source=$artifact_dir,target=/artifacts,readonly" \
     --volume "/sys/fs/cgroup:/sys/fs/cgroup:rw" \
     --mount "type=volume,source=$volume_name,target=/var/lib/cortex" \
+    --mount "type=volume,source=$output_volume_name,target=/qualification-output" \
+    "${network_args[@]}" \
     "$image_tag" >/dev/null
 
 for _attempt in $(seq 1 60); do
@@ -107,7 +121,7 @@ docker exec "$container_name" sh -eu -c \
 
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
-qualification_root=/run/cortex-qualification
+qualification_root=/qualification-output
 qualification_path=$qualification_root/qualification.json
 
 docker exec "$container_name" install -d -o root -g root -m 0700 /run/cortex-install
@@ -173,10 +187,10 @@ for provider_tool in codex claude copilot agy srt openspec; do
         sh "$provider_tool"
 done
 
-# Credentials are deliberately not discovered from any HOME. Each protected
-# environment secret is streamed over stdin into container tmpfs, imported by
-# the explicit provider adapter, and then removed. Secret values are never
-# arguments, receipts, or log output.
+# Credential inputs are deliberately not discovered from any HOME. Canary
+# secrets and release-profile non-secret fixtures both travel over stdin into
+# container tmpfs, pass through the production adapter, and are then removed.
+# Secret values are never arguments, receipts, or log output.
 import_secret() {
     local variable_name=$1 principal=$2 provider=$3 source_path=$4
     [[ -n ${!variable_name:-} ]] || die "required protected secret $variable_name is unavailable"
@@ -191,17 +205,37 @@ import_secret() {
     unset "$variable_name"
 }
 
-import_secret CORTEX_RC_CODEX_AUTH builder codex /run/auth.json
-import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy /run/oauth_creds.json
-import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
-import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
+import_fixture() {
+    local principal=$1 provider=$2 source_path=$3
+    printf '%s' '{}' | docker exec -i "$container_name" \
+        sh -eu -c 'umask 077; cat > "$1"' sh "$source_path"
+    docker exec "$container_name" cortex install trust-root credentials import \
+        --receipt "$receipt_path" \
+        --principal "$principal" \
+        --provider "$provider" \
+        --source "$source_path"
+    docker exec "$container_name" sh -eu -c 'rm -f -- "$1"' sh "$source_path"
+}
 
-# The protected Codex import lands in the account's legacy ``~/.codex`` path.
-# Run the same production scaffold once more so that this newly supplied
-# credential is projected into the Manager-owned canonical authority consumed
-# by ``spool_slot.provision_runtime_surfaces``. Existing control trees and
-# generated hooks are already present, so the scaffold is idempotent here and
-# does not replace them.
+if [[ "$profile" == deployment-canary ]]; then
+    import_secret CORTEX_RC_CODEX_AUTH builder codex /run/auth.json
+    import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy /run/oauth_creds.json
+    import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
+    import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
+else
+    # Exercise the production import/activation path without introducing a
+    # credential or external authority into release qualification.
+    import_fixture builder codex /run/auth.json
+    import_fixture reviewer-planner agy /run/oauth_creds.json
+    import_fixture reviewer-planner copilot /run/hosts.json
+    import_fixture manager github /run/hosts.yml
+fi
+
+# Imported Codex material lands in the account's legacy ``~/.codex`` path. Run
+# the same production scaffold once more so the canary credential or release
+# fixture traverses the Manager-owned canonical projection used by
+# ``spool_slot.provision_runtime_surfaces``. Existing controls and generated
+# hooks are already present, so the scaffold remains idempotent.
 docker exec "$container_name" sh -eu -c \
     'printf "%s\n" "{}" > /var/lib/cortex-reviewer-planner/.codex/auth.json
      python3 -m paulsha_cortex.trust_root scaffold | sh -eu
@@ -218,15 +252,24 @@ docker exec \
     "$container_name" cortex install trust-root verify \
     --receipt "$receipt_path" --json --evidence "$install_evidence_path"
 
-# Provider smokes, runtime-model metadata, all five attack families (including
-# negative controls), Manager auth dry-run, and full intake-to-closeout must be
-# run by a fixed harness installed in the reference image, not by candidate JSON.
-# Protected repository identity is deployment input; it is never inferred from
-# a mounted HOME or from an untrusted candidate-produced evidence document.
+# A fixed harness installed in the reference image always runs the five attack
+# families and negative controls. Only deployment-canary mode adds provider
+# smokes/runtime identity, Manager auth dry-run, and full intake-to-closeout;
+# protected repository identity is never inferred from HOME or candidate JSON.
 qualification_driver=/usr/local/libexec/cortex-release-qualification
-[[ -n ${CORTEX_RC_PROBE_REPOSITORY:-} ]] || die "protected probe repository is unavailable"
-[[ -n ${CORTEX_RC_PROBE_WORK_ID:-} ]] || die "protected probe work id is unavailable"
-[[ ${CORTEX_RC_PROBE_ISSUE:-} =~ ^[1-9][0-9]*$ ]] || die "protected probe issue is unavailable"
+driver_profile_args=(--profile "$profile")
+validator_profile_args=(--require-release-profile)
+if [[ "$profile" == deployment-canary ]]; then
+    [[ -n ${CORTEX_RC_PROBE_REPOSITORY:-} ]] || die "protected probe repository is unavailable"
+    [[ -n ${CORTEX_RC_PROBE_WORK_ID:-} ]] || die "protected probe work id is unavailable"
+    [[ ${CORTEX_RC_PROBE_ISSUE:-} =~ ^[1-9][0-9]*$ ]] || die "protected probe issue is unavailable"
+    driver_profile_args+=(
+        --probe-repository "$CORTEX_RC_PROBE_REPOSITORY"
+        --probe-work-id "$CORTEX_RC_PROBE_WORK_ID"
+        --probe-issue "$CORTEX_RC_PROBE_ISSUE"
+    )
+    validator_profile_args=(--require-canary-profile)
+fi
 wheel_filename=$(basename "$wheel_path")
 docker exec "$container_name" "$qualification_driver" \
     --receipt "$receipt_path" \
@@ -236,9 +279,7 @@ docker exec "$container_name" "$qualification_driver" \
     --bundle-sha256 "$expected_bundle_sha" \
     --image-digest "$image_digest" \
     --wheel-filename "$wheel_filename" \
-    --probe-repository "$CORTEX_RC_PROBE_REPOSITORY" \
-    --probe-work-id "$CORTEX_RC_PROBE_WORK_ID" \
-    --probe-issue "$CORTEX_RC_PROBE_ISSUE" \
+    "${driver_profile_args[@]}" \
     --output "$qualification_path" \
     --evidence-dir "$qualification_root/evidence"
 
@@ -248,10 +289,11 @@ docker exec "$container_name" /usr/local/libexec/cortex-qualification-validate \
     --wheel-sha256 "$expected_wheel_sha" \
     --bundle-sha256 "$expected_bundle_sha" \
     --evidence-root "$qualification_root" \
-    --require-full-suite
+    "${validator_profile_args[@]}"
 
-# docker cp is used instead of binding a host output directory. The only host
-# input bind is the read-only artifact directory above.
+# Evidence lives on a dedicated disposable Docker volume because Docker's archive
+# API cannot read the /run tmpfs. docker cp still avoids a writable host bind; the
+# only host input bind is the read-only artifact directory above.
 docker cp "$container_name:$qualification_path" "$output_dir/qualification.json"
 docker cp "$container_name:$qualification_root/evidence" "$output_dir/evidence"
 
@@ -262,4 +304,4 @@ python3 "$script_dir/validate.py" \
     --wheel-sha256 "$expected_wheel_sha" \
     --bundle-sha256 "$expected_bundle_sha" \
     --evidence-root "$output_dir" \
-    --require-full-suite
+    "${validator_profile_args[@]}"

@@ -25,18 +25,18 @@ persona 是 manager 與 guardrail 共同引用的**角色契約資料**（role p
 
 需求：Python 3.10+、Git，以及至少一個已安裝並登入的 headless executor CLI（`copilot`、`claude` 或 `codex`）。套件只安裝 Python runtime，不會代裝或登入 executor。
 
-推薦：安裝已發版、可回滾、且已在 Python 3.10–3.13 完整 CI 驗證過的 release（目前最新 `v0.1.4`）：
+推薦：安裝已發版、可回滾、且已在 Python 3.10–3.13 完整 CI 驗證過的 release（目前 release batch `v0.1.9`）：
 
 ```bash
-pipx install "git+https://github.com/hamanpaul/paulsha-cortex.git@v0.1.4"
+pipx install "git+https://github.com/hamanpaul/paulsha-cortex.git@v0.1.9"
 cortex --help
-cortex --version   # 應印出 0.1.4
+cortex --version   # 應印出 0.1.9
 ```
 
-也可改用 GitHub Release 附帶的 wheel（`release.yml` 會把 wheel/sdist 附在該 tag 的 Release）：
+也可改用 GitHub Release 附帶的 wheel（`release.yml` 會把 exact RC-qualified wheel 附在該 tag 的 Release）：
 
 ```bash
-pipx install ./paulsha_cortex-0.1.4-py3-none-any.whl
+pipx install ./paulsha_cortex-0.1.9-py3-none-any.whl
 ```
 
 也可在專案內直接安裝：

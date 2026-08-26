@@ -1,5 +1,9 @@
 # Cortex Phase 2 install and Docker release qualification plan
 
+> Historical plan: its step 11 coupled live provider/full-dispatch evidence to package release.
+> `2026-08-26-release-qualification-boundary.md` supersedes that release-gate decision;
+> this file remains as the implementation record for the Phase 2 installer and attack matrix.
+
 Authority: `openspec/changes/phase2-install-docker-qualification/`.
 
 ## Boundaries

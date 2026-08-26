@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Trusted executable probes for Cortex RC qualification.
+"""Trusted executable probes for Cortex release qualification and deployment canary.
 
 The driver is copied into the reference image before the candidate is mounted.
-It never imports qualification verdicts from the candidate checkout.  A missing
-probe, missing provider-native runtime identity, or missing protected probe
-repository is a hard failure.
+It never imports qualification verdicts from the candidate checkout. Shared
+installer and isolation probes always fail closed; provider-native identity and
+protected repository probes are additionally required by deployment-canary mode.
 """
 
 from __future__ import annotations
@@ -2882,9 +2882,12 @@ def main() -> int:
     parser.add_argument("--bundle-sha256", required=True)
     parser.add_argument("--image-digest", required=True)
     parser.add_argument("--wheel-filename", required=True)
-    parser.add_argument("--probe-repository", required=True)
-    parser.add_argument("--probe-work-id", required=True)
-    parser.add_argument("--probe-issue", required=True, type=int)
+    parser.add_argument(
+        "--profile", required=True, choices=("release", "deployment-canary")
+    )
+    parser.add_argument("--probe-repository")
+    parser.add_argument("--probe-work-id")
+    parser.add_argument("--probe-issue", type=int)
     parser.add_argument("--dispatch-timeout", type=int, default=7200)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
@@ -2894,6 +2897,13 @@ def main() -> int:
     for label, value in (("wheel", args.wheel_sha256), ("bundle", args.bundle_sha256)):
         if SHA256.fullmatch(value) is None:
             parser.error(f"{label} SHA-256 is invalid")
+    probe_values = (args.probe_repository, args.probe_work_id, args.probe_issue)
+    if args.profile == "release" and any(value is not None for value in probe_values):
+        parser.error("release profile must not receive external probe inputs")
+    if args.profile == "deployment-canary" and any(
+        value is None for value in probe_values
+    ):
+        parser.error("deployment-canary profile requires every external probe input")
     try:
         receipt = _load_json(args.receipt, "install receipt")
         args.evidence_dir.mkdir(parents=True, exist_ok=False)
@@ -2914,20 +2924,25 @@ def main() -> int:
             )
         ]
         tests.append({"name": "negative-controls", "status": "passed"})
-        providers = _provider_smokes(args.evidence_dir)
-        tests.append({"name": "provider-capability-smoke", "status": "passed"})
-        _manager_github_probe(
-            args.probe_repository, args.candidate_sha, args.evidence_dir
-        )
-        tests.append({"name": "manager-github-dry-run-push", "status": "passed"})
-        _full_dispatch(
-            repository=args.probe_repository,
-            work_id=args.probe_work_id,
-            issue=args.probe_issue,
-            timeout=args.dispatch_timeout,
-            evidence_dir=args.evidence_dir,
-        )
-        tests.append({"name": "full-dispatch-closeout", "status": "passed"})
+        providers: list[dict[str, object]] = []
+        if args.profile == "deployment-canary":
+            providers = _provider_smokes(args.evidence_dir)
+            tests.append({"name": "provider-capability-smoke", "status": "passed"})
+            assert args.probe_repository is not None
+            assert args.probe_work_id is not None
+            assert args.probe_issue is not None
+            _manager_github_probe(
+                args.probe_repository, args.candidate_sha, args.evidence_dir
+            )
+            tests.append({"name": "manager-github-dry-run-push", "status": "passed"})
+            _full_dispatch(
+                repository=args.probe_repository,
+                work_id=args.probe_work_id,
+                issue=args.probe_issue,
+                timeout=args.dispatch_timeout,
+                evidence_dir=args.evidence_dir,
+            )
+            tests.append({"name": "full-dispatch-closeout", "status": "passed"})
         tests = [
             {"name": name, "status": "passed"}
             for name in (
@@ -2940,7 +2955,8 @@ def main() -> int:
         ] + tests
         artifacts = _artifact_inventory(args.evidence_dir)
         qualification = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "profile": args.profile,
             "status": "passed",
             "candidate_sha": args.candidate_sha,
             "wheel": {"filename": args.wheel_filename, "sha256": args.wheel_sha256},

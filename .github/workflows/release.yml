@@ -324,7 +324,7 @@ jobs:
             --wheel-sha256 "$qualified_sha" \
             --bundle-sha256 "$bundle_sha" \
             --evidence-root rc-candidate/qualification-output \
-            --require-full-suite
+            --require-release-profile
 
       - name: Stage the same wheel used by RC
         run: |

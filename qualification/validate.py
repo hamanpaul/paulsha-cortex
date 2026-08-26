@@ -22,6 +22,7 @@ IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 WHEEL_NAME = re.compile(r"^[A-Za-z0-9_.+-]+\.whl$")
 ROOT_KEYS = {
     "schema_version",
+    "profile",
     "status",
     "candidate_sha",
     "wheel",
@@ -37,7 +38,8 @@ REQUIRED_PROVIDERS = {
     "copilot": ("gpt-5.4", "xhigh"),
     "codex": ("gpt-5", "normal"),
 }
-REQUIRED_TESTS = {"fresh-install", "full-dispatch-closeout"}
+QUALIFICATION_PROFILES = {"release", "deployment-canary"}
+BASE_TESTS = {"fresh-install"}
 REQUIRED_RELEASE_SERVICES = {
     "cortex-egress-proxy.service",
     "cortex-manager.service",
@@ -47,10 +49,12 @@ REQUIRED_RELEASE_ARTIFACTS = {
     "evidence/install-verification.json",
     "evidence/generated-installed-attestation.json",
     "evidence/attack-matrix.json",
+    "evidence/artifact-inventory.json",
+}
+CANARY_ONLY_ARTIFACTS = {
     "evidence/provider-capabilities.json",
     "evidence/dispatch-closeout.json",
     "evidence/manager-github-auth.json",
-    "evidence/artifact-inventory.json",
 }
 REQUIRED_RELEASE_TESTS = {
     "fresh-install",
@@ -68,10 +72,14 @@ REQUIRED_RELEASE_TESTS = {
     "process-attack-matrix",
     "gate-attack-matrix",
     "negative-controls",
+}
+CANARY_ONLY_TESTS = {
     "provider-capability-smoke",
     "full-dispatch-closeout",
     "manager-github-dry-run-push",
 }
+REQUIRED_CANARY_ARTIFACTS = REQUIRED_RELEASE_ARTIFACTS | CANARY_ONLY_ARTIFACTS
+REQUIRED_CANARY_TESTS = REQUIRED_RELEASE_TESTS | CANARY_ONLY_TESTS
 R9_HEADLESS_PRINCIPALS = {"cortex-builder", "cortex-reviewer-planner"}
 R9_DENY_ONLY_ASSET_IDS = {"review-verdict"}
 R9_MUTATIONS = {
@@ -160,11 +168,82 @@ def _normalized_keys(value: Any, keys: set[str]) -> set[str]:
     return found
 
 
-def _validate_full_suite_artifacts(
+def _validate_artifact_inventory(
+    *,
+    evidence_root: Path,
+    artifact_hashes: dict[str, str],
+) -> None:
+    inventory = _mapping(
+        _artifact_json(evidence_root, "evidence/artifact-inventory.json"),
+        "artifact-inventory",
+        {"schema_version", "status", "artifacts"},
+    )
+    if inventory["schema_version"] != 1 or inventory["status"] != "passed":
+        _fail("artifact-inventory must pass")
+    inventory_hashes: dict[str, str] = {}
+    for index, raw in enumerate(
+        _list(inventory["artifacts"], "artifact-inventory.artifacts")
+    ):
+        row = _mapping(
+            raw, f"artifact-inventory.artifacts[{index}]", {"path", "sha256"}
+        )
+        path = _nonempty_string(
+            row["path"], f"artifact-inventory.artifacts[{index}].path"
+        )
+        if path in inventory_hashes:
+            _fail(f"artifact-inventory duplicates {path}")
+        inventory_hashes[path] = _digest(
+            row["sha256"], f"artifact-inventory.artifacts[{index}].sha256"
+        )
+    expected_inventory = {
+        path: digest
+        for path, digest in artifact_hashes.items()
+        if path != "evidence/artifact-inventory.json"
+    }
+    if inventory_hashes != expected_inventory:
+        _fail(
+            "artifact-inventory does not exactly attest every non-inventory evidence file"
+        )
+
+
+def _validate_evidence_file_set(
+    *, evidence_root: Path, artifact_paths: set[str]
+) -> None:
+    evidence_dir = evidence_root / "evidence"
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        _fail("evidence root must contain a regular evidence directory")
+
+    actual_paths: set[str] = set()
+    for candidate in evidence_dir.rglob("*"):
+        relative = candidate.relative_to(evidence_root).as_posix()
+        if candidate.is_symlink():
+            _fail(f"evidence tree contains a symlink: {relative}")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            _fail(f"evidence tree contains a non-regular entry: {relative}")
+        actual_paths.add(relative)
+
+    unlisted = actual_paths - artifact_paths
+    if unlisted:
+        _fail(
+            "evidence tree contains unlisted evidence files: "
+            + ", ".join(sorted(unlisted))
+        )
+    outside_tree = artifact_paths - actual_paths
+    if outside_tree:
+        _fail(
+            "qualification lists files outside the canonical evidence tree: "
+            + ", ".join(sorted(outside_tree))
+        )
+
+
+def _validate_profile_artifacts(
     *,
     qualification: dict[str, Any],
     evidence_root: Path,
     artifact_hashes: dict[str, str],
+    include_canary: bool,
 ) -> None:
     """Validate evidence semantics, not merely candidate-supplied filenames and hashes."""
 
@@ -376,6 +455,12 @@ def _validate_full_suite_artifacts(
             "attack-matrix must include a successful negative control for every family"
         )
 
+    if not include_canary:
+        _validate_artifact_inventory(
+            evidence_root=evidence_root, artifact_hashes=artifact_hashes
+        )
+        return
+
     provider_evidence = _mapping(
         _artifact_json(evidence_root, "evidence/provider-capabilities.json"),
         "provider-capabilities",
@@ -506,37 +591,9 @@ def _validate_full_suite_artifacts(
     if before != after:
         _fail("manager-github-auth remote refs changed")
 
-    inventory = _mapping(
-        _artifact_json(evidence_root, "evidence/artifact-inventory.json"),
-        "artifact-inventory",
-        {"schema_version", "status", "artifacts"},
+    _validate_artifact_inventory(
+        evidence_root=evidence_root, artifact_hashes=artifact_hashes
     )
-    if inventory["schema_version"] != 1 or inventory["status"] != "passed":
-        _fail("artifact-inventory must pass")
-    inventory_hashes: dict[str, str] = {}
-    for index, raw in enumerate(
-        _list(inventory["artifacts"], "artifact-inventory.artifacts")
-    ):
-        row = _mapping(
-            raw, f"artifact-inventory.artifacts[{index}]", {"path", "sha256"}
-        )
-        path = _nonempty_string(
-            row["path"], f"artifact-inventory.artifacts[{index}].path"
-        )
-        if path in inventory_hashes:
-            _fail(f"artifact-inventory duplicates {path}")
-        inventory_hashes[path] = _digest(
-            row["sha256"], f"artifact-inventory.artifacts[{index}].sha256"
-        )
-    expected_inventory = {
-        path: digest
-        for path, digest in artifact_hashes.items()
-        if path != "evidence/artifact-inventory.json"
-    }
-    if inventory_hashes != expected_inventory:
-        _fail(
-            "artifact-inventory does not exactly attest every non-inventory evidence file"
-        )
 
 
 def validate(
@@ -546,15 +603,26 @@ def validate(
     wheel_sha256: str,
     bundle_sha256: str | None = None,
     evidence_root: Path | None = None,
-    require_full_suite: bool = False,
+    require_release_profile: bool = False,
+    require_canary_profile: bool = False,
 ) -> None:
     """Validate schema, release binding, and every fail-closed verdict."""
 
     root = _mapping(payload, "$", ROOT_KEYS)
-    if root["schema_version"] != 1 or isinstance(root["schema_version"], bool):
-        _fail("$.schema_version must be 1")
+    if root["schema_version"] != 2 or isinstance(root["schema_version"], bool):
+        _fail("$.schema_version must be 2")
     if root["status"] != "passed":
         _fail("$.status must be passed")
+    profile = _nonempty_string(root["profile"], "$.profile")
+    if profile not in QUALIFICATION_PROFILES:
+        _fail("$.profile must be release or deployment-canary")
+    if require_release_profile and require_canary_profile:
+        _fail("release and deployment-canary profiles are mutually exclusive")
+    if require_release_profile and profile != "release":
+        _fail("qualification profile is not release")
+    if require_canary_profile and profile != "deployment-canary":
+        _fail("qualification profile is not deployment-canary")
+    require_profile_suite = require_release_profile or require_canary_profile
 
     evidence_sha = _nonempty_string(root["candidate_sha"], "$.candidate_sha")
     if SHA40.fullmatch(evidence_sha) is None:
@@ -593,9 +661,9 @@ def validate(
                 _fail(f"{path}.{key} must be a non-negative integer")
         if service["active"] is not True:
             _fail(f"{path}.active must be true")
-    if require_full_suite and service_names != REQUIRED_RELEASE_SERVICES:
+    if require_profile_suite and service_names != REQUIRED_RELEASE_SERVICES:
         _fail("$.services must contain exactly egress proxy, Manager, and Monitor")
-    if require_full_suite:
+    if require_profile_suite:
         services_by_name = {service["name"]: service for service in root["services"]}
         manager = services_by_name["cortex-manager.service"]
         monitor = services_by_name["cortex-monitor.service"]
@@ -622,7 +690,10 @@ def validate(
         "quota",
         "fallback",
     }
-    for index, raw_provider in enumerate(_list(root["providers"], "$.providers")):
+    raw_providers = root["providers"]
+    if not isinstance(raw_providers, list):
+        _fail("$.providers must be an array")
+    for index, raw_provider in enumerate(raw_providers):
         path = f"$.providers[{index}]"
         provider = _mapping(raw_provider, path, provider_keys)
         name = _nonempty_string(provider["provider"], f"{path}.provider")
@@ -651,18 +722,22 @@ def validate(
             _fail(f"{path} runtime model does not match requested model")
         if runtime_effort != requested_effort:
             _fail(f"{path} runtime effort does not match requested effort")
-    if provider_names != set(REQUIRED_PROVIDERS):
-        _fail("$.providers must contain exactly agy, copilot, and codex verdicts")
-    for provider in root["providers"]:
-        expected_model, expected_effort = REQUIRED_PROVIDERS[provider["provider"]]
-        if provider["requested_model"] != expected_model:
-            _fail(
-                f"provider {provider['provider']} must request model {expected_model}"
-            )
-        if provider["requested_effort"] != expected_effort:
-            _fail(
-                f"provider {provider['provider']} must request effort {expected_effort}"
-            )
+    if profile == "release":
+        if provider_names:
+            _fail("release qualification must not contain provider verdicts")
+    else:
+        if provider_names != set(REQUIRED_PROVIDERS):
+            _fail("$.providers must contain exactly agy, copilot, and codex verdicts")
+        for provider in root["providers"]:
+            expected_model, expected_effort = REQUIRED_PROVIDERS[provider["provider"]]
+            if provider["requested_model"] != expected_model:
+                _fail(
+                    f"provider {provider['provider']} must request model {expected_model}"
+                )
+            if provider["requested_effort"] != expected_effort:
+                _fail(
+                    f"provider {provider['provider']} must request effort {expected_effort}"
+                )
 
     test_names: set[str] = set()
     for index, raw_test in enumerate(_list(root["tests"], "$.tests")):
@@ -674,19 +749,27 @@ def validate(
         test_names.add(name)
         if test["status"] != "passed":
             _fail(f"{path}.status must be passed")
-    missing_tests = REQUIRED_TESTS - test_names
+    required_base_tests = BASE_TESTS | (
+        {"full-dispatch-closeout"} if profile == "deployment-canary" else set()
+    )
+    missing_tests = required_base_tests - test_names
     if missing_tests:
         _fail(
             "$.tests missing release-critical results: "
             + ", ".join(sorted(missing_tests))
         )
-    if require_full_suite:
-        missing_release_tests = REQUIRED_RELEASE_TESTS - test_names
-        if missing_release_tests:
+    required_profile_tests = (
+        REQUIRED_RELEASE_TESTS if profile == "release" else REQUIRED_CANARY_TESTS
+    )
+    if require_profile_suite:
+        missing_profile_tests = required_profile_tests - test_names
+        if missing_profile_tests:
             _fail(
-                "$.tests missing full release qualification results: "
-                + ", ".join(sorted(missing_release_tests))
+                f"$.tests missing full {profile} qualification results: "
+                + ", ".join(sorted(missing_profile_tests))
             )
+    if profile == "release" and test_names & CANARY_ONLY_TESTS:
+        _fail("release qualification must not contain live canary tests")
 
     artifact_paths: set[str] = set()
     artifact_hashes: dict[str, str] = {}
@@ -710,20 +793,32 @@ def validate(
             if actual_artifact_sha != expected_artifact_sha:
                 _fail(f"{path}.sha256 does not match the evidence file")
 
-    if require_full_suite and evidence_root is None:
-        _fail("full release validation requires --evidence-root")
-    if require_full_suite:
-        missing_artifacts = REQUIRED_RELEASE_ARTIFACTS - artifact_paths
+    if require_profile_suite and evidence_root is None:
+        _fail(f"full {profile} validation requires --evidence-root")
+    if profile == "release" and artifact_paths & CANARY_ONLY_ARTIFACTS:
+        _fail("release qualification must not contain live canary artifacts")
+    if require_profile_suite:
+        required_artifacts = (
+            REQUIRED_RELEASE_ARTIFACTS
+            if profile == "release"
+            else REQUIRED_CANARY_ARTIFACTS
+        )
+        missing_artifacts = required_artifacts - artifact_paths
         if missing_artifacts:
             _fail(
-                "$.artifacts missing release-critical evidence: "
+                f"$.artifacts missing {profile}-critical evidence: "
                 + ", ".join(sorted(missing_artifacts))
             )
         assert evidence_root is not None
-        _validate_full_suite_artifacts(
+        _validate_evidence_file_set(
+            evidence_root=evidence_root,
+            artifact_paths=artifact_paths,
+        )
+        _validate_profile_artifacts(
             qualification=root,
             evidence_root=evidence_root,
             artifact_hashes=artifact_hashes,
+            include_canary=profile == "deployment-canary",
         )
 
 
@@ -734,7 +829,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wheel-sha256", required=True)
     parser.add_argument("--bundle-sha256")
     parser.add_argument("--evidence-root", type=Path)
-    parser.add_argument("--require-full-suite", action="store_true")
+    profile_group = parser.add_mutually_exclusive_group()
+    profile_group.add_argument("--require-release-profile", action="store_true")
+    profile_group.add_argument("--require-canary-profile", action="store_true")
     return parser
 
 
@@ -758,12 +855,13 @@ def main(argv: list[str] | None = None) -> int:
             wheel_sha256=args.wheel_sha256,
             bundle_sha256=args.bundle_sha256,
             evidence_root=args.evidence_root,
-            require_full_suite=args.require_full_suite,
+            require_release_profile=args.require_release_profile,
+            require_canary_profile=args.require_canary_profile,
         )
     except (OSError, json.JSONDecodeError, ValidationError) as exc:
         print(f"qualification validation failed: {exc}", file=sys.stderr)
         return 1
-    print("qualification evidence is valid and release-bound")
+    print("qualification evidence is valid and profile-bound")
     return 0
 
 

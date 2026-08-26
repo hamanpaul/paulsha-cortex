@@ -151,12 +151,32 @@ def _job_needs(job: dict) -> set[str]:
     return set(needs)
 
 
-def test_rc_qualification_is_manual_protected_and_sha_pinned() -> None:
+def _assert_exact_candidate_checkout_has_complete_history(name: str) -> None:
+    payload = _load_workflow(name)
+    steps = payload["jobs"]["qualification"]["steps"]
+    checkout = next(
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("name") == "Checkout exact candidate"
+    )
+    assert checkout.get("with", {}).get("fetch-depth") == 0, (
+        f"{name} must fetch complete history before `git bundle create`; a depth-1 "
+        "bundle omits the candidate parent and fails installed-repository fsck"
+    )
+    candidate = next(
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("id") == "candidate"
+    )
+    assert 'git rev-parse --is-shallow-repository' in candidate.get("run", "")
+
+
+def test_release_qualification_is_manual_secret_free_and_sha_pinned() -> None:
     payload = _load_workflow("rc-qualification.yml")
     on_block = _workflow_on(payload)
     assert set(on_block) == {
         "workflow_dispatch"
-    }, "RC qualification is privileged and must never run on push, pull_request, or schedule"
+    }, "release qualification is privileged and must never run on push, pull_request, or schedule"
 
     jobs = payload.get("jobs", {})
     assert isinstance(jobs, dict) and jobs
@@ -167,28 +187,81 @@ def test_rc_qualification_is_manual_protected_and_sha_pinned() -> None:
     ]
     assert qualification_jobs, "RC workflow must execute qualification/run.sh"
     assert all(
-        job.get("environment") == "rc-qualification" for job in qualification_jobs
-    ), "every job running privileged qualification must use the protected rc-qualification environment"
+        "environment" not in job for job in qualification_jobs
+    ), "deterministic release qualification must not request a protected environment"
 
     raw = (WORKFLOWS / "rc-qualification.yml").read_text(encoding="utf-8")
     lowered = raw.lower()
     assert "python -m build" in lowered
     assert "qualification/run.sh" in raw
+    assert "--profile release" in raw
+    assert "--profile deployment-canary" not in raw
     assert "qualification.json" in raw
     assert "upload-artifact" in lowered
     assert "github.sha" in lowered or "github.event.inputs" in lowered
     assert "timeout-minutes" in lowered
+    assert "secrets." not in raw
+    assert "CORTEX_RC_" not in raw
 
     _assert_all_uses_are_sha_pinned(
         payload, relpath=".github/workflows/rc-qualification.yml"
     )
     _assert_all_uses_have_version_comments("rc-qualification.yml")
+    _assert_exact_candidate_checkout_has_complete_history("rc-qualification.yml")
+
+
+def test_deployment_canary_is_manual_protected_and_separate_from_release() -> None:
+    payload = _load_workflow("deployment-canary.yml")
+    on_block = _workflow_on(payload)
+    assert set(on_block) == {"workflow_dispatch"}
+
+    jobs = payload.get("jobs", {})
+    assert isinstance(jobs, dict) and jobs
+    canary_jobs = [
+        job
+        for job in jobs.values()
+        if isinstance(job, dict) and "qualification/run.sh" in _job_step_runs(job)
+    ]
+    assert canary_jobs
+    assert all(job.get("environment") == "rc-qualification" for job in canary_jobs)
+
+    raw = (WORKFLOWS / "deployment-canary.yml").read_text(encoding="utf-8")
+    assert "--profile deployment-canary" in raw
+    assert "CORTEX_RC_CODEX_AUTH" in raw
+    assert "CORTEX_RC_AGY_AUTH" in raw
+    assert "CORTEX_RC_COPILOT_AUTH" in raw
+    assert "CORTEX_RC_MANAGER_GITHUB_AUTH" in raw
+    assert "CORTEX_RC_PROBE_REPOSITORY" in raw
+    assert "CORTEX_RC_PROBE_WORK_ID" in raw
+    assert "CORTEX_RC_PROBE_ISSUE" in raw
+    assert "deployment-canary-${{ github.sha }}" in raw
+    assert "rc-qualification-${{ github.sha }}" not in raw
+
+    _assert_all_uses_are_sha_pinned(
+        payload, relpath=".github/workflows/deployment-canary.yml"
+    )
+    _assert_all_uses_have_version_comments("deployment-canary.yml")
+    _assert_exact_candidate_checkout_has_complete_history("deployment-canary.yml")
+
+    release_payload = _load_workflow("rc-qualification.yml")
+    release_steps = release_payload["jobs"]["qualification"]["steps"]
+    canary_steps = payload["jobs"]["qualification"]["steps"]
+    release_build = next(
+        step for step in release_steps if step.get("id") == "candidate"
+    )
+    canary_build = next(step for step in canary_steps if step.get("id") == "candidate")
+    assert canary_build["run"] == release_build["run"], (
+        "release qualification and deployment canary must build the exact candidate "
+        "through one byte-identical recipe"
+    )
 
 
 def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish() -> (
     None
 ):
     payload = _load_workflow("release.yml")
+    release_workflow_raw = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
+    assert "deployment-canary" not in release_workflow_raw
     jobs = payload.get("jobs", {})
     assert isinstance(jobs, dict)
 
@@ -241,6 +314,9 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     gate_lower = gate_runs.lower()
     assert "qualification.json" in gate_text
     assert "qualification/validate.py" in gate_runs
+    assert "--require-release-profile" in gate_runs
+    assert "--require-canary-profile" not in gate_runs
+    assert "--require-full-suite" not in gate_runs
     assert "--candidate-sha" in gate_runs
     assert "--wheel-sha256" in gate_runs
     assert "sha256sum" in gate_lower
