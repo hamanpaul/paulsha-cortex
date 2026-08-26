@@ -46,6 +46,10 @@ qualification evidence 位於專用的一次性 Docker volume，再由 runner �
 daemon 的 archive API 無法看見其中檔案；也不要改成 writable host bind，以免擴大 qualification
 對 host 的寫入面。
 
+container 內的 rollback proof 必須發生在任何 harness runtime scaffold fixture 之前。rollback
+可以依 archived receipt inventory 辨識並保留 fresh checkout 與 content-addressed venv，但仍須
+對同一 parent 下的 foreign sibling fail closed；fixture 若提前建立，會混淆這條 authority 邊界。
+
 release validator 會要求 `qualification-output/evidence/` 的實際 regular-file 集合與
 `qualification.json`／`artifact-inventory.json` 列管集合完全一致；額外檔案、symlink、缺檔或
 tree 外 artifact 都會失敗。這能避免上傳內容存在未受 hash inventory 約束的旁路檔案。
