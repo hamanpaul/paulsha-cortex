@@ -17,6 +17,10 @@
    比對 wheel/bundle hashes，並以 `--require-release-profile` 驗證 evidence。
 5. 驗證 annotated tag、non-draft GitHub Release 與唯一 wheel asset 都指向同一 main SHA。
 
+publication job 刻意不 checkout source tree；所有 repository-aware `gh` 操作都必須由
+`GITHUB_REPOSITORY` 明確指定目標。尤其 `gh release create` 必須帶 `--repo`，不可依賴本地
+`.git` context。
+
 這條路徑不需要設定 GitHub environment secrets 或 variables；若 `RC qualification` 要求它們，
 代表 workflow contract 已退化，應先修復而不是補值。
 

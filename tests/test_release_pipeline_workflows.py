@@ -345,6 +345,10 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "repos/${GITHUB_REPOSITORY}/git/refs" in release_runs
     assert "refs/tags/$tag_name" in release_runs
     assert "gh release create" in release_runs
+    assert '--repo "$GITHUB_REPOSITORY"' in release_runs, (
+        "the release job has no checkout, so gh release create must receive "
+        "an explicit repository context"
+    )
     assert "--verify-tag" in release_runs
     assert "--method DELETE" in release_runs
     assert "--draft" in release_runs
