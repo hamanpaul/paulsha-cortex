@@ -487,7 +487,12 @@ def test_runner_keeps_preinstall_control_files_outside_managed_state() -> None:
     assert "plan_path=/run/cortex-install/install-plan.json" in raw
     assert "receipt_path=/run/cortex-install/install-receipt.json" in raw
     assert "install -d -o root -g root -m 0700 /run/cortex-install" in raw
-    assert "qualification_root=/run/cortex-qualification" in raw
+    assert "qualification_root=/qualification-output" in raw
+    assert "output_volume_name=" in raw
+    assert 'docker volume create "$output_volume_name"' in raw
+    assert "target=/qualification-output" in raw
+    assert 'docker volume rm "$output_volume_name"' in raw
+    assert "qualification_root=/run/cortex-qualification" not in raw
     assert "/var/lib/cortex/qualification" not in raw
     assert "/var/lib/cortex/qualification" not in dockerfile
     assert "plan_path=/var/lib/cortex" not in raw
@@ -521,6 +526,7 @@ def test_runner_declares_disposable_systemd_container_boundaries() -> None:
         assert (
             target == "/artifacts"
             or target == "/sys/fs/cgroup"
+            or target == "/qualification-output"
             or target.startswith("/var/lib/cortex")
         ), f"unexpected host bind/volume target: {target}"
 

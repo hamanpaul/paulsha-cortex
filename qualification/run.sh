@@ -63,10 +63,12 @@ python3 "$script_dir/verify_bundle.py" \
 image_tag="cortex-qualification:${candidate_sha}"
 container_name="cortex-qualification-${candidate_sha:0:12}-$$"
 volume_name="cortex-qualification-data-${candidate_sha:0:12}-$$"
+output_volume_name="cortex-qualification-output-${candidate_sha:0:12}-$$"
 
 cleanup() {
     docker rm --force "$container_name" >/dev/null 2>&1 || true
     docker volume rm "$volume_name" >/dev/null 2>&1 || true
+    docker volume rm "$output_volume_name" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
@@ -75,6 +77,7 @@ image_digest=$(docker image inspect --format '{{.Id}}' "$image_tag")
 [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "Docker image has no content digest"
 
 docker volume create "$volume_name" >/dev/null
+docker volume create "$output_volume_name" >/dev/null
 network_args=()
 if [[ "$profile" == release ]]; then
     # The release profile must be incapable of contacting providers or remotes,
@@ -91,6 +94,7 @@ docker run --detach \
     --mount "type=bind,source=$artifact_dir,target=/artifacts,readonly" \
     --volume "/sys/fs/cgroup:/sys/fs/cgroup:rw" \
     --mount "type=volume,source=$volume_name,target=/var/lib/cortex" \
+    --mount "type=volume,source=$output_volume_name,target=/qualification-output" \
     "${network_args[@]}" \
     "$image_tag" >/dev/null
 
@@ -117,7 +121,7 @@ docker exec "$container_name" sh -eu -c \
 
 plan_path=/run/cortex-install/install-plan.json
 receipt_path=/run/cortex-install/install-receipt.json
-qualification_root=/run/cortex-qualification
+qualification_root=/qualification-output
 qualification_path=$qualification_root/qualification.json
 
 docker exec "$container_name" install -d -o root -g root -m 0700 /run/cortex-install
@@ -287,8 +291,9 @@ docker exec "$container_name" /usr/local/libexec/cortex-qualification-validate \
     --evidence-root "$qualification_root" \
     "${validator_profile_args[@]}"
 
-# docker cp is used instead of binding a host output directory. The only host
-# input bind is the read-only artifact directory above.
+# Evidence lives on a dedicated disposable Docker volume because Docker's archive
+# API cannot read the /run tmpfs. docker cp still avoids a writable host bind; the
+# only host input bind is the read-only artifact directory above.
 docker cp "$container_name:$qualification_path" "$output_dir/qualification.json"
 docker cp "$container_name:$qualification_root/evidence" "$output_dir/evidence"
 

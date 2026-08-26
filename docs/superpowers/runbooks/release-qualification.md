@@ -24,6 +24,11 @@
 前確認 `git rev-parse --is-shallow-repository` 為 `false`。depth-1 bundle 會漏掉 candidate 的
 parent history，直到 installer 執行 repository `fsck` 才以 drift 失敗，不能作為 release evidence。
 
+qualification evidence 位於專用的一次性 Docker volume，再由 runner 以 `docker cp` 匯出並於
+結束時刪除 volume。不要改回 container `/run`：systemd container 的 `/run` 是 tmpfs，Docker
+daemon 的 archive API 無法看見其中檔案；也不要改成 writable host bind，以免擴大 qualification
+對 host 的寫入面。
+
 ## 可選的 live canary
 
 只有要驗特定部署環境時才執行 `Deployment canary`。它使用 protected
