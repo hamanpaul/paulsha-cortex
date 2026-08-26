@@ -769,10 +769,6 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#716'
       - kind: path
         ref: 'docs/superpowers/workstreams/trust-root-agent-loop-qualification/todo.md'
-      - kind: github_pr
-        ref: 'hamanpaul/paulsha-cortex#796'
-      - kind: path
-        ref: 'docs/superpowers/runbooks/release-qualification.md'
     excludes: []
   manager-gitconfig-delivery:
     title: 'manager-gitconfig-delivery'

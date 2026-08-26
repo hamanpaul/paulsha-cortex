@@ -24,22 +24,38 @@ probe 均拒絕回灌；只修正比對中證實仍存在的現行 attestation n
 - `shim` 與 `toolchain_wrappers`：`#!` 決定 interpreter，必須保留為 functional line；
   其他獨立 shell/Python 註解可忽略。
 - `polkit`：獨立 `//` 與 `/* ... */` 註解可忽略；規則內容仍逐行比較。
+- `polkit` block comment 到 EOF 未閉合時是 malformed functional content，必須 fail closed。
+- `polkit` 的 `;` 是 JavaScript statement，不沿用 unit／gitconfig 的 comment semantics。
 - 其他 category 維持既有 `#`／`;` comment semantics，避免擴大行為變更。
 
-三個 focused regression 分別鎖住兩種 shebang fail-closed 與 polkit comment-only warning。
+focused regressions 分別鎖住兩種 shebang fail-closed、polkit comment-only warning、
+inline rule preservation 與 unterminated EOF fail-closed。
 
-### 3. Release qualification 與 deployment canary 邊界保持不變
+### 3. Release qualification 與 deployment canary 邊界維持分離，補強 canary 證據
 
 Deterministic RC 只證明 artifact install/systemd/attestation/attack matrix，且不得取用
 live credentials。需要 provider 的 agent-loop live execution 只屬 deployment canary。
-現行 `_full_dispatch()` 已取代較弱的 standalone probe；「此刻 provider/live rollout
-健康」仍需受保護環境的 canary evidence，不能由 package release 推論。
+PR #796 的 `_full_dispatch()` 已建立較完整的 intake-to-terminal seam，但原本未 pin builder，
+也未驗證 executor/model/runtime 或任何真實 command event，因此不能直接視為 #716 驗收。
+
+本 change 改用 `cortex run work intake` 的 run-scoped override，固定 builder 為
+`codex/gpt-5.3-codex-spark`。closeout 同時驗證 workflow resolution、所有 build job 的
+typed runtime identity，並只對 `workflow_card=worktree-isolation` 的唯一 job 綁定
+Manager-owned `job-specs/builder/<instance>.json`。spec 必須指向同一 worktree、log、template
+instance，第一個 shell command 必須是 exact Codex model、read-only sandbox 且無 unsafe
+bypass。其 job JSONL 至少要有一筆真正完成、exit 0 且非空輸出的 `command_execution`。
+
+JSONL 是 job-writable observational telemetry，不提升為獨立 authority。對外 evidence 只記
+job IDs、count、booleans 與 command/output/log hashes；獨立 validator 會 exact-schema 驗證。
+「此刻 provider/live rollout 健康」仍需受保護環境的成功 canary，不能由 code 或 package
+release 推論。
 
 ### 4. 修正必須以新 immutable patch release 交付
 
 `v0.1.9` 保持不可變歷史；本 change 合併後以 `v0.1.10` 重新產生 exact-main RC、
 annotated tag、GitHub Release 與唯一 wheel。#681/#695 依 shipped replacement evidence 關閉；
-#716 保持 open，但改列為 deployment-canary acceptance，不再阻擋 Phase 2 source/package。
+#716 保持 open，直到上述 contract 對 release SHA 有成功 live run；它不阻擋 Phase 2
+source/package，但 code contract 必須隨 `v0.1.10` 交付。
 
 ## Risks / Trade-offs
 
@@ -49,6 +65,8 @@ annotated tag、GitHub Release 與唯一 wheel。#681/#695 依 shipped replaceme
   與拒絕移植的風險。
 - agent-loop package code 的存在不等於 live provider 成功；docs、issue comment 與
   qualification profile 必須維持這個誠實邊界。
+- job JSONL 可由被觀察 job 寫入，只能稱為綁定 Manager launch authority 的 live
+  observation；若要升為獨立 attestation，需另設 Manager-owned event channel。
 
 ## Rollback
 

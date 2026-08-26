@@ -1,5 +1,6 @@
 ---
-status: executable
+status: historical
+superseded_by: docs/superpowers/runbooks/trust-root-transactional-install.md
 work_item: trust-root-isolation
 phase: 2b
 audience: operator
@@ -13,17 +14,17 @@ refs:
   - paulsha_cortex/coordinator/job_runner.py
 ---
 
-# trust-root Phase 2b：root 設定 runbook（可執行版．A+B 單一路徑）
+# trust-root Phase 2b：歷史設定紀錄（不可執行）
 
-> **本文件是可執行版**：每一步的命令可直接複製、每一步有驗證、每一步可回滾。
-> 文件本身**不執行任何 root 操作**；所有 `sudo` 都由 operator 親自輸入。
-> Manager／Monitor／model jobs 永不具 root；只有第 6 步一次性的 installer
-> `apply`／credential import／`activate`／`verify`／`rollback` 由 operator 明確以 root 執行。
+> **不可執行。** 本文件只保留 Phase 2b 的歷史決策、故障證據與舊命令，不能再當作
+> production 部署程序。現行唯一 authority 是
+> `docs/superpowers/runbooks/trust-root-transactional-install.md`；所有安裝、升級、驗證與
+> rollback 必須走其中的 exact-plan SHA confirmation 與 receipt-bound installer。
 
 實作 `trust-root-isolation-spec.md` 的 **Phase 2**（spec §R10 Phase 2 第 1–8 步）。
 Phase 2a 的權限產生器（`paulsha_cortex/trust_root/permgen.py`）把 R1 登記表機械轉成
 目標 `owner:group mode`、systemd unit 與 polkit 規則；本 runbook 保留早期決策脈絡，
-實際升級與回滾則一律走第 6 步的 transactional installer。
+實際升級與回滾一律走新的 transactional install runbook。
 
 ---
 

@@ -536,6 +536,7 @@ def _validate_profile_artifacts(
             "issue",
             "terminal",
             "required_markers",
+            "agent_loop_probe",
             "artifacts",
         },
     )
@@ -547,6 +548,7 @@ def _validate_profile_artifacts(
     if not terminal_states & {"done", "delivered", "closed"}:
         _fail("dispatch-closeout terminal payload is not terminal")
     required_markers = {
+        "agent-loop-command",
         "candidate",
         "bundle",
         "verdict",
@@ -558,6 +560,46 @@ def _validate_profile_artifacts(
         _list(dispatch["required_markers"], "dispatch-closeout.required_markers")
     ):
         _fail("dispatch-closeout is missing a required terminal artifact class")
+    probe = _mapping(
+        dispatch["agent_loop_probe"],
+        "dispatch-closeout.agent_loop_probe",
+        {
+            "schema_version",
+            "executor",
+            "model_id",
+            "card_id",
+            "builder_job_ids",
+            "successful_command_count",
+            "all_outputs_nonempty",
+            "command_sha256",
+            "output_sha256",
+            "log_sha256",
+        },
+    )
+    builder_job_ids = [
+        _nonempty_string(value, f"dispatch-closeout.agent_loop_probe.builder_job_ids[{index}]")
+        for index, value in enumerate(
+            _list(
+                probe["builder_job_ids"],
+                "dispatch-closeout.agent_loop_probe.builder_job_ids",
+            )
+        )
+    ]
+    command_count = probe["successful_command_count"]
+    if (
+        probe["schema_version"] != 1
+        or probe["executor"] != "codex"
+        or probe["model_id"] != "gpt-5.3-codex-spark"
+        or probe["card_id"] != "worktree-isolation"
+        or len(builder_job_ids) != len(set(builder_job_ids))
+        or isinstance(command_count, bool)
+        or not isinstance(command_count, int)
+        or command_count <= 0
+        or probe["all_outputs_nonempty"] is not True
+    ):
+        _fail("dispatch-closeout Codex agent-loop observation is invalid")
+    for field in ("command_sha256", "output_sha256", "log_sha256"):
+        _digest(probe[field], f"dispatch-closeout.agent_loop_probe.{field}")
     dispatch_artifacts = _list(dispatch["artifacts"], "dispatch-closeout.artifacts")
     for index, raw in enumerate(dispatch_artifacts):
         row = _mapping(raw, f"dispatch-closeout.artifacts[{index}]", {"path", "sha256"})

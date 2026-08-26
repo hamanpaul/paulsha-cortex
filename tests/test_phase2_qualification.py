@@ -284,6 +284,7 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
         "issue": 1,
         "terminal": {"state": "done"},
         "required_markers": [
+            "agent-loop-command",
             "candidate",
             "bundle",
             "verdict",
@@ -291,6 +292,18 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
             "evidence",
             "completion",
         ],
+        "agent_loop_probe": {
+            "schema_version": 1,
+            "executor": "codex",
+            "model_id": "gpt-5.3-codex-spark",
+            "card_id": "worktree-isolation",
+            "builder_job_ids": ["build-job"],
+            "successful_command_count": 1,
+            "all_outputs_nonempty": True,
+            "command_sha256": "5" * 64,
+            "output_sha256": "6" * 64,
+            "log_sha256": "7" * 64,
+        },
         "artifacts": [{"path": "coordinator/jobs.json", "sha256": "2" * 64}],
     }
     github = {
@@ -867,6 +880,10 @@ def test_full_suite_validator_binds_legacy_deny_only_asset(
         "missing-family-control",
         "provider-self-attestation",
         "nonterminal-dispatch",
+        "agent-loop-no-command",
+        "agent-loop-wrong-model",
+        "agent-loop-wrong-card",
+        "agent-loop-bad-hash",
         "changed-remote-refs",
     ],
 )
@@ -894,6 +911,18 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
         path = evidence / "dispatch-closeout.json"
         document = json.loads(path.read_text(encoding="utf-8"))
         document["terminal"] = {"state": "ongoing"}
+    elif mutation.startswith("agent-loop-"):
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        probe = document["agent_loop_probe"]
+        if mutation == "agent-loop-no-command":
+            probe["successful_command_count"] = 0
+        elif mutation == "agent-loop-wrong-model":
+            probe["model_id"] = "gpt-5.4"
+        elif mutation == "agent-loop-wrong-card":
+            probe["card_id"] = "tdd-red"
+        else:
+            probe["command_sha256"] = "not-a-digest"
     else:
         path = evidence / "manager-github-auth.json"
         document = json.loads(path.read_text(encoding="utf-8"))

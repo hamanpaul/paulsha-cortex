@@ -18,13 +18,15 @@ The dirty root checkout was excluded. All writes occur on
 | --- | --- | --- | --- |
 | #681 | HOME/PATH-derived package-tree publisher and wrapper | hash-bound native artifact → install plan → locked staging/apply → root-owned direct wrapper → job PATH; exact-main RC attestation | reject legacy transplant; close as superseded by stronger shipped path |
 | #695 | second inventory builder in `permgen` | `_generated_inventory()` → `installed_inventory()` → `attest_generated_inventory()` → `verify_receipt()` | reject parallel authority; fix only verified category-normalization defect |
-| #716 | standalone launcher/template probe | protected deployment-canary `_full_dispatch()` from intake through terminal and gates | reject weaker probe; retain #716 as post-release live acceptance |
+| #716 | standalone launcher/template probe | protected `_full_dispatch()` plus exact run override, typed runtime + Manager job-spec binding, and `worktree-isolation` Codex command observation | reject weaker probe; ship the stronger contract but retain #716 until a live canary succeeds |
 
 ## Selected delta
 
 - Preserve `#!` as functional content for `shim` and `toolchain_wrappers` inventory rows.
 - Ignore only standalone JavaScript `//` and `/* ... */` comments for `polkit`; preserve
-  inline rule content.
+  inline rule content; reject unclosed blocks and semicolon-prefixed rules.
+- Pin canary builder identity, bind its Manager-authored launch spec and validate exact-card Codex
+  command events without uploading raw commands or outputs.
 - Replace stale work-item, Todo and Phase 2b upgrade authority with current installer／RC／canary paths.
 - Keep deterministic release and credentialed deployment canary as distinct evidence profiles.
 

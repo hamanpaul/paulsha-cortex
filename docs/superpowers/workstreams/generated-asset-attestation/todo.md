@@ -25,6 +25,7 @@ service executable identity 與 candidate venv tree，credential surface 只記�
 - [x] generated 與 installed inventory 由同一 install plan／receipt authority 綁定。
 - [x] missing／unexpected artifact、metadata drift 與 functional drift 一律失敗。
 - [x] shim／toolchain wrapper shebang 是 functional content。
-- [x] polkit 獨立 `//`／`/* ... */` 註解是 comment-only warning，inline rule 仍受驗證。
+- [x] polkit 完整獨立 `//`／`/* ... */` 註解是 comment-only warning；inline rule 與
+      未閉合至 EOF 的 block 仍 fail closed；`;` 不被誤當成 polkit 註解。
 - [x] credential evidence 不含 raw secret content。
 - [x] work-item authority 已移除不存在的 OpenSpec 與舊 PR #790 實作指向。

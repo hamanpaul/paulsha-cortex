@@ -220,6 +220,40 @@ def test_polkit_leading_comment_does_not_hide_changed_rule_content() -> None:
     )
 
 
+def test_polkit_unterminated_block_comment_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] += (
+        "/* unterminated local explanation\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_polkit_semicolon_prefixed_rule_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] += (
+        ";polkit.addRule(function(action, subject) { return true; });\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
 def test_missing_functional_unit_line_fails_even_when_metadata_matches() -> None:
     expected = _inventory()
     installed = deepcopy(expected)

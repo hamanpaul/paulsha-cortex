@@ -4786,13 +4786,15 @@ def _functional_lines(
             if not line:
                 continue
 
-        if line.startswith(";"):
+        if category != "polkit" and line.startswith(";"):
             continue
         if line.startswith("#"):
             if category in {"shim", "toolchain_wrappers"} and line.startswith("#!"):
                 functional.append(line)
             continue
         functional.append(line)
+    if in_polkit_block_comment:
+        raise ValueError("unterminated polkit block comment")
     return functional
 
 
@@ -4842,14 +4844,24 @@ def attest_generated_inventory(
                 )
             expected_content = str(expected_row.get("content", ""))
             actual_content = str(actual_row.get("content", ""))
-            expected_functional = _functional_lines(
-                expected_content,
-                category=category,
-            )
-            actual_functional = _functional_lines(
-                actual_content,
-                category=category,
-            )
+            try:
+                expected_functional = _functional_lines(
+                    expected_content,
+                    category=category,
+                )
+                actual_functional = _functional_lines(
+                    actual_content,
+                    category=category,
+                )
+            except ValueError as exc:
+                failures.append(
+                    {
+                        "code": "functional_drift",
+                        "artifact": artifact,
+                        "malformed_content": str(exc),
+                    }
+                )
+                continue
             if expected_functional != actual_functional:
                 missing = [
                     line for line in expected_functional if line not in actual_functional

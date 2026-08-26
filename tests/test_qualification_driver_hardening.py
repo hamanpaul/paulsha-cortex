@@ -621,7 +621,11 @@ def _dispatch_fixture(tmp_path: Path, driver):
     issue = 42
     phases = ("claim", "define", "plan", "build", "verify", "review", "ship")
     steps = [
-        {"phase": phase, "card": f"{phase}-card", "gate_result": "passed"}
+        {
+            "phase": phase,
+            "card": "worktree-isolation" if phase == "build" else f"{phase}-card",
+            "gate_result": "passed",
+        }
         for phase in phases
     ]
     jobs = []
@@ -629,6 +633,8 @@ def _dispatch_fixture(tmp_path: Path, driver):
     workflow_evidence: dict[str, tuple[Path, str]] = {}
     for phase in ("plan", "build", "verify", "review", "ship"):
         job_id = f"{phase}-job"
+        worktree = tmp_path / "reclaimed" / job_id
+        card = "worktree-isolation" if phase == "build" else f"{phase}-card"
         job = {
             "job_id": job_id,
             "status": "exited",
@@ -636,17 +642,81 @@ def _dispatch_fixture(tmp_path: Path, driver):
             "workflow_run_id": run_id,
             "workflow_claim_key": "claim:v1:" + "1" * 64,
             "workflow_repo": repository,
-            "workflow_card": f"{phase}-card",
+            "workflow_card": card,
             "workflow_phase": phase,
-            "workflow_repo_root": str(repo),
+            "workflow_repo_root": str(worktree) if phase == "build" else str(repo),
             "workflow_inputs": [],
             "workflow_outputs": [],
             "workflow_output_baseline": [],
             "source_revision": "2" * 64,
             "subject_head": candidate if phase != "plan" else None,
-            "worktree": str(tmp_path / "reclaimed" / job_id),
+            "worktree": str(worktree),
             "template_instance": job_id,
         }
+        if phase == "build":
+            log = (
+                coordinator
+                / "commit-spool"
+                / "build-logs"
+                / job_id
+                / "job.jsonl"
+            )
+            log.parent.mkdir(parents=True)
+            log.write_text(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "git status --short && git rev-parse HEAD",
+                            "aggregated_output": f"{candidate}\n",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            log.chmod(0o620)
+            job.update(
+                {
+                    "persona": "builder",
+                    "executor": "codex",
+                    "model_id": "gpt-5.3-codex-spark",
+                    "runtime_principal": "builder",
+                    "runtime_mode": "systemd-template",
+                    "runtime_surface": "builder-codex-home",
+                    "credential_publish": True,
+                    "log_path": str(log),
+                }
+            )
+            artifacts.append(log)
+            spec_path = coordinator / "job-specs" / "builder" / f"{job_id}.json"
+            _write_json(
+                spec_path,
+                {
+                    "spec_version": 1,
+                    "instance": job_id,
+                    "job_id": job_id,
+                    "unit": f"cortex-job-jit@{job_id}.service",
+                    "command": [
+                        "bash",
+                        "-c",
+                        (
+                            "codex exec --ignore-user-config 'Inspect the repository and "
+                            "choose a useful read-only command.' --json --sandbox read-only "
+                            "--enable use_legacy_landlock --model gpt-5.3-codex-spark "
+                            f"-o {log.with_name('last.json')} -C {worktree}; exit \"$?\""
+                        ),
+                    ],
+                    "working_directory": str(worktree),
+                    "log_path": str(log),
+                    "env": {},
+                },
+            )
+            spec_path.chmod(0o640)
+            artifacts.append(spec_path)
         envelope = {
             "schema_version": 1,
             "kind": phase,
@@ -801,6 +871,21 @@ def _dispatch_fixture(tmp_path: Path, driver):
         "completion_source_revisions": {"openspec:qualification": "rev"},
         "pr_candidate": candidate,
         "merge_revision": "b" * 40,
+        "model_chain_override": {
+            "builder": {
+                "executor": "codex",
+                "model_id": "gpt-5.3-codex-spark",
+            }
+        },
+        "resolved_model_chain": {
+            "builder": {
+                "executor": "codex",
+                "model_id": "gpt-5.3-codex-spark",
+                "independence_domain": "openai",
+                "source": "run-override",
+                "envelope_source": "default",
+            }
+        },
     }
     registry = coordinator / "jobs.json"
     _write_json(
@@ -879,7 +964,7 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
         raise AssertionError(argv)
 
     monkeypatch.setattr(driver, "_run", fake_run)
-    markers, rows, workflow = driver._validate_dispatch_closeout(
+    markers, rows, workflow, agent_loop_probe = driver._validate_dispatch_closeout(
         repository=fixture["repository"],
         work_id=fixture["work_id"],
         issue=fixture["issue"],
@@ -891,6 +976,7 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
         coordinator_root=fixture["coordinator"],
     )
     assert set(markers) == {
+        "agent-loop-command",
         "candidate",
         "bundle",
         "verdict",
@@ -899,11 +985,244 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
         "completion",
     }
     assert workflow["run_id"] == fixture["run_id"]
+    assert agent_loop_probe == {
+        "schema_version": 1,
+        "executor": "codex",
+        "model_id": "gpt-5.3-codex-spark",
+        "card_id": "worktree-isolation",
+        "builder_job_ids": ["build-job"],
+        "successful_command_count": 1,
+        "all_outputs_nonempty": True,
+        "command_sha256": agent_loop_probe["command_sha256"],
+        "output_sha256": agent_loop_probe["output_sha256"],
+        "log_sha256": agent_loop_probe["log_sha256"],
+    }
+    assert all(
+        len(agent_loop_probe[field]) == 64
+        for field in ("command_sha256", "output_sha256", "log_sha256")
+    )
     assert rows
     for row in rows:
         path = fixture["coordinator"].parent / row["path"]
         assert path.is_file()
         assert hashlib.sha256(path.read_bytes()).hexdigest() == row["sha256"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-override",
+        "resolved-executor",
+        "job-model",
+        "runtime-mode",
+        "log-path",
+        "no-command",
+        "wrong-card",
+        "spec-command",
+    ],
+)
+def test_dispatch_closeout_requires_exact_codex_agent_loop_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    driver = _load_driver()
+    fixture = _dispatch_fixture(tmp_path, driver)
+    payload = json.loads(fixture["registry"].read_text())
+    workflow = payload["workflows"][0]
+    build_job = next(
+        row for row in payload["jobs"] if row["workflow_phase"] == "build"
+    )
+    if mutation == "missing-override":
+        workflow["model_chain_override"] = None
+    elif mutation == "resolved-executor":
+        workflow["resolved_model_chain"]["builder"]["executor"] = "copilot"
+    elif mutation == "job-model":
+        build_job["model_id"] = "gpt-5.4"
+    elif mutation == "runtime-mode":
+        build_job["runtime_mode"] = "direct"
+    elif mutation == "log-path":
+        build_job["log_path"] = str(tmp_path / "forged.jsonl")
+    elif mutation == "wrong-card":
+        build_job["workflow_card"] = "tdd-red"
+        locator = build_job["workflow_evidence"]
+        evidence_path = fixture["coordinator"] / locator["path"]
+        envelope = json.loads(evidence_path.read_text())
+        envelope["job"]["card_id"] = "tdd-red"
+        envelope["payload"]["card_id"] = "tdd-red"
+        locator["hash"] = _write_json(evidence_path, envelope)
+    elif mutation == "spec-command":
+        spec_path = (
+            fixture["coordinator"]
+            / "job-specs"
+            / "builder"
+            / "build-job.json"
+        )
+        spec = json.loads(spec_path.read_text())
+        spec["command"][2] = spec["command"][2].replace(
+            "codex exec", "copilot -p", 1
+        )
+        _write_json(spec_path, spec)
+        spec_path.chmod(0o640)
+    else:
+        Path(build_job["log_path"]).write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": (
+                            "fake command_execution exit_code=0 "
+                            "aggregated_output=not-real"
+                        ),
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    _write_json(fixture["registry"], payload)
+    monkeypatch.setattr(driver, "_manager_uid", lambda: os.getuid())
+
+    def fake_run(argv, **_kwargs):
+        if "cat-file" in argv or ("bundle" in argv and "verify" in argv):
+            return _result(driver, argv)
+        if "worktree" in argv:
+            return _result(driver, argv, stdout=f"worktree {fixture['repo']}\n")
+        if "bundle" in argv and "list-heads" in argv:
+            return _result(
+                driver, argv, stdout=f"{fixture['candidate']} refs/heads/work\n"
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(driver, "_run", fake_run)
+    with pytest.raises(driver.QualificationFailure, match="Codex agent-loop"):
+        driver._validate_dispatch_closeout(
+            repository=fixture["repository"],
+            work_id=fixture["work_id"],
+            issue=fixture["issue"],
+            terminal={
+                "status": "done",
+                "run_id": fixture["run_id"],
+                "work_id": fixture["work_id"],
+            },
+            coordinator_root=fixture["coordinator"],
+        )
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {
+            "type": "command_execution",
+            "command": "git rev-parse HEAD",
+            "aggregated_output": "head\n",
+            "exit_code": False,
+            "status": "completed",
+        },
+        {
+            "type": "command_execution",
+            "command": "git rev-parse HEAD",
+            "aggregated_output": "head\n",
+            "exit_code": 1,
+            "status": "failed",
+        },
+        {
+            "type": "command_execution",
+            "command": "git rev-parse HEAD",
+            "aggregated_output": "",
+            "exit_code": 0,
+            "status": "completed",
+        },
+        {
+            "type": "agent_message",
+            "text": "command_execution completed exit_code=0 output=head",
+        },
+    ],
+)
+def test_codex_agent_loop_parser_rejects_nonproof_events(item: dict) -> None:
+    driver = _load_driver()
+    content = (json.dumps({"type": "item.completed", "item": item}) + "\n").encode()
+
+    with pytest.raises(driver.QualificationFailure, match="Codex agent-loop"):
+        driver._codex_agent_loop_observation(
+            (("build-job", content),),
+        )
+
+
+def test_full_dispatch_pins_codex_builder_and_persists_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _load_driver()
+    calls: list[tuple[str, ...]] = []
+    terminal = {
+        "status": "done",
+        "run_id": "run-qualification",
+        "work_id": "qualification-work",
+    }
+
+    def fake_run(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if "show" in argv:
+            return _result(driver, argv, stdout=json.dumps(terminal) + "\n")
+        return _result(driver, argv)
+
+    observation = {
+        "schema_version": 1,
+        "executor": "codex",
+        "model_id": "gpt-5.3-codex-spark",
+        "card_id": "worktree-isolation",
+        "builder_job_ids": ["build-job"],
+        "successful_command_count": 1,
+        "all_outputs_nonempty": True,
+        "command_sha256": "a" * 64,
+        "output_sha256": "b" * 64,
+        "log_sha256": "c" * 64,
+    }
+    monkeypatch.setattr(driver, "_run", fake_run)
+    monkeypatch.setattr(
+        driver,
+        "_installed_runtime_env",
+        lambda: {"PSC_COORDINATOR_ROOT": str(tmp_path / "coordinator")},
+    )
+    monkeypatch.setattr(
+        driver,
+        "_validate_dispatch_closeout",
+        lambda **_kwargs: (
+            ["agent-loop-command"],
+            [{"path": "coordinator/jobs.json", "sha256": "d" * 64}],
+            {"run_id": "run-qualification"},
+            observation,
+        ),
+    )
+
+    driver._full_dispatch(
+        repository="owner/repo",
+        work_id="qualification-work",
+        issue=42,
+        timeout=1,
+        evidence_dir=tmp_path / "evidence",
+    )
+
+    assert calls[0] == (
+        "/opt/cortex/venv/bin/cortex",
+        "run",
+        "work",
+        "intake",
+        "qualification-work",
+        "--repo",
+        "owner/repo",
+        "--issue",
+        "42",
+        "--combo",
+        "feature-oneshot",
+        "--builder-executor",
+        "codex",
+        "--builder-model",
+        "gpt-5.3-codex-spark",
+    )
+    evidence = json.loads(
+        (tmp_path / "evidence" / "dispatch-closeout.json").read_text()
+    )
+    assert evidence["agent_loop_probe"] == observation
 
 
 @pytest.mark.parametrize("mutation", ["wrong-hash", "wrong-work", "live-worktree"])

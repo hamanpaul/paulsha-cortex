@@ -17,6 +17,7 @@ import os
 import pwd
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -31,6 +32,10 @@ from paulsha_cortex.coordinator import job_runner
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+DEPLOYMENT_CANARY_BUILDER_EXECUTOR = "codex"
+DEPLOYMENT_CANARY_BUILDER_MODEL = "gpt-5.3-codex-spark"
+DEPLOYMENT_CANARY_PROBE_CARD = "worktree-isolation"
+MAX_AGENT_LOOP_LOG_BYTES = 128 * 1024 * 1024
 PROVIDERS = {
     "agy": ("gemini-3.7-flash", "high", "cortex-reviewer-planner"),
     "copilot": ("gpt-5.4", "xhigh", "cortex-reviewer-planner"),
@@ -2433,6 +2438,183 @@ def _terminal_named_values(value: object, name: str) -> set[str]:
     return found
 
 
+def _codex_agent_loop_observation(
+    logs: Sequence[tuple[str, bytes]],
+) -> dict[str, object]:
+    """Derive non-secret live evidence from Codex JSONL command events.
+
+    The builder log is observational telemetry written by the job, not an
+    independent authority surface.  Closeout still binds it to Manager-owned
+    workflow identity and records only hashes/booleans in uploaded evidence.
+    """
+
+    commands: list[str] = []
+    outputs: list[str] = []
+    log_rows: list[dict[str, str]] = []
+    builder_job_ids: list[str] = []
+    for job_id, content in logs:
+        if not isinstance(job_id, str) or not job_id or not isinstance(content, bytes):
+            raise QualificationFailure("Codex agent-loop log binding is malformed")
+        builder_job_ids.append(job_id)
+        log_rows.append(
+            {"job_id": job_id, "sha256": hashlib.sha256(content).hexdigest()}
+        )
+        try:
+            lines = content.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise QualificationFailure("Codex agent-loop log is not UTF-8") from exc
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            item = event.get("item") if isinstance(event, dict) else None
+            if (
+                not isinstance(item, dict)
+                or event.get("type") != "item.completed"
+                or item.get("type") != "command_execution"
+                or item.get("status") != "completed"
+                or type(item.get("exit_code")) is not int
+                or item.get("exit_code") != 0
+                or not isinstance(item.get("command"), str)
+                or not item["command"].strip()
+                or not isinstance(item.get("aggregated_output"), str)
+                or not item["aggregated_output"].strip()
+            ):
+                continue
+            commands.append(item["command"])
+            outputs.append(item["aggregated_output"])
+    if not commands:
+        raise QualificationFailure(
+            "Codex agent-loop has no completed self-chosen command with non-empty output"
+        )
+    return {
+        "schema_version": 1,
+        "executor": DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
+        "model_id": DEPLOYMENT_CANARY_BUILDER_MODEL,
+        "card_id": DEPLOYMENT_CANARY_PROBE_CARD,
+        "builder_job_ids": sorted(builder_job_ids),
+        "successful_command_count": len(commands),
+        "all_outputs_nonempty": True,
+        "command_sha256": hashlib.sha256(_canonical_bytes(commands)).hexdigest(),
+        "output_sha256": hashlib.sha256(_canonical_bytes(outputs)).hexdigest(),
+        "log_sha256": hashlib.sha256(_canonical_bytes(log_rows)).hexdigest(),
+    }
+
+
+def _bound_codex_builder_log(
+    root: Path, job: Mapping[str, object]
+) -> tuple[Path, bytes]:
+    slot = job.get("template_instance")
+    if (
+        not isinstance(slot, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", slot) is None
+    ):
+        raise QualificationFailure("Codex agent-loop template instance is invalid")
+    expected = root / "commit-spool" / "build-logs" / slot / "job.jsonl"
+    value = job.get("log_path")
+    path = Path(value) if isinstance(value, str) else Path()
+    if not path.is_absolute() or path != expected:
+        raise QualificationFailure("Codex agent-loop log path is not the bound spool")
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise QualificationFailure("Codex agent-loop log escapes coordinator root") from exc
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise QualificationFailure("Codex agent-loop log path contains a symlink")
+    if not path.is_file():
+        raise QualificationFailure("Codex agent-loop log is absent")
+    metadata = path.stat()
+    if metadata.st_uid != _manager_uid() or stat.S_IMODE(metadata.st_mode) & 0o007:
+        raise QualificationFailure("Codex agent-loop log ownership/mode is unsafe")
+    if metadata.st_size > MAX_AGENT_LOOP_LOG_BYTES:
+        raise QualificationFailure("Codex agent-loop log exceeds the evidence bound")
+    try:
+        return path, path.read_bytes()
+    except OSError as exc:
+        raise QualificationFailure("Codex agent-loop log is unreadable") from exc
+
+
+def _bound_codex_builder_spec(root: Path, job: Mapping[str, object]) -> Path:
+    """Validate the Manager-authored launch contract for the observed job."""
+
+    slot = job.get("template_instance")
+    job_id = job.get("job_id")
+    if (
+        not isinstance(slot, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", slot) is None
+        or not isinstance(job_id, str)
+        or not job_id
+    ):
+        raise QualificationFailure("Codex agent-loop job spec binding is invalid")
+    path = root / "job-specs" / "builder" / f"{slot}.json"
+    spec = _json_object(
+        _manager_file(path, label="Codex agent-loop job spec", root=root),
+        label="Codex agent-loop job spec",
+    )
+    command = spec.get("command")
+    worktree = job.get("worktree")
+    repo_root = job.get("workflow_repo_root")
+    log_path = job.get("log_path")
+    unit = spec.get("unit")
+    if (
+        set(spec) != set(job_runner.SPEC_REQUIRED_KEYS)
+        or spec.get("spec_version") != job_runner.JOB_SPEC_VERSION
+        or spec.get("instance") != slot
+        or spec.get("job_id") != job_id
+        or not isinstance(unit, str)
+        or re.fullmatch(
+            rf"cortex-job(?:-jit)?@{re.escape(slot)}\.service", unit
+        )
+        is None
+        or not isinstance(worktree, str)
+        or not Path(worktree).is_absolute()
+        or repo_root != worktree
+        or spec.get("working_directory") != worktree
+        or spec.get("log_path") != log_path
+        or not isinstance(spec.get("env"), dict)
+        or not isinstance(command, list)
+        or len(command) != 3
+        or command[:2] != ["bash", "-c"]
+        or not isinstance(command[2], str)
+    ):
+        raise QualificationFailure("Codex agent-loop job spec authority mismatch")
+    try:
+        lexer = shlex.shlex(command[2], posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError as exc:
+        raise QualificationFailure("Codex agent-loop job command is malformed") from exc
+    try:
+        first_separator = next(
+            index for index, token in enumerate(tokens) if token in {";", "&&", "||", "|"}
+        )
+    except StopIteration:
+        first_separator = len(tokens)
+    argv = tokens[:first_separator]
+    model_indexes = [index for index, token in enumerate(argv) if token == "--model"]
+    sandbox_indexes = [
+        index for index, token in enumerate(argv) if token == "--sandbox"
+    ]
+    if (
+        argv[:3] != ["codex", "exec", "--ignore-user-config"]
+        or "--json" not in argv
+        or len(model_indexes) != 1
+        or model_indexes[0] + 1 >= len(argv)
+        or argv[model_indexes[0] + 1] != DEPLOYMENT_CANARY_BUILDER_MODEL
+        or len(sandbox_indexes) != 1
+        or sandbox_indexes[0] + 1 >= len(argv)
+        or argv[sandbox_indexes[0] + 1] != "read-only"
+        or "--dangerously-bypass-approvals-and-sandbox" in argv
+        or "--dangerously-bypass-hook-trust" in argv
+    ):
+        raise QualificationFailure("Codex agent-loop job command identity is invalid")
+    return path
+
+
 def _validate_dispatch_closeout(
     *,
     repository: str,
@@ -2440,7 +2622,7 @@ def _validate_dispatch_closeout(
     issue: int,
     terminal: object,
     coordinator_root: Path,
-) -> tuple[list[str], list[dict[str, str]], dict[str, Any]]:
+) -> tuple[list[str], list[dict[str, str]], dict[str, Any], dict[str, object]]:
     root = coordinator_root.resolve()
     state_root = root.parent
     registry_path = root / "jobs.json"
@@ -2638,6 +2820,57 @@ def _validate_dispatch_closeout(
 
     bundle_seen = False
     build_jobs = [job for job in bound_jobs if job.get("workflow_phase") == "build"]
+    expected_builder = {
+        "executor": DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
+        "model_id": DEPLOYMENT_CANARY_BUILDER_MODEL,
+    }
+    resolved_chain = workflow.get("resolved_model_chain")
+    resolved_builder = (
+        resolved_chain.get("builder") if isinstance(resolved_chain, dict) else None
+    )
+    if (
+        workflow.get("model_chain_override") != {"builder": expected_builder}
+        or not isinstance(resolved_builder, dict)
+        or resolved_builder.get("executor") != expected_builder["executor"]
+        or resolved_builder.get("model_id") != expected_builder["model_id"]
+        or resolved_builder.get("independence_domain") != "openai"
+        or resolved_builder.get("source") != "run-override"
+        or resolved_builder.get("envelope_source") not in {"default", "measured"}
+        or not build_jobs
+    ):
+        raise QualificationFailure(
+            "Codex agent-loop workflow is not bound to the exact builder override"
+        )
+    for job in build_jobs:
+        if (
+            job.get("persona") != "builder"
+            or job.get("executor") != DEPLOYMENT_CANARY_BUILDER_EXECUTOR
+            or job.get("model_id") != DEPLOYMENT_CANARY_BUILDER_MODEL
+            or job.get("runtime_principal") != "builder"
+            or job.get("runtime_mode") != "systemd-template"
+            or job.get("runtime_surface") != "builder-codex-home"
+            or job.get("credential_publish") is not True
+        ):
+            raise QualificationFailure(
+                "Codex agent-loop builder identity/runtime binding is invalid"
+            )
+    probe_jobs = [
+        job
+        for job in build_jobs
+        if job.get("workflow_card") == DEPLOYMENT_CANARY_PROBE_CARD
+    ]
+    if len(probe_jobs) != 1:
+        raise QualificationFailure(
+            "Codex agent-loop has no unique worktree-isolation job binding"
+        )
+    bound_logs: list[tuple[str, bytes]] = []
+    for job in probe_jobs:
+        spec_path = _bound_codex_builder_spec(root, job)
+        log_path, log_content = _bound_codex_builder_log(root, job)
+        artifact_paths.append(spec_path)
+        artifact_paths.append(log_path)
+        bound_logs.append((str(job["job_id"]), log_content))
+    agent_loop_probe = _codex_agent_loop_observation(bound_logs)
     for job in build_jobs:
         slot = job.get("template_instance") or job.get("job_id")
         if (
@@ -2761,12 +2994,21 @@ def _validate_dispatch_closeout(
         raise QualificationFailure(
             "workflow independent/delivery gate authority is incomplete"
         )
-    markers = ["bundle", "candidate", "completion", "evidence", "ledger", "verdict"]
+    markers = [
+        "agent-loop-command",
+        "bundle",
+        "candidate",
+        "completion",
+        "evidence",
+        "ledger",
+        "verdict",
+    ]
     unique_paths = sorted(set(artifact_paths))
     return (
         markers,
         [_artifact_row(path, state_root=state_root) for path in unique_paths],
         workflow,
+        agent_loop_probe,
     )
 
 
@@ -2779,6 +3021,7 @@ def _full_dispatch(
     intake = _run(
         (
             "/opt/cortex/venv/bin/cortex",
+            "run",
             "work",
             "intake",
             work_id,
@@ -2788,6 +3031,10 @@ def _full_dispatch(
             str(issue),
             "--combo",
             "feature-oneshot",
+            "--builder-executor",
+            DEPLOYMENT_CANARY_BUILDER_EXECUTOR,
+            "--builder-model",
+            DEPLOYMENT_CANARY_BUILDER_MODEL,
         ),
         env=runtime_env,
         timeout=60,
@@ -2831,7 +3078,7 @@ def _full_dispatch(
         raise QualificationFailure(
             "full dispatch did not reach terminal closeout before timeout"
         )
-    markers, artifact_rows, _workflow = _validate_dispatch_closeout(
+    markers, artifact_rows, _workflow, agent_loop_probe = _validate_dispatch_closeout(
         repository=repository,
         work_id=work_id,
         issue=issue,
@@ -2848,6 +3095,7 @@ def _full_dispatch(
             "issue": issue,
             "terminal": terminal,
             "required_markers": markers,
+            "agent_loop_probe": agent_loop_probe,
             "artifacts": artifact_rows,
         },
     )
