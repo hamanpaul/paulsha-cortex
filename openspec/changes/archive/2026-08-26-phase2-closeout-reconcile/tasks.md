@@ -25,9 +25,9 @@ work_item: phase2-closeout-reconcile
 - [x] focused tests、cross-feature trust-root tests、完整 pytest、canonical OpenSpec 與
       build/twine/clean-wheel smoke 全綠。
 - [x] 每條 standard/adversarial review finding 已獨立驗證並修/駁/列管；修後回歸全綠。
-- [ ] 以官方 OpenSpec CLI archive 本 change，並提交 changelog fragment 與
+- [x] 以官方 OpenSpec CLI archive 本 change，並提交 changelog fragment 與
       `CHANGELOG.md [Unreleased]`。
-- [ ] 建立 zh-TW PR、套用 release label，並以該 PR 的 actual metadata 跑 policy preflight。
+- [x] 建立 zh-TW PR、套用 release label，並以該 PR 的 actual metadata 跑 policy preflight。
 
 ## 4. Release-ready implementation
 
