@@ -141,6 +141,169 @@ def test_comment_only_drift_warns_but_does_not_fail() -> None:
     assert rendered["failures"] == []
 
 
+def test_shim_shebang_drift_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["shim"]["cortex-job-shim"]["content"] = (
+        installed["shim"]["cortex-job-shim"]["content"].replace(
+            "#!/opt/cortex/venv/bin/python",
+            "#!/usr/bin/python3",
+        )
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "shim/cortex-job-shim"
+        and "#!/opt/cortex/venv/bin/python" in row["missing_functional_lines"]
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_toolchain_wrapper_shebang_drift_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["toolchain_wrappers"]["codex"]["content"] = (
+        installed["toolchain_wrappers"]["codex"]["content"].replace(
+            "#!/bin/sh",
+            "#!/usr/bin/env sh",
+        )
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "toolchain_wrappers/codex"
+        and "#!/bin/sh" in row["missing_functional_lines"]
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_crlf_toolchain_wrapper_is_malformed_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["toolchain_wrappers"]["codex"]["content"] = (
+        installed["toolchain_wrappers"]["codex"]["content"].replace("\n", "\r\n")
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "toolchain_wrappers/codex"
+        and "carriage-return" in row["malformed_content"]
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_polkit_standalone_comment_drift_warns_but_does_not_fail() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] = (
+        "// local explanation\n"
+        "/* local\n"
+        " * multi-line explanation\n"
+        " */\n"
+        + installed["polkit"]["49-cortex-job.rules"]["content"]
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert report.ok
+    assert {
+        (row["code"], row["artifact"]) for row in report.to_dict()["warnings"]
+    } == {("comment_only_drift", "polkit/49-cortex-job.rules")}
+
+
+def test_polkit_leading_comment_does_not_hide_changed_rule_content() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] = (
+        "/* local explanation */ "
+        "polkit.addRule(function(action, subject) { return true; });\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_polkit_unterminated_block_comment_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] += (
+        "/* unterminated local explanation\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_polkit_semicolon_prefixed_rule_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] += (
+        ";polkit.addRule(function(action, subject) { return true; });\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_polkit_hash_prefixed_line_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] += (
+        "# invalid JavaScript line\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_shell_semicolon_prefixed_line_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["shim"]["cortex-job-shim"]["content"] += ";exit 1\n"
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "shim/cortex-job-shim"
+        for row in report.to_dict()["failures"]
+    )
+
+
 def test_missing_functional_unit_line_fails_even_when_metadata_matches() -> None:
     expected = _inventory()
     installed = deepcopy(expected)
@@ -342,8 +505,17 @@ class CandidateVenvBackend(VerifyBackend):
         return {
             "exists": True,
             "installed_sha256": step["desired_sha256"],
+            "slot_sha256": step["desired_sha256"],
             "path": str(self.slot),
             "tree_sha256": backend_module._tree_sha256(self.slot),
+            "link_target": "venvs/candidate",
+        }
+
+    def inspect_venv_activation(self, _step):
+        return {
+            "exists": True,
+            "is_symlink": True,
+            "link_target": "venvs/candidate",
         }
 
     def apply_step(self, step):
@@ -456,6 +628,16 @@ def _candidate_venv_receipt(tmp_path: Path):
     }
     backend = CandidateVenvBackend(slot)
     receipt = new_install_receipt(plan)
+    installed = backend.inspect_step(step)
+    receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": step,
+            "status": "completed",
+            "prior": {"exists": False},
+            **installed,
+        }
+    ]
     apply_plan(
         plan,
         confirm_sha256=plan_sha256(plan),

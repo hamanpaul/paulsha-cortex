@@ -91,10 +91,10 @@ def _valid_qualification() -> dict:
             },
             {
                 "provider": "codex",
-                "requested_model": "gpt-5",
-                "runtime_model": "gpt-5",
-                "requested_effort": "normal",
-                "runtime_effort": "normal",
+                "requested_model": "gpt-5.3-codex-spark",
+                "runtime_model": "gpt-5.3-codex-spark",
+                "requested_effort": "xhigh",
+                "runtime_effort": "xhigh",
                 "status": "passed",
                 "quota": "available",
                 "fallback": False,
@@ -282,17 +282,55 @@ def _valid_full_qualification(tmp_path: Path) -> dict:
         "repository": "acme/probe",
         "work_id": "qualification",
         "issue": 1,
-        "terminal": {"state": "done"},
+        "release_candidate_sha": "a" * 40,
+        "workflow_candidate_sha": "f" * 40,
+        "terminal": {
+            "state": "done",
+            "work_id": "qualification",
+            "run_id": "workflow-qualification",
+        },
         "required_markers": [
-            "candidate",
+            "agent-loop-command",
             "bundle",
-            "verdict",
-            "ledger",
-            "evidence",
+            "candidate",
             "completion",
+            "evidence",
+            "ledger",
+            "verdict",
         ],
-        "artifacts": [{"path": "coordinator/jobs.json", "sha256": "2" * 64}],
+        "agent_loop_probe": {
+            "schema_version": 1,
+            "executor": "codex",
+            "model_id": "gpt-5.3-codex-spark",
+            "card_id": "worktree-isolation",
+            "builder_job_ids": ["build-job"],
+            "successful_command_count": 1,
+            "all_outputs_nonempty": True,
+            "command_sha256": "5" * 64,
+            "output_sha256": "6" * 64,
+            "log_sha256": "7" * 64,
+            "thread_sha256": "8" * 64,
+            "runtime_model": "gpt-5.3-codex-spark",
+            "runtime_effort": "xhigh",
+            "model_provider": "openai",
+            "probe_candidate_sha": "9" * 40,
+        },
+        "artifacts": [
+            {"path": "coordinator/jobs.json", "sha256": "2" * 64},
+            {
+                "path": "coordinator/commit-spool/build-logs/build-job/job.jsonl",
+                "sha256": "7" * 64,
+            },
+        ],
     }
+    dispatch["agent_loop_probe"]["artifact_set_sha256"] = hashlib.sha256(
+        (
+            json.dumps(
+                dispatch["artifacts"], sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        ).encode()
+    ).hexdigest()
     github = {
         "schema_version": 1,
         "status": "passed",
@@ -385,7 +423,10 @@ def _refresh_full_hashes(tmp_path: Path, payload: dict) -> None:
 
 
 def _run_full_validator(
-    tmp_path: Path, payload: dict
+    tmp_path: Path,
+    payload: dict,
+    *,
+    canary_work_id: str = "qualification",
 ) -> subprocess.CompletedProcess[str]:
     qualification = tmp_path / "qualification.json"
     _write_json(qualification, payload)
@@ -404,6 +445,12 @@ def _run_full_validator(
             "--evidence-root",
             str(tmp_path),
             "--require-canary-profile",
+            "--canary-repository",
+            "acme/probe",
+            "--canary-work-id",
+            canary_work_id,
+            "--canary-issue",
+            "1",
         ],
         cwd=REPO_ROOT,
         text=True,
@@ -675,8 +722,19 @@ def test_qualification_validator_rejects_release_binding_mismatch(
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
-def test_full_suite_validator_checks_evidence_semantics(tmp_path: Path) -> None:
+def test_full_suite_validator_accepts_distinct_candidate_identities(tmp_path: Path) -> None:
     payload = _valid_full_qualification(tmp_path)
+    dispatch = json.loads(
+        (tmp_path / "evidence" / "dispatch-closeout.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {
+        dispatch["release_candidate_sha"],
+        dispatch["workflow_candidate_sha"],
+        dispatch["agent_loop_probe"]["probe_candidate_sha"],
+    } == {"a" * 40, "f" * 40, "9" * 40}
+
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
@@ -867,6 +925,24 @@ def test_full_suite_validator_binds_legacy_deny_only_asset(
         "missing-family-control",
         "provider-self-attestation",
         "nonterminal-dispatch",
+        "unbounded-terminal-dispatch",
+        "unbounded-marker-dispatch",
+        "agent-loop-no-command",
+        "agent-loop-unbounded-command-count",
+        "agent-loop-wrong-model",
+        "agent-loop-wrong-card",
+        "agent-loop-multiple-jobs",
+        "agent-loop-unbounded-job-id",
+        "agent-loop-runtime-model",
+        "agent-loop-log-unbound",
+        "agent-loop-artifact-set",
+        "agent-loop-probe-candidate",
+        "agent-loop-bad-hash",
+        "agent-loop-overlong-artifact-path",
+        "agent-loop-too-many-artifacts",
+        "dispatch-repository",
+        "dispatch-release-candidate",
+        "dispatch-workflow-candidate",
         "changed-remote-refs",
     ],
 )
@@ -893,7 +969,87 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
     elif mutation == "nonterminal-dispatch":
         path = evidence / "dispatch-closeout.json"
         document = json.loads(path.read_text(encoding="utf-8"))
-        document["terminal"] = {"state": "ongoing"}
+        document["terminal"]["state"] = "ongoing"
+    elif mutation == "unbounded-terminal-dispatch":
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["terminal"]["raw_command"] = "/usr/bin/git rev-parse HEAD"
+    elif mutation == "unbounded-marker-dispatch":
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["required_markers"].append(
+            "/usr/bin/git rev-parse HEAD; raw-output"
+        )
+    elif mutation.startswith("agent-loop-"):
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        probe = document["agent_loop_probe"]
+        if mutation == "agent-loop-no-command":
+            probe["successful_command_count"] = 0
+        elif mutation == "agent-loop-unbounded-command-count":
+            probe["successful_command_count"] = 10**100
+        elif mutation == "agent-loop-wrong-model":
+            probe["model_id"] = "gpt-5.4"
+        elif mutation == "agent-loop-wrong-card":
+            probe["card_id"] = "tdd-red"
+        elif mutation == "agent-loop-multiple-jobs":
+            probe["builder_job_ids"] = ["build-job", "another-build-job"]
+        elif mutation == "agent-loop-unbounded-job-id":
+            probe["builder_job_ids"] = ["raw output with spaces" * 100]
+        elif mutation == "agent-loop-runtime-model":
+            probe["runtime_model"] = "gpt-5.4"
+        elif mutation == "agent-loop-log-unbound":
+            probe["log_sha256"] = "9" * 64
+        elif mutation == "agent-loop-artifact-set":
+            probe["artifact_set_sha256"] = "9" * 64
+        elif mutation == "agent-loop-probe-candidate":
+            probe["probe_candidate_sha"] = "not-a-sha"
+        elif mutation == "agent-loop-overlong-artifact-path":
+            document["artifacts"].append(
+                {"path": "coordinator/" + "a" * 129, "sha256": "a" * 64}
+            )
+            probe["artifact_set_sha256"] = hashlib.sha256(
+                (
+                    json.dumps(
+                        document["artifacts"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+            ).hexdigest()
+        elif mutation == "agent-loop-too-many-artifacts":
+            document["artifacts"].extend(
+                {
+                    "path": f"coordinator/evidence/{index}.json",
+                    "sha256": f"{index:064x}",
+                }
+                for index in range(1, 130)
+            )
+            probe["artifact_set_sha256"] = hashlib.sha256(
+                (
+                    json.dumps(
+                        document["artifacts"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+            ).hexdigest()
+        else:
+            probe["command_sha256"] = "not-a-digest"
+    elif mutation == "dispatch-repository":
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["repository"] = "other/repo"
+    elif mutation == "dispatch-release-candidate":
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["release_candidate_sha"] = "f" * 40
+    elif mutation == "dispatch-workflow-candidate":
+        path = evidence / "dispatch-closeout.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["workflow_candidate_sha"] = "not-a-sha"
     else:
         path = evidence / "manager-github-auth.json"
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -903,6 +1059,57 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
 
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode != 0, completed.stdout + completed.stderr
+
+
+def test_canary_validator_requires_external_protected_work_identity(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    qualification = tmp_path / "qualification.json"
+    _write_json(qualification, payload)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--qualification",
+            str(qualification),
+            "--candidate-sha",
+            "a" * 40,
+            "--wheel-sha256",
+            "b" * 64,
+            "--bundle-sha256",
+            "c" * 64,
+            "--evidence-root",
+            str(tmp_path),
+            "--require-canary-profile",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+
+
+def test_canary_validator_rejects_a_self_consistent_overlong_work_id(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    overlong = "a" * 129
+    path = tmp_path / "evidence" / "dispatch-closeout.json"
+    dispatch = json.loads(path.read_text(encoding="utf-8"))
+    dispatch["work_id"] = overlong
+    dispatch["terminal"]["work_id"] = overlong
+    _write_json(path, dispatch)
+    _refresh_full_hashes(tmp_path, payload)
+
+    completed = _run_full_validator(
+        tmp_path, payload, canary_work_id=overlong
+    )
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "protected work identity" in completed.stderr
 
 
 @pytest.mark.parametrize("mutation", ["mixed-model", "quota-denied", "fallback"])

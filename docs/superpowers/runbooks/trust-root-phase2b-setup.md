@@ -1,5 +1,6 @@
 ---
-status: executable
+status: historical
+superseded_by: docs/superpowers/runbooks/trust-root-transactional-install.md
 work_item: trust-root-isolation
 phase: 2b
 audience: operator
@@ -13,17 +14,17 @@ refs:
   - paulsha_cortex/coordinator/job_runner.py
 ---
 
-# trust-root Phase 2b：root 設定 runbook（可執行版．A+B 單一路徑）
+# trust-root Phase 2b：歷史設定紀錄（不可執行）
 
-> **本文件是可執行版**：每一步的命令可直接複製、每一步有驗證、每一步可回滾。
-> 文件本身**不執行任何 root 操作**；所有 `sudo` 都由 operator 親自輸入。
-> **cortex 任何元件永不具 root**——cortex 只**產生**命令字串與驗證結果，
-> root 操作一律由 operator 手動執行（0816 裁決，未決 6）。
+> **不可執行。** 本文件只保留 Phase 2b 的歷史決策、故障證據與舊命令，不能再當作
+> production 部署程序。現行唯一 authority 是
+> `docs/superpowers/runbooks/trust-root-transactional-install.md`；所有安裝、升級、驗證與
+> rollback 必須走其中的 exact-plan SHA confirmation 與 receipt-bound installer。
 
 實作 `trust-root-isolation-spec.md` 的 **Phase 2**（spec §R10 Phase 2 第 1–8 步）。
 Phase 2a 的權限產生器（`paulsha_cortex/trust_root/permgen.py`）把 R1 登記表機械轉成
-目標 `owner:group mode`、systemd unit 與 polkit 規則；本 runbook 是把那份計畫**落到
-OS** 的手動流程。
+目標 `owner:group mode`、systemd unit 與 polkit 規則；本 runbook 保留早期決策脈絡，
+實際升級與回滾一律走新的 transactional install runbook。
 
 ---
 
@@ -37,7 +38,7 @@ OS** 的手動流程。
 | legacy-import | **物理隔離 ＋ hash manifest**（無簽章；簽章屬 Phase 3）。切換前 in-flight job **手動收尾** | 執行前提、第 3 步 |
 | Manager 部署 | **`/opt/cortex`**（root 擁有，對服務唯讀）；system-level unit，`User=cortex-manager` | 第 4 步 |
 | `ReadWritePaths` | **由 R1 登記表經 permgen 機械產生**，不手寫；monitor 再多一層 persona 過濾，嚴格窄於 Manager | 第 4c／4d 步 |
-| root 命令 codify | **不 codify**——不提供 `cortex install trust-root --system`；cortex 只產生命令字串 | 第 6 步 |
+| privileged install | **已由後續 Phase 2 決策取代**：rootless `plan` 與 exact SHA confirmation 分離，`apply`／`activate`／`verify`／`rollback` 只接受 receipt-bound 狀態 | 第 6 步 |
 | R9 | **手動抽驗**（#629 起共**七族**：runbook 族 1–4 ＋ 族 5 privilege-boundary ＋ 族 6 verdict 通道 ＋ 族 7 gate 執行身分。完整自動化矩陣屬另一工項） | 第 8 步 |
 
 > **歷史註記（二分）**：0816 第二輪曾以二分（`cortex-svc` / `cortex-builder`）先行、
@@ -1437,7 +1438,7 @@ SH
 # 🔧 sudo：(2) 移除 pipx_shared.pth —— 部署樹不得再 import operator 的 shared 樹
 sudo find /opt/cortex/venv.new -name "pipx_shared.pth" -print -delete
 #   註：pipx shared 樹裡是 pip／setuptools／wheel，runtime 不需要；部署樹本來就
-#   不該在裡面裝東西（升級走第 6 步整棵替換）。
+#   不該在裡面裝東西（升級走第 6 步 receipt-bound transactional replacement）。
 
 # 🔧 sudo：硬化（順序不可調換——上面兩步要在 a-w 之前做完）
 sudo chown -R root:root /opt/cortex/venv.new
@@ -5112,7 +5113,7 @@ sudo systemctl reset-failed "cortex-job@*" "cortex-job-jit@*" 2>/dev/null || tru
 
 | 殘餘 | 具體形狀 | 現有緩解 | 缺口 |
 |---|---|---|---|
-| **部署樹供應鏈** | 惡意相依／被竄改的 wheel 進到 `/opt/cortex/venv`，之後以 `cortex-manager` 身分執行 | `/opt/cortex` 全 root-owned、對服務唯讀（4a）；升級走第 6 步 operator 手動驗證＋hash diff；**不 codify** root 命令（裁決 6） | 無簽章驗證（屬 **Phase 3**）；hash diff 靠 operator 目視 |
+| **部署樹供應鏈** | 惡意相依／被竄改的 wheel 進到 `/opt/cortex/venv`，之後以 `cortex-manager` 身分執行 | `/opt/cortex` 全 root-owned、對服務唯讀（4a）；第 6 步以 bundle hash、plan SHA、transactional receipt 與 generated-vs-installed attestation 綁定 | 無外部簽章驗證（屬 **Phase 3**）；artifact identity 仍由 release/RC trust chain 提供 |
 | **Manager 自身邏輯被攻陷** | Manager 程式碼路徑被誘導寫出惡意 job-spec | root-owned shim 限定 argv 形狀（5-3）；spec 的 schema 是**白名單**且身分欄位 fail-closed（寫端 `build_job_spec()`、讀端 `job_shim.load_spec()` 各驗一次）；job 仍降到 `cortex-builder`、拿不到 token | shim 只能保證「身分／入口不可選」，**不**保證 command 內容良性——惡意 spec 仍可讓 builder 跑任意命令（上界＝builder 權限）。這條要靠 Manager 端的派工邏輯與 R9 族 2 的檔案邊界共同壓住 |
 | **operator 帳號** | 有 `sudo`，可改任何東西 | 設計上信任邊界之外（本 runbook 全部 root 操作都由 operator 親自輸入） | 不在本階段範圍 |
 | **polkit 不可用** | polkit 掛掉 ⇒ 全部 job 起不來 | fail-closed（安全但功能全停）；執行前提第 6 項＋WSL2 段第 5 項複驗 | 需監控，否則表現為「靜默停擺」 |
@@ -5177,103 +5178,69 @@ sudo systemctl restart cortex-manager.service
 
 ---
 
-## 第 6 步：升級流程（**不 codify**——手動 runbook，cortex 只產生字串）
+## 第 6 步：transactional installer 升級流程
 
-裁決 6：**不**提供 `cortex install trust-root --system` 子命令。把特權操作寫進
-codebase 等於把提權路徑收進攻擊面內；cortex 只負責產生命令字串與驗證，root 由
-operator 手動執行。升級因此是下列固定流程：
+> **現行權威**：早期「不 codify、手動複製 venv」裁決已被 Phase 2 installer 取代。
+> 不再手動 `cp -a`、`chown`、改 shebang 或 `mv /opt/cortex/venv`；這些操作繞過
+> bundle identity、plan confirmation、receipt rollback 與 generated-vs-installed attestation。
 
-```bash
-# ✅ 1. 在 operator 帳號的 pipx 環境驗新版（完全不碰 /opt/cortex）
-pipx upgrade paulsha-cortex     # 或既有 build 流程
-"$HOME/.local/share/pipx/venvs/paulsha-cortex/bin/cortex" --version
-
-# ✅ 2. 差異對照（新舊部署的內容 hash）——供應鏈殘餘風險的唯一人工關卡
-( cd "$HOME/.local/share/pipx/venvs/paulsha-cortex" && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > /tmp/cortex-new.sha
-( cd /opt/cortex/venv && sudo find . -type f -print0 | sort -z | sudo xargs -0 sha256sum ) > /tmp/cortex-cur.sha
-diff <(sort /tmp/cortex-cur.sha) <(sort /tmp/cortex-new.sha) | head -50
-#   ⚠️ 預期會有**兩類與版本無關的固定差異**（第 4a／本步 3a-3b 造成的，不是供應鏈訊號）：
-#     (a) `./bin/*` —— 現行部署的 shebang 已改寫成 /opt/cortex/venv/bin/…
-#     (b) `./lib/python3.*/site-packages/pipx_shared.pth` —— 只存在於 pipx 樹
-#   人工關卡要看的是**扣掉這兩類之後**還有什麼變動：
-diff <(sort /tmp/cortex-cur.sha) <(sort /tmp/cortex-new.sha) \
-  | grep -vE "^[<>] [0-9a-f]{64}  \./(bin/|lib/python3\.[0-9]+/site-packages/pipx_shared\.pth)" \
-  | head -50
-
-# 🔧 3. sudo：旁建新樹（不覆蓋現行）
-#   ⚠️ 與第 4a 步**完全相同**的兩個 pipx 殘留必須在硬化前清掉——升級用的是同一條
-#   `cp -a`，因此同樣會把 operator 樹的 shebang 與 pipx_shared.pth 帶進來。
-#   漏掉的症狀：升級後服務起不來（`Permission denied`），或更糟——起得來但
-#   import path 仍受 operator 可寫目錄影響（見 4a 的表）。
-sudo rm -rf /opt/cortex/venv.new
-sudo cp -a "$HOME/.local/share/pipx/venvs/paulsha-cortex" /opt/cortex/venv.new
-
-# 🔧 3a. sudo：重寫 bin/* 的 shebang 前綴（與 4a 逐字相同）
-sudo env OLD_PREFIX="$HOME/.local/share/pipx/venvs/paulsha-cortex" sh -s <<'SH'
-set -eu
-for f in /opt/cortex/venv.new/bin/*; do
-  [ -f "$f" ] || continue
-  IFS= read -r first < "$f" || continue
-  case "$first" in
-    "#!$OLD_PREFIX/bin/"*) ;;
-    *) continue ;;
-  esac
-  interp=${first#"#!$OLD_PREFIX/bin/"}
-  sed -i "1s|.*|#!/opt/cortex/venv/bin/$interp|" "$f"
-  echo "shebang rewritten: $f -> /opt/cortex/venv/bin/$interp"
-done
-SH
-
-# 🔧 3b. sudo：移除 pipx_shared.pth
-sudo find /opt/cortex/venv.new -name "pipx_shared.pth" -print -delete
-
-# 🔧 3c. sudo：硬化（順序不可調換）
-sudo chown -R root:root /opt/cortex/venv.new
-sudo find /opt/cortex/venv.new -type d -exec chmod 0755 {} +
-sudo find /opt/cortex/venv.new -type f -exec chmod a-w {} +
-sudo find /opt/cortex/venv.new/bin -type f -exec chmod 0755 {} +
-
-# ✅ 3d. 總驗收：新樹裡不得殘留任何指回 operator 樹的路徑
-sudo grep -rIl -- "$HOME/.local/share/pipx" /opt/cortex/venv.new | head    # 期望：空輸出
-sudo find /opt/cortex/venv.new -type l -lname "*/.local/share/pipx/*" | head  # 期望：空輸出
-
-# ✅ 4. 新樹自檢通過才切換
-sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root selfcheck
-sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root equation
-
-# ✅ 5. 登記表若有變動，unit／template／shim 全部必須重新產生
-diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root unit four-way --manager) \
-     /etc/systemd/system/cortex-manager.service || echo "!! manager unit 需更新"
-diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root unit four-way --job) \
-     /etc/systemd/system/cortex-job@.service || echo "!! job template unit (strict) 需更新"
-diff <(python3 -m paulsha_cortex.trust_root unit four-way --job --profile jit) \
-     /etc/systemd/system/cortex-job-jit@.service || echo "!! job template unit (jit) 需更新"
-diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root polkit four-way --template) \
-     /etc/polkit-1/rules.d/49-cortex-downgrade.rules || echo "!! polkit 規則需更新"
-diff <(sudo -u cortex-manager /opt/cortex/venv.new/bin/python -m paulsha_cortex.trust_root shim four-way) \
-     /opt/cortex/bin/cortex-job-shim || echo "!! shim 需更新"
-
-# 🔧 6. sudo：原子切換（保留前一版供回滾）
-sudo systemctl stop cortex-manager.service
-sudo rm -rf /opt/cortex/venv.prev
-sudo mv /opt/cortex/venv /opt/cortex/venv.prev
-sudo mv /opt/cortex/venv.new /opt/cortex/venv
-#   若第 5 步顯示需更新，逐項重新落檔後 `sudo systemctl daemon-reload`
-#   （polkit 規則另需 restart polkit）。
-sudo systemctl start cortex-manager.service
-```
+部署前必須取得同一 candidate SHA 的已驗證 wheelhouse、`bundle.json` 與 deployment
+config。下列路徑只是 operator 明確選定的輸入／輸出；不得從任一 HOME 自動發現
+credential，也不得以其他 plan hash 取代命令輸出的 SHA：
 
 ```bash
-# ✅ 驗證：新版在跑、自檢綠、降權邊界沒被升級順手改掉
-sudo -u cortex-manager /opt/cortex/venv/bin/cortex --version
-systemctl status cortex-manager.service --no-pager | head -5
-sudo -u cortex-manager systemd-run --uid=0 --pipe --wait /bin/id; echo "exit=$?"   # 期望非 0
+# 1. rootless：驗 bundle 並產生 exact desired-state plan
+cortex install trust-root plan \
+  --config /path/to/install-config.yaml \
+  --bundle /path/to/bundle.json \
+  --output /path/to/install-plan.json
+
+# 2. operator 核對上一步輸出的 plan_sha256；receipt 路徑也只能取自同一份 plan
+cortex_plan_sha=$(sha256sum /path/to/install-plan.json | awk '{print $1}')
+cortex_receipt_path=$(python3 -c \
+  'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["receipt_path"])' \
+  /path/to/install-plan.json)
+
+# 3. 以 exact plan identity 明確授權 privileged apply
+sudo cortex install trust-root apply \
+  --plan /path/to/install-plan.json \
+  --confirm-sha256 "$cortex_plan_sha" \
+  --receipt "$cortex_receipt_path"
+
+# 4. 只有 deployment contract 明列需要時才做 explicit credential import。
+#    source 必須是 operator 選定的暫存檔；內容不得出現在 argv、receipt 或 log。
+sudo cortex install trust-root credentials import \
+  --receipt "$cortex_receipt_path" \
+  --principal builder \
+  --provider codex \
+  --source /path/to/operator-selected-credential
+
+# 5. 依固定 egress → Manager → Monitor 順序啟動，再驗 installed state
+sudo cortex install trust-root activate \
+  --receipt "$cortex_receipt_path"
+sudo cortex install trust-root verify \
+  --receipt "$cortex_receipt_path" \
+  --evidence /var/lib/cortex/install/verification.json \
+  --json
 ```
 
-> **不裸 chown**：升級不是「把 headless 產出的檔 chown 給 manager」，而是「operator 驗證
-> 來源後，以 root 身分整棵替換部署樹」。任何 headless 都碰不到 `/opt/cortex`。
-> **回滾**：`sudo systemctl stop cortex-manager; sudo rm -rf /opt/cortex/venv;
-> sudo mv /opt/cortex/venv.prev /opt/cortex/venv; sudo systemctl start cortex-manager`。
+`verify` 必須回傳 PASS／`ok: true` 才能接受升級。它會比對 units、shim、polkit、
+gitconfigs、toolchain wrappers、environment、enforcement、service executable identity
+與 candidate venv tree；functional drift、owner/group/mode 漂移、額外 authority artifact
+或 receipt/plan 不一致都會 fail closed。註解差異只允許明確 category 的 warning。
+
+若 apply／activate／verify 任一步失敗，使用同一 receipt 回滾；rollback 只還原 receipt
+擁有且 current bytes 仍可證明的狀態，遇到外部 drift 會保留並回報，不會強制覆寫：
+
+```bash
+sudo cortex install trust-root rollback \
+  --receipt "$cortex_receipt_path"
+```
+
+Release candidate 的可執行參考流程在 `qualification/run.sh`；release 與 live provider
+canary 的證據邊界在
+`docs/superpowers/runbooks/release-qualification.md`。production 升級仍是獨立、
+需 operator 明確授權的動作，package release 不會自動修改 `/opt/cortex`。
 
 ---
 

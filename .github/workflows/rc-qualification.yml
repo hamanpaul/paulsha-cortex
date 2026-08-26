@@ -173,8 +173,6 @@ jobs:
           if-no-files-found: error
           retention-days: 3
           path: |
-            qualification-input/bundle.json
-            qualification-input/dist/*.whl
-            qualification-input/wheelhouse/*
+            qualification-input/**
             qualification-output/qualification.json
             qualification-output/evidence/**

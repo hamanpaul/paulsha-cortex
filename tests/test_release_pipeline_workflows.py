@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +200,7 @@ def test_release_qualification_is_manual_secret_free_and_sha_pinned() -> None:
     assert "--profile deployment-canary" not in raw
     assert "qualification.json" in raw
     assert "upload-artifact" in lowered
+    assert "qualification-input/**" in raw
     assert "github.sha" in lowered or "github.event.inputs" in lowered
     assert "timeout-minutes" in lowered
     assert "secrets." not in raw
@@ -267,6 +270,7 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
 
     preflight = jobs.get("release-preflight")
     assert isinstance(preflight, dict), "release.yml must define an untagged preflight"
+    assert preflight.get("permissions", {}).get("contents") == "write"
     preflight_runs = _job_step_runs(preflight)
     assert "default-branch head" in preflight_runs
     assert "release dispatch ref is not the default branch" in preflight_runs
@@ -320,6 +324,15 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "--candidate-sha" in gate_runs
     assert "--wheel-sha256" in gate_runs
     assert "sha256sum" in gate_lower
+    assert "qualification/verify_bundle.py" in gate_runs
+    assert "qualification/write_install_config.py" in gate_runs
+    assert "cmp --silent" in gate_runs
+    assert "qualification-input/install-config.yaml" in gate_runs
+    assert "--sort=name" in gate_runs
+    assert "gzip -n" in gate_runs
+    assert "install-input.tar.gz" in gate_runs
+    assert "qualification-manifest" not in gate_runs
+    assert "-qualification.json" in gate_runs
     assert "needs['release-preflight'].outputs.release_sha" in gate_text
     assert "needs['release-preflight'].outputs.rc_run_id" in gate_text
 
@@ -345,6 +358,13 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "repos/${GITHUB_REPOSITORY}/git/refs" in release_runs
     assert "refs/tags/$tag_name" in release_runs
     assert "gh release create" in release_runs
+    assert "expected exactly one wheel, install-input archive, and qualification manifest" in release_runs
+    assert '"${install_inputs[0]}"' in release_runs
+    assert '"${qualification_manifests[0]}"' in release_runs
+    assert "(.assets | length) == 3" in release_runs
+    assert ".digest == $wheel_digest" in release_runs
+    assert ".digest == $install_input_digest" in release_runs
+    assert ".digest == $qualification_digest" in release_runs
     assert '--repo "$GITHUB_REPOSITORY"' in release_runs, (
         "the release job has no checkout, so gh release create must receive "
         "an explicit repository context"
@@ -356,6 +376,12 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "release_transaction_marker" in release_runs
     assert "repos/${GITHUB_REPOSITORY}/releases/$release_id" in release_runs
     assert "release cleanup ownership mismatch" in release_runs
+    assert "owned GitHub Release is already published; retaining release and tag" in release_runs
+    assert 'owned_release_draft=$(jq -er .draft <<<"$owned_release")' in release_runs
+    assert "trap cleanup_release_transaction EXIT" in release_runs
+    assert "trap 'exit 130' INT" in release_runs
+    assert "trap 'exit 143' TERM" in release_runs
+    assert "trap - EXIT INT TERM" in release_runs
     for job_name, job in jobs.items():
         if job_name == "release" or not isinstance(job, dict):
             continue
@@ -367,7 +393,23 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     ), "evidence validation belongs in the required predecessor gate, never after publication"
 
 
-def test_release_asset_failure_removes_owned_release_before_tag(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_returncode", "published_state_survives"),
+    (
+        ("upload", 23, False),
+        ("stale-upload", 23, False),
+        ("term", 143, False),
+        ("double-term", 143, False),
+        ("digest", 1, False),
+        ("post-publish-term", 143, True),
+    ),
+)
+def test_release_transaction_cleanup_respects_publication_boundary(
+    tmp_path: Path,
+    failure_mode: str,
+    expected_returncode: int,
+    published_state_survives: bool,
+) -> None:
     payload = _load_workflow("release.yml")
     release = payload["jobs"]["release"]
     release_runs = _job_step_runs(release)
@@ -378,12 +420,17 @@ def test_release_asset_failure_removes_owned_release_before_tag(tmp_path: Path) 
     state.mkdir()
     dist.mkdir()
     (dist / "candidate.whl").write_bytes(b"qualified wheel")
+    (dist / "candidate-install-input.tar.gz").write_bytes(b"qualified input")
+    (dist / "candidate-qualification.json").write_bytes(b"qualified manifest")
     fake_gh = fake_bin / "gh"
     fake_gh.write_text(
         """#!/usr/bin/env python3
+import hashlib
 import json
 import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -399,9 +446,13 @@ if args[:2] == ["api", "repos/example/cortex"]:
 elif args[:2] == ["api", "repos/example/cortex/git/ref/heads/main"]:
     print(os.environ["RELEASE_SHA"])
 elif "matching-refs/tags" in " ".join(args):
-    print("[]")
+    print(json.dumps([{
+        "ref": "refs/tags/v1.2.3",
+        "object": {"type": "tag", "sha": "b" * 40},
+    }]) if (state / "tag").exists() else "[]")
 elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/tags"):
-    sys.stdin.read()
+    request = json.load(sys.stdin)
+    (state / "tag-message").write_text(request["message"], encoding="utf-8")
     print(json.dumps({"sha": "b" * 40}))
 elif args[:3] == ["api", "--method", "POST"] and args[3].endswith("/git/refs"):
     sys.stdin.read()
@@ -419,22 +470,58 @@ elif args[:2] == ["api", "repos/example/cortex/git/ref/tags/v1.2.3"]:
 elif args[:2] == ["api", "repos/example/cortex/git/tags/" + "b" * 40]:
     print(json.dumps({
         "tag": "v1.2.3",
+        "message": (state / "tag-message").read_text(encoding="utf-8"),
         "object": {"type": "commit", "sha": os.environ["RELEASE_SHA"]},
     }))
 elif args[:2] == ["release", "create"]:
     marker = args[args.index("--notes") + 1]
+    mode = os.environ["FAKE_FAILURE_MODE"]
+    assets = []
+    if mode in {"digest", "post-publish-term"}:
+        assets = [
+            {
+                "name": Path(path).name,
+                "size": Path(path).stat().st_size,
+                "state": "uploaded",
+                "digest": "sha256:" + (
+                    "0" * 64
+                    if mode == "digest"
+                    else hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                ),
+            }
+            for path in args[3:6]
+        ]
     (state / "release.json").write_text(json.dumps({
         "id": 17,
         "tag_name": "v1.2.3",
         "body": marker,
         "draft": True,
-        "assets": [],
+        "assets": assets,
     }), encoding="utf-8")
     record("partial-release-created")
-    raise SystemExit(23)
+    if mode in {"upload", "stale-upload"}:
+        raise SystemExit(23)
+    if mode in {"term", "double-term"}:
+        os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(0.1)
+        raise SystemExit(143)
 elif "releases?per_page=100" in " ".join(args):
+    if os.environ["FAKE_FAILURE_MODE"] == "double-term":
+        os.kill(os.getppid(), signal.SIGTERM)
     release_path = state / "release.json"
     print("[" + release_path.read_text(encoding="utf-8") + "]" if release_path.exists() else "[]")
+elif args[:3] == ["api", "--method", "PATCH"] and args[3].endswith("/releases/17"):
+    request = json.load(sys.stdin)
+    release_path = state / "release.json"
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    release["draft"] = request["draft"]
+    release_path.write_text(json.dumps(release), encoding="utf-8")
+    record("release-published")
+    print(json.dumps(release), flush=True)
+    if os.environ["FAKE_FAILURE_MODE"] == "post-publish-term":
+        os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(0.1)
+        raise SystemExit(143)
 elif args[:3] == ["api", "--method", "DELETE"] and args[3].endswith("/releases/17"):
     (state / "release.json").unlink()
     record("release-deleted")
@@ -442,6 +529,7 @@ elif args[:2] == ["api", "repos/example/cortex/releases/17"]:
     raise SystemExit(1)
 elif args[:3] == ["api", "--method", "DELETE"] and args[3].endswith("/git/refs/tags/v1.2.3"):
     (state / "tag").unlink()
+    (state / "tag-message").unlink(missing_ok=True)
     record("tag-deleted")
 else:
     print("unexpected fake gh argv: " + repr(args), file=sys.stderr)
@@ -455,12 +543,31 @@ else:
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FAKE_GH_STATE": str(state),
+        "FAKE_FAILURE_MODE": failure_mode,
         "GITHUB_REPOSITORY": "example/cortex",
         "GITHUB_RUN_ID": "1234",
         "GITHUB_RUN_ATTEMPT": "1",
         "RELEASE_SHA": release_sha,
         "TAG_NAME": "v1.2.3",
     }
+    if failure_mode == "stale-upload":
+        stale_marker = f"cortex-release-transaction:v1:999:1:{release_sha}"
+        (state / "tag").write_text("b" * 40, encoding="utf-8")
+        (state / "tag-message").write_text(
+            f"Release v1.2.3\n{stale_marker}", encoding="utf-8"
+        )
+        (state / "release.json").write_text(
+            json.dumps(
+                {
+                    "id": 17,
+                    "tag_name": "v1.2.3",
+                    "body": f"<!-- {stale_marker} -->",
+                    "draft": True,
+                    "assets": [],
+                }
+            ),
+            encoding="utf-8",
+        )
 
     result = subprocess.run(
         ["bash", "-c", release_runs],
@@ -471,11 +578,26 @@ else:
         check=False,
     )
 
-    assert result.returncode == 23, result.stderr
+    assert result.returncode == expected_returncode, result.stderr
+    if published_state_survives:
+        release_state = json.loads(
+            (state / "release.json").read_text(encoding="utf-8")
+        )
+        assert release_state["draft"] is False
+        assert (state / "tag").exists()
+        assert (state / "events").read_text(encoding="utf-8").splitlines() == [
+            "partial-release-created",
+            "release-published",
+        ]
+        return
+
     assert not (state / "release.json").exists()
     assert not (state / "tag").exists()
-    assert (state / "events").read_text(encoding="utf-8").splitlines() == [
+    expected_events = [
         "partial-release-created",
         "release-deleted",
         "tag-deleted",
     ]
+    if failure_mode == "stale-upload":
+        expected_events = ["release-deleted", "tag-deleted", *expected_events]
+    assert (state / "events").read_text(encoding="utf-8").splitlines() == expected_events

@@ -743,10 +743,8 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#681'
-      - kind: github_pr
-        ref: 'hamanpaul/paulsha-cortex#789'
-      - kind: openspec
-        ref: 'trust-root-copilot-toolchain-pinning'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/trust-root-copilot-toolchain-pinning/todo.md'
     excludes: []
   trust-root-home-fail-closed:
     title: 'trust-root-home-fail-closed'
@@ -761,20 +759,16 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#695'
-      - kind: github_pr
-        ref: 'hamanpaul/paulsha-cortex#790'
-      - kind: openspec
-        ref: 'generated-asset-attestation'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/generated-asset-attestation/todo.md'
     excludes: []
   trust-root-agent-loop-qualification:
-    title: 'trust-root-agent-loop-qualification'
+    title: 'trust-root-agent-loop-deployment-canary'
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#716'
-      - kind: github_pr
-        ref: 'hamanpaul/paulsha-cortex#791'
-      - kind: openspec
-        ref: 'trust-root-agent-loop-qualification'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/trust-root-agent-loop-qualification/todo.md'
     excludes: []
   manager-gitconfig-delivery:
     title: 'manager-gitconfig-delivery'

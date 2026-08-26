@@ -14,6 +14,7 @@ import subprocess
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
 
@@ -385,6 +386,76 @@ def test_account_state_distinguishes_exact_orphan_group(
     }
 
 
+@pytest.mark.parametrize(
+    "late_state",
+    [
+        {"exists": True, "installed_sha256": "d" * 64},
+        {
+            "exists": False,
+            "group_exists": True,
+            "group_gid": 993,
+            "group_members": [],
+        },
+    ],
+)
+def test_account_backend_rejects_a_late_exact_account_or_group(
+    monkeypatch: pytest.MonkeyPatch,
+    late_state: dict[str, object],
+) -> None:
+    step = {
+        "step_id": "account:cortex-builder",
+        "kind": "account",
+        "name": "cortex-builder",
+        "uid": 993,
+        "gid": 993,
+        "home": "/var/lib/cortex-builder",
+        "login_program": "/usr/sbin/nologin",
+        "desired_sha256": "d" * 64,
+    }
+    monkeypatch.setattr(
+        backend_module,
+        "_account_state",
+        lambda _step: dict(late_state),
+    )
+
+    with pytest.raises(InstallDriftError, match="backend boundary"):
+        LocalInstallBackend(require_root=False).apply_step_checkpointed(
+            step,
+            {"exists": False, "group_exists": False},
+            lambda _authority: None,
+        )
+
+
+def test_asset_backend_rejects_a_leaf_that_appears_after_core_inspection(
+    tmp_path: Path,
+) -> None:
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / "late-unit.service"
+    path.write_text("foreign but exact-looking\n", encoding="utf-8")
+    step = {
+        "step_id": "asset:late-unit",
+        "kind": "asset",
+        "asset_type": "file",
+        "path": str(path),
+        "content": "planned\n",
+        "owner": account,
+        "group": group,
+        "mode": "0600",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+
+    with pytest.raises(InstallDriftError, match="backend boundary"):
+        LocalInstallBackend(require_root=False).apply_step_checkpointed(
+            step,
+            {"exists": False},
+            lambda _authority: None,
+        )
+
+    assert path.read_text(encoding="utf-8") == "foreign but exact-looking\n"
+
+
 def test_venv_step_verifies_locked_wheels_and_atomically_switches_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -521,6 +592,154 @@ def test_venv_step_replays_after_slot_rename_before_link_cutover(
     assert calls == [], "a verified interrupted slot is adopted without reinstall"
 
 
+def test_venv_slot_is_receipt_bound_before_final_name_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = tmp_path / "candidate.whl"
+    wheel.write_bytes(b"candidate")
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    slot = tmp_path / "opt/cortex/venvs" / wheel_sha
+    active = tmp_path / "opt/cortex/venv"
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        if command[:3] == ("python3", "-m", "venv"):
+            temporary = Path(command[3])
+            (temporary / "bin").mkdir()
+            (temporary / "bin/python").write_text("python", encoding="utf-8")
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(slot),
+        "active_link": str(active),
+        "wheel_source": str(wheel),
+        "wheel_sha256": wheel_sha,
+        "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": True,
+        "desired_sha256": wheel_sha,
+    }
+    authorities: list[dict[str, object]] = []
+
+    def checkpoint(authority: Mapping[str, object]) -> None:
+        first_ready = not any(row.get("state") == "ready" for row in authorities)
+        authorities.append(dict(authority))
+        if authority.get("state") == "ready" and first_ready:
+            assert not slot.exists()
+            assert Path(str(authority["staging_path"])).is_dir()
+
+    result = LocalInstallBackend(require_root=False).apply_step_checkpointed(
+        step, {"exists": False}, checkpoint
+    )
+
+    assert result["installed_sha256"] == wheel_sha
+    assert [row["state"] for row in authorities] == [
+        "planned",
+        "building",
+        "ready",
+        "ready",
+    ]
+    assert slot.is_dir()
+    assert active.resolve() == slot
+
+
+def test_venv_post_rename_interruption_replays_from_prepublished_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wheel = tmp_path / "candidate.whl"
+    wheel.write_bytes(b"candidate")
+    wheel_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    slot = tmp_path / "opt/cortex/venvs" / wheel_sha
+    active = tmp_path / "opt/cortex/venv"
+
+    def run(argv, **_kwargs):
+        command = tuple(argv)
+        if command[:3] == ("python3", "-m", "venv"):
+            temporary = Path(command[3])
+            (temporary / "bin").mkdir()
+            (temporary / "bin/python").write_text("python", encoding="utf-8")
+        return _completed(command)
+
+    monkeypatch.setattr(backend_module, "_run", run)
+    step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(slot),
+        "active_link": str(active),
+        "wheel_source": str(wheel),
+        "wheel_sha256": wheel_sha,
+        "wheelhouse": [{"source": str(wheel), "sha256": wheel_sha}],
+        "wheelhouse_locked": True,
+        "desired_sha256": wheel_sha,
+    }
+    authorities: list[dict[str, object]] = []
+    real_rename = backend_module.os.rename
+
+    def rename_then_interrupt(source, destination):
+        real_rename(source, destination)
+        raise SystemExit("simulated interruption after final-slot rename")
+
+    monkeypatch.setattr(backend_module.os, "rename", rename_then_interrupt)
+    backend = LocalInstallBackend(require_root=False)
+    with pytest.raises(SystemExit, match="after final-slot rename"):
+        backend.apply_step_checkpointed(
+            step,
+            {"exists": False},
+            lambda authority: authorities.append(dict(authority)),
+        )
+
+    assert slot.is_dir()
+    assert not active.exists()
+    assert authorities[-1]["state"] == "ready"
+    durable = dict(authorities[-1])
+    monkeypatch.setattr(backend_module.os, "rename", real_rename)
+    replayed: list[dict[str, object]] = []
+    result = backend.apply_step_checkpointed(
+        step,
+        {"exists": False},
+        lambda authority: replayed.append(dict(authority)),
+    )
+    assert replayed == [durable, durable]
+    assert result["installed_sha256"] == wheel_sha
+    assert active.resolve() == slot
+
+
+def test_unknown_scanner_excludes_retained_receipt_bound_venv_slot(
+    tmp_path: Path,
+) -> None:
+    venvs = tmp_path / "opt/cortex/venvs"
+    slot = venvs / ("a" * 64)
+    (slot / "bin").mkdir(parents=True)
+    (slot / "bin/python").write_text("python", encoding="utf-8")
+    directory_step = {
+        "step_id": "asset:venvs",
+        "kind": "asset",
+        "asset_type": "directory",
+        "path": str(venvs),
+    }
+    venv_step = {
+        "step_id": "candidate-venv",
+        "kind": "venv",
+        "path": str(slot),
+    }
+    receipt = InstallReceipt(
+        {
+            "journal": [],
+            "rollback_journal": [
+                {
+                    "step": directory_step,
+                    "prior": {"exists": True, "children": []},
+                },
+                {"step": venv_step, "prior": {"exists": False}},
+            ],
+        }
+    )
+
+    assert LocalInstallBackend(require_root=False).list_unknown_state(receipt) == ()
+
+
 def test_directory_acl_attestation_accounts_for_posix_mask(
     tmp_path: Path,
 ) -> None:
@@ -594,7 +813,11 @@ def test_new_asset_checkpoints_exact_inode_before_followup_mutation(
     monkeypatch.setattr(backend_module, "_read_acl", lambda _path: [])
     backend = LocalInstallBackend(require_root=False)
 
-    outcome = backend.apply_step_checkpointed(step, checkpoint)
+    outcome = backend.apply_step_checkpointed(
+        step,
+        {"exists": False},
+        checkpoint,
+    )
 
     assert checkpoints == [outcome["creation_authority"]]
     assert outcome["installed_sha256"] == step["desired_sha256"]
@@ -727,6 +950,223 @@ def test_existing_directory_drift_is_not_overwritten(tmp_path: Path) -> None:
         LocalInstallBackend(require_root=False).apply_step(step)
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o755
+
+
+def test_file_replacement_binds_prior_inode_and_rolls_back_exact_bytes(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / "cortex-manager.service"
+    path.write_text("old unit\n", encoding="utf-8")
+    path.chmod(0o640)
+    step = {
+        "step_id": "asset:cortex-manager-unit",
+        "kind": "asset",
+        "asset_type": "file",
+        "path": str(path),
+        "content": "new unit\n",
+        "owner": account,
+        "group": group,
+        "mode": "0600",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(step))
+    old_inode = path.stat().st_ino
+    checkpoints: list[dict[str, object]] = []
+
+    outcome = backend.replace_step_checkpointed(
+        step,
+        prior,
+        lambda authority: checkpoints.append(dict(authority)),
+    )
+
+    assert path.read_text(encoding="utf-8") == "new unit\n"
+    assert outcome["installed_sha256"] == step["desired_sha256"]
+    assert checkpoints == [outcome["replacement_authority"]]
+    assert checkpoints[0]["inode"] == old_inode
+    assert path.stat().st_ino != old_inode
+
+    backend.rollback_step(
+        {
+            "step_id": step["step_id"],
+            "step": step,
+            "status": "completed",
+            "prior": prior,
+            "replacement_authority": checkpoints[0],
+            **outcome,
+        }
+    )
+
+    assert path.read_text(encoding="utf-8") == "old unit\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("staging_exact", [True, False])
+def test_prepared_file_replacement_never_false_cleans_a_staging_leaf(
+    tmp_path: Path,
+    staging_exact: bool,
+) -> None:
+    if shutil.which("setfacl") is None or shutil.which("getfacl") is None:
+        pytest.skip("requires acl tools")
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    path = tmp_path / "cortex-monitor.service"
+    path.write_text("old unit\n", encoding="utf-8")
+    path.chmod(0o640)
+    step = {
+        "step_id": "asset:cortex-monitor-unit",
+        "kind": "asset",
+        "asset_type": "file",
+        "path": str(path),
+        "content": "new unit\n",
+        "owner": account,
+        "group": group,
+        "mode": "0600",
+        "acls": [],
+    }
+    step["desired_sha256"] = _desired_digest(step)
+    backend = LocalInstallBackend(require_root=False)
+    prior = dict(backend.inspect_step(step))
+    authority = backend_module._snapshot_authority(
+        path.stat(), file_type="file"
+    )
+    staging = backend_module._replacement_staging_path(step)
+    staging.write_text(
+        "new unit\n" if staging_exact else "partial write",
+        encoding="utf-8",
+    )
+    staging.chmod(0o600)
+    receipt = InstallReceipt(
+        {
+            "state": "applying",
+            "journal": [
+                {
+                    "step_id": step["step_id"],
+                    "step": step,
+                    "status": "prepared",
+                    "prior": prior,
+                    "adopted_from_receipt": True,
+                    "replacement_authority": authority,
+                }
+            ],
+            "services_started": False,
+            "credentials": [],
+        }
+    )
+
+    report = rollback_receipt(receipt, backend=backend)
+
+    assert path.read_text(encoding="utf-8") == "old unit\n"
+    if staging_exact:
+        assert not staging.exists()
+        assert report.retained_drift == ()
+        assert receipt.to_dict()["state"] == "rolled-back"
+    else:
+        assert staging.read_text(encoding="utf-8") == "partial write"
+        assert report.retained_drift[0]["step_id"] == step["step_id"]
+        assert receipt.to_dict()["state"] == "rollback-blocked"
+
+
+def test_repository_replacement_upgrades_and_restores_exact_prior_commit(
+    tmp_path: Path,
+) -> None:
+    def fixture_git(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            argv,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=backend_module._REPOSITORY_GIT_ENV,
+        )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    fixture_git("git", "init", "--quiet", str(source))
+    fixture_git("git", "-C", str(source), "config", "user.name", "Cortex Test")
+    fixture_git(
+        "git",
+        "-C",
+        str(source),
+        "config",
+        "user.email",
+        "cortex@example.invalid",
+    )
+    readme = source / "README.md"
+    readme.write_text("old\n", encoding="utf-8")
+    fixture_git("git", "-C", str(source), "add", "README.md")
+    fixture_git("git", "-C", str(source), "commit", "--quiet", "-m", "old")
+    old_commit = fixture_git(
+        "git", "-C", str(source), "rev-parse", "HEAD"
+    ).stdout.strip()
+    readme.write_text("new\n", encoding="utf-8")
+    fixture_git("git", "-C", str(source), "commit", "--quiet", "-am", "new")
+    new_commit = fixture_git(
+        "git", "-C", str(source), "rev-parse", "HEAD"
+    ).stdout.strip()
+    bundle = tmp_path / "source.bundle"
+    fixture_git("git", "-C", str(source), "bundle", "create", str(bundle), "HEAD")
+
+    account = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    destination = tmp_path / "installed"
+    remote = "https://github.com/hamanpaul/paulsha-cortex.git"
+
+    def repository_step(commit: str, digest: str) -> dict[str, object]:
+        return {
+            "step_id": "repository:paulsha-cortex",
+            "kind": "repository",
+            "slug": "paulsha-cortex",
+            "source": str(bundle),
+            "source_sha256": backend_module._sha256_file(bundle),
+            "path": str(destination),
+            "owner": account,
+            "group": group,
+            "mode": "0755",
+            "commit": commit,
+            "remote": remote,
+            "desired_sha256": digest,
+        }
+
+    backend = LocalInstallBackend(require_root=False)
+    old_step = repository_step(old_commit, "a" * 64)
+    new_step = repository_step(new_commit, "b" * 64)
+    backend.apply_step(old_step)
+    prior = dict(backend.inspect_step(new_step))
+    prior_inode = destination.stat().st_ino
+    checkpoints: list[dict[str, object]] = []
+
+    outcome = backend.replace_step_checkpointed(
+        new_step,
+        prior,
+        lambda authority: checkpoints.append(dict(authority)),
+    )
+
+    assert outcome["installed_sha256"] == new_step["desired_sha256"]
+    assert outcome["commit"] == new_commit
+    assert (destination / "README.md").read_text(encoding="utf-8") == "new\n"
+    assert checkpoints[0]["inode"] == prior_inode
+    assert backend.creation_authority_matches(new_step, checkpoints[0])
+
+    backend.rollback_step(
+        {
+            "step_id": new_step["step_id"],
+            "step": new_step,
+            "status": "completed",
+            "prior": prior,
+            "replacement_authority": checkpoints[0],
+            **outcome,
+        }
+    )
+
+    restored = backend.inspect_step(old_step)
+    assert restored["installed_sha256"] == old_step["desired_sha256"]
+    assert restored["commit"] == old_commit
+    assert (destination / "README.md").read_text(encoding="utf-8") == "old\n"
 
 
 def test_directory_acl_attestation_ignores_semantically_irrelevant_order(

@@ -28,6 +28,7 @@ from .core import (
     rollback_receipt,
     validate_apply_plan,
     validate_bundle_manifest,
+    validate_prior_receipt_handoff,
     validate_preflight,
     verify_receipt,
 )

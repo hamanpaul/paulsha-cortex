@@ -110,7 +110,8 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    Manager 同帳號執行（現行行為）。設為 `systemd-run` 後，builder persona 的 job 改以
    `systemd-run --uid=cortex-builder` 的 transient unit 執行，只帶白名單 env（**不含任何
    token**）。**這個開關要在 `cortex-builder` 帳號與 polkit 規則就位之後才可打開**，
-   步驟見 `docs/superpowers/runbooks/trust-root-phase2b-setup.md` 第 5 步；相關選配變數
+   步驟見 `docs/superpowers/runbooks/trust-root-transactional-install.md`；歷史 Phase 2b
+   手工命令已標記為不可執行。相關選配變數
    為 `PSC_BUILDER_ACCOUNT`／`PSC_BUILDER_GROUP`／`PSC_BUILDER_HOME`。
 
    **`systemd-template` 是定案路徑（0816 第三輪裁決 B 案），涵蓋面比上一段廣**：

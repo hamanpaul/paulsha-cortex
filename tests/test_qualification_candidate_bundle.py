@@ -125,6 +125,7 @@ def test_candidate_builder_emits_and_verifies_the_exact_six_tool_roster(
     )
     bundle = root / "bundle.json"
     bundle.write_text(json.dumps(payload), encoding="utf-8")
+    (root / "install-config.yaml").write_text("{}\n", encoding="utf-8")
 
     assert {row["name"] for row in payload["toolchain"]} == {
         "codex",
@@ -139,6 +140,33 @@ def test_candidate_builder_emits_and_verifies_the_exact_six_tool_roster(
         candidate_sha=candidate_sha,
         wheel_sha256=_sha256(wheel),
     )
+
+
+def test_bundle_verifier_rejects_incomplete_or_hardlinked_install_input(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "candidate"
+    for directory in ("dist", "wheelhouse", "toolchain", "source"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    bundle = root / "bundle.json"
+    bundle.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="root inventory"):
+        validate_bundle(
+            bundle,
+            candidate_sha="a" * 40,
+            wheel_sha256="b" * 64,
+        )
+
+    config = root / "install-config.yaml"
+    config.write_text("{}\n", encoding="utf-8")
+    os.link(config, tmp_path / "install-config-copy.yaml")
+    with pytest.raises(ValueError, match="single-link regular file"):
+        validate_bundle(
+            bundle,
+            candidate_sha="a" * 40,
+            wheel_sha256="b" * 64,
+        )
 
 
 def test_candidate_member_rejects_an_in_root_symlink_ancestor(tmp_path: Path) -> None:

@@ -19,6 +19,9 @@ permissions:
 jobs:
   release-preflight:
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
     outputs:
       release_sha: ${{ steps.preflight.outputs.release_sha }}
       tag_name: ${{ steps.preflight.outputs.tag_name }}
@@ -68,20 +71,69 @@ jobs:
           if [[ "$existing" != null ]]; then
             ref_type=$(jq -r .object.type <<<"$existing")
             ref_sha=$(jq -r .object.sha <<<"$existing")
-            if [[ "$ref_type" == tag ]]; then
-              tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$ref_sha")
-              target_type=$(jq -r .object.type <<<"$tag_object")
-              target_sha=$(jq -r .object.sha <<<"$tag_object")
-            else
-              target_type=$ref_type
-              target_sha=$ref_sha
-            fi
+            [[ "$ref_type" == tag ]] || {
+              echo "::error::existing release tag is not an annotated workflow tag"
+              exit 1
+            }
+            tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$ref_sha")
+            target_type=$(jq -r .object.type <<<"$tag_object")
+            target_sha=$(jq -r .object.sha <<<"$tag_object")
             if [[ "$target_type" != commit || "$target_sha" != "$release_sha" ]]; then
               echo "::error::tag target mismatch for $tag_name"
-            else
-              echo "::error::tag already exists for $tag_name"
+              exit 1
             fi
-            exit 1
+            stale_marker=$(jq -er \
+              --arg title "Release $tag_name" \
+              --arg sha "$release_sha" '
+              (.message | split("\n")) as $lines
+              | ($lines[1] // "" | split(":")) as $marker
+              | if ($lines | length) == 2 and $lines[0] == $title and
+                   ($marker | length) == 5 and
+                   $marker[0] == "cortex-release-transaction" and
+                   $marker[1] == "v1" and
+                   ($marker[2] | test("^[0-9]+$")) and
+                   ($marker[3] | test("^[0-9]+$")) and
+                   $marker[4] == $sha
+                then $lines[1] else empty end
+            ' <<<"$tag_object") || {
+              echo "::error::tag already exists for $tag_name"
+              exit 1
+            }
+            release_pages=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+            stale_release=$(jq -sc --arg tag "$tag_name" '
+              [.[][] | select(.tag_name == $tag)]
+              | if length == 0 then null
+                elif length == 1 then .[0]
+                else error("duplicate exact-tag releases") end
+            ' <<<"$release_pages")
+            if [[ "$stale_release" != null ]]; then
+              stale_release_id=$(jq -er .id <<<"$stale_release")
+              jq -e --arg marker "<!-- $stale_marker -->" '
+                .draft == true and ((.body // "") | contains($marker))
+              ' <<<"$stale_release" >/dev/null || {
+                echo "::error::existing release is not an owned stale draft"
+                exit 1
+              }
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/$stale_release_id" >/dev/null
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/$stale_release_id" \
+                >/dev/null 2>&1; then
+                echo "::error::stale draft release still exists after reconciliation"
+                exit 1
+              fi
+            fi
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/$tag_name" >/dev/null
+            reconciled_refs=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/$tag_name")
+            jq -se --arg ref "refs/tags/$tag_name" '
+              [.[][] | select(.ref == $ref)] | length == 0
+            ' <<<"$reconciled_refs" >/dev/null || {
+              echo "::error::stale release tag still exists after reconciliation"
+              exit 1
+            }
+            echo "::notice::reconciled an exact owned stale release transaction"
           fi
 
           tests_runs=$(gh api --method GET \
@@ -270,7 +322,7 @@ jobs:
           name: rc-qualification-${{ needs['release-preflight'].outputs.release_sha }}
           path: rc-candidate
 
-      - name: Verify exact wheel hash and qualification binding
+      - name: Verify complete install input and qualification binding
         env:
           RELEASE_SHA: ${{ needs['release-preflight'].outputs.release_sha }}
         run: |
@@ -318,6 +370,19 @@ jobs:
             echo "::error::bundle wheel hash does not match the RC wheel"
             exit 1
           }
+          python qualification/verify_bundle.py \
+            --bundle "$bundle_path" \
+            --candidate-sha "$RELEASE_SHA" \
+            --wheel-sha256 "$qualified_sha"
+          python qualification/write_install_config.py \
+            --bundle "$bundle_path" \
+            --output "$RUNNER_TEMP/expected-install-config.yaml"
+          cmp --silent \
+            "$RUNNER_TEMP/expected-install-config.yaml" \
+            rc-candidate/qualification-input/install-config.yaml || {
+            echo "::error::RC install config is not the canonical config for its bundle"
+            exit 1
+          }
           python qualification/validate.py \
             --qualification "$qualification_path" \
             --candidate-sha "$RELEASE_SHA" \
@@ -326,16 +391,35 @@ jobs:
             --evidence-root rc-candidate/qualification-output \
             --require-release-profile
 
-      - name: Stage the same wheel used by RC
+      - name: Stage RC-qualified wheel and complete install input
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
+          export LC_ALL=C
           mkdir qualified-dist
+          qualification_path=rc-candidate/qualification-output/qualification.json
           cp rc-candidate/qualification-input/dist/*.whl qualified-dist/
+          qualification_manifest="qualified-dist/paulsha-cortex-${RELEASE_VERSION}-qualification.json"
+          cp "$qualification_path" "$qualification_manifest"
+          install_input="qualified-dist/paulsha-cortex-${RELEASE_VERSION}-install-input.tar.gz"
+          tar \
+            --sort=name \
+            --mtime='@0' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --format=gnu \
+            -C rc-candidate \
+            -cf - qualification-input | gzip -n > "$install_input"
+          gzip --test "$install_input"
 
-      - name: Upload release-authoritative wheel
+      - name: Upload release-authoritative artifacts
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         with:
           name: qualified-dist
-          path: qualified-dist/*.whl
+          if-no-files-found: error
+          path: qualified-dist/*
 
   release:
     runs-on: ubuntu-latest
@@ -344,7 +428,7 @@ jobs:
       actions: read
       contents: write
     steps:
-      - name: Download release-authoritative wheel
+      - name: Download release-authoritative artifacts
         uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e  # v4.2.1
         with:
           name: qualified-dist
@@ -377,32 +461,89 @@ jobs:
           if [[ "$existing" != null ]]; then
             ref_type=$(jq -r .object.type <<<"$existing")
             ref_sha=$(jq -r .object.sha <<<"$existing")
-            if [[ "$ref_type" == tag ]]; then
-              tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$ref_sha")
-              target_type=$(jq -r .object.type <<<"$tag_object")
-              target_sha=$(jq -r .object.sha <<<"$tag_object")
-            else
-              target_type=$ref_type
-              target_sha=$ref_sha
-            fi
+            [[ "$ref_type" == tag ]] || {
+              echo "::error::existing release tag is not an annotated workflow tag"
+              exit 1
+            }
+            tag_object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$ref_sha")
+            target_type=$(jq -r .object.type <<<"$tag_object")
+            target_sha=$(jq -r .object.sha <<<"$tag_object")
             if [[ "$target_type" != commit || "$target_sha" != "$release_sha" ]]; then
               echo "::error::tag target mismatch for $tag_name"
-            else
-              echo "::error::tag already exists for $tag_name"
+              exit 1
             fi
-            exit 1
+            stale_marker=$(jq -er \
+              --arg title "Release $tag_name" \
+              --arg sha "$release_sha" '
+              (.message | split("\n")) as $lines
+              | ($lines[1] // "" | split(":")) as $marker
+              | if ($lines | length) == 2 and $lines[0] == $title and
+                   ($marker | length) == 5 and
+                   $marker[0] == "cortex-release-transaction" and
+                   $marker[1] == "v1" and
+                   ($marker[2] | test("^[0-9]+$")) and
+                   ($marker[3] | test("^[0-9]+$")) and
+                   $marker[4] == $sha
+                then $lines[1] else empty end
+            ' <<<"$tag_object") || {
+              echo "::error::tag already exists for $tag_name"
+              exit 1
+            }
+            release_pages=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+            stale_release=$(jq -sc --arg tag "$tag_name" '
+              [.[][] | select(.tag_name == $tag)]
+              | if length == 0 then null
+                elif length == 1 then .[0]
+                else error("duplicate exact-tag releases") end
+            ' <<<"$release_pages")
+            if [[ "$stale_release" != null ]]; then
+              stale_release_id=$(jq -er .id <<<"$stale_release")
+              jq -e --arg marker "<!-- $stale_marker -->" '
+                .draft == true and ((.body // "") | contains($marker))
+              ' <<<"$stale_release" >/dev/null || {
+                echo "::error::existing release is not an owned stale draft"
+                exit 1
+              }
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/$stale_release_id" >/dev/null
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/$stale_release_id" \
+                >/dev/null 2>&1; then
+                echo "::error::stale draft release still exists after reconciliation"
+                exit 1
+              fi
+            fi
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/$tag_name" >/dev/null
+            reconciled_refs=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/$tag_name")
+            jq -se --arg ref "refs/tags/$tag_name" '
+              [.[][] | select(.ref == $ref)] | length == 0
+            ' <<<"$reconciled_refs" >/dev/null || {
+              echo "::error::stale release tag still exists after reconciliation"
+              exit 1
+            }
+            echo "::notice::reconciled an exact owned stale release transaction"
           fi
 
           mapfile -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print)
-          ((${#wheels[@]} == 1)) || {
-            echo "::error::expected exactly one release-authoritative wheel"
+          mapfile -t install_inputs < <(
+            find dist -maxdepth 1 -type f -name '*-install-input.tar.gz' -print
+          )
+          mapfile -t qualification_manifests < <(
+            find dist -maxdepth 1 -type f -name '*-qualification.json' -print
+          )
+          mapfile -t release_assets < <(find dist -maxdepth 1 -type f -print)
+          ((${#wheels[@]} == 1 && ${#install_inputs[@]} == 1 && \
+             ${#qualification_manifests[@]} == 1 && ${#release_assets[@]} == 3)) || {
+            echo "::error::expected exactly one wheel, install-input archive, and qualification manifest"
             exit 1
           }
 
           tag_created=false
           tag_object_sha=
           release_id=
-          release_transaction_marker=
+          release_transaction_marker="cortex-release-transaction:v1:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${release_sha}"
 
           find_owned_release() {
             local pages
@@ -422,7 +563,8 @@ jobs:
 
           cleanup_release_transaction() {
             original_status=$?
-            trap - ERR
+            trap - EXIT
+            trap '' INT TERM
             set +e
             if [[ "$tag_created" != true || -z "$tag_object_sha" ]]; then
               exit "$original_status"
@@ -445,6 +587,11 @@ jobs:
               owned_release_id=$(jq -er .id <<<"$owned_release")
               owned_tag=$(jq -er .tag_name <<<"$owned_release")
               owned_body=$(jq -er '.body // ""' <<<"$owned_release")
+              owned_release_draft=$(jq -er .draft <<<"$owned_release")
+              if [[ "$owned_release_draft" != true ]]; then
+                echo "::warning::owned GitHub Release is already published; retaining release and tag"
+                exit "$original_status"
+              fi
               if [[ "$owned_tag" != "$tag_name" || \
                     "$owned_body" != *"$release_transaction_marker"* ]]; then
                 echo "::warning::release cleanup ownership mismatch; retaining release and tag"
@@ -469,22 +616,24 @@ jobs:
               echo "::warning::failed to roll back release tag ref"
             exit "$original_status"
           }
-          trap cleanup_release_transaction ERR
+          trap cleanup_release_transaction EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
 
+          tag_message=$(printf 'Release %s\n%s' "$tag_name" "$release_transaction_marker")
           tag_object=$(jq -n \
             --arg tag "$tag_name" \
-            --arg message "Release $tag_name" \
+            --arg message "$tag_message" \
             --arg object "$release_sha" \
             '{tag: $tag, message: $message, object: $object, type: "commit"}' | \
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/git/tags" --input -)
           tag_object_sha=$(jq -er .sha <<<"$tag_object")
+          tag_created=true
           jq -n --arg ref "refs/tags/$tag_name" --arg sha "$tag_object_sha" \
             '{ref: $ref, sha: $sha}' | \
             gh api --method POST \
               "repos/${GITHUB_REPOSITORY}/git/refs" --input - >/dev/null
-          tag_created=true
-          release_transaction_marker="cortex-release-transaction:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${release_sha}:${tag_object_sha}"
 
           created_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag_name")
           created_tag=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$tag_object_sha")
@@ -499,13 +648,16 @@ jobs:
           jq -e \
             --arg tag "$tag_name" \
             --arg sha "$release_sha" \
-            '.tag == $tag and .object.type == "commit" and .object.sha == $sha' \
+            --arg message "$tag_message" \
+            '.tag == $tag and .message == $message and
+             .object.type == "commit" and .object.sha == $sha' \
             <<<"$created_tag" >/dev/null || {
               echo "::error::created annotated tag target failed verification"
               false
             }
 
-          gh release create "$tag_name" "${wheels[0]}" \
+          gh release create "$tag_name" "${wheels[0]}" "${install_inputs[0]}" \
+            "${qualification_manifests[0]}" \
             --repo "$GITHUB_REPOSITORY" \
             --draft \
             --verify-tag \
@@ -522,18 +674,43 @@ jobs:
           release_id=$(jq -er .id <<<"$owned_release")
           wheel_name=$(basename "${wheels[0]}")
           wheel_size=$(stat --format=%s "${wheels[0]}")
+          wheel_digest="sha256:$(sha256sum "${wheels[0]}" | awk '{print $1}')"
+          install_input_name=$(basename "${install_inputs[0]}")
+          install_input_size=$(stat --format=%s "${install_inputs[0]}")
+          install_input_digest="sha256:$(sha256sum "${install_inputs[0]}" | awk '{print $1}')"
+          qualification_name=$(basename "${qualification_manifests[0]}")
+          qualification_size=$(stat --format=%s "${qualification_manifests[0]}")
+          qualification_digest="sha256:$(sha256sum "${qualification_manifests[0]}" | awk '{print $1}')"
           jq -e \
             --arg tag "$tag_name" \
             --arg marker "$release_transaction_marker" \
             --arg wheel "$wheel_name" \
-            --argjson size "$wheel_size" '
+            --arg install_input "$install_input_name" \
+            --arg qualification "$qualification_name" \
+            --arg wheel_digest "$wheel_digest" \
+            --arg install_input_digest "$install_input_digest" \
+            --arg qualification_digest "$qualification_digest" \
+            --argjson wheel_size "$wheel_size" \
+            --argjson install_input_size "$install_input_size" \
+            --argjson qualification_size "$qualification_size" '
             .tag_name == $tag and
             .draft == true and
             ((.body // "") | contains($marker)) and
-            (.assets | length) == 1 and
-            (.assets[0].name == $wheel) and
-            (.assets[0].size == $size) and
-            (.assets[0].state == "uploaded")
+            (.assets | length) == 3 and
+            ([.assets[]
+              | select(.name == $wheel and .size == $wheel_size and
+                       .state == "uploaded" and
+                       .digest == $wheel_digest)] | length) == 1 and
+            ([.assets[]
+              | select(.name == $install_input and
+                       .size == $install_input_size and
+                       .state == "uploaded" and
+                       .digest == $install_input_digest)] | length) == 1 and
+            ([.assets[]
+              | select(.name == $qualification and
+                       .size == $qualification_size and
+                       .state == "uploaded" and
+                       .digest == $qualification_digest)] | length) == 1
           ' <<<"$owned_release" >/dev/null || {
             echo "::error::draft release asset or ownership verification failed"
             false
@@ -553,4 +730,4 @@ jobs:
             false
           }
           tag_created=false
-          trap - ERR
+          trap - EXIT INT TERM

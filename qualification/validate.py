@@ -18,6 +18,10 @@ from typing import Any, NoReturn
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+WORK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MAX_AGENT_LOOP_COMMANDS = 128
+MAX_DISPATCH_ARTIFACTS = 128
+MAX_DISPATCH_ARTIFACT_PATH_CHARS = 128
 IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 WHEEL_NAME = re.compile(r"^[A-Za-z0-9_.+-]+\.whl$")
 ROOT_KEYS = {
@@ -36,8 +40,12 @@ ROOT_KEYS = {
 REQUIRED_PROVIDERS = {
     "agy": ("gemini-3.7-flash", "high"),
     "copilot": ("gpt-5.4", "xhigh"),
-    "codex": ("gpt-5", "normal"),
+    "codex": ("gpt-5.3-codex-spark", "xhigh"),
 }
+REPOSITORY = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$"
+)
 QUALIFICATION_PROFILES = {"release", "deployment-canary"}
 BASE_TESTS = {"fresh-install"}
 REQUIRED_RELEASE_SERVICES = {
@@ -244,6 +252,9 @@ def _validate_profile_artifacts(
     evidence_root: Path,
     artifact_hashes: dict[str, str],
     include_canary: bool,
+    canary_repository: str | None = None,
+    canary_work_id: str | None = None,
+    canary_issue: int | None = None,
 ) -> None:
     """Validate evidence semantics, not merely candidate-supplied filenames and hashes."""
 
@@ -534,19 +545,66 @@ def _validate_profile_artifacts(
             "repository",
             "work_id",
             "issue",
+            "release_candidate_sha",
+            "workflow_candidate_sha",
             "terminal",
             "required_markers",
+            "agent_loop_probe",
             "artifacts",
         },
     )
     if dispatch["schema_version"] != 1 or dispatch["status"] != "passed":
         _fail("dispatch-closeout must pass")
-    terminal_states = _normalized_keys(
-        dispatch["terminal"], {"state", "status", "lifecycle"}
+    repository = _nonempty_string(
+        dispatch["repository"], "dispatch-closeout.repository"
     )
-    if not terminal_states & {"done", "delivered", "closed"}:
+    work_id = _nonempty_string(dispatch["work_id"], "dispatch-closeout.work_id")
+    issue = dispatch["issue"]
+    release_candidate = _nonempty_string(
+        dispatch["release_candidate_sha"],
+        "dispatch-closeout.release_candidate_sha",
+    )
+    workflow_candidate = _nonempty_string(
+        dispatch["workflow_candidate_sha"],
+        "dispatch-closeout.workflow_candidate_sha",
+    )
+    if (
+        REPOSITORY.fullmatch(repository) is None
+        or WORK_ID.fullmatch(work_id) is None
+        or isinstance(issue, bool)
+        or not isinstance(issue, int)
+        or issue <= 0
+        or SHA40.fullmatch(release_candidate) is None
+        or release_candidate != qualification["candidate_sha"]
+        or SHA40.fullmatch(workflow_candidate) is None
+    ):
+        _fail("dispatch-closeout protected work identity is invalid")
+    if (
+        canary_repository is None
+        or canary_work_id is None
+        or canary_issue is None
+        or repository != canary_repository
+        or work_id != canary_work_id
+        or issue != canary_issue
+    ):
+        _fail("dispatch-closeout does not match the external canary identity")
+    terminal = _mapping(
+        dispatch["terminal"],
+        "dispatch-closeout.terminal",
+        {"state", "work_id", "run_id"},
+    )
+    terminal_run_id = _nonempty_string(
+        terminal["run_id"], "dispatch-closeout.terminal.run_id"
+    )
+    if (
+        terminal["state"] != "done"
+        or terminal["work_id"] != work_id
+        or len(terminal_run_id) > 128
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", terminal_run_id) is None
+    ):
         _fail("dispatch-closeout terminal payload is not terminal")
     required_markers = {
+        "agent-loop-command",
         "candidate",
         "bundle",
         "verdict",
@@ -554,15 +612,120 @@ def _validate_profile_artifacts(
         "evidence",
         "completion",
     }
-    if not required_markers <= set(
-        _list(dispatch["required_markers"], "dispatch-closeout.required_markers")
+    observed_markers = _list(
+        dispatch["required_markers"], "dispatch-closeout.required_markers"
+    )
+    if observed_markers != sorted(required_markers):
+        _fail("dispatch-closeout marker set is not the exact bounded contract")
+    probe = _mapping(
+        dispatch["agent_loop_probe"],
+        "dispatch-closeout.agent_loop_probe",
+        {
+            "schema_version",
+            "executor",
+            "model_id",
+            "card_id",
+            "builder_job_ids",
+            "successful_command_count",
+            "all_outputs_nonempty",
+            "command_sha256",
+            "output_sha256",
+            "log_sha256",
+            "thread_sha256",
+            "artifact_set_sha256",
+            "runtime_model",
+            "runtime_effort",
+            "model_provider",
+            "probe_candidate_sha",
+        },
+    )
+    builder_job_ids = [
+        _nonempty_string(value, f"dispatch-closeout.agent_loop_probe.builder_job_ids[{index}]")
+        for index, value in enumerate(
+            _list(
+                probe["builder_job_ids"],
+                "dispatch-closeout.agent_loop_probe.builder_job_ids",
+            )
+        )
+    ]
+    command_count = probe["successful_command_count"]
+    if (
+        probe["schema_version"] != 1
+        or probe["executor"] != "codex"
+        or probe["model_id"] != "gpt-5.3-codex-spark"
+        or probe["card_id"] != "worktree-isolation"
+        or len(builder_job_ids) != 1
+        or len(builder_job_ids) != len(set(builder_job_ids))
+        or any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", job_id) is None
+            for job_id in builder_job_ids
+        )
+        or probe["runtime_model"] != "gpt-5.3-codex-spark"
+        or probe["runtime_effort"] != "xhigh"
+        or probe["model_provider"] != "openai"
+        or not isinstance(probe["probe_candidate_sha"], str)
+        or SHA40.fullmatch(probe["probe_candidate_sha"]) is None
+        or isinstance(command_count, bool)
+        or not isinstance(command_count, int)
+        or command_count <= 0
+        or command_count > MAX_AGENT_LOOP_COMMANDS
+        or probe["all_outputs_nonempty"] is not True
     ):
-        _fail("dispatch-closeout is missing a required terminal artifact class")
+        _fail("dispatch-closeout Codex agent-loop observation is invalid")
+    for field in (
+        "command_sha256",
+        "output_sha256",
+        "log_sha256",
+        "thread_sha256",
+        "artifact_set_sha256",
+    ):
+        _digest(probe[field], f"dispatch-closeout.agent_loop_probe.{field}")
     dispatch_artifacts = _list(dispatch["artifacts"], "dispatch-closeout.artifacts")
+    if len(dispatch_artifacts) > MAX_DISPATCH_ARTIFACTS:
+        _fail("dispatch-closeout artifact inventory exceeds the evidence bound")
+    dispatch_paths: set[str] = set()
+    dispatch_hashes: set[str] = set()
     for index, raw in enumerate(dispatch_artifacts):
         row = _mapping(raw, f"dispatch-closeout.artifacts[{index}]", {"path", "sha256"})
-        _nonempty_string(row["path"], f"dispatch-closeout.artifacts[{index}].path")
-        _digest(row["sha256"], f"dispatch-closeout.artifacts[{index}].sha256")
+        artifact_path = _nonempty_string(
+            row["path"], f"dispatch-closeout.artifacts[{index}].path"
+        )
+        pure = PurePosixPath(artifact_path)
+        digest = _digest(
+            row["sha256"], f"dispatch-closeout.artifacts[{index}].sha256"
+        )
+        if (
+            pure.is_absolute()
+            or ".." in pure.parts
+            or "\x00" in artifact_path
+            or not pure.parts
+            or len(artifact_path) > MAX_DISPATCH_ARTIFACT_PATH_CHARS
+            or artifact_path in dispatch_paths
+            or digest in dispatch_hashes
+        ):
+            _fail("dispatch-closeout artifact inventory is unsafe or duplicated")
+        dispatch_paths.add(artifact_path)
+        dispatch_hashes.add(digest)
+    observed_set_sha = hashlib.sha256(
+        (
+            json.dumps(
+                dispatch_artifacts,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+    ).hexdigest()
+    if probe["artifact_set_sha256"] != observed_set_sha:
+        _fail("dispatch-closeout artifact set is not bound to the agent-loop probe")
+    log_matches = [
+        row
+        for row in dispatch_artifacts
+        if row["sha256"] == probe["log_sha256"]
+        and str(row["path"]).endswith("/job.jsonl")
+    ]
+    if len(log_matches) != 1:
+        _fail("dispatch-closeout agent-loop log digest has no unique artifact binding")
 
     github = _mapping(
         _artifact_json(evidence_root, "evidence/manager-github-auth.json"),
@@ -584,6 +747,7 @@ def _validate_profile_artifacts(
         or github["authenticated"] is not True
         or github["dry_run"] is not True
         or github["remote_refs_unchanged"] is not True
+        or github["repository"] != repository
     ):
         _fail("manager-github-auth did not pass its authenticated dry-run probe")
     before = _digest(github["before_sha256"], "manager-github-auth.before_sha256")
@@ -605,6 +769,9 @@ def validate(
     evidence_root: Path | None = None,
     require_release_profile: bool = False,
     require_canary_profile: bool = False,
+    canary_repository: str | None = None,
+    canary_work_id: str | None = None,
+    canary_issue: int | None = None,
 ) -> None:
     """Validate schema, release binding, and every fail-closed verdict."""
 
@@ -622,6 +789,12 @@ def validate(
         _fail("qualification profile is not release")
     if require_canary_profile and profile != "deployment-canary":
         _fail("qualification profile is not deployment-canary")
+    if require_canary_profile and (
+        canary_repository is None
+        or canary_work_id is None
+        or canary_issue is None
+    ):
+        _fail("full deployment-canary validation requires external canary identity")
     require_profile_suite = require_release_profile or require_canary_profile
 
     evidence_sha = _nonempty_string(root["candidate_sha"], "$.candidate_sha")
@@ -819,6 +992,9 @@ def validate(
             evidence_root=evidence_root,
             artifact_hashes=artifact_hashes,
             include_canary=profile == "deployment-canary",
+            canary_repository=canary_repository,
+            canary_work_id=canary_work_id,
+            canary_issue=canary_issue,
         )
 
 
@@ -829,6 +1005,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wheel-sha256", required=True)
     parser.add_argument("--bundle-sha256")
     parser.add_argument("--evidence-root", type=Path)
+    parser.add_argument("--canary-repository")
+    parser.add_argument("--canary-work-id")
+    parser.add_argument("--canary-issue", type=int)
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument("--require-release-profile", action="store_true")
     profile_group.add_argument("--require-canary-profile", action="store_true")
@@ -857,6 +1036,9 @@ def main(argv: list[str] | None = None) -> int:
             evidence_root=args.evidence_root,
             require_release_profile=args.require_release_profile,
             require_canary_profile=args.require_canary_profile,
+            canary_repository=args.canary_repository,
+            canary_work_id=args.canary_work_id,
+            canary_issue=args.canary_issue,
         )
     except (OSError, json.JSONDecodeError, ValidationError) as exc:
         print(f"qualification validation failed: {exc}", file=sys.stderr)
