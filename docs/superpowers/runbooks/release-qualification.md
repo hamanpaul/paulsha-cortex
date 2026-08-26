@@ -20,6 +20,10 @@
 這條路徑不需要設定 GitHub environment secrets 或 variables；若 `RC qualification` 要求它們，
 代表 workflow contract 已退化，應先修復而不是補值。
 
+兩條 qualification workflow 的 checkout 都必須使用 `fetch-depth: 0`，並在建立 source bundle
+前確認 `git rev-parse --is-shallow-repository` 為 `false`。depth-1 bundle 會漏掉 candidate 的
+parent history，直到 installer 執行 repository `fsck` 才以 drift 失敗，不能作為 release evidence。
+
 ## 可選的 live canary
 
 只有要驗特定部署環境時才執行 `Deployment canary`。它使用 protected

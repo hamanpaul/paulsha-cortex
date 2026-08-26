@@ -151,6 +151,26 @@ def _job_needs(job: dict) -> set[str]:
     return set(needs)
 
 
+def _assert_exact_candidate_checkout_has_complete_history(name: str) -> None:
+    payload = _load_workflow(name)
+    steps = payload["jobs"]["qualification"]["steps"]
+    checkout = next(
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("name") == "Checkout exact candidate"
+    )
+    assert checkout.get("with", {}).get("fetch-depth") == 0, (
+        f"{name} must fetch complete history before `git bundle create`; a depth-1 "
+        "bundle omits the candidate parent and fails installed-repository fsck"
+    )
+    candidate = next(
+        step
+        for step in steps
+        if isinstance(step, dict) and step.get("id") == "candidate"
+    )
+    assert 'git rev-parse --is-shallow-repository' in candidate.get("run", "")
+
+
 def test_release_qualification_is_manual_secret_free_and_sha_pinned() -> None:
     payload = _load_workflow("rc-qualification.yml")
     on_block = _workflow_on(payload)
@@ -187,6 +207,7 @@ def test_release_qualification_is_manual_secret_free_and_sha_pinned() -> None:
         payload, relpath=".github/workflows/rc-qualification.yml"
     )
     _assert_all_uses_have_version_comments("rc-qualification.yml")
+    _assert_exact_candidate_checkout_has_complete_history("rc-qualification.yml")
 
 
 def test_deployment_canary_is_manual_protected_and_separate_from_release() -> None:
@@ -220,6 +241,7 @@ def test_deployment_canary_is_manual_protected_and_separate_from_release() -> No
         payload, relpath=".github/workflows/deployment-canary.yml"
     )
     _assert_all_uses_have_version_comments("deployment-canary.yml")
+    _assert_exact_candidate_checkout_has_complete_history("deployment-canary.yml")
 
     release_payload = _load_workflow("rc-qualification.yml")
     release_steps = release_payload["jobs"]["qualification"]["steps"]
