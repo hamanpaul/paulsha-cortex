@@ -475,6 +475,118 @@ def test_existing_account_with_matching_prior_receipt_provenance_is_adoptable(
     assert validate_preflight(plan, facts, receipt=receipt).ok
 
 
+def test_exact_prior_plan_receipt_can_handoff_account_provenance(
+    tmp_path: Path,
+) -> None:
+    prior_plan, facts, prior_receipt = _account_adoption_case(tmp_path)
+    prior_receipt._document["state"] = "applied"
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_receipt = new_install_receipt(next_plan)
+
+    report = validate_preflight(
+        next_plan,
+        facts,
+        receipt=next_receipt,
+        prior_receipt=prior_receipt,
+    )
+
+    assert report.ok
+
+
+def test_prior_receipt_cannot_handoff_changed_account_identity(
+    tmp_path: Path,
+) -> None:
+    prior_plan, facts, prior_receipt = _account_adoption_case(tmp_path)
+    prior_receipt._document["state"] = "applied"
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_plan["accounts"][0]["uid"] += 1
+    next_plan["apply_order"][0]["uid"] += 1
+    next_receipt = new_install_receipt(next_plan)
+
+    with pytest.raises(AccountCollisionError, match="does not match|provenance"):
+        validate_preflight(
+            next_plan,
+            facts,
+            receipt=next_receipt,
+            prior_receipt=prior_receipt,
+        )
+
+
+def test_prior_receipt_handoff_adopts_unchanged_asset_and_updates_changed_asset(
+    tmp_path: Path,
+) -> None:
+    prior_plan = _plan(tmp_path)
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document["state"] = "applied"
+    prior_receipt._document["journal"] = [
+        {
+            "step_id": step["step_id"],
+            "step": deepcopy(step),
+            "status": "completed",
+            "prior": {"exists": False},
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+        }
+        for step in prior_plan["apply_order"]
+    ]
+    next_plan = deepcopy(prior_plan)
+    next_plan["repo_identity"]["commit"] = "b" * 40
+    next_plan["candidate"]["wheel_sha256"] = "d" * 64
+    next_plan["apply_order"][1]["desired_sha256"] = "3" * 64
+    next_receipt = new_install_receipt(next_plan)
+    backend = RecordingBackend(next_plan)
+    for step in prior_plan["apply_order"]:
+        backend.states[step["step_id"]] = {
+            "exists": True,
+            "installed_sha256": step["desired_sha256"],
+            "owner": step["owner"],
+            "group": step["group"],
+            "mode": step["mode"],
+            "acl": deepcopy(step["acls"]),
+        }
+
+    apply_plan(
+        next_plan,
+        confirm_sha256=plan_sha256(next_plan),
+        receipt=next_receipt,
+        prior_receipt=prior_receipt,
+        backend=backend,
+    )
+
+    journal = next_receipt.to_dict()["journal"]
+    assert journal[0]["step_id"] == "state-root"
+    assert journal[0]["adopted_from_receipt"] is True
+    assert journal[0]["prior"]["installed_sha256"] == "1" * 64
+    assert backend.states["manager-unit"]["installed_sha256"] == "3" * 64
+
+
+def test_prior_receipt_handoff_rejects_another_install_root_before_mutation(
+    tmp_path: Path,
+) -> None:
+    prior_plan = _plan(tmp_path)
+    prior_receipt = new_install_receipt(prior_plan)
+    prior_receipt._document["state"] = "applied"
+    next_plan = deepcopy(prior_plan)
+    next_plan["roots"]["state"] += "-other"
+    next_receipt = new_install_receipt(next_plan)
+    backend = RecordingBackend(next_plan)
+
+    with pytest.raises(InstallPlanError, match="prior receipt|install root"):
+        apply_plan(
+            next_plan,
+            confirm_sha256=plan_sha256(next_plan),
+            receipt=next_receipt,
+            prior_receipt=prior_receipt,
+            backend=backend,
+        )
+
+    assert backend.applied == []
+
+
 def test_retained_account_from_plan_bound_rollback_journal_can_be_reinstalled(
     tmp_path: Path,
 ) -> None:

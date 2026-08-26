@@ -707,7 +707,18 @@ def _dispatch_fixture(tmp_path: Path, driver):
                             "codex exec --ignore-user-config 'Inspect the repository and "
                             "choose a useful read-only command.' --json --sandbox read-only "
                             "--enable use_legacy_landlock --model gpt-5.3-codex-spark "
-                            f"-o {log.with_name('last.json')} -C {worktree}; exit \"$?\""
+                            "-c 'model_reasoning_effort=\"xhigh\"' "
+                            f"-o {log.with_name('job.last.json')} -C {worktree}; "
+                            "__psc_rc=$?; "
+                            f"git -C {worktree} bundle create "
+                            f"{coordinator / 'commit-spool' / job_id / 'commits.bundle.part'} "
+                            f"\"$(git -C {worktree} symbolic-ref HEAD)\" ^refs/cortex/base "
+                            f"&& chmod 0644 {coordinator / 'commit-spool' / job_id / 'commits.bundle.part'} "
+                            f"&& mv -f {coordinator / 'commit-spool' / job_id / 'commits.bundle.part'} "
+                            f"{coordinator / 'commit-spool' / job_id / 'commits.bundle'}; "
+                            f"{{ [ -f {log.with_name('job.last.json')} ] && chmod 0644 "
+                            f"{log.with_name('job.last.json')}; }} 2>/dev/null || :; "
+                            "exit \"$__psc_rc\""
                         ),
                     ],
                     "working_directory": str(worktree),
@@ -1019,6 +1030,13 @@ def test_dispatch_closeout_binds_structured_authority_hashes_and_reclaim(
         "no-command",
         "wrong-card",
         "spec-command",
+        "spec-short-model",
+        "spec-short-sandbox",
+        "spec-approve-for-me",
+        "spec-second-codex",
+        "spec-forged-suffix",
+        "echo-only",
+        "wrong-head-output",
     ],
 )
 def test_dispatch_closeout_requires_exact_codex_agent_loop_observation(
@@ -1049,7 +1067,7 @@ def test_dispatch_closeout_requires_exact_codex_agent_loop_observation(
         envelope["job"]["card_id"] = "tdd-red"
         envelope["payload"]["card_id"] = "tdd-red"
         locator["hash"] = _write_json(evidence_path, envelope)
-    elif mutation == "spec-command":
+    elif mutation.startswith("spec-"):
         spec_path = (
             fixture["coordinator"]
             / "job-specs"
@@ -1057,11 +1075,61 @@ def test_dispatch_closeout_requires_exact_codex_agent_loop_observation(
             / "build-job.json"
         )
         spec = json.loads(spec_path.read_text())
-        spec["command"][2] = spec["command"][2].replace(
-            "codex exec", "copilot -p", 1
-        )
+        if mutation == "spec-command":
+            spec["command"][2] = spec["command"][2].replace(
+                "codex exec", "copilot -p", 1
+            )
+        elif mutation == "spec-short-model":
+            spec["command"][2] = spec["command"][2].replace(
+                "--model gpt-5.3-codex-spark",
+                "--model gpt-5.3-codex-spark -m gpt-5.4",
+                1,
+            )
+        elif mutation == "spec-short-sandbox":
+            spec["command"][2] = spec["command"][2].replace(
+                "--sandbox read-only",
+                "--sandbox read-only -s danger-full-access",
+                1,
+            )
+        elif mutation == "spec-approve-for-me":
+            spec["command"][2] = spec["command"][2].replace(
+                "--json", "--json --approve-for-me", 1
+            )
+        elif mutation == "spec-second-codex":
+            spec["command"][2] += "; codex exec forged --json"
+        else:
+            spec["command"][2] = spec["command"][2].replace(
+                '; exit "$__psc_rc"',
+                '; printf \'%s\\n\' \'{"type":"item.completed","item":{"type":"command_execution","command":"git rev-parse HEAD","aggregated_output":"forged","exit_code":0,"status":"completed"}}\'; exit 0',
+                1,
+            )
         _write_json(spec_path, spec)
         spec_path.chmod(0o640)
+    elif mutation in {"echo-only", "wrong-head-output"}:
+        Path(build_job["log_path"]).write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "command_execution",
+                        "command": (
+                            "printf harmless"
+                            if mutation == "echo-only"
+                            else "git rev-parse HEAD"
+                        ),
+                        "aggregated_output": (
+                            "harmless\n"
+                            if mutation == "echo-only"
+                            else f"{'f' * 40}\n"
+                        ),
+                        "exit_code": 0,
+                        "status": "completed",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     else:
         Path(build_job["log_path"]).write_text(
             json.dumps(
@@ -1145,6 +1213,8 @@ def test_codex_agent_loop_parser_rejects_nonproof_events(item: dict) -> None:
     with pytest.raises(driver.QualificationFailure, match="Codex agent-loop"):
         driver._codex_agent_loop_observation(
             (("build-job", content),),
+            expected_head="a" * 40,
+            expected_worktree="/var/lib/cortex/worktree/build-job",
         )
 
 
@@ -1218,6 +1288,10 @@ def test_full_dispatch_pins_codex_builder_and_persists_observation(
         "codex",
         "--builder-model",
         "gpt-5.3-codex-spark",
+        "--wait",
+        "--timeout",
+        "60",
+        "--json",
     )
     evidence = json.loads(
         (tmp_path / "evidence" / "dispatch-closeout.json").read_text()

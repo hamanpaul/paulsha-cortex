@@ -254,6 +254,38 @@ def test_polkit_semicolon_prefixed_rule_is_functional_drift() -> None:
     )
 
 
+def test_polkit_hash_prefixed_line_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] += (
+        "# invalid JavaScript line\n"
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "polkit/49-cortex-job.rules"
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_shell_semicolon_prefixed_line_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["shim"]["cortex-job-shim"]["content"] += ";exit 1\n"
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "shim/cortex-job-shim"
+        for row in report.to_dict()["failures"]
+    )
+
+
 def test_missing_functional_unit_line_fails_even_when_metadata_matches() -> None:
     expected = _inventory()
     installed = deepcopy(expected)

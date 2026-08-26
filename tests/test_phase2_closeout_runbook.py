@@ -25,6 +25,19 @@ def test_current_runbook_requires_three_way_operator_confirmation() -> None:
     assert "sudo cp -a" not in current
 
 
+def test_current_runbook_uses_one_root_owned_candidate_cli_for_plan_and_apply() -> None:
+    current = (ROOT / CURRENT).read_text(encoding="utf-8")
+
+    assert "cortex_cli=" in current
+    assert '"$cortex_cli" install trust-root plan' in current
+    assert 'sudo "$cortex_cli" install trust-root apply' in current
+    assert "root-owned" in current
+    assert "--no-index" in current
+    assert "--prior-receipt" in current
+    assert "sudo cortex install trust-root" not in current
+    assert "\ncortex install trust-root plan" not in current
+
+
 def test_legacy_manual_runbook_is_explicitly_non_executable() -> None:
     legacy = (ROOT / LEGACY).read_text(encoding="utf-8")
 

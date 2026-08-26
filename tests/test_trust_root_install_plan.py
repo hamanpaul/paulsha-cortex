@@ -537,6 +537,57 @@ def test_apply_cli_refuses_same_path_receipt_for_a_different_valid_plan(
     assert MutationSentinelBackend.preflight_calls == 0
 
 
+def test_apply_cli_loads_explicit_prior_receipt_for_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, _doc = _bound_plan_document(tmp_path)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    receipt_path = (tmp_path / "next" / "receipt.json").absolute()
+    prior_path = (tmp_path / "prior" / "receipt.json").absolute()
+    prior_plan = deepcopy(plan)
+    prior_plan["repo_identity"]["commit"] = "b" * 40
+    prior_plan["candidate"]["candidate_sha"] = "b" * 40
+    prior_plan["receipt_path"] = str(install_core.canonical_receipt_path(prior_plan))
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_parent", lambda _observed, _path: None
+    )
+    monkeypatch.setattr(
+        install_core, "_validate_receipt_file", lambda _observed, _path: None
+    )
+    prior = new_install_receipt(prior_plan, path=prior_path)
+    prior._document["state"] = "applied"
+    prior._persist()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(install_cli, "_require_root", lambda: None)
+    monkeypatch.setattr(install_cli, "LocalInstallBackend", lambda: object())
+
+    def capture_apply(value, **kwargs):
+        captured["plan"] = value
+        captured.update(kwargs)
+        return kwargs["receipt"]
+
+    monkeypatch.setattr(install_cli, "apply_plan", capture_apply)
+
+    assert install_cli.main(
+        [
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--confirm-sha256",
+            plan_sha256(plan),
+            "--receipt",
+            str(receipt_path),
+            "--prior-receipt",
+            str(prior_path),
+        ]
+    ) == 0
+    assert captured["prior_receipt"].to_dict()["plan_sha256"] == plan_sha256(
+        prior_plan
+    )
+
+
 @pytest.mark.parametrize(
     "case",
     [

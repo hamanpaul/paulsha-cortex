@@ -883,6 +883,7 @@ def test_full_suite_validator_binds_legacy_deny_only_asset(
         "agent-loop-no-command",
         "agent-loop-wrong-model",
         "agent-loop-wrong-card",
+        "agent-loop-multiple-jobs",
         "agent-loop-bad-hash",
         "changed-remote-refs",
     ],
@@ -921,6 +922,8 @@ def test_full_suite_validator_rejects_self_consistent_forged_artifacts(
             probe["model_id"] = "gpt-5.4"
         elif mutation == "agent-loop-wrong-card":
             probe["card_id"] = "tdd-red"
+        elif mutation == "agent-loop-multiple-jobs":
+            probe["builder_job_ids"] = ["build-job", "another-build-job"]
         else:
             probe["command_sha256"] = "not-a-digest"
     else:
