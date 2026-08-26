@@ -206,6 +206,38 @@ def _validate_artifact_inventory(
         )
 
 
+def _validate_evidence_file_set(
+    *, evidence_root: Path, artifact_paths: set[str]
+) -> None:
+    evidence_dir = evidence_root / "evidence"
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        _fail("evidence root must contain a regular evidence directory")
+
+    actual_paths: set[str] = set()
+    for candidate in evidence_dir.rglob("*"):
+        relative = candidate.relative_to(evidence_root).as_posix()
+        if candidate.is_symlink():
+            _fail(f"evidence tree contains a symlink: {relative}")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            _fail(f"evidence tree contains a non-regular entry: {relative}")
+        actual_paths.add(relative)
+
+    unlisted = actual_paths - artifact_paths
+    if unlisted:
+        _fail(
+            "evidence tree contains unlisted evidence files: "
+            + ", ".join(sorted(unlisted))
+        )
+    outside_tree = artifact_paths - actual_paths
+    if outside_tree:
+        _fail(
+            "qualification lists files outside the canonical evidence tree: "
+            + ", ".join(sorted(outside_tree))
+        )
+
+
 def _validate_profile_artifacts(
     *,
     qualification: dict[str, Any],
@@ -778,6 +810,10 @@ def validate(
                 + ", ".join(sorted(missing_artifacts))
             )
         assert evidence_root is not None
+        _validate_evidence_file_set(
+            evidence_root=evidence_root,
+            artifact_paths=artifact_paths,
+        )
         _validate_profile_artifacts(
             qualification=root,
             evidence_root=evidence_root,

@@ -13,7 +13,8 @@
   intake-to-closeout 另移至受保護的 manual `deployment-canary`，不再阻擋 package release；
   qualification 與 canary 都會拒絕 shallow checkout，確保 source bundle 含完整 history 並
   通過安裝後 repository `fsck`；qualification evidence 改寫入一次性 Docker volume，避免
-  Docker archive API 無法從 container `/run` tmpfs 匯出已驗證結果。
+  Docker archive API 無法從 container `/run` tmpfs 匯出已驗證結果；release validator 也會
+  拒絕任何未列入 artifact inventory 的額外 evidence 檔案。
 
 - **Phase 2 部署與 Docker RC qualification release batch**：將已合併的 trust-root
   deployment hardening、exact-SHA qualification bundle 與 protected RC/release

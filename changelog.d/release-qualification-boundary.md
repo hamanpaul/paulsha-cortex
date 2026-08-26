@@ -4,4 +4,5 @@ deployment canary；evidence schema v2 以 profile 防止兩種結果互相冒�
 也會在 source bundle 建立前強制取得並驗證完整 Git history，避免 shallow bundle 在安裝後
 repository `fsck` 才失敗。qualification evidence 會寫入獨立的一次性 Docker volume，再由
 runner 匯出；不新增 writable host bind，且避開 Docker archive API 無法讀取 container
-`/run` tmpfs 的限制。
+`/run` tmpfs 的限制。validator 會比對 canonical evidence tree 與 artifact inventory 的完整
+檔案集合，未列管檔案、symlink 或列在 tree 外的 artifact 都會 fail closed。

@@ -681,6 +681,15 @@ def test_full_suite_validator_checks_evidence_semantics(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_full_suite_validator_rejects_unlisted_evidence_files(tmp_path: Path) -> None:
+    payload = _valid_full_qualification(tmp_path)
+    _write_json(tmp_path / "evidence" / "unlisted.json", {"status": "passed"})
+
+    completed = _run_full_validator(tmp_path, payload)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert "unlisted evidence files" in completed.stderr
+
+
 def test_release_profile_validator_accepts_deterministic_evidence_without_providers(
     tmp_path: Path,
 ) -> None:
