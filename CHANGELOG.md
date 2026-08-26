@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Release qualification 邊界修正**：exact-SHA `rc-qualification` 改為不讀 secrets、
+  不呼叫 provider、以 `--network none` 執行且不修改外部 repository 的 deterministic
+  installer/systemd/attestation/attack-matrix gate；真實 provider、Manager GitHub 與
+  intake-to-closeout 另移至受保護的 manual `deployment-canary`，不再阻擋 package release。
+
 - **Phase 2 部署與 Docker RC qualification release batch**：將已合併的 trust-root
   deployment hardening、exact-SHA qualification bundle 與 protected RC/release
   gate 收口為下一個 patch release，並保留 final-head review、CI、OpenSpec archive

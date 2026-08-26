@@ -1,4 +1,4 @@
-name: RC qualification
+name: Deployment canary
 
 on:
   workflow_dispatch:
@@ -10,6 +10,7 @@ jobs:
   qualification:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    environment: rc-qualification
     steps:
       - name: Checkout exact candidate
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -143,11 +144,19 @@ jobs:
           echo "wheel_sha256=$wheel_sha" >> "$GITHUB_OUTPUT"
           echo "bundle_sha256=$bundle_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Run privileged systemd qualification
+      - name: Run protected live deployment canary
+        env:
+          CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
+          CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
+          CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
+          CORTEX_RC_PROBE_REPOSITORY: ${{ vars.CORTEX_RC_PROBE_REPOSITORY }}
+          CORTEX_RC_PROBE_WORK_ID: ${{ vars.CORTEX_RC_PROBE_WORK_ID }}
+          CORTEX_RC_PROBE_ISSUE: ${{ vars.CORTEX_RC_PROBE_ISSUE }}
         run: |
           set -euo pipefail
           qualification/run.sh \
-            --profile release \
+            --profile deployment-canary \
             --artifacts qualification-input \
             --candidate-sha "${{ github.sha }}" \
             --wheel-sha256 "${{ steps.candidate.outputs.wheel_sha256 }}" \
@@ -156,14 +165,19 @@ jobs:
           test -s qualification-output/qualification.json
 
       - name: Fail closed on credential material in evidence
+        env:
+          CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
+          CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
+          CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
         run: >-
           python qualification/redaction_scan.py qualification-output
-          --profile release
+          --profile deployment-canary
 
-      - name: Upload exact candidate and redacted evidence
+      - name: Upload exact candidate and redacted canary evidence
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         with:
-          name: rc-qualification-${{ github.sha }}
+          name: deployment-canary-${{ github.sha }}
           if-no-files-found: error
           retention-days: 3
           path: |
