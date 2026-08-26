@@ -31,7 +31,7 @@ attestation 會把 executable shebang 漂移誤判為 comment-only，並把 polk
 - 修正現行 install attestation 的 category-aware functional/comment normalization。
 - 更新三個 workstream Todo、work-item links、runbook 與 GitHub issue authority。
 - 新增 governed merge summary、risk/rollback 記錄，說明拒絕舊 branch 的理由。
-- 完成後 bump 下一個 patch version，重新跑 exact-main RC 並發布唯一權威 wheel。
+- 將版本升至 `0.1.10`，重新跑 exact-main RC 並發布唯一權威 wheel。
 
 ## Capabilities
 

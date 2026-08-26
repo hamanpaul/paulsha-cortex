@@ -34,5 +34,5 @@ work_item: phase2-closeout-reconcile
 4. 跑完整 pytest、OpenSpec、build/twine/clean-wheel smoke、PR-context preflight、standard
    review 與 adversarial review；每條 finding 獨立修／駁／列管後重審。
 5. archive OpenSpec、push PR，完成 exact-head approval、CI、thread audit 與 merge。
-6. bump 下一個 patch version，對 final main 跑 exact-SHA RC，發布 immutable release；依
+6. 將版本升至 `0.1.10`，對 final main 跑 exact-SHA RC，發布 immutable release；依
    shipped evidence 關閉 #681/#695，並把 #716 留作受保護 deployment-canary 驗收。

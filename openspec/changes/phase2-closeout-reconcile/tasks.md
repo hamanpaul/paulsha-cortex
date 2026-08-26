@@ -14,10 +14,10 @@ work_item: phase2-closeout-reconcile
 
 ## 2. Governed implementation
 
-- [ ] 在現行 installer 實作 category-aware functional normalization；不得把 shebang
+- [x] 在現行 installer 實作 category-aware functional normalization；不得把 shebang
       當註解，也不得把 polkit 獨立註解當功能內容。
-- [ ] 記錄 #681/#695 的現行替代能力與 #716 deployment-canary 邊界，不新增平行 authority。
-- [ ] 產出 `merge-summary.md`、`merge-risks.md`，逐項記錄 textual／behavioral／interface
+- [x] 記錄 #681/#695 的現行替代能力與 #716 deployment-canary 邊界，不新增平行 authority。
+- [x] 產出 `merge-summary.md`、`merge-risks.md`，逐項記錄 textual／behavioral／interface
       conflict 與 rollback。
 
 ## 3. Verification and delivery
@@ -30,7 +30,7 @@ work_item: phase2-closeout-reconcile
 
 ## 4. Release and authority closeout
 
-- [ ] bump 下一個 patch version，final-main exact-SHA RC qualification 通過後發布
+- [ ] 將 `VERSION` 升至 `0.1.10`，final-main exact-SHA RC qualification 通過後發布
       annotated tag、non-draft GitHub Release 與 hash-matching single wheel。
 - [ ] 依 shipped evidence 關閉 #681/#695；將 #716 明確改列為 deployment-canary
       follow-up；修正 #789–#791 的 superseded 語意。

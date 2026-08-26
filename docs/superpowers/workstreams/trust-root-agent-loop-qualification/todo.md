@@ -3,31 +3,29 @@ status: accepted
 work_item: trust-root-agent-loop-qualification
 ---
 
-# Trust-root real agent-loop qualification Todo
+# Trust-root agent-loop deployment-canary follow-up
 
 Issue: `hamanpaul/paulsha-cortex#716`.
 
-## Boundary
+## Reclassification
 
-Close the gap between a scripted sandbox probe and the production-shaped
-model-driven executor loop. The qualification must exercise the actual
-`codex exec`/configured agent command shape and keep the chosen outer
-hardening plus egress controls intact. It must not switch to an unsafe mode or
-declare success from a probe that bypasses the failing path.
+舊 PR #791 的 standalone probe 沒有走完整 production intake／per-job clone／bundle／
+workflow terminal，不能作為 live acceptance，亦不得回灌。PR #796 已建立較強且唯一的
+canonical seam：protected `Deployment canary` 以 `_full_dispatch()` 執行真實
+`cortex work intake` 到 terminal，並驗證 provider/model/quota、Manager GitHub、claim→ship、
+canonical evidence、commit bundle 與 gates。
 
-## Tasks
+這是**發布後 deployment acceptance**，不是 Phase 2 source/package release blocker。
+Deterministic RC 不讀 secrets、不呼叫 provider、不修改外部 repository；package release
+成功也不能推論當下 production/provider 健康。
 
-- [ ] Reproduce the failing real agent loop under the exact generated systemd
-      unit, recording command, sandbox profile, child process, and exit reason.
-- [ ] Implement the smallest contract correction that lets the intended job
-      loop run while preserving the outer enforcement plane and explicit
-      egress allowlist; document the policy trade-off if an inner sandbox is
-      intentionally absent.
-- [ ] Add production-shaped positive and negative tests for model-driven
-      repository commands, child processes, forbidden paths, network hosts,
-      and no-unsafe-fallback behavior.
-- [ ] Bind qualification evidence to executor/model identity, unit hash,
-      candidate SHA, and artifact hashes; SKIP, fallback, quota, and model
-      mismatch are failures.
-- [ ] Run focused tests, full pytest, policy/preflight, independent review,
-      delivery, CI, and close the issue through Cortex.
+## Acceptance
+
+- [x] production-shaped live acceptance 已移到獨立 protected deployment-canary workflow。
+- [x] SKIP、fallback、quota、model mismatch、ref drift 或未 terminal 均 fail closed。
+- [x] work-item authority 已移除較弱的 PR #791 與不存在的 OpenSpec 指向。
+- [ ] 在受保護 environment 具備明示的 4 secrets、3 variables，且 operator 授權目標
+      repository mutation 後，對指定 deployed SHA 跑成功 canary；完成前 #716 保持 open。
+
+目前沒有成功 canary run，因此 production/provider live health 仍是**未證實**；這不回頭
+否定已通過 deterministic gates 的 Phase 2 source/package release。

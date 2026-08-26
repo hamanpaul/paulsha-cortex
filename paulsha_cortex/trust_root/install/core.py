@@ -4747,12 +4747,53 @@ _INVENTORY_CATEGORIES = (
 )
 
 
-def _functional_lines(content: str) -> list[str]:
-    return [
-        line.strip()
-        for line in content.splitlines()
-        if line.strip() and not line.lstrip().startswith(("#", ";"))
-    ]
+def _functional_lines(
+    content: str,
+    *,
+    category: str | None = None,
+) -> list[str]:
+    """Normalize content without hiding category-specific functional lines."""
+
+    functional: list[str] = []
+    in_polkit_block_comment = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if category == "polkit":
+            while line:
+                if in_polkit_block_comment:
+                    closing = line.find("*/")
+                    if closing < 0:
+                        line = ""
+                        break
+                    line = line[closing + 2 :].strip()
+                    in_polkit_block_comment = False
+                    continue
+                if line.startswith("//"):
+                    line = ""
+                    break
+                if line.startswith("/*"):
+                    closing = line.find("*/", 2)
+                    if closing < 0:
+                        in_polkit_block_comment = True
+                        line = ""
+                        break
+                    line = line[closing + 2 :].strip()
+                    continue
+                break
+            if not line:
+                continue
+
+        if line.startswith(";"):
+            continue
+        if line.startswith("#"):
+            if category in {"shim", "toolchain_wrappers"} and line.startswith("#!"):
+                functional.append(line)
+            continue
+        functional.append(line)
+    return functional
 
 
 def attest_generated_inventory(
@@ -4801,8 +4842,14 @@ def attest_generated_inventory(
                 )
             expected_content = str(expected_row.get("content", ""))
             actual_content = str(actual_row.get("content", ""))
-            expected_functional = _functional_lines(expected_content)
-            actual_functional = _functional_lines(actual_content)
+            expected_functional = _functional_lines(
+                expected_content,
+                category=category,
+            )
+            actual_functional = _functional_lines(
+                actual_content,
+                category=category,
+            )
             if expected_functional != actual_functional:
                 missing = [
                     line for line in expected_functional if line not in actual_functional

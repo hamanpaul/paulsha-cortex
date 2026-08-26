@@ -37,7 +37,7 @@ live credentials。需要 provider 的 agent-loop live execution 只屬 deployme
 
 ### 4. 修正必須以新 immutable patch release 交付
 
-`v0.1.9` 保持不可變歷史；本 change 合併後以新 patch version 重新產生 exact-main RC、
+`v0.1.9` 保持不可變歷史；本 change 合併後以 `v0.1.10` 重新產生 exact-main RC、
 annotated tag、GitHub Release 與唯一 wheel。#681/#695 依 shipped replacement evidence 關閉；
 #716 保持 open，但改列為 deployment-canary acceptance，不再阻擋 Phase 2 source/package。
 

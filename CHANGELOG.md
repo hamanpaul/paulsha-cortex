@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
+  現在把 shim／toolchain wrapper 的 shebang 視為功能內容，並正確忽略 polkit 的獨立
+  JavaScript 註解；#681/#695 改指向現行 transactional installer 與 exact-SHA RC，
+  #716 則明確保留為不阻擋 package release 的 deployment-canary 驗收。
+
 - **Release publication repo context 修正**：不含 checkout 的 publication job 現在明確把
   `GITHUB_REPOSITORY` 傳給 `gh release create --repo`，避免 gh 嘗試從不存在的 `.git`
   推導 repository，並保留既有 annotated-tag transaction rollback。
