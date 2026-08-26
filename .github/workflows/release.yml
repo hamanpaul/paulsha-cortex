@@ -506,6 +506,7 @@ jobs:
             }
 
           gh release create "$tag_name" "${wheels[0]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --draft \
             --verify-tag \
             --target "$release_sha" \

@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Release publication repo context 修正**：不含 checkout 的 publication job 現在明確把
+  `GITHUB_REPOSITORY` 傳給 `gh release create --repo`，避免 gh 嘗試從不存在的 `.git`
+  推導 repository，並保留既有 annotated-tag transaction rollback。
+
 - **Release qualification 邊界修正**：exact-SHA `rc-qualification` 改為不讀 secrets、
   不呼叫 provider、以 `--network none` 執行且不修改外部 repository 的 deterministic
   installer/systemd/attestation/attack-matrix gate；真實 provider、Manager GitHub 與
