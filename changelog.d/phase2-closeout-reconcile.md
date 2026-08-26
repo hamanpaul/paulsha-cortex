@@ -1,3 +1,3 @@
-- 修復 Phase 2 closeout provenance：把先前誤標 superseded、但未進 `v0.1.9` 的
-  Copilot toolchain pinning、generated asset attestation 與 production-shaped agent-loop
-  qualification 以 governed merge 補回，並維持 deterministic release／live canary 分界。
+- 修正 Phase 2 generated-vs-installed attestation：shim／toolchain wrapper shebang 漂移
+  現在會 fail closed，polkit 的獨立 JavaScript 註解只產生 comment-only warning；同步把
+  #681/#695 對齊現行 installer/RC authority，並將 #716 明確保留為發布後 canary 驗收。

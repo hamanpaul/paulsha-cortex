@@ -5,51 +5,49 @@ work_item: phase2-closeout-reconcile
 
 ## Context
 
-三支候選都從舊 baseline `1022d77f9f9a212f9a1e09c1c0698643ee4f581d`
-分岔，之後 `main` 已累積 installer、runtime isolation、RC/release 等大量加固。
-直接 merge 或整檔採用任一候選的 `permgen.py` 會同時帶回舊行為；另一方面，只用
-`v0.1.9` RC 綠燈推論三支候選已整合也不成立，因為 tree 中缺少其具名測試與模組。
+三支候選都從舊 baseline 分岔，之後 `main` 已建立 transactional installer、root-owned
+hash-bound toolchain、完整 install inventory、production full-dispatch canary 與 exact-SHA
+RC/release。逐項行為比對證明現行架構已覆蓋舊分支的有效目的，舊 API 本身不是交付
+契約；直接 merge 反而會引入非原子 reinstall、第二套 inventory authority 與較弱 probe。
 
 ## Decisions
 
-### 1. 使用 governed semantic transplant，不做 branch replay
+### 1. 使用 governed reconciliation，不做 branch replay
 
-以 `7ced8df0a24c55c49ee894b3118ea18d2a97b552` 為 target，三個 PR final
-head 為 provenance source。先移植各自 RED tests 並在 target 上觀察預期失敗，再按
-function／contract 移植最小 production delta。反覆 archive／restore、過時 work-item
-link 與舊 changelog 不重播。
+以 `7ced8df0a24c55c49ee894b3118ea18d2a97b552` 為 target，三個 PR final head
+只作 provenance source。依「能力是否存在且更強」判斷 supersession，不以舊 module／test
+檔名是否存在判斷。#789 的手動 publisher、#790 的第二套 inventory、#791 的 standalone
+probe 均拒絕回灌；只修正比對中證實仍存在的現行 attestation normalization 缺陷。
 
-### 2. 三項能力分開驗證，共用一個 closeout release
+### 2. Attestation normalization 依 artifact category 判定
 
-- #681：wrapper 必須只 exec root-owned pinned payload，拒絕 PATH/HOME search、
-  symlink/path escape 與 metadata mismatch。
-- #695：由 canonical renderer 建 inventory；functional drift fail、comment-only
-  drift warn，且 credential surface 只留 metadata/hash。
-- #716：probe 必須經 production `SubprocessLauncher`、job spec、generated template
-  與 systemd start seam，對 fallback/SKIP/quota/model mismatch fail closed。
+- `shim` 與 `toolchain_wrappers`：`#!` 決定 interpreter，必須保留為 functional line；
+  其他獨立 shell/Python 註解可忽略。
+- `polkit`：獨立 `//` 與 `/* ... */` 註解可忽略；規則內容仍逐行比較。
+- 其他 category 維持既有 `#`／`;` comment semantics，避免擴大行為變更。
 
-整合測試與規格各自保留，避免一個總體綠燈遮住單一能力未落地。
+三個 focused regression 分別鎖住兩種 shebang fail-closed 與 polkit comment-only warning。
 
 ### 3. Release qualification 與 deployment canary 邊界保持不變
 
-deterministic RC 只證明 artifact install/systemd/attestation/attack matrix，且不得取用
+Deterministic RC 只證明 artifact install/systemd/attestation/attack matrix，且不得取用
 live credentials。需要 provider 的 agent-loop live execution 只屬 deployment canary。
-source harness 可在 release 中交付，但「此刻 provider/live rollout 健康」仍需另一次
-canary evidence，不能由 package release 推論。
+現行 `_full_dispatch()` 已取代較弱的 standalone probe；「此刻 provider/live rollout
+健康」仍需受保護環境的 canary evidence，不能由 package release 推論。
 
-### 4. 完成宣稱必須在 recovered code 的新 release 上
+### 4. 修正必須以新 immutable patch release 交付
 
-`v0.1.9` 保持不可變歷史；本 change 合併後以新 patch version 重新產生 exact-main
-RC、annotated tag、GitHub Release 與唯一 wheel。issues 只在各自 acceptance 與 shipped
-evidence 對齊後關閉；若只剩環境健康，則在 closeout comment 明確移到 canary，而非保留
-「Phase 2 source blocker」語意。
+`v0.1.9` 保持不可變歷史；本 change 合併後以新 patch version 重新產生 exact-main RC、
+annotated tag、GitHub Release 與唯一 wheel。#681/#695 依 shipped replacement evidence 關閉；
+#716 保持 open，但改列為 deployment-canary acceptance，不再阻擋 Phase 2 source/package。
 
 ## Risks / Trade-offs
 
-- 三來源都修改 `permgen.py`，存在行為與文字衝突；以現行 registry/invariant 為主，
-  逐項移植並跑交叉 focused tests。
-- source branch 測試可能依賴已演進的 fixture；只修 fixture compatibility，不降低 assertion。
-- agent-loop source harness 的存在不等於 live provider 成功；docs、issue comment 與
+- normalization 若過度忽略內容會造成 fail-open；只忽略 category 明確定義的獨立註解，
+  shebang 與 inline code 一律保留。
+- 舊 branch 的具名檔案不存在不代表能力不存在；merge summary 必須列出現行替代 call path
+  與拒絕移植的風險。
+- agent-loop package code 的存在不等於 live provider 成功；docs、issue comment 與
   qualification profile 必須維持這個誠實邊界。
 
 ## Rollback

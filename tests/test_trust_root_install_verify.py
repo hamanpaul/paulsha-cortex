@@ -141,6 +141,67 @@ def test_comment_only_drift_warns_but_does_not_fail() -> None:
     assert rendered["failures"] == []
 
 
+def test_shim_shebang_drift_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["shim"]["cortex-job-shim"]["content"] = (
+        installed["shim"]["cortex-job-shim"]["content"].replace(
+            "#!/opt/cortex/venv/bin/python",
+            "#!/usr/bin/python3",
+        )
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "shim/cortex-job-shim"
+        and "#!/opt/cortex/venv/bin/python" in row["missing_functional_lines"]
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_toolchain_wrapper_shebang_drift_is_functional_drift() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["toolchain_wrappers"]["codex"]["content"] = (
+        installed["toolchain_wrappers"]["codex"]["content"].replace(
+            "#!/bin/sh",
+            "#!/usr/bin/env sh",
+        )
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert not report.ok
+    assert any(
+        row["code"] == "functional_drift"
+        and row["artifact"] == "toolchain_wrappers/codex"
+        and "#!/bin/sh" in row["missing_functional_lines"]
+        for row in report.to_dict()["failures"]
+    )
+
+
+def test_polkit_standalone_comment_drift_warns_but_does_not_fail() -> None:
+    expected = _inventory()
+    installed = deepcopy(expected)
+    installed["polkit"]["49-cortex-job.rules"]["content"] = (
+        "// local explanation\n"
+        "/* local\n"
+        " * multi-line explanation\n"
+        " */\n"
+        + installed["polkit"]["49-cortex-job.rules"]["content"]
+    )
+
+    report = attest_generated_inventory(expected=expected, installed=installed)
+
+    assert report.ok
+    assert {
+        (row["code"], row["artifact"]) for row in report.to_dict()["warnings"]
+    } == {("comment_only_drift", "polkit/49-cortex-job.rules")}
+
+
 def test_missing_functional_unit_line_fails_even_when_metadata_matches() -> None:
     expected = _inventory()
     installed = deepcopy(expected)

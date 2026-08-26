@@ -5,37 +5,32 @@ work_item: phase2-closeout-reconcile
 
 ## Why
 
-Phase 2 已以 `v0.1.9` 發布，但 PR #789、#790、#791 被關閉為
-`superseded by #794` 的治理紀錄與實際 tree 不一致：三支候選的關鍵
-Copilot toolchain pinning、generated-vs-installed attestation 與 production-shaped
-agent-loop qualification 程式／測試／規格並未進入 `v0.1.9` 的 exact commit。
-只關閉 issue 或改 Todo 會把真實缺口藏掉，不能構成 closeout。
+Phase 2 已以 `v0.1.9` 發布，現行 installer、RC qualification 與 deployment canary
+也已取代 PR #789、#790、#791 的舊設計；但 work-item／Todo 仍指向不存在的
+OpenSpec 與過時 PR，形成錯誤 authority。獨立比對另發現 generated-vs-installed
+attestation 會把 executable shebang 漂移誤判為 comment-only，並把 polkit 的獨立
+註解誤判為 functional drift。這個 fail-open／false-positive 缺口必須在正式收尾前修正。
 
 ## Goals
 
-- 從三支保留的 exact candidate head 重建可追溯的 governed merge，不重播陳舊的
-  archive／restore 歷史。
-- 將 #681、#695、#716 尚缺且仍適用的行為移植到最新 `main`，保留後續 Phase 2
-  installer、sandbox、release qualification 加固。
-- 以 RED→GREEN、完整 preflight、獨立 review、exact-main RC 與新 patch release
-  證明 recovered code 真正 shipped。
-- 修正 issue／Todo／PR closeout 語意；未被當前 evidence 滿足的 live rollout
-  claim 必須明確留在 deployment canary，不得冒充 release evidence。
+- 以 category-aware normalization 讓 shim／toolchain shebang 漂移 fail closed，polkit
+  的獨立註解只產生 warning。
+- 以 exact tree 與 RC evidence 記錄 #681、#695 已由現行架構取代，不回灌舊 branch。
+- 將 #716 明確改列為發布後 deployment-canary 驗收，不再冒充 package release blocker。
+- 以 RED→GREEN、完整 preflight、雙向 review、exact-main RC 與新 patch release 交付修正。
 
 ## Non-Goals
 
-- 不重開或合併已關閉的 #789–#791。
+- 不重開、合併或 cherry-pick 已關閉的 #789–#791。
 - 不讀取或搬移 operator HOME credentials，不修改現行 production services。
-- 不把 provider availability 或 live repository mutation 重新加入 deterministic
-  release gate。
-- 不以整檔覆蓋方式回退 `main` 在候選分支建立後新增的加固。
+- 不把 provider availability 或 live repository mutation 加入 deterministic release gate。
+- 不新增第二套 `permgen` inventory、舊式 wrapper publisher 或 standalone agent-loop probe。
 
 ## What Changes
 
-- 整合 immutable Copilot wrapper/tree、exact metadata 與 installed attestation。
-- 整合完整 generated-asset inventory 與 functional/comment-only drift classification。
-- 整合走 production launcher/template seam 的 agent-loop probe 與 fail-closed evidence。
-- 新增 governed merge summary、risk/rollback 記錄與 Phase 2 closeout authority。
+- 修正現行 install attestation 的 category-aware functional/comment normalization。
+- 更新三個 workstream Todo、work-item links、runbook 與 GitHub issue authority。
+- 新增 governed merge summary、risk/rollback 記錄，說明拒絕舊 branch 的理由。
 - 完成後 bump 下一個 patch version，重新跑 exact-main RC 並發布唯一權威 wheel。
 
 ## Capabilities
@@ -47,6 +42,6 @@ agent-loop qualification 程式／測試／規格並未進入 `v0.1.9` 的 exact
 
 ## Impact
 
-- 主要影響 `paulsha_cortex/trust_root/permgen.py`、launcher／delivery／manager
-  接縫、trust-root CLI/probe、對應 tests/specs/docs 與 release version metadata。
+- 主要影響 `paulsha_cortex/trust_root/install/core.py` 的 attestation normalization、
+  對應 tests/specs/docs 與 release version metadata。
 - 不新增外部依賴；不變更 secrets contract；不直接部署到 `/opt/cortex`。
