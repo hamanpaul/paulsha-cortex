@@ -19,6 +19,10 @@
    wheel、完整 install-input archive、passed release qualification manifest。三份資產的
    GitHub REST `digest` 都必須等於 publication job 的本機 SHA-256。
 
+Release candidate PR 應帶對應 `release:<version>` label。Policy Check 必須在 PR 建立、commit
+同步、重開、title/body 編輯與 label 增刪時重跑；不能沿用缺少後加 label 的舊 event payload，
+否則 VERSION gate 會對相同 PR metadata 產生不同結論。
+
 publication job 刻意不 checkout source tree；所有 repository-aware `gh` 操作都必須由
 `GITHUB_REPOSITORY` 明確指定目標。尤其 `gh release create` 必須帶 `--repo`，不可依賴本地
 `.git` context。
