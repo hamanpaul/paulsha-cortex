@@ -376,6 +376,8 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     assert "release_transaction_marker" in release_runs
     assert "repos/${GITHUB_REPOSITORY}/releases/$release_id" in release_runs
     assert "release cleanup ownership mismatch" in release_runs
+    assert "owned GitHub Release is already published; retaining release and tag" in release_runs
+    assert 'owned_release_draft=$(jq -er .draft <<<"$owned_release")' in release_runs
     assert "trap cleanup_release_transaction EXIT" in release_runs
     assert "trap 'exit 130' INT" in release_runs
     assert "trap 'exit 143' TERM" in release_runs
@@ -392,17 +394,21 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
 
 
 @pytest.mark.parametrize(
-    ("failure_mode", "expected_returncode"),
+    ("failure_mode", "expected_returncode", "published_state_survives"),
     (
-        ("upload", 23),
-        ("stale-upload", 23),
-        ("term", 143),
-        ("double-term", 143),
-        ("digest", 1),
+        ("upload", 23, False),
+        ("stale-upload", 23, False),
+        ("term", 143, False),
+        ("double-term", 143, False),
+        ("digest", 1, False),
+        ("post-publish-term", 143, True),
     ),
 )
-def test_release_asset_failure_removes_owned_release_before_tag(
-    tmp_path: Path, failure_mode: str, expected_returncode: int
+def test_release_transaction_cleanup_respects_publication_boundary(
+    tmp_path: Path,
+    failure_mode: str,
+    expected_returncode: int,
+    published_state_survives: bool,
 ) -> None:
     payload = _load_workflow("release.yml")
     release = payload["jobs"]["release"]
@@ -419,6 +425,7 @@ def test_release_asset_failure_removes_owned_release_before_tag(
     fake_gh = fake_bin / "gh"
     fake_gh.write_text(
         """#!/usr/bin/env python3
+import hashlib
 import json
 import os
 import signal
@@ -470,13 +477,17 @@ elif args[:2] == ["release", "create"]:
     marker = args[args.index("--notes") + 1]
     mode = os.environ["FAKE_FAILURE_MODE"]
     assets = []
-    if mode == "digest":
+    if mode in {"digest", "post-publish-term"}:
         assets = [
             {
                 "name": Path(path).name,
                 "size": Path(path).stat().st_size,
                 "state": "uploaded",
-                "digest": "sha256:" + "0" * 64,
+                "digest": "sha256:" + (
+                    "0" * 64
+                    if mode == "digest"
+                    else hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                ),
             }
             for path in args[3:6]
         ]
@@ -499,6 +510,18 @@ elif "releases?per_page=100" in " ".join(args):
         os.kill(os.getppid(), signal.SIGTERM)
     release_path = state / "release.json"
     print("[" + release_path.read_text(encoding="utf-8") + "]" if release_path.exists() else "[]")
+elif args[:3] == ["api", "--method", "PATCH"] and args[3].endswith("/releases/17"):
+    request = json.load(sys.stdin)
+    release_path = state / "release.json"
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    release["draft"] = request["draft"]
+    release_path.write_text(json.dumps(release), encoding="utf-8")
+    record("release-published")
+    print(json.dumps(release), flush=True)
+    if os.environ["FAKE_FAILURE_MODE"] == "post-publish-term":
+        os.kill(os.getppid(), signal.SIGTERM)
+        time.sleep(0.1)
+        raise SystemExit(143)
 elif args[:3] == ["api", "--method", "DELETE"] and args[3].endswith("/releases/17"):
     (state / "release.json").unlink()
     record("release-deleted")
@@ -556,6 +579,18 @@ else:
     )
 
     assert result.returncode == expected_returncode, result.stderr
+    if published_state_survives:
+        release_state = json.loads(
+            (state / "release.json").read_text(encoding="utf-8")
+        )
+        assert release_state["draft"] is False
+        assert (state / "tag").exists()
+        assert (state / "events").read_text(encoding="utf-8").splitlines() == [
+            "partial-release-created",
+            "release-published",
+        ]
+        return
+
     assert not (state / "release.json").exists()
     assert not (state / "tag").exists()
     expected_events = [

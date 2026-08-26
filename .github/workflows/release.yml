@@ -587,6 +587,11 @@ jobs:
               owned_release_id=$(jq -er .id <<<"$owned_release")
               owned_tag=$(jq -er .tag_name <<<"$owned_release")
               owned_body=$(jq -er '.body // ""' <<<"$owned_release")
+              owned_release_draft=$(jq -er .draft <<<"$owned_release")
+              if [[ "$owned_release_draft" != true ]]; then
+                echo "::warning::owned GitHub Release is already published; retaining release and tag"
+                exit "$original_status"
+              fi
               if [[ "$owned_tag" != "$tag_name" || \
                     "$owned_body" != *"$release_transaction_marker"* ]]; then
                 echo "::warning::release cleanup ownership mismatch; retaining release and tag"

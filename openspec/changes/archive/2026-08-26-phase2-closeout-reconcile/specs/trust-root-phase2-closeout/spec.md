@@ -318,7 +318,9 @@ It MUST persist an ownership marker containing run, attempt, and release SHA in 
 before upload. A later invocation MAY reconcile a hard-kill residue only when the exact tag is
 annotated, targets the same release SHA, carries a structurally valid marker, and any exact-tag
 release is still a draft carrying that same marker. It MUST NOT delete a lightweight, foreign,
-wrong-target, or non-draft release/tag.
+wrong-target, or non-draft release/tag. Once the owned release has become non-draft, transaction
+cleanup MUST treat publication as committed external state and retain both release and tag even if
+`INT` or `TERM` arrives before local traps are disarmed.
 
 #### Scenario: RC artifact omits a bundle-referenced input
 
@@ -336,3 +338,9 @@ wrong-target, or non-draft release/tag.
 - **WHEN** an exact-SHA annotated tag and draft release carry the same valid durable transaction marker
 - **THEN** the next release run MAY delete that owned residue and retry publication
 - **THEN** a foreign marker or non-draft release MUST be retained and MUST fail closed
+
+#### Scenario: a signal arrives immediately after publication
+
+- **WHEN** the owned release is already non-draft but the publication process has not yet disarmed its cleanup trap
+- **THEN** cleanup MUST retain both the published release and its annotated tag
+- **THEN** cleanup MUST return the signal-derived status without attempting either deletion

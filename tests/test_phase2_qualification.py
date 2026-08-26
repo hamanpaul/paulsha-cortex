@@ -722,8 +722,19 @@ def test_qualification_validator_rejects_release_binding_mismatch(
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
-def test_full_suite_validator_checks_evidence_semantics(tmp_path: Path) -> None:
+def test_full_suite_validator_accepts_distinct_candidate_identities(tmp_path: Path) -> None:
     payload = _valid_full_qualification(tmp_path)
+    dispatch = json.loads(
+        (tmp_path / "evidence" / "dispatch-closeout.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {
+        dispatch["release_candidate_sha"],
+        dispatch["workflow_candidate_sha"],
+        dispatch["agent_loop_probe"]["probe_candidate_sha"],
+    } == {"a" * 40, "f" * 40, "9" * 40}
+
     completed = _run_full_validator(tmp_path, payload)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 

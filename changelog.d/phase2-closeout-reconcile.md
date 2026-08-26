@@ -33,7 +33,8 @@
   `*-install-input.tar.gz` 與永久 qualification manifest；三個 asset 都核對 GitHub REST
   digest，INT/TERM/一般失敗都回收本次 draft/tag；annotated tag 內的 durable transaction marker
   讓下次 run 只清理由同 workflow 建立、仍為 draft 且 exact-SHA 的 hard-kill 殘留，不碰 foreign
-  tag 或 non-draft release。
+  tag 或 non-draft release；release 一旦發布為 non-draft，即使 signal 落在 trap 解除前也會保留
+  release/tag，並以 fault-injection 測試固定此提交邊界。
 - Deployment canary 固定 `codex/gpt-5.3-codex-spark`／`xhigh`，byte-compare 完整 Manager-owned
   wrapper script，只接受 exact Bash envelope 內 bound worktree 的 absolute Git HEAD probe，
   並把 probe job subject、workflow final candidate、Cortex release SHA 分開綁定；per-job

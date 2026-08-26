@@ -62,7 +62,16 @@
   transaction checks GitHub's REST digest for all three assets and rolls back its owned tag/release
   on ordinary failure, INT, or TERM. A durable marker in the annotated tag lets a subsequent run
   remove only its exact-SHA owned stale draft/tag after hard kill; foreign and non-draft releases
-  remain fail-closed boundaries.
+  remain fail-closed boundaries. Cleanup re-reads the owned release's draft state and treats an
+  already-published release as committed external state, so an INT/TERM between publication and
+  local trap disarm retains both release and tag; a fault-injection regression covers that window.
+- **Legacy Phase 1 managed-env crash atomicity:** `cortex install service` still writes its managed
+  env through the separate legacy installer, whose hard-crash atomicity is not established here.
+  The CLI routes every `cortex install trust-root ...` invocation directly to the transactional
+  trust-root module before the service parser, and the sole production runbook invokes only that
+  route. This is therefore an acknowledged, bounded risk for the Phase 1 service installer, not a
+  Phase 2 transactional-install or release blocker; changing it requires its own behavior contract
+  and failure-injection coverage.
 - **Legacy reference CLI:** `permgen.build_toolchain_plan()` remains as a compatibility/reference
   surface but is not the install authority. Any removal or deprecation is a separate change; this
   closeout does not strengthen it or route production install through it.

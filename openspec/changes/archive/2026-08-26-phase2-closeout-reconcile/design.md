@@ -154,7 +154,8 @@ annotated tag 與 GitHub Release 會同時發布唯一 qualified wheel、該 ins
 失敗都由同一個 transaction cleanup 回收本次 draft release 與 annotated tag。annotated tag
 message 另持久保存 run/attempt/release-SHA marker；若 SIGKILL 讓 trap 來不及執行，後續 run
 只在 exact tag target、合法 marker，以及同 marker 的 draft release 全吻合時刪除殘留並重試，
-foreign/lightweight/wrong-target tag 或 non-draft release 一律 fail closed。
+foreign/lightweight/wrong-target tag 或 non-draft release 一律 fail closed。release 一旦 PATCH 成
+non-draft 就是已提交的外部狀態；即使 signal 發生在本地 trap 解除前，cleanup 也保留 release/tag。
 #681/#695 依 shipped replacement evidence 關閉；
 #716 保持 open，直到上述 contract 對 release SHA 有成功 live run；它不阻擋 Phase 2
 source/package，但 code contract 必須隨 `v0.1.10` 交付。
@@ -167,6 +168,8 @@ source/package，但 code contract 必須隨 `v0.1.10` 交付。
   與拒絕移植的風險。
 - agent-loop package code 的存在不等於 live provider 成功；docs、issue comment 與
   qualification profile 必須維持這個誠實邊界。
+- legacy Phase 1 `cortex install service` 的 managed-env 寫入不屬於 transactional trust-root
+  installer；production runbook 不呼叫它，本 change 也不宣稱其 hard-crash atomicity。
 - job JSONL 可由被觀察 job 寫入，只能稱為綁定 Manager launch authority 的 live
   observation；provider-persisted thread 與 Manager spec 可阻止 requested/runtime identity
   假綠，但若要讓 command/output 本身升為獨立 attestation，仍需另設 Manager-owned event

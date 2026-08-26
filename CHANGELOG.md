@@ -36,7 +36,8 @@
   全部 hash 與 canonical install config，並同時發佈 qualified wheel、deterministic
   install-input archive 與永久 qualification manifest；逐 asset 核對 GitHub REST digest，
   INT/TERM/一般失敗都回收本次 draft release 與 tag；annotated tag durable marker 讓後續 run
-  只 reconcile 同 workflow 留下的 exact-SHA draft/tag，不刪 foreign 或 non-draft release。
+  只 reconcile 同 workflow 留下的 exact-SHA draft/tag，不刪 foreign 或 non-draft release；一旦
+  release 已發布為 non-draft，signal 即使早於 trap 解除也會保留 release/tag。
   `worktree-isolation` 首張 builder card 使用不指定命令的 autonomous preamble，qualification
   逐 byte 重建並驗證完整 canonical prompt／terminal schema。
   #681/#695 改指向現行 authority；#716 在對應 build 的 live canary 成功前保持 open，且
