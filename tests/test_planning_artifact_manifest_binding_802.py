@@ -81,6 +81,29 @@ def _planning_rows() -> list[dict[str, str]]:
 
 
 @pytest.mark.parametrize(
+    ("kind", "path"),
+    (
+        ("spec", f"docs/superpowers/specs/{TASK_SLUG}-spec.md"),
+        ("design", f"docs/superpowers/specs/{TASK_SLUG}-design.md"),
+        ("plan", f"docs/superpowers/plans/{TASK_SLUG}.md"),
+    ),
+)
+def test_planning_kind_bound_requires_exact_canonical_destination(
+    kind: str, path: str
+) -> None:
+    assert manager.planning_kind_bound(kind, path, TASK_SLUG) is True
+
+    prefix = path.replace(TASK_SLUG, f"prefix-{TASK_SLUG}")
+    suffix = (
+        path.replace(f"{TASK_SLUG}-", f"{TASK_SLUG}-extra-")
+        if kind in {"spec", "design"}
+        else path.replace(f"{TASK_SLUG}.md", f"{TASK_SLUG}-extra.md")
+    )
+    assert manager.planning_kind_bound(kind, prefix, TASK_SLUG) is False
+    assert manager.planning_kind_bound(kind, suffix, TASK_SLUG) is False
+
+
+@pytest.mark.parametrize(
     "combo_name", ("fix-standard", "small-fix", "feature-oneshot")
 )
 def test_manifest_publishes_spec_design_and_plan(
@@ -100,6 +123,86 @@ def test_manifest_publishes_spec_design_and_plan(
         target = tmp_path / row["path"]
         assert target.read_text(encoding="utf-8") == row["content"]
     rollback()
+
+
+def test_fix_standard_authority_accepts_published_canonical_planning_triplet(
+    tmp_path: Path,
+) -> None:
+    """fix-standard publication and authority validation share the same escape hatch."""
+
+    workspace = tmp_path / "workspace"
+    coordinator_root = tmp_path / "coordinator"
+    rows = _planning_rows()
+    rollback = manager._publish_planning_artifacts(
+        str(workspace),
+        rows,
+        work_id=CHANGE,
+        allowed_refs=_manifest_outputs("fix-standard"),
+    )
+
+    evidence_path = coordinator_root / "evidence" / "planning" / "brainstorm.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "brainstorm-peer",
+                "scope": {
+                    "repo": "acme/demo",
+                    "work_id": CHANGE,
+                    "source_revision": "a" * 64,
+                },
+                "artifacts": [
+                    {
+                        "kind": row["kind"],
+                        "ref": row["path"],
+                        "sha256": manager._sha256_path(workspace / row["path"]),
+                    }
+                    for row in rows
+                ],
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    cards = load_cards(DEFAULT_CARDS_PATH)
+    combo = load_combo(DEFAULT_COMBOS_DIR / "fix-standard.yaml", cards)
+    manifest = compile_combo(
+        combo,
+        cards,
+        TASK_SLUG,
+        change=CHANGE,
+        allow_external=True,
+        repo_root=REPO_ROOT,
+    ).workflow_manifest
+    assert manifest is not None
+    run = SimpleNamespace(
+        repo="acme/demo",
+        work_id=CHANGE,
+        workspace_root=str(workspace),
+        steps=manifest.steps,
+        openspec_refs=(CHANGE,),
+        planning_source_revision="a" * 64,
+        planning_authority=(),
+        gate_refs=(
+            manager.GateEvidenceRef(
+                "brainstorm", str(evidence_path), manager._sha256_path(evidence_path)
+            ),
+        ),
+    )
+
+    try:
+        authority, source_revision = manager._validated_brainstorm_planning_authority(
+            run,
+            coordinator_root=coordinator_root,
+        )
+    finally:
+        rollback()
+
+    assert source_revision == "a" * 64
+    assert {(item.kind, item.ref) for item in authority} == {
+        (row["kind"], row["path"]) for row in rows
+    }
 
 
 @pytest.mark.parametrize(

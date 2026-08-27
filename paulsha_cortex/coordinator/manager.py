@@ -3106,7 +3106,10 @@ def _validated_brainstorm_planning_authority(
             )
         existing = persisted.get(ref)
         if existing is None:
-            if not any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns):
+            if not (
+                any(fnmatch.fnmatch(ref, pattern) for pattern in declared_patterns)
+                or planning_kind_bound(kind, ref, run.work_id)
+            ):
                 raise ValueError(
                     f"workflow brainstorm artifact outside planner outputs: ref={ref} "
                     f"(declared={','.join(declared_patterns) or '-'})"
@@ -7898,12 +7901,12 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
     if kind in {"spec", "design"}:
         if relative.parts[:3] != ("docs", "superpowers", "specs"):
             return False
-        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
+        canonical = f"docs/superpowers/specs/{work_id}-{kind}.md"
     else:
         if relative.parts[:3] != ("docs", "superpowers", "plans"):
             return False
-        pattern = f"docs/superpowers/plans/*{work_id}*.md"
-    return fnmatch.fnmatch(path_value, pattern)
+        canonical = f"docs/superpowers/plans/{work_id}.md"
+    return path_value == canonical
 
 
 def _publish_planning_artifacts(
