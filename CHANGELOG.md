@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
+  最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
+  missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
+  已由必要 gates 驗證完成的 release。
+
 - **RC rollback qualification 順序與 unknown-state 修正**：rollback scanner 現在會依 archived
   receipt inventory 排除刻意保留的 fresh checkout／content-addressed venv 及其 carrier parent，
   同時仍回報同層 foreign sibling；container harness 也改成 rollback／clean reinstall 完成後才
