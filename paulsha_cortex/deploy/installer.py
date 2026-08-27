@@ -263,8 +263,8 @@ def _reject_foreign_default_agents_root(
         agents_root.expanduser().resolve().relative_to(home_root)
     except ValueError as exc:
         raise ValueError(
-            f"{source} 位於目前 HOME 外；"
-            "如為合法自訂路徑請使用 --agents-root 明確指定"
+            f"{source} 的 PSC_AGENTS_ROOT={agents_root} 不在目前 "
+            f"HOME={home_root} 底下；如為合法自訂路徑請使用 --agents-root 明確指定"
         ) from exc
 
 
@@ -314,7 +314,12 @@ def _backup_file(path: Path) -> Path:
     while backup.exists():
         backup = path.with_name(f"{path.name}.bak-{timestamp}-{suffix}")
         suffix += 1
-    backup.write_bytes(path.read_bytes())
+    try:
+        backup.write_bytes(path.read_bytes())
+        shutil.copymode(path, backup)
+    except Exception:
+        backup.unlink(missing_ok=True)
+        raise
     return backup
 
 
@@ -363,9 +368,13 @@ def _migrate_instance_config(
         if project_config.is_symlink() or project_config.exists():
             if project_config.is_file():
                 raise ValueError(
-                    f"既有 project config 無法載入，拒絕覆寫：{project_config}"
+                    f"既有 project config 無法載入，拒絕覆寫：{project_config}；"
+                    "請修復或移走該檔案後再重試"
                 )
-            raise ValueError(f"project config 不是一般檔案，拒絕覆寫：{project_config}")
+            raise ValueError(
+                f"project config 不是一般檔案，拒絕覆寫：{project_config}；"
+                "請修復或移走該檔案後再重試"
+            )
         project_payload = {
             "workspaces": [
                 {
@@ -439,6 +448,7 @@ def _migrate_instance_config(
         if project_needs_update:
             if existing_project:
                 created_backups.append(_backup_file(project_config))
+                shutil.copymode(project_config, staged_project)
             os.replace(staged_project, project_config)
         if identities_need_update:
             os.replace(staged_identities, identities)

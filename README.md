@@ -94,6 +94,7 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    installer 只會在末端追加目前目標，並在替換前建立 `project-cortex.yaml.bak-*`；既有
    `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env
    記錄的是另一個 HOME 下的 default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
+   回寫會以 `yaml.safe_dump` 重排格式並移除註解，原始位元組保留於同目錄的 `.bak-*`。
    既有設定若是 symlink 的情境另案處理；本段 append-only 說明只涵蓋一般檔案。
 
 2. 啟動 manager 並分別檢查 service/runtime 狀態：

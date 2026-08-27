@@ -80,6 +80,7 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
         ),
         encoding="utf-8",
     )
+    project_config.chmod(0o600)
     (config_root / "model-identities.yaml").write_text(
         "schema_version: 3\nidentities: []\n", encoding="utf-8"
     )
@@ -111,6 +112,8 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
     backups = sorted(config_root.glob("project-cortex.yaml.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == before_project
+    assert project_config.stat().st_mode & 0o777 == 0o600
+    assert backups[0].stat().st_mode & 0o777 == 0o600
     assert re.fullmatch(
         r"project-cortex\.yaml\.bak-\d{8}T\d{12}Z", backups[0].name
     )
@@ -235,6 +238,8 @@ def test_install_service_rejects_agents_root_from_different_home(
     message = str(exc_info.value).lower()
     assert "home" in message
     assert "agents" in message
+    assert f"psc_agents_root={foreign_agents_root}" in message
+    assert f"home={home}" in message
     assert env_file.read_bytes() == before_env
     assert not foreign_agents_root.exists()
 
@@ -352,7 +357,7 @@ def test_install_service_rejects_existing_unparseable_project_config(
 
     _prepare_installer(monkeypatch, home)
 
-    with pytest.raises(ValueError, match="project config"):
+    with pytest.raises(ValueError, match="修復或移走"):
         installer.install_service_result("hippo", 300, target)
 
     assert project_config.read_bytes() == before_project
