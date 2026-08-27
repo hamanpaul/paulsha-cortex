@@ -13,7 +13,11 @@ from paulsha_cortex.coordinator.claim import (
     _resume_decision,
     needs_human_next_step_hint,
 )
-from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
+from paulsha_cortex.coordinator.diagnostics import (
+    DIAGNOSTIC_DETAIL_MAX_LENGTH,
+    DiagnosticReason,
+    diagnostic_reason,
+)
 from paulsha_cortex.deck.compile import compile_combo
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
 
@@ -23,9 +27,9 @@ TASK_SLUG = "planning-artifact-manifest-binding"
 CHANGE = TASK_SLUG
 
 
-def _fix_standard_manifest_outputs() -> tuple[str, ...]:
+def _manifest_outputs(combo_name: str) -> tuple[str, ...]:
     cards = load_cards(DEFAULT_CARDS_PATH)
-    combo = load_combo(DEFAULT_COMBOS_DIR / "fix-standard.yaml", cards)
+    combo = load_combo(DEFAULT_COMBOS_DIR / f"{combo_name}.yaml", cards)
     result = compile_combo(
         combo,
         cards,
@@ -40,6 +44,10 @@ def _fix_standard_manifest_outputs() -> tuple[str, ...]:
         for step in result.workflow_manifest.steps
         for output in step.outputs
     )
+
+
+def _fix_standard_manifest_outputs() -> tuple[str, ...]:
+    return _manifest_outputs("fix-standard")
 
 
 def _planning_rows() -> list[dict[str, str]]:
@@ -71,15 +79,20 @@ def _planning_rows() -> list[dict[str, str]]:
     ]
 
 
-def test_fix_standard_manifest_publishes_spec_design_and_plan(tmp_path: Path) -> None:
-    """A fix-standard planning run must bind and publish all three artifact kinds."""
+@pytest.mark.parametrize(
+    "combo_name", ("fix-standard", "small-fix", "feature-oneshot")
+)
+def test_manifest_publishes_spec_design_and_plan(
+    tmp_path: Path, combo_name: str
+) -> None:
+    """Each supported planning manifest publishes the complete artifact triplet."""
 
     rows = _planning_rows()
     rollback = manager._publish_planning_artifacts(
         str(tmp_path),
         rows,
         work_id=CHANGE,
-        allowed_refs=_fix_standard_manifest_outputs(),
+        allowed_refs=_manifest_outputs(combo_name),
     )
 
     for row in rows:
@@ -88,7 +101,12 @@ def test_fix_standard_manifest_publishes_spec_design_and_plan(tmp_path: Path) ->
     rollback()
 
 
-def test_fix_standard_manifest_rejects_an_unbound_planning_path(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "combo_name", ("fix-standard", "small-fix", "feature-oneshot")
+)
+def test_manifest_rejects_an_unbound_planning_path(
+    tmp_path: Path, combo_name: str
+) -> None:
     row = {
         "kind": "spec",
         "path": "docs/superpowers/specs/not-this-work-spec.md",
@@ -100,9 +118,57 @@ def test_fix_standard_manifest_rejects_an_unbound_planning_path(tmp_path: Path) 
             str(tmp_path),
             [row],
             work_id=CHANGE,
-            allowed_refs=_fix_standard_manifest_outputs(),
+            allowed_refs=_manifest_outputs(combo_name),
         )
     assert not (tmp_path / row["path"]).exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe_case",
+    ("absolute", "parent-traversal", "non-markdown", "other-work", "symlink"),
+)
+def test_manifest_rejects_unsafe_planning_paths(
+    tmp_path: Path, unsafe_case: str
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("sentinel\n", encoding="utf-8")
+
+    if unsafe_case == "absolute":
+        path_value = str(tmp_path / "absolute.md")
+    elif unsafe_case == "parent-traversal":
+        path_value = f"docs/superpowers/specs/../plans/{TASK_SLUG}.md"
+    elif unsafe_case == "non-markdown":
+        path_value = f"docs/superpowers/specs/{TASK_SLUG}-spec.txt"
+    elif unsafe_case == "other-work":
+        path_value = "openspec/changes/other-work/spec.md"
+    else:
+        path_value = f"docs/superpowers/specs/{TASK_SLUG}-spec.md"
+        symlink = root / path_value
+        symlink.parent.mkdir(parents=True)
+        symlink.symlink_to(outside)
+
+    row = {
+        "kind": "spec",
+        "path": path_value,
+        "content": "---\nstatus: accepted\n---\n# Spec\n## Requirements\nNo.\n",
+    }
+    expected_message = (
+        "symlink rejected" if unsafe_case == "symlink" else "outside governed roots"
+    )
+
+    with pytest.raises(ValueError, match=expected_message):
+        manager._publish_planning_artifacts(
+            str(root),
+            [row],
+            work_id=CHANGE,
+            allowed_refs=_fix_standard_manifest_outputs(),
+        )
+
+    if unsafe_case == "symlink":
+        assert (root / path_value).is_symlink()
+        assert outside.read_text(encoding="utf-8") == "sentinel\n"
 
 
 def _content_needs_human_candidate() -> ClaimCandidate:
@@ -207,3 +273,19 @@ def test_content_needs_human_reason_persists_hint_in_payload() -> None:
     ).to_dict()
 
     assert reason["next_step_hint"] == hint
+
+
+def test_next_step_hint_matches_detail_truncation_contract() -> None:
+    long_hint = "next\nstep " + "x" * (DIAGNOSTIC_DETAIL_MAX_LENGTH + 20)
+
+    reason = DiagnosticReason(
+        reason="hint-too-long",
+        detail=long_hint,
+        source="mod.fn",
+        next_step_hint=long_hint,
+    )
+
+    assert reason.next_step_hint == reason.detail
+    assert reason.next_step_hint.endswith("…")
+    assert len(reason.next_step_hint) == DIAGNOSTIC_DETAIL_MAX_LENGTH + 1
+    assert reason.to_dict()["next_step_hint"] == reason.next_step_hint

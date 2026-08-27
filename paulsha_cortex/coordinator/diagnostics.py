@@ -177,7 +177,12 @@ class DiagnosticReason:
                 raise DiagnosticInvariantError(
                     "diagnostic next_step_hint 必須為非空人可讀字串"
                 )
-            object.__setattr__(self, "next_step_hint", _single_line(self.next_step_hint))
+            next_step_hint = _single_line(self.next_step_hint)
+            if len(next_step_hint) > DIAGNOSTIC_DETAIL_MAX_LENGTH:
+                next_step_hint = (
+                    next_step_hint[:DIAGNOSTIC_DETAIL_MAX_LENGTH].rstrip() + "…"
+                )
+            object.__setattr__(self, "next_step_hint", next_step_hint)
         if self.recorded_at is None:
             object.__setattr__(self, "recorded_at", _utcnow())
         elif not isinstance(self.recorded_at, str) or not self.recorded_at:
