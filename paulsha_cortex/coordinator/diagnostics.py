@@ -49,7 +49,10 @@ __all__ = [
 ]
 
 
-DIAGNOSTIC_REASON_SCHEMA_VERSION = 1
+# v2 adds the optional, persisted ``next_step_hint`` field.  Readers accept
+# v1 payloads below so existing workflow state remains loadable during rollout.
+DIAGNOSTIC_REASON_SCHEMA_VERSION = 2
+_LEGACY_DIAGNOSTIC_REASON_SCHEMA_VERSION = 1
 
 # `reason` 是機器可讀的分類碼：小寫、無空白、無換行。呼叫端既有的 reason 字面值
 # （`planning-publication-drift`、`provider-retry-exhausted`、
@@ -228,15 +231,26 @@ class DiagnosticReason:
         else:
             raise DiagnosticInvariantError("diagnostic evidence_refs 格式錯誤")
         context = payload.get("context") or {}
+        payload_schema_version = payload.get(
+            "schema_version", DIAGNOSTIC_REASON_SCHEMA_VERSION
+        )
+        if payload_schema_version == _LEGACY_DIAGNOSTIC_REASON_SCHEMA_VERSION:
+            # v1 had no next_step_hint.  Normalize the legacy record to the
+            # current schema while preserving all fields it did persist.
+            schema_version = DIAGNOSTIC_REASON_SCHEMA_VERSION
+            next_step_hint = None
+        else:
+            schema_version = payload_schema_version
+            next_step_hint = payload.get("next_step_hint")
         return cls(
             reason=payload.get("reason"),
             detail=payload.get("detail"),
             source=payload.get("source"),
             evidence_refs=evidence_refs,
             context=context,
-            next_step_hint=payload.get("next_step_hint"),
+            next_step_hint=next_step_hint,
             recorded_at=payload.get("recorded_at"),
-            schema_version=payload.get("schema_version", DIAGNOSTIC_REASON_SCHEMA_VERSION),
+            schema_version=schema_version,
         )
 
     def rendered(self) -> str:

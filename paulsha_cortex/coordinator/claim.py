@@ -1326,16 +1326,15 @@ def needs_human_next_step_hint(
     )
     if planning_failure_classification == "content":
         return (
-            "planning content was rejected; first restore an accepted "
-            "spec/design/plan triplet, then run "
-            f"{abandon} and re-intake the work item."
+            "規劃內容遭拒；請先恢復可接受的 spec/design/plan 三件套，接著執行 "
+            f"{abandon}，再重新 intake 此工作項目。"
         )
     if "recover-planning" in actions:
         return (
-            "Fix the planning environment and retry recover-planning; if it "
-            f"cannot be recovered, run {abandon}."
+            "請修復規劃環境並重試 recover-planning；若無法修復，請執行 "
+            f"{abandon}。"
         )
-    return f"Review the blocking evidence, then run {abandon}."
+    return f"請檢視阻塞證據，接著執行 {abandon}。"
 
 
 def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:

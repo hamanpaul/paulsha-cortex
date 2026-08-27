@@ -15,6 +15,7 @@ from paulsha_cortex.coordinator.claim import (
 )
 from paulsha_cortex.coordinator.diagnostics import (
     DIAGNOSTIC_DETAIL_MAX_LENGTH,
+    DIAGNOSTIC_REASON_SCHEMA_VERSION,
     DiagnosticReason,
     diagnostic_reason,
 )
@@ -211,6 +212,30 @@ def test_content_needs_human_exposes_hint_and_abandon() -> None:
     assert decision.next_actions == ("abandon",)
     assert isinstance(decision.next_step_hint, str)
     assert "abandon" in decision.next_step_hint
+    assert "規劃內容遭拒" in decision.next_step_hint
+
+
+@pytest.mark.parametrize(
+    ("phase", "classification", "prefix"),
+    (
+        ("define", "content", "規劃內容遭拒"),
+        ("define", "environment", "請修復規劃環境"),
+        ("build", None, "請檢視阻塞證據"),
+    ),
+)
+def test_needs_human_hint_branches_use_traditional_chinese(
+    phase: str, classification: str | None, prefix: str
+) -> None:
+    hint = needs_human_next_step_hint(
+        phase=phase,
+        planning_failure_classification=classification,
+        work_id=TASK_SLUG,
+        repo="acme/demo",
+        run_id="workflow-" + "a" * 20,
+    )
+
+    assert hint.startswith(prefix)
+    assert "cortex work abandon" in hint
 
 
 def test_content_needs_human_status_exposes_hint_and_abandon(tmp_path: Path) -> None:
@@ -289,3 +314,35 @@ def test_next_step_hint_matches_detail_truncation_contract() -> None:
     assert reason.next_step_hint.endswith("…")
     assert len(reason.next_step_hint) == DIAGNOSTIC_DETAIL_MAX_LENGTH + 1
     assert reason.to_dict()["next_step_hint"] == reason.next_step_hint
+
+
+def test_diagnostic_reason_round_trips_additive_hint_field() -> None:
+    reason = diagnostic_reason(
+        "brainstorm-not-ready",
+        "content planning output was rejected",
+        source="manager.apply_workflow_action:start-brainstorm",
+        next_step_hint="請修復規劃內容後重新 intake。",
+        recorded_at="2026-08-27T00:00:00+00:00",
+    )
+
+    restored = DiagnosticReason.from_dict(reason.to_dict())
+
+    assert restored == reason
+    assert restored.schema_version == DIAGNOSTIC_REASON_SCHEMA_VERSION
+
+
+def test_diagnostic_reason_reads_schema_v1_without_hint() -> None:
+    legacy_payload = {
+        "schema_version": 1,
+        "reason": "brainstorm-not-ready",
+        "detail": "content planning output was rejected",
+        "source": "manager.apply_workflow_action:start-brainstorm",
+        "recorded_at": "2026-08-27T00:00:00+00:00",
+    }
+
+    restored = DiagnosticReason.from_dict(legacy_payload)
+
+    assert restored.schema_version == DIAGNOSTIC_REASON_SCHEMA_VERSION
+    assert restored.next_step_hint is None
+    assert restored.to_dict()["schema_version"] == DIAGNOSTIC_REASON_SCHEMA_VERSION
+    assert "next_step_hint" not in restored.to_dict()
