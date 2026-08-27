@@ -20,4 +20,4 @@ work_item: agy-builder-support
       維持 `plan+sandbox`；本卡交付範圍仍止於 pre-archive。
 - [x] agy builder 的 write-forbidden contract 採建構期顯性拒絕，並以回歸測試固定
       `SubprocessLauncher.__init__`／`as_write_forbidden()` 的 fail-closed 行為。
-- [ ] Manager 於交付前執行 authoritative preflight 並採信 Candidate。
+- [x] 完成 pre-archive Candidate 準備；authoritative preflight 採信與 archive／merge 由 Manager 於 ship 執行。
