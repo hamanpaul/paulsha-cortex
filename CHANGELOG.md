@@ -10,7 +10,8 @@
 - **Installer shared config guard**：`cortex install service` 遇到既有
   `project-cortex.yaml` 時只追加目標 workspace，替換前保留 `.bak-*` 備份；既有
   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時 fail-closed，跨 HOME
-  的 default agents root 也必須以 `--agents-root` 明確指定。
+  的 default agents root 也必須以 `--agents-root` 明確指定；命中既有 workspace 時
+  保留原條目與其他設定區塊，migration rollback 會清理本次建立的備份。
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
   block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同

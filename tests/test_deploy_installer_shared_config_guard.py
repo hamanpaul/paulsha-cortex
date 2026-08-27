@@ -65,7 +65,16 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
                 "workspaces": [
                     {"name": "existing-a", "path": str(existing_a)},
                     {"name": "existing-b", "path": str(existing_b)},
-                ]
+                ],
+                "monitor": {
+                    "poll_interval_seconds": 17,
+                    "ignore_dirs": [".git", ".pytest_cache"],
+                },
+                "hippo": {
+                    "projects": [
+                        {"slug": "shared-memory", "roots": [str(existing_a)]}
+                    ]
+                },
             },
             sort_keys=False,
         ),
@@ -92,6 +101,13 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
         ("existing-b", existing_b.resolve(), False),
         ("target", target.resolve(), True),
     ]
+    assert payload["monitor"] == {
+        "poll_interval_seconds": 17,
+        "ignore_dirs": [".git", ".pytest_cache"],
+    }
+    assert payload["hippo"] == {
+        "projects": [{"slug": "shared-memory", "roots": [str(existing_a)]}]
+    }
     backups = sorted(config_root.glob("project-cortex.yaml.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == before_project
@@ -99,6 +115,100 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
         r"project-cortex\.yaml\.bak-\d{8}T\d{12}Z", backups[0].name
     )
     assert env_file.read_bytes() != before_env
+
+
+def test_install_service_preserves_existing_non_exact_workspace_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching operator entry is never rewritten or promoted by install."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    home = tmp_path / "home"
+    agents_root = home / ".agents"
+    config_root = agents_root / "config" / "paulsha"
+    config_root.mkdir(parents=True)
+    project_config = config_root / "project-cortex.yaml"
+    project_config.write_text(
+        yaml.safe_dump(
+            {
+                "workspaces": [
+                    {
+                        "name": "operator-target",
+                        "path": str(target),
+                        "exact_project": False,
+                    }
+                ],
+                "monitor": {"ignore_dirs": [".cache"]},
+                "hippo": {"projects": [{"slug": "ambient", "roots": [str(target)]}]},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    env_file = _write_instance_env(home, agents_root, config_root)
+    before_project = project_config.read_bytes()
+    before_env = env_file.read_bytes()
+
+    _prepare_installer(monkeypatch, home)
+
+    result = installer.install_service_result("hippo", 300, target)
+
+    assert result.exit_code == 0
+    assert project_config.read_bytes() == before_project
+    assert not list(config_root.glob("project-cortex.yaml.bak-*"))
+    assert yaml.safe_load(project_config.read_text(encoding="utf-8"))["workspaces"][0][
+        "exact_project"
+    ] is False
+    assert env_file.read_bytes() != before_env
+
+
+def test_install_service_rollback_removes_migration_backups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed migration restores files and removes only its new backup."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    other = _init_git_repo(tmp_path / "repo" / "other")
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    project_config = config_root / "project-cortex.yaml"
+    project_config.write_text(
+        yaml.safe_dump(
+            {"workspaces": [{"name": "other", "path": str(other)}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(f"PSC_PROJECT_CONFIG_ROOT={config_root}\n", encoding="utf-8")
+    before_project = project_config.read_bytes()
+    before_env = env_file.read_bytes()
+
+    def fail_env_write(*args, **kwargs):
+        raise OSError("injected env write failure")
+
+    monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
+
+    with pytest.raises(OSError, match="injected env write failure"):
+        installer._migrate_instance_config(
+            env_file=env_file,
+            existing={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+            config_root=config_root,
+            repo_root=target,
+            managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+        )
+
+    assert project_config.read_bytes() == before_project
+    assert env_file.read_bytes() == before_env
+    assert not list(config_root.glob("project-cortex.yaml.bak-*"))
 
 
 def test_install_service_rejects_agents_root_from_different_home(

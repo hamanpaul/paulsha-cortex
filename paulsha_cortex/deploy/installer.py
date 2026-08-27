@@ -378,7 +378,8 @@ def _migrate_instance_config(
         project_needs_update = True
     else:
         workspaces = project_payload["workspaces"]
-        assert isinstance(workspaces, list)
+        if not isinstance(workspaces, list):
+            raise ValueError(f"project config workspaces 格式錯誤：{project_config}")
         target_index = _workspace_index_for_repo(project_payload, repo_root)
         if target_index is None:
             workspaces = [dict(row) for row in workspaces]
@@ -392,17 +393,10 @@ def _migrate_instance_config(
             project_payload["workspaces"] = workspaces
             project_needs_update = True
         else:
-            target = workspaces[target_index]
-            if not isinstance(target, dict):
-                raise ValueError(f"project config workspace 格式錯誤：{project_config}")
-            exact = target.get("exact_project", target.get("exact", False))
-            if exact:
-                project_needs_update = False
-            else:
-                workspaces = [dict(row) for row in workspaces]
-                workspaces[target_index]["exact_project"] = True
-                project_payload["workspaces"] = workspaces
-                project_needs_update = True
+            # A path match is an operator-owned entry.  Keep the complete
+            # validated document byte-for-byte; in particular, do not promote
+            # an existing ``exact_project: false`` entry during install.
+            project_needs_update = False
 
     identities_need_update = not identity_exists
 
@@ -427,6 +421,7 @@ def _migrate_instance_config(
         project_config: project_config.read_bytes() if project_config.is_file() else None,
         identities: identities.read_bytes() if identities.is_file() else None,
     }
+    created_backups: list[Path] = []
     staging = Path(tempfile.mkdtemp(prefix=".cortex-migration-", dir=config_root))
     try:
         if project_needs_update:
@@ -443,7 +438,7 @@ def _migrate_instance_config(
             load_model_identities(staging, use_packaged_default=False)
         if project_needs_update:
             if existing_project:
-                _backup_file(project_config)
+                created_backups.append(_backup_file(project_config))
             os.replace(staged_project, project_config)
         if identities_need_update:
             os.replace(staged_identities, identities)
@@ -453,9 +448,13 @@ def _migrate_instance_config(
             preserve_existing=_PRESERVE_EXISTING_PATHS,
         )
     except Exception:
-        _restore_file(env_file, previous[env_file])
-        _restore_file(project_config, previous[project_config])
-        _restore_file(identities, previous[identities])
+        try:
+            _restore_file(env_file, previous[env_file])
+            _restore_file(project_config, previous[project_config])
+            _restore_file(identities, previous[identities])
+        finally:
+            for backup in created_backups:
+                backup.unlink(missing_ok=True)
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
