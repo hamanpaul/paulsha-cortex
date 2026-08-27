@@ -18,7 +18,7 @@ registry 檔案、不改任何 `.py`**；實際登錄由 `#452` B（schema v2→
   （`paulsha_cortex/coordinator/launcher.py:783-789` `_ARGV_BUILDERS`，唯一真相來源）。
 - packaged registry（`paulsha_cortex/coordinator/data/model-identities.yaml`）現況**只有一個 agy 身分**：
   `agy` / `gemini-3.1-pro-high` / `google` / `capabilities: [planning, review]` /
-  `live_probe: agy-plan-sandbox`。packaged roster 中的 agy 身分未帶 `build` capability
+  `live_probe: agy-plan-sandbox`。packaged roster 中沒有任何 agy 身分帶 `build` capability
   （build 僅 copilot／claude／codex 具備）。
 - 至今**沒有任何真模型跑完整 patchmud deck 的實測樣本**（`#455` 現況），因此本矩陣沒有
   「已實測」格；全部非排除格皆為「待 benchmark」。
@@ -105,7 +105,7 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 |---|---|---|
 | `agy` / `gemini-3.6-flash-high`（review 候選） | `docs/superpowers/workstreams/cost-governance-cluster/todo.md:135`（三身分表，與 packaged registry 矛盾、`#209` spec R6 已記錄未收斂）；`driving-cortex-skill/todo.md:12`（ForeignReview 計畫） | 需 `agy models` 實測確認 CLI token 在列才可登錄。**即使確認，也只登 `review` capability、不得登 `planning`**：`probe_agy_capability`（`model_identities.py:352,360`）寫死只驗 `AGY_MODEL_ID`，第二個 agy planning 身分會通過 registry 驗證卻拿不到真 live probe 覆蓋（假覆蓋）。確認後 reviewer 格 +1 → N+1。 |
 | `codex` / `gpt-5.4-codex` | 僅 `docs/superpowers/plans/feat-slice-executor-model.md:13` 的測試 fixture 例示 | 非實跑紀錄，不足為據；確認實際可用後依 R2 codex 列（3 個非排除格）→ N+3。 |
-| `claude` / `sonnet` 的完整版本 pin | `cost-governance-cluster/todo.md:135` 的 `claude-sonnet-4-6` 掛在 executor `agy` 之下（且該表與 packaged registry 矛盾、agy builder 已被 R1-3 排除），不可移植為 `claude` executor 的依據 | 先以別名 `sonnet` 登錄（CLI 接受），版本 pin 由 benchmark run 的 provenance 記錄實際解析到的模型版本，之後再決定是否改登 pinned id。 |
+| `claude` / `sonnet` 的完整版本 pin | `cost-governance-cluster/todo.md:135` 的 `claude-sonnet-4-6` 掛在 executor `agy` 之下（且該表與 packaged registry 矛盾；agy builder 在 packaged fallback 不可達（R1-3），host overlay 明示 `build` 後由 #799 launcher 可達），不可移植為 `claude` executor 的依據 | 先以別名 `sonnet` 登錄（CLI 接受），版本 pin 由 benchmark run 的 provenance 記錄實際解析到的模型版本，之後再決定是否改登 pinned id。 |
 
 ### R5 `independence_domain` 填法與 builder/reviewer 分離相容性
 
