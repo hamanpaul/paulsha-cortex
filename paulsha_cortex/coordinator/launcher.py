@@ -1222,8 +1222,6 @@ def build_agy_argv(
         if review_only and worktree is not None:
             argv.extend(["--add-dir", str(Path(worktree).resolve())])
     else:
-        if worktree is None:
-            raise ValueError("agy builder requires a worktree")
         worktree = str(Path(worktree).resolve())
         argv = ["agy", "--print", prompt, "--mode", "accept-edits"]
         argv.extend(["--add-dir", worktree])
@@ -1356,6 +1354,8 @@ class SubprocessLauncher:
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
+        if executor == "agy" and write_forbidden:
+            raise ValueError("agy executor has no write-forbidden writable form")
         if executor == "cg" and allow_unsafe:
             raise ValueError("cg executor refuses unsafe mode")
         if (read_only or review_only) and executor == "copilot":
@@ -1532,6 +1532,8 @@ class SubprocessLauncher:
 
         if self._read_only or self._review_only:
             return self
+        if self._executor == "agy":
+            raise ValueError("agy executor has no write-forbidden writable form")
         if self._allow_unsafe:
             return self
         if self._commit_required:

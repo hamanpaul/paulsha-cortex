@@ -18,5 +18,6 @@ work_item: agy-builder-support
 - [x] 依 retry_context 重現並補強 F1／F2／F3 的機械回歸覆蓋；agy 的 builder 判定固定為
       「有 provisioned worktree 且非 read-only/reviewer」，無 worktree 的歷史 direct planning
       維持 `plan+sandbox`；本卡交付範圍仍止於 pre-archive。
-- [ ] Manager 於交付前執行 authoritative preflight 並採信 Candidate；archive、merge、issue closure 與 done
-      判定不屬本卡。
+- [x] agy builder 的 write-forbidden contract 採建構期顯性拒絕，並以回歸測試固定
+      `SubprocessLauncher.__init__`／`as_write_forbidden()` 的 fail-closed 行為。
+- [ ] Manager 於交付前執行 authoritative preflight 並採信 Candidate。

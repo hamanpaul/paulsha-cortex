@@ -18,7 +18,8 @@ registry 檔案、不改任何 `.py`**；實際登錄由 `#452` B（schema v2→
   （`paulsha_cortex/coordinator/launcher.py:783-789` `_ARGV_BUILDERS`，唯一真相來源）。
 - packaged registry（`paulsha_cortex/coordinator/data/model-identities.yaml`）現況**只有一個 agy 身分**：
   `agy` / `gemini-3.1-pro-high` / `google` / `capabilities: [planning, review]` /
-  `live_probe: agy-plan-sandbox`。packaged roster 沒有任何身分帶 `build` capability。
+  `live_probe: agy-plan-sandbox`。packaged roster 中沒有任何 agy 身分帶 `build` capability
+  （build 僅 copilot／claude／codex 具備）。
 - 至今**沒有任何真模型跑完整 patchmud deck 的實測樣本**（`#455` 現況），因此本矩陣沒有
   「已實測」格；全部非排除格皆為「待 benchmark」。
 - 引用之行號以 main @ `ea76673`（v0.1.6）為準，行號可能隨後續 commit 漂移；引用時以

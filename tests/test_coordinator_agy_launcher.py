@@ -9,11 +9,11 @@ from paulsha_cortex.coordinator.launcher import SubprocessLauncher, build_agy_ar
 from paulsha_cortex.coordinator.model_identities import AGY_MODEL_ID, load_model_identities
 
 
-def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single(tmp_path) -> None:
+def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
     argv = build_agy_argv(
         prompt="first line\nsecond line",
         slice_id="plan-demo",
-        log_dir=str(tmp_path / "logs"),
+        log_dir="/tmp/logs",
         model="Gemini 3.1 Pro (High)",
     )
 
@@ -101,6 +101,13 @@ def test_agy_launcher_accepts_explicit_unsafe_builder_mode() -> None:
     launcher = SubprocessLauncher(executor="agy", allow_unsafe=True)
 
     assert launcher.executor == "agy"
+
+
+def test_agy_launcher_rejects_write_forbidden_builder_mode() -> None:
+    with pytest.raises(ValueError, match="agy.*write-forbidden.*writable"):
+        SubprocessLauncher(executor="agy", write_forbidden=True)
+    with pytest.raises(ValueError, match="agy.*write-forbidden.*writable"):
+        SubprocessLauncher(executor="agy").as_write_forbidden()
 
 
 def test_agy_registry_build_capability_matches_writable_launcher_shape(tmp_path) -> None:
