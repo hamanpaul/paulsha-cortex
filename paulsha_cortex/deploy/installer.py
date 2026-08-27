@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import os
 import re
 import shutil
@@ -12,7 +13,6 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Sequence
-from uuid import uuid4
 
 import yaml
 
@@ -255,15 +255,17 @@ def _resolve_agents_root(raw_agents_root: str | None) -> Path | None:
 def _reject_foreign_default_agents_root(
     agents_root: Path | None, bootstrap_root: Path, *, source: str
 ) -> None:
-    """Reject an implicit ``.agents`` root resolved under another HOME."""
-    if agents_root is None or agents_root.name != ".agents":
+    """Reject an implicit agents root resolved outside the current HOME."""
+    if agents_root is None:
         return
-    if agents_root.expanduser().resolve() == bootstrap_root.resolve():
-        return
-    raise ValueError(
-        f"{source} 的 default agents root 位於另一個 HOME；"
-        "如為合法自訂路徑請使用 --agents-root 明確指定"
-    )
+    home_root = bootstrap_root.parent.resolve()
+    try:
+        agents_root.expanduser().resolve().relative_to(home_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"{source} 位於目前 HOME 外；"
+            "如為合法自訂路徑請使用 --agents-root 明確指定"
+        ) from exc
 
 
 def _load_project_config_payload(config_path: Path) -> dict[str, object] | None:
@@ -306,39 +308,18 @@ def _workspace_index_for_repo(
 
 
 def _backup_file(path: Path) -> Path:
-    backup = path.with_name(f"{path.name}.bak-{uuid4().hex}")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}.bak-{timestamp}")
+    suffix = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.bak-{timestamp}-{suffix}")
+        suffix += 1
     backup.write_bytes(path.read_bytes())
     return backup
 
 
 def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
     return runtime_dir / f"{instance}.env"
-
-
-def _is_exact_project_config(config_path: Path, repo_root: Path) -> bool:
-    try:
-        from paulsha_cortex.monitor.config import load_config
-
-        config = load_config(config_path=config_path)
-    except (OSError, ValueError):
-        return False
-    if len(config.workspaces) != 1:
-        return False
-    workspace = config.workspaces[0]
-    return (
-        workspace.exact_project
-        and workspace.path.expanduser().resolve() == repo_root.expanduser().resolve()
-    )
-
-
-def _is_loadable_model_identities(config_root: Path) -> bool:
-    try:
-        from paulsha_cortex.coordinator.model_identities import load_model_identities
-
-        load_model_identities(config_root, use_packaged_default=False)
-    except (OSError, ValueError):
-        return False
-    return True
 
 
 def _restore_file(path: Path, previous: bytes | None) -> None:
@@ -465,8 +446,6 @@ def _migrate_instance_config(
                 _backup_file(project_config)
             os.replace(staged_project, project_config)
         if identities_need_update:
-            if identity_exists:
-                _backup_file(identities)
             os.replace(staged_identities, identities)
         _write_managed_env(
             env_file,

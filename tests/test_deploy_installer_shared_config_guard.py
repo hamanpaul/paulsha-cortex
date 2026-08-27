@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -94,6 +95,9 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
     backups = sorted(config_root.glob("project-cortex.yaml.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == before_project
+    assert re.fullmatch(
+        r"project-cortex\.yaml\.bak-\d{8}T\d{12}Z", backups[0].name
+    )
     assert env_file.read_bytes() != before_env
 
 
@@ -128,12 +132,12 @@ def test_install_service_rejects_agents_root_from_different_home(
 def test_install_service_rejects_process_agents_root_from_different_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An implicit process env default root must obey the HOME boundary too."""
+    """An implicit process env root must obey HOME regardless of its basename."""
     from paulsha_cortex.deploy import installer
 
     target = _init_git_repo(tmp_path / "repo")
     home = tmp_path / "current-home"
-    foreign_agents_root = tmp_path / "foreign-home" / ".agents"
+    foreign_agents_root = tmp_path / "foreign-home" / "external-root"
 
     _prepare_installer(monkeypatch, home)
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(foreign_agents_root))

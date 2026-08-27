@@ -115,6 +115,7 @@ def service_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str
         path.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("PSC_INSTANCE", "beta")
     monkeypatch.setenv("PSC_CONTROL_ROOT", str(control_root))

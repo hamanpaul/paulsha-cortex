@@ -75,13 +75,20 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _isolate_runtime_root_environment() -> Iterator[None]:
+def _isolate_runtime_root_environment(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
     """Prevent session-scoped setup from reading the operator's runtime roots."""
     names = ("PSC_AGENTS_ROOT", "PSC_PROJECT_CONFIG_ROOT")
     previous = {name: os.environ[name] for name in names if name in os.environ}
+    session_root = tmp_path_factory.mktemp("session-psc-root")
+    isolated_agents_root = session_root / "agents"
+    isolated_project_config_root = isolated_agents_root / "config" / "paulsha"
     for name in names:
         os.environ.pop(name, None)
     try:
+        os.environ["PSC_AGENTS_ROOT"] = str(isolated_agents_root)
+        os.environ["PSC_PROJECT_CONFIG_ROOT"] = str(isolated_project_config_root)
         yield
     finally:
         for name in names:

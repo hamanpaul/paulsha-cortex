@@ -7,6 +7,12 @@ import pytest
 from paulsha_cortex.deploy.installer import render_units
 
 
+@pytest.fixture(autouse=True)
+def _clear_injected_agents_root(monkeypatch):
+    """Installer tests choose HOME or an explicit root as their authority."""
+    monkeypatch.delenv("PSC_AGENTS_ROOT", raising=False)
+
+
 def _init_git_repo(path):
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(path)], check=True)
@@ -118,10 +124,9 @@ def test_install_preserves_existing_operator_env_lines(tmp_path, monkeypatch):
     # 曾把它與 PSC_RUN_ROOT/PSC_MONITOR_STATE_ROOT 一視同仁地鎖住，導致一個早期
     # 殘留的錯誤值永遠無法被 `cortex install service` 重裝修復（issue #371 實測
     # hippo instance 正是卡在這裡，多 instance 因此共用同一份 GitHub 配額）。
-    # 現在每次 install 都必須以目前 PSC_AGENTS_ROOT 推導值覆寫。這裡沒有另外
-    # delenv PSC_AGENTS_ROOT，所以套用 conftest 的 `_clear_runtime_env` guard
-    # 預設值（tmp_path/"unset-psc-root-guard"/"agents"），不是 home/.agents。
-    guard_agents_root = tmp_path / "unset-psc-root-guard" / "agents"
+    # 現在每次 install 都必須以目前 PSC_AGENTS_ROOT 推導值覆寫；本 module fixture
+    # 清掉 conftest 的 generic root，故此案例回到本測試 HOME 下的預設 root。
+    guard_agents_root = home / ".agents"
     assert "PSC_PROJECT_CONFIG_ROOT=/custom/config" not in env_lines
     assert f"PSC_PROJECT_CONFIG_ROOT={guard_agents_root / 'config' / 'paulsha'}" in env_lines
     # #375：PSC_CONTROL_ROOT 是新收進 managed_env 的鍵，且明確「絕不可」放進
@@ -212,10 +217,11 @@ def test_install_derives_runtime_defaults_from_agents_root_but_keeps_bootstrap_e
     custom_agents = tmp_path / "custom-agents"
     monkeypatch.setattr(installer, "_systemctl_available", lambda: False)
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("PSC_AGENTS_ROOT", str(custom_agents))
     monkeypatch.chdir(repo_root)
 
-    assert installer.main(["service", "--instance", "beta"]) == 0
+    assert installer.main(
+        ["service", "--instance", "beta", "--agents-root", str(custom_agents)]
+    ) == 0
 
     env_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_lines = env_file.read_text(encoding="utf-8").splitlines()
@@ -230,7 +236,7 @@ def test_install_existing_agents_root_drives_new_specific_defaults(tmp_path, mon
 
     repo_root = _init_git_repo(tmp_path / "repo")
     home = tmp_path / "home"
-    custom_agents = tmp_path / "operator-agents"
+    custom_agents = home / "operator-agents"
     env_file = home / ".agents" / "core" / "runtime" / "beta-manager.env"
     env_file.parent.mkdir(parents=True)
     env_file.write_text(f"PSC_AGENTS_ROOT={custom_agents}\n", encoding="utf-8")
