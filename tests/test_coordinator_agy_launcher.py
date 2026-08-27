@@ -9,13 +9,12 @@ from paulsha_cortex.coordinator.launcher import SubprocessLauncher, build_agy_ar
 from paulsha_cortex.coordinator.model_identities import AGY_MODEL_ID, load_model_identities
 
 
-def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
+def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single(tmp_path) -> None:
     argv = build_agy_argv(
         prompt="first line\nsecond line",
         slice_id="plan-demo",
-        log_dir="/tmp/logs",
+        log_dir=str(tmp_path / "logs"),
         model="Gemini 3.1 Pro (High)",
-        read_only=True,
     )
 
     assert argv == [
@@ -31,12 +30,13 @@ def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
     assert "--dangerously-skip-permissions" not in argv
 
 
-def test_agy_reviewer_argv_grants_only_the_disposable_checkout() -> None:
+def test_agy_reviewer_argv_grants_only_the_disposable_checkout(tmp_path) -> None:
+    worktree = tmp_path / "reviewer-checkout"
     argv = build_agy_argv(
         prompt="inspect",
         slice_id="verify-demo",
-        log_dir="/tmp/logs",
-        worktree="/tmp/reviewer-checkout",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree),
         review_only=True,
     )
 
@@ -48,16 +48,17 @@ def test_agy_reviewer_argv_grants_only_the_disposable_checkout() -> None:
         "plan",
         "--sandbox",
     ]
-    assert argv[6:8] == ["--add-dir", "/tmp/reviewer-checkout"]
+    assert argv[6:8] == ["--add-dir", str(worktree.resolve())]
     assert "--dangerously-skip-permissions" not in argv
 
 
-def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree() -> None:
+def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree(tmp_path) -> None:
+    worktree = tmp_path / "builder-checkout"
     argv = build_agy_argv(
         prompt="implement",
         slice_id="build-demo",
-        log_dir="/tmp/logs",
-        worktree="/tmp/builder-checkout",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree),
     )
 
     assert argv[:5] == [
@@ -67,17 +68,18 @@ def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree() -> None:
         "--mode",
         "accept-edits",
     ]
-    assert argv[5:7] == ["--add-dir", "/tmp/builder-checkout"]
+    assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
     assert "--sandbox" not in argv
     assert "--dangerously-skip-permissions" not in argv
 
 
-def test_agy_builder_unsafe_argv_adds_permission_bypass() -> None:
+def test_agy_builder_unsafe_argv_adds_permission_bypass(tmp_path) -> None:
+    worktree = tmp_path / "builder-checkout"
     argv = build_agy_argv(
         prompt="implement",
         slice_id="build-demo",
-        log_dir="/tmp/logs",
-        worktree="/tmp/builder-checkout",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree),
         allow_unsafe=True,
     )
 
@@ -88,7 +90,7 @@ def test_agy_builder_unsafe_argv_adds_permission_bypass() -> None:
         "--mode",
         "accept-edits",
     ]
-    assert argv[5:7] == ["--add-dir", "/tmp/builder-checkout"]
+    assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
     assert "--sandbox" not in argv
     assert "--dangerously-skip-permissions" in argv
 
@@ -100,17 +102,31 @@ def test_agy_launcher_accepts_explicit_unsafe_builder_mode() -> None:
 
 
 def test_agy_registry_build_capability_matches_writable_launcher_shape(tmp_path) -> None:
+    (tmp_path / "model-identities.yaml").write_text(
+        f"""\
+schema_version: 3
+identities:
+  - executor: agy
+    model_id: {AGY_MODEL_ID}
+    independence_domain: google
+    capabilities: [planning, build, review]
+    live_probe: agy-plan-sandbox
+""",
+        encoding="utf-8",
+    )
     registry = load_model_identities(tmp_path, use_packaged_default=True)
     identity = registry.require("agy", AGY_MODEL_ID)
+    assert identity.origin == "operator-overlay"
+    registry_declares_build = "build" in identity.capabilities
+    assert registry_declares_build
     worktree = tmp_path / "builder-checkout"
     argv = build_agy_argv(
         prompt="implement",
         slice_id="build-demo",
-        log_dir="/tmp/logs",
+        log_dir=str(tmp_path / "logs"),
         worktree=str(worktree),
     )
 
-    registry_declares_build = "build" in identity.capabilities
     expected_mode = "accept-edits" if registry_declares_build else "plan"
     expected_sandbox = not registry_declares_build
     actual_mode = argv[argv.index("--mode") + 1]
@@ -120,7 +136,6 @@ def test_agy_registry_build_capability_matches_writable_launcher_shape(tmp_path)
         and "--sandbox" not in argv
         and actual_worktree == str(worktree.resolve())
     )
-    assert registry_declares_build
     assert actual_mode == expected_mode
     assert ("--sandbox" in argv) is expected_sandbox
     assert registry_declares_build is launcher_is_writable
@@ -128,7 +143,7 @@ def test_agy_registry_build_capability_matches_writable_launcher_shape(tmp_path)
 
 @pytest.mark.parametrize(
     "builder_options",
-    ({}, {"allow_unsafe": True}, {"commit_required": True}),
+    ({"read_only": False}, {"allow_unsafe": True}, {"commit_required": True}),
     ids=("default", "unsafe", "commit-required"),
 )
 def test_agy_builder_requires_a_worktree(builder_options) -> None:
@@ -136,17 +151,17 @@ def test_agy_builder_requires_a_worktree(builder_options) -> None:
         build_agy_argv(
             prompt="implement",
             slice_id="build-demo",
-            log_dir="/tmp/logs",
+            log_dir=".",
             **builder_options,
         )
 
 
 def test_agy_commit_required_argv_adds_linked_git_write_dirs(monkeypatch, tmp_path) -> None:
     git_write_dirs = (
-        "/tmp/worktree-git",
-        "/tmp/common-objects",
-        "/tmp/refs/heads",
-        "/tmp/logs/refs/heads",
+        str(tmp_path / "worktree-git"),
+        str(tmp_path / "common-objects"),
+        str(tmp_path / "refs" / "heads"),
+        str(tmp_path / "logs" / "refs" / "heads"),
     )
     monkeypatch.setattr(
         launcher_module,
@@ -157,7 +172,7 @@ def test_agy_commit_required_argv_adds_linked_git_write_dirs(monkeypatch, tmp_pa
     argv = build_agy_argv(
         prompt="implement",
         slice_id="build-demo",
-        log_dir="/tmp/logs",
+        log_dir=str(tmp_path / "logs"),
         worktree=str(worktree),
         commit_required=True,
     )

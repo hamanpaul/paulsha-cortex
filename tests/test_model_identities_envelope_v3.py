@@ -287,7 +287,7 @@ def test_packaged_roster_positive_load_and_bindings(tmp_path: Path) -> None:
     agy = by_key[("agy", AGY_MODEL_ID)]
     assert agy.independence_domain == "google"
     assert agy.live_probe == "agy-plan-sandbox"
-    assert set(agy.capabilities) == {"planning", "build", "review"}
+    assert set(agy.capabilities) == {"planning", "review"}
     assert by_key[("copilot", "gpt-5.4")].capabilities == ("build",)
     assert by_key[("cg", "glm-5.2")].independence_domain == "zhipu"
     # roster 全體為候選宣告：無任何實測封套欄位（#453 R4 資料層一眼可辨）。

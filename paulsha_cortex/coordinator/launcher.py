@@ -1185,7 +1185,10 @@ def build_agy_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
-    read_only: bool = False,
+    # ``None`` preserves the historical direct planning call, which omitted
+    # the flag and supplied no worktree.  Launcher callers pass an explicit
+    # bool, so a builder context cannot silently fall back to plan+sandbox.
+    read_only: bool | None = None,
     review_only: bool = False,
     commit_required: bool = False,
 ) -> list[str]:
@@ -1205,7 +1208,13 @@ def build_agy_argv(
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required agy builder requires enforced workspace-write")
 
-    if read_only or review_only:
+    legacy_direct_planning = (
+        read_only is None
+        and worktree is None
+        and not allow_unsafe
+        and not commit_required
+    )
+    if read_only or review_only or legacy_direct_planning:
         argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
         # Antigravity's plan sandbox otherwise runs in an isolated workspace and
         # cannot inspect a reviewer checkout at all.  Planner cards receive their

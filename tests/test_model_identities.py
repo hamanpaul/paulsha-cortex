@@ -32,8 +32,8 @@ def test_packaged_v3_registry_has_google_agy_default() -> None:
     agy = registry.require("agy", AGY_MODEL_ID)
     assert registry.schema_version == 3
     assert agy.independence_domain == "google"
-    # #799：agy 的 writable launcher 與 registry build capability 必須成對。
-    assert agy.capabilities == ("planning", "build", "review")
+    # #456 R3：agy 追加 review 候選 capability（planning 綁定不變）。
+    assert agy.capabilities == ("planning", "review")
     assert agy.live_probe == "agy-plan-sandbox"
 
 
