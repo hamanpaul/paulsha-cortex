@@ -1185,10 +1185,9 @@ def build_agy_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
-    # ``None`` preserves the historical direct planning call, which omitted
-    # the flag and supplied no worktree.  Launcher callers pass an explicit
-    # bool, so a builder context cannot silently fall back to plan+sandbox.
-    read_only: bool | None = None,
+    # A missing worktree is the historical direct-planning shape.  A supplied
+    # worktree with the default ``False`` is the explicit builder shape.
+    read_only: bool = False,
     review_only: bool = False,
     commit_required: bool = False,
 ) -> list[str]:
@@ -1208,13 +1207,12 @@ def build_agy_argv(
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required agy builder requires enforced workspace-write")
 
-    legacy_direct_planning = (
-        read_only is None
-        and worktree is None
-        and not allow_unsafe
-        and not commit_required
-    )
-    if read_only or review_only or legacy_direct_planning:
+    # Unsafe and commit-required modes are builder-only; accepting either
+    # without a provisioned checkout would silently turn an invalid builder
+    # request into the historical read-only planning shape.
+    if worktree is None and (allow_unsafe or commit_required):
+        raise ValueError("agy builder requires a worktree")
+    if read_only or review_only or worktree is None:
         argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
         # Antigravity's plan sandbox otherwise runs in an isolated workspace and
         # cannot inspect a reviewer checkout at all.  Planner cards receive their
@@ -1882,10 +1880,11 @@ class SubprocessLauncher:
         # 那是同一族的錯）。要動那幾支，得先各自量一次。
         if self._executor == "codex":
             builder_kwargs["write_forbidden"] = self._write_forbidden
-        # trust-root Phase 2a：Codex／Claude／agy express the spool grant with
-        # `--add-dir`; Copilot uses exact `--allow-tool` entries instead. agy／cg
-        # cannot be assigned a slice-lane reviewer spool, so reject a spool grant
-        # for them explicitly.
+        # trust-root Phase 2a：Codex／Claude express the reviewer spool grant
+        # with `--add-dir`; Copilot uses exact `--allow-tool` entries instead.
+        # agy's `--add-dir` is reserved for its provisioned worktree and, when
+        # required, linked-worktree Git metadata—it cannot receive a slice-lane
+        # reviewer spool grant.
         if self._verdict_spool_dir is not None:
             if self._executor not in {"codex", "copilot", "claude"}:
                 raise ValueError(

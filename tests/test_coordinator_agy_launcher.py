@@ -54,6 +54,8 @@ def test_agy_reviewer_argv_grants_only_the_disposable_checkout(tmp_path) -> None
 
 def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree(tmp_path) -> None:
     worktree = tmp_path / "builder-checkout"
+    # Omitting read_only with a provisioned worktree is the explicit builder
+    # shape; the helper's bool default must not create a third state.
     argv = build_agy_argv(
         prompt="implement",
         slice_id="build-demo",
@@ -143,8 +145,8 @@ identities:
 
 @pytest.mark.parametrize(
     "builder_options",
-    ({"read_only": False}, {"allow_unsafe": True}, {"commit_required": True}),
-    ids=("default", "unsafe", "commit-required"),
+    ({"allow_unsafe": True}, {"commit_required": True}),
+    ids=("unsafe", "commit-required"),
 )
 def test_agy_builder_requires_a_worktree(builder_options) -> None:
     with pytest.raises(ValueError, match="agy builder requires a worktree"):
