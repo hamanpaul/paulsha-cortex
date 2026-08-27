@@ -90,6 +90,7 @@ def _planning_argv(
             worktree=str(worktree),
             allow_unsafe=False,
             model=identity.model_id,
+            read_only=True,
         )
     if identity.executor == "codex":
         return [

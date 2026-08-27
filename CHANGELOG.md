@@ -38,6 +38,11 @@
   Policy Check 同步監聽 PR `edited`／`labeled`／`unlabeled` 事件，讓 release／exemption label、
   標題或 checklist 的變更都會以最新 metadata 重新判定。
 
+- **#799：agy 支援 builder 派工**：agy builder 現在使用 `accept-edits` 並將權限限制在
+  provisioned worktree；明確 `allow_unsafe` 才附加 `--dangerously-skip-permissions`，
+  `commit_required` 也會傳遞 linked-worktree Git metadata 放行。既有 planner／reviewer
+  維持 `plan+sandbox` 形態。
+
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
   block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同
