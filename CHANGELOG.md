@@ -14,6 +14,18 @@
   並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
   超長提示的回歸保護。**
 
+- **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
+  最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
+  missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
+  已由必要 gates 驗證完成的 release。
+
+- **RC rollback qualification 順序與 unknown-state 修正**：rollback scanner 現在會依 archived
+  receipt inventory 排除刻意保留的 fresh checkout／content-addressed venv 及其 carrier parent，
+  同時仍回報同層 foreign sibling；container harness 也改成 rollback／clean reinstall 完成後才
+  加入非 transactional runtime scaffold fixture，避免合法 retained state 被誤判為 unknown。
+  Policy Check 同步監聽 PR `edited`／`labeled`／`unlabeled` 事件，讓 release／exemption label、
+  標題或 checklist 的變更都會以最新 metadata 重新判定。
+
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
   block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同

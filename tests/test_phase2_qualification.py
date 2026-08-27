@@ -581,6 +581,17 @@ def test_runner_declares_disposable_systemd_container_boundaries() -> None:
     assert mode & 0o100, "qualification/run.sh must be executable"
 
 
+def test_release_harness_rolls_back_before_adding_runtime_scaffold_fixture() -> None:
+    runner = _required_text(RUNNER)
+    rollback = runner.index(
+        'cortex install trust-root rollback --receipt "$receipt_path"'
+    )
+    reinstall = runner.index("cortex install trust-root apply", rollback)
+    scaffold = runner.index("python3 -m paulsha_cortex.trust_root scaffold")
+
+    assert rollback < reinstall < scaffold
+
+
 def test_qualification_schema_binds_release_evidence_and_runtime_identity() -> None:
     raw = _required_text(SCHEMA)
     payload = json.loads(raw)
