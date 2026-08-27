@@ -793,7 +793,12 @@ def workflow_status_entry(
         phase=getattr(run, "current_phase", None),
         planning_failure_classification=hint_classification,
     )
-    next_step_hint = needs_human_next_step_hint(
+    persisted_next_step_hint = None
+    if isinstance(reason_payload, dict):
+        value = reason_payload.get("next_step_hint")
+        if isinstance(value, str) and value.strip():
+            persisted_next_step_hint = value
+    next_step_hint = persisted_next_step_hint or needs_human_next_step_hint(
         phase=getattr(run, "current_phase", None),
         planning_failure_classification=hint_classification,
         work_id=getattr(run, "work_id", None),
@@ -11818,6 +11823,13 @@ def apply_workflow_action(
         # 這裡把它 hoist 成區域變數，好讓 evidence 與 needs_human_reason 兩者
         # 引用**同一個**判定結果，不各算一次。
         brainstorm_classification = _classify_planning_failure(brainstorm_not_ready_reason)
+        brainstorm_next_step_hint = needs_human_next_step_hint(
+            phase=run.current_phase,
+            planning_failure_classification=brainstorm_classification,
+            work_id=run.work_id,
+            repo=run.repo,
+            run_id=run.run_id,
+        )
         brainstorm_evidence_refs = _record_planning_failure_evidence(
             run,
             coordinator_root=transaction_root,
@@ -11838,6 +11850,7 @@ def apply_workflow_action(
                 f"brainstorm 未收斂（state={result.state}）：{brainstorm_not_ready_reason}",
                 source="manager.apply_workflow_action:start-brainstorm",
                 evidence_refs=brainstorm_evidence_refs,
+                next_step_hint=brainstorm_next_step_hint,
                 run_id=run.run_id,
                 work_id=run.work_id,
                 classification=brainstorm_classification,

@@ -11,7 +11,9 @@ from paulsha_cortex.coordinator.claim import (
     ClaimCandidate,
     WorkAuthority,
     _resume_decision,
+    needs_human_next_step_hint,
 )
+from paulsha_cortex.coordinator.diagnostics import diagnostic_reason
 from paulsha_cortex.deck.compile import compile_combo
 from paulsha_cortex.deck.schema import DEFAULT_CARDS_PATH, DEFAULT_COMBOS_DIR, load_cards, load_combo
 
@@ -147,6 +149,7 @@ def test_content_needs_human_exposes_hint_and_abandon() -> None:
 
 def test_content_needs_human_status_exposes_hint_and_abandon(tmp_path: Path) -> None:
     run_id = "workflow-" + "d" * 20
+    persisted_hint = "persisted planning hint: abandon and re-intake"
     evidence = tmp_path / "evidence" / "planning-recovery" / "failure.json"
     evidence.parent.mkdir(parents=True)
     evidence.write_text(
@@ -167,12 +170,12 @@ def test_content_needs_human_status_exposes_hint_and_abandon(tmp_path: Path) -> 
         current_phase="define",
         facets=("needs_human",),
         gate_status="running",
-        needs_human_reason={
-            "schema_version": 1,
-            "reason": "brainstorm-not-ready",
-            "detail": "content planning output was rejected",
-            "source": "manager.apply_workflow_action:start-brainstorm",
-        },
+        needs_human_reason=diagnostic_reason(
+            "brainstorm-not-ready",
+            "content planning output was rejected",
+            source="manager.apply_workflow_action:start-brainstorm",
+            next_step_hint=persisted_hint,
+        ).to_dict(),
         evidence_refs=(str(evidence),),
         updated_at="2026-08-27T00:00:00+00:00",
         workspace_root=str(tmp_path),
@@ -182,5 +185,25 @@ def test_content_needs_human_status_exposes_hint_and_abandon(tmp_path: Path) -> 
     entry = manager.workflow_status_entry(None, run)
 
     assert entry["next_actions"] == ["abandon"]
-    assert isinstance(entry["next_step_hint"], str)
-    assert "abandon" in entry["next_step_hint"]
+    assert entry["blocking_reason"]["next_step_hint"] == persisted_hint
+    assert entry["next_step_hint"] == persisted_hint
+
+
+def test_content_needs_human_reason_persists_hint_in_payload() -> None:
+    candidate = _content_needs_human_candidate()
+    hint = needs_human_next_step_hint(
+        phase=candidate.active_phase,
+        planning_failure_classification=candidate.active_planning_failure_classification,
+        work_id=candidate.work_id,
+        repo=candidate.repo,
+        run_id=candidate.active_run_id,
+    )
+
+    reason = diagnostic_reason(
+        "brainstorm-not-ready",
+        "content planning output was rejected",
+        source="manager.apply_workflow_action:start-brainstorm",
+        next_step_hint=hint,
+    ).to_dict()
+
+    assert reason["next_step_hint"] == hint

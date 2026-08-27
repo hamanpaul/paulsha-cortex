@@ -126,6 +126,9 @@ class DiagnosticReason:
     source: str
     evidence_refs: tuple[str, ...] = ()
     context: Mapping[str, str] = field(default_factory=dict)
+    # 可直接供 operator 執行的下一步；與 reason 一起持久化，避免呈現面重算後
+    # 與當時實際寫入 needs_human 的處置提示漂移。
+    next_step_hint: str | None = None
     recorded_at: str | None = None
     schema_version: int = DIAGNOSTIC_REASON_SCHEMA_VERSION
 
@@ -169,6 +172,12 @@ class DiagnosticReason:
                 text = text[:DIAGNOSTIC_CONTEXT_VALUE_MAX_LENGTH].rstrip() + "…"
             normalized[key] = text
         object.__setattr__(self, "context", normalized)
+        if self.next_step_hint is not None:
+            if not isinstance(self.next_step_hint, str) or not self.next_step_hint.strip():
+                raise DiagnosticInvariantError(
+                    "diagnostic next_step_hint 必須為非空人可讀字串"
+                )
+            object.__setattr__(self, "next_step_hint", _single_line(self.next_step_hint))
         if self.recorded_at is None:
             object.__setattr__(self, "recorded_at", _utcnow())
         elif not isinstance(self.recorded_at, str) or not self.recorded_at:
@@ -186,6 +195,8 @@ class DiagnosticReason:
             payload["evidence_refs"] = list(self.evidence_refs)
         if self.context:
             payload["context"] = dict(self.context)
+        if self.next_step_hint is not None:
+            payload["next_step_hint"] = self.next_step_hint
         return payload
 
     @classmethod
@@ -200,6 +211,7 @@ class DiagnosticReason:
             "recorded_at",
             "evidence_refs",
             "context",
+            "next_step_hint",
         }
         if unknown:
             raise DiagnosticInvariantError(
@@ -217,6 +229,7 @@ class DiagnosticReason:
             source=payload.get("source"),
             evidence_refs=evidence_refs,
             context=context,
+            next_step_hint=payload.get("next_step_hint"),
             recorded_at=payload.get("recorded_at"),
             schema_version=payload.get("schema_version", DIAGNOSTIC_REASON_SCHEMA_VERSION),
         )
@@ -240,6 +253,7 @@ def diagnostic_reason(
     *,
     source: str,
     evidence_refs: tuple[str, ...] | list[str] = (),
+    next_step_hint: str | None = None,
     recorded_at: str | None = None,
     **context: object,
 ) -> DiagnosticReason:
@@ -256,6 +270,7 @@ def diagnostic_reason(
         source=source,
         evidence_refs=tuple(evidence_refs),
         context={key: str(value) for key, value in context.items() if value is not None},
+        next_step_hint=next_step_hint,
         recorded_at=recorded_at,
     )
 
