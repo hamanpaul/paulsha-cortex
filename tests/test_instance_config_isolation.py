@@ -114,8 +114,12 @@ def test_install_service_rolls_back_legacy_adoption_after_managed_env_failure(
     config_root.mkdir(parents=True)
     project_config = config_root / "project-cortex.yaml"
     identities = config_root / "model-identities.yaml"
-    project_config.write_text("legacy: project-config\n", encoding="utf-8")
-    identities.write_text("legacy: identities\n", encoding="utf-8")
+    project_config.write_text(
+        "workspaces:\n"
+        f"  - name: sibling\n    path: {target_repo.parent / 'sibling'}\n",
+        encoding="utf-8",
+    )
+    identities.write_text("schema_version: 3\nidentities: []\n", encoding="utf-8")
     before_env = env_file.read_bytes()
     before_project = project_config.read_bytes()
     before_identities = identities.read_bytes()

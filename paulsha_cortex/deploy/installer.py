@@ -252,6 +252,20 @@ def _resolve_agents_root(raw_agents_root: str | None) -> Path | None:
     return candidate
 
 
+def _reject_foreign_default_agents_root(
+    agents_root: Path | None, bootstrap_root: Path, *, source: str
+) -> None:
+    """Reject an implicit ``.agents`` root resolved under another HOME."""
+    if agents_root is None or agents_root.name != ".agents":
+        return
+    if agents_root.expanduser().resolve() == bootstrap_root.resolve():
+        return
+    raise ValueError(
+        f"{source} 的 default agents root 位於另一個 HOME；"
+        "如為合法自訂路徑請使用 --agents-root 明確指定"
+    )
+
+
 def _load_project_config_payload(config_path: Path) -> dict[str, object] | None:
     """Return a validated project config, or ``None`` for a missing/invalid file."""
     if not config_path.is_file():
@@ -357,12 +371,19 @@ def _migrate_instance_config(
             identity_error = exc
     elif identities.exists():
         raise ValueError(f"model-identities.yaml 不是一般檔案，拒絕覆寫：{identities}")
+    if identity_error is not None:
+        raise ValueError(
+            f"既有 model-identities.yaml 無法載入，拒絕覆寫：{identities}"
+        ) from identity_error
 
     existing_project = project_config.is_file() or project_config.is_symlink()
     project_payload = _load_project_config_payload(project_config)
-    project_config_valid = project_payload is not None
     if project_payload is None:
-        if project_config.exists() and not project_config.is_file():
+        if project_config.is_symlink() or project_config.exists():
+            if project_config.is_file():
+                raise ValueError(
+                    f"既有 project config 無法載入，拒絕覆寫：{project_config}"
+                )
             raise ValueError(f"project config 不是一般檔案，拒絕覆寫：{project_config}")
         project_payload = {
             "workspaces": [
@@ -402,17 +423,7 @@ def _migrate_instance_config(
                 project_payload["workspaces"] = workspaces
                 project_needs_update = True
 
-    if identity_error is not None:
-        # 完整 legacy bundle 沒有任何可驗證的 project config；仍走原有的
-        # transactional rebuild 路徑，但先保留 identities 備份。只要 project
-        # 已可載入，就不能用 migration 名義靜默取代 operator registry。
-        if not (not project_config_valid and project_config.is_file()):
-            raise ValueError(
-                f"既有 model-identities.yaml 無法載入，拒絕覆寫：{identities}"
-            ) from identity_error
-        identities_need_update = True
-    else:
-        identities_need_update = not identity_exists
+    identities_need_update = not identity_exists
 
     current_root = existing.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
     root_needs_update = (
@@ -510,19 +521,21 @@ def install_service_result(
     if instance_executor and instance_executor not in _SUPPORTED_EXECUTORS:
         raise ValueError("既有 instance PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
     persisted_agents_root = _resolve_agents_root(existing.get("PSC_AGENTS_ROOT"))
-    if (
-        explicit_agents_root is None
-        and persisted_agents_root is not None
-        and persisted_agents_root.name == ".agents"
-        and persisted_agents_root.expanduser().resolve() != bootstrap_root.resolve()
-    ):
-        raise ValueError(
-            f"既有 runtime env（{env_file}）的 PSC_AGENTS_ROOT 指向另一個 HOME 下的"
-            "預設 agents root；如為合法自訂路徑請使用 --agents-root 明確指定"
+    process_agents_root = _resolve_agents_root(os.environ.get("PSC_AGENTS_ROOT", ""))
+    if explicit_agents_root is None:
+        _reject_foreign_default_agents_root(
+            persisted_agents_root,
+            bootstrap_root,
+            source=f"既有 runtime env（{env_file}）的 PSC_AGENTS_ROOT",
+        )
+        _reject_foreign_default_agents_root(
+            process_agents_root,
+            bootstrap_root,
+            source="process 環境 PSC_AGENTS_ROOT",
         )
     selected_agents_root = explicit_agents_root or persisted_agents_root
     if selected_agents_root is None:
-        selected_agents_root = _resolve_agents_root(os.environ.get("PSC_AGENTS_ROOT", ""))
+        selected_agents_root = process_agents_root
     if selected_agents_root is None:
         selected_agents_root = bootstrap_root
     unit_dir = home / ".config" / "systemd" / "user"

@@ -92,8 +92,8 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    若既有 `$HOME/.agents/config/paulsha/project-cortex.yaml` 已包含其他 workspace，
    installer 只會在末端追加目前目標，並在替換前建立 `project-cortex.yaml.bak-*`；既有
-   `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env 記錄的是另一個 HOME 下的
-   default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
+   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env
+   記錄的是另一個 HOME 下的 default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
 
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
 

@@ -4,5 +4,5 @@ scope: installer
 ---
 
 `cortex install service` 對既有 `project-cortex.yaml` 採 append-only workspace
-遷移，替換前建立 `.bak-*` 備份；不可載入的既有 model identity registry 會拒絕
-覆寫，跨 HOME 的 default agents root 需以 `--agents-root` 明確放行。
+遷移，替換前建立 `.bak-*` 備份；不可載入的既有 project config 或 model identity
+registry 會拒絕覆寫，跨 HOME 的 default agents root 需以 `--agents-root` 明確放行。

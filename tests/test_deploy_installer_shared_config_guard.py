@@ -125,6 +125,25 @@ def test_install_service_rejects_agents_root_from_different_home(
     assert not foreign_agents_root.exists()
 
 
+def test_install_service_rejects_process_agents_root_from_different_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An implicit process env default root must obey the HOME boundary too."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "current-home"
+    foreign_agents_root = tmp_path / "foreign-home" / ".agents"
+
+    _prepare_installer(monkeypatch, home)
+    monkeypatch.setenv("PSC_AGENTS_ROOT", str(foreign_agents_root))
+
+    with pytest.raises(ValueError, match="HOME"):
+        installer.install_service_result("hippo", 300, target)
+
+    assert not foreign_agents_root.exists()
+
+
 def test_install_service_raises_when_existing_model_identities_are_unloadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -168,3 +187,59 @@ def test_install_service_raises_when_existing_model_identities_are_unloadable(
     assert project_config.read_bytes() == before_project
     assert identities.read_bytes() == before_identities
     assert env_file.read_bytes() == before_env
+
+
+def test_install_service_rejects_unloadable_identities_with_invalid_project_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither invalid shared config may be replaced by a migration scaffold."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    agents_root = home / ".agents"
+    config_root = agents_root / "config" / "paulsha"
+    config_root.mkdir(parents=True)
+    project_config = config_root / "project-cortex.yaml"
+    identities = config_root / "model-identities.yaml"
+    project_config.write_text("workspaces: [\n", encoding="utf-8")
+    identities.write_text("schema_version: 99\nidentities: []\n", encoding="utf-8")
+    before_project = project_config.read_bytes()
+    before_identities = identities.read_bytes()
+
+    _prepare_installer(monkeypatch, home)
+
+    with pytest.raises(ValueError, match="model-identities"):
+        installer.install_service_result("hippo", 300, target)
+
+    assert project_config.read_bytes() == before_project
+    assert identities.read_bytes() == before_identities
+    assert not list(config_root.glob("project-cortex.yaml.bak-*"))
+    assert not list(config_root.glob("model-identities.yaml.bak-*"))
+
+
+def test_install_service_rejects_existing_unparseable_project_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing project config must not be scaffold-replaced when unreadable."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo")
+    home = tmp_path / "home"
+    agents_root = home / ".agents"
+    config_root = agents_root / "config" / "paulsha"
+    config_root.mkdir(parents=True)
+    project_config = config_root / "project-cortex.yaml"
+    project_config.write_text("workspaces: [\n", encoding="utf-8")
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    before_project = project_config.read_bytes()
+
+    _prepare_installer(monkeypatch, home)
+
+    with pytest.raises(ValueError, match="project config"):
+        installer.install_service_result("hippo", 300, target)
+
+    assert project_config.read_bytes() == before_project
+    assert not list(config_root.glob("project-cortex.yaml.bak-*"))
