@@ -221,16 +221,32 @@ jobs:
             echo "::error::merged PR lacks an approval bound to its final head"
             exit 1
           }
-          check_pages=$(gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/commits/$pr_head/check-runs?per_page=100")
-          checks=$(jq -sc '{check_runs: [.[].check_runs[]]}' <<<"$check_pages")
-          jq -e '
-            (.check_runs | length) > 0 and
-            all(.check_runs[]; .status == "completed" and .conclusion == "success")
-          ' <<<"$checks" >/dev/null || {
-            echo "::error::the merged PR final head has missing or non-green checks"
-            exit 1
-          }
+          required_pr_workflows=(
+            "tests.yml:pull_request"
+            "persona-scope.yml:pull_request"
+            "policy-check.yml:pull_request"
+            "rc-qualification.yml:workflow_dispatch"
+          )
+          for required_workflow in "${required_pr_workflows[@]}"; do
+            IFS=: read -r workflow event <<<"$required_workflow"
+            workflow_runs=$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/$workflow/runs" \
+              -f head_sha="$pr_head" -f event="$event" -f per_page=100)
+            latest_run=$(jq -c --arg sha "$pr_head" --arg event "$event" '
+              [.workflow_runs[]
+                | select(.head_sha == $sha and .event == $event)]
+              | sort_by([.created_at, .run_attempt])
+              | last // null
+            ' <<<"$workflow_runs")
+            jq -e '
+              . != null and
+              .status == "completed" and
+              .conclusion == "success"
+            ' <<<"$latest_run" >/dev/null || {
+              echo "::error::latest required PR workflow run is missing or non-green: $workflow"
+              exit 1
+            }
+          done
 
           run_json=$(gh api --method GET \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/rc-qualification.yml/runs" \

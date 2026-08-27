@@ -282,10 +282,16 @@ def test_release_requires_exact_sha_qualification_and_wheel_hash_before_publish(
     )
     assert "merge_commit_sha" in preflight_runs
     assert 'state == "APPROVED"' in preflight_runs
-    assert "check-runs" in preflight_runs
-    assert "check-runs?per_page=100" in preflight_runs
-    assert "--paginate" in preflight_runs
-    assert "jq -sc" in preflight_runs
+    for workflow, event in (
+        ("tests.yml", "pull_request"),
+        ("persona-scope.yml", "pull_request"),
+        ("policy-check.yml", "pull_request"),
+        ("rc-qualification.yml", "workflow_dispatch"),
+    ):
+        assert f'"{workflow}:{event}"' in preflight_runs
+    assert "sort_by([.created_at, .run_attempt])" in preflight_runs
+    assert "latest required PR workflow run is missing or non-green" in preflight_runs
+    assert "all(.check_runs[]" not in preflight_runs
     assert "openspec validate --specs --no-interactive" in preflight_runs
     assert (
         "openspec validate phase2-install-docker-qualification" in preflight_runs
