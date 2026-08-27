@@ -1205,10 +1205,7 @@ def build_agy_argv(
     if commit_required and (read_only or review_only or allow_unsafe):
         raise ValueError("commit-required agy builder requires enforced workspace-write")
 
-    # Direct planning historically called this helper without a worktree.  Keep
-    # that compatibility shape while the real builder launcher always supplies
-    # its required checkout.
-    if read_only or review_only or (worktree is None and not allow_unsafe and not commit_required):
+    if read_only or review_only:
         argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
         # Antigravity's plan sandbox otherwise runs in an isolated workspace and
         # cannot inspect a reviewer checkout at all.  Planner cards receive their
