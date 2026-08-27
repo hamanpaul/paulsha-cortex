@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from paulsha_cortex.coordinator.launcher import SubprocessLauncher, build_agy_argv
 
 
@@ -47,13 +45,48 @@ def test_agy_reviewer_argv_grants_only_the_disposable_checkout() -> None:
     assert "--dangerously-skip-permissions" not in argv
 
 
-def test_agy_launcher_refuses_unsafe_mode_instead_of_silently_bypassing() -> None:
-    with pytest.raises(ValueError, match="agy.*unsafe"):
-        build_agy_argv(
-            prompt="P",
-            slice_id="s",
-            log_dir="/tmp/logs",
-            allow_unsafe=True,
-        )
-    with pytest.raises(ValueError, match="agy.*unsafe"):
-        SubprocessLauncher("agy", allow_unsafe=True)
+def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree() -> None:
+    argv = build_agy_argv(
+        prompt="implement",
+        slice_id="build-demo",
+        log_dir="/tmp/logs",
+        worktree="/tmp/builder-checkout",
+    )
+
+    assert argv[:5] == [
+        "agy",
+        "--print",
+        "implement",
+        "--mode",
+        "accept-edits",
+    ]
+    assert argv[5:7] == ["--add-dir", "/tmp/builder-checkout"]
+    assert "--sandbox" not in argv
+    assert "--dangerously-skip-permissions" not in argv
+
+
+def test_agy_builder_unsafe_argv_adds_permission_bypass() -> None:
+    argv = build_agy_argv(
+        prompt="implement",
+        slice_id="build-demo",
+        log_dir="/tmp/logs",
+        worktree="/tmp/builder-checkout",
+        allow_unsafe=True,
+    )
+
+    assert argv[:5] == [
+        "agy",
+        "--print",
+        "implement",
+        "--mode",
+        "accept-edits",
+    ]
+    assert argv[5:7] == ["--add-dir", "/tmp/builder-checkout"]
+    assert "--sandbox" not in argv
+    assert "--dangerously-skip-permissions" in argv
+
+
+def test_agy_launcher_accepts_explicit_unsafe_builder_mode() -> None:
+    launcher = SubprocessLauncher(executor="agy", allow_unsafe=True)
+
+    assert launcher.executor == "agy"
