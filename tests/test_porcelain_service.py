@@ -296,6 +296,41 @@ def test_service_install_foreign_agents_root_explains_porcelain_override(
     )
 
 
+def test_service_install_forwards_stderr_when_installer_returns_normally(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.porcelain import service
+
+    def fake_main(argv: list[str]) -> int:
+        assert argv == [
+            "service",
+            "--instance",
+            "beta",
+            "--repo-root",
+            str(service_runtime["repo_root"]),
+            "--interval",
+            "60",
+        ]
+        sys.stderr.write("installer diagnostic\n")
+        return 3
+
+    monkeypatch.setattr(service.installer, "main", fake_main)
+
+    assert (
+        service._run_install(
+            instance="beta",
+            interval=60,
+            repo_root=str(service_runtime["repo_root"]),
+            json_output=False,
+        )
+        == 3
+    )
+
+    assert capsys.readouterr().err == "installer diagnostic\n"
+
+
 @pytest.mark.parametrize("use_json", [False, True], ids=["plain", "json"])
 def test_service_install_systemctl_failure_reports_expected_channel(
     service_runtime: dict[str, Path],

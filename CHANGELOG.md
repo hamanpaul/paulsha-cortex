@@ -11,7 +11,8 @@
   `project-cortex.yaml` 時只追加目標 workspace，替換前保留 `.bak-*` 備份；既有
   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時 fail-closed，跨 HOME
   的 default agents root 也必須以 `--agents-root` 明確指定；命中既有 workspace 時
-  保留原條目與其他設定區塊，migration rollback 會清理本次建立的備份。
+  保留原條目與其他設定區塊，migration rollback 會清理本次建立的備份；porcelain
+  install 也會保留 installer 正常返回時產生的 stderr 診斷訊息。
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
   missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
