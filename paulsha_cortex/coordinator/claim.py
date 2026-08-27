@@ -1046,6 +1046,7 @@ class ClaimDecision:
     # 才是「這個 run 到底為什麼停住」的具體原因，取自 run 自己的 evidence，
     # 拿不到時為 None（不編造）。
     blocking_reason: str | None = None
+    next_step_hint: str | None = None
 
 
 def _validate_candidate(candidate: ClaimCandidate) -> None:
@@ -1289,6 +1290,54 @@ def needs_human_next_actions(
     return ("abandon",)
 
 
+def needs_human_next_step_hint(
+    *,
+    phase: str | None,
+    planning_failure_classification: str | None,
+    work_id: object = None,
+    repo: object = None,
+    run_id: object = None,
+) -> str:
+    """Return the operator-facing hint paired with ``needs_human_next_actions``.
+
+    The action set is deliberately derived first so the hint cannot advertise a
+    recovery path that the claim policy does not expose.  Content failures have
+    no safe automatic recovery: the accepted planning triplet must be repaired,
+    the stuck run abandoned, and intake started again.
+    """
+
+    actions = needs_human_next_actions(
+        phase=phase,
+        planning_failure_classification=planning_failure_classification,
+    )
+
+    def hint_value(value: object, fallback: str, pattern: str) -> str:
+        if isinstance(value, str) and re.fullmatch(pattern, value):
+            return value
+        return fallback
+
+    safe_work_id = hint_value(work_id, "<work-id>", r"[a-z0-9][a-z0-9-]*")
+    safe_repo = hint_value(repo, "<owner/repo>", r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+    safe_run_id = hint_value(run_id, "<run-id>", r"workflow-[0-9a-f]{20}")
+    abandon = (
+        f"`cortex work abandon {safe_work_id} --repo {safe_repo} "
+        f"--expected-run-id {safe_run_id} --actor <operator> "
+        "--reason '<single-line reason>'`"
+    )
+    if planning_failure_classification == "content":
+        return (
+            "planning content was rejected; first restore an accepted "
+            "spec/design/plan triplet, then run "
+            f"{abandon} and re-intake the work item."
+        )
+    if "recover-planning" in actions:
+        return (
+            "Fix the planning environment and retry recover-planning; if it "
+            f"cannot be recovered, run {abandon}."
+        )
+    return f"Review the blocking evidence, then run {abandon}."
+
+
 def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
     if candidate.active_status == "done":
         return ClaimDecision(
@@ -1315,6 +1364,13 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             if classification is not None and candidate.active_planning_failure_reason
             else None
         )
+        next_step_hint = needs_human_next_step_hint(
+            phase=candidate.active_phase,
+            planning_failure_classification=classification,
+            work_id=candidate.work_id,
+            repo=candidate.repo,
+            run_id=candidate.active_run_id,
+        )
         return ClaimDecision(
             action="needs_human",
             reason="human-intervention-required",
@@ -1322,6 +1378,7 @@ def _resume_decision(candidate: ClaimCandidate) -> ClaimDecision:
             run_id=candidate.active_run_id,
             next_actions=next_actions,
             blocking_reason=blocking_reason,
+            next_step_hint=next_step_hint,
         )
     if candidate.active_status == "blocked":
         return ClaimDecision(

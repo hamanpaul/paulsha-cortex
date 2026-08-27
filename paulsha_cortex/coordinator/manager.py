@@ -50,6 +50,7 @@ from .claim import (
     REASON_PROVIDER_RATE_LIMITED_CANONICAL,
     decomposition_route,
     needs_human_next_actions,
+    needs_human_next_step_hint,
 )
 from . import model_resolution
 from .diagnostics import DiagnosticReason, diagnostic_reason, summarize_exception
@@ -792,6 +793,13 @@ def workflow_status_entry(
         phase=getattr(run, "current_phase", None),
         planning_failure_classification=hint_classification,
     )
+    next_step_hint = needs_human_next_step_hint(
+        phase=getattr(run, "current_phase", None),
+        planning_failure_classification=hint_classification,
+        work_id=getattr(run, "work_id", None),
+        repo=getattr(run, "repo", None),
+        run_id=getattr(run, "run_id", None),
+    )
     try:
         from .work_actions import _phase_recovery_actions
 
@@ -830,6 +838,7 @@ def workflow_status_entry(
         "blocking_reason": dict(reason_payload) if isinstance(reason_payload, dict) else None,
         "evidence_refs": list(run.evidence_refs),
         "next_actions": list(next_actions),
+        "next_step_hint": next_step_hint,
         "updated_at": run.updated_at,
     }
 
@@ -7855,6 +7864,43 @@ def _record_planning_artifact_rejection_evidence(
         return None
 
 
+def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bool:
+    """Whether a planning artifact uses its canonical work-item destination.
+
+    The planning runtime always materializes the accepted spec/design/plan
+    triplet, even when a combo's manifest omits the optional brainstorming card
+    (for example ``fix-standard``).  Keep that runtime contract independent of
+    the combo's flattened output list while still binding each kind to its own
+    destination family and work item.
+    """
+
+    if (
+        kind not in {"spec", "design", "plan"}
+        or not isinstance(path_value, str)
+        or not path_value
+        or not isinstance(work_id, str)
+        or re.fullmatch(r"[a-z0-9][a-z0-9-]*", work_id) is None
+    ):
+        return False
+    relative = Path(path_value)
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix() != path_value
+        or len(relative.parts) != 4
+    ):
+        return False
+    if kind in {"spec", "design"}:
+        if relative.parts[:3] != ("docs", "superpowers", "specs"):
+            return False
+        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
+    else:
+        if relative.parts[:3] != ("docs", "superpowers", "plans"):
+            return False
+        pattern = f"docs/superpowers/plans/*{work_id}*.md"
+    return fnmatch.fnmatch(path_value, pattern)
+
+
 def _publish_planning_artifacts(
     root_value: str,
     rows: object,
@@ -7898,11 +7944,12 @@ def _publish_planning_artifacts(
             and relative.parts[2] != "archive"
         )
         manifest_bound = any(fnmatch.fnmatch(path_value, pattern) for pattern in allowed_refs)
+        kind_bound = planning_kind_bound(row.get("kind"), path_value, work_id)
         if (
             relative.is_absolute()
             or ".." in relative.parts
             or not (docs_bound or openspec_bound)
-            or not manifest_bound
+            or not (manifest_bound or kind_bound)
             or relative.suffix != ".md"
         ):
             raise ValueError("planning artifact path outside governed roots")

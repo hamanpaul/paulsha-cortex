@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **#802：fix-standard 的 planning publication 現在對 spec／design／plan 使用
+  work-item-bound canonical destinations，即使 combo manifest 沒有
+  `brainstorming` card 也能落地三件套；內容型 planning failure 的
+  `needs_human` 回應同步提供補件、`abandon` 與重新 intake 的下一步提示。**
+
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
   block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同
