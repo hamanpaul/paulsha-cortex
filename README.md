@@ -90,6 +90,11 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
 
    Installer 會 render/copy units、執行 `daemon-reload`，並 enable manager timer 與 monitor service；**不會 start service**。`--interval` 只調整 deprecated timer 的 `OnUnitActiveSec`；長駐 daemon 的 tick 週期由 `PSC_MANAGER_INTERVAL_SECONDS` 控制。兩個 service 都會設定 `WorkingDirectory=<PSC_REPO_ROOT>`，因此服務執行時不受 `cwd` 影響。
 
+   若既有 `$HOME/.agents/config/paulsha/project-cortex.yaml` 已包含其他 workspace，
+   installer 只會在末端追加目前目標，並在替換前建立 `project-cortex.yaml.bak-*`；既有
+   `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env 記錄的是另一個 HOME 下的
+   default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
+
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
 
    ```bash

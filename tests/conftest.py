@@ -74,6 +74,21 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     return None
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_runtime_root_environment() -> Iterator[None]:
+    """Prevent session-scoped setup from reading the operator's runtime roots."""
+    names = ("PSC_AGENTS_ROOT", "PSC_PROJECT_CONFIG_ROOT")
+    previous = {name: os.environ[name] for name in names if name in os.environ}
+    for name in names:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name in names:
+            os.environ.pop(name, None)
+        os.environ.update(previous)
+
+
 @pytest.fixture(autouse=True)
 def _network_guard(request: pytest.FixtureRequest):
     """守衛的 per-test 帳本。
@@ -126,6 +141,9 @@ def _clear_runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PSC_REPO_ROOT", str(unset_root / "repo"))
     monkeypatch.setenv("PSC_AGENTS_ROOT", str(unset_root / "agents"))
     monkeypatch.setenv("PSC_CONFIG_ROOT", str(unset_root / "config"))
+    monkeypatch.setenv(
+        "PSC_PROJECT_CONFIG_ROOT", str(unset_root / "agents" / "config" / "paulsha")
+    )
     # Degraded-launch tests exercise production provisioning. Give them a real
     # deployment-owned control/credential authority rather than permitting the
     # old silent fallback to role HOME or generated stubs.

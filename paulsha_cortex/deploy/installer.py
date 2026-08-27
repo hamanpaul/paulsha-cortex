@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 import yaml
 
@@ -251,6 +252,51 @@ def _resolve_agents_root(raw_agents_root: str | None) -> Path | None:
     return candidate
 
 
+def _load_project_config_payload(config_path: Path) -> dict[str, object] | None:
+    """Return a validated project config, or ``None`` for a missing/invalid file."""
+    if not config_path.is_file():
+        return None
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"project config 無法讀取：{config_path}") from exc
+    except (UnicodeDecodeError, yaml.YAMLError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        from paulsha_cortex.monitor.config import load_config
+
+        load_config(config_path=config_path)
+    except (OSError, ValueError):
+        return None
+    return dict(payload)
+
+
+def _workspace_index_for_repo(
+    payload: dict[str, object], repo_root: Path
+) -> int | None:
+    workspaces = payload.get("workspaces")
+    if not isinstance(workspaces, list):
+        return None
+    resolved_repo = repo_root.expanduser().resolve()
+    for index, row in enumerate(workspaces):
+        if not isinstance(row, dict) or not row.get("path"):
+            continue
+        try:
+            if Path(str(row["path"])).expanduser().resolve() == resolved_repo:
+                return index
+        except OSError:
+            continue
+    return None
+
+
+def _backup_file(path: Path) -> Path:
+    backup = path.with_name(f"{path.name}.bak-{uuid4().hex}")
+    backup.write_bytes(path.read_bytes())
+    return backup
+
+
 def _instance_env_file(runtime_dir: Path, instance: str) -> Path:
     return runtime_dir / f"{instance}.env"
 
@@ -299,8 +345,75 @@ def _migrate_instance_config(
     """Adopt a legacy instance with a validated, rollback-safe config bundle."""
     project_config = config_root / "project-cortex.yaml"
     identities = config_root / "model-identities.yaml"
-    project_needs_update = not _is_exact_project_config(project_config, repo_root)
-    identities_need_update = not _is_loadable_model_identities(config_root)
+
+    identity_exists = identities.is_file() or identities.is_symlink()
+    identity_error: Exception | None = None
+    if identity_exists:
+        try:
+            from paulsha_cortex.coordinator.model_identities import load_model_identities
+
+            load_model_identities(config_root, use_packaged_default=False)
+        except (OSError, ValueError) as exc:
+            identity_error = exc
+    elif identities.exists():
+        raise ValueError(f"model-identities.yaml 不是一般檔案，拒絕覆寫：{identities}")
+
+    existing_project = project_config.is_file() or project_config.is_symlink()
+    project_payload = _load_project_config_payload(project_config)
+    project_config_valid = project_payload is not None
+    if project_payload is None:
+        if project_config.exists() and not project_config.is_file():
+            raise ValueError(f"project config 不是一般檔案，拒絕覆寫：{project_config}")
+        project_payload = {
+            "workspaces": [
+                {
+                    "name": repo_root.name,
+                    "path": str(repo_root),
+                    "exact_project": True,
+                }
+            ]
+        }
+        project_needs_update = True
+    else:
+        workspaces = project_payload["workspaces"]
+        assert isinstance(workspaces, list)
+        target_index = _workspace_index_for_repo(project_payload, repo_root)
+        if target_index is None:
+            workspaces = [dict(row) for row in workspaces]
+            workspaces.append(
+                {
+                    "name": repo_root.name,
+                    "path": str(repo_root),
+                    "exact_project": True,
+                }
+            )
+            project_payload["workspaces"] = workspaces
+            project_needs_update = True
+        else:
+            target = workspaces[target_index]
+            if not isinstance(target, dict):
+                raise ValueError(f"project config workspace 格式錯誤：{project_config}")
+            exact = target.get("exact_project", target.get("exact", False))
+            if exact:
+                project_needs_update = False
+            else:
+                workspaces = [dict(row) for row in workspaces]
+                workspaces[target_index]["exact_project"] = True
+                project_payload["workspaces"] = workspaces
+                project_needs_update = True
+
+    if identity_error is not None:
+        # 完整 legacy bundle 沒有任何可驗證的 project config；仍走原有的
+        # transactional rebuild 路徑，但先保留 identities 備份。只要 project
+        # 已可載入，就不能用 migration 名義靜默取代 operator registry。
+        if not (not project_config_valid and project_config.is_file()):
+            raise ValueError(
+                f"既有 model-identities.yaml 無法載入，拒絕覆寫：{identities}"
+            ) from identity_error
+        identities_need_update = True
+    else:
+        identities_need_update = not identity_exists
+
     current_root = existing.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
     root_needs_update = (
         not current_root
@@ -315,15 +428,6 @@ def _migrate_instance_config(
         return
 
     config_root.mkdir(parents=True, exist_ok=True)
-    project_payload = {
-        "workspaces": [
-            {
-                "name": repo_root.name,
-                "path": str(repo_root),
-                "exact_project": True,
-            }
-        ]
-    }
     project_text = yaml.safe_dump(project_payload, sort_keys=False)
     identities_text = "schema_version: 3\nidentities: []\n"
     previous = {
@@ -333,18 +437,25 @@ def _migrate_instance_config(
     }
     staging = Path(tempfile.mkdtemp(prefix=".cortex-migration-", dir=config_root))
     try:
-        staged_project = staging / "project-cortex.yaml"
-        staged_identities = staging / "model-identities.yaml"
-        staged_project.write_text(project_text, encoding="utf-8")
-        staged_identities.write_text(identities_text, encoding="utf-8")
-        from paulsha_cortex.coordinator.model_identities import load_model_identities
-        from paulsha_cortex.monitor.config import load_config
-
-        load_config(config_path=staged_project)
-        load_model_identities(staging, use_packaged_default=False)
         if project_needs_update:
+            staged_project = staging / "project-cortex.yaml"
+            staged_project.write_text(project_text, encoding="utf-8")
+            from paulsha_cortex.monitor.config import load_config
+
+            load_config(config_path=staged_project)
+        if identities_need_update:
+            staged_identities = staging / "model-identities.yaml"
+            staged_identities.write_text(identities_text, encoding="utf-8")
+            from paulsha_cortex.coordinator.model_identities import load_model_identities
+
+            load_model_identities(staging, use_packaged_default=False)
+        if project_needs_update:
+            if existing_project:
+                _backup_file(project_config)
             os.replace(staged_project, project_config)
         if identities_need_update:
+            if identity_exists:
+                _backup_file(identities)
             os.replace(staged_identities, identities)
         _write_managed_env(
             env_file,
@@ -361,7 +472,12 @@ def _migrate_instance_config(
 
 
 def install_service_result(
-    instance: str, interval: int, repo_root: Path, *, rebind: bool = False
+    instance: str,
+    interval: int,
+    repo_root: Path,
+    *,
+    rebind: bool = False,
+    agents_root: Path | str | None = None,
 ) -> InstallServiceResult:
     home = Path.home()
     bootstrap_root = home / ".agents"
@@ -369,6 +485,11 @@ def install_service_result(
     env_file = runtime_dir / f"{instance}-manager.env"
     existing = _read_plain_env(env_file)
     instance_env = _read_plain_env(_instance_env_file(runtime_dir, instance))
+    explicit_agents_root = (
+        _resolve_agents_root(str(agents_root)) if agents_root is not None else None
+    )
+    if agents_root is not None and explicit_agents_root is None:
+        raise ValueError("--agents-root 必須為絕對路徑")
     new_identity = _resolve_repo_identity(repo_root)
     existing_identity = existing.get("PSC_REPO_IDENTITY", "").strip()
     if existing_identity and existing_identity != new_identity and not rebind:
@@ -388,11 +509,22 @@ def install_service_result(
     instance_executor = instance_env.get("PSC_MANAGER_EXECUTOR", "").strip()
     if instance_executor and instance_executor not in _SUPPORTED_EXECUTORS:
         raise ValueError("既有 instance PSC_MANAGER_EXECUTOR 必須為 copilot、claude 或 codex")
-    agents_root = _resolve_agents_root(existing.get("PSC_AGENTS_ROOT"))
-    if agents_root is None:
-        agents_root = _resolve_agents_root(os.environ.get("PSC_AGENTS_ROOT", ""))
-    if agents_root is None:
-        agents_root = bootstrap_root
+    persisted_agents_root = _resolve_agents_root(existing.get("PSC_AGENTS_ROOT"))
+    if (
+        explicit_agents_root is None
+        and persisted_agents_root is not None
+        and persisted_agents_root.name == ".agents"
+        and persisted_agents_root.expanduser().resolve() != bootstrap_root.resolve()
+    ):
+        raise ValueError(
+            f"既有 runtime env（{env_file}）的 PSC_AGENTS_ROOT 指向另一個 HOME 下的"
+            "預設 agents root；如為合法自訂路徑請使用 --agents-root 明確指定"
+        )
+    selected_agents_root = explicit_agents_root or persisted_agents_root
+    if selected_agents_root is None:
+        selected_agents_root = _resolve_agents_root(os.environ.get("PSC_AGENTS_ROOT", ""))
+    if selected_agents_root is None:
+        selected_agents_root = bootstrap_root
     unit_dir = home / ".config" / "systemd" / "user"
     # Units always bootstrap their EnvironmentFile from %h/.agents. The env
     # file then redirects all mutable/runtime data through PSC_AGENTS_ROOT and
@@ -400,9 +532,9 @@ def install_service_result(
     for directory in (
         unit_dir,
         runtime_dir,
-        agents_root / "specs",
-        agents_root / "monitor",
-        agents_root / "config" / "paulsha",
+        selected_agents_root / "specs",
+        selected_agents_root / "monitor",
+        selected_agents_root / "config" / "paulsha",
     ):
         directory.mkdir(parents=True, exist_ok=True)
     for name, content in render_units(instance, interval, repo_root=repo_root).items():
@@ -412,17 +544,17 @@ def install_service_result(
         "PSC_INSTANCE": instance,
         "PSC_REPO_ROOT": str(repo_root),
         "PSC_REPO_IDENTITY": new_identity,
-        "PSC_AGENTS_ROOT": str(agents_root),
-        "PSC_RUN_ROOT": str(agents_root / "run" / instance),
-        "PSC_MONITOR_STATE_ROOT": str(agents_root / "monitor"),
-        "PSC_PROJECT_CONFIG_ROOT": str(agents_root / "config" / "paulsha"),
+        "PSC_AGENTS_ROOT": str(selected_agents_root),
+        "PSC_RUN_ROOT": str(selected_agents_root / "run" / instance),
+        "PSC_MONITOR_STATE_ROOT": str(selected_agents_root / "monitor"),
+        "PSC_PROJECT_CONFIG_ROOT": str(selected_agents_root / "config" / "paulsha"),
         # #375：control plane（manager.lock／requests／done／status.json）沒有
         # instance 成分時，兩個 instance 若共用同一個 PSC_AGENTS_ROOT（installer
         # 目前預設就是如此：agents_root 預設為 $HOME/.agents，與 instance 名稱
         # 無關）會搶同一把 manager.lock——第二個 instance 的 daemon 啟動即退出，
         # 靜默 adopt 對方 pid，work item 永遠不會被處理。比照 PSC_RUN_ROOT 的
         # `run/<instance>` 模式讓它天生 per-instance。
-        "PSC_CONTROL_ROOT": str(agents_root / "control" / instance),
+        "PSC_CONTROL_ROOT": str(selected_agents_root / "control" / instance),
     }
     executor_override = os.environ.get("PSC_MANAGER_EXECUTOR", "").strip()
     if executor_override:
@@ -474,8 +606,21 @@ def install_service_result(
     )
 
 
-def install_service(instance: str, interval: int, repo_root: Path, *, rebind: bool = False) -> int:
-    result = install_service_result(instance, interval, repo_root, rebind=rebind)
+def install_service(
+    instance: str,
+    interval: int,
+    repo_root: Path,
+    *,
+    rebind: bool = False,
+    agents_root: Path | str | None = None,
+) -> int:
+    result = install_service_result(
+        instance,
+        interval,
+        repo_root,
+        rebind=rebind,
+        agents_root=agents_root,
+    )
     print(result.message)
     return result.exit_code
 
@@ -504,6 +649,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="被治理的目標 git repo（預設：目前目錄）",
     )
     svc.add_argument(
+        "--agents-root",
+        default=None,
+        help="明確指定 mutable/runtime agents root；可豁免既有 default root 的 HOME 檢查",
+    )
+    svc.add_argument(
         "--rebind", action="store_true",
         help="既有 instance 記錄的 repo 身分與 --repo-root 不符時，明確放行本次搬遷",
     )
@@ -517,7 +667,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         instance = _validate_instance(args.instance)
         interval = _validate_interval(args.interval)
         repo_root = _resolve_git_repo_root(Path(args.repo_root))
-        return install_service(instance, interval, repo_root, rebind=args.rebind)
+        return install_service(
+            instance,
+            interval,
+            repo_root,
+            rebind=args.rebind,
+            agents_root=args.agents_root,
+        )
     except ValueError as exc:
         parser.error(str(exc))
     raise AssertionError("argparse.error must exit")
