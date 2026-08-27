@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -362,3 +364,101 @@ def test_install_service_rejects_existing_unparseable_project_config(
 
     assert project_config.read_bytes() == before_project
     assert not list(config_root.glob("project-cortex.yaml.bak-*"))
+
+
+def test_backup_file_uses_exclusive_source_mode_when_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    source = tmp_path / "project-cortex.yaml"
+    source.write_bytes(b"workspaces: []\n")
+    source.chmod(0o600)
+    source_mode = source.stat().st_mode & 0o7777
+    open_calls: list[tuple[int, int]] = []
+    real_open = installer.os.open
+
+    def tracked_open(path, flags, mode=0o777, *args, **kwargs):
+        candidate = Path(path)
+        if candidate.parent == source.parent and candidate.name.startswith(
+            "project-cortex.yaml.bak-"
+        ):
+            open_calls.append((flags, mode))
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(installer.os, "open", tracked_open)
+
+    backup = installer._backup_file(source)
+
+    assert len(open_calls) == 1
+    flags, requested_mode = open_calls[0]
+    assert flags & os.O_WRONLY
+    assert flags & os.O_CREAT
+    assert flags & os.O_EXCL
+    assert requested_mode == source_mode
+    assert backup.stat().st_mode & 0o7777 == source_mode
+
+
+def test_instance_config_migration_locks_read_through_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    other = _init_git_repo(tmp_path / "repo" / "other")
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    project_config = config_root / "project-cortex.yaml"
+    project_config.write_text(
+        yaml.safe_dump(
+            {"workspaces": [{"name": "other", "path": str(other)}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    env_file = tmp_path / "instance.env"
+    events: list[str] = []
+    lock_held = False
+    real_flock = fcntl.flock
+    real_load = installer._load_project_config_payload
+    real_replace = installer.os.replace
+
+    def tracked_flock(fd, operation):
+        nonlocal lock_held
+        if operation == fcntl.LOCK_EX:
+            assert not lock_held
+            lock_held = True
+            events.append("lock")
+        elif operation == fcntl.LOCK_UN:
+            assert lock_held
+            events.append("unlock")
+            lock_held = False
+        return real_flock(fd, operation)
+
+    def tracked_load(config_path: Path):
+        assert lock_held
+        events.append("read")
+        return real_load(config_path)
+
+    def tracked_replace(source: Path, destination: Path):
+        assert lock_held
+        events.append("replace")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(installer.fcntl, "flock", tracked_flock)
+    monkeypatch.setattr(installer, "_load_project_config_payload", tracked_load)
+    monkeypatch.setattr(installer.os, "replace", tracked_replace)
+
+    installer._migrate_instance_config(
+        env_file=env_file,
+        existing={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+        config_root=config_root,
+        repo_root=target,
+        managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+    )
+
+    assert events == ["lock", "read", "replace", "unlock"]
+    assert not lock_held

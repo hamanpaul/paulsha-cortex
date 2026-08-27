@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import fcntl
 import os
 import re
 import shutil
@@ -309,15 +310,28 @@ def _workspace_index_for_repo(
 
 def _backup_file(path: Path) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    mode = path.stat().st_mode & 0o7777
     backup = path.with_name(f"{path.name}.bak-{timestamp}")
     suffix = 1
-    while backup.exists():
-        backup = path.with_name(f"{path.name}.bak-{timestamp}-{suffix}")
-        suffix += 1
+    fd = -1
     try:
-        backup.write_bytes(path.read_bytes())
-        shutil.copymode(path, backup)
+        while True:
+            try:
+                fd = os.open(
+                    backup,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    mode,
+                )
+                break
+            except FileExistsError:
+                backup = path.with_name(f"{path.name}.bak-{timestamp}-{suffix}")
+                suffix += 1
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(path.read_bytes())
     except Exception:
+        if fd >= 0:
+            os.close(fd)
         backup.unlink(missing_ok=True)
         raise
     return backup
@@ -335,6 +349,36 @@ def _restore_file(path: Path, previous: bytes | None) -> None:
 
 
 def _migrate_instance_config(
+    *,
+    env_file: Path,
+    existing: dict[str, str],
+    config_root: Path,
+    repo_root: Path,
+    managed_env: dict[str, str],
+) -> None:
+    config_root.mkdir(parents=True, exist_ok=True)
+    lock_path = config_root / ".cortex-migration.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_held = False
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lock_held = True
+        _migrate_instance_config_locked(
+            env_file=env_file,
+            existing=existing,
+            config_root=config_root,
+            repo_root=repo_root,
+            managed_env=managed_env,
+        )
+    finally:
+        try:
+            if lock_held:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _migrate_instance_config_locked(
     *,
     env_file: Path,
     existing: dict[str, str],
@@ -422,7 +466,6 @@ def _migrate_instance_config(
         )
         return
 
-    config_root.mkdir(parents=True, exist_ok=True)
     project_text = yaml.safe_dump(project_payload, sort_keys=False)
     identities_text = "schema_version: 3\nidentities: []\n"
     previous = {

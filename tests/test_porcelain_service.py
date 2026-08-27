@@ -261,6 +261,41 @@ def test_service_install_json_reports_fallback_mode_when_systemd_is_unavailable(
     assert "--follow" in payload["message"]
 
 
+def test_service_install_foreign_agents_root_explains_porcelain_override(
+    service_runtime: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    _load_cli()
+    monkeypatch.setattr(installer, "_resolve_git_repo_root", lambda path: path.resolve())
+
+    def fail_install(*args, **kwargs):
+        raise ValueError(
+            "既有 runtime env 的 PSC_AGENTS_ROOT=/foreign/.agents 不在目前 "
+            "HOME=/current/home 底下；如為合法自訂路徑請使用 --agents-root 明確指定"
+        )
+
+    monkeypatch.setattr(installer, "install_service_result", fail_install)
+
+    with pytest.raises(SystemExit):
+        importlib.import_module("paulsha_cortex.porcelain.service").main(
+            [
+                "install",
+                "--instance",
+                "beta",
+                "--repo-root",
+                str(service_runtime["repo_root"]),
+            ]
+        )
+
+    assert (
+        "porcelain 請改用 cortex install service --agents-root PATH"
+        in capsys.readouterr().err
+    )
+
+
 @pytest.mark.parametrize("use_json", [False, True], ids=["plain", "json"])
 def test_service_install_systemctl_failure_reports_expected_channel(
     service_runtime: dict[str, Path],

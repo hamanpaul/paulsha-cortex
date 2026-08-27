@@ -10,7 +10,7 @@ work_item: installer-shared-config-guard
 - [x] 修復 retry 發現的 process-env default agents root 跨 HOME 守衛，以及既有 project／identity config 不可載入時拒絕替換。
 - [x] 修復 verifier 發現的任意 basename HOME containment、session fixture tmp 隔離、UTC backup timestamp，並移除 installer dead code。
 - [x] 修復 review 發現的既有 workspace 逐字保留、monitor/hippo 設定 round-trip，以及 migration rollback 備份清理。
-- [x] 修復 delivery review 的 HOME 診斷訊息、既有設定檔權限保留，以及 YAML round-trip 的 pre-archive 文件說明。
+- [x] 修復 delivery review 的 HOME 診斷訊息、既有設定檔權限保留、備份建立時的原子權限、porcelain 安裝指引、migration flock，以及 YAML round-trip 的 pre-archive 文件說明。
 - [x] `tests/conftest.py` session fixture 隔離 `PSC_AGENTS_ROOT`／`PSC_PROJECT_CONFIG_ROOT`。
 - [x] 既有 installer 測試回歸綠；補 `changelog.d/` 碎片與 README「install service 對既有 config 只 append」說明。
 - [x] focused／full gates；完成 pre-archive Candidate 準備，後續 evidence canonicalization、archive 與 merge 由 Manager 處理。
