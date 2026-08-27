@@ -706,8 +706,9 @@ def test_venv_post_rename_interruption_replays_from_prepublished_authority(
     assert active.resolve() == slot
 
 
+@pytest.mark.parametrize("parent_existed_before", [False, True])
 def test_unknown_scanner_excludes_retained_receipt_bound_venv_slot(
-    tmp_path: Path,
+    tmp_path: Path, parent_existed_before: bool
 ) -> None:
     venvs = tmp_path / "opt/cortex/venvs"
     slot = venvs / ("a" * 64)
@@ -730,9 +731,89 @@ def test_unknown_scanner_excludes_retained_receipt_bound_venv_slot(
             "rollback_journal": [
                 {
                     "step": directory_step,
-                    "prior": {"exists": True, "children": []},
+                    "prior": (
+                        {"exists": True, "children": []}
+                        if parent_existed_before
+                        else {"exists": False}
+                    ),
                 },
                 {"step": venv_step, "prior": {"exists": False}},
+            ],
+        }
+    )
+
+    assert LocalInstallBackend(require_root=False).list_unknown_state(receipt) == ()
+
+
+def test_unknown_scanner_keeps_foreign_sibling_of_retained_managed_subtree(
+    tmp_path: Path,
+) -> None:
+    managed_root = tmp_path / "opt/cortex"
+    slot = managed_root / "venvs" / ("a" * 64)
+    (slot / "bin").mkdir(parents=True)
+    (slot / "bin/python").write_text("python", encoding="utf-8")
+    unknown = managed_root / "operator" / "keep.txt"
+    unknown.parent.mkdir()
+    unknown.write_text("keep\n", encoding="utf-8")
+    receipt = InstallReceipt(
+        {
+            "journal": [],
+            "rollback_journal": [
+                {
+                    "step": {
+                        "step_id": "asset:deploy-root",
+                        "kind": "asset",
+                        "asset_type": "directory",
+                        "path": str(managed_root),
+                    },
+                    "prior": {"exists": False},
+                },
+                {
+                    "step": {
+                        "step_id": "candidate-venv",
+                        "kind": "venv",
+                        "path": str(slot),
+                    },
+                    "prior": {"exists": False},
+                },
+            ],
+        }
+    )
+
+    retained = LocalInstallBackend(require_root=False).list_unknown_state(receipt)
+
+    assert str(unknown) in retained
+    assert str(managed_root) not in retained
+
+
+def test_unknown_scanner_excludes_receipt_bound_fresh_repository_from_parent(
+    tmp_path: Path,
+) -> None:
+    repositories = tmp_path / "var/lib/cortex/repos"
+    checkout = repositories / "example"
+    checkout.mkdir(parents=True)
+    (checkout / "HEAD").write_text("candidate\n", encoding="utf-8")
+    receipt = InstallReceipt(
+        {
+            "journal": [],
+            "rollback_journal": [
+                {
+                    "step": {
+                        "step_id": "asset:repositories",
+                        "kind": "asset",
+                        "asset_type": "directory",
+                        "path": str(repositories),
+                    },
+                    "prior": {"exists": False},
+                },
+                {
+                    "step": {
+                        "step_id": "repository:example",
+                        "kind": "repository",
+                        "path": str(checkout),
+                    },
+                    "prior": {"exists": False},
+                },
             ],
         }
     )

@@ -19,6 +19,10 @@
    wheel、完整 install-input archive、passed release qualification manifest。三份資產的
    GitHub REST `digest` 都必須等於 publication job 的本機 SHA-256。
 
+Release candidate PR 應帶對應 `release:<version>` label。Policy Check 必須在 PR 建立、commit
+同步、重開、title/body 編輯與 label 增刪時重跑；不能沿用缺少後加 label 的舊 event payload，
+否則 VERSION gate 會對相同 PR metadata 產生不同結論。
+
 publication job 刻意不 checkout source tree；所有 repository-aware `gh` 操作都必須由
 `GITHUB_REPOSITORY` 明確指定目標。尤其 `gh release create` 必須帶 `--repo`，不可依賴本地
 `.git` context。
@@ -45,6 +49,10 @@ qualification evidence 位於專用的一次性 Docker volume，再由 runner �
 結束時刪除 volume。不要改回 container `/run`：systemd container 的 `/run` 是 tmpfs，Docker
 daemon 的 archive API 無法看見其中檔案；也不要改成 writable host bind，以免擴大 qualification
 對 host 的寫入面。
+
+container 內的 rollback proof 必須發生在任何 harness runtime scaffold fixture 之前。rollback
+可以依 archived receipt inventory 辨識並保留 fresh checkout 與 content-addressed venv，但仍須
+對同一 parent 下的 foreign sibling fail closed；fixture 若提前建立，會混淆這條 authority 邊界。
 
 release validator 會要求 `qualification-output/evidence/` 的實際 regular-file 集合與
 `qualification.json`／`artifact-inventory.json` 列管集合完全一致；額外檔案、symlink、缺檔或

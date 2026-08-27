@@ -3090,10 +3090,22 @@ class LocalInstallBackend:
             step = entry.get("step") if isinstance(entry, Mapping) else None
             if (
                 isinstance(step, Mapping)
-                and step.get("kind") in {"asset", "venv"}
+                and step.get("kind") in {"asset", "repository", "toolchain", "venv"}
                 and isinstance(step.get("path"), str)
             ):
                 managed_paths.add(Path(str(step["path"])))
+
+        def is_managed_inventory_path(candidate: Path, container: Path) -> bool:
+            return any(
+                managed != container
+                and (
+                    candidate == managed
+                    or managed in candidate.parents
+                    or candidate in managed.parents
+                )
+                for managed in managed_paths
+            )
+
         for entry in journal_rows:
             if not isinstance(entry, Mapping):
                 continue
@@ -3108,8 +3120,14 @@ class LocalInstallBackend:
                 path = Path(str(step.get("path", "")))
                 try:
                     if not prior.get("exists"):
-                        if path.is_dir() and any(path.iterdir()):
+                        if path.is_symlink() or (path.exists() and not path.is_dir()):
                             retained.append(str(path))
+                        elif path.is_dir():
+                            for relative in _directory_inventory(path):
+                                candidate = path / relative
+                                if is_managed_inventory_path(candidate, path):
+                                    continue
+                                retained.append(str(candidate))
                         continue
                     baseline = prior.get("children")
                     if not isinstance(baseline, list) or not all(
@@ -3121,11 +3139,7 @@ class LocalInstallBackend:
                     current = set(_directory_inventory(path))
                     for relative in sorted(current - set(baseline)):
                         candidate = path / relative
-                        if any(
-                            managed != path
-                            and (candidate == managed or managed in candidate.parents)
-                            for managed in managed_paths
-                        ):
+                        if is_managed_inventory_path(candidate, path):
                             continue
                         retained.append(str(candidate))
                 except (InstallError, OSError):
