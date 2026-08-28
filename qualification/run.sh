@@ -132,6 +132,20 @@ docker exec "$container_name" cortex install trust-root plan \
     --output "$plan_path"
 plan_sha=$(docker exec "$container_name" sha256sum "$plan_path" | awk '{print $1}')
 
+# The packaged release config keeps the builder on Codex. A host overlay may
+# opt into AGY, in which case the plan is the authority for whether a separate
+# builder credential must be supplied. Treat an unreadable/malformed plan as a
+# harness failure instead of silently skipping the protected import.
+builder_agy_required=0
+if docker exec "$container_name" jq -e \
+    'any(.required_credentials[]?; .principal == "builder" and .provider == "agy")' \
+    "$plan_path" >/dev/null 2>&1; then
+    builder_agy_required=1
+else
+    plan_query_status=$?
+    [[ $plan_query_status -eq 1 ]] || die "install plan required_credentials could not be inspected"
+fi
+
 # Apply once for a fresh install and once more to prove idempotency. The public
 # installer owns receipt replay; the harness never translates its plan to shell.
 docker exec "$container_name" cortex install trust-root apply \
@@ -220,6 +234,9 @@ import_fixture() {
 
 if [[ "$profile" == deployment-canary ]]; then
     import_secret CORTEX_RC_CODEX_AUTH builder codex /run/auth.json
+    if (( builder_agy_required )); then
+        import_secret CORTEX_RC_BUILDER_AGY_AUTH builder agy /run/oauth_creds.json
+    fi
     import_secret CORTEX_RC_AGY_AUTH reviewer-planner agy /run/oauth_creds.json
     import_secret CORTEX_RC_COPILOT_AUTH reviewer-planner copilot /run/hosts.json
     import_secret CORTEX_RC_MANAGER_GITHUB_AUTH manager github /run/hosts.yml
@@ -227,6 +244,9 @@ else
     # Exercise the production import/activation path without introducing a
     # credential or external authority into release qualification.
     import_fixture builder codex /run/auth.json
+    if (( builder_agy_required )); then
+        import_fixture builder agy /run/oauth_creds.json
+    fi
     import_fixture reviewer-planner agy /run/oauth_creds.json
     import_fixture reviewer-planner copilot /run/hosts.json
     import_fixture manager github /run/hosts.yml

@@ -10,12 +10,16 @@ import sys
 from pathlib import Path
 
 
-SECRET_ENV = (
+REQUIRED_SECRET_ENV = (
     "CORTEX_RC_CODEX_AUTH",
     "CORTEX_RC_AGY_AUTH",
     "CORTEX_RC_COPILOT_AUTH",
     "CORTEX_RC_MANAGER_GITHUB_AUTH",
 )
+OPTIONAL_SECRET_ENV = ("CORTEX_RC_BUILDER_AGY_AUTH",)
+# Keep one exported inventory for callers/tests while distinguishing the
+# optional host-overlay credential from the four default canary inputs.
+SECRET_ENV = REQUIRED_SECRET_ENV + OPTIONAL_SECRET_ENV
 TOKEN_PATTERNS = (
     re.compile(rb"gh[pousr]_[A-Za-z0-9_]{20,}"),
     re.compile(rb"sk-[A-Za-z0-9_-]{20,}"),
@@ -29,10 +33,22 @@ def _needles(profile: str) -> tuple[bytes, ...]:
     if profile != "deployment-canary":
         raise ValueError("profile must be release or deployment-canary")
     values: set[bytes] = set()
-    for name in SECRET_ENV:
+    for name in REQUIRED_SECRET_ENV:
         raw = os.environ.get(name)
         if not raw:
             raise ValueError(f"protected secret {name} is unavailable")
+        encoded = raw.encode()
+        if len(encoded) < 8:
+            raise ValueError(f"protected secret {name} is unexpectedly short")
+        values.add(encoded)
+        for line in encoded.splitlines():
+            stripped = line.strip()
+            if len(stripped) >= 8:
+                values.add(stripped)
+    for name in OPTIONAL_SECRET_ENV:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
         encoded = raw.encode()
         if len(encoded) < 8:
             raise ValueError(f"protected secret {name} is unexpectedly short")

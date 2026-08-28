@@ -14,6 +14,11 @@
   direct mode 保留既有 operator overlay 相容性，且 packaged roster 不宣傳 AGY build
   fallback。
 
+- **#805 deployment-canary credential wiring**：qualification harness 現在以 install plan 的
+  `required_credentials` 為唯一判準，只有 host overlay 明列 `(builder, agy)` 時才匯入獨立的
+  `CORTEX_RC_BUILDER_AGY_AUTH`；plan 解析失敗會 fail closed，release default 不變，canary
+  redaction scan 也會涵蓋這份 optional credential。
+
 - **#802：fix-standard 的 planning publication 現在對 spec／design／plan 使用
   work-item-bound canonical destinations，即使 combo manifest 沒有
   `brainstorming` card 也能落地三件套；內容型 planning failure 的
