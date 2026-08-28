@@ -216,6 +216,54 @@ def test_install_service_rollback_removes_migration_backups(
     assert not list(config_root.glob("project-cortex.yaml.bak-*"))
 
 
+def test_install_service_rollback_retains_backup_when_restore_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restore failure must leave the pre-migration bytes recoverable."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    other = _init_git_repo(tmp_path / "repo" / "other")
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    project_config = config_root / "project-cortex.yaml"
+    project_config.write_text(
+        yaml.safe_dump(
+            {"workspaces": [{"name": "other", "path": str(other)}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(f"PSC_PROJECT_CONFIG_ROOT={config_root}\n", encoding="utf-8")
+    before_project = project_config.read_bytes()
+
+    def fail_env_write(*args, **kwargs):
+        raise OSError("injected env write failure")
+
+    def fail_restore(*args, **kwargs):
+        raise OSError("injected restore failure")
+
+    monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
+    monkeypatch.setattr(installer, "_restore_file", fail_restore)
+
+    with pytest.raises(OSError, match="injected restore failure"):
+        installer._migrate_instance_config(
+            env_file=env_file,
+            existing={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+            config_root=config_root,
+            repo_root=target,
+            managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+        )
+
+    backups = sorted(config_root.glob("project-cortex.yaml.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == before_project
+
+
 def test_install_service_rejects_agents_root_from_different_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -308,6 +356,7 @@ def test_install_service_raises_when_existing_model_identities_are_unloadable(
     assert project_config.read_bytes() == before_project
     assert identities.read_bytes() == before_identities
     assert env_file.read_bytes() == before_env
+    assert not (config_root / ".cortex-migration.lock").exists()
 
 
 def test_install_service_rejects_unloadable_identities_with_invalid_project_config(
@@ -337,6 +386,7 @@ def test_install_service_rejects_unloadable_identities_with_invalid_project_conf
     assert identities.read_bytes() == before_identities
     assert not list(config_root.glob("project-cortex.yaml.bak-*"))
     assert not list(config_root.glob("model-identities.yaml.bak-*"))
+    assert not (config_root / ".cortex-migration.lock").exists()
 
 
 def test_install_service_rejects_existing_unparseable_project_config(
@@ -364,6 +414,7 @@ def test_install_service_rejects_existing_unparseable_project_config(
 
     assert project_config.read_bytes() == before_project
     assert not list(config_root.glob("project-cortex.yaml.bak-*"))
+    assert not (config_root / ".cortex-migration.lock").exists()
 
 
 def test_backup_file_uses_exclusive_source_mode_when_created(
@@ -439,7 +490,6 @@ def test_instance_config_migration_locks_read_through_replace(
         return real_flock(fd, operation)
 
     def tracked_load(config_path: Path):
-        assert lock_held
         events.append("read")
         return real_load(config_path)
 
@@ -460,5 +510,5 @@ def test_instance_config_migration_locks_read_through_replace(
         managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
     )
 
-    assert events == ["lock", "read", "replace", "unlock"]
+    assert events == ["read", "lock", "read", "replace", "unlock"]
     assert not lock_held

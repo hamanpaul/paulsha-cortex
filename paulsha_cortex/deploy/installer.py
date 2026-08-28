@@ -34,6 +34,14 @@ class InstallServiceResult:
     message: str
 
 
+@dataclass(frozen=True)
+class _MigrationInputs:
+    existing_project: bool
+    project_payload: dict[str, object]
+    project_needs_update: bool
+    identities_need_update: bool
+
+
 def _template(name: str) -> str:
     return (resources.files("paulsha_cortex.deploy") / "templates" / name).read_text()
 
@@ -348,45 +356,7 @@ def _restore_file(path: Path, previous: bytes | None) -> None:
     path.write_bytes(previous)
 
 
-def _migrate_instance_config(
-    *,
-    env_file: Path,
-    existing: dict[str, str],
-    config_root: Path,
-    repo_root: Path,
-    managed_env: dict[str, str],
-) -> None:
-    config_root.mkdir(parents=True, exist_ok=True)
-    lock_path = config_root / ".cortex-migration.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    lock_held = False
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        lock_held = True
-        _migrate_instance_config_locked(
-            env_file=env_file,
-            existing=existing,
-            config_root=config_root,
-            repo_root=repo_root,
-            managed_env=managed_env,
-        )
-    finally:
-        try:
-            if lock_held:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
-
-
-def _migrate_instance_config_locked(
-    *,
-    env_file: Path,
-    existing: dict[str, str],
-    config_root: Path,
-    repo_root: Path,
-    managed_env: dict[str, str],
-) -> None:
-    """Adopt a legacy instance with a validated, rollback-safe config bundle."""
+def _prepare_migration_inputs(*, config_root: Path, repo_root: Path) -> _MigrationInputs:
     project_config = config_root / "project-cortex.yaml"
     identities = config_root / "model-identities.yaml"
 
@@ -451,7 +421,67 @@ def _migrate_instance_config_locked(
             # an existing ``exact_project: false`` entry during install.
             project_needs_update = False
 
-    identities_need_update = not identity_exists
+    return _MigrationInputs(
+        existing_project=existing_project,
+        project_payload=project_payload,
+        project_needs_update=project_needs_update,
+        identities_need_update=not identity_exists,
+    )
+
+
+def _migrate_instance_config(
+    *,
+    env_file: Path,
+    existing: dict[str, str],
+    config_root: Path,
+    repo_root: Path,
+    managed_env: dict[str, str],
+) -> None:
+    config_root.mkdir(parents=True, exist_ok=True)
+    # Validate fail-loud inputs before creating a persistent lock path.  The
+    # locked path repeats this check after acquiring the lock to close the
+    # race between this preflight and the mutation.
+    _prepare_migration_inputs(config_root=config_root, repo_root=repo_root)
+    lock_path = config_root / ".cortex-migration.lock"
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    lock_held = False
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        lock_held = True
+        _migrate_instance_config_locked(
+            env_file=env_file,
+            existing=existing,
+            config_root=config_root,
+            repo_root=repo_root,
+            managed_env=managed_env,
+        )
+    finally:
+        try:
+            if lock_held:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def _migrate_instance_config_locked(
+    *,
+    env_file: Path,
+    existing: dict[str, str],
+    config_root: Path,
+    repo_root: Path,
+    managed_env: dict[str, str],
+) -> None:
+    """Adopt a legacy instance with a validated, rollback-safe config bundle."""
+    project_config = config_root / "project-cortex.yaml"
+    identities = config_root / "model-identities.yaml"
+    migration_inputs = _prepare_migration_inputs(
+        config_root=config_root,
+        repo_root=repo_root,
+    )
+    existing_project = migration_inputs.existing_project
+    project_payload = migration_inputs.project_payload
+    project_needs_update = migration_inputs.project_needs_update
+    identities_need_update = migration_inputs.identities_need_update
 
     current_root = existing.get("PSC_PROJECT_CONFIG_ROOT", "").strip()
     root_needs_update = (
@@ -505,7 +535,9 @@ def _migrate_instance_config_locked(
             _restore_file(env_file, previous[env_file])
             _restore_file(project_config, previous[project_config])
             _restore_file(identities, previous[identities])
-        finally:
+        except Exception:
+            raise
+        else:
             for backup in created_backups:
                 backup.unlink(missing_ok=True)
         raise

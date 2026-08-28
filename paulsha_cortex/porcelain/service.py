@@ -368,21 +368,13 @@ def _run_install(
         _json_dump(payload)
         return int(payload.get("result", {}).get("exit_code", 1))
     stderr = io.StringIO()
-    stderr_forwarded = False
     try:
         with contextlib.redirect_stderr(stderr):
             return int(installer.main(argv) or 0)
-    except SystemExit:
+    finally:
         message = _append_agents_root_install_hint(stderr.getvalue())
         if message:
             sys.stderr.write(message)
-            stderr_forwarded = True
-        raise
-    finally:
-        if not stderr_forwarded:
-            message = _append_agents_root_install_hint(stderr.getvalue())
-            if message:
-                sys.stderr.write(message)
 
 
 def _run_systemctl(verb: str, *units: str) -> subprocess.CompletedProcess[str]:
