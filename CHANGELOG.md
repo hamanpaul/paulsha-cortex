@@ -7,6 +7,18 @@
 
 ## [Unreleased]
 
+- **#802：fix-standard 的 planning publication 現在對 spec／design／plan 使用
+  work-item-bound canonical destinations，即使 combo manifest 沒有
+  `brainstorming` card 也能落地三件套；內容型 planning failure 的
+  `needs_human` 回應同步提供補件、`abandon` 與重新 intake 的下一步提示，
+  並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
+  超長提示的回歸保護。`DiagnosticReason` 以加法欄位 bump 至 schema v2，
+  仍相容讀取缺少 `next_step_hint` 的 v1 payload；這是單向遷移，已寫入 hint
+  記錄後不可將 Manager 降級回不認得該欄位的舊版本；三條 operator hint 分支改用
+  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定以 accepted
+  basename glob 比對，並由四段相對路徑、目錄家族與正規化守衛限制作用範圍；包含
+  work item 的合法 slug 不得因 combo manifest 缺少 brainstorming 而被拒。**
+
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
   missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
