@@ -1356,15 +1356,7 @@ def select_secondary_planner(
         planning,
         role="planning",
         context=registry.resolution_context,
-        compatibility_for=(
-            (
-                lambda identity: model_resolution.compatibility_contract_for(
-                    "planner", identity
-                )
-            )
-            if registry.resolution is not None
-            else None
-        ),
+        compatibility_for=model_resolution.compatibility_checker_for("planner"),
     )
     rejections: list[CandidateRejection] = []
     for identity in ranked.ordered:

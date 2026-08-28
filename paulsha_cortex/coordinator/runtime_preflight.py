@@ -577,6 +577,48 @@ def _identity_token(identity: object) -> str:
     return str(identity)
 
 
+def _candidate_contract_failure_result(
+    *,
+    card: str,
+    identity: object,
+    error: BaseException,
+    now: float | None,
+    environment: ExecutorEnvironment | None = None,
+) -> RuntimePreflightResult:
+    """Represent a per-candidate launcher-contract failure as a blocked attempt.
+
+    A candidate can fail while its launcher is being specialized, before an
+    executor environment can be described.  That failure is candidate-local:
+    the dispatch gate must record it and continue to the next ordered
+    candidate instead of aborting the whole re-route.  The fallback host
+    description is only a serialization anchor; the finding explicitly says
+    that no runtime probe was performed against it.
+    """
+
+    checked_at = time.time() if now is None else float(now)
+    executor = getattr(identity, "executor", None)
+    environment = environment or host_environment(
+        name=f"{executor or 'candidate'}:compatibility-error",
+        provider_identity=executor if isinstance(executor, str) else None,
+    )
+    capability = RuntimeCapability(kind="bridge", name="dispatch-contract")
+    finding = CapabilityFinding(
+        capability=capability,
+        outcome=PreflightOutcome.CAPABILITY_MISSING,
+        reason=(
+            "candidate compatibility rejected before executor preflight: "
+            f"{type(error).__name__}: {error}"
+        ),
+    )
+    return RuntimePreflightResult(
+        card=card,
+        identity_token=_identity_token(identity),
+        environment=environment,
+        findings=(finding,),
+        checked_at=checked_at,
+    )
+
+
 # ------------------------------------------------------------------ dispatch gate
 
 
@@ -642,21 +684,38 @@ def evaluate_dispatch_gate(
     active_budget = budget if budget is not None else ProbeBudget()
 
     for index, identity in enumerate(candidates):
-        result = run_runtime_preflight(
-            card=card,
-            requirements=requirements,
-            identity=identity,
-            environment=environment_for(identity),
-            snapshot_lookup=snapshot_lookup,
-            provider_prober=provider_prober,
-            budget=active_budget,
-            now=now,
-        )
+        try:
+            environment = environment_for(identity)
+        except Exception as exc:  # noqa: BLE001 - one candidate must not abort reroute
+            result = _candidate_contract_failure_result(
+                card=card, identity=identity, error=exc, now=now
+            )
+        else:
+            result = run_runtime_preflight(
+                card=card,
+                requirements=requirements,
+                identity=identity,
+                environment=environment,
+                snapshot_lookup=snapshot_lookup,
+                provider_prober=provider_prober,
+                budget=active_budget,
+                now=now,
+            )
         attempts.append(result)
         if result.blocking:
             continue
         # 通過：到這裡才允許建立 launcher／model session。
-        launcher = None if launcher_factory is None else launcher_factory(identity)
+        try:
+            launcher = None if launcher_factory is None else launcher_factory(identity)
+        except Exception as exc:  # noqa: BLE001 - one candidate must not abort reroute
+            attempts[-1] = _candidate_contract_failure_result(
+                card=card,
+                identity=identity,
+                error=exc,
+                now=now,
+                environment=environment,
+            )
+            continue
         return DispatchGateDecision(
             action="dispatch" if index == 0 else "reroute",
             identity=identity,

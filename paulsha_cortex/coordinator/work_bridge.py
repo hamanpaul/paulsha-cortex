@@ -516,15 +516,7 @@ def start_canonical_workflow(
         planning,
         role="planning",
         context=identities.resolution_context,
-        compatibility_for=(
-            (
-                lambda identity: model_resolution.compatibility_contract_for(
-                    "planner", identity
-                )
-            )
-            if identities.resolution is not None
-            else None
-        ),
+        compatibility_for=model_resolution.compatibility_checker_for("planner"),
     )
     if not ranked.ordered:
         raise RuntimeError(

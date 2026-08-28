@@ -114,10 +114,10 @@ def test_overlay_builder_survives_packaged_primary_domain_preference(tmp_path: P
     # primary_domain 偏好降級為**同層內**的次要偏好，不再有機會讓 packaged 候選
     # （僅為候選宣告、未經評估）壓過人工指定。
     assert keys[0] == ("codex", "gpt-5.4")
-    # 沒有 builder credential cell 的 packaged claude 會被 compatibility guard
-    # 剔除；相容的 packaged codex 仍可作 fallback。
-    assert ("claude", "sonnet") not in keys
-    assert ("codex", "gpt-5.3-codex-spark") in keys
+    # direct mode 保留既有 operator overlay／packaged 候選語意；hardened
+    # compatibility gate 只在 Trust Root runner 明示啟用時套用。
+    assert ("claude", "sonnet") in keys
+    assert keys.index(("codex", "gpt-5.4")) < keys.index(("claude", "sonnet"))
 
 
 def test_measured_band_filter_excludes_with_observable_reason(caplog) -> None:

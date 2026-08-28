@@ -311,13 +311,14 @@ def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeR
         candidates = [
             identity for identity in registry.identities if role in identity.capabilities
         ]
+        compatibility_for = model_resolution.compatibility_checker_for(
+            persona, env=env
+        )
         ranked = model_resolution.rank_candidates(
             candidates,
             role=role,
             context=context,
-            compatibility_for=lambda identity: model_resolution.compatibility_contract_for(
-                persona, identity
-            ),
+            compatibility_for=compatibility_for,
         )
         if not ranked.ordered:
             failures.append(
@@ -327,17 +328,28 @@ def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeR
         top = ranked.ordered[0]
         layer = ranked.layer_of(top)
         summary.append(f"{persona}={top.executor}/{top.model_id}[{layer}]")
-        try:
-            model_resolution.validate_identity_compatibility(persona, top)
-        except ValueError as exc:
-            detail = f"{persona}: {exc}"
-            if layer == model_resolution.RESOLUTION_LAYER_OVERLAY:
-                failures.append(detail)
-            else:
-                # Packaged identities are a candidate pool.  Keep the
-                # deployment diagnosable without making an unqualified
-                # fallback look like a live grant.
-                warnings.append(detail + "（候選未授予有效熱路徑契約）")
+        if compatibility_for is not None:
+            for excluded_identity, reason in ranked.excluded:
+                if (
+                    model_resolution.identity_origin(excluded_identity)
+                    == model_resolution.IDENTITY_ORIGIN_OVERLAY
+                    and reason.startswith("missing ")
+                ):
+                    failures.append(
+                        f"{persona}: {excluded_identity.executor}/"
+                        f"{excluded_identity.model_id}[operator-overlay]: {reason}"
+                    )
+            try:
+                model_resolution.validate_identity_compatibility(persona, top)
+            except ValueError as exc:
+                detail = f"{persona}: {exc}"
+                if layer == model_resolution.RESOLUTION_LAYER_OVERLAY:
+                    failures.append(detail)
+                else:
+                    # Packaged identities are a candidate pool.  Keep the
+                    # deployment diagnosable without making an unqualified
+                    # fallback look like a live grant.
+                    warnings.append(detail + "（候選未授予有效熱路徑契約）")
         overlay_declared = [
             identity
             for identity in candidates

@@ -8212,15 +8212,7 @@ def _rank_candidates_by_resolution_layer(
         candidates,
         role=role,
         context=identities.resolution_context,
-        compatibility_for=(
-            (
-                lambda identity: model_resolution.compatibility_contract_for(
-                    persona, identity
-                )
-            )
-            if identities.resolution is not None
-            else None
-        ),
+        compatibility_for=model_resolution.compatibility_checker_for(persona),
     )
     for warning in ranked.warnings:
         logger.warning(
@@ -8475,6 +8467,7 @@ def _runtime_preflight_gate(
         return None
 
     candidates = _workflow_identity_candidates(run, step, identities)
+    compatibility_for = model_resolution.compatibility_checker_for(step.persona)
 
     # 每個 identity 只 specialize 一次並記憶：preflight 與最終 dispatch 共用同一
     # 個 launcher 實例，因此（a）檢查的環境就是 job 的環境，（b）通過的 identity
@@ -8485,7 +8478,7 @@ def _runtime_preflight_gate(
         key = id(identity)
         if key not in specialized:
             specialized[key] = _specialize_workflow_launcher(launcher_factory(identity), step)
-            if identities.resolution is not None:
+            if compatibility_for is not None:
                 model_resolution.validate_identity_compatibility(
                     step.persona, identity, launcher=specialized[key]
                 )
@@ -9677,13 +9670,16 @@ def _dispatch_workflow_card(
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
         launcher = _specialize_workflow_launcher(launcher, step)
-    if identities.resolution is not None and identity is not None:
-        # The candidate path already checked the static registry contract.  A
+    if identity is not None:
+        # Hardened candidate ranking checks the static registry contract.  A
         # final check against the specialized launcher closes the remaining
-        # dependency seam before any job/worktree launch side effect.
-        model_resolution.validate_identity_compatibility(
-            step.persona, identity, launcher=launcher
-        )
+        # dependency seam before any job/worktree launch side effect; direct
+        # mode intentionally keeps the legacy operator-overlay path.
+        compatibility_for = model_resolution.compatibility_checker_for(step.persona)
+        if compatibility_for is not None:
+            model_resolution.validate_identity_compatibility(
+                step.persona, identity, launcher=launcher
+            )
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
     _record_resolved_model_chain(registry, run, step, identity, identities)

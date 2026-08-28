@@ -21,6 +21,7 @@ duck-typed 讀取，缺欄位時退回最寬鬆的預設，讓既有測試替身
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -112,11 +113,39 @@ _TRUST_ROOT_PRINCIPAL_BY_PERSONA = {
     "planner": "PLANNER",
     "reviewer": "REVIEWER",
 }
-_EXPECTED_CREDENTIAL_SHAPE_BY_EXECUTOR = {
-    "codex": "home-sticky-tree",
-    "agy": "home-redirect-tree",
-    "claude": "home-redirect-tree",
-}
+
+
+def trust_root_hardening_active(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether the authoritative Trust Root runner contract is active.
+
+    The runner mode is the deployment signal emitted by the Trust Root install
+    environment.  A loaded model roster is not evidence that the roster is
+    running under the hardened account/namespace contract: direct-mode
+    installations intentionally keep their historical operator-overlay
+    behavior.  Invalid runner configuration still raises through the single
+    fail-closed resolver.
+    """
+
+    from . import job_runner
+
+    source = os.environ if env is None else env
+    return job_runner.resolve_runner_mode(source) != job_runner.RUNNER_DIRECT
+
+
+def compatibility_checker_for(
+    persona: str, *, env: Mapping[str, str] | None = None
+) -> Callable[[object], Mapping[str, object] | None] | None:
+    """Return the shared compatibility contract callback when hardening is active.
+
+    Callers pass the returned callback to :func:`rank_candidates`; direct mode
+    deliberately returns ``None`` so existing operator overlays remain
+    selectable.  The pure validator remains available to explicit callers and
+    tests regardless of runner mode.
+    """
+
+    if not trust_root_hardening_active(env):
+        return None
+    return lambda identity: compatibility_contract_for(persona, identity)
 
 
 def _launcher_builder_supports(executor: str, parameter: str) -> bool:
@@ -263,6 +292,22 @@ def _credential_grant_for(persona: str, executor: str) -> Mapping[str, object] |
     }
 
 
+def _registered_credential_shape(persona: str, executor: str) -> object | None:
+    """Return the registered cell shape without maintaining an executor map."""
+
+    principal = _CREDENTIAL_PRINCIPAL_BY_PERSONA.get(persona)
+    if principal is None:
+        return None
+    try:
+        from ..trust_root import permgen
+
+        return permgen.credential_for(principal, executor).shape
+    except (AttributeError, ImportError, KeyError):
+        # Unknown/future executors are left to the caller-provided contract;
+        # known registered cells are checked against this authoritative value.
+        return None
+
+
 def validate_persona_executor_compatibility(
     *,
     persona: str,
@@ -363,13 +408,14 @@ def validate_persona_executor_compatibility(
         )
     shape = credential_grant.get("shape")
     shape_value = getattr(shape, "value", shape)
-    expected_shape = _EXPECTED_CREDENTIAL_SHAPE_BY_EXECUTOR.get(executor)
     if not isinstance(shape_value, str) or not shape_value:
         raise ValueError(f"missing {persona} credential grant for {executor}/{model_id}: shape")
-    if expected_shape is not None and shape_value != expected_shape:
+    registered_shape = _registered_credential_shape(persona, executor)
+    registered_shape_value = getattr(registered_shape, "value", registered_shape)
+    if registered_shape_value is not None and shape_value != registered_shape_value:
         raise ValueError(
             f"missing {persona} credential grant for {executor}/{model_id}: "
-            f"shape={shape_value!r}"
+            f"shape={shape_value!r} (registered={registered_shape_value!r})"
         )
 
 
@@ -853,9 +899,7 @@ def rank_candidates(
     roster = ctx.eval_roster
     excluded: list[tuple[object, str]] = []
     warnings: list[str] = []
-    layers: dict[tuple[str, str], str] = {}
     ranked: list[tuple[int, int, int, object]] = []
-    overlay_contract_failure = False
     for index, identity in enumerate(candidates):
         layer = identity_layer(identity, role=role, eval_roster=roster)
         if layer is None:
@@ -891,26 +935,20 @@ def rank_candidates(
                 )
             except Exception as exc:  # noqa: BLE001 - rejection is diagnostic data
                 excluded.append((identity, str(exc)))
-                if identity_origin(identity) == IDENTITY_ORIGIN_OVERLAY:
-                    # An explicit operator declaration must not silently fall
-                    # through to a packaged identity with a different contract.
-                    overlay_contract_failure = True
                 continue
         demoted = 1 if getattr(identity, "operator_action", None) == PACKAGED_ACTION_DEMOTE else 0
-        layers[
-            (getattr(identity, "executor", ""), getattr(identity, "model_id", ""))
-        ] = layer
         ranked.append((_LAYER_RANK[layer], demoted, index, identity))
-    if overlay_contract_failure:
-        # An invalid explicit declaration must not silently fall through to a
-        # packaged identity.  Other valid identities in that same explicit
-        # layer remain eligible, so one stale declaration cannot discard a
-        # compatible operator-selected fallback.
-        ranked = [
-            row for row in ranked if row[0] == _LAYER_RANK[RESOLUTION_LAYER_OVERLAY]
-        ]
     ranked.sort(key=lambda row: (row[0], row[1], row[2]))
     ordered = tuple(row[3] for row in ranked)
+    # Keep provenance indexed by exactly the rows that survived filtering.  In
+    # particular, an excluded overlay identity must not remain addressable via
+    # ``layer_of`` while a lower-layer fallback is being rerouted to.
+    layers = {
+        (getattr(identity, "executor", ""), getattr(identity, "model_id", "")): identity_layer(
+            identity, role=role, eval_roster=roster
+        )
+        for _layer_rank, _demoted, _index, identity in ranked
+    }
     if ordered:
         top = ordered[0]
         top_layer = layers[

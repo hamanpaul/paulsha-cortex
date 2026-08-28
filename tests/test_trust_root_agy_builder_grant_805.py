@@ -145,6 +145,26 @@ def test_complete_builder_contract_is_accepted(
     )
 
 
+def test_credential_shape_comes_from_registered_cell(
+    declared_agy_builder_identity: ModelIdentity,
+    complete_builder_contract: BuilderContractFixture,
+) -> None:
+    wrong_shape = replace(
+        complete_builder_contract,
+        credential_grant={
+            **complete_builder_contract.credential_grant,
+            "shape": CredentialShape.HOME_STICKY_TREE,
+        },
+    )
+
+    with pytest.raises(ValueError, match="shape=.*registered"):
+        _validate_builder_contract(
+            identity=declared_agy_builder_identity,
+            contract=wrong_shape,
+            missing_layer="builder credential grant",
+        )
+
+
 def test_agy_builder_launcher_dependency_is_explicit_until_writable_support_lands() -> None:
     """#805 owns the grant; #799/#806 owns the writable AGY argv contract."""
 
@@ -210,8 +230,9 @@ def test_builder_copilot_fails_closed_without_builder_credential_grant(
 
 
 def test_model_resolution_filters_incomplete_packaged_candidates_to_codex(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("PSC_JOB_RUNNER", "systemd-template")
     identities = load_model_identities(tmp_path)
     run = SimpleNamespace(
         run_id="run-805",
@@ -264,6 +285,88 @@ def test_model_resolution_filters_incomplete_packaged_candidates_to_codex(
     )
 
 
+def test_direct_mode_preserves_operator_executor_variants(tmp_path: Path, monkeypatch) -> None:
+    """The compatibility gate is deployment-scoped, not roster-scoped."""
+
+    monkeypatch.delenv("PSC_JOB_RUNNER", raising=False)
+    (tmp_path / "model-identities.yaml").write_text(
+        """\
+schema_version: 3
+identities:
+  - executor: copilot
+    model_id: build-one
+    independence_domain: microsoft
+    capabilities: [build]
+  - executor: cg
+    model_id: review-one
+    independence_domain: zhipu
+    capabilities: [planning, review]
+""",
+        encoding="utf-8",
+    )
+    identities = load_model_identities(tmp_path, use_packaged_default=False)
+    run = SimpleNamespace(
+        run_id="run-805-direct",
+        steps=(),
+        primary_domain=None,
+        sizing_band=None,
+        model_chain_override=None,
+    )
+
+    for persona, expected in (
+        ("builder", ("copilot", "build-one")),
+        ("planner", ("cg", "review-one")),
+        ("reviewer", ("cg", "review-one")),
+    ):
+        selected = manager._select_workflow_identity(
+            run, SimpleNamespace(persona=persona), identities
+        )
+        assert (selected.executor, selected.model_id) == expected
+
+
+def test_hardened_invalid_overlay_keeps_packaged_fallback_and_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One rejected overlay row must not empty the lower-layer reroute pool."""
+
+    monkeypatch.setenv("PSC_JOB_RUNNER", "systemd-template")
+    (tmp_path / "model-identities.yaml").write_text(
+        """\
+schema_version: 3
+identities:
+  - executor: copilot
+    model_id: gpt-5.4
+    independence_domain: openai
+    capabilities: [build]
+""",
+        encoding="utf-8",
+    )
+    identities = load_model_identities(tmp_path)
+    candidates = [
+        identity for identity in identities.identities if "build" in identity.capabilities
+    ]
+    checker = model_resolution.compatibility_checker_for("builder")
+    assert checker is not None
+    ranked = model_resolution.rank_candidates(
+        candidates,
+        role="build",
+        context=identities.resolution_context,
+        compatibility_for=checker,
+    )
+
+    keys = [(identity.executor, identity.model_id) for identity in ranked.ordered]
+    assert ("copilot", "gpt-5.4") not in keys
+    assert ("codex", "gpt-5.3-codex-spark") in keys
+    invalid_overlay = identities.require("copilot", "gpt-5.4")
+    assert ranked.layer_of(invalid_overlay) is None
+    fallback = identities.require("codex", "gpt-5.3-codex-spark")
+    assert ranked.layer_of(fallback) == model_resolution.RESOLUTION_LAYER_PACKAGED
+    assert any(identity is invalid_overlay for identity, _reason in ranked.excluded)
+    assert set(ranked.layers) == set(
+        (identity.executor, identity.model_id) for identity in ranked.ordered
+    )
+
+
 def test_packaged_roster_does_not_advertise_agy_build(tmp_path: Path) -> None:
     identities = load_model_identities(tmp_path)
     agy = identities.require("agy", AGY_MODEL_ID)
@@ -292,7 +395,11 @@ identities:
     )
 
     result = _model_resolution_probe(
-        {"PSC_PROJECT_CONFIG_ROOT": str(tmp_path)}, tmp_path
+        {
+            "PSC_PROJECT_CONFIG_ROOT": str(tmp_path),
+            "PSC_JOB_RUNNER": "systemd-template",
+        },
+        tmp_path,
     )
 
     assert result.status == "fail"
