@@ -154,6 +154,7 @@ jobs:
         env:
           CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
           CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_BUILDER_AGY_AUTH: ${{ secrets.CORTEX_RC_BUILDER_AGY_AUTH }}
           CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
           CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
           CORTEX_RC_PROBE_REPOSITORY: ${{ vars.CORTEX_RC_PROBE_REPOSITORY }}
@@ -174,6 +175,7 @@ jobs:
         env:
           CORTEX_RC_CODEX_AUTH: ${{ secrets.CORTEX_RC_CODEX_AUTH }}
           CORTEX_RC_AGY_AUTH: ${{ secrets.CORTEX_RC_AGY_AUTH }}
+          CORTEX_RC_BUILDER_AGY_AUTH: ${{ secrets.CORTEX_RC_BUILDER_AGY_AUTH }}
           CORTEX_RC_COPILOT_AUTH: ${{ secrets.CORTEX_RC_COPILOT_AUTH }}
           CORTEX_RC_MANAGER_GITHUB_AUTH: ${{ secrets.CORTEX_RC_MANAGER_GITHUB_AUTH }}
         run: >-

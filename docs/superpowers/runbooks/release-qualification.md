@@ -64,10 +64,12 @@ tree 外 artifact 都會失敗。這能避免上傳內容存在未受 hash inven
 `rc-qualification` environment，既有 live inputs 為：
 
 - secrets：`CORTEX_RC_CODEX_AUTH`、`CORTEX_RC_AGY_AUTH`、
-  `CORTEX_RC_COPILOT_AUTH`、`CORTEX_RC_MANAGER_GITHUB_AUTH`
+  `CORTEX_RC_COPILOT_AUTH`、`CORTEX_RC_MANAGER_GITHUB_AUTH`；host overlay 選用
+  builder/agy 時另需獨立的 `CORTEX_RC_BUILDER_AGY_AUTH`
 - variables：`CORTEX_RC_PROBE_REPOSITORY`、`CORTEX_RC_PROBE_WORK_ID`、
   `CORTEX_RC_PROBE_ISSUE`
 
-canary 會產生 `deployment-canary-<sha>`，其 evidence profile 必須是
+builder/agy credential 只在 install plan 的 `required_credentials` 明列該組合時匯入；預設
+packaged config 仍只列 builder/codex。canary 會產生 `deployment-canary-<sha>`，其 evidence profile 必須是
 `deployment-canary`。provider login/quota/model mismatch、fallback、Manager dry-run ref drift 或
 full dispatch 未 terminal 都會讓 canary 失敗，但 release workflow 永遠不查詢該 artifact。
