@@ -300,7 +300,7 @@ _ACCOUNT_CONFIG_KEYS = frozenset({"uid", "gid", "home", "shell"})
 _ROOT_CONFIG_KEYS = frozenset({"deploy", "state", "systemd", "polkit"})
 _PROVIDER_KEYS = frozenset({"builder", "reviewer-planner", "manager"})
 _PROVIDER_ALLOWLIST = {
-    "builder": frozenset({"codex"}),
+    "builder": frozenset({"agy", "codex"}),
     "reviewer-planner": frozenset({"codex", "agy", "copilot"}),
     "manager": frozenset({"github"}),
 }
@@ -5319,6 +5319,13 @@ class CredentialMetadata:
 
 _CREDENTIAL_ADAPTERS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
     ("builder", "codex"): ("auth.json", (".codex", "auth.json")),
+    # AGY builder import is an explicit principal/provider pair.  Its source
+    # filename and destination are intentionally duplicated from the adapter
+    # contract only; no HOME discovery or reviewer-planner fallback is allowed.
+    ("builder", "agy"): (
+        "oauth_creds.json",
+        ("cache", "gemini", "oauth_creds.json"),
+    ),
     ("reviewer-planner", "codex"): (
         "auth.json",
         (".codex", "auth.json"),

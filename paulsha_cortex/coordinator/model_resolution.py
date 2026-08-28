@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from .._yaml import YAMLError, safe_load
 
@@ -96,6 +96,295 @@ def role_for_persona(persona: str) -> str:
     """persona → 評估角色；未知 persona 比照 manager 的 catch-all 視為 build。"""
 
     return ROLE_BY_PERSONA.get(persona, "build")
+
+
+# Cross-layer compatibility is deliberately expressed in terms of the
+# persona's Trust Root principal, not a fixed executor assignment.  The same
+# builder contract therefore works for codex, AGY, or a future qualified
+# executor without turning ``builder = codex`` into an invariant.
+_CREDENTIAL_PRINCIPAL_BY_PERSONA = {
+    "builder": "builder",
+    "planner": "reviewer-planner",
+    "reviewer": "reviewer-planner",
+}
+_TRUST_ROOT_PRINCIPAL_BY_PERSONA = {
+    "builder": "BUILDER",
+    "planner": "PLANNER",
+    "reviewer": "REVIEWER",
+}
+_EXPECTED_CREDENTIAL_SHAPE_BY_EXECUTOR = {
+    "codex": "home-sticky-tree",
+    "agy": "home-redirect-tree",
+    "claude": "home-redirect-tree",
+}
+
+
+def _launcher_builder_supports(executor: str, parameter: str) -> bool:
+    """Return whether the registered launcher can express ``parameter``.
+
+    Launcher construction remains owned by :mod:`coordinator.launcher` (and
+    the AGY writable implementation is supplied by its dependency).  Reading
+    the registered builder signature here gives the compatibility guard a
+    mechanical, dependency-aware check without duplicating argv generation.
+    """
+
+    try:
+        import inspect
+
+        from .launcher import _ARGV_BUILDERS
+
+        builder = _ARGV_BUILDERS.get(executor)
+        return builder is not None and parameter in inspect.signature(builder).parameters
+    except (ImportError, TypeError, ValueError):
+        return False
+
+
+def launcher_profile_for(persona: str, executor: str) -> Mapping[str, object] | None:
+    """Derive the launcher half of the effective persona/executor contract.
+
+    A ``None`` result is intentional: it means the installed launcher cannot
+    express the required mode, so callers must fail closed before launch.
+    In particular, an AGY builder is only compatible once the writable AGY
+    launcher dependency has landed; this module does not reimplement it.
+    """
+
+    if not isinstance(executor, str) or not executor:
+        return None
+    if persona == "builder":
+        if executor == "cg" or not _launcher_builder_supports(executor, "commit_required"):
+            return None
+        return {
+            "executor": executor,
+            "persona": persona,
+            "mode": "accept-edits" if executor == "agy" else "workspace-write",
+            "requires_worktree": True,
+            "commit_required": True,
+        }
+    if persona == "planner":
+        if not _launcher_builder_supports(executor, "read_only"):
+            return None
+        return {
+            "executor": executor,
+            "persona": persona,
+            "mode": "plan",
+            "requires_worktree": False,
+            "read_only": True,
+            "commit_required": False,
+        }
+    if persona == "reviewer":
+        if not _launcher_builder_supports(executor, "review_only"):
+            return None
+        return {
+            "executor": executor,
+            "persona": persona,
+            "mode": "review-only",
+            "requires_worktree": True,
+            "review_only": True,
+            "commit_required": False,
+        }
+    return None
+
+
+def _toolchain_grant_for(persona: str, executor: str) -> Mapping[str, object] | None:
+    """Resolve a principal-specific executor toolchain grant from the inventory."""
+
+    principal_name = _TRUST_ROOT_PRINCIPAL_BY_PERSONA.get(persona)
+    if principal_name is None:
+        return None
+    try:
+        from ..trust_root import permgen
+
+        principal = getattr(permgen.Principal, principal_name)
+        toolchain_kind = permgen.DependencyKind.TOOLCHAIN_PROGRAM
+        if not any(tool.name == executor for tool in permgen.EXECUTOR_TOOLS):
+            return None
+        if not any(
+            dependency.name == executor
+            and dependency.kind is toolchain_kind
+            and principal in dependency.principals
+            for dependency in permgen.RUN_EXTERNAL_DEPENDENCIES
+        ):
+            return None
+    except (AttributeError, ImportError):
+        return None
+    return {
+        "principal": persona,
+        "executor": executor,
+        "asset_id": "executor-toolchain",
+        "executable": True,
+    }
+
+
+def _credential_grant_for(persona: str, executor: str) -> Mapping[str, object] | None:
+    """Resolve only the explicitly registered credential cell for this principal."""
+
+    principal = _CREDENTIAL_PRINCIPAL_BY_PERSONA.get(persona)
+    if principal is None:
+        return None
+    try:
+        from ..trust_root import permgen
+
+        credential = permgen.credential_for(principal, executor)
+    except (AttributeError, ImportError, KeyError):
+        return None
+    return {
+        "principal": principal,
+        "executor": executor,
+        "shape": credential.shape,
+        "asset_id": permgen.credential_asset_id(principal, credential),
+    }
+
+
+def validate_persona_executor_compatibility(
+    *,
+    persona: str,
+    identity: object,
+    launcher_profile: Mapping[str, object] | None,
+    toolchain_grant: Mapping[str, object] | None,
+    credential_grant: Mapping[str, object] | None,
+) -> None:
+    """Fail closed unless one identity has a complete effective launch contract.
+
+    The error names the first missing layer so doctor and dispatch can expose
+    an actionable diagnosis.  This is intentionally a pure validator: callers
+    choose how to obtain each fact (loaded Trust Root, a launcher instance, or
+    a test fixture), while every entry point applies the same predicate.
+    """
+
+    executor = getattr(identity, "executor", None)
+    model_id = getattr(identity, "model_id", "unknown")
+    capability = role_for_persona(persona)
+    capabilities = getattr(identity, "capabilities", ())
+    if not isinstance(executor, str) or not executor:
+        raise ValueError(f"missing {persona} launcher profile: identity executor is empty")
+    if capability not in capabilities:
+        raise ValueError(
+            f"missing {persona} capability for {executor}/{model_id}: {capability}"
+        )
+
+    if not isinstance(launcher_profile, Mapping):
+        raise ValueError(f"missing {persona} launcher profile for {executor}/{model_id}")
+    if (
+        launcher_profile.get("executor") != executor
+        or launcher_profile.get("persona") != persona
+    ):
+        raise ValueError(
+            f"missing {persona} launcher profile for {executor}/{model_id}: "
+            "executor/persona mismatch"
+        )
+    mode = launcher_profile.get("mode")
+    if persona == "builder":
+        if mode not in {"accept-edits", "workspace-write"}:
+            raise ValueError(
+                f"missing builder launcher profile for {executor}/{model_id}: "
+                f"writable mode={mode!r}"
+            )
+        if launcher_profile.get("requires_worktree") is not True:
+            raise ValueError(
+                f"missing builder launcher profile for {executor}/{model_id}: worktree"
+            )
+        if launcher_profile.get("commit_required") is not True:
+            raise ValueError(
+                f"missing builder launcher profile for {executor}/{model_id}: commit"
+            )
+    elif persona == "planner":
+        if mode not in {"plan", "read-only", "read-only-plan"}:
+            raise ValueError(
+                f"missing planner launcher profile for {executor}/{model_id}: mode={mode!r}"
+            )
+        if launcher_profile.get("read_only") is False:
+            raise ValueError(
+                f"missing planner launcher profile for {executor}/{model_id}: read-only"
+            )
+    elif persona == "reviewer":
+        if mode not in {"review", "review-only", "read-only", "verdict-only"}:
+            raise ValueError(
+                f"missing reviewer launcher profile for {executor}/{model_id}: mode={mode!r}"
+            )
+        if (
+            launcher_profile.get("review_only") is False
+            and launcher_profile.get("read_only") is False
+        ):
+            raise ValueError(
+                f"missing reviewer launcher profile for {executor}/{model_id}: read-only"
+            )
+
+    principal = _CREDENTIAL_PRINCIPAL_BY_PERSONA.get(persona, persona)
+    if not isinstance(toolchain_grant, Mapping):
+        raise ValueError(f"missing {persona} toolchain grant for {executor}/{model_id}")
+    if (
+        toolchain_grant.get("principal") != persona
+        or toolchain_grant.get("executor") != executor
+        or toolchain_grant.get("asset_id") != "executor-toolchain"
+        or toolchain_grant.get("executable") is not True
+    ):
+        raise ValueError(
+            f"missing {persona} toolchain grant for {executor}/{model_id}: "
+            "principal/executor/asset mismatch"
+        )
+
+    if not isinstance(credential_grant, Mapping):
+        raise ValueError(f"missing {persona} credential grant for {executor}/{model_id}")
+    if (
+        credential_grant.get("principal") != principal
+        or credential_grant.get("executor") != executor
+    ):
+        raise ValueError(
+            f"missing {persona} credential grant for {executor}/{model_id}: "
+            "principal/executor mismatch"
+        )
+    shape = credential_grant.get("shape")
+    shape_value = getattr(shape, "value", shape)
+    expected_shape = _EXPECTED_CREDENTIAL_SHAPE_BY_EXECUTOR.get(executor)
+    if not isinstance(shape_value, str) or not shape_value:
+        raise ValueError(f"missing {persona} credential grant for {executor}/{model_id}: shape")
+    if expected_shape is not None and shape_value != expected_shape:
+        raise ValueError(
+            f"missing {persona} credential grant for {executor}/{model_id}: "
+            f"shape={shape_value!r}"
+        )
+
+
+def compatibility_contract_for(
+    persona: str, identity: object, *, launcher: object | None = None
+) -> Mapping[str, Mapping[str, object] | None]:
+    """Return the three facts consumed by the shared compatibility predicate."""
+
+    executor = getattr(identity, "executor", "")
+    profile: Mapping[str, object] | None
+    if launcher is not None:
+        profile_factory = getattr(launcher, "compatibility_profile", None)
+        if callable(profile_factory):
+            try:
+                profile = profile_factory(persona=persona)
+            except TypeError:
+                profile = profile_factory(persona)
+            if not isinstance(profile, Mapping):
+                profile = None
+        else:
+            profile = launcher_profile_for(persona, executor)
+    else:
+        profile = launcher_profile_for(persona, executor)
+    return {
+        "launcher_profile": profile,
+        "toolchain_grant": _toolchain_grant_for(persona, executor),
+        "credential_grant": _credential_grant_for(persona, executor),
+    }
+
+
+def validate_identity_compatibility(
+    persona: str, identity: object, *, launcher: object | None = None
+) -> None:
+    """Validate an identity using facts derived from the current deployment."""
+
+    contract = compatibility_contract_for(persona, identity, launcher=launcher)
+    validate_persona_executor_compatibility(
+        persona=persona,
+        identity=identity,
+        launcher_profile=contract["launcher_profile"],
+        toolchain_grant=contract["toolchain_grant"],
+        credential_grant=contract["credential_grant"],
+    )
 
 
 def _nonempty(value: object, field_name: str) -> str:
@@ -521,12 +810,15 @@ def rank_candidates(
     *,
     role: str,
     context: ResolutionContext | None = None,
+    compatibility_for: Callable[[object], Mapping[str, object] | None] | None = None,
 ) -> RankedCandidates:
     """把既有候選清單重排成三層解析鏈的順序，並套用 packaged fallback 政策。
 
     排序為 **stable**：層級是主鍵，同層內完全維持呼叫端傳進來的既有順序——
     #452 的 measured 側寫優先、#262 的 primary_domain 偏好因此降級為同層內的
-    次要偏好，不再有機會把 operator 的人工指定擠到後面（#534 主訴）。
+    次要偏好，不再有機會把 operator 的人工指定擠到後面（#534 主訴）。若提供
+    ``compatibility_for``，它會在排序前以同一個 persona/executor contract
+    validator 篩掉未具備 launcher、toolchain 或 credential grant 的身分。
     """
 
     ctx = context or DEFAULT_CONTEXT
@@ -535,6 +827,7 @@ def rank_candidates(
     warnings: list[str] = []
     layers: dict[tuple[str, str], str] = {}
     ranked: list[tuple[int, int, int, object]] = []
+    overlay_contract_failure = False
     for index, identity in enumerate(candidates):
         layer = identity_layer(identity, role=role, eval_roster=roster)
         if layer is None:
@@ -552,11 +845,36 @@ def rank_candidates(
                 )
             )
             continue
+        if compatibility_for is not None:
+            try:
+                contract = compatibility_for(identity)
+                if not isinstance(contract, Mapping):
+                    raise ValueError("compatibility contract is not an object")
+                validate_persona_executor_compatibility(
+                    persona={
+                        "planning": "planner",
+                        "build": "builder",
+                        "review": "reviewer",
+                    }.get(role, role),
+                    identity=identity,
+                    launcher_profile=contract.get("launcher_profile"),
+                    toolchain_grant=contract.get("toolchain_grant"),
+                    credential_grant=contract.get("credential_grant"),
+                )
+            except Exception as exc:  # noqa: BLE001 - rejection is diagnostic data
+                excluded.append((identity, str(exc)))
+                if identity_origin(identity) == IDENTITY_ORIGIN_OVERLAY:
+                    # An explicit operator declaration must not silently fall
+                    # through to a packaged identity with a different contract.
+                    overlay_contract_failure = True
+                continue
         demoted = 1 if getattr(identity, "operator_action", None) == PACKAGED_ACTION_DEMOTE else 0
         layers[
             (getattr(identity, "executor", ""), getattr(identity, "model_id", ""))
         ] = layer
         ranked.append((_LAYER_RANK[layer], demoted, index, identity))
+    if overlay_contract_failure:
+        ranked = []
     ranked.sort(key=lambda row: (row[0], row[1], row[2]))
     ordered = tuple(row[3] for row in ranked)
     if ordered:

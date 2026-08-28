@@ -322,6 +322,17 @@ def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeR
         top = ranked.ordered[0]
         layer = ranked.layer_of(top)
         summary.append(f"{persona}={top.executor}/{top.model_id}[{layer}]")
+        try:
+            model_resolution.validate_identity_compatibility(persona, top)
+        except ValueError as exc:
+            detail = f"{persona}: {exc}"
+            if layer == model_resolution.RESOLUTION_LAYER_OVERLAY:
+                failures.append(detail)
+            else:
+                # Packaged identities are a candidate pool.  Keep the
+                # deployment diagnosable without making an unqualified
+                # fallback look like a live grant.
+                warnings.append(detail + "（候選未授予有效熱路徑契約）")
         overlay_declared = [
             identity
             for identity in candidates

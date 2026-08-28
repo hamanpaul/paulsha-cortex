@@ -8413,6 +8413,10 @@ def _runtime_preflight_gate(
         key = id(identity)
         if key not in specialized:
             specialized[key] = _specialize_workflow_launcher(launcher_factory(identity), step)
+            if identities.resolution is not None:
+                model_resolution.validate_identity_compatibility(
+                    step.persona, identity, launcher=specialized[key]
+                )
         return specialized[key]
 
     def _environment_for(identity):
@@ -9601,6 +9605,13 @@ def _dispatch_workflow_card(
         if launcher is None:
             raise ValueError("workflow launcher unavailable")
         launcher = _specialize_workflow_launcher(launcher, step)
+    if identities.resolution is not None and identity is not None:
+        # The candidate path already checked the static registry contract.  A
+        # final check against the specialized launcher closes the remaining
+        # dependency seam before any job/worktree launch side effect.
+        model_resolution.validate_identity_compatibility(
+            step.persona, identity, launcher=launcher
+        )
     # #205 R4/D5：稽核實際解析到的模型鏈。接在兩條路徑之後，因此 #262 preflight
     # re-route 換掉的 identity 也會被如實記錄（記的是真正要跑的那個，不是原選擇）。
     _record_resolved_model_chain(registry, run, step, identity, identities)

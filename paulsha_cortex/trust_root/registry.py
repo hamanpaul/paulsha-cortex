@@ -1939,6 +1939,18 @@ ASSET_REGISTRY: tuple[TrustRootAsset, ...] = (
         ),
     ),
     TrustRootAsset(
+        "builder-agy-state", _T0, _JV, None,
+        (Principal.INSTALLER,), (Principal.BUILDER,),
+        IngressKind.DEPLOYMENT_WRITE,
+        derived_in=("trust_root/permgen.py:PathLayout.executor_credential_of",),
+        note=(
+            "builder principal 的 AGY OAuth／狀態樹：`<HOME>/.gemini` 是 root-owned "
+            "symlink，指向該 builder 自己的 `cache/gemini`。它與 "
+            "`reviewer-planner-agy-state` 分開登記，credential import 只接受明示的 "
+            "`builder/agy` pair，不會探索或複製其他 principal 的 `$HOME`。"
+        ),
+    ),
+    TrustRootAsset(
         "reviewer-planner-codex-state", _T0, _JV, None,
         (Principal.INSTALLER, Principal.REVIEWER, Principal.PLANNER),
         (Principal.REVIEWER, Principal.PLANNER),

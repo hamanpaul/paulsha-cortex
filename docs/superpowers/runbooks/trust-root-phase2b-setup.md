@@ -2403,6 +2403,65 @@ systemctl daemon-reload`，再把 `~/.codex` 改回 #685 的形態（`rm hooks.j
 `chmod 0755`、`setfacl -b`；reviewer-planner 另需把樹搬回 `cache/codex` 並重建 symlink）。
 **回滾之後 R9 T3.9 會在 reviewer-planner 上重新變紅**——那是 #698 的破口，不是新事故。
 
+#### 4e-2b-b. `cortex-builder` 的 AGY builder grant（#805；依賴 #799／#806）
+
+> 本節只收口 Trust Root 的 **builder principal** grant；AGY 的 writable launcher
+> argv／commit contract 仍由 #799／#806 提供，本票不在這裡複製一份 launcher。因而在
+> 依賴尚未安裝前，`agy × builder` 必須由 compatibility preflight 以「missing
+> launcher profile」拒絕，不能把 `--mode plan` 當成可寫 builder。packaged roster 也
+> 維持沒有 AGY `build` fallback；只有 operator 明示 overlay 且 live qualification
+> 通過後，才可把這一格送進實際派工。
+
+**Trust Root 形狀**：`cortex-builder` 的 AGY 憑證列是
+`("agy", HOME_REDIRECT_TREE)`。`~/.gemini` 是 root-owned symlink，指向同一個
+builder HOME 內的 `cache/gemini`；`builder-agy-state` 是獨立的 T0 asset，不能與
+`reviewer-planner-agy-state` 合併、借用或以另一個 principal 的 HOME 代替。
+four-way generator 會先建出 builder 自己的 cache target，再落 symlink 與 root owner
+attestation；這不改 reviewer／planner 的 read-only 與 independence-domain 邊界。
+
+**部署與 attestation（順序固定）**：
+
+```bash
+# 1️⃣ 先從同一份 four-way scheme 產生並檢查 builder-agy-state。
+python3 -m paulsha_cortex.trust_root permissions four-way --commands --paths \
+  --operator-account "$USER" --external-reader-account none \
+  | grep -E 'builder-agy-state|cortex-builder/(\.gemini|cache/gemini)'
+python3 -m paulsha_cortex.trust_root scaffold four-way | grep 'cortex-builder.*cache/gemini'
+#   期望：target 是 cortex-builder 自己的 cache/gemini，symlink 自己由 root 擁有。
+#   不應出現 reviewer-planner 的 HOME、cache 或 credential path。
+
+# 2️⃣ install plan 的 provider manifest 必須明示 builder/agy；這會機械產生
+#    required_credentials[builder/agy]，並由 receipt 綁定 generated/install inventory。
+cortex install trust-root plan \
+  --config /path/to/install-config.yaml \
+  --bundle /path/to/bundle.json \
+  --output /path/to/install-plan.json
+#   config.providers.builder 必須明列 [codex, agy]（未通過 live qualification 時維持
+#   [codex]）；不得用「找得到某個 HOME」來補這一格。
+
+# 3️⃣ apply 完成後，只接受 operator 明確選定的單一來源檔；來源檔名必須是
+#    oauth_creds.json，內容不得進 argv、receipt 或 log。
+sudo cortex install trust-root credentials import \
+  --receipt /path/to/install-receipt.json \
+  --principal builder \
+  --provider agy \
+  --source /path/to/operator-selected-credential
+#   禁止 find、glob、cp "$HOME" 或從 cortex-reviewer-planner 的 HOME 猜來源。
+
+# 4️⃣ 以 builder 自己的 PATH／HOME 做安裝後驗證；這個命令只有在 #799／#806 的
+#    writable launcher 與 live-qualified overlay 同時存在時才可作為 builder acceptance。
+sudo -u cortex-builder env \
+  HOME=/var/lib/cortex-builder \
+  PATH=/opt/cortex/toolchain/bin:/usr/bin:/bin \
+  agy --version
+```
+
+**fail-closed 檢查**：model resolution、doctor 與 dispatch preflight 必須使用同一個
+persona–executor compatibility predicate，逐一確認 launcher profile、`agy` 的
+builder-principal toolchain grant、以及 builder-principal credential grant。任一層缺失
+都要在 job launch／worktree side effect 前點名缺失層；planner 的 AGY 與 reviewer 的
+Claude 既有唯讀／review-only contract 不得因這次 builder grant 被放寬。
+
 #### 4e-2c. `cortex-reviewer-planner` 的 agy／claude 登入態（#685／#672 票 D；U-4／U-7）
 
 > **codex 已於 #698 改走 4e-2b 的 sticky 樹**，因此本節只剩兩格。分界不是帳號，是

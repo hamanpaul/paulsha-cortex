@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Trust Root AGY builder 契約（#805）**：four-way generator、install attestation 與
+  builder credential import 現在支援明示的 AGY builder grant；model resolution、doctor
+  與 dispatch preflight 會在 launch 前拒絕缺少 launcher、toolchain 或 credential 任一層
+  的 persona–executor 契約，且 packaged roster 不宣傳 AGY build fallback。
+
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
   block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同
