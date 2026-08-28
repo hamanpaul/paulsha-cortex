@@ -330,6 +330,7 @@ def _backup_file(path: Path) -> Path:
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                     mode,
                 )
+                os.fchmod(fd, mode)
                 break
             except FileExistsError:
                 backup = path.with_name(f"{path.name}.bak-{timestamp}-{suffix}")
@@ -537,11 +538,26 @@ def _migrate_instance_config_locked(
             _restore_file(project_config, previous[project_config])
             _restore_file(identities, previous[identities])
         except Exception as exc:
-            paths = ", ".join(str(path.resolve()) for path in created_backups)
-            raise ValueError(
-                "migration rollback 失敗，pre-migration 內容保留於 "
-                f"{paths}"
-            ) from exc
+            if created_backups:
+                paths = ", ".join(str(path.resolve()) for path in created_backups)
+                message = (
+                    "migration rollback 失敗，pre-migration 內容保留於 "
+                    f"{paths}"
+                )
+            else:
+                paths = ", ".join(
+                    f"{label}={path.resolve()}"
+                    for label, path in (
+                        ("env_file", env_file),
+                        ("project_config", project_config),
+                        ("identities", identities),
+                    )
+                )
+                message = (
+                    "migration rollback 失敗，未取得備份；以下檔案可能不一致："
+                    f"{paths}"
+                )
+            raise ValueError(message) from exc
         else:
             restore_ok = True
         finally:

@@ -8,5 +8,6 @@ scope: installer
 registry 會拒絕覆寫，跨 HOME 的 default agents root 需以 `--agents-root` 明確放行。
 命中既有 workspace 時逐字保留 operator 條目與其他設定區塊，migration rollback
 僅在 restore 成功時清理本次建立的 `.bak-*`，restore 失敗則保留備份並在錯誤訊息列出
-復原路徑供操作員取回；porcelain install 也會保留 installer 正常返回時產生的 stderr
+復原路徑供操作員取回；若尚未取得備份則列出可能不一致的檔案，且備份 mode 不受
+umask 影響而與來源一致；porcelain install 也會保留 installer 正常返回時產生的 stderr
 診斷訊息。

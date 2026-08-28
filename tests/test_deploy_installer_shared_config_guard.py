@@ -266,6 +266,45 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
     assert isinstance(exc_info.value.__cause__, OSError)
 
 
+def test_install_service_rollback_reports_unbacked_paths_when_restore_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rollback failure before backup creation must identify risky files."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    env_file = tmp_path / "instance.env"
+    project_config = config_root / "project-cortex.yaml"
+    identities = config_root / "model-identities.yaml"
+
+    def fail_env_write(*args, **kwargs):
+        raise OSError("injected env write failure")
+
+    def fail_restore(*args, **kwargs):
+        raise OSError("injected restore failure")
+
+    monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
+    monkeypatch.setattr(installer, "_restore_file", fail_restore)
+
+    with pytest.raises(ValueError, match="未取得備份") as exc_info:
+        installer._migrate_instance_config(
+            env_file=env_file,
+            existing={},
+            config_root=config_root,
+            repo_root=target,
+            managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+        )
+
+    message = str(exc_info.value)
+    assert "可能不一致" in message
+    for path in (env_file, project_config, identities):
+        assert str(path.resolve()) in message
+    assert not list(config_root.glob("*.bak-*"))
+    assert isinstance(exc_info.value.__cause__, OSError)
+
+
 def test_install_service_rejects_agents_root_from_different_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -419,15 +458,15 @@ def test_install_service_rejects_existing_unparseable_project_config(
     assert not (config_root / ".cortex-migration.lock").exists()
 
 
-def test_backup_file_uses_exclusive_source_mode_when_created(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("source_mode", [0o600, 0o644])
+def test_backup_file_preserves_source_mode_under_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_mode: int
 ) -> None:
     from paulsha_cortex.deploy import installer
 
     source = tmp_path / "project-cortex.yaml"
     source.write_bytes(b"workspaces: []\n")
-    source.chmod(0o600)
-    source_mode = source.stat().st_mode & 0o7777
+    source.chmod(source_mode)
     open_calls: list[tuple[int, int]] = []
     real_open = installer.os.open
 
@@ -441,7 +480,11 @@ def test_backup_file_uses_exclusive_source_mode_when_created(
 
     monkeypatch.setattr(installer.os, "open", tracked_open)
 
-    backup = installer._backup_file(source)
+    previous_umask = os.umask(0o077)
+    try:
+        backup = installer._backup_file(source)
+    finally:
+        os.umask(previous_umask)
 
     assert len(open_calls) == 1
     flags, requested_mode = open_calls[0]
@@ -449,6 +492,7 @@ def test_backup_file_uses_exclusive_source_mode_when_created(
     assert flags & os.O_CREAT
     assert flags & os.O_EXCL
     assert requested_mode == source_mode
+    assert source.stat().st_mode & 0o7777 == source_mode
     assert backup.stat().st_mode & 0o7777 == source_mode
 
 
