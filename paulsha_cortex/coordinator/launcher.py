@@ -1185,26 +1185,56 @@ def build_agy_argv(
     remote: str | None = None,
     allow_unsafe: bool = False,
     model: str | None = None,
+    # A missing worktree is the historical direct-planning shape.  A supplied
+    # worktree with the default ``False`` is the explicit builder shape.
     read_only: bool = False,
     review_only: bool = False,
+    commit_required: bool = False,
+    write_forbidden: bool = False,
 ) -> list[str]:
-    """Build the only supported Antigravity invocation: headless plan+sandbox.
+    """Build the headless Antigravity invocation for each launcher persona.
 
-    Antigravity exposes ``--dangerously-skip-permissions`` but cortex never
-    emits it.  The planner peer is evidence-only, so it has no reason to run
-    with write permissions even when another executor was explicitly granted
-    unsafe mode.
+    Planner and reviewer cards keep the established ``plan+sandbox`` shape;
+    reviewers additionally receive their disposable checkout.  A builder is
+    identified by its provisioned worktree and uses ``accept-edits`` unless its
+    card explicitly forbids workspace writes, in which case it keeps the
+    strict ``plan+sandbox`` shape while receiving a read-only ``--add-dir`` for
+    that checkout.  The unsafe flag is an explicit builder-only bypass, while
+    commit-required builders receive the same narrowly scoped linked-worktree
+    Git directories as the other write-capable executors.
     """
-    if allow_unsafe:
-        raise ValueError("agy executor does not support unsafe mode")
-    argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
-    # Antigravity's plan sandbox otherwise runs in an isolated workspace and
-    # cannot inspect a reviewer checkout at all.  Planner cards receive their
-    # source material through Manager-owned input envelopes and stay zero-tool;
-    # reviewer cards need the explicitly provisioned disposable checkout so
-    # their read-only inspection is about the exact Candidate.
-    if review_only and worktree is not None:
-        argv.extend(["--add-dir", str(Path(worktree).resolve())])
+    if read_only and review_only:
+        raise ValueError("agy launcher cannot be both planner-read-only and reviewer-read-only")
+    if (read_only or review_only) and allow_unsafe:
+        raise ValueError("read-only agy launcher cannot bypass permissions")
+    if commit_required and (read_only or review_only or allow_unsafe or write_forbidden):
+        raise ValueError("commit-required agy builder requires enforced workspace-write")
+    if write_forbidden and allow_unsafe:
+        raise ValueError("write-forbidden agy builder cannot bypass permissions")
+
+    # Unsafe and commit-required modes are builder-only; accepting either
+    # without a provisioned checkout would silently turn an invalid builder
+    # request into the historical read-only planning shape.
+    if worktree is None and (allow_unsafe or commit_required):
+        raise ValueError("agy builder requires a worktree")
+    if read_only or review_only or write_forbidden or worktree is None:
+        argv = ["agy", "--print", prompt, "--mode", "plan", "--sandbox"]
+        # Antigravity's plan sandbox otherwise runs in an isolated workspace and
+        # cannot inspect a reviewer checkout at all.  Planner cards receive their
+        # source material through Manager-owned input envelopes and stay zero-tool;
+        # reviewer cards need the explicitly provisioned disposable checkout so
+        # their read-only inspection is about the exact Candidate.
+        if (review_only or (write_forbidden and not read_only)) and worktree is not None:
+            argv.extend(["--add-dir", str(Path(worktree).resolve())])
+    else:
+        worktree = str(Path(worktree).resolve())
+        argv = ["agy", "--print", prompt, "--mode", "accept-edits"]
+        argv.extend(["--add-dir", worktree])
+        if commit_required:
+            for git_write_dir in _linked_worktree_git_write_dirs(worktree):
+                argv += ["--add-dir", git_write_dir]
+        if allow_unsafe:
+            argv.append("--dangerously-skip-permissions")
     if model is not None:
         argv.extend(["--model", model])
     return argv
@@ -1246,10 +1276,10 @@ def build_cg_argv(
     ``worktree``／``remote`` 是為了滿足與其餘 builder 共用的呼叫介面而接收，
     實際不會進入回傳的 argv（prompt 由呼叫端經 stdin 餵入）。
 
-    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：agy 與 cg 都是 read-only
-    planner，這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／
-    unsafe／非 read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在
-    建構期就顯性失敗，不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
+    比照 `build_agy_argv` 對 `allow_unsafe` 的拒絕模式：cg 是 read-only planner，
+    這裡同樣 fail-closed，而非靜默降級成安全形狀——commit_required／unsafe／非
+    read-only-或-review-only 的「builder 語境」一律 raise，讓誤用在建構期就顯性失敗，
+    不會把一個從未被授權寫入的 executor 悄悄放進 builder 角色。
     """
     if allow_unsafe:
         raise ValueError("cg executor does not support unsafe mode")
@@ -1329,8 +1359,6 @@ class SubprocessLauncher:
     ) -> None:
         if executor not in _ARGV_BUILDERS:
             raise ValueError(f"unknown executor: {executor}")
-        if executor == "agy" and allow_unsafe:
-            raise ValueError("agy executor refuses unsafe mode")
         if executor == "cg" and allow_unsafe:
             raise ValueError("cg executor refuses unsafe mode")
         if (read_only or review_only) and executor == "copilot":
@@ -1835,29 +1863,31 @@ class SubprocessLauncher:
             "review_only": self._review_only,
         }
         # #396 item 3：claude 併入 commit_required 傳遞——builder-persona 的
-        # as_commit_required() 轉換（autonomy.dispatch_ready）對三個 executor
-        # 一視同仁，build_claude_argv 缺這個 kwarg 會讓轉換對 claude 變 no-op。
+        # as_commit_required() 轉換（autonomy.dispatch_ready）對所有可寫 executor
+        # 一視同仁，漏掉這個 kwarg 會讓轉換對該 executor 變 no-op。
         # cg 併入同一份 kwarg（issue #442）：self._commit_required 對任何成功建構
         # 的 cg launcher 恆為 False（見 __init__ 的 cg 專屬不變量），這裡顯式傳遞
         # 只是與其餘 builder 的呼叫形狀一致、defense-in-depth，不改變行為。
-        if self._executor in {"codex", "copilot", "claude", "cg"}:
+        if self._executor in {"codex", "copilot", "claude", "agy", "cg"}:
             builder_kwargs["commit_required"] = self._commit_required
         # #716：只有 codex 的 argv 上有 `--sandbox <mode>` 這個維度可表達。其餘 executor
         # 沒有對應旗標（`build_claude_argv` 走 `--permission-mode`、`build_copilot_argv`
-        # 走 `--allow-all`／`--deny-tool`、agy／cg 是 plan-only／zero-tool），傳過去只會
-        # 是一個沒人接的 kwarg——形狀與既有的 `verdict_spool_dir`／`effort`／
-        # `last_message_path` 逐條一致：能力有差異就顯式分岔，不塞給接不住的那幾支。
+        # 走 `--allow-all`／`--deny-tool`、agy 走 plan 或 accept-edits、cg 是
+        # zero-tool），傳過去只會是一個沒人接的 kwarg——形狀與既有的
+        # `verdict_spool_dir`／`effort`／`last_message_path` 逐條一致：能力有差異就
+        # 顯式分岔，不塞給接不住的那幾支。
         #
         # ⚠️ 這是**範圍**判斷，不是「其餘 executor 的最小權限已經對了」的宣稱。
         # `claude` 的 `--permission-mode` 有沒有對應的降級形態**沒有量過**（#716 comment
         # 記過 `EXECUTOR_TOOLS` 的 `inner_sandbox=None` 同時代表「沒有」與「還沒量」，
         # 那是同一族的錯）。要動那幾支，得先各自量一次。
-        if self._executor == "codex":
+        if self._executor in {"codex", "agy"}:
             builder_kwargs["write_forbidden"] = self._write_forbidden
-        # trust-root Phase 2a：Codex／Claude express the spool grant with
-        # `--add-dir`; Copilot uses exact `--allow-tool` entries instead. agy／cg
-        # are zero-tool／plan-only and cannot be assigned a slice-lane reviewer
-        # spool, so reject a spool grant for them explicitly.
+        # trust-root Phase 2a：Codex／Claude express the reviewer spool grant
+        # with `--add-dir`; Copilot uses exact `--allow-tool` entries instead.
+        # agy's `--add-dir` is reserved for its provisioned worktree and, when
+        # required, linked-worktree Git metadata—it cannot receive a slice-lane
+        # reviewer spool grant.
         if self._verdict_spool_dir is not None:
             if self._executor not in {"codex", "copilot", "claude"}:
                 raise ValueError(

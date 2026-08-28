@@ -1,0 +1,32 @@
+---
+status: accepted
+work_item: agy-builder-support
+---
+
+# Tasks
+
+- [x] RED：在 `tests/test_coordinator_agy_launcher.py` 新增 builder 形態測試（`--mode accept-edits`、`--add-dir <worktree>`、
+      無 `--sandbox`、`allow_unsafe` 附 `--dangerously-skip-permissions`），以及
+      `SubprocessLauncher(executor="agy", allow_unsafe=True)` 不拋錯的測試；先確認全數失敗。
+- [x] 實作 `build_agy_argv` 的 planner／reviewer／builder／write-forbidden 形態與
+      `SubprocessLauncher.__init__` 的 agy 放寬；`commit_required` 與 `write_forbidden`
+      傳遞擴及 agy。
+- [x] 補上 registry overlay `build` capability 有／無兩種 fixture 與 writable launcher 形狀的
+      雙向機械回歸測試；明示 capability 閘控在 roster 選擇而非 direct launcher；commit-required
+      Git metadata 與真實 launcher argv forwarding 均有回歸測試；unsafe／commit-required builder
+      intent 無 worktree 皆 fail-closed，default 無 worktree 則維持歷史 direct planning 形態。
+- [x] 回歸：planner／reviewer 形態既有測試維持綠；planning runtime／agy probe 明示 `read_only=True`。
+- [x] 更新 `launcher.py` 相關註解以反映 agy builder 可寫；補 `changelog.d/` 碎片。
+- [x] 依 retry_context 重現並補強 F1／F2／F3 的機械回歸覆蓋；agy 的 builder 判定固定為
+      「有 provisioned worktree 且非 read-only/reviewer」，無 worktree 的歷史 direct planning
+      維持 `plan+sandbox`；planning runtime／agy probe 明示 `read_only=True`，
+      write-forbidden builder 維持 agy 嚴格 `plan+sandbox`，並以 `--add-dir <worktree>`
+      保留唯讀檢視；planner 且 `read_only=True` 時即使帶 `write_forbidden` 也不附
+      `--add-dir`；上述屬 operator 核可的範圍內偏差，本卡交付範圍仍止於 pre-archive。
+- [x] 完成 pre-archive Candidate 準備；本卡不執行 archive／merge／issue closure／done，
+      交付範圍止於 pre-archive。
+- [x] 同步 ADR、unified work lifecycle spec 與部署 changelog 的 agy 權限形態及 trust-root
+      credential caveat；僅完成 pre-archive 文件一致性，不宣稱 archive／merge／issue closure／done。
+- [x] 針對 redispatched Candidate 於 current `main` 上完成 rebase，重現並修復 #805／#799
+      整合後的 stale trust-root assertions；本項僅完成 pre-archive Candidate 修復，不宣稱
+      archive／merge／issue closure／done。

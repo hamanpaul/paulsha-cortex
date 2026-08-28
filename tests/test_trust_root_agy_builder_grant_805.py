@@ -165,10 +165,16 @@ def test_credential_shape_comes_from_registered_cell(
         )
 
 
-def test_agy_builder_launcher_dependency_is_explicit_until_writable_support_lands() -> None:
-    """#805 owns the grant; #799/#806 owns the writable AGY argv contract."""
+def test_agy_builder_launcher_dependency_is_available_after_writable_support_lands() -> None:
+    """#805 owns the grant; #799/#806 supplies the writable AGY argv contract."""
 
-    assert model_resolution.launcher_profile_for("builder", "agy") is None
+    agy = model_resolution.launcher_profile_for("builder", "agy")
+    assert agy is not None
+    assert agy["executor"] == "agy"
+    assert agy["persona"] == "builder"
+    assert agy["mode"] == "accept-edits"
+    assert agy["requires_worktree"] is True
+    assert agy["commit_required"] is True
     codex = model_resolution.launcher_profile_for("builder", "codex")
     assert codex is not None
     assert codex["requires_worktree"] is True
@@ -439,7 +445,7 @@ def test_packaged_roster_does_not_advertise_agy_build(tmp_path: Path) -> None:
     )
 
 
-def test_doctor_rejects_an_incomplete_agy_builder_overlay(tmp_path: Path) -> None:
+def test_doctor_does_not_reject_a_complete_agy_builder_overlay(tmp_path: Path) -> None:
     from paulsha_cortex.doctor import _model_resolution_probe
 
     (tmp_path / "model-identities.yaml").write_text(
@@ -462,9 +468,14 @@ identities:
         tmp_path,
     )
 
-    assert result.status == "fail"
-    assert "builder" in result.detail
-    assert "missing builder launcher profile" in result.detail
+    # The builder overlay is now complete because #799 supplies the writable
+    # launcher profile.  The packaged planner/reviewer fallbacks still produce
+    # their expected warnings in this minimal overlay fixture.
+    assert result.status == "warn"
+    assert result.required is False
+    assert "missing builder launcher profile" not in result.detail
+    assert "planner:" in result.detail
+    assert "reviewer:" in result.detail
 
 
 def test_builder_job_env_is_role_scoped_and_drops_provider_credentials(

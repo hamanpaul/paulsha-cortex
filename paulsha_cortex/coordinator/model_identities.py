@@ -1073,6 +1073,7 @@ def probe_agy_capability(
         slice_id="cortex-capability-probe",
         log_dir=".",
         model=cli_model_token,
+        read_only=True,
     )
     try:
         smoke_raw = process_runner(argv, **common)
