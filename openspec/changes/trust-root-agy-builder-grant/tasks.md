@@ -18,5 +18,9 @@ work_item: trust-root-agy-builder-grant
       Phase 2b runbook，維持 planner/reviewer read-only 與 independence-domain 邊界。
 - [x] 補齊 overlay identity、planner/reviewer non-regression、PATH/OAuth isolation 與
       live qualification 前不得宣傳 packaged AGY fallback 的回歸測試。
-- [ ] 執行 focused/full repository gates、policy/preflight 與獨立 review。
-- [ ] 於 merge 後以 exact SHA 執行 Trust Root AGY builder acceptance。
+- [x] 執行 focused/full repository gates 與 policy/preflight，將 candidate 整合至
+      最新 `origin/main`，並完成 archive 前的 candidate 驗證。
+- [ ] 由 Manager 於 archive 前執行獨立 review 並收斂 candidate evidence。
+
+> Merge 後 exact-SHA Trust Root AGY builder acceptance 由 Manager／operator 另行執行，
+> 不列為本次 pre-archive change 的 active task。
