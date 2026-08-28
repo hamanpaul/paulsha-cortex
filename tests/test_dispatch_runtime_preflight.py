@@ -185,6 +185,28 @@ def test_missing_executable_blocks_dispatch(tmp_path):
     assert ok_factory.model_invocations == 1
 
 
+def test_candidate_contract_failure_reroutes_to_next_identity(tmp_path):
+    """A launcher-contract exception is local to the candidate being tried."""
+
+    def environment_for(identity):
+        if identity is _BUILDER:
+            raise ValueError("missing builder credential grant")
+        return _host_env(tmp_path, name="codex-env")
+
+    decision = evaluate_dispatch_gate(
+        card="tdd-red",
+        requirements=(RuntimeCapability("executable", "sh"),),
+        candidates=(_BUILDER, _ALT_BUILDER),
+        environment_for=environment_for,
+    )
+
+    assert decision.action == "reroute"
+    assert decision.identity is _ALT_BUILDER
+    assert decision.attempts[0].outcome is PreflightOutcome.CAPABILITY_MISSING
+    assert decision.attempts[0].missing_capabilities == ("bridge:dispatch-contract",)
+    assert "missing builder credential grant" in decision.attempts[0].findings[0].reason
+
+
 def test_preflight_uses_executor_environment_not_host(tmp_path):
     """R2：host 有而 executor 環境沒有的 module，必須判為缺失。
 

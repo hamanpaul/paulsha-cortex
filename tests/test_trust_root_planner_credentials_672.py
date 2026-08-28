@@ -95,8 +95,8 @@ def test_the_table_has_two_axes_and_both_are_consulted() -> None:
     裁決因此讓**同一個 executor 在所有帳號上形狀相同**（由
     `EXECUTOR_ENFORCEMENT_LEAVES` 那條規則導出，import 當下強制）。
 
-    兩軸**仍然必要**，判準改成：`reviewer-planner` 有三格而 `builder` 只有一格，
-    且 agy／claude 與 codex 是不同形狀。一張 per-executor 的表表達不了「哪個帳號被
+    兩軸**仍然必要**，判準改成：`reviewer-planner` 有三格而 `builder` 有 codex／agy
+    兩格，且 agy／claude 與 codex 是不同形狀。一張 per-executor 的表表達不了「哪個帳號被
     核可持有哪幾份登入態」——那正是 U-4／U-5 的內容。
     """
     builder = permgen.credential_for("builder", "codex")
@@ -108,8 +108,9 @@ def test_the_table_has_two_axes_and_both_are_consulted() -> None:
     assert permgen.credential_for("reviewer-planner", "agy").shape is (
         CredentialShape.HOME_REDIRECT_TREE
     )
-    with pytest.raises(UnregisteredExecutorCredentialError):
-        permgen.credential_for("builder", "agy")
+    assert permgen.credential_for("builder", "agy").shape is (
+        CredentialShape.HOME_REDIRECT_TREE
+    )
 
 
 def test_the_shape_rule_is_enforced_at_import_time() -> None:
@@ -138,6 +139,7 @@ def test_the_account_axis_is_the_u4_ratification() -> None:
     """U-4 追認的範圍＝planner 帳號那一列有幾格。"""
     assert dict(CREDENTIALED_ACCOUNTS)["builder"] == (
         ("codex", CredentialShape.HOME_STICKY_TREE),
+        ("agy", CredentialShape.HOME_REDIRECT_TREE),
     )
     planner_cells = dict(CREDENTIALED_ACCOUNTS)["reviewer-planner"]
     assert [executor for executor, _shape in planner_cells] == ["codex", "agy", "claude"]
@@ -157,7 +159,9 @@ def test_every_table_row_is_a_registered_asset_and_vice_versa() -> None:
         if any("executor_credential_of" in src for src in asset.derived_in)
     }
     assert from_table == from_registry, (sorted(from_table), sorted(from_registry))
-    assert from_table == set(PLANNER_ASSETS) | {"builder-codex-state"}
+    assert from_table == set(PLANNER_ASSETS) | {
+        "builder-codex-state", "builder-agy-state"
+    }
     for asset_id in from_table:
         assert asset_id in DEFAULT_LAYOUT.asset_paths(), asset_id
 
@@ -238,10 +242,12 @@ def test_symlink_commands_never_use_a_bare_chown_or_chmod() -> None:
 
 def test_the_state_tree_target_lives_inside_the_accounts_own_cache() -> None:
     """「不新增可寫面」的**前提**：目標必須落在該帳號本來就可寫的那一層裡。"""
-    cache = DEFAULT_LAYOUT.cache_of(PLANNER_ACCOUNT)
     for asset_id, target in DEFAULT_LAYOUT.symlink_targets().items():
-        assert asset_id in PLANNER_SYMLINK_ASSETS, asset_id
-        assert target.startswith(cache + "/"), (asset_id, target)
+        account = BUILDER_ACCOUNT if asset_id == "builder-agy-state" else PLANNER_ACCOUNT
+        assert asset_id in {
+            "builder-agy-state", *PLANNER_SYMLINK_ASSETS
+        }, asset_id
+        assert target.startswith(DEFAULT_LAYOUT.cache_of(account) + "/"), (asset_id, target)
 
 
 def test_scaffold_creates_the_target_but_not_a_directory_at_the_symlink() -> None:
@@ -446,10 +452,15 @@ def test_two_way_symlink_commands_are_guarded_by_the_missing_home() -> None:
         layout=DEFAULT_LAYOUT,
         scheme=scheme,
     )
-    guard = f"[ ! -e {DEFAULT_LAYOUT.home_of(PLANNER_ACCOUNT)} ] || "
     ln_lines = [l for l in lines if " ln -sfn " in l or l.startswith("ln -sfn ")]
     assert ln_lines, lines
     for line in ln_lines:
+        account = (
+            BUILDER_ACCOUNT
+            if "/var/lib/cortex-builder/" in line
+            else PLANNER_ACCOUNT
+        )
+        guard = f"[ ! -e {DEFAULT_LAYOUT.home_of(account)} ] || "
         assert line.startswith(guard), line
 
 

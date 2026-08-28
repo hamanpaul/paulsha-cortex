@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+- **Trust Root AGY builder 契約（#805）**：four-way generator、install attestation 與
+  builder credential import 現在支援明示的 AGY builder grant；Trust Root hardened runner
+  （`PSC_JOB_RUNNER` 為非 `direct`）的 model resolution、doctor 與 dispatch preflight 會在
+  launch 前拒絕缺少 launcher、toolchain 或 credential 任一層的 persona–executor 契約，
+  direct mode 保留既有 operator overlay 相容性，且 packaged roster 不宣傳 AGY build
+  fallback。
+
 - **#802：fix-standard 的 planning publication 現在對 spec／design／plan 使用
   work-item-bound canonical destinations，即使 combo manifest 沒有
   `brainstorming` card 也能落地三件套；內容型 planning failure 的

@@ -1353,7 +1353,10 @@ def select_secondary_planner(
         identity for identity in registry.identities if "planning" in identity.capabilities
     ]
     ranked = model_resolution.rank_candidates(
-        planning, role="planning", context=registry.resolution_context
+        planning,
+        role="planning",
+        context=registry.resolution_context,
+        compatibility_for=model_resolution.compatibility_checker_for("planner"),
     )
     rejections: list[CandidateRejection] = []
     for identity in ranked.ordered:

@@ -513,7 +513,10 @@ def start_canonical_workflow(
     # packaged fallback）。舊實作寫死 executor 順序 ("codex", "claude", "agy")，
     # 與 operator 在 host overlay 宣告的順序無關——人工指定形同不存在。
     ranked = model_resolution.rank_candidates(
-        planning, role="planning", context=identities.resolution_context
+        planning,
+        role="planning",
+        context=identities.resolution_context,
+        compatibility_for=model_resolution.compatibility_checker_for("planner"),
     )
     if not ranked.ordered:
         raise RuntimeError(
