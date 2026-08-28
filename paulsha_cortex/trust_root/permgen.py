@@ -1300,8 +1300,9 @@ EXECUTOR_CREDENTIALS: tuple[ExecutorCredential, ...] = (
 #: **明文接受的有界殘餘風險**，不另拆帳號。它在後續任何「planner 攻擊面」討論中**不得**
 #: 被當成未知——U-4 的裁決逐字如此。
 #:
-#: **`builder` 預設只有 codex 一格**；AGY builder 只有在 live qualification 前後由
-#: operator 明示加入 provider manifest 才會匯入。builder 不做 planning，不需要異質性；
+#: **install plan／provider manifest 的 builder 預設只有 codex 一格**；AGY builder 只有在
+#: live qualification 前後由 operator 明示加入 provider manifest 才會匯入。builder 不做
+#: planning，不需要異質性；
 #: 未經 qualification 擴大它的 provider 曝險面買不到任何東西。但每一格的**形狀**與
 #: reviewer-planner 對應 executor 逐字相同
 #: （#698）——形狀不是 per-account 的偏好，是 :data:`EXECUTOR_ENFORCEMENT_LEAVES`

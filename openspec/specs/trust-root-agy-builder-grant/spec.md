@@ -1,7 +1,7 @@
 # trust-root-agy-builder-grant Specification
 
 ## Purpose
-TBD - created by archiving change trust-root-agy-builder-grant. Update Purpose after archive.
+補齊 Trust Root 的 builder／AGY grant 與 hardened runner 的 compatibility fail-closed 守衛。
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 

@@ -206,6 +206,66 @@ def test_planner_and_reviewer_contracts_remain_valid(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("persona", "launcher_profile"),
+    (
+        (
+            "planner",
+            {"executor": "codex", "persona": "planner", "mode": "read-only"},
+        ),
+        (
+            "planner",
+            {
+                "executor": "codex",
+                "persona": "planner",
+                "mode": "read-only",
+                "read_only": None,
+            },
+        ),
+        (
+            "reviewer",
+            {"executor": "codex", "persona": "reviewer", "mode": "review-only"},
+        ),
+        (
+            "reviewer",
+            {
+                "executor": "codex",
+                "persona": "reviewer",
+                "mode": "review-only",
+                "review_only": None,
+                "read_only": None,
+            },
+        ),
+    ),
+)
+def test_read_only_launcher_contract_is_fail_closed(
+    persona: str, launcher_profile: Mapping[str, object]
+) -> None:
+    identity = SimpleNamespace(
+        executor="codex",
+        model_id="read-only-contract",
+        capabilities=("planning", "review"),
+    )
+
+    with pytest.raises(ValueError, match=f"missing {persona} launcher profile.*read-only"):
+        model_resolution.validate_persona_executor_compatibility(
+            persona=persona,
+            identity=identity,
+            launcher_profile=launcher_profile,
+            toolchain_grant={
+                "principal": persona,
+                "executor": "codex",
+                "asset_id": "executor-toolchain",
+                "executable": True,
+            },
+            credential_grant={
+                "principal": "reviewer-planner",
+                "executor": "codex",
+                "shape": CredentialShape.HOME_STICKY_TREE,
+            },
+        )
+
+
 @pytest.mark.parametrize("persona", ("planner", "reviewer"))
 def test_cg_read_only_identities_fail_closed_without_trust_root_grants(
     tmp_path: Path, persona: str

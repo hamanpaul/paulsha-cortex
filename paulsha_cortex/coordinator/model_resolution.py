@@ -365,7 +365,7 @@ def validate_persona_executor_compatibility(
             raise ValueError(
                 f"missing planner launcher profile for {executor}/{model_id}: mode={mode!r}"
             )
-        if launcher_profile.get("read_only") is False:
+        if launcher_profile.get("read_only") is not True:
             raise ValueError(
                 f"missing planner launcher profile for {executor}/{model_id}: read-only"
             )
@@ -375,8 +375,8 @@ def validate_persona_executor_compatibility(
                 f"missing reviewer launcher profile for {executor}/{model_id}: mode={mode!r}"
             )
         if (
-            launcher_profile.get("review_only") is False
-            and launcher_profile.get("read_only") is False
+            launcher_profile.get("review_only") is not True
+            and launcher_profile.get("read_only") is not True
         ):
             raise ValueError(
                 f"missing reviewer launcher profile for {executor}/{model_id}: read-only"
