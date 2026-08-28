@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import fcntl
+import logging
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ _SUPPORTED_EXECUTORS = frozenset({"copilot", "claude", "codex"})
 _PRESERVE_EXISTING_PATHS = frozenset(
     {"PSC_INSTANCE", "PSC_RUN_ROOT", "PSC_MONITOR_STATE_ROOT"}
 )
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -563,7 +565,14 @@ def _migrate_instance_config_locked(
         finally:
             if restore_ok:
                 for backup in created_backups:
-                    backup.unlink(missing_ok=True)
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.warning(
+                            "migration backup cleanup failed path=%s: %s",
+                            backup,
+                            exc,
+                        )
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)

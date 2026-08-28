@@ -10,4 +10,4 @@ registry 會拒絕覆寫，跨 HOME 的 default agents root 需以 `--agents-roo
 僅在 restore 成功時清理本次建立的 `.bak-*`，restore 失敗則保留備份並在錯誤訊息列出
 復原路徑供操作員取回；若尚未取得備份則列出可能不一致的檔案，且備份 mode 不受
 umask 影響而與來源一致；porcelain install 也會保留 installer 正常返回時產生的 stderr
-診斷訊息。
+診斷訊息；rollback 成功後若清理備份失敗則記錄 warning，不遮蔽原始 migration 例外。

@@ -216,6 +216,62 @@ def test_install_service_rollback_removes_migration_backups(
     assert not list(config_root.glob("project-cortex.yaml.bak-*"))
 
 
+def test_install_service_backup_cleanup_failure_does_not_mask_migration_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A cleanup failure must not replace the original migration exception."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    other = _init_git_repo(tmp_path / "repo" / "other")
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    project_config = config_root / "project-cortex.yaml"
+    project_config.write_text(
+        yaml.safe_dump(
+            {"workspaces": [{"name": "other", "path": str(other)}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(f"PSC_PROJECT_CONFIG_ROOT={config_root}\n", encoding="utf-8")
+
+    def fail_env_write(*args, **kwargs):
+        raise OSError("injected env write failure")
+
+    real_unlink = Path.unlink
+
+    def fail_backup_cleanup(path: Path, missing_ok: bool = False):
+        if path.name.startswith("project-cortex.yaml.bak-"):
+            raise OSError("injected backup cleanup failure")
+        return real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
+    monkeypatch.setattr(Path, "unlink", fail_backup_cleanup)
+
+    with caplog.at_level("WARNING", logger="paulsha_cortex.deploy.installer"):
+        with pytest.raises(OSError, match="injected env write failure"):
+            installer._migrate_instance_config(
+                env_file=env_file,
+                existing={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+                config_root=config_root,
+                repo_root=target,
+                managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+            )
+
+    assert any(
+        "migration backup cleanup failed" in record.getMessage()
+        and "project-cortex.yaml.bak-" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_install_service_rollback_retains_backup_when_restore_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
