@@ -103,11 +103,35 @@ def test_agy_launcher_accepts_explicit_unsafe_builder_mode() -> None:
     assert launcher.executor == "agy"
 
 
-def test_agy_launcher_rejects_write_forbidden_builder_mode() -> None:
-    with pytest.raises(ValueError, match="agy.*write-forbidden.*writable"):
-        SubprocessLauncher(executor="agy", write_forbidden=True)
-    with pytest.raises(ValueError, match="agy.*write-forbidden.*writable"):
-        SubprocessLauncher(executor="agy").as_write_forbidden()
+def test_agy_builder_write_forbidden_argv_keeps_strict_plan_sandbox(tmp_path) -> None:
+    worktree = tmp_path / "builder-checkout"
+    argv = build_agy_argv(
+        prompt="inspect",
+        slice_id="build-demo",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree),
+        write_forbidden=True,
+    )
+
+    assert argv[:7] == [
+        "agy",
+        "--print",
+        "inspect",
+        "--mode",
+        "plan",
+        "--sandbox",
+    ]
+    assert "--add-dir" not in argv
+    assert "accept-edits" not in argv
+    assert "--dangerously-skip-permissions" not in argv
+
+
+def test_agy_launcher_accepts_write_forbidden_builder_mode() -> None:
+    launcher = SubprocessLauncher(executor="agy", write_forbidden=True)
+    specialized = SubprocessLauncher(executor="agy").as_write_forbidden()
+
+    assert launcher.executor == "agy"
+    assert specialized.executor == "agy"
 
 
 def test_agy_registry_build_capability_matches_writable_launcher_shape(tmp_path) -> None:
@@ -225,6 +249,39 @@ def test_agy_launcher_forwards_commit_required_to_argv_builder(monkeypatch, tmp_
     )
 
     assert calls and calls[0]["commit_required"] is True
+
+
+def test_agy_launcher_forwards_write_forbidden_to_argv_builder(monkeypatch, tmp_path) -> None:
+    calls: list[dict] = []
+
+    def fake_builder(**kwargs):
+        calls.append(kwargs)
+        return ["agy"]
+
+    class FakeProcess:
+        pid = 125
+
+    monkeypatch.setitem(launcher_module._ARGV_BUILDERS, "agy", fake_builder)
+    monkeypatch.setattr(
+        launcher_module.subprocess,
+        "Popen",
+        lambda argv, **kwargs: FakeProcess(),
+    )
+    monkeypatch.setattr(
+        launcher_module.job_workspace,
+        "prepare_commit_spool",
+        lambda **kwargs: tmp_path / "commit.bundle",
+    )
+    monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+
+    SubprocessLauncher("agy").as_write_forbidden().launch(
+        slice_id="agy-write-forbidden",
+        prompt="inspect",
+        worktree=str(tmp_path),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert calls and calls[0]["write_forbidden"] is True
 
 
 def test_agy_commit_required_launcher_emits_real_scoped_git_dirs(monkeypatch, tmp_path) -> None:
