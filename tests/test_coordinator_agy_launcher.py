@@ -126,6 +126,28 @@ def test_agy_builder_write_forbidden_argv_keeps_strict_plan_sandbox(tmp_path) ->
     assert "--dangerously-skip-permissions" not in argv
 
 
+def test_agy_planner_write_forbidden_argv_never_adds_worktree(tmp_path) -> None:
+    worktree = tmp_path / "planner-checkout"
+    argv = build_agy_argv(
+        prompt="inspect",
+        slice_id="planner-write-forbidden",
+        log_dir=str(tmp_path / "logs"),
+        worktree=str(worktree),
+        read_only=True,
+        write_forbidden=True,
+    )
+
+    assert argv == [
+        "agy",
+        "--print",
+        "inspect",
+        "--mode",
+        "plan",
+        "--sandbox",
+    ]
+    assert "--add-dir" not in argv
+
+
 def test_agy_launcher_accepts_write_forbidden_builder_mode() -> None:
     launcher = SubprocessLauncher(executor="agy", write_forbidden=True)
     specialized = SubprocessLauncher(executor="agy").as_write_forbidden()

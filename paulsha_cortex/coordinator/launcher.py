@@ -1224,7 +1224,7 @@ def build_agy_argv(
         # source material through Manager-owned input envelopes and stay zero-tool;
         # reviewer cards need the explicitly provisioned disposable checkout so
         # their read-only inspection is about the exact Candidate.
-        if (review_only or write_forbidden) and worktree is not None:
+        if (review_only or (write_forbidden and not read_only)) and worktree is not None:
             argv.extend(["--add-dir", str(Path(worktree).resolve())])
     else:
         worktree = str(Path(worktree).resolve())

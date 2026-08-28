@@ -21,7 +21,8 @@ work_item: agy-builder-support
       「有 provisioned worktree 且非 read-only/reviewer」，無 worktree 的歷史 direct planning
       維持 `plan+sandbox`；planning runtime／agy probe 明示 `read_only=True`，
       write-forbidden builder 維持 agy 嚴格 `plan+sandbox`，並以 `--add-dir <worktree>`
-      保留唯讀檢視；上述屬 operator 核可的範圍內偏差，本卡交付範圍仍止於 pre-archive。
+      保留唯讀檢視；planner 且 `read_only=True` 時即使帶 `write_forbidden` 也不附
+      `--add-dir`；上述屬 operator 核可的範圍內偏差，本卡交付範圍仍止於 pre-archive。
 - [x] 完成 pre-archive Candidate 準備；本卡不執行 archive／merge／issue closure／done，
       交付範圍止於 pre-archive。
 - [x] 同步 ADR、unified work lifecycle spec 與部署 changelog 的 agy 權限形態及 trust-root
