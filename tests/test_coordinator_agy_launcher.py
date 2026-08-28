@@ -134,7 +134,25 @@ def test_agy_launcher_accepts_write_forbidden_builder_mode() -> None:
     assert specialized.executor == "agy"
 
 
-def test_agy_registry_build_capability_matches_writable_launcher_shape(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "capabilities, expected_registry_build",
+    (
+        (["planning", "build", "review"], True),
+        (["planning", "review"], False),
+    ),
+    ids=("overlay-declares-build", "overlay-omits-build"),
+)
+def test_agy_registry_build_capability_does_not_gate_direct_launcher_shape(
+    tmp_path, capabilities, expected_registry_build
+) -> None:
+    """Roster selection gates capability; the direct launcher does not inspect it.
+
+    An ad-hoc agy builder with a provisioned worktree therefore keeps the
+    writable ``accept-edits`` shape in both registry fixtures.  The workflow
+    roster selector (``manager._workflow_identity_candidates_for_persona``),
+    not this launcher, is the capability gate.
+    """
+    capability_yaml = ", ".join(capabilities)
     (tmp_path / "model-identities.yaml").write_text(
         f"""\
 schema_version: 3
@@ -142,7 +160,7 @@ identities:
   - executor: agy
     model_id: {AGY_MODEL_ID}
     independence_domain: google
-    capabilities: [planning, build, review]
+    capabilities: [{capability_yaml}]
     live_probe: agy-plan-sandbox
 """,
         encoding="utf-8",
@@ -151,7 +169,7 @@ identities:
     identity = registry.require("agy", AGY_MODEL_ID)
     assert identity.origin == "operator-overlay"
     registry_declares_build = "build" in identity.capabilities
-    assert registry_declares_build
+    assert registry_declares_build is expected_registry_build
     worktree = tmp_path / "builder-checkout"
     argv = build_agy_argv(
         prompt="implement",
@@ -160,8 +178,6 @@ identities:
         worktree=str(worktree),
     )
 
-    expected_mode = "accept-edits" if registry_declares_build else "plan"
-    expected_sandbox = not registry_declares_build
     actual_mode = argv[argv.index("--mode") + 1]
     actual_worktree = argv[argv.index("--add-dir") + 1]
     launcher_is_writable = (
@@ -169,9 +185,9 @@ identities:
         and "--sandbox" not in argv
         and actual_worktree == str(worktree.resolve())
     )
-    assert actual_mode == expected_mode
-    assert ("--sandbox" in argv) is expected_sandbox
-    assert registry_declares_build is launcher_is_writable
+    assert actual_mode == "accept-edits"
+    assert "--sandbox" not in argv
+    assert launcher_is_writable
 
 
 @pytest.mark.parametrize(

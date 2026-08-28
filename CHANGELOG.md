@@ -42,7 +42,8 @@
   provisioned worktree；明確 `allow_unsafe` 才附加 `--dangerously-skip-permissions`，
   `commit_required` 也會傳遞 linked-worktree Git metadata 放行；write-forbidden builder
   維持嚴格 `plan+sandbox`，並以唯讀 `--add-dir` 檢視 provisioned worktree；registry 宣告 `build` capability
-  的 host overlay 由測試機械釘住 writable argv 的對應，packaged fallback roster 維持既有
+  的 host overlay 有／無兩種 fixture 皆由測試釘住 direct launcher 的 writable argv 形狀，
+  capability 閘控維持在 packaged/host roster 選擇，packaged fallback roster 維持既有
   planner／reviewer 形態。
 
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation

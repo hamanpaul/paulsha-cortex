@@ -33,7 +33,7 @@ registry 檔案、不改任何 `.py`**；實際登錄由 `#452` B（schema v2→
 |---|---|---|
 | 1 | `copilot` × planner | `SubprocessLauncher.__init__`（`launcher.py:815-816`）：`(read_only or review_only) and executor == "copilot"` → raise「copilot executor has no enforced read-only planning mode」；`build_copilot_argv`（`launcher.py:496-497`）同樣拒絕。無法提供唯讀保證的 executor 不得任 planner。 |
 | 2 | `copilot` × reviewer | 同上——該檢查對 `review_only` 一併拒絕，`as_review_only()` 對 copilot 必在建構期 raise。注意：ship 階段的「copilot delivery review」gate（`workflow.py:566-568` `delivery_reviews = {"copilot", "maintainer-review"}`、`delivery.py` 的 copilot loop）是 **PR 層的 current-HEAD delivery review**，不是 reviewer persona 的 launcher 巷道，兩者不可混淆；本格排除的是後者。 |
-| 3 | `agy` × builder（packaged fallback） | packaged roster 未宣告 `build` capability，因此 packaged fallback 不會把 agy 選為 builder。#799 另提供 host overlay 明示 `build` 時的 `accept-edits` launcher；該 overlay opt-in 不改 packaged baseline，也不把未驗證的 builder capability 寫入 roster。 |
+| 3 | `agy` × builder（packaged fallback） | packaged roster 未宣告 `build` capability，因此 packaged fallback 不會把 agy 選為 builder；此閘控住在 roster 選擇（`manager._workflow_identity_candidates_for_persona`），launcher 本身不查 capability。#799 另提供 host overlay 明示 `build` 時的 `accept-edits` launcher；ad-hoc 直接指定 `executor: agy` 且具 provisioned worktree 的 builder 語境仍會得到 `accept-edits` 可寫形態。該 overlay opt-in 不改 packaged baseline，也不把未驗證的 builder capability 寫入 roster。 |
 | 4 | `cg` × builder | cg 是 zero-tool（`build_cg_argv` docstring，`launcher.py:703-754`：wrapper 自帶 `--available-tools=__none__`＋`--disable-builtin-mcps`＋throwaway HOME，不能跑 tool／寫檔／commit）。建構期三重 fail-closed：`allow_unsafe` raise（`launcher.py:735-736`、`813-814`）、`commit_required` raise（`launcher.py:737-738`）、builder 語境（`read_only`／`review_only` 皆 False）raise（`launcher.py:739-740`、`820-821`）。`#442` 已確認「補 cg builder」這條路走不通。 |
 
 ### R2 (executor, persona) 候選矩陣定案（5×3 = 15 格）
@@ -77,7 +77,7 @@ benchmark 結果是日後決定是否擴充優先序的依據。
 
 | executor | model_id | independence_domain | capabilities | model_id 出處（repo 內） |
 |---|---|---|---|---|
-| `agy` | `gemini-3.1-pro-high` | `google` | `[planning, review]` ＋ `live_probe: agy-plan-sandbox` | `model_identities.py:20` `AGY_MODEL_ID`；packaged registry 既有身分（#799 的 `build` 僅能由 host overlay 明示，不改 packaged roster） |
+| `agy` | `gemini-3.1-pro-high` | `google` | `[planning, review]` ＋ `live_probe: agy-plan-sandbox` | `model_identities.py:20` `AGY_MODEL_ID`；packaged registry 既有身分（#799 的 `build` 僅能由 host overlay 明示，不改 packaged roster）。此閘控住在 roster 選擇（`manager._workflow_identity_candidates_for_persona`），launcher 本身不查 capability；ad-hoc 直接指定 `executor: agy` 且具 provisioned worktree 的 builder 語境仍會得到 `accept-edits` 可寫形態。 |
 | `copilot` | `gpt-5.4` | `openai` | `[build]` | `docs/superpowers/plans/2026-07-21-v0.1.0-release-plan.md:12`（builder：copilot CLI / gpt-5.4）；`docs/superpowers/workstreams/add-cortex-version-flag/todo.md:11` 等多處派工紀錄 |
 | `claude` | `sonnet` | `anthropic` | `[planning, build, review]` | `docs/superpowers/plans/2026-07-21-v0.1.0-release-plan.md:12`（ForeignReview：claude / sonnet）；claude CLI `--model` 接受 `sonnet` 別名（`build_claude_argv` `--model` 原樣透傳，`launcher.py:600-601`）。完整版本 pin **待確認**（見 R4） |
 | `codex` | `gpt-5.3-codex-spark` | `openai` | `[planning, build, review]` | `docs/superpowers/workstreams/fix-mutation-request-timeout/todo.md:11`、`terminal-result-contract/todo.md:11` 等多處派工紀錄 |

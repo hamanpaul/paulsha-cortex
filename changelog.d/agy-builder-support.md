@@ -2,5 +2,6 @@
   provisioned worktree；`allow_unsafe` 只在明確指定時附加
   `--dangerously-skip-permissions`，`commit_required` 會同步放行 linked-worktree Git
   metadata；write-forbidden builder 維持嚴格 `plan+sandbox`，並以唯讀
-  `--add-dir` 檢視 provisioned worktree；宣告 `build` capability 的 host overlay 以測試釘住 writable argv 形狀，
-  packaged fallback roster 的 planner／reviewer `plan+sandbox` 形態維持不變。
+  `--add-dir` 檢視 provisioned worktree；host overlay 有／無 `build` capability 皆以測試釘住
+  direct launcher 的 writable argv 形狀，capability 閘控維持在 roster 選擇，packaged fallback
+  roster 的 planner／reviewer `plan+sandbox` 形態維持不變。
