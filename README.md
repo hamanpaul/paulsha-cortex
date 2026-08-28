@@ -95,6 +95,11 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時會拒絕覆寫。若舊 env
    記錄的是另一個 HOME 下的 default agents root，請以 `--agents-root PATH` 明確指定後再安裝。
    回寫會以 `yaml.safe_dump` 重排格式並移除註解，原始位元組保留於同目錄的 `.bak-*`。
+   每次 append 遷移會在 config root 留下
+   `project-cortex.yaml.bak-<UTC timestamp>`；這是刻意保留的復原素材（spec 要求），
+   operator 可自行依需要清理舊備份。config root 會有一個 `.cortex-migration.lock`（0600）
+   用於序列化併發安裝，屬常駐鎖檔，不需清除。沒有任何程式會 glob config root，殘留檔
+   不影響 monitor/doctor 讀取。
    既有設定若是 symlink 的情境另案處理；本段 append-only 說明只涵蓋一般檔案。
 
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
