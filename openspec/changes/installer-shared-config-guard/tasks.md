@@ -22,4 +22,5 @@ work_item: installer-shared-config-guard
 - [x] `tests/conftest.py` session fixture 隔離 `PSC_AGENTS_ROOT`／`PSC_PROJECT_CONFIG_ROOT`。
 - [x] 既有 installer 測試回歸綠；補 `changelog.d/` 碎片與 README「install service 對既有 config 只 append」說明。
 - [x] focused／full gates；完成 pre-archive Candidate 準備，後續 evidence canonicalization、archive 與 merge 由 Manager 處理。
-- [x] 修復既有 `project-cortex.yaml` symlink 的 append/replace 風險：在 mutation 前 fail-loud 並指出路徑，補 regression test 與 README 說明；本卡仍僅完成 pre-archive 修正，archive／merge／issue closure 由 Manager 處理。
+- [x] 修復既有 `project-cortex.yaml` symlink 的 append/replace 風險：僅在確實需要 mutation 時 fail-loud 並指出路徑，保留 no-op install；補 regression tests 與 README 說明。本卡仍僅完成 pre-archive 修正，archive／merge／issue closure 由 Manager 處理。
+- [x] 修復 rollback 失敗診斷的 previous 缺檔誤述：區分遷移前不存在與僅存於記憶體的內容，並逐檔記錄 restore 結果；本卡仍僅完成 pre-archive 修正，archive／merge／issue closure 由 Manager 處理。

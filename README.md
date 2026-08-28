@@ -100,10 +100,12 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    operator 可自行依需要清理舊備份。config root 會有一個 `.cortex-migration.lock`（0600）
    用於序列化併發安裝，屬常駐鎖檔，不需清除。沒有任何程式會 glob config root，殘留檔
    不影響 monitor/doctor 讀取；若 rollback restore 失敗，錯誤會逐一列出各檔案自己的
-   backup 或明示沒有 backup（原始內容只留在記憶體中的 `previous`）。既有
-   `project-cortex.yaml` 若是 symlink，installer
-   會在 append/replace 前 fail-closed，明確指出該路徑並保留 symlink 與其 target 不變；
-   請先改為一般檔案後再重試。本段 append-only 說明只涵蓋一般檔案。
+   backup、遷移前不存在而 rollback 僅需移除，或沒有 backup 且原始內容只留在記憶體
+   中的 `previous`，並逐檔記錄 restore 結果。既有 `project-cortex.yaml` 若是 symlink，
+   只有在此次 install 需要 append/replace、確實會改寫 project config 時才會
+   fail-closed，明確指出該路徑並保留 symlink 與其 target 不變；若目標 workspace 已存在、
+   install 不需改寫 project config，則保留 symlink 正常完成。本段 append-only 說明只涵蓋
+   一般檔案的改寫。
 
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
 

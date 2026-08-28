@@ -168,6 +168,45 @@ def test_install_service_rejects_project_config_symlink_before_append(
     assert not (config_root / ".cortex-migration.lock").exists()
 
 
+def test_install_service_allows_project_config_symlink_for_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching workspace must not reject or rewrite an operator symlink."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    home = tmp_path / "home"
+    agents_root = home / ".agents"
+    config_root = agents_root / "config" / "paulsha"
+    config_root.mkdir(parents=True)
+    real_config = tmp_path / "operator-owned" / "project-cortex.yaml"
+    real_config.parent.mkdir()
+    real_config.write_text(
+        yaml.safe_dump(
+            {"workspaces": [{"name": "target", "path": str(target)}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    project_config = config_root / "project-cortex.yaml"
+    project_config.symlink_to(real_config)
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    _write_instance_env(home, agents_root, config_root)
+    before_real_config = real_config.read_bytes()
+
+    _prepare_installer(monkeypatch, home)
+
+    result = installer.install_service_result("hippo", 300, target)
+
+    assert result.exit_code == 0
+    assert project_config.is_symlink()
+    assert project_config.resolve() == real_config.resolve()
+    assert real_config.read_bytes() == before_real_config
+    assert not list(config_root.glob("project-cortex.yaml.bak-*"))
+
+
 def test_install_service_preserves_existing_non_exact_workspace_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -347,7 +386,10 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
     def fail_env_write(*args, **kwargs):
         raise OSError("injected env write failure")
 
-    def fail_restore(*args, **kwargs):
+    restore_calls: list[Path] = []
+
+    def fail_restore(path: Path, previous: bytes | None):
+        restore_calls.append(path)
         raise OSError("injected restore failure")
 
     monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
@@ -374,6 +416,8 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
             f"{path.resolve()}=無備份；"
             "pre-migration 內容只存在於記憶體中的 previous"
         ) in message
+    assert restore_calls == [env_file, project_config, identities]
+    assert message.count("restore=失敗:injected restore failure") == 3
     assert isinstance(exc_info.value.__cause__, OSError)
 
 
@@ -393,7 +437,10 @@ def test_install_service_rollback_reports_unbacked_paths_when_restore_fails(
     def fail_env_write(*args, **kwargs):
         raise OSError("injected env write failure")
 
-    def fail_restore(*args, **kwargs):
+    restore_calls: list[Path] = []
+
+    def fail_restore(path: Path, previous: bytes | None):
+        restore_calls.append(path)
         raise OSError("injected restore failure")
 
     monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
@@ -409,9 +456,12 @@ def test_install_service_rollback_reports_unbacked_paths_when_restore_fails(
         )
 
     message = str(exc_info.value)
-    assert "pre-migration 內容只存在於記憶體中的 previous" in message
+    assert "遷移前不存在，rollback 僅移除" in message
+    assert "pre-migration 內容只存在於記憶體中的 previous" not in message
     for path in (env_file, project_config, identities):
         assert str(path.resolve()) in message
+    assert message.count("restore=失敗:injected restore failure") == 3
+    assert restore_calls == [env_file, project_config, identities]
     assert not list(config_root.glob("*.bak-*"))
     assert isinstance(exc_info.value.__cause__, OSError)
 

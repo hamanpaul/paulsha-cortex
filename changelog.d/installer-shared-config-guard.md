@@ -15,4 +15,6 @@ rollback 失敗診斷改為逐檔綁定自身 backup 或明示內容只存在於
 改以同目錄暫存檔搭配 atomic replace 並保留原檔 mode，project config loader 也會保留原始
 驗證例外與原因。
 既有 `project-cortex.yaml` 若為 symlink，append/replace 會在 mutation 前 fail-closed 並明示
-路徑，保留 symlink 與其 target 不變。
+路徑，保留 symlink 與其 target 不變；若目標 workspace 已存在而不需改寫 project config，
+則允許 no-op install 保留該 symlink。rollback 失敗時另逐檔記錄 restore 結果，並區分
+遷移前不存在而 rollback 僅需移除的檔案。

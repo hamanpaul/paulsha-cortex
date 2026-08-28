@@ -404,14 +404,9 @@ def _prepare_migration_inputs(*, config_root: Path, repo_root: Path) -> _Migrati
         ) from identity_error
 
     existing_project = project_config.is_file() or project_config.is_symlink()
-    if project_config.is_symlink():
-        raise ValueError(
-            f"既有 project config 為 symlink，拒絕 append/replace：{project_config}；"
-            "請改為一般檔案後再重試"
-        )
     project_payload = _load_project_config_payload(project_config)
     if project_payload is None:
-        if project_config.is_symlink() or project_config.exists():
+        if os.path.lexists(project_config):
             if project_config.is_file():
                 raise ValueError(
                     f"既有 project config 無法載入，拒絕覆寫：{project_config}；"
@@ -452,6 +447,12 @@ def _prepare_migration_inputs(*, config_root: Path, repo_root: Path) -> _Migrati
             # validated document byte-for-byte; in particular, do not promote
             # an existing ``exact_project: false`` entry during install.
             project_needs_update = False
+
+    if project_needs_update and project_config.is_symlink():
+        raise ValueError(
+            f"既有 project config 為 symlink，拒絕 append/replace：{project_config}；"
+            "請改為一般檔案後再重試"
+        )
 
     return _MigrationInputs(
         existing_project=existing_project,
@@ -563,43 +564,48 @@ def _migrate_instance_config_locked(
             preserve_existing=_PRESERVE_EXISTING_PATHS,
         )
     except Exception:
-        restore_ok = False
-        try:
-            for path, previous_content in previous.items():
+        restore_errors: dict[Path, Exception] = {}
+        restore_results: dict[Path, str] = {}
+        for path, previous_content in previous.items():
+            try:
                 _restore_file(path, previous_content)
-        except Exception as exc:
+            except Exception as exc:
+                restore_errors[path] = exc
+                restore_results[path] = f"失敗:{exc}"
+            else:
+                restore_results[path] = "成功"
+        if restore_errors:
             risky_paths = []
-            for path in previous:
+            for path, previous_content in previous.items():
                 backup = backup_paths.get(path)
-                if backup is None:
-                    risky_paths.append(
-                        f"{path.resolve()}=無備份；"
-                        "pre-migration 內容只存在於記憶體中的 previous"
-                    )
+                if backup is not None:
+                    provenance = f"有備份:{backup.resolve()}"
+                elif previous_content is None:
+                    provenance = "遷移前不存在，rollback 僅移除"
                 else:
-                    risky_paths.append(
-                        f"{path.resolve()}=有備份:{backup.resolve()}"
+                    provenance = (
+                        "無備份；pre-migration 內容只存在於記憶體中的 previous"
                     )
+                risky_paths.append(
+                    f"{path.resolve()}={provenance}；restore={restore_results[path]}"
+                )
             has_unbacked_paths = any(path not in backup_paths for path in previous)
             if has_unbacked_paths:
                 prefix = "migration rollback 失敗，未取得備份的檔案與既有備份逐一列出："
             else:
                 prefix = "migration rollback 失敗，各檔案備份逐一列出："
-            message = f"{prefix}{', '.join(risky_paths)}；restore error: {exc}"
-            raise ValueError(message) from exc
-        else:
-            restore_ok = True
-        finally:
-            if restore_ok:
-                for backup in backup_paths.values():
-                    try:
-                        backup.unlink(missing_ok=True)
-                    except OSError as exc:
-                        logger.warning(
-                            "migration backup cleanup failed path=%s: %s",
-                            backup,
-                            exc,
-                        )
+            message = f"{prefix}{', '.join(risky_paths)}"
+            first_restore_error = next(iter(restore_errors.values()))
+            raise ValueError(message) from first_restore_error
+        for backup in backup_paths.values():
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "migration backup cleanup failed path=%s: %s",
+                    backup,
+                    exc,
+                )
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
