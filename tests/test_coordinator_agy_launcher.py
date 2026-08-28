@@ -113,7 +113,7 @@ def test_agy_builder_write_forbidden_argv_keeps_strict_plan_sandbox(tmp_path) ->
         write_forbidden=True,
     )
 
-    assert argv[:7] == [
+    assert argv[:6] == [
         "agy",
         "--print",
         "inspect",
@@ -121,7 +121,7 @@ def test_agy_builder_write_forbidden_argv_keeps_strict_plan_sandbox(tmp_path) ->
         "plan",
         "--sandbox",
     ]
-    assert "--add-dir" not in argv
+    assert argv[6:8] == ["--add-dir", str(worktree.resolve())]
     assert "accept-edits" not in argv
     assert "--dangerously-skip-permissions" not in argv
 

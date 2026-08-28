@@ -40,9 +40,10 @@
 
 - **#799：agy 支援 builder 派工**：agy builder 現在使用 `accept-edits` 並將權限限制在
   provisioned worktree；明確 `allow_unsafe` 才附加 `--dangerously-skip-permissions`，
-  `commit_required` 也會傳遞 linked-worktree Git metadata 放行；registry 宣告 `build`
-  capability 的 host overlay 由測試機械釘住 writable argv 的對應，packaged fallback
-  roster 維持既有 planner／reviewer 形態。
+  `commit_required` 也會傳遞 linked-worktree Git metadata 放行；write-forbidden builder
+  維持嚴格 `plan+sandbox`，並以唯讀 `--add-dir` 檢視 provisioned worktree；registry 宣告 `build` capability
+  的 host overlay 由測試機械釘住 writable argv 的對應，packaged fallback roster 維持既有
+  planner／reviewer 形態。
 
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合

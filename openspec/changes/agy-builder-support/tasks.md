@@ -20,7 +20,7 @@ work_item: agy-builder-support
 - [x] 依 retry_context 重現並補強 F1／F2／F3 的機械回歸覆蓋；agy 的 builder 判定固定為
       「有 provisioned worktree 且非 read-only/reviewer」，無 worktree 的歷史 direct planning
       維持 `plan+sandbox`；planning runtime／agy probe 明示 `read_only=True`，
-      write-forbidden builder 維持 agy 嚴格 `plan+sandbox`（不帶 writable `--add-dir`）；
-      上述屬 operator 核可的範圍內偏差，本卡交付範圍仍止於 pre-archive。
-- [x] 完成 pre-archive Candidate 準備；authoritative preflight、archive、merge、issue closure
-      與 done 判定由 Manager 於 ship 執行。
+      write-forbidden builder 維持 agy 嚴格 `plan+sandbox`，並以 `--add-dir <worktree>`
+      保留唯讀檢視；上述屬 operator 核可的範圍內偏差，本卡交付範圍仍止於 pre-archive。
+- [x] 完成 pre-archive Candidate 準備；本卡不執行 archive／merge／issue closure／done，
+      交付範圍止於 pre-archive。

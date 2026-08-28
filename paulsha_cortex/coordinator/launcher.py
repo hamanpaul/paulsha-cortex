@@ -1198,10 +1198,10 @@ def build_agy_argv(
     reviewers additionally receive their disposable checkout.  A builder is
     identified by its provisioned worktree and uses ``accept-edits`` unless its
     card explicitly forbids workspace writes, in which case it keeps the
-    strict ``plan+sandbox`` shape without a writable ``--add-dir``.  The unsafe
-    flag is an explicit builder-only bypass, while commit-required builders
-    receive the same narrowly scoped linked-worktree Git directories as the
-    other write-capable executors.
+    strict ``plan+sandbox`` shape while receiving a read-only ``--add-dir`` for
+    that checkout.  The unsafe flag is an explicit builder-only bypass, while
+    commit-required builders receive the same narrowly scoped linked-worktree
+    Git directories as the other write-capable executors.
     """
     if read_only and review_only:
         raise ValueError("agy launcher cannot be both planner-read-only and reviewer-read-only")
@@ -1224,7 +1224,7 @@ def build_agy_argv(
         # source material through Manager-owned input envelopes and stay zero-tool;
         # reviewer cards need the explicitly provisioned disposable checkout so
         # their read-only inspection is about the exact Candidate.
-        if review_only and worktree is not None:
+        if (review_only or write_forbidden) and worktree is not None:
             argv.extend(["--add-dir", str(Path(worktree).resolve())])
     else:
         worktree = str(Path(worktree).resolve())
