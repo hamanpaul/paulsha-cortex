@@ -24,3 +24,5 @@ work_item: agy-builder-support
       保留唯讀檢視；上述屬 operator 核可的範圍內偏差，本卡交付範圍仍止於 pre-archive。
 - [x] 完成 pre-archive Candidate 準備；本卡不執行 archive／merge／issue closure／done，
       交付範圍止於 pre-archive。
+- [x] 同步 ADR、unified work lifecycle spec 與部署 changelog 的 agy 權限形態及 trust-root
+      credential caveat；僅完成 pre-archive 文件一致性，不宣稱 archive／merge／issue closure／done。
