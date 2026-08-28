@@ -1,7 +1,7 @@
 # planning-artifact-manifest-binding Specification
 
 ## Purpose
-本規格定義 planning publication 對 spec／design／plan 三類規劃產物的 work-item 綁定行為：即使 combo manifest 未宣告 brainstorming 輸出，規劃 runtime 仍可將三件套寫入 work item 的 canonical superpowers 路徑（含合法的日期前綴 slug）；只有 manifest 綁定或符合限定 slug 形狀的 canonical 目的地可通過，任意額外前後綴、未綁定、路徑逃逸與 symlink 目的地則必須拒絕，內容拒收時仍提供可操作的 needs_human 診斷提示。
+本規格定義 planning publication 對 spec／design／plan 三類規劃產物的 work-item 綁定行為：即使 combo manifest 未宣告 brainstorming 輸出，規劃 runtime 仍可將三件套寫入 `docs/superpowers` 對應目錄；目的地必須是四段式、正規化的相對 Markdown 路徑，並依 kind 模板以 basename glob 包含該 work item，且保留 manifest 綁定與 OpenSpec 路徑的既有安全檢查。絕對路徑、`..`、跨目錄、非 `.md`、其他 work item 與 symlink 目的地必須拒絕；內容拒收時仍提供可操作的 needs_human 診斷提示。
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 

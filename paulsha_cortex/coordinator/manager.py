@@ -7901,21 +7901,18 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
     if kind in {"spec", "design"}:
         if relative.parts[:3] != ("docs", "superpowers", "specs"):
             return False
-        suffix = f"-{kind}.md"
+        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
     else:
         if relative.parts[:3] != ("docs", "superpowers", "plans"):
             return False
-        suffix = ".md"
-    if not relative.name.endswith(suffix):
+        pattern = f"docs/superpowers/plans/*{work_id}*.md"
+    if relative.suffix != ".md":
         return False
-    # OpenSpec archive slugs may carry a date prefix.  Match the complete
-    # basename instead of using a substring glob, so arbitrary text before or
-    # after the work item cannot turn an unintended file into a canonical
-    # destination.
-    stem = relative.name[: -len(suffix)]
-    return stem == work_id or re.fullmatch(
-        rf"\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(work_id)}", stem
-    ) is not None
+    # The accepted planning contract intentionally permits any basename slug
+    # containing the work item.  The directory, four-part relative path and
+    # normalized-path guards above keep this basename glob from crossing into
+    # another governed root or escaping the workspace.
+    return fnmatch.fnmatch(path_value, pattern)
 
 
 def _publish_planning_artifacts(

@@ -100,7 +100,7 @@ def _planning_rows() -> list[dict[str, str]]:
         ),
     ),
 )
-def test_planning_kind_bound_accepts_canonical_or_date_prefixed_destination(
+def test_planning_kind_bound_accepts_glob_bound_destinations(
     kind: str, path: str, dated_path: str
 ) -> None:
     assert manager.planning_kind_bound(kind, path, TASK_SLUG) is True
@@ -112,8 +112,43 @@ def test_planning_kind_bound_accepts_canonical_or_date_prefixed_destination(
         if kind in {"spec", "design"}
         else path.replace(f"{TASK_SLUG}.md", f"{TASK_SLUG}-extra.md")
     )
-    assert manager.planning_kind_bound(kind, prefix, TASK_SLUG) is False
-    assert manager.planning_kind_bound(kind, suffix, TASK_SLUG) is False
+    middle = (
+        path.replace(
+            f"{TASK_SLUG}-",
+            f"prefix-{TASK_SLUG}-middle-",
+        )
+        if kind in {"spec", "design"}
+        else path.replace(f"{TASK_SLUG}.md", f"prefix-{TASK_SLUG}-middle.md")
+    )
+    assert manager.planning_kind_bound(kind, prefix, TASK_SLUG) is True
+    assert manager.planning_kind_bound(kind, suffix, TASK_SLUG) is True
+    assert manager.planning_kind_bound(kind, middle, TASK_SLUG) is True
+
+
+@pytest.mark.parametrize(
+    ("kind", "path"),
+    (
+        ("spec", "docs/superpowers/specs/not-this-work-spec.md"),
+        ("design", "docs/superpowers/specs/not-this-work-design.md"),
+        ("plan", "docs/superpowers/plans/not-this-work.md"),
+        (
+            "spec",
+            f"docs/superpowers/plans/{TASK_SLUG}-spec.md",
+        ),
+        (
+            "plan",
+            f"docs/superpowers/specs/{TASK_SLUG}-plan.md",
+        ),
+        (
+            "spec",
+            f"docs/superpowers/specs/{TASK_SLUG}-spec.txt",
+        ),
+    ),
+)
+def test_planning_kind_bound_rejects_unbound_kind_or_path(
+    kind: str, path: str
+) -> None:
+    assert manager.planning_kind_bound(kind, path, TASK_SLUG) is False
 
 
 @pytest.mark.parametrize(
