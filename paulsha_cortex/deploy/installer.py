@@ -531,15 +531,23 @@ def _migrate_instance_config_locked(
             preserve_existing=_PRESERVE_EXISTING_PATHS,
         )
     except Exception:
+        restore_ok = False
         try:
             _restore_file(env_file, previous[env_file])
             _restore_file(project_config, previous[project_config])
             _restore_file(identities, previous[identities])
-        except Exception:
-            raise
+        except Exception as exc:
+            paths = ", ".join(str(path.resolve()) for path in created_backups)
+            raise ValueError(
+                "migration rollback 失敗，pre-migration 內容保留於 "
+                f"{paths}"
+            ) from exc
         else:
-            for backup in created_backups:
-                backup.unlink(missing_ok=True)
+            restore_ok = True
+        finally:
+            if restore_ok:
+                for backup in created_backups:
+                    backup.unlink(missing_ok=True)
         raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)

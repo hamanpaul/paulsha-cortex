@@ -250,7 +250,7 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
     monkeypatch.setattr(installer, "_write_managed_env", fail_env_write)
     monkeypatch.setattr(installer, "_restore_file", fail_restore)
 
-    with pytest.raises(OSError, match="injected restore failure"):
+    with pytest.raises(ValueError, match="migration rollback 失敗") as exc_info:
         installer._migrate_instance_config(
             env_file=env_file,
             existing={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
@@ -262,6 +262,8 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
     backups = sorted(config_root.glob("project-cortex.yaml.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == before_project
+    assert str(backups[0].resolve()) in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, OSError)
 
 
 def test_install_service_rejects_agents_root_from_different_home(

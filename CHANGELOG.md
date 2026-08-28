@@ -12,8 +12,8 @@
   `project-cortex.yaml` 或 `model-identities.yaml` 無法載入時 fail-closed，跨 HOME
   的 default agents root 也必須以 `--agents-root` 明確指定；命中既有 workspace 時
   保留原條目與其他設定區塊，migration rollback 僅在 restore 成功時清理本次建立的
-  備份，restore 失敗則保留備份供復原；porcelain install 也會保留 installer 正常返回
-  時產生的 stderr 診斷訊息。
+  備份，restore 失敗則保留備份並在錯誤訊息列出復原路徑；porcelain install 也會保留
+  installer 正常返回時產生的 stderr 診斷訊息。
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
   missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
