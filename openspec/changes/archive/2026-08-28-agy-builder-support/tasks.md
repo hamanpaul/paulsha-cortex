@@ -27,3 +27,6 @@ work_item: agy-builder-support
       交付範圍止於 pre-archive。
 - [x] 同步 ADR、unified work lifecycle spec 與部署 changelog 的 agy 權限形態及 trust-root
       credential caveat；僅完成 pre-archive 文件一致性，不宣稱 archive／merge／issue closure／done。
+- [x] 針對 redispatched Candidate 於 current `main` 上完成 rebase，重現並修復 #805／#799
+      整合後的 stale trust-root assertions；本項僅完成 pre-archive Candidate 修復，不宣稱
+      archive／merge／issue closure／done。
