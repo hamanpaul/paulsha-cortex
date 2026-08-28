@@ -435,6 +435,8 @@ def test_brainstorm_not_ready_logs_reason_before_needs_human(
     assert persisted.current_phase == "define"
     assert persisted.facets == ("needs_human",)
     assert result["reason"] == "no-heterogeneous-planner"
+    assert isinstance(persisted.needs_human_reason["next_step_hint"], str)
+    assert "abandon" in persisted.needs_human_reason["next_step_hint"]
     assert any(
         "no-heterogeneous-planner" in record.message and persisted.run_id in record.message
         for record in caplog.records

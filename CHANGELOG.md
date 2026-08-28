@@ -12,6 +12,30 @@
   與 dispatch preflight 會在 launch 前拒絕缺少 launcher、toolchain 或 credential 任一層
   的 persona–executor 契約，且 packaged roster 不宣傳 AGY build fallback。
 
+- **#802：fix-standard 的 planning publication 現在對 spec／design／plan 使用
+  work-item-bound canonical destinations，即使 combo manifest 沒有
+  `brainstorming` card 也能落地三件套；內容型 planning failure 的
+  `needs_human` 回應同步提供補件、`abandon` 與重新 intake 的下一步提示，
+  並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
+  超長提示的回歸保護。`DiagnosticReason` 以加法欄位 bump 至 schema v2，
+  仍相容讀取缺少 `next_step_hint` 的 v1 payload；這是單向遷移，已寫入 hint
+  記錄後不可將 Manager 降級回不認得該欄位的舊版本；三條 operator hint 分支改用
+  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定以 accepted
+  basename glob 比對，並由四段相對路徑、目錄家族與正規化守衛限制作用範圍；包含
+  work item 的合法 slug 不得因 combo manifest 缺少 brainstorming 而被拒。**
+
+- **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
+  最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
+  missing／pending／failure fail-closed，同時不再讓事故留下的第三方歷史 check 永久阻擋
+  已由必要 gates 驗證完成的 release。
+
+- **RC rollback qualification 順序與 unknown-state 修正**：rollback scanner 現在會依 archived
+  receipt inventory 排除刻意保留的 fresh checkout／content-addressed venv 及其 carrier parent，
+  同時仍回報同層 foreign sibling；container harness 也改成 rollback／clean reinstall 完成後才
+  加入非 transactional runtime scaffold fixture，避免合法 retained state 被誤判為 unknown。
+  Policy Check 同步監聽 PR `edited`／`labeled`／`unlabeled` 事件，讓 release／exemption label、
+  標題或 checklist 的變更都會以最新 metadata 重新判定。
+
 - **Phase 2 attestation 與 closeout authority 修正**：generated-vs-installed attestation
   依 artifact category 分辨真正註解，shebang、`;`-prefixed shell、polkit `#`／未閉合
   block／`;` statement 都會 fail closed。Installer 新增明示 `--prior-receipt`，只讓同
