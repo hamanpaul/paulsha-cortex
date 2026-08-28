@@ -20,7 +20,7 @@ work_item: trust-root-agy-builder-grant
       live qualification 前不得宣傳 packaged AGY fallback 的回歸測試。
 - [x] 執行 focused/full repository gates 與 policy/preflight，將 candidate 整合至
       最新 `origin/main`，並完成 archive 前的 candidate 驗證。
-- [ ] 由 Manager 於 archive 前執行獨立 review 並收斂 candidate evidence。
+- [x] 由 Manager 於 archive 前執行獨立 review 並收斂 candidate evidence。
 
 > Merge 後 exact-SHA Trust Root AGY builder acceptance 由 Manager／operator 另行執行，
 > 不列為本次 pre-archive change 的 active task。
