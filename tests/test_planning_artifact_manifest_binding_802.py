@@ -81,17 +81,30 @@ def _planning_rows() -> list[dict[str, str]]:
 
 
 @pytest.mark.parametrize(
-    ("kind", "path"),
+    ("kind", "path", "dated_path"),
     (
-        ("spec", f"docs/superpowers/specs/{TASK_SLUG}-spec.md"),
-        ("design", f"docs/superpowers/specs/{TASK_SLUG}-design.md"),
-        ("plan", f"docs/superpowers/plans/{TASK_SLUG}.md"),
+        (
+            "spec",
+            f"docs/superpowers/specs/{TASK_SLUG}-spec.md",
+            f"docs/superpowers/specs/2026-08-27-{TASK_SLUG}-spec.md",
+        ),
+        (
+            "design",
+            f"docs/superpowers/specs/{TASK_SLUG}-design.md",
+            f"docs/superpowers/specs/2026-08-27-{TASK_SLUG}-design.md",
+        ),
+        (
+            "plan",
+            f"docs/superpowers/plans/{TASK_SLUG}.md",
+            f"docs/superpowers/plans/2026-08-27-{TASK_SLUG}.md",
+        ),
     ),
 )
-def test_planning_kind_bound_requires_exact_canonical_destination(
-    kind: str, path: str
+def test_planning_kind_bound_accepts_canonical_or_date_prefixed_destination(
+    kind: str, path: str, dated_path: str
 ) -> None:
     assert manager.planning_kind_bound(kind, path, TASK_SLUG) is True
+    assert manager.planning_kind_bound(kind, dated_path, TASK_SLUG) is True
 
     prefix = path.replace(TASK_SLUG, f"prefix-{TASK_SLUG}")
     suffix = (

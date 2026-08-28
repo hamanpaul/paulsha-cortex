@@ -7901,12 +7901,22 @@ def planning_kind_bound(kind: object, path_value: object, work_id: object) -> bo
     if kind in {"spec", "design"}:
         if relative.parts[:3] != ("docs", "superpowers", "specs"):
             return False
-        canonical = f"docs/superpowers/specs/{work_id}-{kind}.md"
+        pattern = f"docs/superpowers/specs/*{work_id}*-{kind}.md"
+        suffix = f"-{kind}.md"
     else:
         if relative.parts[:3] != ("docs", "superpowers", "plans"):
             return False
-        canonical = f"docs/superpowers/plans/{work_id}.md"
-    return path_value == canonical
+        pattern = f"docs/superpowers/plans/*{work_id}*.md"
+        suffix = ".md"
+    if not fnmatch.fnmatch(path_value, pattern):
+        return False
+    # OpenSpec archive slugs may carry a date prefix.  Keep the accepted glob
+    # shape for that contract, but do not let arbitrary text before/after the
+    # work item turn a substring match into a canonical destination.
+    stem = relative.name[: -len(suffix)]
+    return stem == work_id or re.fullmatch(
+        rf"\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(work_id)}", stem
+    ) is not None
 
 
 def _publish_planning_artifacts(

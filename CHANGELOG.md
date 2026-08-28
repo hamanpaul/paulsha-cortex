@@ -14,8 +14,8 @@
   並將提示持久化在 `needs_human_reason` payload；補齊多 combo、路徑邊界與
   超長提示的回歸保護。`DiagnosticReason` 以加法欄位 bump 至 schema v2，
   仍相容讀取缺少 `next_step_hint` 的 v1 payload；三條 operator hint 分支改用
-  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定改為精確
-  canonical 檔名，額外前綴／後綴不得繞過 manifest 綁定。**
+  正體中文，保留內嵌的 `cortex work abandon` 指令；kind-bound 判定接受 canonical
+  work-item slug 與合法日期前綴，額外前綴／後綴不得繞過 manifest 綁定。**
 
 - **Release final-head check scope 修正**：release preflight 現在逐一驗證 exact PR head
   最新的 Tests、Persona Scope、Policy Check 與 RC qualification workflow run，保留
