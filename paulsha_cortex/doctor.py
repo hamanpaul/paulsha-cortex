@@ -312,7 +312,12 @@ def _model_resolution_probe(env: Mapping[str, str], agents_root: Path) -> ProbeR
             identity for identity in registry.identities if role in identity.capabilities
         ]
         ranked = model_resolution.rank_candidates(
-            candidates, role=role, context=context
+            candidates,
+            role=role,
+            context=context,
+            compatibility_for=lambda identity: model_resolution.compatibility_contract_for(
+                persona, identity
+            ),
         )
         if not ranked.ordered:
             failures.append(

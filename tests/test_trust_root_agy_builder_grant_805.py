@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Mapping
 
 import pytest
 
-from paulsha_cortex.coordinator import model_resolution
+from paulsha_cortex.coordinator import manager, model_resolution
 from paulsha_cortex.coordinator.model_identities import (
     AGY_MODEL_ID,
     IdentityRegistry,
@@ -174,8 +175,92 @@ def test_planner_and_reviewer_contracts_remain_valid(tmp_path: Path) -> None:
     model_resolution.validate_identity_compatibility(
         "planner", identities.require("agy", AGY_MODEL_ID)
     )
+    # reviewer and planner intentionally share cortex-reviewer-planner.  The
+    # AGY dependency inventory names PLANNER, so the check must compare the
+    # resolved account rather than raw Principal enum members.
+    model_resolution.validate_identity_compatibility(
+        "reviewer", identities.require("agy", AGY_MODEL_ID)
+    )
     model_resolution.validate_identity_compatibility(
         "reviewer", identities.require("claude", "sonnet")
+    )
+
+
+@pytest.mark.parametrize("persona", ("planner", "reviewer"))
+def test_cg_read_only_identities_fail_closed_without_trust_root_grants(
+    tmp_path: Path, persona: str
+) -> None:
+    identities = load_model_identities(tmp_path)
+
+    with pytest.raises(ValueError, match=f"missing {persona} toolchain grant"):
+        model_resolution.validate_identity_compatibility(
+            persona, identities.require("cg", "glm-5.2")
+        )
+
+
+def test_builder_copilot_fails_closed_without_builder_credential_grant(
+    tmp_path: Path,
+) -> None:
+    identities = load_model_identities(tmp_path)
+
+    with pytest.raises(ValueError, match="missing builder credential grant"):
+        model_resolution.validate_identity_compatibility(
+            "builder", identities.require("copilot", "gpt-5.4")
+        )
+
+
+def test_model_resolution_filters_incomplete_packaged_candidates_to_codex(
+    tmp_path: Path,
+) -> None:
+    identities = load_model_identities(tmp_path)
+    run = SimpleNamespace(
+        run_id="run-805",
+        steps=(),
+        primary_domain=None,
+        sizing_band=None,
+        model_chain_override=None,
+    )
+
+    selected = manager._select_workflow_identity(
+        run,
+        SimpleNamespace(persona="builder"),
+        identities,
+    )
+    assert (selected.executor, selected.model_id) == ("codex", "gpt-5.3-codex-spark")
+
+    for persona, role in (("planner", "planning"), ("reviewer", "review")):
+        candidates = [
+            identity for identity in identities.identities if role in identity.capabilities
+        ]
+        ranked = model_resolution.rank_candidates(
+            candidates,
+            role=role,
+            context=identities.resolution_context,
+            compatibility_for=lambda identity: model_resolution.compatibility_contract_for(
+                persona, identity
+            ),
+        )
+        assert all(identity.executor != "cg" for identity in ranked.ordered)
+        assert any(
+            identity.executor == "cg" and "toolchain grant" in reason
+            for identity, reason in ranked.excluded
+        )
+
+    builder_candidates = [
+        identity for identity in identities.identities if "build" in identity.capabilities
+    ]
+    builder_ranked = model_resolution.rank_candidates(
+        builder_candidates,
+        role="build",
+        context=identities.resolution_context,
+        compatibility_for=lambda identity: model_resolution.compatibility_contract_for(
+            "builder", identity
+        ),
+    )
+    assert all(identity.executor != "copilot" for identity in builder_ranked.ordered)
+    assert any(
+        identity.executor == "copilot" and "credential grant" in reason
+        for identity, reason in builder_ranked.excluded
     )
 
 

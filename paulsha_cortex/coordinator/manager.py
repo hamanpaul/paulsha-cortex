@@ -8209,7 +8209,18 @@ def _rank_candidates_by_resolution_layer(
 
     role = model_resolution.role_for_persona(persona)
     ranked = model_resolution.rank_candidates(
-        candidates, role=role, context=identities.resolution_context
+        candidates,
+        role=role,
+        context=identities.resolution_context,
+        compatibility_for=(
+            (
+                lambda identity: model_resolution.compatibility_contract_for(
+                    persona, identity
+                )
+            )
+            if identities.resolution is not None
+            else None
+        ),
     )
     for warning in ranked.warnings:
         logger.warning(

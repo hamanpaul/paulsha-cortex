@@ -100,7 +100,7 @@ def test_operator_overlay_outranks_packaged_roster_for_every_persona(tmp_path: P
 
 
 def test_packaged_candidates_are_kept_as_lower_priority_fallback(tmp_path: Path) -> None:
-    """降級為候選池≠剔除：#262 的 preflight re-route 仍需要次佳候選。"""
+    """不完整的 packaged 候選被剔除，仍保留相容的 codex fallback。"""
 
     _write(tmp_path, "model-identities.yaml", _OPERATOR_OVERLAY)
     registry = load_model_identities(tmp_path)
@@ -108,10 +108,8 @@ def test_packaged_candidates_are_kept_as_lower_priority_fallback(tmp_path: Path)
     candidates = manager._workflow_identity_candidates(_run(), _step("builder"), registry)
     keys = [(item.executor, item.model_id) for item in candidates]
     assert keys[0] == ("codex", "gpt-5.6-luna")
-    assert ("copilot", "gpt-5.4") in keys  # packaged 候選仍在，但排在 overlay 之後
-    overlay_keys = {("codex", "gpt-5.6-luna"), ("copilot", "MAI-Code-1.1-Flash"), ("agy", "gemini-3.6-flash-high")}
-    last_overlay = max(keys.index(key) for key in overlay_keys if key in keys)
-    assert keys.index(("copilot", "gpt-5.4")) > last_overlay
+    assert ("copilot", "gpt-5.4") not in keys
+    assert ("codex", "gpt-5.3-codex-spark") not in keys
 
 
 def test_primary_domain_preference_no_longer_outranks_operator_overlay(tmp_path: Path) -> None:
@@ -127,7 +125,7 @@ def test_primary_domain_preference_no_longer_outranks_operator_overlay(tmp_path:
     )
     keys = [(item.executor, item.model_id) for item in candidates]
     assert keys[0] == ("codex", "gpt-5.6-luna")
-    assert keys.index(("codex", "gpt-5.6-luna")) < keys.index(("claude", "sonnet"))
+    assert ("claude", "sonnet") not in keys
 
 
 def test_secondary_planner_is_not_pinned_to_agy_anymore(tmp_path: Path) -> None:
@@ -167,7 +165,12 @@ identities:
 
     assert selection.state == "ready"
     assert selection.identity is not None
-    assert (selection.identity.executor, selection.identity.model_id) == ("cg", "glm-5.3")
+    # cg has a read-only launcher but no Trust Root toolchain/credential cell;
+    # the next compatible overlay candidate remains selectable.
+    assert (selection.identity.executor, selection.identity.model_id) == (
+        "claude",
+        "claude-opus-5",
+    )
 
 
 def test_packaged_only_deployment_keeps_packaged_roster_order(tmp_path: Path) -> None:
@@ -231,13 +234,12 @@ identities:
     candidates = manager._workflow_identity_candidates(_run(), _step("builder"), registry)
     keys = [(item.executor, item.model_id) for item in candidates]
 
-    # 1. overlay；2. 評估合格且人工複核通過的 packaged claude/sonnet；3. 其餘 packaged。
+    # 1. overlay；相容性檢查會剔除沒有 builder credential cell 的 packaged claude。
     assert keys[0] == ("codex", "gpt-5.6-luna")
-    assert keys[1] == ("claude", "sonnet")
-    assert keys.index(("claude", "sonnet")) < keys.index(("copilot", "gpt-5.4"))
+    assert keys[1] == ("codex", "gpt-5.3-codex-spark")
     assert (
         manager._resolution_layer_for(candidates[1], "builder", registry)
-        == model_resolution.RESOLUTION_LAYER_EVALUATED
+        == model_resolution.RESOLUTION_LAYER_PACKAGED
     )
 
 
@@ -389,15 +391,24 @@ def test_overlay_can_park_and_demote_packaged_identities(tmp_path: Path) -> None
     _write(
         tmp_path,
         "model-identities.yaml",
-        _OPERATOR_OVERLAY
-        + """\
+        """\
+schema_version: 3
+identities:
+  - executor: claude
+    model_id: claude-opus-5
+    independence_domain: anthropic
+    capabilities: [planning, review]
+  - executor: codex
+    model_id: gpt-5.6-luna
+    independence_domain: openai
+    capabilities: [build]
 packaged_overrides:
   - executor: agy
     model_id: gemini-3.1-pro-high
     action: park
     reason: operator 未核可此引擎
-  - executor: copilot
-    model_id: gpt-5.4
+  - executor: codex
+    model_id: gpt-5.3-codex-spark
     action: demote
     reason: 尚未評估，僅供最後手段
 """,
@@ -417,7 +428,7 @@ packaged_overrides:
         (item.executor, item.model_id)
         for item in manager._workflow_identity_candidates(_run(), _step("builder"), registry)
     ]
-    assert builder_keys[-1] == ("copilot", "gpt-5.4")
+    assert builder_keys[-1] == ("codex", "gpt-5.3-codex-spark")
 
 
 def test_packaged_overrides_are_fail_closed(tmp_path: Path) -> None:
@@ -693,14 +704,8 @@ identities:
     )
     identities = load_model_identities(tmp_path)
 
-    identity = manager._select_workflow_identity(_run(), _step("builder"), identities)
-
-    assert (identity.executor, identity.model_id) == ("claude", "gemma4-26b-a4b-nvfp4")
-    assert identity.independence_domain == "self-hosted-gemma"
-    assert (
-        manager._resolution_layer_for(identity, "builder", identities)
-        == model_resolution.RESOLUTION_LAYER_OVERLAY
-    )
+    with pytest.raises(ValueError, match="missing builder credential grant"):
+        manager._select_workflow_identity(_run(), _step("builder"), identities)
 
 
 # ---------------------------------------------------------------------------
@@ -723,7 +728,13 @@ def test_existing_overlay_files_stay_valid_without_any_new_field(tmp_path: Path)
         registry = load_model_identities(tmp_path)
         assert registry.resolution_context.packaged_overrides == ()
         assert registry.resolution_context.eval_roster.entries == ()
-        assert manager._workflow_identity_candidates(_run(), _step("builder"), registry)
+        if "executor: copilot" in text:
+            with pytest.raises(ValueError, match="missing builder credential grant"):
+                manager._workflow_identity_candidates(_run(), _step("builder"), registry)
+        elif "schema_version: 1" in text:
+            assert manager._workflow_identity_candidates(_run(), _step("planner"), registry)
+        else:
+            assert manager._workflow_identity_candidates(_run(), _step("builder"), registry)
 
 
 def test_hand_built_registries_keep_pre_534_ordering() -> None:

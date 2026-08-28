@@ -186,7 +186,16 @@ def launcher_profile_for(persona: str, executor: str) -> Mapping[str, object] | 
 
 
 def _toolchain_grant_for(persona: str, executor: str) -> Mapping[str, object] | None:
-    """Resolve a principal-specific executor toolchain grant from the inventory."""
+    """Resolve an executor grant through the persona's Trust Root account.
+
+    ``RUN_EXTERNAL_DEPENDENCIES`` records which Trust Root principals consume a
+    dependency, but those principals are not the account boundary.  In the
+    default four-way scheme reviewer and planner intentionally resolve to the
+    same ``cortex-reviewer-planner`` account; comparing enum members directly
+    would therefore reject a valid reviewer/AGY pairing.  Resolve both sides
+    through the active scheme before checking the model-call dependency and the
+    generated executor asset ACL.
+    """
 
     principal_name = _TRUST_ROOT_PRINCIPAL_BY_PERSONA.get(persona)
     if principal_name is None:
@@ -198,19 +207,38 @@ def _toolchain_grant_for(persona: str, executor: str) -> Mapping[str, object] | 
         toolchain_kind = permgen.DependencyKind.TOOLCHAIN_PROGRAM
         if not any(tool.name == executor for tool in permgen.EXECUTOR_TOOLS):
             return None
-        if not any(
-            dependency.name == executor
-            and dependency.kind is toolchain_kind
-            and principal in dependency.principals
-            for dependency in permgen.RUN_EXTERNAL_DEPENDENCIES
-        ):
+        account = permgen.DEFAULT_SCHEME.resolve(principal)
+        if account is None:
             return None
-    except (AttributeError, ImportError):
+        toolchain_asset = permgen.registry.asset_by_id("executor-toolchain")
+        reader_accounts = {
+            reader_account
+            for reader in toolchain_asset.readers
+            if (reader_account := permgen.DEFAULT_SCHEME.resolve(reader)) is not None
+        }
+        if account not in reader_accounts:
+            return None
+        dependency_accounts = {
+            dependency_account
+            for dependency in permgen.RUN_EXTERNAL_DEPENDENCIES
+            if dependency.name == executor
+            and dependency.kind is toolchain_kind
+            and permgen.RunStage.MODEL_CALL in dependency.stages
+            for dependency_account in (
+                permgen.DEFAULT_SCHEME.resolve(dep_principal)
+                for dep_principal in dependency.principals
+            )
+            if dependency_account is not None
+        }
+        if account not in dependency_accounts:
+            return None
+    except (AttributeError, ImportError, KeyError):
         return None
     return {
         "principal": persona,
         "executor": executor,
         "asset_id": "executor-toolchain",
+        "account": account,
         "executable": True,
     }
 
@@ -874,7 +902,13 @@ def rank_candidates(
         ] = layer
         ranked.append((_LAYER_RANK[layer], demoted, index, identity))
     if overlay_contract_failure:
-        ranked = []
+        # An invalid explicit declaration must not silently fall through to a
+        # packaged identity.  Other valid identities in that same explicit
+        # layer remain eligible, so one stale declaration cannot discard a
+        # compatible operator-selected fallback.
+        ranked = [
+            row for row in ranked if row[0] == _LAYER_RANK[RESOLUTION_LAYER_OVERLAY]
+        ]
     ranked.sort(key=lambda row: (row[0], row[1], row[2]))
     ordered = tuple(row[3] for row in ranked)
     if ordered:
