@@ -122,6 +122,52 @@ def test_install_service_appends_workspace_and_backs_up_existing_config(
     assert env_file.read_bytes() != before_env
 
 
+def test_install_service_rejects_project_config_symlink_before_append(
+    tmp_path: Path,
+) -> None:
+    """A project-config symlink is rejected before migration can replace its leaf."""
+    from paulsha_cortex.deploy import installer
+
+    target = _init_git_repo(tmp_path / "repo" / "target")
+    other = _init_git_repo(tmp_path / "repo" / "other")
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    real_config = tmp_path / "operator-owned" / "project-cortex.yaml"
+    real_config.parent.mkdir()
+    real_config.write_text(
+        yaml.safe_dump(
+            {"workspaces": [{"name": "other", "path": str(other)}]},
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    project_config = config_root / "project-cortex.yaml"
+    project_config.symlink_to(real_config)
+    (config_root / "model-identities.yaml").write_text(
+        "schema_version: 3\nidentities: []\n", encoding="utf-8"
+    )
+    env_file = tmp_path / "instance.env"
+    env_file.write_text(f"PSC_PROJECT_CONFIG_ROOT={config_root}\n", encoding="utf-8")
+    before_real_config = real_config.read_bytes()
+    before_env = env_file.read_bytes()
+
+    with pytest.raises(ValueError, match="symlink") as exc_info:
+        installer._migrate_instance_config(
+            env_file=env_file,
+            existing={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+            config_root=config_root,
+            repo_root=target,
+            managed_env={"PSC_PROJECT_CONFIG_ROOT": str(config_root)},
+        )
+
+    assert str(project_config) in str(exc_info.value)
+    assert project_config.is_symlink()
+    assert real_config.read_bytes() == before_real_config
+    assert env_file.read_bytes() == before_env
+    assert not list(config_root.glob("*.bak-*"))
+    assert not (config_root / ".cortex-migration.lock").exists()
+
+
 def test_install_service_preserves_existing_non_exact_workspace_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -290,7 +336,8 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
         ),
         encoding="utf-8",
     )
-    (config_root / "model-identities.yaml").write_text(
+    identities = config_root / "model-identities.yaml"
+    identities.write_text(
         "schema_version: 3\nidentities: []\n", encoding="utf-8"
     )
     env_file = tmp_path / "instance.env"
@@ -318,7 +365,15 @@ def test_install_service_rollback_retains_backup_when_restore_fails(
     backups = sorted(config_root.glob("project-cortex.yaml.bak-*"))
     assert len(backups) == 1
     assert backups[0].read_bytes() == before_project
-    assert str(backups[0].resolve()) in str(exc_info.value)
+    message = str(exc_info.value)
+    assert (
+        f"{project_config.resolve()}=有備份:{backups[0].resolve()}" in message
+    )
+    for path in (env_file, identities):
+        assert (
+            f"{path.resolve()}=無備份；"
+            "pre-migration 內容只存在於記憶體中的 previous"
+        ) in message
     assert isinstance(exc_info.value.__cause__, OSError)
 
 
@@ -354,11 +409,68 @@ def test_install_service_rollback_reports_unbacked_paths_when_restore_fails(
         )
 
     message = str(exc_info.value)
-    assert "可能不一致" in message
+    assert "pre-migration 內容只存在於記憶體中的 previous" in message
     for path in (env_file, project_config, identities):
         assert str(path.resolve()) in message
     assert not list(config_root.glob("*.bak-*"))
     assert isinstance(exc_info.value.__cause__, OSError)
+
+
+def test_restore_file_replaces_atomically_and_preserves_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from paulsha_cortex.deploy import installer
+
+    path = tmp_path / "runtime.env"
+    path.write_bytes(b"before\n")
+    path.chmod(0o640)
+    replacements: list[tuple[Path, Path]] = []
+    real_replace = installer.os.replace
+
+    def tracked_replace(source: Path, destination: Path) -> None:
+        replacements.append((Path(source), Path(destination)))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(installer.os, "replace", tracked_replace)
+
+    installer._restore_file(path, b"after\n")
+
+    assert path.read_bytes() == b"after\n"
+    assert path.stat().st_mode & 0o7777 == 0o640
+    assert len(replacements) == 1
+    source, destination = replacements[0]
+    assert source.parent == path.parent
+    assert source.name.startswith(f".{path.name}.restore-")
+    assert destination == path
+    assert not list(tmp_path.glob(f".{path.name}.restore-*"))
+
+
+@pytest.mark.parametrize(
+    "loader_error", [OSError("loader I/O"), ValueError("loader env")]
+)
+def test_load_project_config_payload_preserves_loader_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loader_error: Exception,
+) -> None:
+    from paulsha_cortex.deploy import installer
+    from paulsha_cortex.monitor import config as monitor_config
+
+    config_path = tmp_path / "project-cortex.yaml"
+    config_path.write_text(
+        "workspaces:\n  - name: demo\n    path: /tmp/demo\n", encoding="utf-8"
+    )
+
+    def fail_load(*, config_path: Path):
+        raise loader_error
+
+    monkeypatch.setattr(monitor_config, "load_config", fail_load)
+
+    with pytest.raises(ValueError, match="project config 驗證失敗") as exc_info:
+        installer._load_project_config_payload(config_path)
+
+    assert str(loader_error) in str(exc_info.value)
+    assert exc_info.value.__cause__ is loader_error
 
 
 def test_install_service_rejects_agents_root_from_different_home(

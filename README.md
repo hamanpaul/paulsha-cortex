@@ -99,8 +99,11 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    `project-cortex.yaml.bak-<UTC timestamp>`；這是刻意保留的復原素材（spec 要求），
    operator 可自行依需要清理舊備份。config root 會有一個 `.cortex-migration.lock`（0600）
    用於序列化併發安裝，屬常駐鎖檔，不需清除。沒有任何程式會 glob config root，殘留檔
-   不影響 monitor/doctor 讀取。
-   既有設定若是 symlink 的情境另案處理；本段 append-only 說明只涵蓋一般檔案。
+   不影響 monitor/doctor 讀取；若 rollback restore 失敗，錯誤會逐一列出各檔案自己的
+   backup 或明示沒有 backup（原始內容只留在記憶體中的 `previous`）。既有
+   `project-cortex.yaml` 若是 symlink，installer
+   會在 append/replace 前 fail-closed，明確指出該路徑並保留 symlink 與其 target 不變；
+   請先改為一般檔案後再重試。本段 append-only 說明只涵蓋一般檔案。
 
 2. 啟動 manager 並分別檢查 service/runtime 狀態：
 

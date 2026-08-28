@@ -280,7 +280,12 @@ def _reject_foreign_default_agents_root(
 
 
 def _load_project_config_payload(config_path: Path) -> dict[str, object] | None:
-    """Return a validated project config, or ``None`` for a missing/invalid file."""
+    """Return a validated project config, or ``None`` for a missing/syntax-invalid file.
+
+    A loader failure is not the same as an invalid project document.  Preserve
+    that distinction so operators can see the underlying environment/config
+    error instead of being told to move a potentially valid file.
+    """
     if not config_path.is_file():
         return None
     try:
@@ -295,8 +300,10 @@ def _load_project_config_payload(config_path: Path) -> dict[str, object] | None:
         from paulsha_cortex.monitor.config import load_config
 
         load_config(config_path=config_path)
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"project config 驗證失敗：{config_path}；原因：{exc}"
+        ) from exc
     return dict(payload)
 
 
@@ -356,7 +363,24 @@ def _restore_file(path: Path, previous: bytes | None) -> None:
     if previous is None:
         path.unlink(missing_ok=True)
         return
-    path.write_bytes(previous)
+    mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.restore-",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(previous)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary_path.unlink(missing_ok=True)
 
 
 def _prepare_migration_inputs(*, config_root: Path, repo_root: Path) -> _MigrationInputs:
@@ -380,6 +404,11 @@ def _prepare_migration_inputs(*, config_root: Path, repo_root: Path) -> _Migrati
         ) from identity_error
 
     existing_project = project_config.is_file() or project_config.is_symlink()
+    if project_config.is_symlink():
+        raise ValueError(
+            f"既有 project config 為 symlink，拒絕 append/replace：{project_config}；"
+            "請改為一般檔案後再重試"
+        )
     project_payload = _load_project_config_payload(project_config)
     if project_payload is None:
         if project_config.is_symlink() or project_config.exists():
@@ -506,7 +535,7 @@ def _migrate_instance_config_locked(
         project_config: project_config.read_bytes() if project_config.is_file() else None,
         identities: identities.read_bytes() if identities.is_file() else None,
     }
-    created_backups: list[Path] = []
+    backup_paths: dict[Path, Path] = {}
     staging = Path(tempfile.mkdtemp(prefix=".cortex-migration-", dir=config_root))
     try:
         if project_needs_update:
@@ -523,7 +552,7 @@ def _migrate_instance_config_locked(
             load_model_identities(staging, use_packaged_default=False)
         if project_needs_update:
             if existing_project:
-                created_backups.append(_backup_file(project_config))
+                backup_paths[project_config] = _backup_file(project_config)
                 shutil.copymode(project_config, staged_project)
             os.replace(staged_project, project_config)
         if identities_need_update:
@@ -536,35 +565,33 @@ def _migrate_instance_config_locked(
     except Exception:
         restore_ok = False
         try:
-            _restore_file(env_file, previous[env_file])
-            _restore_file(project_config, previous[project_config])
-            _restore_file(identities, previous[identities])
+            for path, previous_content in previous.items():
+                _restore_file(path, previous_content)
         except Exception as exc:
-            if created_backups:
-                paths = ", ".join(str(path.resolve()) for path in created_backups)
-                message = (
-                    "migration rollback 失敗，pre-migration 內容保留於 "
-                    f"{paths}"
-                )
-            else:
-                paths = ", ".join(
-                    f"{label}={path.resolve()}"
-                    for label, path in (
-                        ("env_file", env_file),
-                        ("project_config", project_config),
-                        ("identities", identities),
+            risky_paths = []
+            for path in previous:
+                backup = backup_paths.get(path)
+                if backup is None:
+                    risky_paths.append(
+                        f"{path.resolve()}=無備份；"
+                        "pre-migration 內容只存在於記憶體中的 previous"
                     )
-                )
-                message = (
-                    "migration rollback 失敗，未取得備份；以下檔案可能不一致："
-                    f"{paths}"
-                )
+                else:
+                    risky_paths.append(
+                        f"{path.resolve()}=有備份:{backup.resolve()}"
+                    )
+            has_unbacked_paths = any(path not in backup_paths for path in previous)
+            if has_unbacked_paths:
+                prefix = "migration rollback 失敗，未取得備份的檔案與既有備份逐一列出："
+            else:
+                prefix = "migration rollback 失敗，各檔案備份逐一列出："
+            message = f"{prefix}{', '.join(risky_paths)}；restore error: {exc}"
             raise ValueError(message) from exc
         else:
             restore_ok = True
         finally:
             if restore_ok:
-                for backup in created_backups:
+                for backup in backup_paths.values():
                     try:
                         backup.unlink(missing_ok=True)
                     except OSError as exc:

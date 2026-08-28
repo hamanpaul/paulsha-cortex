@@ -16,8 +16,10 @@ work_item: installer-shared-config-guard
 - [x] 修復 migration restore 失敗時的備份路徑診斷，並以 `restore_ok` 控制成功後的備份清理；archive／merge／issue closure 仍由 Manager 處理。
 - [x] 修復 review #7 的無備份 rollback 診斷與 umask 下的備份 mode 保留，並補 0600／0644 與無備份情境 regression tests；本卡僅完成 pre-archive 修正，archive／merge／issue closure 仍由 Manager 處理。
 - [x] 修復 review #8 的備份清理 `OSError` 例外遮蔽，改以 warning 記錄並保留原始 migration 例外，補 rollback cleanup regression test；本卡僅完成 pre-archive 修正，archive／merge／issue closure 仍由 Manager 處理。
+- [x] 修復 retry acceptance review 的逐檔 rollback 診斷、原子 restore 與來源 mode 保留、loader 原始例外保留；補對應 regression tests，並避免區域變數遮蔽 `paths` 模組 import；本卡僅完成 pre-archive 修正，archive／merge／issue closure 仍由 Manager 處理。
 - [x] operator 核可的範圍內偏差：porcelain/service.py 的 stderr 轉送與 --agents-root 提示雖超出 frozen todo 的 Boundary（原限於 deploy/installer.py 及其測試），但屬新 fail-loud 路徑的直接必要後果（porcelain 未提供 --agents-root 旗標，錯誤訊息需可操作），經 operator 於 2026-08-28 核可。
 - [x] 補充 README 的 migration 備份與常駐鎖檔保留策略，並說明殘留檔不影響 monitor/doctor 讀取；本卡僅完成 pre-archive 文件修正，archive／merge／issue closure 仍由 Manager 處理。
 - [x] `tests/conftest.py` session fixture 隔離 `PSC_AGENTS_ROOT`／`PSC_PROJECT_CONFIG_ROOT`。
 - [x] 既有 installer 測試回歸綠；補 `changelog.d/` 碎片與 README「install service 對既有 config 只 append」說明。
 - [x] focused／full gates；完成 pre-archive Candidate 準備，後續 evidence canonicalization、archive 與 merge 由 Manager 處理。
+- [x] 修復既有 `project-cortex.yaml` symlink 的 append/replace 風險：在 mutation 前 fail-loud 並指出路徑，補 regression test 與 README 說明；本卡仍僅完成 pre-archive 修正，archive／merge／issue closure 由 Manager 處理。
