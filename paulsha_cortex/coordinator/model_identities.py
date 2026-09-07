@@ -1074,6 +1074,7 @@ def probe_agy_capability(
         log_dir=".",
         model=cli_model_token,
         read_only=True,
+        json_envelope=False,
     )
     try:
         smoke_raw = process_runner(argv, **common)

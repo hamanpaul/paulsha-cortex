@@ -381,3 +381,24 @@ def test_agy_commit_required_launcher_emits_real_scoped_git_dirs(monkeypatch, tm
     ]
     assert add_dirs == [str(tmp_path.resolve()), *git_write_dirs]
     assert "--sandbox" not in inner_argv
+
+
+def test_build_agy_argv_json_envelope_opt_out_keeps_probe_shape() -> None:
+    """#670 probe 契約：``json_envelope=False`` 時不得帶 ``--output-format``；預設仍帶 json。"""
+    probe = build_agy_argv(
+        prompt="p",
+        slice_id="cortex-capability-probe",
+        log_dir=".",
+        model="gemini-3.1-pro-high",
+        read_only=True,
+        json_envelope=False,
+    )
+    assert "--output-format" not in probe
+    default = build_agy_argv(
+        prompt="p",
+        slice_id="cortex-capability-probe",
+        log_dir=".",
+        model="gemini-3.1-pro-high",
+        read_only=True,
+    )
+    assert default[default.index("--output-format") + 1] == "json"
