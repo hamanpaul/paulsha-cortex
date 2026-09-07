@@ -187,8 +187,8 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 | 批次 | 狀態 | 證據／下一動作 |
 |---|---|---|
 | B0 | complete | #832 規劃／進件已合併；review、PR-context preflight、CI通過，原稿及其他工作所有權保留。不是產品修正完成。 |
-| B1 | in-progress | #822 RED/GREEN已採信，verify因terminal schema拒收，等待合格reviewer重試；未review/merge/installed。#831為6/Yellow、#830為8/Red；#819/#825/#827 accepted intake均仍Red，#833未實作。 |
-| B2 | pending | PatchMUD #37已開；Cortex #835 profile與#842 qualification分工明確，契約待拆分／派工。 |
+| B1 | in-progress | #822 b448ce84 已採信 verify，review 因 Claude quota 等待，未 merge/installed；#831 RED 已採信，GREEN timeout checkpoint 尚未提交。#830/#819/#825/#827 仍依實際 runtime Red；#850 store child 已登錄但不可派，#833 未實作。 |
+| B2 | planning-in-progress | PatchMUD #37已開；#849 schema-key child 經審查並登錄，現行7/Red；#835其餘接線與#842 qualification尚待拆分／派工。產品仍未交付。 |
 | B3 | pending | 觀測與預估先 shadow。 |
 | B4 | pending | 資格、預估與所有權契約先過，再有限啟用動態路由。 |
 | B5 | pending | #828 獨立處理；其餘狀態／部署待分拆。 |
@@ -246,6 +246,8 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 | production stage reuse | #844，#214 successor；先限同run/claim-era安全cohort，跨run新採信未支援，不倒退既有candidate保留政策。 |
 | requirement delivery accounting | #845；消費CompletionRecord與#841證據，不重建ship引擎、不代替#808/#810勾完成。 |
 | self-publication authority stability | #847；可信 frozen 自身同內容發布的 metadata 等價，不清 needs_human 或重開 gates；真需求變更仍走既有合法 restart。 |
+| schema/key pure core | #849，#835 child；精確 typed wire／canonical key、三層 profile 與 bounded input。現行7/Red，#831後5僅投影；不授予資格、不做母件 routing/migration。 |
+| backoff store/event fold | #850，#825 child A；有界 fresh store、flock/atomic replace/durability、immutable event fold與ack。現行8/Red，#831後6僅投影；C/D provenance/reconciliation与production lanes仍另交付。 |
 
 #835–#842的查重與read-back見[動態issue對照](../../../reports/review/refine-dynamic-issues-20260907.md)；
 #843–#845各票保存不可變source與10/12/12項AC，root已全文讀回。所有新scope都尚未
@@ -274,6 +276,28 @@ PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需
   不變，但自身 plan source 晚加入 authority 後觸發了 restart；精確 Monitor 納入時間與
   單次 writer 身分未證實。不以 bytes 相同就授予豁免，仍須 exact run/era、owner、受治理
   發布 provenance 與其他 authority 不變；#843/#844 不代替這項產品修正。
+
+### 有界 child 與現場進度核對（2026-09-07 13:27 UTC）
+
+- #849／#850 已建立並全文讀回，本批登錄兩組 child 三件組與獨立報告；首輪 MAJOR、
+  R2 及 fresh-reader 歧義已處置，fresh compact R3 為 PASS。Root 重驗 schema 兩個
+  canonical golden、兩組 completeness／真 sizing／Tasks 負控制；產品 AC 全部未勾。
+- 兩組不是 #833 自動拆分證據。未載入 #831 前維持 7/8 Red；其 5/6 Yellow 僅為
+  設計情境投影，不先改 frozen run、現行 scoring 或 capability registry。
+- #822 的單引號 escape 修補 8073d1d2 及文件同步 b448ce84 已由 Cortex 提交；
+  root 在 b448ce84 的隔離 checkout 真跑 5663 passed、44 skipped、173 subtests，
+  214.35 秒、exit 0；verification53 已採信。review55/57/58 撞 Claude 五小時池，
+  最新 rejected utilization=1.04，reset 14:50 UTC。未 review／archive／merge／installed。
+- #831 RED c62df773 已採信；AGY GREEN52/54/56 五分鐘 timeout，沒有提交／合法
+  JSON terminal，保留原工作。56 checkpoint 的 Manager 全套 gate 通過、root 集中
+  51 passed，均不替代新 candidate evidence。正式重試先被 stale GitHub authority 擋下。
+- Monitor 13:27 UTC temporary user-service recovery 前為 5157 threads、GitHub stale；
+  不重啟 Manager、不清原 run/evidence。這是 #827 待修的現場證據，不是有界性驗收。
+- #824 launcher-only timeout 規劃另發現 optional AGY probe 的 argv ValueError 可穿透
+  並阻擋已可用的非 AGY primary。新增 probe-construction containment 前置正在獨立
+  審查，timeout-only 保持 blocked-dependency，兩者未登錄／dispatch。本批不混入未通過文件。
+- #827 watcher child 已收斂 controlled polling 候選並送 fresh R3；延遲、短命事件、
+  last-good snapshot recovery 與 CI watchdog 依賴均需真測試，仍未登錄／dispatch。
 
 ### Canary sizing 校正紀錄
 

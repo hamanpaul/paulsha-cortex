@@ -906,3 +906,27 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/execution-profile-contract/todo.md'
     excludes: []
+  execution-profile-schema-core:
+    title: 'execution-profile-schema-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#849'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-schema-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-schema-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/execution-profile-schema-core/todo.md'
+    excludes: []
+  executor-backoff-store-core:
+    title: 'executor-backoff-store-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#850'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-store-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-store-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-backoff-store-core/todo.md'
+    excludes: []
