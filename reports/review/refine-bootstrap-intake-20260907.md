@@ -5,7 +5,7 @@ Runtime 與 issue 查證：2026-09-07 08:38 UTC；報告整理及檔案檢查隨
 ## 產物與邊界
 
 隔離分支 `feature/refine-bootstrap-intake-20260907`，基底 `79ba644780bf1c697c722ac24a297e7d02416100`。
-僅新增以下六件 accepted 規劃材料與本報告；未 commit/push、開 issue、改 code/tests、註冊 `.cortex` links、改其他 worktree、registry 或服務。
+隔離查證當下僅新增以下六件 accepted 規劃材料與本報告，尚未 commit/push，亦未開 issue、改 code/tests、註冊 `.cortex` links、改其他 worktree、registry 或服務；後續 root 整合與提交另列於本報告末節。
 
 - #831：`docs/superpowers/specs/sizing-stability-direction-{spec,design}.md`、`docs/superpowers/workstreams/sizing-stability-direction/todo.md`。
 - #830：`docs/superpowers/specs/dispatch-decision-contract-{spec,design}.md`、`docs/superpowers/workstreams/dispatch-decision-contract/todo.md`。
