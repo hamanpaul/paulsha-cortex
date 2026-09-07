@@ -13,6 +13,12 @@ Monitor 對每個 repo/work item 只公開 `topic`、`todo`、`on-going`、`done
 
 Provider 失敗時會保留 last-good snapshot 並標 `degraded`。GitHub provider 超過 900 秒沒有成功 snapshot 時，auto claim 與 merge 都會 fail-closed。
 
+### Planning capability probe boundary
+
+Planning runtime 建構時，AGY capability probe 的 `build_agy_argv(...)` 若拋出一般 `Exception`，只會把 AGY probe 降為 `smoke-failed`／`ready=false`；這個局部 containment 不會把建構錯誤升格成整個 runtime failure。只要非 AGY primary 的 probe 成功，production planning runtime 仍可完成建構並保留 primary。失敗的 AGY identity 不會被選為 ready secondary；這只說明 probe 邊界，並不保證一定存在合格的異質 secondary planner。
+
+這項邊界不涵蓋直接 launcher 的錯誤吞除：direct `SubprocessLauncher` 仍會讓無效 argv 設定向 caller 傳播，且在 argv 建構失敗後不啟動 Popen。真實非法 timeout env 的 direct／probe 雙路徑驗收仍屬後續 timeout child，不由本 child 冒稱完成。
+
 GitHub terminal closure scan 會以 authenticated default revision 的 Contents API 讀取 remote Todo，並重驗 path、blob SHA 與 base64 encoding；production 只對 canonical WorkflowRegistry 已連結的 PR 做 merge ancestry compare。只有 HTTP 502/503/504 會有限次 backoff retry，auth、rate-limit、其他 HTTP error、malformed JSON 或 identity mismatch 都立即保留 last-good 並標 degraded。
 
 ## Correlation authority

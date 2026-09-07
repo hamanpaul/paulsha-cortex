@@ -252,6 +252,21 @@ def test_agy_probe_contains_argv_builder_value_error_as_smoke_failure(
     assert builder_calls[0]["json_envelope"] is False
 
 
+@pytest.mark.parametrize("exception_type", (KeyboardInterrupt, SystemExit))
+@pytest.mark.parametrize("stage", ("models", "smoke"))
+def test_agy_probe_does_not_swallow_base_exceptions(exception_type, stage) -> None:
+    """#851 R5：cancellation/system-exit 不得被 Exception 邊界吞掉。"""
+
+    def runner(argv, **kwargs):
+        del kwargs
+        if stage == "models" or argv != ["agy", "models"]:
+            raise exception_type("stop-probe")
+        return _completed(stdout=f"{AGY_MODEL_ID}\n")
+
+    with pytest.raises(exception_type):
+        probe_agy_capability(runner=runner)
+
+
 @pytest.mark.parametrize(
     ("model_stdout", "smoke_result", "reason"),
     [
