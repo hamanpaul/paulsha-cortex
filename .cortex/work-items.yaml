@@ -737,7 +737,11 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#665'
       - kind: path
         ref: 'docs/superpowers/workstreams/trust-root-executor-hardening/todo.md'
-    excludes: []
+    excludes:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#692'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#763'
   trust-root-copilot-toolchain-pinning:
     title: 'trust-root-copilot-toolchain-pinning'
     links:
@@ -779,4 +783,66 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#792'
       - kind: openspec
         ref: 'manager-gitconfig-delivery'
+    excludes: []
+  daemon-tick-clock-not-idle:
+    title: 'daemon-tick-clock-not-idle'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#819'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/daemon-tick-clock-not-idle/todo.md'
+    excludes: []
+  registry-persist-hygiene:
+    title: 'registry-persist-hygiene'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#821'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/registry-persist-hygiene/todo.md'
+    excludes: []
+  executor-durable-backoff:
+    title: 'executor-durable-backoff'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#825'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-durable-backoff/todo.md'
+    excludes: []
+  outcome-taxonomy-signals:
+    title: 'outcome-taxonomy-signals'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#826'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/outcome-taxonomy-signals/todo.md'
+    excludes: []
+  yaml-inline-list-quotes:
+    title: 'yaml-inline-list-quotes'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#822'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/yaml-inline-list-quotes/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/yaml-inline-list-quotes-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/yaml-inline-list-quotes-design.md'
+    excludes: []
+  launcher-session-and-timeout:
+    title: 'launcher-session-and-timeout'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#823'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#824'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/launcher-session-and-timeout/todo.md'
+    excludes: []
+  monitor-refresh-thread-backlog:
+    title: 'monitor-refresh-thread-backlog'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#827'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-refresh-thread-backlog/todo.md'
     excludes: []

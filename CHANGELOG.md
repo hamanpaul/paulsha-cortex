@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **十四類 Cortex 精修進件（#829）**：收斂完整分批計畫、OpenSpec 驗收契約、動態
+  execution profile／額度觀測與預估／fallback 邊界；PatchMUD producer 由獨立 #37
+  列管。補齊 P1 canonical todo 與 #496／#497 校正，保留 #828 獨立工作所有權。
+  此項只交付規劃與進件，不宣稱產品修正、測試或部署完成。
+
 - **#807 agy headless terminal 改走 JSON envelope 並剝除前導文字**：`build_agy_argv` 對
   planner／reviewer／verifier／builder 所有 agy headless 形態一律附加 `--output-format json`，
   讓 terminal 證據落成單行 JSON envelope；Manager `_extract_terminal_json` 與
