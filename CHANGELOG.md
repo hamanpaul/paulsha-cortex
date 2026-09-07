@@ -7,6 +7,9 @@
 
 ## [Unreleased]
 
+- **#823 headless launcher session**：共用 headless `Popen` kwargs 現在建立獨立
+  session/process group，保留 Claude stdin 與既有 runner override/retry 契約。
+
 - **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
   登錄 #853 有界 watcher A child。真 process-group 與 cgroup 邊界、raw0／generation／
   partial-scan／nonfollow 驗收完整列管；現行 sizing 6／8 與正式產品交付分開。

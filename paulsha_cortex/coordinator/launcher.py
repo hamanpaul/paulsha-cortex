@@ -1347,6 +1347,30 @@ _ARGV_BUILDERS = {
 }
 
 
+def build_headless_popen_kwargs(
+    *,
+    cwd: str | None,
+    env: Mapping[str, str],
+    executor: str,
+) -> dict[str, object]:
+    """Build the common spawn kwargs for every headless executor.
+
+    The launcher owns the process-group boundary.  Runner-specific callers may
+    override stdin, cwd, or env after this helper returns, but every Popen
+    attempt starts from the same isolated-session contract.
+    """
+
+    kwargs: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stderr": subprocess.STDOUT,
+        "start_new_session": True,
+    }
+    if executor == "claude":
+        kwargs["stdin"] = subprocess.PIPE
+    return kwargs
+
+
 class SubprocessLauncher:
     """真實作：headless subprocess 啟動。測試 MUST 注入 fake，不實體化。"""
 
@@ -2083,13 +2107,11 @@ class SubprocessLauncher:
         # 白名單 env 建立完成之後重新 source ~/.profile，把 env 約束整個覆寫掉。
         # direct 模式的 builder 維持 `-lc` 不動——那是既有行為，本票不改。
         argv = ["bash", "-c" if (self._review_only or degraded) else "-lc", script]
-        popen_kwargs: dict[str, object] = {
-            "cwd": worktree,
-            "env": env,
-            "stderr": subprocess.STDOUT,
-        }
-        if self._executor == "claude":
-            popen_kwargs["stdin"] = subprocess.PIPE
+        popen_kwargs = build_headless_popen_kwargs(
+            cwd=worktree,
+            env=env,
+            executor=self._executor,
+        )
         if runner_plan is not None:
             argv = job_runner.build_systemd_run_argv(
                 systemd_run=runner_plan.binary,

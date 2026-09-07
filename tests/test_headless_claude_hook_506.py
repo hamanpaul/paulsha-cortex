@@ -532,7 +532,7 @@ def test_the_launcher_marks_the_job_environment() -> None:
     class _FakeProc:
         pid = 4242
 
-    def _fake_popen(argv, *, cwd, env, stdout, stderr):
+    def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
         calls.append({"argv": argv, "env": env})
         return _FakeProc()
 
@@ -563,7 +563,7 @@ def test_the_preflight_environment_matches_the_job_environment() -> None:
     class _FakeProc:
         pid = 1
 
-    def _fake_popen(argv, *, cwd, env, stdout, stderr):
+    def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
         calls.append({"env": env})
         return _FakeProc()
 
@@ -691,7 +691,7 @@ def test_end_to_end_from_launcher_injection_to_a_consumable_event(
     class _FakeProc:
         pid = 99
 
-    def _fake_popen(argv, *, cwd, env, stdout, stderr):
+    def _fake_popen(argv, *, cwd, env, stdout, stderr, start_new_session):
         calls.append({"argv": argv, "env": env})
         return _FakeProc()
 
