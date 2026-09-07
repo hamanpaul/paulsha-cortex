@@ -791,6 +791,10 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#819'
       - kind: path
         ref: 'docs/superpowers/workstreams/daemon-tick-clock-not-idle/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/daemon-tick-clock-not-idle-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/daemon-tick-clock-not-idle-design.md'
     excludes: []
   registry-persist-hygiene:
     title: 'registry-persist-hygiene'
@@ -807,6 +811,10 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#825'
       - kind: path
         ref: 'docs/superpowers/workstreams/executor-durable-backoff/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-durable-backoff-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-durable-backoff-design.md'
     excludes: []
   outcome-taxonomy-signals:
     title: 'outcome-taxonomy-signals'
@@ -845,6 +853,10 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#827'
       - kind: path
         ref: 'docs/superpowers/workstreams/monitor-refresh-thread-backlog/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-refresh-thread-backlog-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-refresh-thread-backlog-design.md'
     excludes: []
   sizing-stability-direction:
     title: 'sizing-stability-direction'

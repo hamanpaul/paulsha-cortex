@@ -20,11 +20,11 @@
 
 ## 3. B2 可擴充配置與資格
 
-- [ ] 3.1 為 R08/R09/R12 建立/重用精確 child work items；profile schema、原生 effort 與 registry 相容性先有 spec。
+- [ ] 3.1 為 R08/R09/R12 建立/重用精確 child work items；#835 profile schema、原生 effort 與 registry 相容性先有 spec，完整母範圍仍須真實分拆。
 - [ ] 3.2 實作 adapter capability descriptors 與 conformance；新虛構 model/effort 無 central product-name diff。
 - [ ] 3.3 實作 requested/resolved/observed profile 與可追溯 effective argv/config；unsupported pre-spawn fail-closed。
 - [ ] 3.4 實作 PatchMUD versioned report consumer、legacy migration 與 profile/cohort/role/coverage 驗證。
-- [ ] 3.5 實作 qualification candidate→review receipt→approved roster 發布鏈；保留 operator 核可與 independence policy。
+- [ ] 3.5 由 #842 實作 qualification candidate→review receipt→approved roster 發布鏈；保留 operator 核可與 independence policy，不擴 #581 原scope。
 - [ ] 3.6 實作安全 model register/probe 操作面與 TTL、角色擴充契約；探活不暗中消耗無上限額度。
 - [ ] 3.7 定義 pool/account 非機敏 identity、instance authority 與所有權邊界，為共享 admission 建 fixture。
 
@@ -32,30 +32,31 @@
 
 - [ ] 4.1 完成 #826 failure 原始訊號→持久化→消費端分類，保留 runtime-contract 硬阻擋。
 - [ ] 4.2 整合 usage provenance：observed/estimated/unknown、增量/累計、input/cache/reasoning 不重複加總。
-- [ ] 4.3 核對各 provider 真正可用的 quota observation 介面，實作帶來源/TTL/window/unit 的 adapters 與 unknown fallback。
+- [ ] 4.3 由 #836 核對各 provider 真正可用的 quota observation 介面，實作帶來源/TTL/window/unit 的 adapters 與 unknown fallback。
 - [ ] 4.4 實作與 benchmark 分開的 operational track record，涵蓋失敗消耗、duration 及任務分布。
-- [ ] 4.5 實作 task/profile 用量 forecast 與冷啟動先驗、風險區間、版本與資料期間。
+- [ ] 4.5 由 #837 實作 task/profile 用量 forecast 與冷啟動先驗、風險區間、版本與資料期間。
 - [ ] 4.6 以 shadow 流程取得觀測覆蓋率、預估誤差與 confidence baseline；據此核定有限啟用門檻。
 
 ## 5. B4 動態派工與恢復
 
-- [ ] 5.1 完成 qualified feasible candidate selection，維持 explicit pin、permissions、role、independence 硬條件。
-- [ ] 5.2 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試。
+- [ ] 5.1 由 #839 完成 qualified feasible candidate selection，維持 explicit pin、permissions、role、independence 硬條件。
+- [ ] 5.2 由 #838 完成多池/多時間窗原子 reservation 與同主機多 instance contention 測試。
 - [ ] 5.3 完成 consumption reconciliation、crash/restart uncertain liveness 與 lease 不誤釋放。
 - [ ] 5.4 完成 card/attempt 安全邊界的 fallback、supersession 與 artifact preservation；同耗盡 pool 不可繞過。
-- [ ] 5.5 補 R07 recovery matrix 與 exact-run/card CAS、late evidence、重送冪等、abandon owner-aware 資源處置。
+- [ ] 5.5 由 #843 補 R07 recovery matrix 與 exact-run/card CAS、late evidence、重送冪等、abandon owner-aware 資源處置；#497/#547/#577等原producer缺陷仍須修正。
 - [ ] 5.6 通過計畫 12 個 quota/profile 場景，再有限 opt-in canary；保留 legacy policy 回復路徑與 receipts。
+- [ ] 5.7 由 #844 完成 production stage reuse 的同run/claim-era安全cohort與可信採信；跨run新採信未支援需列管，不能以相同key改寫舊evidence。
 
 ## 6. B5 狀態與部署
 
-- [ ] 6.1 核對 #828 獨立 producer 交付；補 actual/planned/last、facets、quota wait 與 selection receipts 的 status 一致性。
-- [ ] 6.2 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
+- [ ] 6.1 核對 #828 獨立 producer 交付；由 #840 補 actual/planned/last、facets、quota wait 與 selection receipts 的 status 一致性，不接管原producer。
+- [ ] 6.2 由 #841 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
 - [ ] 6.3 完成 installer/doctor instance roots、writer ownership 與 owner-aware stop/cleanup 的契約驗收。
 - [ ] 6.4 取得 upgrade/restart/rollback 對 active jobs 的實際 receipts；未重載程序不得標已部署。
 - [ ] 6.5 PatchMUD #37 producer 交付後，以真實 report→approval→dispatch 驗跨 repo 接線；外部依賴未交付則保持未完成。
 
 ## 7. B6 整體閉環
 
-- [ ] 7.1 對全部 R01–R14 逐列核對 spec、work/run、測試、獨立 review、merge revision 與 runtime/installed evidence。
+- [ ] 7.1 以 #845 requirement delivery accounting 對全部 R01–R14 逐列核對 spec、work/run、測試、獨立 review、merge revision 與 runtime/installed evidence；索引建好不代表每條需求已交付。
 - [ ] 7.2 逐 issue 重驗已修、取代與殘餘分類，補 closing/cross-reference；不依歷史清單批次猜測關閉。
 - [ ] 7.3 完成 release/changelog/install 一致性與 plan ledger；全部必要驗收完成後才 archive 本 umbrella。

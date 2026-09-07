@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Refine P1 runtime 進件**：補 #819/#825/#827 accepted spec/design、保留全部
+  原驗收並列真實 Red sizing／人工拆分；補限流事件亂序、寫入故障與到期去重負例。
+  將 #835–#845 的 profile、quota、資格、recovery 與交付責任納入總帳；
+  此項為規劃交付，不代表任何產品修正或 runtime gate 已完成。
+
 - **Refine bootstrap 進件**：補 #831 stability 風險方向與 #830 非 Job 派工決策的
   accepted 三件組、真實 sizing 與純 gate 驗證；#833 獨立列管 Red planner 接續。
   記錄 #832 規劃合併及 B2–B5 既有能力／待補 child 對照，不宣稱產品修正已交付。
