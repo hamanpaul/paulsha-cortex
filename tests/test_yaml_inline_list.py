@@ -18,6 +18,7 @@ from paulsha_cortex.deck.compile import _format_inline_list, _format_scalar
         ('["a]b"]', ["a]b"]),
         ("['a, b', plain]", ["a, b", "plain"]),
         (r'["say \"hi, there\"", done]', ['say "hi, there"', "done"]),
+        (r"['it\'s, okay', plain]", ["it's, okay", "plain"]),
         ('["a",]', ["a"]),
         ('[""]', [""]),
         ("[]", []),

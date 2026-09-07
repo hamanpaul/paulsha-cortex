@@ -17,7 +17,7 @@ def _tokenize_inline_list(inner: str) -> list[str]:
         char = inner[index]
         if quote is not None:
             token.append(char)
-            if quote == '"' and char == "\\":
+            if char == "\\":
                 index += 1
                 if index < len(inner):
                     token.append(inner[index])
