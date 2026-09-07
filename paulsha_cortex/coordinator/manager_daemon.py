@@ -273,12 +273,16 @@ def _in_flight_status(
             ).to_dict()
         except Exception:  # noqa: BLE001 - 呈現面不得因曝光計算失敗而讓 status 死掉
             git_base = None
+        execution_identity = manager._job_execution_identity(
+            job, identity_source="in-flight"
+        )
         in_flight.append(
             {
                 "job_id": job.get("job_id"),
                 "slice_id": job.get("task"),
                 "state": status,
                 "candidate_git_base": git_base,
+                **execution_identity,
             }
         )
     return in_flight
@@ -436,6 +440,14 @@ def build_runtime_status_provider(
                         "job_id": payload.get("job_id"),
                         "branch": payload.get("branch"),
                         "repo": _repo_from_manifest(payload),
+                        **manager._manifest_execution_identity(
+                            registry,
+                            job_id=payload.get("job_id"),
+                            workflow_run_id=payload.get("workflow_run_id"),
+                            workflow_repo=_repo_from_manifest(payload),
+                            workflow_card=payload.get("workflow_card"),
+                            workflow_phase=payload.get("workflow_phase"),
+                        ),
                     },
                 )
             )

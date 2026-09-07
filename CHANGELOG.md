@@ -9,6 +9,8 @@
 
 - **#828 RED：** 新增 workflow status execution-identity regression coverage，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影；本卡交付 failing tests，producer 修正留待後續卡片。
 
+- **#828 producer GREEN：** workflow `in_flight`、`attention` 與 `recent_done` 現在從明確的 registry job run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；無 job 時保留 planned 或 unknown，不從 phase／persona 推測實際模型。
+
 - **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
   與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
   真 process-death 測試契約。獨立審查通過，現行 sizing 仍為 7／8 Red，
