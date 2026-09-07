@@ -16,7 +16,8 @@
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
 - [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。
-  - [x] RED：在 `tests/test_model_identities.py` 以 local `build_agy_argv` alias fault injection 鎖定 plain `ValueError` 的 probe containment；未實作 source containment。
+  - [x] RED：在 `tests/test_model_identities.py` 以 local `build_agy_argv` alias fault injection 鎖定 plain `ValueError` 的 probe containment；當時未實作 source containment。
+  - [x] Source containment：將 `build_agy_argv(...)` 納入既有 AGY smoke `try`，保留 `Exception` 邊界與 `smoke-failed` 診斷；runtime／launcher／timeout 驗收仍待後續子項。
 - [ ] 2.7.2 #824 dependency 證據未滿前不登錄可 claim child／不開 auto label；解除後重新核對完整性、真 sizing、唯一 owner 與正式 freeze，不能依 custom frontmatter 自稱已鎖派工。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
 - [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
