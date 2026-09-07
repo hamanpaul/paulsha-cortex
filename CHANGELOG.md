@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Refine bootstrap 進件**：補 #831 stability 風險方向與 #830 非 Job 派工決策的
+  accepted 三件組、真實 sizing 與純 gate 驗證；#833 獨立列管 Red planner 接續。
+  記錄 #832 規劃合併及 B2–B5 既有能力／待補 child 對照，不宣稱產品修正已交付。
+
 - **十四類 Cortex 精修進件（#829）**：收斂完整分批計畫、OpenSpec 驗收契約、動態
   execution profile／額度觀測與預估／fallback 邊界；PatchMUD producer 由獨立 #37
   列管。補齊 P1 canonical todo 與 #496／#497 校正，保留 #828 獨立工作所有權。
