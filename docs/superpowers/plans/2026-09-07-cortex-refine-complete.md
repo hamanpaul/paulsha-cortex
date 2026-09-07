@@ -248,6 +248,7 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 | self-publication authority stability | #847；可信 frozen 自身同內容發布的 metadata 等價，不清 needs_human 或重開 gates；真需求變更仍走既有合法 restart。 |
 | schema/key pure core | #849，#835 child；精確 typed wire／canonical key、三層 profile 與 bounded input。現行7/Red，#831後5僅投影；不授予資格、不做母件 routing/migration。 |
 | backoff store/event fold | #850，#825 child A；有界 fresh store、flock/atomic replace/durability、immutable event fold與ack。現行8/Red，#831後6僅投影；C/D provenance/reconciliation与production lanes仍另交付。 |
+| AGY probe exception containment | #851，#824 前置；只將 model_identities.py 的 argv 建構納入既有 smoke try。真6Yellow、独立內容審查與 fresh reader通過，正式派工／產品未完成。 |
 
 #835–#842的查重與read-back見[動態issue對照](../../../reports/review/refine-dynamic-issues-20260907.md)；
 #843–#845各票保存不可變source與10/12/12項AC，root已全文讀回。所有新scope都尚未
@@ -298,6 +299,36 @@ PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需
   審查，timeout-only 保持 blocked-dependency，兩者未登錄／dispatch。本批不混入未通過文件。
 - #827 watcher child 已收斂 controlled polling 候選並送 fresh R3；延遲、短命事件、
   last-good snapshot recovery 與 CI watchdog 依賴均需真測試，仍未登錄／dispatch。
+
+### AGY dependency 與 recovery 核對（2026-09-07 13:51 UTC）
+
+- [PR #852](https://github.com/hamanpaul/paulsha-cortex/pull/852) 已合併
+  `984fce5b86604aa71c6e8ecf82cc253a1441a106`；exact head `512688413e4c60480907a0076d12f0fdb80133bd`
+  全 preflight（tests176.89s）、四版pytest/build/installed smoke與遠端review gate通過。
+  這只交付 #849/#850 規劃；現行 Red、不曾產品派工，B1/B2 仍未完成。
+- #831 GREEN59 再遇AGY五分鐘 timeout，雖有8項dirty artifacts及Manager全套gate通過，
+  無 commit/JSON仍拒收。正式resume `20260907T133842Z-bcf9249f391245ca91bb8147e7932696`
+  採信失敗並保留 needs_human／RED c62df773；不再重複相同AGY路徑。
+- 原 run 不能經目前公開 recovery 原子換 builder+reviewer；只換Codex builder會撞到
+  Codex reviewer pin，首次reviewer job前失敗又不滿足retry-card terminal前提。
+  Root與獨立reviewer核對現行paths／純helper，具體缺口已補
+  [#839](https://github.com/hamanpaul/paulsha-cortex/issues/839#issuecomment-5571522109)／
+  [#843](https://github.com/hamanpaul/paulsha-cortex/issues/843#issuecomment-5571522360)。
+  不放寬pin／independence、不手改registry；Claude額度恢復後可只換builder，保留Codex reviewer。
+- 本批登錄 #851 containment：單production model_identities.py，真6Yellow；
+  timeout-only 的 #824 與 session 的 #823 分開，後者保留 canonical work_id。
+  #824 AC5/AC6／fullmatch與Go界線／#851依賴已由root正式修訂並全文讀回。
+- #824 自訂 dispatch_readiness／dependency_issues 不是79 runtime的canonical guard。
+  Root在Todo加入真Open Questions marker，completeness=false／blocking-decision；
+  原完整6分因舊反向stability成4分，surface-only Yellow helper仍ready且envelope bypass。
+  兩者都不能授權派工，也不偽造Red。incomplete start還可能啟動brainstorm，因此
+  本批只發布其候選文件、從母件移除 #824，**暫不登錄 timeout 可 claim owner**，
+  不啟用 `cortex:auto-on-going`、不start；目前兩issue均無此label、沒有相關既有run。
+  #851產品／預定base／loaded runtime證據具備後才正式解除、登錄與重新接受。
+- #824 parser另經root無憑證／無prompt／stdin EOF真跑AGY1.1.27五列：全部exit2；
+  abc/missing-unit/overflow與合法duration到unknown sentinel可區分。這不是模型或live gate。
+- #827 watcher修订fresh R4已PASS：failure latch與逐層nofollow契約處置兩MAJOR，
+  純memory/source證據不等dirfd/FD上界/OS/產品/CI；仍8Red且未派工。
 
 ### Canary sizing 校正紀錄
 

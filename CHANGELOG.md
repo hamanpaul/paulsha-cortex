@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **AGY 前置契約進件**：登錄 #851 probe argv 例外隔離，#824 timeout 拆為獨立候選，
+  保留 #823 session/cgroup 邊界。#824 依賴未完成，移除母件重複 owner 並暫不登錄
+  可 claim child；真 completeness 阻擋與 surface-only Yellow gate 分帳，不依自訂欄位假鎖派工。
+
 - **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
   與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
   真 process-death 測試契約。獨立審查通過，現行 sizing 仍為 7／8 Red，
