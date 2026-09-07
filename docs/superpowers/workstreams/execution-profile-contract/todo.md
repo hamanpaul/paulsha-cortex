@@ -4,7 +4,10 @@ work_item: execution-profile-contract
 domain_breadth: 2
 state_consistency: 2
 invariant_count: 10
-artifact_classes: [source, tests, documentation]
+artifact_classes:
+  - source
+  - tests
+  - documentation
 ---
 
 # Execution profile 契約 Todo
