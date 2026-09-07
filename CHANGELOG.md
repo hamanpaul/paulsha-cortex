@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **#828 RED：** 新增 workflow status execution-identity regression coverage，鎖定 registry job 綁定與 planned／actual／last execution 的可區分投影；本卡交付 failing tests，producer 修正留待後續卡片。
+
 - **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
   與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
   真 process-death 測試契約。獨立審查通過，現行 sizing 仍為 7／8 Red，
