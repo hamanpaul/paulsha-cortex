@@ -19,6 +19,7 @@
 - [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。
 - [ ] 2.7.2 #824 dependency 證據未滿前不登錄可 claim child／不開 auto label；解除後重新核對完整性、真 sizing、唯一 owner 與正式 freeze，不能依 custom frontmatter 自稱已鎖派工。
 - [ ] 2.7.3 依 #823 session-only 三件組完成共用 kwargs 真接線、兩個 Popen／stdin 窄重試、合法配置及既有拒絕、所有權驗證先於 group signal 的真 fixture 與候選 wheel 驗收；不擴成 cgroup/restart/cancel 實作。
+  - [x] RED：新增 `tests/test_coordinator_launcher_session.py`，鎖定 shared Popen kwargs 的 `start_new_session=True`、Claude stdin 保留，以及五個 executor 的 direct launch recording；production helper/接線仍待 GREEN card。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
 - [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
