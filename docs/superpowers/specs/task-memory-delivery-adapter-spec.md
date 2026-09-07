@@ -29,7 +29,7 @@ Adapter MUST 只消費 Hippo public candidate contract。每次最多 0–3 則 
 Adapter MUST 依 executor capability 選擇下列互斥結果：
 
 1. `context-delivered`：inline/context input 已提供；不得映射為 Read。
-2. `snapshot-delivered`：task-scoped、唯讀、受 manifest 綁定的內容快照。
+2. `snapshot-ready`：task-scoped、唯讀、受 manifest 綁定的 snapshot/materialized artifact 已 ready/offer；artifact 存在本身不代表內容已被取閱。
 3. `note-fetch`：工具只接受本 task manifest 內的 note id，不接受任意路徑。
 4. `ineligible` 或 `read-failed(reason)`：來源不在原任務允許範圍、能力缺失、送達失敗或權限拒絕。
 
@@ -37,7 +37,7 @@ Adapter MUST NOT 將整個 memory root 加入全域權限、使用 allow-all，�
 
 ### R4 Tool-neutral evidence
 
-Receipt MUST 能區分 `candidate-selected`、`offer-emitted`、`read-attempted`、`content-returned`、`context-delivered`、`read-failed(reason)` 與 `applied-with-evidence`，並帶 task/attempt/session/tool/project/note/hash/time 關聯。相同 attempt 的重試 MUST 冪等；worker 不直接寫中央 Hippo ledger。
+Receipt MUST 能區分 `candidate-selected`、`offer-emitted`、`read-attempted`、`content-returned`、`context-delivered`、`read-failed(reason)` 與 `applied-with-evidence`，並帶 task/attempt/session/tool/project/note/hash/time 關聯。`content-returned` 只有在實際 tool/provider 成功返回內容後才能產生；snapshot/materialized ready/offer 與檔案存在不可替代它。相同 attempt 的重試 MUST 冪等；worker 不直接寫中央 Hippo ledger。
 
 ### R5 KPI compatibility
 

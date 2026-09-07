@@ -13,7 +13,7 @@ Hippo #146 定義 `hippo/task-memory/v1` 的 task envelope、candidate 與工具
 
 ### D2 Delivery is an explicit capability matrix
 
-Adapter 先計算 `eligible`、允許 evidence sources 與 capability，再選擇 inline、task-scoped readonly snapshot 或 manifest-bound note-fetch。每次只允許一種 primary delivery mode，receipt 另記 fallback/拒絕原因。工具不可用不改成 arbitrary path；host permission denied 不改成 allow-all。
+Adapter 先計算 `eligible`、允許 evidence sources 與 capability，再選擇 inline、task-scoped readonly snapshot 或 manifest-bound note-fetch。每次只允許一種 primary delivery mode，receipt 另記 fallback/拒絕原因。`snapshot/materialized` 只代表 readonly manifest 已 ready/offer；只有實際 tool/provider 成功返回內容才可記 `content-returned`，不能把檔案已寫好當成取得成功。工具不可用不改成 arbitrary path；host permission denied 不改成 allow-all。
 
 ### D3 Evidence is append-only sidecar, not central ledger mutation
 
@@ -39,7 +39,8 @@ Work Item/WorkflowRun/card
   -> Hippo candidate request (public v1)
   -> capability matrix
        | inline -> context-delivered receipt
-       | snapshot -> readonly manifest + content-returned receipt
+       | snapshot -> readonly manifest/materialized ready + offer
+                    -> tool/provider content-returned receipt（成功返回內容才成立）
        | note-fetch -> manifest-bound tool call + return/failure receipt
        | ineligible/failure -> bounded reason receipt
   -> Cortex sidecar/single-writer projection

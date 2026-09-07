@@ -15,7 +15,7 @@ work_item: task-memory-delivery-adapter
 
 - [ ] 凍結 `hippo/task-memory/v1` envelope、0–3 candidate、manifest、delivery modes、receipt/event names 與 strict KPI separation；由 Hippo #146 的 public contract 驗證，不在 Cortex 複製第二份權威 schema。
 - [ ] 新增 Cortex adapter contract tests：Work Item/WorkflowRun/card → task envelope，缺 task id、跨 project、manifest/hash mismatch、unsupported major、ineligible source 均 fail closed。
-- [ ] 新增 receipt tests：inline/context-delivered、readonly snapshot/content-returned、manifest-bound note-fetch、permission denied/read-failed、applied-with-evidence 分流與 retry idempotency。
+- [ ] 新增 receipt tests：inline/context-delivered、readonly snapshot/materialized ready/offer、僅由 tool/provider 成功返回內容產生的 content-returned、manifest-bound note-fetch、permission denied/read-failed、applied-with-evidence 分流與 retry idempotency。
 - [ ] 先取得真正 RED（測試確實能抓到 adapter 未接線或錯誤分類），保存 bounded test evidence；不得以文件 checkbox 代替 RED。
 
 ## 3. Adapter implementation
