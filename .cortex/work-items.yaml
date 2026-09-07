@@ -853,8 +853,6 @@ work_items:
     links:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#823'
-      - kind: github_issue
-        ref: 'hamanpaul/paulsha-cortex#824'
       - kind: path
         ref: 'docs/superpowers/workstreams/launcher-session-and-timeout/todo.md'
     excludes: []
@@ -929,4 +927,16 @@ work_items:
         ref: 'docs/superpowers/specs/executor-backoff-store-core-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/executor-backoff-store-core/todo.md'
+    excludes: []
+  agy-probe-construction-containment:
+    title: 'agy-probe-construction-containment'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#851'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/agy-probe-construction-containment/todo.md'
     excludes: []
