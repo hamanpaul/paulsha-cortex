@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **#822：YAML inline list 保留引號元素**：zero-dependency YAML subset parser 現在以
+  quote-aware tokenizer 讀取 flow list，含逗號或 `]` 的 `argv` 元素、雙引號跳脫與尾逗號
+  可正確 round-trip；中間空元素與未閉合引號會以 `malformed inline list` 拒絕。
+
 - **#807 agy headless terminal 改走 JSON envelope 並剝除前導文字**：`build_agy_argv` 對
   planner／reviewer／verifier／builder 所有 agy headless 形態一律附加 `--output-format json`，
   讓 terminal 證據落成單行 JSON envelope；Manager `_extract_terminal_json` 與

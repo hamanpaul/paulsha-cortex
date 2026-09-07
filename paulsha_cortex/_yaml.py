@@ -7,6 +7,43 @@ class YAMLError(ValueError):
     """Subset YAML parser error for zero-dependency runtime paths."""
 
 
+def _tokenize_inline_list(inner: str) -> list[str]:
+    parts: list[str] = []
+    token: list[str] = []
+    quote: str | None = None
+    index = 0
+
+    while index < len(inner):
+        char = inner[index]
+        if quote is not None:
+            token.append(char)
+            if quote == '"' and char == "\\":
+                index += 1
+                if index < len(inner):
+                    token.append(inner[index])
+            elif char == quote:
+                quote = None
+        elif char in {'"', "'"} and not "".join(token).strip():
+            quote = char
+            token.append(char)
+        elif char == ",":
+            parts.append("".join(token).strip())
+            token.clear()
+        else:
+            token.append(char)
+        index += 1
+
+    if quote is not None:
+        raise YAMLError(f"malformed inline list: [{inner}]")
+
+    parts.append("".join(token).strip())
+    if parts[-1] == "":
+        parts.pop()
+    if not parts or any(not part for part in parts):
+        raise YAMLError(f"malformed inline list: [{inner}]")
+    return parts
+
+
 def _parse_scalar(raw: str):
     if raw in {"null", "Null", "NULL", "~"}:
         return None
@@ -20,7 +57,7 @@ def _parse_scalar(raw: str):
         inner = raw[1:-1].strip()
         if not inner:
             return []
-        return [_parse_scalar(part.strip()) for part in inner.split(",")]
+        return [_parse_scalar(part) for part in _tokenize_inline_list(inner)]
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         try:
             return ast.literal_eval(raw)
