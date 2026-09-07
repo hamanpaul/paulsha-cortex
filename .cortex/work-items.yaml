@@ -854,6 +854,10 @@ work_items:
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#823'
       - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-design.md'
+      - kind: path
         ref: 'docs/superpowers/workstreams/launcher-session-and-timeout/todo.md'
     excludes: []
   monitor-refresh-thread-backlog:
@@ -939,4 +943,16 @@ work_items:
         ref: 'docs/superpowers/specs/agy-probe-construction-containment-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/agy-probe-construction-containment/todo.md'
+    excludes: []
+  monitor-watcher-bounded:
+    title: 'monitor-watcher-bounded'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#853'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
     excludes: []
