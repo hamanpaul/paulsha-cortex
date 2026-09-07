@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
+  與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
+  真 process-death 測試契約。獨立審查通過，現行 sizing 仍為 7／8 Red，
+  不把規劃登錄、機械 gate 或 #831 投影當成產品／派工／資格完成。
+
 - **Evidence／profile 進件**：補 #496/#497/#821 的 accepted 三件組與 #835 可擴充
   execution-profile／原生 effort／歷史 unknown 契約，保留 Red 真分數、writer ownership、
   archive 與 PatchMUD/#842 外部資格邊界；只交規劃，不宣稱產品、量測或部署生效。

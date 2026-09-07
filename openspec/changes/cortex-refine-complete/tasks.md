@@ -16,6 +16,7 @@
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
+- [ ] 2.8.1 先依 #850 有界 store／immutable event-fold child 交付 component；C/D provenance、reconciliation 與所有 lane 接線仍由 #825 後續 child 承接。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
 - [ ] 2.10 由 #847 區分可信 frozen 自發布 metadata 等價與真 authority 變更；前者保持 needs_human/gates/attempt/model binding 且零 spawn，後者仍走合法 restart，缺 provenance 不豁免。
 
@@ -24,6 +25,7 @@
 - [ ] 3.1 為 R08/R09/R12 建立/重用精確 child work items；#835 已有 accepted profile schema/原生 effort/registry 相容三件組，完整母範圍仍 Red，先 schema-key child 再分拆其他入口，不先勾產品完成。
 - [ ] 3.2 實作 adapter capability descriptors 與 conformance；新虛構 model/effort 無 central product-name diff。
 - [ ] 3.3 實作 requested/resolved/observed profile 與可追溯 effective argv/config；unsupported pre-spawn fail-closed。
+- [ ] 3.3.1 依 #849 交付純 schema／canonical key 核心，原生 effort 與 observed unknown 不補值；母 #835 routing／migration 與 #842 qualification 另留正式 evidence。
 - [ ] 3.4 實作 PatchMUD versioned report consumer、legacy migration 與 profile/cohort/role/coverage 驗證。
 - [ ] 3.5 由 #842 實作 qualification candidate→review receipt→approved roster 發布鏈；保留 operator 核可與 independence policy，不擴 #581 原scope。
 - [ ] 3.6 實作安全 model register/probe 操作面與 TTL、角色擴充契約；探活不暗中消耗無上限額度。
