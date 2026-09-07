@@ -4377,6 +4377,89 @@ def test_terminal_json_reads_copilot_assistant_message_data_content(tmp_path: Pa
     assert manager._extract_terminal_json(str(log)) == evidence
 
 
+def test_terminal_json_reads_agy_json_response(tmp_path: Path) -> None:
+    evidence = {
+        "schema_version": 2,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+        "diagnostics": {},
+        "gate_evidence": [],
+    }
+    log = tmp_path / "agy.jsonl"
+    log.write_text(
+        json.dumps({
+            "conversation_id": "conversation",
+            "status": "SUCCESS",
+            "response": f"```json\n{json.dumps(evidence)}\n```\n",
+        })
+        + "\nfatal: Refusing to create empty bundle.\n"
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
+def test_terminal_json_reads_agy_response_with_progress_prefix(tmp_path: Path) -> None:
+    evidence = {
+        "schema_version": 2,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+        "diagnostics": {},
+        "gate_evidence": [],
+    }
+    log = tmp_path / "agy-progress.jsonl"
+    log.write_text(
+        json.dumps({
+            "conversation_id": "conversation",
+            "status": "SUCCESS",
+            "response": "Waiting for tests...\n" + json.dumps(evidence, indent=2) + "\n",
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
+def test_terminal_json_reads_agy_response_with_progress_prefix_and_fence(tmp_path: Path) -> None:
+    evidence = {
+        "schema_version": 2,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+        "diagnostics": {},
+        "gate_evidence": [],
+    }
+    log = tmp_path / "agy-progress-fenced.jsonl"
+    log.write_text(
+        json.dumps({
+            "conversation_id": "conversation",
+            "status": "SUCCESS",
+            "response": (
+                "I have launched the test suite.\n"
+                "Waiting for tests...\n"
+                f"```json\n{json.dumps(evidence, indent=2)}\n```\n"
+            ),
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
 def test_terminal_json_rejects_copilot_non_message_data_content(tmp_path: Path) -> None:
     fake = {
         "schema_version": 1,

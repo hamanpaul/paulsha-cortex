@@ -24,6 +24,8 @@ def test_agy_argv_is_headless_plan_sandbox_and_keeps_prompt_single() -> None:
         "--mode",
         "plan",
         "--sandbox",
+        "--output-format",
+        "json",
         "--model",
         "Gemini 3.1 Pro (High)",
     ]
@@ -49,6 +51,7 @@ def test_agy_reviewer_argv_grants_only_the_disposable_checkout(tmp_path) -> None
         "--sandbox",
     ]
     assert argv[6:8] == ["--add-dir", str(worktree.resolve())]
+    assert argv[argv.index("--output-format") + 1] == "json"
     assert "--dangerously-skip-permissions" not in argv
 
 
@@ -71,6 +74,7 @@ def test_agy_builder_argv_uses_accept_edits_and_scopes_worktree(tmp_path) -> Non
         "accept-edits",
     ]
     assert argv[5:7] == ["--add-dir", str(worktree.resolve())]
+    assert argv[argv.index("--output-format") + 1] == "json"
     assert "--sandbox" not in argv
     assert "--dangerously-skip-permissions" not in argv
 
@@ -122,6 +126,7 @@ def test_agy_builder_write_forbidden_argv_keeps_strict_plan_sandbox(tmp_path) ->
         "--sandbox",
     ]
     assert argv[6:8] == ["--add-dir", str(worktree.resolve())]
+    assert argv[argv.index("--output-format") + 1] == "json"
     assert "accept-edits" not in argv
     assert "--dangerously-skip-permissions" not in argv
 
@@ -144,6 +149,8 @@ def test_agy_planner_write_forbidden_argv_never_adds_worktree(tmp_path) -> None:
         "--mode",
         "plan",
         "--sandbox",
+        "--output-format",
+        "json",
     ]
     assert "--add-dir" not in argv
 

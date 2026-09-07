@@ -726,7 +726,7 @@ _FENCED_JSON = re.compile(
 
 # issue #401 巢狀欄位名——CLI launcher（claude/codex/agy）的成功 envelope
 # 用來裝「模型實際輸出」的欄位名不一而足，沿用既有偵測順序。
-_ENVELOPE_KEYS = ("result", "content", "message", "text")
+_ENVELOPE_KEYS = ("result", "content", "message", "text", "response")
 
 # issue #401：questioner／integrator／secondary planner 的 prompt 過去只用
 # 「Return only ... JSON」這類軟性措辭，模型（實測 sonnet 對 questioner
