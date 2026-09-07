@@ -245,11 +245,35 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 | recovery conformance | #843；公開action矩陣與不變量測試；producer缺陷仍由#497/#547/#577等原票修。 |
 | production stage reuse | #844，#214 successor；先限同run/claim-era安全cohort，跨run新採信未支援，不倒退既有candidate保留政策。 |
 | requirement delivery accounting | #845；消費CompletionRecord與#841證據，不重建ship引擎、不代替#808/#810勾完成。 |
+| self-publication authority stability | #847；可信 frozen 自身同內容發布的 metadata 等價，不清 needs_human 或重開 gates；真需求變更仍走既有合法 restart。 |
 
 #835–#842的查重與read-back見[動態issue對照](../../../reports/review/refine-dynamic-issues-20260907.md)；
 #843–#845各票保存不可變source與10/12/12項AC，root已全文讀回。所有新scope都尚未
 implemented/tests/merge/installed/live；開票只補owner，不增加已完成數量。
 PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需真receipt，兩者不由agent捏造。
+
+### Evidence／profile 正式進件（2026-09-07 10:03 UTC）
+
+- P1 planning PR #846 已合併 `fb31083e7325be86c6c9d217da56b9c4d799f5a5`：
+  exact head f7d77d3b 的 full preflight、四版 pytest、build、installed smoke 全綠，review 已解決。
+  #819/#825/#827 的產品驗收仍未完成，不將 PR 合併等同 runtime 修復。
+- 本批補 #496/#497/#821 三件組及 #835 execution-profile 三件組，均經 root 全文核對、
+  獨立 review、現行 runtime pure gate 與 Tasks 負控制。真分數為 7/9/8/10，均 Red。
+  #831 定案映射下 5/7/6/8 只是推算，真正派工前须重跑已載入 runtime；不提前降 band。
+- #497 保留 proof 後 consumed、原子解除 bindings、crash reconciliation；#821 保留 writer
+  ownership、rollback、digest/append fixture 及「輪替不等於完整 archive」的備份前置。
+- #835 對既有協定的 model/native-effort 採 descriptor 擴充，新協定可用受控 adapter；
+  requested/resolved/observed 分開，legacy 缺可信原 policy snapshot 就維持 unknown，
+  不猜版、不回寫 chain。schema-key child 先行，#842 不等待整張 #835 關閉，避免循環依賴。
+- #497/#835 即使 #831 載入仍 Red，須另建受治理 child；#833 自動分解仍未實作。
+  #581 原五項、PatchMUD #37 producer 與適用的真人 qualification receipt 邊界不變。
+  [整合核對](../../../reports/review/refine-evidence-profile-integration-20260907.md)
+  明列 AC、計分、根據與 residual；這批尚未交付產品 implemented/tests/merged/installed/live。
+- 新 [#847](https://github.com/hamanpaul/paulsha-cortex/issues/847) 接手本次 canary 揭露的
+  自發布 membership 變動 producer 缺口，root 已全文核對 10 項 AC。四份 frozen 內容 hash
+  不變，但自身 plan source 晚加入 authority 後觸發了 restart；精確 Monitor 納入時間與
+  單次 writer 身分未證實。不以 bytes 相同就授予豁免，仍須 exact run/era、owner、受治理
+  發布 provenance 與其他 authority 不變；#843/#844 不代替這項產品修正。
 
 ### Canary sizing 校正紀錄
 

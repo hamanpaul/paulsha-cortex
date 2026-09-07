@@ -707,6 +707,10 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-superseded-terminal-replay/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-superseded-terminal-replay-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-superseded-terminal-replay-design.md'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#497'
     excludes: []
@@ -715,6 +719,10 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-dirty-recheck-idempotency/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dirty-recheck-idempotency-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dirty-recheck-idempotency-design.md'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#496'
     excludes: []
@@ -803,6 +811,10 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#821'
       - kind: path
         ref: 'docs/superpowers/workstreams/registry-persist-hygiene/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-persist-hygiene-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-persist-hygiene-design.md'
     excludes: []
   executor-durable-backoff:
     title: 'executor-durable-backoff'
@@ -881,4 +893,16 @@ work_items:
         ref: 'docs/superpowers/specs/dispatch-decision-contract-design.md'
       - kind: path
         ref: 'docs/superpowers/workstreams/dispatch-decision-contract/todo.md'
+    excludes: []
+  execution-profile-contract:
+    title: 'execution-profile-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#835'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-contract-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/execution-profile-contract/todo.md'
     excludes: []
