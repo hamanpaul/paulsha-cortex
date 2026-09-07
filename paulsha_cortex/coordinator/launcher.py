@@ -1191,6 +1191,10 @@ def build_agy_argv(
     review_only: bool = False,
     commit_required: bool = False,
     write_forbidden: bool = False,
+    # Workflow lanes want the single-line JSON envelope; the capability probe
+    # (#670) keeps the bare ``--output-format text`` shape because the CLI
+    # rejects ``--json-schema`` there and the probe parser reads raw JSON.
+    json_envelope: bool = True,
 ) -> list[str]:
     """Build the headless Antigravity invocation for each launcher persona.
 
@@ -1235,6 +1239,11 @@ def build_agy_argv(
                 argv += ["--add-dir", git_write_dir]
         if allow_unsafe:
             argv.append("--dangerously-skip-permissions")
+    # Antigravity's default text output pretty-prints structured responses over
+    # multiple lines.  Workflow terminal evidence is JSONL, so ask the CLI for
+    # its single-line JSON envelope and let Manager unwrap the ``response``.
+    if json_envelope:
+        argv.extend(["--output-format", "json"])
     if model is not None:
         argv.extend(["--model", model])
     return argv

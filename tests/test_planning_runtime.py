@@ -14,6 +14,24 @@ def _completed(stdout: str = "", returncode: int = 0):
     return type("Completed", (), {"stdout": stdout, "stderr": "", "returncode": returncode})()
 
 
+def test_planning_json_extracts_agy_response_envelope() -> None:
+    expected = {
+        "schema_version": 1,
+        "question_pack_id": "qp-demo",
+        "evidence": [],
+    }
+    stdout = json.dumps(
+        {
+            "conversation_id": "conversation",
+            "status": "SUCCESS",
+            "response": json.dumps(expected),
+            "duration_seconds": 1.0,
+        }
+    )
+
+    assert planning_runtime._extract_json_candidates(stdout, None) == expected
+
+
 def test_production_runtime_loads_registry_and_probes_only_safe_launchers(
     monkeypatch, tmp_path: Path
 ) -> None:

@@ -4386,7 +4386,7 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
             parsed = _parse_terminal_json_text(data.get("content"))
             if parsed is not None:
                 return parsed
-        for key in ("result", "content", "message", "text"):
+        for key in ("result", "content", "message", "text", "response"):
             parsed = _parse_terminal_json_text(value.get(key))
             if parsed is not None:
                 return parsed
@@ -4408,12 +4408,32 @@ def _extract_terminal_json(log_path: object) -> dict[str, object]:
 def _parse_terminal_json_text(value: object) -> dict[str, object] | None:
     if not isinstance(value, str):
         return None
-    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```", value)
+    fenced = re.fullmatch(r"```json\r?\n(?P<body>[\s\S]+)\r?\n```\r?\n?", value)
     if fenced is not None:
         value = fenced.group("body")
+    else:
+        # AGY can emit progress prose before its final fenced terminal object.
+        # Accept the fence only when it is the response suffix; embedded example
+        # blocks remain non-terminal evidence.
+        trailing_fenced = re.search(
+            r"(?:^|\r?\n)```json\r?\n(?P<body>[\s\S]+?)\r?\n```\r?\n?\Z",
+            value,
+        )
+        if trailing_fenced is not None:
+            value = trailing_fenced.group("body")
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
+        # AGY may prepend progress text even when asked for a terminal JSON object.
+        # Accept only a complete terminal payload at the very end of the response;
+        # arbitrary embedded JSON remains rejected.
+        for start in (index for index, char in enumerate(value) if char == "{"):
+            try:
+                parsed = json.loads(value[start:].strip())
+            except json.JSONDecodeError:
+                continue
+            if _is_workflow_terminal_payload(parsed):
+                return parsed
         return None
     return parsed if _is_workflow_terminal_payload(parsed) else None
 

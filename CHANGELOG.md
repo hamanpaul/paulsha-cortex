@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+- **#807 agy headless terminal 改走 JSON envelope 並剝除前導文字**：`build_agy_argv` 對
+  planner／reviewer／verifier／builder 所有 agy headless 形態一律附加 `--output-format json`，
+  讓 terminal 證據落成單行 JSON envelope；Manager `_extract_terminal_json` 與
+  planning_runtime `_ENVELOPE_KEYS` 新增接受 agy envelope 的 `response` 鍵，
+  `_parse_terminal_json_text` 只在 json code fence 為回應尾綴時剝殼、並在 agy 前綴進度文字時
+  只採信回應尾端的完整 terminal payload（內嵌範例 fence 與任意內嵌 JSON 仍拒絕）。status
+  enum 別名與 rate-limit 同 identity 重試不在本次範圍。
+
 - **Trust Root AGY builder 契約（#805）**：four-way generator、install attestation 與
   builder credential import 現在支援明示的 AGY builder grant；Trust Root hardened runner
   （`PSC_JOB_RUNNER` 為非 `direct`）的 model resolution、doctor 與 dispatch preflight 會在
