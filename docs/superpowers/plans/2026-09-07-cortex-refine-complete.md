@@ -249,6 +249,8 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 | schema/key pure core | #849，#835 child；精確 typed wire／canonical key、三層 profile 與 bounded input。現行7/Red，#831後5僅投影；不授予資格、不做母件 routing/migration。 |
 | backoff store/event fold | #850，#825 child A；有界 fresh store、flock/atomic replace/durability、immutable event fold與ack。現行8/Red，#831後6僅投影；C/D provenance/reconciliation与production lanes仍另交付。 |
 | AGY probe exception containment | #851，#824 前置；只將 model_identities.py 的 argv 建構納入既有 smoke try。真6Yellow、独立內容審查與 fresh reader通過，正式派工／產品未完成。 |
+| bounded watcher A | #853，#827 child A；watcher-only controlled polling、raw0/root invalidation、generation/shared-backend及partial/nonfollow契約。R4與fresh reader通過；現行8/Red，#831後6僅投影，B/C與母件未完成。 |
+| headless session-only | #823；保留 launcher-session-and-timeout canonical id，補 spec/design/plan。單launcher的共用kwargs與窄retry、真安全PGID/SID及checkout外wheel驗收；現行6Yellow，timeout/probe與cgroup/restart均不混入完成宣稱。 |
 
 #835–#842的查重與read-back見[動態issue對照](../../../reports/review/refine-dynamic-issues-20260907.md)；
 #843–#845各票保存不可變source與10/12/12項AC，root已全文讀回。所有新scope都尚未

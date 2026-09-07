@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
+  登錄 #853 有界 watcher A child。真 process-group 與 cgroup 邊界、raw0／generation／
+  partial-scan／nonfollow 驗收完整列管；現行 sizing 6／8 與正式產品交付分開。
+
 - **AGY 前置契約進件**：登錄 #851 probe argv 例外隔離，#824 timeout 拆為獨立候選，
   保留 #823 session/cgroup 邊界。#824 依賴未完成，移除母件重複 owner 並暫不登錄
   可 claim child；真 completeness 阻擋與 surface-only Yellow gate 分帳，不依自訂欄位假鎖派工。
