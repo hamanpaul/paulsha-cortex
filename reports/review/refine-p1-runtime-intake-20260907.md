@@ -1,7 +1,7 @@
 # P1 runtime intake：完整性、真實 sizing 與人工分拆建議
 
 日期：2026-09-07；純 gate 初次查證09:14 UTC，同 identity 亂序校正後於09:27 UTC重跑。隔離分支 `feature/refine-p1-runtime-intake-20260907`，authoring 基底 `60a3ffa867377b0c86fa2f10e91fb9820d91938c`（#832 merge）。
-範圍只有三組 accepted spec/design/todo 與本報告。隔離 authoring 及此輪文件校正當下，作者未執行 commit/push、建 issue/run、改產品 code/tests、寫 `.cortex`/operator/runtime/服務，也未操作 #822；主流程後續提交/整合以其獨立紀錄為準，這段不是對未來 Git 狀態的宣稱。
+隔離分支的 intake 子任務範圍只有三組 accepted spec/design/todo 與本報告，不是整合 PR 的完整 diff 清單。隔離 authoring 及此輪文件校正當下，作者未執行 commit/push、建 issue/run、改產品 code/tests、寫 `.cortex`/operator/runtime/服務，也未操作 #822；主流程後續提交/整合另含 `.cortex` links、plan/OpenSpec ledger、changelog，以其獨立紀錄為準，這段不是對未來 Git 狀態的宣稱。
 
 ## 已交付 intake 與保留範圍
 
