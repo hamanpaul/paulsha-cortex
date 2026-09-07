@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
+
 - **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
   登錄 #853 有界 watcher A child。真 process-group 與 cgroup 邊界、raw0／generation／
   partial-scan／nonfollow 驗收完整列管；現行 sizing 6／8 與正式產品交付分開。

@@ -956,3 +956,17 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
     excludes: []
+  task-memory-delivery-adapter:
+    title: 'task memory delivery Cortex adapter'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#857'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/task-memory-delivery-adapter.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/task-memory-delivery-adapter/todo.md'
+    excludes: []
