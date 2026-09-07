@@ -11,16 +11,17 @@
 - [ ] 2.1 透過 Cortex 完成 #822 argv/YAML canary，取得 RED/GREEN、review、policy 與 terminal delivery 證據。
 - [ ] 2.2 完成 #827 有界 refresh/coalesce、slow-provider 公平與 stop/diagnostics。
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。
-- [ ] 2.4 完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄。
-- [ ] 2.5 完成 #497 原子解除綁定、持久 supersession 與 restart/late-terminal 回歸；#501 只核對已修及殘餘污染。
-- [ ] 2.6 完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理。
+- [ ] 2.4 依 accepted 三件組完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄；保留現行 7/Red，#831 後真重評。
+- [ ] 2.5 依 accepted 三件組分拆並完成 #497 原子解除綁定、持久 supersession 與 restart/late-terminal 回歸；#831 後仍預計 Red，#501 只核對已修及殘餘污染。
+- [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
 - [ ] 2.8 完成 #825 最小 durable backoff，所有 lane 與 corrupt-state/expiry 可測；不標 R05 完成。
 - [ ] 2.9 以實際已載入 revision 驗 B1 成效，退出暫時 bypass 前保存 active jobs 與 rollback 方案。
+- [ ] 2.10 由 #847 區分可信 frozen 自發布 metadata 等價與真 authority 變更；前者保持 needs_human/gates/attempt/model binding 且零 spawn，後者仍走合法 restart，缺 provenance 不豁免。
 
 ## 3. B2 可擴充配置與資格
 
-- [ ] 3.1 為 R08/R09/R12 建立/重用精確 child work items；#835 profile schema、原生 effort 與 registry 相容性先有 spec，完整母範圍仍須真實分拆。
+- [ ] 3.1 為 R08/R09/R12 建立/重用精確 child work items；#835 已有 accepted profile schema/原生 effort/registry 相容三件組，完整母範圍仍 Red，先 schema-key child 再分拆其他入口，不先勾產品完成。
 - [ ] 3.2 實作 adapter capability descriptors 與 conformance；新虛構 model/effort 無 central product-name diff。
 - [ ] 3.3 實作 requested/resolved/observed profile 與可追溯 effective argv/config；unsupported pre-spawn fail-closed。
 - [ ] 3.4 實作 PatchMUD versioned report consumer、legacy migration 與 profile/cohort/role/coverage 驗證。

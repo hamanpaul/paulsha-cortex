@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Evidence／profile 進件**：補 #496/#497/#821 的 accepted 三件組與 #835 可擴充
+  execution-profile／原生 effort／歷史 unknown 契約，保留 Red 真分數、writer ownership、
+  archive 與 PatchMUD/#842 外部資格邊界；只交規劃，不宣稱產品、量測或部署生效。
+
 - **Refine P1 runtime 進件**：補 #819/#825/#827 accepted spec/design、保留全部
   原驗收並列真實 Red sizing／人工拆分；補限流事件亂序、寫入故障與到期去重負例。
   將 #835–#845 的 profile、quota、資格、recovery 與交付責任納入總帳；
