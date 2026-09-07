@@ -187,8 +187,8 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 | 批次 | 狀態 | 證據／下一動作 |
 |---|---|---|
 | B0 | complete | #832 規劃／進件已合併；review、PR-context preflight、CI通過，原稿及其他工作所有權保留。不是產品修正完成。 |
-| B1 | in-progress | #820 已合併基底；#822 第三run的隔離卡已採信，TDD RED執行中，尚待產品測試／交付。#831為6/Yellow、#830為8/Red；#833補Red接續，皆未實作完成。 |
-| B2 | pending | PatchMUD producer 由專責 subagent 開票；Cortex contract 待派工。 |
+| B1 | in-progress | #822 RED/GREEN已採信，verify因terminal schema拒收，等待合格reviewer重試；未review/merge/installed。#831為6/Yellow、#830為8/Red；#819/#825/#827 accepted intake均仍Red，#833未實作。 |
+| B2 | pending | PatchMUD #37已開；Cortex #835 profile與#842 qualification分工明確，契約待拆分／派工。 |
 | B3 | pending | 觀測與預估先 shadow。 |
 | B4 | pending | 資格、預估與所有權契約先過，再有限啟用動態路由。 |
 | B5 | pending | #828 獨立處理；其餘狀態／部署待分拆。 |
@@ -208,6 +208,48 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
   接續successor；#830/#831不代替它，完整parent→children→closure仍是未完成gate。
 - 後續工作依[動態進件對照](../../../reports/review/refine-dynamic-intake-map-20260907.md)
   查重拆票；D1–D10只是責任切面，仍須真實sizing及accepted child plan，不直接整包派工。
+
+### 已核對的進度更新（2026-09-07 09:30 UTC）
+
+- [PR #834](https://github.com/hamanpaul/paulsha-cortex/pull/834) 已合併，
+  merge `217ff5b701f2a6ae54a20ab07212d3acef1d2114`；修正文句後的新head
+  `04418f7f09ad6ad360c93866be2bb1867fb9db70` 通過post-commit preflight、
+  全CI及resolved review thread。#830/#831是進件交付，產品修正仍未完成。
+- #822 RED `357dece2a328acb43022d23539f06aaca91a2598`：root集中10 failed/4 passed，
+  production diff為空；GREEN `7d72dee3acd8cc36ea0a96be8713e1e52f2c7346`：
+  集中14/14與Manager pytest gate通過，worker全套5662 passed/44 skipped。
+  verifier AGY terminal因details不是object而拒收；candidate未變，不採用該結果。
+  尚待合法verify/review/ship，不能因GREEN就關#822或宣稱B1完成。
+- 既有fallback曾選到本批列出型號以外的packaged AGY 3.1；目前停在needs_human，
+  後續以run-scoped選擇受本批許可且具review資格的候選，不改共享capability或放寬
+  independence。這是舊runtime限制，不是本計畫新動態admission已完成。
+- #819/#825/#827的accepted intake見[獨立審查／真實sizing](../../../reports/review/refine-p1-runtime-intake-20260907.md)：
+  舊runtime依序7/10/9 Red。#825已補同identity不同terminal亂序的event-time合併、
+  deadline不縮短及expire後ack保留；獨立複審PASS不代表產品實作。#831真正載入後
+  才重新計分；#827/#825的人工child候選不是已接受的child authority。
+- Monitor於09:21 UTC再次只重啟使用者層服務，GitHub freshness恢復；舊程序曾3029 threads。
+  Manager與既有jobs未重啟。此為temporary recovery，不是#827有界性驗收。
+
+### 新增 child 責任總帳（issue 已建立，產品交付未完成）
+
+| Work scope | Owner／依賴與不可混淆的邊界 |
+|---|---|
+| execution profile | #835；schema-key先供#842，未知原生effort/observed不補成實測；各child仍需真實sizing。 |
+| quota observation | #836；只產來源/單位/窗口/TTL/unknown，不做reservation或選模。 |
+| operational forecast | #837；消費#835/#836，與benchmark分帳，不拿token直接扣訂閱額度。 |
+| shared reservation | #838；共同authority/all-or-none，#818 instance契約仍獨立。 |
+| quota admission | #839；依#835–#838/#842，保留pin、最低品質及review independence。 |
+| decision projection | #840；消費#828 producer與#839 receipts，不改workflow真值。 |
+| loaded-runtime attestation | #841；沿用installed/Trust Root receipt，另證實實際已載入程序。 |
+| qualification publication | #842；report→candidate→human-review receipt→approved roster、撤銷/到期/CAS；不擴#581五項原scope。 |
+| recovery conformance | #843；公開action矩陣與不變量測試；producer缺陷仍由#497/#547/#577等原票修。 |
+| production stage reuse | #844，#214 successor；先限同run/claim-era安全cohort，跨run新採信未支援，不倒退既有candidate保留政策。 |
+| requirement delivery accounting | #845；消費CompletionRecord與#841證據，不重建ship引擎、不代替#808/#810勾完成。 |
+
+#835–#842的查重與read-back見[動態issue對照](../../../reports/review/refine-dynamic-issues-20260907.md)；
+#843–#845各票保存不可變source與10/12/12項AC，root已全文讀回。所有新scope都尚未
+implemented/tests/merge/installed/live；開票只補owner，不增加已完成數量。
+PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需真receipt，兩者不由agent捏造。
 
 ### Canary sizing 校正紀錄
 

@@ -1,6 +1,13 @@
 ---
 status: accepted
 work_item: monitor-refresh-thread-backlog
+domain_breadth: 1
+state_consistency: 2
+invariant_count: 8
+artifact_classes:
+  - source
+  - tests
+  - documentation
 ---
 
 # Monitor refresh 有界排程、公平性與停止契約
@@ -21,6 +28,10 @@ work_item: monitor-refresh-thread-backlog
 
 ## Tasks
 
+- [ ] **Intake source/tests/documentation**：以同 work_item 的 accepted spec/design
+      明定 W/D/S、三模組 scope、stop publication fence 與測試 oracle；下列 #832
+      已審查任務全部保留。現行 sizing 若 Red，等 #831 實際 runtime 重評，仍 Red
+      先真拆，不降低 domain/state 或拿 Yellow 純函式 ready 覆蓋 band。
 - [ ] 用固定、可查詢的 refresh worker 上限 W 取代每事件建立 Timer/thread；
       W 在測試中明確設定，執行中同一 project／refresh source 最多一份 pending dirty
       標記，無界 executor queue 不算有界實作。workspace 未映射事件的全量 scan
@@ -66,3 +77,9 @@ work_item: monitor-refresh-thread-backlog
       記錄 RED／GREEN、完整 gates、review、merge。部署驗收先保存現場，再在實際
       event 負載下量測 thread／queue／freshness 的有界性；任何服務重啟由主流程
       按當時 in-flight ownership 另外執行，不由本票測試擅自重啟共享 Manager。
+- [ ] **documentation/CLI help 與 tests/真入口**：同步 monitor 操作說明的排程、
+      timeout、stop 殘餘界線；在候選 checkout 外真跑 monitor --help 與
+      `monitor --config <fixture> --once` JSON smoke。另以隔離 socket/config、fake
+      provider 的 service harness 查 snapshot 並呼叫 stop，驗 owned worker 收尾；
+      不發明 monitor status/stop CLI，不連 live socket。先 focused pytest，再 full pytest、既有 CI、
+      PR-context policy、git diff --check；changelog fragment 必須 commit 後才算交付。

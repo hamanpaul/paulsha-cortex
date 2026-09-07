@@ -1,6 +1,13 @@
 ---
 status: accepted
 work_item: daemon-tick-clock-not-idle
+domain_breadth: 0
+state_consistency: 1
+invariant_count: 7
+artifact_classes:
+  - source
+  - tests
+  - documentation
 ---
 
 # Daemon periodic tick 時鐘與 idle 設定
@@ -20,6 +27,9 @@ work_item: daemon-tick-clock-not-idle
 
 ## Tasks
 
+- [ ] **Intake source/tests/documentation**：production 限 manager_daemon.py，按同
+      work_item spec/design 保留全部下列 #832 驗收與 residual。現行 Red 不派整包；
+      #831 實際 runtime 落地後重評，仍 Red 先真拆，不刪 sizing 宣告。
 - [ ] 在 periodic runner 回傳 not-idle 時推進 `last_tick_monotonic`，如同失敗分支
       會推進時鐘；不更新 `last_tick_at`、`consecutive_tick_failures`、
       `tick_circuit_open`、`last_tick_error`，且 `daemon.idle` 保持 False。
@@ -59,6 +69,14 @@ work_item: daemon-tick-clock-not-idle
       新增本 workstream 的 changelog fragment 並同步 `CHANGELOG.md [Unreleased]`。
 - [ ] 透過 Cortex 記錄修前 RED、修後 focused／完整 gates、review、merge 與實際
       runtime 驗證；本 todo 的 accepted 不代表修正或測試已完成。
+- [ ] **documentation/CLI help 與 tests/真入口**：從候選 checkout 外真跑
+      `python3 -m paulsha_cortex.coordinator.manager_daemon --help`；以隔離 env
+      subprocess 驗 --max-load NaN/Inf/0/-1 exit 2 且不啟動 run_loop，合法值透過
+      既有 main stub/harness 證明傳入。執行 focused/full pytest、CI、PR-context
+      policy、git diff --check；不連 live daemon、不修改任何 instance env。
+- [ ] **documentation/changelog fragment**：新增並 commit
+      `changelog.d/daemon-tick-clock-not-idle.md`，同步 CHANGELOG [Unreleased]；
+      明示預設行為變更與保留舊門檻的方式，不能只在未入 commit 的檔案提及。
 
 ## 已列管限制
 
