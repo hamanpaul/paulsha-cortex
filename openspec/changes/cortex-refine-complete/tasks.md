@@ -1,13 +1,13 @@
 ## 1. B0 進件與責任邊界
 
-- [ ] 1.1 收斂十四類 plan、domain glossary、OpenSpec 與 PatchMUD producer issue 連結，獨立審查零未處置 MAJOR。
-- [ ] 1.2 將 Claude 已完成的進件驗證與本輪缺失複核併回 canonical child todo；保留 #828 獨立 ownership。
-- [ ] 1.3 保存 operator dirty 原稿並對齊實際 builder base；核對 Monitor confirmed authority 後只啟動一條低風險 Cortex canary。
-- [ ] 1.4 進件 artifact-only commit/PR 經 preflight 與 CI；不關閉尚未實作的 issues。
+- [x] 1.1 收斂十四類 plan、domain glossary、OpenSpec 與 PatchMUD producer issue 連結，獨立審查零未處置 MAJOR。（#832）
+- [x] 1.2 將 Claude 已完成的進件驗證與本輪缺失複核併回 canonical child todo；保留 #828 獨立 ownership。（#832；operator原稿另存）
+- [x] 1.3 保存 operator dirty 原稿並對齊實際 builder base；核對 Monitor confirmed authority 後只啟動一條低風險 Cortex canary。（#822 run workflow-97a9aa661e4816e38964；不是canary完成）
+- [x] 1.4 進件 artifact-only commit/PR 經 preflight 與 CI；不關閉尚未實作的 issues。（#832 merge 60a3ffa8；#829仍OPEN）
 
 ## 2. B1 執行基礎
 
-- [ ] 2.0 補 #830 非 Job 決策回覆與 #831 sizing stability 方向；保留合理單模組 sizing 及所有 gate，另列 Red planner 分解接線的必要 child 範圍。
+- [ ] 2.0 補 #830 非 Job 決策回覆與 #831 sizing stability 方向；保留合理單模組 sizing 及所有 gate；#833 獨立交付 Red planner 分解接線。
 - [ ] 2.1 透過 Cortex 完成 #822 argv/YAML canary，取得 RED/GREEN、review、policy 與 terminal delivery 證據。
 - [ ] 2.2 完成 #827 有界 refresh/coalesce、slow-provider 公平與 stop/diagnostics。
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。

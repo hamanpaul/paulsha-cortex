@@ -846,3 +846,27 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/monitor-refresh-thread-backlog/todo.md'
     excludes: []
+  sizing-stability-direction:
+    title: 'sizing-stability-direction'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#831'
+      - kind: path
+        ref: 'docs/superpowers/specs/sizing-stability-direction-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/sizing-stability-direction-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/sizing-stability-direction/todo.md'
+    excludes: []
+  dispatch-decision-contract:
+    title: 'dispatch-decision-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#830'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-decision-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-decision-contract-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/dispatch-decision-contract/todo.md'
+    excludes: []

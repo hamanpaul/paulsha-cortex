@@ -186,13 +186,28 @@ B1 的主要目標是讓 Cortex 能可靠承接後續工作。B2–B4 完成後�
 
 | 批次 | 狀態 | 證據／下一動作 |
 |---|---|---|
-| B0 | in-progress | 已保存原工作樹；隔離 authoring branch；補查缺少的 intake 驗證；本 umbrella strict OpenSpec validation 通過。 |
-| B1 | in-progress | #820 已合併基底；#822 前兩個進件 run 已正式 supersede，第三個 run 通過 Yellow plan review、進入 build，尚待實際 job／測試證據。#830/#831 已開票並準備獨立進件。 |
+| B0 | complete | #832 規劃／進件已合併；review、PR-context preflight、CI通過，原稿及其他工作所有權保留。不是產品修正完成。 |
+| B1 | in-progress | #820 已合併基底；#822 第三run的隔離卡已採信，TDD RED執行中，尚待產品測試／交付。#831為6/Yellow、#830為8/Red；#833補Red接續，皆未實作完成。 |
 | B2 | pending | PatchMUD producer 由專責 subagent 開票；Cortex contract 待派工。 |
 | B3 | pending | 觀測與預估先 shadow。 |
 | B4 | pending | 資格、預估與所有權契約先過，再有限啟用動態路由。 |
 | B5 | pending | #828 獨立處理；其餘狀態／部署待分拆。 |
 | B6 | pending | 所有驗收證據及逐票 closure 尚未取得。 |
+
+### 已核對的進度更新（2026-09-07 08:47 UTC）
+
+- B0 已完成規劃／進件交付：[PR #832](https://github.com/hamanpaul/paulsha-cortex/pull/832)
+  merge `60a3ffa867377b0c86fa2f10e91fb9820d91938c`。兩輪獨立 review、commit 後
+  PR-context preflight、Python3.10–3.13 tests、build與四版installed smoke全部通過；
+  未關閉任何尚未實作的精修 issue。
+- B1 仍在進行：#822 run `workflow-97a9aa661e4816e38964` 的隔離卡經Claude429後
+  正式fallback到Codex並被Manager採信；TDD RED卡已派，尚未取得產品RED/GREEN或交付。
+- #831 accepted三件組在現行runtime為6/Yellow；#830為8/Red，待#831真正載入runtime
+  後重評。兩者純gate的 `envelope_unavailable` 仍是既有bypass，不代表量測能力合格。
+- [#833](https://github.com/hamanpaul/paulsha-cortex/issues/833) 是R14/B1的Red planner
+  接續successor；#830/#831不代替它，完整parent→children→closure仍是未完成gate。
+- 後續工作依[動態進件對照](../../../reports/review/refine-dynamic-intake-map-20260907.md)
+  查重拆票；D1–D10只是責任切面，仍須真實sizing及accepted child plan，不直接整包派工。
 
 ### Canary sizing 校正紀錄
 
