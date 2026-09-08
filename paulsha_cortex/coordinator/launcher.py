@@ -520,6 +520,46 @@ def _claude_spool_hook_settings() -> str:
     return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
+def _claude_builder_settings() -> str:
+    """Grant commit-required jobs Git writes and exact declared Python tests.
+
+    This is a per-process usability grant, not an OS sandbox. Never derive
+    permissions from candidate files or prompt text. Other gate executables
+    remain subject to the existing approval policy.
+    """
+    settings = json.loads(_claude_spool_hook_settings())
+    allowed = ["Bash(git add:*)", "Bash(git commit:*)"]
+    safe_chars = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/.:=,@+"
+    )
+    for spec in gate_ledger.load_gate_specs():
+        argv = spec.argv
+        offset = 0
+        # Support the existing scoped repository-selector cleanup, not an
+        # arbitrary env wrapper or executable/PATH substitution.
+        if Path(argv[0]).name == "env":
+            if argv[1:3] != ("-u", "PSC_REPO_ROOT"):
+                continue
+            offset = 3
+        command = argv[offset:]
+        if not command:
+            continue
+        executable = Path(command[0]).name
+        is_test = executable == "pytest" or (
+            executable in {"python", "python3"}
+            and command[1:3] in {("-m", "pytest"), ("-m", "unittest")}
+        )
+        if not is_test:
+            continue
+        # Claude rules have their own pattern grammar. Even shell-quoted
+        # wildcard/metacharacter arguments must not become permission rules.
+        if any(not set(arg) <= safe_chars for arg in argv):
+            raise ValueError("Claude builder gate cannot be represented as an exact permission rule")
+        allowed.append(f"Bash({spec.command})")
+    settings["permissions"] = {"allow": sorted(set(allowed))}
+    return json.dumps(settings, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
 def _git_scope_env() -> dict[str, str]:
     """Drop inherited Git repository/config selectors before scope binding."""
 
@@ -949,7 +989,10 @@ def build_claude_argv(
         # - review_only reviewer 是 read-only 契約，且它的 `--settings` 是那份
         #   sandbox 政策（deny 掉 $HOME 讀寫），事件根本寫不出去。
         # 這一行是 hook 的**唯一**注入點：per-job、走 argv、不落地任何檔案。
-        argv += ["--settings", _claude_spool_hook_settings()]
+        argv += [
+            "--settings",
+            _claude_builder_settings() if commit_required else _claude_spool_hook_settings(),
+        ]
     if model is not None:
         argv += ["--model", model]
     if worktree is not None and not review_only:
