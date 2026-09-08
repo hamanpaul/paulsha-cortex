@@ -21,13 +21,13 @@ branch `feature/refine-recovery-registry-20260907`；worktree 以 repo 相鄰 `p
 以下行號以 authoring base `b1b44bc476dc49481d8467c9595e7c4db3f1a87d` 為準，路徑皆相對 repo：
 
 - `paulsha_cortex/coordinator/registry.py:387–484`：loader；409–429 既有 v1 backup/migration，479–482 既有 #501 normalization 寫回。OQ02 已裁決保留原政策，A 不宣稱全面 read-only。
-- `registry.py:572–641`（同目錄）：已有單檔 atomic replace/fsync/rollback，A 重用而不重做 #821。
-- `registry.py:875–986`：slice load/copy 需要覆蓋 nested receipt；新欄位缺值不能觸發 normalization 寫回。
-- `registry.py:1175–1180,1395–1444,1446–1489,1500–1588,1591–1675`：job copy、create、repin、update、action。None 不清 binding；revision writer inventory 與實際行為測試的起點。
+- `paulsha_cortex/coordinator/registry.py:572–641`：已有單檔 atomic replace/fsync/rollback，A 重用而不重做 #821。
+- `paulsha_cortex/coordinator/registry.py:875–986`：slice load/copy 需要覆蓋 nested receipt；新欄位缺值不能觸發 normalization 寫回。
+- `paulsha_cortex/coordinator/registry.py:1175–1180,1395–1444,1446–1489,1500–1588,1591–1675`：job copy、create、repin、update、action。None 不清 binding；revision writer inventory 與實際行為測試的起點。
 - `paulsha_cortex/coordinator/manager.py:1671–1703,1744–1755,1801–1817,11976–12018`：現有 gate-before-replay、None 清綁錯誤及 work shim；屬 B，不塞入 A。
 - `paulsha_cortex/coordinator/work_actions.py:4713–4761,4788–4816,6084–6096,6202–6208`：缺 context/pins、target fallback 與 recovery update；屬 C，#547 廣泛選擇政策仍不在本拆分。
-- `paulsha_cortex/control/contract.py:33–34,62–88`：req_id 目前已含 UUID，但不是完整 pinned recovery schema。`coordinator/manager_daemon.py:691–708,830–845,1391–1438`：metadata 丟失與 done crash window，屬 D2。
-- `paulsha_cortex/coordinator/cli.py:186–199,403–414,445–458`、`paulsha_cortex/porcelain/recover.py:39–74,90–119`：D1 需兩套 CLI；`porcelain/run.py:163–170` 已有 work payload 通道可重用。完整 D 是四模組，不是舊估計三模組。
+- `paulsha_cortex/control/contract.py:33–34,62–88`：req_id 目前已含 UUID，但不是完整 pinned recovery schema。`paulsha_cortex/coordinator/manager_daemon.py:691–708,830–845,1391–1438`：metadata 丟失與 done crash window，屬 D2。
+- `paulsha_cortex/coordinator/cli.py:186–199,403–414,445–458`、`paulsha_cortex/porcelain/recover.py:39–74,90–119`：D1 需兩套 CLI；`paulsha_cortex/porcelain/run.py:163–170` 已有 work payload 通道可重用。完整 D 是四模組，不是舊估計三模組。
 - `tests/test_record_action_atomic_382.py:120,191`、`tests/test_workflow_registry.py:277`、`tests/test_coordinator_registry_headless.py:312,416`：既有 atomic/repin 回歸起點，未在本輪重跑。
 - 母 `docs/superpowers/specs/fix-superseded-terminal-replay-spec.md` 的 S01–S13 與 design 的 Decisions 3–10、Decomposition and Compatibility：A 完成不關母票，跨第四模組先重規劃。
 
