@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
+  子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
+  本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。
+
 - **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
 - **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，

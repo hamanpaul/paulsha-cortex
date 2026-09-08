@@ -956,6 +956,20 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
     excludes: []
+  workflow-terminal-jsonl-framing:
+    title: 'workflow-terminal-jsonl-framing'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#860'
+      - kind: openspec
+        ref: 'workflow-terminal-jsonl-framing'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/workflow-terminal-jsonl-framing/todo.md'
+    excludes: []
   task-memory-delivery-adapter:
     title: 'task memory delivery Cortex adapter'
     links:
