@@ -102,6 +102,17 @@ cortex work intake unified-work-lifecycle --repo owner/repo --issue 14 --combo f
 ```
 
 Telegram 等 bot 宿主若要提供「貼一段文字/issue 就進件」的入口，應呼叫 `submit_work_action(action="intake", ...)`（`paulsha_cortex/control/client.py`）；既有的 `/dispatch <slice_id>` 走既存 slice_id 派工，維持原樣不變，不在本次範圍內改動。
+
+### Headless launcher session boundary（#823）
+
+Headless job 的每次合法 `Popen`（direct、`systemd-run`、`systemd-template` 的外層
+Manager client，以及只移除 `stdin` 的相容 retry）都必須使用
+`start_new_session=True`。direct mode 的 child 因此離開 Manager 的 POSIX session/process
+group；這不等於把程序移入 systemd cgroup，也不承諾 Manager daemon restart 後 job 存活，
+更不改變 systemd unit 的 cgroup／`KillMode` 語意。#824 的 timeout/parser/CLI 合約與
+#851 的 AGY probe containment 仍由各自 work item 負責；#823 不藉 session flag 宣稱
+timeout、cancel、probe 或 issue closure 已完成。
+
 ### Work identity migration（設計中，見 ADR-0002）
 
 `link`／`unlink` 目前一次只能對單一 `(work_id, source)` pair 生效，重識別

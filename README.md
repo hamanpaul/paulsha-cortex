@@ -125,6 +125,14 @@ cortex bootstrap --instance cortex --repo-root "$(git rev-parse --show-toplevel)
    同為**必填**，未宣告時 Manager 在派工前即 fail-closed。值由產生器導出，不要手打：
    `python3 -m paulsha_cortex.trust_root unit four-way --job | grep '^Environment=PATH='`。
 
+   **#823 headless session 的生命週期邊界**：每個合法 headless `Popen` 嘗試（含
+   `systemd-run`／`systemd-template` 的 Manager-side client wrapper 與窄 `stdin` retry）都帶
+   `start_new_session=True`。direct child 因此有自己的 POSIX session/process group；這是
+   `setsid` 隔離，不是 systemd cgroup 移動，也不改變 unit 的 `KillMode` 或提供 cgroup
+   restart survival 保證。Manager daemon restart、timeout/parser/CLI 值域（#824）與 AGY
+   probe containment（#851）仍是獨立工作項；本 session 修正不新增 cancel/timeout/probe
+   語意，也不宣稱這些 issue 已完成或關閉。
+
 3. 使用 Deck 先 dry-run，再 emit `dispatch: hold` specs：
 
    ```bash
