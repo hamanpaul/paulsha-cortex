@@ -43,6 +43,7 @@
 - [ ] 4.1 完成 #826 failure 原始訊號→持久化→消費端分類，保留 runtime-contract 硬阻擋。
 - [ ] 4.2 整合 usage provenance：observed/estimated/unknown、增量/累計、input/cache/reasoning 不重複加總。
 - [ ] 4.3 由 #836 核對各 provider 真正可用的 quota observation 介面，實作帶來源/TTL/window/unit 的 adapters 與 unknown fallback。
+- [ ] 4.3.1 先依 #866 交付純 schema A 的十組不變量、standalone native unit cold-start、strict refs/unknown 與無 I/O helpers；現行7/Red不派工，#831真正loaded後重評。B來源adapter、C持久ledger、Dshadow及#849正式upstream conformance仍需各自證據；A不得關閉#836或代替forecast/reservation/fallback。
 - [ ] 4.4 實作與 benchmark 分開的 operational track record，涵蓋失敗消耗、duration 及任務分布。
 - [ ] 4.5 由 #837 實作 task/profile 用量 forecast 與冷啟動先驗、風險區間、版本與資料期間。
 - [ ] 4.6 以 shadow 流程取得觀測覆蓋率、預估誤差與 confidence baseline；據此核定有限啟用門檻。

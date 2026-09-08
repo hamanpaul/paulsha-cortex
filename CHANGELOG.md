@@ -7,6 +7,11 @@
 
 ## [Unreleased]
 
+- **Quota observation 純資料核心進件（#866）**：納入 #836 A 的 accepted 三件組、
+  自有 OpenSpec 與原生單位／未知 coverage 契約；未歸戶 usage 不捏造 account/pool。
+  本批只有規劃，現行 7/Red 不派工；來源 adapter、ledger、forecast、reservation
+  與跨獨立額度池 fallback 仍須後續正式交付，不硬編 model/agent/native effort。
+
 - **Recovery registry 子計畫進件（#862）**：納入 #497 的 registry-only A，保留
   exact CAS／ABA revision、prepared/complete、atomic receipt 與顯式 legacy checkpoint
   九組不變量。只有 accepted 規劃，現行 8/Red 不派工；公開 recovery／父項仍未完成。
