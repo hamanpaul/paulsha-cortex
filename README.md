@@ -390,6 +390,9 @@ systemctl --user status cortex-manager.service cortex-monitor.service
   `execution_state`。workflow 的 `attention`／`recent_done` 也使用同一組身份欄位：
   `identity_source` 為 `in-flight`、`last-execution`、`planned` 或 `unknown`；沒有
   registry 證據時不從 phase／persona 推測 executor 或 model。
+  下游可直接使用去識別化 producer snapshot fixture
+  `tests/fixtures/workflow-execution-identity-828-status.json`；欄位與 selection
+  語意見 `docs/superpowers/specs/workflow-execution-identity-producer-contract.md`。
 - `slices`：交付生命週期、gate、Candidate 與 evidence 摘要。
 - `attention`：全部 `needs_human` 項目，包含 reason、當下合法的 `next_actions`，以及 `candidate_git_base`。
 - `candidate_git_base`（#731）：這條 run／這張卡的**候選 git base**——真正那個 40-hex commit SHA，以及它落後 mirror 上 `origin/main` 幾個 commit。欄位含 `sha`、`sha_source`（`frozen-readiness-base-sha` 或 `first-build-job-dispatch-head`）、`behind_origin_main`、`mirror_origin_main`、`threshold_commits`、`reason`、`measured_against`、`fetched`。

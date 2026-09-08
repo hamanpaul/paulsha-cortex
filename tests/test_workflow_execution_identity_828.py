@@ -18,6 +18,16 @@ from diagnostic_fixtures import fixture_needs_human_reason
 
 
 REPO = "hamanpaul/paulsha-cortex"
+STATUS_FIXTURE = Path(__file__).parent / "fixtures" / "workflow-execution-identity-828-status.json"
+IDENTITY_FIELDS = {
+    "executor",
+    "model",
+    "job_id",
+    "card",
+    "identity_source",
+    "execution_state",
+}
+IDENTITY_SOURCES = {"in-flight", "last-execution", "planned", "unknown"}
 
 
 def _step(
@@ -395,3 +405,45 @@ def test_recent_done_projects_identity_from_the_completed_registry_job(tmp_path)
     assert row["card"] == "build-primary"
     assert row["identity_source"] == "last-execution"
     assert row["execution_state"] == "exited"
+
+
+def test_deidentified_status_fixture_is_a_consumer_contract() -> None:
+    status = json.loads(STATUS_FIXTURE.read_text(encoding="utf-8"))
+
+    assert status["schema_version"] == 1
+    assert {
+        "ready",
+        "held",
+        "in_flight",
+        "recent_done",
+        "slices",
+        "attention",
+        "not_claimable",
+    } <= status.keys()
+
+    rows = [
+        row
+        for section in ("in_flight", "attention", "recent_done")
+        for row in status[section]
+    ]
+    assert rows
+    assert {row["identity_source"] for row in rows} == IDENTITY_SOURCES
+
+    for row in rows:
+        assert IDENTITY_FIELDS <= row.keys()
+        source = row["identity_source"]
+        if source == "in-flight":
+            assert isinstance(row["job_id"], str) and row["job_id"]
+            assert row["execution_state"] == "running"
+        elif source == "last-execution":
+            assert isinstance(row["job_id"], str) and row["job_id"]
+            assert row["execution_state"] == "exited"
+        elif source == "planned":
+            assert row["job_id"] is None
+            assert row["executor"] and row["model"]
+            assert row["execution_state"] == "not-dispatched"
+        else:
+            assert row["executor"] is None
+            assert row["model"] is None
+            assert row["job_id"] is None
+            assert row["execution_state"] == "not-dispatched"

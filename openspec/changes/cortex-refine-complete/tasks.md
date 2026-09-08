@@ -55,6 +55,7 @@
 - [ ] 6.1 核對 #828 獨立 producer 交付；由 #840 補 actual/planned/last、facets、quota wait 與 selection receipts 的 status 一致性，不接管原producer。
   - [x] 6.1.a [RED] #828 在 Cortex producer 邊界新增 execution-identity regression tests；以 registry job binding 驗證多卡、retry、缺值、未派工、跨 run/repo、needs_human、in-flight 與 completed status projection，保留 RED 供後續最小修正。
   - [x] 6.1.b [GREEN] #828 producer 以 registry job 的 run/repo/card/phase binding 投影 executor、model、job_id、card、identity_source 與 execution_state；planned、actual、last execution 與 unknown 不互相代填。
+  - [x] 6.1.c [CONTRACT] #828 新增去識別化 status snapshot fixture 與 producer/consumer 欄位契約；僅完成 pre-archive handoff，consumer、pin、installed/runtime integration 與下游 issue closure 仍未完成。
 - [ ] 6.2 由 #841 建立 CLI/site-packages/service loaded artifact/config identity 的同源驗證與 checkout 外 smoke。
 - [ ] 6.3 完成 installer/doctor instance roots、writer ownership 與 owner-aware stop/cleanup 的契約驗收。
 - [ ] 6.4 取得 upgrade/restart/rollback 對 active jobs 的實際 receipts；未重載程序不得標已部署。

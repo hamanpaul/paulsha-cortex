@@ -10,3 +10,8 @@ scope: coordinator
 同一 run 的當前 card 優先使用 in-flight job，其次使用該 card 的最後一次 terminal
 execution；沒有 job 時只呈現明確的 planned identity，否則保持 unknown，不從 phase 或
 persona 推測模型。跨 run、repo、phase 或 card 的 job 不會被借用。
+
+另提供去識別化 status snapshot fixture
+`tests/fixtures/workflow-execution-identity-828-status.json` 與 producer/consumer
+契約文件；下游 consumer、pin、installed/runtime integration 與 issue closure
+仍由後續工作負責。

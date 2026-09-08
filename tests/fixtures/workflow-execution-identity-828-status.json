@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-09-08T00:00:00+00:00",
+  "daemon": {
+    "pid": 0,
+    "last_tick_at": "2026-09-08T00:00:00+00:00",
+    "idle": true,
+    "consecutive_tick_failures": 0,
+    "tick_circuit_open": false,
+    "last_tick_error": null
+  },
+  "ready": [],
+  "held": [],
+  "in_flight": [
+    {
+      "job_id": "job-828-retry",
+      "slice_id": "workflow-828-retry-build-primary",
+      "state": "running",
+      "candidate_git_base": null,
+      "executor": "codex",
+      "model": "gpt-5.3-codex",
+      "card": "build-primary",
+      "identity_source": "in-flight",
+      "execution_state": "running"
+    }
+  ],
+  "recent_done": [
+    {
+      "slice_id": "workflow-828-completed-build-primary",
+      "gate_status": "passed",
+      "at": "2026-09-08T00:00:00+00:00",
+      "gate_reason": null,
+      "job_id": "job-828-completed",
+      "branch": "feature/example",
+      "repo": "example/cortex",
+      "executor": "claude",
+      "model": "claude-sonnet-4.5",
+      "card": "build-primary",
+      "identity_source": "last-execution",
+      "execution_state": "exited"
+    }
+  ],
+  "slices": [],
+  "attention": [
+    {
+      "kind": "workflow_run",
+      "run_id": "workflow-828-retry",
+      "work_id": "example-work-retry",
+      "repo": "example/cortex",
+      "current_phase": "build",
+      "slice_state": "needs_human",
+      "gate_state": "failed",
+      "reason": "verification-failed",
+      "candidate_git_base": null,
+      "blocking_reason": {
+        "reason": "verification-failed",
+        "detail": "等待 operator 重新執行 build card"
+      },
+      "evidence_refs": [],
+      "next_actions": ["retry-build", "abandon"],
+      "next_step_hint": "先核對當前 card 的 registry job identity",
+      "updated_at": "2026-09-08T00:00:00+00:00",
+      "executor": "codex",
+      "model": "gpt-5.3-codex",
+      "job_id": "job-828-retry",
+      "card": "build-primary",
+      "identity_source": "in-flight",
+      "execution_state": "running"
+    },
+    {
+      "kind": "workflow_run",
+      "run_id": "workflow-828-last",
+      "work_id": "example-work-last",
+      "repo": "example/cortex",
+      "current_phase": "build",
+      "slice_state": "needs_human",
+      "gate_state": "failed",
+      "reason": "retry-exhausted",
+      "candidate_git_base": null,
+      "blocking_reason": {
+        "reason": "retry-exhausted",
+        "detail": "目前只保留最後一次已退出執行的身份"
+      },
+      "evidence_refs": [],
+      "next_actions": ["retry-build", "abandon"],
+      "next_step_hint": "不得將 last execution 顯示為仍在執行",
+      "updated_at": "2026-09-08T00:00:00+00:00",
+      "executor": "claude",
+      "model": "claude-sonnet-4.5",
+      "job_id": "job-828-last",
+      "card": "build-primary",
+      "identity_source": "last-execution",
+      "execution_state": "exited"
+    },
+    {
+      "kind": "workflow_run",
+      "run_id": "workflow-828-planned",
+      "work_id": "example-work-planned",
+      "repo": "example/cortex",
+      "current_phase": "plan",
+      "slice_state": "needs_human",
+      "gate_state": "failed",
+      "reason": "planning-hold",
+      "candidate_git_base": null,
+      "blocking_reason": {
+        "reason": "planning-hold",
+        "detail": "尚未派工"
+      },
+      "evidence_refs": [],
+      "next_actions": ["abandon"],
+      "next_step_hint": "尚未派工；這是明確的 planned identity",
+      "updated_at": "2026-09-08T00:00:00+00:00",
+      "executor": "cortex-manager",
+      "model": "deterministic",
+      "job_id": null,
+      "card": "manager-plan",
+      "identity_source": "planned",
+      "execution_state": "not-dispatched"
+    },
+    {
+      "kind": "workflow_run",
+      "run_id": "workflow-828-unknown",
+      "work_id": "example-work-unknown",
+      "repo": "example/cortex",
+      "current_phase": "claim",
+      "slice_state": "needs_human",
+      "gate_state": "failed",
+      "reason": "identity-unavailable",
+      "candidate_git_base": null,
+      "blocking_reason": {
+        "reason": "identity-unavailable",
+        "detail": "沒有 registry job 或明確 planned identity"
+      },
+      "evidence_refs": [],
+      "next_actions": ["abandon"],
+      "next_step_hint": "不可從 phase 或 persona 推測 executor/model",
+      "updated_at": "2026-09-08T00:00:00+00:00",
+      "executor": null,
+      "model": null,
+      "job_id": null,
+      "card": "claim-work",
+      "identity_source": "unknown",
+      "execution_state": "not-dispatched"
+    }
+  ],
+  "not_claimable": []
+}
