@@ -16,6 +16,7 @@ planning-authority plan，以及 Manager-owned archive／merge／runtime 仍不�
 - [x] T3 新增隔離 `tmp_path` regression：CompletionRecord 與 immutable verification evidence 的 bytes、raw SHA-256 與 canonical hash 在 fresh reads 後穩定；history/evidence mutation negative controls 確認 oracle 會失敗並由 read-time hash check 拒絕。
 - [x] T4 新增 `current_sizing_snapshot` 的 single/cross-scope complete/missing/blocked 成對 score+band matrix，並覆蓋 invalid domain/state 的 `(None, None)` fail-soft；保留既有 claim/retry、pure-function 與 band boundary tests。
 - [x] T5 更新本票 changelog fragment、`CHANGELOG.md [Unreleased]` 與本 child ledger；本卡不宣稱 archive、merge、issue closure 或 runtime/install loaded revision。
+- [x] T6 修補歷史回歸 oracle：以完整 persisted v2 `WorkflowRun` baseline 比對 first/fresh reload，保留 legacy sizing 欄位缺席語意，並以實際 frozen planning bytes 與 matching SHA 驗證 non-null versioned fixture；只補 pre-archive tests，不改 production 或 pinned planning input。
 
 PENDING — Manager 的獨立 review、exact-head delivery preflight、CI/remote checks、archive、merge 與 issue closure。
 

@@ -13,6 +13,8 @@ from paulsha_cortex.coordinator.workflow import (
     WorkflowStep,
 )
 
+FROZEN_PLAN_REF = "docs/superpowers/plans/sizing-stability-direction.md"
+
 
 def _step() -> WorkflowStep:
     return WorkflowStep(
@@ -23,12 +25,29 @@ def _step() -> WorkflowStep:
         model="gemini-3.1-pro-high",
         domain="google",
         inputs=("openspec/changes/sizing-stability-direction/tasks.md",),
-        outputs=("docs/superpowers/plans/sizing-stability-direction.md",),
+        outputs=(FROZEN_PLAN_REF,),
         gate_result="pending",
     )
 
 
-def _create_run(registry: JobRegistry):
+def _write_frozen_plan(tmp_path: Path) -> tuple[Path, str]:
+    artifact = tmp_path / FROZEN_PLAN_REF
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    frozen_bytes = (
+        b"---\nstatus: accepted\nwork_item: sizing-stability-direction\n---\n"
+        b"# Frozen sizing stability plan\n"
+    )
+    artifact.write_bytes(frozen_bytes)
+    return artifact, hashlib.sha256(frozen_bytes).hexdigest()
+
+
+def _create_run(
+    registry: JobRegistry,
+    *,
+    planning_digest: str,
+    sizing_score: int | None = None,
+    sizing_band: str | None = None,
+):
     return registry._manager_create_workflow_run(
         work_id="sizing-stability-direction",
         repo="hamanpaul/paulsha-cortex",
@@ -44,14 +63,14 @@ def _create_run(registry: JobRegistry):
         evidence_refs=("evidence/planning/frozen.json",),
         planning_authority=(
             PlanningArtifactAuthority(
-                ref="docs/superpowers/plans/sizing-stability-direction.md",
+                ref=FROZEN_PLAN_REF,
                 kind="plan",
                 work_id="sizing-stability-direction",
-                baseline_sha256="b" * 64,
+                baseline_sha256=planning_digest,
             ),
         ),
-        sizing_score=None,
-        sizing_band=None,
+        sizing_score=sizing_score,
+        sizing_band=sizing_band,
     )
 
 
@@ -68,8 +87,12 @@ def _assert_bytes_and_sha_unchanged(
 def test_legacy_workflow_reload_preserves_frozen_planning_history_without_backfill(
     tmp_path: Path,
 ) -> None:
+    artifact, artifact_sha256 = _write_frozen_plan(tmp_path)
     state = tmp_path / "jobs.json"
-    created = _create_run(JobRegistry(state_path=state))
+    created = _create_run(
+        JobRegistry(state_path=state),
+        planning_digest=artifact_sha256,
+    )
     payload = json.loads(state.read_text(encoding="utf-8"))
     legacy_run = payload["workflows"][0]
     # This is the pre-sizing shape: no algorithm/provenance snapshot fields.
@@ -79,22 +102,36 @@ def test_legacy_workflow_reload_preserves_frozen_planning_history_without_backfi
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    # This is the complete persisted legacy baseline.  Only the two sizing
+    # fields are absent; every identity, binding, step, planning, attempt and
+    # evidence field remains part of the expected returned state.
+    expected_returned_state = dict(legacy_run)
+    expected_returned_state["sizing_score"] = None
+    expected_returned_state["sizing_band"] = None
     frozen_bytes = state.read_bytes()
     frozen_sha256 = hashlib.sha256(frozen_bytes).hexdigest()
+    frozen_artifact_bytes = artifact.read_bytes()
 
-    first = JobRegistry(state_path=state).get_workflow_run(created.run_id)
-    second = JobRegistry(state_path=state).get_workflow_run(created.run_id)
+    first_registry = JobRegistry(state_path=state)
+    first = first_registry.get_workflow_run(created.run_id)
+    fresh_registry = JobRegistry(state_path=state)
+    second = fresh_registry.get_workflow_run(created.run_id)
 
     for run in (first, second):
-        assert run.sizing_score is None
-        assert run.sizing_band is None
-        assert run.source_revision == "source-revision-before-repair"
-        assert run.planning_source_revision == "source-revision-before-repair"
-        assert run.planning_authority[0].baseline_sha256 == "b" * 64
-        assert run.attempts == {"plan": 2}
-        assert run.evidence_refs == ("evidence/planning/frozen.json",)
-    assert "sizing_score" not in json.loads(state.read_text(encoding="utf-8"))["workflows"][0]
+        # Comparing the complete projection catches read-time field loss such
+        # as issue_refs/openspec_refs disappearing while selected assertions
+        # still pass.  Legacy sizing fields stay absent on disk but resolve to
+        # the model's documented None defaults in the returned object.
+        assert run.to_dict() == expected_returned_state
+    assert first is not second
+    assert first.issue_refs == ("hamanpaul/paulsha-cortex#831",)
+    assert first.openspec_refs == ("sizing-stability-direction",)
+    assert first.planning_authority[0].baseline_sha256 == artifact_sha256
+    persisted_legacy = json.loads(state.read_text(encoding="utf-8"))["workflows"][0]
+    assert "sizing_score" not in persisted_legacy
+    assert "sizing_band" not in persisted_legacy
     _assert_bytes_and_sha_unchanged(state, frozen_bytes, frozen_sha256)
+    _assert_bytes_and_sha_unchanged(artifact, frozen_artifact_bytes, artifact_sha256)
 
     # Negative control: a history mutation must make the immutability oracle fail.
     mutated = json.loads(state.read_text(encoding="utf-8"))
@@ -105,6 +142,42 @@ def test_legacy_workflow_reload_preserves_frozen_planning_history_without_backfi
     )
     with pytest.raises(AssertionError):
         _assert_bytes_and_sha_unchanged(state, frozen_bytes, frozen_sha256)
+
+
+def test_versioned_workflow_reload_preserves_non_null_sizing_and_frozen_plan(
+    tmp_path: Path,
+) -> None:
+    artifact, artifact_sha256 = _write_frozen_plan(tmp_path)
+    state = tmp_path / "jobs.json"
+    created = _create_run(
+        JobRegistry(state_path=state),
+        planning_digest=artifact_sha256,
+        sizing_score=6,
+        sizing_band="yellow",
+    )
+    persisted = json.loads(state.read_text(encoding="utf-8"))
+    assert persisted["schema_version"] == 2
+    expected_returned_state = persisted["workflows"][0]
+    frozen_bytes = state.read_bytes()
+    frozen_sha256 = hashlib.sha256(frozen_bytes).hexdigest()
+    frozen_artifact_bytes = artifact.read_bytes()
+
+    first = JobRegistry(state_path=state).get_workflow_run(created.run_id)
+    fresh = JobRegistry(state_path=state).list_workflow_runs()[0]
+
+    assert first.to_dict() == expected_returned_state
+    assert fresh.to_dict() == expected_returned_state
+    assert first.sizing_score == fresh.sizing_score == 6
+    assert first.sizing_band == fresh.sizing_band == "yellow"
+    assert first.planning_authority[0].baseline_sha256 == artifact_sha256
+    _assert_bytes_and_sha_unchanged(state, frozen_bytes, frozen_sha256)
+    _assert_bytes_and_sha_unchanged(artifact, frozen_artifact_bytes, artifact_sha256)
+
+    # A real frozen artifact mutation must be visible to the byte/hash oracle;
+    # the digest is not a synthetic placeholder detached from fixture bytes.
+    artifact.write_bytes(frozen_artifact_bytes + b"mutated\n")
+    with pytest.raises(AssertionError):
+        _assert_bytes_and_sha_unchanged(artifact, frozen_artifact_bytes, artifact_sha256)
 
 
 def _verification_evidence(root: Path, *, slice_id: str, candidate: str) -> dict[str, str]:

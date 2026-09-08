@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-- **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload 與 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。
+- **#831 stability-risk-v2**：修正 planning sizing 的 `spec_stability` 方向；完整 accepted 三件組為 0、單一缺失 kind 為 1、至少兩個缺失 kind／blocking marker／未 accepted artifact 為 2，並以保守 2 處理 unknown 或不一致 report。其他 sizing 維度、band 門檻、fail-soft 邊界與歷史資料不變；補齊隔離 history/evidence reload、完整 `WorkflowRun` baseline（含 legacy sizing 欄位缺席語意）與真實 frozen-plan bytes/SHA fixture，以及 current snapshot score+band matrix 回歸覆蓋，不新增 schema 或 migration。
 
 - **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
