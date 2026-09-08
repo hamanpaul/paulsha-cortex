@@ -23,6 +23,21 @@ _MATRIX_CASES = tuple(
 )
 
 
+def _private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+    return path
+
+
+def _assert_matrix_covers_argv_builders() -> None:
+    matrix_executors = {executor for _runner, executor in _MATRIX_CASES}
+    registered_executors = set(launcher_module._ARGV_BUILDERS)
+    assert matrix_executors == registered_executors, (
+        "session matrix executor coverage drifted from _ARGV_BUILDERS: "
+        f"matrix={sorted(matrix_executors)!r}, registered={sorted(registered_executors)!r}"
+    )
+
+
 def _patch_degraded_launch_seams(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -70,8 +85,7 @@ def _patch_degraded_launch_seams(
     def principal_spool(_env, *, role):
         principal = "reviewer" if role == launcher_module.job_runner.JOB_ROLE_REVIEW else "builder"
         path = tmp_path / principal
-        path.mkdir(parents=True, exist_ok=True)
-        return str(path)
+        return str(_private_dir(path))
 
     monkeypatch.setattr(launcher_module.job_runner, "resolve_job_spec_spool", principal_spool)
     monkeypatch.setattr(
@@ -151,7 +165,7 @@ def _patch_degraded_launch_seams(
     )
 
     for principal in ("builder", "reviewer"):
-        (tmp_path / principal).mkdir(parents=True, exist_ok=True)
+        _private_dir(tmp_path / principal)
 
     if runner == "systemd-template":
         def fake_log_spool_dir(*, principal_id: str, spool_key: str):
@@ -159,7 +173,7 @@ def _patch_degraded_launch_seams(
 
         def fake_prepare_job_log_spool(*, principal_id: str, spool_key: str, manager_log_path: str):
             path = fake_log_spool_dir(principal_id=principal_id, spool_key=spool_key)
-            path.mkdir(parents=True, exist_ok=True)
+            _private_dir(path)
             log_path = path / launcher_module.job_workspace.JOB_LOG_FILENAME
             log_path.touch()
             return log_path
@@ -192,8 +206,7 @@ def _record_subprocess_launch(
         pid = 12347
 
     def fake_popen(argv, **kwargs):
-        if require_session:
-            assert kwargs.get("start_new_session") is True, "start_new_session flag was dropped"
+        assert kwargs.get("start_new_session") is True, "start_new_session flag was dropped"
         calls.append({"argv": argv, **kwargs})
         return FakeProcess()
 
@@ -308,6 +321,18 @@ def test_every_admitted_runner_executor_records_start_new_session(
         else:
             assert "systemctl" in calls[0]["argv"][2]
             assert calls[0]["cwd"] is None
+
+
+def test_session_matrix_covers_every_registered_argv_builder() -> None:
+    _assert_matrix_covers_argv_builders()
+
+
+def test_new_argv_builder_requires_a_session_matrix_cell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(launcher_module._ARGV_BUILDERS, "synthetic", lambda **_kwargs: ["synthetic"])
+    with pytest.raises(AssertionError, match="coverage drifted from _ARGV_BUILDERS"):
+        _assert_matrix_covers_argv_builders()
 
 
 def test_recording_negative_control_catches_helper_wiring_bypass(
@@ -479,6 +504,23 @@ def test_second_stdin_retry_error_is_propagated(
     assert "stdin" not in calls[1]
 
 
+def _signal_owned_process_group(proc, sig: int) -> bool:
+    parent_pgid = os.getpgid(0)
+    parent_sid = os.getsid(0)
+    child_pgid = os.getpgid(proc.pid)
+    child_sid = os.getsid(proc.pid)
+    owned = (
+        child_pgid == proc.pid
+        and child_sid == proc.pid
+        and child_pgid != parent_pgid
+        and child_sid != parent_sid
+    )
+    if not owned:
+        return False
+    os.killpg(child_pgid, sig)
+    return True
+
+
 @pytest.mark.skipif(os.name != "posix", reason="headless session isolation is POSIX-specific")
 def test_headless_session_owns_its_process_group_before_group_signal(tmp_path) -> None:
     build_kwargs = launcher_module.build_headless_popen_kwargs
@@ -493,15 +535,8 @@ def test_headless_session_owns_its_process_group_before_group_signal(tmp_path) -
     parent_sid = os.getsid(0)
     proc = subprocess.Popen(["bash", "-c", "exec sleep 30"], **kwargs)
     try:
-        child_pgid = os.getpgid(proc.pid)
-        child_sid = os.getsid(proc.pid)
-        assert child_pgid == proc.pid
-        assert child_sid == proc.pid
-        assert child_pgid != parent_pgid
-        assert child_sid != parent_sid
-
         # Ownership is established before the only intentional group signal.
-        os.killpg(proc.pid, signal.SIGTERM)
+        assert _signal_owned_process_group(proc, signal.SIGTERM)
         assert proc.wait(timeout=5) == -signal.SIGTERM
         assert os.getpgid(0) == parent_pgid
         assert os.getsid(0) == parent_sid
@@ -538,15 +573,7 @@ def test_missing_session_negative_control_rejects_before_group_signal(
 
     proc = subprocess.Popen(["bash", "-c", "exec sleep 30"], **kwargs)
     try:
-        child_pgid = os.getpgid(proc.pid)
-        child_sid = os.getsid(proc.pid)
-        ownership = (
-            child_pgid == proc.pid
-            and child_sid == proc.pid
-            and child_pgid != parent_pgid
-            and child_sid != parent_sid
-        )
-        assert not ownership
+        assert not _signal_owned_process_group(proc, signal.SIGTERM)
         assert killpg_calls == []
     finally:
         try:
@@ -556,4 +583,6 @@ def test_missing_session_negative_control_rejects_before_group_signal(
         finally:
             if getattr(proc, "stdin", None) is not None:
                 proc.stdin.close()
+    assert os.getpgid(0) == parent_pgid
+    assert os.getsid(0) == parent_sid
     assert proc.poll() is not None
