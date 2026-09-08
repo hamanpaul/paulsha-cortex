@@ -89,6 +89,46 @@ def test_spec_stability_grading(missing_kinds, blocking, expected):
 
 
 @pytest.mark.parametrize(
+    "missing_kinds, blocking, rejected, expected",
+    [
+        ((), False, False, 0),  # 完整 accepted → 0
+        (("design",), False, False, 1),  # 單缺 kind → 1
+        (("design", "spec"), False, False, 2),  # 至少兩缺 kind → 2
+        ((), True, False, 2),  # marker → 2
+        ((), False, True, 2),  # 拒收 artifact → 2
+    ],
+)
+def test_spec_stability_v2_oracle(missing_kinds, blocking, rejected, expected):
+    artifact = PlanningArtifact(
+        kind="plan",
+        ref="docs/superpowers/plans/demo.md",
+        text="---\nstatus: " + ("draft" if rejected else "accepted") + "\n---\n## Tasks\n- a",
+    )
+    markers = (BlockingMarker("standalone", 5, "TBD"),) if blocking else ()
+    assessment = ArtifactAssessment(
+        artifact,
+        not blocking and not rejected,
+        () if (not blocking and not rejected) else ("blocking-decision" if blocking else "status-not-accepted",),
+        markers,
+    )
+    report = CompletenessReport(
+        complete=not missing_kinds and not blocking and not rejected,
+        assessments=(assessment,),
+        missing_kinds=tuple(missing_kinds),
+        default_question_pack=_empty_question_pack(),
+    )
+    score = compute_sizing_score(
+        plan_artifact=_plan_artifact(),
+        completeness_report=report,
+        gate_spine_count=0,
+        applicable_contract_rules=frozenset(),
+        cards_count=1,
+        persona_binding_count=0,
+    )
+    assert score.spec_stability == expected
+
+
+@pytest.mark.parametrize(
     "gate_spine_count, rules, expected",
     [
         (0, frozenset(), 0),
