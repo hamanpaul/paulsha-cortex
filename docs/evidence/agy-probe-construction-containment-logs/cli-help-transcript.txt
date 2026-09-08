@@ -1,0 +1,49 @@
+2026-09-08T07:49:58Z
+usage: cortex [-h] [--version] <command> [<args>...]
+
+paulsha-cortex 檔案驅動的 Agent 派工與交付治理 CLI
+
+options:
+  -h, --help      show this help message and exit
+  --version       show installed version and exit
+
+setup and workflow commands:
+  install service  安裝 manager service/timer 與 monitor 的 systemd --user units
+  deck             預覽或產生 dispatch:hold 的 slice specs
+  skill            skill usage ledger 檢視與 park/janitor 操作（inspect/park/restore/...）
+  monitor          掃描專案文件並輸出 Project Monitor 狀態
+  egress-proxy     出口 proxy 服務（#716；--check 只印生效設定與白名單）
+  list             列出統一 Work Item read model
+  work show        顯示單一 Work Item 與可解釋關聯
+  doctor           檢查 gh、preflight、model identity、agy 與 service paths
+  control lock-path 印出 manager.lock 契約路徑（shell wrapper／daemon 同源，整合用途）
+  relay-hook       執行封裝內 relay hook（整合用途）
+
+coordinator commands:
+  status           讀取 manager daemon 綜合狀態
+  ready            列出符合派工條件的 specs
+  jobs, stat       查詢 Job 執行紀錄與 combo/retry 彙總
+  fanout           派送目前 ready 的 slices
+  tick             執行 fanout + completion/review 流程
+  complete         輪詢既有 jobs 並執行 verification/review/completion
+  slice-action     對 needs_human slice 執行允許的 recovery action
+  work             透過 Manager 單一 writer 執行 work lifecycle action
+  outcome          讀取 canonical engineering outcome outbox（唯讀）
+  reap-brokers     dry-run 或受限清理孤兒 Codex broker
+  dispatch         已停用的舊低階入口
+
+run 'cortex <command> --help' for command-specific help.
+
+porcelain commands:
+  bootstrap       從 preflight 到 service 啟動與健檢
+  capacity-gate   PreToolUse 容量閘門：忙碌時對 subagent/headless spawn 回 ask
+  digest          組裝並投遞 manager status digest（供排程觸發，見 emit）
+  headless-hook   headless job 的事件 hook：把被動過的 GitHub 物件寫進 monitor spool
+  init-sample     建立第一個 dispatch: hold sample workflow
+  inspect         唯讀檢查 status/job/ready/work/doctor/service/models
+  mechanical-acceptance對 agent/subagent 產出執行零 model session 確定性機械驗收
+  model           模型能力側寫：patchmud 一次性評測 → 封套 diff 預覽／--apply 落地
+  recover         執行 slice/work/brokers/service 復原
+  request         追蹤 control request
+  run             執行 tick/fanout/complete/work mutation
+  service         管理 service/runtime、logs 與 uninstall
