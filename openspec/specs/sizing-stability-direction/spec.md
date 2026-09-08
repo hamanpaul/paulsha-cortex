@@ -1,7 +1,7 @@
 # sizing-stability-direction Specification
 
 ## Purpose
-TBD - created by archiving change sizing-stability-direction. Update Purpose after archive.
+Define the stability-risk-v2 sizing direction: complete accepted planning artifacts are the lowest risk, while missing, blocked, or unaccepted material raises the risk; unknown and legacy/unversioned records remain conservatively bounded and are not backfilled during reads.
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 
@@ -11,4 +11,3 @@ TBD - created by archiving change sizing-stability-direction. Update Purpose aft
 
 - **WHEN** 依 `docs/superpowers/specs/sizing-stability-direction-spec.md` 的 Requirements 對 candidate 驗收
 - **THEN** 全部驗收條件成立
-
