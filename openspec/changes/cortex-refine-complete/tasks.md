@@ -14,6 +14,7 @@
 - [ ] 2.3 完成 #819 not-idle clock、periodic 有效 max_load/require_idle 與非法值處置。
 - [ ] 2.4 依 accepted 三件組完成 #496 內容/狀態冪等，驗同 path 內容改變仍恰好記錄；保留現行 7/Red，#831 後真重評。
 - [ ] 2.5 依 accepted 三件組分拆並完成 #497 原子解除綁定、持久 supersession 與 restart/late-terminal 回歸；#831 後仍預計 Red，#501 只核對已修及殘餘污染。
+- [ ] 2.5.1 先依 #862 交付 registry-only A 的九組 receipt/disposition/revision/checkpoint 不變量；accepted 現行8/Red不派工，#831實際loaded後重評。C→B→D2、D1→D2仍需獨立交付，A完成不得關閉#497；own OpenSpec需run前完成唯一owner/發布/binding，archive只收自身。
 - [ ] 2.6 依 accepted 三件組完成 #821 no-op persistence、history retention、writer/fault/rollback 相容與安全暫存清理；完整 archive 缺口/截斷前備份保持列管。
 - [ ] 2.7 完成 #823/#824 session 與 AGY timeout 合約，明示 cgroup restart survival 的獨立驗收。
 - [ ] 2.7.1 先依 #851 補 AGY probe 的 argv construction containment，真 ready 非 AGY primary 不被阻擋；#824 仍需真非法 env 的 direct/probe/runtime 整合驗收，不拿 baseline fault injection 代替。

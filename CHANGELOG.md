@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+- **Recovery registry 子計畫進件（#862）**：納入 #497 的 registry-only A，保留
+  exact CAS／ABA revision、prepared/complete、atomic receipt 與顯式 legacy checkpoint
+  九組不變量。只有 accepted 規劃，現行 8/Red 不派工；公開 recovery／父項仍未完成。
+
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。
   本項只有規劃進件；既存 generic carrier 殘餘與產品、部署驗收保持分帳。
