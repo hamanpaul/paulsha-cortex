@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+- **Claude builder 命令授權（#480 部分修復）**：commit-required job 使用 per-job 最小 Git 與精確 Python 測試 allowlist，保留 `acceptEdits` 與既有事件／路徑設定，解除無人可核可的測試／提交阻塞。
+
 - **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
 
 - **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
