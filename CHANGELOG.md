@@ -9,7 +9,9 @@
 
 - **Terminal JSONL framing 實作（#860）**：Manager terminal parser 以保留換行的 UTF-8 reader
   和 literal LF record framing 保真處理 CRLF 與 Unicode JSON string data，維持既有
-  terminal carrier、schema 與 fail-closed 邊界。
+  terminal carrier、schema 與 fail-closed 邊界；補齊 framing／carrier／recovery 負例、
+  incident-shaped byte oracle 與 lifecycle 邊界文件。OpenSpec archive、remote CI、PR／
+  merge、issue closure 與 live qualification 仍為下游 pending。
 
 - **Terminal JSONL framing 進件（#860）**：登錄實體 LF／CRLF 與 Unicode 資料保真
   子計畫，沿用 terminal trust boundary，補雙層序列化／不可變重播／負控制契約。

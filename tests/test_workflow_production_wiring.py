@@ -4484,6 +4484,98 @@ def test_terminal_json_rejects_copilot_non_message_data_content(tmp_path: Path) 
         manager._extract_terminal_json(str(log))
 
 
+def test_terminal_extraction_keeps_real_terminal_before_later_noise_and_spoof(
+    tmp_path: Path,
+) -> None:
+    evidence = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "run",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    fake = {**evidence, "run_id": "spoof"}
+    lines = [
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": json.dumps(evidence)},
+            }
+        ),
+        json.dumps({"type": "turn.completed", "usage": {"output_tokens": 10}}),
+        "terminal wrapper emitted ordinary text after completion",
+        json.dumps(
+            {
+                "type": "tool.execution_complete",
+                "data": {"content": {"nested": json.dumps(fake)}},
+            }
+        ),
+    ]
+    log = tmp_path / "terminal-before-spoof.jsonl"
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    assert manager._extract_terminal_json(str(log)) == evidence
+
+
+def test_terminal_extraction_rejects_spoof_only_and_embedded_json_with_prose(
+    tmp_path: Path,
+) -> None:
+    fake = {
+        "schema_version": 1,
+        "kind": "workflow-card",
+        "status": "passed",
+        "run_id": "spoof",
+        "card_id": "card",
+        "candidate": "a" * 40,
+        "outputs": [],
+    }
+    spoof_logs = (
+        {
+            "type": "tool.execution_complete",
+            "data": {"content": {"nested": json.dumps(fake)}},
+        },
+        {
+            "type": "assistant.message",
+            "data": {
+                "content": (
+                    "Example output follows:\n"
+                    + json.dumps(fake)
+                    + "\nThe example is followed by explanatory prose."
+                )
+            },
+        },
+    )
+    for index, record in enumerate(spoof_logs):
+        log = tmp_path / f"spoof-only-{index}.jsonl"
+        log.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="no JSON evidence"):
+            manager._extract_terminal_json(str(log))
+
+
+def test_terminal_report_path_and_size_negative_controls_remain_separate() -> None:
+    report = [{"path": "reports/verify/work.md", "body": "# Verification"}]
+
+    with pytest.raises(ValueError, match="manifest root invalid"):
+        manager._inline_terminal_reports(
+            report,
+            phase="verify",
+            declared_outputs=["README.md"],
+        )
+
+    oversized = [{
+        "path": "reports/verify/work.md",
+        "body": "x" * (manager.WORKFLOW_REPORT_MAX_BYTES + 1),
+    }]
+    with pytest.raises(ValueError, match="exceeds bound"):
+        manager._inline_terminal_reports(
+            oversized,
+            phase="verify",
+            declared_outputs=["reports/verify/work.md"],
+        )
+
+
 def test_failed_planner_retry_replaces_only_its_disposable_sandbox(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

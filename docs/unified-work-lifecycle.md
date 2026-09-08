@@ -196,6 +196,10 @@ PR #54 僅識別目前仍為 open 的 delivery target；此編號本身不是 me
 
 **Canonical envelope。** envelope 帶 `schema_version`，並完整支援 `passed`、`failed`、`needs_human` 三種終局狀態與結構化 `diagnostics`；三類 card 都不存在「只有成功形狀才合法」的路徑。不帶 canonical 版本的舊 payload 走相容讀取路徑並記 legacy 標記，既有 run 不因版本差異被拒收。
 
+**Terminal JSONL extraction 與 recovery 邊界（#860）。** Manager 讀取 terminal log 時以保留換行的 UTF-8 reader 開啟檔案，且只用 literal LF（`\n`）切分 JSONL records。CRLF 是相容輸入；單筆 JSON 外的 CR 仍交給 JSON whitespace／既有 fence 規則處理，但裸 CR 不會被當成另一個 record delimiter，因此兩筆 JSON 只以裸 CR 相接時會 fail closed。末筆無換行、空行與尾端空行都不改變這項判定。Recovery 只讀取既有 log；路徑遺失、檔案遺失、UTF-8 無效、純文字或 terminal shape 無效時，不會產生 terminal evidence。
+
+JSON string data 中的原始 Unicode NEL（`U+0085`）、line separator（`U+2028`）與 paragraph separator（`U+2029`）會保留在 details／reports 等欄位；inner `result` JSON string 與 outer provider record 的 `structured_output` 各自可能採 raw 或 `ensure_ascii` escaped 形式。只 escape inner result 並不足以修復會把 outer raw separator 當換行的 reader；以 ASCII codepoint 名稱暫避只是一種內容改寫，不能當作 fidelity 修復或事故 replay 的替代品。Parser 仍只接受既有 terminal carriers 與一層白名單 wrapper；任意 `structured_output` 不會自動成為證據來源。這項修復也不把 generic top-level text 欄位變成經 event-type 認證的工具輸出，既有相容路徑的限制仍須分開看待。既有 `work start`／`recover work` CLI 介面不因本修復新增旗標。
+
 **gate ledger 由 manager 產生，不是模型自述。** 重驗只有在「被驗的東西不是模型講的話」時才有意義。`launcher.build_wrapper_script` 產生的 headless wrapper 是 manager 擁有的，形狀為：
 
 ```text
