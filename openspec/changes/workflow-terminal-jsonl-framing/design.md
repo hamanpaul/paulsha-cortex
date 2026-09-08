@@ -5,7 +5,7 @@ work_item: workflow-terminal-jsonl-framing
 
 # Workflow terminal JSONL framing 自有 OpenSpec 設計
 
-與 [spec](proposal.md) 同屬 owner [#860](https://github.com/hamanpaul/paulsha-cortex/issues/860)。Root 於 2026-09-08 依 fresh `bounded_contracts_review` 的 PASS／0 BLOCKER-MAJOR 接受內容供 repository intake；以下仍是未來實作，不是已部署行為，也未因此完成產品 freeze／dispatch／qualification。
+與 [proposal](proposal.md) 同屬 owner [#860](https://github.com/hamanpaul/paulsha-cortex/issues/860)。Root 於 2026-09-08 依 fresh `bounded_contracts_review` 的 PASS／0 BLOCKER-MAJOR 接受內容供 repository intake；以下仍是未來實作，不是已部署行為，也未因此完成產品 freeze／dispatch／qualification。
 
 本文件完整承接 [原 accepted design](../../../docs/superpowers/specs/workflow-terminal-jsonl-framing-design.md) 的 D1–D6，並非要求 builder 在 freeze 後新增 planning 文件。這份 upfront baseline 與 [proposal](proposal.md)／[tasks](tasks.md) 一起交 root 做 integration review；不是新的 production 範圍或已完成的產品 gate。
 
