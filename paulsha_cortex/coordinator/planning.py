@@ -813,11 +813,15 @@ class SizingScore:
 def _spec_stability_risk(completeness_report: CompletenessReport) -> int:
     """Map deterministic planning completeness to the stability risk score.
 
-    The report is normally produced by :func:`assess_planning_completeness`,
-    but callers can construct the dataclass directly.  Treat an empty or
-    internally inconsistent report as unknown and return the conservative
-    maximum risk rather than allowing fabricated completeness to score as
-    stable.
+    The typed report is expected to come from
+    :func:`assess_planning_completeness`.  The checks below protect the
+    report's structural invariants (kinds, acceptance/reasons, missing kinds,
+    blockers, and completeness); they do not parse artifact text a second
+    time.  A caller that fabricates ``ArtifactAssessment(accepted=True,
+    reasons=())`` can therefore bypass the assessor's content checks, so this
+    helper is not a trust boundary for arbitrary dataclass construction.
+    Empty or structurally inconsistent reports remain unknown and receive the
+    conservative maximum risk.
     """
     assessments = completeness_report.assessments
     if not assessments:
