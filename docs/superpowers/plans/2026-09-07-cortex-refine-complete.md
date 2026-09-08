@@ -68,14 +68,14 @@ R01–R14 是本文件的需求識別碼，**不是新建的 GitHub issue**。�
 | R03 evidence／terminal 冪等 | 同內容與狀態不重複產 evidence；變更恰好一次；舊 attempt 不能改現行候選或 completion | #496／#497；#501 只驗已修版本與既存污染 | 同 path 不同內容、重複 tick、重啟、delayed terminal、retry generation 的回歸；evidence hash 與 contract hash 各自保持語意。 |
 | R04 registry 寫入放大 | 無變更 no-op、history 上限與可追溯封存、安全 tmp sweep、rollback 成本與相容性；高頻寫入量測 | #821；更大 storage 遷移須有 profiling 依據，不預設重寫資料庫 | 無變更零寫入；history 有界而必要 audit 證據可追；crash recovery／migration／讀者 schema 全過；真變更仍正確持久化。 |
 | R05 額度／預估／fallback | 多額度池與時間窗觀測、任務需求預估、並行額度預留、動態候選選擇、持久退避與 reset reconciliation | #825 保留最小退避修復；新增 quota observation、forecast、reservation 與 admission 範圍 | 派前拒絕不足候選；同池換模型仍排除；不同池合格候選可選；並行不超額預留；重啟不丟；預估不足／外部消耗可修正；未知餘量不假裝足夠。 |
-| R06 失敗分類失真 | 原始結構化原因、phase、retryability、reset 與診斷鏈一致保留；planning／build／review 共用語意 | #826 補訊號；另補 planning launcher error 被包成 content 等消費端 | auth、quota、rate-limit、effort unsupported、127、缺 handle、schema/content 各有真實 fixture；同一底層原因不因 phase 換名而丟失恢復資訊。 |
+| R06 失敗分類失真 | 原始結構化原因、phase、retryability、reset 與診斷鏈一致保留；planning／build／review 共用語意 | #826 補訊號；另補 planning launcher error 被包成 content 等消費端；#860 framing 為 R13 主責的子件 | auth、quota、rate-limit、effort unsupported、127、缺 handle、schema/content 各有真實 fixture；同一底層原因不因 phase 換名而丟失恢復資訊；合法 Unicode terminal 不得被錯報 no JSON evidence。 |
 | R07 Recovery 語意與可恢復性 | 定義 resume/retry/recover/abandon 各自 precondition、effect、generation、資源處置與合法 next_actions；解除綁定必須真的生效 | #497 + 現有 recovery 家族（含 #545/#546/#547/#577 等需先查現況再拆票） | 狀態轉換矩陣、重送冪等、CAS mismatch、重啟續跑、late evidence、已合併工作禁止重派；只清受控 attempt 資源，不丟 operator 修改。 |
 | R08 model/agent/effort 彈性 | 可擴充 capability/adapter 契約；任務需求與執行配置分離；effort 實際解析與 operator preference/pin 語意 | #483/#581 與新 execution-profile 範圍；替換分散硬編，不把本次型號寫成 invariant | 新虛構模型與新 effort 只改 descriptor 即能在既有 adapter 執行；新 runtime 只加 adapter 與測試、不改 central resolver；unsupported 在 spawn 前拒絕；requested/resolved 可對照。 |
 | R09 評測／探活／實務紀錄 | PatchMUD qualification 供給、角色 deck、完整 profile fingerprint、版本化核可清單、TTL probe 與分層 track-record | 沿用 #452/#454/#466/#534 成果；補後續管線；PatchMUD 端獨立 PR | 一份真實 report 可追到核可條目，再追到實際派工；未測量維度為 unknown；更換 effort/adapter/toolchain 後不沿用不相容評分；評測不中斷 tick 熱路徑。 |
 | R10 狀態真實性與可解釋性 | actual/planned/last execution、完整 facets、等待額度/恢復原因、有效配置與選模依據；read model 不寫 workflow | #828 負責 identity producer；另補 needs_human/freshness/decision provenance | 同卡 retry 換模型、多卡同 phase、跨 repo、未派工／已退出均不猜測；registry needs_human 保留；所有 status sections 一致；下游 fixture 獨立驗收。 |
 | R11 runtime／release 一致性 | CLI 安裝、服務載入 revision、設定 revision、artifact digest 可辨識；受治理 upgrade/restart/rollback 與 source override receipt | P4 擴充成部署一致性工作；先核對既有 installer/release 實作，避免重建 | 從 checkout 外驗 installed CLI；真正服務報告載入 artifact；未重啟舊程序不算已更新；upgrade/rollback 不丟 active jobs；#820 僅計已完成的部分。 |
 | R12 instance／工作所有權 | instance roots、workspaces、writer、資源與共享 quota authority 的邊界；installer/doctor 同源檢查，owner-aware 清理 | #818/#800/#476 等既有票；P0 手動配置轉成產品契約 | 多 instance 並行與重啟不互寫 registry；共享 quota 仍能協調；stop/cleanup 只作用於指定 owner；dirty artifacts 與下游工作不被混入 commit。 |
-| R13 launcher／parser 基礎可靠性 | argv 引號／逗號解析、process/session 與 cgroup 生命週期、timeout/取消、terminal envelope/enum 契約、adapter conformance | #822/#823/#824 + #807/#820 residual；systemd 取消語意若超出 #823 另票 | 實際 argv round-trip；kill 單 job 不連坐 manager；manager restart 對 child 的處置有證據；timeout 可設定且 parse 正確；terminal 不靠寬鬆 status 別名繞過驗證。 |
+| R13 launcher／parser 基礎可靠性 | argv 引號／逗號解析、process/session 與 cgroup 生命週期、timeout/取消、terminal envelope/enum 契約、adapter conformance | #822/#823/#824 + #807/#820 residual；#860 單函式 JSONL framing；systemd 取消語意與 carrier-authentication 超出各票者由母 #829 另拆 | 實際 argv round-trip；kill 單 job 不連坐 manager；manager restart 對 child 的處置有證據；timeout 可設定且 parse 正確；LF/CRLF 與 Unicode 字串保真，不靠刪字元、status 別名或擴大 carrier/schema 繞過驗證。 |
 | R14 進件／驗證／交付脫節 | 規範文件唯一來源、coverage matrix、逐項 evidence-backed checklist、可恢復分批審查與人力/用量預算、issue/PR/installed 狀態分開 | #830 非 Job 派工決策契約、#831 sizing 方向；補 Red 分解接續與 delivery-accounting；P5 backlog hygiene 沿用 | 缺任一驗收、未 commit、policy 佔位字時不可宣告完成；合法等待／轉換不冒充 Job；完整 spec 不因算法反向變高風險；Red 真正產出可追溯子工作；中斷只重跑缺失工作；同 issue 不重複註冊；已修未關逐票證據關閉。 |
 
 「全部交代」的意思是每列均有責任模組、交付邊界、驗收與殘餘限制；不代表用有限的靜態掃描證明今後不存在同類缺陷。關鍵全稱需求由 runtime 不變量與負面測試守護。
@@ -331,6 +331,26 @@ PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需
   abc/missing-unit/overflow與合法duration到unknown sentinel可區分。這不是模型或live gate。
 - #827 watcher修订fresh R4已PASS：failure latch與逐層nofollow契約處置兩MAJOR，
   純memory/source證據不等dirfd/FD上界/OS/產品/CI；仍8Red且未派工。
+
+### Terminal framing child 進件（2026-09-08）
+
+- [#860](https://github.com/hamanpaul/paulsha-cortex/issues/860) 為 `workflow-terminal-jsonl-framing`
+  唯一 owner；[spec](../specs/workflow-terminal-jsonl-framing-spec.md)、
+  [design](../specs/workflow-terminal-jsonl-framing-design.md)、
+  [todo](../workstreams/workflow-terminal-jsonl-framing/todo.md) 與
+  [審查證據](../../../reports/review/refine-terminal-framing-20260908.md) 對齊。
+  Product 僅 manager.py::_extract_terminal_json，domain0/state0/invariants10，
+  accepted 真 sizing6Yellow；#831 真載入後4Yellow只是條件投影，不變更歷史分數。
+- #822 job94 的合法 Unicode 被 splitlines 切壞是獨立 framing 缺陷，不擴大 YAML 票。
+  Root／fresh reviewer 以原件只讀重播及36組 synthetic serializer/EOF/LF/CRLF反例證明
+  framing 根因與保真候選；原hash未變，這不是原 verification 採信或已修產品。
+  完整純函式八組負控制與 reader review PASS；沒有用 envelope unavailable/bypass 當资格。
+- 現行 generic top-level text/result/content/message/response 並非完整 event-type allowlist，
+  synthetic tool 的頂層 text 仍可能被原 parser 接受。本 framing diff 不新增 carrier；
+  完整 authentication 是母 #829 的後續獨立子件與2.12驗收，不假稱 #860 封鎖全部 spoof。
+- 本次只進件 planning。產品仍須真 Cortex RED/GREEN、full/policy、獨立 review、自己
+  OpenSpec archive/exact-head delivery；實際 Manager 載入需共享 owner 的安全維護窗口。
+  不因這份規劃合併而關閉 #860、#822、#829，或宣稱 R06/R13/B1 已完成。
 
 ### Canary sizing 校正紀錄
 
