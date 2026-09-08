@@ -1,7 +1,7 @@
 # yaml-inline-list-quotes Specification
 
 ## Purpose
-TBD - created by archiving change yaml-inline-list-quotes. Update Purpose after archive.
+讓 zero-dependency YAML subset parser 以 quote-aware tokenizer 正確讀取 inline flow list，保留引號元素內的逗號、`]` 與跳脫引號。
 ## Requirements
 ### Requirement: 依 canonical superpowers 規格驗收
 
@@ -11,4 +11,3 @@ TBD - created by archiving change yaml-inline-list-quotes. Update Purpose after 
 
 - **WHEN** 依 `docs/superpowers/specs/yaml-inline-list-quotes-spec.md` 的 Requirements 對 candidate 驗收
 - **THEN** 全部驗收條件成立
-
