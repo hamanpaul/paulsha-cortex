@@ -956,6 +956,34 @@ work_items:
       - kind: path
         ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
     excludes: []
+  workflow-terminal-jsonl-framing:
+    title: 'workflow-terminal-jsonl-framing'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#860'
+      - kind: openspec
+        ref: 'workflow-terminal-jsonl-framing'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/workflow-terminal-jsonl-framing-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/workflow-terminal-jsonl-framing/todo.md'
+    excludes: []
+  recovery-registry-receipt:
+    title: 'recovery-registry-receipt'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#862'
+      - kind: openspec
+        ref: 'recovery-registry-receipt'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/recovery-registry-receipt-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/recovery-registry-receipt/todo.md'
+    excludes: []
   task-memory-delivery-adapter:
     title: 'task memory delivery Cortex adapter'
     links:
