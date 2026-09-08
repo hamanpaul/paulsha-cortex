@@ -117,13 +117,13 @@ def test_claim_time_sizing_computed_when_plan_and_combo_available(tmp_path: Path
     )
 
     # feature-oneshot combo (real, checked-in): gate_spine=4, cards=11,
-    # persona_binding_count=11 → acceptance_surfaces=2, spec_stability=2,
-    # orchestration=2；加上宣告的 domain_breadth=1/state_consistency=1 → total=8.
-    assert run.sizing_score == 8
-    assert run.sizing_band == "red"
+    # persona_binding_count=11 → acceptance_surfaces=2, spec_stability=0,
+    # orchestration=2；加上宣告的 domain_breadth=1/state_consistency=1 → total=6.
+    assert run.sizing_score == 6
+    assert run.sizing_band == "yellow"
     persisted = registry.get_workflow_run(run.run_id)
-    assert persisted.sizing_score == 8
-    assert persisted.sizing_band == "red"
+    assert persisted.sizing_score == 6
+    assert persisted.sizing_band == "yellow"
 
 
 def test_claim_time_sizing_fails_soft_when_plan_lacks_declared_dimensions(

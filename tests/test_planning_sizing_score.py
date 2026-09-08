@@ -5,12 +5,9 @@ import inspect
 import pytest
 
 from paulsha_cortex.coordinator.planning import (
-    ArtifactAssessment,
-    BlockingMarker,
-    CompletenessReport,
     PlanningArtifact,
-    QuestionPack,
     SizingScore,
+    assess_planning_completeness,
     compute_sizing_score,
 )
 
@@ -31,20 +28,26 @@ def _plan_artifact(domain_breadth: object = 2, state_consistency: object = 1, ex
     return PlanningArtifact(kind="plan", ref="docs/superpowers/plans/demo.md", text=text)
 
 
-def _empty_question_pack() -> QuestionPack:
-    return QuestionPack(pack_id="qp-empty", questions=())
-
-
-def _completeness_report(*, missing_kinds=(), blocking=False) -> CompletenessReport:
-    artifact = PlanningArtifact(kind="plan", ref="docs/superpowers/plans/demo.md", text="---\nstatus: accepted\n---\n## Tasks\n- a")
-    markers = (BlockingMarker("standalone", 5, "TBD"),) if blocking else ()
-    assessment = ArtifactAssessment(artifact, not blocking, () if not blocking else ("blocking-decision",), markers)
-    return CompletenessReport(
-        complete=not missing_kinds and not blocking,
-        assessments=(assessment,),
-        missing_kinds=tuple(missing_kinds),
-        default_question_pack=_empty_question_pack(),
-    )
+def _completeness_report(*, missing_kinds=(), blocking=False, rejected=False):
+    headings = {
+        "spec": "Requirements",
+        "design": "Decisions",
+        "plan": "Tasks",
+    }
+    artifacts = []
+    for kind in ("spec", "design", "plan"):
+        if kind in missing_kinds:
+            continue
+        status = "draft" if rejected and kind == "spec" else "accepted"
+        extra = "\nTBD\n" if blocking and not artifacts else ""
+        ref = (
+            f"docs/superpowers/{kind}s/demo-{kind}.md"
+            if kind != "plan"
+            else "docs/superpowers/plans/demo.md"
+        )
+        text = f"---\nstatus: {status}\n---\n## {headings[kind]}\n- item\n{extra}"
+        artifacts.append(PlanningArtifact(kind=kind, ref=ref, text=text))
+    return assess_planning_completeness(artifacts)
 
 
 def test_compute_sizing_score_full_example():
@@ -59,21 +62,21 @@ def test_compute_sizing_score_full_example():
     assert isinstance(score, SizingScore)
     assert score.domain_breadth == 2
     assert score.state_consistency == 1
-    assert score.spec_stability == 2  # 全 accepted 無缺無阻塞
+    assert score.spec_stability == 0  # 全 accepted 無缺無阻塞
     assert score.acceptance_surfaces == 2  # gate 2 + rule 3 = 5 → 上限 2
     assert score.orchestration == 2  # cards>1 且 persona_binding>1
-    assert score.total == 9
-    assert score.to_dict()["total"] == 9
+    assert score.total == 7
+    assert score.to_dict()["total"] == 7
 
 
 @pytest.mark.parametrize(
     "missing_kinds, blocking, expected",
     [
-        ((), False, 2),
+        ((), False, 0),
         (("design",), False, 1),
-        ((), True, 1),
-        (("design",), True, 0),
-        (("design", "spec"), False, 0),
+        ((), True, 2),
+        (("design",), True, 2),
+        (("design", "spec"), False, 2),
     ],
 )
 def test_spec_stability_grading(missing_kinds, blocking, expected):
@@ -99,23 +102,10 @@ def test_spec_stability_grading(missing_kinds, blocking, expected):
     ],
 )
 def test_spec_stability_v2_oracle(missing_kinds, blocking, rejected, expected):
-    artifact = PlanningArtifact(
-        kind="plan",
-        ref="docs/superpowers/plans/demo.md",
-        text="---\nstatus: " + ("draft" if rejected else "accepted") + "\n---\n## Tasks\n- a",
-    )
-    markers = (BlockingMarker("standalone", 5, "TBD"),) if blocking else ()
-    assessment = ArtifactAssessment(
-        artifact,
-        not blocking and not rejected,
-        () if (not blocking and not rejected) else ("blocking-decision" if blocking else "status-not-accepted",),
-        markers,
-    )
-    report = CompletenessReport(
-        complete=not missing_kinds and not blocking and not rejected,
-        assessments=(assessment,),
-        missing_kinds=tuple(missing_kinds),
-        default_question_pack=_empty_question_pack(),
+    report = _completeness_report(
+        missing_kinds=missing_kinds,
+        blocking=blocking,
+        rejected=rejected,
     )
     score = compute_sizing_score(
         plan_artifact=_plan_artifact(),

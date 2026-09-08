@@ -223,13 +223,13 @@ def test_retry_build_recomputes_sizing_on_success(tmp_path: Path) -> None:
 
     updated = result["result"]["run"]
     # feature-oneshot 真實 combo：gate_spine=4、cards=11、
-    # persona_binding_count=11 → acceptance_surfaces=2/spec_stability=2/
-    # orchestration=2；加上宣告的 domain_breadth=1/state_consistency=1 → 8。
-    assert updated["sizing_score"] == 8
-    assert updated["sizing_band"] == "red"
+    # persona_binding_count=11 → acceptance_surfaces=2/spec_stability=0/
+    # orchestration=2；加上宣告的 domain_breadth=1/state_consistency=1 → 6。
+    assert updated["sizing_score"] == 6
+    assert updated["sizing_band"] == "yellow"
     persisted = registry.get_workflow_run(updated["run_id"])
-    assert persisted.sizing_score == 8
-    assert persisted.sizing_band == "red"
+    assert persisted.sizing_score == 6
+    assert persisted.sizing_band == "yellow"
 
 
 def test_retry_build_fails_soft_and_leaves_stale_sizing_when_recompute_unavailable(
@@ -319,8 +319,8 @@ def test_retry_verify_recomputes_sizing_on_success(tmp_path: Path) -> None:
     )
 
     updated = result["result"]["run"]
-    assert updated["sizing_score"] == 8
-    assert updated["sizing_band"] == "red"
+    assert updated["sizing_score"] == 6
+    assert updated["sizing_band"] == "yellow"
 
 
 # ---------------------------------------------------------------------------
@@ -366,5 +366,5 @@ def test_retry_review_recomputes_sizing_on_success(tmp_path: Path) -> None:
     )
 
     updated = result["result"]["run"]
-    assert updated["sizing_score"] == 8
-    assert updated["sizing_band"] == "red"
+    assert updated["sizing_score"] == 6
+    assert updated["sizing_band"] == "yellow"

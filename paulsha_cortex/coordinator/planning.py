@@ -760,6 +760,10 @@ SIZING_DIMENSIONS = (
     "spec_stability",
     "orchestration",
 )
+# Stability is a risk score (higher means less stable), unlike the other
+# sizing dimensions' descriptive difficulty scores.  Keep the identifier
+# explicit so historical scores are not mistaken for this mapping.
+STABILITY_RISK_ALGORITHM = "stability-risk-v2"
 # acceptance_surfaces 讀取的 contract 規則白名單（policy checklist R-09/R-16/R-19：
 # changelog fragment／CLI help 同步／CI 測試）；呼叫端算好「這個 work item 碰了哪些
 # 規則」後以 frozenset 注入，避免 planning.py 反向 import policy_check 或 deck。
@@ -806,6 +810,54 @@ class SizingScore:
         return payload
 
 
+def _spec_stability_risk(completeness_report: CompletenessReport) -> int:
+    """Map deterministic planning completeness to the stability risk score.
+
+    The report is normally produced by :func:`assess_planning_completeness`,
+    but callers can construct the dataclass directly.  Treat an empty or
+    internally inconsistent report as unknown and return the conservative
+    maximum risk rather than allowing fabricated completeness to score as
+    stable.
+    """
+    assessments = completeness_report.assessments
+    if not assessments:
+        return 2
+
+    if any(assessment.artifact.kind not in PLANNING_KINDS for assessment in assessments):
+        return 2
+    if any(
+        assessment.accepted != (not assessment.reasons)
+        for assessment in assessments
+    ):
+        return 2
+
+    accepted_kinds = {
+        assessment.artifact.kind
+        for assessment in assessments
+        if assessment.accepted
+    }
+    expected_missing = tuple(
+        kind for kind in PLANNING_KINDS if kind not in accepted_kinds
+    )
+    missing_kinds = tuple(completeness_report.missing_kinds)
+    if missing_kinds != expected_missing:
+        return 2
+
+    has_blockers = any(assessment.blocking_markers for assessment in assessments)
+    if completeness_report.complete != (not missing_kinds and not has_blockers):
+        return 2
+
+    # A rejected artifact remains a risk even when another artifact of the
+    # same kind was accepted; the rejected authority cannot be masked.
+    if any(not assessment.accepted for assessment in assessments):
+        return 2
+    if has_blockers:
+        return 2
+    if len(missing_kinds) >= 2:
+        return 2
+    return len(missing_kinds)
+
+
 def compute_sizing_score(
     *,
     plan_artifact: PlanningArtifact,
@@ -850,13 +902,10 @@ def compute_sizing_score(
     else:
         acceptance_surfaces = 2
 
-    # spec_stability：deterministic completeness 結果——缺的 kind 數與是否有
-    # blocking markers 各扣一分，不只取 CompletenessReport.complete 的布林值。
-    missing_penalty = len(completeness_report.missing_kinds)
-    blocking_penalty = 1 if any(
-        assessment.blocking_markers for assessment in completeness_report.assessments
-    ) else 0
-    spec_stability = max(0, 2 - missing_penalty - blocking_penalty)
+    # spec_stability is the explicit stability-risk-v2 mapping: complete
+    # accepted material is zero risk; missing or unresolved authority raises
+    # the bounded risk instead of lowering it.
+    spec_stability = _spec_stability_risk(completeness_report)
 
     # orchestration：card 清單規模 + 有填 persona_binding 的卡片數。
     if cards_count <= 1:
