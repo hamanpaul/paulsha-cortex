@@ -16,7 +16,7 @@ Owner [#860](https://github.com/hamanpaul/paulsha-cortex/issues/860)，work_id `
 
 ## Tasks
 
-- [ ] **T1 tests／RED（R1–R3、R7–R8）**：新增 `tests/test_workflow_terminal_jsonl_framing.py`，以合成 payload、真 `tmp_path` JSONL 與 actual `_extract_terminal_json`，parameterize raw/escaped U+0085/U+2028/U+2029、inner/outer ensure_ascii 四組、只有 outer 副本含 separator 等；先證 baseline 是收集成功後的 assertion/ValueError RED。深度相等驗全部 details/reports 字串，不只 status。
+- [x] **T1 tests／RED（R1–R3、R7–R8）**：新增 `tests/test_workflow_terminal_jsonl_framing.py`，以合成 payload、真 `tmp_path` JSONL 與 actual `_extract_terminal_json`，parameterize raw/escaped U+0085/U+2028/U+2029、inner/outer ensure_ascii 四組、只有 outer 副本含 separator 等；先證 baseline 是收集成功後的 assertion/ValueError RED。深度相等驗全部 details/reports 字串，不只 status。
 - [ ] **T2 source／GREEN（R1–R6）**：只在 `paulsha_cortex/coordinator/manager.py::_extract_terminal_json` 採 design D1 的 newline-preserving file open 與 literal LF record split；維持 UTF-8、原錯誤映射、反向掃描、carrier／wrapper／schema 與 fence。不改 provider、status alias、其他 parser 或任何 state writer。
 - [ ] **T3 tests／framing 相容（R1、R2、R6）**：真檔測 LF/CRLF、空行、末筆無換行、尾端空行、裸 CR 相接兩筆 JSON 拒收，以及單筆 JSON 合法 CR whitespace 相容；在讀取前後 hash 相同。測 Unicode 一般文字／組合字無變動；不得因 test serializer 預設 ensure_ascii 讓 raw 案例其實沒 raw 字元。
 - [ ] **T4 tests／雙層反例（R2–R3、R8）**：分開驗 inner escaped+outer raw structured_output 的舊失敗、候選成功；`type=result` 只有任意 structured_output 而沒有已認可 carrier 時仍拒收；wrapper 的 unknown／多層偽 evidence 不被新 fallback 接住。
