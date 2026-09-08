@@ -707,6 +707,10 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-superseded-terminal-replay/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-superseded-terminal-replay-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-superseded-terminal-replay-design.md'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#497'
     excludes: []
@@ -715,6 +719,10 @@ work_items:
     links:
       - kind: path
         ref: 'docs/superpowers/workstreams/fix-dirty-recheck-idempotency/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dirty-recheck-idempotency-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/fix-dirty-recheck-idempotency-design.md'
       - kind: github_issue
         ref: 'hamanpaul/paulsha-cortex#496'
     excludes: []
@@ -737,7 +745,11 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#665'
       - kind: path
         ref: 'docs/superpowers/workstreams/trust-root-executor-hardening/todo.md'
-    excludes: []
+    excludes:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#692'
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#763'
   trust-root-copilot-toolchain-pinning:
     title: 'trust-root-copilot-toolchain-pinning'
     links:
@@ -779,4 +791,182 @@ work_items:
         ref: 'hamanpaul/paulsha-cortex#792'
       - kind: openspec
         ref: 'manager-gitconfig-delivery'
+    excludes: []
+  daemon-tick-clock-not-idle:
+    title: 'daemon-tick-clock-not-idle'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#819'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/daemon-tick-clock-not-idle/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/daemon-tick-clock-not-idle-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/daemon-tick-clock-not-idle-design.md'
+    excludes: []
+  registry-persist-hygiene:
+    title: 'registry-persist-hygiene'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#821'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/registry-persist-hygiene/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-persist-hygiene-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/registry-persist-hygiene-design.md'
+    excludes: []
+  executor-durable-backoff:
+    title: 'executor-durable-backoff'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#825'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-durable-backoff/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-durable-backoff-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-durable-backoff-design.md'
+    excludes: []
+  outcome-taxonomy-signals:
+    title: 'outcome-taxonomy-signals'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#826'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/outcome-taxonomy-signals/todo.md'
+    excludes: []
+  yaml-inline-list-quotes:
+    title: 'yaml-inline-list-quotes'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#822'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/yaml-inline-list-quotes/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/yaml-inline-list-quotes-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/yaml-inline-list-quotes-design.md'
+    excludes: []
+  launcher-session-and-timeout:
+    title: 'launcher-session-and-timeout'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#823'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/launcher-session-and-timeout-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/launcher-session-and-timeout/todo.md'
+    excludes: []
+  monitor-refresh-thread-backlog:
+    title: 'monitor-refresh-thread-backlog'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#827'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-refresh-thread-backlog/todo.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-refresh-thread-backlog-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-refresh-thread-backlog-design.md'
+    excludes: []
+  sizing-stability-direction:
+    title: 'sizing-stability-direction'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#831'
+      - kind: path
+        ref: 'docs/superpowers/specs/sizing-stability-direction-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/sizing-stability-direction-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/sizing-stability-direction/todo.md'
+    excludes: []
+  dispatch-decision-contract:
+    title: 'dispatch-decision-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#830'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-decision-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/dispatch-decision-contract-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/dispatch-decision-contract/todo.md'
+    excludes: []
+  execution-profile-contract:
+    title: 'execution-profile-contract'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#835'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-contract-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-contract-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/execution-profile-contract/todo.md'
+    excludes: []
+  execution-profile-schema-core:
+    title: 'execution-profile-schema-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#849'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-schema-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/execution-profile-schema-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/execution-profile-schema-core/todo.md'
+    excludes: []
+  executor-backoff-store-core:
+    title: 'executor-backoff-store-core'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#850'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-store-core-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/executor-backoff-store-core-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/executor-backoff-store-core/todo.md'
+    excludes: []
+  agy-probe-construction-containment:
+    title: 'agy-probe-construction-containment'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#851'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/agy-probe-construction-containment-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/agy-probe-construction-containment/todo.md'
+    excludes: []
+  monitor-watcher-bounded:
+    title: 'monitor-watcher-bounded'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#853'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/monitor-watcher-bounded-design.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/monitor-watcher-bounded/todo.md'
+    excludes: []
+  task-memory-delivery-adapter:
+    title: 'task memory delivery Cortex adapter'
+    links:
+      - kind: github_issue
+        ref: 'hamanpaul/paulsha-cortex#857'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-spec.md'
+      - kind: path
+        ref: 'docs/superpowers/specs/task-memory-delivery-adapter-design.md'
+      - kind: path
+        ref: 'docs/superpowers/plans/task-memory-delivery-adapter.md'
+      - kind: path
+        ref: 'docs/superpowers/workstreams/task-memory-delivery-adapter/todo.md'
     excludes: []

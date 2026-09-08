@@ -21,6 +21,8 @@ from paulsha_cortex.deck.compile import _format_inline_list, _format_scalar
         (r"['it\'s, okay', plain]", ["it's, okay", "plain"]),
         ('["a",]', ["a"]),
         ('[""]', [""]),
+        ("['', a]", ["", "a"]),
+        ('["", a]', ["", "a"]),
         ("[]", []),
         ("[1, true, null, ~, x]", [1, True, None, None, "x"]),
     ],

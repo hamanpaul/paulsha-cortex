@@ -9,7 +9,40 @@
 
 - **#822：YAML inline list 保留引號元素**：zero-dependency YAML subset parser 現在以
   quote-aware tokenizer 讀取 flow list，含逗號或 `]` 的 `argv` 元素、單／雙引號內的反斜線跳脫與尾逗號
-  可正確 round-trip；中間空元素與未閉合引號會以 `malformed inline list` 拒絕。
+  可正確 round-trip；前導／中間空元素與未閉合引號會以 `malformed inline list` 拒絕。
+
+- **Task memory delivery adapter 進件（#857）**：登錄 Hippo #146 dependency、capability-aware delivery、工具中立 receipt、strict KPI 分離與 ≥95% authorized retrieval canary gate；本項只交付 accepted 規劃，不宣稱產品或 runtime 完成。
+
+- **Launcher／watcher 子計畫進件**：補齊 #823 session-only 三件組與唯一 owner links，
+  登錄 #853 有界 watcher A child。真 process-group 與 cgroup 邊界、raw0／generation／
+  partial-scan／nonfollow 驗收完整列管；現行 sizing 6／8 與正式產品交付分開。
+
+- **AGY 前置契約進件**：登錄 #851 probe argv 例外隔離，#824 timeout 拆為獨立候選，
+  保留 #823 session/cgroup 邊界。#824 依賴未完成，移除母件重複 owner 並暫不登錄
+  可 claim child；真 completeness 阻擋與 surface-only Yellow gate 分帳，不依自訂欄位假鎖派工。
+
+- **有界核心 child 進件**：登錄 #849 可擴充 execution-profile schema／canonical key，
+  與 #850 跨程序 backoff store／immutable event fold；補 byte-level oracle、資源上限及
+  真 process-death 測試契約。獨立審查通過，現行 sizing 仍為 7／8 Red，
+  不把規劃登錄、機械 gate 或 #831 投影當成產品／派工／資格完成。
+
+- **Evidence／profile 進件**：補 #496/#497/#821 的 accepted 三件組與 #835 可擴充
+  execution-profile／原生 effort／歷史 unknown 契約，保留 Red 真分數、writer ownership、
+  archive 與 PatchMUD/#842 外部資格邊界；只交規劃，不宣稱產品、量測或部署生效。
+
+- **Refine P1 runtime 進件**：補 #819/#825/#827 accepted spec/design、保留全部
+  原驗收並列真實 Red sizing／人工拆分；補限流事件亂序、寫入故障與到期去重負例。
+  將 #835–#845 的 profile、quota、資格、recovery 與交付責任納入總帳；
+  此項為規劃交付，不代表任何產品修正或 runtime gate 已完成。
+
+- **Refine bootstrap 進件**：補 #831 stability 風險方向與 #830 非 Job 派工決策的
+  accepted 三件組、真實 sizing 與純 gate 驗證；#833 獨立列管 Red planner 接續。
+  記錄 #832 規劃合併及 B2–B5 既有能力／待補 child 對照，不宣稱產品修正已交付。
+
+- **十四類 Cortex 精修進件（#829）**：收斂完整分批計畫、OpenSpec 驗收契約、動態
+  execution profile／額度觀測與預估／fallback 邊界；PatchMUD producer 由獨立 #37
+  列管。補齊 P1 canonical todo 與 #496／#497 校正，保留 #828 獨立工作所有權。
+  此項只交付規劃與進件，不宣稱產品修正、測試或部署完成。
 
 - **#807 agy headless terminal 改走 JSON envelope 並剝除前導文字**：`build_agy_argv` 對
   planner／reviewer／verifier／builder 所有 agy headless 形態一律附加 `--output-format json`，
