@@ -1,0 +1,27 @@
+2026-09-08T09:45:09Z
+$ ./scripts/openspec validate --specs
+- Validating...
+✓ spec/agy-builder-support
+✓ spec/cli-version-reporting
+✓ spec/governed-delivery-closure
+✓ spec/lifecycle-terminal-live-canary
+✓ spec/onboarding-documentation
+✓ spec/persona-workflow-orchestration
+✓ spec/planning-artifact-manifest-binding
+✓ spec/porcelain-command-registry
+✓ spec/porcelain-guided-bootstrap
+✓ spec/porcelain-init-sample
+✓ spec/porcelain-inspect-surface
+✓ spec/porcelain-request-tracking
+✓ spec/porcelain-run-recover-verbs
+✓ spec/porcelain-service-lifecycle
+✓ spec/release-engineering-pipeline
+✓ spec/scoped-broker-cleanup
+✓ spec/trust-root-agy-builder-grant
+✓ spec/trust-root-home-fail-closed
+✓ spec/trust-root-manager-visibility
+✓ spec/trust-root-phase2-closeout
+✓ spec/trusted-dispatch-completion
+✓ spec/unified-work-read-model
+Totals: 22 passed, 0 failed (22 items)
+[exit code: 0]

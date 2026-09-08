@@ -45,3 +45,35 @@ workflow evidence or older reports. The active OpenSpec task ledger remains
 pre-archive-only with downstream review, archive, remote CI, merge, closure,
 and loaded-runtime actions explicitly pending. Those actions remain Manager or
 operator responsibilities.
+
+## Current-card OpenSpec validation
+
+- **Producer:** `wf-68ec7e3df5-subagent-build-219`.
+- **Tested code subject:** `037cdee46010395c04d8e607eed203c76f1eba14`.
+- **Command:** `./scripts/openspec validate --specs` from `$CANDIDATE_ROOT`
+  (the candidate checkout root; the real private prefix is intentionally not
+  recorded here).
+- **Observed UTC:** `2026-09-08T09:45:09Z`.
+- **Result:** exit code `0`; `22 passed, 0 failed (22 items)`.
+- **Durable transcript:**
+  `docs/evidence/agy-probe-construction-containment-logs/openspec-specs-transcript.txt`.
+  It contains the complete merged stdout/stderr stream and the recorded exit
+  code for this run; it is `919` bytes with SHA256
+  `8a123c5998b88c25208339b5a2fbac7038795b5b75e2a26836d9d9d4c669452a`.
+- This run is distinct from the four `wf-68ec7e3df5-subagent-build-212`
+  producer checks above. Neither run is an archive, merge, closure, or loaded
+  runtime claim, and a hash is not a producer signature or independent time
+  attestation.
+
+## Retention and access boundary
+
+The four producer transcripts and this current-card transcript are retained as
+tracked Git blobs once this descendant is committed, and remain subject to the
+existing workflow-evidence retention period. The existing Manager/workflow
+evidence retention responsibility and its normal evidence access path apply;
+this card does not create a new retention duration or garbage-collection
+policy. Reviewers should retrieve the bytes from the candidate Git blob at the
+repo-relative paths named above and recompute the listed hashes. The worktree's
+continued existence is not a preservation guarantee, and the externally
+retained `212` source bundle remains outside this repository under the
+previously recorded Manager evidence reference.
