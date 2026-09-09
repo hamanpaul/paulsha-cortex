@@ -65,15 +65,41 @@ operator responsibilities.
   runtime claim, and a hash is not a producer signature or independent time
   attestation.
 
+## Preserved 219 PR-context preflight
+
+The following is a new durable preservation of an existing
+`wf-68ec7e3df5-subagent-build-219` result, not a test newly executed by this
+card. The source event is the exact `item_41` completion event, and its body
+context is established by the source workflow's `item_39` observation. The
+complete merged output is retained at
+`docs/evidence/agy-probe-construction-containment-logs/preflight-219-transcript.txt`;
+the path-redacted command, context, source-log binding, and byte measurements
+are in the accompanying `preflight-219-metadata.md`.
+
+- **Producer:** `wf-68ec7e3df5-subagent-build-219`.
+- **Tested code subject:** `81b854e4eea25162d50cab9ce4d0b0a8c4cbbacc`.
+- **PR context:** title `fix(agy-probe): 補齊建構失敗 containment`, empty labels,
+  base `main`, head `feature/851-agy-probe-construction-containment`, and
+  `visibility=unknown` because the source command omitted
+  `--repo-visibility`.
+- **Pinned engine:**
+  `hamanpaul/paulsha-conventions@9e7fabbf0b5eea9ad933fa6798764b723934a0b7`.
+- **Result:** exit code `0`; the preserved output is 383 bytes with SHA256
+  `4d92e207c7a740a3b01e17945634474cdbabfe92e05f31da3440c499c8005868`.
+- This is separate from the `wf-68ec7e3df5-subagent-build-219` OpenSpec
+  validation transcript above and from any current-card public-visibility
+  preflight. The old run must not be relabeled or merged with a new run.
+
 ## Retention and access boundary
 
-The four producer transcripts and this current-card transcript are retained as
-tracked Git blobs once this descendant is committed, and remain subject to the
-existing workflow-evidence retention period. The existing Manager/workflow
-evidence retention responsibility and its normal evidence access path apply;
-this card does not create a new retention duration or garbage-collection
-policy. Reviewers should retrieve the bytes from the candidate Git blob at the
-repo-relative paths named above and recompute the listed hashes. The worktree's
-continued existence is not a preservation guarantee, and the externally
-retained `212` source bundle remains outside this repository under the
-previously recorded Manager evidence reference.
+The four producer transcripts, the preserved 219 preflight transcript and
+metadata, and the current-card OpenSpec transcript are retained as tracked Git
+blobs once this descendant is committed, and remain subject to the existing
+workflow-evidence retention period. The existing Manager/workflow evidence
+retention responsibility and its normal evidence access path apply; this card
+does not create a new retention duration or garbage-collection policy.
+Reviewers should retrieve the bytes from the candidate Git blob at the
+repo-relative paths named above and recompute the listed hashes. The
+worktree's continued existence is not a preservation guarantee, and the
+externally retained `212` source bundle remains outside this repository under
+the previously recorded Manager evidence reference.
