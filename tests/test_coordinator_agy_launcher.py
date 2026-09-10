@@ -296,6 +296,33 @@ def test_agy_launcher_forwards_commit_required_to_argv_builder(monkeypatch, tmp_
     assert calls and calls[0]["commit_required"] is True
 
 
+def test_agy_direct_launcher_propagates_builder_error_before_popen(monkeypatch, tmp_path) -> None:
+    """#851 R4：probe-local containment 不得吞 direct launch 的建構錯誤。"""
+    popen_calls: list[object] = []
+
+    def broken_builder(**kwargs):
+        del kwargs
+        raise ValueError("invalid-agy-configuration")
+
+    def fake_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        raise AssertionError("Popen must not run after argv construction failure")
+
+    monkeypatch.setitem(launcher_module._ARGV_BUILDERS, "agy", broken_builder)
+    monkeypatch.setattr(launcher_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("PSC_JOB_RUNNER", "direct")
+
+    with pytest.raises(ValueError, match="invalid-agy-configuration"):
+        SubprocessLauncher("agy").launch(
+            slice_id="agy-direct-failure",
+            prompt="probe",
+            worktree=str(tmp_path),
+            log_dir=str(tmp_path / "logs"),
+        )
+
+    assert popen_calls == []
+
+
 def test_agy_launcher_forwards_write_forbidden_to_argv_builder(monkeypatch, tmp_path) -> None:
     calls: list[dict] = []
 
