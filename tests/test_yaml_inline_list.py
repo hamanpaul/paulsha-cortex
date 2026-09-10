@@ -34,6 +34,7 @@ def test_inline_flow_list_preserves_quoted_values(source: str, expected: list[ob
 @pytest.mark.parametrize(
     "source",
     [
+        '[, a]',
         '["a",, "b"]',
         '["unterminated]',
     ],

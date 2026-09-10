@@ -14,4 +14,4 @@ work_item: yaml-inline-list-quotes
 - [x] [CLI] 執行 `python3 -m paulsha_cortex.cli --help` 與 `python3 -m paulsha_cortex.cli deck --help`。
 - [x] [DOC-REPAIR] 修正三份交付前文件對單／雙引號反斜線跳脫的遺漏，未宣稱 archive、ship、merge 或 issue closure。
 - [x] [VERIFY] 完成本卡修補的 pre-archive focused／consumer pytest；canonical gate 重跑與 ship／archive 由 Manager 後續處理。
-- [x] [REPAIR-2] 補齊前導／中間空元素的拒絕說明，並新增空引號字串與其他元素的單／雙引號 regression；此項為 post-archive／pre-merge Candidate 修補，不宣稱 archive／merge／issue closure／done。
+- [x] [REPAIR-2] 補齊前導／中間空元素的拒絕說明，並新增 `[, a]` 前導空元素及空引號字串與其他元素的單／雙引號 regression；此項為 post-archive／pre-merge Candidate 修補，不宣稱 archive／merge／issue closure／done。
