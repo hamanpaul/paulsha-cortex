@@ -1,7 +1,9 @@
 # workflow-terminal-jsonl-framing Specification
 
 ## Purpose
-TBD - created by archiving change workflow-terminal-jsonl-framing. Update Purpose after archive.
+以保留 JSONL 實體記錄分界與既有 terminal carrier 的方式，確保 Manager
+解析 terminal log 時保留 CRLF 與 Unicode JSON string data，並維持既有
+fail-closed 的信任與驗證邊界。
 ## Requirements
 ### Requirement: R1 實體分界
 
@@ -92,4 +94,3 @@ TBD - created by archiving change workflow-terminal-jsonl-framing. Update Purpos
 
 - **WHEN** Cortex 實作本 child 並推進候選驗證及正式下游交付
 - **THEN** production 只改 manager.py 的指定函式；tests/docs/changelog/own OpenSpec/full/policy/CI/review/exact-head 與安全 loaded gate 全保留，未完成不能假勾或當已部署
-

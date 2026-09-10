@@ -352,6 +352,30 @@ PatchMUD #37仍是外部producer gate，真人qualification核可若生效也需
   OpenSpec archive/exact-head delivery；實際 Manager 載入需共享 owner 的安全維護窗口。
   不因這份規劃合併而關閉 #860、#822、#829，或宣稱 R06/R13/B1 已完成。
 
+### Recovery registry child A 進件（2026-09-08，#862）
+
+- #497 人工拆分的第一件為 #862 `recovery-registry-receipt`，只改 registry.py；
+  母 R03/R07 的完整公開 recovery、terminal admission 與重啟穩定仍須其餘 children。
+  分工維持 A→C→B→D2、D1→D2，不冒稱 #833 已自動分解或替母票完成。
+- [Spec](../specs/recovery-registry-receipt-spec.md)、[design](../specs/recovery-registry-receipt-design.md)、
+  [todo](../workstreams/recovery-registry-receipt/todo.md) 與
+  [own OpenSpec](../../../openspec/changes/recovery-registry-receipt/proposal.md) 皆為已審內容；
+  [審查紀錄](../../../reports/review/refine-recovery-registry-20260907.md) 保留歷史草稿與接受後證據分帳。
+- I01–I09 保留 exact request/digest、全域 ID、CAS/ABA、prepared/complete、單 snapshot
+  原子 commit、supersession/consumption、deep-copy/history、failure matrix 與顯式 checkpoint。
+  Legacy fingerprint 不追證歷史 ABA；舊 unversioned mutator 不自動升級，v1/#501 migration
+  政策不變。Actor/proof 字串不是新權限；A不讀外部proof或操作live資源，後續C/B驗真。
+- domain=0/state=2/invariants=9，不以單檔 production 將 state 壓成0。兩份14項Tasks
+  與六份planning views等價，accepted現行8/Red；#831實際載入後的6/Yellow目前僅條件
+  投影，須重新計分並核對資格。不開auto label，不以此規劃PR宣稱可派工。
+- 產品run前必須完成own四件的規劃合併、發布、唯一mapping/source binding及讀回；
+  candidate只准既有checkbox狀態切換，operator baseline不動。只archive本child，
+  下游CI/merge/installed/live、C/B/D與父closure以prose分帳，不建立archive前循環待辦。
+- 現場額度缺口再現：2026-09-08的reviewer139/140/145為Claude five_hour結構化429，
+  當時共享池已106%；identity roster沒有可用Copilot Claude reviewer，eval roster亦缺。
+  這是R05/R08/R09待辦的現場佐證，不能同池換名當fallback或自造review資格；#836–#839、
+  #842仍須正式交付，#862不承接模型設定或額度產品實作。
+
 ### Canary sizing 校正紀錄
 
 首輪 #822 的 domain_breadth 被主 agent 設為 1，將 emitter/frontmatter 的回歸測試消費端誤算為 production 模組。依 #208 原始 rubric（0=單模組／單資料流、1=2–3 模組），本工作 production 只改 `_yaml._parse_scalar`，正確為 0；state_consistency=0、其餘實際條件不變。更正不直接改凍結 run；使用正式 abandon/重新接受流程保留原 receipts，且 yellow plan review 仍須執行。spec_stability 與原 rubric 方向不一致由 #831 列管，不以刪欄位/捏造數值繞過 sizing gate。
