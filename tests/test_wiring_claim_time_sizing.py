@@ -20,6 +20,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from paulsha_cortex.coordinator import work_bridge
 from paulsha_cortex.coordinator.claim import load_work_authority
 from paulsha_cortex.coordinator.registry import JobRegistry
@@ -58,6 +60,37 @@ def _write_planning_docs(root: Path, *, declare_sizing_dimensions: bool) -> None
         f"---\n{plan_frontmatter}---\n# Tasks\n## Task 1\nBuild.\n",
         encoding="utf-8",
     )
+
+
+def _write_matrix_planning_docs(
+    root: Path,
+    *,
+    kinds: tuple[str, ...],
+    dimension: int | str,
+    blocked_kind: str | None = None,
+    invalid_field: str | None = None,
+) -> list[dict[str, str]]:
+    base = root / "openspec/changes/matrix"
+    base.mkdir(parents=True, exist_ok=True)
+    filenames = {"spec": "proposal.md", "design": "design.md", "plan": "tasks.md"}
+    headings = {"spec": "Requirements", "design": "Decisions", "plan": "Tasks"}
+    rows: list[dict[str, str]] = []
+    for kind in kinds:
+        ref = f"openspec/changes/matrix/{filenames[kind]}"
+        frontmatter = ["---", "status: accepted"]
+        if kind == "plan":
+            domain = dimension if invalid_field != "domain_breadth" else "3"
+            state = dimension if invalid_field != "state_consistency" else "not-an-int"
+            frontmatter.extend(
+                [f"domain_breadth: {domain}", f"state_consistency: {state}"]
+            )
+        frontmatter.append("---")
+        body = [f"## {headings[kind]}", "- Ready."]
+        if blocked_kind == kind:
+            body.append("TBD")
+        (root / ref).write_text("\n".join(frontmatter + body) + "\n", encoding="utf-8")
+        rows.append({"kind": kind, "ref": ref})
+    return rows
 
 
 def _snapshot(path: Path) -> Path:
@@ -117,13 +150,13 @@ def test_claim_time_sizing_computed_when_plan_and_combo_available(tmp_path: Path
     )
 
     # feature-oneshot combo (real, checked-in): gate_spine=4, cards=11,
-    # persona_binding_count=11 → acceptance_surfaces=2, spec_stability=2,
-    # orchestration=2；加上宣告的 domain_breadth=1/state_consistency=1 → total=8.
-    assert run.sizing_score == 8
-    assert run.sizing_band == "red"
+    # persona_binding_count=11 → acceptance_surfaces=2, spec_stability=0,
+    # orchestration=2；加上宣告的 domain_breadth=1/state_consistency=1 → total=6.
+    assert run.sizing_score == 6
+    assert run.sizing_band == "yellow"
     persisted = registry.get_workflow_run(run.run_id)
-    assert persisted.sizing_score == 8
-    assert persisted.sizing_band == "red"
+    assert persisted.sizing_score == 6
+    assert persisted.sizing_band == "yellow"
 
 
 def test_claim_time_sizing_fails_soft_when_plan_lacks_declared_dimensions(
@@ -179,6 +212,62 @@ def test_current_sizing_snapshot_helper_is_fail_soft_on_missing_combo(tmp_path: 
     )
     assert score is None
     assert band is None
+
+
+@pytest.mark.parametrize(
+    ("scope", "kinds", "blocked_kind", "expected"),
+    [
+        ("single-complete", ("spec", "design", "plan"), None, (4, "yellow")),
+        ("single-missing", ("spec", "plan"), None, (5, "yellow")),
+        ("single-blocked", ("spec", "design", "plan"), "spec", (6, "yellow")),
+        ("cross-complete", ("spec", "design", "plan"), None, (8, "red")),
+        ("cross-missing", ("spec", "plan"), None, (9, "red")),
+        ("cross-blocked", ("spec", "design", "plan"), "spec", (10, "red")),
+    ],
+)
+def test_current_sizing_snapshot_pairs_single_and_cross_scope_matrix(
+    tmp_path: Path,
+    scope: str,
+    kinds: tuple[str, ...],
+    blocked_kind: str | None,
+    expected: tuple[int, str],
+) -> None:
+    # small-fix has two core gate-spine entries and seven persona-bound cards;
+    # with all three policy surfaces this fixes acceptance+orchestration at 4.
+    dimension = 0 if scope.startswith("single") else 2
+    root = _repo(tmp_path / scope)
+    rows = _write_matrix_planning_docs(
+        root,
+        kinds=kinds,
+        dimension=dimension,
+        blocked_kind=blocked_kind,
+    )
+
+    assert work_bridge.current_sizing_snapshot(
+        workspace_root=root,
+        combo_name="small-fix",
+        artifact_rows=rows,
+    ) == expected
+
+
+@pytest.mark.parametrize("invalid_field", ["domain_breadth", "state_consistency"])
+def test_current_sizing_snapshot_invalid_dimensions_fail_soft(
+    tmp_path: Path,
+    invalid_field: str,
+) -> None:
+    root = _repo(tmp_path / invalid_field)
+    rows = _write_matrix_planning_docs(
+        root,
+        kinds=("spec", "design", "plan"),
+        dimension=1,
+        invalid_field=invalid_field,
+    )
+
+    assert work_bridge.current_sizing_snapshot(
+        workspace_root=root,
+        combo_name="small-fix",
+        artifact_rows=rows,
+    ) == (None, None)
 
 
 # ---------------------------------------------------------------------------
